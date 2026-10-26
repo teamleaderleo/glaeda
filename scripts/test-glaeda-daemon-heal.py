@@ -494,6 +494,33 @@ class SelfUpdate(unittest.TestCase):
         self.assertEqual(self.installed(heal.SCRIPT_NAME), SCRIPT_BYTES + b"# 2\n")
         self.assertIn("does not descend", report["release"]["error"])
 
+    def test_a_crash_before_state_is_saved_still_refuses_a_downgrade(self) -> None:
+        self.channel.publish(1, script=SCRIPT_BYTES + b"# 1\n")
+        self.run_pass()
+        saved = (self.state_dir / "state.json").read_bytes()
+        self.channel.publish(2, script=SCRIPT_BYTES + b"# 2\n")
+        self.run_pass(POLICY["release"]["every_s"])
+        (self.state_dir / "state.json").write_bytes(saved)  # the pass died after the swap, before its state
+        self.channel.publish(1, script=SCRIPT_BYTES + b"# 1\n")  # a lagging source names the older release
+        report = self.run_pass(POLICY["release"]["every_s"])
+        self.assertEqual(self.installed(heal.SCRIPT_NAME), SCRIPT_BYTES + b"# 2\n")
+        self.assertIn("does not descend", report["release"]["error"])
+
+    def test_a_truncated_download_is_an_error_not_a_crash(self) -> None:
+        import http.client
+        self.channel.publish(2, script=b"# new\n")
+        real = self.channel.get
+
+        def truncated(url: str, limit: int) -> bytes:
+            if url.endswith(heal.ARCHIVE):
+                raise http.client.IncompleteRead(b"partial")
+            return real(url, limit)
+        self.channel.get = truncated
+        report = self.run_pass()
+        self.assertTrue(report["release"]["error"])
+        self.assertEqual(self.installed(heal.SCRIPT_NAME), SCRIPT_BYTES)
+        self.assertTrue((self.state_dir / "report.json").exists(), "the pass still saved its report")
+
     def test_malformed_release_metadata_is_an_error_not_a_crash(self) -> None:
         self.channel.publish(2, script=b"# new\n")
         url = next(u for u in self.channel.files if u.endswith("/release.json") and f"/{ORIGIN}/" in u)
@@ -514,13 +541,15 @@ class SelfUpdate(unittest.TestCase):
         stage.mkdir()
         (stage / heal.SCRIPT_NAME).write_bytes(script)
         (stage / heal.POLICY_NAME).write_bytes(policy)
-        (stage / heal.PAIR_MARK).write_text(json.dumps({heal.SCRIPT_NAME: heal.sha256(script),
-                                                        heal.POLICY_NAME: heal.sha256(policy)}))
+        hashes = {heal.SCRIPT_NAME: heal.sha256(script), heal.POLICY_NAME: heal.sha256(policy)}
+        (stage / heal.PAIR_MARK).write_text(json.dumps({"files": hashes, "release": {"tag": "r-9", "commit": "c9"}}))
         (self.dir / heal.POLICY_NAME).write_bytes(policy)  # died after the policy, before the script
         self.assertTrue(heal.finish_pair(self.dir, root=False))
         self.assertEqual((self.installed(heal.SCRIPT_NAME), self.installed(heal.POLICY_NAME)), (script, policy))
+        self.assertEqual(json.loads(self.installed(heal.INSTALLED))["commit"], "c9", "the release is swapped with it")
         self.assertFalse((stage / heal.PAIR_MARK).exists())
-        (stage / heal.PAIR_MARK).write_text(json.dumps({heal.SCRIPT_NAME: "0" * 64, heal.POLICY_NAME: "0" * 64}))
+        (stage / heal.PAIR_MARK).write_text(json.dumps({"files": {heal.SCRIPT_NAME: "0" * 64,
+                                                                  heal.POLICY_NAME: "0" * 64}, "release": None}))
         (stage / heal.SCRIPT_NAME).write_bytes(b"# torn\n")
         self.assertTrue(heal.finish_pair(self.dir, root=False))
         self.assertEqual(self.installed(heal.SCRIPT_NAME), script, "a mark the staged files do not match is dropped")
@@ -531,6 +560,10 @@ class SelfUpdate(unittest.TestCase):
         self.assertEqual((code, len(out)), (0, 1000))
         code, _out, _err = heal.bounded_run([sys.executable, "-c", "import time; time.sleep(30)"], 0.5)
         self.assertEqual(code, 124)
+        started = heal.time.time()  # a descendant that keeps the pipes open is killed with it
+        code, _out, _err = heal.bounded_run(["/bin/sh", "-c", "sleep 30 & sleep 30"], 0.5)
+        self.assertEqual(code, 124)
+        self.assertLess(heal.time.time() - started, 4)
 
     def test_the_same_release_costs_two_small_reads_and_rewrites_nothing(self) -> None:
         tag = self.channel.publish(2)

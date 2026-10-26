@@ -47,6 +47,7 @@ import argparse
 import contextlib
 import datetime
 import hashlib
+import http.client
 import io
 import json
 import os
@@ -100,6 +101,7 @@ MAX_EXTRACTED = 1 << 30  # glaeda-update MAX_EXTRACTED: what the whole archive m
 ANCESTRY = "ancestry.txt"  # glaeda_release.ANCESTRY: the release's commit and its ancestors, at the archive root
 URL_HOSTS = ("github.com", "release-assets.githubusercontent.com", "objects.githubusercontent.com")
 PAIR_MARK = "ready.json"  # in staged/: the commit point of a script and policy swap
+INSTALLED = "installed.json"  # beside the pair: the release it is (tag, commit, hashes), swapped with it
 FETCH_TIMEOUT = 60
 CHECK_TIMEOUT = 120  # the staged copy's plan pass (ps and one top sample)
 AFTER_PID_WAIT_S = 300
@@ -482,7 +484,7 @@ def install(policy_path: Path, apply: bool, expect_sha256: str | None = None,
     finish_pair(INSTALL_DIR, root=True)
     if any(read_bytes(path) != data or (path.stat().st_mode & 0o777) != mode
            for path, (data, mode) in want["files"].items()):
-        commit_pair({path.name: data for path, (data, _mode) in want["files"].items()}, INSTALL_DIR, root=True)
+        commit_pair({path.name: data for path, (data, _mode) in want["files"].items()}, INSTALL_DIR, True, None)
     changed = read_bytes(PLIST) != want["plist"]
     if changed:
         launchctl("bootout", f"system/{LABEL}")
@@ -554,7 +556,7 @@ def read_channel(sources: list[str], get=fetch) -> tuple[str, dict[str, Any] | N
                     or not HEX64.fullmatch(str(entry.get("releaseSha256"))):
                 raise HealError(f"{RING}.json is malformed")
             return source, entry
-        except (HealError, OSError, ValueError) as e:  # urllib's errors are OSErrors
+        except (HealError, OSError, ValueError, http.client.HTTPException) as e:  # urllib's errors are OSErrors
             errors.append(f"{source}: {str(e)[:120]}")
     raise HealError("no release source answered: " + "; ".join(errors))
 
@@ -602,7 +604,8 @@ def release_files(source: str, entry: dict[str, Any], get=fetch, installed: str 
 def bounded_run(argv: list[str], timeout: float, limit: int = MAX_META) -> tuple[int, str, str]:
     """sh() for code root did not write: keeps at most `limit` bytes of each stream, drains and drops the rest."""
     try:
-        proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                start_new_session=True)
     except OSError as e:
         return 127, "", str(e)
     kept = (bytearray(), bytearray())
@@ -618,13 +621,15 @@ def bounded_run(argv: list[str], timeout: float, limit: int = MAX_META) -> tuple
     try:
         code = proc.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
-        proc.kill()
-        proc.wait()
         code = 124
+        with contextlib.suppress(OSError):  # its own session (not yet reaped): what it started, holding our pipes, too
+            os.killpg(proc.pid, signal.SIGKILL)
+        proc.wait()
     for reader in readers:
         reader.join(5)
-    for stream in (proc.stdout, proc.stderr):
-        stream.close()
+    for stream, reader in zip((proc.stdout, proc.stderr), readers):
+        if not reader.is_alive():
+            stream.close()
     return code, kept[0].decode(errors="replace"), kept[1].decode(errors="replace")
 
 
@@ -636,14 +641,16 @@ def stage_dir(install_dir: Path, root: bool) -> Path:
     return stage
 
 
-def commit_pair(files: dict[str, bytes], install_dir: Path, root: bool) -> None:
-    """The script and the policy change together or not at all: both staged, then a ready mark (the commit point),
-    then the swap. A pass or install that dies after the mark is finished by finish_pair, before any policy load."""
+def commit_pair(files: dict[str, bytes], install_dir: Path, root: bool, release: dict[str, str] | None) -> None:
+    """The script, the policy and the release they are (installed.json; None for a hand install) change together or
+    not at all: all staged, then a ready mark (the commit point), then the swap. A pass or install that dies after
+    the mark is finished by finish_pair before any policy load."""
     stage = stage_dir(install_dir, root)
     for name, data in files.items():
         if read_bytes(stage / name) != data:
             atomic_write(stage / name, data, MODES[name], root)
-    atomic_write(stage / PAIR_MARK, json.dumps({n: sha256(d) for n, d in files.items()}).encode(), 0o644, root)
+    mark = {"files": {n: sha256(d) for n, d in files.items()}, "release": release}
+    atomic_write(stage / PAIR_MARK, json.dumps(mark, sort_keys=True).encode(), 0o644, root)
     finish_pair(install_dir, root)
 
 
@@ -653,12 +660,20 @@ def finish_pair(install_dir: Path, root: bool) -> bool:
     mark = load_json(stage / PAIR_MARK)
     if not mark:
         return False
+    want = mark.get("files") if isinstance(mark.get("files"), dict) else {}
     staged = {name: read_bytes(stage / name) for name in MEMBERS}
-    if set(mark) == set(MEMBERS) and all(data is not None and sha256(data) == mark[name] for name, data in staged.items()):
+    if set(want) == set(MEMBERS) and all(data is not None and sha256(data) == want[name] for name, data in staged.items()):
         for name in (POLICY_NAME, SCRIPT_NAME):
             path = install_dir / name
             if read_bytes(path) != staged[name] or (path.stat().st_mode & 0o777) != MODES[name]:
                 atomic_write(path, staged[name], MODES[name], root)
+        release = mark.get("release")
+        if isinstance(release, dict):
+            atomic_write(install_dir / INSTALLED, json.dumps({**release, "files": want}, sort_keys=True).encode(),
+                         0o644, root)
+        else:
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(install_dir / INSTALLED)  # a hand install: these bytes are no release this copy knows
     os.unlink(stage / PAIR_MARK)
     return True
 
@@ -686,24 +701,30 @@ def refresh(policy: dict[str, Any], state: dict[str, Any], now: float, install_d
     rel = dict(state.get("release") or {})
     have = {name: read_bytes(install_dir / name) for name in MEMBERS}
     hashes = {name: None if data is None else sha256(data) for name, data in have.items()}
-    drifted = rel.get("files") != hashes
+    ident = load_json(install_dir / INSTALLED)  # what the pair is, swapped with it: never ahead of or behind it
+    drifted = ident.get("files") != hashes
     if now - float(rel.get("checked") or 0) < policy["release"]["every_s"] and not (drifted and not rel.get("error")):
         return rel
     rel["checked"] = now
     try:
         source, entry = read_channel(policy["release"]["sources"], get)
         rel.update(source=source, wants=None if entry is None else entry["tag"], ok=now)  # ok: the channel answered
-        if entry is not None and (entry["tag"] != rel.get("tag") or drifted):
-            files = release_files(source, entry, get, rel.get("commit"))
+        if entry is not None and (entry["tag"] != ident.get("tag") or drifted):
+            commit = ident.get("commit") if isinstance(ident.get("commit"), str) else None
+            files = release_files(source, entry, get, commit)
+            release = {"tag": entry["tag"], "commit": entry["source"]}
             if any(have[name] != data for name, data in files.items()):
                 stage_check(files, install_dir, root, run, python)
-                commit_pair(files, install_dir, root)  # the next pass runs the pair
+                commit_pair(files, install_dir, root, release)  # the next pass runs the pair
                 rel["installed_at"] = now
-            rel.update(tag=entry["tag"], commit=entry["source"],
-                       files={name: sha256(data) for name, data in files.items()})
+            else:  # the bytes already are this release (a hand install of it): only name them
+                atomic_write(install_dir / INSTALLED, json.dumps({**release, "files": hashes}, sort_keys=True).encode(),
+                             0o644, root)
         rel["error"] = None
-    except (HealError, OSError, ValueError, tarfile.TarError, EOFError, AttributeError, KeyError, TypeError) as e:
+    except Exception as e:  # noqa: BLE001 (a root pass persists its heal state whatever the network or release did)
         rel["error"] = re.sub(r"\s+", " ", str(e))[:300] or type(e).__name__
+    ident = load_json(install_dir / INSTALLED)
+    rel.update(tag=ident.get("tag"), commit=ident.get("commit"))
     if rel.get("wants") and rel.get("wants") != rel.get("tag"):
         rel.setdefault("behind_since", now)
     else:
@@ -837,7 +858,11 @@ def main(argv: list[str] | None = None) -> int:
             wait_for_exit(args.after_pid)
         if args.apply and not args.install and os.geteuid() == 0 \
                 and Path(__file__).resolve() == (INSTALL_DIR / SCRIPT_NAME).resolve():
-            finish_pair(INSTALL_DIR, root=True)  # before the policy loads: a swap a crash cut short
+            before = Path(__file__).read_bytes()
+            if finish_pair(INSTALL_DIR, root=True) and Path(__file__).read_bytes() != before:
+                # a swap a crash cut short, finished: run the pass with the code that goes with the new policy
+                os.execv(SYSTEM_PYTHON, [SYSTEM_PYTHON, "-I", os.fspath(INSTALL_DIR / SCRIPT_NAME),
+                                         *(sys.argv[1:] if argv is None else argv)])
         if args.status:
             out = install_status(args.policy)
         elif args.install:
