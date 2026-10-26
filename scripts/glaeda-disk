@@ -1178,29 +1178,34 @@ DEVBOX_TRANSCRIPT_DAYS = 30
 DEVBOX_TRANSCRIPT_DELETE_DAYS = 180
 
 
-def disk_policy(path: Path | None = None) -> dict[str, Any]:
-    """POLICY_DEFAULTS overlaid with DISK_POLICY; an unreadable file or a wrongly typed key keeps the default."""
-    policy = dict(POLICY_DEFAULTS)
+def policy_overrides(path: Path | None = None) -> dict[str, Any]:
+    """The keys DISK_POLICY sets, each with a value of its default's type; an unreadable file sets none."""
+    out: dict[str, Any] = {}
     try:
         doc = json.loads((DISK_POLICY if path is None else path).read_text())
     except (OSError, ValueError):
-        return policy
+        return out
     if isinstance(doc, dict):
         for key, default in POLICY_DEFAULTS.items():
             value = doc.get(key)
             if isinstance(default, bool):
                 if isinstance(value, bool):
-                    policy[key] = value
+                    out[key] = value
             elif isinstance(default, list):
                 if isinstance(value, list) and all(isinstance(v, str) and v for v in value):
-                    policy[key] = list(value)
+                    out[key] = list(value)
             elif isinstance(default, str):
                 if isinstance(value, str) and value:
-                    policy[key] = value
+                    out[key] = value
             elif isinstance(value, (int, float)) and not isinstance(value, bool) and value >= 0:
                 if math.isfinite(value):
-                    policy[key] = type(default)(value)
-    return policy
+                    out[key] = type(default)(value)
+    return out
+
+
+def disk_policy(path: Path | None = None) -> dict[str, Any]:
+    """POLICY_DEFAULTS overlaid with DISK_POLICY; an unreadable file or a wrongly typed key keeps the default."""
+    return {**POLICY_DEFAULTS, **policy_overrides(path)}
 
 
 POLICY = disk_policy()
@@ -1940,32 +1945,46 @@ def runner_checkout_last_use(runner: Path, checkout: Path) -> float:
     return max(times)
 
 
-GIT_LOCK_NAMES = ("index.lock", "HEAD.lock", "shallow.lock", "packed-refs.lock", "config.lock", "ORIG_HEAD.lock")
+GIT_LOCK_NAMES = ("index.lock", "HEAD.lock", "shallow.lock", "packed-refs.lock", "config.lock", "ORIG_HEAD.lock",
+                  "FETCH_HEAD.lock", "MERGE_HEAD", "REBASE_HEAD", "rebase-merge", "rebase-apply", "CHERRY_PICK_HEAD",
+                  "REVERT_HEAD", "BISECT_LOG", "sequencer")  # the home-clone set (HOME_CLONE_GIT_LOCKS) and more
 
 
 def runner_checkout_git_veto(checkout: Path) -> str:
-    """Why a stale runner checkout must stay for git's sake, or "": git holds a lock in it, or a commit there (HEAD, a
-    local branch or tag, the stash, any worktree's HEAD) is on no remote-tracking ref. Untracked and ignored files are
-    a job's build output and go with it. Any doubt (git fails or times out) keeps it."""
+    """Why a stale runner checkout must stay for git's sake, or "": git holds a lock or has an operation under way in
+    it or any of its worktrees (a lock file, MERGE_HEAD, a rebase or sequencer dir), or a commit there (HEAD, every
+    worktree's HEAD, a local branch or tag, the stash) is on no remote-tracking ref. Any doubt (git fails or times
+    out) keeps it.
+
+    What goes with it: untracked and ignored files (a job's build output), tracked edits and commits only a reflog
+    names. This is actions/checkout's own directory: the next job there runs `git clean -ffdx` and `git reset --hard`
+    and moves HEAD, so a runner checkout never carries those from one job to the next; deleting it loses only what
+    the runner would throw away itself."""
     dotgit = checkout / ".git"
     if dotgit.is_symlink() or not dotgit.is_dir():
         return "not a plain checkout (.git is not a directory)"
-    with contextlib.suppress(OSError):
-        for root, dirs, files in os.walk(dotgit):
-            dirs[:] = [d for d in dirs if d not in ("objects", "lfs", "logs")]
-            if any(f in GIT_LOCK_NAMES or (f.endswith(".lock") and "refs" in Path(root).relative_to(dotgit).parts)
-                   for f in files):
-                return "git holds a lock in it"
-    env = {**os.environ, "GIT_OPTIONAL_LOCKS": "0"}
     try:
-        tips = subprocess.run(["git", "-C", os.fspath(checkout), "for-each-ref", "--format=%(objectname)",
-                               "refs/heads", "refs/tags", "refs/stash"], capture_output=True, text=True, timeout=60,
-                              env=env, check=True).stdout.split()
-        local = subprocess.run(["git", "-C", os.fspath(checkout), "rev-list", "--max-count=1", "HEAD", *tips,
-                                "--not", "--remotes"], capture_output=True, text=True, timeout=120, env=env, check=True)
-    except (OSError, subprocess.SubprocessError):
+        for root, dirs, files in os.walk(dotgit):
+            rel = Path(root).relative_to(dotgit).parts
+            dirs[:] = [d for d in dirs if d not in ("objects", "lfs", "logs")]
+            if any(n in GIT_LOCK_NAMES for n in (*files, *dirs)) or any(
+                    f.endswith(".lock") and "refs" in rel for f in files):
+                return "git holds a lock in it"
+    except OSError:
+        return "git could not say whether it holds a lock"
+    env = {**os.environ, "GIT_OPTIONAL_LOCKS": "0"}
+
+    def git(*args: str, timeout: int = 60) -> str:
+        return subprocess.run(["git", "-C", os.fspath(checkout), *args], capture_output=True, text=True,
+                              timeout=timeout, env=env, check=True).stdout
+    try:
+        tips = git("for-each-ref", "--format=%(objectname)", "refs/heads", "refs/tags", "refs/stash").split()
+        heads = [ln.split(" ", 1)[1] for ln in git("worktree", "list", "--porcelain").splitlines()
+                 if ln.startswith("HEAD ")]
+        local = git("rev-list", "--max-count=1", "HEAD", *heads, *tips, "--not", "--remotes", timeout=120)
+    except (OSError, subprocess.SubprocessError, IndexError):
         return "git could not say whether a commit is only here"
-    return "a commit here is on no remote-tracking ref" if local.stdout.strip() else ""
+    return "a commit here is on no remote-tracking ref" if local.strip() else ""
 
 
 def idle_runner_checkout_veto(runner: Path, checkout: Path, opened: frozenset[str], cmds: str) -> str:
@@ -5330,10 +5349,12 @@ LEGACY_POLICY = {"soft_idle_hours": 24.0, "stale_marker_max_hours": 48.0, "cmux_
 
 
 def keep_legacy_ages() -> None:
-    """Put back the pre-12 h ages for this run (a reserved host). POLICY keys a disk-policy.json sets stay its own."""
+    """Put back the pre-12 h ages for this run (a reserved host). A POLICY key disk-policy.json sets stays its own,
+    even one set to the new default; so does one already changed in this run."""
     globals().update(LEGACY_AGES)
+    explicit = policy_overrides()
     for key, value in LEGACY_POLICY.items():
-        if POLICY.get(key) == POLICY_DEFAULTS.get(key):
+        if key not in explicit and POLICY.get(key) == POLICY_DEFAULTS.get(key):
             POLICY[key] = value
 
 

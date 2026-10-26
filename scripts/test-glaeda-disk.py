@@ -4511,6 +4511,18 @@ class GlaedaDiskTest(unittest.TestCase):
             git("commit", "-q", "--allow-empty", "-m", "local only")
         (co / "build-output.o").write_text("x")  # untracked build output never keeps a checkout
 
+    def _git_worktree_commit(self, co: Path) -> None:
+        """A detached linked worktree of co (inside its _work dir) with a commit no ref names."""
+        env = {"PATH": "/usr/bin:/bin:/opt/homebrew/bin", "HOME": os.fspath(self.root), "GIT_AUTHOR_NAME": "t",
+               "GIT_AUTHOR_EMAIL": "t@x", "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@x"}
+        wt = co.parent / "linked"
+        if wt.exists():
+            shutil.rmtree(wt)
+        subprocess.run(["git", "-C", os.fspath(co), "worktree", "add", "-q", "--detach", os.fspath(wt)], env=env,
+                       check=True, capture_output=True)
+        subprocess.run(["git", "-C", os.fspath(wt), "commit", "-q", "--allow-empty", "-m", "only in the worktree"],
+                       env=env, check=True, capture_output=True)
+
     def test_stale_runner_checkouts_go_above_the_floor_and_without_one(self) -> None:
         """Old runner work dirs go by age: a checkout no job used for DEFAULT_AGE_HOURS goes whatever the free space,
         unless git would lose something (a commit on no remote-tracking ref) or holds a lock; younger ones stay."""
@@ -4518,7 +4530,8 @@ class GlaedaDiskTest(unittest.TestCase):
         self.assertEqual(stale, 12.0)
         names = {"actions-runner-glaeda": stale + 1, "actions-runner-glaeda-2": stale + 30,
                  "actions-runner-glaeda-3": stale - 1, "actions-runner-glaeda-4": stale + 2,
-                 "actions-runner-glaeda-5": stale + 3}
+                 "actions-runner-glaeda-5": stale + 3, "actions-runner-glaeda-6": stale + 3,
+                 "actions-runner-glaeda-7": stale + 3, "actions-runner-glaeda-8": stale + 3}
         home, cos = self._idle_checkouts(names)
         gd.process_evidence = lambda: ([], "")
         for floor in (30.0, 0.0):
@@ -4527,6 +4540,12 @@ class GlaedaDiskTest(unittest.TestCase):
                     self._git_checkout(cos[name], pushed=name != "actions-runner-glaeda-4")
                     if name == "actions-runner-glaeda-5":
                         (cos[name] / ".git/index.lock").write_text("")
+                    if name == "actions-runner-glaeda-6":
+                        (cos[name] / ".git/FETCH_HEAD.lock").write_text("")
+                    if name == "actions-runner-glaeda-7":
+                        (cos[name] / ".git/rebase-merge").mkdir()
+                    if name == "actions-runner-glaeda-8":  # a linked worktree holds the only copy of a commit
+                        self._git_worktree_commit(cos[name])
                     self._age(home / name, hours=age)
                 patches, removed = self._floor_disk(400.0)  # far above the floor and its target
                 receipt = self.receipt()
@@ -4534,13 +4553,18 @@ class GlaedaDiskTest(unittest.TestCase):
                     self.assertGreater(gd.evict_idle_runner_checkouts(receipt, floor, home), 0)
                 self.assertEqual(sorted(removed), sorted([str(cos["actions-runner-glaeda-2"]),
                                                           str(cos["actions-runner-glaeda"])]))
-                for name in ("actions-runner-glaeda-3", "actions-runner-glaeda-4", "actions-runner-glaeda-5"):
+                for name in ("actions-runner-glaeda-3", "actions-runner-glaeda-4", "actions-runner-glaeda-5",
+                             "actions-runner-glaeda-6", "actions-runner-glaeda-7", "actions-runner-glaeda-8"):
                     self.assertTrue((cos[name] / ".git").is_dir(), name)
                 self.assertIn("unused for 12 h", out.getvalue())
                 why = {Path(r["path"]).parts[-4]: (r["outcome"], r["reasons"][0])
                        for r in map(json.loads, receipt.read_text().splitlines())}
                 self.assertEqual(why["actions-runner-glaeda-4"], ("blocked:git", "a commit here is on no remote-tracking ref"))
                 self.assertEqual(why["actions-runner-glaeda-5"], ("blocked:git", "git holds a lock in it"))
+                self.assertEqual(why["actions-runner-glaeda-6"], ("blocked:git", "git holds a lock in it"))
+                self.assertEqual(why["actions-runner-glaeda-7"], ("blocked:git", "git holds a lock in it"))
+                self.assertEqual(why["actions-runner-glaeda-8"],
+                                 ("blocked:git", "a commit here is on no remote-tracking ref"))
                 self.assertEqual(why["actions-runner-glaeda"], ("reclaimed", "unused for 12 h"))
 
     def test_every_disposable_age_is_twelve_hours(self) -> None:
@@ -6319,6 +6343,18 @@ class HostReservationTest(unittest.TestCase):
             self.assertEqual(gd.POLICY["stale_marker_max_hours"], 5.0, "a disk-policy.json value stays")
         self.assertEqual((gd.DEFAULT_AGE_HOURS, gd.CMUX_NEXT_CI_MIN_IDLE_HOURS, gd.RUNTIME_IDLE_DAYS), (24.0, 72.0, 14.0))
         self.assertEqual(gd.RUNNER_STALE_CHECKOUT_HOURS, float("inf"), "no above-floor checkout eviction")
+
+    def test_a_disk_policy_key_set_to_the_new_default_stays_on_a_reserved_host(self) -> None:
+        saved = {n: getattr(gd, n) for n in gd.LEGACY_AGES}
+        self.addCleanup(lambda: [setattr(gd, n, v) for n, v in saved.items()])
+        policy = Path(tempfile.mkdtemp()) / "disk-policy.json"
+        self.addCleanup(shutil.rmtree, policy.parent)
+        policy.write_text(json.dumps({"soft_idle_hours": 12, "stale_marker_max_hours": "twelve"}))
+        with mock.patch.object(gd, "DISK_POLICY", policy), mock.patch.dict(gd.POLICY, gd.disk_policy(policy)):
+            self.assertEqual(gd.policy_overrides(), {"soft_idle_hours": 12.0})
+            gd.keep_legacy_ages()
+            self.assertEqual(gd.POLICY["soft_idle_hours"], 12.0, "set explicitly, even to the new default")
+            self.assertEqual(gd.POLICY["stale_marker_max_hours"], 48.0, "a wrongly typed key is not a setting")
 
     def test_the_shipped_list_parses_and_matches_the_registry_where_it_is_checked_out(self) -> None:
         shipped = json.loads((ROOT / "config/fleet-reservations.json").read_text())
