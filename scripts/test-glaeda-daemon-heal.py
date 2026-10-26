@@ -158,6 +158,11 @@ class Policy(unittest.TestCase):
         finally:
             heal.sh = real
         self.assertEqual(len(calls), 1, "no pids: top is not run")
+        heal.sh = lambda argv, timeout=15: (1, top, "top: failure")
+        try:
+            self.assertEqual(heal.Host().footprints([427]), {}, "a failed top measures nothing, whatever it printed")
+        finally:
+            heal.sh = real
         self.assertEqual(calls[0][:2], ["/usr/bin/top", "-l"])
         self.assertEqual([calls[0][i + 1] for i, a in enumerate(calls[0]) if a == "-pid"], ["1", "427"])
 

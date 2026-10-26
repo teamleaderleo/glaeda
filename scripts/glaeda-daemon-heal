@@ -154,8 +154,11 @@ class Host:
         argv = ["/usr/bin/top", "-l", "1", "-s", "0", "-stats", "pid,mem"]
         for pid in pids:
             argv += ["-pid", str(pid)]
+        code, text, _err = sh(argv, timeout=30)
+        if code != 0:  # a failed top measured nothing, whatever it printed
+            return {}
         out = {}
-        for line in sh(argv, timeout=30)[1].splitlines():
+        for line in text.splitlines():
             parts = line.split()
             if len(parts) == 2 and parts[0].isdigit() and int(parts[0]) in pids:
                 size = footprint_bytes(parts[1])
