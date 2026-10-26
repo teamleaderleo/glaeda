@@ -7761,13 +7761,18 @@ def _main_impl(argv: list[str] | None = None) -> int:
         # Before the cap's du (10-20 s on a mini): a run that would only find evict.lock taken stops here. Another
         # caller's pressure run (the LaunchAgent's, idle-repair's) joins the runner hook's queue while a hook pass is
         # under way, so that pass serves it with its one follow-up rather than this run skipping as busy.
-        if a.apply and not a.cmux_next_drain and not RUNNER_CACHE_PROFILE and not EMERGENCY_DEVS:
+        if a.apply and not a.cmux_next_drain and not RUNNER_CACHE_PROFILE:
+            # the trigger is written while the pass holds its lock, and the lock is probed again after: a pass that
+            # let go in between may have checked for triggers already, so this run then does the work itself
             if os.environ.get(HOOK_PASS_ENV) != "1" and hook_pass_running():
+                joined = False
                 with contextlib.suppress(OSError):
                     HOOK_PASS_PENDING.touch()
-                print("a runner hook pass is under way; this run joins its queue")
-                RUN["skipped"] = COALESCED_INTO_HOOK
-                return 0
+                    joined = hook_pass_running()
+                if joined:
+                    print("a runner hook pass is under way; this run joins its queue")
+                    RUN["skipped"] = COALESCED_INTO_HOOK
+                    return 0
             if eviction_lock_is_held():
                 owner = eviction_owner_status()
                 RUN["evict_owner"] = owner

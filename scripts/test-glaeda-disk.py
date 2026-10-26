@@ -4208,22 +4208,43 @@ class GlaedaDiskTest(unittest.TestCase):
         lock, pending, p_lock, p_pending = self._queue()
         with p_lock, p_pending, lock.open("a") as held, \
                 mock.patch.dict(os.environ, {gd.CALLER_ENV: "disk-pressure LaunchAgent"}), \
-                mock.patch.object(gd, "cmux_next_ci_cap_state") as cap:
+                mock.patch.object(gd, "cmux_next_ci_cap_state", return_value=None) as cap:
             os.environ.pop(gd.HOOK_PASS_ENV, None)
             fcntl.flock(held, fcntl.LOCK_EX)
-            status, rows, survey, _ = self._main_run(["--pressure", "--idle", "--apply"])
+            status, rows, survey, _ = self._main_run(["--pressure", "--idle", "--apply"], free_gib=100.0)
         self.assertEqual(status, 0)
         self.assertEqual((rows[-1]["skipped"], rows[-1]["caller"]), (gd.COALESCED_INTO_HOOK, "disk-pressure LaunchAgent"))
         self.assertTrue(pending.exists(), "the running hook pass serves this trigger with its follow-up")
         survey.assert_not_called()
         cap.assert_not_called()
 
+    def test_a_queue_join_that_loses_the_race_to_the_pass_ending_runs_itself(self) -> None:
+        """The hook pass can let go of its lock after the probe and before it re-checks the trigger; the run then
+        sees the lock free on its second look and does the work itself, so no trigger waits for nobody."""
+        lock, pending, p_lock, p_pending = self._queue()
+        probes = iter([True, False])
+        with p_lock, p_pending, mock.patch.object(gd, "hook_pass_running", side_effect=lambda: next(probes)), \
+                mock.patch.object(gd, "cmux_next_ci_cap_state", return_value=None):
+            os.environ.pop(gd.HOOK_PASS_ENV, None)
+            status, rows, survey, _ = self._main_run(["--pressure", "--apply"], free_gib=100.0)
+        self.assertEqual((status, rows[-1]["skipped"]), (0, None))
+        survey.assert_called()
+
+    def test_an_emergency_run_joins_the_queue_too(self) -> None:
+        """Below the emergency mark the hook's pass deletes the same way, so the LaunchAgent's run still joins it."""
+        lock, pending, p_lock, p_pending = self._queue()
+        with p_lock, p_pending, lock.open("a") as held, mock.patch.object(gd, "cmux_next_ci_cap_state", return_value=None):
+            os.environ.pop(gd.HOOK_PASS_ENV, None)
+            fcntl.flock(held, fcntl.LOCK_EX)
+            _, rows, _, _ = self._main_run(["--pressure", "--apply"], free_gib=20.0)
+        self.assertEqual(rows[-1]["skipped"], gd.COALESCED_INTO_HOOK)
+
     def test_the_hook_pass_itself_and_floor_evictions_are_never_queued(self) -> None:
         lock, pending, p_lock, p_pending = self._queue()
         with p_lock, p_pending, lock.open("a") as held, mock.patch.dict(os.environ, {gd.HOOK_PASS_ENV: "1"}), \
                 mock.patch.object(gd, "cmux_next_ci_cap_state", return_value=None):
             fcntl.flock(held, fcntl.LOCK_EX)
-            status, rows, survey, _ = self._main_run(["--pressure", "--apply"])
+            status, rows, survey, _ = self._main_run(["--pressure", "--apply"], free_gib=100.0)
         self.assertEqual((status, rows[-1]["skipped"]), (0, None))
         self.assertFalse(pending.exists())
         survey.assert_called()
@@ -4234,12 +4255,12 @@ class GlaedaDiskTest(unittest.TestCase):
         _, _, p_lock, p_pending = self._queue()
         lock = self.root / "evict.lock"
         with p_lock, p_pending, lock.open("a") as held, mock.patch.dict(os.environ, {gd.CALLER_ENV: "test"}), \
-                mock.patch.object(gd, "cmux_next_ci_cap_state") as cap:
+                mock.patch.object(gd, "cmux_next_ci_cap_state", return_value=None) as cap:
             fcntl.flock(held, fcntl.LOCK_EX)
             (self.root / "evict.owner.json").write_text(json.dumps({
                 "pid": os.getpid(), "owner": "cmux", "started_at": time.time() - 60,
                 "command": "glaeda-disk --pressure --apply --top 0"}))
-            status, rows, survey, _ = self._main_run(["--pressure", "--apply"])
+            status, rows, survey, _ = self._main_run(["--pressure", "--apply"], free_gib=100.0)
         self.assertEqual(status, 0)
         row = rows[-1]
         self.assertEqual((row["skipped"], row["caller"]), ("eviction_busy", "test"))

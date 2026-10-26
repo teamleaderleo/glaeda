@@ -503,7 +503,8 @@ class HookTest(unittest.TestCase):
                                env={"GLAEDA_RUNNER_DISK_TIMEOUT": "1"})
         self.assertEqual(result.returncode, 0, result.stdout)
         self.assertLess(time.monotonic() - start, 10)
-        self.assertIn("timed out", result.stdout)
+        self.assertIn("glaeda-disk started in the background", result.stdout)  # the queued pass, never waited on
+        self.assertTrue(wait_for_path(marker))
         self.assertEqual(marker.read_text(), "--pressure --apply --top 0")
         for phase in ("job-started", "job-completed"):
             result = self.run_hook(phase, "push", push, "--allowed-repo", "manaflow-ai/cmux",
