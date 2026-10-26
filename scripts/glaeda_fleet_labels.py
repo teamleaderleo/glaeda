@@ -259,7 +259,7 @@ def member_labels(manifest: Any, member: str, xcode_ok: Callable[[dict[str, Any]
     labels = [MINI_LABEL, f"glaeda-class-{klass}", f"glaeda-{availability}",
               *(["glaeda-trusted"] if trusted_ref else []),
               *(["glaeda-trusted-next-nightly"] if next_nightly else []),
-              *[f"xcode-{v}" for v in versions], *pools, *dev_pools,
+              *[f"xcode-{v}" for v in versions], *pools,
               *([IOS_SIM_LABEL] if ios_sim else []),
               *([macos_label(macos_major)] if isinstance(macos_major, str)
                 and re.fullmatch(MACOS_MAJOR_RE, macos_major) else [])]
@@ -300,6 +300,8 @@ def member_labels(manifest: Any, member: str, xcode_ok: Callable[[dict[str, Any]
     if compile_slots > roots:
         return None, (f"runner.classes.{klass}.compileSlots {compile_slots} needs canonicalRoots {compile_slots} "
                       "(every compile holds a root)")
+    if dev_compile and roots + gui + fast >= runners:
+        return None, f"{member} runner.devCompile needs an existing side instance after canonicalRoots"
     return {"member": member, "class": klass, "availability": availability, "roles": roles,
             "labels": list(dict.fromkeys(labels)), "pools": list(dict.fromkeys(pools)),
             "devPools": list(dict.fromkeys(dev_pools)),
@@ -307,7 +309,7 @@ def member_labels(manifest: Any, member: str, xcode_ok: Callable[[dict[str, Any]
             "hardware": hardware, "xcodeApps": [str(a.get("path")) for a in ready], "iosSim": ios_sim,
             "runners": runners, "capacityUnits": units, "compileSlots": compile_slots,
             "trustedRef": trusted_ref, "trustedRepo": trusted_repo, "trustedNextNightly": next_nightly,
-            "devCompile": dev_compile,
+            "devCompile": dev_compile, "devCompileInstance": roots if dev_compile else None,
             "canonicalRoots": roots, "rootPools": [root_label(label) for label in dict.fromkeys(pools)],
             "sidePools": list(dict.fromkeys(side_label(pool_label(k, v, bool(trusted_ref), normal_pool_prefix))
                                             for v in (versions if pools else []) for k in side_classes(klass))),
@@ -324,6 +326,6 @@ def declared_pools(manifest: Any, xcode_ok: Callable[[str, dict[str, Any]], bool
     for member in hosts if isinstance(hosts, dict) else {}:
         check = (lambda app, m=member: xcode_ok(m, app)) if xcode_ok else (lambda app: True)
         summary, _ = member_labels(manifest, member, check)
-        for label in (summary or {}).get("pools", []):
+        for label in [*(summary or {}).get("pools", []), *(summary or {}).get("devPools", [])]:
             out.setdefault(label, []).append(member)
     return {label: sorted(members) for label, members in sorted(out.items())}

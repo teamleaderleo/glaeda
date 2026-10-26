@@ -5980,7 +5980,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--trusted-next-nightly", action="store_true",
                    help="also admit only cmux nightly-next's exact nightly app push on attempt 1")
     p.add_argument("--dev-compile-runner", action="store_true",
-                   help="admit only cmux NEXT DEV Release compile jobs")
+                   help="this instance admits only cmux NEXT DEV Release compile jobs (shared host capacity)")
     p.add_argument("--disk", help="glaeda-disk path (default: PATH, then ~/.local/bin)")
     p.add_argument("--no-disk", action="store_true")
     p.add_argument("--no-telemetry", action="store_true", help="do not sample the host while the job runs")
