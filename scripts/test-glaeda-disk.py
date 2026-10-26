@@ -4569,6 +4569,25 @@ class GlaedaDiskTest(unittest.TestCase):
                                  ("blocked:git", "a commit here is on no remote-tracking ref"))
                 self.assertEqual(why["actions-runner-glaeda"], ("reclaimed", "unused for 12 h"))
 
+    def test_the_git_veto_ignores_the_callers_git_env_and_keeps_what_it_cannot_read(self) -> None:
+        co = self.root / "veto/_work/cmux/cmux"
+        self._git_checkout(co, pushed=False)
+        other = self.root / "other"
+        self._git_checkout(other, pushed=True)
+        with mock.patch.dict(os.environ, {"GIT_DIR": os.fspath(other / ".git"), "GIT_WORK_TREE": os.fspath(other)}):
+            self.assertEqual(gd.runner_checkout_git_veto(co), "a commit here is on no remote-tracking ref")
+        self._git_checkout(co, pushed=True)
+        self.assertEqual(gd.runner_checkout_git_veto(co), "")
+        locked = co / ".git/worktrees/hidden"
+        locked.mkdir(parents=True)
+        locked.chmod(0)
+        try:  # tearDown removes the tree before any addCleanup runs, so the mode goes back here
+            if os.access(locked, os.R_OK):
+                self.skipTest("running as a user who can read a mode-0 directory")
+            self.assertEqual(gd.runner_checkout_git_veto(co), "git could not say whether it holds a lock")
+        finally:
+            locked.chmod(0o755)
+
     def test_every_disposable_age_is_twelve_hours(self) -> None:
         """Leo, 2026-10-26: "When have we ever had something useful greater than 12 hours?" Only the newest warm
         compile cache per builder (the per-host cmux-next root) is exempt, by role."""

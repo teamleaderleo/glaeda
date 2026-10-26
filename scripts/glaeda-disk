@@ -1963,8 +1963,11 @@ def runner_checkout_git_veto(checkout: Path) -> str:
     dotgit = checkout / ".git"
     if dotgit.is_symlink() or not dotgit.is_dir():
         return "not a plain checkout (.git is not a directory)"
+    def unreadable(error: OSError) -> None:
+        raise error  # a directory git keeps state in that cannot be read is doubt, and doubt keeps it
+
     try:
-        for root, dirs, files in os.walk(dotgit):
+        for root, dirs, files in os.walk(dotgit, onerror=unreadable):
             rel = Path(root).relative_to(dotgit).parts
             dirs[:] = [d for d in dirs if d not in ("objects", "lfs", "logs")]
             if any(n in GIT_LOCK_NAMES for n in (*files, *dirs)) or any(
@@ -1972,7 +1975,9 @@ def runner_checkout_git_veto(checkout: Path) -> str:
                 return "git holds a lock in it"
     except OSError:
         return "git could not say whether it holds a lock"
-    env = {**os.environ, "GIT_OPTIONAL_LOCKS": "0"}
+    # the caller's GIT_* would override -C (a hook's GIT_DIR names one repository for every checkout)
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    env.update(GIT_OPTIONAL_LOCKS="0", GIT_TERMINAL_PROMPT="0")
 
     def git(*args: str, timeout: int = 60) -> str:
         return subprocess.run(["git", "-C", os.fspath(checkout), *args], capture_output=True, text=True,
