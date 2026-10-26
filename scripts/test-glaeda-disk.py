@@ -4218,17 +4218,34 @@ class GlaedaDiskTest(unittest.TestCase):
         survey.assert_not_called()
         cap.assert_not_called()
 
-    def test_a_queue_join_that_loses_the_race_to_the_pass_ending_runs_itself(self) -> None:
-        """The hook pass can let go of its lock after the probe and before it re-checks the trigger; the run then
-        sees the lock free on its second look and does the work itself, so no trigger waits for nobody."""
+    def test_a_run_that_takes_the_hook_lock_holds_it_and_serves_the_waiting_triggers(self) -> None:
+        """A run that finds the hook's lock free takes it for its whole run, so a hook pass started meanwhile only
+        queues behind it, and it clears the triggers it served (and only when it did its pass)."""
         lock, pending, p_lock, p_pending = self._queue()
-        probes = iter([True, False])
-        with p_lock, p_pending, mock.patch.object(gd, "hook_pass_running", side_effect=lambda: next(probes)), \
+        claimed = Path(f"{pending}.claimed")
+        seen = []
+
+        def working(*_a, **_k) -> None:
+            seen.append(hook_held())
+
+        def hook_held() -> bool:
+            with lock.open("a") as probe:
+                try:
+                    fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    return True
+                return False
+
+        pending.touch()
+        with p_lock, p_pending, mock.patch.object(gd, "HOOK_PASS_CLAIMED", claimed), \
                 mock.patch.object(gd, "cmux_next_ci_cap_state", return_value=None):
             os.environ.pop(gd.HOOK_PASS_ENV, None)
-            status, rows, survey, _ = self._main_run(["--pressure", "--apply"], free_gib=100.0)
+            with mock.patch.object(gd, "write_health_summary", side_effect=working):
+                status, rows, _, _ = self._main_run(["--pressure", "--apply"], free_gib=100.0)
         self.assertEqual((status, rows[-1]["skipped"]), (0, None))
-        survey.assert_called()
+        self.assertTrue(seen and all(seen), "the hook lock is held while the run works")
+        self.assertFalse(pending.exists() or claimed.exists(), "the triggers it served are cleared")
+        self.assertFalse(hook_held(), "and the lock is let go")
 
     def test_an_emergency_run_joins_the_queue_too(self) -> None:
         """Below the emergency mark the hook's pass deletes the same way, so the LaunchAgent's run still joins it."""

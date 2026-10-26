@@ -211,6 +211,8 @@ EVICT_LOCK = HOME / ".cache/glaeda-disk/evict.lock"  # one --apply at a time (th
 HOOK_PASS_LOCK = HOME / ".cache/glaeda-disk/hook-pass.lock"
 HOOK_PASS_PENDING = HOME / ".cache/glaeda-disk/hook-pass.pending"
 HOOK_PASS_ENV = "GLAEDA_DISK_HOOK_PASS"  # "1" in the hook's own pass and its floor evictions: never queued
+# Any other --pressure --apply run (the LaunchAgent's, idle-repair's) takes HOOK_PASS_LOCK itself (take_hook_pass), so
+# it and the hook's pass never overlap, or leaves its trigger to the pass that holds it.
 CALLER_ENV = "GLAEDA_DISK_CALLER"  # who started this run, for its run line; else the parent's command
 COALESCED_INTO_HOOK = "coalesced into the running pass (glaeda-disk)"
 EVICT_OWNER = HOME / ".cache/glaeda-disk/evict.owner.json"
@@ -609,7 +611,7 @@ CMUX_NEXT_DRAIN_HOOK_SHA256 = frozenset({
     "9809f36fece71390cf0070407c0d2d960b9a9c2c825581ed478a297a89ec3129",
     "d5e73be990d67d9499ff352d01fda2e1392a6fd257a57770b23008b3bf55fb59",
     "0c2c8880e3b17af8324f8304121c4159bee8ade5c31496b9af713586cb90bcfc",
-    "dc5e1755387544fdb18f04f8e863251b8f01b2540f9b84cf469553c50acb0928",
+    "c86d26adb83d1be3336bdfa7df57fc3e401c04e81236f8edf23d08d51ad06608",
 })
 CMUX_NEXT_CI_PRESERVED_NAMES = frozenset({
     "SourcePackages", "ModuleCache.noindex", "SDKStatCaches.noindex",
@@ -1047,21 +1049,56 @@ def run_caller() -> str:
     return (out or f"pid {os.getppid()}")[:120]
 
 
-def hook_pass_running() -> bool:
-    """True when the runner hook's pass process holds HOOK_PASS_LOCK (a non-blocking probe that keeps nothing)."""
+HOOK_PASS_CLAIMED = Path(f"{HOOK_PASS_PENDING}.claimed")
+_HOOK_PASS_FD: int | None = None  # HOOK_PASS_LOCK, held for the rest of this run once taken (take_hook_pass)
+
+
+def take_hook_pass() -> bool | None:
+    """Take the runner hook's one-pass-at-a-time lock for this run, as the hook's pass process does: True when taken
+    (held until this process exits, so no hook pass overlaps it; the triggers waiting are claimed for it), False when
+    a pass holds it (this run's trigger is then left for that pass, which serves it with its follow-up), None when
+    the lock cannot be used (the run goes on as before). The trigger is written before the second try, so a pass that
+    lets go in between either sees it or leaves the lock to this run."""
+    global _HOOK_PASS_FD
     try:
-        fd = os.open(HOOK_PASS_LOCK, os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK)
+        HOOK_PASS_LOCK.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(HOOK_PASS_LOCK, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
     except OSError:
-        return False
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
+        return None
+    for attempt in range(2):
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            if attempt:
+                os.close(fd)
+                return False
+            try:
+                os.close(os.open(HOOK_PASS_PENDING, os.O_WRONLY | os.O_CREAT, 0o600))
+            except OSError:
+                os.close(fd)
+                return None  # no trigger to leave: run anyway rather than drop it
+            continue
+        except OSError:
+            os.close(fd)
+            return None
+        _HOOK_PASS_FD = fd
+        with contextlib.suppress(OSError):
+            os.replace(HOOK_PASS_PENDING, HOOK_PASS_CLAIMED)  # served by this run, which starts after them
         return True
-    except OSError:
-        return False
-    finally:
-        os.close(fd)
     return False
+
+
+def release_hook_pass(served: bool) -> None:
+    """Let go of the hook's lock; the claimed triggers are cleared only when this run did its pass."""
+    global _HOOK_PASS_FD
+    if _HOOK_PASS_FD is None:
+        return
+    if served:
+        with contextlib.suppress(OSError):
+            HOOK_PASS_CLAIMED.unlink()
+    with contextlib.suppress(OSError):
+        os.close(_HOOK_PASS_FD)
+    _HOOK_PASS_FD = None
 
 
 def config_sha256(disk: Path | None = None, policy: Path | None = None) -> str:
@@ -7761,18 +7798,12 @@ def _main_impl(argv: list[str] | None = None) -> int:
         # Before the cap's du (10-20 s on a mini): a run that would only find evict.lock taken stops here. Another
         # caller's pressure run (the LaunchAgent's, idle-repair's) joins the runner hook's queue while a hook pass is
         # under way, so that pass serves it with its one follow-up rather than this run skipping as busy.
+        if a.apply and not a.cmux_next_drain and not RUNNER_CACHE_PROFILE \
+                and os.environ.get(HOOK_PASS_ENV) != "1" and take_hook_pass() is False:
+            print("a runner hook pass is under way; this run joins its queue")
+            RUN["skipped"] = COALESCED_INTO_HOOK
+            return 0
         if a.apply and not a.cmux_next_drain and not RUNNER_CACHE_PROFILE:
-            # the trigger is written while the pass holds its lock, and the lock is probed again after: a pass that
-            # let go in between may have checked for triggers already, so this run then does the work itself
-            if os.environ.get(HOOK_PASS_ENV) != "1" and hook_pass_running():
-                joined = False
-                with contextlib.suppress(OSError):
-                    HOOK_PASS_PENDING.touch()
-                    joined = hook_pass_running()
-                if joined:
-                    print("a runner hook pass is under way; this run joins its queue")
-                    RUN["skipped"] = COALESCED_INTO_HOOK
-                    return 0
             if eviction_lock_is_held():
                 owner = eviction_owner_status()
                 RUN["evict_owner"] = owner
@@ -8085,9 +8116,12 @@ def _logged_main(args: list[str]) -> int:
     RUN["caller"] = run_caller()
     started, before = time.time(), _home_free()
     try:
-        return _main_impl(args)
+        status = _main_impl(args)
+        release_hook_pass(served=status == 0 and RUN.get("skipped") not in ("eviction_busy", "measurement_busy"))
+        return status
     except BaseException as e:
         RUN.setdefault("skipped", f"error: {type(e).__name__}")
+        release_hook_pass(served=False)
         raise
     finally:
         if RUN.get("apply"):

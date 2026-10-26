@@ -3886,7 +3886,8 @@ class DiskPassCoalesceTest(unittest.TestCase):
         hook.disk_skip_line(hook.HOOK_SKIP_COALESCED, 12.0, None)
         row = json.loads(self.log.read_text().splitlines()[-1])
         for key in ("at", "host", "mode", "off", "free_gib_before", "free_gib_after", "target_gib", "target_bytes",
-                    "targets", "default_targets", "config_sha256", "floor_gib", "reclaimed_gib", "reached", "blocked",
+                    "targets", "default_targets", "config_sha256", "caller", "evict_owner", "floor_gib",
+                    "reclaimed_gib", "reached", "blocked",
                     "duration_s", "skipped", "cmux_next_ci_over_gib"):
             self.assertIn(key, row)
 
@@ -3900,6 +3901,12 @@ class DiskPassCoalesceTest(unittest.TestCase):
         self.pending.touch()
         self.assertEqual(self.bound(disk).wait(30), 0)
         self.assertEqual(seen.read_text(), "1 runner hook pass")
+
+    def test_a_pass_that_exits_nonzero_keeps_its_trigger(self) -> None:
+        disk = make_executable(self.dir / "glaeda-disk", "import sys\nsys.exit(1)\n")
+        self.pending.touch()
+        self.assertEqual(self.bound(disk, lifetime=2).wait(30), 0)
+        self.assertTrue(self.waiting())
 
     def test_floor_evictions_are_never_queued(self) -> None:
         env = hook.floor_disk_env("runner hook floor eviction")

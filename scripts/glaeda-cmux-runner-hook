@@ -5691,13 +5691,13 @@ def run_pass():
     if not evict_free(deadline) or deadline - time.monotonic() <= 0:
         return False
     try:
-        out = subprocess.run(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                             timeout=deadline - time.monotonic(), check=False).stdout or b""
+        done = subprocess.run(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                              timeout=deadline - time.monotonic(), check=False)
     except subprocess.TimeoutExpired:
         return True  # it ran, cut at its bound
     except OSError:
         return False  # glaeda-disk did not start: keep the trigger
-    return not any(busy in out for busy in BUSY)
+    return done.returncode == 0 and not any(busy in (done.stdout or b"") for busy in BUSY)
 
 try:
     held = os.open(lock, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
@@ -5823,7 +5823,7 @@ def disk_skip_line(why: str, free: float, targets: dict[str, int] | None) -> Non
            "free_gib_before": round(free, 1), "free_gib_after": round(free, 1),
            "target_gib": None if home is None else round(home / 1024**3, 1), "target_bytes": home,
            "targets": targets, "default_targets": False, "config_sha256": None, "floor_gib": None,
-           "reclaimed_gib": 0.0,
+           "caller": "runner hook trigger", "evict_owner": None, "reclaimed_gib": 0.0,
            "reached": None if home is None else free * 1024**3 >= home,
            "blocked": {}, "duration_s": 0.0, "skipped": why, "cmux_next_ci_over_gib": None}
     with contextlib.suppress(OSError):
