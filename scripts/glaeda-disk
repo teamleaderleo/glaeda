@@ -2202,6 +2202,25 @@ def transcript_candidates(root: Path, archives: bool = False) -> list[Path]:
     return found
 
 
+# The hq build workers' shared cache: the dedicated dev-build worker (cmuxterm-hq#661) and the lent worker
+# on borrowed minis (ai.manaflow.cmux-lent-worker, CMUX_CI_SHARED_CACHE_DIR) both build in it. It is
+# retired, and reclaimable, only while neither service is loaded. Naming only the dev-build worker
+# labelled the lent minis' live cmux-workspaces "RETIRED" (cmux12s, 2026-10-11).
+# A retired worker's checkouts are mirrors as a reload unit's are: cmux-workspaces/<key>/src is a clone the
+# worker synced from GitHub, swiftpm holds SwiftPM's own clones, and no person edits either. So once an entry
+# sat idle a week, no git check keeps it, and a tree too deep to search (cmux-tui-target, a cargo target dir)
+# is not kept as "unchecked" either. A fleet lease or running job that names an entry still keeps it, as in
+# fleet-artifacts over the same directory. cmux14 sat at the 30 GiB floor with 0.0G reclaimable while
+# cmux-workspaces (11.6 GiB, idle 190 h), cmux-tui-target (4.2 GiB, 289 h) and swiftpm (3.9 GiB, 310 h) of
+# its unloaded workers read "git-checkout" and "unchecked" (2026-10-25).
+def hq_cache_family(root: Path | None = None) -> Family:
+    return Family(HQ_CACHE_FAMILY, FLEET_ROOT / "cache" if root is None else root, True,
+                  "the hq build worker rebuilds its cache", retired_only=True,
+                  owner="cmux dev-build and lent build workers (hq controller)",
+                  owner_job=HQ_BUILD_WORKERS, mirror_idle_hours=CMUX_JOB_MIRROR_HOURS,
+                  reference_root=FLEET_ROOT if root is None else root.parent, platform="macos")
+
+
 def default_families(role: str = "fleet-mini") -> list[Family]:
     tmp = Path("/private/tmp") if DARWIN else Path("/tmp")
     tmpfs = tmp.is_dir() and fs_type(tmp) == "tmpfs"
@@ -2291,22 +2310,7 @@ def default_families(role: str = "fleet-mini") -> list[Family]:
                            app_clones=True, build_output=True, min_idle_hours=2.0,
                            owner="Chromium-based apps, one bundle copy per launch",
                            rebuild_minutes=0.5, platform="macos"))
-    # The hq build workers' shared cache: the dedicated dev-build worker (cmuxterm-hq#661) and the lent worker
-    # on borrowed minis (ai.manaflow.cmux-lent-worker, CMUX_CI_SHARED_CACHE_DIR) both build in it. It is
-    # retired, and reclaimable, only while neither service is loaded. Naming only the dev-build worker
-    # labelled the lent minis' live cmux-workspaces "RETIRED" (cmux12s, 2026-10-11).
-    # A retired worker's checkouts are mirrors as a reload unit's are: cmux-workspaces/<key>/src is a clone the
-    # worker synced from GitHub, swiftpm holds SwiftPM's own clones, and no person edits either. So once an entry
-    # sat idle a week, no git check keeps it, and a tree too deep to search (cmux-tui-target, a cargo target dir)
-    # is not kept as "unchecked" either. A fleet lease or running job that names an entry still keeps it, as in
-    # fleet-artifacts over the same directory. cmux14 sat at the 30 GiB floor with 0.0G reclaimable while
-    # cmux-workspaces (11.6 GiB, idle 190 h), cmux-tui-target (4.2 GiB, 289 h) and swiftpm (3.9 GiB, 310 h) of
-    # its unloaded workers read "git-checkout" and "unchecked" (2026-10-25).
-    fams.append(Family(HQ_CACHE_FAMILY, Path("/Users/Shared/cmux-build-fleet/cache"), True,
-                       "the hq build worker rebuilds its cache", retired_only=True,
-                       owner="cmux dev-build and lent build workers (hq controller)",
-                       owner_job=HQ_BUILD_WORKERS, mirror_idle_hours=CMUX_JOB_MIRROR_HOURS,
-                       reference_root=FLEET_ROOT, platform="macos"))
+    fams.append(hq_cache_family())
     bazel_user = ""
     with contextlib.suppress(KeyError):
         bazel_user = pwd.getpwuid(uid).pw_name

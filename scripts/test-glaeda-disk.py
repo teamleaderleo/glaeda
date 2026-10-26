@@ -6,7 +6,6 @@ from __future__ import annotations
 import importlib.machinery
 import importlib.util
 import contextlib
-import dataclasses
 import collections
 import fcntl
 import hashlib
@@ -1454,12 +1453,14 @@ class GlaedaDiskTest(unittest.TestCase):
     def test_a_retired_workers_cache_entries_idle_a_week_are_mirrors(self) -> None:
         """cmux14, 2026-10-25: at the 30 GiB floor with 0.0G reclaimable, while its unloaded hq workers'
         cmux-workspaces (idle 190 h), cmux-tui-target (289 h) and swiftpm (310 h) read git-checkout or unchecked."""
-        real = next(f for f in gd.default_families() if f.id == "hq-build-fleet-cache")
+        real = gd.hq_cache_family()
+        self.assertEqual((real.root, real.reference_root), (gd.FLEET_ROOT / "cache", gd.FLEET_ROOT))
         self.assertEqual(real.mirror_idle_hours, gd.CMUX_JOB_MIRROR_HOURS)
-        self.assertEqual(real.reference_root, gd.FLEET_ROOT)
         self.assertTrue(real.retired_only)
+        self.assertEqual(real.owner_job, gd.HQ_BUILD_WORKERS)
         cache = self.root / "cache"
-        fam = dataclasses.replace(real, root=cache, reference_root=self.root)
+        fam = gd.hq_cache_family(cache)
+        self.assertEqual(fam.reference_root, self.root)
         week = gd.CMUX_JOB_MIRROR_HOURS
         for name, hours in (("cmux-workspaces", week + 22), ("swiftpm", week + 142), ("fresh-workspaces", 72),
                             ("leased", week + 50), ("cmux-tui-target", week + 121)):
