@@ -5289,16 +5289,27 @@ def host_reservation(now: float | None = None, path: Path | None = None, names: 
             hosts = {h.lower() for h in _str_list(e["hosts"], "hosts")}
             hosts |= {a for h in list(hosts) for a in alias.get(h, ())}
             start, end = reservation_time(e["from"]), reservation_time(e["until"])
+            if start >= end:
+                raise ValueError("from must be before until")
             if not hit and names & hosts and start <= now <= end:
                 hit = f"reserved for {e.get('owner', '?')} until {e['until']} ({e.get('id', '?')})"
         if hit:
             return hit
     except (OSError, ValueError, KeyError, TypeError) as error:
         return f"fleet reservations unreadable ({type(error).__name__}); kept as reserved"
-    with contextlib.suppress(OSError, ValueError, TypeError, AttributeError, KeyError):
-        held = json.loads((HOST_RESERVATION_LOCAL if local is None else local).read_text())
-        if held.get("schema") == "glaeda-reservation/v1" and int(held["since"]) <= now < int(held["until"]):
-            return f"host reservation by {held.get('owner', '?')} until {held['until']}"
+    marker = HOST_RESERVATION_LOCAL if local is None else local
+    if not os.path.lexists(marker):
+        return ""
+    try:  # a marker that is there but cannot be read or understood holds the host, as host_busy reads it
+        held = json.loads(marker.read_text())
+        since, until = held["since"], held["until"]
+        if (held.get("schema") != "glaeda-reservation/v1" or not all(
+                isinstance(v, int) and not isinstance(v, bool) for v in (since, until))):
+            raise ValueError("not a glaeda-reservation/v1 marker")
+    except (OSError, ValueError, TypeError, AttributeError, KeyError) as error:
+        return f"host reservation marker unreadable ({type(error).__name__}); kept as reserved"
+    if since <= now < until:
+        return f"host reservation by {held.get('owner', '?')} until {until}"
     return ""
 
 
@@ -7798,7 +7809,8 @@ def _main_impl(argv: list[str] | None = None) -> int:
         a.target = f"{a.need + POLICY['target_margin_gib']:g}"
 
     # before any family is built: a reserved host's families keep its holder's ages (keep_legacy_ages, once 12 h lands)
-    reserved = host_reservation() if role == "fleet-mini" and DARWIN and a.apply else ""
+    reserved = (host_reservation() if role == "fleet-mini" and DARWIN and (a.apply or a.dedupe or a.dedupe_builds)
+                else "")
     global RUNNER_CACHE_PROFILE
     RUNNER_CACHE_PROFILE = bool(a.runner_caches)
     fams = runner_cache_families() if RUNNER_CACHE_PROFILE else default_families(role)
@@ -7817,6 +7829,9 @@ def _main_impl(argv: list[str] | None = None) -> int:
         fams = [f for f in fams if f.id in a.family]
     if RUNNER_CACHE_PROFILE and not runner_profile_roots_safe(fams):
         print("runner cache profile roots are not safe; skipped")
+        return 0
+    if (a.dedupe or a.dedupe_builds) and reserved:
+        print(f"{reserved}: only floor-pressure eviction runs here; no dedupe")
         return 0
     if a.dedupe or a.dedupe_builds:
         dd = next((f.root for f in fams if f.id == "xcode-derived-data"), None)
@@ -7970,7 +7985,8 @@ def _main_impl(argv: list[str] | None = None) -> int:
                 fcntl.flock(maintenance_handle, fcntl.LOCK_UN)
                 maintenance_handle.close()
             return result
-        stale_marker_released = clear_stale_build_markers(a.receipt)
+        if not reserved:  # a reserved host gets the floor-pressure pass and nothing else
+            stale_marker_released = clear_stale_build_markers(a.receipt)
     idle = a.idle_hours if a.idle_hours is not None else IDLE_SWEEP_HOURS if sweep else (6 if under else 24)
     at, known, measured_at = (0.0, {}, {}) if a.refresh or a.no_snapshot else load_snapshot_meta()
     original_known = set(known)
@@ -8098,10 +8114,10 @@ def _main_impl(argv: list[str] | None = None) -> int:
         logical_released = stale_marker_released + apply_pass([i for i in items if id(i) not in last])
         # A drained runner is explicitly held by cmux_mini_fix; once its listener and worker
         # are absent, its disposable checkout can be cleared under this same eviction lock.
-        if not RUNNER_CACHE_PROFILE:
+        if not RUNNER_CACHE_PROFILE and not reserved:
             logical_released += cleanup_paused_runner_work(a.receipt)
         # test scratch left in $TMPDIR, two days untouched: too small per entry for any family's size floor
-        if not RUNNER_CACHE_PROFILE and not a.cmux_next_drain \
+        if not RUNNER_CACHE_PROFILE and not a.cmux_next_drain and not reserved \
                 and (not a.family or TMP_TEST_RESIDUE_FAMILY in a.family):
             logical_released += reap_tmpdir_test_residue(a.receipt, halt=halt)
         # still under the runner gate's floor after every family: idle runners' whole checkouts, last
@@ -8113,9 +8129,9 @@ def _main_impl(argv: list[str] | None = None) -> int:
         # a home clone that fetch after fetch left in many packs: repacked at most hourly or under pressure,
         # after the eviction lock is released, so a gc of many minutes never holds back another eviction
         home_clone_gc_due = ((sweep or a.pressure) and ROLE == "fleet-mini" and not RUNNER_CACHE_PROFILE
-                             and not a.cmux_next_drain and (not a.family or HOME_CLONE_GC_FAMILY in a.family))
+                             and not a.cmux_next_drain and not reserved and (not a.family or HOME_CLONE_GC_FAMILY in a.family))
         runner_repack_due = ((sweep or a.pressure) and ROLE == "fleet-mini" and not RUNNER_CACHE_PROFILE
-                             and not a.cmux_next_drain
+                             and not a.cmux_next_drain and not reserved
                              and (not a.family or RUNNER_CHECKOUT_REPACK_FAMILY in a.family))
         # the fleet compilation-cache node store's hard cap, on every pressure pass: the runner hook's pass before each
         # job and its floor eviction run this one (glaeda-fleet-cas-prune keeps its own working-set rule)
