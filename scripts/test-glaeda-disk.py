@@ -4264,6 +4264,28 @@ class GlaedaDiskTest(unittest.TestCase):
         self.assertEqual(rows[-1]["skipped"], "defer_during_ci")
         self.assertTrue(claimed.exists(), "a deferred run did no pass, so its claimed trigger stays")
 
+    def test_a_lock_taking_run_that_does_no_pass_leaves_its_own_trigger(self) -> None:
+        lock, pending, p_lock, p_pending = self._queue()
+        claimed = Path(f"{pending}.claimed")
+        self.assertFalse(pending.exists())
+        with p_lock, p_pending, mock.patch.object(gd, "HOOK_PASS_CLAIMED", claimed), \
+                mock.patch.object(gd, "cmux_next_ci_cap_state", return_value=None), \
+                mock.patch.object(gd, "ci_defer", return_value="deferred: a CI job is running (x)"):
+            os.environ.pop(gd.HOOK_PASS_ENV, None)
+            _, rows, _, _ = self._main_run(["--pressure", "--apply"], free_gib=100.0, policy={"defer_during_ci": True})
+        self.assertEqual(rows[-1]["skipped"], "defer_during_ci")
+        self.assertTrue(claimed.exists())
+
+    def test_a_trigger_that_cannot_be_left_never_overlaps_the_running_pass(self) -> None:
+        lock, _, p_lock, _ = self._queue()
+        with p_lock, mock.patch.object(gd, "HOOK_PASS_PENDING", self.root / "missing" / "hook-pass.pending"), \
+                lock.open("a") as held, mock.patch.object(gd, "cmux_next_ci_cap_state", return_value=None):
+            os.environ.pop(gd.HOOK_PASS_ENV, None)
+            fcntl.flock(held, fcntl.LOCK_EX)
+            _, rows, survey, _ = self._main_run(["--pressure", "--apply"], free_gib=100.0)
+        self.assertEqual(rows[-1]["skipped"], gd.COALESCED_INTO_HOOK)
+        survey.assert_not_called()
+
     def test_a_json_run_that_joins_the_queue_reports_deferred(self) -> None:
         lock, _, p_lock, p_pending = self._queue()
         with p_lock, p_pending, lock.open("a") as held, mock.patch.object(gd, "cmux_next_ci_cap_state", return_value=None):

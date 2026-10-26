@@ -1077,7 +1077,7 @@ def take_hook_pass() -> bool | None:
                 os.close(os.open(HOOK_PASS_PENDING, os.O_WRONLY | os.O_CREAT, 0o600))
             except OSError:
                 os.close(fd)
-                return None  # no trigger to leave: run anyway rather than drop it
+                return False  # never overlap the running pass, which is freeing space now; the next run comes back
             continue
         except OSError:
             os.close(fd)
@@ -1090,13 +1090,16 @@ def take_hook_pass() -> bool | None:
 
 
 def release_hook_pass(served: bool) -> None:
-    """Let go of the hook's lock; the claimed triggers are cleared only when this run did its pass."""
+    """Let go of the hook's lock; the claimed triggers are cleared only when this run did its pass, and a run that did
+    none leaves its own trigger claimed too, for the next pass."""
     global _HOOK_PASS_FD
     if _HOOK_PASS_FD is None:
         return
-    if served:
-        with contextlib.suppress(OSError):
+    with contextlib.suppress(OSError):
+        if served:
             HOOK_PASS_CLAIMED.unlink()
+        else:
+            os.close(os.open(HOOK_PASS_CLAIMED, os.O_WRONLY | os.O_CREAT, 0o600))
     with contextlib.suppress(OSError):
         os.close(_HOOK_PASS_FD)
     _HOOK_PASS_FD = None
