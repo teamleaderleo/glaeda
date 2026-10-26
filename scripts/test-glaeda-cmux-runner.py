@@ -581,6 +581,19 @@ class HookTest(unittest.TestCase):
             time.sleep(0.1)
         self.assertFalse(hook.pid_alive(int(pid)), "the detached pass ran past its timeout")
 
+    def test_job_completed_disk_pass_outlasts_a_whole_pass(self) -> None:
+        """Nothing waits on the detached pass, so it is not cut at a hook's DISK_TIMEOUT_S: on cmux14 under the floor
+        a whole pass took 192-685 s, every one was killed at 120 s holding evict.lock, and the LaunchAgent's pass
+        skipped as busy for over an hour while the disk stayed short."""
+        self.assertGreater(hook.BACKGROUND_DISK_TIMEOUT_S, 685)
+        self.assertGreater(hook.BACKGROUND_DISK_TIMEOUT_S, hook.DISK_TIMEOUT_S)
+        quick = make_executable(self.dir / "glaeda-disk-quick", "import sys\n")
+        result = self.run_hook("job-completed", None, None, "--disk", os.fspath(quick),
+                               "--state-dir", os.fspath(self.dir / "state"))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(f"glaeda-disk started in the background (bounded by {hook.BACKGROUND_DISK_TIMEOUT_S:g} s)",
+                      result.stdout)
+
     # ------------------------------------------------------------ host lock, reservation, disk floor
 
     def fleet(self) -> Path:
@@ -5160,9 +5173,16 @@ class GateTest(unittest.TestCase):
             self.assertEqual(len(procs), 2, "retried every GATE_DISK_EVICT_EVERY_S")
             clock["t"] += hook.DISK_TIMEOUT_S
             self.assertIsNotNone(gate.low_disk())
+            procs[1].kill.assert_not_called()  # nothing waits on it: a whole pass outlasts a hook's bound
+            self.assertEqual(len(procs), 2)
+            clock["t"] += hook.BACKGROUND_DISK_TIMEOUT_S - hook.DISK_TIMEOUT_S
+            self.assertIsNotNone(gate.low_disk())
             procs[1].kill.assert_called_once()
-            self.assertEqual(logs[-1], "under the 100 GiB disk floor: glaeda-disk timed out, freed 0.0 GiB")
-            self.assertIsNone(gate.evicting)
+            # the same poll then notes the hold, now past GATE_DISK_NOTE_S
+            self.assertIn("under the 100 GiB disk floor: glaeda-disk timed out, freed 0.0 GiB", logs[-2:])
+            # the bound is GATE_DISK_EVICT_EVERY_S too, so the same poll starts the next try
+            self.assertEqual(len(procs), 3)
+            self.assertIs(gate.evicting[0], procs[2])
 
     def test_a_root_runner_holds_while_a_token_its_jobs_need_is_taken(self) -> None:
         root = hook.RunnerScope(4, 2, 2, True)
