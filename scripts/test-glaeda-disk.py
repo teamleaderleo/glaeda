@@ -1495,11 +1495,23 @@ class GlaedaDiskTest(unittest.TestCase):
         self.assertIn("idle 168h+: its checkouts are mirrors", items["cmux-workspaces"].reasons)
         self.assertIn("live lease or running job", items["leased"].reasons)
         self.assertEqual({k for k, v in live.items() if v != "report-only"}, {"leased"})
+        reclaim = [i for i in items.values() if i.verdict == "reclaimable"]
+        # between the survey and the delete a fleet job leases swiftpm and a process starts in cmux-tui-target:
+        # apply re-reads both (the survey's cached references and process snapshot are stale by then)
+        (self.root / "jobs/late.json").write_text(json.dumps({"until": time.time() + 600,
+                                                              "path": os.fspath(cache / "swiftpm")}))
+        late = ([], f"cargo build --target-dir {cache / 'cmux-tui-target'}\n")
         receipt = self.receipt()
         with contextlib.redirect_stdout(io.StringIO()), mock.patch.object(gd, "owner_retired", return_value=True), \
-                mock.patch.object(gd, "family_git_state", git_state):
-            gd.apply([i for i in items.values() if i.verdict == "reclaimable"], {fam.id: fam}, receipt, None, 24)
-        self.assertEqual(sorted(p.name for p in cache.iterdir()), ["fresh-workspaces", "leased"])
+                mock.patch.object(gd, "family_git_state", git_state), \
+                mock.patch.object(gd, "process_evidence", return_value=late), \
+                mock.patch.object(gd, "command_lines", return_value=late[1]):
+            gd.apply(reclaim, {fam.id: fam}, receipt, None, 24)
+        self.assertEqual(sorted(p.name for p in cache.iterdir()),
+                         ["cmux-tui-target", "fresh-workspaces", "leased", "swiftpm"])
+        outcomes = {Path(r["path"]).name: r["outcome"] for r in map(json.loads, receipt.read_text().splitlines())}
+        self.assertEqual(outcomes, {"cmux-workspaces": "reclaimed", "swiftpm": "changed:in-use",
+                                    "cmux-tui-target": "changed:in-use"})
 
     def test_pressure_waits_for_a_ci_job_until_the_emergency_floor(self) -> None:
         job = "/Users/cmux/actions-runner-glaeda-2/bin/Runner.Worker spawnclient 148 151"
@@ -2028,6 +2040,11 @@ class GlaedaDiskTest(unittest.TestCase):
         self.assertFalse((roots[1] / "derived-data-compile-admission").exists())
         self.assertTrue((roots[3] / "derived-data-compile-admission").exists(), "a held root keeps its build")
         self.assertTrue(all((roots[k] / "src").exists() for k in roots), "src stays the tmp family's to judge")
+        # a root without a token file is outside the runner hook's protocol: its 24 h window stands
+        (capacity / "root-1.token").unlink()
+        make(roots[1] / "derived-data-compile-admission", age_hours=9.3)
+        _, under = verdicts({dev: 50 * gd.GIB})
+        self.assertEqual(under["cmux-ci/derived-data-compile-admission"], "recent")
 
     def test_the_tmp_family_deletes_a_whole_canonical_root_only_under_its_root_token(self) -> None:
         """The tmp family judges /private/tmp/cmux-ci and cmux-ci-<k> as one item each and may delete a whole one

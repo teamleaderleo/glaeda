@@ -519,6 +519,12 @@ def live_artifact_references(root: Path = FLEET_ROOT) -> frozenset[str]:
     return result
 
 
+def fresh_artifact_references(root: Path) -> frozenset[str]:
+    """live_artifact_references read again now: apply's re-check before a delete, never the survey's cached set."""
+    _LIVE_REFERENCES.pop(os.fspath(root), None)
+    return live_artifact_references(root)
+
+
 def artifact_referenced(path: Path, references: frozenset[str]) -> bool:
     p = os.path.realpath(path)
     return any(p == ref or p.startswith(ref + os.sep) or ref.startswith(p + os.sep) for ref in references)
@@ -931,12 +937,16 @@ def item_window(fam: Family, path: Path, idle_hours: float, archived: frozenset[
 def floor_hold_family(fam: Family, path: Path) -> bool:
     """Whether the runner gate's floor hold lets PATH go before its family's window: an idle runner's checkout
     build output, an enrolled runner's cmux-next scheme output (its Runner.Worker vetoes it in
-    cmux_next_ci_busy), a canonical root's admission DerivedData (the root's token keeps it while a compile or a
-    product consumer holds the root: canonical_root_held, re-checked at apply and taken exclusive to delete; the
-    next compile on the root clears it anyway, and a rerun restores it from the artifact), and code-sign clones
+    cmux_next_ci_busy), a canonical root's admission DerivedData once the root has a token file (the token keeps
+    it while a compile or a product consumer holds the root: canonical_root_held, re-checked at apply with fresh
+    process evidence and taken exclusive to delete; the next compile on the root clears it anyway, and a rerun
+    restores it from the artifact; a root without a token file keeps its 24 h window), and code-sign clones
     (keep_live_app_clones and app_clone_running keep the live ones)."""
-    if fam.id in (RUNNER_BUILD_FAMILY, CANONICAL_ADMISSION) or fam.app_clones:
+    if fam.id == RUNNER_BUILD_FAMILY or fam.app_clones:
         return True
+    if fam.id == CANONICAL_ADMISSION:  # only where the runner hook's token protocol is in force on this root
+        token = canonical_root_token(path)
+        return token is not None and token.is_file() and not token.is_symlink()
     return fam.id == CMUX_NEXT_CI_FAMILY and not CMUX_NEXT_CI_DRAIN and (
         cmux_next_ci_runner(path, fam.root) is not None or cmux_next_ci_floor_slot(fam, path))
 
@@ -2163,6 +2173,7 @@ def bazel_family(root: Path) -> Family:
 
 # launchd services of the hq build workers that read and write /Users/Shared/cmux-build-fleet/cache
 HQ_BUILD_WORKERS = ("system/ai.manaflow.cmux-build-worker", "system/ai.manaflow.cmux-lent-worker")
+HQ_CACHE_FAMILY = "hq-build-fleet-cache"
 
 # A reload-cloud unit's checkouts are mirrors: cmux-base is a clone of GitHub (sync-repo.sh checks out
 # origin/<branch> into it) and work/<slot> is that clone with the developer's tree rsynced over it from their
@@ -2291,7 +2302,7 @@ def default_families(role: str = "fleet-mini") -> list[Family]:
     # fleet-artifacts over the same directory. cmux14 sat at the 30 GiB floor with 0.0G reclaimable while
     # cmux-workspaces (11.6 GiB, idle 190 h), cmux-tui-target (4.2 GiB, 289 h) and swiftpm (3.9 GiB, 310 h) of
     # its unloaded workers read "git-checkout" and "unchecked" (2026-10-25).
-    fams.append(Family("hq-build-fleet-cache", Path("/Users/Shared/cmux-build-fleet/cache"), True,
+    fams.append(Family(HQ_CACHE_FAMILY, Path("/Users/Shared/cmux-build-fleet/cache"), True,
                        "the hq build worker rebuilds its cache", retired_only=True,
                        owner="cmux dev-build and lent build workers (hq controller)",
                        owner_job=HQ_BUILD_WORKERS, mirror_idle_hours=CMUX_JOB_MIRROR_HOURS,
@@ -5933,7 +5944,7 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
         if halt is not None and (why := halt()):
             print(f"stopped: {why}")
             break
-        if fam.id in FLEET_FAMILY_IDS or fam.id == CMUX_NEXT_CI_FAMILY or (
+        if fam.id in FLEET_FAMILY_IDS or fam.id in (CMUX_NEXT_CI_FAMILY, HQ_CACHE_FAMILY, CANONICAL_ADMISSION) or (
                 fam.id == INTERRUPTED and fam.root in cmux_next_ci_state_parents(HOME / "Library/Caches" / CMUX_NEXT_CI_ROOT)):
             # Pressure eligibility is intentionally broad, so take fresh cwd/open-file evidence immediately
             # before each rename. A job may start using a candidate after the survey or during a long pass.
@@ -5982,6 +5993,8 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
                 or (fam.id == RUNNER_BUILD_FAMILY and runner_job_live(fam.root.parent, cmds))
                 or (fam.app_clones and app_clone_running(p, cmds))
                 or in_cwd(i.path, cwds) or named_by(i.path, cmds) or holds_socket(p) or job_busy(fam, p)
+                or (fam.reference_root is not None
+                    and artifact_referenced(p, fresh_artifact_references(fam.reference_root)))
                 or (i.family == "claude-scratchpad" and claude_session_active(p.name, idle_hours * 3600))
                 or (i.family == SPM_SCRATCH and spm_scratch_held(p))
                 or (i.family == CANONICAL_ADMISSION and canonical_root_held(p))
