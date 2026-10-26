@@ -397,11 +397,13 @@ class Channel:
         self.got: list[str] = []
 
     def publish(self, n: int, script: bytes = SCRIPT_BYTES, policy: bytes = POLICY_BYTES, sources=(ORIGIN, MIRROR),
-                members: dict | None = None, release_sha: str | None = None, paused: bool = False) -> str:
+                members: dict | None = None, release_sha: str | None = None, paused: bool = False,
+                ancestors: range | None = None) -> str:
         tag, commit = f"r-20261026-{n:012x}", f"{n:040x}"
+        ancestry = "".join(f"{k:040x}\n" for k in (ancestors if ancestors is not None else range(n, 0, -1)))
         archive = tar_gz(members if members is not None else {
             "glaeda/README.md": b"glaeda\n", heal.MEMBERS[heal.SCRIPT_NAME]: script,
-            heal.MEMBERS[heal.POLICY_NAME]: policy})
+            heal.MEMBERS[heal.POLICY_NAME]: policy, heal.ANCESTRY: ancestry.encode()})
         release = json.dumps({"schema": heal.RELEASE_SCHEMA, "repository": heal.REPOSITORY, "tag": tag,
                               "source": commit, "assets": {heal.ARCHIVE: {
                                   "size": len(archive), "sha256": hashlib.sha256(archive).hexdigest()}}}).encode()
@@ -475,6 +477,60 @@ class SelfUpdate(unittest.TestCase):
         self.assertEqual((self.installed(heal.POLICY_NAME), report["release"]["tag"]), (later, tag3))
         mode = (self.dir / heal.SCRIPT_NAME).stat().st_mode & 0o777
         self.assertEqual(mode, 0o555)
+
+    def test_a_release_that_changes_only_the_script_reaches_the_snapshot(self) -> None:
+        script = SCRIPT_BYTES + b"\n# only the script\n"
+        tag = self.channel.publish(2, script=script)
+        report = self.run_pass()
+        self.assertEqual((self.installed(heal.SCRIPT_NAME), self.installed(heal.POLICY_NAME)), (script, POLICY_BYTES))
+        self.assertEqual(report["release"]["tag"], tag)
+        self.assertFalse((self.dir / "staged" / heal.PAIR_MARK).exists(), "the swap finished")
+
+    def test_a_release_that_does_not_descend_from_the_installed_one_is_refused(self) -> None:
+        self.channel.publish(2, script=SCRIPT_BYTES + b"# 2\n")
+        self.run_pass()
+        self.channel.publish(3, script=SCRIPT_BYTES + b"# 3, from a branch\n", ancestors=range(3, 2, -1))
+        report = self.run_pass(POLICY["release"]["every_s"])
+        self.assertEqual(self.installed(heal.SCRIPT_NAME), SCRIPT_BYTES + b"# 2\n")
+        self.assertIn("does not descend", report["release"]["error"])
+
+    def test_malformed_release_metadata_is_an_error_not_a_crash(self) -> None:
+        self.channel.publish(2, script=b"# new\n")
+        url = next(u for u in self.channel.files if u.endswith("/release.json") and f"/{ORIGIN}/" in u)
+        doc = json.loads(self.channel.files[url])
+        doc["assets"] = ["not", "a", "map"]
+        self.channel.files[url] = json.dumps(doc).encode()
+        stable = heal.release_url(ORIGIN, "ota-channels", "stable.json")
+        entry = json.loads(self.channel.files[stable])
+        entry["releaseSha256"] = hashlib.sha256(self.channel.files[url]).hexdigest()
+        self.channel.files[stable] = json.dumps(entry).encode()
+        report = self.run_pass()
+        self.assertIn("has no", report["release"]["error"])
+        self.assertEqual(self.installed(heal.SCRIPT_NAME), SCRIPT_BYTES)
+
+    def test_a_swap_cut_short_is_finished_before_the_next_policy_load(self) -> None:
+        script, policy = SCRIPT_BYTES + b"# next\n", edited_policy(hot_hours=5)
+        stage = self.dir / "staged"
+        stage.mkdir()
+        (stage / heal.SCRIPT_NAME).write_bytes(script)
+        (stage / heal.POLICY_NAME).write_bytes(policy)
+        (stage / heal.PAIR_MARK).write_text(json.dumps({heal.SCRIPT_NAME: heal.sha256(script),
+                                                        heal.POLICY_NAME: heal.sha256(policy)}))
+        (self.dir / heal.POLICY_NAME).write_bytes(policy)  # died after the policy, before the script
+        self.assertTrue(heal.finish_pair(self.dir, root=False))
+        self.assertEqual((self.installed(heal.SCRIPT_NAME), self.installed(heal.POLICY_NAME)), (script, policy))
+        self.assertFalse((stage / heal.PAIR_MARK).exists())
+        (stage / heal.PAIR_MARK).write_text(json.dumps({heal.SCRIPT_NAME: "0" * 64, heal.POLICY_NAME: "0" * 64}))
+        (stage / heal.SCRIPT_NAME).write_bytes(b"# torn\n")
+        self.assertTrue(heal.finish_pair(self.dir, root=False))
+        self.assertEqual(self.installed(heal.SCRIPT_NAME), script, "a mark the staged files do not match is dropped")
+        self.assertFalse(heal.finish_pair(self.dir, root=False))
+
+    def test_the_staged_run_keeps_bounded_output_and_a_timeout(self) -> None:
+        code, out, _err = heal.bounded_run([sys.executable, "-c", "print('x' * 5_000_000)"], 30, limit=1000)
+        self.assertEqual((code, len(out)), (0, 1000))
+        code, _out, _err = heal.bounded_run([sys.executable, "-c", "import time; time.sleep(30)"], 0.5)
+        self.assertEqual(code, 124)
 
     def test_the_same_release_costs_two_small_reads_and_rewrites_nothing(self) -> None:
         tag = self.channel.publish(2)
@@ -554,8 +610,11 @@ class SelfUpdate(unittest.TestCase):
             heal.fetch("http://github.com/x", 10)
         with self.assertRaises(heal.HealError):
             heal.fetch("https://example.com/x", 10)
-        with self.assertRaisesRegex(heal.HealError, "off https"):
-            heal.HttpsOnly().redirect_request(None, None, 302, "Found", {}, "http://objects.example/x")
+        for bad in ("http://release-assets.githubusercontent.com/x", "https://evil.example/x",
+                    "https://github.com.evil.example/x", "https://release-assets.githubusercontent.com:8443/x"):
+            with self.assertRaisesRegex(heal.HealError, "refusing a redirect", msg=bad):
+                heal.HttpsOnly().redirect_request(None, None, 302, "Found", {}, bad)
+        self.assertTrue(heal.url_ok("https://release-assets.githubusercontent.com/github-production-release-asset/1"))
         for sources in (["someone/glaeda"], [], [ORIGIN, ORIGIN], [{"x": 1}]):
             bad = copy.deepcopy(POLICY)
             bad["release"]["sources"] = sources

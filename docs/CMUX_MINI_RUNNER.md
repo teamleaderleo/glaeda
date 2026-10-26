@@ -1425,8 +1425,9 @@ last read the channel and the last error. `judge` in the script turns that repor
   `release.stale_s`.
 - `current`: none of these.
 
-`glaeda-mini-health` reports a verdict other than `current` as `daemon_heal_stale`. `glaeda-fleet-status`
-reports it per member as `daemon_heal_missing` or `daemon_heal_stale` ([FLEET_STATUS.md](FLEET_STATUS.md)).
+`glaeda-mini-health` reports a verdict other than `current` as `daemon_heal_stale`. Where `sudo -n` works it
+reinstalls only when a reinstall can fix the verdict (`reinstall` in the verdict). It never reinstalls for a
+channel the daemon cannot read, or for a release the daemon refused.
 
 ## 2m. Build mesh: the fleet index and kept state between PR minis
 

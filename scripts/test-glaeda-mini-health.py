@@ -1511,10 +1511,13 @@ class DaemonHealLiveness(Base):
         # It follows stable; this user may run a newer canary release, whose bytes differ.
         self.mini.heal_status = self.status(current=False, stale=["/x"], verdict={"state": "current", "why": "runs r"})
         self.assertEqual(self.ids(self.run_once()), [])
-        self.mini.heal_status = self.status(verdict={"state": "stale", "why": "has not read its release channel"})
+        self.mini.sudo = True
+        self.mini.heal_status = self.status(verdict={"state": "stale", "reinstall": False,
+                                                     "why": "has not read its release channel"})
         f = self.run_once(NOW + 120)["findings"][0]
-        self.assertEqual(f["id"], "daemon_heal_stale")
+        self.assertEqual((f["id"], f["auto_fix"]), ("daemon_heal_stale", "impossible"))
         self.assertIn("has not read its release channel", f["evidence"])
+        self.assertEqual(self.mini.did, [], "a reinstall cannot fix its channel: no sudo for it")
 
 
 class ClaudeRoute(Base):

@@ -1063,11 +1063,13 @@ def check_daemon_heal(mini: Mini) -> list[dict[str, Any]]:
         return []
     out = []
     why = None
+    fixable = True
     verdict = status.get("verdict")
     if isinstance(verdict, dict) and verdict.get("state") in ("current", "stale", "missing"):
         # A copy that keeps itself on stable: its own report says whether it does, not this user's release bytes.
         if verdict["state"] != "current":
             why = str(verdict.get("why") or verdict["state"])[:300]
+            fixable = verdict.get("reinstall") is not False
     elif not status.get("installed"):
         why = "the root daemon-heal LaunchDaemon is not installed"
     elif not status.get("current"):
@@ -1078,7 +1080,10 @@ def check_daemon_heal(mini: Mini) -> list[dict[str, Any]]:
         age = status.get("reportAgeS")
         why = ("the root daemon-heal LaunchDaemon is loaded but its report is "
                + ("missing" if age is None else f"{age} s old") + ": its passes are not running")
-    if why:
+    if why and not fixable:  # a reinstall cannot make it read its channel or take a release it refused
+        out.append(finding("daemon_heal_stale", "warn", why, "impossible",
+                           "its report's release.error says why; it retries every release.every_s"))
+    elif why:
         out.append(finding("daemon_heal_stale", "warn", why,
                            "pending" if mini.sudo_ok() else "impossible",
                            "reinstalled with sudo -n" if mini.sudo_ok() else
