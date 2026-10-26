@@ -167,6 +167,7 @@ import calendar
 import collections
 import contextlib
 import ctypes
+import errno
 import fcntl
 import glob
 import gzip
@@ -4393,8 +4394,8 @@ def job_busy(fam: Family, path: Path) -> bool:
         return False
     if fam.id == INTERRUPTED:  # renamed away from every job's path; its deleter's pid is its in-use signal
         return False
-    if cmux_next_ci_floor_slot(fam, path):  # a slot's inputs are wider than the budget; cmux_next_ci_busy is its signal
-        return False
+    if fam.id == CMUX_NEXT_CI_FAMILY and path in cmux_next_ci_state_roots(fam.root):
+        return False  # a whole state's inputs are wider than the budget; cmux_next_ci_busy is its signal
     return fam.reclaimable and not fam.discover and cmux_active(path)
 
 
@@ -6225,16 +6226,19 @@ def cmux_next_ci_slot_recheck(fam: Family, path: Path):
         except NoEvidence:
             opened, cmds = None, ""
         taken = (opened is None or (runner is not None and runner_job_live(runner, cmds))
-                 or in_cwd(os.fspath(doomed), open_index(opened)) or named_by(os.fspath(path), cmds))
+                 or in_cwd(os.fspath(doomed), open_index(opened)) or named_by(os.fspath(path), cmds)
+                 or named_by(os.fspath(doomed), cmds) or bool(cmux_next_ci_tree_busy(doomed)))
         if not taken and floor_stop_unmet(path):
             return  # nobody's, and still needed: remove() deletes it
         try:
             os.rename(doomed, path)
-        except OSError:
-            if not taken:
+        except OSError as e:
+            if not taken and e.errno in (errno.EEXIST, errno.ENOTEMPTY) and os.path.lexists(path):
                 return  # the floor was met, but a new slot stands at the path: the detached one is nobody's
-            # in use, and a new slot stands at the path: the detached tree stays aside, never deleted from here
-            raise SlotTaken(f"{path.name}: in use and a new slot is at its path; left aside as {doomed.name}")
+            # in use, or the rename back failed for another reason: the detached tree stays aside, never deleted
+            # from here (interrupted-deletions finishes it once this pid is gone and its own vetoes pass)
+            raise (SlotTaken if taken else SlotNotNeeded)(
+                f"{path.name}: could not be put back ({e.strerror}); left aside as {doomed.name}")
         if taken:
             raise SlotTaken(f"{path.name}: its runner took a job; put back")
         raise SlotNotNeeded(f"{path.name}: free reached the floor hold's stop; put back")
@@ -6368,6 +6372,12 @@ def cmux_next_ci_busy(fam: Family, path: Path, opened: list[str] | frozenset[str
     state_text = os.fspath(state)
     if in_cwd(state_text, opened) or named_by(state_text, commands):
         return "cmux-next state is referenced by a process"
+    return cmux_next_ci_tree_busy(state)
+
+
+def cmux_next_ci_tree_busy(state: Path) -> str:
+    """cmux_next_ci_busy's vetoes read from the tree itself: a socket, an activity marker in it or beside it,
+    a child the family does not know. Also read on a slot's detached tree (cmux_next_ci_slot_recheck)."""
     if holds_socket(state):
         return "cmux-next state holds a socket"
     for ancestor in (state, state.parent):

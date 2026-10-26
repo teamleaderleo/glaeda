@@ -11,6 +11,7 @@ import fcntl
 import hashlib
 import io
 import json
+import errno
 import os
 import plistlib
 import shutil
@@ -3141,8 +3142,12 @@ class GlaedaDiskTest(unittest.TestCase):
         dev = home.stat().st_dev
         state = {"free": 20 * gd.GIB}
 
-        def evidence():
-            state["free"] = 60 * gd.GIB  # another job's cleanup finished meanwhile
+        calls = {"n": 0}
+
+        def evidence():  # apply's first read leaves free under the stop; the per-item fresh read sees it met
+            calls["n"] += 1
+            if calls["n"] >= 2:
+                state["free"] = 60 * gd.GIB  # another job's cleanup finished meanwhile
             return [], ""
         gd._DISCOVERED.clear()
         with mock.patch.object(gd, "free_bytes", side_effect=lambda _p: (state["free"], 460 * gd.GIB)), \
@@ -3155,6 +3160,7 @@ class GlaedaDiskTest(unittest.TestCase):
             self.assertEqual([i.verdict for i in items], ["reclaimable"])
             with mock.patch.object(gd, "process_evidence", side_effect=evidence):
                 gd.apply(items, {fam.id: fam}, self.receipt(), None, 6, all_families=[fam])
+        self.assertGreaterEqual(calls["n"], 2)  # it got past the pre-item stop check to the fresh evidence
         remove.assert_not_called()
 
     def test_a_slot_whose_runner_takes_a_job_during_the_rename_is_put_back(self) -> None:
@@ -3202,6 +3208,60 @@ class GlaedaDiskTest(unittest.TestCase):
         self.assertTrue((aside[0] / "SourcePackages").is_dir())
         self.assertTrue((st["mini-glaeda"] / "Build").exists())  # nor the job's new slot
         self.assertEqual(next(i for i in items if Path(i.path) == st["mini-glaeda"]).verdict, "blocked")
+
+    def test_no_cmux_next_state_root_is_busy_for_its_width_alone(self) -> None:
+        # an unowned stale root the cap takes whole, and an enrolled runner's slot, each wider than cmux_active's budget
+        home, fam, st = self._cmux_next_cap_tree()
+        for key in ("gone-runner", "mini-glaeda"):
+            wide = st[key] / "ModuleCache.noindex"
+            wide.mkdir()
+            for n in range(5001):
+                (wide / f"m{n}.pcm").touch()
+            self.assertTrue(gd.cmux_active(st[key]), key)  # the generic search gives up
+            self.assertFalse(gd.job_busy(fam, st[key]), key)
+
+    def test_a_socket_that_moves_with_the_slot_keeps_it(self) -> None:
+        home, fam, st = self._cmux_next_cap_tree()
+        calls = {"n": 0}
+        real_tree_busy = gd.cmux_next_ci_tree_busy
+
+        def tree_busy(state):  # a socket appears in the tree between the last check and the rename
+            return "cmux-next state holds a socket" if gd.DELETING_PREFIX in state.name else real_tree_busy(state)
+        with mock.patch.object(gd, "cmux_next_ci_tree_busy", side_effect=tree_busy):
+            _, removed, items = self._floor_apply(home, fam, 20.0, 4.0, slots_only=True)
+        self.assertNotIn(st["mini-glaeda"], removed)
+        self.assertTrue((st["mini-glaeda"] / "SourcePackages").is_dir())  # put back
+        self.assertEqual(next(i for i in items if Path(i.path) == st["mini-glaeda"]).verdict, "blocked")
+
+    def test_a_slot_that_cannot_be_put_back_for_another_reason_stays_aside(self) -> None:
+        # the floor is met after the rename, and the rename back fails without a new slot at the path
+        home, fam, st = self._cmux_next_cap_tree()
+        dev = home.stat().st_dev
+        state = {"free": 20 * gd.GIB, "n": 0}
+        real_rename = os.rename
+
+        def evidence():
+            state["n"] += 1
+            if state["n"] > 2:
+                state["free"] = 60 * gd.GIB
+            return [], ""
+
+        def rename(src, dst):
+            if gd.DELETING_PREFIX in os.fspath(src):
+                raise PermissionError(errno.EACCES, "Permission denied")
+            return real_rename(src, dst)
+        gd._DISCOVERED.clear()
+        with mock.patch.object(gd, "free_bytes", side_effect=lambda _p: (state["free"], 460 * gd.GIB)), \
+                mock.patch.object(gd, "HOME", home), mock.patch.object(gd, "command_lines", return_value=""), \
+                mock.patch.object(gd, "ACTIVITY_MODE", "pressure"), mock.patch.object(gd.os, "rename", rename), \
+                mock.patch.object(gd, "FLOOR_HOLD", {dev: 50 * gd.GIB}), contextlib.redirect_stdout(io.StringIO()):
+            with mock.patch.object(gd, "process_evidence", return_value=([], "")):
+                items = [i for i in gd.survey([fam], 6, 0) if Path(i.path) == st["mini-glaeda"]]
+            with mock.patch.object(gd, "process_evidence", side_effect=evidence):
+                gd.apply(items, {fam.id: fam}, self.receipt(), None, 6, all_families=[fam])
+        aside = [p for p in st["mini-glaeda"].parent.iterdir() if p.name.startswith(gd.DELETING_PREFIX)]
+        self.assertEqual(len(aside), 1)
+        self.assertTrue((aside[0] / "SourcePackages").is_dir())  # not deleted
 
     def test_a_slot_no_longer_needed_after_the_rename_is_put_back(self) -> None:
         # free reaches the stop while the post-rename evidence is taken: the slot goes back to its path
