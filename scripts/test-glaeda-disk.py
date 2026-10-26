@@ -22,6 +22,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import types
 import unittest
 from dataclasses import replace
 from unittest import mock
@@ -4514,6 +4515,18 @@ class GlaedaDiskTest(unittest.TestCase):
             git("commit", "-q", "--allow-empty", "-m", "local only")
         (co / "build-output.o").write_text("x")  # untracked build output never keeps a checkout
 
+    def _git_worktree_commit(self, co: Path) -> None:
+        """A detached linked worktree of co (inside its _work dir) with a commit no ref names."""
+        env = {"PATH": "/usr/bin:/bin:/opt/homebrew/bin", "HOME": os.fspath(self.root), "GIT_AUTHOR_NAME": "t",
+               "GIT_AUTHOR_EMAIL": "t@x", "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@x"}
+        wt = co.parent / "linked"
+        if wt.exists():
+            shutil.rmtree(wt)
+        subprocess.run(["git", "-C", os.fspath(co), "worktree", "add", "-q", "--detach", os.fspath(wt)], env=env,
+                       check=True, capture_output=True)
+        subprocess.run(["git", "-C", os.fspath(wt), "commit", "-q", "--allow-empty", "-m", "only in the worktree"],
+                       env=env, check=True, capture_output=True)
+
     def test_stale_runner_checkouts_go_above_the_floor_and_without_one(self) -> None:
         """Old runner work dirs go by age: a checkout no job used for DEFAULT_AGE_HOURS goes whatever the free space,
         unless git would lose something (a commit on no remote-tracking ref) or holds a lock; younger ones stay."""
@@ -4521,7 +4534,8 @@ class GlaedaDiskTest(unittest.TestCase):
         self.assertEqual(stale, 12.0)
         names = {"actions-runner-glaeda": stale + 1, "actions-runner-glaeda-2": stale + 30,
                  "actions-runner-glaeda-3": stale - 1, "actions-runner-glaeda-4": stale + 2,
-                 "actions-runner-glaeda-5": stale + 3}
+                 "actions-runner-glaeda-5": stale + 3, "actions-runner-glaeda-6": stale + 3,
+                 "actions-runner-glaeda-7": stale + 3, "actions-runner-glaeda-8": stale + 3}
         home, cos = self._idle_checkouts(names)
         gd.process_evidence = lambda: ([], "")
         for floor in (30.0, 0.0):
@@ -4530,6 +4544,12 @@ class GlaedaDiskTest(unittest.TestCase):
                     self._git_checkout(cos[name], pushed=name != "actions-runner-glaeda-4")
                     if name == "actions-runner-glaeda-5":
                         (cos[name] / ".git/index.lock").write_text("")
+                    if name == "actions-runner-glaeda-6":
+                        (cos[name] / ".git/FETCH_HEAD.lock").write_text("")
+                    if name == "actions-runner-glaeda-7":
+                        (cos[name] / ".git/rebase-merge").mkdir()
+                    if name == "actions-runner-glaeda-8":  # a linked worktree holds the only copy of a commit
+                        self._git_worktree_commit(cos[name])
                     self._age(home / name, hours=age)
                 patches, removed = self._floor_disk(400.0)  # far above the floor and its target
                 receipt = self.receipt()
@@ -4537,13 +4557,18 @@ class GlaedaDiskTest(unittest.TestCase):
                     self.assertGreater(gd.evict_idle_runner_checkouts(receipt, floor, home), 0)
                 self.assertEqual(sorted(removed), sorted([str(cos["actions-runner-glaeda-2"]),
                                                           str(cos["actions-runner-glaeda"])]))
-                for name in ("actions-runner-glaeda-3", "actions-runner-glaeda-4", "actions-runner-glaeda-5"):
+                for name in ("actions-runner-glaeda-3", "actions-runner-glaeda-4", "actions-runner-glaeda-5",
+                             "actions-runner-glaeda-6", "actions-runner-glaeda-7", "actions-runner-glaeda-8"):
                     self.assertTrue((cos[name] / ".git").is_dir(), name)
                 self.assertIn("unused for 12 h", out.getvalue())
                 why = {Path(r["path"]).parts[-4]: (r["outcome"], r["reasons"][0])
                        for r in map(json.loads, receipt.read_text().splitlines())}
                 self.assertEqual(why["actions-runner-glaeda-4"], ("blocked:git", "a commit here is on no remote-tracking ref"))
                 self.assertEqual(why["actions-runner-glaeda-5"], ("blocked:git", "git holds a lock in it"))
+                self.assertEqual(why["actions-runner-glaeda-6"], ("blocked:git", "git holds a lock in it"))
+                self.assertEqual(why["actions-runner-glaeda-7"], ("blocked:git", "git holds a lock in it"))
+                self.assertEqual(why["actions-runner-glaeda-8"],
+                                 ("blocked:git", "a commit here is on no remote-tracking ref"))
                 self.assertEqual(why["actions-runner-glaeda"], ("reclaimed", "unused for 12 h"))
 
     def test_every_disposable_age_is_twelve_hours(self) -> None:
@@ -6474,7 +6499,7 @@ class ActivityClockTest(unittest.TestCase):
         self.assertEqual(seen, [("54", "70", 30.0), ("55", "71", 50.0)])
 
 class HostReservationTest(unittest.TestCase):
-    """A reserved fleet mini gets floor-pressure eviction only, at the pre-2026-10-26 ages (config/fleet-reservations.json)."""
+    """A reserved fleet mini gets floor-pressure eviction only. The list lives only on the host; fixtures are made up."""
 
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
@@ -6526,18 +6551,68 @@ class HostReservationTest(unittest.TestCase):
         self.assertEqual(gd.RUNNER_STALE_CHECKOUT_HOURS, float("inf"), "no above-floor checkout eviction")
         self.assertEqual(gd.CMUX_JOB_MIRROR_HOURS, 168.0, "no 12 h mirror deletion on a reserved host")
 
-    def test_the_shipped_list_parses_and_matches_the_registry_where_it_is_checked_out(self) -> None:
-        shipped = json.loads((ROOT / "config/fleet-reservations.json").read_text())
-        for e in shipped["reservations"]:
-            gd.reservation_time(e["from"]), gd.reservation_time(e["until"])
-            self.assertTrue(e["hosts"] and e["owner"] and e["id"])
-        registry = Path(os.environ.get("GLAEDA_FLEET_REGISTRY")
-                        or Path.home() / "Projects/leo-workspace/machines/fleet-registry.json")
-        if not registry.is_file():
-            self.skipTest("leo-workspace's fleet registry is not checked out here")
-        want = [{k: e[k] for k in ("id", "owner", "hosts", "from", "until") if k in e}
-                for e in json.loads(registry.read_text()).get("reservations", [])]
-        self.assertEqual(shipped["reservations"], want, "config/fleet-reservations.json is behind the registry")
+    def test_a_disk_policy_key_set_to_the_new_default_stays_on_a_reserved_host(self) -> None:
+        saved = {n: getattr(gd, n) for n in gd.LEGACY_AGES}
+        self.addCleanup(lambda: [setattr(gd, n, v) for n, v in saved.items()])
+        policy = Path(tempfile.mkdtemp()) / "disk-policy.json"
+        self.addCleanup(shutil.rmtree, policy.parent)
+        policy.write_text(json.dumps({"soft_idle_hours": 12, "stale_marker_max_hours": "twelve"}))
+        with mock.patch.object(gd, "DISK_POLICY", policy), mock.patch.dict(gd.POLICY, gd.disk_policy(policy)):
+            self.assertEqual(gd.policy_overrides(), {"soft_idle_hours": 12.0})
+            gd.keep_legacy_ages()
+            self.assertEqual(gd.POLICY["soft_idle_hours"], 12.0, "set explicitly, even to the new default")
+            self.assertEqual(gd.POLICY["stale_marker_max_hours"], 48.0, "a wrongly typed key is not a setting")
+
+    def test_a_malformed_list_anywhere_fails_closed(self) -> None:
+        good = {"id": "r2", "owner": "someone-else", "hosts": ["cmux40"], "from": "2026-10-25T00:00:00Z",
+                "until": "2026-10-28T00:00:00Z"}
+        bad_docs = (
+            [],  # not an object
+            {"aliases": {}},  # no reservations
+            {"reservations": {"r1": good}},
+            {"reservations": [dict(good, hosts="cmux31")]},  # a string, not a list: never matched letter by letter
+            {"reservations": [dict(good, hosts=[31])]},
+            {"reservations": ["cmux31"]},
+            {"reservations": [dict(good, until="soon")]},  # a bad time on an entry naming another host
+            {"reservations": [good], "aliases": {"cmux40": "cmux-forty"}},
+            {"reservations": [good], "aliases": []},
+        )
+        for doc in bad_docs:
+            with self.subTest(doc=doc):
+                self.list.write_text(json.dumps(doc))
+                self.assertIn("unreadable", self.reserved({"cmux31"}))
+        self.list.write_text(json.dumps({"reservations": [good]}))
+        self.assertEqual(self.reserved({"cmux31"}), "", "a well-formed list without this host")
+
+    def test_a_missing_list_is_reserved_whatever_the_host_local_file_says(self) -> None:
+        now = int(self.during)
+        self.local.write_text(json.dumps({"schema": "glaeda-reservation/v1", "owner": "fleet", "since": now - 600,
+                                          "until": now - 60}))
+        self.list.unlink()
+        self.assertIn("kept as reserved", self.reserved({"cmux31"}))
+
+    def test_the_list_is_read_from_the_fleet_owners_home(self) -> None:
+        owner = types.SimpleNamespace(pw_dir=os.fspath(self.root / "fleet-home"))
+        with mock.patch.object(gd, "FLEET_RESERVATIONS", None), mock.patch.object(gd, "FLEET_ROOT", self.root), \
+                mock.patch.object(gd.pwd, "getpwuid", return_value=owner) as getpwuid:
+            self.assertEqual(gd.fleet_reservations_path(),
+                             self.root / "fleet-home/.local/share/glaeda/fleet-reservations.json")
+            getpwuid.assert_called_once_with(self.root.stat().st_uid)
+            self.assertIn("kept as reserved", gd.host_reservation(self.during, None, {"cmux31"}, self.local),
+                          "nothing written there yet")
+        with mock.patch.object(gd, "FLEET_RESERVATIONS", None), \
+                mock.patch.object(gd, "FLEET_ROOT", self.root / "absent"):
+            self.assertEqual(gd.fleet_reservations_path(), gd.HOME / gd.FLEET_RESERVATIONS_NAME)
+
+    def test_a_reserved_hosts_pressure_starts_at_the_floor_itself(self) -> None:
+        fam = gd.Family("home", gd.HOME, False, "")
+        total = 1000 * gd.GIB
+        with mock.patch.object(gd, "free_bytes", return_value=(100 * gd.GIB, total)):
+            plain = next(iter(gd.filesystems([fam], "1", "1", floor_gib=30.0).values()))
+            held = next(iter(gd.filesystems([fam], "30", "50", floor_gib=30.0, reserved=True).values()))
+        self.assertEqual(plain.low, int((30 + gd.POLICY["low_margin_gib"]) * gd.GIB))
+        self.assertEqual(held.low, 30 * gd.GIB)
+        self.assertEqual(held.target, int((30 + gd.POLICY["target_margin_gib"]) * gd.GIB))
 
     def run_disk(self, *args: str, reserved: str, floor: float, free_gib: float):
         """glaeda-disk's main on a fake fleet mini; returns (exit code, output, the families' low/target it used)."""
@@ -6546,8 +6621,8 @@ class HostReservationTest(unittest.TestCase):
         self.addCleanup(lambda: [setattr(gd, n, v) for n, v in saved.items()])
         self.addCleanup(lambda policy=dict(gd.POLICY): (gd.POLICY.clear(), gd.POLICY.update(policy)))
 
-        def filesystems(fams, low, target, *rest):
-            seen.update(low=low, target=target)
+        def filesystems(fams, low, target, *rest, reserved=False):
+            seen.update(low=low, target=target, **({"reserved": True} if reserved else {}))
             run.update(gd.RUN)
             raise SystemExit(0)  # stop before any survey: the gate is what is under test
         with mock.patch.object(gd, "host_reservation", return_value=reserved), \
@@ -6575,8 +6650,12 @@ class HostReservationTest(unittest.TestCase):
         self.assertEqual(seen, {})
         code, out, seen, run = self.run_disk("--pressure", "--idle", reserved=why, floor=30.0, free_gib=50)
         margin = gd.POLICY["target_margin_gib"]
-        self.assertEqual(seen, {"low": "30", "target": f"{30 + margin:g}"})
+        self.assertEqual(seen, {"low": "30", "target": f"{30 + margin:g}", "reserved": True})
         self.assertEqual(run["reserved"], why)
+        # the runner-cache profile is held to the same rule
+        code, out, seen, run = self.run_disk("--runner-caches", reserved=why, floor=30.0, free_gib=50)
+        self.assertIn("nothing deleted", out)
+        self.assertEqual(seen, {})
         # an unreserved host keeps its policy
         self.assertEqual(gd.DEFAULT_AGE_HOURS, 24.0, "the reserved run kept the legacy ages")
         for n, v in {n: 12.0 for n in ("DEFAULT_AGE_HOURS",)}.items():
