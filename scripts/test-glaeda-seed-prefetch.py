@@ -497,6 +497,7 @@ class GovernorTest(unittest.TestCase):
         self.write(folder, "a", leader.pid, started)
         os.kill(leader.pid, signal.SIGKILL)
         leader.wait()
+        leader.stdout.close()
         stat = lambda: subprocess.run(["ps", "-o", "stat=", "-p", str(member)], capture_output=True,
                                       text=True).stdout.strip()
         self.assertTrue(stat().startswith("T"))
