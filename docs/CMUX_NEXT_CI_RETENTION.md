@@ -76,9 +76,11 @@ included, and only:
 - under the runner floor hold while free space is still below the floor itself.
 
 It is never touched while its lock is held: the survey probes the lock, and the
-removal takes it exclusive, without waiting, across the rename, so a build that
-starts meanwhile falls back per instance and one that starts after sets up a
-fresh tree. A process open in it or naming it keeps it too. Among the other
+removal takes it exclusive, without waiting, and holds it while it removes every
+child except `lock` itself. The lock file keeps its inode, so a build that had
+already opened it still excludes every other build. A build that starts
+meanwhile falls back per instance, and one that starts after sets up a fresh
+tree. A process open in it or naming it keeps it too. Among the other
 cmux-next items, the per-instance states of a kind with a host root go first,
 and over the size cap such a state idle `cmux_next_ci_unowned_idle_hours` goes
 whole, inputs included, as an unowned one does (its runner's `Runner.Worker`

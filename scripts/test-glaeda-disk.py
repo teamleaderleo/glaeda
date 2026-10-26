@@ -3748,9 +3748,10 @@ class GlaedaDiskTest(unittest.TestCase):
         home, fam, st, host = self._cmux_next_host_tree()
         with mock.patch.object(gd, "CMUX_NEXT_HOST_FLOOR", {dev: 30 * gd.GIB}):
             _, removed, _ = self._floor_apply(home, fam, 10.0, 0.0, over=100 * gd.GIB)
-        self.assertEqual(removed, everything_else + [host])
-        self.assertFalse(host.exists())
-        self.assertFalse([p for p in host.parent.iterdir() if p.name.startswith(gd.DELETING_PREFIX)])
+        self.assertEqual(removed[:len(everything_else)], everything_else)
+        self.assertEqual(sorted(removed[len(everything_else):]), [host / "Release", host / "src"])  # last
+        # emptied, its lock left in place (the same inode a build may already have open), and no aside left
+        self.assertEqual([p.name for p in host.iterdir()], ["lock"])
 
     def test_the_per_host_cmux_next_root_is_kept_while_its_lock_is_held_and_goes_once_idle(self) -> None:
         home, fam, st, host = self._cmux_next_host_tree()
@@ -3777,15 +3778,14 @@ class GlaedaDiskTest(unittest.TestCase):
                     mock.patch.object(gd, "ACTIVITY_MODE", "sweep"), contextlib.redirect_stdout(io.StringIO()):
                 items = [i for i in gd.survey([fam], 6, 0) if Path(i.path) == host]
                 gd.apply(items, {fam.id: fam}, receipt, None, 6, all_families=[fam])
-            self.assertEqual(not host.exists(), gone, hours)
+            self.assertEqual(not (host / "src").exists(), gone, hours)
         # an interrupted removal's aside tree is finished like any other, unless a build holds its lock
-        aside = host.parent / f"{gd.DELETING_PREFIX}host-999999"
-        make(aside / "src")
-        (aside / "lock").write_text("")
+        aside = host / f"{gd.DELETING_PREFIX}src-999999"
+        make(aside / "x")
         with mock.patch.object(gd, "HOME", home):
-            self.assertIn(host.parent, gd.cmux_next_ci_host_parents(fam.root))
+            self.assertIn(host, gd.cmux_next_ci_host_parents(fam.root))
             self.assertEqual(gd.cmux_next_ci_aside_busy(aside, [], ""), "")
-            with open(aside / "lock", "a") as build:
+            with open(host / "lock", "a") as build:
                 fcntl.flock(build, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 self.assertIn("holds the host root", gd.cmux_next_ci_aside_busy(aside, [], ""))
         # [] in disk-policy.json turns the rule off: the tree is then nobody's to judge, and kept
@@ -3793,6 +3793,54 @@ class GlaedaDiskTest(unittest.TestCase):
             self.assertEqual(gd.cmux_next_ci_host_roots(fam.root), [])
         self.assertEqual(gd.POLICY_DEFAULTS["cmux_next_ci_host_roots"], ["dev-daily-release/host"])
         self.assertEqual(gd.POLICY_DEFAULTS["cmux_next_ci_host_idle_hours"], 48.0)
+
+    def test_the_host_lock_keeps_its_inode_so_a_build_that_opened_it_still_excludes_others(self) -> None:
+        # a build opened host/lock (fd 9) before the removal and flocks it after: a new lock file at the path would
+        # let a second build lock another inode and share host/src with it
+        home, fam, st, host = self._cmux_next_host_tree()
+        inode = (host / "lock").stat().st_ino
+        with open(host / "lock", "a") as early:
+            self.assertTrue(gd.remove_cmux_next_host(host))
+            fcntl.flock(early, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.assertEqual((host / "lock").stat().st_ino, inode)
+            with open(host / "lock", "a") as late, self.assertRaises(BlockingIOError):
+                fcntl.flock(late, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    def test_over_the_cap_an_idle_owned_fallback_state_goes_whole_without_a_floor_hold(self) -> None:
+        home, fam, st, host = self._cmux_next_host_tree()
+        for key in st:
+            self._age(st[key], hours=3)
+        self._age(st["daily"], hours=7)  # the owned per-instance fallback, idle past a job's timeout
+        receipt = self.receipt()
+        gd._DISCOVERED.clear()
+        with mock.patch.object(gd, "HOME", home), mock.patch.object(gd, "process_evidence", return_value=([], "")), \
+                mock.patch.object(gd, "command_lines", return_value=""), \
+                mock.patch.object(gd, "ACTIVITY_MODE", "pressure"), mock.patch.object(gd, "CMUX_NEXT_CI_OVER", 1), \
+                contextlib.redirect_stdout(io.StringIO()):
+            items = gd.survey([fam], 6, 0)
+            self.assertFalse(gd.cmux_next_ci_floor_slot(fam, st["daily"]))
+            gd.apply(items, {fam.id: fam}, receipt, None, 6, all_families=[fam])
+        records = [json.loads(line) for line in receipt.read_text().splitlines()]
+        self.assertEqual([(Path(r["path"]), r["outcome"]) for r in records], [(st["daily"], "reclaimed")])
+        self.assertFalse(st["daily"].exists())
+        self.assertTrue((host / "src").is_dir())
+
+    def test_a_finished_host_aside_counts_against_the_cap(self) -> None:
+        home, fam, st, host = self._cmux_next_host_tree()
+        aside = host / f"{gd.DELETING_PREFIX}src-999999"
+        make(aside / "x", mib=3)
+        inter = gd.Family(gd.INTERRUPTED, host, True, "finish", build_output=True, max_idle_hours=0.0,
+                          rebuild_minutes=0.1)
+        items = [gd.Item(gd.INTERRUPTED, os.fspath(aside), 3 * 1024 * 1024, 48, "reclaimable", []),
+                 gd.Item(fam.id, os.fspath(st["mini-glaeda"] / "Build"), 1024 * 1024, 5, "reclaimable", [])]
+        receipt = self.receipt()
+        with mock.patch.object(gd, "HOME", home), mock.patch.object(gd, "process_evidence", return_value=([], "")), \
+                mock.patch.object(gd, "command_lines", return_value=""), \
+                mock.patch.object(gd, "ACTIVITY_MODE", "pressure"), \
+                mock.patch.object(gd, "CMUX_NEXT_CI_OVER", 2 * 1024 * 1024), contextlib.redirect_stdout(io.StringIO()):
+            gd.apply(items, {fam.id: fam, inter.id: inter}, receipt, None, 6, all_families=[fam, inter])
+        self.assertFalse(aside.exists())
+        self.assertTrue((st["mini-glaeda"] / "Build").is_dir())  # the aside alone brought the cache under its cap
 
     def test_main_takes_the_per_host_cmux_next_root_after_idle_runners_checkouts(self) -> None:
         home, fam, st, host = self._cmux_next_host_tree()
