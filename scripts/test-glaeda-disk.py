@@ -39,6 +39,13 @@ spec = importlib.util.spec_from_loader("glaeda_disk", loader)
 gd = importlib.util.module_from_spec(spec)
 sys.modules["glaeda_disk"] = gd
 loader.exec_module(gd)
+# Every test runs on an unreserved host unless it says otherwise (HostReservationTest): an empty reservation list, so a
+# test's host never reads the real ~/.local/share/glaeda/fleet-reservations.json, or fails closed without one.
+_NO_RESERVATIONS = tempfile.NamedTemporaryFile("w", suffix="-fleet-reservations.json", delete=False)
+_NO_RESERVATIONS.write('{"schema": "glaeda-fleet-reservations/v1", "reservations": [], "aliases": {}}')
+_NO_RESERVATIONS.close()
+gd.FLEET_RESERVATIONS = Path(_NO_RESERVATIONS.name)
+gd.HOST_RESERVATION_LOCAL = Path(_NO_RESERVATIONS.name + ".none")
 # An --apply in a test must never reap the real $TMPDIR of the host running the suite: without a tmp of
 # the test's own, the TMPDIR reaper does nothing.
 _reap_tmpdir_test_residue = gd.reap_tmpdir_test_residue
@@ -6189,6 +6196,99 @@ class ActivityClockTest(unittest.TestCase):
             gd.main(["--pressure", "--no-snapshot"])
             gd.main(["--pressure", "--need", "50", "--no-snapshot"])
         self.assertEqual(seen, [("54", "70", 30.0), ("55", "71", 50.0)])
+
+class HostReservationTest(unittest.TestCase):
+    """A reserved fleet mini gets floor-pressure eviction only, at the pre-2026-10-26 ages (config/fleet-reservations.json)."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.list = self.root / "fleet-reservations.json"
+        self.local = self.root / "reservation.json"
+        self.list.write_text(json.dumps({"schema": "glaeda-fleet-reservations/v1", "aliases": {"cmux30": ["cmux-thirty"]},
+                                         "reservations": [{"id": "r1", "owner": "someone", "hosts": ["cmux30"],
+                                                           "from": "2026-10-25T22:00:00Z",
+                                                           "until": "2026-10-28T23:59:59Z"}]}))
+        self.during = gd.reservation_time("2026-10-27T00:00:00Z")
+
+    def reserved(self, names, now=None) -> str:
+        return gd.host_reservation(self.during if now is None else now, self.list, set(names), self.local)
+
+    def test_an_active_entry_or_alias_reserves_and_it_lapses_by_itself(self) -> None:
+        self.assertIn("reserved for someone until 2026-10-28T23:59:59Z (r1)", self.reserved({"cmux30"}))
+        self.assertIn("reserved for someone", self.reserved({"CMUX-Thirty"}))
+        self.assertEqual(self.reserved({"cmux31"}), "")
+        self.assertEqual(self.reserved({"cmux30"}, gd.reservation_time("2026-10-29T00:00:00Z")), "", "lapsed")
+        self.assertEqual(self.reserved({"cmux30"}, gd.reservation_time("2026-10-25T21:59:59Z")), "", "not yet")
+
+    def test_an_unreadable_list_fails_closed(self) -> None:
+        self.list.write_text("{nope")
+        self.assertIn("unreadable", self.reserved({"cmux31"}))
+        self.list.unlink()
+        self.assertIn("unreadable", self.reserved({"cmux31"}))
+
+    def test_the_host_local_reservation_counts(self) -> None:
+        now = int(self.during)
+        self.local.write_text(json.dumps({"schema": "glaeda-reservation/v1", "owner": "fleet", "since": now - 60,
+                                          "until": now + 60}))
+        self.assertIn("host reservation by fleet", self.reserved({"cmux31"}))
+        self.local.write_text(json.dumps({"schema": "glaeda-reservation/v1", "owner": "fleet", "since": now - 60,
+                                          "until": now - 1}))
+        self.assertEqual(self.reserved({"cmux31"}), "")
+
+    def test_the_shipped_list_parses_and_matches_the_registry_where_it_is_checked_out(self) -> None:
+        shipped = json.loads((ROOT / "config/fleet-reservations.json").read_text())
+        for e in shipped["reservations"]:
+            gd.reservation_time(e["from"]), gd.reservation_time(e["until"])
+            self.assertTrue(e["hosts"] and e["owner"] and e["id"])
+        registry = Path(os.environ.get("GLAEDA_FLEET_REGISTRY")
+                        or Path.home() / "Projects/leo-workspace/machines/fleet-registry.json")
+        if not registry.is_file():
+            self.skipTest("leo-workspace's fleet registry is not checked out here")
+        want = [{k: e[k] for k in ("id", "owner", "hosts", "from", "until") if k in e}
+                for e in json.loads(registry.read_text()).get("reservations", [])]
+        self.assertEqual(shipped["reservations"], want, "config/fleet-reservations.json is behind the registry")
+
+    def run_disk(self, *args: str, reserved: str, floor: float, free_gib: float):
+        """glaeda-disk's main on a fake fleet mini; returns (exit code, output, the families' low/target it used)."""
+        seen, run = {}, {}
+
+        def filesystems(fams, low, target, *rest):
+            seen.update(low=low, target=target)
+            run.update(gd.RUN)
+            raise SystemExit(0)  # stop before any survey: the gate is what is under test
+        with mock.patch.object(gd, "host_reservation", return_value=reserved), \
+                mock.patch.object(gd, "runner_floor_gib", return_value=floor), \
+                mock.patch.object(gd, "DARWIN", True), mock.patch.object(gd, "filesystems", side_effect=filesystems), \
+                mock.patch.object(gd, "disk_off", return_value=""), mock.patch.dict(gd.RUN, clear=True), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            try:
+                code = gd._main_impl(["--apply", "--top", "0", "--no-snapshot", *args])
+            except SystemExit as stop:
+                code = stop.code
+        return code, out.getvalue(), seen, run
+
+    def test_a_reserved_host_runs_only_floor_pressure_to_the_floor_plus_the_margin(self) -> None:
+        why = "reserved for someone until 2026-10-28T23:59:59Z (r1)"
+        for args in (("--idle",), ()):
+            with self.subTest(args=args):
+                code, out, seen, run = self.run_disk(*args, reserved=why, floor=30.0, free_gib=50)
+                self.assertEqual(code, 0)
+                self.assertIn("only floor-pressure eviction runs here", out)
+                self.assertIn("nothing deleted", out)
+                self.assertEqual(seen, {}, "never reached a survey")
+        code, out, seen, run = self.run_disk("--pressure", "--idle", reserved=why, floor=0.0, free_gib=50)
+        self.assertIn("no runner floor", out)
+        self.assertEqual(seen, {})
+        code, out, seen, run = self.run_disk("--pressure", "--idle", reserved=why, floor=30.0, free_gib=50)
+        margin = gd.POLICY["target_margin_gib"]
+        self.assertEqual(seen, {"low": "30", "target": f"{30 + margin:g}"})
+        self.assertEqual(run["reserved"], why)
+        # an unreserved host keeps its policy
+        code, out, seen, run = self.run_disk("--pressure", reserved="", floor=30.0, free_gib=50)
+        self.assertEqual(seen, {"low": gd.POLICY["low"], "target": gd.POLICY["target"]})
+
 
 if __name__ == "__main__":
     unittest.main()

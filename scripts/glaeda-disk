@@ -5212,6 +5212,64 @@ def runner_floor_gib(home: Path = HOME) -> float:
     return floor
 
 
+# A fleet reservation (leo-workspace machines/fleet-registry.json `reservations`, shipped as
+# config/fleet-reservations.json and installed here by glaeda-mini-setup) hands a host to one person for a while. On a
+# reserved fleet mini only floor-pressure eviction runs: no idle sweep, and a pressure run acts only below the runner
+# floor and works only to the floor plus target_margin_gib, so state its holder keeps idle is not aged out. The
+# host-local fleet reservation (FLEET_ROOT/reservation.json, glaeda-reservation/v1, the one the runner hook reads)
+# counts too. Fails closed: an unreadable or missing list on a fleet mini reads as reserved.
+FLEET_RESERVATIONS = HOME / ".local/share/glaeda/fleet-reservations.json"
+UPDATE_CONFIG = HOME / ".config/glaeda/update.json"
+HOST_RESERVATION_LOCAL = FLEET_ROOT / "reservation.json"
+
+
+def reservation_time(value: Any) -> float:
+    """An ISO 8601 time (Z or an offset; a naive one is UTC) as Unix seconds; ValueError otherwise."""
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"not an ISO 8601 time: {value!r}")
+    text = value.strip()
+    text = text[:-1] + "+00:00" if text[-1:] in "Zz" else text
+    import datetime as _dt
+    when = _dt.datetime.fromisoformat(text)
+    return (when if when.tzinfo else when.replace(tzinfo=_dt.timezone.utc)).timestamp()
+
+
+def host_names() -> set[str]:
+    """This host's names as the registry spells them: glaeda-update's configured host, and the machine name without
+    .local, lowercased."""
+    names = {platform.node().split(".")[0].lower()}
+    with contextlib.suppress(OSError, ValueError, AttributeError):
+        host = json.loads(UPDATE_CONFIG.read_text()).get("host")
+        if isinstance(host, str) and host:
+            names.add(host.lower())
+    return {n for n in names if n}
+
+
+def host_reservation(now: float | None = None, path: Path | None = None, names: set[str] | None = None,
+                     local: Path | None = None) -> str:
+    """Why this host is reserved now ("" when it is not): an active fleet reservation naming it (or an alias), an
+    active host-local reservation, or a reservation list that cannot be read."""
+    now = time.time() if now is None else now
+    names = host_names() if names is None else {n.lower() for n in names}
+    try:
+        doc = json.loads((FLEET_RESERVATIONS if path is None else path).read_text())
+        entries, aliases = doc["reservations"], doc.get("aliases") or {}
+        if not isinstance(entries, list) or not isinstance(aliases, dict):
+            raise ValueError("malformed")
+        for e in entries:
+            hosts = {str(h).lower() for h in e["hosts"]}
+            hosts |= {str(a).lower() for h in e["hosts"] for a in aliases.get(h, [])}
+            if names & hosts and reservation_time(e["from"]) <= now <= reservation_time(e["until"]):
+                return f"reserved for {e.get('owner', '?')} until {e['until']} ({e.get('id', '?')})"
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        return f"fleet reservations unreadable ({type(error).__name__}); kept as reserved"
+    with contextlib.suppress(OSError, ValueError, TypeError, AttributeError):
+        held = json.loads((HOST_RESERVATION_LOCAL if local is None else local).read_text())
+        if held.get("schema") == "glaeda-reservation/v1" and int(held["since"]) <= now < int(held["until"]):
+            return f"host reservation by {held.get('owner', '?')} until {held['until']}"
+    return ""
+
+
 def filesystems(fams: list[Family], low: str, target: str,
                 tmpfs_low: str = "75%", tmpfs_target: str = "90%", floor_gib: float = 0.0) -> dict[int, Fs]:
     out: dict[int, Fs] = {}
@@ -7745,8 +7803,21 @@ def _main_impl(argv: list[str] | None = None) -> int:
         # home traversal.
         print("runner cache profile: no configured cache roots")
         return 0
+    reserved = host_reservation() if role == "fleet-mini" and DARWIN and a.apply and not RUNNER_CACHE_PROFILE else ""
     try:
         floor_gib = max(runner_floor_gib(), a.floor_gib if math.isfinite(a.floor_gib) else 0.0)
+        if reserved:
+            RUN["reserved"] = reserved
+            a.idle = False  # no idle sweep on a reserved host
+            if not a.pressure or floor_gib <= 0:
+                print(f"{reserved}: only floor-pressure eviction runs here"
+                      f"{'' if a.pressure else ' (--pressure)'}{'' if floor_gib > 0 else ', and it has no runner floor'}; "
+                      "nothing deleted")
+                RUN["skipped"] = "reserved host: floor-pressure eviction only"
+                return 0
+            # pressure below the floor only, and only back to the floor plus the margin
+            a.low, a.target = f"{floor_gib:g}", f"{floor_gib + POLICY['target_margin_gib']:g}"
+            print(f"{reserved}: only floor-pressure eviction runs here")
         fss = filesystems(fams or [Family("home", HOME, False, "")], a.low, a.target,
                           a.tmpfs_low, a.tmpfs_target, floor_gib)
         space(a.emergency, GIB)

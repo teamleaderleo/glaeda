@@ -38,6 +38,8 @@ from __future__ import annotations
 
 import argparse
 import errno
+import importlib.machinery
+import importlib.util
 import fcntl
 import json
 import os
@@ -58,6 +60,24 @@ BUSY = re.compile(r"(^|/)(xcodebuild|SWBBuildService|XCBBuildService)(\s|$)"
 PRUNING = ".cas.pruning-"  # a local CAS renamed aside for deletion
 GC_EVERY = 86400  # seconds between fleet-store gc runs
 GC_REPORT = re.compile(r"kept entries naming no stored object: (\d+)")
+
+
+def reserved_above_floor() -> str:
+    """Why this host is left alone: a fleet reservation holds it (glaeda-disk's host_reservation, read from the
+    glaeda-disk installed beside this script) and free disk is at or above its runner floor. "" when not."""
+    try:
+        loader = importlib.machinery.SourceFileLoader("glaeda_disk_for_prune", os.fspath(Path(__file__).with_name("glaeda-disk")))
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        gd = importlib.util.module_from_spec(spec)
+        loader.exec_module(gd)
+        why = gd.host_reservation()
+        floor = gd.runner_floor_gib()
+    except Exception as error:  # noqa: BLE001  (fail closed: no glaeda-disk to ask, so treat the host as reserved)
+        return f"cannot read fleet reservations ({type(error).__name__}); kept as reserved"
+    if not why:
+        return ""
+    free = shutil.disk_usage(ROOT if ROOT.is_dir() else Path.home()).free / GIB
+    return "" if floor > 0 and free < floor else f"{why}; {free:.0f} GiB free, floor {floor:g}"
 
 
 def busy(commands: list[str]) -> str:
@@ -206,6 +226,10 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     writer = is_writer(ROOT)
     rec["role"] = "writer" if writer else "reader"
+    if a.apply and (held := reserved_above_floor()):  # a reserved host's caches are its holder's until the floor
+        rec["result"] = f"deferred: {held}"
+        print(json.dumps(rec))
+        return 0
     commands = running_commands()
     if commands is None:
         rec["result"] = "deferred: ps failed, cannot rule out a running build"

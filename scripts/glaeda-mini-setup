@@ -194,6 +194,7 @@ DAEMON_UNITS = frozenset({"glaeda-gh.service"})
 SKILL_SOURCE = REPO / "skills/github-ci-wait/SKILL.md"
 DAEMON_POLICY_SOURCE = REPO / "config/macos-daemons.json"  # desired state of macOS system daemons
 CLAUDE_ROUTES_SOURCE = REPO / "config/claude-routes.json"  # the fleet routes glaeda-mini-health keeps Claude on
+FLEET_RESERVATIONS_SOURCE = REPO / "config/fleet-reservations.json"  # who holds which fleet host; glaeda-disk reads it
 # glaeda-update runs this command from a release; it sets this so setup never unloads the job running it
 UPDATE_ENV = "GLAEDA_UPDATE_RUNNING"
 OTA_RINGS = ("canary", "stable")
@@ -987,6 +988,11 @@ def skill_path(ctx: Context) -> Path:
     return ctx.home / ".claude/skills/github-ci-wait/SKILL.md"
 
 
+def fleet_reservations_path(ctx: Context) -> Path:
+    """config/fleet-reservations.json, where glaeda-disk and glaeda-fleet-cas-prune read it (FLEET_RESERVATIONS)."""
+    return ctx.home / ".local/share/glaeda/fleet-reservations.json"
+
+
 def daemon_policy_path(ctx: Context) -> Path:
     """config/macos-daemons.json, where glaeda-mini-health and glaeda-daemon-heal read it."""
     return ctx.home / ".local/share/glaeda/macos-daemons.json"
@@ -1286,7 +1292,8 @@ def plan_install(ctx: Context) -> list[dict[str, Any]]:
 def plan_hygiene_tools(ctx: Context) -> list[dict[str, Any]]:
     """The macOS daemon policy and glaeda-worktree-reclaim: the parts of a hygiene install beyond the scripts."""
     actions: list[dict[str, Any]] = []
-    for dest, source in ((daemon_policy_path(ctx), DAEMON_POLICY_SOURCE), (claude_routes_path(ctx), CLAUDE_ROUTES_SOURCE)):
+    for dest, source in ((daemon_policy_path(ctx), DAEMON_POLICY_SOURCE), (claude_routes_path(ctx), CLAUDE_ROUTES_SOURCE),
+                         (fleet_reservations_path(ctx), FLEET_RESERVATIONS_SOURCE)):
         act = file_action(ctx, "tool", dest, source.read_bytes(), 0o644)
         act["source"] = os.fspath(source)
         actions.append(act)
@@ -1483,6 +1490,7 @@ def plan_uninstall(ctx: Context) -> list[dict[str, Any]]:
     actions.append({"kind": "tool", "path": os.fspath(skill_path(ctx))})
     actions.append({"kind": "tool", "path": os.fspath(daemon_policy_path(ctx))})
     actions.append({"kind": "tool", "path": os.fspath(claude_routes_path(ctx))})
+    actions.append({"kind": "tool", "path": os.fspath(fleet_reservations_path(ctx))})
     for marker in scan_exclusion_markers(ctx):
         actions.append({"kind": "marker", "path": os.fspath(marker)})
     for act in actions:
