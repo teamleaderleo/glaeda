@@ -4493,28 +4493,55 @@ class GlaedaDiskTest(unittest.TestCase):
         self.assertEqual(removed, [])
         self.assertTrue(all(c.is_dir() for c in cos.values()))
 
+    def _git_checkout(self, co: Path, pushed: bool = True) -> None:
+        """A real checkout at co whose HEAD is on origin/main (pushed) or one commit past it."""
+        env = {"PATH": "/usr/bin:/bin:/opt/homebrew/bin", "HOME": os.fspath(self.root), "GIT_AUTHOR_NAME": "t",
+               "GIT_AUTHOR_EMAIL": "t@x", "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@x"}
+
+        def git(*args: str) -> None:
+            subprocess.run(["git", "-C", os.fspath(co), *args], env=env, check=True, capture_output=True)
+        if (co / ".git").exists():
+            shutil.rmtree(co / ".git")
+        co.mkdir(parents=True, exist_ok=True)
+        git("init", "-q")
+        git("commit", "-q", "--allow-empty", "-m", "base")
+        git("update-ref", "refs/remotes/origin/main", "HEAD")
+        git("checkout", "-q", "--detach")
+        if not pushed:
+            git("commit", "-q", "--allow-empty", "-m", "local only")
+        (co / "build-output.o").write_text("x")  # untracked build output never keeps a checkout
+
     def test_stale_runner_checkouts_go_above_the_floor_and_without_one(self) -> None:
         """Old runner work dirs go by age: a checkout no job used for DEFAULT_AGE_HOURS goes whatever the free space,
-        oldest first and every one of them; younger ones stay above the floor."""
+        unless git would lose something (a commit on no remote-tracking ref) or holds a lock; younger ones stay."""
         stale = gd.RUNNER_STALE_CHECKOUT_HOURS
         self.assertEqual(stale, 12.0)
-        home, cos = self._idle_checkouts({"actions-runner-glaeda": stale + 1, "actions-runner-glaeda-2": stale + 30,
-                                          "actions-runner-glaeda-3": stale - 1})
+        names = {"actions-runner-glaeda": stale + 1, "actions-runner-glaeda-2": stale + 30,
+                 "actions-runner-glaeda-3": stale - 1, "actions-runner-glaeda-4": stale + 2,
+                 "actions-runner-glaeda-5": stale + 3}
+        home, cos = self._idle_checkouts(names)
         gd.process_evidence = lambda: ([], "")
         for floor in (30.0, 0.0):
             with self.subTest(floor=floor):
+                for name, age in names.items():
+                    self._git_checkout(cos[name], pushed=name != "actions-runner-glaeda-4")
+                    if name == "actions-runner-glaeda-5":
+                        (cos[name] / ".git/index.lock").write_text("")
+                    self._age(home / name, hours=age)
                 patches, removed = self._floor_disk(400.0)  # far above the floor and its target
                 receipt = self.receipt()
                 with patches[0], patches[1], contextlib.redirect_stdout(io.StringIO()) as out:
                     self.assertGreater(gd.evict_idle_runner_checkouts(receipt, floor, home), 0)
-                self.assertEqual(sorted(removed), sorted([str(cos["actions-runner-glaeda-2"]), str(cos["actions-runner-glaeda"])]))
-                self.assertTrue(cos["actions-runner-glaeda-3"].is_dir())
+                self.assertEqual(sorted(removed), sorted([str(cos["actions-runner-glaeda-2"]),
+                                                          str(cos["actions-runner-glaeda"])]))
+                for name in ("actions-runner-glaeda-3", "actions-runner-glaeda-4", "actions-runner-glaeda-5"):
+                    self.assertTrue((cos[name] / ".git").is_dir(), name)
                 self.assertIn("unused for 12 h", out.getvalue())
-                recs = [json.loads(line) for line in receipt.read_text().splitlines()]
-                self.assertEqual({r["reasons"][0] for r in recs}, {"unused for 12 h"})
-                for name in ("actions-runner-glaeda", "actions-runner-glaeda-2"):  # back for the next floor
-                    (cos[name] / ".git").mkdir(parents=True)
-                    self._age(home / name, hours=stale + 1)
+                why = {Path(r["path"]).parts[-4]: (r["outcome"], r["reasons"][0])
+                       for r in map(json.loads, receipt.read_text().splitlines())}
+                self.assertEqual(why["actions-runner-glaeda-4"], ("blocked:git", "a commit here is on no remote-tracking ref"))
+                self.assertEqual(why["actions-runner-glaeda-5"], ("blocked:git", "git holds a lock in it"))
+                self.assertEqual(why["actions-runner-glaeda"], ("reclaimed", "unused for 12 h"))
 
     def test_every_disposable_age_is_twelve_hours(self) -> None:
         """Leo, 2026-10-26: "When have we ever had something useful greater than 12 hours?" Only the newest warm

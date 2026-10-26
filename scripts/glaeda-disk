@@ -1940,6 +1940,34 @@ def runner_checkout_last_use(runner: Path, checkout: Path) -> float:
     return max(times)
 
 
+GIT_LOCK_NAMES = ("index.lock", "HEAD.lock", "shallow.lock", "packed-refs.lock", "config.lock", "ORIG_HEAD.lock")
+
+
+def runner_checkout_git_veto(checkout: Path) -> str:
+    """Why a stale runner checkout must stay for git's sake, or "": git holds a lock in it, or a commit there (HEAD, a
+    local branch or tag, the stash, any worktree's HEAD) is on no remote-tracking ref. Untracked and ignored files are
+    a job's build output and go with it. Any doubt (git fails or times out) keeps it."""
+    dotgit = checkout / ".git"
+    if dotgit.is_symlink() or not dotgit.is_dir():
+        return "not a plain checkout (.git is not a directory)"
+    with contextlib.suppress(OSError):
+        for root, dirs, files in os.walk(dotgit):
+            dirs[:] = [d for d in dirs if d not in ("objects", "lfs", "logs")]
+            if any(f in GIT_LOCK_NAMES or (f.endswith(".lock") and "refs" in Path(root).relative_to(dotgit).parts)
+                   for f in files):
+                return "git holds a lock in it"
+    env = {**os.environ, "GIT_OPTIONAL_LOCKS": "0"}
+    try:
+        tips = subprocess.run(["git", "-C", os.fspath(checkout), "for-each-ref", "--format=%(objectname)",
+                               "refs/heads", "refs/tags", "refs/stash"], capture_output=True, text=True, timeout=60,
+                              env=env, check=True).stdout.split()
+        local = subprocess.run(["git", "-C", os.fspath(checkout), "rev-list", "--max-count=1", "HEAD", *tips,
+                                "--not", "--remotes"], capture_output=True, text=True, timeout=120, env=env, check=True)
+    except (OSError, subprocess.SubprocessError):
+        return "git could not say whether a commit is only here"
+    return "a commit here is on no remote-tracking ref" if local.stdout.strip() else ""
+
+
 def idle_runner_checkout_veto(runner: Path, checkout: Path, opened: frozenset[str], cmds: str) -> str:
     """Why an idle runner's checkout must stay, or "" when it may go."""
     path = os.fspath(checkout)
@@ -1996,9 +2024,12 @@ def evict_idle_runner_checkouts(receipt: Path, floor_gib: float, home: Path | No
             print(f"refusing to delete idle runner checkouts: {e}", file=sys.stderr)
             break
         why = idle_runner_checkout_veto(runner, checkout, open_index(opened), cmds)
+        if not why and stale and not under:  # above the floor only what git can lose nothing of goes
+            why = runner_checkout_git_veto(checkout)
         size = 0
         if why:
-            outcome = "changed:modified" if why.startswith("used within") else "changed:in-use"
+            outcome = ("changed:modified" if why.startswith("used within")
+                       else "blocked:git" if why.startswith(("git", "a commit", "not a plain")) else "changed:in-use")
         else:
             try:
                 before = free_bytes(home)[0]
