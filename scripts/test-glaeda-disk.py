@@ -3441,10 +3441,12 @@ class GlaedaDiskTest(unittest.TestCase):
         try:
             server.bind(os.fspath(sock_dir / "s"))
             os.rename(sock_dir / "s", aside / "Build" / "s")
-            with mock.patch.object(gd, "HOME", home), contextlib.redirect_stdout(io.StringIO()):
+            # the generic search gives up past its budget (where it meets the wide cache first depends on the
+            # filesystem's listing order, so that is simulated): the aside's own vetoes still see the socket
+            with mock.patch.object(gd, "HOME", home), mock.patch.object(gd, "holds_socket", return_value=False), \
+                    contextlib.redirect_stdout(io.StringIO()):
                 fams = [f for f in gd.interrupted_families([fam]) if f.root == scheme]
                 self.assertEqual(len(fams), 1)
-                self.assertFalse(gd.holds_socket(aside))  # the generic search gives up past its budget
                 self.assertIn("socket", gd.cmux_next_ci_aside_busy(aside, [], ""))
                 worker = f"{home}/actions-runner-glaeda/bin/Runner.Worker spawnclient 1 2\n"
                 os.unlink(aside / "Build" / "s")
