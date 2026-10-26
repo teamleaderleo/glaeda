@@ -5318,6 +5318,25 @@ def host_reservation(now: float | None = None, path: Path | None = None, names: 
     return ""
 
 
+# The ages before DEFAULT_AGE_HOURS (2026-10-26). A host a fleet reservation holds keeps them (and gets only
+# floor-pressure eviction, _main_impl): its holder's idle state is theirs until the reservation lapses, when the 12 h
+# ages apply by themselves. Family minimums that read DEFAULT_AGE_HOURS take its legacy value, 24 h.
+LEGACY_AGES = {"DEFAULT_AGE_HOURS": 24.0, "KEPT_BUILD_IDLE_HOURS": 24.0, "IDLE_SWEEP_HOURS": 24.0,
+               "PARKED_NO_LOG_IDLE_HOURS": 168.0, "CMUX_NEXT_CI_MIN_IDLE_HOURS": 72.0,
+               "CANONICAL_ADMISSION_IDLE_HOURS": 24.0, "IDLE_SEED_HOURS": 12.0, "RUNTIME_IDLE_DAYS": 14.0,
+               "CHECKOUT_BUILD_IDLE_HOURS": 24.0, "TMP_TEST_RESIDUE_IDLE_HOURS": 48.0,
+               "RUNNER_STALE_CHECKOUT_HOURS": float("inf")}
+LEGACY_POLICY = {"soft_idle_hours": 24.0, "stale_marker_max_hours": 48.0, "cmux_next_ci_host_idle_hours": 48.0}
+
+
+def keep_legacy_ages() -> None:
+    """Put back the pre-12 h ages for this run (a reserved host). POLICY keys a disk-policy.json sets stay its own."""
+    globals().update(LEGACY_AGES)
+    for key, value in LEGACY_POLICY.items():
+        if POLICY.get(key) == POLICY_DEFAULTS.get(key):
+            POLICY[key] = value
+
+
 def filesystems(fams: list[Family], low: str, target: str,
                 tmpfs_low: str = "75%", tmpfs_target: str = "90%", floor_gib: float = 0.0) -> dict[int, Fs]:
     out: dict[int, Fs] = {}
@@ -7857,6 +7876,7 @@ def _main_impl(argv: list[str] | None = None) -> int:
         floor_gib = max(runner_floor_gib(), a.floor_gib if math.isfinite(a.floor_gib) else 0.0)
         if reserved:
             RUN["reserved"] = reserved
+            keep_legacy_ages()
             a.idle = False  # no idle sweep on a reserved host
             if not a.pressure or floor_gib <= 0:
                 print(f"{reserved}: only floor-pressure eviction runs here"
