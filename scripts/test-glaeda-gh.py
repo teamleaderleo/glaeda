@@ -3259,6 +3259,21 @@ class LaunchdRestartTest(unittest.TestCase):
                 self.assertTrue(gg.service_loaded())
             self.assertFalse(gg.service_loaded())
 
+    def test_no_restart_begins_while_a_shell_serve_runs_its_probes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(gg, "BASE", Path(tmp)), \
+                mock.patch.object(gg.sys, "platform", "darwin"):
+            won: list[bool] = []
+
+            def fake(argv: list[str], timeout: float | None = None) -> subprocess.CompletedProcess:
+                with open(Path(tmp) / "restart.lock", "a+") as restart:  # a restart's own open, mid-probe
+                    won.append(gg.try_lock(restart))
+                return subprocess.CompletedProcess(argv, gg.NOT_LOADED, "", "")
+            with mock.patch.object(gg, "run_bounded", fake):
+                self.assertFalse(gg.service_loaded())
+            self.assertEqual(won, [False, False, False])  # one try per probe, each refused
+            with open(Path(tmp) / "restart.lock", "a+") as restart:
+                self.assertTrue(gg.try_lock(restart))  # and released afterwards
+
     def test_a_login_or_logout_during_a_restart_changes_nothing(self) -> None:
         uid = os.getuid()
         for first, then in ((f"user/{uid}", f"gui/{uid}"), (f"gui/{uid}", f"user/{uid}")):
