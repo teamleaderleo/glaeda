@@ -4573,6 +4573,25 @@ class GlaedaDiskTest(unittest.TestCase):
                                  ("blocked:git", "a commit here is on no remote-tracking ref"))
                 self.assertEqual(why["actions-runner-glaeda"], ("reclaimed", "unused for 12 h"))
 
+    def test_the_git_veto_ignores_the_callers_git_env_and_keeps_what_it_cannot_read(self) -> None:
+        co = self.root / "veto/_work/cmux/cmux"
+        self._git_checkout(co, pushed=False)
+        other = self.root / "other"
+        self._git_checkout(other, pushed=True)
+        with mock.patch.dict(os.environ, {"GIT_DIR": os.fspath(other / ".git"), "GIT_WORK_TREE": os.fspath(other)}):
+            self.assertEqual(gd.runner_checkout_git_veto(co), "a commit here is on no remote-tracking ref")
+        self._git_checkout(co, pushed=True)
+        self.assertEqual(gd.runner_checkout_git_veto(co), "")
+        locked = co / ".git/worktrees/hidden"
+        locked.mkdir(parents=True)
+        locked.chmod(0)
+        try:  # tearDown removes the tree before any addCleanup runs, so the mode goes back here
+            if os.access(locked, os.R_OK):
+                self.skipTest("running as a user who can read a mode-0 directory")
+            self.assertEqual(gd.runner_checkout_git_veto(co), "git could not say whether it holds a lock")
+        finally:
+            locked.chmod(0o755)
+
     def test_every_disposable_age_is_twelve_hours(self) -> None:
         """Leo, 2026-10-26: "When have we ever had something useful greater than 12 hours?" Only the newest warm
         compile cache per builder (the per-host cmux-next root) is exempt, by role."""
@@ -6737,6 +6756,8 @@ class HostReservationTest(unittest.TestCase):
             {"reservations": [dict(good, hosts=[31])]},
             {"reservations": ["cmux31"]},
             {"reservations": [dict(good, until="soon")]},  # a bad time on an entry naming another host
+            {"reservations": [dict(good, hosts=["cmux31"], until=good["from"])]},  # zero length
+            {"reservations": [dict(good, hosts=["cmux31"], **{"from": good["until"], "until": good["from"]})]},
             {"reservations": [good], "aliases": {"cmux40": "cmux-forty"}},
             {"reservations": [good], "aliases": []},
         )
@@ -6783,6 +6804,63 @@ class HostReservationTest(unittest.TestCase):
         self.assertEqual(plain.low, int((30 + gd.POLICY["low_margin_gib"]) * gd.GIB))
         self.assertEqual(held.low, 30 * gd.GIB)
         self.assertEqual(held.target, int((30 + gd.POLICY["target_margin_gib"]) * gd.GIB))
+
+    def test_a_local_marker_that_is_there_but_unreadable_holds_the_host(self) -> None:
+        now = int(self.during)
+        for text in ("{nope", "[]", json.dumps({"schema": "other", "since": now - 60, "until": now + 60}),
+                     json.dumps({"schema": "glaeda-reservation/v1", "since": "yesterday", "until": now + 60}),
+                     json.dumps({"schema": "glaeda-reservation/v1", "until": now + 60})):
+            with self.subTest(text=text):
+                self.local.write_text(text)
+                self.assertIn("marker unreadable", self.reserved({"cmux31"}))
+        self.local.write_text(json.dumps({"schema": "glaeda-reservation/v1", "since": now + 600, "until": now + 900}))
+        self.assertIn("host reservation", self.reserved({"cmux31"}), "a future since holds, as the runner hook reads it")
+        real_read = Path.read_text
+
+        def read_text(path, *args, **kwargs):
+            if path == self.local:
+                raise PermissionError("denied")
+            return real_read(path, *args, **kwargs)
+        with mock.patch.object(Path, "read_text", read_text):
+            self.assertIn("marker unreadable (PermissionError)", self.reserved({"cmux31"}))
+        self.local.unlink()
+        self.assertEqual(self.reserved({"cmux31"}), "", "no marker, no hold")
+
+    def test_a_reserved_pressure_pass_does_nothing_but_evict(self) -> None:
+        """Under its floor, a reserved host runs the pressure pass and nothing else: no marker clearing, paused-work
+        cleanup, test-residue reaping, clone gc or repack; and no dedupe at all."""
+        empty = self.root / "empty"
+        empty.mkdir()
+        state = self.root / "state"
+        state.mkdir()
+        why = "reserved for someone until 2026-10-28T23:59:59Z (r1)"
+        with contextlib.ExitStack() as stack:
+            for name in ("SNAPSHOT", "DEDUPE_STATE", "CMUX_NEXT_CAP_RECORD", "MEASURE_LOCK", "ACCOUNTING",
+                         "HEALTH_SUMMARY", "EVICT_LOCK", "HOOK_PASS_LOCK", "HOOK_PASS_PENDING", "EVICT_OWNER",
+                         "NESTED_KEEP"):
+                stack.enter_context(mock.patch.object(gd, name, state / name))
+            for name in ("clear_stale_build_markers", "cleanup_paused_runner_work", "reap_tmpdir_test_residue",
+                         "gc_home_clones", "repack_runner_checkouts", "dedupe_xcode", "dedupe_captures"):
+                stack.enter_context(mock.patch.object(gd, name, side_effect=AssertionError(f"{name} ran")))
+            stack.enter_context(mock.patch.object(gd, "default_families",
+                                                  return_value=[gd.Family("tmp", empty, True, "scratch")]))
+            stack.enter_context(mock.patch.object(gd, "host_reservation", return_value=why))
+            stack.enter_context(mock.patch.object(gd, "runner_floor_gib", return_value=30.0))
+            stack.enter_context(mock.patch.object(gd, "free_bytes", return_value=(20 * gd.GIB, 1000 * gd.GIB)))
+            stack.enter_context(mock.patch.object(gd, "DARWIN", True))
+            stack.enter_context(mock.patch.object(gd, "disk_off", return_value=""))
+            stack.enter_context(mock.patch.object(gd, "notify_disk"))
+            evict = stack.enter_context(mock.patch.object(gd, "evict_idle_runner_checkouts", return_value=0))
+            stack.enter_context(mock.patch.dict(gd.RUN, clear=True))
+            out = stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
+            for args in (("--pressure",), ("--dedupe",), ("--dedupe-builds",)):
+                with self.subTest(args=args):
+                    code = gd._main_impl(["--apply", "--top", "0", "--no-snapshot",
+                                          "--receipt", os.fspath(self.root / "receipt.jsonl"), *args])
+                    self.assertEqual(code, 0, out.getvalue())
+        self.assertIn("eviction summary", out.getvalue(), "the pressure pass itself ran")
+        evict.assert_called_once()  # the floor's last resort still runs
+        self.assertIn("no dedupe", out.getvalue())
 
     def run_disk(self, *args: str, reserved: str, floor: float, free_gib: float):
         """glaeda-disk's main on a fake fleet mini; returns (exit code, output, the families' low/target it used)."""
