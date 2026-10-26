@@ -5637,9 +5637,10 @@ DISK_TARGET_MAX_AGE_S = 6 * 3600  # an older target is not trusted: the trigger 
 DISK_BOUND = """# glaeda-disk-bound (leftover_spared reads this name)
 # argv: TIMEOUT LIFETIME LOCK PENDING EVICT_LOCK GLAEDA-DISK-ARGV...
 # Holds LOCK while it runs passes, one at a time; never runs one without it. A trigger writes PENDING, then starts
-# this; one that finds LOCK held exits at once and leaves PENDING to the holder. The holder removes PENDING only right
-# before a pass that starts after it, puts it back when that pass did not run (another evict.lock holder past the
-# bound, or glaeda-disk skipping as busy), and checks it again after it lets go of LOCK, so no trigger is dropped.
+# this; one that finds LOCK held exits at once and leaves PENDING to the holder. The holder renames PENDING to
+# PENDING.claimed right before a pass that starts after it and removes that only once the pass ran (it stays when
+# another evict.lock holder outlasted the bound or glaeda-disk skipped as busy), and checks both again after it lets
+# go of LOCK, so no trigger is dropped.
 # Each pass is bounded by TIMEOUT and the holder by LIFETIME; a trigger left then is served by the next one.
 import fcntl, os, subprocess, sys, time
 timeout, lifetime = float(sys.argv[1]), float(sys.argv[2])
@@ -5648,11 +5649,10 @@ argv = sys.argv[6:]
 end = time.monotonic() + lifetime
 BUSY = (b"another eviction running", b"another measurement running")
 
-def keep():
-    try:
-        os.close(os.open(pending, os.O_WRONLY | os.O_CREAT, 0o600))
-    except OSError:
-        pass
+claimed = pending + ".claimed"  # the triggers the current pass serves; removed only once a pass ran after them
+
+def waiting():
+    return os.path.lexists(pending) or os.path.lexists(claimed)
 
 def evict_free(deadline):
     try:
@@ -5701,20 +5701,27 @@ while time.monotonic() < end:
         sys.exit(0)  # a pass is running; it serves PENDING
     try:
         misses = 0
-        while os.path.lexists(pending) and time.monotonic() < end:
+        while waiting() and time.monotonic() < end:
             try:
-                os.unlink(pending)
+                os.replace(pending, claimed)  # triggers from here on wait for the next pass
             except FileNotFoundError:
                 pass
+            except OSError:
+                pass  # PENDING stays; this pass serves it all the same and the loop comes back for it
             if run_pass():
                 misses = 0
+                try:
+                    os.unlink(claimed)
+                except FileNotFoundError:
+                    pass
+                except OSError:
+                    break  # cannot mark it served: leave it for the next bound rather than loop on it
             else:
-                keep()
                 time.sleep(min(30, 2 ** misses, max(0, end - time.monotonic())))
                 misses += 1
     finally:
         fcntl.flock(held, fcntl.LOCK_UN)
-    if not os.path.lexists(pending):
+    if not waiting():
         break
 """
 
@@ -5804,7 +5811,8 @@ def disk_skip_line(why: str, free: float, targets: dict[str, int] | None) -> Non
     row = {"at": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "host": platform.node(), "mode": "pressure", "off": False,
            "free_gib_before": round(free, 1), "free_gib_after": round(free, 1),
            "target_gib": None if home is None else round(home / 1024**3, 1), "target_bytes": home,
-           "targets": targets, "default_targets": False, "floor_gib": None, "reclaimed_gib": 0.0,
+           "targets": targets, "default_targets": False, "config_sha256": None, "floor_gib": None,
+           "reclaimed_gib": 0.0,
            "reached": None if home is None else free * 1024**3 >= home,
            "blocked": {}, "duration_s": 0.0, "skipped": why, "cmux_next_ci_over_gib": None}
     with contextlib.suppress(OSError):

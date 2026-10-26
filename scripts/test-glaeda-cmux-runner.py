@@ -3691,6 +3691,10 @@ class DiskPassCoalesceTest(unittest.TestCase):
                                  sys.executable, os.fspath(disk), "--pressure", "--apply", "--top", "0"],
                                 env={**os.environ, "HOME": os.fspath(self.dir)})
 
+    def waiting(self) -> bool:
+        """A trigger no pass has served: pending, or claimed by a pass that did not run."""
+        return self.pending.exists() or Path(f"{self.pending}.claimed").exists()
+
     def run_count(self) -> int:
         return len(self.runs.read_text().splitlines()) if self.runs.exists() else 0
 
@@ -3771,14 +3775,14 @@ class DiskPassCoalesceTest(unittest.TestCase):
         # what the holder does once its pass ends: serve the pending trigger with one pass, not five
         self.assertEqual(self.bound(disk).wait(30), 0)
         self.assertEqual(self.run_count(), 1)
-        self.assertFalse(self.pending.exists())
+        self.assertFalse(self.waiting())
 
     def test_triggers_during_a_pass_get_exactly_one_follow_up(self) -> None:
         disk = self.fake_disk(triggers_on_first=3)
         self.pending.touch()
         self.assertEqual(self.bound(disk).wait(30), 0)
         self.assertEqual(self.run_count(), 2)
-        self.assertFalse(self.pending.exists())
+        self.assertFalse(self.waiting())
 
     def test_a_second_bound_never_overlaps_the_first(self) -> None:
         disk = self.fake_disk(seconds=4, triggers_on_first=1)
@@ -3792,7 +3796,7 @@ class DiskPassCoalesceTest(unittest.TestCase):
         self.assertEqual(first.wait(30), 0)
         self.assertFalse(self.overlap.exists(), "two passes ran at once")
         self.assertEqual(self.run_count(), 2)
-        self.assertFalse(self.pending.exists())
+        self.assertFalse(self.waiting())
 
     def test_a_trigger_after_the_holder_lets_go_is_served(self) -> None:
         """The holder checks the trigger again after it unlocks: a bound that lost the lock race to it must not
@@ -3815,7 +3819,7 @@ class DiskPassCoalesceTest(unittest.TestCase):
         self.pending.touch()
         self.assertEqual(self.bound(disk).wait(30), 0)
         self.assertEqual(self.run_count(), 2, "the trigger a busy pass did not serve was dropped")
-        self.assertFalse(self.pending.exists())
+        self.assertFalse(self.waiting())
 
     def test_the_bound_never_runs_a_pass_without_its_lock(self) -> None:
         disk = self.fake_disk()
@@ -3831,7 +3835,7 @@ class DiskPassCoalesceTest(unittest.TestCase):
         self.assertEqual(self.bound(disk, timeout=10, lifetime=3).wait(30), 0)
         self.assertLess(time.monotonic() - start, 10)
         self.assertGreaterEqual(self.run_count(), 2)
-        self.assertTrue(self.pending.exists(), "the next trigger's bound serves what this one left")
+        self.assertTrue(self.waiting(), "the next trigger's bound serves what this one left")
         self.assertFalse(self.overlap.exists())
 
     def test_a_glaeda_disk_that_cannot_start_keeps_its_trigger(self) -> None:
@@ -3840,7 +3844,7 @@ class DiskPassCoalesceTest(unittest.TestCase):
                                   os.fspath(self.pending), os.fspath(hook.evict_lock_path()),
                                   os.fspath(self.dir / "no-such-python"), "glaeda-disk", "--pressure"])
         self.assertEqual(bound.wait(30), 0)
-        self.assertTrue(self.pending.exists())
+        self.assertTrue(self.waiting())
 
     def test_an_infinite_or_huge_timeout_stays_bounded(self) -> None:
         disk = self.fake_disk()
@@ -3854,6 +3858,21 @@ class DiskPassCoalesceTest(unittest.TestCase):
             note = hook.disk_pressure_detached(os.fspath(disk))
         self.assertIn(f"bounded by {hook.BACKGROUND_DISK_TIMEOUT_MAX_S:g} s", note)
 
+    def test_a_claimed_trigger_left_by_a_bound_is_served_by_the_next(self) -> None:
+        disk = self.fake_disk()
+        Path(f"{self.pending}.claimed").touch()
+        self.assertEqual(self.bound(disk).wait(30), 0)
+        self.assertEqual(self.run_count(), 1)
+        self.assertFalse(self.waiting())
+
+    def test_skip_lines_have_every_key_of_glaedas_run_line(self) -> None:
+        hook.disk_skip_line(hook.HOOK_SKIP_COALESCED, 12.0, None)
+        row = json.loads(self.log.read_text().splitlines()[-1])
+        for key in ("at", "host", "mode", "off", "free_gib_before", "free_gib_after", "target_gib", "target_bytes",
+                    "targets", "default_targets", "config_sha256", "floor_gib", "reclaimed_gib", "reached", "blocked",
+                    "duration_s", "skipped", "cmux_next_ci_over_gib"):
+            self.assertIn(key, row)
+
     def test_a_pass_that_could_not_start_keeps_its_trigger(self) -> None:
         disk = self.fake_disk()
         self.pending.touch()
@@ -3861,7 +3880,7 @@ class DiskPassCoalesceTest(unittest.TestCase):
             fcntl.flock(held, fcntl.LOCK_EX)
             self.assertEqual(self.bound(disk, timeout=1, lifetime=2.5).wait(30), 0)
         self.assertEqual(self.run_count(), 0)
-        self.assertTrue(self.pending.exists())
+        self.assertTrue(self.waiting())
 
     def test_a_pass_waits_for_another_evict_lock_holder(self) -> None:
         """A pass started while the gate's or the LaunchAgent's glaeda-disk holds evict.lock would only skip as
