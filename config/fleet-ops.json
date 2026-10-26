@@ -6,7 +6,7 @@
       "every_s": 600,
       "sha256": "0a4dcc189b04dd5ed2c89c52ef3b288fd5fa9e8e6250527ddce2eca60eff7581",
       "source": {
-        "commit": "376fe8872c22b738ae4c9444e7ed89960212b650",
+        "commit": "40ff26151be8a644737cd2a5e35b08c9c29d4371",
         "path": "build-fleet/mini-ops/ops/console-unlock-guard.sh",
         "repository": "manaflow-ai/cmuxterm-hq"
       }
@@ -16,7 +16,7 @@
       "every_s": 21600,
       "sha256": "49514fb65e9caee7e307445c4e72c631afdd04bdf4807911c289b1fa9614d5c7",
       "source": {
-        "commit": "376fe8872c22b738ae4c9444e7ed89960212b650",
+        "commit": "40ff26151be8a644737cd2a5e35b08c9c29d4371",
         "path": "build-fleet/mini-ops/ops/symbol-cache-cap.sh",
         "repository": "manaflow-ai/cmuxterm-hq"
       }
