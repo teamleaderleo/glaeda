@@ -6310,6 +6310,16 @@ class HostReservationTest(unittest.TestCase):
             with self.subTest(text=text):
                 self.local.write_text(text)
                 self.assertIn("marker unreadable", self.reserved({"cmux31"}))
+        self.local.write_text(json.dumps({"schema": "glaeda-reservation/v1", "since": now + 600, "until": now + 900}))
+        self.assertIn("host reservation", self.reserved({"cmux31"}), "a future since holds, as the runner hook reads it")
+        real_read = Path.read_text
+
+        def read_text(path, *args, **kwargs):
+            if path == self.local:
+                raise PermissionError("denied")
+            return real_read(path, *args, **kwargs)
+        with mock.patch.object(Path, "read_text", read_text):
+            self.assertIn("marker unreadable (PermissionError)", self.reserved({"cmux31"}))
         self.local.unlink()
         self.assertEqual(self.reserved({"cmux31"}), "", "no marker, no hold")
 
