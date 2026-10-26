@@ -1592,8 +1592,14 @@ class ClientTest(Base):
         self.assertEqual([c["status"] for c in data["checks"]], ["QUEUED"])
         self.assertEqual(data["superseded"], [])
         self.assertNotIn("superseded", gg.summary("pr:o/r#1", {"data": data}))
+        # Nor when the cancelled twin has the lower id.
+        live = {**real, "databaseId": 121636524435}
+        for order in ([live, cancelled], [cancelled, live]):
+            data = gg.parse_pr(pr_node(1, rollup="PENDING", checks=order))
+            self.assertEqual([c["status"] for c in data["checks"]], ["QUEUED"])
+            self.assertEqual(data["superseded"], [])
         # A pending check that is superseded reads as pending, never as failed.
-        line = gg.summary("pr:o/r#1", {"data": {**data, "superseded": [gg.brief(real)]}})
+        line = gg.summary("pr:o/r#1", {"data": {**data, "superseded": [gg.brief(data["checks"][0])]}})
         self.assertIn(f"superseded: cmux-next / {name} pending", line)
         # The head reading picks the running job over the skipped twin too.
         self.assertEqual(gg.newest_verdict([(121636522702, "queued", ""), (121636524434, "completed", "skipped")]),

@@ -923,8 +923,11 @@ def parse_pr(node: dict) -> dict:
             superseded.append(check)
         # a twin newer than the job that outranks it was not replaced by anything: it is not named
     checks = [check for _, check in latest.values()]
-    # only the ones that would have counted against the PR are worth naming
-    superseded = [brief(c) for c in superseded if (c.get("conclusion") or "").upper() not in PASSED][:20]
+    # only the ones that would have counted against the PR are worth naming, and never a job that ran
+    # nothing (GitHub stamps it started and completed at once): a twin cancelled before it began has
+    # no error to chase, whichever of the pair has the higher id
+    superseded = [brief(c) for c in superseded if (c.get("conclusion") or "").upper() not in PASSED
+                  and not (c.get("completedAt") and c.get("startedAt") == c.get("completedAt"))][:20]
     base = node.get("baseRef") or {}
     required = set((base.get("branchProtectionRule") or {}).get("requiredStatusCheckContexts") or [])
     for rule in ((base.get("rules") or {}).get("nodes") or []):
