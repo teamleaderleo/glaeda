@@ -7965,7 +7965,7 @@ def _main_impl(argv: list[str] | None = None) -> int:
             a.low, a.target = f"{floor_gib:g}", f"{floor_gib + POLICY['target_margin_gib']:g}"
             print(f"{reserved}: only floor-pressure eviction runs here")
         fss = filesystems(fams or [Family("home", HOME, False, "")], a.low, a.target,
-                          a.tmpfs_low, a.tmpfs_target, floor_gib, reserved=bool(reserved))
+                          a.tmpfs_low, a.tmpfs_target, floor_gib, **({"reserved": True} if reserved else {}))
         space(a.emergency, GIB)
     except ValueError:
         ap.error(f"--low/--target/--tmpfs-*/--emergency take GiB or N%: {a.low!r}, {a.target!r}, "
