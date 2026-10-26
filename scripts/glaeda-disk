@@ -598,6 +598,9 @@ CMUX_NEXT_CI_PRESERVED_NAMES = frozenset({
 CMUX_NEXT_CI_GENERATED_NAMES = frozenset({
     "Build", "Index.noindex", "Logs", "Products", "Intermediates.noindex",
     "DerivedSources", "XCBuildData",
+    # the workflow's xcodebuild log beside its Build: unknown, it vetoed every idle state as in use, so a pressure
+    # run took nothing (cmux14, 2026-10-25: 10.8 GiB free under a 30 GiB floor, every Build "unknown children")
+    "cmux-next-build.log",
 })
 CMUX_NEXT_CI_ACTIVITY_MARKERS = frozenset({
     ".cmux-active", ".build.active", ".lock", "lease.json", "reservation.json",
@@ -926,7 +929,8 @@ def floor_hold_family(fam: Family, path: Path) -> bool:
     cmux_next_ci_busy), and code-sign clones (keep_live_app_clones and app_clone_running keep the live ones)."""
     if fam.id == RUNNER_BUILD_FAMILY or fam.app_clones:
         return True
-    return fam.id == CMUX_NEXT_CI_FAMILY and not CMUX_NEXT_CI_DRAIN and cmux_next_ci_runner(path, fam.root) is not None
+    return fam.id == CMUX_NEXT_CI_FAMILY and not CMUX_NEXT_CI_DRAIN and (
+        cmux_next_ci_runner(path, fam.root) is not None or cmux_next_ci_floor_slot(fam, path))
 
 
 def floor_hold_only(fam: Family, item: "Item", idle_hours: float) -> bool:
@@ -4464,7 +4468,8 @@ def candidates(fam: Family) -> list[Path]:
             _DISCOVERED[key] = discover_caches(fam.root)
         level = list(_DISCOVERED[key])
     elif fam.checkout_builds:
-        key = f"checkout-builds:{fam.id}:" + os.fspath(fam.root) + (":over-cap" if cmux_next_ci_over() else "")
+        key = (f"checkout-builds:{fam.id}:" + os.fspath(fam.root) + (":over-cap" if cmux_next_ci_over() else "")
+               + (":floor" if FLOOR_HOLD else ""))
         if key not in _DISCOVERED:
             _DISCOVERED[key] = (cmux_next_ci_generated_paths(fam.root, whole_stale=True)
                                 if fam.id == CMUX_NEXT_CI_FAMILY and cmux_next_ci_over()
@@ -4871,7 +4876,10 @@ def _survey(families, idle_hours, min_bytes, known, evidence, defer_bulk=False,
             verdict = "reclaimable"
             if path.name in archived and fam.id == "cmux-seeds":
                 reasons.append("the seed archive holds it")
-            if cmux_next_cap_only(fam, path, idle, idle_hours):
+            if cmux_next_ci_floor_slot(fam, path):
+                reasons.append("an idle runner's whole cmux-next slot, under the runner floor (its next job builds "
+                               "cold; least recently used first, after every generated child)")
+            elif cmux_next_cap_only(fam, path, idle, idle_hours):
                 reasons.append(f"cmux-next-ci is {gib(cmux_next_ci_over()).strip()} over its size cap "
                                "(least recently used first)")
             if (fam.mirror_idle_hours is not None and idle >= fam.mirror_idle_hours
@@ -5848,6 +5856,9 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
     cap_left = cmux_next_ci_over()  # what the cmux-next-ci cache is still over its cap
 
     def order(i):
+        if cmux_next_ci_floor_slot(family_of(i), Path(i.path)):
+            # a whole slot costs its runner a cold build: after every generated child, least recently used first
+            return (-2, 0, i.idle_hours, i.bytes)
         if floor_hold_only(family_of(i), i, idle_hours) \
                 or cmux_next_cap_only(family_of(i), Path(i.path), i.idle_hours, idle_hours):
             # reclaimable only by FLOOR_HOLD or the cmux-next cap: warm builds go last, least recently used first
@@ -5882,7 +5893,14 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
         # an item younger than its family's window goes only while a budget that let it go still allows:
         # the floor hold stops at the floor plus target_margin_gib, the cmux-next cap once the cache is under it
         warm: list[bool] = []
-        if floor_hold_only(fam, i, idle_hours):
+        if cmux_next_ci_floor_slot(fam, p):
+            try:
+                stop = FLOOR_HOLD.get(p.parent.stat().st_dev)
+                if not (stop is not None and free_bytes(p.parent)[0] < stop):
+                    continue
+            except OSError:
+                continue
+        elif floor_hold_only(fam, i, idle_hours):
             try:
                 stop = FLOOR_HOLD.get(p.parent.stat().st_dev)
                 warm.append(stop is not None and free_bytes(p.parent)[0] < stop)
@@ -6148,6 +6166,27 @@ def cmux_next_ci_stale_roots(root: Path) -> list[Path]:
             if cmux_next_ci_owner(s, root) is None and now - newest_mtime(s, 2, 3000) >= idle_s]
 
 
+def cmux_next_ci_floor_slots(root: Path) -> list[Path]:
+    """Validated state roots of runners enrolled here, listed whole while the runner gate holds for disk on their
+    filesystem (FLOOR_HOLD): a slot's inputs (SourcePackages, module and compilation caches) are what a cold build
+    of that runner fetches again, and with 14 slots at 4-11 GiB each they are most of the cache. They go last, least
+    recently used first, only up to the floor hold's stop, and under every in-use veto (cmux_next_ci_busy: the
+    runner's Runner.Worker, a process naming or open in it, a marker, an unknown child). cmux14, 2026-10-25: 115
+    GiB of cmux-next-ci, 10.8 GiB free under a 30 GiB floor, Swift compiles refused."""
+    try:
+        if root.stat().st_dev not in FLOOR_HOLD:
+            return []
+    except OSError:
+        return []
+    return [s for s in cmux_next_ci_state_roots(root) if cmux_next_ci_owner(s, root) is not None]
+
+
+def cmux_next_ci_floor_slot(fam: Family, path: Path) -> bool:
+    """Whether PATH is an enrolled runner's whole cmux-next state root, listed only under the floor hold."""
+    return (fam.id == CMUX_NEXT_CI_FAMILY and not CMUX_NEXT_CI_DRAIN and path in cmux_next_ci_state_roots(fam.root)
+            and cmux_next_ci_owner(path, fam.root) is not None)
+
+
 def cmux_next_ci_generated_paths(root: Path, whole_stale: bool = False) -> list[Path]:
     """Generated children eligible for the cmux-next retention family.
 
@@ -6168,6 +6207,8 @@ def cmux_next_ci_generated_paths(root: Path, whole_stale: bool = False) -> list[
                 continue
             if child.name in CMUX_NEXT_CI_GENERATED_NAMES and (child.is_dir() or child.is_file()):
                 found.append(child)
+    # its generated children are listed as well and go first (apply's order); the slot itself goes after them
+    found.extend(slot for slot in cmux_next_ci_floor_slots(root) if slot not in stale)
     return found
 
 
@@ -6258,9 +6299,11 @@ def cmux_next_ci_busy(fam: Family, path: Path, opened: list[str] | frozenset[str
     state = cmux_next_ci_state_for(path, fam.root)
     if state is None and cmux_next_ci_over() and path in cmux_next_ci_stale_roots(fam.root):
         state = path  # an unowned state root the cap takes whole: the same vetoes, on the root itself
+    if state is None and FLOOR_HOLD and cmux_next_ci_floor_slot(fam, path):
+        state = path  # an enrolled runner's slot the floor hold takes whole: the same vetoes, its runner's job first
     if state is None:
         return "cmux-next state root is no longer validated"
-    if (runner := cmux_next_ci_runner(path, fam.root)) is not None and (why := runner_job_live(runner, commands)):
+    if (runner := cmux_next_ci_owner(state, fam.root)) is not None and (why := runner_job_live(runner, commands)):
         return why
     state_text = os.fspath(state)
     if in_cwd(state_text, opened) or named_by(state_text, commands):
