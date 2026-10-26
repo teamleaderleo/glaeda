@@ -1247,6 +1247,43 @@ class TailscaleRouteDrain(Base):
         self.assertIn("no drain before", health.drain_gave_up(health.drain_state_path(self.state),
                                                               NOW + self.after + health.TAILSCALE_DRAIN_MAX_S + 60))
 
+    def test_a_cap_whose_record_failed_still_blocks_a_new_drain(self) -> None:
+        # re-review P2: gave_up_at could not be written; the started record must still keep the 6 h cooldown
+        self.broken(NOW + self.after)
+        self.mini.drain_jobs = self.BUSY
+        real = health.write_json
+        drain_record = health.drain_state_path(self.state)
+        cap = NOW + self.after + health.TAILSCALE_DRAIN_MAX_S
+
+        def write_json(path, doc):
+            if path == drain_record and "gave_up_at" in doc:
+                raise PermissionError(path)
+            real(path, doc)
+        with mock.patch.object(health, "write_json", write_json):
+            report = self.run_once(cap)
+        self.assertEqual(self.mini.did, ["drain", "undrain"])
+        self.assertIn("could not be written", report["findings"][0]["note"])
+        report = self.run_once(cap + 120)
+        self.assertEqual(self.mini.did, ["drain", "undrain"], "no redrain 120 s after the cap")
+        self.assertIn("did not record its end", report["findings"][0]["note"])
+        self.run_once(cap + health.TAILSCALE_RESTART_EVERY_S)
+        self.assertEqual(self.mini.did, ["drain", "undrain", "drain"])
+
+    def test_a_drain_that_ended_early_does_not_block_the_next_one(self) -> None:
+        self.broken(NOW + self.after)
+        self.run_once(NOW + self.after + 120)  # idle: restart, undrain
+        self.assertEqual(self.mini.did, ["drain", "lock", "restart app", "undrain"])
+        self.assertEqual(health.drain_gave_up(health.drain_state_path(self.state), NOW + 4 * 3600), "")
+
+    def test_a_utun_route_ends_the_drain_even_when_the_cli_times_out(self) -> None:
+        # re-review P2: the route is back but the CLI timed out: the drain must not hold jobs off until the cap
+        self.broken(NOW + self.after)
+        self.mini.drain_jobs = self.BUSY
+        self.mini.ts, self.mini.route = ("app", None, "status --json timed out after 15 s"), "utun4"
+        report = self.run_once(NOW + self.after + 120)
+        self.assertEqual(self.ids(report), ["tailscale_probe_error"])
+        self.assertEqual(self.mini.did, ["drain", "undrain"])
+
     def test_a_kill_switch_during_probe_errors_ends_the_drain(self) -> None:
         self.broken(NOW + self.after)
         self.mini.ts, self.mini.route = ("app", None, "status --json timed out after 15 s"), None
