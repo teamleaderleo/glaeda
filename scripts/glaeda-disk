@@ -4566,8 +4566,8 @@ def bundle_unpushed(gitdir: Path, key: str, written: list[Path], relied: list[st
     if _git_dir_run(gitdir, "for-each-ref", "--count=1") == "" and _git_dir_run(
             gitdir, "rev-parse", "-q", "--verify", "HEAD") is None and _git_dir_run(
             gitdir, "symbolic-ref", "-q", "HEAD") is not None and not any(
-            f.is_file() for f in (gitdir / "logs").rglob("*")):
-        return ""  # unborn: no ref, no reflog, HEAD names a branch with no commit yet; nothing to keep
+            f.is_file() for f in (gitdir / "logs").rglob("*")) and not os.path.lexists(gitdir / "worktrees"):
+        return ""  # unborn: no ref, reflog or linked worktree, HEAD a branch with no commit yet; nothing to keep
     tips = local_tips(gitdir)
     for wt in [p for p in (gitdir / "worktrees").glob("*") if p.is_dir()] if tips is not None else []:
         own = local_tips(wt, worktree_only=True)
@@ -4674,6 +4674,20 @@ def mirror_git_snapshot(gitdirs: list[Path], trees: list[Path]) -> list[str | No
     return snap
 
 
+def _linked_trees_strict(gitdir: Path) -> list[Path] | None:
+    """linked_work_trees, but None when <gitdir>/worktrees or any record in it cannot be read."""
+    wts = gitdir / "worktrees"
+    if not os.path.lexists(wts):
+        return []
+    try:
+        if wts.is_symlink() or not wts.is_dir():
+            return None
+        with os.scandir(wts) as it:
+            return [Path((Path(e.path) / "gitdir").read_text().strip()).parent for e in it]
+    except (OSError, ValueError):
+        return None
+
+
 def mirror_repos(path: Path) -> tuple[str, dict[str, Path], list[Path]]:
     """Every repository a mirror item takes along, found as _nested_loss finds them (checkouts, bare
     repositories, a linked worktree's repository inside it, checkouts in ignored directories, submodule stores
@@ -4740,7 +4754,9 @@ def mirror_repos(path: Path) -> tuple[str, dict[str, Path], list[Path]]:
     if [u for u in unreadable if os.path.lexists(u)]:  # a missing modules/ is no submodule store
         return f"unreadable submodule store {unreadable[0]}", {}, []
     for key, g in gitdirs.items():
-        if any(t.exists() and not (os.path.realpath(t) + "/").startswith(inside) for t in linked_work_trees(g)):
+        if (linked := _linked_trees_strict(g)) is None:
+            return f"{key}: unreadable linked worktree records", {}, []
+        if any(t.exists() and not (os.path.realpath(t) + "/").startswith(inside) for t in linked):
             return f"{key}: a worktree outside this item uses it", {}, []
     return "", gitdirs, sorted(trees)
 
@@ -4766,19 +4782,8 @@ def mirror_moved(fam: Family, path: Path, recheck: tuple) -> str:
     """Right before a bundled mirror goes, everything the bundling took time over is read again: process
     evidence, the family's owner and artifact references, and its repositories, found afresh (the same set,
     every work tree clean) and as at bundle time, and the servers, asked again for what the bundles left to them."""
-    try:
-        opened, cmds = process_evidence()
-    except NoEvidence as e:
-        return f"no process evidence: {e}"
-    if in_cwd(os.fspath(path), open_index(opened)) or named_by(os.fspath(path), cmds) or holds_socket(path) \
-            or job_busy(fam, path):
-        return "in use while its git work was bundled"
-    if fam.retired_only and not owner_retired(fam):
-        return "its owner loaded while its git work was bundled"
-    if fam.reference_root is not None and artifact_referenced(path, fresh_artifact_references(fam.reference_root)):
-        return "referenced while its git work was bundled"
     gitdirs, trees, snap, relied = recheck
-    for g, commits in relied.items():  # the network first: the local checks below are the last word
+    for g, commits in relied.items():  # the slow network first, then git, then the quick process checks last
         if (why := server_still_holds(g, commits)):
             return why
     why, now, now_trees = mirror_repos(path)
@@ -4787,6 +4792,17 @@ def mirror_moved(fam: Family, path: Path, recheck: tuple) -> str:
         return f"its repositories changed while they were bundled{': ' + why if why else ''}"
     if None in snap or mirror_git_snapshot(gitdirs, trees) != snap:
         return "its git refs or work trees changed while they were bundled"
+    if fam.retired_only and not owner_retired(fam):
+        return "its owner loaded while its git work was bundled"
+    if fam.reference_root is not None and artifact_referenced(path, fresh_artifact_references(fam.reference_root)):
+        return "referenced while its git work was bundled"
+    try:
+        opened, cmds = process_evidence()
+    except NoEvidence as e:
+        return f"no process evidence: {e}"
+    if in_cwd(os.fspath(path), open_index(opened)) or named_by(os.fspath(path), cmds) or holds_socket(path) \
+            or job_busy(fam, path):
+        return "in use while its git work was bundled"
     return ""
 
 

@@ -5997,6 +5997,49 @@ class LinuxLayoutTest(unittest.TestCase):
         self.assertEqual(rec["outcome"], "reclaimed", rec["reasons"])
         self.assertFalse((self.home / "archive/glaeda-disk").exists())
 
+    def test_a_job_that_starts_while_the_servers_are_asked_keeps_the_mirror(self) -> None:
+        unit, clone, _ = self.mirror_unit()
+        busy = []
+        real = gd.server_still_holds
+
+        def slow(g, commits):
+            busy.append(1)  # a job takes the unit during the network wait
+            return real(g, commits)
+        with mock.patch.object(gd, "server_still_holds", slow), \
+                mock.patch.object(gd, "job_busy", lambda fam, p: bool(busy)):
+            rec, _ = self.apply_mirror(unit)
+        self.assertEqual(rec["outcome"], "changed:in-use")
+        self.assertIn("in use while its git work was bundled", rec["reasons"])
+        self.assertTrue((clone / ".git").is_dir())
+
+    def test_an_unborn_repositorys_linked_worktree_commit_is_never_lost(self) -> None:
+        unit, clone, env = self.mirror_unit()
+        self.git(clone, "worktree", "add", "-q", "--detach", str(unit / "slot-2"), env=env)
+        self.git(unit / "slot-2", "commit", "-q", "--allow-empty", "-m", "worktree only", env=env)
+        only = self.git(unit / "slot-2", "rev-parse", "HEAD")
+        for ref in self.git(clone, "for-each-ref", "--format=%(refname)").split():
+            self.git(clone, "update-ref", "-d", "--no-deref", ref, env=env)
+        shutil.rmtree(clone / ".git/logs")  # the common repository now reads as unborn
+        rec, _ = self.apply_mirror(unit)
+        if rec["outcome"] == "reclaimed":
+            self.assertIn(only, {c for _, c in self.bundled_pairs()})
+        else:
+            self.assertTrue((unit / "slot-2/.git").is_file())
+
+    def test_unreadable_linked_worktree_records_keep_the_mirror(self) -> None:
+        unit, clone, env = self.mirror_unit()
+        self.git(clone, "worktree", "add", "-q", "--detach", str(self.home / "outside"), env=env)
+        record = next((clone / ".git/worktrees").iterdir()) / "gitdir"
+        os.chmod(record, 0)
+        try:
+            why, bundles, _ = gd.archive_mirror(unit)
+        finally:
+            with contextlib.suppress(OSError):
+                os.chmod(record, 0o644)
+        self.assertTrue(record.exists(), "nothing prunes the record")
+        self.assertIn("unreadable linked worktree records", why)
+        self.assertEqual(bundles, [])
+
     def test_only_manifest_listed_bundles_at_their_hash_are_pruned_after_the_evidence_gate(self) -> None:
         archive = self.home / "archive/glaeda-disk"
         archive.mkdir(parents=True)
