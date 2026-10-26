@@ -102,17 +102,21 @@ class PruneTest(unittest.TestCase):
         self.assertIn("would remove", rec["node_store"])
         self.assertTrue(all(p.exists() for p in paths))
 
-    def test_writer_prunes_its_node_store_and_keeps_its_local_cas(self) -> None:
-        """The writer writes through to the fleet store, so its node store is a cache like a reader's (cmux15's
-        reached 73 GiB, 2026-10-26); its local CAS is emptied by every writer build and stays here."""
+    def test_writer_prunes_its_objects_and_keeps_its_index_entries_and_local_cas(self) -> None:
+        """The writer's objects are content-addressed and written through, so they go like a reader's (cmux15's store
+        reached 73 GiB, 2026-10-26). Its kv/ entries stay: the fleet store keeps the first value for a key, so a writer
+        that recomputed a lost entry would serve a value the fleet does not hold. Its local CAS stays too."""
         self.env("/Users/cmux/.config/fleet-cas/sign.key")
-        paths = self.node(10)
+        paths = self.node(10)  # kv: obj0, obj3, obj6, obj9; the rest cas
         (self.root / "cas/v1").mkdir(parents=True)
         (self.root / "cas/v1/blob").write_bytes(b"\0" * 8192)
         per = paths[0].stat().st_blocks * 512
         rec = self.run_main("--apply", "--node-gib", str(6 * per / fp.GIB), "--local-cas-gib", "0")
         self.assertEqual(rec["role"], "writer")
-        self.assertEqual([p for p in paths if p.exists()], paths[5:])
+        kv = {paths[i] for i in (0, 3, 6, 9)}
+        self.assertTrue(all(p.exists() for p in kv), "index entries stay")
+        # 10 files, budget 6, goal 5.4: the 5 oldest objects go (obj1, obj2, obj4, obj5, obj7)
+        self.assertEqual([p.name for p in paths if not p.exists()], ["obj1", "obj2", "obj4", "obj5", "obj7"])
         self.assertTrue((self.root / "cas/v1/blob").exists())
 
     def test_reader_local_cas_goes_whole_over_budget(self) -> None:
@@ -183,20 +187,24 @@ class PruneTest(unittest.TestCase):
         blob.write_bytes(b"\0" * 8192)
         return blob
 
-    def test_the_node_cap_holds_while_a_build_runs_and_keeps_its_working_set(self) -> None:
-        """A hard cap: a busy mini always has a build running, so the node store is pruned anyway, but never a file
-        the node touched within NODE_ACTIVE_S. The local CAS, which a build has open, waits for no build."""
+    def test_the_node_cap_is_hard_while_a_build_runs(self) -> None:
+        """A busy mini always has a build running, so the node store is pruned anyway, oldest first, down to 90% of
+        the cap whatever the files' age (a file a build still wants is fetched again). The local CAS, which a build has
+        open, waits for no build."""
         self.env()
-        paths = self.node(10)  # obj9 is 1 h old, obj8 2 h, ... obj0 10 h
+        paths = self.node(10, size=4096)
+        for p in paths[5:]:  # used just now
+            os.utime(p, None)
         blob = self.local_cas()
+        per = paths[0].stat().st_blocks * 512
         fp.running_commands = lambda: ["/Users/cmux/actions-runner-glaeda/bin/Runner.Worker spawnclient 1 2"]
-        rec = self.run_main("--apply", "--node-gib", "0", "--local-cas-gib", "0")
+        rec = self.run_main("--apply", "--node-gib", str(2 * per / fp.GIB), "--local-cas-gib", "0")
         self.assertTrue(rec["result"].startswith("deferred: a build is running"), rec)
         self.assertTrue(rec["local_cas"].startswith("deferred: a build is running"))
-        self.assertEqual([p for p in paths if p.exists()], paths[9:], "only the file used within 2 h stays")
-        self.assertIn("removed 9 oldest files", rec["node_store"])
+        left = [p for p in paths if p.exists()]
+        self.assertLessEqual(len(left) * per, 2 * per * 0.9 + per, "under the cap, recent files or not")
+        self.assertIn("removed", rec["node_store"])
         self.assertTrue(blob.exists())
-        self.assertIn("every file was used within 2 h", self.run_main("--node-gib", "0")["node_store"])
 
     def test_the_local_cas_defers_while_ps_fails_or_a_build_holds_the_lock(self) -> None:
         self.env()
@@ -222,7 +230,7 @@ class PruneTest(unittest.TestCase):
         rec = self.run_main("--apply", "--node-only", "--node-gib", "0", "--local-cas-gib", "0")
         self.assertEqual(rec["result"], "ok")
         self.assertEqual(rec["local_cas"], "not judged (--node-only)")
-        self.assertEqual([p for p in paths if p.exists()], paths[9:])
+        self.assertEqual([p for p in paths if p.exists()], [])
         self.assertTrue(blob.exists())
         self.assertTrue(left.exists(), "no sweep")
         self.assertNotIn("gc", rec)

@@ -17,14 +17,16 @@ Two stores under /Users/Shared/cmux-build-fleet/xcode (docs/CMUX_BUILD_SLOT_MODE
   node-store  the node daemon's cache of the fleet store: one file per object (cas/) or index
               entry (kv/), named by hash in two-hex-digit shards. Any file may go: a missing one
               is fetched again, and its signature re-verified, on the next lookup. Oldest mtime
-              goes first until the store is under 90% of --node-gib. stats.json stays. The
-              writer's too: it writes through (a CAS put and an index entry are acknowledged only
-              once the fleet store took them), so its node store is a cache like a reader's.
-              It is a hard cap: it holds while builds run (on a busy mini a build always runs,
-              and cmux15's writer store reached 73 GiB, 2026-10-26). The node touches a file it
-              reads once its mtime is TOUCH_EVERY (1 h) old, so a file with an mtime within
-              NODE_ACTIVE_S (2 h) may be in a running build's working set and is kept; anything
-              older that a build still wants is fetched again.
+              goes first until the store is under 90% of --node-gib. stats.json stays. It is a
+              hard cap: it holds while builds run (on a busy mini a build always runs, and
+              cmux15's writer store reached 73 GiB, 2026-10-26). Removing a file mid-build is a
+              cache miss, never a wrong result: a missing object is fetched again from the fleet
+              store and its ID recomputed from the bytes (get_or_fetch), or the build compiles; a
+              reader's index entries are signed by the writer and fetched again the same way.
+              On the writer only cas/ objects go, which are content-addressed and written through
+              before they are acknowledged. Its kv/ index entries stay: the fleet store keeps the
+              first value for a key, so a writer that lost its own entry and computed another
+              would then serve a value the fleet store does not hold (kv_put).
 
 A missing local CAS in the middle of a build breaks the build, so the local CAS goes only while no
 xcodebuild, Xcode build service or GitHub Actions Runner.Worker runs. Sizes and the plan are worked
@@ -67,7 +69,6 @@ BUSY = re.compile(r"(^|/)(xcodebuild|SWBBuildService|XCBBuildService)(\s|$)"
                   r"|/actions-runner[^/\s]*/bin(?:\.[0-9.]+)?/Runner\.Worker(?:\s|$)")
 PRUNING = ".cas.pruning-"  # a local CAS renamed aside for deletion
 GC_EVERY = 86400  # seconds between fleet-store gc runs
-NODE_ACTIVE_S = 2 * 3600  # twice the node's TOUCH_EVERY (gc.rs): a file read within the last hour is this new
 GC_REPORT = re.compile(r"kept entries naming no stored object: (\d+)")
 
 
@@ -127,10 +128,11 @@ def tree_bytes(path: Path) -> int:
     return total
 
 
-def node_files(store: Path) -> list[tuple[float, int, str]]:
-    """(mtime, bytes, path) of every object and index entry; stats.json and anything else stays."""
+def node_files(store: Path, subs: tuple[str, ...] = ("cas", "kv")) -> list[tuple[float, int, str]]:
+    """(mtime, bytes, path) of every object (cas/) and index entry (kv/) under subs; stats.json and anything else
+    stays."""
     out = []
-    for sub in ("cas", "kv"):
+    for sub in subs:
         for dirpath, _, files in os.walk(store / sub):
             for f in files:
                 p = os.path.join(dirpath, f)
@@ -142,17 +144,16 @@ def node_files(store: Path) -> list[tuple[float, int, str]]:
     return out
 
 
-def plan_node(files: list[tuple[float, int, str]], budget: int,
-              keep_after: float | None = None) -> list[tuple[float, int, str]]:
-    """Oldest first until the rest fits in 90% of the budget; nothing while it is under budget. A file with an mtime
-    at or after keep_after (a running build's working set) is never planned, even if the store stays over."""
-    total = sum(b for _, b, _ in files)
+def plan_node(files: list[tuple[float, int, str]], budget: int, total: int | None = None) -> list[tuple[float, int, str]]:
+    """Oldest first until the store (total, by default the files' sum) fits in 90% of the budget; nothing while it is
+    under budget."""
+    total = sum(b for _, b, _ in files) if total is None else total
     if total <= budget:
         return []
     goal = int(budget * 0.9)
     doomed = []
     for entry in sorted(files):
-        if total <= goal or (keep_after is not None and entry[0] >= keep_after):
+        if total <= goal:
             break
         doomed.append(entry)
         total -= entry[1]
@@ -259,18 +260,18 @@ def main(argv: list[str] | None = None) -> int:
     store = ROOT / "node-store"
     files = node_files(store) if store.is_dir() else []
     rec["node_store_bytes"] = sum(b for _, b, _ in files)
-    doomed = plan_node(files, int(a.node_gib * GIB), keep_after=time.time() - NODE_ACTIVE_S)
+    # the writer's kv/ entries stay (above); its objects count against the cap with them
+    prunable = [f for f in files if not writer or f"{os.sep}kv{os.sep}" not in f[2][len(os.fspath(store)):]]
+    doomed = plan_node(prunable, int(a.node_gib * GIB), total=rec["node_store_bytes"])
     rec["local_cas"] = ("not judged (--node-only)" if a.node_only
                         else "kept: the writer empties it before every writer build" if writer
                         else ("would remove" if drop_local else "within budget"))
-    rec["node_store"] = (f"would remove {len(doomed)} oldest files, {sum(b for _, b, _ in doomed) / GIB:.1f} GiB"
-                         if doomed or rec["node_store_bytes"] <= a.node_gib * GIB
-                         else f"over budget, but every file was used within {NODE_ACTIVE_S // 3600} h: kept")
+    rec["node_store"] = f"would remove {len(doomed)} oldest files, {sum(b for _, b, _ in doomed) / GIB:.1f} GiB"
     if not a.apply:
         rec["result"] = "ok"
         print(json.dumps(rec))
         return 0
-    if doomed:  # the hard cap: no lock and no build check, a running build's working set is kept by mtime
+    if doomed:  # the hard cap: no lock and no build check; a file a running build still wants is fetched again
         freed = 0
         for _, b, p in doomed:
             try:
