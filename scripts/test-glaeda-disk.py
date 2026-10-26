@@ -5946,6 +5946,38 @@ class LinuxLayoutTest(unittest.TestCase):
         self.assertTrue(any("locked worktree" in r for r in rec["reasons"]), rec["reasons"])
         self.assertTrue((unit / "slot-2/.git").is_file())
 
+    def test_a_commit_made_while_the_servers_are_asked_keeps_the_mirror(self) -> None:
+        unit, clone, env = self.mirror_unit()
+        real = gd.server_still_holds
+
+        def slow(g, commits):
+            self.git(clone, "commit", "-q", "--allow-empty", "-m", "made meanwhile", env=env)
+            return real(g, commits)
+        with mock.patch.object(gd, "server_still_holds", slow):
+            rec, _ = self.apply_mirror(unit)
+        self.assertEqual(rec["outcome"], "changed:in-use")
+        self.assertTrue((clone / ".git").is_dir())
+
+    def test_a_symlinked_submodule_store_keeps_the_mirror(self) -> None:
+        unit, clone, _ = self.mirror_unit()
+        (unit / "store/sub").mkdir(parents=True)
+        (clone / ".git/modules").symlink_to(unit / "store")
+        rec, _ = self.apply_mirror(unit)
+        self.assertEqual(rec["outcome"], "blocked:bundle-failed")
+        self.assertTrue(any("unreadable submodule store" in r for r in rec["reasons"]), rec["reasons"])
+        (clone / ".git/modules").unlink()
+        (clone / ".git/modules/a").mkdir(parents=True)
+        (clone / ".git/modules/a/b").symlink_to(unit / "store")
+        why, _, _ = gd.archive_mirror(unit)
+        self.assertIn("unreadable submodule store", why)
+
+    def test_an_empty_repository_goes_without_a_bundle(self) -> None:
+        unit = self.home / ".cache/cmux-job/reload-cloud/cmux-base"
+        subprocess.run(["git", "init", "-q", "-b", "main", str(unit / "slot-1")], check=True)
+        rec, _ = self.apply_mirror(unit)
+        self.assertEqual(rec["outcome"], "reclaimed", rec["reasons"])
+        self.assertFalse((self.home / "archive/glaeda-disk").exists())
+
     def test_only_manifest_listed_bundles_at_their_hash_are_pruned_after_the_evidence_gate(self) -> None:
         archive = self.home / "archive/glaeda-disk"
         archive.mkdir(parents=True)

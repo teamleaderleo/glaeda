@@ -4558,6 +4558,11 @@ def bundle_unpushed(gitdir: Path, key: str, written: list[Path], relied: list[st
     and what `fetch --negotiate-only` acknowledges; local remote-tracking refs are only candidates to ask
     about), and every branch or tag the servers do not have at that commit. The commits left to the servers
     go to relied, for server_still_holds. "" or why it failed."""
+    if _git_dir_run(gitdir, "for-each-ref", "--count=1") == "" and _git_dir_run(
+            gitdir, "rev-parse", "-q", "--verify", "HEAD") is None and _git_dir_run(
+            gitdir, "symbolic-ref", "-q", "HEAD") is not None and not any(
+            f.is_file() for f in (gitdir / "logs").rglob("*")):
+        return ""  # unborn: no ref, no reflog, HEAD names a branch with no commit yet; nothing to keep
     tips = local_tips(gitdir)
     for wt in [p for p in (gitdir / "worktrees").glob("*") if p.is_dir()] if tips is not None else []:
         own = local_tips(wt, worktree_only=True)
@@ -4649,7 +4654,10 @@ def mirror_git_snapshot(gitdirs: list[Path], trees: list[Path]) -> list[str | No
     for g in gitdirs:
         snap.append(_git_dir_run(g, "for-each-ref", "--format=%(refname) %(objectname)"))
         for d in [g, *(p for p in (g / "worktrees").glob("*") if p.is_dir())]:
-            snap.append(_git_dir_run(d, "rev-parse", "HEAD"))
+            try:
+                snap.append((d / "HEAD").read_text())  # a symbolic ref or a commit; an unborn HEAD reads too
+            except OSError:
+                snap.append(None)
             logs = d / "logs"
             try:
                 snap.append(" ".join(f"{f}:{f.stat().st_size}" for f in sorted(logs.rglob("*")) if f.is_file())
@@ -4716,7 +4724,11 @@ def mirror_repos(path: Path) -> tuple[str, dict[str, Path], list[Path]]:
             return f"{where}: commits only this worktree's reflog holds", {}, []
     unreadable: list[str] = []
     for g in list(gitdirs.values()):  # submodule stores: modules/<name>, nested ones too
+        if (g / "modules").is_symlink():
+            unreadable.append(os.fspath(g / "modules"))
         for dirpath, dirnames, _ in os.walk(g / "modules", onerror=lambda e: unreadable.append(str(e.filename))):
+            # os.walk neither enters nor reports a symlinked directory: as submodule_loss, it is unreadable
+            unreadable += [os.path.join(dirpath, d) for d in dirnames if os.path.islink(os.path.join(dirpath, d))]
             if looks_like_repository(dirpath):
                 gitdirs[os.path.realpath(dirpath)] = Path(dirpath)
                 dirnames[:] = ["modules"] if "modules" in dirnames else []
@@ -4761,15 +4773,15 @@ def mirror_moved(fam: Family, path: Path, recheck: tuple) -> str:
     if fam.reference_root is not None and artifact_referenced(path, fresh_artifact_references(fam.reference_root)):
         return "referenced while its git work was bundled"
     gitdirs, trees, snap, relied = recheck
+    for g, commits in relied.items():  # the network first: the local checks below are the last word
+        if (why := server_still_holds(g, commits)):
+            return why
     why, now, now_trees = mirror_repos(path)
     if why or {os.path.realpath(g) for g in now.values()} != {os.path.realpath(g) for g in gitdirs} \
             or now_trees != trees:
         return f"its repositories changed while they were bundled{': ' + why if why else ''}"
     if None in snap or mirror_git_snapshot(gitdirs, trees) != snap:
         return "its git refs or work trees changed while they were bundled"
-    for g, commits in relied.items():
-        if (why := server_still_holds(g, commits)):
-            return why
     return ""
 
 
