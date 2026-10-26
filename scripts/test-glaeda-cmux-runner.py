@@ -3647,6 +3647,154 @@ def fake_clt(base: Path, sdk: str = "27.0") -> Path:
     return path
 
 
+class DiskPassCoalesceTest(unittest.TestCase):
+    """job-completed's disk passes: one at a time per host, triggers coalesced into one follow-up, none started above
+    glaeda-disk's target. On cmux14, 2889 of 2986 passes (2026-10-24..26) skipped as eviction_busy: every job started
+    a pass while one (11-28 min) still held evict.lock."""
+
+    def setUp(self) -> None:
+        self.dir = Path(os.path.realpath(tempfile.mkdtemp()))
+        self.addCleanup(shutil.rmtree, self.dir, ignore_errors=True)
+        env = mock.patch.dict(os.environ, {"HOME": os.fspath(self.dir)})
+        env.start()
+        self.addCleanup(env.stop)
+        self.state = hook.disk_state_dir()
+        self.state.mkdir(parents=True)
+        self.lock, self.pending = self.state / hook.DISK_PASS_LOCK, self.state / hook.DISK_PASS_PENDING
+        self.log = hook.disk_run_log()
+        self.runs = self.dir / "runs"
+        self.overlap = self.dir / "overlap"
+
+    def fake_disk(self, seconds: float = 0.0, triggers_on_first: int = 0) -> Path:
+        """A glaeda-disk that records each run, notes any overlap with another, and on its first run can stand in
+        for triggers arriving mid-pass (writes the pending trigger as a hook would)."""
+        return make_executable(self.dir / "glaeda-disk", "import os, pathlib, time\n"
+                               f"runs, overlap = pathlib.Path({os.fspath(self.runs)!r}), "
+                               f"pathlib.Path({os.fspath(self.overlap)!r})\n"
+                               f"running = pathlib.Path({os.fspath(self.dir / 'running')!r})\n"
+                               "try:\n    os.close(os.open(running, os.O_CREAT | os.O_EXCL))\n"
+                               "except FileExistsError:\n    overlap.touch()\n"
+                               "n = len(runs.read_text().splitlines()) if runs.exists() else 0\n"
+                               "with runs.open('a') as f:\n    f.write(f'{time.monotonic()}\\n')\n"
+                               f"if n == 0:\n    for _ in range({triggers_on_first}):\n"
+                               f"        pathlib.Path({os.fspath(self.pending)!r}).touch()\n"
+                               f"time.sleep({seconds})\n"
+                               "running.unlink()\n")
+
+    def bound(self, disk: Path, timeout: float = 30) -> subprocess.Popen:
+        return subprocess.Popen([sys.executable, "-c", hook.DISK_BOUND, f"{timeout:g}", os.fspath(self.lock),
+                                 os.fspath(self.pending), os.fspath(self.log), os.fspath(hook.evict_lock_path()),
+                                 sys.executable, os.fspath(disk), "--pressure", "--apply", "--top", "0"],
+                                env={**os.environ, "HOME": os.fspath(self.dir)})
+
+    def run_count(self) -> int:
+        return len(self.runs.read_text().splitlines()) if self.runs.exists() else 0
+
+    def logged(self) -> list[str]:
+        return [json.loads(line).get("skipped") for line in self.log.read_text().splitlines()] if self.log.exists() else []
+
+    def write_target(self, gib: float) -> None:
+        self.log.parent.mkdir(parents=True, exist_ok=True)
+        self.log.write_text(json.dumps({"mode": "pressure", "target_gib": gib, "skipped": None}) + "\n")
+
+    def test_the_bound_skips_above_the_same_mark_as_the_hook(self) -> None:
+        self.assertIn(f'"{hook.HOOK_SKIP_ABOVE_TARGET}"', hook.DISK_BOUND)
+        self.assertIn("glaeda-disk-bound", hook.DISK_BOUND.splitlines()[0])  # leftover_spared reads it
+
+    def test_target_is_glaeda_disks_latest_recorded_target(self) -> None:
+        self.assertIsNone(hook.disk_target_gib())
+        self.log.parent.mkdir(parents=True, exist_ok=True)
+        self.log.write_text('{"target_gib": 100.0}\nnot json\n{"target_gib": 170.0}\n{"target_gib": null}\n')
+        self.assertEqual(hook.disk_target_gib(), 170.0)
+
+    def test_a_trigger_above_target_is_skipped_without_a_pass(self) -> None:
+        disk = self.fake_disk()
+        self.write_target(0.001)
+        note = hook.disk_pressure_detached(os.fspath(disk))
+        self.assertIn("at or above its 0.001 GiB target", note)
+        self.assertFalse(self.pending.exists())
+        time.sleep(0.5)
+        self.assertEqual(self.run_count(), 0)
+        self.assertEqual(self.logged()[-1], hook.HOOK_SKIP_ABOVE_TARGET)
+
+    def test_triggers_while_a_pass_runs_are_coalesced_not_dropped(self) -> None:
+        disk = self.fake_disk()
+        self.write_target(10**9)  # never reached
+        with self.lock.open("a") as held:  # a running pass's bounding process
+            fcntl.flock(held, fcntl.LOCK_EX)
+            for _ in range(5):
+                self.assertIn("coalesced", hook.disk_pressure_detached(os.fspath(disk)))
+            self.assertTrue(self.pending.exists(), "the trigger must wait for the running pass")
+            self.assertEqual(self.logged().count(hook.HOOK_SKIP_COALESCED), 5)
+            self.assertEqual(self.run_count(), 0)
+        # what the holder does once its pass ends: serve the pending trigger with one pass, not five
+        self.assertEqual(self.bound(disk).wait(30), 0)
+        self.assertEqual(self.run_count(), 1)
+        self.assertFalse(self.pending.exists())
+
+    def test_triggers_during_a_pass_get_exactly_one_follow_up(self) -> None:
+        disk = self.fake_disk(triggers_on_first=3)
+        self.pending.touch()
+        self.assertEqual(self.bound(disk).wait(30), 0)
+        self.assertEqual(self.run_count(), 2)
+        self.assertFalse(self.pending.exists())
+
+    def test_a_second_bound_never_overlaps_the_first(self) -> None:
+        disk = self.fake_disk(seconds=1.5, triggers_on_first=1)
+        self.pending.touch()
+        first = self.bound(disk)
+        self.assertTrue(wait_for_path(self.runs))
+        self.pending.touch()
+        start = time.monotonic()
+        self.assertEqual(self.bound(disk).wait(30), 0)
+        self.assertLess(time.monotonic() - start, 1.4, "the second bound waited instead of leaving the pass to the first")
+        self.assertEqual(first.wait(30), 0)
+        self.assertFalse(self.overlap.exists(), "two passes ran at once")
+        self.assertEqual(self.run_count(), 2)
+        self.assertFalse(self.pending.exists())
+
+    def test_a_trigger_after_the_holder_lets_go_is_served(self) -> None:
+        """The holder checks the trigger again after it unlocks: a bound that lost the lock race to it must not
+        leave its trigger behind."""
+        disk = self.fake_disk()
+        self.write_target(10**9)
+        self.pending.touch()
+        self.assertEqual(self.bound(disk).wait(30), 0)
+        self.assertEqual(self.run_count(), 1)
+        self.pending.touch()  # a trigger right after; the next start (or the hook's own fork) serves it
+        note = hook.disk_pressure_detached(os.fspath(disk))
+        self.assertIn("started in the background", note)
+        deadline = time.monotonic() + 10
+        while self.run_count() < 2 and time.monotonic() < deadline:
+            time.sleep(0.05)
+        self.assertEqual(self.run_count(), 2)
+
+    def test_a_follow_up_above_target_is_skipped(self) -> None:
+        disk = self.fake_disk()
+        self.write_target(0.001)
+        self.pending.touch()
+        self.assertEqual(self.bound(disk).wait(30), 0)
+        self.assertEqual(self.run_count(), 0)
+        self.assertEqual(self.logged()[-1], hook.HOOK_SKIP_ABOVE_TARGET)
+        self.assertFalse(self.pending.exists())
+
+    def test_a_pass_waits_for_another_evict_lock_holder(self) -> None:
+        """A pass started while the gate's or the LaunchAgent's glaeda-disk holds evict.lock would only skip as
+        eviction_busy; it waits for that one within its bound instead."""
+        disk = self.fake_disk()
+        self.pending.touch()
+        evict = hook.evict_lock_path()
+        with evict.open("a") as held:
+            fcntl.flock(held, fcntl.LOCK_EX)
+            proc = self.bound(disk)
+            time.sleep(1.5)
+            self.assertEqual(self.run_count(), 0)
+            released = time.monotonic()
+        self.assertEqual(proc.wait(30), 0)
+        self.assertEqual(self.run_count(), 1)
+        self.assertGreaterEqual(float(self.runs.read_text().split()[0]), released - 0.01)
+
+
 class XcodeToolchainTest(unittest.TestCase):
     """The pool Xcode's toolchain: the listener's env, and the check that a host's xcrun resolves inside it."""
 
