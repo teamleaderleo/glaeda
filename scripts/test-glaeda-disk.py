@@ -4176,6 +4176,9 @@ class GlaedaDiskTest(unittest.TestCase):
         self.assertEqual((row["targets"], row["default_targets"]), ({"/": 170 * gd.GIB}, True))  # the hook's skip
         _, custom, _, _ = self._main_run(["--pressure", "--apply", "--target", "100"])
         self.assertFalse(custom[-1]["default_targets"], "a custom target must never let the runner hook skip")
+        self.assertEqual(row["config_sha256"], gd.config_sha256())
+        policy = self.root / "policy.json"
+        self.assertNotEqual(gd.config_sha256(policy=policy), (policy.write_text("{}"), gd.config_sha256(policy=policy))[1])
         self.assertEqual(row["reclaimed_gib"], 3.0)
         self.assertFalse(row["reached"])
         self.assertEqual(row["blocked"], {"code-sign-clones": 12.0})

@@ -134,6 +134,7 @@ DISK_TIMEOUT_S = 120  # a pass a hook or the gate waits on or reaps
 # DISK_TIMEOUT_S every one (a pass per job) was killed mid-apply while holding evict.lock, and the LaunchAgent's pass,
 # which has no bound, skipped as busy (274 of 277 passes on 2026-10-26, none finished for over an hour)
 BACKGROUND_DISK_TIMEOUT_S = 15 * 60
+BACKGROUND_DISK_TIMEOUT_MAX_S = 6 * 3600  # an override above this is cut to it, so the bound's lifetime stays finite
 BACKGROUND_DISK_TIMEOUT_ENV = "GLAEDA_RUNNER_BACKGROUND_DISK_TIMEOUT"  # GLAEDA_RUNNER_DISK_TIMEOUT bounds the others
 EVICT_TIMEOUT_S = 60  # job-started waits at most this long for an eviction under the disk floor
 # The runner's own environment (its LaunchAgent), never a job's env:, which does not reach hooks.
@@ -5729,9 +5730,22 @@ def disk_run_log() -> Path:
                           else ".local/state/glaeda/disk-runs.jsonl")
 
 
-def disk_targets(log: Path | None = None, now: float | None = None) -> dict[str, int] | None:
+def disk_config_sha256(disk: str | None) -> str | None:
+    """glaeda-disk's config_sha256 for the glaeda-disk this hook runs: its bytes and disk-policy.json's."""
+    if disk is None:
+        return None
+    h = hashlib.sha256()
+    for path in (Path(os.path.abspath(disk)), Path.home() / ".config/glaeda/disk-policy.json"):
+        with contextlib.suppress(OSError):
+            h.update(path.read_bytes())
+        h.update(b"\0")
+    return h.hexdigest()
+
+
+def disk_targets(log: Path | None = None, now: float | None = None, config: str | None = None) -> dict[str, int] | None:
     """Every filesystem's exact target (mount: bytes) from glaeda-disk's newest own --pressure run line, or None (run
-    the pass) unless that line is a plain `--pressure --apply`'s (default_targets), at least this runner's floor,
+    the pass) unless that line is a plain `--pressure --apply`'s (default_targets) under the same glaeda-disk and
+    disk-policy.json (config, its config_sha256), at least this runner's floor,
     under DISK_TARGET_MAX_AGE_S old and well formed. The hook's own skip lines and other modes' lines are passed over;
     an older pressure line never stands in for the newest."""
     try:
@@ -5760,6 +5774,7 @@ def disk_targets(log: Path | None = None, now: float | None = None) -> dict[str,
             return None
         targets = row.get("targets")
         if ((time.time() if now is None else now) - at > DISK_TARGET_MAX_AGE_S or row.get("default_targets") is not True
+                or config is None or row.get("config_sha256") != config
                 or not math.isfinite(floor) or floor < hooks_floor_gib() or not isinstance(targets, dict) or not targets
                 or not all(isinstance(v, int) and not isinstance(v, bool) and v > 0 for v in targets.values())):
             return None
@@ -5833,8 +5848,9 @@ def disk_pressure_detached(explicit: str | None, timeout: float = BACKGROUND_DIS
         timeout = float(os.environ.get(BACKGROUND_DISK_TIMEOUT_ENV) or timeout)
         if not math.isfinite(timeout) or timeout <= 0:
             timeout = BACKGROUND_DISK_TIMEOUT_S
+        timeout = min(timeout, BACKGROUND_DISK_TIMEOUT_MAX_S)
         state, log = disk_state_dir(), disk_run_log()
-        free, targets = free_gib(str(Path.home())), disk_targets(log)
+        free, targets = free_gib(str(Path.home())), disk_targets(log, config=disk_config_sha256(argv[1]))
         if targets is not None and disk_short(targets) == "":
             disk_skip_line(HOOK_SKIP_ABOVE_TARGET, free, targets)
             return f"glaeda-disk skipped: every filesystem at or above its target ({free:.1f} GiB free on home)"
