@@ -93,13 +93,13 @@ class FakeMini(health.Mini):
         if self.drain_write:
             return self.drain_write
         self.did.append("drain")
-        self.marker = ("ours", {"schema": health.RESERVATION_SCHEMA, "owner": health.TAILSCALE_DRAIN_OWNER,
-                                "purpose": purpose, "since": int(now),
-                                "until": int(now + health.TAILSCALE_DRAIN_MAX_S + health.TAILSCALE_DRAIN_LAPSE_S)})
+        doc = {"schema": health.RESERVATION_SCHEMA, "owner": health.TAILSCALE_DRAIN_OWNER, "purpose": purpose,
+               "since": int(now), "until": int(now + health.TAILSCALE_DRAIN_MAX_S + health.TAILSCALE_DRAIN_LAPSE_S)}
+        self.marker = ("ours", {**doc, "raw": json.dumps(doc).encode()})
         return ""
 
-    def end_drain(self):
-        if self.marker[0] != "ours":
+    def end_drain(self, seen):
+        if self.marker[0] != "ours" or not seen or seen.get("raw") != self.marker[1]["raw"]:
             return False
         self.did.append("undrain")
         self.marker = ("none", None)
@@ -1185,6 +1185,75 @@ class TailscaleRouteDrain(Base):
         self.assertIn("drain cap", report["findings"][0]["note"])
         self.assertEqual(self.mini.did, ["drain", "undrain"])
 
+    def test_a_pass_that_lost_the_race_leaves_the_winner_s_drain(self) -> None:
+        # review P2: two passes both saw no marker; the loser's start_drain fails and it must not end the winner's
+        self.broken(NOW + self.after - 120)
+        winner = {"schema": health.RESERVATION_SCHEMA, "owner": health.TAILSCALE_DRAIN_OWNER, "purpose": "x",
+                  "since": int(NOW + self.after), "until": int(NOW + self.after + 7800)}
+        self.mini.drain_write = "another reservation appeared"
+        real = self.mini.start_drain
+
+        def lose(now, purpose):
+            self.mini.marker = ("ours", {**winner, "raw": b"winner"})
+            return real(now, purpose)
+        self.mini.start_drain = lose
+        self.run_once(NOW + self.after)
+        self.assertEqual(self.mini.marker[1]["raw"], b"winner")
+        self.assertNotIn("undrain", self.mini.did)
+
+    def test_a_refusal_under_the_lock_ends_the_drain(self) -> None:
+        # review P2: an idle drained host whose restart is refused (state unwritable) must not stay closed to jobs
+        self.broken(NOW + self.after)
+        real = health.write_json
+
+        def write_json(path, doc):
+            if path == self.mini.restart_state:
+                raise PermissionError(path)
+            real(path, doc)
+        self.addCleanup(setattr, health, "write_json", real)
+        health.write_json = write_json
+        report = self.run_once(NOW + self.after + 120)
+        self.assertEqual(self.restarts(), 0)
+        self.assertEqual(self.mini.did, ["drain", "lock", "undrain"])
+        self.assertIn("cannot write the restart state", report["findings"][0]["note"])
+
+    def test_an_unwritable_drain_record_is_no_drain(self) -> None:
+        # review P2: without the cooldown record a capped drain could start again at once, so none starts
+        real = health.write_json
+        drain_record = health.drain_state_path(self.state)
+
+        def write_json(path, doc):
+            if path == drain_record:
+                raise PermissionError(path)
+            real(path, doc)
+        self.addCleanup(setattr, health, "write_json", real)
+        health.write_json = write_json
+        report = self.broken(NOW + self.after + 600)
+        self.assertNotIn("drain", self.mini.did)
+        self.assertEqual(report["findings"][0]["auto_fix"], "impossible")
+        self.assertIn(health.TAILSCALE_DRAIN_STATE, report["findings"][0]["note"])
+
+    def test_probe_errors_do_not_strand_a_drain(self) -> None:
+        # review P2: runs that cannot judge the route keep the drain, but the cap and kill switches still end it
+        self.broken(NOW + self.after)
+        self.mini.drain_jobs = self.BUSY
+        self.mini.ts, self.mini.route = ("app", None, "status --json timed out after 15 s"), None
+        report = self.run_once(NOW + self.after + 120)
+        self.assertEqual(self.mini.did, ["drain"])
+        report = self.run_once(NOW + self.after + health.TAILSCALE_DRAIN_MAX_S)
+        self.assertEqual(self.mini.did, ["drain", "undrain"], "the cap ends it")
+        self.assertEqual(report["findings"][0]["auto_fix"], "impossible")
+        self.assertIn("drain cap", report["findings"][0]["note"])
+        self.assertIn("no drain before", health.drain_gave_up(health.drain_state_path(self.state),
+                                                              NOW + self.after + health.TAILSCALE_DRAIN_MAX_S + 60))
+
+    def test_a_kill_switch_during_probe_errors_ends_the_drain(self) -> None:
+        self.broken(NOW + self.after)
+        self.mini.ts, self.mini.route = ("app", None, "status --json timed out after 15 s"), None
+        self.mini.restart_off = "GLAEDA_TAILSCALE_RESTART=off"
+        self.run_once(NOW + self.after + 120)
+        self.assertEqual(self.mini.did, ["drain", "undrain"])
+
     def test_a_reserved_host_is_never_drained(self) -> None:
         # cmux16-24 are opted in (ci-runner) but Lawrence's until 2026-10-28: the fleet list holds them
         self.mini.fleet_res = "reserved for lawrencecchen until 2026-10-28T23:59:59Z (lawrence-2026-10-25)"
@@ -1263,10 +1332,43 @@ class DrainMarkerOnDisk(unittest.TestCase):
         self.assertTrue(self.rules.active(marker, NOW + health.TAILSCALE_DRAIN_MAX_S))
         self.assertFalse(self.rules.active(marker, NOW + health.TAILSCALE_DRAIN_MAX_S + health.TAILSCALE_DRAIN_LAPSE_S),
                          "it lapses by itself if mini-health stops")
-        self.assertEqual(self.mini.host_reservation()[0], "ours")
-        self.assertTrue(self.mini.end_drain())
+        kind, seen = self.mini.host_reservation()
+        self.assertEqual(kind, "ours")
+        self.assertTrue(self.mini.end_drain(seen))
         self.assertFalse((self.fleet / "reservation.json").exists())
-        self.assertEqual(sorted(p.name for p in self.fleet.iterdir()), [], "no temp file left")
+        self.assertEqual(sorted(p.name for p in self.fleet.iterdir()), [".reservation.lock"], "no temp file left")
+
+    def test_a_marker_replaced_since_it_was_read_is_never_removed(self) -> None:
+        # review P1: a glaeda-mini-fleet reserve between the read and the unlink must survive
+        self.assertEqual(self.mini.start_drain(NOW, "drain"), "")
+        _, seen = self.mini.host_reservation()
+        theirs = json.dumps({"schema": "glaeda-reservation/v1", "owner": "lawrence", "purpose": "x",
+                             "since": int(NOW), "until": int(NOW + 3600)})
+        (self.fleet / "reservation.json").write_text(theirs)
+        self.assertFalse(self.mini.end_drain(seen))
+        self.assertEqual((self.fleet / "reservation.json").read_text(), theirs)
+
+    def test_another_pass_s_drain_is_not_removed_by_a_stale_read(self) -> None:
+        # review P2: a second drain marker (a later pass) differs in bytes from the one first read
+        self.assertEqual(self.mini.start_drain(NOW, "drain"), "")
+        _, seen = self.mini.host_reservation()
+        (self.fleet / "reservation.json").unlink()
+        self.assertEqual(self.mini.start_drain(NOW + 120, "drain"), "")
+        self.assertFalse(self.mini.end_drain(seen))
+        self.assertTrue((self.fleet / "reservation.json").exists())
+
+    def test_removal_waits_for_mini_fleet_s_writer_lock(self) -> None:
+        self.assertEqual(self.mini.start_drain(NOW, "drain"), "")
+        _, seen = self.mini.host_reservation()
+        fd = os.open(self.fleet / ".reservation.lock", os.O_WRONLY | os.O_APPEND | os.O_CREAT)
+        self.addCleanup(os.close, fd)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        clock = iter(range(0, 1000, 30))
+        with mock.patch.object(health.time, "monotonic", lambda: next(clock)), \
+                mock.patch.object(health.time, "sleep", lambda s: None):
+            self.assertFalse(self.mini.end_drain(seen), "a held writer lock is no removal")
+            self.assertIn("another reserve or release", self.mini.start_drain(NOW, "drain"))
+        self.assertTrue((self.fleet / "reservation.json").exists())
 
     def test_another_reservation_is_never_overwritten_or_removed(self) -> None:
         theirs = json.dumps({"schema": "glaeda-reservation/v1", "owner": "lawrence", "purpose": "x",
@@ -1274,13 +1376,14 @@ class DrainMarkerOnDisk(unittest.TestCase):
         (self.fleet / "reservation.json").write_text(theirs)
         self.assertEqual(self.mini.host_reservation()[0], "other")
         self.assertIn("another reservation", self.mini.start_drain(NOW, "drain"))
-        self.assertFalse(self.mini.end_drain())
+        self.assertFalse(self.mini.end_drain(None))
+        self.assertFalse(self.mini.end_drain({"raw": theirs.encode() + b" "}))
         self.assertEqual((self.fleet / "reservation.json").read_text(), theirs)
 
     def test_an_unreadable_marker_is_someone_else_s(self) -> None:
         (self.fleet / "reservation.json").write_text("{not json")
         self.assertEqual(self.mini.host_reservation(), ("other", None))
-        self.assertFalse(self.mini.end_drain())
+        self.assertFalse(self.mini.end_drain(None))
         self.assertTrue((self.fleet / "reservation.json").exists())
 
     def test_drain_busy_sees_dev_build_jobs(self) -> None:

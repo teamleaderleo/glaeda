@@ -818,10 +818,12 @@ class Mini:
         return FLEET_DIR / "reservation.json"
 
     def host_reservation(self) -> tuple[str, dict[str, Any] | None]:
-        """The host-local reservation marker: ("none", None), ("ours", marker) for this drain's, ("other", marker or
-        None) for anyone else's or one that cannot be read (never ours to remove)."""
+        """The host-local reservation marker: ("none", None), ("ours", marker) for a drain's, ("other", marker or
+        None) for anyone else's or one that cannot be read (never ours to remove). An "ours" marker carries the
+        exact bytes read under "raw", which end_drain compares before it removes anything."""
         try:
-            doc = json.loads(self.reservation_path().read_text())
+            raw = self.reservation_path().read_bytes()
+            doc = json.loads(raw)
         except FileNotFoundError:
             return "none", None
         except (OSError, ValueError):
@@ -831,7 +833,7 @@ class Mini:
         ours = (doc.get("schema") == RESERVATION_SCHEMA and doc.get("owner") == TAILSCALE_DRAIN_OWNER
                 and isinstance(doc.get("since"), int) and not isinstance(doc.get("since"), bool)
                 and isinstance(doc.get("until"), int) and not isinstance(doc.get("until"), bool))
-        return ("ours" if ours else "other"), doc
+        return ("ours", {**doc, "raw": raw}) if ours else ("other", doc)
 
     def fleet_reservation(self) -> str:
         """Why the fleet's reservation list holds this host (glaeda-disk's host_reservation, glaeda#1626: cmux16-24 are
@@ -842,36 +844,73 @@ class Mini:
             return NoAnswer(f"glaeda-disk cannot say whether the fleet reserved this host ({type(error).__name__})")
         return why if isinstance(why, str) else NoAnswer("glaeda-disk's host_reservation gave no answer")
 
+    @contextlib.contextmanager
+    def reservation_lock(self):
+        """glaeda-mini-fleet's writer lock, FLEET_DIR/.reservation.lock (flock, exclusive): a reserve or release
+        there and a drain here never interleave their check and their write. Yields "" when held, else why not
+        (it waits at most 20 s, as mini-fleet does)."""
+        path = FLEET_DIR / ".reservation.lock"
+        if not FLEET_DIR.is_dir() or FLEET_DIR.is_symlink() or path.is_symlink():
+            yield f"no usable fleet dir or reservation lock at {FLEET_DIR}"
+            return
+        try:
+            fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o664)
+        except OSError as error:
+            yield f"cannot open {path} ({type(error).__name__})"
+            return
+        try:
+            deadline = time.monotonic() + 20
+            while True:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except OSError:
+                    if time.monotonic() >= deadline:
+                        yield "another reserve or release is still running on this host"
+                        return
+                    time.sleep(0.2)
+            yield ""
+        finally:
+            os.close(fd)
+
     def start_drain(self, now: float, purpose: str) -> str:
-        """Write this drain's reservation marker, never over another one: "" when written, else why not."""
-        if not FLEET_DIR.is_dir() or FLEET_DIR.is_symlink():
-            return f"no fleet dir {FLEET_DIR}"
+        """Write a drain's reservation marker, never over another one: "" when written, else why not."""
         marker = {"schema": RESERVATION_SCHEMA, "owner": TAILSCALE_DRAIN_OWNER, "purpose": purpose[:300],
                   "since": int(now), "until": int(now + TAILSCALE_DRAIN_MAX_S + TAILSCALE_DRAIN_LAPSE_S)}
         path = self.reservation_path()
-        tmp = path.with_name(f".reservation.{os.getpid()}.tmp")
-        try:
-            tmp.write_text(json.dumps(marker) + "\n")
-            os.chmod(tmp, 0o664)
-            os.link(tmp, path)  # fails if any marker is there: a reservation made meanwhile is never overwritten
-        except FileExistsError:
-            return "another reservation appeared"
-        except OSError as error:
-            return f"cannot write {path} ({type(error).__name__})"
-        finally:
-            with contextlib.suppress(OSError):
-                tmp.unlink()
+        with self.reservation_lock() as locked:
+            if locked:
+                return locked
+            tmp = path.with_name(f".reservation.json.health-{os.getpid()}")
+            try:
+                tmp.write_text(json.dumps(marker) + "\n")
+                os.chmod(tmp, 0o664)
+                os.link(tmp, path)  # fails if any marker is there: a reservation is never overwritten
+            except FileExistsError:
+                return "another reservation appeared"
+            except OSError as error:
+                return f"cannot write {path} ({type(error).__name__})"
+            finally:
+                with contextlib.suppress(OSError):
+                    tmp.unlink()
         return ""
 
-    def end_drain(self) -> bool:
-        """Remove this drain's marker (only ours); True when one was removed."""
-        kind, _ = self.host_reservation()
-        if kind != "ours":
+    def end_drain(self, seen: dict[str, Any] | None) -> bool:
+        """Remove the drain marker seen (host_reservation's "ours" marker), under the writer lock and only while
+        the file still holds exactly those bytes: a marker anyone wrote since is never removed. True when removed."""
+        if not seen or "raw" not in seen:
             return False
-        with contextlib.suppress(OSError):
-            self.reservation_path().unlink()
-            return True
-        return False
+        path = self.reservation_path()
+        with self.reservation_lock() as locked:
+            if locked:
+                return False
+            try:
+                if path.is_symlink() or path.read_bytes() != seen["raw"]:
+                    return False
+                path.unlink()
+                return True
+            except OSError:
+                return False
 
     def drain_busy(self) -> str:
         """While draining: what still runs (host_busy without the reservation, which is our own marker). The host
@@ -1547,6 +1586,8 @@ def drain_gave_up(path: Path, now: float) -> str:
         return ""
     except (OSError, ValueError):
         return f"the drain record ({TAILSCALE_DRAIN_STATE}) is unreadable"
+    if isinstance(doc, dict) and "gave_up_at" not in doc:
+        return ""  # a drain was started (its record written) and never hit the cap
     at = doc.get("gave_up_at") if isinstance(doc, dict) else None
     if not attempt_time_ok(at, now):
         return f"the drain record ({TAILSCALE_DRAIN_STATE}) is unreadable"
@@ -1556,22 +1597,57 @@ def drain_gave_up(path: Path, now: float) -> str:
     return ""
 
 
+def drain_capped(mini: Mini, marker: dict[str, Any], now: float, drain_path: Path, busy: str) -> str:
+    """End a drain at its cap: the cooldown record first (so no new drain starts for TAILSCALE_RESTART_EVERY_S),
+    then the marker, which goes even when the record cannot be written (no host stays closed to jobs; a drain
+    whose record cannot be written never starts again, start_drain's precondition). The note to report."""
+    start = marker["since"]
+    try:
+        write_json(drain_path, {"gave_up_at": now, "at": iso(now), "drain_since": iso(start), "busy": str(busy)[:200]})
+        kept = ""
+    except OSError as error:
+        kept = f"; the drain record could not be written ({type(error).__name__})"
+    mini.end_drain(marker)
+    return (f"{busy}: still there after the {TAILSCALE_DRAIN_MAX_S // 3600} h drain cap (draining since "
+            f"{iso(start)}); the drain ended and jobs are admitted again; look at it{kept}")
+
+
+def drain_housekeeping(mini: Mini, now: float, heal_ok: bool, drain_path: Path, route_clear: bool) -> str:
+    """A pass that did not run tailscale_no_route's heal (the route is clear, the CLI and route gave no answer, or
+    the finding is not reported yet) still ends a drain of ours that has no reason to stay: the route is clear, a
+    kill switch is on, or the cap is past. The note for the report ("" when nothing ended at the cap)."""
+    kind, marker = mini.host_reservation()
+    if kind != "ours":
+        return ""
+    if route_clear or not heal_ok or mini.tailscale_restart_off():
+        mini.end_drain(marker)
+        return ""
+    if now - marker["since"] >= TAILSCALE_DRAIN_MAX_S:
+        return drain_capped(mini, marker, now, drain_path, "the route could not be judged this run")
+    return ""
+
+
 def heal_tailscale_route(mini: Mini, f: dict[str, Any], now: float, runs: int, apply: bool, heal_ok: bool,
                          path: Path, since: float | None = None) -> tuple[dict[str, Any], dict[str, Any] | None, bool]:
     """tailscale_no_route's restart behind every gate: (the finding as reported, the heal it ran or None, fixed).
     auto_fix stays pending only while a restart is still possible and none has failed: a restart that did not fix it
     (or an unreadable restart state) is impossible, the state ci-dash's health_alerts raises to an operator.
-    Under --apply, a drain this pass does not keep (a gate that now refuses, the restart done) ends here."""
-    keep_drain = [False]
+    Under --apply, the drain this pass owns (one it found, or one it started) ends here unless the pass keeps it
+    (still waiting on jobs or the host lock): a gate that now refuses or a restart that ran ends it. A pass that
+    found no drain and lost the race to start one owns none, so it never removes another pass's marker."""
+    kind, marker = mini.host_reservation() if apply else ("none", None)
+    owned: list[dict[str, Any] | None] = [marker if kind == "ours" else None]
+    keep = [False]
     try:
-        return _heal_tailscale_route(mini, f, now, runs, apply, heal_ok, path, since, keep_drain)
+        return _heal_tailscale_route(mini, f, now, runs, apply, heal_ok, path, since, kind, marker, owned, keep)
     finally:
-        if apply and not keep_drain[0]:
-            mini.end_drain()
+        if apply and owned[0] is not None and not keep[0]:
+            mini.end_drain(owned[0])
 
 
 def _heal_tailscale_route(mini: Mini, f: dict[str, Any], now: float, runs: int, apply: bool, heal_ok: bool,
-                          path: Path, since: float | None, keep_drain: list[bool]
+                          path: Path, since: float | None, kind: str, marker: dict[str, Any] | None,
+                          owned: list[dict[str, Any] | None], keep: list[bool]
                           ) -> tuple[dict[str, Any], dict[str, Any] | None, bool]:
     drain_path = drain_state_path(path)
     f = dict(f)
@@ -1624,28 +1700,22 @@ def _heal_tailscale_route(mini: Mini, f: dict[str, Any], now: float, runs: int, 
     window = restart_window_refusal(record, now)
     if window:  # hours, not a short wait; a failed restart's note already names the next try
         return stop("impossible", "" if failed else window)
-    def drain_over(start: int, busy: str) -> tuple[dict[str, Any], None, bool]:
-        # past the cap: the drain ends with the work still running, an alert, and no new drain for 6 h
-        mini.end_drain()
-        with contextlib.suppress(OSError):
-            write_json(drain_path, {"gave_up_at": now, "at": iso(now), "drain_since": iso(start),
-                                    "busy": str(busy)[:200]})
-        return stop("impossible", f"{busy}: still there after the {TAILSCALE_DRAIN_MAX_S // 3600} h drain cap "
-                    f"(draining since {iso(start)}); the drain ended and jobs are admitted again; look at it")
+    def drain_over(busy: str) -> tuple[dict[str, Any], None, bool]:
+        note = drain_capped(mini, owned[0], now, drain_path, busy)
+        owned[0] = None
+        return stop("impossible", note)
 
-    kind, marker = mini.host_reservation()
     start = marker["since"] if kind == "ours" else None
     if kind == "ours":  # draining: what still runs, not our own marker
         busy = mini.drain_busy()
         if busy and not isinstance(busy, NoAnswer):
             if now - start >= TAILSCALE_DRAIN_MAX_S:
-                return drain_over(start, busy)
-            keep_drain[0] = True
+                return drain_over(busy)
+            keep[0] = True
             return stop("pending", f"{busy}: draining since {iso(start)}, no new job is admitted "
                         f"({mini.reservation_path()}); the cap is {iso(start + TAILSCALE_DRAIN_MAX_S)}")
         if busy:
-            return wait(busy)
-        keep_drain[0] = True  # idle: the restart below runs, and the marker goes after it
+            return wait(busy)  # no answer: the drain ends (a pass that cannot look does not hold jobs off)
     else:
         busy = mini.host_busy()
         if busy:
@@ -1659,19 +1729,30 @@ def _heal_tailscale_route(mini: Mini, f: dict[str, Any], now: float, runs: int, 
             refused = ("someone else's reservation holds the host" if kind == "other" else mini.fleet_reservation())
             if refused:
                 return wait(type(refused)(f"{busy}; no drain: {refused}"))  # a NoAnswer stays one: it alerts
+            try:  # the record first: a drain whose cap could not be recorded must not be able to start
+                write_json(drain_path, {"drain_started_at": now, "at": iso(now)})
+            except OSError as error:
+                return wait(NoAnswer(f"{busy}; no drain: cannot write {drain_path.name} ({type(error).__name__})"))
             why = mini.start_drain(now, f"drain for a Tailscale restart: tailscale_no_route since {iso(since)} "
                                    "(glaeda-mini-health)")
             if why:
                 return wait(f"{busy}; no drain: {why}")
-            keep_drain[0] = True
+            kind, marker = mini.host_reservation()
+            if kind != "ours":
+                return wait(f"{busy}; no drain: the marker could not be read back")
+            owned[0], keep[0] = marker, True
             return stop("pending", f"{busy}: draining from now, no new job is admitted ({mini.reservation_path()}); "
                         f"no idle moment since {iso(since)}; the cap is {iso(now + TAILSCALE_DRAIN_MAX_S)}")
     with mini.hold_host_lock() as held:
-        if held and start is not None and not isinstance(held, NoAnswer) and now - start >= TAILSCALE_DRAIN_MAX_S:
-            return drain_over(start, held)  # a lock nobody lets go of is capped as a job is
+        if held and start is not None and not isinstance(held, NoAnswer):
+            if now - start >= TAILSCALE_DRAIN_MAX_S:
+                return drain_over(held)  # a lock nobody lets go of is capped as a job is
+            keep[0] = True  # a short wait: the drain holds
         if held:
             return wait(held)
         busy = mini.jobs_running()
+        if busy and start is not None and not isinstance(busy, NoAnswer):
+            keep[0] = True
         if busy:
             return wait(busy)
         record = load_restart_state(path)  # another pass may have gone first
@@ -1690,7 +1771,6 @@ def _heal_tailscale_route(mini: Mini, f: dict[str, Any], now: float, runs: int, 
         except OSError as error:
             return stop("impossible", f"cannot write the restart state ({type(error).__name__}): not restarted")
         started = mini.clock()
-        keep_drain[0] = False  # the drain's marker goes once this pass is done, fixed or not
         ran, what = mini.run_restart(commands)
         mini.sleep(TAILSCALE_RESTART_SETTLE_S)  # one bounded wait, then one re-check
         checked = now + max(0.0, mini.clock() - started)
@@ -1817,6 +1897,7 @@ def run(mini: Mini, apply: bool, now: float | None = None, state_path: Path = ST
         found = check_claude_route(mini, now, apply)
 
     findings, heals = [], []
+    route_healed = False  # heal_tailscale_route ran this pass (it looks after the drain itself)
     for f in found:
         f = dict(f)
         s = seen.get(f["id"]) or {"since": now, "runs": 0}
@@ -1826,6 +1907,7 @@ def run(mini: Mini, apply: bool, now: float | None = None, state_path: Path = ST
             continue  # seen, not yet reported
         f["since"] = iso(s["since"])
         if f["code"] == "tailscale_no_route":  # its own gates and 6 h window, not HEALS' tries
+            route_healed = True
             f, done_heal, fixed = heal_tailscale_route(mini, f, now, s["runs"], apply, heal_ok,
                                                        restart_state_path(state_path), s["since"])
             if done_heal:
@@ -1868,8 +1950,12 @@ def run(mini: Mini, apply: bool, now: float | None = None, state_path: Path = ST
                 f["note"] = f"healing is off ({KILL_SWITCH})"
         findings.append(f)
     ids = {f["id"] for f in findings}
-    if apply and runner and not any(f["code"] in ("tailscale_no_route", "tailscale_probe_error") for f in found):
-        mini.end_drain()  # the route is back: nothing to drain for (a run that could not look keeps it)
+    if apply and runner and not route_healed:
+        route_clear = not any(f["code"] in ("tailscale_no_route", "tailscale_probe_error") for f in found)
+        capped = drain_housekeeping(mini, now, heal_ok, drain_state_path(state_path), route_clear)
+        for f in findings:
+            if capped and f["code"] == "tailscale_probe_error":
+                f["auto_fix"], f["note"] = "impossible", f"{f.get('note', '')}; {capped}"[:300]
     # a CLI that gave no BackendState never looked at the route: tailscale_no_route's count neither grows nor
     # starts again (cmuxs-mac-mini-5, 2026-10-26: a 15 s status timeout every other run kept it at 1 for hours)
     unlooked = {"tailscale_no_route"} if any(f["code"] == "tailscale_probe_error" for f in found) else set()
