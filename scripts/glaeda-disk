@@ -215,6 +215,7 @@ HOOK_PASS_ENV = "GLAEDA_DISK_HOOK_PASS"  # "1" in the hook's own pass and its fl
 # it and the hook's pass never overlap, or leaves its trigger to the pass that holds it.
 CALLER_ENV = "GLAEDA_DISK_CALLER"  # who started this run, for its run line; else the parent's command
 COALESCED_INTO_HOOK = "coalesced into the running pass (glaeda-disk)"
+UNSERVED = ("eviction_busy", "measurement_busy", "defer_during_ci")  # a run that skipped these did no pass
 EVICT_OWNER = HOME / ".cache/glaeda-disk/evict.owner.json"
 EVICT_OWNER_STALE_S = 30 * 60
 RUNNER_HELD_DIR = ".local/state/glaeda/mini-fleet/runner-held"
@@ -611,7 +612,7 @@ CMUX_NEXT_DRAIN_HOOK_SHA256 = frozenset({
     "9809f36fece71390cf0070407c0d2d960b9a9c2c825581ed478a297a89ec3129",
     "d5e73be990d67d9499ff352d01fda2e1392a6fd257a57770b23008b3bf55fb59",
     "0c2c8880e3b17af8324f8304121c4159bee8ade5c31496b9af713586cb90bcfc",
-    "c86d26adb83d1be3336bdfa7df57fc3e401c04e81236f8edf23d08d51ad06608",
+    "fca8abb34684680ad0344a7a82b0ee8b2b476f6490407de27eb410904f5fac91",
 })
 CMUX_NEXT_CI_PRESERVED_NAMES = frozenset({
     "SourcePackages", "ModuleCache.noindex", "SDKStatCaches.noindex",
@@ -7791,17 +7792,16 @@ def _main_impl(argv: list[str] | None = None) -> int:
     if a.pressure:
         # only families on a filesystem under pressure are surveyed or touched
         fams = [f for f in fams if fss[f.root.stat().st_dev].under]
+        # Before the cap's du (10-20 s on a mini): a run that would only find evict.lock taken stops here. Another
+        # caller's pressure run (the LaunchAgent's, idle-repair's) joins the runner hook's queue while a hook pass is
+        # under way, so that pass serves it with its one follow-up rather than this run skipping as busy. It does so
+        # before any deferral, so a deferred run's trigger is still left (or kept claimed) for a later pass.
+        if a.apply and not a.cmux_next_drain and not RUNNER_CACHE_PROFILE \
+                and os.environ.get(HOOK_PASS_ENV) != "1" and take_hook_pass() is False:
+            return deferred(COALESCED_INTO_HOOK, "a runner hook pass is under way; this run joins its queue")
         if a.apply and POLICY["defer_during_ci"] and (why := ci_defer(fss, ci_jobs(), a.emergency, floor_gib)):
             print(why)
             RUN["skipped"] = "defer_during_ci"
-            return 0
-        # Before the cap's du (10-20 s on a mini): a run that would only find evict.lock taken stops here. Another
-        # caller's pressure run (the LaunchAgent's, idle-repair's) joins the runner hook's queue while a hook pass is
-        # under way, so that pass serves it with its one follow-up rather than this run skipping as busy.
-        if a.apply and not a.cmux_next_drain and not RUNNER_CACHE_PROFILE \
-                and os.environ.get(HOOK_PASS_ENV) != "1" and take_hook_pass() is False:
-            print("a runner hook pass is under way; this run joins its queue")
-            RUN["skipped"] = COALESCED_INTO_HOOK
             return 0
         if a.apply and not a.cmux_next_drain and not RUNNER_CACHE_PROFILE:
             if eviction_lock_is_held():
@@ -8117,7 +8117,7 @@ def _logged_main(args: list[str]) -> int:
     started, before = time.time(), _home_free()
     try:
         status = _main_impl(args)
-        release_hook_pass(served=status == 0 and RUN.get("skipped") not in ("eviction_busy", "measurement_busy"))
+        release_hook_pass(served=status == 0 and RUN.get("skipped") not in UNSERVED)
         return status
     except BaseException as e:
         RUN.setdefault("skipped", f"error: {type(e).__name__}")

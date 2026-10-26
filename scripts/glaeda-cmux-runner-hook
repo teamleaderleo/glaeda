@@ -5656,7 +5656,7 @@ argv = sys.argv[6:]
 os.environ["GLAEDA_DISK_HOOK_PASS"] = "1"  # glaeda-disk's HOOK_PASS_ENV: this is the queue's own pass
 os.environ.setdefault("GLAEDA_DISK_CALLER", "runner hook pass")
 end = time.monotonic() + lifetime
-BUSY = (b"another eviction running", b"another measurement running")
+BUSY = (b"another eviction running", b"another measurement running", b"deferred: a CI job is running")
 
 claimed = pending + ".claimed"  # the triggers the current pass serves; removed only once a pass ran after them
 

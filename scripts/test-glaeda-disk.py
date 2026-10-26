@@ -4247,6 +4247,31 @@ class GlaedaDiskTest(unittest.TestCase):
         self.assertFalse(pending.exists() or claimed.exists(), "the triggers it served are cleared")
         self.assertFalse(hook_held(), "and the lock is let go")
 
+    def test_a_run_deferred_for_ci_still_leaves_or_keeps_its_trigger(self) -> None:
+        lock, pending, p_lock, p_pending = self._queue()
+        claimed = Path(f"{pending}.claimed")
+        with p_lock, p_pending, mock.patch.object(gd, "HOOK_PASS_CLAIMED", claimed), \
+                mock.patch.object(gd, "cmux_next_ci_cap_state", return_value=None), \
+                mock.patch.object(gd, "ci_defer", return_value="deferred: a CI job is running (x)"):
+            os.environ.pop(gd.HOOK_PASS_ENV, None)
+            with lock.open("a") as held:
+                fcntl.flock(held, fcntl.LOCK_EX)
+                _, rows, _, _ = self._main_run(["--pressure", "--apply"], free_gib=100.0,
+                                               policy={"defer_during_ci": True})
+                self.assertEqual(rows[-1]["skipped"], gd.COALESCED_INTO_HOOK)
+                self.assertTrue(pending.exists(), "joined before the deferral")
+            _, rows, _, _ = self._main_run(["--pressure", "--apply"], free_gib=100.0, policy={"defer_during_ci": True})
+        self.assertEqual(rows[-1]["skipped"], "defer_during_ci")
+        self.assertTrue(claimed.exists(), "a deferred run did no pass, so its claimed trigger stays")
+
+    def test_a_json_run_that_joins_the_queue_reports_deferred(self) -> None:
+        lock, _, p_lock, p_pending = self._queue()
+        with p_lock, p_pending, lock.open("a") as held, mock.patch.object(gd, "cmux_next_ci_cap_state", return_value=None):
+            os.environ.pop(gd.HOOK_PASS_ENV, None)
+            fcntl.flock(held, fcntl.LOCK_EX)
+            status, _, _, _ = self._main_run(["--pressure", "--apply", "--json"], free_gib=100.0)
+        self.assertEqual(status, 3)
+
     def test_an_emergency_run_joins_the_queue_too(self) -> None:
         """Below the emergency mark the hook's pass deletes the same way, so the LaunchAgent's run still joins it."""
         lock, pending, p_lock, p_pending = self._queue()

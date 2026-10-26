@@ -3902,6 +3902,13 @@ class DiskPassCoalesceTest(unittest.TestCase):
         self.assertEqual(self.bound(disk).wait(30), 0)
         self.assertEqual(seen.read_text(), "1 runner hook pass")
 
+    def test_a_pass_deferred_for_ci_keeps_its_trigger(self) -> None:
+        disk = make_executable(self.dir / "glaeda-disk", "print('deferred: a CI job is running (x); pressure deletes "
+                                                         "wait unless free drops below 30')\n")
+        self.pending.touch()
+        self.assertEqual(self.bound(disk, lifetime=2).wait(30), 0)
+        self.assertTrue(self.waiting())
+
     def test_a_pass_that_exits_nonzero_keeps_its_trigger(self) -> None:
         disk = make_executable(self.dir / "glaeda-disk", "import sys\nsys.exit(1)\n")
         self.pending.touch()
