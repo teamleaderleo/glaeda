@@ -102,14 +102,17 @@ class PruneTest(unittest.TestCase):
         self.assertIn("would remove", rec["node_store"])
         self.assertTrue(all(p.exists() for p in paths))
 
-    def test_writer_keeps_both_stores(self) -> None:
+    def test_writer_prunes_its_node_store_and_keeps_its_local_cas(self) -> None:
+        """The writer writes through to the fleet store, so its node store is a cache like a reader's (cmux15's
+        reached 73 GiB, 2026-10-26); its local CAS is emptied by every writer build and stays here."""
         self.env("/Users/cmux/.config/fleet-cas/sign.key")
         paths = self.node(10)
         (self.root / "cas/v1").mkdir(parents=True)
         (self.root / "cas/v1/blob").write_bytes(b"\0" * 8192)
-        rec = self.run_main("--apply", "--node-gib", "0", "--local-cas-gib", "0")
+        per = paths[0].stat().st_blocks * 512
+        rec = self.run_main("--apply", "--node-gib", str(6 * per / fp.GIB), "--local-cas-gib", "0")
         self.assertEqual(rec["role"], "writer")
-        self.assertTrue(all(p.exists() for p in paths))
+        self.assertEqual([p for p in paths if p.exists()], paths[5:])
         self.assertTrue((self.root / "cas/v1/blob").exists())
 
     def test_reader_local_cas_goes_whole_over_budget(self) -> None:
@@ -174,22 +177,55 @@ class PruneTest(unittest.TestCase):
     def test_no_store_no_gc(self) -> None:
         self.assertEqual(fp.store_gc(self.root, 14), {})
 
-    def test_defers_while_a_build_runs_or_holds_the_lock(self) -> None:
+    def local_cas(self) -> Path:
+        blob = self.root / "cas/v1/blob"
+        blob.parent.mkdir(parents=True, exist_ok=True)
+        blob.write_bytes(b"\0" * 8192)
+        return blob
+
+    def test_the_node_cap_holds_while_a_build_runs_and_keeps_its_working_set(self) -> None:
+        """A hard cap: a busy mini always has a build running, so the node store is pruned anyway, but never a file
+        the node touched within NODE_ACTIVE_S. The local CAS, which a build has open, waits for no build."""
         self.env()
-        paths = self.node(10)
+        paths = self.node(10)  # obj9 is 1 h old, obj8 2 h, ... obj0 10 h
+        blob = self.local_cas()
         fp.running_commands = lambda: ["/Users/cmux/actions-runner-glaeda/bin/Runner.Worker spawnclient 1 2"]
-        self.assertTrue(self.run_main("--apply", "--node-gib", "0")["result"].startswith("deferred: a build is running"))
+        rec = self.run_main("--apply", "--node-gib", "0", "--local-cas-gib", "0")
+        self.assertTrue(rec["result"].startswith("deferred: a build is running"), rec)
+        self.assertTrue(rec["local_cas"].startswith("deferred: a build is running"))
+        self.assertEqual([p for p in paths if p.exists()], paths[9:], "only the file used within 2 h stays")
+        self.assertIn("removed 9 oldest files", rec["node_store"])
+        self.assertTrue(blob.exists())
+        self.assertIn("every file was used within 2 h", self.run_main("--node-gib", "0")["node_store"])
+
+    def test_the_local_cas_defers_while_ps_fails_or_a_build_holds_the_lock(self) -> None:
+        self.env()
+        blob = self.local_cas()
         fp.running_commands = lambda: None
-        self.assertTrue(self.run_main("--apply", "--node-gib", "0")["result"].startswith("deferred: ps failed"))
+        self.assertTrue(self.run_main("--apply", "--local-cas-gib", "0")["result"].startswith("deferred: ps failed"))
         fp.running_commands = lambda: []
         held = os.open(self.lock, os.O_RDWR)
         try:
             fcntl.flock(held, fcntl.LOCK_EX)
-            self.assertEqual(self.run_main("--apply", "--node-gib", "0")["result"],
+            self.assertEqual(self.run_main("--apply", "--local-cas-gib", "0")["result"],
                              "deferred: a build holds the host lock")
         finally:
             os.close(held)
-        self.assertTrue(all(p.exists() for p in paths))
+        self.assertTrue(blob.exists())
+
+    def test_node_only_caps_the_node_store_and_leaves_the_rest(self) -> None:
+        self.env()
+        paths = self.node(10)
+        blob = self.local_cas()
+        left = self.root / ".cas.pruning-4242/v1"
+        left.mkdir(parents=True)
+        rec = self.run_main("--apply", "--node-only", "--node-gib", "0", "--local-cas-gib", "0")
+        self.assertEqual(rec["result"], "ok")
+        self.assertEqual(rec["local_cas"], "not judged (--node-only)")
+        self.assertEqual([p for p in paths if p.exists()], paths[9:])
+        self.assertTrue(blob.exists())
+        self.assertTrue(left.exists(), "no sweep")
+        self.assertNotIn("gc", rec)
 
 
     def test_a_reserved_host_above_its_floor_is_left_alone(self) -> None:
