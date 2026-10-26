@@ -6028,6 +6028,8 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
                                    capture_output=True, timeout=60)
             except SlotTaken:
                 outcome = "changed:in-use"
+            except SlotNotNeeded:
+                continue  # as the stop check before the rename
             except (OSError, subprocess.SubprocessError) as e:
                 outcome = f"incomplete:{e.__class__.__name__}"
         is_sweep = halt is not None if receipt_sweep is None else receipt_sweep
@@ -6198,13 +6200,20 @@ def floor_stop_unmet(path: Path) -> bool:
 
 
 class SlotTaken(OSError):
-    """A runner's job took its slot between the last check and the rename: the slot was put back."""
+    """A runner's job took its slot between the last check and the rename: the slot was put back, or, when a new
+    slot already stands at its path, left aside under its deleting name. remove() deletes neither; the
+    interrupted-deletions family finishes an aside tree only once this pid is gone and nothing has it open."""
+
+
+class SlotNotNeeded(OSError):
+    """Free reached the floor hold's stop while the post-rename evidence was taken: the slot was put back."""
 
 
 def cmux_next_ci_slot_recheck(fam: Family, path: Path):
     """after_rename for a whole slot. A slot is only its own runner's, and that runner's Runner.Worker shows in ps
     long before its build reaches the slot, so the fresh ps right before the rename already keeps a job's slot;
-    this closes the rest: if the runner took a job, or anything is open in the detached tree, put it back."""
+    this closes the rest: if the runner took a job, or anything is open in the detached tree, put it back. Free
+    space is read again after that evidence too: a slot no longer needed for the floor hold goes back as well."""
     doomed = path.with_name(f"{DELETING_PREFIX}{path.name}-{os.getpid()}")
 
     def recheck() -> None:
@@ -6213,13 +6222,20 @@ def cmux_next_ci_slot_recheck(fam: Family, path: Path):
             opened, cmds = process_evidence()
         except NoEvidence:
             opened, cmds = None, ""
-        if (opened is None or (runner is not None and runner_job_live(runner, cmds))
-                or in_cwd(os.fspath(doomed), open_index(opened)) or named_by(os.fspath(path), cmds)):
-            try:
-                os.rename(doomed, path)
-            except OSError:
-                return  # the job made a new slot at the path: the detached one is nobody's
+        taken = (opened is None or (runner is not None and runner_job_live(runner, cmds))
+                 or in_cwd(os.fspath(doomed), open_index(opened)) or named_by(os.fspath(path), cmds))
+        if not taken and floor_stop_unmet(path):
+            return  # nobody's, and still needed: remove() deletes it
+        try:
+            os.rename(doomed, path)
+        except OSError:
+            if not taken:
+                return  # the floor was met, but a new slot stands at the path: the detached one is nobody's
+            # in use, and a new slot stands at the path: the detached tree stays aside, never deleted from here
+            raise SlotTaken(f"{path.name}: in use and a new slot is at its path; left aside as {doomed.name}")
+        if taken:
             raise SlotTaken(f"{path.name}: its runner took a job; put back")
+        raise SlotNotNeeded(f"{path.name}: free reached the floor hold's stop; put back")
     return recheck
 
 

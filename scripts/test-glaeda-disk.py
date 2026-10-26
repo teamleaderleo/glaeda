@@ -3171,6 +3171,50 @@ class GlaedaDiskTest(unittest.TestCase):
         self.assertFalse([p for p in st["mini-glaeda"].parent.iterdir() if p.name.startswith(gd.DELETING_PREFIX)])
         self.assertEqual(next(i for i in items if Path(i.path) == st["mini-glaeda"]).verdict, "blocked")
 
+    def test_a_slot_in_use_is_kept_aside_when_a_new_slot_took_its_path(self) -> None:
+        home, fam, st = self._cmux_next_cap_tree()
+        worker = f"{home}/actions-runner-glaeda/bin/Runner.Worker spawnclient 1 2\n"
+        calls = {"n": 0}
+
+        def during():  # after the rename, runner 1's job is live and has already made a new slot at the path
+            calls["n"] += 1
+            if calls["n"] <= 2:
+                return [], ""
+            if not st["mini-glaeda"].exists():
+                make(st["mini-glaeda"] / "Build")
+            return [], worker
+        _, removed, items = self._floor_apply(home, fam, 20.0, 4.0, slots_only=True, during=during)
+        self.assertNotIn(st["mini-glaeda"], removed)
+        aside = [p for p in st["mini-glaeda"].parent.iterdir() if p.name.startswith(gd.DELETING_PREFIX)]
+        self.assertEqual(len(aside), 1)  # the tree the job may still use is not deleted
+        self.assertTrue((aside[0] / "SourcePackages").is_dir())
+        self.assertTrue((st["mini-glaeda"] / "Build").exists())  # nor the job's new slot
+        self.assertEqual(next(i for i in items if Path(i.path) == st["mini-glaeda"]).verdict, "blocked")
+
+    def test_a_slot_no_longer_needed_after_the_rename_is_put_back(self) -> None:
+        # free reaches the stop while the post-rename evidence is taken: the slot goes back to its path
+        home, fam, st = self._cmux_next_cap_tree()
+        dev = home.stat().st_dev
+        state = {"free": 20 * gd.GIB, "n": 0}
+
+        def evidence():
+            state["n"] += 1
+            if state["n"] > 2:  # before the loop, before the rename, after it
+                state["free"] = 60 * gd.GIB
+            return [], ""
+        gd._DISCOVERED.clear()
+        with mock.patch.object(gd, "free_bytes", side_effect=lambda _p: (state["free"], 460 * gd.GIB)), \
+                mock.patch.object(gd, "HOME", home), mock.patch.object(gd, "command_lines", return_value=""), \
+                mock.patch.object(gd, "ACTIVITY_MODE", "pressure"), \
+                mock.patch.object(gd, "FLOOR_HOLD", {dev: 50 * gd.GIB}), contextlib.redirect_stdout(io.StringIO()):
+            with mock.patch.object(gd, "process_evidence", return_value=([], "")):
+                items = [i for i in gd.survey([fam], 6, 0) if Path(i.path) == st["mini-glaeda"]]
+            with mock.patch.object(gd, "process_evidence", side_effect=evidence):
+                released = gd.apply(items, {fam.id: fam}, self.receipt(), None, 6, all_families=[fam])
+        self.assertEqual(released, 0)
+        self.assertTrue((st["mini-glaeda"] / "SourcePackages").is_dir())
+        self.assertFalse([p for p in st["mini-glaeda"].parent.iterdir() if p.name.startswith(gd.DELETING_PREFIX)])
+
     @staticmethod
     def _release_key(name: str, runner: Path) -> str:
         """cmux scripts/cmux-next/release-derived-data-path.sh: sha256("$RUNNER_NAME\n$GITHUB_WORKSPACE\n")[:16]."""
