@@ -1074,5 +1074,74 @@ class ToolingTests(unittest.TestCase):
         self.assertTrue(fs.parser().parse_args(["--no-tooling"]).no_tooling)
 
 
+
+def heal_stdout(report=None, installed=True, now=AT):
+    body = "" if report is None else json.dumps(report)
+    return f"{'@installed' if installed else '@missing'}\n@report\n{body}\n@now\n{now}\n"
+
+
+def heal_report(at=AT, **release):
+    iso = fs.daemon_heal().iso
+    rel = {"tag": "r-20261026-aaaaaaaaaaaa", "wants": "r-20261026-aaaaaaaaaaaa", "okAt": iso(at), "error": None,
+           "behindSince": None, "staleAfterS": 3600, **release}
+    return {"schema": "glaeda-daemon-heal/v1", "at": iso(at), "staleAfterS": 360, "hot": [], "release": rel}
+
+
+class DaemonHealTests(unittest.TestCase):
+    """The root daemon-heal per macOS member, judged from its own report by glaeda-daemon-heal's judge."""
+
+    def build_rows(self, **rows):
+        return build(daemon_heal=src({"hosts": rows}))
+
+    def test_missing_stale_and_current_members(self):
+        iso = fs.daemon_heal().iso
+        rows = {
+            "mini-a": fs.parse_daemon_heal(heal_stdout(installed=False), AT),
+            "mini-b": fs.parse_daemon_heal(heal_stdout(heal_report(at=AT - 3 * 3600, behindSince=iso(AT - 7200),
+                                                                   wants="r-20261026-bbbbbbbbbbbb",
+                                                                   error="no release source answered")), AT),
+        }
+        doc = self.build_rows(**rows)
+        self.assertEqual([(f["code"], f["member"]) for f in by_id(doc, "daemon_heal.")],
+                         [("daemon_heal_missing", "mini-a"), ("daemon_heal_stale", "mini-b")])
+        stale = by_id(doc, "daemon_heal.daemon_heal_stale")[0]
+        self.assertIn("not running", stale["summary"], "a report three hours old: the passes stopped")
+        self.assertEqual((stale["action"]["who"], stale["action"]["safe_to_apply"]), ("password", False))
+        current = fs.parse_daemon_heal(heal_stdout(heal_report()), AT)
+        self.assertEqual(current["state"], "current")
+        self.assertEqual(by_id(self.build_rows(**{"mini-a": current}), "daemon_heal."), [])
+        behind = fs.parse_daemon_heal(heal_stdout(heal_report(wants="r-20261026-bbbbbbbbbbbb",
+                                                              behindSince=iso(AT - 7200), error="plan pass failed")), AT)
+        self.assertEqual(behind["state"], "stale")
+        self.assertIn("plan pass failed", behind["why"])
+
+    def test_a_copy_from_before_it_updated_itself_is_stale(self):
+        row = fs.parse_daemon_heal(heal_stdout({"schema": "glaeda-daemon-heal/v1", "at": fs.daemon_heal().iso(AT),
+                                                "hot": [], "healed": []}), AT)
+        self.assertEqual(row["state"], "stale")
+        self.assertIn("one root --install", row["why"])
+        self.assertEqual(fs.parse_daemon_heal(heal_stdout(None), AT)["state"], "stale")
+
+    def test_the_members_clock_judges_and_linux_members_are_skipped(self):
+        skewed = fs.parse_daemon_heal(heal_stdout(heal_report(at=AT - 7200), now=AT - 7200), AT)
+        self.assertEqual(skewed["state"], "current", "the member's own clock, not this machine's")
+        linux = fs.parse_daemon_heal("@not_darwin\n", AT)
+        doc = self.build_rows(**{"mini-a": linux, "mini-b": {"reachable": False, "error": "timeout",
+                                                               "observed_at": AT}})
+        self.assertEqual([f["code"] for f in by_id(doc, "daemon_heal.")], ["probe_failed"])
+        self.assertNotIn("daemon_heal", next(m for m in doc["members"] if m["name"] == "mini-a"))
+
+    def test_probe_is_read_only_skips_never_touch_and_shows_in_text(self):
+        for word in (" rm ", "unlink", "sudo", "launchctl", "--apply", "--install", "> "):
+            self.assertNotIn(word, fs.DAEMON_HEAL_SCRIPT, word)
+        seen = []
+        with mock.patch.object(fs, "daemon_heal_host", side_effect=lambda h, u: seen.append(h) or {"reachable": True}):
+            fs.collect_daemon_heal({"ssh_user": "builder", "never_touch": ["coordinator"]}, ["mini-a", "coordinator"])
+        self.assertEqual(seen, ["mini-a"])
+        doc = self.build_rows(**{"mini-a": fs.parse_daemon_heal(heal_stdout(installed=False), AT)})
+        self.assertIn("root daemon-heal:", fs.render_text(doc))
+        self.assertTrue(fs.parser().parse_args(["--no-daemon-heal"]).no_daemon_heal)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1507,6 +1507,15 @@ class DaemonHealLiveness(Base):
         self.mini.heal_status = self.status(loaded=False)
         self.assertIn("--expect-sha256", self.run_once()["findings"][0]["note"])
 
+    def test_a_self_updating_healer_is_judged_by_its_own_report_not_this_users_bytes(self) -> None:
+        # It follows stable; this user may run a newer canary release, whose bytes differ.
+        self.mini.heal_status = self.status(current=False, stale=["/x"], verdict={"state": "current", "why": "runs r"})
+        self.assertEqual(self.ids(self.run_once()), [])
+        self.mini.heal_status = self.status(verdict={"state": "stale", "why": "has not read its release channel"})
+        f = self.run_once(NOW + 120)["findings"][0]
+        self.assertEqual(f["id"], "daemon_heal_stale")
+        self.assertIn("has not read its release channel", f["evidence"])
+
 
 class ClaudeRoute(Base):
     """Claude Code on a fleet mini goes through a fleet route that answers, or capture-host admits no lease here."""

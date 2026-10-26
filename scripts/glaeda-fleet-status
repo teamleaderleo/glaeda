@@ -24,6 +24,9 @@ Collection joins what exists today, each source optional and read-only:
   (default on)               runner tooling per member: the commit its ~/glaeda-runner/scripts/.glaeda-source.json
                              stamp names, against this checkout's local origin/main ref (never fetched here):
                              how far behind, or not an ancestor at all (--no-tooling to skip)
+  (default on)               the root daemon-heal LaunchDaemon per macOS member: installed, and its own report
+                             judged by glaeda-daemon-heal (passes running, kept on the stable release), as
+                             daemon_heal_missing and daemon_heal_stale (--no-daemon-heal to skip)
 
 Every finding carries a typed action {id, who: agent|password|person, safe_to_apply, command, note}:
 `command` runs from the operator machine, `safe_to_apply` is true only for read-only commands, and
@@ -66,7 +69,7 @@ SSH_ROUTE_FIELDS = ("ssh_jump_host", "ssh_user", "ssh_identity", "tailnet_ip")
 WHO = ("agent", "password", "person")
 SEVERITIES = ("error", "warn", "info")
 SOURCE_NAMES = ("manifest", "check", "preflight", "controller", "runners", "queue", "cache", "lima", "disk", "jobs",
-                "tooling", "live_builder")
+                "tooling", "daemon_heal", "live_builder")
 # A source older than this at build time is itself a finding.
 DEFAULT_MAX_AGE = 900
 MAX_MEMBERS = 128
@@ -298,6 +301,11 @@ def host_process(manifest: dict[str, Any], host: str, user: str, command: str,
     proc = subprocess.run(argv, capture_output=True, text=True, timeout=timeout,
                           env=child_env(), check=False)
     return fleet.ssh_result(manifest, host, proc)
+
+
+def daemon_heal() -> Any:
+    """glaeda-daemon-heal, for its judge: one reading of a root report for this tool and glaeda-mini-health."""
+    return sys.modules.get("glaeda_daemon_heal") or _load("glaeda_daemon_heal", SCRIPT_DIR / "glaeda-daemon-heal")
 
 
 def runner_hook() -> Any:
@@ -860,6 +868,66 @@ def collect_tooling(manifest: dict[str, Any], hosts: list[str], repo: Path = SCR
     return source({"origin_main": main, "hosts": results})
 
 
+# Read-only: is the root daemon-heal installed, its report (root writes it 0644), and the member's clock.
+DAEMON_HEAL_SCRIPT = (
+    'if [ "$(uname)" != Darwin ]; then echo @not_darwin; exit 0; fi; '
+    'd="/Library/Application Support/glaeda/daemon-heal"; '
+    'if [ -f "$d/glaeda-daemon-heal" ] && [ -f /Library/LaunchDaemons/com.teamleaderleo.glaeda.daemon-heal.plist ]; '
+    'then echo @installed; else echo @missing; fi; '
+    'echo @report; head -c 65536 "$d/state/report.json" 2>/dev/null; echo; echo @now; date +%s')
+DAEMON_HEAL_STATES = ("current", "stale", "missing")
+
+
+def parse_daemon_heal(stdout: str, at: int) -> dict[str, Any]:
+    """The probe, judged on the member's clock; only the verdict, the tags and a cleaned reason leave it."""
+    lines = stdout.splitlines()
+    if "@not_darwin" in (x.strip() for x in lines[:1]):
+        return {"reachable": True, "observed_at": at, "state": "not_darwin"}
+    sections: dict[str, list[str]] = {}
+    current = None
+    for line in lines:
+        if line.strip() in ("@installed", "@missing", "@report", "@now"):
+            current = line.strip()[1:]
+            sections[current] = []
+        elif current is not None:
+            sections[current].append(line)
+    try:
+        report = json.loads("\n".join(sections.get("report", [])) or "null")
+    except ValueError:
+        report = None
+    remote_now = next((int(x) for x in sections.get("now", []) if x.strip().isdigit()), at)
+    verdict = daemon_heal().judge(report, remote_now, "installed" in sections)
+    release = (report or {}).get("release") if isinstance(report, dict) else None
+    release = release if isinstance(release, dict) else {}
+    return {"reachable": True, "observed_at": at, "state": verdict["state"], "why": clean(verdict["why"], 200),
+            "tag": clean(release.get("tag"), 40) or None, "wants": clean(release.get("wants"), 40) or None}
+
+
+def daemon_heal_host(host: str, user: str, manifest: dict[str, Any] | None = None) -> dict[str, Any]:
+    try:
+        proc = (host_process(manifest, host, user, DAEMON_HEAL_SCRIPT, TOOLING_TIMEOUT) if manifest is not None else
+                subprocess.run([SSH, "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-l", user, host,
+                                DAEMON_HEAL_SCRIPT], capture_output=True, text=True, timeout=TOOLING_TIMEOUT,
+                               env=child_env(), check=False))
+    except (OSError, subprocess.TimeoutExpired) as error:
+        return {"reachable": False, "error": type(error).__name__, "observed_at": now()}
+    if proc.returncode != 0:
+        return {"reachable": False, "error": clean(proc.stderr, 160) or f"exit {proc.returncode}", "observed_at": now()}
+    return parse_daemon_heal(proc.stdout, now())
+
+
+def collect_daemon_heal(manifest: dict[str, Any], hosts: list[str]) -> dict[str, Any]:
+    never = set(manifest.get("never_touch") or [])
+    targets = [h for h in hosts if h not in never]
+    def probe(h: str) -> dict[str, Any]:
+        host = manifest.get("hosts", {}).get(h) or {}
+        return daemon_heal_host(h, manifest["ssh_user"], manifest) if any(k in host for k in SSH_ROUTE_FIELDS) \
+            else daemon_heal_host(h, manifest["ssh_user"])
+    with concurrent.futures.ThreadPoolExecutor(max_workers=16) as pool:
+        results = dict(zip(targets, pool.map(probe, targets)))
+    return source({"hosts": results})
+
+
 def collect(args: argparse.Namespace) -> dict[str, Any]:
     fleet = mini_fleet()
     try:
@@ -888,6 +956,8 @@ def collect(args: argparse.Namespace) -> dict[str, Any]:
         sources["jobs"] = collect_jobs(manifest, hosts)
     if not args.no_tooling:
         sources["tooling"] = collect_tooling(manifest, hosts)
+    if not args.no_daemon_heal:
+        sources["daemon_heal"] = collect_daemon_heal(manifest, hosts)
     return {"schema": SOURCES_SCHEMA, "collected_at": now(), "sources": sources}
 
 
@@ -1560,6 +1630,39 @@ class Builder:
                              self.action(member, "none", "person", None,
                                          note="glaeda-cmux-runner-fleet --apply writes the stamp"))
 
+    def fold_daemon_heal(self) -> None:
+        """A macOS member whose root daemon-heal is missing, or whose own report says it stopped or fell behind."""
+        data = self.data("daemon_heal")
+        if not data:
+            return
+        for host, row in sorted((data.get("hosts") or {}).items()):
+            member = self.member_of(host)
+            if member is None or not isinstance(row, dict):
+                continue
+            at = stamp_of(row.get("observed_at"))
+            m = self.members[member]
+            m["observed"]["daemon_heal"] = at
+            if not row.get("reachable"):
+                m["daemon_heal"] = {"reachable": False}
+                self.finding("daemon_heal", "probe_failed", "info",
+                             f"daemon-heal probe failed: {clean(row.get('error'), 160)}", member, at,
+                             self.action(member, "retry_probe", "agent", "glaeda-fleet-status", safe=True,
+                                         on_member=False))
+                continue
+            if row.get("state") == "not_darwin":
+                continue
+            state = row.get("state") if row.get("state") in DAEMON_HEAL_STATES else "stale"
+            m["daemon_heal"] = {"reachable": True, "state": state, "tag": clean(row.get("tag"), 40) or None,
+                                "wants": clean(row.get("wants"), 40) or None, "why": clean(row.get("why"), 200)}
+            if state == "current":
+                continue
+            self.finding("daemon_heal", f"daemon_heal_{state}", "warn",
+                         f"root daemon-heal: {m['daemon_heal']['why'] or state}", member, at,
+                         self.action(member, "install_daemon_heal", "password", None,
+                                     note="one root install of the stable release, pinned to its hashes "
+                                          "(docs/CMUX_MINI_RUNNER.md, Root daemon-heal); it keeps itself "
+                                          "current after that"))
+
     def build(self) -> dict[str, Any]:
         self.state = self.freshness()
         self.fold_check()
@@ -1573,6 +1676,7 @@ class Builder:
         self.fold_disk()
         self.fold_jobs()
         self.fold_tooling()
+        self.fold_daemon_heal()
         findings = dedupe(self.findings)
         rank = {s: i for i, s in enumerate(SEVERITIES)}
         findings.sort(key=lambda f: (rank[f["severity"]], f["member"] or "", f["id"]))
@@ -1754,6 +1858,14 @@ def tooling_line(t: dict[str, Any] | None) -> str:
     return clean(t.get("note") or t.get("state") or "?", MAX_TEXT)
 
 
+def daemon_heal_line(d: dict[str, Any] | None) -> str:
+    if not d:
+        return ""
+    if not d.get("reachable"):
+        return "unreachable"
+    return clean(f"{d.get('state')}: {d.get('why') or ''}", MAX_TEXT)
+
+
 def when(stamp: Any, at: int) -> str:
     if stamp is None:
         return "never"
@@ -1785,6 +1897,11 @@ def render_text(doc: dict[str, Any]) -> str:
         lines.append("")
         lines.append("runner tooling:")
         lines.extend(f"  {name:<{width}}  {line}" for name, line in tooling)
+    heal = [(m["name"], daemon_heal_line(m.get("daemon_heal"))) for m in doc["members"] if m.get("daemon_heal")]
+    if heal:
+        lines.append("")
+        lines.append("root daemon-heal:")
+        lines.extend(f"  {name:<{width}}  {line}" for name, line in heal)
     live_builders = []
     for m in doc["members"]:
         live = m.get("live_builder")
@@ -1950,6 +2067,7 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--no-disk", action="store_true", help="skip the per-member disk and cache probe")
     p.add_argument("--no-jobs", action="store_true", help="skip the per-member runner job records")
     p.add_argument("--no-tooling", action="store_true", help="skip the per-member runner tooling stamp")
+    p.add_argument("--no-daemon-heal", action="store_true", help="skip the per-member root daemon-heal probe")
     p.add_argument("--controller-status", type=Path, help="path to cmuxterm-hq build-fleet/status.py")
     p.add_argument("--controller-json", type=Path, help="a saved status.py --json output instead")
     p.add_argument("--live-builder-status", type=Path,

@@ -23,8 +23,21 @@ the VM volume and 3 GiB left on a 460 GiB disk, while its CPU streak kept breaki
 Only processes whose executable is exactly a policy path run as a system account (uid < 500) are touched, and a
 policy path must lie under a SIP-protected system directory. The installed copy and its policy are root-owned
 snapshots under INSTALL_DIR run by /usr/bin/python3 -I, so nothing the runner user (or a PR job) can write runs as
-root. glaeda-mini-health compares the snapshot with the user's installed release (--status) and reinstalls it where
-`sudo -n` works (headless AWS hosts); elsewhere it reports daemon_heal_stale with the one root command.
+root.
+
+The root copy keeps itself on the stable release (policy `release`), so a release that changes this script or the
+policy reaches every mini with no hand step. Every release.every_s an --apply pass reads ota-channels/control.json
+and stable.json from the first of release.sources that answers (glaeda-update's channel: this repository, or its
+byte-identical mirror), over HTTPS only. When the tag differs from the one installed, or the installed files no
+longer hash to what that tag shipped, it downloads release.json (its SHA-256 must be the channel's), then the macOS
+glaeda-hygiene archive (size and SHA-256 must be release.json's), and reads exactly two members from it in memory:
+glaeda/scripts/glaeda-daemon-heal and glaeda/config/macos-daemons.json. Those are staged root-owned and must plan a
+pass with each other (the new code's own check of its own policy) before they replace the snapshot; the next pass
+runs them. A pass whose plist no longer matches its policy (every_s changed) reloads the LaunchDaemon from a detached
+helper, after the pass exits. Nothing the runner user can write is read: not ~/.config/glaeda, not the release
+copies glaeda-update keeps. The report says what it runs and what the channel wants, and `judge` turns a report into
+current, stale or missing for glaeda-mini-health and glaeda-fleet-status (daemon_heal_missing, daemon_heal_stale).
+A copy installed before this existed cannot update itself: one root --install of a current release makes it.
 Stdlib only; runs on macOS /usr/bin/python3 (3.9).
 """
 
@@ -34,6 +47,7 @@ import argparse
 import contextlib
 import datetime
 import hashlib
+import io
 import json
 import os
 import plistlib
@@ -41,8 +55,10 @@ import re
 import signal
 import subprocess
 import sys
+import tarfile
 import tempfile
 import time
+import urllib.request
 from pathlib import Path
 from typing import Any
 
@@ -61,7 +77,26 @@ GIB = 1 << 30
 UNITS = {"B": 1, "K": 1 << 10, "M": 1 << 20, "G": 1 << 30, "T": 1 << 40}
 POLICY_KEYS = {"every_s": int, "hot_cores": (int, float), "hot_hours": (int, float), "busy_hot_hours": (int, float),
                "footprint_gib": (int, float), "max_restarts_per_day": int, "stop_wait_s": (int, float), "report_stale_passes": int, "busy": list,
-               "daemons": list}
+               "daemons": list, "release": dict}
+# The release channel (glaeda-update and glaeda_release.py write and read the same files).
+REPOSITORY = "teamleaderleo/glaeda"
+RELEASE_SOURCES = (REPOSITORY, "manaflow-ai/glaeda")  # glaeda-update SOURCES: the repository and its mirror
+RING = "stable"  # only releases a canary verified (with attestation) and that soaked
+CONTROL_SCHEMA = "glaeda-ota-control/v1"
+CHANNEL_SCHEMA = "glaeda-ota-channel/v1"
+RELEASE_SCHEMA = "glaeda-release/v1"
+TAG_RE = re.compile(r"r-\d{8}-[0-9a-f]{12}")
+SHA_RE = re.compile(r"[0-9a-f]{40}")
+HEX64 = re.compile(r"[0-9a-f]{64}")
+ARCHIVE = "glaeda-hygiene-aarch64-apple-darwin.tar.gz"
+MEMBERS = {SCRIPT_NAME: "glaeda/scripts/glaeda-daemon-heal", POLICY_NAME: "glaeda/config/macos-daemons.json"}
+MODES = {SCRIPT_NAME: 0o555, POLICY_NAME: 0o444}
+MAX_META = 1 << 20
+MAX_ARCHIVE = 200 << 20  # glaeda-update MAX_ASSET
+MAX_MEMBER = 1 << 20
+FETCH_TIMEOUT = 60
+CHECK_TIMEOUT = 120  # the staged copy's plan pass (ps and one top sample)
+AFTER_PID_WAIT_S = 300
 
 
 class HealError(RuntimeError):
@@ -86,7 +121,7 @@ def validate_policy(doc: Any) -> dict[str, Any]:
         value = doc.get(key)
         if isinstance(value, bool) or not isinstance(value, kind):
             raise HealError(f"policy {key} is missing or not {kind}")
-        if kind is not list and value <= 0:
+        if kind not in (list, dict) and value <= 0:
             raise HealError(f"policy {key} must be positive")
     if doc["busy_hot_hours"] < doc["hot_hours"]:
         raise HealError("policy busy_hot_hours must be at least hot_hours")
@@ -103,6 +138,16 @@ def validate_policy(doc: Any) -> dict[str, Any]:
         if d["name"] in names:
             raise HealError(f"policy daemon {d['name']} is listed twice")
         names.add(d["name"])
+    release = doc["release"]
+    for key in ("every_s", "stale_s"):
+        if type(release.get(key)) is not int or release[key] <= 0:
+            raise HealError(f"policy release.{key} must be a positive integer")
+    if release["stale_s"] < release["every_s"]:
+        raise HealError("policy release.stale_s must be at least release.every_s")
+    sources = release.get("sources")
+    if not isinstance(sources, list) or not sources or not all(s in RELEASE_SOURCES for s in sources) \
+            or len(set(sources)) != len(sources):
+        raise HealError(f"policy release.sources must name some of {', '.join(RELEASE_SOURCES)}")
     return doc
 
 
@@ -358,8 +403,8 @@ def desired_install(policy_path: Path, install_dir: Path = INSTALL_DIR) -> dict[
         "StandardOutPath": os.fspath(state_dir / "heal.log"),
         "StandardErrorPath": os.fspath(state_dir / "heal.err"),
     }
-    return {"files": {script: (Path(__file__).read_bytes(), 0o555),
-                      install_dir / POLICY_NAME: (policy_bytes, 0o444)},
+    return {"files": {script: (Path(__file__).read_bytes(), MODES[SCRIPT_NAME]),
+                      install_dir / POLICY_NAME: (policy_bytes, MODES[POLICY_NAME])},
             "plist": plistlib.dumps(plist, sort_keys=True), "state_dir": state_dir}
 
 
@@ -377,7 +422,9 @@ def install_status(policy_path: Path, install_dir: Path = INSTALL_DIR, plist_pat
         report_age = None
     # The daemon writes its report every pass: older than report_stale_passes passes means it is not running.
     fresh = report_age is not None and report_age <= policy["report_stale_passes"] * policy["every_s"]
-    return {"schema": SCHEMA, "installed": installed, "current": not stale, "stale": stale,
+    # current/stale/missing from the root report: a self-updating copy follows stable, not this user's release
+    verdict = judge(load_json(report_path), time.time(), installed)
+    return {"schema": SCHEMA, "installed": installed, "current": not stale, "stale": stale, "verdict": verdict,
             "loaded": loaded(), "reportFresh": fresh,
             "reportAgeS": None if report_age is None else round(report_age),
             "sha256": sha256(Path(__file__).read_bytes()), "policySha256": sha256(policy_path.read_bytes()),
@@ -441,19 +488,241 @@ def install(policy_path: Path, apply: bool, expect_sha256: str | None = None,
     return {**install_status(policy_path), "state": "applied"}
 
 
+# ---------------------------------------------------------------- the release this copy follows
+
+
+class HttpsOnly(urllib.request.HTTPRedirectHandler):
+    """Release downloads redirect to GitHub's asset host; a redirect off https is refused, not followed."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: ANN001 (urllib's signature)
+        if not str(newurl).startswith("https://"):
+            raise HealError("refusing a redirect off https")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def fetch(url: str, limit: int) -> bytes:
+    if not url.startswith("https://github.com/"):
+        raise HealError("release files come from https://github.com only")
+    request = urllib.request.Request(url, headers={"User-Agent": "glaeda-daemon-heal"})
+    with urllib.request.build_opener(HttpsOnly).open(request, timeout=FETCH_TIMEOUT) as response:
+        raw = response.read(limit + 1)
+    if len(raw) > limit:
+        raise HealError(f"{url} exceeds {limit} bytes")
+    return raw
+
+
+def release_url(source: str, tag: str, name: str) -> str:
+    return f"https://github.com/{source}/releases/download/{tag}/{name}"
+
+
+def read_channel(sources: list[str], get=fetch) -> tuple[str, dict[str, Any] | None]:
+    """(source, the stable entry), or (source, None) while paused; the first source that answers wins."""
+    errors = []
+    for source in sources:
+        try:
+            control = json.loads(get(release_url(source, "ota-channels", "control.json"), MAX_META))
+            if not isinstance(control, dict) or control.get("schema") != CONTROL_SCHEMA \
+                    or not isinstance(control.get("paused"), bool):
+                raise HealError("control.json is malformed")
+            if control["paused"]:
+                return source, None
+            entry = json.loads(get(release_url(source, "ota-channels", f"{RING}.json"), MAX_META))
+            if not isinstance(entry, dict) or entry.get("schema") != CHANNEL_SCHEMA or entry.get("ring") != RING \
+                    or not TAG_RE.fullmatch(str(entry.get("tag"))) or not SHA_RE.fullmatch(str(entry.get("source"))) \
+                    or not HEX64.fullmatch(str(entry.get("releaseSha256"))):
+                raise HealError(f"{RING}.json is malformed")
+            return source, entry
+        except (HealError, OSError, ValueError) as e:  # urllib's errors are OSErrors
+            errors.append(f"{source}: {str(e)[:120]}")
+    raise HealError("no release source answered: " + "; ".join(errors))
+
+
+def release_files(source: str, entry: dict[str, Any], get=fetch) -> dict[str, bytes]:
+    """The two files the channel's release ships, by the hash chain channel -> release.json -> archive."""
+    raw = get(release_url(source, entry["tag"], "release.json"), MAX_META)
+    if sha256(raw) != entry["releaseSha256"]:
+        raise HealError(f"release.json of {entry['tag']} does not match the channel")
+    doc = json.loads(raw)
+    if not isinstance(doc, dict) or doc.get("schema") != RELEASE_SCHEMA or doc.get("repository") != REPOSITORY \
+            or doc.get("tag") != entry["tag"] or doc.get("source") != entry["source"]:
+        raise HealError(f"release.json does not describe {entry['tag']}")
+    meta = (doc.get("assets") or {}).get(ARCHIVE)
+    if not isinstance(meta, dict):
+        raise HealError(f"{entry['tag']} has no {ARCHIVE}")
+    archive = get(release_url(source, entry["tag"], ARCHIVE), MAX_ARCHIVE)
+    if len(archive) != meta.get("size") or sha256(archive) != meta.get("sha256"):
+        raise HealError(f"{ARCHIVE} of {entry['tag']} does not match release.json")
+    files = {}
+    with tarfile.open(fileobj=io.BytesIO(archive), mode="r:gz") as tar:
+        for name, member in MEMBERS.items():
+            try:
+                info = tar.getmember(member)
+            except KeyError:
+                raise HealError(f"{entry['tag']} ships no {member}") from None
+            if not info.isfile() or info.size > MAX_MEMBER:
+                raise HealError(f"{member} in {entry['tag']} is not a small regular file")
+            files[name] = tar.extractfile(info).read()
+    return files
+
+
+def stage_check(files: dict[str, bytes], install_dir: Path, root: bool, run=sh,
+                python: str = SYSTEM_PYTHON) -> None:
+    """The new pair must plan a pass with each other (its code reading its policy) before it replaces the snapshot."""
+    stage = install_dir / "staged"
+    stage.mkdir(mode=0o700, exist_ok=True)
+    if root:
+        check_root_dir(stage)
+    for name, data in files.items():
+        atomic_write(stage / name, data, MODES[name], root)
+    code, out, err = run([python, "-I", os.fspath(stage / SCRIPT_NAME), "--policy", os.fspath(stage / POLICY_NAME),
+                          "--state-dir", os.fspath(install_dir / "state")], timeout=CHECK_TIMEOUT)
+    try:
+        doc = json.loads(out) if code == 0 else None
+    except ValueError:
+        doc = None
+    if not isinstance(doc, dict) or not str(doc.get("schema") or "").startswith("glaeda-daemon-heal/"):
+        raise HealError(f"its own plan pass failed (exit {code}): {(err or out).strip()[-160:]}")
+
+
+def refresh(policy: dict[str, Any], state: dict[str, Any], now: float, install_dir: Path = INSTALL_DIR,
+            root: bool = True, get=fetch, run=sh, python: str = SYSTEM_PYTHON) -> dict[str, Any]:
+    """Bring the snapshot to the stable release's two files; returns the new state["release"]. Never raises: a
+    channel or release that fails a check leaves the snapshot as it is and says why."""
+    rel = dict(state.get("release") or {})
+    have = {name: read_bytes(install_dir / name) for name in MEMBERS}
+    hashes = {name: None if data is None else sha256(data) for name, data in have.items()}
+    drifted = rel.get("files") != hashes
+    if now - float(rel.get("checked") or 0) < policy["release"]["every_s"] and not (drifted and not rel.get("error")):
+        return rel
+    rel["checked"] = now
+    try:
+        source, entry = read_channel(policy["release"]["sources"], get)
+        rel.update(source=source, wants=None if entry is None else entry["tag"], ok=now)  # ok: the channel answered
+        if entry is not None and (entry["tag"] != rel.get("tag") or drifted):
+            files = release_files(source, entry, get)
+            if any(have[name] != data for name, data in files.items()):
+                stage_check(files, install_dir, root, run, python)
+                for name in (POLICY_NAME, SCRIPT_NAME):  # the script last: the next pass runs the pair
+                    atomic_write(install_dir / name, files[name], MODES[name], root)
+                rel["installed_at"] = now
+            rel.update(tag=entry["tag"], commit=entry["source"],
+                       files={name: sha256(data) for name, data in files.items()})
+        rel["error"] = None
+    except (HealError, OSError, ValueError, tarfile.TarError, EOFError) as e:
+        rel["error"] = re.sub(r"\s+", " ", str(e))[:300] or type(e).__name__
+    if rel.get("wants") and rel.get("wants") != rel.get("tag"):
+        rel.setdefault("behind_since", now)
+    else:
+        rel.pop("behind_since", None)
+    return rel
+
+
+def release_report(rel: dict[str, Any], policy: dict[str, Any]) -> dict[str, Any]:
+    def at(key: str) -> str | None:
+        return iso(rel[key]) if isinstance(rel.get(key), (int, float)) else None
+    return {"tag": rel.get("tag"), "commit": rel.get("commit"), "wants": rel.get("wants"), "source": rel.get("source"),
+            "checkedAt": at("checked"), "okAt": at("ok"), "installedAt": at("installed_at"),
+            "behindSince": at("behind_since"), "error": rel.get("error"), "staleAfterS": policy["release"]["stale_s"]}
+
+
+def parse_iso(text: Any) -> float | None:
+    try:
+        return datetime.datetime.strptime(str(text), "%Y-%m-%dT%H:%M:%SZ").replace(
+            tzinfo=datetime.timezone.utc).timestamp()
+    except ValueError:
+        return None
+
+
+def judge(report: Any, now: float, installed: bool) -> dict[str, str]:
+    """current, stale or missing, and why, from the root report alone (any reader: mini-health, fleet-status)."""
+    if not installed:
+        return {"state": "missing", "why": "the root daemon-heal LaunchDaemon is not installed"}
+    at = parse_iso(report.get("at")) if isinstance(report, dict) else None
+    if at is None:
+        return {"state": "stale", "why": "the root daemon-heal LaunchDaemon has written no report: no passes run"}
+    rel = report.get("release")
+    limit = report.get("staleAfterS")
+    if not isinstance(rel, dict) or type(limit) is not int or type(rel.get("staleAfterS")) is not int:
+        return {"state": "stale", "why": "installed before it kept itself on the release: one root --install of a "
+                                         "current release makes it"}
+    if now - at > limit:
+        return {"state": "stale", "why": f"its last pass was {round(now - at)} s ago: its passes are not running"}
+    tag, wants, error = rel.get("tag"), rel.get("wants"), rel.get("error")
+    grace = rel["staleAfterS"]
+    because = f": {str(error)[:200]}" if error else ""
+    behind = parse_iso(rel.get("behindSince"))
+    if wants and wants != tag and behind is not None and now - behind > grace:
+        return {"state": "stale", "why": f"runs {tag or 'an unknown release'}, its channel has named {wants} since "
+                                         f"{rel.get('behindSince')}{because}"}
+    ok = parse_iso(rel.get("okAt"))
+    if ok is None or now - ok > grace:
+        return {"state": "stale", "why": f"has not read its release channel since {rel.get('okAt') or 'install'}"
+                                         f"{because}"}
+    lag = f", its channel names {wants}" if wants and wants != tag else ""
+    return {"state": "current", "why": f"runs {tag or 'its install'}{lag}"}
+
+
+def schedule_reload(install_dir: Path, plist_path: Path, state: dict[str, Any], now: float,
+                    every_s: int, spawn=subprocess.Popen) -> bool:
+    """A plist that no longer matches the installed policy (or this code) is reloaded by a detached --install, in
+    its own session so launchd's bootout of this job does not end it; it waits for this pass to exit first."""
+    want = desired_install(install_dir / POLICY_NAME, install_dir)["plist"]
+    if read_bytes(plist_path) == want or now - float(state.get("reload_at") or 0) < every_s:
+        return False
+    state["reload_at"] = now
+    with open(install_dir / "state" / "reload.log", "ab") as log:
+        spawn([SYSTEM_PYTHON, "-I", os.fspath(install_dir / SCRIPT_NAME), "--install", "--apply", "--policy",
+               os.fspath(install_dir / POLICY_NAME), "--after-pid", str(os.getpid())],
+              stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True, close_fds=True)
+    return True
+
+
 # ---------------------------------------------------------------- main
 
 
-def run_pass(policy_path: Path, state_dir: Path, apply: bool, host: Host | None = None) -> dict[str, Any]:
+def run_pass(policy_path: Path, state_dir: Path, apply: bool, host: Host | None = None,
+             install_dir: Path | None = None, **release: Any) -> dict[str, Any]:
+    """One pass. The installed root copy (or a test's install_dir) also keeps itself on the release."""
     policy = load_policy(policy_path)
     state = load_json(state_dir / "state.json")
     new_state, report = reconcile(host or Host(), policy, state, apply)
+    root = os.geteuid() == 0
+    if install_dir is None and root and Path(__file__).resolve() == (INSTALL_DIR / SCRIPT_NAME).resolve():
+        install_dir = INSTALL_DIR
+    for key in ("release", "reload_at"):
+        if key in state:
+            new_state[key] = state[key]
+    if apply and install_dir is not None:
+        new_state["release"] = refresh(policy, state, report_time(report), install_dir, root, **release)
+        if root and install_dir == INSTALL_DIR:
+            try:
+                schedule_reload(install_dir, PLIST, new_state, report_time(report), policy["release"]["every_s"])
+            except (HealError, OSError, ValueError) as e:  # never at the cost of this pass's report
+                new_state["release"]["error"] = f"reload: {str(e)[:200]}"
+    report["staleAfterS"] = policy["report_stale_passes"] * policy["every_s"]
+    if "release" in new_state:
+        report["release"] = release_report(new_state["release"], policy)
     if apply:
         state_dir.mkdir(mode=0o755, parents=True, exist_ok=True)
-        root = os.geteuid() == 0
         atomic_write(state_dir / "state.json", json.dumps(new_state, sort_keys=True).encode() + b"\n", 0o644, root)
         atomic_write(state_dir / "report.json", json.dumps(report, sort_keys=True).encode() + b"\n", 0o644, root)
     return report
+
+
+def report_time(report: dict[str, Any]) -> float:
+    return parse_iso(report["at"]) or time.time()
+
+
+def wait_for_exit(pid: int) -> None:
+    deadline = time.time() + AFTER_PID_WAIT_S
+    while time.time() < deadline:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return
+        except PermissionError:
+            pass
+        time.sleep(0.5)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -466,8 +735,11 @@ def main(argv: list[str] | None = None) -> int:
     mode.add_argument("--status", action="store_true", help="is the installed copy this one")
     p.add_argument("--expect-sha256", help="--install: refuse unless this script's sha256 is this (from the release)")
     p.add_argument("--expect-policy-sha256", help="--install: the same for the policy file")
+    p.add_argument("--after-pid", type=int, help="--install: wait for this pass to exit first (the self-reload)")
     args = p.parse_args(argv)
     try:
+        if args.after_pid:
+            wait_for_exit(args.after_pid)
         if args.status:
             out = install_status(args.policy)
         elif args.install:
