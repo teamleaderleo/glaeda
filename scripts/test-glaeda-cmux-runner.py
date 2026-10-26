@@ -586,6 +586,22 @@ class HookTest(unittest.TestCase):
             time.sleep(0.1)
         self.assertFalse(hook.pid_alive(int(pid)), "the detached pass ran past its timeout")
 
+    def test_job_started_triggers_the_queued_pass_and_never_waits_on_it(self) -> None:
+        """job-started ran its own glaeda-disk before every job: 10-20 s of measuring that then skipped as busy."""
+        marker = self.dir / "disk-pass"
+        slow = make_executable(self.dir / "glaeda-disk-slow", "import pathlib, time\n"
+                               f"pathlib.Path({os.fspath(marker)!r}).touch()\ntime.sleep(30)\n")
+        self.fleet()
+        push = event(self.dir, "push", {"repository": CMUX})
+        start = time.monotonic()
+        result = self.run_hook("job-started", "push", push, "--allowed-repo", "manaflow-ai/cmux", "--disk",
+                               os.fspath(slow), "--state-dir", os.fspath(self.dir / "state"),
+                               "--watch-pid", str(os.getpid()), repo="manaflow-ai/cmux")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("glaeda-disk started in the background", result.stdout + result.stderr)
+        self.assertLess(time.monotonic() - start, 20, "job-started waited on glaeda-disk")
+        self.assertTrue(wait_for_path(marker))
+
     def test_job_completed_disk_pass_outlasts_a_whole_pass(self) -> None:
         """By default the detached pass gets longer than the slowest whole pass measured (685 s on cmux14)."""
         self.assertGreater(hook.BACKGROUND_DISK_TIMEOUT_S, 685)
@@ -3872,6 +3888,21 @@ class DiskPassCoalesceTest(unittest.TestCase):
                     "targets", "default_targets", "config_sha256", "floor_gib", "reclaimed_gib", "reached", "blocked",
                     "duration_s", "skipped", "cmux_next_ci_over_gib"):
             self.assertIn(key, row)
+
+    def test_the_bound_marks_its_pass_as_the_queues_own(self) -> None:
+        """glaeda-disk folds any other pressure run into the queue while the bound holds its lock; the bound's own
+        pass must not be folded into itself."""
+        seen = self.dir / "env"
+        disk = make_executable(self.dir / "glaeda-disk", "import os, pathlib\n"
+                               f"pathlib.Path({os.fspath(seen)!r}).write_text(os.environ.get('GLAEDA_DISK_HOOK_PASS', '-')"
+                               " + ' ' + os.environ.get('GLAEDA_DISK_CALLER', '-'))\n")
+        self.pending.touch()
+        self.assertEqual(self.bound(disk).wait(30), 0)
+        self.assertEqual(seen.read_text(), "1 runner hook pass")
+
+    def test_floor_evictions_are_never_queued(self) -> None:
+        env = hook.floor_disk_env("runner hook floor eviction")
+        self.assertEqual((env["GLAEDA_DISK_HOOK_PASS"], env["GLAEDA_DISK_CALLER"]), ("1", "runner hook floor eviction"))
 
     def test_a_pass_that_could_not_start_keeps_its_trigger(self) -> None:
         disk = self.fake_disk()

@@ -4196,6 +4196,64 @@ class GlaedaDiskTest(unittest.TestCase):
         policy.write_text("{}")
         self.assertNotEqual(before, gd.config_sha256(policy=policy))
 
+    def _queue(self):
+        """This test's runner-hook queue files, in place of the home's."""
+        lock, pending = self.root / "hook-pass.lock", self.root / "hook-pass.pending"
+        lock.touch()
+        return lock, pending, mock.patch.object(gd, "HOOK_PASS_LOCK", lock), \
+            mock.patch.object(gd, "HOOK_PASS_PENDING", pending)
+
+    def test_a_pressure_run_joins_a_running_hook_pass_instead_of_skipping_as_busy(self) -> None:
+        """The LaunchAgent's 15-minute pass raced the runner hook's queued pass and skipped as eviction_busy."""
+        lock, pending, p_lock, p_pending = self._queue()
+        with p_lock, p_pending, lock.open("a") as held, \
+                mock.patch.dict(os.environ, {gd.CALLER_ENV: "disk-pressure LaunchAgent"}), \
+                mock.patch.object(gd, "cmux_next_ci_cap_state") as cap:
+            os.environ.pop(gd.HOOK_PASS_ENV, None)
+            fcntl.flock(held, fcntl.LOCK_EX)
+            status, rows, survey, _ = self._main_run(["--pressure", "--idle", "--apply"])
+        self.assertEqual(status, 0)
+        self.assertEqual((rows[-1]["skipped"], rows[-1]["caller"]), (gd.COALESCED_INTO_HOOK, "disk-pressure LaunchAgent"))
+        self.assertTrue(pending.exists(), "the running hook pass serves this trigger with its follow-up")
+        survey.assert_not_called()
+        cap.assert_not_called()
+
+    def test_the_hook_pass_itself_and_floor_evictions_are_never_queued(self) -> None:
+        lock, pending, p_lock, p_pending = self._queue()
+        with p_lock, p_pending, lock.open("a") as held, mock.patch.dict(os.environ, {gd.HOOK_PASS_ENV: "1"}), \
+                mock.patch.object(gd, "cmux_next_ci_cap_state", return_value=None):
+            fcntl.flock(held, fcntl.LOCK_EX)
+            status, rows, survey, _ = self._main_run(["--pressure", "--apply"])
+        self.assertEqual((status, rows[-1]["skipped"]), (0, None))
+        self.assertFalse(pending.exists())
+        survey.assert_called()
+
+    def test_a_held_evict_lock_skips_before_the_cap_measurement(self) -> None:
+        """A busy run spent 10-20 s in the cmux-next cap's du before it found evict.lock taken; it now stops first,
+        and its run line names its caller and the holder with when it took the lock."""
+        _, _, p_lock, p_pending = self._queue()
+        lock = self.root / "evict.lock"
+        with p_lock, p_pending, lock.open("a") as held, mock.patch.dict(os.environ, {gd.CALLER_ENV: "test"}), \
+                mock.patch.object(gd, "cmux_next_ci_cap_state") as cap:
+            fcntl.flock(held, fcntl.LOCK_EX)
+            (self.root / "evict.owner.json").write_text(json.dumps({
+                "pid": os.getpid(), "owner": "cmux", "started_at": time.time() - 60,
+                "command": "glaeda-disk --pressure --apply --top 0"}))
+            status, rows, survey, _ = self._main_run(["--pressure", "--apply"])
+        self.assertEqual(status, 0)
+        row = rows[-1]
+        self.assertEqual((row["skipped"], row["caller"]), ("eviction_busy", "test"))
+        self.assertEqual((row["evict_owner"]["pid"], row["evict_owner"]["command"]),
+                         (os.getpid(), "glaeda-disk --pressure --apply --top 0"))
+        self.assertIsNotNone(row["evict_owner"]["since"])
+        cap.assert_not_called()
+        survey.assert_not_called()
+
+    def test_the_run_line_names_its_caller_without_the_variable(self) -> None:
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(gd.CALLER_ENV, None)
+            self.assertTrue(gd.run_caller())
+
     def test_a_deferred_run_writes_its_reason(self) -> None:
         lock = self.root / "measure.lock"
         with lock.open("a") as held:
