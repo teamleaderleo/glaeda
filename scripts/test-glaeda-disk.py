@@ -233,7 +233,7 @@ class GlaedaDiskTest(unittest.TestCase):
                 {"xcode-derived-data", "cmux-job-cache", "cmux-ghosttykit-cache",
                  "cua-recordings", "cua-cache"},
             )
-            self.assertTrue(all(family.min_idle_hours == 168.0 for family in families))
+            self.assertTrue(all(family.min_idle_hours == gd.DEFAULT_AGE_HOURS for family in families))
             self.assertTrue(gd.runner_profile_roots_safe(families))
             measured = gd.fixed_measurement_roots()
             self.assertEqual(set(measured), {family.root for family in families})
@@ -1620,7 +1620,7 @@ class GlaedaDiskTest(unittest.TestCase):
                              gd.HOME / "Library/Application Support/cua-ssh/recordings")
             self.assertEqual(fams["cua-cache"].root, gd.HOME / "Library/Caches/cmux/cmux-cua")
             self.assertTrue(fams["cua-recordings"].reclaimable)
-            self.assertEqual(fams["cua-recordings"].min_idle_hours, 24.0)
+            self.assertEqual(fams["cua-recordings"].min_idle_hours, gd.DEFAULT_AGE_HOURS)
             self.assertEqual(fams["cua-cache"].owner, "cmux CUA")
         finally:
             gd.HOME, gd.FLEET_ROOT, gd.DARWIN = saved
@@ -1724,7 +1724,7 @@ class GlaedaDiskTest(unittest.TestCase):
 
     def test_cmux_next_ci_idle_floor_survives_pressure_mode(self) -> None:
         root = self.root / "Library/Caches/cmux-next-ci"
-        build = make(root / "cmux-scheme/runner-a/Build", age_hours=48)
+        build = make(root / "cmux-scheme/runner-a/Build", age_hours=gd.CMUX_NEXT_CI_MIN_IDLE_HOURS - 1)
         fam = gd.cmux_next_ci_family(root)
         with mock.patch.object(gd, "ACTIVITY_MODE", "pressure"), \
                 mock.patch.object(gd, "process_evidence", return_value=([], "")):
@@ -2017,7 +2017,7 @@ class GlaedaDiskTest(unittest.TestCase):
         for k in (1, 2, 3):
             (capacity / f"root-{k}.token").touch()
         roots = {k: tmp / ("cmux-ci" if k == 1 else f"cmux-ci-{k}") for k in (1, 2, 3)}
-        for k, hours in ((1, 9.3), (2, 20.9), (3, 0.5)):
+        for k, hours in ((1, 9.3), (2, 10.9), (3, 0.5)):  # under the 12 h window
             make(roots[k] / "derived-data-compile-admission", age_hours=hours)
             make(roots[k] / "src", age_hours=hours)
         job = open(capacity / "root-3.token")
@@ -2031,7 +2031,7 @@ class GlaedaDiskTest(unittest.TestCase):
                 fams = gd.canonical_admission_families(tmp)
                 return fams, {os.path.relpath(i.path, tmp): i.verdict for i in gd.survey(fams, 6, 0)}
         _, above = verdicts({})
-        self.assertEqual(set(above.values()), {"recent", "in-use"})  # above the floor the 24 h window stands
+        self.assertEqual(set(above.values()), {"recent", "in-use"})  # above the floor the 12 h window stands
         fams, under = verdicts({dev: 50 * gd.GIB})
         self.assertEqual(under, {"cmux-ci/derived-data-compile-admission": "reclaimable",
                                  "cmux-ci-2/derived-data-compile-admission": "reclaimable",
@@ -3857,6 +3857,7 @@ class GlaedaDiskTest(unittest.TestCase):
         item = gd.Item(fam.id, os.fspath(host), 5 * 1024 * 1024, 49, "reclaimable", [])
         with mock.patch.object(gd, "HOME", home), mock.patch.object(gd, "process_evidence", return_value=([], "")), \
                 mock.patch.object(gd, "command_lines", return_value=""), \
+                mock.patch.dict(gd.POLICY, {"cmux_next_ci_host_idle_hours": 48.0}), \
                 mock.patch.object(gd, "ACTIVITY_MODE", "sweep"), contextlib.redirect_stdout(io.StringIO()):
             released = gd.apply([item], {fam.id: fam}, receipt, None, 6, all_families=[fam], taken=taken)
         self.assertEqual(released, 2 * 1024 * 1024)
@@ -4735,7 +4736,7 @@ class GlaedaDiskTest(unittest.TestCase):
         self.assertEqual((rec["family"], rec["outcome"], rec["items"]), (gd.TMP_TEST_RESIDUE_FAMILY, "reclaimed", 4))
         self.assertEqual(rec["by_prefix"], {"cmux-cli-socket": 1, "git-pr": 1, "TemporaryDirectory": 1,
                                             "cmux-shortcut-routing": 1})
-        self.assertEqual(rec["kept"], {"a symlink": 1, "changed within 48h": 1})  # recent tops are never walked
+        self.assertEqual(rec["kept"], {"a symlink": 1, f"changed within {gd.TMP_TEST_RESIDUE_IDLE_HOURS:g}h": 1})  # recent tops are never walked
 
     def test_tmpdir_test_residue_vetoes_open_and_named_entries(self) -> None:
         tmp, e = self._tmp_residue()
@@ -5387,7 +5388,7 @@ class GlaedaDiskTest(unittest.TestCase):
     def test_simulator_runtimes_go_only_when_nothing_uses_them(self) -> None:
         now = time.time()
         old = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now - 30 * 86400))
-        new = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now - 86400))
+        new = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now - 6 * 3600))  # inside RUNTIME_IDLE_DAYS
 
         def rt(version, used, deletable=True):
             return {"runtimeIdentifier": f"ios-{version}", "platformIdentifier": "iphonesimulator",
