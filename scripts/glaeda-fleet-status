@@ -869,39 +869,49 @@ def collect_tooling(manifest: dict[str, Any], hosts: list[str], repo: Path = SCR
 
 
 # Read-only: is the root daemon-heal installed, its report (root writes it 0644), and the member's clock.
+DAEMON_HEAL_MAX_OUT = 70000  # the report's 64 KiB and the markers: output this long is cut short, so refused
 DAEMON_HEAL_SCRIPT = (
-    'if [ "$(/usr/bin/uname)" != Darwin ]; then echo @not_darwin; exit 0; fi; '
+    '{ if [ "$(/usr/bin/uname)" != Darwin ]; then echo @not_darwin; exit 0; fi; '
     'd="/Library/Application Support/glaeda/daemon-heal"; '
     'if [ -f "$d/glaeda-daemon-heal" ] && [ -f /Library/LaunchDaemons/com.teamleaderleo.glaeda.daemon-heal.plist ]; '
     'then echo @installed; else echo @missing; fi; '
     'if /bin/launchctl print system/com.teamleaderleo.glaeda.daemon-heal >/dev/null 2>&1; then echo @loaded; fi; '
-    'echo @report; /usr/bin/head -c 65536 "$d/state/report.json" 2>/dev/null; echo; echo @now; /bin/date +%s')
-DAEMON_HEAL_MAX_OUT = 70000  # the report's 64 KiB and the markers: more is not this probe's output
+    'echo @report; /usr/bin/head -c 65536 "$d/state/report.json" 2>/dev/null; echo; echo @now; /bin/date +%s; } '
+    f'| /usr/bin/head -c {DAEMON_HEAL_MAX_OUT}')
 DAEMON_HEAL_STATES = ("current", "stale", "missing")
 
 
 def parse_daemon_heal(stdout: str, at: int) -> dict[str, Any]:
-    """The probe, judged on the member's clock; only the verdict, the tags and a cleaned reason leave it."""
-    lines = stdout[:DAEMON_HEAL_MAX_OUT].splitlines()
-    if "@not_darwin" in (x.strip() for x in lines[:1]):
+    """The probe, judged on the member's clock; only the verdict, the tags and a cleaned reason leave it. Output that
+    is not exactly the probe's (a marker twice or out of order, no clock, cut short) is a probe failure, never a
+    verdict."""
+    def failed(why: str) -> dict[str, Any]:
+        return {"reachable": False, "error": f"daemon-heal probe output refused: {why}", "observed_at": at}
+
+    if len(stdout) >= DAEMON_HEAL_MAX_OUT:
+        return failed(f"{DAEMON_HEAL_MAX_OUT} bytes or more")
+    lines = stdout.splitlines()
+    if lines == ["@not_darwin"]:
         return {"reachable": True, "observed_at": at, "state": "not_darwin"}
-    sections: dict[str, list[str]] = {}
-    current = None
-    for line in lines:
-        if line.strip() in ("@installed", "@missing", "@loaded", "@report", "@now"):
-            current = line.strip()[1:]
-            sections[current] = []
-        elif current is not None:
-            sections[current].append(line)
+    # @installed|@missing, [@loaded], @report, <one JSON line or nothing>, [""], @now, <seconds>
+    head = lines[:3 if len(lines) > 1 and lines[1] == "@loaded" else 2]
+    if not head or head[0] not in ("@installed", "@missing") or head[-1] != "@report":
+        return failed("no install marker, or markers out of order")
+    rest = lines[len(head):]
+    if len(rest) < 2 or rest[-2] != "@now" or any(x.startswith("@") for x in rest[:-2]):
+        return failed("no clock, or a marker twice")
+    body = [x for x in rest[:-2] if x.strip()]
+    if len(body) > 1 or not re.fullmatch(r"\d{9,11}", rest[-1].strip()):
+        return failed("more than one report line, or a clock that is not seconds")
+    remote_now = int(rest[-1].strip())
     try:
-        report = json.loads("\n".join(sections.get("report", [])) or "null")
-    except ValueError:
-        report = None
-    remote_now = next((int(x) for x in sections.get("now", []) if x.strip().isdigit()), at)
-    verdict = daemon_heal().judge(report, remote_now, "installed" in sections)
-    if verdict["state"] == "current" and "loaded" not in sections:  # a report from before a bootout reads current
+        report = json.loads(body[0]) if body else None
+        verdict = daemon_heal().judge(report, remote_now, head[0] == "@installed")
+    except (ValueError, RecursionError, TypeError, AttributeError, OverflowError) as error:
+        return failed(f"unreadable report ({type(error).__name__})")
+    if verdict["state"] == "current" and "@loaded" not in head:  # a report from before a bootout reads current
         verdict = {"state": "stale", "reinstall": True, "why": "the root daemon-heal LaunchDaemon is installed but not loaded"}
-    release = (report or {}).get("release") if isinstance(report, dict) else None
+    release = report.get("release") if isinstance(report, dict) else None
     release = release if isinstance(release, dict) else {}
     return {"reachable": True, "observed_at": at, "state": verdict["state"], "why": clean(verdict["why"], 200),
             "reinstall": verdict.get("reinstall") is not False,
@@ -914,7 +924,7 @@ def daemon_heal_host(host: str, user: str, manifest: dict[str, Any] | None = Non
                 subprocess.run([SSH, "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-l", user, host,
                                 DAEMON_HEAL_SCRIPT], capture_output=True, text=True, timeout=TOOLING_TIMEOUT,
                                env=child_env(), check=False))
-    except (OSError, subprocess.TimeoutExpired) as error:
+    except (OSError, ValueError, subprocess.TimeoutExpired) as error:  # ValueError: output that is not UTF-8
         return {"reachable": False, "error": type(error).__name__, "observed_at": now()}
     if proc.returncode != 0:
         return {"reachable": False, "error": clean(proc.stderr, 160) or f"exit {proc.returncode}", "observed_at": now()}

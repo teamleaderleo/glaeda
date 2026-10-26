@@ -233,8 +233,11 @@ cmux13s-mac-mini  5e1f0c2a9b3d, 3 behind origin/main 63b5493c1d2e
 
 ## Root daemon-heal
 
-The `daemon_heal` probe reads three things on each member, read-only: whether the root LaunchDaemon and its
-snapshot exist, its `state/report.json` (at most 64 KiB), and the member's clock. Linux members answer
+The `daemon_heal` probe reads four things on each member, read-only: whether the root LaunchDaemon and its
+snapshot exist, whether launchd lists it (`launchctl print`), its `state/report.json` (at most 64 KiB), and
+the member's clock. Output that is not exactly the probe's is a `probe_failed`, never a verdict. That covers
+a marker repeated or out of order, no clock, more than one report line, unreadable JSON, and output cut off
+at 70,000 bytes on the member. Linux members answer
 `@not_darwin` and are skipped. `glaeda-daemon-heal`'s own `judge` decides, on the member's clock, so this tool
 and `glaeda-mini-health` read a report the same way ([CMUX_MINI_RUNNER.md](CMUX_MINI_RUNNER.md), 2l2). Only the
 verdict, the tags and a cleaned reason leave the member.

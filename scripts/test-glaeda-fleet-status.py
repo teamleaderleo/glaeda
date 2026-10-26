@@ -7,6 +7,7 @@ import importlib.machinery
 import importlib.util
 import io
 import json
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -1137,6 +1138,38 @@ class DaemonHealTests(unittest.TestCase):
                                                                "observed_at": AT}})
         self.assertEqual([f["code"] for f in by_id(doc, "daemon_heal.")], ["probe_failed"])
         self.assertNotIn("daemon_heal", next(m for m in doc["members"] if m["name"] == "mini-a"))
+
+    def test_output_that_is_not_the_probes_is_a_probe_failure_never_a_verdict(self):
+        good = heal_stdout(heal_report())
+        cases = {
+            "no clock": good.replace(f"@now\n{AT}\n", ""),
+            "clock not seconds": good.replace(f"@now\n{AT}", "@now\nsoon"),
+            "huge clock": good.replace(f"@now\n{AT}", "@now\n" + "9" * 40),
+            "marker twice": good.replace("@report\n", "@report\n@now\n1\n@report\n"),
+            "out of order": good.replace("@installed\n@loaded\n", "@loaded\n@installed\n"),
+            "two report lines": good.replace("@report\n", "@report\n{}\n"),
+            "nested json": heal_stdout().replace("@report\n", "@report\n" + "[" * 60000 + "\n"),
+            "not json": heal_stdout().replace("@report\n", "@report\n{nope\n"),
+            "too long": good + "x" * fs.DAEMON_HEAL_MAX_OUT,
+            "empty": "",
+        }
+        for name, out in cases.items():
+            row = fs.parse_daemon_heal(out, AT)
+            self.assertFalse(row["reachable"], name)
+            self.assertIn("refused", row["error"], name)
+        self.assertEqual(fs.parse_daemon_heal(good, AT)["state"], "current")
+        self.assertIn(f"/usr/bin/head -c {fs.DAEMON_HEAL_MAX_OUT}", fs.DAEMON_HEAL_SCRIPT, "bounded on the member")
+
+    def test_the_read_only_action_quotes_and_runs_on_the_member(self):
+        iso = fs.daemon_heal().iso
+        row = fs.parse_daemon_heal(heal_stdout(heal_report(wants="r-20261026-bbbbbbbbbbbb",
+                                                           behindSince=iso(AT - 7200), error="x")), AT)
+        action = by_id(self.build_rows(**{"mini-a": row}), "daemon_heal.daemon_heal_stale")[0]["action"]
+        inner = shlex.split(action["command"])[-1]
+        self.assertIn('json.load(open("/Library/Application Support/glaeda/daemon-heal/state/report.json"))', inner)
+        self.assertTrue(action["command"].startswith("ssh "), action["command"])
+        src_text = (Path(fs.__file__).parent / "glaeda-daemon-heal").read_text()
+        self.assertNotIn("import fcntl", src_text, "fleet-status imports it on Linux and on the operator machine")
 
     def test_probe_is_read_only_skips_never_touch_and_shows_in_text(self):
         for word in (" rm ", "unlink", "sudo", "bootout", "bootstrap", "kickstart", "--apply", "--install", "> "):
