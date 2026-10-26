@@ -6011,7 +6011,8 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
                     # the moment the toolchain is renamed away, so an interrupted delete cannot leave it behind
                     stale_hash = (p.parent.parent / "update-hashes" / p.name
                                   if fresh_layout == "rustup-toolchain" else None)
-                    remove(p, after_rename=cmux_next_ci_slot_recheck(fam, p) if cmux_next_ci_floor_slot(fam, p)
+                    remove(p, after_rename=cmux_next_ci_slot_recheck(fam, p, floor=cmux_next_ci_floor_slot(fam, p))
+                           if whole_state
                            else None if stale_hash is None else lambda h=stale_hash: h.unlink(missing_ok=True))
                     gone = True
                     if fam.id == CMUX_NEXT_CI_FAMILY and p.parent.parent.parent in tuple(
@@ -6088,12 +6089,17 @@ def cmux_next_ci_aside_busy(path: Path, opened: list[str] | frozenset[str], comm
 def cmux_next_ci_state_parents(root: Path) -> list[Path]:
     """The directories cmux_next_ci_state_roots' roots sit in (cmux-scheme, each <kind>/<key>/Release), whether
     or not a state is left in them."""
+    if root.is_symlink() or not root.is_dir():
+        return []
     found = [root / "cmux-scheme"]
     for kind in CMUX_NEXT_RELEASE_KINDS:
+        if (root / kind).is_symlink():
+            continue
         for key in _children(root / kind):
             if not key.is_symlink() and re.fullmatch(r"[0-9a-fA-F]{8,64}", key.name):
                 found.append(key / "Release")
-    return [d for d in found if d.is_dir() and not d.is_symlink()]
+    real = root.resolve()
+    return [d for d in found if d.is_dir() and not d.is_symlink() and d.resolve().is_relative_to(real)]
 
 
 def cmux_next_ci_state_roots(root: Path) -> list[Path]:
@@ -6151,18 +6157,23 @@ def runner_work_folder(runner: Path) -> Path:
     return runner / (work if isinstance(work, str) and work else "_work")
 
 
-def enrolled_runner_roster() -> tuple[dict[str, Path], bool]:
-    """agentName -> runner directory for every enrolled runner, from one read of each .runner, and whether every
-    one named its agent. While one cannot be read (mid-write, malformed) a state no name matches may be its."""
+def enrolled_runner_roster() -> tuple[dict[str, Path], bool, dict[Path, Path]]:
+    """From one read of each enrolled runner's .runner: agentName -> runner directory, whether every one named its
+    agent (while one cannot be read, mid-write or malformed, a state no name matches may be its), and each named
+    runner's work folder (runner_work_folder) from that same read."""
     names: dict[str, Path] = {}
+    work: dict[Path, Path] = {}
     complete = True
     for runner in enrolled_runners():
-        name = runner_config(runner).get("agentName")
+        config = runner_config(runner)
+        name = config.get("agentName")
         if isinstance(name, str):
             names.setdefault(name, runner)
+            folder = config.get("workFolder")
+            work[runner] = runner / (folder if isinstance(folder, str) and folder else "_work")
         else:
             complete = False
-    return names, complete
+    return names, complete, work
 
 
 def enrolled_runner_names() -> dict[str, Path]:
@@ -6180,12 +6191,13 @@ def cmux_next_ci_release_key(runner_name: str, workspace: str) -> str:
     return hashlib.sha256(f"{runner_name}\n{workspace}\n".encode()).hexdigest()[:16]
 
 
-def cmux_next_ci_release_keys(names: dict[str, Path] | None = None) -> dict[str, Path]:
+def cmux_next_ci_release_keys(roster: tuple[dict[str, Path], bool, dict[Path, Path]] | None = None) -> dict[str, Path]:
     """Release state key -> enrolled runner, for its cmux checkout ($GITHUB_WORKSPACE: <workFolder>/cmux/cmux)
-    as given and as resolved."""
+    as given and as resolved, from one roster read (enrolled_runner_roster)."""
+    names, _, work = enrolled_runner_roster() if roster is None else roster
     keys: dict[str, Path] = {}
-    for name, runner in (enrolled_runner_names() if names is None else names).items():
-        workspace = os.fspath(runner_work_folder(runner) / "cmux/cmux")
+    for name, runner in names.items():
+        workspace = os.fspath(work[runner] / "cmux/cmux")
         for ws in {workspace, os.path.realpath(workspace)}:
             keys.setdefault(cmux_next_ci_release_key(name, ws), runner)
     return keys
@@ -6200,11 +6212,12 @@ def cmux_next_ci_owner(state: Path, root: Path) -> Path | None:
     """The enrolled runner a validated state root belongs to: cmux-scheme/<agentName>, or <kind>/<key>/Release/...
     by its release key. None for a runner no longer enrolled here, or a shape neither names; OWNER_UNKNOWN when
     no runner matched but one's .runner could not be read in the same read."""
-    names, complete = enrolled_runner_roster()
+    roster = enrolled_runner_roster()
+    names, complete, _ = roster
     if state.parent == root / "cmux-scheme":
         owner = names.get(state.name)
     elif state.parent.parent.parent in tuple(root / kind for kind in CMUX_NEXT_RELEASE_KINDS):
-        owner = cmux_next_ci_release_keys(names).get(state.parent.parent.name)
+        owner = cmux_next_ci_release_keys(roster).get(state.parent.parent.name)
     else:
         return None
     return owner if owner is not None or complete else OWNER_UNKNOWN
@@ -6286,11 +6299,12 @@ class SlotNotNeeded(OSError):
     """Free reached the floor hold's stop while the post-rename evidence was taken: the slot was put back."""
 
 
-def cmux_next_ci_slot_recheck(fam: Family, path: Path):
+def cmux_next_ci_slot_recheck(fam: Family, path: Path, floor: bool = True):
     """after_rename for a whole slot. A slot is only its own runner's, and that runner's Runner.Worker shows in ps
     long before its build reaches the slot, so the fresh ps right before the rename already keeps a job's slot;
     this closes the rest: if the runner took a job, or anything is open in the detached tree, put it back. Free
-    space is read again after that evidence too: a slot no longer needed for the floor hold goes back as well."""
+    space is read again after that evidence too: a slot no longer needed for the floor hold goes back as well
+    (FLOOR: the floor hold took it; a stale root the cap takes whole has no stop)."""
     doomed = path.with_name(f"{DELETING_PREFIX}{path.name}-{os.getpid()}")
 
     def recheck() -> None:
@@ -6302,7 +6316,7 @@ def cmux_next_ci_slot_recheck(fam: Family, path: Path):
         taken = (opened is None or runner == OWNER_UNKNOWN or (runner is not None and runner_job_live(runner, cmds))
                  or in_cwd(os.fspath(doomed), open_index(opened)) or named_by(os.fspath(path), cmds)
                  or named_by(os.fspath(doomed), cmds) or bool(cmux_next_ci_tree_busy(doomed)))
-        if not taken and floor_stop_unmet(path):
+        if not taken and (not floor or floor_stop_unmet(path)):
             return  # nobody's, and still needed: remove() deletes it
         try:
             rename_noreplace(doomed, path)

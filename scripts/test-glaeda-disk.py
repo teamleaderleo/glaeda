@@ -3255,6 +3255,56 @@ class GlaedaDiskTest(unittest.TestCase):
             # a runner it can read still owns its own
             self.assertEqual(gd.cmux_next_ci_owner(st["mini-glaeda"], fam.root), home / "actions-runner-glaeda")
 
+    def test_a_release_owner_comes_from_one_read_of_its_runner(self) -> None:
+        home, fam, st = self._cmux_next_cap_tree()
+        runner = home / "actions-runner-glaeda"
+        good = (runner / ".runner").read_text(encoding="utf-8-sig")
+        reads = {"n": 0}
+        real = gd.runner_config
+
+        def config(r):  # the first read of runner 1 succeeds, any later one fails
+            if r == runner:
+                reads["n"] += 1
+                if reads["n"] > 1:
+                    return {}
+            return real(r)
+        with mock.patch.object(gd, "HOME", home), mock.patch.object(gd, "runner_config", side_effect=config):
+            self.assertEqual(gd.cmux_next_ci_owner(st["daily"], fam.root), runner)
+        self.assertEqual(reads["n"], 1)
+        self.assertTrue(good)
+
+    def test_a_stale_root_the_cap_takes_is_put_back_when_its_tree_turns_busy(self) -> None:
+        home, fam, st = self._cmux_next_cap_tree()
+        doomed = st["gone-runner"].with_name(f"{gd.DELETING_PREFIX}{st['gone-runner'].name}-{os.getpid()}")
+        recheck = gd.cmux_next_ci_slot_recheck(fam, st["gone-runner"], floor=False)
+        os.rename(st["gone-runner"], doomed)
+        (doomed / "unknown-child").mkdir()  # something new arrived in the detached tree
+        with mock.patch.object(gd, "HOME", home), mock.patch.object(gd, "process_evidence", return_value=([], "")):
+            with self.assertRaises(gd.SlotTaken):
+                recheck()
+        self.assertTrue((st["gone-runner"] / "SourcePackages").is_dir())
+        (st["gone-runner"] / "unknown-child").rmdir()
+        recheck = gd.cmux_next_ci_slot_recheck(fam, st["gone-runner"], floor=False)
+        os.rename(st["gone-runner"], doomed)
+        with mock.patch.object(gd, "HOME", home), mock.patch.object(gd, "process_evidence", return_value=([], "")), \
+                mock.patch.object(gd, "free_bytes", return_value=(400 * gd.GIB, 460 * gd.GIB)):
+            recheck()  # idle, and no floor stop applies to the cap's stale root: remove() deletes it
+        self.assertTrue(doomed.is_dir())
+
+    def test_no_state_parent_is_found_through_a_symlink(self) -> None:
+        home, fam, st = self._cmux_next_cap_tree()
+        outside = self.root / "outside"
+        (outside / ("ab" * 8) / "Release").mkdir(parents=True)
+        os.symlink(outside, fam.root / "dev-daily-release-link")
+        shutil.rmtree(fam.root / "release-compile")
+        os.symlink(outside, fam.root / "release-compile")
+        parents = gd.cmux_next_ci_state_parents(fam.root)
+        self.assertFalse([d for d in parents if d.resolve().is_relative_to(outside.resolve())], parents)
+        self.assertIn(fam.root / "cmux-scheme", parents)
+        linked_root = self.root / "linked-cmux-next-ci"
+        os.symlink(fam.root, linked_root)
+        self.assertEqual(gd.cmux_next_ci_state_parents(linked_root), [])
+
     def test_an_aside_slot_keeps_its_vetoes_on_a_later_pass(self) -> None:
         home, fam, st = self._cmux_next_cap_tree()
         scheme = st["mini-glaeda"].parent
