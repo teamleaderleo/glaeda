@@ -3101,6 +3101,76 @@ class GlaedaDiskTest(unittest.TestCase):
         self.assertEqual(removed, [])
         self.assertTrue((st["mini-glaeda"] / "SourcePackages").is_dir())
 
+    def _floor_apply(self, home, fam, free_gib, freed_gib, evidence=([], ""), over=0, slots_only=False, during=None):
+        """One pressure apply under a 50 GiB floor hold stop. Returns (released, removed, items)."""
+        dev = home.stat().st_dev
+        patches, removed = self._floor_disk(free_gib, freed_gib=freed_gib)
+        gd._DISCOVERED.clear()
+        with patches[0], patches[1], mock.patch.object(gd, "HOME", home), \
+                mock.patch.object(gd, "command_lines", return_value=evidence[1]), \
+                mock.patch.object(gd, "ACTIVITY_MODE", "pressure"), mock.patch.object(gd, "CMUX_NEXT_CI_OVER", over), \
+                mock.patch.object(gd, "FLOOR_HOLD", {dev: 50 * gd.GIB}), contextlib.redirect_stdout(io.StringIO()):
+            with mock.patch.object(gd, "process_evidence", return_value=([], "")):
+                items = gd.survey([fam], 6, 0)
+            if slots_only:
+                items = [i for i in items if Path(i.path).name not in gd.CMUX_NEXT_CI_GENERATED_NAMES]
+            with mock.patch.object(gd, "process_evidence", side_effect=during or (lambda: evidence)):
+                released = gd.apply(items, {fam.id: fam}, self.receipt(), None, 6, all_families=[fam])
+        return released, [Path(r) for r in removed], items
+
+    def test_a_floor_slot_is_not_stopped_by_the_spent_cap_budget(self) -> None:
+        # over the cap by one byte: the first Build spends the cap's budget, and the floor hold still wants 50 GiB
+        home, fam, st = self._cmux_next_cap_tree()
+        _, removed, _ = self._floor_apply(home, fam, 20.0, 4.0, over=1)
+        for key in ("mini-glaeda", "daily"):
+            self.assertIn(st[key], removed, key)
+
+    def test_a_slots_bytes_count_once_with_its_children(self) -> None:
+        home, fam, st = self._cmux_next_cap_tree()
+        worker = f"{home}/actions-runner-glaeda-2/bin/Runner.Worker spawnclient 1 2\n"  # runner 2 has a job
+        released, removed, items = self._floor_apply(home, fam, 20.0, 4.0, evidence=([], worker))
+        size = {Path(i.path): i.bytes for i in items}
+        self.assertEqual(removed, [st["mini-glaeda"] / "Build", st["daily"] / "Build", st["mini-glaeda"],
+                                       st["daily"]])
+        # each slot's measured size includes its Build: the pass counts what the slots held, not more
+        self.assertEqual(released, size[st["mini-glaeda"]] + size[st["daily"]])
+
+    def test_the_floor_stop_is_read_again_right_before_a_slot_goes(self) -> None:
+        # free reaches the stop while the fresh evidence is taken: the slot stays
+        home, fam, st = self._cmux_next_cap_tree()
+        dev = home.stat().st_dev
+        state = {"free": 20 * gd.GIB}
+
+        def evidence():
+            state["free"] = 60 * gd.GIB  # another job's cleanup finished meanwhile
+            return [], ""
+        gd._DISCOVERED.clear()
+        with mock.patch.object(gd, "free_bytes", side_effect=lambda _p: (state["free"], 460 * gd.GIB)), \
+                mock.patch.object(gd, "remove") as remove, mock.patch.object(gd, "HOME", home), \
+                mock.patch.object(gd, "command_lines", return_value=""), \
+                mock.patch.object(gd, "ACTIVITY_MODE", "pressure"), \
+                mock.patch.object(gd, "FLOOR_HOLD", {dev: 50 * gd.GIB}), contextlib.redirect_stdout(io.StringIO()):
+            with mock.patch.object(gd, "process_evidence", return_value=([], "")):
+                items = [i for i in gd.survey([fam], 6, 0) if Path(i.path) == st["mini-glaeda"]]
+            self.assertEqual([i.verdict for i in items], ["reclaimable"])
+            with mock.patch.object(gd, "process_evidence", side_effect=evidence):
+                gd.apply(items, {fam.id: fam}, self.receipt(), None, 6, all_families=[fam])
+        remove.assert_not_called()
+
+    def test_a_slot_whose_runner_takes_a_job_during_the_rename_is_put_back(self) -> None:
+        home, fam, st = self._cmux_next_cap_tree()
+        worker = f"{home}/actions-runner-glaeda/bin/Runner.Worker spawnclient 1 2\n"
+        calls = {"n": 0}
+
+        def during():  # idle at the last check before the rename, then runner 1's Runner.Worker appears
+            calls["n"] += 1
+            return ([], "") if calls["n"] <= 2 else ([], worker)  # before the loop, before the rename, after it
+        released, removed, items = self._floor_apply(home, fam, 20.0, 4.0, slots_only=True, during=during)
+        self.assertNotIn(st["mini-glaeda"], removed)
+        self.assertTrue((st["mini-glaeda"] / "SourcePackages").is_dir())  # back at its path
+        self.assertFalse([p for p in st["mini-glaeda"].parent.iterdir() if p.name.startswith(gd.DELETING_PREFIX)])
+        self.assertEqual(next(i for i in items if Path(i.path) == st["mini-glaeda"]).verdict, "blocked")
+
     @staticmethod
     def _release_key(name: str, runner: Path) -> str:
         """cmux scripts/cmux-next/release-derived-data-path.sh: sha256("$RUNNER_NAME\n$GITHUB_WORKSPACE\n")[:16]."""

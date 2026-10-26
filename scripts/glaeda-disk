@@ -946,7 +946,7 @@ def cmux_next_ci_over() -> int:
 def cmux_next_cap_only(fam: Family, path: Path, idle: float, idle_hours: float) -> bool:
     """Reclaimable only because the cmux-next-ci cache is over its cap: an unowned state root listed whole, or
     generated output younger than the family's own window. apply stops these once the cache is under the cap."""
-    return (fam.id == CMUX_NEXT_CI_FAMILY and cmux_next_ci_over() > 0
+    return (fam.id == CMUX_NEXT_CI_FAMILY and cmux_next_ci_over() > 0 and not cmux_next_ci_floor_slot(fam, path)
             and (cmux_next_ci_state_for(path, fam.root) is None or idle < idle_window(fam, idle_hours)))
 
 
@@ -5854,6 +5854,7 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
     archived = archived_seeds() if any(i.family == "cmux-seeds" for i in items) else frozenset()
     # Among pressure hot-tier items, evict greatest reuse distance, then oldest use.
     cap_left = cmux_next_ci_over()  # what the cmux-next-ci cache is still over its cap
+    taken_in: dict[Path, int] = {}  # bytes this pass took from inside each cmux-next state root
 
     def order(i):
         if cmux_next_ci_floor_slot(family_of(i), Path(i.path)):
@@ -5894,11 +5895,7 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
         # the floor hold stops at the floor plus target_margin_gib, the cmux-next cap once the cache is under it
         warm: list[bool] = []
         if cmux_next_ci_floor_slot(fam, p):
-            try:
-                stop = FLOOR_HOLD.get(p.parent.stat().st_dev)
-                if not (stop is not None and free_bytes(p.parent)[0] < stop):
-                    continue
-            except OSError:
+            if not floor_stop_unmet(p):
                 continue
         elif floor_hold_only(fam, i, idle_hours):
             try:
@@ -5976,6 +5973,8 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
             outcome = "changed:modified"
         elif keep_verdict(fam, p):
             outcome = "changed:kept"
+        elif cmux_next_ci_floor_slot(fam, p) and not floor_stop_unmet(p):
+            continue  # free reached the floor hold's stop while the evidence was re-taken
         elif not git_exempt(fam, p, idle_now) and not fam.git_disposable and family_git_state(fam, p) != "none":
             outcome = "changed:git"  # a clone appeared at the top of the cache since the survey
         elif (fam.git_disposable and p.is_dir() and not git_exempt(fam, p, idle_now)
@@ -5983,6 +5982,7 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
               and (g != "git" or family_git_loss(fam, p))):
             outcome = "changed:git"  # the checkout gained something to lose since the survey
         else:
+            whole_state = fam.id == CMUX_NEXT_CI_FAMILY and p in cmux_next_ci_state_roots(fam.root)
             try:
                 common = git_common_dir(p) if fam.git_disposable else ""
                 if fam.transcripts:
@@ -6004,8 +6004,8 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
                     # the moment the toolchain is renamed away, so an interrupted delete cannot leave it behind
                     stale_hash = (p.parent.parent / "update-hashes" / p.name
                                   if fresh_layout == "rustup-toolchain" else None)
-                    remove(p, after_rename=None if stale_hash is None
-                           else lambda h=stale_hash: h.unlink(missing_ok=True))
+                    remove(p, after_rename=cmux_next_ci_slot_recheck(fam, p) if cmux_next_ci_floor_slot(fam, p)
+                           else None if stale_hash is None else lambda h=stale_hash: h.unlink(missing_ok=True))
                     gone = True
                     if fam.id == CMUX_NEXT_CI_FAMILY and p.parent.parent.parent in tuple(
                             fam.root / kind for kind in CMUX_NEXT_RELEASE_KINDS):
@@ -6015,12 +6015,19 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
                                 empty.rmdir()
                 if not fam.transcripts:
                     outcome = "reclaimed" if gone else "changed:in-use"
-                    released += i.bytes if gone else 0
+                    took = i.bytes
                     if gone and fam.id == CMUX_NEXT_CI_FAMILY:
-                        cap_left -= i.bytes
+                        if whole_state:
+                            took = max(0, took - taken_in.get(p, 0))  # its children's bytes were counted already
+                        else:
+                            taken_in[p.parent] = taken_in.get(p.parent, 0) + took
+                        cap_left -= took
+                    released += took if gone else 0
                 if common:  # drop the deleted worktree's record from its repository
                     subprocess.run(["git", "--git-dir", common, "worktree", "prune"],
                                    capture_output=True, timeout=60)
+            except SlotTaken:
+                outcome = "changed:in-use"
             except (OSError, subprocess.SubprocessError) as e:
                 outcome = f"incomplete:{e.__class__.__name__}"
         is_sweep = halt is not None if receipt_sweep is None else receipt_sweep
@@ -6179,6 +6186,41 @@ def cmux_next_ci_floor_slots(root: Path) -> list[Path]:
     except OSError:
         return []
     return [s for s in cmux_next_ci_state_roots(root) if cmux_next_ci_owner(s, root) is not None]
+
+
+def floor_stop_unmet(path: Path) -> bool:
+    """Whether free space on PATH's filesystem is still under the floor hold's stop."""
+    try:
+        stop = FLOOR_HOLD.get(path.parent.stat().st_dev)
+        return stop is not None and free_bytes(path.parent)[0] < stop
+    except OSError:
+        return False
+
+
+class SlotTaken(OSError):
+    """A runner's job took its slot between the last check and the rename: the slot was put back."""
+
+
+def cmux_next_ci_slot_recheck(fam: Family, path: Path):
+    """after_rename for a whole slot. A slot is only its own runner's, and that runner's Runner.Worker shows in ps
+    long before its build reaches the slot, so the fresh ps right before the rename already keeps a job's slot;
+    this closes the rest: if the runner took a job, or anything is open in the detached tree, put it back."""
+    doomed = path.with_name(f"{DELETING_PREFIX}{path.name}-{os.getpid()}")
+
+    def recheck() -> None:
+        runner = cmux_next_ci_owner(path, fam.root)
+        try:
+            opened, cmds = process_evidence()
+        except NoEvidence:
+            opened, cmds = None, ""
+        if (opened is None or (runner is not None and runner_job_live(runner, cmds))
+                or in_cwd(os.fspath(doomed), open_index(opened)) or named_by(os.fspath(path), cmds)):
+            try:
+                os.rename(doomed, path)
+            except OSError:
+                return  # the job made a new slot at the path: the detached one is nobody's
+            raise SlotTaken(f"{path.name}: its runner took a job; put back")
+    return recheck
 
 
 def cmux_next_ci_floor_slot(fam: Family, path: Path) -> bool:
