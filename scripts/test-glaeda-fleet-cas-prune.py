@@ -249,6 +249,28 @@ class PruneTest(unittest.TestCase):
         real = self.saved[3]
         with mock.patch.object(fp.importlib.machinery, "SourceFileLoader", side_effect=OSError("gone")):
             self.assertIn("kept as reserved", real())
+        # the real glaeda-disk loads (its dataclasses need the module in sys.modules) and answers from a made-up list
+        gd = fp.load_glaeda_disk(ROOT / "scripts/glaeda-disk")
+        listing = Path(self.tmp.name) / "fleet-reservations.json"
+        listing.write_text(json.dumps({"reservations": [{"id": "r9", "owner": "someone", "hosts": ["cmux30"],
+                                                         "from": "2000-01-01T00:00:00Z",
+                                                         "until": "2999-01-01T00:00:00Z"}]}))
+        gd.FLEET_RESERVATIONS = listing
+        gd.host_names = lambda: {"cmux30"}
+        gd.runner_floor_gib = lambda: 0.0
+        self.assertIn("reserved for someone", real(gd))
+        gd.host_names = lambda: {"cmux31"}
+        gd.HOST_RESERVATION_LOCAL = Path(self.tmp.name) / "no-reservation.json"
+        self.assertEqual(real(gd), "")
+        listing.unlink()
+        self.assertIn("kept as reserved", real(gd))
+
+    def test_a_reserved_host_never_runs_store_gc(self) -> None:
+        fp.reserved_above_floor = lambda: "reserved for someone until 2999-01-01T00:00:00Z (r9); 80 GiB free, floor 30"
+        with mock.patch.object(fp, "store_gc", side_effect=AssertionError("gc ran on a reserved host")):
+            rec = self.run_main("--apply")
+        self.assertTrue(rec["result"].startswith("deferred: reserved"), rec)
+
 
     def test_in_flight_daemon_temporaries_are_never_removed(self) -> None:
         self.env()
