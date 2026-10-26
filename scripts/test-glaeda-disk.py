@@ -1518,7 +1518,7 @@ class GlaedaDiskTest(unittest.TestCase):
                 mock.patch.object(gd, "process_evidence", return_value=late), \
                 mock.patch.object(gd, "command_lines", return_value=late[1]), \
                 mock.patch.object(gd, "HOME", self.root / "home"), \
-                mock.patch.object(gd, "archive_mirror", return_value=("", [], ([], [], []))), \
+                mock.patch.object(gd, "archive_mirror", return_value=("", [], ([], [], [], {}))), \
                 mock.patch.object(gd, "mirror_moved", return_value=""):  # bundling: the cmux-job tests
             gd.apply(reclaim, {fam.id: fam}, receipt, None, 24)
         self.assertEqual(sorted(p.name for p in cache.iterdir()),
@@ -5899,6 +5899,52 @@ class LinuxLayoutTest(unittest.TestCase):
         self.assertEqual(rec["outcome"], "blocked:bundle-failed")
         self.assertTrue(any("locked worktree" in r for r in rec["reasons"]))
         self.assertTrue((unit / "slot-1/.git").is_file())
+
+    def test_a_branch_the_server_drops_after_bundling_keeps_the_mirror(self) -> None:
+        unit, clone, env = self.mirror_unit()
+        srv = self.home / "srv"
+        self.git(srv, "checkout", "-q", "-b", "feat", env=env)
+        self.git(srv, "commit", "-q", "--allow-empty", "-m", "feat", env=env)
+        self.git(srv, "checkout", "-q", "main", env=env)
+        self.git(clone, "fetch", "-q", "origin", env=env)
+        self.git(clone, "branch", "mine", "origin/feat", env=env)  # on the server now: no bundle needed
+        real = gd.archive_mirror
+
+        def racing(path):
+            out = real(path)
+            self.git(srv, "branch", "-q", "-D", "feat", env=env)
+            self.git(srv, "reflog", "expire", "--expire=now", "--all", env=env)
+            self.git(srv, "gc", "-q", "--prune=now", env=env)
+            return out
+        with mock.patch.object(gd, "archive_mirror", racing):
+            rec, _ = self.apply_mirror(unit)
+        self.assertEqual(rec["outcome"], "changed:in-use")
+        self.assertTrue(any("no longer on one" in r for r in rec["reasons"]), rec["reasons"])
+        self.assertTrue((clone / ".git").is_dir())
+
+    def test_a_directory_read_error_while_finding_repositories_keeps_the_mirror(self) -> None:
+        unit, _, _ = self.mirror_unit()
+        hidden = unit / "slot-2/deep"
+        hidden.mkdir(parents=True)
+        real = os.scandir
+
+        def failing(p):
+            if os.fspath(p) == os.fspath(unit / "slot-2"):
+                raise OSError(errno.EIO, "I/O error")
+            return real(p)
+        with mock.patch.object(gd.os, "scandir", failing):
+            why, bundles, _ = gd.archive_mirror(unit)
+        self.assertIn("unreadable", why)
+        self.assertEqual(bundles, [])
+        self.assertEqual(gd.checkouts(unit, strict=False) is None, False)
+
+    def test_a_locked_worktree_of_a_repository_inside_the_mirror_keeps_it(self) -> None:
+        unit, clone, env = self.mirror_unit()
+        self.git(clone, "worktree", "add", "-q", "--detach", "--lock", str(unit / "slot-2"), env=env)
+        rec, _ = self.apply_mirror(unit)
+        self.assertEqual(rec["outcome"], "blocked:bundle-failed")
+        self.assertTrue(any("locked worktree" in r for r in rec["reasons"]), rec["reasons"])
+        self.assertTrue((unit / "slot-2/.git").is_file())
 
     def test_only_manifest_listed_bundles_at_their_hash_are_pruned_after_the_evidence_gate(self) -> None:
         archive = self.home / "archive/glaeda-disk"
