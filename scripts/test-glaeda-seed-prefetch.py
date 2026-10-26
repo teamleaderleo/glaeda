@@ -12,6 +12,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -376,9 +377,14 @@ class GovernorTest(unittest.TestCase):
 
         governor = sp.Governor(self.proc.pid, 1000, lambda: "job", read_interface=lambda: None, read_own=flaky,
                                tick=0.05)
-        governor.start()
-        governor.thread.join(5)
+        hook, threading.excepthook = threading.excepthook, lambda args: None  # the RuntimeError is the point
+        try:
+            governor.start()
+            governor.thread.join(5)
+        finally:
+            threading.excepthook = hook
         self.assertFalse(governor.thread.is_alive())
+        self.assertGreater(governor.stats["paused_seconds"], 0, "it was paused when the counter broke")
         self.assertFalse(self.stopped(), "the loop's end continues the group it stopped")
         governor.set_paused(True)
         self.assertFalse(self.stopped())
