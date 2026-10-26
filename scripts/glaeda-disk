@@ -5918,7 +5918,8 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
         if halt is not None and (why := halt()):
             print(f"stopped: {why}")
             break
-        if fam.id in FLEET_FAMILY_IDS or fam.id == CMUX_NEXT_CI_FAMILY:
+        if fam.id in FLEET_FAMILY_IDS or fam.id == CMUX_NEXT_CI_FAMILY or (
+                fam.id == INTERRUPTED and fam.root in cmux_next_ci_state_parents(HOME / "Library/Caches" / CMUX_NEXT_CI_ROOT)):
             # Pressure eligibility is intentionally broad, so take fresh cwd/open-file evidence immediately
             # before each rename. A job may start using a candidate after the survey or during a long pass.
             try:
@@ -5962,6 +5963,7 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
         elif fam.discover and not fresh_layout:
             outcome = "changed:layout"
         elif (cmux_next_ci_busy(fam, p, cwds, cmds)
+                or (fam.id == INTERRUPTED and cmux_next_ci_aside_busy(p, cwds, cmds))
                 or (fam.id == RUNNER_BUILD_FAMILY and runner_job_live(fam.root.parent, cmds))
                 or (fam.app_clones and app_clone_running(p, cmds))
                 or in_cwd(i.path, cwds) or named_by(i.path, cmds) or holds_socket(p) or job_busy(fam, p)
@@ -6064,6 +6066,25 @@ def cmux_next_ci_dirs(home: Path | None = None) -> list[Path]:
     return [d for d in _children(root) if d.is_dir() and not d.is_symlink()]
 
 
+def cmux_next_ci_aside_busy(path: Path, opened: list[str] | frozenset[str], commands: str) -> str:
+    """For an aside tree (DELETING_PREFIX<name>-<pid>) where cmux-next state roots sit, the state's own vetoes,
+    as if it were still at <name>: its runner's job (unknown ownership refuses), a process naming it, the
+    fail-closed socket search, markers, unknown children. "" for any other aside tree."""
+    root = HOME / "Library/Caches" / CMUX_NEXT_CI_ROOT
+    m = DELETING_RE.fullmatch(path.name)
+    if m is None or path.parent not in cmux_next_ci_state_parents(root):
+        return ""
+    original = path.with_name(path.name[len(DELETING_PREFIX):m.start(1) - 1])
+    runner = cmux_next_ci_owner(original, root)
+    if runner == OWNER_UNKNOWN:
+        return "an enrolled runner's .runner names no agent: whose cmux-next state this is is unknown"
+    if runner is not None and (why := runner_job_live(runner, commands)):
+        return why
+    if named_by(os.fspath(original), commands) or named_by(os.fspath(path), commands):
+        return "cmux-next state is referenced by a process"
+    return cmux_next_ci_tree_busy(path)
+
+
 def cmux_next_ci_state_parents(root: Path) -> list[Path]:
     """The directories cmux_next_ci_state_roots' roots sit in (cmux-scheme, each <kind>/<key>/Release), whether
     or not a state is left in them."""
@@ -6130,20 +6151,23 @@ def runner_work_folder(runner: Path) -> Path:
     return runner / (work if isinstance(work, str) and work else "_work")
 
 
-def enrolled_runner_names_complete() -> bool:
-    """Whether every enrolled runner's .runner names its agent, so a state no name or key matches is no runner's.
-    While one cannot be read (mid-write, malformed), its states would read unowned: nothing is."""
-    return all(isinstance(runner_config(r).get("agentName"), str) for r in enrolled_runners())
-
-
-def enrolled_runner_names() -> dict[str, Path]:
-    """agentName -> runner directory for every enrolled runner."""
+def enrolled_runner_roster() -> tuple[dict[str, Path], bool]:
+    """agentName -> runner directory for every enrolled runner, from one read of each .runner, and whether every
+    one named its agent. While one cannot be read (mid-write, malformed) a state no name matches may be its."""
     names: dict[str, Path] = {}
+    complete = True
     for runner in enrolled_runners():
         name = runner_config(runner).get("agentName")
         if isinstance(name, str):
             names.setdefault(name, runner)
-    return names
+        else:
+            complete = False
+    return names, complete
+
+
+def enrolled_runner_names() -> dict[str, Path]:
+    """agentName -> runner directory for every enrolled runner."""
+    return enrolled_runner_roster()[0]
 
 
 CMUX_NEXT_RELEASE_KINDS = ("dev-daily-release", "release-compile")
@@ -6156,25 +6180,34 @@ def cmux_next_ci_release_key(runner_name: str, workspace: str) -> str:
     return hashlib.sha256(f"{runner_name}\n{workspace}\n".encode()).hexdigest()[:16]
 
 
-def cmux_next_ci_release_keys() -> dict[str, Path]:
+def cmux_next_ci_release_keys(names: dict[str, Path] | None = None) -> dict[str, Path]:
     """Release state key -> enrolled runner, for its cmux checkout ($GITHUB_WORKSPACE: <workFolder>/cmux/cmux)
     as given and as resolved."""
     keys: dict[str, Path] = {}
-    for name, runner in enrolled_runner_names().items():
+    for name, runner in (enrolled_runner_names() if names is None else names).items():
         workspace = os.fspath(runner_work_folder(runner) / "cmux/cmux")
         for ws in {workspace, os.path.realpath(workspace)}:
             keys.setdefault(cmux_next_ci_release_key(name, ws), runner)
     return keys
 
 
+# cmux_next_ci_owner's answer while an enrolled runner's .runner cannot be read: the state may be that runner's.
+# Not None, so nothing takes the state as unowned, and every in-use veto refuses it (cmux_next_ci_busy).
+OWNER_UNKNOWN = Path("/nonexistent/glaeda-disk-owner-unknown")
+
+
 def cmux_next_ci_owner(state: Path, root: Path) -> Path | None:
     """The enrolled runner a validated state root belongs to: cmux-scheme/<agentName>, or <kind>/<key>/Release/...
-    by its release key. None for a runner no longer enrolled here, or a shape neither names."""
+    by its release key. None for a runner no longer enrolled here, or a shape neither names; OWNER_UNKNOWN when
+    no runner matched but one's .runner could not be read in the same read."""
+    names, complete = enrolled_runner_roster()
     if state.parent == root / "cmux-scheme":
-        return enrolled_runner_names().get(state.name)
-    if state.parent.parent.parent in tuple(root / kind for kind in CMUX_NEXT_RELEASE_KINDS):
-        return cmux_next_ci_release_keys().get(state.parent.parent.name)
-    return None
+        owner = names.get(state.name)
+    elif state.parent.parent.parent in tuple(root / kind for kind in CMUX_NEXT_RELEASE_KINDS):
+        owner = cmux_next_ci_release_keys(names).get(state.parent.parent.name)
+    else:
+        return None
+    return owner if owner is not None or complete else OWNER_UNKNOWN
 
 
 def cmux_next_ci_runner(path: Path, root: Path) -> Path | None:
@@ -6189,7 +6222,7 @@ def cmux_next_ci_stale_roots(root: Path) -> list[Path]:
     (a scheme state by name, a release state by key; cmux_next_ci_owner), idle at least a job's timeout
     (cmux_next_ci_unowned_idle_hours). Only a host with enrolled runners can say an owner is gone, so elsewhere
     there are none. An enrolled runner's states, and a younger unowned one, keep their inputs."""
-    if not enrolled_runner_names() or not enrolled_runner_names_complete():
+    if not enrolled_runner_names():
         return []
     idle_s = float(POLICY["cmux_next_ci_unowned_idle_hours"]) * 3600
     now = time.time()
@@ -6221,6 +6254,28 @@ def floor_stop_unmet(path: Path) -> bool:
         return False
 
 
+RENAME_EXCL = 0x4  # macOS renamex_np: fail with EEXIST if the destination exists
+RENAME_NOREPLACE = 0x1  # Linux renameat2
+
+
+def rename_noreplace(src: Path, dst: Path) -> None:
+    """Rename SRC to DST atomically, failing with EEXIST when anything is at DST, even an empty directory (which
+    os.rename would replace). Raises OSError(ENOTSUP) where the platform has no such rename."""
+    import ctypes
+    import ctypes.util
+    libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+    a, b = os.fsencode(src), os.fsencode(dst)
+    if hasattr(libc, "renamex_np"):
+        rc = libc.renamex_np(a, b, ctypes.c_uint(RENAME_EXCL))
+    elif hasattr(libc, "renameat2"):
+        rc = libc.renameat2(-100, a, -100, b, ctypes.c_uint(RENAME_NOREPLACE))  # AT_FDCWD
+    else:
+        raise OSError(errno.ENOTSUP, "no atomic no-replace rename here")
+    if rc != 0:
+        err = ctypes.get_errno()
+        raise OSError(err, os.strerror(err), os.fspath(dst))
+
+
 class SlotTaken(OSError):
     """A runner's job took its slot between the last check and the rename: the slot was put back, or, when a new
     slot already stands at its path, left aside under its deleting name. remove() deletes neither; the
@@ -6244,13 +6299,13 @@ def cmux_next_ci_slot_recheck(fam: Family, path: Path):
             opened, cmds = process_evidence()
         except NoEvidence:
             opened, cmds = None, ""
-        taken = (opened is None or (runner is not None and runner_job_live(runner, cmds))
+        taken = (opened is None or runner == OWNER_UNKNOWN or (runner is not None and runner_job_live(runner, cmds))
                  or in_cwd(os.fspath(doomed), open_index(opened)) or named_by(os.fspath(path), cmds)
                  or named_by(os.fspath(doomed), cmds) or bool(cmux_next_ci_tree_busy(doomed)))
         if not taken and floor_stop_unmet(path):
             return  # nobody's, and still needed: remove() deletes it
         try:
-            os.rename(doomed, path)
+            rename_noreplace(doomed, path)
         except OSError as e:
             if not taken and e.errno in (errno.EEXIST, errno.ENOTEMPTY) and os.path.lexists(path):
                 return  # the floor was met, but a new slot stands at the path: the detached one is nobody's
@@ -6386,7 +6441,10 @@ def cmux_next_ci_busy(fam: Family, path: Path, opened: list[str] | frozenset[str
         state = path  # an enrolled runner's slot the floor hold takes whole: the same vetoes, its runner's job first
     if state is None:
         return "cmux-next state root is no longer validated"
-    if (runner := cmux_next_ci_owner(state, fam.root)) is not None and (why := runner_job_live(runner, commands)):
+    runner = cmux_next_ci_owner(state, fam.root)
+    if runner == OWNER_UNKNOWN:
+        return "an enrolled runner's .runner names no agent: whose cmux-next state this is is unknown"
+    if runner is not None and (why := runner_job_live(runner, commands)):
         return why
     state_text = os.fspath(state)
     if in_cwd(state_text, opened) or named_by(state_text, commands):

@@ -3209,6 +3209,86 @@ class GlaedaDiskTest(unittest.TestCase):
         self.assertTrue((st["mini-glaeda"] / "Build").exists())  # nor the job's new slot
         self.assertEqual(next(i for i in items if Path(i.path) == st["mini-glaeda"]).verdict, "blocked")
 
+    def test_a_slot_put_back_never_replaces_an_empty_slot_a_job_made(self) -> None:
+        home, fam, st = self._cmux_next_cap_tree()
+        worker = f"{home}/actions-runner-glaeda/bin/Runner.Worker spawnclient 1 2\n"
+        calls = {"n": 0}
+
+        def during():  # after the rename, runner 1's job is live and has made an empty slot (its cwd)
+            calls["n"] += 1
+            if calls["n"] <= 2:
+                return [], ""
+            if not st["mini-glaeda"].exists():
+                st["mini-glaeda"].mkdir()
+                made.append(st["mini-glaeda"].stat().st_ino)
+            return [], worker
+        made: list[int] = []
+        _, removed, _ = self._floor_apply(home, fam, 20.0, 4.0, slots_only=True, during=during)
+        self.assertNotIn(st["mini-glaeda"], removed)
+        self.assertEqual(st["mini-glaeda"].stat().st_ino, made[0])  # the job's directory is still the one there
+        self.assertEqual(list(st["mini-glaeda"].iterdir()), [])
+        aside = [p for p in st["mini-glaeda"].parent.iterdir() if p.name.startswith(gd.DELETING_PREFIX)]
+        self.assertEqual(len(aside), 1)
+        self.assertTrue((aside[0] / "SourcePackages").is_dir())
+
+    def test_rename_noreplace_refuses_an_empty_directory(self) -> None:
+        src, dst = self.root / "src", self.root / "dst"
+        src.mkdir()
+        dst.mkdir()
+        with self.assertRaises(OSError) as raised:
+            gd.rename_noreplace(src, dst)
+        self.assertIn(raised.exception.errno, (errno.EEXIST, errno.ENOTSUP))
+        self.assertTrue(src.is_dir() and dst.is_dir())
+        if raised.exception.errno == errno.EEXIST:
+            dst.rmdir()
+            gd.rename_noreplace(src, dst)
+            self.assertTrue(dst.is_dir() and not src.exists())
+
+    def test_an_unknown_owner_vetoes_a_state_and_its_children(self) -> None:
+        home, fam, st = self._cmux_next_cap_tree()
+        with mock.patch.object(gd, "HOME", home), mock.patch.object(gd, "FLOOR_HOLD", {home.stat().st_dev: 50 * gd.GIB}):
+            (home / "actions-runner-glaeda-2/.runner").write_text("{not json")
+            # mini-glaeda-2's own slot and children: no runner matches by name, and one .runner cannot be read
+            self.assertEqual(gd.cmux_next_ci_owner(st["mini-glaeda-2"], fam.root), gd.OWNER_UNKNOWN)
+            for path in (st["mini-glaeda-2"], st["mini-glaeda-2"] / "Build", st["gone-runner"]):
+                self.assertIn("unknown", gd.cmux_next_ci_busy(fam, path, [], ""), path)
+            # a runner it can read still owns its own
+            self.assertEqual(gd.cmux_next_ci_owner(st["mini-glaeda"], fam.root), home / "actions-runner-glaeda")
+
+    def test_an_aside_slot_keeps_its_vetoes_on_a_later_pass(self) -> None:
+        home, fam, st = self._cmux_next_cap_tree()
+        scheme = st["mini-glaeda"].parent
+        aside = scheme / f"{gd.DELETING_PREFIX}mini-glaeda-999999"
+        os.rename(st["mini-glaeda"], aside)
+        wide = aside / "ModuleCache.noindex"
+        wide.mkdir()
+        for n in range(3001):
+            (wide / f"m{n}.pcm").touch()
+        sock_dir = Path(tempfile.mkdtemp(dir="/tmp"))
+        server = socket.socket(socket.AF_UNIX)
+        try:
+            server.bind(os.fspath(sock_dir / "s"))
+            os.rename(sock_dir / "s", aside / "Build" / "s")
+            with mock.patch.object(gd, "HOME", home), contextlib.redirect_stdout(io.StringIO()):
+                fams = [f for f in gd.interrupted_families([fam]) if f.root == scheme]
+                self.assertEqual(len(fams), 1)
+                self.assertFalse(gd.holds_socket(aside))  # the generic search gives up past its budget
+                self.assertIn("socket", gd.cmux_next_ci_aside_busy(aside, [], ""))
+                worker = f"{home}/actions-runner-glaeda/bin/Runner.Worker spawnclient 1 2\n"
+                os.unlink(aside / "Build" / "s")
+                self.assertEqual(gd.cmux_next_ci_aside_busy(aside, [], ""), "")
+                self.assertIn("Runner.Worker", gd.cmux_next_ci_aside_busy(aside, [], worker))
+                with mock.patch.object(gd, "process_evidence", return_value=([], worker)), \
+                        mock.patch.object(gd, "command_lines", return_value=worker):
+                    items = [i for i in gd.survey(fams, 6, 0) if Path(i.path) == aside]
+                    self.assertEqual(len(items), 1)
+                    items[0].verdict = "reclaimable"
+                    gd.apply(items, {f.id: f for f in fams}, self.receipt(), None, 6, all_families=fams)
+            self.assertTrue((aside / "SourcePackages").is_dir())  # its runner's job keeps it on the second pass
+        finally:
+            server.close()
+            shutil.rmtree(sock_dir, ignore_errors=True)
+
     def test_no_cmux_next_state_root_is_busy_for_its_width_alone(self) -> None:
         # an unowned stale root the cap takes whole, and an enrolled runner's slot, each wider than cmux_active's budget
         home, fam, st = self._cmux_next_cap_tree()
@@ -3286,7 +3366,6 @@ class GlaedaDiskTest(unittest.TestCase):
         home, fam, st = self._cmux_next_cap_tree()
         dev = home.stat().st_dev
         state = {"free": 20 * gd.GIB, "n": 0}
-        real_rename = os.rename
 
         def evidence():
             state["n"] += 1
@@ -3294,14 +3373,12 @@ class GlaedaDiskTest(unittest.TestCase):
                 state["free"] = 60 * gd.GIB
             return [], ""
 
-        def rename(src, dst):
-            if gd.DELETING_PREFIX in os.fspath(src):
-                raise PermissionError(errno.EACCES, "Permission denied")
-            return real_rename(src, dst)
+        def rename(src, dst):  # the put-back alone fails
+            raise PermissionError(errno.EACCES, "Permission denied")
         gd._DISCOVERED.clear()
         with mock.patch.object(gd, "free_bytes", side_effect=lambda _p: (state["free"], 460 * gd.GIB)), \
                 mock.patch.object(gd, "HOME", home), mock.patch.object(gd, "command_lines", return_value=""), \
-                mock.patch.object(gd, "ACTIVITY_MODE", "pressure"), mock.patch.object(gd.os, "rename", rename), \
+                mock.patch.object(gd, "ACTIVITY_MODE", "pressure"), mock.patch.object(gd, "rename_noreplace", rename), \
                 mock.patch.object(gd, "FLOOR_HOLD", {dev: 50 * gd.GIB}), contextlib.redirect_stdout(io.StringIO()):
             with mock.patch.object(gd, "process_evidence", return_value=([], "")):
                 items = [i for i in gd.survey([fam], 6, 0) if Path(i.path) == st["mini-glaeda"]]
