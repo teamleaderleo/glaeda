@@ -2626,14 +2626,16 @@ LAUNCHCTL_ERROR_5 = (f"If launchctl answers \"5: Input/output error\": from boot
 def start_hint(restart: bool = False, domain: str | None = None) -> str:
     """How to (re)start the daemon here, including when its service was never loaded."""
     if sys.platform == "darwin":
-        if (domain or launchd_domain()).startswith("user/"):
+        domain = domain or launchd_domain()
+        if domain is None:
+            return DOMAIN_UNKNOWN_HINT[0].upper() + DOMAIN_UNKNOWN_HINT[1:]
+        if domain.startswith("user/"):
             try:
                 system = system_daemon_loaded()
             except (OSError, subprocess.TimeoutExpired):
-                return (f"nobody is logged in here and launchctl could not say whether the system LaunchDaemon "
-                        f"system/{LAUNCH_LABEL} is loaded: check with sudo launchctl print system/{LAUNCH_LABEL} "
-                        f"before starting anything. If it is loaded: sudo launchctl kickstart -k "
-                        f"system/{LAUNCH_LABEL}; if not: glaeda-gh restart, which loads a Background copy in "
+                system = None
+            if system is None:
+                return (f"nobody is logged in here and {SYSTEM_UNKNOWN_HINT}, which loads a Background copy in "
                         f"user/$(id -u). Never run glaeda-gh serve yourself")
             if system:
                 return SYSTEM_DAEMON_HINT[0].upper() + SYSTEM_DAEMON_HINT[1:] + ". Never run glaeda-gh serve yourself"
@@ -2643,7 +2645,7 @@ def start_hint(restart: bool = False, domain: str | None = None) -> str:
                     f"Logging the user in, or a reboot with automatic login, brings the LaunchAgent back. "
                     f"Never run glaeda-gh serve yourself. Its log is ~/Library/Logs/glaeda-gh.err")
         try:
-            system = system_daemon_loaded()
+            system = system_daemon_loaded() is not False  # loaded, or launchctl cannot tell
             copy = not unloaded(f"user/{os.getuid()}/{LAUNCH_LABEL}")
         except (OSError, subprocess.TimeoutExpired):
             system = copy = True
@@ -5602,15 +5604,22 @@ def cmd_gh_install_shim(print_only: bool) -> int:
 NO_GUI_DOMAIN = 125
 
 
-def launchd_domain() -> str:
-    """gui/UID while this user has a login session; user/UID when launchd says there is none."""
+def launchd_domain() -> str | None:
+    """gui/UID while this user has a login session; user/UID when launchd says there is none; None when
+    launchctl cannot tell (any other answer, or none): callers then change nothing."""
     gui = f"gui/{os.getuid()}"
     try:
-        if run_bounded(["launchctl", "print", gui], 10).returncode == NO_GUI_DOMAIN:
-            return f"user/{os.getuid()}"
+        code = run_bounded(["launchctl", "print", gui], 10).returncode
     except (OSError, subprocess.TimeoutExpired):
-        pass
-    return gui
+        return None
+    return gui if code == 0 else f"user/{os.getuid()}" if code == NO_GUI_DOMAIN else None
+
+
+DOMAIN_UNKNOWN_HINT = (f"launchctl could not say whether anyone is logged in here (launchctl print gui/$(id -u) "
+                       f"answered neither 0 nor {NO_GUI_DOMAIN}), so nothing was started or stopped: run "
+                       f"glaeda-gh restart again, and if it persists check launchctl print gui/$(id -u), "
+                       f"launchctl print user/$(id -u)/{LAUNCH_LABEL} and sudo launchctl print "
+                       f"system/{LAUNCH_LABEL} by hand. Never run glaeda-gh serve yourself")
 
 
 def background_copy_path() -> Path:  # read BASE at call time: tests move it
@@ -5650,9 +5659,16 @@ def unloaded(target: str) -> bool:
     return run_bounded(["launchctl", "print", target], 10).returncode == NOT_LOADED
 
 
-def system_daemon_loaded() -> bool:
-    """Whether a headless Mac's system LaunchDaemon with the service's label may be loaded (service_loaded)."""
-    return not unloaded(f"system/{LAUNCH_LABEL}")
+def system_daemon_loaded() -> bool | None:
+    """Whether a headless Mac's system LaunchDaemon with the service's label is loaded (service_loaded): None
+    when launchctl's answer is neither loaded (0) nor not loaded (113)."""
+    code = run_bounded(["launchctl", "print", f"system/{LAUNCH_LABEL}"], 10).returncode
+    return True if code == 0 else False if code == NOT_LOADED else None
+
+
+SYSTEM_UNKNOWN_HINT = (f"launchctl could not say whether the system LaunchDaemon system/{LAUNCH_LABEL} is loaded: "
+                       f"check with sudo launchctl print system/{LAUNCH_LABEL} before starting anything. If it is "
+                       f"loaded: sudo launchctl kickstart -k system/{LAUNCH_LABEL}; if not: glaeda-gh restart")
 
 
 SYSTEM_DAEMON_HINT = (f"the system LaunchDaemon system/{LAUNCH_LABEL} runs the daemon on this headless Mac; restart "
@@ -5661,8 +5677,11 @@ SYSTEM_DAEMON_HINT = (f"the system LaunchDaemon system/{LAUNCH_LABEL} runs the d
 
 def launchd_state(domain: str | None = None) -> str | None:
     """The service's `state = ...` line (running, spawn scheduled, not running), or None."""
+    domain = domain or launchd_domain()
+    if domain is None:
+        return None
     try:
-        result = run_bounded(["launchctl", "print", f"{domain or launchd_domain()}/{LAUNCH_LABEL}"], 10)
+        result = run_bounded(["launchctl", "print", f"{domain}/{LAUNCH_LABEL}"], 10)
     except (OSError, subprocess.TimeoutExpired):
         return None
     if result.returncode != 0:
@@ -5680,10 +5699,16 @@ def restart_service(hung: bool) -> tuple[bool, str]:
         result = run_bounded(argv, SUBPROCESS_DEADLINE)
         return result.returncode == 0, " ".join(argv)
     domain = launchd_domain()
+    if domain is None:
+        # booting a copy out, or loading one, on a guess about the login session could leave no daemon at all
+        return False, "nothing: " + DOMAIN_UNKNOWN_HINT
     target = f"{domain}/{LAUNCH_LABEL}"
     # A headless Mac's system LaunchDaemon (service_loaded) runs the daemon there: neither a copy nor the
     # LaunchAgent may start beside it, whether or not someone is logged in
-    if system_daemon_loaded():
+    system = system_daemon_loaded()
+    if system is None:
+        return False, "nothing: " + SYSTEM_UNKNOWN_HINT
+    if system:
         return False, "nothing: " + SYSTEM_DAEMON_HINT
     if domain.startswith("user/"):
         # Always reload, never kickstart and never wait on a scheduled respawn: either would keep running a copy

@@ -3032,7 +3032,9 @@ class LaunchdRestartTest(unittest.TestCase):
                          "test_a_login_session_restart_never_starts_beside_a_system_daemon",
                          "test_a_logged_out_user_gets_a_background_copy_in_the_user_domain",
                          "test_a_missing_launch_agent_fails_the_user_domain_restart_with_a_reason",
-                         "test_a_bad_launch_agent_fails_the_user_domain_restart_with_a_reason"}
+                         "test_a_bad_launch_agent_fails_the_user_domain_restart_with_a_reason",
+                         "test_a_login_session_probe_that_cannot_tell_changes_nothing",
+                         "test_a_system_probe_that_cannot_tell_is_not_called_loaded"}
 
     def setUp(self) -> None:
         if self._testMethodName not in self.REAL_SYSTEM_PROBE:
@@ -3119,8 +3121,9 @@ class LaunchdRestartTest(unittest.TestCase):
 
     def test_the_domain_is_user_only_when_launchd_says_there_is_no_gui_domain(self) -> None:
         uid = os.getuid()
-        for answer, domain in ((0, f"gui/{uid}"), (125, f"user/{uid}"), (113, f"gui/{uid}"),
-                               (OSError("no launchctl"), f"gui/{uid}")):
+        # any other answer, or none, is neither: restart then changes nothing
+        for answer, domain in ((0, f"gui/{uid}"), (125, f"user/{uid}"), (113, None), (5, None),
+                               (OSError("no launchctl"), None)):
             def fake(argv: list[str], timeout: float | None = None) -> subprocess.CompletedProcess:
                 self.assertEqual(argv, ["launchctl", "print", f"gui/{uid}"])
                 if isinstance(answer, Exception):
@@ -3222,6 +3225,9 @@ class LaunchdRestartTest(unittest.TestCase):
 
             def fake(argv: list[str], timeout: float | None = None) -> subprocess.CompletedProcess:
                 seen.append(argv)
+                # the system probe says "not loaded", so the domain's own path is what has to fail closed
+                if argv[1:] == ["print", f"system/{gg.LAUNCH_LABEL}"]:
+                    return subprocess.CompletedProcess(argv, gg.NOT_LOADED, "", "")
                 return subprocess.CompletedProcess(argv, 5 if argv[1] == "print" else 0, "", "")
 
             clock = iter(range(0, 1000, 5))
@@ -3234,6 +3240,53 @@ class LaunchdRestartTest(unittest.TestCase):
             self.assertFalse(ok, domain)
             self.assertNotIn("bootstrap", [a[1] for a in seen], domain)
             self.assertNotIn("kickstart", [a[1] for a in seen], domain)
+            self.assertIn(["launchctl", "print", f"system/{gg.LAUNCH_LABEL}"], seen, domain)
+            self.assertNotIn("system LaunchDaemon", how, domain)  # it got past the system guard
+
+    def test_a_login_session_probe_that_cannot_tell_changes_nothing(self) -> None:
+        """A gui/UID print that answers neither 0 nor 125 (or none at all) is not taken for a login session:
+        on a headless host that would boot the Background copy out and then fail to bootstrap gui/UID."""
+        for answer in (5, None):
+            seen: list[list[str]] = []
+
+            def fake(argv: list[str], timeout: float | None = None) -> subprocess.CompletedProcess:
+                seen.append(argv)
+                if argv[1:] == ["print", f"gui/{os.getuid()}"] and answer is None:
+                    raise subprocess.TimeoutExpired(argv, 10)
+                return subprocess.CompletedProcess(argv, answer if argv[1:] == ["print", f"gui/{os.getuid()}"]
+                                                   else 0, "", "")
+
+            with mock.patch.object(gg.sys, "platform", "darwin"), mock.patch.object(gg, "run_bounded", fake):
+                self.assertIsNone(gg.launchd_domain(), answer)
+                ok, how = gg.restart_service(True)
+                hint = gg.start_hint(restart=True)
+            self.assertFalse(ok, answer)
+            self.assertIn("could not say whether anyone is logged in", how)
+            self.assertIn("could not say whether anyone is logged in", hint)
+            self.assertEqual({a[1] for a in seen}, {"print"}, answer)
+
+    def test_a_system_probe_that_cannot_tell_is_not_called_loaded(self) -> None:
+        for domain in (f"user/{os.getuid()}", f"gui/{os.getuid()}"):
+            seen: list[list[str]] = []
+
+            def fake(argv: list[str], timeout: float | None = None) -> subprocess.CompletedProcess:
+                seen.append(argv)
+                if argv[1:] == ["print", f"system/{gg.LAUNCH_LABEL}"]:
+                    return subprocess.CompletedProcess(argv, 5, "", "")
+                return subprocess.CompletedProcess(argv, gg.NOT_LOADED, "", "")
+
+            with mock.patch.object(gg.sys, "platform", "darwin"), mock.patch.object(gg, "run_bounded", fake), \
+                    mock.patch.object(gg, "launchd_domain", return_value=domain):
+                self.assertIsNone(gg.system_daemon_loaded())
+                ok, how = gg.restart_service(True)
+                hint = gg.start_hint(restart=True)
+            self.assertFalse(ok, domain)
+            self.assertIn("could not say whether the system LaunchDaemon", how, domain)
+            self.assertNotIn("runs the daemon on this headless Mac", how, domain)
+            self.assertNotIn("kickstart", [a[1] for a in seen], domain)
+            self.assertNotIn("bootstrap", [a[1] for a in seen], domain)
+            self.assertNotIn("runs the daemon on this headless Mac", hint, domain)
+            self.assertIn("check", hint, domain)
 
     def test_a_headless_launch_daemon_is_not_doubled_by_a_user_domain_copy(self) -> None:
         seen: list[list[str]] = []
