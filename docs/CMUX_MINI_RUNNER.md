@@ -1347,7 +1347,9 @@ all of them failing closed (`heal_tailscale_route` in the script):
    mini-setup's receipt role `fleet-mini`. A name holding "lawrence" (cmux-lawrence) refuses whatever the
    opt-in says. A name (the tailnet name from `tailscale status --json` included) or fact that cannot be read
    refuses.
-2. **Persistent.** The two-runs rule has reported it; by hand (no `--apply`) it never restarts.
+2. **Persistent.** The two-runs rule has reported it; by hand (no `--apply`) it never restarts. A run whose CLI
+   gave no BackendState (`tailscale_probe_error`) did not look at the route, so it keeps the count as it was: it
+   neither adds a run nor starts the count again. Only a run that sees the route on the tunnel does that.
 3. **Idle.** glaeda-disk's `host_busy` (the gate glaeda-idle-repair uses: no Runner.Worker or build, no
    dev-build worker job, no reservation, the host lock free) says idle. Then it takes
    `/Users/Shared/cmux-build-fleet/host.lock` exclusively, as with-host-lock and a fleet build do, so the runner

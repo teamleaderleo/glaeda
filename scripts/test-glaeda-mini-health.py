@@ -695,6 +695,25 @@ class TailscaleRouteRestart(Base):
         self.assertIn("restarted", healed["action"])
         self.assertIn("utun4", healed["action"])
 
+    def test_a_run_whose_cli_did_not_answer_keeps_the_count_without_adding_to_it(self) -> None:
+        # cmuxs-mac-mini-5, 2026-10-26: `status --json` timed out every other run, which started the count again
+        self.run_once()
+        self.mini.ts = ("app", None, "status --json timed out after 15 s")
+        self.assertEqual(self.ids(self.run_once(NOW + 120)), ["tailscale_probe_error"])
+        self.assertEqual(self.mini.did, [], "a run that could not look restarts nothing")
+        self.mini.ts = ("app", "Running", "")
+        report = self.run_once(NOW + 240)
+        self.assertEqual([h["id"] for h in report["heals"]], ["tailscale_no_route"])
+        self.assertEqual(self.restarts(), 1)
+
+    def test_a_route_seen_on_the_tunnel_still_starts_the_count_again(self) -> None:
+        self.run_once()
+        self.mini.route = "utun4"
+        self.run_once(NOW + 120)
+        self.mini.route = "en0"
+        self.assertEqual(self.run_once(NOW + 240)["findings"], [])
+        self.assertEqual(self.restarts(), 0)
+
     def test_the_attempt_is_written_before_the_restart_runs(self) -> None:
         self.broken_twice()
         self.assertEqual(len(self.mini.state_at_restart), 1)
