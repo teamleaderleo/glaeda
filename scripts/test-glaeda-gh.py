@@ -2646,6 +2646,9 @@ class ServeGuardTest(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
+        base = mock.patch.object(gg, "BASE", Path(self.tmp.name) / "gh")  # service_loaded locks BASE/restart.lock
+        base.start()
+        self.addCleanup(base.stop)
 
     def fake_service_tools(self, rc: int) -> dict:
         bin_dir = Path(self.tmp.name) / f"bin{rc}"
