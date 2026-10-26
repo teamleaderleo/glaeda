@@ -3171,6 +3171,18 @@ class GlaedaDiskTest(unittest.TestCase):
         self.assertFalse([p for p in st["mini-glaeda"].parent.iterdir() if p.name.startswith(gd.DELETING_PREFIX)])
         self.assertEqual(next(i for i in items if Path(i.path) == st["mini-glaeda"]).verdict, "blocked")
 
+    def test_a_slot_with_inputs_wider_than_the_marker_search_still_goes(self) -> None:
+        # a real slot's module cache holds thousands of entries: more than cmux_active's 5000-entry budget
+        home, fam, st = self._cmux_next_cap_tree()
+        wide = st["mini-glaeda"] / "ModuleCache.noindex"
+        wide.mkdir()
+        for n in range(5001):
+            (wide / f"m{n}.pcm").touch()
+        self._age(st["mini-glaeda"], hours=5)
+        _, removed, items = self._floor_apply(home, fam, 20.0, 4.0, slots_only=True)
+        self.assertEqual(next(i for i in items if Path(i.path) == st["mini-glaeda"]).verdict, "reclaimable")
+        self.assertIn(st["mini-glaeda"], removed)
+
     def test_a_slot_in_use_is_kept_aside_when_a_new_slot_took_its_path(self) -> None:
         home, fam, st = self._cmux_next_cap_tree()
         worker = f"{home}/actions-runner-glaeda/bin/Runner.Worker spawnclient 1 2\n"

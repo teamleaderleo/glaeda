@@ -4393,6 +4393,8 @@ def job_busy(fam: Family, path: Path) -> bool:
         return False
     if fam.id == INTERRUPTED:  # renamed away from every job's path; its deleter's pid is its in-use signal
         return False
+    if cmux_next_ci_floor_slot(fam, path):  # a slot's inputs are wider than the budget; cmux_next_ci_busy is its signal
+        return False
     return fam.reclaimable and not fam.discover and cmux_active(path)
 
 
