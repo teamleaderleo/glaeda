@@ -772,15 +772,30 @@ PS_TIMEOUT = 10
 
 
 def leader_start(pid: int) -> str | None:
-    """The start time ps gives pid ('' when no such process), or None when ps could not tell."""
+    """pid's start time, precise enough that a reused pid never matches ('' when no such process; None when it
+    could not be read): macOS proc_pidinfo's start seconds and microseconds, Linux /proc's start in clock ticks
+    since boot with the boot id. `ps lstart` has one-second precision, which a reused pid can share."""
+    if sys.platform == "darwin":
+        import ctypes
+        try:
+            libproc = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+        except OSError:
+            return None
+        info = ctypes.create_string_buffer(136)  # struct proc_bsdinfo (PROC_PIDTBSDINFO)
+        size = libproc.proc_pidinfo(pid, 3, ctypes.c_uint64(0), info, 136)
+        if size != 136:
+            return "" if ctypes.get_errno() == errno.ESRCH else None
+        sec, usec = int.from_bytes(info.raw[120:128], "little"), int.from_bytes(info.raw[128:136], "little")
+        return f"darwin {sec}.{usec:06d}"
     try:
-        out = subprocess.run(["ps", "-o", "lstart=", "-p", str(pid)], capture_output=True, text=True,
-                             timeout=PS_TIMEOUT)
-    except (OSError, subprocess.SubprocessError):
+        stat = Path(f"/proc/{pid}/stat").read_text()
+        boot = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+    except FileNotFoundError:
+        return ""
+    except OSError:
         return None
-    if out.returncode not in (0, 1):
-        return None
-    return out.stdout.strip()
+    fields = stat[stat.rfind(")") + 2:].split()
+    return f"linux {boot} {fields[19]}" if len(fields) > 19 else None
 
 
 def group_alive(pgid: int) -> bool | None:
@@ -802,12 +817,13 @@ def thaw_left_paused(folder: Path) -> list[int]:
     crash, a power loss). Run under the prefetch lock, so no live Governor's record is touched. Per record:
     - the group is gone: the record goes;
     - its leader (pid == pgid) lives with another start time: a new group took the pgid after the old one died,
-      so it is left alone and the record goes;
+      so it is left alone and the record goes (the start time has microseconds: leader_start);
     - its leader lives with the recorded start time, or is gone while members remain (a pgid is never reused
       while a member of its group lives): SIGCONT, and the record goes once that succeeded or found no group.
-    When ps cannot tell, or the SIGCONT fails otherwise, the record stays for the next run. Between the check and
-    the SIGCONT the whole group would have to exit and its pgid be reused within milliseconds; even then a SIGCONT
-    to running processes changes nothing."""
+    When ps cannot tell, or the SIGCONT fails otherwise, the record stays for the next run. Accepted: between the
+    check and the SIGCONT (microseconds; neither macOS nor a process group has a pidfd) every member would have to
+    exit, a new process take the pid, make it a group and be stopped by someone else; only then would it be
+    continued early."""
     thawed = []
     for record in sorted(folder.glob("*.json")) if folder.is_dir() else []:
         try:
@@ -871,19 +887,21 @@ class Governor:
 
     def set_paused(self, paused: bool) -> None:
         if paused and self.record is not None and not self.started:
-            self.started = leader_start(self.pgid) or ""  # ps once, outside the lock: stop() never waits on it
+            self.started = leader_start(self.pgid) or ""  # read once, outside the lock: stop() never waits on it
         with self.lock:
             if self.stop_event.is_set() or paused == self.paused:
                 return
-            if paused and not self.write_record():
+            if not paused:
+                self.resume()
+                return
+            if not self.write_record():
                 return  # no record, no pause: a stop nothing could undo after a SIGKILL is worse than a fast download
             try:
-                os.killpg(self.pgid, signal.SIGSTOP if paused else signal.SIGCONT)
+                os.killpg(self.pgid, signal.SIGSTOP)
             except OSError:
-                pass
-            self.paused = paused
-            if not paused:
-                self.drop_record()
+                self.drop_record()  # not stopped: nothing to undo
+                return
+            self.paused = True
 
     def write_record(self) -> bool:
         if self.record is None:
@@ -906,16 +924,21 @@ class Governor:
             except OSError:
                 pass
 
-    def resume(self) -> None:
-        """Continue the group if this Governor stopped it (under the lock, so no tick pauses it in between)."""
+    def resume(self) -> bool:
+        """Continue the group if this Governor stopped it (under the lock, so no tick pauses it in between).
+        The record goes only once the group is continued or gone; a SIGCONT that failed otherwise keeps it (and
+        paused), for the next tick, stop() or the next run's thaw_left_paused. Returns whether it is not paused."""
         with self.lock:
             if self.paused:
                 try:
                     os.killpg(self.pgid, signal.SIGCONT)
-                except OSError:
+                except ProcessLookupError:
                     pass
+                except OSError:
+                    return False
                 self.paused = False
                 self.drop_record()
+            return True
 
     def loop(self) -> None:
         try:

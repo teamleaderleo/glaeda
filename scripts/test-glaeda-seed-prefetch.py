@@ -467,6 +467,51 @@ class GovernorTest(unittest.TestCase):
             os.killpg(self.proc.pid, signal.SIGCONT)
         self.assertEqual(sp.thaw_left_paused(folder / "missing"), [])
 
+    def test_a_start_time_one_microsecond_off_is_another_process(self):
+        folder = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, folder, ignore_errors=True)
+        started = sp.leader_start(self.proc.pid)
+        self.assertTrue(started)
+        self.assertEqual(sp.leader_start(self.proc.pid), started, "stable for one process")
+        head, _, last = started.rpartition(" " if started.startswith("linux") else ".")
+        sep = " " if started.startswith("linux") else "."
+        self.write(folder, "a", self.proc.pid, f"{head}{sep}{int(last) + 1:0{len(last)}d}")
+        os.killpg(self.proc.pid, signal.SIGSTOP)
+        try:
+            self.assertEqual(sp.thaw_left_paused(folder), [])
+            self.assertTrue(self.stopped(), "a pid reused within the same second is not continued")
+        finally:
+            os.killpg(self.proc.pid, signal.SIGCONT)
+
+    def test_a_sigcont_that_fails_keeps_the_record_and_the_pause(self):
+        folder = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, folder, ignore_errors=True)
+        governor = sp.Governor(self.proc.pid, 1000, lambda: "job", read_interface=lambda: None,
+                               read_own=lambda: 0, tick=60, record_dir=folder)
+        governor.set_paused(True)
+        record = folder / f"{self.proc.pid}.json"
+        real = os.killpg
+
+        def refuse(pgid, sig):
+            if sig == signal.SIGCONT:
+                raise PermissionError(1, "refused")
+            real(pgid, sig)
+
+        sp.os.killpg = refuse
+        try:
+            governor.set_paused(False)
+            self.assertTrue(governor.paused)
+            self.assertTrue(record.exists())
+            self.assertFalse(governor.resume())
+            governor.stop()
+            self.assertTrue(record.exists(), "left for the next run's thaw")
+            self.assertTrue(self.stopped())
+        finally:
+            sp.os.killpg = real
+        self.assertEqual(sp.thaw_left_paused(folder), [self.proc.pid])
+        self.assertFalse(self.stopped())
+        self.assertFalse(record.exists())
+
     def test_thaw_keeps_the_record_when_ps_cannot_tell(self):
         folder = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, folder, ignore_errors=True)
