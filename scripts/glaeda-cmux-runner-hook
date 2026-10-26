@@ -125,11 +125,12 @@ import time
 from pathlib import Path
 from typing import Any, Callable, NamedTuple
 
-DISK_TIMEOUT_S = 120  # a pass a hook waits on
-# A pass nothing waits on (job-completed's detached one, the gate's): a whole pass took 192-685 s on cmux14 under the
-# floor, so at DISK_TIMEOUT_S every one was killed mid-apply while holding evict.lock, and the LaunchAgent's pass,
+DISK_TIMEOUT_S = 120  # a pass a hook or the gate waits on or reaps
+# job-completed's detached pass, which nothing waits on: a whole pass took 192-685 s on cmux14 under the floor, so at
+# DISK_TIMEOUT_S every one (a pass per job) was killed mid-apply while holding evict.lock, and the LaunchAgent's pass,
 # which has no bound, skipped as busy (274 of 277 passes on 2026-10-26, none finished for over an hour)
 BACKGROUND_DISK_TIMEOUT_S = 15 * 60
+BACKGROUND_DISK_TIMEOUT_ENV = "GLAEDA_RUNNER_BACKGROUND_DISK_TIMEOUT"  # GLAEDA_RUNNER_DISK_TIMEOUT bounds the others
 EVICT_TIMEOUT_S = 60  # job-started waits at most this long for an eviction under the disk floor
 # The runner's own environment (its LaunchAgent), never a job's env:, which does not reach hooks.
 FLEET_DIR = os.environ.get("GLAEDA_FLEET_DIR") or "/Users/Shared/cmux-build-fleet"
@@ -4065,13 +4066,13 @@ class Gate:
         self.evicting = (proc, now, before)
 
     def reap_eviction(self, path: str, floor: float) -> None:
-        """Log a finished eviction with the space it freed; kill one running past BACKGROUND_DISK_TIMEOUT_S."""
+        """Log a finished eviction with the space it freed; kill one running past DISK_TIMEOUT_S."""
         if self.evicting is None:
             return
         proc, started, before = self.evicting
         code = proc.poll()
         if code is None:
-            if time.monotonic() - started < BACKGROUND_DISK_TIMEOUT_S:
+            if time.monotonic() - started < DISK_TIMEOUT_S:
                 return
             with contextlib.suppress(OSError):
                 proc.kill()
@@ -5639,7 +5640,7 @@ def disk_pressure_detached(explicit: str | None, timeout: float = BACKGROUND_DIS
         argv = disk_argv(explicit)
         if argv is None:
             return "glaeda-disk not installed; skipped"
-        timeout = float(os.environ.get("GLAEDA_RUNNER_DISK_TIMEOUT") or timeout)
+        timeout = float(os.environ.get(BACKGROUND_DISK_TIMEOUT_ENV) or timeout)
         env = {key: value for key, value in os.environ.items() if key != "RUNNER_TRACKING_ID"}
         child = os.fork()
     except Exception as error:  # noqa: BLE001  (never fail the job on housekeeping)
