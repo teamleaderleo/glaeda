@@ -5707,7 +5707,9 @@ while time.monotonic() < end:
             except FileNotFoundError:
                 pass
             except OSError:
-                pass  # PENDING stays; this pass serves it all the same and the loop comes back for it
+                sys.exit(0)  # cannot claim it: leave it to the next bound, never a pass for an unclaimed trigger
+            if not os.path.lexists(claimed):
+                continue
             if run_pass():
                 misses = 0
                 try:
@@ -5715,7 +5717,7 @@ while time.monotonic() < end:
                 except FileNotFoundError:
                     pass
                 except OSError:
-                    break  # cannot mark it served: leave it for the next bound rather than loop on it
+                    sys.exit(0)  # cannot mark it served: leave it to the next bound rather than pass again
             else:
                 time.sleep(min(30, 2 ** misses, max(0, end - time.monotonic())))
                 misses += 1
