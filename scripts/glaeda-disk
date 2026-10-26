@@ -124,9 +124,11 @@ disposable; newer ones stay when a live reservation or lease names them.
 Under the runner gate's disk floor (FLOOR_HOLD) the windows that only keep things warm give way, least
 recently used first and only down to the floor plus target_margin_gib: an idle runner's checkout build
 output, its cmux-next scheme state's generated output (cmux-scheme/<runner name>, only while that runner
-has no Runner.Worker), and code-sign clones other than each bundle's newest copy and any running app's.
+has no Runner.Worker), a canonical build root's admission DerivedData while no job holds the root's token,
+and code-sign clones other than each bundle's newest copy and any running app's.
 cmux7s sat at 21 GiB under a 30 GiB floor with 40 GiB of media CI's cmux DEV clones and 20 GiB of
-per-runner cmux-next Build "recent" (2026-10-21).
+per-runner cmux-next Build "recent" (2026-10-21). cmux14 sat at the floor with 17.9 GiB of admission
+DerivedData idle 9-21 h on two roots no job held (2026-10-25).
 
 Kill switch: while ~/.config/glaeda/disk-off exists, or disk-policy.json has "enabled": false, an
 --apply (or --dedupe) run deletes nothing; it says so and exits 0. Every --apply run, whatever it
@@ -929,8 +931,11 @@ def item_window(fam: Family, path: Path, idle_hours: float, archived: frozenset[
 def floor_hold_family(fam: Family, path: Path) -> bool:
     """Whether the runner gate's floor hold lets PATH go before its family's window: an idle runner's checkout
     build output, an enrolled runner's cmux-next scheme output (its Runner.Worker vetoes it in
-    cmux_next_ci_busy), and code-sign clones (keep_live_app_clones and app_clone_running keep the live ones)."""
-    if fam.id == RUNNER_BUILD_FAMILY or fam.app_clones:
+    cmux_next_ci_busy), a canonical root's admission DerivedData (the root's token keeps it while a compile or a
+    product consumer holds the root: canonical_root_held, re-checked at apply and taken exclusive to delete; the
+    next compile on the root clears it anyway, and a rerun restores it from the artifact), and code-sign clones
+    (keep_live_app_clones and app_clone_running keep the live ones)."""
+    if fam.id in (RUNNER_BUILD_FAMILY, CANONICAL_ADMISSION) or fam.app_clones:
         return True
     return fam.id == CMUX_NEXT_CI_FAMILY and not CMUX_NEXT_CI_DRAIN and (
         cmux_next_ci_runner(path, fam.root) is not None or cmux_next_ci_floor_slot(fam, path))
@@ -2279,10 +2284,18 @@ def default_families(role: str = "fleet-mini") -> list[Family]:
     # on borrowed minis (ai.manaflow.cmux-lent-worker, CMUX_CI_SHARED_CACHE_DIR) both build in it. It is
     # retired, and reclaimable, only while neither service is loaded. Naming only the dev-build worker
     # labelled the lent minis' live cmux-workspaces "RETIRED" (cmux12s, 2026-10-11).
+    # A retired worker's checkouts are mirrors as a reload unit's are: cmux-workspaces/<key>/src is a clone the
+    # worker synced from GitHub, swiftpm holds SwiftPM's own clones, and no person edits either. So once an entry
+    # sat idle a week, no git check keeps it, and a tree too deep to search (cmux-tui-target, a cargo target dir)
+    # is not kept as "unchecked" either. A fleet lease or running job that names an entry still keeps it, as in
+    # fleet-artifacts over the same directory. cmux14 sat at the 30 GiB floor with 0.0G reclaimable while
+    # cmux-workspaces (11.6 GiB, idle 190 h), cmux-tui-target (4.2 GiB, 289 h) and swiftpm (3.9 GiB, 310 h) of
+    # its unloaded workers read "git-checkout" and "unchecked" (2026-10-25).
     fams.append(Family("hq-build-fleet-cache", Path("/Users/Shared/cmux-build-fleet/cache"), True,
                        "the hq build worker rebuilds its cache", retired_only=True,
                        owner="cmux dev-build and lent build workers (hq controller)",
-                       owner_job=HQ_BUILD_WORKERS, platform="macos"))
+                       owner_job=HQ_BUILD_WORKERS, mirror_idle_hours=CMUX_JOB_MIRROR_HOURS,
+                       reference_root=FLEET_ROOT, platform="macos"))
     bazel_user = ""
     with contextlib.suppress(KeyError):
         bazel_user = pwd.getpwuid(uid).pw_name
