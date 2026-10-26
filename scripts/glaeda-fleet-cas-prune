@@ -141,21 +141,29 @@ def tree_bytes(path: Path) -> int:
     return total
 
 
+TMP_STALE_S = 6 * 3600  # a CAS temp file untouched this long belongs to no live write
+
+
 def node_files(store: Path, subs: tuple[str, ...] = ("cas", "kv")) -> list[tuple[float, int, str]]:
     """(mtime, bytes, path) of every object (cas/) and index entry (kv/) under subs; stats.json and anything else
     stays. A name with a dot is an in-flight write (the daemon writes name.tmp<pid>.<seq> and renames it when done,
     as fleet-cas gc.rs skips them): unlinking one would fail that write and the build, so it is never counted or
-    removed."""
+    removed while young. One untouched for TMP_STALE_S is a write an interrupted daemon left; it counts and goes
+    first."""
     out = []
+    stale_before = time.time() - TMP_STALE_S
     for sub in subs:
         for dirpath, _, files in os.walk(store / sub):
             for f in files:
-                if "." in f:
-                    continue
                 p = os.path.join(dirpath, f)
                 try:
                     st = os.lstat(p)
                 except OSError:
+                    continue
+                if "." in f:
+                    if st.st_mtime >= stale_before:
+                        continue  # in flight
+                    out.append((0.0, st.st_blocks * 512, p))  # abandoned: before every object
                     continue
                 out.append((st.st_mtime, st.st_blocks * 512, p))
     return out
@@ -262,11 +270,11 @@ def main(argv: list[str] | None = None) -> int:
     writer = is_writer(ROOT)
     rec["role"] = "writer" if writer else "reader"
     commands = running_commands()
-    if commands is None:
+    if commands is None and not a.node_only:
         rec["result"] = "deferred: ps failed, cannot rule out a running build"
         print(json.dumps(rec))
         return 0
-    building = busy(commands)
+    building = busy(commands) if commands is not None else "ps failed"  # --node-only: the cap needs no build check
     if a.apply and not a.node_only:
         rec["swept_bytes"] = sweep(ROOT)
     # Measure and plan with no lock held: these walks are the slow part.

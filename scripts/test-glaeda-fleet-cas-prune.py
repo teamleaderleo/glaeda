@@ -278,12 +278,34 @@ class PruneTest(unittest.TestCase):
         shard = paths[1].parent
         tmp = shard / f"{paths[1].name}.tmp4242.7"  # fleet-cas write_atomic: name.tmp<pid>.<seq>, renamed when done
         tmp.write_bytes(b"\0" * (1 << 20))
-        old = time.time() - 30 * 86400
-        os.utime(tmp, (old, old))
+        recent = time.time() - 60  # a write in progress: its file was touched a minute ago
+        os.utime(tmp, (recent, recent))
         self.assertNotIn(str(tmp), [p for _, _, p in fp.node_files(self.root / "node-store")])
         self.run_main("--apply", "--node-gib", "0")
         self.assertTrue(tmp.exists(), "an in-flight write was unlinked")
         self.assertFalse(any(p.exists() for p in paths if "/cas/" in str(p)), "the finished objects still go")
+
+    def test_an_abandoned_temporary_counts_and_goes_first(self) -> None:
+        self.env()
+        paths = self.node(3)
+        tmp = paths[1].parent / f"{paths[1].name}.tmp99.1"
+        tmp.write_bytes(b"\0" * 4096)
+        old = time.time() - fp.TMP_STALE_S - 60
+        os.utime(tmp, (old, old))
+        listed = fp.node_files(self.root / "node-store")
+        self.assertEqual(min(listed)[2], str(tmp), "oldest of all")
+        self.run_main("--apply", "--node-gib", "0")
+        self.assertFalse(tmp.exists())
+
+    def test_node_only_caps_even_when_ps_fails(self) -> None:
+        self.env()
+        paths = self.node(6)
+        fp.running_commands = lambda: None
+        rec = self.run_main("--apply", "--node-only", "--node-gib", "0")
+        self.assertIn("removed", rec["node_store"], rec)
+        self.assertFalse(any(p.exists() for p in paths if "/cas/" in str(p)))
+        rec = self.run_main("--apply", "--node-gib", "0")
+        self.assertTrue(rec["result"].startswith("deferred: ps failed"), rec)
 
 
 if __name__ == "__main__":
