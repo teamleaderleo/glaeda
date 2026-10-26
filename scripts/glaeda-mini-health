@@ -1983,7 +1983,9 @@ def run(mini: Mini, apply: bool, now: float | None = None, state_path: Path = ST
                 f["auto_fix"], f["note"] = "impossible", f"{f.get('note', '')}; {capped}"[:300]
     # a CLI that gave no BackendState never looked at the route: tailscale_no_route's count neither grows nor
     # starts again (cmuxs-mac-mini-5, 2026-10-26: a 15 s status timeout every other run kept it at 1 for hours)
-    unlooked = {"tailscale_no_route"} if any(f["code"] == "tailscale_probe_error" for f in found) else set()
+    # (a probe error whose route lookup named a utun did look: the route is clear, so the count starts again)
+    unlooked = ({"tailscale_no_route"} if any(f["code"] == "tailscale_probe_error" for f in found)
+                and not (runner and mini.route_on_tunnel) else set())
     seen = {k: v for k, v in seen.items() if k in ids | {f["id"] for f in found} | unlooked}
     tries = {k: v for k, v in tries.items() if k in ids}
     report = {"schema": SCHEMA, "at": iso(now), "findings": findings,

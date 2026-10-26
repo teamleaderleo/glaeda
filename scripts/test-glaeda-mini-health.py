@@ -1284,6 +1284,20 @@ class TailscaleRouteDrain(Base):
         self.assertEqual(self.ids(report), ["tailscale_probe_error"])
         self.assertEqual(self.mini.did, ["drain", "undrain"])
 
+    def test_a_utun_route_under_a_cli_timeout_starts_the_count_again(self) -> None:
+        # re-review P2: after the route was seen on utun, one en0 sighting must not drain again at once
+        self.broken(NOW + self.after)
+        self.mini.drain_jobs = self.BUSY
+        self.mini.ts, self.mini.route = ("app", None, "status --json timed out after 15 s"), "utun4"
+        self.run_once(NOW + self.after + 120)
+        self.mini.ts, self.mini.route = ("app", "Running", ""), "en0"
+        report = self.run_once(NOW + self.after + 240)
+        self.assertEqual(report["findings"], [], "one sighting after a clear route is no finding")
+        self.assertEqual(self.mini.did, ["drain", "undrain"])
+        report = self.run_once(NOW + self.after + 360)
+        self.assertEqual(report["findings"][0]["since"], health.iso(NOW + self.after + 240), "a fresh since")
+        self.assertEqual(self.mini.did, ["drain", "undrain"], "and a fresh hour before any drain")
+
     def test_a_kill_switch_during_probe_errors_ends_the_drain(self) -> None:
         self.broken(NOW + self.after)
         self.mini.ts, self.mini.route = ("app", None, "status --json timed out after 15 s"), None
