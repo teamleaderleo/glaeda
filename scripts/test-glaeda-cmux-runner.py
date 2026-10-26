@@ -3697,42 +3697,51 @@ class DiskPassCoalesceTest(unittest.TestCase):
     def logged(self) -> list[str]:
         return [json.loads(line).get("skipped") for line in self.log.read_text().splitlines()] if self.log.exists() else []
 
-    @staticmethod
-    def row(target_gib: float | None = None, target_bytes: int | None = None, mode: str = "pressure",
-            skipped: str | None = None, age_s: float = 60) -> str:
+    def row(self, targets: dict | None = None, mode: str = "pressure", skipped: str | None = None,
+            age_s: float = 60, default: bool = True, floor: float = 30.0) -> str:
         at = time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(time.time() - age_s))
-        return json.dumps({"at": at, "mode": mode, "target_gib": target_gib, "target_bytes": target_bytes,
-                           "skipped": skipped}) + "\n"
+        return json.dumps({"at": at, "mode": mode, "targets": targets, "default_targets": default,
+                           "floor_gib": floor, "skipped": skipped}) + "\n"
 
     def write_target(self, gib: float) -> None:
         self.log.parent.mkdir(parents=True, exist_ok=True)
-        self.log.write_text(self.row(target_bytes=int(gib * 1024**3) or 1))
+        self.log.write_text(self.row({os.fspath(self.dir): max(1, int(gib * 1024**3))}))
 
     def test_the_bound_is_spared_as_glaedas_own(self) -> None:
         self.assertIn("glaeda-disk-bound", hook.DISK_BOUND.splitlines()[0])  # leftover_spared reads it
 
-    def test_target_is_glaeda_disks_newest_own_pressure_line(self) -> None:
-        self.assertIsNone(hook.disk_target_gib())
+    def test_targets_are_glaeda_disks_newest_own_default_pressure_line(self) -> None:
+        self.assertIsNone(hook.disk_targets())
         self.log.parent.mkdir(parents=True, exist_ok=True)
-        gib = 1024**3
-        self.log.write_text(self.row(target_bytes=100 * gib) + "not json\n" + self.row(target_bytes=170 * gib)
-                            + self.row(target_gib=90.0, mode="idle")
-                            + self.row(target_gib=50.0, skipped=hook.HOOK_SKIP_ABOVE_TARGET)
-                            + self.row(target_gib=50.0, skipped=hook.HOOK_SKIP_COALESCED))
-        self.assertEqual(hook.disk_target_gib(), 170.0)  # the idle line and the hook's own lines are passed over
-        self.log.write_text(self.row(target_gib=170.0))  # an older glaeda-disk: rounded to 0.1 GiB
-        self.assertAlmostEqual(hook.disk_target_gib(), 170.0 + hook.DISK_TARGET_ROUNDING_GIB)
-        self.log.write_text(self.row(target_bytes=100 * gib, age_s=hook.DISK_TARGET_MAX_AGE_S + 60))
-        self.assertIsNone(hook.disk_target_gib(), "a stale target must not skip a pass")
-        self.log.write_text(self.row(target_bytes=100 * gib, age_s=hook.DISK_TARGET_MAX_AGE_S + 60)
-                            + self.row(target_bytes=None))
-        self.assertIsNone(hook.disk_target_gib(), "an older line never stands in for the newest")
+        gib, home = 1024**3, os.fspath(self.dir)
+        self.log.write_text(self.row({home: 100 * gib}) + self.row({home: 170 * gib, "/tmp": 2 * gib})
+                            + self.row({home: 90 * gib}, mode="idle")
+                            + self.row({home: 50 * gib}, skipped=hook.HOOK_SKIP_ABOVE_TARGET)
+                            + self.row({home: 50 * gib}, skipped=hook.HOOK_SKIP_COALESCED))
+        self.assertEqual(hook.disk_targets(), {home: 170 * gib, "/tmp": 2 * gib})
+        refused = {"stale": self.row({home: 100 * gib}, age_s=hook.DISK_TARGET_MAX_AGE_S + 60),
+                   "custom --target": self.row({home: 100 * gib}, default=False),
+                   "lower floor": self.row({home: 100 * gib}, floor=10.0),
+                   "no targets": self.row(None),
+                   "newest malformed": self.row({home: 100 * gib}) + "{not json\n",
+                   "newest has no targets": self.row({home: 100 * gib}) + self.row({})}
+        with mock.patch.object(hook, "hooks_floor_gib", return_value=30.0):
+            for why, text in refused.items():
+                with self.subTest(why):
+                    self.log.write_text(text)
+                    self.assertIsNone(hook.disk_targets(), "it must run the pass, never skip on this")
+
+    def test_any_filesystem_short_of_its_target_runs_the_pass(self) -> None:
+        home = os.fspath(self.dir)
+        self.assertEqual(hook.disk_short({home: 1}), "")
+        self.assertIn(f"on {home}", hook.disk_short({home: 1, "/": 1, home + "/.": 10**18}) or "")
+        self.assertIsNone(hook.disk_short({home + "/missing": 1}))
 
     def test_a_trigger_above_target_is_skipped_without_a_pass(self) -> None:
         disk = self.fake_disk()
         self.write_target(0.001)
         note = hook.disk_pressure_detached(os.fspath(disk))
-        self.assertIn("at or above its 0.001 GiB target", note)
+        self.assertIn("every filesystem at or above its target", note)
         self.assertFalse(self.pending.exists())
         time.sleep(0.5)
         self.assertEqual(self.run_count(), 0)
@@ -3813,6 +3822,20 @@ class DiskPassCoalesceTest(unittest.TestCase):
         self.assertGreaterEqual(self.run_count(), 2)
         self.assertTrue(self.pending.exists(), "the next trigger's bound serves what this one left")
         self.assertFalse(self.overlap.exists())
+
+    def test_a_glaeda_disk_that_cannot_start_keeps_its_trigger(self) -> None:
+        self.pending.touch()
+        bound = subprocess.Popen([sys.executable, "-c", hook.DISK_BOUND, "30", "2", os.fspath(self.lock),
+                                  os.fspath(self.pending), os.fspath(hook.evict_lock_path()),
+                                  os.fspath(self.dir / "no-such-python"), "glaeda-disk", "--pressure"])
+        self.assertEqual(bound.wait(30), 0)
+        self.assertTrue(self.pending.exists())
+
+    def test_an_infinite_timeout_falls_back_to_the_bound(self) -> None:
+        disk = self.fake_disk()
+        with mock.patch.dict(os.environ, {hook.BACKGROUND_DISK_TIMEOUT_ENV: "inf"}):
+            note = hook.disk_pressure_detached(os.fspath(disk))
+        self.assertIn(f"bounded by {hook.BACKGROUND_DISK_TIMEOUT_S:g} s", note)
 
     def test_a_pass_that_could_not_start_keeps_its_trigger(self) -> None:
         disk = self.fake_disk()

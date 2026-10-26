@@ -5632,7 +5632,6 @@ HOOK_SKIP_ABOVE_TARGET = "above target (runner hook)"
 HOOK_SKIP_COALESCED = "coalesced into the running pass (runner hook)"
 HOOK_SKIP_MARK = "(runner hook)"
 DISK_TARGET_MAX_AGE_S = 6 * 3600  # an older target is not trusted: the trigger runs its pass
-DISK_TARGET_ROUNDING_GIB = 0.05  # a line without target_bytes rounds target_gib to 0.1 GiB
 
 DISK_BOUND = """# glaeda-disk-bound (leftover_spared reads this name)
 # argv: TIMEOUT LIFETIME LOCK PENDING EVICT_LOCK GLAEDA-DISK-ARGV...
@@ -5687,7 +5686,7 @@ def run_pass():
     except subprocess.TimeoutExpired:
         return True  # it ran, cut at its bound
     except OSError:
-        return True  # nothing a retry fixes
+        return False  # glaeda-disk did not start: keep the trigger
     return not any(busy in out for busy in BUSY)
 
 try:
@@ -5700,14 +5699,18 @@ while time.monotonic() < end:
     except OSError:
         sys.exit(0)  # a pass is running; it serves PENDING
     try:
+        misses = 0
         while os.path.lexists(pending) and time.monotonic() < end:
             try:
                 os.unlink(pending)
             except FileNotFoundError:
                 pass
-            if not run_pass():
+            if run_pass():
+                misses = 0
+            else:
                 keep()
-                time.sleep(1)
+                time.sleep(min(30, 2 ** misses, max(0, end - time.monotonic())))
+                misses += 1
     finally:
         fcntl.flock(held, fcntl.LOCK_UN)
     if not os.path.lexists(pending):
@@ -5726,45 +5729,68 @@ def disk_run_log() -> Path:
                           else ".local/state/glaeda/disk-runs.jsonl")
 
 
-def disk_target_gib(log: Path | None = None, now: float | None = None) -> float | None:
-    """The free-space target of glaeda-disk's newest own --pressure run line (target_bytes, else target_gib plus its
-    rounding), or None (run the pass) when that line is older than DISK_TARGET_MAX_AGE_S, undated or has no target.
-    The hook's own skip lines and other modes' lines are passed over; an older pressure line never stands in."""
+def disk_targets(log: Path | None = None, now: float | None = None) -> dict[str, int] | None:
+    """Every filesystem's exact target (mount: bytes) from glaeda-disk's newest own --pressure run line, or None (run
+    the pass) unless that line is a plain `--pressure --apply`'s (default_targets), at least this runner's floor,
+    under DISK_TARGET_MAX_AGE_S old and well formed. The hook's own skip lines and other modes' lines are passed over;
+    an older pressure line never stands in for the newest."""
     try:
         with (log or disk_run_log()).open("rb") as f:
             f.seek(0, os.SEEK_END)
-            f.seek(max(0, f.tell() - 262144))
-            lines = f.read().decode("utf-8", "replace").splitlines()
+            start = max(0, f.tell() - 262144)
+            f.seek(start)
+            lines = f.read().decode("utf-8", "replace").splitlines()[1 if start else 0:]
     except OSError:
         return None
     for line in reversed(lines):
+        if not line.strip():
+            continue
         try:
             row = json.loads(line)
         except ValueError:
-            continue
-        if not isinstance(row, dict) or row.get("mode") != "pressure" or HOOK_SKIP_MARK in str(row.get("skipped") or ""):
+            return None
+        if not isinstance(row, dict):
+            return None
+        if row.get("mode") != "pressure" or HOOK_SKIP_MARK in str(row.get("skipped") or ""):
             continue
         try:
             at = datetime.datetime.strptime(str(row.get("at")), "%Y-%m-%dT%H:%M:%S%z").timestamp()
-        except ValueError:
+            floor = float(row.get("floor_gib"))
+        except (TypeError, ValueError):
             return None
-        if (time.time() if now is None else now) - at > DISK_TARGET_MAX_AGE_S:
+        targets = row.get("targets")
+        if ((time.time() if now is None else now) - at > DISK_TARGET_MAX_AGE_S or row.get("default_targets") is not True
+                or not math.isfinite(floor) or floor < hooks_floor_gib() or not isinstance(targets, dict) or not targets
+                or not all(isinstance(v, int) and not isinstance(v, bool) and v > 0 for v in targets.values())):
             return None
-        exact, rounded = row.get("target_bytes"), row.get("target_gib")
-        if isinstance(exact, int) and not isinstance(exact, bool) and exact > 0:
-            return exact / 1024**3
-        if isinstance(rounded, (int, float)) and not isinstance(rounded, bool) and rounded > 0:
-            return float(rounded) + DISK_TARGET_ROUNDING_GIB
-        return None
+        return {str(mount): value for mount, value in targets.items()}
     return None
 
 
-def disk_skip_line(why: str, free: float, target: float | None) -> None:
+def disk_short(targets: dict[str, int]) -> str | None:
+    """The first filesystem below its target ("<free> of <target> GiB on <mount>"), "" when every one is met, or None
+    when one cannot be read (run the pass)."""
+    for mount, target in targets.items():
+        try:
+            free = shutil.disk_usage(mount).free
+        except OSError:
+            return None
+        if free < target:
+            return f"{free / 1024**3:.1f} of {target / 1024**3:g} GiB on {mount}"
+    return ""
+
+
+def disk_skip_line(why: str, free: float, targets: dict[str, int] | None) -> None:
     """A skipped trigger's line in glaeda-disk's RUN_LOG, in its own schema, so skips are counted where passes are."""
+    home = None
+    with contextlib.suppress(OSError):
+        home = (targets or {}).get(os.fspath(Path.home()), None) or next(
+            (v for m, v in (targets or {}).items() if os.stat(m).st_dev == Path.home().stat().st_dev), None)
     row = {"at": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "host": platform.node(), "mode": "pressure", "off": False,
            "free_gib_before": round(free, 1), "free_gib_after": round(free, 1),
-           "target_gib": None if target is None else round(target, 1),
-           "floor_gib": None, "reclaimed_gib": 0.0, "reached": None if target is None else free >= target,
+           "target_gib": None if home is None else round(home / 1024**3, 1), "target_bytes": home,
+           "targets": targets, "default_targets": False, "floor_gib": None, "reclaimed_gib": 0.0,
+           "reached": None if home is None else free * 1024**3 >= home,
            "blocked": {}, "duration_s": 0.0, "skipped": why, "cmux_next_ci_over_gib": None}
     with contextlib.suppress(OSError):
         log = disk_run_log()
@@ -5805,16 +5831,18 @@ def disk_pressure_detached(explicit: str | None, timeout: float = BACKGROUND_DIS
         if argv is None:
             return "glaeda-disk not installed; skipped"
         timeout = float(os.environ.get(BACKGROUND_DISK_TIMEOUT_ENV) or timeout)
+        if not math.isfinite(timeout) or timeout <= 0:
+            timeout = BACKGROUND_DISK_TIMEOUT_S
         state, log = disk_state_dir(), disk_run_log()
-        free, target = free_gib(str(Path.home())), disk_target_gib(log)
-        if target is not None and free >= target:
-            disk_skip_line(HOOK_SKIP_ABOVE_TARGET, free, target)
-            return f"glaeda-disk skipped: {free:.1f} GiB free, at or above its {target:g} GiB target"
+        free, targets = free_gib(str(Path.home())), disk_targets(log)
+        if targets is not None and disk_short(targets) == "":
+            disk_skip_line(HOOK_SKIP_ABOVE_TARGET, free, targets)
+            return f"glaeda-disk skipped: every filesystem at or above its target ({free:.1f} GiB free on home)"
         state.mkdir(parents=True, exist_ok=True)
         lock, pending = state / DISK_PASS_LOCK, state / DISK_PASS_PENDING
         pending.touch()  # before the probe: a holder that lets go after it still sees this trigger
         if disk_pass_running(lock):
-            disk_skip_line(HOOK_SKIP_COALESCED, free, target)
+            disk_skip_line(HOOK_SKIP_COALESCED, free, targets)
             return "glaeda-disk pass already running; this trigger is coalesced into its follow-up"
         env = {key: value for key, value in os.environ.items() if key != "RUNNER_TRACKING_ID"}
         bound = [f"{timeout * DISK_PASS_LIFETIME_FACTOR:g}", os.fspath(lock), os.fspath(pending),
