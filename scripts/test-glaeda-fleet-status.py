@@ -1158,6 +1158,8 @@ class DaemonHealTests(unittest.TestCase):
             self.assertFalse(row["reachable"], name)
             self.assertIn("refused", row["error"], name)
         self.assertEqual(fs.parse_daemon_heal(good, AT)["state"], "current")
+        with mock.patch.object(fs.daemon_heal(), "judge", side_effect=RuntimeError("boom")):
+            self.assertIn("RuntimeError", fs.parse_daemon_heal(good, AT)["error"])
         self.assertIn(f"/usr/bin/head -c {fs.DAEMON_HEAL_MAX_OUT}", fs.DAEMON_HEAL_SCRIPT, "bounded on the member")
 
     def test_the_read_only_action_quotes_and_runs_on_the_member(self):
