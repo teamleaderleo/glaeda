@@ -35,6 +35,7 @@ with open(os.environ["FAKE_CALLS"], "a") as log:
               + " curlrc=" + (open(os.path.join(os.environ["CURL_HOME"], ".curlrc")).read().strip().replace(" ", "")
                               if os.environ.get("CURL_HOME") else "") + "\\n")
 distance = int(os.environ.get("FAKE_DISTANCE", "0"))
+__import__("time").sleep(float(os.environ.get("FAKE_SLEEP", "0")))
 print("some progress line")
 print(json.dumps({"fetched": "true", "key": "k", "distance": distance}))
 """
@@ -83,6 +84,44 @@ class SeedPrefetchTest(PrefetchBase):
         result = sp.run(True, self.state)
         self.assertEqual(result["state"], "skip")
         self.assertFalse((self.state / ".prefetch").exists())
+
+    def test_every_run_first_continues_a_group_a_killed_run_left_paused(self):
+        sleeper = subprocess.Popen(["sleep", "60"], start_new_session=True)
+        self.addCleanup(lambda: (sleeper.kill(), sleeper.wait()))
+        folder = self.state / ".prefetch" / sp.PAUSED
+        folder.mkdir(parents=True)
+        (folder / f"{sleeper.pid}.json").write_text(json.dumps({"pgid": sleeper.pid,
+                                                                "started": sp.leader_start(sleeper.pid)}))
+        os.killpg(sleeper.pid, signal.SIGSTOP)
+        result = sp.run(True, self.state)  # no roots: still thaws, under the lock
+        self.assertEqual((result["state"], result.get("thawed")), ("skip", [sleeper.pid]))
+        stat = subprocess.run(["ps", "-o", "stat=", "-p", str(sleeper.pid)], capture_output=True, text=True)
+        self.assertFalse(stat.stdout.strip().startswith("T"))
+        self.assertEqual(list(folder.iterdir()), [])
+
+    def test_a_paused_download_killed_by_its_timeout_is_continued_and_its_record_removed(self):
+        self.record(self.state)
+        saved = (sp.Governor.pace, sp.PREFETCH_TIMEOUT)
+        sp.PREFETCH_TIMEOUT = 2
+
+        held = []
+
+        def pace(governor) -> None:  # a job downloading the whole time: paused at once, never continued
+            governor.set_paused(True)
+            held.append((governor.paused, sorted(p.name for p in governor.record.parent.glob("*.json"))))
+            governor.stop_event.wait()
+
+        sp.Governor.pace = pace
+        os.environ["FAKE_SLEEP"] = "30"
+        try:
+            result = sp.run(True, self.state)
+        finally:
+            sp.Governor.pace, sp.PREFETCH_TIMEOUT = saved
+            os.environ.pop("FAKE_SLEEP", None)
+        self.assertIn("timed out", result["results"][os.fspath(self.state)]["reason"])
+        self.assertTrue(held[0][0])
+        self.assertEqual(len(held[0][1]), 1, "the pause was recorded while it held")
+        self.assertEqual(list((self.state / ".prefetch" / sp.PAUSED).glob("*.json")), [])
 
     def test_a_busy_mini_fetches_under_the_governor_and_never_at_a_fixed_rate(self):
         self.record(self.state)
@@ -409,19 +448,87 @@ class GovernorTest(unittest.TestCase):
         self.assertFalse(record.exists(), "continuing removes the record")
         governor.stop()
 
-    def test_thaw_never_signals_a_reused_pid_and_drops_bad_records(self):
+    def write(self, folder: Path, name: str, pgid: int, started: str) -> Path:
+        path = folder / f"{name}.json"
+        path.write_text(json.dumps({"pgid": pgid, "started": started}))
+        return path
+
+    def test_thaw_never_signals_a_new_group_on_the_pgid_and_drops_bad_records(self):
         folder = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, folder, ignore_errors=True)
         os.killpg(self.proc.pid, signal.SIGSTOP)
         try:
-            (folder / "a.json").write_text(json.dumps({"pgid": self.proc.pid, "started": "Mon Jan  1 00:00:00 2001"}))
+            self.write(folder, "a", self.proc.pid, "Mon Jan  1 00:00:00 2001")
             (folder / "b.json").write_text("not json")
             self.assertEqual(sp.thaw_left_paused(folder), [])
-            self.assertTrue(self.stopped(), "a different start time is a different process: left alone")
+            self.assertTrue(self.stopped(), "a different start time is a different group: left alone")
             self.assertEqual(list(folder.iterdir()), [])
         finally:
             os.killpg(self.proc.pid, signal.SIGCONT)
         self.assertEqual(sp.thaw_left_paused(folder / "missing"), [])
+
+    def test_thaw_keeps_the_record_when_ps_cannot_tell(self):
+        folder = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, folder, ignore_errors=True)
+        record = self.write(folder, "a", self.proc.pid, sp.leader_start(self.proc.pid))
+        os.killpg(self.proc.pid, signal.SIGSTOP)
+        saved = sp.group_alive
+        sp.group_alive = lambda pgid: None
+        try:
+            self.assertEqual(sp.thaw_left_paused(folder), [])
+            self.assertTrue(record.exists(), "kept for the next run")
+            self.assertTrue(self.stopped())
+        finally:
+            sp.group_alive = saved
+        self.assertEqual(sp.thaw_left_paused(folder), [self.proc.pid])
+        self.assertFalse(self.stopped())
+        self.assertFalse(record.exists())
+
+    def test_thaw_continues_members_whose_leader_has_exited(self):
+        folder = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, folder, ignore_errors=True)
+        leader = subprocess.Popen([sys.executable, "-c", "import subprocess, sys; "
+                                   "print(subprocess.Popen(['sleep', '60']).pid, flush=True)"],
+                                  stdout=subprocess.PIPE, text=True, start_new_session=True)
+        member = int(leader.stdout.readline())
+        started = sp.leader_start(leader.pid)
+        os.killpg(leader.pid, signal.SIGSTOP)
+        self.addCleanup(lambda: (os.kill(member, signal.SIGKILL), os.kill(member, signal.SIGCONT)))
+        self.write(folder, "a", leader.pid, started)
+        os.kill(leader.pid, signal.SIGKILL)
+        leader.wait()
+        stat = lambda: subprocess.run(["ps", "-o", "stat=", "-p", str(member)], capture_output=True,
+                                      text=True).stdout.strip()
+        self.assertTrue(stat().startswith("T"))
+        self.assertEqual(sp.thaw_left_paused(folder), [leader.pid])
+        self.assertFalse(stat().startswith("T"))
+        self.assertEqual(list(folder.iterdir()), [])
+
+    def test_thaw_drops_the_record_of_a_group_that_is_gone(self):
+        folder = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, folder, ignore_errors=True)
+        gone = subprocess.Popen(["true"], start_new_session=True)
+        gone.wait()
+        self.write(folder, "a", gone.pid, "Mon Jan  1 00:00:00 2001")
+        self.assertEqual(sp.thaw_left_paused(folder), [])
+        self.assertEqual(list(folder.iterdir()), [])
+
+    def test_set_paused_runs_no_ps_under_the_lock(self):
+        folder = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, folder, ignore_errors=True)
+        governor = sp.Governor(self.proc.pid, 1000, lambda: "job", read_interface=lambda: None,
+                               read_own=lambda: 0, tick=60, record_dir=folder)
+        saved, seen = sp.leader_start, []
+        sp.leader_start = lambda pid: seen.append(governor.lock._is_owned()) or saved(pid)
+        try:
+            governor.set_paused(True)
+        finally:
+            sp.leader_start = saved
+        self.assertEqual(seen, [False])
+        self.assertTrue(self.stopped())
+        governor.stop()
+        self.assertFalse(self.stopped())
+        self.assertEqual(list(folder.iterdir()), [])
 
     def test_no_record_means_no_pause(self):
         governor = sp.Governor(self.proc.pid, 1000, lambda: "job", read_interface=lambda: None,

@@ -85,7 +85,7 @@ BUCKET_URL = os.environ.get("GLAEDA_SEED_BUCKET_URL", "https://ci-cache.cmux.com
 # launchd's PATH lacks Homebrew, and without zstd cmux's r2-cache.sh cannot read a .tar.zst seed.
 TOOL_PATH = "/opt/homebrew/bin:/usr/local/bin"
 SOURCE = "seed-source.json"
-PAUSED = STATE / "seed-prefetch-paused"  # the Governor's record of each group it holds stopped (thaw_left_paused)
+PAUSED = "paused"  # in the prefetch's work folder: the Governor's record of each group it holds stopped
 DEPTH = 60  # seed_derived_data.ANCESTOR_LIMIT (50) commits of history, plus margin
 # A job or build that may be using the uplink or the seed cache right now.
 BUSY = re.compile(r"(^|/)(xcodebuild|SWBBuildService|XCBBuildService)(\s|$)"
@@ -768,32 +768,67 @@ def running_group_commands(pgid: int) -> list[str]:
     return commands
 
 
-def leader_start(pid: int) -> str:
-    """The start time ps gives pid (a pid with a different one is a reused pid), or '' when it is gone."""
-    out = subprocess.run(["ps", "-o", "lstart=", "-p", str(pid)], capture_output=True, text=True)
+PS_TIMEOUT = 10
+
+
+def leader_start(pid: int) -> str | None:
+    """The start time ps gives pid ('' when no such process), or None when ps could not tell."""
+    try:
+        out = subprocess.run(["ps", "-o", "lstart=", "-p", str(pid)], capture_output=True, text=True,
+                             timeout=PS_TIMEOUT)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if out.returncode not in (0, 1):
+        return None
     return out.stdout.strip()
 
 
-def thaw_left_paused(folder: Path) -> list[int]:
-    """SIGCONT each process group a killed run left paused, by its record in folder; returns the groups continued.
+def group_alive(pgid: int) -> bool | None:
+    """Whether any process is in process group pgid, or None when ps could not tell."""
+    try:
+        out = subprocess.run(["ps", "-axo", "pgid="], capture_output=True, text=True, timeout=PS_TIMEOUT)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if out.returncode != 0:
+        return None
+    return str(pgid) in out.stdout.split()
 
-    A Governor records a group (pgid and its leader's start time) before it stops it and removes the record when it
-    continues it. A record that outlives its run means that run died while the group was stopped (SIGKILL, a crash,
-    a power loss): the group is continued only while its leader is the same process (same pid, same start time),
-    so a reused pid is never signalled. Every record is removed."""
+
+def thaw_left_paused(folder: Path) -> list[int]:
+    """SIGCONT each process group a dead run left paused, by its record in folder; returns the groups continued.
+
+    A Governor records a group (pgid and its leader's start time) before it stops it and removes the record once
+    it has continued it, so a record that outlives its run means that run died with the group stopped (SIGKILL, a
+    crash, a power loss). Run under the prefetch lock, so no live Governor's record is touched. Per record:
+    - the group is gone: the record goes;
+    - its leader (pid == pgid) lives with another start time: a new group took the pgid after the old one died,
+      so it is left alone and the record goes;
+    - its leader lives with the recorded start time, or is gone while members remain (a pgid is never reused
+      while a member of its group lives): SIGCONT, and the record goes once that succeeded or found no group.
+    When ps cannot tell, or the SIGCONT fails otherwise, the record stays for the next run. Between the check and
+    the SIGCONT the whole group would have to exit and its pgid be reused within milliseconds; even then a SIGCONT
+    to running processes changes nothing."""
     thawed = []
     for record in sorted(folder.glob("*.json")) if folder.is_dir() else []:
         try:
             data = json.loads(record.read_text())
             pgid, started = int(data["pgid"]), str(data["started"])
         except (OSError, ValueError, KeyError, TypeError):
-            pgid, started = 0, ""
-        if pgid > 1 and started and leader_start(pgid) == started:
-            try:
-                os.killpg(pgid, signal.SIGCONT)
-                thawed.append(pgid)
-            except OSError:
-                pass
+            record.unlink(missing_ok=True)
+            continue
+        alive, leader = group_alive(pgid), leader_start(pgid)
+        if pgid <= 1 or not started or alive is False or (leader and leader != started):
+            record.unlink(missing_ok=True)
+            continue
+        if alive is None or leader is None:
+            continue
+        try:
+            os.killpg(pgid, signal.SIGCONT)
+            thawed.append(pgid)
+        except ProcessLookupError:
+            pass
+        except OSError:
+            continue
         record.unlink(missing_ok=True)
     return thawed
 
@@ -835,6 +870,8 @@ class Governor:
         self.thread = threading.Thread(target=self.loop, daemon=True)
 
     def set_paused(self, paused: bool) -> None:
+        if paused and self.record is not None and not self.started:
+            self.started = leader_start(self.pgid) or ""  # ps once, outside the lock: stop() never waits on it
         with self.lock:
             if self.stop_event.is_set() or paused == self.paused:
                 return
@@ -851,10 +888,9 @@ class Governor:
     def write_record(self) -> bool:
         if self.record is None:
             return True
+        if not self.started:
+            return False
         try:
-            self.started = self.started or leader_start(self.pgid)
-            if not self.started:
-                return False
             self.record.parent.mkdir(parents=True, exist_ok=True)
             tmp = self.record.with_suffix(".tmp")
             tmp.write_text(json.dumps({"pgid": self.pgid, "started": self.started}))
@@ -951,12 +987,11 @@ def remove_downloads(paths: list[str]) -> None:
             shutil.rmtree(folder, ignore_errors=True)
 
 
-def prefetch(scripts: Path, store: Path, head: str, mirror: Path, job: str = "") -> dict:
+def prefetch(scripts: Path, store: Path, head: str, mirror: Path, job: str = "", paused: Path | None = None) -> dict:
     """cmux's R2 prefetch for STORE, under the Governor; JOB (running at the start, or '') gives the longer timeout."""
     env = {key: value for key, value in os.environ.items()
            if key not in ("GITHUB_REPOSITORY", "GITHUB_OUTPUT", "CURL_HOME")}
     timeout = BUSY_PREFETCH_TIMEOUT if job else PREFETCH_TIMEOUT
-    thaw_left_paused(PAUSED)  # a group an earlier run stopped and then died (SIGKILL) before it could continue
     shutil.rmtree(mirror.parent / "curl-busy", ignore_errors=True)  # the old fixed-rate .curlrc
     env["CMUX_SEED_GIT_DIR"] = os.fspath(mirror)
     env["CI_CACHE_R2_PUBLIC_URL"] = BUCKET_URL
@@ -969,7 +1004,7 @@ def prefetch(scripts: Path, store: Path, head: str, mirror: Path, job: str = "")
                               os.fspath(store), head], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                              env=env, start_new_session=True)
     downloads = DownloadBytes(child.pid)
-    governor = Governor(child.pid, BUSY_RATE, busy, read_own=downloads, record_dir=PAUSED).start()
+    governor = Governor(child.pid, BUSY_RATE, busy, read_own=downloads, record_dir=paused).start()
 
     def stop_child() -> None:
         # Only while the leader is unreaped (the Governor stopped first), so the group is still ours.
@@ -1034,9 +1069,9 @@ def prefetch(scripts: Path, store: Path, head: str, mirror: Path, job: str = "")
 def run(apply: bool, state: Path = STATE) -> dict:
     record: dict = {"tool": "glaeda-seed-prefetch", "time": int(time.time()), "apply": apply}
     roots = stores(state)
-    if not roots:
-        return {**record, "state": "skip", "reason": "no owned job has recorded a seed prefix on this mini"}
     work = state / ".prefetch"
+    if not roots and not (work / PAUSED).is_dir():
+        return {**record, "state": "skip", "reason": "no owned job has recorded a seed prefix on this mini"}
     work.mkdir(parents=True, exist_ok=True)
     lock = os.open(work / "lock", os.O_RDONLY | os.O_CREAT, 0o644)
     try:
@@ -1045,6 +1080,12 @@ def run(apply: bool, state: Path = STATE) -> dict:
         os.close(lock)
         return {**record, "state": "skip", "reason": "another prefetch is running"}
     try:
+        # First, under the lock, on every run: a group an earlier run stopped and then died (SIGKILL) holding.
+        thawed = thaw_left_paused(work / PAUSED)
+        if thawed:
+            record["thawed"] = thawed
+        if not roots:
+            return {**record, "state": "skip", "reason": "no owned job has recorded a seed prefix on this mini"}
         try:
             mirror, head = main_head(work)
         except (OSError, subprocess.SubprocessError) as error:
@@ -1095,7 +1136,7 @@ def run(apply: bool, state: Path = STATE) -> dict:
                 if why:
                     lan["paced"] = f"{LAN_BUSY_RATE}B/s extraction, busy"
                 why = busy()  # the LAN step may have taken a while
-            result = prefetch(scripts, store, head, mirror, job=why)
+            result = prefetch(scripts, store, head, mirror, job=why, paused=work / PAUSED)
             if why:
                 result["busy"] = why
             if lan is not None:
