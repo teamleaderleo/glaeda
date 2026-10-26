@@ -77,6 +77,36 @@ class FakeMini(health.Mini):
         self.state_at_restart: list[dict] = []
         self.after_restart: tuple[str | None, str | None] = ("Running", "utun4")
         self.restart_cmds: list[list[str]] = []
+        # the drain: no reservation marker, the fleet list holds nothing, nothing left once drained
+        self.marker: tuple[str, dict | None] = ("none", None)
+        self.fleet_res = ""
+        self.drain_jobs = ""
+        self.drain_write = ""  # why start_drain fails, "" when it writes
+
+    def host_reservation(self):
+        return self.marker
+
+    def fleet_reservation(self):
+        return self.fleet_res
+
+    def start_drain(self, now, purpose):
+        if self.drain_write:
+            return self.drain_write
+        self.did.append("drain")
+        self.marker = ("ours", {"schema": health.RESERVATION_SCHEMA, "owner": health.TAILSCALE_DRAIN_OWNER,
+                                "purpose": purpose, "since": int(now),
+                                "until": int(now + health.TAILSCALE_DRAIN_MAX_S + health.TAILSCALE_DRAIN_LAPSE_S)})
+        return ""
+
+    def end_drain(self):
+        if self.marker[0] != "ours":
+            return False
+        self.did.append("undrain")
+        self.marker = ("none", None)
+        return True
+
+    def drain_busy(self):
+        return self.drain_jobs
 
     def host_names(self):
         return self.names
@@ -699,16 +729,35 @@ class TailscaleRouteRestart(Base):
         self.assertIn("restarted", healed["action"])
         self.assertIn("utun4", healed["action"])
 
-    def test_a_run_whose_cli_did_not_answer_keeps_the_count_without_adding_to_it(self) -> None:
-        # cmuxs-mac-mini-5, 2026-10-26: `status --json` timed out every other run, which started the count again
+    def test_a_cli_that_did_not_answer_with_the_route_off_the_tunnel_still_counts(self) -> None:
+        # cmuxs-mac-mini-5, 2026-10-26: `status --json` timed out every other run under load, which masked the
+        # finding; the route lookup is its own look, so en0 there is tailscale_no_route whatever the CLI said
         self.run_once()
         self.mini.ts = ("app", None, "status --json timed out after 15 s")
-        self.assertEqual(self.ids(self.run_once(NOW + 120)), ["tailscale_probe_error"])
-        self.assertEqual(self.mini.did, [], "a run that could not look restarts nothing")
-        self.mini.ts = ("app", "Running", "")
-        report = self.run_once(NOW + 240)
-        self.assertEqual([h["id"] for h in report["heals"]], ["tailscale_no_route"])
+        report = self.run_once(NOW + 120)
+        self.assertEqual([h["id"] for h in report["heals"]], ["tailscale_no_route"], "the second run in a row")
         self.assertEqual(self.restarts(), 1)
+        self.assertEqual(report["findings"], [], "after the restart the route is on the tunnel")
+
+    def test_a_cli_timeout_alone_reports_the_route_it_saw(self) -> None:
+        self.mini.ts = ("app", None, "status --json timed out after 15 s")
+        report = self.run_once(apply=False)
+        self.assertEqual(self.ids(report), ["tailscale_no_route"])
+        self.assertIn("gave no BackendState", report["findings"][0]["evidence"])
+        self.assertIn("out of en0", report["findings"][0]["evidence"])
+
+    def test_a_cli_that_did_not_answer_with_the_route_on_the_tunnel_is_a_probe_error(self) -> None:
+        self.run_once()
+        self.mini.ts, self.mini.route = ("app", None, "status --json timed out after 15 s"), "utun4"
+        self.assertEqual(self.ids(self.run_once(NOW + 120)), ["tailscale_probe_error"])
+        self.assertEqual(self.mini.did, [], "a run that could not judge the tunnel restarts nothing")
+
+    def test_a_restart_rechecked_by_a_cli_that_times_out_is_judged_on_the_route(self) -> None:
+        self.mini.after_restart = (None, "utun4")
+        report = self.broken_twice()
+        self.assertEqual(self.restarts(), 1)
+        self.assertTrue(report["heals"][0]["ok"])
+        self.assertEqual(report["findings"], [])
 
     def test_a_run_whose_route_lookup_named_no_interface_keeps_the_count_too(self) -> None:
         # cmuxs-mac-mini-5, 2026-10-26: under load, runs that read no route reported nothing and started the count again
@@ -891,7 +940,9 @@ class TailscaleRouteRestart(Base):
         self.assertEqual(self.mini.did, [])
 
     def test_a_wait_older_than_6_h_alerts(self) -> None:
-        # a stranded host lock or a stuck jobs/ entry looks busy forever: past 6 h it is no short wait
+        # a stranded host lock or a stuck jobs/ entry looks busy forever: past 6 h it is no short wait (on a host
+        # that cannot drain, here a reserved one; a drainable one drains after an hour, TailscaleRouteDrain)
+        self.mini.fleet_res = "reserved for someone"
         self.mini.busy = "a dev-build worker job is in /Users/Shared/cmux-build-fleet/jobs"
         report = self.broken_twice()
         self.assertEqual(report["findings"][0]["auto_fix"], "pending")
@@ -1047,6 +1098,216 @@ class TailscaleRouteRestart(Base):
         self.assertEqual(report["findings"][0]["auto_fix"], "impossible")
 
 
+class TailscaleRouteDrain(Base):
+    """A mini that is never idle (cmuxs-mac-mini-5: 12 runners) drains after TAILSCALE_DRAIN_AFTER_S, restarts once
+    the jobs are done, and ends the drain; the drain is capped and skips reserved hosts."""
+
+    BUSY = "a CI job is running (/Users/cmux/actions-runner-glaeda-3/bin/Runner.Worker spawnclient 1 2)"
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.mini.route = "en0"
+        self.mini.busy = self.BUSY
+        self.after = health.TAILSCALE_DRAIN_AFTER_S
+
+    def restarts(self) -> int:
+        return sum(1 for d in self.mini.did if d.startswith("restart"))
+
+    def broken(self, until: float, step: float = 120) -> dict:
+        t, report = NOW, {}
+        while t <= until:
+            report = self.run_once(t)
+            t += step
+        return report
+
+    def test_it_waits_an_hour_before_draining(self) -> None:
+        report = self.broken(NOW + self.after - 1)
+        self.assertNotIn("drain", self.mini.did)
+        self.assertEqual(report["findings"][0]["auto_fix"], "pending")
+
+    def test_a_busy_mini_drains_restarts_when_the_jobs_finish_and_ends_the_drain(self) -> None:
+        report = self.run_once(NOW)
+        report = self.run_once(NOW + self.after)
+        self.assertEqual(self.mini.did, ["drain"])
+        f = report["findings"][0]
+        self.assertEqual(f["auto_fix"], "pending")
+        self.assertIn("draining from now", f["note"])
+        self.assertIn("Runner.Worker", f["note"])
+        # jobs still run: the drain holds, no restart
+        self.mini.drain_jobs = self.BUSY
+        report = self.run_once(NOW + self.after + 120)
+        self.assertEqual(self.mini.did, ["drain"])
+        self.assertEqual(self.mini.marker[0], "ours")
+        self.assertIn("draining since", report["findings"][0]["note"])
+        self.assertIn("Runner.Worker", report["findings"][0]["note"])
+        # the last job finished: the restart runs under the host lock, then the marker goes
+        self.mini.drain_jobs = ""
+        report = self.run_once(NOW + self.after + 240)
+        self.assertEqual(self.mini.did, ["drain", "lock", "restart app", "undrain"])
+        self.assertEqual(report["findings"], [])
+        self.assertEqual(self.mini.marker, ("none", None))
+
+    def test_a_restart_that_did_not_fix_it_still_ends_the_drain(self) -> None:
+        self.mini.after_restart = ("Running", "en0")
+        self.broken(NOW + self.after)
+        self.run_once(NOW + self.after + 120)
+        self.assertEqual(self.mini.did, ["drain", "lock", "restart app", "undrain"])
+        self.assertEqual(self.mini.marker, ("none", None))
+
+    def test_the_drain_is_capped_and_alerts(self) -> None:
+        self.broken(NOW + self.after)
+        self.mini.drain_jobs = self.BUSY
+        cap = NOW + self.after + health.TAILSCALE_DRAIN_MAX_S
+        report = self.run_once(cap - 1)
+        self.assertEqual(report["findings"][0]["auto_fix"], "pending")
+        report = self.run_once(cap)
+        f = report["findings"][0]
+        self.assertEqual(f["auto_fix"], "impossible", "past the cap: an alert")
+        self.assertIn("cap", f["note"])
+        self.assertIn("Runner.Worker", f["note"])
+        self.assertEqual(self.mini.did, ["drain", "undrain"], "the cap ends the drain, never a restart under a job")
+        # no new drain for 6 h, and the finding keeps alerting
+        report = self.run_once(cap + 120)
+        self.assertEqual(self.mini.did, ["drain", "undrain"])
+        self.assertEqual(report["findings"][0]["auto_fix"], "impossible")
+        self.assertIn("no drain before", report["findings"][0]["note"])
+        self.run_once(cap + health.TAILSCALE_RESTART_EVERY_S)
+        self.assertEqual(self.mini.did, ["drain", "undrain", "drain"], "after 6 h it may drain again")
+
+    def test_a_host_lock_held_through_the_drain_is_capped_too(self) -> None:
+        self.broken(NOW + self.after)
+        self.mini.lock_why = "a job or a fleet build holds the fleet host lock"
+        report = self.run_once(NOW + self.after + 120)
+        self.assertEqual(report["findings"][0]["auto_fix"], "pending")
+        self.assertEqual(self.mini.marker[0], "ours", "a short wait keeps the drain")
+        report = self.run_once(NOW + self.after + health.TAILSCALE_DRAIN_MAX_S)
+        self.assertEqual(report["findings"][0]["auto_fix"], "impossible")
+        self.assertIn("drain cap", report["findings"][0]["note"])
+        self.assertEqual(self.mini.did, ["drain", "undrain"])
+
+    def test_a_reserved_host_is_never_drained(self) -> None:
+        # cmux16-24 are opted in (ci-runner) but Lawrence's until 2026-10-28: the fleet list holds them
+        self.mini.fleet_res = "reserved for lawrencecchen until 2026-10-28T23:59:59Z (lawrence-2026-10-25)"
+        report = self.broken(NOW + self.after + 600)
+        self.assertNotIn("drain", self.mini.did)
+        self.assertIn("no drain: reserved for lawrencecchen", report["findings"][0]["note"])
+
+    def test_no_answer_on_the_fleet_reservations_is_no_drain(self) -> None:
+        self.mini.fleet_res = health.NoAnswer("glaeda-disk cannot say whether the fleet reserved this host (AttributeError)")
+        report = self.broken(NOW + self.after + 600)
+        self.assertNotIn("drain", self.mini.did)
+        self.assertEqual(report["findings"][0]["auto_fix"], "impossible", "no answer alerts")
+
+    def test_someone_else_s_reservation_is_never_replaced(self) -> None:
+        self.mini.marker = ("other", {"schema": health.RESERVATION_SCHEMA, "owner": "leo", "purpose": "soak",
+                                      "since": int(NOW), "until": int(NOW + 86400)})
+        self.mini.busy = "the host is reserved"
+        report = self.broken(NOW + self.after + 600)
+        self.assertEqual(self.mini.did, [])
+        self.assertEqual(self.mini.marker[1]["owner"], "leo")
+        self.assertIn("someone else's reservation", report["findings"][0]["note"])
+
+    def test_a_marker_that_cannot_be_written_is_no_drain(self) -> None:
+        self.mini.drain_write = "another reservation appeared"
+        report = self.broken(NOW + self.after)
+        self.assertNotIn("drain", self.mini.did)
+        self.assertIn("another reservation appeared", report["findings"][0]["note"])
+
+    def test_the_route_coming_back_ends_the_drain(self) -> None:
+        self.broken(NOW + self.after)
+        self.mini.drain_jobs = self.BUSY
+        self.mini.route = "utun4"
+        self.assertEqual(self.run_once(NOW + self.after + 120)["findings"], [])
+        self.assertEqual(self.mini.did, ["drain", "undrain"])
+
+    def test_a_run_that_could_not_look_keeps_the_drain(self) -> None:
+        self.broken(NOW + self.after)
+        self.mini.drain_jobs = self.BUSY
+        self.mini.route = None
+        self.run_once(NOW + self.after + 120)
+        self.assertEqual(self.mini.did, ["drain"])
+
+    def test_a_kill_switch_ends_the_drain(self) -> None:
+        self.broken(NOW + self.after)
+        self.mini.drain_jobs = self.BUSY
+        self.mini.restart_off = "GLAEDA_TAILSCALE_RESTART=off"
+        self.run_once(NOW + self.after + 120)
+        self.assertEqual(self.mini.did, ["drain", "undrain"])
+
+    def test_report_mode_never_drains_or_ends_one(self) -> None:
+        self.broken(NOW + self.after)
+        self.mini.drain_jobs = self.BUSY
+        self.run_once(NOW + self.after + 120, apply=False)
+        self.assertEqual(self.mini.did, ["drain"])
+        self.assertEqual(self.mini.marker[0], "ours")
+
+
+class DrainMarkerOnDisk(unittest.TestCase):
+    """The real Mini's marker writes against a temporary fleet dir, read back by the runner hook's parser."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.fleet = Path(self.tmp.name) / "fleet"
+        self.fleet.mkdir()
+        patch = mock.patch.object(health, "FLEET_DIR", self.fleet)
+        patch.start()
+        self.addCleanup(patch.stop)
+        self.addCleanup(self.tmp.cleanup)
+        self.mini = health.Mini(Path(self.tmp.name))
+        self.rules = load("glaeda_reservation_for_health", ROOT / "scripts" / "glaeda_reservation.py")
+
+    def test_the_marker_is_a_reservation_the_runner_hook_honours(self) -> None:
+        self.assertEqual(self.mini.start_drain(NOW, "drain for a Tailscale restart"), "")
+        marker, why = self.rules.parse((self.fleet / "reservation.json").read_text())
+        self.assertIsNone(why)
+        self.assertTrue(self.rules.active(marker, NOW + health.TAILSCALE_DRAIN_MAX_S))
+        self.assertFalse(self.rules.active(marker, NOW + health.TAILSCALE_DRAIN_MAX_S + health.TAILSCALE_DRAIN_LAPSE_S),
+                         "it lapses by itself if mini-health stops")
+        self.assertEqual(self.mini.host_reservation()[0], "ours")
+        self.assertTrue(self.mini.end_drain())
+        self.assertFalse((self.fleet / "reservation.json").exists())
+        self.assertEqual(sorted(p.name for p in self.fleet.iterdir()), [], "no temp file left")
+
+    def test_another_reservation_is_never_overwritten_or_removed(self) -> None:
+        theirs = json.dumps({"schema": "glaeda-reservation/v1", "owner": "lawrence", "purpose": "x",
+                             "since": int(NOW), "until": int(NOW + 3600)})
+        (self.fleet / "reservation.json").write_text(theirs)
+        self.assertEqual(self.mini.host_reservation()[0], "other")
+        self.assertIn("another reservation", self.mini.start_drain(NOW, "drain"))
+        self.assertFalse(self.mini.end_drain())
+        self.assertEqual((self.fleet / "reservation.json").read_text(), theirs)
+
+    def test_an_unreadable_marker_is_someone_else_s(self) -> None:
+        (self.fleet / "reservation.json").write_text("{not json")
+        self.assertEqual(self.mini.host_reservation(), ("other", None))
+        self.assertFalse(self.mini.end_drain())
+        self.assertTrue((self.fleet / "reservation.json").exists())
+
+    def test_drain_busy_sees_dev_build_jobs(self) -> None:
+        self.mini.jobs_running = lambda: ""
+        self.assertEqual(self.mini.drain_busy(), "")
+        (self.fleet / "jobs").mkdir()
+        (self.fleet / "jobs" / "job-1").write_text("")
+        self.assertIn("dev-build worker job", self.mini.drain_busy())
+
+    def test_fleet_reservation_asks_glaeda_disk_without_the_host_local_file(self) -> None:
+        seen = {}
+
+        class Disk:
+            @staticmethod
+            def host_reservation(local=None):
+                seen["local"] = local
+                return "reserved for lawrencecchen until 2026-10-28T23:59:59Z (lawrence-2026-10-25)"
+
+        self.mini.disk_module = lambda: Disk
+        self.assertIn("lawrencecchen", self.mini.fleet_reservation())
+        self.assertEqual(seen["local"], health.NO_LOCAL_RESERVATION)
+
+    def test_a_glaeda_disk_without_host_reservation_is_no_answer(self) -> None:
+        self.mini.disk_module = lambda: object()
+        self.assertIsInstance(self.mini.fleet_reservation(), health.NoAnswer)
+
+
 class TailscaleRestartGates(unittest.TestCase):
     """The restart's gates as pure functions, and the real Mini's reads against stand-ins (never the host)."""
 
@@ -1169,7 +1430,9 @@ class TailscaleRestartGates(unittest.TestCase):
         self.assertFalse(health.route_ok("Running", "en0"))
         self.assertFalse(health.route_ok("Running", None))
         self.assertFalse(health.route_ok("Starting", "utun3"))
-        self.assertFalse(health.route_ok(None, "utun3"))
+        self.assertTrue(health.route_ok(None, "utun3"), "a CLI that timed out after the restart: judged on the route")
+        self.assertFalse(health.route_ok(None, "en0"))
+        self.assertFalse(health.route_ok(None, None))
 
 
 class TailscaleRestartReads(unittest.TestCase):
