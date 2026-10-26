@@ -71,7 +71,7 @@ Runner.Worker vetoes still hold (docs/CMUX_NEXT_CI_RETENTION.md). Only a pressur
 report shows its last measurement, and its run line records how far over the cap it is.
 The per-host build root (cmux_next_ci_host_roots, default dev-daily-release/host: one tree a mini's DEV
 compiles share under flock on its lock, so their compilation cache hits) is never the cap's: it goes whole, after
-everything else, only once idle cmux_next_ci_host_idle_hours (48) or while free is still under the runner floor,
+everything else, only while free is still under the runner floor (exempt from age by role: the newest warm cache),
 and never while its lock is held. Per-instance dev-daily-release states, now its fallback only, go first.
 
 Each enrolled GitHub runner's checkout (~/actions-runner*/_work/<repo>/<repo>) has two families.
@@ -79,9 +79,9 @@ runner-checkout-build is SwiftPM's Packages/*/.build and Packages/*/*/.build plu
 directories (cmux-tui/target), plus DerivedData a workflow keeps in $RUNNER_WORKSPACE/.glaeda-state
 (_work/<repo>/.glaeda-state/*derived-data*); it goes only under pressure, only while that runner has no Runner.Worker,
 an hour idle, least recently modified first. runner-git-garbage is git's tmp_pack_*/tmp_obj_* temp files an
-interrupted fetch left; one an hour old goes whenever nothing holds it open. The checkout itself stays,
-except as the last resort of a pressure run still under the runner gate's disk floor after everything else
-(runner-idle-checkout): then the whole checkout of a runner with no Runner.Worker, unused for 10 minutes and
+interrupted fetch left; one an hour old goes whenever nothing holds it open. The checkout itself stays
+until no job used it for 12 hours (any pressure or sweep pass then removes it), except as the last resort of a
+pressure run still under the runner gate's disk floor after everything else (runner-idle-checkout): then the whole checkout of a runner with no Runner.Worker, unused for 10 minutes and
 held open by nothing, goes, least recently used first, until free space reaches the floor plus
 target_margin_gib. The runner's next job clones it again. Before that, on every pressure or sweep pass of a
 fleet mini, runner-checkout-repack folds a checkout's packs with `git repack -a -d -k -l` (keeps every object) once
@@ -101,7 +101,7 @@ it or its linked work trees. Only a home with enrolled runners. A slow gc runs o
 
 The runner-account profile is intentionally narrower than the normal user profile:
 it covers only DerivedData, cmux reload/GhosttyKit caches, and CUA recordings/frame
-caches, with a seven-day minimum idle age. Git index refreshes are ignored for that
+caches, with a DEFAULT_AGE_HOURS (12 h) minimum idle age. Git index refreshes are ignored for that
 age clock; process/open-file/command/socket/git-loss checks still veto deletion.
 
 The idle sweep (--idle) reclaims whatever the free space. A busy host sweeps too: deletes skip only what a
@@ -551,13 +551,19 @@ def artifact_referenced(path: Path, references: frozenset[str]) -> bool:
 FLEET_CI = Path("/Users/Shared/cmux-build-fleet/ci")
 SEED_SOURCE = "seed-source.json"
 SEED_KEEP = 2  # seed_derived_data.LOCAL_KEEP_LOW_DISK: newest seeds of the current prefix each root keeps
-KEPT_BUILD_IDLE_HOURS = 24.0
+# One age for everything disposable (Leo, 2026-10-26): "When have we ever had something useful greater than 12 hours?
+# I mean, if something stalls, like sure, but why would it stall? If it stalls, it's gonna have to get a rebase
+# anyway." DerivedData, CoreSimulator, package caches, runner work dirs and build dirs go once idle this long. Only
+# the newest warm compile cache per builder is exempt, by role and not by age (the per-host cmux-next build root,
+# cmux_next_ci_host_idle_hours; each root's newest SEED_KEEP seeds); older warm caches go at this age too.
+DEFAULT_AGE_HOURS = 12.0
+KEPT_BUILD_IDLE_HOURS = DEFAULT_AGE_HOURS
 PARKED_IDLE_HOURS = float("inf")  # parked builds age by host-job reuse distance, not wall clock
 # A missing job log cannot establish a reuse distance.  An idle sweep can still make
-# bounded progress after the same seven-day window used for mirror checkouts; the
+# bounded progress after DEFAULT_AGE_HOURS, the window used for mirror checkouts; the
 # sweep's host-busy gate plus the normal process, socket, lease and recheck guards
 # remain in force before any deletion.
-PARKED_NO_LOG_IDLE_HOURS = 168.0
+PARKED_NO_LOG_IDLE_HOURS = DEFAULT_AGE_HOURS
 
 
 def fleet_stores(ci: Path | None = None) -> list[Path]:
@@ -576,7 +582,7 @@ FLEET_FAMILY_IDS = ("cmux-pr-builds", "cmux-seeds", "cmux-kept-build", "ci-deriv
 # are deliberately outside this allowlist.
 CMUX_NEXT_CI_FAMILY = "cmux-next-ci-generated"
 CMUX_NEXT_CI_ROOT = "cmux-next-ci"
-CMUX_NEXT_CI_MIN_IDLE_HOURS = 72.0
+CMUX_NEXT_CI_MIN_IDLE_HOURS = DEFAULT_AGE_HOURS
 CMUX_NEXT_CI_DRAIN = False
 # Bytes the whole cmux-next-ci cache is over its LRU cap (cmux_next_ci_cap_gib) in this pressure run, 0 within
 # it. While over, the 72 h window gives way, least recently used first, until the cache is back under the cap
@@ -613,6 +619,7 @@ CMUX_NEXT_DRAIN_HOOK_SHA256 = frozenset({
     "d5e73be990d67d9499ff352d01fda2e1392a6fd257a57770b23008b3bf55fb59",
     "0c2c8880e3b17af8324f8304121c4159bee8ade5c31496b9af713586cb90bcfc",
     "fca8abb34684680ad0344a7a82b0ee8b2b476f6490407de27eb410904f5fac91",
+    "6bdc89db3e25e5fa40321e5d3066d7d5cf4ba7354c6915687cd76f118d7dfec5",
 })
 CMUX_NEXT_CI_PRESERVED_NAMES = frozenset({
     "SourcePackages", "ModuleCache.noindex", "SDKStatCaches.noindex",
@@ -692,7 +699,7 @@ def ci_ios_family(root: Path | None = None) -> Family:
 # (2026-10-21). Only these names one level below the root, so src/ stays the tmp family's and git's to judge.
 CANONICAL_ADMISSION = "cmux-ci-admission"
 CANONICAL_ADMISSION_NAMES = ("derived-data-", "compile-admission-cas")
-CANONICAL_ADMISSION_IDLE_HOURS = 24.0
+CANONICAL_ADMISSION_IDLE_HOURS = DEFAULT_AGE_HOURS
 CANONICAL_CAPACITY = FLEET_ROOT / "capacity"
 
 
@@ -944,7 +951,7 @@ def item_window(fam: Family, path: Path, idle_hours: float, archived: frozenset[
             if fam.root.stat().st_dev in FLOOR_HOLD:
                 return 0.0
         window = float(POLICY["cmux_next_ci_host_idle_hours"])
-        return max(window, fam.min_idle_hours) if RUNNER_CACHE_PROFILE else window  # that profile's 7-day minimum
+        return max(window, fam.min_idle_hours) if RUNNER_CACHE_PROFILE else window  # that profile's minimum age
     if fam.id == CMUX_NEXT_CI_FAMILY and (CMUX_NEXT_CI_DRAIN or cmux_next_ci_over()):
         return 0.0
     if fam.id == SPM_SCRATCH:
@@ -1005,7 +1012,7 @@ def cmux_next_cap_only(fam: Family, path: Path, idle: float, idle_hours: float) 
 # which bounds stale disposable output without touching a live job's state.
 IDLE_SWEEP_HOURS = KEPT_BUILD_IDLE_HOURS
 IDLE_PR_BUILD_HOURS = float("inf")
-IDLE_SEED_HOURS = 12.0
+IDLE_SEED_HOURS = DEFAULT_AGE_HOURS
 IDLE_SWEEP_EVERY_S = 3600  # the 15-minute agent sweeps at most hourly: an apply re-measures every candidate
 IDLE_STAMP = HOME / ".cache/glaeda-disk/idle-sweep.last"
 FLEET_DIR = FLEET_CI.parent
@@ -1127,12 +1134,12 @@ POLICY_DEFAULTS: dict[str, Any] = {
     "pressure_jobs": 80,
     "min_jobs": 6,
     "sweep_jobs": 190,
-    "soft_idle_hours": 24.0,
+    "soft_idle_hours": DEFAULT_AGE_HOURS,
     # Build markers are aged by observed host activity, not a fixed wall-clock
     # guess.  The cap is only a recovery bound when the job log is unavailable.
     "stale_marker_min_age_hours": 0.5,
     "stale_marker_jobs": 3,
-    "stale_marker_max_hours": 48.0,
+    "stale_marker_max_hours": DEFAULT_AGE_HOURS,
     # A busy host cleans too: deletes skip only what a job uses (open, named by a command, its root's
     # current seed or checkout), never the whole pass. true restores the old defer-while-CI-runs rule.
     "defer_during_ci": False,
@@ -1148,7 +1155,9 @@ POLICY_DEFAULTS: dict[str, Any] = {
     # (cmux_next_ci_host_roots): never for the size cap, only once idle cmux_next_ci_host_idle_hours, or while free is
     # still under the runner floor after everything else, and never while its lock is held. [] turns this off.
     "cmux_next_ci_host_roots": ["dev-daily-release/host"],
-    "cmux_next_ci_host_idle_hours": 48.0,
+    # The newest warm compile cache per builder is exempt by role, not by age (DEFAULT_AGE_HOURS): the host root goes
+    # only under the runner floor. A finite number here ages it again.
+    "cmux_next_ci_host_idle_hours": float("inf"),
     # --dedupe also clones identical files in capture and evidence trees (screen-capture frames, UI evidence),
     # with its own floor: one PNG frame is 16-200 KiB, so Xcode's 1 MiB floor saw 2.7 of the 11.2 GiB of
     # identical frames in cmux-mac-mini's ~/messageslab-26. "~" is the account's home; globs are allowed; a
@@ -1514,7 +1523,7 @@ def idle_due(stamp: Path | None = None, every_s: float = IDLE_SWEEP_EVERY_S) -> 
 
 # Xcode copies and simulator runtimes (idle sweep, macOS). An Xcode is an install, not a rebuild: it is only
 # reported, with the pins that name it. A runtime is a multi-GiB download; one goes only when nothing uses it.
-RUNTIME_IDLE_DAYS = 14.0  # simctl's lastUsedAt: an iOS lane touches its runtime on every run
+RUNTIME_IDLE_DAYS = DEFAULT_AGE_HOURS / 24  # simctl's lastUsedAt: an iOS lane touches its runtime on every run
 
 
 def _version_key(v: str) -> tuple[int, ...]:
@@ -1694,7 +1703,7 @@ def seed_verdict(path: Path) -> str:
 
 
 WORKTREE_DIRS = ("worktrees", "cmux-worktrees", "glaeda-worktrees")
-CHECKOUT_BUILD_IDLE_HOURS = 24.0
+CHECKOUT_BUILD_IDLE_HOURS = DEFAULT_AGE_HOURS
 
 
 def _checkout_git(checkout: Path, *args: str) -> list[str]:
@@ -1775,7 +1784,7 @@ def checkout_build_family(projects: Path, role: str = "fleet-mini") -> Family:
     return Family("checkout-build", projects, True,
                   "swift build or glaeda-apple warm rebuilds it; also counted in its checkout",
                   checkout_builds=True, build_output=True,
-                  min_idle_hours=min(CHECKOUT_BUILD_IDLE_HOURS, 12.0),
+                  min_idle_hours=CHECKOUT_BUILD_IDLE_HOURS,
                   owner="SwiftPM and glaeda-apple, per checkout", rebuild_minutes=15,
                   platform="shared")
 
@@ -1912,6 +1921,9 @@ def runner_checkout_families(home: Path | None = None) -> list[Family]:
 # used 23-32 minutes before, and the pass freed nothing). No Runner.Worker is what keeps a job's checkout.
 RUNNER_IDLE_CHECKOUT_FAMILY = "runner-idle-checkout"
 RUNNER_IDLE_CHECKOUT_HOURS = 10 / 60
+# Old runner work dirs go by age too, above the floor and in the idle sweep: a checkout no job used for
+# DEFAULT_AGE_HOURS is cloned again by its runner's next job, like one the floor took.
+RUNNER_STALE_CHECKOUT_HOURS = DEFAULT_AGE_HOURS
 
 
 def runner_checkout_last_use(runner: Path, checkout: Path) -> float:
@@ -1948,17 +1960,16 @@ def idle_runner_checkout_veto(runner: Path, checkout: Path, opened: frozenset[st
 
 
 def evict_idle_runner_checkouts(receipt: Path, floor_gib: float, home: Path | None = None) -> int:
-    """Under the runner gate's disk floor only: remove idle runners' whole checkouts, least recently used
-    first, each after fresh process evidence, until free space is back at the floor plus target_margin_gib."""
+    """Remove idle runners' whole checkouts, least recently used first, each after fresh process evidence: every
+    one unused for RUNNER_STALE_CHECKOUT_HOURS, and under the runner gate's disk floor also younger ones (quiet for
+    RUNNER_IDLE_CHECKOUT_HOURS) until free space is back at the floor plus target_margin_gib."""
     home = HOME if home is None else home
-    if floor_gib <= 0:
-        return 0
     try:
         free, total = free_bytes(home)
     except OSError:
         return 0
-    if free >= (floor_gib + GATE_DISK_RESUME_GIB) * GIB:  # the gate is not holding for disk: whole checkouts stay
-        return 0
+    # above the gate's resume mark (or with no floor) only stale checkouts go
+    under = floor_gib > 0 and free < (floor_gib + GATE_DISK_RESUME_GIB) * GIB
     target = min(int((floor_gib + POLICY["target_margin_gib"]) * GIB), total // 2)  # as filesystems() sets it
     now = time.time()
     found = []
@@ -1970,13 +1981,15 @@ def evict_idle_runner_checkouts(receipt: Path, floor_gib: float, home: Path | No
             if checkout.name != checkout.parent.name:  # only actions/checkout's default _work/<repo>/<repo>
                 continue
             used = runner_checkout_last_use(runner, checkout)
-            if (now - used) / 3600 >= RUNNER_IDLE_CHECKOUT_HOURS:
+            idle = (now - used) / 3600
+            if idle >= RUNNER_IDLE_CHECKOUT_HOURS and (under or idle >= RUNNER_STALE_CHECKOUT_HOURS):
                 found.append((used, runner, checkout))
     released = 0
     for used, runner, checkout in sorted(found, key=lambda t: t[0]):
+        stale = (now - used) / 3600 >= RUNNER_STALE_CHECKOUT_HOURS
         try:
-            if free_bytes(home)[0] >= target:
-                break
+            if not stale and free_bytes(home)[0] >= target:
+                break  # oldest first: every stale checkout came before this one
             opened, cmds = process_evidence()  # a job may have started since the last deletion
         except OSError:
             break
@@ -1999,12 +2012,14 @@ def evict_idle_runner_checkouts(receipt: Path, floor_gib: float, home: Path | No
         rec = {"at": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "host": platform.node(), "outcome": outcome,
                "family": RUNNER_IDLE_CHECKOUT_FAMILY, "path": os.fspath(checkout), "bytes": size,
                "verdict": "reclaimable" if not why else "blocked",
-               "reasons": [why] if why else ["under the runner disk floor", "runner has no job"],
+               "reasons": [why] if why else [f"unused for {RUNNER_STALE_CHECKOUT_HOURS:g} h" if stale
+                                             else "under the runner disk floor", "runner has no job"],
                "idle_hours": round((now - used) / 3600, 2)}
         with contextlib.suppress(OSError), receipt.open("a") as f:  # a lost receipt line must not stop the pass
             f.write(json.dumps(rec) + "\n")
         if outcome == "reclaimed":
-            print(f"  reclaimed {gib(size).strip():>8s}  {checkout} (idle runner checkout, under the disk floor)")
+            why_now = f"unused for {RUNNER_STALE_CHECKOUT_HOURS:g} h" if stale else "under the disk floor"
+            print(f"  reclaimed {gib(size).strip():>8s}  {checkout} (idle runner checkout, {why_now})")
     return released
 
 
@@ -2021,7 +2036,7 @@ TMP_TEST_RESIDUE = re.compile(
     r"|floating-chat|header-pr|picker-listing|swift-package-test\.XXXXXX|TemporaryDirectory|cmux-claude-hooks"
     r"|swift-crash-reproducer|cmux-shortcut-routing|cmux-agent-journal-test|cmux-git-active-pwd"
     r"|cmux-ssh-pty-replay)[-.][0-9A-Za-z]")
-TMP_TEST_RESIDUE_IDLE_HOURS = 48.0  # nothing in the entry changed for two days: no test run still uses it
+TMP_TEST_RESIDUE_IDLE_HOURS = DEFAULT_AGE_HOURS  # nothing in the entry changed for this long: no test run uses it
 TMP_TEST_RESIDUE_WALK_BUDGET = 20_000  # entries walked per candidate; a bigger tree is not proven idle
 TMP_TEST_RESIDUE_EVIDENCE_S = 60.0  # process evidence is re-read at least this often during a pass
 TMP_TEST_RESIDUE_BUDGET_S = 600.0  # one pass stops here and holds the eviction lock no longer; the next continues
@@ -2296,6 +2311,8 @@ HQ_CACHE_FAMILY = "hq-build-fleet-cache"
 # laptop, which keeps the edits. So once a unit sat idle a week, no git check keeps it. Before that, a clone
 # still has to lose nothing. Every git check kept them: 107 GiB idle since Sep 28-Oct 2 on eight minis read
 # "git-checkout (checkout below the top level)" while glaeda-disk reported 0.0 G reclaimable (2026-10-11).
+# Not DEFAULT_AGE_HOURS: past this window a checkout counts as a mirror and goes without the git-loss check, so a
+# commit only it holds would be lost unarchived; the disposable output inside it goes at DEFAULT_AGE_HOURS.
 CMUX_JOB_MIRROR_HOURS = 168.0
 
 
@@ -2365,7 +2382,7 @@ def default_families(role: str = "fleet-mini") -> list[Family]:
         # runs therefore cannot erase a slot used recently in the same work period.
         Family("cmux-job-cache", HOME / ".cache/cmux-job", True,
                "next cmux reload or CI job rebuilds it (cold)", depth=2, git_disposable=True,
-               owner="cmuxterm-hq reload-cloud scripts", rebuild_minutes=30, min_idle_hours=12.0,
+               owner="cmuxterm-hq reload-cloud scripts", rebuild_minutes=30, min_idle_hours=DEFAULT_AGE_HOURS,
                mirror_idle_hours=CMUX_JOB_MIRROR_HOURS, platform=host_cache_platform()),
         # Caches are disposable by definition; an idle one goes under pressure, a live one (go-build
         # while a Go build runs) stays recent. Any git data inside keeps it, as everywhere else.
@@ -2387,17 +2404,18 @@ def default_families(role: str = "fleet-mini") -> list[Family]:
         # can see their age and reclaim them after the normal process/open-file gate passes.
         Family("cua-recordings", HOME / "Library/Application Support/cua-ssh/recordings", True,
                "the CUA recorder can capture it again", depth=1, files=True,
-               min_idle_hours=24.0, owner="CUA recorder", rebuild_minutes=2, platform="macos"),
+               min_idle_hours=DEFAULT_AGE_HOURS, owner="CUA recorder", rebuild_minutes=2, platform="macos"),
         Family("cua-cache", HOME / "Library/Caches/cmux/cmux-cua", True,
                "the CUA client rebuilds its frame cache", depth=1, files=True,
-               min_idle_hours=12.0, owner="cmux CUA", rebuild_minutes=1, platform="macos"),
+               min_idle_hours=DEFAULT_AGE_HOURS, owner="cmux CUA", rebuild_minutes=1, platform="macos"),
         # Sealed caches (cache_layout) anywhere else in the home directory: ~/.npm/_cacache,
         # ~/.bun/install/cache, ~/.cargo/registry, ~/go/pkg/mod, rustup toolchains. Found by content,
         # so a tool this list never heard of is covered once its cache has a recognized layout.
-        # Twelve hours at least: Linux's relatime moves a file's access time once a day, so a cache read
-        # every hour can show a day-old atime. The live process and command checks still protect use.
+        # DEFAULT_AGE_HOURS: Linux's relatime moves a file's access time once a day, so a cache read every hour can
+        # show a day-old atime; the live process and command checks protect a cache in use, and one that goes is
+        # downloaded again.
         Family("home-caches", HOME, True, "the tool re-downloads or rebuilds it", discover=True,
-               owner="tools (found by cache layout)", rebuild_minutes=5, min_idle_hours=24.0, pressure_only=role == "devbox", platform=host_cache_platform()),
+               owner="tools (found by cache layout)", rebuild_minutes=5, min_idle_hours=DEFAULT_AGE_HOURS, pressure_only=role == "devbox", platform=host_cache_platform()),
         Family("simulators", HOME / "Library/Developer/CoreSimulator", False,
                "use `xcrun simctl delete unavailable` (report only)", platform="macos"),
         Family("projects", projects, False, "checkouts (report only)",
@@ -2512,26 +2530,26 @@ def runner_cache_families() -> list[Family]:
     roots = [
         Family("xcode-derived-data", HOME / "Library/Developer/Xcode/DerivedData", True,
                "next xcodebuild rebuilds it", owner="Xcode, per checkout", rebuild_minutes=15,
-               build_output=True, min_idle_hours=168.0, platform="macos"),
+               build_output=True, min_idle_hours=DEFAULT_AGE_HOURS, platform="macos"),
         Family("cmux-job-cache", HOME / ".cache/cmux-job", True,
                "next cmux reload or CI job rebuilds it", depth=2, git_disposable=True,
-               owner="cmux reload-cloud", rebuild_minutes=30, min_idle_hours=168.0,
+               owner="cmux reload-cloud", rebuild_minutes=30, min_idle_hours=DEFAULT_AGE_HOURS,
                mirror_idle_hours=CMUX_JOB_MIRROR_HOURS, platform="macos"),
         Family("cmux-ghosttykit-cache", HOME / ".cache/cmux/ghosttykit", True,
                "cmux rebuilds GhosttyKit", depth=1, files=True,
-               owner="cmux build tooling", rebuild_minutes=5, min_idle_hours=168.0,
+               owner="cmux build tooling", rebuild_minutes=5, min_idle_hours=DEFAULT_AGE_HOURS,
                platform="macos"),
         Family("cua-recordings", HOME / "Library/Application Support/cua-ssh/recordings", True,
                "the CUA recorder can capture it again", depth=1, files=True,
                skip=("index.json", "manifest.json", "state.json", ".metadata_never_index", ".lock"),
-               owner="CUA recorder", rebuild_minutes=2, min_idle_hours=168.0, platform="macos"),
+               owner="CUA recorder", rebuild_minutes=2, min_idle_hours=DEFAULT_AGE_HOURS, platform="macos"),
         Family("cua-cache", HOME / "Library/Caches/cmux/cmux-cua", True,
                "the CUA client rebuilds its frame cache", depth=1, files=True,
                skip=("index.json", "manifest.json", "state.json", ".metadata_never_index", ".lock"),
-               owner="cmux CUA", rebuild_minutes=1, min_idle_hours=168.0, platform="macos"),
+               owner="cmux CUA", rebuild_minutes=1, min_idle_hours=DEFAULT_AGE_HOURS, platform="macos"),
     ]
     if (HOME / "Library/Caches" / CMUX_NEXT_CI_ROOT).is_dir():
-        roots.append(replace(cmux_next_ci_family(), min_idle_hours=168.0))
+        roots.append(replace(cmux_next_ci_family(), min_idle_hours=DEFAULT_AGE_HOURS))
     return [f for f in roots if f.root.is_dir()]
 
 
@@ -7682,7 +7700,7 @@ def _main_impl(argv: list[str] | None = None) -> int:
     ap.add_argument("--cmux-next-reservation-owner",
                     help="cmux-next drain: exact owner string in the active Glaeda reservation")
     ap.add_argument("--idle-hours", type=float, default=None,
-                    help="idle window (default 24h, or 6h under pressure)")
+                    help="idle window (default 12h, or 6h under pressure)")
     ap.add_argument("--family", action="append", help="limit to these family ids")
     ap.add_argument("--runner-caches", action="store_true",
                     help="use the narrow enrolled-runner account profile (macOS only)")
@@ -7936,7 +7954,7 @@ def _main_impl(argv: list[str] | None = None) -> int:
                 maintenance_handle.close()
             return result
         stale_marker_released = clear_stale_build_markers(a.receipt)
-    idle = a.idle_hours if a.idle_hours is not None else IDLE_SWEEP_HOURS if sweep else (6 if under else 24)
+    idle = a.idle_hours if a.idle_hours is not None else IDLE_SWEEP_HOURS if sweep else (6 if under else DEFAULT_AGE_HOURS)
     at, known, measured_at = (0.0, {}, {}) if a.refresh or a.no_snapshot else load_snapshot_meta()
     original_known = set(known)
     _REFRESH_PROGRESS_KNOWN = dict(known)
@@ -8069,8 +8087,9 @@ def _main_impl(argv: list[str] | None = None) -> int:
         if not RUNNER_CACHE_PROFILE and not a.cmux_next_drain \
                 and (not a.family or TMP_TEST_RESIDUE_FAMILY in a.family):
             logical_released += reap_tmpdir_test_residue(a.receipt, halt=halt)
-        # still under the runner gate's floor after every family: idle runners' whole checkouts, last
-        if a.pressure and not RUNNER_CACHE_PROFILE and not a.cmux_next_drain \
+        # idle runners' whole checkouts, last: stale ones on every pressure or sweep pass, younger ones only while
+        # still under the runner gate's floor after every family
+        if (a.pressure or sweep) and not RUNNER_CACHE_PROFILE and not a.cmux_next_drain \
                 and (not a.family or RUNNER_IDLE_CHECKOUT_FAMILY in a.family):
             logical_released += evict_idle_runner_checkouts(a.receipt, floor_gib)
         if last:

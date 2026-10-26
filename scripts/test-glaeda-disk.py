@@ -2910,14 +2910,14 @@ class GlaedaDiskTest(unittest.TestCase):
         fd = os.open(state / "build.lock", os.O_RDWR | os.O_CREAT, 0o600)
         self.addCleanup(os.close, fd)
         fcntl.flock(fd, fcntl.LOCK_EX)
-        v = {str(Path(i.path).relative_to(projects)): i.verdict for i in gd.survey([fam], 6, 0)}
+        v = {str(Path(i.path).relative_to(projects)): i.verdict for i in gd.survey([fam], 24, 0)}
         self.assertEqual(v["app/.glaeda/apple-build/cache/k1"], "kept")
         fcntl.flock(fd, fcntl.LOCK_UN)
         (state / "inflight.json").write_text("{}")
-        v = {str(Path(i.path).relative_to(projects)): i.verdict for i in gd.survey([fam], 6, 0)}
+        v = {str(Path(i.path).relative_to(projects)): i.verdict for i in gd.survey([fam], 24, 0)}
         self.assertEqual(v["app/.glaeda/apple-build/cache/k1"], "kept")
         (state / "inflight.json").unlink()
-        v = {str(Path(i.path).relative_to(projects)): i.verdict for i in gd.survey([fam], 6, 0)}
+        v = {str(Path(i.path).relative_to(projects)): i.verdict for i in gd.survey([fam], 24, 0)}
         self.assertEqual(v["app/.glaeda/apple-build/cache/k1"], "reclaimable")
 
     def test_checkout_builds_ignore_the_callers_git_dir(self) -> None:
@@ -3059,7 +3059,7 @@ class GlaedaDiskTest(unittest.TestCase):
         def verdicts(hold):
             with mock.patch.object(gd, "keep_live_app_clones", side_effect=not_newest), \
                     mock.patch.object(gd, "ACTIVITY_MODE", "pressure"), mock.patch.object(gd, "FLOOR_HOLD", hold):
-                return {Path(i.path).name: i.verdict for i in gd.survey([fam], 6, 0)}
+                return {Path(i.path).name: i.verdict for i in gd.survey([fam], 24, 0)}
         self.assertEqual(verdicts({}), {"code_sign_clone.Old1": "recent", "code_sign_clone.Old2": "recent"})
         self.assertEqual(verdicts({dev: 50 * gd.GIB}),
                          {"code_sign_clone.Old1": "reclaimable", "code_sign_clone.Old2": "reclaimable"})
@@ -3729,7 +3729,7 @@ class GlaedaDiskTest(unittest.TestCase):
         gd._DISCOVERED.clear()
         with mock.patch.object(gd, "HOME", home), mock.patch.object(gd, "process_evidence", return_value=([], "")), \
                 mock.patch.object(gd, "ACTIVITY_MODE", "pressure"), mock.patch.object(gd, "CMUX_NEXT_CI_OVER", gd.GIB):
-            v = {Path(i.path): i.verdict for i in gd.survey([fam], 6, 0)}
+            v = {Path(i.path): i.verdict for i in gd.survey([fam], 24, 0)}
         self.assertEqual(v[host], "recent")
         self.assertNotIn(host / "Release/xcode-2c2299e9015ce0c8", v)  # never a state root of its own
         # 35 GiB free: under the hold's 50 GiB stop, above the 30 GiB floor. Everything else goes; the host stays
@@ -3775,13 +3775,16 @@ class GlaedaDiskTest(unittest.TestCase):
             fcntl.flock(build, fcntl.LOCK_EX | fcntl.LOCK_NB)
             self.assertFalse(gd.remove_cmux_next_host(host))
         self.assertTrue((host / "src/.git").is_dir())
-        # idle 48 h: an idle sweep (no pressure, no floor) takes it, git clone and all; younger, it stays
+        # the newest warm compile cache per builder is exempt from age by role: an idle sweep (no pressure, no floor)
+        # never takes it, however old; a finite cmux_next_ci_host_idle_hours in disk-policy.json ages it again
         receipt = self.receipt()
-        for hours, gone in ((47.0, False), (49.0, True)):
+        for hours, gone, window in ((49.0, False, float("inf")), (500.0, False, float("inf")),
+                                    (47.0, False, 48.0), (49.0, True, 48.0)):
             self._age(host, hours=hours)
             gd._DISCOVERED.clear()
             with mock.patch.object(gd, "HOME", home), mock.patch.object(gd, "process_evidence", return_value=([], "")), \
                     mock.patch.object(gd, "command_lines", return_value=""), \
+                    mock.patch.dict(gd.POLICY, {"cmux_next_ci_host_idle_hours": window}), \
                     mock.patch.object(gd, "ACTIVITY_MODE", "sweep"), contextlib.redirect_stdout(io.StringIO()):
                 items = [i for i in gd.survey([fam], 6, 0) if Path(i.path) == host]
                 gd.apply(items, {fam.id: fam}, receipt, None, 6, all_families=[fam])
@@ -3799,7 +3802,7 @@ class GlaedaDiskTest(unittest.TestCase):
         with mock.patch.dict(gd.POLICY, {"cmux_next_ci_host_roots": []}):
             self.assertEqual(gd.cmux_next_ci_host_roots(fam.root), [])
         self.assertEqual(gd.POLICY_DEFAULTS["cmux_next_ci_host_roots"], ["dev-daily-release/host"])
-        self.assertEqual(gd.POLICY_DEFAULTS["cmux_next_ci_host_idle_hours"], 48.0)
+        self.assertEqual(gd.POLICY_DEFAULTS["cmux_next_ci_host_idle_hours"], float("inf"))
 
     def test_the_host_lock_keeps_its_inode_so_a_build_that_opened_it_still_excludes_others(self) -> None:
         # a build opened host/lock (fd 9) before the removal and flocks it after: a new lock file at the path would
@@ -4012,7 +4015,7 @@ class GlaedaDiskTest(unittest.TestCase):
             with mock.patch.object(gd, "HOME", home), \
                     mock.patch.object(gd, "process_evidence", return_value=([], worker)), \
                     mock.patch.object(gd, "ACTIVITY_MODE", mode), mock.patch.object(gd, "CMUX_NEXT_CI_OVER", over):
-                return {Path(i.path): (i.verdict, i.reasons) for i in gd.survey([fam], 6, 0)}
+                return {Path(i.path): (i.verdict, i.reasons) for i in gd.survey([fam], 24, 0)}
         # within the cap: the generated children alone, each waiting out the 72 h window
         v = verdicts(0)
         self.assertEqual(set(v), {s / "Build" for s in st.values()})
@@ -4048,7 +4051,7 @@ class GlaedaDiskTest(unittest.TestCase):
         with mock.patch.object(gd, "HOME", home), \
                 mock.patch.object(gd, "process_evidence", return_value=([os.fspath(st["release-new"])], xcodebuild)), \
                 mock.patch.object(gd, "ACTIVITY_MODE", "pressure"), mock.patch.object(gd, "CMUX_NEXT_CI_OVER", gd.GIB):
-            v = {Path(i.path): (i.verdict, i.reasons) for i in gd.survey([fam], 6, 0)}
+            v = {Path(i.path): (i.verdict, i.reasons) for i in gd.survey([fam], 24, 0)}
         self.assertEqual(v[st["release-old"]][0], "in-use")
         self.assertIn("active or ambiguous marker", v[st["release-old"]][1][0])
         self.assertEqual(v[st["gone-runner"]][0], "in-use")
@@ -4063,7 +4066,7 @@ class GlaedaDiskTest(unittest.TestCase):
         gd._DISCOVERED.clear()
         with mock.patch.object(gd, "HOME", home), mock.patch.object(gd, "process_evidence", return_value=([], "")), \
                 mock.patch.object(gd, "ACTIVITY_MODE", "pressure"), mock.patch.object(gd, "CMUX_NEXT_CI_OVER", gd.GIB):
-            paths = {Path(i.path) for i in gd.survey([fam], 6, 0)}
+            paths = {Path(i.path) for i in gd.survey([fam], 24, 0)}
         for key in ("gone-runner", "release-old"):
             self.assertIn(st[key] / "Build", paths)
             self.assertNotIn(st[key], paths)
@@ -4488,6 +4491,46 @@ class GlaedaDiskTest(unittest.TestCase):
             self.assertEqual(gd.evict_idle_runner_checkouts(self.receipt(), 0.0, home), 0)  # no runner floor
         self.assertEqual(removed, [])
         self.assertTrue(all(c.is_dir() for c in cos.values()))
+
+    def test_stale_runner_checkouts_go_above_the_floor_and_without_one(self) -> None:
+        """Old runner work dirs go by age: a checkout no job used for DEFAULT_AGE_HOURS goes whatever the free space,
+        oldest first and every one of them; younger ones stay above the floor."""
+        stale = gd.RUNNER_STALE_CHECKOUT_HOURS
+        self.assertEqual(stale, 12.0)
+        home, cos = self._idle_checkouts({"actions-runner-glaeda": stale + 1, "actions-runner-glaeda-2": stale + 30,
+                                          "actions-runner-glaeda-3": stale - 1})
+        gd.process_evidence = lambda: ([], "")
+        for floor in (30.0, 0.0):
+            with self.subTest(floor=floor):
+                patches, removed = self._floor_disk(400.0)  # far above the floor and its target
+                receipt = self.receipt()
+                with patches[0], patches[1], contextlib.redirect_stdout(io.StringIO()) as out:
+                    self.assertGreater(gd.evict_idle_runner_checkouts(receipt, floor, home), 0)
+                self.assertEqual(sorted(removed), sorted([str(cos["actions-runner-glaeda-2"]), str(cos["actions-runner-glaeda"])]))
+                self.assertTrue(cos["actions-runner-glaeda-3"].is_dir())
+                self.assertIn("unused for 12 h", out.getvalue())
+                recs = [json.loads(line) for line in receipt.read_text().splitlines()]
+                self.assertEqual({r["reasons"][0] for r in recs}, {"unused for 12 h"})
+                for name in ("actions-runner-glaeda", "actions-runner-glaeda-2"):  # back for the next floor
+                    (cos[name] / ".git").mkdir(parents=True)
+                    self._age(home / name, hours=stale + 1)
+
+    def test_every_disposable_age_is_twelve_hours(self) -> None:
+        """Leo, 2026-10-26: "When have we ever had something useful greater than 12 hours?" Only the newest warm
+        compile cache per builder (the per-host cmux-next root) is exempt, by role."""
+        self.assertEqual(gd.DEFAULT_AGE_HOURS, 12.0)
+        for name in ("KEPT_BUILD_IDLE_HOURS", "IDLE_SWEEP_HOURS", "IDLE_SEED_HOURS", "PARKED_NO_LOG_IDLE_HOURS",
+                     "CMUX_NEXT_CI_MIN_IDLE_HOURS", "CANONICAL_ADMISSION_IDLE_HOURS", "CHECKOUT_BUILD_IDLE_HOURS",
+                     "TMP_TEST_RESIDUE_IDLE_HOURS", "RUNNER_STALE_CHECKOUT_HOURS"):
+            with self.subTest(name):
+                self.assertEqual(getattr(gd, name), 12.0)
+        self.assertEqual(gd.RUNTIME_IDLE_DAYS * 24, 12.0)
+        for key in ("soft_idle_hours", "stale_marker_max_hours"):
+            self.assertEqual(gd.POLICY_DEFAULTS[key], 12.0, key)
+        self.assertEqual(gd.POLICY_DEFAULTS["cmux_next_ci_host_idle_hours"], float("inf"))
+        for fam in [*gd.default_families(), *gd.runner_cache_families()]:
+            with self.subTest(fam.id):
+                self.assertLessEqual(fam.min_idle_hours, 12.0)
 
     def test_idle_runner_checkouts_go_between_the_floor_and_the_gates_resume_mark(self) -> None:
         # the gate holds until floor + 2 GiB; at 31 GiB it still holds, so the last resort still acts
