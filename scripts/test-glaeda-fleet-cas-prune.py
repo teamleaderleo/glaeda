@@ -250,5 +250,19 @@ class PruneTest(unittest.TestCase):
         with mock.patch.object(fp.importlib.machinery, "SourceFileLoader", side_effect=OSError("gone")):
             self.assertIn("kept as reserved", real())
 
+    def test_in_flight_daemon_temporaries_are_never_removed(self) -> None:
+        self.env()
+        paths = self.node(6)
+        shard = paths[1].parent
+        tmp = shard / f"{paths[1].name}.tmp4242.7"  # fleet-cas write_atomic: name.tmp<pid>.<seq>, renamed when done
+        tmp.write_bytes(b"\0" * (1 << 20))
+        old = time.time() - 30 * 86400
+        os.utime(tmp, (old, old))
+        self.assertNotIn(str(tmp), [p for _, _, p in fp.node_files(self.root / "node-store")])
+        self.run_main("--apply", "--node-gib", "0")
+        self.assertTrue(tmp.exists(), "an in-flight write was unlinked")
+        self.assertFalse(any(p.exists() for p in paths if "/cas/" in str(p)), "the finished objects still go")
+
+
 if __name__ == "__main__":
     unittest.main()
