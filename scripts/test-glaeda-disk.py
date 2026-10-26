@@ -3275,6 +3275,9 @@ class GlaedaDiskTest(unittest.TestCase):
 
     def test_a_stale_root_the_cap_takes_is_put_back_when_its_tree_turns_busy(self) -> None:
         home, fam, st = self._cmux_next_cap_tree()
+        vetted = mock.patch.dict(gd.CMUX_NEXT_CI_VETTED_OWNER, {st["gone-runner"]: None})
+        vetted.start()
+        self.addCleanup(vetted.stop)
         doomed = st["gone-runner"].with_name(f"{gd.DELETING_PREFIX}{st['gone-runner'].name}-{os.getpid()}")
         recheck = gd.cmux_next_ci_slot_recheck(fam, st["gone-runner"], floor=False)
         os.rename(st["gone-runner"], doomed)
@@ -3290,6 +3293,63 @@ class GlaedaDiskTest(unittest.TestCase):
                 mock.patch.object(gd, "free_bytes", return_value=(400 * gd.GIB, 460 * gd.GIB)):
             recheck()  # idle, and no floor stop applies to the cap's stale root: remove() deletes it
         self.assertTrue(doomed.is_dir())
+
+    def test_an_unreadable_directory_in_a_slot_counts_as_holding_a_socket(self) -> None:
+        if os.geteuid() == 0:
+            self.skipTest("root reads any directory")
+        home, fam, st = self._cmux_next_cap_tree()
+        build = st["mini-glaeda"] / "Build"
+        build.chmod(0)
+        try:
+            self.assertTrue(gd.cmux_next_ci_holds_socket(st["mini-glaeda"]))
+        finally:
+            build.chmod(0o755)
+        self.assertFalse(gd.cmux_next_ci_holds_socket(st["mini-glaeda"]))
+
+    def test_a_blank_agent_name_leaves_the_roster_incomplete(self) -> None:
+        home, fam, st = self._cmux_next_cap_tree()
+        (home / "actions-runner-glaeda-2/.runner").write_text(json.dumps({"agentName": " "}), encoding="utf-8-sig")
+        with mock.patch.object(gd, "HOME", home):
+            names, complete, _ = gd.enrolled_runner_roster()
+            self.assertNotIn(" ", names)
+            self.assertFalse(complete)
+            self.assertEqual(gd.cmux_next_ci_owner(st["mini-glaeda-2"], fam.root), gd.OWNER_UNKNOWN)
+
+    def test_a_slot_is_not_deleted_beside_a_new_one_when_free_space_cannot_be_read(self) -> None:
+        home, fam, st = self._cmux_next_cap_tree()
+        slot, runner = st["mini-glaeda"], home / "actions-runner-glaeda"
+        doomed = slot.with_name(f"{gd.DELETING_PREFIX}{slot.name}-{os.getpid()}")
+        with mock.patch.object(gd, "HOME", home), \
+                mock.patch.object(gd, "FLOOR_HOLD", {slot.parent.stat().st_dev: 50 * gd.GIB}), \
+                mock.patch.dict(gd.CMUX_NEXT_CI_VETTED_OWNER, {slot: runner}), \
+                mock.patch.object(gd, "process_evidence", return_value=([], "")):
+            recheck = gd.cmux_next_ci_slot_recheck(fam, slot, floor=True)
+            os.rename(slot, doomed)
+            slot.mkdir()  # a new slot stands at the path
+            with mock.patch.object(gd, "free_bytes", side_effect=OSError(errno.EIO, "unreadable")), \
+                    self.assertRaises(gd.SlotNotNeeded):
+                recheck()
+        self.assertTrue((doomed / "SourcePackages").is_dir())  # left aside, not handed to remove()
+
+    def test_a_slot_whose_runner_is_renamed_after_its_veto_is_put_back(self) -> None:
+        home, fam, st = self._cmux_next_cap_tree()
+        slot, runner = st["mini-glaeda"], home / "actions-runner-glaeda"
+        doomed = slot.with_name(f"{gd.DELETING_PREFIX}{slot.name}-{os.getpid()}")
+        worker = f"{runner}/bin/Runner.Worker spawnclient 1 2\n"
+        with mock.patch.object(gd, "HOME", home), \
+                mock.patch.object(gd, "FLOOR_HOLD", {slot.parent.stat().st_dev: 50 * gd.GIB}), \
+                mock.patch.object(gd, "free_bytes", return_value=(10 * gd.GIB, 460 * gd.GIB)), \
+                mock.patch.dict(gd.CMUX_NEXT_CI_VETTED_OWNER, {}):
+            self.assertEqual(gd.cmux_next_ci_busy(fam, slot, [], ""), "")  # vetted under runner 1
+            recheck = gd.cmux_next_ci_slot_recheck(fam, slot, floor=True)
+            os.rename(slot, doomed)
+            # runner 1 is re-registered under another name while its old Runner.Worker still runs
+            (runner / ".runner").write_text(json.dumps({"agentName": "renamed"}), encoding="utf-8-sig")
+            self.assertIsNone(gd.cmux_next_ci_owner(slot, fam.root))
+            with mock.patch.object(gd, "process_evidence", return_value=([], worker)), \
+                    self.assertRaises(gd.SlotTaken):
+                recheck()
+        self.assertTrue((slot / "SourcePackages").is_dir())  # put back
 
     def test_no_state_parent_is_found_through_a_symlink(self) -> None:
         home, fam, st = self._cmux_next_cap_tree()

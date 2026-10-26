@@ -6159,15 +6159,15 @@ def runner_work_folder(runner: Path) -> Path:
 
 def enrolled_runner_roster() -> tuple[dict[str, Path], bool, dict[Path, Path]]:
     """From one read of each enrolled runner's .runner: agentName -> runner directory, whether every one named its
-    agent (while one cannot be read, mid-write or malformed, a state no name matches may be its), and each named
-    runner's work folder (runner_work_folder) from that same read."""
+    agent (while one cannot be read, mid-write, malformed or with a blank name, a state no name matches may be its),
+    and each named runner's work folder (runner_work_folder) from that same read."""
     names: dict[str, Path] = {}
     work: dict[Path, Path] = {}
     complete = True
     for runner in enrolled_runners():
         config = runner_config(runner)
         name = config.get("agentName")
-        if isinstance(name, str):
+        if isinstance(name, str) and name.strip():
             names.setdefault(name, runner)
             folder = config.get("workFolder")
             work[runner] = runner / (folder if isinstance(folder, str) and folder else "_work")
@@ -6206,6 +6206,10 @@ def cmux_next_ci_release_keys(roster: tuple[dict[str, Path], bool, dict[Path, Pa
 # cmux_next_ci_owner's answer while an enrolled runner's .runner cannot be read: the state may be that runner's.
 # Not None, so nothing takes the state as unowned, and every in-use veto refuses it (cmux_next_ci_busy).
 OWNER_UNKNOWN = Path("/nonexistent/glaeda-disk-owner-unknown")
+
+# state root -> the owner cmux_next_ci_busy last vetted it under. A slot's post-rename recheck holds its runner to
+# that one: a .runner rewritten in between (re-registered, renamed) would otherwise drop the old Runner.Worker.
+CMUX_NEXT_CI_VETTED_OWNER: dict[Path, Path | None] = {}
 
 
 def cmux_next_ci_owner(state: Path, root: Path) -> Path | None:
@@ -6258,13 +6262,14 @@ def cmux_next_ci_floor_slots(root: Path) -> list[Path]:
     return [s for s in cmux_next_ci_state_roots(root) if cmux_next_ci_owner(s, root) is not None]
 
 
-def floor_stop_unmet(path: Path) -> bool:
-    """Whether free space on PATH's filesystem is still under the floor hold's stop."""
+def floor_stop_unmet(path: Path) -> bool | None:
+    """Whether free space on PATH's filesystem is still under the floor hold's stop; None when it cannot be read
+    (falsy, so nothing more is taken for the floor, and never proof the stop was met)."""
     try:
         stop = FLOOR_HOLD.get(path.parent.stat().st_dev)
         return stop is not None and free_bytes(path.parent)[0] < stop
     except OSError:
-        return False
+        return None
 
 
 RENAME_EXCL = 0x4  # macOS renamex_np: fail with EEXIST if the destination exists
@@ -6306,6 +6311,7 @@ def cmux_next_ci_slot_recheck(fam: Family, path: Path, floor: bool = True):
     space is read again after that evidence too: a slot no longer needed for the floor hold goes back as well
     (FLOOR: the floor hold took it; a stale root the cap takes whole has no stop)."""
     doomed = path.with_name(f"{DELETING_PREFIX}{path.name}-{os.getpid()}")
+    vetted = CMUX_NEXT_CI_VETTED_OWNER.get(path, OWNER_UNKNOWN)  # never vetted: whose it is is unknown
 
     def recheck() -> None:
         runner = cmux_next_ci_owner(path, fam.root)
@@ -6313,15 +6319,17 @@ def cmux_next_ci_slot_recheck(fam: Family, path: Path, floor: bool = True):
             opened, cmds = process_evidence()
         except NoEvidence:
             opened, cmds = None, ""
-        taken = (opened is None or runner == OWNER_UNKNOWN or (runner is not None and runner_job_live(runner, cmds))
+        taken = (opened is None or OWNER_UNKNOWN in (runner, vetted) or runner != vetted
+                 or (runner is not None and runner_job_live(runner, cmds))
                  or in_cwd(os.fspath(doomed), open_index(opened)) or named_by(os.fspath(path), cmds)
                  or named_by(os.fspath(doomed), cmds) or bool(cmux_next_ci_tree_busy(doomed)))
-        if not taken and (not floor or floor_stop_unmet(path)):
+        unmet = floor_stop_unmet(path) if floor else True
+        if not taken and unmet:
             return  # nobody's, and still needed: remove() deletes it
         try:
             rename_noreplace(doomed, path)
         except OSError as e:
-            if not taken and e.errno in (errno.EEXIST, errno.ENOTEMPTY) and os.path.lexists(path):
+            if not taken and unmet is False and e.errno in (errno.EEXIST, errno.ENOTEMPTY) and os.path.lexists(path):
                 return  # the floor was met, but a new slot stands at the path: the detached one is nobody's
             # in use, or the rename back failed for another reason: the detached tree stays aside, never deleted
             # from here (interrupted-deletions finishes it once this pid is gone and its own vetoes pass)
@@ -6456,6 +6464,7 @@ def cmux_next_ci_busy(fam: Family, path: Path, opened: list[str] | frozenset[str
     if state is None:
         return "cmux-next state root is no longer validated"
     runner = cmux_next_ci_owner(state, fam.root)
+    CMUX_NEXT_CI_VETTED_OWNER[state] = runner
     if runner == OWNER_UNKNOWN:
         return "an enrolled runner's .runner names no agent: whose cmux-next state this is is unknown"
     if runner is not None and (why := runner_job_live(runner, commands)):
@@ -6474,7 +6483,7 @@ CMUX_NEXT_CI_TOOL_CACHES = frozenset({"ModuleCache.noindex", "SDKStatCaches.noin
 
 def cmux_next_ci_holds_socket(state: Path, budget: int = 3000) -> bool:
     """holds_socket for a cmux-next state, two levels down as holds_socket, failing closed: a tree it cannot
-    finish within `budget` entries counts as holding one. The tools' caches (CMUX_NEXT_CI_TOOL_CACHES) are not
+    finish within `budget` entries, or a directory it cannot read, counts as holding one. The tools' caches (CMUX_NEXT_CI_TOOL_CACHES) are not
     listed, so a real slot's width alone never makes it busy."""
     frontier = [state]
     for depth in range(2):
@@ -6488,14 +6497,16 @@ def cmux_next_ci_holds_socket(state: Path, budget: int = 3000) -> bool:
                             return True
                         try:
                             st = e.stat(follow_symlinks=False)
-                        except OSError:
+                        except FileNotFoundError:
                             continue
                         if stat.S_ISSOCK(st.st_mode):
                             return True
                         if stat.S_ISDIR(st.st_mode) and not (depth == 0 and e.name in CMUX_NEXT_CI_TOOL_CACHES):
                             nxt.append(Path(e.path))
+            except FileNotFoundError:
+                continue  # gone since it was listed
             except OSError:
-                continue
+                return True  # unreadable: a socket in it cannot be ruled out
         frontier = nxt
     return False
 
