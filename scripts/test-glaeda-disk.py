@@ -3294,6 +3294,17 @@ class GlaedaDiskTest(unittest.TestCase):
             recheck()  # idle, and no floor stop applies to the cap's stale root: remove() deletes it
         self.assertTrue(doomed.is_dir())
 
+    def test_a_drain_lists_no_whole_slot(self) -> None:
+        home, fam, st = self._cmux_next_cap_tree()
+        with mock.patch.object(gd, "HOME", home), \
+                mock.patch.object(gd, "FLOOR_HOLD", {fam.root.stat().st_dev: 50 * gd.GIB}):
+            self.assertIn(st["mini-glaeda"], gd.cmux_next_ci_floor_slots(fam.root))
+            with mock.patch.object(gd, "CMUX_NEXT_CI_DRAIN", True), mock.patch.dict(gd._DISCOVERED, {}, clear=True):
+                self.assertEqual(gd.cmux_next_ci_floor_slots(fam.root), [])
+                listed = gd.candidates(fam)
+                self.assertFalse(set(listed) & set(gd.cmux_next_ci_state_roots(fam.root)))
+                self.assertIn(st["mini-glaeda"] / "Build", listed)
+
     def test_an_unreadable_directory_in_a_slot_counts_as_holding_a_socket(self) -> None:
         if os.geteuid() == 0:
             self.skipTest("root reads any directory")

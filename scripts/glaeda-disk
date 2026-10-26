@@ -4474,7 +4474,7 @@ def candidates(fam: Family) -> list[Path]:
         level = list(_DISCOVERED[key])
     elif fam.checkout_builds:
         key = (f"checkout-builds:{fam.id}:" + os.fspath(fam.root) + (":over-cap" if cmux_next_ci_over() else "")
-               + (":floor" if FLOOR_HOLD else ""))
+               + (":floor" if FLOOR_HOLD else "") + (":drain" if CMUX_NEXT_CI_DRAIN else ""))
         if key not in _DISCOVERED:
             _DISCOVERED[key] = (cmux_next_ci_generated_paths(fam.root, whole_stale=True)
                                 if fam.id == CMUX_NEXT_CI_FAMILY and cmux_next_ci_over()
@@ -6254,6 +6254,8 @@ def cmux_next_ci_floor_slots(root: Path) -> list[Path]:
     recently used first, only up to the floor hold's stop, and under every in-use veto (cmux_next_ci_busy: the
     runner's Runner.Worker, a process naming or open in it, a marker, an unknown child). cmux14, 2026-10-25: 115
     GiB of cmux-next-ci, 10.8 GiB free under a 30 GiB floor, Swift compiles refused."""
+    if CMUX_NEXT_CI_DRAIN:
+        return []  # a drain takes generated output only (cmux_next_ci_floor_slot): never a slot's inputs
     try:
         if root.stat().st_dev not in FLOOR_HOLD:
             return []
