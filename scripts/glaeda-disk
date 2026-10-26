@@ -601,7 +601,7 @@ CMUX_NEXT_DRAIN_HOOK_SHA256 = frozenset({
     "ebd2ebff13a12fb4038187d5398a61fe6509ead3b58b2f0aa561e1fa80cbcb7e",
     "9809f36fece71390cf0070407c0d2d960b9a9c2c825581ed478a297a89ec3129",
     "d5e73be990d67d9499ff352d01fda2e1392a6fd257a57770b23008b3bf55fb59",
-    "4a3acc03234e495fae3e95b0e807682b23ae6ce2d7fe2862e88e5440649ebb88",
+    "3364056931a7465c795c9cdfc22882d99ac150de39c03096ca96f6a496b61bf2",
 })
 CMUX_NEXT_CI_PRESERVED_NAMES = frozenset({
     "SourcePackages", "ModuleCache.noindex", "SDKStatCaches.noindex",
@@ -7974,7 +7974,7 @@ def write_run_line(started: float, free_before: int | None) -> None:
         return None if b is None else round(b / GIB, 1)
     row = {"at": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "host": platform.node(), "mode": RUN.get("mode"),
            "off": bool(RUN.get("off")), "free_gib_before": g(free_before), "free_gib_after": g(after),
-           "target_gib": RUN.get("target_gib"), "floor_gib": RUN.get("floor_gib"),
+           "target_gib": RUN.get("target_gib"), "target_bytes": target, "floor_gib": RUN.get("floor_gib"),
            "reclaimed_gib": round(RUN.get("released", 0) / GIB, 1),
            "reached": None if target is None or after is None else after >= target,
            "blocked": RUN.get("blocked", {}), "duration_s": round(time.time() - started, 1),

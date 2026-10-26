@@ -4172,6 +4172,7 @@ class GlaedaDiskTest(unittest.TestCase):
             self.assertIn(key, row)
         self.assertEqual((row["mode"], row["off"], row["skipped"]), ("pressure", False, None))
         self.assertEqual((row["free_gib_before"], row["target_gib"], row["floor_gib"]), (20.0, 170.0, 30.0))
+        self.assertEqual(row["target_bytes"], 170 * gd.GIB)  # exact: the runner hook skips at it
         self.assertEqual(row["reclaimed_gib"], 3.0)
         self.assertFalse(row["reached"])
         self.assertEqual(row["blocked"], {"code-sign-clones": 12.0})

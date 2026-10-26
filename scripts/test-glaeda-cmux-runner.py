@@ -3665,9 +3665,10 @@ class DiskPassCoalesceTest(unittest.TestCase):
         self.runs = self.dir / "runs"
         self.overlap = self.dir / "overlap"
 
-    def fake_disk(self, seconds: float = 0.0, triggers_on_first: int = 0) -> Path:
+    def fake_disk(self, seconds: float = 0.0, triggers_on_first: int = 0, busy_first: bool = False,
+                  trigger_every: bool = False) -> Path:
         """A glaeda-disk that records each run, notes any overlap with another, and on its first run can stand in
-        for triggers arriving mid-pass (writes the pending trigger as a hook would)."""
+        for triggers arriving mid-pass (writes the pending trigger as a hook would) or skip as eviction_busy."""
         return make_executable(self.dir / "glaeda-disk", "import os, pathlib, time\n"
                                f"runs, overlap = pathlib.Path({os.fspath(self.runs)!r}), "
                                f"pathlib.Path({os.fspath(self.overlap)!r})\n"
@@ -3678,12 +3679,15 @@ class DiskPassCoalesceTest(unittest.TestCase):
                                "with runs.open('a') as f:\n    f.write(f'{time.monotonic()}\\n')\n"
                                f"if n == 0:\n    for _ in range({triggers_on_first}):\n"
                                f"        pathlib.Path({os.fspath(self.pending)!r}).touch()\n"
+                               f"if n == 0 and {busy_first!r}:\n"
+                               "    print('another eviction running; skipped (pid 1)')\n"
+                               f"if {trigger_every!r}:\n    pathlib.Path({os.fspath(self.pending)!r}).touch()\n"
                                f"time.sleep({seconds})\n"
                                "running.unlink()\n")
 
-    def bound(self, disk: Path, timeout: float = 30) -> subprocess.Popen:
-        return subprocess.Popen([sys.executable, "-c", hook.DISK_BOUND, f"{timeout:g}", os.fspath(self.lock),
-                                 os.fspath(self.pending), os.fspath(self.log), os.fspath(hook.evict_lock_path()),
+    def bound(self, disk: Path, timeout: float = 30, lifetime: float = 120, lock: Path | None = None) -> subprocess.Popen:
+        return subprocess.Popen([sys.executable, "-c", hook.DISK_BOUND, f"{timeout:g}", f"{lifetime:g}",
+                                 os.fspath(lock or self.lock), os.fspath(self.pending), os.fspath(hook.evict_lock_path()),
                                  sys.executable, os.fspath(disk), "--pressure", "--apply", "--top", "0"],
                                 env={**os.environ, "HOME": os.fspath(self.dir)})
 
@@ -3693,19 +3697,36 @@ class DiskPassCoalesceTest(unittest.TestCase):
     def logged(self) -> list[str]:
         return [json.loads(line).get("skipped") for line in self.log.read_text().splitlines()] if self.log.exists() else []
 
+    @staticmethod
+    def row(target_gib: float | None = None, target_bytes: int | None = None, mode: str = "pressure",
+            skipped: str | None = None, age_s: float = 60) -> str:
+        at = time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(time.time() - age_s))
+        return json.dumps({"at": at, "mode": mode, "target_gib": target_gib, "target_bytes": target_bytes,
+                           "skipped": skipped}) + "\n"
+
     def write_target(self, gib: float) -> None:
         self.log.parent.mkdir(parents=True, exist_ok=True)
-        self.log.write_text(json.dumps({"mode": "pressure", "target_gib": gib, "skipped": None}) + "\n")
+        self.log.write_text(self.row(target_bytes=int(gib * 1024**3) or 1))
 
-    def test_the_bound_skips_above_the_same_mark_as_the_hook(self) -> None:
-        self.assertIn(f'"{hook.HOOK_SKIP_ABOVE_TARGET}"', hook.DISK_BOUND)
+    def test_the_bound_is_spared_as_glaedas_own(self) -> None:
         self.assertIn("glaeda-disk-bound", hook.DISK_BOUND.splitlines()[0])  # leftover_spared reads it
 
-    def test_target_is_glaeda_disks_latest_recorded_target(self) -> None:
+    def test_target_is_glaeda_disks_newest_own_pressure_line(self) -> None:
         self.assertIsNone(hook.disk_target_gib())
         self.log.parent.mkdir(parents=True, exist_ok=True)
-        self.log.write_text('{"target_gib": 100.0}\nnot json\n{"target_gib": 170.0}\n{"target_gib": null}\n')
-        self.assertEqual(hook.disk_target_gib(), 170.0)
+        gib = 1024**3
+        self.log.write_text(self.row(target_bytes=100 * gib) + "not json\n" + self.row(target_bytes=170 * gib)
+                            + self.row(target_gib=90.0, mode="idle")
+                            + self.row(target_gib=50.0, skipped=hook.HOOK_SKIP_ABOVE_TARGET)
+                            + self.row(target_gib=50.0, skipped=hook.HOOK_SKIP_COALESCED))
+        self.assertEqual(hook.disk_target_gib(), 170.0)  # the idle line and the hook's own lines are passed over
+        self.log.write_text(self.row(target_gib=170.0))  # an older glaeda-disk: rounded to 0.1 GiB
+        self.assertAlmostEqual(hook.disk_target_gib(), 170.0 + hook.DISK_TARGET_ROUNDING_GIB)
+        self.log.write_text(self.row(target_bytes=100 * gib, age_s=hook.DISK_TARGET_MAX_AGE_S + 60))
+        self.assertIsNone(hook.disk_target_gib(), "a stale target must not skip a pass")
+        self.log.write_text(self.row(target_bytes=100 * gib, age_s=hook.DISK_TARGET_MAX_AGE_S + 60)
+                            + self.row(target_bytes=None))
+        self.assertIsNone(hook.disk_target_gib(), "an older line never stands in for the newest")
 
     def test_a_trigger_above_target_is_skipped_without_a_pass(self) -> None:
         disk = self.fake_disk()
@@ -3740,14 +3761,14 @@ class DiskPassCoalesceTest(unittest.TestCase):
         self.assertFalse(self.pending.exists())
 
     def test_a_second_bound_never_overlaps_the_first(self) -> None:
-        disk = self.fake_disk(seconds=1.5, triggers_on_first=1)
+        disk = self.fake_disk(seconds=4, triggers_on_first=1)
         self.pending.touch()
         first = self.bound(disk)
         self.assertTrue(wait_for_path(self.runs))
         self.pending.touch()
         start = time.monotonic()
         self.assertEqual(self.bound(disk).wait(30), 0)
-        self.assertLess(time.monotonic() - start, 1.4, "the second bound waited instead of leaving the pass to the first")
+        self.assertLess(time.monotonic() - start, 3.5, "the second bound waited instead of leaving the pass to the first")
         self.assertEqual(first.wait(30), 0)
         self.assertFalse(self.overlap.exists(), "two passes ran at once")
         self.assertEqual(self.run_count(), 2)
@@ -3769,14 +3790,38 @@ class DiskPassCoalesceTest(unittest.TestCase):
             time.sleep(0.05)
         self.assertEqual(self.run_count(), 2)
 
-    def test_a_follow_up_above_target_is_skipped(self) -> None:
-        disk = self.fake_disk()
-        self.write_target(0.001)
+    def test_a_pass_skipped_as_busy_keeps_its_trigger(self) -> None:
+        disk = self.fake_disk(busy_first=True)
         self.pending.touch()
         self.assertEqual(self.bound(disk).wait(30), 0)
-        self.assertEqual(self.run_count(), 0)
-        self.assertEqual(self.logged()[-1], hook.HOOK_SKIP_ABOVE_TARGET)
+        self.assertEqual(self.run_count(), 2, "the trigger a busy pass did not serve was dropped")
         self.assertFalse(self.pending.exists())
+
+    def test_the_bound_never_runs_a_pass_without_its_lock(self) -> None:
+        disk = self.fake_disk()
+        self.pending.touch()
+        self.assertEqual(self.bound(disk, lock=self.dir / "missing" / "hook-pass.lock").wait(30), 0)
+        self.assertEqual(self.run_count(), 0)
+        self.assertTrue(self.pending.exists(), "the trigger stays for a bound that can lock")
+
+    def test_the_bound_has_one_lifetime_and_leaves_the_trigger_after_it(self) -> None:
+        disk = self.fake_disk(seconds=0.5, trigger_every=True)  # a trigger during every pass, without end
+        self.pending.touch()
+        start = time.monotonic()
+        self.assertEqual(self.bound(disk, timeout=10, lifetime=3).wait(30), 0)
+        self.assertLess(time.monotonic() - start, 10)
+        self.assertGreaterEqual(self.run_count(), 2)
+        self.assertTrue(self.pending.exists(), "the next trigger's bound serves what this one left")
+        self.assertFalse(self.overlap.exists())
+
+    def test_a_pass_that_could_not_start_keeps_its_trigger(self) -> None:
+        disk = self.fake_disk()
+        self.pending.touch()
+        with hook.evict_lock_path().open("a") as held:  # another eviction past this bound's whole lifetime
+            fcntl.flock(held, fcntl.LOCK_EX)
+            self.assertEqual(self.bound(disk, timeout=1, lifetime=2.5).wait(30), 0)
+        self.assertEqual(self.run_count(), 0)
+        self.assertTrue(self.pending.exists())
 
     def test_a_pass_waits_for_another_evict_lock_holder(self) -> None:
         """A pass started while the gate's or the LaunchAgent's glaeda-disk holds evict.lock would only skip as
