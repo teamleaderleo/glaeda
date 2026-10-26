@@ -3314,6 +3314,36 @@ class GlaedaDiskTest(unittest.TestCase):
             self._registered_long_ago(runner / ".runner")
             self.assertIsNone(gd.cmux_next_ci_owner(st["mini-glaeda"], fam.root))  # a job's timeout later: gone
 
+    def test_a_runner_whose_config_went_missing_just_now_is_not_known_gone(self) -> None:
+        home, fam, st = self._cmux_next_cap_tree()
+        runner = home / "actions-runner-glaeda-2"
+        (runner / ".runner").unlink()  # mid re-registration: its old Runner.Worker may still use its state
+        with mock.patch.object(gd, "HOME", home):
+            self.assertEqual(gd.cmux_next_ci_owner(st["mini-glaeda-2"], fam.root), gd.OWNER_UNKNOWN)
+            self.assertNotIn(st["mini-glaeda-2"], gd.cmux_next_ci_stale_roots(fam.root))
+            self._registered_long_ago(runner)  # removed a job's timeout ago: gone
+            self.assertIsNone(gd.cmux_next_ci_owner(st["mini-glaeda-2"], fam.root))
+
+    def test_an_aside_slot_finished_counts_against_the_cap(self) -> None:
+        home, fam, st = self._cmux_next_cap_tree()
+        aside = st["gone-runner"].with_name(f"{gd.DELETING_PREFIX}gone-runner-999999")
+        os.rename(st["gone-runner"], aside)
+        self._age(aside, hours=30)
+        with mock.patch.object(gd, "HOME", home), mock.patch.object(gd, "ACTIVITY_MODE", "pressure"), \
+                mock.patch.object(gd, "CMUX_NEXT_CI_OVER", 1), mock.patch.object(gd, "process_evidence", return_value=([], "")), \
+                mock.patch.object(gd, "command_lines", return_value=""), contextlib.redirect_stdout(io.StringIO()):
+            gd._DISCOVERED.clear()
+            fams = [fam] + [f for f in gd.interrupted_families([fam]) if f.root == aside.parent]
+            items = gd.survey(fams, 6, 0)
+            by_path = {Path(i.path): i for i in items}
+            self.assertIn(aside, by_path)
+            for i in items:  # the aside first, then the cap's young output
+                i.verdict = "reclaimable" if Path(i.path) in (aside, st["mini-glaeda"] / "Build") else "blocked"
+            items.sort(key=lambda i: Path(i.path) != aside)
+            gd.apply(items, {f.id: f for f in fams}, self.receipt(), None, 6, all_families=fams)
+        self.assertFalse(aside.exists())
+        self.assertTrue((st["mini-glaeda"] / "Build").exists())  # the aside's bytes already met the cap
+
     def test_a_drain_lists_no_whole_slot(self) -> None:
         home, fam, st = self._cmux_next_cap_tree()
         with mock.patch.object(gd, "HOME", home), \

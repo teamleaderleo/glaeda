@@ -6030,6 +6030,9 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
                         else:
                             taken_in[p.parent] = taken_in.get(p.parent, 0) + took
                         cap_left -= took
+                    elif gone and fam.id == INTERRUPTED and p.parent in cmux_next_ci_state_parents(
+                            HOME / "Library/Caches" / CMUX_NEXT_CI_ROOT):
+                        cap_left -= took  # an aside slot was part of the cache the cap measured
                     released += took if gone else 0
                 if common:  # drop the deleted worktree's record from its repository
                     subprocess.run(["git", "--git-dir", common, "worktree", "prune"],
@@ -6161,12 +6164,19 @@ def enrolled_runner_roster() -> tuple[dict[str, Path], bool, dict[Path, Path]]:
     """From one read of each enrolled runner's .runner: agentName -> runner directory, whether every one named its
     agent (while one cannot be read, mid-write, malformed or with a blank name, a state no name matches may be its),
     and each named runner's work folder (runner_work_folder) from that same read. A .runner rewritten within a
-    job's timeout (cmux_next_ci_unowned_idle_hours) leaves the roster incomplete too: a Runner.Worker started
-    under the old name may still be on its way to the old name's state."""
+    job's timeout (cmux_next_ci_unowned_idle_hours) leaves the roster incomplete too, as does one removed
+    within it: a Runner.Worker started under the old name may still be on its way to the old name's state."""
     names: dict[str, Path] = {}
     work: dict[Path, Path] = {}
     complete = True
     recent = time.time() - float(POLICY["cmux_next_ci_unowned_idle_hours"]) * 3600
+    try:  # a runner whose .runner went missing just now (mid re-registration) is not known gone either
+        for runner in HOME.glob("actions-runner*"):
+            if (not runner.is_symlink() and (runner / "glaeda-hooks").is_dir()
+                    and not (runner / ".runner").is_file() and runner.stat().st_mtime > recent):
+                complete = False
+    except OSError:
+        complete = False
     for runner in enrolled_runners():
         try:
             if (runner / ".runner").stat().st_mtime > recent:
