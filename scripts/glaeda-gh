@@ -2546,8 +2546,24 @@ def under_service() -> bool:
         return False
 
 
+def restart_in_progress() -> bool:
+    """Whether a glaeda-gh restart holds restart.lock right now (cmd_restart): between its bootout and its
+    bootstrap nothing is loaded, and a shell serve started then would take daemon.lock from the service."""
+    try:
+        with open(BASE / "restart.lock", "r") as guard:
+            if not try_lock(guard):
+                return True
+            fcntl.flock(guard, fcntl.LOCK_UN)
+            return False
+    except OSError:
+        return False
+
+
 def service_loaded() -> bool:
-    """Whether this user's glaeda-gh service is loaded (launchd) or enabled or running (systemd)."""
+    """Whether this user's glaeda-gh service is loaded (launchd) or enabled or running (systemd), or about to be
+    (a restart in progress)."""
+    if restart_in_progress():
+        return True
     if sys.platform == "darwin":
         # the LaunchAgent, the copy restart loads while nobody is logged in (launchd_domain), or the
         # same label as a system LaunchDaemon on a headless Mac. Only a definite "not there" (113, or 125 for a
@@ -5717,12 +5733,16 @@ def restart_service(hung: bool) -> tuple[bool, str]:
             plist = background_plist()
         except Exception as error:  # OSError, plistlib's and expat's parse errors, a plist that is not a job
             return False, f"no Background copy for {domain}: {type(error).__name__}: {error}"
+        if launchd_domain() != domain:
+            return False, "nothing: someone logged in or out while restarting; run glaeda-gh restart again"
         loaded = reload_job(target, domain, plist)
         how = (f"launchctl bootout and bootstrap {target} from {plist} "
                f"(nobody is logged in, so gui/{os.getuid()} does not exist)")
         return loaded == 0, how + ("" if loaded == 0 else f" (bootstrap exit {loaded})")
     # Logged in again: the copy a logged-out restart loaded would keep a second KeepAlive daemon (waiting on
     # daemon.lock behind this one) and is what a hung-holder stop would hit first, so it goes now
+    if launchd_domain() != domain:
+        return False, "nothing: someone logged in or out while restarting; run glaeda-gh restart again"
     gone, dropped = drop_background_copy()
     if not gone:
         return False, dropped + f"; not starting {target} beside it"

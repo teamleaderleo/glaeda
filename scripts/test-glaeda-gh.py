@@ -3162,6 +3162,7 @@ class LaunchdRestartTest(unittest.TestCase):
                 self.assertTrue(ok, how)
                 self.assertEqual(seen[1:], [
                     ["launchctl", "print", f"system/{gg.LAUNCH_LABEL}"],
+                    ["launchctl", "print", f"gui/{uid}"],  # still logged out, right before the reload
                     ["launchctl", "bootout", f"user/{uid}/{gg.LAUNCH_LABEL}"],
                     ["launchctl", "bootstrap", f"user/{uid}", os.fspath(copy)]])
                 with open(copy, "rb") as handle:
@@ -3187,13 +3188,13 @@ class LaunchdRestartTest(unittest.TestCase):
                 seen.clear()
                 ok, how = gg.restart_service(True)
                 self.assertTrue(ok, how)
-                self.assertEqual([a[1] for a in seen], ["print", "print", "bootout", "bootstrap"])
+                self.assertEqual([a[1] for a in seen], ["print", "print", "print", "bootout", "bootstrap"])
                 # a scheduled respawn does not stop the reload either: it would respawn the old copy
                 seen.clear()
                 with mock.patch.object(gg, "launchd_state", return_value="spawn scheduled"):
                     ok, how = gg.restart_service(False)
                 self.assertTrue(ok, how)
-                self.assertEqual([a[1] for a in seen], ["print", "print", "bootout", "bootstrap"])
+                self.assertEqual([a[1] for a in seen], ["print", "print", "print", "bootout", "bootstrap"])
                 with open(copy, "rb") as handle:
                     self.assertEqual(gg.plistlib.load(handle), {**updated, "LimitLoadToSessionType": "Background"})
 
@@ -3217,10 +3218,11 @@ class LaunchdRestartTest(unittest.TestCase):
             self.assertIn(f"no Background copy for user/{os.getuid()}: {why}", how)
 
     def test_a_probe_that_cannot_tell_fails_closed(self) -> None:
-        """Only 113 means not loaded: a print that fails otherwise neither doubles a system daemon nor starts the
-        LaunchAgent beside a copy that may still be there."""
+        """Only 113 means not loaded: a copy probe that fails otherwise keeps the LaunchAgent from starting beside
+        a copy that may still be there. (The user path probes nothing of its own: it always reloads the copy. The
+        system and domain probes have their own tests below.)"""
         uid = os.getuid()
-        for domain in (f"user/{uid}", f"gui/{uid}"):
+        for domain in (f"gui/{uid}",):
             seen: list[list[str]] = []
 
             def fake(argv: list[str], timeout: float | None = None) -> subprocess.CompletedProcess:
@@ -3242,6 +3244,42 @@ class LaunchdRestartTest(unittest.TestCase):
             self.assertNotIn("kickstart", [a[1] for a in seen], domain)
             self.assertIn(["launchctl", "print", f"system/{gg.LAUNCH_LABEL}"], seen, domain)
             self.assertNotIn("system LaunchDaemon", how, domain)  # it got past the system guard
+            self.assertIn("still loaded", how, domain)  # and stopped at the copy probe, not elsewhere
+            self.assertIn(["launchctl", "print", f"user/{uid}/{gg.LAUNCH_LABEL}"], seen, domain)
+
+    def test_a_shell_serve_is_refused_while_a_restart_holds_its_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(gg, "BASE", Path(tmp)), \
+                mock.patch.object(gg.sys, "platform", "darwin"), \
+                mock.patch.object(gg, "run_bounded", side_effect=lambda argv, timeout=None: subprocess.CompletedProcess(
+                    argv, gg.NOT_LOADED, "", "")):
+            self.assertFalse(gg.service_loaded())  # nothing loaded, no restart
+            with open(Path(tmp) / "restart.lock", "a+") as guard:
+                # flock belongs to the open file, so the probe's own open sees this one held, as another process would
+                self.assertTrue(gg.try_lock(guard))
+                self.assertTrue(gg.service_loaded())
+            self.assertFalse(gg.service_loaded())
+
+    def test_a_login_or_logout_during_a_restart_changes_nothing(self) -> None:
+        uid = os.getuid()
+        for first, then in ((f"user/{uid}", f"gui/{uid}"), (f"gui/{uid}", f"user/{uid}")):
+            seen: list[list[str]] = []
+
+            def fake(argv: list[str], timeout: float | None = None) -> subprocess.CompletedProcess:
+                seen.append(argv)
+                return subprocess.CompletedProcess(argv, gg.NOT_LOADED if argv[1] == "print" else 0, "", "")
+            with tempfile.TemporaryDirectory() as tmp:
+                (Path(tmp) / "Library/LaunchAgents").mkdir(parents=True)
+                (Path(tmp) / "Library/LaunchAgents" / f"{gg.LAUNCH_LABEL}.plist").write_bytes(
+                    gg.plistlib.dumps({"Label": gg.LAUNCH_LABEL}))
+                with mock.patch.object(gg.sys, "platform", "darwin"), mock.patch.object(gg, "run_bounded", fake), \
+                        mock.patch.object(gg, "launchd_domain", side_effect=[first, then]), \
+                        mock.patch.object(gg, "launchd_state", return_value=None), \
+                        mock.patch.object(gg.Path, "home", return_value=Path(tmp)), \
+                        mock.patch.object(gg, "BASE", Path(tmp) / "gh"):
+                    ok, how = gg.restart_service(True)
+            self.assertFalse(ok, first)
+            self.assertIn("logged in or out while restarting", how, first)
+            self.assertFalse({"bootout", "bootstrap", "kickstart"} & {a[1] for a in seen}, first)
 
     def test_a_login_session_probe_that_cannot_tell_changes_nothing(self) -> None:
         """A gui/UID print that answers neither 0 nor 125 (or none at all) is not taken for a login session:
@@ -3380,6 +3418,7 @@ class LaunchdRestartTest(unittest.TestCase):
             ok, how = gg.restart_service(True)
         self.assertTrue(ok, how)
         self.assertEqual(seen, [["launchctl", "print", f"gui/{uid}"],
+                                ["launchctl", "print", f"gui/{uid}"],  # still logged in, right before the drop
                                 ["launchctl", "print", f"user/{uid}/{gg.LAUNCH_LABEL}"],
                                 ["launchctl", "bootout", f"user/{uid}/{gg.LAUNCH_LABEL}"],
                                 ["launchctl", "print", f"user/{uid}/{gg.LAUNCH_LABEL}"],
@@ -3396,7 +3435,7 @@ class LaunchdRestartTest(unittest.TestCase):
                 mock.patch.object(gg, "launchd_state", return_value=None):
             ok, how = gg.restart_service(True)
         self.assertTrue(ok, how)
-        self.assertEqual([a[1] for a in seen], ["print", "print", "kickstart"])
+        self.assertEqual([a[1] for a in seen], ["print", "print", "print", "kickstart"])
         self.assertEqual(how, f"launchctl kickstart -k gui/{uid}/{gg.LAUNCH_LABEL}")
 
     def test_a_missing_launch_agent_fails_the_user_domain_restart_with_a_reason(self) -> None:
