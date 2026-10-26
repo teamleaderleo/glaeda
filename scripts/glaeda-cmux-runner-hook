@@ -1588,9 +1588,13 @@ def prejob_target_gib(min_free_gib: float) -> float:
 
 
 def pass_active() -> bool:
-    """Whether a glaeda-disk pass is freeing space now: the queued pass (the hook's pass lock) or any --apply holding
-    evict.lock."""
-    return disk_pass_running(disk_state_dir() / DISK_PASS_LOCK) or wait_for_running_pass(time.monotonic())
+    """Whether a glaeda-disk pass is freeing space now or about to: a trigger no pass has served yet (DISK_PASS_PENDING
+    or its .claimed, which disk_pressure_detached writes before its detached child takes the pass lock), the queued
+    pass (the hook's pass lock), or any --apply holding evict.lock."""
+    state = disk_state_dir()
+    pending = state / DISK_PASS_PENDING
+    return (os.path.lexists(pending) or os.path.lexists(f"{pending}.claimed")
+            or disk_pass_running(state / DISK_PASS_LOCK) or wait_for_running_pass(time.monotonic()))
 
 
 def prejob_evict(path: str, min_free_gib: float, explicit: str | None, wait_s: float = PREJOB_WAIT_S) -> str | None:
@@ -6175,6 +6179,12 @@ def main(argv: list[str] | None = None) -> int:
         prejob = None if args.no_disk else prejob_evict(disk_path, args.min_free_gib, args.disk)
         if prejob:
             print(f"{PREFIX}: {prejob}", flush=True)
+            # the jobs already running may have written the disk below the floor while this one waited
+            if disk_refusal(disk_path, args.min_free_gib):
+                print(f"{PREFIX}: {evict(disk_path, args.min_free_gib, args.disk)}", flush=True)
+                why = disk_refusal(disk_path, args.min_free_gib)
+                if why:
+                    return refused(why, disk=True)
         # before any capacity is taken: a job that needs the console session fails on a locked one
         admit_class = None
         if args.gui_runner or args.session_runner or job_class(

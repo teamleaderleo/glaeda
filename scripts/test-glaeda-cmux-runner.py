@@ -854,17 +854,63 @@ class HookTest(unittest.TestCase):
                 self.assertIsNone(note)
                 started.assert_not_called()
 
+    def test_a_trigger_no_pass_has_served_yet_counts_as_an_active_pass(self) -> None:
+        """disk_pressure_detached returns before its detached child takes the pass lock; the pending trigger it wrote
+        first keeps the pre-job wait going until a pass served it."""
+        with mock.patch.dict(os.environ, {"HOME": os.fspath(self.dir)}):
+            state = hook.disk_state_dir()
+            state.mkdir(parents=True, exist_ok=True)
+            self.assertFalse(hook.pass_active())
+            for name in (hook.DISK_PASS_PENDING, f"{hook.DISK_PASS_PENDING}.claimed"):
+                (state / name).touch()
+                self.assertTrue(hook.pass_active(), name)
+                (state / name).unlink()
+            self.assertFalse(hook.pass_active())
+
+    def test_the_floor_is_checked_again_after_the_prejob_wait(self) -> None:
+        """Running jobs can write the disk below the floor while this one waits: it then evicts and is refused, as
+        under the floor before the wait."""
+        self.fleet()
+        frees = iter([35.0, 35.0, 20.0])  # the two floor checks, then the one after the wait
+        last = [35.0]
+
+        def free(_path):
+            last[0] = next(frees, last[0])
+            return last[0]
+        push = event(self.dir, "push", {"repository": CMUX})
+        env = {"PATH": "/usr/bin:/bin", "HOME": os.fspath(self.dir), "GLAEDA_RUNNER_TELEMETRY": "0",
+               "GLAEDA_CANONICAL_ROOT_PARENT": NO_ROOTS, "GLAEDA_FLEET_DIR": os.fspath(self.dir / "fleet"),
+               "GITHUB_EVENT_NAME": "push", "GITHUB_EVENT_PATH": os.fspath(push), "GITHUB_REPOSITORY": "manaflow-ai/cmux"}
+        with mock.patch.dict(os.environ, env, clear=True), \
+                mock.patch.object(hook, "free_gib", side_effect=free), \
+                mock.patch.object(hook, "prejob_evict", return_value="under the 50 GiB pre-job target: waited 30 s"), \
+                mock.patch.object(hook, "evict", return_value="under the 30 GiB disk floor: glaeda-disk exited 0") as ev, \
+                mock.patch.object(hook, "start_runner_parent_watchdog"), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            code = hook.main(["job-started", "--allowed-repo", "manaflow-ai/cmux",
+                              "--reservation", os.fspath(self.dir / "fleet" / "reservation.json"),
+                              "--host-lock", os.fspath(self.dir / "fleet" / "host.lock"), "--min-free-gib", "30",
+                              "--state-dir", os.fspath(self.dir / "state"), "--watch-pid", str(os.getpid())])
+        self.assertEqual(code, 1, out.getvalue())
+        ev.assert_called_once()
+        text = out.getvalue()
+        self.assertLess(text.index("pre-job target"), text.index("disk floor"))
+        self.assertIn("20.0 GiB free, 30 GiB required", text)
+        self.assertTrue(self.lock_free())
+
     def test_prejob_margin_override_is_bounded(self) -> None:
         for value, want in (("5", 5.0), ("0", 0.0), ("-1", 20.0), ("501", 20.0), ("nan", 20.0), ("x", 20.0)):
             with self.subTest(value=value), mock.patch.dict(os.environ, {hook.PREJOB_MARGIN_ENV: value}):
                 self.assertEqual(hook.prejob_margin_gib(), want)
 
     def test_job_started_evicts_to_the_prejob_target_before_admitting(self) -> None:
-        """The whole hook: free space between the floor and the target starts the queued pass before admission (the
-        fake glaeda-disk runs) and the job is admitted."""
+        """The whole hook, with the real detached pass: free space between the floor and the target starts the queued
+        pass before admission, and the job waits while that pass (here a 2 s fake glaeda-disk) runs, through its
+        startup, so the pass has finished by the time the job is admitted."""
         self.fleet()
         marker = self.dir / "disk-ran"
-        disk = make_executable(self.dir / "glaeda-disk-fake", "import pathlib, sys\n"
+        disk = make_executable(self.dir / "glaeda-disk-fake", "import pathlib, sys, time\n"
+                               "time.sleep(2)\n"
                                f"pathlib.Path({os.fspath(marker)!r}).write_text(' '.join(sys.argv[1:]))\n")
         floor = max(1.0, hook.free_gib(os.fspath(self.dir / "fleet")) - 5)  # above the floor, under floor + 20
         push = event(self.dir, "push", {"repository": CMUX})
@@ -873,12 +919,9 @@ class HookTest(unittest.TestCase):
                                os.fspath(self.dir / "state"), "--watch-pid", str(os.getpid()), repo="manaflow-ai/cmux")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertRegex(result.stdout, r"under the [0-9.]+ GiB pre-job target \([0-9.]+ GiB floor \+ 20\): "
-                                        r"glaeda-disk started in the background")
+                                        r"glaeda-disk started in the background \(bounded by [0-9]+ s\); waited ([2-9]|[1-9][0-9]) s")
         self.assertLess(result.stdout.index("pre-job target"), result.stdout.index("admitted"), "evicted, then admitted")
-        deadline = time.monotonic() + 20
-        while not marker.exists() and time.monotonic() < deadline:
-            time.sleep(0.1)
-        self.assertTrue(marker.read_text().startswith("--pressure --apply"))
+        self.assertTrue(marker.read_text().startswith("--pressure --apply"), "the pass ran before admission")
         self.run_hook("job-completed", None, None, "--no-disk", "--state-dir", os.fspath(self.dir / "state"))
 
     def test_lock_held_by_another_build_refuses_fast(self) -> None:
