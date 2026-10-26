@@ -5604,9 +5604,11 @@ def runner_floor_gib(home: Path = HOME) -> float:
 # target_margin_gib, so state its holder keeps idle is not aged out. The list is never part of this repository: the
 # fleet's own writer puts it on each host, in the home of the user that owns FLEET_ROOT
 # (~/.local/share/glaeda/fleet-reservations.json, schema glaeda-fleet-reservations/v1:
-# {"reservations": [{"id", "owner", "hosts": [...], "from", "until"}], "aliases": {host: [...]}}). The host-local
-# reservation (FLEET_ROOT/reservation.json, glaeda-reservation/v1, the one the runner hook reads) counts too. Fails
-# closed: a missing, unreadable or malformed list reads as reserved, whatever the host-local file says.
+# {"expires", "reservations": [{"id", "owner", "hosts": [...], "from", "until"}], "aliases": {host: [...]}}; the
+# writer stamps expires 13 h after each write and refreshes it every 6 h). The host-local reservation
+# (FLEET_ROOT/reservation.json, glaeda-reservation/v1, the one the runner hook reads) counts too. Fails closed: a
+# missing, unreadable, malformed or expired list, or one with no expires, reads as reserved, whatever the
+# host-local file says.
 FLEET_RESERVATIONS: Path | None = None  # None: fleet_reservations_path(); tests point it at a fixture
 FLEET_RESERVATIONS_NAME = ".local/share/glaeda/fleet-reservations.json"
 UPDATE_CONFIG = HOME / ".config/glaeda/update.json"
@@ -5664,6 +5666,8 @@ def host_reservation(now: float | None = None, path: Path | None = None, names: 
         entries, aliases = doc["reservations"], doc.get("aliases", {})
         if not isinstance(entries, list) or not isinstance(aliases, dict):
             raise ValueError("malformed")
+        if reservation_time(doc["expires"]) <= now:  # KeyError without one: the writer stopped refreshing it
+            return f"fleet reservations expired at {doc['expires']}; kept as reserved"
         alias = {str(h).lower(): {a.lower() for a in _str_list(v, "aliases")} for h, v in aliases.items()}
         hit = ""
         for e in entries:  # every entry is checked, so one malformed entry anywhere fails closed

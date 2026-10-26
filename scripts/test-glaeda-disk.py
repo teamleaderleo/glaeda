@@ -43,7 +43,8 @@ loader.exec_module(gd)
 # Every test runs on an unreserved host unless it says otherwise (HostReservationTest): an empty reservation list, so a
 # test's host never reads the real ~/.local/share/glaeda/fleet-reservations.json, or fails closed without one.
 _NO_RESERVATIONS = tempfile.NamedTemporaryFile("w", suffix="-fleet-reservations.json", delete=False)
-_NO_RESERVATIONS.write('{"schema": "glaeda-fleet-reservations/v1", "reservations": [], "aliases": {}}')
+_NO_RESERVATIONS.write('{"schema": "glaeda-fleet-reservations/v1", "expires": "2999-01-01T00:00:00Z", '
+                       '"reservations": [], "aliases": {}}')
 _NO_RESERVATIONS.close()
 gd.FLEET_RESERVATIONS = Path(_NO_RESERVATIONS.name)
 gd.HOST_RESERVATION_LOCAL = Path(_NO_RESERVATIONS.name + ".none")
@@ -6507,7 +6508,8 @@ class HostReservationTest(unittest.TestCase):
         self.root = Path(self.tmp.name)
         self.list = self.root / "fleet-reservations.json"
         self.local = self.root / "reservation.json"
-        self.list.write_text(json.dumps({"schema": "glaeda-fleet-reservations/v1", "aliases": {"cmux30": ["cmux-thirty"]},
+        self.list.write_text(json.dumps({"schema": "glaeda-fleet-reservations/v1", "expires": "2026-10-27T13:00:00Z",
+                                         "aliases": {"cmux30": ["cmux-thirty"]},
                                          "reservations": [{"id": "r1", "owner": "someone", "hosts": ["cmux30"],
                                                            "from": "2026-10-25T22:00:00Z",
                                                            "until": "2026-10-28T23:59:59Z"}]}))
@@ -6520,6 +6522,8 @@ class HostReservationTest(unittest.TestCase):
         self.assertIn("reserved for someone until 2026-10-28T23:59:59Z (r1)", self.reserved({"cmux30"}))
         self.assertIn("reserved for someone", self.reserved({"CMUX-Thirty"}))
         self.assertEqual(self.reserved({"cmux31"}), "")
+        doc = json.loads(self.list.read_text())
+        self.list.write_text(json.dumps(dict(doc, expires="2026-10-30T00:00:00Z")))
         self.assertEqual(self.reserved({"cmux30"}, gd.reservation_time("2026-10-29T00:00:00Z")), "", "lapsed")
         self.assertEqual(self.reserved({"cmux30"}, gd.reservation_time("2026-10-25T21:59:59Z")), "", "not yet")
 
@@ -6578,11 +6582,18 @@ class HostReservationTest(unittest.TestCase):
             {"reservations": [good], "aliases": []},
         )
         for doc in bad_docs:
-            with self.subTest(doc=doc):
-                self.list.write_text(json.dumps(doc))
+            with self.subTest(doc=doc):  # each with a fresh expires, so only its own fault can make it fail
+                self.list.write_text(json.dumps(dict(doc, expires="2026-10-27T13:00:00Z") if isinstance(doc, dict)
+                                                else doc))
                 self.assertIn("unreadable", self.reserved({"cmux31"}))
-        self.list.write_text(json.dumps({"reservations": [good]}))
+        fresh = "2026-10-27T13:00:00Z"
+        self.list.write_text(json.dumps({"reservations": [good], "expires": fresh}))
         self.assertEqual(self.reserved({"cmux31"}), "", "a well-formed list without this host")
+        for expires in (None, "2026-10-26T23:59:59Z", "soon", 12):
+            with self.subTest(expires=expires):
+                doc = {"reservations": [good]} if expires is None else {"reservations": [good], "expires": expires}
+                self.list.write_text(json.dumps(doc))
+                self.assertIn("kept as reserved", self.reserved({"cmux31"}))
 
     def test_a_missing_list_is_reserved_whatever_the_host_local_file_says(self) -> None:
         now = int(self.during)
