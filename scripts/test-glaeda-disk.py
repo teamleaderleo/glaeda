@@ -4738,6 +4738,66 @@ class GlaedaDiskTest(unittest.TestCase):
                                  ("blocked:git", "a commit here is on no remote-tracking ref"))
                 self.assertEqual(why["actions-runner-glaeda"], ("reclaimed", "unused for 12 h"))
 
+    def _packs(self, co: Path, gib: float) -> None:
+        """A sparse .pack of gib GiB in co's object store (no .idx, so git never reads it)."""
+        pack = co / ".git/objects/pack"
+        pack.mkdir(parents=True, exist_ok=True)
+        with (pack / "pack-0000.pack").open("wb") as f:
+            f.truncate(int(gib * gd.GIB))
+
+    def test_a_bloated_runner_checkout_goes_once_quiet_at_any_free_space(self) -> None:
+        """2026-10-27: one runner per mini held a 6.8 GiB full-history checkout with 22k remote refs while its
+        siblings held about 0.55 GiB. Far above the floor, it goes once its runner is quiet; its siblings stay."""
+        names = {"actions-runner-glaeda": 2, "actions-runner-glaeda-2": 2, "actions-runner-glaeda-3": 2,
+                 "actions-runner-glaeda-11": 2, "actions-runner-glaeda-12": 0.05}
+        home, cos = self._idle_checkouts(names)
+        gd.process_evidence = lambda: ([], "")
+        for name, age in names.items():
+            self._git_checkout(cos[name])
+            self._packs(cos[name], 6.8 if name in ("actions-runner-glaeda-11", "actions-runner-glaeda-12") else 0.55)
+            self._age(home / name, hours=age)
+        self.assertEqual(set(gd.bloated_runner_checkouts(list(cos.values()))),
+                         {str(cos["actions-runner-glaeda-11"]), str(cos["actions-runner-glaeda-12"])})
+        patches, removed = self._floor_disk(400.0)  # far above the floor and its target
+        receipt = self.receipt()
+        with patches[0], patches[1], contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertGreater(gd.evict_idle_runner_checkouts(receipt, 30.0, home), 0)
+        self.assertEqual(removed, [str(cos["actions-runner-glaeda-11"])])
+        self.assertTrue(cos["actions-runner-glaeda-12"].is_dir(), "used minutes ago: its job may be finishing")
+        self.assertIn("bloated: ", out.getvalue())
+        (rec,) = map(json.loads, receipt.read_text().splitlines())
+        self.assertEqual((rec["outcome"], rec["reasons"][0][:9]), ("reclaimed", "bloated: "))
+
+    def test_bloat_is_relative_to_the_same_repositorys_siblings(self) -> None:
+        root = self.root / "bloat"
+        cos = []
+        for i, (repo, size) in enumerate([("cmux", 6.8), ("cmux", 0.55), ("cmux", 0.6), ("big", 9.0), ("big", 8.0),
+                                          ("lone", 9.0), ("cmux", 1.9)]):
+            co = root / f"r{i}/_work/{repo}/{repo}"
+            self._packs(co, size)
+            cos.append(co)
+        # the 6.8 GiB cmux one only: big is big everywhere, lone has no sibling, 1.9 GiB is under the 2 GiB minimum
+        self.assertEqual(set(gd.bloated_runner_checkouts(cos)), {str(cos[0])})
+        self.assertEqual(gd.git_pack_bytes(cos[1] / ".git"), int(0.55 * gd.GIB))
+        with mock.patch.object(gd, "RUNNER_CHECKOUT_BLOAT_RATIO", float("inf")):  # a reserved host keeps legacy ages
+            self.assertEqual(gd.bloated_runner_checkouts(cos), {})
+
+    def test_a_bloated_checkout_keeps_a_commit_only_it_has(self) -> None:
+        names = {"actions-runner-glaeda": 2, "actions-runner-glaeda-2": 2, "actions-runner-glaeda-11": 2}
+        home, cos = self._idle_checkouts(names)
+        gd.process_evidence = lambda: ([], "")
+        for name, age in names.items():
+            self._git_checkout(cos[name], pushed=name != "actions-runner-glaeda-11")
+            self._packs(cos[name], 6.8 if name == "actions-runner-glaeda-11" else 0.55)
+            self._age(home / name, hours=age)
+        patches, removed = self._floor_disk(400.0)
+        receipt = self.receipt()
+        with patches[0], patches[1]:
+            self.assertEqual(gd.evict_idle_runner_checkouts(receipt, 30.0, home), 0)
+        self.assertEqual(removed, [])
+        (rec,) = map(json.loads, receipt.read_text().splitlines())
+        self.assertEqual((rec["outcome"], rec["reasons"][0]), ("blocked:git", "a commit here is on no remote-tracking ref"))
+
     def test_the_git_veto_ignores_the_callers_git_env_and_keeps_what_it_cannot_read(self) -> None:
         co = self.root / "veto/_work/cmux/cmux"
         self._git_checkout(co, pushed=False)

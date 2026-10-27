@@ -2059,6 +2059,14 @@ RUNNER_IDLE_CHECKOUT_HOURS = 10 / 60
 # Old runner work dirs go by age too, above the floor and in the idle sweep: a checkout no job used for
 # DEFAULT_AGE_HOURS is cloned again by its runner's next job, like one the floor took.
 RUNNER_STALE_CHECKOUT_HOURS = DEFAULT_AGE_HOURS
+# A runner checkout that one full-history job fetched into stays full-history: every later job only adds to it, and
+# runner-checkout-repack's `repack -k` keeps what no ref names. On 2026-10-27 one runner per mini (12 of 109
+# checkouts) held 6.7-7.1 GiB of packs and 22k refs/remotes/origin/* while its siblings held about 0.55 GiB: 118.5 of
+# the fleet's 198 GB of runner .git. Such a checkout goes once its runner is quiet, at any free space, and the next
+# job starts from a shallow clone or git seed again. Bloated is relative to the same repository's other checkouts on
+# this mini, so a repository that is big everywhere never counts.
+RUNNER_CHECKOUT_BLOAT_RATIO = 4.0  # times the median pack bytes of the same repository's other checkouts here
+RUNNER_CHECKOUT_BLOAT_MIN_GIB = 2.0
 
 
 def runner_checkout_last_use(runner: Path, checkout: Path) -> float:
@@ -2141,10 +2149,40 @@ def idle_runner_checkout_veto(runner: Path, checkout: Path, opened: frozenset[st
     return ""
 
 
+def git_pack_bytes(gitdir: Path) -> int:
+    """Bytes of the .pack files in a git dir's objects/pack, from one directory listing (no git, no walk)."""
+    total = 0
+    for e in _entries(gitdir / "objects/pack"):
+        if e.name.endswith(".pack"):
+            with contextlib.suppress(OSError):
+                if e.is_file(follow_symlinks=False):
+                    total += e.stat(follow_symlinks=False).st_size
+    return total
+
+
+def bloated_runner_checkouts(checkouts: list[Path]) -> dict[str, int]:
+    """The checkouts whose packs are over RUNNER_CHECKOUT_BLOAT_RATIO times the median of the same repository's
+    other checkouts (by directory name) and over RUNNER_CHECKOUT_BLOAT_MIN_GIB: path -> pack bytes. A checkout
+    with no sibling of its repository has nothing to compare with and never counts."""
+    if RUNNER_CHECKOUT_BLOAT_RATIO == float("inf"):
+        return {}
+    sizes = {os.fspath(c): (c.name, git_pack_bytes(c / ".git")) for c in checkouts}
+    out = {}
+    for path, (repo, size) in sizes.items():
+        others = sorted(b for p, (r, b) in sizes.items() if r == repo and p != path)
+        if not others or size <= RUNNER_CHECKOUT_BLOAT_MIN_GIB * GIB:
+            continue
+        median = (others[(len(others) - 1) // 2] + others[len(others) // 2]) / 2
+        if size > RUNNER_CHECKOUT_BLOAT_RATIO * median:
+            out[path] = size
+    return out
+
+
 def evict_idle_runner_checkouts(receipt: Path, floor_gib: float, home: Path | None = None) -> int:
     """Remove idle runners' whole checkouts, least recently used first, each after fresh process evidence: every
-    one unused for RUNNER_STALE_CHECKOUT_HOURS, and under the runner gate's disk floor also younger ones (quiet for
-    RUNNER_IDLE_CHECKOUT_HOURS) until free space is back at the floor plus target_margin_gib."""
+    one unused for RUNNER_STALE_CHECKOUT_HOURS or bloated (bloated_runner_checkouts) and quiet for
+    RUNNER_IDLE_CHECKOUT_HOURS, and under the runner gate's disk floor also other quiet ones until free space is
+    back at the floor plus target_margin_gib."""
     home = HOME if home is None else home
     try:
         free, total = free_bytes(home)
@@ -2154,24 +2192,28 @@ def evict_idle_runner_checkouts(receipt: Path, floor_gib: float, home: Path | No
     under = floor_gib > 0 and free < (floor_gib + GATE_DISK_RESUME_GIB) * GIB
     target = min(int((floor_gib + POLICY["target_margin_gib"]) * GIB), total // 2)  # as filesystems() sets it
     now = time.time()
-    found = []
+    every = []
     for runner in enrolled_runners(home):
         work = runner / "_work"
         if work.is_symlink() or not work.is_dir():
             continue
-        for checkout in runner_checkouts(work):
-            if checkout.name != checkout.parent.name:  # only actions/checkout's default _work/<repo>/<repo>
-                continue
-            used = runner_checkout_last_use(runner, checkout)
-            idle = (now - used) / 3600
-            if idle >= RUNNER_IDLE_CHECKOUT_HOURS and (under or idle >= RUNNER_STALE_CHECKOUT_HOURS):
-                found.append((used, runner, checkout))
+        # only actions/checkout's default _work/<repo>/<repo>
+        every += [(runner, c) for c in runner_checkouts(work) if c.name == c.parent.name]
+    bloated = bloated_runner_checkouts([c for _, c in every])
+    found = []
+    for runner, checkout in every:
+        used = runner_checkout_last_use(runner, checkout)
+        idle = (now - used) / 3600
+        if idle >= RUNNER_IDLE_CHECKOUT_HOURS and (under or idle >= RUNNER_STALE_CHECKOUT_HOURS
+                                                   or os.fspath(checkout) in bloated):
+            found.append((used, runner, checkout))
     released = 0
     for used, runner, checkout in sorted(found, key=lambda t: t[0]):
         stale = (now - used) / 3600 >= RUNNER_STALE_CHECKOUT_HOURS
+        bloat = bloated.get(os.fspath(checkout), 0)
         try:
-            if not stale and free_bytes(home)[0] >= target:
-                break  # oldest first: every stale checkout came before this one
+            if not stale and not bloat and free_bytes(home)[0] >= target:
+                continue  # under the floor's last resort only until the target; stale and bloated ones still go
             opened, cmds = process_evidence()  # a job may have started since the last deletion
         except OSError:
             break
@@ -2179,7 +2221,7 @@ def evict_idle_runner_checkouts(receipt: Path, floor_gib: float, home: Path | No
             print(f"refusing to delete idle runner checkouts: {e}", file=sys.stderr)
             break
         why = idle_runner_checkout_veto(runner, checkout, open_index(opened), cmds)
-        if not why and stale and not under:  # above the floor only what git can lose nothing of goes
+        if not why and (stale or bloat) and not under:  # above the floor only what git can lose nothing of goes
             why = runner_checkout_git_veto(checkout)
         size = 0
         if why:
@@ -2198,12 +2240,14 @@ def evict_idle_runner_checkouts(receipt: Path, floor_gib: float, home: Path | No
                "family": RUNNER_IDLE_CHECKOUT_FAMILY, "path": os.fspath(checkout), "bytes": size,
                "verdict": "reclaimable" if not why else "blocked",
                "reasons": [why] if why else [f"unused for {RUNNER_STALE_CHECKOUT_HOURS:g} h" if stale
+                                             else f"bloated: {gib(bloat).strip()} of packs" if bloat
                                              else "under the runner disk floor", "runner has no job"],
                "idle_hours": round((now - used) / 3600, 2)}
         with contextlib.suppress(OSError), receipt.open("a") as f:  # a lost receipt line must not stop the pass
             f.write(json.dumps(rec) + "\n")
         if outcome == "reclaimed":
-            why_now = f"unused for {RUNNER_STALE_CHECKOUT_HOURS:g} h" if stale else "under the disk floor"
+            why_now = (f"unused for {RUNNER_STALE_CHECKOUT_HOURS:g} h" if stale
+                       else f"bloated: {gib(bloat).strip()} of packs" if bloat else "under the disk floor")
             print(f"  reclaimed {gib(size).strip():>8s}  {checkout} (idle runner checkout, {why_now})")
     return released
 
@@ -6185,7 +6229,7 @@ LEGACY_AGES = {"DEFAULT_AGE_HOURS": 24.0, "KEPT_BUILD_IDLE_HOURS": 24.0, "IDLE_S
                "CANONICAL_ADMISSION_IDLE_HOURS": 24.0, "IDLE_SEED_HOURS": 12.0, "RUNTIME_IDLE_DAYS": 14.0,
                "CHECKOUT_BUILD_IDLE_HOURS": 24.0, "TMP_TEST_RESIDUE_IDLE_HOURS": 48.0,
                "RUNNER_STALE_CHECKOUT_HOURS": float("inf"), "RUNNER_CACHE_IDLE_HOURS": 168.0,
-               "CMUX_JOB_MIRROR_HOURS": 168.0}
+               "CMUX_JOB_MIRROR_HOURS": 168.0, "RUNNER_CHECKOUT_BLOAT_RATIO": float("inf")}
 LEGACY_POLICY = {"soft_idle_hours": 24.0, "stale_marker_max_hours": 48.0, "cmux_next_ci_host_idle_hours": 48.0}
 
 
