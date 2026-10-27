@@ -324,25 +324,45 @@ class NodeEligibility(unittest.TestCase):
 
     def test_a_missing_rust_toolchain_is_read_from_the_hook_for_a_fleet_node(self) -> None:
         mini, _ = self.mini("exec /usr/bin/python3 hook job-started --require-eligible --fleet-class m4pro-48")
-        why = "node not eligible (Rust toolchain missing: /Users/cmux/.cargo/bin/rustup)"
+        why = "node not eligible (Rust toolchain missing: rustc is not on the job PATH /usr/bin:/bin (...))"
         homes: list[Path] = []
-        fleet_node = [True]
-        mini._hook.require_eligible_here = lambda home: fleet_node[0]
 
-        def toolchain_missing(env=None, home=None):
+        def fleet_toolchain_missing(home=None):
             homes.append(home)
             return why
 
-        mini._hook.toolchain_missing = toolchain_missing
+        mini._hook.fleet_toolchain_missing = fleet_toolchain_missing
         self.assertEqual(mini.toolchain_missing(), why)
-        self.assertEqual(homes, [self.home], "the runner user's own ~/.cargo/bin")
-        fleet_node[0] = False
-        self.assertIsNone(mini.toolchain_missing(), "a mini with no fleet build runner needs no Rust")
-        fleet_node[0] = True
-        mini._hook.toolchain_missing = lambda env=None, home=None: 1 / 0
+        self.assertEqual(homes, [self.home], "the runner user's own runners and ~/.cargo/bin")
+        mini._hook.fleet_toolchain_missing = lambda home=None: 1 / 0
         self.assertIsNone(mini.toolchain_missing(), "a hook that cannot answer is no finding")
-        del mini._hook.toolchain_missing
+        del mini._hook.fleet_toolchain_missing
         self.assertIsNone(mini.toolchain_missing(), "an older hook without the check is no finding")
+
+    def test_the_real_hook_reads_the_fleet_runners_job_path(self) -> None:
+        """Against the real hook: the health agent's launchd PATH never decides; the runner's .path does."""
+        spec = importlib.util.spec_from_loader("hook_for_health_test", importlib.machinery.SourceFileLoader(
+            "hook_for_health_test", os.fspath(ROOT / "scripts" / "glaeda-cmux-runner-hook")))
+        real = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(real)
+        real.TOOLCHAIN_GATE = True
+        mini, _ = self.mini("exec /usr/bin/python3 hook job-started --require-eligible --fleet-class m4pro-48")
+        mini._hook = real
+        bin_dir = self.home / ".cargo" / "bin"
+        bin_dir.mkdir(parents=True)
+        for tool in ("rustup", "rustc", "cargo"):
+            (bin_dir / tool).write_text("#!/bin/sh\n")
+            (bin_dir / tool).chmod(0o755)
+        runner = self.home / "actions-runner-glaeda"
+        (runner / ".path").write_text("/usr/bin:/bin\n")
+        with mock.patch.dict(os.environ, {"PATH": os.fspath(bin_dir)}):
+            self.assertIn("rustc is not on the job PATH /usr/bin:/bin", mini.toolchain_missing() or "")
+            (runner / ".path").write_text(f"{bin_dir}:/usr/bin:/bin\n")
+            self.assertIsNone(mini.toolchain_missing())
+            (bin_dir / "rustup").unlink()
+            self.assertIn(f"{bin_dir / 'rustup'} is gone", mini.toolchain_missing() or "")
+            (runner / "glaeda-hooks" / "job-started.sh").write_text("exec /usr/bin/python3 hook job-started\n")
+            self.assertIsNone(mini.toolchain_missing(), "a mini with no fleet build runner needs no Rust")
 
     def test_a_runner_without_a_pool_xcode_has_no_toolchain_to_check(self) -> None:
         mini, _ = self.mini("exec /usr/bin/python3 hook job-started --allowed-owner manaflow-ai")

@@ -81,8 +81,9 @@ Each run checks, as the runner user and without sudo:
                                      job here (a missing staged generation, a receipt that does not validate, a node
                                      that is not eligible). Restaging or re-enrolling is an operator's: reported only.
   toolchain_missing                  rustup, rustc or cargo cannot run on a fleet build node (the runner hook's
-                                     toolchain_missing: neither the job PATH nor ~/.cargo/bin has it, or a link
-                                     there dangles; 2026-10-26, ~/.cargo/bin/rustup deleted fleet-wide). job-started
+                                     fleet_toolchain_missing, on the runner's job PATH, its .path): it names each
+                                     tool and whether its ~/.cargo/bin link dangles, it is gone, or it is there but
+                                     off the job PATH (2026-10-26: rustup deleted fleet-wide). job-started
                                      refuses every job, the gate holds the listeners off at once and ci-step fits
                                      advertises nothing. Names each missing path. Reported only.
   toolchain_mismatch                 xcrun, in the env the runner gives its jobs (no SDKROOT or TOOLCHAINS,
@@ -559,12 +560,11 @@ class Mini:
         """Why the runner hook's toolchain_missing says this fleet node cannot run rustup, rustc or cargo (each
         missing path), or None when they run, no runner here requires eligibility, or the hook cannot answer."""
         hook = self.hook()
-        missing = getattr(hook, "toolchain_missing", None) if hook is not None else None
-        here = getattr(hook, "require_eligible_here", None) if hook is not None else None
-        if missing is None or here is None:
+        missing = getattr(hook, "fleet_toolchain_missing", None) if hook is not None else None
+        if missing is None:
             return None
         try:
-            return missing(home=self.home) if here(self.home) else None
+            return missing(self.home)  # the fleet runner's job PATH (.path), never this agent's launchd PATH
         except Exception:  # noqa: BLE001  (a hook that cannot answer is no finding)
             return None
 

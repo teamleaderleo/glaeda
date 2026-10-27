@@ -3208,13 +3208,19 @@ time.sleep(60)
         bin_dir.mkdir(parents=True)
         for tool in ("rustc", "cargo"):
             (bin_dir / tool).symlink_to("rustup")
-        env = {"PATH": os.fspath(self.dir / "no-rust-here")}  # never this host's own rustc
+        # The worker's own PATH finds a rust elsewhere; the jobs' PATH (the runner's .path) is what counts.
+        elsewhere = self.dir / "worker-path"
+        elsewhere.mkdir()
+        for tool in ("rustup", "rustc", "cargo"):
+            make_executable(elsewhere / tool, "#!/bin/sh\nexit 0\n")
+        env = {"PATH": os.fspath(elsewhere)}
+        (hooks.parent / ".path").write_text(f"{bin_dir}:{self.dir / 'no-rust-here'}\n")
         worker = self.ci_worker()
         watch = ("--watch-pid", str(worker.pid))
         status, fits = self.ci_step("fits", env=env)
         self.assertEqual((status, fits["fits"], fits["unknown"]), (0, [], False))
-        self.assertIn(f"Rust toolchain missing: {bin_dir / 'rustup'}, {bin_dir / 'rustc'} (a link to rustup, "
-                      "which is gone)", fits["refusal"])
+        self.assertIn(f"Rust toolchain missing: {bin_dir / 'rustup'} is gone and rustup is not on the job PATH; "
+                      f"{bin_dir / 'rustc'} (a link to rustup, which is gone)", fits["refusal"])
         status, refused = self.ci_step("admit", "--class", "light", "--job-key", "rust-1-1", *watch, env=env)
         self.assertEqual((status, refused["admitted"]), (1, False))
         self.assertIn("Rust toolchain missing", refused["reason"])
@@ -5539,7 +5545,7 @@ class GateTest(unittest.TestCase):
         for tool in ("rustc", "cargo"):
             (bin_dir / tool).symlink_to("rustup")
         for patch in (mock.patch.object(hook, "TOOLCHAIN_GATE", True),
-                      mock.patch.dict(os.environ, {"PATH": os.fspath(self.tmp / "no-rust-here"),
+                      mock.patch.dict(os.environ, {"PATH": f"{bin_dir}:{self.tmp / 'no-rust-here'}",
                                                    "CARGO_HOME": os.fspath(bin_dir.parent)})):
             patch.start()
             self.addCleanup(patch.stop)
@@ -5547,11 +5553,17 @@ class GateTest(unittest.TestCase):
 
     def test_toolchain_missing_names_each_path_and_follows_links(self) -> None:
         bin_dir = self.rust_bin()
-        self.assertEqual(hook.toolchain_missing(),
-                         f"node not eligible (Rust toolchain missing: {bin_dir / 'rustup'}, {bin_dir / 'rustc'} (a link "
-                         f"to rustup, which is gone), {bin_dir / 'cargo'} (a link to rustup, which is gone))")
+        self.assertEqual(hook.toolchain_missing({"PATH": f"{bin_dir}:/nonexistent", "CARGO_HOME": os.fspath(bin_dir.parent)}),
+                         f"node not eligible (Rust toolchain missing: {bin_dir / 'rustup'} is gone and rustup is not on "
+                         f"the job PATH; {bin_dir / 'rustc'} (a link to rustup, which is gone); {bin_dir / 'cargo'} "
+                         "(a link to rustup, which is gone))")
         make_executable(bin_dir / "rustup", "#!/bin/sh\nexit 0\n")
-        self.assertIsNone(hook.toolchain_missing(), "the links resolve again")
+        self.assertIsNone(hook.toolchain_missing({"PATH": os.fspath(bin_dir)}), "the links resolve again")
+        # a re-registered runner's .path without ~/.cargo/bin (cmux14, 2026-10-26): there, but off the job PATH
+        self.assertEqual(hook.toolchain_missing({"PATH": "/usr/bin:/bin", "CARGO_HOME": os.fspath(bin_dir.parent)}),
+                         "node not eligible (Rust toolchain missing: " + "; ".join(
+                             f"{tool} is not on the job PATH /usr/bin:/bin ({bin_dir / tool} is there)"
+                             for tool in hook.RUST_TOOLS) + ")")
         (bin_dir / "rustup").unlink()
         on_path = self.tmp / "path"
         on_path.mkdir()
@@ -5586,25 +5598,40 @@ class GateTest(unittest.TestCase):
             look.assert_not_called()
             make_executable(bin_dir / "rustup", "#!/bin/sh\nexit 0\n")
             self.assertIsNone(gate.claimed(), "listening again on the next poll")
+            (self.runner / hook.RUNNER_PATH_FILE).write_text("/usr/bin:/bin:/usr/sbin:/sbin\n")
+            self.assertIn("rustup is not on the job PATH /usr/bin:/bin:/usr/sbin:/sbin", gate.claimed() or "",
+                          "the runner's .path is the jobs' PATH, whatever the gate's own")
+            (self.runner / hook.RUNNER_PATH_FILE).write_text(f"{bin_dir}:/usr/bin:/bin\n")
+            self.assertIsNone(gate.claimed())
         script.write_text("exec /usr/bin/python3 /hook job-started --fleet-class m4pro-48 --instance 1\n")
         (bin_dir / "rustup").unlink()
         self.assertIsNone(gate.claimed(), "no --require-eligible: never held for the toolchain")
 
-    def test_a_missing_toolchain_from_the_look_holds_without_a_recheck(self) -> None:
+    def test_a_missing_toolchain_never_outlives_its_return(self) -> None:
+        """The threaded look's toolchain_refusal also refuses a missing toolchain, but the per-poll check owns that
+        answer: the look never stores it, so a runner is listening again on the first poll after rustup is back,
+        and a reload never carries it."""
         script = self.runner / hook.RUNNER_HOOK_SCRIPT
         script.parent.mkdir(parents=True, exist_ok=True)
         script.write_text("exec /usr/bin/python3 /hook job-started --require-eligible --fleet-class m4pro-48\n")
-        gate = hook.Gate(self.runner, os.fspath(self.lock), os.fspath(self.tmp / "none.json"), self.state)
+        bin_dir = self.rust_bin()
+        why = f"node not eligible ({hook.TOOLCHAIN_MISSING}: {bin_dir / 'rustup'} is gone)"
+        with mock.patch.dict(os.environ, {hook.GATE_INELIGIBLE_ENV: why}):
+            gate = hook.Gate(self.runner, os.fspath(self.lock), os.fspath(self.tmp / "none.json"), self.state)
+        self.assertIsNone(gate.eligible_why, "a reload drops a carried missing-toolchain answer")
         for name in ("saturated", "hot"):
             patch = mock.patch.object(gate, name, return_value=None)
             patch.start()
             self.addCleanup(patch.stop)
-        why = f"node not eligible ({hook.TOOLCHAIN_MISSING}: /Users/cmux/.cargo/bin/rustup)"
-        with mock.patch.object(hook, "eligibility_refusal", return_value=why) as look:
-            self.assertIsNone(gate.claimed(), "the first poll starts the look")
+        self.assertIn(hook.TOOLCHAIN_MISSING, gate.claimed() or "")
+        make_executable(bin_dir / "rustup", "#!/bin/sh\nexit 0\n")
+        # a look that started while rustup was gone answers after it is back
+        with mock.patch.object(hook, "eligibility_refusal", return_value=why):
+            self.assertIsNone(gate.claimed(), "listening again on the first poll after it is back")
             gate.eligible_look.join(5)
-            self.assertEqual(gate.claimed(), f"ineligible: {why}", "held on the look's own answer")
-            self.assertEqual(look.call_count, 1, "no GATE_ELIGIBLE_RECHECK_S look first")
+            self.assertIsNone(gate.eligible_why, "the look never stores it, so it cannot hold for 300 s")
+            self.assertIsNone(gate.eligible_new, "no recheck queued for it either")
+            self.assertIsNone(gate.claimed())
 
     def test_the_listener_starts_without_sdkroot_and_on_the_pool_xcode(self) -> None:
         """cmux21: the gate ran under the /usr/bin/python3 xcrun shim, which put SDKROOT in its env, and run.sh
