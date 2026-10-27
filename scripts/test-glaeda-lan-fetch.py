@@ -207,6 +207,164 @@ class ProductServeTest(unittest.TestCase):
         self.assertIsNone(serve.open_product(self.products, sha))
 
 
+# Stands in for /usr/bin/curl on the cache host: https://BUCKET/v1/NS/objects/FILE is FAKE_BUCKETS/BUCKET/NS/FILE.
+FAKE_CURL = """import os, sys, time
+args = sys.argv[1:]
+out, url = args[args.index("--output") + 1], args[-1]
+with open(os.environ["FAKE_CURL_LOG"], "a") as log:
+    log.write(url + "\\n")
+bucket, rest = url.removeprefix("https://").split("/", 1)
+ns, file = rest.removeprefix("v1/").split("/objects/")
+source = os.path.join(os.environ["FAKE_BUCKETS"], bucket, ns, file)
+if not os.path.exists(source):
+    sys.stdout.write("404"); sys.exit(22)
+data = open(source, "rb").read()
+with open(out, "wb") as f:
+    for i in range(0, len(data), 4096):
+        f.write(data[i:i + 4096]); f.flush()
+        time.sleep(float(os.environ.get("FAKE_CURL_DELAY", "0")))
+sys.stdout.write("200")
+"""
+
+# Stands in for /usr/bin/ssh to the cache host: the real serve script answers as its forced command would.
+FAKE_CACHE_SSH = """import json, os, sys
+address, request = sys.argv[-2], sys.argv[-1]
+if address != os.environ["FAKE_CACHE_HOST"]:
+    sys.stderr.write("ssh: No route to host\\n"); sys.exit(255)
+os.environ["SSH_ORIGINAL_COMMAND"] = request
+os.environ["SSH_CLIENT"] = "172.20.21.197 1 22"
+os.execv(sys.executable, [sys.executable, os.environ["FAKE_SERVE"], "--role", "cache",
+                          "--cache", os.environ["FAKE_CACHE"], "--mirrors", os.environ["FAKE_MIRRORS"],
+                          "--run-dir", os.environ["FAKE_CACHE"] + ".run", "--receipt", os.environ["FAKE_RECEIPT"],
+                          "--curl", os.environ["FAKE_CURL"]])
+"""
+
+
+class LanCacheTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        base = Path(os.path.realpath(self.tmp.name))
+        self.base = base
+        self.buckets = base / "buckets"
+        self.cache = base / "lan-cache"
+        self.mirrors = base / "git"
+        self.mirrors.mkdir()
+        receipt = base / "receipt.json"
+        receipt.write_text(json.dumps({"member": {"trustedRef": "refs/heads/main"}}))
+        conf = base / "lan-cache-conf"
+        conf.mkdir()
+        (conf / "id_ed25519").write_text("k")
+        (conf / "known_hosts").write_text("x")
+        (conf / "config.json").write_text(json.dumps({"schema": 1, "source": "lan", "host": "cmux15", "user": "cmux",
+                                                      "addresses": ["172.20.21.9", "172.20.21.202"]}))
+        self.conf = conf / "config.json"
+        for name, text in (("fake-ssh", FAKE_CACHE_SSH), ("fake-curl", FAKE_CURL)):
+            (base / name).write_text(f"#!{sys.executable}\n" + text)
+            (base / name).chmod(0o755)
+        self.saved = (lf.SSH, dict(os.environ))
+        lf.SSH = os.fspath(base / "fake-ssh")
+        self.curl_log = base / "curl.log"
+        os.environ.update({"FAKE_CACHE_HOST": "172.20.21.202", "FAKE_SERVE": os.fspath(SERVE),
+                           "FAKE_CACHE": os.fspath(self.cache), "FAKE_MIRRORS": os.fspath(self.mirrors),
+                           "FAKE_RECEIPT": os.fspath(receipt), "FAKE_CURL": os.fspath(base / "fake-curl"),
+                           "FAKE_BUCKETS": os.fspath(self.buckets), "FAKE_CURL_LOG": os.fspath(self.curl_log)})
+        self.out = base / "job"
+        self.out.mkdir()
+
+    def tearDown(self) -> None:
+        lf.SSH, env = self.saved
+        os.environ.clear()
+        os.environ.update(env)
+        self.tmp.cleanup()
+
+    def put(self, data: bytes, file: str = "spm-abc.tar.zst", ns: str = "macOS-ARM64",
+            bucket: str = "ci-cache.cmux.com") -> str:
+        (self.buckets / bucket / ns).mkdir(parents=True, exist_ok=True)
+        (self.buckets / bucket / ns / file).write_bytes(data)
+        return f"{bucket}/{ns}/{file}"
+
+    def fetch(self, name: str, dest: str = "archive") -> tuple[int, dict, Path]:
+        code, record = lf.fetch_cache(name, self.out / dest, lf.load_cache_config(self.conf))
+        return code, record, self.out / dest
+
+    def downloads(self) -> list[str]:
+        return self.curl_log.read_text().splitlines() if self.curl_log.exists() else []
+
+    def test_an_object_crosses_the_uplink_once(self):
+        data = os.urandom(300000)
+        name = self.put(data)
+        code, record, dest = self.fetch(name)
+        self.assertEqual((code, record["bytes"], record["address"]), (0, len(data), "172.20.21.202"), record)
+        self.assertEqual(dest.read_bytes(), data)
+        code, _, dest = self.fetch(name, "again")
+        self.assertEqual((code, dest.read_bytes()), (0, data))
+        self.assertEqual(self.downloads(), ["https://ci-cache.cmux.com/v1/macOS-ARM64/objects/spm-abc.tar.zst"])
+        self.assertEqual(sorted(p.name for p in self.out.iterdir() if p.name.startswith(".")), [])
+
+    def test_clients_waiting_on_one_fill_share_it_and_hear_its_progress(self):
+        data = os.urandom(40960)
+        name = self.put(data)
+        os.environ["FAKE_CURL_DELAY"] = "0.3"  # ~3 s a fill: longer than one progress report
+        results = []
+        threads = [threading.Thread(target=lambda i=i: results.append(self.fetch(name, f"d{i}"))) for i in range(3)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(60)
+        self.assertEqual(sorted(code for code, _, _ in results), [0, 0, 0], [r for _, r, _ in results])
+        self.assertTrue(all(dest.read_bytes() == data for _, _, dest in results))
+        self.assertEqual(len(self.downloads()), 1)
+
+    def test_a_missing_object_is_a_miss_and_a_down_host_an_error(self):
+        code, record, dest = self.fetch("ci-cache.cmux.com/macOS-ARM64/none.tar.zst")
+        self.assertEqual((code, record["reason"]), (3, "not in the bucket"))
+        self.assertFalse(dest.exists())
+        os.environ["FAKE_CACHE_HOST"] = "10.0.0.1"
+        name = self.put(b"x" * 100)
+        code, record, dest = self.fetch(name)
+        self.assertEqual(code, 1)
+        self.assertFalse(dest.exists())
+        self.assertEqual(lf.fetch_cache(name, self.out / "z", None)[0], 1)  # no config: download directly
+
+    def test_only_cache_objects_of_known_buckets_are_asked(self):
+        for parts in (("evil.example", "ns", "a.tar.zst"), ("ci-cache.cmux.com", "../x", "a.tar.zst"),
+                      ("ci-cache.cmux.com", "ns", "a.txt"), ("ci-cache.cmux.com", "ns", "../a.tar.zst")):
+            with self.subTest(parts=parts):
+                self.assertIsNone(lf.cache_object(*parts))
+        for request in ("cache-v1 evil.example ns a.tar.zst", "cache-v1 ci-cache.cmux.com ns ../a.tar.zst",
+                        "git-upload-pack '../etc.git'", "product-v1 " + "a" * 64, "seed-list-v1"):
+            with self.subTest(request=request):
+                with self.assertRaises(serve.Refused):
+                    serve.parse_request(request, "cache")
+
+    def test_the_cache_role_needs_a_trusted_host(self):
+        Path(os.environ["FAKE_RECEIPT"]).write_text(json.dumps({"member": {}}))
+        code, record, _ = self.fetch(self.put(b"x" * 10))
+        self.assertEqual(code, 1)
+        self.assertIn("refused", record["error"])
+
+    def test_the_prune_keeps_the_newest_and_the_one_just_filled(self):
+        root = self.cache / "ci-cache.cmux.com/ns"
+        root.mkdir(parents=True)
+        for index, name in enumerate(("old.tar.zst", "mid.tar.zst", "new.tar.zst")):
+            (root / name).write_bytes(b"x" * 100)
+            os.utime(root / name, (1000 + index, 1000 + index))
+        (root / ".fill-part.tar.zst").write_bytes(b"x" * 100)
+        removed = serve.prune_cache(self.cache, "ci-cache.cmux.com/ns/old.tar.zst", budget=250, min_free=0)
+        self.assertEqual(removed, 1)
+        self.assertEqual(sorted(p.name for p in root.iterdir()), [".fill-part.tar.zst", "new.tar.zst", "old.tar.zst"])
+
+    def test_git_is_served_only_from_a_ready_mirror(self):
+        repo = self.mirrors / "cmux.git"
+        subprocess.run(["git", "init", "-q", "--bare", os.fspath(repo)], check=True)
+        self.assertEqual(serve.ready_mirrors(self.mirrors), {})
+        (self.mirrors / "cmux.json").write_text(json.dumps({"ready": {"cmux": "a" * 40, "nope": "b" * 40,
+                                                                      "../x": "c" * 40}}))
+        self.assertEqual(serve.ready_mirrors(self.mirrors), {"cmux": "a" * 40})
+        self.assertEqual(serve.parse_request("git-upload-pack 'cmux.git'", "cache"), ("git", "", ["cmux"]))
+        self.assertEqual(serve.parse_request("git-upload-pack '/cmux.git'", "cache"), ("git", "", ["cmux"]))
+
+
 class LanFetchTest(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()

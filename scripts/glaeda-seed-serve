@@ -122,7 +122,7 @@ MAX_OBJECT_BYTES = 20 * 1024**3
 MAX_METADATA_BYTES = 64 * 1024
 MAX_PRODUCT_ENTRIES = 4096
 SHA_RE = re.compile(r"[a-f0-9]{64}")
-ROLES = ("seed", "product", "archive")
+ROLES = ("seed", "product", "archive", "cache")
 # The seed archive on cmux-lawrence (cmuxterm-hq#821): an APFS disk image glaeda-seed-archive attaches.
 ARCHIVE = "/Volumes/glaeda-seed-archive/seeds"
 ARCHIVE_SUFFIX = ".tar.zst"
@@ -148,6 +148,28 @@ STATE_SERVE_TIMEOUT = 420
 SNAPSHOT_PREFIX = ".lan-serve-"
 CP = "/bin/cp"
 IP_RE = re.compile(r"[0-9A-Fa-f.:]{1,64}")
+# The site's LAN cache host (--role cache, the fleet registry's lan-cache role): the CI cache buckets' objects
+# and the git mirrors (glaeda-git-mirror), each fetched over the site's uplink once.
+CACHE = "/Users/Shared/cmux-build-fleet/lan-cache"
+CACHE_BUCKETS = ("ci-cache.cmux.com", "ci-cache-next.cmux.com")
+CACHE_NS_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
+CACHE_FILE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,250}\.tar\.(?:zst|gz)")
+CACHE_BYTES = 60 * 1024**3
+CACHE_MIN_FREE = 40 * 1024**3
+CACHE_QUEUE = 24  # waiting for a fill counts: a whole site may want the same new object at once
+# A fill runs at the uplink's speed (2026-10-27: 0.4-0.9 MB/s a mini, 4 at once): a 2 GB object can take an
+# hour. It reports its progress every FILL_REPORT seconds, so a client waits as long as bytes keep coming.
+FILL_TIMEOUT = 5400
+FILL_REPORT = 10
+CACHE_SERVE_TIMEOUT = 900
+CURL = "/usr/bin/curl"
+GIT_CANDIDATES = ("/usr/bin/git", "/opt/homebrew/bin/git")
+GIT_MIRRORS = "/Users/Shared/cmux-build-fleet/git"
+GIT_RECORD = "cmux.json"  # glaeda-git-mirror's record: which mirrors are ready
+GIT_NAME_RE = re.compile(r"[a-z][a-z0-9-]{0,40}")
+GIT_REQUEST_RE = re.compile(r"git-upload-pack '/?([a-z][a-z0-9-]{0,40})\.git'")
+GIT_IDLE_TIMEOUT = 120
+GIT_SERVE_TIMEOUT = 1800
 
 
 class Refused(Exception):
@@ -163,6 +185,16 @@ def parse_request(text: str, role: str = "seed") -> tuple[str, str, list[str]]:
     words = text.split(" ")
     if words == ["ping-v1"]:
         return "ping", "", []
+    if role == "cache":
+        if len(words) == 4 and words[0] == "cache-v1" and words[1] in CACHE_BUCKETS \
+                and CACHE_NS_RE.fullmatch(words[2]) and CACHE_FILE_RE.fullmatch(words[3]):
+            return "cache", "", [f"{words[1]}/{words[2]}/{words[3]}"]
+        if words == ["mirrors-v1"]:
+            return "mirrors", "", []
+        found = GIT_REQUEST_RE.fullmatch(text)
+        if found:
+            return "git", "", [found.group(1)]
+        raise Refused("unknown request")
     if words == ["seed-list-v1"] and role != "product":
         return "list", "", []
     if role == "product":
@@ -304,7 +336,7 @@ def try_lock(path: Path) -> int | None:
         return None
 
 
-def admit(run_dir: Path, client: str, lane: str = "") -> list[int] | None:
+def admit(run_dir: Path, client: str | None, lane: str = "", queue: str = "queue", places: int = QUEUE) -> list[int] | None:
     """The fds of this client's lock and a queue place, or None (answer busy at once).
 
     LANE gives a client's bookkeeping traffic its own per-client guard. The guard exists to stop one
@@ -312,14 +344,15 @@ def admit(run_dir: Path, client: str, lane: str = "") -> list[int] | None:
     sharing the lane with it makes the fetch read as a miss on a peer that has the object. The queue
     places are still shared, so total concurrency stays bounded.
     """
-    mine = try_lock(run_dir / f"client-{client.replace(':', '_')}{lane}.lock")
-    if mine is None:
+    mine = None if client is None else try_lock(run_dir / f"client-{client.replace(':', '_')}{lane}.lock")
+    if client is not None and mine is None:
         return None
-    for place in range(QUEUE):
-        fd = try_lock(run_dir / f"queue-{place}.lock")
+    for place in range(places):
+        fd = try_lock(run_dir / f"{queue}-{place}.lock")
         if fd is not None:
-            return [mine, fd]
-    os.close(mine)
+            return [fd] if mine is None else [mine, fd]
+    if mine is not None:
+        os.close(mine)
     return None
 
 
@@ -442,9 +475,9 @@ def open_entry_object(entry: int, sha: str) -> tuple[int, int] | None:
     return None
 
 
-def stream_product(fd: int, size: int) -> int:
-    """Write exactly SIZE bytes of FD to stdout within SERVE_TIMEOUT (SIGALRM ends a stalled reader)."""
-    signal.alarm(SERVE_TIMEOUT)
+def stream_product(fd: int, size: int, timeout: int = SERVE_TIMEOUT) -> int:
+    """Write exactly SIZE bytes of FD to stdout within TIMEOUT seconds (SIGALRM ends a stalled reader)."""
+    signal.alarm(timeout)
     left = size
     try:
         while left:
@@ -524,13 +557,14 @@ def stream(seeds: Path, key: str, codec: str, names: list[str] | None = None, ti
 
 
 def serve(request: str, state: Path, run_dir: Path, receipt: Path, client: str, slot_wait: float,
-          role: str = "seed", products: Path = Path(PRODUCTS), archive: Path = Path(ARCHIVE)) -> int:
+          role: str = "seed", products: Path = Path(PRODUCTS), archive: Path = Path(ARCHIVE),
+          cache: Path = Path(CACHE), mirrors: Path = Path(GIT_MIRRORS), curl: str = CURL) -> int:
     run_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
     client = client if IP_RE.fullmatch(client) else "unknown"
     record: dict = {"time": int(time.time()), "client": client, "role": role}
     try:
         verb, codec, keys = parse_request(request, role)
-        if role == "seed" and not trusted(receipt):
+        if role in ("seed", "cache") and not trusted(receipt):
             raise Refused("this host is not a trusted-only seeder")
         if role == "archive" and os.path.lexists(receipt):
             raise Refused("this host runs glaeda runners; it cannot be the seed archive")
@@ -542,6 +576,12 @@ def serve(request: str, state: Path, run_dir: Path, receipt: Path, client: str, 
         say("pong")
         log(run_dir, {**record, "outcome": "pong"})
         return 0
+    if verb == "cache":
+        return serve_cache(keys[0], Path(cache), run_dir, client, record, curl)
+    if verb == "mirrors":
+        return serve_mirrors(Path(mirrors), run_dir, record)
+    if verb == "git":
+        return serve_git(keys[0], Path(mirrors), run_dir, client, record)
     if verb in ("product", "product-has"):
         return serve_product(verb, keys[0], products, run_dir, client, slot_wait, record)
     if verb == "inventory":
@@ -930,6 +970,236 @@ def serve_state(state: Path, k: int, slot: str, want: str, codec: str, run_dir: 
             os.close(fd)
 
 
+# ------------------------------------------------------------------ the LAN cache host (--role cache)
+
+
+def open_cached(cache: Path, name: str) -> tuple[int, int] | None:
+    """(fd, size) of the cached object NAME (BUCKET/NS/FILE): a regular file of ours, no symlink on the way."""
+    parent = open_dir_path(cache.joinpath(*name.split("/")[:-1]))
+    if parent is None:
+        return None
+    try:
+        fd = os.open(name.split("/")[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
+    except OSError:
+        return None
+    finally:
+        os.close(parent)
+    info = os.fstat(fd)
+    if stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid() and info.st_size > 0:
+        fcntl.fcntl(fd, fcntl.F_SETFL, fcntl.fcntl(fd, fcntl.F_GETFL) & ~os.O_NONBLOCK)
+        return fd, info.st_size
+    os.close(fd)
+    return None
+
+
+def part_of(cache: Path, name: str) -> Path:
+    bucket, ns, file = name.split("/")
+    return cache / bucket / ns / f".fill-{file}"
+
+
+def report(part: Path) -> None:
+    """One progress line for a waiting client; a client that hung up does not stop the fill."""
+    try:
+        size = part.stat().st_size
+    except OSError:
+        size = 0
+    with contextlib.suppress(OSError):
+        say(f"filling {size}")
+
+
+def fill(cache: Path, name: str, timeout: float = FILL_TIMEOUT, curl: str = CURL) -> str:
+    """Download NAME from its bucket into the cache; '' when it is there, 'miss' for a 404, else why not.
+
+    Into a temporary name beside it, so a reader never sees a part. curl keeps a low-speed abort.
+    """
+    bucket, ns, file = name.split("/")
+    part = part_of(cache, name)
+    part.parent.mkdir(parents=True, exist_ok=True)
+    part.unlink(missing_ok=True)
+    try:
+        proc = subprocess.Popen([curl, "--silent", "--location", "--fail", "--proto", "=https",
+                                 "--connect-timeout", "15", "--speed-limit", "10240", "--speed-time", "120",
+                                 "--max-time", str(int(timeout)), "--max-filesize", str(MAX_OBJECT_BYTES),
+                                 "--write-out", "%{http_code}", "--output", os.fspath(part),
+                                 f"https://{bucket}/v1/{ns}/objects/{file}"],
+                                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                text=True, start_new_session=True)
+    except OSError as error:
+        return type(error).__name__
+    deadline = time.monotonic() + timeout + 30
+    while True:
+        try:
+            code = proc.wait(timeout=FILL_REPORT)
+            break
+        except subprocess.TimeoutExpired:
+            if time.monotonic() >= deadline:
+                with contextlib.suppress(OSError):
+                    os.killpg(proc.pid, signal.SIGKILL)
+                proc.wait()
+                part.unlink(missing_ok=True)
+                return "timed out"
+            report(part)
+    http = (proc.stdout.read() or "").strip()
+    if code != 0 or not part.is_file() or part.stat().st_size == 0:
+        part.unlink(missing_ok=True)
+        return "miss" if http == "404" else f"curl exit {code} http {http}"
+    os.replace(part, part.parent / file)
+    return ""
+
+
+def prune_cache(cache: Path, keep: str, budget: int = CACHE_BYTES, min_free: int = CACHE_MIN_FREE) -> int:
+    """Remove the least recently served objects (a hit touches the mtime) past BUDGET or under MIN_FREE free;
+    never KEEP or a part being filled. Returns how many it removed."""
+    entries = []
+    for path in cache.glob("*/*/*"):
+        try:
+            info = path.lstat()
+        except OSError:
+            continue
+        if stat.S_ISREG(info.st_mode) and not path.name.startswith(".fill-"):
+            entries.append((info.st_mtime, info.st_size, path))
+    entries.sort()
+    total, removed = sum(size for _, size, _ in entries), 0
+    for _, size, path in entries:
+        if total <= budget and shutil.disk_usage(cache).free >= min_free:
+            break
+        if "/".join(path.parts[-3:]) == keep:
+            continue
+        path.unlink(missing_ok=True)
+        total -= size
+        removed += 1
+    return removed
+
+
+def serve_cache(name: str, cache: Path, run_dir: Path, client: str, record: dict, curl: str = CURL) -> int:
+    """`cache-v1 BUCKET NS FILE`: the object from this host's cache, filled from its bucket once on a miss.
+
+    Answers `hit-cache SIZE` then exactly SIZE bytes, or `miss` (exit 3: the bucket has none), or `busy`
+    (exit 4). While the object is being filled, by this request or another, it writes `filling BYTES`
+    every FILL_REPORT seconds.
+    """
+    record = {**record, "verb": "cache", "object": name}
+    digest = hashlib.sha256(name.encode()).hexdigest()[:24]
+    # No per-client guard: a mini's parallel jobs may want the same object, and most requests only wait on a
+    # fill. The queue places bound what any number of clients can hold.
+    admitted = admit(run_dir, None, queue="cache-queue", places=CACHE_QUEUE)
+    if admitted is None:
+        say("busy")
+        log(run_dir, {**record, "outcome": "busy"})
+        return 4
+    # A client that hangs up mid-fill must not stop it: the next mini gets the object from here.
+    signal.signal(signal.SIGHUP, signal.SIG_IGN)
+    signal.signal(signal.SIGPIPE, signal.SIG_IGN)
+    started, filled = time.monotonic(), None
+    try:
+        opened = open_cached(cache, name)
+        if opened is None:
+            lock = os.open(run_dir / f"fill-{digest}.lock", os.O_RDONLY | os.O_CREAT, 0o600)
+            try:
+                while True:  # one fill per object; the others wait for it and report its progress
+                    try:
+                        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        break
+                    except OSError:
+                        if time.monotonic() - started >= FILL_TIMEOUT:
+                            say("busy")
+                            log(run_dir, {**record, "outcome": "busy", "why": "fill lock"})
+                            return 4
+                        time.sleep(FILL_REPORT)
+                        report(part_of(cache, name))
+                opened = open_cached(cache, name)  # filled while we waited
+                if opened is None:
+                    filled = fill(cache, name, curl=curl)
+                    if filled == "miss":
+                        say("miss")
+                        log(run_dir, {**record, "outcome": "miss", "seconds": round(time.monotonic() - started, 1)})
+                        return 3
+                    if filled:
+                        say("busy")
+                        log(run_dir, {**record, "outcome": "fill-failed", "why": filled[:200]})
+                        return 4
+                    record["pruned"] = prune_cache(cache, name)
+                    opened = open_cached(cache, name)
+            finally:
+                os.close(lock)
+        if opened is None:
+            say("busy")
+            log(run_dir, {**record, "outcome": "busy", "why": "gone after the fill"})
+            return 4
+        fd, size = opened
+        try:
+            with contextlib.suppress(OSError):
+                os.utime(fd)  # last use, for the prune
+            wait = round(time.monotonic() - started, 1)
+            say(f"hit-cache {size}")
+            status = stream_product(fd, size, CACHE_SERVE_TIMEOUT)
+        finally:
+            os.close(fd)
+        log(run_dir, {**record, "outcome": "served" if status == 0 else "failed", "bytes": size,
+                      "filled": filled == "", "wait_seconds": wait, "seconds": round(time.monotonic() - started, 1)})
+        return 0 if status == 0 else 5
+    finally:
+        for held in admitted:
+            os.close(held)
+
+
+def ready_mirrors(mirrors: Path) -> dict[str, str]:
+    """{name: main head} of the mirrors glaeda-git-mirror's last pass here found ready."""
+    try:
+        record = json.loads((mirrors / GIT_RECORD).read_bytes()[:MAX_INVENTORY_BYTES])
+    except (OSError, ValueError):
+        return {}
+    ready = record.get("ready") if isinstance(record, dict) else None
+    if not isinstance(ready, dict):
+        return {}
+    return {name: head for name, head in ready.items()
+            if isinstance(name, str) and GIT_NAME_RE.fullmatch(name) and isinstance(head, str)
+            and re.fullmatch(r"[0-9a-f]{40}", head) and (mirrors / f"{name}.git" / "HEAD").is_file()}
+
+
+def serve_mirrors(mirrors: Path, run_dir: Path, record: dict) -> int:
+    """`mirrors-v1`: `mirrors N` then N lines `NAME HEAD`, the mirrors ready to fetch from."""
+    ready = ready_mirrors(mirrors)
+    say(f"mirrors {len(ready)}")
+    os.write(1, "".join(f"{name} {head}\n" for name, head in sorted(ready.items())).encode())
+    log(run_dir, {**record, "outcome": "mirrors", "count": len(ready)})
+    return 0
+
+
+def serve_git(name: str, mirrors: Path, run_dir: Path, client: str, record: dict) -> int:
+    """`git-upload-pack 'NAME.git'`: git's own protocol on stdin and stdout, from a ready mirror here."""
+    record = {**record, "verb": "git", "repository": name}
+    if name not in ready_mirrors(mirrors):
+        log(run_dir, {**record, "outcome": "miss"})
+        print(f"glaeda-seed-serve: no ready mirror {name}", file=sys.stderr)
+        return 3
+    admitted = admit(run_dir, None, queue="cache-queue", places=CACHE_QUEUE)
+    if admitted is None:
+        log(run_dir, {**record, "outcome": "busy"})
+        print("glaeda-seed-serve: busy", file=sys.stderr)
+        return 4
+    git = next((c for c in GIT_CANDIDATES if os.access(c, os.X_OK)), "git")
+    started = time.monotonic()
+    try:
+        with contextlib.suppress(OSError):
+            os.nice(10)
+        proc = subprocess.Popen([git, "upload-pack", "--strict", f"--timeout={GIT_IDLE_TIMEOUT}",
+                                 os.fspath(mirrors / f"{name}.git")], stdin=0, stdout=1, stderr=subprocess.DEVNULL,
+                                env={"PATH": "/usr/bin:/bin", "HOME": os.path.expanduser("~")})
+        try:
+            status = proc.wait(timeout=GIT_SERVE_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+            status = 124
+    finally:
+        for held in admitted:
+            os.close(held)
+    log(run_dir, {**record, "outcome": "served" if status == 0 else "failed", "status": status,
+                  "seconds": round(time.monotonic() - started, 1)})
+    return 0 if status == 0 else 5
+
+
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--state", default=STATE)
@@ -939,6 +1209,9 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--role", choices=ROLES, default="seed")
     parser.add_argument("--products", default=PRODUCTS)
     parser.add_argument("--archive", default=ARCHIVE)
+    parser.add_argument("--cache", default=CACHE)
+    parser.add_argument("--mirrors", default=GIT_MIRRORS)
+    parser.add_argument("--curl", default=CURL)
     args = parser.parse_args(argv)
     request = os.environ.get("SSH_ORIGINAL_COMMAND")
     if request is None:
@@ -947,7 +1220,7 @@ def main(argv: list[str]) -> int:
     client = (os.environ.get("SSH_CLIENT") or "").split(" ")[0]
     return serve(request, Path(args.state), Path(os.path.expanduser(args.run_dir)),
                  Path(os.path.expanduser(args.receipt)), client, args.slot_wait, args.role, Path(args.products),
-                 Path(args.archive))
+                 Path(args.archive), Path(args.cache), Path(args.mirrors), args.curl)
 
 
 if __name__ == "__main__":
