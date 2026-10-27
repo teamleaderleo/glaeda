@@ -1308,8 +1308,10 @@ def plan_install(ctx: Context, receipt: dict[str, Any] | None) -> list[dict[str,
             current = sha256_file(Path(str(old.get("path"))))
             if current is not None:
                 ours = current == old.get("ownedSha256")
+                # owned until the removal is applied, so a skipped removal (an earlier step failed) is planned again
                 actions.append({"kind": "watch", "label": old.get("label"), "path": old.get("path"),
-                                "state": "remove" if ours else "kept", "owned": False,
+                                "state": "remove" if ours else "kept", "owned": ours,
+                                "ownedSha256": current if ours else None,
                                 "note": "" if ours else "changed since this command wrote it"})
     actions.append({"kind": "verify", "state": "pending", "note": f"GET {ctx.scope_api}/actions/runners, name {ctx.name}"})
     return actions
@@ -1735,7 +1737,7 @@ def apply_install(ctx: Context, actions: list[dict[str, Any]], receipt_doc: dict
             if not ctx.skip_launchctl:
                 run([LAUNCHCTL, "bootout", f"gui/{ctx.uid}/{act['label']}"])
             Path(act["path"]).unlink(missing_ok=True)
-            act["applied"] = True
+            act["applied"], act["owned"], act["ownedSha256"] = True, False, None
         elif kind == "agent" and state in {"create", "update"} and not ctx.skip_launchctl \
                 and (act.get("loaded") or getattr(ctx, "agent_started", False)) and not stop_if_idle(ctx):
             # loaded at plan time, or started since by a relabel: a bootout now would cancel its job
@@ -1765,7 +1767,20 @@ def apply_install(ctx: Context, actions: list[dict[str, Any]], receipt_doc: dict
         if kind == "agent" and getattr(ctx, "enabled_label", False):
             act["wasDisabled"] = act["enabled"] = True
         if kind == "register" and dedicated_of(ctx) and act["state"] != "failed":
-            keep_runner_env(ctx)  # before the agent starts the runner, which reads .env once
+            # before the agent starts the runner, which reads .env and .path once: a running listener whose env
+            # changes is restarted between jobs (the agent step below starts it again), never under a job
+            agent = next((a for a in actions if a["kind"] == "agent"), None)
+            running = not ctx.skip_launchctl and agent is not None and \
+                bool(agent.get("loaded") or getattr(ctx, "agent_started", False))
+            if running and keep_runner_env(ctx, write=False):
+                if stop_if_idle(ctx):
+                    agent["loaded"] = ctx.agent_started = False
+                    keep_runner_env(ctx)
+                    act["note"] = "; ".join(filter(None, [act.get("note"), "env changed: restarted between jobs"]))
+                else:
+                    act["state"], act["note"] = "failed", "its env changed, but the runner has a job; nothing changed, re-run when idle"
+            else:
+                keep_runner_env(ctx)
         if act["state"] == "failed":
             failed = True
         if kind == "verify":
@@ -2581,19 +2596,23 @@ def restart_watch(ctx: Context, act: dict[str, Any]) -> None:
         act["state"], act["note"] = "failed", ("launchctl bootstrap failed: " + out)[:400]
 
 
-def keep_runner_env(ctx: Context) -> None:
+def keep_runner_env(ctx: Context, write: bool = True) -> bool:
     """Set the dedicated runner's declared env in its .env (config.sh writes the file; the runner reads it at start),
-    keeping every other line. A declared PATH goes to .path instead (the jobs' PATH), merged as runner_path does."""
+    keeping every other line. A declared PATH goes to .path instead (the jobs' PATH), merged as runner_path does.
+    True when .env or .path differs from what it should be (write=False only tells, writing nothing)."""
     env = dedicated_env(ctx)
     path = ctx.runner_dir / ".env"
     if not (ctx.runner_dir / ".runner").is_file():
-        return
+        return False
+    changed = False
     declared_path = env.pop("PATH", None)
     if declared_path is not None:
         merged = runner_path(ctx.home, declared_path, read_runner_path(ctx.runner_dir))
         if merged != read_runner_path(ctx.runner_dir):
-            write_atomic(ctx.runner_dir / ".path", (merged + "\n").encode("utf-8", "surrogateescape"), 0o644,
-                         make_parent=False)
+            changed = True
+            if write:
+                write_atomic(ctx.runner_dir / ".path", (merged + "\n").encode("utf-8", "surrogateescape"), 0o644,
+                             make_parent=False)
     try:
         lines = path.read_text().splitlines()
     except OSError:
@@ -2605,10 +2624,14 @@ def keep_runner_env(ctx: Context) -> None:
     except (OSError, ValueError, TypeError):
         previous = set()
     kept = [line for line in lines if line.split("=", 1)[0] not in env and line.split("=", 1)[0] not in previous]
-    write_atomic(marker, json.dumps(sorted(env)).encode(), 0o644, make_parent=False)
     want = "\n".join([*kept, *(f"{k}={v}" for k, v in env.items())]) + "\n"
     if want != ("\n".join(lines) + "\n" if lines else ""):
-        write_atomic(path, want.encode(), 0o644, make_parent=False)
+        changed = True
+        if write:
+            write_atomic(path, want.encode(), 0o644, make_parent=False)
+    if write:
+        write_atomic(marker, json.dumps(sorted(env)).encode(), 0o644, make_parent=False)
+    return changed
 
 
 def dev_compile_instance(member: dict[str, Any], instance: int) -> bool:

@@ -9472,11 +9472,25 @@ class DedicatedRunnerTest(unittest.TestCase):
         # the manifest drops the watch loop and an env key: the agent this install wrote and the key both go
         trimmed = {k: v for k, v in NIGHTLY.items() if k != "watch"}
         trimmed["env"] = {"PATH": "~/.local/bin"}
+        (self.state / "loaded.json").write_text(json.dumps([label, f"{label}.watch"]))  # both agents run
+        env_before = (runner / ".env").read_text()
+        with mock.patch.object(cr.pwd, "getpwuid", return_value=fake_pw), \
+                mock.patch.object(cr, "runner_busy", return_value=True):
+            busy = self.invoke("--apply", "--manifest", self.manifest(trimmed), "--member", "mini-std",
+                               "--dedicated", "nightly-next", expect=1)
+        self.assertEqual(self.by_kind(busy)["register"]["state"], "failed", "never restarted under a job")
+        self.assertEqual((runner / ".env").read_text(), env_before)
+        self.assertIn(label, json.loads((self.state / "loaded.json").read_text()))
+        before = [e for e in self.log() if e["tool"] == "launchctl"]
         with mock.patch.object(cr.pwd, "getpwuid", return_value=fake_pw):
             self.invoke("--apply", "--manifest", self.manifest(trimmed), "--member", "mini-std",
                         "--dedicated", "nightly-next")
         self.assertFalse((self.home / "Library/LaunchAgents" / f"{label}.watch.plist").exists())
         self.assertNotIn("NIGHTLY_BUILDER_RUNNER_DIR", (runner / ".env").read_text())
+        # the env changed under a loaded, idle listener: it is restarted so its jobs see the new env
+        tail = [e["argv"] for e in self.log() if e["tool"] == "launchctl"][len(before):]
+        self.assertIn(["bootout", f"gui/{os.getuid()}/{label}"], tail)
+        self.assertTrue(any(a[0] == "bootstrap" and a[2].endswith(f"{label}.plist") for a in tail), tail)
         self.assertIn(["bootout", f"gui/{os.getuid()}/{label}.watch"],
                       [e["argv"] for e in self.log() if e["tool"] == "launchctl"])
         with mock.patch.object(cr.pwd, "getpwuid", return_value=fake_pw):
