@@ -89,8 +89,11 @@ def _selector_problem(key: str, text: str) -> bool:
     for match in EXPRESSION.finditer(text):
         if not any(pattern.fullmatch(match.group(1)) for pattern in allowed):
             return True
-        rest = rest.replace(match.group(0), " ", 1)
-    return "${{" in rest or HOSTED.search(rest) is not None
+        rest = rest.replace(match.group(0), "\0", 1)
+    # An expression must be a whole label: `ubuntu-${{ matrix.version }}` composes a hosted one.
+    if re.search(r"[^\s,\[\]\"'\0]\0|\0[^\s,\[\]\"'\0]", rest):
+        return True
+    return "${{" in rest or HOSTED.search(rest.replace("\0", " ")) is not None
 
 
 def hosted_jobs(path: Path) -> dict[str, list[str]]:

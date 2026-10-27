@@ -57,6 +57,8 @@ class Refuses(unittest.TestCase):
             "    runs-on: ${{ github.event.client_payload.runner }}\n",
             "    runs-on: ${{ matrix.os || 'ubuntu-latest' }}\n",
             "    runs-on: [self-hosted, ubuntu-24.04]\n",
+            "    strategy:\n      matrix:\n        version: ['22.04', '24.04']\n    runs-on: ubuntu-${{ matrix.version }}\n",
+            "    runs-on: [\"${{ matrix.os }}-arm\"]\n",
         ):
             with self.subTest(runs_on=runs_on):
                 self.assertTrue(check("  a:\n" + runs_on + "    steps: [{run: true}]\n"))
