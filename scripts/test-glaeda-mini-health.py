@@ -12,6 +12,7 @@ import os
 import shutil
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -2126,6 +2127,61 @@ class CheckoutSlow(Base):
         self.assertIn("over 12 steps", report["findings"][0]["evidence"])
         self.assertNotIn(str(self.home), json.dumps(report))
         self.assertEqual(self.mini.did, [])
+
+    def test_the_finding_says_whether_the_time_is_local_or_network(self) -> None:
+        for i in range(12):
+            self.job(690 + i)
+        probes: list[float | None] = []
+        self.mini.checkout_probe = lambda: probes.pop(0)  # type: ignore[method-assign]
+        probes.append(9.0)
+        def slow(at: float = NOW) -> dict:
+            return next(f for f in self.run_once(at=at)["findings"] if f["id"] == "checkout_slow")
+        local = slow()
+        self.assertIn("where: local (git submodule status took 9 s here", local["evidence"])
+        self.assertIn("Full Disk Access", local["note"])
+        # Reused for an hour: no second probe (the list is empty, so a probe would raise and drop the finding).
+        self.assertIn("where: local", slow(NOW + 600)["evidence"])
+        probes.append(0.3)
+        net = slow(NOW + health.CHECKOUT_PROBE_TTL_S + 60)
+        self.assertIn("where: network (local git is fast: git submodule status took 0.3 s)", net["evidence"])
+        self.assertIn("uplink", net["note"])
+        probes.append(float(health.CHECKOUT_PROBE_S))
+        killed = slow(NOW + 2 * health.CHECKOUT_PROBE_TTL_S + 120)
+        self.assertIn(f"took over {health.CHECKOUT_PROBE_S} s", killed["evidence"])
+        probes.append(None)
+        unknown = slow(NOW + 3 * health.CHECKOUT_PROBE_TTL_S + 180)
+        self.assertIn("where: unknown", unknown["evidence"])
+        def broken() -> float:
+            raise TypeError("an older Python")
+        self.mini.checkout_probe = broken  # type: ignore[method-assign]
+        self.assertIn("where: unknown", slow(NOW + 4 * health.CHECKOUT_PROBE_TTL_S + 240)["evidence"])
+        self.assertNotIn(str(self.home), json.dumps(unknown))
+
+    def test_a_fast_mini_is_never_probed(self) -> None:
+        for _ in range(12):
+            self.job(8)
+        self.mini.checkout_probe = lambda: self.fail("probed a fast mini")  # type: ignore[method-assign]
+        self.assertEqual(self.run_once()["findings"], [])
+
+    def test_the_probe_times_and_kills_a_slow_git(self) -> None:
+        work = self.home / "actions-runner-glaeda" / "_work" / "cmux" / "cmux"
+        (work / ".git").mkdir(parents=True)
+        (self.home / "actions-runner-glaeda" / "glaeda-hooks").mkdir(parents=True, exist_ok=True)
+        bin_dir = self.home / "bin"
+        bin_dir.mkdir()
+        fake = bin_dir / "git"
+        fake.write_text("#!/bin/sh\n/bin/sleep 30\n")
+        fake.chmod(0o755)
+        with mock.patch.object(health, "CHECKOUT_PROBE_PATH", os.fspath(bin_dir)), \
+                mock.patch.object(health, "CHECKOUT_PROBE_S", 1):
+            start = time.monotonic()
+            self.assertEqual(self.mini.checkout_probe(), 1.0)
+            self.assertLess(time.monotonic() - start, 10)
+            fake.write_text("#!/bin/sh\nexit 0\n")
+            self.assertLess(self.mini.checkout_probe(), 1.0)
+        shutil.rmtree(work)
+        with mock.patch.object(health, "CHECKOUT_PROBE_PATH", os.fspath(bin_dir)):
+            self.assertIsNone(self.mini.checkout_probe())  # no checkout to time
 
     def test_a_fast_mini_or_too_few_samples_is_no_finding(self) -> None:
         for i in range(30):
