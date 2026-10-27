@@ -2168,8 +2168,61 @@ class CheckoutSlow(Base):
 
     def test_only_the_newest_logs_are_read(self) -> None:
         for i in range(health.CHECKOUT_MAX_LOGS + 20):
-            self.job(700 if i < 20 else 8, age_s=7200 - i * 10)  # the 20 oldest are the slow ones
+            self.job(8 if i < health.CHECKOUT_MAX_LOGS else 700, age_s=600 + i * 10)  # the 20 oldest are slow
+        reads: list[Path] = []
+        real = self.mini.read_log
+        self.mini.read_log = lambda path, limit: reads.append(path) or real(path, limit)
         self.assertEqual(self.run_once()["findings"], [])
+        self.assertEqual(len(reads), health.CHECKOUT_MAX_LOGS)
+        self.assertEqual(len(json.loads((self.dir / health.CHECKOUT_CACHE).read_text())["logs"]),
+                         health.CHECKOUT_MAX_LOGS)
+
+    def test_the_pass_byte_budget_leaves_the_rest_for_a_later_pass(self) -> None:
+        for _ in range(12):
+            self.job(700)
+        size = (self.home / "actions-runner-glaeda" / "_diag" / "Worker_20261027-000001-utc.log").stat().st_size
+        with mock.patch.object(health, "CHECKOUT_PASS_BYTES", size * 5 + size // 2):
+            self.assertEqual(self.run_once()["findings"], [])  # 5 read, the 6th cut short is not kept
+            self.assertEqual(len(json.loads((self.dir / health.CHECKOUT_CACHE).read_text())["logs"]), 5)
+            self.run_once(at=NOW + 120)
+            self.assertEqual(self.ids(self.run_once(at=NOW + 240)), ["checkout_slow"])
+
+    def test_a_log_past_the_per_log_cap_keeps_its_prefix_and_says_so(self) -> None:
+        for _ in range(12):
+            self.job(700)
+        with mock.patch.object(health, "CHECKOUT_MAX_LOG_BYTES", 400):
+            self.run_once()
+        logs = json.loads((self.dir / health.CHECKOUT_CACHE).read_text())["logs"]
+        self.assertTrue(all(e.get("truncated") for e in logs.values()))
+
+    def test_a_corrupt_cache_or_a_future_step_is_ignored(self) -> None:
+        paths = [self.job(700) for _ in range(12)]
+        logs = {}
+        for p in paths:
+            st = p.stat()
+            logs[f"actions-runner-glaeda/{p.name}"] = {"size": st.st_size, "mtime": st.st_mtime, "steps": [[1]]}
+        (self.dir / health.CHECKOUT_CACHE).write_text(json.dumps({"schema": health.CHECKOUT_CACHE_SCHEMA, "logs": logs}))
+        self.assertEqual(self.ids(self.run_once()), ["checkout_slow"])  # re-read, not crashed
+        future = {k: {**v, "steps": [[NOW + 86400, 900.0]]} for k, v in
+                  json.loads((self.dir / health.CHECKOUT_CACHE).read_text())["logs"].items()}
+        (self.dir / health.CHECKOUT_CACHE).write_text(json.dumps({"schema": health.CHECKOUT_CACHE_SCHEMA, "logs": future}))
+        self.assertEqual(self.run_once()["findings"], [])
+
+    def test_a_cache_that_cannot_be_written_still_reports(self) -> None:
+        for _ in range(12):
+            self.job(700)
+        with mock.patch.object(health, "write_json", side_effect=OSError("disk full")):
+            self.assertEqual(self.ids(health.run(self.mini, False, now=NOW)), ["checkout_slow"])
+            self.assertEqual(health.check_checkout_steps(self.mini, NOW, self.dir / "c.json")[0]["id"], "checkout_slow")
+
+    def test_a_failure_in_the_check_is_no_finding_and_spares_the_pass(self) -> None:
+        self.mini.worker_logs = mock.Mock(side_effect=RuntimeError("boom"))
+        self.assertEqual(self.run_once()["findings"], [])
+
+    def test_p90_is_the_nearest_rank(self) -> None:
+        for i in range(10):
+            self.job(100 + i)
+        self.assertIn("p90 108 s", self.run_once()["findings"][0]["evidence"])
 
 
 class DaemonHeal(Base):

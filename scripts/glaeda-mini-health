@@ -84,8 +84,9 @@ Each run checks, as the runner user and without sudo:
                                      CHECKOUT_SLOW_S (60 s) across at least CHECKOUT_MIN_SAMPLES of them in the
                                      last CHECKOUT_WINDOW_S (3 days); the fleet's median is under 10 s. Read from
                                      the timings the runners already log (each runner's _diag/Worker_*.log
-                                     StepsRunner lines, the newest CHECKOUT_MAX_LOGS of them, each parsed once and
-                                     kept in checkout-steps.json beside STATE). A mini whose console never answers
+                                     StepsRunner lines, the newest CHECKOUT_MAX_LOGS of them, at most
+                                     CHECKOUT_PASS_BYTES read a pass, each parsed once and kept in
+                                     checkout-steps.json beside STATE). A mini whose console never answers
                                      a macOS privacy (TCC) prompt stalls every git script for its timeout (about
                                      100 s per `git submodule` call, 2026-10-27), as can a slow network or disk.
                                      Reported only (a warning); it never refuses or delays a job.
@@ -195,7 +196,10 @@ CHECKOUT_SLOW_S = 60  # the fleet's checkout median is 8 s (2026-10-27); a mini 
 CHECKOUT_MIN_SAMPLES = 10
 CHECKOUT_WINDOW_S = 3 * 86400
 CHECKOUT_MAX_LOGS = 80  # the newest worker logs (one per job) across this mini's runners
-CHECKOUT_MAX_LOG_BYTES = 16 << 20  # a worker log is about 0.2 to 1 MB; past this the rest is not read
+CHECKOUT_MAX_LOG_BYTES = 16 << 20  # a worker log is about 0.2 to 1 MB; past this the rest is not read (checkout
+# runs at a job's start, so a longer log's checkout steps are in this prefix; its cache entry says "truncated")
+CHECKOUT_PASS_BYTES = 64 << 20  # read per pass at most: logs past it wait for the next pass (2 minutes later)
+CHECKOUT_MAX_DIR_ENTRIES = 5000  # _diag entries looked at per runner (the runner keeps a few hundred)
 CHECKOUT_CACHE = "checkout-steps.json"  # beside STATE: each parsed log's (size, mtime) and its checkout times
 CHECKOUT_CACHE_SCHEMA = "glaeda-mini-health-checkout-steps/v1"
 WORKER_LOG = re.compile(r"Worker_[0-9]{8}-[0-9]{6}-utc\.log")
@@ -377,18 +381,22 @@ class Mini:
         return self._hook or None
 
     def worker_logs(self) -> list[tuple[str, Path, int, float]]:
-        """(key, path, size, mtime) of each runner's worker logs, any age; key is "<runner dir>/<file>"."""
+        """(key, path, size, mtime) of each runner's worker logs, any age; key is "<runner dir>/<file>". At most
+        CHECKOUT_MAX_DIR_ENTRIES _diag entries are looked at per runner."""
         out = []
         for d in self.runner_dirs():
-            with contextlib.suppress(OSError):
-                for p in (d / "_diag").iterdir():
-                    if WORKER_LOG.fullmatch(p.name):
+            with contextlib.suppress(OSError), os.scandir(d / "_diag") as it:
+                for n, e in enumerate(it):
+                    if n >= CHECKOUT_MAX_DIR_ENTRIES:
+                        break
+                    if WORKER_LOG.fullmatch(e.name):
                         with contextlib.suppress(OSError):
-                            st = p.stat()
-                            out.append((f"{d.name}/{p.name}", p, st.st_size, st.st_mtime))
+                            st = e.stat(follow_symlinks=False)
+                            out.append((f"{d.name}/{e.name}", Path(e.path), st.st_size, st.st_mtime))
         return out
 
     def read_log(self, path: Path, limit: int) -> str | None:
+        """The first `limit` bytes of a log, or None when it cannot be read."""
         try:
             with open(path, "rb") as fh:
                 return fh.read(limit).decode("utf-8", "replace")
@@ -1319,9 +1327,33 @@ def checkout_durations(text: str) -> list[tuple[float, float]]:
     return out
 
 
+def finite(x: Any) -> bool:
+    return isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x)
+
+
+def cached_steps(hit: Any, size: int, mtime: float) -> list[list[float]] | None:
+    """A cache entry's steps when it is for this size and mtime and every step is a finite (end, seconds) pair."""
+    if not isinstance(hit, dict) or hit.get("size") != size or hit.get("mtime") != mtime:
+        return None
+    steps = hit.get("steps")
+    if not isinstance(steps, list) or len(steps) > 1000:
+        return None
+    if not all(isinstance(st, list) and len(st) == 2 and all(finite(v) and abs(v) < 1e11 for v in st) for st in steps):
+        return None
+    return steps
+
+
 def check_checkout_steps(mini: Mini, now: float, cache_path: Path, remember: bool = True) -> list[dict[str, Any]]:
     """checkout_slow: the median checkout step over this mini's recent jobs, from its worker logs. Each log is
-    parsed once (cached by size and mtime), so a pass reads only the logs that changed."""
+    parsed once (cached by size and mtime), so a pass reads only the logs that changed. Observation only: a
+    failure here is no finding and never stops the rest of the pass."""
+    try:
+        return _check_checkout_steps(mini, now, cache_path, remember)
+    except Exception:  # noqa: BLE001  (an unreadable log or cache must not cost the other checks)
+        return []
+
+
+def _check_checkout_steps(mini: Mini, now: float, cache_path: Path, remember: bool) -> list[dict[str, Any]]:
     recent = sorted((w for w in mini.worker_logs() if 0 <= now - w[3] <= CHECKOUT_WINDOW_S),
                     key=lambda w: w[3], reverse=True)[:CHECKOUT_MAX_LOGS]
     cache = load_json(cache_path)
@@ -1329,21 +1361,28 @@ def check_checkout_steps(mini: Mini, now: float, cache_path: Path, remember: boo
     logs = logs if isinstance(logs, dict) else {}
     kept: dict[str, Any] = {}
     samples: list[float] = []
+    budget = CHECKOUT_PASS_BYTES
     for key, path, size, mtime in recent:
         hit = logs.get(key)
-        if isinstance(hit, dict) and hit.get("size") == size and hit.get("mtime") == mtime \
-                and isinstance(hit.get("steps"), list):
-            steps = hit["steps"]
-        else:
-            text = mini.read_log(path, CHECKOUT_MAX_LOG_BYTES)
+        steps = cached_steps(hit, size, mtime)
+        truncated = bool(hit.get("truncated")) if steps is not None else False
+        if steps is None:
+            if budget <= 0:
+                continue  # read on a later pass
+            limit = min(CHECKOUT_MAX_LOG_BYTES, budget)
+            text = mini.read_log(path, limit)
             if text is None:
                 continue
+            budget -= min(size, limit)
+            if size > limit and limit < CHECKOUT_MAX_LOG_BYTES:
+                continue  # cut short by the pass budget, not the per-log cap: read whole on a later pass
+            truncated = size > limit
             steps = [[round(at), round(sec, 1)] for at, sec in checkout_durations(text)]
-        kept[key] = {"size": size, "mtime": mtime, "steps": steps}
-        samples += [float(sec) for at, sec in steps
-                    if isinstance(at, (int, float)) and isinstance(sec, (int, float)) and now - at <= CHECKOUT_WINDOW_S]
+        kept[key] = {"size": size, "mtime": mtime, "steps": steps, **({"truncated": True} if truncated else {})}
+        samples += [float(sec) for at, sec in steps if 0 <= now - at <= CHECKOUT_WINDOW_S]
     if remember and kept != logs:
-        write_json(cache_path, {"schema": CHECKOUT_CACHE_SCHEMA, "logs": kept})
+        with contextlib.suppress(OSError):
+            write_json(cache_path, {"schema": CHECKOUT_CACHE_SCHEMA, "logs": kept})
     if len(samples) < CHECKOUT_MIN_SAMPLES:
         return []
     samples.sort()
@@ -1351,7 +1390,7 @@ def check_checkout_steps(mini: Mini, now: float, cache_path: Path, remember: boo
     p50 = samples[n // 2] if n % 2 else (samples[n // 2 - 1] + samples[n // 2]) / 2
     if p50 <= CHECKOUT_SLOW_S:
         return []
-    p90 = samples[min(n - 1, int(n * 0.9))]
+    p90 = samples[max(0, math.ceil(0.9 * n) - 1)]  # nearest rank
     return [finding("checkout_slow", "warn",
                     f"checkout steps took a median {p50:.0f} s (p90 {p90:.0f} s, slowest {samples[-1]:.0f} s) over "
                     f"{n} steps in the last {CHECKOUT_WINDOW_S // 86400} days; over {CHECKOUT_SLOW_S} s is slow",
