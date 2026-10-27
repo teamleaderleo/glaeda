@@ -1863,6 +1863,10 @@ class Runners(Base):
         (state / "registration-actions-runner-glaeda-2.json").write_text(json.dumps(
             {"cause": "registration_deleted", "runner": "mini-a-glaeda-2", "exits": 3, "first_seen": 1}))
         (state / "registration-actions-runner-glaeda.json").write_text("{}")  # cleared or foreign: ignored
+        (state / "registration-actions-runner-glaeda-3.json").write_text(json.dumps(
+            {"cause": "registration_deleted", "runner": "mini-a-glaeda-3"}))  # uninstalled: no runner dir
+        (home / "actions-runner-glaeda-2").mkdir()
+        (home / "actions-runner-glaeda-2/.runner").write_text("{}")
         self.mini.home = home
         report = self.run_once()
         self.assertEqual(self.ids(report), ["registration_deleted:2"])

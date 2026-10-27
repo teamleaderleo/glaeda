@@ -1227,10 +1227,10 @@ class DeclaredRunnerTests(unittest.TestCase):
     def test_an_instance_registered_under_the_hostname_counts(self):
         doc = declared_bundle(["mini-a-glaeda", "mini-a-glaeda-1", "MINI-A.local-glaeda-2"])
         self.assertTrue(by_id(doc, "runners.missing@mini-a"), "a .local name is not the hostname alias")
-        hosts = {"mini-a": {"class": "std", "roles": ["ci-runner"], "hostname": "studio-a", "node_id": None,
-                            "lima_expected": [], "runners_declared": 2}}
+        hosts = {"mini-a": {"class": "std", "roles": ["ci-runner"], "hostname": "studio-a.example.com",
+                            "node_id": None, "lima_expected": [], "runners_declared": 3}}
         data = {"runners": [{"name": n, "status": "online", "busy": False, "labels": []}
-                            for n in ("mini-a-glaeda", "studio-a-glaeda-1")]}
+                            for n in ("mini-a-glaeda", "studio-a.example.com-glaeda-1", "studio-a-glaeda-2")]}
         doc = fs.build({"schema": fs.SOURCES_SCHEMA, "collected_at": AT, "sources": {
             "manifest": src({"fleet": "test", "hosts": hosts, "never_touch": []}), "runners": src(data)}}, at=AT)
         self.assertFalse(by_id(doc, "runners.missing"))

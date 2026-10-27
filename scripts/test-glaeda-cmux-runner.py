@@ -6320,7 +6320,8 @@ class GateTest(unittest.TestCase):
         # 2026-10-24 01:00Z: 36 org runners lost their registrations while the gate held them offline; each
         # listen.sh then restarted its listener about 33k times, and nothing said why.
         gate, _ = self.gate([None] * 20)
-        with mock.patch.object(hook.subprocess, "Popen", return_value=gate.child) as popen:
+        with mock.patch.object(hook.subprocess, "Popen", return_value=gate.child) as popen, \
+                mock.patch.object(hook, "processes", return_value={}):
             gate.start()
             self.deleted()
             gate.child.poll.return_value = 1
@@ -6344,7 +6345,8 @@ class GateTest(unittest.TestCase):
 
     def test_a_reconfigured_runner_listens_at_once_and_a_listener_that_stays_up_clears_the_record(self) -> None:
         gate, _ = self.gate([None] * 20)
-        with mock.patch.object(hook.subprocess, "Popen", return_value=gate.child) as popen:
+        with mock.patch.object(hook.subprocess, "Popen", return_value=gate.child) as popen, \
+                mock.patch.object(hook, "processes", return_value={}):
             gate.start()
             self.deleted()
             gate.child.poll.return_value = 1
@@ -6362,6 +6364,17 @@ class GateTest(unittest.TestCase):
             gate.step()
             self.assertFalse(hook.registration_file(self.state, self.runner).exists())
             self.assertIsNone(gate.registration)
+
+    def test_a_job_left_behind_keeps_the_exit_with_launchd(self) -> None:
+        gate, _ = self.gate([None] * 4)
+        with mock.patch.object(hook.subprocess, "Popen", return_value=gate.child):
+            gate.start()
+            self.deleted()
+            gate.child.poll.return_value = 1
+            worker = os.fspath(self.runner / "bin/Runner.Worker")
+            with mock.patch.object(hook, "processes", return_value={77: (1, f"{worker} spawnclient 3 4")}):
+                self.assertEqual(gate.step(), 1, "an orphaned Worker still runs: no backoff beside its job")
+        self.assertFalse(hook.registration_file(self.state, self.runner).exists())
 
     def test_any_other_exit_still_goes_to_launchd(self) -> None:
         gate, _ = self.gate([None] * 4)

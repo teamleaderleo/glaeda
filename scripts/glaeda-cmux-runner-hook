@@ -4293,6 +4293,18 @@ class Gate:
         worker = os.fspath(self.runner_dir / "bin" / "Runner.Worker")
         return tuple(pid for pid in pids if worker in table[pid][1])
 
+    def job_left(self) -> bool:
+        """After run.sh exited: a Runner.Worker of this runner anywhere (an orphan is no longer in tree()), or a
+        request its listener took and did not finish. A failed look counts as a job: the exit then goes to
+        launchd as before, never to the registration backoff, which would start a listener beside the job."""
+        try:
+            table = processes()
+        except Exception:  # noqa: BLE001
+            return True
+        worker = os.fspath(self.runner_dir / "bin" / "Runner.Worker")
+        found = any(command == worker or command.startswith(worker + " ") for _, command in table.values())
+        return found or self.taking() is not None
+
     def worker(self) -> bool:
         """A Runner.Worker under this runner's tree. A failed look counts as busy."""
         try:
@@ -4407,7 +4419,8 @@ class Gate:
             if code is not None:
                 self.child = None
                 if self.stop_deadline is None and not self.terminating and \
-                        (evidence := registration_deleted(self.runner_dir, self.started_wall)):
+                        (evidence := registration_deleted(self.runner_dir, self.started_wall)) and \
+                        not self.job_left():
                     self.registration = note_registration_deleted(self.state_dir, self.runner_dir, evidence,
                                                                   time.time())
                     gate_log(f"{REGISTRATION_DELETED}: GitHub deleted this runner's registration ({evidence}); it "

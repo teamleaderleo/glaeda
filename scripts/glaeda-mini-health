@@ -421,8 +421,10 @@ class Mini:
         out = []
         for path in sorted((self.home / ".local/state/glaeda/cmux-runner").glob("registration-*.json")):
             doc = load_json(path)
-            if doc.get("cause") == "registration_deleted":
-                out.append({**doc, "dir": path.name[len("registration-"):-len(".json")]})
+            name = path.name[len("registration-"):-len(".json")]
+            # an uninstalled runner (its directory removed) leaves a stale record that nothing will clear
+            if doc.get("cause") == "registration_deleted" and (self.home / name / ".runner").is_file():
+                out.append({**doc, "dir": name})
         return out
 
     def runner_agents(self) -> list[tuple[str, bool, bool, str]]:

@@ -1351,13 +1351,15 @@ class Builder:
         for name, m in self.members.items():
             if "ci-runner" not in m["roles"] or name in self.never:
                 continue
-            registered = {norm(r["name"]) for r in by_member.get(name, [])}
+            # every runner in scope: a name under the member's short hostname maps to no member (member_of)
+            registered = {norm(r["name"]) for _, r in every}
             declared = (self.hosts.get(name) or {}).get("runners_declared")
             if isinstance(declared, int) and not isinstance(declared, bool) and declared > 0:
                 # every declared instance by name: a host with some runners left still lost the others
                 # under the member's name (glaeda-cmux-runner-fleet passes --member) or, for an older install, the
                 # host's own name (glaeda-cmux-runner's default): either registration is that instance
-                aliases = [a for a, owner in self.aliases.items() if owner == name]
+                # (glaeda-cmux-runner's default takes the short hostname: worker.example.com registers worker-glaeda)
+                aliases = {short for a, owner in self.aliases.items() if owner == name for short in (a, a.split(".")[0])}
                 count = min(declared, MAX_DECLARED_RUNNERS)
                 missing = [n for k, n in enumerate(runner_names(name, count))
                            if not any(norm(runner_names(a, k + 1)[k]) in registered for a in aliases)]
@@ -1365,7 +1367,7 @@ class Builder:
                     continue
                 m["runners_missing"] = missing
                 summary = (f"{len(missing)} of {declared} declared runner(s) not registered: {', '.join(missing)}")
-            elif registered:
+            elif name in by_member:
                 continue
             else:
                 summary = "manifest role ci-runner but no runner registered"
