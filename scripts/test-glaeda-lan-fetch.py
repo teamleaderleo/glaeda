@@ -14,6 +14,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 import unittest.mock
 from pathlib import Path
 
@@ -388,6 +389,50 @@ class LanCacheTest(unittest.TestCase):
         self.assertEqual(serve.parse_request("git-upload-pack 'cmux.git'", "cache"), ("git", "", ["cmux"]))
         self.assertEqual(serve.parse_request("git-upload-pack '/cmux.git'", "cache"), ("git", "", ["cmux"]))
 
+
+    def test_an_object_over_the_cap_is_never_kept_or_served(self):
+        name = self.put(b"y" * 5000)
+        saved = serve.FILL_MAX_BYTES
+        serve.FILL_MAX_BYTES = 1000
+        self.addCleanup(setattr, serve, "FILL_MAX_BYTES", saved)
+        # A fill that finished before the first poll: checked once more before it is kept.
+        self.assertEqual(serve.fill(self.cache, name, curl=os.environ["FAKE_CURL"]), "larger than a cache object may be")
+        self.assertFalse(serve.stored(self.cache, name).exists())
+        serve.stored(self.cache, name).parent.mkdir(parents=True, exist_ok=True)
+        serve.stored(self.cache, name).write_bytes(b"y" * 5000)  # one kept before the cap
+        self.assertIsNone(serve.open_cached(self.cache, name))
+
+    def test_a_replaced_partial_file_is_never_linked_to_dest(self):
+        data = os.urandom(20000)
+        name = self.put(data)
+        real = lf.cache_transfer
+
+        def swap(config, address, name, fd, deadline, cancel):
+            result = real(config, address, name, fd, deadline, cancel)
+            if not result[0]:  # the host that answered: swap the file its bytes went to
+                partial = next(p for p in self.out.iterdir() if p.name.startswith(".archive.lan-")
+                               and os.stat(p).st_ino == os.fstat(fd).st_ino)
+                partial.unlink()
+                partial.write_bytes(b"planted")
+            return result
+
+        with mock.patch.object(lf, "cache_transfer", swap):
+            code, record, dest = self.fetch(name)
+        self.assertEqual(code, 1, record)
+        self.assertFalse(dest.exists())
+        self.assertEqual(next(self.out.glob(".archive.lan-*")).read_bytes(), b"planted")  # not ours to remove
+
+    def test_the_mirror_list_is_admitted_and_bounded(self):
+        self.assertEqual(self.fetch(self.put(b"x" * 10))[0], 0)  # makes the run dir
+        run_dir = Path(os.environ["FAKE_CACHE"] + ".run")
+        taken = [serve.admit(run_dir, None, queue="cache-queue", places=1)]
+        saved = serve.CACHE_QUEUE
+        serve.CACHE_QUEUE = 1
+        self.addCleanup(setattr, serve, "CACHE_QUEUE", saved)
+        with mock.patch.object(serve, "say"), mock.patch.object(serve.signal, "alarm"):
+            self.assertEqual(serve.serve_mirrors(self.mirrors, run_dir, {}), 4)
+        for fd in taken[0]:
+            os.close(fd)
 
 class LanFetchTest(unittest.TestCase):
     def setUp(self) -> None:

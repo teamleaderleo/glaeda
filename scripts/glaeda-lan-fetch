@@ -589,9 +589,10 @@ def cache_object(bucket: object, ns: object, file: object) -> str | None:
     return None
 
 
-def cache_transfer(config: dict, address: str, name: str, partial: Path, deadline: float,
+def cache_transfer(config: dict, address: str, name: str, partial: int, deadline: float,
                    cancel: threading.Event) -> tuple[str, int, float]:
-    """Stream NAME from the cache host at ADDRESS into PARTIAL: (why not or '' or 'miss', bytes, wait seconds).
+    """Stream NAME from the cache host at ADDRESS into the open file PARTIAL: (why not or '' or 'miss', bytes,
+    wait seconds).
 
     The host answers `filling BYTES` lines while it fills the object from the bucket; the ssh is killed at
     DEADLINE, as soon as CANCEL is set, or after CACHE_STALL seconds with neither a line nor a byte.
@@ -628,16 +629,18 @@ def cache_transfer(config: dict, address: str, name: str, partial: Path, deadlin
         if len(words) != 2 or words[0] != "hit-cache" or not words[1].isdecimal():
             return (stopped[0] if stopped else "answered " + (" ".join(words)[:60] or "nothing")), 0, 0.0
         size, got, wait = int(words[1]), 0, time.monotonic() - started
-        with partial.open("r+b") as out:
-            while got < size:
-                chunk = proc.stdout.read(min(1 << 20, size - got))
-                if not chunk:
-                    break
-                alive[0] = time.monotonic()
-                out.write(chunk)
-                got += len(chunk)
-            out.flush()
-            os.fsync(out.fileno())
+        os.lseek(partial, 0, os.SEEK_SET)
+        os.ftruncate(partial, 0)
+        while got < size:
+            chunk = proc.stdout.read(min(1 << 20, size - got))
+            if not chunk:
+                break
+            alive[0] = time.monotonic()
+            view = memoryview(chunk)
+            while view:
+                view = view[os.write(partial, view):]
+            got += len(chunk)
+        os.fsync(partial)
         if stopped:
             return stopped[0], got, wait
         return ("" if got == size else f"short stream ({got} of {size} bytes)"), got, wait
@@ -648,6 +651,14 @@ def cache_transfer(config: dict, address: str, name: str, partial: Path, deadlin
             os.killpg(proc.pid, signal.SIGKILL)
         proc.stdout.close()
         proc.wait()
+
+
+def same_file(path: Path, info: os.stat_result) -> bool:
+    try:
+        now = os.lstat(path)
+    except OSError:
+        return False
+    return stat.S_ISREG(now.st_mode) and (now.st_dev, now.st_ino) == (info.st_dev, info.st_ino)
 
 
 def fetch_cache(name: str, dest: Path, config: dict | None, deadline: float | None = None,
@@ -674,22 +685,33 @@ def fetch_cache(name: str, dest: Path, config: dict | None, deadline: float | No
             break
         partial = dest.parent / f".{dest.name}.lan-{os.getpid()}-{threading.get_ident()}-{secrets.token_hex(6)}"
         try:
-            os.close(os.open(partial, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644))
+            fd = os.open(partial, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
         except OSError as error:
             return EXIT_ERROR, {**record, "error": f"partial file: {type(error).__name__}"}
+        # Written through the descriptor this call created, never reopened by name; DEST is linked only to
+        # that same file (checked by inode on both sides of the link).
+        mine = os.fstat(fd)
         try:
-            why, size, wait = cache_transfer(config, address, name, partial, deadline, cancel)
+            why, size, wait = cache_transfer(config, address, name, fd, deadline, cancel)
             if why == "miss":
                 return EXIT_MISS, {**record, "reason": "not in the bucket", "seconds": round(time.monotonic() - started, 3)}
             if not why:
-                os.link(partial, dest)  # no-replace: fails if DEST appeared meanwhile
+                if not same_file(partial, mine):
+                    raise FileNotFoundError("the partial file was replaced")
+                os.link(partial, dest, follow_symlinks=False)  # no-replace: fails if DEST appeared meanwhile
+                if not same_file(dest, mine):
+                    with contextlib.suppress(OSError):
+                        dest.unlink()
+                    raise FileNotFoundError("the partial file was replaced")
                 return EXIT_HIT, {**record, "address": address, "bytes": size, "wait_seconds": round(wait, 3),
                                   "seconds": round(time.monotonic() - started, 3)}
             errors.append(f"{address}: {why}")
         except OSError as error:
             errors.append(f"{address}: {type(error).__name__}")
         finally:
-            partial.unlink(missing_ok=True)
+            os.close(fd)
+            if same_file(partial, mine):
+                partial.unlink(missing_ok=True)
     return EXIT_ERROR, {**record, "error": "; ".join(errors)[:400], "seconds": round(time.monotonic() - started, 3)}
 
 

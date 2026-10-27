@@ -997,7 +997,7 @@ def open_cached(cache: Path, name: str) -> tuple[int, int] | None:
     finally:
         os.close(parent)
     info = os.fstat(fd)
-    if stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid() and info.st_size > 0:
+    if stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid() and 0 < info.st_size <= FILL_MAX_BYTES:
         fcntl.fcntl(fd, fcntl.F_SETFL, fcntl.fcntl(fd, fcntl.F_GETFL) & ~os.O_NONBLOCK)
         return fd, info.st_size
     os.close(fd)
@@ -1065,13 +1065,18 @@ def fill(cache: Path, name: str, timeout: float = FILL_TIMEOUT, curl: str = CURL
                 with contextlib.suppress(OSError):
                     os.killpg(proc.pid, signal.SIGKILL)
                 proc.wait()
+                proc.stdout.close()
                 part.unlink(missing_ok=True)
                 return "timed out" if written <= FILL_MAX_BYTES else "larger than a cache object may be"
             report(part)
-    http = (proc.stdout.read() or "").strip()
+    with proc.stdout:
+        http = (proc.stdout.read() or "").strip()
     if code != 0 or not part.is_file() or part.stat().st_size == 0:
         part.unlink(missing_ok=True)
         return "miss" if http == "404" else f"curl exit {code} http {http}"
+    if part.stat().st_size > FILL_MAX_BYTES:  # a chunked answer that finished between two polls
+        part.unlink(missing_ok=True)
+        return "larger than a cache object may be"
     os.replace(part, stored(cache, name))
     return ""
 
@@ -1208,11 +1213,22 @@ def ready_mirrors(mirrors: Path) -> dict[str, str]:
 
 def serve_mirrors(mirrors: Path, run_dir: Path, record: dict) -> int:
     """`mirrors-v1`: `mirrors N` then N lines `NAME HEAD`, the mirrors ready to fetch from."""
-    ready = ready_mirrors(mirrors)
-    say(f"mirrors {len(ready)}")
-    os.write(1, "".join(f"{name} {head}\n" for name, head in sorted(ready.items())).encode())
-    log(run_dir, {**record, "outcome": "mirrors", "count": len(ready)})
-    return 0
+    signal.alarm(60)  # a few hundred bytes: a client that never reads them holds nothing for long
+    admitted = admit(run_dir, None, queue="cache-queue", places=CACHE_QUEUE)
+    if admitted is None:
+        log(run_dir, {**record, "outcome": "busy"})
+        print("glaeda-seed-serve: busy", file=sys.stderr)
+        return 4
+    try:
+        ready = ready_mirrors(mirrors)
+        say(f"mirrors {len(ready)}")
+        os.write(1, "".join(f"{name} {head}\n" for name, head in sorted(ready.items())).encode())
+        log(run_dir, {**record, "outcome": "mirrors", "count": len(ready)})
+        return 0
+    finally:
+        for fd in admitted:
+            os.close(fd)
+        signal.alarm(0)
 
 
 def serve_git(name: str, mirrors: Path, run_dir: Path, client: str, record: dict) -> int:
