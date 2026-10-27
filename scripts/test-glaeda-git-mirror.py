@@ -478,6 +478,131 @@ class Mirror(unittest.TestCase):
         self.assertEqual((result["state"], result["health"]), ("plan", "missing"))
         self.assertFalse(self.mirror.exists())
 
+    # Source selection (the capture download picker, cmuxterm-hq#4608/#4618): measure, choose, fall back.
+
+    def publish_bundle(self) -> str:
+        """A newer bundle of upstream as it is now (feat-cmux-next moved to main), named the newest."""
+        sh("git", "branch", "-f", "feat-cmux-next", "main", cwd=self.upstream)
+        sh("git", "branch", "-f", "nightly-next", "main", cwd=self.upstream)
+        key = "git-mirror-cmux-2026102712." + sh("git", "rev-parse", "feat-cmux-next", cwd=self.upstream)[:12]
+        staged = Path(tempfile.mkdtemp(dir=self.temp.name))
+        sh("git", "bundle", "create", os.fspath(staged / gm.BUNDLE_FILE), "--branches", cwd=self.upstream)
+        with tarfile.open(self.bucket / f"v1/any/objects/{key}.tar.gz", "w:gz") as archive:
+            archive.add(staged / gm.BUNDLE_FILE, arcname=f"./{gm.BUNDLE_FILE}")
+        (self.bucket / f"v1/any/latest/{gm.BUNDLE_PREFIX}").write_text(key + "\n")
+        return key
+
+    def measured(self, **rates: float) -> None:
+        now = time.time()
+        (gm.GIT_DIR / gm.ROUTE_STATE).write_text(json.dumps({r: {"rate": v, "at": now} for r, v in rates.items()}))
+
+    def bundle_downloads(self) -> list[str]:
+        return [url for url in self.downloads if "/objects/" in url]
+
+    def test_slow_direct_github_catches_up_from_the_faster_bundle_then_fetches_the_rest(self) -> None:
+        gm.run(True, home=self.home)
+        self.downloads.clear()
+        bundled = self.commit("two")
+        key = self.publish_bundle()
+        after = self.commit("three")  # pushed after the bundle: only GitHub has it
+        self.measured(github=100_000)  # 0.1 MB/s, as the minis measured GitHub on 2026-10-27
+        probes = []
+        with mock.patch.object(gm, "probe_rate", lambda url, ranged: probes.append(url) or 10_000_000.0):
+            result = gm.run(True, home=self.home)
+        self.assertEqual(result["state"], "applied", result)
+        select = result["source_select"]
+        self.assertEqual((select["chosen"], select["why"], select["key"]), ("bundle", "github is under the threshold", key))
+        self.assertEqual(select["rates_mb_s"], {"github": 0.1, "bundle": 10.0})
+        self.assertTrue(select["bundle"]["ok"], select)
+        self.assertEqual(probes, [f"https://bucket.test/v1/any/objects/{key}.tar.gz"])
+        self.assertEqual(self.bundle_downloads(), [f"https://bucket.test/v1/any/objects/{key}.tar.gz"])
+        sh("git", "-C", os.fspath(self.mirror), "cat-file", "-e", f"{bundled}^{{commit}}")
+        self.assertEqual(result["heads"]["main"], after)  # GitHub, the fallback, still ends the pass
+        self.assertEqual(json.loads(gm.RECORD.read_text())["source_select"]["chosen"], "bundle")
+        self.assertIn("repack", result)  # the bundle's second whole-history pack is folded at once
+        # Next pass: the mirror holds the bundle's tip, so GitHub alone, however slow, and no download.
+        self.downloads.clear()
+        result = gm.run(True, home=self.home)
+        self.assertEqual(result["source_select"]["chosen"], "github")
+        self.assertEqual(result["source_select"]["why"], "the bundle has nothing the mirror lacks")
+        self.assertEqual(self.bundle_downloads(), [])
+
+    def test_fast_direct_github_never_touches_the_bundle(self) -> None:
+        gm.run(True, home=self.home)
+        self.downloads.clear()
+        self.commit("two")
+        self.publish_bundle()
+        self.measured(github=40_000_000)
+        result = gm.run(True, home=self.home)
+        self.assertEqual((result["source_select"]["chosen"], result["source_select"]["why"]),
+                         ("github", "github meets the threshold"))
+        self.assertEqual(self.downloads, [])
+
+    def test_a_bundle_route_no_faster_than_github_is_not_taken(self) -> None:
+        gm.run(True, home=self.home)
+        self.commit("two")
+        self.publish_bundle()
+        self.measured(github=1_500_000, bundle=2_500_000)  # bundle over threshold but not twice GitHub
+        self.downloads.clear()
+        result = gm.run(True, home=self.home)
+        self.assertEqual(result["source_select"]["why"], "the bundle's route is no faster")
+        self.assertEqual(self.bundle_downloads(), [])
+
+    def test_a_failed_github_fetch_falls_back_to_the_bundle(self) -> None:
+        gm.run(True, home=self.home)
+        bundled = self.commit("two")
+        self.publish_bundle()
+        self.measured(github=40_000_000, bundle=10_000_000)
+        gm.REPO_URL, old = (Path(self.temp.name) / "gone").as_uri(), gm.REPO_URL
+        self.addCleanup(setattr, gm, "REPO_URL", old)
+        result = gm.run(True, home=self.home)
+        self.assertEqual(result["state"], "fetch-failed")
+        self.assertEqual((result["source_select"]["chosen"], result["source_select"]["why"]),
+                         ("bundle", "github failed this pass"))
+        self.assertEqual(result["heads"]["main"], bundled)  # caught up as far as the bundle goes
+        # Each failed fetch folds a near-zero rate into GitHub's average (here two: before and after the bundle).
+        self.assertLessEqual(json.loads((gm.GIT_DIR / gm.ROUTE_STATE).read_text())["github"]["rate"], 10_000_001)
+
+    def test_the_bundle_never_takes_a_branch_back(self) -> None:
+        gm.run(True, home=self.home)
+        self.commit("two")
+        key = self.publish_bundle()  # main at "two"
+        newer = self.commit("three")
+        self.assertEqual(gm.run(True, home=self.home)["heads"]["main"], newer)  # GitHub gave main "three"
+        result = gm.catch_up_from_bundle(self.mirror, key)
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(sh("git", "-C", os.fspath(self.mirror), "rev-parse", "main"), newer)
+
+    def test_a_failed_bundle_is_not_retried_every_pass(self) -> None:
+        gm.run(True, home=self.home)
+        self.commit("two")
+        key = self.publish_bundle()
+        (self.bucket / f"v1/any/objects/{key}.tar.gz").unlink()
+        self.measured(github=100_000, bundle=10_000_000)
+        result = gm.run(True, home=self.home)
+        self.assertFalse(result["source_select"]["bundle"]["ok"])
+        self.assertEqual(result["state"], "applied")  # GitHub, slow but working, still fetched
+        self.downloads.clear()
+        result = gm.run(True, home=self.home)
+        self.assertEqual(result["source_select"]["why"], "the bundle failed within BUNDLE_RETRY")
+        self.assertEqual(self.bundle_downloads(), [])
+
+    def test_a_stale_github_rate_is_probed_and_a_fresh_one_is_not(self) -> None:
+        self.assertIsNone(gm.github_probe_url())  # a file:// upstream is never probed
+        with mock.patch.object(gm, "REPO_URL", "https://github.com/manaflow-ai/cmux.git"):
+            self.assertEqual(gm.github_probe_url(), "https://codeload.github.com/manaflow-ai/cmux/tar.gz/refs/heads/main")
+            calls = []
+            with mock.patch.object(gm, "probe_rate", lambda url, ranged: calls.append((url, ranged)) or 30e6), \
+                    mock.patch.object(gm, "newest_bundle", lambda mirror: None):
+                self.mirror.mkdir()
+                select = gm.choose_source(self.mirror)
+                self.assertEqual((select["chosen"], select["probed"]), ("github", ["github"]))
+                self.assertEqual(calls, [(gm.github_probe_url(), False)])
+                self.assertEqual(gm.choose_source(self.mirror)["probed"], [])  # measured within PROBE_EVERY
+                old = time.time() - gm.PROBE_EVERY - 1
+                (gm.GIT_DIR / gm.ROUTE_STATE).write_text(json.dumps({"github": {"rate": 30e6, "at": old}}))
+                self.assertEqual(gm.choose_source(self.mirror)["probed"], ["github"])
+
 
 class Fetch(unittest.TestCase):
     def test_every_try_is_bounded_and_retried_with_the_low_speed_abort(self) -> None:

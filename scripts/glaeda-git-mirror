@@ -18,6 +18,9 @@ fetch from GitHub never happens during a build.
 - Every LaunchAgent pass (StartInterval 60) fetches those three refs from GitHub. A pass with nothing
   new takes under a second. Each try has a time limit (FETCH_TIMEOUT) and git's low-speed abort (under
   1 KiB/s for 60 s); there are FETCH_TRIES tries with backoff.
+- Each pass measures its routes (ROUTES) and records the choice as `source_select` in the record: when GitHub
+  measures under MIN_RATE or its fetch fails, and the R2 bundle is newer than the mirror and its route is
+  faster, the bundle catches the mirror up first; GitHub's fetch still ends the pass.
 - A missing or broken mirror is seeded from the R2 git bundle that cmux's git-mirror-bundle.yml
   refreshes (BUCKET_URL v1/any, pointer git-mirror-cmux-), never from a full GitHub clone. The bundle
   is downloaded and checked with `git bundle verify`. A missing mirror is built in a staging
@@ -90,6 +93,29 @@ PACK_LIMIT = 24
 SOURCE_CONFIG = ".config/glaeda/lan-cache/config.json"
 SOURCES = ("direct",)
 REPACK_TIMEOUT = 1200
+# Where a pass takes new commits from, measured, never listed by host (the capture download picker,
+# cmuxterm-hq#4608/#4618). On 2026-10-27 the minis behind one gateway got GitHub at 0.1-45 MB/s and fetches
+# hung or died with early EOF, while the bucket's edge answered at about 10 MB/s. The bundle is the whole
+# history (2.4 GB), so it only pays when the mirror is far behind: the mirror lacking the bundle's tip (written
+# at most 12 hours ago) means GitHub has not delivered for that long. Each route's rate is a
+# moving average in GIT_DIR/ROUTE_STATE, from real transfers and from a bounded probe once PROBE_EVERY. GitHub
+# stays first, as before; when it measures under MIN_RATE (or this pass's fetch failed) and the bucket's newest
+# bundle holds commits the mirror lacks, the bundle catches the mirror up when its route measures at least
+# MIN_RATE and more than twice GitHub's (after a failed fetch, MIN_RATE alone), and GitHub's fetch then
+# brings only what came after it. GitHub is the fallback either way: the pass always ends with its fetch.
+ROUTES = ("github", "bundle")
+ROUTE_STATE = "routes.json"
+ROUTE_MAX_AGE = 6 * 3600
+PROBE_EVERY = 3600
+PROBE_BYTES = 8 << 20
+PROBE_SECONDS = 10.0
+# A transfer smaller than this says nothing about its route's rate (a minute's fetch is usually kilobytes).
+MEASURE_BYTES = 1 << 20
+MIN_RATE = 2_000_000
+# A healthy mirror's catch-up from the bundle (2.4 GB) at MIN_RATE or better, with room; a failed one is not
+# tried again for BUNDLE_RETRY.
+BUNDLE_TIMEOUT = 2400
+BUNDLE_RETRY = 1800
 # A release reaches every mini of a site at once and setup writes their source together, so a host's first seed
 # (no mirror at all) waits SEED_SLOT_S times a slot fixed by its name, from the first pass that found no mirror:
 # a site's minis seed over its uplink one or two at a time, within SEED_SLOTS * SEED_SLOT_S. A repair never waits.
@@ -410,15 +436,19 @@ def unpack(archive: Path, extension: str, into: Path) -> None:
                        pass_fds=held())
 
 
-def seed_from_bundle(staging: Path, work: Path, fetch_url: Callable[[str, Path, float], None] = download) -> str:
-    """Fill the bare repository `staging` from the newest R2 bundle; returns its key."""
-    key = bundle_key(work, fetch_url)
+def seed_from_bundle(staging: Path, work: Path, fetch_url: Callable[[str, Path, float], None] = download, *,
+                     forward_only: bool = False, key: str = "", timeout: float = DOWNLOAD_TIMEOUT) -> str:
+    """Fill the bare repository `staging` from the newest R2 bundle (or `key`); returns its key.
+
+    `forward_only` (a healthy mirror catching up from the bundle): a branch moves to the bundle's tip only when
+    that tip is ahead of it, so the bundle never takes a branch back behind what GitHub already gave."""
+    key = key or bundle_key(work, fetch_url)
     extensions = ("tar.zst", "tar.gz") if zstd() else ("tar.gz",)
     last: Exception | None = None
     for extension in extensions:
         archive = work / f"bundle.{extension}"
         try:
-            fetch_url(f"{BUCKET_URL.rstrip('/')}/v1/any/objects/{key}.{extension}", archive, DOWNLOAD_TIMEOUT)
+            fetch_url(f"{BUCKET_URL.rstrip('/')}/v1/any/objects/{key}.{extension}", archive, timeout)
         except (OSError, subprocess.SubprocessError) as error:
             last = error
             continue
@@ -442,9 +472,27 @@ def seed_from_bundle(staging: Path, work: Path, fetch_url: Callable[[str, Path, 
         for branch in BRANCHES:
             if f"refs/heads/{branch}" not in tips:
                 raise RuntimeError(f"bundle {key} has no {branch}")
-            git(staging, "update-ref", f"refs/heads/{branch}", tips[f"refs/heads/{branch}"], timeout=60)
+            tip = tips[f"refs/heads/{branch}"]
+            if forward_only and not is_behind(staging, f"refs/heads/{branch}", tip):
+                continue
+            git(staging, "update-ref", f"refs/heads/{branch}", tip, timeout=60)
         return key
     raise RuntimeError(f"no archive for {key}: {last}")
+
+
+def is_behind(repo: Path, ref: str, tip: str) -> bool:
+    """`ref` is missing, or an ancestor of `tip` other than `tip` itself."""
+    try:
+        current = git(repo, "rev-parse", "--verify", "-q", f"{ref}^{{commit}}", timeout=60).strip()
+    except subprocess.CalledProcessError:
+        return True
+    if current == tip:
+        return False
+    try:
+        git(repo, "merge-base", "--is-ancestor", current, tip, timeout=120)
+        return True
+    except subprocess.CalledProcessError:
+        return False
 
 
 # Written before a repair changes anything and removed only once it verified, so a repair killed part way
@@ -582,10 +630,11 @@ def seed(mirror: Path, from_github: bool, fetch_url: Callable[[str, Path, float]
         shutil.rmtree(work, ignore_errors=True)
 
 
-def fold_packs(mirror: Path) -> dict | None:
-    """Fold small packs geometrically once there are more than PACK_LIMIT; readers keep working throughout."""
+def fold_packs(mirror: Path, force: bool = False) -> dict | None:
+    """Fold small packs geometrically once there are more than PACK_LIMIT (or `force`: a bundle catch-up added
+    a second whole-history pack, which geometric folding combines with the first); readers keep working."""
     packs = list((mirror / "objects" / "pack").glob("*.pack"))
-    if len(packs) <= PACK_LIMIT:
+    if len(packs) <= (1 if force else PACK_LIMIT):
         return None
     started = time.monotonic()
     status, err = run_group([GIT, "-C", os.fspath(mirror), "repack", "-d", "-q", "--geometric=2"], REPACK_TIMEOUT)
@@ -655,6 +704,177 @@ def seed_wait(home: Path | None = None, now: float | None = None, *, keep: bool 
     return max(0.0, deadline - now)
 
 
+def route_entries(now: float) -> dict:
+    """GIT_DIR/ROUTE_STATE: {route: {"rate", "at"}} measured within ROUTE_MAX_AGE, plus "bundle_failed_at"."""
+    try:
+        doc = json.loads((GIT_DIR / ROUTE_STATE).read_text())
+    except (OSError, ValueError, RecursionError):
+        return {}
+    kept: dict = {}
+    if not isinstance(doc, dict):
+        return kept
+    for route in ROUTES:
+        entry = doc.get(route)
+        if isinstance(entry, dict):
+            rate, at = entry.get("rate"), entry.get("at")
+            if (isinstance(rate, (int, float)) and isinstance(at, (int, float)) and 0 < rate < 1e12
+                    and -3600 <= now - at <= ROUTE_MAX_AGE):
+                kept[route] = {"rate": float(rate), "at": float(at)}
+    failed = doc.get("bundle_failed_at")
+    if isinstance(failed, (int, float)) and 0 <= now - failed <= BUNDLE_RETRY:
+        kept["bundle_failed_at"] = float(failed)
+    return kept
+
+
+def write_routes(doc: dict) -> None:
+    incoming = GIT_DIR / f".{ROUTE_STATE}.{os.getpid()}"
+    with_suppressed(lambda: (incoming.write_text(json.dumps(doc) + "\n"), incoming.rename(GIT_DIR / ROUTE_STATE)))
+
+
+def note_rate(route: str, rate: float, now: float | None = None) -> None:
+    """Fold `rate` (bytes per second) into `route`'s moving average (the pass holds the flock)."""
+    now = time.time() if now is None else now
+    doc = route_entries(now)
+    old = doc.get(route)
+    doc[route] = {"rate": max(1.0, rate if old is None else 0.5 * old["rate"] + 0.5 * rate), "at": now}
+    write_routes(doc)
+
+
+def note_bundle_failed(now: float | None = None) -> None:
+    doc = route_entries(time.time() if now is None else now)
+    doc["bundle_failed_at"] = time.time() if now is None else now
+    write_routes(doc)
+
+
+def probe_rate(url: str, ranged: bool) -> float | None:
+    """Bytes per second reading the start of `url`: up to PROBE_BYTES within PROBE_SECONDS; None when nothing came."""
+    command = [CURL, "--fail", "--silent", "--location", "--connect-timeout", "5", "--max-time", str(int(PROBE_SECONDS)),
+               *(["--range", f"0-{PROBE_BYTES - 1}"] if ranged else []), "-o", "-", url]
+    started, got = time.monotonic(), 0
+    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, start_new_session=True,
+                               pass_fds=held())
+    try:
+        while got < PROBE_BYTES and time.monotonic() - started < PROBE_SECONDS:
+            chunk = process.stdout.read(1 << 16) if process.stdout else b""
+            if not chunk:
+                break
+            got += len(chunk)
+    finally:
+        with_suppressed(lambda: os.killpg(process.pid, signal.SIGKILL))
+        process.communicate()
+    spent = time.monotonic() - started
+    return got / spent if got >= 64 << 10 and spent > 0 else None
+
+
+def github_probe_url() -> str | None:
+    """A GitHub download of the repository's main (its archive, over the same uplink as a fetch)."""
+    match = re.fullmatch(r"https://github\.com/([^/]+)/([^/]+?)(?:\.git)?", REPO_URL)
+    return f"https://codeload.github.com/{match[1]}/{match[2]}/tar.gz/refs/heads/main" if match else None
+
+
+def bundle_probe_url(key: str) -> str:
+    return f"{BUCKET_URL.rstrip('/')}/v1/any/objects/{key}.{'tar.zst' if zstd() else 'tar.gz'}"
+
+
+def newest_bundle(mirror: Path) -> str | None:
+    """The bucket's newest bundle key when it holds a feat-cmux-next the mirror lacks, else None."""
+    work = Path(tempfile.mkdtemp(prefix=".seed-", dir=mirror.parent))
+    try:
+        key = bundle_key(work, download)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+    try:
+        git(mirror, "rev-parse", "--verify", "-q", f"{key.rsplit('.', 1)[1]}^{{commit}}", timeout=60)
+        return None
+    except subprocess.CalledProcessError:
+        return key
+
+
+def choose_source(mirror: Path, *, failed: bool = False, now: float | None = None) -> dict:
+    """Which route catches the mirror up this pass: measure (probing a stale route), choose, say why."""
+    now = time.time() if now is None else now
+    probed = []
+    routes = route_entries(now)
+    github = routes.get("github")
+    if not failed and (github is None or now - github["at"] >= PROBE_EVERY) and (url := github_probe_url()):
+        rate = probe_rate(url, ranged=False)
+        note_rate("github", rate if rate is not None else 1.0, now)
+        probed.append("github")
+        routes = route_entries(now)
+    rates = {route: routes[route]["rate"] for route in ROUTES if route in routes}
+    selection: dict = {"chosen": "github", "threshold_mb_s": MIN_RATE / 1e6, "probed": probed}
+
+    def done(why: str) -> dict:
+        selection["rates_mb_s"] = {route: round(rate / 1e6, 2) for route, rate in rates.items()}
+        return {**selection, "why": why}
+
+    if not failed and rates.get("github", MIN_RATE) >= MIN_RATE:
+        return done("github meets the threshold")
+    if "bundle_failed_at" in routes:
+        return done("the bundle failed within BUNDLE_RETRY")
+    key = newest_bundle(mirror)
+    if key is None:
+        return done("the bundle has nothing the mirror lacks")
+    selection["key"] = key
+    if "bundle" not in rates or now - routes["bundle"]["at"] >= PROBE_EVERY:
+        rate = probe_rate(bundle_probe_url(key), ranged=True)
+        note_rate("bundle", rate if rate is not None else 1.0, now)
+        probed.append("bundle")
+        rates["bundle"] = route_entries(now)["bundle"]["rate"]
+    # After GitHub failed this pass, a bundle route meeting the threshold is enough: GitHub just gave nothing.
+    if rates["bundle"] < MIN_RATE or (not failed and rates["bundle"] <= 2 * rates.get("github", 0)):
+        return done("the bundle's route is no faster")
+    selection["chosen"] = "bundle"
+    return done("github failed this pass" if failed else "github is under the threshold")
+
+
+def catch_up_from_bundle(mirror: Path, key: str, fetch_url: Callable[[str, Path, float], None] | None = None) -> dict:
+    """Add the bundle's objects to the healthy `mirror` and move each branch forward to its tip, timed."""
+    fetch_url = fetch_url or download
+    free = shutil.disk_usage(mirror.parent).free
+    if free < SEED_MIN_FREE:
+        return {"ok": False, "error": f"{free / 1024**3:.1f} GiB free"}
+    measured: dict = {}
+
+    def timed(url: str, target: Path, timeout: float) -> None:
+        started = time.monotonic()
+        fetch_url(url, target, timeout)
+        measured.update(bytes=target.stat().st_size, seconds=max(time.monotonic() - started, 1e-3))
+
+    started = time.monotonic()
+    work = Path(tempfile.mkdtemp(prefix=".seed-", dir=mirror.parent))
+    try:
+        seed_from_bundle(mirror, work, timed, forward_only=True, key=key, timeout=BUNDLE_TIMEOUT)
+    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
+        note_bundle_failed()
+        return {"ok": False, "key": key, "error": f"{type(error).__name__}: {str(error)[:200]}"}
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+        drop_leftovers(mirror)
+    result = {"ok": True, "key": key, "seconds": round(time.monotonic() - started, 1)}
+    if measured.get("bytes", 0) >= MEASURE_BYTES:
+        note_rate("bundle", measured["bytes"] / measured["seconds"])
+        result["mb_s"] = round(measured["bytes"] / measured["seconds"] / 1e6, 2)
+    return result
+
+
+def pack_bytes(mirror: Path) -> int:
+    return sum(pack.stat().st_size for pack in (mirror / "objects" / "pack").glob("*.pack"))
+
+
+def fetch_measured(mirror: Path) -> dict:
+    """fetch() from GitHub, its rate folded into the github route when it carried MEASURE_BYTES or failed."""
+    before, started = pack_bytes(mirror), time.monotonic()
+    result = fetch(mirror, REPO_URL)
+    got, spent = max(0, pack_bytes(mirror) - before), max(time.monotonic() - started, 1e-3)
+    if got >= MEASURE_BYTES or not result["ok"]:
+        note_rate("github", got / spent)
+        result["mb_s"] = round(got / spent / 1e6, 2)
+    return result
+
+
 def run(apply: bool, *, wait: bool = False, from_github: bool = False, home: Path | None = None) -> dict:
     record: dict = {"time": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
                     "mirror": os.fspath(MIRROR)}
@@ -696,9 +916,20 @@ def run(apply: bool, *, wait: bool = False, from_github: bool = False, home: Pat
         if problem:
             record["seeded"] = {"because": problem, **seed(MIRROR, from_github)}
         configure(MIRROR)
-        result = fetch(MIRROR, REPO_URL)
+        selection = choose_source(MIRROR)
+        if selection["chosen"] == "bundle":
+            selection["bundle"] = catch_up_from_bundle(MIRROR, selection["key"])
+        result = fetch_measured(MIRROR)
+        if not result["ok"] and selection["chosen"] != "bundle":
+            # GitHub failed: the bundle, when it is newer and its route is fast enough, then GitHub once more.
+            selection = choose_source(MIRROR, failed=True)
+            if selection["chosen"] == "bundle":
+                selection["bundle"] = catch_up_from_bundle(MIRROR, selection["key"])
+                if selection["bundle"]["ok"]:
+                    result = fetch_measured(MIRROR)
+        record["source_select"] = selection
         record["fetch"] = result
-        folded = fold_packs(MIRROR)
+        folded = fold_packs(MIRROR, force=bool(selection.get("bundle", {}).get("ok")))
         if folded:
             record["repack"] = folded
         record["heads"] = heads(MIRROR)
