@@ -13,6 +13,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import shutil
 import time
 import unittest
 from pathlib import Path
@@ -48,7 +49,6 @@ class Mirror(unittest.TestCase):
         (self.home / "actions-runner-glaeda/.runner").write_text("{}")
         (self.home / gm.SOURCE_CONFIG).parent.mkdir(parents=True)
         (self.home / gm.SOURCE_CONFIG).write_text('{"schema": 1, "source": "direct"}')
-        os.utime(self.home / gm.SOURCE_CONFIG, (0, 0))  # written long ago: this host's first-seed slot is open
         # The "GitHub" repository: three branches.
         self.upstream = root / "upstream"
         self.upstream.mkdir()
@@ -83,6 +83,8 @@ class Mirror(unittest.TestCase):
         gm.seed = lambda mirror, from_github, fetch_url=self.fake_download: real_seed(mirror, from_github, fetch_url)
         self.addCleanup(setattr, gm, "seed", real_seed)
         self.mirror = git_dir / "cmux.git"
+        git_dir.mkdir(parents=True)
+        (git_dir / gm.SEED_AFTER).write_text("0\n")  # this host's first-seed slot opened long ago
 
     def commit(self, message: str) -> str:
         (self.upstream / "f").write_text(message)
@@ -232,7 +234,7 @@ class Mirror(unittest.TestCase):
         sh("git", "bundle", "create", os.fspath(staged / gm.BUNDLE_FILE), "--branches", cwd=self.upstream)
         with tarfile.open(self.bucket / f"v1/any/objects/{self.key}.tar.gz", "w:gz") as archive:
             archive.add(staged / gm.BUNDLE_FILE, arcname=f"./{gm.BUNDLE_FILE}")
-        self.mirror.parent.mkdir(parents=True)
+        self.mirror.parent.mkdir(parents=True, exist_ok=True)
         sh("git", "clone", "-q", "--bare", "--depth=1", self.upstream.as_uri(), os.fspath(self.mirror))
         self.assertEqual(gm.healthy(self.mirror), "shallow")
         result = gm.run(True, home=self.home)
@@ -438,30 +440,38 @@ class Mirror(unittest.TestCase):
         self.assertEqual(mark.read_text(), "True")
 
     def test_a_first_seed_waits_for_the_host_s_slot_and_a_repair_never_does(self) -> None:
-        config = self.home / gm.SOURCE_CONFIG
-        now = float(int(time.time()))
-        os.utime(config, (now, now))  # just written by setup, as on every mini of a site at once
-        with mock.patch.object(gm.platform, "node", lambda: "mini-a"), mock.patch.object(gm, "SEED_SLOTS", 1), \
-                mock.patch.object(gm, "SEED_SLOT_S", 600):
-            self.assertEqual(gm.seed_wait(self.home, now), 0)  # slot 0 of 1: no wait
+        after = gm.GIT_DIR / gm.SEED_AFTER
+        longest = gm.SEED_SLOTS * gm.SEED_SLOT_S
         waits = set()
         for host in ("mini-a", "mini-b", "mini-c", "mini-d", "mini-e", "mini-f"):
+            after.unlink()
             with mock.patch.object(gm.platform, "node", lambda host=host: host):
-                wait = gm.seed_wait(self.home, now)
-            self.assertLess(wait, gm.SEED_SLOTS * gm.SEED_SLOT_S)
+                wait = gm.seed_wait(self.home, 1000.0)
+                self.assertEqual(gm.seed_wait(self.home, 1000.0 + wait / 2), wait / 2)  # one deadline, kept
+            self.assertLess(wait, longest)
             self.assertEqual(wait % gm.SEED_SLOT_S, 0)
             waits.add(wait)
         self.assertGreater(len(waits), 1)  # spread, not all at once
-        with mock.patch.object(gm, "seed_wait", lambda home=None, now=None: 300.0):
+        # touching the source config never moves it; a deadline from a clock that was ahead is pulled back
+        os.utime(self.home / gm.SOURCE_CONFIG, None)
+        after.write_text(f"{1000 + 86400}\n")
+        self.assertLess(gm.seed_wait(self.home, 1000.0), longest)
+        self.assertLess(gm.seed_wait(self.home, 1000.0 + longest), 1)
+        after.unlink()
+        self.assertEqual(gm.seed_wait(self.home, 1000.0, keep=False) >= 0, True)
+        self.assertFalse(after.exists())  # plan mode writes nothing
+        with mock.patch.object(gm, "seed_wait", lambda home=None, now=None, keep=True: 300.0):
             result = gm.run(True, home=self.home)
             self.assertEqual(result["state"], "skipped", result)
             self.assertIn("slot", result["reason"])
             self.assertFalse(self.mirror.exists())
-        os.utime(config, (0, 0))  # the slot has opened
+        after.write_text("0\n")  # the slot has opened
         self.assertEqual(gm.run(True, home=self.home)["state"], "applied")
         (self.mirror / "shallow").write_text("0" * 40 + "\n")  # broken, not missing: repaired at once
-        with mock.patch.object(gm, "seed_wait", lambda home=None, now=None: 300.0):
+        with mock.patch.object(gm, "seed_wait", lambda home=None, now=None, keep=True: 300.0):
             self.assertEqual(gm.run(True, home=self.home)["state"], "applied")
+        shutil.rmtree(self.mirror)  # a seeded mirror that disappears: its kept deadline has passed
+        self.assertEqual(gm.run(True, home=self.home)["state"], "applied")
 
     def test_plan_changes_nothing(self) -> None:
         result = gm.run(False, home=self.home)
