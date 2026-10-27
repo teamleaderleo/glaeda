@@ -99,6 +99,11 @@ CONFIG = {
     "gc.reflogExpireUnreachable": "never",
     "gc.autoDetach": "false",
     "fetch.recurseSubmodules": "false",
+    # Every fetch keeps its pack (git unpacks one under 100 objects into loose objects by default, which no
+    # pack count would ever see with gc off), so fold_packs is the one place objects are combined. 1, not 0:
+    # git reads 0 as no limit and unpacks every fetch.
+    "fetch.unpackLimit": "1",
+    "transfer.unpackLimit": "1",
     "uploadpack.allowAnySHA1InWant": "true",
     "uploadpack.allowReachableSHA1InWant": "true",
     "protocol.version": "2",
@@ -184,8 +189,37 @@ def run_group(command: Sequence[str], timeout: float) -> tuple[int, str]:
 
 
 def own_group() -> list[int]:
-    """This pass's own process group, when the pass leads it (its git, curl and tar children run there)."""
-    return [os.getpid()] if os.getpgid(0) == os.getpid() else []
+    """This pass's own process group, when the pass leads its own session (its git, curl and tar children run
+    there). Only a session leader's group is sure to hold nothing but the pass and its children: the first
+    command of a shell pipeline leads a group its siblings share, so such a group is never recorded (main runs
+    an --apply pass in a session of its own)."""
+    return [os.getpid()] if os.getsid(0) == os.getpid() == os.getpgid(0) else []
+
+
+def in_own_session(call: Callable[[], int]) -> int:
+    """Run `call` in a child that leads a new session, so the group the pass records holds only the pass and its
+    children; the parent forwards SIGINT, SIGTERM and SIGHUP to it and returns its exit status."""
+    sys.stdout.flush()
+    pid = os.fork()
+    if pid == 0:
+        code = 1
+        try:
+            os.setsid()
+            code = call()
+        except BaseException:  # noqa: BLE001  (a signal or a crash: the child's exit status says so)
+            code = 1
+        finally:
+            sys.stdout.flush()
+            os._exit(code)
+    for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, lambda signum, _frame: with_suppressed(lambda: os.kill(pid, signum)))
+    while True:
+        try:
+            _, status = os.waitpid(pid, 0)
+            break
+        except InterruptedError:
+            continue
+    return os.WEXITSTATUS(status) if os.WIFEXITED(status) else 1
 
 
 def alive(pid: int) -> bool:
@@ -650,11 +684,14 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--seed-from-github", action="store_true",
                         help="operator fallback: seed from GitHub when the R2 bundle cannot be read")
     args = parser.parse_args(argv)
-    if args.apply and os.getpgid(0) != os.getpid():
-        with_suppressed(lambda: os.setpgid(0, 0))  # lead a group, so its children can be stopped together
-    result = run(args.apply, wait=args.wait, from_github=args.seed_from_github)
-    print(json.dumps(result), flush=True)
-    return 0 if result["state"] in ("applied", "plan", "skipped", "busy") else 1
+
+    def one_pass() -> int:
+        result = run(args.apply, wait=args.wait, from_github=args.seed_from_github)
+        print(json.dumps(result), flush=True)
+        return 0 if result["state"] in ("applied", "plan", "skipped", "busy") else 1
+    if args.apply and own_group() == []:
+        return in_own_session(one_pass)  # its children can then be stopped together, and only they
+    return one_pass()
 
 
 if __name__ == "__main__":

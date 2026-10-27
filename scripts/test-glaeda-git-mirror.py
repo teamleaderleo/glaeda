@@ -400,13 +400,41 @@ class Mirror(unittest.TestCase):
         old = gm.PACK_LIMIT
         gm.PACK_LIMIT = 2
         self.addCleanup(setattr, gm, "PACK_LIMIT", old)
+        folds = []
         for n in range(4):
             self.commit(f"c{n}")
-            gm.run(True, home=self.home)
+            folds.append(gm.run(True, home=self.home))
         packs = list((self.mirror / "objects/pack").glob("*.pack"))
         self.assertLessEqual(len(packs), 3)
+        self.assertTrue(any(r.get("repack", {}).get("status") == 0 for r in folds), folds)
+        loose = [p for p in (self.mirror / "objects").iterdir() if len(p.name) == 2 and any(p.iterdir())]
+        self.assertEqual(loose, [])  # a small fetch keeps its pack (fetch.unpackLimit 1), so the folds see it
         sh("git", "-C", os.fspath(self.mirror), "cat-file", "-e", f"{orphan}^{{commit}}")
         self.assertEqual(gm.healthy(self.mirror), "")
+
+    def test_only_a_session_leader_records_its_own_group(self) -> None:
+        """The first command of a shell pipeline leads a group its siblings share, so its group is never recorded
+        (stop_orphans would kill a sibling); a session leader's group holds only the pass and its children."""
+        probe = (f"import importlib.machinery, importlib.util, os, sys\n"
+                 f"loader = importlib.machinery.SourceFileLoader('gm', {os.fspath(ROOT / 'scripts/glaeda-git-mirror')!r})\n"
+                 f"spec = importlib.util.spec_from_loader('gm', loader); gm = importlib.util.module_from_spec(spec)\n"
+                 f"loader.exec_module(gm)\n"
+                 f"if sys.argv[1] == 'group': os.setpgid(0, 0)\n"
+                 f"print(gm.own_group() == [os.getpid()])\n")
+        group = subprocess.run([sys.executable, "-c", probe, "group"], capture_output=True, text=True, check=True)
+        self.assertEqual(group.stdout.strip(), "False")
+        session = subprocess.run([sys.executable, "-c", probe, "session"], capture_output=True, text=True, check=True,
+                                 start_new_session=True)
+        self.assertEqual(session.stdout.strip(), "True")
+
+    def test_an_apply_pass_runs_in_a_session_of_its_own(self) -> None:
+        mark = Path(self.temp.name) / "leader"
+
+        def call() -> int:
+            mark.write_text(str(os.getsid(0) == os.getpid() and gm.own_group() == [os.getpid()]))
+            return 3
+        self.assertEqual(gm.in_own_session(call), 3)
+        self.assertEqual(mark.read_text(), "True")
 
     def test_plan_changes_nothing(self) -> None:
         result = gm.run(False, home=self.home)
