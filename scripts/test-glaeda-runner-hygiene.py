@@ -185,6 +185,46 @@ class RunnerHygieneTest(unittest.TestCase):
         # past the edit check: what remains is ownership, which only a root install has
         self.assertEqual(rh._managed_plist(self.install)[1], "existing plist is not root-owned and protected")
 
+    def installed(self) -> None:
+        """A finished --apply of this source, owned by the test's user (standing in for root)."""
+        self.place()
+        self.install.install_dir.chmod(0o755)
+        self.install.snapshot.chmod(0o555)
+        self.install.manifest.write_text(json.dumps({
+            "version": 1, "uid": self.account.uid, "user": self.account.name, "home": str(self.home),
+            "device": self.install.install_dir.stat().st_dev, "sha256": rh._sha256(self.source),
+            "snapshot": str(self.install.snapshot), "python": "/usr/bin/python3",
+            "plist_sha256": rh._sha256(self.install.plist)}))
+        self.install.manifest.chmod(0o444)
+        for path in (self.install.install_dir, self.install.snapshot, self.install.manifest, self.install.plist):
+            os.chown(path, -1, os.getgid())  # macOS gives new files their directory's group
+
+    def owned(self):
+        return mock.patch.multiple(rh, ROOT_UID=os.getuid(), _root_gid=mock.Mock(return_value=os.getgid()))
+
+    def test_an_interrupted_or_partial_install_is_repairable_stale_not_refused(self) -> None:
+        self.installed()
+        with self.owned():
+            self.assertEqual(rh._managed_install(self.install), (True, "managed"))
+            # --apply swapped the snapshot, then died before the plist and manifest: check says stale, apply proceeds
+            self.install.snapshot.chmod(0o755)
+            self.install.snapshot.write_bytes(b"# the next release's glaeda-disk\n")
+            self.install.snapshot.chmod(0o555)
+            self.assertEqual(rh._managed_install(self.install), (True, "repairable"))
+            with mock.patch.object(rh, "service_loaded", return_value=True):
+                self.assertEqual(rh.check(self.install)["state"], "stale")
+            self.install.snapshot.unlink()  # the snapshot is gone
+            with mock.patch.object(rh, "service_loaded", return_value=True):
+                self.assertIn("snapshot missing", rh.check(self.install)["stale"])
+            self.place()
+            self.install.snapshot.chmod(0o555)
+            os.chown(self.install.snapshot, -1, os.getgid())
+            self.install.plist.unlink()  # the plist is gone
+            with mock.patch.object(rh, "service_loaded", return_value=True):
+                self.assertIn("plist missing", rh.check(self.install)["stale"])
+            (self.install.install_dir / "operator-file").write_text("keep")
+            self.assertEqual(rh._managed_install(self.install), (False, "install directory contains unrelated files"))
+
     def test_check_is_read_only_on_the_command_line(self) -> None:
         with mock.patch.object(rh.platform, "system", return_value="Darwin"), \
                 self.assertRaises(SystemExit):
