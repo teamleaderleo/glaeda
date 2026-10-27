@@ -8269,7 +8269,7 @@ class DaemonPolicyTest(Base):
         for i in range(4):  # inside TERMINAL_GRACE, so the finished run stays watched
             gg.register(key)
             self.daemon.tick(NOW + i * 25)
-            self.assertEqual(self.daemon.jobs_tried.get(key), 1)
+            self.assertEqual(gg.read_cache(key)["jobsTried"], 1)
         self.assertEqual(len(self.gh.job_calls()), 1)
         # a new attempt is a new exemption
         cached = gg.read_cache(key)
@@ -8318,8 +8318,24 @@ class DaemonPolicyTest(Base):
         e = {"key": key, "jobs": False, "cache": {"data": gg.slim_run(failed)}}
         with mock.patch.object(self.daemon, "get", side_effect=gg.OutOfTime):
             self.daemon.read_jobs(e, {}, False)
-        self.assertNotIn(key, self.daemon.jobs_tried)
+        self.assertNotIn("jobsTried", gg.read_cache(key))
         self.assertIn(key, self.daemon.deferred)
+
+    def test_a_tried_job_list_is_remembered_across_a_restart(self) -> None:
+        failed = {"id": 7, "name": "CI", "display_title": "fix", "status": "completed", "conclusion": "failure",
+                  "html_url": "https://github.com/o/r/actions/runs/7", "head_sha": "b" * 40, "head_branch": "x",
+                  "event": "push", "run_attempt": 1, "created_at": iso(NOW - 99), "updated_at": iso(NOW - 9)}
+        self.gh.runs[7] = failed
+        self.gh.jobs[7] = []
+        key = gg.parse_key("run", "o/r/7")
+        self.daemon.now = NOW
+        self.spend_rest(2000, at=NOW)
+        self.daemon.read_jobs({"key": key, "jobs": False, "cache": None}, {"data": gg.slim_run(failed)}, True)
+        self.assertEqual(len(self.gh.job_calls()), 1)
+        again = gg.Daemon(transport=self.gh, token=lambda: TOKEN, controller=None)
+        again.now, again.clock_real = NOW, False
+        again.read_jobs({"key": key, "jobs": False, "cache": gg.read_cache(key)}, {}, False)
+        self.assertEqual(len(self.gh.job_calls()), 1)  # the new daemon knows it was tried
 
     def test_a_failed_attempt_still_gets_its_job_list_at_the_cap(self) -> None:
         """The one read the share does not hold back: a wait cannot rule on a failed run without it."""
