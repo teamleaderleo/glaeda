@@ -709,6 +709,9 @@ class FleetOps(unittest.TestCase):
         self.plists.mkdir()
         self.calls: list[tuple] = []
         self.loaded: set[str] = set()
+        self.bootstrap_fails = False
+        self.bootout_sticks = False
+        self.ledger = self.root / "managed.json"
         self.doc = json.loads(OPS_BYTES)
         self.path = self.root / heal.FLEET_OPS_NAME
         self.path.write_bytes(OPS_BYTES)
@@ -718,14 +721,17 @@ class FleetOps(unittest.TestCase):
         if args[0] == "print":
             return (0, "") if args[1] in self.loaded else (113, "could not find service")
         if args[0] == "bootstrap":
+            if self.bootstrap_fails:
+                return 5, "Bootstrap failed: 5: Input/output error"
             self.loaded.add("system/" + plistlib.loads(Path(args[2]).read_bytes())["Label"])
-        if args[0] == "bootout":
+        if args[0] == "bootout" and not self.bootout_sticks:
             self.loaded.discard(args[1])
         return 0, ""
 
     def run_ops(self, apply: bool = True, hold: str = "", eligible: str = "") -> dict:
         return heal.fleet_ops_pass(self.path, T0, apply, ops_dir=self.ops_dir, plist_dir=self.plists, root=False,
-                                   hold=lambda now: hold, eligible=lambda d: eligible, ctl=self.ctl)
+                                   hold=lambda now: hold, eligible=lambda d: eligible, ctl=self.ctl,
+                                   ledger=self.ledger, wait=lambda s: None)
 
     def test_shipped_ops_are_pinned_to_their_source(self) -> None:
         doc = heal.load_fleet_ops(OPS_BYTES)
@@ -750,6 +756,54 @@ class FleetOps(unittest.TestCase):
                                      "StandardErrorPath": f"/var/log/{name}.log"})
             self.assertEqual(out["ops"][name]["state"], "current")
         self.assertEqual(self.loaded, {"system/ai.manaflow.console-unlock-guard", "system/ai.manaflow.symbol-cache-cap"})
+
+    def test_an_op_dropped_from_the_file_is_unloaded_and_removed_but_nothing_else(self) -> None:
+        self.run_ops()
+        (self.ops_dir / "by-hand").write_bytes(b"#!/bin/bash\n")  # installed by a person, not by this pass
+        (self.plists / "ai.manaflow.by-hand.plist").write_bytes(b"x")
+        doc = copy.deepcopy(self.doc)
+        doc["ops"].pop("symbol-cache-cap")
+        self.path.write_text(json.dumps(doc))
+        out = self.run_ops()
+        self.assertEqual(out["removed"], ["symbol-cache-cap"])
+        self.assertFalse((self.ops_dir / "symbol-cache-cap").exists())
+        self.assertFalse((self.plists / "ai.manaflow.symbol-cache-cap.plist").exists())
+        self.assertNotIn("system/ai.manaflow.symbol-cache-cap", self.loaded)
+        self.assertTrue((self.ops_dir / "by-hand").exists() and (self.plists / "ai.manaflow.by-hand.plist").exists())
+        self.assertEqual(json.loads(self.ledger.read_text())["ops"], ["console-unlock-guard"])
+        self.assertNotIn("removed", self.run_ops())
+
+    def test_a_load_that_fails_is_retried_at_the_next_pass(self) -> None:
+        self.bootstrap_fails = True
+        out = self.run_ops()
+        self.assertIn("bootstrap", out["ops"]["console-unlock-guard"]["error"])
+        self.assertFalse((self.plists / "ai.manaflow.console-unlock-guard.plist").exists(), "removed so it differs")
+        self.bootstrap_fails = False
+        out = self.run_ops()
+        self.assertNotIn("error", out["ops"]["console-unlock-guard"])
+        self.assertIn("system/ai.manaflow.console-unlock-guard", self.loaded)
+
+    def test_a_job_that_will_not_unload_is_not_bootstrapped_over(self) -> None:
+        self.run_ops()
+        self.bootout_sticks = True
+        doc = copy.deepcopy(self.doc)
+        doc["ops"]["symbol-cache-cap"]["every_s"] = 7200
+        self.path.write_text(json.dumps(doc))
+        out = self.run_ops()
+        self.assertIn("did not unload", out["ops"]["symbol-cache-cap"]["error"])
+        self.assertFalse((self.plists / "ai.manaflow.symbol-cache-cap.plist").exists())
+
+    def test_a_hand_install_never_installs_fleet_ops_json(self) -> None:
+        """--install takes the script and the policy (each pinnable by --expect-*), never a fleet-ops.json found
+        beside them in a directory the runner user can write; only the release chain installs that."""
+        with tempfile.TemporaryDirectory() as tmp:
+            want = heal.desired_install(POLICY_PATH, Path(tmp))
+            self.assertEqual(sorted(p.name for p in want["files"]), [heal.SCRIPT_NAME, heal.POLICY_NAME])
+            d = Path(tmp) / "heal"
+            (d / "staged").mkdir(parents=True)
+            (d / heal.FLEET_OPS_NAME).write_bytes(OPS_BYTES)
+            heal.commit_pair({heal.SCRIPT_NAME: SCRIPT_BYTES, heal.POLICY_NAME: POLICY_BYTES}, d, False, None)
+            self.assertFalse((d / heal.FLEET_OPS_NAME).exists(), "a hand install drops it until the release restores it")
 
     def test_a_current_host_is_left_alone(self) -> None:
         self.run_ops()
@@ -831,6 +885,30 @@ class FleetOps(unittest.TestCase):
                       "the update config's host name counts too")
         self.assertIn("host reservation", self.reservations(self.lst(), local={
             "schema": "glaeda-reservation/v1", "since": int(T0) - 60, "until": int(T0) + 60}))
+        self.assertEqual(self.reservations(self.lst(), local={
+            "schema": "glaeda-reservation/v1", "since": int(T0) - 60, "until": int(T0) - 1}), "", "lapsed")
+
+    def test_a_malformed_reservation_anywhere_holds(self) -> None:
+        entry = {"id": "r1", "owner": "someone", "hosts": ["build-mini-8"], "from": heal.iso(T0 - 60),
+                 "until": heal.iso(T0 + 60)}
+        for bad in ('{"schema": "glaeda-fleet-reservations/v1", "expires": NaN, "reservations": []}',
+                    self.lst(reservations=[{**entry, "hosts": "build-mini-7"}]),
+                    self.lst(reservations=[{**entry, "hosts": [7]}]),
+                    self.lst(reservations=[{**entry, "until": "NaN"}]),
+                    self.lst(reservations=[entry, "not an entry"]),
+                    self.lst(reservations=[entry], aliases={"build-mini-8": "build-mini-7"}),
+                    self.lst(reservations=[entry], aliases=[]),
+                    self.lst(expires=1e300)):
+            with self.subTest(bad=str(bad)[:80]):
+                self.assertIn("held", self.reservations(bad))
+        for local in ("not json", {"schema": "glaeda-reservation/v1", "since": "x", "until": 1},
+                      {"schema": "other/v1"}, ["list"]):
+            with self.subTest(local=local):
+                fleet = self.root / "fleet"
+                fleet.mkdir(exist_ok=True)
+                (fleet / "reservation.json").write_text(local if isinstance(local, str) else json.dumps(local))
+                self.assertIn("unreadable", self.reservations(self.lst()))
+                (fleet / "reservation.json").unlink()
 
     def test_the_fleet_ops_file_names_no_host_or_login(self) -> None:
         """This file is public: no host, address, account or person in it. The real fleet's names are checked

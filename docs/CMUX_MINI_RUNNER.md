@@ -1486,8 +1486,14 @@ It acts only where all of the following hold. Otherwise it reports and changes n
   `/Users/Shared/cmux-build-fleet/reservation.json`. The list's writer refreshes it. Whatever these files say, the
   bytes installed are the pinned ones.
 
-A release without the file is accepted, and its copy is removed. A pair installed by a copy from before the file
-existed reads the file from its own release at the next pass.
+Only the release chain installs `fleet-ops.json`. A hand `--install` takes the script and the policy and drops
+the snapshot's `fleet-ops.json`; the next pass restores it from the release. An op that this pass installed (listed
+in the root-owned `state/fleet-ops-managed.json`) and that the file no longer lists is unloaded and removed.
+Nothing it did not install is touched. A plist that does not load is removed, so the next pass tries again.
+
+A release without the file is accepted. Its copy of the file is removed, and the ops already installed stay as
+they are. A pair installed by a copy from before the file existed reads the file from its own release at the next
+pass.
 
 ## 2m. Build mesh: the fleet index and kept state between PR minis
 

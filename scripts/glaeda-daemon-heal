@@ -428,13 +428,11 @@ def desired_install(policy_path: Path, install_dir: Path = INSTALL_DIR) -> dict[
         "StandardOutPath": os.fspath(state_dir / "heal.log"),
         "StandardErrorPath": os.fspath(state_dir / "heal.err"),
     }
+    # Not fleet-ops.json: a hand install takes the script and the policy (pinned by --expect-*), and drops any
+    # fleet-ops.json the snapshot had (finish_pair). Only the release chain (refresh) installs fleet-ops.json, so
+    # root never runs an op body it did not verify against the signed release.
     files = {script: (Path(__file__).read_bytes(), MODES[SCRIPT_NAME]),
              install_dir / POLICY_NAME: (policy_bytes, MODES[POLICY_NAME])}
-    ops_path = policy_path.with_name(FLEET_OPS_NAME)  # a release ships it beside the policy
-    if ops_path.exists():
-        ops_bytes = ops_path.read_bytes()
-        load_fleet_ops(ops_bytes)
-        files[install_dir / FLEET_OPS_NAME] = (ops_bytes, MODES[FLEET_OPS_NAME])
     return {"files": files,
             "plist": plistlib.dumps(plist, sort_keys=True), "state_dir": state_dir}
 
@@ -894,12 +892,25 @@ def read_small(path: Path, limit: int = MAX_META) -> bytes:
 
 
 def reservation_time(value: Any) -> float:
-    if isinstance(value, (int, float)) and not isinstance(value, bool):
+    if isinstance(value, (int, float)) and not isinstance(value, bool) and value == value and abs(value) < 1e11:
         return float(value)
     t = parse_iso(value)
     if t is None:
         raise ValueError(f"not a time: {value!r}")
     return t
+
+
+def strict_json(raw: bytes) -> Any:
+    """json.loads that refuses NaN and Infinity, which no reservation may carry."""
+    def refuse(token: str) -> Any:
+        raise ValueError(f"{token} in a reservation file")
+    return json.loads(raw, parse_constant=refuse)
+
+
+def names_list(value: Any, what: str) -> set[str]:
+    if not isinstance(value, list) or not all(isinstance(v, str) and v for v in value):
+        raise ValueError(f"{what} is not a list of names")
+    return {v.lower() for v in value}
 
 
 def fleet_ops_hold(now: float, fleet_root: Path = FLEET_ROOT, node: str | None = None) -> str:
@@ -919,24 +930,38 @@ def fleet_ops_hold(now: float, fleet_root: Path = FLEET_ROOT, node: str | None =
         if isinstance(host, str) and host:
             names.add(host.lower())
     try:
-        doc = json.loads(read_small(home / ".local/share/glaeda/fleet-reservations.json"))
-        if doc.get("schema") != RESERVATIONS_SCHEMA:
+        doc = strict_json(read_small(home / ".local/share/glaeda/fleet-reservations.json"))
+        if not isinstance(doc, dict) or doc.get("schema") != RESERVATIONS_SCHEMA:
             raise ValueError("schema")
         if reservation_time(doc.get("expires")) <= now:  # its writer refreshes it; an old list is no answer
             return f"fleet reservations expired at {doc.get('expires')}; held as reserved"
-        entries, aliases = doc["reservations"], doc.get("aliases") or {}
+        entries, aliases = doc["reservations"], doc.get("aliases", {})
         if not isinstance(entries, list) or not isinstance(aliases, dict):
             raise ValueError("malformed")
-        for e in entries:
-            hosts = {str(h).lower() for h in e["hosts"]}
-            hosts |= {str(a).lower() for h in e["hosts"] for a in aliases.get(h, [])}
-            if names & hosts and reservation_time(e["from"]) <= now <= reservation_time(e["until"]):
-                return f"reserved until {e['until']}"
+        alias_of = {str(k).lower(): names_list(v, f"aliases of {k}") for k, v in aliases.items()}
+        reserved = ""
+        for e in entries:  # every entry is checked, so a malformed one anywhere holds
+            if not isinstance(e, dict):
+                raise ValueError("an entry is not an object")
+            hosts = names_list(e["hosts"], "hosts")
+            hosts |= {a for h in hosts for a in alias_of.get(h, ())}
+            start, until = reservation_time(e["from"]), reservation_time(e["until"])
+            if names & hosts and start <= now <= until and not reserved:
+                reserved = f"reserved until {e['until']}"
+        if reserved:
+            return reserved
     except (OSError, ValueError, KeyError, TypeError, AttributeError) as e:
         return f"fleet reservations unreadable ({type(e).__name__}); held as reserved"
-    with contextlib.suppress(OSError, ValueError, TypeError, KeyError, AttributeError):
-        held = json.loads(read_small(fleet_root / "reservation.json"))
-        if held.get("schema") == "glaeda-reservation/v1" and int(held["since"]) <= now < int(held["until"]):
+    local = fleet_root / "reservation.json"
+    if os.path.lexists(local):  # absent is no reservation; anything there that cannot be read holds
+        try:
+            held = strict_json(read_small(local))
+            if not isinstance(held, dict) or held.get("schema") != "glaeda-reservation/v1":
+                raise ValueError("schema")
+            since, until = reservation_time(held["since"]), reservation_time(held["until"])
+        except (OSError, ValueError, KeyError, TypeError) as e:
+            return f"host reservation unreadable ({type(e).__name__}); held as reserved"
+        if since <= now < until:
             return f"host reservation until {held['until']}"
     return ""
 
@@ -958,12 +983,39 @@ def fleet_ops_eligible(ops_dir: Path) -> str:
     return ""
 
 
+def load_op(name: str, plist: Path, ctl, wait=time.sleep) -> str | None:
+    """Load plist as system/ai.manaflow.NAME afresh; None when it is loaded, else why not. A plist left that did
+    not load is removed, so the next pass sees it differ and tries again."""
+    target = f"system/{op_label(name)}"
+    ctl("bootout", target)
+    for _ in range(40):  # launchd lets go of a booted-out job asynchronously
+        if ctl("print", target)[0] != 0:
+            break
+        wait(0.25)
+    else:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(plist)
+        return f"launchctl bootout {target} did not unload it"
+    said = ""
+    for pause in (0, 1, 2, 4):  # a bootstrap right after a bootout can fail with EIO
+        wait(pause)
+        code, said = ctl("bootstrap", "system", os.fspath(plist))
+        if code == 0 or ctl("print", target)[0] == 0:
+            return None
+    with contextlib.suppress(FileNotFoundError):
+        os.unlink(plist)
+    return f"launchctl bootstrap: {said}"
+
+
 def fleet_ops_pass(ops_path: Path, now: float, apply: bool, ops_dir: Path = FLEET_OPS_DIR,
                    plist_dir: Path = PLIST.parent, root: bool = True, hold=fleet_ops_hold, eligible=fleet_ops_eligible,
-                   ctl=None) -> dict[str, Any]:
+                   ctl=None, ledger: Path = INSTALL_DIR / "state" / "fleet-ops-managed.json",
+                   wait=time.sleep) -> dict[str, Any]:
     """Each op's state here (current, stale, missing) and, on apply, what was installed. A body is replaced
     atomically (launchd runs the path afresh at each StartInterval, so no reload is needed for it); the
-    LaunchDaemon is rewritten and reloaded only when it differs from the op's, and bootstrapped when not loaded."""
+    LaunchDaemon is rewritten and reloaded only when it differs from the op's, and loaded when it is not. An op this
+    pass installed earlier (the root-owned ledger) that the file no longer lists is unloaded and removed; nothing
+    it did not install is touched."""
     ctl = ctl or launchctl
     doc = load_fleet_ops(read_bytes(ops_path) or b"")
     out: dict[str, Any] = {"ops": {}, "installed": []}
@@ -981,12 +1033,24 @@ def fleet_ops_pass(ops_path: Path, now: float, apply: bool, ops_dir: Path = FLEE
     if root:
         check_root_dir(ops_dir)
         check_root_dir(plist_dir)
+    managed = load_json(ledger).get("ops")
+    managed = {n for n in managed if isinstance(n, str) and OP_NAME.fullmatch(n)} if isinstance(managed, list) else set()
+    for name in sorted(managed - set(doc["ops"])):
+        target = f"system/{op_label(name)}"
+        ctl("bootout", target)
+        for path in (plist_dir / f"{op_label(name)}.plist", ops_dir / name):
+            if path.is_file() and not path.is_symlink():
+                os.unlink(path)
+        out.setdefault("removed", []).append(name)
+    managed &= set(doc["ops"])
     for name, op in sorted(doc["ops"].items()):
         target = ops_dir / name
         if target.is_symlink() or target.exists() and not target.is_file():
             out["ops"][name]["error"] = f"{target} is not a regular file; left alone"
             continue
         if out["ops"][name]["state"] != "current" or (target.stat().st_mode & 0o777) != 0o755:
+            managed.add(name)
+            atomic_write(ledger, json.dumps({"ops": sorted(managed)}).encode(), 0o644, root)  # before the write
             atomic_write(target, op["body"].encode(), 0o755, root)
             out["installed"].append(name)
             out["ops"][name].update(state="current", have=op["sha256"])
@@ -997,12 +1061,15 @@ def fleet_ops_pass(ops_path: Path, now: float, apply: bool, ops_dir: Path = FLEE
         except Exception:  # noqa: BLE001 (any unparsable plist is one to rewrite)
             same = False
         if not same:
-            ctl("bootout", f"system/{op_label(name)}")
+            managed.add(name)
+            atomic_write(ledger, json.dumps({"ops": sorted(managed)}).encode(), 0o644, root)
             atomic_write(plist, plistlib.dumps(want, sort_keys=True), 0o644, root)
         if not same or ctl("print", f"system/{op_label(name)}")[0] != 0:
-            code, said = ctl("bootstrap", "system", os.fspath(plist))
-            if code != 0:
-                out["ops"][name]["error"] = f"launchctl bootstrap: {said}"
+            error = load_op(name, plist, ctl, wait)
+            if error:
+                out["ops"][name]["error"] = error
+    if managed != set(load_json(ledger).get("ops") or []):
+        atomic_write(ledger, json.dumps({"ops": sorted(managed)}).encode(), 0o644, root)
     return out
 
 
