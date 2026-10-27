@@ -6031,6 +6031,22 @@ class VolumeCensusTest(unittest.TestCase):
         self.assertEqual(files, sum((held / f"f{n:02d}").stat().st_blocks * 512 for n in range(30))
                          + held.lstat().st_blocks * 512)  # each file counted once across the slices
 
+    def test_a_child_opened_while_its_parent_is_paused_keeps_the_parent_cursor(self) -> None:
+        for n in range(12):
+            self.write(f"p/c{n:02d}/item/blob")  # each child holds a sized path, so each is opened too
+            self.write(f"p/c{n:02d}/loose")
+        covered = {str(self.root / f"p/c{n:02d}/item") for n in range(12)}
+        ticks = itertools.count(step=1.0)
+        state, rounds = None, 0
+        while not (state or {}).get("complete"):
+            rounds += 1
+            self.assertLess(rounds, 40, "the paused parent kept restarting")
+            state = gd.census_pass([self.root], covered, state, budget_s=6, now=1.0,
+                                   clock=lambda: next(ticks), path=self.state)
+        for n in range(12):
+            self.assertIn(str(self.root / f"p/c{n:02d}" / gd.CENSUS_FILES), state["rows"])
+        self.assertEqual(state["cursors"], {})
+
     def test_a_measured_ancestor_of_the_shared_tree_leaves_coverage_out(self) -> None:
         fs = self.fs(10 * gd.GIB)
         gd.DARWIN = True

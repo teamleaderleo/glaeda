@@ -6581,13 +6581,14 @@ def census_pass(roots: list[Path], covered: set[str], state: dict[str, Any] | No
     deadline = clock() + budget_s
     saved = clock()
 
-    cursor: dict[str, Any] = state.setdefault("cursor", {})  # a directory opened part way: where to go on
+    # directories opened part way, each with where to go on: a child opened meanwhile has its own entry
+    cursor: dict[str, Any] = state.setdefault("cursors", {})
 
     def expand(current: Path) -> bool:
         """Open one directory, reading its entries one at a time; False means the slice ended inside it and
         ``cursor`` holds how far it got, so the next slice goes on from there instead of starting it over."""
         key = str(current)
-        part = cursor.get(key) if cursor.get("dir") == key else None
+        part = cursor.get(key)
         after, files = (str(part["after"]), int(part["files"])) if part else ("", 0)
         try:
             if not part:
@@ -6602,8 +6603,7 @@ def census_pass(roots: list[Path], covered: set[str], state: dict[str, Any] | No
         children: list[str] = []
         for name in names:
             if clock() >= deadline:
-                cursor.clear()
-                cursor.update({"dir": key, key: {"after": after, "files": files}})
+                cursor[key] = {"after": after, "files": files}
                 pending.append(key)
                 pending.extend(sorted(children, reverse=True))
                 return False
@@ -6626,7 +6626,7 @@ def census_pass(roots: list[Path], covered: set[str], state: dict[str, Any] | No
                 files += est.st_blocks * 512
             else:
                 skipped_files.append(child)
-        cursor.clear()
+        cursor.pop(key, None)
         rows[str(current / CENSUS_FILES)] = [files, "unclassified", True]
         pending.extend(sorted(children, reverse=True))
         return True
@@ -6645,7 +6645,7 @@ def census_pass(roots: list[Path], covered: set[str], state: dict[str, Any] | No
             if key in covered:
                 skipped_covered.append(key)
                 continue
-            if key in ancestors or key in [str(r) for r in roots] or cursor.get("dir") == key:
+            if key in ancestors or key in [str(r) for r in roots] or key in cursor:
                 if not expand(current):
                     break
             else:
