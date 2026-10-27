@@ -368,6 +368,18 @@ class Mirror(unittest.TestCase):
             self.assertEqual(gm.run(True, home=self.home)["state"], "busy")
         self.assertIsNone(writer.poll())
 
+    def test_a_lost_object_is_found_by_the_daily_walk_and_repaired(self) -> None:
+        gm.run(True, home=self.home)
+        self.assertTrue((self.mirror / gm.VERIFIED).exists())
+        self.assertEqual(gm.run(True, home=self.home).get("seeded"), None)  # walked today: not again
+        os.utime(self.mirror / gm.VERIFIED, (0, 0))
+        walks = iter([False])
+        with mock.patch.object(gm, "connected", lambda repo: next(walks)):
+            result = gm.run(True, home=self.home)
+        self.assertEqual(result["state"], "applied", result)
+        self.assertEqual(result["seeded"]["because"], "missing objects")
+        self.assertTrue(gm.verified_recently(self.mirror))
+
     def test_a_bad_pointer_is_refused(self) -> None:
         (self.bucket / f"v1/any/latest/{gm.BUNDLE_PREFIX}").write_text("../../etc/passwd")
         result = gm.run(True, home=self.home)
@@ -454,9 +466,10 @@ class Fetch(unittest.TestCase):
     def test_a_child_does_no_work_until_its_group_is_recorded(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             marker = Path(temp) / "worked"
+            script_path = os.fspath(ROOT / "scripts/glaeda-git-mirror")
             # The pass is SIGKILLed between starting the child and recording its group.
             script = ("import importlib.machinery, importlib.util, os, signal, sys\n"
-                      f"loader = importlib.machinery.SourceFileLoader('gm', {os.fspath(ROOT / "scripts/glaeda-git-mirror")!r})\n"
+                      f"loader = importlib.machinery.SourceFileLoader('gm', {script_path!r})\n"
                       "spec = importlib.util.spec_from_loader('gm', loader); gm = importlib.util.module_from_spec(spec)\n"
                       "loader.exec_module(gm)\n"
                       "gm.note_groups = lambda groups: os.kill(os.getpid(), signal.SIGKILL)\n"

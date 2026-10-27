@@ -117,7 +117,7 @@ def runner_installed(home: Path | None = None) -> bool:
 HELD: list[int] = []
 PASS_FILE = ".pass.json"
 ORPHAN_NAMES = {"git", "git-remote-https", "git-remote-http", "git-index-pack", "git-upload-pack", "ssh", "curl",
-                "tar", "bsdtar", "zstd", "python3", "Python"}
+                "tar", "bsdtar", "zstd", "python3", "Python", "sh"}  # sh: run_group's wrapper before its exec
 
 
 def held() -> tuple[int, ...]:
@@ -419,10 +419,32 @@ def fill(repo: Path, work: Path, from_github: bool, fetch_url: Callable[[str, Pa
         return f"github (bundle: {type(error).__name__})"
 
 
+# healthy() reads refs and markers only; an object lost under them (a bad disk, a hand-made copy) shows only
+# in a full connectivity walk, which takes about a minute on cmux, so a pass walks it once a day.
+VERIFIED = "glaeda-verified"
+VERIFY_EVERY = 24 * 3600
+
+
+def connected(repo: Path) -> bool:
+    try:
+        git(repo, "fsck", "--connectivity-only", "--no-dangling", "--no-progress", timeout=REPACK_TIMEOUT)
+        return True
+    except subprocess.CalledProcessError:
+        return False
+
+
+def verified_recently(repo: Path) -> bool:
+    try:
+        return time.time() - (repo / VERIFIED).stat().st_mtime < VERIFY_EVERY
+    except OSError:
+        return False
+
+
 def verify(repo: Path) -> None:
     """Every branch is fully connected (no missing object), and the repository reads as healthy."""
     git(repo, "fsck", "--connectivity-only", "--no-dangling", "--no-progress", timeout=DOWNLOAD_TIMEOUT)
     (repo / REPAIR_PENDING).unlink(missing_ok=True)  # the history is proven whole
+    (repo / VERIFIED).write_text(dt.datetime.now(dt.timezone.utc).isoformat() + "\n")
     problem = healthy(repo)
     if problem:
         raise RuntimeError(f"after the seed the mirror is still {problem}")
@@ -572,6 +594,11 @@ def run(apply: bool, *, wait: bool = False, from_github: bool = False, home: Pat
             if abandoned.is_dir() and not abandoned.is_symlink():
                 shutil.rmtree(abandoned, ignore_errors=True)
         problem = healthy(MIRROR)
+        if not problem and not verified_recently(MIRROR):
+            if connected(MIRROR):
+                (MIRROR / VERIFIED).write_text(dt.datetime.now(dt.timezone.utc).isoformat() + "\n")
+            else:
+                problem = "missing objects"
         if problem:
             record["seeded"] = {"because": problem, **seed(MIRROR, from_github)}
         configure(MIRROR)
