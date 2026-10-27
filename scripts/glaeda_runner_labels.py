@@ -14,8 +14,8 @@ serves this repository either. So:
   image itself, is listed in HOSTED_ALLOWED with its reason until the repository moves under an organization.
 
 Any other job that names a hosted label fails CI. An entry whose job no longer names one fails too, so the list only
-shrinks. A runs-on or matrix this scan cannot read (`vars.`, `needs.`, `inputs.`, `steps.`, `fromJSON`) fails as
-well unless its job is listed: a variable or picker output could hold a hosted label the text never shows.
+shrinks. A runs-on or matrix this scan cannot read (`vars`, `needs`, `inputs` or `steps`, in any case or bracket
+form, or `fromJSON`), on its line or nested under it, fails as well unless its job is listed: a variable or picker output could hold a hosted label the text never shows.
 
 The scan reads workflow text line by line, so it sees labels in `runs-on`, matrix rows (`runner: ubuntu-24.04`),
 expression defaults (`vars.X || 'ubuntu-24.04'`) and arrays. Comments and `run:`, `name:` and `description:` text
@@ -39,11 +39,16 @@ HOSTED = re.compile(
 NON_RUNNER_KEY = re.compile(r"^\s*(?:-\s+)?(?:name|description|run)\s*:")
 BLOCK_SCALAR = re.compile(r":\s*[|>][-+0-9]*\s*(?:#.*)?$")
 JOB = re.compile(r"^  ([A-Za-z_][A-Za-z0-9_-]*)\s*:\s*(?:#.*)?$")
-# Blacksmith in the manaflow-ai fork, the hosted image only in this personal-account repository.
-OWNER_BRANCH = re.compile(
-    r"github\.repository_owner\s*==\s*'manaflow-ai'\s*&&\s*'blacksmith-[0-9]+vcpu-[a-z0-9.-]+'\s*\|\|\s*'[^']+'")
-SELECTOR = re.compile(r"^\s*(?:-\s+)?(?:runs-on|runner|matrix|include)\s*:")
-UNREADABLE = re.compile(r"\b(?:vars|needs|inputs|steps)\.|fromJSON", re.IGNORECASE)
+# Blacksmith in the manaflow-ai fork, the hosted image only in this personal-account repository. The whole value
+# must be exactly this expression: a condition added in front of it (`github.event_name == 'push' && ...`) would
+# send the fork to the hosted image too.
+OWNER_FORM = re.compile(
+    r"^\s*(?:-\s+)?(?:runs-on|runner)\s*:\s*(?P<q>[\"']?)\$\{\{\s*"
+    r"github\.repository_owner\s*==\s*'manaflow-ai'\s*&&\s*'blacksmith-[0-9]+vcpu-[a-z0-9.-]+'\s*\|\|\s*'[^']+'"
+    r"\s*\}\}(?P=q)\s*$")
+# A key whose value, and every line nested under it, selects a runner.
+SELECTOR_KEY = re.compile(r"^\s*(?:-\s+)?(?:runs-on|matrix)\s*:")
+UNREADABLE = re.compile(r"\b(?:vars|needs|inputs|steps)\s*[.\[]|fromJSON", re.IGNORECASE)
 
 PERSONAL = ("runs only in teamleaderleo/glaeda, a personal-account repository: Blacksmith installs on organizations "
             "only and no owned runner serves it")
@@ -77,8 +82,11 @@ def hosted_jobs(path: Path) -> dict[str, list[str]]:
     job = ""
     in_jobs = False
     block_indent = -1
+    selector_indent = -1  # indent of the runs-on or matrix key whose nested lines are being read
     for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
         indent = len(line) - len(line.lstrip())
+        if selector_indent >= 0 and line.strip() and indent <= selector_indent:
+            selector_indent = -1
         if block_indent >= 0:
             if line.strip() and indent <= block_indent:
                 block_indent = -1
@@ -97,7 +105,13 @@ def hosted_jobs(path: Path) -> dict[str, list[str]]:
                 block_indent = indent
             continue
         code = _strip_comment(line)
-        if HOSTED.search(OWNER_BRANCH.sub("", code)) or (SELECTOR.match(code) and UNREADABLE.search(code)):
+        if SELECTOR_KEY.match(code):
+            selector_indent = indent
+        if OWNER_FORM.match(code):
+            continue
+        # Inside runs-on or matrix (a block value, a list, or a matrix axis that runs-on reads as `matrix.x`), any
+        # value the text cannot show could be a hosted label.
+        if HOSTED.search(code) or (selector_indent >= 0 and UNREADABLE.search(code)):
             found.setdefault(job, []).append(f"{path.name}:{number}: {line.strip()}")
     return found
 
