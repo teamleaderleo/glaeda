@@ -3727,7 +3727,7 @@ class GlaedaDiskTest(unittest.TestCase):
                            st["release-old"], st["gone-runner"],  # then least recently used: 8 h, 7 h (whole)
                            st["mini-glaeda"] / "Build", st["mini-glaeda-2"] / "Build", st["release-new"] / "Build",
                            st["mini-glaeda"], st["mini-glaeda-2"], st["release-new"]]  # then the other slots
-        # over the cap with no floor hold: the host tree is listed, but its 12 h window holds
+        # over the cap with no floor hold: the host tree is listed, but its age exemption (cmux_next_ci_host_idle_hours, inf by default) holds
         gd._DISCOVERED.clear()
         with mock.patch.object(gd, "HOME", home), mock.patch.object(gd, "process_evidence", return_value=([], "")), \
                 mock.patch.object(gd, "ACTIVITY_MODE", "pressure"), mock.patch.object(gd, "CMUX_NEXT_CI_OVER", gd.GIB):
