@@ -6553,6 +6553,18 @@ class HostReservationTest(unittest.TestCase):
         self.assertEqual(run["reserved"], why)
         self.assertEqual(run["age_hours"], 24.0, "the reserved run used the legacy ages")
         self.assertEqual(gd.DEFAULT_AGE_HOURS, 12.0, "and put the 12 h ages back for whatever runs next")
+        # the runner-account caches were 168 h before the 12 h default, and stay 168 h on a reserved host
+        home = self.root / "runner-home"
+        for rel in ("Library/Developer/Xcode/DerivedData", ".cache/cmux-job"):
+            (home / rel).mkdir(parents=True)
+        with mock.patch.object(gd, "DARWIN", True), mock.patch.object(gd, "HOME", home):
+            self.assertEqual({f.min_idle_hours for f in gd.runner_cache_families()}, {12.0})
+            with mock.patch.multiple(gd, **{k: getattr(gd, k) for k in gd.LEGACY_AGES}), \
+                    mock.patch.dict(gd.POLICY, dict(gd.POLICY)):
+                gd.keep_legacy_ages()
+                fams = gd.runner_cache_families()
+            self.assertEqual(len(fams), 2)
+            self.assertEqual({f.min_idle_hours for f in fams}, {168.0}, "a reserved host keeps the old runner-cache age")
         # the runner-cache profile is held to the same rule (given a root, as a Linux CI host has none of its own)
         with mock.patch.object(gd, "runner_cache_families", return_value=[gd.Family("x", self.root, True, "x")]), \
                 mock.patch.object(gd, "runner_profile_roots_safe", return_value=True):

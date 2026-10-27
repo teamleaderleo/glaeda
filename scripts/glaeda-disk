@@ -1709,6 +1709,9 @@ def seed_verdict(path: Path) -> str:
 
 WORKTREE_DIRS = ("worktrees", "cmux-worktrees", "glaeda-worktrees")
 CHECKOUT_BUILD_IDLE_HOURS = DEFAULT_AGE_HOURS
+# The runner-account cache profile (runner_cache_families): 168 h before the 12 h default, and 168 h again on a
+# reserved host, where keep_legacy_ages puts it back.
+RUNNER_CACHE_IDLE_HOURS = DEFAULT_AGE_HOURS
 
 
 def _checkout_git(checkout: Path, *args: str) -> list[str]:
@@ -2585,26 +2588,26 @@ def runner_cache_families() -> list[Family]:
     roots = [
         Family("xcode-derived-data", HOME / "Library/Developer/Xcode/DerivedData", True,
                "next xcodebuild rebuilds it", owner="Xcode, per checkout", rebuild_minutes=15,
-               build_output=True, min_idle_hours=DEFAULT_AGE_HOURS, platform="macos"),
+               build_output=True, min_idle_hours=RUNNER_CACHE_IDLE_HOURS, platform="macos"),
         Family("cmux-job-cache", HOME / ".cache/cmux-job", True,
                "next cmux reload or CI job rebuilds it", depth=2, git_disposable=True,
-               owner="cmux reload-cloud", rebuild_minutes=30, min_idle_hours=DEFAULT_AGE_HOURS,
+               owner="cmux reload-cloud", rebuild_minutes=30, min_idle_hours=RUNNER_CACHE_IDLE_HOURS,
                mirror_idle_hours=CMUX_JOB_MIRROR_HOURS, platform="macos"),
         Family("cmux-ghosttykit-cache", HOME / ".cache/cmux/ghosttykit", True,
                "cmux rebuilds GhosttyKit", depth=1, files=True,
-               owner="cmux build tooling", rebuild_minutes=5, min_idle_hours=DEFAULT_AGE_HOURS,
+               owner="cmux build tooling", rebuild_minutes=5, min_idle_hours=RUNNER_CACHE_IDLE_HOURS,
                platform="macos"),
         Family("cua-recordings", HOME / "Library/Application Support/cua-ssh/recordings", True,
                "the CUA recorder can capture it again", depth=1, files=True,
                skip=("index.json", "manifest.json", "state.json", ".metadata_never_index", ".lock"),
-               owner="CUA recorder", rebuild_minutes=2, min_idle_hours=DEFAULT_AGE_HOURS, platform="macos"),
+               owner="CUA recorder", rebuild_minutes=2, min_idle_hours=RUNNER_CACHE_IDLE_HOURS, platform="macos"),
         Family("cua-cache", HOME / "Library/Caches/cmux/cmux-cua", True,
                "the CUA client rebuilds its frame cache", depth=1, files=True,
                skip=("index.json", "manifest.json", "state.json", ".metadata_never_index", ".lock"),
-               owner="cmux CUA", rebuild_minutes=1, min_idle_hours=DEFAULT_AGE_HOURS, platform="macos"),
+               owner="cmux CUA", rebuild_minutes=1, min_idle_hours=RUNNER_CACHE_IDLE_HOURS, platform="macos"),
     ]
     if (HOME / "Library/Caches" / CMUX_NEXT_CI_ROOT).is_dir():
-        roots.append(replace(cmux_next_ci_family(), min_idle_hours=DEFAULT_AGE_HOURS))
+        roots.append(replace(cmux_next_ci_family(), min_idle_hours=RUNNER_CACHE_IDLE_HOURS))
     return [f for f in roots if f.root.is_dir()]
 
 
@@ -5395,7 +5398,7 @@ LEGACY_AGES = {"DEFAULT_AGE_HOURS": 24.0, "KEPT_BUILD_IDLE_HOURS": 24.0, "IDLE_S
                "PARKED_NO_LOG_IDLE_HOURS": 168.0, "CMUX_NEXT_CI_MIN_IDLE_HOURS": 72.0,
                "CANONICAL_ADMISSION_IDLE_HOURS": 24.0, "IDLE_SEED_HOURS": 12.0, "RUNTIME_IDLE_DAYS": 14.0,
                "CHECKOUT_BUILD_IDLE_HOURS": 24.0, "TMP_TEST_RESIDUE_IDLE_HOURS": 48.0,
-               "RUNNER_STALE_CHECKOUT_HOURS": float("inf")}
+               "RUNNER_STALE_CHECKOUT_HOURS": float("inf"), "RUNNER_CACHE_IDLE_HOURS": 168.0}
 LEGACY_POLICY = {"soft_idle_hours": 24.0, "stale_marker_max_hours": 48.0, "cmux_next_ci_host_idle_hours": 48.0}
 
 
