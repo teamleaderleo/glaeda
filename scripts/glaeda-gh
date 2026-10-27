@@ -191,6 +191,7 @@ FLOORS = {"rest": (1500, 300), "graphql": (500, 100)}  # (floor, reserve) per qu
 # 304s) on PR reads the balancer had sent to REST, and the account ran out under a nightly re-run.
 REST_SHARE = 0.4
 DAEMON_CONFIG = Path.home() / ".config/glaeda/gh-daemon.json"  # cycle, commentCycle, floors, restShare
+REST_SPEND_FILE = "rest-spend.json"  # the daemon's counted REST requests per minute, kept across restarts
 # How stale this host's view of the shared quota may get before GET /rate_limit refreshes it. That
 # endpoint reports every family at once and costs no primary quota, so the only cost of a short
 # interval is the secondary limit, which one call every two minutes is nowhere near. 0 turns it off.
@@ -1264,6 +1265,14 @@ class Daemon:
         self.denied: dict[str, float] = {}  # consumer -> when a head read it needed was refused for budget
         self.saved_consumers: str = ""
         self.policy = daemon_policy()  # re-read at the start of every tick
+        # minute (epoch // 60) -> counted REST requests sent in it. Per minute, so the cap's check is
+        # at most 61 additions however busy the hour was, and on disk, so a restart does not hand the
+        # daemon a fresh share of an hour it already spent.
+        spend = read_json(BASE / REST_SPEND_FILE)
+        self.rest_minutes: dict[int, int] = {
+            int(k): int(v) for k, v in (spend if isinstance(spend, dict) else {}).items()
+            if str(k).isdigit() and isinstance(v, int) and not isinstance(v, bool) and v > 0}
+        self.saved_rest_minutes = dict(self.rest_minutes)
 
     # -- budget
 
@@ -1280,8 +1289,10 @@ class Daemon:
         return "stop" if remaining < reserve else "lean" if remaining < floor or capped else "normal"
 
     def rest_spent(self) -> int:
-        """REST requests this daemon sent in the last hour that GitHub counted (304s are free)."""
-        return sum(1 for t, what in self.sent if what == "rest" and self.now - t < 3600)
+        """REST requests this daemon sent in the last hour that GitHub counted (304s are free), by the
+        minute: the minute an hour back counts whole, so this errs toward the cap, not past it."""
+        oldest = int(self.now // 60) - 60
+        return sum(n for minute, n in self.rest_minutes.items() if minute >= oldest)
 
     def rest_cap(self) -> int:
         limit = (self.budget.get("rest") or {}).get("limit") or 5000
@@ -1297,7 +1308,10 @@ class Daemon:
         if self.mode(bucket) == "stop":
             return -1.0
         if bucket == "rest" and self.rest_capped():
-            return -1.0  # the daemon's own REST share is spent: balanced kinds read over GraphQL
+            # The daemon's own REST share is spent: nothing to spend, so balanced kinds read over
+            # GraphQL. Zero, not -1: REST is lean, not stopped, so a kind whose GraphQL is stopped
+            # still moves here and is read four times less often instead of not at all.
+            return 0.0
         seen = self.budget.get(bucket) or {}
         limit = seen.get("limit") or 5000
         reserve = self.policy["floors"][bucket][1]
@@ -1399,6 +1413,9 @@ class Daemon:
         # `free` is /rate_limit, which costs no quota: counting it as a REST request would overstate
         # what the daemon spends.
         self.sent.append((self.now, "free" if free else "rest304" if bucket == "rest" and status == 304 else bucket))
+        if bucket == "rest" and not free and status != 304:
+            minute = int(self.now // 60)
+            self.rest_minutes[minute] = self.rest_minutes.get(minute, 0) + 1
         if status == 401:
             self.token = None  # re-read from gh next time
         if "x-ratelimit-remaining" in h and h.get("x-ratelimit-resource", "core") in {"core", "graphql"}:
@@ -1853,8 +1870,13 @@ class Daemon:
             self.batched(kind, batch, fetch)
             self.post_between()
         over_rest = (prs if over["pr"] == "rest" else []) + (runs if over["run"] == "rest" else [])
+        capped = self.rest_capped()
         for i, e in enumerate(over_rest):
-            if self.mode("rest") == "stop":
+            # Reaching the share mid-tick ends this tick's REST reads, or one tick could overshoot it
+            # by a whole batch; the rest go first next tick, over whichever bucket is richer then. A
+            # tick that started capped is reading here because GraphQL is stopped, in lean mode.
+            if self.mode("rest") == "stop" or (not capped and self.rest_capped()):
+                self.defer(over_rest[i:])
                 break
             try:
                 (self.fetch_pr_rest if e["key"].startswith("pr:") else self.fetch_run)(e)
@@ -1882,6 +1904,11 @@ class Daemon:
         oldest = self.oldest_data(entries, {e["key"] for e in prs + runs + comments + heads})
         self.prune({e["key"] for e in entries})
         self.post_prune()
+        first_minute = int(self.now // 60) - 60
+        self.rest_minutes = {m: n for m, n in self.rest_minutes.items() if m >= first_minute}
+        if self.rest_minutes != self.saved_rest_minutes:
+            write_json(BASE / REST_SPEND_FILE, {str(m): n for m, n in self.rest_minutes.items()})
+            self.saved_rest_minutes = dict(self.rest_minutes)
         if self.budget != self.saved_budget:
             write_json(BASE / "budget.json", self.budget)
             self.saved_budget = json.loads(json.dumps(self.budget))
@@ -2493,7 +2520,7 @@ class Daemon:
                 c["failedSteps"], c["stepCount"] = known[c["id"]]
                 continue
             job_id = job_ids.get(c["id"])
-            if not job_id or not c.get("runId") or left <= 0 or self.mode("rest") == "stop":
+            if not job_id or not c.get("runId") or left <= 0 or self.mode("rest") == "stop" or self.rest_capped():
                 continue
             left -= 1
             try:

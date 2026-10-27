@@ -8019,8 +8019,9 @@ class DaemonPolicyTest(Base):
         gg.DAEMON_CONFIG.write_text(json.dumps(doc))
         self.daemon.policy = gg.daemon_policy()
 
-    def spend_rest(self, n: int, what: str = "rest") -> None:
-        self.daemon.sent += [(NOW - 10, what)] * n
+    def spend_rest(self, n: int, at: float | None = None) -> None:
+        minute = int(((NOW - 10) if at is None else at) // 60)
+        self.daemon.rest_minutes[minute] = self.daemon.rest_minutes.get(minute, 0) + n
 
     def test_defaults_without_a_config(self) -> None:
         policy = gg.daemon_policy()
@@ -8085,17 +8086,16 @@ class DaemonPolicyTest(Base):
         self.assertEqual(self.daemon.route("pr"), "rest")  # REST is far richer
         self.assertEqual(self.daemon.mode("rest"), "normal")
         self.spend_rest(1999)
-        self.spend_rest(500, "rest304")  # free: never counted against the share
         self.assertFalse(self.daemon.rest_capped())
         self.spend_rest(1)
         self.assertEqual((self.daemon.rest_spent(), self.daemon.rest_cap()), (2000, 2000))
         self.assertTrue(self.daemon.rest_capped())
-        self.assertEqual(self.daemon.richness("rest"), -1)
+        self.assertEqual(self.daemon.richness("rest"), 0)
         self.assertEqual(self.daemon.mode("rest"), "lean")
         self.assertEqual(self.daemon.route("pr"), "graphql")
         self.assertEqual(self.daemon.route("run"), "graphql")
-        # an hour later those requests no longer count
-        self.daemon.now = NOW + 3600
+        # an hour later (and the minute they were sent in) those requests no longer count
+        self.daemon.now = NOW + 3660
         self.daemon.budget["rest"]["reset"] = NOW + 5000
         self.daemon.budget["graphql"]["reset"] = NOW + 5000
         self.assertFalse(self.daemon.rest_capped())
@@ -8117,6 +8117,38 @@ class DaemonPolicyTest(Base):
         self.spend_rest(2000)
         self.assertEqual(self.daemon.route("run"), "rest")  # nowhere richer to go
         self.assertEqual(self.daemon.mode("rest"), "lean")  # so it reads, four times less often
+        self.assertEqual(self.daemon.paths["pr"], "graphql")
+        self.assertEqual(self.daemon.route("pr"), "rest")  # a kind on a stopped GraphQL still moves
+
+    def test_only_counted_rest_requests_spend_the_share(self) -> None:
+        self.daemon.now = NOW
+        answers = iter([(200, {}, b"{}"), (304, {}, b""), (200, {}, b"{}")])
+        self.daemon.transport = lambda *a: next(answers)
+        self.daemon.request("GET", "/repos/o/r/pulls/1")
+        self.daemon.request("GET", "/repos/o/r/pulls/1", etag="x")  # a 304 is free
+        self.daemon.request("GET", "/rate_limit", free=True)
+        self.assertEqual(self.daemon.rest_spent(), 1)
+
+    def test_the_spend_survives_a_restart_and_expires_after_an_hour(self) -> None:
+        self.spend_rest(1200)
+        self.spend_rest(900, at=NOW - 3700)  # over an hour ago
+        self.daemon.tick(NOW)
+        again = gg.Daemon(transport=self.gh, token=lambda: TOKEN, controller=None)
+        again.now = NOW
+        self.assertEqual(again.rest_spent(), 1200)
+        self.assertNotIn(str(int((NOW - 3700) // 60)), gg.read_json(gg.BASE / gg.REST_SPEND_FILE))
+
+    def test_reaching_the_share_mid_tick_defers_the_rest_reads(self) -> None:
+        for n in (7, 8, 9):
+            self.gh.runs[n] = {"id": n, "status": "in_progress", "html_url": f"u{n}"}
+            gg.register(f"run:o/r/{n}")
+        self.daemon.budget = {"rest": {"limit": 5000, "remaining": 4500, "reset": NOW + 1800},
+                              "graphql": {"limit": 5000, "remaining": 600, "reset": NOW + 1800}}
+        self.daemon.paths["run"] = "rest"
+        self.spend_rest(1999, at=NOW)  # one request short of the 2000 share
+        self.daemon.tick(NOW)
+        self.assertEqual(len(self.gh.run_calls()), 1)
+        self.assertEqual(len(self.daemon.deferred), 2)
 
     def test_status_and_budget_show_the_share(self) -> None:
         self.spend_rest(990)
