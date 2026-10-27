@@ -358,9 +358,30 @@ class GlaedaDiskTest(unittest.TestCase):
         many = gd.Family("user-tmp", many_root, True, "scratch")
         few = gd.Family("cmux-spm-scratch", few_root, True, "scratch")
         order = [(fam.id, path.name) for fam, path in gd.round_robin_work([many, few])]
-        self.assertEqual(len(order), 22)
-        self.assertEqual({name for _, name in order[:4]}, {"m00", "m01", "spm-a", "spm-b"})
-        self.assertEqual(order[4:], [("user-tmp", f"m{k:02d}") for k in range(2, 20)])
+        self.assertEqual(sorted(name for _, name in order),
+                         sorted([f"m{k:02d}" for k in range(20)] + ["spm-a", "spm-b"]))
+        # directory order is unspecified, so only the family sequence is: alternating, then the long family's rest
+        self.assertEqual([fid for fid, _ in order],
+                         ["user-tmp", "cmux-spm-scratch"] * 2 + ["user-tmp"] * 18)
+
+    def test_the_judge_deadline_stops_the_verdicts_too(self) -> None:
+        """The verdicts' own checks (sockets, locks, git) run under the judge deadline: one that passes mid-way keeps
+        what was judged and leaves the rest out."""
+        old_a, old_b = make(self.root / "a"), make(self.root / "b")
+        calls = []
+
+        def slow_keep(fam, path):
+            calls.append(path.name)
+            time.sleep(0.4)
+            return ""
+        known = {os.fspath(old_a): 1 << 20, os.fspath(old_b): 1 << 20}
+        with mock.patch.object(gd, "keep_verdict", side_effect=slow_keep), \
+                mock.patch.object(gd, "process_evidence", return_value=([], "")):
+            items = gd.survey([self.fam], 24, 0, known, deadline=time.monotonic() + 60,
+                              judge_deadline=time.monotonic() + 0.2)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual([Path(i.path).name for i in items], calls)
+        self.assertTrue(gd._MEASURE_BUDGET_REACHED)
 
     def verdicts(self, idle: float = 24) -> dict[str, str]:
         return {Path(i.path).name: i.verdict for i in gd.survey([self.fam], idle, 0)}

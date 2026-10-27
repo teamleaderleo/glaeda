@@ -5668,6 +5668,11 @@ def _survey(families, idle_hours, min_bytes, known, evidence, defer_bulk=False,
     references_by_root: dict[str, frozenset[str]] = {}
     archived = archived_seeds() if any(fam.id == "cmux-seeds" for fam, _ in work) else frozenset()
     for (fam, path), size, idle, floor in zip(work, sizes, idles, floors):
+        # the verdicts' socket, lock and git checks count against the judge deadline too: what is judged by then
+        # is kept (and may be deleted), the rest is left out
+        if judge_deadline is not None and time.monotonic() >= judge_deadline:
+            _MEASURE_BUDGET_REACHED = True
+            break
         if size < floor:
             continue
         sp = str(path)
