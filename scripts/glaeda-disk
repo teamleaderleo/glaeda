@@ -582,7 +582,8 @@ def _at_inside_or_above(path: Path, keep: list[str] | tuple[str, ...]) -> bool:
 
 def toolchain_held(path: Path, fresh: bool = False) -> bool:
     """PATH is at, inside or above a toolchain_keep() path or a role_keep() path. No family flag lifts it (not
-    allow_stale_protected)."""
+    allow_stale_protected). A root above a role keep is held whole, so a family that would take that root as one
+    item splits it first (nightly_next_split: the cmux-nightly-next root's other runners' trees still go by age)."""
     return _at_inside_or_above(path, toolchain_keep(fresh)) or _at_inside_or_above(path, role_keep())
 
 
@@ -595,13 +596,22 @@ def toolchain_held(path: Path, fresh: bool = False) -> bool:
 ROLE_KEEP_MARKER = ".glaeda-keep.json"
 
 
+def real_runner_dir(runner: Path) -> bool:
+    """RUNNER is a real directory directly in the home, not a symlink to a tree elsewhere."""
+    try:
+        return (not runner.is_symlink() and runner.is_dir()
+                and os.path.realpath(runner) == os.path.join(os.path.realpath(HOME), runner.name))
+    except OSError:
+        return False
+
+
 def role_keep() -> tuple[str, ...]:
     """Every enrolled dedicated runner's kept paths (ROLE_KEEP_MARKER), as spelled and resolved. Read fresh each
     call: a marker is small, and a keep the installer just added must hold for the very next delete."""
     out: list[str] = []
     home = os.path.realpath(HOME)
     for runner in HOME.glob("actions-runner-glaeda-*"):
-        if not ((runner / ".runner").is_file() and (runner / "glaeda-hooks").is_dir()):
+        if not (real_runner_dir(runner) and (runner / ".runner").is_file() and (runner / "glaeda-hooks").is_dir()):
             continue
         try:
             paths = json.loads((runner / ROLE_KEEP_MARKER).read_text())
@@ -2966,7 +2976,7 @@ def default_families(role: str = "fleet-mini") -> list[Family]:
     cmux_next_ci = HOME / "Library/Caches" / CMUX_NEXT_CI_ROOT
     if DARWIN and cmux_next_ci.is_dir():
         fams.append(cmux_next_ci_family(cmux_next_ci))
-    if DARWIN and nightly_next_dedicated():
+    if DARWIN and nightly_next_split():
         lib = next(i for i, f in enumerate(fams) if f.id == "library-caches")
         fams[lib] = replace(fams[lib], skip=(*fams[lib].skip, NIGHTLY_NEXT_ROOT))
         fams.append(nightly_next_family())
@@ -3026,12 +3036,14 @@ def default_families(role: str = "fleet-mini") -> list[Family]:
                 fams.append(Family("ci-derived-data", temp, True, "the CI test job rebuilds it",
                                    include=("cmux-derived-data-tests-",), build_output=True,
                                    owner="cmux CI test jobs", rebuild_minutes=6, platform="macos"))
-                if runner.name.startswith("actions-runner-glaeda-") and (runner / "glaeda-hooks/dedicated-admit.sh").is_file():
+                if (runner.name.startswith("actions-runner-glaeda-") and real_runner_dir(runner)
+                        and not (runner / "_work").is_symlink() and not temp.is_symlink()
+                        and (runner / "glaeda-hooks/dedicated-admit.sh").is_file()):
                     # a dedicated runner (its admission wrapper): what its jobs leave in _temp goes by age
                     fams.append(Family("dedicated-runner-temp", temp, True, "the next job writes its own _temp",
                                        files=True, skip=("_github_home", "_github_workflow", "_runner_file_commands"),
                                        skip_prefixes=("cmux-derived-data-tests-",),  # ci-derived-data's
-                                       max_idle_hours=DEFAULT_AGE_HOURS, owner="the dedicated runner's jobs",
+                                       min_idle_hours=DEFAULT_AGE_HOURS, owner="the dedicated runner's jobs",
                                        rebuild_minutes=0.1, platform="macos"))
         # Bounded by its owner: node_product_cache.py evicts LRU to CMUX_NODE_PRODUCT_CACHE_MAX_BYTES (24 GiB).
         fams.append(Family("cmux-node-products", Path("/Users/Shared/cmux-build-fleet/node-products"), False,
@@ -3103,7 +3115,7 @@ def runner_cache_families() -> list[Family]:
     ]
     if (HOME / "Library/Caches" / CMUX_NEXT_CI_ROOT).is_dir():
         roots.append(replace(cmux_next_ci_family(), min_idle_hours=RUNNER_CACHE_IDLE_HOURS))
-    if nightly_next_dedicated():
+    if nightly_next_split():
         roots.append(replace(nightly_next_family(), min_idle_hours=RUNNER_CACHE_IDLE_HOURS,
                              max_idle_hours=RUNNER_CACHE_IDLE_HOURS))
     return [f for f in roots if f.root.is_dir()]
@@ -8547,6 +8559,16 @@ def cmux_next_ci_cap_state(fams: list[Family], cap_gib: float, measure: bool = F
 def nightly_next_dedicated() -> bool:
     """The nightly-next build routes to its dedicated builder: disk-policy names the label cmux routes by."""
     return POLICY.get("nightly_next_dedicated_label") == NIGHTLY_NEXT_DEDICATED_LABEL
+
+
+def nightly_next_split() -> bool:
+    """cmux-nightly-next is split into per-runner items: the build routes to its dedicated builder, or a dedicated
+    runner keeps a tree in it by role (role_keep). Whole, a root above a role keep would be held forever, and with
+    it every pool runner's stale tree."""
+    if nightly_next_dedicated():
+        return True
+    root = os.path.realpath(HOME / "Library/Caches" / NIGHTLY_NEXT_ROOT)
+    return any(k.startswith(root + "/") for k in role_keep())
 
 
 def nightly_next_family(root: Path | None = None) -> Family:

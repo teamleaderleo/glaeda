@@ -4909,6 +4909,13 @@ class GlaedaDiskTest(unittest.TestCase):
         stray.mkdir()
         (stray / gd.ROLE_KEEP_MARKER).write_text(json.dumps([os.fspath(cache)]))
         self.assertEqual(gd.role_keep(), ())
+        # a symlink named like a dedicated runner, to an enrolled runner elsewhere, keeps nothing
+        outside = self.root / "outside-runner"
+        (outside / "glaeda-hooks").mkdir(parents=True)
+        (outside / ".runner").write_text("{}")
+        (outside / gd.ROLE_KEEP_MARKER).write_text(json.dumps([os.fspath(cache)]))
+        (home / "actions-runner-glaeda-linked").symlink_to(outside)
+        self.assertEqual(gd.role_keep(), ())
         (runner / gd.ROLE_KEEP_MARKER).write_text(json.dumps([os.fspath(cos[runner.name]), os.fspath(cache)]))
         gd.process_evidence = lambda: ([], "")
         for name in names:
@@ -4931,11 +4938,29 @@ class GlaedaDiskTest(unittest.TestCase):
                 (runner / "glaeda-hooks/dedicated-admit.sh").write_text("#!/bin/sh\n")
             if keep:
                 (runner / gd.ROLE_KEEP_MARKER).write_text("[]")
+        # a symlink named like a dedicated runner, to one outside the home: its _temp is never swept
+        outside = self.root / "outside-runner"
+        (outside / "glaeda-hooks").mkdir(parents=True)
+        (outside / ".runner").write_text("{}")
+        (outside / "_work/_temp").mkdir(parents=True)
+        (outside / "glaeda-hooks/dedicated-admit.sh").write_text("#!/bin/sh\n")
+        (home / "actions-runner-glaeda-linked").symlink_to(outside)
+        # a real runner whose _temp is a symlink out of the home: not swept either
+        swapped = home / "actions-runner-glaeda-swapped"
+        (swapped / "glaeda-hooks").mkdir(parents=True)
+        (swapped / ".runner").write_text("{}")
+        (swapped / "_work").mkdir()
+        (swapped / "_work/_temp").symlink_to(outside / "_work/_temp")
+        (swapped / "glaeda-hooks/dedicated-admit.sh").write_text("#!/bin/sh\n")
         with mock.patch.object(gd, "HOME", home), mock.patch.object(gd, "DARWIN", True):
-            roots = sorted(os.fspath(f.root.relative_to(home)) for f in gd.default_families()
-                           if f.id == "dedicated-runner-temp")
+            fams = [f for f in gd.default_families() if f.id == "dedicated-runner-temp"]
+        roots = sorted(os.fspath(f.root.relative_to(home)) for f in fams)
         self.assertEqual(roots, ["actions-runner-glaeda-ios-internal/_work/_temp",
                                  "actions-runner-glaeda-nightly-next/_work/_temp"], "a pool runner's _temp is not this")
+        for fam in fams:  # at least DEFAULT_AGE_HOURS idle, however tight the disk (the pressure window is shorter)
+            self.assertEqual(fam.min_idle_hours, gd.DEFAULT_AGE_HOURS)
+            self.assertIsNone(fam.max_idle_hours)
+            self.assertEqual(gd.idle_window(fam, 6.0), gd.DEFAULT_AGE_HOURS)
 
     def test_stale_runner_checkouts_go_above_the_floor_and_without_one(self) -> None:
         """Old runner work dirs go by age: a checkout no job used for DEFAULT_AGE_HOURS goes whatever the free space,
@@ -7862,6 +7887,25 @@ class NightlyNextFallbackTest(unittest.TestCase):
             self.assertNotIn(gd.NIGHTLY_NEXT_FAMILY, fams, label)
             # as before: the whole root is one library-caches item
             self.assertNotIn(gd.NIGHTLY_NEXT_ROOT, fams["library-caches"].skip, label)
+
+    def test_a_role_keep_in_the_root_splits_it_without_the_label(self) -> None:
+        """A dedicated runner keeping its tree by role holds that tree, not the whole root: before the routing label is
+        set, the root is split anyway, so the other runners' stale trees still go by age."""
+        runner = self.home / "actions-runner-glaeda-nightly-next"
+        (runner / "glaeda-hooks").mkdir(parents=True)
+        (runner / ".runner").write_text("{}")
+        kept = self.root / "cmux7s-mac-mini-glaeda-nightly-next"
+        (runner / gd.ROLE_KEEP_MARKER).write_text(json.dumps([os.fspath(kept)]))
+        fams = self.families(None)
+        self.assertIn(gd.NIGHTLY_NEXT_FAMILY, fams)
+        self.assertIn(gd.NIGHTLY_NEXT_ROOT, fams["library-caches"].skip)
+        self.assertTrue(gd.toolchain_held(kept / "0123456789abcdef0123456789abcdef"))
+        self.assertFalse(gd.toolchain_held(self.root / "cmux9s-mac-mini-glaeda-2"))
+        # a keep elsewhere leaves the root whole, as before
+        (runner / gd.ROLE_KEEP_MARKER).write_text(json.dumps([os.fspath(runner / "_work/cmux/cmux")]))
+        fams = self.families(None)
+        self.assertNotIn(gd.NIGHTLY_NEXT_FAMILY, fams)
+        self.assertNotIn(gd.NIGHTLY_NEXT_ROOT, fams["library-caches"].skip)
 
     def test_policy_file_turns_it_on(self) -> None:
         policy = self.home / "disk-policy.json"
