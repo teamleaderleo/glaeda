@@ -68,6 +68,22 @@ os.environ["GLAEDA_RUNNER_IOREG"] = "/nonexistent/ioreg"
 os.environ["GLAEDA_RUNNER_TOOLCHAIN_GATE"] = "0"
 hook = load("glaeda_cmux_runner_hook", HOOK)
 REAL_FIND_DISK = hook.find_disk
+REAL_LEAVE_JOB_WORKSPACE = hook.leave_job_workspace
+
+
+def _leave_job_workspace_in_process(args) -> None:
+    """In-process hook.main(["job-started", ...]) runs keep this test process's cwd and PATH: the real chdir to / would
+    outlive the test (relative paths later in the run would break). Its own tests call REAL_LEAVE_JOB_WORKSPACE."""
+    cwd, path = os.getcwd(), os.environ.get("PATH")
+    try:
+        REAL_LEAVE_JOB_WORKSPACE(args)
+    finally:
+        os.chdir(cwd)
+        if path is not None:
+            os.environ["PATH"] = path
+
+
+hook.leave_job_workspace = _leave_job_workspace_in_process
 # The gate evicts under its disk floor with whatever glaeda-disk it finds: in this process never this machine's own
 # (~/.local/bin); a test that wants one passes it explicitly or patches disk_pressure_run.
 hook.find_disk = lambda explicit: explicit if explicit and os.path.isfile(explicit) else None
@@ -4993,7 +5009,7 @@ class DiskPassCoalesceTest(unittest.TestCase):
                                       job_log=Path("/abs/jobs.jsonl"), capacity_dir=Path("cap"), state_dir=None,
                                       host_lock="host.lock", reservation="/r.json",
                                       toolchain_xcode="Applications/Xcode.app")
-            hook.leave_job_workspace(args)
+            REAL_LEAVE_JOB_WORKSPACE(args)
             self.assertEqual(os.getcwd(), "/")
             real = os.path.realpath(workspace)
             self.assertEqual(os.path.realpath(hook.JOB_CWD), real)
