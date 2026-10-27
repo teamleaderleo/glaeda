@@ -1018,6 +1018,23 @@ def reserved(cache: Path, mine: Path) -> int:
     return total
 
 
+# A bucket miss is remembered this long, so the requests that queued behind its fill get the same answer
+# without each asking the bucket again; a new object appears within a minute.
+MISS_TTL = 60
+
+
+def miss_of(cache: Path, name: str) -> Path:
+    path = stored(cache, name)
+    return path.with_name(".miss-" + path.name)
+
+
+def missed_recently(cache: Path, name: str) -> bool:
+    try:
+        return time.time() - miss_of(cache, name).lstat().st_mtime < MISS_TTL
+    except OSError:
+        return False
+
+
 def part_of(cache: Path, name: str) -> Path:
     path = stored(cache, name)
     return path.with_name(".fill-" + path.name)
@@ -1078,6 +1095,17 @@ def fill_part(cache: Path, name: str, timeout: float, curl: str) -> str:
     except OSError as error:
         part.unlink(missing_ok=True)
         return type(error).__name__
+    try:
+        return watch_fill(proc, cache, name, part, timeout)
+    finally:  # whatever ends this request (its alarm included), its curl ends with it
+        with contextlib.suppress(OSError):
+            os.killpg(proc.pid, signal.SIGKILL)
+        proc.wait()
+        if proc.stdout:
+            proc.stdout.close()
+
+
+def watch_fill(proc: subprocess.Popen, cache: Path, name: str, part: Path, timeout: float) -> str:
     deadline = time.monotonic() + timeout + 30
     while True:
         try:
@@ -1121,10 +1149,15 @@ def prune_cache(cache: Path, keep: str, budget: int = CACHE_BYTES, min_free: int
             continue
         if not stat.S_ISREG(info.st_mode):
             continue
-        if not path.name.startswith(".fill-"):
+        age = time.time() - info.st_mtime
+        if path.name.startswith(".fill-"):
+            if age > FILL_TIMEOUT + 600:  # a killed fill's part: no fill lives this long
+                path.unlink(missing_ok=True)
+        elif path.name.startswith(".miss-"):
+            if age > MISS_TTL:
+                path.unlink(missing_ok=True)
+        else:
             entries.append((info.st_mtime, info.st_size, path))
-        elif time.time() - info.st_mtime > FILL_TIMEOUT + 600:  # a killed fill's part: no fill lives this long
-            path.unlink(missing_ok=True)
     entries.sort()
     total, removed = sum(size for _, size, _ in entries), 0
     for _, size, path in entries:
@@ -1179,6 +1212,10 @@ def serve_cache(name: str, cache: Path, run_dir: Path, client: str, record: dict
                         time.sleep(FILL_REPORT)
                         report(part_of(cache, name))
                 opened = open_cached(cache, name)  # filled while we waited
+                if opened is None and missed_recently(cache, name):  # or found missing while we waited
+                    say("miss")
+                    log(run_dir, {**record, "outcome": "miss", "shared": True})
+                    return 3
                 if opened is None:
                     slot = None
                     while slot is None:  # FILL_SLOTS fills at a time, whatever the clients ask for
@@ -1198,6 +1235,8 @@ def serve_cache(name: str, cache: Path, run_dir: Path, client: str, record: dict
                     finally:
                         os.close(slot)
                     if filled == "miss":
+                        with contextlib.suppress(OSError):
+                            miss_of(cache, name).touch()
                         say("miss")
                         log(run_dir, {**record, "outcome": "miss", "seconds": round(time.monotonic() - started, 1)})
                         return 3

@@ -447,6 +447,34 @@ class LanCacheTest(unittest.TestCase):
             self.assertEqual(serve.fill(self.cache, name, curl=os.environ["FAKE_CURL"]), "")
         self.assertFalse(other.exists())
 
+    def test_a_miss_is_shared_by_the_requests_behind_it(self):
+        name = "ci-cache.cmux.com/macOS-ARM64/none.tar.zst"
+        self.assertEqual(self.fetch(name)[0], 3)
+        self.assertEqual(self.fetch(name, "again")[0], 3)
+        self.assertEqual(len(self.downloads()), 1)
+        os.utime(serve.miss_of(self.cache, name), (0, 0))  # past MISS_TTL: the bucket is asked again
+        self.assertEqual(self.fetch(name, "later")[0], 3)
+        self.assertEqual(len(self.downloads()), 2)
+
+    def test_an_interrupted_fill_stops_its_curl(self):
+        name = self.put(b"q" * 40960)
+        os.environ["FAKE_CURL_DELAY"] = "0.5"
+        started = []
+        real = serve.subprocess.Popen
+
+        def popen(*args, **kwargs):
+            started.append(real(*args, **kwargs))
+            return started[-1]
+
+        def interrupt(proc, *args):
+            raise TimeoutError("the request's alarm")
+
+        with mock.patch.object(serve.subprocess, "Popen", popen), mock.patch.object(serve, "watch_fill", interrupt):
+            with self.assertRaises(TimeoutError):
+                serve.fill(self.cache, name, curl=os.environ["FAKE_CURL"])
+        self.assertIsNotNone(started[0].poll())
+        self.assertFalse(serve.part_of(self.cache, name).exists())
+
     def test_the_mirror_list_is_admitted_and_bounded(self):
         self.assertEqual(self.fetch(self.put(b"x" * 10))[0], 0)  # makes the run dir
         run_dir = Path(os.environ["FAKE_CACHE"] + ".run")
