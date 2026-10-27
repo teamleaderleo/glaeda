@@ -2217,6 +2217,9 @@ class CheckoutSlow(Base):
                                                     "steps": [[10 ** 400, 5]]} for p in paths}
         (self.dir / health.CHECKOUT_CACHE).write_text(json.dumps({"schema": health.CHECKOUT_CACHE_SCHEMA, "logs": logs}))
         self.assertEqual(self.ids(self.run_once()), ["checkout_slow"])
+        logs = {k: {**v, "steps": [[NOW - 600, -1]]} for k, v in logs.items()}
+        (self.dir / health.CHECKOUT_CACHE).write_text(json.dumps({"schema": health.CHECKOUT_CACHE_SCHEMA, "logs": logs}))
+        self.assertEqual(self.ids(self.run_once()), ["checkout_slow"])  # a negative duration is re-read too
 
     def test_a_corrupt_cache_or_a_future_step_is_ignored(self) -> None:
         paths = [self.job(700) for _ in range(12)]

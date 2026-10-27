@@ -1367,7 +1367,7 @@ def cached_steps(hit: Any, size: int, mtime: float) -> list[list[float]] | None:
     steps = hit.get("steps")
     if not isinstance(steps, list) or len(steps) > CHECKOUT_MAX_STEPS:
         return None
-    if not all(isinstance(st, list) and len(st) == 2 and all(finite(v) for v in st) for st in steps):
+    if not all(isinstance(st, list) and len(st) == 2 and all(finite(v) for v in st) and st[1] >= 0 for st in steps):
         return None
     return steps
 
