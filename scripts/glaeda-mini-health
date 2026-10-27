@@ -160,6 +160,7 @@ import argparse
 import contextlib
 import datetime
 import fcntl
+import heapq
 import importlib.machinery
 import importlib.util
 import json
@@ -170,6 +171,7 @@ import re
 import shlex
 import shutil
 import signal
+import stat
 import socket
 import subprocess
 import sys
@@ -199,7 +201,8 @@ CHECKOUT_MAX_LOGS = 80  # the newest worker logs (one per job) across this mini'
 CHECKOUT_MAX_LOG_BYTES = 16 << 20  # a worker log is about 0.2 to 1 MB; past this the rest is not read (checkout
 # runs at a job's start, so a longer log's checkout steps are in this prefix; its cache entry says "truncated")
 CHECKOUT_PASS_BYTES = 64 << 20  # read per pass at most: logs past it wait for the next pass (2 minutes later)
-CHECKOUT_MAX_DIR_ENTRIES = 5000  # _diag entries looked at per runner (the runner keeps a few hundred)
+CHECKOUT_MAX_DIR_ENTRIES = 20000  # _diag entries looked at per pass, all runners (each keeps a few hundred)
+CHECKOUT_MAX_STEPS = 200  # checkout steps kept per log (a job has one to a few)
 CHECKOUT_CACHE = "checkout-steps.json"  # beside STATE: each parsed log's (size, mtime) and its checkout times
 CHECKOUT_CACHE_SCHEMA = "glaeda-mini-health-checkout-steps/v1"
 WORKER_LOG = re.compile(r"Worker_[0-9]{8}-[0-9]{6}-utc\.log")
@@ -381,27 +384,48 @@ class Mini:
         return self._hook or None
 
     def worker_logs(self) -> list[tuple[str, Path, int, float]]:
-        """(key, path, size, mtime) of each runner's worker logs, any age; key is "<runner dir>/<file>". At most
-        CHECKOUT_MAX_DIR_ENTRIES _diag entries are looked at per runner."""
-        out = []
+        """(key, path, size, mtime) of the runners' newest CHECKOUT_MAX_LOGS worker logs that are regular files;
+        key is "<runner dir>/<file>". At most CHECKOUT_MAX_DIR_ENTRIES _diag entries are looked at in all."""
+        newest: list[tuple[float, str, str, int]] = []  # a min-heap of (mtime, key, path, size)
+        seen = 0
         for d in self.runner_dirs():
             with contextlib.suppress(OSError), os.scandir(d / "_diag") as it:
-                for n, e in enumerate(it):
-                    if n >= CHECKOUT_MAX_DIR_ENTRIES:
+                for e in it:
+                    seen += 1
+                    if seen > CHECKOUT_MAX_DIR_ENTRIES:
                         break
-                    if WORKER_LOG.fullmatch(e.name):
-                        with contextlib.suppress(OSError):
-                            st = e.stat(follow_symlinks=False)
-                            out.append((f"{d.name}/{e.name}", Path(e.path), st.st_size, st.st_mtime))
-        return out
+                    if not WORKER_LOG.fullmatch(e.name):
+                        continue
+                    with contextlib.suppress(OSError):
+                        st = e.stat(follow_symlinks=False)
+                        if not stat.S_ISREG(st.st_mode):
+                            continue
+                        item = (st.st_mtime, f"{d.name}/{e.name}", e.path, st.st_size)
+                        if len(newest) < CHECKOUT_MAX_LOGS:
+                            heapq.heappush(newest, item)
+                        elif item > newest[0]:
+                            heapq.heapreplace(newest, item)
+            if seen > CHECKOUT_MAX_DIR_ENTRIES:
+                break
+        return [(key, Path(path), size, mtime) for mtime, key, path, size in newest]
 
     def read_log(self, path: Path, limit: int) -> str | None:
-        """The first `limit` bytes of a log, or None when it cannot be read."""
+        """The first `limit` bytes of a regular file (never a symlink, FIFO or device), or None."""
         try:
-            with open(path, "rb") as fh:
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        except OSError:
+            return None
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                return None
+            with os.fdopen(fd, "rb") as fh:
+                fd = -1
                 return fh.read(limit).decode("utf-8", "replace")
         except OSError:
             return None
+        finally:
+            if fd >= 0:
+                os.close(fd)
 
     # ---- reads
 
@@ -1328,7 +1352,12 @@ def checkout_durations(text: str) -> list[tuple[float, float]]:
 
 
 def finite(x: Any) -> bool:
-    return isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x)
+    """A real number of a sane size (an int too large for a float is not)."""
+    if isinstance(x, bool) or not isinstance(x, (int, float)):
+        return False
+    if isinstance(x, int):
+        return abs(x) < 10 ** 11
+    return math.isfinite(x) and abs(x) < 1e11
 
 
 def cached_steps(hit: Any, size: int, mtime: float) -> list[list[float]] | None:
@@ -1336,9 +1365,9 @@ def cached_steps(hit: Any, size: int, mtime: float) -> list[list[float]] | None:
     if not isinstance(hit, dict) or hit.get("size") != size or hit.get("mtime") != mtime:
         return None
     steps = hit.get("steps")
-    if not isinstance(steps, list) or len(steps) > 1000:
+    if not isinstance(steps, list) or len(steps) > CHECKOUT_MAX_STEPS:
         return None
-    if not all(isinstance(st, list) and len(st) == 2 and all(finite(v) and abs(v) < 1e11 for v in st) for st in steps):
+    if not all(isinstance(st, list) and len(st) == 2 and all(finite(v) for v in st) for st in steps):
         return None
     return steps
 
@@ -1355,7 +1384,7 @@ def check_checkout_steps(mini: Mini, now: float, cache_path: Path, remember: boo
 
 def _check_checkout_steps(mini: Mini, now: float, cache_path: Path, remember: bool) -> list[dict[str, Any]]:
     recent = sorted((w for w in mini.worker_logs() if 0 <= now - w[3] <= CHECKOUT_WINDOW_S),
-                    key=lambda w: w[3], reverse=True)[:CHECKOUT_MAX_LOGS]
+                    key=lambda w: w[3], reverse=True)[:CHECKOUT_MAX_LOGS]  # worker_logs is already the newest
     cache = load_json(cache_path)
     logs = cache.get("logs") if cache.get("schema") == CHECKOUT_CACHE_SCHEMA else None
     logs = logs if isinstance(logs, dict) else {}
@@ -1377,7 +1406,7 @@ def _check_checkout_steps(mini: Mini, now: float, cache_path: Path, remember: bo
             if size > limit and limit < CHECKOUT_MAX_LOG_BYTES:
                 continue  # cut short by the pass budget, not the per-log cap: read whole on a later pass
             truncated = size > limit
-            steps = [[round(at), round(sec, 1)] for at, sec in checkout_durations(text)]
+            steps = [[round(at), round(sec, 1)] for at, sec in checkout_durations(text)][-CHECKOUT_MAX_STEPS:]
         kept[key] = {"size": size, "mtime": mtime, "steps": steps, **({"truncated": True} if truncated else {})}
         samples += [float(sec) for at, sec in steps if 0 <= now - at <= CHECKOUT_WINDOW_S]
     if remember and kept != logs:

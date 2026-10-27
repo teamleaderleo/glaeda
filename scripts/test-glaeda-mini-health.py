@@ -2190,10 +2190,33 @@ class CheckoutSlow(Base):
     def test_a_log_past_the_per_log_cap_keeps_its_prefix_and_says_so(self) -> None:
         for _ in range(12):
             self.job(700)
+        limits: list[int] = []
+        real = self.mini.read_log
+        self.mini.read_log = lambda path, limit: limits.append(limit) or real(path, limit)
         with mock.patch.object(health, "CHECKOUT_MAX_LOG_BYTES", 400):
             self.run_once()
+        self.assertEqual(set(limits), {400})
+        self.assertEqual(len(real(next(iter(self.home.glob("*/_diag/Worker_*"))), 400)), 400)
         logs = json.loads((self.dir / health.CHECKOUT_CACHE).read_text())["logs"]
         self.assertTrue(all(e.get("truncated") for e in logs.values()))
+
+    def test_only_regular_files_are_read(self) -> None:
+        for _ in range(12):
+            self.job(700)
+        diag = self.home / "actions-runner-glaeda" / "_diag"
+        os.mkfifo(diag / "Worker_20991231-000000-utc.log")
+        (diag / "Worker_20991231-000001-utc.log").symlink_to(diag / "Worker_20261027-000001-utc.log")
+        self.assertEqual(len(self.mini.worker_logs()), 12)
+        self.assertIsNone(self.mini.read_log(diag / "Worker_20991231-000000-utc.log", 100))
+        self.assertIsNone(self.mini.read_log(diag / "Worker_20991231-000001-utc.log", 100))
+        self.assertEqual(self.ids(self.run_once()), ["checkout_slow"])
+
+    def test_a_huge_cached_number_is_reread_not_fatal(self) -> None:
+        paths = [self.job(700) for _ in range(12)]
+        logs = {f"actions-runner-glaeda/{p.name}": {"size": p.stat().st_size, "mtime": p.stat().st_mtime,
+                                                    "steps": [[10 ** 400, 5]]} for p in paths}
+        (self.dir / health.CHECKOUT_CACHE).write_text(json.dumps({"schema": health.CHECKOUT_CACHE_SCHEMA, "logs": logs}))
+        self.assertEqual(self.ids(self.run_once()), ["checkout_slow"])
 
     def test_a_corrupt_cache_or_a_future_step_is_ignored(self) -> None:
         paths = [self.job(700) for _ in range(12)]
