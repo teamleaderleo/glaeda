@@ -7682,13 +7682,15 @@ def cmux_next_ci_stale_roots(root: Path) -> list[Path]:
     only their generated output the cap's to take, the inputs of states no job had built in for hours held the
     cache over its cap for good (cmux14, 2026-10-27: 79 GiB against 40, eight states of five runners, 4-5 GiB of
     SourcePackages and module cache each). A younger state keeps its inputs. Only a host with enrolled runners
-    applies the cap, so elsewhere there are none. Every in-use veto, its runner's running job included, still
-    holds (cmux_next_ci_busy)."""
+    applies the cap, so elsewhere there are none, and while an enrolled runner's .runner cannot be read none is
+    (the state may be that runner's, mid-registration). Every in-use veto, its runner's running job included,
+    still holds (cmux_next_ci_busy)."""
     if not enrolled_runner_names():
         return []
     idle_s = float(POLICY["cmux_next_ci_unowned_idle_hours"]) * 3600
     now = time.time()
-    return [s for s in cmux_next_ci_state_roots(root) if now - newest_mtime(s, 2, 3000) >= idle_s]
+    return [s for s in cmux_next_ci_state_roots(root)
+            if cmux_next_ci_owner(s, root) != OWNER_UNKNOWN and now - newest_mtime(s, 2, 3000) >= idle_s]
 
 
 def cmux_next_ci_stale_roots_cached(root: Path) -> frozenset[Path]:
