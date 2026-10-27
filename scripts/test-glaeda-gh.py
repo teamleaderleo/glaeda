@@ -420,8 +420,8 @@ class ControllerTest(Base):
         self.daemon.tick(NOW + 2 * gg.TICK)
         entry = gg.read_cache(key)
         self.assertEqual(gg.verdict("run", entry["data"], jobs=entry.get("jobs")), gg.EXIT_OK)
-        # attempt 1's run and job list, and one read confirming attempt 2's finish
-        self.assertEqual(len(self.gh.rest_calls()), 3)
+        # attempt 1's run and job list; attempt 2's finish is confirmed a cycle after the last read
+        self.assertEqual(len(self.gh.rest_calls()), 2)
 
     def test_a_finish_only_the_controller_reported_is_confirmed_before_a_wait_rules(self) -> None:
         """manaflow-ai/cmux run 40434431701, 2026-10-27: the controller kept attempt 1's "cancelled" (its rerun's
@@ -459,7 +459,9 @@ class ControllerTest(Base):
                             "updated_at": iso(now)}
         self.ctl.runs[46] = {**ctl_run(46, "completed", "success", iso(now)), "attempt": 2}
         self.daemon.tick(NOW + 3 * gg.TICK)
-        self.daemon.tick(NOW + 4 * gg.TICK)
+        self.assertIsNone(gg.wait_step(req, time.time()), "the controller's success is confirmed first")
+        self.daemon.tick(NOW + gg.TICK + gg.CYCLE)  # confirmations are paced at one per cycle
+        self.assertEqual(len(self.gh.rest_calls()), calls + 2)
         result = gg.wait_step(req, time.time())
         self.assertIsNotNone(result)
         self.assertEqual(result[0], gg.EXIT_OK)
@@ -482,6 +484,19 @@ class ControllerTest(Base):
         self.assertEqual(gg.read_cache(key)["data"]["run_attempt"], 2)
         self.daemon.tick(NOW + 3 * gg.TICK)
         self.assertEqual(len(self.gh.rest_calls()), 1, "confirmed once, not every tick")
+
+    def test_a_failed_confirmation_is_retried_once_a_cycle(self) -> None:
+        now = time.time()
+        key = "run:o/r/48"
+        self.ctl.runs[48] = ctl_run(48, "completed", "success", iso(now - 60))
+        gg.register(key)
+        self.age_watch(key, 1)
+        # no self.gh.runs[48]: every GitHub read of it fails (404 here; a 500 or a transport error is the same)
+        for t in range(10):
+            self.daemon.tick(NOW + t * gg.TICK)
+        self.assertEqual(len(self.gh.rest_calls()), 1, "one failed read, not one a tick")
+        self.daemon.tick(NOW + gg.CYCLE + 1)
+        self.assertEqual(len(self.gh.rest_calls()), 2)
 
     def test_safety_net_reads_rest_every_15_minutes(self) -> None:
         self.ctl.runs[22] = ctl_run(22, "in_progress")
@@ -615,16 +630,17 @@ class ControllerTest(Base):
         gg.register(key)
         self.age_watch(key, 200)
         self.daemon.tick(NOW - 100)
-        self.assertEqual(self.gh.rest_calls(), [])
+        # a finish only the controller reported is read from GitHub once before any wait rules on it
+        self.assertEqual(len(self.gh.rest_calls()), 1)
         stale = gg.read_cache(key)["dataAt"]
         self.daemon.tick(NOW - 98)
-        self.assertEqual(gg.read_cache(key)["dataAt"], stale, "unchanged controller data keeps its time")
+        self.assertEqual(gg.read_cache(key)["dataAt"], stale, "unchanged data keeps its time")
         self.age_watch(key, 0)  # a new reader
         self.daemon.tick(NOW)
-        self.assertEqual(len(self.gh.rest_calls()), 1)
+        self.assertEqual(len(self.gh.rest_calls()), 2)
         self.assertEqual(gg.read_cache(key)["dataAt"], NOW)
         self.daemon.tick(NOW + gg.CYCLE)
-        self.assertEqual(len(self.gh.rest_calls()), 1, "confirmed once, not every cycle")
+        self.assertEqual(len(self.gh.rest_calls()), 2, "confirmed once, not every cycle")
 
     def test_rerun_before_its_webhook_is_not_answered_with_the_old_attempt(self) -> None:
         self.ctl.runs[29] = ctl_run(29, "completed", "failure")
@@ -812,6 +828,32 @@ class UpstreamTest(Base):
         self.assertEqual(pr["source"], "upstream")
         self.assertEqual(gg.read_cache("run:o/r/9")["jobs"], [{"id": 1}])
         self.assertEqual(status["upstream"]["state"], "ok")
+
+    def test_a_controller_only_finish_stays_unconfirmed_downstream(self) -> None:
+        """The upstream's provenance travels with the data: a finish only its controller reported is not ruled on
+        here either, and one a GitHub read confirmed is."""
+        now = time.time()
+        gg.register("run:o/r/9")
+        req = gg.wait_request("run", "o/r/9", "done", 60, False, False, None, True, gg.RESCUE_GRACE)
+        req["began"] = now - 30
+        done = {"id": 9, "status": "completed", "conclusion": "cancelled", "run_attempt": 1, "head_sha": "a" * 40}
+        self.answers["run:o/r/9"] = {"data": done, "dataAt": now - 5, "origin": "controller"}
+        self.daemon.tick(now=NOW)
+        entry = gg.read_cache("run:o/r/9")
+        self.assertEqual((entry["source"], entry["origin"]), ("upstream", "controller"))
+        self.assertIsNone(gg.wait_step(req, time.time()))
+        self.answers["run:o/r/9"] = {**self.answers["run:o/r/9"],
+                                     "restRun": {"run_attempt": 1, "status": "completed", "conclusion": "cancelled"}}
+        self.daemon.tick(now=NOW + gg.UPSTREAM_EVERY + 1)
+        self.assertIsNotNone(gg.wait_step(req, time.time()))
+        # what this host serves to its own downstream says where the data came from
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), mock.patch.object(gg, "daemon_running", return_value=True), \
+                mock.patch.object(gg, "daemon_failing", return_value=None):
+            gg.cmd_read(json.dumps({"keys": [{"key": "run:o/r/9", "jobs": False}]}))
+        served = json.loads(out.getvalue())["entries"]["run:o/r/9"]
+        self.assertEqual(served["origin"], "controller")
+        self.assertEqual(served["restRun"]["conclusion"], "cancelled")
 
     def test_reads_are_paced_and_a_new_key_is_asked_for_soon(self) -> None:
         gg.register("pr:o/r#7")
@@ -1655,9 +1697,32 @@ class ClientTest(Base):
         req = gg.wait_request("run", "o/r/14", "green", 5, False, False, None, True, gg.RESCUE_GRACE)
         with mock.patch.object(gg.Controller, "from_env", return_value=controller):
             self.assertIsNotNone(gg.controller_wait_run("run:o/r/14", 5))
+        # an empty cache: the controller's finish alone is not ruled on (a rerun's deliveries can be lost)
+        self.assertIsNone(gg.wait_step(req, time.time()))
+        # once a GitHub read showed the same attempt finished, the long-poll's answer is fresh for the wait
+        self.put("run:o/r/14", gg.read_cache("run:o/r/14")["data"], source="controller",
+                 restRun={"run_attempt": 1, "status": "completed", "conclusion": "success"})
+        with mock.patch.object(gg.Controller, "from_env", return_value=controller):
+            self.assertIsNotNone(gg.controller_wait_run("run:o/r/14", 5))
         result = gg.wait_step(req, time.time())
         self.assertIsNotNone(result)
         self.assertEqual(result[0], gg.EXIT_OK)
+        # and with GitHub unreadable, the controller's finish counts once it is REST_SAFETY old
+        self.put("run:o/r/14", gg.read_cache("run:o/r/14")["data"], source="controller")
+        entry = gg.read_cache("run:o/r/14")
+        self.assertTrue(gg.controller_unconfirmed(entry, entry["dataAt"] + 1))
+        self.assertFalse(gg.controller_unconfirmed(entry, entry["dataAt"] + gg.REST_SAFETY))
+
+    def test_the_handoff_keeps_the_wait_start_and_its_deadline(self) -> None:
+        """After the long-poll, the daemon's request keeps the wait's own start: a controller finish read during the
+        long-poll still counts once it is REST_SAFETY old, and the deadline does not move."""
+        began = time.time() - 40
+        with mock.patch.object(gg.os, "mkfifo"):
+            rid = gg.write_wait_request("run", "o/r/14", "done", 20, False, False, None, True, gg.RESCUE_GRACE,
+                                        os.getpid(), began=began)
+        req = gg.read_json(gg.waits_dir() / f"{rid}.json")
+        self.assertEqual(req["began"], began)
+        self.assertAlmostEqual(req["began"] + req["timeout"], time.time() + 20, delta=2)
 
     def test_controller_wait_rejects_foreign_repo(self) -> None:
         controller = mock.Mock()
