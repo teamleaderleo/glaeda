@@ -48,6 +48,7 @@ class Mirror(unittest.TestCase):
         (self.home / "actions-runner-glaeda/.runner").write_text("{}")
         (self.home / gm.SOURCE_CONFIG).parent.mkdir(parents=True)
         (self.home / gm.SOURCE_CONFIG).write_text('{"schema": 1, "source": "direct"}')
+        os.utime(self.home / gm.SOURCE_CONFIG, (0, 0))  # written long ago: this host's first-seed slot is open
         # The "GitHub" repository: three branches.
         self.upstream = root / "upstream"
         self.upstream.mkdir()
@@ -435,6 +436,32 @@ class Mirror(unittest.TestCase):
             return 3
         self.assertEqual(gm.in_own_session(call), 3)
         self.assertEqual(mark.read_text(), "True")
+
+    def test_a_first_seed_waits_for_the_host_s_slot_and_a_repair_never_does(self) -> None:
+        config = self.home / gm.SOURCE_CONFIG
+        now = float(int(time.time()))
+        os.utime(config, (now, now))  # just written by setup, as on every mini of a site at once
+        with mock.patch.object(gm.platform, "node", lambda: "mini-a"), mock.patch.object(gm, "SEED_SLOTS", 1), \
+                mock.patch.object(gm, "SEED_SLOT_S", 600):
+            self.assertEqual(gm.seed_wait(self.home, now), 0)  # slot 0 of 1: no wait
+        waits = set()
+        for host in ("mini-a", "mini-b", "mini-c", "mini-d", "mini-e", "mini-f"):
+            with mock.patch.object(gm.platform, "node", lambda host=host: host):
+                wait = gm.seed_wait(self.home, now)
+            self.assertLess(wait, gm.SEED_SLOTS * gm.SEED_SLOT_S)
+            self.assertEqual(wait % gm.SEED_SLOT_S, 0)
+            waits.add(wait)
+        self.assertGreater(len(waits), 1)  # spread, not all at once
+        with mock.patch.object(gm, "seed_wait", lambda home=None, now=None: 300.0):
+            result = gm.run(True, home=self.home)
+            self.assertEqual(result["state"], "skipped", result)
+            self.assertIn("slot", result["reason"])
+            self.assertFalse(self.mirror.exists())
+        os.utime(config, (0, 0))  # the slot has opened
+        self.assertEqual(gm.run(True, home=self.home)["state"], "applied")
+        (self.mirror / "shallow").write_text("0" * 40 + "\n")  # broken, not missing: repaired at once
+        with mock.patch.object(gm, "seed_wait", lambda home=None, now=None: 300.0):
+            self.assertEqual(gm.run(True, home=self.home)["state"], "applied")
 
     def test_plan_changes_nothing(self) -> None:
         result = gm.run(False, home=self.home)

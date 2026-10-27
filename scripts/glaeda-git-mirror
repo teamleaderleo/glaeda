@@ -42,8 +42,10 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import fcntl
+import hashlib
 import json
 import os
+import platform
 import re
 import shutil
 import signal
@@ -88,6 +90,11 @@ PACK_LIMIT = 24
 SOURCE_CONFIG = ".config/glaeda/lan-cache/config.json"
 SOURCES = ("direct",)
 REPACK_TIMEOUT = 1200
+# A release reaches every mini of a site at once and setup writes their source together, so a host's first seed
+# (no mirror at all) waits SEED_SLOT_S times a slot fixed by its name, counted from when its source was written:
+# a site's minis seed over its uplink one or two at a time, within SEED_SLOTS * SEED_SLOT_S. A repair never waits.
+SEED_SLOTS = 8
+SEED_SLOT_S = 600
 CONFIG = {
     "core.bare": "true",
     "gc.auto": "0",
@@ -620,6 +627,18 @@ def source(home: Path | None = None) -> str:
     return raw["source"]
 
 
+def seed_wait(home: Path | None = None, now: float | None = None) -> float:
+    """Seconds until this host's first-seed slot opens (0 when open)."""
+    home = Path.home() if home is None else home
+    try:
+        written = (home / SOURCE_CONFIG).stat().st_mtime
+    except OSError:
+        return 0.0
+    host = platform.node().split(".")[0].lower()
+    slot = int.from_bytes(hashlib.sha256(host.encode()).digest()[:4], "big") % SEED_SLOTS
+    return max(0.0, written + slot * SEED_SLOT_S - (time.time() if now is None else now))
+
+
 def run(apply: bool, *, wait: bool = False, from_github: bool = False, home: Path | None = None) -> dict:
     record: dict = {"time": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
                     "mirror": os.fspath(MIRROR)}
@@ -629,6 +648,8 @@ def run(apply: bool, *, wait: bool = False, from_github: bool = False, home: Pat
     if not record["source"]:
         return {**record, "state": "skipped", "reason": f"no mirror source in ~/{SOURCE_CONFIG}"}
     problem = healthy(MIRROR)
+    if problem == "missing" and not (MIRROR.exists() or MIRROR.is_symlink()) and (left := seed_wait(home)) > 0:
+        return {**record, "state": "skipped", "reason": f"first seed waits for this host's slot: {left:.0f} s"}
     if not apply:
         return {**record, "state": "plan", "health": problem or "ok",
                 "would": f"seed from the R2 bundle ({problem}), then fetch" if problem else "fetch"}
