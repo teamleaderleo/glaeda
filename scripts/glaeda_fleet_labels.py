@@ -339,7 +339,7 @@ def declared_pools(manifest: Any, xcode_ok: Callable[[str, dict[str, Any]], bool
 # command, and refuses the job when that fails. watch, when given, is the builder's own loop, run as a glaeda
 # LaunchAgent beside the runner. env goes into the runner's .env and the watch loop's environment; "{runnerDir}" in a
 # value is the runner's directory. A leading "~/" in a command word or env value is the runner user's home.
-DEDICATED_NAME_RE = r"[a-z0-9][a-z0-9-]{0,39}"
+DEDICATED_NAME_RE = r"[a-z][a-z0-9-]{0,39}"  # starts with a letter: never read as a pool instance number
 RUNNER_LABEL_RE = r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}"
 ENV_NAME_RE = r"[A-Z_][A-Z0-9_]{0,63}"
 DEFAULT_LABELS = ("self-hosted", "macos", "arm64", MINI_LABEL)

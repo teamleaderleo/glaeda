@@ -2476,6 +2476,7 @@ class DedicatedRunnerAgentTest(unittest.TestCase):
         self.assertEqual((health.agent_label("0"), health.agent_label("3")),
                          ("com.teamleaderleo.glaeda.cmux-runner", "com.teamleaderleo.glaeda.cmux-runner.3"))
         self.assertEqual(health.RUNNER_DIR.fullmatch("actions-runner-glaeda-nightly-next").group(1), "nightly-next")
+        self.assertEqual(health.RUNNER_DIR.fullmatch("actions-runner-glaeda-7").group(1), "7")
         mini = mock.Mock()
         mini.runner_registrations.return_value = []
         mini.runner_agents.return_value = [(label, True, False, "0")]

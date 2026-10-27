@@ -176,8 +176,8 @@ KILL_SWITCH = HOME / ".config/glaeda/mini-health.disabled"
 AGENTS = HOME / "Library/LaunchAgents"
 HELD = HOME / ".local/state/glaeda/mini-fleet/runner-held"  # cmux_mini_fix.sh runner_hold's marks
 # an instance (.K) or a dedicated runner (.dedicated.NAME, glaeda-cmux-runner --dedicated; never its .watch agent)
-RUNNER_AGENT = re.compile(r"com\.teamleaderleo\.glaeda\.cmux-runner(?:\.\d+|\.dedicated\.[a-z0-9-]+)?")
-RUNNER_DIR = re.compile(r"actions-runner-glaeda(?:-(\d+|[a-z0-9][a-z0-9-]*))?")
+RUNNER_AGENT = re.compile(r"com\.teamleaderleo\.glaeda\.cmux-runner(?:\.\d+|\.dedicated\.[a-z][a-z0-9-]*)?")
+RUNNER_DIR = re.compile(r"actions-runner-glaeda(?:-(\d+|[a-z][a-z0-9-]*))?")
 RUNNER_PIN = "2.338.0"  # glaeda-cmux-runner's PINNED_RUNNER_VERSION; a test keeps the two equal
 RUNNER_VERSION_RE = r"[0-9]{1,4}\.[0-9]{1,4}\.[0-9]{1,4}"
 RUNNER_RECEIPTS = ".local/state/glaeda/cmux-runner"  # glaeda-cmux-runner's install receipts, under HOME

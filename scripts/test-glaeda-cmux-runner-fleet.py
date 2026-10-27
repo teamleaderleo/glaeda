@@ -270,6 +270,10 @@ class FleetTest(unittest.TestCase):
         self.assertEqual(applies[0]["stdin"].strip(), TOKEN)
         tokens = [c["argv"] for c in self.calls() if c["tool"] == "gh" and "registration-token" in " ".join(c["argv"])]
         self.assertIn("repos/manaflow-ai/cmux/actions/runners/registration-token", [a for t in tokens for a in t])
+        lists = [c["argv"] for c in self.calls() if c["tool"] == "gh" and any("actions/runners?" in a for a in c["argv"])]
+        self.assertTrue(any("repos/manaflow-ai/cmux/actions/runners?name=mini-a-glaeda-nightly-next" in " ".join(a)
+                            for a in lists),
+                        "its labels are read from its own scope, so a mini without gh never re-registers it")
         staged = json.loads((self.dir / "calls.jsonl.mini-a.manifest").read_text())
         self.assertEqual(staged["hosts"]["mini-a"]["overrides"]["runner"]["dedicated"][0]["name"], "nightly-next")
 

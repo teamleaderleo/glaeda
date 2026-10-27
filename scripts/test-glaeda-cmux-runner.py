@@ -9412,7 +9412,8 @@ class DedicatedRunnerTest(unittest.TestCase):
         self.assertEqual(fleet_labels.dedicated_runners(MANIFEST, "mini-std"), ([], None))
         for change, needle in (({"labels": ["self-hosted", "x"]}, "leave out"), ({"labels": []}, "non-empty"),
                                ({"org": "manaflow-ai"}, "exactly one of repo"), ({"admit": ["relative.py"]}, "admit"),
-                               ({"name": "Bad Name"}, "name"), ({"env": {"lower": "x"}}, "env"),
+                               ({"name": "Bad Name"}, "name"), ({"name": "123"}, "name"),
+                               ({"env": {"lower": "x"}}, "env"),
                                ({"surprise": 1}, "unknown keys"), ({"group": "g"}, "group goes with org")):
             with self.subTest(change):
                 _, why = fleet_labels.dedicated_runners(dedicated_manifest({**NIGHTLY, **change}), "mini-std")
@@ -9450,6 +9451,9 @@ class DedicatedRunnerTest(unittest.TestCase):
         watch = plistlib.loads((self.home / "Library/LaunchAgents" / f"{label}.watch.plist").read_bytes())
         self.assertEqual(watch["ProgramArguments"][1], f"{self.home}/nightly-builder/nightly_builder.py")
         self.assertEqual(watch["EnvironmentVariables"]["NIGHTLY_BUILDER_RUNNER_DIR"], os.fspath(runner))
+        watch_path = watch["EnvironmentVariables"]["PATH"].split(":")
+        self.assertIn(f"{self.home}/.local/bin", watch_path)
+        self.assertIn("/usr/bin", watch_path, "a declared PATH joins the workload PATH, never replaces it")
         self.assertIn(f"NIGHTLY_BUILDER_RUNNER_DIR={runner}", (runner / ".env").read_text().splitlines())
         path = (runner / ".path").read_text().strip().split(":")
         self.assertEqual(path[:3], ["/opt/homebrew/bin", "/usr/local/bin", f"{self.home}/.local/bin"])
@@ -9465,6 +9469,20 @@ class DedicatedRunnerTest(unittest.TestCase):
                                 "--dedicated", "nightly-next")
         self.assertEqual(self.by_kind(again)["register"]["state"], "unchanged")
         self.assertEqual(len(self.config_argvs()), 1)
+        # the manifest drops the watch loop and an env key: the agent this install wrote and the key both go
+        trimmed = {k: v for k, v in NIGHTLY.items() if k != "watch"}
+        trimmed["env"] = {"PATH": "~/.local/bin"}
+        with mock.patch.object(cr.pwd, "getpwuid", return_value=fake_pw):
+            self.invoke("--apply", "--manifest", self.manifest(trimmed), "--member", "mini-std",
+                        "--dedicated", "nightly-next")
+        self.assertFalse((self.home / "Library/LaunchAgents" / f"{label}.watch.plist").exists())
+        self.assertNotIn("NIGHTLY_BUILDER_RUNNER_DIR", (runner / ".env").read_text())
+        self.assertIn(["bootout", f"gui/{os.getuid()}/{label}.watch"],
+                      [e["argv"] for e in self.log() if e["tool"] == "launchctl"])
+        with mock.patch.object(cr.pwd, "getpwuid", return_value=fake_pw):
+            self.invoke("--apply", "--manifest", self.manifest(), "--member", "mini-std",
+                        "--dedicated", "nightly-next")
+        self.assertTrue((self.home / "Library/LaunchAgents" / f"{label}.watch.plist").exists(), "and comes back")
         # and an uninstall deregisters it and removes both agents
         with mock.patch.object(cr.pwd, "getpwuid", return_value=fake_pw):
             self.invoke("--uninstall", "--apply", "--manifest", self.manifest(), "--member", "mini-std",

@@ -620,9 +620,12 @@ def apply_dedicated(member: str, entry: dict[str, Any], extra: list[str]) -> dic
     scope = (f"--org {_quote(entry['org'])}" + (f" --group {_quote(entry['group'])}" if entry["group"] else "")
              if entry["org"] else f"--repo {_quote(entry['repo'])}")
     version, sha, _ = latest_release()
+    # GitHub's labels for it, so a mini without gh sees a match and never re-registers it (#1645)
+    labels = github_labels(scope_api(entry["repo"], entry["org"]), f"{member}-glaeda-{entry['name']}")
+    observed = f"--github-labels={_quote(labels)} " if labels is not None else ""
     remote = (f"~/{REMOTE_DIR}/scripts/glaeda-cmux-runner --apply --token-stdin {scope} "
               f"--manifest ~/{REMOTE_DIR}/mini-fleet.json --member {_quote(member)} --dedicated {_quote(entry['name'])} "
-              f"--latest-runner-version {_quote(version)} --latest-runner-sha256 {_quote(sha)} --output json "
+              f"--latest-runner-version {_quote(version)} --latest-runner-sha256 {_quote(sha)} {observed}--output json "
               + " ".join(_quote(a) for a in extra if a != "--headless"))
     code, out, err = run(["ssh", *SSH_OPTIONS, member, remote], APPLY_TIMEOUT_S, stdin=token + "\n")
     del token
