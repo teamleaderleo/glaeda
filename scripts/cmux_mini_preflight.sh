@@ -93,6 +93,8 @@ e pf_python3 "$p3|$v3"
 [ -x /opt/homebrew/bin/python3.13 ] && e pf_brew_python3 /opt/homebrew/bin/python3.13
 # gh as the workload resolves it (cmux CI jobs call it with GH_TOKEN); only its path, so nothing runs.
 e pf_gh "$(PATH="$WORKLOAD_PATH" command -v gh 2>/dev/null)"
+# git as the workload resolves it (a host policy may ask for Homebrew's); only its path, so nothing runs.
+e pf_git "$(PATH="$WORKLOAD_PATH" command -v git 2>/dev/null)"
 
 # The cmux checkout: submodules, setup artifacts and local changes. Then the pinned candidate.
 if [ -e "$CMUX_ROOT/.git" ]; then
