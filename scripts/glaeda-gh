@@ -5640,8 +5640,13 @@ GH_CACHE_MAX_BYTES = 2 * 1024 * 1024  # a bigger answer (a whole log) is passed 
 GH_CACHE_FILL_WAIT = 30.0
 GH_CACHE_KEEP = 600.0  # stored answers older than this are deleted
 GH_CACHE_PRUNE_EVERY = 60.0
+GH_CACHE_DRAIN = 3.0  # after a fill is killed, how long its pipes are read before they are dropped
 GH_CACHE_FILL_DEADLINE = 600.0  # a filling gh still running after this is killed with its process group
 GH_CACHE_DEBUG_ENV = ("GH_DEBUG", "DEBUG")  # gh prints request headers under these: never stored
+# What changes the bytes gh prints for the same arguments: colour, a forced tty, the markdown style,
+# the width. Part of the key, so a caller is never handed output rendered for another.
+GH_CACHE_OUTPUT_ENV = ("GH_FORCE_TTY", "CLICOLOR_FORCE", "CLICOLOR", "NO_COLOR", "GLAMOUR_STYLE",
+                       "GH_MDWIDTH", "COLUMNS", "TERM", "GH_PAGER", "PAGER", "LANG", "LC_ALL")
 GH_CACHE_READS = {("pr", "view"), ("run", "view")}  # and `api` GET
 GH_CACHE_NEVER = {"--web", "-w", "--watch", "--verbose", "--include", "-i"}
 # (subcommand, verb) pairs that never write; `None` as the verb is every verb of that subcommand.
@@ -5733,6 +5738,7 @@ def gh_cache_identity(real: str | None) -> str:
     except OSError:
         parts.append("?")
     parts.append(real or "")
+    parts += [f"{name}={os.environ.get(name, '')}" for name in GH_CACHE_OUTPUT_ENV]
     return hashlib.sha256("\0".join(parts).encode()).hexdigest()
 
 
@@ -5846,9 +5852,11 @@ def gh_cache_emit(answer: dict) -> int:
 
 
 def gh_cache_child(real: str, args: list[str], capture: bool, deadline: float | None) -> tuple[int, bytes, bytes]:
-    """Run the real gh once as a child. With `capture`, its own process group and a deadline after
-    which the whole group is killed (exit 124); without, it shares the terminal and the caller's
-    stdio, and the broker ignores ^C itself so the child decides how to end."""
+    """Run the real gh once as a child, in the caller's own process group, so whoever bounds the
+    caller (run_bounded kills a whole group) bounds gh too. With `capture`, a deadline after which
+    gh is killed (exit 124); without, it shares the terminal and the caller's stdio. ^C reaches gh
+    from the terminal as it would without the broker; the broker ignores it only once gh is running,
+    so it waits for gh's own exit and stamps the write."""
     env = dict(os.environ)
     # A child, not an exec, so the hop mark (scoped to this pid) means nothing to it; the depth
     # count is what keeps a wrapper that hands gh back here finite.
@@ -5856,25 +5864,27 @@ def gh_cache_child(real: str, args: list[str], capture: bool, deadline: float | 
     env.pop(BROKER_MARK, None)
     if capture:
         with subprocess.Popen([real, *args], env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                              stderr=subprocess.PIPE, start_new_session=True) as proc:
+                              stderr=subprocess.PIPE) as proc:
             try:
                 out, err = proc.communicate(timeout=deadline)
             except subprocess.TimeoutExpired:
-                with contextlib.suppress(OSError):
-                    os.killpg(proc.pid, signal.SIGKILL)
-                proc.communicate()
+                proc.kill()
+                # A grandchild may still hold the pipes; it is in the caller's group, so the
+                # caller's own bound reaches it. Not waiting for it here is what keeps this one.
+                with contextlib.suppress(subprocess.TimeoutExpired):
+                    proc.communicate(timeout=GH_CACHE_DRAIN)
                 return 124, b"", f"glaeda-gh: gh ran past {int(deadline or 0)} s and was stopped\n".encode()
             return proc.returncode, out, err
-    previous = signal.signal(signal.SIGINT, signal.SIG_IGN)
-    try:
-        with subprocess.Popen([real, *args], env=env) as proc:
-            forward = signal.signal(signal.SIGTERM, lambda *_: proc.send_signal(signal.SIGTERM))
-            try:
-                code = proc.wait()
-            finally:
-                signal.signal(signal.SIGTERM, forward)
-    finally:
-        signal.signal(signal.SIGINT, previous)
+    with subprocess.Popen([real, *args], env=env) as proc:
+        # Set only after the fork: a disposition of SIG_IGN would survive gh's exec, and ^C would
+        # then not stop a write it stops without the broker.
+        previous = signal.signal(signal.SIGINT, signal.SIG_IGN)
+        forward = signal.signal(signal.SIGTERM, lambda *_: proc.send_signal(signal.SIGTERM))
+        try:
+            code = proc.wait()
+        finally:
+            signal.signal(signal.SIGTERM, forward)
+            signal.signal(signal.SIGINT, previous)
     return (128 - code if code < 0 else code), b"", b""
 
 

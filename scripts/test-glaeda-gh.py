@@ -8324,5 +8324,39 @@ class RunnersTest(BrokerBase):
             gg.cmd_runners("not a scope", None, False)
 
 
+class BrokerAnswerCacheReviewTest(BrokerBase):
+    """Round-two findings: output environment, process group, and ^C on a write."""
+
+    def test_output_environment_is_part_of_the_key(self) -> None:
+        os.environ["GLAEDA_GH_CACHE_TTL"] = "60"
+        args = ["pr", "view", "7", "-R", "o/r"]
+        words, method, seen, values = gg.broker_words(args)
+        with mock.patch.object(sys.stdout, "isatty", return_value=False):
+            plain = gg.gh_cache_key(args, words, values, seen, method, "/gh")
+            self.assertIsNotNone(plain)
+            for name, value in (("GH_FORCE_TTY", "1"), ("CLICOLOR_FORCE", "1"), ("NO_COLOR", "1"),
+                                ("GLAMOUR_STYLE", "dark"), ("COLUMNS", "80")):
+                with self.subTest(name=name), mock.patch.dict(os.environ, {name: value}):
+                    self.assertNotEqual(gg.gh_cache_key(args, words, values, seen, method, "/gh"), plain)
+
+    def test_a_fill_child_stays_in_the_callers_process_group(self) -> None:
+        probe = self.home / "bin" / "pgid"
+        probe.write_text("#!/bin/sh\nps -o pgid= -p $$\n")
+        probe.chmod(0o755)
+        rc, out, _err = gg.gh_cache_child(str(probe), [], True, 10)
+        self.assertEqual((rc, int(out.decode().strip())), (0, os.getpgrp()))
+
+    def test_a_write_child_gets_default_sigint(self) -> None:
+        probe = self.home / "bin" / "sigint"
+        out = self.home / "sigint.txt"
+        # SigIgn in /proc is Linux only; ask the shell instead: `trap` prints an ignored INT
+        probe.write_text(f"#!/bin/sh\ntrap > {out}\n")
+        probe.chmod(0o755)
+        rc, _o, _e = gg.gh_cache_child(str(probe), [], False, None)
+        self.assertEqual(rc, 0)
+        self.assertNotIn("INT", out.read_text())
+        self.assertIsNot(signal.getsignal(signal.SIGINT), signal.SIG_IGN)
+
+
 if __name__ == "__main__":
     unittest.main()
