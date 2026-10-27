@@ -5401,6 +5401,27 @@ class GateTest(unittest.TestCase):
                                            "cmux-next.yml"),
             hook.DEV_COMPILE_CAPACITY_WAIT_S)
 
+    def test_every_job_on_the_freshness_slot_waits_a_bounded_time(self) -> None:
+        """A push's release-compile on the slot is not a DEV compile (dev_compile_capacity_wait is None), but the
+        slot still bounds its wait, so a mini that fills while it waits refuses it back to placement."""
+        self.fleet()
+        self.take_units(14)
+        ref = "refs/heads/feat-cmux-next"
+        push = event(self.dir, "fresh-full", {"repository": CMUX, "ref": ref})
+        start = time.monotonic()
+        result = self.run_hook(
+            "job-started", "push", push, "--allowed-repo", "manaflow-ai/cmux", "--no-disk", "--state-dir",
+            os.fspath(self.dir / "state"), "--watch-pid", str(os.getpid()),
+            "--capacity-units", "14", "--capacity-dir", os.fspath(self.dir / "capacity"), "--dev-compile-runner",
+            repo="manaflow-ai/cmux",
+            env={"GITHUB_JOB": "release-compile", "RUNNER_NAME": "d1", "GITHUB_REF": ref,
+                 "GLAEDA_TEST_DEV_COMPILE_WAIT_S": "1",
+                 "GITHUB_WORKFLOW_REF": f"manaflow-ai/cmux/.github/workflows/cmux-next.yml@{ref}"},
+            timeout=hook.DEV_COMPILE_CAPACITY_WAIT_S + 60)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("refused", result.stdout)
+        self.assertLess(time.monotonic() - start, hook.DEV_COMPILE_CAPACITY_WAIT_S + 45)
+
     def test_other_capacity_waits_remain_unbounded(self) -> None:
         event = {"repository": CMUX, "ref": "refs/heads/feat-cmux-next"}
         for job, workflow, event_name in (("cmux-scheme-compile", "cmux-next.yml", "pull_request"),
@@ -6019,6 +6040,21 @@ class GateTest(unittest.TestCase):
             self.assertFalse(hook.probe(reserve), "idle: the slot holds its reserve")
             self.assertEqual(hook.gui_reserved(capacity), hook.FRESH_RESERVE_UNITS)
             self.assertEqual(hook.gui_reserved(capacity, hook.FRESH_RESERVE_TOKEN), 0, "its own job takes it")
+        # A job arrives: the reserve stays until that job holds its admission, then goes back to the other lanes.
+        gate.child = mock.Mock(poll=mock.Mock(return_value=None))
+        (self.runner / ".runner").write_text("\ufeff" + json.dumps({"agentName": "mini-glaeda-1"}), encoding="utf-8")
+        with mock.patch.object(gate, "start"), mock.patch.object(gate, "stop"), \
+                mock.patch.object(gate, "reload"), mock.patch.object(gate, "saturated", return_value=None), \
+                mock.patch.object(gate, "busy", return_value=True):
+            gate.step()
+            self.assertFalse(hook.probe(reserve), "a job not yet admitted: its units wait for it")
+            self.state.mkdir(parents=True, exist_ok=True)
+            holder = hook.holder_file(self.state, "mini-glaeda-1")
+            holder.write_text(f"{os.getpid()}\n")
+            gate.step()
+            self.assertTrue(hook.probe(reserve), "its job holds its units: the reserve is released")
+            self.assertEqual(hook.gui_reserved(capacity), 0)
+            holder.unlink()
 
     def gui_gate(self, capacity: Path, gui: bool = True) -> hook.Gate:
         script = self.runner / hook.RUNNER_HOOK_SCRIPT

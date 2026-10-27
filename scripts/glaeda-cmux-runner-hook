@@ -470,6 +470,14 @@ def dev_compile_capacity_wait(repo: str | None, home_repo: str, event_name: str 
     return None
 
 
+def slot_capacity_wait(cap: float | None, dev_compile_runner: bool) -> float | None:
+    """`cap`, bounded on the freshness slot: every job it admits (a push's release-compile too, which
+    dev_compile_capacity_wait does not name) waits at most DEV_COMPILE_CAPACITY_WAIT_S. GitHub never moves a job
+    off the runner that took it, so a refusal lets placement send it to the side label or Blacksmith instead of
+    stranding it here (review of glaeda#1636)."""
+    return DEV_COMPILE_CAPACITY_WAIT_S if cap is None and dev_compile_runner else cap
+
+
 def job_class(job: str, repo: str | None, home_repo: str = DEFAULT_HOME_REPO,
               workflow: str = "") -> tuple[str, bool]:
     """The job's class and whether it is pinned to /private/tmp/cmux-ci (an unknown job of the home repo)."""
@@ -6523,6 +6531,7 @@ def main(argv: list[str] | None = None) -> int:
                 cap = dev_compile_capacity_wait(
                     repo, args.home_repo, os.environ.get("GITHUB_EVENT_NAME"),
                     os.environ.get("GITHUB_REF"), event, os.environ.get("GITHUB_JOB", ""), job_workflow())
+            cap = slot_capacity_wait(cap, args.dev_compile_runner)
             start, since = time.monotonic(), time.time()
             marker = args.capacity_dir / f"{ADMIT_WANT}{os.getpid()}"
             shown, shown_at = "", 0.0
