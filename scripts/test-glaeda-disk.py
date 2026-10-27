@@ -3883,8 +3883,8 @@ class GlaedaDiskTest(unittest.TestCase):
             next(i for i in items if Path(i.path) == host).reasons))
         self.assertEqual(removed, everything_else)
         self.assertTrue((host / "Release/xcode-2c2299e9015ce0c8/CompilationCache.noindex").is_dir())
-        # over the cap, the per-instance fallback state idle past a job's timeout goes whole, inputs included; an
-        # enrolled runner's other state as idle keeps its inputs
+        # over the cap, a state idle past a job's timeout goes whole, inputs included: the per-instance fallback
+        # and an enrolled runner's own state alike
         shutil.rmtree(home)
         home, fam, st, host = self._cmux_next_host_tree()
         for key in ("daily", "mini-glaeda"):
@@ -3892,7 +3892,8 @@ class GlaedaDiskTest(unittest.TestCase):
         with mock.patch.object(gd, "HOME", home):
             stale = gd.cmux_next_ci_stale_roots(fam.root)
         self.assertIn(st["daily"], stale)
-        self.assertNotIn(st["mini-glaeda"], stale)
+        self.assertIn(st["mini-glaeda"], stale)
+        self.assertNotIn(st["mini-glaeda-2"], stale)  # 4 h
         self.assertNotIn(host, stale)
         # 10 GiB free: still under the floor after everything else, so the host tree goes, last
         shutil.rmtree(home)
@@ -4251,6 +4252,136 @@ class GlaedaDiskTest(unittest.TestCase):
         self.assertTrue((st["mini-glaeda"] / "SourcePackages").is_dir())  # an enrolled runner's inputs stay
         for key in ("daily", "release-new"):
             self.assertTrue((st[key] / "Build").is_dir(), key)
+
+    def test_runner_job_started_reads_the_workers_start_from_ps(self) -> None:
+        runner = self.root / "actions-runner-glaeda-2"
+        out = (f"Tue Oct 27 01:10:26 2026 {runner}/bin.2.338.0/Runner.Worker spawnclient 1 2\n"
+               f"Mon Oct  5 09:00:00 2026 {self.root}/actions-runner-glaeda-3/bin/Runner.Worker spawnclient 1 2\n"
+               f"Tue Oct 27 02:00:00 2026 /usr/bin/xcodebuild -derivedDataPath {runner}/x\n")
+        done = subprocess.CompletedProcess([], 0, out, "")
+        with mock.patch.object(gd.subprocess, "run", return_value=done) as run:
+            self.assertEqual(gd.runner_job_started(runner),
+                             time.mktime(time.strptime("Tue Oct 27 01:10:26 2026", "%a %b %d %H:%M:%S %Y")))
+        self.assertEqual(run.call_args.kwargs["env"]["LC_ALL"], "C")
+        with mock.patch.object(gd.subprocess, "run", return_value=done):
+            self.assertIsNone(gd.runner_job_started(self.root / "actions-runner-glaeda-4"))  # no job
+        with mock.patch.object(gd.subprocess, "run", return_value=subprocess.CompletedProcess([], 1, "", "")):
+            self.assertIsNone(gd.runner_job_started(runner))  # ps failed: unknown, so the job holds its states
+
+    def test_a_busy_runner_keeps_only_the_states_its_job_has_built_in(self) -> None:
+        # cmux14, 2026-10-27: 79 GiB against the 40 GiB cap and "reclaimable 0.0G": ten runners always had a job,
+        # and every state was last built in hours before its runner's job began
+        home, fam, st = self._cmux_next_cap_tree()
+        worker = f"{home}/actions-runner-glaeda-2/bin/Runner.Worker spawnclient 1 2\n"
+
+        def verdicts(started, over=5 * gd.GIB):
+            gd._DISCOVERED.clear()
+            with mock.patch.object(gd, "HOME", home), \
+                    mock.patch.object(gd, "process_evidence", return_value=([], worker)), \
+                    mock.patch.object(gd, "runner_job_started", return_value=started), \
+                    mock.patch.object(gd, "ACTIVITY_MODE", "pressure"), mock.patch.object(gd, "CMUX_NEXT_CI_OVER", over):
+                return {Path(i.path): (i.verdict, i.reasons) for i in gd.survey([fam], 24, 0)}
+        # the job began 2 h ago: runner 2's scheme state (4 h) is its last job's; its Release state (1 h) is this one's
+        v = verdicts(time.time() - 2 * 3600)
+        self.assertEqual(v[st["mini-glaeda-2"] / "Build"][0], "reclaimable")
+        self.assertEqual(v[st["release-new"] / "Build"],
+                         ("in-use", ["actions-runner-glaeda-2 is running a job (Runner.Worker)"]))
+        # a job whose start cannot be read keeps everything its runner owns
+        v = verdicts(None)
+        for key in ("mini-glaeda-2", "release-new"):
+            self.assertEqual(v[st[key] / "Build"][0], "in-use", key)
+        # a drain keeps its own rule: no live Runner.Worker at all
+        with mock.patch.object(gd, "HOME", home), mock.patch.object(gd, "CMUX_NEXT_CI_DRAIN", True), \
+                mock.patch.object(gd, "runner_job_started", return_value=time.time()):
+            self.assertIn("Runner.Worker", gd.cmux_next_ci_busy(fam, st["mini-glaeda-2"] / "Build", [], worker))
+
+    def test_over_the_cap_an_enrolled_runners_state_idle_past_a_jobs_timeout_goes_whole(self) -> None:
+        home, fam, st = self._cmux_next_cap_tree()
+        self._age(st["mini-glaeda"], hours=9)
+        receipt = self.receipt()
+        with mock.patch.object(gd, "HOME", home):
+            self.assertEqual(sorted(gd.cmux_next_ci_stale_roots(fam.root)),
+                             sorted([st["mini-glaeda"], st["gone-runner"], st["release-old"]]))
+        with mock.patch.object(gd, "HOME", home), mock.patch.object(gd, "process_evidence", return_value=([], "")), \
+                mock.patch.object(gd, "command_lines", return_value=""), \
+                mock.patch.object(gd, "ACTIVITY_MODE", "pressure"), \
+                mock.patch.object(gd, "CMUX_NEXT_CI_OVER", int(1.5 * 1024 * 1024)), \
+                contextlib.redirect_stdout(io.StringIO()):
+            gd._DISCOVERED.clear()
+            items = gd.survey([fam], 6, 0)
+            self.assertFalse(gd.cmux_next_ci_floor_slot(fam, st["mini-glaeda"]))
+            gd.apply(items, {fam.id: fam}, receipt, None, 6, all_families=[fam])
+        records = [json.loads(line) for line in receipt.read_text().splitlines()]
+        self.assertEqual([(Path(r["path"]), r["outcome"]) for r in records],
+                         [(st["mini-glaeda"], "reclaimed"),  # 9 h, least recently used, inputs and all
+                          (st["release-old"], "reclaimed")])  # 8 h: now under the cap
+        self.assertFalse(st["mini-glaeda"].exists())
+        self.assertTrue((st["mini-glaeda-2"] / "SourcePackages").is_dir())  # a state used within 6 h keeps its inputs
+
+    def test_a_childs_removal_is_undone_when_its_runners_job_starts_on_the_state(self) -> None:
+        home, fam, st = self._cmux_next_cap_tree()
+        worker = f"{home}/actions-runner-glaeda-2/bin/Runner.Worker spawnclient 1 2\n"
+        building = worker + f"xcodebuild -derivedDataPath {st['mini-glaeda-2']} build\n"
+        receipt = self.receipt()
+        with mock.patch.object(gd, "HOME", home), \
+                mock.patch.object(gd, "runner_job_started", return_value=time.time() - 2 * 3600), \
+                mock.patch.object(gd, "ACTIVITY_MODE", "pressure"), mock.patch.object(gd, "CMUX_NEXT_CI_OVER", gd.GIB), \
+                contextlib.redirect_stdout(io.StringIO()):
+            gd._DISCOVERED.clear()
+            with mock.patch.object(gd, "process_evidence", return_value=([], worker)):
+                items = [i for i in gd.survey([fam], 6, 0) if Path(i.path) == st["mini-glaeda-2"] / "Build"]
+            self.assertEqual([i.verdict for i in items], ["reclaimable"])
+            # the fresh evidence before the rename shows only the job; once the child is aside, its build has begun
+            with mock.patch.object(gd, "process_evidence", side_effect=[([], worker), ([], building)]):
+                gd.apply(items, {fam.id: fam}, receipt, None, 6, all_families=[fam])
+        records = [json.loads(line) for line in receipt.read_text().splitlines()]
+        self.assertEqual([(Path(r["path"]), r["outcome"]) for r in records],
+                         [(st["mini-glaeda-2"] / "Build", "changed:in-use")])
+        self.assertTrue((st["mini-glaeda-2"] / "Build/blob").is_file())
+        self.assertEqual([p.name for p in st["mini-glaeda-2"].iterdir() if p.name.startswith(gd.DELETING_PREFIX)], [])
+
+    def test_a_childs_recheck_reads_the_states_times_from_before_the_rename(self) -> None:
+        # the rename aside moves the state directory's mtime: that alone never puts the child back
+        home, fam, st = self._cmux_next_cap_tree()
+        worker = f"{home}/actions-runner-glaeda-2/bin/Runner.Worker spawnclient 1 2\n"
+        receipt = self.receipt()
+        with mock.patch.object(gd, "HOME", home), \
+                mock.patch.object(gd, "runner_job_started", return_value=time.time() - 2 * 3600), \
+                mock.patch.object(gd, "process_evidence", return_value=([], worker)), \
+                mock.patch.object(gd, "command_lines", return_value=worker), \
+                mock.patch.object(gd, "ACTIVITY_MODE", "pressure"), mock.patch.object(gd, "CMUX_NEXT_CI_OVER", gd.GIB), \
+                contextlib.redirect_stdout(io.StringIO()):
+            gd._DISCOVERED.clear()
+            items = [i for i in gd.survey([fam], 6, 0) if Path(i.path) == st["mini-glaeda-2"] / "Build"]
+            gd.apply(items, {fam.id: fam}, receipt, None, 6, all_families=[fam])
+        records = [json.loads(line) for line in receipt.read_text().splitlines()]
+        self.assertEqual([(Path(r["path"]), r["outcome"]) for r in records],
+                         [(st["mini-glaeda-2"] / "Build", "reclaimed")])
+        self.assertTrue((st["mini-glaeda-2"] / "SourcePackages").is_dir())
+
+    def test_an_idle_runners_child_is_put_back_when_a_build_starts_during_the_rename(self) -> None:
+        # no job when the evidence was taken; once the child is aside, a build has rewritten the state's info.plist
+        home, fam, st = self._cmux_next_cap_tree()
+        receipt = self.receipt()
+        real_remove = gd.remove
+
+        def remove(path, after_rename=None):
+            def started():
+                (st["mini-glaeda"] / "info.plist").write_text("{}")
+                if after_rename is not None:
+                    after_rename()
+            return real_remove(path, after_rename=started)
+        with mock.patch.object(gd, "HOME", home), mock.patch.object(gd, "process_evidence", return_value=([], "")), \
+                mock.patch.object(gd, "command_lines", return_value=""), mock.patch.object(gd, "remove", remove), \
+                mock.patch.object(gd, "ACTIVITY_MODE", "pressure"), mock.patch.object(gd, "CMUX_NEXT_CI_OVER", gd.GIB), \
+                contextlib.redirect_stdout(io.StringIO()):
+            gd._DISCOVERED.clear()
+            items = [i for i in gd.survey([fam], 6, 0) if Path(i.path) == st["mini-glaeda"] / "Build"]
+            gd.apply(items, {fam.id: fam}, receipt, None, 6, all_families=[fam])
+        records = [json.loads(line) for line in receipt.read_text().splitlines()]
+        self.assertEqual([(Path(r["path"]), r["outcome"]) for r in records],
+                         [(st["mini-glaeda"] / "Build", "changed:in-use")])
+        self.assertTrue((st["mini-glaeda"] / "Build/blob").is_file())
 
     def test_main_shows_the_cmux_next_cap_and_records_it_in_the_run_line(self) -> None:
         self.addCleanup(setattr, gd, "CMUX_NEXT_CI_OVER", gd.CMUX_NEXT_CI_OVER)
