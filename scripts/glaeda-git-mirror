@@ -135,24 +135,30 @@ def healthy(mirror: Path) -> str:
     try:
         if git(mirror, "rev-parse", "--is-shallow-repository", timeout=30).strip() != "false":
             return "shallow"
-        if git(mirror, "config", "--get", "remote.origin.promisor", timeout=30).strip():
+        if any(config_values(mirror, key) for key in PARTIAL_KEYS):
             return "partial"
-    except subprocess.CalledProcessError:
-        pass  # config --get exits 1 when the key is unset: not partial
     except (OSError, subprocess.SubprocessError) as error:
         return f"unreadable ({type(error).__name__})"
-    try:
-        git(mirror, "rev-parse", "--verify", "-q", "refs/heads/main^{commit}", timeout=60)
-    except (OSError, subprocess.SubprocessError):
-        return "no main"
+    for branch in BRANCHES:
+        try:
+            git(mirror, "rev-parse", "--verify", "-q", f"refs/heads/{branch}^{{commit}}", timeout=60)
+        except (OSError, subprocess.SubprocessError):
+            return f"no {branch}"
     return ""
 
 
 def configure(mirror: Path) -> None:
     """Idempotent: the remote, CONFIG, and the shallow guard."""
     configure_without_guard(mirror)
-    # A directory where git writes its shallow lock file: any --depth fetch into the mirror fails.
-    (mirror / "shallow.lock").mkdir(exist_ok=True)
+    guard(mirror)
+
+
+def guard(mirror: Path) -> None:
+    """A directory where git writes its shallow lock file: any --depth fetch into the mirror fails."""
+    lock_file = mirror / "shallow.lock"
+    if lock_file.is_file() and not lock_file.is_symlink():
+        lock_file.unlink()  # git's own lock, left by a killed fetch
+    lock_file.mkdir(exist_ok=True)
 
 
 def configure_without_guard(mirror: Path) -> None:
@@ -183,6 +189,9 @@ def fetch(mirror: Path, url: str, *, tries: int = FETCH_TRIES, timeout: float = 
         errors.append(f"try {attempt}: exit {status}: {err.strip()[-200:]}")
         for leftover in (mirror / "objects" / "pack").glob("tmp_*"):
             with_suppressed(leftover.unlink)
+        # A killed unshallowing fetch leaves git's own shallow.lock file, which would block the guard.
+        if (mirror / "shallow.lock").is_file():
+            with_suppressed((mirror / "shallow.lock").unlink)
         if attempt < tries:
             sleep(BACKOFF[min(attempt - 1, len(BACKOFF) - 1)])
     return {"ok": False, "tries": tries, "errors": errors}
@@ -270,9 +279,9 @@ def fill(repo: Path, work: Path, from_github: bool, fetch_url: Callable[[str, Pa
     except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
         if not from_github:
             raise RuntimeError(f"R2 bundle: {type(error).__name__}: {str(error)[:200]}") from error
-        # Into an existing broken mirror: every object again (--refetch ignores what it claims to have, so a
-        # partial mirror's missing blobs come too) and the history past a shallow boundary.
-        extra = ["--refetch"] if any((repo / "objects" / "pack").glob("*.pack")) else []
+        # Every object again (--refetch ignores what the repository claims to have, so a broken mirror's
+        # missing blobs come too, packed or loose) and the history past a shallow boundary.
+        extra = ["--refetch"]
         if (repo / "shallow").exists():
             extra.append("--unshallow")
         result = fetch(repo, REPO_URL, extra=extra, timeout=DOWNLOAD_TIMEOUT)
@@ -316,9 +325,11 @@ def seed(mirror: Path, from_github: bool, fetch_url: Callable[[str, Path, float]
         # Re-initializing an existing repository keeps its objects and refs (and writes a missing HEAD).
         git(mirror.parent, "init", "--quiet", "--bare", os.fspath(mirror), timeout=60)
         # The guard would refuse the unshallowing a full fetch into a shallow repository does.
-        guard = mirror / "shallow.lock"
-        if guard.is_dir():
-            guard.rmdir()
+        lock_dir = mirror / "shallow.lock"
+        if lock_dir.is_dir():
+            lock_dir.rmdir()
+        elif lock_dir.is_file():
+            lock_dir.unlink()  # git's own lock, left by a killed fetch
         # What marks the mirror shallow or partial stays until the history is proven whole, and comes back if
         # it is not, so healthy() keeps reporting it and the next pass tries again.
         markers = {key: config_values(mirror, key) for key in PARTIAL_KEYS}
@@ -339,13 +350,15 @@ def seed(mirror: Path, from_github: bool, fetch_url: Callable[[str, Path, float]
                 unset(mirror, key)
                 for value in values:
                     git(mirror, "config", "--add", key, value, timeout=30)
-            if shallow_text is not None and not shallow.exists():
+            if shallow_text is None:
+                shallow.unlink(missing_ok=True)
+            else:
                 shallow.write_text(shallow_text)
             raise
         return {"source": source, "mode": "repaired in place", "seconds": round(time.monotonic() - started, 1)}
     finally:
         if mirror.is_dir() and not mirror.is_symlink():
-            (mirror / "shallow.lock").mkdir(exist_ok=True)
+            guard(mirror)
         shutil.rmtree(work, ignore_errors=True)
 
 

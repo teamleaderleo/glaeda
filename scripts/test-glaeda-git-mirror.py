@@ -160,6 +160,54 @@ class Mirror(unittest.TestCase):
         self.assertEqual(gm.healthy(self.mirror), "")
         self.assertTrue(guard.is_dir())
 
+    def test_every_partial_marker_and_every_branch_counts(self) -> None:
+        gm.run(True, home=self.home)
+        self.assertEqual(gm.healthy(self.mirror), "")
+        sh("git", "-C", os.fspath(self.mirror), "config", "extensions.partialclone", "origin")
+        self.assertEqual(gm.healthy(self.mirror), "partial")
+        sh("git", "-C", os.fspath(self.mirror), "config", "--unset", "extensions.partialclone")
+        sh("git", "-C", os.fspath(self.mirror), "update-ref", "-d", "refs/heads/nightly-next")
+        self.assertEqual(gm.healthy(self.mirror), "no nightly-next")
+
+    def test_git_s_own_shallow_lock_file_never_blocks_the_guard(self) -> None:
+        gm.run(True, home=self.home)
+        guard = self.mirror / "shallow.lock"
+        guard.rmdir()
+        guard.write_text("")  # what a fetch killed mid-unshallow leaves
+        self.assertEqual(gm.run(True, home=self.home)["state"], "applied")
+        self.assertTrue(guard.is_dir())
+
+    def test_the_github_fallback_always_refetches(self) -> None:
+        calls = []
+        real = gm.fetch
+        gm.fetch = lambda repo, url, **kw: calls.append(kw.get("extra")) or {"ok": True, "tries": 1, "seconds": 0}
+        try:
+            with tempfile.TemporaryDirectory() as temp:
+                repo = Path(temp) / "r.git"
+                sh("git", "init", "-q", "--bare", os.fspath(repo))
+                (self.bucket / f"v1/any/latest/{gm.BUNDLE_PREFIX}").unlink()
+                gm.fill(repo, Path(temp), True, gm.download)
+        finally:
+            gm.fetch = real
+        self.assertEqual(calls, [["--refetch"]])
+
+    def test_a_failed_repair_restores_the_shallow_file_exactly(self) -> None:
+        gm.run(True, home=self.home)
+        (self.bucket / f"v1/any/latest/{gm.BUNDLE_PREFIX}").unlink()
+        sh("git", "-C", os.fspath(self.mirror), "update-ref", "-d", "refs/heads/main")
+        real = gm.fill
+
+        def writes_shallow(repo, *args):
+            (repo / "shallow").write_text("0" * 40 + "\n")
+            raise RuntimeError("fill failed")
+
+        gm.fill = writes_shallow
+        try:
+            self.assertEqual(gm.run(True, home=self.home)["state"], "error")
+        finally:
+            gm.fill = real
+        self.assertFalse((self.mirror / "shallow").exists())
+
     def test_a_failed_repair_keeps_the_mirror_marked_broken(self) -> None:
         self.commit("two")
         gm.run(True, home=self.home)
