@@ -269,8 +269,21 @@ runner_launchctl() {
   esac
 }
 
+runner_idle() {  # DIR: true only when that runner has no job, as the gate and glaeda-cmux-runner decide it (a
+  # Worker under bin or a self-update's bin.<version>, or a request its listener took); anything else is a job
+  local hook="$1/glaeda-hooks/glaeda-cmux-runner-hook" py="$HOME/.local/bin/python3" rc=0
+  [ -x "$py" ] || py=python3
+  if [ -f "$hook" ]; then
+    "$py" "$hook" busy --runner-dir "$1" >/dev/null 2>&1 || rc=$?
+    [ "$rc" -eq 3 ]  # the hook's idle; a crash or an older hook without the phase is a job
+    return
+  fi
+  pgrep -f "$1/bin[^/ ]*/Runner.Worker" >/dev/null 2>&1 || rc=$?
+  [ "$rc" -eq 1 ]  # no glaeda hook here: no Worker of it (pgrep's 1), never a pgrep that failed
+}
+
 runner_hold() {  # WAIT_SECONDS
-  local r dir plist label domain deadline
+  local r dir plist label domain deadline disabled
   mkdir -p "$(held_dir)"
   for r in "$HOME"/actions-runner*/.runner; do
     [ -f "$r" ] || continue
@@ -280,19 +293,24 @@ runner_hold() {  # WAIT_SECONDS
     domain=$(runner_domain "$plist")
     if ! runner_launchctl "$plist" print "$domain/$label" >/dev/null 2>&1; then say "unchanged: $label is not loaded"; continue; fi
     deadline=$(( $(date +%s) + $1 ))
-    while pgrep -f "$dir/bin/Runner.Worker" >/dev/null 2>&1; do
+    # the last look and the stop happen with its listener frozen, as the gate's own stop: it cannot take a job between
+    while pkill -STOP -f "$dir/bin/Runner\.Listener" 2>/dev/null; ! runner_idle "$dir"; do
+      pkill -CONT -f "$dir/bin/Runner\.Listener" 2>/dev/null || true
       [ "$(date +%s)" -lt "$deadline" ] || refuse "$label is still running a job after $1 seconds; rerun once it ends"
       say "$label is running a job; waiting for it to end"
       sleep 30
     done
     : > "$(held_dir)/$(basename "$dir")"
-    if ! runner_launchctl "$plist" disable "$domain/$label"; then
+    disabled=1
+    runner_launchctl "$plist" disable "$domain/$label" || disabled=
+    [ -z "$disabled" ] || runner_launchctl "$plist" bootout "$domain/$label" 2>/dev/null || true
+    pkill -CONT -f "$dir/bin/Runner\.Listener" 2>/dev/null || true  # gone after the bootout, else thawed
+    if [ -z "$disabled" ]; then
       case "$plist" in
         /Library/LaunchDaemons/*) say "marked $label held; launchd disable was refused, the listener gate remains active"; continue ;;
         *) refuse "could not disable $label" ;;
       esac
     fi
-    runner_launchctl "$plist" bootout "$domain/$label" 2>/dev/null || true
     case "$plist" in
       /Library/LaunchDaemons/*) say "held $label; the headless listener gate remains active"; continue ;;
     esac

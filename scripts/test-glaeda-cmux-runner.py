@@ -7042,6 +7042,18 @@ class GateTest(unittest.TestCase):
                 self.assertEqual(gate.step(), 1, "an orphaned Worker still runs: no backoff beside its job")
         self.assertFalse(hook.registration_file(self.state, self.runner).exists())
 
+    def test_a_self_updated_runners_worker_is_its_job(self) -> None:
+        # a runner that updated itself spawns bin.<version>/Runner.Worker (bin is a symlink to it)
+        gate, _ = self.gate([None] * 4)
+        with mock.patch.object(hook.subprocess, "Popen", return_value=gate.child):
+            gate.start()
+            gate.child.poll.return_value = 1
+            worker = os.fspath(self.runner / "bin.2.338.0/Runner.Worker")
+            with mock.patch.object(hook, "processes", return_value={77: (1, f"{worker} spawnclient 148 151")}):
+                self.assertTrue(gate.job_left())
+            with mock.patch.object(hook, "processes", return_value={77: (1, f"{self.runner}-2/bin.2.338.0/Runner.Worker")}):
+                self.assertFalse(gate.job_left(), "another instance's Worker is not this runner's job")
+
     def test_an_adopted_listener_never_reads_a_diag_log_from_before_the_reload(self) -> None:
         # a reload's exec adopts run.sh: an exit after it must not match an older start's deletion trace
         self.deleted()
@@ -7362,8 +7374,27 @@ class RunnerTest(unittest.TestCase):
                 mock.patch.object(cr, "REFRESH_GAP_WAIT_S", 0):
             self.assertEqual(self.invoke("--refresh-hooks", "--apply")["runners"][0]["state"], "deferred")
         self.assertEqual((hooks / cr.HOOK_NAME).read_bytes(), older)
-        with mock.patch.object(cr, "run", return_value=(127, "")):  # pgrep cannot tell: busy
-            self.assertTrue(cr.worker_running(self.home / "actions-runner-glaeda"))
+        runner = self.home / "actions-runner-glaeda"
+        with mock.patch.object(cr.subprocess, "run", side_effect=OSError("no ps")):  # ps cannot tell: busy
+            self.assertTrue(cr.worker_running(runner))
+        def table(*commands: str):
+            return mock.patch.object(cr.subprocess, "run", return_value=subprocess.CompletedProcess(
+                [], 0, "".join(c + "\n" for c in commands), ""))
+        with table(f"{runner}/bin.2.338.0/Runner.Worker spawnclient 148 151"):  # a self-updated runner's job
+            self.assertTrue(cr.worker_running(runner))
+        with table(f"{runner}/bin/Runner.Worker spawnclient 1 2"):
+            self.assertTrue(cr.worker_running(runner))
+        with table(f"{runner}-2/bin.2.338.0/Runner.Worker spawnclient 1 2", f"{runner}/bin/Runner.Listener run"):
+            self.assertFalse(cr.worker_running(runner), "another instance's job, or a bare listener, is not this one's")
+            (runner / "_diag").mkdir(exist_ok=True)
+            (runner / "_diag/Runner_20261027-021255-utc.log").write_text(
+                "[2026-10-27 02:18:14Z INFO BrokerMessageListener] Acknowledging runner request 'abc-123'.\n")
+            self.assertTrue(cr.worker_running(runner), "a request the listener took is a job before its Worker starts")
+        with table(f"{runner}-2/bin/Runner.Listener run"):
+            self.assertFalse(cr.worker_running(runner), "a request left by a listener that is gone holds nothing")
+        (runner / "_diag/Runner_20261027-021255-utc.log").unlink()
+        with mock.patch.object(cr, "hook_module", side_effect=OSError("no hook")), table():
+            self.assertTrue(cr.worker_running(runner), "a copy without its hook cannot tell: busy")
         # an --apply holds the lock: a later run refreshes
         with cr.runner_lock(self.home, wait=True):
             self.assertIn("lock", self.invoke("--refresh-hooks", "--apply", expect=1)["error"])
@@ -8527,6 +8558,66 @@ class RunnerTest(unittest.TestCase):
         self.assertIn("--replace", self.config_argvs()[-1])
         self.assertEqual(self.by_kind(receipt)["verify"]["state"], "failed")
         self.assertFalse(receipt["ready"])
+
+    def test_apply_never_re_registers_a_self_updated_runner_with_a_job(self) -> None:
+        # 2026-10-27 02:09:59Z: a runner that updated itself runs bin.2.338.0/Runner.Worker; a pgrep for
+        # bin/Runner.Worker read it as idle and --apply booted it out mid-compile to re-register it
+        with mock.patch.object(cr, "xcode_present", return_value=True):
+            first = self.invoke("--apply", "--manifest", self.manifest(), "--member", "mini-std")
+            (self.state / "fail-list").touch()
+            worker = f"{first['runnerDir']}/bin.2.338.0/Runner.Worker spawnclient 148 151"
+            real_run = subprocess.run
+            def ps(argv, *args, **kwargs):  # the process table of a mini with that job
+                if list(argv[:2]) == ["/bin/ps", "-axww"]:
+                    return subprocess.CompletedProcess(argv, 0, f"/sbin/launchd\n{worker}\n", "")
+                return real_run(argv, *args, **kwargs)
+            with mock.patch.object(cr.subprocess, "run", side_effect=ps):
+                receipt = self.invoke("--apply", "--token-stdin", "--manifest", self.manifest(),
+                                      "--member", "mini-std", stdin=REG_TOKEN, expect=1)
+        register = self.by_kind(receipt)["register"]
+        self.assertEqual(register["state"], "blocked", register)
+        self.assertIn("running a job", register["note"])
+        self.assertNotIn("bootout", [e["argv"][0] for e in self.log() if e["tool"] == "launchctl"])
+
+    def test_a_real_self_updated_worker_is_busy_and_its_listener_is_frozen_for_the_stop(self) -> None:
+        runner = self.home / "actions-runner-glaeda-7"
+        (runner / "_diag").mkdir(parents=True)
+        def spawn(argv0: str) -> subprocess.Popen:  # a process ps lists as argv0 (python re-execs, so a sleep)
+            proc = subprocess.Popen(["/bin/bash", "-c", 'exec -a "$0" /bin/sleep 60', argv0])
+            self.addCleanup(lambda: (proc.kill(), proc.wait()))
+            return proc
+        self.assertFalse(cr.worker_running(runner))
+        listener = spawn(f"{runner}/bin/Runner.Listener")
+        worker = spawn(f"{runner}/bin.2.338.0/Runner.Worker")
+        deadline = time.monotonic() + 10
+        while not cr.worker_running(runner):
+            self.assertLess(time.monotonic(), deadline, "a live bin.2.338.0/Runner.Worker is this runner's job")
+            time.sleep(0.05)
+        ctx = mock.Mock(runner_dir=runner)
+        with mock.patch.object(cr, "bootout") as bootout:
+            self.assertFalse(cr.stop_if_idle(ctx))
+            bootout.assert_not_called()
+            worker.kill()
+            worker.wait()
+            def frozen(_ctx: object) -> None:
+                state = subprocess.run(["/bin/ps", "-o", "stat=", "-p", str(listener.pid)], capture_output=True,
+                                       text=True).stdout.strip()
+                self.assertTrue(state.startswith("T"), f"the listener is stopped for the bootout: {state!r}")
+            bootout.side_effect = frozen
+            self.assertTrue(cr.stop_if_idle(ctx))
+            bootout.assert_called_once()
+        state = subprocess.run(["/bin/ps", "-o", "stat=", "-p", str(listener.pid)], capture_output=True, text=True)
+        self.assertFalse(state.stdout.strip().startswith("T"), "and thawed after")
+
+    def test_an_agent_relabel_started_is_never_booted_out_with_a_job(self) -> None:
+        ctx = mock.Mock(skip_launchctl=False, agent_started=True, headless=False)
+        act = {"kind": "agent", "state": "update", "loaded": False, "path": "/nonexistent.plist"}
+        with mock.patch.object(cr, "runner_busy", return_value=True), mock.patch.object(cr, "bootout") as bootout, \
+                mock.patch.object(cr, "listeners_frozen", return_value=contextlib.nullcontext()):
+            cr.apply_install(ctx, [act], {})
+        bootout.assert_not_called()
+        self.assertEqual(act["state"], "failed")
+        self.assertIn("re-run when idle", act["note"])
 
     def installed_release(self, labels: list[str], same_files: bool = False) -> Path:
         """An OTA release on this fake HOME whose plan registers `labels`; returns the log of its argv."""

@@ -81,6 +81,7 @@ import importlib.util
 import contextlib
 import datetime
 import fcntl
+import functools
 import hashlib
 import json
 import os
@@ -100,7 +101,7 @@ import tempfile
 import time
 import urllib.parse
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 SCHEMA = "glaeda-cmux-runner/v1"
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -812,11 +813,11 @@ def hook_wrappers(ctx: Context) -> dict[str, bytes]:
         "# never start a second one beside it: stop the listener once it has no job, then exit 1 so launchd\n"
         "# restarts this wrapper and a fresh gate. With no runner left, run it without the gate.\n"
         f"dir={shlex.quote(os.fspath(ctx.runner_dir))}  # as the gate runs it, so pgrep matches its tree\n"
-        "tree=\"$dir/run|$dir/bin/Runner\\.(Listener|Worker)\"\n"
+        "tree=\"$dir/run|$dir/bin[^/ ]*/Runner\\.(Listener|Worker)\"  # bin.<version> after a self-update\n"
         "if /usr/bin/pgrep -f \"$tree\" >/dev/null; then\n"
         "    echo \"$(date -u '+%Y-%m-%d %H:%M:%SZ'): glaeda-cmux-runner-gate: the gate exited $code with its runner running; stopping the runner once it has no job\"\n"
         "    while [ -z \"$stopping\" ] && /usr/bin/pgrep -f \"$tree\" >/dev/null; do\n"
-        "        if ! /usr/bin/pgrep -f \"$dir/bin/Runner\\.Worker\" >/dev/null; then\n"
+        "        if ! /usr/bin/pgrep -f \"$dir/bin[^/ ]*/Runner\\.Worker\" >/dev/null; then\n"
         "            /usr/bin/pkill -INT -f \"$dir/bin/Runner\\.Listener\" ||\n"
         "                /usr/bin/pkill -TERM -f \"$dir/run\"\n"
         "        fi\n"
@@ -1423,22 +1424,73 @@ LOCAL_REGISTRATION = (".runner", ".credentials", ".credentials_rsaparams", ".run
                       ".credentials_migrated")
 
 
+@functools.lru_cache(maxsize=1)
+def hook_module() -> Any:
+    """The hook beside this copy, for the one reading of "this runner has a job" the gate uses too."""
+    loader = importlib.machinery.SourceFileLoader("glaeda_cmux_runner_hook", os.fspath(HOOK_SOURCE))
+    spec = importlib.util.spec_from_loader("glaeda_cmux_runner_hook", loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
 def worker_running(runner_dir: Path) -> bool:
-    """A Runner.Worker from this install means a job is running right now. A pgrep that cannot tell counts as busy."""
-    return run(["/usr/bin/pgrep", "-f", os.fspath(runner_dir / "bin/Runner.Worker")])[0] != 1
+    """This install has a job right now: the hook's runner_busy_now, the gate's own test (a Runner.Worker under bin
+    or a self-update's bin.<version>, or a request its live listener took). A pgrep for bin/Runner.Worker missed a
+    self-updated runner's job, so --apply re-registered runners mid-compile (2026-10-27 02:09:59Z, 02:21:55Z).
+    A copy without its hook counts as busy, as does anything the hook cannot read."""
+    try:
+        return bool(hook_module().runner_busy_now(runner_dir))
+    except Exception:  # noqa: BLE001
+        return True
 
 
 def runner_busy(ctx: Context) -> bool:
     return worker_running(ctx.runner_dir)
 
 
+@contextlib.contextmanager
+def listeners_frozen(runner_dir: Path) -> Iterator[None]:
+    """This runner's listeners stopped (SIGSTOP) for a last look and a bootout, as the gate's own stop does:
+    frozen, a listener can neither acknowledge a request nor start a Worker, so an idle reading stays true until
+    the bootout lands. Thawed afterwards; a booted-out listener is gone by then, or gets launchd's SIGKILL."""
+    frozen: list[int] = []
+    try:
+        out = subprocess.run(["/bin/ps", "-axww", "-o", "pid=,command="], stdin=subprocess.DEVNULL,
+                             capture_output=True, text=True, timeout=RUN_TIMEOUT, check=True).stdout
+        hook = hook_module()
+        for line in out.splitlines():
+            pid, _, command = line.strip().partition(" ")
+            if pid.isdigit() and hook.runner_worker(runner_dir, command, "Listener"):
+                with contextlib.suppress(OSError):
+                    os.kill(int(pid), signal.SIGSTOP)
+                    frozen.append(int(pid))
+    except Exception:  # noqa: BLE001  (no freeze: worker_running still decides, and fails closed itself)
+        pass
+    try:
+        yield
+    finally:
+        for pid in frozen:
+            with contextlib.suppress(OSError):
+                os.kill(pid, signal.SIGCONT)
+
+
+def stop_if_idle(ctx: Context) -> bool:
+    """Boot this runner's agent out only when it has no job, deciding with its listeners frozen. False: it has a
+    job (or cannot tell) and nothing was stopped."""
+    with listeners_frozen(ctx.runner_dir):
+        if runner_busy(ctx):
+            return False
+        bootout(ctx)
+    return True
+
+
 def relabel(ctx: Context, act: dict[str, Any]) -> None:
     """Re-register this runner under the same name with the manifest's labels. _work stays."""
-    if runner_busy(ctx):
+    if ctx.skip_launchctl and runner_busy(ctx) or not ctx.skip_launchctl and not stop_if_idle(ctx):
         act["state"], act["note"] = "failed", "the runner started a job; nothing changed, re-run when idle"
         return
     if not ctx.skip_launchctl:
-        bootout(ctx)
         ctx.agent_started = False  # stopped now, whatever the plan saw; the agent step reads this
     for name in LOCAL_REGISTRATION:
         (ctx.runner_dir / name).unlink(missing_ok=True)
@@ -1549,14 +1601,14 @@ def apply_install(ctx: Context, actions: list[dict[str, Any]], receipt_doc: dict
             if adopted:
                 receipt_doc["registration"] = adopted
                 act["note"] = "adopted the registration an interrupted --apply finished in this directory"
-        elif kind == "agent" and state == "update" and act.get("loaded") and not ctx.skip_launchctl \
-                and runner_busy(ctx):  # a bootout now would cancel the job; the next --apply updates it
+        elif kind == "agent" and state in {"create", "update"} and not ctx.skip_launchctl \
+                and (act.get("loaded") or getattr(ctx, "agent_started", False)) and not stop_if_idle(ctx):
+            # loaded at plan time, or started since by a relabel: a bootout now would cancel its job
             act["state"], act["note"] = "failed", "the runner has a job; nothing changed, re-run when idle"
         elif kind in {"hook", "agent"} and state in {"create", "update"}:
             data, mode = desired_files(ctx)[Path(act["path"])]
             if kind == "agent" and (act.get("loaded") or getattr(ctx, "agent_started", False)):
-                bootout(ctx)  # loaded at plan time, or started since by a relabel
-                act["loaded"] = ctx.agent_started = False
+                act["loaded"] = ctx.agent_started = False  # the step above stopped it idle
             if kind == "agent":
                 install_service_file(ctx, Path(act["path"]), data, mode)
             else:
