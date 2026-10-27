@@ -283,6 +283,7 @@ DISK_AGENT = "com.teamleaderleo.glaeda.disk-pressure"  # glaeda-mini-setup's 15-
 DISK_CACHE = ".cache/glaeda-disk"  # glaeda-disk's sizes.json and accounting.json, under HOME
 RUNNER_HYGIENE = "com.teamleaderleo.glaeda.runner-hygiene"  # glaeda-runner-hygiene's LABEL_PREFIX (.<uid>)
 PROFILE_SNAPSHOT = "sizes.runner-caches.json"  # glaeda-disk's PROFILE_SNAPSHOT, in DISK_CACHE
+PROFILE_SUMMARY = "summary.runner-caches.json"  # glaeda-disk's PROFILE_HEALTH_SUMMARY, beside summary.json
 SYSTEM_DAEMONS = Path("/Library/LaunchDaemons")
 OTA_CONVERGE = ".local/state/glaeda/update/converge.json"  # glaeda-update's CONVERGE, under this home
 CLAUDE_ROUTES = "claude-routes.json"  # config/, beside this script or as mini-setup installs it
@@ -948,9 +949,10 @@ class Mini:
         # the runner-cache profile alone (no disk-pressure job for this account) keeps its own snapshot, or sizes.json
         # from a pinned copy older than that split, and writes no accounting.json by design
         primary = any(not target.startswith(f"system/{RUNNER_HYGIENE}.") for _, target in installed)
-        summary = self.disk_summary()
+        summaries = [self.disk_summary(), load_json(self.home / ".local/state/glaeda/disk" / PROFILE_SUMMARY)]
         profile = not primary and (bool(installed) or any(
-            isinstance(x, dict) and x.get("scope") == "runner-cache-profile" for x in summary.get("accounting") or []))
+            isinstance(x, dict) and x.get("scope") == "runner-cache-profile"
+            for summary in summaries for x in summary.get("accounting") or []))
         sizes_path = cache / "sizes.json"
         if profile:
             sizes_path = max((cache / PROFILE_SNAPSHOT, sizes_path), key=lambda p: mtime(p) or 0.0)

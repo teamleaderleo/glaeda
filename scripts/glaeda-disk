@@ -1354,6 +1354,9 @@ IDLE_STAMP = HOME / ".cache/glaeda-disk/idle-sweep.last"
 # within the hour", and its writes to sizes.json kept that snapshot's stamp days old (cmux-austin-mini-0, 2026-10-27).
 PROFILE_SNAPSHOT = HOME / ".cache/glaeda-disk/sizes.runner-caches.json"
 PROFILE_IDLE_STAMP = HOME / ".cache/glaeda-disk/idle-sweep.runner-caches.last"
+# and its own health summary: the shared one flipped disk_unmeasured and the accounting gap with whichever job wrote
+# last. summary.json stays the disk-pressure pass's (mini-health and ci-dash read it there).
+PROFILE_HEALTH_SUMMARY = HOME / ".local/state/glaeda/disk/summary.runner-caches.json"
 FLEET_DIR = FLEET_CI.parent
 BUILD_PROCESS = re.compile(r"(^|/)(xcodebuild|SWBBuildService|XCBBuildService)(\s|$)")
 
@@ -1870,11 +1873,20 @@ def _fresh(path: Path, seconds: float) -> bool:
         return False
 
 
+_MAIN_STATE: tuple[Path, Path, Path] | None = None
+
+
 def use_profile_state(profile: bool) -> None:
-    """Point the snapshot and the idle stamp at the runner-cache profile's own files (PROFILE_SNAPSHOT)."""
-    global SNAPSHOT, IDLE_STAMP
+    """Point the snapshot, the idle stamp and the health summary at the runner-cache profile's own files
+    (PROFILE_SNAPSHOT), or back at the disk-pressure pass's."""
+    global SNAPSHOT, IDLE_STAMP, HEALTH_SUMMARY, _MAIN_STATE
     if profile:
-        SNAPSHOT, IDLE_STAMP = PROFILE_SNAPSHOT, PROFILE_IDLE_STAMP
+        if _MAIN_STATE is None:  # remembered on the way in, so a later non-profile run gets them back
+            _MAIN_STATE = (SNAPSHOT, IDLE_STAMP, HEALTH_SUMMARY)
+        SNAPSHOT, IDLE_STAMP, HEALTH_SUMMARY = PROFILE_SNAPSHOT, PROFILE_IDLE_STAMP, PROFILE_HEALTH_SUMMARY
+    elif _MAIN_STATE is not None:  # only undoes a switch: paths a caller set itself are left alone
+        SNAPSHOT, IDLE_STAMP, HEALTH_SUMMARY = _MAIN_STATE
+        _MAIN_STATE = None
 
 
 def idle_due(stamp: Path | None = None, every_s: float = IDLE_SWEEP_EVERY_S) -> bool:
@@ -6560,7 +6572,7 @@ def launch_background_refresh() -> bool:
     try:
         subprocess.Popen([sys.executable, os.path.abspath(__file__), "--refresh", "--top", "0",
                           "--min-mib", "0", "--refresh-budget-s", str(REFRESH_BUDGET_S),
-                          "--refresh-lock-fd", str(fd)],
+                          "--refresh-lock-fd", str(fd), *(["--runner-caches"] if RUNNER_CACHE_PROFILE else [])],
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                          stdin=subprocess.DEVNULL, start_new_session=True, pass_fds=(fd,))
     except (OSError, subprocess.SubprocessError):
