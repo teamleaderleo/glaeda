@@ -198,16 +198,16 @@ LISTENER_RE = re.compile(r"(/\S+?)/bin(?:\.[0-9.]+)?/Runner\.Listener(?:\s|$)")
 
 
 def starts_runner(word: str, cwd: str = "") -> bool:
-    """A plist word that starts a GitHub runner: a Runner.Listener, a directory holding a runner registration
-    (.runner), or a run.sh, runsvc.sh or run-helper.sh that sits in one. A bare "run.sh" counts only with the
-    plist's WorkingDirectory, which the caller passes as `cwd`."""
+    """A plist program word that starts a GitHub runner: a Runner.Listener, or a run.sh, runsvc.sh or run-helper.sh
+    that sits in a directory holding a runner registration (.runner). A bare "run.sh" is found through the plist's
+    WorkingDirectory, which the caller passes as `cwd`; a working directory or an argument naming a runner
+    directory is not a runner by itself (a cleaner or a tool may run there)."""
     if re.search(r"/Runner\.Listener$", word):
         return True
     with contextlib.suppress(OSError):
         if re.search(r"(?:^|/)(?:run|runsvc|run-helper)\.sh$", word):
             script = Path(word) if os.path.isabs(word) else (Path(cwd) / word if cwd else None)
             return script is not None and (script.parent / ".runner").is_file()
-        return os.path.isabs(word) and Path(word, ".runner").is_file()
     return False
 
 
@@ -630,21 +630,23 @@ class Mini:
 
     def foreign_runners(self) -> list[tuple[str, str]]:
         """(where, what) for each GitHub runner glaeda does not own: a LaunchAgent or LaunchDaemon plist that is not
-        glaeda's (RUNNER_AGENT) and starts a runner (a directory with a .runner, its run.sh or runsvc.sh, or a
-        Runner.Listener), and a running Runner.Listener whose runner directory is not ~/actions-runner-glaeda*."""
+        glaeda's (its Label, RUNNER_AGENT) and starts a runner (the run.sh or runsvc.sh of a directory with a .runner,
+        or a Runner.Listener), and a running Runner.Listener whose runner directory is not ~/actions-runner-glaeda*."""
         out = []
         for folder in (self.home / "Library/LaunchAgents", self.daemons_dir):
             for plist in sorted(folder.glob("*.plist")) if folder.is_dir() else []:
-                label = plist.name[:-len(".plist")]
-                if RUNNER_AGENT.fullmatch(label) or label.startswith(GLAEDA_LABEL_PREFIX):
-                    continue
                 try:
                     doc = plistlib.loads(plist.read_bytes())
                 except Exception:  # unreadable or not a plist: nothing to say about it
                     continue
-                words = [str(w) for w in (doc.get("ProgramArguments") or [])] + [str(doc.get("Program") or ""),
-                                                                                 str(doc.get("WorkingDirectory") or "")]
-                cwd = str(doc.get("WorkingDirectory") or "")
+                if not isinstance(doc, dict):
+                    continue
+                # launchd's own name for the job (its Label), not the file's: a renamed file changes neither way
+                label = str(doc.get("Label") or plist.name[:-len(".plist")])
+                if RUNNER_AGENT.fullmatch(label) or label.startswith(GLAEDA_LABEL_PREFIX):
+                    continue
+                words = [str(w) for w in (doc.get("ProgramArguments") or [])] + [str(doc.get("Program") or "")]
+                cwd = str(doc.get("WorkingDirectory") or "")  # only to find a bare run.sh, never a runner itself
                 if any(starts_runner(w, cwd) for w in words if w):
                     out.append((os.fspath(plist), f"{label} starts a GitHub runner glaeda does not manage"))
         own = os.path.realpath(self.home) + "/actions-runner-glaeda"

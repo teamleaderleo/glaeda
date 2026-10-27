@@ -2800,6 +2800,15 @@ class ForeignRunnerTest(unittest.TestCase):
         (home / "build").mkdir()
         plist(agents, "com.example.build", [f"{home}/build/run.sh"])  # a run.sh outside any runner: not a runner
         plist(agents, "com.example.relative", ["/bin/bash", "run.sh"], os.fspath(home / "build"))
+        # a tool that only works in a runner's directory, or names it, is not a runner
+        plist(agents, "com.example.cleaner", ["/usr/bin/python3", "/x/clean.py", os.fspath(old)], os.fspath(old))
+        # ownership is the plist's Label: a renamed glaeda plist is glaeda's, a foreign one with a glaeda-like file
+        # name is not
+        renamed = {"Label": "com.teamleaderleo.glaeda.cmux-runner.4",
+                   "ProgramArguments": [f"{home}/actions-runner-glaeda-4/run.sh"]}
+        (agents / "renamed.plist").write_bytes(plistlib.dumps(renamed))
+        posing = {"Label": "ai.manaflow.ios-internal-builder.runner", "ProgramArguments": [f"{old}/run.sh"]}
+        (agents / "com.teamleaderleo.glaeda.cmux-runner.9.plist").write_bytes(plistlib.dumps(posing))
         mini = health.Mini(home)
         mini.daemons_dir = daemons
         procs = [(1, 501, "S", f"{home}/actions-runner-glaeda-3/bin.2.338.0/Runner.Listener run"),
@@ -2812,10 +2821,11 @@ class ForeignRunnerTest(unittest.TestCase):
         ids = sorted(f["id"] for f in found)
         self.assertEqual(ids, ["runner_unmanaged:actions-runner-glaedax", "runner_unmanaged:actions-runner-nightly-next",
                                "runner_unmanaged:actions.runner.manaflow-ai-cmux.mini.plist",
-                               "runner_unmanaged:ai.manaflow.nightly-builder.runner.plist"])
+                               "runner_unmanaged:ai.manaflow.nightly-builder.runner.plist",
+                               "runner_unmanaged:com.teamleaderleo.glaeda.cmux-runner.9.plist"])
         self.assertTrue(all(f["severity"] == "error" for f in found))
         with mock.patch.object(mini, "processes", return_value=procs[:3]):
-            for p in agents.glob("ai.manaflow.*"):
+            for p in [*agents.glob("ai.manaflow.*"), agents / "com.teamleaderleo.glaeda.cmux-runner.9.plist"]:
                 p.unlink()
             for p in daemons.glob("*.plist"):
                 p.unlink()
