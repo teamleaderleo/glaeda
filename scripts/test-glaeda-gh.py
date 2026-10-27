@@ -1360,7 +1360,7 @@ class DaemonTest(Base):
         self.daemon.tick(NOW + 100)
         self.daemon.tick(NOW + 100 + gg.CYCLE)
         hour = gg.read_json(gg.BASE / "daemon.json")["lastHour"]
-        self.assertEqual(hour, {"rest": 1, "rest304": 1, "graphql": 0, "free": 0})
+        self.assertEqual(hour, {"rest": 1, "rest304": 1, "graphql": 0, "free": 0, "write": 0})
         self.gh.runs[7] = {"id": 7, "status": "queued"}
         self.daemon.tick(NOW + 100 + 3700)
         self.assertEqual(gg.read_json(gg.BASE / "daemon.json")["lastHour"]["rest304"], 0)  # an hour later
@@ -5012,7 +5012,7 @@ class BudgetRefreshTest(Base):
     def test_the_free_read_is_not_counted_as_a_request_the_daemon_spent(self) -> None:
         status = self.daemon.tick(NOW)
         self.assertEqual(self.gh.rate_limit_calls, 1)
-        self.assertEqual(status["lastHour"], {"rest": 0, "rest304": 0, "graphql": 0, "free": 1},
+        self.assertEqual(status["lastHour"], {"rest": 0, "rest304": 0, "graphql": 0, "free": 1, "write": 0},
                          "the refresh is counted, and not as a request that spent anything")
 
     def test_a_refusal_is_reported_and_leaves_the_last_view_alone(self) -> None:
@@ -8306,6 +8306,20 @@ class DaemonPolicyTest(Base):
         self.daemon.request("GET", "/repos/o/r/issues/1/comments")  # the write's own dedupe lookup
         self.daemon.writing = False
         self.assertEqual(self.daemon.rest_spent(), 0)
+        self.assertEqual([w for _, w in self.daemon.sent], ["write", "write"])  # and budget shows them apart
+
+    def test_a_job_list_a_tick_had_no_time_for_is_not_counted_as_tried(self) -> None:
+        failed = {"id": 7, "name": "CI", "display_title": "fix", "status": "completed", "conclusion": "failure",
+                  "html_url": "https://github.com/o/r/actions/runs/7", "head_sha": "b" * 40, "head_branch": "x",
+                  "event": "push", "run_attempt": 1, "created_at": iso(NOW - 99), "updated_at": iso(NOW - 9)}
+        key = gg.parse_key("run", "o/r/7")
+        self.daemon.now = NOW
+        self.spend_rest(2000, at=NOW)
+        e = {"key": key, "jobs": False, "cache": {"data": gg.slim_run(failed)}}
+        with mock.patch.object(self.daemon, "get", side_effect=gg.OutOfTime):
+            self.daemon.read_jobs(e, {}, False)
+        self.assertNotIn(key, self.daemon.jobs_tried)
+        self.assertIn(key, self.daemon.deferred)
 
     def test_a_failed_attempt_still_gets_its_job_list_at_the_cap(self) -> None:
         """The one read the share does not hold back: a wait cannot rule on a failed run without it."""

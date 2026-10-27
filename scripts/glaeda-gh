@@ -64,7 +64,8 @@ the daemon is the only process that talks to GitHub, and clients only read its c
   the outbox's writes, which sessions asked for), kept per minute in rest-spend.json across restarts.
   A read starts only when its worst case fits. At the cap, PR and run reads move to GraphQL, or wait
   while GraphQL is stopped too, so the shared REST pool is left to `gh`, landers and nightly re-runs.
-  The one read the cap never holds back is a failed attempt's job list (once per attempt). The cycle, the floors and the share are read every tick from
+  The one read the cap never holds back is a failed attempt's job list (once per attempt). The share
+  is per daemon: hosts that each run one should split it (restShare 0.2 on two hosts is 0.4 in all). The cycle, the floors and the share are read every tick from
   ~/.config/glaeda/gh-daemon.json, {"cycle": 60, "commentCycle": 15, "restShare": 0.4,
   "floors": {"rest": {"floor": 1500, "reserve": 300}, "graphql": {"floor": 500, "reserve": 100}}};
   a missing key or a value out of range keeps its default.
@@ -1457,7 +1458,8 @@ class Daemon:
             self.charge_rest(minute, -1)
         # `free` is /rate_limit, which costs no quota: counting it as a REST request would overstate
         # what the daemon spends.
-        self.sent.append((self.now, "free" if free else "rest304" if bucket == "rest" and status == 304 else bucket))
+        self.sent.append((self.now, "free" if free else "rest304" if bucket == "rest" and status == 304
+                          else "write" if bucket == "rest" and self.writing else bucket))
         if status == 401:
             self.token = None  # re-read from gh next time
         if "x-ratelimit-remaining" in h and h.get("x-ratelimit-resource", "core") in {"core", "graphql"}:
@@ -1979,7 +1981,7 @@ class Daemon:
         self.write_consumers()
         self.sent = [(t, what) for t, what in self.sent if self.now - t < 3600]
         hour = {what: sum(1 for _, w in self.sent if w == what)
-                for what in ("rest", "rest304", "graphql", "free")}
+                for what in ("rest", "rest304", "graphql", "free", "write")}
         self.reads = [r for r in self.reads if self.now - r[0] < 3600]
         reads = {kind: {b: sum(1 for _, k, w in self.reads if k == kind and w == b) for b in ("graphql", "rest")}
                  for kind in CYCLES}
@@ -2509,13 +2511,13 @@ class Daemon:
                           # past the REST share, once per attempt, answered or not: an error or an empty
                           # list would otherwise be asked for again every cycle, past the share
                           and (self.rest_room(1) or self.jobs_tried.get(e["key"]) != attempt))
-        if failed_attempt:
-            self.jobs_tried[e["key"]] = attempt
         if (e["jobs"] and self.mode("rest") == "normal") or failed_attempt:
             try:
                 jstate, jdoc, jetag = self.get(base + "/jobs?per_page=100", prior.get("jobsEtag") if "jobs" in prior else None)
             except OutOfTime:  # the run itself is read: store it, and its jobs wait for a later read
                 jstate, jdoc, jetag = "late", None, None
+            if failed_attempt and jstate != "late":  # sent: a tick out of time sent nothing, so it is not tried
+                self.jobs_tried[e["key"]] = attempt
             if jstate == "fresh":
                 fields.update(jobs=slim_jobs(jdoc), jobsEtag=jetag, jobsAt=self.now)
             elif jstate == "same":
@@ -3598,7 +3600,9 @@ def emit(key: str, entry: dict | None, as_json: bool, extra: dict | None = None,
     sys.stdout.write(render(key, entry, as_json, extra, until, grace))
 
 
-def cmd_status(kind: str, target: str, jobs: bool, as_json: bool, first_wait: float = CYCLE + 10) -> int:
+def cmd_status(kind: str, target: str, jobs: bool, as_json: bool, first_wait: float | None = None) -> int:
+    if first_wait is None:
+        first_wait = daemon_policy()["cycle"] + 10.0  # a first read lands within one configured cycle
     key = parse_key(kind, target)
     if not daemon_running(grace=DOWN_GRACE):
         say_waiting(down_message())
@@ -4459,7 +4463,7 @@ def cmd_budget(as_json: bool) -> int:
         if isinstance(hour, dict):
             print(f"daemon requests in the last hour: {hour.get('rest', 0)} REST, {hour.get('rest304', 0)} more "
                   f"REST answered 304 (free), {hour.get('graphql', 0)} GraphQL, "
-                  f"{hour.get('free', 0)} rate_limit reads (free)")
+                  f"{hour.get('free', 0)} rate_limit reads (free), {hour.get('write', 0)} REST for queued writes")
         share = status.get("restShare")
         if isinstance(share, dict):
             print(f"daemon REST spend {share.get('spent', '?')}/{share.get('cap', '?')} this hour "
