@@ -4316,6 +4316,12 @@ def files_strict(d: Path) -> list[Path] | None:
     for dp, dirs, fs in os.walk(d, onerror=errors.append):
         if any(os.path.islink(os.path.join(dp, x)) for x in dirs):  # os.walk would not enter it: unread
             return None
+        for f in fs:  # a symlink or special file is skipped by is_file() readers: unread too
+            try:
+                if not stat.S_ISREG(os.lstat(os.path.join(dp, f)).st_mode):
+                    return None
+            except OSError:
+                return None
         found += [Path(dp) / f for f in fs]
     return None if errors or d.is_symlink() else found
 
@@ -4673,6 +4679,47 @@ def _work_tree_dirty(root: Path) -> str:
     return ""
 
 
+def mirror_git_digest(root: Path, gitdirs: list[Path], at: Path | None = None) -> str | None:
+    """A hash of every git dir's HEAD, packed-refs, refs/, logs/ and worktrees/ (each per-worktree HEAD and
+    reflog), read as files relative to root, so it can be read again at `at` once root was renamed there."""
+    h = hashlib.sha256()
+    for g in sorted(gitdirs):
+        base = (at or root) / os.path.relpath(g, root)
+        for name in ("HEAD", "packed-refs"):
+            try:
+                h.update(f"{g}/{name}\0".encode() + (base / name).read_bytes())
+            except FileNotFoundError:
+                h.update(f"{g}/{name}\0-".encode())
+            except OSError:
+                return None
+        for sub_dir in ("refs", "logs", "worktrees"):
+            if (files := files_strict(base / sub_dir)) is None:
+                return None
+            for f in sorted(files):
+                try:
+                    h.update(f"{f.relative_to(base)}\0".encode() + f.read_bytes())
+                except OSError:
+                    return None
+    return h.hexdigest()
+
+
+def mirror_rename_recheck(path: Path, recheck: tuple):
+    """after_rename for a bundled mirror: once the tree is out of the way, its git metadata must still be what
+    archive_mirror bundled; otherwise it is put back and kept (SlotTaken: changed:in-use)."""
+    doomed = path.with_name(f"{DELETING_PREFIX}{path.name}-{os.getpid()}")
+    gitdirs, digest = recheck[0], recheck[4]
+
+    def check() -> None:
+        if digest is not None and mirror_git_digest(path, gitdirs, at=doomed) == digest:
+            return
+        try:
+            rename_noreplace(doomed, path)
+        except OSError as e:
+            raise SlotTaken(f"{path.name}: git changed after bundling; left aside as {doomed.name} ({e.strerror})")
+        raise SlotTaken(f"{path.name}: git changed after bundling; put back")
+    return check
+
+
 def mirror_git_snapshot(gitdirs: list[Path], trees: list[Path]) -> list[str | None]:
     """Every ref, HEAD and reflog size of the item's repositories and the status of its work trees: compared
     before and after archive_mirror's bundles, so a commit made meanwhile keeps the tree."""
@@ -4798,24 +4845,25 @@ def archive_mirror(path: Path) -> tuple[str, list[Path], tuple]:
     """Before a mirror item goes: bundle_unpushed for every repository mirror_repos finds. A tree with
     uncommitted work, or whose repositories cannot all be found or bundled, is kept.
     ("" or why it must stay, the bundles written, what mirror_moved rechecks)."""
-    none: tuple = ([], [], [], {})
+    none: tuple = ([], [], [], {}, None)
     why, gitdirs, trees = mirror_repos(path)
     if why:
         return why, [], none
     snap = mirror_git_snapshot(list(gitdirs.values()), trees)
+    digest = mirror_git_digest(path, list(gitdirs.values()))
     bundles: list[Path] = []
     relied: dict[Path, list[str]] = {}
     for key, g in sorted(gitdirs.items()):
         if (why := bundle_unpushed(g, key, bundles, relied.setdefault(g, []))):
             return why, bundles, none
-    return "", bundles, (list(gitdirs.values()), trees, snap, relied)
+    return "", bundles, (list(gitdirs.values()), trees, snap, relied, digest)
 
 
 def mirror_moved(fam: Family, path: Path, recheck: tuple) -> str:
     """Right before a bundled mirror goes, everything the bundling took time over is read again: process
     evidence, the family's owner and artifact references, and its repositories, found afresh (the same set,
     every work tree clean) and as at bundle time, and the servers, asked again for what the bundles left to them."""
-    gitdirs, trees, snap, relied = recheck
+    gitdirs, trees, snap, relied, digest = recheck
     for g, commits in relied.items():  # the slow network first, then git, then the quick process checks last
         if (why := server_still_holds(g, commits)):
             return why
@@ -4825,6 +4873,10 @@ def mirror_moved(fam: Family, path: Path, recheck: tuple) -> str:
         return f"its repositories changed while they were bundled{': ' + why if why else ''}"
     if None in snap or mirror_git_snapshot(gitdirs, trees) != snap:
         return "its git refs or work trees changed while they were bundled"
+    if digest is None or mirror_git_digest(path, gitdirs) != digest:
+        return "its git metadata changed while it was bundled"
+    if fam.git_disposable and (ref := referenced_main_checkout(path, nested=fam.nested_git)):
+        return f"referenced while its git work was bundled: {ref}"
     if fam.retired_only and not owner_retired(fam):
         return "its owner loaded while its git work was bundled"
     if fam.reference_root is not None and artifact_referenced(path, fresh_artifact_references(fam.reference_root)):
@@ -6849,6 +6901,7 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
                                   if fresh_layout == "rustup-toolchain" else None)
                     remove(p, after_rename=cmux_next_ci_slot_recheck(fam, p, floor=cmux_next_ci_floor_slot(fam, p))
                            if whole_state
+                           else mirror_rename_recheck(p, bundled[2]) if mirror_due(fam, p, idle_now)
                            else None if stale_hash is None else lambda h=stale_hash: h.unlink(missing_ok=True))
                     gone = True
                     if fam.id == CMUX_NEXT_CI_FAMILY and p.parent.parent.parent in tuple(

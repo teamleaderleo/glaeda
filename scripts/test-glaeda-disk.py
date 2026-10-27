@@ -1518,7 +1518,7 @@ class GlaedaDiskTest(unittest.TestCase):
                 mock.patch.object(gd, "process_evidence", return_value=late), \
                 mock.patch.object(gd, "command_lines", return_value=late[1]), \
                 mock.patch.object(gd, "HOME", self.root / "home"), \
-                mock.patch.object(gd, "archive_mirror", return_value=("", [], ([], [], [], {}))), \
+                mock.patch.object(gd, "archive_mirror", return_value=("", [], ([], [], [], {}, gd.mirror_git_digest(Path("/"), [])))), \
                 mock.patch.object(gd, "mirror_moved", return_value=""):  # bundling: the cmux-job tests
             gd.apply(reclaim, {fam.id: fam}, receipt, None, 24)
         self.assertEqual(sorted(p.name for p in cache.iterdir()),
@@ -6090,6 +6090,45 @@ class LinuxLayoutTest(unittest.TestCase):
             os.chmod(parent, 0o755)
         self.assertIn("unreadable linked worktree", why)
         self.assertEqual(bundles, [])
+
+    def test_a_commit_after_the_last_recheck_puts_the_mirror_back(self) -> None:
+        unit, clone, env = self.mirror_unit()
+        real = gd.mirror_moved
+
+        def late(fam, path, recheck):
+            out = real(fam, path, recheck)
+            self.git(clone, "commit", "-q", "--allow-empty", "-m", "made after the recheck", env=env)
+            return out
+        with mock.patch.object(gd, "mirror_moved", late):
+            rec, _ = self.apply_mirror(unit)
+        self.assertEqual(rec["outcome"], "changed:in-use")
+        self.assertTrue((clone / ".git").is_dir(), "renamed back to its path")
+        self.assertEqual([p.name for p in unit.parent.iterdir() if p.name.startswith(gd.DELETING_PREFIX)], [])
+
+    def test_a_checkout_referenced_while_bundling_keeps_the_mirror(self) -> None:
+        unit, clone, _ = self.mirror_unit()
+        bundled = []
+        real = gd.archive_mirror
+
+        def archive(path):
+            bundled.append(path)  # a tool names the checkout while its git work is bundled
+            return real(path)
+        with mock.patch.object(gd, "referenced_main_checkout",
+                               lambda path, nested=False: "named by ~/.local/bin/tool" if bundled else ""), \
+                mock.patch.object(gd, "archive_mirror", archive):
+            rec, _ = self.apply_mirror(unit)
+        self.assertEqual(rec["outcome"], "changed:in-use")
+        self.assertTrue(any("referenced while its git work was bundled" in r for r in rec["reasons"]), rec["reasons"])
+        self.assertTrue((clone / ".git").is_dir())
+
+    def test_a_symlinked_or_special_reflog_file_keeps_the_mirror(self) -> None:
+        unit, clone, _ = self.mirror_unit()
+        log = clone / ".git/logs/HEAD"
+        log.rename(self.home / "head-log")
+        log.symlink_to(self.home / "head-log")
+        self.assertIsNone(gd.files_strict(clone / ".git/logs"))
+        self.assertIsNone(gd.local_tips(clone / ".git"))
+        self.assertTrue(gd.archive_mirror(unit)[0])
 
     def test_only_manifest_listed_bundles_at_their_hash_are_pruned_after_the_evidence_gate(self) -> None:
         archive = self.home / "archive/glaeda-disk"
