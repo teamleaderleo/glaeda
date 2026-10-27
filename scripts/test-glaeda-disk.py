@@ -4971,6 +4971,13 @@ class GlaedaDiskTest(unittest.TestCase):
             self.assertEqual(fam.min_idle_hours, gd.DEFAULT_AGE_HOURS)
             self.assertIsNone(fam.max_idle_hours)
             self.assertEqual(gd.idle_window(fam, 6.0), gd.DEFAULT_AGE_HOURS)
+        # a job's scratch wider than cmux_active's bounded search is not "busy" forever: age decides
+        big = home / "actions-runner-glaeda-ios-internal/_work/_temp/archive-scratch"
+        big.mkdir()
+        for i in range(5001):
+            (big / f"f{i}").write_bytes(b"")
+        self.assertTrue(gd.cmux_active(big), "the bounded search alone would call it busy")
+        self.assertFalse(gd.job_busy(fams[0], big))
 
     def test_stale_runner_checkouts_go_above_the_floor_and_without_one(self) -> None:
         """Old runner work dirs go by age: a checkout no job used for DEFAULT_AGE_HOURS goes whatever the free space,

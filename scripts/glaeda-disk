@@ -594,6 +594,8 @@ def toolchain_held(path: Path, fresh: bool = False) -> bool:
 # and only paths under the home that are not the home, the runner directory or its _work themselves; everything
 # else in that runner (PR leftovers, _work/_temp, test TMPDIRs, other DerivedData) still goes by age.
 ROLE_KEEP_MARKER = ".glaeda-keep.json"
+# What a dedicated runner's jobs leave in its _work/_temp: goes once idle DEFAULT_AGE_HOURS (default_families)
+DEDICATED_RUNNER_TEMP = "dedicated-runner-temp"
 
 
 def real_runner_dir(runner: Path) -> bool:
@@ -3243,7 +3245,7 @@ def default_families(role: str = "fleet-mini") -> list[Family]:
                         and not (runner / "_work").is_symlink() and not temp.is_symlink()
                         and (runner / "glaeda-hooks/dedicated-admit.sh").is_file()):
                     # a dedicated runner (its admission wrapper): what its jobs leave in _temp goes by age
-                    fams.append(Family("dedicated-runner-temp", temp, True, "the next job writes its own _temp",
+                    fams.append(Family(DEDICATED_RUNNER_TEMP, temp, True, "the next job writes its own _temp",
                                        files=True, skip=("_github_home", "_github_workflow", "_runner_file_commands"),
                                        skip_prefixes=("cmux-derived-data-tests-",),  # ci-derived-data's
                                        min_idle_hours=DEFAULT_AGE_HOURS, owner="the dedicated runner's jobs",
@@ -5860,6 +5862,8 @@ def job_busy(fam: Family, path: Path) -> bool:
         return False
     if fam.id == INTERRUPTED:  # renamed away from every job's path; its deleter's pid is its in-use signal
         return False
+    if fam.id == DEDICATED_RUNNER_TEMP:  # a job's scratch can be wider than the budget; a running job is seen by
+        return False                     # its processes and open files, and nothing here is younger than 12 h
     if fam.id == CMUX_NEXT_CI_FAMILY and (path in cmux_next_ci_state_roots(fam.root)
                                          or cmux_next_ci_host_root(fam, path)):
         return False  # a whole state's inputs are wider than the budget; cmux_next_ci_busy is its signal
