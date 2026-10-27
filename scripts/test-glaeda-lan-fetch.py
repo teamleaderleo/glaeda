@@ -8,6 +8,7 @@ import importlib.machinery
 import importlib.util
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -431,6 +432,20 @@ class LanCacheTest(unittest.TestCase):
         curl.chmod(0o755)
         self.assertEqual(serve.fill(self.cache, name, curl=os.fspath(curl)), "curl exit 0 http 302")
         self.assertFalse(serve.stored(self.cache, name).exists())
+
+    def test_running_fills_keep_room_for_each_other(self):
+        name = self.put(b"z" * 100)
+        objects = self.cache / "objects"
+        objects.mkdir(parents=True, exist_ok=True)
+        other = serve.part_of(self.cache, "ci-cache.cmux.com/ns/other.tar.zst")
+        other.write_bytes(b"x" * 10)  # a fill running now
+        free = serve.CACHE_MIN_FREE + serve.FILL_MAX_BYTES + 1000  # room for one fill, not two
+        usage = shutil.disk_usage(self.cache)._replace(free=free)
+        with mock.patch.object(serve.shutil, "disk_usage", lambda path: usage):
+            self.assertEqual(serve.fill(self.cache, name, curl=os.environ["FAKE_CURL"]), "no room for a fill")
+            os.utime(other, (0, 0))  # its fill died long ago: no longer holds room, and is removed
+            self.assertEqual(serve.fill(self.cache, name, curl=os.environ["FAKE_CURL"]), "")
+        self.assertFalse(other.exists())
 
     def test_the_mirror_list_is_admitted_and_bounded(self):
         self.assertEqual(self.fetch(self.put(b"x" * 10))[0], 0)  # makes the run dir

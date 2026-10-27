@@ -1004,6 +1004,20 @@ def open_cached(cache: Path, name: str) -> tuple[int, int] | None:
     return None
 
 
+def reserved(cache: Path, mine: Path) -> int:
+    """What the other fills running now may still write: each may grow to FILL_MAX_BYTES. A part that has not
+    grown for longer than curl's low-speed abort allows is not a running fill's."""
+    total = 0
+    for path in (cache / "objects").glob(".fill-*"):
+        try:
+            info = path.lstat()
+        except OSError:
+            continue
+        if path != mine and stat.S_ISREG(info.st_mode) and time.time() - info.st_mtime < 300:
+            total += max(0, FILL_MAX_BYTES - info.st_size)
+    return total
+
+
 def part_of(cache: Path, name: str) -> Path:
     path = stored(cache, name)
     return path.with_name(".fill-" + path.name)
@@ -1036,8 +1050,12 @@ def fill(cache: Path, name: str, timeout: float = FILL_TIMEOUT, curl: str = CURL
     part = part_of(cache, name)
     part.parent.mkdir(parents=True, exist_ok=True)
     part.unlink(missing_ok=True)
-    prune_cache(cache, "", min_free=CACHE_MIN_FREE + FILL_MAX_BYTES)
-    if shutil.disk_usage(cache).free < CACHE_MIN_FREE + FILL_MAX_BYTES:
+    # The part exists before the check, so fills starting together each count the others' room.
+    part.touch()
+    need = CACHE_MIN_FREE + FILL_MAX_BYTES + reserved(cache, part)
+    prune_cache(cache, "", min_free=need)
+    if shutil.disk_usage(cache).free < need:
+        part.unlink(missing_ok=True)
         return "no room for a fill"
     try:
         # No --location: a redirect could send the fetch to any host, past the bucket allow list.
@@ -1091,8 +1109,12 @@ def prune_cache(cache: Path, keep: str, budget: int = CACHE_BYTES, min_free: int
             info = path.lstat()
         except OSError:
             continue
-        if stat.S_ISREG(info.st_mode) and not path.name.startswith(".fill-"):
+        if not stat.S_ISREG(info.st_mode):
+            continue
+        if not path.name.startswith(".fill-"):
             entries.append((info.st_mtime, info.st_size, path))
+        elif time.time() - info.st_mtime > FILL_TIMEOUT + 600:  # a killed fill's part: no fill lives this long
+            path.unlink(missing_ok=True)
     entries.sort()
     total, removed = sum(size for _, size, _ in entries), 0
     for _, size, path in entries:
