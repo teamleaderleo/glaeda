@@ -408,6 +408,7 @@ plist_file="${home}/Library/LaunchAgents/io.smolrunner.quarry-autoidle.smolrunne
 grep -F '<string>io.smolrunner.quarry-autoidle.smolrunner</string>' "${plist_file}" >/dev/null
 grep -F '<string>autoidle-tick</string>' "${plist_file}" >/dev/null
 grep -F '<key>StartInterval</key>' "${plist_file}" >/dev/null
+grep -A1 -F '<key>RunAtLoad</key>' "${plist_file}" | grep -F '<false/>' >/dev/null
 ! grep -F '<key>KeepAlive</key>' "${plist_file}" >/dev/null
 [ -f "${launchd_loaded}" ]
 

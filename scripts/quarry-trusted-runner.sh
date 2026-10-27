@@ -18,7 +18,8 @@ autoidle_label="io.smolrunner.quarry-autoidle.${instance}"
 autoidle_plist="${HOME}/Library/LaunchAgents/${autoidle_label}.plist"
 autoidle_timeout="${SMOLRUNNER_QUARRY_IDLE_TIMEOUT:-900}"
 # launchd runs one autoidle tick this often (StartInterval): a timer, not a polling loop. Each tick
-# with the VM running reads the runner list once.
+# with the VM running reads the runner list once and adds one interval of idle time, so the first tick
+# comes one interval after load (no RunAtLoad) and the timeout is not reached early.
 autoidle_interval="${SMOLRUNNER_QUARRY_POLL_INTERVAL:-60}"
 autoidle_state="${SMOLRUNNER_QUARRY_AUTOIDLE_STATE:-${HOME}/Library/LaunchAgents/.${autoidle_label}.state}"
 launchctl_cmd="${LAUNCHCTL:-$(command -v launchctl 2>/dev/null || printf '/bin/launchctl')}"
@@ -508,7 +509,7 @@ write_autoidle_plist() {
 		<string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
 	</dict>
 	<key>RunAtLoad</key>
-	<true/>
+	<false/>
 	<key>StartInterval</key>
 	<integer>${autoidle_interval}</integer>
 	<key>ProcessType</key>
@@ -662,8 +663,8 @@ EOF_RUNNER
 # A LaunchAgent written before autoidle ran on StartInterval runs this with KeepAlive. One tick, a
 # pause of one interval, then exit: launchd starts it again. `autoidle-enable` rewrites the agent.
 autoidle_daemon() {
-  autoidle_tick "${autoidle_interval}" || true
   sleep "${autoidle_interval}"
+  autoidle_tick "${autoidle_interval}" || true
 }
 
 remove_runner() {

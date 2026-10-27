@@ -219,6 +219,25 @@ def split_command(src, depth=0, line0=1):
             if c == "\\":
                 j += 2
                 continue
+            if c == "#" and (j == start or src[j - 1] in " \t\n;"):
+                k = src.find("\n", j)  # a comment: its quotes and parens are not code
+                j = n if k < 0 else k
+                continue
+            if c == "<" and src.startswith("<<", j) and not src.startswith("<<<", j):
+                # A heredoc body (a perl or python script in `$(cat <<'X' ...)`) is data up to its terminator line.
+                m = re.match(r"""<<(-?)[ \t]*(?:'([^']*)'|"([^"]*)"|\\?([A-Za-z0-9_.-]+))""", src[j:])
+                if m:
+                    delim = m.group(2) or m.group(3) or m.group(4)
+                    body = src.find("\n", j + m.end())
+                    end = re.search(r"(?m)^" + ("\t*" if m.group(1) else "") + re.escape(delim) + r"[ \t]*$",
+                                    src[body + 1:]) if body >= 0 else None
+                    if end:
+                        rest = src[j + m.end():body + 1]  # the rest of the heredoc's own line is still code
+                        sub = match_paren_in(rest, d)
+                        if sub is not None:
+                            return j + m.end() + sub
+                        j = body + 1 + end.end()
+                        continue
             if c == "'":
                 k = src.find("'", j + 1)
                 j = n if k < 0 else k + 1
@@ -237,6 +256,29 @@ def split_command(src, depth=0, line0=1):
                     return j
             j += 1
         return n
+
+    def match_paren_in(text, depth):
+        """Index in text of the ')' that brings depth to 0, outside quotes, or None."""
+        k = 0
+        while k < len(text):
+            c = text[k]
+            if c == "\\":
+                k += 2
+                continue
+            if c in "'\"":
+                e = text.find(c, k + 1)
+                if e < 0:
+                    return None
+                k = e + 1
+                continue
+            if c == "(":
+                depth += 1
+            elif c == ")":
+                depth -= 1
+                if depth == 0:
+                    return k
+            k += 1
+        return None
 
     def substitute(j):
         """Handle $( at src[j-2:j]; j is just past '('. Returns the index to resume at."""
@@ -402,6 +444,9 @@ def gh_positionals(eff):
 GH_FUNCS = set()
 FUNC_DEF = re.compile(r"^([ \t]*)(?:function[ \t]+([A-Za-z_][\w:-]*)(?:[ \t]*\(\))?|([A-Za-z_][\w:-]*)[ \t]*\(\))[ \t]*\{?[ \t]*$",
                       re.M)
+# `name() { body; }` on one line
+FUNC_INLINE = re.compile(r"^[ \t]*(?:function[ \t]+([A-Za-z_][\w:-]*)(?:[ \t]*\(\))?|([A-Za-z_][\w:-]*)[ \t]*\(\))[ \t]*"
+                         r"\{(.*)\}[ \t]*;?[ \t]*$", re.M)
 
 
 def is_github(argv):
@@ -494,7 +539,7 @@ def verdict(loop):
         pure = all(
             (c[0] in BOUND_MARKERS) or (strip_wrappers(c) and base_of(strip_wrappers(c)[0]) in IDLE)
             for c in body if c)
-        if any(is_file_test(c) for c in everything) and pure and not iterating and not bounded:
+        if any(is_file_test(c) for c in everything) and pure and not iterating and (STRICT["on"] or not bounded):
             return MSG_FILE
     elif kind == "for" and gh_cmds and sleeps and min(sleeps) < long_sleep():
         var = loop.get("var")
@@ -579,6 +624,9 @@ def function_bodies(text):
                 break
             body.append(line)
         out[name] = out.get(name, "") + "\n".join(body) + "\n"
+    for m in FUNC_INLINE.finditer(text):
+        name = m.group(1) or m.group(2)
+        out[name] = out.get(name, "") + m.group(3) + "\n"
     return out
 
 

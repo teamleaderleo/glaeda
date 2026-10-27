@@ -140,6 +140,24 @@ class PollingScanTests(unittest.TestCase):
         rc, out = Repo({"scripts/ok.sh": script, "README.md": "while :; do gh run view; sleep 1; done\n"}).scan()
         self.assertEqual(rc, 0, out)
 
+    def test_a_one_line_github_function_counts(self):
+        script = "#!/bin/bash\nread_api() { gh api \"$@\"; }\nuntil read_api repos/o/r/pulls/1; do sleep 30; done\n"
+        rc, out = Repo({"scripts/inline.sh": script}).scan()
+        self.assertEqual(rc, 1, out)
+        self.assertIn("scripts/inline.sh:3:", out)
+
+    def test_a_bounded_file_wait_is_still_a_wait_in_a_file(self):
+        script = "#!/bin/bash\nend=$((SECONDS + 60))\nwhile [ ! -s out.txt ] && [ $SECONDS -lt $end ]; do sleep 1; done\n"
+        rc, out = Repo({"scripts/bounded.sh": script}).scan()
+        self.assertEqual(rc, 1, out)
+        self.assertIn("scripts/bounded.sh:3:", out)
+
+    def test_a_heredoc_script_inside_a_substitution_is_data(self):
+        script = ("#!/bin/bash\ncode=$(cat <<'PERL'\nwhile ($b =~ s/\\A([^\\n]*)\\n//) { next unless -e $f; sleep 1; }\n"
+                  "print \"it's (odd\";\nPERL\n)\nperl -e \"$code\"\n")
+        rc, out = Repo({"scripts/perl.sh": script}).scan()
+        self.assertEqual(rc, 0, out)
+
     def test_file_wait_loops_fail(self):
         script = "#!/bin/bash\nuntil [ -s out.txt ]; do sleep 5; done\n"
         rc, out = Repo({"scripts/f.sh": script}).scan()
