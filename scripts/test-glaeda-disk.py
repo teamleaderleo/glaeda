@@ -365,22 +365,22 @@ class GlaedaDiskTest(unittest.TestCase):
                          ["user-tmp", "cmux-spm-scratch"] * 2 + ["user-tmp"] * 18)
 
     def test_the_judge_deadline_stops_the_verdicts_too(self) -> None:
-        """The verdicts' own checks (sockets, locks, git) run under the judge deadline: one that passes mid-way keeps
-        what was judged and leaves the rest out."""
-        old_a, old_b = make(self.root / "a"), make(self.root / "b")
-        calls = []
+        """The verdicts' own checks (ages, sockets, locks, git) run under the judge deadline: one that passes mid-way
+        keeps what was judged and leaves the rest out. A controlled clock, so no scheduler pause decides it."""
+        known = {os.fspath(make(self.root / n)): 1 << 20 for n in ("a", "b", "c")}
+        clock, calls = [0.0], []
 
         def slow_keep(fam, path):
             calls.append(path.name)
-            time.sleep(0.4)
+            clock[0] += 10.0
             return ""
-        known = {os.fspath(old_a): 1 << 20, os.fspath(old_b): 1 << 20}
         with mock.patch.object(gd, "keep_verdict", side_effect=slow_keep), \
-                mock.patch.object(gd, "process_evidence", return_value=([], "")):
-            items = gd.survey([self.fam], 24, 0, known, deadline=time.monotonic() + 60,
-                              judge_deadline=time.monotonic() + 0.2)
-        self.assertEqual(len(calls), 1)
-        self.assertEqual([Path(i.path).name for i in items], calls)
+                mock.patch.object(gd, "process_evidence", return_value=([], "")), \
+                mock.patch.object(gd.time, "monotonic", side_effect=lambda: clock[0]):
+            items = gd.survey([self.fam], 24, 0, known, deadline=5.0, judge_deadline=15.0)
+        self.assertEqual(len(calls), 2)  # judged at 0 and 10; at 20 the deadline (15) has passed
+        self.assertEqual(sorted(Path(i.path).name for i in items), sorted(calls))
+        self.assertTrue(all(i.verdict == "reclaimable" for i in items))
         self.assertTrue(gd._MEASURE_BUDGET_REACHED)
 
     def verdicts(self, idle: float = 24) -> dict[str, str]:

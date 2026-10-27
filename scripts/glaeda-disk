@@ -5640,22 +5640,14 @@ def _survey(families, idle_hours, min_bytes, known, evidence, defer_bulk=False,
     work = [(fam, path) for fam, path in work if str(path) in known]
     sizes = [known[str(path)] for _, path in work]
     floors = [min_bytes if fam.min_bytes is None else fam.min_bytes for fam, _ in work]
-    idles = []
     judge_deadline = deadline if judge_deadline is None else judge_deadline
     if judge_deadline is None:
-        idles = [(now - item_mtime(fam, path)) / 3600
-                 if size >= floor else 0.0 for (fam, path), size, floor in zip(work, sizes, floors)]
+        idles: list[float | None] = [(now - item_mtime(fam, path)) / 3600
+                                     if size >= floor else 0.0 for (fam, path), size, floor in zip(work, sizes, floors)]
     else:
-        # A refresh deadline also covers the live verdict pass.  A large completed batch must not
-        # turn a bounded measurement into another unbounded walk of every candidate's metadata.
-        keep = 0
-        for (fam, path), size, floor in zip(work, sizes, floors):
-            if time.monotonic() >= judge_deadline:
-                _MEASURE_BUDGET_REACHED = True
-                break
-            idles.append((now - item_mtime(fam, path)) / 3600 if size >= floor else 0.0)
-            keep += 1
-        work, sizes, floors = work[:keep], sizes[:keep], floors[:keep]
+        # A deadline also covers the live verdict pass, ages included: each candidate's age is read in the verdict
+        # loop below, so a pass that runs out of time keeps every candidate it fully judged, not none.
+        idles = [None] * len(work)
     if isinstance(evidence, NoEvidence):
         cwds, cmds, blind = [], "", f"no process evidence ({evidence})"
     else:
@@ -5675,6 +5667,8 @@ def _survey(families, idle_hours, min_bytes, known, evidence, defer_bulk=False,
             break
         if size < floor:
             continue
+        if idle is None:
+            idle = (now - item_mtime(fam, path)) / 3600
         sp = str(path)
         reasons = []
         if blind:
