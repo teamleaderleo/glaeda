@@ -71,10 +71,10 @@ the daemon is the only process that talks to GitHub, and clients only read its c
   while GraphQL is stopped too, so the shared REST pool is left to `gh`, landers and nightly re-runs.
   The one read the cap never holds back is a failed attempt's job list (once per attempt). The share
   is per daemon, so the fleet splits it: config/gh-daemon.json gives each host its share (a host it
-  does not name gets 0 and reads over GraphQL only), and its shares sum to at most 0.4. The cycle,
-  the floors and the share are read every tick from that file (installed to
-  ~/.local/share/glaeda/gh-daemon.json; its default, then hosts[update.json's host]) with
-  ~/.config/glaeda/gh-daemon.json laid over it, {"cycle": 60, "commentCycle": 15, "restShare": 0.4,
+  does not name gets 0 and reads PRs and runs over GraphQL, all but that job list), and its shares
+  sum to at most 0.4. The cycle, the floors and the share are read every tick from that file
+  (installed to ~/.local/share/glaeda/gh-daemon.json; its default, then hosts[update.json's host])
+  with ~/.config/glaeda/gh-daemon.json laid over it, {"cycle": 60, "commentCycle": 15, "restShare": 0.4,
   "floors": {"rest": {"floor": 1500, "reserve": 300}, "graphql": {"floor": 500, "reserve": 100}}};
   a missing key or a value out of range keeps its default.
 - The token comes from `gh auth token` and stays in memory; it is never written or logged.
@@ -1215,7 +1215,8 @@ def daemon_policy() -> dict:
 
     Every key is optional, and a value that is not a number in range keeps its default, so a typo
     can neither stop the daemon nor turn it into a busy loop. A reserve above its floor keeps both
-    defaults: "stop" must come after "lean". restShare 0 sends every PR and run read to GraphQL.
+    defaults: "stop" must come after "lean". restShare 0 sends every PR and run read to GraphQL
+    (a failed attempt's job list is still read once: the cap never holds that back).
     Read every tick, so an edit applies without a restart."""
     doc = policy_doc()
     cycle = int(_bounded(doc.get("cycle"), CYCLE, 15, 900))

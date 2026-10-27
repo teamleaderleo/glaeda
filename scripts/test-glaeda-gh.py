@@ -8094,6 +8094,8 @@ class DaemonPolicyTest(Base):
         self.assertLessEqual(doc["maxRestShare"], 0.4)
 
     def test_a_zero_share_reads_prs_and_runs_over_graphql(self) -> None:
+        """A host the fleet policy does not name: every PR and run read is GraphQL. The one REST read left
+        is the cap's own exemption, a failed attempt's job list, once per attempt."""
         self.daemon.now = NOW
         self.daemon.budget = {"rest": {"limit": 5000, "remaining": 5000, "reset": NOW + 1800},
                               "graphql": {"limit": 5000, "remaining": 1000, "reset": NOW + 1800}}
@@ -8102,11 +8104,20 @@ class DaemonPolicyTest(Base):
         self.assertEqual(self.daemon.route("pr"), "graphql")
         self.assertEqual(self.daemon.route("run"), "graphql")
         self.gh.prs[("o", "r", 1)] = pr_node(1)
+        self.gh.runs[7] = {"id": 7, "name": "CI", "display_title": "fix", "status": "completed", "conclusion": "failure",
+                           "html_url": "https://github.com/o/r/actions/runs/7", "head_sha": "b" * 40, "head_branch": "x",
+                           "event": "push", "run_attempt": 1, "created_at": iso(NOW - 99), "updated_at": iso(NOW - 9)}
+        self.gh.jobs[7] = [job("build")]
         gg.register("pr:o/r#1")
+        gg.register("run:o/r/7")
         gg.DAEMON_CONFIG.write_text(json.dumps({"restShare": 0}))
         self.daemon.tick(NOW)
-        self.assertEqual(len(self.gh.gql_calls()), 1)
-        self.assertEqual(self.gh.rest_calls(), [])
+        self.assertGreaterEqual(len(self.gh.gql_calls()), 1)
+        self.assertEqual(self.gh.run_calls(), [])
+        self.assertEqual(len(self.gh.job_calls()), 1)
+        gg.register("run:o/r/7")
+        self.daemon.tick(NOW + 200)
+        self.assertEqual(len(self.gh.job_calls()), 1)  # once per attempt
 
     def test_floors_from_the_config_drive_the_mode(self) -> None:
         self.daemon.now = NOW
