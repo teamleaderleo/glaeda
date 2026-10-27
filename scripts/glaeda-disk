@@ -4793,7 +4793,7 @@ def _linked_trees_strict(gitdir: Path) -> list[Path] | None:
         return None
 
 
-def mirror_repos(path: Path, linked_inside: tuple[Path, ...] = ()) -> tuple[str, dict[str, Path], list[Path]]:
+def mirror_repos(path: Path) -> tuple[str, dict[str, Path], list[Path]]:
     """Every repository a mirror item takes along, found as _nested_loss finds them (checkouts, bare
     repositories, a linked worktree's repository inside it, checkouts in ignored directories, submodule stores
     and initialized submodules, recursively), and its work trees, each checked clean right now.
@@ -4801,7 +4801,7 @@ def mirror_repos(path: Path, linked_inside: tuple[Path, ...] = ()) -> tuple[str,
     queue = checkouts(path, NESTED_DEPTH, NESTED_BUDGET, strict=True)  # an unreadable directory may hide one
     if queue is None:
         return "too deep, large or unreadable to find every checkout", {}, []
-    queue, inside = [*queue, *linked_inside], os.path.realpath(path) + "/"
+    queue, inside = list(queue), os.path.realpath(path) + "/"
     gitdirs: dict[str, Path] = {}
     trees: list[Path] = []
     seen: set[str] = set()
@@ -4858,24 +4858,11 @@ def mirror_repos(path: Path, linked_inside: tuple[Path, ...] = ()) -> tuple[str,
                 dirnames[:] = ["modules"] if "modules" in dirnames else []
     if [u for u in unreadable if os.path.lexists(u)]:  # a missing modules/ is no submodule store
         return f"unreadable submodule store {unreadable[0]}", {}, []
-    found: list[Path] = []
     for key, g in gitdirs.items():
         if (linked := _linked_trees_strict(g)) is None:
             return f"{key}: unreadable linked worktree records", {}, []
-        present: list[Path] = []
-        for t in linked:
-            try:  # os.stat, not exists(): a tree we cannot read (EACCES, EIO) is not an absent one
-                os.stat(t)
-                present.append(t)
-            except FileNotFoundError:
-                continue
-            except OSError:
-                return f"{key}: unreadable linked worktree {t}", {}, []
-        if any(not (os.path.realpath(t) + "/").startswith(inside) for t in present):
-            return f"{key}: a worktree outside this item uses it", {}, []
-        found += [t for t in present if os.path.realpath(t) not in seen]
-    if found:  # a linked worktree inside the item, even in ignored output: checked clean and unlocked too
-        return mirror_repos(path, (*linked_inside, *found))
+        if linked:  # the records name absolute paths, so after the rename its worktrees can't be checked again
+            return f"{key}: has linked worktrees ({', '.join(map(os.fspath, linked[:3]))}); kept", {}, []
     return "", gitdirs, sorted(trees)
 
 

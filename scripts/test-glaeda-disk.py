@@ -5963,7 +5963,8 @@ class LinuxLayoutTest(unittest.TestCase):
         self.git(clone, "worktree", "add", "-q", "--detach", "--lock", str(unit / "slot-2"), env=env)
         rec, _ = self.apply_mirror(unit)
         self.assertEqual(rec["outcome"], "blocked:bundle-failed")
-        self.assertTrue(any("locked worktree" in r for r in rec["reasons"]), rec["reasons"])
+        self.assertTrue(any("locked worktree" in r or "has linked worktrees" in r for r in rec["reasons"]),
+                        rec["reasons"])
         self.assertTrue((unit / "slot-2/.git").is_file())
 
     def test_a_commit_made_while_the_servers_are_asked_keeps_the_mirror(self) -> None:
@@ -6054,21 +6055,20 @@ class LinuxLayoutTest(unittest.TestCase):
         self.assertTrue(why)
         self.assertEqual(bundles, [])
 
-    def test_a_dirty_or_locked_worktree_in_ignored_output_keeps_the_mirror(self) -> None:
+    def test_a_linked_worktree_inside_the_mirror_keeps_it_however_clean(self) -> None:
+        """Its record names an absolute path, so once the item is renamed the worktree cannot be checked again."""
         unit, clone, env = self.mirror_unit()
         with (clone / ".git/info/exclude").open("a") as f:
             f.write("target/\n")
         wt = clone / "target/wt"
         self.git(clone, "worktree", "add", "-q", "--detach", str(wt), env=env)
         (wt / "edit.txt").write_text("uncommitted")
-        why, _, _ = gd.archive_mirror(unit)
-        self.assertIn("uncommitted", why)
+        self.assertTrue(gd.archive_mirror(unit)[0])
         (wt / "edit.txt").unlink()
-        self.git(clone, "worktree", "lock", str(wt), env=env)
-        why, _, _ = gd.archive_mirror(unit)
-        self.assertIn("locked worktree", why)
-        self.git(clone, "worktree", "unlock", str(wt), env=env)
-        self.assertEqual(gd.archive_mirror(unit)[0], "")
+        self.assertIn("has linked worktrees", gd.archive_mirror(unit)[0])
+        rec, _ = self.apply_mirror(unit)
+        self.assertEqual(rec["outcome"], "blocked:bundle-failed")
+        self.assertTrue((wt / ".git").is_file())
 
     def test_a_symlinked_reflog_directory_keeps_the_mirror(self) -> None:
         unit, clone, _ = self.mirror_unit()
@@ -6089,7 +6089,7 @@ class LinuxLayoutTest(unittest.TestCase):
             why, bundles, _ = gd.archive_mirror(unit)
         finally:
             os.chmod(parent, 0o755)
-        self.assertIn("unreadable linked worktree", why)
+        self.assertIn("linked worktree", why)
         self.assertEqual(bundles, [])
 
     def test_a_commit_after_the_last_recheck_puts_the_mirror_back(self) -> None:
