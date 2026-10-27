@@ -363,9 +363,46 @@ def declared_pools(manifest: Any, xcode_ok: Callable[[str, dict[str, Any]], bool
 # LaunchAgent beside the runner. env goes into the runner's .env and the watch loop's environment; "{runnerDir}" in a
 # value is the runner's directory. A leading "~/" in a command word or env value is the runner user's home.
 DEDICATED_NAME_RE = r"[a-z][a-z0-9-]{0,39}"  # starts with a letter: never read as a pool instance number
+DEDICATED_POOL_SUFFIX_RE = r"(?:^|-)glaeda(?:-\d+)?$"  # <member>-glaeda-<name> would read as another member's instance
 RUNNER_LABEL_RE = r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}"
 ENV_NAME_RE = r"[A-Z_][A-Z0-9_]{0,63}"
 DEFAULT_LABELS = ("self-hosted", "macos", "arm64", MINI_LABEL)
+
+
+# Where a member's pool instances register (glaeda-cmux-runner-fleet, when no --org/--repo is passed): the manifest's
+# runner.org and runner.group (defaults, or a host's overrides), so a re-apply keeps the scope the pools already have
+# and nobody passes flags by hand. A trusted-only member (runner.trustedRepo) stays on that repository unless its own
+# overrides name runner.org (a trusted runner registered in the org's group). Neither set:
+# None, and the fleet tool falls back to its default repository as before.
+GROUP_RE = r"[A-Za-z0-9][A-Za-z0-9 ._-]*"
+ORG_RE = r"[A-Za-z0-9][A-Za-z0-9-]*"
+
+
+def pool_scope(manifest: Any, member: str) -> tuple[dict[str, str | None] | None, str | None]:
+    """({"org", "group"} or {"repo"}, None), (None, None) when the manifest names no scope, or (None, why) when the
+    member's runner.org/runner.group are unusable. Pure."""
+    hosts = manifest.get("hosts") if isinstance(manifest, dict) else None
+    host = hosts.get(member) if isinstance(hosts, dict) else None
+    if not isinstance(host, dict):
+        return None, f"{member} is not a member in the manifest"
+    defaults, overrides = manifest.get("defaults") or {}, host.get("overrides") or {}
+    if not isinstance(defaults, dict) or not isinstance(overrides, dict):
+        return None, f"manifest defaults or {member} overrides is not an object"
+    runner = merge(defaults, overrides).get("runner")
+    runner = runner if isinstance(runner, dict) else {}
+    org, group, trusted = runner.get("org"), runner.get("group"), runner.get("trustedRepo")
+    if org is not None and not (isinstance(org, str) and re.fullmatch(ORG_RE, org)):
+        return None, f"{member} runner.org must be an organization login"
+    if group is not None and (org is None or not (isinstance(group, str) and re.fullmatch(GROUP_RE, group))):
+        return None, f"{member} runner.group must be a runner group name and goes with runner.org"
+    if trusted is not None and not (isinstance(trusted, str) and re.fullmatch(REPO_RE, trusted)):
+        return None, f"{member} runner.trustedRepo must be owner/name"  # never fall back to the pools' scope
+    own = (overrides.get("runner") or {}) if isinstance(overrides.get("runner"), dict) else {}
+    if isinstance(trusted, str) and re.fullmatch(REPO_RE, trusted) and own.get("org") is None:
+        return {"repo": trusted}, None  # the defaults' org is for the pools; the host's own org says otherwise
+    if org is None:
+        return None, None
+    return {"org": org, "group": group}, None
 
 
 def dedicated_runners(manifest: Any, member: str) -> tuple[list[dict[str, Any]], str | None]:
@@ -391,12 +428,15 @@ def dedicated_runners(manifest: Any, member: str) -> tuple[list[dict[str, Any]],
         where = f"{member} runner.dedicated[{index}]"
         if not isinstance(entry, dict):
             return [], f"{where} is not an object"
-        unknown = sorted(set(entry) - {"name", "repo", "org", "group", "labels", "admit", "watch", "env", "note"})
+        unknown = sorted(set(entry) - {"name", "repo", "org", "group", "labels", "admit", "watch", "env", "keep",
+                                       "note"})
         if unknown:
             return [], f"{where} has unknown keys: {', '.join(unknown)}"
         name, repo, org, group = entry.get("name"), entry.get("repo"), entry.get("org"), entry.get("group")
         if not isinstance(name, str) or not re.fullmatch(DEDICATED_NAME_RE, name):
             return [], f"{where}.name must match {DEDICATED_NAME_RE}"
+        if re.search(DEDICATED_POOL_SUFFIX_RE, name):
+            return [], f"{where}.name must not end in glaeda or glaeda-<n> (it would read as a pool instance)"
         if name in {d["name"] for d in out}:
             return [], f"{where}.name {name} is declared twice"
         if (repo is None) == (org is None):
@@ -434,6 +474,13 @@ def dedicated_runners(manifest: Any, member: str) -> tuple[list[dict[str, Any]],
         if not (isinstance(env, dict) and all(isinstance(k, str) and re.fullmatch(ENV_NAME_RE, k) and isinstance(v, str)
                                               and "\n" not in v and "\0" not in v for k, v in env.items())):
             return [], f"{where}.env must map NAME to a one-line string"
+        keep = entry.get("keep", [])
+        if not (isinstance(keep, list) and all(isinstance(k, str) and k and "\n" not in k and "\0" not in k
+                                               and (k.startswith("~/") or k.startswith("{runnerDir}/"))
+                                               and ".." not in k.split("/") for k in keep)):
+            return [], (f"{where}.keep must list paths under ~/ or {{runnerDir}}/ (no ..): the warm state glaeda-disk "
+                        "keeps by role")
         out.append({"name": name, "repo": repo, "org": org, "group": group, "labels": list(labels),
-                    "admit": commands["admit"], "watch": commands.get("watch"), "env": dict(env)})
+                    "admit": commands["admit"], "watch": commands.get("watch"), "env": dict(env),
+                    "keep": list(keep)})
     return out, None
