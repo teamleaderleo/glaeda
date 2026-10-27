@@ -1955,6 +1955,7 @@ class RunnerBelowPin(Base):
         """A runner dir: updated is the self-updater's layout (bin -> bin.X), else a fresh unpack with a receipt."""
         d = self.home / name
         (d / "glaeda-hooks").mkdir(parents=True)
+        (d / "config.sh").write_text("#!/bin/sh\n")
         if updated:
             (d / f"bin.{version}").mkdir()
             (d / "bin").symlink_to(d / f"bin.{version}")
@@ -1962,7 +1963,8 @@ class RunnerBelowPin(Base):
             (d / "bin").mkdir()
             receipts = self.home / health.RUNNER_RECEIPTS / f"instance-{name}"
             receipts.mkdir(parents=True)
-            (receipts / "receipt.json").write_text(json.dumps({"runnerDir": os.fspath(d), "runnerVersion": version}))
+            (receipts / "receipt.json").write_text(json.dumps({"runnerDir": os.fspath(d), "runnerDirOwned": True,
+                                                               "runnerVersion": version}))
         return d
 
     def test_the_pin_is_glaeda_cmux_runners(self) -> None:
@@ -1981,6 +1983,19 @@ class RunnerBelowPin(Base):
         self.assertTrue((a / "bin").is_dir() and not (a / "bin").is_symlink())
         self.assertEqual(os.readlink(b / "bin"), os.fspath(b / f"bin.{self.OLD}"))
         self.assertEqual(self.mini.did, [])
+
+    def test_a_receipt_glaeda_cmux_runner_would_not_count_is_no_finding(self) -> None:
+        for broken in ("unowned", "no config.sh"):
+            with self.subTest(broken):
+                d = self.runner("actions-runner-glaeda", self.OLD, updated=False)
+                if broken == "unowned":
+                    receipt = self.home / health.RUNNER_RECEIPTS / "instance-actions-runner-glaeda" / "receipt.json"
+                    receipt.write_text(json.dumps({"runnerDir": os.fspath(d), "runnerVersion": self.OLD}))
+                else:
+                    (d / "config.sh").unlink()
+                self.assertEqual(self.run_once()["findings"], [])
+                shutil.rmtree(d)
+                shutil.rmtree(self.home / health.RUNNER_RECEIPTS)
 
     def test_an_unknown_version_is_no_finding(self) -> None:
         d = self.home / "actions-runner-glaeda"
