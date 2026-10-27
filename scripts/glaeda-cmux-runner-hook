@@ -600,13 +600,15 @@ def dev_compile_capacity_wait(repo: str | None, home_repo: str, event_name: str 
     return None
 
 
-def nightly_capacity_wait(tier: str, ref: str | None, job: str | None, workflow: str,
+def nightly_capacity_wait(tier: str, event_name: str | None, ref: str | None, job: str | None, workflow: str,
                           attempt: str | None) -> float | None:
-    """NIGHTLY_CAPACITY_WAIT_S for NEXT's nightly app build on attempt 1 (its re-run takes Blacksmith), else None.
-    `tier` is job_tier()'s answer, so only merged nightly.yml code on nightly-next's own ref qualifies."""
-    if tier != TIER_NIGHTLY or ref != NIGHTLY_NEXT_REF or job != NIGHTLY_APP_JOB or workflow != "nightly.yml":
+    """NIGHTLY_CAPACITY_WAIT_S for NEXT's nightly app build on a nightly-next push's attempt 1 (the push the owned-pool
+    rescue re-runs, onto Blacksmith), else None. `tier` is job_tier()'s answer, so only merged nightly.yml code on
+    nightly-next's own ref qualifies; a dispatch or schedule there, which the rescue does not watch, keeps its wait."""
+    if (tier != TIER_NIGHTLY or event_name != "push" or ref != NIGHTLY_NEXT_REF or job != NIGHTLY_APP_JOB
+            or workflow != "nightly.yml"):
         return None
-    return NIGHTLY_CAPACITY_WAIT_S if (attempt or "1").strip() == "1" else None
+    return NIGHTLY_CAPACITY_WAIT_S if attempt == "1" else None
 
 
 def bounded_wait(cap: float | None, bound: float | None) -> float | None:
@@ -6984,7 +6986,8 @@ def main(argv: list[str] | None = None) -> int:
             tier = job_tier(os.environ.get("GITHUB_EVENT_NAME"), os.environ.get("GITHUB_REF"),
                             os.environ.get("GITHUB_REPOSITORY"), event, os.environ.get("GITHUB_WORKFLOW_REF"),
                             os.environ.get("GITHUB_JOB"))
-            nightly_bound = nightly_capacity_wait(tier, os.environ.get("GITHUB_REF"), os.environ.get("GITHUB_JOB"),
+            nightly_bound = nightly_capacity_wait(tier, os.environ.get("GITHUB_EVENT_NAME"),
+                                                  os.environ.get("GITHUB_REF"), os.environ.get("GITHUB_JOB"),
                                                   job_workflow(), os.environ.get("GITHUB_RUN_ATTEMPT"))
             cap = bounded_wait(cap, nightly_bound)
             if tier == TIER_NIGHTLY:

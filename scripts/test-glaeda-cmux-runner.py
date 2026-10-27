@@ -5900,13 +5900,13 @@ class GateTest(unittest.TestCase):
         bound = hook.NIGHTLY_CAPACITY_WAIT_S
         self.assertEqual(bound, 90.0)
         self.assertLessEqual(hook.NIGHTLY_BOUND_WORST_S, 2.5 * 60)
-        args = (hook.TIER_NIGHTLY, "refs/heads/nightly-next", "build-nightly-app", "nightly.yml")
-        for attempt in ("1", "", None, " 1"):
+        args = (hook.TIER_NIGHTLY, "push", "refs/heads/nightly-next", "build-nightly-app", "nightly.yml")
+        self.assertEqual(hook.nightly_capacity_wait(*args, "1"), bound)
+        for attempt in ("2", "", None, " 1", "01"):  # only an exact attempt 1; anything else keeps its wait
             with self.subTest(attempt=attempt):
-                self.assertEqual(hook.nightly_capacity_wait(*args, attempt), bound)
-        self.assertIsNone(hook.nightly_capacity_wait(*args, "2"))
-        for index, value in ((0, hook.TIER_DEV), (0, ""), (1, "refs/heads/main"), (2, "build-sign-notarize-nightly"),
-                             (3, "cmux-next.yml")):
+                self.assertIsNone(hook.nightly_capacity_wait(*args, attempt))
+        for index, value in ((0, hook.TIER_DEV), (0, ""), (1, "workflow_dispatch"), (1, "schedule"), (1, None),
+                             (2, "refs/heads/main"), (3, "build-sign-notarize-nightly"), (4, "cmux-next.yml")):
             changed = list(args)
             changed[index] = value
             with self.subTest(changed=changed):
@@ -5918,11 +5918,11 @@ class GateTest(unittest.TestCase):
         ref = "refs/heads/nightly-next"
         tier = hook.job_tier("push", ref, "manaflow-ai/cmux", {"ref": ref, "repository": CMUX},
                              f"manaflow-ai/cmux/.github/workflows/nightly.yml@{ref}", "build-nightly-app")
-        self.assertEqual(hook.nightly_capacity_wait(tier, ref, "build-nightly-app", "nightly.yml", "1"), bound)
+        self.assertEqual(hook.nightly_capacity_wait(tier, "push", ref, "build-nightly-app", "nightly.yml", "1"), bound)
         untrusted = hook.job_tier("pull_request", "refs/pull/1/merge", "manaflow-ai/cmux", {"repository": CMUX},
                                   "manaflow-ai/cmux/.github/workflows/nightly.yml@refs/pull/1/merge",
                                   "build-nightly-app")
-        self.assertIsNone(hook.nightly_capacity_wait(untrusted, ref, "build-nightly-app", "nightly.yml", "1"))
+        self.assertIsNone(hook.nightly_capacity_wait(untrusted, "push", ref, "build-nightly-app", "nightly.yml", "1"))
 
     def test_other_capacity_waits_remain_unbounded(self) -> None:
         event = {"repository": CMUX, "ref": "refs/heads/feat-cmux-next"}
