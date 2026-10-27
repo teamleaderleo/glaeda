@@ -31,7 +31,8 @@ KEYCHAIN_SERVICE = re.compile(r"manaflow-fleet-sudo")
 # Any way to read a keychain item: the security CLI, the Security framework, Python keyring (however imported).
 KEYCHAIN_READ = re.compile(r"find-(generic|internet)-password|SecItemCopyMatching|SecKeychainFind|\bkeyring\b|"
                            r"get_password\s*\(|security\s+find-")
-KEYCHAIN_LINE = re.compile(r"find-generic-password[^\n]*(fleet[-_ ]sudo|KEYCHAIN_SERVICE)")
+# A line that names the service through a variable or a looser spelling; each read on it counts.
+KEYCHAIN_NAMED = re.compile(r"fleet[-_ ]sudo|KEYCHAIN_SERVICE")
 PKILL = re.compile(r"\b(pkill|killall)\b")
 BIG_RED = re.compile(r"big[-_ ]?red", re.IGNORECASE)
 
@@ -46,9 +47,9 @@ FIX = {
 
 def keychain_matches(text: str) -> int:
     """A file that names the service and reads a keychain counts every occurrence of the service name; a read
-    that names the service only through a variable (KEYCHAIN_SERVICE) counts once per line, wherever it is."""
-    by_variable = sum(1 for line in text.splitlines()
-                      if KEYCHAIN_LINE.search(line) and not KEYCHAIN_SERVICE.search(line))
+    that names the service only through a variable (KEYCHAIN_SERVICE) counts once per read, wherever it is."""
+    by_variable = sum(len(KEYCHAIN_READ.findall(line)) for line in text.splitlines()
+                      if KEYCHAIN_NAMED.search(line) and not KEYCHAIN_SERVICE.search(line))
     if KEYCHAIN_SERVICE.search(text) and KEYCHAIN_READ.search(text):
         return len(KEYCHAIN_SERVICE.findall(text)) + by_variable
     return by_variable
@@ -110,7 +111,7 @@ def problems(found: dict[str, dict[str, int]], allow: dict) -> list[str]:
         for rel, entry in sorted(entries.items()):
             if rel not in found[rule]:
                 out.append(f"{rule}: {rel}: allowlisted but has no match: remove the entry")
-            if not str(entry.get("reason", "")).strip():
+            if not isinstance(entry.get("reason"), str) or not entry["reason"].strip():
                 out.append(f"{rule}: {rel}: allowlist entry has no reason")
     for rule in allow:
         if rule not in found and not rule.startswith("_"):
@@ -170,6 +171,9 @@ class FleetRuleLints(unittest.TestCase):
         self.assertEqual(keychain_matches("the fleet password lives in manaflow-fleet-sudo\n"), 0)
         self.assertEqual(keychain_matches('from keyring import get_password\npw = get_password("manaflow-fleet-sudo", "x")\n'), 1)
         self.assertEqual(keychain_matches('import keyring as k\nk.get_password("manaflow-fleet-sudo", "x")\n'), 1)
+        self.assertEqual(keychain_matches('a = keyring.get_password(KEYCHAIN_SERVICE, "g"); '
+                                          'b = keyring.get_password(KEYCHAIN_SERVICE, "h")\n'), 4)
+        self.assertEqual(keychain_matches('security find-internet-password -s "$KEYCHAIN_SERVICE" -w\n'), 1)
         self.assertEqual(line_matches(PKILL, "pkill -x a -u 1; pkill -f b"), 2)
         self.assertEqual(keychain_matches('security find-generic-password -s manaflow-fleet-sudo -w; '
                                           'security find-generic-password -s manaflow-fleet-sudo -a x -w\n'), 2)
@@ -211,6 +215,8 @@ class FleetRuleLints(unittest.TestCase):
             self.assertTrue(problems(found, allow), count)
             self.assertTrue(growth(allow, {"pkill": {"a.sh": {"count": 5, "reason": "r"}}}), count)
         self.assertTrue(problems(found, json.loads('{"pkill": {"a.sh": {"count": NaN, "reason": "r"}}}')))
+        for reason in (True, 0, None, "  ", ["x"]):
+            self.assertTrue(problems(found, {"pkill": {"a.sh": {"count": 5, "reason": reason}}}), reason)
 
     def test_the_allowlist_cannot_grow_against_the_base(self):
         base = {"pkill": {"a.sh": {"count": 2, "reason": "r"}}}
