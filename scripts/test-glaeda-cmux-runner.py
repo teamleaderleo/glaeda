@@ -4958,20 +4958,27 @@ class DiskPassCoalesceTest(unittest.TestCase):
         its cwd, so glaeda-disk's checkout evictions read that checkout as in use."""
         cwd_file = self.dir / "pass-cwd"
         disk = make_executable(self.dir / "glaeda-disk", "import os, pathlib\n"
-                               f"pathlib.Path({os.fspath(cwd_file)!r}).write_text(os.getcwd())\n")
+                               f"pathlib.Path({os.fspath(cwd_file)!r}).write_text(os.getcwd() + '|' + "
+                               "os.environ.get('PATH', ''))\n")
         self.write_target(10**9)
         workspace = self.dir / "actions-runner-glaeda-11/_work/cmux/cmux"
         workspace.mkdir(parents=True)
         before = os.getcwd()
         os.chdir(workspace)
-        try:
-            self.assertIn("started in the background", hook.disk_pressure_detached(os.fspath(disk)))
+        try:  # a caller that never ran leave_job_workspace (the listener gate) with a relative PATH entry
+            with mock.patch.dict(os.environ, {"PATH": os.pathsep.join(["rel-bin", "/usr/bin"])}):
+                self.assertIn("started in the background", hook.disk_pressure_detached(os.fspath(disk)))
         finally:
             os.chdir(before)
         deadline = time.monotonic() + 20
         while not cwd_file.exists() and time.monotonic() < deadline:
             time.sleep(0.05)
-        self.assertEqual(cwd_file.read_text(), "/")
+        cwd, path = cwd_file.read_text().split("|", 1)
+        self.assertEqual(cwd, "/")
+        first = path.split(os.pathsep)[0]
+        self.assertTrue(os.path.isabs(first), first)
+        self.assertEqual(os.path.realpath(os.path.dirname(first)), os.path.realpath(workspace))
+        self.assertEqual(os.path.basename(first), "rel-bin")
 
     def test_the_hook_leaves_the_job_workspace_with_absolute_paths(self) -> None:
         workspace = self.dir / "actions-runner-glaeda-11/_work/cmux/cmux"

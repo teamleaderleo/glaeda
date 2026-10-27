@@ -7214,6 +7214,9 @@ def disk_pressure_detached(explicit: str | None, timeout: float = BACKGROUND_DIS
             disk_skip_line(HOOK_SKIP_COALESCED, free, targets)
             return "glaeda-disk pass already running; this trigger is coalesced into its follow-up"
         env = {key: value for key, value in os.environ.items() if key != "RUNNER_TRACKING_ID"}
+        with contextlib.suppress(OSError):  # the child runs in / (every caller: job-completed and the listener gate)
+            if "PATH" in env:
+                env["PATH"] = absolute_path_entries(env["PATH"], Path(os.getcwd()))
         bound = [f"{timeout * DISK_PASS_LIFETIME_FACTOR:g}", os.fspath(lock), os.fspath(pending),
                  os.fspath(evict_lock_path())]
         child = os.fork()
@@ -7249,6 +7252,12 @@ def disk_pressure_detached(explicit: str | None, timeout: float = BACKGROUND_DIS
     return f"glaeda-disk started in the background (bounded by {timeout:g} s)"
 
 
+def absolute_path_entries(path: str, cwd: Path) -> str:
+    """PATH with each relative (or empty, the cwd) entry made absolute against cwd, so it names the same directories
+    after a chdir."""
+    return os.pathsep.join(e if os.path.isabs(e) else os.path.join(os.fspath(cwd), e) for e in path.split(os.pathsep))
+
+
 JOB_CWD: Path | None = None  # the job's working directory the runner started the hook in (leave_job_workspace)
 
 
@@ -7266,8 +7275,7 @@ def leave_job_workspace(args: argparse.Namespace) -> None:
     if JOB_CWD is not None and "PATH" in os.environ:
         # a relative PATH entry (or an empty one, the cwd) keeps naming what it named here, for every later lookup
         # (find_disk(None), shutil.which) and every child the hook starts
-        os.environ["PATH"] = os.pathsep.join(os.path.join(os.fspath(JOB_CWD), e) if not os.path.isabs(e) else e
-                                             for e in os.environ["PATH"].split(os.pathsep))
+        os.environ["PATH"] = absolute_path_entries(os.environ["PATH"], JOB_CWD)
     for name in ("disk", "runner_dir", "dedicated_admit", "job_log", "capacity_dir", "state_dir", "host_lock",
                  "reservation", "toolchain_xcode"):
         value = getattr(args, name, None)
