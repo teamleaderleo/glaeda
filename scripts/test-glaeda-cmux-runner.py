@@ -6043,8 +6043,10 @@ class GateTest(unittest.TestCase):
         re-run (attempt 2, the picker's Blacksmith label) builds it within minutes. Main's nightly, other nightly
         jobs, later attempts and non-nightly tiers keep their waits."""
         bound = hook.NIGHTLY_CAPACITY_WAIT_S
-        self.assertEqual(bound, 90.0)
-        self.assertLessEqual(hook.NIGHTLY_BOUND_WORST_S, 2.5 * 60)
+        self.assertEqual(bound, 300.0)
+        # the refusal must come within cmux owned_pool_rescue.py REFUSAL_SECONDS (360 s), or the rescue reads it as an
+        # ordinary failure and never re-runs it off the fleet
+        self.assertLess(hook.NIGHTLY_BOUND_WORST_S, 360)
         args = (hook.TIER_NIGHTLY, "push", "refs/heads/nightly-next", "build-nightly-app", "nightly.yml")
         self.assertEqual(hook.nightly_capacity_wait(*args, "1"), bound)
         for attempt in ("2", "", None, " 1", "01"):  # only an exact attempt 1; anything else keeps its wait
@@ -8182,6 +8184,19 @@ class RunnerTest(unittest.TestCase):
         self.assertIn("rejects job-started.sh", blocked["note"])
         self.assertEqual((hooks / cr.HOOK_NAME).read_bytes(), older)
         started.write_text(wrapper)
+        # a check that times out on a loaded host is no verdict: deferred to a later run, never blocked
+        real_run = subprocess.run
+
+        def slow(argv, *args, **kwargs):
+            if "--parse-only" in argv:
+                raise subprocess.TimeoutExpired(argv, kwargs.get("timeout"))
+            return real_run(argv, *args, **kwargs)
+
+        with mock.patch.object(cr.subprocess, "run", side_effect=slow):
+            slowed = self.invoke("--refresh-hooks", "--apply")["runners"][0]
+        self.assertEqual(slowed["state"], "deferred")
+        self.assertTrue(slowed["note"].startswith(cr.HOOK_CHECK_SLOW), slowed["note"])
+        self.assertEqual((hooks / cr.HOOK_NAME).read_bytes(), older)
         # a directory whose marker no longer matches the receipt is not this command's
         marker = self.home / "actions-runner-glaeda" / cr.MARKER
         install_id = marker.read_text()
