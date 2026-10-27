@@ -4927,9 +4927,8 @@ class GlaedaDiskTest(unittest.TestCase):
         git(co, "remote", "set-url", "origin", os.fspath(self.root / "gone.git"))
         self.assertEqual(gd.runner_checkout_git_veto(co), "git could not say whether a commit is only here")
 
-    def test_a_submodule_at_the_commit_a_pushed_head_pins_is_not_only_here(self) -> None:
-        """A submodule is fetched by id at its pin and no ref there names it; HEAD is pushed, so the pin is too.
-        An older pin from an earlier job, which no pushed HEAD's tree names, still keeps the checkout."""
+    def test_a_submodule_commit_a_pushed_gitlink_pins_still_keeps_the_checkout(self) -> None:
+        """A job may push a superproject gitlink to a submodule commit it never pushed; the pin proves nothing."""
         env = {"PATH": "/usr/bin:/bin:/opt/homebrew/bin", "HOME": os.fspath(self.root), "GIT_AUTHOR_NAME": "t",
                "GIT_AUTHOR_EMAIL": "t@x", "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@x"}
 
@@ -4941,22 +4940,39 @@ class GlaedaDiskTest(unittest.TestCase):
         store = co / ".git/modules/ghostty"
         store.parent.mkdir(parents=True)
         git(store.parent, "init", "-q", "--bare", "ghostty")
-        git(store, "--work-tree", os.fspath(self.root), "commit", "-q", "--allow-empty", "-m", "old pin")
-        old = git(store, "rev-parse", "HEAD")
-        git(store, "update-ref", "refs/remotes/origin/main", old)
-        git(store, "--work-tree", os.fspath(self.root), "commit", "-q", "--allow-empty", "-m", "pin")
+        git(store, "--work-tree", os.fspath(self.root), "commit", "-q", "--allow-empty", "-m", "made by a job")
         pin = git(store, "rev-parse", "HEAD")
         git(co, "update-index", "--add", "--cacheinfo", f"160000,{pin},ghostty")
         git(co, "commit", "-q", "-m", "pin ghostty")
-        git(co, "update-ref", "refs/remotes/origin/main", "HEAD")
+        git(co, "update-ref", "refs/remotes/origin/main", "HEAD")  # the superproject's gitlink is pushed
         git(co, "checkout", "-q", "--detach", "refs/remotes/origin/main")
-        self.assertEqual(gd.runner_checkout_git_veto(co), "", "the store's HEAD is the pushed HEAD's pin")
-        self.assertEqual(gd.runner_checkout_git_veto(co), "", "history of the pin is on origin with it")
-        empty = git(store, "hash-object", "-t", "tree", "-w", "/dev/null")
-        other = git(store, "commit-tree", empty, "-m", "an unrelated older pin")  # not in the pin's history
-        git(store, "update-ref", "--no-deref", "HEAD", other)  # an older pin no pushed tree names here
-        git(store, "update-ref", "refs/heads/main", other)
         self.assertEqual(gd.runner_checkout_git_veto(co), "a commit in modules/ghostty is on no remote-tracking ref")
+        git(store, "update-ref", "refs/remotes/origin/main", pin)
+        self.assertEqual(gd.runner_checkout_git_veto(co), "")
+        (store / "worktrees/w").mkdir(parents=True)  # a submodule's own locked linked worktree
+        (store / "worktrees/w/locked").write_text("")
+        self.assertEqual(gd.runner_checkout_git_veto(co), "a linked worktree of it is locked")
+        shutil.rmtree(store / "worktrees")
+        (co / ".git/modules/dangling").symlink_to(self.root / "nowhere")
+        self.assertEqual(gd.runner_checkout_git_veto(co), "a symlink inside .git: git could not say what it holds")
+
+    def test_a_job_that_starts_during_the_git_veto_keeps_its_checkout(self) -> None:
+        names = {"actions-runner-glaeda": 2, "actions-runner-glaeda-2": 2, "actions-runner-glaeda-11": 2}
+        home, cos = self._idle_checkouts(names)
+        for name, age in names.items():
+            self._git_checkout(cos[name])
+            self._packs(cos[name], 6.8 if name == "actions-runner-glaeda-11" else 0.55)
+            self._age(home / name, hours=age)
+        live = f"{home / 'actions-runner-glaeda-11'}/bin/Runner.Worker spawnclient 1 2\n"
+        reads = iter([([], ""), ([], live)])  # idle when first judged, a job by the time the veto returns
+        gd.process_evidence = lambda: next(reads, ([], live))
+        patches, removed = self._floor_disk(400.0)
+        receipt = self.receipt()
+        with patches[0], patches[1]:
+            self.assertEqual(gd.evict_idle_runner_checkouts(receipt, 30.0, home), 0)
+        self.assertEqual(removed, [])
+        (rec,) = map(json.loads, receipt.read_text().splitlines())
+        self.assertIn("running a job", rec["reasons"][0])
 
     def test_bloat_siblings_share_an_origin_and_an_unreadable_size_counts_none(self) -> None:
         root = self.root / "origin"

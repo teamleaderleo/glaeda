@@ -2112,7 +2112,7 @@ def runner_checkout_git_veto(checkout: Path) -> str:
             if any(n in GIT_LOCK_NAMES for n in (*files, *dirs)) or any(
                     f.endswith(".lock") and "refs" in rel for f in files):
                 return "git holds a lock in it"
-            if len(rel) == 2 and rel[0] == "worktrees" and "locked" in files:
+            if len(rel) >= 2 and rel[-2] == "worktrees" and "locked" in files:
                 return "a linked worktree of it is locked"
     except OSError:
         return "git could not say whether it holds a lock"
@@ -2123,7 +2123,6 @@ def runner_checkout_git_veto(checkout: Path) -> str:
     def git(*args: str, timeout: int = 60) -> str:
         return subprocess.run(["git", "-C", os.fspath(checkout), *args], capture_output=True, text=True,
                               timeout=timeout, env=env, check=True).stdout
-    git.argv, git.env = ["git", "-C", os.fspath(checkout)], env
     try:
         heads = [ln.split(" ", 1)[1] for ln in git("worktree", "list", "--porcelain").splitlines()
                  if ln.startswith("HEAD ")]
@@ -2135,15 +2134,7 @@ def runner_checkout_git_veto(checkout: Path) -> str:
     return submodule_git_veto(dotgit, env)
 
 
-def git_argv(git) -> list[str]:
-    return git.argv
-
-
-def git_env(git) -> dict[str, str]:
-    return git.env
-
-
-def unpushed_commit(git, heads: list[str], pushed: tuple[str, ...] = ()) -> bool:
+def unpushed_commit(git, heads: list[str]) -> bool:
     """Whether HEAD, `heads`, or any ref but a remote-tracking one (a branch, the stash, bisect, notes, refs/worktree,
     a tag) names a commit on no remote-tracking ref. A tag
     counts only when origin does not have it at the same object: a full-history fetch brings every tag of origin,
@@ -2154,12 +2145,7 @@ def unpushed_commit(git, heads: list[str], pushed: tuple[str, ...] = ()) -> bool
             if " " in ln]
     # every ref but remote-tracking ones and tags: branches, the stash, bisect, notes, refs/worktree, anything
     tips = [sha for sha, ref in refs if not ref.startswith(("refs/remotes/", "refs/tags/"))]
-    if pushed:  # commits known to be on origin some other way: only those this repository has can go to rev-list
-        listed = subprocess.run([*git_argv(git), "cat-file", "--batch-check=%(objectname) %(objecttype)"],
-                                input="\n".join(pushed) + "\n", capture_output=True, text=True, timeout=60,
-                                env=git_env(git), check=True).stdout
-        pushed = tuple(ln.split(" ", 1)[0] for ln in listed.splitlines() if ln.endswith(" commit"))
-    if git("rev-list", "--max-count=1", "HEAD", *heads, *tips, "--not", "--remotes", *pushed, timeout=120).strip():
+    if git("rev-list", "--max-count=1", "HEAD", *heads, *tips, "--not", "--remotes", timeout=120).strip():
         return True
     tags = {ref: sha for sha, ref in refs if ref.startswith("refs/tags/")}
     if not tags or not git("rev-list", "--max-count=1", *tags.values(), "--not", "--remotes", timeout=120).strip():
@@ -2171,7 +2157,7 @@ def unpushed_commit(git, heads: list[str], pushed: tuple[str, ...] = ()) -> bool
         if ref and not ref.endswith("^{}"):
             origin[ref] = sha
     only_here = [sha for ref, sha in tags.items() if origin.get(ref) != sha]
-    return bool(only_here) and bool(git("rev-list", "--max-count=1", *only_here, "--not", "--remotes", *pushed,
+    return bool(only_here) and bool(git("rev-list", "--max-count=1", *only_here, "--not", "--remotes",
                                         timeout=120).strip())
 
 
@@ -2195,7 +2181,8 @@ def submodule_git_veto(dotgit: Path, env: dict[str, str]) -> str:
             is_gitdir = "HEAD" in files and "objects" in dirs
             if here != dotgit and is_gitdir:
                 gitdirs.append(here)
-            if any((here / d).is_symlink() for d in dirs):
+            if any((here / d).is_symlink() for d in dirs) or (here != dotgit and any(
+                    (here / f).is_symlink() for f in files if not is_gitdir)):
                 return "a symlink inside .git: git could not say what it holds"
             # a git dir's own object store, reflogs and LFS store hold no git dirs; a directory with those names
             # anywhere else (a submodule named refs) is walked
@@ -2205,45 +2192,21 @@ def submodule_git_veto(dotgit: Path, env: dict[str, str]) -> str:
     why = embedded_submodule_veto(dotgit.parent, env, SUBMODULE_DEPTH)
     if why:
         return why
-    # A submodule is checked out at the commit its superproject pins, fetched by id, so no ref names it there; the
-    # superproject's HEAD is on origin (checked first), so every commit its tree pins is on origin too. So are the
-    # pins in those submodules' own pinned trees, which each store's rev-list gets as more pushed commits.
-    try:
-        pins = tuple(gitlink_pins(dotgit.parent, env))
-    except (OSError, subprocess.SubprocessError, ValueError):
-        return "git could not list the submodule commits HEAD pins"
     for gitdir in gitdirs:
         name = os.fspath(gitdir.relative_to(dotgit))
 
         def git(*args: str, timeout: int = 120, gitdir: Path = gitdir) -> str:
             return subprocess.run(["git", "--git-dir", os.fspath(gitdir), *args], capture_output=True, text=True,
                                   timeout=timeout, env=env, check=True).stdout
-        git.argv, git.env = ["git", "--git-dir", os.fspath(gitdir)], env
         try:
             heads = [ln.split(" ", 1)[1] for ln in git("worktree", "list", "--porcelain").splitlines()
                      if ln.startswith("HEAD ")]
-            local = unpushed_commit(git, heads, pins)
+            local = unpushed_commit(git, heads)
         except (OSError, subprocess.SubprocessError, ValueError, IndexError):
             return f"git could not say whether a commit in {name} is only here"
         if local:
             return f"a commit in {name} is on no remote-tracking ref"
     return ""
-
-
-def gitlink_pins(tree: Path, env: dict[str, str], depth: int = SUBMODULE_DEPTH) -> list[str]:
-    """The submodule commits HEAD's tree pins (mode 160000 entries), and those each initialized submodule's own
-    HEAD tree pins, depth levels down. Only HEAD trees: an index or work tree may pin a commit made here."""
-    out = subprocess.run(["git", "-C", os.fspath(tree), "ls-tree", "-r", "-z", "HEAD"], capture_output=True,
-                         timeout=120, env=env, check=True).stdout
-    pins = []
-    for entry in out.split(b"\0"):
-        if entry.startswith(b"160000 commit "):
-            meta, _, path = entry.partition(b"\t")
-            pins.append(meta.split(b" ")[2].decode())
-            sub = tree / os.fsdecode(path)
-            if depth > 0 and (sub / ".git").is_file():
-                pins += gitlink_pins(sub, env, depth - 1)
-    return pins
 
 
 def embedded_submodule_veto(tree: Path, env: dict[str, str], depth: int) -> str:
@@ -2391,6 +2354,13 @@ def evict_idle_runner_checkouts(receipt: Path, floor_gib: float, home: Path | No
         # something of; a stale or bloated one anywhere else goes only when git loses nothing.
         if not why and not (under and free_now < target):
             why = runner_checkout_git_veto(checkout)
+        if not why:  # the git veto can take a minute (it may ask origin for its tags): judge the runner again now
+            try:
+                opened, cmds = process_evidence()
+            except NoEvidence as e:
+                print(f"refusing to delete idle runner checkouts: {e}", file=sys.stderr)
+                break
+            why = idle_runner_checkout_veto(runner, checkout, open_index(opened), cmds)
         size = 0
         if why:
             outcome = ("changed:modified" if why.startswith("used within")
