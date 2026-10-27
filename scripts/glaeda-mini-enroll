@@ -165,7 +165,9 @@ def unanswered_python(home: Path | None = None) -> str | None:
             out = subprocess.run([candidate, "-c", "import sys; print(*sys.version_info[:2])"],
                                  capture_output=True, text=True, timeout=PYTHON_PROBE_TIMEOUT_S, check=False)
         except subprocess.TimeoutExpired:
-            return candidate
+            if path_names_python_313(candidate):  # a bare python3 that times out could be any version
+                return candidate
+            continue
         except OSError:
             continue
         parts = out.stdout.split()
@@ -173,6 +175,20 @@ def unanswered_python(home: Path | None = None) -> str | None:
                 (int(parts[0]), int(parts[1])) >= (3, 13):
             return candidate
     return None
+
+
+def path_names_python_313(candidate: str) -> bool:
+    """Whether the candidate's own name or the file it resolves to names a Python 3.13+ (python3.13,
+    python@3.14, Versions/3.13), so a version probe it missed cannot hide an older Python."""
+    try:
+        resolved = os.path.realpath(candidate)
+    except OSError:
+        resolved = candidate
+    for path in (candidate, resolved):
+        for match in re.finditer(r"(?:python@?|Versions/)3\.(\d+)", path):
+            if int(match.group(1)) >= 13:
+                return True
+    return False
 
 
 def pick_python(explicit: str | None, home: Path | None = None) -> str | None:

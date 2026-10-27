@@ -352,13 +352,29 @@ class Python(unittest.TestCase):
         def slow(argv, **kwargs):
             raise subprocess.TimeoutExpired(argv, kwargs.get("timeout"))
         with mock.patch.object(me, "PYTHON_CANDIDATES", ("/a", "/b")), \
-             mock.patch.object(me.shutil, "which", return_value=None), \
+             mock.patch.object(me.shutil, "which", return_value=None), mock.patch.object(me, "USER_PYTHONS", ()), \
              mock.patch.object(me.os, "access", return_value=True), \
              mock.patch.object(me.subprocess, "run", side_effect=slow):
-            self.assertEqual(me.unanswered_python(Path("/nohome")), "/a")
+            self.assertIsNone(me.unanswered_python(Path("/nohome")), "a timeout names no version")
+        with mock.patch.object(me, "PYTHON_CANDIDATES", ("/opt/homebrew/bin/python3", "/opt/homebrew/bin/python3.13")), \
+             mock.patch.object(me.shutil, "which", return_value=None), mock.patch.object(me, "USER_PYTHONS", ()), \
+             mock.patch.object(me.os, "access", return_value=True), \
+             mock.patch.object(me.os.path, "realpath", side_effect=lambda p: p), \
+             mock.patch.object(me.subprocess, "run", side_effect=slow):
+            self.assertEqual(me.unanswered_python(Path("/nohome")), "/opt/homebrew/bin/python3.13",
+                             "review: a bare python3 that times out could be 3.9; only a 3.13+ name counts")
+        with mock.patch.object(me, "PYTHON_CANDIDATES", ("/opt/homebrew/bin/python3",)), \
+             mock.patch.object(me.shutil, "which", return_value=None), mock.patch.object(me, "USER_PYTHONS", ()), \
+             mock.patch.object(me.os, "access", return_value=True), \
+             mock.patch.object(me.os.path, "realpath",
+                               return_value="/opt/homebrew/Cellar/python@3.9/3.9.6/bin/python3.9"), \
+             mock.patch.object(me.subprocess, "run", side_effect=slow):
+            self.assertIsNone(me.unanswered_python(Path("/nohome")))
+        self.assertTrue(me.path_names_python_313("/x/Frameworks/Python.framework/Versions/3.14/bin/python3"))
+        self.assertFalse(me.path_names_python_313("/usr/local/bin/python3"))
         late = mock.Mock(returncode=0, stdout="3 13\n")
         with mock.patch.object(me, "PYTHON_CANDIDATES", ("/a",)), \
-             mock.patch.object(me.shutil, "which", return_value=None), \
+             mock.patch.object(me.shutil, "which", return_value=None), mock.patch.object(me, "USER_PYTHONS", ()), \
              mock.patch.object(me.os, "access", return_value=True), \
              mock.patch.object(me.subprocess, "run", return_value=late):
             self.assertEqual(me.unanswered_python(Path("/nohome")), "/a")
@@ -366,12 +382,12 @@ class Python(unittest.TestCase):
     def test_an_old_or_missing_python_is_not_unanswered(self) -> None:
         old = mock.Mock(returncode=0, stdout="3 9\n")
         with mock.patch.object(me, "PYTHON_CANDIDATES", ("/a",)), \
-             mock.patch.object(me.shutil, "which", return_value=None), \
+             mock.patch.object(me.shutil, "which", return_value=None), mock.patch.object(me, "USER_PYTHONS", ()), \
              mock.patch.object(me.os, "access", return_value=True), \
              mock.patch.object(me.subprocess, "run", return_value=old):
             self.assertIsNone(me.unanswered_python(Path("/nohome")))
         with mock.patch.object(me, "PYTHON_CANDIDATES", ("/a",)), \
-             mock.patch.object(me.shutil, "which", return_value=None), \
+             mock.patch.object(me.shutil, "which", return_value=None), mock.patch.object(me, "USER_PYTHONS", ()), \
              mock.patch.object(me.os, "access", return_value=False):
             self.assertIsNone(me.unanswered_python(Path("/nohome")))
 
