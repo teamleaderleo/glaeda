@@ -4978,6 +4978,9 @@ class DiskPassCoalesceTest(unittest.TestCase):
         workspace.mkdir(parents=True)
         before = os.getcwd()
         os.chdir(workspace)
+        path = mock.patch.dict(os.environ, {"PATH": os.pathsep.join(["rel-bin", "/usr/bin", ""])})
+        path.start()
+        self.addCleanup(path.stop)
         try:
             args = argparse.Namespace(disk="bin/glaeda-disk", runner_dir=None, dedicated_admit=Path("admit.sh"),
                                       job_log=Path("/abs/jobs.jsonl"), capacity_dir=Path("cap"), state_dir=None,
@@ -4997,6 +5000,10 @@ class DiskPassCoalesceTest(unittest.TestCase):
             self.assertEqual(os.path.realpath(args.toolchain_xcode), os.path.join(real, "Applications/Xcode.app"))
             self.assertEqual(os.path.realpath(args.capacity_dir), os.path.join(real, "cap"))
             self.assertIsNone(args.runner_dir)
+            # a relative PATH entry still finds what it found in the workspace (find_disk(None) runs after the chdir)
+            self.assertNotIn("", os.environ["PATH"].split(os.pathsep))
+            self.assertIn(os.path.join(os.fspath(hook.JOB_CWD), "rel-bin"), os.environ["PATH"].split(os.pathsep))
+            self.assertTrue(os.path.isabs(hook.GIT) and os.path.isabs(hook.LSOF))
             # the dedicated runner's admission still runs in the job's directory
             script = make_executable(workspace / "admit.sh", f"#!{sys.executable}\nimport os, sys\n"
                                      f"sys.exit(0 if os.path.realpath(os.getcwd()) == {real!r} else 7)\n")

@@ -1089,8 +1089,9 @@ NIGHTLY_BOUND_WORST_S = NIGHTLY_CAPACITY_WAIT_S + ADMISSION_WAIT_S + ADMIT_POLL_
 # The listener gate reads its runner's --capacity-units from the job-started hook glaeda-cmux-runner wrote.
 RUNNER_HOOK_SCRIPT = "glaeda-hooks/job-started.sh"
 LISTEN_SCRIPT = "glaeda-hooks/listen.sh"
-LSOF = shutil.which("lsof") or "/usr/sbin/lsof"
-GIT = shutil.which("git") or "/usr/bin/git"
+# absolute: the hook leaves the job's workspace (leave_job_workspace), so a relative PATH match would stop resolving
+LSOF = os.path.abspath(shutil.which("lsof") or "/usr/sbin/lsof")
+GIT = os.path.abspath(shutil.which("git") or "/usr/bin/git")
 # Events whose code is the repository's own, or a same-repo pull request checked below. Comment,
 # check and review-comment events can run with secrets on behalf of a fork PR, so they are left out.
 ADMITTED_EVENTS = ("push", "pull_request", "merge_group", "workflow_dispatch", "schedule", "workflow_run")
@@ -7262,6 +7263,11 @@ def leave_job_workspace(args: argparse.Namespace) -> None:
         JOB_CWD = Path(os.getcwd())
     except OSError:
         JOB_CWD = None
+    if JOB_CWD is not None and "PATH" in os.environ:
+        # a relative PATH entry (or an empty one, the cwd) keeps naming what it named here, for every later lookup
+        # (find_disk(None), shutil.which) and every child the hook starts
+        os.environ["PATH"] = os.pathsep.join(os.path.join(os.fspath(JOB_CWD), e) if not os.path.isabs(e) else e
+                                             for e in os.environ["PATH"].split(os.pathsep))
     for name in ("disk", "runner_dir", "dedicated_admit", "job_log", "capacity_dir", "state_dir", "host_lock",
                  "reservation", "toolchain_xcode"):
         value = getattr(args, name, None)
