@@ -6573,6 +6573,7 @@ def census_pass(roots: list[Path], covered: set[str], state: dict[str, Any] | No
     state["slice_at"] = now
     save_census(state, path)  # a launcher reading the state now sees this slice and does not start another
     skipped_covered: list[str] = state.setdefault("covered_skips", [])
+    skipped_files: list[str] = state.setdefault("covered_files", [])
     ancestors = {str(parent) for p in covered for parent in Path(p).parents}
     pending: list[str] = state["pending"]  # a stack: the next directory is the last entry
     rows: dict[str, list[Any]] = state["rows"]
@@ -6623,6 +6624,8 @@ def census_pass(roots: list[Path], covered: set[str], state: dict[str, Any] | No
                     children.append(child)
             elif child not in covered:  # a sized file is counted by its own size, not again here
                 files += est.st_blocks * 512
+            else:
+                skipped_files.append(child)
         cursor.clear()
         rows[str(current / CENSUS_FILES)] = [files, "unclassified", True]
         pending.extend(sorted(children, reverse=True))
@@ -6664,6 +6667,13 @@ def census_pass(roots: list[Path], covered: set[str], state: dict[str, Any] | No
     finally:
         state["complete"] = not pending and not any(p not in covered for p in skipped_covered)
         if state["complete"]:
+            # a sized file whose size has since gone from the snapshot goes back into its directory's files row
+            for gone in [f for f in skipped_files if f not in covered]:
+                with contextlib.suppress(OSError):
+                    row = rows.setdefault(str(Path(gone).parent / CENSUS_FILES), [0, "unclassified", True])
+                    row[0] += os.lstat(gone).st_blocks * 512
+            skipped_files[:] = [f for f in skipped_files if f in covered]
+        if state["complete"]:
             state["completed_at"] = now
             state["last"] = None
         save_census(state, path)
@@ -6697,8 +6707,15 @@ def _census_label(key: str, kind: str) -> str:
 def census_catalogue(census: dict[str, Any] | None) -> list[tuple[Path, int, str]]:
     if not census:
         return []
-    return [(Path(census_canon(key)), int(row[0]), "census") for key, row in census["rows"].items()
-            if isinstance(row, list) and row and isinstance(row[0], int) and row[0] > 0]
+    out = []
+    for key, row in census["rows"].items():
+        if not (isinstance(row, list) and row and isinstance(row[0], int) and row[0] > 0):
+            continue
+        # a tree deleted since the census (an apply, a finished job) no longer holds its bytes
+        if not os.path.lexists(os.path.dirname(key) if key.endswith("/" + CENSUS_FILES) else key):
+            continue
+        out.append((Path(census_canon(key)), int(row[0]), "census"))
+    return out
 
 
 def census_coverage_row(census: dict[str, Any]) -> dict[str, Any]:
@@ -9391,8 +9408,6 @@ def _main_impl(argv: list[str] | None = None) -> int:
             save_snapshot(known, at=at or None, measured_at=updated_times)
         if at and age_min > a.max_age and not a.apply:
             launch_background_refresh()
-        if not a.refresh and not a.pressure and not a.apply:  # never census a tree an apply is deleting from
-            launch_background_census()
     if at and not a.json:
         print(f"sizes from {age_min:.0f} min ago"
               f"{' (refreshing in background)' if age_min > a.max_age and not a.apply else ''};"
@@ -9410,6 +9425,10 @@ def _main_impl(argv: list[str] | None = None) -> int:
     operation = "idle" if sweep else "pressure" if a.pressure else "apply"
     RUN["mode"] = operation
     write_health_summary(shown, items, accounting, a.receipt)
+    # After accounting.json holds this run's fixed-root walk, so the census skips those roots; never from an
+    # apply, whose deletions it would race (another process's apply only leaves rows the next census drops).
+    if not a.no_snapshot and not a.refresh and not a.pressure and not a.apply:
+        launch_background_census()
     # Xcode copies are sized by a walk, so only a report shows them (the agent runs with --top 0)
     tooling = (simulator_runtimes() + (xcode_items() if a.top or a.json else [])) \
         if sweep and DARWIN and not RUNNER_CACHE_PROFILE else []

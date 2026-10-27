@@ -5897,7 +5897,8 @@ class VolumeCensusTest(unittest.TestCase):
     def test_nested_sized_paths_are_counted_once(self) -> None:
         parent, child = self.root / "parent", self.root / "parent/child"
         child.mkdir(parents=True)
-        (self.root / "small").mkdir()
+        for name in ("small", "loose", "parent/inside"):  # census rows count only trees that still exist
+            (self.root / name).mkdir()
         items = [gd.Item("projects", str(parent), 7 * gd.GIB, 2.0, "report-only"),
                  gd.Item("checkout-build", str(child), 3 * gd.GIB, 2.0, "reclaimable")]
         sizes = {str(parent): 7 * gd.GIB, str(child): 3 * gd.GIB,  # the items themselves
@@ -6045,6 +6046,22 @@ class VolumeCensusTest(unittest.TestCase):
             got = gd.filesystem_accounting([fs], [])[0]
         self.assertEqual(got["known_coverage"], 0)
         self.assertEqual(got["accounting_gap"], 2 * gd.GIB)
+
+    def test_a_sized_file_whose_size_goes_is_counted_and_deleted_trees_drop_out(self) -> None:
+        f = self.write("d/sized", 4096 * 3)
+        self.write("e/blob")
+        state = gd.census_pass([self.root], {str(f)}, budget_s=1000, clock=itertools.count().__next__,
+                               path=self.state)
+        files = state["rows"][str(self.root / "d" / gd.CENSUS_FILES)][0]
+        self.assertEqual(files, (self.root / "d").lstat().st_blocks * 512)  # the sized file is not in it
+        state = {**state, "complete": False, "pending": [str(self.root / "e")]}
+        state = gd.census_pass([self.root], set(), state, path=self.state)  # its size has gone meanwhile
+        self.assertEqual(state["rows"][str(self.root / "d" / gd.CENSUS_FILES)][0],
+                         files + f.stat().st_blocks * 512)
+        shutil.rmtree(self.root / "e")
+        census = gd.census_for(self.root.stat().st_dev, state)
+        self.assertNotIn(self.root / "e", [p for p, _, _ in gd.census_catalogue(census)])
+        self.assertIn(self.root / "d" / gd.CENSUS_FILES, [p for p, _, _ in gd.census_catalogue(census)])
 
     def test_an_unfinished_census_of_another_volume_starts_over(self) -> None:
         self.write("a/blob")
