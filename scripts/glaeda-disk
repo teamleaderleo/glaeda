@@ -93,8 +93,10 @@ git-pr-<uuid>, TemporaryDirectory.<rand>, ...): tens of thousands, each under th
 family reclaims them. user-tmp-test-residue removes entries named by TMP_TEST_RESIDUE on every apply (not only
 under pressure) once nothing in the whole entry changed for 12 hours and no process holds or names it. On a fleet
 mini with enrolled runners every entry is a candidate except the TMP_TEST_RESIDUE_KEEP names (com.apple.*, dot
-names, TemporaryItems, tmux/ssh sockets), and an unnamed one also stays while a socket sits in it. Each goes from a
-holding dir one level down, where macOS does not guard a TemporaryItems inside it. Every report shows the count
+names, TemporaryItems, tmux/ssh sockets), and an unnamed one also stays while a socket sits in it or is one.
+An entry with a TemporaryItems child (macOS guards $TMPDIR/<entry>/TemporaryItems) is moved into a holding dir
+one level down (glaeda-tmp-hold-<pid>, itself named scratch if a pass dies), walked and judged there, and deleted
+there or moved back. Every report shows the count
 ($TMPDIR entries, test scratch, untouched 12 h+; JSON tmp_test_residue) from one listing, no walk or du.
 
 A clone directly in a CI runner account's home (~/cmux) that is fetched branch after branch gains a pack per
@@ -2214,7 +2216,7 @@ TMP_TEST_RESIDUE = re.compile(
     r"(?:cmux-cli-socket|cnd-bin|git-pr-merge|git-pr|git-stage|git-hunk|cmux-home-attach-tests|cmux-file-pages"
     r"|floating-chat|header-pr|picker-listing|swift-package-test\.XXXXXX|TemporaryDirectory|cmux-claude-hooks"
     r"|swift-crash-reproducer|cmux-shortcut-routing|cmux-agent-journal-test|cmux-git-active-pwd"
-    r"|cmux-ssh-pty-replay|cmux-screenshots-tests)[-.][0-9A-Za-z]")
+    r"|cmux-ssh-pty-replay|cmux-screenshots-tests|glaeda-tmp-hold)[-.][0-9A-Za-z]")
 # On a host with enrolled runners the runner user's $TMPDIR is test scratch, and new tests keep adding prefixes
 # no list names (~47k entries under ~60 prefixes on one CI mini, 2026-10-26): there every entry is a candidate
 # under the same 12 h idle and process rules, except these, which macOS and live daemons keep.
@@ -2223,8 +2225,9 @@ TMP_TEST_RESIDUE_OTHER = "unnamed"  # the receipt's by_prefix bucket for an entr
 # macOS guards $TMPDIR/<entry>/TemporaryItems (a sandboxed app's temporary-items folder): listing, renaming or
 # removing it fails, and on macOS 27 the call blocks first. A test fixture that made one in its scratch dir left
 # that dir behind on every run (cmux-screenshots-tests-*). One level deeper the name is not guarded, so the reaper
-# reads only its own stat and moves the entry into a holding dir before deleting it.
+# moves such an entry into a holding dir, walks and judges it there like any other, and moves it back if it stays.
 TMP_GUARDED_CHILD = "TemporaryItems"
+TMP_HOLD_PREFIX = "glaeda-tmp-hold-"
 TMP_TEST_RESIDUE_WARN = 10_000  # glaeda-fleet-status warns when this many test scratch entries are past 12 h
 TMP_TEST_RESIDUE_IDLE_HOURS = DEFAULT_AGE_HOURS  # nothing in the entry changed for this long: no test run uses it
 TMP_TEST_RESIDUE_WALK_BUDGET = 20_000  # entries walked per candidate; a bigger tree is not proven idle
@@ -2236,12 +2239,14 @@ def tree_newest(path: Path, budget: int | None = None, deadline: float | None = 
                 no_sockets: bool = False) -> tuple[float, int] | None:
     """Newest mtime of path and of everything below it, and the bytes allocated to it, without following
     symlinks. None when the walk would visit more than budget entries, passes deadline (time.time()), meets
-    a directory it cannot read, another filesystem mounted below path or (no_sockets) a socket: such a tree is
-    not proven idle. A guarded TemporaryItems directly below path counts by its own stat and is never opened."""
+    a directory it cannot read, another filesystem mounted below path or (no_sockets) a socket, path itself
+    included: such a tree is not proven idle."""
     budget = TMP_TEST_RESIDUE_WALK_BUDGET if budget is None else budget
     try:
         st = path.lstat()
     except OSError:
+        return None
+    if no_sockets and stat.S_ISSOCK(st.st_mode):
         return None
     newest, used, dev = st.st_mtime, st.st_blocks * 512, st.st_dev
     stack = [os.fspath(path)] if stat.S_ISDIR(st.st_mode) else []
@@ -2262,8 +2267,7 @@ def tree_newest(path: Path, budget: int | None = None, deadline: float | None = 
                         return None
                     newest = max(newest, est.st_mtime)
                     used += est.st_blocks * 512
-                    if stat.S_ISDIR(est.st_mode) and not (e.name == TMP_GUARDED_CHILD
-                                                          and os.path.dirname(e.path) == os.fspath(path)):
+                    if stat.S_ISDIR(est.st_mode):
                         stack.append(e.path)
         except OSError:
             return None
@@ -2332,14 +2336,36 @@ def tmp_test_residue_census(tmp: Path | None = None, every_entry: bool | None = 
             "every_entry": every_entry}
 
 
-def remove_tmp_entry(tmp: Path, entry: Path, hold: Path) -> None:
-    """Delete a $TMPDIR entry from inside hold (one level deeper), where a TemporaryItems in it is not guarded."""
-    if entry.is_dir() and not entry.is_symlink():
-        hold.mkdir(exist_ok=True)
-        moved = hold / entry.name
-        os.rename(entry, moved)
-        entry = moved
-    remove(entry)
+def guarded_tmp_entry(entry: Path) -> bool:
+    """A $TMPDIR entry with a TemporaryItems child, which macOS will not let anyone list or remove in place."""
+    try:
+        return stat.S_ISDIR(entry.lstat().st_mode) and os.path.lexists(entry / TMP_GUARDED_CHILD)
+    except OSError:
+        return False
+
+
+def judge_tmp_entry(entry: Path, hold: Path, opened: frozenset[str], cmds: str, now: float,
+                    deadline: float | None, unnamed: bool) -> tuple[str, int, Path]:
+    """tmp_test_residue_veto for one $TMPDIR entry, and the path it now sits at. A guarded entry is first vetoed
+    by its own name (open files, cwds, commands), then moved into hold, where it can be walked; one that must stay
+    moves back to its name."""
+    if not guarded_tmp_entry(entry):
+        return (*tmp_test_residue_veto(entry, opened, cmds, now, deadline=deadline, unnamed=unnamed), entry)
+    path = os.fspath(entry)
+    if in_cwd(path, opened):
+        return "open or a working directory of a process", 0, entry
+    if named_by(path, cmds):
+        return "named by a running command", 0, entry
+    hold.mkdir(exist_ok=True)
+    moved = hold / entry.name
+    os.rename(entry, moved)
+    why, used = tmp_test_residue_veto(moved, opened, cmds, now, deadline=deadline, unnamed=unnamed)
+    if why:
+        if os.path.lexists(entry):  # a test made a new one meanwhile: the old one waits in hold for the next pass
+            return why, used, moved
+        os.rename(moved, entry)
+        return why, used, entry
+    return "", used, moved
 
 
 def reap_tmpdir_test_residue(receipt: Path, tmp: Path | None = None, halt=None,
@@ -2354,7 +2380,9 @@ def reap_tmpdir_test_residue(receipt: Path, tmp: Path | None = None, halt=None,
     tmp = (darwin_user_tmp() if DARWIN else None) if tmp is None else tmp
     if tmp is None or tmp.is_symlink() or not tmp.is_dir():
         return 0
-    hold = tmp / f"{DELETING_PREFIX}{TMP_TEST_RESIDUE_FAMILY}-{os.getpid()}"
+    # Not a DELETING_PREFIX name: interrupted-deletions would finish a leftover without judging it. A hold a killed
+    # pass left is named test scratch itself, walked and judged like any other entry.
+    hold = tmp / f"{TMP_HOLD_PREFIX}{os.getpid()}"
     start = now = time.time()
     names = []
     try:
@@ -2390,20 +2418,23 @@ def reap_tmpdir_test_residue(receipt: Path, tmp: Path | None = None, halt=None,
             evidence, read_at = (open_index(opened), cmds), time.time()
         entry = tmp / name
         prefix = tmp_test_residue_prefix(name, every_entry)
-        why, used = tmp_test_residue_veto(entry, evidence[0], evidence[1], time.time(),
-                                          deadline=start + TMP_TEST_RESIDUE_BUDGET_S,
-                                          unnamed=prefix == TMP_TEST_RESIDUE_OTHER)
+        try:
+            why, used, entry = judge_tmp_entry(entry, hold, evidence[0], evidence[1], time.time(),
+                                               start + TMP_TEST_RESIDUE_BUDGET_S, prefix == TMP_TEST_RESIDUE_OTHER)
+        except OSError as e:
+            kept[f"incomplete:{e.__class__.__name__}"] += 1
+            continue
         if why:
             kept[why.split(" (")[0]] += 1
             continue
         try:
-            remove_tmp_entry(tmp, entry, hold)
+            remove(entry)
         except OSError as e:
             kept[f"incomplete:{e.__class__.__name__}"] += 1
             continue
         removed[prefix] += 1
         released += used
-    with contextlib.suppress(OSError):  # empty once every move was deleted; a leftover is an interrupted deletion
+    with contextlib.suppress(OSError):  # empty once every move was deleted or moved back
         hold.rmdir()
     rec = {"at": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "host": platform.node(),
            "outcome": "reclaimed" if removed else "none", "family": TMP_TEST_RESIDUE_FAMILY,

@@ -5073,32 +5073,69 @@ class GlaedaDiskTest(unittest.TestCase):
         with mock.patch.object(gd.os, "scandir", scandir):
             self.assertIsNone(gd.tree_newest(e["socket"]))
 
+    def _guarded_scandir(self, tmp: Path):
+        """os.scandir as macOS behaves: $TMPDIR/<entry>/TemporaryItems cannot be listed (a CI mini blocks, then fails)."""
+        real_scandir = os.scandir
+
+        def scandir(path):
+            p = Path(os.fspath(path)) if isinstance(path, (str, os.PathLike)) else None
+            if p is not None and p.name == gd.TMP_GUARDED_CHILD and p.parent.parent == tmp:
+                raise InterruptedError(errno.EINTR, "guarded")
+            return real_scandir(path)
+        return mock.patch.object(gd.os, "scandir", scandir)
+
     def test_tmpdir_test_residue_reaps_screenshots_scratch_with_a_guarded_temporary_items(self) -> None:
-        """macOS guards $TMPDIR/<entry>/TemporaryItems: never opened, and the entry goes from one level down."""
+        """An entry with a guarded TemporaryItems is walked from one level down, then deleted there."""
         tmp, e = self._tmp_residue()
         shot = tmp / "cmux-screenshots-tests-00303B44-B4A7-458D-9A15-8674711569DB"
         (shot / "TemporaryItems").mkdir(parents=True)
         self._age(shot, hours=72)
-        real_scandir, real_remove, removed_from = os.scandir, gd.remove, []
-
-        def scandir(path):
-            if isinstance(path, (str, os.PathLike)) and os.fspath(path) == os.fspath(shot / "TemporaryItems"):
-                raise InterruptedError(errno.EINTR, "guarded")  # a CI mini blocks, then fails
-            return real_scandir(path)
-
-        def remove(path, after_rename=None):
-            removed_from.append(path.parent.name)
-            real_remove(path, after_rename)
+        fresh = tmp / "cmux-screenshots-tests-012B59EA-CD57-4ADE-86DF-CB2F2196EA54"
+        (fresh / "TemporaryItems").mkdir(parents=True)
+        (fresh / "TemporaryItems/shot.png").write_bytes(b"png")
+        self._age(fresh, hours=72)
+        os.utime(fresh / "TemporaryItems/shot.png", None)  # written just now: no ancestor mtime shows it
         receipt = self.receipt()
-        with mock.patch.object(gd.os, "scandir", scandir), mock.patch.object(gd, "remove", remove), \
-                contextlib.redirect_stdout(io.StringIO()):
-            self.assertIsNotNone(gd.tree_newest(shot))  # the guarded child is read by its stat only
+        with self._guarded_scandir(tmp), contextlib.redirect_stdout(io.StringIO()):
+            self.assertIsNone(gd.tree_newest(shot))  # in place it cannot be walked: not proven idle
             gd.reap_tmpdir_test_residue(receipt, tmp)
         self.assertFalse(shot.exists())
-        hold = f"{gd.DELETING_PREFIX}{gd.TMP_TEST_RESIDUE_FAMILY}-{os.getpid()}"
-        self.assertIn(hold, removed_from)  # deleted from the holding dir, one level below $TMPDIR
-        self.assertFalse((tmp / hold).exists())
-        self.assertEqual(json.loads(receipt.read_text())["by_prefix"]["cmux-screenshots-tests"], 1)
+        self.assertTrue((fresh / "TemporaryItems/shot.png").is_file())  # judged in the hold, then moved back
+        self.assertEqual([p.name for p in tmp.iterdir() if p.name.startswith(gd.TMP_HOLD_PREFIX)], [])
+        rec = json.loads(receipt.read_text())
+        self.assertEqual(rec["by_prefix"]["cmux-screenshots-tests"], 1)
+        self.assertEqual(rec["kept"][f"changed within {gd.TMP_TEST_RESIDUE_IDLE_HOURS:g}h"], 2)  # fresh, inner-recent
+
+    def test_tmpdir_test_residue_guarded_entry_is_vetoed_by_name_before_it_moves(self) -> None:
+        tmp, e = self._tmp_residue()
+        shot = tmp / "cmux-screenshots-tests-00303B44-B4A7-458D-9A15-8674711569DB"
+        (shot / "TemporaryItems").mkdir(parents=True)
+        self._age(shot, hours=72)
+        gd.process_evidence = lambda: ([str(shot)], "")
+        renames = []
+        real_rename = os.rename
+        with self._guarded_scandir(tmp), mock.patch.object(gd.os, "rename",
+                                                           lambda a, b: (renames.append(a), real_rename(a, b))), \
+                contextlib.redirect_stdout(io.StringIO()):
+            gd.reap_tmpdir_test_residue(self.receipt(), tmp)
+        self.assertTrue((shot / "TemporaryItems").is_dir())
+        self.assertNotIn(shot, [Path(os.fspath(r)) for r in renames])
+
+    def test_tmpdir_test_residue_keeps_a_top_level_socket(self) -> None:
+        tmp, e = self._tmp_residue()
+        cwd, sock = os.getcwd(), socket.socket(socket.AF_UNIX)
+        try:
+            os.chdir(tmp)
+            sock.bind("service-sock")
+        finally:
+            os.chdir(cwd)
+        os.utime(tmp / "service-sock", (time.time() - 72 * 3600,) * 2)
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                gd.reap_tmpdir_test_residue(self.receipt(), tmp, every_entry=True)
+        finally:
+            sock.close()
+        self.assertTrue(stat.S_ISSOCK((tmp / "service-sock").lstat().st_mode))
 
     def test_tmpdir_test_residue_on_a_runner_host_takes_every_unkept_entry(self) -> None:
         tmp, e = self._tmp_residue()
