@@ -5917,16 +5917,18 @@ class VolumeCensusTest(unittest.TestCase):
         self.write("sized/b", 16384)
         item = self.write("holder/item/blob").parent
         self.write("holder/loose")
+        sized_file = self.write("holder/sized-file", 4096 * 5)  # sized on its own: not in the files row too
         self.write("holder/other/deep/blob", 12288)
         self.write("plain/x/y", 4096)
         self.write("rootfile")
-        covered = {str(sized), str(item)}
+        covered = {str(sized), str(item), str(sized_file)}
         state = gd.census_pass([self.root], covered, path=self.state)
         self.assertTrue(state["complete"])
         self.assertIn(str(self.root / "plain"), state["rows"])
         self.assertIn(str(self.root / "holder/other"), state["rows"])
         self.assertNotIn(str(sized), state["rows"])
-        sizes = {p: self.du(Path(p)) for p in covered}
+        sizes = {p: (Path(p).stat().st_blocks * 512 if Path(p).is_file() else self.du(Path(p)))
+                 for p in covered}
         got = gd.filesystem_accounting([self.fs(self.du(self.root))], [], sizes)[0]
         self.assertEqual(got["accounting_gap"], 0)
         self.assertEqual(got["measured"], got["used"])
@@ -5947,7 +5949,7 @@ class VolumeCensusTest(unittest.TestCase):
 
         def census_du(path, timeout):
             if path == locked:
-                return 4096, False  # du printed "Permission denied" and a lower bound
+                return 0, False  # du printed "Permission denied" and nothing it could read
             return real_du(path, timeout)
 
         with mock.patch.object(gd.os, "scandir", side_effect=scandir), \
@@ -5960,6 +5962,63 @@ class VolumeCensusTest(unittest.TestCase):
         row = next(r for r in got["coverage"] if r["scope"] == gd.CENSUS_SCOPE)
         self.assertIn(f"unreadable:{locked}", [c["category"] for c in row["children"]])
         self.assertIn("unreadable", got["residual"]["category"])
+
+    def test_paths_share_one_namespace_and_other_homes_stay_private(self) -> None:
+        gd._CENSUS_FIRMLINK_MEM.clear()
+        self.addCleanup(gd._CENSUS_FIRMLINK_MEM.clear)
+        with mock.patch.object(gd, "_firmlinked", return_value=True), \
+                mock.patch.object(gd, "_private_link", return_value=True):
+            self.assertEqual(gd.census_canon("/System/Volumes/Data/Users/x/y"), "/Users/x/y")
+            self.assertEqual(gd.census_canon("/var/folders/ab"), "/private/var/folders/ab")
+            self.assertEqual(gd.census_canon("/private/var/folders/ab"), "/private/var/folders/ab")
+            self.assertEqual(gd._census_label("/System/Volumes/Data/Users/someone-else/Library", "unreadable"),
+                             "unreadable:private-user-data")
+        with mock.patch.object(gd, "_firmlinked", return_value=False), \
+                mock.patch.object(gd, "_private_link", return_value=False):
+            self.assertEqual(gd.census_canon("/var/lib/x"), "/var/lib/x")
+            self.assertEqual(gd._census_label("/System/Volumes/Data/Users/someone-else", "unreadable"),
+                             "unreadable:private-user-data")
+
+    def test_shared_coverage_is_not_subtracted_twice_before_a_census(self) -> None:
+        fs = self.fs(10 * gd.GIB)
+        gd.DARWIN = True
+        coverage = [{"scope": "shared-fleet", "complete": True,
+                     "children": [{"category": "cache", "bytes": 6 * gd.GIB}]}]
+        canon = gd.census_canon
+        with mock.patch.object(gd, "fixed_measurement_roots", return_value=[self.root]), \
+                mock.patch.object(gd, "du_bytes", return_value=6 * gd.GIB), \
+                mock.patch.object(gd, "accounting_coverage", return_value=coverage), \
+                mock.patch.object(gd, "apfs_container_capacity", return_value=None), \
+                mock.patch.object(gd, "census_canon", side_effect=lambda p: (
+                    "/Users/Shared/cmux-build-fleet/cache" if p == str(self.root) else canon(p))):
+            got = gd.filesystem_accounting([fs], [])[0]
+        self.assertEqual(got["measured"], 6 * gd.GIB)
+        self.assertEqual(got["accounting_gap"], 4 * gd.GIB)
+        self.assertTrue(got["residual"]["category"].startswith("unwalked"))
+
+    def test_a_running_slice_blocks_another_launch(self) -> None:
+        saved = (gd.CENSUS_LOCK, gd.CENSUS_AUTOLAUNCH, gd.census_roots)
+        gd.CENSUS_LOCK, gd.CENSUS_AUTOLAUNCH = Path(self.tmp.name) / "census.lock", True
+        gd.census_roots = lambda: [self.root]
+        self.addCleanup(lambda: (setattr(gd, "CENSUS_LOCK", saved[0]), setattr(gd, "CENSUS_AUTOLAUNCH", saved[1]),
+                                  setattr(gd, "census_roots", saved[2])))
+        held = gd._census_lock()
+        self.addCleanup(held.close)
+        with mock.patch.object(gd.subprocess, "Popen", side_effect=AssertionError("spawned")):
+            self.assertFalse(gd.launch_background_census())
+        held.close()
+        with mock.patch.object(gd.subprocess, "Popen") as popen:
+            self.assertTrue(gd.launch_background_census())
+        self.assertIn("--census-lock-fd", popen.call_args.args[0])
+
+    def test_a_sized_dir_whose_size_goes_is_walked_before_completion(self) -> None:
+        a, b = self.write("a/blob").parent, self.write("b/blob").parent
+        state = {"schema": "glaeda-disk-census/v1", "started_at": 1.0, "dev": self.root.stat().st_dev,
+                 "complete": False, "pending": [str(b)], "rows": {}, "covered_skips": [str(a)]}
+        got = gd.census_pass([self.root], set(), state, path=self.state)
+        self.assertTrue(got["complete"])
+        self.assertIn(str(a), got["rows"])
+        self.assertIn(str(b), got["rows"])
 
     def test_cadence_is_daily_and_a_slice_stops_at_its_budget_then_resumes(self) -> None:
         now = 1_000_000.0
