@@ -5648,8 +5648,10 @@ def note_waiter_refusal(state_dir: Path, why: str) -> None:
     with contextlib.suppress(OSError):
         state_dir.mkdir(parents=True, exist_ok=True)
         path = state_dir / WAITER_SEEN_FILE
-        path.touch()
-        os.utime(path, ns=(time.time_ns(), time.time_ns()))  # a fresh stamp even within the filesystem's tick
+        try:  # one stamp per refusal: a new file's creation, else one utime (APFS keeps nanoseconds)
+            os.utime(path)
+        except FileNotFoundError:
+            os.close(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o644))
 
 
 def refused_note(state_dir: Path, worker: int) -> Path:
