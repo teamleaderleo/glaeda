@@ -628,7 +628,8 @@ CMUX_NEXT_DRAIN_HOOK_SHA256 = frozenset({
     "d5e73be990d67d9499ff352d01fda2e1392a6fd257a57770b23008b3bf55fb59",
     "0c2c8880e3b17af8324f8304121c4159bee8ade5c31496b9af713586cb90bcfc",
     "fca8abb34684680ad0344a7a82b0ee8b2b476f6490407de27eb410904f5fac91",
-    "1fc7691585b12980a7edb2b071b44bdccef1c9f729a5fb0a8adca20dc004b593",
+    "cb76c42f0a448eb18bc95e7f3da175602b6ace77579b4130a61d14df9eeaf94e",
+    "f384448fceb64d9827d072a362e6a8c7ade041c00679486532b4d8d2b76592a3",
 })
 CMUX_NEXT_CI_PRESERVED_NAMES = frozenset({
     "SourcePackages", "ModuleCache.noindex", "SDKStatCaches.noindex",
@@ -1718,6 +1719,9 @@ def seed_verdict(path: Path) -> str:
 
 WORKTREE_DIRS = ("worktrees", "cmux-worktrees", "glaeda-worktrees")
 CHECKOUT_BUILD_IDLE_HOURS = DEFAULT_AGE_HOURS
+# The runner-account cache profile (runner_cache_families): 168 h before the 12 h default, and 168 h again on a
+# reserved host, where keep_legacy_ages puts it back.
+RUNNER_CACHE_IDLE_HOURS = DEFAULT_AGE_HOURS
 
 
 def _checkout_git(checkout: Path, *args: str) -> list[str]:
@@ -2595,26 +2599,26 @@ def runner_cache_families() -> list[Family]:
     roots = [
         Family("xcode-derived-data", HOME / "Library/Developer/Xcode/DerivedData", True,
                "next xcodebuild rebuilds it", owner="Xcode, per checkout", rebuild_minutes=15,
-               build_output=True, min_idle_hours=DEFAULT_AGE_HOURS, platform="macos"),
+               build_output=True, min_idle_hours=RUNNER_CACHE_IDLE_HOURS, platform="macos"),
         Family("cmux-job-cache", HOME / ".cache/cmux-job", True,
                "next cmux reload or CI job rebuilds it", depth=2, git_disposable=True,
-               owner="cmux reload-cloud", rebuild_minutes=30, min_idle_hours=DEFAULT_AGE_HOURS,
+               owner="cmux reload-cloud", rebuild_minutes=30, min_idle_hours=RUNNER_CACHE_IDLE_HOURS,
                mirror_idle_hours=CMUX_JOB_MIRROR_HOURS, platform="macos"),
         Family("cmux-ghosttykit-cache", HOME / ".cache/cmux/ghosttykit", True,
                "cmux rebuilds GhosttyKit", depth=1, files=True,
-               owner="cmux build tooling", rebuild_minutes=5, min_idle_hours=DEFAULT_AGE_HOURS,
+               owner="cmux build tooling", rebuild_minutes=5, min_idle_hours=RUNNER_CACHE_IDLE_HOURS,
                platform="macos"),
         Family("cua-recordings", HOME / "Library/Application Support/cua-ssh/recordings", True,
                "the CUA recorder can capture it again", depth=1, files=True,
                skip=("index.json", "manifest.json", "state.json", ".metadata_never_index", ".lock"),
-               owner="CUA recorder", rebuild_minutes=2, min_idle_hours=DEFAULT_AGE_HOURS, platform="macos"),
+               owner="CUA recorder", rebuild_minutes=2, min_idle_hours=RUNNER_CACHE_IDLE_HOURS, platform="macos"),
         Family("cua-cache", HOME / "Library/Caches/cmux/cmux-cua", True,
                "the CUA client rebuilds its frame cache", depth=1, files=True,
                skip=("index.json", "manifest.json", "state.json", ".metadata_never_index", ".lock"),
-               owner="cmux CUA", rebuild_minutes=1, min_idle_hours=DEFAULT_AGE_HOURS, platform="macos"),
+               owner="cmux CUA", rebuild_minutes=1, min_idle_hours=RUNNER_CACHE_IDLE_HOURS, platform="macos"),
     ]
     if (HOME / "Library/Caches" / CMUX_NEXT_CI_ROOT).is_dir():
-        roots.append(replace(cmux_next_ci_family(), min_idle_hours=DEFAULT_AGE_HOURS))
+        roots.append(replace(cmux_next_ci_family(), min_idle_hours=RUNNER_CACHE_IDLE_HOURS))
     return [f for f in roots if f.root.is_dir()]
 
 
@@ -5832,7 +5836,8 @@ LEGACY_AGES = {"DEFAULT_AGE_HOURS": 24.0, "KEPT_BUILD_IDLE_HOURS": 24.0, "IDLE_S
                "PARKED_NO_LOG_IDLE_HOURS": 168.0, "CMUX_NEXT_CI_MIN_IDLE_HOURS": 72.0,
                "CANONICAL_ADMISSION_IDLE_HOURS": 24.0, "IDLE_SEED_HOURS": 12.0, "RUNTIME_IDLE_DAYS": 14.0,
                "CHECKOUT_BUILD_IDLE_HOURS": 24.0, "TMP_TEST_RESIDUE_IDLE_HOURS": 48.0,
-               "RUNNER_STALE_CHECKOUT_HOURS": float("inf"), "CMUX_JOB_MIRROR_HOURS": 168.0}
+               "RUNNER_STALE_CHECKOUT_HOURS": float("inf"), "RUNNER_CACHE_IDLE_HOURS": 168.0,
+               "CMUX_JOB_MIRROR_HOURS": 168.0}
 LEGACY_POLICY = {"soft_idle_hours": 24.0, "stale_marker_max_hours": 48.0, "cmux_next_ci_host_idle_hours": 48.0}
 
 
@@ -8685,6 +8690,10 @@ def _main_impl(argv: list[str] | None = None) -> int:
         runner_repack_due = ((sweep or a.pressure) and ROLE == "fleet-mini" and not RUNNER_CACHE_PROFILE
                              and not a.cmux_next_drain and not reserved
                              and (not a.family or RUNNER_CHECKOUT_REPACK_FAMILY in a.family))
+        # the fleet compilation-cache node store's hard cap, on every pressure pass: the runner hook's pass before each
+        # job and its floor eviction run this one (glaeda-fleet-cas-prune keeps its own working-set rule)
+        if a.pressure and ROLE == "fleet-mini" and not RUNNER_CACHE_PROFILE and not a.cmux_next_drain and not a.family:
+            logical_released += fleet_cas_node_cap()
         remaining = []
         for fs in shown:
             try:
@@ -8763,6 +8772,31 @@ def _owner_line(owner: Any) -> dict[str, Any] | None:
     return {"pid": owner.get("pid"), "command": str(owner.get("command") or "")[:120] or None,
             "since": time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(started))
             if isinstance(started, (int, float)) else None}
+
+
+FLEET_CAS_ROOT = FLEET_ROOT / "xcode"
+FLEET_CAS_PRUNE_TIMEOUT_S = 300.0
+
+
+def fleet_cas_node_cap(root: Path | None = None, prune: Path | None = None) -> int:
+    """Run `glaeda-fleet-cas-prune --apply --node-only` (installed beside this script) on a host with fleet-cas, bounded
+    by FLEET_CAS_PRUNE_TIMEOUT_S; the bytes it reports freed, 0 when it is absent, fails or freed nothing. Never raises."""
+    root = FLEET_CAS_ROOT if root is None else root
+    prune = Path(os.path.abspath(__file__)).with_name("glaeda-fleet-cas-prune") if prune is None else prune
+    if not (root / "fleet-cas.env").is_file() or not prune.is_file():
+        return 0
+    try:
+        out = subprocess.run([sys.executable, os.fspath(prune), "--apply", "--node-only"], capture_output=True,
+                             text=True, timeout=FLEET_CAS_PRUNE_TIMEOUT_S, check=False,
+                             env={**os.environ, "GLAEDA_FLEET_CAS_ROOT": os.fspath(root)})
+        rec = json.loads(out.stdout.strip().splitlines()[-1]) if out.stdout.strip() else {}
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return 0
+    m = re.match(r"removed (\d+) oldest files, ([0-9.]+) GiB", str(rec.get("node_store") or ""))
+    if not m:
+        return 0
+    print(f"  fleet-cas node store: {rec['node_store']}")
+    return int(float(m.group(2)) * GIB)
 
 
 def write_run_line(started: float, free_before: int | None) -> None:
