@@ -1592,8 +1592,9 @@ def stop_if_idle(ctx: Context, stop: Callable[[], bool] | None = None, listener_
         return bool((stop or (lambda: bootout(ctx)))())
 
 
-def relabel(ctx: Context, act: dict[str, Any]) -> None:
-    """Re-register this runner under the same name with the manifest's labels. _work stays."""
+def relabel(ctx: Context, act: dict[str, Any], stopped: Callable[[], None] | None = None) -> None:
+    """Re-register this runner under the same name with the manifest's labels. _work stays. `stopped` runs once the
+    runner is confirmed stopped and idle, before it registers and starts again."""
     def unregister() -> bool:  # with its listeners frozen and idle: none can take a job before the files go
         for name in LOCAL_REGISTRATION:
             (ctx.runner_dir / name).unlink(missing_ok=True)
@@ -1606,6 +1607,8 @@ def relabel(ctx: Context, act: dict[str, Any]) -> None:
         return
     if not ctx.skip_launchctl:
         ctx.agent_started = False  # stopped now, whatever the plan saw; the agent step reads this
+    if stopped is not None:
+        stopped()
     act["replace"] = True
     register(ctx, act)
     if act["state"] != "failed" and dedicated_of(ctx):
@@ -1714,15 +1717,16 @@ def apply_install(ctx: Context, actions: list[dict[str, Any]], receipt_doc: dict
                                                "name": ctx.name, "labels": ctx.labels,
                                                "runnerId": act.get("runnerId")}
         elif kind == "register" and state == "relabel":
-            if dedicated_of(ctx):
-                # its hooks (the admission wrapper) first: relabel starts the listener, and its first job must meet
-                # the manifest's admission, not the one being replaced
+            def write_hooks() -> None:
+                # a dedicated runner's hooks (its admission wrapper) once it is stopped and before relabel starts it
+                # again: its first job meets the manifest's admission, and a runner relabel could not stop (a job)
+                # keeps its old labels with its old admission
                 for hook_act in [a for a in actions if a["kind"] == "hook" and a["state"] in {"create", "update"}]:
                     data, mode = desired_files(ctx)[Path(hook_act["path"])]
                     write_atomic(Path(hook_act["path"]), data, mode)
                     hook_act["applied"] = hook_act["owned"] = True
                     hook_act["ownedSha256"] = hook_act["sha256"]
-            relabel(ctx, act)
+            relabel(ctx, act, write_hooks if dedicated_of(ctx) else None)
             if act["state"] != "failed":
                 receipt_doc["registration"] = {**(receipt_doc.get("registration") or {}), "labels": ctx.labels,
                                                "runnerId": act.get("runnerId"), "owned": True}

@@ -9582,6 +9582,22 @@ class DedicatedRunnerTest(unittest.TestCase):
             self.invoke("--apply", "--manifest", self.manifest(), "--member", "mini-std", "--dedicated", "nightly-next")
         changed = {**NIGHTLY, "labels": [*NIGHTLY["labels"], "glaeda-extra"],
                    "admit": ["/usr/bin/python3", "~/nightly-builder/nightly_builder.py", "admit", "--strict"]}
+        old_wrapper = wrapper.read_text()
+        (self.state / "loaded.json").write_text(json.dumps(["com.teamleaderleo.glaeda.cmux-runner.dedicated.nightly-next"]))
+        with mock.patch.object(cr.pwd, "getpwuid", return_value=fake_pw), \
+                mock.patch.object(cr, "runner_busy", return_value=True):
+            busy = self.invoke("--apply", "--manifest", self.manifest(changed), "--member", "mini-std",
+                               "--dedicated", "nightly-next", expect=1)
+        self.assertIn(self.by_kind(busy)["register"]["state"], {"failed", "blocked"})
+        self.assertEqual(wrapper.read_text(), old_wrapper, "a runner under a job keeps its old labels and admission")
+        # a job that starts between the plan and the stop: relabel fails and writes no hook either
+        with mock.patch.object(cr.pwd, "getpwuid", return_value=fake_pw), \
+                mock.patch.object(cr, "stop_if_idle", return_value=False):
+            raced = self.invoke("--apply", "--manifest", self.manifest(changed), "--member", "mini-std",
+                                "--dedicated", "nightly-next", expect=1)
+        self.assertEqual(self.by_kind(raced)["register"]["state"], "failed")
+        self.assertEqual(wrapper.read_text(), old_wrapper, "the stop failed: the old admission stays")
+        (self.state / "loaded.json").unlink()
         seen = []
         real_start = cr.start_agent
 
