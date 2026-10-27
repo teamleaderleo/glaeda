@@ -137,6 +137,8 @@ def healthy(mirror: Path) -> str:
     """'' when `mirror` is a usable full mirror, else why not."""
     if not (mirror / "HEAD").is_file():
         return "missing"
+    if (mirror / REPAIR_PENDING).exists():
+        return "repair pending"
     try:
         if git(mirror, "rev-parse", "--is-shallow-repository", timeout=30).strip() != "false":
             return "shallow"
@@ -279,6 +281,9 @@ def seed_from_bundle(staging: Path, work: Path, fetch_url: Callable[[str, Path, 
     raise RuntimeError(f"no archive for {key}: {last}")
 
 
+# Written before a repair changes anything and removed only once it verified, so a repair killed part way
+# (SIGKILL, a reboot) still reads as broken and the next pass repairs again.
+REPAIR_PENDING = "glaeda-repair-pending"
 PARTIAL_KEYS = ("remote.origin.promisor", "remote.origin.partialclonefilter", "extensions.partialclone")
 
 
@@ -313,6 +318,7 @@ def fill(repo: Path, work: Path, from_github: bool, fetch_url: Callable[[str, Pa
 def verify(repo: Path) -> None:
     """Every branch is fully connected (no missing object), and the repository reads as healthy."""
     git(repo, "fsck", "--connectivity-only", "--no-dangling", "--no-progress", timeout=DOWNLOAD_TIMEOUT)
+    (repo / REPAIR_PENDING).unlink(missing_ok=True)  # the history is proven whole
     problem = healthy(repo)
     if problem:
         raise RuntimeError(f"after the seed the mirror is still {problem}")
@@ -344,6 +350,11 @@ def seed(mirror: Path, from_github: bool, fetch_url: Callable[[str, Path, float]
             raise RuntimeError(f"{mirror} is not a directory; left for an operator")
         # Re-initializing an existing repository keeps its objects and refs (and writes a missing HEAD).
         git(mirror.parent, "init", "--quiet", "--bare", os.fspath(mirror), timeout=60)
+        pending = mirror / REPAIR_PENDING
+        with pending.open("w") as marker:
+            marker.write(f"{dt.datetime.now(dt.timezone.utc).isoformat()}\n")
+            marker.flush()
+            os.fsync(marker.fileno())
         # The guard would refuse the unshallowing a full fetch into a shallow repository does.
         lock_dir = mirror / "shallow.lock"
         if lock_dir.is_dir():

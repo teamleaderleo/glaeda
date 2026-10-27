@@ -247,6 +247,26 @@ class Mirror(unittest.TestCase):
         self.assertFalse((self.mirror / "refs/heads/main.lock").exists())
         self.assertFalse((self.mirror / "config.lock").exists())
 
+    def test_a_repair_killed_part_way_still_reads_as_broken(self) -> None:
+        gm.run(True, home=self.home)
+        sh("git", "-C", os.fspath(self.mirror), "config", "remote.origin.promisor", "true")
+        real = gm.fill
+
+        def killed(repo, *args):
+            raise KeyboardInterrupt  # stands in for SIGKILL: no restore runs past the marker
+        gm.fill = killed
+        try:
+            with self.assertRaises(KeyboardInterrupt):
+                gm.seed(self.mirror, False, self.fake_download)
+        finally:
+            gm.fill = real
+        sh("git", "-C", os.fspath(self.mirror), "config", "--unset-all", "remote.origin.promisor")  # as if lost
+        self.assertEqual(gm.healthy(self.mirror), "repair pending")
+        result = gm.run(True, home=self.home)
+        self.assertEqual(result["state"], "applied", result)
+        self.assertEqual(result["seeded"]["because"], "repair pending")
+        self.assertFalse((self.mirror / gm.REPAIR_PENDING).exists())
+
     def test_a_failed_repair_keeps_the_mirror_marked_broken(self) -> None:
         self.commit("two")
         gm.run(True, home=self.home)
