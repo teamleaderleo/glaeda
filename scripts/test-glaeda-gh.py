@@ -8239,6 +8239,21 @@ class DaemonPolicyTest(Base):
         self.assertEqual(self.gh.gql_calls(), [])
         self.assertEqual(len(self.gh.job_calls()), 1)
 
+    def test_an_unanswered_job_list_is_not_asked_again_at_the_cap_over_graphql(self) -> None:
+        self.gh.runs[7] = {"id": 7, "name": "CI", "display_title": "fix", "status": "completed", "conclusion": "failure",
+                           "html_url": "https://github.com/o/r/actions/runs/7", "head_sha": "b" * 40, "head_branch": "x",
+                           "event": "push", "run_attempt": 1, "created_at": iso(NOW - 99), "updated_at": iso(NOW - 9)}
+        self.gh.jobs[7] = []  # an empty answer leaves the attempt without jobs
+        key = gg.parse_key("run", "o/r/7")
+        self.daemon.budget = {"rest": {"limit": 5000, "remaining": 4500, "reset": NOW + 1800},
+                              "graphql": {"limit": 5000, "remaining": 4000, "reset": NOW + 1800}}
+        self.spend_rest(2000, at=NOW)
+        for i in range(4):  # inside TERMINAL_GRACE, a reader newer than each read: re-read every cycle
+            gg.register(key)
+            self.daemon.tick(NOW + i * gg.CYCLE / 2 + i)
+        self.assertGreaterEqual(len(self.gh.gql_calls()), 2)  # the run itself is re-read over GraphQL
+        self.assertEqual(len(self.gh.job_calls()), 1)
+
     def test_an_unanswered_job_list_is_not_asked_again_at_the_cap(self) -> None:
         failed = {"id": 7, "name": "CI", "display_title": "fix", "status": "completed", "conclusion": "failure",
                   "html_url": "https://github.com/o/r/actions/runs/7", "head_sha": "b" * 40, "head_branch": "x",
@@ -8254,7 +8269,7 @@ class DaemonPolicyTest(Base):
         for i in range(4):  # inside TERMINAL_GRACE, so the finished run stays watched
             gg.register(key)
             self.daemon.tick(NOW + i * 25)
-            self.assertEqual(self.daemon.jobs_tried, {key: 1})
+            self.assertEqual(self.daemon.jobs_tried.get(key), 1)
         self.assertEqual(len(self.gh.job_calls()), 1)
         # a new attempt is a new exemption
         cached = gg.read_cache(key)

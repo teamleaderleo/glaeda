@@ -1765,12 +1765,9 @@ class Daemon:
             # read that the share admits (the run's own) still fills it in.
             if kind == "run" and self.mode("rest") != "stop":
                 self.jobs_only = [e for e in mine if self.failed_without_jobs(e)
-                                  and self.jobs_tried.get(e["key"]) != ((e["cache"] or {}).get("data") or {}).get("run_attempt")]
+                                  and self.jobs_tried.get(e["key"]) != (((e["cache"] or {}).get("data") or {}).get("run_attempt") or 1)]
                 for e in self.jobs_only:
                     self.attempted[e["key"]] = self.now
-                    self.jobs_tried[e["key"]] = (e["cache"].get("data") or {}).get("run_attempt")
-                live = {e["key"] for e in mine}
-                self.jobs_tried = {k: v for k, v in self.jobs_tried.items() if k in live}
             return []
         if kind == "head":
             return self.due_heads(mine, mode)
@@ -1969,6 +1966,8 @@ class Daemon:
         oldest = self.oldest_data(entries, {e["key"] for e in prs + runs + comments + heads})
         self.prune({e["key"] for e in entries})
         self.post_prune()
+        live = {e["key"] for e in entries}
+        self.jobs_tried = {k: v for k, v in self.jobs_tried.items() if k in live}
         first_minute = int(self.clock() // 60) - 60
         self.rest_minutes = {m: n for m, n in self.rest_minutes.items() if m >= first_minute}
         if self.rest_minutes != self.saved_rest_minutes:
@@ -2503,9 +2502,15 @@ class Daemon:
         # failure. It is read once per attempt, lean or not: callers would otherwise each read it. That
         # is also why it is the one read the REST share does not hold back: a wait cannot rule on a
         # failed run without it, and one request per failed attempt is what keeps every waiter off gh.
+        attempt = run.get("run_attempt") or 1
         failed_attempt = (run.get("status") == "completed" and run.get("conclusion") not in RUN_OK
                           and self.mode("rest") != "stop"
-                          and (fresh or jobs_attempt(prior.get("jobs")) < (run.get("run_attempt") or 1)))
+                          and (fresh or jobs_attempt(prior.get("jobs")) < attempt)
+                          # past the REST share, once per attempt, answered or not: an error or an empty
+                          # list would otherwise be asked for again every cycle, past the share
+                          and (self.rest_room(1) or self.jobs_tried.get(e["key"]) != attempt))
+        if failed_attempt:
+            self.jobs_tried[e["key"]] = attempt
         if (e["jobs"] and self.mode("rest") == "normal") or failed_attempt:
             try:
                 jstate, jdoc, jetag = self.get(base + "/jobs?per_page=100", prior.get("jobsEtag") if "jobs" in prior else None)
