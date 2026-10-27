@@ -8696,7 +8696,7 @@ class RunnerTest(unittest.TestCase):
         ps = lambda *a, **k: subprocess.CompletedProcess([], 0, next(looks), "")
         with mock.patch.object(cr.subprocess, "run", side_effect=ps), mock.patch.object(cr.os, "kill") as kill:
             with cr.listeners_frozen(runner) as frozen:
-                self.assertEqual(frozen, 1, "the listener the gate started after the first look")
+                self.assertEqual(frozen, 2, "the gate, and the listener it started after the first look")
         self.assertEqual([c.args for c in kill.call_args_list],
                          [(1, signal.SIGSTOP), (2, signal.SIGSTOP), (2, signal.SIGCONT), (1, signal.SIGCONT)])
         endless = iter(f"{n} {runner}/bin/Runner.Listener run\n" for n in range(1, 99))
@@ -8704,6 +8704,18 @@ class RunnerTest(unittest.TestCase):
                 [], 0, next(endless), "")), mock.patch.object(cr.os, "kill"):
             with cr.listeners_frozen(runner) as frozen:
                 self.assertIsNone(frozen, "a tree that keeps changing is not frozen: stop nothing")
+
+    def test_a_skip_launchctl_stop_refuses_a_live_spawner_without_a_listener(self) -> None:
+        runner = self.home / "actions-runner-glaeda-9"
+        gate = subprocess.Popen(["/bin/bash", "-c", 'exec -a "$0" /bin/sleep 60',
+                                 f"/usr/bin/python3 hook listen --runner-dir {runner} --x"])
+        self.addCleanup(lambda: (gate.kill(), gate.wait()))
+        time.sleep(0.2)
+        stop = mock.Mock(return_value=True)
+        with mock.patch.object(cr, "runner_busy", return_value=False):
+            self.assertFalse(cr.stop_if_idle(mock.Mock(runner_dir=runner), stop, listener_ok=False),
+                             "a gate between listeners starts one the moment it is thawed")
+        stop.assert_not_called()
 
     def test_a_relabel_whose_bootout_did_not_complete_keeps_the_registration(self) -> None:
         runner = self.home / "actions-runner-glaeda-8"

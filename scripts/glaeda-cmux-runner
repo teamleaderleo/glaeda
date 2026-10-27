@@ -1507,10 +1507,9 @@ def listeners_frozen(runner_dir: Path) -> Iterator[int | None]:
     look and a stop, as the gate's own stop freezes its listener: frozen, nothing of it can start a listener,
     acknowledge a request or start a Worker, so an idle reading stays true through the stop. It looks again until a
     look finds nothing new to freeze (a listener a spawner started between two looks is frozen too). Yields how
-    many listeners it froze, or None when it could not freeze them all or the tree kept changing: the caller then
+    many processes of that tree it froze (0: nothing of the runner runs), or None when it could not freeze them all or the tree kept changing: the caller then
     stops nothing. Thawed afterwards; a booted-out process is gone by then (launchd's SIGKILL reaches it frozen)."""
     frozen: list[int] = []
-    listeners: set[int] = set()
     count: int | None = None
     try:
         for _ in range(FREEZE_LOOKS):
@@ -1523,7 +1522,7 @@ def listeners_frozen(runner_dir: Path) -> Iterator[int | None]:
                 if role and int(pid) not in frozen and int(pid) != os.getpid():
                     new.append((int(pid), role))
             if not new:
-                count = len(listeners)
+                count = len(frozen)  # everything of the runner's tree that runs: listeners and their spawners
                 break
             for pid, role in new:
                 try:
@@ -1531,8 +1530,6 @@ def listeners_frozen(runner_dir: Path) -> Iterator[int | None]:
                 except ProcessLookupError:
                     continue  # it exited: nothing left of it to take a job
                 frozen.append(pid)
-                if role == "listener":
-                    listeners.add(pid)
     except Exception:  # noqa: BLE001
         count = None
     try:
