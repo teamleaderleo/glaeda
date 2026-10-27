@@ -37,6 +37,34 @@ class Refuses(unittest.TestCase):
             with self.subTest(runs_on=runs_on):
                 self.assertTrue(check("  a:\n" + runs_on + "    steps: [{run: true}]\n"))
 
+    def test_a_runner_the_text_cannot_show_is_refused(self) -> None:
+        for runs_on in (
+            "    runs-on: ${{ vars.LINUX_RUNNER }}\n",
+            "    runs-on: ${{ vars.LINUX_RUNNER || 'blacksmith-4vcpu-ubuntu-2404' }}\n",
+            "    runs-on: ${{ inputs.runner }}\n",
+            "    runs-on: ${{ fromJSON(needs.pick.outputs.labels) }}\n",
+            "    strategy:\n      matrix: ${{ fromJSON(needs.pick.outputs.matrix) }}\n",
+        ):
+            with self.subTest(runs_on=runs_on):
+                self.assertTrue(check("  a:\n" + runs_on + "    steps: [{run: true}]\n"))
+
+    def test_a_picker_that_emits_a_hosted_label_is_refused(self) -> None:
+        body = ("  pick:\n    runs-on: blacksmith-4vcpu-ubuntu-2404\n    outputs:\n"
+                "      runner: ${{ steps.pick.outputs.runner }}\n    steps:\n      - id: pick\n        run: |\n"
+                "          echo runner=ubuntu-latest >> \"$GITHUB_OUTPUT\"\n"
+                "  test:\n    needs: pick\n    runs-on: ${{ needs.pick.outputs.runner }}\n")
+        problems = check(body)
+        self.assertTrue(any("job test" in p for p in problems), problems)
+
+    def test_the_owner_form_must_send_the_fork_to_blacksmith(self) -> None:
+        for runs_on in (
+            "    runs-on: ${{ github.repository_owner != 'manaflow-ai' && 'blacksmith-4vcpu-ubuntu-2404' || 'ubuntu-24.04' }}\n",
+            "    runs-on: ${{ github.repository_owner == 'someone' && 'blacksmith-4vcpu-ubuntu-2404' || 'ubuntu-24.04' }}\n",
+            "    runs-on: ${{ github.repository_owner == 'manaflow-ai' && 'ubuntu-latest' || 'ubuntu-24.04' }}\n",
+        ):
+            with self.subTest(runs_on=runs_on):
+                self.assertTrue(check("  a:\n" + runs_on))
+
     def test_matrix_row_counts_for_its_job(self) -> None:
         body = ("  a:\n    strategy:\n      matrix:\n        include:\n          - runner: ubuntu-24.04\n"
                 "    runs-on: ${{ matrix.runner }}\n    steps: [{run: true}]\n")
@@ -62,6 +90,12 @@ class Accepts(unittest.TestCase):
             "    runs-on: blacksmith-4vcpu-ubuntu-2404\n"
             "  b:\n"
             "    runs-on: blacksmith-16vcpu-ubuntu-2404-arm  # was ubuntu-24.04\n"
+            "  d:\n"
+            "    runs-on: ${{ github.repository_owner == 'manaflow-ai' && 'blacksmith-16vcpu-ubuntu-2404' || 'ubuntu-24.04' }}\n"
+            "  e:\n"
+            "    strategy:\n      matrix:\n        include:\n"
+            "          - runner: \"${{ github.repository_owner == 'manaflow-ai' && 'blacksmith-4vcpu-ubuntu-2404-arm' || 'ubuntu-24.04-arm' }}\"\n"
+            "    runs-on: ${{ matrix.runner }}\n"
             "  c:\n"
             "    name: compare with ubuntu-24.04\n"
             "    runs-on: glaeda-owned-linux\n"
@@ -85,11 +119,19 @@ class Repository(unittest.TestCase):
 
     def test_jobs_in_the_fleet_fork_run_on_blacksmith(self) -> None:
         # manaflow-ai/glaeda is an organization repository with Blacksmith installed, so a job that runs only
-        # there never takes a hosted image.
+        # there never takes a hosted image, and every allowlisted job is one the fork never runs or a macOS row.
         for path in rl.workflow_files([]):
             text = path.read_text(encoding="utf-8")
             if "github.repository == 'manaflow-ai/glaeda'" in text:
                 self.assertEqual(rl.hosted_jobs(path), {}, path.name)
+
+    def test_an_allowlisted_job_never_runs_in_the_fleet_fork(self) -> None:
+        # The fork has Blacksmith, so an entry is either gated to this repository or measures the hosted image.
+        for (name, job), reason in rl.HOSTED_ALLOWED.items():
+            with self.subTest(job=f"{name}:{job}"):
+                text = (rl.workflow_files([])[0].parent / name).read_text(encoding="utf-8")
+                gated = "github.repository == 'teamleaderleo/glaeda'" in text
+                self.assertTrue(gated or reason in (rl.HOSTED_ON_PURPOSE, rl.HOSTED_BASELINE), reason)
 
 
 if __name__ == "__main__":

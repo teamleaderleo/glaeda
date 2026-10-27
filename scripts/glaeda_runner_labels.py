@@ -4,9 +4,18 @@
 Rulebook: Linux jobs run on Blacksmith ("just put it on blacksmith / 16vcpu blacksmiths do exist", Leo, 2026-10-27),
 and no runs-on names a GitHub-hosted macOS label. Blacksmith installs on GitHub organizations only, so it serves
 manaflow-ai/glaeda (the fleet fork) but not teamleaderleo/glaeda, a personal-account repository, and no owned runner
-serves this repository either. Every job that runs only here therefore stays on a hosted image until the repository
-moves under an organization; each is listed below with that reason, and any other job that names a hosted label
-fails CI. An entry whose job no longer names a hosted label also fails, so the list only shrinks.
+serves this repository either. So:
+
+- A job that can also run in the fork picks by owner, `${{ github.repository_owner == 'manaflow-ai' &&
+  'blacksmith-<n>vcpu-ubuntu-2404' || 'ubuntu-24.04' }}` (macOS rows likewise, `blacksmith-6vcpu-macos-15`): Blacksmith
+  there, the hosted image only here. That form, in runs-on or a matrix row, is the one hosted spelling accepted
+  without an entry.
+- A job gated to this repository (`github.repository == 'teamleaderleo/glaeda'`), or one that measures the hosted
+  image itself, is listed in HOSTED_ALLOWED with its reason until the repository moves under an organization.
+
+Any other job that names a hosted label fails CI. An entry whose job no longer names one fails too, so the list only
+shrinks. A runs-on or matrix this scan cannot read (`vars.`, `needs.`, `inputs.`, `steps.`, `fromJSON`) fails as
+well unless its job is listed: a variable or picker output could hold a hosted label the text never shows.
 
 The scan reads workflow text line by line, so it sees labels in `runs-on`, matrix rows (`runner: ubuntu-24.04`),
 expression defaults (`vars.X || 'ubuntu-24.04'`) and arrays. Comments and `run:`, `name:` and `description:` text
@@ -30,35 +39,26 @@ HOSTED = re.compile(
 NON_RUNNER_KEY = re.compile(r"^\s*(?:-\s+)?(?:name|description|run)\s*:")
 BLOCK_SCALAR = re.compile(r":\s*[|>][-+0-9]*\s*(?:#.*)?$")
 JOB = re.compile(r"^  ([A-Za-z_][A-Za-z0-9_-]*)\s*:\s*(?:#.*)?$")
+# Blacksmith in the manaflow-ai fork, the hosted image only in this personal-account repository.
+OWNER_BRANCH = re.compile(
+    r"github\.repository_owner\s*==\s*'manaflow-ai'\s*&&\s*'blacksmith-[0-9]+vcpu-[a-z0-9.-]+'\s*\|\|\s*'[^']+'")
+SELECTOR = re.compile(r"^\s*(?:-\s+)?(?:runs-on|runner|matrix|include)\s*:")
+UNREADABLE = re.compile(r"\b(?:vars|needs|inputs|steps)\.|fromJSON", re.IGNORECASE)
 
 PERSONAL = ("runs only in teamleaderleo/glaeda, a personal-account repository: Blacksmith installs on organizations "
             "only and no owned runner serves it")
-PERSONAL_MACOS = PERSONAL + "; builds and checks the aarch64-apple-darwin target"
-PERSONAL_ARM = PERSONAL + "; probes the arm64 Ubuntu package and container closure"
+HOSTED_ON_PURPOSE = ("measures the developer loop on a GitHub-hosted runner, so the hosted image is the thing "
+                     "measured; it is dispatched or runs on pull requests that change the benchmark")
+HOSTED_BASELINE = ("the GitHub-hosted baseline the owned-runner JIT canary is compared with, so the hosted image is "
+                   "the thing measured; dispatched by hand")
+PERSONAL_MACOS = PERSONAL + "; builds the aarch64-apple-darwin target"
 
 # (workflow file, job id) -> why the job stays on a GitHub-hosted image.
 HOSTED_ALLOWED: dict[tuple[str, str], str] = {
-    ("big-red-jit-canary.yml", "hosted-baseline"): PERSONAL + "; it is the hosted baseline the canary compares",
-    ("bootstrap-compatibility.yml", "verify"): PERSONAL,
-    ("ci.yml", "changes"): PERSONAL,
-    ("ci.yml", "go"): PERSONAL,
-    ("ci.yml", "scripts"): PERSONAL,
-    ("ci.yml", "runner-tests"): PERSONAL,
-    ("ci.yml", "lint"): PERSONAL,
-    ("ci.yml", "lint-macos"): PERSONAL_MACOS,
-    ("ci.yml", "test"): PERSONAL,
-    ("ci.yml", "cli"): PERSONAL,
-    ("ci.yml", "fleet-cas-build"): PERSONAL_MACOS,
-    ("ci.yml", "ci-status"): PERSONAL,
+    ("big-red-jit-canary.yml", "hosted-baseline"): HOSTED_BASELINE,
     ("control.yml", "control"): PERSONAL,
-    ("cultist-advisory.yml", "diff"): PERSONAL,
-    ("developer-loop-benchmark.yml", "fresh-hosted"): PERSONAL + "; it measures the hosted developer loop",
-    ("developer-loop-benchmark.yml", "prepared-hosted"): PERSONAL + "; it measures the hosted developer loop",
-    ("fleet-candidate.yml", "candidate"): PERSONAL_MACOS,
-    ("github-resident-snapshot.yml", "contract"): PERSONAL,
-    ("linux-acceptance.yml", "disposable-linux"): PERSONAL,
-    ("podman-closure-probe.yml", "ubuntu-package"): PERSONAL_ARM,
-    ("podman-container-closure-probe.yml", "ubuntu-container"): PERSONAL_ARM,
+    ("developer-loop-benchmark.yml", "fresh-hosted"): HOSTED_ON_PURPOSE,
+    ("developer-loop-benchmark.yml", "prepared-hosted"): HOSTED_ON_PURPOSE,
     ("promote.yml", "promote"): PERSONAL,
     ("release.yml", "build"): PERSONAL_MACOS,
     ("release.yml", "publish"): PERSONAL,
@@ -72,7 +72,7 @@ def _strip_comment(line: str) -> str:
 
 
 def hosted_jobs(path: Path) -> dict[str, list[str]]:
-    """job id -> the lines in that job that name a GitHub-hosted label (a line outside any job is under '')."""
+    """job id -> lines in that job that name a hosted label or a runner this scan cannot read ('' = outside jobs)."""
     found: dict[str, list[str]] = {}
     job = ""
     in_jobs = False
@@ -96,7 +96,8 @@ def hosted_jobs(path: Path) -> dict[str, list[str]]:
             if BLOCK_SCALAR.search(line):
                 block_indent = indent
             continue
-        if HOSTED.search(_strip_comment(line)):
+        code = _strip_comment(line)
+        if HOSTED.search(OWNER_BRANCH.sub("", code)) or (SELECTOR.match(code) and UNREADABLE.search(code)):
             found.setdefault(job, []).append(f"{path.name}:{number}: {line.strip()}")
     return found
 
@@ -134,7 +135,8 @@ def workflow_files(args: list[str]) -> list[Path]:
 def main(argv: list[str]) -> int:
     problems = violations(workflow_files(argv))
     if problems:
-        print("GitHub-hosted runner labels outside HOSTED_ALLOWED (use a blacksmith-<n>vcpu-ubuntu-2404 label):")
+        print("GitHub-hosted or unreadable runners outside HOSTED_ALLOWED (use a blacksmith-<n>vcpu-ubuntu-2404 label,")
+        print("or the owner form for a job that also runs in teamleaderleo/glaeda):")
         print("\n".join(problems))
         return 1
     print(f"PASS: only the {len(HOSTED_ALLOWED)} allowlisted jobs name a GitHub-hosted runner")
