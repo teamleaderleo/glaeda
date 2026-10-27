@@ -5859,6 +5859,19 @@ class GateTest(unittest.TestCase):
                                            "cmux-next.yml"),
             hook.DEV_COMPILE_CAPACITY_WAIT_S)
 
+    def test_dev_daily_publisher_jobs_wait_a_bounded_time(self) -> None:
+        """cmux-next-dev-daily.yml's Mac jobs have 15 and 20 minute timeouts that count the wait in runner setup
+        (run 40466210697 timed out after 19 min there), so each is refused after the bound, whatever its event."""
+        for job in ("verify", "tip-dmg-build", "anything-new"):
+            for event_name in ("workflow_dispatch", "push"):
+                with self.subTest(job=job, event=event_name):
+                    self.assertEqual(hook.dev_compile_capacity_wait(
+                        "manaflow-ai/cmux", hook.DEFAULT_HOME_REPO, event_name, "refs/heads/main",
+                        {"repository": CMUX}, job, "cmux-next-dev-daily.yml"), hook.DEV_COMPILE_CAPACITY_WAIT_S)
+        self.assertIsNone(hook.dev_compile_capacity_wait(
+            "someone/else", hook.DEFAULT_HOME_REPO, "workflow_dispatch", "refs/heads/main", {}, "verify",
+            "cmux-next-dev-daily.yml"))
+
     def test_every_job_on_the_freshness_slot_waits_a_bounded_time(self) -> None:
         """A push's release-compile on the slot is not a DEV compile (dev_compile_capacity_wait is None), but the
         slot still bounds its wait, so a mini that fills while it waits refuses it back to placement. An explicit
