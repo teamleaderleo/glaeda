@@ -5,10 +5,10 @@ and NEXT alike, unless it is stuck past its timeout or certain to fail." Leo, 20
 have nightlies >30min out of date. shouldn't be cancelling unless existing run would've literally been busted".
 
 may_cancel() is the predicate: a delivery run (nightly, nightly-next, DEV or promote, on any branch, see
-delivery_reason()) that has started is never cancelled, unless one of its jobs has run longer than the longest
+delivery_reason()) that has started is never cancelled, unless one of its jobs has worked longer than the longest
 job-level timeout-minutes in its workflow at the run's own head_sha (GitHub ends a job at its own timeout, so such
-a run is stuck). A job's wait for a runner, or for a runner hook's admission, never counts: the clock starts at the
-job's own started_at. When the workflow or the jobs cannot be read, the cancel is refused (fail closed).
+a run is stuck). A job's wait for a runner, or for a runner hook's admission inside "Set up runner", never counts:
+the clock starts at the job's first step after its setup, and a job still in setup is never past its timeout. When the workflow or the jobs cannot be read, the cancel is refused (fail closed).
 
 cancel_run() is the only code in glaeda that POSTs a run's /cancel or /force-cancel. test-glaeda-never-cancel.py
 scans the repository for any other cancel call, so a new path that skips the predicate fails CI.
@@ -59,12 +59,26 @@ def delivery_reason(run: Mapping[str, Any]) -> str:
 
 
 def started(run: Mapping[str, Any], jobs: Sequence[Mapping[str, Any]] | None) -> bool:
-    """Whether the run has started: GitHub says in_progress, or any job of it has a runner or a start time."""
-    if run.get("status") == "completed":
-        return True
+    """Whether the run has started: GitHub says in_progress or completed, or any job of it has a runner, a start
+    time or a status past queued. Any one sign counts, so a run is called unstarted only when none shows."""
     if run.get("status") not in NOT_STARTED:
         return True
-    return any(j.get("runner_name") or j.get("status") in ("in_progress", "completed") for j in jobs or ())
+    return any(j.get("runner_name") or j.get("started_at") or j.get("status") in ("in_progress", "completed")
+               for j in jobs or ())
+
+
+# A runner's own setup, where a runner hook's admission waits for capacity: never part of the job's run time.
+SETUP_STEPS = frozenset({"Set up job", "Set up runner"})
+
+
+def work_started_at(job: Mapping[str, Any]) -> float | None:
+    """When the job's own work began: the start of its first step after the runner's setup. None while it is still
+    in setup (an admission wait), or when its steps are not listed: then no time of it counts toward a timeout."""
+    for step in job.get("steps") or ():
+        if step.get("name") in SETUP_STEPS:
+            continue
+        return parse_utc(step.get("started_at"))
+    return None
 
 
 def parse_utc(text: Any) -> float | None:
@@ -135,10 +149,11 @@ def may_cancel(run: Mapping[str, Any], jobs: Sequence[Mapping[str, Any]] | None,
     for job in jobs:
         if job.get("status") != "in_progress":
             continue
-        began = parse_utc(job.get("started_at"))
+        began = work_started_at(job)  # never job.started_at: that counts the runner setup's admission wait
         if began is not None and now - began > timeout_minutes * 60:
-            return True, (f"{what} stuck past its timeout: job {job.get('name')!r} has run "
-                          f"{(now - began) / 60:.0f} min, past the longest job timeout of {timeout_minutes} min")
+            return True, (f"{what} stuck past its timeout: job {job.get('name')!r} has worked "
+                          f"{(now - began) / 60:.0f} min after its setup, past the longest job timeout of "
+                          f"{timeout_minutes} min")
     return False, f"{what} that has started and no job of it has run past its timeout ({timeout_minutes} min)"
 
 

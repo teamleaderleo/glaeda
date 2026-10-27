@@ -40,10 +40,21 @@ def run(path="nightly.yml", status="in_progress", event="schedule", name="", att
             "display_title": name, "head_sha": SHA, "run_attempt": attempt}
 
 
-def job(status="in_progress", started_min_ago=5.0, runner="r1"):
-    return {"id": 1, "name": "build", "status": status, "runner_name": runner if status != "queued" else None,
-            "started_at": datetime.fromtimestamp(NOW - started_min_ago * 60, timezone.utc)
-            .isoformat().replace("+00:00", "Z") if status != "queued" else None}
+def ts(min_ago):
+    return datetime.fromtimestamp(NOW - min_ago * 60, timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def job(status="in_progress", started_min_ago=5.0, runner="r1", setup_min=0.0, in_setup=False):
+    """A job that started started_min_ago minutes ago and spent setup_min of them in "Set up runner"."""
+    if status == "queued":
+        return {"id": 1, "name": "build", "status": "queued", "runner_name": None, "started_at": None, "steps": []}
+    steps = [{"name": "Set up job", "status": "completed", "started_at": ts(started_min_ago)},
+             {"name": "Set up runner", "status": "in_progress" if in_setup else "completed",
+              "started_at": ts(started_min_ago)}]
+    if not in_setup:
+        steps.append({"name": "Compile", "status": "in_progress", "started_at": ts(started_min_ago - setup_min)})
+    return {"id": 1, "name": "build", "status": status, "runner_name": runner, "started_at": ts(started_min_ago),
+            "steps": steps}
 
 
 class DeliveryTable(unittest.TestCase):
@@ -96,6 +107,19 @@ class PredicateTable(unittest.TestCase):
             ("DEV daily stuck in setup 19 min of 20", run("cmux-next-dev-daily.yml"),
              [job(started_min_ago=19)], 20, False),
             ("promote past timeout", run("cloud-vm-image-promote.yml"), [job(started_min_ago=400)], 360, True),
+            # A runner hook's admission wait in "Set up runner" never counts toward the timeout.
+            ("still in admission 91 min of 90", run(), [job(started_min_ago=91, in_setup=True)], 90, False),
+            ("still in admission for hours", run(), [job(started_min_ago=600, in_setup=True)], 90, False),
+            ("left a 90 min admission 1 min ago", run(), [job(started_min_ago=91, setup_min=90)], 90, False),
+            ("worked 91 min after a 30 min admission", run(), [job(started_min_ago=121, setup_min=30)], 90, True),
+            ("steps not listed", run(), [{**job(started_min_ago=500), "steps": []}], 90, False),
+            # Any sign of a start counts, whatever status the run reports.
+            ("waiting run, job with a start time", run(status="waiting"),
+             [{**job("queued"), "started_at": ts(5)}], 90, False),
+            ("waiting run, job with a runner", run(status="waiting"), [{**job("queued"), "runner_name": "m1"}], 90,
+             False),
+            ("queued run, a completed job", run(status="queued"), [job("completed")], 90, False),
+            ("waiting run, nothing started", run(status="waiting"), [job("queued")], 90, True),
         ]
         for label, r, jobs, timeout, want in cases:
             with self.subTest(label):
@@ -162,14 +186,20 @@ class CancelRun(unittest.TestCase):
             self.assertEqual(f.posts, [])
 
 
-# Ways to cancel a GitHub Actions run or job: the REST endpoints in any spelling, gh's command, and SDK names.
+# Ways to cancel a GitHub Actions run or job: the REST endpoints in any spelling, gh's command in a shell line or an
+# argv list, and SDK names. Comment lines are skipped; everything else is matched, f-string pieces included.
 CANCEL_CALL = re.compile(
-    r"actions/runs/[^\s\"'`]*?/(?:force-)?cancel(?![\w-])"   # .../actions/runs/{id}/cancel, force-cancel
-    r"|[\"'`]/(?:force-)?cancel[\"'`]"                        # a path piece joined on later: "/cancel"
-    r"|\bgh\b[^\n]*\brun\s+cancel\b"                          # gh run cancel N
-    r"|cancel[_-]?workflow[_-]?run|cancelWorkflowRun",        # octokit and other SDK names
+    r"actions/+(?:runs|jobs)/.*?/(?:force-)?cancel(?![\w-])"   # .../actions/runs/{run['id']}/cancel, force-cancel
+    r"|[\"'`]/?(?:force-)?cancel[\"'`]"                        # a piece joined on later ("/cancel"), or argv's "cancel"
+    r"|\brun\s+cancel\b"                                        # gh run cancel N
+    r"|get_workflow_run\b|cancel[_-]?workflow[_-]?run|cancelWorkflowRun",  # PyGithub, octokit and other SDKs
     re.IGNORECASE)
 GUARD = "scripts/glaeda_never_cancel.py"
+# Each hit outside the guard's one POST, by file and exact line, with why it cancels no GitHub run.
+ALLOWED = {
+    ("src/main.rs", '"cancel",'): "the local personal-worker queue's `glaeda job cancel` subcommand in a CLI test",
+}
+GUARD_LINE = "post(f\"/repos/{repo}/actions/runs/{run_id}/{'force-cancel' if force else 'cancel'}\")"
 
 
 def scanned_files() -> list[str]:
@@ -179,36 +209,54 @@ def scanned_files() -> list[str]:
     return [n for n in names if not (n.endswith(".md") or re.search(r"(^|/)test[-_][^/]*$", n) or n.startswith("tests/"))]
 
 
+def cancel_hits(name: str, text: str) -> list[str]:
+    hits = []
+    for lineno, line in enumerate(text.splitlines(), 1):
+        code = line.strip()
+        if code.startswith(("#", "//", "*", "/*")) or not CANCEL_CALL.search(code):
+            continue
+        if (name, code) in ALLOWED or (name == GUARD and code == GUARD_LINE):
+            continue
+        hits.append(f"{name}:{lineno}: {code}")
+    return hits
+
+
 class NoOtherCancelPath(unittest.TestCase):
     def test_only_the_guard_cancels_runs(self):
-        offenders = []
+        offenders, guard_posts = [], 0
         for name in scanned_files():
-            path = ROOT / name
             try:
-                text = path.read_text()
+                text = (ROOT / name).read_text()
             except (UnicodeDecodeError, OSError):
                 continue
-            for lineno, line in enumerate(text.splitlines(), 1):
-                if CANCEL_CALL.search(line) and name != GUARD:
-                    offenders.append(f"{name}:{lineno}: {line.strip()}")
+            offenders += cancel_hits(name, text)
+            if name == GUARD:
+                guard_posts = sum(1 for ln in text.splitlines() if ln.strip() == GUARD_LINE)
         self.assertEqual(offenders, [], "cancel a run only through glaeda_never_cancel.cancel_run, so a started "
                          "nightly, DEV or promote run is never cancelled:\n" + "\n".join(offenders))
+        self.assertEqual(guard_posts, 1, "the guard's one cancel POST moved: update GUARD_LINE with it")
 
     def test_the_scan_catches_each_spelling(self):
         for line in ('api.ok("POST", f"/repos/{repo}/actions/runs/{run_id}/cancel")',
+                     """api.ok("POST", f"/repos/{repo}/actions/runs/{run['id']}/cancel")""",
                      'post(f"/repos/{r}/actions/runs/{i}/force-cancel")',
                      'url = base + "/cancel"',
                      "gh run cancel 123 -R o/r",
+                     'subprocess.run(["gh", "run", "cancel", str(run_id)])',
                      "subprocess.run(['gh', 'api', '-X', 'POST', 'repos/o/r/actions/runs/1/cancel'])",
-                     "octokit.rest.actions.cancelWorkflowRun({owner, repo, run_id})"):
-            self.assertTrue(CANCEL_CALL.search(line), line)
+                     "repo.get_workflow_run(run_id).cancel()",
+                     "octokit.rest.actions.cancelWorkflowRun({owner, repo, run_id})",
+                     "curl -X POST https://api.github.com/repos/o/r/actions/runs/$ID/cancel"):
+            self.assertTrue(cancel_hits("scripts/x", line), line)
         for line in ("cancel-in-progress: false", "future.cancel()", 'conclusion == "cancelled"',
-                     "the rescue cancels a job"):
-            self.assertFalse(CANCEL_CALL.search(line), line)
+                     "the rescue cancels a job", "# gh run cancel is refused here", "    // run cancel docs"):
+            self.assertFalse(cancel_hits("scripts/x", line), line)
+        # The guard file gets no blanket pass: a second cancel there is caught too.
+        self.assertTrue(cancel_hits(GUARD, 'api.ok("POST", f"/repos/{repo}/actions/runs/{run_id}/cancel")'))
 
     def test_glaeda_route_cancels_through_the_guard(self):
         route = (ROOT / "scripts/glaeda-route").read_text()
-        self.assertIn("cancel_run(", route)
+        self.assertIn("never_cancel.cancel_run(", route)
         self.assertIn("force=True", route)
 
 
