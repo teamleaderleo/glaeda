@@ -581,8 +581,41 @@ def _at_inside_or_above(path: Path, keep: list[str] | tuple[str, ...]) -> bool:
 
 
 def toolchain_held(path: Path, fresh: bool = False) -> bool:
-    """PATH is at, inside or above a toolchain_keep() path. No family flag lifts it (not allow_stale_protected)."""
-    return _at_inside_or_above(path, toolchain_keep(fresh))
+    """PATH is at, inside or above a toolchain_keep() path or a role_keep() path. No family flag lifts it (not
+    allow_stale_protected)."""
+    return _at_inside_or_above(path, toolchain_keep(fresh)) or _at_inside_or_above(path, role_keep())
+
+
+# A dedicated runner's warm state, kept by role and not by age (Leo, 2026-10-26: warm compile caches an incremental
+# build keeps fresh stay by role). glaeda-cmux-runner --dedicated writes the entry's `keep` paths, expanded, to
+# <runner>/ROLE_KEEP_MARKER: the nightly-next builder's own checkout (_work/cmux/cmux, its .git and cargo targets)
+# and its ~/Library/Caches/cmux-nightly-next/<runner> DerivedData. Only a glaeda-enrolled runner's marker counts,
+# and only paths under the home that are not the home, the runner directory or its _work themselves; everything
+# else in that runner (PR leftovers, _work/_temp, test TMPDIRs, other DerivedData) still goes by age.
+ROLE_KEEP_MARKER = ".glaeda-keep.json"
+
+
+def role_keep() -> tuple[str, ...]:
+    """Every enrolled dedicated runner's kept paths (ROLE_KEEP_MARKER), as spelled and resolved. Read fresh each
+    call: a marker is small, and a keep the installer just added must hold for the very next delete."""
+    out: list[str] = []
+    home = os.path.realpath(HOME)
+    for runner in HOME.glob("actions-runner-glaeda-*"):
+        if not ((runner / ".runner").is_file() and (runner / "glaeda-hooks").is_dir()):
+            continue
+        try:
+            paths = json.loads((runner / ROLE_KEEP_MARKER).read_text())
+        except (OSError, ValueError):
+            continue
+        for raw in paths if isinstance(paths, list) else []:
+            if not isinstance(raw, str) or not os.path.isabs(raw):
+                continue
+            for spelled in {os.path.abspath(raw), os.path.realpath(raw)}:
+                if (spelled.startswith(home + "/") and spelled not in
+                        {os.path.realpath(runner), os.path.realpath(runner / "_work"), os.path.abspath(runner),
+                         os.path.abspath(runner / "_work")}):
+                    out.append(spelled)
+    return tuple(dict.fromkeys(out))
 
 
 def toolchain_within(path: Path) -> bool:
@@ -2352,6 +2385,8 @@ def evict_idle_runner_checkouts(receipt: Path, floor_gib: float, home: Path | No
         for checkout in runner_checkouts(work):
             if checkout.name != checkout.parent.name:  # only actions/checkout's default _work/<repo>/<repo>
                 continue
+            if toolchain_held(checkout):  # a dedicated runner's checkout, kept by role (role_keep)
+                continue
             used = runner_checkout_last_use(runner, checkout)
             idle = (now - used) / 3600
             if idle >= RUNNER_IDLE_CHECKOUT_HOURS and (under or idle >= RUNNER_STALE_CHECKOUT_HOURS):
@@ -2991,6 +3026,13 @@ def default_families(role: str = "fleet-mini") -> list[Family]:
                 fams.append(Family("ci-derived-data", temp, True, "the CI test job rebuilds it",
                                    include=("cmux-derived-data-tests-",), build_output=True,
                                    owner="cmux CI test jobs", rebuild_minutes=6, platform="macos"))
+                if (runner / ROLE_KEEP_MARKER).is_file():
+                    # a dedicated runner keeps its warm state by role, so what its jobs leave in _temp goes by age
+                    fams.append(Family("dedicated-runner-temp", temp, True, "the next job writes its own _temp",
+                                       files=True, skip=("_github_home", "_github_workflow", "_runner_file_commands"),
+                                       skip_prefixes=("cmux-derived-data-tests-",),  # ci-derived-data's
+                                       max_idle_hours=DEFAULT_AGE_HOURS, owner="the dedicated runner's jobs",
+                                       rebuild_minutes=0.1, platform="macos"))
         # Bounded by its owner: node_product_cache.py evicts LRU to CMUX_NODE_PRODUCT_CACHE_MAX_BYTES (24 GiB).
         fams.append(Family("cmux-node-products", Path("/Users/Shared/cmux-build-fleet/node-products"), False,
                            "report only: its owner evicts LRU to a 24 GiB budget",

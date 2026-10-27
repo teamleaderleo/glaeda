@@ -193,6 +193,20 @@ KILL_SWITCH = HOME / ".config/glaeda/mini-health.disabled"
 AGENTS = HOME / "Library/LaunchAgents"
 HELD = HOME / ".local/state/glaeda/mini-fleet/runner-held"  # cmux_mini_fix.sh runner_hold's marks
 # an instance (.K) or a dedicated runner (.dedicated.NAME, glaeda-cmux-runner --dedicated; never its .watch agent)
+GLAEDA_LABEL_PREFIX = "com.teamleaderleo.glaeda."  # every agent glaeda installs (watch loops included)
+LISTENER_RE = re.compile(r"(/\S+?)/bin(?:\.[0-9.]+)?/Runner\.Listener(?:\s|$)")
+
+
+def starts_runner(word: str) -> bool:
+    """A plist word that starts a GitHub runner: its run.sh or runsvc.sh, a Runner.Listener, or a directory holding a
+    runner registration (.runner)."""
+    if re.search(r"(?:^|/)(?:run|runsvc|run-helper)\.sh$|/Runner\.Listener$", word):
+        return True
+    with contextlib.suppress(OSError):
+        return os.path.isabs(word) and Path(word, ".runner").is_file()
+    return False
+
+
 RUNNER_AGENT = re.compile(r"com\.teamleaderleo\.glaeda\.cmux-runner(?:\.\d+|\.dedicated\.[a-z][a-z0-9-]*)?")
 RUNNER_DIR = re.compile(r"actions-runner-glaeda(?:-(\d+|[a-z][a-z0-9-]*))?")
 RUNNER_PIN = "2.338.0"  # glaeda-cmux-runner's PINNED_RUNNER_VERSION; a test keeps the two equal
@@ -351,6 +365,7 @@ class Mini:
 
     def __init__(self, home: Path = HOME) -> None:
         self.home = home
+        self.daemons_dir = Path("/Library/LaunchDaemons")
         self.uid = os.getuid()
         self._hook: Any = None
         self.tailnet_route_ok = False  # check_tailscale saw the tailnet route on the tunnel this run
@@ -608,6 +623,32 @@ class Mini:
             if doc.get("cause") == "registration_deleted" and name in dirs and (dirs[name] / ".runner").is_file():
                 out.append({**doc, "dir": name})
         return out
+
+    def foreign_runners(self) -> list[tuple[str, str]]:
+        """(where, what) for each GitHub runner glaeda does not own: a LaunchAgent or LaunchDaemon plist that is not
+        glaeda's (RUNNER_AGENT) and starts a runner (a directory with a .runner, its run.sh or runsvc.sh, or a
+        Runner.Listener), and a running Runner.Listener whose runner directory is not ~/actions-runner-glaeda*."""
+        out = []
+        for folder in (self.home / "Library/LaunchAgents", self.daemons_dir):
+            for plist in sorted(folder.glob("*.plist")) if folder.is_dir() else []:
+                label = plist.name[:-len(".plist")]
+                if RUNNER_AGENT.fullmatch(label) or label.startswith(GLAEDA_LABEL_PREFIX):
+                    continue
+                try:
+                    doc = plistlib.loads(plist.read_bytes())
+                except Exception:  # unreadable or not a plist: nothing to say about it
+                    continue
+                words = [str(w) for w in (doc.get("ProgramArguments") or [])] + [str(doc.get("Program") or ""),
+                                                                                 str(doc.get("WorkingDirectory") or "")]
+                if any(starts_runner(w) for w in words if w):
+                    out.append((os.fspath(plist), f"{label} starts a GitHub runner glaeda does not manage"))
+        own = os.path.realpath(self.home) + "/actions-runner-glaeda"
+        for _pid, _uid, _stat, command in self.processes():
+            m = LISTENER_RE.search(command)
+            if m and not (os.path.realpath(m.group(1)) + "-").startswith(own + "-") \
+                    and os.path.realpath(m.group(1)) != own:
+                out.append((m.group(1), f"Runner.Listener runs from {m.group(1)}, not a glaeda runner directory"))
+        return sorted(set(out))
 
     def runner_agents(self) -> list[tuple[str, bool, bool, str]]:
         """(label, loaded, running, last exit) for each runner LaunchAgent plist."""
@@ -1383,6 +1424,15 @@ def check_runners(mini: Mini) -> list[dict[str, Any]]:
             out.append(finding(f"runner_stopped:{agent}", "error", f"{label} is loaded but not running "
                                f"(last exit code {last})", "pending", "launchctl kickstart"))
     return out
+
+
+def check_foreign_runners(mini: Mini) -> list[dict[str, Any]]:
+    """Leo, 2026-10-27: "why the fuck not manage it with glaeda????????" A runner glaeda does not install gets none of
+    its reconcilers (.path repair, toolchain hold, hook refresh, disk eviction, this heal)."""
+    return [finding(f"runner_unmanaged:{Path(where).name}", "error", f"{what} ({where})", "impossible",
+                    "declare it as runner.dedicated in mini-fleet.json, apply it with glaeda-cmux-runner-fleet --apply "
+                    "--hosts <this mini>, then remove the hand-made one between jobs (docs/CMUX_MINI_RUNNER.md 2e1)")
+            for where, what in mini.foreign_runners()]
 
 
 def version_key(version: str) -> tuple[int, ...]:
@@ -2304,6 +2354,7 @@ def run(mini: Mini, apply: bool, now: float | None = None, state_path: Path = ST
         # keeps that probe nor reroutes on it until the tunnel is back (tailscale_no_route's restart may fix it)
         tunnel_down = any(f["code"] in TUNNEL_DOWN for f in tailnet)
         found = (check_console(mini) + check_power(mini) + tailnet + check_runners(mini) + check_runner_versions(mini)
+                 + check_foreign_runners(mini)
                  + check_node_eligibility(mini) + check_toolchain_missing(mini) + check_toolchain(mini)
                  + check_leaked_test_apps(mini)
                  + check_checkout_steps(mini, now, state_path.parent / CHECKOUT_CACHE, apply)

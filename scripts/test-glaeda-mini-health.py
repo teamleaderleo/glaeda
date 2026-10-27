@@ -12,6 +12,7 @@ import os
 import shutil
 import subprocess
 import sys
+import plistlib
 import tempfile
 import time
 import unittest
@@ -62,6 +63,7 @@ class FakeMini(health.Mini):
         self.claude: str | None = None  # no Claude Code here: no route to check
         self.claude_env: dict = {}
         self.answers: dict[str, bool] = {}  # route -> whether `claude -p` through it answers
+        self.daemons_dir = Path("/nonexistent")
         self.probe_memory: dict = {}
         self.fleet = True  # a fleet mini, not a personal Mac (--hygiene-only)
         # the tailscale_no_route restart's gates: an idle CI runner mini unless a test says otherwise
@@ -2767,6 +2769,53 @@ class DedicatedRunnerAgentTest(unittest.TestCase):
         with mock.patch.object(health, "HELD", Path(tempfile.mkdtemp())):
             found = health.check_runners(mini)
         self.assertEqual([f["id"] for f in found], ["runner_stopped:nightly-next"])
+
+class ForeignRunnerTest(unittest.TestCase):
+    """Leo, 2026-10-27: "why the fuck not manage it with glaeda????????" A runner service glaeda does not own is a
+    fault: its LaunchAgent or LaunchDaemon, or a Runner.Listener outside ~/actions-runner-glaeda*."""
+
+    def test_a_hand_made_runner_is_a_fault_and_glaedas_are_not(self) -> None:
+        home = Path(tempfile.mkdtemp())
+        agents, daemons = home / "Library/LaunchAgents", home / "daemons"
+        agents.mkdir(parents=True)
+        daemons.mkdir()
+        old = home / "actions-runner-nightly-next"
+        old.mkdir()
+        (old / ".runner").write_text("{}")
+
+        def plist(folder, label, args, cwd=None):
+            doc = {"Label": label, "ProgramArguments": args}
+            if cwd:
+                doc["WorkingDirectory"] = cwd
+            (folder / f"{label}.plist").write_bytes(plistlib.dumps(doc))
+        plist(agents, "ai.manaflow.nightly-builder.runner", ["/bin/bash", "run.sh"], os.fspath(old))
+        plist(agents, "ai.manaflow.nightly-builder.watch", ["/usr/bin/python3", "/x/nightly_builder.py", "watch"])
+        plist(daemons, "actions.runner.manaflow-ai-cmux.mini", [f"{home}/actions-runner/runsvc.sh"])
+        plist(agents, "com.teamleaderleo.glaeda.cmux-runner.dedicated.nightly-next",
+              [f"{home}/actions-runner-glaeda-nightly-next/run.sh"])
+        plist(agents, "com.teamleaderleo.glaeda.cmux-runner.3", [f"{home}/actions-runner-glaeda-3/run.sh"])
+        (agents / "broken.plist").write_text("not a plist")
+        mini = health.Mini(home)
+        mini.daemons_dir = daemons
+        procs = [(1, 501, "S", f"{home}/actions-runner-glaeda-3/bin.2.338.0/Runner.Listener run"),
+                 (2, 501, "S", f"{home}/actions-runner-glaeda-nightly-next/bin/Runner.Listener run"),
+                 (3, 501, "S", f"{home}/actions-runner-glaeda/bin/Runner.Listener run"),
+                 (4, 501, "S", f"{old}/bin/Runner.Listener run"),
+                 (5, 501, "S", f"{home}/actions-runner-glaedax/bin/Runner.Listener run")]
+        with mock.patch.object(mini, "processes", return_value=procs):
+            found = health.check_foreign_runners(mini)
+        ids = sorted(f["id"] for f in found)
+        self.assertEqual(ids, ["runner_unmanaged:actions-runner-glaedax", "runner_unmanaged:actions-runner-nightly-next",
+                               "runner_unmanaged:actions.runner.manaflow-ai-cmux.mini.plist",
+                               "runner_unmanaged:ai.manaflow.nightly-builder.runner.plist"])
+        self.assertTrue(all(f["severity"] == "error" for f in found))
+        with mock.patch.object(mini, "processes", return_value=procs[:3]):
+            for p in agents.glob("ai.manaflow.*"):
+                p.unlink()
+            for p in daemons.glob("*.plist"):
+                p.unlink()
+            self.assertEqual(health.check_foreign_runners(mini), [], "every runner glaeda's: no fault")
+
 
 if __name__ == "__main__":
     unittest.main()

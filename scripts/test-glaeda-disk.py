@@ -4875,6 +4875,50 @@ class GlaedaDiskTest(unittest.TestCase):
         subprocess.run(["git", "-C", os.fspath(wt), "commit", "-q", "--allow-empty", "-m", "only in the worktree"],
                        env=env, check=True, capture_output=True)
 
+    def test_a_dedicated_runners_warm_state_is_kept_by_role(self) -> None:
+        """The dedicated nightly builder's checkout and its DerivedData cache stay by role (ROLE_KEEP_MARKER), however
+        old; its _temp leftovers, other runners' checkouts and other caches still go by age."""
+        stale = gd.RUNNER_STALE_CHECKOUT_HOURS
+        names = {"actions-runner-glaeda-nightly-next": stale + 30, "actions-runner-glaeda": stale + 30}
+        home, cos = self._idle_checkouts(names)
+        patch_home = mock.patch.object(gd, "HOME", home)
+        patch_home.start()
+        self.addCleanup(patch_home.stop)
+        runner = home / "actions-runner-glaeda-nightly-next"
+        cache = home / "Library/Caches/cmux-nightly-next/mini-glaeda-nightly-next"
+        (cache / "DerivedData").mkdir(parents=True)
+        other_cache = home / "Library/Caches/cmux-nightly-next/someone-else"
+        other_cache.mkdir(parents=True)
+        (runner / gd.ROLE_KEEP_MARKER).write_text(json.dumps([os.fspath(cos[runner.name]), os.fspath(cache)]))
+        self.assertTrue(gd.toolchain_held(cos[runner.name]))
+        self.assertTrue(gd.toolchain_held(cos[runner.name] / ".git"), "inside a kept path")
+        self.assertTrue(gd.toolchain_held(cache / "DerivedData"))
+        self.assertFalse(gd.toolchain_held(other_cache))
+        self.assertFalse(gd.toolchain_held(cos["actions-runner-glaeda"]))
+        self.assertFalse(gd.toolchain_held(runner / "_work/_temp"), "_temp is not kept")
+        self.assertTrue(gd.toolchain_held(runner), "above a kept path: the runner dir is never taken whole")
+        with self.assertRaises(OSError):
+            gd.remove(cache)
+        # a marker naming the runner, its _work, the home or a path outside home keeps nothing more
+        for bad in (os.fspath(runner), os.fspath(runner / "_work"), os.fspath(home), "/tmp", "relative"):
+            with self.subTest(bad=bad):
+                (runner / gd.ROLE_KEEP_MARKER).write_text(json.dumps([bad]))
+                self.assertEqual(gd.role_keep(), ())
+        # an unenrolled directory's marker counts for nothing
+        stray = home / "actions-runner-glaeda-stray"
+        stray.mkdir()
+        (stray / gd.ROLE_KEEP_MARKER).write_text(json.dumps([os.fspath(cache)]))
+        self.assertEqual(gd.role_keep(), ())
+        (runner / gd.ROLE_KEEP_MARKER).write_text(json.dumps([os.fspath(cos[runner.name]), os.fspath(cache)]))
+        gd.process_evidence = lambda: ([], "")
+        for name in names:
+            self._git_checkout(cos[name])
+            self._age(home / name, hours=names[name])
+        patches, removed = self._floor_disk(400.0)
+        with patches[0], patches[1], contextlib.redirect_stdout(io.StringIO()):
+            gd.evict_idle_runner_checkouts(self.receipt(), 30.0, home)
+        self.assertEqual(removed, [str(cos["actions-runner-glaeda"])], "only the pool runner's old checkout goes")
+
     def test_stale_runner_checkouts_go_above_the_floor_and_without_one(self) -> None:
         """Old runner work dirs go by age: a checkout no job used for DEFAULT_AGE_HOURS goes whatever the free space,
         unless git would lose something (a commit on no remote-tracking ref) or holds a lock; younger ones stay."""
