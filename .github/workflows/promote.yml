@@ -20,12 +20,14 @@ permissions:
   contents: write
   statuses: read
 
-# One group per run: a shared group let the next cron or canary dispatch replace a waiting promotion
-# (an operator's soak_hours dispatch included). Every run decides from the releases and statuses it reads
-# when it starts, and stable.json only moves forward: the write re-reads it and gives way when another
-# promotion moved it meanwhile (the next run reconsiders).
+# stable.json has this one writer, one run at a time. The group is shared on purpose: every run decides
+# from the releases and statuses it reads when it starts, so a waiting run that GitHub replaces loses
+# nothing the run that replaced it does not do (scripts/test-delivery-concurrency.py declares it). A
+# release asset upload has no compare-and-swap, so stable.json keeps this one group rather than racing
+# writers. The one input, an operator's soak_hours, can be replaced by a later cron while it waits; GitHub
+# then shows the dispatch as cancelled and the operator dispatches it again.
 concurrency:
-  group: ota-stable-${{ github.run_id }}
+  group: ota-stable
   cancel-in-progress: false
 
 jobs:
@@ -93,17 +95,6 @@ jobs:
           cat channels/why.txt >> "$GITHUB_STEP_SUMMARY"
           if [ "$code" = 3 ]; then exit 0; fi
           [ "$code" = 0 ] || exit "$code"
-          # Compare-and-swap on stable.json: write only while it still names what this run decided from.
-          latest_source=""
-          if gh release download ota-channels --pattern stable.json --output channels/latest.json --clobber 2>channels/err; then
-            latest_source=$(python3 -c 'import json;print(json.load(open("channels/latest.json"))["source"])')
-          elif ! grep -q -e "no assets match" -e "release not found" channels/err; then
-            cat channels/err; exit 1
-          fi
-          if [ "$latest_source" != "$stable_source" ]; then
-            echo "stable moved to ${latest_source:-none} while this run decided from ${stable_source:-none}; nothing written, the next run reconsiders" >> "$GITHUB_STEP_SUMMARY"
-            exit 0
-          fi
           mv channels/next.json channels/stable.json
           gh release upload ota-channels channels/stable.json --clobber
           cat channels/stable.json >> "$GITHUB_STEP_SUMMARY"

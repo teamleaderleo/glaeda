@@ -74,11 +74,10 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     if: github.repository == 'teamleaderleo/glaeda' && github.ref == 'refs/heads/main'
-    # One group per commit: a shared group let a newer push replace an older pending publish, so that
-    # commit never got its durable release. canary.json still only moves forward: the write below
-    # re-reads it and refuses a commit that does not descend from what it names.
+    # One group per commit: every push gets its durable release, and a newer push never replaces an
+    # older pending publish (a shared group did). canary.json moves in the canary job below.
     concurrency:
-      group: ota-canary-${{ github.sha }}
+      group: ota-release-${{ github.sha }}
       cancel-in-progress: false
     permissions:
       contents: write
@@ -119,49 +118,72 @@ jobs:
             gh release create "$TAG" release-assets/* --target "$GITHUB_SHA" --prerelease --latest=false \
               --title "$TAG" --notes "glaeda $GITHUB_SHA. Installed by glaeda-update on the canary ring first (docs/GLAEDA_OTA.md)."
           fi
-      - name: Move canary to it
+
+  # canary.json has this one writer, one run at a time. A waiting run that GitHub replaces loses nothing:
+  # each run moves canary to the newest published release on main that descends from the current
+  # canary, read when it starts, and the run that replaced it started after that release existed.
+  # scripts/test-delivery-concurrency.py holds the group.
+  canary:
+    needs: publish
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    if: github.repository == 'teamleaderleo/glaeda' && github.ref == 'refs/heads/main'
+    concurrency:
+      group: ota-canary
+      cancel-in-progress: false
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          show-progress: false
+          fetch-depth: 0  # canary only moves forward: the ancestry checks need history
+      - name: Move canary to the newest release
         run: |
+          set -euo pipefail
+          # Releases of later pushes may be newer than this run's commit.
+          git fetch --quiet origin main
+          main=$(git rev-parse FETCH_HEAD)
           mkdir -p channels
           if ! gh release view ota-channels >/dev/null 2>&1; then
             python3 scripts/glaeda_release.py control --paused false > channels/control.json
             gh release create ota-channels channels/control.json --target "$GITHUB_SHA" --prerelease --latest=false \
               --title "OTA channels" --notes "canary.json, stable.json, control.json: what each glaeda-update ring installs (docs/GLAEDA_OTA.md)."
           fi
+          previous=""
+          previous_tag=""
           if gh release download ota-channels --pattern canary.json --dir channels 2>channels/err; then
             previous=$(python3 -c 'import json;print(json.load(open("channels/canary.json"))["source"])')
-            set +e
-            git merge-base --is-ancestor "$previous" "$GITHUB_SHA"
-            descends=$?
-            set -e
-            if [ "$descends" = 1 ]; then
-              echo "canary stays at $previous: $GITHUB_SHA does not descend from it" >> "$GITHUB_STEP_SUMMARY"
-              exit 0
-            elif [ "$descends" != 0 ]; then
+            previous_tag=$(python3 -c 'import json;print(json.load(open("channels/canary.json"))["tag"])')
+            if ! git merge-base --is-ancestor "$previous" "$main" 2>/dev/null; then
               echo "canary commit $previous is not in main's history (rewritten?); fix canary.json by hand" >&2
               exit 1
             fi
           elif ! grep -q "no assets match" channels/err; then
             cat channels/err; exit 1
           fi
-          python3 scripts/glaeda_release.py canary --release release-assets/release.json > channels/next.json
-          # Publishes of different commits run side by side: read canary.json again right before the write and
-          # never move it back to a commit the newer canary does not descend from.
-          if gh release download ota-channels --pattern canary.json --output channels/latest.json --clobber 2>channels/err; then
-            latest=$(python3 -c 'import json;print(json.load(open("channels/latest.json"))["source"])')
-            set +e
-            git merge-base --is-ancestor "$latest" "$GITHUB_SHA"
-            descends=$?
-            set -e
-            if [ "$descends" = 1 ]; then
-              echo "canary moved to $latest meanwhile; $GITHUB_SHA does not descend from it, canary stays" >> "$GITHUB_STEP_SUMMARY"
-              exit 0
-            elif [ "$descends" != 0 ]; then
-              echo "canary commit $latest is not in main's history (rewritten?); fix canary.json by hand" >&2
-              exit 1
-            fi
-          elif ! grep -q "no assets match" channels/err; then
-            cat channels/err; exit 1
+          # Newest first, down to the current canary's release.
+          gh release list --limit 40 --json tagName \
+            --jq '.[] | select(.tagName | test("^r-[0-9]{8}-[0-9a-f]{12}$")) | .tagName' > channels/tags.txt
+          best="" best_depth=-1 best_tag=""
+          while read -r tag; do
+            [ "$tag" != "$previous_tag" ] || break
+            gh release download "$tag" --pattern release.json --output "channels/$tag.json" --clobber || continue
+            source=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["source"])' "channels/$tag.json")
+            git merge-base --is-ancestor "$source" "$main" 2>/dev/null || continue
+            if [ -n "$previous" ] && ! git merge-base --is-ancestor "$previous" "$source"; then continue; fi
+            depth=$(git rev-list --count "$source")
+            if [ "$depth" -gt "$best_depth" ]; then best="$source" best_depth="$depth" best_tag="$tag"; fi
+          done < channels/tags.txt
+          if [ -z "$best" ] || [ "$best" = "$previous" ]; then
+            echo "canary stays at ${previous:-none}: no newer release on main descends from it" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
           fi
+          python3 scripts/glaeda_release.py canary --release "channels/$best_tag.json" > channels/next.json
           mv channels/next.json channels/canary.json
           gh release upload ota-channels channels/canary.json --clobber
           cat channels/canary.json >> "$GITHUB_STEP_SUMMARY"

@@ -16,11 +16,18 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 WORKFLOWS = ROOT / ".github" / "workflows"
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from delivery_concurrency import can_be_shared, findings, stale_allowances  # noqa: E402
+from delivery_concurrency import can_be_shared, findings, matching, stale_allowances  # noqa: E402
 
-DELIVERY_GLOBS = ("release*.yml", "*promote*.yml", "mirror*.yml", "nightly*.yml", "*-nightly*.yml")
+DELIVERY_GLOBS = ("release*.yml", "*-release*.yml", "*promote*.yml", "mirror*.yml", "nightly*.yml", "*-nightly*.yml",
+                  "publish*.yml", "*-publish*.yml", "dev-*.yml", "*-dev-*.yml", "*deliver*.yml")
 REQUIRED = ("release.yml", "promote.yml", "mirror.yml")
 ALLOWED_SHARED: dict[tuple[str, str], str] = {
+    ("release.yml", "canary"): (
+        "canary.json's one writer: each run moves canary to the newest release on main that descends from "
+        "it, read when it starts, so the run that replaced a waiting one covers its release"),
+    ("promote.yml", ""): (
+        "stable.json's one writer (a release asset upload has no compare-and-swap): each run decides from the "
+        "releases and statuses it reads when it starts"),
     ("mirror.yml", ""): (
         "a schedule-only copy of upstream's tags, releases and channel files as they are when it starts; "
         "the waiting run copies everything a replaced one would have"),
@@ -28,7 +35,7 @@ ALLOWED_SHARED: dict[tuple[str, str], str] = {
 
 
 def delivery_workflows() -> list[Path]:
-    return sorted({p for pattern in DELIVERY_GLOBS for p in WORKFLOWS.glob(pattern)})
+    return matching(WORKFLOWS, DELIVERY_GLOBS)
 
 
 class DeliveryConcurrencyTest(unittest.TestCase):
