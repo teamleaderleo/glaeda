@@ -72,15 +72,11 @@ class Mirror(unittest.TestCase):
         git_dir = root / "fleet/git"
         patches = {"GIT_DIR": git_dir, "MIRROR": git_dir / "cmux.git", "RECORD": git_dir / "cmux.json",
                    "REPO_URL": self.upstream.as_uri(), "BUCKET_URL": "https://bucket.test", "SEED_MIN_FREE": 0,
-                   "download": self.fake_download, "zstd": lambda: None, "BACKOFF": (0, 0)}
+                   "download": self.fake_download, "zstd": lambda: None, "BACKOFF": (0, 0), "SUBMODULES": ()}
         for name, value in patches.items():
             old = getattr(gm, name)
             setattr(gm, name, value)
             self.addCleanup(setattr, gm, name, old)
-        # seed()'s default argument captured the real download at definition time.
-        real_seed = gm.seed
-        gm.seed = lambda mirror, from_github, fetch_url=self.fake_download: real_seed(mirror, from_github, fetch_url)
-        self.addCleanup(setattr, gm, "seed", real_seed)
         self.mirror = git_dir / "cmux.git"
 
     def commit(self, message: str) -> str:
@@ -200,7 +196,7 @@ class Mirror(unittest.TestCase):
                 repo = Path(temp) / "r.git"
                 sh("git", "init", "-q", "--bare", os.fspath(repo))
                 (self.bucket / f"v1/any/latest/{gm.BUNDLE_PREFIX}").unlink()
-                gm.fill(repo, Path(temp), True, gm.download)
+                gm.from_url("https://example.test/r.git", ("main",))(repo, Path(temp))
         finally:
             gm.fetch = real
         self.assertEqual(calls, [["--refetch"]])
@@ -267,7 +263,7 @@ class Mirror(unittest.TestCase):
         gm.fill = killed
         try:
             with self.assertRaises(KeyboardInterrupt):
-                gm.seed(self.mirror, False, self.fake_download)
+                gm.seed(self.mirror, [("bundle", lambda r, w: gm.seed_from_bundle(r, w, self.fake_download))])
         finally:
             gm.fill = real
         sh("git", "-C", os.fspath(self.mirror), "config", "--unset-all", "remote.origin.promisor")  # as if lost
@@ -310,7 +306,7 @@ class Mirror(unittest.TestCase):
         (self.bucket / f"v1/any/latest/{gm.BUNDLE_PREFIX}").unlink()
         result = gm.run(True, home=self.home)
         self.assertEqual(result["state"], "error", result)
-        self.assertIn("R2 bundle", result["reason"])
+        self.assertIn("bundle", result["reason"])
         self.assertFalse(self.mirror.exists())
         # The operator's fallback fills the staging repository before it takes the path.
         result = gm.run(True, home=self.home, from_github=True)
@@ -412,6 +408,109 @@ class Mirror(unittest.TestCase):
         result = gm.run(False, home=self.home)
         self.assertEqual((result["state"], result["health"]), ("plan", "missing"))
         self.assertFalse(self.mirror.exists())
+
+
+# Stands in for /usr/bin/ssh to the LAN cache host: the real glaeda-seed-serve --role cache answers.
+FAKE_SSH = """import json, os, sys
+address, request = sys.argv[-2], sys.argv[-1]
+with open(os.environ["FAKE_SSH_LOG"], "a") as log:
+    log.write(json.dumps([address, request]) + "\\n")
+if address != os.environ["FAKE_LAN_HOST"]:
+    sys.stderr.write("ssh: No route to host\\n"); sys.exit(255)
+os.environ["SSH_ORIGINAL_COMMAND"] = request
+os.environ["SSH_CLIENT"] = "172.20.21.197 1 22"
+os.execv(sys.executable, [sys.executable, "-I", os.environ["FAKE_SERVE"], "--role", "cache",
+                          "--mirrors", os.environ["FAKE_MIRRORS"], "--cache", os.environ["FAKE_MIRRORS"] + "/c",
+                          "--run-dir", os.environ["FAKE_MIRRORS"] + ".run", "--receipt", os.environ["FAKE_RECEIPT"]])
+"""
+
+
+class LanSource(unittest.TestCase):
+    """A mini whose source is `lan` fetches from the LAN cache host's mirror, and the bucket and GitHub
+    only when the host cannot be reached."""
+
+    commit = Mirror.commit
+    fake_download = Mirror.fake_download
+
+    def setUp(self) -> None:
+        Mirror.setUp(self)
+        root = Path(os.path.realpath(self.temp.name))
+        # The cache host: a `direct` pass of its own, whose record names the ready mirrors.
+        self.host_git = root / "host/git"
+        self.pass_on(self.host_git)
+        self.assertEqual(gm.run(True, home=self.home)["state"], "applied")
+        self.assertEqual(set(json.loads((self.host_git / "cmux.json").read_text())["ready"]), {"cmux"})
+        receipt = root / "receipt.json"
+        receipt.write_text(json.dumps({"member": {"trustedRef": "refs/heads/main"}}))
+        fake = root / "fake-ssh"
+        fake.write_text(f"#!{sys.executable}\n" + FAKE_SSH)
+        fake.chmod(0o755)
+        self.ssh_log = root / "ssh.log"
+        saved = dict(os.environ)
+        self.addCleanup(lambda: (os.environ.clear(), os.environ.update(saved)))
+        os.environ.update({"FAKE_LAN_HOST": "172.20.21.202", "FAKE_SERVE": os.fspath(ROOT / "scripts/glaeda-seed-serve"),
+                           "FAKE_MIRRORS": os.fspath(self.host_git), "FAKE_RECEIPT": os.fspath(receipt),
+                           "FAKE_SSH_LOG": os.fspath(self.ssh_log)})
+        old = gm.SSH
+        gm.SSH = os.fspath(fake)
+        self.addCleanup(setattr, gm, "SSH", old)
+        conf = self.home / gm.SOURCE_CONFIG
+        (conf.parent / "id_ed25519").write_text("k")
+        (conf.parent / "known_hosts").write_text("x")
+        conf.write_text(json.dumps({"schema": 1, "source": "lan", "user": "cmux",
+                                    "addresses": ["172.20.21.9", "172.20.21.202"]}))
+        # The mini.
+        self.mini_git = root / "mini/git"
+        self.pass_on(self.mini_git)
+        self.downloads.clear()
+
+    def pass_on(self, git_dir: Path) -> None:
+        for name, value in (("GIT_DIR", git_dir), ("MIRROR", git_dir / "cmux.git"), ("RECORD", git_dir / "cmux.json")):
+            setattr(gm, name, value)
+        self.mirror = git_dir / "cmux.git"
+
+    def test_a_mini_seeds_and_fetches_from_the_lan_host_never_the_uplink(self) -> None:
+        result = gm.run(True, home=self.home)
+        self.assertEqual(result["state"], "applied", result)
+        self.assertEqual(result["lan"], {"address": "172.20.21.202", "ready": ["cmux"]})
+        self.assertTrue(result["seeded"]["source"].startswith("lan 172.20.21.202"), result["seeded"])
+        self.assertEqual(self.downloads, [])
+        self.assertNotIn("fetch", result)  # GitHub was never asked
+        # A new commit reaches the mini through the host's next pass.
+        tip = self.commit("two")
+        self.pass_on(self.host_git)
+        (self.home / gm.SOURCE_CONFIG).write_text(json.dumps({"schema": 1, "source": "direct"}))
+        gm.run(True, home=self.home)
+        (self.home / gm.SOURCE_CONFIG).write_text(json.dumps({"schema": 1, "source": "lan", "user": "cmux",
+                                                              "addresses": ["172.20.21.202"]}))
+        self.pass_on(self.mini_git)
+        result = gm.run(True, home=self.home)
+        self.assertTrue(result["fetch_lan"]["ok"], result)
+        self.assertEqual(result["heads"]["main"], tip)
+        self.assertNotIn("fetch", result)
+
+    def test_a_down_host_falls_back_to_the_bundle_and_github(self) -> None:
+        os.environ["FAKE_LAN_HOST"] = "nobody"
+        result = gm.run(True, home=self.home)
+        self.assertEqual(result["state"], "applied", result)
+        self.assertEqual(result["lan"], {"reachable": False})
+        self.assertIn("bundle", result["seeded"]["source"])
+        self.assertTrue(result["fetch"]["ok"])
+
+    def test_a_reachable_host_without_the_mirror_makes_the_mini_wait(self) -> None:
+        (self.host_git / "cmux.json").write_text(json.dumps({"ready": {}}))
+        result = gm.run(True, home=self.home)
+        self.assertEqual(result["state"], "waiting", result)
+        self.assertEqual(self.downloads, [])
+        self.assertFalse(self.mirror.exists())
+
+    def test_the_host_serves_only_mirrors_it_named_ready(self) -> None:
+        out = subprocess.run([gm.SSH, "172.20.21.202", "git-upload-pack 'ghostty.git'"], capture_output=True,
+                             stdin=subprocess.DEVNULL)
+        self.assertEqual(out.returncode, 3)
+        out = subprocess.run([gm.SSH, "172.20.21.202", "git-upload-pack '../cmux.git'"], capture_output=True,
+                             stdin=subprocess.DEVNULL)
+        self.assertEqual(out.returncode, 2)
 
 
 class Fetch(unittest.TestCase):
