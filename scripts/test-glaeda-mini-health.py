@@ -2790,11 +2790,16 @@ class ForeignRunnerTest(unittest.TestCase):
             (folder / f"{label}.plist").write_bytes(plistlib.dumps(doc))
         plist(agents, "ai.manaflow.nightly-builder.runner", ["/bin/bash", "run.sh"], os.fspath(old))
         plist(agents, "ai.manaflow.nightly-builder.watch", ["/usr/bin/python3", "/x/nightly_builder.py", "watch"])
+        (home / "actions-runner").mkdir()
+        (home / "actions-runner/.runner").write_text("{}")
         plist(daemons, "actions.runner.manaflow-ai-cmux.mini", [f"{home}/actions-runner/runsvc.sh"])
         plist(agents, "com.teamleaderleo.glaeda.cmux-runner.dedicated.nightly-next",
               [f"{home}/actions-runner-glaeda-nightly-next/run.sh"])
         plist(agents, "com.teamleaderleo.glaeda.cmux-runner.3", [f"{home}/actions-runner-glaeda-3/run.sh"])
         (agents / "broken.plist").write_text("not a plist")
+        (home / "build").mkdir()
+        plist(agents, "com.example.build", [f"{home}/build/run.sh"])  # a run.sh outside any runner: not a runner
+        plist(agents, "com.example.relative", ["/bin/bash", "run.sh"], os.fspath(home / "build"))
         mini = health.Mini(home)
         mini.daemons_dir = daemons
         procs = [(1, 501, "S", f"{home}/actions-runner-glaeda-3/bin.2.338.0/Runner.Listener run"),

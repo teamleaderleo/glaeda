@@ -197,12 +197,16 @@ GLAEDA_LABEL_PREFIX = "com.teamleaderleo.glaeda."  # every agent glaeda installs
 LISTENER_RE = re.compile(r"(/\S+?)/bin(?:\.[0-9.]+)?/Runner\.Listener(?:\s|$)")
 
 
-def starts_runner(word: str) -> bool:
-    """A plist word that starts a GitHub runner: its run.sh or runsvc.sh, a Runner.Listener, or a directory holding a
-    runner registration (.runner)."""
-    if re.search(r"(?:^|/)(?:run|runsvc|run-helper)\.sh$|/Runner\.Listener$", word):
+def starts_runner(word: str, cwd: str = "") -> bool:
+    """A plist word that starts a GitHub runner: a Runner.Listener, a directory holding a runner registration
+    (.runner), or a run.sh, runsvc.sh or run-helper.sh that sits in one. A bare "run.sh" counts only with the
+    plist's WorkingDirectory, which the caller passes as `cwd`."""
+    if re.search(r"/Runner\.Listener$", word):
         return True
     with contextlib.suppress(OSError):
+        if re.search(r"(?:^|/)(?:run|runsvc|run-helper)\.sh$", word):
+            script = Path(word) if os.path.isabs(word) else (Path(cwd) / word if cwd else None)
+            return script is not None and (script.parent / ".runner").is_file()
         return os.path.isabs(word) and Path(word, ".runner").is_file()
     return False
 
@@ -640,7 +644,8 @@ class Mini:
                     continue
                 words = [str(w) for w in (doc.get("ProgramArguments") or [])] + [str(doc.get("Program") or ""),
                                                                                  str(doc.get("WorkingDirectory") or "")]
-                if any(starts_runner(w) for w in words if w):
+                cwd = str(doc.get("WorkingDirectory") or "")
+                if any(starts_runner(w, cwd) for w in words if w):
                     out.append((os.fspath(plist), f"{label} starts a GitHub runner glaeda does not manage"))
         own = os.path.realpath(self.home) + "/actions-runner-glaeda"
         for _pid, _uid, _stat, command in self.processes():

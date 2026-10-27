@@ -3026,8 +3026,8 @@ def default_families(role: str = "fleet-mini") -> list[Family]:
                 fams.append(Family("ci-derived-data", temp, True, "the CI test job rebuilds it",
                                    include=("cmux-derived-data-tests-",), build_output=True,
                                    owner="cmux CI test jobs", rebuild_minutes=6, platform="macos"))
-                if (runner / ROLE_KEEP_MARKER).is_file():
-                    # a dedicated runner keeps its warm state by role, so what its jobs leave in _temp goes by age
+                if runner.name.startswith("actions-runner-glaeda-") and (runner / "glaeda-hooks/dedicated-admit.sh").is_file():
+                    # a dedicated runner (its admission wrapper): what its jobs leave in _temp goes by age
                     fams.append(Family("dedicated-runner-temp", temp, True, "the next job writes its own _temp",
                                        files=True, skip=("_github_home", "_github_workflow", "_runner_file_commands"),
                                        skip_prefixes=("cmux-derived-data-tests-",),  # ci-derived-data's

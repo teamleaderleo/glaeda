@@ -4919,6 +4919,24 @@ class GlaedaDiskTest(unittest.TestCase):
             gd.evict_idle_runner_checkouts(self.receipt(), 30.0, home)
         self.assertEqual(removed, [str(cos["actions-runner-glaeda"])], "only the pool runner's old checkout goes")
 
+    def test_a_dedicated_runners_temp_goes_by_age_with_or_without_keep(self) -> None:
+        home = self.root / "home"
+        for name, keep in (("actions-runner-glaeda-nightly-next", True), ("actions-runner-glaeda-ios-internal", False),
+                           ("actions-runner-glaeda-2", False)):
+            runner = home / name
+            (runner / "glaeda-hooks").mkdir(parents=True)
+            (runner / ".runner").write_text("{}")
+            (runner / "_work/_temp").mkdir(parents=True)
+            if name != "actions-runner-glaeda-2":
+                (runner / "glaeda-hooks/dedicated-admit.sh").write_text("#!/bin/sh\n")
+            if keep:
+                (runner / gd.ROLE_KEEP_MARKER).write_text("[]")
+        with mock.patch.object(gd, "HOME", home), mock.patch.object(gd, "DARWIN", True):
+            roots = sorted(os.fspath(f.root.relative_to(home)) for f in gd.default_families()
+                           if f.id == "dedicated-runner-temp")
+        self.assertEqual(roots, ["actions-runner-glaeda-ios-internal/_work/_temp",
+                                 "actions-runner-glaeda-nightly-next/_work/_temp"], "a pool runner's _temp is not this")
+
     def test_stale_runner_checkouts_go_above_the_floor_and_without_one(self) -> None:
         """Old runner work dirs go by age: a checkout no job used for DEFAULT_AGE_HOURS goes whatever the free space,
         unless git would lose something (a commit on no remote-tracking ref) or holds a lock; younger ones stay."""
