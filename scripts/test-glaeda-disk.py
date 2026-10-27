@@ -51,8 +51,8 @@ gd.HOST_RESERVATION_LOCAL = Path(_NO_RESERVATIONS.name + ".none")
 # An --apply in a test must never reap the real $TMPDIR of the host running the suite: without a tmp of
 # the test's own, the TMPDIR reaper does nothing.
 _reap_tmpdir_test_residue = gd.reap_tmpdir_test_residue
-gd.reap_tmpdir_test_residue = (lambda receipt, tmp=None, halt=None:
-                               0 if tmp is None else _reap_tmpdir_test_residue(receipt, tmp, halt))
+gd.reap_tmpdir_test_residue = (lambda receipt, tmp=None, halt=None, every_entry=None:
+                               0 if tmp is None else _reap_tmpdir_test_residue(receipt, tmp, halt, every_entry))
 # Nor git gc the clones in the real home of the host running the suite: only a test's own home is gc'd.
 _gc_home_clones = gd.gc_home_clones
 gd.gc_home_clones = lambda receipt, home=None, halt=None: 0 if home is None else _gc_home_clones(receipt, home, halt)
@@ -5072,6 +5072,91 @@ class GlaedaDiskTest(unittest.TestCase):
                 yield [Other(x) for x in it]
         with mock.patch.object(gd.os, "scandir", scandir):
             self.assertIsNone(gd.tree_newest(e["socket"]))
+
+    def test_tmpdir_test_residue_reaps_screenshots_scratch_with_a_guarded_temporary_items(self) -> None:
+        """macOS guards $TMPDIR/<entry>/TemporaryItems: never opened, and the entry goes from one level down."""
+        tmp, e = self._tmp_residue()
+        shot = tmp / "cmux-screenshots-tests-00303B44-B4A7-458D-9A15-8674711569DB"
+        (shot / "TemporaryItems").mkdir(parents=True)
+        self._age(shot, hours=72)
+        real_scandir, real_remove, removed_from = os.scandir, gd.remove, []
+
+        def scandir(path):
+            if isinstance(path, (str, os.PathLike)) and os.fspath(path) == os.fspath(shot / "TemporaryItems"):
+                raise InterruptedError(errno.EINTR, "guarded")  # a CI mini blocks, then fails
+            return real_scandir(path)
+
+        def remove(path, after_rename=None):
+            removed_from.append(path.parent.name)
+            real_remove(path, after_rename)
+        receipt = self.receipt()
+        with mock.patch.object(gd.os, "scandir", scandir), mock.patch.object(gd, "remove", remove), \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertIsNotNone(gd.tree_newest(shot))  # the guarded child is read by its stat only
+            gd.reap_tmpdir_test_residue(receipt, tmp)
+        self.assertFalse(shot.exists())
+        hold = f"{gd.DELETING_PREFIX}{gd.TMP_TEST_RESIDUE_FAMILY}-{os.getpid()}"
+        self.assertIn(hold, removed_from)  # deleted from the holding dir, one level below $TMPDIR
+        self.assertFalse((tmp / hold).exists())
+        self.assertEqual(json.loads(receipt.read_text())["by_prefix"]["cmux-screenshots-tests"], 1)
+
+    def test_tmpdir_test_residue_on_a_runner_host_takes_every_unkept_entry(self) -> None:
+        tmp, e = self._tmp_residue()
+        kept = {name: tmp / name for name in (".hidden-state", "TemporaryItems", "tmux-501", "xcrun_db")}
+        for path in kept.values():
+            path.mkdir()
+        listener = tmp / "phone-tests-sock"
+        listener.mkdir()
+        cwd, sock = os.getcwd(), socket.socket(socket.AF_UNIX)
+        try:
+            os.chdir(listener)  # a short relative path: AF_UNIX paths are limited to ~104 bytes
+            sock.bind("s")
+        finally:
+            os.chdir(cwd)
+        for path in [*kept.values(), listener]:
+            self._age(path, hours=72)
+        receipt = self.receipt()
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                gd.reap_tmpdir_test_residue(receipt, tmp, every_entry=True)
+        finally:
+            sock.close()
+        self.assertFalse(e["unknown"].exists())  # no prefix names it: on a runner host it is test scratch
+        self.assertFalse(e["dash"].exists())
+        self.assertTrue(e["apple"].is_dir())
+        self.assertTrue(all(p.is_dir() for p in kept.values()))
+        self.assertTrue(listener.is_dir())  # a socket below an unnamed entry keeps it
+        rec = json.loads(receipt.read_text())
+        self.assertEqual(rec["by_prefix"][gd.TMP_TEST_RESIDUE_OTHER], 2)
+        self.assertEqual(rec["kept"]["not proven idle"], 1)
+        # a directory given without every_entry keeps everything no prefix names
+        tmp2 = self.root / "T2"
+        (tmp2 / "notes-from-an-agent").mkdir(parents=True)
+        self._age(tmp2 / "notes-from-an-agent", hours=72)
+        with contextlib.redirect_stdout(io.StringIO()):
+            gd.reap_tmpdir_test_residue(self.receipt(), tmp2)
+        self.assertTrue((tmp2 / "notes-from-an-agent").is_dir())
+
+    def test_tmpdir_test_residue_census_counts_without_walking(self) -> None:
+        tmp, e = self._tmp_residue()
+        walked = []
+        with mock.patch.object(gd, "tree_newest", side_effect=lambda *a, **k: walked.append(a)):
+            named = gd.tmp_test_residue_census(tmp)
+            every = gd.tmp_test_residue_census(tmp, every_entry=True)
+        self.assertEqual(walked, [])
+        total = len(list(tmp.iterdir()))
+        # named: socket, git, foundation, file, recent, inner-recent, link; all but recent are old at the top
+        self.assertEqual(named, {"entries": total, "test_residue": 7, "idle": 6,
+                                 "idle_hours": gd.TMP_TEST_RESIDUE_IDLE_HOURS, "every_entry": False})
+        self.assertEqual((every["test_residue"], every["idle"], every["every_entry"]), (9, 8, True))
+        self.assertIsNone(gd.tmp_test_residue_census(self.root / "missing"))
+
+    def test_tmpdir_test_residue_prefix(self) -> None:
+        self.assertEqual(gd.tmp_test_residue_prefix("cmux-screenshots-tests-0A1B", False), "cmux-screenshots-tests")
+        self.assertIsNone(gd.tmp_test_residue_prefix("downloads-0A1B2C", False))
+        self.assertEqual(gd.tmp_test_residue_prefix("downloads-0A1B2C", True), gd.TMP_TEST_RESIDUE_OTHER)
+        for keep in ("com.apple.WebKit", ".X", "TemporaryItems", "tmux-501", "ssh-abc", "xcrun_db"):
+            self.assertIsNone(gd.tmp_test_residue_prefix(keep, True), keep)
 
     def test_tmpdir_test_residue_main_apply_reaps_the_user_tmp(self) -> None:
         tmp, e = self._tmp_residue()
