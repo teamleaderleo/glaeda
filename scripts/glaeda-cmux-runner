@@ -823,15 +823,16 @@ def hook_wrappers(ctx: Context) -> dict[str, bytes]:
         "if /usr/bin/pgrep -f \"$tree\" >/dev/null; then\n"
         "    echo \"$(date -u '+%Y-%m-%d %H:%M:%SZ'): glaeda-cmux-runner-gate: the gate exited $code with its runner running; stopping the runner once it has no job\"\n"
         "    # idle only by the hook's own test (no Worker, no request its listener took: exit 3), decided with the\n"
-        "    # listener frozen so it cannot take one before the SIGINT; a hook that cannot answer keeps the runner\n"
+        "    # listener and run.sh/run-helper.sh frozen, so none can start or take one before the SIGINT; a hook that\n"
+        "    # cannot answer keeps the runner\n"
         "    while [ -z \"$stopping\" ] && /usr/bin/pgrep -f \"$tree\" >/dev/null; do\n"
-        "        /usr/bin/pkill -STOP -f \"$re/bin[^/ ]*/Runner\\.Listener\"; frozen=$?\n"
+        "        /usr/bin/pkill -STOP -f \"$re/(run(-helper)?\\.sh|bin[^/ ]*/Runner\\.Listener)\"; frozen=$?\n"
         f"        {python} {hook} busy --runner-dir \"$dir\" >/dev/null 2>&1; busy=$?\n"
         "        if [ \"$frozen\" -le 1 ] && [ \"$busy\" -eq 3 ]; then\n"
         "            /usr/bin/pkill -INT -f \"$re/bin[^/ ]*/Runner\\.Listener\" ||\n"
         "                /usr/bin/pkill -TERM -f \"$re/run\"\n"
         "        fi\n"
-        "        /usr/bin/pkill -CONT -f \"$re/bin[^/ ]*/Runner\\.Listener\"\n"
+        "        /usr/bin/pkill -CONT -f \"$re/(run(-helper)?\\.sh|bin[^/ ]*/Runner\\.Listener)\"\n"
         "        sleep 5\n"
         "    done\n"
         "    exit 1\n"
@@ -1555,13 +1556,18 @@ def relabel(ctx: Context, act: dict[str, Any]) -> None:
             act["state"], act["note"] = "failed", ("re-registered, but " + why)[:400]
 
 
+LAUNCHCTL_NOT_FOUND = 113  # launchctl print: "Could not find service"; anything else is no proof it is gone
+
+
 def bootout(ctx: Context, wait_s: float = 15.0) -> bool:
-    """Unload this runner's agent; True once launchd no longer has it (launchd SIGKILLs a job 5 s after its SIGTERM,
-    so wait_s covers that). False: it is still loaded, and the caller must not act as if it stopped."""
+    """Unload this runner's agent; True once launchd says it no longer has it (print exits LAUNCHCTL_NOT_FOUND;
+    launchd SIGKILLs a job 5 s after its SIGTERM, so wait_s covers that). False: still loaded, or a print that
+    failed some other way (sudo refused, a timeout), and the caller must not act as if it stopped."""
     domain = f"system/{ctx.label}" if ctx.headless else f"gui/{ctx.uid}/{ctx.label}"
     run([SUDO, LAUNCHCTL, "bootout", domain] if ctx.headless else [LAUNCHCTL, "bootout", domain])
     deadline = time.monotonic() + wait_s
-    while run(([SUDO, LAUNCHCTL, "print", domain] if ctx.headless else [LAUNCHCTL, "print", domain]))[0] == 0:
+    while run(([SUDO, LAUNCHCTL, "print", domain] if ctx.headless
+               else [LAUNCHCTL, "print", domain]))[0] != LAUNCHCTL_NOT_FOUND:
         if time.monotonic() >= deadline:
             return False
         time.sleep(0.25)

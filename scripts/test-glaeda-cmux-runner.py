@@ -160,13 +160,13 @@ lpath = os.path.join(state, "loaded.json")
 if os.path.exists(lpath):
     loaded = json.load(open(lpath))
     if argv[0] == "print":
-        sys.exit(0 if argv[1].rsplit("/", 1)[1] in loaded else 1)
+        sys.exit(0 if argv[1].rsplit("/", 1)[1] in loaded else 113)  # launchctl's "Could not find service"
     if argv[0] == "bootstrap":
         loaded.append(os.path.basename(argv[2])[:-len(".plist")])
     if argv[0] == "bootout":
         loaded = [l for l in loaded if l != argv[1].rsplit("/", 1)[1]]
     json.dump(loaded, open(lpath, "w"))
-sys.exit(1 if argv[0] == "print" else 0)
+sys.exit(113 if argv[0] == "print" else 0)
 '''
 
 FAKE_CONFIG = FAKE_LOG_HEADER + r'''
@@ -8670,6 +8670,14 @@ class RunnerTest(unittest.TestCase):
         register.assert_not_called()
         self.assertEqual(act["state"], "failed")
         self.assertTrue((runner / ".runner").exists())
+
+    def test_a_bootout_is_done_only_when_launchd_says_the_service_is_gone(self) -> None:
+        ctx = mock.Mock(headless=False, uid=501, label="x")
+        with mock.patch.object(cr, "run", return_value=(127, "")), mock.patch.object(cr.time, "sleep"):
+            self.assertFalse(cr.bootout(ctx, wait_s=0), "a print that failed (timeout, sudo) is no proof")
+        with mock.patch.object(cr, "run", side_effect=[(0, ""), (0, ""), (cr.LAUNCHCTL_NOT_FOUND, "")]), \
+                mock.patch.object(cr.time, "sleep"):
+            self.assertTrue(cr.bootout(ctx))
 
     def test_listen_sh_patterns_match_the_runner_path_literally(self) -> None:
         self.assertEqual(cr.ere_escape("/Users/a.b/actions-runner[1]"), "/Users/a\\.b/actions-runner\\[1\\]")
