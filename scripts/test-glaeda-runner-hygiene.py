@@ -147,5 +147,49 @@ class RunnerHygieneTest(unittest.TestCase):
         close.assert_called_once_with(41)
 
 
+    def place(self, snapshot: bytes | None = None, plist: bytes | None = None) -> None:
+        self.install.install_dir.mkdir(parents=True, exist_ok=True)
+        self.install.snapshot.write_bytes(self.source.read_bytes() if snapshot is None else snapshot)
+        self.install.plist.write_bytes(rh.plist_bytes(self.install) if plist is None else plist)
+
+    def check(self, loaded: bool = True) -> dict:
+        with mock.patch.object(rh, "_managed_plist", return_value=(True, "managed")), \
+                mock.patch.object(rh, "_managed_install", return_value=(True, "managed")), \
+                mock.patch.object(rh, "service_loaded", return_value=loaded):
+            return rh.check(self.install)
+
+    def test_check_is_current_only_for_this_sources_snapshot_and_plist_loaded(self) -> None:
+        self.place()
+        before = sorted((p, p.stat().st_mtime_ns) for p in self.base.rglob("*"))
+        self.assertEqual(self.check()["state"], "current")
+        self.assertEqual(before, sorted((p, p.stat().st_mtime_ns) for p in self.base.rglob("*")), "read-only")
+        self.assertEqual(self.check(loaded=False)["stale"], ["daemon not loaded"])
+        self.place(snapshot=b"# an older glaeda-disk\n")
+        result = self.check()
+        self.assertEqual((result["state"], result["stale"]), ("stale", ["snapshot is not this source"]))
+        self.assertNotEqual(result["installed"], result["sha256"])
+        self.place(plist=rh.plist_bytes(self.install).replace(b"900", b"600"))
+        self.assertEqual(self.check()["stale"], ["plist is not this release's"])
+
+    def test_check_refuses_an_install_that_is_not_ours(self) -> None:
+        with mock.patch.object(rh, "_managed_plist", return_value=(False, "existing plist was edited")), \
+                mock.patch.object(rh, "_managed_install", return_value=(True, "managed")):
+            with self.assertRaisesRegex(rh.HygieneError, "edited"):
+                rh.check(self.install)
+
+    def test_a_plist_an_older_release_wrote_is_replaceable_but_a_hand_edit_is_not(self) -> None:
+        old = plistlib.dumps({**rh.plist_for(self.install), "StartInterval": 600})
+        self.place(plist=old)
+        self.assertEqual(rh._managed_plist(self.install), (False, "existing plist was edited"))
+        self.install.manifest.write_text(json.dumps({"plist_sha256": rh._sha256(self.install.plist)}))
+        # past the edit check: what remains is ownership, which only a root install has
+        self.assertEqual(rh._managed_plist(self.install)[1], "existing plist is not root-owned and protected")
+
+    def test_check_is_read_only_on_the_command_line(self) -> None:
+        with mock.patch.object(rh.platform, "system", return_value="Darwin"), \
+                self.assertRaises(SystemExit):
+            rh.main(["--user", self.account.name, "--check", "--apply"])
+
+
 if __name__ == "__main__":
     unittest.main()
