@@ -1295,10 +1295,14 @@ class Daemon:
         remaining = seen.get("remaining", floor)
         return "stop" if remaining < reserve else "lean" if remaining < floor or capped else "normal"
 
+    def clock(self) -> float:
+        """Now, for the REST share: the wall clock, or the pinned one a test drives tick(now=...) with."""
+        return time.time() if self.clock_real else self.now
+
     def rest_spent(self) -> int:
         """REST requests this daemon sent in the last hour that GitHub counted (304s are free), by the
         minute: the minute an hour back counts whole, so this errs toward the cap, not past it."""
-        oldest = int(self.now // 60) - 60
+        oldest = int(self.clock() // 60) - 60
         return sum(n for minute, n in self.rest_minutes.items() if minute >= oldest)
 
     def rest_cap(self) -> int:
@@ -1306,8 +1310,10 @@ class Daemon:
         return int(self.policy["restShare"] * limit)
 
     def rest_capped(self) -> bool:
-        """The daemon spent its share of the hourly REST limit: what is left is for everyone else."""
-        return self.rest_spent() >= self.rest_cap()
+        """The daemon spent its share of the hourly REST limit, as near as the largest read can tell:
+        once that read no longer fits, routing reads to REST would only defer them tick after tick
+        while GraphQL could answer them."""
+        return not self.rest_room(max(REST_READ_MAX.values()))
 
     def rest_room(self, cost: int) -> bool:
         """Whether `cost` more counted REST requests fit in the share."""
@@ -1422,7 +1428,9 @@ class Daemon:
         # what the daemon spends.
         self.sent.append((self.now, "free" if free else "rest304" if bucket == "rest" and status == 304 else bucket))
         if bucket == "rest" and not free and status != 304 and not self.writing:
-            minute = int(self.now // 60)
+            # The request's own minute, not the tick's: a tick can run TICK_BUDGET past its start,
+            # and dating its requests early would let them leave the hour's window early.
+            minute = int(self.clock() // 60)
             self.rest_minutes[minute] = self.rest_minutes.get(minute, 0) + 1
             # On disk before the next request, so a daemon that dies mid-tick hands its successor the
             # spend it really made. One small file write per counted request (about 2000 an hour at
@@ -1921,7 +1929,7 @@ class Daemon:
         oldest = self.oldest_data(entries, {e["key"] for e in prs + runs + comments + heads})
         self.prune({e["key"] for e in entries})
         self.post_prune()
-        first_minute = int(self.now // 60) - 60
+        first_minute = int(self.clock() // 60) - 60
         self.rest_minutes = {m: n for m, n in self.rest_minutes.items() if m >= first_minute}
         if self.rest_minutes != self.saved_rest_minutes:
             write_json(BASE / REST_SPEND_FILE, {str(m): n for m, n in self.rest_minutes.items()})
@@ -5308,7 +5316,9 @@ def broker_max_age(fields: list[str]) -> float:
     # A daemon configured to poll less often than every BROKER_MAX_AGE - 30 s would leave its cache
     # always older than the horizon, and every read would go to gh: the horizon follows the cycle.
     # (Not for the live fields above: their horizon is a correctness bound, not a cost.)
-    normal = max(BROKER_MAX_AGE, daemon_policy()["cycle"] + 30.0)
+    cycle = daemon_policy()["cycle"]
+    normal = max(BROKER_MAX_AGE, cycle + 30.0)
+    lean = max(BROKER_LEAN_AGE, cycle * LEAN_FACTOR + 30.0)  # below the floor the daemon reads that rarely
     try:
         age = float(os.environ["GLAEDA_GH_MAX_AGE"])
         return age if age >= 0 else normal
@@ -5324,7 +5334,7 @@ def broker_max_age(fields: list[str]) -> float:
             continue
         remaining = seen.get("remaining")
         if isinstance(remaining, int) and remaining < floor:
-            return max(BROKER_LEAN_AGE, normal)
+            return lean
     return normal
 
 

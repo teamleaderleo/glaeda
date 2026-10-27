@@ -8014,6 +8014,7 @@ class DaemonPolicyTest(Base):
         self.saved_config = gg.DAEMON_CONFIG
         gg.DAEMON_CONFIG = Path(self.tmp.name) / "gh-daemon.json"
         self.addCleanup(setattr, gg, "DAEMON_CONFIG", self.saved_config)
+        self.daemon.clock_real = False  # the share runs on daemon.now here, as tick(now=...) pins it
 
     def configure(self, doc: Any) -> None:
         gg.DAEMON_CONFIG.write_text(json.dumps(doc))
@@ -8085,11 +8086,11 @@ class DaemonPolicyTest(Base):
                               "graphql": {"limit": 5000, "remaining": 1000, "reset": NOW + 1800}}
         self.assertEqual(self.daemon.route("pr"), "rest")  # REST is far richer
         self.assertEqual(self.daemon.mode("rest"), "normal")
-        self.spend_rest(1999)
-        self.assertFalse(self.daemon.rest_capped())
+        self.spend_rest(2000 - gg.REST_READ_MAX["pr"])
+        self.assertFalse(self.daemon.rest_capped())  # the largest read still fits
         self.spend_rest(1)
-        self.assertEqual((self.daemon.rest_spent(), self.daemon.rest_cap()), (2000, 2000))
-        self.assertTrue(self.daemon.rest_capped())
+        self.assertEqual(self.daemon.rest_cap(), 2000)
+        self.assertTrue(self.daemon.rest_capped())  # it no longer does: REST is lean, reads go to GraphQL
         self.assertEqual(self.daemon.richness("rest"), -1)
         self.assertEqual(self.daemon.mode("rest"), "lean")
         self.assertEqual(self.daemon.route("pr"), "graphql")
@@ -8158,19 +8159,35 @@ class DaemonPolicyTest(Base):
         self.assertEqual(gg.broker_max_age(["headRefOid"]), gg.BROKER_MAX_AGE)  # live fields keep theirs
         with mock.patch.dict(os.environ, {"GLAEDA_GH_MAX_AGE": "-1"}):
             self.assertEqual(gg.broker_max_age(["title"]), 330)
+        gg.write_json(gg.BASE / "budget.json", {"rest": {"limit": 5000, "remaining": 1000, "reset": time.time() + 900}})
+        self.assertEqual(gg.broker_max_age(["title"]), 300 * gg.LEAN_FACTOR + 30)  # lean polls that rarely
 
     def test_reaching_the_share_mid_tick_defers_the_rest_reads(self) -> None:
-        for n in (7, 8, 9):
+        for n in range(1, 21):
             self.gh.runs[n] = {"id": n, "status": "in_progress", "html_url": f"u{n}"}
             gg.register(f"run:o/r/{n}")
         self.daemon.budget = {"rest": {"limit": 5000, "remaining": 4500, "reset": NOW + 1800},
                               "graphql": {"limit": 5000, "remaining": 600, "reset": NOW + 1800}}
         self.daemon.paths["run"] = "rest"
-        self.spend_rest(1997, at=NOW)  # room for the first two run reads' worst case (2 each), not a third
+        self.spend_rest(1985, at=NOW)  # one request a read; a read starts only while 2 more fit
         self.daemon.tick(NOW)
-        self.assertEqual(len(self.gh.run_calls()), 2)
-        self.assertEqual(len(self.daemon.deferred), 1)
-        self.assertLessEqual(self.daemon.rest_spent(), self.daemon.rest_cap())
+        self.assertEqual(len(self.gh.run_calls()), 14)
+        self.assertEqual(len(self.daemon.deferred), 6)
+        self.assertEqual(self.daemon.rest_spent(), 1999)
+        # and the next tick routes them to GraphQL rather than defer them again
+        for n in range(1, 21):
+            gg.register(f"run:o/r/{n}")
+        self.daemon.tick(NOW + 2)
+        self.assertEqual(self.daemon.paths["run"], "graphql")
+        self.assertEqual(len(self.gh.run_calls()), 14)
+        self.assertEqual(self.daemon.deferred, set())
+
+    def test_a_request_is_dated_by_its_own_minute(self) -> None:
+        self.daemon.now = NOW - 90  # the tick began 90 s ago
+        self.daemon.transport = lambda *a: (200, {}, b"{}")
+        with mock.patch.object(self.daemon, "clock", return_value=NOW):
+            self.daemon.request("GET", "/repos/o/r/pulls/1")
+        self.assertEqual(self.daemon.rest_minutes, {int(NOW // 60): 1})
 
     def test_a_pr_read_is_admitted_only_when_its_worst_case_fits(self) -> None:
         self.gh.prs[("o", "r", 1)] = pr_node(1)
@@ -8180,8 +8197,10 @@ class DaemonPolicyTest(Base):
         self.daemon.paths["pr"] = "rest"
         self.spend_rest(2000 - gg.REST_READ_MAX["pr"] + 1, at=NOW)
         self.daemon.tick(NOW)
-        self.assertEqual(self.gh.rest_calls(), [])
-        self.assertIn("pr:o/r#1", self.daemon.deferred)
+        self.assertEqual(self.gh.rest_calls(), [])  # 11 no longer fit: it went over GraphQL instead
+        self.assertEqual(len(self.gh.gql_calls()), 1)
+        self.assertFalse(self.daemon.rest_room(gg.REST_READ_MAX["pr"]))
+        self.assertTrue(self.daemon.rest_room(gg.REST_READ_MAX["run"]))
 
     def test_writes_do_not_spend_the_share(self) -> None:
         self.daemon.now = NOW
