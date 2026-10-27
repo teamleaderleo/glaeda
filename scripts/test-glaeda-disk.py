@@ -4841,15 +4841,45 @@ class GlaedaDiskTest(unittest.TestCase):
         git(nested, "update-ref", "refs/remotes/origin/main", "HEAD")
         embedded = co / "vendor/lib"
         embedded.mkdir(parents=True)
-        (co / ".gitmodules").write_text('[submodule "lib"]\n\tpath = vendor/lib\n\turl = https://x/lib\n')
         git(embedded, "init", "-q")
         git(embedded, "commit", "-q", "--allow-empty", "-m", "embedded, on no remote")
+        sha = subprocess.run(
+            ["git", "-C", os.fspath(embedded), "rev-parse", "HEAD"], env=env, check=True, capture_output=True,
+            text=True).stdout.strip()
+        git(co, "update-index", "--add", "--cacheinfo", f"160000,{sha},vendor/lib")  # a gitlink in the index
         self.assertEqual(gd.runner_checkout_git_veto(co), "submodule vendor/lib keeps its own repository in the work tree")
         shutil.rmtree(embedded / ".git")
-        (co / ".gitmodules").write_text("[submodule \"lib\"\n\tpath")  # git cannot parse it: doubt keeps it
-        self.assertEqual(gd.runner_checkout_git_veto(co), "git could not read .gitmodules")
-        (co / ".gitmodules").unlink()
+        (embedded / ".git").write_text("gitdir: ../../.git/modules/lib\n")  # absorbed: followed into its work tree
+        inner = embedded / "deeper"
+        inner.mkdir()
+        git(inner, "init", "-q")
+        self.assertEqual(gd.runner_checkout_git_veto(co), "git could not list the index of lib")  # gitfile is dangling
+        (embedded / ".git").unlink()
+        shutil.rmtree(inner)
+        self.assertEqual(gd.runner_checkout_git_veto(co), "", "an uninitialized submodule has no repository here")
+        (co / ".git/index").write_bytes(b"not an index")  # git cannot list it: doubt keeps it
+        self.assertEqual(gd.runner_checkout_git_veto(co), "git could not list the index of cmux")
+        (co / ".git/index").unlink()
         self.assertEqual(gd.runner_checkout_git_veto(co), "")
+        # refs beyond branches and tags, a locked linked worktree and a symlink inside .git
+        git(co, "commit", "-q", "--allow-empty", "-m", "bisect only")
+        git(co, "update-ref", "refs/bisect/bad", "HEAD")
+        git(co, "checkout", "-q", "--detach", "refs/remotes/origin/main")
+        self.assertEqual(gd.runner_checkout_git_veto(co), "a commit here is on no remote-tracking ref")
+        git(co, "update-ref", "-d", "refs/bisect/bad")
+        (co / ".git/worktrees/w").mkdir(parents=True)
+        (co / ".git/worktrees/w/locked").write_text("")
+        self.assertEqual(gd.runner_checkout_git_veto(co), "a linked worktree of it is locked")
+        shutil.rmtree(co / ".git/worktrees")
+        (co / ".git/modules/elsewhere").symlink_to(self.root)
+        self.assertEqual(gd.runner_checkout_git_veto(co), "a symlink inside .git: git could not say what it holds")
+        (co / ".git/modules/elsewhere").unlink()
+        # a submodule store named refs is still walked
+        named_refs = co / ".git/modules/refs"
+        git(named_refs.parent, "init", "-q", "--bare", "refs")
+        git(named_refs, "--work-tree", os.fspath(self.root), "commit", "-q", "--allow-empty", "-m", "only here")
+        self.assertEqual(gd.runner_checkout_git_veto(co), "a commit in modules/refs is on no remote-tracking ref")
+        shutil.rmtree(named_refs)
         # a linked worktree's submodule store, and a detached HEAD in a submodule's own linked worktree
         store = co / ".git/worktrees/wt/modules/sub"
         store.parent.mkdir(parents=True)
@@ -4897,6 +4927,37 @@ class GlaedaDiskTest(unittest.TestCase):
         git(co, "remote", "set-url", "origin", os.fspath(self.root / "gone.git"))
         self.assertEqual(gd.runner_checkout_git_veto(co), "git could not say whether a commit is only here")
 
+    def test_a_submodule_at_the_commit_a_pushed_head_pins_is_not_only_here(self) -> None:
+        """A submodule is fetched by id at its pin and no ref there names it; HEAD is pushed, so the pin is too.
+        An older pin from an earlier job, which no pushed HEAD's tree names, still keeps the checkout."""
+        env = {"PATH": "/usr/bin:/bin:/opt/homebrew/bin", "HOME": os.fspath(self.root), "GIT_AUTHOR_NAME": "t",
+               "GIT_AUTHOR_EMAIL": "t@x", "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@x"}
+
+        def git(where: Path, *args: str) -> str:
+            return subprocess.run(["git", *args], cwd=where, env=env, check=True, capture_output=True,
+                                  text=True).stdout.strip()
+        co = self.root / "pins/_work/cmux/cmux"
+        self._git_checkout(co)
+        store = co / ".git/modules/ghostty"
+        store.parent.mkdir(parents=True)
+        git(store.parent, "init", "-q", "--bare", "ghostty")
+        git(store, "--work-tree", os.fspath(self.root), "commit", "-q", "--allow-empty", "-m", "old pin")
+        old = git(store, "rev-parse", "HEAD")
+        git(store, "update-ref", "refs/remotes/origin/main", old)
+        git(store, "--work-tree", os.fspath(self.root), "commit", "-q", "--allow-empty", "-m", "pin")
+        pin = git(store, "rev-parse", "HEAD")
+        git(co, "update-index", "--add", "--cacheinfo", f"160000,{pin},ghostty")
+        git(co, "commit", "-q", "-m", "pin ghostty")
+        git(co, "update-ref", "refs/remotes/origin/main", "HEAD")
+        git(co, "checkout", "-q", "--detach", "refs/remotes/origin/main")
+        self.assertEqual(gd.runner_checkout_git_veto(co), "", "the store's HEAD is the pushed HEAD's pin")
+        self.assertEqual(gd.runner_checkout_git_veto(co), "", "history of the pin is on origin with it")
+        empty = git(store, "hash-object", "-t", "tree", "-w", "/dev/null")
+        other = git(store, "commit-tree", empty, "-m", "an unrelated older pin")  # not in the pin's history
+        git(store, "update-ref", "--no-deref", "HEAD", other)  # an older pin no pushed tree names here
+        git(store, "update-ref", "refs/heads/main", other)
+        self.assertEqual(gd.runner_checkout_git_veto(co), "a commit in modules/ghostty is on no remote-tracking ref")
+
     def test_bloat_siblings_share_an_origin_and_an_unreadable_size_counts_none(self) -> None:
         root = self.root / "origin"
         cos = []
@@ -4906,13 +4967,19 @@ class GlaedaDiskTest(unittest.TestCase):
             self._packs(co, size)
             (co / ".git/config").write_text(f'[core]\n\tbare = false\n[remote "origin"]\n\turl = {url}\n')
             cos.append(co)
-        (cos[3] / ".git/config").write_text('[Remote "origin"]\n\tURL = https://github.com/b/foo\n')  # git's own spelling
+        (cos[3] / ".git/included").write_text('[Remote "origin"]\n\tURL = https://GitHub.com/b/foo\n')  # git's spelling
+        (cos[3] / ".git/config").write_text("[include]\n\tpath = included\n")  # through an include
         # a/foo over https and ssh is one repository; b/foo's checkouts are not its siblings
         self.assertEqual(gd.checkout_origin(cos[0]), gd.checkout_origin(cos[1]))
         self.assertNotEqual(gd.checkout_origin(cos[0]), gd.checkout_origin(cos[2]))
         self.assertEqual(set(gd.bloated_runner_checkouts(cos)), {str(cos[0])})
         self.assertEqual(set(gd.bloated_runner_checkouts([cos[0], cos[2], cos[3]])), set(), "no a/foo sibling")
         self.assertEqual(gd.checkout_origin(cos[3]), "github.com/b/foo")
+        (cos[1] / ".git/config").write_text('[remote "origin"]\n\turl = git@github.com:A/foo\n')
+        self.assertNotEqual(gd.checkout_origin(cos[0]), gd.checkout_origin(cos[1]), "a path is case-sensitive")
+        (cos[1] / ".git/config").write_text('[remote "origin"]\n\turl = git@github.com:a/foo\n')
+        (cos[2] / ".git/config").write_bytes(b'[remote "origin"]\n\turl = https://github.com/b/f\xffoo\n')
+        gd.checkout_origin(cos[2])  # bytes that are not UTF-8 never raise
         (cos[2] / ".git/config").write_text("[core]\n")  # no origin: never a sibling, never bloated
         self.assertIsNone(gd.checkout_origin(cos[2]))
         self.assertEqual(set(gd.bloated_runner_checkouts([cos[0], cos[2]])), set())

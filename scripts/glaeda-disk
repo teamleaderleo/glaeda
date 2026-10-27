@@ -2112,6 +2112,8 @@ def runner_checkout_git_veto(checkout: Path) -> str:
             if any(n in GIT_LOCK_NAMES for n in (*files, *dirs)) or any(
                     f.endswith(".lock") and "refs" in rel for f in files):
                 return "git holds a lock in it"
+            if len(rel) == 2 and rel[0] == "worktrees" and "locked" in files:
+                return "a linked worktree of it is locked"
     except OSError:
         return "git could not say whether it holds a lock"
     # the caller's GIT_* would override -C (a hook's GIT_DIR names one repository for every checkout)
@@ -2121,6 +2123,7 @@ def runner_checkout_git_veto(checkout: Path) -> str:
     def git(*args: str, timeout: int = 60) -> str:
         return subprocess.run(["git", "-C", os.fspath(checkout), *args], capture_output=True, text=True,
                               timeout=timeout, env=env, check=True).stdout
+    git.argv, git.env = ["git", "-C", os.fspath(checkout)], env
     try:
         heads = [ln.split(" ", 1)[1] for ln in git("worktree", "list", "--porcelain").splitlines()
                  if ln.startswith("HEAD ")]
@@ -2132,17 +2135,33 @@ def runner_checkout_git_veto(checkout: Path) -> str:
     return submodule_git_veto(dotgit, env)
 
 
-def unpushed_commit(git, heads: list[str]) -> bool:
-    """Whether HEAD, `heads`, a local branch, the stash or a tag names a commit on no remote-tracking ref. A tag
+def git_argv(git) -> list[str]:
+    return git.argv
+
+
+def git_env(git) -> dict[str, str]:
+    return git.env
+
+
+def unpushed_commit(git, heads: list[str], pushed: tuple[str, ...] = ()) -> bool:
+    """Whether HEAD, `heads`, or any ref but a remote-tracking one (a branch, the stash, bisect, notes, refs/worktree,
+    a tag) names a commit on no remote-tracking ref. A tag
     counts only when origin does not have it at the same object: a full-history fetch brings every tag of origin,
     including tags of commits on no branch (cmux's cmux-rbh-src-*, 270 of them on 2026-10-27), and those are not
     only here. Asking origin is one `git ls-remote --tags` (0.3 s), made only when a tag names such a commit; with
     the checkout's expired job token header cleared. Raises when git cannot say, which keeps the checkout."""
-    tips = git("for-each-ref", "--format=%(objectname)", "refs/heads", "refs/stash").split()
-    if git("rev-list", "--max-count=1", "HEAD", *heads, *tips, "--not", "--remotes", timeout=120).strip():
+    refs = [ln.split(" ", 1) for ln in git("for-each-ref", "--format=%(objectname) %(refname)").splitlines()
+            if " " in ln]
+    # every ref but remote-tracking ones and tags: branches, the stash, bisect, notes, refs/worktree, anything
+    tips = [sha for sha, ref in refs if not ref.startswith(("refs/remotes/", "refs/tags/"))]
+    if pushed:  # commits known to be on origin some other way: only those this repository has can go to rev-list
+        listed = subprocess.run([*git_argv(git), "cat-file", "--batch-check=%(objectname) %(objecttype)"],
+                                input="\n".join(pushed) + "\n", capture_output=True, text=True, timeout=60,
+                                env=git_env(git), check=True).stdout
+        pushed = tuple(ln.split(" ", 1)[0] for ln in listed.splitlines() if ln.endswith(" commit"))
+    if git("rev-list", "--max-count=1", "HEAD", *heads, *tips, "--not", "--remotes", *pushed, timeout=120).strip():
         return True
-    tags = dict(ln.split(" ", 1)[::-1] for ln in
-                git("for-each-ref", "--format=%(objectname) %(refname)", "refs/tags").splitlines() if " " in ln)
+    tags = {ref: sha for sha, ref in refs if ref.startswith("refs/tags/")}
     if not tags or not git("rev-list", "--max-count=1", *tags.values(), "--not", "--remotes", timeout=120).strip():
         return False
     origin = {}
@@ -2152,17 +2171,20 @@ def unpushed_commit(git, heads: list[str]) -> bool:
         if ref and not ref.endswith("^{}"):
             origin[ref] = sha
     only_here = [sha for ref, sha in tags.items() if origin.get(ref) != sha]
-    return bool(only_here) and bool(git("rev-list", "--max-count=1", *only_here, "--not", "--remotes",
+    return bool(only_here) and bool(git("rev-list", "--max-count=1", *only_here, "--not", "--remotes", *pushed,
                                         timeout=120).strip())
 
 
+SUBMODULE_DEPTH = 4  # submodules of submodules this deep are followed; deeper is doubt
+
+
 def submodule_git_veto(dotgit: Path, env: dict[str, str]) -> str:
-    """runner_checkout_git_veto's commit rule for every other git dir inside .git: submodule stores under modules/
-    (nested ones too) and under a linked worktree's worktrees/<name>/modules. A HEAD, a linked worktree's HEAD, a
-    branch, a tag origin lacks or the stash there on none of its remote-tracking refs keeps the checkout. Their locks
-    and operations are already in runner_checkout_git_veto's walk of .git. A submodule whose repository is embedded
-    in the work tree (its own .git directory, not absorbed into .git/modules) keeps the checkout outright, and so
-    does any doubt: a git dir that cannot be read or a .gitmodules git cannot parse."""
+    """runner_checkout_git_veto's commit rule for every other git dir inside .git (submodule stores under modules/,
+    nested ones, those under a linked worktree's worktrees/<name>/modules): a HEAD, a linked worktree's HEAD or any
+    ref but a remote-tracking one on none of its remote-tracking refs keeps the checkout. Their locks and operations
+    are in runner_checkout_git_veto's walk of .git. A submodule (a gitlink in the index, followed through absorbed
+    submodules) whose repository sits in the work tree as its own .git directory keeps the checkout outright, and so
+    does doubt: a symlink inside .git, a git dir that cannot be read, or an index git cannot list."""
     def unreadable(error: OSError) -> None:
         raise error
 
@@ -2170,38 +2192,83 @@ def submodule_git_veto(dotgit: Path, env: dict[str, str]) -> str:
     try:
         for root, dirs, files in os.walk(dotgit, onerror=unreadable):
             here = Path(root)
-            if here != dotgit and "HEAD" in files and "objects" in dirs:
+            is_gitdir = "HEAD" in files and "objects" in dirs
+            if here != dotgit and is_gitdir:
                 gitdirs.append(here)
-            dirs[:] = [d for d in dirs if d not in ("objects", "lfs", "logs", "refs") and not (here / d).is_symlink()]
+            if any((here / d).is_symlink() for d in dirs):
+                return "a symlink inside .git: git could not say what it holds"
+            # a git dir's own object store, reflogs and LFS store hold no git dirs; a directory with those names
+            # anywhere else (a submodule named refs) is walked
+            dirs[:] = [d for d in dirs if not (is_gitdir and d in ("objects", "lfs", "logs", "refs"))]
     except OSError:
         return "git could not say whether a submodule commit is only here"
-    tree = dotgit.parent
-    if (tree / ".gitmodules").exists():
-        try:
-            listed = subprocess.run(["git", "config", "--file", os.fspath(tree / ".gitmodules"), "--get-regexp",
-                                     r"^submodule\..*\.path$"], capture_output=True, text=True, timeout=30, env=env)
-        except (OSError, subprocess.SubprocessError):
-            return "git could not read .gitmodules"
-        if listed.returncode not in (0, 1):  # 1: no submodule paths
-            return "git could not read .gitmodules"
-        for line in listed.stdout.splitlines():
-            embedded = tree / line.split(" ", 1)[-1] / ".git"
-            if embedded.is_dir() or embedded.is_symlink():
-                return f"submodule {line.split(' ', 1)[-1]} keeps its own repository in the work tree"
+    why = embedded_submodule_veto(dotgit.parent, env, SUBMODULE_DEPTH)
+    if why:
+        return why
+    # A submodule is checked out at the commit its superproject pins, fetched by id, so no ref names it there; the
+    # superproject's HEAD is on origin (checked first), so every commit its tree pins is on origin too. So are the
+    # pins in those submodules' own pinned trees, which each store's rev-list gets as more pushed commits.
+    try:
+        pins = tuple(gitlink_pins(dotgit.parent, env))
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return "git could not list the submodule commits HEAD pins"
     for gitdir in gitdirs:
         name = os.fspath(gitdir.relative_to(dotgit))
 
         def git(*args: str, timeout: int = 120, gitdir: Path = gitdir) -> str:
             return subprocess.run(["git", "--git-dir", os.fspath(gitdir), *args], capture_output=True, text=True,
                                   timeout=timeout, env=env, check=True).stdout
+        git.argv, git.env = ["git", "--git-dir", os.fspath(gitdir)], env
         try:
             heads = [ln.split(" ", 1)[1] for ln in git("worktree", "list", "--porcelain").splitlines()
                      if ln.startswith("HEAD ")]
-            local = unpushed_commit(git, heads)
+            local = unpushed_commit(git, heads, pins)
         except (OSError, subprocess.SubprocessError, ValueError, IndexError):
             return f"git could not say whether a commit in {name} is only here"
         if local:
             return f"a commit in {name} is on no remote-tracking ref"
+    return ""
+
+
+def gitlink_pins(tree: Path, env: dict[str, str], depth: int = SUBMODULE_DEPTH) -> list[str]:
+    """The submodule commits HEAD's tree pins (mode 160000 entries), and those each initialized submodule's own
+    HEAD tree pins, depth levels down. Only HEAD trees: an index or work tree may pin a commit made here."""
+    out = subprocess.run(["git", "-C", os.fspath(tree), "ls-tree", "-r", "-z", "HEAD"], capture_output=True,
+                         timeout=120, env=env, check=True).stdout
+    pins = []
+    for entry in out.split(b"\0"):
+        if entry.startswith(b"160000 commit "):
+            meta, _, path = entry.partition(b"\t")
+            pins.append(meta.split(b" ")[2].decode())
+            sub = tree / os.fsdecode(path)
+            if depth > 0 and (sub / ".git").is_file():
+                pins += gitlink_pins(sub, env, depth - 1)
+    return pins
+
+
+def embedded_submodule_veto(tree: Path, env: dict[str, str], depth: int) -> str:
+    """Why a work tree's submodules keep the checkout, or "": a gitlink (mode 160000 in the index) whose .git is a
+    directory or a symlink, not a gitfile into the superproject's .git/modules, or such a one in an absorbed
+    submodule's own work tree. Any doubt (git cannot list an index, the nesting is deeper than depth) keeps it."""
+    try:
+        listed = subprocess.run(["git", "-C", os.fspath(tree), "ls-files", "--stage", "-z"], capture_output=True,
+                                timeout=120, env=env, check=True).stdout
+    except (OSError, subprocess.SubprocessError):
+        return f"git could not list the index of {tree.name}"
+    for entry in listed.split(b"\0"):
+        if not entry.startswith(b"160000 "):
+            continue
+        path = os.fsdecode(entry.split(b"\t", 1)[-1])
+        sub = tree / path
+        dotgit = sub / ".git"
+        if dotgit.is_symlink() or dotgit.is_dir():
+            return f"submodule {path} keeps its own repository in the work tree"
+        if not dotgit.exists():
+            continue  # not initialized: no repository of its own here
+        if depth <= 0:
+            return f"submodule {path} is nested deeper than {SUBMODULE_DEPTH}"
+        if why := embedded_submodule_veto(sub, env, depth - 1):
+            return why
     return ""
 
 
@@ -2238,16 +2305,20 @@ def git_pack_bytes(gitdir: Path) -> int | None:
 
 
 def checkout_origin(checkout: Path) -> str | None:
-    """The repository a checkout is of: its remote.origin.url as git reads it, normalized so https and ssh spellings
-    match. None when git cannot say; such a checkout is never anyone's sibling."""
+    """The repository a checkout is of: its remote.origin.url as git reads it (includes too), normalized so https
+    and ssh spellings match (the host lowercased, the path as is). None when git cannot say; such a checkout is
+    never anyone's sibling."""
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    env.update(GIT_OPTIONAL_LOCKS="0", GIT_TERMINAL_PROMPT="0", GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL="/dev/null")
     try:
-        out = subprocess.run(["git", "config", "--file", os.fspath(checkout / ".git/config"), "--get",
-                              "remote.origin.url"], capture_output=True, text=True, timeout=30, check=True,
-                             env={k: v for k, v in os.environ.items() if not k.startswith("GIT_")}).stdout.strip()
-    except (OSError, subprocess.SubprocessError):
+        out = subprocess.run(["git", "config", "--file", os.fspath(checkout / ".git/config"), "--includes", "--get",
+                              "remote.origin.url"], capture_output=True, timeout=30, check=True, env=env).stdout
+        url = os.fsdecode(out).strip()
+    except (OSError, ValueError, subprocess.SubprocessError):
         return None
-    url = out.removesuffix("/").removesuffix(".git")
-    return re.sub(r"^(?:https?://|ssh://)?(?:[^@/]+@)?", "", url).replace(":", "/", 1).lower() or None
+    url = re.sub(r"^(?:https?://|ssh://|git://)?(?:[^@/]+@)?", "", url.removesuffix("/").removesuffix(".git"))
+    host, sep, path = url.replace(":", "/", 1).partition("/")
+    return f"{host.lower()}/{path}" if host and sep and path else None
 
 
 def bloated_runner_checkouts(checkouts: list[Path]) -> dict[str, int]:
