@@ -6040,6 +6040,35 @@ class LinuxLayoutTest(unittest.TestCase):
         self.assertIn("unreadable linked worktree records", why)
         self.assertEqual(bundles, [])
 
+    def test_an_unreadable_reflog_directory_keeps_the_mirror(self) -> None:
+        unit, clone, _ = self.mirror_unit()
+        hidden = clone / ".git/logs/refs/heads"
+        os.chmod(hidden, 0)
+        try:
+            self.assertIsNone(gd.files_strict(clone / ".git/logs"))
+            self.assertIsNone(gd.local_tips(clone / ".git"))
+            why, bundles, _ = gd.archive_mirror(unit)
+        finally:
+            os.chmod(hidden, 0o755)
+        self.assertTrue(why)
+        self.assertEqual(bundles, [])
+
+    def test_a_dirty_or_locked_worktree_in_ignored_output_keeps_the_mirror(self) -> None:
+        unit, clone, env = self.mirror_unit()
+        with (clone / ".git/info/exclude").open("a") as f:
+            f.write("target/\n")
+        wt = clone / "target/wt"
+        self.git(clone, "worktree", "add", "-q", "--detach", str(wt), env=env)
+        (wt / "edit.txt").write_text("uncommitted")
+        why, _, _ = gd.archive_mirror(unit)
+        self.assertIn("uncommitted", why)
+        (wt / "edit.txt").unlink()
+        self.git(clone, "worktree", "lock", str(wt), env=env)
+        why, _, _ = gd.archive_mirror(unit)
+        self.assertIn("locked worktree", why)
+        self.git(clone, "worktree", "unlock", str(wt), env=env)
+        self.assertEqual(gd.archive_mirror(unit)[0], "")
+
     def test_only_manifest_listed_bundles_at_their_hash_are_pruned_after_the_evidence_gate(self) -> None:
         archive = self.home / "archive/glaeda-disk"
         archive.mkdir(parents=True)
