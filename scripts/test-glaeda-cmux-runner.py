@@ -5403,24 +5403,14 @@ class GateTest(unittest.TestCase):
 
     def test_every_job_on_the_freshness_slot_waits_a_bounded_time(self) -> None:
         """A push's release-compile on the slot is not a DEV compile (dev_compile_capacity_wait is None), but the
-        slot still bounds its wait, so a mini that fills while it waits refuses it back to placement."""
-        self.fleet()
-        self.take_units(14)
-        ref = "refs/heads/feat-cmux-next"
-        push = event(self.dir, "fresh-full", {"repository": CMUX, "ref": ref})
-        start = time.monotonic()
-        result = self.run_hook(
-            "job-started", "push", push, "--allowed-repo", "manaflow-ai/cmux", "--no-disk", "--state-dir",
-            os.fspath(self.dir / "state"), "--watch-pid", str(os.getpid()),
-            "--capacity-units", "14", "--capacity-dir", os.fspath(self.dir / "capacity"), "--dev-compile-runner",
-            repo="manaflow-ai/cmux",
-            env={"GITHUB_JOB": "release-compile", "RUNNER_NAME": "d1", "GITHUB_REF": ref,
-                 "GLAEDA_TEST_DEV_COMPILE_WAIT_S": "1",
-                 "GITHUB_WORKFLOW_REF": f"manaflow-ai/cmux/.github/workflows/cmux-next.yml@{ref}"},
-            timeout=hook.DEV_COMPILE_CAPACITY_WAIT_S + 60)
-        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-        self.assertIn("refused", result.stdout)
-        self.assertLess(time.monotonic() - start, hook.DEV_COMPILE_CAPACITY_WAIT_S + 45)
+        slot still bounds its wait, so a mini that fills while it waits refuses it back to placement. An explicit
+        longer wait is clamped and a shorter one kept; off the slot, waits are unchanged."""
+        bound = hook.DEV_COMPILE_CAPACITY_WAIT_S
+        self.assertEqual(hook.slot_capacity_wait(None, True), bound)
+        self.assertEqual(hook.slot_capacity_wait(bound * 2, True), bound)
+        self.assertEqual(hook.slot_capacity_wait(5.0, True), 5.0)
+        self.assertIsNone(hook.slot_capacity_wait(None, False))
+        self.assertEqual(hook.slot_capacity_wait(bound * 2, False), bound * 2)
 
     def test_other_capacity_waits_remain_unbounded(self) -> None:
         event = {"repository": CMUX, "ref": "refs/heads/feat-cmux-next"}

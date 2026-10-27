@@ -471,11 +471,13 @@ def dev_compile_capacity_wait(repo: str | None, home_repo: str, event_name: str 
 
 
 def slot_capacity_wait(cap: float | None, dev_compile_runner: bool) -> float | None:
-    """`cap`, bounded on the freshness slot: every job it admits (a push's release-compile too, which
+    """`cap`, bounded on the freshness slot (an explicit longer --gui-wait is clamped too): every job it admits (a push's release-compile too, which
     dev_compile_capacity_wait does not name) waits at most DEV_COMPILE_CAPACITY_WAIT_S. GitHub never moves a job
     off the runner that took it, so a refusal lets placement send it to the side label or Blacksmith instead of
     stranding it here (review of glaeda#1636)."""
-    return DEV_COMPILE_CAPACITY_WAIT_S if cap is None and dev_compile_runner else cap
+    if not dev_compile_runner:
+        return cap
+    return DEV_COMPILE_CAPACITY_WAIT_S if cap is None else min(cap, DEV_COMPILE_CAPACITY_WAIT_S)
 
 
 def job_class(job: str, repo: str | None, home_repo: str = DEFAULT_HOME_REPO,
