@@ -1754,14 +1754,12 @@ class Daemon:
         mine = [e for e in entries if e["key"].startswith(kind + ":")]
         path = self.route(kind)
         mode = self.mode(path)
-        if mode == "stop":
-            return []
-        if path == "rest" and kind in BALANCED and self.rest_capped():
-            # The daemon's REST share is spent and GraphQL is stopped too: a kind with nowhere to go
-            # waits for the share to free up rather than spend the REST the sessions are left with.
-            # Except a failed attempt whose job list is not read yet, the one read the share does not
-            # hold back: tick() reads just that list, from the run already cached.
-            if kind == "run":
+        if mode == "stop" or (path == "rest" and kind in BALANCED and self.rest_capped()):
+            # Spent, or the daemon's REST share is and GraphQL is stopped too: a kind with nowhere to
+            # go waits rather than spend the REST the sessions are left with. Except a failed attempt
+            # whose job list is not read yet, the one read the share does not hold back, whichever
+            # bucket runs are routed to: tick() reads just that list, from the run already cached.
+            if kind == "run" and self.mode("rest") != "stop":
                 self.jobs_only = [e for e in mine if self.failed_without_jobs(e)
                                   and self.now - self.attempted.get(e["key"], float("-inf")) >= self.policy["cycles"]["run"]]
                 for e in self.jobs_only:

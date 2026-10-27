@@ -8221,6 +8221,24 @@ class DaemonPolicyTest(Base):
         self.daemon.tick(NOW + 2 * gg.CYCLE)
         self.assertEqual(len(self.gh.job_calls()), 1)  # once per attempt
 
+    def test_the_job_list_exemption_holds_with_runs_routed_to_a_stopped_graphql(self) -> None:
+        failed = {"id": 7, "name": "CI", "display_title": "fix", "status": "completed", "conclusion": "failure",
+                  "html_url": "https://github.com/o/r/actions/runs/7", "head_sha": "b" * 40, "head_branch": "x",
+                  "event": "push", "run_attempt": 1, "created_at": iso(NOW - 99), "updated_at": iso(NOW - 9)}
+        self.gh.runs[7] = failed
+        self.gh.jobs[7] = [job("build")]
+        key = gg.parse_key("run", "o/r/7")
+        self.daemon.store(key, None, data=gg.slim_run(failed), dataAt=NOW - 5)
+        gg.register(key)
+        self.daemon.budget = {"rest": {"limit": 5000, "remaining": 4500, "reset": NOW + 1800},
+                              "graphql": {"limit": 5000, "remaining": 10, "reset": NOW + 1800}}
+        self.daemon.paths["run"] = "graphql"  # routed there while REST was capped; then GraphQL stopped
+        self.spend_rest(2000, at=NOW)
+        self.daemon.tick(NOW)
+        self.assertEqual(self.gh.run_calls(), [])
+        self.assertEqual(self.gh.gql_calls(), [])
+        self.assertEqual(len(self.gh.job_calls()), 1)
+
     def test_a_request_is_dated_by_its_own_minute(self) -> None:
         self.daemon.now = NOW - 90  # the tick began 90 s ago
         self.daemon.transport = lambda *a: (200, {}, b"{}")
