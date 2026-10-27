@@ -130,21 +130,55 @@ class Mirror(unittest.TestCase):
         self.assertEqual(self.downloads, [])
         self.assertEqual(result["heads"]["main"], head)
 
-    def test_a_broken_mirror_is_reseeded_and_never_from_github_by_default(self) -> None:
+    def test_a_broken_mirror_is_repaired_in_place_and_keeps_every_object(self) -> None:
+        sh("git", "checkout", "-q", "-b", "scratch", cwd=self.upstream)
+        forced_away = self.commit("only the old mirror has this")
+        sh("git", "branch", "-f", "nightly-next", forced_away, cwd=self.upstream)
         gm.run(True, home=self.home)
+        sh("git", "branch", "-f", "nightly-next", "main", cwd=self.upstream)
+        sh("git", "checkout", "-q", "main", cwd=self.upstream)
+        inode = self.mirror.stat().st_ino
         (self.mirror / "HEAD").unlink()
         self.assertEqual(gm.healthy(self.mirror), "missing")
-        self.assertIn("bundle", gm.run(True, home=self.home)["seeded"]["source"])
-        # No bundle: an error, and nothing cloned from GitHub.
+        result = gm.run(True, home=self.home)
+        self.assertEqual(result["state"], "applied", result)
+        self.assertEqual(result["seeded"]["mode"], "repaired in place")
+        self.assertIn("bundle", result["seeded"]["source"])
+        self.assertEqual(self.mirror.stat().st_ino, inode)  # never replaced
+        sh("git", "-C", os.fspath(self.mirror), "cat-file", "-e", f"{forced_away}^{{commit}}")
+
+    def test_a_shallow_mirror_is_unshallowed_in_place(self) -> None:
+        self.commit("two")
+        gm.run(True, home=self.home)
+        guard = self.mirror / "shallow.lock"
+        guard.rmdir()
+        tip = sh("git", "-C", os.fspath(self.mirror), "rev-parse", "main")
+        (self.mirror / "shallow").write_text(tip + "\n")
+        self.assertEqual(gm.healthy(self.mirror), "shallow")
+        result = gm.run(True, home=self.home)
+        self.assertEqual(result["state"], "applied", result)
+        self.assertEqual(gm.healthy(self.mirror), "")
+        self.assertTrue(guard.is_dir())
+
+    def test_no_bundle_never_clones_from_github_unless_asked(self) -> None:
         (self.bucket / f"v1/any/latest/{gm.BUNDLE_PREFIX}").unlink()
-        (self.mirror / "HEAD").unlink()
         result = gm.run(True, home=self.home)
         self.assertEqual(result["state"], "error", result)
         self.assertIn("R2 bundle", result["reason"])
-        # The operator's fallback.
+        self.assertFalse(self.mirror.exists())
+        # The operator's fallback fills the staging repository before it takes the path.
         result = gm.run(True, home=self.home, from_github=True)
         self.assertEqual(result["state"], "applied", result)
         self.assertIn("github", result["seeded"]["source"])
+        self.assertEqual(result["seeded"]["mode"], "new")
+        self.assertEqual(gm.healthy(self.mirror), "")
+
+    def test_a_failed_seed_leaves_no_half_mirror(self) -> None:
+        (self.bucket / f"v1/any/objects/{self.key}.tar.gz").write_bytes(b"not an archive")
+        result = gm.run(True, home=self.home)
+        self.assertEqual(result["state"], "error", result)
+        self.assertFalse(self.mirror.exists())
+        self.assertEqual([p.name for p in self.mirror.parent.iterdir() if p.name.startswith(".seed-")], [])
 
     def test_a_bad_pointer_is_refused(self) -> None:
         (self.bucket / f"v1/any/latest/{gm.BUNDLE_PREFIX}").write_text("../../etc/passwd")

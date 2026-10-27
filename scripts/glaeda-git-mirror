@@ -20,8 +20,10 @@ fetch from GitHub never happens during a build.
   1 KiB/s for 60 s); there are FETCH_TRIES tries with backoff.
 - A missing or broken mirror is seeded from the R2 git bundle that cmux's git-mirror-bundle.yml
   refreshes (BUCKET_URL v1/any, pointer git-mirror-cmux-), never from a full GitHub clone. The bundle
-  is downloaded, verified with `git bundle verify`, fetched into a staging repository beside the
-  mirror, and renamed into place, so a reader never sees half a mirror. --seed-from-github is the
+  is downloaded and checked with `git bundle verify`. A missing mirror is built in a staging
+  directory, checked for connectivity, and renamed to the path, which no reader can have open. An
+  existing broken one (shallow, partial, no main) is repaired in place by only adding objects, then
+  dropping the shallow or partial marker. The mirror is never removed and never loses an object. --seed-from-github is the
   operator's fallback when the bucket has no bundle.
 - uploadpack.allowAnySHA1InWant is on, so `git fetch MIRROR <sha>` works for any commit it holds.
 - glaeda-disk keeps the mirror by role (family `cmux-git-mirror`, report only).
@@ -148,14 +150,18 @@ def healthy(mirror: Path) -> str:
 
 def configure(mirror: Path) -> None:
     """Idempotent: the remote, CONFIG, and the shallow guard."""
+    configure_without_guard(mirror)
+    # A directory where git writes its shallow lock file: any --depth fetch into the mirror fails.
+    (mirror / "shallow.lock").mkdir(exist_ok=True)
+
+
+def configure_without_guard(mirror: Path) -> None:
     for key, value in CONFIG.items():
         git(mirror, "config", key, value, timeout=30)
     try:
         git(mirror, "remote", "set-url", "origin", REPO_URL, timeout=30)
     except subprocess.CalledProcessError:
         git(mirror, "remote", "add", "origin", REPO_URL, timeout=30)
-    # A directory where git writes its shallow lock file: any --depth fetch into the mirror fails.
-    (mirror / "shallow.lock").mkdir(exist_ok=True)
 
 
 def refspecs() -> list[str]:
@@ -243,30 +249,71 @@ def seed_from_bundle(staging: Path, work: Path, fetch_url: Callable[[str, Path, 
     raise RuntimeError(f"no archive for {key}: {last}")
 
 
+def fill(repo: Path, work: Path, from_github: bool, fetch_url: Callable[[str, Path, float], None]) -> str:
+    """Add the three branches' full history to `repo`: from the R2 bundle, else (operator flag) from GitHub."""
+    try:
+        return f"bundle {seed_from_bundle(repo, work, fetch_url)}"
+    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
+        if not from_github:
+            raise RuntimeError(f"R2 bundle: {type(error).__name__}: {str(error)[:200]}") from error
+        result = fetch(repo, REPO_URL)
+        if not result["ok"]:
+            raise RuntimeError(f"R2 bundle: {type(error).__name__}; GitHub: {result['errors'][-1]}") from error
+        return f"github (bundle: {type(error).__name__})"
+
+
+def verify(repo: Path) -> None:
+    """Every branch is fully connected (no missing object), and the repository reads as healthy."""
+    git(repo, "fsck", "--connectivity-only", "--no-dangling", "--no-progress", timeout=DOWNLOAD_TIMEOUT)
+    problem = healthy(repo)
+    if problem:
+        raise RuntimeError(f"after the seed the mirror is still {problem}")
+
+
 def seed(mirror: Path, from_github: bool, fetch_url: Callable[[str, Path, float], None] = download) -> dict:
-    """Build a new mirror beside `mirror` and rename it into place; the old one goes."""
+    """Make `mirror` a healthy full mirror without ever removing it or an object in it.
+
+    A missing mirror is built in a staging directory beside it, verified, and renamed to the path, which
+    no reader can have open. An existing one is repaired in place: objects are only added (the bundle,
+    or GitHub with the operator's flag), then a shallow or partial marker is dropped once the history is
+    whole. Jobs fetching from it, and checkouts borrowing its objects, never see it vanish or shrink.
+    """
     free = shutil.disk_usage(mirror.parent).free
     if free < SEED_MIN_FREE:
         raise RuntimeError(f"{free / 1024**3:.1f} GiB free, under {SEED_MIN_FREE / 1024**3:.0f} GiB")
     started = time.monotonic()
     work = Path(tempfile.mkdtemp(prefix=".seed-", dir=mirror.parent))
     try:
-        staging = work / "cmux.git"
-        git(work, "init", "--quiet", "--bare", os.fspath(staging), timeout=60)
-        configure(staging)
-        try:
-            source = f"bundle {seed_from_bundle(staging, work, fetch_url)}"
-        except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
-            if not from_github:
-                raise RuntimeError(f"R2 bundle: {type(error).__name__}: {str(error)[:200]}") from error
-            source = f"github (bundle: {type(error).__name__})"
-        old = mirror.with_name(f".{mirror.name}.old-{os.getpid()}")
-        if mirror.exists() or mirror.is_symlink():
-            mirror.rename(old)
-        staging.rename(mirror)
-        shutil.rmtree(old, ignore_errors=True)
-        return {"source": source, "seconds": round(time.monotonic() - started, 1)}
+        if not (mirror.exists() or mirror.is_symlink()):
+            staging = work / "cmux.git"
+            git(work, "init", "--quiet", "--bare", os.fspath(staging), timeout=60)
+            configure(staging)
+            source = fill(staging, work, from_github, fetch_url)
+            verify(staging)
+            staging.rename(mirror)
+            return {"source": source, "mode": "new", "seconds": round(time.monotonic() - started, 1)}
+        if mirror.is_symlink() or not mirror.is_dir():
+            raise RuntimeError(f"{mirror} is not a directory; left for an operator")
+        # Re-initializing an existing repository keeps its objects and refs (and writes a missing HEAD).
+        git(mirror.parent, "init", "--quiet", "--bare", os.fspath(mirror), timeout=60)
+        # The guard would refuse the unshallowing a full fetch into a shallow repository does.
+        guard = mirror / "shallow.lock"
+        if guard.is_dir():
+            guard.rmdir()
+        for key in ("remote.origin.promisor", "remote.origin.partialclonefilter"):
+            subprocess.run([GIT, "-C", os.fspath(mirror), "config", "--unset-all", key], capture_output=True, timeout=30)
+        configure_without_guard(mirror)
+        source = fill(mirror, work, from_github, fetch_url)
+        shallow = mirror / "shallow"
+        if shallow.exists():
+            shallow.unlink()
+        subprocess.run([GIT, "-C", os.fspath(mirror), "config", "--unset-all", "extensions.partialclone"],
+                       capture_output=True, timeout=30)
+        verify(mirror)
+        return {"source": source, "mode": "repaired in place", "seconds": round(time.monotonic() - started, 1)}
     finally:
+        if mirror.is_dir() and not mirror.is_symlink():
+            (mirror / "shallow.lock").mkdir(exist_ok=True)
         shutil.rmtree(work, ignore_errors=True)
 
 
