@@ -1518,7 +1518,8 @@ class GlaedaDiskTest(unittest.TestCase):
                 mock.patch.object(gd, "process_evidence", return_value=late), \
                 mock.patch.object(gd, "command_lines", return_value=late[1]), \
                 mock.patch.object(gd, "HOME", self.root / "home"), \
-                mock.patch.object(gd, "archive_mirror", return_value=("", [], ([], [], [], {}, gd.mirror_git_digest(Path("/"), [])))), \
+                mock.patch.object(gd, "archive_mirror", return_value=("", [], ([], [], [], {}, {}))), \
+                mock.patch.object(gd, "mirror_rename_recheck", lambda p, r: None), \
                 mock.patch.object(gd, "mirror_moved", return_value=""):  # bundling: the cmux-job tests
             gd.apply(reclaim, {fam.id: fam}, receipt, None, 24)
         self.assertEqual(sorted(p.name for p in cache.iterdir()),
@@ -6129,6 +6130,67 @@ class LinuxLayoutTest(unittest.TestCase):
         self.assertIsNone(gd.files_strict(clone / ".git/logs"))
         self.assertIsNone(gd.local_tips(clone / ".git"))
         self.assertTrue(gd.archive_mirror(unit)[0])
+
+    def recheck_after_rename(self, change, unit: Path | None = None) -> tuple[dict, Path]:
+        """apply with `change(doomed)` run on the renamed-aside tree, right before the post-rename recheck."""
+        unit = unit or self.mirror_unit()[0]
+        real = gd.mirror_rename_recheck
+
+        def wrapped(path, recheck):
+            inner = real(path, recheck)
+
+            def run():
+                change(path.with_name(f"{gd.DELETING_PREFIX}{path.name}-{os.getpid()}"))
+                inner()
+            return run
+        with mock.patch.object(gd, "mirror_rename_recheck", wrapped):
+            rec, _ = self.apply_mirror(unit)
+        return rec, unit
+
+    def test_work_staged_after_the_last_check_puts_the_mirror_back(self) -> None:
+        def stage(doomed):
+            (doomed / "slot-1/new.txt").write_text("x")
+            subprocess.run(["git", "-C", str(doomed / "slot-1"), "add", "new.txt"], check=True)
+        rec, unit = self.recheck_after_rename(stage)
+        self.assertEqual(rec["outcome"], "changed:in-use")
+        self.assertTrue((unit / "slot-1/new.txt").exists())
+
+    def test_a_repository_created_after_the_last_check_puts_the_mirror_back(self) -> None:
+        def create(doomed):
+            subprocess.run(["git", "init", "-q", str(doomed / "slot-9")], check=True)
+        rec, unit = self.recheck_after_rename(create)
+        self.assertEqual(rec["outcome"], "changed:in-use")
+        self.assertTrue((unit / "slot-9/.git").is_dir())
+
+    def test_a_symlinked_packed_refs_is_unreadable(self) -> None:
+        _, clone, _ = self.mirror_unit()
+        (clone / ".git/packed-refs").write_text("")
+        (clone / ".git/packed-refs").rename(self.home / "packed")
+        (clone / ".git/packed-refs").symlink_to(self.home / "packed")
+        self.assertIsNone(gd.local_tips(clone / ".git"))
+
+    def test_a_tree_that_cannot_go_back_is_kept_aside_and_never_finished(self) -> None:
+        unit, clone, env = self.mirror_unit()
+        real_rename = gd.rename_noreplace
+
+        def blocked(src, dst):
+            raise OSError(errno.EEXIST, "File exists")
+
+        def commit(doomed):
+            subprocess.run(["git", "-C", str(doomed / "slot-1"), "commit", "-q", "--allow-empty", "-m", "late"],
+                           check=True, env=env)
+        with mock.patch.object(gd, "rename_noreplace", blocked):
+            rec, _ = self.recheck_after_rename(commit, unit)
+        self.assertEqual(rec["outcome"], "changed:in-use")
+        aside = [p for p in unit.parent.iterdir() if p.name.startswith(gd.DELETING_PREFIX)]
+        self.assertEqual(len(aside), 1)
+        self.assertTrue((aside[0] / gd.MIRROR_KEEP).exists())
+        with self.assertRaises(OSError):
+            gd.finish_deletion(aside[0])
+        fam = gd.Family(gd.INTERRUPTED, unit.parent, True, "x")
+        self.assertIn("kept it", gd.keep_verdict(fam, aside[0]))
+        self.assertTrue((aside[0] / "slot-1/.git").is_dir())
+        del real_rename
 
     def test_only_manifest_listed_bundles_at_their_hash_are_pruned_after_the_evidence_gate(self) -> None:
         archive = self.home / "archive/glaeda-disk"

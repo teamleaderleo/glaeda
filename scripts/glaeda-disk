@@ -3613,6 +3613,8 @@ def finish_deletion(path: Path) -> None:
         raise OSError("refusing a mount point")
     if not DELETING_RE.fullmatch(path.name):
         raise OSError("refusing a tree without the deleting name")
+    if os.path.lexists(path / MIRROR_KEEP):
+        raise OSError("refusing a tree glaeda-disk kept: its git work changed after bundling")
     if path.is_dir():
         shutil.rmtree(path, onerror=_chmod_retry)
     else:
@@ -3939,6 +3941,8 @@ def keep_verdict(fam: "Family", path: Path) -> str:
     if fam.id == "cmux-seeds":
         return seed_verdict(path)
     if fam.id == INTERRUPTED:
+        if os.path.lexists(path / MIRROR_KEEP):
+            return "glaeda-disk kept it: its git work changed after bundling"
         return deletion_owner_live(path)
     if fam.discover and stat_layout(os.fspath(path)) == "rustup-toolchain":
         return rustup_verdict(path)
@@ -4335,6 +4339,15 @@ def local_tips(gitdir: Path, worktree_only: bool = False) -> list[str] | None:
     ones, and every reflog entry (a commit left behind by `submodule update` lives only there).
     With worktree_only, only what a linked worktree's git dir holds for itself: HEAD, its
     per-worktree refs and its reflogs. None when they cannot all be read."""
+    for name in ("HEAD", "packed-refs"):  # git reads these through a symlink; a hidden one is unreadable
+        try:
+            if not stat.S_ISREG(os.lstat(gitdir / name).st_mode):
+                return None
+        except FileNotFoundError:
+            if name == "HEAD":
+                return None
+        except OSError:
+            return None
     refs = _git_dir_run(gitdir, "for-each-ref",
                         "--format=%(refname)%09%(objectname)%09%(*objectname)",
                         *(WORKTREE_REFS if worktree_only else ()))
@@ -4590,11 +4603,8 @@ def bundle_unpushed(gitdir: Path, key: str, written: list[Path], relied: list[st
     and what `fetch --negotiate-only` acknowledges; local remote-tracking refs are only candidates to ask
     about), and every branch or tag the servers do not have at that commit. The commits left to the servers
     go to relied, for server_still_holds. "" or why it failed."""
-    if _git_dir_run(gitdir, "for-each-ref", "--count=1") == "" and _git_dir_run(
-            gitdir, "rev-parse", "-q", "--verify", "HEAD") is None and _git_dir_run(
-            gitdir, "symbolic-ref", "-q", "HEAD") is not None and files_strict(gitdir / "logs") == [] \
-            and not os.path.lexists(gitdir / "worktrees"):
-        return ""  # unborn: no ref, reflog or linked worktree, HEAD a branch with no commit yet; nothing to keep
+    if repo_unborn(gitdir):
+        return ""  # nothing to keep
     tips = local_tips(gitdir)
     for wt in [p for p in (gitdir / "worktrees").glob("*") if p.is_dir()] if tips is not None else []:
         own = local_tips(wt, worktree_only=True)
@@ -4679,44 +4689,53 @@ def _work_tree_dirty(root: Path) -> str:
     return ""
 
 
-def mirror_git_digest(root: Path, gitdirs: list[Path], at: Path | None = None) -> str | None:
-    """A hash of every git dir's HEAD, packed-refs, refs/, logs/ and worktrees/ (each per-worktree HEAD and
-    reflog), read as files relative to root, so it can be read again at `at` once root was renamed there."""
-    h = hashlib.sha256()
-    for g in sorted(gitdirs):
-        base = (at or root) / os.path.relpath(g, root)
-        for name in ("HEAD", "packed-refs"):
-            try:
-                h.update(f"{g}/{name}\0".encode() + (base / name).read_bytes())
-            except FileNotFoundError:
-                h.update(f"{g}/{name}\0-".encode())
-            except OSError:
-                return None
-        for sub_dir in ("refs", "logs", "worktrees"):
-            if (files := files_strict(base / sub_dir)) is None:
-                return None
-            for f in sorted(files):
-                try:
-                    h.update(f"{f.relative_to(base)}\0".encode() + f.read_bytes())
-                except OSError:
-                    return None
-    return h.hexdigest()
+MIRROR_KEEP = ".glaeda-disk-keep"  # in an aside tree: finish_deletion and interrupted-deletions never delete it
+
+
+def repo_unborn(gitdir: Path) -> bool:
+    """No ref, reflog or linked worktree, and HEAD a branch with no commit yet: a repository with nothing in it."""
+    return (_git_dir_run(gitdir, "for-each-ref", "--count=1") == ""
+            and _git_dir_run(gitdir, "rev-parse", "-q", "--verify", "HEAD") is None
+            and _git_dir_run(gitdir, "symbolic-ref", "-q", "HEAD") is not None
+            and files_strict(gitdir / "logs") == [] and not os.path.lexists(gitdir / "worktrees"))
+
+
+def mirror_tips(root: Path, gitdirs: dict[str, Path]) -> dict[str, list[str]] | None:
+    """Every commit each repository points at on its own (local_tips: refs, HEAD, reflogs, its worktrees'),
+    keyed by the git dir's path relative to root, so the same item can be read again after a rename."""
+    tips: dict[str, list[str]] = {}
+    for g in gitdirs.values():
+        t = [] if repo_unborn(g) else local_tips(g)
+        for wt in [p for p in (g / "worktrees").glob("*") if p.is_dir()] if t is not None else []:
+            own = local_tips(wt, worktree_only=True)
+            t = None if own is None else sorted({*t, *own})
+        if t is None:
+            return None
+        tips[os.path.relpath(g, root)] = t
+    return tips
 
 
 def mirror_rename_recheck(path: Path, recheck: tuple):
-    """after_rename for a bundled mirror: once the tree is out of the way, its git metadata must still be what
-    archive_mirror bundled; otherwise it is put back and kept (SlotTaken: changed:in-use)."""
+    """after_rename for a bundled mirror: the renamed tree gets the whole check archive_mirror made before its
+    bundles again (a fresh strict scan of repositories and work trees, each clean and unlocked), and must hold
+    the same repositories with no commit beyond what was bundled or left to the servers. Otherwise it goes back
+    to its path, or, when that fails, stays aside with MIRROR_KEEP so nothing deletes it."""
     doomed = path.with_name(f"{DELETING_PREFIX}{path.name}-{os.getpid()}")
-    gitdirs, digest = recheck[0], recheck[4]
+    before = recheck[4]
 
     def check() -> None:
-        if digest is not None and mirror_git_digest(path, gitdirs, at=doomed) == digest:
+        why, gitdirs, _ = mirror_repos(doomed)
+        now = None if why else mirror_tips(doomed, gitdirs)
+        if now is not None and before is not None and set(now) == set(before) \
+                and all(set(t) <= set(before[k]) for k, t in now.items()):
             return
         try:
             rename_noreplace(doomed, path)
         except OSError as e:
-            raise SlotTaken(f"{path.name}: git changed after bundling; left aside as {doomed.name} ({e.strerror})")
-        raise SlotTaken(f"{path.name}: git changed after bundling; put back")
+            with contextlib.suppress(OSError):
+                (doomed / MIRROR_KEEP).write_text(f"kept by glaeda-disk {os.getpid()}: {why or 'git changed'}\n")
+            raise SlotTaken(f"{path.name}: changed after bundling; kept aside as {doomed.name} ({e.strerror})")
+        raise SlotTaken(f"{path.name}: changed after bundling ({why or 'git changed'}); put back")
     return check
 
 
@@ -4850,20 +4869,22 @@ def archive_mirror(path: Path) -> tuple[str, list[Path], tuple]:
     if why:
         return why, [], none
     snap = mirror_git_snapshot(list(gitdirs.values()), trees)
-    digest = mirror_git_digest(path, list(gitdirs.values()))
+    tips = mirror_tips(path, gitdirs)  # what the bundles and the servers cover, for mirror_rename_recheck
+    if tips is None:
+        return "unreadable refs", [], none
     bundles: list[Path] = []
     relied: dict[Path, list[str]] = {}
     for key, g in sorted(gitdirs.items()):
         if (why := bundle_unpushed(g, key, bundles, relied.setdefault(g, []))):
             return why, bundles, none
-    return "", bundles, (list(gitdirs.values()), trees, snap, relied, digest)
+    return "", bundles, (list(gitdirs.values()), trees, snap, relied, tips)
 
 
 def mirror_moved(fam: Family, path: Path, recheck: tuple) -> str:
     """Right before a bundled mirror goes, everything the bundling took time over is read again: process
     evidence, the family's owner and artifact references, and its repositories, found afresh (the same set,
     every work tree clean) and as at bundle time, and the servers, asked again for what the bundles left to them."""
-    gitdirs, trees, snap, relied, digest = recheck
+    gitdirs, trees, snap, relied, _ = recheck
     for g, commits in relied.items():  # the slow network first, then git, then the quick process checks last
         if (why := server_still_holds(g, commits)):
             return why
@@ -4873,8 +4894,6 @@ def mirror_moved(fam: Family, path: Path, recheck: tuple) -> str:
         return f"its repositories changed while they were bundled{': ' + why if why else ''}"
     if None in snap or mirror_git_snapshot(gitdirs, trees) != snap:
         return "its git refs or work trees changed while they were bundled"
-    if digest is None or mirror_git_digest(path, gitdirs) != digest:
-        return "its git metadata changed while it was bundled"
     if fam.git_disposable and (ref := referenced_main_checkout(path, nested=fam.nested_git)):
         return f"referenced while its git work was bundled: {ref}"
     if fam.retired_only and not owner_retired(fam):
