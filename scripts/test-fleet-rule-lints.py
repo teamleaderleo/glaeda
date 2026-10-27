@@ -45,12 +45,13 @@ FIX = {
 
 
 def keychain_matches(text: str) -> int:
-    """A file that names the service and reads a keychain counts every naming of the service; a read that names
-    the service only through a variable (KEYCHAIN_SERVICE) counts too."""
-    lines = text.splitlines()
+    """A file that names the service and reads a keychain counts every occurrence of the service name; a read
+    that names the service only through a variable (KEYCHAIN_SERVICE) counts once per line, wherever it is."""
+    by_variable = sum(1 for line in text.splitlines()
+                      if KEYCHAIN_LINE.search(line) and not KEYCHAIN_SERVICE.search(line))
     if KEYCHAIN_SERVICE.search(text) and KEYCHAIN_READ.search(text):
-        return sum(1 for line in lines if KEYCHAIN_SERVICE.search(line) or KEYCHAIN_LINE.search(line))
-    return sum(1 for line in lines if KEYCHAIN_LINE.search(line))
+        return len(KEYCHAIN_SERVICE.findall(text)) + by_variable
+    return by_variable
 
 
 def line_matches(pattern: re.Pattern[str], text: str) -> int:
@@ -70,9 +71,12 @@ def scan(root: Path) -> dict[str, dict[str, int]]:
         if rel in SELF or not path.is_file() or path.is_symlink():
             continue
         try:
-            text = path.read_text(encoding="utf-8")
-        except (UnicodeDecodeError, OSError):
+            raw = path.read_bytes()
+        except OSError:
             continue
+        if b"\0" in raw:  # binary (images, archives), as git grep -I skips them; any text encoding is scanned
+            continue
+        text = raw.decode("utf-8", errors="replace")
         counts = {"keychain": keychain_matches(text), "pkill": line_matches(PKILL, text),
                   "big-red": line_matches(BIG_RED, text) if big_red_scanned(rel) else 0}
         for rule, n in counts.items():
@@ -155,6 +159,17 @@ class FleetRuleLints(unittest.TestCase):
         self.assertEqual(keychain_matches('from keyring import get_password\npw = get_password("manaflow-fleet-sudo", "x")\n'), 1)
         self.assertEqual(keychain_matches('import keyring as k\nk.get_password("manaflow-fleet-sudo", "x")\n'), 1)
         self.assertEqual(line_matches(PKILL, "pkill -x a -u 1; pkill -f b"), 2)
+        self.assertEqual(keychain_matches('security find-generic-password -s manaflow-fleet-sudo -w; '
+                                          'security find-generic-password -s manaflow-fleet-sudo -a x -w\n'), 2)
+
+    def test_non_utf8_text_is_scanned(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            subprocess.run(["git", "init", "-q", d], check=True)
+            Path(d, "x.sh").write_bytes(b"# \xff\npkill -f thing\n")
+            Path(d, "b.bin").write_bytes(b"\0pkill")
+            subprocess.run(["git", "-C", d, "add", "."], check=True)
+            self.assertEqual(scan(Path(d))["pkill"], {"x.sh": 1})
         for line in ("pkill -f glaeda", "subprocess.run(['/usr/bin/killall', 'Dock'])", "  /usr/bin/pkill -9 x"):
             self.assertEqual(line_matches(PKILL, line), 1, line)
         for line in ("kill -TERM -- -$pgid", "os.killpg(p.pid, signal.SIGTERM)", "skill_set"):
