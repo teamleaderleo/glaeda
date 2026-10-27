@@ -807,34 +807,80 @@ class GlaedaDiskTest(unittest.TestCase):
                                           '[overrides]\n"/p/x" = "1.90.0-aarch64-apple-darwin"\n')
         return rh
 
-    def test_rustup_toolchains_other_than_the_default_go_lru(self) -> None:
+    def test_rustup_toolchains_and_cargo_bin_are_never_evicted(self) -> None:
+        """2026-10-26: all 14 runner minis lost ~/.cargo/bin/rustup and job-started refused every job. ~/.rustup (every
+        toolchain, the default or not) and ~/.cargo/bin stay at any age and any pressure; ~/.cargo's registry still goes."""
         home = self.root / "home"
         rh = self.rustup_home(home)
-        self.age(rh)
-        # read an hour ago, written long ago: where the filesystem records access, LRU order sees it
+        (home / ".cargo/bin").mkdir(parents=True)
+        (home / ".cargo/bin/rustup").write_bytes(b"\0" * 1024 * 1024)
+        for link in ("cargo", "rustc"):
+            (home / ".cargo/bin" / link).symlink_to("rustup")
+        registry = home / ".cargo/registry"
+        registry.mkdir()
+        (registry / "CACHEDIR.TAG").write_bytes(gd.CACHEDIR_TAG + b"\n# This file is a cache directory tag created by cargo.\n")
+        (registry / "blob").write_bytes(b"\0" * 1024 * 1024)
+        self.age(home)
         now = time.time()
         os.utime(rh / "toolchains/nightly-aarch64-apple-darwin/bin/rustc", (now - 3600, now - 90 * 24 * 3600))
         self.fam = gd.Family("home-caches", home, True, "re-download", discover=True)
         with mock.patch.object(gd, "HOME", home), mock.patch.object(gd.shutil, "which", return_value=None), \
                 mock.patch.dict(os.environ, {"CARGO_HOME": str(home / ".cargo")}):
-            self.assertTrue(all(v == "kept" for v in self.verdicts().values()))  # no rustup to reinstall
-            (home / ".cargo/bin").mkdir(parents=True)
-            (home / ".cargo/bin/rustup").write_bytes(b"")
-            self.assertEqual(self.verdicts(), {"stable-aarch64-apple-darwin": "kept",
-                                               "1.90.0-aarch64-apple-darwin": "kept",
-                                               "nightly-aarch64-apple-darwin": "recent",
-                                               "1.88.0-aarch64-apple-darwin": "reclaimable"})
+            os.environ.pop("RUSTUP_HOME", None)
+            for path in (rh, rh / "toolchains/1.88.0-aarch64-apple-darwin", rh / "settings.toml", home / ".cargo/bin",
+                         home / ".cargo/bin/rustup", home / ".cargo", home):
+                self.assertTrue(gd.toolchain_held(path), path)
+                self.assertTrue(gd.never_delete(path), path)
+            self.assertFalse(gd.toolchain_held(registry))
             items = gd.survey([self.fam], 24, 0)
+            self.assertFalse([i for i in items if gd.toolchain_held(Path(i.path))], "nothing under the toolchain listed")
             receipt = self.root.parent / f"{self.root.name}-r.jsonl"
             with contextlib.redirect_stdout(io.StringIO()):
                 gd.apply(items, {self.fam.id: self.fam}, receipt, None, 24)
             receipt.unlink(missing_ok=True)
-        self.assertFalse((rh / "toolchains/1.88.0-aarch64-apple-darwin").exists())
-        # rustup would skip the reinstall while the old update hash still matches the channel
-        self.assertFalse((rh / "update-hashes/1.88.0-aarch64-apple-darwin").exists())
-        self.assertTrue((rh / "update-hashes/nightly-aarch64-apple-darwin").exists())
-        self.assertTrue((rh / "toolchains/stable-aarch64-apple-darwin").exists())
-        self.assertTrue((rh / "settings.toml").exists())
+            # the last line of defence holds even for a caller that names the path itself
+            for path in (home / ".cargo/bin/rustup", home / ".cargo/bin", rh / "toolchains/1.88.0-aarch64-apple-darwin"):
+                with self.assertRaisesRegex(OSError, "job toolchain"):
+                    gd.remove(path)
+            aside = rh / "toolchains" / f"{gd.DELETING_PREFIX}x"
+            aside.mkdir()
+            with self.assertRaisesRegex(OSError, "job toolchain"):
+                gd.finish_deletion(aside)
+        for tc in ("stable", "nightly", "1.88.0", "1.90.0"):
+            self.assertTrue((rh / f"toolchains/{tc}-aarch64-apple-darwin/bin/rustc").exists(), tc)
+            self.assertTrue((rh / f"update-hashes/{tc}-aarch64-apple-darwin").exists(), tc)
+        self.assertTrue((home / ".cargo/bin/rustup").exists())
+        self.assertTrue(all((home / ".cargo/bin" / n).is_symlink() for n in ("cargo", "rustc")))
+        self.assertFalse(registry.exists(), "cargo's registry is a cache and still goes")
+
+    def test_the_tools_the_runner_hook_probes_are_never_evicted(self) -> None:
+        """Every TOOLCHAIN_TOOLS binary in the fixed tool dirs, the dir it sits in, where it links to, CARGO_HOME/bin,
+        RUSTUP_HOME and the Xcode apps; never a directory only the caller's PATH names (a job's checkout bin)."""
+        home = self.root / "home"
+        local_bin = home / ".local/bin"
+        local_bin.mkdir(parents=True)
+        cellar = home / "cellar/python/bin"
+        cellar.mkdir(parents=True)
+        (cellar / "python3.13").write_text("#!/bin/sh\n")
+        (cellar / "python3.13").chmod(0o755)
+        (local_bin / "python3").symlink_to(cellar / "python3.13")
+        checkout_bin = home / "work/repo/node_modules/.bin"
+        checkout_bin.mkdir(parents=True)
+        (checkout_bin / "gh").write_text("#!/bin/sh\n")
+        (checkout_bin / "gh").chmod(0o755)
+        cargo_home, rustup_home = self.root / "cargo-home", self.root / "rustup-home"
+        with mock.patch.object(gd, "HOME", home), \
+                mock.patch.object(gd, "TOOLCHAIN_SYSTEM_BIN_DIRS", ()), \
+                mock.patch.dict(os.environ, {"CARGO_HOME": str(cargo_home), "RUSTUP_HOME": str(rustup_home),
+                                             "PATH": f"{checkout_bin}{os.pathsep}{os.environ.get('PATH', '')}"}):
+            for path in (local_bin / "python3", local_bin, cellar / "python3.13", cargo_home / "bin",
+                         rustup_home / "toolchains/x", Path("/Applications/Xcode_26.6.app")):
+                self.assertTrue(gd.toolchain_held(path), path)
+            self.assertFalse(gd.toolchain_held(checkout_bin), "a job PATH entry keeps nothing")
+            self.assertFalse(gd.toolchain_held(home / "work/repo"))
+            self.assertFalse(gd.toolchain_held(cargo_home / "registry"))
+        for tool in ("rustup", "rustc", "cargo", "python3", "gh", "git", "xcodebuild"):
+            self.assertIn(tool, gd.TOOLCHAIN_TOOLS, "the runner hook's job-started probes each of these")
 
     def test_rustup_toolchains_a_checkout_or_the_environment_pins_stay(self) -> None:
         home = self.root / "home"

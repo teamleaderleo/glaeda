@@ -478,15 +478,66 @@ def referenced_main_checkout(path: Path, *, nested: bool = False) -> str:
     return ""
 
 
-def never_delete(path: Path) -> bool:
+# The toolchain a job runs, never deleted by any family at any pressure: rustup's binary and the cargo/rustc links
+# to it, rustup's home with every installed toolchain, and the tools glaeda-cmux-runner-hook's job-started probes
+# on the job PATH (rustup, rustc, cargo, python3, gh, git, xcodebuild) plus the Xcode apps. All 14 runner minis lost
+# ~/.cargo/bin/rustup on 2026-10-26 (21:26-00:48Z); job-started then refused every job ("cannot name a toolchain
+# for 'rustc 1.98.1'"). Whatever removed it, glaeda-disk must never be able to.
+TOOLCHAIN_HOME_PATHS = (".cargo/bin", ".rustup")  # under HOME; CARGO_HOME/bin and RUSTUP_HOME too
+TOOLCHAIN_TOOLS = ("rustup", "rustc", "cargo", "python3", "gh", "git", "xcodebuild")
+TOOLCHAIN_ROOTS = ("/Applications",)  # the pool Xcode (--toolchain-xcode) and every other Xcode_*.app
+# Where TOOLCHAIN_TOOLS are looked up: the fleet's fixed tool directories, never the caller's PATH, which inside a
+# job can name a checkout's own bin directory and would then keep that checkout.
+TOOLCHAIN_BIN_DIRS = (".cargo/bin", ".local/bin")  # under HOME, before the system ones below
+TOOLCHAIN_SYSTEM_BIN_DIRS = ("/opt/homebrew/bin", "/usr/local/bin", "/usr/bin")
+_TOOLCHAIN_KEEP: dict[tuple[str, str, str], tuple[str, ...]] = {}
+
+
+def toolchain_keep() -> tuple[str, ...]:
+    """Real paths of the job toolchain (TOOLCHAIN_HOME_PATHS, CARGO_HOME/bin, RUSTUP_HOME, each TOOLCHAIN_TOOLS
+    binary found in TOOLCHAIN_BIN_DIRS with the directory it is linked from, TOOLCHAIN_ROOTS). Cached per HOME,
+    CARGO_HOME and RUSTUP_HOME: never_delete runs for every directory a discovery walk visits."""
+    env = os.environ
+    key = (os.fspath(HOME), env.get("CARGO_HOME", ""), env.get("RUSTUP_HOME", ""))
+    if key not in _TOOLCHAIN_KEEP:
+        paths = [HOME / rel for rel in TOOLCHAIN_HOME_PATHS] + [Path(r) for r in TOOLCHAIN_ROOTS]
+        if env.get("CARGO_HOME"):
+            paths.append(Path(env["CARGO_HOME"]) / "bin")
+        if env.get("RUSTUP_HOME"):
+            paths.append(Path(env["RUSTUP_HOME"]))
+        search = os.pathsep.join([os.fspath(HOME / d) for d in TOOLCHAIN_BIN_DIRS] + list(TOOLCHAIN_SYSTEM_BIN_DIRS))
+        for tool in TOOLCHAIN_TOOLS:
+            found = shutil.which(tool, path=search)
+            if found:
+                paths += [Path(found).parent, Path(found)]
+        _TOOLCHAIN_KEEP[key] = tuple(dict.fromkeys(os.path.realpath(p) for p in paths))
+    return _TOOLCHAIN_KEEP[key]
+
+
+def _at_inside_or_above(path: Path, keep: list[str] | tuple[str, ...]) -> bool:
+    p = os.path.realpath(path)
+    return any(p == k or p.startswith(k + "/") or k.startswith(p + "/") for k in keep)
+
+
+def toolchain_held(path: Path) -> bool:
+    """PATH is at, inside or above a toolchain_keep() path. No family flag lifts it (not allow_stale_protected)."""
+    return _at_inside_or_above(path, toolchain_keep())
+
+
+def toolchain_within(path: Path) -> bool:
+    """PATH is at or inside a toolchain_keep() path: a discovery walk stops there, but walks on through one only
+    above it (~/.cargo, to reach the registry beside ~/.cargo/bin), which toolchain_held still keeps whole."""
+    p = os.path.realpath(path)
+    return any(p == k or p.startswith(k + "/") for k in toolchain_keep())
+
+
+def never_delete(path: Path, walk: bool = False) -> bool:
+    """With walk (a discovery walk asking whether to descend), a directory only above the job toolchain is not
+    kept from the walk, only from being taken itself."""
     if NEVER_DELETE_NAMES.search(path.name):
         return True
-    p = os.path.realpath(path)
-    for keep in NEVER_DELETE:
-        k = os.path.realpath(HOME / keep)
-        if p == k or p.startswith(k + "/") or k.startswith(p + "/"):
-            return True
-    return False
+    return (_at_inside_or_above(path, [os.path.realpath(HOME / keep) for keep in NEVER_DELETE])
+            or (toolchain_within(path) if walk else toolchain_held(path)))
 
 
 _LIVE_REFERENCES: dict[str, frozenset[str]] = {}
@@ -3592,6 +3643,8 @@ def interrupted_families(fams: list[Family]) -> list[Family]:
 
 def finish_deletion(path: Path) -> None:
     """Delete an aside tree in place: it already has its deleting name, so a second rename adds nothing."""
+    if toolchain_held(path):
+        raise OSError("refusing the job toolchain (toolchain_keep)")
     if path.is_symlink():
         raise OSError("refusing symlink")
     if os.path.ismount(path) or path.lstat().st_dev != path.parent.stat().st_dev:
@@ -3834,11 +3887,11 @@ def discover_caches(root: Path, depth: int = DISCOVER_DEPTH, budget: int = DISCO
                 except OSError:
                     continue
                 if (other_fs or os.path.realpath(d) in never or SECRET_NAME.search(name)
-                        or name in DISCOVER_SKIP or never_delete(Path(d)) or vcs_at(d)
+                        or name in DISCOVER_SKIP or never_delete(Path(d), walk=True) or vcs_at(d)
                         or os.path.lexists(os.path.join(d, "pyvenv.cfg"))):
                     continue
                 if stat_layout(d):
-                    if discoverable(d):
+                    if discoverable(d) and not toolchain_held(Path(d)):
                         found.append(Path(d))
                     continue  # a sealed cache discovery may not take is not searched either
                 entries: list[os.DirEntry] = []
@@ -3854,7 +3907,7 @@ def discover_caches(root: Path, depth: int = DISCOVER_DEPTH, budget: int = DISCO
                 if left < 0:
                     break  # a partial listing can hide a layout, never invent one: stop here
                 if listing_layout(d, entries):
-                    if discoverable(d):
+                    if discoverable(d) and not toolchain_held(Path(d)):
                         found.append(Path(d))
                     continue
                 nxt += [e.path for e in entries if e.is_dir(follow_symlinks=False)]
@@ -4732,7 +4785,7 @@ def candidates(fam: Family) -> list[Path]:
     uid = os.getuid()
     owned = []
     for p in level:
-        if never_delete(p) and not fam.allow_stale_protected:
+        if (never_delete(p) and not fam.allow_stale_protected) or toolchain_held(p):
             continue
         try:
             if p.lstat().st_uid == uid:
@@ -6132,6 +6185,8 @@ def write_eviction_summary(receipt: Path, operation: str, logical_released: int,
 
 def remove(path: Path, after_rename=None) -> None:
     """Delete path. `after_rename` runs once the tree is out of the way, before the long delete."""
+    if toolchain_held(path):
+        raise OSError("refusing the job toolchain (toolchain_keep)")
     if path.is_symlink():
         raise OSError("refusing symlink")
     if os.path.ismount(path) or path.lstat().st_dev != path.parent.stat().st_dev:
