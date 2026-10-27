@@ -3030,7 +3030,7 @@ def admission_waiters(capacity_dir: Path, skip_pid: int = 0) -> list[dict[str, A
             fresh = time.time() - marker.stat().st_mtime < ADMIT_FRESH_S
         except (OSError, ValueError):
             continue
-        if pid == skip_pid:
+        if pid == skip_pid or not 0 < pid < 2 ** 31:  # a pid no process has: never signalled or ranked
             continue
         if not fresh or not pid_alive(pid):
             with contextlib.suppress(OSError):
@@ -3038,7 +3038,11 @@ def admission_waiters(capacity_dir: Path, skip_pid: int = 0) -> list[dict[str, A
             continue
         try:
             data = json.loads(read_bounded(marker) or b"")
+            if isinstance(data["since"], bool):
+                continue
             since = float(data["since"])
+            if not math.isfinite(since):  # an infinite or NaN since would break the one total order
+                continue
             wants = [str(kind) for kind in data.get("wants") or [] if isinstance(kind, str)]
         except (OSError, ValueError, TypeError, KeyError, AttributeError):
             continue
@@ -3067,7 +3071,7 @@ def fair_turn(capacity_dir: Path, needs: set[str], since: float, tier: str = "",
         if admission_rank(waiter["tier"], waiter["since"], waiter["pid"], now) >= mine:
             continue
         shared = needs & set(waiter["wants"])
-        if waiter["tier"] == TIER_NIGHTLY and tier != TIER_NIGHTLY and takes_units:
+        if waiter["tier"] == TIER_NIGHTLY and takes_units:  # a later nightly job too: arrival order among them
             shared.add("units")
         if shared:
             who = waiter["who"] or "pid " + str(waiter["pid"])
@@ -3543,7 +3547,9 @@ def step_fits(capacity_dir: Path, total: int, compile_slots: int, roots: int, ho
 
         units = sum(1 for slot in range(total) if free(f"unit-{slot}"))
         reserved = gui_reserved(capacity_dir)  # a step is never the gui runner's job: it leaves the reserve free
-        waited = {kind for waiter in admission_waiters(capacity_dir) for kind in waiter["wants"]}
+        waited = set()
+        for waiter in admission_waiters(capacity_dir):
+            waited |= set(waiter["wants"]) | ({"units"} if waiter["tier"] == TIER_NIGHTLY else set())  # FEED_FIRST
         fits = []
         for klass in STEP_CLASSES:
             need, tokens = CLASS_COST[klass]

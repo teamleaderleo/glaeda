@@ -2924,12 +2924,33 @@ time.sleep(60)
                 self.assertIsNone(hook.fair_turn(capacity, set(), since, tier, False), "no unit taken: no wait")
         waiting(now - 5, nightly)
         self.assertIsNone(hook.fair_turn(capacity, {"units"}, now - 60, nightly, True), "nightly: arrival order")
+        fits = (capacity, 14, 1, 1, os.fspath(self.dir / "no-fleet" / "host.lock"),
+                os.fspath(self.dir / "no-reservation"), self.dir / "state", now)
+        waiting(now - 5, None, ("root",))  # a PR job waiting for a root leaves unit-only ci-steps fitting
+        self.assertEqual(hook.step_fits(*fits), list(hook.STEP_CLASSES))
+        waiting(now - 5, nightly, ("root",))  # an older nightly job waiting for a token holds a later one's units too
+        self.assertIn("has waited longer here for units",
+                      hook.fair_turn(capacity, {"persistent-dd"}, now, nightly, True))
+        self.assertEqual(hook.step_fits(*fits), [], "no ci-step fits while a nightly job waits")
+        waiting(now - 5, nightly)
         self.assertIn("has waited longer", hook.fair_turn(capacity, {"units"}, now, nightly, True))
         waiting(now - 5, dev)  # a DEV compile that came later
         self.assertIn("is a DEV compile and goes first here for units", hook.fair_turn(capacity, {"units"}, now - 60))
         self.assertIsNone(hook.fair_turn(capacity, {"units"}, now - bound - 10), "past the bound: arrival order")
         waiting(now - 5, "boss")  # only the known tiers count
         self.assertEqual([w["tier"] for w in hook.admission_waiters(capacity)], [""])
+        for since in (True, "inf", "nan", float("inf")):  # a since that would break the total order is no waiter
+            with self.subTest(since=since):
+                marker.write_text(json.dumps({"since": since, "wants": ["units"]}) if not isinstance(since, float)
+                                  else '{"since": Infinity, "wants": ["units"]}')
+                self.assertEqual(hook.admission_waiters(capacity), [])
+        for name in ("0", "-5", str(2 ** 64)):  # nor a pid no process has
+            with self.subTest(pid=name):
+                bad = capacity / f"{hook.ADMIT_WANT}{name}"
+                bad.write_text(json.dumps({"since": now, "wants": ["units"]}))
+                self.assertEqual([w["pid"] for w in hook.admission_waiters(capacity)], [])
+                bad.unlink()
+        waiting(now - 5, "boss")
         self.assertIsNone(hook.fair_turn(capacity, {"units"}, now - 60))
         # one total order: of any two waiters, exactly one is ahead
         tiers = ("", dev, nightly)
