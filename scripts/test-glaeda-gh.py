@@ -2822,11 +2822,14 @@ class TickBudgetTest(Base):
                                                                "data": {"status": "in_progress"}})
         order: list[str] = []
 
+        reads = [0]
+
         def read(e: dict) -> None:
+            reads[0] += 1
+            if reads[0] % 3 == 0:
+                raise gg.OutOfTime()  # two reads a tick, then the deadline stops the third before it sends
             order.append(e["key"])
             self.daemon.store(e["key"], e["cache"], data={"status": "in_progress"}, dataAt=self.daemon.now)
-            if len(order) % 2 == 0:
-                raise gg.OutOfTime()  # two reads a tick, then the budget is spent
 
         with mock.patch.object(self.daemon, "fetch_pr_rest", side_effect=read), \
                 mock.patch.object(self.daemon, "fetch_run", side_effect=read):
