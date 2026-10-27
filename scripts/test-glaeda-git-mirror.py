@@ -1,0 +1,189 @@
+#!/usr/bin/env python3
+"""glaeda-git-mirror: a full local cmux mirror, seeded from an R2 bundle, refreshed by bounded fetches."""
+
+from __future__ import annotations
+
+import importlib.machinery
+import importlib.util
+import os
+import subprocess
+import sys
+import tarfile
+import tempfile
+import unittest
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def load():
+    loader = importlib.machinery.SourceFileLoader("glaeda_git_mirror", os.fspath(ROOT / "scripts/glaeda-git-mirror"))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+gm = load()
+
+
+def sh(*args: str, cwd: Path | None = None) -> str:
+    env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NAME": "t",
+           "GIT_COMMITTER_EMAIL": "t@t"}
+    return subprocess.run(args, cwd=cwd, check=True, capture_output=True, text=True, env=env).stdout.strip()
+
+
+class Mirror(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        root = Path(self.temp.name)
+        self.home = root / "home"
+        (self.home / "actions-runner-glaeda").mkdir(parents=True)
+        (self.home / "actions-runner-glaeda/.runner").write_text("{}")
+        # The "GitHub" repository: three branches.
+        self.upstream = root / "upstream"
+        self.upstream.mkdir()
+        sh("git", "init", "-q", "-b", "main", cwd=self.upstream)
+        self.commit("one")
+        for branch in ("feat-cmux-next", "nightly-next"):
+            sh("git", "branch", branch, cwd=self.upstream)
+        sh("git", "branch", "pr-only", cwd=self.upstream)
+        # The bucket: a bundle of upstream, archived as r2-cache.sh saves a directory.
+        self.bucket = root / "bucket"
+        self.key = "git-mirror-cmux-2026102709-" + sh("git", "rev-parse", "HEAD", cwd=self.upstream)[:12]
+        staged = root / "staged"
+        staged.mkdir()
+        sh("git", "bundle", "create", os.fspath(staged / gm.BUNDLE_FILE), "--branches", cwd=self.upstream)
+        (self.bucket / "v1/any/objects").mkdir(parents=True)
+        (self.bucket / "v1/any/latest").mkdir(parents=True)
+        with tarfile.open(self.bucket / f"v1/any/objects/{self.key}.tar.gz", "w:gz") as archive:
+            archive.add(staged / gm.BUNDLE_FILE, arcname=f"./{gm.BUNDLE_FILE}")
+        (self.bucket / f"v1/any/latest/{gm.BUNDLE_PREFIX}").write_text(self.key + "\n")
+        self.downloads: list[str] = []
+
+        git_dir = root / "fleet/git"
+        patches = {"GIT_DIR": git_dir, "MIRROR": git_dir / "cmux.git", "RECORD": git_dir / "cmux.json",
+                   "REPO_URL": self.upstream.as_uri(), "BUCKET_URL": "https://bucket.test", "SEED_MIN_FREE": 0,
+                   "download": self.fake_download, "zstd": lambda: None}
+        for name, value in patches.items():
+            old = getattr(gm, name)
+            setattr(gm, name, value)
+            self.addCleanup(setattr, gm, name, old)
+        # seed()'s default argument captured the real download at definition time.
+        real_seed = gm.seed
+        gm.seed = lambda mirror, from_github, fetch_url=self.fake_download: real_seed(mirror, from_github, fetch_url)
+        self.addCleanup(setattr, gm, "seed", real_seed)
+        self.mirror = git_dir / "cmux.git"
+
+    def commit(self, message: str) -> str:
+        (self.upstream / "f").write_text(message)
+        sh("git", "add", "f", cwd=self.upstream)
+        sh("git", "commit", "-q", "-m", message, cwd=self.upstream)
+        return sh("git", "rev-parse", "HEAD", cwd=self.upstream)
+
+    def fake_download(self, url: str, target: Path, timeout: float) -> None:
+        self.downloads.append(url)
+        source = self.bucket / url.removeprefix("https://bucket.test/")
+        if not source.is_file():
+            raise subprocess.CalledProcessError(22, "curl")
+        target.write_bytes(source.read_bytes())
+
+    def test_no_runner_is_a_no_op(self) -> None:
+        empty = Path(self.temp.name) / "nobody"
+        empty.mkdir()
+        self.assertEqual(gm.run(True, home=empty)["state"], "skipped")
+        self.assertFalse(self.mirror.exists())
+
+    def test_seeds_from_the_bundle_then_fetches_new_commits(self) -> None:
+        head = self.commit("two")  # newer than the bundle: the fetch after the seed brings it
+        result = gm.run(True, home=self.home)
+        self.assertEqual(result["state"], "applied", result)
+        self.assertIn(f"bundle {self.key}", result["seeded"]["source"])
+        self.assertEqual(result["heads"]["main"], head)
+        self.assertEqual(set(result["heads"]), set(gm.BRANCHES))  # pr-only is not mirrored
+        self.assertEqual(gm.healthy(self.mirror), "")
+        self.assertEqual(sh("git", "-C", os.fspath(self.mirror), "config", "uploadpack.allowAnySHA1InWant"), "true")
+        self.assertTrue(gm.RECORD.is_file())
+
+    def test_a_job_fetches_any_commit_from_the_mirror(self) -> None:
+        old = sh("git", "rev-parse", "HEAD", cwd=self.upstream)
+        self.commit("two")
+        gm.run(True, home=self.home)
+        work = Path(self.temp.name) / "work"
+        sh("git", "init", "-q", os.fspath(work))
+        sh("git", "-C", os.fspath(work), "fetch", "-q", os.fspath(self.mirror), old)
+        self.assertEqual(sh("git", "-C", os.fspath(work), "rev-parse", "FETCH_HEAD"), old)
+
+    def test_the_mirror_refuses_to_become_shallow(self) -> None:
+        gm.run(True, home=self.home)
+        with self.assertRaises(subprocess.CalledProcessError):
+            sh("git", "-C", os.fspath(self.mirror), "fetch", "-q", "--depth=1", self.upstream.as_uri(), "main")
+        self.assertEqual(gm.healthy(self.mirror), "")
+
+    def test_a_second_pass_only_fetches(self) -> None:
+        gm.run(True, home=self.home)
+        self.downloads.clear()
+        head = self.commit("three")
+        result = gm.run(True, home=self.home)
+        self.assertNotIn("seeded", result)
+        self.assertEqual(self.downloads, [])
+        self.assertEqual(result["heads"]["main"], head)
+
+    def test_a_broken_mirror_is_reseeded_and_never_from_github_by_default(self) -> None:
+        gm.run(True, home=self.home)
+        (self.mirror / "HEAD").unlink()
+        self.assertEqual(gm.healthy(self.mirror), "missing")
+        self.assertIn("bundle", gm.run(True, home=self.home)["seeded"]["source"])
+        # No bundle: an error, and nothing cloned from GitHub.
+        (self.bucket / f"v1/any/latest/{gm.BUNDLE_PREFIX}").unlink()
+        (self.mirror / "HEAD").unlink()
+        result = gm.run(True, home=self.home)
+        self.assertEqual(result["state"], "error", result)
+        self.assertIn("R2 bundle", result["reason"])
+        # The operator's fallback.
+        result = gm.run(True, home=self.home, from_github=True)
+        self.assertEqual(result["state"], "applied", result)
+        self.assertIn("github", result["seeded"]["source"])
+
+    def test_a_bad_pointer_is_refused(self) -> None:
+        (self.bucket / f"v1/any/latest/{gm.BUNDLE_PREFIX}").write_text("../../etc/passwd")
+        result = gm.run(True, home=self.home)
+        self.assertEqual(result["state"], "error")
+        self.assertFalse(self.mirror.exists())
+
+    def test_plan_changes_nothing(self) -> None:
+        result = gm.run(False, home=self.home)
+        self.assertEqual((result["state"], result["health"]), ("plan", "missing"))
+        self.assertFalse(self.mirror.exists())
+
+
+class Fetch(unittest.TestCase):
+    def test_every_try_is_bounded_and_retried_with_the_low_speed_abort(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            mirror = Path(temp)
+            (mirror / "objects/pack").mkdir(parents=True)
+            calls, sleeps = [], []
+
+            def runner(command, timeout):
+                calls.append((list(command), timeout))
+                (mirror / "objects/pack/tmp_pack_x").write_text("partial")
+                return (124, "timed out") if len(calls) < 3 else (0, "")
+
+            result = gm.fetch(mirror, "https://example.test/r.git", runner=runner, sleep=sleeps.append)
+            self.assertTrue(result["ok"])
+            self.assertEqual(result["tries"], 3)
+            self.assertEqual(sleeps, list(gm.BACKOFF))
+            for command, timeout in calls:
+                self.assertEqual(timeout, gm.FETCH_TIMEOUT)
+                self.assertEqual(command[1:5], list(gm.LOW_SPEED))
+                self.assertNotIn("--depth", " ".join(command))
+
+    def test_run_group_kills_a_hung_command(self) -> None:
+        status, why = gm.run_group(["sh", "-c", "sleep 30 & sleep 30"], timeout=1)
+        self.assertEqual(status, 124)
+        self.assertIn("timed out", why)
+
+
+if __name__ == "__main__":
+    unittest.main()

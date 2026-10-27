@@ -354,7 +354,7 @@ def shared_fleet_roots() -> list[tuple[str, Path]]:
     except OSError:
         return []
     scopes = [("shared-fleet", root)]
-    for name in ("cache", "xcode", "ci", "ci-ios", "node-products", "logs", "tools",
+    for name in ("cache", "xcode", "ci", "ci-ios", "node-products", "git", "logs", "tools",
                  "job-volumes", "bin"):
         child = root / name
         try:
@@ -2797,6 +2797,11 @@ def default_families(role: str = "fleet-mini") -> list[Family]:
                 fams.append(Family("ci-derived-data", temp, True, "the CI test job rebuilds it",
                                    include=("cmux-derived-data-tests-",), build_output=True,
                                    owner="cmux CI test jobs", rebuild_minutes=6, platform="macos"))
+        # The runner mini's full cmux git mirror (glaeda-git-mirror), kept by role: jobs fetch their commit from it
+        # instead of GitHub, and a reseed is a 2.4 GB bundle download. About 2.2 GiB, grown only by new commits.
+        fams.append(Family("cmux-git-mirror", Path("/Users/Shared/cmux-build-fleet/git"), False,
+                           "report only: kept by role, the fleet git mirror jobs fetch from",
+                           owner="glaeda-git-mirror", platform="macos"))
         # Bounded by its owner: node_product_cache.py evicts LRU to CMUX_NODE_PRODUCT_CACHE_MAX_BYTES (24 GiB).
         fams.append(Family("cmux-node-products", Path("/Users/Shared/cmux-build-fleet/node-products"), False,
                            "report only: its owner evicts LRU to a 24 GiB budget",
