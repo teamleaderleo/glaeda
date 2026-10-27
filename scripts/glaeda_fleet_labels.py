@@ -360,6 +360,7 @@ def dedicated_runners(manifest: Any, member: str) -> tuple[list[dict[str, Any]],
     if not isinstance(entries, list):
         return [], f"{member} runner.dedicated must be a list"
     out: list[dict[str, Any]] = []
+    pools: set[str] | None = None  # every pool label the manifest declares, read once when there is an entry
     for index, entry in enumerate(entries):
         where = f"{member} runner.dedicated[{index}]"
         if not isinstance(entry, dict):
@@ -387,6 +388,12 @@ def dedicated_runners(manifest: Any, member: str) -> tuple[list[dict[str, Any]],
         if len(set(labels)) != len(labels) or any(x.lower() in DEFAULT_LABELS for x in labels):
             return [], (f"{where}.labels must be distinct and leave out {', '.join(DEFAULT_LABELS)}: a dedicated "
                         "runner takes only the jobs that name its own labels")
+        if pools is None:
+            pools = {label.lower() for label in declared_pools(manifest)}
+        shared = sorted(x for x in labels if x.lower() in pools)
+        if shared:
+            return [], (f"{where}.labels must leave out the manifest's pool labels ({', '.join(shared)}): a pool job "
+                        "would land on the builder, outside pool capacity and reservations")
         commands = {}
         for key in ("admit", "watch"):
             argv = entry.get(key)

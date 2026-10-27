@@ -9421,7 +9421,9 @@ class DedicatedRunnerTest(unittest.TestCase):
                                ({"org": "manaflow-ai"}, "exactly one of repo"), ({"admit": ["relative.py"]}, "admit"),
                                ({"name": "Bad Name"}, "name"), ({"name": "123"}, "name"),
                                ({"env": {"lower": "x"}}, "env"),
-                               ({"surprise": 1}, "unknown keys"), ({"group": "g"}, "group goes with org")):
+                               ({"surprise": 1}, "unknown keys"), ({"group": "g"}, "group goes with org"),
+                               ({"labels": ["x", "glaeda-std-xcode-26.6".upper()]}, "pool labels"),
+                               ({"labels": ["glaeda-std-xcode-26.6"]}, "pool labels")):
             with self.subTest(change):
                 _, why = fleet_labels.dedicated_runners(dedicated_manifest({**NIGHTLY, **change}), "mini-std")
                 self.assertIn(needle, why or "")
