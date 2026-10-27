@@ -1074,8 +1074,12 @@ def archived_seeds(log: Path | None = None) -> frozenset[str]:
 # in-use vetoes (open files, cwd, command lines) still hold for every one of them.
 MEDIA_TOUR_DD = re.compile(r"^cmux-ci-media-[A-Za-z0-9._-]+$")
 MEDIA_TOUR_WARM_SLOT = re.compile(r"^cmux-ci-media-slot(0|[1-9][0-9]*)-(?:base|head)$")
-MEDIA_TOUR_LABEL_PREFIXES = ("glaeda-gui-", "glaeda-session-")
+# pr_runner_pool.gui_label()/session_label(): glaeda-gui-<class>-xcode-<version>, glaeda-session-<class>-xcode-<version>
+MEDIA_TOUR_LABEL = re.compile(r"^glaeda-(?:gui|session)-[a-z0-9]+-xcode-[0-9][0-9.]*$")
 CMUX_RUNNER_STATE = HOME / ".local/state/glaeda/cmux-runner"
+# media_tag_lock.py's lock dir: one flock per tag (ci-media-slot0 for cmux-ci-media-slot0-{base,head}), held by a
+# tour from its claim until its Runner.Worker exits, before it has opened anything in the DerivedData.
+MEDIA_TOUR_LOCKS = HOME / "Library/Caches/cmux-ci-media/locks"
 _MEDIA_TOUR_HOST: bool | None = None
 _MEDIA_TOUR_HOST_SET = False
 
@@ -1107,7 +1111,7 @@ def media_tour_host(state: Path | None = None) -> bool | None:
         if not isinstance(labels, list):
             answer = None
             break
-        if any(isinstance(x, str) and x.startswith(MEDIA_TOUR_LABEL_PREFIXES) for x in labels):
+        if any(isinstance(x, str) and MEDIA_TOUR_LABEL.match(x) for x in labels):
             answer = True
             break
     result = answer if enrolled or answer is None else None
@@ -1128,6 +1132,49 @@ def media_tour_warm_slot(fam: Family, path: Path) -> bool:
         return False
     m = MEDIA_TOUR_WARM_SLOT.match(path.name)
     return m is not None and int(m.group(1)) < int(POLICY["media_tour_warm_slots"])
+
+
+def media_tour_tag_lock(path: Path) -> int | None:
+    """An fd holding the tour tag lock of media DerivedData PATH (media_tag_lock.py), taken without waiting, or None
+    while a tour holds it or the lock cannot be opened or taken (fail closed). Keep it until PATH is gone: a tour
+    claiming the tag meanwhile takes the next slot or waits, so it never builds into a dir being removed."""
+    tag = path.name[len("cmux-"):]
+    for side in ("-base", "-head"):
+        if tag.endswith(side):
+            tag = tag[: -len(side)]
+            break
+    try:
+        MEDIA_TOUR_LOCKS.mkdir(parents=True, exist_ok=True)
+        fd = os.open(MEDIA_TOUR_LOCKS / f"{tag}.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o644)
+    except OSError:
+        return None
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        return None
+    return fd
+
+
+def media_tour_tag_held(path: Path) -> bool:
+    """Whether a tour holds (or may hold: the lock cannot be taken) the tag of media DerivedData PATH."""
+    fd = media_tour_tag_lock(path)
+    if fd is None:
+        return True
+    os.close(fd)
+    return False
+
+
+def remove_media_tour_dd(path: Path) -> bool:
+    """Delete media DerivedData PATH only under its tour tag lock; False (nothing done) while a tour holds it."""
+    fd = media_tour_tag_lock(path)
+    if fd is None:
+        return False
+    try:
+        remove(path)
+    finally:
+        os.close(fd)
+    return True
 
 
 def media_tour_stray(fam: Family, path: Path) -> bool:
@@ -5921,6 +5968,8 @@ def _survey(families, idle_hours, min_bytes, known, evidence, defer_bulk=False,
                 reasons.append("live lease or running job")
         if fam.id == SPM_SCRATCH and spm_scratch_held(path):
             reasons.append("a job holds its lock (owned_spm_scratch.py)")
+        if media_tour_dd(fam, path) and media_tour_tag_held(path):
+            reasons.append("a media tour holds its slot's tag lock (media_tag_lock.py)")
         if fam.id == CANONICAL_ADMISSION and canonical_root_held(path):
             reasons.append("a job holds its canonical root (root token)")
         if tmp_canonical_root(fam, path) and canonical_root_held(path, whole_root=True):
@@ -7172,7 +7221,8 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
         if halt is not None and (why := halt()):
             print(f"stopped: {why}")
             break
-        if fam.id in FLEET_FAMILY_IDS or fam.id in (CMUX_NEXT_CI_FAMILY, HQ_CACHE_FAMILY, CANONICAL_ADMISSION) or (
+        if fam.id in FLEET_FAMILY_IDS or fam.id in (CMUX_NEXT_CI_FAMILY, HQ_CACHE_FAMILY, CANONICAL_ADMISSION) \
+                or media_tour_dd(fam, p) or (
                 fam.id == INTERRUPTED and fam.root in (cmux_next_ci_state_parents(HOME / "Library/Caches" / CMUX_NEXT_CI_ROOT)
                                                        + cmux_next_ci_host_parents(HOME / "Library/Caches" / CMUX_NEXT_CI_ROOT))):
             # Pressure eligibility is intentionally broad, so take fresh cwd/open-file evidence immediately
@@ -7279,6 +7329,8 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
                 elif i.family == INTERRUPTED:
                     finish_deletion(p)
                     gone = True
+                elif media_tour_dd(fam, p):
+                    gone = remove_media_tour_dd(p)  # only under the tour's tag lock: a tour may claim the slot now
                 elif cmux_next_ci_host_root(fam, p):
                     # only under its own lock (a build may take it now); for the floor alone, only while still under it
                     gone = remove_cmux_next_host(p, needed=(lambda q=p: cmux_next_ci_host_floor_unmet(q))

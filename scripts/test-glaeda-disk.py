@@ -5872,6 +5872,7 @@ class MediaTourDerivedDataTest(unittest.TestCase):
         self.fam = gd.Family("xcode-derived-data", self.root, True, "rebuild", build_output=True)
         self.patches = [mock.patch.object(gd, "process_evidence", lambda: ([], "")),
                         mock.patch.object(gd, "CMUX_RUNNER_STATE", self.state),
+                        mock.patch.object(gd, "MEDIA_TOUR_LOCKS", base / "locks"),
                         mock.patch.object(gd, "_MEDIA_TOUR_HOST_SET", False),
                         mock.patch.object(gd, "FLOOR_HOLD", {})]
         for p in self.patches:
@@ -5895,8 +5896,8 @@ class MediaTourDerivedDataTest(unittest.TestCase):
 
     def test_host_is_derived_from_enrolled_runner_labels(self) -> None:
         self.assertIsNone(gd.media_tour_host(self.state), "no runner enrolled: not a CI mini, nothing changes")
-        self.runner(1, ["glaeda-std-xcode-26.6"])
-        self.assertIs(gd.media_tour_host(self.state), False)
+        self.runner(1, ["glaeda-std-xcode-26.6", "glaeda-gui-std-linux", "glaeda-session-std", "glaeda-gui-std-xcode-"])
+        self.assertIs(gd.media_tour_host(self.state), False, "only the labels the tour's route picks count")
         self.runner(2, ["glaeda-gui-std-xcode-26.6"], installed=False)
         self.assertIs(gd.media_tour_host(self.state), False, "an uninstalled runner's labels route nothing here")
         self.runner(3, ["glaeda-session-light-xcode-26.6"])
@@ -5942,6 +5943,42 @@ class MediaTourDerivedDataTest(unittest.TestCase):
                                            "cmux-ci-media-slot3-base": "recent"})
         with mock.patch.object(gd, "POLICY", {**gd.POLICY, "media_tour_warm_slots": 1}):
             self.assertEqual(self.verdicts()["cmux-ci-media-slot1-head"], "reclaimable")
+
+    def tag_held(self, tag: str):
+        (self.root.parent / "locks").mkdir(exist_ok=True)
+        fd = os.open(self.root.parent / "locks" / f"{tag}.lock", os.O_RDWR | os.O_CREAT, 0o644)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        self.addCleanup(os.close, fd)
+
+    def test_a_held_tour_tag_keeps_its_dirs(self) -> None:
+        self.runner(1, ["glaeda-std-xcode-26.6"])
+        make(self.root / "cmux-ci-media-slot0-base", age_hours=30)
+        make(self.root / "cmux-ci-media-slot0-head", age_hours=30)
+        make(self.root / "cmux-ci-media-slot1-head", age_hours=30)
+        self.tag_held("ci-media-slot0")  # claimed: the tour has not opened anything yet
+        self.assertEqual(self.verdicts(), {"cmux-ci-media-slot0-base": "in-use", "cmux-ci-media-slot0-head": "in-use",
+                                           "cmux-ci-media-slot1-head": "reclaimable"})
+
+    def test_apply_deletes_only_under_the_tag_lock_and_fresh_evidence(self) -> None:
+        self.runner(1, ["glaeda-std-xcode-26.6"])
+        claimed = make(self.root / "cmux-ci-media-slot0-base", age_hours=30)
+        started = make(self.root / "cmux-ci-media-slot1-base", age_hours=30)
+        stray = make(self.root / "cmux-ci-media-pr-3-head", age_hours=30)
+        gd._MEDIA_TOUR_HOST_SET = False
+        items = gd.survey([self.fam], 12, 0)
+        self.assertEqual({i.verdict for i in items}, {"reclaimable"})
+        self.tag_held("ci-media-slot0")  # a tour claims slot 0 after the survey
+        # and an xcodebuild starts in slot 1 after the survey: only a fresh ps at apply sees it
+        calls = []
+
+        def evidence():  # apply's own first reading sees nothing; the build starts after it
+            calls.append(1)
+            return [], (f"xcodebuild -derivedDataPath {started}" if len(calls) > 1 else "")
+        with mock.patch.object(gd, "process_evidence", evidence), contextlib.redirect_stdout(io.StringIO()):
+            gd.apply(items, {self.fam.id: self.fam}, self.root.parent / "r.jsonl", None, 12)
+        self.assertTrue(claimed.exists(), "a claimed slot is never removed")
+        self.assertTrue(started.exists(), "a build that started after the survey keeps its dir")
+        self.assertFalse(stray.exists())
 
     def test_warm_slot_goes_only_under_the_runner_floor(self) -> None:
         self.runner(1, ["glaeda-gui-std-xcode-26.6"])
