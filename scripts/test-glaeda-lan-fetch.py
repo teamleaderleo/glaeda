@@ -422,6 +422,16 @@ class LanCacheTest(unittest.TestCase):
         self.assertFalse(dest.exists())
         self.assertEqual(next(self.out.glob(".archive.lan-*")).read_bytes(), b"planted")  # not ours to remove
 
+    def test_a_redirect_is_never_kept_as_an_object(self):
+        name = self.put(b"<html>moved</html>")
+        curl = self.base / "fake-redirect-curl"
+        curl.write_text(f"#!{sys.executable}\nimport sys\nargs = sys.argv[1:]\n"
+                        "open(args[args.index('--output') + 1], 'wb').write(b'<html>moved</html>')\n"
+                        "sys.stdout.write('302')\n")
+        curl.chmod(0o755)
+        self.assertEqual(serve.fill(self.cache, name, curl=os.fspath(curl)), "curl exit 0 http 302")
+        self.assertFalse(serve.stored(self.cache, name).exists())
+
     def test_the_mirror_list_is_admitted_and_bounded(self):
         self.assertEqual(self.fetch(self.put(b"x" * 10))[0], 0)  # makes the run dir
         run_dir = Path(os.environ["FAKE_CACHE"] + ".run")

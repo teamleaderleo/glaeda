@@ -653,9 +653,9 @@ def cache_transfer(config: dict, address: str, name: str, partial: int, deadline
         proc.wait()
 
 
-def same_file(path: Path, info: os.stat_result) -> bool:
+def same_file(parent: int, name: str, info: os.stat_result) -> bool:
     try:
-        now = os.lstat(path)
+        now = os.stat(name, dir_fd=parent, follow_symlinks=False)
     except OSError:
         return False
     return stat.S_ISREG(now.st_mode) and (now.st_dev, now.st_ino) == (info.st_dev, info.st_ino)
@@ -678,31 +678,42 @@ def fetch_cache(name: str, dest: Path, config: dict | None, deadline: float | No
         return EXIT_ERROR, {**record, "error": "DEST must be an absolute, absent path in an existing directory"}
     if config is None:
         return EXIT_ERROR, {**record, "error": "no LAN cache config"}
+    try:
+        # Every name below is looked up in this one directory, so a job that swaps DEST's directory for a
+        # symlink meanwhile moves nothing of ours anywhere else.
+        parent = os.open(dest.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError as error:
+        return EXIT_ERROR, {**record, "error": f"DEST directory: {type(error).__name__}"}
+    try:
+        return fetch_cache_into(name, parent, dest.name, config, record, started, deadline, cancel)
+    finally:
+        os.close(parent)
+
+
+def fetch_cache_into(name: str, parent: int, dest: str, config: dict, record: dict, started: float,
+                     deadline: float, cancel: threading.Event) -> tuple[int, dict]:
     errors = []
     for address in config["addresses"]:
         if cancel.is_set() or time.monotonic() >= deadline:
             errors.append("cancelled" if cancel.is_set() else "deadline passed")
             break
-        partial = dest.parent / f".{dest.name}.lan-{os.getpid()}-{threading.get_ident()}-{secrets.token_hex(6)}"
+        partial = f".{dest}.lan-{os.getpid()}-{threading.get_ident()}-{secrets.token_hex(6)}"
         try:
-            fd = os.open(partial, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
+            fd = os.open(partial, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644, dir_fd=parent)
         except OSError as error:
             return EXIT_ERROR, {**record, "error": f"partial file: {type(error).__name__}"}
         # Written through the descriptor this call created, never reopened by name; DEST is linked only to
-        # that same file (checked by inode on both sides of the link).
+        # that same file, checked by inode first.
         mine = os.fstat(fd)
         try:
             why, size, wait = cache_transfer(config, address, name, fd, deadline, cancel)
             if why == "miss":
                 return EXIT_MISS, {**record, "reason": "not in the bucket", "seconds": round(time.monotonic() - started, 3)}
             if not why:
-                if not same_file(partial, mine):
+                if not same_file(parent, partial, mine):
                     raise FileNotFoundError("the partial file was replaced")
-                os.link(partial, dest, follow_symlinks=False)  # no-replace: fails if DEST appeared meanwhile
-                if not same_file(dest, mine):
-                    with contextlib.suppress(OSError):
-                        dest.unlink()
-                    raise FileNotFoundError("the partial file was replaced")
+                # no-replace: fails if DEST appeared meanwhile
+                os.link(partial, dest, src_dir_fd=parent, dst_dir_fd=parent, follow_symlinks=False)
                 return EXIT_HIT, {**record, "address": address, "bytes": size, "wait_seconds": round(wait, 3),
                                   "seconds": round(time.monotonic() - started, 3)}
             errors.append(f"{address}: {why}")
@@ -710,8 +721,9 @@ def fetch_cache(name: str, dest: Path, config: dict | None, deadline: float | No
             errors.append(f"{address}: {type(error).__name__}")
         finally:
             os.close(fd)
-            if same_file(partial, mine):
-                partial.unlink(missing_ok=True)
+            if same_file(parent, partial, mine):
+                with contextlib.suppress(OSError):
+                    os.unlink(partial, dir_fd=parent)
     return EXIT_ERROR, {**record, "error": "; ".join(errors)[:400], "seconds": round(time.monotonic() - started, 3)}
 
 

@@ -1071,7 +1071,8 @@ def fill(cache: Path, name: str, timeout: float = FILL_TIMEOUT, curl: str = CURL
             report(part)
     with proc.stdout:
         http = (proc.stdout.read() or "").strip()
-    if code != 0 or not part.is_file() or part.stat().st_size == 0:
+    # Only a 200 is an object: with no redirects followed, a 3xx would otherwise be kept as its body.
+    if code != 0 or http != "200" or not part.is_file() or part.stat().st_size == 0:
         part.unlink(missing_ok=True)
         return "miss" if http == "404" else f"curl exit {code} http {http}"
     if part.stat().st_size > FILL_MAX_BYTES:  # a chunked answer that finished between two polls
