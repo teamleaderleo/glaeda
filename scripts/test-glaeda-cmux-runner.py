@@ -521,33 +521,50 @@ class HookTest(unittest.TestCase):
             with self.subTest(overrides=overrides):
                 self.assertIsNotNone(hook.dev_compile_refusal(**{**args, **overrides}))
 
-    def test_feed_jobs_are_the_nightly_app_build_and_the_feed_compiles(self) -> None:
+    def test_job_tiers_are_nightly_jobs_then_dev_compiles(self) -> None:
+        """FEED_FIRST: every nightly.yml job on a nightly-next or main push, schedule or dispatch is a nightly job, and
+        so is a feat-cmux-next push's release-compile (nightly-next's promote gate); the DEV compiles are DEV; nothing
+        a pull request runs is either, whatever its environment says."""
         for branch in ("nightly-next", "main"):
             ref = f"refs/heads/{branch}"
             args = {"event_name": "push", "ref": ref, "repository": "manaflow-ai/cmux",
                     "event": {"ref": ref, "repository": CMUX},
                     "workflow_ref": f"manaflow-ai/cmux/.github/workflows/nightly.yml@{ref}", "job": "build-nightly-app"}
-            with self.subTest(branch=branch):
-                self.assertTrue(hook.feed_job(**args))
-                self.assertTrue(hook.feed_job(**{**args, "event_name": "schedule", "event": {"repository": CMUX}}))
-                self.assertTrue(hook.feed_job(**{**args, "event_name": "workflow_dispatch",
-                                                 "event": {"repository": CMUX}}))
-                for overrides in (
-                        {"job": "build-sign-notarize-nightly"}, {"event_name": "pull_request"},
-                        {"repository": "other/cmux"}, {"event": {"ref": "refs/heads/other", "repository": CMUX}},
-                        {"workflow_ref": args["workflow_ref"].replace("nightly.yml", "ci.yml")},
-                        {"workflow_ref": "manaflow-ai/cmux/.github/workflows/nightly.yml@refs/pull/1/merge"},
-                        {"ref": "refs/pull/1/merge"}, {"ref": "refs/heads/rc/1"}):
-                    with self.subTest(branch=branch, overrides=overrides):
-                        self.assertFalse(hook.feed_job(**{**args, **overrides}))
+            for job in ("build-nightly-app", "promote-nightly-next", "build-sign-notarize-nightly",
+                        "verify-signed-nightly", "verify-final-dmg-nightly"):
+                with self.subTest(branch=branch, job=job):
+                    self.assertEqual(hook.job_tier(**{**args, "job": job}), hook.TIER_NIGHTLY)
+            self.assertEqual(hook.job_tier(**{**args, "event_name": "schedule", "event": {"repository": CMUX}}),
+                             hook.TIER_NIGHTLY)
+            self.assertEqual(hook.job_tier(**{**args, "event_name": "workflow_dispatch",
+                                              "event": {"repository": CMUX}}), hook.TIER_NIGHTLY)
+            for overrides in (
+                    {"job": ""}, {"event_name": "pull_request"}, {"event_name": "pull_request_target"},
+                    {"repository": "other/cmux"}, {"event": {"ref": "refs/heads/other", "repository": CMUX}},
+                    {"workflow_ref": args["workflow_ref"].replace("nightly.yml", "ci.yml")},
+                    {"workflow_ref": "manaflow-ai/cmux/.github/workflows/nightly.yml@refs/pull/1/merge"},
+                    {"ref": "refs/pull/1/merge"}, {"ref": "refs/heads/rc/1"}):
+                with self.subTest(branch=branch, overrides=overrides):
+                    self.assertEqual(hook.job_tier(**{**args, **overrides}), "")
         dev = {"event_name": "push", "ref": "refs/heads/feat-cmux-next", "repository": "manaflow-ai/cmux",
                "event": {"ref": "refs/heads/feat-cmux-next", "repository": CMUX},
                "workflow_ref": "manaflow-ai/cmux/.github/workflows/cmux-next.yml@refs/heads/feat-cmux-next",
                "job": "cmux-scheme-compile"}
-        self.assertTrue(hook.feed_job(**dev))
-        self.assertTrue(hook.feed_job(**{**dev, "job": "release-compile"}))
-        self.assertFalse(hook.feed_job(**{**dev, "job": "swift-test"}))
-        self.assertFalse(hook.feed_job(**{**dev, "event_name": "pull_request"}))
+        self.assertEqual(hook.job_tier(**dev), hook.TIER_DEV)
+        self.assertEqual(hook.job_tier(**{**dev, "job": "release-compile"}), hook.TIER_NIGHTLY)
+        daily = {**dev, "event_name": "workflow_dispatch",
+                 "event": {"repository": CMUX, "inputs": {"dev_daily": "true"}}}
+        self.assertEqual(hook.job_tier(**daily), hook.TIER_DEV)
+        self.assertEqual(hook.job_tier(**{**dev, "job": "swift-test"}), "")
+        self.assertEqual(hook.job_tier(**{**dev, "event_name": "pull_request"}), "")
+        nightly = {**dev, "ref": "refs/heads/nightly-next",
+                   "event": {"ref": "refs/heads/nightly-next", "repository": CMUX},
+                   "workflow_ref": "manaflow-ai/cmux/.github/workflows/nightly.yml@refs/heads/nightly-next",
+                   "job": "build-nightly-app"}
+        for key in hook.UNTRUSTED_PAYLOAD_KEYS:  # a payload that carries a pull request is never a feed's
+            for args in (dev, {**dev, "job": "release-compile"}, nightly):
+                with self.subTest(key=key, job=args["job"]):
+                    self.assertEqual(hook.job_tier(**{**args, "event": {**args["event"], key: {"number": 1}}}), "")
 
     def test_dev_compile_instance_gate_leaves_ordinary_admission_unchanged(self) -> None:
         self.fleet()
@@ -1315,46 +1332,67 @@ class HookTest(unittest.TestCase):
             (self.dir / "capacity" / f"{hook.ADMIT_WANT}{os.getppid()}").unlink(missing_ok=True)
             self.finish("d0")
 
-    def test_a_waiting_nightly_build_goes_ahead_of_pr_waiters_and_takes_the_fresh_reserve(self) -> None:
+    def nightly_job(self, ref: str, runner: str, job: str = "build-nightly-app") -> subprocess.CompletedProcess:
+        push = event(self.dir, f"nightly-{runner}", {"repository": CMUX, "ref": ref})
+        return self.run_hook(
+            "job-started", "push", push, "--allowed-repo", "manaflow-ai/cmux", "--no-disk", "--state-dir",
+            os.fspath(self.dir / "state"), "--watch-pid", str(os.getpid()), "--gui-wait", "0",
+            "--capacity-units", "14", "--capacity-dir", os.fspath(self.dir / "capacity"), "--instance", "4",
+            repo="manaflow-ai/cmux",
+            env={"GITHUB_JOB": job, "RUNNER_NAME": runner, "GITHUB_REF": ref,
+                 "GITHUB_WORKFLOW_REF": f"manaflow-ai/cmux/.github/workflows/nightly.yml@{ref}"})
+
+    def test_a_waiting_nightly_job_is_admitted_next_and_keeps_no_reserve(self) -> None:
         """2026-10-27 04:27Z: a nightly-next build-nightly-app (isolated, 4 units) waited 13+ min on a side runner
-        behind PR jobs that reached the mini first, and the idle freshness slot kept 4 more units from it. A feed
-        build (FEED_FIRST) goes ahead of a younger-than-FEED_JUMP_S PR waiter and does not keep the fresh reserve;
-        the same job from a pull request does both."""
+        behind PR jobs that reached the mini first, then, the oldest waiter, with 3 of 14 units free while an idle
+        DEV slot (4) and an idle gui runner (1) kept their reserves. A nightly job goes ahead of every waiter, a PR
+        job past FEED_JUMP_S too, and keeps no reserve; the same job from a pull request does neither."""
         self.fleet()
-        self.take_units(7)
-        reserve = self.hold_gui_reserve(hook.FRESH_RESERVE_TOKEN)
-        self.addCleanup(os.close, reserve)
+        self.take_units(8)
+        for token in (hook.FRESH_RESERVE_TOKEN, "gui"):  # the live mini: an idle DEV slot and an idle gui runner
+            self.addCleanup(os.close, self.hold_gui_reserve(token))
         marker = self.dir / "capacity" / f"{hook.ADMIT_WANT}{os.getppid()}"
-        marker.write_text(json.dumps({"since": time.time() - 60, "wants": ["units"], "who": "s9 fast-tier (run 1)"})
-                          + "\n")
-
-        def nightly(ref: str, runner: str) -> subprocess.CompletedProcess:
-            push = event(self.dir, f"nightly-{runner}", {"repository": CMUX, "ref": ref})
-            return self.run_hook(
-                "job-started", "push", push, "--allowed-repo", "manaflow-ai/cmux", "--no-disk", "--state-dir",
-                os.fspath(self.dir / "state"), "--watch-pid", str(os.getpid()), "--gui-wait", "0",
-                "--capacity-units", "14", "--capacity-dir", os.fspath(self.dir / "capacity"), "--instance", "4",
-                repo="manaflow-ai/cmux",
-                env={"GITHUB_JOB": "build-nightly-app", "RUNNER_NAME": runner, "GITHUB_REF": ref,
-                     "GITHUB_WORKFLOW_REF": f"manaflow-ai/cmux/.github/workflows/nightly.yml@{ref}"})
-
+        marker.write_text(json.dumps({"since": time.time() - hook.FEED_JUMP_S - 60, "wants": ["units"],
+                                      "who": "s9 fast-tier (run 1)"}) + "\n")
         try:
-            pr = nightly("refs/pull/1/merge", "p0")
+            pr = self.nightly_job("refs/pull/1/merge", "p0")
             self.assertEqual(pr.returncode, 1, pr.stdout)
             self.assertIn("s9 fast-tier (run 1) has waited longer here for units", pr.stdout)
             marker.unlink()
-            pr = nightly("refs/pull/1/merge", "p0")
+            pr = self.nightly_job("refs/pull/1/merge", "p0")
             self.assertEqual(pr.returncode, 1, pr.stdout)
-            self.assertIn("7 of 14 units free, build-nightly-app (isolated) needs 4 and 4 are kept", pr.stdout)
-            marker.write_text(json.dumps({"since": time.time() - 60, "wants": ["units"],
+            self.assertIn("6 of 14 units free, build-nightly-app (isolated) needs 4 and 5 are kept", pr.stdout)
+            marker.write_text(json.dumps({"since": time.time() - hook.FEED_JUMP_S - 60, "wants": ["units"],
                                           "who": "s9 fast-tier (run 1)"}) + "\n")
-            feed = nightly("refs/heads/nightly-next", "n0")
-            self.assertEqual(feed.returncode, 0, feed.stdout + feed.stderr)
-            self.assertIn("a feed build: it goes ahead of PR jobs waiting here", feed.stdout)
-            self.assertIn("holding 4/14 units for build-nightly-app (isolated", feed.stdout)
+            nightly = self.nightly_job("refs/heads/nightly-next", "n0")
+            self.assertEqual(nightly.returncode, 0, nightly.stdout + nightly.stderr)
+            self.assertIn("a nightly job: it goes ahead of every other job waiting here", nightly.stdout)
+            self.assertIn("holding 4/14 units for build-nightly-app (isolated", nightly.stdout)
         finally:
             marker.unlink(missing_ok=True)
             self.finish("n0")
+
+    def test_no_other_job_starts_while_a_nightly_job_waits(self) -> None:
+        """A PR job that arrives while a nightly job waits here does not start, though its units are free, and the
+        listener gate holds every runner whose next job takes units, the gui runner and the freshness slot too.
+        Nothing running is touched."""
+        self.fleet()
+        marker = self.dir / "capacity" / f"{hook.ADMIT_WANT}{os.getppid()}"
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(json.dumps({"since": time.time(), "wants": ["units"], "who": "n9 build-nightly-app (run 1)",
+                                      "tier": hook.TIER_NIGHTLY}) + "\n")
+        try:
+            pr = self.job("swift-package-tests", "s0", 14)
+            self.assertEqual(pr.returncode, 1, pr.stdout)
+            self.assertIn("n9 build-nightly-app (run 1) is a nightly job and goes first here for units", pr.stdout)
+            for scope in (hook.RunnerScope(units=14), hook.RunnerScope(units=14, gui=True),
+                          hook.RunnerScope(units=14, fresh=True)):
+                with self.subTest(scope=scope):
+                    self.assertIn("n9 build-nightly-app (run 1) waits here for units",
+                                  hook.mini_full(self.dir / "capacity", 14, scope) or "")
+        finally:
+            marker.unlink(missing_ok=True)
+            self.finish("s0")
 
     def test_a_waiter_behind_another_names_the_units_it_needs(self) -> None:
         """A waiter refused by fair_turn names every kind it needs, units too, so a newcomer that fits cannot take
@@ -2856,51 +2894,61 @@ time.sleep(60)
         self.assertIsNone(hook.fair_turn(capacity, {"simulator"}, now), "no shared kind: no turn to wait for")
         self.assertIsNone(hook.fair_turn(capacity, {"root", "units"}, now - 60), "an older admission goes first")
 
-    def test_feed_builds_go_ahead_of_pr_waiters_until_the_jump_bound(self) -> None:
-        """FEED_FIRST: a feed build waiting for units goes ahead of a PR job that began to wait earlier, unless that
-        job has waited FEED_JUMP_S; a PR job never goes ahead of a waiting feed build it has not outwaited that long.
-        Feed builds keep arrival order among themselves, and nothing else in the queue changes."""
+    def test_tiers_order_the_admission_queue(self) -> None:
+        """FEED_FIRST: a nightly job goes ahead of every waiter however long it has waited, and while one waits no
+        admission of another tier takes a unit, not even one its own gate's reserve covers. A DEV compile goes ahead
+        of a PR job that has waited less than FEED_JUMP_S. Within a tier, arrival order."""
         capacity = self.dir / "capacity"
         capacity.mkdir()
         now, bound = time.time(), hook.FEED_JUMP_S
         marker = capacity / f"{hook.ADMIT_WANT}{os.getppid()}"
 
-        def waiting(since: float, feed: object = None) -> None:
-            want: dict[str, object] = {"since": since, "wants": ["units"], "who": "w0 job (run 1)"}
-            if feed is not None:
-                want["feed"] = feed
+        def waiting(since: float, tier: object = None, wants: tuple[str, ...] = ("units",)) -> None:
+            want: dict[str, object] = {"since": since, "wants": list(wants), "who": "w0 job (run 1)"}
+            if tier is not None:
+                want["tier"] = tier
             marker.write_text(json.dumps(want))
 
+        nightly, dev = hook.TIER_NIGHTLY, hook.TIER_DEV
+        waiting(now - bound - 600)  # a PR job long past the bound
+        self.assertIsNone(hook.fair_turn(capacity, {"units"}, now, nightly, True), "a nightly job goes first")
+        self.assertIn("has waited longer here for units", hook.fair_turn(capacity, {"units"}, now, dev, True))
         waiting(now - 60)  # a PR job, a minute in
-        self.assertIsNone(hook.fair_turn(capacity, {"units"}, now, feed=True), "a feed build goes first")
+        self.assertIsNone(hook.fair_turn(capacity, {"units"}, now, dev, True), "a DEV compile goes first")
         self.assertIn("has waited longer here for units", hook.fair_turn(capacity, {"units"}, now))
-        self.assertIsNone(hook.fair_turn(capacity, {"simulator"}, now, feed=True))
-        waiting(now - bound - 5)  # a PR job past the bound is not jumped
-        self.assertIn("has waited longer here for units", hook.fair_turn(capacity, {"units"}, now, feed=True))
-        waiting(now - 5, feed=True)  # a feed build that arrived after this PR job
-        self.assertIn("is a feed build and goes first here for units", hook.fair_turn(capacity, {"units"}, now - 60))
+        waiting(now - 5, nightly, ())  # a nightly job that came later and waits for no unit (a token, say)
+        for tier, since in (("", now - bound - 600), (dev, now - 60), ("", now - 60)):
+            with self.subTest(tier=tier, since=since):
+                self.assertIn("is a nightly job and goes first here for units",
+                              hook.fair_turn(capacity, set(), since, tier, True))
+                self.assertIsNone(hook.fair_turn(capacity, set(), since, tier, False), "no unit taken: no wait")
+        waiting(now - 5, nightly)
+        self.assertIsNone(hook.fair_turn(capacity, {"units"}, now - 60, nightly, True), "nightly: arrival order")
+        self.assertIn("has waited longer", hook.fair_turn(capacity, {"units"}, now, nightly, True))
+        waiting(now - 5, dev)  # a DEV compile that came later
+        self.assertIn("is a DEV compile and goes first here for units", hook.fair_turn(capacity, {"units"}, now - 60))
         self.assertIsNone(hook.fair_turn(capacity, {"units"}, now - bound - 10), "past the bound: arrival order")
-        self.assertIsNone(hook.fair_turn(capacity, {"units"}, now - 60, feed=True), "feed builds: arrival order")
-        self.assertIn("has waited longer", hook.fair_turn(capacity, {"units"}, now, feed=True))
-        waiting(now - 5, feed="true")  # only a JSON true marks a feed build
-        self.assertEqual([w["feed"] for w in hook.admission_waiters(capacity)], [False])
+        waiting(now - 5, "boss")  # only the known tiers count
+        self.assertEqual([w["tier"] for w in hook.admission_waiters(capacity)], [""])
         self.assertIsNone(hook.fair_turn(capacity, {"units"}, now - 60))
         # one total order: of any two waiters, exactly one is ahead
-        for a, b in ((False, True), (True, False), (True, True), (False, False)):
-            for age_a, age_b in ((60, 5), (bound + 60, 5), (bound + 60, bound + 5), (5, 60)):
-                ra = hook.admission_rank(a, now - age_a, 10, now)
-                rb = hook.admission_rank(b, now - age_b, 11, now)
-                self.assertNotEqual(ra < rb, rb < ra, (a, age_a, b, age_b))
+        tiers = ("", dev, nightly)
+        for a in tiers:
+            for b in tiers:
+                for age_a, age_b in ((60, 5), (bound + 60, 5), (bound + 60, bound + 5), (5, 60), (5, bound + 60)):
+                    ra = hook.admission_rank(a, now - age_a, 10, now)
+                    rb = hook.admission_rank(b, now - age_b, 11, now)
+                    self.assertNotEqual(ra < rb, rb < ra, (a, age_a, b, age_b))
 
-    def test_a_waiting_feed_build_marks_its_marker(self) -> None:
+    def test_a_waiting_job_marks_its_tier(self) -> None:
         capacity = self.dir / "capacity"
         capacity.mkdir()
         marker = capacity / f"{hook.ADMIT_WANT}{os.getppid()}"
         hook.write_want(marker, 1.0, ["units"])
-        self.assertNotIn("feed", json.loads(marker.read_text()))
-        hook.write_want(marker, 1.0, ["units"], feed=True)
-        self.assertIs(json.loads(marker.read_text())["feed"], True)
-        self.assertEqual([w["feed"] for w in hook.admission_waiters(capacity)], [True])
+        self.assertNotIn("tier", json.loads(marker.read_text()))
+        hook.write_want(marker, 1.0, ["units"], hook.TIER_NIGHTLY)
+        self.assertEqual(json.loads(marker.read_text())["tier"], hook.TIER_NIGHTLY)
+        self.assertEqual([w["tier"] for w in hook.admission_waiters(capacity)], [hook.TIER_NIGHTLY])
 
     def test_capacity_runners_wait_for_units(self) -> None:
         # a 4-core side lane waits for units instead of refusing, on a side runner (instance past
