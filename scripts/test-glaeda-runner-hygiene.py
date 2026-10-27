@@ -225,6 +225,22 @@ class RunnerHygieneTest(unittest.TestCase):
             (self.install.install_dir / "operator-file").write_text("keep")
             self.assertEqual(rh._managed_install(self.install), (False, "install directory contains unrelated files"))
 
+    def test_apply_boots_out_a_loaded_job_whose_plist_is_gone_before_recreating_it(self) -> None:
+        self.installed()
+        self.install.plist.unlink()
+        calls = []
+
+        def ctl(install, *args):
+            calls.append(args[0])
+            return SimpleNamespace(returncode=0, stderr="", stdout="")
+        with self.owned(), mock.patch.object(rh, "_require_root"), mock.patch.object(rh, "_check_root_install_path"), \
+                mock.patch.object(rh, "_immutable"), mock.patch.object(rh, "launchctl_run", side_effect=ctl), \
+                mock.patch.object(rh, "service_loaded", side_effect=[True, True]), \
+                mock.patch.object(rh.os, "chown"):
+            rh.apply_install(self.install)
+        self.assertEqual(calls, ["bootout", "bootstrap"])
+        self.assertEqual(self.install.plist.read_bytes(), rh.plist_bytes(self.install))
+
     def test_check_is_read_only_on_the_command_line(self) -> None:
         with mock.patch.object(rh.platform, "system", return_value="Darwin"), \
                 self.assertRaises(SystemExit):

@@ -1205,10 +1205,12 @@ def hygiene_pass(install_dir: Path, state: dict[str, Any], now: float, live: boo
             continue
         if doc is None or doc.get("state") != "stale":
             entry.update(state="error", why=f"glaeda-runner-hygiene: {said or 'no answer'}")
-        else:
-            entry.update(state="stale", why=", ".join(map(str, doc.get("stale") or [])) +
+        else:  # a root pass that tried to reinstall and is still stale has failed: an error, retried
+            failed = live and "reinstalled" in entry
+            entry.update(state="error" if failed else "stale", why=", ".join(map(str, doc.get("stale") or [])) +
                          ("" if live else "; a root pass reinstalls it") +
-                         (f"; reinstall failed: {said}" if entry.get("reinstalled") is False else ""), action="reinstall")
+                         (f"; reinstall failed: {said}" if entry.get("reinstalled") is False else
+                          "; still stale after a reinstall" if failed else ""), action="reinstall")
         if live:  # a root pass that could not fix it waits HYGIENE_RETRY_S before trying again
             cache[uid] = {"failed": entry["why"], "state": entry["state"], "inputs": inputs(), "at": now}
         else:

@@ -1156,10 +1156,10 @@ class RunnerHygiene(unittest.TestCase):
     def test_a_failed_reinstall_is_retried_after_hygiene_retry_s_not_every_pass(self) -> None:
         self.run.fail_apply = True
         a = self.hygiene_pass()["accounts"]["501"]
-        self.assertEqual((a["state"], a["reinstalled"]), ("stale", False))
+        self.assertEqual((a["state"], a["reinstalled"], a["action"]), ("error", False, "reinstall"))
         self.assertIn("bootstrap failed", a["why"])
         calls = len(self.run.argv)
-        self.assertEqual(self.hygiene_pass(now=T0 + 120)["accounts"]["501"]["state"], "stale")
+        self.assertEqual(self.hygiene_pass(now=T0 + 120)["accounts"]["501"]["state"], "error")
         self.assertEqual(len(self.run.argv), calls)
         self.run.fail_apply = False
         self.hygiene_pass(now=T0 + heal.HYGIENE_RETRY_S + 1)

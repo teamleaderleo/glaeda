@@ -548,7 +548,7 @@ def apply_install(install: Install) -> dict:
     if managed_install:
         for item in (p for p in (install.snapshot, install.manifest) if p.exists()):
             st = item.stat()
-            if st.st_uid != 0 or st.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+            if st.st_uid != ROOT_UID or st.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
                 raise HygieneError(f"existing install file is not root-owned and protected: {item}")
     install.install_dir.mkdir(mode=0o755, parents=True, exist_ok=True)
     os.chown(install.install_dir, 0, _root_gid())
@@ -568,7 +568,8 @@ def apply_install(install: Install) -> dict:
     expected = plist_bytes(install)
     changed = not install.plist.exists() or install.plist.read_bytes() != expected
     if changed:
-        if managed_plist and service_loaded(install):
+        # A job of ours (its plist, or its validated install with the plist gone) may still be loaded: boot it out.
+        if (managed_plist or managed_install) and service_loaded(install):
             result = launchctl_run(install, "bootout", f"system/{install.label}")
             if result.returncode not in (0, 113):
                 raise HygieneError(f"launchctl bootout failed: {result.stderr.strip()[-200:]}")
@@ -601,7 +602,7 @@ def apply_uninstall(install: Install) -> dict:
         raise HygieneError(install_note)
     if managed_plist and not managed_install:
         raise HygieneError("managed plist has no matching install manifest")
-    if managed_plist and service_loaded(install):
+    if (managed_plist or managed_install) and service_loaded(install):
         result = launchctl_run(install, "bootout", f"system/{install.label}")
         if result.returncode not in (0, 113):
             raise HygieneError(f"launchctl bootout failed: {result.stderr.strip()[-200:]}")
