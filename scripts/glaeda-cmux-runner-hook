@@ -41,7 +41,7 @@ re-runs it elsewhere) when:
     must reference ~/.config/glaeda/cmux-fleet/class-acceptance/<class>.json. The toolchain check runs
     rustc, cargo, zig, xcodebuild and xcrun and compares them with that receipt's strings, exactly. First,
     rustup, rustc or cargo that cannot run at all (missing, or a link that dangles) refuses by path
-    or is not on the job PATH (toolchain_missing); the gate then holds every such runner at once, and ci-step fits
+    or is not on the job PATH, which is the runner's own (toolchain_missing); the gate then holds every such runner at once, and ci-step fits
     advertises nothing.
   * with --toolchain-xcode APP (the pool Xcode): the runner's environment sets TOOLCHAINS or an SDKROOT outside APP
     (leaked_toolchain_env; the xcrun shim's own SDKROOT does not count), or, with --require-eligible, xcrun in the
@@ -1286,41 +1286,34 @@ def receipt_source(enrollment: dict[str, Any], acceptance: Any, receipt: dict[st
 
 
 # A node that cannot run its Rust toolchain at all. 2026-10-26 21:26Z-00:48Z: ~/.cargo/bin/rustup was deleted on the
-# runner minis (rust-cache's cleanBin), so rustc and cargo (links to it) dangled; re-registered runners also got a
-# .path without ~/.cargo/bin, so the job PATH found no rustc. job-started refused with "cannot name a toolchain", which
-# reads like a version drift. That is a definite answer, not a slow probe: the listener gate holds at once, with no
+# runner minis (rust-cache's cleanBin), and job-started refused with "cannot name a toolchain", which reads like a
+# version drift. That is a definite answer, not a slow probe: the listener gate holds at once, with no
 # GATE_ELIGIBLE_EVERY_S wait and no GATE_ELIGIBLE_RECHECK_S look (Gate.ineligible); ci-step fits advertises no class
 # and admit refuses (step_refusal), so the controller stops leasing steps here; and glaeda-mini-health reports
-# toolchain_missing, naming which tool and why. All of them read the job's PATH, the runner's .path (job_env), not
-# their own launchd PATH. A few stats, so the gate reads it every poll.
+# toolchain_missing, naming which tool and why. The PATH is the one jobs run with: the gate's own (it runs run.sh with
+# it), else the runner LaunchAgent's WORKLOAD_PATH (glaeda-cmux-runner's; a test keeps the two equal). Never the
+# runner's .path: nothing on a glaeda runner reads it (only bin/runsvc.sh does), and it drifted to /usr/bin:/bin:...
+# on re-registered minis while their jobs ran on WORKLOAD_PATH. A few stats, so the gate reads it every poll.
 # GLAEDA_RUNNER_TOOLCHAIN_GATE=0 turns all of it off (job-started still probes rustc as before).
 RUST_TOOLS = ("rustup", "rustc", "cargo")
 TOOLCHAIN_MISSING = "Rust toolchain missing"
+TOOLCHAIN_OFF_PATH = "is not on the job PATH"
 TOOLCHAIN_GATE = os.environ.get("GLAEDA_RUNNER_TOOLCHAIN_GATE", "1") != "0"
-RUNNER_PATH_FILE = ".path"  # the actions runner's job PATH (env.sh writes it at configure time)
-RUNNER_ENV_FILE = ".env"  # KEY=VALUE lines the runner exports to every job
+WORKLOAD_DEFAULT = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"  # glaeda-cmux-runner WORKLOAD_PATH
+WORKLOAD_PATH = os.environ.get("GLAEDA_RUNNER_WORKLOAD_PATH") or WORKLOAD_DEFAULT
 
 
-def job_env(runner_dir: Path | None) -> dict[str, str]:
-    """PATH and CARGO_HOME as this runner's jobs get them: its .path and .env, else this process's own."""
-    env = {k: v for k in ("PATH", "CARGO_HOME") if (v := os.environ.get(k))}
-    if runner_dir is None:
-        return env
-    with contextlib.suppress(OSError, UnicodeDecodeError):
-        if path := (runner_dir / RUNNER_PATH_FILE).read_text().strip():
-            env["PATH"] = path
-    with contextlib.suppress(OSError, UnicodeDecodeError):
-        for line in (runner_dir / RUNNER_ENV_FILE).read_text().splitlines():
-            if line.startswith("CARGO_HOME=") and line[len("CARGO_HOME="):].strip():
-                env["CARGO_HOME"] = line[len("CARGO_HOME="):].strip()
-    return env
+def workload_env() -> dict[str, str]:
+    """The env a runner job gets its Rust from, for a caller outside the listener (the build worker's fits and admit,
+    the health agent): the LaunchAgent's WORKLOAD_PATH, and this process's CARGO_HOME if it sets one."""
+    return {"PATH": WORKLOAD_PATH, **({"CARGO_HOME": os.environ["CARGO_HOME"]} if os.environ.get("CARGO_HOME") else {})}
 
 
 def toolchain_missing(env: dict[str, str] | None = None, home: Path | None = None) -> str | None:
-    """Why a job with this env (PATH, CARGO_HOME) cannot run rustup, rustc or cargo, naming each tool, or None. A tool
-    counts when PATH finds it executable; one that is not found is described from rustup's bin dir ($CARGO_HOME/bin,
-    else ~/.cargo/bin): a link that dangles (rustc -> rustup with rustup gone), a path that is gone, or a tool that is
-    there while PATH does not reach it."""
+    """Why a job with this env (PATH, CARGO_HOME; default this process's) cannot run rustup, rustc or cargo, naming
+    each tool, or None. A tool counts when PATH finds it executable. One that is not found is described by what is
+    there: a link on PATH that dangles (rustc -> rustup with rustup gone), else rustup's bin dir ($CARGO_HOME/bin, else
+    ~/.cargo/bin) holding it while PATH does not reach it, else that it is nowhere."""
     if not TOOLCHAIN_GATE:
         return None
     env = os.environ if env is None else env
@@ -1330,26 +1323,24 @@ def toolchain_missing(env: dict[str, str] | None = None, home: Path | None = Non
     for tool in RUST_TOOLS:
         if shutil.which(tool, path=path):
             continue
-        candidate = bin_dir / tool
-        if os.access(candidate, os.X_OK):
-            gone.append(f"{tool} is not on the job PATH {path or '(empty)'} ({candidate} is there)")
-        elif os.path.islink(candidate):
-            gone.append(f"{candidate} (a link to {os.readlink(candidate)}, which is gone)")
+        links = [Path(d) / tool for d in [*path.split(os.pathsep), os.fspath(bin_dir)] if d]
+        dangling = next((c for c in links if os.path.islink(c) and not os.path.exists(c)), None)
+        if dangling is not None:
+            gone.append(f"{dangling} (a link to {os.readlink(dangling)}, which is gone)")
+        elif os.access(bin_dir / tool, os.X_OK):
+            gone.append(f"{tool} {TOOLCHAIN_OFF_PATH} {path or '(empty)'} ({bin_dir / tool} is there)")
         else:
-            gone.append(f"{candidate} is gone and {tool} is not on the job PATH")
+            gone.append(f"{tool} is not installed (not on the job PATH {path or '(empty)'}, not in {bin_dir})")
     return f"node not eligible ({TOOLCHAIN_MISSING}: {'; '.join(gone)})" if gone else None
 
 
-def fleet_runner(home: Path) -> Path | None:
-    """The first glaeda runner on this mini that runs its jobs with --require-eligible (a fleet build node), or None."""
-    return next((d for d in sorted(home.glob("actions-runner-glaeda*")) if eligibility_scope(d) is not None), None)
-
-
 def fleet_toolchain_missing(home: Path | None = None) -> str | None:
-    """toolchain_missing for this mini's fleet runner's jobs (job_env), or None on a mini without one."""
+    """toolchain_missing on the workload PATH, for a mini with a glaeda runner that runs its jobs with
+    --require-eligible (a fleet build node), else None."""
     home = home or Path.home()
-    runner = fleet_runner(home)
-    return toolchain_missing(job_env(runner), home) if runner is not None else None
+    if not any(eligibility_scope(d) is not None for d in sorted(home.glob("actions-runner-glaeda*"))):
+        return None
+    return toolchain_missing(workload_env(), home)
 
 
 def receipt_toolchain_name(want: dict[str, Any], env: dict[str, str], home: Path, deadline: float) -> str | None:
@@ -4525,7 +4516,7 @@ class Gate:
         if scope is None:
             self.eligible_why = self.missing_why = None
             return None
-        missing = toolchain_missing(job_env(self.runner_dir))  # every poll: a few stats; a definite answer holds now
+        missing = toolchain_missing()  # run.sh's PATH, so the jobs'; every poll: a few stats, a definite answer
         if missing != self.missing_why:
             gate_log(f"{missing}; held off at once so another runner takes the job (glaeda-mini-health: "
                      "toolchain_missing)" if missing else "the Rust toolchain is back")
@@ -4543,7 +4534,7 @@ class Gate:
                     why = None
                     gate_log(f"the eligibility look failed ({type(error).__name__}); not holding for it")
                 if why and TOOLCHAIN_MISSING in why:
-                    why = None  # the per-poll toolchain_missing holds and releases that, from the job's own PATH
+                    return  # the per-poll toolchain_missing owns that answer; the held one, if any, stands
                 if why and not self.eligible_why and not self.eligible_new:
                     self.eligible_new = why  # look again soon; hold only if that look refuses too
                     self.eligible_at = time.monotonic() - GATE_ELIGIBLE_EVERY_S + GATE_ELIGIBLE_RECHECK_S
@@ -6501,7 +6492,7 @@ def main(argv: list[str] | None = None) -> int:
         unknown = isinstance(fits, Unknown)
         answer: dict[str, Any] = {"schema": STEP_FITS, "fits": [] if unknown else fits, "unknown": unknown}
         if why:
-            answer["refusal"] = why[:400]
+            answer["refusal"] = why[:2000]  # every tool, with its paths
             print(f"{PREFIX}: fits: {why}", file=sys.stderr, flush=True)
         print(json.dumps(answer, sort_keys=True), flush=True)
         return 0
