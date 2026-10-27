@@ -112,7 +112,8 @@ def runner_installed(home: Path | None = None) -> bool:
 
 # Every child of a pass inherits the pass's flock (pass_fds), so a writer the pass's own death left running
 # still holds the lock and no later pass writes beside it; PASS_FILE names its process groups so the next
-# pass can stop them (macOS has no parent-death signal).
+# pass can stop them (macOS has no parent-death signal). A group is in PASS_FILE before its child does any
+# work: run_group's child waits for a line on stdin that the pass writes only once the file names it.
 HELD: list[int] = []
 PASS_FILE = ".pass.json"
 ORPHAN_NAMES = {"git", "git-remote-https", "git-remote-http", "git-index-pack", "git-upload-pack", "ssh", "curl",
@@ -132,23 +133,32 @@ def note_groups(groups: list[int]) -> None:
     """Record this pass and the process groups it runs children in (under the flock)."""
     if not HELD:
         return
-    with_suppressed(lambda: (GIT_DIR / PASS_FILE).write_text(json.dumps({"pid": os.getpid(), "groups": groups})))
+    incoming = GIT_DIR / f".{PASS_FILE}.{os.getpid()}"
+    incoming.write_text(json.dumps({"pid": os.getpid(), "groups": groups}))
+    incoming.rename(GIT_DIR / PASS_FILE)  # whole or not at all, so the next pass can always read it
 
 
 def run_group(command: Sequence[str], timeout: float) -> tuple[int, str]:
     """Run `command` in its own process group, killed whole at `timeout`; (status, stderr tail). 124 is a timeout."""
-    process = subprocess.Popen(list(command), start_new_session=True, stdout=subprocess.DEVNULL,
+    # The child waits for the go line: if the pass dies before recording the group, it reads EOF and exits.
+    process = subprocess.Popen(["/bin/sh", "-c", 'read -r go || exit 125; exec "$@"', "sh", *command],
+                               start_new_session=True, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
                                stderr=subprocess.PIPE, text=True, pass_fds=held())
-    note_groups(own_group() + [process.pid])
     try:
-        _, err = process.communicate(timeout=timeout)
+        note_groups(own_group() + [process.pid])
+    except BaseException:
+        with_suppressed(lambda: os.killpg(process.pid, signal.SIGKILL))
+        process.communicate()
+        raise
+    try:
+        _, err = process.communicate("go\n", timeout=timeout)
         return process.returncode, (err or "")[-400:]
     except subprocess.TimeoutExpired:
         with_suppressed(lambda: os.killpg(process.pid, signal.SIGKILL))
         process.communicate()
         return 124, f"timed out after {timeout:.0f} s"
     finally:
-        note_groups(own_group())
+        with_suppressed(lambda: note_groups(own_group()))
 
 
 def own_group() -> list[int]:
@@ -292,15 +302,15 @@ def download(url: str, target: Path, timeout: float) -> None:
     deadline = time.monotonic() + timeout
     status = 28
     for attempt in range(1, DOWNLOAD_TRIES + 1):
+        if attempt > 1:
+            time.sleep(min(5, max(0, deadline - time.monotonic())))
         left = deadline - time.monotonic()
         if left < 1:
             break
-        if attempt > 1:
-            time.sleep(5)
         status = subprocess.run([CURL, "--fail", "--silent", "--show-error", "--location", "--continue-at", "-",
                                  "--connect-timeout", "15", "--speed-limit", "1024", "--speed-time", "60",
                                  "--max-time", str(max(1, int(left))), "-o", os.fspath(target), url],
-                                capture_output=True, timeout=left + 60, pass_fds=held()).returncode
+                                capture_output=True, timeout=left, pass_fds=held()).returncode
         if status == 0:
             return
         if status == 22 and not target.exists():  # not in the bucket (or refused): no use asking again

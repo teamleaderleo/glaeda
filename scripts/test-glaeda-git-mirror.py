@@ -8,10 +8,12 @@ import importlib.machinery
 import importlib.util
 import json
 import os
+import signal
 import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -448,6 +450,23 @@ class Fetch(unittest.TestCase):
                 with self.assertRaises(subprocess.CalledProcessError):
                     gm.download("https://bucket.test/x", Path(temp) / "x", 60)
             self.assertEqual(len(calls), 1)
+
+    def test_a_child_does_no_work_until_its_group_is_recorded(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            marker = Path(temp) / "worked"
+            # The pass is SIGKILLed between starting the child and recording its group.
+            script = ("import importlib.machinery, importlib.util, os, signal, sys\n"
+                      f"loader = importlib.machinery.SourceFileLoader('gm', {os.fspath(ROOT / "scripts/glaeda-git-mirror")!r})\n"
+                      "spec = importlib.util.spec_from_loader('gm', loader); gm = importlib.util.module_from_spec(spec)\n"
+                      "loader.exec_module(gm)\n"
+                      "gm.note_groups = lambda groups: os.kill(os.getpid(), signal.SIGKILL)\n"
+                      f"gm.run_group(['/usr/bin/touch', {os.fspath(marker)!r}], 30)\n")
+            proc = subprocess.run([sys.executable, "-c", script], timeout=30)
+            self.assertEqual(proc.returncode, -signal.SIGKILL)
+            time.sleep(1)  # the orphaned child reads EOF and exits instead of running the command
+            self.assertFalse(marker.exists())
+            self.assertEqual(gm.run_group(["/usr/bin/touch", os.fspath(marker)], 30)[0], 0)
+            self.assertTrue(marker.exists())
 
     def test_run_group_kills_a_hung_command(self) -> None:
         status, why = gm.run_group(["sh", "-c", "sleep 30 & sleep 30"], timeout=1)
