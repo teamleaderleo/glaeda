@@ -5826,8 +5826,9 @@ def gh_cache_put(key: str, at: float, rc: int, out: bytes, err: bytes) -> None:
 
 def gh_cache_prune(now: float) -> None:
     """Delete stored answers past GH_CACHE_KEEP, and fill locks past GH_CACHE_LOCK_KEEP, at most once a
-    GH_CACHE_PRUNE_EVERY. A lock is kept well past the longest a fill can hold it (GH_CACHE_FILL_WAIT plus
-    GH_CACHE_FILL_DEADLINE), so the file a live fill holds is never the one removed."""
+    GH_CACHE_PRUNE_EVERY. A lock file is removed only while this holds it, and a fill checks after taking
+    its lock that the file is still the one at the path (gh_cache_fill_lock), so a fill that took a lock just
+    removed gives up rather than run beside one holding the new file."""
     stamp = gh_cache_dir() / ".pruned"
     with contextlib.suppress(OSError):
         if now - stamp.stat().st_mtime < GH_CACHE_PRUNE_EVERY:
@@ -5838,8 +5839,15 @@ def gh_cache_prune(now: float) -> None:
             if path.name != "writes.json" and now - path.stat().st_mtime > GH_CACHE_KEEP:
                 path.unlink(missing_ok=True)
         for path in gh_cache_dir().glob(".*.lock"):
-            if now - path.stat().st_mtime > GH_CACHE_LOCK_KEEP:
-                path.unlink(missing_ok=True)
+            if now - path.stat().st_mtime <= GH_CACHE_LOCK_KEEP:
+                continue
+            with contextlib.suppress(OSError), open(path, "a+") as handle:
+                try:
+                    fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except OSError:
+                    continue  # a fill holds it: in use, so not old
+                if now - os.fstat(handle.fileno()).st_mtime > GH_CACHE_LOCK_KEEP:
+                    path.unlink(missing_ok=True)
 
 
 def gh_cache_emit(answer: dict) -> int:
@@ -5895,13 +5903,49 @@ def gh_cache_child(real: str, args: list[str], capture: bool, deadline: float | 
     return (128 - code if code < 0 else code), b"", b""
 
 
+@contextlib.contextmanager
+def gh_cache_fill_lock(path: Path, seconds: float):
+    """bounded_lock for a fill, plus one check: once held, the file must still be the one at `path`. The
+    pruner removes an old lock file only while holding it, but a fill that opened the file before the removal
+    can take it after; that fill yields False, as for a lock it could not get, instead of filling beside a
+    fill holding the new file."""
+    try:
+        handle = open(path, "a+")
+    except OSError:
+        yield False
+        return
+    held = False
+    deadline = time.monotonic() + seconds
+    try:
+        while True:
+            try:
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                held = True
+                break
+            except OSError:
+                if time.monotonic() >= deadline:
+                    break
+                time.sleep(0.02)
+        if held:
+            try:
+                held = os.stat(path).st_ino == os.fstat(handle.fileno()).st_ino
+            except OSError:
+                held = False
+            if held:
+                os.utime(path)  # in use: the pruner's clock starts again
+        yield held
+    finally:
+        with contextlib.suppress(OSError):
+            handle.close()
+
+
 def gh_cache_fill(real: str, args: list[str], key: str, repo: str | None, ran: list[int]) -> int | None:
     """Run the real gh once for `key` and keep its answer; an identical call already doing that is
     waited for instead. None when the key's lock could not be had in GH_CACHE_FILL_WAIT: the caller
     then runs gh the ordinary way. Once gh has run its exit code is in `ran`, so a caller that
     catches an error from here knows not to run it a second time."""
     gh_cache_dir().mkdir(parents=True, exist_ok=True, mode=0o700)
-    with bounded_lock(gh_cache_dir() / f".{key}.lock", GH_CACHE_FILL_WAIT) as held:
+    with gh_cache_fill_lock(gh_cache_dir() / f".{key}.lock", GH_CACHE_FILL_WAIT) as held:
         if not held:
             return None
         answer = gh_cache_get(key, repo, time.time())

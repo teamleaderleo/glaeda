@@ -8242,6 +8242,36 @@ class BrokerAnswerCacheTest(BrokerBase):
         gg.gh_cache_prune(time.time())
         self.assertEqual((old.exists(), fresh.exists()), (False, True))
 
+    def test_a_held_lock_is_never_pruned(self) -> None:
+        gg.gh_cache_dir().mkdir(parents=True, exist_ok=True)
+        lock = gg.gh_cache_dir() / ".h.lock"
+        lock.touch()
+        os.utime(lock, (time.time() - gg.GH_CACHE_LOCK_KEEP - 5,) * 2)
+        with open(lock, "a+") as holder:
+            fcntl.flock(holder, fcntl.LOCK_EX)
+            gg.gh_cache_prune(time.time())
+            self.assertTrue(lock.exists())
+
+    def test_a_fill_lock_whose_file_was_replaced_is_not_held(self) -> None:
+        """The interleaving: a fill opens the lock file, the pruner removes it, another fill creates a new one;
+        the first, taking its lock, finds the path no longer its file and yields False."""
+        gg.gh_cache_dir().mkdir(parents=True, exist_ok=True)
+        lock = gg.gh_cache_dir() / ".r.lock"
+        lock.touch()
+        real_open = open
+
+        def opened_then_replaced(path, *a, **k):
+            handle = real_open(path, *a, **k)
+            if Path(path) == lock:
+                lock.unlink()
+                lock.touch()
+            return handle
+        with mock.patch("builtins.open", opened_then_replaced):
+            with gg.gh_cache_fill_lock(lock, 0.1) as held:
+                self.assertFalse(held)
+        with gg.gh_cache_fill_lock(lock, 0.1) as held:
+            self.assertTrue(held)
+
     def test_old_answers_are_pruned(self) -> None:
         gg.gh_cache_put("c" * 40, time.time(), 0, b"x", b"")
         old = gg.gh_cache_dir() / ("c" * 40 + ".json")
