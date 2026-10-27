@@ -9022,6 +9022,42 @@ class StaleRunRereadTest(Base):
         self.assertEqual(len(self.gh.rest_calls()), 2)
         self.assertIn("If-None-Match", self.gh.rest_calls()[-1][2], "conditional: an unchanged run answers a free 304")
 
+    def test_a_run_wait_marks_its_watch_before_the_controller_long_poll(self) -> None:
+        """subscribe_wait long-polls the controller (up to CONTROLLER_RUN_MAX_WAIT) before it leaves its request: the
+        daemon must already see the wait, and keep seeing it through that poll, or a lost finish waits it out."""
+        key = "run:o/r/67"
+        seen: list = []
+
+        def long_poll(k: str, timeout: float) -> None:
+            seen.append(gg.read_json(gg.watch_dir() / gg.file_name(k)))
+
+        with mock.patch.object(gg, "controller_wait_run", side_effect=long_poll), \
+                mock.patch.object(gg, "block", side_effect=SystemExit(9)), mock.patch.object(gg, "say_waiting"):
+            with self.assertRaises(SystemExit):
+                gg.subscribe_wait("run", "o/r/67", "green", 600, False, False, None, gg.RESCUE_GRACE)
+        self.assertTrue(seen and isinstance(seen[0].get("waitedAt"), float), seen)
+        e = {"key": key, "waitedAt": seen[0]["waitedAt"]}
+        self.daemon.now = seen[0]["waitedAt"] + gg.CONTROLLER_RUN_MAX_WAIT  # the long-poll's whole length
+        self.assertTrue(self.daemon.waited(e))
+
+    def test_a_long_poll_that_ends_on_the_same_in_progress_record_keeps_its_age(self) -> None:
+        key = "run:o/r/68"
+        old = time.time() - 400
+        updated = iso(time.time() - 600)
+        gg.write_json(gg.cache_dir() / gg.file_name(key), {
+            "key": key, "fetchedAt": old, "dataAt": old, "restAt": old, "source": "controller", "error": None,
+            "data": gg.controller_run(ctl_run(68, "in_progress", "", updated))})
+        controller = mock.Mock()
+        controller.run.return_value = ctl_run(68, "in_progress", "", updated)
+        with mock.patch.object(gg.Controller, "from_env", return_value=controller):
+            entry = gg.controller_wait_run(key, 5)
+        self.assertEqual((entry["dataAt"], entry["restAt"]), (old, old), "an unchanged record is not new data")
+        self.assertGreater(entry["fetchedAt"], old)
+        controller.run.return_value = ctl_run(68, "in_progress", "", iso(time.time()))
+        with mock.patch.object(gg.Controller, "from_env", return_value=controller):
+            entry = gg.controller_wait_run(key, 5)
+        self.assertGreater(entry["dataAt"], old, "a changed record is")
+
     def test_a_downstream_wait_marks_the_upstream_watch(self) -> None:
         out = io.StringIO()
         with mock.patch.object(gg, "daemon_running", lambda grace=0.0: True), \

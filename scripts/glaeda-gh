@@ -294,7 +294,9 @@ REST_SAFETY = 900  # a run the controller tracks is still read over REST this of
 # was read from GitHub for this long, is read once more (a lost completion delivery: manaflow-ai/cmux run
 # 40557947333, 2026-10-27, finished on GitHub while the controller kept it in_progress and its waiter blocked).
 STALE_RUN_REREAD = 180
-WAIT_INTEREST = 120  # a watch counts as waited on this long after a wait (or a downstream's) last registered it
+# A watch counts as waited on this long after a wait (or a downstream's) last registered it: past the client's
+# controller long-poll (subscribe_wait), which registers once before it blocks, and the daemon's touches after it.
+WAIT_INTEREST = CONTROLLER_RUN_MAX_WAIT + 2 * TOUCH_EVERY
 CONTROLLER_ABSENT = 900  # a controller without the run-events receiver (404, 503) is asked again this rarely
 FEED_PAGES = 5  # feed pages read per tick at most; a longer backlog continues on the next tick
 NUDGE_MIN = 20  # a PR a check event nudged is re-read at most this often (GraphQL points)
@@ -4068,7 +4070,15 @@ def controller_wait_run(key: str, timeout: float) -> dict | None:
         now = time.time()
         rest_at = (prior.get("restAt") if prior.get("source") == "controller"
                    and isinstance(prior.get("restAt"), (int, float)) else now)
-        entry = {"key": key, "fetchedAt": now, "dataAt": now, "restAt": rest_at,
+        # An unchanged queued or in-progress record keeps its time, as apply_run's does: a long-poll that ends
+        # on the same stale record must not make it look fresh and push back the daemon's STALE_RUN_REREAD.
+        data_at = now
+        if (not terminal("run", candidate) and isinstance(prior.get("dataAt"), (int, float))
+                and all(prior_data.get(k) == candidate.get(k) for k in ("status", "conclusion", "run_attempt", "updated_at"))):
+            data_at = prior["dataAt"]
+            if isinstance(prior.get("restAt"), (int, float)):
+                rest_at = prior["restAt"]
+        entry = {"key": key, "fetchedAt": now, "dataAt": data_at, "restAt": rest_at,
                  "data": candidate, "error": None, "source": "controller"}
         for field in ("etag", "jobs", "jobsEtag", "jobsAt", "jobsTried", "restParts", "restRun"):
             if field in prior:
@@ -4099,6 +4109,8 @@ def subscribe_wait(kind: str, target: str, until: str, timeout: float, jobs: boo
     say_waiting(waiting_line(key, until, sha, exact, timeout))
     req = wait_request(kind, target, until, timeout, jobs, as_json, sha, exact, grace)
     if kind == "run" and not jobs:
+        # the daemon keeps reading while this blocks (a lost finish is re-read past STALE_RUN_REREAD)
+        register(key, jobs, waited=True)
         started = time.monotonic()
         controller_wait_run(key, timeout)
         done = wait_step(req, time.time())
