@@ -908,6 +908,26 @@ class AgentTests(unittest.TestCase):
                 self.assertEqual(self.cmux.effects, [])
                 self.assertEqual(store.doc()["reservations"][0]["state"], "released")
 
+    def test_a_refused_force_cancel_is_not_marked_forced(self):
+        """If the guard refuses a force-cancel (never_cancelled() missed a started delivery run), nothing is
+        recorded as forced and no force-cancel is sent; the entry fails at the give-up as before."""
+        original = gr.never_cancelled
+        gr.never_cancelled = lambda run, entry: ""
+        try:
+            self.cmux.add_run(event="push", pr=None, path=".github/workflows/nightly.yml",
+                              jobs=[job(1, created=NOW - 600)])
+            store, ledger = fake_ledger(ledger_doc(reservation(state="rescuing", created=NOW - 600)))
+            seen = {f"cancel:{REPO.lower()}#7.1": NOW - gr.FORCE_CANCEL_SECONDS - 5, "job:1": NOW - 200}
+            self.tick(ledger, now=NOW, seen=seen)
+            entry = store.doc()["reservations"][0]
+            self.assertFalse(entry.get("forced"))
+            self.assertIn("no force-cancel", entry.get("note", ""))
+            self.tick(ledger, now=NOW + gr.CANCEL_GIVE_UP_SECONDS, seen=seen)
+        finally:
+            gr.never_cancelled = original
+        self.assertEqual(self.cmux.effects, [])
+        self.assertEqual(store.doc()["reservations"][0]["state"], "failed")
+
     def test_an_older_agents_cancel_of_a_nightly_run_is_never_forced_and_is_restored(self):
         """A stale `rescuing` entry whose cancel an older agent recorded: no force-cancel while the run settles,
         and once it ends cancelled it is re-run, so a protected run is never left cancelled."""

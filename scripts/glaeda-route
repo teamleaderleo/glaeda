@@ -1098,7 +1098,8 @@ def watch_one(api: GitHub, entry: dict[str, Any], *, now: float, seen: dict[str,
             if waited >= FORCE_CANCEL_SECONDS and not entry.get("forced"):
                 forced, refused_why = never_cancel.cancel_run(
                     lambda path: api.ok("GET", path), lambda path: api.ok("POST", path), repo, run, force=True)
-                return {"forced": True} if forced else {"forced": True, "note": f"no force-cancel: {refused_why}"}
+                # Refused: not marked forced, so a later tick asks again (a read may have failed) until the give-up.
+                return {"forced": True} if forced else {"note": f"no force-cancel: {refused_why}"}
             return None
         if kept and cancelled_before and run.get("conclusion") == "cancelled":
             # An older agent cancelled a protected run: restore it, whatever moved meanwhile.

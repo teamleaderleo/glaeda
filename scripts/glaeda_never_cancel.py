@@ -74,10 +74,13 @@ SETUP_STEPS = frozenset({"Set up job", "Set up runner"})
 def work_started_at(job: Mapping[str, Any]) -> float | None:
     """When the job's own work began: the start of its first step after the runner's setup. None while it is still
     in setup (an admission wait), or when its steps are not listed: then no time of it counts toward a timeout."""
-    for step in job.get("steps") or ():
-        if step.get("name") in SETUP_STEPS:
+    steps = job.get("steps")
+    for step in steps if isinstance(steps, list) else ():
+        if not isinstance(step, Mapping) or step.get("name") in SETUP_STEPS or step.get("conclusion") == "skipped":
             continue
-        return parse_utc(step.get("started_at"))
+        began = parse_utc(step.get("started_at"))
+        if began is not None:
+            return began
     return None
 
 
@@ -163,7 +166,9 @@ def read_jobs(get: Callable[[str], Any], repo: str, run: Mapping[str, Any]) -> l
         body = get(f"/repos/{repo}/actions/runs/{run.get('id')}/attempts/{int(run.get('run_attempt') or 1)}"
                    "/jobs?per_page=100")
         jobs = body.get("jobs") if isinstance(body, dict) else None
-        return list(jobs) if isinstance(jobs, list) else None
+        if not isinstance(jobs, list) or not all(isinstance(j, Mapping) for j in jobs):
+            return None  # a malformed answer is an unreadable one
+        return list(jobs)
     except Exception:  # noqa: BLE001 - any failure to read refuses the cancel
         return None
 

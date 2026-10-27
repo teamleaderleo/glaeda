@@ -113,6 +113,11 @@ class PredicateTable(unittest.TestCase):
             ("left a 90 min admission 1 min ago", run(), [job(started_min_ago=91, setup_min=90)], 90, False),
             ("worked 91 min after a 30 min admission", run(), [job(started_min_ago=121, setup_min=30)], 90, True),
             ("steps not listed", run(), [{**job(started_min_ago=500), "steps": []}], 90, False),
+            ("first work step skipped, the next one past timeout", run(),
+             [{**job(started_min_ago=200), "steps": [
+                 {"name": "Set up runner", "status": "completed", "started_at": ts(200)},
+                 {"name": "Maybe", "status": "completed", "conclusion": "skipped", "started_at": None},
+                 {"name": "Compile", "status": "in_progress", "started_at": ts(100)}]}], 90, True),
             # Any sign of a start counts, whatever status the run reports.
             ("waiting run, job with a start time", run(status="waiting"),
              [{**job("queued"), "started_at": ts(5)}], 90, False),
@@ -179,6 +184,13 @@ class CancelRun(unittest.TestCase):
         f = Fake(run(), [job(started_min_ago=95)])
         self.assertTrue(self.cancel(f)[0])
         self.assertEqual(f.posts, ["/repos/o/r/actions/runs/7/cancel"])
+
+    def test_malformed_jobs_refuse(self):
+        for body in ({"jobs": ["x"]}, {"jobs": None}, {"jobs": {"a": 1}}, ["x"]):
+            f = Fake(run(), [])
+            f.get = lambda path, body=body: body if "/jobs" in path else Fake.get(f, path)
+            self.assertFalse(self.cancel(f)[0], body)
+            self.assertEqual(f.posts, [])
 
     def test_unreadable_reads_refuse(self):
         for f in (Fake(run(), None), Fake(run(), [job(started_min_ago=500)], wf=None)):
