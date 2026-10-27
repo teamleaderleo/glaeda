@@ -93,7 +93,8 @@ git-pr-<uuid>, TemporaryDirectory.<rand>, ...): tens of thousands, each under th
 family reclaims them. user-tmp-test-residue removes entries named by TMP_TEST_RESIDUE on every apply (not only
 under pressure) once nothing in the whole entry changed for 12 hours and no process holds or names it. On a fleet
 mini with enrolled runners every entry is a candidate except the TMP_TEST_RESIDUE_KEEP names (com.apple.*, dot
-names, TemporaryItems, tmux/ssh sockets, a bare UUID), and an unnamed one also stays while a socket sits in it or is one.
+names, TemporaryItems, tmux/ssh sockets, a bare UUID; a kept name with a UUID too), and any entry outside the measured
+prefixes (or a hold a killed pass left) also stays while a socket sits in it or is one.
 An entry with a TemporaryItems child (macOS guards $TMPDIR/<entry>/TemporaryItems) is moved into a holding dir
 one level down (glaeda-tmp-hold-<pid>, itself named scratch if a pass dies), walked and judged there, and deleted
 there or moved back. Every report shows the count
@@ -2307,11 +2308,19 @@ def tmp_test_residue_prefix(name: str, every_entry: bool) -> str | None:
     TMP_TEST_UUID_NAME, or with every_entry (a runner host) any name TMP_TEST_RESIDUE_KEEP does not keep."""
     if m := TMP_TEST_RESIDUE.match(name):
         return m.group(0)[:-2]
+    if TMP_TEST_RESIDUE_KEEP.match(name):  # a kept name stays whatever follows it (ssh-<uuid>, tmux-<uuid>)
+        return None
     if m := TMP_TEST_UUID_NAME.fullmatch(name):
         return m.group("prefix")
-    if every_entry and not TMP_TEST_RESIDUE_KEEP.match(name):
-        return TMP_TEST_RESIDUE_OTHER
-    return None
+    return TMP_TEST_RESIDUE_OTHER if every_entry else None
+
+
+def tmp_socket_veto(name: str) -> bool:
+    """A socket in or at this entry keeps it: every candidate except the measured TMP_TEST_RESIDUE prefixes (whose
+    tests leave socket files of their own, cmux-cli-socket-*), and always a hold a killed pass left, which may hold
+    an entry of any kind."""
+    m = TMP_TEST_RESIDUE.match(name)
+    return m is None or name.startswith(TMP_HOLD_PREFIX)
 
 
 def tmp_test_residue_every_entry() -> bool:
@@ -2355,7 +2364,7 @@ def guarded_tmp_entry(entry: Path) -> bool:
 
 def judge_tmp_entry(entry: Path, hold: Path, opened: frozenset[str], cmds: str, now: float,
                     deadline: float | None, unnamed: bool) -> tuple[str, int, Path]:
-    """tmp_test_residue_veto for one $TMPDIR entry, and the path it now sits at. A guarded entry is first vetoed
+    """tmp_test_residue_veto for one $TMPDIR entry, and the path it now sits at; unnamed is tmp_socket_veto. A guarded entry is first vetoed
     by its own name (open files, cwds, commands), then moved into hold, where it can be walked; one that must stay
     moves back to its name."""
     if not guarded_tmp_entry(entry):
@@ -2429,7 +2438,7 @@ def reap_tmpdir_test_residue(receipt: Path, tmp: Path | None = None, halt=None,
         prefix = tmp_test_residue_prefix(name, every_entry)
         try:
             why, used, entry = judge_tmp_entry(entry, hold, evidence[0], evidence[1], time.time(),
-                                               start + TMP_TEST_RESIDUE_BUDGET_S, prefix == TMP_TEST_RESIDUE_OTHER)
+                                               start + TMP_TEST_RESIDUE_BUDGET_S, tmp_socket_veto(name))
         except OSError as e:
             kept[f"incomplete:{e.__class__.__name__}"] += 1
             continue

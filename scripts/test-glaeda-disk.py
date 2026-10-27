@@ -5221,6 +5221,41 @@ class GlaedaDiskTest(unittest.TestCase):
             gd.reap_tmpdir_test_residue(self.receipt(), tmp, every_entry=False)
         self.assertTrue(live.is_file())
 
+    def test_tmpdir_test_residue_kept_names_and_sockets_win_over_the_uuid_rule(self) -> None:
+        for name in ("ssh-0157d868-1a4f-4a4c-b017-9a3bb1b51aa6", "tmux-0157d868-1a4f-4a4c-b017-9a3bb1b51aa6",
+                     "launchd-0157d868-1a4f-4a4c-b017-9a3bb1b51aa6"):
+            for every in (False, True):
+                self.assertIsNone(gd.tmp_test_residue_prefix(name, every), name)
+        self.assertTrue(gd.tmp_socket_veto("phone-tests-0157d868-1a4f-4a4c-b017-9a3bb1b51aa6"))
+        self.assertFalse(gd.tmp_socket_veto("cmux-cli-socket-00D670AE-52D1-4CCE-88A3-08D9A0C1851D"))
+        self.assertTrue(gd.tmp_socket_veto(f"{gd.TMP_HOLD_PREFIX}4242"))
+
+    def test_tmpdir_test_residue_a_leftover_hold_keeps_its_socket_veto(self) -> None:
+        """A pass killed after the move leaves glaeda-tmp-hold-<pid>; the next pass still keeps a live socket in it."""
+        tmp, e = self._tmp_residue()
+        hold = tmp / f"{gd.TMP_HOLD_PREFIX}4242"
+        moved = hold / "phone-tests-sock"
+        moved.mkdir(parents=True)
+        cwd, sock = os.getcwd(), socket.socket(socket.AF_UNIX)
+        try:
+            os.chdir(moved)
+            sock.bind("s")
+        finally:
+            os.chdir(cwd)
+        self._age(hold, hours=72)
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                gd.reap_tmpdir_test_residue(self.receipt(), tmp, every_entry=True)
+        finally:
+            sock.close()
+        self.assertTrue((moved / "s").exists())
+        # without the socket the leftover hold is idle scratch and goes
+        (moved / "s").unlink()
+        self._age(hold, hours=72)
+        with contextlib.redirect_stdout(io.StringIO()):
+            gd.reap_tmpdir_test_residue(self.receipt(), tmp)
+        self.assertFalse(hold.exists())
+
     def test_tmpdir_test_residue_prefix(self) -> None:
         self.assertEqual(gd.tmp_test_residue_prefix("cmux-screenshots-tests-0A1B", False), "cmux-screenshots-tests")
         self.assertIsNone(gd.tmp_test_residue_prefix("downloads-0A1B2C", False))
