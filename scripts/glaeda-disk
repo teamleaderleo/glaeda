@@ -413,6 +413,8 @@ class Family:
     # Past this idle age the checkouts inside an item are mirrors (a GitHub clone, a laptop's synced tree)
     # and no git check keeps it; process, socket and job-marker checks still do.
     mirror_idle_hours: float | None = None
+    # mirror_idle_hours applies only to the items named with one of these prefixes (empty: every item)
+    mirror_include: tuple[str, ...] = ()
     platform: str = "unknown"  # macos | linux | shared | unknown; reporting only, never deletion authority
 
 
@@ -3529,6 +3531,20 @@ HQ_CACHE_FAMILY = "hq-build-fleet-cache"
 # window archive_mirror bundles those into ~/archive and the tree goes (Leo, 2026-10-26: "When have we ever had
 # something useful greater than 12 hours?").
 CMUX_JOB_MIRROR_HOURS = DEFAULT_AGE_HOURS
+# The same 12 h hygiene rule, on a CI mini (hygiene_mirror_host), for the trees no person works in that a git check
+# kept forever (cmux13s, 2026-10-27: 16 GiB cache/ios-workspaces read "git-checkout", 3.6 GiB split-spring-apps
+# idle 85 h and cua build-src-* idle 102 h read "unchecked", ~/Library/Caches/cmux-ci "unchecked"): the fleet
+# cache's entries, the CUA client's build trees and the cmux* trees in ~/Library/Caches. Past 12 h idle,
+# archive_mirror bundles every unpushed commit and local-only ref into ~/archive first; uncommitted work, a process,
+# an open file, a lease or a running job's command line keeps the tree. Warm compile caches stay by role:
+# cmux-next-ci, cmux-nightly-next and the fleet's xcode/ tree are other families, and cmux-release-support (a release
+# builder's warm depot_tools, ghostty and cmux trees) is NEVER_DELETE.
+
+
+def hygiene_mirror_host() -> bool:
+    """The 12 h mirror rule for fleet-artifacts, cua-cache and ~/Library/Caches/cmux*: a fleet mini (macOS) whose
+    user runs enrolled CI runners, never an interactive Mac or a devbox."""
+    return DARWIN and ROLE == "fleet-mini" and bool(enrolled_runners())
 
 
 def transcript_candidates(root: Path, archives: bool = False) -> list[Path]:
@@ -3575,6 +3591,7 @@ def default_families(role: str = "fleet-mini") -> list[Family]:
     uid = os.getuid()
     projects = HOME / "Projects"
     wt_roots = worktree_roots(projects)
+    mirror_host = role == "fleet-mini" and hygiene_mirror_host()
     fams = [
         Family("xcode-derived-data", HOME / "Library/Developer/Xcode/DerivedData", True,
                "next xcodebuild rebuilds it", owner="Xcode, per checkout", rebuild_minutes=15,
@@ -3607,6 +3624,7 @@ def default_families(role: str = "fleet-mini") -> list[Family]:
                skip=("cmux-job", "huggingface", "codex-runtimes"), skip_prefixes=("glaeda",),
                owner="tools (XDG cache)", rebuild_minutes=5, pressure_only=role == "devbox", platform=host_cache_platform()),
         Family("library-caches", HOME / "Library/Caches", True, "the app re-downloads or rebuilds it",
+               mirror_idle_hours=CMUX_JOB_MIRROR_HOURS if mirror_host else None, mirror_include=("cmux",),
                # glaeda: OTA candidates and LAN seed stages; PassKit: web service cookies; tidy-branches:
                # a deletion receipt; the rest are Apple daemons without the com.apple. prefix
                skip=("glaeda", "cmux-next-ci", "PassKit", "tidy-branches", "CloudKit", "GeoServices", "FamilyCircle",
@@ -3622,7 +3640,8 @@ def default_families(role: str = "fleet-mini") -> list[Family]:
                min_idle_hours=DEFAULT_AGE_HOURS, owner="CUA recorder", rebuild_minutes=2, platform="macos"),
         Family("cua-cache", HOME / "Library/Caches/cmux/cmux-cua", True,
                "the CUA client rebuilds its frame cache", depth=1, files=True,
-               min_idle_hours=DEFAULT_AGE_HOURS, owner="cmux CUA", rebuild_minutes=1, platform="macos"),
+               min_idle_hours=DEFAULT_AGE_HOURS, mirror_idle_hours=CMUX_JOB_MIRROR_HOURS if mirror_host else None,
+               owner="cmux CUA", rebuild_minutes=1, platform="macos"),
         # Sealed caches (cache_layout) anywhere else in the home directory: ~/.npm/_cacache,
         # ~/.bun/install/cache, ~/.cargo/registry, ~/go/pkg/mod, rustup toolchains. Found by content,
         # so a tool this list never heard of is covered once its cache has a recognized layout.
@@ -3679,6 +3698,7 @@ def default_families(role: str = "fleet-mini") -> list[Family]:
                                "the fleet worker rebuilds or fetches the artifact", depth=1,
                                files=True, allow_stale_protected=True, stale_before=ARTIFACT_CUTOFF,
                                reference_root=FLEET_ROOT, owner="cmux fleet worker", rebuild_minutes=8,
+                               mirror_idle_hours=CMUX_JOB_MIRROR_HOURS if mirror_host else None,
                                platform="macos"))
         ci_ios = FLEET_ROOT / "ci-ios"
         if ci_ios.is_dir():
@@ -4723,6 +4743,7 @@ def derived_data(fam: Family, path: Path) -> bool:
 def mirror_due(fam: Family, path: Path, idle_hours: float) -> bool:
     """A mirror family's item idle past its mirror age: it goes once archive_mirror has bundled what is unpushed."""
     return (fam.mirror_idle_hours is not None and idle_hours >= fam.mirror_idle_hours
+            and (not fam.mirror_include or path.name.startswith(fam.mirror_include))
             and not derived_data(fam, path))
 
 

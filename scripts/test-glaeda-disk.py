@@ -8595,6 +8595,102 @@ class CaptureDedupeTest(unittest.TestCase):
         self.assertTrue(all(p.read_bytes() == d for p, d in frames.items()))
 
 
+class HygieneMirrorTest(unittest.TestCase):
+    """The 12 h hygiene rule on a CI mini: fleet cache entries, CUA build trees and ~/Library/Caches/cmux* idle past
+    12 h go once their unpushed commits are bundled into ~/archive; a process in one keeps it (cmux13s, 2026-10-27)."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.home = Path(os.path.realpath(self.tmp.name))
+        self.saved = (gd.HOME, gd.FLEET_ROOT, gd.DARWIN, gd.ROLE)
+        gd.HOME, gd.FLEET_ROOT, gd.DARWIN, gd.ROLE = self.home, self.home / "shared-fleet", True, "fleet-mini"
+        gd._DISCOVERED.clear()
+        (gd.FLEET_ROOT / "cache").mkdir(parents=True)
+        self.env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+                    "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
+
+    def tearDown(self) -> None:
+        gd.HOME, gd.FLEET_ROOT, gd.DARWIN, gd.ROLE = self.saved
+        gd._DISCOVERED.clear()
+        self.tmp.cleanup()
+
+    def checkout(self, tree: Path) -> Path:
+        """A clone with a commit no remote holds, idle 26 h."""
+        repo = tree / "work"
+        subprocess.run(["git", "init", "-q", str(repo)], check=True, env=self.env)
+        (repo / "f").write_text("x")
+        subprocess.run(["git", "-C", str(repo), "add", "f"], check=True, env=self.env)
+        subprocess.run(["git", "-C", str(repo), "commit", "-qm", "local only"], check=True, env=self.env)
+        (tree / "build.o").write_bytes(b"o" * 4096)
+        t = time.time() - 26 * 3600
+        for dirpath, dirnames, filenames in os.walk(tree):
+            for n in dirnames + filenames:
+                os.utime(os.path.join(dirpath, n), (t, t), follow_symlinks=False)
+        os.utime(tree, (t, t))
+        return repo
+
+    def families(self, runners: bool = True) -> dict[str, gd.Family]:
+        with mock.patch.object(gd, "enrolled_runners", return_value=[self.home / "actions-runner"] if runners else []):
+            return {f.id: f for f in gd.default_families()
+                    if f.id in ("fleet-artifacts", "cua-cache", "library-caches")}
+
+    def survey(self, fam: gd.Family, cmds: str = "", opened: list[str] | None = None) -> dict[str, gd.Item]:
+        with mock.patch.object(gd, "process_evidence", return_value=(opened or [], cmds)):
+            return {Path(i.path).name: i for i in gd.survey([fam], 24, 0)}
+
+    def test_an_idle_tree_with_unpushed_commits_is_bundled_then_removed(self) -> None:
+        tree = gd.FLEET_ROOT / "cache/ios-workspaces"
+        self.checkout(tree)
+        fam = self.families()["fleet-artifacts"]
+        self.assertEqual(fam.mirror_idle_hours, gd.DEFAULT_AGE_HOURS)
+        item = self.survey(fam)["ios-workspaces"]
+        self.assertEqual(item.verdict, "reclaimable", item.reasons)
+        self.assertTrue(any("mirrors" in r for r in item.reasons))
+        receipt = self.home / "receipt.jsonl"
+        with contextlib.redirect_stdout(io.StringIO()), \
+                mock.patch.object(gd, "process_evidence", return_value=([], "")):
+            gd.apply([item], {fam.id: fam}, receipt, None, 24)
+        self.assertFalse(tree.exists())
+        bundles = sorted((self.home / "archive/glaeda-disk").glob("*.bundle"))
+        self.assertEqual(len(bundles), 1)
+        heads = subprocess.run(["git", "bundle", "list-heads", str(bundles[0])], capture_output=True, text=True,
+                               check=True).stdout
+        self.assertIn("refs/heads/", heads)
+
+    def test_a_tree_with_a_process_in_it_is_kept(self) -> None:
+        tree = gd.HOME / "Library/Caches/cmux/cmux-cua/build-src-abc"
+        repo = self.checkout(tree)
+        fam = self.families()["cua-cache"]
+        self.assertEqual(self.survey(fam)["build-src-abc"].verdict, "reclaimable")
+        item = self.survey(fam, opened=[f"{repo}"])["build-src-abc"]
+        self.assertEqual(item.verdict, "in-use", item.reasons)
+        # a process that starts after the survey keeps it at apply's fresh evidence, before any bundle goes
+        idle = self.survey(fam)["build-src-abc"]
+        receipt = self.home / "receipt.jsonl"
+        with contextlib.redirect_stdout(io.StringIO()), \
+                mock.patch.object(gd, "process_evidence", return_value=([], f"swift build --package-path {repo}\n")):
+            gd.apply([idle], {fam.id: fam}, receipt, None, 24)
+        self.assertTrue((repo / ".git").is_dir())
+        self.assertIn("changed:in-use", receipt.read_text())
+
+    def test_only_cmux_library_caches_and_never_a_warm_tree_kept_by_role(self) -> None:
+        caches = gd.HOME / "Library/Caches"
+        for name in ("cmux-ci", "cmux-release-support", "org.example.tool"):
+            self.checkout(caches / name)
+        items = self.survey(self.families()["library-caches"])
+        self.assertEqual(items["cmux-ci"].verdict, "reclaimable", items["cmux-ci"].reasons)
+        self.assertNotIn("cmux-release-support", items)  # NEVER_DELETE: a release builder's warm trees
+        self.assertEqual(items["org.example.tool"].verdict, "git-checkout")
+
+    def test_off_where_no_ci_runner_is_enrolled(self) -> None:
+        (gd.HOME / "Library/Caches/cmux/cmux-cua").mkdir(parents=True)
+        fams = self.families(runners=False)
+        self.assertEqual({fid: f.mirror_idle_hours for fid, f in fams.items()},
+                         {"fleet-artifacts": None, "cua-cache": None, "library-caches": None})
+        self.checkout(gd.FLEET_ROOT / "cache/ios-workspaces")
+        self.assertEqual(self.survey(fams["fleet-artifacts"])["ios-workspaces"].verdict, "git-checkout")
+
+
 class NightlyNextFallbackTest(unittest.TestCase):
     """~/Library/Caches/cmux-nightly-next: the dedicated builder's tree is kept by role, a pool runner's goes once idle
     DEFAULT_AGE_HOURS, and nothing changes until disk-policy names the routing label."""
