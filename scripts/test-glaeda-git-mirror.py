@@ -67,7 +67,7 @@ class Mirror(unittest.TestCase):
         git_dir = root / "fleet/git"
         patches = {"GIT_DIR": git_dir, "MIRROR": git_dir / "cmux.git", "RECORD": git_dir / "cmux.json",
                    "REPO_URL": self.upstream.as_uri(), "BUCKET_URL": "https://bucket.test", "SEED_MIN_FREE": 0,
-                   "download": self.fake_download, "zstd": lambda: None}
+                   "download": self.fake_download, "zstd": lambda: None, "BACKOFF": (0, 0)}
         for name, value in patches.items():
             old = getattr(gm, name)
             setattr(gm, name, value)
@@ -216,6 +216,33 @@ class Mirror(unittest.TestCase):
         finally:
             gm.fill = real
         self.assertFalse((self.mirror / "shallow").exists())
+
+    def test_a_truly_shallow_mirror_is_deepened_from_the_bundle(self) -> None:
+        self.commit("two")
+        self.commit("three")
+        (self.bucket / f"v1/any/objects/{self.key}.tar.gz").unlink()
+        staged = Path(self.temp.name) / "staged2"
+        staged.mkdir()
+        sh("git", "bundle", "create", os.fspath(staged / gm.BUNDLE_FILE), "--branches", cwd=self.upstream)
+        with tarfile.open(self.bucket / f"v1/any/objects/{self.key}.tar.gz", "w:gz") as archive:
+            archive.add(staged / gm.BUNDLE_FILE, arcname=f"./{gm.BUNDLE_FILE}")
+        self.mirror.parent.mkdir(parents=True)
+        sh("git", "clone", "-q", "--bare", "--depth=1", self.upstream.as_uri(), os.fspath(self.mirror))
+        self.assertEqual(gm.healthy(self.mirror), "shallow")
+        result = gm.run(True, home=self.home)
+        self.assertEqual(result["state"], "applied", result)
+        self.assertEqual(result["seeded"]["mode"], "repaired in place")
+        self.assertEqual(sh("git", "-C", os.fspath(self.mirror), "rev-list", "--count", "main"), "3")
+
+    def test_a_killed_fetch_s_ref_locks_never_wedge_the_mirror(self) -> None:
+        gm.run(True, home=self.home)
+        self.commit("two")
+        (self.mirror / "refs/heads/main.lock").write_text("")
+        (self.mirror / "packed-refs.lock").write_text("")
+        result = gm.run(True, home=self.home)
+        self.assertTrue(result["fetch"]["ok"], result)
+        self.assertEqual(result["fetch"]["tries"], 2)
+        self.assertFalse((self.mirror / "refs/heads/main.lock").exists())
 
     def test_a_failed_repair_keeps_the_mirror_marked_broken(self) -> None:
         self.commit("two")

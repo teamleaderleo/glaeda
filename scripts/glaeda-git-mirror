@@ -192,14 +192,20 @@ def fetch(mirror: Path, url: str, *, tries: int = FETCH_TRIES, timeout: float = 
         if status == 0:
             return {"ok": True, "tries": attempt, "seconds": round(time.monotonic() - started, 1)}
         errors.append(f"try {attempt}: exit {status}: {err.strip()[-200:]}")
-        for leftover in (mirror / "objects" / "pack").glob("tmp_*"):
-            with_suppressed(leftover.unlink)
-        # A killed unshallowing fetch leaves git's own shallow.lock file, which would block the guard.
-        if (mirror / "shallow.lock").is_file():
-            with_suppressed((mirror / "shallow.lock").unlink)
+        drop_leftovers(mirror)
         if attempt < tries:
             sleep(BACKOFF[min(attempt - 1, len(BACKOFF) - 1)])
     return {"ok": False, "tries": tries, "errors": errors}
+
+
+def drop_leftovers(mirror: Path) -> None:
+    """What a killed git (its process group is dead by now) leaves in the mirror, which would make every
+    later fetch fail: temporary packs, ref locks ("cannot lock ref"), and git's own shallow.lock file
+    (the guard is a directory there)."""
+    for leftover in [*(mirror / "objects" / "pack").glob("tmp_*"), *(mirror / "refs").rglob("*.lock"),
+                     mirror / "packed-refs.lock", mirror / "shallow.lock"]:
+        if leftover.is_file() and not leftover.is_symlink():
+            with_suppressed(leftover.unlink)
 
 
 def zstd() -> str | None:
@@ -259,7 +265,16 @@ def seed_from_bundle(staging: Path, work: Path, fetch_url: Callable[[str, Path, 
         archive.unlink()
         bundle = unpacked / BUNDLE_FILE
         git(staging, "bundle", "verify", "--quiet", os.fspath(bundle), timeout=DOWNLOAD_TIMEOUT)
-        git(staging, "fetch", "--quiet", "--no-tags", os.fspath(bundle), *refspecs(), timeout=DOWNLOAD_TIMEOUT)
+        # unbundle indexes the bundle's whole pack, so every object lands even in a shallow repository,
+        # where a fetch would stop at the commits it thinks it has; then the refs are set to its tips.
+        tips = {}
+        for line in git(staging, "bundle", "unbundle", os.fspath(bundle), timeout=DOWNLOAD_TIMEOUT).splitlines():
+            sha, _, ref = line.partition(" ")
+            tips[ref.strip()] = sha
+        for branch in BRANCHES:
+            if f"refs/heads/{branch}" not in tips:
+                raise RuntimeError(f"bundle {key} has no {branch}")
+            git(staging, "update-ref", f"refs/heads/{branch}", tips[f"refs/heads/{branch}"], timeout=60)
         return key
     raise RuntimeError(f"no archive for {key}: {last}")
 
@@ -375,8 +390,7 @@ def fold_packs(mirror: Path) -> dict | None:
     started = time.monotonic()
     status, err = run_group([GIT, "-C", os.fspath(mirror), "repack", "-d", "-q", "--geometric=2"], REPACK_TIMEOUT)
     if status != 0:
-        for leftover in (mirror / "objects" / "pack").glob("tmp_*"):
-            with_suppressed(leftover.unlink)
+        drop_leftovers(mirror)
     return {"packs": len(packs), "status": status, "seconds": round(time.monotonic() - started, 1),
             **({"error": err.strip()[-200:]} if status else {})}
 
