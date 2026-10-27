@@ -9532,6 +9532,21 @@ class DedicatedRunnerTest(unittest.TestCase):
         self.assertNotIn(f"{self.home}/.local/bin", path)
         self.assertIn("/opt/someone-else/bin", path)
         self.assertEqual(path[:2], ["/opt/homebrew/bin", "/usr/local/bin"])
+        # a watch update launchd will not unload writes nothing, so the next apply sees the change again
+        watch_plist = self.home / "Library/LaunchAgents" / f"{label}.watch.plist"
+        old_watch = watch_plist.read_bytes()
+        changed = {**NIGHTLY, "watch": [*NIGHTLY["watch"], "--verbose"], "env": {}}
+        with mock.patch.object(cr.pwd, "getpwuid", return_value=fake_pw), \
+                mock.patch.object(cr, "bootout_watch", return_value=False):
+            failed = self.invoke("--apply", "--manifest", self.manifest(changed), "--member", "mini-std",
+                                 "--dedicated", "nightly-next", expect=1)
+        self.assertEqual(next(a for a in failed["actions"] if a["kind"] == "watch")["state"], "failed")
+        self.assertEqual(watch_plist.read_bytes(), old_watch, "the old plist stays while the old agent runs")
+        with mock.patch.object(cr.pwd, "getpwuid", return_value=fake_pw):
+            again = self.invoke("--apply", "--manifest", self.manifest(changed), "--member", "mini-std",
+                                "--dedicated", "nightly-next")
+        self.assertEqual(next(a for a in again["actions"] if a["kind"] == "watch")["state"], "update")
+        self.assertIn("--verbose", plistlib.loads(watch_plist.read_bytes())["ProgramArguments"])
         # launchd keeps the watch agent: its plist and ownership stay, and the next apply removes it
         trimmed = {k: v for k, v in NIGHTLY.items() if k != "watch"}
         with mock.patch.object(cr.pwd, "getpwuid", return_value=fake_pw), \

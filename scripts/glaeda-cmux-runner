@@ -1725,12 +1725,17 @@ def apply_install(ctx: Context, actions: list[dict[str, Any]], receipt_doc: dict
                 receipt_doc["registration"] = adopted
                 act["note"] = "adopted the registration an interrupted --apply finished in this directory"
         elif kind == "watch" and state in {"create", "update"}:
-            data, mode = desired_files(ctx)[Path(act["path"])]
-            write_atomic(Path(act["path"]), data, mode)
-            act["applied"] = act["owned"] = True
-            act["ownedSha256"] = act["sha256"]
-            if not ctx.skip_launchctl:
-                restart_watch(ctx, act)
+            # unloaded first, confirmed: a watch launchd still runs keeps its old plist on disk, so the next apply
+            # sees the change again instead of an "unchanged" plist under an old process
+            if not ctx.skip_launchctl and not bootout_watch(ctx, watch_label(ctx)):
+                act["state"], act["note"] = "failed", "launchd still has the old watch agent; nothing written, re-run"
+            else:
+                data, mode = desired_files(ctx)[Path(act["path"])]
+                write_atomic(Path(act["path"]), data, mode)
+                act["applied"] = act["owned"] = True
+                act["ownedSha256"] = act["sha256"]
+                if not ctx.skip_launchctl:
+                    restart_watch(ctx, act)
         elif kind == "watch" and state == "unchanged" and not ctx.skip_launchctl and not act.get("loaded"):
             restart_watch(ctx, act)
         elif kind == "watch" and state == "remove":
@@ -2603,9 +2608,8 @@ def bootout_watch(ctx: Context, label: str, wait_s: float = 15.0) -> bool:
 
 
 def restart_watch(ctx: Context, act: dict[str, Any]) -> None:
-    """Load the watch agent afresh (bootout, then bootstrap). The watch loop holds no job, so it is never waited for."""
+    """Load the watch agent's plist (after watch_unloaded). The watch loop holds no job, so it is never waited for."""
     domain = f"gui/{ctx.uid}"
-    run([LAUNCHCTL, "bootout", f"{domain}/{watch_label(ctx)}"])
     code, out = run([LAUNCHCTL, "bootstrap", domain, act["path"]])
     act["bootstrapped"] = code == 0
     if code != 0:
