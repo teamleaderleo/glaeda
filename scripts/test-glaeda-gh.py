@@ -8233,6 +8233,15 @@ class BrokerAnswerCacheTest(BrokerBase):
         gg.gh_cache_put(key, time.time(), 0, b"x" * (gg.GH_CACHE_MAX_BYTES + 1), b"")
         self.assertIsNone(gg.gh_cache_get(key, None, time.time()))
 
+    def test_old_fill_locks_are_pruned_and_fresh_ones_kept(self) -> None:
+        gg.gh_cache_dir().mkdir(parents=True, exist_ok=True)
+        old, fresh = gg.gh_cache_dir() / (".o" * 20 + ".lock"), gg.gh_cache_dir() / (".f" * 20 + ".lock")
+        old.touch()
+        fresh.touch()
+        os.utime(old, (time.time() - gg.GH_CACHE_LOCK_KEEP - 5,) * 2)
+        gg.gh_cache_prune(time.time())
+        self.assertEqual((old.exists(), fresh.exists()), (False, True))
+
     def test_old_answers_are_pruned(self) -> None:
         gg.gh_cache_put("c" * 40, time.time(), 0, b"x", b"")
         old = gg.gh_cache_dir() / ("c" * 40 + ".json")

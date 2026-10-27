@@ -5641,12 +5641,14 @@ GH_CACHE_FILL_WAIT = 30.0
 GH_CACHE_KEEP = 600.0  # stored answers older than this are deleted
 GH_CACHE_PRUNE_EVERY = 60.0
 GH_CACHE_DRAIN = 3.0  # after a fill is killed, how long its pipes are read before they are dropped
-GH_CACHE_FILL_DEADLINE = 600.0  # a filling gh still running after this is killed with its process group
+GH_CACHE_FILL_DEADLINE = 600.0
+GH_CACHE_LOCK_KEEP = 3600.0  # a fill lock file is removed this long after its last use  # a filling gh still running after this is killed with its process group
 GH_CACHE_DEBUG_ENV = ("GH_DEBUG", "DEBUG")  # gh prints request headers under these: never stored
 # What changes the bytes gh prints for the same arguments: colour, a forced tty, the markdown style,
 # the width. Part of the key, so a caller is never handed output rendered for another.
 GH_CACHE_OUTPUT_ENV = ("GH_FORCE_TTY", "CLICOLOR_FORCE", "CLICOLOR", "NO_COLOR", "GLAMOUR_STYLE",
-                       "GH_MDWIDTH", "COLUMNS", "TERM", "GH_PAGER", "PAGER", "LANG", "LC_ALL")
+                       "GH_MDWIDTH", "COLUMNS", "TERM", "GH_PAGER", "PAGER", "LANG", "LC_ALL",
+                       "GH_NO_UPDATE_NOTIFIER", "GH_SPINNER_DISABLED", "GH_PROMPT_DISABLED")
 GH_CACHE_READS = {("pr", "view"), ("run", "view")}  # and `api` GET
 GH_CACHE_NEVER = {"--web", "-w", "--watch", "--verbose", "--include", "-i"}
 # (subcommand, verb) pairs that never write; `None` as the verb is every verb of that subcommand.
@@ -5823,7 +5825,9 @@ def gh_cache_put(key: str, at: float, rc: int, out: bytes, err: bytes) -> None:
 
 
 def gh_cache_prune(now: float) -> None:
-    """Delete stored answers past GH_CACHE_KEEP, at most once a GH_CACHE_PRUNE_EVERY."""
+    """Delete stored answers past GH_CACHE_KEEP, and fill locks past GH_CACHE_LOCK_KEEP, at most once a
+    GH_CACHE_PRUNE_EVERY. A lock is kept well past the longest a fill can hold it (GH_CACHE_FILL_WAIT plus
+    GH_CACHE_FILL_DEADLINE), so the file a live fill holds is never the one removed."""
     stamp = gh_cache_dir() / ".pruned"
     with contextlib.suppress(OSError):
         if now - stamp.stat().st_mtime < GH_CACHE_PRUNE_EVERY:
@@ -5832,6 +5836,9 @@ def gh_cache_prune(now: float) -> None:
         stamp.touch()
         for path in gh_cache_dir().glob("*.json"):
             if path.name != "writes.json" and now - path.stat().st_mtime > GH_CACHE_KEEP:
+                path.unlink(missing_ok=True)
+        for path in gh_cache_dir().glob(".*.lock"):
+            if now - path.stat().st_mtime > GH_CACHE_LOCK_KEEP:
                 path.unlink(missing_ok=True)
 
 
