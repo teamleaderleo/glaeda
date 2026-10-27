@@ -45,6 +45,7 @@ import fcntl
 import json
 import os
 import re
+import shlex
 import shutil
 import signal
 import subprocess
@@ -52,7 +53,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
-from typing import Callable, Sequence
+from typing import Callable, NamedTuple, Sequence
 
 FLEET_DIR = Path(os.environ.get("GLAEDA_FLEET_DIR") or "/Users/Shared/cmux-build-fleet")
 GIT_DIR = Path(os.environ.get("GLAEDA_GIT_MIRROR_DIR") or FLEET_DIR / "git")
@@ -73,7 +74,9 @@ LOW_SPEED = ("-c", "http.lowSpeedLimit=1024", "-c", "http.lowSpeedTime=60")
 FETCH_TIMEOUT = 600
 FETCH_TRIES = 3
 BACKOFF = (10, 30)
-# A first seed runs at the uplink's speed: 2.2 GB at 0.4-0.9 MB/s (2026-10-27) is 40-90 minutes.
+# A seed crosses the site's uplink once (2026-10-27: 0.4-0.9 MB/s a mini behind one gateway): the 2.1 GB
+# bundle or ghostty's 1.4 GB history can take an hour. Every download keeps its low-speed abort, and a
+# bundle download cut off part way resumes.
 DOWNLOAD_TIMEOUT = 10800
 DOWNLOAD_TRIES = 4
 LOCK_WAIT = 900
@@ -82,11 +85,24 @@ SEED_MIN_FREE = 12 * 1024**3
 # Each pass's fetch writes a small pack. gc --auto would fold them with a full repack inside the bounded
 # fetch (2.2 GiB), so it is off and the pass folds them geometrically once PACK_LIMIT is passed.
 PACK_LIMIT = 24
-# Which hosts keep a mirror, and from where, is the fleet's call, not each host's: `direct` (GitHub and
-# the bucket) is the only source so far. Without it the tool does nothing, so a release never starts
-# every mini at a site seeding 2 GB over one shared uplink at once (2026-10-27: 0.4-0.9 MB/s a mini).
+# Which hosts keep a mirror, and from where, is the fleet's call, not each host's (glaeda-seed-lan cache
+# writes it): `direct` (GitHub and the bucket: the site's LAN cache host, or a host alone on its uplink)
+# or `lan` (the LAN cache host's mirrors over ssh, GitHub and the bucket only when it cannot be reached).
+# Without it the tool does nothing, so a release never starts every mini at a site seeding 2 GB over one
+# shared uplink at once.
 SOURCE_CONFIG = ".config/glaeda/lan-cache/config.json"
-SOURCES = ("direct",)
+SOURCES = ("direct", "lan")
+SSH = "/usr/bin/ssh"
+LAN_HOST_KEY_ALIAS = "glaeda-lan-cache"
+LAN_ADDRESS_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9.:-]{0,252}")
+LAN_USER_RE = re.compile(r"[a-z_][a-z0-9_-]{0,31}")
+LAN_ASK_TIMEOUT = 20
+LAN_FETCH_TIMEOUT = 300
+# cmux's submodules (.gitmodules), mirrored beside it for a build's `git submodule update`. Each pins a
+# commit on its main.
+SUBMODULES = (("ghostty", "https://github.com/manaflow-ai/ghostty.git"),
+              ("ghostty-next", "https://github.com/manaflow-ai/ghostty-next.git"),
+              ("homebrew-cmux", "https://github.com/manaflow-ai/homebrew-cmux.git"))
 REPACK_TIMEOUT = 1200
 CONFIG = {
     "core.bare": "true",
@@ -103,6 +119,18 @@ CONFIG = {
     "uploadpack.allowReachableSHA1InWant": "true",
     "protocol.version": "2",
 }
+
+
+class Repo(NamedTuple):
+    name: str
+    url: str
+    branches: tuple[str, ...]
+    path: Path
+
+
+def repos() -> list[Repo]:
+    return [Repo("cmux", REPO_URL, BRANCHES, MIRROR),
+            *(Repo(name, url, ("main",), GIT_DIR / f"{name}.git") for name, url in SUBMODULES)]
 
 
 def runner_installed(home: Path | None = None) -> bool:
@@ -138,12 +166,12 @@ def note_groups(groups: list[int]) -> None:
     incoming.rename(GIT_DIR / PASS_FILE)  # whole or not at all, so the next pass can always read it
 
 
-def run_group(command: Sequence[str], timeout: float) -> tuple[int, str]:
+def run_group(command: Sequence[str], timeout: float, env: dict | None = None) -> tuple[int, str]:
     """Run `command` in its own process group, killed whole at `timeout`; (status, stderr tail). 124 is a timeout."""
     # The child waits for the go line: if the pass dies before recording the group, it reads EOF and exits.
     process = subprocess.Popen(["/bin/sh", "-c", 'read -r go || exit 125; exec "$@"', "sh", *command],
                                start_new_session=True, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
-                               stderr=subprocess.PIPE, text=True, pass_fds=held())
+                               stderr=subprocess.PIPE, text=True, env=env, pass_fds=held())
     try:
         note_groups(own_group() + [process.pid])
     except BaseException:
@@ -212,7 +240,7 @@ def with_suppressed(call: Callable[[], object]) -> None:
         pass
 
 
-def healthy(mirror: Path) -> str:
+def healthy(mirror: Path, branches: Sequence[str] = BRANCHES) -> str:
     """'' when `mirror` is a usable full mirror, else why not."""
     if not (mirror / "HEAD").is_file():
         return "missing"
@@ -225,7 +253,7 @@ def healthy(mirror: Path) -> str:
             return "partial"
     except (OSError, subprocess.SubprocessError) as error:
         return f"unreadable ({type(error).__name__})"
-    for branch in BRANCHES:
+    for branch in branches:
         try:
             git(mirror, "rev-parse", "--verify", "-q", f"refs/heads/{branch}^{{commit}}", timeout=60)
         except (OSError, subprocess.SubprocessError):
@@ -233,9 +261,9 @@ def healthy(mirror: Path) -> str:
     return ""
 
 
-def configure(mirror: Path) -> None:
+def configure(mirror: Path, url: str | None = None) -> None:
     """Idempotent: the remote, CONFIG, and the shallow guard."""
-    configure_without_guard(mirror)
+    configure_without_guard(mirror, url)
     guard(mirror)
 
 
@@ -247,29 +275,31 @@ def guard(mirror: Path) -> None:
     lock_file.mkdir(exist_ok=True)
 
 
-def configure_without_guard(mirror: Path) -> None:
+def configure_without_guard(mirror: Path, url: str | None = None) -> None:
+    url = url or REPO_URL
     for key, value in CONFIG.items():
         git(mirror, "config", key, value, timeout=30)
     try:
-        git(mirror, "remote", "set-url", "origin", REPO_URL, timeout=30)
+        git(mirror, "remote", "set-url", "origin", url, timeout=30)
     except subprocess.CalledProcessError:
-        git(mirror, "remote", "add", "origin", REPO_URL, timeout=30)
+        git(mirror, "remote", "add", "origin", url, timeout=30)
 
 
-def refspecs() -> list[str]:
-    return [f"+refs/heads/{branch}:refs/heads/{branch}" for branch in BRANCHES]
+def refspecs(branches: Sequence[str] = BRANCHES) -> list[str]:
+    return [f"+refs/heads/{branch}:refs/heads/{branch}" for branch in branches]
 
 
 def fetch(mirror: Path, url: str, *, tries: int = FETCH_TRIES, timeout: float = FETCH_TIMEOUT,
-          runner: Callable[[Sequence[str], float], tuple[int, str]] = run_group,
-          sleep: Callable[[float], None] = time.sleep, extra: Sequence[str] = ()) -> dict:
-    """Fetch BRANCHES from `url` into `mirror`, bounded and retried; removes a failed try's partial pack."""
+          runner: Callable[..., tuple[int, str]] = run_group,
+          sleep: Callable[[float], None] = time.sleep, extra: Sequence[str] = (),
+          branches: Sequence[str] = BRANCHES, env: dict | None = None) -> dict:
+    """Fetch `branches` from `url` into `mirror`, bounded and retried; removes a failed try's partial pack."""
     command = [GIT, *LOW_SPEED, "-C", os.fspath(mirror), "fetch", "--quiet", "--no-tags", "--prune", *extra, url,
-               *refspecs()]
+               *refspecs(branches)]
     errors = []
     for attempt in range(1, tries + 1):
         started = time.monotonic()
-        status, err = runner(command, timeout)
+        status, err = runner(command, timeout, **({"env": env} if env else {}))
         if status == 0:
             return {"ok": True, "tries": attempt, "seconds": round(time.monotonic() - started, 1)}
         errors.append(f"try {attempt}: exit {status}: {err.strip()[-200:]}")
@@ -352,7 +382,7 @@ def unpack(archive: Path, extension: str, into: Path) -> None:
 
 
 def seed_from_bundle(staging: Path, work: Path, fetch_url: Callable[[str, Path, float], None] = download) -> str:
-    """Fill the bare repository `staging` from the newest R2 bundle; returns its key."""
+    """Fill the bare repository `staging` from the newest R2 bundle; returns its label."""
     key = bundle_key(work, fetch_url)
     extensions = ("tar.zst", "tar.gz") if zstd() else ("tar.gz",)
     last: Exception | None = None
@@ -384,7 +414,7 @@ def seed_from_bundle(staging: Path, work: Path, fetch_url: Callable[[str, Path, 
             if f"refs/heads/{branch}" not in tips:
                 raise RuntimeError(f"bundle {key} has no {branch}")
             git(staging, "update-ref", f"refs/heads/{branch}", tips[f"refs/heads/{branch}"], timeout=60)
-        return key
+        return f"bundle {key}"
     raise RuntimeError(f"no archive for {key}: {last}")
 
 
@@ -405,22 +435,19 @@ def unset(repo: Path, key: str) -> None:
                    pass_fds=held())
 
 
-def fill(repo: Path, work: Path, from_github: bool, fetch_url: Callable[[str, Path, float], None]) -> str:
-    """Add the three branches' full history to `repo`: from the R2 bundle, else (operator flag) from GitHub."""
-    try:
-        return f"bundle {seed_from_bundle(repo, work, fetch_url)}"
-    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
-        if not from_github:
-            raise RuntimeError(f"R2 bundle: {type(error).__name__}: {str(error)[:200]}") from error
+Filler = tuple[str, Callable[[Path, Path], object]]
+
+
+def from_url(url: str, branches: Sequence[str], env: dict | None = None, tries: int = FETCH_TRIES) -> Callable:
+    """A filler: the full history of `branches` from `url` (GitHub, or the LAN host's mirror over ssh)."""
+    def run_fetch(repo: Path, _work: Path) -> None:
         # Every object again (--refetch ignores what the repository claims to have, so a broken mirror's
         # missing blobs come too, packed or loose) and the history past a shallow boundary.
-        extra = ["--refetch"]
-        if (repo / "shallow").exists():
-            extra.append("--unshallow")
-        result = fetch(repo, REPO_URL, extra=extra, timeout=DOWNLOAD_TIMEOUT)
+        extra = ["--refetch", *(["--unshallow"] if (repo / "shallow").exists() else [])]
+        result = fetch(repo, url, extra=extra, timeout=DOWNLOAD_TIMEOUT, branches=branches, env=env, tries=tries)
         if not result["ok"]:
-            raise RuntimeError(f"R2 bundle: {type(error).__name__}; GitHub: {result['errors'][-1]}") from error
-        return f"github (bundle: {type(error).__name__})"
+            raise RuntimeError(result["errors"][-1])
+    return run_fetch
 
 
 # healthy() reads refs and markers only; an object lost under them (a bad disk, a hand-made copy) shows only
@@ -444,22 +471,34 @@ def verified_recently(repo: Path) -> bool:
         return False
 
 
-def verify(repo: Path) -> None:
+def fill(repo: Path, work: Path, fillers: Sequence[Filler]) -> str:
+    """Add the full history to `repo` from the first of `fillers` that works; returns its label."""
+    errors = []
+    for label, filler in fillers:
+        try:
+            said = filler(repo, work)
+            return (said if isinstance(said, str) else label) + (f" ({'; '.join(errors)})" if errors else "")
+        except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
+            errors.append(f"{label}: {type(error).__name__}: {str(error)[:160]}")
+    raise RuntimeError("; ".join(errors) or "no source")
+
+
+def verify(repo: Path, branches: Sequence[str] = BRANCHES) -> None:
     """Every branch is fully connected (no missing object), and the repository reads as healthy."""
     git(repo, "fsck", "--connectivity-only", "--no-dangling", "--no-progress", timeout=DOWNLOAD_TIMEOUT)
     (repo / REPAIR_PENDING).unlink(missing_ok=True)  # the history is proven whole
     (repo / VERIFIED).write_text(dt.datetime.now(dt.timezone.utc).isoformat() + "\n")
-    problem = healthy(repo)
+    problem = healthy(repo, branches)
     if problem:
         raise RuntimeError(f"after the seed the mirror is still {problem}")
 
 
-def seed(mirror: Path, from_github: bool, fetch_url: Callable[[str, Path, float], None] = download) -> dict:
+def seed(mirror: Path, fillers: Sequence[Filler], url: str | None = None, branches: Sequence[str] = BRANCHES) -> dict:
     """Make `mirror` a healthy full mirror without ever removing it or an object in it.
 
     A missing mirror is built in a staging directory beside it, verified, and renamed to the path, which
-    no reader can have open. An existing one is repaired in place: objects are only added (the bundle,
-    or GitHub with the operator's flag), then a shallow or partial marker is dropped once the history is
+    no reader can have open. An existing one is repaired in place: objects are only added (from the first
+    of `fillers` that works), then a shallow or partial marker is dropped once the history is
     whole. Jobs fetching from it, and checkouts borrowing its objects, never see it vanish or shrink.
     """
     free = shutil.disk_usage(mirror.parent).free
@@ -469,11 +508,11 @@ def seed(mirror: Path, from_github: bool, fetch_url: Callable[[str, Path, float]
     work = Path(tempfile.mkdtemp(prefix=".seed-", dir=mirror.parent))
     try:
         if not (mirror.exists() or mirror.is_symlink()):
-            staging = work / "cmux.git"
+            staging = work / mirror.name
             git(work, "init", "--quiet", "--bare", os.fspath(staging), timeout=60)
-            configure(staging)
-            source = fill(staging, work, from_github, fetch_url)
-            verify(staging)
+            configure(staging, url)
+            source = fill(staging, work, fillers)
+            verify(staging, branches)
             staging.rename(mirror)
             return {"source": source, "mode": "new", "seconds": round(time.monotonic() - started, 1)}
         if mirror.is_symlink() or not mirror.is_dir():
@@ -500,12 +539,12 @@ def seed(mirror: Path, from_github: bool, fetch_url: Callable[[str, Path, float]
             # A filter or promisor left on would make every fetch partial again.
             for key in ("remote.origin.promisor", "remote.origin.partialclonefilter"):
                 unset(mirror, key)
-            configure_without_guard(mirror)
-            source = fill(mirror, work, from_github, fetch_url)
+            configure_without_guard(mirror, url)
+            source = fill(mirror, work, fillers)
             if shallow.exists():
                 shallow.unlink()
             unset(mirror, "extensions.partialclone")
-            verify(mirror)
+            verify(mirror, branches)
         except BaseException:
             for key, values in markers.items():
                 unset(mirror, key)
@@ -556,16 +595,117 @@ def lock(path: Path, wait: float) -> int | None:
             time.sleep(1)
 
 
-def source(home: Path | None = None) -> str:
-    """Where this host's mirror comes from (SOURCE_CONFIG `source`), or '' when it has none configured."""
+def lan_config(home: Path | None = None) -> dict | None:
+    """SOURCE_CONFIG when it is valid: `source`, and for `lan` the host's user, addresses and the key files."""
     home = Path.home() if home is None else home
+    path = home / SOURCE_CONFIG
     try:
-        raw = json.loads((home / SOURCE_CONFIG).read_text())
+        raw = json.loads(path.read_text())
     except (OSError, ValueError):
-        return ""
+        return None
     if not isinstance(raw, dict) or raw.get("schema") != 1 or raw.get("source") not in SOURCES:
-        return ""
-    return raw["source"]
+        return None
+    if raw["source"] == "direct":
+        return {"source": "direct"}
+    user, addresses = raw.get("user"), raw.get("addresses")
+    identity, known_hosts = path.parent / "id_ed25519", path.parent / "known_hosts"
+    if (not isinstance(user, str) or not LAN_USER_RE.fullmatch(user) or not isinstance(addresses, list)
+            or not 1 <= len(addresses) <= 4
+            or not all(isinstance(a, str) and LAN_ADDRESS_RE.fullmatch(a) for a in addresses)
+            or not identity.is_file() or not known_hosts.is_file()):
+        return None
+    return {"source": "lan", "user": user, "addresses": addresses, "identity": identity, "known_hosts": known_hosts}
+
+
+def ssh_argv(config: dict) -> list[str]:
+    """/usr/bin/ssh with nothing from ~/.ssh: the LAN cache key, the host's pinned key, no forwarding."""
+    return [SSH, "-F", "/dev/null", "-a", "-x", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5",
+            "-o", "ConnectionAttempts=1", "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=4",
+            "-o", "IdentitiesOnly=yes", "-o", "IdentityAgent=none", "-o", f"IdentityFile={config['identity']}",
+            "-o", f"UserKnownHostsFile={config['known_hosts']}", "-o", "GlobalKnownHostsFile=/dev/null",
+            "-o", "StrictHostKeyChecking=yes", "-o", f"HostKeyAlias={LAN_HOST_KEY_ALIAS}", "-o", "UpdateHostKeys=no",
+            "-o", "ClearAllForwardings=yes", "-o", "ControlMaster=no", "-o", "ControlPath=none",
+            "-o", "LogLevel=ERROR", "-l", config["user"]]
+
+
+def lan_offer(config: dict) -> tuple[str, dict[str, str]] | None:
+    """(address, {name: main head}) of the LAN cache host's ready mirrors, or None when it cannot be reached."""
+    for address in config["addresses"]:
+        try:
+            out = subprocess.run([*ssh_argv(config), "-T", address, "mirrors-v1"], stdin=subprocess.DEVNULL,
+                                 capture_output=True, text=True, timeout=LAN_ASK_TIMEOUT).stdout
+        except (OSError, subprocess.SubprocessError):
+            continue
+        lines = out.splitlines()
+        header = next((i for i, line in enumerate(lines) if line.startswith("glaeda-seed-serve 1 mirrors ")), None)
+        if header is None:
+            continue
+        ready = {}
+        for line in lines[header + 1:]:
+            words = line.split()
+            if len(words) == 2 and re.fullmatch(r"[a-z][a-z0-9-]{0,40}", words[0]):
+                ready[words[0]] = words[1]
+        return address, ready
+    return None
+
+
+def ssh_env(config: dict) -> dict:
+    return {**os.environ, "GIT_SSH_COMMAND": shlex.join(ssh_argv(config)), "GIT_SSH_VARIANT": "ssh"}
+
+
+def fillers(repo: Repo, config: dict, offer: tuple[str, dict[str, str]] | None, from_github: bool) -> list[Filler]:
+    """Where a missing or broken mirror of `repo` is filled from, in order; none means wait for the LAN host.
+
+    Over the site's uplink at most once: from the LAN cache host's ready mirror when there is one, and only
+    when the host cannot be reached (or this host is the cache host) from the bucket's bundle (cmux) or
+    GitHub (a submodule, on the cache host only). --seed-from-github adds GitHub last.
+    """
+    chain: list[Filler] = []
+    if offer is not None and repo.name in offer[1]:
+        chain.append((f"lan {offer[0]}", from_url(f"{offer[0]}:{repo.name}.git", repo.branches, ssh_env(config), 1)))
+    elif config["source"] == "direct" or offer is None:
+        if repo.name == "cmux":
+            chain.append(("bundle", lambda staging, work: seed_from_bundle(staging, work, download)))
+        elif config["source"] == "direct":
+            chain.append(("github", from_url(repo.url, repo.branches)))
+    if from_github and repo.name == "cmux":
+        chain.append(("github", from_url(repo.url, repo.branches)))
+    return chain
+
+
+def keep(repo: Repo, config: dict, offer: tuple[str, dict[str, str]] | None, from_github: bool) -> dict:
+    """One mirror's pass: seed it if it is missing or broken, then fetch the new commits."""
+    entry: dict = {}
+    # Only a pass holding the flock writes the mirrors (jobs only read them), so any lock git left is from a
+    # pass that was killed: clear them before anything else writes, or the repair itself would wedge.
+    if repo.path.is_dir() and not repo.path.is_symlink():
+        drop_leftovers(repo.path)
+    problem = healthy(repo.path, repo.branches)
+    if not problem and not verified_recently(repo.path):
+        if connected(repo.path):
+            (repo.path / VERIFIED).write_text(dt.datetime.now(dt.timezone.utc).isoformat() + "\n")
+        else:
+            problem = "missing objects"
+    if problem:
+        chain = fillers(repo, config, offer, from_github)
+        if not chain:
+            return {"state": "waiting", "because": problem, "reason": "the LAN cache host has no ready mirror yet"}
+        entry["seeded"] = {"because": problem, **seed(repo.path, chain, repo.url, repo.branches)}
+    configure(repo.path, repo.url)
+    result = None
+    if offer is not None and repo.name in offer[1]:
+        result = fetch(repo.path, f"{offer[0]}:{repo.name}.git", branches=repo.branches, tries=1,
+                       timeout=LAN_FETCH_TIMEOUT, env=ssh_env(config))
+        entry["fetch_lan"] = result
+    if result is None or not result["ok"]:
+        result = fetch(repo.path, repo.url, branches=repo.branches)
+        entry["fetch"] = result
+    folded = fold_packs(repo.path)
+    if folded:
+        entry["repack"] = folded
+    entry["heads"] = heads(repo.path)
+    entry["state"] = "applied" if result["ok"] else "fetch-failed"
+    return entry
 
 
 def run(apply: bool, *, wait: bool = False, from_github: bool = False, home: Path | None = None) -> dict:
@@ -573,13 +713,14 @@ def run(apply: bool, *, wait: bool = False, from_github: bool = False, home: Pat
                     "mirror": os.fspath(MIRROR)}
     if not runner_installed(home):
         return {**record, "state": "skipped", "reason": "no GitHub Actions runner on this host"}
-    record["source"] = source(home)
-    if not record["source"]:
+    config = lan_config(home)
+    if config is None:
         return {**record, "state": "skipped", "reason": f"no mirror source in ~/{SOURCE_CONFIG}"}
-    problem = healthy(MIRROR)
+    record["source"] = config["source"]
     if not apply:
+        problem = healthy(MIRROR)
         return {**record, "state": "plan", "health": problem or "ok",
-                "would": f"seed from the R2 bundle ({problem}), then fetch" if problem else "fetch"}
+                "would": f"seed ({problem}), then fetch" if problem else "fetch"}
     fd = lock(GIT_DIR / ".lock", LOCK_WAIT if wait else 0)
     if fd is None and stop_orphans():
         fd = lock(GIT_DIR / ".lock", 30)
@@ -588,31 +729,28 @@ def run(apply: bool, *, wait: bool = False, from_github: bool = False, home: Pat
     HELD.append(fd)
     try:
         note_groups(own_group())
-        # Only a pass holding the flock writes the mirror (jobs only read it), so any lock git left is from a
-        # pass that was killed: clear them before anything else writes, or the repair itself would wedge.
-        if MIRROR.is_dir() and not MIRROR.is_symlink():
-            drop_leftovers(MIRROR)
         # A seed killed part way leaves its staging directory (gigabytes) beside the mirror: under the flock
         # no seed is running, so every one there is abandoned.
         for abandoned in GIT_DIR.glob(".seed-*"):
             if abandoned.is_dir() and not abandoned.is_symlink():
                 shutil.rmtree(abandoned, ignore_errors=True)
-        problem = healthy(MIRROR)
-        if not problem and not verified_recently(MIRROR):
-            if connected(MIRROR):
-                (MIRROR / VERIFIED).write_text(dt.datetime.now(dt.timezone.utc).isoformat() + "\n")
+        offer = lan_offer(config) if config["source"] == "lan" else None
+        if config["source"] == "lan":
+            record["lan"] = {"address": offer[0], "ready": sorted(offer[1])} if offer else {"reachable": False}
+        record["mirrors"], ready = {}, {}
+        for repo in repos():
+            try:
+                entry = keep(repo, config, offer, from_github)
+            except (OSError, RuntimeError, subprocess.SubprocessError) as error:
+                entry = {"state": "error", "reason": f"{type(error).__name__}: {str(error)[:300]}"}
+            if repo.name == "cmux":
+                record.update(entry)
             else:
-                problem = "missing objects"
-        if problem:
-            record["seeded"] = {"because": problem, **seed(MIRROR, from_github)}
-        configure(MIRROR)
-        result = fetch(MIRROR, REPO_URL)
-        record["fetch"] = result
-        folded = fold_packs(MIRROR)
-        if folded:
-            record["repack"] = folded
-        record["heads"] = heads(MIRROR)
-        record["state"] = "applied" if result["ok"] else "fetch-failed"
+                record["mirrors"][repo.name] = entry
+            if entry.get("state") == "applied" and "main" in entry.get("heads", {}):
+                ready[repo.name] = entry["heads"]["main"]
+        # The mirrors this host serves when it is the LAN cache host (glaeda-seed-serve mirrors-v1).
+        record["ready"] = ready
         incoming = RECORD.with_name(f".{RECORD.name}.{os.getpid()}")
         incoming.write_text(json.dumps(record) + "\n")
         incoming.rename(RECORD)
@@ -636,7 +774,7 @@ def main(argv: list[str]) -> int:
         with_suppressed(lambda: os.setpgid(0, 0))  # lead a group, so its children can be stopped together
     result = run(args.apply, wait=args.wait, from_github=args.seed_from_github)
     print(json.dumps(result), flush=True)
-    return 0 if result["state"] in ("applied", "plan", "skipped", "busy") else 1
+    return 0 if result["state"] in ("applied", "plan", "skipped", "busy", "waiting") else 1
 
 
 if __name__ == "__main__":
