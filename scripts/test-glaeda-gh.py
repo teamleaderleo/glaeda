@@ -498,6 +498,39 @@ class ControllerTest(Base):
         self.daemon.tick(NOW + gg.CYCLE + 1)
         self.assertEqual(len(self.gh.rest_calls()), 2)
 
+    def test_an_outage_is_read_once_a_cycle_even_with_a_waiting_reader_past_the_safety_age(self) -> None:
+        now = time.time()
+        key = "run:o/r/49"
+        self.ctl.runs[49] = ctl_run(49, "completed", "success", iso(now - 60))
+        gg.register(key)
+        self.daemon.tick(NOW)
+        reads = len(self.gh.rest_calls())  # its confirmation: the run is unknown to GitHub here, so it fails
+        start = NOW + gg.REST_SAFETY + 1  # past the safety-net age, with a reader touching it every tick
+        for t in range(10):
+            self.age_watch(key, -(gg.REST_SAFETY + 1 + t * gg.TICK))
+            self.daemon.tick(start + t * gg.TICK)
+        self.assertEqual(len(self.gh.rest_calls()), reads + 1, "one failed read a cycle, not one a tick")
+
+    def test_a_confirmation_ignores_an_etag_from_before_the_controller_record(self) -> None:
+        """A cache from before restRun, or one whose ETag is from a read the controller's record replaced: a 304 would
+        prove nothing about the finish, so the confirmation asks without the ETag and records what GitHub shows."""
+        now = time.time()
+        key = "run:o/r/50"
+        self.gh.runs[50] = {"id": 50, "status": "completed", "conclusion": "success", "run_attempt": 1,
+                            "updated_at": iso(now - 60)}
+        self.ctl.runs[50] = ctl_run(50, "completed", "success", iso(now - 60))
+        gg.register(key)
+        self.daemon.tick(NOW)
+        entry = gg.read_cache(key)
+        self.assertTrue(entry.get("etag"))
+        # an older version's cache: an ETag, no restRun
+        entry.pop("restRun", None)
+        gg.write_json(gg.cache_dir() / gg.file_name(key), entry)
+        self.assertTrue(gg.controller_unconfirmed(gg.read_cache(key), time.time()))
+        self.daemon.tick(NOW + gg.CYCLE + 1)
+        self.assertNotIn("If-None-Match", self.gh.rest_calls()[-1][2])
+        self.assertFalse(gg.controller_unconfirmed(gg.read_cache(key), time.time()))
+
     def test_safety_net_reads_rest_every_15_minutes(self) -> None:
         self.ctl.runs[22] = ctl_run(22, "in_progress")
         self.gh.runs[22] = {"id": 22, "status": "in_progress", "updated_at": "2026-09-25T10:00:00Z"}
@@ -846,6 +879,14 @@ class UpstreamTest(Base):
                                      "restRun": {"run_attempt": 1, "status": "completed", "conclusion": "cancelled"}}
         self.daemon.tick(now=NOW + gg.UPSTREAM_EVERY + 1)
         self.assertIsNotNone(gg.wait_step(req, time.time()))
+        # an upstream that does not say where the data came from (an older version) is not trusted for a finish
+        self.answers["run:o/r/9"] = {"data": done, "dataAt": time.time() - 5}
+        self.daemon.tick(now=NOW + 2 * gg.UPSTREAM_EVERY + 2)
+        self.assertIsNone(gg.read_cache("run:o/r/9").get("origin"))
+        self.assertTrue(gg.controller_unconfirmed(gg.read_cache("run:o/r/9"), time.time()))
+        self.answers["run:o/r/9"] = {**self.answers["run:o/r/9"], "origin": "controller",
+                                     "restRun": {"run_attempt": 1, "status": "completed", "conclusion": "cancelled"}}
+        self.daemon.tick(now=NOW + 3 * gg.UPSTREAM_EVERY + 3)
         # what this host serves to its own downstream says where the data came from
         out = io.StringIO()
         with contextlib.redirect_stdout(out), mock.patch.object(gg, "daemon_running", return_value=True), \

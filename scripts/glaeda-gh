@@ -1667,12 +1667,12 @@ class Daemon:
                 # And a finish the controller reported that REST has not read since: a rerun's deliveries can be
                 # lost (manaflow-ai/cmux run 40434431701, 2026-10-27: the controller kept attempt 1 "cancelled"
                 # while GitHub had attempt 2 queued), and wait_step rules on it only once REST confirms it.
-                confirm = terminal(kind, data) and (
-                    e["touched"] > max(c.get("dataAt") or 0, c.get("restAt") or 0)
-                    or (controller_unconfirmed(c, self.now)  # paced: a failed read is retried once per cycle
-                        and self.now - self.attempted.get(e["key"], float("-inf")) >= CYCLES[kind]))
-                # Otherwise the controller answered on this tick: REST only as the safety net.
-                if failed or confirm or self.now - (c.get("restAt") or 0) >= REST_SAFETY:
+                confirm = terminal(kind, data) and (e["touched"] > max(c.get("dataAt") or 0, c.get("restAt") or 0)
+                                                    or controller_unconfirmed(c, self.now))
+                # Otherwise the controller answered on this tick: REST only as the safety net. A failed read leaves
+                # each of these true (restAt keeps its time), so a key is read at most once a cycle.
+                paced = self.now - self.attempted.get(e["key"], float("-inf")) >= CYCLES[kind]
+                if failed or (paced and (confirm or self.now - (c.get("restAt") or 0) >= REST_SAFETY)):
                     out.append(e)
                 continue
             if c is None:
@@ -2284,7 +2284,10 @@ class Daemon:
         prior = e["cache"] or {}
         self.reads.append((self.now, "run", "rest"))
         base = f"/repos/{owner}/{repo}/actions/runs/{run_id}"
-        state, doc, etag = self.get(base, prior.get("etag") if prior.get("data") else None)
+        # a confirmation asks without the ETag: a 304 would prove only what the ETag's own read showed, which the
+        # controller's newer record replaced (and a cache from before restRun has nothing to prove it with)
+        unconfirmed = controller_unconfirmed(prior, self.now)
+        state, doc, etag = self.get(base, prior.get("etag") if prior.get("data") and not unconfirmed else None)
         if state == "error":
             self.errors.append(f"{e['key']}: {doc}")
             return self.store(e["key"], e["cache"], error=doc)
@@ -3609,7 +3612,8 @@ def controller_unconfirmed(entry: dict | None, now: float | None = None) -> bool
     Bounded: once the record is REST_SAFETY old (dataAt, which an unchanged record keeps) it counts, so a wait still
     rules when GitHub cannot be read and the controller is all there is."""
     entry = entry or {}
-    origin = entry.get("origin") if entry.get("source") == "upstream" else entry.get("source")
+    # an upstream that does not say where its data came from (an older version) is treated as the controller's
+    origin = (entry.get("origin") or "controller") if entry.get("source") == "upstream" else entry.get("source")
     data = entry.get("data")
     if origin != "controller" or not terminal("run", data):
         return False
