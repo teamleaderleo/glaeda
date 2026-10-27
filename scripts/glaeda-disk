@@ -3312,6 +3312,28 @@ def item_mtime(fam: Family, path: Path) -> float:
     if fam.id == SPM_SCRATCH:
         with contextlib.suppress(OSError):
             newest = max(newest, spm_lock(path).stat().st_mtime)
+    if fam.id == NIGHTLY_NEXT_FAMILY:
+        newest = max(newest, nightly_next_last_use(path))
+    return newest
+
+
+# Files every nightly-next build on a runner rewrites, below its tree (cmux nightly_build_state.py's layout), each
+# glob a handful of entries. A build that reuses an identity touches neither the runner nor the identity directory:
+# SwiftPM rewrites workspace-state.json when it resolves, and the compilation cache rewrites its action cache and
+# index on every lookup (cmux14, 2026-10-27: generic/v1.1/v3.actions and v8.index at the build's end, 5 levels
+# down, under directories dated two days earlier).
+NIGHTLY_NEXT_USE_GLOBS = ("*/SourcePackages/workspace-state.json", "*/CompilationCache/*/lock",
+                          "*/CompilationCache/generic/*/*", "notices-crates", "notices-crates/*")
+
+
+def nightly_next_last_use(path: Path) -> float:
+    """The newest mtime of the files a nightly-next build on this runner writes, however deep."""
+    newest = 0.0
+    for pattern in NIGHTLY_NEXT_USE_GLOBS:
+        with contextlib.suppress(OSError):
+            for entry in path.glob(pattern):
+                with contextlib.suppress(OSError):
+                    newest = max(newest, entry.lstat().st_mtime)
     return newest
 
 

@@ -7248,6 +7248,28 @@ class NightlyNextFallbackTest(unittest.TestCase):
                 self.assertIn(self.root, paths)  # inert: the root stays one library-caches item, as before
                 self.assertEqual(names, set())
 
+    def test_a_reused_tree_is_recent_from_its_deep_writes(self) -> None:
+        """A build that reuses an identity writes only deep files: the cache's index, SwiftPM's state."""
+        tree = self.root / "cmux9s-mac-mini-glaeda-2"
+        ident = tree / "0123456789abcdef0123456789abcdef"
+        index = ident / "CompilationCache/generic/v1.1/v8.index"
+        index.parent.mkdir(parents=True)
+        index.write_bytes(b"i")
+        state = ident / "SourcePackages/workspace-state.json"
+        state.write_text("{}")
+        old = time.time() - 30 * 24 * 3600
+        for p in [tree, *tree.rglob("*")]:
+            os.utime(p, (old, old), follow_symlinks=False)
+        fam = gd.nightly_next_family(self.root)
+        self.assertLess(gd.item_mtime(fam, tree), old + 1)
+        for written in (index, state):
+            now = time.time() - 60
+            os.utime(written, (now, now))
+            self.assertGreaterEqual(gd.item_mtime(fam, tree), now - 1, written.name)
+            os.utime(written, (old, old))
+        # other families' items keep their usual shallow look
+        self.assertLess(gd.item_mtime(gd.Family("x", self.root, True, "x"), tree), old + 1)
+
     def test_runner_cache_profile(self) -> None:
         self.assertNotIn(gd.NIGHTLY_NEXT_FAMILY, {f.id for f in gd.runner_cache_families()})
         policy = {**gd.POLICY, "nightly_next_dedicated_label": gd.NIGHTLY_NEXT_DEDICATED_LABEL}
