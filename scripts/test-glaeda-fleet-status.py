@@ -741,7 +741,7 @@ class DiskTests(unittest.TestCase):
         report = {"schema": "glaeda-disk/v2", "free": 200 * GIB, "total": 460 * GIB,
                   "filesystems": [{"free": 200 * GIB, "total": 460 * GIB, "low": 69 * GIB}],
                   "tmp_test_residue": {"entries": 47000, "test_residue": 45000, "idle": 44000, "idle_hours": 12,
-                                       "every_entry": True, "path": "/private/var/folders/x/T"}}
+                                       "runner_host": True, "path": "/private/var/folders/x/T"}}
         row = fs.parse_disk("@disk\n" + json.dumps(report) + "\n@now\n1800000000\n", AT)
         self.assertEqual(row["tmp_test_residue"], {"entries": 47000, "test_residue": 45000, "idle": 44000})
         doc = build(disk=disk(mini_a=row, mini_b=disk_row(tmp_test_residue={"entries": 300, "test_residue": 20,

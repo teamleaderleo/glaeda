@@ -92,12 +92,13 @@ Tests leave one small scratch entry per case in the runner user's $TMPDIR (cmux-
 git-pr-<uuid>, TemporaryDirectory.<rand>, ...): tens of thousands, each under the 50 MiB item floor, so no
 family reclaims them. user-tmp-test-residue removes entries named by TMP_TEST_RESIDUE on every apply (not only
 under pressure) once nothing in the whole entry changed for 12 hours and no process holds or names it. On a fleet
-mini with enrolled runners every entry is a candidate except the TMP_TEST_RESIDUE_KEEP names (com.apple.*, dot
-names, TemporaryItems, tmux/ssh sockets, a bare UUID; a kept name with a UUID too), and any entry outside the measured
-prefixes (or a hold a killed pass left) also stays while a socket sits in it or is one.
-An entry with a TemporaryItems child (macOS guards $TMPDIR/<entry>/TemporaryItems) is moved into a holding dir
-one level down (glaeda-tmp-hold-<pid>, itself named scratch if a pass dies), walked and judged there, and deleted
-there or moved back. Every report shows the count
+mini with enrolled runners it also takes test fixture names: dash-separated words, a full UUID and at most a short
+extension (TMP_TEST_UUID_NAME), never a dotted or bare-UUID name, a TMP_TEST_RESIDUE_KEEP name (com.apple.*, dot
+names, tmux/ssh, signing, keychain, credential, export, release...) or a credential extension; such an entry also
+stays while a socket sits in it or is one. Any other name stays: age alone does not prove an entry disposable.
+A measured-prefix entry with a TemporaryItems child (macOS guards $TMPDIR/<entry>/TemporaryItems) is moved into a
+holding dir one level down (glaeda-tmp-hold-<pid>, itself named scratch with the socket veto if a pass dies),
+walked and judged there, and deleted there or moved back. Every report shows the count
 ($TMPDIR entries, test scratch, untouched 12 h+; JSON tmp_test_residue) from one listing, no walk or du.
 
 A clone directly in a CI runner account's home (~/cmux) that is fetched branch after branch gains a pack per
@@ -2218,18 +2219,18 @@ TMP_TEST_RESIDUE = re.compile(
     r"|floating-chat|header-pr|picker-listing|swift-package-test\.XXXXXX|TemporaryDirectory|cmux-claude-hooks"
     r"|swift-crash-reproducer|cmux-shortcut-routing|cmux-agent-journal-test|cmux-git-active-pwd"
     r"|cmux-ssh-pty-replay|cmux-screenshots-tests|glaeda-tmp-hold)[-.][0-9A-Za-z]")
-# On a host with enrolled runners the runner user's $TMPDIR is test scratch, and new tests keep adding prefixes
-# no list names (~47k entries under ~60 prefixes on one CI mini, 2026-10-26): there every entry is a candidate
-# under the same 12 h idle and process rules, except these, which macOS and live daemons keep.
-# Any host: a test's fixture name is dash-separated words (no dots), a full UUID and at most a short extension
-# (phone-tests-<uuid>.sqlite). A dotted name (com.apple.CoreSimulator.SimDevice.<uuid>) or a bare UUID is no
-# test's. by_prefix counts by the words before the UUID.
+# On a fleet mini with enrolled runners, also a name that is dash-separated words (no dots), a full UUID and at
+# most a short extension (phone-tests-<uuid>.sqlite): test fixtures name their scratch this way, ~60 prefixes on
+# one CI mini (2026-10-26), more than a list keeps up with. A dotted name (com.apple.CoreSimulator.SimDevice.<uuid>),
+# a bare UUID, a TMP_TEST_RESIDUE_KEEP name or a credential extension never matches; by_prefix counts by the words.
+# Only there: elsewhere $TMPDIR also holds a person's and their tools' own files.
 _UUID = r"[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}"
 TMP_TEST_UUID_NAME = re.compile(
-    r"(?P<prefix>[A-Za-z][A-Za-z0-9_]*(?:-[A-Za-z0-9_]+)*)-" + _UUID + r"(?:\.[A-Za-z0-9]{1,8})?")
-TMP_TEST_RESIDUE_KEEP = re.compile(r"(?:\.|com\.apple\.|TemporaryItems$|tmux-|ssh-|launchd|xcrun_db|"
-                                   + _UUID + r"$)")
-TMP_TEST_RESIDUE_OTHER = "unnamed"  # the receipt's by_prefix bucket for an entry no TMP_TEST_RESIDUE prefix names
+    r"(?P<prefix>[A-Za-z][A-Za-z0-9_]*(?:-[A-Za-z0-9_]+)*)-" + _UUID + r"(?:\.(?P<ext>[A-Za-z0-9]{1,8}))?")
+TMP_TEST_RESIDUE_KEEP = re.compile(r"(?:\.|com\.apple\.|tmux-|ssh-|launchd|xcrun_db|[A-Za-z0-9_-]*(?:sign|keychain|"
+                                   r"cert|credential|secret|token|provision|notar|export|release))", re.I)
+TMP_CREDENTIAL_EXT = frozenset(("keychain", "keychaindb", "p12", "pfx", "pem", "key", "cer", "crt", "der",
+                                "mobileprovision", "provisionprofile", "p8", "jks", "keystore"))
 # macOS guards $TMPDIR/<entry>/TemporaryItems (a sandboxed app's temporary-items folder): listing, renaming or
 # removing it fails, and on macOS 27 the call blocks first. A test fixture that made one in its scratch dir left
 # that dir behind on every run (cmux-screenshots-tests-*). One level deeper the name is not guarded, so the reaper
@@ -2303,37 +2304,43 @@ def tmp_test_residue_veto(entry: Path, opened: frozenset[str], cmds: str, now: f
     return "", used
 
 
-def tmp_test_residue_prefix(name: str, every_entry: bool) -> str | None:
-    """The receipt prefix of a $TMPDIR entry the reaper may take, or None: a TMP_TEST_RESIDUE name, a
-    TMP_TEST_UUID_NAME, or with every_entry (a runner host) any name TMP_TEST_RESIDUE_KEEP does not keep."""
+def tmp_test_residue_prefix(name: str, runner_host: bool) -> str | None:
+    """The receipt prefix of a $TMPDIR entry the reaper may take, or None: a TMP_TEST_RESIDUE name, or on a runner
+    host (runner_host) a TMP_TEST_UUID_NAME that no KEEP name or credential extension rules out. Anything else
+    stays: an idle, unopened entry is not proven disposable by its age alone."""
     if m := TMP_TEST_RESIDUE.match(name):
         return m.group(0)[:-2]
-    if TMP_TEST_RESIDUE_KEEP.match(name):  # a kept name stays whatever follows it (ssh-<uuid>, tmux-<uuid>)
+    if not runner_host or TMP_TEST_RESIDUE_KEEP.match(name):
         return None
-    if m := TMP_TEST_UUID_NAME.fullmatch(name):
-        return m.group("prefix")
-    return TMP_TEST_RESIDUE_OTHER if every_entry else None
+    m = TMP_TEST_UUID_NAME.fullmatch(name)
+    if m is None or (m.group("ext") or "").lower() in TMP_CREDENTIAL_EXT:
+        return None
+    return m.group("prefix")
 
 
 def tmp_socket_veto(name: str) -> bool:
     """A socket in or at this entry keeps it: every candidate except the measured TMP_TEST_RESIDUE prefixes (whose
-    tests leave socket files of their own, cmux-cli-socket-*), and always a hold a killed pass left, which may hold
-    an entry of any kind."""
-    m = TMP_TEST_RESIDUE.match(name)
-    return m is None or name.startswith(TMP_HOLD_PREFIX)
+    tests leave socket files of their own, cmux-cli-socket-*), and always a hold a killed pass left."""
+    return TMP_TEST_RESIDUE.match(name) is None or name.startswith(TMP_HOLD_PREFIX)
 
 
-def tmp_test_residue_every_entry() -> bool:
-    """Every entry of $TMPDIR is test scratch on a fleet mini whose user runs enrolled CI runners."""
+def tmp_hold_movable(name: str) -> bool:
+    """Only a measured test prefix's entry is moved into the hold to be judged (its tests own it, and it has no
+    socket veto to lose on the way): an entry the UUID rule names is judged in place, so a guarded one stays."""
+    return TMP_TEST_RESIDUE.match(name) is not None and not name.startswith(TMP_HOLD_PREFIX)
+
+
+def tmp_test_residue_runner_host() -> bool:
+    """The UUID-named test fixture rule applies: a fleet mini whose user runs enrolled CI runners."""
     return ROLE == "fleet-mini" and bool(enrolled_runners())
 
 
-def tmp_test_residue_census(tmp: Path | None = None, every_entry: bool | None = None) -> dict[str, Any] | None:
+def tmp_test_residue_census(tmp: Path | None = None, runner_host: bool | None = None) -> dict[str, Any] | None:
     """How much test scratch sits in $TMPDIR, for status: one listing and one lstat per candidate, no walk and
     no du. entries is every name; test_residue the reaper's candidates; idle those whose own mtime is past
     TMP_TEST_RESIDUE_IDLE_HOURS (an entry that changed deeper down still counts here). None off macOS."""
-    if every_entry is None:  # the host's own $TMPDIR follows the host; a given directory only its named prefixes
-        every_entry = tmp is None and tmp_test_residue_every_entry()
+    if runner_host is None:  # the host's own $TMPDIR follows the host; a given directory only its named prefixes
+        runner_host = tmp is None and tmp_test_residue_runner_host()
     tmp = (darwin_user_tmp() if DARWIN else None) if tmp is None else tmp
     if tmp is None or tmp.is_symlink() or not tmp.is_dir():
         return None
@@ -2342,7 +2349,7 @@ def tmp_test_residue_census(tmp: Path | None = None, every_entry: bool | None = 
         with os.scandir(tmp) as it:
             for e in it:
                 entries += 1
-                if tmp_test_residue_prefix(e.name, every_entry) is None:
+                if tmp_test_residue_prefix(e.name, runner_host) is None:
                     continue
                 residue += 1
                 with contextlib.suppress(OSError):
@@ -2351,7 +2358,7 @@ def tmp_test_residue_census(tmp: Path | None = None, every_entry: bool | None = 
     except OSError:
         return None
     return {"entries": entries, "test_residue": residue, "idle": idle, "idle_hours": TMP_TEST_RESIDUE_IDLE_HOURS,
-            "every_entry": every_entry}
+            "runner_host": runner_host}
 
 
 def guarded_tmp_entry(entry: Path) -> bool:
@@ -2363,12 +2370,14 @@ def guarded_tmp_entry(entry: Path) -> bool:
 
 
 def judge_tmp_entry(entry: Path, hold: Path, opened: frozenset[str], cmds: str, now: float,
-                    deadline: float | None, unnamed: bool) -> tuple[str, int, Path]:
-    """tmp_test_residue_veto for one $TMPDIR entry, and the path it now sits at; unnamed is tmp_socket_veto. A guarded entry is first vetoed
-    by its own name (open files, cwds, commands), then moved into hold, where it can be walked; one that must stay
-    moves back to its name."""
+                    deadline: float | None, unnamed: bool, movable: bool = True) -> tuple[str, int, Path]:
+    """tmp_test_residue_veto for one $TMPDIR entry, and the path it now sits at; unnamed is tmp_socket_veto. A
+    guarded entry stays unless movable (tmp_hold_movable); a movable one is first vetoed by its own name (open
+    files, cwds, commands), then moved into hold, where it can be walked; one that must stay moves back."""
     if not guarded_tmp_entry(entry):
         return (*tmp_test_residue_veto(entry, opened, cmds, now, deadline=deadline, unnamed=unnamed), entry)
+    if not movable:
+        return "a guarded TemporaryItems in a name no measured test prefix lists", 0, entry
     path = os.fspath(entry)
     if in_cwd(path, opened):
         return "open or a working directory of a process", 0, entry
@@ -2387,14 +2396,14 @@ def judge_tmp_entry(entry: Path, hold: Path, opened: frozenset[str], cmds: str, 
 
 
 def reap_tmpdir_test_residue(receipt: Path, tmp: Path | None = None, halt=None,
-                             every_entry: bool | None = None) -> int:
+                             runner_host: bool | None = None) -> int:
     """Remove test scratch the runner user's tests left in $TMPDIR: entries named by TMP_TEST_RESIDUE (on a
-    runner host every entry TMP_TEST_RESIDUE_KEEP does not keep), whole trees unchanged for
+    runner host also a TMP_TEST_UUID_NAME, see tmp_test_residue_prefix), whole trees unchanged for
     TMP_TEST_RESIDUE_IDLE_HOURS, held open and named by no process. Every candidate is walked and judged right
     before its own deletion; process evidence is never older than TMP_TEST_RESIDUE_EVIDENCE_S, and missing
     evidence stops the pass. One summary receipt line per pass."""
-    if every_entry is None:  # the host's own $TMPDIR follows the host; a given directory only its named prefixes
-        every_entry = tmp is None and tmp_test_residue_every_entry()
+    if runner_host is None:  # the host's own $TMPDIR follows the host; a given directory only its named prefixes
+        runner_host = tmp is None and tmp_test_residue_runner_host()
     tmp = (darwin_user_tmp() if DARWIN else None) if tmp is None else tmp
     if tmp is None or tmp.is_symlink() or not tmp.is_dir():
         return 0
@@ -2406,7 +2415,7 @@ def reap_tmpdir_test_residue(receipt: Path, tmp: Path | None = None, halt=None,
     try:
         with os.scandir(tmp) as it:
             for e in it:
-                if tmp_test_residue_prefix(e.name, every_entry) is None:
+                if tmp_test_residue_prefix(e.name, runner_host) is None:
                     continue
                 with contextlib.suppress(OSError):  # an entry a test removed mid-scan drops only itself
                     # an entry whose own mtime is recent cannot be idle; skip it without walking it
@@ -2435,10 +2444,11 @@ def reap_tmpdir_test_residue(receipt: Path, tmp: Path | None = None, halt=None,
                 break
             evidence, read_at = (open_index(opened), cmds), time.time()
         entry = tmp / name
-        prefix = tmp_test_residue_prefix(name, every_entry)
+        prefix = tmp_test_residue_prefix(name, runner_host)
         try:
             why, used, entry = judge_tmp_entry(entry, hold, evidence[0], evidence[1], time.time(),
-                                               start + TMP_TEST_RESIDUE_BUDGET_S, tmp_socket_veto(name))
+                                               start + TMP_TEST_RESIDUE_BUDGET_S, tmp_socket_veto(name),
+                                               tmp_hold_movable(name))
         except OSError as e:
             kept[f"incomplete:{e.__class__.__name__}"] += 1
             continue
@@ -9001,7 +9011,7 @@ def _main_impl(argv: list[str] | None = None) -> int:
         if tmp_residue is not None:
             print(f"\n$TMPDIR: {tmp_residue['entries']} entries, {tmp_residue['test_residue']} test scratch"
                   f" ({tmp_residue['idle']} untouched {TMP_TEST_RESIDUE_IDLE_HOURS:g}h+ at the top)"
-                  f"{'; every unkept entry counts on this runner host' if tmp_residue['every_entry'] else ''}")
+                  f"{'; words-UUID test names count on this runner host' if tmp_residue['runner_host'] else ''}")
         if tooling:
             print("\nXcode copies and simulator runtimes")
         for t in tooling:

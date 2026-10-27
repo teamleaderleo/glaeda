@@ -51,8 +51,8 @@ gd.HOST_RESERVATION_LOCAL = Path(_NO_RESERVATIONS.name + ".none")
 # An --apply in a test must never reap the real $TMPDIR of the host running the suite: without a tmp of
 # the test's own, the TMPDIR reaper does nothing.
 _reap_tmpdir_test_residue = gd.reap_tmpdir_test_residue
-gd.reap_tmpdir_test_residue = (lambda receipt, tmp=None, halt=None, every_entry=None:
-                               0 if tmp is None else _reap_tmpdir_test_residue(receipt, tmp, halt, every_entry))
+gd.reap_tmpdir_test_residue = (lambda receipt, tmp=None, halt=None, runner_host=None:
+                               0 if tmp is None else _reap_tmpdir_test_residue(receipt, tmp, halt, runner_host))
 # Nor git gc the clones in the real home of the host running the suite: only a test's own home is gc'd.
 _gc_home_clones = gd.gc_home_clones
 gd.gc_home_clones = lambda receipt, home=None, halt=None: 0 if home is None else _gc_home_clones(receipt, home, halt)
@@ -5121,74 +5121,81 @@ class GlaedaDiskTest(unittest.TestCase):
         self.assertTrue((shot / "TemporaryItems").is_dir())
         self.assertNotIn(shot, [Path(os.fspath(r)) for r in renames])
 
+    def _bind(self, folder: Path, name: str) -> socket.socket:
+        """A listening unix socket at folder/name (a short relative bind: AF_UNIX paths are limited to ~104 bytes)."""
+        cwd, sock = os.getcwd(), socket.socket(socket.AF_UNIX)
+        try:
+            os.chdir(folder)
+            sock.bind(name)
+        finally:
+            os.chdir(cwd)
+        return sock
+
     def test_tmpdir_test_residue_keeps_a_top_level_socket(self) -> None:
         tmp, e = self._tmp_residue()
-        cwd, sock = os.getcwd(), socket.socket(socket.AF_UNIX)
-        try:
-            os.chdir(tmp)
-            sock.bind("service-sock")
-        finally:
-            os.chdir(cwd)
-        os.utime(tmp / "service-sock", (time.time() - 72 * 3600,) * 2)
+        name = "phone-tests-0157d868-1a4f-4a4c-b017-9a3bb1b51aa6"
+        sock = self._bind(tmp, name)
+        os.utime(tmp / name, (time.time() - 72 * 3600,) * 2, follow_symlinks=False)
         try:
             with contextlib.redirect_stdout(io.StringIO()):
-                gd.reap_tmpdir_test_residue(self.receipt(), tmp, every_entry=True)
+                gd.reap_tmpdir_test_residue(self.receipt(), tmp, runner_host=True)
         finally:
             sock.close()
-        self.assertTrue(stat.S_ISSOCK((tmp / "service-sock").lstat().st_mode))
+        self.assertTrue(stat.S_ISSOCK((tmp / name).lstat().st_mode))
 
-    def test_tmpdir_test_residue_on_a_runner_host_takes_every_unkept_entry(self) -> None:
+    def test_tmpdir_test_residue_never_takes_an_unknown_name(self) -> None:
+        """Age alone does not prove an entry disposable: on a runner host too, only test names go."""
         tmp, e = self._tmp_residue()
-        kept = {name: tmp / name for name in (".hidden-state", "TemporaryItems", "tmux-501", "xcrun_db")}
-        for path in kept.values():
+        unknown = {name: tmp / name for name in ("signing.Xk3a9Q", "project-7", "downloads",
+                                                  "signing-0157d868-1a4f-4a4c-b017-9a3bb1b51aa6",
+                                                  "build-0157d868-1a4f-4a4c-b017-9a3bb1b51aa6.keychain",
+                                                  "release-export-0157d868-1a4f-4a4c-b017-9a3bb1b51aa6.zip")}
+        for path in unknown.values():
             path.mkdir()
-        listener = tmp / "phone-tests-sock"
-        listener.mkdir()
-        cwd, sock = os.getcwd(), socket.socket(socket.AF_UNIX)
-        try:
-            os.chdir(listener)  # a short relative path: AF_UNIX paths are limited to ~104 bytes
-            sock.bind("s")
-        finally:
-            os.chdir(cwd)
-        for path in [*kept.values(), listener]:
             self._age(path, hours=72)
-        receipt = self.receipt()
-        try:
-            with contextlib.redirect_stdout(io.StringIO()):
-                gd.reap_tmpdir_test_residue(receipt, tmp, every_entry=True)
-        finally:
-            sock.close()
-        self.assertFalse(e["unknown"].exists())  # no prefix names it: on a runner host it is test scratch
-        self.assertFalse(e["dash"].exists())
-        self.assertTrue(e["apple"].is_dir())
-        self.assertTrue(all(p.is_dir() for p in kept.values()))
-        self.assertTrue(listener.is_dir())  # a socket below an unnamed entry keeps it
-        rec = json.loads(receipt.read_text())
-        self.assertEqual(rec["by_prefix"][gd.TMP_TEST_RESIDUE_OTHER], 2)
-        self.assertEqual(rec["kept"]["not proven idle"], 1)
-        # a directory given without every_entry keeps everything no prefix names
-        tmp2 = self.root / "T2"
-        (tmp2 / "notes-from-an-agent").mkdir(parents=True)
-        self._age(tmp2 / "notes-from-an-agent", hours=72)
         with contextlib.redirect_stdout(io.StringIO()):
-            gd.reap_tmpdir_test_residue(self.receipt(), tmp2)
-        self.assertTrue((tmp2 / "notes-from-an-agent").is_dir())
+            gd.reap_tmpdir_test_residue(self.receipt(), tmp, runner_host=True)
+        self.assertTrue(e["unknown"].is_dir())
+        self.assertTrue(e["dash"].is_dir())
+        self.assertTrue(e["apple"].is_dir())
+        self.assertEqual([n for n, p in unknown.items() if not p.is_dir()], [])
+        self.assertFalse(e["socket"].exists())  # the measured prefixes still go
+
+    def test_tmpdir_test_residue_an_unmeasured_guarded_entry_stays_in_place(self) -> None:
+        tmp, e = self._tmp_residue()
+        guarded = tmp / "phone-tests-0157d868-1a4f-4a4c-b017-9a3bb1b51aa6"
+        (guarded / "TemporaryItems").mkdir(parents=True)
+        self._age(guarded, hours=72)
+        renames = []
+        real_rename = os.rename
+        receipt = self.receipt()
+        with self._guarded_scandir(tmp), mock.patch.object(gd.os, "rename",
+                                                           lambda a, b: (renames.append(a), real_rename(a, b))), \
+                contextlib.redirect_stdout(io.StringIO()):
+            gd.reap_tmpdir_test_residue(receipt, tmp, runner_host=True)
+        self.assertTrue((guarded / "TemporaryItems").is_dir())
+        self.assertNotIn(guarded, [Path(os.fspath(r)) for r in renames])
+        self.assertEqual(json.loads(receipt.read_text())["kept"]["a guarded TemporaryItems in a name no measured test"
+                                                                 " prefix lists"], 1)
 
     def test_tmpdir_test_residue_census_counts_without_walking(self) -> None:
         tmp, e = self._tmp_residue()
+        fixture = tmp / "phone-tests-0157d868-1a4f-4a4c-b017-9a3bb1b51aa6.sqlite"
+        fixture.write_bytes(b"sqlite")
+        os.utime(fixture, (time.time() - 72 * 3600,) * 2)
         walked = []
         with mock.patch.object(gd, "tree_newest", side_effect=lambda *a, **k: walked.append(a)):
             named = gd.tmp_test_residue_census(tmp)
-            every = gd.tmp_test_residue_census(tmp, every_entry=True)
+            runner = gd.tmp_test_residue_census(tmp, runner_host=True)
         self.assertEqual(walked, [])
         total = len(list(tmp.iterdir()))
         # named: socket, git, foundation, file, recent, inner-recent, link; all but recent are old at the top
         self.assertEqual(named, {"entries": total, "test_residue": 7, "idle": 6,
-                                 "idle_hours": gd.TMP_TEST_RESIDUE_IDLE_HOURS, "every_entry": False})
-        self.assertEqual((every["test_residue"], every["idle"], every["every_entry"]), (9, 8, True))
+                                 "idle_hours": gd.TMP_TEST_RESIDUE_IDLE_HOURS, "runner_host": False})
+        self.assertEqual((runner["test_residue"], runner["idle"], runner["runner_host"]), (8, 7, True))
         self.assertIsNone(gd.tmp_test_residue_census(self.root / "missing"))
 
-    def test_tmpdir_test_residue_takes_any_words_uuid_name_on_every_host(self) -> None:
+    def test_tmpdir_test_residue_takes_words_uuid_names_on_a_runner_host(self) -> None:
         tmp = self.root / "T3"
         reaped = [tmp / "cmux-screenshots-tests-FA6A171A-766D-46D5-8D5D-6035A5A74F9D",
                   tmp / "phone-tests-0157d868-1a4f-4a4c-b017-9a3bb1b51aa6.sqlite"]
@@ -5202,50 +5209,50 @@ class GlaedaDiskTest(unittest.TestCase):
         kept[2].write_bytes(b"gz")
         for p in [*reaped, *kept]:
             self._age(p, hours=72) if p.is_dir() else os.utime(p, (time.time() - 72 * 3600,) * 2)
+        # elsewhere only the measured prefix goes
+        with contextlib.redirect_stdout(io.StringIO()):
+            gd.reap_tmpdir_test_residue(self.receipt(), tmp, runner_host=False)
+        self.assertFalse(reaped[0].exists())
+        self.assertTrue(reaped[1].is_file())
         receipt = self.receipt()
         with contextlib.redirect_stdout(io.StringIO()):
-            gd.reap_tmpdir_test_residue(receipt, tmp, every_entry=False)
+            gd.reap_tmpdir_test_residue(receipt, tmp, runner_host=True)
         self.assertEqual([p.name for p in reaped if os.path.lexists(p)], [])
         self.assertEqual([p.name for p in kept if not os.path.lexists(p)], [])
-        self.assertEqual(json.loads(receipt.read_text())["by_prefix"],
-                         {"cmux-screenshots-tests": 1, "phone-tests": 1})
-        # a runner host takes unkept names too, but never a dotted Apple name or a bare UUID
-        for p in kept[:2]:
-            self.assertIsNone(gd.tmp_test_residue_prefix(p.name, True), p.name)
+        self.assertEqual(json.loads(receipt.read_text().splitlines()[-1])["by_prefix"], {"phone-tests": 1})
         # the same vetoes hold: an open fixture stays
         live = tmp / "phone-tests-1157d868-1a4f-4a4c-b017-9a3bb1b51aa6.sqlite"
         live.write_bytes(b"sqlite")
         os.utime(live, (time.time() - 72 * 3600,) * 2)
         gd.process_evidence = lambda: ([str(live)], "")
         with contextlib.redirect_stdout(io.StringIO()):
-            gd.reap_tmpdir_test_residue(self.receipt(), tmp, every_entry=False)
+            gd.reap_tmpdir_test_residue(self.receipt(), tmp, runner_host=True)
         self.assertTrue(live.is_file())
 
     def test_tmpdir_test_residue_kept_names_and_sockets_win_over_the_uuid_rule(self) -> None:
         for name in ("ssh-0157d868-1a4f-4a4c-b017-9a3bb1b51aa6", "tmux-0157d868-1a4f-4a4c-b017-9a3bb1b51aa6",
-                     "launchd-0157d868-1a4f-4a4c-b017-9a3bb1b51aa6"):
-            for every in (False, True):
-                self.assertIsNone(gd.tmp_test_residue_prefix(name, every), name)
+                     "launchd-0157d868-1a4f-4a4c-b017-9a3bb1b51aa6", "codesign-0157d868-1a4f-4a4c-b017-9a3bb1b51aa6",
+                     "ci-0157d868-1a4f-4a4c-b017-9a3bb1b51aa6.p12"):
+            for runner in (False, True):
+                self.assertIsNone(gd.tmp_test_residue_prefix(name, runner), name)
         self.assertTrue(gd.tmp_socket_veto("phone-tests-0157d868-1a4f-4a4c-b017-9a3bb1b51aa6"))
         self.assertFalse(gd.tmp_socket_veto("cmux-cli-socket-00D670AE-52D1-4CCE-88A3-08D9A0C1851D"))
         self.assertTrue(gd.tmp_socket_veto(f"{gd.TMP_HOLD_PREFIX}4242"))
+        self.assertFalse(gd.tmp_hold_movable(f"{gd.TMP_HOLD_PREFIX}4242"))
+        self.assertFalse(gd.tmp_hold_movable("phone-tests-0157d868-1a4f-4a4c-b017-9a3bb1b51aa6"))
+        self.assertTrue(gd.tmp_hold_movable("cmux-screenshots-tests-0157d868-1a4f-4a4c-b017-9a3bb1b51aa6"))
 
     def test_tmpdir_test_residue_a_leftover_hold_keeps_its_socket_veto(self) -> None:
         """A pass killed after the move leaves glaeda-tmp-hold-<pid>; the next pass still keeps a live socket in it."""
         tmp, e = self._tmp_residue()
         hold = tmp / f"{gd.TMP_HOLD_PREFIX}4242"
-        moved = hold / "phone-tests-sock"
+        moved = hold / "cmux-screenshots-tests-x"
         moved.mkdir(parents=True)
-        cwd, sock = os.getcwd(), socket.socket(socket.AF_UNIX)
-        try:
-            os.chdir(moved)
-            sock.bind("s")
-        finally:
-            os.chdir(cwd)
+        sock = self._bind(moved, "s")
         self._age(hold, hours=72)
         try:
             with contextlib.redirect_stdout(io.StringIO()):
-                gd.reap_tmpdir_test_residue(self.receipt(), tmp, every_entry=True)
+                gd.reap_tmpdir_test_residue(self.receipt(), tmp)
         finally:
             sock.close()
         self.assertTrue((moved / "s").exists())
@@ -5259,10 +5266,11 @@ class GlaedaDiskTest(unittest.TestCase):
     def test_tmpdir_test_residue_prefix(self) -> None:
         self.assertEqual(gd.tmp_test_residue_prefix("cmux-screenshots-tests-0A1B", False), "cmux-screenshots-tests")
         self.assertIsNone(gd.tmp_test_residue_prefix("downloads-0A1B2C", False))
-        self.assertEqual(gd.tmp_test_residue_prefix("phone-tests-0157d868-1a4f-4a4c-b017-9a3bb1b51aa6.sqlite", False),
-                         "phone-tests")
+        self.assertIsNone(gd.tmp_test_residue_prefix("downloads-0A1B2C", True))
+        uuid_name = "phone-tests-0157d868-1a4f-4a4c-b017-9a3bb1b51aa6.sqlite"
+        self.assertIsNone(gd.tmp_test_residue_prefix(uuid_name, False))
+        self.assertEqual(gd.tmp_test_residue_prefix(uuid_name, True), "phone-tests")
         self.assertIsNone(gd.tmp_test_residue_prefix("F1D60153-D8F6-4573-BE5E-7EBEC850026F", True))
-        self.assertEqual(gd.tmp_test_residue_prefix("downloads-0A1B2C", True), gd.TMP_TEST_RESIDUE_OTHER)
         for keep in ("com.apple.WebKit", ".X", "TemporaryItems", "tmux-501", "ssh-abc", "xcrun_db"):
             self.assertIsNone(gd.tmp_test_residue_prefix(keep, True), keep)
 
