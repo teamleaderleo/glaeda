@@ -1030,6 +1030,29 @@ class HookTest(unittest.TestCase):
             self.assertEqual(hook.disk_low_turn(capacity, second.pid), "another admission holds the disk ledger")
         self.assertLess(time.monotonic() - begin, 5)
 
+    def test_an_unpinned_job_never_takes_the_disk_ledgers_turn(self) -> None:
+        """Review: with no pinned JobOwner, job-started guessed the parent pid and could leave a live marker before it
+        refused for the owner. Without an owner it refuses under the runner floor and writes nothing."""
+        self.fleet()
+        push = event(self.dir, "push", {"repository": CMUX})
+        env = {"PATH": "/usr/bin:/bin", "HOME": os.fspath(self.dir), "GLAEDA_RUNNER_TELEMETRY": "0",
+               "GLAEDA_CANONICAL_ROOT_PARENT": NO_ROOTS, "GLAEDA_FLEET_DIR": os.fspath(self.dir / "fleet"),
+               "GITHUB_EVENT_NAME": "push", "GITHUB_EVENT_PATH": os.fspath(push), "GITHUB_REPOSITORY": "manaflow-ai/cmux"}
+        with mock.patch.object(hook, "free_gib", return_value=25.0), \
+                mock.patch.dict(os.environ, env, clear=True), \
+                mock.patch.object(hook, "job_owner", return_value=None), \
+                mock.patch.object(hook, "start_runner_parent_watchdog"), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            code = hook.main(["job-started", "--allowed-repo", "manaflow-ai/cmux", "--no-disk",
+                              "--reservation", os.fspath(self.dir / "fleet" / "reservation.json"),
+                              "--host-lock", os.fspath(self.dir / "fleet" / "host.lock"), "--min-free-gib", "30",
+                              "--capacity-dir", os.fspath(self.dir / "capacity"),
+                              "--state-dir", os.fspath(self.dir / "state"), "--watch-pid", str(os.getpid()),
+                              "--gui-wait", "0"])
+        self.assertEqual(code, 1, out.getvalue())
+        self.assertIn("is not pinned, so it cannot take the disk ledger's turn", out.getvalue())
+        self.assertEqual(list((self.dir / "capacity").glob(f"{hook.DISK_LOW}-*")), [])
+
     def test_job_started_admits_under_the_runner_floor_only_one_job_at_a_time(self) -> None:
         self.fleet()
         args = ("--min-free-gib", "30", "--capacity-dir", os.fspath(self.dir / "capacity"))

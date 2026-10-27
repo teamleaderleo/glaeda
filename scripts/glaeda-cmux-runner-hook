@@ -6886,8 +6886,9 @@ def main(argv: list[str] | None = None) -> int:
             low = disk_refusal(disk_path, admit_floor)
             if low or admit_floor >= args.min_free_gib or not disk_refusal(disk_path, args.min_free_gib):
                 return low
-            worker = owner.pid if owner is not None else args.watch_pid or os.getppid()
-            turn = disk_low_turn(args.capacity_dir, worker)
+            # only a pinned Runner.Worker takes the ledger's turn: its marker lives exactly as long as that job
+            turn = disk_low_turn(args.capacity_dir, owner.pid) if owner is not None \
+                else "this job's Runner.Worker is not pinned, so it cannot take the disk ledger's turn"
             if turn:
                 return f"{disk_refusal(disk_path, args.min_free_gib) or 'under the disk floor'}: {turn}"
             return disk_refusal(disk_path, admit_floor)  # read again: it may have waited for the ledger
