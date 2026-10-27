@@ -2615,6 +2615,7 @@ RUNNER_CHECKOUT_AT_START_FAMILY = "runner-bloated-checkout-at-start"
 # bookkeeping is newer than that start (a checkout step rewrites the index, HEAD and FETCH_HEAD). A later step of
 # the job, or any other caller, finds the checkout already in use and is refused.
 RUNNER_JOB_START_WINDOW_S = 600.0
+OWN_CHECKOUT_BUDGET_S = 75  # whole seconds (signal.alarm); the hook gives the run 90
 
 
 def runner_agent_name(runner: Path) -> str | None:
@@ -2634,6 +2635,38 @@ def checkout_git_touched(checkout: Path) -> float:
         with contextlib.suppress(OSError):
             times.append((checkout / ".git" / n).lstat().st_mtime)
     return max(times)
+
+
+def checkout_users(checkout: Path) -> str:
+    """The processes other than this one and its ancestors (the job-started hook, whose working directory is the
+    workspace) that have a file open or their working directory anywhere in the checkout: "pid N (command)", or "".
+    Raises NoEvidence when lsof or ps cannot say."""
+    try:
+        code, out = _owned_query(["ps", "-axww", "-o", "pid=,ppid=,command="], 60)
+        lcode, listing = _owned_query([shutil.which("lsof") or "/usr/sbin/lsof", "-n", "-P", "-Fpn"], 120)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        raise NoEvidence(f"lsof or ps: {e}") from e
+    if code != 0 or not out.strip() or lcode != 0 or not listing.strip():
+        raise NoEvidence(f"lsof or ps failed (exit {lcode}, {code})")
+    parents, commands = {}, {}
+    for line in out.splitlines():
+        fields = line.split(None, 2)
+        if len(fields) >= 2 and fields[0].isdigit() and fields[1].isdigit():
+            parents[int(fields[0])], commands[int(fields[0])] = int(fields[1]), (fields[2] if len(fields) > 2 else "")
+    mine, pid = set(), os.getpid()
+    while pid > 1 and pid not in mine:
+        mine.add(pid)
+        pid = parents.get(pid, 0)
+    names = {*spellings(os.fspath(checkout)), *spellings(os.fspath(checkout.resolve()))}
+    pid = 0
+    for line in listing.splitlines():
+        if line.startswith("p") and line[1:].isdigit():
+            pid = int(line[1:])
+        elif line.startswith("n/") and pid not in mine:
+            path = line[1:]
+            if any(path == n or path.startswith(n + "/") for n in names):
+                return f"pid {pid} ({commands.get(pid, '?')[:80]})"
+    return ""
 
 
 def live_linked_worktrees(checkout: Path) -> list[str] | None:
@@ -2689,14 +2722,14 @@ def evict_own_runner_checkout(workspace: Path, receipt: Path, home: Path | None 
            else f"a linked worktree uses it ({linked[0]})" if linked else runner_checkout_git_veto(checkout))
     if not why:  # the git veto can take a minute: the evidence is read after it
         try:
-            opened, cmds = process_evidence()
+            _, cmds = process_evidence()
+            users = checkout_users(checkout)
         except NoEvidence as e:
             why = f"no process evidence: {e}"
         else:
-            index = open_index(opened)
             resolved = os.fspath(checkout.resolve())
-            if in_cwd(os.fspath(git_dir), index) or in_cwd(os.path.join(resolved, ".git"), index):
-                why = "its .git is open or a working directory of a process"
+            if users:
+                why = f"open or a working directory of {users}"
             elif named_by(os.fspath(checkout), cmds) or named_by(resolved, cmds):
                 why = "named by a running command"
     size = 0
@@ -2739,6 +2772,11 @@ def own_runner_checkout_main(args: list[str]) -> int:
     RUN.clear()
     RUN.update(caller=run_caller(), mode="own-runner-checkout", apply=True)
     started, before = time.time(), _home_free()
+
+    def out_of_time(_sig, _frame):
+        raise TimeoutError("own-runner-checkout budget")
+    previous = signal.signal(signal.SIGALRM, out_of_time)
+    signal.alarm(OWN_CHECKOUT_BUDGET_S)  # inside the hook's 90 s, so lsof and ps (own sessions) go with it
     try:
         if (off := disk_off()):
             RUN.update(off=True, skipped=f"kill switch: {off}")
@@ -2749,7 +2787,13 @@ def own_runner_checkout_main(args: list[str]) -> int:
         else:
             RUN["skipped"] = "not a bloated checkout of a starting job"
         return 0
+    except TimeoutError:
+        RUN["skipped"] = f"out of time after {OWN_CHECKOUT_BUDGET_S} s"
+        return 0
     finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, previous)
+        _terminate_active_children()
         write_run_line(started, before)
 
 

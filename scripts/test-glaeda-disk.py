@@ -5010,6 +5010,9 @@ class GlaedaDiskTest(unittest.TestCase):
         stack.enter_context(mock.patch.object(gd, "runner_job_started", return_value=time.time() - ago_s))
         stack.enter_context(mock.patch.dict(os.environ, {"RUNNER_NAME": runner.replace("actions-runner-", "mini-")}))
         stack.enter_context(mock.patch.object(gd, "disk_off", return_value=""))
+        # who uses the checkout, from what process_evidence opened (checkout_users has its own test)
+        stack.enter_context(mock.patch.object(gd, "checkout_users", side_effect=lambda co: next(
+            (f"pid 9 ({p})" for p in gd.process_evidence()[0] if p == os.fspath(co) or p.startswith(f"{co}/")), "")))
         return stack
 
     def test_the_job_start_takes_its_own_bloated_checkouts_git(self) -> None:
@@ -5018,8 +5021,8 @@ class GlaedaDiskTest(unittest.TestCase):
         bloated and git loses nothing. The workspace and its files stay; a sibling that is not bloated stays whole."""
         home, cos = self._own_checkout_fixture()
         bloated = cos["actions-runner-glaeda-11"]
-        # the hook's own cwd is the workspace (not its .git), and the runner's Worker is live: neither keeps it
-        gd.process_evidence = lambda: ([os.fspath(bloated)], f"{home}/actions-runner-glaeda-11/bin/Runner.Worker spawnclient 1 2")
+        # the runner's Worker is live (it is this job's): that does not keep it; the hook's cwd is checkout_users'
+        gd.process_evidence = lambda: ([], f"{home}/actions-runner-glaeda-11/bin/Runner.Worker spawnclient 1 2")
         patches, removed = self._floor_disk(400.0)
         receipt = self.receipt()
         with patches[0], patches[1], mock.patch.object(gd, "host_reservation", return_value=""), self._starting():
@@ -5038,6 +5041,7 @@ class GlaedaDiskTest(unittest.TestCase):
             raise gd.NoEvidence("lsof failed")
         cases = {  # what is wrong -> (process evidence, unpushed commit, reserved, expected receipt outcome or None)
             "an open file in its .git": (lambda co: ([os.fspath(co / ".git/objects/pack/pack-0000.pack")], ""), False, "", "changed:in-use"),
+            "a process working in it": (lambda co: ([os.fspath(co)], ""), False, "", "changed:in-use"),
             "a command names it": (lambda co: ([], f"git -C {co} gc"), False, "", "changed:in-use"),
             "no process evidence": (lambda co: no_evidence, False, "", "changed:in-use"),
             "a commit only it has": (lambda co: ([], ""), True, "", "blocked:git"),
@@ -5076,6 +5080,23 @@ class GlaedaDiskTest(unittest.TestCase):
                     self.assertIn("kept", note)
                     (rec,) = map(json.loads, receipt.read_text().splitlines())
                     self.assertEqual(rec["outcome"], outcome)
+
+    def test_checkout_users_skips_only_this_process_and_its_ancestors(self) -> None:
+        co = self.root / "r/_work/cmux/cmux"
+        me, parent, grand = os.getpid(), os.getppid(), 77001
+        ps = f"{me} {parent} glaeda-disk\n{parent} {grand} hook\n{grand} 1 job-started.sh\n555 1 swift test\n"
+
+        def lsof(rows):
+            return "".join(f"p{pid}\nfcwd\nn{path}\n" for pid, path in rows)
+        cases = [([(grand, os.fspath(co)), (parent, "/")], ""),  # the hook shell's cwd is the workspace
+                 ([(grand, os.fspath(co)), (555, os.fspath(co) + "/Sources")], "pid 555 (swift test)"),
+                 ([(555, os.fspath(co) + "-old/x")], "")]  # a sibling name is not inside it
+        for rows, want in cases:
+            with self.subTest(want=want), mock.patch.object(
+                    gd, "_owned_query", side_effect=lambda argv, t: (0, ps) if argv[0] == "ps" else (0, lsof(rows))):
+                self.assertEqual(gd.checkout_users(co), want)
+        with mock.patch.object(gd, "_owned_query", return_value=(1, "")), self.assertRaises(gd.NoEvidence):
+            gd.checkout_users(co)
 
     def test_the_job_start_judges_only_an_enrolled_runners_checkout_from_its_environment(self) -> None:
         home, cos = self._own_checkout_fixture()
