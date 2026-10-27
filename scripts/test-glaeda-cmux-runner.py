@@ -5893,6 +5893,37 @@ class GateTest(unittest.TestCase):
         self.assertIsNone(hook.slot_capacity_wait(None, False))
         self.assertEqual(hook.slot_capacity_wait(bound * 2, False), bound * 2)
 
+    def test_the_nightly_next_app_build_waits_a_bounded_time_on_attempt_1(self) -> None:
+        """NEXT's nightly app build is refused after NIGHTLY_CAPACITY_WAIT_S on attempt 1, so the owned-pool rescue's
+        re-run (attempt 2, the picker's Blacksmith label) builds it within minutes. Main's nightly, other nightly
+        jobs, later attempts and non-nightly tiers keep their waits."""
+        bound = hook.NIGHTLY_CAPACITY_WAIT_S
+        self.assertEqual(bound, 90.0)
+        self.assertLessEqual(hook.NIGHTLY_BOUND_WORST_S, 2.5 * 60)
+        args = (hook.TIER_NIGHTLY, "refs/heads/nightly-next", "build-nightly-app", "nightly.yml")
+        for attempt in ("1", "", None, " 1"):
+            with self.subTest(attempt=attempt):
+                self.assertEqual(hook.nightly_capacity_wait(*args, attempt), bound)
+        self.assertIsNone(hook.nightly_capacity_wait(*args, "2"))
+        for index, value in ((0, hook.TIER_DEV), (0, ""), (1, "refs/heads/main"), (2, "build-sign-notarize-nightly"),
+                             (3, "cmux-next.yml")):
+            changed = list(args)
+            changed[index] = value
+            with self.subTest(changed=changed):
+                self.assertIsNone(hook.nightly_capacity_wait(*changed, "1"))
+        # composes with an explicit wait the way the DEV bound does
+        self.assertEqual(hook.bounded_wait(None, hook.nightly_capacity_wait(*args, "1")), bound)
+        self.assertEqual(hook.bounded_wait(5.0, hook.nightly_capacity_wait(*args, "1")), 5.0)
+        # job_tier() is the gate: a pull request's copy of nightly.yml is no nightly job, so it is never bounded here
+        ref = "refs/heads/nightly-next"
+        tier = hook.job_tier("push", ref, "manaflow-ai/cmux", {"ref": ref, "repository": CMUX},
+                             f"manaflow-ai/cmux/.github/workflows/nightly.yml@{ref}", "build-nightly-app")
+        self.assertEqual(hook.nightly_capacity_wait(tier, ref, "build-nightly-app", "nightly.yml", "1"), bound)
+        untrusted = hook.job_tier("pull_request", "refs/pull/1/merge", "manaflow-ai/cmux", {"repository": CMUX},
+                                  "manaflow-ai/cmux/.github/workflows/nightly.yml@refs/pull/1/merge",
+                                  "build-nightly-app")
+        self.assertIsNone(hook.nightly_capacity_wait(untrusted, ref, "build-nightly-app", "nightly.yml", "1"))
+
     def test_other_capacity_waits_remain_unbounded(self) -> None:
         event = {"repository": CMUX, "ref": "refs/heads/feat-cmux-next"}
         for job, workflow, event_name in (("cmux-scheme-compile", "cmux-next.yml", "pull_request"),
