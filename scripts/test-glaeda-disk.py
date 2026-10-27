@@ -861,12 +861,22 @@ class GlaedaDiskTest(unittest.TestCase):
         local_bin, brew_bin = home / ".local/bin", self.root / "brew/bin"
         local_bin.mkdir(parents=True)
         brew_bin.mkdir(parents=True)
-        cellar = self.root / "cellar/python/bin"
-        cellar.mkdir(parents=True)
-        (cellar / "python3.13").write_text("#!/bin/sh\n")
+        cellar, brew_cellar = self.root / "cellar/python/bin", self.root / "brew/Cellar/python/bin"
+        for d in (cellar, brew_cellar):
+            d.mkdir(parents=True)
+            (d / "python3.13").write_text("#!/bin/sh\n")
         (local_bin / "python3").symlink_to(cellar / "python3.13")
-        (brew_bin / "python3").symlink_to(cellar / "python3.13")
-        (brew_bin / "zig").write_text("#!/bin/sh\n")
+        (brew_bin / "python3").symlink_to(brew_cellar / "python3.13")  # a second, distinct installation
+        zig_dir = self.root / "zigdir"
+        zig_dir.mkdir()
+        (zig_dir / "zig").write_text("#!/bin/sh\n")
+        # ~/.cargo itself a link to a switch link inside a cache: every link on the way stays, not only the target
+        switch = home / ".cache/cargo-switch"
+        switch.mkdir(parents=True)
+        job_cargo = self.root / "opt/job-cargo"
+        (job_cargo / "bin").mkdir(parents=True)
+        (switch / "current").symlink_to(job_cargo)
+        (home / ".cargo").symlink_to(switch / "current")
         checkout_bin = home / "work/repo/node_modules/.bin"
         checkout_bin.mkdir(parents=True)
         (checkout_bin / "gh").write_text("#!/bin/sh\n")
@@ -877,16 +887,24 @@ class GlaedaDiskTest(unittest.TestCase):
         (cargo_home / "bin").symlink_to(cargo_real / "bin")
         rustup_home = self.root / "rustup-home"
         with mock.patch.object(gd, "HOME", home), \
-                mock.patch.object(gd, "TOOLCHAIN_SYSTEM_BIN_DIRS", (os.fspath(brew_bin),)), \
+                mock.patch.object(gd, "TOOLCHAIN_SYSTEM_BIN_DIRS", (os.fspath(brew_bin), os.fspath(zig_dir))), \
                 mock.patch.dict(os.environ, {"CARGO_HOME": str(cargo_home), "RUSTUP_HOME": str(rustup_home),
                                              "PATH": f"{checkout_bin}{os.pathsep}{os.environ.get('PATH', '')}"}):
-            for path in (local_bin / "python3", local_bin, brew_bin / "python3", brew_bin / "zig", brew_bin,
-                         cellar / "python3.13", cargo_home, cargo_home / "bin", cargo_real / "bin", self.root / "tmp",
+            for path in (local_bin / "python3", local_bin, brew_bin / "python3", brew_bin, zig_dir / "zig",
+                         cellar / "python3.13", cellar, brew_cellar / "python3.13", brew_cellar,
+                         home / ".cargo", switch / "current", switch, job_cargo / "bin",
+                         cargo_home, cargo_home / "bin", cargo_real / "bin", self.root / "tmp",
                          rustup_home / "toolchains/x", Path("/Applications/Xcode_26.6.app")):
                 self.assertTrue(gd.toolchain_held(path, fresh=True), path)
             self.assertFalse(gd.toolchain_held(checkout_bin), "a job PATH entry keeps nothing")
             self.assertFalse(gd.toolchain_held(home / "work/repo"))
             self.assertFalse(gd.toolchain_held(self.root / "tmp/other"))
+            self.assertFalse(gd.toolchain_held(home / ".cache/other"), "only the switch link's own path stays")
+            self.assertFalse(gd.toolchain_held(self.root / "opt/other"))
+            # a link in a system ancestor (macOS /tmp -> private/tmp) keeps what runs through it, not all below it
+            self.assertFalse(gd.toolchain_held(Path("/tmp") / f"glaeda-disk-not-a-toolchain-{os.getpid()}"))
+            with self.assertRaisesRegex(OSError, "job toolchain"):
+                gd.remove(switch)
             # a tool switched after the cached look: remove() looks again before it deletes
             gd.toolchain_keep(fresh=True)
             newer = self.root / "cellar/python314/bin"

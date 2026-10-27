@@ -516,18 +516,36 @@ def toolchain_keep(fresh: bool = False) -> tuple[str, ...]:
                     paths += [d, d / tool]
         out: list[str] = []
         for path in paths:
-            out.append(os.path.abspath(path))
-            hop, seen = os.path.abspath(path), 0
-            while seen < 40 and os.path.islink(hop):  # each link on the way, then where the chain ends
-                try:
-                    hop = os.path.abspath(os.path.join(os.path.dirname(hop), os.readlink(hop)))
-                except OSError:
-                    break
-                out.append(hop)
-                seen += 1
+            out += _link_spellings(os.path.abspath(path))
             out.append(os.path.realpath(path))
         _TOOLCHAIN_KEEP[key] = tuple(dict.fromkeys(out))
     return _TOOLCHAIN_KEEP[key]
+
+
+def _link_spellings(path: str, hops: int = 40) -> list[str]:
+    """PATH and every spelling it passes through on the way to its target, resolved one component at a time: a symlink
+    in any component (~/.cargo -> ~/.cache/cargo-switch/current -> /opt/job-cargo) adds each target with the rest of
+    PATH appended (~/.cache/cargo-switch/current/bin, /opt/job-cargo/bin). The link itself is never added as a path of
+    its own: it is above the spelling that runs through it, so it is kept that way, while a system link such as /tmp
+    keeps only what PATH runs through, not everything below it."""
+    out = [path]
+    todo = [path]
+    while todo and hops > 0:
+        cur = todo.pop()
+        parts = cur.split(os.sep)
+        for i in range(2, len(parts) + 1):
+            head = os.sep.join(parts[:i]) or os.sep
+            if os.path.islink(head):
+                hops -= 1
+                try:
+                    target = os.path.normpath(os.path.join(os.path.dirname(head), os.readlink(head)))
+                except OSError:
+                    break
+                nxt = os.path.join(target, *parts[i:]) if parts[i:] else target
+                out.append(nxt)
+                todo.append(nxt)
+                break
+    return out
 
 
 def _at_inside_or_above(path: Path, keep: list[str] | tuple[str, ...]) -> bool:
