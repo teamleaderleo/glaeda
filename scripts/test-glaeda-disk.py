@@ -6146,6 +6146,136 @@ class VolumeCensusTest(unittest.TestCase):
         self.assertIn("not due", out.getvalue())
 
 
+class MediaTourDerivedDataTest(unittest.TestCase):
+    """cmux media tour DerivedData lives only where a tour can be routed (a gui or session runner), warm by role there."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        base = Path(os.path.realpath(self.tmp.name))
+        self.root = base / "DerivedData"
+        self.state = base / "state"
+        self.runners = base / "runners"
+        self.fam = gd.Family("xcode-derived-data", self.root, True, "rebuild", build_output=True)
+        self.patches = [mock.patch.object(gd, "process_evidence", lambda: ([], "")),
+                        mock.patch.object(gd, "CMUX_RUNNER_STATE", self.state),
+                        mock.patch.object(gd, "MEDIA_TOUR_LOCKS", base / "locks"),
+                        mock.patch.object(gd, "_MEDIA_TOUR_HOST_SET", False),
+                        mock.patch.object(gd, "FLOOR_HOLD", {})]
+        for p in self.patches:
+            p.start()
+            self.addCleanup(p.stop)
+        self.addCleanup(self.tmp.cleanup)
+
+    def runner(self, n: int, labels: list[str], installed: bool = True) -> None:
+        rdir = self.runners / f"r{n}"
+        rdir.mkdir(parents=True, exist_ok=True)
+        if installed:
+            (rdir / ".runner").write_text("{}")
+        receipt = self.state / f"instance-{n}" / "receipt.json"
+        receipt.parent.mkdir(parents=True, exist_ok=True)
+        receipt.write_text(json.dumps({"mode": "install", "runnerDir": str(rdir),
+                                       "registration": {"labels": ["self-hosted", "glaeda-mini", *labels]}}))
+
+    def verdicts(self) -> dict[str, str]:
+        gd._MEDIA_TOUR_HOST_SET = False
+        return {Path(i.path).name: i.verdict for i in gd.survey([self.fam], 12, 0)}
+
+    def test_host_is_derived_from_enrolled_runner_labels(self) -> None:
+        self.assertIsNone(gd.media_tour_host(self.state), "no runner enrolled: not a CI mini, nothing changes")
+        self.runner(1, ["glaeda-std-xcode-26.6", "glaeda-gui-std-linux", "glaeda-session-std", "glaeda-gui-std-xcode-"])
+        self.assertIs(gd.media_tour_host(self.state), False, "only the labels the tour's route picks count")
+        self.runner(2, ["glaeda-gui-std-xcode-26.6"], installed=False)
+        self.assertIs(gd.media_tour_host(self.state), False, "an uninstalled runner's labels route nothing here")
+        self.runner(3, ["glaeda-session-light-xcode-26.6"])
+        self.assertIs(gd.media_tour_host(self.state), True)
+        (self.state / "instance-9").mkdir()
+        (self.state / "instance-9" / "receipt.json").write_text("{not json")
+        self.assertIs(gd.media_tour_host(self.state), True, "a host with a gui runner stays one")
+
+    def test_unreadable_receipt_changes_nothing(self) -> None:
+        (self.state / "instance-0").mkdir(parents=True)
+        (self.state / "instance-0" / "receipt.json").write_text("{not json")
+        self.runner(1, ["glaeda-std-xcode-26.6"])
+        self.assertIsNone(gd.media_tour_host(self.state))
+        make(self.root / "cmux-ci-media-slot0-base", age_hours=2)
+        self.assertEqual(self.verdicts(), {"cmux-ci-media-slot0-base": "recent"})
+
+    def test_non_media_host_drops_media_dd_at_any_age(self) -> None:
+        self.runner(1, ["glaeda-std-xcode-26.6"])
+        make(self.root / "cmux-ci-media-slot0-base", age_hours=0.5)
+        make(self.root / "cmux-ci-media-pr-12-head", age_hours=0.5)
+        make(self.root / "cmux-other", age_hours=0.5)
+        self.assertEqual(self.verdicts(), {"cmux-ci-media-slot0-base": "reclaimable",
+                                           "cmux-ci-media-pr-12-head": "reclaimable",
+                                           "cmux-other": "recent"})
+
+    def test_open_media_dd_is_still_in_use(self) -> None:
+        self.runner(1, ["glaeda-std-xcode-26.6"])
+        held = make(self.root / "cmux-ci-media-slot0-head", age_hours=0.5)
+        with mock.patch.object(gd, "process_evidence", lambda: ([], f"/x/cmux-tui --dir {held}/Build")):
+            self.assertEqual(self.verdicts(), {"cmux-ci-media-slot0-head": "in-use"})
+
+    def test_media_host_keeps_warm_slots_by_role(self) -> None:
+        self.runner(1, ["glaeda-gui-std-xcode-26.6"])
+        make(self.root / "cmux-ci-media-slot0-base", age_hours=400)
+        make(self.root / "cmux-ci-media-slot1-head", age_hours=400)
+        make(self.root / "cmux-ci-media-slot2-head", age_hours=13)  # an overflow slot: the 12 h window
+        make(self.root / "cmux-ci-media-pr-7-base", age_hours=13)
+        make(self.root / "cmux-ci-media-slot3-base", age_hours=2)
+        self.assertEqual(self.verdicts(), {"cmux-ci-media-slot0-base": "recent",
+                                           "cmux-ci-media-slot1-head": "recent",
+                                           "cmux-ci-media-slot2-head": "reclaimable",
+                                           "cmux-ci-media-pr-7-base": "reclaimable",
+                                           "cmux-ci-media-slot3-base": "recent"})
+        with mock.patch.object(gd, "POLICY", {**gd.POLICY, "media_tour_warm_slots": 1}):
+            self.assertEqual(self.verdicts()["cmux-ci-media-slot1-head"], "reclaimable")
+
+    def tag_held(self, tag: str):
+        (self.root.parent / "locks").mkdir(exist_ok=True)
+        fd = os.open(self.root.parent / "locks" / f"{tag}.lock", os.O_RDWR | os.O_CREAT, 0o644)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        self.addCleanup(os.close, fd)
+
+    def test_a_held_tour_tag_keeps_its_dirs(self) -> None:
+        self.runner(1, ["glaeda-std-xcode-26.6"])
+        make(self.root / "cmux-ci-media-slot0-base", age_hours=30)
+        make(self.root / "cmux-ci-media-slot0-head", age_hours=30)
+        make(self.root / "cmux-ci-media-slot1-head", age_hours=30)
+        self.tag_held("ci-media-slot0")  # claimed: the tour has not opened anything yet
+        self.assertEqual(self.verdicts(), {"cmux-ci-media-slot0-base": "in-use", "cmux-ci-media-slot0-head": "in-use",
+                                           "cmux-ci-media-slot1-head": "reclaimable"})
+
+    def test_apply_deletes_only_under_the_tag_lock_and_fresh_evidence(self) -> None:
+        self.runner(1, ["glaeda-std-xcode-26.6"])
+        claimed = make(self.root / "cmux-ci-media-slot0-base", age_hours=30)
+        started = make(self.root / "cmux-ci-media-slot1-base", age_hours=30)
+        stray = make(self.root / "cmux-ci-media-pr-3-head", age_hours=30)
+        gd._MEDIA_TOUR_HOST_SET = False
+        items = gd.survey([self.fam], 12, 0)
+        self.assertEqual({i.verdict for i in items}, {"reclaimable"})
+        self.tag_held("ci-media-slot0")  # a tour claims slot 0 after the survey
+        # and an xcodebuild starts in slot 1 after the survey: only a fresh ps at apply sees it
+        calls = []
+
+        def evidence():  # apply's own first reading sees nothing; the build starts after it
+            calls.append(1)
+            return [], (f"xcodebuild -derivedDataPath {started}" if len(calls) > 1 else "")
+        with mock.patch.object(gd, "process_evidence", evidence), contextlib.redirect_stdout(io.StringIO()):
+            gd.apply(items, {self.fam.id: self.fam}, self.root.parent / "r.jsonl", None, 12)
+        self.assertTrue(claimed.exists(), "a claimed slot is never removed")
+        self.assertTrue(started.exists(), "a build that started after the survey keeps its dir")
+        self.assertFalse(stray.exists())
+
+    def test_warm_slot_goes_only_under_the_runner_floor(self) -> None:
+        self.runner(1, ["glaeda-gui-std-xcode-26.6"])
+        slot = make(self.root / "cmux-ci-media-slot0-base", age_hours=1)
+        dev = self.root.stat().st_dev
+        with mock.patch.object(gd, "ACTIVITY_MODE", "pressure"), mock.patch.object(gd, "FLOOR_HOLD", {dev: 50 * gd.GIB}):
+            self.assertEqual(self.verdicts(), {"cmux-ci-media-slot0-base": "reclaimable"})
+            item = gd.Item("xcode-derived-data", str(slot), gd.GIB, 1.0, "reclaimable")
+            self.assertTrue(gd.floor_hold_only(self.fam, item, 12), "it waits for the floor stop like warm builds")
+
+
 class LinuxLayoutTest(unittest.TestCase):
     """The Linux layout, checked on every platform by pointing HOME and DARWIN at a fake host."""
 
@@ -7450,6 +7580,134 @@ class CaptureDedupeTest(unittest.TestCase):
         self.assertGreater(passes, 2)
         self.assertEqual(changed(), {"r1": 2, "r2": 2, "r3": 2, "r4": 2})
         self.assertTrue(all(p.read_bytes() == d for p, d in frames.items()))
+
+
+class NightlyNextFallbackTest(unittest.TestCase):
+    """~/Library/Caches/cmux-nightly-next: the dedicated builder's tree is kept by role, a pool runner's goes once idle
+    DEFAULT_AGE_HOURS, and nothing changes until disk-policy names the routing label."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.home = Path(os.path.realpath(self.tmp.name))
+        self.saved = (gd.HOME, gd.FLEET_ROOT, gd.DARWIN)
+        gd.HOME, gd.FLEET_ROOT, gd.DARWIN = self.home, self.home / "shared-fleet", True
+        gd._DISCOVERED.clear()
+        self.root = self.home / "Library/Caches" / gd.NIGHTLY_NEXT_ROOT
+        for name in ("cmux9s-mac-mini-glaeda-2", "cmux9s-mac-mini-glaeda-5", "cmux14-glaeda",
+                     "cmux7s-mac-mini-nightly-next", "cmux7s-mac-mini-glaeda-nightly-next", "notes"):
+            # nightly_build_state.py's layout: SwiftPM clones and the compilation cache per identity, notices crates
+            ident = self.root / name / "0123456789abcdef0123456789abcdef"
+            clone = ident / "SourcePackages/checkouts/swift-collections"
+            (clone / ".git/objects").mkdir(parents=True)
+            (clone / ".git/HEAD").write_text("ref: refs/heads/main\n")
+            (clone / "Package.swift").write_text("// package\n")
+            (ident / "CompilationCache").mkdir()
+            (ident / "CompilationCache/blob").write_bytes(b"x" * 4096)
+            (self.root / name / "notices-crates/registry").mkdir(parents=True)
+
+    def tearDown(self) -> None:
+        gd.HOME, gd.FLEET_ROOT, gd.DARWIN = self.saved
+        gd._DISCOVERED.clear()
+        self.tmp.cleanup()
+
+    def families(self, label: str | None) -> dict[str, gd.Family]:
+        policy = dict(gd.POLICY)
+        if label is not None:
+            policy["nightly_next_dedicated_label"] = label
+        with mock.patch.object(gd, "POLICY", policy):
+            return {f.id: f for f in gd.default_families()}
+
+    def test_inert_until_the_routing_label_is_set(self) -> None:
+        self.assertEqual(gd.POLICY_DEFAULTS["nightly_next_dedicated_label"], "")
+        for label in (None, "", "glaeda-trusted", "glaeda-trusted-next-nightly-x"):
+            fams = self.families(label)
+            self.assertNotIn(gd.NIGHTLY_NEXT_FAMILY, fams, label)
+            # as before: the whole root is one library-caches item
+            self.assertNotIn(gd.NIGHTLY_NEXT_ROOT, fams["library-caches"].skip, label)
+
+    def test_policy_file_turns_it_on(self) -> None:
+        policy = self.home / "disk-policy.json"
+        policy.write_text(json.dumps({"nightly_next_dedicated_label": gd.NIGHTLY_NEXT_DEDICATED_LABEL}))
+        self.assertEqual(gd.disk_policy(policy)["nightly_next_dedicated_label"], gd.NIGHTLY_NEXT_DEDICATED_LABEL)
+        policy.write_text(json.dumps({"nightly_next_dedicated_label": 1}))
+        self.assertEqual(gd.disk_policy(policy)["nightly_next_dedicated_label"], "")
+
+    def test_active_keeps_the_dedicated_builder_and_offers_pool_trees(self) -> None:
+        fams = self.families(gd.NIGHTLY_NEXT_DEDICATED_LABEL)
+        self.assertIn(gd.NIGHTLY_NEXT_ROOT, fams["library-caches"].skip)
+        fam = fams[gd.NIGHTLY_NEXT_FAMILY]
+        self.assertEqual(fam.root, self.root)
+        self.assertTrue(fam.reclaimable)
+        got = sorted(p.name for p in gd.candidates(fam))
+        self.assertEqual(got, ["cmux14-glaeda", "cmux9s-mac-mini-glaeda-2", "cmux9s-mac-mini-glaeda-5"])
+
+    def test_survey_of_every_family_never_offers_the_dedicated_tree(self) -> None:
+        old = time.time() - 30 * 24 * 3600
+        for p in self.root.rglob("*"):
+            os.utime(p, (old, old))
+        for label in ("", gd.NIGHTLY_NEXT_DEDICATED_LABEL):
+            gd._DISCOVERED.clear()
+            policy = {**gd.POLICY, "nightly_next_dedicated_label": label}
+            with mock.patch.object(gd, "POLICY", policy), \
+                    mock.patch.object(gd, "process_evidence", return_value=([], "")):
+                fams = [f for f in gd.default_families()
+                        if f.reclaimable and f.root.is_relative_to(self.home)]  # not the host's real temp dirs
+                items = {Path(i.path): i.verdict for i in gd.survey(fams, 0, 0)}
+            paths = set(items)
+            names = {p.name for p in paths if p.parent == self.root}
+            if label:
+                self.assertNotIn(self.root, paths)
+                self.assertEqual(names, {"cmux14-glaeda", "cmux9s-mac-mini-glaeda-2", "cmux9s-mac-mini-glaeda-5"})
+                # the SwiftPM clones inside do not make a pool tree a checkout: a month idle, it is reclaimable
+                self.assertEqual({items[self.root / n] for n in names}, {"reclaimable"})
+            else:
+                self.assertIn(self.root, paths)  # inert: the root stays one library-caches item, as before
+                self.assertEqual(names, set())
+
+    def test_a_reused_tree_is_recent_from_its_deep_writes(self) -> None:
+        """A build that reuses an identity writes only deep files: the cache's index, SwiftPM's state."""
+        tree = self.root / "cmux9s-mac-mini-glaeda-2"
+        ident = tree / "0123456789abcdef0123456789abcdef"
+        index = ident / "CompilationCache/generic/v1.1/v8.index"
+        index.parent.mkdir(parents=True)
+        index.write_bytes(b"i")
+        state = ident / "SourcePackages/workspace-state.json"
+        state.write_text("{}")
+        old = time.time() - 30 * 24 * 3600
+        for p in [tree, *tree.rglob("*")]:
+            os.utime(p, (old, old), follow_symlinks=False)
+        fam = gd.nightly_next_family(self.root)
+        self.assertLess(gd.item_mtime(fam, tree), old + 1)
+        for written in (index, state):
+            now = time.time() - 60
+            os.utime(written, (now, now))
+            self.assertGreaterEqual(gd.item_mtime(fam, tree), now - 1, written.name)
+            os.utime(written, (old, old))
+        # other families' items keep their usual shallow look
+        self.assertLess(gd.item_mtime(gd.Family("x", self.root, True, "x"), tree), old + 1)
+
+    def test_runner_cache_profile(self) -> None:
+        self.assertNotIn(gd.NIGHTLY_NEXT_FAMILY, {f.id for f in gd.runner_cache_families()})
+        policy = {**gd.POLICY, "nightly_next_dedicated_label": gd.NIGHTLY_NEXT_DEDICATED_LABEL}
+        with mock.patch.object(gd, "POLICY", policy):
+            fam = {f.id: f for f in gd.runner_cache_families()}[gd.NIGHTLY_NEXT_FAMILY]
+        self.assertEqual(gd.idle_window(fam, 1.0), gd.RUNNER_CACHE_IDLE_HOURS)
+        self.assertEqual(sorted(p.name for p in gd.candidates(fam)),
+                         ["cmux14-glaeda", "cmux9s-mac-mini-glaeda-2", "cmux9s-mac-mini-glaeda-5"])
+
+    def test_pool_tree_goes_after_its_own_idle_window(self) -> None:
+        fam = gd.nightly_next_family(self.root)
+        window = gd.DEFAULT_AGE_HOURS
+        with mock.patch.object(gd, "DEFAULT_AGE_HOURS", 24.0):  # keep_legacy_ages on a reserved host
+            self.assertEqual(gd.idle_window(gd.nightly_next_family(self.root), 1.0), 24.0)
+        self.assertEqual(gd.idle_window(fam, gd.DEFAULT_AGE_HOURS), window)
+        self.assertEqual(gd.idle_window(fam, 1.0), window)
+        quiet = [time.time() - 3600]  # not a hot-tier family: the job count never stretches its window
+        for mode in ("sweep", "pressure", None):
+            with mock.patch.object(gd, "ACTIVITY_MODE", mode), mock.patch.object(gd, "job_starts", return_value=quiet), \
+                    mock.patch.object(gd, "running_job_hours", return_value=0.5):
+                self.assertTrue(gd.item_due(fam, window + 0.5, window)[0], mode)
+                self.assertFalse(gd.item_due(fam, window - 0.5, window)[0], mode)
 
 
 class ActivityClockTest(unittest.TestCase):
