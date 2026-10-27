@@ -1165,6 +1165,25 @@ class RunnerHygiene(unittest.TestCase):
         self.hygiene_pass(now=T0 + heal.HYGIENE_RETRY_S + 1)
         self.assertEqual(self.snapshot.read_bytes(), DISK_BYTES)
 
+    def test_a_release_from_before_these_members_still_installs_and_holds_the_hygiene_pass(self) -> None:
+        for name in (heal.DISK_NAME, heal.HYGIENE_NAME, heal.INSTALLED):
+            (self.dir / name).unlink()
+        (self.dir / heal.SCRIPT_NAME).write_bytes(SCRIPT_BYTES)
+        (self.dir / heal.POLICY_NAME).write_bytes(POLICY_BYTES)
+        (self.dir / "state").mkdir()
+        channel = Channel()
+        tag = channel.publish(2, members={  # an archive with only the three members older releases shipped
+            heal.MEMBERS[heal.SCRIPT_NAME]: SCRIPT_BYTES, heal.MEMBERS[heal.POLICY_NAME]: POLICY_BYTES,
+            heal.MEMBERS[heal.FLEET_OPS_NAME]: OPS_BYTES,
+            heal.ANCESTRY: "".join(f"{k:040x}\n" for k in range(2, 0, -1)).encode()})
+        hygiene = {"hygiene_root": self.root, "daemons": self.daemons, "run": self.run, "python": sys.executable,
+                   "account": lambda uid: "cmux", "live": True}
+        report = heal.run_pass(self.dir / heal.POLICY_NAME, self.dir / "state", True, FakeHost(), install_dir=self.dir,
+                               get=channel.get, python=sys.executable, hygiene=hygiene)
+        self.assertEqual((report["release"]["tag"], report["release"]["error"], report["release"]["drifted"]),
+                         (tag, None, False))
+        self.assertEqual((report["runnerHygiene"]["accounts"]["501"]["state"], self.run.argv), ("unchecked", []))
+
     def test_an_account_its_manifest_does_not_match_is_left_alone(self) -> None:
         report = heal.hygiene_pass(self.dir, self.state, T0, True, self.root, self.daemons, self.run,
                                    sys.executable, lambda uid: "someone-else")
