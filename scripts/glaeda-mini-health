@@ -382,6 +382,7 @@ class Mini:
     def __init__(self, home: Path = HOME) -> None:
         self.home = home
         self.daemons_dir = Path("/Library/LaunchDaemons")
+        self.global_agents_dir = Path("/Library/LaunchAgents")
         self.uid = os.getuid()
         self._hook: Any = None
         self.tailnet_route_ok = False  # check_tailscale saw the tailnet route on the tunnel this run
@@ -641,11 +642,12 @@ class Mini:
         return out
 
     def foreign_runners(self) -> list[tuple[str, str]]:
-        """(where, what) for each GitHub runner glaeda does not own: a LaunchAgent or LaunchDaemon plist that is not
+        """(where, what) for each GitHub runner glaeda does not own: a LaunchAgent (the user's or /Library's) or
+        LaunchDaemon plist that is not
         glaeda's (its Label, RUNNER_AGENT) and starts a runner (the run.sh or runsvc.sh of a directory with a .runner,
         or a Runner.Listener), and a running Runner.Listener whose runner directory is not ~/actions-runner-glaeda*."""
         out = []
-        for folder in (self.home / "Library/LaunchAgents", self.daemons_dir):
+        for folder in (self.home / "Library/LaunchAgents", self.global_agents_dir, self.daemons_dir):
             for plist in sorted(folder.glob("*.plist")) if folder.is_dir() else []:
                 try:
                     doc = plistlib.loads(plist.read_bytes())

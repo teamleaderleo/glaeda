@@ -66,6 +66,7 @@ class FakeMini(health.Mini):
         self.claude_env: dict = {}
         self.answers: dict[str, bool] = {}  # route -> whether `claude -p` through it answers
         self.daemons_dir = Path("/nonexistent")
+        self.global_agents_dir = Path("/nonexistent")
         self.probe_memory: dict = {}
         self.fleet = True  # a fleet mini, not a personal Mac (--hygiene-only)
         # the tailscale_no_route restart's gates: an idle CI runner mini unless a test says otherwise
@@ -2972,6 +2973,10 @@ class ForeignRunnerTest(unittest.TestCase):
         (agents / "com.teamleaderleo.glaeda.cmux-runner.9.plist").write_bytes(plistlib.dumps(posing))
         mini = health.Mini(home)
         mini.daemons_dir = daemons
+        global_agents = home / "global-agents"
+        global_agents.mkdir()
+        mini.global_agents_dir = global_agents
+        plist(global_agents, "com.example.global-runner", [f"{old}/run.sh"])
         procs = [(1, 501, "S", f"{home}/actions-runner-glaeda-3/bin.2.338.0/Runner.Listener run"),
                  (2, 501, "S", f"{home}/actions-runner-glaeda-nightly-next/bin/Runner.Listener run"),
                  (3, 501, "S", f"{home}/actions-runner-glaeda/bin/Runner.Listener run"),
@@ -2983,12 +2988,13 @@ class ForeignRunnerTest(unittest.TestCase):
         self.assertEqual(ids, ["runner_unmanaged:actions-runner-glaedax", "runner_unmanaged:actions-runner-nightly-next",
                                "runner_unmanaged:actions.runner.manaflow-ai-cmux.mini.plist",
                                "runner_unmanaged:ai.manaflow.nightly-builder.runner.plist",
+                               "runner_unmanaged:com.example.global-runner.plist",
                                "runner_unmanaged:com.teamleaderleo.glaeda.cmux-runner.9.plist"])
         self.assertTrue(all(f["severity"] == "error" for f in found))
         with mock.patch.object(mini, "processes", return_value=procs[:3]):
             for p in [*agents.glob("ai.manaflow.*"), agents / "com.teamleaderleo.glaeda.cmux-runner.9.plist"]:
                 p.unlink()
-            for p in daemons.glob("*.plist"):
+            for p in [*daemons.glob("*.plist"), *global_agents.glob("*.plist")]:
                 p.unlink()
             self.assertEqual(health.check_foreign_runners(mini), [], "every runner glaeda's: no fault")
 
