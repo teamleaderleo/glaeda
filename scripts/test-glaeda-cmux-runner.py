@@ -8592,7 +8592,7 @@ class RunnerTest(unittest.TestCase):
 
     def test_an_uninstall_never_stops_or_deregisters_a_runner_with_a_job(self) -> None:
         for skip in (False, True):
-            ctx = mock.Mock(skip_launchctl=skip, headless=False)
+            ctx = mock.Mock(skip_launchctl=skip, headless=False, sandbox=True)
             actions = [{"kind": "agent", "state": "remove", "path": "/nonexistent.plist"},
                        {"kind": "deregister", "state": "remove", "name": "x"}]
             with mock.patch.object(cr, "listeners_frozen", return_value=contextlib.nullcontext(0)), \
@@ -8602,8 +8602,17 @@ class RunnerTest(unittest.TestCase):
             bootout.assert_not_called()
             config.assert_not_called()
             self.assertEqual([a["state"] for a in actions], ["failed", "failed"], skip)
+        # a plist this install does not own, still loaded in launchd (KeepAlive restarts it): no deregister
+        ctx = mock.Mock(skip_launchctl=False, headless=False, sandbox=False, label="x", uid=501)
+        actions = [{"kind": "agent", "state": "kept", "path": "/x.plist"}, {"kind": "deregister", "state": "remove"}]
+        with mock.patch.object(cr, "listeners_frozen", return_value=contextlib.nullcontext(0)), \
+                mock.patch.object(cr, "runner_busy", return_value=False), mock.patch.object(cr, "run", return_value=(0, "")), \
+                mock.patch.object(cr, "run_with_token") as config:
+            cr.apply_uninstall(ctx, actions)
+        config.assert_not_called()
+        self.assertEqual(actions[1]["state"], "failed")
         # a plist this install does not own (kept): a live listener refuses the deregister
-        ctx = mock.Mock(skip_launchctl=False, headless=False)
+        ctx = mock.Mock(skip_launchctl=False, headless=False, sandbox=True)
         actions = [{"kind": "agent", "state": "kept", "path": "/x.plist"}, {"kind": "deregister", "state": "remove"}]
         with mock.patch.object(cr, "listeners_frozen", return_value=contextlib.nullcontext(1)), \
                 mock.patch.object(cr, "runner_busy", return_value=False), mock.patch.object(cr, "run_with_token") as config:

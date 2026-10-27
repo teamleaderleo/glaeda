@@ -1812,6 +1812,16 @@ def verify(ctx: Context, act: dict[str, Any], wait: bool) -> None:
             "; the listener gate is holding it off while a fleet build has the host" if gate_holding(ctx) else "")
 
 
+def service_may_run(ctx: Context) -> bool:
+    """launchd may (re)start this runner's agent: it has the label loaded (KeepAlive restarts it between processes),
+    or print failed some other way. A sandbox HOME loads nothing."""
+    if getattr(ctx, "sandbox", False):
+        return False
+    domain = f"system/{ctx.label}" if ctx.headless else f"gui/{ctx.uid}/{ctx.label}"
+    return run([SUDO, LAUNCHCTL, "print", domain] if ctx.headless else [LAUNCHCTL, "print", domain])[0] \
+        != LAUNCHCTL_NOT_FOUND
+
+
 def apply_uninstall(ctx: Context, actions: list[dict[str, Any]]) -> None:
     # Nothing is removed under a job: the agent's bootout, the deregister and the directory each cancel one. One
     # frozen look decides for every step: with launchctl, the agent is booted out under it (and its own step then
@@ -1819,8 +1829,9 @@ def apply_uninstall(ctx: Context, actions: list[dict[str, Any]]) -> None:
     # still running refuses too, since deregistering under a live listener orphans it.
     removing = [act for act in actions if act["state"] == "remove"]
     agent = next((act for act in removing if act["kind"] == "agent"), None)
-    idle = not removing or stop_if_idle(ctx, (lambda: bootout(ctx)) if agent and not ctx.skip_launchctl
-                                        else (lambda: True), listener_ok=bool(agent) and not ctx.skip_launchctl)
+    booting_out = bool(agent) and not ctx.skip_launchctl
+    idle = not removing or ((booting_out or not service_may_run(ctx)) and stop_if_idle(
+        ctx, (lambda: bootout(ctx)) if booting_out else (lambda: True), listener_ok=booting_out))
     for act in actions:
         act["applied"] = False
         if act["state"] != "remove":
