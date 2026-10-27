@@ -7166,6 +7166,70 @@ class CaptureDedupeTest(unittest.TestCase):
         self.assertTrue(all(p.read_bytes() == d for p, d in frames.items()))
 
 
+class NightlyNextFallbackTest(unittest.TestCase):
+    """~/Library/Caches/cmux-nightly-next: the dedicated builder's tree is kept by role, a pool runner's goes once idle
+    NIGHTLY_NEXT_FALLBACK_IDLE_HOURS, and nothing changes until disk-policy names the routing label."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.home = Path(os.path.realpath(self.tmp.name))
+        self.saved = (gd.HOME, gd.FLEET_ROOT, gd.DARWIN)
+        gd.HOME, gd.FLEET_ROOT, gd.DARWIN = self.home, self.home / "shared-fleet", True
+        gd._DISCOVERED.clear()
+        self.root = self.home / "Library/Caches" / gd.NIGHTLY_NEXT_ROOT
+        for name in ("cmux9s-mac-mini-glaeda-2", "cmux9s-mac-mini-glaeda-5", "cmux14-glaeda",
+                     "cmux7s-mac-mini-nightly-next", "cmux7s-mac-mini-glaeda-nightly-next", "notes"):
+            (self.root / name / "caches").mkdir(parents=True)
+
+    def tearDown(self) -> None:
+        gd.HOME, gd.FLEET_ROOT, gd.DARWIN = self.saved
+        gd._DISCOVERED.clear()
+        self.tmp.cleanup()
+
+    def families(self, label: str | None) -> dict[str, gd.Family]:
+        policy = dict(gd.POLICY)
+        if label is not None:
+            policy["nightly_next_dedicated_label"] = label
+        with mock.patch.object(gd, "POLICY", policy):
+            return {f.id: f for f in gd.default_families()}
+
+    def test_inert_until_the_routing_label_is_set(self) -> None:
+        self.assertEqual(gd.POLICY_DEFAULTS["nightly_next_dedicated_label"], "")
+        for label in (None, "", "glaeda-trusted", "glaeda-trusted-next-nightly-x"):
+            fams = self.families(label)
+            self.assertNotIn(gd.NIGHTLY_NEXT_FAMILY, fams, label)
+            # as before: the whole root is one library-caches item
+            self.assertNotIn(gd.NIGHTLY_NEXT_ROOT, fams["library-caches"].skip, label)
+
+    def test_policy_file_turns_it_on(self) -> None:
+        policy = self.home / "disk-policy.json"
+        policy.write_text(json.dumps({"nightly_next_dedicated_label": gd.NIGHTLY_NEXT_DEDICATED_LABEL}))
+        self.assertEqual(gd.disk_policy(policy)["nightly_next_dedicated_label"], gd.NIGHTLY_NEXT_DEDICATED_LABEL)
+        policy.write_text(json.dumps({"nightly_next_dedicated_label": 1}))
+        self.assertEqual(gd.disk_policy(policy)["nightly_next_dedicated_label"], "")
+
+    def test_active_keeps_the_dedicated_builder_and_offers_pool_trees(self) -> None:
+        fams = self.families(gd.NIGHTLY_NEXT_DEDICATED_LABEL)
+        self.assertIn(gd.NIGHTLY_NEXT_ROOT, fams["library-caches"].skip)
+        fam = fams[gd.NIGHTLY_NEXT_FAMILY]
+        self.assertEqual(fam.root, self.root)
+        self.assertTrue(fam.reclaimable)
+        got = sorted(p.name for p in gd.candidates(fam))
+        self.assertEqual(got, ["cmux14-glaeda", "cmux9s-mac-mini-glaeda-2", "cmux9s-mac-mini-glaeda-5"])
+
+    def test_pool_tree_goes_after_its_own_idle_window(self) -> None:
+        fam = gd.nightly_next_family(self.root)
+        window = gd.NIGHTLY_NEXT_FALLBACK_IDLE_HOURS
+        self.assertEqual(gd.idle_window(fam, gd.DEFAULT_AGE_HOURS), window)
+        self.assertEqual(gd.idle_window(fam, 1.0), window)
+        quiet = [time.time() - 3600]  # not a hot-tier family: the job count never stretches its window
+        for mode in ("sweep", "pressure", None):
+            with mock.patch.object(gd, "ACTIVITY_MODE", mode), mock.patch.object(gd, "job_starts", return_value=quiet), \
+                    mock.patch.object(gd, "running_job_hours", return_value=0.5):
+                self.assertTrue(gd.item_due(fam, window + 0.5, window)[0], mode)
+                self.assertFalse(gd.item_due(fam, window - 0.5, window)[0], mode)
+
+
 class ActivityClockTest(unittest.TestCase):
     """The hot tier ages in host CI jobs since last use, not hours; thresholds come from disk-policy.json."""
 
