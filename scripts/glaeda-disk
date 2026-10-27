@@ -413,8 +413,10 @@ class Family:
     # Past this idle age the checkouts inside an item are mirrors (a GitHub clone, a laptop's synced tree)
     # and no git check keeps it; process, socket and job-marker checks still do.
     mirror_idle_hours: float | None = None
-    # mirror_idle_hours applies only to the items named with one of these prefixes (empty: every item)
+    # mirror_idle_hours applies only to the items named with one of these prefixes (empty: every item), never to one
+    # in mirror_exclude (a warm tree kept by role)
     mirror_include: tuple[str, ...] = ()
+    mirror_exclude: tuple[str, ...] = ()
     platform: str = "unknown"  # macos | linux | shared | unknown; reporting only, never deletion authority
 
 
@@ -3538,7 +3540,9 @@ CMUX_JOB_MIRROR_HOURS = DEFAULT_AGE_HOURS
 # archive_mirror bundles every unpushed commit and local-only ref into ~/archive first; uncommitted work, a process,
 # an open file, a lease or a running job's command line keeps the tree. Warm compile caches stay by role:
 # cmux-next-ci, cmux-nightly-next and the fleet's xcode/ tree are other families, and cmux-release-support (a release
-# builder's warm depot_tools, ghostty and cmux trees) is NEVER_DELETE.
+# builder's warm depot_tools, ghostty and cmux trees) is NEVER_DELETE. HYGIENE_MIRROR_KEEP names them again for
+# library-caches, so no split, skip list or flag change ever lets the rule reach one.
+HYGIENE_MIRROR_KEEP = (CMUX_NEXT_CI_ROOT, NIGHTLY_NEXT_ROOT, "cmux-release-support", "cmux-ci-media")
 
 
 def hygiene_mirror_host() -> bool:
@@ -3625,6 +3629,7 @@ def default_families(role: str = "fleet-mini") -> list[Family]:
                owner="tools (XDG cache)", rebuild_minutes=5, pressure_only=role == "devbox", platform=host_cache_platform()),
         Family("library-caches", HOME / "Library/Caches", True, "the app re-downloads or rebuilds it",
                mirror_idle_hours=CMUX_JOB_MIRROR_HOURS if mirror_host else None, mirror_include=("cmux",),
+               mirror_exclude=HYGIENE_MIRROR_KEEP,
                # glaeda: OTA candidates and LAN seed stages; PassKit: web service cookies; tidy-branches:
                # a deletion receipt; the rest are Apple daemons without the com.apple. prefix
                skip=("glaeda", "cmux-next-ci", "PassKit", "tidy-branches", "CloudKit", "GeoServices", "FamilyCircle",
@@ -4744,6 +4749,8 @@ def mirror_due(fam: Family, path: Path, idle_hours: float) -> bool:
     """A mirror family's item idle past its mirror age: it goes once archive_mirror has bundled what is unpushed."""
     return (fam.mirror_idle_hours is not None and idle_hours >= fam.mirror_idle_hours
             and (not fam.mirror_include or path.name.startswith(fam.mirror_include))
+            and path.name not in fam.mirror_exclude
+            and (not fam.mirror_include or path.is_dir())  # the hygiene rule takes trees, never a lone file
             and not derived_data(fam, path))
 
 
@@ -6078,11 +6085,49 @@ def mirror_repos(path: Path) -> tuple[str, dict[str, Path], list[Path]]:
     return "", gitdirs, sorted(trees)
 
 
+MOUNT_WALK_BUDGET = 2_000_000  # entries; a mirror too large to walk stays
+
+
+def mount_below(path: Path, budget: int = MOUNT_WALK_BUDGET) -> str:
+    """Why a mirror item must stay because remove() could reach another filesystem through it ("" when none can):
+    a directory below it on another device, or more than budget entries to look at. A directory it cannot read is
+    left to mirror_repos, which keeps the tree for it (an unreadable submodule store is a failed bundle, and alerts);
+    remove() cannot descend into it either."""
+    try:
+        dev = path.lstat().st_dev
+    except OSError as e:
+        return f"unreadable: {e.__class__.__name__}"
+    stack = [os.fspath(path)] if path.is_dir() and not path.is_symlink() else []
+    while stack:
+        try:
+            with os.scandir(stack.pop()) as it:
+                for e in it:
+                    budget -= 1
+                    if budget < 0:
+                        return "too large to rule out another filesystem mounted below it"
+                    if not e.is_dir(follow_symlinks=False):
+                        continue
+                    if e.stat(follow_symlinks=False).st_dev != dev:
+                        return f"another filesystem is mounted below it ({os.path.relpath(e.path, path)})"
+                    stack.append(e.path)
+        except OSError:
+            continue
+    return ""
+
+
+def mount_below_why(why: str) -> str:
+    """why when it is one of mount_below's answers (a tree kept for what is below it, not a failed bundle), else ""."""
+    return why if why.startswith(("another filesystem is mounted below it", "too large to rule out another",
+                                  "unreadable: ")) else ""
+
+
 def archive_mirror(path: Path) -> tuple[str, list[Path], tuple]:
     """Before a mirror item goes: bundle_unpushed for every repository mirror_repos finds. A tree with
     uncommitted work, or whose repositories cannot all be found or bundled, is kept.
     ("" or why it must stay, the bundles written, what mirror_moved rechecks)."""
     none: tuple = ([], [], [], {}, None)
+    if (why := mount_below(path)):  # a mirror is git_exempt, so git_state's nested-filesystem check never ran
+        return why, [], none
     why, gitdirs, trees = mirror_repos(path)
     if why:
         return why, [], none
@@ -8590,9 +8635,10 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
         elif mirror_due(fam, p, idle_now) and (bundled := archive_mirror(p))[0]:
             # never deleted without a verified bundle of what is unpushed; uncommitted work no bundle holds
             dirty = bundled[0].startswith("uncommitted: ")
-            outcome = "blocked:uncommitted" if dirty else "blocked:bundle-failed"
+            mounted = bundled[0] == mount_below_why(bundled[0])
+            outcome = "blocked:uncommitted" if dirty else "blocked:mount" if mounted else "blocked:bundle-failed"
             i.reasons.append(bundled[0])
-            if not dirty:
+            if not dirty and not mounted:
                 RUN.setdefault("bundle_failed", []).append(i.path)
                 print(f"glaeda-disk: ALERT: kept {i.path}: bundling its unpushed git work failed: {bundled[0]}",
                       file=sys.stderr)

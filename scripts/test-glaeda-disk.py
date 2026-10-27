@@ -8682,6 +8682,68 @@ class HygieneMirrorTest(unittest.TestCase):
         self.assertNotIn("cmux-release-support", items)  # NEVER_DELETE: a release builder's warm trees
         self.assertEqual(items["org.example.tool"].verdict, "git-checkout")
 
+    def test_warm_caches_kept_by_role_never_take_the_rule_even_unsplit(self) -> None:
+        """cmux-nightly-next is a library-caches item while its split is off: the rule must still pass it by, as it
+        does cmux-next-ci, cmux-release-support and cmux-ci-media."""
+        caches = gd.HOME / "Library/Caches"
+        for name in gd.HYGIENE_MIRROR_KEEP:
+            self.checkout(caches / name)
+        policy = {**gd.POLICY, "nightly_next_dedicated_label": ""}
+        with mock.patch.object(gd, "POLICY", policy):
+            fam = self.families()["library-caches"]
+            self.assertNotIn(gd.NIGHTLY_NEXT_ROOT, fam.skip)
+            items = self.survey(fam)
+        for name in gd.HYGIENE_MIRROR_KEEP:
+            self.assertFalse(gd.mirror_due(fam, caches / name, 999.0), name)
+            if name in items:
+                self.assertNotEqual(items[name].verdict, "reclaimable", (name, items[name].reasons))
+
+    def test_a_lone_file_never_takes_the_rule(self) -> None:
+        caches = gd.HOME / "Library/Caches"
+        caches.mkdir(parents=True)
+        (caches / "cmux-notes.txt").write_text("x")
+        fam = self.families()["library-caches"]
+        self.assertFalse(gd.mirror_due(fam, caches / "cmux-notes.txt", 999.0))
+
+    def test_another_filesystem_below_a_mirror_keeps_it(self) -> None:
+        tree = gd.FLEET_ROOT / "cache/split-spring-apps"
+        (tree / "apps/vol").mkdir(parents=True)
+        fam = self.families()["fleet-artifacts"]
+        self.assertEqual(gd.mount_below(tree), "")
+        self.assertIn("too large", gd.mount_below(tree, budget=1))
+        real_scandir = os.scandir
+
+        class Entry:  # a DirEntry whose directory sits on another device
+            def __init__(self, e):
+                self._e, self.name, self.path = e, e.name, e.path
+
+            def is_dir(self, follow_symlinks=True):
+                return self._e.is_dir(follow_symlinks=follow_symlinks)
+
+            def stat(self, follow_symlinks=True):
+                st = self._e.stat(follow_symlinks=follow_symlinks)
+                return os.stat_result((st.st_mode, st.st_ino, st.st_dev + 1, *tuple(st)[3:])) \
+                    if self.name == "vol" else st
+
+        @contextlib.contextmanager
+        def scandir(path):
+            with real_scandir(path) as it:
+                yield [Entry(e) for e in it]
+        with mock.patch.object(gd.os, "scandir", scandir):
+            self.assertEqual(gd.mount_below(tree), "another filesystem is mounted below it (apps/vol)")
+        t = time.time() - 26 * 3600
+        for d in (tree / "apps/vol", tree / "apps", tree):
+            os.utime(d, (t, t))
+        item = self.survey(fam)["split-spring-apps"]
+        self.assertEqual(item.verdict, "reclaimable", item.reasons)
+        receipt = self.home / "receipt.jsonl"
+        with mock.patch.object(gd, "mount_below", return_value="another filesystem is mounted below it (apps/vol)"), \
+                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()), \
+                mock.patch.object(gd, "process_evidence", return_value=([], "")):
+            gd.apply([item], {fam.id: fam}, receipt, None, 24)
+        self.assertTrue((tree / "apps/vol").is_dir())
+        self.assertIn("blocked:mount", receipt.read_text())
+
     def test_off_where_no_ci_runner_is_enrolled(self) -> None:
         (gd.HOME / "Library/Caches/cmux/cmux-cua").mkdir(parents=True)
         fams = self.families(runners=False)
