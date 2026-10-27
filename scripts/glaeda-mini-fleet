@@ -483,8 +483,20 @@ def loopback_only(options: str) -> bool:
     """True when the options field takes a key only from this host's own loopback: exactly one from= whose
     every pattern is 127.0.0.1 or ::1, with no negation or wildcard. Such a key lets in nobody who is not
     already running on the host."""
-    froms = re.findall(r'(?:^|,)from="([^"]*)"', options)
-    return len(froms) == 1 and bool(froms[0]) and set(froms[0].split(",")) <= LOOPBACK_SOURCES
+    tokens, current, quoted = [], "", False
+    for i, c in enumerate(options):  # split on commas outside quotes, as sshd does
+        if c == '"' and (i == 0 or options[i - 1] != "\\"):
+            quoted = not quoted
+        if c == "," and not quoted:
+            tokens.append(current)
+            current = ""
+        else:
+            current += c
+    tokens.append(current)
+    froms = [t.split("=", 1)[1] if "=" in t else "" for t in tokens if t.split("=", 1)[0].lower() == "from"]
+    if len(froms) != 1 or not (froms[0].startswith('"') and froms[0].endswith('"') and len(froms[0]) > 2):
+        return False
+    return set(froms[0][1:-1].split(",")) <= LOOPBACK_SOURCES
 
 
 def options_well_formed(options: str) -> bool:
@@ -1205,7 +1217,7 @@ def check_host(manifest: dict[str, Any], name: str, obs: dict[str, Any]) -> list
                 drift("ssh", f"key {known[k['fingerprint']]} lacks its declared options "
                              f"({'none' if not k['options'] else 'different ones'}); replace its line",
                       f"remove key {k['fingerprint']}, then add key {known[k['fingerprint']]}")
-            elif not want and k["options"] and k["options"] != loopback:
+            elif not want and k["options"] and (k["options"] != loopback or k["fingerprint"] in allowed):
                 drift("ssh", f"key {k['fingerprint'][7:19]} carries options; review them")
     for k in obs["authorized_keys"]:
         if k.get("file") != "authorized_keys":
