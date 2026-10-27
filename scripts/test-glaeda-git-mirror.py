@@ -160,6 +160,35 @@ class Mirror(unittest.TestCase):
         self.assertEqual(gm.healthy(self.mirror), "")
         self.assertTrue(guard.is_dir())
 
+    def test_a_failed_repair_keeps_the_mirror_marked_broken(self) -> None:
+        self.commit("two")
+        gm.run(True, home=self.home)
+        (self.mirror / "shallow.lock").rmdir()
+        tip = sh("git", "-C", os.fspath(self.mirror), "rev-parse", "main")
+        (self.mirror / "shallow").write_text(tip + "\n")
+        sh("git", "-C", os.fspath(self.mirror), "config", "remote.origin.promisor", "true")
+        # No bundle and no GitHub fallback: the repair fails, and the markers stay.
+        (self.bucket / f"v1/any/latest/{gm.BUNDLE_PREFIX}").unlink()
+        self.assertEqual(gm.run(True, home=self.home)["state"], "error")
+        self.assertEqual((self.mirror / "shallow").read_text(), tip + "\n")
+        self.assertEqual(gm.config_values(self.mirror, "remote.origin.promisor"), ["true"])
+        self.assertNotEqual(gm.healthy(self.mirror), "")
+
+    def test_the_github_fallback_unshallows_an_existing_mirror(self) -> None:
+        self.commit("two")
+        self.commit("three")
+        gm.run(True, home=self.home)
+        # Make it truly shallow: a fresh depth-1 copy in place of the full one.
+        sh("rm", "-rf", os.fspath(self.mirror))
+        sh("git", "clone", "-q", "--bare", "--depth=1", self.upstream.as_uri(), os.fspath(self.mirror))
+        self.assertEqual(gm.healthy(self.mirror), "shallow")
+        (self.bucket / f"v1/any/latest/{gm.BUNDLE_PREFIX}").unlink()
+        result = gm.run(True, home=self.home, from_github=True)
+        self.assertEqual(result["state"], "applied", result)
+        self.assertEqual(result["seeded"]["mode"], "repaired in place")
+        self.assertEqual(gm.healthy(self.mirror), "")
+        self.assertEqual(sh("git", "-C", os.fspath(self.mirror), "rev-list", "--count", "main"), "3")
+
     def test_no_bundle_never_clones_from_github_unless_asked(self) -> None:
         (self.bucket / f"v1/any/latest/{gm.BUNDLE_PREFIX}").unlink()
         result = gm.run(True, home=self.home)

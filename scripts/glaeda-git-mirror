@@ -170,9 +170,10 @@ def refspecs() -> list[str]:
 
 def fetch(mirror: Path, url: str, *, tries: int = FETCH_TRIES, timeout: float = FETCH_TIMEOUT,
           runner: Callable[[Sequence[str], float], tuple[int, str]] = run_group,
-          sleep: Callable[[float], None] = time.sleep) -> dict:
+          sleep: Callable[[float], None] = time.sleep, extra: Sequence[str] = ()) -> dict:
     """Fetch BRANCHES from `url` into `mirror`, bounded and retried; removes a failed try's partial pack."""
-    command = [GIT, *LOW_SPEED, "-C", os.fspath(mirror), "fetch", "--quiet", "--no-tags", "--prune", url, *refspecs()]
+    command = [GIT, *LOW_SPEED, "-C", os.fspath(mirror), "fetch", "--quiet", "--no-tags", "--prune", *extra, url,
+               *refspecs()]
     errors = []
     for attempt in range(1, tries + 1):
         started = time.monotonic()
@@ -249,6 +250,19 @@ def seed_from_bundle(staging: Path, work: Path, fetch_url: Callable[[str, Path, 
     raise RuntimeError(f"no archive for {key}: {last}")
 
 
+PARTIAL_KEYS = ("remote.origin.promisor", "remote.origin.partialclonefilter", "extensions.partialclone")
+
+
+def config_values(repo: Path, key: str) -> list[str]:
+    result = subprocess.run([GIT, "-C", os.fspath(repo), "config", "--get-all", key], capture_output=True, text=True,
+                            timeout=30)
+    return result.stdout.splitlines() if result.returncode == 0 else []
+
+
+def unset(repo: Path, key: str) -> None:
+    subprocess.run([GIT, "-C", os.fspath(repo), "config", "--unset-all", key], capture_output=True, timeout=30)
+
+
 def fill(repo: Path, work: Path, from_github: bool, fetch_url: Callable[[str, Path, float], None]) -> str:
     """Add the three branches' full history to `repo`: from the R2 bundle, else (operator flag) from GitHub."""
     try:
@@ -256,7 +270,12 @@ def fill(repo: Path, work: Path, from_github: bool, fetch_url: Callable[[str, Pa
     except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
         if not from_github:
             raise RuntimeError(f"R2 bundle: {type(error).__name__}: {str(error)[:200]}") from error
-        result = fetch(repo, REPO_URL)
+        # Into an existing broken mirror: every object again (--refetch ignores what it claims to have, so a
+        # partial mirror's missing blobs come too) and the history past a shallow boundary.
+        extra = ["--refetch"] if any((repo / "objects" / "pack").glob("*.pack")) else []
+        if (repo / "shallow").exists():
+            extra.append("--unshallow")
+        result = fetch(repo, REPO_URL, extra=extra, timeout=DOWNLOAD_TIMEOUT)
         if not result["ok"]:
             raise RuntimeError(f"R2 bundle: {type(error).__name__}; GitHub: {result['errors'][-1]}") from error
         return f"github (bundle: {type(error).__name__})"
@@ -300,16 +319,29 @@ def seed(mirror: Path, from_github: bool, fetch_url: Callable[[str, Path, float]
         guard = mirror / "shallow.lock"
         if guard.is_dir():
             guard.rmdir()
-        for key in ("remote.origin.promisor", "remote.origin.partialclonefilter"):
-            subprocess.run([GIT, "-C", os.fspath(mirror), "config", "--unset-all", key], capture_output=True, timeout=30)
-        configure_without_guard(mirror)
-        source = fill(mirror, work, from_github, fetch_url)
+        # What marks the mirror shallow or partial stays until the history is proven whole, and comes back if
+        # it is not, so healthy() keeps reporting it and the next pass tries again.
+        markers = {key: config_values(mirror, key) for key in PARTIAL_KEYS}
         shallow = mirror / "shallow"
-        if shallow.exists():
-            shallow.unlink()
-        subprocess.run([GIT, "-C", os.fspath(mirror), "config", "--unset-all", "extensions.partialclone"],
-                       capture_output=True, timeout=30)
-        verify(mirror)
+        shallow_text = shallow.read_text() if shallow.exists() else None
+        try:
+            # A filter or promisor left on would make every fetch partial again.
+            for key in ("remote.origin.promisor", "remote.origin.partialclonefilter"):
+                unset(mirror, key)
+            configure_without_guard(mirror)
+            source = fill(mirror, work, from_github, fetch_url)
+            if shallow.exists():
+                shallow.unlink()
+            unset(mirror, "extensions.partialclone")
+            verify(mirror)
+        except BaseException:
+            for key, values in markers.items():
+                unset(mirror, key)
+                for value in values:
+                    git(mirror, "config", "--add", key, value, timeout=30)
+            if shallow_text is not None and not shallow.exists():
+                shallow.write_text(shallow_text)
+            raise
         return {"source": source, "mode": "repaired in place", "seconds": round(time.monotonic() - started, 1)}
     finally:
         if mirror.is_dir() and not mirror.is_symlink():
