@@ -125,8 +125,26 @@ def held() -> tuple[int, ...]:
 
 
 def git(repo: Path, *args: str, timeout: float = FETCH_TIMEOUT) -> str:
-    return subprocess.run([GIT, "-C", os.fspath(repo), *args], check=True, capture_output=True, text=True,
-                          timeout=timeout, pass_fds=held()).stdout
+    """git's stdout; CalledProcessError on failure, TimeoutExpired past `timeout`. In its own recorded process
+    group like run_group, so a timeout or a stopped pass ends git's children (index-pack, pack-objects) too."""
+    command = [GIT, "-C", os.fspath(repo), *args]
+    process = subprocess.Popen(["/bin/sh", "-c", 'read -r go || exit 125; exec "$@" </dev/null', "sh", *command],
+                               start_new_session=True, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                               stderr=subprocess.PIPE, text=True, pass_fds=held())
+    try:
+        note_groups(own_group() + [process.pid])
+        out, err = process.communicate("go\n", timeout=timeout)
+    except BaseException as error:
+        with_suppressed(lambda: os.killpg(process.pid, signal.SIGKILL))
+        process.communicate()
+        if isinstance(error, subprocess.TimeoutExpired):
+            raise subprocess.TimeoutExpired(command, timeout) from None
+        raise
+    finally:
+        with_suppressed(lambda: note_groups(own_group()))
+    if process.returncode != 0:
+        raise subprocess.CalledProcessError(process.returncode, command, out, err)
+    return out
 
 
 def note_groups(groups: list[int]) -> None:

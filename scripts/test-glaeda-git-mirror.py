@@ -500,6 +500,20 @@ class Fetch(unittest.TestCase):
         with self.assertRaises(ProcessLookupError):
             os.killpg(started[0].pid, 0)
 
+    def test_a_git_timeout_ends_its_children(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            child = Path(temp) / "child.pid"
+            fake = Path(temp) / "git"  # stands in for git: a child (index-pack) that outlives it
+            fake.write_text(f"#!/bin/sh\nsleep 30 &\necho $! > {child}\nwait\n")
+            fake.chmod(0o755)
+            with mock.patch.object(gm, "GIT", os.fspath(fake)):
+                with self.assertRaises(subprocess.TimeoutExpired):
+                    gm.git(Path(temp), "bundle", "unbundle", "x", timeout=1)
+            pid = int(child.read_text())
+            time.sleep(0.2)
+            with self.assertRaises(ProcessLookupError):
+                os.kill(pid, 0)
+
     def test_run_group_kills_a_hung_command(self) -> None:
         status, why = gm.run_group(["sh", "-c", "sleep 30 & sleep 30"], timeout=1)
         self.assertEqual(status, 124)
