@@ -371,6 +371,8 @@ def pool_scope(manifest: Any, member: str) -> tuple[dict[str, str | None] | None
         return None, f"{member} runner.org must be an organization login"
     if group is not None and (org is None or not (isinstance(group, str) and re.fullmatch(GROUP_RE, group))):
         return None, f"{member} runner.group must be a runner group name and goes with runner.org"
+    if trusted is not None and not (isinstance(trusted, str) and re.fullmatch(REPO_RE, trusted)):
+        return None, f"{member} runner.trustedRepo must be owner/name"  # never fall back to the pools' scope
     own = (overrides.get("runner") or {}) if isinstance(overrides.get("runner"), dict) else {}
     if isinstance(trusted, str) and re.fullmatch(REPO_RE, trusted) and "org" not in own:
         return {"repo": trusted}, None  # the defaults' org is for the pools; the host's own org says otherwise

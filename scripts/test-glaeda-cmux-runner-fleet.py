@@ -115,6 +115,13 @@ elif path.startswith("orgs/") and path.endswith("registration-token") and os.env
 else:
     print("{token}")
 """
+def load_labels_module():
+    spec = importlib.util.spec_from_file_location("glaeda_fleet_labels_t", ROOT / "scripts" / "glaeda_fleet_labels.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 GROUP = json.dumps([{"id": 7, "name": "glaeda-minis", "visibility": "selected", "allows_public_repositories": True}])
 
 
@@ -323,6 +330,12 @@ class FleetTest(unittest.TestCase):
         bad = self.fleet("--apply", "--hosts", "mini-a", FAKE_GROUPS=GROUP)
         self.assertIn("bad runner scope", json.loads(bad.stdout)["members"][0]["action"])
         self.assertFalse(any(c["tool"] == "ssh" and "--apply" in c["remote"] for c in self.calls()))
+        # a malformed trustedRepo never falls back to the pools' org scope
+        labels = load_labels_module()
+        manifest["hosts"]["mini-a"]["overrides"] = {"runner": {"trustedRepo": "no-slash"}}
+        scope, why = labels.pool_scope(manifest, "mini-a")
+        self.assertIsNone(scope)
+        self.assertIn("trustedRepo", why)
 
     def test_without_a_manifest_scope_the_default_repository_is_used(self) -> None:
         result = self.fleet("--apply", "--hosts", "mini-a")
