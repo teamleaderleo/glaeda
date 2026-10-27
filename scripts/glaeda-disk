@@ -2157,41 +2157,51 @@ def unpushed_commit(git, heads: list[str]) -> bool:
 
 
 def submodule_git_veto(dotgit: Path, env: dict[str, str]) -> str:
-    """runner_checkout_git_veto's commit rule for each submodule git dir under .git/modules (nested ones too), and
-    for a submodule whose .git is its own directory inside the work tree: a HEAD, branch, tag or stash there that is
-    on none of its remote-tracking refs keeps the checkout. A git dir that cannot be read is doubt, and keeps it."""
+    """runner_checkout_git_veto's commit rule for every other git dir inside .git: submodule stores under modules/
+    (nested ones too) and under a linked worktree's worktrees/<name>/modules. A HEAD, a linked worktree's HEAD, a
+    branch, a tag origin lacks or the stash there on none of its remote-tracking refs keeps the checkout. Their locks
+    and operations are already in runner_checkout_git_veto's walk of .git. A submodule whose repository is embedded
+    in the work tree (its own .git directory, not absorbed into .git/modules) keeps the checkout outright, and so
+    does any doubt: a git dir that cannot be read or a .gitmodules git cannot parse."""
     def unreadable(error: OSError) -> None:
         raise error
 
-    gitdirs: list[tuple[str, Path]] = []
+    gitdirs: list[Path] = []
     try:
-        if (dotgit / "modules").is_symlink():
-            return "git could not say whether a submodule commit is only here"
-        if (dotgit / "modules").is_dir():
-            for root, dirs, files in os.walk(dotgit / "modules", onerror=unreadable):
-                if "HEAD" in files and "objects" in dirs:
-                    gitdirs.append((Path(root).name, Path(root)))
-                    dirs[:] = [d for d in dirs if d == "modules"]  # a git dir's own modules/ holds nested ones
+        for root, dirs, files in os.walk(dotgit, onerror=unreadable):
+            here = Path(root)
+            if here != dotgit and "HEAD" in files and "objects" in dirs:
+                gitdirs.append(here)
+            dirs[:] = [d for d in dirs if d not in ("objects", "lfs", "logs", "refs") and not (here / d).is_symlink()]
     except OSError:
         return "git could not say whether a submodule commit is only here"
     tree = dotgit.parent
-    with contextlib.suppress(OSError, ValueError, subprocess.SubprocessError):
-        out = subprocess.run(["git", "-C", os.fspath(tree), "config", "--file", ".gitmodules", "--get-regexp",
-                              r"^submodule\..*\.path$"], capture_output=True, text=True, timeout=30, env=env).stdout
-        for line in out.splitlines():
+    if (tree / ".gitmodules").exists():
+        try:
+            listed = subprocess.run(["git", "config", "--file", os.fspath(tree / ".gitmodules"), "--get-regexp",
+                                     r"^submodule\..*\.path$"], capture_output=True, text=True, timeout=30, env=env)
+        except (OSError, subprocess.SubprocessError):
+            return "git could not read .gitmodules"
+        if listed.returncode not in (0, 1):  # 1: no submodule paths
+            return "git could not read .gitmodules"
+        for line in listed.stdout.splitlines():
             embedded = tree / line.split(" ", 1)[-1] / ".git"
-            if embedded.is_dir() and not embedded.is_symlink() and contained_directory(embedded, tree):
-                gitdirs.append((embedded.parent.name, embedded))
-    for name, gitdir in gitdirs:
+            if embedded.is_dir() or embedded.is_symlink():
+                return f"submodule {line.split(' ', 1)[-1]} keeps its own repository in the work tree"
+    for gitdir in gitdirs:
+        name = os.fspath(gitdir.relative_to(dotgit))
+
         def git(*args: str, timeout: int = 120, gitdir: Path = gitdir) -> str:
             return subprocess.run(["git", "--git-dir", os.fspath(gitdir), *args], capture_output=True, text=True,
                                   timeout=timeout, env=env, check=True).stdout
         try:
-            local = unpushed_commit(git, [])
-        except (OSError, subprocess.SubprocessError, ValueError):
-            return f"git could not say whether a commit in submodule {name} is only here"
+            heads = [ln.split(" ", 1)[1] for ln in git("worktree", "list", "--porcelain").splitlines()
+                     if ln.startswith("HEAD ")]
+            local = unpushed_commit(git, heads)
+        except (OSError, subprocess.SubprocessError, ValueError, IndexError):
+            return f"git could not say whether a commit in {name} is only here"
         if local:
-            return f"a commit in submodule {name} is on no remote-tracking ref"
+            return f"a commit in {name} is on no remote-tracking ref"
     return ""
 
 
@@ -2227,19 +2237,17 @@ def git_pack_bytes(gitdir: Path) -> int | None:
     return total
 
 
-def checkout_origin(checkout: Path) -> str:
-    """The checkout's remote.origin.url, read from .git/config without git, or its directory name when it has none:
-    the repository it is a checkout of, so two repositories that share a name are never siblings."""
-    section = ""
-    with contextlib.suppress(OSError, UnicodeDecodeError):
-        for line in (checkout / ".git/config").read_text().splitlines():
-            line = line.strip()
-            if line.startswith("["):
-                section = line
-            elif section.replace(" ", "") in ('[remote"origin"]',) and line.split("=", 1)[0].strip() == "url":
-                url = line.split("=", 1)[1].strip().removesuffix(".git").rstrip("/")
-                return re.sub(r"^(?:https?://|ssh://)?(?:[^@/]+@)?", "", url).replace(":", "/", 1).lower()
-    return f"name:{checkout.name}"
+def checkout_origin(checkout: Path) -> str | None:
+    """The repository a checkout is of: its remote.origin.url as git reads it, normalized so https and ssh spellings
+    match. None when git cannot say; such a checkout is never anyone's sibling."""
+    try:
+        out = subprocess.run(["git", "config", "--file", os.fspath(checkout / ".git/config"), "--get",
+                              "remote.origin.url"], capture_output=True, text=True, timeout=30, check=True,
+                             env={k: v for k, v in os.environ.items() if not k.startswith("GIT_")}).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return None
+    url = out.removesuffix("/").removesuffix(".git")
+    return re.sub(r"^(?:https?://|ssh://)?(?:[^@/]+@)?", "", url).replace(":", "/", 1).lower() or None
 
 
 def bloated_runner_checkouts(checkouts: list[Path]) -> dict[str, int]:
@@ -2253,7 +2261,7 @@ def bloated_runner_checkouts(checkouts: list[Path]) -> dict[str, int]:
     unknown = {r for r, b in sizes.values() if b is None}  # a size that cannot be read could skew the median
     out = {}
     for path, (repo, size) in sizes.items():
-        if repo in unknown:
+        if repo is None or repo in unknown:
             continue
         others = sorted(b for p, (r, b) in sizes.items() if r == repo and p != path)
         if not others or size <= RUNNER_CHECKOUT_BLOAT_MIN_GIB * GIB:

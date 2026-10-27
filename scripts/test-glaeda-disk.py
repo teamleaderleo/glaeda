@@ -4744,6 +4744,10 @@ class GlaedaDiskTest(unittest.TestCase):
         pack.mkdir(parents=True, exist_ok=True)
         with (pack / "pack-0000.pack").open("wb") as f:
             f.truncate(int(gib * gd.GIB))
+        config = co / ".git/config"
+        if "url" not in (config.read_text() if config.exists() else ""):  # the repository it is a checkout of
+            with config.open("a") as f:
+                f.write(f'[remote "origin"]\n\turl = https://github.com/manaflow-ai/{co.name}.git\n')
 
     def test_a_bloated_runner_checkout_goes_once_quiet_at_any_free_space(self) -> None:
         """2026-10-27: one runner per mini held a 6.8 GiB full-history checkout with 22k remote refs while its
@@ -4833,14 +4837,31 @@ class GlaedaDiskTest(unittest.TestCase):
         self.assertEqual(gd.runner_checkout_git_veto(co), "")
         nested = co / ".git/modules/ghostty/modules/nested"
         git(nested, "--work-tree", os.fspath(self.root), "commit", "-q", "--allow-empty", "-m", "only here")
-        self.assertEqual(gd.runner_checkout_git_veto(co), "a commit in submodule nested is on no remote-tracking ref")
+        self.assertEqual(gd.runner_checkout_git_veto(co), "a commit in modules/ghostty/modules/nested is on no remote-tracking ref")
         git(nested, "update-ref", "refs/remotes/origin/main", "HEAD")
         embedded = co / "vendor/lib"
         embedded.mkdir(parents=True)
         (co / ".gitmodules").write_text('[submodule "lib"]\n\tpath = vendor/lib\n\turl = https://x/lib\n')
         git(embedded, "init", "-q")
         git(embedded, "commit", "-q", "--allow-empty", "-m", "embedded, on no remote")
-        self.assertEqual(gd.runner_checkout_git_veto(co), "a commit in submodule lib is on no remote-tracking ref")
+        self.assertEqual(gd.runner_checkout_git_veto(co), "submodule vendor/lib keeps its own repository in the work tree")
+        shutil.rmtree(embedded / ".git")
+        (co / ".gitmodules").write_text("[submodule \"lib\"\n\tpath")  # git cannot parse it: doubt keeps it
+        self.assertEqual(gd.runner_checkout_git_veto(co), "git could not read .gitmodules")
+        (co / ".gitmodules").unlink()
+        self.assertEqual(gd.runner_checkout_git_veto(co), "")
+        # a linked worktree's submodule store, and a detached HEAD in a submodule's own linked worktree
+        store = co / ".git/worktrees/wt/modules/sub"
+        store.parent.mkdir(parents=True)
+        git(store.parent, "init", "-q", "--bare", "sub")
+        git(store, "--work-tree", os.fspath(self.root), "commit", "-q", "--allow-empty", "-m", "only here")
+        self.assertEqual(gd.runner_checkout_git_veto(co), "a commit in worktrees/wt/modules/sub is on no remote-tracking ref")
+        shutil.rmtree(co / ".git/worktrees")
+        ghostty = co / ".git/modules/ghostty"
+        wt = self.root / "ghostty-wt"
+        git(ghostty, "worktree", "add", "-q", "--detach", os.fspath(wt), "refs/remotes/origin/main")
+        git(wt, "commit", "-q", "--allow-empty", "-m", "only in the submodule's worktree")
+        self.assertEqual(gd.runner_checkout_git_veto(co), "a commit in modules/ghostty is on no remote-tracking ref")
 
     def test_a_tag_origin_has_at_the_same_object_is_not_only_here(self) -> None:
         """A full-history fetch brings origin's tags of commits on no branch (cmux-rbh-src-*): they keep nothing.
@@ -4885,11 +4906,16 @@ class GlaedaDiskTest(unittest.TestCase):
             self._packs(co, size)
             (co / ".git/config").write_text(f'[core]\n\tbare = false\n[remote "origin"]\n\turl = {url}\n')
             cos.append(co)
+        (cos[3] / ".git/config").write_text('[Remote "origin"]\n\tURL = https://github.com/b/foo\n')  # git's own spelling
         # a/foo over https and ssh is one repository; b/foo's checkouts are not its siblings
         self.assertEqual(gd.checkout_origin(cos[0]), gd.checkout_origin(cos[1]))
         self.assertNotEqual(gd.checkout_origin(cos[0]), gd.checkout_origin(cos[2]))
         self.assertEqual(set(gd.bloated_runner_checkouts(cos)), {str(cos[0])})
         self.assertEqual(set(gd.bloated_runner_checkouts([cos[0], cos[2], cos[3]])), set(), "no a/foo sibling")
+        self.assertEqual(gd.checkout_origin(cos[3]), "github.com/b/foo")
+        (cos[2] / ".git/config").write_text("[core]\n")  # no origin: never a sibling, never bloated
+        self.assertIsNone(gd.checkout_origin(cos[2]))
+        self.assertEqual(set(gd.bloated_runner_checkouts([cos[0], cos[2]])), set())
         shutil.rmtree(cos[1] / ".git/objects/pack")  # a sibling whose packs cannot be read
         self.assertIsNone(gd.git_pack_bytes(cos[1] / ".git"))
         self.assertEqual(gd.bloated_runner_checkouts(cos), {})
