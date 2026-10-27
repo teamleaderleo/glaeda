@@ -4126,7 +4126,7 @@ def dedicated_admission(script: Path) -> tuple[bool, str]:
     It holds nothing of glaeda's (no host lock, capacity or root), so the runners beside it never wait for it."""
     try:
         code = subprocess.run([os.fspath(script)], stdin=subprocess.DEVNULL, timeout=DEDICATED_ADMIT_TIMEOUT_S,
-                              check=False).returncode
+                              cwd=JOB_CWD, check=False).returncode
     except (OSError, subprocess.TimeoutExpired) as error:
         return False, f"the dedicated runner's admission {script.name} could not run ({type(error).__name__})"
     if code != 0:
@@ -7221,6 +7221,8 @@ def disk_pressure_detached(explicit: str | None, timeout: float = BACKGROUND_DIS
     if child == 0:  # detach twice so the runner never waits on the pass
         try:
             os.setsid()
+            with contextlib.suppress(OSError):  # never keep the job's workspace (a runner checkout) as its cwd
+                os.chdir("/")
             # the middle process exits only once the pass has exec'd (the close-on-exec end reads EOF), so when the
             # hook returns no process of this job's environment, RUNNER_TRACKING_ID included, is left to clean up
             execd, execing = os.pipe()  # both close-on-exec
@@ -7244,6 +7246,30 @@ def disk_pressure_detached(explicit: str | None, timeout: float = BACKGROUND_DIS
     with contextlib.suppress(OSError):
         os.waitpid(child, 0)
     return f"glaeda-disk started in the background (bounded by {timeout:g} s)"
+
+
+JOB_CWD: Path | None = None  # the job's working directory the runner started the hook in (leave_job_workspace)
+
+
+def leave_job_workspace(args: argparse.Namespace) -> None:
+    """Move the hook off the job's working directory (the runner starts it in the workspace, the runner checkout):
+    while any process of ours has its cwd there, glaeda-disk's at-start and idle checkout evictions read the checkout
+    as in use (cmux8s-mac-mini, 2026-10-27: the hook, pid 6069, and the detached pass it forked kept
+    actions-runner-glaeda-11's 5.9 GiB .git). The path arguments are made absolute first; the dedicated runner's
+    admission still runs in the job's directory (JOB_CWD)."""
+    global JOB_CWD
+    try:
+        JOB_CWD = Path(os.getcwd())
+    except OSError:
+        JOB_CWD = None
+    for name in ("disk", "runner_dir", "dedicated_admit", "job_log", "capacity_dir", "state_dir", "host_lock",
+                 "reservation"):
+        value = getattr(args, name, None)
+        if value is not None:
+            absolute = os.path.abspath(os.fspath(value))
+            setattr(args, name, absolute if isinstance(value, str) else Path(absolute))
+    with contextlib.suppress(OSError):
+        os.chdir("/")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -7345,6 +7371,9 @@ def main(argv: list[str] | None = None) -> int:
     admit_floor = admit_floor_gib(args.min_free_gib, args.gui_runner or args.session_runner)
     # the runner LaunchAgent's environment can switch sampling off fleet-wide without a reinstall
     telemetry = not args.no_telemetry and os.environ.get("GLAEDA_RUNNER_TELEMETRY", "1") != "0"
+
+    if args.phase in ("job-started", "job-completed"):
+        leave_job_workspace(args)
 
     owner: JobOwner | None = None
     if args.phase == "job-started":

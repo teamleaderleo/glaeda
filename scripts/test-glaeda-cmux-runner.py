@@ -8,6 +8,7 @@ reaches an argv, a file, or the output.
 
 from __future__ import annotations
 
+import argparse
 import contextlib
 import copy
 import fcntl
@@ -4950,6 +4951,53 @@ class DiskPassCoalesceTest(unittest.TestCase):
         time.sleep(0.5)
         self.assertEqual(self.run_count(), 0)
         self.assertEqual(self.logged()[-1], hook.HOOK_SKIP_ABOVE_TARGET)
+
+    def test_the_detached_pass_never_keeps_the_job_workspace_as_its_cwd(self) -> None:
+        """cmux8s-mac-mini, 2026-10-27: the pass forked from job-completed kept the runner checkout it started in as
+        its cwd, so glaeda-disk's checkout evictions read that checkout as in use."""
+        cwd_file = self.dir / "pass-cwd"
+        disk = make_executable(self.dir / "glaeda-disk", "import os, pathlib\n"
+                               f"pathlib.Path({os.fspath(cwd_file)!r}).write_text(os.getcwd())\n")
+        self.write_target(10**9)
+        workspace = self.dir / "actions-runner-glaeda-11/_work/cmux/cmux"
+        workspace.mkdir(parents=True)
+        before = os.getcwd()
+        os.chdir(workspace)
+        try:
+            self.assertIn("started in the background", hook.disk_pressure_detached(os.fspath(disk)))
+        finally:
+            os.chdir(before)
+        deadline = time.monotonic() + 20
+        while not cwd_file.exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        self.assertEqual(cwd_file.read_text(), "/")
+
+    def test_the_hook_leaves_the_job_workspace_with_absolute_paths(self) -> None:
+        workspace = self.dir / "actions-runner-glaeda-11/_work/cmux/cmux"
+        workspace.mkdir(parents=True)
+        before = os.getcwd()
+        os.chdir(workspace)
+        try:
+            args = argparse.Namespace(disk="bin/glaeda-disk", runner_dir=None, dedicated_admit=Path("admit.sh"),
+                                      job_log=Path("/abs/jobs.jsonl"), capacity_dir=Path("cap"), state_dir=None,
+                                      host_lock="host.lock", reservation="/r.json")
+            hook.leave_job_workspace(args)
+            self.assertEqual(os.getcwd(), "/")
+            real = os.path.realpath(workspace)
+            self.assertEqual(os.path.realpath(hook.JOB_CWD), real)
+            self.assertEqual(os.path.realpath(os.path.dirname(args.disk)), os.path.join(real, "bin"))
+            self.assertEqual(os.path.realpath(args.dedicated_admit), os.path.join(real, "admit.sh"))
+            self.assertIsInstance(args.dedicated_admit, Path)
+            self.assertIsInstance(args.disk, str)
+            self.assertEqual(args.job_log, Path("/abs/jobs.jsonl"))
+            self.assertEqual(os.path.realpath(args.host_lock), os.path.join(real, "host.lock"))
+            # the dedicated runner's admission still runs in the job's directory
+            script = make_executable(workspace / "admit.sh", f"#!{sys.executable}\nimport os, sys\n"
+                                     f"sys.exit(0 if os.path.realpath(os.getcwd()) == {real!r} else 7)\n")
+            self.assertTrue(hook.dedicated_admission(script)[0])
+        finally:
+            hook.JOB_CWD = None
+            os.chdir(before)
 
     def test_triggers_while_a_pass_runs_are_coalesced_not_dropped(self) -> None:
         disk = self.fake_disk()
