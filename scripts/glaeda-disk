@@ -777,7 +777,8 @@ CMUX_NEXT_CI_DEDUPE_DIR_NAMES = frozenset({"Products"})
 # "and how can <100gb be free on >256gb minis all the time"). Once the build routes to one dedicated builder
 # (cmux vars.CI_NIGHTLY_NEXT_DEDICATED_LABEL, cmux#26048; Leo: "what if we just dedicatd one, only, always, and
 # it just incrementally... did the thing? clear its stuff, etc"), that builder's tree is kept by role and every
-# pool runner's tree is its own fallback item that goes once idle NIGHTLY_NEXT_FALLBACK_IDLE_HOURS. The build still
+# pool runner's tree is its own fallback item that goes once idle DEFAULT_AGE_HOURS (read when the family is built,
+# so a reserved host's keep_legacy_ages applies). The build still
 # falls back to an idle pool mini when the builder is busy (cmux scripts/ci/nightly_build_runner.py: dedicated,
 # then owned, then Blacksmith), so a recently used fallback stays warm under the normal age; one no overflow used
 # for that long is not worth the disk (a cold Blacksmith Release build took a median 620 s against 830 s on a warm
@@ -788,7 +789,6 @@ CMUX_NEXT_CI_DEDUPE_DIR_NAMES = frozenset({"Products"})
 NIGHTLY_NEXT_ROOT = "cmux-nightly-next"
 NIGHTLY_NEXT_FAMILY = "cmux-nightly-next-fallback"
 NIGHTLY_NEXT_DEDICATED_LABEL = "glaeda-trusted-next-nightly"  # cmux pr_runner_pool.NIGHTLY_DEDICATED_LABEL
-NIGHTLY_NEXT_FALLBACK_IDLE_HOURS = DEFAULT_AGE_HOURS
 # the dedicated builder's runner: <member>-nightly-next (hand-made) or <member>-glaeda-nightly-next (glaeda#1648)
 NIGHTLY_NEXT_DEDICATED_RUNNER = re.compile(r"[A-Za-z0-9._-]+-nightly-next")
 # a pool runner's tree (cmux nightly_build_state.owned: <member>-glaeda[-K]); anything else in the root stays
@@ -2897,6 +2897,9 @@ def runner_cache_families() -> list[Family]:
     ]
     if (HOME / "Library/Caches" / CMUX_NEXT_CI_ROOT).is_dir():
         roots.append(replace(cmux_next_ci_family(), min_idle_hours=RUNNER_CACHE_IDLE_HOURS))
+    if nightly_next_dedicated():
+        roots.append(replace(nightly_next_family(), min_idle_hours=RUNNER_CACHE_IDLE_HOURS,
+                             max_idle_hours=RUNNER_CACHE_IDLE_HOURS))
     return [f for f in roots if f.root.is_dir()]
 
 
@@ -7804,9 +7807,10 @@ def nightly_next_dedicated() -> bool:
 def nightly_next_family(root: Path | None = None) -> Family:
     """Pool runners' cmux-nightly-next trees, each its own item; the dedicated builder's tree is never one."""
     root = (HOME / "Library/Caches" / NIGHTLY_NEXT_ROOT) if root is None else root
+    window = DEFAULT_AGE_HOURS  # a module global keep_legacy_ages may have raised for this run
     return Family(NIGHTLY_NEXT_FAMILY, root, True,
                   "a fallback nightly-next build on this runner starts cold (the dedicated builder keeps its own)",
-                  min_idle_hours=NIGHTLY_NEXT_FALLBACK_IDLE_HOURS, max_idle_hours=NIGHTLY_NEXT_FALLBACK_IDLE_HOURS,
+                  min_idle_hours=window, max_idle_hours=window,
                   owner="cmux nightly_build_state.py, per runner", rebuild_minutes=4, platform="macos")
 
 
