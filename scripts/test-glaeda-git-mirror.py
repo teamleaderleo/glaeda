@@ -41,6 +41,8 @@ class Mirror(unittest.TestCase):
         self.home = root / "home"
         (self.home / "actions-runner-glaeda").mkdir(parents=True)
         (self.home / "actions-runner-glaeda/.runner").write_text("{}")
+        (self.home / gm.SOURCE_CONFIG).parent.mkdir(parents=True)
+        (self.home / gm.SOURCE_CONFIG).write_text('{"schema": 1, "source": "direct"}')
         # The "GitHub" repository: three branches.
         self.upstream = root / "upstream"
         self.upstream.mkdir()
@@ -159,6 +161,13 @@ class Mirror(unittest.TestCase):
         self.assertEqual(result["state"], "applied", result)
         self.assertEqual(gm.healthy(self.mirror), "")
         self.assertTrue(guard.is_dir())
+
+    def test_nothing_happens_without_a_configured_source(self) -> None:
+        (self.home / gm.SOURCE_CONFIG).unlink()
+        result = gm.run(True, home=self.home)
+        self.assertEqual(result["state"], "skipped")
+        self.assertFalse(self.mirror.exists())
+        self.assertEqual(self.downloads, [])
 
     def test_every_partial_marker_and_every_branch_counts(self) -> None:
         gm.run(True, home=self.home)

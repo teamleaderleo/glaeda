@@ -32,8 +32,8 @@ fetch from GitHub never happens during a build.
   may borrow its objects through objects/info/alternates. A reseed replaces a broken mirror; a
   borrower that then misses an object is reset by the runner hook.
 
-It runs only where a GitHub Actions runner is installed (~/actions-runner*/.runner) and is a no-op
-anywhere else. One pass at a time (flock on GIT_DIR/.lock). It needs no credential: the repository and
+It runs only where a GitHub Actions runner is installed (~/actions-runner*/.runner) and a mirror
+source is configured (SOURCE_CONFIG), and is a no-op anywhere else. One pass at a time (flock on GIT_DIR/.lock). It needs no credential: the repository and
 the bucket are public. Prints one JSON line; the last pass's record is GIT_DIR/cmux.json.
 """
 
@@ -80,6 +80,11 @@ SEED_MIN_FREE = 12 * 1024**3
 # Each pass's fetch writes a small pack. gc --auto would fold them with a full repack inside the bounded
 # fetch (2.2 GiB), so it is off and the pass folds them geometrically once PACK_LIMIT is passed.
 PACK_LIMIT = 24
+# Which hosts keep a mirror, and from where, is the fleet's call, not each host's: `direct` (GitHub and
+# the bucket) is the only source so far. Without it the tool does nothing, so a release never starts
+# every mini at a site seeding 2 GB over one shared uplink at once (2026-10-27: 0.4-0.9 MB/s a mini).
+SOURCE_CONFIG = ".config/glaeda/lan-cache/config.json"
+SOURCES = ("direct",)
 REPACK_TIMEOUT = 1200
 CONFIG = {
     "core.bare": "true",
@@ -396,11 +401,26 @@ def lock(path: Path, wait: float) -> int | None:
             time.sleep(1)
 
 
+def source(home: Path | None = None) -> str:
+    """Where this host's mirror comes from (SOURCE_CONFIG `source`), or '' when it has none configured."""
+    home = Path.home() if home is None else home
+    try:
+        raw = json.loads((home / SOURCE_CONFIG).read_text())
+    except (OSError, ValueError):
+        return ""
+    if not isinstance(raw, dict) or raw.get("schema") != 1 or raw.get("source") not in SOURCES:
+        return ""
+    return raw["source"]
+
+
 def run(apply: bool, *, wait: bool = False, from_github: bool = False, home: Path | None = None) -> dict:
     record: dict = {"time": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
                     "mirror": os.fspath(MIRROR)}
     if not runner_installed(home):
         return {**record, "state": "skipped", "reason": "no GitHub Actions runner on this host"}
+    record["source"] = source(home)
+    if not record["source"]:
+        return {**record, "state": "skipped", "reason": f"no mirror source in ~/{SOURCE_CONFIG}"}
     problem = healthy(MIRROR)
     if not apply:
         return {**record, "state": "plan", "health": problem or "ok",
