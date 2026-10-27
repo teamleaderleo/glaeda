@@ -142,7 +142,98 @@ DISK_TIMEOUT_S = 120  # a pass a hook or the gate waits on or reaps
 BACKGROUND_DISK_TIMEOUT_S = 15 * 60
 BACKGROUND_DISK_TIMEOUT_MAX_S = 6 * 3600  # an override above this is cut to it, so the bound's lifetime stays finite
 BACKGROUND_DISK_TIMEOUT_ENV = "GLAEDA_RUNNER_BACKGROUND_DISK_TIMEOUT"  # GLAEDA_RUNNER_DISK_TIMEOUT bounds the others
-EVICT_TIMEOUT_S = 60  # job-started waits at most this long for an eviction under the disk floor
+# job-started waits at most this long for an eviction under the disk floor. At 60 s it only ever waited out part of
+# the queued pass job-completed starts (hook passes took 125-534 s on 2026-10-26, median about 250 s), and its own
+# pass then skipped as busy because the queue's next pass took evict.lock first: on cmuxs-mac-mini-6 at 05:18Z a
+# nightly build-nightly-app was refused at 23.8 GiB ("waited 60 s for a running glaeda-disk pass; glaeda-disk exited 0,
+# freed -1.0 GiB") while the pass in flight freed 16.2 GiB 100 s later. evict() now waits for running passes and
+# retries its own while it skips as busy, within this budget.
+EVICT_TIMEOUT_S = 300
+EVICT_BUSY_PAUSE_S = 2.0  # between a pass of evict()'s own that skipped as busy and its next look
+# The free disk a job is refused under, after eviction: the measured disk growth of one CMUX job, rounded up (p99
+# 10.8 GiB, max 18.7 GiB). The runner floor (--min-free-gib, the manifest's disk.min_free_gib, 30 GiB since HQ #967, a
+# judgement rather than a measurement) still decides when to evict, the pre-job target and when the gate stops
+# listening; it no longer refuses a job that fits. A runner that takes cmux's tours keeps the tour floor
+# (runner_floor_gib), which cmux measured for those jobs. glaeda-cmux-job/v1 completed lines record disk_free_start_gib,
+# disk_free_end_gib (#1650) and disk_free_min_gib, so this can be resized from build-nightly-app's own peak.
+DISK_JOB_PEAK_GIB = 20.0
+DISK_JOB_PEAK_ENV = "GLAEDA_RUNNER_JOB_DISK_GIB"  # the runner's own environment may set another, 0 to 10000 GiB
+
+
+def job_disk_gib() -> float:
+    """DISK_JOB_PEAK_GIB, or DISK_JOB_PEAK_ENV when it is a finite number from 0 to 10000."""
+    try:
+        value = float(os.environ.get(DISK_JOB_PEAK_ENV) or DISK_JOB_PEAK_GIB)
+    except ValueError:
+        return DISK_JOB_PEAK_GIB
+    return value if math.isfinite(value) and 0 <= value <= 10000 else DISK_JOB_PEAK_GIB
+
+
+DISK_LOW = "disk-low"  # capacity/disk-low.lock and capacity/disk-low-<pid>: jobs admitted under the runner floor
+
+
+def disk_low_turn(capacity_dir: Path, worker: int) -> str | None:
+    """Admit at most one job at a time between the admission floor and the runner floor: the capacity ledger counts
+    cores, not disk, so two jobs admitted together at 25 GiB could write past the disk between them (each may write
+    up to DISK_JOB_PEAK_GIB). Under capacity/disk-low.lock (taken without blocking, retried for ADMISSION_WAIT_S), a
+    marker of another job refuses this one unless that job is proven gone: its pid is dead, or alive with another
+    start identity (process_identity). An unreadable marker or an identity that cannot be read refuses too. Otherwise
+    this job's Worker leaves its own marker. Returns the refusal, or None (admitted, marker written)."""
+    try:
+        capacity_dir.mkdir(parents=True, exist_ok=True)
+        lock = os.open(capacity_dir / f"{DISK_LOW}.lock", os.O_RDONLY | os.O_CREAT | os.O_NOFOLLOW, 0o644)
+    except OSError as error:
+        return f"cannot open the disk ledger ({type(error).__name__})"
+    try:
+        deadline = time.monotonic() + ADMISSION_WAIT_S
+        while True:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError:
+                if time.monotonic() >= deadline:
+                    return "another admission holds the disk ledger"
+                time.sleep(0.1)
+        for marker in capacity_dir.glob(f"{DISK_LOW}-*"):
+            name = marker.name[len(DISK_LOW) + 1:]
+            if not name.isdigit():
+                continue  # not a marker (disk-low.lock, a .tmp being written)
+            pid = int(name)
+            if pid == worker:
+                continue
+            gone = not 1 < pid < 2 ** 31 or not pid_alive(pid)
+            if not gone:
+                try:
+                    identity = (read_bounded(marker) or b"").decode("utf-8").strip()
+                except (OSError, UnicodeDecodeError):
+                    if not os.path.lexists(marker):
+                        continue  # removed meanwhile
+                    return f"cannot read the disk ledger's marker for pid {pid}"
+                current = process_identity(pid)
+                if not identity or current is None:
+                    return f"another job may still run here under the disk floor (pid {pid}, identity unknown)"
+                if current == identity:
+                    return f"another job admitted under the disk floor still runs here (pid {pid})"
+            with contextlib.suppress(OSError):
+                marker.unlink()  # its job is proven gone
+        identity = process_identity(worker)
+        if identity is None:
+            return f"cannot pin this job's Runner.Worker (pid {worker}) for the disk ledger"
+        mine = capacity_dir / f"{DISK_LOW}-{worker}"
+        tmp = mine.with_name(f".{mine.name}.tmp")
+        tmp.write_text(identity + "\n")
+        tmp.replace(mine)
+        return None
+    except OSError as error:
+        return f"cannot write the disk ledger ({type(error).__name__})"
+    finally:
+        os.close(lock)
+
+
+def admit_floor_gib(min_free_gib: float, takes_tours: bool) -> float:
+    """The free disk a job is refused under after eviction: the runner floor, capped at one job's measured disk
+    growth (job_disk_gib), except on a runner that takes cmux's tours, whose floor is cmux's own measure."""
+    return min_free_gib if takes_tours else min(min_free_gib, job_disk_gib())
 # Before every job, not after it (Leo, 2026-10-26: "Just throw it away. Just delete more stuff, more often"): free disk
 # is brought to the pre-job target, the floor plus PREJOB_MARGIN_GIB, before a job is admitted. Only checking the floor
 # admitted several jobs at 31 GiB under a 30 GiB floor, and together they wrote the disk down to 0.1 GiB while every
@@ -370,6 +461,14 @@ GUEST_WAIT_S = 600.0  # guests have no rescue workflow: a full mini holds their 
 # job after it has entered runner setup, so the hook refuses after this short bounded wait; the owned-pool rescue
 # then re-runs it through placement, where an idle warm-cache mini (or the configured overflow) can take it.
 DEV_COMPILE_CAPACITY_WAIT_S = 60.0
+# The DEV daily publisher's Mac jobs (verify, the tip DMG) take 1.6 and 2.5 min p95 on Blacksmith, and their
+# timeout-minutes (15 and 20) count the wait inside "Set up runner". A full mini held tip-dmg-build there 19 min
+# (cmux run 40466210697, 2026-10-27) until GitHub timed it out and the DEV feed went stale. So every job of that
+# workflow waits DEV_COMPILE_CAPACITY_WAIT_S at most and is then refused; cmux's owned-pool rescue re-runs a refused
+# job, and attempt 2 takes Blacksmith. The bound, like the DEV compile's, is when the last try starts: one try can
+# wait ADMISSION_WAIT_S more for admission.lock, so the refusal comes within DEV_BOUND_WORST_S, far inside the 15
+# and 20 minute timeouts it protects.
+DEV_DAILY_WORKFLOW = "cmux-next-dev-daily.yml"
 # CAPACITY_WAIT: an ordinary cmux job that finds its units or tokens taken waits for them, with no time limit,
 # instead of failing. The DEV cmux-next scheme compile is the bounded exception above: GitHub handed the job to
 # this runner and never moves it to another one, so a refusal only turned a
@@ -413,6 +512,20 @@ GUI_RESERVE_UNITS = 1
 # to the side label and Blacksmith, so the reservation never makes a job wait on it.
 FRESH_RESERVE_TOKEN = "fresh"
 FRESH_RESERVE_UNITS = max(JOB_CORES[("cmux-next.yml", job)] for job in ("cmux-scheme-compile", "release-compile"))
+# A reserving runner's gate keeps its reserve through its own job, lent to that job: the job's admission holder (the
+# detached process whose flocks are the job's units, take_capacity) also holds an flock on
+# capacity/<token>.reserve.lent, and while that flock is held the reserve keeps nothing (gui_reserved), since the job
+# holds those units itself. The flock dies with the holder, as the job's units go back, so the reserve is whole again
+# at that moment, with no gate poll in between and no pid to trust. Before, the gate let the reserve go once its job
+# was admitted and took it again on its first idle poll, seconds after job-completed released the units: a PR job
+# waiting here for units took them in that gap, so the slot found the mini full right after each job and held its
+# listener off (2026-10-27 05:07:50Z: "only 1 of 14 capacity units on this mini are free; its next job needs 4", 6 s
+# after a DEV compile ended), and a feed compile its listener took at once met a PR waiter ahead of it for units
+# instead of its own reserve (run 40452488452, refused at 05:06Z: "has waited longer here for units"). Like every file
+# in the ledger, any process of the runner user can take the flock; the ledger is cooperative between the jobs on one
+# mini, which can take unit flocks directly as well.
+RESERVE_LENT = ".lent"
+LEND_WAIT_S = 5.0  # an admission waits this long for the previous job's holder to let go of the lend
 UNITS_FULL = "capacity units on this mini"  # in mini_full's answers that are about units (Gate.reserves)
 
 
@@ -422,16 +535,27 @@ def reserve_units(name: str) -> int:
     return FRESH_RESERVE_UNITS if name == f"{FRESH_RESERVE_TOKEN}{GUI_RESERVE}" else GUI_RESERVE_UNITS
 
 
+def lent_file(reserve: Path) -> Path:
+    return reserve.with_name(reserve.name + RESERVE_LENT)
+
+
+def reserve_lent(reserve: Path) -> bool:
+    """Whether this reserve is lent to its runner's own admitted job: that job's holder holds <token>.reserve.lent
+    (RESERVE_LENT). Never raises: an unreadable file lends nothing."""
+    return not probe(lent_file(reserve))
+
+
 def gui_reserved(capacity_dir: Path, own_token: str | None = None) -> int:
     """The units this mini keeps for idle reserving runners: reserve_units() for each <token>.reserve an idle gui
-    runner's (or the freshness slot's) gate holds, except own_token's (a runner's own job takes its own reserve).
-    Never raises: an unreadable ledger reserves nothing."""
+    runner's (or the freshness slot's) gate holds, except own_token's (a runner's own job takes its own reserve) and
+    one lent to its runner's running job (RESERVE_LENT). Never raises: an unreadable ledger reserves nothing."""
     try:
         paths = sorted(capacity_dir.glob(f"*{GUI_RESERVE}"))
     except OSError:
         return 0
     own = f"{own_token}{GUI_RESERVE}" if own_token is not None else None
-    return sum(reserve_units(path.name) for path in paths if path.name != own and not probe(path))
+    return sum(reserve_units(path.name) for path in paths
+               if path.name != own and not probe(path) and not reserve_lent(path))
 
 
 def reserve_for(reserved: int, units: int, total: int) -> int:
@@ -471,11 +595,15 @@ def dev_compile_capacity_wait(repo: str | None, home_repo: str, event_name: str 
     """The bounded capacity wait for cmux NEXT's DEV compile, or None for ordinary jobs.
 
     A push to feat-cmux-next runs the DEV Release product in ``cmux-scheme-compile``. A DEV daily
-    workflow_dispatch carries ``inputs.dev_daily=true``. Once either job has been claimed by a runner,
+    workflow_dispatch carries ``inputs.dev_daily=true``. Every job of DEV_DAILY_WORKFLOW (the publisher's verify
+    and tip DMG jobs, whose short timeouts count this wait) is bounded too. Once a job has been claimed by a runner,
     waiting longer only strands it on one mini; a refusal lets the owned-pool rescue run placement again.
     """
-    if repo is None or repo.lower() != home_repo.lower() or workflow != "cmux-next.yml" \
-            or job != "cmux-scheme-compile":
+    if repo is None or repo.lower() != home_repo.lower():
+        return None
+    if workflow == DEV_DAILY_WORKFLOW:
+        return DEV_COMPILE_CAPACITY_WAIT_S
+    if workflow != "cmux-next.yml" or job != "cmux-scheme-compile":
         return None
     if event_name == "push" and ref == "refs/heads/feat-cmux-next":
         return DEV_COMPILE_CAPACITY_WAIT_S
@@ -484,6 +612,13 @@ def dev_compile_capacity_wait(repo: str | None, home_repo: str, event_name: str 
         if isinstance(inputs, dict) and str(inputs.get("dev_daily", "")).lower() == "true":
             return DEV_COMPILE_CAPACITY_WAIT_S
     return None
+
+
+def bounded_wait(cap: float | None, bound: float | None) -> float | None:
+    """The shorter of an explicit wait (`cap`, None for no limit) and a job's own bound (None for none)."""
+    if bound is None:
+        return cap
+    return bound if cap is None else min(cap, bound)
 
 
 def slot_capacity_wait(cap: float | None, dev_compile_runner: bool) -> float | None:
@@ -885,6 +1020,8 @@ def export_root(name: str) -> str:
             pass
     return f"{CANONICAL_ROOT_ENV}={path} via {'+'.join(wrote) or 'nothing (no GITHUB_ENV or RUNNER_TEMP)'}"
 ADMISSION_WAIT_S = 30.0  # admissions are serialized briefly so two jobs never split the free units
+# A DEV-bounded job's worst wait before its refusal (DEV_DAILY_WORKFLOW's comment).
+DEV_BOUND_WORST_S = DEV_COMPILE_CAPACITY_WAIT_S + ADMISSION_WAIT_S + ADMIT_POLL_S
 # The listener gate reads its runner's --capacity-units from the job-started hook glaeda-cmux-runner wrote.
 RUNNER_HOOK_SCRIPT = "glaeda-hooks/job-started.sh"
 LISTEN_SCRIPT = "glaeda-hooks/listen.sh"
@@ -1003,6 +1140,7 @@ GATE_ELIGIBLE_RECHECK_S = 30.0
 GATE_INELIGIBLE_ENV = "GLAEDA_RUNNER_GATE_INELIGIBLE"
 # Across a reload: "clean" when this gate started its listener with listener_env, else why its env is stale.
 GATE_LISTENER_ENV = "GLAEDA_RUNNER_GATE_LISTENER_ENV"
+GATE_RESERVE_FD_ENV = "GLAEDA_RUNNER_GATE_RESERVE_FD"  # a reload hands its reserve flock's fd to the new gate
 
 
 def _repo_name(repo: Any) -> str | None:
@@ -1775,26 +1913,43 @@ def evicted(path: str, min_free_gib: float, ran: str, before: float | None) -> s
     return f"under the {min_free_gib:g} GiB disk floor: {ran}, freed {freed}"
 
 
-def evict(path: str, min_free_gib: float, explicit: str | None) -> str:
-    """Free disk under the floor before refusing a job for it: one glaeda-disk --pressure run, bounded by
+def evict(path: str, min_free_gib: float, explicit: str | None, deadline: float | None = None) -> str:
+    """Free disk under the floor before refusing a job for it: glaeda-disk --pressure runs, bounded together by
     EVICT_TIMEOUT_S. Under the floor, free space is below glaeda-disk's emergency mark (20 GiB above the floor), so
     it deletes even while CI jobs run on this mini; it frees idle caches up to its runner target. glaeda-disk
     never deletes the Chromium trees (NEVER_DELETE) or anything a running job has open, names or marks busy.
-    When a pass already holds glaeda-disk's evict.lock (job-completed starts one detached), it waits for that one
-    within the same budget, then runs its own only if still under the floor.
+    When a pass already holds glaeda-disk's evict.lock (job-completed starts one detached), it waits for that one,
+    then runs its own only if still under the floor; when that one skips as busy (the queue's next pass took the
+    lock first) it waits for that pass too, and so on until a pass of its own ran or the budget is spent. deadline
+    (monotonic) is the budget's end, which job-started shares between its evictions; by default EVICT_TIMEOUT_S on.
     Returns a one-line note with the space freed; never raises."""
     before = free_or_none(path)
     start = time.monotonic()
-    deadline = start + EVICT_TIMEOUT_S
-    if not wait_for_running_pass(deadline):
-        return evicted(path, min_free_gib, disk_pressure(explicit, min_free_gib, EVICT_TIMEOUT_S), before)
-    # job-completed's detached pass (or the gate's, or the LaunchAgent's) held glaeda-disk's evict.lock: a pass of
-    # our own would have skipped as busy and refused this job while space was being freed
-    waited = f"waited {time.monotonic() - start:.0f} s for a running glaeda-disk pass"
-    if not disk_refusal(path, min_free_gib):
-        return evicted(path, min_free_gib, waited, before)
-    ran = disk_pressure(explicit, min_free_gib, max(1.0, deadline - time.monotonic()))
-    return evicted(path, min_free_gib, f"{waited}; {ran}", before)
+    deadline = start + EVICT_TIMEOUT_S if deadline is None else deadline
+    waited, busy, ran = 0.0, 0, ""
+    while True:
+        looked = time.monotonic()
+        if wait_for_running_pass(deadline):
+            # job-completed's detached pass (or the gate's, or the LaunchAgent's) held glaeda-disk's evict.lock: a
+            # pass of our own would have skipped as busy and refused this job while space was being freed
+            waited += time.monotonic() - looked
+            if not disk_refusal(path, min_free_gib):
+                ran = ""
+                break
+        left = deadline - time.monotonic()
+        if left < 1.0:
+            ran = ran or "the eviction budget is spent"
+            break
+        ran, skipped = disk_pressure_run(explicit, min_free_gib, left)
+        if not skipped or time.monotonic() >= deadline:
+            break
+        busy += 1
+        # busy behind measure.lock, which wait_for_running_pass does not watch: never a tight loop of glaeda-disk runs
+        time.sleep(min(EVICT_BUSY_PAUSE_S, max(0.0, deadline - time.monotonic())))
+    notes = [f"waited {waited:.0f} s for a running glaeda-disk pass"] if waited else []
+    if busy:
+        notes.append(f"its own pass skipped as busy {busy} time{'s' if busy > 1 else ''}")
+    return evicted(path, min_free_gib, "; ".join([*notes, *([ran] if ran else [])]), before)
 
 
 def prejob_margin_gib() -> float:
@@ -3056,8 +3211,8 @@ def admission_waiters(capacity_dir: Path, skip_pid: int = 0) -> list[dict[str, A
             if not math.isfinite(since):  # an infinite or NaN since would break the one total order
                 continue
             wants = [str(kind) for kind in data.get("wants") or [] if isinstance(kind, str)]
-        except (OSError, ValueError, TypeError, KeyError, AttributeError):
-            continue
+        except (OSError, ValueError, TypeError, KeyError, AttributeError, OverflowError):
+            continue  # OverflowError: a since too large for a float (an integer past 1e308)
         tier = data.get("tier") if data.get("tier") in (TIER_NIGHTLY, TIER_DEV) else ""
         waiters.append({"pid": pid, "since": since, "wants": wants, "who": str(data.get("who") or "")[:200],
                         "tier": tier})
@@ -3301,12 +3456,25 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
                 return False, f"capacity: {held} ({job or 'unknown job'} is {klass})"
         # every job but a reserving runner's own leaves the idle reserves free (GUI_RESERVE, FRESH_RESERVE_TOKEN); a
         # nightly job keeps none (FEED_FIRST)
-        kept = 0 if tier == TIER_NIGHTLY else reserve_for(gui_reserved(capacity_dir, own_reserve), units, total)
+        def kept_now() -> int:
+            return 0 if tier == TIER_NIGHTLY else reserve_for(gui_reserved(capacity_dir, own_reserve), units, total)
+
+        kept = kept_now()
+        lent: int | None = None
+        if own_reserve is not None and units > 0:
+            # the reserving runner's own job: its holder lends the reserve (RESERVE_LENT) for as long as it lives. Taken
+            # before the units and let go before them (hold's close_first), so the lend never outlives the job's units.
+            # The previous job's holder may still be letting go: wait for it briefly. One not taken leaves the reserve
+            # counted beside this job, which keeps more units from the other lanes, never fewer.
+            lend_until = time.monotonic() + LEND_WAIT_S
+            while (lent := lock_file(lent_file(capacity_dir / f"{own_reserve}{GUI_RESERVE}"), fcntl.LOCK_EX)) is None \
+                    and time.monotonic() < lend_until:
+                time.sleep(0.1)
+            if lent is not None:
+                fds.append(lent)
         got = spare = 0
         unit_fds: list[int] = []
         for slot in range(total):
-            if got == units and spare >= kept:
-                break
             fd = lock_file(capacity_dir / f"unit-{slot}", fcntl.LOCK_EX)
             if fd is None:
                 continue
@@ -3317,6 +3485,9 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
             else:  # free beside this job's units: one the reserve keeps (under admission.lock, so it stays free)
                 os.close(fd)
                 spare += 1
+        # a lend that ended during the scan (its holder let the job's units go) makes the reserve whole again: the
+        # larger of the two looks, so units freed by that holder are never counted as spare beside a kept-at-0 reserve
+        kept = max(kept, kept_now())
         if got < units or spare < kept:
             if taken_out is not None:
                 taken_out["wants"] = ["units"]
@@ -3326,8 +3497,11 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
         split = named[root] if root and klass in ROOT_SWITCHERS else None
         if split is not None:  # its own holder (ROOT_SWITCHERS); the main holder must not inherit it
             fds.remove(split)
+        # a lent reserve covers the job's whole admission: its units are never released early (the sampler's
+        # dynamic release), else the reserve would stay lent while the units it stands for went to other jobs
         held, note = hold(fds, watch_pid, state_dir, drop=(admission,) if split is None else (admission, split),
-                          release_fds=unit_fds)
+                          release_fds=[] if own_reserve is not None and units > 0 else unit_fds,
+                          close_first=(lent,) if lent is not None else ())
         fds = [] if split is None else [split]  # the holder has them now, or hold closed them
         if held and split is not None:
             held, why = hold(fds, watch_pid, state_dir, drop=(admission,), pid_file=root_holder_file(state_dir, root),
@@ -3356,12 +3530,15 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
 
 
 def hold(fds: list[int], watch: int | JobOwner, state_dir: Path, drop: tuple[int, ...] = (),
-         pid_file: Path | None = None, release_fds: list[int] | None = None) -> tuple[bool, str]:
+         pid_file: Path | None = None, release_fds: list[int] | None = None,
+         close_first: tuple[int, ...] = ()) -> tuple[bool, str]:
     """Hand the locked fds to a detached holder that keeps them until job-completed or the job's owner exits.
     watch is the owner job-started pinned (JobOwner), or a pid a step resolved just now (take-root, take-gui).
     Closes this process's copies either way. The holder closes `drop` (locks that must not outlive the
     admission). Succeeds only once the holder reports its own pid. pid_file defaults to the runner's
-    holder file; take-root passes its own so a second holder for the same job lives beside it."""
+    holder file; take-root passes its own so a second holder for the same job lives beside it. close_first (fds
+    among fds) are let go before every other lock when the holder ends (the reserve's lend, RESERVE_LENT, so no
+    reader sees the job's units free while the reserve still counts as lent)."""
     owner = watch if isinstance(watch, JobOwner) else JobOwner.of(watch)
     if owner is None:
         close_all(fds)
@@ -3427,6 +3604,7 @@ def hold(fds: list[int], watch: int | JobOwner, state_dir: Path, drop: tuple[int
                         pass
                 time.sleep(HOLDER_POLL_S)
         finally:
+            close_all(list(close_first))
             for leftover in ("releasing", "pid_file"):  # still ours: released, or the job died first
                 with contextlib.suppress(Exception):
                     path = releasing if leftover == "releasing" else pid_file
@@ -4457,12 +4635,20 @@ class Gate:
             os.environ[GATE_INELIGIBLE_ENV] = self.eligible_why
         if self.child is not None:
             os.environ[GATE_LISTENER_ENV] = self.stale_env or "clean"
+        if self.reserve_fd is not None:  # the flock stays held across the exec: no admission sees the reserve free
+            with contextlib.suppress(OSError):
+                os.set_inheritable(self.reserve_fd, True)
+                os.environ[GATE_RESERVE_FD_ENV] = str(self.reserve_fd)
         try:
             os.execv(sys.executable, [sys.executable, *argv])
         except OSError:
             os.environ.pop(GATE_LISTENING_SINCE_ENV, None)
             os.environ.pop(GATE_INELIGIBLE_ENV, None)
             os.environ.pop(GATE_LISTENER_ENV, None)
+            os.environ.pop(GATE_RESERVE_FD_ENV, None)
+            if self.reserve_fd is not None:
+                with contextlib.suppress(OSError):
+                    os.set_inheritable(self.reserve_fd, False)
             signal.pthread_sigmask(signal.SIG_UNBLOCK, blocked)
             gate_log("the reload failed; keeping this gate")
 
@@ -4747,21 +4933,60 @@ class Gate:
     def reserve(self, want: bool) -> None:
         """Hold or let go of this gui runner's reserve (GUI_RESERVE: capacity/<gui token>.reserve), which keeps
         GUI_RESERVE_UNITS units from every other job and runner on the mini. step() holds it while the runner is
-        idle and reserves() agrees, keeps it through a new job's admission, and lets it go once that job is
-        admitted (admitted()). Only a gui runner with a capacity ledger reserves. The flock is the gate's own fd (not inherited by run.sh, closed by a reload's exec, which
-        takes it again on its next poll), so a gate that dies reserves nothing. Never raises: a reserve it cannot
+        idle and reserves() agrees, and keeps it through the runner's own job, which its admission holder lends
+        (RESERVE_LENT), so it is whole again the moment that job's units go back. Only a gui runner with a capacity
+        ledger reserves. The flock is the gate's own fd (not inherited by run.sh; a reload hands it to the new gate,
+        adopt_reserve), so a gate that dies reserves nothing. Never raises: a reserve it cannot
         take is tried again on the next poll."""
         if want and self.reserve_fd is None:
-            scope = runner_scope(self.runner_dir)
-            token = reserve_token(scope)
-            if token is None or scope.units <= 0 or self.capacity_dir is None or not self.capacity_dir.is_dir():
+            path = self.reserve_path()
+            if path is None:
                 return
             with contextlib.suppress(OSError):
-                self.reserve_fd = lock_file(self.capacity_dir / f"{token}{GUI_RESERVE}", fcntl.LOCK_EX)
+                self.reserve_fd = lock_file(path, fcntl.LOCK_EX)
         elif not want and self.reserve_fd is not None:
             with contextlib.suppress(OSError):
                 os.close(self.reserve_fd)
             self.reserve_fd = None
+
+    def adopt_reserve(self, handed: str | None) -> None:
+        """Take over the reserve flock the gate before a reload held (GATE_RESERVE_FD_ENV), so the reserve is never
+        free across the exec. Only an fd open on this runner's own <token>.reserve is kept; anything else is closed
+        if it was a number, and ignored otherwise. Never raises."""
+        try:
+            fd = int(handed or "")
+        except ValueError:
+            return
+        if fd < 3:
+            return
+        path = self.reserve_path()
+        try:
+            same = path is not None and os.path.samestat(os.fstat(fd), os.stat(path, follow_symlinks=False))
+        except OSError:
+            same = False
+        if not same:
+            with contextlib.suppress(OSError):
+                os.close(fd)
+            return
+        with contextlib.suppress(OSError):
+            os.set_inheritable(fd, False)
+        self.reserve_fd = fd
+
+    def reserve_path(self) -> Path | None:
+        """This runner's capacity/<token>.reserve, or None when it reserves nothing (reserve())."""
+        scope = runner_scope(self.runner_dir)
+        token = reserve_token(scope)
+        if token is None or scope.units <= 0 or self.capacity_dir is None or not self.capacity_dir.is_dir():
+            return None
+        return self.capacity_dir / f"{token}{GUI_RESERVE}"
+
+    def keeps_reserve(self, why: str | None) -> bool:
+        """reserves(why), except that a held reserve is never let go once a job has arrived meanwhile: claimed() can
+        read the runner's own new job (its gui token, its units) as a reason to hold off, and a reserve dropped then
+        stays dropped through that job, reopening the gap at its end (review of glaeda#1651)."""
+        if self.reserves(why):
+            return True
+        return self.reserve_fd is not None and self.busy()
 
     def reserves(self, why: str | None) -> bool:
         """Whether an idle gui runner keeps its reserve, given claimed()'s answer: only while nothing holds it or
@@ -4769,19 +4994,6 @@ class Gate:
         pressure, a locked console, the gui token or the canonical roots, it could take no job, so the unit would
         only sit idle."""
         return (why is None or (why == self.full_why and UNITS_FULL in why)) and self.locked() is None
-
-    def admitted(self) -> bool:
-        """Whether this runner's job holds its admission: the holder job-started leaves (holder_file, named for the
-        runner in its .runner file) is alive. Until then a busy gui runner keeps its reserve, so a job waiting here
-        for units cannot take the reserved unit in the seconds between the listener taking the job and its
-        job-started admitting it. Unreadable counts as admitted: the reserve goes back, as before it existed."""
-        try:
-            name = json.loads((self.runner_dir / ".runner").read_text(encoding="utf-8-sig")).get("agentName")
-        except (OSError, ValueError, AttributeError):
-            return True
-        if not isinstance(name, str) or not name:
-            return True
-        return holder_alive(holder_file(self.state_dir, name))
 
     def tree(self) -> tuple[list[int], dict[int, tuple[int, str]]]:
         table = processes()
@@ -4997,16 +5209,25 @@ class Gate:
                     self.fast_until = time.monotonic() + 5.0
                 self.streak = 0  # a claim must hold for two idle polls, not carry over from the job
                 self.load_since = None  # the hold limit times a pause, never a job
-                if self.reserve_fd is not None and self.admitted():
-                    self.reserve(False)  # its job has its units: the reserve goes back to the other lanes
+                # the reserve stays held through the runner's own job: its admission lends it (RESERVE_LENT), so it
+                # keeps nothing while that job holds its units and is whole the moment they go back. One the job could
+                # not borrow keeps its units from the other lanes meanwhile, the safe side.
+                if self.reserve_fd is None and self.locked() is None:
+                    # one let go at an idle look a job then beat, or a reload's: a job of its own always gets it
+                    # back, read from nothing but the job itself, so no state is lost across a reload
+                    self.reserve(True)
                 return None
             why = self.claimed()
-            self.reserve(self.reserves(why))
+            if self.reserves(why):
+                self.reserve(True)
             self.streak = self.streak + 1 if why else 0
             if why and self.streak >= GATE_CONFIRM and not self.first_poll(why):
                 why = self.confirmed()
                 if why and not self.busy():  # the fresh look and the busy check right before the signal
                     self.stop(why)
+            # let go only after the last look (confirmed() included), and never with a job of its own arrived
+            # (keeps_reserve); a job that beats even this busy() check gets it back on its first busy poll
+            self.reserve(self.keeps_reserve(why))
             return None
         if self.terminating:
             return 0
@@ -5015,7 +5236,7 @@ class Gate:
             self.reserve(False)  # a runner GitHub no longer knows takes no job: it keeps no units from the others
             return None
         why = self.claimed()
-        self.reserve(self.reserves(why))
+        self.reserve(self.keeps_reserve(why))
         if why:
             if why != self.held:
                 gate_log(f"holding the listener off: {why}")
@@ -5097,6 +5318,7 @@ class Gate:
 def listen(runner_dir: Path, host_lock: str, reservation: str, state_dir: Path, waiters: bool,
            adopt: int = 0, capacity_dir: Path | None = None, fit_units: int = 1) -> int:
     gate = Gate(runner_dir, host_lock, reservation, state_dir, waiters, capacity_dir, fit_units)
+    gate.adopt_reserve(os.environ.pop(GATE_RESERVE_FD_ENV, None))
     marker = os.environ.pop(GATE_LISTENER_ENV, None)
     xcode = runner_xcode(runner_dir)
     if adopt:
@@ -5447,11 +5669,15 @@ class JobSamples:
         # free GiB on the disk the floor checks (--min-free-gib), at admission and at the end: what a job wrote
         self.disk_free_start: float | None = None
         self.disk_free_end: float | None = None
+        # and the lowest sampled while it ran (DISK_JOB_PEAK_GIB's evidence: its peak is start minus min)
+        self.disk_free_min: float | None = None
 
     def add(self, load: float | None, split: tuple[float, float, float, dict[str, float], dict[str, float]],
             interval: float, queue: tuple[int, int] | None = None, disk: float | None = None,
-            busy: float | None = None) -> None:
+            busy: float | None = None, free: float | None = None) -> None:
         job, others, outside, by_outside, by_runner = split
+        if free is not None and math.isfinite(free):
+            self.disk_free_min = free if self.disk_free_min is None else min(self.disk_free_min, free)
         if queue is not None:
             self.queues += 1
             self.running += queue[0]
@@ -5517,6 +5743,8 @@ class JobSamples:
             "thermal_limited": self.thermal,
             "disk_free_start_gib": None if self.disk_free_start is None else round(self.disk_free_start, 1),
             "disk_free_end_gib": None if self.disk_free_end is None else round(self.disk_free_end, 1),
+            # the volume's, so other jobs' writes count too: the peak this job saw is start minus min
+            "disk_free_min_gib": None if self.disk_free_min is None else round(self.disk_free_min, 1),
             "verdict": "contended" if reasons else "clear", "reasons": reasons,
         }
 
@@ -5720,7 +5948,8 @@ def start_sampler(watch_pid: int, state_dir: Path, meta: dict[str, Any], log: Pa
                 test_apps = (telemetry_test_app_owners(processes())
                              if any(os.path.basename(row[4]) == "cmux DEV" for row in rows) else {})
                 split = classify(rows, watch_pid, skip, test_apps)
-                samples.add(load_average(), split, interval, queue, *disk_busy)
+                samples.add(load_average(), split, interval, queue, *disk_busy,
+                            free=free_or_none(disk_path) if disk_path else None)
                 if dynamic_units > 1 and dynamic_total > 1:
                     now = time.monotonic()
                     job_cores = split[0]
@@ -6270,23 +6499,33 @@ def floor_disk_env(caller: str) -> dict[str, str]:
     return {**os.environ, "GLAEDA_DISK_HOOK_PASS": "1", "GLAEDA_DISK_CALLER": caller}
 
 
-def disk_pressure(explicit: str | None, floor_gib: float = 0.0, timeout: float = DISK_TIMEOUT_S) -> str:
-    """The floor eviction before refusing a job (evict). Best effort. Returns a one-line note; never raises."""
+# glaeda-disk's answers when it ran no pass because another holds evict.lock or measure.lock (DISK_BOUND's BUSY)
+DISK_BUSY = (b"another eviction running", b"another measurement running")
+
+
+def disk_pressure_run(explicit: str | None, floor_gib: float = 0.0,
+                      timeout: float = DISK_TIMEOUT_S) -> tuple[str, bool]:
+    """The floor eviction before refusing a job (evict): its one-line note, and whether glaeda-disk skipped as busy
+    (DISK_BUSY: another pass held its lock first, so nothing was freed and evict() waits for that pass instead). Best
+    effort; never raises."""
     try:
         argv = disk_argv(explicit, floor_gib)
         if argv is None:
-            return "glaeda-disk not installed; skipped"
-        timeout = float(os.environ.get("GLAEDA_RUNNER_DISK_TIMEOUT") or timeout)
+            return "glaeda-disk not installed; skipped", False
+        override = float(os.environ.get("GLAEDA_RUNNER_DISK_TIMEOUT") or timeout)
+        timeout = min(override, timeout) if math.isfinite(override) and override > 0 else timeout  # never past it
         result = subprocess.run(
             argv,
-            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
             timeout=timeout, check=False, env=floor_disk_env("runner hook floor eviction"),
         )
-        return f"glaeda-disk exited {result.returncode}"
+        out = result.stdout if isinstance(result.stdout, bytes) else b""
+        skipped = any(mark in out for mark in DISK_BUSY)
+        return f"glaeda-disk exited {result.returncode}{' (busy)' if skipped else ''}", skipped
     except subprocess.TimeoutExpired:
-        return "glaeda-disk timed out; continuing"
+        return "glaeda-disk timed out; continuing", False
     except Exception as error:  # noqa: BLE001  (never fail the job on housekeeping)
-        return f"glaeda-disk skipped: {type(error).__name__}"
+        return f"glaeda-disk skipped: {type(error).__name__}", False
 
 
 # job-completed's passes: one at a time per host, triggers coalesced, none started above the target. Every job on
@@ -6664,6 +6903,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.phase == "busy":
         return runner_busy_main([os.fspath(args.runner_dir)] if args.runner_dir else [])
     args.min_free_gib = runner_floor_gib(args.min_free_gib, args.gui_runner or args.session_runner)
+    # the floor a job is refused under, after eviction (DISK_JOB_PEAK_GIB); a tour runner's floor is cmux's measure
+    admit_floor = admit_floor_gib(args.min_free_gib, args.gui_runner or args.session_runner)
     # the runner LaunchAgent's environment can switch sampling off fleet-wide without a reinstall
     telemetry = not args.no_telemetry and os.environ.get("GLAEDA_RUNNER_TELEMETRY", "1") != "0"
 
@@ -6788,11 +7029,26 @@ def main(argv: list[str] | None = None) -> int:
         # a dedicated builder is not a pool runner: a reservation of the mini's pool never refuses its one job shape
         why = None if args.dedicated_admit else reservation_refusal(args.reservation, time.time(), taken_job=True)
         disk_path = os.path.dirname(args.host_lock)
+        disk_deadline = time.monotonic() + EVICT_TIMEOUT_S  # one budget for every eviction of this job-started
         if not why and not args.no_disk and disk_refusal(disk_path, args.min_free_gib):
-            print(f"{PREFIX}: {evict(disk_path, args.min_free_gib, args.disk)}", flush=True)
+            print(f"{PREFIX}: {evict(disk_path, args.min_free_gib, args.disk, disk_deadline)}", flush=True)
         if why:
             return refused(why)
-        why = disk_refusal(disk_path, args.min_free_gib)
+
+        def disk_why() -> str | None:
+            """The refusal for this job's disk, after eviction: under the admission floor, or under the runner floor
+            while another job admitted there still runs (disk_low_turn)."""
+            low = disk_refusal(disk_path, admit_floor)
+            if low or admit_floor >= args.min_free_gib or not disk_refusal(disk_path, args.min_free_gib):
+                return low
+            # only a pinned Runner.Worker takes the ledger's turn: its marker lives exactly as long as that job
+            turn = disk_low_turn(args.capacity_dir, owner.pid) if owner is not None \
+                else "this job's Runner.Worker is not pinned, so it cannot take the disk ledger's turn"
+            if turn:
+                return f"{disk_refusal(disk_path, args.min_free_gib) or 'under the disk floor'}: {turn}"
+            return disk_refusal(disk_path, admit_floor)  # read again: it may have waited for the ledger
+
+        why = disk_why()
         if why:
             return refused(why, disk=True)
         prejob = None if args.no_disk else prejob_evict(disk_path, args.min_free_gib, args.disk)
@@ -6800,8 +7056,8 @@ def main(argv: list[str] | None = None) -> int:
             print(f"{PREFIX}: {prejob}", flush=True)
             # the jobs already running may have written the disk below the floor while this one waited
             if disk_refusal(disk_path, args.min_free_gib):
-                print(f"{PREFIX}: {evict(disk_path, args.min_free_gib, args.disk)}", flush=True)
-                why = disk_refusal(disk_path, args.min_free_gib)
+                print(f"{PREFIX}: {evict(disk_path, args.min_free_gib, args.disk, disk_deadline)}", flush=True)
+                why = disk_why()
                 if why:
                     return refused(why, disk=True)
         # before any capacity is taken: a job that needs the console session fails on a locked one
@@ -6832,10 +7088,10 @@ def main(argv: list[str] | None = None) -> int:
             # A cmux job waits for capacity with no limit (CAPACITY_WAIT); a guest has no rescue workflow, so it
             # waits GUEST_WAIT_S for room and is then refused.
             cap = args.guest_wait if is_guest(repo, args.home_repo) else args.gui_wait
-            if cap is None:
-                cap = dev_compile_capacity_wait(
-                    repo, args.home_repo, os.environ.get("GITHUB_EVENT_NAME"),
-                    os.environ.get("GITHUB_REF"), event, os.environ.get("GITHUB_JOB", ""), job_workflow())
+            # The DEV bound holds over a longer --gui-wait too; a shorter one is kept.
+            cap = bounded_wait(cap, dev_compile_capacity_wait(
+                repo, args.home_repo, os.environ.get("GITHUB_EVENT_NAME"),
+                os.environ.get("GITHUB_REF"), event, os.environ.get("GITHUB_JOB", ""), job_workflow()))
             cap = slot_capacity_wait(cap, args.dev_compile_runner)
             tier = job_tier(os.environ.get("GITHUB_EVENT_NAME"), os.environ.get("GITHUB_REF"),
                             os.environ.get("GITHUB_REPOSITORY"), event, os.environ.get("GITHUB_WORKFLOW_REF"),
