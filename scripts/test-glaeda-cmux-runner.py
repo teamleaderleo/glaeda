@@ -8573,6 +8573,23 @@ class RunnerTest(unittest.TestCase):
         self.assertEqual(register["state"], "blocked")
         self.assertIn("receipt labels are not authoritative", register["note"])
 
+    def test_labels_the_fleet_read_spare_a_mini_without_gh_its_re_registration(self) -> None:
+        # the minis hold no gh login, so each fleet apply re-registered every idle runner in place whatever its labels
+        real_which = cr.which
+        with mock.patch.object(cr, "xcode_present", return_value=True):
+            first = self.invoke("--apply", "--manifest", self.manifest(), "--member", "mini-std")
+            labels = ",".join(first["registration"]["labels"])
+            configs = len(self.config_argvs())
+            with mock.patch.object(cr, "which", lambda name, extra=(): None if name == "gh" else real_which(name, extra)):
+                same = self.invoke("--apply", "--token-stdin", "--manifest", self.manifest(), "--member", "mini-std",
+                                   "--github-labels", labels, gh=False, stdin=REG_TOKEN)
+                self.assertEqual(self.by_kind(same)["register"]["state"], "unchanged", self.by_kind(same)["register"])
+                self.assertEqual(len(self.config_argvs()), configs, "matching labels: no config.sh, no bootout")
+                stale = self.invoke("--manifest", self.manifest(), "--member", "mini-std", "--token-stdin",
+                                    "--github-labels", "self-hosted,glaeda-mini", gh=False)
+        self.assertEqual(self.by_kind(stale)["register"]["state"], "relabel")
+        self.assertEqual(self.by_kind(stale)["register"]["previousLabels"], ["glaeda-mini", "self-hosted"])
+
     def test_manifest_apply_with_token_relabels_when_github_lookup_is_unavailable(self) -> None:
         with mock.patch.object(cr, "xcode_present", return_value=True):
             self.invoke("--apply", "--manifest", self.manifest(), "--member", "mini-std")

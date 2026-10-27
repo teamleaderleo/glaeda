@@ -370,6 +370,7 @@ class Context:
         self.service_plist_path = (SYSTEM_DAEMON_DIR / f"{self.label}.plist") if self.headless else self.plist_path
         self.log_path = self.logs / f"glaeda-cmux-runner{self.suffix}.log"
         self.token_stdin = args.token_stdin
+        self.github_labels = getattr(args, "github_labels", None)
         self.stdin_token: str | None = None  # set by main() from stdin; used once, never stored
 
     def take_token(self, endpoint: str) -> str | None:
@@ -1181,6 +1182,11 @@ def plan_install(ctx: Context, receipt: dict[str, Any] | None) -> list[dict[str,
         # A local receipt records what this copy last requested, not what GitHub currently
         # holds.  Read the registration once and use that observation for reconciliation.
         github_listed, github_found = lookup_runner(ctx)
+    elif ours and configured and isinstance(getattr(ctx, "github_labels", None), str):
+        # the minis hold no gh login: the fleet read GitHub's labels with its own and passed them. Without them,
+        # every apply re-registered each idle runner in place (the token path below) whatever its labels were.
+        github_listed, github_found = True, {"labels": sorted({label.strip() for label in ctx.github_labels.split(",")
+                                                              if label.strip()})}
     # This install registered that name before and lost its local .runner (an interrupted relabel):
     # registering again replaces its own server-side entry instead of colliding with it.
     own_name = bool(ours and not configured and registered.get("owned") and registered.get("name") == ctx.name)
@@ -2257,6 +2263,9 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--latest-runner-sha256", help="the osx-arm64 SHA-256 of --latest-runner-version")
     p.add_argument("--route-repo", default=DEFAULT_REPO, help="repository whose variables the printed routing commands set")
     p.add_argument("--gh", help="gh binary (default: PATH)")
+    p.add_argument("--github-labels", metavar="LABELS",
+                   help="the labels GitHub lists for this runner now (comma-separated), as glaeda-cmux-runner-fleet "
+                        "read them with its admin gh; used when this machine's gh cannot read them itself")
     p.add_argument("--token-stdin", action="store_true",
                    help="with --apply, read the registration (or, with --uninstall, removal) token from stdin; "
                         "without --apply, plan that path")
