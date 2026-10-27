@@ -5940,19 +5940,19 @@ class VolumeCensusTest(unittest.TestCase):
         self.write("readable/x")
         locked = self.write("locked/inner/blob").parents[1]
         held = self.write("held/item/blob").parent
-        real_scandir, real_du = os.scandir, gd._census_du
+        real_listdir, real_du = os.listdir, gd._census_du
 
-        def scandir(path):
+        def listdir(path):
             if Path(path) == self.root / "held":
                 raise PermissionError(errno.EACCES, "Permission denied", str(path))
-            return real_scandir(path)
+            return real_listdir(path)
 
         def census_du(path, timeout):
             if path == locked:
                 return 0, False  # du printed "Permission denied" and nothing it could read
             return real_du(path, timeout)
 
-        with mock.patch.object(gd.os, "scandir", side_effect=scandir), \
+        with mock.patch.object(gd.os, "listdir", side_effect=listdir), \
                 mock.patch.object(gd, "_census_du", side_effect=census_du):
             state = gd.census_pass([self.root], {str(held)}, path=self.state)
         self.assertTrue(state["complete"])
@@ -6045,6 +6045,22 @@ class VolumeCensusTest(unittest.TestCase):
             got = gd.filesystem_accounting([fs], [])[0]
         self.assertEqual(got["known_coverage"], 0)
         self.assertEqual(got["accounting_gap"], 2 * gd.GIB)
+
+    def test_an_unfinished_census_of_another_volume_starts_over(self) -> None:
+        self.write("a/blob")
+        stale = {"schema": "glaeda-disk-census/v1", "started_at": 1.0, "dev": -1, "complete": False,
+                 "pending": ["/gone"], "rows": {"/gone/x": [5, "unclassified", True]}}
+        got = gd.census_pass([self.root], set(), stale, now=50.0, path=self.state)
+        self.assertTrue(got["complete"])
+        self.assertEqual(got["dev"], self.root.stat().st_dev)
+        self.assertNotIn("/gone/x", got["rows"])
+        self.assertIn(str(self.root / "a"), got["rows"])
+
+    def test_census_du_never_enters_file_provider_trees(self) -> None:
+        argv = gd._census_du_argv(self.root)
+        for name in gd.MEASURE_SKIP_COMPONENTS:
+            self.assertTrue(name in argv or f"--exclude={name}" in argv, name)
+        self.assertEqual(argv[-1], str(self.root))
 
     def test_a_sized_dir_whose_size_goes_is_walked_before_completion(self) -> None:
         a, b = self.write("a/blob").parent, self.write("b/blob").parent

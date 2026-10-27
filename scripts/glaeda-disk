@@ -6526,7 +6526,10 @@ def census_covered() -> set[str]:
 
 
 def _census_du_argv(path: Path) -> list[str]:
-    argv = ["du", "-xsk", str(path)]
+    # never enter a FileProvider/cloud tree below an unowned directory: du can block in the kernel there
+    skips = [arg for name in sorted(MEASURE_SKIP_COMPONENTS)
+             for arg in (("-I", name) if DARWIN else (f"--exclude={name}",))]
+    argv = ["du", "-xsk", *skips, str(path)]
     if os.path.exists("/usr/sbin/taskpolicy"):
         return ["/usr/sbin/taskpolicy", "-b", *argv]  # background QoS: CPU and I/O throttled
     if ionice := shutil.which("ionice"):
@@ -6552,6 +6555,12 @@ def census_pass(roots: list[Path], covered: set[str], state: dict[str, Any] | No
     """Run one bounded slice of the census, resuming ``state`` and saving progress to ``path``."""
     now = time.time() if now is None else now
     state = dict(state or {})
+    try:
+        root_dev = roots[0].stat().st_dev if roots else None
+    except OSError:
+        root_dev = None
+    if state.get("pending") and not state.get("complete") and state.get("dev") != root_dev:
+        state = {"last": state.get("last")}  # the volume changed under an unfinished census: start over
     if not state.get("pending") or state.get("complete"):
         last = ({"rows": state.get("rows", {}), "completed_at": state.get("completed_at"),
                  "dev": state.get("dev")} if state.get("complete") else state.get("last"))
@@ -6578,43 +6587,42 @@ def census_pass(roots: list[Path], covered: set[str], state: dict[str, Any] | No
         ``cursor`` holds how far it got, so the next slice goes on from there instead of starting it over."""
         key = str(current)
         part = cursor.get(key) if cursor.get("dir") == key else None
-        skip, files = (int(part["seen"]), int(part["files"])) if part else (0, 0)
+        after, files = (str(part["after"]), int(part["files"])) if part else ("", 0)
         try:
             if not part:
                 files = os.lstat(current).st_blocks * 512
-            iterator = os.scandir(current)
+            # names in sorted order, so a resumed slice goes on after the last name it read: an entry added
+            # or removed meanwhile can be missed by this census, never counted twice
+            names = sorted(name for name in os.listdir(current) if name > after)
         except OSError:
             probe = _census_du(current, max(1.0, min(CENSUS_DU_TIMEOUT_S, deadline - clock())))
             rows[key] = [probe[0] if probe else 0, "unreadable", False]
             return True
         children: list[str] = []
-        seen = 0
-        with iterator:
-            for entry in iterator:
-                seen += 1
-                if seen <= skip:
-                    continue
-                if clock() >= deadline:
-                    cursor.clear()
-                    cursor.update({"dir": key, key: {"seen": seen - 1, "files": files}})
-                    pending.append(key)
-                    pending.extend(sorted(children, reverse=True))
-                    return False
-                child = census_canon(entry.path)
-                try:
-                    est = entry.stat(follow_symlinks=False)
-                except OSError:
-                    rows[child] = [0, "unreadable", False]  # vanished or not ours to stat: named, never dropped
-                    continue
-                if stat.S_ISDIR(est.st_mode):
-                    if dev is not None and est.st_dev != dev:
-                        continue  # another volume mounted here
-                    if entry.name in MEASURE_SKIP_COMPONENTS:
-                        rows[child] = [0, "skipped", False]  # FileProvider: du can block in the kernel there
-                    else:
-                        children.append(child)
-                elif child not in covered:  # a sized file is counted by its own size, not again here
-                    files += est.st_blocks * 512
+        for name in names:
+            if clock() >= deadline:
+                cursor.clear()
+                cursor.update({"dir": key, key: {"after": after, "files": files}})
+                pending.append(key)
+                pending.extend(sorted(children, reverse=True))
+                return False
+            after = name
+            entry_path = os.path.join(current, name)
+            child = census_canon(entry_path)
+            try:
+                est = os.lstat(entry_path)
+            except OSError:
+                rows[child] = [0, "unreadable", False]  # vanished or not ours to stat: named, never dropped
+                continue
+            if stat.S_ISDIR(est.st_mode):
+                if dev is not None and est.st_dev != dev:
+                    continue  # another volume mounted here
+                if name in MEASURE_SKIP_COMPONENTS:
+                    rows[child] = [0, "skipped", False]  # FileProvider: du can block in the kernel there
+                else:
+                    children.append(child)
+            elif child not in covered:  # a sized file is counted by its own size, not again here
+                files += est.st_blocks * 512
         cursor.clear()
         rows[str(current / CENSUS_FILES)] = [files, "unclassified", True]
         pending.extend(sorted(children, reverse=True))
