@@ -60,8 +60,9 @@ the daemon is the only process that talks to GitHub, and clients only read its c
   the reserve (REST 300, GraphQL 100) it stops that API until the quota resets. The quota is shared,
   so this also protects every other tool on the account.
 - The daemon's own REST polling is capped at restShare (0.4) of the hourly REST limit: the read
-  requests it sent over the last hour that GitHub counted (a 304 is free and is not counted, nor are
-  the outbox's writes, which sessions asked for), kept per minute in rest-spend.json across restarts.
+  requests it sent over the last hour that GitHub counted (a 304 is free and is not counted, nor is
+  the outbox -- writes sessions asked for and their dedupe lookups -- which the share never holds),
+  kept per minute in rest-spend.json across restarts.
   A read starts only when its worst case fits. At the cap, PR and run reads move to GraphQL, or wait
   while GraphQL is stopped too, so the shared REST pool is left to `gh`, landers and nightly re-runs.
   The one read the cap never holds back is a failed attempt's job list (once per attempt). The share
@@ -1444,9 +1445,11 @@ class Daemon:
         if raw_body is not None:
             headers["Content-Type"] = "application/json"
         bucket = "graphql" if path == "/graphql" else "rest"
-        # The outbox's own writes (POST, PATCH, DELETE) are what sessions asked for and are not the
-        # daemon's polling; its lookups (a GET to find a write that already landed) are reads, and count.
-        write = self.writing and method != "GET"
+        # The outbox -- a write and the lookups that keep it from landing twice -- is what sessions
+        # asked for, at most one write per POST_SPACING, and would cost the same through gh. The share
+        # caps the daemon's polling, so the outbox is neither counted against it nor held by it:
+        # holding a lander's write until the hour turns would be an outage, not a saving.
+        write = self.writing
         charged = bucket == "rest" and not free and not write
         if charged:
             # Charged before it is sent, and refunded only when GitHub says it was free (a 304): a

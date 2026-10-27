@@ -7653,6 +7653,15 @@ class PostTest(unittest.TestCase):
         self.assertNotIn("body", state)
         self.assertEqual(list(gg.outbox_dir().glob("*.json")), [])
 
+    def test_the_outbox_is_not_held_or_counted_at_the_rest_share(self) -> None:
+        item = self.queue("comment", "o/r#7", "--body", "landed")
+        d, t = self.daemon((201, {}, {"html_url": "u"}))
+        d.rest_minutes = {int(NOW // 60): 2000}  # the daemon's polling share is spent
+        d.clock_real = False
+        self.step(d, NOW)
+        self.assertEqual(gg.post_state(item["id"])["state"], "posted")
+        self.assertEqual(d.rest_spent(), 2000)
+
     def test_writes_are_spaced_and_oldest_first(self) -> None:
         first = self.queue("comment", "o/r#1", "--body", "one")
         second = self.queue("review", "https://github.com/o/r/pull/2", "--event", "approve", "--body", "two")
@@ -8298,16 +8307,18 @@ class DaemonPolicyTest(Base):
         self.assertFalse(self.daemon.rest_room(gg.REST_READ_MAX["pr"]))
         self.assertTrue(self.daemon.rest_room(gg.REST_READ_MAX["run"]))
 
-    def test_writes_do_not_spend_the_share_but_their_lookups_do(self) -> None:
+    def test_the_outbox_does_not_spend_the_share(self) -> None:
         self.daemon.now = NOW
         self.daemon.transport = lambda *a: (201, {}, b"{}")
         self.daemon.writing = True  # as post_tick sets it around one write
         self.daemon.request("POST", "/repos/o/r/issues/1/comments", {"body": "x"}, content=True)
         self.daemon.request("DELETE", "/repos/o/r/issues/1/labels/x")
-        self.daemon.request("GET", "/repos/o/r/issues/1/comments")  # the write's own dedupe lookup is a read
+        self.daemon.request("GET", "/repos/o/r/issues/1/comments")  # the write's own dedupe lookup
         self.daemon.writing = False
+        self.assertEqual(self.daemon.rest_spent(), 0)
+        self.assertEqual([w for _, w in self.daemon.sent], ["write"] * 3)  # budget shows them apart
+        self.daemon.request("GET", "/repos/o/r/pulls/1")  # outside the outbox, a read counts
         self.assertEqual(self.daemon.rest_spent(), 1)
-        self.assertEqual([w for _, w in self.daemon.sent], ["write", "write", "rest"])  # budget shows them apart
 
     def test_a_job_list_a_tick_had_no_time_for_is_not_counted_as_tried(self) -> None:
         failed = {"id": 7, "name": "CI", "display_title": "fix", "status": "completed", "conclusion": "failure",
