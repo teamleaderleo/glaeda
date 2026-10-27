@@ -636,6 +636,56 @@ class HookTest(unittest.TestCase):
         finally:
             self.finish("")
 
+    def test_a_waiting_nightly_job_holds_every_new_job_but_no_running_jobs_step(self) -> None:
+        """No new PR job starts on a mini where a nightly job waits: the fast tier on its own tokens (no units)
+        too. A ci-step lease inside a running job (new_job False) is not held, so it cannot deadlock the nightly
+        job waiting for that job's units."""
+        capacity = self.dir / "capacity"
+        waiters = [{"pid": os.getpid() + 1, "since": time.time(), "wants": ["units"],
+                    "who": "n2 build-nightly-app (run 9)", "tier": hook.TIER_NIGHTLY}]
+        with mock.patch.object(hook, "admission_waiters", return_value=waiters):
+            fast = set(hook.FAST_TOKENS)
+            self.assertIn("is a nightly job and goes first", hook.fair_turn(capacity, fast, time.time(), "", False, True))
+            self.assertIsNone(hook.fair_turn(capacity, fast, time.time(), "", False, False), "a ci-step lease")
+            self.assertIn("goes first", hook.fair_turn(capacity, {"units"}, time.time(), hook.TIER_DEV, True, True))
+            self.assertIsNone(hook.fair_turn(capacity, fast, time.time() + 1, hook.TIER_NIGHTLY, False, True),
+                              "a later nightly job that takes no unit does not wait on another nightly job")
+
+    def test_the_nightly_slot_admits_only_nightly_jobs(self) -> None:
+        self.assertIsNone(hook.nightly_slot_refusal(hook.TIER_NIGHTLY))
+        for tier in (hook.TIER_DEV, ""):
+            self.assertIn("admits only nightly jobs", hook.nightly_slot_refusal(tier))
+        self.fleet()
+        push = event(self.dir, "nightly-push", {"repository": CMUX, "ref": "refs/heads/nightly-next"})
+        env = {"GITHUB_REF": "refs/heads/nightly-next", "GITHUB_JOB": "build-nightly-app",
+               "GITHUB_WORKFLOW_REF": "manaflow-ai/cmux/.github/workflows/nightly.yml@refs/heads/nightly-next"}
+        args = ("--allowed-repo", "manaflow-ai/cmux", "--no-disk", "--watch-pid", str(os.getpid()),
+                "--state-dir", os.fspath(self.dir / "state"))
+        try:
+            admitted = self.run_hook("job-started", "push", push, *args, "--nightly-runner",
+                                     repo="manaflow-ai/cmux", env=env)
+            self.assertEqual(admitted.returncode, 0, admitted.stdout + admitted.stderr)
+            self.finish("")
+            dev_push = event(self.dir, "dev-push", {"repository": CMUX, "ref": "refs/heads/feat-cmux-next"})
+            ordinary = {**env, "GITHUB_REF": "refs/heads/nightly-next", "GITHUB_JOB": "swift-test",
+                        "GITHUB_WORKFLOW_REF": f"{CMUX}/.github/workflows/ci.yml@refs/heads/nightly-next"}
+            for name, payload, job_env in (
+                    ("another workflow's job", push, ordinary),
+                    ("a feat-cmux-next DEV compile", dev_push,
+                     {"GITHUB_REF": "refs/heads/feat-cmux-next", "GITHUB_JOB": "cmux-scheme-compile",
+                      "GITHUB_WORKFLOW_REF": f"{CMUX}/.github/workflows/cmux-next.yml@refs/heads/feat-cmux-next"})):
+                with self.subTest(name):
+                    refused = self.run_hook("job-started", "push", payload, *args, "--nightly-runner",
+                                            repo="manaflow-ai/cmux", env=job_env)
+                    self.assertEqual(refused.returncode, 1, refused.stdout + refused.stderr)
+                    self.assertIn("the nightly slot admits only nightly jobs", refused.stdout)
+                    neighbor = self.run_hook("job-started", "push", payload, *args,
+                                             repo="manaflow-ai/cmux", env=job_env)
+                    self.assertEqual(neighbor.returncode, 0, neighbor.stdout + neighbor.stderr)
+                    self.finish("")
+        finally:
+            self.finish("")
+
     def test_disk_pressure_never_fails_and_is_bounded(self) -> None:
         marker = self.dir / "disk-ran"
         slow = make_executable(self.dir / "glaeda-disk-slow", "import time, pathlib, sys\n"
@@ -6668,6 +6718,7 @@ class GateTest(unittest.TestCase):
         with mock.patch.object(hook.shutil, "disk_usage", side_effect=usage), \
                 mock.patch.object(hook, "disk_argv", side_effect=lambda _e, floor: ["glaeda-disk", f"{floor:g}"]), \
                 mock.patch.object(hook.subprocess, "Popen", side_effect=popen), \
+                mock.patch.object(hook, "pass_active", return_value=False), \
                 mock.patch.object(hook, "gate_log", side_effect=logs.append), \
                 mock.patch.object(hook.time, "monotonic", side_effect=lambda: clock["t"]):
             gate.child = mock.Mock(pid=1)
@@ -6693,6 +6744,55 @@ class GateTest(unittest.TestCase):
             procs[1].kill.assert_called_once()
             self.assertEqual(logs[-1], "under the 100 GiB disk floor: glaeda-disk timed out, freed 0.0 GiB")
             self.assertIsNone(gate.evicting)
+
+    def test_the_gate_waits_for_a_running_pass_instead_of_racing_it(self) -> None:
+        """Under the floor while the queued pass (or any evict.lock holder) runs, the gate's own glaeda-disk would
+        only skip as eviction_busy: it leaves one trigger for that pass, waits, and runs its own only once no pass
+        runs or after GATE_DISK_EVICT_EVERY_S."""
+        script = self.runner / hook.RUNNER_HOOK_SCRIPT
+        script.parent.mkdir(parents=True, exist_ok=True)
+        script.write_text("exec python3 /hook job-started --min-free-gib 100\n")
+        gate = hook.Gate(self.runner, os.fspath(self.lock), os.fspath(self.tmp / "none.json"), self.state)
+        usage = lambda _path: mock.Mock(free=int(99 * 1024**3))  # noqa: E731
+        procs: list[mock.Mock] = []
+
+        def popen(argv: list[str], **_: object) -> mock.Mock:
+            proc = mock.Mock(argv=argv)
+            proc.poll.return_value = None
+            procs.append(proc)
+            return proc
+
+        logs: list[str] = []
+        clock = {"t": 1000.0}
+        active = {"on": True}
+        with mock.patch.object(hook.shutil, "disk_usage", side_effect=usage), \
+                mock.patch.object(hook, "disk_argv", side_effect=lambda _e, floor: ["glaeda-disk", f"{floor:g}"]), \
+                mock.patch.object(hook.subprocess, "Popen", side_effect=popen), \
+                mock.patch.object(hook, "pass_active", side_effect=lambda: active["on"]), \
+                mock.patch.object(hook, "disk_pressure_detached", return_value="coalesced") as trigger, \
+                mock.patch.object(hook, "gate_log", side_effect=logs.append), \
+                mock.patch.object(hook.time, "monotonic", side_effect=lambda: clock["t"]):
+            gate.child = mock.Mock(pid=1)
+            for _ in range(5):
+                self.assertIsNotNone(gate.low_disk())
+                clock["t"] += 30
+            self.assertEqual(procs, [], "no run of its own while a pass runs")
+            trigger.assert_called_once()
+            self.assertEqual(logs, ["under the 100 GiB disk floor: a glaeda-disk pass is running; waiting for it "
+                                    "(coalesced)"])
+            active["on"] = False
+            gate.low_disk()
+            self.assertEqual([p.argv for p in procs], [["glaeda-disk", "100"]], "the pass ended short: its own run")
+            procs[0].poll.return_value = 0
+            gate.low_disk()
+            # a pass that never ends (a stale trigger): waited at most GATE_DISK_EVICT_EVERY_S, then its own run
+            clock["t"] += hook.GATE_DISK_EVICT_EVERY_S
+            active["on"] = True
+            gate.low_disk()
+            self.assertEqual(len(procs), 1)
+            clock["t"] += hook.GATE_DISK_EVICT_EVERY_S
+            gate.low_disk()
+            self.assertEqual(len(procs), 2, "a wait past GATE_DISK_EVICT_EVERY_S runs its own")
 
     def test_a_root_runner_holds_while_a_token_its_jobs_need_is_taken(self) -> None:
         root = hook.RunnerScope(4, 2, 2, True)
@@ -6837,6 +6937,40 @@ class GateTest(unittest.TestCase):
             json.dumps({"since": time.time(), "wants": ["units"], "who": "s1 daemon-test (run 4)"}) + "\n")
         self.assertIsNone(hook.mini_full(ledger, 10, fresh), "a PR job waiting for units does not hold the slot")
         self.assertIsNotNone(hook.mini_full(ledger, 10, side))
+
+    def test_the_nightly_slot_listens_on_a_full_mini_and_its_waiting_job_holds_every_other_runner(self) -> None:
+        """NIGHTLY_SLOT: the nightly slot's gate never holds it for units, a waiter or CPU saturation, so GitHub
+        hands it the queued nightly job at once; that job, waiting here, holds every other runner on the mini."""
+        capacity = self.units(10)
+        script = self.runner / hook.RUNNER_HOOK_SCRIPT
+        script.parent.mkdir(exist_ok=True)
+        script.write_text("#!/bin/bash\nexec /usr/bin/python3 /hook job-started --capacity-units 10 --instance 2"
+                          " --canonical-roots 2 --nightly-runner --test-keychain\n")
+        scope = hook.runner_scope(self.runner)
+        self.assertTrue(scope.nightly)
+        self.assertFalse(scope.root or scope.fresh or scope.gui or scope.session or scope.fast or scope.dedicated)
+        self.assertIsNone(hook.reserve_token(scope), "it keeps no reserve: a nightly job takes the next free units")
+        gate = self.full_gate(capacity)
+        self.assertEqual(hook.mini_full(capacity, 10, hook.RunnerScope(10, 2, 2)),
+                         "all 10 capacity units on this mini are taken")
+        self.assertIsNone(gate.full(), "every unit taken: the nightly slot listens anyway")
+        self.assertIsNone(gate.full(fresh=True))
+        (capacity / f"{hook.ADMIT_WANT}{os.getpid()}").write_text(json.dumps(
+            {"since": time.time() - 600, "wants": ["units"], "who": "s3 swift-test (run 7)"}) + "\n")
+        self.assertIsNone(gate.full(), "an older PR waiter does not hold it: its job goes first")
+        with mock.patch.object(hook, "host_io", return_value=(None, 99.0)), \
+                mock.patch.object(hook, "memory_pressure_level", return_value=None):
+            self.assertIsNone(gate.saturated(), "a busy CPU does not hold it, as it does not hold the freshness slot")
+        free = self.units(0)
+        (free / f"{hook.ADMIT_WANT}{os.getpid()}").write_text(json.dumps(
+            {"since": time.time(), "wants": ["units"], "who": "n2 build-nightly-app (run 9)",
+             "tier": hook.TIER_NIGHTLY}) + "\n")
+        for other in (hook.RunnerScope(10, 2, 2), hook.RunnerScope(10, 2, 2, root=True),
+                      hook.RunnerScope(10, 2, 2, gui=True), hook.RunnerScope(10, 2, 2, fresh=True),
+                      hook.RunnerScope(10, 2, 2, session=True), hook.RunnerScope(10, 2, 2, fast=True)):
+            with self.subTest(other=other):
+                self.assertEqual(hook.mini_full(free, 10, other), "n2 build-nightly-app (run 9) waits here for units",
+                                 "no new job starts on a mini where a nightly job waits")
 
     def test_a_freshness_slots_gate_holds_fresh_reserve_while_idle(self) -> None:
         capacity = self.units(0)
@@ -8891,12 +9025,14 @@ class RunnerTest(unittest.TestCase):
         self.assertEqual(again, scopes)
 
     def fast_labels(self, classes: dict, name: str, *, dev_compile: bool = False,
-                    ios_sim: bool = False) -> tuple[list[list[str]], list[str]]:
+                    ios_sim: bool = False, nightly_slot: bool = False) -> tuple[list[list[str]], list[str]]:
         """Apply every instance of mini-std under these runner classes: (labels per instance, job-started.sh texts)."""
         manifest = json.loads(json.dumps(MANIFEST))
         manifest["defaults"]["runner"] = {"classes": {"std": classes}}
         if dev_compile:
             manifest["hosts"]["mini-std"].setdefault("overrides", {})["runner"] = {"devCompile": True}
+        if nightly_slot:
+            manifest["hosts"]["mini-std"].setdefault("overrides", {}).setdefault("runner", {})["nightlySlot"] = True
         if ios_sim:
             manifest["hosts"]["mini-std"]["roles"].append("ios-simulators")
             manifest["defaults"]["ios_simulator"] = {"runtimes": ["23F77"]}
@@ -8947,6 +9083,30 @@ class RunnerTest(unittest.TestCase):
             suffix = f"-{instance}" if instance else ""
             again = (self.fast_home / f"actions-runner-glaeda{suffix}/glaeda-hooks/job-started.sh").read_text()
             self.assertEqual(again.replace(os.fspath(self.fast_home), "HOME"), original)
+
+    def test_the_nightly_slot_takes_the_side_instance_after_the_freshness_slot(self) -> None:
+        shape = {"runners": 6, "capacityUnits": 14, "compileSlots": 2, "canonicalRoots": 2,
+                 "guiRunners": 1, "fastRunners": 1}
+        with mock.patch.object(cr, "ios_sim_present", return_value=True):
+            dev, dev_hooks = self.fast_labels(shape, "nightly-dev-baseline", dev_compile=True, ios_sim=True)
+            both, both_hooks = self.fast_labels(shape, "nightly-and-dev", dev_compile=True, ios_sim=True,
+                                                nightly_slot=True)
+        for instance in (0, 1, 2, 4, 5):
+            self.assertEqual(both[instance], dev[instance], f"neighbor {instance} keeps every label")
+            self.assertEqual(both_hooks[instance], dev_hooks[instance], f"neighbor {instance} keeps its hook")
+        self.assertEqual([label for label in both[3] if label not in cr.BASE_LABELS],
+                         ["glaeda-mini", "glaeda-class-std", "glaeda-dedicated", "xcode-26.6",
+                          "glaeda-nightly-std-xcode-26.6"], "no pool, side or iOS label: no PR job reaches it")
+        self.assertEqual(["--nightly-runner" in text for text in both_hooks],
+                         [False, False, False, True, False, False])
+        self.assertIn("--test-keychain", both_hooks[3])
+        self.assertNotIn("--dev-compile-runner", both_hooks[3])
+        with mock.patch.object(cr, "ios_sim_present", return_value=True):
+            alone, _ = self.fast_labels(shape, "nightly-alone", ios_sim=True, nightly_slot=True)
+        self.assertEqual(["glaeda-nightly-std-xcode-26.6" in labels for labels in alone],
+                         [False, False, True, False, False, False], "without a freshness slot: the first side instance")
+        self.assertTrue(hook.runner_scope(self.fast_home / "actions-runner-glaeda-2").nightly)
+        self.assertFalse(hook.runner_scope(self.fast_home / "actions-runner-glaeda-3").nightly)
 
     def test_dev_compile_install_refuses_without_existing_side_instance(self) -> None:
         manifest = copy.deepcopy(MANIFEST)
@@ -10022,6 +10182,7 @@ class DedicatedRunnerTest(unittest.TestCase):
         for change, needle in (({"labels": ["self-hosted", "x"]}, "leave out"), ({"labels": []}, "non-empty"),
                                ({"org": "manaflow-ai"}, "exactly one of repo"), ({"admit": ["relative.py"]}, "admit"),
                                ({"name": "Bad Name"}, "name"), ({"name": "123"}, "name"),
+                               ({"name": "x-glaeda"}, "pool instance"), ({"name": "x-glaeda-2"}, "pool instance"),
                                ({"env": {"lower": "x"}}, "env"),
                                ({"surprise": 1}, "unknown keys"), ({"group": "g"}, "group goes with org"),
                                ({"labels": ["x", "glaeda-std-xcode-26.6".upper()]}, "pool labels"),
@@ -10201,6 +10362,22 @@ class DedicatedRunnerTest(unittest.TestCase):
                         "--dedicated", "nightly-next")
         self.assertFalse((self.home / "Library/LaunchAgents" / f"{label}.watch.plist").exists())
         self.assertEqual(json.loads((self.state / "runners.json").read_text())["runners"], [])
+
+    def test_keep_paths_are_written_for_glaeda_disk_and_validated(self) -> None:
+        fake_pw = mock.Mock(pw_dir=os.fspath(self.home))
+        runner = self.home / "actions-runner-glaeda-nightly-next"
+        kept = {**NIGHTLY, "keep": ["{runnerDir}/_work/cmux/cmux", "~/Library/Caches/cmux-nightly-next/x"]}
+        with mock.patch.object(cr.pwd, "getpwuid", return_value=fake_pw):
+            self.invoke("--apply", "--manifest", self.manifest(kept), "--member", "mini-std", "--dedicated", "nightly-next")
+        self.assertEqual(json.loads((runner / cr.ROLE_KEEP_MARKER).read_text()),
+                         [f"{runner}/_work/cmux/cmux", f"{self.home}/Library/Caches/cmux-nightly-next/x"])
+        with mock.patch.object(cr.pwd, "getpwuid", return_value=fake_pw):
+            self.invoke("--apply", "--manifest", self.manifest(), "--member", "mini-std", "--dedicated", "nightly-next")
+        self.assertFalse((runner / cr.ROLE_KEEP_MARKER).exists(), "dropped from the manifest: kept no longer")
+        for bad in (["/abs"], ["~/../x"], ["relative"], "~/x", [""]):
+            with self.subTest(bad=bad):
+                _, why = fleet_labels.dedicated_runners(dedicated_manifest({**NIGHTLY, "keep": bad}), "mini-std")
+                self.assertIn("keep", why or "")
 
     def test_a_relabel_starts_the_runner_only_under_its_new_admission(self) -> None:
         fake_pw = mock.Mock(pw_dir=os.fspath(self.home))
@@ -10552,6 +10729,40 @@ class FleetLabelsModuleTest(unittest.TestCase):
         manifest["hosts"]["mini-std"]["overrides"]["runner"]["poolPrefix"] = "dev-"
         self.assertEqual(fleet_labels.member_labels(manifest, "mini-std", lambda app: True)[0], after,
                          "the DEV namespace never moves neighboring instances out of their normal pool")
+
+    def test_the_nightly_slot_declares_its_own_pool_without_adding_capacity(self) -> None:
+        manifest = copy.deepcopy(MANIFEST)
+        before = fleet_labels.member_labels(manifest, "mini-std", lambda app: True)[0]
+        manifest["hosts"]["mini-std"].setdefault("overrides", {})["runner"] = {"nightlySlot": True}
+        after, why = fleet_labels.member_labels(manifest, "mini-std", lambda app: True)
+        self.assertIsNone(why)
+        for field in ("runners", "capacityUnits", "compileSlots", "canonicalRoots", "pools", "labels", "sidePools"):
+            self.assertEqual(after[field], before[field], field)
+        self.assertEqual(after["nightlyPools"], ["glaeda-nightly-std-xcode-26.6"])
+        self.assertEqual((after["nightlySlot"], after["nightlyInstance"]), (True, 1))
+        self.assertEqual((before["nightlyPools"], before["nightlyInstance"]), ([], None))
+        self.assertIn("glaeda-nightly-std-xcode-26.6", fleet_labels.declared_pools(manifest))
+        self.assertEqual(fleet_labels.widened_labels(after["nightlyPools"]), after["nightlyPools"])
+        manifest["hosts"]["mini-std"]["overrides"]["runner"]["devCompile"] = True
+        manifest["defaults"]["runner"] = {"classes": {"std": {"runners": 3}}}
+        both, why = fleet_labels.member_labels(manifest, "mini-std", lambda app: True)
+        self.assertIsNone(why)
+        self.assertEqual((both["devCompileInstance"], both["nightlyInstance"]), (1, 2))
+        cases = [({"nightlySlot": value}, {}, "nightlySlot must be boolean") for value in ("true", 1, None)]
+        cases += [({"nightlySlot": True, "devCompile": True}, {"runners": 2}, "and the freshness slot"),
+                  ({"nightlySlot": True}, {"runners": 2, "canonicalRoots": 2}, "needs an existing side instance"),
+                  ({"nightlySlot": True, "poolPrefix": "aws-"}, {}, "default pool namespace"),
+                  ({"nightlySlot": True, "trustedRef": "refs/heads/main", "trustedRepo": "manaflow-ai/cmux"}, {},
+                   "without trustedRef")]
+        for runner, shape, message in cases:
+            with self.subTest(runner=runner, shape=shape):
+                bad = copy.deepcopy(MANIFEST)
+                bad["defaults"]["runner"] = {"classes": {"std": shape}} if shape else {}
+                bad["hosts"]["mini-std"].setdefault("overrides", {})["runner"] = runner
+                member, why = fleet_labels.member_labels(bad, "mini-std", lambda app: True)
+                self.assertIsNone(member)
+                self.assertIn(message, why)
+        self.assertIn("nightly-", fleet_labels.RESERVED_POOL_PREFIXES)
 
     def test_dev_compile_malformed_manifest_fails_closed(self) -> None:
         cases = [({"devCompile": value}, {}, "devCompile must be boolean")
