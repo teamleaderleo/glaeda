@@ -9575,6 +9575,26 @@ class DedicatedRunnerTest(unittest.TestCase):
         self.assertEqual(next(a for a in again["actions"] if a["kind"] == "watch")["state"], "remove")
         self.assertFalse((self.home / "Library/LaunchAgents" / f"{label}.watch.plist").exists())
 
+    def test_a_relabel_starts_the_runner_only_under_its_new_admission(self) -> None:
+        fake_pw = mock.Mock(pw_dir=os.fspath(self.home))
+        wrapper = self.home / "actions-runner-glaeda-nightly-next" / cr.HOOK_DIR / cr.DEDICATED_ADMIT
+        with mock.patch.object(cr.pwd, "getpwuid", return_value=fake_pw):
+            self.invoke("--apply", "--manifest", self.manifest(), "--member", "mini-std", "--dedicated", "nightly-next")
+        changed = {**NIGHTLY, "labels": [*NIGHTLY["labels"], "glaeda-extra"],
+                   "admit": ["/usr/bin/python3", "~/nightly-builder/nightly_builder.py", "admit", "--strict"]}
+        seen = []
+        real_start = cr.start_agent
+
+        def start(ctx, act, path):
+            seen.append(wrapper.read_text())
+            return real_start(ctx, act, path)
+        with mock.patch.object(cr.pwd, "getpwuid", return_value=fake_pw), mock.patch.object(cr, "start_agent", start):
+            receipt = self.invoke("--apply", "--manifest", self.manifest(changed), "--member", "mini-std",
+                                  "--dedicated", "nightly-next")
+        self.assertEqual(self.by_kind(receipt)["register"]["state"], "updated")
+        self.assertTrue(seen, "the relabel started the runner again")
+        self.assertTrue(all("--strict" in text for text in seen), "never started under the old admission")
+
     def test_unknown_names_and_mixed_flags_are_refused(self) -> None:
         out = io.StringIO()
         with contextlib.redirect_stderr(out):

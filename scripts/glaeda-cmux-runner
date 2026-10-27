@@ -1714,6 +1714,14 @@ def apply_install(ctx: Context, actions: list[dict[str, Any]], receipt_doc: dict
                                                "name": ctx.name, "labels": ctx.labels,
                                                "runnerId": act.get("runnerId")}
         elif kind == "register" and state == "relabel":
+            if dedicated_of(ctx):
+                # its hooks (the admission wrapper) first: relabel starts the listener, and its first job must meet
+                # the manifest's admission, not the one being replaced
+                for hook_act in [a for a in actions if a["kind"] == "hook" and a["state"] in {"create", "update"}]:
+                    data, mode = desired_files(ctx)[Path(hook_act["path"])]
+                    write_atomic(Path(hook_act["path"]), data, mode)
+                    hook_act["applied"] = hook_act["owned"] = True
+                    hook_act["ownedSha256"] = hook_act["sha256"]
             relabel(ctx, act)
             if act["state"] != "failed":
                 receipt_doc["registration"] = {**(receipt_doc.get("registration") or {}), "labels": ctx.labels,
