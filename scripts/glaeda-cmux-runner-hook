@@ -5418,9 +5418,11 @@ def job_owners(rows: list[tuple[int, int, float, str, str]], job_root: int,
 def job_rss_kib(rows: list[tuple[int, int, float, str, str]], rss: dict[int, int], job_root: int,
                 skip: set[int], test_app_owners: dict[int, int] | None = None) -> int | None:
     """Resident KiB of this job's tree right now (its Runner.Worker, everything under it and its reparented CI test
-    app), the same tree classify counts as the job's cores; None when ps gave no RSS for any of it."""
+    app), the same tree classify counts as the job's cores; None when ps gave no nonzero RSS for any of it (a zombie
+    shows 0, as the whole tree can while its Runner.Worker exits), so an unknown reading is never a 0."""
     _, owner = job_owners(rows, job_root, test_app_owners)
-    mine = [rss[pid] for pid, _, _, _, _ in rows if pid not in skip and pid in rss and owner(pid) == job_root]
+    mine = [rss[pid] for pid, _, _, _, _ in rows
+            if pid not in skip and rss.get(pid, 0) > 0 and owner(pid) == job_root]
     return sum(mine) if mine else None
 
 

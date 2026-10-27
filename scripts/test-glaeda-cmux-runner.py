@@ -10023,6 +10023,9 @@ class JobTelemetryTest(unittest.TestCase):
         self.assertEqual(self.hook.job_rss_kib(rows, rss, 100, {400}, {300: 100}), 3_000_000)
         self.assertEqual(self.hook.job_rss_kib(rows, rss, 200, {400}, {300: 100}), 790_000)
         self.assertIsNone(self.hook.job_rss_kib(rows, {}, 100, set()), "no RSS read is unknown, not zero")
+        zombies = {pid: 0 for pid in rss}  # a tree of zombies while the Runner.Worker exits
+        self.assertIsNone(self.hook.job_rss_kib(rows, zombies, 100, set()), "an all-zero reading is unknown too")
+        self.assertEqual(self.hook.job_rss_kib(rows, {**rss, 101: 0}, 100, {400}, {300: 100}), 1_000_000)
 
     def test_summary_records_the_peak_job_rss_or_null(self) -> None:
         split = (1.0, 0.0, 0.0, {}, {})
