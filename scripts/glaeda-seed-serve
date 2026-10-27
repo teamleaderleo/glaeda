@@ -1010,13 +1010,21 @@ def part_of(cache: Path, name: str) -> Path:
 
 
 def report(part: Path) -> None:
-    """One progress line for a waiting client; a client that hung up does not stop the fill."""
+    """One progress line for a waiting client, dropped when the client is not reading (a full pipe): a
+    client that stops reading, or hung up, never stalls the fill."""
     try:
         size = part.stat().st_size
     except OSError:
         size = 0
-    with contextlib.suppress(OSError):
-        say(f"filling {size}")
+    blocking = os.get_blocking(1)
+    try:
+        os.set_blocking(1, False)
+        os.write(1, f"{HEADER} filling {size}\n".encode())
+    except OSError:
+        pass
+    finally:
+        with contextlib.suppress(OSError):
+            os.set_blocking(1, blocking)
 
 
 def fill(cache: Path, name: str, timeout: float = FILL_TIMEOUT, curl: str = CURL) -> str:
@@ -1032,7 +1040,8 @@ def fill(cache: Path, name: str, timeout: float = FILL_TIMEOUT, curl: str = CURL
     if shutil.disk_usage(cache).free < CACHE_MIN_FREE + FILL_MAX_BYTES:
         return "no room for a fill"
     try:
-        proc = subprocess.Popen([curl, "--silent", "--location", "--fail", "--proto", "=https",
+        # No --location: a redirect could send the fetch to any host, past the bucket allow list.
+        proc = subprocess.Popen([curl, "--silent", "--fail", "--proto", "=https",
                                  "--connect-timeout", "15", "--speed-limit", "10240", "--speed-time", "120",
                                  "--max-time", str(int(timeout)), "--max-filesize", str(FILL_MAX_BYTES),
                                  "--write-out", "%{http_code}", "--output", os.fspath(part),
@@ -1047,12 +1056,17 @@ def fill(cache: Path, name: str, timeout: float = FILL_TIMEOUT, curl: str = CURL
             code = proc.wait(timeout=FILL_REPORT)
             break
         except subprocess.TimeoutExpired:
-            if time.monotonic() >= deadline:
+            try:
+                written = part.stat().st_size
+            except OSError:
+                written = 0
+            # curl's --max-filesize holds only when the size is announced; a chunked answer is cut here.
+            if time.monotonic() >= deadline or written > FILL_MAX_BYTES:
                 with contextlib.suppress(OSError):
                     os.killpg(proc.pid, signal.SIGKILL)
                 proc.wait()
                 part.unlink(missing_ok=True)
-                return "timed out"
+                return "timed out" if written <= FILL_MAX_BYTES else "larger than a cache object may be"
             report(part)
     http = (proc.stdout.read() or "").strip()
     if code != 0 or not part.is_file() or part.stat().st_size == 0:
@@ -1094,6 +1108,10 @@ def serve_cache(name: str, cache: Path, run_dir: Path, client: str, record: dict
     every FILL_REPORT seconds.
     """
     record = {**record, "verb": "cache", "object": name}
+    # A hard bound on the whole request, however the client behaves: the lock and slot waits (each within
+    # FILL_TIMEOUT of the start), one fill and the stream. SIGALRM ends the process; the kernel drops its
+    # flocks, and curl stops at its own --max-time.
+    signal.alarm(int(2 * FILL_TIMEOUT + CACHE_SERVE_TIMEOUT + 120))
     digest = hashlib.sha256(name.encode()).hexdigest()[:24]
     # No per-client guard: a mini's parallel jobs may want the same object, and most requests only wait on a
     # fill. The queue places bound what any number of clients can hold.

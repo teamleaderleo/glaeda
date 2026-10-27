@@ -365,6 +365,19 @@ class LanCacheTest(unittest.TestCase):
         self.assertEqual(len(self.downloads()), 2)
         self.assertNotEqual(serve.stored(self.cache, name), serve.stored(self.cache, name.replace("a.", "A.")))
 
+    def test_progress_to_a_client_that_stopped_reading_is_dropped(self):
+        script = (f"import fcntl, os, sys, importlib.machinery, importlib.util\n"
+                  f"loader = importlib.machinery.SourceFileLoader('s', {os.fspath(SERVE)!r})\n"
+                  "spec = importlib.util.spec_from_loader('s', loader); m = importlib.util.module_from_spec(spec)\n"
+                  "loader.exec_module(m)\n"
+                  "for _ in range(20000): m.report(m.Path('/nonexistent'))\n"
+                  "sys.stderr.write('done')\n")
+        read, write = os.pipe()  # never read: the pipe fills after a few KB
+        proc = subprocess.run([sys.executable, "-c", script], stdout=write, stderr=subprocess.PIPE, timeout=30)
+        os.close(write)
+        os.close(read)
+        self.assertEqual(proc.stderr, b"done")
+
     def test_git_is_served_only_from_a_ready_mirror(self):
         repo = self.mirrors / "cmux.git"
         subprocess.run(["git", "init", "-q", "--bare", os.fspath(repo)], check=True)
