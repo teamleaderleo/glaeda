@@ -4383,6 +4383,51 @@ class GlaedaDiskTest(unittest.TestCase):
                          [(st["mini-glaeda"] / "Build", "changed:in-use")])
         self.assertTrue((st["mini-glaeda"] / "Build/blob").is_file())
 
+    def test_a_childs_recheck_puts_it_back_for_a_marker_a_drain_job_or_a_new_owner(self) -> None:
+        home, fam, st = self._cmux_next_cap_tree()
+        state = st["mini-glaeda"]
+        worker = f"{home}/actions-runner-glaeda/bin/Runner.Worker spawnclient 1 2\n"
+
+        def outcome(during, evidence=([], ""), **patches):
+            for child in ("Build", "Logs"):
+                if not (state / child).exists():
+                    make(state / child, age_hours=5)
+            self._age(state, hours=5)
+            receipt = self.receipt()
+            real_remove = gd.remove
+            calls: list[int] = []
+
+            def remove(path, after_rename=None):
+                def hook():
+                    calls.append(1)  # the recheck's evidence is the job's
+                    during()
+                    if after_rename is not None:
+                        after_rename()
+                return real_remove(path, after_rename=hook)
+            with contextlib.ExitStack() as stack:
+                for name, value in {"HOME": home, "process_evidence": mock.Mock(side_effect=lambda: evidence if calls.append(1) or len(calls) > 1 else ([], "")),
+                                    "command_lines": lambda: "", "remove": remove, "ACTIVITY_MODE": "pressure",
+                                    "CMUX_NEXT_CI_OVER": gd.GIB,
+                                    "runner_job_started": lambda runner: time.time() - 3600, **patches}.items():
+                    stack.enter_context(mock.patch.object(gd, name, value))
+                stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
+                gd._DISCOVERED.clear()
+                with mock.patch.object(gd, "process_evidence", return_value=([], "")):
+                    items = [i for i in gd.survey([fam], 6, 0) if Path(i.path) == state / "Build"]
+                gd.apply(items, {fam.id: fam}, receipt, None, 6, all_families=[fam])
+            return [json.loads(line)["outcome"] for line in receipt.read_text().splitlines()][-1:]
+        # an activity marker beside the state appears during the rename
+        marker = state.parent / ".lock"
+        self.assertEqual(outcome(lambda: marker.write_text("")), ["changed:in-use"])
+        self.assertTrue((state / "Build/blob").is_file())
+        marker.unlink()
+        # in a drain, a job that started meanwhile keeps it even though it predates the state's last build
+        self.assertEqual(outcome(lambda: None, evidence=([], worker), CMUX_NEXT_CI_DRAIN=True), ["changed:in-use"])
+        # the runner re-registered under another name meanwhile: whose state it is changed
+        runner = home / "actions-runner-glaeda/.runner"
+        self.assertEqual(outcome(lambda: runner.write_text(json.dumps({"agentName": "renamed"}), encoding="utf-8-sig")),
+                         ["changed:in-use"])
+
     def test_main_shows_the_cmux_next_cap_and_records_it_in_the_run_line(self) -> None:
         self.addCleanup(setattr, gd, "CMUX_NEXT_CI_OVER", gd.CMUX_NEXT_CI_OVER)
         state = {"used": 47 * gd.GIB, "cap": 25 * gd.GIB, "over": 22 * gd.GIB, "at": time.time() - 600}

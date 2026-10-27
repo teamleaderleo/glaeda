@@ -7740,16 +7740,18 @@ def cmux_next_ci_job_predates(state: Path, runner: Path, written: float | None =
 
 
 def cmux_next_ci_child_recheck(fam: Family, path: Path):
-    """after_rename for a state's generated child: once the child is renamed aside, fresh process evidence, and the
-    child goes back when anything has started on its state since the last check before the rename. That is a
-    process naming the state or open in it, the state's runner running a job that the state's times (taken before
-    the rename, so the rename's own change to the state directory is not mistaken for a build) do not predate, or a
-    write to any other top-level entry of the state since then (a build that began: xcodebuild rewrites its
-    info.plist first). Evidence that cannot be taken puts the child back too."""
+    """after_rename for a state's generated child: once the child is renamed aside, fresh evidence, and the child
+    goes back when anything has started on its state since the last check before the rename. That is a process
+    naming the state or open in it; its owner changed from the one cmux_next_ci_busy vetted (a re-registration); its
+    runner running a job that the state's times (taken before the rename, so the rename's own change to the state
+    directory is not mistaken for a build) do not predate, or any running job in a drain; a write to any other
+    top-level entry of the state since then (a build that began: xcodebuild rewrites its info.plist first); or a
+    marker, socket or unknown child (cmux_next_ci_tree_busy). Evidence that cannot be taken or read puts the child
+    back too."""
     state = cmux_next_ci_state_for(path, fam.root)
     if state is None:
         return None
-    runner = cmux_next_ci_owner(state, fam.root)
+    vetted = CMUX_NEXT_CI_VETTED_OWNER.get(state, OWNER_UNKNOWN)  # never vetted: whose it is is unknown
     written = cmux_next_ci_state_written(state)
     doomed = path.with_name(f"{DELETING_PREFIX}{path.name}-{os.getpid()}")
 
@@ -7758,11 +7760,14 @@ def cmux_next_ci_child_recheck(fam: Family, path: Path):
             opened, cmds = process_evidence()
         except NoEvidence:
             opened, cmds = None, ""
-        taken = (opened is None or runner == OWNER_UNKNOWN or written <= 0
+        runner = cmux_next_ci_owner(state, fam.root)
+        since = cmux_next_ci_children_written(state, doomed.name)
+        taken = (opened is None or written <= 0 or since is None or since > written
+                 or OWNER_UNKNOWN in (runner, vetted) or runner != vetted
                  or (runner is not None and runner_job_live(runner, cmds)
-                     and not cmux_next_ci_job_predates(state, runner, written))
+                     and (CMUX_NEXT_CI_DRAIN or not cmux_next_ci_job_predates(state, runner, written)))
                  or in_cwd(os.fspath(state), open_index(opened)) or named_by(os.fspath(state), cmds)
-                 or cmux_next_ci_children_written(state, doomed.name) > written)
+                 or bool(cmux_next_ci_tree_busy(state, aside=doomed.name)))
         if not taken:
             return
         try:
@@ -7773,15 +7778,17 @@ def cmux_next_ci_child_recheck(fam: Family, path: Path):
     return recheck
 
 
-def cmux_next_ci_children_written(state: Path, skip: str) -> float:
+def cmux_next_ci_children_written(state: Path, skip: str) -> float | None:
     """The newest mtime among STATE's direct children other than SKIP (not the state directory itself, whose mtime the
-    rename aside just moved), 0 when there are none or they cannot be read."""
+    rename aside just moved): 0 when there are none, None when the state or a child cannot be read."""
     newest = 0.0
-    for child in _children(state):
-        if child.name == skip:
-            continue
-        with contextlib.suppress(OSError):
-            newest = max(newest, child.lstat().st_mtime)
+    try:
+        with os.scandir(state) as it:
+            for entry in it:
+                if entry.name != skip:
+                    newest = max(newest, entry.stat(follow_symlinks=False).st_mtime)
+    except OSError:
+        return None
     return newest
 
 
@@ -7967,9 +7974,11 @@ def cmux_next_ci_holds_socket(state: Path, budget: int = 3000) -> bool:
     return False
 
 
-def cmux_next_ci_tree_busy(state: Path) -> str:
+def cmux_next_ci_tree_busy(state: Path, aside: str = "") -> str:
     """cmux_next_ci_busy's vetoes read from the tree itself: a socket, an activity marker in it or beside it,
-    a child the family does not know. Also read on a slot's detached tree (cmux_next_ci_slot_recheck)."""
+    a child the family does not know. Also read on a slot's detached tree (cmux_next_ci_slot_recheck), and on a
+    state one of whose generated children is renamed aside as ASIDE (cmux_next_ci_child_recheck), which is not
+    an unknown child."""
     if cmux_next_ci_holds_socket(state):
         return "cmux-next state holds a socket"
     for ancestor in (state, state.parent):
@@ -7978,7 +7987,7 @@ def cmux_next_ci_tree_busy(state: Path) -> str:
                 return f"cmux-next active or ambiguous marker: {entry.name}"
     unknown = [entry.name for entry in _children(state)
                if entry.name not in CMUX_NEXT_CI_PRESERVED_NAMES
-               and entry.name not in CMUX_NEXT_CI_GENERATED_NAMES]
+               and entry.name not in CMUX_NEXT_CI_GENERATED_NAMES and entry.name != aside]
     if unknown:
         return "cmux-next state has unknown children: " + ", ".join(sorted(unknown)[:4])
     return ""

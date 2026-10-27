@@ -26,9 +26,11 @@ than the `Runner.Worker` (its `ps` start time) holds the runner's last job's
 output, as an idle runner's does. A job whose start `ps` cannot show keeps
 everything its runner owns. Once any state's generated child is renamed
 aside, evidence is taken again, against the state's times read before the
-rename: if a process names the state or is open in it, its runner's job no
-longer predates it, or another top-level entry of the state was written since
-(a build that began rewrites `info.plist`), the child is put back. cmux14,
+rename: if a process names the state or is open in it, its owner changed (a
+re-registration), its runner's job no longer predates it (in a drain, any
+running job), another top-level entry of the state was written since (a build
+that began rewrites `info.plist`), a marker, socket or unknown child appeared,
+or the state cannot be read, the child is put back. cmux14,
 2026-10-27: ten runners had a job around the clock, every state was last built
 in before its runner's job began, and the cache sat at 79 GiB against its
 40 GiB cap with nothing reclaimable. An explicit drain (below) still refuses
