@@ -2816,6 +2816,10 @@ class TickBudgetTest(Base):
             gg.register(f"pr:o/r#{n}")
         gg.register("run:o/r/1")
         gg.register("run:o/r/2", waited=True)
+        for key in [f"pr:o/r#{n}" for n in range(1, 6)] + ["run:o/r/1", "run:o/r/2"]:  # all read a while ago, alike
+            gg.write_json(gg.cache_dir() / gg.file_name(key), {"key": key, "fetchedAt": NOW - 2 * gg.CYCLE,
+                                                               "dataAt": NOW - 2 * gg.CYCLE, "error": None,
+                                                               "data": {"status": "in_progress"}})
         order: list[str] = []
 
         def read(e: dict) -> None:
@@ -2832,6 +2836,21 @@ class TickBudgetTest(Base):
                 self.daemon.tick(NOW + t * gg.TICK)
         self.assertEqual(sorted(set(order)), sorted([f"pr:o/r#{n}" for n in range(1, 6)] + ["run:o/r/1", "run:o/r/2"]),
                          "every key is reached: a deferred key never starves behind the rest")
+
+    def test_waiters_kept_busy_do_not_starve_an_unwaited_key(self) -> None:
+        """A waited key is aged WAIT_PRIORITY, not ranked absolutely: with waited runs due every cycle and room for
+        one read a tick, an unwaited run unread longer than that still gets its turn."""
+        self.daemon.now = NOW
+        cached = lambda key, at: {"key": key, "cache": {"source": "rest", "fetchedAt": at}, "waitedAt": None}
+        old = cached("run:o/r/9", NOW - gg.WAIT_PRIORITY - 60)
+        waited = [{**cached(f"run:o/r/{i}", NOW - 30), "waitedAt": NOW} for i in range(1, 4)]
+        fresh_unwaited = cached("run:o/r/8", NOW - 10)
+        never = {"key": "run:o/r/7", "cache": None, "waitedAt": None}
+        entries = [fresh_unwaited, *waited, old, never]
+        entries.sort(key=lambda e: self.daemon.last_read(e) - (gg.WAIT_PRIORITY if self.daemon.waited(e) else 0))
+        self.assertEqual([e["key"] for e in entries][:2], ["run:o/r/7", "run:o/r/9"],
+                         "a never-read key, then one unread past the waiters' head start")
+        self.assertEqual(entries[-1]["key"], "run:o/r/8", "a fresh unwaited key waits behind the waiters")
 
     def test_pr_batches_left_over_go_first_next_tick(self) -> None:
         keys = []

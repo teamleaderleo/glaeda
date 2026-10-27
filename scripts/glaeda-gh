@@ -294,6 +294,7 @@ REST_SAFETY = 900  # a run the controller tracks is still read over REST this of
 # was read from GitHub for this long, is read once more (a lost completion delivery: manaflow-ai/cmux run
 # 40557947333, 2026-10-27, finished on GitHub while the controller kept it in_progress and its waiter blocked).
 STALE_RUN_REREAD = 180
+WAIT_PRIORITY = STALE_RUN_REREAD  # in a busy tick, a waited key is read as if this much longer unread
 # A watch counts as waited on this long after a wait (or a downstream's) last registered it: past the client's
 # controller long-poll (subscribe_wait), which registers once before it blocks, and the daemon's touches after it.
 WAIT_INTEREST = CONTROLLER_RUN_MAX_WAIT + 2 * TOUCH_EVERY
@@ -2006,10 +2007,12 @@ class Daemon:
             self.batched(kind, batch, fetch)
             self.post_between()
         over_rest = (prs if over["pr"] == "rest" else []) + (runs if over["run"] == "rest" else [])
-        # Waited keys first, then the longest unread: a tick that runs out of time defers the tail, and with PRs
-        # always ahead of runs a busy daemon read PRs tick after tick while a blocked `wait run` sat on a run
-        # nobody reached (2026-10-27: 581 s and counting, with STALE_RUN_REREAD due at 180 s).
-        over_rest.sort(key=lambda e: (not self.waited(e), self.last_read(e)))
+        # The longest unread first, a key a wait is blocked on counted WAIT_PRIORITY older: a tick that runs out of
+        # time defers the tail, and with PRs always ahead of runs a busy daemon read PRs tick after tick while a
+        # blocked `wait run` sat on a run nobody reached (2026-10-27: 581 s and counting, with STALE_RUN_REREAD
+        # due at 180 s). Aging, not an absolute rank: an unread key's place only improves while read keys move
+        # back, so waiters cannot starve the rest, and a never-read key (no cache) goes first.
+        over_rest.sort(key=lambda e: self.last_read(e) - (WAIT_PRIORITY if self.waited(e) else 0))
         for i, e in enumerate(over_rest):
             # A read is admitted only when its worst case fits in the share, so the share holds at a
             # request, not at a batch; the rest go first next tick, over whichever bucket is richer.
