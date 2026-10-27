@@ -2837,6 +2837,35 @@ class TickBudgetTest(Base):
         self.assertEqual(sorted(set(order)), sorted([f"pr:o/r#{n}" for n in range(1, 6)] + ["run:o/r/1", "run:o/r/2"]),
                          "every key is reached: a deferred key never starves behind the rest")
 
+    def test_slow_failing_reads_do_not_hold_the_head_of_every_tick(self) -> None:
+        """A controller-fed run whose REST read fails keeps its restAt; the read's start still moves it back, so
+        two slow failures a tick cannot keep a healthy run deferred forever."""
+        self.daemon.budget = {"rest": {"limit": 5000, "remaining": 4500, "reset": NOW + 1800},
+                              "graphql": {"limit": 5000, "remaining": 0, "reset": NOW + 1800}}
+        for i in (1, 2, 3, 4):
+            key = f"run:o/r/{i}"
+            gg.register(key)
+            rest_at = NOW - 3600 if i < 4 else NOW - 2 * gg.CYCLE  # the failing three are far older
+            gg.write_json(gg.cache_dir() / gg.file_name(key), {
+                "key": key, "fetchedAt": rest_at, "dataAt": rest_at, "restAt": rest_at, "source": "rest",
+                "error": None, "data": {"status": "in_progress"}})
+        order: list[str] = []
+
+        def read(e: dict) -> None:
+            order.append(e["key"])
+            if e["key"] != "run:o/r/4":
+                self.daemon.store(e["key"], e["cache"], error="HTTP 502")
+                c = gg.read_cache(e["key"])
+                c["fetchedAt"] = NOW - 3600  # as a controller-fed run keeps restAt across a failure
+                gg.write_json(gg.cache_dir() / gg.file_name(e["key"]), c)
+            if len(order) % 2 == 0:
+                raise gg.OutOfTime()
+
+        with mock.patch.object(self.daemon, "fetch_run", side_effect=read):
+            for t in range(4):
+                self.daemon.tick(NOW + t * (gg.CYCLE + 1))
+        self.assertIn("run:o/r/4", order, "the healthy run is reached despite the failing ones")
+
     def test_waiters_kept_busy_do_not_starve_an_unwaited_key(self) -> None:
         """A waited key is aged WAIT_PRIORITY, not ranked absolutely: with waited runs due every cycle and room for
         one read a tick, an unwaited run unread longer than that still gets its turn."""

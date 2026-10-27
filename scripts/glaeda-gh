@@ -1294,6 +1294,7 @@ class Daemon:
         self.now = time.time()
         self.errors: list[str] = []
         self.attempted: dict[str, float] = {}  # when each key was last fetched: a new one at most once per cycle
+        self.rest_tried: dict[str, float] = {}  # when a REST read of each key last started, answered or not
         self.sent: list[tuple[float, str]] = []  # (time, rest|rest304|graphql) for the last hour's counts
         self.paths: dict[str, str] = dict(BUCKETS)  # the bucket each kind reads over now
         self.reads: list[tuple[float, str, str]] = []  # (time, kind, bucket) per entry read, for the last hour
@@ -1816,13 +1817,14 @@ class Daemon:
         at = e.get("waitedAt")
         return isinstance(at, (int, float)) and self.now - at < WAIT_INTEREST
 
-    @staticmethod
-    def last_read(e: dict) -> float:
-        """When GitHub was last read for this entry: a controller-fed run's REST clock, else its last fetch.
-        Never read (no cache) sorts first, so a new watch is filled at once."""
+    def last_read(self, e: dict) -> float:
+        """When GitHub was last read for this entry, or a REST read of it last started (a read that failed slowly
+        must move back too, or failing keys would hold the head of every tick): a controller-fed run's REST clock,
+        else its last fetch. Never read nor tried (no cache) sorts first, so a new watch is filled at once."""
         c = e.get("cache") or {}
         at = c.get("restAt") if c.get("source") == "controller" else c.get("fetchedAt")
-        return float(at) if isinstance(at, (int, float)) else float("-inf")
+        return max(float(at) if isinstance(at, (int, float)) else float("-inf"),
+                   self.rest_tried.get(e["key"], float("-inf")))
 
     def due(self, kind: str, entries: list[dict]) -> list[dict]:
         mine = [e for e in entries if e["key"].startswith(kind + ":")]
@@ -2019,6 +2021,7 @@ class Daemon:
             if self.mode("rest") == "stop" or not self.rest_room(REST_READ_MAX[e["key"].split(":", 1)[0]]):
                 self.defer(over_rest[i:])
                 break
+            self.rest_tried[e["key"]] = self.now
             try:
                 (self.fetch_pr_rest if e["key"].startswith("pr:") else self.fetch_run)(e)
             except OutOfTime:
@@ -2047,6 +2050,7 @@ class Daemon:
             self.errors.append(f"waits: {describe(error)} at {error_site(error)}")
         self.deferred &= {e["key"] for e in entries}
         self.attempted = {k: t for k, t in self.attempted.items() if self.now - t < 2 * IDLE_EXPIRY}
+        self.rest_tried = {k: t for k, t in self.rest_tried.items() if self.now - t < 2 * IDLE_EXPIRY}
         oldest = self.oldest_data(entries, {e["key"] for e in prs + runs + comments + heads})
         self.prune({e["key"] for e in entries})
         self.post_prune()
