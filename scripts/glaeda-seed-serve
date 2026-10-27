@@ -1042,6 +1042,15 @@ def report(part: Path) -> None:
 
 
 def fill(cache: Path, name: str, timeout: float = FILL_TIMEOUT, curl: str = CURL) -> str:
+    """fill_part, and no part left behind whatever stops it (the request's alarm included)."""
+    try:
+        return fill_part(cache, name, timeout, curl)
+    except BaseException:
+        part_of(cache, name).unlink(missing_ok=True)
+        raise
+
+
+def fill_part(cache: Path, name: str, timeout: float, curl: str) -> str:
     """Download NAME from its bucket into the cache; '' when it is there, 'miss' for a 404, else why not.
 
     Into a temporary name beside it, so a reader never sees a part. curl keeps a low-speed abort.
@@ -1067,6 +1076,7 @@ def fill(cache: Path, name: str, timeout: float = FILL_TIMEOUT, curl: str = CURL
                                 stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                                 text=True, start_new_session=True)
     except OSError as error:
+        part.unlink(missing_ok=True)
         return type(error).__name__
     deadline = time.monotonic() + timeout + 30
     while True:
