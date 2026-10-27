@@ -9575,6 +9575,27 @@ class DedicatedRunnerTest(unittest.TestCase):
         self.assertEqual(next(a for a in again["actions"] if a["kind"] == "watch")["state"], "remove")
         self.assertFalse((self.home / "Library/LaunchAgents" / f"{label}.watch.plist").exists())
 
+    def test_an_uninstall_stops_when_the_watch_agent_does_not_unload(self) -> None:
+        fake_pw = mock.Mock(pw_dir=os.fspath(self.home))
+        runner = self.home / "actions-runner-glaeda-nightly-next"
+        label = "com.teamleaderleo.glaeda.cmux-runner.dedicated.nightly-next"
+        with mock.patch.object(cr.pwd, "getpwuid", return_value=fake_pw):
+            self.invoke("--apply", "--manifest", self.manifest(), "--member", "mini-std", "--dedicated", "nightly-next")
+        with mock.patch.object(cr.pwd, "getpwuid", return_value=fake_pw), \
+                mock.patch.object(cr, "bootout_watch", return_value=False):
+            stuck = self.invoke("--uninstall", "--apply", "--manifest", self.manifest(), "--member", "mini-std",
+                                "--dedicated", "nightly-next", expect=1)
+        self.assertTrue(all(a["state"] != "remove" or not a.get("applied") for a in stuck["actions"]))
+        self.assertTrue((self.home / "Library/LaunchAgents" / f"{label}.watch.plist").exists())
+        self.assertTrue((self.home / "Library/LaunchAgents" / f"{label}.plist").exists(), "the runner stays too")
+        self.assertTrue((runner / ".runner").is_file(), "still registered")
+        self.assertEqual(len(json.loads((self.state / "runners.json").read_text())["runners"]), 1)
+        with mock.patch.object(cr.pwd, "getpwuid", return_value=fake_pw):
+            self.invoke("--uninstall", "--apply", "--manifest", self.manifest(), "--member", "mini-std",
+                        "--dedicated", "nightly-next")
+        self.assertFalse((self.home / "Library/LaunchAgents" / f"{label}.watch.plist").exists())
+        self.assertEqual(json.loads((self.state / "runners.json").read_text())["runners"], [])
+
     def test_a_relabel_starts_the_runner_only_under_its_new_admission(self) -> None:
         fake_pw = mock.Mock(pw_dir=os.fspath(self.home))
         wrapper = self.home / "actions-runner-glaeda-nightly-next" / cr.HOOK_DIR / cr.DEDICATED_ADMIT

@@ -1920,11 +1920,26 @@ def apply_uninstall(ctx: Context, actions: list[dict[str, Any]]) -> None:
     # only removes the plist); otherwise (--skip-launchctl, or a plist this install does not own) any listener
     # still running refuses too, since deregistering under a live listener orphans it.
     removing = [act for act in actions if act["state"] == "remove"]
+    # a dedicated runner's watch loop goes first, confirmed: one launchd keeps would outlive everything below it,
+    # so the uninstall stops there and keeps the receipt, the registration and the directory for a re-run
+    for act in [a for a in removing if a["kind"] == "watch"]:
+        act["applied"] = False
+        if not ctx.skip_launchctl and not bootout_watch(ctx, act["label"]):
+            for other in removing:
+                other["state"], other["note"] = "failed", (
+                    "launchd still has the watch agent; nothing else removed, re-run" if other is act
+                    else "kept: the watch agent did not unload")
+            return
+        Path(act["path"]).unlink(missing_ok=True)
+        act["applied"] = True
+    removing = [act for act in removing if act["kind"] != "watch"]
     agent = next((act for act in removing if act["kind"] == "agent"), None)
     booting_out = bool(agent) and not ctx.skip_launchctl
     idle = not removing or ((booting_out or not service_may_run(ctx)) and stop_if_idle(
         ctx, (lambda: bootout(ctx)) if booting_out else (lambda: True), listener_ok=booting_out))
     for act in actions:
+        if act["kind"] == "watch":
+            continue  # handled above
         act["applied"] = False
         if act["state"] != "remove":
             continue
@@ -1944,12 +1959,6 @@ def apply_uninstall(ctx: Context, actions: list[dict[str, Any]]) -> None:
             if held_marker(ctx).is_file():  # a later install of this directory must not start out held
                 held_marker(ctx).unlink()
                 act["heldMarkRemoved"] = True
-        elif act["kind"] == "watch":
-            if not ctx.skip_launchctl and not bootout_watch(ctx, act["label"]):
-                act["state"], act["note"] = "failed", "launchd still has the watch agent; its plist is kept, re-run"
-                continue
-            Path(act["path"]).unlink(missing_ok=True)
-            act["applied"] = True
         elif act["kind"] == "deregister":
             token = ctx.take_token(f"{ctx.scope_api}/actions/runners/remove-token")
             code, out = (1, "no removal token")
