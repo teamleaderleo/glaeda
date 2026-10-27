@@ -280,10 +280,30 @@ runner_idle() {  # DIR: true only when that runner has no job, as the gate and g
   [ "$rc" -eq 3 ]
 }
 
-runner_freeze() {  # DIR: SIGSTOP its listeners; false when that failed (pkill 1, no listener, is fine)
-  local rc=0
-  pkill -STOP -f "$1/bin/Runner\.Listener" 2>/dev/null || rc=$?
-  [ "$rc" -le 1 ]
+runner_re() {  # DIR as a literal pgrep pattern
+  printf '%s' "$1" | sed 's/[][\.*^$+?(){}|]/\\&/g'
+}
+
+runner_supervisors() {  # DIR: the pgrep pattern for its listeners and what starts them (the gate, run.sh, run-helper.sh)
+  local re; re=$(runner_re "$1")
+  printf '%s' "$re/bin[^/ ]*/Runner\.Listener|listen --runner-dir $re( |\$)|$re/run(-helper)?\.sh"
+}
+
+runner_freeze() {  # DIR: SIGSTOP its listeners and their spawners until a look finds none left running; false when
+  # a signal failed or the tree kept changing (pkill 1, nothing matched, is fine)
+  local rc tries=0 pattern; pattern=$(runner_supervisors "$1")
+  while [ "$tries" -lt 5 ]; do
+    tries=$((tries + 1))
+    rc=0; pkill -STOP -f "$pattern" 2>/dev/null || rc=$?
+    [ "$rc" -le 1 ] || return 1
+    # every match stopped (state T): nothing of it can start a listener or take a job now
+    ps -axww -o stat=,command= | grep -E -- "$pattern" | grep -v grep | awk '$1 !~ /^T/ {found=1} END {exit !found}' || return 0
+  done
+  return 1
+}
+
+runner_thaw() {  # DIR
+  pkill -CONT -f "$(runner_supervisors "$1")" 2>/dev/null || true
 }
 
 runner_hold() {  # WAIT_SECONDS
@@ -299,7 +319,7 @@ runner_hold() {  # WAIT_SECONDS
     deadline=$(( $(date +%s) + $1 ))
     # the last look and the stop happen with its listener frozen, as the gate's own stop: it cannot take a job between
     while ! { runner_freeze "$dir" && runner_idle "$dir"; }; do
-      pkill -CONT -f "$dir/bin/Runner\.Listener" 2>/dev/null || true
+      runner_thaw "$dir"
       [ "$(date +%s)" -lt "$deadline" ] || refuse "$label is still running a job after $1 seconds; rerun once it ends"
       say "$label is running a job; waiting for it to end"
       sleep 30
@@ -308,7 +328,7 @@ runner_hold() {  # WAIT_SECONDS
     disabled=1
     runner_launchctl "$plist" disable "$domain/$label" || disabled=
     [ -z "$disabled" ] || runner_launchctl "$plist" bootout "$domain/$label" 2>/dev/null || true
-    pkill -CONT -f "$dir/bin/Runner\.Listener" 2>/dev/null || true  # gone after the bootout, else thawed
+    runner_thaw "$dir"  # gone after the bootout, else thawed
     if [ -z "$disabled" ]; then
       case "$plist" in
         /Library/LaunchDaemons/*) say "marked $label held; launchd disable was refused, the listener gate remains active"; continue ;;

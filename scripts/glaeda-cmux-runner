@@ -710,6 +710,11 @@ def find_runner(ctx: Context) -> dict[str, Any] | None:
 # ---------------------------------------------------------------- desired state
 
 
+def ere_escape(text: str) -> str:
+    """text as a POSIX extended regular expression that matches only itself (for pgrep -f)."""
+    return re.sub(r"([][.*^$+?(){}|\\])", r"\\\1", text)
+
+
 def hook_wrappers(ctx: Context) -> dict[str, bytes]:
     python = shlex.quote(ctx.python or "/usr/bin/python3")
     hook = shlex.quote(os.fspath(ctx.hook_dir / "glaeda-cmux-runner-hook"))
@@ -812,20 +817,21 @@ def hook_wrappers(ctx: Context) -> dict[str, bytes]:
         "# The gate died (a crash, a SIGKILL, a re-exec into a hook it cannot run). If its runner still runs,\n"
         "# never start a second one beside it: stop the listener once it has no job, then exit 1 so launchd\n"
         "# restarts this wrapper and a fresh gate. With no runner left, run it without the gate.\n"
-        f"dir={shlex.quote(os.fspath(ctx.runner_dir))}  # as the gate runs it, so pgrep matches its tree\n"
-        "tree=\"$dir/run|$dir/bin[^/ ]*/Runner\\.(Listener|Worker)\"  # bin.<version> after a self-update\n"
+        f"dir={shlex.quote(os.fspath(ctx.runner_dir))}  # as the gate runs it\n"
+        f"re={shlex.quote(ere_escape(os.fspath(ctx.runner_dir)))}  # the same, as a literal pgrep pattern\n"
+        "tree=\"$re/run|$re/bin[^/ ]*/Runner\\.(Listener|Worker)\"  # bin.<version> after a self-update\n"
         "if /usr/bin/pgrep -f \"$tree\" >/dev/null; then\n"
         "    echo \"$(date -u '+%Y-%m-%d %H:%M:%SZ'): glaeda-cmux-runner-gate: the gate exited $code with its runner running; stopping the runner once it has no job\"\n"
         "    # idle only by the hook's own test (no Worker, no request its listener took: exit 3), decided with the\n"
         "    # listener frozen so it cannot take one before the SIGINT; a hook that cannot answer keeps the runner\n"
         "    while [ -z \"$stopping\" ] && /usr/bin/pgrep -f \"$tree\" >/dev/null; do\n"
-        "        /usr/bin/pkill -STOP -f \"$dir/bin/Runner\\.Listener\"; frozen=$?\n"
+        "        /usr/bin/pkill -STOP -f \"$re/bin[^/ ]*/Runner\\.Listener\"; frozen=$?\n"
         f"        {python} {hook} busy --runner-dir \"$dir\" >/dev/null 2>&1; busy=$?\n"
         "        if [ \"$frozen\" -le 1 ] && [ \"$busy\" -eq 3 ]; then\n"
-        "            /usr/bin/pkill -INT -f \"$dir/bin/Runner\\.Listener\" ||\n"
-        "                /usr/bin/pkill -TERM -f \"$dir/run\"\n"
+        "            /usr/bin/pkill -INT -f \"$re/bin[^/ ]*/Runner\\.Listener\" ||\n"
+        "                /usr/bin/pkill -TERM -f \"$re/run\"\n"
         "        fi\n"
-        "        /usr/bin/pkill -CONT -f \"$dir/bin/Runner\\.Listener\"\n"
+        "        /usr/bin/pkill -CONT -f \"$re/bin[^/ ]*/Runner\\.Listener\"\n"
         "        sleep 5\n"
         "    done\n"
         "    exit 1\n"
@@ -1454,54 +1460,82 @@ def runner_busy(ctx: Context) -> bool:
     return worker_running(ctx.runner_dir)
 
 
+def supervisor_role(runner_dir: Path, command: str) -> str | None:
+    """Which part of this runner's launchd job command is: "listener" (bin or bin.<version>/Runner.Listener), "spawner"
+    (the gate, `listen --runner-dir DIR`, and run.sh or run-helper.sh, which start listeners), else None."""
+    hook = hook_module()
+    if hook.runner_worker(runner_dir, command, "Listener"):
+        return "listener"
+    root = re.escape(os.fspath(runner_dir))
+    if re.search(r"(?:^|\s)listen\s+--runner-dir[ =]" + root + r"(?:\s|$)", command) or \
+            re.search(r"(?:^|\s)(?:/bin/(?:ba)?sh\s+)?" + root + r"/(?:run|run-helper)\.sh(?:\s|$)", command):
+        return "spawner"
+    return None
+
+
+FREEZE_LOOKS = 5
+
+
 @contextlib.contextmanager
 def listeners_frozen(runner_dir: Path) -> Iterator[int | None]:
-    """This runner's listeners stopped (SIGSTOP) for a last look and a stop, as the gate's own stop does: frozen, a
-    listener can neither acknowledge a request nor start a Worker, so an idle reading stays true until the bootout
-    lands. Yields how many it froze, or None when it could not freeze them all (the caller then stops nothing).
-    Thawed afterwards; a booted-out listener is gone by then, or gets launchd's SIGKILL."""
+    """This runner's listeners and what spawns them (the gate, run.sh, run-helper.sh) stopped (SIGSTOP) for a last
+    look and a stop, as the gate's own stop freezes its listener: frozen, nothing of it can start a listener,
+    acknowledge a request or start a Worker, so an idle reading stays true through the stop. It looks again until a
+    look finds nothing new to freeze (a listener a spawner started between two looks is frozen too). Yields how
+    many listeners it froze, or None when it could not freeze them all or the tree kept changing: the caller then
+    stops nothing. Thawed afterwards; a booted-out process is gone by then (launchd's SIGKILL reaches it frozen)."""
     frozen: list[int] = []
-    count: int | None = 0
+    listeners: set[int] = set()
+    count: int | None = None
     try:
-        out = subprocess.run(["/bin/ps", "-axww", "-o", "pid=,command="], stdin=subprocess.DEVNULL,
-                             capture_output=True, text=True, timeout=RUN_TIMEOUT, check=True).stdout
-        hook = hook_module()
-        for line in out.splitlines():
-            pid, _, command = line.strip().partition(" ")
-            if pid.isdigit() and hook.runner_worker(runner_dir, command, "Listener"):
+        for _ in range(FREEZE_LOOKS):
+            out = subprocess.run(["/bin/ps", "-axww", "-o", "pid=,command="], stdin=subprocess.DEVNULL,
+                                 capture_output=True, text=True, timeout=RUN_TIMEOUT, check=True).stdout
+            new = []
+            for line in out.splitlines():
+                pid, _, command = line.strip().partition(" ")
+                role = supervisor_role(runner_dir, command.strip()) if pid.isdigit() else None
+                if role and int(pid) not in frozen and int(pid) != os.getpid():
+                    new.append((int(pid), role))
+            if not new:
+                count = len(listeners)
+                break
+            for pid, role in new:
                 try:
-                    os.kill(int(pid), signal.SIGSTOP)
-                    frozen.append(int(pid))
+                    os.kill(pid, signal.SIGSTOP)
                 except ProcessLookupError:
-                    continue  # it exited: nothing left to take a job
-        count = len(frozen)
+                    continue  # it exited: nothing left of it to take a job
+                frozen.append(pid)
+                if role == "listener":
+                    listeners.add(pid)
     except Exception:  # noqa: BLE001
         count = None
     try:
         yield count
     finally:
-        for pid in frozen:
+        for pid in reversed(frozen):
             with contextlib.suppress(OSError):
                 os.kill(pid, signal.SIGCONT)
 
 
-def stop_if_idle(ctx: Context, stop: Callable[[], None] | None = None, listener_ok: bool = True) -> bool:
-    """Run stop (default: boot this runner's agent out) only when it has no job, deciding with its listeners
-    frozen. listener_ok=False also refuses while a listener of it lives (a re-registration under a listener
-    nothing stops would orphan it). False: it has a job, or this cannot tell, and nothing was stopped."""
+def stop_if_idle(ctx: Context, stop: Callable[[], bool] | None = None, listener_ok: bool = True) -> bool:
+    """Run stop (default: boot this runner's agent out) only when it has no job, deciding with its listeners and
+    their spawners frozen. listener_ok=False also refuses while a listener of it lives (a re-registration under a
+    listener nothing stops would orphan it). False: it has a job, this cannot tell, or the stop did not complete."""
     with listeners_frozen(ctx.runner_dir) as frozen:
         if frozen is None or (frozen and not listener_ok) or runner_busy(ctx):
             return False
-        (stop or (lambda: bootout(ctx)))()
-    return True
+        return bool((stop or (lambda: bootout(ctx)))())
 
 
 def relabel(ctx: Context, act: dict[str, Any]) -> None:
     """Re-register this runner under the same name with the manifest's labels. _work stays."""
-    def unregister() -> None:  # with its listeners frozen and idle: none can take a job before the files go
+    def unregister() -> bool:  # with its listeners frozen and idle: none can take a job before the files go
         for name in LOCAL_REGISTRATION:
             (ctx.runner_dir / name).unlink(missing_ok=True)
-    stop = unregister if ctx.skip_launchctl else (lambda: (bootout(ctx), unregister()))
+        return True
+    # only after a confirmed bootout: a listener that survived one would take jobs under a registration --replace drops
+    stop = unregister if ctx.skip_launchctl else (lambda: bootout(ctx) and unregister())
     # --skip-launchctl stops nothing, so a listener still running there refuses: --replace would orphan it
     if not stop_if_idle(ctx, stop, listener_ok=not ctx.skip_launchctl):
         act["state"], act["note"] = "failed", "the runner started a job (or a listener runs); nothing changed, re-run when idle"
@@ -1521,13 +1555,17 @@ def relabel(ctx: Context, act: dict[str, Any]) -> None:
             act["state"], act["note"] = "failed", ("re-registered, but " + why)[:400]
 
 
-def bootout(ctx: Context, wait_s: float = 5.0) -> None:
+def bootout(ctx: Context, wait_s: float = 15.0) -> bool:
+    """Unload this runner's agent; True once launchd no longer has it (launchd SIGKILLs a job 5 s after its SIGTERM,
+    so wait_s covers that). False: it is still loaded, and the caller must not act as if it stopped."""
     domain = f"system/{ctx.label}" if ctx.headless else f"gui/{ctx.uid}/{ctx.label}"
     run([SUDO, LAUNCHCTL, "bootout", domain] if ctx.headless else [LAUNCHCTL, "bootout", domain])
     deadline = time.monotonic() + wait_s
-    while time.monotonic() < deadline and run(([SUDO, LAUNCHCTL, "print", domain] if ctx.headless
-                                               else [LAUNCHCTL, "print", domain]))[0] == 0:
+    while run(([SUDO, LAUNCHCTL, "print", domain] if ctx.headless else [LAUNCHCTL, "print", domain]))[0] == 0:
+        if time.monotonic() >= deadline:
+            return False
         time.sleep(0.25)
+    return True
 
 
 def install_service_file(ctx: Context, path: Path, data: bytes, mode: int) -> None:

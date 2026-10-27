@@ -8614,6 +8614,9 @@ class RunnerTest(unittest.TestCase):
             return proc
         self.assertFalse(cr.worker_running(runner))
         listener = spawn(f"{runner}/bin/Runner.Listener")
+        spawner = subprocess.Popen(["/bin/bash", "-c", 'exec -a "$0" /bin/sleep 60',  # the gate, which starts listeners
+                                    f"/usr/bin/python3 hook listen --runner-dir {runner} --x"])
+        self.addCleanup(lambda: (spawner.kill(), spawner.wait()))
         worker = spawn(f"{runner}/bin.2.338.0/Runner.Worker")
         deadline = time.monotonic() + 10
         while not cr.worker_running(runner):
@@ -8625,15 +8628,55 @@ class RunnerTest(unittest.TestCase):
             bootout.assert_not_called()
             worker.kill()
             worker.wait()
-            def frozen(_ctx: object) -> None:
-                state = subprocess.run(["/bin/ps", "-o", "stat=", "-p", str(listener.pid)], capture_output=True,
-                                       text=True).stdout.strip()
-                self.assertTrue(state.startswith("T"), f"the listener is stopped for the bootout: {state!r}")
+            def frozen(_ctx: object) -> bool:
+                for pid in (listener.pid, spawner.pid):
+                    state = subprocess.run(["/bin/ps", "-o", "stat=", "-p", str(pid)], capture_output=True,
+                                           text=True).stdout.strip()
+                    self.assertTrue(state.startswith("T"), f"listener and gate are stopped for the bootout: {state!r}")
+                return True
             bootout.side_effect = frozen
             self.assertTrue(cr.stop_if_idle(ctx))
             bootout.assert_called_once()
         state = subprocess.run(["/bin/ps", "-o", "stat=", "-p", str(listener.pid)], capture_output=True, text=True)
         self.assertFalse(state.stdout.strip().startswith("T"), "and thawed after")
+
+    def test_a_listener_started_between_two_looks_is_frozen_too(self) -> None:
+        runner = self.home / "actions-runner-glaeda-6"
+        looks = iter([f"1 /usr/bin/python3 hook listen --runner-dir {runner} --x\n",
+                      f"1 /usr/bin/python3 hook listen --runner-dir {runner} --x\n2 {runner}/bin/Runner.Listener run\n",
+                      f"1 /usr/bin/python3 hook listen --runner-dir {runner} --x\n2 {runner}/bin/Runner.Listener run\n"])
+        ps = lambda *a, **k: subprocess.CompletedProcess([], 0, next(looks), "")
+        with mock.patch.object(cr.subprocess, "run", side_effect=ps), mock.patch.object(cr.os, "kill") as kill:
+            with cr.listeners_frozen(runner) as frozen:
+                self.assertEqual(frozen, 1, "the listener the gate started after the first look")
+        self.assertEqual([c.args for c in kill.call_args_list],
+                         [(1, signal.SIGSTOP), (2, signal.SIGSTOP), (2, signal.SIGCONT), (1, signal.SIGCONT)])
+        endless = iter(f"{n} {runner}/bin/Runner.Listener run\n" for n in range(1, 99))
+        with mock.patch.object(cr.subprocess, "run", side_effect=lambda *a, **k: subprocess.CompletedProcess(
+                [], 0, next(endless), "")), mock.patch.object(cr.os, "kill"):
+            with cr.listeners_frozen(runner) as frozen:
+                self.assertIsNone(frozen, "a tree that keeps changing is not frozen: stop nothing")
+
+    def test_a_relabel_whose_bootout_did_not_complete_keeps_the_registration(self) -> None:
+        runner = self.home / "actions-runner-glaeda-8"
+        runner.mkdir()
+        (runner / ".runner").write_text("{}")
+        ctx = mock.Mock(runner_dir=runner, skip_launchctl=False)
+        act: dict = {}
+        with mock.patch.object(cr, "listeners_frozen", return_value=contextlib.nullcontext(0)), \
+                mock.patch.object(cr, "runner_busy", return_value=False), \
+                mock.patch.object(cr, "bootout", return_value=False), mock.patch.object(cr, "register") as register:
+            cr.relabel(ctx, act)
+        register.assert_not_called()
+        self.assertEqual(act["state"], "failed")
+        self.assertTrue((runner / ".runner").exists())
+
+    def test_listen_sh_patterns_match_the_runner_path_literally(self) -> None:
+        self.assertEqual(cr.ere_escape("/Users/a.b/actions-runner[1]"), "/Users/a\\.b/actions-runner\\[1\\]")
+        self.assertIn("re=", cr.hook_wrappers(mock.Mock(
+            python=sys.executable, hook_dir=self.home / "h", runner_dir=self.home / "actions-runner-glaeda",
+            org=None, repo="manaflow-ai/cmux", min_free_gib=0, member=None, capacity_units=4,
+            labels=["glaeda-mini"], session_runner=False))["listen.sh"].decode())
 
     def test_a_stop_that_cannot_freeze_the_listeners_stops_nothing(self) -> None:
         ctx = mock.Mock(runner_dir=self.home / "actions-runner-glaeda")
