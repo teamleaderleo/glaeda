@@ -2421,7 +2421,7 @@ def unsparse_workspace(workspace: str | None) -> str:
 # Started only when the workspace's packs pass glaeda-disk's RUNNER_CHECKOUT_BLOAT_MIN_GIB, so an ordinary job pays
 # one directory listing.
 OWN_CHECKOUT_MIN_GIB = 2.0
-OWN_CHECKOUT_TIMEOUT_S = 180.0
+OWN_CHECKOUT_TIMEOUT_S = 90.0
 
 
 def evict_own_checkout(workspace: str | None, explicit: str | None, timeout: float = OWN_CHECKOUT_TIMEOUT_S) -> str:
@@ -2439,12 +2439,19 @@ def evict_own_checkout(workspace: str | None, explicit: str | None, timeout: flo
         disk = find_disk(explicit)
         if disk is None:
             return ""
-        result = subprocess.run([sys.executable, disk, "--own-runner-checkout"], stdin=subprocess.DEVNULL,
-                                capture_output=True, text=True, timeout=timeout, check=False, cwd="/")
-        lines = result.stdout.strip().splitlines()
+        proc = subprocess.Popen([sys.executable, disk, "--own-runner-checkout"], stdin=subprocess.DEVNULL,
+                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, cwd="/",
+                                start_new_session=True)
+        try:
+            out, _ = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            with contextlib.suppress(OSError):
+                os.killpg(proc.pid, signal.SIGKILL)  # glaeda-disk and every git, lsof and ps it started
+            with contextlib.suppress(Exception):
+                proc.communicate(timeout=5)
+            return f"own checkout eviction timed out after {timeout:g} s"
+        lines = (out or "").strip().splitlines()
         return lines[-1] if lines else ""
-    except subprocess.TimeoutExpired:
-        return f"own checkout eviction timed out after {timeout:g} s"
     except Exception:  # noqa: BLE001  (never fail the job on housekeeping)
         return ""
 

@@ -750,7 +750,7 @@ CMUX_NEXT_DRAIN_HOOK_SHA256 = frozenset({
     "c2cabd0d00919555079c5dfbbb8f44f99e13c2295cf16abbe519f6badf1acdba",
     "0fb8b8caaffb7cce6eb662e21345da50e2c76f1092f81d9af5945a709f602707",
     "7c3dce3781487309ea60bacbfaccf7281895aaeb6085e7c4165aac474084fb9d",
-    "5f287540ca1aeaacc46e46b1324e261e6dc491e4fbcd3f6149d9d8063bbd96ec",
+    "2309117c961524c2aa6a868a38d61df275a84f910323be7dc89b1a87fb4c5878",
 })
 CMUX_NEXT_CI_PRESERVED_NAMES = frozenset({
     "SourcePackages", "ModuleCache.noindex", "SDKStatCaches.noindex",
@@ -2611,6 +2611,51 @@ def evict_idle_runner_checkouts(receipt: Path, floor_gib: float, home: Path | No
 # this runner is using it and no other runner ever does. Only its .git goes; the workspace directory stays for the
 # steps that run before checkout, and actions/checkout, finding no repository there, clones at the job's depth.
 RUNNER_CHECKOUT_AT_START_FAMILY = "runner-bloated-checkout-at-start"
+# The job must be starting: its Runner.Worker began at most this long ago, and nothing in the checkout's git
+# bookkeeping is newer than that start (a checkout step rewrites the index, HEAD and FETCH_HEAD). A later step of
+# the job, or any other caller, finds the checkout already in use and is refused.
+RUNNER_JOB_START_WINDOW_S = 600.0
+
+
+def runner_agent_name(runner: Path) -> str | None:
+    """The runner's name from its .runner config (agentName), or None when it cannot be read."""
+    try:
+        doc = json.loads((runner / ".runner").read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        return None
+    name = doc.get("agentName") if isinstance(doc, dict) else None
+    return name if isinstance(name, str) and name else None
+
+
+def checkout_git_touched(checkout: Path) -> float:
+    """The newest mtime of the checkout's git bookkeeping, which any git command that moves it rewrites."""
+    times = [0.0]
+    for n in ("index", "HEAD", "FETCH_HEAD", "logs/HEAD", "packed-refs", "shallow", "config"):
+        with contextlib.suppress(OSError):
+            times.append((checkout / ".git" / n).lstat().st_mtime)
+    return max(times)
+
+
+def live_linked_worktrees(checkout: Path) -> list[str] | None:
+    """The linked worktrees of the checkout whose directories still exist (each worktrees/<name>/gitdir names its
+    <worktree>/.git), or None when the list cannot be read. A worktree whose directory is gone (a job's RUNNER_TEMP,
+    wiped between jobs) is only a stale entry."""
+    root = checkout / ".git" / "worktrees"
+    try:
+        entries = list(os.scandir(root))
+    except FileNotFoundError:
+        return []
+    except OSError:
+        return None
+    live = []
+    for e in entries:
+        try:
+            target = (Path(e.path) / "gitdir").read_text().strip()
+        except OSError:
+            return None
+        if target and os.path.lexists(os.path.dirname(target)):
+            live.append(os.path.dirname(target))
+    return live
 
 
 def evict_own_runner_checkout(workspace: Path, receipt: Path, home: Path | None = None) -> str:
@@ -2624,15 +2669,24 @@ def evict_own_runner_checkout(workspace: Path, receipt: Path, home: Path | None 
     runners = enrolled_runners(home)
     if checkout.parent.parent.name != "_work" or checkout.name != checkout.parent.name or runner not in runners:
         return ""
-    if checkout not in runner_checkouts(runner / "_work") or host_reservation():
+    if checkout not in runner_checkouts(runner / "_work") or host_reservation() or disk_off():
         return ""
+    name = os.environ.get("RUNNER_NAME")
+    if not name or runner_agent_name(runner) != name:
+        return ""  # only the runner whose job is starting, about its own workspace
+    started = runner_job_started(runner)
+    if started is None or time.time() - started > RUNNER_JOB_START_WINDOW_S \
+            or checkout_git_touched(checkout) >= started:
+        return ""  # no job starting here, or this job already used the checkout
     every = [c for r in runners if not (r / "_work").is_symlink() and (r / "_work").is_dir()
              for c in runner_checkouts(r / "_work") if c.name == c.parent.name]
     bloat = bloated_runner_checkouts(every).get(os.fspath(checkout), 0)
     if not bloat:
         return ""
     git_dir = checkout / ".git"
-    why = runner_checkout_git_veto(checkout)
+    linked = live_linked_worktrees(checkout)
+    why = ("its linked worktrees cannot be read" if linked is None
+           else f"a linked worktree uses it ({linked[0]})" if linked else runner_checkout_git_veto(checkout))
     if not why:  # the git veto can take a minute: the evidence is read after it
         try:
             opened, cmds = process_evidence()
@@ -2660,8 +2714,11 @@ def evict_own_runner_checkout(workspace: Path, receipt: Path, home: Path | None 
            "family": RUNNER_CHECKOUT_AT_START_FAMILY, "path": os.fspath(git_dir), "bytes": size,
            "verdict": "blocked" if why else "reclaimable",
            "reasons": [why] if why else [f"bloated: {gib(bloat).strip()} of packs", "its runner's job is starting"]}
-    with contextlib.suppress(OSError), receipt.open("a") as f:
-        f.write(json.dumps(rec) + "\n")
+    with contextlib.suppress(OSError):
+        receipt.parent.mkdir(parents=True, exist_ok=True)
+        with receipt.open("a") as f:
+            f.write(json.dumps(rec) + "\n")
+    RUN["released"] = RUN.get("released", 0) + size
     if why:
         return f"kept the bloated checkout {checkout} ({gib(bloat).strip()} of packs): {why}"
     if outcome != "reclaimed":
@@ -2679,10 +2736,21 @@ def own_runner_checkout_main(args: list[str]) -> int:
     workspace = os.environ.get("GITHUB_WORKSPACE")
     if not workspace or not os.environ.get("RUNNER_NAME"):
         return 0
-    note = evict_own_runner_checkout(Path(workspace), a.receipt)
-    if note:
-        print(note)
-    return 0
+    RUN.clear()
+    RUN.update(caller=run_caller(), mode="own-runner-checkout", apply=True)
+    started, before = time.time(), _home_free()
+    try:
+        if (off := disk_off()):
+            RUN.update(off=True, skipped=f"kill switch: {off}")
+            return 0
+        note = evict_own_runner_checkout(Path(workspace), a.receipt)
+        if note:
+            print(note)
+        else:
+            RUN["skipped"] = "not a bloated checkout of a starting job"
+        return 0
+    finally:
+        write_run_line(started, before)
 
 
 

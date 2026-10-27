@@ -5000,7 +5000,17 @@ class GlaedaDiskTest(unittest.TestCase):
         for name in names:
             self._git_checkout(cos[name])
             self._packs(cos[name], 6.8 if name == "actions-runner-glaeda-11" else 0.55)
+            (home / name / ".runner").write_text('\ufeff{"agentName": "%s"}' % name.replace("actions-runner-", "mini-"))
+            self._age(cos[name] / ".git", hours=1)  # the last job's checkout, an hour ago
         return home, cos
+
+    def _starting(self, runner: str = "actions-runner-glaeda-11", ago_s: float = 20.0):
+        """This runner's job started ago_s ago; the hook runs with its environment."""
+        stack = contextlib.ExitStack()
+        stack.enter_context(mock.patch.object(gd, "runner_job_started", return_value=time.time() - ago_s))
+        stack.enter_context(mock.patch.dict(os.environ, {"RUNNER_NAME": runner.replace("actions-runner-", "mini-")}))
+        stack.enter_context(mock.patch.object(gd, "disk_off", return_value=""))
+        return stack
 
     def test_the_job_start_takes_its_own_bloated_checkouts_git(self) -> None:
         """A runner that takes job after job is never quiet, so its bloated checkout never went (the tour runner on all
@@ -5012,7 +5022,7 @@ class GlaedaDiskTest(unittest.TestCase):
         gd.process_evidence = lambda: ([os.fspath(bloated)], f"{home}/actions-runner-glaeda-11/bin/Runner.Worker spawnclient 1 2")
         patches, removed = self._floor_disk(400.0)
         receipt = self.receipt()
-        with patches[0], patches[1], mock.patch.object(gd, "host_reservation", return_value=""):
+        with patches[0], patches[1], mock.patch.object(gd, "host_reservation", return_value=""), self._starting():
             self.assertEqual(gd.evict_own_runner_checkout(cos["actions-runner-glaeda"], receipt, home), "")
             note = gd.evict_own_runner_checkout(bloated, receipt, home)
         self.assertIn("removed", note)
@@ -5032,20 +5042,30 @@ class GlaedaDiskTest(unittest.TestCase):
             "no process evidence": (lambda co: no_evidence, False, "", "changed:in-use"),
             "a commit only it has": (lambda co: ([], ""), True, "", "blocked:git"),
             "a reserved host": (lambda co: ([], ""), False, "reserved by x", None),
+            "a live linked worktree": (lambda co: ([], ""), "worktree", "", "changed:in-use"),
         }
         for what, (evidence, unpushed, reserved, outcome) in cases.items():
             with self.subTest(what):
                 self.root = Path(tempfile.mkdtemp(dir=self.root))
                 home, cos = self._own_checkout_fixture()
                 bloated = cos["actions-runner-glaeda-11"]
-                if unpushed:
+                if unpushed == "worktree":
+                    wt = self.root / "temp/cmux-next-base"
+                    wt.parent.mkdir(parents=True, exist_ok=True)
+                    subprocess.run(["git", "-C", os.fspath(bloated), "worktree", "add", "-q", "--detach", os.fspath(wt)],
+                                   check=True, capture_output=True, env={"PATH": "/usr/bin:/bin:/opt/homebrew/bin",
+                                                                          "HOME": os.fspath(self.root)})
+                    self._age(bloated / ".git", hours=1)
+                elif unpushed:
                     self._git_checkout(bloated, pushed=False)
                     self._packs(bloated, 6.8)
+                    self._age(bloated / ".git", hours=1)
                 ev = evidence(bloated)
                 gd.process_evidence = ev if callable(ev) else (lambda ev=ev: ev)
                 patches, removed = self._floor_disk(400.0)
                 receipt = self.receipt()
-                with patches[0], patches[1], mock.patch.object(gd, "host_reservation", return_value=reserved):
+                with patches[0], patches[1], mock.patch.object(gd, "host_reservation", return_value=reserved), \
+                        self._starting():
                     note = gd.evict_own_runner_checkout(bloated, receipt, home)
                 self.assertEqual(removed, [])
                 self.assertTrue((bloated / ".git").is_dir())
@@ -5061,17 +5081,35 @@ class GlaedaDiskTest(unittest.TestCase):
         home, cos = self._own_checkout_fixture()
         stray = self.root / "elsewhere/_work/cmux/cmux"
         self._packs(stray, 6.8)
-        with mock.patch.object(gd, "host_reservation", return_value=""):
-            self.assertEqual(gd.evict_own_runner_checkout(stray, self.receipt(), home), "")
-            self.assertEqual(gd.evict_own_runner_checkout(cos["actions-runner-glaeda-11"].parent, self.receipt(), home), "")
+        bloated = cos["actions-runner-glaeda-11"]
+        with mock.patch.object(gd, "host_reservation", return_value=""), \
+                mock.patch.object(gd, "process_evidence", side_effect=AssertionError("judged")):
+            with self._starting():
+                self.assertEqual(gd.evict_own_runner_checkout(stray, self.receipt(), home), "")
+                self.assertEqual(gd.evict_own_runner_checkout(bloated.parent, self.receipt(), home), "")
+            with self._starting(runner="actions-runner-glaeda-2"):  # another runner's job: never this workspace
+                self.assertEqual(gd.evict_own_runner_checkout(bloated, self.receipt(), home), "")
+            with self._starting(ago_s=gd.RUNNER_JOB_START_WINDOW_S + 60):  # a later step of a long job
+                self.assertEqual(gd.evict_own_runner_checkout(bloated, self.receipt(), home), "")
+            with self._starting(), mock.patch.object(gd, "runner_job_started", return_value=None):  # no job here
+                self.assertEqual(gd.evict_own_runner_checkout(bloated, self.receipt(), home), "")
+            with self._starting():  # this job already checked out: its index is newer than its start
+                os.utime(bloated / ".git/index")
+                self.assertEqual(gd.evict_own_runner_checkout(bloated, self.receipt(), home), "")
+                self._age(bloated / ".git/index", hours=1)
+            with self._starting(), mock.patch.object(gd, "disk_off", return_value="disk-off exists"):
+                self.assertEqual(gd.evict_own_runner_checkout(bloated, self.receipt(), home), "")
         called = []
-        with mock.patch.object(gd, "evict_own_runner_checkout", side_effect=lambda *a: called.append(a) or ""):
+        with mock.patch.object(gd, "evict_own_runner_checkout", side_effect=lambda *a: called.append(a) or ""), \
+                mock.patch.object(gd, "RUN_LOG", self.root / "runs.jsonl"), mock.patch.object(gd, "disk_off", return_value=""):
             for env in ({}, {"GITHUB_WORKSPACE": "/w"}, {"GITHUB_WORKSPACE": "/w", "RUNNER_NAME": "r"}):
                 with mock.patch.dict(os.environ, env, clear=False):
                     for key in {"GITHUB_WORKSPACE", "RUNNER_NAME"} - set(env):
                         os.environ.pop(key, None)
                     self.assertEqual(gd.main(["--own-runner-checkout", "--receipt", os.fspath(self.receipt())]), 0)
         self.assertEqual([a[0] for a in called], [Path("/w")])
+        (line,) = map(json.loads, (self.root / "runs.jsonl").read_text().splitlines())
+        self.assertEqual(line["mode"], "own-runner-checkout")
 
     def test_past_the_target_under_the_floor_a_bloated_checkout_keeps_a_commit_only_it_has(self) -> None:
         """Under the floor the last resort takes quiet checkouts without the git veto only until the target; a
