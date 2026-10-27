@@ -10,6 +10,7 @@ import collections
 import fcntl
 import hashlib
 import io
+import itertools
 import json
 import errno
 import os
@@ -53,6 +54,9 @@ gd.HOST_RESERVATION_LOCAL = Path(_NO_RESERVATIONS.name + ".none")
 _reap_tmpdir_test_residue = gd.reap_tmpdir_test_residue
 gd.reap_tmpdir_test_residue = (lambda receipt, tmp=None, halt=None, runner_host=None:
                                0 if tmp is None else _reap_tmpdir_test_residue(receipt, tmp, halt, runner_host))
+# Nor start a background volume census, or read the real host's census, from a test.
+gd.CENSUS_AUTOLAUNCH = False
+gd.CENSUS_STATE = Path(_NO_RESERVATIONS.name + ".census-none.json")
 # Nor git gc the clones in the real home of the host running the suite: only a test's own home is gc'd.
 _gc_home_clones = gd.gc_home_clones
 gd.gc_home_clones = lambda receipt, home=None, halt=None: 0 if home is None else _gc_home_clones(receipt, home, halt)
@@ -1192,8 +1196,9 @@ class GlaedaDiskTest(unittest.TestCase):
                 mock.patch.object(gd, "apfs_container_capacity", return_value=None):
             got = gd.filesystem_accounting([fs], [item])
         du.assert_called_once_with(self.root, record_timeout=False)
-        self.assertEqual(got[0]["measured"], 3 * gd.GIB)
-        self.assertEqual(got[0]["unmeasured"], 5 * gd.GIB)
+        # the walked root holds the item: measured is the root's bytes, the item is not added again
+        self.assertEqual(got[0]["measured"], 8 * gd.GIB)
+        self.assertEqual(got[0]["unmeasured"], 0)
         self.assertEqual(got[0]["top_level"][0]["path"], str(self.root))
 
     def test_accounting_reconciles_overlapping_shared_runner_coverage(self) -> None:
@@ -5858,6 +5863,144 @@ class GlaedaDiskTest(unittest.TestCase):
         (home / "actions-runner-glaeda/glaeda-hooks/job-started.sh").write_text(
             "exec x job-started --min-free-gib 50 --toolchain-xcode /Applications/Xcode_26.6.app --instance 0\n")
         self.assertIn(os.path.realpath("/Applications/Xcode_26.6.app"), gd.xcode_pins(home))
+
+
+class VolumeCensusTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(os.path.realpath(self.tmp.name)) / "vol"
+        self.root.mkdir()
+        self.state = Path(self.tmp.name) / "census.json"
+        saved = (gd.DARWIN, gd.ACCOUNTING, gd.CENSUS_STATE)
+        gd.DARWIN, gd.ACCOUNTING, gd.CENSUS_STATE = False, Path(self.tmp.name) / "accounting.json", self.state
+        gd._ACCOUNTING_MEM.clear()
+        gd._ACCOUNTING_COVERAGE_MEM.clear()
+        self.addCleanup(self.tmp.cleanup)
+        self.addCleanup(lambda: (setattr(gd, "DARWIN", saved[0]), setattr(gd, "ACCOUNTING", saved[1]),
+                                  setattr(gd, "CENSUS_STATE", saved[2]),
+                                  gd._ACCOUNTING_MEM.clear(), gd._ACCOUNTING_COVERAGE_MEM.clear()))
+
+    def write(self, rel: str, size: int = 8192) -> Path:
+        path = self.root / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(os.urandom(size))  # random bytes: no sparse or compressed blocks
+        return path
+
+    def fs(self, used: int) -> "gd.Fs":
+        return gd.Fs(self.root.stat().st_dev, str(self.root), 100 * gd.GIB - used, 100 * gd.GIB, 0, 0)
+
+    @staticmethod
+    def du(path: Path) -> int:
+        return int(subprocess.run(["du", "-xsk", str(path)], capture_output=True, text=True,
+                                  check=True).stdout.split()[0]) * 1024
+
+    def test_nested_sized_paths_are_counted_once(self) -> None:
+        parent, child = self.root / "parent", self.root / "parent/child"
+        child.mkdir(parents=True)
+        (self.root / "small").mkdir()
+        items = [gd.Item("projects", str(parent), 7 * gd.GIB, 2.0, "report-only"),
+                 gd.Item("checkout-build", str(child), 3 * gd.GIB, 2.0, "reclaimable")]
+        sizes = {str(parent): 7 * gd.GIB, str(child): 3 * gd.GIB,  # the items themselves
+                 str(self.root / "small"): 2 * gd.GIB}  # below the report floor, still sized
+        census = {"complete": True, "at": 1.0, "rows": {
+            str(self.root / "loose"): [4 * gd.GIB, "unclassified", True],
+            str(parent / "inside"): [5 * gd.GIB, "unclassified", True]}}  # nested in a sized item
+        with mock.patch.object(gd, "census_for", return_value=census):
+            got = gd.filesystem_accounting([self.fs(13 * gd.GIB)], items, sizes)[0]
+        self.assertEqual(got["measured"], 13 * gd.GIB)
+        self.assertEqual(got["reclaimable"], 3 * gd.GIB)
+        self.assertEqual(got["accounting_gap"], 0)
+        self.assertEqual(got["residual"]["category"], gd.APFS_INVISIBLE)
+
+    def test_a_complete_walk_leaves_no_gap(self) -> None:
+        sized = self.write("sized/a").parent
+        self.write("sized/b", 16384)
+        item = self.write("holder/item/blob").parent
+        self.write("holder/loose")
+        self.write("holder/other/deep/blob", 12288)
+        self.write("plain/x/y", 4096)
+        self.write("rootfile")
+        covered = {str(sized), str(item)}
+        state = gd.census_pass([self.root], covered, path=self.state)
+        self.assertTrue(state["complete"])
+        self.assertIn(str(self.root / "plain"), state["rows"])
+        self.assertIn(str(self.root / "holder/other"), state["rows"])
+        self.assertNotIn(str(sized), state["rows"])
+        sizes = {p: self.du(Path(p)) for p in covered}
+        got = gd.filesystem_accounting([self.fs(self.du(self.root))], [], sizes)[0]
+        self.assertEqual(got["accounting_gap"], 0)
+        self.assertEqual(got["measured"], got["used"])
+        self.assertEqual(got["residual"]["category"], gd.APFS_INVISIBLE)
+        row = next(r for r in got["coverage"] if r["scope"] == gd.CENSUS_SCOPE)
+        self.assertIn(f"unclassified:{self.root / 'plain'}", [c["category"] for c in row["children"]])
+
+    def test_an_unreadable_dir_is_reported_not_raised(self) -> None:
+        self.write("readable/x")
+        locked = self.write("locked/inner/blob").parents[1]
+        held = self.write("held/item/blob").parent
+        real_scandir, real_du = os.scandir, gd._census_du
+
+        def scandir(path):
+            if Path(path) == self.root / "held":
+                raise PermissionError(errno.EACCES, "Permission denied", str(path))
+            return real_scandir(path)
+
+        def census_du(path, timeout):
+            if path == locked:
+                return 4096, False  # du printed "Permission denied" and a lower bound
+            return real_du(path, timeout)
+
+        with mock.patch.object(gd.os, "scandir", side_effect=scandir), \
+                mock.patch.object(gd, "_census_du", side_effect=census_du):
+            state = gd.census_pass([self.root], {str(held)}, path=self.state)
+        self.assertTrue(state["complete"])
+        self.assertEqual(state["rows"][str(locked)][1:], ["unreadable", False])
+        self.assertEqual(state["rows"][str(self.root / "held")][1], "unreadable")
+        got = gd.filesystem_accounting([self.fs(gd.GIB)], [])[0]
+        row = next(r for r in got["coverage"] if r["scope"] == gd.CENSUS_SCOPE)
+        self.assertIn(f"unreadable:{locked}", [c["category"] for c in row["children"]])
+        self.assertIn("unreadable", got["residual"]["category"])
+
+    def test_cadence_is_daily_and_a_slice_stops_at_its_budget_then_resumes(self) -> None:
+        now = 1_000_000.0
+        self.assertTrue(gd.census_due({}, now))
+        self.assertFalse(gd.census_due({"complete": True, "started_at": now - 23 * 3600}, now))
+        self.assertTrue(gd.census_due({"complete": True, "started_at": now - 24 * 3600}, now))
+        self.assertFalse(gd.census_due({"complete": False, "slice_at": now - 600}, now))
+        self.assertTrue(gd.census_due({"complete": False, "slice_at": now - 3600}, now))
+        for name in ("a", "b", "c", "d", "e", "f"):
+            self.write(f"{name}/blob")
+        ticks = itertools.count(step=10.0)
+        walked: list[Path] = []
+
+        def census_du(path, timeout):
+            walked.append(path)
+            self.assertLessEqual(timeout, gd.CENSUS_DU_TIMEOUT_S)
+            return 8192, True
+
+        with mock.patch.object(gd, "_census_du", side_effect=census_du):
+            first = gd.census_pass([self.root], set(), budget_s=75, now=now,
+                                   clock=lambda: next(ticks), path=self.state)
+            self.assertFalse(first["complete"])
+            self.assertTrue(first["pending"])
+            self.assertFalse(gd.census_due(gd.load_census(self.state), now + 60))
+            done = len(walked)
+            second = gd.census_pass([self.root], set(), gd.load_census(self.state), budget_s=1000,
+                                    now=now + 3600, clock=lambda: next(ticks), path=self.state)
+        self.assertTrue(second["complete"])
+        self.assertEqual(second["started_at"], now)  # resumed, not restarted
+        self.assertEqual(len(walked), 6)
+        self.assertEqual(len(set(walked)), 6, "a resumed slice re-walked a finished directory")
+        self.assertLess(done, 6)
+        # a complete census is not due again the same day, so the CLI does not walk
+        saved = (gd.CENSUS_LOCK, gd.census_roots)
+        gd.CENSUS_LOCK, gd.census_roots = Path(self.tmp.name) / "census.lock", lambda: [self.root]
+        self.addCleanup(lambda: (setattr(gd, "CENSUS_LOCK", saved[0]), setattr(gd, "census_roots", saved[1])))
+        with mock.patch.object(gd, "census_pass", side_effect=AssertionError("walked")), \
+                mock.patch.object(gd.time, "time", return_value=now + 7200), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(gd.main(["--census"]), 0)
+        self.assertIn("not due", out.getvalue())
 
 
 class LinuxLayoutTest(unittest.TestCase):
