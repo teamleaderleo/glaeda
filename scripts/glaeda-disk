@@ -1925,7 +1925,8 @@ def sim_device_items(devices: object, cmds: str, opened: frozenset[str], now: fl
             if not isinstance(d, dict) or not isinstance(d.get("udid"), str):
                 continue
             udid, size = d["udid"], d.get("dataPathSize")
-            size = size if isinstance(size, int) else 0
+            sized = isinstance(size, int) and not isinstance(size, bool)
+            size = size if sized else 0
             idle = _iso_age_hours(d.get("lastBootedAt"), now)
             reasons = [f"{d.get('name', '?')} ({str(runtime).rsplit('.', 1)[-1]}) {d.get('state', '?')}"]
             keep = []
@@ -1933,7 +1934,9 @@ def sim_device_items(devices: object, cmds: str, opened: frozenset[str], now: fl
                 keep.append(f"it is {d.get('state', 'in an unknown state')}")
             if d.get("isAvailable") is not True:
                 keep.append("simctl lists it unavailable")
-            if size < SIM_DEVICE_MIN_BYTES:
+            if not sized:
+                keep.append("its size cannot be read")
+            elif size < SIM_DEVICE_MIN_BYTES:
                 keep.append("its data is already small")
             if idle is None:
                 keep.append("no last-boot time")
@@ -1945,7 +1948,7 @@ def sim_device_items(devices: object, cmds: str, opened: frozenset[str], now: fl
                 keep.append("a process has a file open in it")
             name = d.get("name")
             if re.search(re.escape(udid), cmds, re.I) or (
-                    isinstance(name, str) and len(name) >= 3 and re.search(
+                    isinstance(name, str) and name and re.search(
                         r"(?:^|[\s'\"=,])" + re.escape(name) + r"(?=$|[\s'\",])", cmds, re.M)):
                 keep.append("a running command names it")  # by UDID, or by name (-destination name=...)
             if leases is None:
@@ -1963,11 +1966,12 @@ def erase_idle_sim_devices(receipt: Path, halt=None, budget_s: float = SIM_DEVIC
     """Erase each reclaimable device, largest first, while budget_s lasts (no new erase starts after it; one erase
     may then run up to its own 300 s limit), and, when below_target is given, only while it says free space is still
     short. Before each erase the device is judged again: process evidence first (lsof, the slow part), then the
-    reservation, a fresh `ps`, the capture leases and a fresh simctl reading, so the last readings are a fraction of
-    a second old when simctl starts. What can still slip between them and the erase is a job that picks this device
-    but has not booted it: simctl refuses to erase a Booted or Booting device, and an unbooted device holds only
-    state that went untouched for SIM_DEVICE_IDLE_HOURS, which this policy gives up. Returns the bytes simctl
-    reports released (0 for a device it cannot read back)."""
+    reservation, a fresh `ps`, then, holding the simulator token (sim_token) so no simulator-class job is admitted,
+    the capture leases, a fresh simctl reading and the budget, halt and target once more. What can still slip
+    between them and the erase is a job outside the simulator class that picks this device and has not yet named,
+    opened or booted it: simctl refuses to erase a Booted or Booting device, and an unbooted device holds only state
+    that went untouched for SIM_DEVICE_IDLE_HOURS, which this policy gives up. Returns the bytes simctl reports
+    released (0 for a device it cannot read back)."""
     if not DARWIN or not shutil.which("xcrun") or SIM_DEVICE_IDLE_HOURS == float("inf"):
         return 0
     simctl = (lambda: simctl_json("list", "devices")) if simctl is None else simctl
@@ -1998,24 +2002,35 @@ def erase_idle_sim_devices(receipt: Path, halt=None, budget_s: float = SIM_DEVIC
         except (OSError, subprocess.SubprocessError):
             print("refusing to erase simulator devices: ps failed", file=sys.stderr)
             break
-        now = {x.path: x for x in sim_device_items(simctl(), cmds, opened)}.get(i.path)
-        size = 0
-        if now is None or now.verdict != "reclaimable":
-            outcome, reasons = "changed:in-use", (now.reasons if now else ["no longer listed"])
-        else:
-            reasons = now.reasons
-            try:
-                r = subprocess.run(["xcrun", "simctl", "erase", i.path], capture_output=True, text=True, timeout=300)
-                outcome = "reclaimed" if r.returncode == 0 else f"incomplete:exit {r.returncode}"
-            except (OSError, subprocess.SubprocessError) as e:
-                outcome = f"incomplete:{e.__class__.__name__}"
-            if outcome == "reclaimed":
-                after = {x.path: x for x in sim_device_items(simctl(), "", frozenset(), leases="")}.get(i.path)
-                if after is None:
-                    reasons = reasons + ["its size after the erase could not be read; counted 0"]
-                else:
-                    size = max(0, now.bytes - after.bytes)
-                released += size
+        token = sim_token()
+        if token is None:
+            print("not erasing simulator devices: a simulator job holds the simulator token", file=sys.stderr)
+            break
+        try:  # held through the last reading and the erase, so no simulator job is admitted in between
+            now = {x.path: x for x in sim_device_items(simctl(), cmds, opened)}.get(i.path)
+            if time.monotonic() - started > budget_s or (halt is not None and halt()) or (
+                    below_target is not None and not below_target()):
+                break  # the readings took the rest of the budget, a job started, or the target was reached
+            size = 0
+            if now is None or now.verdict != "reclaimable":
+                outcome, reasons = "changed:in-use", (now.reasons if now else ["no longer listed"])
+            else:
+                reasons = now.reasons
+                try:
+                    r = subprocess.run(["xcrun", "simctl", "erase", i.path], capture_output=True, text=True,
+                                       timeout=300)
+                    outcome = "reclaimed" if r.returncode == 0 else f"incomplete:exit {r.returncode}"
+                except (OSError, subprocess.SubprocessError) as e:
+                    outcome = f"incomplete:{e.__class__.__name__}"
+        finally:
+            os.close(token)
+        if outcome == "reclaimed":
+            after = sim_device_size(simctl(), i.path)
+            if after is None:
+                reasons = reasons + ["its size after the erase could not be read; counted 0"]
+            else:
+                size = max(0, now.bytes - after)
+            released += size
         rec = {"at": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "host": platform.node(), "family": SIM_DEVICE_FAMILY,
                "path": i.path, "outcome": outcome, "bytes": size, "idle_hours": i.idle_hours,
                "verdict": "reclaimable" if outcome == "reclaimed" else "blocked", "reasons": reasons,
@@ -2026,6 +2041,38 @@ def erase_idle_sim_devices(receipt: Path, halt=None, budget_s: float = SIM_DEVIC
                 f.write(json.dumps(rec) + "\n")
         print(f"  {outcome:16s} {gib(size)}  simulator device {i.path} ({reasons[0]})")
     return released
+
+
+# The runner hook admits a simulator-class job (ios-simulator, screenshots, a guest's *-sim) only while it holds
+# capacity/simulator.token exclusive, for the whole job. The eraser takes it the same way (created if missing, as
+# the hook's lock_file does) around its last reading and the erase, so no such job starts in between.
+SIM_TOKEN = CANONICAL_CAPACITY / "simulator.token"
+
+
+def sim_token(path: Path | None = None) -> int | None:
+    """An fd holding the simulator token exclusive, or None while a job holds it or it cannot be opened."""
+    path = SIM_TOKEN if path is None else path
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_CREAT | os.O_NOFOLLOW, 0o644)
+    except OSError:
+        return None
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        return None
+    return fd
+
+
+def sim_device_size(devices: object, udid: str) -> int | None:
+    """The dataPathSize simctl lists for a device, or None when it is not listed or the size is not a number."""
+    by_runtime = devices.get("devices") if isinstance(devices, dict) else None
+    for devs in by_runtime.values() if isinstance(by_runtime, dict) else ():
+        for d in devs if isinstance(devs, list) else ():
+            if isinstance(d, dict) and d.get("udid") == udid:
+                size = d.get("dataPathSize")
+                return size if isinstance(size, int) and not isinstance(size, bool) else None
+    return None
 
 
 CAPTURE_LEASE_ROOT = HOME / ".cache/cmux-capture-host"  # cmuxterm-hq build-fleet/capture-host's LEASE_ROOT

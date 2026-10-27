@@ -6393,6 +6393,9 @@ class SimDeviceTest(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.receipt = Path(self.tmp.name) / "receipt.jsonl"
+        token = mock.patch.object(gd, "SIM_TOKEN", Path(self.tmp.name) / "simulator.token")  # never the fleet's
+        token.start()
+        self.addCleanup(token.stop)
 
     def verdicts(self, cmds: str = "", opened: frozenset[str] = frozenset(), leases: str | None = "") -> dict:
         return {i.reasons[0].split(" (")[0]: (i.verdict, i.reasons[1:])
@@ -6421,6 +6424,18 @@ class SimDeviceTest(unittest.TestCase):
             with self.subTest(why=why):
                 with mock.patch.object(gd, "capture_lease_text", return_value=leases):
                     self.assertEqual(self.verdicts(cmds, opened, None)["kit-kit-composer-files"], ("kept", [why]))
+        # a short name counts too: keeping a device too often is safe
+        self.assertEqual(self.verdicts("xcodebuild -destination 'platform=iOS Simulator,name=QA'\n",
+                                       leases="")["kit-kit-composer-files"][0], "reclaimable")
+        short = json.loads(json.dumps(SIM_REPLAY))
+        short["devices"]["com.apple.CoreSimulator.SimRuntime.iOS-26-5"][0]["name"] = "QA"
+        (item,) = [i for i in gd.sim_device_items(short, "xcodebuild -destination name=QA\n", frozenset(), SIM_NOW, "")
+                   if i.path == "11592F6E-1A41-4215-BF7D-8BE182D2922E"]
+        self.assertEqual((item.verdict, item.reasons[1:]), ("kept", ["a running command names it"]))
+        unsized = json.loads(json.dumps(SIM_REPLAY))
+        unsized["devices"]["com.apple.CoreSimulator.SimRuntime.iOS-26-5"][0]["dataPathSize"] = "big"
+        self.assertEqual({i.path: i.reasons[1:] for i in gd.sim_device_items(unsized, "", frozenset(), SIM_NOW, "")}
+                         ["11592F6E-1A41-4215-BF7D-8BE182D2922E"], ["its size cannot be read"])
         # a name that is only part of another word or path is no use of it
         self.assertEqual(self.verdicts("/tmp/kit-kit-composer-files-old/build\n")["kit-kit-composer-files"][0],
                          "reclaimable")
@@ -6496,6 +6511,40 @@ class SimDeviceTest(unittest.TestCase):
                     contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
                 self.assertEqual(gd.erase_idle_sim_devices(self.receipt, halt, simctl=lambda: SIM_REPLAY,
                                                            below_target=short), 0)
+
+    def test_a_simulator_job_holding_the_token_stops_the_erase(self) -> None:
+        """A simulator-class job holds capacity/simulator.token for its whole run; while it does, nothing is erased,
+        and the eraser releases the token after each erase so the job it held back is admitted."""
+        held = os.open(gd.SIM_TOKEN, os.O_RDONLY | os.O_CREAT, 0o644)
+        fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        common = (mock.patch.object(gd, "DARWIN", True), mock.patch.object(gd.shutil, "which", return_value="/usr/bin/xcrun"),
+                  mock.patch.object(gd, "capture_lease_text", return_value=""),
+                  mock.patch.object(gd, "process_evidence", return_value=([], "")),
+                  mock.patch.object(gd, "host_reservation", return_value=""),
+                  mock.patch.object(gd.time, "time", return_value=SIM_NOW))
+        try:
+            with contextlib.ExitStack() as stack:
+                for c in common:
+                    stack.enter_context(c)
+                stack.enter_context(mock.patch.object(gd.subprocess, "run", side_effect=lambda argv, **kw: (
+                    subprocess.CompletedProcess(argv, 0, "", "") if argv[0] == "ps" else self.fail("simctl ran"))))
+                stack.enter_context(contextlib.redirect_stderr(io.StringIO()))
+                self.assertEqual(gd.erase_idle_sim_devices(self.receipt, simctl=lambda: SIM_REPLAY), 0)
+        finally:
+            os.close(held)
+        self.assertFalse(self.receipt.exists())
+        with contextlib.ExitStack() as stack:
+            for c in common:
+                stack.enter_context(c)
+            stack.enter_context(mock.patch.object(gd.subprocess, "run",
+                                                  side_effect=lambda argv, **kw: subprocess.CompletedProcess(argv, 0, "", "")))
+            stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
+            gd.erase_idle_sim_devices(self.receipt, simctl=lambda: SIM_REPLAY)
+        mine = os.open(gd.SIM_TOKEN, os.O_RDONLY)
+        try:
+            fcntl.flock(mine, fcntl.LOCK_EX | fcntl.LOCK_NB)  # released after the erase
+        finally:
+            os.close(mine)
 
     def test_an_unreadable_size_after_the_erase_counts_zero(self) -> None:
         readings = iter([SIM_REPLAY, SIM_REPLAY, None])

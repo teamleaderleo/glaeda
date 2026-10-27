@@ -110,8 +110,9 @@ On fleet minis, simulator devices are judged one at a time on every pressure pas
 
 The device's name, type and runtime stay, so a job or lane that boots it by name or UDID still finds it. Each
 device is judged again right before its erase, on fresh simctl, `ps` and open-file evidence and a fresh
-reservation check. simctl itself refuses to erase a device that is booting or booted, so a job that starts
-between that check and the erase gets an error, not an erased device. No new erase starts after five minutes,
+reservation check, while glaeda-disk holds `capacity/simulator.token`, the token the runner hook gives every
+simulator-class job for its whole run. So no such job is admitted between that check and the erase, and none is
+erased under one that is running. simctl itself refuses to erase a device that is booting or booted. No new erase starts after five minutes,
 after the idle sweep's busy check names a reason, or, on a pressure pass, once every filesystem is back above
 its target. A reserved host keeps every device. If the size after an erase can't be read, the receipt counts
 0 bytes. Receipts carry `family: simulator-device-data`.
