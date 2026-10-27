@@ -1402,13 +1402,14 @@ def register(ctx: Context, act: dict[str, Any]) -> None:
     code, out = run_with_token(argv, token, ctx.runner_dir)
     del token
     act["argv"] = argv
+    # env.sh rewrites .path before config.sh can fail (a bad token, a timeout), so this runs either way
+    try:
+        keep_runner_path(ctx, path_before)
+    except OSError as error:  # the registration's outcome stands; a later --apply or relabel fixes .path
+        act["pathNote"] = f"could not rewrite .path ({type(error).__name__}: {error})"[:300]
     if code != 0 or not (ctx.runner_dir / ".runner").is_file():
         act["state"], act["note"] = "failed", f"config.sh failed: {out[-400:]}"
         return
-    try:
-        keep_runner_path(ctx, path_before)
-    except OSError as error:  # registered all the same; a later --apply or relabel merges it again
-        act["pathNote"] = f"could not rewrite .path ({type(error).__name__}: {error})"[:300]
     act["applied"] = True
     act["runnerId"] = (local_runner(ctx) or {}).get("agentId")
 

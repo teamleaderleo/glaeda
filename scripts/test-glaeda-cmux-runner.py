@@ -8196,6 +8196,25 @@ class RunnerTest(unittest.TestCase):
         self.assertIn(cargo, entries)
         self.assertNotIn("", entries)
 
+    def test_failed_reregistration_still_keeps_homebrew_on_runner_path(self) -> None:
+        # env.sh rewrites .path before config.sh rejects the token: the failed relabel must not leave it bare
+        bare = "/usr/bin:/bin:/usr/sbin:/sbin"
+        runner = self.home / "actions-runner-glaeda"
+        local = os.fspath(self.home / ".local/bin")
+        with mock.patch.dict(os.environ, {"PATH": bare}):
+            self.invoke("--apply", "--labels", "ram48")
+            (runner / ".path").write_text(f"{local}:{bare}\n")
+            with mock.patch.object(cr, "xcode_present", return_value=True), \
+                    mock.patch.object(cr, "read_token", lambda gh, ep: REG_TOKEN + "X"):
+                receipt = self.invoke("--apply", "--manifest", self.manifest(), "--member", "mini-std",
+                                      "--name", "mini-test-glaeda", expect=1)
+        self.assertEqual(self.by_kind(receipt)["register"]["state"], "failed")
+        self.assertIn("--replace", self.config_argvs()[-1])
+        entries = (runner / ".path").read_text().strip().split(":")
+        self.assertEqual(entries[:2], ["/opt/homebrew/bin", "/usr/local/bin"])
+        self.assertIn(local, entries)
+        self.assertIn(os.fspath(self.home / ".cargo/bin"), entries)
+
     def test_runner_path_merges_in_order_without_duplicates(self) -> None:
         home = Path("/Users/cmux")
         self.assertEqual(cr.runner_path(home, "/usr/bin:/bin:/usr/sbin:/sbin"),
