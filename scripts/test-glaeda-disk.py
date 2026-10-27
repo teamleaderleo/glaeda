@@ -10,6 +10,7 @@ import collections
 import fcntl
 import hashlib
 import io
+import itertools
 import json
 import errno
 import os
@@ -53,6 +54,9 @@ gd.HOST_RESERVATION_LOCAL = Path(_NO_RESERVATIONS.name + ".none")
 _reap_tmpdir_test_residue = gd.reap_tmpdir_test_residue
 gd.reap_tmpdir_test_residue = (lambda receipt, tmp=None, halt=None, runner_host=None:
                                0 if tmp is None else _reap_tmpdir_test_residue(receipt, tmp, halt, runner_host))
+# Nor start a background volume census, or read the real host's census, from a test.
+gd.CENSUS_AUTOLAUNCH = False
+gd.CENSUS_STATE = Path(_NO_RESERVATIONS.name + ".census-none.json")
 # Nor git gc the clones in the real home of the host running the suite: only a test's own home is gc'd.
 _gc_home_clones = gd.gc_home_clones
 gd.gc_home_clones = lambda receipt, home=None, halt=None: 0 if home is None else _gc_home_clones(receipt, home, halt)
@@ -1192,8 +1196,9 @@ class GlaedaDiskTest(unittest.TestCase):
                 mock.patch.object(gd, "apfs_container_capacity", return_value=None):
             got = gd.filesystem_accounting([fs], [item])
         du.assert_called_once_with(self.root, record_timeout=False)
-        self.assertEqual(got[0]["measured"], 3 * gd.GIB)
-        self.assertEqual(got[0]["unmeasured"], 5 * gd.GIB)
+        # the walked root holds the item: measured is the root's bytes, the item is not added again
+        self.assertEqual(got[0]["measured"], 8 * gd.GIB)
+        self.assertEqual(got[0]["unmeasured"], 0)
         self.assertEqual(got[0]["top_level"][0]["path"], str(self.root))
 
     def test_accounting_reconciles_overlapping_shared_runner_coverage(self) -> None:
@@ -5860,6 +5865,417 @@ class GlaedaDiskTest(unittest.TestCase):
         self.assertIn(os.path.realpath("/Applications/Xcode_26.6.app"), gd.xcode_pins(home))
 
 
+class VolumeCensusTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(os.path.realpath(self.tmp.name)) / "vol"
+        self.root.mkdir()
+        self.state = Path(self.tmp.name) / "census.json"
+        saved = (gd.DARWIN, gd.ACCOUNTING, gd.CENSUS_STATE)
+        gd.DARWIN, gd.ACCOUNTING, gd.CENSUS_STATE = False, Path(self.tmp.name) / "accounting.json", self.state
+        gd._ACCOUNTING_MEM.clear()
+        gd._ACCOUNTING_COVERAGE_MEM.clear()
+        self.addCleanup(self.tmp.cleanup)
+        self.addCleanup(lambda: (setattr(gd, "DARWIN", saved[0]), setattr(gd, "ACCOUNTING", saved[1]),
+                                  setattr(gd, "CENSUS_STATE", saved[2]),
+                                  gd._ACCOUNTING_MEM.clear(), gd._ACCOUNTING_COVERAGE_MEM.clear()))
+
+    def write(self, rel: str, size: int = 8192) -> Path:
+        path = self.root / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(os.urandom(size))  # random bytes: no sparse or compressed blocks
+        return path
+
+    def fs(self, used: int) -> "gd.Fs":
+        return gd.Fs(self.root.stat().st_dev, str(self.root), 100 * gd.GIB - used, 100 * gd.GIB, 0, 0)
+
+    @staticmethod
+    def du(path: Path) -> int:
+        return int(subprocess.run(["du", "-xsk", str(path)], capture_output=True, text=True,
+                                  check=True).stdout.split()[0]) * 1024
+
+    def test_nested_sized_paths_are_counted_once(self) -> None:
+        parent, child = self.root / "parent", self.root / "parent/child"
+        child.mkdir(parents=True)
+        for name in ("small", "loose", "parent/inside"):  # census rows count only trees that still exist
+            (self.root / name).mkdir()
+        items = [gd.Item("projects", str(parent), 7 * gd.GIB, 2.0, "report-only"),
+                 gd.Item("checkout-build", str(child), 3 * gd.GIB, 2.0, "reclaimable")]
+        sizes = {str(parent): 7 * gd.GIB, str(child): 3 * gd.GIB,  # the items themselves
+                 str(self.root / "small"): 2 * gd.GIB}  # below the report floor, still sized
+        census = {"complete": True, "at": 1.0, "rows": {
+            str(self.root / "loose"): [4 * gd.GIB, "unclassified", True],
+            str(parent / "inside"): [5 * gd.GIB, "unclassified", True]}}  # nested in a sized item
+        with mock.patch.object(gd, "census_for", return_value=census):
+            got = gd.filesystem_accounting([self.fs(13 * gd.GIB)], items, sizes)[0]
+        self.assertEqual(got["measured"], 13 * gd.GIB)
+        self.assertEqual(got["reclaimable"], 3 * gd.GIB)
+        self.assertEqual(got["accounting_gap"], 0)
+        self.assertEqual(got["residual"]["category"], gd.APFS_INVISIBLE)
+
+    def test_a_complete_walk_leaves_no_gap(self) -> None:
+        sized = self.write("sized/a").parent
+        self.write("sized/b", 16384)
+        item = self.write("holder/item/blob").parent
+        self.write("holder/loose")
+        sized_file = self.write("holder/sized-file", 4096 * 5)  # sized on its own: not in the files row too
+        self.write("holder/other/deep/blob", 12288)
+        self.write("plain/x/y", 4096)
+        self.write("rootfile")
+        covered = {str(sized), str(item), str(sized_file)}
+        state = gd.census_pass([self.root], covered, path=self.state)
+        self.assertTrue(state["complete"])
+        self.assertIn(str(self.root / "plain"), state["rows"])
+        self.assertIn(str(self.root / "holder/other"), state["rows"])
+        self.assertNotIn(str(sized), state["rows"])
+        sizes = {p: (Path(p).stat().st_blocks * 512 if Path(p).is_file() else self.du(Path(p)))
+                 for p in covered}
+        got = gd.filesystem_accounting([self.fs(self.du(self.root))], [], sizes)[0]
+        self.assertEqual(got["accounting_gap"], 0)
+        self.assertEqual(got["measured"], got["used"])
+        self.assertEqual(got["residual"]["category"], gd.APFS_INVISIBLE)
+        row = next(r for r in got["coverage"] if r["scope"] == gd.CENSUS_SCOPE)
+        self.assertIn(f"unclassified:{self.root / 'plain'}", [c["category"] for c in row["children"]])
+
+    def test_an_unreadable_dir_is_reported_not_raised(self) -> None:
+        self.write("readable/x")
+        locked = self.write("locked/inner/blob").parents[1]
+        held = self.write("held/item/blob").parent
+        real_listdir, real_du = os.listdir, gd._census_du
+
+        def listdir(path):
+            if Path(path) == self.root / "held":
+                raise PermissionError(errno.EACCES, "Permission denied", str(path))
+            return real_listdir(path)
+
+        def census_du(path, timeout):
+            if path == locked:
+                return 0, False  # du printed "Permission denied" and nothing it could read
+            return real_du(path, timeout)
+
+        with mock.patch.object(gd.os, "listdir", side_effect=listdir), \
+                mock.patch.object(gd, "_census_du", side_effect=census_du):
+            state = gd.census_pass([self.root], {str(held)}, path=self.state)
+        self.assertTrue(state["complete"])
+        self.assertEqual(state["rows"][str(locked)][1:], ["unreadable", False])
+        self.assertEqual(state["rows"][str(self.root / "held")][1], "unreadable")
+        got = gd.filesystem_accounting([self.fs(gd.GIB)], [])[0]
+        row = next(r for r in got["coverage"] if r["scope"] == gd.CENSUS_SCOPE)
+        self.assertIn(f"unreadable:{locked}", [c["category"] for c in row["children"]])
+        self.assertIn("unreadable", got["residual"]["category"])
+
+    def test_paths_share_one_namespace_and_other_homes_stay_private(self) -> None:
+        gd._CENSUS_FIRMLINK_MEM.clear()
+        self.addCleanup(gd._CENSUS_FIRMLINK_MEM.clear)
+        with mock.patch.object(gd, "_firmlinked", return_value=True), \
+                mock.patch.object(gd, "_private_link", return_value=True):
+            self.assertEqual(gd.census_canon("/System/Volumes/Data/Users/x/y"), "/Users/x/y")
+            self.assertEqual(gd.census_canon("/var/folders/ab"), "/private/var/folders/ab")
+            self.assertEqual(gd.census_canon("/private/var/folders/ab"), "/private/var/folders/ab")
+            self.assertEqual(gd._census_label("/System/Volumes/Data/Users/someone-else/Library", "unreadable"),
+                             "unreadable:private-user-data")
+        with mock.patch.object(gd, "_firmlinked", return_value=False), \
+                mock.patch.object(gd, "_private_link", return_value=False):
+            self.assertEqual(gd.census_canon("/var/lib/x"), "/var/lib/x")
+            self.assertEqual(gd._census_label("/System/Volumes/Data/Users/someone-else", "unreadable"),
+                             "unreadable:private-user-data")
+
+    def test_shared_coverage_is_not_subtracted_twice_before_a_census(self) -> None:
+        fs = self.fs(10 * gd.GIB)
+        gd.DARWIN = True
+        coverage = [{"scope": "shared-fleet", "complete": True,
+                     "children": [{"category": "cache", "bytes": 6 * gd.GIB}]}]
+        canon = gd.census_canon
+        with mock.patch.object(gd, "fixed_measurement_roots", return_value=[self.root]), \
+                mock.patch.object(gd, "du_bytes", return_value=6 * gd.GIB), \
+                mock.patch.object(gd, "accounting_coverage", return_value=coverage), \
+                mock.patch.object(gd, "apfs_container_capacity", return_value=None), \
+                mock.patch.object(gd, "census_canon", side_effect=lambda p: (
+                    "/Users/Shared/cmux-build-fleet/cache" if p == str(self.root) else canon(p))):
+            got = gd.filesystem_accounting([fs], [])[0]
+        self.assertEqual(got["measured"], 6 * gd.GIB)
+        self.assertEqual(got["accounting_gap"], 4 * gd.GIB)
+        self.assertTrue(got["residual"]["category"].startswith("unwalked"))
+
+    def test_a_running_slice_blocks_another_launch(self) -> None:
+        saved = (gd.CENSUS_LOCK, gd.CENSUS_AUTOLAUNCH, gd.census_roots)
+        gd.CENSUS_LOCK, gd.CENSUS_AUTOLAUNCH = Path(self.tmp.name) / "census.lock", True
+        gd.census_roots = lambda: [self.root]
+        self.addCleanup(lambda: (setattr(gd, "CENSUS_LOCK", saved[0]), setattr(gd, "CENSUS_AUTOLAUNCH", saved[1]),
+                                  setattr(gd, "census_roots", saved[2])))
+        held = gd._census_lock()
+        self.addCleanup(held.close)
+        with mock.patch.object(gd.subprocess, "Popen", side_effect=AssertionError("spawned")):
+            self.assertFalse(gd.launch_background_census())
+        held.close()
+        with mock.patch.object(gd.subprocess, "Popen") as popen:
+            self.assertTrue(gd.launch_background_census())
+        self.assertIn("--census-lock-fd", popen.call_args.args[0])
+
+    def test_a_large_opened_dir_resumes_at_its_cursor(self) -> None:
+        for n in range(30):
+            self.write(f"held/f{n:02d}", 4096)
+        held = self.root / "held"
+        self.write("held/item/blob")
+        ticks = itertools.count(step=1.0)
+        state = None
+        rounds = 0
+        while not (state or {}).get("complete"):
+            rounds += 1
+            self.assertLess(rounds, 20)
+            with mock.patch.object(gd, "_census_du", return_value=(8192, True)):
+                state = gd.census_pass([self.root], {str(held / "item")}, state, budget_s=12,
+                                       now=1.0, clock=lambda: next(ticks), path=self.state)
+        self.assertGreater(rounds, 2)  # the 31-entry directory took several slices
+        files = state["rows"][str(held / gd.CENSUS_FILES)][0]
+        self.assertEqual(files, sum((held / f"f{n:02d}").stat().st_blocks * 512 for n in range(30))
+                         + held.lstat().st_blocks * 512)  # each file counted once across the slices
+
+    def test_a_child_opened_while_its_parent_is_paused_keeps_the_parent_cursor(self) -> None:
+        for n in range(12):
+            self.write(f"p/c{n:02d}/item/blob")  # each child holds a sized path, so each is opened too
+            self.write(f"p/c{n:02d}/loose")
+        covered = {str(self.root / f"p/c{n:02d}/item") for n in range(12)}
+        ticks = itertools.count(step=1.0)
+        state, rounds = None, 0
+        while not (state or {}).get("complete"):
+            rounds += 1
+            self.assertLess(rounds, 40, "the paused parent kept restarting")
+            state = gd.census_pass([self.root], covered, state, budget_s=6, now=1.0,
+                                   clock=lambda: next(ticks), path=self.state)
+        for n in range(12):
+            self.assertIn(str(self.root / f"p/c{n:02d}" / gd.CENSUS_FILES), state["rows"])
+        self.assertEqual(state["cursors"], {})
+
+    def test_a_measured_ancestor_of_the_shared_tree_leaves_coverage_out(self) -> None:
+        fs = self.fs(10 * gd.GIB)
+        gd.DARWIN = True
+        coverage = [{"scope": "shared-fleet", "complete": True,
+                     "children": [{"category": "cache", "bytes": 6 * gd.GIB}]}]
+        canon = gd.census_canon
+        with mock.patch.object(gd, "fixed_measurement_roots", return_value=[self.root]), \
+                mock.patch.object(gd, "du_bytes", return_value=8 * gd.GIB), \
+                mock.patch.object(gd, "accounting_coverage", return_value=coverage), \
+                mock.patch.object(gd, "apfs_container_capacity", return_value=None), \
+                mock.patch.object(gd, "census_canon", side_effect=lambda p: (
+                    "/Users" if p == str(self.root) else canon(p))):
+            got = gd.filesystem_accounting([fs], [])[0]
+        self.assertEqual(got["known_coverage"], 0)
+        self.assertEqual(got["accounting_gap"], 2 * gd.GIB)
+
+    def test_a_sized_file_whose_size_goes_is_counted_and_deleted_trees_drop_out(self) -> None:
+        f = self.write("d/sized", 4096 * 3)
+        self.write("e/blob")
+        state = gd.census_pass([self.root], {str(f)}, budget_s=1000, clock=itertools.count().__next__,
+                               path=self.state)
+        files = state["rows"][str(self.root / "d" / gd.CENSUS_FILES)][0]
+        self.assertEqual(files, (self.root / "d").lstat().st_blocks * 512)  # the sized file is not in it
+        state = {**state, "complete": False, "pending": [str(self.root / "e")]}
+        state = gd.census_pass([self.root], set(), state, path=self.state)  # its size has gone meanwhile
+        self.assertEqual(state["rows"][str(self.root / "d" / gd.CENSUS_FILES)][0],
+                         files + f.stat().st_blocks * 512)
+        shutil.rmtree(self.root / "e")
+        census = gd.census_for(self.root.stat().st_dev, state)
+        self.assertNotIn(self.root / "e", [p for p, _, _ in gd.census_catalogue(census)])
+        self.assertIn(self.root / "d" / gd.CENSUS_FILES, [p for p, _, _ in gd.census_catalogue(census)])
+
+    def test_an_unfinished_census_of_another_volume_starts_over(self) -> None:
+        self.write("a/blob")
+        stale = {"schema": "glaeda-disk-census/v1", "started_at": 1.0, "dev": -1, "complete": False,
+                 "pending": ["/gone"], "rows": {"/gone/x": [5, "unclassified", True]}}
+        got = gd.census_pass([self.root], set(), stale, now=50.0, path=self.state)
+        self.assertTrue(got["complete"])
+        self.assertEqual(got["dev"], self.root.stat().st_dev)
+        self.assertNotIn("/gone/x", got["rows"])
+        self.assertIn(str(self.root / "a"), got["rows"])
+
+    def test_census_du_never_enters_file_provider_trees(self) -> None:
+        argv = gd._census_du_argv(self.root)
+        for name in gd.MEASURE_SKIP_COMPONENTS:
+            self.assertTrue(name in argv or f"--exclude={name}" in argv, name)
+        self.assertEqual(argv[-1], str(self.root))
+
+    def test_a_sized_dir_whose_size_goes_is_walked_before_completion(self) -> None:
+        a, b = self.write("a/blob").parent, self.write("b/blob").parent
+        state = {"schema": "glaeda-disk-census/v1", "started_at": 1.0, "dev": self.root.stat().st_dev,
+                 "complete": False, "pending": [str(b)], "rows": {}, "covered_skips": [str(a)]}
+        got = gd.census_pass([self.root], set(), state, path=self.state)
+        self.assertTrue(got["complete"])
+        self.assertIn(str(a), got["rows"])
+        self.assertIn(str(b), got["rows"])
+
+    def test_cadence_is_daily_and_a_slice_stops_at_its_budget_then_resumes(self) -> None:
+        now = 1_000_000.0
+        self.assertTrue(gd.census_due({}, now))
+        self.assertFalse(gd.census_due({"complete": True, "started_at": now - 23 * 3600}, now))
+        self.assertTrue(gd.census_due({"complete": True, "started_at": now - 24 * 3600}, now))
+        self.assertFalse(gd.census_due({"complete": False, "slice_at": now - 600}, now))
+        self.assertTrue(gd.census_due({"complete": False, "slice_at": now - 3600}, now))
+        for name in ("a", "b", "c", "d", "e", "f"):
+            self.write(f"{name}/blob")
+        ticks = itertools.count(step=10.0)
+        walked: list[Path] = []
+
+        def census_du(path, timeout):
+            walked.append(path)
+            self.assertLessEqual(timeout, gd.CENSUS_DU_TIMEOUT_S)
+            return 8192, True
+
+        with mock.patch.object(gd, "_census_du", side_effect=census_du):
+            first = gd.census_pass([self.root], set(), budget_s=75, now=now,
+                                   clock=lambda: next(ticks), path=self.state)
+            self.assertFalse(first["complete"])
+            self.assertTrue(first["pending"])
+            self.assertFalse(gd.census_due(gd.load_census(self.state), now + 60))
+            done = len(walked)
+            second = gd.census_pass([self.root], set(), gd.load_census(self.state), budget_s=1000,
+                                    now=now + 3600, clock=lambda: next(ticks), path=self.state)
+        self.assertTrue(second["complete"])
+        self.assertEqual(second["started_at"], now)  # resumed, not restarted
+        self.assertEqual(len(walked), 6)
+        self.assertEqual(len(set(walked)), 6, "a resumed slice re-walked a finished directory")
+        self.assertLess(done, 6)
+        # a complete census is not due again the same day, so the CLI does not walk
+        saved = (gd.CENSUS_LOCK, gd.census_roots)
+        gd.CENSUS_LOCK, gd.census_roots = Path(self.tmp.name) / "census.lock", lambda: [self.root]
+        self.addCleanup(lambda: (setattr(gd, "CENSUS_LOCK", saved[0]), setattr(gd, "census_roots", saved[1])))
+        with mock.patch.object(gd, "census_pass", side_effect=AssertionError("walked")), \
+                mock.patch.object(gd.time, "time", return_value=now + 7200), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(gd.main(["--census"]), 0)
+        self.assertIn("not due", out.getvalue())
+
+
+class MediaTourDerivedDataTest(unittest.TestCase):
+    """cmux media tour DerivedData lives only where a tour can be routed (a gui or session runner), warm by role there."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        base = Path(os.path.realpath(self.tmp.name))
+        self.root = base / "DerivedData"
+        self.state = base / "state"
+        self.runners = base / "runners"
+        self.fam = gd.Family("xcode-derived-data", self.root, True, "rebuild", build_output=True)
+        self.patches = [mock.patch.object(gd, "process_evidence", lambda: ([], "")),
+                        mock.patch.object(gd, "CMUX_RUNNER_STATE", self.state),
+                        mock.patch.object(gd, "MEDIA_TOUR_LOCKS", base / "locks"),
+                        mock.patch.object(gd, "_MEDIA_TOUR_HOST_SET", False),
+                        mock.patch.object(gd, "FLOOR_HOLD", {})]
+        for p in self.patches:
+            p.start()
+            self.addCleanup(p.stop)
+        self.addCleanup(self.tmp.cleanup)
+
+    def runner(self, n: int, labels: list[str], installed: bool = True) -> None:
+        rdir = self.runners / f"r{n}"
+        rdir.mkdir(parents=True, exist_ok=True)
+        if installed:
+            (rdir / ".runner").write_text("{}")
+        receipt = self.state / f"instance-{n}" / "receipt.json"
+        receipt.parent.mkdir(parents=True, exist_ok=True)
+        receipt.write_text(json.dumps({"mode": "install", "runnerDir": str(rdir),
+                                       "registration": {"labels": ["self-hosted", "glaeda-mini", *labels]}}))
+
+    def verdicts(self) -> dict[str, str]:
+        gd._MEDIA_TOUR_HOST_SET = False
+        return {Path(i.path).name: i.verdict for i in gd.survey([self.fam], 12, 0)}
+
+    def test_host_is_derived_from_enrolled_runner_labels(self) -> None:
+        self.assertIsNone(gd.media_tour_host(self.state), "no runner enrolled: not a CI mini, nothing changes")
+        self.runner(1, ["glaeda-std-xcode-26.6", "glaeda-gui-std-linux", "glaeda-session-std", "glaeda-gui-std-xcode-"])
+        self.assertIs(gd.media_tour_host(self.state), False, "only the labels the tour's route picks count")
+        self.runner(2, ["glaeda-gui-std-xcode-26.6"], installed=False)
+        self.assertIs(gd.media_tour_host(self.state), False, "an uninstalled runner's labels route nothing here")
+        self.runner(3, ["glaeda-session-light-xcode-26.6"])
+        self.assertIs(gd.media_tour_host(self.state), True)
+        (self.state / "instance-9").mkdir()
+        (self.state / "instance-9" / "receipt.json").write_text("{not json")
+        self.assertIs(gd.media_tour_host(self.state), True, "a host with a gui runner stays one")
+
+    def test_unreadable_receipt_changes_nothing(self) -> None:
+        (self.state / "instance-0").mkdir(parents=True)
+        (self.state / "instance-0" / "receipt.json").write_text("{not json")
+        self.runner(1, ["glaeda-std-xcode-26.6"])
+        self.assertIsNone(gd.media_tour_host(self.state))
+        make(self.root / "cmux-ci-media-slot0-base", age_hours=2)
+        self.assertEqual(self.verdicts(), {"cmux-ci-media-slot0-base": "recent"})
+
+    def test_non_media_host_drops_media_dd_at_any_age(self) -> None:
+        self.runner(1, ["glaeda-std-xcode-26.6"])
+        make(self.root / "cmux-ci-media-slot0-base", age_hours=0.5)
+        make(self.root / "cmux-ci-media-pr-12-head", age_hours=0.5)
+        make(self.root / "cmux-other", age_hours=0.5)
+        self.assertEqual(self.verdicts(), {"cmux-ci-media-slot0-base": "reclaimable",
+                                           "cmux-ci-media-pr-12-head": "reclaimable",
+                                           "cmux-other": "recent"})
+
+    def test_open_media_dd_is_still_in_use(self) -> None:
+        self.runner(1, ["glaeda-std-xcode-26.6"])
+        held = make(self.root / "cmux-ci-media-slot0-head", age_hours=0.5)
+        with mock.patch.object(gd, "process_evidence", lambda: ([], f"/x/cmux-tui --dir {held}/Build")):
+            self.assertEqual(self.verdicts(), {"cmux-ci-media-slot0-head": "in-use"})
+
+    def test_media_host_keeps_warm_slots_by_role(self) -> None:
+        self.runner(1, ["glaeda-gui-std-xcode-26.6"])
+        make(self.root / "cmux-ci-media-slot0-base", age_hours=400)
+        make(self.root / "cmux-ci-media-slot1-head", age_hours=400)
+        make(self.root / "cmux-ci-media-slot2-head", age_hours=13)  # an overflow slot: the 12 h window
+        make(self.root / "cmux-ci-media-pr-7-base", age_hours=13)
+        make(self.root / "cmux-ci-media-slot3-base", age_hours=2)
+        self.assertEqual(self.verdicts(), {"cmux-ci-media-slot0-base": "recent",
+                                           "cmux-ci-media-slot1-head": "recent",
+                                           "cmux-ci-media-slot2-head": "reclaimable",
+                                           "cmux-ci-media-pr-7-base": "reclaimable",
+                                           "cmux-ci-media-slot3-base": "recent"})
+        with mock.patch.object(gd, "POLICY", {**gd.POLICY, "media_tour_warm_slots": 1}):
+            self.assertEqual(self.verdicts()["cmux-ci-media-slot1-head"], "reclaimable")
+
+    def tag_held(self, tag: str):
+        (self.root.parent / "locks").mkdir(exist_ok=True)
+        fd = os.open(self.root.parent / "locks" / f"{tag}.lock", os.O_RDWR | os.O_CREAT, 0o644)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        self.addCleanup(os.close, fd)
+
+    def test_a_held_tour_tag_keeps_its_dirs(self) -> None:
+        self.runner(1, ["glaeda-std-xcode-26.6"])
+        make(self.root / "cmux-ci-media-slot0-base", age_hours=30)
+        make(self.root / "cmux-ci-media-slot0-head", age_hours=30)
+        make(self.root / "cmux-ci-media-slot1-head", age_hours=30)
+        self.tag_held("ci-media-slot0")  # claimed: the tour has not opened anything yet
+        self.assertEqual(self.verdicts(), {"cmux-ci-media-slot0-base": "in-use", "cmux-ci-media-slot0-head": "in-use",
+                                           "cmux-ci-media-slot1-head": "reclaimable"})
+
+    def test_apply_deletes_only_under_the_tag_lock_and_fresh_evidence(self) -> None:
+        self.runner(1, ["glaeda-std-xcode-26.6"])
+        claimed = make(self.root / "cmux-ci-media-slot0-base", age_hours=30)
+        started = make(self.root / "cmux-ci-media-slot1-base", age_hours=30)
+        stray = make(self.root / "cmux-ci-media-pr-3-head", age_hours=30)
+        gd._MEDIA_TOUR_HOST_SET = False
+        items = gd.survey([self.fam], 12, 0)
+        self.assertEqual({i.verdict for i in items}, {"reclaimable"})
+        self.tag_held("ci-media-slot0")  # a tour claims slot 0 after the survey
+        # and an xcodebuild starts in slot 1 after the survey: only a fresh ps at apply sees it
+        calls = []
+
+        def evidence():  # apply's own first reading sees nothing; the build starts after it
+            calls.append(1)
+            return [], (f"xcodebuild -derivedDataPath {started}" if len(calls) > 1 else "")
+        with mock.patch.object(gd, "process_evidence", evidence), contextlib.redirect_stdout(io.StringIO()):
+            gd.apply(items, {self.fam.id: self.fam}, self.root.parent / "r.jsonl", None, 12)
+        self.assertTrue(claimed.exists(), "a claimed slot is never removed")
+        self.assertTrue(started.exists(), "a build that started after the survey keeps its dir")
+        self.assertFalse(stray.exists())
+
+    def test_warm_slot_goes_only_under_the_runner_floor(self) -> None:
+        self.runner(1, ["glaeda-gui-std-xcode-26.6"])
+        slot = make(self.root / "cmux-ci-media-slot0-base", age_hours=1)
+        dev = self.root.stat().st_dev
+        with mock.patch.object(gd, "ACTIVITY_MODE", "pressure"), mock.patch.object(gd, "FLOOR_HOLD", {dev: 50 * gd.GIB}):
+            self.assertEqual(self.verdicts(), {"cmux-ci-media-slot0-base": "reclaimable"})
+            item = gd.Item("xcode-derived-data", str(slot), gd.GIB, 1.0, "reclaimable")
+            self.assertTrue(gd.floor_hold_only(self.fam, item, 12), "it waits for the floor stop like warm builds")
+
+
 class LinuxLayoutTest(unittest.TestCase):
     """The Linux layout, checked on every platform by pointing HOME and DARWIN at a fake host."""
 
@@ -7164,6 +7580,134 @@ class CaptureDedupeTest(unittest.TestCase):
         self.assertGreater(passes, 2)
         self.assertEqual(changed(), {"r1": 2, "r2": 2, "r3": 2, "r4": 2})
         self.assertTrue(all(p.read_bytes() == d for p, d in frames.items()))
+
+
+class NightlyNextFallbackTest(unittest.TestCase):
+    """~/Library/Caches/cmux-nightly-next: the dedicated builder's tree is kept by role, a pool runner's goes once idle
+    DEFAULT_AGE_HOURS, and nothing changes until disk-policy names the routing label."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.home = Path(os.path.realpath(self.tmp.name))
+        self.saved = (gd.HOME, gd.FLEET_ROOT, gd.DARWIN)
+        gd.HOME, gd.FLEET_ROOT, gd.DARWIN = self.home, self.home / "shared-fleet", True
+        gd._DISCOVERED.clear()
+        self.root = self.home / "Library/Caches" / gd.NIGHTLY_NEXT_ROOT
+        for name in ("cmux9s-mac-mini-glaeda-2", "cmux9s-mac-mini-glaeda-5", "cmux14-glaeda",
+                     "cmux7s-mac-mini-nightly-next", "cmux7s-mac-mini-glaeda-nightly-next", "notes"):
+            # nightly_build_state.py's layout: SwiftPM clones and the compilation cache per identity, notices crates
+            ident = self.root / name / "0123456789abcdef0123456789abcdef"
+            clone = ident / "SourcePackages/checkouts/swift-collections"
+            (clone / ".git/objects").mkdir(parents=True)
+            (clone / ".git/HEAD").write_text("ref: refs/heads/main\n")
+            (clone / "Package.swift").write_text("// package\n")
+            (ident / "CompilationCache").mkdir()
+            (ident / "CompilationCache/blob").write_bytes(b"x" * 4096)
+            (self.root / name / "notices-crates/registry").mkdir(parents=True)
+
+    def tearDown(self) -> None:
+        gd.HOME, gd.FLEET_ROOT, gd.DARWIN = self.saved
+        gd._DISCOVERED.clear()
+        self.tmp.cleanup()
+
+    def families(self, label: str | None) -> dict[str, gd.Family]:
+        policy = dict(gd.POLICY)
+        if label is not None:
+            policy["nightly_next_dedicated_label"] = label
+        with mock.patch.object(gd, "POLICY", policy):
+            return {f.id: f for f in gd.default_families()}
+
+    def test_inert_until_the_routing_label_is_set(self) -> None:
+        self.assertEqual(gd.POLICY_DEFAULTS["nightly_next_dedicated_label"], "")
+        for label in (None, "", "glaeda-trusted", "glaeda-trusted-next-nightly-x"):
+            fams = self.families(label)
+            self.assertNotIn(gd.NIGHTLY_NEXT_FAMILY, fams, label)
+            # as before: the whole root is one library-caches item
+            self.assertNotIn(gd.NIGHTLY_NEXT_ROOT, fams["library-caches"].skip, label)
+
+    def test_policy_file_turns_it_on(self) -> None:
+        policy = self.home / "disk-policy.json"
+        policy.write_text(json.dumps({"nightly_next_dedicated_label": gd.NIGHTLY_NEXT_DEDICATED_LABEL}))
+        self.assertEqual(gd.disk_policy(policy)["nightly_next_dedicated_label"], gd.NIGHTLY_NEXT_DEDICATED_LABEL)
+        policy.write_text(json.dumps({"nightly_next_dedicated_label": 1}))
+        self.assertEqual(gd.disk_policy(policy)["nightly_next_dedicated_label"], "")
+
+    def test_active_keeps_the_dedicated_builder_and_offers_pool_trees(self) -> None:
+        fams = self.families(gd.NIGHTLY_NEXT_DEDICATED_LABEL)
+        self.assertIn(gd.NIGHTLY_NEXT_ROOT, fams["library-caches"].skip)
+        fam = fams[gd.NIGHTLY_NEXT_FAMILY]
+        self.assertEqual(fam.root, self.root)
+        self.assertTrue(fam.reclaimable)
+        got = sorted(p.name for p in gd.candidates(fam))
+        self.assertEqual(got, ["cmux14-glaeda", "cmux9s-mac-mini-glaeda-2", "cmux9s-mac-mini-glaeda-5"])
+
+    def test_survey_of_every_family_never_offers_the_dedicated_tree(self) -> None:
+        old = time.time() - 30 * 24 * 3600
+        for p in self.root.rglob("*"):
+            os.utime(p, (old, old))
+        for label in ("", gd.NIGHTLY_NEXT_DEDICATED_LABEL):
+            gd._DISCOVERED.clear()
+            policy = {**gd.POLICY, "nightly_next_dedicated_label": label}
+            with mock.patch.object(gd, "POLICY", policy), \
+                    mock.patch.object(gd, "process_evidence", return_value=([], "")):
+                fams = [f for f in gd.default_families()
+                        if f.reclaimable and f.root.is_relative_to(self.home)]  # not the host's real temp dirs
+                items = {Path(i.path): i.verdict for i in gd.survey(fams, 0, 0)}
+            paths = set(items)
+            names = {p.name for p in paths if p.parent == self.root}
+            if label:
+                self.assertNotIn(self.root, paths)
+                self.assertEqual(names, {"cmux14-glaeda", "cmux9s-mac-mini-glaeda-2", "cmux9s-mac-mini-glaeda-5"})
+                # the SwiftPM clones inside do not make a pool tree a checkout: a month idle, it is reclaimable
+                self.assertEqual({items[self.root / n] for n in names}, {"reclaimable"})
+            else:
+                self.assertIn(self.root, paths)  # inert: the root stays one library-caches item, as before
+                self.assertEqual(names, set())
+
+    def test_a_reused_tree_is_recent_from_its_deep_writes(self) -> None:
+        """A build that reuses an identity writes only deep files: the cache's index, SwiftPM's state."""
+        tree = self.root / "cmux9s-mac-mini-glaeda-2"
+        ident = tree / "0123456789abcdef0123456789abcdef"
+        index = ident / "CompilationCache/generic/v1.1/v8.index"
+        index.parent.mkdir(parents=True)
+        index.write_bytes(b"i")
+        state = ident / "SourcePackages/workspace-state.json"
+        state.write_text("{}")
+        old = time.time() - 30 * 24 * 3600
+        for p in [tree, *tree.rglob("*")]:
+            os.utime(p, (old, old), follow_symlinks=False)
+        fam = gd.nightly_next_family(self.root)
+        self.assertLess(gd.item_mtime(fam, tree), old + 1)
+        for written in (index, state):
+            now = time.time() - 60
+            os.utime(written, (now, now))
+            self.assertGreaterEqual(gd.item_mtime(fam, tree), now - 1, written.name)
+            os.utime(written, (old, old))
+        # other families' items keep their usual shallow look
+        self.assertLess(gd.item_mtime(gd.Family("x", self.root, True, "x"), tree), old + 1)
+
+    def test_runner_cache_profile(self) -> None:
+        self.assertNotIn(gd.NIGHTLY_NEXT_FAMILY, {f.id for f in gd.runner_cache_families()})
+        policy = {**gd.POLICY, "nightly_next_dedicated_label": gd.NIGHTLY_NEXT_DEDICATED_LABEL}
+        with mock.patch.object(gd, "POLICY", policy):
+            fam = {f.id: f for f in gd.runner_cache_families()}[gd.NIGHTLY_NEXT_FAMILY]
+        self.assertEqual(gd.idle_window(fam, 1.0), gd.RUNNER_CACHE_IDLE_HOURS)
+        self.assertEqual(sorted(p.name for p in gd.candidates(fam)),
+                         ["cmux14-glaeda", "cmux9s-mac-mini-glaeda-2", "cmux9s-mac-mini-glaeda-5"])
+
+    def test_pool_tree_goes_after_its_own_idle_window(self) -> None:
+        fam = gd.nightly_next_family(self.root)
+        window = gd.DEFAULT_AGE_HOURS
+        with mock.patch.object(gd, "DEFAULT_AGE_HOURS", 24.0):  # keep_legacy_ages on a reserved host
+            self.assertEqual(gd.idle_window(gd.nightly_next_family(self.root), 1.0), 24.0)
+        self.assertEqual(gd.idle_window(fam, gd.DEFAULT_AGE_HOURS), window)
+        self.assertEqual(gd.idle_window(fam, 1.0), window)
+        quiet = [time.time() - 3600]  # not a hot-tier family: the job count never stretches its window
+        for mode in ("sweep", "pressure", None):
+            with mock.patch.object(gd, "ACTIVITY_MODE", mode), mock.patch.object(gd, "job_starts", return_value=quiet), \
+                    mock.patch.object(gd, "running_job_hours", return_value=0.5):
+                self.assertTrue(gd.item_due(fam, window + 0.5, window)[0], mode)
+                self.assertFalse(gd.item_due(fam, window - 0.5, window)[0], mode)
 
 
 class ActivityClockTest(unittest.TestCase):

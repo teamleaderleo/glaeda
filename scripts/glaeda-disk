@@ -744,6 +744,8 @@ CMUX_NEXT_DRAIN_HOOK_SHA256 = frozenset({
     "b8bded2a5a8f677f93b54d4257bf30625f34fa1224feaf9e4532bc9b8a9ac8f7",
     "2d954be43980c062555b189952c371933d48d479116ca770fa2e387aee33323f",
     "92478d7f853e797072634514774c5588ed684fe324fa2ae5b34d5750ac1aea5a",
+    "db5e321e7d3832232945852920674247bed182070edfd93d6950d70d4f0a6509",
+    "248a7de2ee83a9e81e09d2c9b4a092086551be27776c2908074fa77c209f5fc1",
 })
 CMUX_NEXT_CI_PRESERVED_NAMES = frozenset({
     "SourcePackages", "ModuleCache.noindex", "SDKStatCaches.noindex",
@@ -772,6 +774,28 @@ CMUX_NEXT_CI_ACTIVITY_MARKERS = frozenset({
 # deliberately best-effort rather than a build synchronisation primitive.
 CMUX_NEXT_CI_DEDUPE_SETTLE_MINUTES = 15.0
 CMUX_NEXT_CI_DEDUPE_DIR_NAMES = frozenset({"Products"})
+# ~/Library/Caches/cmux-nightly-next/<runner>: cmux's scripts/ci/nightly_build_state.py keeps NEXT's package
+# checkouts, compilation cache and notices crates there, one tree per runner that built nightly-next (7-9 GiB
+# each). Every pool runner of every mini could be that builder, so it held 0-35 GiB per mini (Leo, 2026-10-27:
+# "and how can <100gb be free on >256gb minis all the time"). Once the build routes to one dedicated builder
+# (cmux vars.CI_NIGHTLY_NEXT_DEDICATED_LABEL, cmux#26048; Leo: "what if we just dedicatd one, only, always, and
+# it just incrementally... did the thing? clear its stuff, etc"), that builder's tree is kept by role and every
+# pool runner's tree is its own fallback item that goes once idle DEFAULT_AGE_HOURS (read when the family is built,
+# so a reserved host's keep_legacy_ages applies). The build still
+# falls back to an idle pool mini when the builder is busy (cmux scripts/ci/nightly_build_runner.py: dedicated,
+# then owned, then Blacksmith), so a recently used fallback stays warm under the normal age; one no overflow used
+# for that long is not worth the disk (a cold Blacksmith Release build took a median 620 s against 830 s on a warm
+# pool mini, 22 builds on 2026-10-26/27). Before, the whole root was one library-caches item that any pool runner's
+# build kept fresh, so every tree on a mini stayed. Inert until disk-policy's
+# nightly_next_dedicated_label names the label cmux routes by: before that the whole root stays the
+# library-caches item it always was.
+NIGHTLY_NEXT_ROOT = "cmux-nightly-next"
+NIGHTLY_NEXT_FAMILY = "cmux-nightly-next-fallback"
+NIGHTLY_NEXT_DEDICATED_LABEL = "glaeda-trusted-next-nightly"  # cmux pr_runner_pool.NIGHTLY_DEDICATED_LABEL
+# the dedicated builder's runner: <member>-nightly-next (hand-made) or <member>-glaeda-nightly-next (glaeda#1648)
+NIGHTLY_NEXT_DEDICATED_RUNNER = re.compile(r"[A-Za-z0-9._-]+-nightly-next")
+# a pool runner's tree (cmux nightly_build_state.owned: <member>-glaeda[-K]); anything else in the root stays
+NIGHTLY_NEXT_POOL_RUNNER = re.compile(r"[A-Za-z0-9._-]+-glaeda(?:-[0-9]+)?")
 
 
 def fleet_families(ci: Path | None = None) -> list[Family]:
@@ -1064,6 +1088,125 @@ def archived_seeds(log: Path | None = None) -> frozenset[str]:
     return frozenset(held)
 
 
+# cmux's media tour (cmux-next-media.yml) builds two apps per tour slot into
+# ~/Library/Developer/Xcode/DerivedData/cmux-ci-media-slot<N>-{base,head}, about 12 GiB each side.
+# cmux_next_media_runner.py routes tours only to the glaeda-gui-<class>-* and glaeda-session-<class>-* labels,
+# so the media hosts are the minis where an enrolled runner carries one of them: derived from the runners'
+# own registration receipts, never a host list. Elsewhere these dirs go at once (a mini that lost its gui
+# runner, or one that never had one). On a media host, the warm slots (index below media_tour_warm_slots,
+# the workflow's CMUX_MEDIA_TOUR_SLOTS) are kept by role, not by age: they go only under the runner floor,
+# after everything else. Overflow slots and old per-PR dirs keep the family's 12 h window. The usual
+# in-use vetoes (open files, cwd, command lines) still hold for every one of them.
+MEDIA_TOUR_DD = re.compile(r"^cmux-ci-media-[A-Za-z0-9._-]+$")
+MEDIA_TOUR_WARM_SLOT = re.compile(r"^cmux-ci-media-slot(0|[1-9][0-9]*)-(?:base|head)$")
+# pr_runner_pool.gui_label()/session_label(): glaeda-gui-<class>-xcode-<version>, glaeda-session-<class>-xcode-<version>
+MEDIA_TOUR_LABEL = re.compile(r"^glaeda-(?:gui|session)-[a-z0-9]+-xcode-[0-9][0-9.]*$")
+CMUX_RUNNER_STATE = HOME / ".local/state/glaeda/cmux-runner"
+# media_tag_lock.py's lock dir: one flock per tag (ci-media-slot0 for cmux-ci-media-slot0-{base,head}), held by a
+# tour from its claim until its Runner.Worker exits, before it has opened anything in the DerivedData.
+MEDIA_TOUR_LOCKS = HOME / "Library/Caches/cmux-ci-media/locks"
+_MEDIA_TOUR_HOST: bool | None = None
+_MEDIA_TOUR_HOST_SET = False
+
+
+def media_tour_host(state: Path | None = None) -> bool | None:
+    """Whether a media tour can be routed to this host: True when an enrolled runner's registration carries a gui
+    or session pool label, False when every enrolled runner was read and none does, None when no runner is
+    enrolled here or a receipt cannot be read (not a CI mini, or unknown: nothing changes)."""
+    global _MEDIA_TOUR_HOST, _MEDIA_TOUR_HOST_SET
+    if state is None and _MEDIA_TOUR_HOST_SET:
+        return _MEDIA_TOUR_HOST
+    base = CMUX_RUNNER_STATE if state is None else state
+    enrolled, answer = 0, False
+    for path in [base / "receipt.json", *sorted(base.glob("instance-*/receipt.json"))]:
+        try:
+            doc = json.loads(path.read_text())
+        except FileNotFoundError:
+            continue
+        except (OSError, ValueError):
+            answer = None
+            break
+        if not isinstance(doc, dict) or doc.get("mode") == "uninstall":
+            continue
+        runner_dir = doc.get("runnerDir")
+        if not runner_dir or not (Path(str(runner_dir)) / ".runner").is_file():
+            continue  # not installed (any more): its labels route nothing here
+        enrolled += 1
+        labels = (doc.get("registration") or {}).get("labels") if isinstance(doc.get("registration"), dict) else None
+        if not isinstance(labels, list):
+            answer = None
+            break
+        if any(isinstance(x, str) and MEDIA_TOUR_LABEL.match(x) for x in labels):
+            answer = True
+            break
+    result = answer if enrolled or answer is None else None
+    if state is None:
+        _MEDIA_TOUR_HOST, _MEDIA_TOUR_HOST_SET = result, True
+    return result
+
+
+def media_tour_dd(fam: Family, path: Path) -> bool:
+    """Whether PATH is a cmux media tour's DerivedData (cmux-ci-media-<tag>) directly in Xcode's DerivedData."""
+    return (fam.id == "xcode-derived-data" and path.parent == fam.root and bool(MEDIA_TOUR_DD.match(path.name))
+            and not path.is_symlink())
+
+
+def media_tour_warm_slot(fam: Family, path: Path) -> bool:
+    """Whether PATH is one of a media host's warm tour slots, kept by role (see MEDIA_TOUR_DD)."""
+    if not media_tour_dd(fam, path) or media_tour_host() is not True:
+        return False
+    m = MEDIA_TOUR_WARM_SLOT.match(path.name)
+    return m is not None and int(m.group(1)) < int(POLICY["media_tour_warm_slots"])
+
+
+def media_tour_tag_lock(path: Path) -> int | None:
+    """An fd holding the tour tag lock of media DerivedData PATH (media_tag_lock.py), taken without waiting, or None
+    while a tour holds it or the lock cannot be opened or taken (fail closed). Keep it until PATH is gone: a tour
+    claiming the tag meanwhile takes the next slot or waits, so it never builds into a dir being removed."""
+    tag = path.name[len("cmux-"):]
+    for side in ("-base", "-head"):
+        if tag.endswith(side):
+            tag = tag[: -len(side)]
+            break
+    try:
+        MEDIA_TOUR_LOCKS.mkdir(parents=True, exist_ok=True)
+        fd = os.open(MEDIA_TOUR_LOCKS / f"{tag}.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o644)
+    except OSError:
+        return None
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        return None
+    return fd
+
+
+def media_tour_tag_held(path: Path) -> bool:
+    """Whether a tour holds (or may hold: the lock cannot be taken) the tag of media DerivedData PATH."""
+    fd = media_tour_tag_lock(path)
+    if fd is None:
+        return True
+    os.close(fd)
+    return False
+
+
+def remove_media_tour_dd(path: Path) -> bool:
+    """Delete media DerivedData PATH only under its tour tag lock; False (nothing done) while a tour holds it."""
+    fd = media_tour_tag_lock(path)
+    if fd is None:
+        return False
+    try:
+        remove(path)
+    finally:
+        os.close(fd)
+    return True
+
+
+def media_tour_stray(fam: Family, path: Path) -> bool:
+    """Whether PATH is media tour DerivedData on an enrolled CI host that no tour can be routed to."""
+    return media_tour_dd(fam, path) and media_tour_host() is False
+
+
 def item_window(fam: Family, path: Path, idle_hours: float, archived: frozenset[str] = frozenset()) -> float:
     """The idle window for one candidate: a seed the archive already holds may go at once (the newest of each
     root still stay, by keep_verdict), and SwiftPM scratch left in the trash or under the emergency floor
@@ -1072,6 +1215,13 @@ def item_window(fam: Family, path: Path, idle_hours: float, archived: frozenset[
     (cmux_next_ci_over). Everything else waits out its family's window."""
     if fam.id == "cmux-seeds" and path.name in archived:
         return 0.0
+    if media_tour_stray(fam, path):  # no tour can reach this host: nothing will reuse it
+        return 0.0
+    if media_tour_warm_slot(fam, path):  # warm by role: only under the runner floor (floor_hold_only)
+        with contextlib.suppress(OSError):
+            if fam.root.stat().st_dev in FLOOR_HOLD:
+                return 0.0
+        return math.inf
     if cmux_next_ci_host_root(fam, path):  # never the cap's: its own idle window, or at once under the floor hold
         with contextlib.suppress(OSError):
             if fam.root.stat().st_dev in FLOOR_HOLD:
@@ -1101,7 +1251,7 @@ def floor_hold_family(fam: Family, path: Path) -> bool:
     process evidence and taken exclusive to delete; the next compile on the root clears it anyway, and a rerun
     restores it from the artifact; a root without a token file keeps its 12 h window), and code-sign clones
     (keep_live_app_clones and app_clone_running keep the live ones)."""
-    if fam.id == RUNNER_BUILD_FAMILY or fam.app_clones:
+    if fam.id == RUNNER_BUILD_FAMILY or fam.app_clones or media_tour_warm_slot(fam, path):
         return True
     if fam.id == CANONICAL_ADMISSION:  # only where the runner hook's token protocol is in force on this root
         token = canonical_root_token(path)
@@ -1111,7 +1261,10 @@ def floor_hold_family(fam: Family, path: Path) -> bool:
 
 
 def floor_hold_only(fam: Family, item: "Item", idle_hours: float) -> bool:
-    """Reclaimable only because of the floor hold: younger than its family's own window."""
+    """Reclaimable only because of the floor hold: younger than its family's own window. A media host's warm tour
+    slot has no age window, so the floor hold is the only thing that lets it go."""
+    if media_tour_warm_slot(fam, Path(item.path)):
+        return True
     return floor_hold_family(fam, Path(item.path)) and item.idle_hours < idle_window(fam, idle_hours)
 
 
@@ -1276,6 +1429,9 @@ POLICY_DEFAULTS: dict[str, Any] = {
     # Over the cap, a cmux-next state no enrolled runner owns goes whole (inputs too) only once idle this long:
     # GitHub's default job timeout (timeout-minutes 360), so no job can still be using it.
     "cmux_next_ci_unowned_idle_hours": 6.0,
+    # Warm media tour slots a media host keeps by role (cmux-ci-media-slot<N>-{base,head}, N below this): cmux's
+    # CMUX_MEDIA_TOUR_SLOTS, default 2. They go only under the runner floor; on a host no tour can reach, none stay.
+    "media_tour_warm_slots": 2,
     # Per-host cmux-next build roots, relative to the cmux-next-ci cache (cmux#25147: the DEV Release compile builds
     # from one tree per mini, so the compilation cache's path-bearing keys match whichever runner instance builds).
     # Builds hold flock(2) on <root>/lock; <root>/src and <root>/Release/xcode-<toolchain> are one warm state, and the
@@ -1286,6 +1442,10 @@ POLICY_DEFAULTS: dict[str, Any] = {
     # The newest warm compile cache per builder is exempt by role, not by age (DEFAULT_AGE_HOURS): the host root goes
     # only under the runner floor. A finite number here ages it again.
     "cmux_next_ci_host_idle_hours": float("inf"),
+    # The label cmux's nightly-next build routes to its one dedicated builder by (vars.CI_NIGHTLY_NEXT_DEDICATED_LABEL).
+    # Only NIGHTLY_NEXT_DEDICATED_LABEL turns the cmux-nightly-next fallback eviction on; "" (or any other value)
+    # leaves that cache as it was. Set it only once that variable is set, so no fallback goes before the routing.
+    "nightly_next_dedicated_label": "",
     # --dedupe also clones identical files in capture and evidence trees (screen-capture frames, UI evidence),
     # with its own floor: one PNG frame is 16-200 KiB, so Xcode's 1 MiB floor saw 2.7 of the 11.2 GiB of
     # identical frames in cmux-mac-mini's ~/messageslab-26. "~" is the account's home; globs are allowed; a
@@ -2742,6 +2902,10 @@ def default_families(role: str = "fleet-mini") -> list[Family]:
     cmux_next_ci = HOME / "Library/Caches" / CMUX_NEXT_CI_ROOT
     if DARWIN and cmux_next_ci.is_dir():
         fams.append(cmux_next_ci_family(cmux_next_ci))
+    if DARWIN and nightly_next_dedicated():
+        lib = next(i for i, f in enumerate(fams) if f.id == "library-caches")
+        fams[lib] = replace(fams[lib], skip=(*fams[lib].skip, NIGHTLY_NEXT_ROOT))
+        fams.append(nightly_next_family())
     user_tmp = darwin_user_tmp() if DARWIN else None
     if user_tmp is not None:
         # Apple daemons keep live state in com.apple.* entries without holding them open.
@@ -2868,6 +3032,9 @@ def runner_cache_families() -> list[Family]:
     ]
     if (HOME / "Library/Caches" / CMUX_NEXT_CI_ROOT).is_dir():
         roots.append(replace(cmux_next_ci_family(), min_idle_hours=RUNNER_CACHE_IDLE_HOURS))
+    if nightly_next_dedicated():
+        roots.append(replace(nightly_next_family(), min_idle_hours=RUNNER_CACHE_IDLE_HOURS,
+                             max_idle_hours=RUNNER_CACHE_IDLE_HOURS))
     return [f for f in roots if f.root.is_dir()]
 
 
@@ -3112,7 +3279,7 @@ def fixed_measurement_roots() -> list[Path]:
 
 
 def _du_output(argv: list[str], allow_nonzero: bool = False,
-               record_timeout: bool = True) -> str | None:
+               record_timeout: bool = True, timeout: float | None = None) -> str | None:
     """Run one du walk with a killable process group; None means the tree is unsized.
 
     Report-only accounting and tooling probes use the same bounded walker, but a timeout there
@@ -3130,7 +3297,7 @@ def _du_output(argv: list[str], allow_nonzero: bool = False,
         )
         _ACTIVE_DU_PROCS[proc.pid] = proc
         try:
-            out, _ = proc.communicate(timeout=DU_TIMEOUT_S)
+            out, _ = proc.communicate(timeout=DU_TIMEOUT_S if timeout is None else timeout)
         except subprocess.TimeoutExpired:
             # du can be stuck in a kernel open() on a dead or remote filesystem.  Kill the group
             # and do not wait indefinitely for a post-kill read: callers must remain fail-closed.
@@ -3280,6 +3447,28 @@ def item_mtime(fam: Family, path: Path) -> float:
     if fam.id == SPM_SCRATCH:
         with contextlib.suppress(OSError):
             newest = max(newest, spm_lock(path).stat().st_mtime)
+    if fam.id == NIGHTLY_NEXT_FAMILY:
+        newest = max(newest, nightly_next_last_use(path))
+    return newest
+
+
+# Files every nightly-next build on a runner rewrites, below its tree (cmux nightly_build_state.py's layout), each
+# glob a handful of entries. A build that reuses an identity touches neither the runner nor the identity directory:
+# SwiftPM rewrites workspace-state.json when it resolves, and the compilation cache rewrites its action cache and
+# index on every lookup (cmux14, 2026-10-27: generic/v1.1/v3.actions and v8.index at the build's end, 5 levels
+# down, under directories dated two days earlier).
+NIGHTLY_NEXT_USE_GLOBS = ("*/SourcePackages/workspace-state.json", "*/CompilationCache/*/lock",
+                          "*/CompilationCache/generic/*/*", "notices-crates", "notices-crates/*")
+
+
+def nightly_next_last_use(path: Path) -> float:
+    """The newest mtime of the files a nightly-next build on this runner writes, however deep."""
+    newest = 0.0
+    for pattern in NIGHTLY_NEXT_USE_GLOBS:
+        with contextlib.suppress(OSError):
+            for entry in path.glob(pattern):
+                with contextlib.suppress(OSError):
+                    newest = max(newest, entry.lstat().st_mtime)
     return newest
 
 
@@ -5486,6 +5675,8 @@ def candidates(fam: Family) -> list[Path]:
                           or (fam.files and e.is_file(follow_symlinks=False)))]
         if fam.include:
             level = [p for p in level if p.name.startswith(fam.include)]
+        if fam.id == NIGHTLY_NEXT_FAMILY:  # kept by role: the dedicated builder's tree and anything unrecognized
+            level = [p for p in level if nightly_next_fallback(p)]
         if fam.app_clones:
             level = keep_live_app_clones(level)
     # an aside tree (remove()'s rename) is the interrupted-deletions family's alone, whatever family's root holds it
@@ -5837,6 +6028,8 @@ def _survey(families, idle_hours, min_bytes, known, evidence, defer_bulk=False,
                 reasons.append("live lease or running job")
         if fam.id == SPM_SCRATCH and spm_scratch_held(path):
             reasons.append("a job holds its lock (owned_spm_scratch.py)")
+        if media_tour_dd(fam, path) and media_tour_tag_held(path):
+            reasons.append("a media tour holds its slot's tag lock (media_tag_lock.py)")
         if fam.id == CANONICAL_ADMISSION and canonical_root_held(path):
             reasons.append("a job holds its canonical root (root token)")
         if tmp_canonical_root(fam, path) and canonical_root_held(path, whole_root=True):
@@ -5888,8 +6081,14 @@ def _survey(families, idle_hours, min_bytes, known, evidence, defer_bulk=False,
                 reasons.append(loss)
         elif not due:
             verdict = "recent"
+            if media_tour_warm_slot(fam, path):
+                reasons.append("a warm media tour slot on a media host: kept by role, only under the runner floor")
         else:
             verdict = "reclaimable"
+            if media_tour_stray(fam, path):
+                reasons.append("media tour DerivedData on a host no tour is routed to (no gui or session runner)")
+            elif media_tour_warm_slot(fam, path):
+                reasons.append("a warm media tour slot, under the runner floor: last, least recently used first")
             if path.name in archived and fam.id == "cmux-seeds":
                 reasons.append("the seed archive holds it")
             if cmux_next_ci_host_root(fam, path):
@@ -6423,6 +6622,396 @@ def reconciled_known_coverage(coverage: list[dict[str, Any]]) -> int:
     return max(totals, default=0)
 
 
+# Whole-volume census: a report-only, once-a-day pass that sizes every directory of the Data volume no
+# family or fixed accounting root already sizes, so `accounting_gap` names its bytes instead of leaving
+# half the volume unexplained (Leo, 2026-10-27: "and how can <100gb be free on >256gb minis all the time").
+# It walks top-down: a directory that is sized is skipped, a directory that holds sized paths is opened and
+# its loose files counted, and any other directory gets one throttled `du` as "unclassified:<path>". A walk
+# that times out is opened one level instead, so the next slice resumes at a finer grain. It never deletes,
+# never uses sudo, and a root-only directory is reported as "unreadable:<path>" with du's lower bound.
+CENSUS_STATE = HOME / ".cache/glaeda-disk/census.json"
+CENSUS_LOCK = HOME / ".cache/glaeda-disk/census.lock"
+CENSUS_EVERY_S = 24 * 3600  # a new census starts at most once a day
+CENSUS_RESUME_S = 3600  # an unfinished census continues at most hourly, one bounded slice at a time
+CENSUS_BUDGET_S = 5 * 60  # wall clock per slice; no new walk starts after it
+CENSUS_DU_TIMEOUT_S = 120  # one walk; past it the directory is opened one level instead
+CENSUS_SAVE_EVERY_S = 10.0
+CENSUS_ROWS_SHOWN = 48
+CENSUS_SCOPE = "volume-census"
+CENSUS_FILES = ".glaeda-census-files"  # pseudo child naming the loose files of an opened directory
+CENSUS_AUTOLAUNCH = True
+DATA_VOLUME = Path("/System/Volumes/Data")
+APFS_INVISIBLE = "apfs-invisible (open-deleted/purgeable)"
+
+
+_CENSUS_FIRMLINK_MEM: dict[str, bool] = {}
+_PRIVATE_LINKS = ("var", "tmp", "etc")
+
+
+def _firmlinked(name: str) -> bool:
+    """Whether /NAME and the Data volume's NAME are one directory (a firmlink such as /Users or /private)."""
+    hit = _CENSUS_FIRMLINK_MEM.get(name)
+    if hit is None:
+        try:
+            a, b = os.stat(Path("/") / name), os.stat(DATA_VOLUME / name)
+            hit = (a.st_dev, a.st_ino) == (b.st_dev, b.st_ino)
+        except OSError:
+            hit = False
+        _CENSUS_FIRMLINK_MEM[name] = hit
+    return hit
+
+
+def census_canon(path: str) -> str:
+    """One name per directory for coverage checks and overlap: /Users/... not /System/Volumes/Data/Users/...,
+    /private/var/... not /var/..., so a snapshot size and a census row of the same tree always overlap."""
+    path = os.path.abspath(path)
+    data = str(DATA_VOLUME)
+    if path.startswith(data + "/"):
+        rest = path[len(data):]
+        if _firmlinked(rest.split("/", 2)[1]):
+            path = rest
+    parts = path.split("/", 2)
+    if len(parts) > 1 and parts[1] in _PRIVATE_LINKS and _private_link(parts[1]):
+        path = "/private" + path
+    return path
+
+
+def _private_link(name: str) -> bool:
+    """macOS: /var, /tmp and /etc are symlinks into /private; elsewhere they are real directories."""
+    key = "private:" + name
+    hit = _CENSUS_FIRMLINK_MEM.get(key)
+    if hit is None:
+        hit = _CENSUS_FIRMLINK_MEM[key] = os.path.realpath("/" + name) == "/private/" + name
+    return hit
+
+
+def census_roots() -> list[Path]:
+    if not DARWIN or RUNNER_CACHE_PROFILE:
+        return []
+    return [DATA_VOLUME] if DATA_VOLUME.is_dir() else []
+
+
+def load_census(path: Path | None = None) -> dict[str, Any]:
+    try:
+        doc = json.loads((path or CENSUS_STATE).read_text())
+        return doc if isinstance(doc, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_census(state: dict[str, Any], path: Path | None = None) -> None:
+    path = path or CENSUS_STATE
+    with contextlib.suppress(OSError):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(f".{os.getpid()}.tmp")
+        tmp.write_text(json.dumps(state, separators=(",", ":")))
+        os.replace(tmp, path)
+
+
+def census_due(state: dict[str, Any], now: float) -> bool:
+    if state.get("complete"):
+        return now - float(state.get("started_at", 0)) >= CENSUS_EVERY_S
+    return now - float(state.get("slice_at", 0)) >= CENSUS_RESUME_S
+
+
+def census_covered() -> set[str]:
+    """Paths glaeda already sizes: every snapshot size and every fixed accounting root that was walked."""
+    _, sizes = load_snapshot()
+    paths = set(sizes)
+    for record in _accounting_cache().values():
+        for row in (record.get("top_level") or []) if isinstance(record, dict) else []:
+            if isinstance(row, dict) and isinstance(row.get("path"), str):
+                paths.add(row["path"])
+    return {census_canon(p) for p in paths}
+
+
+def _census_du_argv(path: Path) -> list[str]:
+    # never enter a FileProvider/cloud tree below an unowned directory: du can block in the kernel there
+    skips = [arg for name in sorted(MEASURE_SKIP_COMPONENTS)
+             for arg in (("-I", name) if DARWIN else (f"--exclude={name}",))]
+    argv = ["du", "-xsk", *skips, str(path)]
+    if os.path.exists("/usr/sbin/taskpolicy"):
+        return ["/usr/sbin/taskpolicy", "-b", *argv]  # background QoS: CPU and I/O throttled
+    if ionice := shutil.which("ionice"):
+        return [ionice, "-c", "3", *argv]
+    return argv
+
+
+def _census_du(path: Path, timeout: float) -> tuple[int, bool] | None:
+    out = _du_output(_census_du_argv(path), allow_nonzero=True, record_timeout=False, timeout=timeout)
+    if out is None:
+        return None
+    lines = out.splitlines()
+    sized = [line.split(None, 1) for line in lines if not line.startswith("du:")]
+    sized = [fields for fields in sized if len(fields) == 2 and fields[0].isdigit()]
+    if not sized:
+        return None
+    return int(sized[-1][0]) * 1024, not any(line.startswith("du:") for line in lines)
+
+
+def census_pass(roots: list[Path], covered: set[str], state: dict[str, Any] | None = None, *,
+                budget_s: float = CENSUS_BUDGET_S, now: float | None = None, clock=time.monotonic,
+                path: Path | None = None) -> dict[str, Any]:
+    """Run one bounded slice of the census, resuming ``state`` and saving progress to ``path``."""
+    now = time.time() if now is None else now
+    state = dict(state or {})
+    try:
+        root_dev = roots[0].stat().st_dev if roots else None
+    except OSError:
+        root_dev = None
+    if state.get("pending") and not state.get("complete") and state.get("dev") != root_dev:
+        state = {"last": state.get("last")}  # the volume changed under an unfinished census: start over
+    if not state.get("pending") or state.get("complete"):
+        last = ({"rows": state.get("rows", {}), "completed_at": state.get("completed_at"),
+                 "dev": state.get("dev")} if state.get("complete") else state.get("last"))
+        try:
+            dev = roots[0].stat().st_dev if roots else None
+        except OSError:
+            dev = None
+        state = {"schema": "glaeda-disk-census/v1", "started_at": now, "dev": dev, "complete": False,
+                 "pending": [str(r) for r in reversed(roots)], "rows": {}, "last": last}
+    state["slice_at"] = now
+    save_census(state, path)  # a launcher reading the state now sees this slice and does not start another
+    skipped_covered: list[str] = state.setdefault("covered_skips", [])
+    skipped_files: list[str] = state.setdefault("covered_files", [])
+    ancestors = {str(parent) for p in covered for parent in Path(p).parents}
+    pending: list[str] = state["pending"]  # a stack: the next directory is the last entry
+    rows: dict[str, list[Any]] = state["rows"]
+    dev = state.get("dev")
+    deadline = clock() + budget_s
+    saved = clock()
+
+    # directories opened part way, each with where to go on: a child opened meanwhile has its own entry
+    cursor: dict[str, Any] = state.setdefault("cursors", {})
+
+    def expand(current: Path) -> bool:
+        """Open one directory, reading its entries one at a time; False means the slice ended inside it and
+        ``cursor`` holds how far it got, so the next slice goes on from there instead of starting it over."""
+        key = str(current)
+        part = cursor.get(key)
+        after, files = (str(part["after"]), int(part["files"])) if part else ("", 0)
+        try:
+            if not part:
+                files = os.lstat(current).st_blocks * 512
+            # names in sorted order, so a resumed slice goes on after the last name it read: an entry added
+            # or removed meanwhile can be missed by this census, never counted twice
+            names = sorted(name for name in os.listdir(current) if name > after)
+        except OSError:
+            probe = _census_du(current, max(1.0, min(CENSUS_DU_TIMEOUT_S, deadline - clock())))
+            rows[key] = [probe[0] if probe else 0, "unreadable", False]
+            return True
+        children: list[str] = []
+        for name in names:
+            if clock() >= deadline:
+                cursor[key] = {"after": after, "files": files}
+                pending.append(key)
+                pending.extend(sorted(children, reverse=True))
+                return False
+            after = name
+            entry_path = os.path.join(current, name)
+            child = census_canon(entry_path)
+            try:
+                est = os.lstat(entry_path)
+            except OSError:
+                rows[child] = [0, "unreadable", False]  # vanished or not ours to stat: named, never dropped
+                continue
+            if stat.S_ISDIR(est.st_mode):
+                if dev is not None and est.st_dev != dev:
+                    continue  # another volume mounted here
+                if name in MEASURE_SKIP_COMPONENTS:
+                    rows[child] = [0, "skipped", False]  # FileProvider: du can block in the kernel there
+                else:
+                    children.append(child)
+            elif child not in covered:  # a sized file is counted by its own size, not again here
+                files += est.st_blocks * 512
+            else:
+                skipped_files.append(child)
+        cursor.pop(key, None)
+        rows[str(current / CENSUS_FILES)] = [files, "unclassified", True]
+        pending.extend(sorted(children, reverse=True))
+        return True
+
+    try:
+        while clock() < deadline:
+            if not pending:
+                # a directory skipped because it was sized is walked after all if that size has since gone
+                back = [p for p in skipped_covered if p not in covered]
+                if not back:
+                    break
+                pending.extend(back)
+                skipped_covered[:] = [p for p in skipped_covered if p in covered]
+            current = Path(pending.pop())
+            key = str(current)
+            if key in covered:
+                skipped_covered.append(key)
+                continue
+            if key in ancestors or key in [str(r) for r in roots] or key in cursor:
+                if not expand(current):
+                    break
+            else:
+                # One row per directory nothing sizes (its subtree is that row): the census names where the
+                # unexplained bytes are at the first level glaeda does not already own, not every leaf.
+                result = _census_du(current, max(1.0, min(CENSUS_DU_TIMEOUT_S, deadline - clock())))
+                if result is None:
+                    if clock() >= deadline:
+                        pending.append(key)  # the slice ran out during the walk: the next one retries it
+                        break
+                    if not expand(current):  # timed out: opened one level instead, so each piece is smaller
+                        break
+                else:
+                    size, complete = result
+                    rows[key] = [size, "unclassified" if complete else "unreadable", complete]
+            if clock() - saved >= CENSUS_SAVE_EVERY_S:
+                save_census(state, path)
+                saved = clock()
+    finally:
+        state["complete"] = not pending and not any(p not in covered for p in skipped_covered)
+        if state["complete"]:
+            # a sized file whose size has since gone from the snapshot goes back into its directory's files row
+            for gone in [f for f in skipped_files if f not in covered]:
+                with contextlib.suppress(OSError):
+                    row = rows.setdefault(str(Path(gone).parent / CENSUS_FILES), [0, "unclassified", True])
+                    row[0] += os.lstat(gone).st_blocks * 512
+            skipped_files[:] = [f for f in skipped_files if f in covered]
+        if state["complete"]:
+            state["completed_at"] = now
+            state["last"] = None
+        save_census(state, path)
+    return state
+
+
+def census_for(dev: int, state: dict[str, Any] | None = None) -> dict[str, Any] | None:
+    """The newest complete census of this volume (or the one in progress before any completed)."""
+    state = load_census() if state is None else state
+    if state.get("complete") and state.get("dev") == dev:
+        return {"rows": state.get("rows", {}), "complete": True, "at": state.get("completed_at")}
+    last = state.get("last")
+    if isinstance(last, dict) and last.get("dev") == dev and last.get("rows"):
+        return {"rows": last["rows"], "complete": True, "at": last.get("completed_at")}
+    if state.get("dev") == dev and state.get("rows"):
+        return {"rows": state["rows"], "complete": False, "at": state.get("slice_at")}
+    return None
+
+
+def _census_label(key: str, kind: str) -> str:
+    path = Path(census_canon(key))
+    shown = f"{path.parent} (files)" if path.name == CENSUS_FILES else str(path)
+    parts = Path(shown).parts
+    if parts[:4] == ("/", "System", "Volumes", "Data"):
+        parts = ("/", *parts[4:])  # an unfirmlinked physical path is redacted the same way
+    if len(parts) >= 3 and parts[1] == "Users" and parts[2] not in {HOME.name, "Shared"}:
+        return f"{kind}:private-user-data"  # never name another account's home
+    return f"{kind}:{shown}"
+
+
+def census_catalogue(census: dict[str, Any] | None) -> list[tuple[Path, int, str]]:
+    if not census:
+        return []
+    out = []
+    for key, row in census["rows"].items():
+        if not (isinstance(row, list) and row and isinstance(row[0], int) and row[0] > 0):
+            continue
+        # a tree deleted since the census (an apply, a finished job) no longer holds its bytes
+        if not os.path.lexists(os.path.dirname(key) if key.endswith("/" + CENSUS_FILES) else key):
+            continue
+        out.append((Path(census_canon(key)), int(row[0]), "census"))
+    return out
+
+
+def census_coverage_row(census: dict[str, Any]) -> dict[str, Any]:
+    merged: dict[str, list[Any]] = {}
+    for key, row in census["rows"].items():
+        label = _census_label(key, str(row[1]))
+        hit = merged.setdefault(label, [0, row[1]])
+        hit[0] += int(row[0])
+    ranked = sorted(merged.items(), key=lambda kv: -kv[1][0])
+    children = [{"category": label, "bytes": size, "private": label.endswith(":private-user-data"),
+                 "classification": kind} for label, (size, kind) in ranked[:CENSUS_ROWS_SHOWN]
+                if size or kind != "unclassified"]  # an unreadable or skipped tree stays named at 0 bytes
+    rest = sum(size for _, (size, _) in ranked[CENSUS_ROWS_SHOWN:])
+    if rest:
+        children.append({"category": "unclassified:other", "bytes": rest, "private": False,
+                         "classification": "unclassified"})
+    return {"scope": CENSUS_SCOPE, "complete": census["complete"], "at": census["at"],
+            "platform": "macos", "children": children}
+
+
+def _census_lock():
+    try:
+        CENSUS_LOCK.parent.mkdir(parents=True, exist_ok=True)
+        handle = CENSUS_LOCK.open("a+")
+    except OSError:
+        return None
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        handle.close()
+        return None
+    return handle
+
+
+def _background_argv(argv: list[str]) -> list[str]:
+    """Run the whole census process at background QoS (macOS) or idle I/O class (Linux), not only its du."""
+    if os.path.exists("/usr/sbin/taskpolicy"):
+        return ["/usr/sbin/taskpolicy", "-b", *argv]
+    if ionice := shutil.which("ionice"):
+        return [ionice, "-c", "3", *argv]
+    return argv
+
+
+def launch_background_census() -> bool:
+    """Start one detached, throttled census slice when one is due, handing it the lock this process took."""
+    if not CENSUS_AUTOLAUNCH or not census_roots() or not census_due(load_census(), time.time()):
+        return False
+    handle = _census_lock()
+    if handle is None:
+        return False  # a slice is running
+    fd = handle.fileno()
+    try:
+        subprocess.Popen(_background_argv([sys.executable, os.path.abspath(__file__), "--census",
+                                           "--census-lock-fd", str(fd)]),
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         stdin=subprocess.DEVNULL, start_new_session=True, pass_fds=(fd,))
+    except (OSError, subprocess.SubprocessError):
+        handle.close()
+        return False
+    handle.close()  # the child holds the same open file description, and with it the lock
+    return True
+
+
+def census_main(args: list[str]) -> int:
+    ap = argparse.ArgumentParser(prog="glaeda-disk --census")
+    ap.add_argument("--census", action="store_true")
+    ap.add_argument("--census-budget-s", type=float, default=CENSUS_BUDGET_S)
+    ap.add_argument("--census-lock-fd", type=int, default=None, help=argparse.SUPPRESS)
+    a = ap.parse_args(args)
+    with contextlib.suppress(OSError):
+        os.nice(19)
+    if a.census_lock_fd is not None:
+        try:
+            handle = os.fdopen(a.census_lock_fd, "a+")
+        except (OSError, ValueError):
+            handle = None
+    else:
+        handle = _census_lock()
+    if handle is None:
+        print("census already running; skipped")
+        return 0
+    budget = max(1.0, a.census_budget_s)
+    # a filesystem call that blocks in the kernel must not keep the lock forever: progress is saved every
+    # CENSUS_SAVE_EVERY_S, and the default SIGALRM action ends the process well past the slice budget
+    signal.alarm(int(budget + 3 * CENSUS_DU_TIMEOUT_S))
+    with handle:
+        roots, state = census_roots(), load_census()
+        if not roots or not census_due(state, time.time()):
+            print("census not due; skipped")
+            return 0
+        state = census_pass(roots, census_covered(), state, budget_s=max(1.0, a.census_budget_s))
+    print(f"census {'complete' if state['complete'] else 'paused'}: {len(state['rows'])} rows, "
+          f"{len(state['pending'])} directories left")
+    return 0
+
+
 def top_level_catalogued(catalogued: list[tuple[Path, int, str]]) -> list[tuple[Path, int, str]]:
     """Keep the highest-level item from each overlapping path set.
 
@@ -6447,8 +7036,13 @@ def top_level_catalogued(catalogued: list[tuple[Path, int, str]]) -> list[tuple[
     return selected
 
 
-def filesystem_accounting(fss: list[Fs], items: list[Item]) -> list[dict[str, Any]]:
+def filesystem_accounting(fss: list[Fs], items: list[Item],
+                          sizes: dict[str, int] | None = None) -> list[dict[str, Any]]:
     """Show df-used minus catalogued bytes and bounded top-level volume usage.
+
+    ``measured`` is every sized byte on the volume, counting the outermost path of each overlapping set
+    once: catalogue items, every other snapshot size (``sizes``, including candidates below the report
+    floor), the fixed accounting roots and the whole-volume census rows.
 
     The top-level walk is cached for six hours. Item sizes stay the authoritative measured catalog;
     this report deliberately calls out anything the catalog does not own so a zero reclaimable result
@@ -6528,7 +7122,26 @@ def filesystem_accounting(fss: list[Fs], items: list[Item]) -> list[dict[str, An
                 blocked_by_verdict[verdict] = blocked_by_verdict.get(verdict, 0) + size
         blocked = sum(blocked_by_verdict.values())
         unchecked = blocked_by_verdict.get("unchecked", 0)
-        measured = sum(size for _, size, _ in top_level_catalogued(ordered))
+        census = None if RUNNER_CACHE_PROFILE else census_for(fs.dev)
+        sized_rows = [(Path(census_canon(str(path))), size, verdict) for path, size, verdict in catalogued]
+        listed = {str(path) for path, _, _ in catalogued}
+        for path, size in (sizes or {}).items():
+            if path in listed or size <= 0:
+                continue
+            try:
+                if Path(path).stat().st_dev == fs.dev:
+                    sized_rows.append((Path(census_canon(path)), size, "sized"))
+            except OSError:
+                continue
+        for row in top:
+            if isinstance(row, dict) and isinstance(row.get("path"), str) and isinstance(row.get("bytes"), int):
+                sized_rows.append((Path(census_canon(row["path"])), row["bytes"], "sized"))
+        sized_rows.extend(census_catalogue(census))
+        outermost = top_level_catalogued(sorted(sized_rows, key=lambda row: (len(row[0].parts), str(row[0]))))
+        measured = sum(size for _, size, _ in outermost)
+        shared = Path("/Users/Shared")
+        measured_shared = (math.inf if any(path in shared.parents for path, _, _ in outermost) else
+                           sum(size for path, size, _ in outermost if path == shared or shared in path.parents))
         # A report-only checkout must not mask a reclaimable build directory nested inside it.
         # Deduplicate reclaimable candidates independently so this number is the bytes the next
         # apply can actually target, rather than every item carrying a reclaimable verdict.
@@ -6551,12 +7164,27 @@ def filesystem_accounting(fss: list[Fs], items: list[Item]) -> list[dict[str, An
             coverage = accounting_coverage(fs.dev, now)
             coverage_at = now if coverage else 0.0
         _ACCOUNTING_COVERAGE_MEM[(fs.dev, fs.mount)] = (coverage_at, coverage)
+        coverage = [row for row in coverage if row.get("scope") != CENSUS_SCOPE]
         unclassified = max(0, used - measured)
-        known_coverage = min(unclassified, reconciled_known_coverage(coverage))
+        # The shared-runner coverage rows have no paths: subtract only what they hold beyond the sized
+        # paths already measured inside /Users/Shared, or the same bytes would leave the gap twice.
+        known_coverage = min(unclassified, int(max(0, reconciled_known_coverage(coverage) - measured_shared)))
+        if census is not None:
+            coverage = [*coverage, census_coverage_row(census)]
+        if census is not None and census["complete"]:
+            # The census already sized the shared tree by path, so the path-less coverage rows add nothing.
+            gap = unclassified
+            unreadable = sum(1 for row in census["rows"].values() if row[1] in ("unreadable", "skipped"))
+            residual = APFS_INVISIBLE + (f" and {unreadable} unreadable or skipped dirs (lower bounds)"
+                                         if unreadable else "")
+        else:
+            gap = max(0, unclassified - known_coverage)
+            residual = "unwalked (volume census in progress)" if census else "unwalked (no volume census yet)"
         entry = {"dev": fs.dev, "mount": fs.mount, "used": used, "measured": measured,
                  "unmeasured": unclassified, "unclassified": unclassified,
                  "known_coverage": known_coverage,
-                 "accounting_gap": max(0, unclassified - known_coverage),
+                 "accounting_gap": gap,
+                 "residual": {"category": residual, "bytes": gap},
                  "reclaimable": reclaimable, "blocked": blocked, "unchecked": unchecked,
                  "blocked_by_verdict": blocked_by_verdict, "top_level": top,
                  "scope": "runner-cache-profile" if RUNNER_CACHE_PROFILE else "volume",
@@ -6826,6 +7454,8 @@ def report(items: list[Item], fss: list[Fs], limit: int, idle_hours: float,
               f"(unchecked {gib(a.get('unchecked', 0)).strip()}), "
               f"unclassified {gib(a.get('unclassified', a.get('unmeasured', 0))).strip()} "
               f"(df used {gib(a['used']).strip()}, measured {gib(a['measured']).strip()})")
+        if isinstance(a.get("residual"), dict):
+            print(f"  accounting gap {gib(a['residual'].get('bytes', 0)).strip()}: {a['residual'].get('category')}")
         container = a.get("container") or {}
         if container.get("free") is not None:
             print(f"  APFS container free {gib(container['free']).strip()} of "
@@ -7082,7 +7712,8 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
         if halt is not None and (why := halt()):
             print(f"stopped: {why}")
             break
-        if fam.id in FLEET_FAMILY_IDS or fam.id in (CMUX_NEXT_CI_FAMILY, HQ_CACHE_FAMILY, CANONICAL_ADMISSION) or (
+        if fam.id in FLEET_FAMILY_IDS or fam.id in (CMUX_NEXT_CI_FAMILY, HQ_CACHE_FAMILY, CANONICAL_ADMISSION) \
+                or media_tour_dd(fam, p) or (
                 fam.id == INTERRUPTED and fam.root in (cmux_next_ci_state_parents(HOME / "Library/Caches" / CMUX_NEXT_CI_ROOT)
                                                        + cmux_next_ci_host_parents(HOME / "Library/Caches" / CMUX_NEXT_CI_ROOT))):
             # Pressure eligibility is intentionally broad, so take fresh cwd/open-file evidence immediately
@@ -7189,6 +7820,8 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
                 elif i.family == INTERRUPTED:
                     finish_deletion(p)
                     gone = True
+                elif media_tour_dd(fam, p):
+                    gone = remove_media_tour_dd(p)  # only under the tour's tag lock: a tour may claim the slot now
                 elif cmux_next_ci_host_root(fam, p):
                     # only under its own lock (a build may take it now); for the floor alone, only while still under it
                     gone = remove_cmux_next_host(p, needed=(lambda q=p: cmux_next_ci_host_floor_unmet(q))
@@ -7763,6 +8396,30 @@ def cmux_next_ci_cap_state(fams: list[Family], cap_gib: float, measure: bool = F
         return None
     cap = int(cap_gib * GIB)
     return {"used": used, "cap": cap, "over": max(0, used - cap), "at": at}
+
+
+def nightly_next_dedicated() -> bool:
+    """The nightly-next build routes to its dedicated builder: disk-policy names the label cmux routes by."""
+    return POLICY.get("nightly_next_dedicated_label") == NIGHTLY_NEXT_DEDICATED_LABEL
+
+
+def nightly_next_family(root: Path | None = None) -> Family:
+    """Pool runners' cmux-nightly-next trees, each its own item; the dedicated builder's tree is never one."""
+    root = (HOME / "Library/Caches" / NIGHTLY_NEXT_ROOT) if root is None else root
+    window = DEFAULT_AGE_HOURS  # a module global keep_legacy_ages may have raised for this run
+    return Family(NIGHTLY_NEXT_FAMILY, root, True,
+                  "a fallback nightly-next build on this runner starts cold (the dedicated builder keeps its own)",
+                  # SourcePackages/checkouts and notices-crates/git hold SwiftPM and cargo clones, which the next
+                  # build fetches again: build output, not a checkout anyone works in
+                  build_output=True, min_idle_hours=window, max_idle_hours=window,
+                  owner="cmux nightly_build_state.py, per runner", rebuild_minutes=4, platform="macos")
+
+
+def nightly_next_fallback(path: Path) -> bool:
+    """A pool runner's tree under cmux-nightly-next: never the dedicated builder's, never an unknown name."""
+    name = path.name
+    return (NIGHTLY_NEXT_POOL_RUNNER.fullmatch(name) is not None
+            and NIGHTLY_NEXT_DEDICATED_RUNNER.fullmatch(name) is None)
 
 
 def cmux_next_ci_family(root: Path | None = None) -> Family:
@@ -8986,15 +9643,19 @@ def _main_impl(argv: list[str] | None = None) -> int:
         print(f"refresh budget reached after {a.refresh_budget_s:g}s; completed measurements were saved; "
               "the next refresh will continue\n")
     shown = [fs for fs in fss.values() if not a.pressure or fs.under]
-    accounting = filesystem_accounting(shown, items)
+    accounting = filesystem_accounting(shown, items, known)
     # A before/after receipt must compare the same filesystem set even when a pressure
     # report only displays volumes currently below the threshold.
     receipt_accounting_before = (accounting if len(shown) == len(fss)
-                                 else filesystem_accounting(list(fss.values()), items))
+                                 else filesystem_accounting(list(fss.values()), items, known))
     before_fs_receipt = filesystem_receipt_state(fss)
     operation = "idle" if sweep else "pressure" if a.pressure else "apply"
     RUN["mode"] = operation
     write_health_summary(shown, items, accounting, a.receipt)
+    # After accounting.json holds this run's fixed-root walk, so the census skips those roots; never from an
+    # apply, whose deletions it would race (another process's apply only leaves rows the next census drops).
+    if not a.no_snapshot and not a.refresh and not a.pressure and not a.apply:
+        launch_background_census()
     # Xcode copies are sized by a walk, so only a report shows them (the agent runs with --top 0)
     tooling = (simulator_runtimes() + (xcode_items() if a.top or a.json else [])) \
         if sweep and DARWIN and not RUNNER_CACHE_PROFILE else []
@@ -9090,7 +9751,7 @@ def _main_impl(argv: list[str] | None = None) -> int:
         # deliberately separate: logical catalogue bytes can differ from physical free
         # blocks because of APFS clones, snapshots, concurrent jobs, or failed measurements.
         after_fss, after_fs_receipt = reobserve_filesystems(fss)
-        after_accounting = filesystem_accounting(after_fss, items)
+        after_accounting = filesystem_accounting(after_fss, items, known)
         write_health_summary(after_fss, items, after_accounting, a.receipt)
         summary = write_eviction_summary(a.receipt, operation, logical_released,
                                          before_fs_receipt, after_fs_receipt,
@@ -9210,6 +9871,8 @@ def _logged_main(args: list[str]) -> int:
 def main(argv: list[str] | None = None) -> int:
     """Run the disk command, bounding only the owned background refresh process."""
     args = list(sys.argv[1:] if argv is None else argv)
+    if "--census" in args:
+        return census_main(args)
     background = "--refresh" in args and "--refresh-lock-fd" in args and "--apply" not in args
     if not background:
         return _logged_main(args)
