@@ -359,6 +359,9 @@ def dedicated_runners(manifest: Any, member: str) -> tuple[list[dict[str, Any]],
     entries = runner.get("dedicated", []) if isinstance(runner, dict) else []
     if not isinstance(entries, list):
         return [], f"{member} runner.dedicated must be a list"
+    if entries and host.get("gui") is False:
+        # a dedicated runner is a LaunchAgent in the user's GUI session; the headless supervisor is not wired for it
+        return [], f"{member} has gui: false; runner.dedicated runs only on a member with a GUI session"
     out: list[dict[str, Any]] = []
     pools: set[str] | None = None  # every pool label the manifest declares, read once when there is an entry
     for index, entry in enumerate(entries):

@@ -9429,6 +9429,10 @@ class DedicatedRunnerTest(unittest.TestCase):
                 self.assertIn(needle, why or "")
         _, why = fleet_labels.dedicated_runners(dedicated_manifest(NIGHTLY, NIGHTLY), "mini-std")
         self.assertIn("declared twice", why)
+        headless = dedicated_manifest(NIGHTLY)
+        headless["hosts"]["mini-std"]["gui"] = False
+        _, why = fleet_labels.dedicated_runners(headless, "mini-std")
+        self.assertIn("gui: false", why or "")
 
     def test_install_registers_exactly_its_labels_with_its_own_admission_and_watch(self) -> None:
         fake_pw = mock.Mock(pw_dir=os.fspath(self.home))

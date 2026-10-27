@@ -1016,12 +1016,12 @@ def start_agent(ctx: Context, act: dict[str, Any], plist: str) -> str | None:
 
 
 def routing(ctx: Context) -> dict[str, Any]:
-    repo = shlex.quote(ctx.route_repo)
-    member = ctx.member
     if dedicated_of(ctx):
         return {"route": [], "rollback": [],
                 "note": "dedicated runner: only jobs that name its labels come here, as they did before glaeda "
                         "managed it; nothing is set per runner"}
+    repo = shlex.quote(ctx.route_repo)
+    member = ctx.member
     if not member:
         return {
             "route": [f"gh variable set {v} --body {MINI_LABEL} --repo {repo}" for v in ROUTE_VARIABLES],
