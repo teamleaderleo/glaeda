@@ -2907,6 +2907,35 @@ class TickBudgetTest(Base):
         self.assertIn("run:o/r/1", order[:3])
         self.assertIn("run:o/r/2", order[:3], "both deferred keys are read before the newer arrivals pile up")
 
+    def test_a_read_that_defers_itself_does_not_keep_its_place(self) -> None:
+        """A read that stores its data and defers itself for the rest (fill_steps_rest, out of time for the steps)
+        was served: it queues behind keys deferred while it was read, not ahead of them forever."""
+        self.daemon.budget = {"rest": {"limit": 5000, "remaining": 4500, "reset": NOW + 1800},
+                              "graphql": {"limit": 5000, "remaining": 0, "reset": NOW + 1800}}
+        order: list[str] = []
+
+        def read(e: dict) -> None:
+            if order and order[-1] == "cut":
+                order.pop()
+                raise gg.OutOfTime()
+            order.extend([e["key"], "cut"])
+            self.daemon.store(e["key"], e["cache"], data={"status": "in_progress"}, dataAt=self.daemon.now)
+            if e["key"] == "run:o/r/1":
+                self.daemon.deferred.add(e["key"])  # served, with work left for the next tick
+
+        with mock.patch.object(self.daemon, "fetch_run", side_effect=read):
+            for t in range(5):
+                if t == 1:  # arrive after run 1 first deferred itself
+                    gg.register("run:o/r/2")
+                    gg.register("run:o/r/3")
+                else:
+                    gg.register("run:o/r/1")
+                self.daemon.tick(NOW + t * gg.TICK)
+                if order and order[-1] == "cut":
+                    order.pop()
+        self.assertIn("run:o/r/2", order, order)
+        self.assertIn("run:o/r/3", order, order)
+
     def test_failed_controller_fed_reads_move_back(self) -> None:
         """A controller-fed run keeps restAt when its REST read fails; the failure still moves it back
         (rest_tried), so failing keys cannot hold the head of the order."""

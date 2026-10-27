@@ -2043,6 +2043,8 @@ class Daemon:
             except Exception as error:  # noqa: BLE001
                 self.errors.append(f"{e['key']}: {describe(error)}")
             self.rest_tried[e["key"]] = self.now  # read, or failed: either way it moves back
+            # and a read that deferred itself for the rest of its work (fill_steps_rest) queues as a new deferral
+            self.deferred_since.pop(e["key"], None)
         for e in self.jobs_only:
             try:
                 self.read_jobs(e, {}, False)  # read_jobs reads the list a failed attempt is missing
