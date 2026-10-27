@@ -1498,8 +1498,10 @@ POLICY_DEFAULTS: dict[str, Any] = {
     "cmux_next_ci_host_idle_hours": float("inf"),
     # The label cmux's nightly-next build routes to its one dedicated builder by (vars.CI_NIGHTLY_NEXT_DEDICATED_LABEL).
     # Only NIGHTLY_NEXT_DEDICATED_LABEL turns the cmux-nightly-next fallback eviction on; "" (or any other value)
-    # leaves that cache as it was. Set it only once that variable is set, so no fallback goes before the routing.
-    "nightly_next_dedicated_label": "",
+    # leaves that cache as it was. It is set: cmux#26048 routes the build to that label first (then owned Macs, then
+    # Blacksmith), vars.CI_NIGHTLY_NEXT_DEDICATED_LABEL is glaeda-trusted-next-nightly and its builder is online, so
+    # pool runners' fallback trees go after DEFAULT_AGE_HOURS idle. A policy file's "off" turns it back off.
+    "nightly_next_dedicated_label": NIGHTLY_NEXT_DEDICATED_LABEL,
     # --dedupe also clones identical files in capture and evidence trees (screen-capture frames, UI evidence),
     # with its own floor: one PNG frame is 16-200 KiB, so Xcode's 1 MiB floor saw 2.7 of the 11.2 GiB of
     # identical frames in cmux-mac-mini's ~/messageslab-26. "~" is the account's home; globs are allowed; a

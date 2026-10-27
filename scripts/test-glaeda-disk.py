@@ -8591,9 +8591,15 @@ class NightlyNextFallbackTest(unittest.TestCase):
         with mock.patch.object(gd, "POLICY", policy):
             return {f.id: f for f in gd.default_families()}
 
-    def test_inert_until_the_routing_label_is_set(self) -> None:
-        self.assertEqual(gd.POLICY_DEFAULTS["nightly_next_dedicated_label"], "")
-        for label in (None, "", "glaeda-trusted", "glaeda-trusted-next-nightly-x"):
+    def test_on_by_default_now_that_cmux_routes_to_the_label(self) -> None:
+        """cmux#26048 routes nightly-next to the dedicated builder, so the split is on unless a policy file opts out."""
+        self.assertEqual(gd.POLICY_DEFAULTS["nightly_next_dedicated_label"], gd.NIGHTLY_NEXT_DEDICATED_LABEL)
+        self.assertEqual(gd.disk_policy(self.home / "no-such-policy.json")["nightly_next_dedicated_label"],
+                         gd.NIGHTLY_NEXT_DEDICATED_LABEL)
+        self.assertIn(gd.NIGHTLY_NEXT_FAMILY, self.families(gd.POLICY_DEFAULTS["nightly_next_dedicated_label"]))
+
+    def test_inert_when_a_policy_file_clears_the_label(self) -> None:
+        for label in ("", "glaeda-trusted", "glaeda-trusted-next-nightly-x"):
             fams = self.families(label)
             self.assertNotIn(gd.NIGHTLY_NEXT_FAMILY, fams, label)
             # as before: the whole root is one library-caches item
@@ -8607,14 +8613,14 @@ class NightlyNextFallbackTest(unittest.TestCase):
         (runner / ".runner").write_text("{}")
         kept = self.root / "cmux7s-mac-mini-glaeda-nightly-next"
         (runner / gd.ROLE_KEEP_MARKER).write_text(json.dumps([os.fspath(kept)]))
-        fams = self.families(None)
+        fams = self.families("")
         self.assertIn(gd.NIGHTLY_NEXT_FAMILY, fams)
         self.assertIn(gd.NIGHTLY_NEXT_ROOT, fams["library-caches"].skip)
         self.assertTrue(gd.toolchain_held(kept / "0123456789abcdef0123456789abcdef"))
         self.assertFalse(gd.toolchain_held(self.root / "cmux9s-mac-mini-glaeda-2"))
         # a keep elsewhere leaves the root whole, as before
         (runner / gd.ROLE_KEEP_MARKER).write_text(json.dumps([os.fspath(runner / "_work/cmux/cmux")]))
-        fams = self.families(None)
+        fams = self.families("")
         self.assertNotIn(gd.NIGHTLY_NEXT_FAMILY, fams)
         self.assertNotIn(gd.NIGHTLY_NEXT_ROOT, fams["library-caches"].skip)
 
@@ -8622,8 +8628,10 @@ class NightlyNextFallbackTest(unittest.TestCase):
         policy = self.home / "disk-policy.json"
         policy.write_text(json.dumps({"nightly_next_dedicated_label": gd.NIGHTLY_NEXT_DEDICATED_LABEL}))
         self.assertEqual(gd.disk_policy(policy)["nightly_next_dedicated_label"], gd.NIGHTLY_NEXT_DEDICATED_LABEL)
-        policy.write_text(json.dumps({"nightly_next_dedicated_label": 1}))
-        self.assertEqual(gd.disk_policy(policy)["nightly_next_dedicated_label"], "")
+        policy.write_text(json.dumps({"nightly_next_dedicated_label": "off"}))  # any other label opts out
+        self.assertEqual(gd.disk_policy(policy)["nightly_next_dedicated_label"], "off")
+        policy.write_text(json.dumps({"nightly_next_dedicated_label": 1}))  # wrongly typed: the default stays
+        self.assertEqual(gd.disk_policy(policy)["nightly_next_dedicated_label"], gd.NIGHTLY_NEXT_DEDICATED_LABEL)
 
     def test_active_keeps_the_dedicated_builder_and_offers_pool_trees(self) -> None:
         fams = self.families(gd.NIGHTLY_NEXT_DEDICATED_LABEL)
@@ -8680,7 +8688,8 @@ class NightlyNextFallbackTest(unittest.TestCase):
         self.assertLess(gd.item_mtime(gd.Family("x", self.root, True, "x"), tree), old + 1)
 
     def test_runner_cache_profile(self) -> None:
-        self.assertNotIn(gd.NIGHTLY_NEXT_FAMILY, {f.id for f in gd.runner_cache_families()})
+        with mock.patch.object(gd, "POLICY", {**gd.POLICY, "nightly_next_dedicated_label": "off"}):
+            self.assertNotIn(gd.NIGHTLY_NEXT_FAMILY, {f.id for f in gd.runner_cache_families()})
         policy = {**gd.POLICY, "nightly_next_dedicated_label": gd.NIGHTLY_NEXT_DEDICATED_LABEL}
         with mock.patch.object(gd, "POLICY", policy):
             fam = {f.id: f for f in gd.runner_cache_families()}[gd.NIGHTLY_NEXT_FAMILY]
