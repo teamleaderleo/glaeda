@@ -1091,8 +1091,8 @@ def dev_compile_refusal(event_name: str | None, ref: str | None, repository: str
 
 # glaeda-mini-health's drain for a Tailscale restart (glaeda#1627): it wants the host idle, not jobs refused. The gate
 # stops idle listeners while the marker stands, so no new job comes; a job a listener already took before the gate
-# saw the marker is admitted and finishes (mini-health waits for it). Refusing it only failed that job: on
-# 2026-10-27 mini-5 refused 28 jobs this way between 00:47Z and 01:06Z.
+# saw the marker is admitted and finishes (mini-health waits for it). Refusing it only failed that job: one
+# mini refused 28 jobs this way during a single 20-minute drain.
 DRAIN_OWNER = "glaeda-mini-health"
 DRAIN_PURPOSE = "drain for "
 
