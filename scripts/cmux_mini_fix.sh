@@ -270,16 +270,20 @@ runner_launchctl() {
 }
 
 runner_idle() {  # DIR: true only when that runner has no job, as the gate and glaeda-cmux-runner decide it (a
-  # Worker under bin or a self-update's bin.<version>, or a request its listener took); anything else is a job
+  # Worker under bin or a self-update's bin.<version>, or a request its live listener took). The runner's own hook
+  # answers, else the fleet copy's; with neither, or any other answer (a crash, an older hook), it has a job.
   local hook="$1/glaeda-hooks/glaeda-cmux-runner-hook" py="$HOME/.local/bin/python3" rc=0
   [ -x "$py" ] || py=python3
-  if [ -f "$hook" ]; then
-    "$py" "$hook" busy --runner-dir "$1" >/dev/null 2>&1 || rc=$?
-    [ "$rc" -eq 3 ]  # the hook's idle; a crash or an older hook without the phase is a job
-    return
-  fi
-  pgrep -f "$1/bin[^/ ]*/Runner.Worker" >/dev/null 2>&1 || rc=$?
-  [ "$rc" -eq 1 ]  # no glaeda hook here: no Worker of it (pgrep's 1), never a pgrep that failed
+  [ -f "$hook" ] || hook="$HOME/glaeda-runner/scripts/glaeda-cmux-runner-hook"
+  [ -f "$hook" ] || return 1
+  "$py" "$hook" busy --runner-dir "$1" >/dev/null 2>&1 || rc=$?
+  [ "$rc" -eq 3 ]
+}
+
+runner_freeze() {  # DIR: SIGSTOP its listeners; false when that failed (pkill 1, no listener, is fine)
+  local rc=0
+  pkill -STOP -f "$1/bin/Runner\.Listener" 2>/dev/null || rc=$?
+  [ "$rc" -le 1 ]
 }
 
 runner_hold() {  # WAIT_SECONDS
@@ -294,7 +298,7 @@ runner_hold() {  # WAIT_SECONDS
     if ! runner_launchctl "$plist" print "$domain/$label" >/dev/null 2>&1; then say "unchanged: $label is not loaded"; continue; fi
     deadline=$(( $(date +%s) + $1 ))
     # the last look and the stop happen with its listener frozen, as the gate's own stop: it cannot take a job between
-    while pkill -STOP -f "$dir/bin/Runner\.Listener" 2>/dev/null; ! runner_idle "$dir"; do
+    while ! { runner_freeze "$dir" && runner_idle "$dir"; }; do
       pkill -CONT -f "$dir/bin/Runner\.Listener" 2>/dev/null || true
       [ "$(date +%s)" -lt "$deadline" ] || refuse "$label is still running a job after $1 seconds; rerun once it ends"
       say "$label is running a job; waiting for it to end"

@@ -4673,8 +4673,17 @@ class Gate:
             gate_log(f"the leftover sweep failed ({type(error).__name__}); trying again later")
 
     def busy(self) -> bool:
-        """The runner has a job: a Runner.Worker under its tree, or a request its listener is taking."""
-        return self.worker() or self.taking() is not None
+        """The runner has a job: a Runner.Worker under its tree, or a request its live listener is taking. A request
+        left in the diag of a listener that is gone holds nothing (nothing can run it), so it never pins the gate."""
+        return self.worker() or (self.listening() and self.taking() is not None)
+
+    def listening(self) -> bool:
+        """A Runner.Listener of this runner under its tree. A failed look counts as listening."""
+        try:
+            pids, table = self.tree()
+        except Exception:  # noqa: BLE001
+            return True
+        return any(runner_worker(self.runner_dir, table[pid][1], "Listener") for pid in pids)
 
     def worker_pids(self) -> tuple[int, ...]:
         """Runner.Worker descendants, used to wake a disk hold when the job exits."""

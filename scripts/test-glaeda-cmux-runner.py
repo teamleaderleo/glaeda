@@ -7095,6 +7095,32 @@ class GateTest(unittest.TestCase):
         self.assertEqual(log.read_text().count("Listening for Jobs"), 1)
         self.assertEqual(self.listeners(), [])
 
+    def test_listen_sh_fallback_never_stops_a_listener_taking_a_job(self) -> None:
+        # the fallback asks the hook (exit 3: idle) with the listener frozen, so a request it took keeps it
+        script = self.listen_sh(sys.executable)
+        self.assertIn("busy --runner-dir", script.read_text())
+        proc, log = self.run_listen(os.fspath(script))
+        self.addCleanup(lambda: proc.poll() is None and (proc.kill(), proc.wait()))
+        self.wait_for(log, "Listening for Jobs")
+        diag = self.diag(MID_ACQUIRE_DIAG, "Runner_29990101-000000-utc.log")  # the newest diag
+        gate = [pid for pid, (_, cmd) in hook.processes().items()
+                if "listen --runner-dir" in cmd and os.fspath(self.runner) in cmd and "listen.sh" not in cmd]
+        os.kill(gate[0], 9)
+        self.wait_for(log, "with its runner running")
+        time.sleep(7)  # past one pass of the fallback's loop
+        self.assertIsNone(proc.poll(), "taking a job: the fallback keeps the listener")
+        self.assertTrue(self.listeners())
+        diag.write_text(diag.read_text() + ACQUIRE_FAILED)  # the acquisition ended: idle
+        self.assertEqual(proc.wait(timeout=30), 1)
+        self.assertEqual(self.listeners(), [])
+
+    def test_a_request_left_by_a_listener_that_is_gone_is_no_job_for_the_gate(self) -> None:
+        self.diag(MID_ACQUIRE_DIAG)
+        gate = hook.Gate(self.runner, os.fspath(self.lock), os.fspath(self.tmp / "none.json"), self.state)
+        self.assertFalse(gate.busy(), "no listener, no Worker: a stale acknowledge holds nothing")
+        with mock.patch.object(gate, "listening", return_value=True):
+            self.assertTrue(gate.busy(), "with its listener alive it is a job being taken")
+
     def test_listen_sh_forwards_sigterm_and_leaves_nothing_behind(self) -> None:
         script = self.listen_sh(sys.executable)
         proc, log = self.run_listen(os.fspath(script))
@@ -8608,6 +8634,28 @@ class RunnerTest(unittest.TestCase):
             bootout.assert_called_once()
         state = subprocess.run(["/bin/ps", "-o", "stat=", "-p", str(listener.pid)], capture_output=True, text=True)
         self.assertFalse(state.stdout.strip().startswith("T"), "and thawed after")
+
+    def test_a_stop_that_cannot_freeze_the_listeners_stops_nothing(self) -> None:
+        ctx = mock.Mock(runner_dir=self.home / "actions-runner-glaeda")
+        with mock.patch.object(cr.subprocess, "run", side_effect=OSError("no ps")), \
+                mock.patch.object(cr, "runner_busy", return_value=False), mock.patch.object(cr, "bootout") as bootout:
+            self.assertFalse(cr.stop_if_idle(ctx), "an idle reading without the freeze is no proof")
+        bootout.assert_not_called()
+
+    def test_a_skip_launchctl_relabel_refuses_a_live_listener(self) -> None:
+        runner = self.home / "actions-runner-glaeda-5"
+        runner.mkdir()
+        (runner / ".runner").write_text("{}")
+        ctx = mock.Mock(runner_dir=runner, skip_launchctl=True)
+        act: dict = {}
+        listener = subprocess.Popen(["/bin/bash", "-c", 'exec -a "$0" /bin/sleep 60', f"{runner}/bin/Runner.Listener"])
+        self.addCleanup(lambda: (listener.kill(), listener.wait()))
+        time.sleep(0.2)
+        with mock.patch.object(cr, "register") as register:
+            cr.relabel(ctx, act)
+        register.assert_not_called()
+        self.assertEqual(act["state"], "failed")
+        self.assertTrue((runner / ".runner").exists(), "its registration is kept")
 
     def test_an_agent_relabel_started_is_never_booted_out_with_a_job(self) -> None:
         ctx = mock.Mock(skip_launchctl=False, agent_started=True, headless=False)

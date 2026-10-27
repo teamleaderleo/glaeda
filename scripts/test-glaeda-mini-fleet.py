@@ -2525,28 +2525,16 @@ esac
             (home / "loaded/actions.runner.x").write_text("")
             held = home / ".local/state/glaeda/mini-fleet/runner-held/actions-runner-x"
             with mock.patch.object(mf.bootstrap, "CMUX_WORKLOAD_TOOL_PATH", f"{shims}:/usr/bin:/bin"):
-                (home / "worker-running").write_text("")
+                # no glaeda hook to ask (neither the runner's nor the fleet copy's): it cannot tell, so a job
                 busy = self.call(home, "runner_hold", "0")
                 self.assertEqual(busy.returncode, 3)
                 self.assertIn("still running a job", busy.stderr)
                 self.assertFalse(held.exists())
-                (home / "worker-running").unlink()
-                stopped = self.call(home, "runner_hold", "60")
-                self.assertEqual(stopped.returncode, 0, stopped.stderr)
-                self.assertTrue(held.exists())
-                self.assertFalse((home / "loaded/actions.runner.x").exists())
-                self.assertIn("unchanged", self.call(home, "runner_hold", "60").stdout)  # a rerun changes nothing
-                started = self.call(home, "runner_release")
-                self.assertEqual(started.returncode, 0, started.stderr)
-                self.assertFalse(held.exists())
-                self.assertTrue((home / "loaded/actions.runner.x").exists())
-                self.assertEqual(self.call(home, "runner_kick").returncode, 0)  # loaded, no listener: restarted
-                (home / "listener-running").write_text("")
-                self.assertEqual(self.call(home, "runner_kick").returncode, 0)  # listening: left alone
-                # a glaeda runner decides with its hook: a self-updated runner's bin.<version> Worker is a job
-                hooks = runner / "glaeda-hooks"
-                hooks.mkdir()
-                shutil.copy(Path(mf.FIX_LIBRARY).parent / "glaeda-cmux-runner-hook", hooks)
+                self.assertTrue((home / "loaded/actions.runner.x").exists(), "never booted out")
+                # the fleet copy's hook decides: a self-updated runner's bin.<version> Worker is a job
+                fleet_copy = home / "glaeda-runner/scripts"
+                fleet_copy.mkdir(parents=True)
+                shutil.copy(Path(mf.FIX_LIBRARY).parent / "glaeda-cmux-runner-hook", fleet_copy)
                 (shims / "python3").symlink_to(sys.executable)  # the hook's python, as ~/.local/bin/python3 on a mini
                 worker = subprocess.Popen(["/bin/bash", "-c", 'exec -a "$0" /bin/sleep 60',
                                            f"{runner}/bin.2.338.0/Runner.Worker"])
@@ -2559,8 +2547,18 @@ esac
                 finally:
                     worker.kill()
                     worker.wait()
-                self.assertEqual(self.call(home, "runner_hold", "60").returncode, 0)
+                stopped = self.call(home, "runner_hold", "60")
+                self.assertEqual(stopped.returncode, 0, stopped.stderr)
+                self.assertTrue(held.exists())
                 self.assertFalse((home / "loaded/actions.runner.x").exists())
+                self.assertIn("unchanged", self.call(home, "runner_hold", "60").stdout)  # a rerun changes nothing
+                started = self.call(home, "runner_release")
+                self.assertEqual(started.returncode, 0, started.stderr)
+                self.assertFalse(held.exists())
+                self.assertTrue((home / "loaded/actions.runner.x").exists())
+                self.assertEqual(self.call(home, "runner_kick").returncode, 0)  # loaded, no listener: restarted
+                (home / "listener-running").write_text("")
+                self.assertEqual(self.call(home, "runner_kick").returncode, 0)  # listening: left alone
             log = (home / "launchctl.log").read_text()
             uid = os.getuid()
             self.assertIn(f"disable gui/{uid}/actions.runner.x", log)

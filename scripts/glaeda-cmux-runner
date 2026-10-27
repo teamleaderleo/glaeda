@@ -101,7 +101,7 @@ import tempfile
 import time
 import urllib.parse
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 
 SCHEMA = "glaeda-cmux-runner/v1"
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -816,11 +816,16 @@ def hook_wrappers(ctx: Context) -> dict[str, bytes]:
         "tree=\"$dir/run|$dir/bin[^/ ]*/Runner\\.(Listener|Worker)\"  # bin.<version> after a self-update\n"
         "if /usr/bin/pgrep -f \"$tree\" >/dev/null; then\n"
         "    echo \"$(date -u '+%Y-%m-%d %H:%M:%SZ'): glaeda-cmux-runner-gate: the gate exited $code with its runner running; stopping the runner once it has no job\"\n"
+        "    # idle only by the hook's own test (no Worker, no request its listener took: exit 3), decided with the\n"
+        "    # listener frozen so it cannot take one before the SIGINT; a hook that cannot answer keeps the runner\n"
         "    while [ -z \"$stopping\" ] && /usr/bin/pgrep -f \"$tree\" >/dev/null; do\n"
-        "        if ! /usr/bin/pgrep -f \"$dir/bin[^/ ]*/Runner\\.Worker\" >/dev/null; then\n"
+        "        /usr/bin/pkill -STOP -f \"$dir/bin/Runner\\.Listener\"; frozen=$?\n"
+        f"        {python} {hook} busy --runner-dir \"$dir\" >/dev/null 2>&1; busy=$?\n"
+        "        if [ \"$frozen\" -le 1 ] && [ \"$busy\" -eq 3 ]; then\n"
         "            /usr/bin/pkill -INT -f \"$dir/bin/Runner\\.Listener\" ||\n"
         "                /usr/bin/pkill -TERM -f \"$dir/run\"\n"
         "        fi\n"
+        "        /usr/bin/pkill -CONT -f \"$dir/bin/Runner\\.Listener\"\n"
         "        sleep 5\n"
         "    done\n"
         "    exit 1\n"
@@ -1450,11 +1455,13 @@ def runner_busy(ctx: Context) -> bool:
 
 
 @contextlib.contextmanager
-def listeners_frozen(runner_dir: Path) -> Iterator[None]:
-    """This runner's listeners stopped (SIGSTOP) for a last look and a bootout, as the gate's own stop does:
-    frozen, a listener can neither acknowledge a request nor start a Worker, so an idle reading stays true until
-    the bootout lands. Thawed afterwards; a booted-out listener is gone by then, or gets launchd's SIGKILL."""
+def listeners_frozen(runner_dir: Path) -> Iterator[int | None]:
+    """This runner's listeners stopped (SIGSTOP) for a last look and a stop, as the gate's own stop does: frozen, a
+    listener can neither acknowledge a request nor start a Worker, so an idle reading stays true until the bootout
+    lands. Yields how many it froze, or None when it could not freeze them all (the caller then stops nothing).
+    Thawed afterwards; a booted-out listener is gone by then, or gets launchd's SIGKILL."""
     frozen: list[int] = []
+    count: int | None = 0
     try:
         out = subprocess.run(["/bin/ps", "-axww", "-o", "pid=,command="], stdin=subprocess.DEVNULL,
                              capture_output=True, text=True, timeout=RUN_TIMEOUT, check=True).stdout
@@ -1462,38 +1469,45 @@ def listeners_frozen(runner_dir: Path) -> Iterator[None]:
         for line in out.splitlines():
             pid, _, command = line.strip().partition(" ")
             if pid.isdigit() and hook.runner_worker(runner_dir, command, "Listener"):
-                with contextlib.suppress(OSError):
+                try:
                     os.kill(int(pid), signal.SIGSTOP)
                     frozen.append(int(pid))
-    except Exception:  # noqa: BLE001  (no freeze: worker_running still decides, and fails closed itself)
-        pass
+                except ProcessLookupError:
+                    continue  # it exited: nothing left to take a job
+        count = len(frozen)
+    except Exception:  # noqa: BLE001
+        count = None
     try:
-        yield
+        yield count
     finally:
         for pid in frozen:
             with contextlib.suppress(OSError):
                 os.kill(pid, signal.SIGCONT)
 
 
-def stop_if_idle(ctx: Context) -> bool:
-    """Boot this runner's agent out only when it has no job, deciding with its listeners frozen. False: it has a
-    job (or cannot tell) and nothing was stopped."""
-    with listeners_frozen(ctx.runner_dir):
-        if runner_busy(ctx):
+def stop_if_idle(ctx: Context, stop: Callable[[], None] | None = None, listener_ok: bool = True) -> bool:
+    """Run stop (default: boot this runner's agent out) only when it has no job, deciding with its listeners
+    frozen. listener_ok=False also refuses while a listener of it lives (a re-registration under a listener
+    nothing stops would orphan it). False: it has a job, or this cannot tell, and nothing was stopped."""
+    with listeners_frozen(ctx.runner_dir) as frozen:
+        if frozen is None or (frozen and not listener_ok) or runner_busy(ctx):
             return False
-        bootout(ctx)
+        (stop or (lambda: bootout(ctx)))()
     return True
 
 
 def relabel(ctx: Context, act: dict[str, Any]) -> None:
     """Re-register this runner under the same name with the manifest's labels. _work stays."""
-    if ctx.skip_launchctl and runner_busy(ctx) or not ctx.skip_launchctl and not stop_if_idle(ctx):
-        act["state"], act["note"] = "failed", "the runner started a job; nothing changed, re-run when idle"
+    def unregister() -> None:  # with its listeners frozen and idle: none can take a job before the files go
+        for name in LOCAL_REGISTRATION:
+            (ctx.runner_dir / name).unlink(missing_ok=True)
+    stop = unregister if ctx.skip_launchctl else (lambda: (bootout(ctx), unregister()))
+    # --skip-launchctl stops nothing, so a listener still running there refuses: --replace would orphan it
+    if not stop_if_idle(ctx, stop, listener_ok=not ctx.skip_launchctl):
+        act["state"], act["note"] = "failed", "the runner started a job (or a listener runs); nothing changed, re-run when idle"
         return
     if not ctx.skip_launchctl:
         ctx.agent_started = False  # stopped now, whatever the plan saw; the agent step reads this
-    for name in LOCAL_REGISTRATION:
-        (ctx.runner_dir / name).unlink(missing_ok=True)
     act["replace"] = True
     register(ctx, act)
     if act["state"] == "failed":
