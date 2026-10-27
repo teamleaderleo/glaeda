@@ -336,6 +336,11 @@ class FleetTest(unittest.TestCase):
         scope, why = labels.pool_scope(manifest, "mini-a")
         self.assertIsNone(scope)
         self.assertIn("trustedRepo", why)
+        # a null org in the host's own overrides is no org: the trusted member stays on its repository
+        manifest["defaults"]["runner"] = {"org": "manaflow-ai", "group": "glaeda-minis"}
+        manifest["hosts"]["mini-a"]["overrides"] = {"runner": {"trustedRepo": "manaflow-ai/private", "org": None,
+                                                               "group": None}}
+        self.assertEqual(labels.pool_scope(manifest, "mini-a"), ({"repo": "manaflow-ai/private"}, None))
 
     def test_without_a_manifest_scope_the_default_repository_is_used(self) -> None:
         result = self.fleet("--apply", "--hosts", "mini-a")
