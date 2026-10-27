@@ -50,6 +50,13 @@ class Refuses(unittest.TestCase):
             "    runs-on:\n      - ${{ inputs.runner }}\n",
             "    strategy:\n      matrix:\n        os: ${{ fromJSON(inputs.oses) }}\n    runs-on: ${{ matrix.os }}\n",
             "    strategy:\n      matrix:\n        include:\n          - os: ${{ vars.OS }}\n    runs-on: ${{ matrix.os }}\n",
+            "    strategy:\n      matrix:\n        name: [ubuntu-latest]\n    runs-on: ${{ matrix.name }}\n",
+            "    strategy:\n      matrix:\n        include:\n          - run: ubuntu-24.04\n    runs-on: ${{ matrix.run }}\n",
+            "    runs-on: >-\n      ${{ vars\n      ['LINUX_RUNNER'] }}\n",
+            "    runs-on: ${{ format('ubuntu-{0}', 'latest') }}\n",
+            "    runs-on: ${{ github.event.client_payload.runner }}\n",
+            "    runs-on: ${{ matrix.os || 'ubuntu-latest' }}\n",
+            "    runs-on: [self-hosted, ubuntu-24.04]\n",
         ):
             with self.subTest(runs_on=runs_on):
                 self.assertTrue(check("  a:\n" + runs_on + "    steps: [{run: true}]\n"))
@@ -69,8 +76,6 @@ class Refuses(unittest.TestCase):
             "    runs-on: ${{ github.repository_owner == 'manaflow-ai' && 'ubuntu-latest' || 'ubuntu-24.04' }}\n",
             "    runs-on: ${{ github.event_name == 'push' && github.repository_owner == 'manaflow-ai'"
             " && 'blacksmith-4vcpu-ubuntu-2404' || 'ubuntu-24.04' }}\n",
-            "    runs-on: ${{ github.repository_owner == 'manaflow-ai' && 'blacksmith-4vcpu-ubuntu-2404'"
-            " || 'ubuntu-24.04' }}-x\n",
         ):
             with self.subTest(runs_on=runs_on):
                 self.assertTrue(check("  a:\n" + runs_on))

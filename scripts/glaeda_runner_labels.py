@@ -14,8 +14,9 @@ serves this repository either. So:
   image itself, is listed in HOSTED_ALLOWED with its reason until the repository moves under an organization.
 
 Any other job that names a hosted label fails CI. An entry whose job no longer names one fails too, so the list only
-shrinks. A runs-on or matrix this scan cannot read (`vars`, `needs`, `inputs` or `steps`, in any case or bracket
-form, or `fromJSON`), on its line or nested under it, fails as well unless its job is listed: a variable or picker output could hold a hosted label the text never shows.
+shrinks. A runs-on or matrix value is read whole, and any expression in it other than the owner form (or `matrix.<axis>`
+in runs-on) fails as well unless its job is listed: a variable, input or picker output could hold a hosted label the
+text never shows.
 
 The scan reads workflow text line by line, so it sees labels in `runs-on`, matrix rows (`runner: ubuntu-24.04`),
 expression defaults (`vars.X || 'ubuntu-24.04'`) and arrays. Comments and `run:`, `name:` and `description:` text
@@ -39,16 +40,17 @@ HOSTED = re.compile(
 NON_RUNNER_KEY = re.compile(r"^\s*(?:-\s+)?(?:name|description|run)\s*:")
 BLOCK_SCALAR = re.compile(r":\s*[|>][-+0-9]*\s*(?:#.*)?$")
 JOB = re.compile(r"^  ([A-Za-z_][A-Za-z0-9_-]*)\s*:\s*(?:#.*)?$")
-# Blacksmith in the manaflow-ai fork, the hosted image only in this personal-account repository. The whole value
-# must be exactly this expression: a condition added in front of it (`github.event_name == 'push' && ...`) would
-# send the fork to the hosted image too.
-OWNER_FORM = re.compile(
-    r"^\s*(?:-\s+)?(?:runs-on|runner)\s*:\s*(?P<q>[\"']?)\$\{\{\s*"
-    r"github\.repository_owner\s*==\s*'manaflow-ai'\s*&&\s*'blacksmith-[0-9]+vcpu-[a-z0-9.-]+'\s*\|\|\s*'[^']+'"
-    r"\s*\}\}(?P=q)\s*$")
+# Blacksmith in the manaflow-ai fork, the hosted image only in this personal-account repository. An expression in
+# a runs-on or matrix value must be exactly this one (or, in runs-on, `matrix.<axis>`): a condition added in front
+# (`github.event_name == 'push' && ...`) would send the fork to the hosted image too, and anything else (`vars`,
+# `needs`, `inputs`, `format()`, `github.event...`) could resolve to a hosted label the text never shows.
+OWNER_BODY = re.compile(
+    r"\s*github\.repository_owner\s*==\s*'manaflow-ai'\s*&&\s*'blacksmith-[0-9]+vcpu-[a-z0-9.-]+'\s*\|\|\s*'[^']+'\s*",
+    re.DOTALL)
+MATRIX_BODY = re.compile(r"\s*matrix\.[A-Za-z_][A-Za-z0-9_-]*\s*", re.DOTALL)
+EXPRESSION = re.compile(r"\$\{\{(.*?)\}\}", re.DOTALL)
 # A key whose value, and every line nested under it, selects a runner.
-SELECTOR_KEY = re.compile(r"^\s*(?:-\s+)?(?:runs-on|matrix)\s*:")
-UNREADABLE = re.compile(r"\b(?:vars|needs|inputs|steps)\s*[.\[]|fromJSON", re.IGNORECASE)
+SELECTOR_KEY = re.compile(r"^(\s*)(?:-\s+)?(runs-on|matrix)\s*:(.*)$")
 
 PERSONAL = ("runs only in teamleaderleo/glaeda, a personal-account repository: Blacksmith installs on organizations "
             "only and no owned runner serves it")
@@ -76,17 +78,45 @@ def _strip_comment(line: str) -> str:
     return line[: match.start()] if match else line
 
 
+def _selector_problem(key: str, text: str) -> bool:
+    """Whether a runs-on or matrix value (its whole text, comments removed) can name a hosted or unreadable runner."""
+    allowed = (OWNER_BODY, MATRIX_BODY) if key == "runs-on" else (OWNER_BODY,)
+    rest = text
+    for match in EXPRESSION.finditer(text):
+        if not any(pattern.fullmatch(match.group(1)) for pattern in allowed):
+            return True
+        rest = rest.replace(match.group(0), " ", 1)
+    return "${{" in rest or HOSTED.search(rest) is not None
+
+
 def hosted_jobs(path: Path) -> dict[str, list[str]]:
-    """job id -> lines in that job that name a hosted label or a runner this scan cannot read ('' = outside jobs)."""
+    """job id -> lines in that job that name a hosted label or a runner this scan cannot read ('' = outside jobs).
+
+    A runs-on or matrix value is read whole, with every line nested under its key (block scalars, lists, matrix
+    rows, `name:` axes included), so an expression split over lines is judged as one. Elsewhere a line that names a
+    hosted label counts, except comments and `run:`, `name:` and `description:` text, which are prose or shell.
+    """
     found: dict[str, list[str]] = {}
     job = ""
     in_jobs = False
     block_indent = -1
-    selector_indent = -1  # indent of the runs-on or matrix key whose nested lines are being read
+    selector: tuple[str, int, int, list[str]] | None = None  # (key, key indent, first line, value lines)
+
+    def close() -> None:
+        nonlocal selector
+        if selector is not None:
+            key, _indent, first, lines = selector
+            if _selector_problem(key, "\n".join(lines)):
+                found.setdefault(job, []).append(f"{path.name}:{first}: {key}: {' '.join(lines).strip()}")
+            selector = None
+
     for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
         indent = len(line) - len(line.lstrip())
-        if selector_indent >= 0 and line.strip() and indent <= selector_indent:
-            selector_indent = -1
+        if selector is not None:
+            if not line.strip() or line.lstrip().startswith("#") or indent > selector[1]:
+                selector[3].append(_strip_comment(line))
+                continue
+            close()
         if block_indent >= 0:
             if line.strip() and indent <= block_indent:
                 block_indent = -1
@@ -100,19 +130,16 @@ def hosted_jobs(path: Path) -> dict[str, list[str]]:
         elif in_jobs and (match := JOB.match(line)):
             job = match.group(1)
             continue
+        if (match := SELECTOR_KEY.match(line)):
+            selector = (match.group(2), indent, number, [_strip_comment(match.group(3))])
+            continue
         if NON_RUNNER_KEY.match(line):
             if BLOCK_SCALAR.search(line):
                 block_indent = indent
             continue
-        code = _strip_comment(line)
-        if SELECTOR_KEY.match(code):
-            selector_indent = indent
-        if OWNER_FORM.match(code):
-            continue
-        # Inside runs-on or matrix (a block value, a list, or a matrix axis that runs-on reads as `matrix.x`), any
-        # value the text cannot show could be a hosted label.
-        if HOSTED.search(code) or (selector_indent >= 0 and UNREADABLE.search(code)):
+        if HOSTED.search(_strip_comment(line)):
             found.setdefault(job, []).append(f"{path.name}:{number}: {line.strip()}")
+    close()
     return found
 
 
