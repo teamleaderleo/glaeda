@@ -8298,15 +8298,16 @@ class DaemonPolicyTest(Base):
         self.assertFalse(self.daemon.rest_room(gg.REST_READ_MAX["pr"]))
         self.assertTrue(self.daemon.rest_room(gg.REST_READ_MAX["run"]))
 
-    def test_writes_do_not_spend_the_share(self) -> None:
+    def test_writes_do_not_spend_the_share_but_their_lookups_do(self) -> None:
         self.daemon.now = NOW
         self.daemon.transport = lambda *a: (201, {}, b"{}")
         self.daemon.writing = True  # as post_tick sets it around one write
         self.daemon.request("POST", "/repos/o/r/issues/1/comments", {"body": "x"}, content=True)
-        self.daemon.request("GET", "/repos/o/r/issues/1/comments")  # the write's own dedupe lookup
+        self.daemon.request("DELETE", "/repos/o/r/issues/1/labels/x")
+        self.daemon.request("GET", "/repos/o/r/issues/1/comments")  # the write's own dedupe lookup is a read
         self.daemon.writing = False
-        self.assertEqual(self.daemon.rest_spent(), 0)
-        self.assertEqual([w for _, w in self.daemon.sent], ["write", "write"])  # and budget shows them apart
+        self.assertEqual(self.daemon.rest_spent(), 1)
+        self.assertEqual([w for _, w in self.daemon.sent], ["write", "write", "rest"])  # budget shows them apart
 
     def test_a_job_list_a_tick_had_no_time_for_is_not_counted_as_tried(self) -> None:
         failed = {"id": 7, "name": "CI", "display_title": "fix", "status": "completed", "conclusion": "failure",
@@ -8336,6 +8337,20 @@ class DaemonPolicyTest(Base):
         again.now, again.clock_real = NOW, False
         again.read_jobs({"key": key, "jobs": False, "cache": gg.read_cache(key)}, {}, False)
         self.assertEqual(len(self.gh.job_calls()), 1)  # the new daemon knows it was tried
+
+    def test_a_controller_wait_keeps_the_tried_attempt(self) -> None:
+        key = gg.parse_key("run", "o/r/7")
+        gg.cache_dir().mkdir(parents=True, exist_ok=True)
+        gg.write_json(gg.cache_dir() / gg.file_name(key),
+                      {"key": key, "data": {"status": "completed", "run_attempt": 1}, "jobsTried": 1})
+        controller = mock.Mock()
+        controller.run.return_value = {"id": 7, "repo": "o/r", "attempt": 1}
+        with mock.patch.object(gg.Controller, "from_env", return_value=controller), \
+                mock.patch.object(gg, "controller_run", return_value={"status": "completed", "run_attempt": 1}):
+            gg.controller_wait_run(key, 1)
+        entry = gg.read_cache(key)
+        self.assertEqual(entry["source"], "controller")  # the wait did rewrite it
+        self.assertEqual(entry.get("jobsTried"), 1)
 
     def test_a_failed_attempt_still_gets_its_job_list_at_the_cap(self) -> None:
         """The one read the share does not hold back: a wait cannot rule on a failed run without it."""

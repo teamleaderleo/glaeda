@@ -1444,7 +1444,10 @@ class Daemon:
         if raw_body is not None:
             headers["Content-Type"] = "application/json"
         bucket = "graphql" if path == "/graphql" else "rest"
-        charged = bucket == "rest" and not free and not self.writing
+        # The outbox's own writes (POST, PATCH, DELETE) are what sessions asked for and are not the
+        # daemon's polling; its lookups (a GET to find a write that already landed) are reads, and count.
+        write = self.writing and method != "GET"
+        charged = bucket == "rest" and not free and not write
         if charged:
             # Charged before it is sent, and refunded only when GitHub says it was free (a 304): a
             # request whose answer never arrives (a body timeout) may still have been counted by
@@ -1458,7 +1461,7 @@ class Daemon:
         # `free` is /rate_limit, which costs no quota: counting it as a REST request would overstate
         # what the daemon spends.
         self.sent.append((self.now, "free" if free else "rest304" if bucket == "rest" and status == 304
-                          else "write" if bucket == "rest" and self.writing else bucket))
+                          else "write" if bucket == "rest" and write else bucket))
         if status == 401:
             self.token = None  # re-read from gh next time
         if "x-ratelimit-remaining" in h and h.get("x-ratelimit-resource", "core") in {"core", "graphql"}:
@@ -4003,7 +4006,7 @@ def controller_wait_run(key: str, timeout: float) -> dict | None:
                    and isinstance(prior.get("restAt"), (int, float)) else now)
         entry = {"key": key, "fetchedAt": now, "dataAt": now, "restAt": rest_at,
                  "data": candidate, "error": None, "source": "controller"}
-        for field in ("etag", "jobs", "jobsEtag", "jobsAt", "restParts", "restRun"):
+        for field in ("etag", "jobs", "jobsEtag", "jobsAt", "jobsTried", "restParts", "restRun"):
             if field in prior:
                 entry[field] = prior[field]
         write_json(cache, entry)
