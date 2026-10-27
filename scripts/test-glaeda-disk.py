@@ -4798,6 +4798,68 @@ class GlaedaDiskTest(unittest.TestCase):
         (rec,) = map(json.loads, receipt.read_text().splitlines())
         self.assertEqual((rec["outcome"], rec["reasons"][0]), ("blocked:git", "a commit here is on no remote-tracking ref"))
 
+    def test_past_the_target_under_the_floor_a_bloated_checkout_keeps_a_commit_only_it_has(self) -> None:
+        """Under the floor the last resort takes quiet checkouts without the git veto only until the target; a
+        bloated one past it goes only when git loses nothing."""
+        names = {"actions-runner-glaeda": 2, "actions-runner-glaeda-2": 2, "actions-runner-glaeda-11": 2}
+        home, cos = self._idle_checkouts(names)
+        gd.process_evidence = lambda: ([], "")
+        for name, age in names.items():
+            self._git_checkout(cos[name], pushed=name != "actions-runner-glaeda-11")
+            self._packs(cos[name], 6.8 if name == "actions-runner-glaeda-11" else 0.55)
+            self._age(home / name, hours=age)
+        patches, removed = self._floor_disk(31.0, freed_gib=30.0)  # under the resume mark; one removal reaches 61
+        with mock.patch.object(gd, "runner_checkout_last_use",  # the bloated one was used last, so it sorts last
+                               side_effect=lambda r, c: time.time() - 3600 * (1 if r.name.endswith("-11") else 2)), \
+                patches[0], patches[1], contextlib.redirect_stdout(io.StringIO()):
+            gd.evict_idle_runner_checkouts(self.receipt(), 30.0, home)
+        self.assertEqual(len(removed), 1)
+        self.assertNotIn(str(cos["actions-runner-glaeda-11"]), removed)
+        self.assertTrue((cos["actions-runner-glaeda-11"] / ".git").is_dir())
+
+    def test_the_git_veto_keeps_a_commit_only_a_submodule_has(self) -> None:
+        env = {"PATH": "/usr/bin:/bin:/opt/homebrew/bin", "HOME": os.fspath(self.root), "GIT_AUTHOR_NAME": "t",
+               "GIT_AUTHOR_EMAIL": "t@x", "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@x"}
+
+        def git(where: Path, *args: str) -> None:
+            subprocess.run(["git", *args], cwd=where, env=env, check=True, capture_output=True)
+        co = self.root / "sub/_work/cmux/cmux"
+        self._git_checkout(co)
+        for gitdir in (co / ".git/modules/ghostty", co / ".git/modules/ghostty/modules/nested"):
+            gitdir.parent.mkdir(parents=True, exist_ok=True)
+            git(gitdir.parent, "init", "-q", "--bare", gitdir.name)
+            git(gitdir, "--work-tree", os.fspath(self.root), "commit", "-q", "--allow-empty", "-m", "base")
+            git(gitdir, "update-ref", "refs/remotes/origin/main", "HEAD")
+        self.assertEqual(gd.runner_checkout_git_veto(co), "")
+        nested = co / ".git/modules/ghostty/modules/nested"
+        git(nested, "--work-tree", os.fspath(self.root), "commit", "-q", "--allow-empty", "-m", "only here")
+        self.assertEqual(gd.runner_checkout_git_veto(co), "a commit in submodule nested is on no remote-tracking ref")
+        git(nested, "update-ref", "refs/remotes/origin/main", "HEAD")
+        embedded = co / "vendor/lib"
+        embedded.mkdir(parents=True)
+        (co / ".gitmodules").write_text('[submodule "lib"]\n\tpath = vendor/lib\n\turl = https://x/lib\n')
+        git(embedded, "init", "-q")
+        git(embedded, "commit", "-q", "--allow-empty", "-m", "embedded, on no remote")
+        self.assertEqual(gd.runner_checkout_git_veto(co), "a commit in submodule lib is on no remote-tracking ref")
+
+    def test_bloat_siblings_share_an_origin_and_an_unreadable_size_counts_none(self) -> None:
+        root = self.root / "origin"
+        cos = []
+        for i, (url, size) in enumerate([("https://github.com/a/foo.git", 6.8), ("git@github.com:a/foo", 0.55),
+                                         ("https://github.com/b/foo", 0.5), ("https://github.com/b/foo", 0.6)]):
+            co = root / f"r{i}/_work/foo/foo"
+            self._packs(co, size)
+            (co / ".git/config").write_text(f'[core]\n\tbare = false\n[remote "origin"]\n\turl = {url}\n')
+            cos.append(co)
+        # a/foo over https and ssh is one repository; b/foo's checkouts are not its siblings
+        self.assertEqual(gd.checkout_origin(cos[0]), gd.checkout_origin(cos[1]))
+        self.assertNotEqual(gd.checkout_origin(cos[0]), gd.checkout_origin(cos[2]))
+        self.assertEqual(set(gd.bloated_runner_checkouts(cos)), {str(cos[0])})
+        self.assertEqual(set(gd.bloated_runner_checkouts([cos[0], cos[2], cos[3]])), set(), "no a/foo sibling")
+        shutil.rmtree(cos[1] / ".git/objects/pack")  # a sibling whose packs cannot be read
+        self.assertIsNone(gd.git_pack_bytes(cos[1] / ".git"))
+        self.assertEqual(gd.bloated_runner_checkouts(cos), {})
+
     def test_the_git_veto_ignores_the_callers_git_env_and_keeps_what_it_cannot_read(self) -> None:
         co = self.root / "veto/_work/cmux/cmux"
         self._git_checkout(co, pushed=False)

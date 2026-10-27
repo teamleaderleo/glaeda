@@ -2128,7 +2128,49 @@ def runner_checkout_git_veto(checkout: Path) -> str:
         local = git("rev-list", "--max-count=1", "HEAD", *heads, *tips, "--not", "--remotes", timeout=120)
     except (OSError, subprocess.SubprocessError, IndexError):
         return "git could not say whether a commit is only here"
-    return "a commit here is on no remote-tracking ref" if local.strip() else ""
+    if local.strip():
+        return "a commit here is on no remote-tracking ref"
+    return submodule_git_veto(dotgit, env)
+
+
+def submodule_git_veto(dotgit: Path, env: dict[str, str]) -> str:
+    """runner_checkout_git_veto's commit rule for each submodule git dir under .git/modules (nested ones too), and
+    for a submodule whose .git is its own directory inside the work tree: a HEAD, branch, tag or stash there that is
+    on none of its remote-tracking refs keeps the checkout. A git dir that cannot be read is doubt, and keeps it."""
+    def unreadable(error: OSError) -> None:
+        raise error
+
+    gitdirs: list[tuple[str, Path]] = []
+    try:
+        if (dotgit / "modules").is_symlink():
+            return "git could not say whether a submodule commit is only here"
+        if (dotgit / "modules").is_dir():
+            for root, dirs, files in os.walk(dotgit / "modules", onerror=unreadable):
+                if "HEAD" in files and "objects" in dirs:
+                    gitdirs.append((Path(root).name, Path(root)))
+                    dirs[:] = [d for d in dirs if d == "modules"]  # a git dir's own modules/ holds nested ones
+    except OSError:
+        return "git could not say whether a submodule commit is only here"
+    tree = dotgit.parent
+    with contextlib.suppress(OSError, ValueError, subprocess.SubprocessError):
+        out = subprocess.run(["git", "-C", os.fspath(tree), "config", "--file", ".gitmodules", "--get-regexp",
+                              r"^submodule\..*\.path$"], capture_output=True, text=True, timeout=30, env=env).stdout
+        for line in out.splitlines():
+            embedded = tree / line.split(" ", 1)[-1] / ".git"
+            if embedded.is_dir() and not embedded.is_symlink() and contained_directory(embedded, tree):
+                gitdirs.append((embedded.parent.name, embedded))
+    for name, gitdir in gitdirs:
+        def git(*args: str) -> str:
+            return subprocess.run(["git", "--git-dir", os.fspath(gitdir), *args], capture_output=True, text=True,
+                                  timeout=120, env=env, check=True).stdout
+        try:
+            tips = git("for-each-ref", "--format=%(objectname)", "refs/heads", "refs/tags", "refs/stash").split()
+            local = git("rev-list", "--max-count=1", "HEAD", *tips, "--not", "--remotes")
+        except (OSError, subprocess.SubprocessError):
+            return f"git could not say whether a commit in submodule {name} is only here"
+        if local.strip():
+            return f"a commit in submodule {name} is on no remote-tracking ref"
+    return ""
 
 
 def idle_runner_checkout_veto(runner: Path, checkout: Path, opened: frozenset[str], cmds: str) -> str:
@@ -2149,26 +2191,48 @@ def idle_runner_checkout_veto(runner: Path, checkout: Path, opened: frozenset[st
     return ""
 
 
-def git_pack_bytes(gitdir: Path) -> int:
-    """Bytes of the .pack files in a git dir's objects/pack, from one directory listing (no git, no walk)."""
+def git_pack_bytes(gitdir: Path) -> int | None:
+    """Bytes of the .pack files in a git dir's objects/pack, from one directory listing (no git, no walk); None
+    when the directory or a pack in it cannot be read."""
     total = 0
-    for e in _entries(gitdir / "objects/pack"):
-        if e.name.endswith(".pack"):
-            with contextlib.suppress(OSError):
-                if e.is_file(follow_symlinks=False):
+    try:
+        with os.scandir(gitdir / "objects/pack") as it:
+            for e in it:
+                if e.name.endswith(".pack") and e.is_file(follow_symlinks=False):
                     total += e.stat(follow_symlinks=False).st_size
+    except OSError:
+        return None
     return total
+
+
+def checkout_origin(checkout: Path) -> str:
+    """The checkout's remote.origin.url, read from .git/config without git, or its directory name when it has none:
+    the repository it is a checkout of, so two repositories that share a name are never siblings."""
+    section = ""
+    with contextlib.suppress(OSError, UnicodeDecodeError):
+        for line in (checkout / ".git/config").read_text().splitlines():
+            line = line.strip()
+            if line.startswith("["):
+                section = line
+            elif section.replace(" ", "") in ('[remote"origin"]',) and line.split("=", 1)[0].strip() == "url":
+                url = line.split("=", 1)[1].strip().removesuffix(".git").rstrip("/")
+                return re.sub(r"^(?:https?://|ssh://)?(?:[^@/]+@)?", "", url).replace(":", "/", 1).lower()
+    return f"name:{checkout.name}"
 
 
 def bloated_runner_checkouts(checkouts: list[Path]) -> dict[str, int]:
     """The checkouts whose packs are over RUNNER_CHECKOUT_BLOAT_RATIO times the median of the same repository's
-    other checkouts (by directory name) and over RUNNER_CHECKOUT_BLOAT_MIN_GIB: path -> pack bytes. A checkout
-    with no sibling of its repository has nothing to compare with and never counts."""
+    other checkouts (by origin URL) and over RUNNER_CHECKOUT_BLOAT_MIN_GIB: path -> pack bytes. A checkout with no
+    sibling of its repository has nothing to compare with and never counts, and no checkout of a repository counts
+    when any of its checkouts' packs cannot be read."""
     if RUNNER_CHECKOUT_BLOAT_RATIO == float("inf"):
         return {}
-    sizes = {os.fspath(c): (c.name, git_pack_bytes(c / ".git")) for c in checkouts}
+    sizes = {os.fspath(c): (checkout_origin(c), git_pack_bytes(c / ".git")) for c in checkouts}
+    unknown = {r for r, b in sizes.values() if b is None}  # a size that cannot be read could skew the median
     out = {}
     for path, (repo, size) in sizes.items():
+        if repo in unknown:
+            continue
         others = sorted(b for p, (r, b) in sizes.items() if r == repo and p != path)
         if not others or size <= RUNNER_CHECKOUT_BLOAT_MIN_GIB * GIB:
             continue
@@ -2212,7 +2276,8 @@ def evict_idle_runner_checkouts(receipt: Path, floor_gib: float, home: Path | No
         stale = (now - used) / 3600 >= RUNNER_STALE_CHECKOUT_HOURS
         bloat = bloated.get(os.fspath(checkout), 0)
         try:
-            if not stale and not bloat and free_bytes(home)[0] >= target:
+            free_now = free_bytes(home)[0]
+            if not stale and not bloat and free_now >= target:
                 continue  # under the floor's last resort only until the target; stale and bloated ones still go
             opened, cmds = process_evidence()  # a job may have started since the last deletion
         except OSError:
@@ -2221,7 +2286,9 @@ def evict_idle_runner_checkouts(receipt: Path, floor_gib: float, home: Path | No
             print(f"refusing to delete idle runner checkouts: {e}", file=sys.stderr)
             break
         why = idle_runner_checkout_veto(runner, checkout, open_index(opened), cmds)
-        if not why and (stale or bloat) and not under:  # above the floor only what git can lose nothing of goes
+        # Only the floor's last resort (under the floor, short of the target) takes a checkout git could lose
+        # something of; a stale or bloated one anywhere else goes only when git loses nothing.
+        if not why and not (under and free_now < target):
             why = runner_checkout_git_veto(checkout)
         size = 0
         if why:
