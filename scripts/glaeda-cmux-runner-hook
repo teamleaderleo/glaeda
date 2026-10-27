@@ -7393,6 +7393,10 @@ def main(argv: list[str] | None = None) -> int:
     args.min_free_gib = runner_floor_gib(args.min_free_gib, args.gui_runner or args.session_runner)
     # the floor a job is refused under, after eviction (DISK_JOB_PEAK_GIB); a tour runner's floor is cmux's measure
     admit_floor = admit_floor_gib(args.min_free_gib, args.gui_runner or args.session_runner)
+    if args.dedicated_admit:
+        # a dedicated runner's floor is its builder's own (runner.dedicated minFreeGib): never capped at one job's
+        # measured growth, so the hook refuses where the builder would, and the gate holds the runner off there
+        admit_floor = args.min_free_gib
     # the runner LaunchAgent's environment can switch sampling off fleet-wide without a reinstall
     telemetry = not args.no_telemetry and os.environ.get("GLAEDA_RUNNER_TELEMETRY", "1") != "0"
 

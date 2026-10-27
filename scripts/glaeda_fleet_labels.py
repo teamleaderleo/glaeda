@@ -10,7 +10,6 @@ the runner checks the machine it runs on and glaeda-mini-fleet checks what it ob
 
 from __future__ import annotations
 
-import math
 import re
 from typing import Any, Callable
 
@@ -485,8 +484,9 @@ def dedicated_runners(manifest: Any, member: str) -> tuple[list[dict[str, Any]],
         # The builder's own disk floor: the runner's --min-free-gib, so the listener gate holds the runner off under
         # it (the job goes elsewhere) instead of the builder's admission refusing a job the runner already took.
         floor = entry.get("minFreeGib")
+        # the range check alone (no float conversion): it refuses nan and inf, and a huge int never overflows
         if floor is not None and (isinstance(floor, bool) or not isinstance(floor, (int, float))
-                                  or not math.isfinite(floor) or not 0 < floor <= 10000):
+                                  or not 0 < floor <= 10000):
             return [], f"{where}.minFreeGib must be a number of GiB above 0 and at most 10000"
         out.append({"name": name, "repo": repo, "org": org, "group": group, "labels": list(labels),
                     "admit": commands["admit"], "watch": commands.get("watch"), "env": dict(env),
