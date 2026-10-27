@@ -8215,6 +8215,20 @@ class RunnerTest(unittest.TestCase):
         self.assertIn(local, entries)
         self.assertIn(os.fspath(self.home / ".cargo/bin"), entries)
 
+    def test_reregistration_with_a_non_utf8_runner_path_keeps_its_bytes(self) -> None:
+        bare = "/usr/bin:/bin:/usr/sbin:/sbin"
+        runner = self.home / "actions-runner-glaeda"
+        with mock.patch.dict(os.environ, {"PATH": bare}):
+            self.invoke("--apply", "--labels", "ram48")
+            (runner / ".path").write_bytes(b"/opt/odd\xff/bin:/usr/bin\n")
+            with mock.patch.object(cr, "xcode_present", return_value=True):
+                receipt = self.invoke("--apply", "--manifest", self.manifest(), "--member", "mini-std",
+                                      "--name", "mini-test-glaeda")
+        self.assertEqual(self.by_kind(receipt)["register"]["state"], "updated")
+        entries = (runner / ".path").read_bytes().strip().split(b":")
+        self.assertEqual(entries[:3], [b"/opt/homebrew/bin", b"/usr/local/bin", b"/opt/odd\xff/bin"])
+        self.assertEqual(cr.read_runner_path(self.home / "missing"), "")
+
     def test_runner_path_merges_in_order_without_duplicates(self) -> None:
         home = Path("/Users/cmux")
         self.assertEqual(cr.runner_path(home, "/usr/bin:/bin:/usr/sbin:/sbin"),

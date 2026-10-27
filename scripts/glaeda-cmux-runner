@@ -1368,19 +1368,25 @@ def runner_path(home: Path, *paths: str) -> str:
     return ":".join(dict.fromkeys(e for e in entries if e))
 
 
+def read_runner_path(runner_dir: Path) -> str:
+    """The runner's .path, "" when it is missing or unreadable. Bytes that are not UTF-8 round-trip unchanged
+    (surrogateescape) instead of raising mid-registration."""
+    try:
+        return (runner_dir / ".path").read_bytes().decode("utf-8", "surrogateescape").strip()
+    except OSError:
+        return ""
+
+
 def keep_runner_path(ctx: Context, before: str) -> None:
     """config.sh's env.sh overwrites .path with the PATH it ran under, and runsvc.sh runs the runner with it. A
     registration over ssh runs under a bare /usr/bin:/bin:/usr/sbin:/sbin and so dropped /opt/homebrew/bin
     (2026-10-26). Merge the .path that was there before with the new one and make sure Homebrew and ~/.cargo/bin
     are on it."""
-    target = ctx.runner_dir / ".path"
-    try:
-        after = target.read_text().strip()
-    except OSError:
-        after = ""
+    after = read_runner_path(ctx.runner_dir)
     merged = runner_path(ctx.home, before, after)
     if merged != after:
-        write_atomic(target, (merged + "\n").encode(), 0o644, make_parent=False)
+        write_atomic(ctx.runner_dir / ".path", (merged + "\n").encode("utf-8", "surrogateescape"), 0o644,
+                     make_parent=False)
 
 
 def register(ctx: Context, act: dict[str, Any]) -> None:
@@ -1388,10 +1394,7 @@ def register(ctx: Context, act: dict[str, Any]) -> None:
     if token is None:
         act["state"], act["note"] = "failed", "could not obtain a registration token (needs repo or org admin)"
         return
-    try:
-        path_before = (ctx.runner_dir / ".path").read_text().strip()
-    except OSError:
-        path_before = ""
+    path_before = read_runner_path(ctx.runner_dir)
     argv = [os.fspath(ctx.runner_dir / "config.sh"), "--unattended", "--url", ctx.scope_url,
             "--name", ctx.name, "--labels", ",".join(l for l in ctx.labels if l not in BASE_LABELS),
             "--work", "_work"]
