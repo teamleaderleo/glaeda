@@ -311,25 +311,26 @@ class Mini:
         return sorted(p for p in self.home.glob("actions-runner-glaeda*") if (p / "glaeda-hooks").is_dir())
 
     def runner_version(self, d: Path) -> str | None:
-        """The actions/runner version d runs: its bin symlink's bin.X (the self-updater's layout), else the version
-        the install receipt that unpacked d recorded, read as glaeda-cmux-runner's installed_versions does (an
-        owned dir with a config.sh). None when neither says."""
-        with contextlib.suppress(OSError):
-            hit = re.fullmatch(rf"(?:.*/)?bin\.({RUNNER_VERSION_RE})/?", os.readlink(d / "bin"))
-            if hit:
-                return hit.group(1)
-        if (d / "bin").is_symlink():
-            return None
+        """The actions/runner version d runs, read as glaeda-cmux-runner's installed_versions does: only for an
+        installed runner (d/config.sh and an owned receipt for d), its bin symlink's bin.X (the self-updater's
+        layout) over the receipt's runnerVersion. None when d is no such runner or neither says."""
         if not (d / "config.sh").is_file():
-            return None  # not an installed runner (glaeda-cmux-runner installed_versions skips it too)
+            return None
         base = self.home / RUNNER_RECEIPTS
+        recorded = None
         for path in [base / "receipt.json", *sorted(base.glob("instance-*/receipt.json"))]:
             doc = load_json(path)
-            version = str(doc.get("runnerVersion") or "")
-            if (doc.get("runnerDirOwned") and doc.get("runnerDir") == os.fspath(d)
-                    and re.fullmatch(RUNNER_VERSION_RE, version)):
-                return version
-        return None
+            if doc.get("runnerDirOwned") and doc.get("runnerDir") == os.fspath(d):
+                recorded = str(doc.get("runnerVersion") or "")
+                break
+        if recorded is None:
+            return None
+        live = None
+        with contextlib.suppress(OSError):
+            hit = re.fullmatch(rf"(?:.*/)?bin\.({RUNNER_VERSION_RE})/?", os.readlink(d / "bin"))
+            live = hit.group(1) if hit else None
+        version = live or recorded
+        return version if re.fullmatch(RUNNER_VERSION_RE, version) else None
 
     def hook(self) -> Any:
         """The runner hook module the jobs run (console state, testmanagerd recycler), or None."""

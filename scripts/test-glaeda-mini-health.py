@@ -1961,10 +1961,10 @@ class RunnerBelowPin(Base):
             (d / "bin").symlink_to(d / f"bin.{version}")
         else:
             (d / "bin").mkdir()
-            receipts = self.home / health.RUNNER_RECEIPTS / f"instance-{name}"
-            receipts.mkdir(parents=True)
-            (receipts / "receipt.json").write_text(json.dumps({"runnerDir": os.fspath(d), "runnerDirOwned": True,
-                                                               "runnerVersion": version}))
+        receipts = self.home / health.RUNNER_RECEIPTS / f"instance-{name}"
+        receipts.mkdir(parents=True)
+        (receipts / "receipt.json").write_text(json.dumps({"runnerDir": os.fspath(d), "runnerDirOwned": True,
+                                                           "runnerVersion": "2.200.0" if updated else version}))
         return d
 
     def test_the_pin_is_glaeda_cmux_runners(self) -> None:
@@ -1985,9 +1985,9 @@ class RunnerBelowPin(Base):
         self.assertEqual(self.mini.did, [])
 
     def test_a_receipt_glaeda_cmux_runner_would_not_count_is_no_finding(self) -> None:
-        for broken in ("unowned", "no config.sh"):
-            with self.subTest(broken):
-                d = self.runner("actions-runner-glaeda", self.OLD, updated=False)
+        for broken, updated in [(b, u) for b in ("unowned", "no config.sh") for u in (False, True)]:
+            with self.subTest(broken, updated=updated):
+                d = self.runner("actions-runner-glaeda", self.OLD, updated=updated)
                 if broken == "unowned":
                     receipt = self.home / health.RUNNER_RECEIPTS / "instance-actions-runner-glaeda" / "receipt.json"
                     receipt.write_text(json.dumps({"runnerDir": os.fspath(d), "runnerVersion": self.OLD}))
