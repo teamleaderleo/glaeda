@@ -46,6 +46,8 @@ sys.modules["glaeda_gh"] = gg
 loader.exec_module(gg)
 # A host's own upstream.json (a lane VM's) must not turn every Daemon here into an upstream client.
 gg.UPSTREAM_CONFIG = Path(tempfile.gettempdir()) / f"glaeda-gh-test-no-upstream-{os.getpid()}.json"
+# Nor may a host's own gh-daemon.json change the pacing the tests expect.
+gg.DAEMON_CONFIG = Path(tempfile.gettempdir()) / f"glaeda-gh-test-no-daemon-config-{os.getpid()}.json"
 
 TOKEN = "ghp_faketoken_must_never_touch_disk"
 NOW = float(int(time.time()))  # watch files carry real mtimes
@@ -8002,6 +8004,141 @@ class RiskReceiptPostTest(unittest.TestCase):
         self.assertEqual(len(t.calls), 4)
         self.assertEqual(gg.post_state(item["id"])["riskRegrade"]["state"], "failed")
         self.assertEqual(gg.post_state(other["id"])["url"], "other")
+
+
+class DaemonPolicyTest(Base):
+    """~/.config/glaeda/gh-daemon.json: the cycle, the floors and the daemon's own REST share."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.saved_config = gg.DAEMON_CONFIG
+        gg.DAEMON_CONFIG = Path(self.tmp.name) / "gh-daemon.json"
+        self.addCleanup(setattr, gg, "DAEMON_CONFIG", self.saved_config)
+
+    def configure(self, doc: Any) -> None:
+        gg.DAEMON_CONFIG.write_text(json.dumps(doc))
+        self.daemon.policy = gg.daemon_policy()
+
+    def spend_rest(self, n: int, what: str = "rest") -> None:
+        self.daemon.sent += [(NOW - 10, what)] * n
+
+    def test_defaults_without_a_config(self) -> None:
+        policy = gg.daemon_policy()
+        self.assertEqual(policy["cycle"], 60)
+        self.assertEqual(policy["commentCycle"], 15)
+        self.assertEqual(policy["cycles"], {"pr": 60, "run": 60, "comment": 15, "head": 60})
+        self.assertEqual(policy["floors"], {"rest": (1500, 300), "graphql": (500, 100)})
+        self.assertEqual(policy["restShare"], 0.4)
+
+    def test_values_are_read_and_bad_ones_keep_their_default(self) -> None:
+        self.configure({"cycle": 120, "commentCycle": 30, "restShare": 0.25,
+                        "floors": {"rest": {"floor": 2000, "reserve": 400}, "graphql": {"floor": 800}}})
+        policy = self.daemon.policy
+        self.assertEqual(policy["cycles"], {"pr": 120, "run": 120, "comment": 30, "head": 120})
+        self.assertEqual(policy["floors"], {"rest": (2000, 400), "graphql": (800, 100)})
+        self.assertEqual(policy["restShare"], 0.25)
+        # out of range, the wrong type, NaN, a bool, and a reserve above its floor
+        self.configure({"cycle": 1, "commentCycle": "5", "restShare": 0, "floors": {
+            "rest": {"floor": 100, "reserve": 200}, "graphql": {"floor": True, "reserve": float("nan")}}})
+        policy = self.daemon.policy
+        self.assertEqual(policy["cycles"], {"pr": 60, "run": 60, "comment": 15, "head": 60})
+        self.assertEqual(policy["floors"], {"rest": (1500, 300), "graphql": (500, 100)})
+        self.assertEqual(policy["restShare"], 0.4)
+        self.configure({"restShare": 7, "cycle": 100000})
+        self.assertEqual((self.daemon.policy["restShare"], self.daemon.policy["cycle"]), (0.4, 60))
+        gg.DAEMON_CONFIG.write_text("{not json")
+        self.assertEqual(gg.daemon_policy()["cycle"], 60)
+
+    def test_floors_from_the_config_drive_the_mode(self) -> None:
+        self.daemon.now = NOW
+        self.daemon.budget = {"rest": {"limit": 5000, "remaining": 1000, "reset": NOW + 1800}}
+        self.assertEqual(self.daemon.mode("rest"), "lean")  # under the 1500 default
+        self.configure({"floors": {"rest": {"floor": 800, "reserve": 100}}})
+        self.assertEqual(self.daemon.mode("rest"), "normal")
+        self.configure({"floors": {"rest": {"floor": 3000, "reserve": 1200}}})
+        self.assertEqual(self.daemon.mode("rest"), "stop")
+
+    def test_a_tick_rereads_the_config(self) -> None:
+        self.configure({"cycle": 300})
+        gg.DAEMON_CONFIG.write_text(json.dumps({"cycle": 90}))
+        self.daemon.tick(NOW)
+        self.assertEqual(self.daemon.policy["cycles"]["pr"], 90)
+
+    def test_the_cycle_paces_reads(self) -> None:
+        self.configure({"cycle": 120})
+        self.gh.prs[("o", "r", 1)] = pr_node(1)
+        gg.register("pr:o/r#1")
+        gg.DAEMON_CONFIG.write_text(json.dumps({"cycle": 120}))
+        self.daemon.tick(NOW)
+        self.assertEqual(len(self.gh.gql_calls()), 1)
+        gg.register("pr:o/r#1")
+        self.daemon.tick(NOW + 61)
+        self.assertEqual(len(self.gh.gql_calls()), 1)  # 60 s was the old cycle: not due yet
+        gg.register("pr:o/r#1")
+        self.daemon.tick(NOW + 121)
+        self.assertEqual(len(self.gh.gql_calls()), 2)
+
+    def test_the_rest_share_moves_balanced_kinds_to_graphql_and_leans_rest(self) -> None:
+        self.daemon.now = NOW
+        self.daemon.budget = {"rest": {"limit": 5000, "remaining": 4500, "reset": NOW + 1800},
+                              "graphql": {"limit": 5000, "remaining": 1000, "reset": NOW + 1800}}
+        self.assertEqual(self.daemon.route("pr"), "rest")  # REST is far richer
+        self.assertEqual(self.daemon.mode("rest"), "normal")
+        self.spend_rest(1999)
+        self.spend_rest(500, "rest304")  # free: never counted against the share
+        self.assertFalse(self.daemon.rest_capped())
+        self.spend_rest(1)
+        self.assertEqual((self.daemon.rest_spent(), self.daemon.rest_cap()), (2000, 2000))
+        self.assertTrue(self.daemon.rest_capped())
+        self.assertEqual(self.daemon.richness("rest"), -1)
+        self.assertEqual(self.daemon.mode("rest"), "lean")
+        self.assertEqual(self.daemon.route("pr"), "graphql")
+        self.assertEqual(self.daemon.route("run"), "graphql")
+        # an hour later those requests no longer count
+        self.daemon.now = NOW + 3600
+        self.daemon.budget["rest"]["reset"] = NOW + 5000
+        self.daemon.budget["graphql"]["reset"] = NOW + 5000
+        self.assertFalse(self.daemon.rest_capped())
+        self.assertEqual(self.daemon.mode("rest"), "normal")
+
+    def test_the_share_follows_the_config_and_the_limit(self) -> None:
+        self.daemon.now = NOW
+        self.daemon.budget = {"rest": {"limit": 15000, "remaining": 14000, "reset": NOW + 1800}}
+        self.configure({"restShare": 0.1})
+        self.assertEqual(self.daemon.rest_cap(), 1500)
+        self.spend_rest(1500)
+        self.assertEqual(self.daemon.mode("rest"), "lean")
+
+    def test_capped_with_graphql_stopped_keeps_rest_lean_not_stopped(self) -> None:
+        self.daemon.now = NOW
+        self.daemon.budget = {"rest": {"limit": 5000, "remaining": 4000, "reset": NOW + 1800},
+                              "graphql": {"limit": 5000, "remaining": 10, "reset": NOW + 1800}}
+        self.daemon.paths["run"] = "rest"
+        self.spend_rest(2000)
+        self.assertEqual(self.daemon.route("run"), "rest")  # nowhere richer to go
+        self.assertEqual(self.daemon.mode("rest"), "lean")  # so it reads, four times less often
+
+    def test_status_and_budget_show_the_share(self) -> None:
+        self.spend_rest(990)
+        self.daemon.tick(NOW)
+        status = gg.read_json(gg.BASE / "daemon.json")
+        self.assertEqual(status["restShare"], {"spent": 990, "cap": 2000, "share": 0.4, "capped": False})
+        lock = open(gg.BASE / "daemon.lock", "a+")
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()), \
+                    mock.patch.object(gg, "daemon_stale", return_value=None):
+                gg.cmd_budget(False)
+            self.assertIn("daemon REST spend 990/2000 this hour (restShare 0.4)", out.getvalue())
+        finally:
+            lock.close()
+
+    def test_the_broker_reads_the_configured_floors(self) -> None:
+        gg.write_json(gg.BASE / "budget.json", {"rest": {"limit": 5000, "remaining": 1000, "reset": time.time() + 900}})
+        self.assertEqual(gg.broker_max_age(["title"]), gg.BROKER_LEAN_AGE)  # under the 1500 default
+        self.configure({"floors": {"rest": {"floor": 800, "reserve": 100}}})
+        self.assertEqual(gg.broker_max_age(["title"]), gg.BROKER_MAX_AGE)
 
 
 if __name__ == "__main__":

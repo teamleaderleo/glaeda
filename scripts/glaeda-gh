@@ -56,9 +56,16 @@ the daemon is the only process that talks to GitHub, and clients only read its c
 - Comment watches (an issue's or PR's latest 50 comments) are one batched GraphQL query every 15 s,
   and last only while someone waits on them.
 - The X-RateLimit headers and the GraphQL rateLimit field drive a budget guard: below the floor
-  (500 left) the daemon polls four times less often and skips job lists; below the reserve (100
-  left) it stops that API until the quota resets. The quota is shared, so this also protects
-  every other tool on the account.
+  (REST 1500 left, GraphQL 500) the daemon polls four times less often and skips job lists; below
+  the reserve (REST 300, GraphQL 100) it stops that API until the quota resets. The quota is shared,
+  so this also protects every other tool on the account.
+- The daemon's own REST spend is capped at restShare (0.4) of the hourly REST limit: the requests it
+  sent over the last hour that GitHub counted (a 304 is free and is not counted). At the cap, REST is
+  lean and PR and run reads move to GraphQL, so the shared REST pool is left to `gh`, landers and
+  nightly re-runs. The cycle, the floors and the share are read every tick from
+  ~/.config/glaeda/gh-daemon.json, {"cycle": 60, "commentCycle": 15, "restShare": 0.4,
+  "floors": {"rest": {"floor": 1500, "reserve": 300}, "graphql": {"floor": 500, "reserve": 100}}};
+  a missing key or a value out of range keeps its default.
 - The token comes from `gh auth token` and stays in memory; it is never written or logged.
 - A host with no GitHub login of its own (a VM that may hold no token) can read through an upstream
   instead: ~/.config/glaeda/upstream.json, {"command": ["PROGRAM", "ARG", ...]}, names a program that
@@ -178,7 +185,12 @@ TERMINAL_GRACE = 120  # drop a merged, closed or completed entry (or a comment w
 TERMINAL_REFRESH = 600  # a terminal entry still watched is re-read this rarely (a rerun reopens a run)
 CACHE_KEEP = 3600  # unwatched cache files are removed after this long
 LEAN_FACTOR = 4  # below the floor, poll this many times less often
-FLOORS = {"rest": (500, 100), "graphql": (500, 100)}  # (floor, reserve) per quota
+FLOORS = {"rest": (1500, 300), "graphql": (500, 100)}  # (floor, reserve) per quota: the defaults
+# The daemon's own counted REST requests in the last hour stay under this share of the hourly limit.
+# Measured 2026-10-27: the daemon spent 2549 REST requests of one hour's 5000 (756 more were free
+# 304s) on PR reads the balancer had sent to REST, and the account ran out under a nightly re-run.
+REST_SHARE = 0.4
+DAEMON_CONFIG = Path.home() / ".config/glaeda/gh-daemon.json"  # cycle, commentCycle, floors, restShare
 # How stale this host's view of the shared quota may get before GET /rate_limit refreshes it. That
 # endpoint reports every family at once and costs no primary quota, so the only cost of a short
 # interval is the secondary limit, which one call every two minutes is nowhere near. 0 turns it off.
@@ -1146,6 +1158,38 @@ def head_data(sha: str, runs: dict, statuses: dict, ids: dict) -> dict:
     return {"sha": sha, "found": found, "ids": ids, "settled": settled}
 
 
+def _bounded(value: Any, default: float, low: float, high: float) -> float:
+    """value when it is a plain number within [low, high], else default."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value != value:
+        return default
+    return value if low <= value <= high else default
+
+
+def daemon_policy() -> dict:
+    """The daemon's pacing, from ~/.config/glaeda/gh-daemon.json laid over the module defaults.
+
+    {"cycle": 60, "commentCycle": 15, "restShare": 0.4,
+     "floors": {"rest": {"floor": 1500, "reserve": 300}, "graphql": {"floor": 500, "reserve": 100}}}
+
+    Every key is optional, and a value that is not a number in range keeps its default, so a typo
+    can neither stop the daemon nor turn it into a busy loop. A reserve above its floor keeps both
+    defaults: "stop" must come after "lean". Read every tick, so an edit applies without a restart."""
+    doc = read_json(DAEMON_CONFIG)
+    doc = doc if isinstance(doc, dict) else {}
+    cycle = int(_bounded(doc.get("cycle"), CYCLE, 15, 900))
+    comment = int(_bounded(doc.get("commentCycle"), COMMENT_CYCLE, 5, 300))
+    floors = dict(FLOORS)
+    given = doc.get("floors") if isinstance(doc.get("floors"), dict) else {}
+    for bucket, (floor, reserve) in FLOORS.items():
+        one = given.get(bucket) if isinstance(given.get(bucket), dict) else {}
+        f = int(_bounded(one.get("floor"), floor, 0, 100000))
+        r = int(_bounded(one.get("reserve"), reserve, 0, 100000))
+        floors[bucket] = (f, r) if r <= f else (floor, reserve)
+    return {"cycle": cycle, "commentCycle": comment,
+            "cycles": {"pr": cycle, "run": cycle, "comment": comment, "head": cycle},
+            "floors": floors, "restShare": float(_bounded(doc.get("restShare"), REST_SHARE, 0.05, 1.0))}
+
+
 def consumer_policy() -> dict:
     """CONSUMER_DEFAULTS with the keys of ~/.config/glaeda/gh-consumers.json laid over them."""
     policy = {**CONSUMER_DEFAULTS, "reserved": dict(CONSUMER_DEFAULTS["reserved"])}
@@ -1219,6 +1263,7 @@ class Daemon:
         self.payer: dict[str, tuple[str, float]] = {}  # head key -> (consumer, time) charged for a read in flight
         self.denied: dict[str, float] = {}  # consumer -> when a head read it needed was refused for budget
         self.saved_consumers: str = ""
+        self.policy = daemon_policy()  # re-read at the start of every tick
 
     # -- budget
 
@@ -1226,21 +1271,36 @@ class Daemon:
         """normal, lean (below the floor) or stop (below the reserve, or told to back off)."""
         if self.backoff[bucket] > self.now:
             return "stop"
+        capped = bucket == "rest" and self.rest_capped()
         seen = self.budget.get(bucket) or {}
         if not seen or (seen.get("reset") or 0) <= self.now:
-            return "normal"
-        floor, reserve = FLOORS[bucket]
+            return "lean" if capped else "normal"
+        floor, reserve = self.policy["floors"][bucket]
         remaining = seen.get("remaining", floor)
-        return "stop" if remaining < reserve else "lean" if remaining < floor else "normal"
+        return "stop" if remaining < reserve else "lean" if remaining < floor or capped else "normal"
+
+    def rest_spent(self) -> int:
+        """REST requests this daemon sent in the last hour that GitHub counted (304s are free)."""
+        return sum(1 for t, what in self.sent if what == "rest" and self.now - t < 3600)
+
+    def rest_cap(self) -> int:
+        limit = (self.budget.get("rest") or {}).get("limit") or 5000
+        return int(self.policy["restShare"] * limit)
+
+    def rest_capped(self) -> bool:
+        """The daemon spent its share of the hourly REST limit: what is left is for everyone else."""
+        return self.rest_spent() >= self.rest_cap()
 
     def richness(self, bucket: str) -> float:
         """What this bucket can still spend per second until its own reset, above its reserve; -1
         while it is stopped. A bucket not seen yet, or past its reset, counts as a full hour's quota."""
         if self.mode(bucket) == "stop":
             return -1.0
+        if bucket == "rest" and self.rest_capped():
+            return -1.0  # the daemon's own REST share is spent: balanced kinds read over GraphQL
         seen = self.budget.get(bucket) or {}
         limit = seen.get("limit") or 5000
-        reserve = FLOORS[bucket][1]
+        reserve = self.policy["floors"][bucket][1]
         if not seen or (seen.get("reset") or 0) <= self.now:
             return max(0, limit - reserve) / FULL_WINDOW
         return max(0, seen.get("remaining", limit) - reserve) / max(seen["reset"] - self.now, RICH_WINDOW_MIN)
@@ -1283,9 +1343,9 @@ class Daemon:
         """
         if BUDGET_REFRESH <= 0 or self.now < self.budget_retry:
             return
-        seen = [(self.budget.get(b) or {}).get("seenAt") for b in FLOORS]
+        seen = [(self.budget.get(b) or {}).get("seenAt") for b in ("rest", "graphql")]
         ages = [self.now - t for t in seen if isinstance(t, (int, float))]
-        if len(ages) == len(FLOORS) and max(ages) < BUDGET_REFRESH:
+        if len(ages) == 2 and max(ages) < BUDGET_REFRESH:
             return  # every bucket's view is recent enough; a bucket never seen always refreshes
         try:
             status, _, doc = self.request("GET", "/rate_limit", free=True)
@@ -1636,7 +1696,7 @@ class Daemon:
             return []
         if kind == "head":
             return self.due_heads(mine, mode)
-        interval = CYCLES[kind] * (LEAN_FACTOR if mode == "lean" else 1)
+        interval = self.policy["cycles"][kind] * (LEAN_FACTOR if mode == "lean" else 1)
         full = self.now - self.last_cycle[kind] >= interval
         if full:
             self.last_cycle[kind] = self.now
@@ -1660,7 +1720,7 @@ class Daemon:
                 # at most), for the failed steps and to tell a runner's refusal from a real failure.
                 failed = (data.get("status") == "completed" and data.get("conclusion") not in RUN_OK
                           and jobs_attempt(c.get("jobs")) < (data.get("run_attempt") or 1)
-                          and self.now - self.attempted.get(e["key"], float("-inf")) >= CYCLES[kind])
+                          and self.now - self.attempted.get(e["key"], float("-inf")) >= self.policy["cycles"][kind])
                 # A finished run with a reader newer than both its data and the last REST read: that
                 # reader's wait will not rule on older data, so REST confirms it once (it may have
                 # been rerun before the webhook said so).
@@ -1671,14 +1731,14 @@ class Daemon:
                                                     or controller_unconfirmed(c, self.now))
                 # Otherwise the controller answered on this tick: REST only as the safety net. A failed read leaves
                 # each of these true (restAt keeps its time), so a key is read at most once a cycle.
-                paced = self.now - self.attempted.get(e["key"], float("-inf")) >= CYCLES[kind]
+                paced = self.now - self.attempted.get(e["key"], float("-inf")) >= self.policy["cycles"][kind]
                 if failed or (paced and (confirm or self.now - (c.get("restAt") or 0) >= REST_SAFETY)):
                     out.append(e)
                 continue
             if c is None:
                 # a new entry is filled at once, but at most once per cycle when the fetch never gets as
                 # far as storing an answer (a failed fetch stores its error, and then waits for full cycles)
-                if self.now - self.attempted.get(e["key"], float("-inf")) >= CYCLES[kind]:
+                if self.now - self.attempted.get(e["key"], float("-inf")) >= self.policy["cycles"][kind]:
                     out.append(e)
             elif full and (not terminal(kind, c.get("data")) or self.now - c.get("fetchedAt", 0) >= TERMINAL_REFRESH
                            # a reader came after the last fetch: a rerun or reopen may have changed it
@@ -1713,7 +1773,7 @@ class Daemon:
         policy = consumer_policy()
         self.head_spend = {k: [t for t in v if self.now - t < CONSUMER_WINDOW] for k, v in self.head_spend.items()}
         for key, (_, at) in list(self.payer.items()):
-            if self.now - at > 2 * CYCLE:  # a read that raised never reported back
+            if self.now - at > 2 * self.policy["cycle"]:  # a read that raised never reported back
                 self.refund(key)
         out = []
         for e in mine:
@@ -1725,7 +1785,7 @@ class Daemon:
                 ttl = HEAD_SETTLED_TTL if c["data"].get("settled") else HEAD_PENDING_TTL
                 if self.now - (c.get("dataAt") or 0) < ttl:
                     continue
-            retry = HEAD_MISSING_RETRY if c.get("missing") else CYCLES["head"]
+            retry = HEAD_MISSING_RETRY if c.get("missing") else self.policy["cycles"]["head"]
             if e["key"] in self.deferred:
                 self.deferred.discard(e["key"])  # the last tick ran out of time for it: no cycle to wait
             elif self.now - self.attempted.get(e["key"], float("-inf")) < retry:
@@ -1765,6 +1825,7 @@ class Daemon:
         self.clock_real = now is None
         self.tick_deadline = time.monotonic() + TICK_BUDGET
         self.errors = []
+        self.policy = daemon_policy()
         if self.failing is None:
             # and again in serve_waits: a long read phase must not look like a dead daemon; ticks that
             # keep raising stop marking, so their blockers hand the wait back (resume_wait says why)
@@ -1836,7 +1897,10 @@ class Daemon:
                   "fetched": {"pr": len(prs), "run": len(runs), "comment": len(comments), "head": len(heads)},
                   "controller": {**self.controller_status, "runs": len(self.controller_filled)},
                   "modes": {b: self.mode(b) for b in ("rest", "graphql")}, "errors": self.errors[:10],
-                  "lastHour": hour, "heartbeat": HEARTBEAT_EVERY, "paths": dict(self.paths), "reads": reads,
+                  "lastHour": hour,
+                  "restShare": {"spent": self.rest_spent(), "cap": self.rest_cap(),
+                                "share": self.policy["restShare"], "capped": self.rest_capped()},
+                  "heartbeat": HEARTBEAT_EVERY, "paths": dict(self.paths), "reads": reads,
                   "perMinute": {b: round(self.richness(b) * 60, 1) for b in ("rest", "graphql")},
                   "batch": dict(self.batch), "oldestData": oldest, "deferred": len(self.deferred),
                   "outbox": {"queued": len(list(outbox_dir().glob("*.json"))) if outbox_dir().is_dir() else 0,
@@ -2018,7 +2082,7 @@ class Daemon:
             h = self.heavy.get(e["key"])
             if h is None:
                 rest.append(e)
-            elif h["fails"] < HEAVY_AFTER or self.now - h["at"] >= LEAN_FACTOR * CYCLES[kind]:
+            elif h["fails"] < HEAVY_AFTER or self.now - h["at"] >= LEAN_FACTOR * self.policy["cycles"][kind]:
                 alone.append([e])
         queue = alone + [rest[i:i + size] for i in range(0, len(rest), size)]
         splits, shrunk = 0, False
@@ -4297,6 +4361,11 @@ def cmd_budget(as_json: bool) -> int:
             print(f"daemon requests in the last hour: {hour.get('rest', 0)} REST, {hour.get('rest304', 0)} more "
                   f"REST answered 304 (free), {hour.get('graphql', 0)} GraphQL, "
                   f"{hour.get('free', 0)} rate_limit reads (free)")
+        share = status.get("restShare")
+        if isinstance(share, dict):
+            print(f"daemon REST spend {share.get('spent', '?')}/{share.get('cap', '?')} this hour "
+                  f"(restShare {share.get('share', '?')}"
+                  + ("; at the cap, so REST is lean and PRs and runs read over GraphQL)" if share.get("capped") else ")"))
         if status.get("errors"):
             print("last errors: " + "; ".join(status["errors"][:3]))
     if not running:
@@ -5199,7 +5268,7 @@ def broker_max_age(fields: list[str]) -> float:
     if not isinstance(budget, dict):
         return BROKER_MAX_AGE
     now = time.time()
-    for bucket, (floor, _reserve) in FLOORS.items():
+    for bucket, (floor, _reserve) in daemon_policy()["floors"].items():
         seen = budget.get(bucket)
         if not isinstance(seen, dict) or (seen.get("reset") or 0) <= now:
             continue
@@ -5215,13 +5284,14 @@ def broker_bucket_spent(key: str, now: float) -> bool:
     budget = read_json(BASE / "budget.json")
     if not isinstance(budget, dict):
         return False
+    floors = daemon_policy()["floors"]
 
     def spent(bucket: str) -> bool:
         seen = budget.get(bucket)
         if not isinstance(seen, dict) or (seen.get("reset") or 0) <= now:
             return False
         remaining = seen.get("remaining")
-        return isinstance(remaining, int) and remaining < FLOORS[bucket][1]
+        return isinstance(remaining, int) and remaining < floors[bucket][1]
 
     mine = BROKER_GH_BUCKET.get(key.split(":", 1)[0])
     return mine is not None and spent(mine) and not spent(OTHER[mine])
