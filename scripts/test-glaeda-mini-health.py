@@ -2068,6 +2068,110 @@ class RunnerBelowPin(Base):
         self.assertEqual(self.run_once()["findings"], [])
 
 
+def worker_log(steps: list[tuple[str, int, int | None]], start: float) -> str:
+    """A worker log's StepsRunner lines: (display name, seconds after start, seconds it took or None for skipped)."""
+    def at(t: float) -> str:
+        return health.datetime.datetime.fromtimestamp(t, health.datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    lines = []
+    for name, offset, took in steps:
+        t = start + offset
+        lines += [f"[{at(t)}Z INFO StepsRunner] Processing step: DisplayName='{name}'",
+                  f"[{at(t)}Z INFO StepsRunner] Evaluating: success()"]
+        if took is None:
+            lines.append(f"[{at(t)}Z INFO StepsRunner] Skipping step due to condition evaluation.")
+        else:
+            lines += [f"[{at(t + took)}Z INFO ProcessInvokerWrapper] Finished process 1 with exit code 0",
+                      f"[{at(t + took)}Z INFO StepsRunner] Step result: "]
+    return "\n".join(lines) + "\n"
+
+
+class CheckoutSlow(Base):
+    """checkout_slow: the median checkout step from the runners' own worker logs, over the last three days."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.home = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.home, ignore_errors=True)
+        self.mini.home = self.home
+        self.n = 0
+
+    def job(self, checkout_s: int, age_s: float = 3600, runner: str = "actions-runner-glaeda") -> Path:
+        diag = self.home / runner / "_diag"
+        (self.home / runner / "glaeda-hooks").mkdir(parents=True, exist_ok=True)
+        diag.mkdir(exist_ok=True)
+        self.n += 1
+        start = NOW - age_s - 2000
+        path = diag / f"Worker_20261027-{self.n:06d}-utc.log"
+        path.write_text(worker_log([("Set up runner", 0, 1), ("Checkout", 5, checkout_s),
+                                    ("Discard the git object seed after a failed checkout", 1200, None),
+                                    ("Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd", 1201, None),
+                                    ("Build", 1210, 300), ("Post Checkout", 1700, 290)], start))
+        os.utime(path, (NOW - age_s, NOW - age_s))
+        return path
+
+    def test_the_parser_times_checkout_steps_only(self) -> None:
+        text = worker_log([("Checkout", 0, 700), ("Skipped", 800, None), ("Checkout the script", 900, 12),
+                           ("Run actions/checkout@abc", 1000, None), ("Post Checkout", 1100, 290),
+                           ("Retry checkout after transient network failure", 1500, 40),
+                           ("Run actions/checkout@abc", 1600, 9)], NOW)
+        self.assertEqual([sec for _, sec in health.checkout_durations(text)], [700.0, 12.0, 9.0])
+
+    def test_a_slow_median_is_a_warning_and_never_healed(self) -> None:
+        for i in range(12):
+            self.job(690 + i)
+        report = self.run_once()
+        self.assertEqual([(f["id"], f["severity"], f["auto_fix"]) for f in report["findings"]],
+                         [("checkout_slow", "warn", "impossible")])
+        self.assertIn("median 696 s", report["findings"][0]["evidence"])
+        self.assertIn("over 12 steps", report["findings"][0]["evidence"])
+        self.assertNotIn(str(self.home), json.dumps(report))
+        self.assertEqual(self.mini.did, [])
+
+    def test_a_fast_mini_or_too_few_samples_is_no_finding(self) -> None:
+        for i in range(30):
+            self.job(8 if i % 3 else 900)  # a third of the jobs slow: the median is still fast
+        self.assertEqual(self.run_once()["findings"], [])
+        shutil.rmtree(self.home / "actions-runner-glaeda")
+        for _ in range(health.CHECKOUT_MIN_SAMPLES - 1):
+            self.job(700)
+        self.assertEqual(self.run_once()["findings"], [])
+
+    def test_old_logs_are_not_counted(self) -> None:
+        for _ in range(12):
+            self.job(700, age_s=health.CHECKOUT_WINDOW_S + 3600)
+        for _ in range(12):
+            self.job(8, runner="actions-runner-glaeda-1")
+        self.assertEqual(self.run_once()["findings"], [])
+
+    def test_each_log_is_parsed_once_and_the_cache_follows_the_logs(self) -> None:
+        paths = [self.job(700) for _ in range(12)]
+        reads: list[Path] = []
+        real = self.mini.read_log
+        self.mini.read_log = lambda path, limit: reads.append(path) or real(path, limit)
+        self.assertEqual(self.ids(self.run_once()), ["checkout_slow"])
+        self.assertEqual(len(reads), 12)
+        cache = json.loads((self.dir / health.CHECKOUT_CACHE).read_text())
+        self.assertEqual(cache["schema"], health.CHECKOUT_CACHE_SCHEMA)
+        self.assertEqual(len(cache["logs"]), 12)
+        self.assertEqual(self.ids(self.run_once(at=NOW + 120)), ["checkout_slow"])
+        self.assertEqual(len(reads), 12)  # nothing changed: nothing read again
+        for p in paths:
+            p.unlink()
+        self.assertEqual(self.run_once(at=NOW + 240)["findings"], [])
+        self.assertEqual(json.loads((self.dir / health.CHECKOUT_CACHE).read_text())["logs"], {})
+
+    def test_a_check_only_run_writes_no_cache(self) -> None:
+        for _ in range(12):
+            self.job(700)
+        self.assertEqual(self.ids(self.run_once(apply=False)), ["checkout_slow"])
+        self.assertFalse((self.dir / health.CHECKOUT_CACHE).exists())
+
+    def test_only_the_newest_logs_are_read(self) -> None:
+        for i in range(health.CHECKOUT_MAX_LOGS + 20):
+            self.job(700 if i < 20 else 8, age_s=7200 - i * 10)  # the 20 oldest are the slow ones
+        self.assertEqual(self.run_once()["findings"], [])
+
+
 class DaemonHeal(Base):
     """The root daemon-heal LaunchDaemon is kept installed; its hot daemons show up in the report."""
 
