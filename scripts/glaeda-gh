@@ -2035,11 +2035,15 @@ class Daemon:
             if self.mode("rest") == "stop" or not self.rest_room(REST_READ_MAX[e["key"].split(":", 1)[0]]):
                 self.defer(over_rest[i:])
                 break
+            sent = len(self.sent)
             try:
                 (self.fetch_pr_rest if e["key"].startswith("pr:") else self.fetch_run)(e)
-            except OutOfTime:  # not read: it keeps its place, first next tick
+            except OutOfTime:
                 self.defer(over_rest[i:])
-                break
+                if len(self.sent) > sent:  # cut off partway: it had its turn, and queues as a new deferral
+                    self.rest_tried[e["key"]] = self.now
+                    self.deferred_since.pop(e["key"], None)
+                break  # (cut off before its first request, it was not read: it keeps its place, first next tick)
             except Exception as error:  # noqa: BLE001
                 self.errors.append(f"{e['key']}: {describe(error)}")
             self.rest_tried[e["key"]] = self.now  # read, or failed: either way it moves back

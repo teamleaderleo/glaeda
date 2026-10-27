@@ -2936,6 +2936,33 @@ class TickBudgetTest(Base):
         self.assertIn("run:o/r/2", order, order)
         self.assertIn("run:o/r/3", order, order)
 
+    def test_a_pr_read_cut_off_partway_does_not_hold_the_head(self) -> None:
+        """The real fetch_pr_rest sends several requests; a deadline inside it (after some answers) had its turn: a
+        waited run behind it is read next tick, not after that PR forever."""
+        self.daemon.budget = {"rest": {"limit": 5000, "remaining": 4500, "reset": NOW + 1800},
+                              "graphql": {"limit": 5000, "remaining": 0, "reset": NOW + 1800}}
+        self.daemon.paths["pr"] = self.daemon.paths["run"] = "rest"
+        self.gh.prs[("o", "r", 1)] = pr_node(1)
+        gg.register("pr:o/r#1")
+        self.daemon.deferred.add("pr:o/r#1")
+        self.daemon.deferred_since["pr:o/r#1"] = NOW - 600  # deferred long ago, so it heads the order
+        self.gh.runs[2] = {"id": 2, "status": "in_progress", "conclusion": None, "run_attempt": 1}
+        gg.register("run:o/r/2", waited=True)
+        self.daemon.deferred.add("run:o/r/2")
+        inner, count = self.daemon.transport, [0]
+
+        def transport(method, url, headers, body):
+            count[0] += 1
+            if count[0] % 2 == 0:
+                self.daemon.tick_deadline = float("-inf")  # two requests a tick: the PR never finishes in one
+            return inner(method, url, headers, body)
+        self.daemon.transport = transport
+        self.daemon.tick(NOW)
+        run_reads = lambda: [c for c in self.gh.rest_calls() if "/actions/runs/2" in c[1]]
+        self.assertEqual(run_reads(), [], "the PR, deferred first, takes this tick")
+        self.daemon.tick(NOW + gg.TICK)
+        self.assertTrue(run_reads(), "the waited run is read the tick after the PR's partial read")
+
     def test_failed_controller_fed_reads_move_back(self) -> None:
         """A controller-fed run keeps restAt when its REST read fails; the failure still moves it back
         (rest_tried), so failing keys cannot hold the head of the order."""
