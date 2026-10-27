@@ -674,6 +674,32 @@ class SelfUpdate(unittest.TestCase):
             self.assertFalse(calls[-1][0][2], "a file the release did not record: never live")
             self.assertIn("not the one its release installed", calls[-1][1]["hold"](0))
 
+    def test_a_failed_optional_stage_does_not_poison_a_later_release_without_it(self) -> None:
+        self.channel.publish(2)
+        self.run_pass()
+        bad = tar_gz({heal.MEMBERS[heal.SCRIPT_NAME]: SCRIPT_BYTES + b"# 3\n", heal.MEMBERS[heal.POLICY_NAME]: POLICY_BYTES,
+                      heal.MEMBERS[heal.FLEET_OPS_NAME]: b"{}",
+                      heal.ANCESTRY: "".join(f"{k:040x}\n" for k in range(3, 0, -1)).encode()})
+        self.channel.publish(3, members={})  # its archive and release.json are replaced below
+        for source in (ORIGIN, MIRROR):
+            self.channel.files[heal.release_url(source, "r-20261026-000000000003", heal.ARCHIVE)] = bad
+            rel = heal.release_url(source, "r-20261026-000000000003", "release.json")
+            doc = json.loads(self.channel.files[rel])
+            doc["assets"][heal.ARCHIVE] = {"size": len(bad), "sha256": hashlib.sha256(bad).hexdigest()}
+            self.channel.files[rel] = json.dumps(doc).encode()
+            stable = heal.release_url(source, "ota-channels", "stable.json")
+            entry = json.loads(self.channel.files[stable])
+            entry["releaseSha256"] = hashlib.sha256(self.channel.files[rel]).hexdigest()
+            self.channel.files[stable] = json.dumps(entry).encode()
+        report = self.run_pass(POLICY["release"]["every_s"])
+        self.assertTrue(report["release"]["error"], "a malformed fleet-ops.json fails the staged plan")
+        members = {heal.MEMBERS[heal.SCRIPT_NAME]: SCRIPT_BYTES + b"# 4\n", heal.MEMBERS[heal.POLICY_NAME]: POLICY_BYTES,
+                   heal.ANCESTRY: "".join(f"{k:040x}\n" for k in range(4, 0, -1)).encode()}
+        self.channel.publish(4, members=members)
+        report = self.run_pass(POLICY["release"]["every_s"])
+        self.assertEqual(report["release"]["error"], None)
+        self.assertEqual(self.installed(heal.SCRIPT_NAME), SCRIPT_BYTES + b"# 4\n")
+
     def test_a_copy_from_before_fleet_ops_takes_the_file_from_its_own_release(self) -> None:
         """A mini whose snapshot is the script and policy only (installed.json names two files) gets
         fleet-ops.json from the same release, with no new tag, and a release without it takes it away again."""
@@ -730,6 +756,7 @@ class FleetOps(unittest.TestCase):
         self.loaded: set[str] = set()
         self.bootstrap_fails = False
         self.bootout_sticks = False
+        self.print_broken = False
         self.ledger = self.root / "managed.json"
         self.doc = json.loads(OPS_BYTES)
         self.path = self.root / heal.FLEET_OPS_NAME
@@ -738,6 +765,8 @@ class FleetOps(unittest.TestCase):
     def ctl(self, *args: str):
         self.calls.append(args)
         if args[0] == "print":
+            if self.print_broken:
+                return 5, "Could not connect to launchd"
             return (0, "") if args[1] in self.loaded else (113, "could not find service")
         if args[0] == "bootstrap":
             if self.bootstrap_fails:
@@ -815,6 +844,17 @@ class FleetOps(unittest.TestCase):
         self.assertIn("symbol-cache-cap", json.loads(self.ledger.read_text())["ops"])
         self.bootout_sticks = False
         self.assertEqual(self.run_ops()["removed"], ["symbol-cache-cap"])
+
+    def test_launchd_that_does_not_answer_is_not_read_as_unloaded(self) -> None:
+        self.run_ops()
+        doc = copy.deepcopy(self.doc)
+        doc["ops"].pop("symbol-cache-cap")
+        self.path.write_text(json.dumps(doc))
+        self.print_broken = True
+        out = self.run_ops()
+        self.assertNotIn("removed", out)
+        self.assertIn("symbol-cache-cap", json.loads(self.ledger.read_text())["ops"])
+        self.assertTrue((self.ops_dir / "symbol-cache-cap").exists())
 
     def test_a_job_that_will_not_unload_is_not_bootstrapped_over(self) -> None:
         self.run_ops()
@@ -939,7 +979,10 @@ class FleetOps(unittest.TestCase):
                     self.lst(reservations=[entry], aliases={"build-mini-8": "build-mini-7"}),
                     self.lst(reservations=[entry], aliases=[]),
                     self.lst(expires=1e300),
-                    self.lst(reservations=[{**entry, "from": heal.iso(T0 + 60), "until": heal.iso(T0 - 60)}])):
+                    self.lst(reservations=[{**entry, "from": heal.iso(T0 + 60), "until": heal.iso(T0 - 60)}]),
+                    '{"schema": "glaeda-fleet-reservations/v1", "expires": "%s", "reservations": [{"hosts": '
+                    '["build-mini-7"], "from": "%s", "until": "%s"}], "reservations": []}'
+                    % (heal.iso(T0 + 3600), heal.iso(T0 - 60), heal.iso(T0 + 60))):
             with self.subTest(bad=str(bad)[:80]):
                 self.assertIn("held", self.reservations(bad))
         for local in ("not json", {"schema": "glaeda-reservation/v1", "since": "x", "until": 1},

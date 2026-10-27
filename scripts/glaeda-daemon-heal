@@ -712,6 +712,9 @@ def stage_check(files: dict[str, bytes], install_dir: Path, root: bool, run=boun
     stage = stage_dir(install_dir, root)
     for name, data in files.items():
         atomic_write(stage / name, data, MODES[name], root)
+    for name in OPTIONAL - set(files):  # a release without it: the plan must not read an earlier stage's copy
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(stage / name)
     code, out, err = run([python, "-I", os.fspath(stage / SCRIPT_NAME), "--policy", os.fspath(stage / POLICY_NAME),
                           "--state-dir", os.fspath(install_dir / "state")], timeout=CHECK_TIMEOUT)
     try:
@@ -901,10 +904,16 @@ def reservation_time(value: Any) -> float:
 
 
 def strict_json(raw: bytes) -> Any:
-    """json.loads that refuses NaN and Infinity, which no reservation may carry."""
+    """json.loads that refuses NaN and Infinity and a key given twice (the later one would win unseen)."""
     def refuse(token: str) -> Any:
         raise ValueError(f"{token} in a reservation file")
-    return json.loads(raw, parse_constant=refuse)
+
+    def unique(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        keys = [k for k, _v in pairs]
+        if len(keys) != len(set(keys)):
+            raise ValueError("a key given twice")
+        return dict(pairs)
+    return json.loads(raw, parse_constant=refuse, object_pairs_hook=unique)
 
 
 def names_list(value: Any, what: str) -> set[str]:
@@ -995,10 +1004,18 @@ def unload_op(name: str, ctl, wait=time.sleep) -> bool:
     target = f"system/{op_label(name)}"
     ctl("bootout", target)
     for _ in range(40):  # launchd lets go of a booted-out job asynchronously
-        if ctl("print", target)[0] != 0:
+        if op_loaded(name, ctl) is False:  # launchd said it has no such service; no answer is not that
             return True
         wait(0.25)
     return False
+
+
+def op_loaded(name: str, ctl) -> bool | None:
+    """True when launchd lists system/ai.manaflow.NAME, False when it says it has no such service, None otherwise."""
+    code, said = ctl("print", f"system/{op_label(name)}")
+    if code == 0:
+        return True
+    return False if code in (36, 113) or "could not find service" in str(said).lower() else None
 
 
 def load_op(name: str, plist: Path, ctl, wait=time.sleep) -> str | None:
@@ -1013,7 +1030,7 @@ def load_op(name: str, plist: Path, ctl, wait=time.sleep) -> str | None:
     for pause in (0, 1, 2, 4):  # a bootstrap right after a bootout can fail with EIO
         wait(pause)
         code, said = ctl("bootstrap", "system", os.fspath(plist))
-        if code == 0 or ctl("print", target)[0] == 0:
+        if code == 0:
             return None
     with contextlib.suppress(FileNotFoundError):
         os.unlink(plist)
@@ -1078,7 +1095,7 @@ def fleet_ops_pass(ops_path: Path, now: float, apply: bool, ops_dir: Path = FLEE
             managed.add(name)
             atomic_write(ledger, json.dumps({"ops": sorted(managed)}).encode(), 0o644, root)
             atomic_write(plist, plistlib.dumps(want, sort_keys=True), 0o644, root)
-        if not same or ctl("print", f"system/{op_label(name)}")[0] != 0:
+        if not same or op_loaded(name, ctl) is not True:
             error = load_op(name, plist, ctl, wait)
             if error:
                 out["ops"][name]["error"] = error
