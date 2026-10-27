@@ -186,11 +186,22 @@ jobs:
             best="$source" best_tag="$tag"
             break
           done < <(sort -rn channels/candidates.txt)
-          if [ -z "$best" ] || [ "$best" = "$previous" ]; then
-            echo "canary stays at ${previous:-none}: no newer release on main descends from it" >> "$GITHUB_STEP_SUMMARY"
+          if [ -z "$best" ]; then
+            echo "canary stays at ${previous:-none}: no release on main descends from it" >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
           python3 scripts/glaeda_release.py canary --release "channels/$best_tag.json" > channels/next.json
+          # The same commit rebuilt (a re-run replaces its release's assets and release.json): canary.json is
+          # rewritten when its tag or release digest differ, so clients never check a stale digest.
+          if [ "$best" = "$previous" ] && python3 - channels/canary.json channels/next.json <<'PY'
+          import json, sys
+          old, new = (json.load(open(p)) for p in sys.argv[1:])
+          sys.exit(0 if (old.get("tag"), old.get("releaseSha256")) == (new["tag"], new["releaseSha256"]) else 1)
+          PY
+          then
+            echo "canary stays at $previous: it names the newest descending release" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
           mv channels/next.json channels/canary.json
           gh release upload ota-channels channels/canary.json --clobber
           cat channels/canary.json >> "$GITHUB_STEP_SUMMARY"
