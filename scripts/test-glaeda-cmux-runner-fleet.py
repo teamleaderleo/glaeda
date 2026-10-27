@@ -277,6 +277,51 @@ class FleetTest(unittest.TestCase):
         staged = json.loads((self.dir / "calls.jsonl.mini-a.manifest").read_text())
         self.assertEqual(staged["hosts"]["mini-a"]["overrides"]["runner"]["dedicated"][0]["name"], "nightly-next")
 
+    def test_with_no_scope_flags_each_member_registers_where_the_manifest_says(self) -> None:
+        """A re-apply needs no --org/--group: runner.org and runner.group come from the manifest (defaults or a host's
+        overrides), a trusted-only member stays on its repository, and the group is checked before anything changes."""
+        manifest = json.loads(json.dumps(MANIFEST))
+        manifest["defaults"]["runner"] = {"org": "manaflow-ai", "group": "glaeda-minis"}
+        manifest["hosts"]["mini-b"]["overrides"] = {"runner": {"trustedRef": "refs/heads/main",
+                                                               "trustedRepo": "manaflow-ai/cmux"}}
+        self.manifest.write_text(json.dumps(manifest))
+        result = self.fleet("--apply", "--hosts", "mini-a,mini-b", FAKE_GROUPS=GROUP)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        rows = {r["member"]: r for r in json.loads(result.stdout)["members"]}
+        self.assertEqual((rows["mini-a"]["scope"], rows["mini-b"]["scope"]),
+                         ("manaflow-ai/glaeda-minis", "manaflow-ai/cmux"))
+        registers = [c for c in self.calls() if c["tool"] == "ssh" and "--apply" in c["remote"]]
+        self.assertTrue(all("--org manaflow-ai --group glaeda-minis" in c["remote"]
+                            for c in registers if c["host"] == "mini-a"))
+        self.assertTrue(all("--repo manaflow-ai/cmux" in c["remote"] and "--org" not in c["remote"]
+                            for c in registers if c["host"] == "mini-b"))
+        self.assertEqual(len(registers), 8)
+        # a group the org lacks: nothing changes
+        self.log.unlink()
+        missing = self.fleet("--apply", "--hosts", "mini-a", FAKE_GROUPS="[]")
+        self.assertEqual(missing.returncode, 2)
+        self.assertIn("no runner group named", missing.stderr)
+        self.assertFalse(any(c["tool"] == "ssh" and "--apply" in c["remote"] for c in self.calls()))
+        # flags still win, for every member
+        self.log.unlink()
+        flagged = self.fleet("--apply", "--hosts", "mini-a", "--repo", "manaflow-ai/other")
+        self.assertEqual(flagged.returncode, 0, flagged.stdout + flagged.stderr)
+        self.assertTrue(all("--repo manaflow-ai/other" in c["remote"] for c in self.calls()
+                            if c["tool"] == "ssh" and "--apply" in c["remote"]))
+        # an unusable scope refuses that member and touches nothing on it
+        self.log.unlink()
+        manifest["hosts"]["mini-a"]["overrides"] = {"runner": {"org": "not an org"}}
+        self.manifest.write_text(json.dumps(manifest))
+        bad = self.fleet("--apply", "--hosts", "mini-a", FAKE_GROUPS=GROUP)
+        self.assertIn("bad runner scope", json.loads(bad.stdout)["members"][0]["action"])
+        self.assertFalse(any(c["tool"] == "ssh" and "--apply" in c["remote"] for c in self.calls()))
+
+    def test_without_a_manifest_scope_the_default_repository_is_used(self) -> None:
+        result = self.fleet("--apply", "--hosts", "mini-a")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        registers = [c for c in self.calls() if c["tool"] == "ssh" and "--apply" in c["remote"]]
+        self.assertTrue(registers and all("--repo manaflow-ai/cmux" in c["remote"] for c in registers))
+
     def test_org_migration_goes_one_member_at_a_time_and_skips_trusted(self) -> None:
         manifest = json.loads(json.dumps(MANIFEST))
         manifest["hosts"]["mini-t"] = {"class": "std", "availability": "dedicated", "roles": ["ci-runner"],
