@@ -8145,10 +8145,45 @@ class DaemonPolicyTest(Base):
         self.daemon.budget = {"rest": {"limit": 5000, "remaining": 4500, "reset": NOW + 1800},
                               "graphql": {"limit": 5000, "remaining": 600, "reset": NOW + 1800}}
         self.daemon.paths["run"] = "rest"
-        self.spend_rest(1999, at=NOW)  # one request short of the 2000 share
+        self.spend_rest(1997, at=NOW)  # room for the first two run reads' worst case (2 each), not a third
         self.daemon.tick(NOW)
-        self.assertEqual(len(self.gh.run_calls()), 1)
-        self.assertEqual(len(self.daemon.deferred), 2)
+        self.assertEqual(len(self.gh.run_calls()), 2)
+        self.assertEqual(len(self.daemon.deferred), 1)
+        self.assertLessEqual(self.daemon.rest_spent(), self.daemon.rest_cap())
+
+    def test_a_pr_read_is_admitted_only_when_its_worst_case_fits(self) -> None:
+        self.gh.prs[("o", "r", 1)] = pr_node(1)
+        gg.register("pr:o/r#1")
+        self.daemon.budget = {"rest": {"limit": 5000, "remaining": 4500, "reset": NOW + 1800},
+                              "graphql": {"limit": 5000, "remaining": 600, "reset": NOW + 1800}}
+        self.daemon.paths["pr"] = "rest"
+        self.spend_rest(2000 - gg.REST_READ_MAX["pr"] + 1, at=NOW)
+        self.daemon.tick(NOW)
+        self.assertEqual(self.gh.rest_calls(), [])
+        self.assertIn("pr:o/r#1", self.daemon.deferred)
+
+    def test_reaching_the_share_during_the_tick_does_not_exempt_it(self) -> None:
+        self.daemon.now = NOW
+        self.spend_rest(1999, at=NOW)
+        self.daemon.tick_capped = self.daemon.rest_capped()  # as tick() does, before any request
+        self.spend_rest(5, at=NOW)  # the GraphQL phase's job reads, say
+        self.assertFalse(self.daemon.rest_room(1))
+        self.daemon.tick_capped = True  # a tick that began capped: GraphQL is stopped, REST lean
+        self.assertTrue(self.daemon.rest_room(gg.REST_READ_MAX["pr"]))
+
+    def test_a_failed_attempt_still_gets_its_job_list_at_the_cap(self) -> None:
+        """The one read the share does not hold back: a wait cannot rule on a failed run without it."""
+        self.gh.runs[7] = {"id": 7, "name": "CI", "display_title": "fix", "status": "completed", "conclusion": "failure",
+                           "html_url": "https://github.com/o/r/actions/runs/7", "head_sha": "b" * 40, "head_branch": "x",
+                           "event": "push", "run_attempt": 1, "created_at": iso(NOW - 99), "updated_at": iso(NOW - 9)}
+        self.gh.jobs[7] = [job("build")]
+        self.daemon.budget = {"rest": {"limit": 5000, "remaining": 4500, "reset": NOW + 1800},
+                              "graphql": {"limit": 5000, "remaining": 4000, "reset": NOW + 1800}}
+        self.spend_rest(2000, at=NOW)
+        gg.register("run:o/r/7")
+        self.daemon.tick(NOW)
+        self.assertEqual(self.gh.run_calls(), [])  # the run itself went over GraphQL
+        self.assertEqual(len(self.gh.job_calls()), 1)
 
     def test_status_and_budget_show_the_share(self) -> None:
         self.spend_rest(990)

@@ -322,6 +322,10 @@ FULL_WINDOW = 3600  # a bucket not seen yet, or past its reset, counts as a full
 SWITCH_MARGIN = 1.25  # a kind moves to the other bucket only when that one is this much richer
 REST_CHECK_PAGES = 5  # check-run pages (100 each) one PR read over REST takes at most
 REST_STEPS_MAX = 10  # failed or cancelled jobs whose steps one PR read over REST looks up at most
+# The most counted REST requests one read can make before its step lookups, which are admitted one
+# at a time: a PR is its pull, REST_CHECK_PAGES of check runs, statuses, runs, workflows, rules and
+# the branch; a run is the run and its job list. The share admits a read only when this much fits.
+REST_READ_MAX = {"pr": REST_CHECK_PAGES + 6, "run": 2}
 
 # NUM is the alias's PR-number variable: isRequired needs it
 PR_FIELDS = """number url title state isDraft merged mergedAt mergeable mergeStateStatus headRefOid
@@ -1273,6 +1277,7 @@ class Daemon:
             int(k): int(v) for k, v in (spend if isinstance(spend, dict) else {}).items()
             if str(k).isdigit() and isinstance(v, int) and not isinstance(v, bool) and v > 0}
         self.saved_rest_minutes = dict(self.rest_minutes)
+        self.tick_capped = False  # the share was spent when this tick began (REST is then lean, not shared)
 
     # -- budget
 
@@ -1301,6 +1306,12 @@ class Daemon:
     def rest_capped(self) -> bool:
         """The daemon spent its share of the hourly REST limit: what is left is for everyone else."""
         return self.rest_spent() >= self.rest_cap()
+
+    def rest_room(self, cost: int) -> bool:
+        """Whether `cost` more counted REST requests fit in the share. A tick that began capped reads
+        over REST only because GraphQL is stopped too, in lean mode, and is not held to the share:
+        reading four times less often beats not reading at all."""
+        return self.tick_capped or self.rest_spent() + cost <= self.rest_cap()
 
     def richness(self, bucket: str) -> float:
         """What this bucket can still spend per second until its own reset, above its reserve; -1
@@ -1843,6 +1854,7 @@ class Daemon:
         self.tick_deadline = time.monotonic() + TICK_BUDGET
         self.errors = []
         self.policy = daemon_policy()
+        self.tick_capped = self.rest_capped()  # before any request: this tick's GraphQL phase may spend REST too
         if self.failing is None:
             # and again in serve_waits: a long read phase must not look like a dead daemon; ticks that
             # keep raising stop marking, so their blockers hand the wait back (resume_wait says why)
@@ -1870,12 +1882,10 @@ class Daemon:
             self.batched(kind, batch, fetch)
             self.post_between()
         over_rest = (prs if over["pr"] == "rest" else []) + (runs if over["run"] == "rest" else [])
-        capped = self.rest_capped()
         for i, e in enumerate(over_rest):
-            # Reaching the share mid-tick ends this tick's REST reads, or one tick could overshoot it
-            # by a whole batch; the rest go first next tick, over whichever bucket is richer then. A
-            # tick that started capped is reading here because GraphQL is stopped, in lean mode.
-            if self.mode("rest") == "stop" or (not capped and self.rest_capped()):
+            # A read is admitted only when its worst case fits in the share, so the share holds at a
+            # request, not at a batch; the rest go first next tick, over whichever bucket is richer.
+            if self.mode("rest") == "stop" or not self.rest_room(REST_READ_MAX[e["key"].split(":", 1)[0]]):
                 self.defer(over_rest[i:])
                 break
             try:
@@ -2435,7 +2445,9 @@ class Daemon:
         base = f"/repos/{owner}/{repo}/actions/runs/{run_id}"
         run = fields.get("data") or prior.get("data") or {}
         # A failed attempt's job list names the failed steps, and tells a runner's refusal from a real
-        # failure. It is read once per attempt, lean or not: callers would otherwise each read it.
+        # failure. It is read once per attempt, lean or not: callers would otherwise each read it. That
+        # is also why it is the one read the REST share does not hold back: a wait cannot rule on a
+        # failed run without it, and one request per failed attempt is what keeps every waiter off gh.
         failed_attempt = (run.get("status") == "completed" and run.get("conclusion") not in RUN_OK
                           and self.mode("rest") != "stop"
                           and (fresh or jobs_attempt(prior.get("jobs")) < (run.get("run_attempt") or 1)))
@@ -2520,7 +2532,7 @@ class Daemon:
                 c["failedSteps"], c["stepCount"] = known[c["id"]]
                 continue
             job_id = job_ids.get(c["id"])
-            if not job_id or not c.get("runId") or left <= 0 or self.mode("rest") == "stop" or self.rest_capped():
+            if not job_id or not c.get("runId") or left <= 0 or self.mode("rest") == "stop" or not self.rest_room(1):
                 continue
             left -= 1
             try:
