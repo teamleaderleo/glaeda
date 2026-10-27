@@ -9512,6 +9512,52 @@ class DedicatedRunnerTest(unittest.TestCase):
         self.assertFalse((self.home / "Library/LaunchAgents" / f"{label}.plist").exists())
         self.assertEqual(json.loads((self.state / "runners.json").read_text())["runners"], [])
 
+    def test_a_dropped_path_entry_leaves_path_and_a_stuck_watch_is_retried(self) -> None:
+        fake_pw = mock.Mock(pw_dir=os.fspath(self.home))
+        runner = self.home / "actions-runner-glaeda-nightly-next"
+        label = "com.teamleaderleo.glaeda.cmux-runner.dedicated.nightly-next"
+        builder = {**NIGHTLY, "env": {"PATH": "/opt/builder-v1/bin:~/.local/bin"}}
+        with mock.patch.object(cr.pwd, "getpwuid", return_value=fake_pw):
+            self.invoke("--apply", "--manifest", self.manifest(builder), "--member", "mini-std",
+                        "--dedicated", "nightly-next")
+        path = (runner / ".path").read_text().strip().split(":")
+        self.assertIn("/opt/builder-v1/bin", path)
+        (runner / ".path").write_text(":".join([*path, "/opt/someone-else/bin"]) + "\n")  # not ours: it stays
+        # PATH goes from the manifest: the entries it added go, every other entry stays
+        with mock.patch.object(cr.pwd, "getpwuid", return_value=fake_pw):
+            self.invoke("--apply", "--manifest", self.manifest({**NIGHTLY, "env": {}}), "--member", "mini-std",
+                        "--dedicated", "nightly-next")
+        path = (runner / ".path").read_text().strip().split(":")
+        self.assertNotIn("/opt/builder-v1/bin", path)
+        self.assertNotIn(f"{self.home}/.local/bin", path)
+        self.assertIn("/opt/someone-else/bin", path)
+        self.assertEqual(path[:2], ["/opt/homebrew/bin", "/usr/local/bin"])
+        # launchd keeps the watch agent: its plist and ownership stay, and the next apply removes it
+        trimmed = {k: v for k, v in NIGHTLY.items() if k != "watch"}
+        with mock.patch.object(cr.pwd, "getpwuid", return_value=fake_pw), \
+                mock.patch.object(cr, "bootout_watch", return_value=False) as stuck:
+            failed = self.invoke("--apply", "--manifest", self.manifest(trimmed), "--member", "mini-std",
+                                 "--dedicated", "nightly-next", expect=1)
+        stuck.assert_called_once()
+        watch = next(a for a in failed["actions"] if a["kind"] == "watch")
+        self.assertEqual(watch["state"], "failed")
+        self.assertTrue((self.home / "Library/LaunchAgents" / f"{label}.watch.plist").exists())
+        # bootout_watch itself: True only once launchd says it no longer has the agent
+        (self.state / "loaded.json").write_text(json.dumps([f"{label}.watch"]))
+        ctx = mock.Mock(uid=os.getuid())
+        self.assertTrue(cr.bootout_watch(ctx, f"{label}.watch"))
+        make_executable(self.launchctl, FAKE_LAUNCHCTL.replace('if argv[0] == "bootout":',
+                                                               'if argv[0] == "bootout" and False:'))
+        (self.state / "loaded.json").write_text(json.dumps([f"{label}.watch"]))
+        self.assertFalse(cr.bootout_watch(ctx, f"{label}.watch", wait_s=0.3))
+        make_executable(self.launchctl, FAKE_LAUNCHCTL)
+        (self.state / "loaded.json").unlink()
+        with mock.patch.object(cr.pwd, "getpwuid", return_value=fake_pw):
+            again = self.invoke("--apply", "--manifest", self.manifest(trimmed), "--member", "mini-std",
+                                "--dedicated", "nightly-next")
+        self.assertEqual(next(a for a in again["actions"] if a["kind"] == "watch")["state"], "remove")
+        self.assertFalse((self.home / "Library/LaunchAgents" / f"{label}.watch.plist").exists())
+
     def test_unknown_names_and_mixed_flags_are_refused(self) -> None:
         out = io.StringIO()
         with contextlib.redirect_stderr(out):

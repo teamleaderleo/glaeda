@@ -1734,10 +1734,12 @@ def apply_install(ctx: Context, actions: list[dict[str, Any]], receipt_doc: dict
         elif kind == "watch" and state == "unchanged" and not ctx.skip_launchctl and not act.get("loaded"):
             restart_watch(ctx, act)
         elif kind == "watch" and state == "remove":
-            if not ctx.skip_launchctl:
-                run([LAUNCHCTL, "bootout", f"gui/{ctx.uid}/{act['label']}"])
-            Path(act["path"]).unlink(missing_ok=True)
-            act["applied"], act["owned"], act["ownedSha256"] = True, False, None
+            if not ctx.skip_launchctl and not bootout_watch(ctx, act["label"]):
+                # still owned, plist kept: the next apply plans the removal again
+                act["state"], act["note"] = "failed", "launchd still has the watch agent; its plist is kept, re-run"
+            else:
+                Path(act["path"]).unlink(missing_ok=True)
+                act["applied"], act["owned"], act["ownedSha256"] = True, False, None
         elif kind == "agent" and state in {"create", "update"} and not ctx.skip_launchctl \
                 and (act.get("loaded") or getattr(ctx, "agent_started", False)) and not stop_if_idle(ctx):
             # loaded at plan time, or started since by a relabel: a bootout now would cancel its job
@@ -1926,8 +1928,9 @@ def apply_uninstall(ctx: Context, actions: list[dict[str, Any]]) -> None:
                 held_marker(ctx).unlink()
                 act["heldMarkRemoved"] = True
         elif act["kind"] == "watch":
-            if not ctx.skip_launchctl:
-                run([LAUNCHCTL, "bootout", f"gui/{ctx.uid}/{act['label']}"])
+            if not ctx.skip_launchctl and not bootout_watch(ctx, act["label"]):
+                act["state"], act["note"] = "failed", "launchd still has the watch agent; its plist is kept, re-run"
+                continue
             Path(act["path"]).unlink(missing_ok=True)
             act["applied"] = True
         elif act["kind"] == "deregister":
@@ -2586,6 +2589,19 @@ def watch_plist(ctx: Context) -> dict[str, Any]:
             "StandardErrorPath": os.fspath(ctx.logs / f"glaeda-cmux-runner-{ctx.dedicated['name']}.watch.err")}
 
 
+def bootout_watch(ctx: Context, label: str, wait_s: float = 15.0) -> bool:
+    """Unload a watch agent; True once launchd no longer has it (print exits LAUNCHCTL_NOT_FOUND), as bootout does
+    for the runner. False: still loaded, or launchctl could not tell, and its plist must stay so a re-run retries."""
+    domain = f"gui/{ctx.uid}/{label}"
+    run([LAUNCHCTL, "bootout", domain])
+    deadline = time.monotonic() + wait_s
+    while run([LAUNCHCTL, "print", domain])[0] != LAUNCHCTL_NOT_FOUND:
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.25)
+    return True
+
+
 def restart_watch(ctx: Context, act: dict[str, Any]) -> None:
     """Load the watch agent afresh (bootout, then bootstrap). The watch loop holds no job, so it is never waited for."""
     domain = f"gui/{ctx.uid}"
@@ -2605,10 +2621,24 @@ def keep_runner_env(ctx: Context, write: bool = True) -> bool:
     if not (ctx.runner_dir / ".runner").is_file():
         return False
     changed = False
-    declared_path = env.pop("PATH", None)
-    if declared_path is not None:
-        merged = runner_path(ctx.home, declared_path, read_runner_path(ctx.runner_dir))
-        if merged != read_runner_path(ctx.runner_dir):
+    # what this install wrote before: the .env keys, and the .path entries its declared PATH added (a key or an
+    # entry the manifest drops goes too). An older marker is a plain list of keys.
+    marker = ctx.runner_dir / DEDICATED_ENV_KEYS
+    try:
+        doc = json.loads(marker.read_text())
+    except (OSError, ValueError, TypeError):
+        doc = []
+    doc = doc if isinstance(doc, dict) else {"keys": doc if isinstance(doc, list) else []}
+    previous = {str(k) for k in doc.get("keys") or []}
+    previous_path = [str(e) for e in doc.get("path") or []]
+    declared = [e for e in env.pop("PATH", "").split(":") if e]
+    current = read_runner_path(ctx.runner_dir)
+    kept_path = [e for e in current.split(":") if e and (e not in previous_path or e in declared)]
+    base = runner_path(ctx.home)  # what every runner's .path has anyway: never owned, never removed
+    owned_path = [e for e in declared if e not in base.split(":") and (e not in kept_path or e in previous_path)]
+    if declared or previous_path:
+        merged = runner_path(ctx.home, ":".join(declared), ":".join(kept_path))
+        if merged != current:
             changed = True
             if write:
                 write_atomic(ctx.runner_dir / ".path", (merged + "\n").encode("utf-8", "surrogateescape"), 0o644,
@@ -2617,12 +2647,6 @@ def keep_runner_env(ctx: Context, write: bool = True) -> bool:
         lines = path.read_text().splitlines()
     except OSError:
         lines = []
-    # drop the keys this install wrote before (a key removed from the manifest goes too), then write the current ones
-    marker = ctx.runner_dir / DEDICATED_ENV_KEYS
-    try:
-        previous = set(json.loads(marker.read_text()))
-    except (OSError, ValueError, TypeError):
-        previous = set()
     kept = [line for line in lines if line.split("=", 1)[0] not in env and line.split("=", 1)[0] not in previous]
     want = "\n".join([*kept, *(f"{k}={v}" for k, v in env.items())]) + "\n"
     if want != ("\n".join(lines) + "\n" if lines else ""):
@@ -2630,7 +2654,7 @@ def keep_runner_env(ctx: Context, write: bool = True) -> bool:
         if write:
             write_atomic(path, want.encode(), 0o644, make_parent=False)
     if write:
-        write_atomic(marker, json.dumps(sorted(env)).encode(), 0o644, make_parent=False)
+        write_atomic(marker, json.dumps({"keys": sorted(env), "path": owned_path}).encode(), 0o644, make_parent=False)
     return changed
 
 
