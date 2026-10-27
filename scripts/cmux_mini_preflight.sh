@@ -98,12 +98,21 @@ e pf_git "$(PATH="$WORKLOAD_PATH" command -v git 2>/dev/null)"
 # The git calls below run the workload's git too: on a host with git.source homebrew, Xcode's git waits on privacy
 # prompts (about 100 s per git submodule call), and that is what the jobs run anyway.
 wgit() { PATH="$WORKLOAD_PATH" git "$@"; }
+# A host whose policy wants Homebrew's git (GIT_SOURCE homebrew) and does not have it yet skips the checkout's
+# submodule walk: Xcode's git would stall there past the probe's time limit. The git check asks for the install.
+checkout_git=yes
+[ "${GIT_SOURCE:-system}" = "homebrew" ] && [ "$(PATH="$WORKLOAD_PATH" command -v git 2>/dev/null)" != "/opt/homebrew/bin/git" ] &&
+  checkout_git=no
 
 # The cmux checkout: submodules, setup artifacts and local changes. Then the pinned candidate.
 if [ -e "$CMUX_ROOT/.git" ]; then
   e pf_cmux present
   e pf_cmux_pin "$(cat "$CMUX_ROOT/.xcode-version" 2>/dev/null)"
-  wgit -C "$CMUX_ROOT" submodule status --recursive 2>&1 | while IFS= read -r line; do e pf_submodule "$line"; done
+  if [ "$checkout_git" = yes ]; then
+    wgit -C "$CMUX_ROOT" submodule status --recursive 2>&1 | while IFS= read -r line; do e pf_submodule "$line"; done
+  else
+    e pf_submodule_skipped git
+  fi
   e pf_zig_min "$(sed -nE 's/^[[:space:]]*\.minimum_zig_version[[:space:]]*=[[:space:]]*"([0-9.]+)".*/\1/p' "$CMUX_ROOT/ghostty/build.zig.zon" 2>/dev/null | head -1)"
   artifacts=no
   if [ -f "$CMUX_ROOT/ghostty/include/ghostty.h" ]; then

@@ -877,6 +877,8 @@ def parse_preflight(out: dict[str, Any]) -> dict[str, Any]:
         "gh": out.get("pf_gh"),
         # git as the workload PATH resolves it, the same way as gh.
         "git": out.get("pf_git"),
+        # The probe skipped the checkout's git walk until the policy's git is installed.
+        "submodules_skipped": bool(out.get("pf_submodule_skipped")),
         # state: empty (directories only), partial (an interrupted homebrew_fetch: a .git, no brew) or files.
         "brew_dir": None if brew_dir is None else {"owner": brew_dir[0], "state": brew_dir[1]},
         "brew_formulas": {f: state == "pinned" for f, _, state in (v.partition("|") for v in out["pf_brew_formula"])},
@@ -2170,6 +2172,7 @@ def preflight_script(manifest: dict[str, Any], name: str) -> bytes:
         "CANDIDATE_PIN": operator_candidate_source(),
         "ENROLL_FLAGS": " ".join(ENROLL_FLAGS),
         "PIN_FORMULAS": " ".join(BREW_FORMULAS),
+        "GIT_SOURCE": git_source(manifest, name),
     }
     header = "".join(f"{k}={shlex.quote(v)}\n" for k, v in inputs.items())
     return PROBE.read_bytes() + b"\n" + header.encode() + PREFLIGHT_PROBE.read_bytes()
@@ -2434,6 +2437,9 @@ def preflight_host(manifest: dict[str, Any], name: str, obs: dict[str, Any],
         put("cmux", "fail", f"no checkout at {root}", clone, "self",
             {"kind": "cmux_clone", "repo": checkout["repo"], "ref": checkout["ref"], "root": root, "depth": checkout["depth"]})
         put("setup", "fail", "no checkout", f"after the clone: cd {root} && ./scripts/setup.sh", "self", setup)
+    elif pf.get("submodules_skipped"):
+        put("cmux", "todo", "the checkout's git walk waits for the policy's git (see git)", "install git first, then "
+            "rerun preflight", "self")
     else:
         errors = [s for s in pf.get("submodules", []) if s.startswith(("fatal:", "error:", "warning:"))]
         if errors:
@@ -2745,14 +2751,17 @@ def render_preflight(results: list[dict[str, Any]]) -> str:
 # ---------------------------------------------------------------- fix and sudo-plan
 
 # The order fix runs a host's repairs in, so each runs after what it builds on.
-FIX_ORDER = ("xcode_share", "xcode_clone", "python", "cmux_clone", "submodules", "homebrew_fetch", "brew", "python_link",
+# The checkout comes after brew: a git.source homebrew host clones and walks it with the git brew installs.
+FIX_ORDER = ("xcode_share", "xcode_clone", "python", "homebrew_fetch", "brew", "python_link", "cmux_clone", "submodules",
              "rust_default", "rust_channel", "glaeda", "glaeda_sync", "metal", "setup", "candidate")
 # What each repair needs to pass first (checks, or repairs made earlier in the same run).
 # glaeda-mini-setup builds glaeda-worktree-reclaim with cargo, under the Python enroll will use.
 FIX_NEEDS = {"metal": ("licence", "launch"), "setup": ("cmux", "licence", "launch", "metal", "zig"), "brew": ("brew",),
              "python_link": ("brew",), "glaeda": ("python", "rust", "headless_sudo"),
              # git runs through the /usr/bin shim, which needs a selected, licensed developer directory.
-             "homebrew_fetch": ("select", "licence")}
+             "homebrew_fetch": ("select", "licence"),
+             # git.source homebrew: the checkout is cloned and walked with Homebrew's git, never Xcode's.
+             "cmux_clone": ("git",), "submodules": ("git",)}
 # Remote functions that only read; every other one takes the host's step lock.
 # share_send only reads, and stays lock-free so one source can feed several peers at once.
 READ_ONLY_FUNCTIONS = {"candidate_check", "share_have", "share_source", "share_send", "host_check"}
