@@ -7179,7 +7179,15 @@ class NightlyNextFallbackTest(unittest.TestCase):
         self.root = self.home / "Library/Caches" / gd.NIGHTLY_NEXT_ROOT
         for name in ("cmux9s-mac-mini-glaeda-2", "cmux9s-mac-mini-glaeda-5", "cmux14-glaeda",
                      "cmux7s-mac-mini-nightly-next", "cmux7s-mac-mini-glaeda-nightly-next", "notes"):
-            (self.root / name / "caches").mkdir(parents=True)
+            # nightly_build_state.py's layout: SwiftPM clones and the compilation cache per identity, notices crates
+            ident = self.root / name / "0123456789abcdef0123456789abcdef"
+            clone = ident / "SourcePackages/checkouts/swift-collections"
+            (clone / ".git/objects").mkdir(parents=True)
+            (clone / ".git/HEAD").write_text("ref: refs/heads/main\n")
+            (clone / "Package.swift").write_text("// package\n")
+            (ident / "CompilationCache").mkdir()
+            (ident / "CompilationCache/blob").write_bytes(b"x" * 4096)
+            (self.root / name / "notices-crates/registry").mkdir(parents=True)
 
     def tearDown(self) -> None:
         gd.HOME, gd.FLEET_ROOT, gd.DARWIN = self.saved
@@ -7228,11 +7236,14 @@ class NightlyNextFallbackTest(unittest.TestCase):
                     mock.patch.object(gd, "process_evidence", return_value=([], "")):
                 fams = [f for f in gd.default_families()
                         if f.reclaimable and f.root.is_relative_to(self.home)]  # not the host's real temp dirs
-                paths = {Path(i.path) for i in gd.survey(fams, 0, 0)}
+                items = {Path(i.path): i.verdict for i in gd.survey(fams, 0, 0)}
+            paths = set(items)
             names = {p.name for p in paths if p.parent == self.root}
             if label:
                 self.assertNotIn(self.root, paths)
                 self.assertEqual(names, {"cmux14-glaeda", "cmux9s-mac-mini-glaeda-2", "cmux9s-mac-mini-glaeda-5"})
+                # the SwiftPM clones inside do not make a pool tree a checkout: a month idle, it is reclaimable
+                self.assertEqual({items[self.root / n] for n in names}, {"reclaimable"})
             else:
                 self.assertIn(self.root, paths)  # inert: the root stays one library-caches item, as before
                 self.assertEqual(names, set())

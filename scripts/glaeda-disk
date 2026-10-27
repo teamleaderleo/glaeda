@@ -7810,7 +7810,9 @@ def nightly_next_family(root: Path | None = None) -> Family:
     window = DEFAULT_AGE_HOURS  # a module global keep_legacy_ages may have raised for this run
     return Family(NIGHTLY_NEXT_FAMILY, root, True,
                   "a fallback nightly-next build on this runner starts cold (the dedicated builder keeps its own)",
-                  min_idle_hours=window, max_idle_hours=window,
+                  # SourcePackages/checkouts and notices-crates/git hold SwiftPM and cargo clones, which the next
+                  # build fetches again: build output, not a checkout anyone works in
+                  build_output=True, min_idle_hours=window, max_idle_hours=window,
                   owner="cmux nightly_build_state.py, per runner", rebuild_minutes=4, platform="macos")
 
 
