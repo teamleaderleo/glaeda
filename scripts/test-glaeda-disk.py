@@ -854,32 +854,53 @@ class GlaedaDiskTest(unittest.TestCase):
         self.assertFalse(registry.exists(), "cargo's registry is a cache and still goes")
 
     def test_the_tools_the_runner_hook_probes_are_never_evicted(self) -> None:
-        """Every TOOLCHAIN_TOOLS binary in the fixed tool dirs, the dir it sits in, where it links to, CARGO_HOME/bin,
+        """Every TOOLCHAIN_TOOLS binary in any fixed tool dir (each match, whatever the order: the job PATH starts with
+        /opt/homebrew/bin), the dir, every link on the way and where it ends, CARGO_HOME/bin with a symlinked ancestor,
         RUSTUP_HOME and the Xcode apps; never a directory only the caller's PATH names (a job's checkout bin)."""
         home = self.root / "home"
-        local_bin = home / ".local/bin"
+        local_bin, brew_bin = home / ".local/bin", self.root / "brew/bin"
         local_bin.mkdir(parents=True)
-        cellar = home / "cellar/python/bin"
+        brew_bin.mkdir(parents=True)
+        cellar = self.root / "cellar/python/bin"
         cellar.mkdir(parents=True)
         (cellar / "python3.13").write_text("#!/bin/sh\n")
-        (cellar / "python3.13").chmod(0o755)
         (local_bin / "python3").symlink_to(cellar / "python3.13")
+        (brew_bin / "python3").symlink_to(cellar / "python3.13")
+        (brew_bin / "zig").write_text("#!/bin/sh\n")
         checkout_bin = home / "work/repo/node_modules/.bin"
         checkout_bin.mkdir(parents=True)
         (checkout_bin / "gh").write_text("#!/bin/sh\n")
-        (checkout_bin / "gh").chmod(0o755)
-        cargo_home, rustup_home = self.root / "cargo-home", self.root / "rustup-home"
+        # CARGO_HOME as spelled is a plain dir whose bin is a symlink elsewhere: both spellings stay
+        cargo_home, cargo_real = self.root / "tmp/cargo-home", self.root / "cargo-real"
+        cargo_home.mkdir(parents=True)
+        (cargo_real / "bin").mkdir(parents=True)
+        (cargo_home / "bin").symlink_to(cargo_real / "bin")
+        rustup_home = self.root / "rustup-home"
         with mock.patch.object(gd, "HOME", home), \
-                mock.patch.object(gd, "TOOLCHAIN_SYSTEM_BIN_DIRS", ()), \
+                mock.patch.object(gd, "TOOLCHAIN_SYSTEM_BIN_DIRS", (os.fspath(brew_bin),)), \
                 mock.patch.dict(os.environ, {"CARGO_HOME": str(cargo_home), "RUSTUP_HOME": str(rustup_home),
                                              "PATH": f"{checkout_bin}{os.pathsep}{os.environ.get('PATH', '')}"}):
-            for path in (local_bin / "python3", local_bin, cellar / "python3.13", cargo_home / "bin",
+            for path in (local_bin / "python3", local_bin, brew_bin / "python3", brew_bin / "zig", brew_bin,
+                         cellar / "python3.13", cargo_home, cargo_home / "bin", cargo_real / "bin", self.root / "tmp",
                          rustup_home / "toolchains/x", Path("/Applications/Xcode_26.6.app")):
-                self.assertTrue(gd.toolchain_held(path), path)
+                self.assertTrue(gd.toolchain_held(path, fresh=True), path)
             self.assertFalse(gd.toolchain_held(checkout_bin), "a job PATH entry keeps nothing")
             self.assertFalse(gd.toolchain_held(home / "work/repo"))
-            self.assertFalse(gd.toolchain_held(cargo_home / "registry"))
-        for tool in ("rustup", "rustc", "cargo", "python3", "gh", "git", "xcodebuild"):
+            self.assertFalse(gd.toolchain_held(self.root / "tmp/other"))
+            # a tool switched after the cached look: remove() looks again before it deletes
+            gd.toolchain_keep(fresh=True)
+            newer = self.root / "cellar/python314/bin"
+            newer.mkdir(parents=True)
+            (newer / "python3.14").write_text("#!/bin/sh\n")
+            (local_bin / "python3").unlink()
+            (local_bin / "python3").symlink_to(newer / "python3.14")
+            self.assertFalse(gd.toolchain_held(newer), "the cached look predates the switch")
+            with self.assertRaisesRegex(OSError, "job toolchain"):
+                gd.remove(self.root / "cellar/python314")
+            with self.assertRaisesRegex(OSError, "job toolchain"):
+                gd.remove_spm_scratch(cargo_real / "bin")
+        self.assertTrue((newer / "python3.14").exists())
+        for tool in ("rustup", "rustc", "cargo", "zig", "python3", "gh", "git", "xcodebuild", "xcrun"):
             self.assertIn(tool, gd.TOOLCHAIN_TOOLS, "the runner hook's job-started probes each of these")
 
     def test_rustup_toolchains_a_checkout_or_the_environment_pins_stay(self) -> None:
