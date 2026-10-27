@@ -291,14 +291,16 @@ runner_supervisors() {  # DIR: the pgrep pattern for its listeners and what star
 
 runner_freeze() {  # DIR: SIGSTOP its listeners and their spawners until a look finds none left running; false when
   # a signal failed or the tree kept changing (pkill 1, nothing matched, is fine)
-  local rc tries=0 pattern table running; pattern=$(runner_supervisors "$1")
+  local rc tries=0 pattern table matches running; pattern=$(runner_supervisors "$1")
   while [ "$tries" -lt 5 ]; do
     tries=$((tries + 1))
     rc=0; pkill -STOP -f "$pattern" 2>/dev/null || rc=$?
     [ "$rc" -le 1 ] || return 1
     # every match stopped (state T): nothing of it can start a listener or take a job now. A ps that fails is no proof.
     table=$(ps -axww -o stat=,command=) || return 1
-    running=$(printf '%s\n' "$table" | grep -E -- "$pattern" | grep -v -e 'grep ' | awk '$1 !~ /^T/') || true
+    rc=0; matches=$(printf '%s\n' "$table" | grep -E -- "$pattern") || rc=$?
+    [ "$rc" -le 1 ] || return 1  # grep's 1 is no match; anything else is a failed look
+    running=$(printf '%s\n' "$matches" | awk 'NF && $1 !~ /^T/') || return 1
     [ -n "$running" ] || return 0
   done
   return 1
