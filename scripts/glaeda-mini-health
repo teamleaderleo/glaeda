@@ -427,15 +427,32 @@ class Mini:
         Read-only: GIT_OPTIONAL_LOCKS=0, no prompts, stdio closed, its own process group killed on timeout."""
         newest: tuple[float, str] | None = None
         seen = 0
+
+        def entries(path: Path) -> list[os.DirEntry]:
+            """At most what is left of CHECKOUT_PROBE_MAX_ENTRIES of path's entries, never following a symlink."""
+            nonlocal seen
+            out: list[os.DirEntry] = []
+            if seen >= CHECKOUT_PROBE_MAX_ENTRIES:
+                return out
+            with contextlib.suppress(OSError), os.scandir(path) as it:
+                for e in it:
+                    if seen >= CHECKOUT_PROBE_MAX_ENTRIES:
+                        break
+                    seen += 1
+                    with contextlib.suppress(OSError):
+                        if e.is_dir(follow_symlinks=False) and not e.name.startswith("_"):
+                            out.append(e)
+            return out
+
         for d in self.runner_dirs():
-            for repo in sorted((d / "_work").glob("[!_]*/*"))[:CHECKOUT_PROBE_MAX_ENTRIES]:
-                seen += 1
-                if seen > CHECKOUT_PROBE_MAX_ENTRIES:
-                    break
-                with contextlib.suppress(OSError):
-                    st = os.stat(repo / ".git", follow_symlinks=False)
-                    if stat.S_ISDIR(st.st_mode) and (newest is None or st.st_mtime > newest[0]):
-                        newest = (st.st_mtime, os.fspath(repo))
+            for group in entries(d / "_work"):
+                for repo in entries(Path(group.path)):
+                    with contextlib.suppress(OSError):
+                        st = os.stat(os.path.join(repo.path, ".git"), follow_symlinks=False)
+                        if stat.S_ISDIR(st.st_mode) and (newest is None or st.st_mtime > newest[0]):
+                            newest = (st.st_mtime, repo.path)
+            if seen >= CHECKOUT_PROBE_MAX_ENTRIES:
+                break
         git = shutil.which("git", path=CHECKOUT_PROBE_PATH)
         if newest is None or git is None:
             return None
@@ -443,19 +460,21 @@ class Mini:
                "GIT_TERMINAL_PROMPT": "0", "LC_ALL": "C"}
         start = time.monotonic()
         try:
-            p = subprocess.Popen([git, "-C", newest[1], "submodule", "status"], stdin=subprocess.DEVNULL,
+            # core.fsmonitor=false: a configured monitor hook would run otherwise, even with optional locks off.
+            p = subprocess.Popen([git, "-c", "core.fsmonitor=false", "-C", newest[1], "submodule", "status"], stdin=subprocess.DEVNULL,
                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env, start_new_session=True)
         except OSError:
             return None
         try:
-            p.wait(timeout=CHECKOUT_PROBE_S)
+            code = p.wait(timeout=CHECKOUT_PROBE_S)
         except subprocess.TimeoutExpired:
             with contextlib.suppress(OSError):
                 os.killpg(p.pid, signal.SIGKILL)
             with contextlib.suppress(subprocess.SubprocessError):
                 p.wait(timeout=5)
             return float(CHECKOUT_PROBE_S)
-        return time.monotonic() - start
+        # A git that failed (a checkout removed under it, a broken config) timed nothing: where stays unknown.
+        return time.monotonic() - start if code == 0 else None
 
     def read_log(self, path: Path, limit: int) -> str | None:
         """The first `limit` bytes of a regular file (never a symlink, FIFO or device), or None."""
@@ -1463,7 +1482,8 @@ def _check_checkout_steps(mini: Mini, now: float, cache_path: Path, remember: bo
     p50 = (samples[n // 2] if n % 2 else (samples[n // 2 - 1] + samples[n // 2]) / 2) if n else 0.0
     slow = slow and p50 > CHECKOUT_SLOW_S
     old = cache.get("probe") if cache.get("schema") == CHECKOUT_CACHE_SCHEMA else None
-    probe = old if (slow and isinstance(old, dict) and finite(old.get("at")) and finite(old.get("s"))
+    # Kept for its hour whatever this pass's median says, so a median near the line never probes more often.
+    probe = old if (isinstance(old, dict) and finite(old.get("at")) and finite(old.get("s"))
                     and old["s"] >= 0 and 0 <= now - old["at"] <= CHECKOUT_PROBE_TTL_S) else None
     if slow and probe is None:
         try:
