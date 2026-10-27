@@ -1650,7 +1650,9 @@ class Daemon:
                 self.nudged.discard(e["key"])  # a check event on its head: re-read now, not at the cycle
                 out.append(e)
                 continue
-            if kind == "run" and c is not None and e["key"] in self.controller_filled:
+            if kind == "run" and c is not None and e["key"] in self.controller_filled and c.get("source") == "controller":
+                # (a run REST has shown newer than the controller's record keeps its normal cycle below: the
+                # controller missed that attempt's deliveries, so it is not the source for it)
                 data = c.get("data") or {}
                 # A failed attempt whose job list is not this attempt's: REST reads it once (per cycle
                 # at most), for the failed steps and to tell a runner's refusal from a real failure.
@@ -1660,7 +1662,11 @@ class Daemon:
                 # A finished run with a reader newer than both its data and the last REST read: that
                 # reader's wait will not rule on older data, so REST confirms it once (it may have
                 # been rerun before the webhook said so).
-                confirm = terminal(kind, data) and e["touched"] > max(c.get("dataAt") or 0, c.get("restAt") or 0)
+                # And a finish the controller reported that REST has not read since: a rerun's deliveries can be
+                # lost (manaflow-ai/cmux run 40434431701, 2026-10-27: the controller kept attempt 1 "cancelled"
+                # while GitHub had attempt 2 queued), and wait_step rules on it only once REST confirms it.
+                confirm = terminal(kind, data) and (e["touched"] > max(c.get("dataAt") or 0, c.get("restAt") or 0)
+                                                    or controller_unconfirmed(c, self.now))
                 # Otherwise the controller answered on this tick: REST only as the safety net.
                 if failed or confirm or self.now - (c.get("restAt") or 0) >= REST_SAFETY:
                     out.append(e)
@@ -3581,6 +3587,18 @@ def wait_request(kind: str, target: str, until: str, timeout: float, jobs: bool,
             "jobs": jobs, "json": as_json, "sha": sha, "exact": exact, "grace": grace, "began": time.time()}
 
 
+def controller_unconfirmed(entry: dict | None, now: float | None = None) -> bool:
+    """A finished run whose finish only the controller has reported: no REST read since (restAt older than dataAt)
+    and younger than REST_SAFETY, after which the daemon's safety net has read it (or REST is down, and the
+    controller is all there is). The controller can miss a rerun's deliveries and keep the last attempt's
+    finish; wait does not rule on such a finish until REST has seen it."""
+    entry = entry or {}
+    if entry.get("source") != "controller" or not terminal("run", entry.get("data")):
+        return False
+    at = entry.get("dataAt") or 0
+    return (entry.get("restAt") or 0) < at and (time.time() if now is None else now) - at < REST_SAFETY
+
+
 def wait_step(req: dict, now: float) -> tuple[int, str] | None:
     """One look at a `wait pr|run` (wait_request): (exit code, what it prints) once it is decided or out
     of time, else None. Rules only on data the daemon fetched after the wait began, never on an older
@@ -3597,6 +3615,8 @@ def wait_step(req: dict, now: float) -> tuple[int, str] | None:
     # only a merge is final; a completed run can be rerun and a closed PR reopened
     final = kind == "pr" and data and data.get("state") == "MERGED"
     usable = data and ((entry.get("dataAt") or 0) >= began or final)
+    if usable and kind == "run" and controller_unconfirmed(entry, now):
+        usable = False  # the daemon reads it over REST first (Daemon.due's confirm)
     if usable and sha:
         head = str(data.get("headRefOid" if kind == "pr" else "head_sha") or "").lower()
         if head and not head.startswith(sha):

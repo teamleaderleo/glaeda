@@ -420,7 +420,68 @@ class ControllerTest(Base):
         self.daemon.tick(NOW + 2 * gg.TICK)
         entry = gg.read_cache(key)
         self.assertEqual(gg.verdict("run", entry["data"], jobs=entry.get("jobs")), gg.EXIT_OK)
-        self.assertEqual(len(self.gh.rest_calls()), 2)  # only attempt 1's run and job list
+        # attempt 1's run and job list, and one read confirming attempt 2's finish
+        self.assertEqual(len(self.gh.rest_calls()), 3)
+
+    def test_a_finish_only_the_controller_reported_is_confirmed_before_a_wait_rules(self) -> None:
+        """manaflow-ai/cmux run 40434431701, 2026-10-27: the controller kept attempt 1's "cancelled" (its rerun's
+        deliveries were lost) while GitHub had attempt 2 queued, and `wait run` returned cancelled. A finish only
+        the controller has reported is not ruled on until REST reads the run, which shows the rerun."""
+        now = time.time()
+        key = "run:o/r/46"
+        self.ctl.runs[46] = ctl_run(46, "in_progress", "", iso(now - 120))
+        self.gh.runs[46] = {"id": 46, "status": "in_progress", "conclusion": None, "run_attempt": 1,
+                            "updated_at": iso(now - 120)}
+        gg.register(key)
+        self.daemon.tick(NOW)
+        req = gg.wait_request("run", "o/r/46", "done", 60, False, False, None, True, gg.RESCUE_GRACE)
+        req["began"] = time.time() - 1  # the reads below come after the wait began
+        self.ctl.runs[46] = ctl_run(46, "completed", "cancelled", iso(now - 60))
+        self.gh.runs[46] = {"id": 46, "status": "queued", "conclusion": None, "run_attempt": 2,
+                            "updated_at": iso(now - 30)}
+        calls = len(self.gh.rest_calls())
+        controller = mock.Mock()
+        controller.run.return_value = self.ctl.runs[46]
+        with mock.patch.object(gg.Controller, "from_env", return_value=controller):
+            gg.controller_wait_run(key, 5)  # the client's own long-poll stores the controller's finish
+        self.assertEqual(gg.read_cache(key)["data"]["conclusion"], "cancelled")
+        self.assertIsNone(gg.wait_step(req, time.time()), "never ruled on the controller's word alone")
+        self.daemon.tick(NOW + gg.TICK)  # the daemon confirms it over REST
+        self.assertEqual(len(self.gh.rest_calls()), calls + 1)
+        entry = gg.read_cache(key)
+        self.assertEqual((entry["data"]["status"], entry["data"]["run_attempt"], entry["source"]), ("queued", 2, "rest"))
+        self.assertIsNone(gg.wait_step(req, time.time()), "the rerun is still queued")
+        self.daemon.tick(NOW + 2 * gg.TICK)
+        self.assertEqual(len(self.gh.rest_calls()), calls + 1, "a newer REST read keeps the controller's stale finish out")
+        self.assertEqual(gg.read_cache(key)["data"]["status"], "queued")
+        # once GitHub shows the rerun finished, the wait rules on it
+        self.gh.runs[46] = {"id": 46, "status": "completed", "conclusion": "success", "run_attempt": 2,
+                            "updated_at": iso(now)}
+        self.ctl.runs[46] = {**ctl_run(46, "completed", "success", iso(now)), "attempt": 2}
+        self.daemon.tick(NOW + 3 * gg.TICK)
+        self.daemon.tick(NOW + 4 * gg.TICK)
+        result = gg.wait_step(req, time.time())
+        self.assertIsNotNone(result)
+        self.assertEqual(result[0], gg.EXIT_OK)
+
+    def test_a_controller_success_is_confirmed_over_rest_once(self) -> None:
+        """A green finish takes no failed-attempt read, so only the confirmation reads REST, once, and finds the
+        rerun the controller missed."""
+        now = time.time()
+        key = "run:o/r/47"
+        self.ctl.runs[47] = ctl_run(47, "in_progress", "", iso(now - 120))
+        gg.register(key)
+        self.age_watch(key, 1)  # the reader came before the first fetch, so a reader is not the reason to read REST
+        self.daemon.tick(NOW)
+        self.ctl.runs[47] = ctl_run(47, "completed", "success", iso(now - 60))
+        self.gh.runs[47] = {"id": 47, "status": "queued", "conclusion": None, "run_attempt": 2,
+                            "updated_at": iso(now - 30)}
+        self.daemon.tick(NOW + gg.TICK)
+        self.daemon.tick(NOW + 2 * gg.TICK)
+        self.assertEqual(len(self.gh.rest_calls()), 1)
+        self.assertEqual(gg.read_cache(key)["data"]["run_attempt"], 2)
+        self.daemon.tick(NOW + 3 * gg.TICK)
+        self.assertEqual(len(self.gh.rest_calls()), 1, "confirmed once, not every tick")
 
     def test_safety_net_reads_rest_every_15_minutes(self) -> None:
         self.ctl.runs[22] = ctl_run(22, "in_progress")
@@ -618,7 +679,9 @@ class ControllerTest(Base):
         self.daemon.tick(NOW + 10 * gg.TICK)
         self.assertEqual(gg.read_cache("run:o/r/41")["data"]["conclusion"], "success")
         self.assertEqual(len(self.ctl.calls), 3)
-        self.assertEqual(self.gh.rest_calls(), [])
+        # the one REST read: the controller's finish is confirmed before a wait rules on it (a rerun's
+        # deliveries can be lost), and only for the run that finished
+        self.assertEqual([c[1].rsplit("/", 1)[-1] for c in self.gh.rest_calls()], ["41"])
         self.assertEqual(self.daemon.tick(NOW + 11 * gg.TICK)["controller"]["runs"], 3)
 
     def test_feed_is_read_at_most_every_feed_interval(self) -> None:
