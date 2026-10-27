@@ -1947,6 +1947,8 @@ def sim_device_items(devices: object, cmds: str, opened: frozenset[str], now: fl
             elif in_cwd(home, opened):
                 keep.append("a process has a file open in it")
             name = d.get("name")
+            if not isinstance(name, str) or not name:
+                keep.append("its name cannot be read")
             if re.search(re.escape(udid), cmds, re.I) or (
                     isinstance(name, str) and name and re.search(
                         r"(?:^|[\s'\"=,])" + re.escape(name) + r"(?=$|[\s'\",])", cmds, re.M)):
@@ -2011,6 +2013,9 @@ def erase_idle_sim_devices(receipt: Path, halt=None, budget_s: float = SIM_DEVIC
             if time.monotonic() - started > budget_s or (halt is not None and halt()) or (
                     below_target is not None and not below_target()):
                 break  # the readings took the rest of the budget, a job started, or the target was reached
+            if (why := host_reservation()):
+                print(f"refusing to erase simulator devices: {why}", file=sys.stderr)
+                break
             size = 0
             if now is None or now.verdict != "reclaimable":
                 outcome, reasons = "changed:in-use", (now.reasons if now else ["no longer listed"])

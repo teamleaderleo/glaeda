@@ -6432,6 +6432,10 @@ class SimDeviceTest(unittest.TestCase):
         (item,) = [i for i in gd.sim_device_items(short, "xcodebuild -destination name=QA\n", frozenset(), SIM_NOW, "")
                    if i.path == "11592F6E-1A41-4215-BF7D-8BE182D2922E"]
         self.assertEqual((item.verdict, item.reasons[1:]), ("kept", ["a running command names it"]))
+        nameless = json.loads(json.dumps(SIM_REPLAY))
+        del nameless["devices"]["com.apple.CoreSimulator.SimRuntime.iOS-26-5"][0]["name"]
+        self.assertIn("its name cannot be read", {i.path: i.reasons for i in gd.sim_device_items(
+            nameless, "", frozenset(), SIM_NOW, "")}["11592F6E-1A41-4215-BF7D-8BE182D2922E"])
         unsized = json.loads(json.dumps(SIM_REPLAY))
         unsized["devices"]["com.apple.CoreSimulator.SimRuntime.iOS-26-5"][0]["dataPathSize"] = "big"
         self.assertEqual({i.path: i.reasons[1:] for i in gd.sim_device_items(unsized, "", frozenset(), SIM_NOW, "")}
@@ -6501,13 +6505,17 @@ class SimDeviceTest(unittest.TestCase):
                 ("evidence", mock.patch.object(gd, "process_evidence", side_effect=no_evidence), None, "", None),
                 ("halt", ok, lambda: "a CI job", "", None),
                 ("reserved mid-pass", ok, None, "reserved for someone (r1)", None),
+                ("reserved under the token", ok, None, iter(["", "reserved for someone (r1)"]), None),
                 ("target reached", ok, None, "", lambda: False)):
             with self.subTest(name), patch, mock.patch.object(gd, "DARWIN", True), \
-                    mock.patch.object(gd, "host_reservation", return_value=reserved), \
+                    mock.patch.object(gd, "host_reservation", **(
+                        {"side_effect": reserved} if not isinstance(reserved, str) else {"return_value": reserved})), \
                     mock.patch.object(gd.shutil, "which", return_value="/usr/bin/xcrun"), \
                     mock.patch.object(gd, "capture_lease_text", return_value=""), \
                     mock.patch.object(gd.time, "time", return_value=SIM_NOW), \
-                    mock.patch.object(gd.subprocess, "run", side_effect=AssertionError("simctl ran")), \
+                    mock.patch.object(gd.subprocess, "run", side_effect=lambda argv, **kw: (
+                        subprocess.CompletedProcess(argv, 0, "", "") if argv[0] == "ps"
+                        else self.fail("simctl ran"))), \
                     contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
                 self.assertEqual(gd.erase_idle_sim_devices(self.receipt, halt, simctl=lambda: SIM_REPLAY,
                                                            below_target=short), 0)
