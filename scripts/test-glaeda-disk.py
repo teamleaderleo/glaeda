@@ -8628,8 +8628,14 @@ class NightlyNextFallbackTest(unittest.TestCase):
         policy = self.home / "disk-policy.json"
         policy.write_text(json.dumps({"nightly_next_dedicated_label": gd.NIGHTLY_NEXT_DEDICATED_LABEL}))
         self.assertEqual(gd.disk_policy(policy)["nightly_next_dedicated_label"], gd.NIGHTLY_NEXT_DEDICATED_LABEL)
-        policy.write_text(json.dumps({"nightly_next_dedicated_label": "off"}))  # any other label opts out
+        policy.write_text(json.dumps({"nightly_next_dedicated_label": ""}))  # "" is an opt-out, not a missing value
+        self.assertEqual(gd.disk_policy(policy)["nightly_next_dedicated_label"], "")
+        with mock.patch.object(gd, "POLICY", gd.disk_policy(policy)):
+            self.assertNotIn(gd.NIGHTLY_NEXT_FAMILY, {f.id for f in gd.default_families()})
+        policy.write_text(json.dumps({"nightly_next_dedicated_label": "off"}))  # any other label opts out too
         self.assertEqual(gd.disk_policy(policy)["nightly_next_dedicated_label"], "off")
+        policy.write_text(json.dumps({"cmux_next_ci_cap_gib": 40}))  # other string keys still ignore ""
+        self.assertEqual(gd.disk_policy(policy)["nightly_next_dedicated_label"], gd.NIGHTLY_NEXT_DEDICATED_LABEL)
         policy.write_text(json.dumps({"nightly_next_dedicated_label": 1}))  # wrongly typed: the default stays
         self.assertEqual(gd.disk_policy(policy)["nightly_next_dedicated_label"], gd.NIGHTLY_NEXT_DEDICATED_LABEL)
 
@@ -8642,6 +8648,56 @@ class NightlyNextFallbackTest(unittest.TestCase):
         got = sorted(p.name for p in gd.candidates(fam))
         self.assertEqual(got, ["cmux14-glaeda", "cmux9s-mac-mini-glaeda-2", "cmux9s-mac-mini-glaeda-5"])
 
+    def enroll(self, name: str) -> Path:
+        runner = self.home / f"actions-runner-{name}"
+        (runner / "glaeda-hooks").mkdir(parents=True)
+        (runner / ".runner").write_text(json.dumps({"agentName": name}))
+        old = time.time() - 30 * 24 * 3600
+        os.utime(runner / ".runner", (old, old))  # not mid re-registration
+        return runner
+
+    def test_a_pool_tree_whose_runner_has_a_job_is_in_use(self) -> None:
+        """A fallback build that started on the runner (its Runner.Worker in ps) holds its tree in the survey and,
+        when the job starts after the survey, at apply's fresh ps right before the delete."""
+        self.enroll("cmux9s-mac-mini-glaeda-2")
+        busy = self.enroll("cmux9s-mac-mini-glaeda-5")
+        old = time.time() - 30 * 24 * 3600
+        for p in [self.root, *self.root.rglob("*")]:
+            os.utime(p, (old, old), follow_symlinks=False)
+        worker = f"{busy}/bin/Runner.Worker spawnclient 151 154\n"
+        policy = {**gd.POLICY, "nightly_next_dedicated_label": gd.NIGHTLY_NEXT_DEDICATED_LABEL}
+        with mock.patch.object(gd, "POLICY", policy):
+            fam = gd.nightly_next_family(self.root)
+            with mock.patch.object(gd, "process_evidence", return_value=([], worker)):
+                items = {Path(i.path).name: i for i in gd.survey([fam], 0, 0)}
+            self.assertEqual(items["cmux9s-mac-mini-glaeda-2"].verdict, "reclaimable")
+            self.assertEqual(items["cmux9s-mac-mini-glaeda-5"].verdict, "in-use")
+            self.assertIn("cmux9s-mac-mini-glaeda-5 is running a job",
+                          " ".join(items["cmux9s-mac-mini-glaeda-5"].reasons))
+            # survey saw no job; one starts before the delete
+            with mock.patch.object(gd, "process_evidence", return_value=([], "/bin/zsh\n")):
+                idle = next(i for i in gd.survey([fam], 0, 0) if Path(i.path).name == "cmux9s-mac-mini-glaeda-5")
+            self.assertEqual(idle.verdict, "reclaimable")
+            receipt = self.home / "r.jsonl"
+            with mock.patch.object(gd, "process_evidence", return_value=([], worker)), \
+                    mock.patch.object(gd, "command_lines", return_value=worker):
+                gd.apply([idle], {fam.id: fam}, receipt, None, 0)
+            self.assertTrue((self.root / "cmux9s-mac-mini-glaeda-5").is_dir())
+            self.assertIn("changed:in-use", receipt.read_text())
+            # ps failing at apply stops the deletes instead of reading as no job
+            with mock.patch.object(gd, "process_evidence", return_value=([], "/bin/zsh\n")), \
+                    mock.patch.object(gd, "command_lines", return_value=""):
+                gd.apply([idle], {fam.id: fam}, receipt, None, 0)
+            self.assertTrue((self.root / "cmux9s-mac-mini-glaeda-5").is_dir())
+
+    def test_runner_busy_fails_closed(self) -> None:
+        tree = self.root / "cmux9s-mac-mini-glaeda-2"
+        self.assertTrue(gd.nightly_next_runner_busy(tree, ""))  # ps failed
+        self.assertEqual(gd.nightly_next_runner_busy(tree, "/bin/zsh\n"), "")  # no runner of that name, roster whole
+        runner = self.enroll("cmux9s-mac-mini-glaeda-3")
+        os.utime(runner / ".runner")  # a .runner rewritten just now: the tree may be the renamed runner's
+        self.assertTrue(gd.nightly_next_runner_busy(tree, "/bin/zsh\n"))
+
     def test_survey_of_every_family_never_offers_the_dedicated_tree(self) -> None:
         old = time.time() - 30 * 24 * 3600
         for p in self.root.rglob("*"):
@@ -8650,7 +8706,7 @@ class NightlyNextFallbackTest(unittest.TestCase):
             gd._DISCOVERED.clear()
             policy = {**gd.POLICY, "nightly_next_dedicated_label": label}
             with mock.patch.object(gd, "POLICY", policy), \
-                    mock.patch.object(gd, "process_evidence", return_value=([], "")):
+                    mock.patch.object(gd, "process_evidence", return_value=([], "/bin/zsh\n")):
                 fams = [f for f in gd.default_families()
                         if f.reclaimable and f.root.is_relative_to(self.home)]  # not the host's real temp dirs
                 items = {Path(i.path): i.verdict for i in gd.survey(fams, 0, 0)}
