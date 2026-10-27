@@ -175,29 +175,47 @@ DISK_LOW = "disk-low"  # capacity/disk-low.lock and capacity/disk-low-<pid>: job
 def disk_low_turn(capacity_dir: Path, worker: int) -> str | None:
     """Admit at most one job at a time between the admission floor and the runner floor: the capacity ledger counts
     cores, not disk, so two jobs admitted together at 25 GiB could write past the disk between them (each may write
-    up to DISK_JOB_PEAK_GIB). Under capacity/disk-low.lock, a live marker of another job (pid and start identity,
-    process_identity) refuses this one; otherwise this job's Worker leaves its own. Markers of gone jobs are removed.
-    Returns the refusal, or None (admitted, marker written). An unwritable ledger refuses, as below the floor before."""
+    up to DISK_JOB_PEAK_GIB). Under capacity/disk-low.lock (taken without blocking, retried for ADMISSION_WAIT_S), a
+    marker of another job refuses this one unless that job is proven gone: its pid is dead, or alive with another
+    start identity (process_identity). An unreadable marker or an identity that cannot be read refuses too. Otherwise
+    this job's Worker leaves its own marker. Returns the refusal, or None (admitted, marker written)."""
     try:
         capacity_dir.mkdir(parents=True, exist_ok=True)
         lock = os.open(capacity_dir / f"{DISK_LOW}.lock", os.O_RDONLY | os.O_CREAT | os.O_NOFOLLOW, 0o644)
     except OSError as error:
         return f"cannot open the disk ledger ({type(error).__name__})"
     try:
-        fcntl.flock(lock, fcntl.LOCK_EX)
-        for marker in capacity_dir.glob(f"{DISK_LOW}-*"):
+        deadline = time.monotonic() + ADMISSION_WAIT_S
+        while True:
             try:
-                pid = int(marker.name[len(DISK_LOW) + 1:])
-                raw = read_bounded(marker)
-                identity = (raw or b"").decode("utf-8").strip()
-            except (OSError, ValueError, UnicodeDecodeError):
-                continue
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError:
+                if time.monotonic() >= deadline:
+                    return "another admission holds the disk ledger"
+                time.sleep(0.1)
+        for marker in capacity_dir.glob(f"{DISK_LOW}-*"):
+            name = marker.name[len(DISK_LOW) + 1:]
+            if not name.isdigit():
+                continue  # not a marker (disk-low.lock, a .tmp being written)
+            pid = int(name)
             if pid == worker:
                 continue
-            if 1 < pid < 2 ** 31 and pid_alive(pid) and identity and process_identity(pid) == identity:
-                return f"another job admitted under the disk floor still runs here (pid {pid})"
+            gone = not 1 < pid < 2 ** 31 or not pid_alive(pid)
+            if not gone:
+                try:
+                    identity = (read_bounded(marker) or b"").decode("utf-8").strip()
+                except (OSError, UnicodeDecodeError):
+                    if not os.path.lexists(marker):
+                        continue  # removed meanwhile
+                    return f"cannot read the disk ledger's marker for pid {pid}"
+                current = process_identity(pid)
+                if not identity or current is None:
+                    return f"another job may still run here under the disk floor (pid {pid}, identity unknown)"
+                if current == identity:
+                    return f"another job admitted under the disk floor still runs here (pid {pid})"
             with contextlib.suppress(OSError):
-                marker.unlink()
+                marker.unlink()  # its job is proven gone
         identity = process_identity(worker)
         if identity is None:
             return f"cannot pin this job's Runner.Worker (pid {worker}) for the disk ledger"
@@ -6870,7 +6888,9 @@ def main(argv: list[str] | None = None) -> int:
                 return low
             worker = owner.pid if owner is not None else args.watch_pid or os.getppid()
             turn = disk_low_turn(args.capacity_dir, worker)
-            return f"{disk_refusal(disk_path, args.min_free_gib)}: {turn}" if turn else None
+            if turn:
+                return f"{disk_refusal(disk_path, args.min_free_gib) or 'under the disk floor'}: {turn}"
+            return disk_refusal(disk_path, admit_floor)  # read again: it may have waited for the ledger
 
         why = disk_why()
         if why:

@@ -1004,6 +1004,32 @@ class HookTest(unittest.TestCase):
         second.wait()
         self.assertIsNone(hook.disk_low_turn(capacity, first.pid), "the job ended: the next one's turn")
 
+    def test_the_disk_ledger_refuses_on_unknown_ownership_and_never_blocks(self) -> None:
+        """Review: an unreadable marker, or a live pid whose identity cannot be read (a timed-out ps), let a second job
+        in; and the ledger's flock could block job-started without bound. Ambiguity refuses; the lock is bounded."""
+        capacity = self.dir / "capacity"
+        first, second = (subprocess.Popen(["/bin/sleep", "60"]) for _ in range(2))
+        for proc in (first, second):
+            self.addCleanup(proc.wait)
+            self.addCleanup(proc.kill)
+        self.assertIsNone(hook.disk_low_turn(capacity, first.pid))
+        real = hook.process_identity
+        with mock.patch.object(hook, "process_identity",
+                               side_effect=lambda pid: None if pid == first.pid else real(pid)):
+            why = hook.disk_low_turn(capacity, second.pid)
+        self.assertIn(f"pid {first.pid}, identity unknown", why or "")
+        self.assertTrue((capacity / f"{hook.DISK_LOW}-{first.pid}").exists(), "never removed on an unknown identity")
+        (capacity / f"{hook.DISK_LOW}-{first.pid}").write_text("")
+        self.assertIn("identity unknown", hook.disk_low_turn(capacity, second.pid) or "", "an empty marker refuses")
+        (capacity / f"{hook.DISK_LOW}-{first.pid}").unlink()
+        held = os.open(capacity / f"{hook.DISK_LOW}.lock", os.O_RDONLY)
+        self.addCleanup(os.close, held)
+        fcntl.flock(held, fcntl.LOCK_EX)
+        begin = time.monotonic()
+        with mock.patch.object(hook, "ADMISSION_WAIT_S", 0.3):
+            self.assertEqual(hook.disk_low_turn(capacity, second.pid), "another admission holds the disk ledger")
+        self.assertLess(time.monotonic() - begin, 5)
+
     def test_job_started_admits_under_the_runner_floor_only_one_job_at_a_time(self) -> None:
         self.fleet()
         args = ("--min-free-gib", "30", "--capacity-dir", os.fspath(self.dir / "capacity"))
@@ -1122,7 +1148,7 @@ class HookTest(unittest.TestCase):
         """Running jobs can write the disk below the floor while this one waits: it then evicts and is refused, as
         under the floor before the wait."""
         self.fleet()
-        frees = iter([35.0, 35.0, 15.0])  # the two floor checks, then the one after the wait
+        frees = iter([35.0, 35.0, 35.0, 15.0])  # the three floor checks, then the one after the wait
         last = [35.0]
 
         def free(_path):
