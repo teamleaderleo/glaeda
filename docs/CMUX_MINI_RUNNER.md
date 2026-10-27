@@ -229,7 +229,12 @@ What `--apply` does:
      of the cores, or uninterruptible waits averaged at least 4 and 30% of the cores. When the
      job ends it appends one line to `~/Library/Logs/glaeda-cmux-jobs.jsonl`
      (`glaeda-cmux-job/v1`): load mean and max, host CPU busy %, disk MB/s, the run queue,
-     mean cores per bucket, the top five
+     mean cores per bucket, `rss_footprint_peak_mib` (the job tree's summed physical footprint at
+     its largest sample, read with `proc_pid_rusage` for the tree the same `ps` pass finds, so pages
+     its processes share count once and compressed or swapped pages count too; null off Darwin or when
+     no sample read it) and `rss_peak_mib` (the same tree's summed `ps` RSS, which counts shared pages
+     once per process and leaves out compressed and swapped pages, so it reads high or low).
+     Both are sampled, so a spike shorter than the sample period can be missed. Then the top five
      outside processes by estimated core-seconds, the other runner jobs seen, and a
      `contended` or `clear` verdict with its reasons. Processes are named by the kernel's
      executable name (`ucomm`, never argv) and user only. The log keeps its newest half past 16 MiB
@@ -557,6 +562,24 @@ label and Blacksmith, so no job waits on the reservation. A DEV hook waiting
 for capacity uses the existing `admit.want` fairness mechanism, then refuses
 after 60 seconds so the workflow can use its normal fallback.
 
+`runner.nightlySlot: true` on a dedicated member (no `trustedRef`, no
+`poolPrefix`) gives its next side instance after `canonicalRoots`, after the
+freshness slot when `devCompile` is set too, the nightly pool label
+`glaeda-nightly-<class>-xcode-<version>` in place of its side label, and its
+hook `--nightly-runner`. Like the freshness slot it reuses an instance and adds no
+runners, cores or roots; its neighbors keep their labels and hooks. It admits
+only nightly-tier jobs (the hook's `job_tier`: `nightly.yml` on `nightly-next`
+or `main`, and the Release compile that gates nightly-next's promotion). GitHub
+hands a queued job to the next idle runner in arrival order, so a nightly job
+queued on a side label waited behind every PR job queued there first and never
+reached a mini (2026-10-27). No PR job asks for the nightly label, and the slot's
+gate listens however full the mini is (units, waiters and CPU saturation do not
+hold it; disk, a fleet build's host claim, eligibility and heat still do), so
+the nightly job is taken at once. Its job then waits first in line (FEED_FIRST):
+no other admission takes a unit, every other runner's gate on the mini holds,
+and it keeps no reserve. NEXT's app build on attempt 1 still waits at most
+`NIGHTLY_CAPACITY_WAIT_S`, then is refused so its re-run takes Blacksmith.
+
 `glaeda-macos-<major>` is observed on the mini, not declared, so a fleet that straddles an
 OS upgrade can route a job to one macOS (`runs-on: [glaeda-std-xcode-26.6, glaeda-macos-27]`).
 It is never the bare `macos-<N>`: that is GitHub-hosted vocabulary, and cmux's workflows check
@@ -797,6 +820,50 @@ What the gate cannot see, and the operator must keep true:
   that trusted runs wrote. A cache namespace that PR runs also write (build seeds, sccache, SwiftPM
   manifest caches) brings PR-produced bytes next to the secret.
 - Also limit the org runner group to the one repository (an admin setting).
+## 2e1. Dedicated runners: a builder's one job shape, managed like an instance
+
+A builder that takes one job shape (cmux's nightly-next app build, the iOS internal archive) used to run as a hand-made
+runner with its own LaunchAgent, outside every glaeda reconciler: no `.path` repair, no Rust toolchain hold, no OTA hook
+refresh, no mini-health heal. It is now a manifest entry, and glaeda installs it like any instance:
+
+```json
+"overrides": {"runner": {"dedicated": [{
+  "name": "nightly-next", "repo": "manaflow-ai/cmux",
+  "labels": ["glaeda-trusted-next-nightly", "glaeda-trusted-light-xcode-26.6", "glaeda-runner-<old name>"],
+  "admit": ["/usr/bin/python3", "~/nightly-builder/nightly_builder.py", "admit"],
+  "watch": ["/usr/bin/python3", "~/nightly-builder/nightly_builder.py", "watch", "--loop"],
+  "env": {"NIGHTLY_BUILDER_RUNNER_DIR": "{runnerDir}", "PATH": "~/.local/bin"}}]}}
+```
+
+`glaeda-cmux-runner --manifest M --member NAME --dedicated nightly-next --apply` installs it, and
+`glaeda-cmux-runner-fleet --apply` applies every member's entries after its instances, each with a token for the
+entry's own scope (an org migration never moves them). The install is `~/actions-runner-glaeda-nightly-next`,
+LaunchAgent `com.teamleaderleo.glaeda.cmux-runner.dedicated.nightly-next`, receipt `instance-dedicated-nightly-next/`
+(so `--refresh-hooks` reaches it) and runner name `<member>-glaeda-nightly-next`.
+
+- **Exactly its labels.** It registers with `--no-default-labels` and only the listed labels: no `self-hosted`,
+  `macOS`, `glaeda-mini` or pool label (`dedicated_runners` refuses those), so no other job can land on it. Keep a
+  runner-name label from the hand-made runner in the list and the workflows that name it need no change.
+- **Its own admission.** `job-started` runs glaeda's checks (event, repository, fork, disk floor), then
+  `glaeda-hooks/dedicated-admit.sh`, which execs the entry's `admit` with the job's environment; a non-zero exit
+  refuses the job. It takes no host lock, capacity unit, root or gui token, and the mini's reservation never refuses it.
+- **The gate holds it only for what would fail its job here**: the disk floor and a missing Rust toolchain. Fleet
+  builds, reservations, CPU load and heat never hold a dedicated runner off.
+- **Warm state kept by role** (optional `keep`: paths under `~/` or `{runnerDir}/`). The installer writes them to
+  `<runner>/.glaeda-keep.json`, and glaeda-disk never takes them or anything inside them (`role_keep`), however old:
+  for the nightly builder, its `_work/cmux/cmux` checkout and its `~/Library/Caches/cmux-nightly-next/<runner>`
+  DerivedData. Everything else of that runner still goes by age: its `_work/_temp` leftovers after 12 h,
+  other checkouts, test TMPDIRs and other DerivedData.
+- **The watch loop** (optional) is the builder's own, run as `<agent label>.watch` beside the runner, with the
+  entry's `env` and the workload PATH. `env` also goes into the runner's `.env`; a declared `PATH` is merged into
+  `.path` instead (`runner_path`). `~/` and `{runnerDir}` are expanded on the mini.
+- mini-health checks and kickstarts the runner agent like an instance's (`runner_stopped:<name>`).
+- `--uninstall --apply` with the same flags deregisters it and removes both agents.
+
+To move a hand-made runner over: declare the entry with the old runner's labels (`gh api
+repos/OWNER/REPO/actions/runners/ID`), apply it so the glaeda runner is online beside the old one, then, while the old
+runner has no `Runner.Worker`, boot out and archive its LaunchAgents and remove its registration.
+
 ## 2e2. Other repositories on the same minis (org scope)
 
 Registered to `manaflow-ai/cmux`, the runners serve only cmux. To let another repository of the org use

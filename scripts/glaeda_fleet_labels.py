@@ -61,8 +61,17 @@ MAX_RUNNERS = 16
 TRUSTED_REF_RE = r"refs/heads/[A-Za-z0-9._/-]+"
 REPO_RE = r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+"
 POOL_PREFIX_RE = r"[a-z0-9]+-"
-RESERVED_POOL_PREFIXES = {"root-", "side-", "gui-", "fast-", "trusted-", "std-", "light-", "xl-", "dev-"}
+RESERVED_POOL_PREFIXES = {"root-", "side-", "gui-", "fast-", "trusted-", "std-", "light-", "xl-", "dev-", "nightly-"}
 DEV_COMPILE_POOL_PREFIX = "dev-"
+# A host's runner.nightlySlot: true gives its next side instance after canonicalRoots (after the freshness slot when
+# devCompile is set too) the nightly pool label glaeda-nightly-<class>-xcode-<version> instead of its side label. Only
+# cmux's nightly jobs (glaeda-cmux-runner-hook --nightly-runner: nightly.yml on nightly-next or main, and the Release
+# compile that gates nightly-next's promotion) run there. GitHub hands a queued job to the next idle runner in arrival
+# order, so a nightly job queued on a side label waited behind every PR job queued there before it (2026-10-27
+# 14:08Z: a nightly-next build-nightly-app on the light side label was never acquired by a runner while 37 side
+# runners ran PR jobs). No PR job carries this label, so the nightly job is the only one this runner can take; it
+# listens on a full mini, and its job waits there first in line (FEED_FIRST) while no other job takes a unit.
+NIGHTLY_POOL_PREFIX = "nightly-"
 
 
 def merge(base: dict[str, Any], over: dict[str, Any]) -> dict[str, Any]:
@@ -233,6 +242,11 @@ def member_labels(manifest: Any, member: str, xcode_ok: Callable[[dict[str, Any]
         return None, f"{member} runner.devCompile must be boolean"
     if dev_compile and (klass != "std" or availability != "dedicated" or trusted_ref is not None):
         return None, f"{member} runner.devCompile needs a dedicated std runner without trustedRef"
+    nightly_slot = runner.get("nightlySlot", False) if isinstance(runner, dict) else False
+    if not isinstance(nightly_slot, bool):
+        return None, f"{member} runner.nightlySlot must be boolean"
+    if nightly_slot and (availability != "dedicated" or trusted_ref is not None):
+        return None, f"{member} runner.nightlySlot needs a dedicated runner without trustedRef"
     pool_prefix = runner.get("poolPrefix", "") if isinstance(runner, dict) else ""
     prefix_ok = isinstance(pool_prefix, str) and (pool_prefix == "" or (
         re.fullmatch(POOL_PREFIX_RE, pool_prefix) and
@@ -241,6 +255,8 @@ def member_labels(manifest: Any, member: str, xcode_ok: Callable[[dict[str, Any]
         return None, f"{member} runner.poolPrefix must be empty or a lowercase prefix such as aws-"
     if dev_compile and pool_prefix not in ("", DEV_COMPILE_POOL_PREFIX):
         return None, f"{member} runner.devCompile uses poolPrefix {DEV_COMPILE_POOL_PREFIX}"
+    if nightly_slot and pool_prefix not in ("", DEV_COMPILE_POOL_PREFIX):
+        return None, f"{member} runner.nightlySlot needs the default pool namespace (no poolPrefix)"
     normal_pool_prefix = "" if dev_compile and pool_prefix == DEV_COMPILE_POOL_PREFIX else pool_prefix
     ready = [a for a in apps if re.fullmatch(VERSION_RE, str(a.get("version") or "")) and xcode_ok(a)]
     versions = [str(a["version"]) for a in ready]
@@ -248,6 +264,8 @@ def member_labels(manifest: Any, member: str, xcode_ok: Callable[[dict[str, Any]
     pools = [pool_label(klass, v, bool(trusted_ref), normal_pool_prefix) for v in versions] if availability == "dedicated" else []
     dev_pools = ([pool_label(klass, v, False, DEV_COMPILE_POOL_PREFIX) for v in versions]
                  if dev_compile and availability == "dedicated" else [])
+    nightly_pools = ([pool_label(klass, v, False, NIGHTLY_POOL_PREFIX) for v in versions]
+                     if nightly_slot and availability == "dedicated" else [])
     # Declared (the ios-simulators role) and, when the caller can look (the installer on the mini), a simulator
     # runtime actually present: an iOS job routed here must be able to boot one. Without a check (the fleet
     # plan) this is the declared view.
@@ -302,9 +320,13 @@ def member_labels(manifest: Any, member: str, xcode_ok: Callable[[dict[str, Any]
                       "(every compile holds a root)")
     if dev_compile and roots + gui + fast >= runners:
         return None, f"{member} runner.devCompile needs an existing side instance after canonicalRoots"
+    if nightly_slot and roots + gui + fast + int(dev_compile) >= runners:
+        return None, (f"{member} runner.nightlySlot needs an existing side instance after canonicalRoots"
+                      + (" and the freshness slot" if dev_compile else ""))
     return {"member": member, "class": klass, "availability": availability, "roles": roles,
             "labels": list(dict.fromkeys(labels)), "pools": list(dict.fromkeys(pools)),
-            "devPools": list(dict.fromkeys(dev_pools)),
+            "devPools": list(dict.fromkeys(dev_pools)), "nightlyPools": list(dict.fromkeys(nightly_pools)),
+            "nightlySlot": nightly_slot, "nightlyInstance": roots + int(dev_compile) if nightly_slot else None,
             "minFreeGib": floor if isinstance(floor, (int, float)) and floor > 0 else None,
             "hardware": hardware, "xcodeApps": [str(a.get("path")) for a in ready], "iosSim": ios_sim,
             "runners": runners, "capacityUnits": units, "compileSlots": compile_slots,
@@ -326,6 +348,139 @@ def declared_pools(manifest: Any, xcode_ok: Callable[[str, dict[str, Any]], bool
     for member in hosts if isinstance(hosts, dict) else {}:
         check = (lambda app, m=member: xcode_ok(m, app)) if xcode_ok else (lambda app: True)
         summary, _ = member_labels(manifest, member, check)
-        for label in [*(summary or {}).get("pools", []), *(summary or {}).get("devPools", [])]:
+        for label in [*(summary or {}).get("pools", []), *(summary or {}).get("devPools", []),
+                      *(summary or {}).get("nightlyPools", [])]:
             out.setdefault(label, []).append(member)
     return {label: sorted(members) for label, members in sorted(out.items())}
+
+
+# A host's runner.dedicated list (in its overrides, or the defaults) declares runners that are not pool instances: a
+# builder that takes one job shape, such as cmux's nightly-next app build or the iOS internal archive. glaeda-cmux-runner
+# --dedicated NAME installs each one like an instance (glaeda's release, .path, hooks, gate, disk floor, OTA hook
+# refresh), but with exactly the labels listed (no self-hosted, macOS or pool label, so no other job can land on it),
+# its own repo or org scope, and its own admission: the job-started hook runs glaeda's checks, then the entry's admit
+# command, and refuses the job when that fails. watch, when given, is the builder's own loop, run as a glaeda
+# LaunchAgent beside the runner. env goes into the runner's .env and the watch loop's environment; "{runnerDir}" in a
+# value is the runner's directory. A leading "~/" in a command word or env value is the runner user's home.
+DEDICATED_NAME_RE = r"[a-z][a-z0-9-]{0,39}"  # starts with a letter: never read as a pool instance number
+DEDICATED_POOL_SUFFIX_RE = r"(?:^|-)glaeda(?:-\d+)?$"  # <member>-glaeda-<name> would read as another member's instance
+RUNNER_LABEL_RE = r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}"
+ENV_NAME_RE = r"[A-Z_][A-Z0-9_]{0,63}"
+DEFAULT_LABELS = ("self-hosted", "macos", "arm64", MINI_LABEL)
+
+
+# Where a member's pool instances register (glaeda-cmux-runner-fleet, when no --org/--repo is passed): the manifest's
+# runner.org and runner.group (defaults, or a host's overrides), so a re-apply keeps the scope the pools already have
+# and nobody passes flags by hand. A trusted-only member (runner.trustedRepo) stays on that repository unless its own
+# overrides name runner.org (a trusted runner registered in the org's group). Neither set:
+# None, and the fleet tool falls back to its default repository as before.
+GROUP_RE = r"[A-Za-z0-9][A-Za-z0-9 ._-]*"
+ORG_RE = r"[A-Za-z0-9][A-Za-z0-9-]*"
+
+
+def pool_scope(manifest: Any, member: str) -> tuple[dict[str, str | None] | None, str | None]:
+    """({"org", "group"} or {"repo"}, None), (None, None) when the manifest names no scope, or (None, why) when the
+    member's runner.org/runner.group are unusable. Pure."""
+    hosts = manifest.get("hosts") if isinstance(manifest, dict) else None
+    host = hosts.get(member) if isinstance(hosts, dict) else None
+    if not isinstance(host, dict):
+        return None, f"{member} is not a member in the manifest"
+    defaults, overrides = manifest.get("defaults") or {}, host.get("overrides") or {}
+    if not isinstance(defaults, dict) or not isinstance(overrides, dict):
+        return None, f"manifest defaults or {member} overrides is not an object"
+    runner = merge(defaults, overrides).get("runner")
+    runner = runner if isinstance(runner, dict) else {}
+    org, group, trusted = runner.get("org"), runner.get("group"), runner.get("trustedRepo")
+    if org is not None and not (isinstance(org, str) and re.fullmatch(ORG_RE, org)):
+        return None, f"{member} runner.org must be an organization login"
+    if group is not None and (org is None or not (isinstance(group, str) and re.fullmatch(GROUP_RE, group))):
+        return None, f"{member} runner.group must be a runner group name and goes with runner.org"
+    if trusted is not None and not (isinstance(trusted, str) and re.fullmatch(REPO_RE, trusted)):
+        return None, f"{member} runner.trustedRepo must be owner/name"  # never fall back to the pools' scope
+    own = (overrides.get("runner") or {}) if isinstance(overrides.get("runner"), dict) else {}
+    if isinstance(trusted, str) and re.fullmatch(REPO_RE, trusted) and own.get("org") is None:
+        return {"repo": trusted}, None  # the defaults' org is for the pools; the host's own org says otherwise
+    if org is None:
+        return None, None
+    return {"org": org, "group": group}, None
+
+
+def dedicated_runners(manifest: Any, member: str) -> tuple[list[dict[str, Any]], str | None]:
+    """([{name, repo, org, group, labels, admit, watch, env}], None), or ([], why the member's list is unusable).
+    Pure. A member with no runner.dedicated has none."""
+    hosts = manifest.get("hosts") if isinstance(manifest, dict) else None
+    host = hosts.get(member) if isinstance(hosts, dict) else None
+    if not isinstance(host, dict):
+        return [], f"{member} is not a member in the manifest"
+    defaults, overrides = manifest.get("defaults") or {}, host.get("overrides") or {}
+    if not isinstance(defaults, dict) or not isinstance(overrides, dict):
+        return [], f"manifest defaults or {member} overrides is not an object"
+    runner = merge(defaults, overrides).get("runner")
+    entries = runner.get("dedicated", []) if isinstance(runner, dict) else []
+    if not isinstance(entries, list):
+        return [], f"{member} runner.dedicated must be a list"
+    if entries and host.get("gui") is False:
+        # a dedicated runner is a LaunchAgent in the user's GUI session; the headless supervisor is not wired for it
+        return [], f"{member} has gui: false; runner.dedicated runs only on a member with a GUI session"
+    out: list[dict[str, Any]] = []
+    pools: set[str] | None = None  # every pool label the manifest declares, read once when there is an entry
+    for index, entry in enumerate(entries):
+        where = f"{member} runner.dedicated[{index}]"
+        if not isinstance(entry, dict):
+            return [], f"{where} is not an object"
+        unknown = sorted(set(entry) - {"name", "repo", "org", "group", "labels", "admit", "watch", "env", "keep",
+                                       "note"})
+        if unknown:
+            return [], f"{where} has unknown keys: {', '.join(unknown)}"
+        name, repo, org, group = entry.get("name"), entry.get("repo"), entry.get("org"), entry.get("group")
+        if not isinstance(name, str) or not re.fullmatch(DEDICATED_NAME_RE, name):
+            return [], f"{where}.name must match {DEDICATED_NAME_RE}"
+        if re.search(DEDICATED_POOL_SUFFIX_RE, name):
+            return [], f"{where}.name must not end in glaeda or glaeda-<n> (it would read as a pool instance)"
+        if name in {d["name"] for d in out}:
+            return [], f"{where}.name {name} is declared twice"
+        if (repo is None) == (org is None):
+            return [], f"{where} needs exactly one of repo (owner/name) and org"
+        if repo is not None and not (isinstance(repo, str) and re.fullmatch(REPO_RE, repo)):
+            return [], f"{where}.repo must be owner/name"
+        if org is not None and not (isinstance(org, str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]*", org)):
+            return [], f"{where}.org must be an organization login"
+        if group is not None and (org is None or not isinstance(group, str) or not group.strip()):
+            return [], f"{where}.group goes with org"
+        labels = entry.get("labels")
+        if not (isinstance(labels, list) and labels and all(isinstance(x, str) and re.fullmatch(RUNNER_LABEL_RE, x)
+                                                            for x in labels)):
+            return [], f"{where}.labels must be a non-empty list of runner labels"
+        if len(set(labels)) != len(labels) or any(x.lower() in DEFAULT_LABELS for x in labels):
+            return [], (f"{where}.labels must be distinct and leave out {', '.join(DEFAULT_LABELS)}: a dedicated "
+                        "runner takes only the jobs that name its own labels")
+        if pools is None:
+            pools = {label.lower() for label in declared_pools(manifest)}
+        shared = sorted(x for x in labels if x.lower() in pools)
+        if shared:
+            return [], (f"{where}.labels must leave out the manifest's pool labels ({', '.join(shared)}): a pool job "
+                        "would land on the builder, outside pool capacity and reservations")
+        commands = {}
+        for key in ("admit", "watch"):
+            argv = entry.get(key)
+            if argv is None and key == "watch":
+                continue
+            if not (isinstance(argv, list) and argv and all(isinstance(w, str) and w and "\n" not in w and "\0" not in w
+                                                           for w in argv)
+                    and (argv[0].startswith("/") or argv[0].startswith("~/"))):
+                return [], f"{where}.{key} must be a command (a list of words, the first an absolute or ~/ path)"
+            commands[key] = list(argv)
+        env = entry.get("env", {})
+        if not (isinstance(env, dict) and all(isinstance(k, str) and re.fullmatch(ENV_NAME_RE, k) and isinstance(v, str)
+                                              and "\n" not in v and "\0" not in v for k, v in env.items())):
+            return [], f"{where}.env must map NAME to a one-line string"
+        keep = entry.get("keep", [])
+        if not (isinstance(keep, list) and all(isinstance(k, str) and k and "\n" not in k and "\0" not in k
+                                               and (k.startswith("~/") or k.startswith("{runnerDir}/"))
+                                               and ".." not in k.split("/") for k in keep)):
+            return [], (f"{where}.keep must list paths under ~/ or {{runnerDir}}/ (no ..): the warm state glaeda-disk "
+                        "keeps by role")
+        out.append({"name": name, "repo": repo, "org": org, "group": group, "labels": list(labels),
+                    "admit": commands["admit"], "watch": commands.get("watch"), "env": dict(env),
+                    "keep": list(keep)})
+    return out, None

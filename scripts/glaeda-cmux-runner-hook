@@ -461,6 +461,31 @@ GUEST_WAIT_S = 600.0  # guests have no rescue workflow: a full mini holds their 
 # job after it has entered runner setup, so the hook refuses after this short bounded wait; the owned-pool rescue
 # then re-runs it through placement, where an idle warm-cache mini (or the configured overflow) can take it.
 DEV_COMPILE_CAPACITY_WAIT_S = 60.0
+# The DEV daily publisher's Mac jobs (verify, the tip DMG) take 1.6 and 2.5 min p95 on Blacksmith, and their
+# timeout-minutes (15 and 20) count the wait inside "Set up runner". A full mini held tip-dmg-build there 19 min
+# (cmux run 40466210697, 2026-10-27) until GitHub timed it out and the DEV feed went stale. So every job of that
+# workflow waits DEV_COMPILE_CAPACITY_WAIT_S at most and is then refused; cmux's owned-pool rescue re-runs a refused
+# job, and attempt 2 takes Blacksmith. The bound, like the DEV compile's, is when the last try starts: one try can
+# wait ADMISSION_WAIT_S more for admission.lock, so the refusal comes within DEV_BOUND_WORST_S, far inside the 15
+# and 20 minute timeouts it protects.
+DEV_DAILY_WORKFLOW = "cmux-next-dev-daily.yml"
+# NEXT's nightly app build (nightly.yml build-nightly-app on a nightly-next push, attempt 1) is placed on an owned
+# label only while one of its runners is idle (cmux scripts/ci/nightly_build_runner.py), but an idle listener does
+# not mean free units. FEED_FIRST puts a nightly job first in line and preempts nothing, so it waits for running PR
+# jobs to end: on 2026-10-27 such builds sat in "Set up runner" with "0 of 14 units free" for minutes, and owned
+# builds' setup wait was 7.8 / 37.5 min p50 / p95. A feed may be at most 30 minutes behind its branch, and every
+# reservation falls back within minutes. So that job waits NIGHTLY_CAPACITY_WAIT_S at most and is then refused:
+# cmux's owned-pool rescue re-runs a refused nightly-next build, and attempt 2 takes the picker's moving Blacksmith
+# label. Like the DEV bound, it limits when the last try starts (NIGHTLY_BOUND_WORST_S).
+# Sized from the waits FEED_FIRST gives that job, not from Blacksmith at its best: the refusal's re-run waited about
+# 40 minutes when Blacksmith's macOS labels stalled (2026-10-27), and this hook cannot see the picker's stall verdict.
+# A 90 s bound refused builds that would have started a few minutes later: of 11 owned nightly-next builds
+# (2026-10-27 06:35-08:43Z) 10 were admitted within 5 minutes (p50 0.1, max 9.4 min). 5 minutes is also the most
+# that fits cmux's owned-pool rescue: it counts a setup failure as a refusal (and re-runs it off the fleet) only
+# within REFUSAL_SECONDS (360 s) of the job's start, and NIGHTLY_BOUND_WORST_S stays under that.
+NIGHTLY_CAPACITY_WAIT_S = 300.0
+NIGHTLY_APP_JOB = "build-nightly-app"
+NIGHTLY_NEXT_REF = "refs/heads/nightly-next"
 # CAPACITY_WAIT: an ordinary cmux job that finds its units or tokens taken waits for them, with no time limit,
 # instead of failing. The DEV cmux-next scheme compile is the bounded exception above: GitHub handed the job to
 # this runner and never moves it to another one, so a refusal only turned a
@@ -504,6 +529,20 @@ GUI_RESERVE_UNITS = 1
 # to the side label and Blacksmith, so the reservation never makes a job wait on it.
 FRESH_RESERVE_TOKEN = "fresh"
 FRESH_RESERVE_UNITS = max(JOB_CORES[("cmux-next.yml", job)] for job in ("cmux-scheme-compile", "release-compile"))
+# A reserving runner's gate keeps its reserve through its own job, lent to that job: the job's admission holder (the
+# detached process whose flocks are the job's units, take_capacity) also holds an flock on
+# capacity/<token>.reserve.lent, and while that flock is held the reserve keeps nothing (gui_reserved), since the job
+# holds those units itself. The flock dies with the holder, as the job's units go back, so the reserve is whole again
+# at that moment, with no gate poll in between and no pid to trust. Before, the gate let the reserve go once its job
+# was admitted and took it again on its first idle poll, seconds after job-completed released the units: a PR job
+# waiting here for units took them in that gap, so the slot found the mini full right after each job and held its
+# listener off (2026-10-27 05:07:50Z: "only 1 of 14 capacity units on this mini are free; its next job needs 4", 6 s
+# after a DEV compile ended), and a feed compile its listener took at once met a PR waiter ahead of it for units
+# instead of its own reserve (run 40452488452, refused at 05:06Z: "has waited longer here for units"). Like every file
+# in the ledger, any process of the runner user can take the flock; the ledger is cooperative between the jobs on one
+# mini, which can take unit flocks directly as well.
+RESERVE_LENT = ".lent"
+LEND_WAIT_S = 5.0  # an admission waits this long for the previous job's holder to let go of the lend
 UNITS_FULL = "capacity units on this mini"  # in mini_full's answers that are about units (Gate.reserves)
 
 
@@ -513,16 +552,27 @@ def reserve_units(name: str) -> int:
     return FRESH_RESERVE_UNITS if name == f"{FRESH_RESERVE_TOKEN}{GUI_RESERVE}" else GUI_RESERVE_UNITS
 
 
+def lent_file(reserve: Path) -> Path:
+    return reserve.with_name(reserve.name + RESERVE_LENT)
+
+
+def reserve_lent(reserve: Path) -> bool:
+    """Whether this reserve is lent to its runner's own admitted job: that job's holder holds <token>.reserve.lent
+    (RESERVE_LENT). Never raises: an unreadable file lends nothing."""
+    return not probe(lent_file(reserve))
+
+
 def gui_reserved(capacity_dir: Path, own_token: str | None = None) -> int:
     """The units this mini keeps for idle reserving runners: reserve_units() for each <token>.reserve an idle gui
-    runner's (or the freshness slot's) gate holds, except own_token's (a runner's own job takes its own reserve).
-    Never raises: an unreadable ledger reserves nothing."""
+    runner's (or the freshness slot's) gate holds, except own_token's (a runner's own job takes its own reserve) and
+    one lent to its runner's running job (RESERVE_LENT). Never raises: an unreadable ledger reserves nothing."""
     try:
         paths = sorted(capacity_dir.glob(f"*{GUI_RESERVE}"))
     except OSError:
         return 0
     own = f"{own_token}{GUI_RESERVE}" if own_token is not None else None
-    return sum(reserve_units(path.name) for path in paths if path.name != own and not probe(path))
+    return sum(reserve_units(path.name) for path in paths
+               if path.name != own and not probe(path) and not reserve_lent(path))
 
 
 def reserve_for(reserved: int, units: int, total: int) -> int:
@@ -562,11 +612,15 @@ def dev_compile_capacity_wait(repo: str | None, home_repo: str, event_name: str 
     """The bounded capacity wait for cmux NEXT's DEV compile, or None for ordinary jobs.
 
     A push to feat-cmux-next runs the DEV Release product in ``cmux-scheme-compile``. A DEV daily
-    workflow_dispatch carries ``inputs.dev_daily=true``. Once either job has been claimed by a runner,
+    workflow_dispatch carries ``inputs.dev_daily=true``. Every job of DEV_DAILY_WORKFLOW (the publisher's verify
+    and tip DMG jobs, whose short timeouts count this wait) is bounded too. Once a job has been claimed by a runner,
     waiting longer only strands it on one mini; a refusal lets the owned-pool rescue run placement again.
     """
-    if repo is None or repo.lower() != home_repo.lower() or workflow != "cmux-next.yml" \
-            or job != "cmux-scheme-compile":
+    if repo is None or repo.lower() != home_repo.lower():
+        return None
+    if workflow == DEV_DAILY_WORKFLOW:
+        return DEV_COMPILE_CAPACITY_WAIT_S
+    if workflow != "cmux-next.yml" or job != "cmux-scheme-compile":
         return None
     if event_name == "push" and ref == "refs/heads/feat-cmux-next":
         return DEV_COMPILE_CAPACITY_WAIT_S
@@ -575,6 +629,24 @@ def dev_compile_capacity_wait(repo: str | None, home_repo: str, event_name: str 
         if isinstance(inputs, dict) and str(inputs.get("dev_daily", "")).lower() == "true":
             return DEV_COMPILE_CAPACITY_WAIT_S
     return None
+
+
+def nightly_capacity_wait(tier: str, event_name: str | None, ref: str | None, job: str | None, workflow: str,
+                          attempt: str | None) -> float | None:
+    """NIGHTLY_CAPACITY_WAIT_S for NEXT's nightly app build on a nightly-next push's attempt 1 (the push the owned-pool
+    rescue re-runs, onto Blacksmith), else None. `tier` is job_tier()'s answer, so only merged nightly.yml code on
+    nightly-next's own ref qualifies; a dispatch or schedule there, which the rescue does not watch, keeps its wait."""
+    if (tier != TIER_NIGHTLY or event_name != "push" or ref != NIGHTLY_NEXT_REF or job != NIGHTLY_APP_JOB
+            or workflow != "nightly.yml"):
+        return None
+    return NIGHTLY_CAPACITY_WAIT_S if attempt == "1" else None
+
+
+def bounded_wait(cap: float | None, bound: float | None) -> float | None:
+    """The shorter of an explicit wait (`cap`, None for no limit) and a job's own bound (None for none)."""
+    if bound is None:
+        return cap
+    return bound if cap is None else min(cap, bound)
 
 
 def slot_capacity_wait(cap: float | None, dev_compile_runner: bool) -> float | None:
@@ -976,6 +1048,10 @@ def export_root(name: str) -> str:
             pass
     return f"{CANONICAL_ROOT_ENV}={path} via {'+'.join(wrote) or 'nothing (no GITHUB_ENV or RUNNER_TEMP)'}"
 ADMISSION_WAIT_S = 30.0  # admissions are serialized briefly so two jobs never split the free units
+# A DEV-bounded job's worst wait before its refusal (DEV_DAILY_WORKFLOW's comment).
+DEV_BOUND_WORST_S = DEV_COMPILE_CAPACITY_WAIT_S + ADMISSION_WAIT_S + ADMIT_POLL_S
+# The nightly-next app build's worst wait before its refusal (NIGHTLY_CAPACITY_WAIT_S's comment).
+NIGHTLY_BOUND_WORST_S = NIGHTLY_CAPACITY_WAIT_S + ADMISSION_WAIT_S + ADMIT_POLL_S
 # The listener gate reads its runner's --capacity-units from the job-started hook glaeda-cmux-runner wrote.
 RUNNER_HOOK_SCRIPT = "glaeda-hooks/job-started.sh"
 LISTEN_SCRIPT = "glaeda-hooks/listen.sh"
@@ -1094,6 +1170,7 @@ GATE_ELIGIBLE_RECHECK_S = 30.0
 GATE_INELIGIBLE_ENV = "GLAEDA_RUNNER_GATE_INELIGIBLE"
 # Across a reload: "clean" when this gate started its listener with listener_env, else why its env is stale.
 GATE_LISTENER_ENV = "GLAEDA_RUNNER_GATE_LISTENER_ENV"
+GATE_RESERVE_FD_ENV = "GLAEDA_RUNNER_GATE_RESERVE_FD"  # a reload hands its reserve flock's fd to the new gate
 
 
 def _repo_name(repo: Any) -> str | None:
@@ -1248,12 +1325,33 @@ def dev_compile_refusal(event_name: str | None, ref: str | None, repository: str
 # 13+ min in this hook on a side runner behind a fast-tier, a generated-files and a swift test job that had arrived
 # first, and at 04:47Z, the oldest waiter, it still waited with 3 of 14 units free, because the fresh reserve (4) and a
 # gui reserve (1) made its 4 units need 9 free.
+# NIGHTLY_SLOT: FEED_FIRST orders the jobs a mini's runners already took, but GitHub hands a queued job to the next
+# idle runner in arrival order, so a nightly job queued on a side label waited behind every PR job queued there before
+# it, and none of it reached this hook (2026-10-27 14:08Z: a nightly-next build-nightly-app on the light side label
+# was never acquired by a runner while every side runner ran PR jobs, and its re-run then queued on Blacksmith). The
+# nightly slot (glaeda-cmux-runner --nightly-runner, the manifest's runner.nightlySlot) is one instance per mini with
+# its own label, glaeda-nightly-<class>-xcode-<version>, that no PR job asks for. It admits only nightly-tier jobs
+# (nightly_slot_refusal), and its gate listens however full the mini is (CPU saturation and units hold it no more than
+# they hold the freshness slot), so GitHub hands it the nightly job at once. Its job then waits here first in line:
+# ahead of every other waiter, no other admission takes a unit and every other runner's gate on the mini holds while it
+# waits (mini_full), and it keeps no reserve, so it takes the next units that free up. Disk, a fleet build's host
+# claim, eligibility and heat still hold it. Leo, 2026-10-27: "a waiting nightly, promote or nightly sign/verify job is
+# admitted on a mini ahead of every PR, DEV and side job and may use any reserve, and no new PR job starts on a mini
+# where a nightly job waits."
 NIGHTLY_REFS = ("refs/heads/nightly-next", "refs/heads/main")
 NIGHTLY_EVENTS = ("push", "schedule", "workflow_dispatch")
 NIGHTLY_WORKFLOW = "manaflow-ai/cmux/.github/workflows/nightly.yml"
 PROMOTE_COMPILE = "release-compile"  # cmux-next.yml's, on a feat-cmux-next push: nightly-next's promote gate
 TIER_NIGHTLY, TIER_DEV = "nightly", "dev"
 FEED_JUMP_S = 20 * 60.0
+
+
+def nightly_slot_refusal(tier: str) -> str | None:
+    """Why the nightly slot refuses a job of this job_tier(), or None: it takes only nightly jobs (NIGHTLY_SLOT)."""
+    if tier == TIER_NIGHTLY:
+        return None
+    return ("the nightly slot admits only nightly jobs (nightly.yml on nightly-next or main, and the Release compile "
+            "that gates nightly-next's promotion)")
 
 
 def job_tier(event_name: str | None, ref: str | None, repository: str | None, event: Any,
@@ -2338,6 +2436,49 @@ def unsparse_workspace(workspace: str | None) -> str:
     return f"reset the workspace {ws} an earlier job left {why} (checkout rebuilds it whole)"
 
 
+# glaeda-disk --own-runner-checkout removes the starting job's own workspace .git when it is bloated against the same
+# repository's checkouts on the other runners (a full-history fetch left 7-8 GiB of packs in one runner's checkout
+# on every mini, 2026-10-27), since a runner that takes job after job is never quiet long enough for the disk pass.
+# Started only when the workspace's packs pass glaeda-disk's RUNNER_CHECKOUT_BLOAT_MIN_GIB, so an ordinary job pays
+# one directory listing.
+OWN_CHECKOUT_MIN_GIB = 2.0
+OWN_CHECKOUT_TIMEOUT_S = 90.0
+
+
+def evict_own_checkout(workspace: str | None, explicit: str | None, timeout: float = OWN_CHECKOUT_TIMEOUT_S) -> str:
+    """glaeda-disk's note on the job's own bloated workspace checkout, or "". Never raises."""
+    try:
+        if not workspace:
+            return ""
+        total = 0
+        with os.scandir(Path(workspace) / ".git" / "objects" / "pack") as it:
+            for e in it:
+                if e.name.endswith(".pack") and e.is_file(follow_symlinks=False):
+                    total += e.stat(follow_symlinks=False).st_size
+        if total <= OWN_CHECKOUT_MIN_GIB * 1024**3:
+            return ""
+        disk = find_disk(explicit)
+        if disk is None:
+            return ""
+        proc = subprocess.Popen([sys.executable, disk, "--own-runner-checkout"], stdin=subprocess.DEVNULL,
+                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, cwd="/",
+                                start_new_session=True)
+        try:
+            out, _ = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            with contextlib.suppress(OSError):
+                os.killpg(proc.pid, signal.SIGKILL)  # glaeda-disk and every git, lsof and ps it started
+            with contextlib.suppress(Exception):
+                proc.communicate(timeout=5)
+            return f"own checkout eviction timed out after {timeout:g} s"
+        with contextlib.suppress(OSError):  # what glaeda-disk left behind (a git transport a timeout orphaned)
+            os.killpg(proc.pid, signal.SIGKILL)
+        lines = (out or "").strip().splitlines()
+        return lines[-1] if lines else ""
+    except Exception:  # noqa: BLE001  (never fail the job on housekeeping)
+        return ""
+
+
 def workspace_damage(ws: Path) -> str:
     """Why the reused workspace cannot take a plain checkout, or "". A failed checkout (glaeda-2, three
     cmux-tui runs on 2026-10-12) leaves skip-worktree entries with no sparse setting, or tracked files that
@@ -3164,8 +3305,8 @@ def admission_waiters(capacity_dir: Path, skip_pid: int = 0) -> list[dict[str, A
             if not math.isfinite(since):  # an infinite or NaN since would break the one total order
                 continue
             wants = [str(kind) for kind in data.get("wants") or [] if isinstance(kind, str)]
-        except (OSError, ValueError, TypeError, KeyError, AttributeError):
-            continue
+        except (OSError, ValueError, TypeError, KeyError, AttributeError, OverflowError):
+            continue  # OverflowError: a since too large for a float (an integer past 1e308)
         tier = data.get("tier") if data.get("tier") in (TIER_NIGHTLY, TIER_DEV) else ""
         waiters.append({"pid": pid, "since": since, "wants": wants, "who": str(data.get("who") or "")[:200],
                         "tier": tier})
@@ -3181,18 +3322,20 @@ def admission_rank(tier: str, since: float, pid: int, now: float) -> tuple[int, 
 
 
 def fair_turn(capacity_dir: Path, needs: set[str], since: float, tier: str = "",
-              takes_units: bool = False) -> str | None:
+              takes_units: bool = False, new_job: bool = False) -> str | None:
     """Why an admission needing these kinds (tokens and "units") must wait behind a waiter ahead of it, or None.
     Ahead is older, except across tiers (FEED_FIRST, admission_rank). A waiting nightly job also stops every other
-    admission that takes a unit (takes_units), one the reserve its own gate holds would cover too."""
+    admission that takes a unit (takes_units), one the reserve its own gate holds would cover too, and every new job
+    of another tier (new_job: job-started), the fast tier on its own fast tokens too: no new PR job starts on a mini
+    where a nightly job waits. A ci-step lease inside a running job is not a new job, so it never waits on one."""
     now = time.time()
     mine = admission_rank(tier, since, os.getpid(), now)
     for waiter in admission_waiters(capacity_dir, os.getpid()):
         if admission_rank(waiter["tier"], waiter["since"], waiter["pid"], now) >= mine:
             continue
         shared = needs & set(waiter["wants"])
-        if waiter["tier"] == TIER_NIGHTLY and takes_units:  # a later nightly job too: arrival order among them
-            shared.add("units")
+        if waiter["tier"] == TIER_NIGHTLY and (takes_units or (new_job and tier != TIER_NIGHTLY)):
+            shared.add("units")  # a later nightly job too: arrival order among them
         if shared:
             who = waiter["who"] or "pid " + str(waiter["pid"])
             if (waiter["since"], waiter["pid"]) > (since, os.getpid()) or waiter["tier"] == TIER_NIGHTLY != tier:
@@ -3266,7 +3409,8 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
                   owned_state_dir: str = "", taken_out: dict[str, Any] | None = None,
                   warm_target: tuple[Any, ...] = ("", None, 0), klass: str | None = None,
                   one_holder: bool = False, since: float | None = None, gui_token: str = "gui",
-                  gui_runner: bool = False, fresh_runner: bool = False, tier: str = "") -> tuple[bool, str]:
+                  gui_runner: bool = False, fresh_runner: bool = False, tier: str = "",
+                  new_job: bool = False) -> tuple[bool, str]:
     """Weighted admission for one of several runners on this mini, without ever waiting on a job.
     When held, taken_out (if given) receives the units and tokens taken, for the job log; on a capacity refusal it
     receives "wants", the kinds a waiter marker names (CAPACITY_WAIT): the token kind or "units" it lacks, else
@@ -3326,7 +3470,7 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
         in_reserve = (own_reserve is not None and 0 < units <= reserve_units(f"{own_reserve}{GUI_RESERVE}")
                       and not probe(capacity_dir / f"{own_reserve}{GUI_RESERVE}"))
         needs = {*tokens, *(("units",) if units and not in_reserve else ())}
-        behind = fair_turn(capacity_dir, needs, time.time() if since is None else since, tier, units > 0)
+        behind = fair_turn(capacity_dir, needs, time.time() if since is None else since, tier, units > 0, new_job)
         if behind:
             # a waiter behind another names every kind it needs, units too: a newcomer that fits must not take the
             # units it waits for in the poll between the waiter ahead being admitted and this one's next try
@@ -3409,12 +3553,25 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
                 return False, f"capacity: {held} ({job or 'unknown job'} is {klass})"
         # every job but a reserving runner's own leaves the idle reserves free (GUI_RESERVE, FRESH_RESERVE_TOKEN); a
         # nightly job keeps none (FEED_FIRST)
-        kept = 0 if tier == TIER_NIGHTLY else reserve_for(gui_reserved(capacity_dir, own_reserve), units, total)
+        def kept_now() -> int:
+            return 0 if tier == TIER_NIGHTLY else reserve_for(gui_reserved(capacity_dir, own_reserve), units, total)
+
+        kept = kept_now()
+        lent: int | None = None
+        if own_reserve is not None and units > 0:
+            # the reserving runner's own job: its holder lends the reserve (RESERVE_LENT) for as long as it lives. Taken
+            # before the units and let go before them (hold's close_first), so the lend never outlives the job's units.
+            # The previous job's holder may still be letting go: wait for it briefly. One not taken leaves the reserve
+            # counted beside this job, which keeps more units from the other lanes, never fewer.
+            lend_until = time.monotonic() + LEND_WAIT_S
+            while (lent := lock_file(lent_file(capacity_dir / f"{own_reserve}{GUI_RESERVE}"), fcntl.LOCK_EX)) is None \
+                    and time.monotonic() < lend_until:
+                time.sleep(0.1)
+            if lent is not None:
+                fds.append(lent)
         got = spare = 0
         unit_fds: list[int] = []
         for slot in range(total):
-            if got == units and spare >= kept:
-                break
             fd = lock_file(capacity_dir / f"unit-{slot}", fcntl.LOCK_EX)
             if fd is None:
                 continue
@@ -3425,6 +3582,9 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
             else:  # free beside this job's units: one the reserve keeps (under admission.lock, so it stays free)
                 os.close(fd)
                 spare += 1
+        # a lend that ended during the scan (its holder let the job's units go) makes the reserve whole again: the
+        # larger of the two looks, so units freed by that holder are never counted as spare beside a kept-at-0 reserve
+        kept = max(kept, kept_now())
         if got < units or spare < kept:
             if taken_out is not None:
                 taken_out["wants"] = ["units"]
@@ -3434,8 +3594,11 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
         split = named[root] if root and klass in ROOT_SWITCHERS else None
         if split is not None:  # its own holder (ROOT_SWITCHERS); the main holder must not inherit it
             fds.remove(split)
+        # a lent reserve covers the job's whole admission: its units are never released early (the sampler's
+        # dynamic release), else the reserve would stay lent while the units it stands for went to other jobs
         held, note = hold(fds, watch_pid, state_dir, drop=(admission,) if split is None else (admission, split),
-                          release_fds=unit_fds)
+                          release_fds=[] if own_reserve is not None and units > 0 else unit_fds,
+                          close_first=(lent,) if lent is not None else ())
         fds = [] if split is None else [split]  # the holder has them now, or hold closed them
         if held and split is not None:
             held, why = hold(fds, watch_pid, state_dir, drop=(admission,), pid_file=root_holder_file(state_dir, root),
@@ -3464,12 +3627,15 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
 
 
 def hold(fds: list[int], watch: int | JobOwner, state_dir: Path, drop: tuple[int, ...] = (),
-         pid_file: Path | None = None, release_fds: list[int] | None = None) -> tuple[bool, str]:
+         pid_file: Path | None = None, release_fds: list[int] | None = None,
+         close_first: tuple[int, ...] = ()) -> tuple[bool, str]:
     """Hand the locked fds to a detached holder that keeps them until job-completed or the job's owner exits.
     watch is the owner job-started pinned (JobOwner), or a pid a step resolved just now (take-root, take-gui).
     Closes this process's copies either way. The holder closes `drop` (locks that must not outlive the
     admission). Succeeds only once the holder reports its own pid. pid_file defaults to the runner's
-    holder file; take-root passes its own so a second holder for the same job lives beside it."""
+    holder file; take-root passes its own so a second holder for the same job lives beside it. close_first (fds
+    among fds) are let go before every other lock when the holder ends (the reserve's lend, RESERVE_LENT, so no
+    reader sees the job's units free while the reserve still counts as lent)."""
     owner = watch if isinstance(watch, JobOwner) else JobOwner.of(watch)
     if owner is None:
         close_all(fds)
@@ -3535,6 +3701,7 @@ def hold(fds: list[int], watch: int | JobOwner, state_dir: Path, drop: tuple[int
                         pass
                 time.sleep(HOLDER_POLL_S)
         finally:
+            close_all(list(close_first))
             for leftover in ("releasing", "pid_file"):  # still ours: released, or the job died first
                 with contextlib.suppress(Exception):
                     path = releasing if leftover == "releasing" else pid_file
@@ -3750,6 +3917,8 @@ class RunnerScope(NamedTuple):
     fast: bool = False
     session: bool = False
     fresh: bool = False
+    dedicated: bool = False
+    nightly: bool = False
 
 
 def reserve_token(scope: RunnerScope | None) -> str | None:
@@ -3769,6 +3938,22 @@ def listen_fit_units(runner_dir: Path) -> int:
     except (OSError, UnicodeDecodeError):
         return 1
     return int(match.group(1)) if match else 1
+
+
+DEDICATED_ADMIT_TIMEOUT_S = 600
+
+
+def dedicated_admission(script: Path) -> tuple[bool, str]:
+    """(admitted, note) from a dedicated runner's own admission script, run with the job's environment and output.
+    It holds nothing of glaeda's (no host lock, capacity or root), so the runners beside it never wait for it."""
+    try:
+        code = subprocess.run([os.fspath(script)], stdin=subprocess.DEVNULL, timeout=DEDICATED_ADMIT_TIMEOUT_S,
+                              check=False).returncode
+    except (OSError, subprocess.TimeoutExpired) as error:
+        return False, f"the dedicated runner's admission {script.name} could not run ({type(error).__name__})"
+    if code != 0:
+        return False, f"the dedicated runner's admission {script.name} refused the job (exit {code})"
+    return True, "dedicated runner: admitted by its own admission, no host lock or capacity taken"
 
 
 def runner_scope(runner_dir: Path) -> RunnerScope:
@@ -3792,10 +3977,13 @@ def runner_scope(runner_dir: Path) -> RunnerScope:
     fresh = re.search(r"\s--dev-compile-runner(?:\s|$)", text) is not None and not fast and not session and not gui
     gui_match = re.search(r"\s--gui-token\s+([A-Za-z0-9._-]+)(?:\s|$)", text)
     gui_token = gui_match.group(1) if gui_match else "gui"
+    dedicated = re.search(r"\s--dedicated-admit\s", text) is not None
+    nightly = (re.search(r"\s--nightly-runner(?:\s|$)", text) is not None
+               and not fast and not session and not gui and not fresh and not dedicated)
     return RunnerScope(flag("capacity-units", 0), max(1, flag("compile-slots", 1)), roots,
-                       instance < roots and not gui and not fast and not session, gui,
-                       runner_floor_gib(min_free_gib(text), gui or session), gui_token,
-                       fast, session, fresh)
+                       instance < roots and not gui and not fast and not session and not dedicated and not nightly,
+                       gui, runner_floor_gib(min_free_gib(text), gui or session), gui_token,
+                       fast, session, fresh, dedicated, nightly)
 
 
 def eligibility_scope(runner_dir: Path) -> tuple[str, str | None] | None:
@@ -3936,6 +4124,8 @@ def mini_full(capacity_dir: Path | None, total: int, scope: RunnerScope | None =
         if scope is not None and scope.fast:
             for waiter in admission_waiters(capacity_dir):
                 shared = set(FAST_TOKENS) & set(waiter["wants"])
+                if waiter["tier"] == TIER_NIGHTLY:  # no new job starts while a nightly job waits (FEED_FIRST)
+                    shared.add("units")
                 if shared:
                     return f"{waiter['who'] or 'a job'} waits here for {', '.join(sorted(shared))}"
             for name in FAST_TOKENS:
@@ -4500,6 +4690,8 @@ class Gate:
         self.disk_evicted_at = -GATE_DISK_EVICT_EVERY_S  # when the last eviction under the floor started
         # the eviction under way: the detached glaeda-disk, when it started and the free GiB before it
         self.evicting: tuple[subprocess.Popen[bytes], float, float | None] | None = None
+        # under the floor while another glaeda-disk pass runs: when the gate began waiting for it (monotonic)
+        self.disk_waiting_since: float | None = None
         self.watching: tuple[int, ...] = ()
         self.fast_until = 0.0
         self.listening_since: float | None = None  # when start() last started run.sh (GATE_FIRST_POLL_S)
@@ -4547,16 +4739,28 @@ class Gate:
             os.environ[GATE_INELIGIBLE_ENV] = self.eligible_why
         if self.child is not None:
             os.environ[GATE_LISTENER_ENV] = self.stale_env or "clean"
+        if self.reserve_fd is not None:  # the flock stays held across the exec: no admission sees the reserve free
+            with contextlib.suppress(OSError):
+                os.set_inheritable(self.reserve_fd, True)
+                os.environ[GATE_RESERVE_FD_ENV] = str(self.reserve_fd)
         try:
             os.execv(sys.executable, [sys.executable, *argv])
         except OSError:
             os.environ.pop(GATE_LISTENING_SINCE_ENV, None)
             os.environ.pop(GATE_INELIGIBLE_ENV, None)
             os.environ.pop(GATE_LISTENER_ENV, None)
+            os.environ.pop(GATE_RESERVE_FD_ENV, None)
+            if self.reserve_fd is not None:
+                with contextlib.suppress(OSError):
+                    os.set_inheritable(self.reserve_fd, False)
             signal.pthread_sigmask(signal.SIG_UNBLOCK, blocked)
             gate_log("the reload failed; keeping this gate")
 
     def claimed(self) -> str | None:
+        if runner_scope(self.runner_dir).dedicated:
+            # a dedicated builder (a nightly or archive build) is not a pool runner: fleet builds, reservations,
+            # load and heat never hold it off, only what would fail its job here (disk, a missing Rust toolchain)
+            return self.low_disk() or self.dedicated_toolchain()
         why = host_held(self.host_lock, self.reservation, time.time(), self.state_dir)
         if why is None and self.waiters and time.monotonic() - self.waiting_at >= GATE_WAITER_EVERY_S:
             self.waiting, self.waiting_at = host_waiters(self.host_lock, self.state_dir), time.monotonic()
@@ -4602,7 +4806,7 @@ class Gate:
         runs slower beats one that waits 30+ minutes for a mini to cool."""
         now = time.monotonic()
         scope = runner_scope(self.runner_dir)
-        if scope.gui or scope.fresh:
+        if scope.gui or scope.fresh or scope.nightly:
             self.cpu_busy = None
         elif now - self.cpu_at >= GATE_CPU_EVERY_S:
             _, self.cpu_busy = host_io()
@@ -4647,6 +4851,8 @@ class Gate:
     def confirmed(self) -> str | None:
         """A fresh reading right before a stop: the holder still holds, or a waiter seen at least one poll ago
         is still waiting (a job-started in flight, which lsof also lists, is gone by then)."""
+        if runner_scope(self.runner_dir).dedicated:
+            return self.claimed()
         why = host_held(self.host_lock, self.reservation, time.time(), self.state_dir)
         if why is None and self.waiting:
             again = self.waiting & host_waiters(self.host_lock, self.state_dir)
@@ -4672,7 +4878,10 @@ class Gate:
         return f"a fleet build is waiting for the host (pid {min(again)})"
 
     def still_reserved(self) -> str | None:
-        """The host's reservation, read afresh (one small file): why it holds the host, or None."""
+        """The host's reservation, read afresh (one small file): why it holds the host, or None. A dedicated runner
+        never yields to one (claimed)."""
+        if runner_scope(self.runner_dir).dedicated:
+            return None
         return reservation_refusal(self.reservation, time.time()) if self.reservation else None
 
     def low_disk(self) -> str | None:
@@ -4711,10 +4920,27 @@ class Gate:
     def evict_in_background(self, path: str, floor: float) -> None:
         """Start a detached glaeda-disk --pressure run for the floor (disk_argv) unless one is under way or one
         started within GATE_DISK_EVICT_EVERY_S. It stays in the gate's process group, so launchd's cleanup covers
-        it; reap_eviction reads it on later polls, so no poll waits on it."""
+        it; reap_eviction reads it on later polls, so no poll waits on it.
+        While another pass is freeing space (pass_active: the queued pass, its trigger, or any evict.lock holder) it
+        waits for that one, as evict() does with wait_for_running_pass, instead of starting a run that would only skip
+        as eviction_busy (cmux13s, 2026-10-26..27: 145 of 219 busy skips were the gate's). It leaves one trigger in the
+        queue, so the running pass does a follow-up for this floor, and checks again on every poll; once no pass runs,
+        or after GATE_DISK_EVICT_EVERY_S of waiting (a stale trigger), it runs its own as before."""
         now = time.monotonic()
         if self.evicting is not None or now - self.disk_evicted_at < GATE_DISK_EVICT_EVERY_S:
             return
+        if self.disk_waiting_since is None or now - self.disk_waiting_since < GATE_DISK_EVICT_EVERY_S:
+            try:
+                active = pass_active()
+            except OSError:
+                active = False
+            if active:
+                if self.disk_waiting_since is None:
+                    self.disk_waiting_since = now
+                    gate_log(f"under the {floor:g} GiB disk floor: a glaeda-disk pass is running; waiting for it "
+                             f"({disk_pressure_detached(None)})")
+                return
+        self.disk_waiting_since = None
         self.disk_evicted_at = now
         argv = disk_argv(None, floor)
         if argv is None:
@@ -4758,6 +4984,14 @@ class Gate:
         if fresh or time.monotonic() - self.console_at >= GATE_CONSOLE_EVERY_S:
             self.console_why, self.console_at = console_refusal(), time.monotonic()
         return self.console_why
+
+    def dedicated_toolchain(self) -> str | None:
+        """toolchain_missing for a dedicated runner, every poll, logged when it changes (glaeda #1640)."""
+        missing = toolchain_missing()
+        if missing != self.missing_why:
+            gate_log(f"{missing}; held off until the toolchain is back" if missing else "the Rust toolchain is back")
+            self.missing_why = missing
+        return f"ineligible: {missing}" if missing else None
 
     def ineligible(self) -> str | None:
         """For a --require-eligible runner: why job-started would refuse every job for eligibility (GATE_ELIGIBLE_EVERY_S),
@@ -4811,6 +5045,9 @@ class Gate:
         answer, so a full mini's retrying admissions never read as free and restart a listener; the fresh
         look right before a stop (confirmed()) stops only on a reading of its own."""
         scope = runner_scope(self.runner_dir)
+        if scope.nightly:  # NIGHTLY_SLOT: its one job shape goes first here, so it listens on a full mini
+            self.full_why = None
+            return None
         why = mini_full(self.capacity_dir, scope.units, scope, max(self.fit_units, listen_fit_units(self.runner_dir)))
         if isinstance(why, Unknown):
             return None if fresh else self.full_why
@@ -4820,21 +5057,60 @@ class Gate:
     def reserve(self, want: bool) -> None:
         """Hold or let go of this gui runner's reserve (GUI_RESERVE: capacity/<gui token>.reserve), which keeps
         GUI_RESERVE_UNITS units from every other job and runner on the mini. step() holds it while the runner is
-        idle and reserves() agrees, keeps it through a new job's admission, and lets it go once that job is
-        admitted (admitted()). Only a gui runner with a capacity ledger reserves. The flock is the gate's own fd (not inherited by run.sh, closed by a reload's exec, which
-        takes it again on its next poll), so a gate that dies reserves nothing. Never raises: a reserve it cannot
+        idle and reserves() agrees, and keeps it through the runner's own job, which its admission holder lends
+        (RESERVE_LENT), so it is whole again the moment that job's units go back. Only a gui runner with a capacity
+        ledger reserves. The flock is the gate's own fd (not inherited by run.sh; a reload hands it to the new gate,
+        adopt_reserve), so a gate that dies reserves nothing. Never raises: a reserve it cannot
         take is tried again on the next poll."""
         if want and self.reserve_fd is None:
-            scope = runner_scope(self.runner_dir)
-            token = reserve_token(scope)
-            if token is None or scope.units <= 0 or self.capacity_dir is None or not self.capacity_dir.is_dir():
+            path = self.reserve_path()
+            if path is None:
                 return
             with contextlib.suppress(OSError):
-                self.reserve_fd = lock_file(self.capacity_dir / f"{token}{GUI_RESERVE}", fcntl.LOCK_EX)
+                self.reserve_fd = lock_file(path, fcntl.LOCK_EX)
         elif not want and self.reserve_fd is not None:
             with contextlib.suppress(OSError):
                 os.close(self.reserve_fd)
             self.reserve_fd = None
+
+    def adopt_reserve(self, handed: str | None) -> None:
+        """Take over the reserve flock the gate before a reload held (GATE_RESERVE_FD_ENV), so the reserve is never
+        free across the exec. Only an fd open on this runner's own <token>.reserve is kept; anything else is closed
+        if it was a number, and ignored otherwise. Never raises."""
+        try:
+            fd = int(handed or "")
+        except ValueError:
+            return
+        if fd < 3:
+            return
+        path = self.reserve_path()
+        try:
+            same = path is not None and os.path.samestat(os.fstat(fd), os.stat(path, follow_symlinks=False))
+        except OSError:
+            same = False
+        if not same:
+            with contextlib.suppress(OSError):
+                os.close(fd)
+            return
+        with contextlib.suppress(OSError):
+            os.set_inheritable(fd, False)
+        self.reserve_fd = fd
+
+    def reserve_path(self) -> Path | None:
+        """This runner's capacity/<token>.reserve, or None when it reserves nothing (reserve())."""
+        scope = runner_scope(self.runner_dir)
+        token = reserve_token(scope)
+        if token is None or scope.units <= 0 or self.capacity_dir is None or not self.capacity_dir.is_dir():
+            return None
+        return self.capacity_dir / f"{token}{GUI_RESERVE}"
+
+    def keeps_reserve(self, why: str | None) -> bool:
+        """reserves(why), except that a held reserve is never let go once a job has arrived meanwhile: claimed() can
+        read the runner's own new job (its gui token, its units) as a reason to hold off, and a reserve dropped then
+        stays dropped through that job, reopening the gap at its end (review of glaeda#1651)."""
+        if self.reserves(why):
+            return True
+        return self.reserve_fd is not None and self.busy()
 
     def reserves(self, why: str | None) -> bool:
         """Whether an idle gui runner keeps its reserve, given claimed()'s answer: only while nothing holds it or
@@ -4842,19 +5118,6 @@ class Gate:
         pressure, a locked console, the gui token or the canonical roots, it could take no job, so the unit would
         only sit idle."""
         return (why is None or (why == self.full_why and UNITS_FULL in why)) and self.locked() is None
-
-    def admitted(self) -> bool:
-        """Whether this runner's job holds its admission: the holder job-started leaves (holder_file, named for the
-        runner in its .runner file) is alive. Until then a busy gui runner keeps its reserve, so a job waiting here
-        for units cannot take the reserved unit in the seconds between the listener taking the job and its
-        job-started admitting it. Unreadable counts as admitted: the reserve goes back, as before it existed."""
-        try:
-            name = json.loads((self.runner_dir / ".runner").read_text(encoding="utf-8-sig")).get("agentName")
-        except (OSError, ValueError, AttributeError):
-            return True
-        if not isinstance(name, str) or not name:
-            return True
-        return holder_alive(holder_file(self.state_dir, name))
 
     def tree(self) -> tuple[list[int], dict[int, tuple[int, str]]]:
         table = processes()
@@ -5070,16 +5333,25 @@ class Gate:
                     self.fast_until = time.monotonic() + 5.0
                 self.streak = 0  # a claim must hold for two idle polls, not carry over from the job
                 self.load_since = None  # the hold limit times a pause, never a job
-                if self.reserve_fd is not None and self.admitted():
-                    self.reserve(False)  # its job has its units: the reserve goes back to the other lanes
+                # the reserve stays held through the runner's own job: its admission lends it (RESERVE_LENT), so it
+                # keeps nothing while that job holds its units and is whole the moment they go back. One the job could
+                # not borrow keeps its units from the other lanes meanwhile, the safe side.
+                if self.reserve_fd is None and self.locked() is None:
+                    # one let go at an idle look a job then beat, or a reload's: a job of its own always gets it
+                    # back, read from nothing but the job itself, so no state is lost across a reload
+                    self.reserve(True)
                 return None
             why = self.claimed()
-            self.reserve(self.reserves(why))
+            if self.reserves(why):
+                self.reserve(True)
             self.streak = self.streak + 1 if why else 0
             if why and self.streak >= GATE_CONFIRM and not self.first_poll(why):
                 why = self.confirmed()
                 if why and not self.busy():  # the fresh look and the busy check right before the signal
                     self.stop(why)
+            # let go only after the last look (confirmed() included), and never with a job of its own arrived
+            # (keeps_reserve); a job that beats even this busy() check gets it back on its first busy poll
+            self.reserve(self.keeps_reserve(why))
             return None
         if self.terminating:
             return 0
@@ -5088,7 +5360,7 @@ class Gate:
             self.reserve(False)  # a runner GitHub no longer knows takes no job: it keeps no units from the others
             return None
         why = self.claimed()
-        self.reserve(self.reserves(why))
+        self.reserve(self.keeps_reserve(why))
         if why:
             if why != self.held:
                 gate_log(f"holding the listener off: {why}")
@@ -5170,6 +5442,7 @@ class Gate:
 def listen(runner_dir: Path, host_lock: str, reservation: str, state_dir: Path, waiters: bool,
            adopt: int = 0, capacity_dir: Path | None = None, fit_units: int = 1) -> int:
     gate = Gate(runner_dir, host_lock, reservation, state_dir, waiters, capacity_dir, fit_units)
+    gate.adopt_reserve(os.environ.pop(GATE_RESERVE_FD_ENV, None))
     marker = os.environ.pop(GATE_LISTENER_ENV, None)
     xcode = runner_xcode(runner_dir)
     if adopt:
@@ -5280,10 +5553,11 @@ def sampler_file(state_dir: Path) -> Path:
     return state_dir / main.name.replace(HOLDER_FILE, SAMPLER_FILE, 1)
 
 
-def ps_rows() -> list[tuple[int, int, float, str, str]]:
+def ps_rows(rss: dict[int, int] | None = None) -> list[tuple[int, int, float, str, str]]:
     """(pid, ppid, %cpu, user, name) for every process. The name is the kernel's executable name (ucomm), not
     argv[0], so a process title can never carry arguments into the record; Runner.Worker keeps its argv[0]
-    because its runner directory is the only thing read from it."""
+    because its runner directory is the only thing read from it. With rss, the same ps pass also fills it with
+    each process's resident set size in KiB (ps's rss column, on macOS and Linux alike)."""
     def run(fields: str) -> str:
         return subprocess.run([PS, "-Ao", fields], stdin=subprocess.DEVNULL, capture_output=True, text=True,
                               timeout=10, check=False, env={"LC_ALL": "C"}).stdout
@@ -5293,16 +5567,18 @@ def ps_rows() -> list[tuple[int, int, float, str, str]]:
         if len(parts) == 2 and parts[0].isdigit():
             names[int(parts[0])] = parts[1].strip()
     rows = []
-    for line in run("pid=,ppid=,pcpu=,user=,comm=").splitlines():
-        parts = line.split(None, 4)
-        if len(parts) < 5:
+    for line in run("pid=,ppid=,pcpu=,user=,rss=,comm=").splitlines():
+        parts = line.split(None, 5)
+        if len(parts) < 6:
             continue
         try:
-            pid, comm = int(parts[0]), parts[4].strip()
+            pid, comm = int(parts[0]), parts[5].strip()
             name = comm if comm.endswith("Runner.Worker") else names.get(pid, "?")
             rows.append((pid, int(parts[1]), float(parts[2]), parts[3], name))
         except ValueError:
             continue
+        if rss is not None and parts[4].isdigit():
+            rss[pid] = int(parts[4])
     return rows
 
 
@@ -5347,22 +5623,7 @@ def classify(rows: list[tuple[int, int, float, str, str]], job_root: int,
              ) -> tuple[float, float, float, dict[str, float], dict[str, float]]:
     """Cores used right now by this job's tree, its reparented CI test app tree, other jobs, and everything else, plus the outside
     cores by "basename (user)" and the other jobs' cores by runner directory."""
-    parent = {pid: ppid for pid, ppid, _, _, _ in rows}
-    workers = {pid: (m.group(1) if (m := RUNNER_DIR_RE.search(comm)) else "runner")
-               for pid, _, _, _, comm in rows if comm.endswith("Runner.Worker")}
-    workers.setdefault(job_root, "this job")
-
-    def owner(pid: int) -> int | None:
-        seen = 0
-        while pid > 1 and seen < 256:
-            if pid in workers:
-                return pid
-            if test_app_owners and test_app_owners.get(pid) in workers:
-                return test_app_owners[pid]
-            pid = parent.get(pid, 0)
-            seen += 1
-        return None
-
+    workers, owner = job_owners(rows, job_root, test_app_owners)
     job = others = outside = 0.0
     by_outside: dict[str, float] = {}
     by_runner: dict[str, float] = {}
@@ -5381,6 +5642,98 @@ def classify(rows: list[tuple[int, int, float, str, str]], job_root: int,
             key = f"{os.path.basename(comm)[:60]} ({user[:24]})"
             by_outside[key] = by_outside.get(key, 0.0) + cores
     return job, others, outside, by_outside, by_runner
+
+
+def job_owners(rows: list[tuple[int, int, float, str, str]], job_root: int,
+               test_app_owners: dict[int, int] | None = None) -> tuple[dict[int, str], Callable[[int], int | None]]:
+    """The Runner.Worker pids by runner directory (job_root as "this job"), and owner(pid): the Runner.Worker whose
+    tree holds pid, following a reparented CI test app to the job that launched it, else None."""
+    parent = {pid: ppid for pid, ppid, _, _, _ in rows}
+    workers = {pid: (m.group(1) if (m := RUNNER_DIR_RE.search(comm)) else "runner")
+               for pid, _, _, _, comm in rows if comm.endswith("Runner.Worker")}
+    workers.setdefault(job_root, "this job")
+
+    def owner(pid: int) -> int | None:
+        seen = 0
+        while pid > 1 and seen < 256:
+            if pid in workers:
+                return pid
+            if test_app_owners and test_app_owners.get(pid) in workers:
+                return test_app_owners[pid]
+            pid = parent.get(pid, 0)
+            seen += 1
+        return None
+
+    return workers, owner
+
+
+def job_tree_pids(rows: list[tuple[int, int, float, str, str]], job_root: int, skip: set[int],
+                  test_app_owners: dict[int, int] | None = None) -> list[int]:
+    """This job's tree right now (its Runner.Worker, everything under it and its reparented CI test app): the same
+    tree classify counts as the job's cores."""
+    _, owner = job_owners(rows, job_root, test_app_owners)
+    return [pid for pid, _, _, _, _ in rows if pid not in skip and owner(pid) == job_root]
+
+
+def tree_kib(pids: list[int], kib: dict[int, int]) -> int | None:
+    """The sum of the nonzero readings for pids; None when none of them read nonzero (a zombie shows 0, as the whole
+    tree can while its Runner.Worker exits, and a process that exited between ps and the read has none), so an
+    unknown reading is never a 0."""
+    mine = [kib[pid] for pid in pids if kib.get(pid, 0) > 0]
+    return sum(mine) if mine else None
+
+
+def job_rss_kib(rows: list[tuple[int, int, float, str, str]], rss: dict[int, int], job_root: int,
+                skip: set[int], test_app_owners: dict[int, int] | None = None) -> int | None:
+    """Resident KiB of this job's tree right now (ps rss summed: pages its processes share count once per process,
+    and compressed or swapped pages not at all, so it can read high or low); None when ps gave no nonzero RSS."""
+    return tree_kib(job_tree_pids(rows, job_root, skip, test_app_owners), rss)
+
+
+# proc_pid_rusage(pid, RUSAGE_INFO_V0, &info) from libSystem, read through ctypes: no helper binary to build or
+# ship. rusage_info_v0 is a 16-byte uuid and ten uint64s; ri_phys_footprint is the eighth of those (index 9 of
+# the buffer as uint64s, after ri_resident_size). The footprint is the memory the kernel charges the process
+# (dirty private pages, compressed and swapped included; shared clean pages such as the dyld cache and
+# mapped files excluded), the number Activity Monitor's Memory column shows, so a tree's sum does not count
+# what its processes share once per process.
+RUSAGE_INFO_V0 = 0
+RUSAGE_V0_WORDS = 12
+RUSAGE_V0_FOOTPRINT = 9
+_LIBSYSTEM: list[Any] = []
+
+
+def _proc_pid_rusage() -> Any:
+    """libSystem's proc_pid_rusage, loaded once; None off Darwin or when it cannot be loaded."""
+    if not _LIBSYSTEM:
+        fn = None
+        if sys.platform == "darwin":
+            try:
+                import ctypes
+                fn = ctypes.CDLL("/usr/lib/libSystem.B.dylib", use_errno=True).proc_pid_rusage
+                fn.argtypes = (ctypes.c_int, ctypes.c_int, ctypes.c_void_p)
+                fn.restype = ctypes.c_int
+            except (OSError, AttributeError, ImportError):
+                fn = None
+        _LIBSYSTEM.append(fn)
+    return _LIBSYSTEM[0]
+
+
+def phys_footprints_kib(pids: list[int]) -> dict[int, int]:
+    """Each pid's physical footprint in KiB, for the pids the kernel lets this user read (the runner's own
+    processes; another user's process, or one that exited, is left out). Empty off Darwin."""
+    fn = _proc_pid_rusage()
+    if fn is None:
+        return {}
+    import ctypes
+    out: dict[int, int] = {}
+    buf = (ctypes.c_uint64 * RUSAGE_V0_WORDS)()
+    for pid in pids:
+        try:
+            if fn(pid, RUSAGE_INFO_V0, ctypes.byref(buf)) == 0:
+                out[pid] = int(buf[RUSAGE_V0_FOOTPRINT]) // 1024
+        except (OSError, ctypes.ArgumentError, OverflowError):
+            continue
+    return out
 
 
 def load_average() -> float | None:
@@ -5522,11 +5875,21 @@ class JobSamples:
         self.disk_free_end: float | None = None
         # and the lowest sampled while it ran (DISK_JOB_PEAK_GIB's evidence: its peak is start minus min)
         self.disk_free_min: float | None = None
+        # the largest resident KiB of the job's tree at any sample (from the ps pass the cores already read)
+        self.rss_peak_kib: int | None = None
+        # and of its summed physical footprint (Darwin proc_pid_rusage), which counts shared pages once
+        self.footprint_peak_kib: int | None = None
 
     def add(self, load: float | None, split: tuple[float, float, float, dict[str, float], dict[str, float]],
             interval: float, queue: tuple[int, int] | None = None, disk: float | None = None,
-            busy: float | None = None, free: float | None = None) -> None:
+            busy: float | None = None, free: float | None = None, rss_kib: int | None = None,
+            footprint_kib: int | None = None) -> None:
         job, others, outside, by_outside, by_runner = split
+        if rss_kib is not None:
+            self.rss_peak_kib = rss_kib if self.rss_peak_kib is None else max(self.rss_peak_kib, rss_kib)
+        if footprint_kib is not None:
+            self.footprint_peak_kib = (footprint_kib if self.footprint_peak_kib is None
+                                       else max(self.footprint_peak_kib, footprint_kib))
         if free is not None and math.isfinite(free):
             self.disk_free_min = free if self.disk_free_min is None else min(self.disk_free_min, free)
         if queue is not None:
@@ -5596,6 +5959,13 @@ class JobSamples:
             "disk_free_end_gib": None if self.disk_free_end is None else round(self.disk_free_end, 1),
             # the volume's, so other jobs' writes count too: the peak this job saw is start minus min
             "disk_free_min_gib": None if self.disk_free_min is None else round(self.disk_free_min, 1),
+            # the job tree's summed RSS at its largest sample (every sample_seconds, so a shorter spike can be
+            # missed); null when no sample read it. Shared pages count once per process and compressed or swapped
+            # pages not at all, so it can read high or low: rss_footprint_peak_mib is the job's memory.
+            "rss_peak_mib": None if self.rss_peak_kib is None else round(self.rss_peak_kib / 1024, 1),
+            # the same tree's summed physical footprint at its largest sample: the job's memory (null off Darwin)
+            "rss_footprint_peak_mib": (None if self.footprint_peak_kib is None
+                                       else round(self.footprint_peak_kib / 1024, 1)),
             "verdict": "contended" if reasons else "clear", "reasons": reasons,
         }
 
@@ -5790,7 +6160,8 @@ def start_sampler(watch_pid: int, state_dir: Path, meta: dict[str, Any], log: Pa
         while True:
             sampled_at = time.monotonic()
             try:
-                rows = ps_rows()
+                rss: dict[int, int] = {}
+                rows = ps_rows(rss)
                 skip = {os.getpid()} | {pid for pid, ppid, _, _, _ in rows if ppid == os.getpid()}
                 queue = run_queue()
                 disk_busy = host_io()
@@ -5799,8 +6170,10 @@ def start_sampler(watch_pid: int, state_dir: Path, meta: dict[str, Any], log: Pa
                 test_apps = (telemetry_test_app_owners(processes())
                              if any(os.path.basename(row[4]) == "cmux DEV" for row in rows) else {})
                 split = classify(rows, watch_pid, skip, test_apps)
+                tree = job_tree_pids(rows, watch_pid, skip, test_apps)
                 samples.add(load_average(), split, interval, queue, *disk_busy,
-                            free=free_or_none(disk_path) if disk_path else None)
+                            free=free_or_none(disk_path) if disk_path else None,
+                            rss_kib=tree_kib(tree, rss), footprint_kib=tree_kib(tree, phys_footprints_kib(tree)))
                 if dynamic_units > 1 and dynamic_total > 1:
                     now = time.monotonic()
                     job_cores = split[0]
@@ -6699,6 +7072,14 @@ def main(argv: list[str] | None = None) -> int:
                    help="also admit only cmux nightly-next's exact nightly app push on attempt 1")
     p.add_argument("--dev-compile-runner", action="store_true",
                    help="this instance admits only cmux NEXT DEV Release compile jobs (shared host capacity)")
+    p.add_argument("--nightly-runner", action="store_true",
+                   help="the nightly slot (runner.nightlySlot): this instance admits only nightly-tier jobs "
+                        "(job_tier) and its gate listens on a full mini (NIGHTLY_SLOT)")
+    p.add_argument("--dedicated-admit", type=Path,
+                   help="job-started: a dedicated runner (glaeda-cmux-runner --dedicated). It takes no host lock, "
+                        "capacity or reservation; after glaeda's own checks this script, the builder's admission, "
+                        "runs and a non-zero exit refuses the job. The gate holds it only for disk and a missing "
+                        "Rust toolchain")
     p.add_argument("--disk", help="glaeda-disk path (default: PATH, then ~/.local/bin)")
     p.add_argument("--no-disk", action="store_true")
     p.add_argument("--no-telemetry", action="store_true", help="do not sample the host while the job runs")
@@ -6848,6 +7229,12 @@ def main(argv: list[str] | None = None) -> int:
                                tuple(args.allow_event))
         if not admit:
             return refused(reason)
+        if args.nightly_runner:
+            why = nightly_slot_refusal(job_tier(os.environ.get("GITHUB_EVENT_NAME"), os.environ.get("GITHUB_REF"),
+                                                os.environ.get("GITHUB_REPOSITORY"), event,
+                                                os.environ.get("GITHUB_WORKFLOW_REF"), os.environ.get("GITHUB_JOB")))
+            if why:
+                return refused(why)
         if args.dev_compile_runner:
             why = dev_compile_refusal(os.environ.get("GITHUB_EVENT_NAME"), os.environ.get("GITHUB_REF"),
                                       os.environ.get("GITHUB_REPOSITORY"), event,
@@ -6872,7 +7259,8 @@ def main(argv: list[str] | None = None) -> int:
             why = leaked_toolchain_env(given, args.toolchain_xcode)
             if why:
                 return refused(why)
-        why = reservation_refusal(args.reservation, time.time(), taken_job=True)
+        # a dedicated builder is not a pool runner: a reservation of the mini's pool never refuses its one job shape
+        why = None if args.dedicated_admit else reservation_refusal(args.reservation, time.time(), taken_job=True)
         disk_path = os.path.dirname(args.host_lock)
         disk_deadline = time.monotonic() + EVICT_TIMEOUT_S  # one budget for every eviction of this job-started
         if not why and not args.no_disk and disk_refusal(disk_path, args.min_free_gib):
@@ -6907,8 +7295,8 @@ def main(argv: list[str] | None = None) -> int:
                     return refused(why, disk=True)
         # before any capacity is taken: a job that needs the console session fails on a locked one
         admit_class = None
-        if args.gui_runner or args.session_runner or job_class(
-                os.environ.get("GITHUB_JOB", ""), repo, args.home_repo, job_workflow())[0] in CONSOLE_CLASSES:
+        if not args.dedicated_admit and (args.gui_runner or args.session_runner or job_class(
+                os.environ.get("GITHUB_JOB", ""), repo, args.home_repo, job_workflow())[0] in CONSOLE_CLASSES):
             why = console_refusal()
             if why and (job_workflow(), os.environ.get("GITHUB_JOB", "")) in CONSOLE_SKIPPERS:
                 print(f"{PREFIX}: {why}; admitted as light, its take-gui step skips the console steps", flush=True)
@@ -6933,17 +7321,23 @@ def main(argv: list[str] | None = None) -> int:
             # A cmux job waits for capacity with no limit (CAPACITY_WAIT); a guest has no rescue workflow, so it
             # waits GUEST_WAIT_S for room and is then refused.
             cap = args.guest_wait if is_guest(repo, args.home_repo) else args.gui_wait
-            if cap is None:
-                cap = dev_compile_capacity_wait(
-                    repo, args.home_repo, os.environ.get("GITHUB_EVENT_NAME"),
-                    os.environ.get("GITHUB_REF"), event, os.environ.get("GITHUB_JOB", ""), job_workflow())
+            # The DEV bound holds over a longer --gui-wait too; a shorter one is kept.
+            cap = bounded_wait(cap, dev_compile_capacity_wait(
+                repo, args.home_repo, os.environ.get("GITHUB_EVENT_NAME"),
+                os.environ.get("GITHUB_REF"), event, os.environ.get("GITHUB_JOB", ""), job_workflow()))
             cap = slot_capacity_wait(cap, args.dev_compile_runner)
             tier = job_tier(os.environ.get("GITHUB_EVENT_NAME"), os.environ.get("GITHUB_REF"),
                             os.environ.get("GITHUB_REPOSITORY"), event, os.environ.get("GITHUB_WORKFLOW_REF"),
                             os.environ.get("GITHUB_JOB"))
+            nightly_bound = nightly_capacity_wait(tier, os.environ.get("GITHUB_EVENT_NAME"),
+                                                  os.environ.get("GITHUB_REF"), os.environ.get("GITHUB_JOB"),
+                                                  job_workflow(), os.environ.get("GITHUB_RUN_ATTEMPT"))
+            cap = bounded_wait(cap, nightly_bound)
             if tier == TIER_NIGHTLY:
                 print(f"{PREFIX}: a nightly job: it goes ahead of every other job waiting here, no other job takes a "
-                      f"unit while it waits, and it keeps no idle reserve", flush=True)
+                      f"unit while it waits, and it keeps no idle reserve"
+                      + (f"; it waits {nightly_bound:g} s at most, then is refused so its re-run takes Blacksmith"
+                         if nightly_bound is not None else ""), flush=True)
             elif tier:
                 print(f"{PREFIX}: a DEV compile: it goes ahead of PR jobs waiting here for capacity "
                       f"(those waiting under {FEED_JUMP_S / 60:g} min)", flush=True)
@@ -6963,7 +7357,7 @@ def main(argv: list[str] | None = None) -> int:
                                                warm_target=job_warm_target(event), since=since,
                                                gui_token=args.gui_token, klass=admit_class,
                                                gui_runner=args.gui_runner,
-                                               fresh_runner=args.dev_compile_runner, tier=tier)
+                                               fresh_runner=args.dev_compile_runner, tier=tier, new_job=True)
                     if held or not note.startswith("capacity:"):
                         break
                     waited = time.monotonic() - start
@@ -6984,6 +7378,8 @@ def main(argv: list[str] | None = None) -> int:
             finally:
                 with contextlib.suppress(OSError):
                     marker.unlink()
+        elif args.dedicated_admit:
+            held, note = dedicated_admission(args.dedicated_admit)
         else:
             with contextlib.suppress(OSError):  # a crashed job's record must not show in this job's log lines
                 roots_file(args.state_dir).unlink(missing_ok=True)
@@ -7014,6 +7410,8 @@ def main(argv: list[str] | None = None) -> int:
                 return refused(testmanagerd)
             note += f"; {testmanagerd}"
         print(f"{PREFIX}: admitted: {reason}; {note}", flush=True)
+        if not args.no_disk and (own := evict_own_checkout(os.environ.get("GITHUB_WORKSPACE"), args.disk)):
+            print(f"{PREFIX}: {own}", flush=True)
         unsparsed = ""
         with contextlib.suppress(Exception):  # must not fail an admitted job
             unsparsed = unsparse_workspace(os.environ.get("GITHUB_WORKSPACE"))
