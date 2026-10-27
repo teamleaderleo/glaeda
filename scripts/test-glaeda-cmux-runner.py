@@ -723,6 +723,9 @@ class HookTest(unittest.TestCase):
             "drain": (drain, True, "admitting the job this runner already took"),
             "other-owner": ({**drain, "owner": "fleet-session"}, False, "host reserved by fleet-session"),
             "not-a-drain": ({**drain, "purpose": "restart now"}, False, "host reserved by glaeda-mini-health"),
+            "bare-drain-prefix": ({**drain, "purpose": "drain for "}, False, "host reserved by glaeda-mini-health"),
+            "other-drain": ({**drain, "purpose": "drain for unrelated work"}, False,
+                            "host reserved by glaeda-mini-health"),
             "expired-drain": ({**drain, "until": now - 1}, True, "admitted"),
             "invalid-drain": ({**drain, "until": "soon"}, False, "until is not integer"),
         }
@@ -739,7 +742,8 @@ class HookTest(unittest.TestCase):
         marker = self.dir / "reservation.json"
         now = int(time.time())
         marker.write_text(json.dumps({"schema": "glaeda-reservation/v1", "owner": "glaeda-mini-health",
-                                      "purpose": "drain for a Tailscale restart", "since": now - 5,
+                                      "purpose": "drain for a Tailscale restart: tailscale_no_route since x",
+                                      "since": now - 5,
                                       "until": now + 600}))
         why = hook.host_held(os.fspath(self.dir / "no-host.lock"), os.fspath(marker), time.time())
         self.assertIn("host reserved by glaeda-mini-health for drain", why or "")

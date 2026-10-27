@@ -1094,7 +1094,7 @@ def dev_compile_refusal(event_name: str | None, ref: str | None, repository: str
 # saw the marker is admitted and finishes (mini-health waits for it). Refusing it only failed that job: one
 # mini refused 28 jobs this way during a single 20-minute drain.
 DRAIN_OWNER = "glaeda-mini-health"
-DRAIN_PURPOSE = "drain for "
+DRAIN_PURPOSE = "drain for a Tailscale restart: "  # glaeda-mini-health start_drain's purpose, exactly this prefix
 
 
 def drain_marker(marker: dict[str, Any]) -> bool:
