@@ -331,6 +331,37 @@ class GlaedaDiskTest(unittest.TestCase):
         du.assert_not_called()
         self.assertTrue(gd._MEASURE_BUDGET_REACHED)
 
+    def test_a_spent_measure_budget_still_judges_what_was_measured(self) -> None:
+        """A pressure apply's walks stop at its measure deadline and its verdicts at a later one: the candidates
+        measured by then are judged (and can be deleted), the rest stay unsized and are never judged."""
+        old, unsized = make(self.root / "old"), make(self.root / "unsized")
+        with mock.patch.object(gd, "du_bytes") as du:
+            items = gd.survey([self.fam], 24, 0, {os.fspath(old): 1 << 20},
+                              deadline=time.monotonic() - 1, judge_deadline=time.monotonic() + 60)
+        du.assert_not_called()
+        self.assertEqual([(Path(i.path).name, i.verdict) for i in items], [("old", "reclaimable")])
+        self.assertNotIn(os.fspath(unsized), [i.path for i in items])
+        self.assertTrue(gd._MEASURE_BUDGET_REACHED)
+        # the verdict deadline passed too: nothing is judged, so nothing can be deleted
+        items = gd.survey([self.fam], 24, 0, {os.fspath(old): 1 << 20},
+                          deadline=time.monotonic() - 1, judge_deadline=time.monotonic() - 1)
+        self.assertEqual(items, [])
+
+    def test_survey_walks_families_round_robin(self) -> None:
+        """A family of tens of thousands of small entries (a CI mini's $TMPDIR) must not hold every other family's
+        candidates behind it until the measure deadline."""
+        many_root, few_root = self.root / "many", self.root / "few"
+        for k in range(20):
+            make(many_root / f"m{k:02d}")
+        make(few_root / "spm-a")
+        make(few_root / "spm-b")
+        many = gd.Family("user-tmp", many_root, True, "scratch")
+        few = gd.Family("cmux-spm-scratch", few_root, True, "scratch")
+        order = [(fam.id, path.name) for fam, path in gd.round_robin_work([many, few])]
+        self.assertEqual(len(order), 22)
+        self.assertEqual({name for _, name in order[:4]}, {"m00", "m01", "spm-a", "spm-b"})
+        self.assertEqual(order[4:], [("user-tmp", f"m{k:02d}") for k in range(2, 20)])
+
     def verdicts(self, idle: float = 24) -> dict[str, str]:
         return {Path(i.path).name: i.verdict for i in gd.survey([self.fam], idle, 0)}
 
@@ -4253,7 +4284,8 @@ class GlaedaDiskTest(unittest.TestCase):
                 mock.patch.object(gd, "filesystems", return_value=fss), \
                 mock.patch.object(gd, "free_bytes", return_value=(int(free_gib * gd.GIB), total)), \
                 mock.patch.object(gd, "ci_jobs", return_value=[]), \
-                mock.patch.object(gd, "survey", return_value=items) as survey, \
+                mock.patch.object(gd, "survey", return_value=items,
+                                  side_effect=over.pop("survey_effect", None)) as survey, \
                 mock.patch.object(gd, "apply", return_value=over.pop("released", 0)) as apply, \
                 mock.patch.object(gd, "cleanup_paused_runner_work", return_value=0), \
                 mock.patch.object(gd, "evict_idle_runner_checkouts", return_value=0), \
@@ -4288,6 +4320,31 @@ class GlaedaDiskTest(unittest.TestCase):
         # a report writes none
         self._main_run(["report"])
         self.assertEqual(len((self.root / "runs.jsonl").read_text().splitlines()), 2)
+
+    def test_a_pressure_apply_bounds_its_survey(self) -> None:
+        """Every pressure --apply measures for at most pressure_measure_budget_s and judges until twice that, so it
+        reaches its deletes inside the runner hook's bound; a report and a 0 budget keep the unbounded survey."""
+        start = time.monotonic()
+        _, rows, survey, _ = self._main_run(["--pressure", "--apply"])
+        kw = survey.call_args.kwargs
+        budget = gd.POLICY["pressure_measure_budget_s"]
+        self.assertEqual(budget, gd.PRESSURE_MEASURE_BUDGET_S)
+        self.assertGreaterEqual(kw["deadline"], start + budget)
+        self.assertLess(kw["deadline"], time.monotonic() + budget)
+        self.assertAlmostEqual(kw["judge_deadline"] - kw["deadline"], budget, delta=0.01)
+        self.assertFalse(rows[-1]["measure_budget_reached"])
+        _, _, survey, _ = self._main_run(["report"])
+        self.assertIsNone(survey.call_args.kwargs["deadline"])
+        self.assertIsNone(survey.call_args.kwargs["judge_deadline"])
+        _, _, survey, _ = self._main_run(["--pressure", "--apply"], policy={"pressure_measure_budget_s": 0.0})
+        self.assertIsNone(survey.call_args.kwargs["deadline"])
+        self.assertIsNone(survey.call_args.kwargs["judge_deadline"])
+
+        def spent(*_args, **_kwargs):
+            gd._MEASURE_BUDGET_REACHED = True
+            return []
+        _, rows, _, _ = self._main_run(["--pressure", "--apply"], survey_effect=spent)
+        self.assertTrue(rows[-1]["measure_budget_reached"])
 
     def test_the_run_line_says_when_its_targets_are_not_the_defaults(self) -> None:
         """The runner hook skips its pass on a run line's targets only when they are a plain --pressure --apply's
