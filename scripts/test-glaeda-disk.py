@@ -6749,6 +6749,20 @@ class ActivityClockTest(unittest.TestCase):
             gd.main(["--pressure", "--need", "50", "--no-snapshot"])
         self.assertEqual(seen, [("54", "70", 30.0), ("55", "71", 50.0)])
 
+MAIN_GLOBALS = ("ROLE", "RUNNER_CACHE_PROFILE", "CMUX_NEXT_CI_DRAIN", "ACTIVITY_MODE", "EMERGENCY_DEVS", "FLOOR_HOLD",
+                "CMUX_NEXT_HOST_FLOOR", "CMUX_NEXT_CI_OVER", "_JOB_STARTS", "_JOB_STARTS_READ", "_RUNNING_JOB_HOURS",
+                "_MEASURE_BUDGET_REACHED", "_EVICT_HANDLE", "_HOOK_PASS_FD")
+
+
+def keep_main_globals(stack: contextlib.ExitStack) -> None:
+    """glaeda-disk's main sets these for its run (a reserved host's legacy ages and POLICY too); put each back when
+    the stack closes, so no later test sees it."""
+    for name in (*MAIN_GLOBALS, *getattr(gd, "LEGACY_AGES", {})):
+        if hasattr(gd, name):
+            stack.enter_context(mock.patch.object(gd, name, getattr(gd, name)))
+    stack.enter_context(mock.patch.dict(gd.POLICY, dict(gd.POLICY)))
+
+
 class HostReservationTest(unittest.TestCase):
     """A reserved fleet mini gets floor-pressure eviction only. The list lives only on the host; fixtures are made up."""
 
@@ -6911,6 +6925,7 @@ class HostReservationTest(unittest.TestCase):
                          "HEALTH_SUMMARY", "EVICT_LOCK", "HOOK_PASS_LOCK", "HOOK_PASS_PENDING", "EVICT_OWNER",
                          "NESTED_KEEP"):
                 stack.enter_context(mock.patch.object(gd, name, state / name))
+            keep_main_globals(stack)
             for name in ("clear_stale_build_markers", "cleanup_paused_runner_work", "reap_tmpdir_test_residue",
                          "gc_home_clones", "repack_runner_checkouts", "dedupe_xcode", "dedupe_captures"):
                 stack.enter_context(mock.patch.object(gd, name, side_effect=AssertionError(f"{name} ran")))
@@ -6943,13 +6958,14 @@ class HostReservationTest(unittest.TestCase):
 
         def filesystems(fams, low, target, *rest, reserved=False):
             seen.update(low=low, target=target, **({"reserved": True} if reserved else {}))
-            run.update(gd.RUN)
+            run.update(gd.RUN, age_hours=gd.DEFAULT_AGE_HOURS)  # the ages this run's families were built with
             raise SystemExit(0)  # stop before any survey: the gate is what is under test
-        with mock.patch.object(gd, "host_reservation", return_value=reserved), \
+        with contextlib.ExitStack() as globals_back, mock.patch.object(gd, "host_reservation", return_value=reserved), \
                 mock.patch.object(gd, "runner_floor_gib", return_value=floor), \
                 mock.patch.object(gd, "DARWIN", True), mock.patch.object(gd, "filesystems", side_effect=filesystems), \
                 mock.patch.object(gd, "disk_off", return_value=""), mock.patch.dict(gd.RUN, clear=True), \
                 contextlib.redirect_stdout(io.StringIO()) as out:
+            keep_main_globals(globals_back)
             try:
                 code = gd._main_impl(["--apply", "--top", "0", "--no-snapshot", *args])
             except SystemExit as stop:
@@ -6972,17 +6988,18 @@ class HostReservationTest(unittest.TestCase):
         margin = gd.POLICY["target_margin_gib"]
         self.assertEqual(seen, {"low": "30", "target": f"{30 + margin:g}", "reserved": True})
         self.assertEqual(run["reserved"], why)
-        # the runner-cache profile is held to the same rule
-        code, out, seen, run = self.run_disk("--runner-caches", reserved=why, floor=30.0, free_gib=50)
+        self.assertEqual(run["age_hours"], 24.0, "the reserved run used the legacy ages")
+        self.assertEqual(gd.DEFAULT_AGE_HOURS, 12.0, "and put the 12 h ages back for whatever runs next")
+        # the runner-cache profile is held to the same rule (given a root, as a Linux CI host has none of its own)
+        with mock.patch.object(gd, "runner_cache_families", return_value=[gd.Family("x", self.root, True, "x")]), \
+                mock.patch.object(gd, "runner_profile_roots_safe", return_value=True):
+            code, out, seen, run = self.run_disk("--runner-caches", reserved=why, floor=30.0, free_gib=50)
         self.assertIn("nothing deleted", out)
         self.assertEqual(seen, {})
-        # an unreserved host keeps its policy
-        self.assertEqual(gd.DEFAULT_AGE_HOURS, 24.0, "the reserved run kept the legacy ages")
-        for n, v in {n: 12.0 for n in ("DEFAULT_AGE_HOURS",)}.items():
-            setattr(gd, n, v)
+        # an unreserved host keeps its policy and the 12 h ages
         code, out, seen, run = self.run_disk("--pressure", reserved="", floor=30.0, free_gib=50)
-        self.assertEqual(gd.DEFAULT_AGE_HOURS, 12.0)
         self.assertEqual(seen, {"low": gd.POLICY["low"], "target": gd.POLICY["target"]})
+        self.assertEqual(run["age_hours"], 12.0)
 
 
 if __name__ == "__main__":

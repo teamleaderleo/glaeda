@@ -44,6 +44,8 @@ spec = importlib.util.spec_from_loader("glaeda_gh", loader)
 gg = importlib.util.module_from_spec(spec)
 sys.modules["glaeda_gh"] = gg
 loader.exec_module(gg)
+# A host's own upstream.json (a lane VM's) must not turn every Daemon here into an upstream client.
+gg.UPSTREAM_CONFIG = Path(tempfile.gettempdir()) / f"glaeda-gh-test-no-upstream-{os.getpid()}.json"
 
 TOKEN = "ghp_faketoken_must_never_touch_disk"
 NOW = float(int(time.time()))  # watch files carry real mtimes
@@ -708,6 +710,177 @@ class ControllerTest(Base):
         finally:
             for k, v in saved.items():
                 os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
+
+
+class UpstreamTest(Base):
+    """A host with no login reads through upstream.json's program: one request per tick, never GitHub."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.asked: list[dict] = []
+        self.answers: dict[str, dict | None] = {}
+        self.broken: Exception | None = None
+
+        def ask(request: dict) -> dict:
+            self.asked.append(request)
+            if self.broken is not None:
+                raise self.broken
+            return {"entries": {k["key"]: self.answers.get(k["key"]) for k in request["keys"]}}
+
+        self.daemon = gg.Daemon(transport=self.gh, token=lambda: self.fail("read a token"), controller=None,
+                                upstream=ask)
+
+    def pr_data(self) -> dict:
+        return {"number": 7, "state": "OPEN", "checks": [], "headRefOid": "a" * 40}
+
+    def test_a_watched_pr_is_filled_from_the_upstream_with_no_github_request(self) -> None:
+        gg.register("pr:o/r#7")
+        gg.register("run:o/r/9", jobs=True)
+        self.answers["pr:o/r#7"] = {"data": self.pr_data(), "dataAt": NOW - 30, "error": None}
+        self.answers["run:o/r/9"] = {"data": {"id": 9, "status": "completed"}, "dataAt": NOW - 5, "jobs": [{"id": 1}]}
+        status = self.daemon.tick(now=NOW)
+        self.assertEqual(self.gh.calls, [])
+        self.assertEqual(len(self.asked), 1)
+        self.assertEqual(sorted(k["key"] for k in self.asked[0]["keys"]), ["pr:o/r#7", "run:o/r/9"])
+        self.assertIn({"key": "run:o/r/9", "jobs": True}, self.asked[0]["keys"])
+        pr = gg.read_cache("pr:o/r#7")
+        self.assertEqual(pr["data"]["number"], 7)
+        self.assertEqual(pr["dataAt"], NOW - 30)  # the upstream's age, not this host's
+        self.assertEqual(pr["source"], "upstream")
+        self.assertEqual(gg.read_cache("run:o/r/9")["jobs"], [{"id": 1}])
+        self.assertEqual(status["upstream"]["state"], "ok")
+
+    def test_reads_are_paced_and_a_new_key_is_asked_for_soon(self) -> None:
+        gg.register("pr:o/r#7")
+        self.daemon.tick(now=NOW)  # the upstream has not read it yet: null
+        self.assertIsNone(gg.read_cache("pr:o/r#7"))
+        self.daemon.tick(now=NOW + 1)
+        self.assertEqual(len(self.asked), 1, "a key with no data waits UPSTREAM_NEW")
+        self.answers["pr:o/r#7"] = {"data": self.pr_data(), "dataAt": NOW + 2}
+        self.daemon.tick(now=NOW + gg.UPSTREAM_NEW)
+        self.assertEqual(len(self.asked), 2)
+        self.assertIsNotNone(gg.read_cache("pr:o/r#7")["data"])
+        self.daemon.tick(now=NOW + gg.UPSTREAM_NEW + 2)
+        self.assertEqual(len(self.asked), 2, "a key with data waits for the full cycle")
+        self.daemon.tick(now=NOW + gg.UPSTREAM_EVERY)
+        self.assertEqual(len(self.asked), 3)
+
+    def test_no_watch_no_request(self) -> None:
+        self.daemon.tick(now=NOW)
+        self.daemon.tick(now=NOW + gg.UPSTREAM_EVERY)
+        self.assertEqual(self.asked, [])
+
+    def test_a_failing_upstream_names_the_cause_and_keeps_old_data(self) -> None:
+        gg.register("pr:o/r#7")
+        gg.register("pr:o/r#8")
+        self.answers["pr:o/r#7"] = {"data": self.pr_data(), "dataAt": NOW}
+        self.daemon.tick(now=NOW)
+        self.broken = gg.WatchError("upstream: no broker socket")
+        status = self.daemon.tick(now=NOW + gg.UPSTREAM_EVERY)
+        self.assertEqual(status["upstream"]["state"], "failing")
+        self.assertIn("upstream: no broker socket", status["errors"])
+        self.assertEqual(gg.read_cache("pr:o/r#7")["data"]["number"], 7)  # kept, and the outage named on it
+        self.assertIn("no broker socket", gg.read_cache("pr:o/r#7")["error"])
+        self.assertIn("no broker socket", gg.read_cache("pr:o/r#8")["error"])
+        self.broken = None
+        self.daemon.tick(now=NOW + 2 * gg.UPSTREAM_EVERY)
+        self.assertIsNone(gg.read_cache("pr:o/r#7")["error"])
+
+    def test_past_the_key_cap_the_least_recently_read_go_first(self) -> None:
+        keys = [f"pr:o/r#{n}" for n in range(1, 6)]
+        for k in keys:
+            gg.register(k)
+            self.answers[k] = {"data": self.pr_data(), "dataAt": NOW}
+        with mock.patch.object(gg, "UPSTREAM_MAX_KEYS", 2):
+            for i in range(5):
+                self.daemon.tick(now=NOW + i * gg.UPSTREAM_EVERY)
+        asked = [k["key"] for r in self.asked for k in r["keys"]]
+        self.assertEqual(set(asked), set(keys), "every key is read in turn")
+        self.assertTrue(all(len(r["keys"]) <= 2 for r in self.asked))
+
+    def test_keys_that_keep_failing_do_not_starve_one_with_data(self) -> None:
+        bad = [f"pr:o/r#{n}" for n in range(10, 14)]
+        for k in bad:
+            gg.register(k)
+            self.answers[k] = {"data": None, "error": "NOT_FOUND", "missing": True}
+        gg.register("pr:o/r#7")
+        self.answers["pr:o/r#7"] = {"data": self.pr_data(), "dataAt": NOW}
+        with mock.patch.object(gg, "UPSTREAM_MAX_KEYS", 2):
+            for i in range(30):
+                self.daemon.tick(now=NOW + i * gg.UPSTREAM_NEW)
+        asked = [k["key"] for r in self.asked for k in r["keys"]]
+        self.assertGreaterEqual(asked.count("pr:o/r#7"), 2)
+        # a key the upstream answered with an error waits for full cycles, not UPSTREAM_NEW: one full read per
+        # UPSTREAM_EVERY, plus the reads that first fill the 5 new keys 2 at a time
+        self.assertLessEqual(len(self.asked), 30 * gg.UPSTREAM_NEW // gg.UPSTREAM_EVERY + 1 + 3)
+
+    def test_a_pr_github_says_does_not_exist_fails_a_wait_instead_of_timing_out(self) -> None:
+        gg.register("pr:o/r#404")
+        self.answers["pr:o/r#404"] = {"data": None, "error": "NOT_FOUND", "missing": True, "fetchedAt": NOW}
+        self.daemon.tick(now=NOW)
+        entry = gg.read_cache("pr:o/r#404")
+        self.assertTrue(entry["missing"])
+        self.assertEqual(entry["fetchedAt"], NOW)
+        req = {"key": "pr:o/r#404", "kind": "pr", "until": "green", "grace": 0, "began": NOW - 1, "timeout": 60,
+               "target": "o/r#404"}
+        self.assertEqual(gg.wait_step(req, NOW)[0], gg.EXIT_FAIL)
+
+    def test_heads_and_posts_are_refused_with_a_reason(self) -> None:
+        key = gg.parse_key("head", "o/r@" + "b" * 40)
+        gg.register(key, consumer="me")
+        gg.outbox_dir().mkdir(parents=True)
+        gg.write_json(gg.outbox_dir() / "x1.json", {"id": "x1", "kind": "comment", "body": "hi"})
+        self.daemon.tick(now=NOW)
+        self.assertIn("login", gg.read_cache(key)["error"])
+        self.assertEqual(self.asked, [])
+        done = gg.read_json(gg.posted_dir() / "x1.json")
+        self.assertEqual(done["state"], "failed")
+        self.assertIn("no login", done["error"])
+        self.assertEqual(self.gh.calls, [])
+
+    def test_upstream_json_switches_the_mode_and_runs_the_program(self) -> None:
+        tmp = Path(self.tmp.name)
+        program = tmp / "up"
+        program.write_text("#!/bin/sh\nread line\nprintf '%%s\\n' \"$line\" > %s\n"
+                           "echo '{\"entries\": {\"pr:o/r#7\": {\"data\": {\"number\": 7}, \"dataAt\": 5}}}'\n"
+                           % (tmp / "seen"))
+        program.chmod(0o755)
+        config = tmp / "upstream.json"
+        gg.write_json(config, {"command": [os.fspath(program)]})
+        with mock.patch.object(gg, "UPSTREAM_CONFIG", config):
+            daemon = gg.Daemon(transport=self.gh, token=lambda: self.fail("read a token"), controller=None)
+            gg.register("pr:o/r#7")
+            daemon.tick(now=NOW)
+        self.assertEqual(json.loads((tmp / "seen").read_text()), {"keys": [{"key": "pr:o/r#7", "jobs": False}]})
+        self.assertEqual(gg.read_cache("pr:o/r#7")["data"], {"number": 7})
+        self.assertEqual(self.gh.calls, [])
+
+    def test_read_registers_and_answers_from_the_cache(self) -> None:
+        self.daemon.store("pr:o/r#7", None, data={"number": 7}, dataAt=NOW)
+        self.daemon.store("pr:o/r#8", None, error="NOT_FOUND", missing=True)
+        out = io.StringIO()
+        req = json.dumps({"keys": [{"key": "pr:o/r#7", "jobs": False}, {"key": "run:o/r/9", "jobs": True}]})
+        with mock.patch.object(gg, "daemon_running", lambda grace=0.0: True), \
+                mock.patch.object(gg, "daemon_failing", lambda: None), contextlib.redirect_stdout(out):
+            self.assertEqual(gg.cmd_read(req), 0)
+        doc = json.loads(out.getvalue())
+        self.assertEqual(doc["entries"]["pr:o/r#7"]["data"], {"number": 7})
+        self.assertIsNone(doc["entries"]["run:o/r/9"])
+        req = json.dumps({"keys": [{"key": "pr:o/r#8", "jobs": False}]})
+        with mock.patch.object(gg, "daemon_running", lambda grace=0.0: True), \
+                mock.patch.object(gg, "daemon_failing", lambda: None), contextlib.redirect_stdout(out := io.StringIO()):
+            gg.cmd_read(req)
+        self.assertTrue(json.loads(out.getvalue())["entries"]["pr:o/r#8"]["missing"])
+        self.assertTrue(gg.read_json(gg.watch_dir() / gg.file_name("run:o/r/9"))["jobs"])
+        self.assertTrue((gg.watch_dir() / gg.file_name("pr:o/r#7")).exists())
+
+    def test_read_refuses_what_is_not_a_key(self) -> None:
+        for bad in ("nope", json.dumps({"keys": [{"key": "head:o/r@" + "a" * 40}]}),
+                    json.dumps({"keys": [{"key": "pr:O/r#7"}]}), json.dumps({"keys": [{"key": "pr:o/r#07"}]}),
+                    json.dumps({"keys": [{"key": "pr:o/r#7", "jobs": "yes"}]}),
+                    json.dumps({"keys": [{"key": "pr:o/r#7"}] * (gg.UPSTREAM_MAX_KEYS + 1)})):
+            with self.assertRaises(gg.WatchError, msg=bad):
+                gg.read_request(bad)
 
 
 class TransportErrorTest(unittest.TestCase):
@@ -2505,6 +2678,7 @@ gg = importlib.util.module_from_spec(spec)
 sys.modules["glaeda_gh"] = gg
 loader.exec_module(gg)
 gg.BASE = Path(sys.argv[3])
+gg.UPSTREAM_CONFIG = Path(sys.argv[3]) / "no-upstream.json"
 """
 
 
@@ -7498,6 +7672,167 @@ class PostTest(unittest.TestCase):
         status = d.tick(now=NOW)
         self.assertEqual(len(t.calls), 1)
         self.assertEqual(status["outbox"], {"queued": 1, "holdUntil": None})
+
+
+class RiskReceiptPostTest(unittest.TestCase):
+    """A delivered exact-head review wakes cmux's existing risk grader, without replaying content."""
+
+    setUp = PostTest.setUp
+    daemon = PostTest.daemon
+    queue = PostTest.queue
+    step = PostTest.step
+    head = "a" * 40
+    url = "https://github.com/manaflow-ai/cmux/pull/7#issuecomment-1"
+
+    def receipt(self, **changes) -> dict:
+        return {"body": f"Review (independent Codex): SHIP at {self.head}", "html_url": self.url,
+                "user": {"type": "User", "login": "reviewer"}, "author_association": "COLLABORATOR", **changes}
+
+    def pull(self, **changes) -> dict:
+        return {"state": "open", "base": {"ref": "feat-cmux-next"}, "head": {"sha": self.head},
+                "labels": [{"name": "risk:high"}, {"name": "ready-to-land"}], **changes}
+
+    def test_risk_receipt_immediately_regrades_comments_and_reviews_including_block(self) -> None:
+        for kind, verdict in (("comment", "SHIP"), ("review", "SHIP"), ("comment", "BLOCK"),
+                              ("review", "FIX"), ("comment", "NOT SHIP"), ("comment", "HOLD")):
+            with self.subTest(kind=kind, verdict=verdict):
+                body = f"Review (independent Codex): {verdict} at {self.head}\nDetails."
+                item = self.queue(kind, "manaflow-ai/cmux#7", "--body", body)
+                d, t = self.daemon((201, {}, self.receipt(body=body)), (200, {}, self.pull()), (200, {}, []))
+                self.step(d, NOW)
+                self.assertEqual([c[:2] for c in t.calls[1:]], [
+                    ("GET", "/repos/manaflow-ai/cmux/pulls/7"),
+                    ("DELETE", "/repos/manaflow-ai/cmux/issues/7/labels/risk%3Ahigh")])
+                state = gg.post_state(item["id"])
+                self.assertEqual((state["state"], state["riskRegrade"]["state"]), ("posted", "triggered"))
+                self.assertEqual(state["riskRegrade"]["head"], self.head)
+                self.step(d, NOW + gg.POST_SPACING)
+                self.assertEqual(len(t.calls), 3)
+
+    def test_risk_receipt_reconciliation_triggers_without_a_second_comment(self) -> None:
+        for kind in ("comment", "review"):
+            with self.subTest(kind=kind):
+                body = "\n" + self.receipt()["body"]  # the classifier reads the first nonblank line
+                item = self.queue(kind, "manaflow-ai/cmux#7", "--body", body)
+                d, t = self.daemon((502, {}, {}), (200, {}, [self.receipt(body=body)]),
+                                   (200, {}, self.pull()), (200, {}, []))
+                self.step(d, NOW)
+                self.step(d, NOW + gg.POST_RETRY)
+                self.assertEqual([c[0] for c in t.calls], ["POST", "GET", "GET", "DELETE"])
+                self.assertEqual(gg.post_state(item["id"])["riskRegrade"]["state"], "triggered")
+
+    def test_risk_receipt_ignores_unrelated_untrusted_self_and_nonfirstline_posts(self) -> None:
+        for target, body, posted in (
+                ("o/r#7", self.receipt()["body"], self.receipt()),
+                ("manaflow-ai/cmux#7", "ordinary comment", self.receipt(body="ordinary comment")),
+                ("manaflow-ai/cmux#7", f"Intro\n{self.receipt()['body']}", self.receipt()),
+                ("manaflow-ai/cmux#7", f"Review (self): SHIP at {self.head}", self.receipt()),
+                ("manaflow-ai/cmux#7", f"Review (Codex): SHIP at {self.head[:12]}", self.receipt()),
+                ("manaflow-ai/cmux#7", f"Review (Codex): SHIP at {self.head}a", self.receipt()),
+                ("manaflow-ai/cmux#7", self.receipt()["body"], self.receipt(author_association="CONTRIBUTOR")),
+                ("manaflow-ai/cmux#7", self.receipt()["body"], self.receipt(user={"type": "Bot"})),
+                ("manaflow-ai/cmux#7", self.receipt()["body"], {"html_url": self.url})):
+            with self.subTest(target=target, body=body, posted=posted):
+                item = self.queue("comment", target, "--body", body)
+                d, t = self.daemon((201, {}, posted))
+                self.step(d, NOW)
+                self.assertEqual(len(t.calls), 1)
+                self.assertEqual(gg.post_state(item["id"])["state"], "posted")
+
+    def test_risk_receipt_reads_fresh_identity_and_only_removes_one_current_tier(self) -> None:
+        for pull, label in ((self.pull(), "risk:high"),
+                            (self.pull(labels=[{"name": "risk:normal"}]), "risk:normal"),
+                            (self.pull(state="closed"), None),
+                            (self.pull(base={"ref": "main"}), None),
+                            (self.pull(head={"sha": "b" * 40}), None),
+                            (self.pull(labels=[{"name": "risk:human-ok"}]), None),
+                            (self.pull(labels=[{"name": "risk:high"}, {"name": "risk:low"}]), None)):
+            with self.subTest(pull=pull):
+                item = self.queue("comment", "manaflow-ai/cmux#7", "--body", self.receipt()["body"])
+                d, t = self.daemon((201, {}, self.receipt()), (200, {}, pull), (200, {}, []))
+                self.step(d, NOW)
+                self.assertEqual(len(t.calls), 3 if label else 2)
+                if label:
+                    self.assertEqual(t.calls[-1][1], f"/repos/manaflow-ai/cmux/issues/7/labels/{label.replace(':', '%3A')}")
+                self.assertEqual(gg.post_state(item["id"])["riskRegrade"]["state"], "triggered" if label else "skipped")
+
+    def test_risk_receipt_regrade_failure_never_reposts_or_retries_the_comment(self) -> None:
+        for answer in ((403, {"retry-after": "120"}, {"message": "secondary rate limit"}),
+                       (502, {}, {}), gg.WatchError("request failed: TimeoutError")):
+            with self.subTest(answer=answer):
+                item = self.queue("comment", "manaflow-ai/cmux#7", "--body", self.receipt()["body"])
+                d, t = self.daemon((201, {}, self.receipt()), (200, {}, self.pull()), answer)
+                self.step(d, NOW)
+                state = gg.post_state(item["id"])
+                self.assertEqual((state["state"], state["url"]), ("posted", self.url))
+                self.assertEqual(state["riskRegrade"]["state"], "failed")
+                self.assertIn("risk regrade", state["note"])
+                self.step(d, NOW + 600)
+                self.assertEqual(len(t.calls), 3)
+
+    def test_risk_receipt_checkpoint_resumes_after_delivery_without_reposting(self) -> None:
+        item = self.queue("comment", "manaflow-ai/cmux#7", "--body", self.receipt()["body"])
+        d, _ = self.daemon((201, {}, self.receipt()), gg.OutOfTime())
+        self.step(d, NOW)
+        queued = gg.read_json(gg.outbox_dir() / f"{item['id']}.json")
+        self.assertEqual(queued["delivered"]["url"], self.url)
+        again, t = self.daemon((200, {}, self.pull()), (200, {}, []))
+        self.step(again, NOW + gg.POST_SPACING)
+        self.assertEqual([c[0] for c in t.calls], ["GET", "DELETE"])
+        self.assertEqual(gg.post_state(item["id"])["riskRegrade"]["state"], "triggered")
+
+    def test_risk_receipt_crash_during_label_write_does_not_repeat_an_uncertain_effect(self) -> None:
+        item = self.queue("comment", "manaflow-ai/cmux#7", "--body", self.receipt()["body"])
+        d, transport = self.daemon((201, {}, self.receipt()), (200, {}, self.pull()))
+
+        def crash(method, *args):
+            if method == "DELETE":
+                raise SystemExit
+            return transport(method, *args)
+
+        d.transport = crash
+        with self.assertRaises(SystemExit):
+            self.step(d, NOW)
+        again, t = self.daemon()
+        self.step(again, NOW + gg.POST_SPACING)
+        self.assertEqual(t.calls, [])
+        state = gg.post_state(item["id"])
+        self.assertEqual((state["state"], state["riskRegrade"]["state"]), ("posted", "uncertain"))
+
+    def test_risk_receipt_respects_stopped_rest_budget(self) -> None:
+        item = self.queue("comment", "manaflow-ai/cmux#7", "--body", self.receipt()["body"])
+        d, t = self.daemon((201, {}, self.receipt()))
+        d.note_budget("rest", 5000, 0, NOW + 300)
+        self.step(d, NOW)
+        self.assertEqual(len(t.calls), 1)
+        self.assertEqual(gg.post_state(item["id"])["riskRegrade"]["state"], "failed")
+
+    def test_risk_receipt_metadata_failure_finishes_delivery_without_label_effect(self) -> None:
+        for answer in ((404, {}, {}), (429, {"retry-after": "120"}, {}),
+                       gg.WatchError("request failed: TimeoutError")):
+            with self.subTest(answer=answer):
+                item = self.queue("comment", "manaflow-ai/cmux#7", "--body", self.receipt()["body"])
+                d, t = self.daemon((201, {}, self.receipt()), answer)
+                self.step(d, NOW)
+                state = gg.post_state(item["id"])
+                self.assertEqual((state["state"], state["riskRegrade"]["state"]), ("posted", "failed"))
+                self.assertEqual(len(t.calls), 2)
+                if isinstance(answer, tuple) and answer[0] == 429:
+                    self.assertEqual(d.backoff["rest"], NOW + 120)
+
+    def test_risk_receipt_label_throttle_holds_other_writes_without_replaying_delivery(self) -> None:
+        item = self.queue("comment", "manaflow-ai/cmux#7", "--body", self.receipt()["body"])
+        d, t = self.daemon((201, {}, self.receipt()), (200, {}, self.pull()),
+                           (429, {"retry-after": "120"}, {}), (201, {}, {"html_url": "other"}))
+        self.step(d, NOW)
+        other = self.queue("comment", "o/r#8", "--body", "other")
+        self.step(d, NOW + gg.POST_SPACING)
+        self.assertEqual(len(t.calls), 3)
+        self.assertEqual(d.post_hold, NOW + 120)
+        self.step(d, NOW + 120)
+        self.assertEqual(len(t.calls), 4)
+        self.assertEqual(gg.post_state(item["id"])["riskRegrade"]["state"], "failed")
+        self.assertEqual(gg.post_state(other["id"])["url"], "other")
 
 
 if __name__ == "__main__":
