@@ -2674,27 +2674,36 @@ def checkout_users(checkout: Path) -> tuple[str, str]:
 
 
 def live_linked_worktrees(checkout: Path) -> list[str] | None:
-    """The linked worktrees of the checkout whose directories still exist (each worktrees/<name>/gitdir names its
-    <worktree>/.git), or None when the list cannot be read. A worktree whose directory is gone (a job's RUNNER_TEMP,
-    wiped between jobs) is only a stale entry."""
-    root = checkout / ".git" / "worktrees"
+    """The linked worktrees of the checkout's repository and of every repository stored inside its .git (absorbed
+    submodules under modules/, nested ones) whose directories still exist (each <gitdir>/worktrees/<name>/gitdir
+    names its <worktree>/.git; a --relative-paths one from worktrees/<name>), or None when any of it cannot be read.
+    A worktree whose directory is gone (a job's RUNNER_TEMP, wiped between jobs) is only a stale entry."""
+    dotgit = checkout / ".git"
+    roots = []
     try:
-        entries = list(os.scandir(root))
-    except FileNotFoundError:
-        return []
+        for root, dirs, files in os.walk(dotgit, onerror=lambda e: (_ for _ in ()).throw(e)):
+            if "worktrees" in dirs and ("HEAD" in files or Path(root) == dotgit):
+                roots.append(Path(root) / "worktrees")
+            if "HEAD" in files and "objects" in dirs:  # a git dir: its stores hold no git dirs
+                dirs[:] = [d for d in dirs if d not in ("objects", "lfs", "logs", "refs", "worktrees")]
     except OSError:
         return None
     live = []
-    for e in entries:
+    for root in roots:
         try:
-            target = (Path(e.path) / "gitdir").read_text().strip()
+            entries = list(os.scandir(root))
         except OSError:
             return None
-        if not target:
-            return None
-        target = os.path.normpath(os.path.join(e.path, target))  # a --relative-paths backlink is from worktrees/<name>
-        if os.path.lexists(os.path.dirname(target)):
-            live.append(os.path.dirname(target))
+        for e in entries:
+            try:
+                target = (Path(e.path) / "gitdir").read_text().strip()
+            except OSError:
+                return None
+            if not target:
+                return None
+            target = os.path.normpath(os.path.join(e.path, target))  # a relative backlink is from worktrees/<name>
+            if os.path.lexists(os.path.dirname(target)):
+                live.append(os.path.dirname(target))
     return live
 
 

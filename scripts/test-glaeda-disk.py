@@ -5108,6 +5108,15 @@ class GlaedaDiskTest(unittest.TestCase):
         (self.root / "rel/_work/cmux/elsewhere").mkdir()
         self.assertEqual(gd.live_linked_worktrees(self.root / "rel/_work/cmux/cmux"),
                          [os.fspath(self.root / "rel/_work/cmux/elsewhere")])
+        # an absorbed submodule's own linked worktree (git -C cmux/ghostty worktree add ...) counts too
+        sub = self.root / "rel/_work/cmux/cmux/.git/modules/ghostty"
+        (sub / "objects").mkdir(parents=True)
+        (sub / "HEAD").write_text("ref: refs/heads/main\n")
+        (sub / "worktrees/g1").mkdir(parents=True)
+        (self.root / "ghostty-wt").mkdir()
+        (sub / "worktrees/g1/gitdir").write_text(os.fspath(self.root / "ghostty-wt/.git") + "\n")
+        self.assertEqual(sorted(gd.live_linked_worktrees(self.root / "rel/_work/cmux/cmux")),
+                         sorted([os.fspath(self.root / "rel/_work/cmux/elsewhere"), os.fspath(self.root / "ghostty-wt")]))
 
     def test_the_job_start_judges_only_an_enrolled_runners_checkout_from_its_environment(self) -> None:
         home, cos = self._own_checkout_fixture()
