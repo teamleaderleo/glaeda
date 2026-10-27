@@ -4291,6 +4291,7 @@ class GlaedaDiskTest(unittest.TestCase):
         for name in ("EMERGENCY_DEVS", "ACTIVITY_MODE", "FLOOR_HOLD", "ROLE", "RUNNER_CACHE_PROFILE",
                      "_REFRESH_DEADLINE_ACTIVE", "_MEASURE_BUDGET_REACHED"):
             self.addCleanup(setattr, gd, name, getattr(gd, name))
+        gd._MEASURE_BUDGET_REACHED = False  # survey resets it; a mocked survey must start from a clean run too
         fss = {dev: gd.Fs(dev, "/", int(free_gib * gd.GIB), total, 120 * gd.GIB, 170 * gd.GIB)}
         items = over.pop("items", [])
         with mock.patch.object(gd, "RUN_LOG", log), \
