@@ -8076,30 +8076,42 @@ class BrokerAnswerCacheTest(BrokerBase):
         self.run_gh(read)
         self.run_gh(["api", "repos/o/other/pulls/9"])
         comment = ["pr", "comment", "7", "-R", "o/r", "--body", "hi"]
-        _code, _out, _err, passed = self.run_gh(comment)
-        self.assertEqual(passed, comment, "a write is exec'd")
+        code, _out, _err, passed = self.run_gh(comment)
+        self.assertEqual((code, passed, self.runs()), (0, None, 3), "a write runs once, as a child")
+        self.assertIn("comment", self.passed.read_text())
         _code, out, _err, _ = self.run_gh(read)
-        self.assertEqual(out, "answer 3\n")
+        self.assertEqual(out, "answer 4\n")
         _code, out, _err, _ = self.run_gh(["api", "repos/o/other/pulls/9"])
         self.assertEqual(out, "answer 2\n", "a write to another repository leaves this one's answers")
 
     def test_a_read_during_a_write_is_not_kept_for_others(self) -> None:
-        """The stamp is written before the write runs, so it reaches past it."""
-        self.run_gh(["pr", "comment", "7", "-R", "o/r", "--body", "hi"])
-        self.run_gh(["api", "repos/o/r/pulls/7"])
-        _code, out, _err, _ = self.run_gh(["api", "repos/o/r/pulls/7"])
-        self.assertEqual(out, "answer 2\n")
+        """A write is stamped again when it finishes, so an answer read while it was in flight is
+        older than that stamp and is not served."""
+        key = "e" * 40
+        started = time.time()
+        gg.gh_cache_put(key, started, 0, b"old\n", b"")
+        self.assertIsNotNone(gg.gh_cache_get(key, "o/r", started + 1))
+        gg.gh_cache_note_write("o/r", started + 0.5)
+        self.assertIsNone(gg.gh_cache_get(key, "o/r", started + 1))
+
+    def test_a_failing_write_still_returns_its_code_and_stamps(self) -> None:
+        os.environ["FAKE_GH_RC"] = "3"
+        self.addCleanup(os.environ.pop, "FAKE_GH_RC", None)
+        code, _out, _err, passed = self.run_gh(["pr", "merge", "7", "-R", "o/r"])
+        self.assertEqual((code, passed, self.runs()), (3, None, 1))
+        self.assertIn("o/r", gg.gh_cache_writes())
 
     def test_a_write_naming_no_repository_stamps_them_all(self) -> None:
         self.run_gh(["api", "repos/o/r/pulls/7"])
         self.run_gh(["api", "-X", "PATCH", "user", "-f", "name=x"])
         _code, out, _err, _ = self.run_gh(["api", "repos/o/r/pulls/7"])
-        self.assertEqual(out, "answer 2\n")
+        self.assertEqual(out, "answer 3\n")
 
-    def test_writes_and_uncacheable_reads_go_straight_to_gh(self) -> None:
-        for args in (["api", "-X", "POST", "repos/o/r/issues/7/comments", "-f", "body=hi"],
-                     ["api", "repos/o/r/issues/7/comments", "-f", "body=hi"],
-                     ["api", "graphql", "-f", "query=query{viewer{login}}"],
+    def test_uncacheable_reads_go_straight_to_gh(self) -> None:
+        for args in (["api", "graphql", "-f", "query=query{viewer{login}}"],
+                     ["api", "-i", "repos/o/r/pulls/7"],
+                     ["api", "--verbose", "repos/o/r/pulls/7"],
+                     ["api", "repos/{owner}/{repo}/branches/{branch}"],
                      ["api", "rate_limit"],
                      ["pr", "view"],
                      ["pr", "view", "7", "-R", "o/r", "--web"],
@@ -8110,10 +8122,10 @@ class BrokerAnswerCacheTest(BrokerBase):
                 self.assertEqual(passed, args)
         self.assertEqual(self.runs(), 0)
 
-    def test_the_working_directory_is_part_of_a_question_that_names_no_repository(self) -> None:
-        one, two = self.home / "one", self.home / "two"
-        one.mkdir()
-        two.mkdir()
+    def test_the_resolved_repository_is_part_of_a_question_that_names_none(self) -> None:
+        one, two = self.checkout("o/one"), self.checkout("o/two")
+        nowhere = self.home / "nowhere"
+        nowhere.mkdir()
         here = os.getcwd()
         self.addCleanup(os.chdir, here)
         for where in (one, two, one):
@@ -8121,6 +8133,73 @@ class BrokerAnswerCacheTest(BrokerBase):
             self.run_gh(["pr", "view", "7", "--json", "body"])
             self.run_gh(["api", "repos/{owner}/{repo}/pulls/7"])
         self.assertEqual(self.runs(), 4)
+        # the same directory, its remote changed: another repository, another question
+        self.git_checkout(one, '[remote "origin"]\n\turl = git@github.com:o/three.git\n')
+        os.chdir(one)
+        self.run_gh(["pr", "view", "7", "--json", "body"])
+        self.assertEqual(self.runs(), 5)
+        # a directory whose repository cannot be known is never cached: exec'd, never filled
+        os.chdir(nowhere)
+        for _ in range(2):
+            _code, _out, _err, passed = self.run_gh(["pr", "view", "7", "--json", "body"])
+            self.assertIsNotNone(passed)
+        self.assertEqual(self.runs(), 5)
+
+    def test_writes_go_through_once_and_are_never_kept(self) -> None:
+        for args in (["api", "-X", "POST", "repos/o/r/issues/7/comments", "-f", "body=hi"],
+                     ["api", "repos/o/r/issues/7/comments", "-f", "body=hi"],
+                     ["api", "graphql", "--input", "q.json"],
+                     ["api", "graphql", "-F", "query=@q.graphql"],
+                     ["auth", "switch"]):
+            with self.subTest(args=args):
+                before = self.runs()
+                self.run_gh(args)
+                self.run_gh(args)
+                self.assertEqual(self.runs(), before + 2)
+
+    def test_debug_output_is_never_kept(self) -> None:
+        with mock.patch.dict(os.environ, {"GH_DEBUG": "api"}):
+            _code, _out, _err, passed = self.run_gh(["api", "repos/o/r/pulls/7"])
+        self.assertIsNotNone(passed)
+
+    def test_another_account_in_hosts_yml_is_another_question(self) -> None:
+        config = self.home / "gh-config"
+        config.mkdir(exist_ok=True)
+        (config / "hosts.yml").write_text("github.com:\n    user: one\n")
+        args = ["api", "repos/o/r/pulls/7"]
+        self.run_gh(args)
+        self.run_gh(args)
+        (config / "hosts.yml").write_text("github.com:\n    user: two\n")
+        self.run_gh(args)
+        self.assertEqual(self.runs(), 2)
+
+    def test_a_fill_whose_lock_is_held_runs_gh_the_ordinary_way(self) -> None:
+        key = "f" * 40
+        gg.gh_cache_dir().mkdir(parents=True, exist_ok=True)
+        with mock.patch.object(gg, "GH_CACHE_FILL_WAIT", 0.1), \
+                gg.bounded_lock(gg.gh_cache_dir() / f".{key}.lock") as held:
+            self.assertTrue(held)
+            ran: list[int] = []
+            self.assertIsNone(gg.gh_cache_fill(str(self.home / "bin" / "gh"), ["api", "x"], key, None, ran))
+        self.assertEqual((ran, self.runs()), ([], 0))
+
+    def test_a_hung_fill_is_stopped_at_its_deadline(self) -> None:
+        hung = self.home / "bin" / "hung"
+        hung.write_text("#!/bin/sh\nsleep 30\n")
+        hung.chmod(0o755)
+        started = time.monotonic()
+        rc, _out, err = gg.gh_cache_child(str(hung), [], True, 0.5)
+        self.assertEqual(rc, 124)
+        self.assertIn(b"stopped", err)
+        self.assertLess(time.monotonic() - started, 10)
+
+    def test_a_queued_post_stamps_its_repository(self) -> None:
+        args = mock.Mock(kind="comment", target="O/R#7", body="hi", body_file=None, wait=0, json=False,
+                         head=None, base=None, title=None, reviewer=None, event="comment")
+        with mock.patch.object(gg, "daemon_running", return_value=False), \
+                contextlib.redirect_stderr(io.StringIO()):
+            gg.cmd_post(args)
+        self.assertIn("o/r", gg.gh_cache_writes())
 
     def test_another_token_is_another_question(self) -> None:
         args = ["api", "repos/o/r/pulls/7"]
@@ -8167,6 +8246,7 @@ class BrokerAnswerCacheTest(BrokerBase):
             words, method, _seen, _values = gg.broker_words(args)
             return gg.gh_cache_is_write(args, words, method)
         for args in (["pr", "merge", "7"], ["pr", "edit", "7"], ["run", "rerun", "5"], ["workflow", "run", "x"],
+                     ["auth", "switch"], ["api", "graphql", "--input", "q.json"],
                      ["api", "-X", "DELETE", "repos/o/r/x"], ["api", "repos/o/r/x", "-F", "a=1"],
                      ["api", "graphql", "-f", "query=mutation{x}"], ["something-new", "verb"]):
             with self.subTest(args=args):
@@ -8226,7 +8306,14 @@ class RunnersTest(BrokerBase):
         out = io.StringIO()
         with mock.patch.object(gg, "run_bounded", return_value=done) as ran, contextlib.redirect_stdout(out):
             self.assertEqual(gg.cmd_runners("o", None, True), 0)
-        self.assertIn("orgs/o/actions/runners?per_page=100", ran.call_args[0][0])
+        argv = ran.call_args[0][0]
+        self.assertIn("orgs/o/actions/runners?per_page=100", argv)
+        self.assertEqual(argv[2:4], ["gh", "api"], "read through this broker, so the cache shares it")
+        bad = subprocess.CompletedProcess([], 0, "not json\n", "")
+        with mock.patch.object(gg, "run_bounded", return_value=bad), self.assertRaises(gg.WatchError):
+            gg.cmd_runners("o", None, True)
+        with mock.patch.object(gg, "run_bounded", side_effect=OSError("no")), self.assertRaises(gg.WatchError):
+            gg.cmd_runners("o", None, True)
         doc = json.loads(out.getvalue())
         self.assertEqual((doc["runners"], doc["online"], doc["busy"], doc["busyRunners"]), (3, 2, 1, ["a"]))
         self.assertEqual(doc["labels"]["mini"], {"online": 2, "busy": 1})
