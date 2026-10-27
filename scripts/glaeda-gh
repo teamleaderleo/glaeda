@@ -59,10 +59,12 @@ the daemon is the only process that talks to GitHub, and clients only read its c
   (REST 1500 left, GraphQL 500) the daemon polls four times less often and skips job lists; below
   the reserve (REST 300, GraphQL 100) it stops that API until the quota resets. The quota is shared,
   so this also protects every other tool on the account.
-- The daemon's own REST spend is capped at restShare (0.4) of the hourly REST limit: the requests it
-  sent over the last hour that GitHub counted (a 304 is free and is not counted). At the cap, REST is
-  lean and PR and run reads move to GraphQL, so the shared REST pool is left to `gh`, landers and
-  nightly re-runs. The cycle, the floors and the share are read every tick from
+- The daemon's own REST polling is capped at restShare (0.4) of the hourly REST limit: the read
+  requests it sent over the last hour that GitHub counted (a 304 is free and is not counted, nor are
+  the outbox's writes, which sessions asked for), kept per minute in rest-spend.json across restarts.
+  A read starts only when its worst case fits. At the cap, PR and run reads move to GraphQL, or wait
+  while GraphQL is stopped too, so the shared REST pool is left to `gh`, landers and nightly re-runs.
+  The one read the cap never holds back is a failed attempt's job list (once per attempt). The cycle, the floors and the share are read every tick from
   ~/.config/glaeda/gh-daemon.json, {"cycle": 60, "commentCycle": 15, "restShare": 0.4,
   "floors": {"rest": {"floor": 1500, "reserve": 300}, "graphql": {"floor": 500, "reserve": 100}}};
   a missing key or a value out of range keeps its default.
@@ -1277,7 +1279,7 @@ class Daemon:
             int(k): int(v) for k, v in (spend if isinstance(spend, dict) else {}).items()
             if str(k).isdigit() and isinstance(v, int) and not isinstance(v, bool) and v > 0}
         self.saved_rest_minutes = dict(self.rest_minutes)
-        self.tick_capped = False  # the share was spent when this tick began (REST is then lean, not shared)
+        self.writing = False  # inside the outbox: its requests are sessions' writes, not the daemon's polling
 
     # -- budget
 
@@ -1308,10 +1310,8 @@ class Daemon:
         return self.rest_spent() >= self.rest_cap()
 
     def rest_room(self, cost: int) -> bool:
-        """Whether `cost` more counted REST requests fit in the share. A tick that began capped reads
-        over REST only because GraphQL is stopped too, in lean mode, and is not held to the share:
-        reading four times less often beats not reading at all."""
-        return self.tick_capped or self.rest_spent() + cost <= self.rest_cap()
+        """Whether `cost` more counted REST requests fit in the share."""
+        return self.rest_spent() + cost <= self.rest_cap()
 
     def richness(self, bucket: str) -> float:
         """What this bucket can still spend per second until its own reset, above its reserve; -1
@@ -1319,10 +1319,7 @@ class Daemon:
         if self.mode(bucket) == "stop":
             return -1.0
         if bucket == "rest" and self.rest_capped():
-            # The daemon's own REST share is spent: nothing to spend, so balanced kinds read over
-            # GraphQL. Zero, not -1: REST is lean, not stopped, so a kind whose GraphQL is stopped
-            # still moves here and is read four times less often instead of not at all.
-            return 0.0
+            return -1.0  # the daemon's own REST share is spent: balanced kinds read over GraphQL
         seen = self.budget.get(bucket) or {}
         limit = seen.get("limit") or 5000
         reserve = self.policy["floors"][bucket][1]
@@ -1424,7 +1421,7 @@ class Daemon:
         # `free` is /rate_limit, which costs no quota: counting it as a REST request would overstate
         # what the daemon spends.
         self.sent.append((self.now, "free" if free else "rest304" if bucket == "rest" and status == 304 else bucket))
-        if bucket == "rest" and not free and status != 304:
+        if bucket == "rest" and not free and status != 304 and not self.writing:
             minute = int(self.now // 60)
             self.rest_minutes[minute] = self.rest_minutes.get(minute, 0) + 1
             # On disk before the next request, so a daemon that dies mid-tick hands its successor the
@@ -1468,12 +1465,15 @@ class Daemon:
                 continue
             if (item.get("notBefore") or 0) > self.now:
                 continue
+            self.writing = True
             try:
                 self.post_one(path, item)
             except OutOfTime:
                 pass
             except Exception as error:  # noqa: BLE001  a malformed entry (a key missing, an unknown kind) fails alone
                 self.post_finish(path, item, error=f"bad queue entry: {describe(error)} at {error_site(error)}")
+            finally:
+                self.writing = False
             return
 
     def post_between(self) -> None:
@@ -1724,8 +1724,11 @@ class Daemon:
 
     def due(self, kind: str, entries: list[dict]) -> list[dict]:
         mine = [e for e in entries if e["key"].startswith(kind + ":")]
-        mode = self.mode(self.route(kind))
-        if mode == "stop":
+        path = self.route(kind)
+        mode = self.mode(path)
+        if mode == "stop" or (path == "rest" and kind in BALANCED and self.rest_capped()):
+            # Spent, or the daemon's REST share is: a kind with no GraphQL to go to (it is stopped too)
+            # waits for the share to free up rather than spend the REST the sessions are left with.
             return []
         if kind == "head":
             return self.due_heads(mine, mode)
@@ -1859,7 +1862,6 @@ class Daemon:
         self.tick_deadline = time.monotonic() + TICK_BUDGET
         self.errors = []
         self.policy = daemon_policy()
-        self.tick_capped = self.rest_capped()  # before any request: this tick's GraphQL phase may spend REST too
         if self.failing is None:
             # and again in serve_waits: a long read phase must not look like a dead daemon; ticks that
             # keep raising stop marking, so their blockers hand the wait back (resume_wait says why)
@@ -5303,15 +5305,15 @@ def broker_max_age(fields: list[str]) -> float:
         # horizon for fields where staleness only costs a request; it is not a way to turn that
         # distinction off.
         return BROKER_MAX_AGE
-    try:
-        age = float(os.environ["GLAEDA_GH_MAX_AGE"])
-        return age if age >= 0 else BROKER_MAX_AGE
-    except (KeyError, ValueError):
-        pass
     # A daemon configured to poll less often than every BROKER_MAX_AGE - 30 s would leave its cache
     # always older than the horizon, and every read would go to gh: the horizon follows the cycle.
     # (Not for the live fields above: their horizon is a correctness bound, not a cost.)
     normal = max(BROKER_MAX_AGE, daemon_policy()["cycle"] + 30.0)
+    try:
+        age = float(os.environ["GLAEDA_GH_MAX_AGE"])
+        return age if age >= 0 else normal
+    except (KeyError, ValueError):
+        pass
     budget = read_json(BASE / "budget.json")
     if not isinstance(budget, dict):
         return normal

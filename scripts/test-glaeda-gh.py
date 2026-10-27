@@ -8090,7 +8090,7 @@ class DaemonPolicyTest(Base):
         self.spend_rest(1)
         self.assertEqual((self.daemon.rest_spent(), self.daemon.rest_cap()), (2000, 2000))
         self.assertTrue(self.daemon.rest_capped())
-        self.assertEqual(self.daemon.richness("rest"), 0)
+        self.assertEqual(self.daemon.richness("rest"), -1)
         self.assertEqual(self.daemon.mode("rest"), "lean")
         self.assertEqual(self.daemon.route("pr"), "graphql")
         self.assertEqual(self.daemon.route("run"), "graphql")
@@ -8109,16 +8109,19 @@ class DaemonPolicyTest(Base):
         self.spend_rest(1500)
         self.assertEqual(self.daemon.mode("rest"), "lean")
 
-    def test_capped_with_graphql_stopped_keeps_rest_lean_not_stopped(self) -> None:
+    def test_capped_with_graphql_stopped_reads_nothing_over_rest(self) -> None:
         self.daemon.now = NOW
         self.daemon.budget = {"rest": {"limit": 5000, "remaining": 4000, "reset": NOW + 1800},
                               "graphql": {"limit": 5000, "remaining": 10, "reset": NOW + 1800}}
         self.daemon.paths["run"] = "rest"
         self.spend_rest(2000)
         self.assertEqual(self.daemon.route("run"), "rest")  # nowhere richer to go
-        self.assertEqual(self.daemon.mode("rest"), "lean")  # so it reads, four times less often
-        self.assertEqual(self.daemon.paths["pr"], "graphql")
-        self.assertEqual(self.daemon.route("pr"), "rest")  # a kind on a stopped GraphQL still moves
+        self.assertEqual(self.daemon.mode("rest"), "lean")
+        # the share holds even so: the run waits for it rather than spend what the sessions have left
+        self.gh.runs[7] = {"id": 7, "status": "in_progress", "html_url": "u"}
+        gg.register("run:o/r/7")
+        self.daemon.tick(NOW)
+        self.assertEqual(self.gh.rest_calls(), [])
 
     def test_only_counted_rest_requests_spend_the_share(self) -> None:
         self.daemon.now = NOW
@@ -8153,6 +8156,8 @@ class DaemonPolicyTest(Base):
         self.configure({"cycle": 300})
         self.assertEqual(gg.broker_max_age(["title"]), 330)
         self.assertEqual(gg.broker_max_age(["headRefOid"]), gg.BROKER_MAX_AGE)  # live fields keep theirs
+        with mock.patch.dict(os.environ, {"GLAEDA_GH_MAX_AGE": "-1"}):
+            self.assertEqual(gg.broker_max_age(["title"]), 330)
 
     def test_reaching_the_share_mid_tick_defers_the_rest_reads(self) -> None:
         for n in (7, 8, 9):
@@ -8178,14 +8183,14 @@ class DaemonPolicyTest(Base):
         self.assertEqual(self.gh.rest_calls(), [])
         self.assertIn("pr:o/r#1", self.daemon.deferred)
 
-    def test_reaching_the_share_during_the_tick_does_not_exempt_it(self) -> None:
+    def test_writes_do_not_spend_the_share(self) -> None:
         self.daemon.now = NOW
-        self.spend_rest(1999, at=NOW)
-        self.daemon.tick_capped = self.daemon.rest_capped()  # as tick() does, before any request
-        self.spend_rest(5, at=NOW)  # the GraphQL phase's job reads, say
-        self.assertFalse(self.daemon.rest_room(1))
-        self.daemon.tick_capped = True  # a tick that began capped: GraphQL is stopped, REST lean
-        self.assertTrue(self.daemon.rest_room(gg.REST_READ_MAX["pr"]))
+        self.daemon.transport = lambda *a: (201, {}, b"{}")
+        self.daemon.writing = True  # as post_tick sets it around one write
+        self.daemon.request("POST", "/repos/o/r/issues/1/comments", {"body": "x"}, content=True)
+        self.daemon.request("GET", "/repos/o/r/issues/1/comments")  # the write's own dedupe lookup
+        self.daemon.writing = False
+        self.assertEqual(self.daemon.rest_spent(), 0)
 
     def test_a_failed_attempt_still_gets_its_job_list_at_the_cap(self) -> None:
         """The one read the share does not hold back: a wait cannot rule on a failed run without it."""
