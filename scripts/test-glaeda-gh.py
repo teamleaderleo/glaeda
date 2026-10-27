@@ -8138,6 +8138,22 @@ class DaemonPolicyTest(Base):
         self.assertEqual(again.rest_spent(), 1200)
         self.assertNotIn(str(int((NOW - 3700) // 60)), gg.read_json(gg.BASE / gg.REST_SPEND_FILE))
 
+    def test_the_spend_is_on_disk_as_each_request_is_made(self) -> None:
+        self.daemon.now = NOW
+        self.daemon.transport = lambda *a: (200, {}, b"{}")
+        self.daemon.request("GET", "/repos/o/r/pulls/1")
+        self.daemon.request("GET", "/repos/o/r/pulls/2")
+        # no finish_tick: a daemon killed here still leaves its spend for the next one
+        again = gg.Daemon(transport=self.gh, token=lambda: TOKEN, controller=None)
+        again.now = NOW
+        self.assertEqual(again.rest_spent(), 2)
+
+    def test_the_broker_horizon_follows_a_longer_cycle(self) -> None:
+        self.assertEqual(gg.broker_max_age(["title"]), gg.BROKER_MAX_AGE)
+        self.configure({"cycle": 300})
+        self.assertEqual(gg.broker_max_age(["title"]), 330)
+        self.assertEqual(gg.broker_max_age(["headRefOid"]), gg.BROKER_MAX_AGE)  # live fields keep theirs
+
     def test_reaching_the_share_mid_tick_defers_the_rest_reads(self) -> None:
         for n in (7, 8, 9):
             self.gh.runs[n] = {"id": n, "status": "in_progress", "html_url": f"u{n}"}

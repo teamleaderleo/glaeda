@@ -1427,6 +1427,11 @@ class Daemon:
         if bucket == "rest" and not free and status != 304:
             minute = int(self.now // 60)
             self.rest_minutes[minute] = self.rest_minutes.get(minute, 0) + 1
+            # On disk before the next request, so a daemon that dies mid-tick hands its successor the
+            # spend it really made. One small file write per counted request (about 2000 an hour at
+            # the cap) is nothing next to the request itself.
+            write_json(BASE / REST_SPEND_FILE, {str(m): n for m, n in self.rest_minutes.items()})
+            self.saved_rest_minutes = dict(self.rest_minutes)
         if status == 401:
             self.token = None  # re-read from gh next time
         if "x-ratelimit-remaining" in h and h.get("x-ratelimit-resource", "core") in {"core", "graphql"}:
@@ -5303,9 +5308,13 @@ def broker_max_age(fields: list[str]) -> float:
         return age if age >= 0 else BROKER_MAX_AGE
     except (KeyError, ValueError):
         pass
+    # A daemon configured to poll less often than every BROKER_MAX_AGE - 30 s would leave its cache
+    # always older than the horizon, and every read would go to gh: the horizon follows the cycle.
+    # (Not for the live fields above: their horizon is a correctness bound, not a cost.)
+    normal = max(BROKER_MAX_AGE, daemon_policy()["cycle"] + 30.0)
     budget = read_json(BASE / "budget.json")
     if not isinstance(budget, dict):
-        return BROKER_MAX_AGE
+        return normal
     now = time.time()
     for bucket, (floor, _reserve) in daemon_policy()["floors"].items():
         seen = budget.get(bucket)
@@ -5313,8 +5322,8 @@ def broker_max_age(fields: list[str]) -> float:
             continue
         remaining = seen.get("remaining")
         if isinstance(remaining, int) and remaining < floor:
-            return BROKER_LEAN_AGE
-    return BROKER_MAX_AGE
+            return max(BROKER_LEAN_AGE, normal)
+    return normal
 
 
 def broker_bucket_spent(key: str, now: float) -> bool:
