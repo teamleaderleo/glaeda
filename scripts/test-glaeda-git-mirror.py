@@ -3,8 +3,10 @@
 
 from __future__ import annotations
 
+import fcntl
 import importlib.machinery
 import importlib.util
+import json
 import os
 import subprocess
 import sys
@@ -12,6 +14,7 @@ import tarfile
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -321,6 +324,48 @@ class Mirror(unittest.TestCase):
         self.assertFalse(self.mirror.exists())
         self.assertEqual([p.name for p in self.mirror.parent.iterdir() if p.name.startswith(".seed-")], [])
 
+    def test_a_corrupt_archive_falls_through_to_the_other_one(self) -> None:
+        (self.bucket / f"v1/any/objects/{self.key}.tar.zst").write_bytes(b"not zstd")
+        with mock.patch.object(gm, "zstd", lambda: "/usr/bin/false"):
+            result = gm.run(True, home=self.home)
+        self.assertEqual(result["state"], "applied", result)
+        self.assertTrue(self.downloads[-1].endswith(".tar.gz"), self.downloads)
+
+    def test_a_killed_fetch_s_keep_files_never_pile_up(self) -> None:
+        gm.run(True, home=self.home)
+        keep = self.mirror / "objects/pack/pack-dead.keep"
+        keep.write_text("fetch-pack 1 on host\n")
+        self.assertEqual(gm.run(True, home=self.home)["state"], "applied")
+        self.assertFalse(keep.exists())
+
+    def test_a_dead_pass_s_writers_are_stopped_before_the_next_pass_writes(self) -> None:
+        gm.run(True, home=self.home)
+        fd = os.open(gm.GIT_DIR / ".lock", os.O_RDWR)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        writer = subprocess.Popen(["/bin/sleep", "60"], start_new_session=True, pass_fds=(fd,))
+        self.addCleanup(lambda: (writer.poll() is None and writer.kill(), writer.wait()))
+        os.close(fd)  # only the orphan holds the flock now
+        dead = subprocess.Popen(["/usr/bin/true"])
+        dead.wait()
+        (gm.GIT_DIR / gm.PASS_FILE).write_text(json.dumps({"pid": dead.pid, "groups": [writer.pid]}))
+        with mock.patch.object(gm, "ORPHAN_NAMES", {"sleep"}):
+            result = gm.run(True, home=self.home)
+        self.assertEqual(result["state"], "applied", result)
+        self.assertIsNotNone(writer.wait(timeout=10))
+        self.assertFalse((gm.GIT_DIR / gm.PASS_FILE).exists())
+
+    def test_a_live_pass_is_never_stopped(self) -> None:
+        gm.run(True, home=self.home)
+        fd = os.open(gm.GIT_DIR / ".lock", os.O_RDWR)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        self.addCleanup(os.close, fd)
+        writer = subprocess.Popen(["/bin/sleep", "60"], start_new_session=True)
+        self.addCleanup(lambda: (writer.kill(), writer.wait()))
+        (gm.GIT_DIR / gm.PASS_FILE).write_text(json.dumps({"pid": os.getpid(), "groups": [writer.pid]}))
+        with mock.patch.object(gm, "ORPHAN_NAMES", {"sleep"}):
+            self.assertEqual(gm.run(True, home=self.home)["state"], "busy")
+        self.assertIsNone(writer.poll())
+
     def test_a_bad_pointer_is_refused(self) -> None:
         (self.bucket / f"v1/any/latest/{gm.BUNDLE_PREFIX}").write_text("../../etc/passwd")
         result = gm.run(True, home=self.home)
@@ -375,6 +420,34 @@ class Fetch(unittest.TestCase):
                 self.assertEqual(timeout, gm.FETCH_TIMEOUT)
                 self.assertEqual(command[1:5], list(gm.LOW_SPEED))
                 self.assertNotIn("--depth", " ".join(command))
+
+    def test_a_download_cut_off_part_way_resumes(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            target, calls = Path(temp) / "bundle", []
+
+            def curl(command, **_):
+                calls.append(command)
+                if len(calls) == 1:
+                    target.write_bytes(b"half")
+                    return subprocess.CompletedProcess(command, 28)
+                with target.open("ab") as out:
+                    out.write(b" and the rest")
+                return subprocess.CompletedProcess(command, 0)
+
+            with mock.patch.object(gm.subprocess, "run", curl), mock.patch.object(gm.time, "sleep"):
+                gm.download("https://bucket.test/x", target, 60)
+            self.assertEqual(target.read_bytes(), b"half and the rest")
+            self.assertEqual(len(calls), 2)
+            self.assertIn("--continue-at", calls[1])
+
+    def test_a_missing_object_is_asked_for_once(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            calls = []
+            with mock.patch.object(gm.subprocess, "run",
+                                   lambda command, **_: calls.append(command) or subprocess.CompletedProcess(command, 22)):
+                with self.assertRaises(subprocess.CalledProcessError):
+                    gm.download("https://bucket.test/x", Path(temp) / "x", 60)
+            self.assertEqual(len(calls), 1)
 
     def test_run_group_kills_a_hung_command(self) -> None:
         status, why = gm.run_group(["sh", "-c", "sleep 30 & sleep 30"], timeout=1)

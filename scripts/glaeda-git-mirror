@@ -73,7 +73,9 @@ LOW_SPEED = ("-c", "http.lowSpeedLimit=1024", "-c", "http.lowSpeedTime=60")
 FETCH_TIMEOUT = 600
 FETCH_TRIES = 3
 BACKOFF = (10, 30)
-DOWNLOAD_TIMEOUT = 1800
+# A first seed runs at the uplink's speed: 2.2 GB at 0.4-0.9 MB/s (2026-10-27) is 40-90 minutes.
+DOWNLOAD_TIMEOUT = 10800
+DOWNLOAD_TRIES = 4
 LOCK_WAIT = 900
 # A seed writes the bundle and its unpacked copy (2.4 GB each, 2026-10-27), with room to spare.
 SEED_MIN_FREE = 12 * 1024**3
@@ -108,15 +110,36 @@ def runner_installed(home: Path | None = None) -> bool:
     return any((runner / ".runner").is_file() for runner in home.glob("actions-runner*"))
 
 
+# Every child of a pass inherits the pass's flock (pass_fds), so a writer the pass's own death left running
+# still holds the lock and no later pass writes beside it; PASS_FILE names its process groups so the next
+# pass can stop them (macOS has no parent-death signal).
+HELD: list[int] = []
+PASS_FILE = ".pass.json"
+ORPHAN_NAMES = {"git", "git-remote-https", "git-remote-http", "git-index-pack", "git-upload-pack", "ssh", "curl",
+                "tar", "bsdtar", "zstd", "python3", "Python"}
+
+
+def held() -> tuple[int, ...]:
+    return tuple(HELD)
+
+
 def git(repo: Path, *args: str, timeout: float = FETCH_TIMEOUT) -> str:
     return subprocess.run([GIT, "-C", os.fspath(repo), *args], check=True, capture_output=True, text=True,
-                          timeout=timeout).stdout
+                          timeout=timeout, pass_fds=held()).stdout
+
+
+def note_groups(groups: list[int]) -> None:
+    """Record this pass and the process groups it runs children in (under the flock)."""
+    if not HELD:
+        return
+    with_suppressed(lambda: (GIT_DIR / PASS_FILE).write_text(json.dumps({"pid": os.getpid(), "groups": groups})))
 
 
 def run_group(command: Sequence[str], timeout: float) -> tuple[int, str]:
     """Run `command` in its own process group, killed whole at `timeout`; (status, stderr tail). 124 is a timeout."""
     process = subprocess.Popen(list(command), start_new_session=True, stdout=subprocess.DEVNULL,
-                               stderr=subprocess.PIPE, text=True)
+                               stderr=subprocess.PIPE, text=True, pass_fds=held())
+    note_groups(own_group() + [process.pid])
     try:
         _, err = process.communicate(timeout=timeout)
         return process.returncode, (err or "")[-400:]
@@ -124,6 +147,48 @@ def run_group(command: Sequence[str], timeout: float) -> tuple[int, str]:
         with_suppressed(lambda: os.killpg(process.pid, signal.SIGKILL))
         process.communicate()
         return 124, f"timed out after {timeout:.0f} s"
+    finally:
+        note_groups(own_group())
+
+
+def own_group() -> list[int]:
+    """This pass's own process group, when the pass leads it (its git, curl and tar children run there)."""
+    return [os.getpid()] if os.getpgid(0) == os.getpid() else []
+
+
+def alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def stop_orphans() -> list[int]:
+    """The flock is held but the pass that took it is dead: its children are still writing the mirror with
+    no watchdog. Stop the groups it recorded, when each still holds only a pass's own kinds of process."""
+    try:
+        recorded = json.loads((GIT_DIR / PASS_FILE).read_text())
+        pid, groups = int(recorded["pid"]), [int(group) for group in recorded["groups"]]
+    except (OSError, ValueError, KeyError, TypeError):
+        return []
+    if alive(pid):
+        return []
+    listing = subprocess.run(["/bin/ps", "-A", "-o", "pgid=,comm="], capture_output=True, text=True, timeout=30)
+    members: dict[int, set[str]] = {}
+    for line in listing.stdout.splitlines():
+        group, _, command = line.strip().partition(" ")
+        if group.isdigit():
+            members.setdefault(int(group), set()).add(Path(command.strip()).name)
+    stopped = []
+    for group in groups:
+        names = members.get(group)
+        if group > 1 and names and names <= ORPHAN_NAMES:
+            with_suppressed(lambda: os.killpg(group, signal.SIGKILL))
+            stopped.append(group)
+    return stopped
 
 
 def with_suppressed(call: Callable[[], object]) -> None:
@@ -202,9 +267,11 @@ def fetch(mirror: Path, url: str, *, tries: int = FETCH_TRIES, timeout: float = 
 
 def drop_leftovers(mirror: Path) -> None:
     """What a killed git (its process group is dead by now) leaves in the mirror, which would make every
-    later fetch fail: temporary packs, ref locks ("cannot lock ref"), and git's own shallow.lock file
+    later fetch fail: temporary packs, the .keep an index-pack holds until its refs land (geometric repack
+    skips a kept pack, so they would pile up), ref locks ("cannot lock ref"), and git's own shallow.lock file
     (the guard is a directory there)."""
-    for leftover in [*(mirror / "objects" / "pack").glob("tmp_*"), *(mirror / "refs").rglob("*.lock"),
+    for leftover in [*(mirror / "objects" / "pack").glob("tmp_*"), *(mirror / "objects" / "pack").glob("*.keep"),
+                     *(mirror / "refs").rglob("*.lock"),
                      mirror / "packed-refs.lock", mirror / "shallow.lock", mirror / "config.lock",
                      mirror / "HEAD.lock"]:
         if leftover.is_file() and not leftover.is_symlink():
@@ -220,10 +287,27 @@ def zstd() -> str | None:
 
 
 def download(url: str, target: Path, timeout: float) -> None:
-    subprocess.run([CURL, "--fail", "--silent", "--show-error", "--location", "--retry", "3", "--retry-delay", "5",
-                    "--connect-timeout", "15", "--speed-limit", "1024", "--speed-time", "60",
-                    "--max-time", str(int(timeout)), "-o", os.fspath(target), url],
-                   check=True, capture_output=True, timeout=timeout + 60)
+    """Fetch `url` to `target` within `timeout`; a try cut off part way resumes where it stopped."""
+    target.unlink(missing_ok=True)
+    deadline = time.monotonic() + timeout
+    status = 28
+    for attempt in range(1, DOWNLOAD_TRIES + 1):
+        left = deadline - time.monotonic()
+        if left < 1:
+            break
+        if attempt > 1:
+            time.sleep(5)
+        status = subprocess.run([CURL, "--fail", "--silent", "--show-error", "--location", "--continue-at", "-",
+                                 "--connect-timeout", "15", "--speed-limit", "1024", "--speed-time", "60",
+                                 "--max-time", str(max(1, int(left))), "-o", os.fspath(target), url],
+                                capture_output=True, timeout=left + 60, pass_fds=held()).returncode
+        if status == 0:
+            return
+        if status == 22 and not target.exists():  # not in the bucket (or refused): no use asking again
+            break
+        if status in (33, 36):  # the server would not resume: start over
+            target.unlink(missing_ok=True)
+    raise subprocess.CalledProcessError(status, "curl")
 
 
 def bundle_key(work: Path, fetch_url: Callable[[str, Path, float], None] = download) -> str:
@@ -238,17 +322,19 @@ def bundle_key(work: Path, fetch_url: Callable[[str, Path, float], None] = downl
 def unpack(archive: Path, extension: str, into: Path) -> None:
     into.mkdir(parents=True, exist_ok=True)
     if extension == "tar.zst":
-        decompress = subprocess.Popen([zstd() or "zstd", "-dc", os.fspath(archive)], stdout=subprocess.PIPE)
+        decompress = subprocess.Popen([zstd() or "zstd", "-dc", os.fspath(archive)], stdout=subprocess.PIPE,
+                                      pass_fds=held())
         try:
             subprocess.run([TAR, "-xf", "-", "-C", os.fspath(into)], stdin=decompress.stdout, check=True,
-                           timeout=DOWNLOAD_TIMEOUT)
+                           timeout=DOWNLOAD_TIMEOUT, pass_fds=held())
         finally:
             if decompress.stdout:
                 decompress.stdout.close()
             if decompress.wait(timeout=60) != 0:
                 raise subprocess.CalledProcessError(decompress.returncode, "zstd -dc")
     else:
-        subprocess.run([TAR, "-xzf", os.fspath(archive), "-C", os.fspath(into)], check=True, timeout=DOWNLOAD_TIMEOUT)
+        subprocess.run([TAR, "-xzf", os.fspath(archive), "-C", os.fspath(into)], check=True, timeout=DOWNLOAD_TIMEOUT,
+                       pass_fds=held())
 
 
 def seed_from_bundle(staging: Path, work: Path, fetch_url: Callable[[str, Path, float], None] = download) -> str:
@@ -264,10 +350,16 @@ def seed_from_bundle(staging: Path, work: Path, fetch_url: Callable[[str, Path, 
             last = error
             continue
         unpacked = work / "unpacked"
-        unpack(archive, extension, unpacked)
-        archive.unlink()
         bundle = unpacked / BUNDLE_FILE
-        git(staging, "bundle", "verify", "--quiet", os.fspath(bundle), timeout=DOWNLOAD_TIMEOUT)
+        try:
+            unpack(archive, extension, unpacked)
+            git(staging, "bundle", "verify", "--quiet", os.fspath(bundle), timeout=DOWNLOAD_TIMEOUT)
+        except (OSError, subprocess.SubprocessError) as error:  # a corrupt archive: the other one may be whole
+            last = error
+            shutil.rmtree(unpacked, ignore_errors=True)
+            continue
+        finally:
+            archive.unlink(missing_ok=True)
         # unbundle indexes the bundle's whole pack, so every object lands even in a shallow repository,
         # where a fetch would stop at the commits it thinks it has; then the refs are set to its tips.
         tips = {}
@@ -290,12 +382,13 @@ PARTIAL_KEYS = ("remote.origin.promisor", "remote.origin.partialclonefilter", "e
 
 def config_values(repo: Path, key: str) -> list[str]:
     result = subprocess.run([GIT, "-C", os.fspath(repo), "config", "--get-all", key], capture_output=True, text=True,
-                            timeout=30)
+                            timeout=30, pass_fds=held())
     return result.stdout.splitlines() if result.returncode == 0 else []
 
 
 def unset(repo: Path, key: str) -> None:
-    subprocess.run([GIT, "-C", os.fspath(repo), "config", "--unset-all", key], capture_output=True, timeout=30)
+    subprocess.run([GIT, "-C", os.fspath(repo), "config", "--unset-all", key], capture_output=True, timeout=30,
+                   pass_fds=held())
 
 
 def fill(repo: Path, work: Path, from_github: bool, fetch_url: Callable[[str, Path, float], None]) -> str:
@@ -452,9 +545,13 @@ def run(apply: bool, *, wait: bool = False, from_github: bool = False, home: Pat
         return {**record, "state": "plan", "health": problem or "ok",
                 "would": f"seed from the R2 bundle ({problem}), then fetch" if problem else "fetch"}
     fd = lock(GIT_DIR / ".lock", LOCK_WAIT if wait else 0)
+    if fd is None and stop_orphans():
+        fd = lock(GIT_DIR / ".lock", 30)
     if fd is None:
         return {**record, "state": "busy", "reason": "another pass holds the lock"}
+    HELD.append(fd)
     try:
+        note_groups(own_group())
         # Only a pass holding the flock writes the mirror (jobs only read it), so any lock git left is from a
         # pass that was killed: clear them before anything else writes, or the repair itself would wedge.
         if MIRROR.is_dir() and not MIRROR.is_symlink():
@@ -482,6 +579,8 @@ def run(apply: bool, *, wait: bool = False, from_github: bool = False, home: Pat
     except (OSError, RuntimeError, subprocess.SubprocessError) as error:
         return {**record, "state": "error", "reason": f"{type(error).__name__}: {str(error)[:300]}"}
     finally:
+        HELD.remove(fd)
+        with_suppressed((GIT_DIR / PASS_FILE).unlink)
         os.close(fd)
 
 
@@ -492,6 +591,8 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--seed-from-github", action="store_true",
                         help="operator fallback: seed from GitHub when the R2 bundle cannot be read")
     args = parser.parse_args(argv)
+    if args.apply and os.getpgid(0) != os.getpid():
+        with_suppressed(lambda: os.setpgid(0, 0))  # lead a group, so its children can be stopped together
     result = run(args.apply, wait=args.wait, from_github=args.seed_from_github)
     print(json.dumps(result), flush=True)
     return 0 if result["state"] in ("applied", "plan", "skipped", "busy") else 1
