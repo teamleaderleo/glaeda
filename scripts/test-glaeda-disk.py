@@ -5011,8 +5011,10 @@ class GlaedaDiskTest(unittest.TestCase):
         stack.enter_context(mock.patch.dict(os.environ, {"RUNNER_NAME": runner.replace("actions-runner-", "mini-")}))
         stack.enter_context(mock.patch.object(gd, "disk_off", return_value=""))
         # who uses the checkout, from what process_evidence opened (checkout_users has its own test)
-        stack.enter_context(mock.patch.object(gd, "checkout_users", side_effect=lambda co: next(
-            (f"pid 9 ({p})" for p in gd.process_evidence()[0] if p == os.fspath(co) or p.startswith(f"{co}/")), "")))
+        def users(co):
+            opened, cmds = gd.process_evidence()
+            return next((f"pid 9 ({p})" for p in opened if p == os.fspath(co) or p.startswith(f"{co}/")), ""), cmds
+        stack.enter_context(mock.patch.object(gd, "checkout_users", side_effect=users))
         return stack
 
     def test_the_job_start_takes_its_own_bloated_checkouts_git(self) -> None:
@@ -5092,11 +5094,20 @@ class GlaedaDiskTest(unittest.TestCase):
                  ([(grand, os.fspath(co)), (555, os.fspath(co) + "/Sources")], "pid 555 (swift test)"),
                  ([(555, os.fspath(co) + "-old/x")], "")]  # a sibling name is not inside it
         for rows, want in cases:
-            with self.subTest(want=want), mock.patch.object(
-                    gd, "_owned_query", side_effect=lambda argv, t: (0, ps) if argv[0] == "ps" else (0, lsof(rows))):
-                self.assertEqual(gd.checkout_users(co), want)
-        with mock.patch.object(gd, "_owned_query", return_value=(1, "")), self.assertRaises(gd.NoEvidence):
+            with self.subTest(want=want), mock.patch.object(gd.subprocess, "run", side_effect=lambda argv, **kw: (
+                    subprocess.CompletedProcess(argv, 0, ps if argv[0] == "ps" else lsof(rows), ""))):
+                self.assertEqual(gd.checkout_users(co)[0], want)
+        with mock.patch.object(gd.subprocess, "run", return_value=subprocess.CompletedProcess([], 1, "", "")), \
+                self.assertRaises(gd.NoEvidence):
             gd.checkout_users(co)
+        # relative worktree backlinks (git worktree add --relative-paths) resolve from worktrees/<name>
+        wt = self.root / "rel/_work/cmux/cmux/.git/worktrees/base"
+        wt.mkdir(parents=True)
+        (wt / "gitdir").write_text("../../../../elsewhere/.git\n")  # .git/worktrees/base -> _work/cmux/elsewhere
+        self.assertEqual(gd.live_linked_worktrees(self.root / "rel/_work/cmux/cmux"), [], "its directory is gone")
+        (self.root / "rel/_work/cmux/elsewhere").mkdir()
+        self.assertEqual(gd.live_linked_worktrees(self.root / "rel/_work/cmux/cmux"),
+                         [os.fspath(self.root / "rel/_work/cmux/elsewhere")])
 
     def test_the_job_start_judges_only_an_enrolled_runners_checkout_from_its_environment(self) -> None:
         home, cos = self._own_checkout_fixture()

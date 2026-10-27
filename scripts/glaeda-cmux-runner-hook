@@ -2450,6 +2450,8 @@ def evict_own_checkout(workspace: str | None, explicit: str | None, timeout: flo
             with contextlib.suppress(Exception):
                 proc.communicate(timeout=5)
             return f"own checkout eviction timed out after {timeout:g} s"
+        with contextlib.suppress(OSError):  # what glaeda-disk left behind (a git transport a timeout orphaned)
+            os.killpg(proc.pid, signal.SIGKILL)
         lines = (out or "").strip().splitlines()
         return lines[-1] if lines else ""
     except Exception:  # noqa: BLE001  (never fail the job on housekeeping)

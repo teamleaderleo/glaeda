@@ -750,7 +750,7 @@ CMUX_NEXT_DRAIN_HOOK_SHA256 = frozenset({
     "c2cabd0d00919555079c5dfbbb8f44f99e13c2295cf16abbe519f6badf1acdba",
     "0fb8b8caaffb7cce6eb662e21345da50e2c76f1092f81d9af5945a709f602707",
     "7c3dce3781487309ea60bacbfaccf7281895aaeb6085e7c4165aac474084fb9d",
-    "2309117c961524c2aa6a868a38d61df275a84f910323be7dc89b1a87fb4c5878",
+    "ee005104dc0d74003634494d776a1f204682443912d000d7747c6eaf2c4041f6",
 })
 CMUX_NEXT_CI_PRESERVED_NAMES = frozenset({
     "SourcePackages", "ModuleCache.noindex", "SDKStatCaches.noindex",
@@ -2615,7 +2615,6 @@ RUNNER_CHECKOUT_AT_START_FAMILY = "runner-bloated-checkout-at-start"
 # bookkeeping is newer than that start (a checkout step rewrites the index, HEAD and FETCH_HEAD). A later step of
 # the job, or any other caller, finds the checkout already in use and is refused.
 RUNNER_JOB_START_WINDOW_S = 600.0
-OWN_CHECKOUT_BUDGET_S = 75  # whole seconds (signal.alarm); the hook gives the run 90
 
 
 def runner_agent_name(runner: Path) -> str | None:
@@ -2637,14 +2636,19 @@ def checkout_git_touched(checkout: Path) -> float:
     return max(times)
 
 
-def checkout_users(checkout: Path) -> str:
+def checkout_users(checkout: Path) -> tuple[str, str]:
     """The processes other than this one and its ancestors (the job-started hook, whose working directory is the
-    workspace) that have a file open or their working directory anywhere in the checkout: "pid N (command)", or "".
+    workspace) that have a file open or their working directory anywhere in the checkout ("pid N (command)", or ""),
+    and every command line. ps and lsof run in this process's own group, so the hook's timeout kill takes them too.
     Raises NoEvidence when lsof or ps cannot say."""
+    def query(argv: list[str], timeout: float) -> tuple[int, str]:
+        r = subprocess.run(argv, stdin=subprocess.DEVNULL, capture_output=True, text=True, errors="replace",
+                           timeout=timeout, check=False)
+        return r.returncode, r.stdout
     try:
-        code, out = _owned_query(["ps", "-axww", "-o", "pid=,ppid=,command="], 60)
-        lcode, listing = _owned_query([shutil.which("lsof") or "/usr/sbin/lsof", "-n", "-P", "-Fpn"], 120)
-    except (OSError, subprocess.TimeoutExpired) as e:
+        code, out = query(["ps", "-axww", "-o", "pid=,ppid=,command="], 30)
+        lcode, listing = query([shutil.which("lsof") or "/usr/sbin/lsof", "-n", "-P", "-Fpn"], 60)
+    except (OSError, subprocess.SubprocessError) as e:
         raise NoEvidence(f"lsof or ps: {e}") from e
     if code != 0 or not out.strip() or lcode != 0 or not listing.strip():
         raise NoEvidence(f"lsof or ps failed (exit {lcode}, {code})")
@@ -2665,8 +2669,8 @@ def checkout_users(checkout: Path) -> str:
         elif line.startswith("n/") and pid not in mine:
             path = line[1:]
             if any(path == n or path.startswith(n + "/") for n in names):
-                return f"pid {pid} ({commands.get(pid, '?')[:80]})"
-    return ""
+                return f"pid {pid} ({commands.get(pid, '?')[:80]})", command_text("\n".join(commands.values()))
+    return "", command_text("\n".join(commands.values()))
 
 
 def live_linked_worktrees(checkout: Path) -> list[str] | None:
@@ -2686,7 +2690,10 @@ def live_linked_worktrees(checkout: Path) -> list[str] | None:
             target = (Path(e.path) / "gitdir").read_text().strip()
         except OSError:
             return None
-        if target and os.path.lexists(os.path.dirname(target)):
+        if not target:
+            return None
+        target = os.path.normpath(os.path.join(e.path, target))  # a --relative-paths backlink is from worktrees/<name>
+        if os.path.lexists(os.path.dirname(target)):
             live.append(os.path.dirname(target))
     return live
 
@@ -2722,8 +2729,7 @@ def evict_own_runner_checkout(workspace: Path, receipt: Path, home: Path | None 
            else f"a linked worktree uses it ({linked[0]})" if linked else runner_checkout_git_veto(checkout))
     if not why:  # the git veto can take a minute: the evidence is read after it
         try:
-            _, cmds = process_evidence()
-            users = checkout_users(checkout)
+            users, cmds = checkout_users(checkout)
         except NoEvidence as e:
             why = f"no process evidence: {e}"
         else:
@@ -2772,11 +2778,6 @@ def own_runner_checkout_main(args: list[str]) -> int:
     RUN.clear()
     RUN.update(caller=run_caller(), mode="own-runner-checkout", apply=True)
     started, before = time.time(), _home_free()
-
-    def out_of_time(_sig, _frame):
-        raise TimeoutError("own-runner-checkout budget")
-    previous = signal.signal(signal.SIGALRM, out_of_time)
-    signal.alarm(OWN_CHECKOUT_BUDGET_S)  # inside the hook's 90 s, so lsof and ps (own sessions) go with it
     try:
         if (off := disk_off()):
             RUN.update(off=True, skipped=f"kill switch: {off}")
@@ -2787,13 +2788,7 @@ def own_runner_checkout_main(args: list[str]) -> int:
         else:
             RUN["skipped"] = "not a bloated checkout of a starting job"
         return 0
-    except TimeoutError:
-        RUN["skipped"] = f"out of time after {OWN_CHECKOUT_BUDGET_S} s"
-        return 0
     finally:
-        signal.alarm(0)
-        signal.signal(signal.SIGALRM, previous)
-        _terminate_active_children()
         write_run_line(started, before)
 
 

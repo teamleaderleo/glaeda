@@ -380,7 +380,7 @@ class HookTest(unittest.TestCase):
                 return "measuring\nremoved it\n", ""
         disk = self.dir / "glaeda-disk"
         disk.write_text("")
-        with mock.patch.object(hook.subprocess, "Popen", Proc):
+        with mock.patch.object(hook.subprocess, "Popen", Proc), mock.patch.object(hook.os, "killpg"):
             self.assertEqual(hook.evict_own_checkout(os.fspath(ws), os.fspath(disk)), "")
             self.assertEqual(hook.evict_own_checkout(None, os.fspath(disk)), "")
             self.assertEqual(hook.evict_own_checkout(os.fspath(self.dir / "none"), os.fspath(disk)), "")
