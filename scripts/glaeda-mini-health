@@ -657,7 +657,8 @@ class Mini:
                 label = str(doc.get("Label") or plist.name[:-len(".plist")])
                 if RUNNER_AGENT.fullmatch(label) or label.startswith(GLAEDA_LABEL_PREFIX):
                     continue
-                words = [str(w) for w in (doc.get("ProgramArguments") or [])] + [str(doc.get("Program") or "")]
+                args = doc.get("ProgramArguments")
+                words = [str(w) for w in (args if isinstance(args, list) else [])] + [str(doc.get("Program") or "")]
                 cwd = str(doc.get("WorkingDirectory") or "")  # only to find a bare run.sh, never a runner itself
                 if any(starts_runner(w, cwd) for w in words if w):
                     out.append((os.fspath(plist), f"{label} starts a GitHub runner glaeda does not manage"))
@@ -2486,7 +2487,8 @@ def iso(t: float) -> str:
 
 def run(mini: Mini, apply: bool, now: float | None = None, state_path: Path = STATE,
         report_path: Path = REPORT, heal_ok: bool = True, runner: bool = True) -> dict[str, Any]:
-    """One pass. runner=False is a host with no glaeda runner (a capture-only mini): only its Claude route."""
+    """One pass. runner=False is a host with no glaeda runner (a capture-only mini): only its Claude route and
+    runner_unmanaged."""
     now = time.time() if now is None else now
     state = load_json(state_path) if apply else {}
     seen: dict[str, Any] = state.get("seen") or {}
@@ -2513,8 +2515,8 @@ def run(mini: Mini, apply: bool, now: float | None = None, state_path: Path = ST
         tm = check_testmanagerd(mini, now)
         carried = tm is None and "testmanagerd_wedged" in previous  # a test runs, or the log was unreadable: no heal
         found += [previous["testmanagerd_wedged"]] if carried else tm or []
-    else:
-        found = check_claude_route(mini, now, apply)
+    else:  # no glaeda runner here, yet a hand-made one is still a fault (it may be the only runner on the host)
+        found = check_claude_route(mini, now, apply) + check_foreign_runners(mini)
 
     findings, heals = [], []
     route_healed = False  # heal_tailscale_route ran this pass (it looks after the drain itself)
@@ -2614,11 +2616,17 @@ def main(argv: list[str] | None = None) -> int:
         # report is written where capture-host reads it.
         claude = (run(mini, args.apply, state_path=STATE, report_path=REPORT, heal_ok=not KILL_SWITCH.exists(),
                       runner=False) if mini.claude_bin() else None)
+        # without Claude there is no report to write, but a hand-made runner is still said
+        foreign = check_foreign_runners(mini) if claude is None else []
+        if foreign and args.apply:
+            for f in foreign:
+                print(json.dumps({"finding": f["id"], "evidence": f["evidence"]}, separators=(",", ":")), flush=True)
         heals = ([{"id": "daemon_heal_stale", "ok": healed[0], "action": healed[1]}] if healed else []) \
             + (claude["heals"] if claude else [])
         if not args.apply:
             print(json.dumps({"schema": SCHEMA, "skipped": "no glaeda runner on this host",
-                              "findings": [f["id"] for f in stale] + [f["id"] for f in (claude or {}).get("findings", [])]}))
+                              "findings": [f["id"] for f in stale + foreign]
+                              + [f["id"] for f in (claude or {}).get("findings", [])]}))
         elif heals or (claude and claude["changed"]):
             print(json.dumps({"findings": [f["id"] for f in (claude or {}).get("findings", [])], "heals": heals},
                              separators=(",", ":")), flush=True)

@@ -2781,8 +2781,15 @@ class ClaudeRoute(Base):
         self.mini.console_state = ("locked", "cmux")  # a runner finding: not this host's
         self.mini.claude_env = {}
         self.mini.answers = {SR2: False, POOL: False}
-        report = health.run(self.mini, True, now=NOW, state_path=self.state, report_path=self.report, runner=False)
+        with mock.patch.object(self.mini, "foreign_runners", return_value=[], create=True):
+            report = health.run(self.mini, True, now=NOW, state_path=self.state, report_path=self.report, runner=False)
         self.assertEqual([f["code"] for f in report["findings"]], ["claude_route"])
+        # a hand-made runner on a host with no glaeda runner is still a fault
+        hand = [("/x/ai.manaflow.builder.runner.plist", "ai.manaflow.builder.runner starts a GitHub runner")]
+        with mock.patch.object(self.mini, "foreign_runners", return_value=hand, create=True):
+            report = health.run(self.mini, True, now=NOW + 1, state_path=self.state, report_path=self.report,
+                                runner=False)
+        self.assertIn("runner_unmanaged:ai.manaflow.builder.runner.plist", [f["id"] for f in report["findings"]])
 
 
 class ClaudeRouteOnDisk(unittest.TestCase):
@@ -2948,6 +2955,9 @@ class ForeignRunnerTest(unittest.TestCase):
               [f"{home}/actions-runner-glaeda-nightly-next/run.sh"])
         plist(agents, "com.teamleaderleo.glaeda.cmux-runner.3", [f"{home}/actions-runner-glaeda-3/run.sh"])
         (agents / "broken.plist").write_text("not a plist")
+        # valid plists of the wrong shape say nothing and never stop the pass
+        (agents / "odd-args.plist").write_bytes(plistlib.dumps({"Label": "com.example.odd", "ProgramArguments": 7}))
+        (agents / "odd-root.plist").write_bytes(plistlib.dumps(["not", "a", "dict"]))
         (home / "build").mkdir()
         plist(agents, "com.example.build", [f"{home}/build/run.sh"])  # a run.sh outside any runner: not a runner
         plist(agents, "com.example.relative", ["/bin/bash", "run.sh"], os.fspath(home / "build"))
