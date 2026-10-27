@@ -1358,11 +1358,40 @@ def download_and_unpack(ctx: Context, act: dict[str, Any], install_id: str) -> N
     act["applied"] = True
 
 
+def runner_path(home: Path, *paths: str) -> str:
+    """The PATH a runner's .path keeps: Homebrew first (the workload PATH's order), every entry the given PATHs
+    already had in their order, then the runner user's ~/.cargo/bin and the system directories, each once."""
+    entries = ["/opt/homebrew/bin", "/usr/local/bin"]
+    for path in paths:
+        entries += path.split(":")
+    entries += [os.fspath(home / ".cargo/bin"), *WORKLOAD_PATH.split(":")]
+    return ":".join(dict.fromkeys(e for e in entries if e))
+
+
+def keep_runner_path(ctx: Context, before: str) -> None:
+    """config.sh's env.sh overwrites .path with the PATH it ran under, and runsvc.sh runs the runner with it. A
+    registration over ssh runs under a bare /usr/bin:/bin:/usr/sbin:/sbin and so dropped /opt/homebrew/bin
+    (2026-10-26). Merge the .path that was there before with the new one and make sure Homebrew and ~/.cargo/bin
+    are on it."""
+    target = ctx.runner_dir / ".path"
+    try:
+        after = target.read_text().strip()
+    except OSError:
+        after = ""
+    merged = runner_path(ctx.home, before, after)
+    if merged != after:
+        write_atomic(target, (merged + "\n").encode(), 0o644, make_parent=False)
+
+
 def register(ctx: Context, act: dict[str, Any]) -> None:
     token = ctx.take_token(f"{ctx.scope_api}/actions/runners/registration-token")
     if token is None:
         act["state"], act["note"] = "failed", "could not obtain a registration token (needs repo or org admin)"
         return
+    try:
+        path_before = (ctx.runner_dir / ".path").read_text().strip()
+    except OSError:
+        path_before = ""
     argv = [os.fspath(ctx.runner_dir / "config.sh"), "--unattended", "--url", ctx.scope_url,
             "--name", ctx.name, "--labels", ",".join(l for l in ctx.labels if l not in BASE_LABELS),
             "--work", "_work"]
@@ -1376,6 +1405,10 @@ def register(ctx: Context, act: dict[str, Any]) -> None:
     if code != 0 or not (ctx.runner_dir / ".runner").is_file():
         act["state"], act["note"] = "failed", f"config.sh failed: {out[-400:]}"
         return
+    try:
+        keep_runner_path(ctx, path_before)
+    except OSError as error:  # registered all the same; a later --apply or relabel merges it again
+        act["pathNote"] = f"could not rewrite .path ({type(error).__name__}: {error})"[:300]
     act["applied"] = True
     act["runnerId"] = (local_runner(ctx) or {}).get("agentId")
 
