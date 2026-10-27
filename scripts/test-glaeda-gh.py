@@ -2839,7 +2839,7 @@ class TickBudgetTest(Base):
 
     def entry(self, key: str, source: str, at: float, waited: bool = False, deferred: bool = False) -> dict:
         if deferred:
-            self.daemon.deferred_before.add(key)
+            self.daemon.deferred_before[key] = NOW - 10
         return {"key": key, "cache": {"source": source, "fetchedAt": at, "restAt": at}, "waitedAt": NOW if waited else None}
 
     def order(self, entries: list[dict]) -> list[str]:
@@ -2877,6 +2877,35 @@ class TickBudgetTest(Base):
         status = self.daemon.tick(NOW + gg.TICK)
         self.assertEqual(status["fetched"]["run"], 1)
         self.assertIn(cut, self.daemon.rest_tried)
+
+    def test_new_watches_arriving_every_tick_do_not_starve_a_deferred_one(self) -> None:
+        """One read a tick and a new (never-read) watch every tick: a key first deferred earlier is read before the
+        newer deferrals, whose never-read age would otherwise sort first every time."""
+        self.daemon.budget = {"rest": {"limit": 5000, "remaining": 4500, "reset": NOW + 1800},
+                              "graphql": {"limit": 5000, "remaining": 0, "reset": NOW + 1800}}
+        for i in (1, 2):
+            key = f"run:o/r/{i}"
+            gg.register(key)
+            gg.write_json(gg.cache_dir() / gg.file_name(key), {"key": key, "fetchedAt": NOW - 2 * gg.CYCLE,
+                                                               "dataAt": NOW - 2 * gg.CYCLE, "error": None,
+                                                               "data": {"status": "in_progress"}})
+        order: list[str] = []
+
+        def read(e: dict) -> None:
+            if order and order[-1] == "cut":
+                order.pop()
+                raise gg.OutOfTime()  # one read a tick
+            order.extend([e["key"], "cut"])
+            self.daemon.store(e["key"], e["cache"], data={"status": "in_progress"}, dataAt=self.daemon.now)
+
+        with mock.patch.object(self.daemon, "fetch_run", side_effect=read):
+            for t in range(6):
+                gg.register(f"run:o/r/{100 + t}")  # a new watch every tick
+                self.daemon.tick(NOW + t * gg.TICK)
+                if order and order[-1] == "cut":
+                    order.pop()
+        self.assertIn("run:o/r/1", order[:3])
+        self.assertIn("run:o/r/2", order[:3], "both deferred keys are read before the newer arrivals pile up")
 
     def test_failed_controller_fed_reads_move_back(self) -> None:
         """A controller-fed run keeps restAt when its REST read fails; the failure still moves it back

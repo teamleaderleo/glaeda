@@ -1295,7 +1295,8 @@ class Daemon:
         self.errors: list[str] = []
         self.attempted: dict[str, float] = {}  # when each key was last fetched: a new one at most once per cycle
         self.rest_tried: dict[str, float] = {}  # when a REST read of each key last ended, answered or failed
-        self.deferred_before: set[str] = set()
+        self.deferred_before: dict[str, float] = {}  # deferred by the last tick: when each was first deferred
+        self.deferred_since: dict[str, float] = {}  # when each key still deferred was first deferred
         self.sent: list[tuple[float, str]] = []  # (time, rest|rest304|graphql) for the last hour's counts
         self.paths: dict[str, str] = dict(BUCKETS)  # the bucket each kind reads over now
         self.reads: list[tuple[float, str, str]] = []  # (time, kind, bucket) per entry read, for the last hour
@@ -1830,11 +1831,12 @@ class Daemon:
     def rest_order(self, entries: list[dict]) -> list[dict]:
         """The order a tick reads REST keys in. Keys the last tick ran out of time for go first, ahead of new ones
         of either kind (due() put them first only within their kind, so deferred runs still sat behind every new
-        PR). Then the longest unread, a key a wait is blocked on counted WAIT_PRIORITY older, and waited first on a
-        tie (two never-read keys). Aging, not an absolute rank: an unread key's place only improves while read keys
-        move back, so waiters cannot starve the rest."""
+        PR), oldest deferral first, so a newer one (a new watch, never read) cannot overtake a key deferred tick
+        after tick. Then the longest unread, a key a wait is blocked on counted WAIT_PRIORITY older, and waited
+        first on a tie (two never-read keys). Aging, not an absolute rank: an unread key's place only improves
+        while read keys move back, so waiters cannot starve the rest."""
         carried = self.deferred_before
-        return sorted(entries, key=lambda e: (e["key"] not in carried,
+        return sorted(entries, key=lambda e: (e["key"] not in carried, carried.get(e["key"], 0.0),
                                               self.last_read(e) - (WAIT_PRIORITY if self.waited(e) else 0),
                                               not self.waited(e)))
 
@@ -2012,7 +2014,9 @@ class Daemon:
             # there must not stop GitHub polling (it did: glaeda#1305). A WatchError is expected and
             # says what failed; anything else is a bug, so it carries its code site.
             self.controller_down(error, None if isinstance(error, WatchError) else error_site(error))
-        self.deferred_before = set(self.deferred)  # due() consumes it; the REST order below still needs it
+        # due() consumes the deferred set; the REST order below still needs it, oldest deferral first
+        self.deferred_since = {k: self.deferred_since.get(k, self.now) for k in self.deferred}
+        self.deferred_before = dict(self.deferred_since)
         prs, runs, comments = self.due("pr", entries), self.due("run", entries), self.due("comment", entries)
         heads = self.due("head", entries)
         over = {kind: self.paths[kind] for kind in BALANCED}  # due() routed each kind
