@@ -156,6 +156,12 @@ CACHE_NS_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 CACHE_FILE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,250}\.tar\.(?:zst|gz)")
 CACHE_BYTES = 60 * 1024**3
 CACHE_MIN_FREE = 40 * 1024**3
+# A fill may write at most this much (the largest cache object, 2026-10-27, is 2 GB), and at most
+# FILL_SLOTS fills run at once, each starting only with room for it past CACHE_MIN_FREE: so however many
+# distinct objects clients ask for, partial fills hold at most FILL_SLOTS * FILL_MAX_BYTES.
+FILL_MAX_BYTES = 8 * 1024**3
+FILL_SLOTS = 3
+FILL_LOCKS = 64  # fill locks are striped by object, so asking for new names leaves no new files
 CACHE_QUEUE = 24  # waiting for a fill counts: a whole site may want the same new object at once
 # A fill runs at the uplink's speed (2026-10-27: 0.4-0.9 MB/s a mini, 4 at once): a 2 GB object can take an
 # hour. It reports its progress every FILL_REPORT seconds, so a client waits as long as bytes keep coming.
@@ -973,13 +979,19 @@ def serve_state(state: Path, k: int, slot: str, want: str, codec: str, run_dir: 
 # ------------------------------------------------------------------ the LAN cache host (--role cache)
 
 
+def stored(cache: Path, name: str) -> Path:
+    """Where NAME (BUCKET/NS/FILE) is kept: named by its sha256, so names that differ only in case (the
+    APFS volume folds case) or in anything else never share a file."""
+    return cache / "objects" / hashlib.sha256(name.encode()).hexdigest()
+
+
 def open_cached(cache: Path, name: str) -> tuple[int, int] | None:
-    """(fd, size) of the cached object NAME (BUCKET/NS/FILE): a regular file of ours, no symlink on the way."""
-    parent = open_dir_path(cache.joinpath(*name.split("/")[:-1]))
+    """(fd, size) of the cached object NAME: a regular file of ours, no symlink on the way."""
+    parent = open_dir_path(cache / "objects")
     if parent is None:
         return None
     try:
-        fd = os.open(name.split("/")[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
+        fd = os.open(stored(cache, name).name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
     except OSError:
         return None
     finally:
@@ -993,8 +1005,8 @@ def open_cached(cache: Path, name: str) -> tuple[int, int] | None:
 
 
 def part_of(cache: Path, name: str) -> Path:
-    bucket, ns, file = name.split("/")
-    return cache / bucket / ns / f".fill-{file}"
+    path = stored(cache, name)
+    return path.with_name(".fill-" + path.name)
 
 
 def report(part: Path) -> None:
@@ -1016,10 +1028,13 @@ def fill(cache: Path, name: str, timeout: float = FILL_TIMEOUT, curl: str = CURL
     part = part_of(cache, name)
     part.parent.mkdir(parents=True, exist_ok=True)
     part.unlink(missing_ok=True)
+    prune_cache(cache, "", min_free=CACHE_MIN_FREE + FILL_MAX_BYTES)
+    if shutil.disk_usage(cache).free < CACHE_MIN_FREE + FILL_MAX_BYTES:
+        return "no room for a fill"
     try:
         proc = subprocess.Popen([curl, "--silent", "--location", "--fail", "--proto", "=https",
                                  "--connect-timeout", "15", "--speed-limit", "10240", "--speed-time", "120",
-                                 "--max-time", str(int(timeout)), "--max-filesize", str(MAX_OBJECT_BYTES),
+                                 "--max-time", str(int(timeout)), "--max-filesize", str(FILL_MAX_BYTES),
                                  "--write-out", "%{http_code}", "--output", os.fspath(part),
                                  f"https://{bucket}/v1/{ns}/objects/{file}"],
                                 stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
@@ -1043,7 +1058,7 @@ def fill(cache: Path, name: str, timeout: float = FILL_TIMEOUT, curl: str = CURL
     if code != 0 or not part.is_file() or part.stat().st_size == 0:
         part.unlink(missing_ok=True)
         return "miss" if http == "404" else f"curl exit {code} http {http}"
-    os.replace(part, part.parent / file)
+    os.replace(part, stored(cache, name))
     return ""
 
 
@@ -1051,7 +1066,7 @@ def prune_cache(cache: Path, keep: str, budget: int = CACHE_BYTES, min_free: int
     """Remove the least recently served objects (a hit touches the mtime) past BUDGET or under MIN_FREE free;
     never KEEP or a part being filled. Returns how many it removed."""
     entries = []
-    for path in cache.glob("*/*/*"):
+    for path in (cache / "objects").glob("*"):
         try:
             info = path.lstat()
         except OSError:
@@ -1063,7 +1078,7 @@ def prune_cache(cache: Path, keep: str, budget: int = CACHE_BYTES, min_free: int
     for _, size, path in entries:
         if total <= budget and shutil.disk_usage(cache).free >= min_free:
             break
-        if "/".join(path.parts[-3:]) == keep:
+        if keep and path == stored(cache, keep):
             continue
         path.unlink(missing_ok=True)
         total -= size
@@ -1094,7 +1109,7 @@ def serve_cache(name: str, cache: Path, run_dir: Path, client: str, record: dict
     try:
         opened = open_cached(cache, name)
         if opened is None:
-            lock = os.open(run_dir / f"fill-{digest}.lock", os.O_RDONLY | os.O_CREAT, 0o600)
+            lock = os.open(run_dir / f"fill-{int(digest, 16) % FILL_LOCKS}.lock", os.O_RDONLY | os.O_CREAT, 0o600)
             try:
                 while True:  # one fill per object; the others wait for it and report its progress
                     try:
@@ -1109,7 +1124,23 @@ def serve_cache(name: str, cache: Path, run_dir: Path, client: str, record: dict
                         report(part_of(cache, name))
                 opened = open_cached(cache, name)  # filled while we waited
                 if opened is None:
-                    filled = fill(cache, name, curl=curl)
+                    slot = None
+                    while slot is None:  # FILL_SLOTS fills at a time, whatever the clients ask for
+                        for index in range(FILL_SLOTS):
+                            slot = try_lock(run_dir / f"fill-slot-{index}.lock")
+                            if slot is not None:
+                                break
+                        else:
+                            if time.monotonic() - started >= FILL_TIMEOUT:
+                                say("busy")
+                                log(run_dir, {**record, "outcome": "busy", "why": "fill slots"})
+                                return 4
+                            time.sleep(FILL_REPORT)
+                            report(part_of(cache, name))
+                    try:
+                        filled = fill(cache, name, curl=curl)
+                    finally:
+                        os.close(slot)
                     if filled == "miss":
                         say("miss")
                         log(run_dir, {**record, "outcome": "miss", "seconds": round(time.monotonic() - started, 1)})
@@ -1183,15 +1214,18 @@ def serve_git(name: str, mirrors: Path, run_dir: Path, client: str, record: dict
     try:
         with contextlib.suppress(OSError):
             os.nice(10)
+        # Its own process group: a timeout ends pack-objects too, not only upload-pack.
         proc = subprocess.Popen([git, "upload-pack", "--strict", f"--timeout={GIT_IDLE_TIMEOUT}",
                                  os.fspath(mirrors / f"{name}.git")], stdin=0, stdout=1, stderr=subprocess.DEVNULL,
-                                env={"PATH": "/usr/bin:/bin", "HOME": os.path.expanduser("~")})
+                                env={"PATH": "/usr/bin:/bin", "HOME": os.path.expanduser("~")}, start_new_session=True)
         try:
             status = proc.wait(timeout=GIT_SERVE_TIMEOUT)
         except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait()
             status = 124
+        finally:
+            with contextlib.suppress(OSError):
+                os.killpg(proc.pid, signal.SIGKILL)
+            proc.wait()
     finally:
         for held in admitted:
             os.close(held)

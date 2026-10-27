@@ -344,15 +344,26 @@ class LanCacheTest(unittest.TestCase):
         self.assertIn("refused", record["error"])
 
     def test_the_prune_keeps_the_newest_and_the_one_just_filled(self):
-        root = self.cache / "ci-cache.cmux.com/ns"
+        root = self.cache / "objects"
         root.mkdir(parents=True)
-        for index, name in enumerate(("old.tar.zst", "mid.tar.zst", "new.tar.zst")):
-            (root / name).write_bytes(b"x" * 100)
-            os.utime(root / name, (1000 + index, 1000 + index))
-        (root / ".fill-part.tar.zst").write_bytes(b"x" * 100)
-        removed = serve.prune_cache(self.cache, "ci-cache.cmux.com/ns/old.tar.zst", budget=250, min_free=0)
+        names = [f"ci-cache.cmux.com/ns/{n}.tar.zst" for n in ("old", "mid", "new")]
+        for index, name in enumerate(names):
+            serve.stored(self.cache, name).write_bytes(b"x" * 100)
+            os.utime(serve.stored(self.cache, name), (1000 + index, 1000 + index))
+        serve.part_of(self.cache, names[1]).write_bytes(b"x" * 100)
+        removed = serve.prune_cache(self.cache, names[0], budget=250, min_free=0)
         self.assertEqual(removed, 1)
-        self.assertEqual(sorted(p.name for p in root.iterdir()), [".fill-part.tar.zst", "new.tar.zst", "old.tar.zst"])
+        self.assertFalse(serve.stored(self.cache, names[1]).exists())
+        self.assertTrue(serve.stored(self.cache, names[0]).exists() and serve.stored(self.cache, names[2]).exists())
+        self.assertTrue(serve.part_of(self.cache, names[1]).exists())
+
+    def test_names_differing_only_in_case_never_share_an_object(self):
+        name = self.put(b"lower" * 100, file="a.tar.zst")
+        self.assertEqual(self.fetch(name)[0], 0)
+        # The test's own bucket folds case too, so it answers; what matters is that the host asked it.
+        self.fetch("ci-cache.cmux.com/macOS-ARM64/A.tar.zst", "upper")
+        self.assertEqual(len(self.downloads()), 2)
+        self.assertNotEqual(serve.stored(self.cache, name), serve.stored(self.cache, name.replace("a.", "A.")))
 
     def test_git_is_served_only_from_a_ready_mirror(self):
         repo = self.mirrors / "cmux.git"
