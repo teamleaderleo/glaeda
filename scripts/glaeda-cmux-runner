@@ -139,6 +139,7 @@ RUNNER_CACHE_KEEP = 2  # versions kept after a download; older ones are removed 
 API_TOKEN_ENV = ("GH_TOKEN", "GITHUB_TOKEN")  # the gh-free path's optional API auth, sent on curl's stdin
 MARKER = ".glaeda-cmux-runner"
 HOOK_DIR = "glaeda-hooks"
+DEDICATED_ADMIT = "dedicated-admit.sh"  # a --dedicated runner's own admission, which job-started runs
 HELD_DIR = ".local/state/glaeda/mini-fleet/runner-held"  # cmux_mini_fix.sh held_dir
 DARWIN_REQUIRED = True
 RUN_TIMEOUT = 60
@@ -339,6 +340,7 @@ class Context:
         # re-run keeps whatever the receipt registered and never asks for a relabel.
         self.labels_requested = bool(extra)
         self.member: dict[str, Any] | None = None
+        self.dedicated: dict[str, Any] | None = None  # a runner.dedicated entry (--dedicated): see dedicated_context
         self.min_free_gib: float = args.min_free_gib or 0
         self.capacity_units: int = args.capacity_units or 0
         configured_capacity = args.capacity_dir or os.environ.get("GLAEDA_FLEET_CAPACITY_DIR")
@@ -729,6 +731,9 @@ def hook_wrappers(ctx: Context) -> dict[str, bytes]:
     recycle = ""
     if ctx.min_free_gib:
         scope += f" --min-free-gib {ctx.min_free_gib:g}"
+    dedicated = dedicated_of(ctx)
+    if dedicated:  # glaeda's checks, then the builder's own admission (dedicated-admit.sh below)
+        scope += f" --dedicated-admit {shlex.quote(os.fspath(ctx.hook_dir / DEDICATED_ADMIT))}"
     if ctx.member:  # a fleet member runs PR jobs only while it is an eligible node on its class toolchain
         scope += f" --require-eligible --fleet-class {shlex.quote(ctx.member['hardware'])}"
         if ctx.member.get("xcodeApps"):
@@ -884,8 +889,15 @@ def hook_wrappers(ctx: Context) -> dict[str, bytes]:
         "*) usage ;;\n"
         "esac\n"
     )
-    return {"job-started.sh": started.encode(), "job-completed.sh": completed.encode(), "listen.sh": listen.encode(),
-            "glaeda-canonical-root": root.encode()}
+    wrappers = {"job-started.sh": started.encode(), "job-completed.sh": completed.encode(),
+                "listen.sh": listen.encode(), "glaeda-canonical-root": root.encode()}
+    if dedicated:
+        wrappers[DEDICATED_ADMIT] = (
+            "#!/bin/bash\n"
+            "# glaeda-cmux-runner dedicated runner admission (generated from the manifest's runner.dedicated admit,\n"
+            "# receipt-owned). The job-started hook runs it after glaeda's own checks; a non-zero exit refuses the job.\n"
+            f"exec {' '.join(shlex.quote(dedicated_word(ctx, w)) for w in dedicated['admit'])}\n").encode()
+    return wrappers
 
 
 def agent_plist(ctx: Context) -> dict[str, Any]:
@@ -937,6 +949,9 @@ def desired_files(ctx: Context) -> dict[Path, tuple[bytes, int]]:
     for name, data in hook_wrappers(ctx).items():
         files[ctx.hook_dir / name] = (data, 0o755)
     files[ctx.service_plist_path] = (plistlib.dumps(agent_plist(ctx), sort_keys=True), 0o644)
+    watch = watch_plist_path(ctx)
+    if watch is not None:
+        files[watch] = (plistlib.dumps(watch_plist(ctx), sort_keys=True), 0o644)
     return files
 
 
@@ -1001,6 +1016,10 @@ def start_agent(ctx: Context, act: dict[str, Any], plist: str) -> str | None:
 def routing(ctx: Context) -> dict[str, Any]:
     repo = shlex.quote(ctx.route_repo)
     member = ctx.member
+    if dedicated_of(ctx):
+        return {"route": [], "rollback": [],
+                "note": "dedicated runner: only jobs that name its labels come here, as they did before glaeda "
+                        "managed it; nothing is set per runner"}
     if not member:
         return {
             "route": [f"gh variable set {v} --body {MINI_LABEL} --repo {repo}" for v in ROUTE_VARIABLES],
@@ -1243,9 +1262,9 @@ def plan_install(ctx: Context, receipt: dict[str, Any] | None) -> list[dict[str,
     actions.append(reg)
 
     prior = {a.get("path"): a.get("ownedSha256") for a in (receipt or {}).get("actions", [])
-             if a.get("kind") in {"hook", "agent"} and a.get("owned")}
+             if a.get("kind") in {"hook", "agent", "watch"} and a.get("owned")}
     for path, (data, mode) in desired_files(ctx).items():
-        kind = "agent" if path == ctx.service_plist_path else "hook"
+        kind = "agent" if path == ctx.service_plist_path else "watch" if path == watch_plist_path(ctx) else "hook"
         current, want = sha256_file(path), sha256_bytes(data)
         if current is None:
             state = "create"
@@ -1262,6 +1281,10 @@ def plan_install(ctx: Context, receipt: dict[str, Any] | None) -> list[dict[str,
                "mode": oct(mode), "owned": owned, "ownedSha256": current if owned else None}
         if state == "blocked" and not blocked_dir:
             act["note"] = "exists and was not written by this command"
+        if kind == "watch":
+            act["label"] = watch_label(ctx)
+            act["loaded"] = None if ctx.skip_launchctl else run(
+                [LAUNCHCTL, "print", f"gui/{ctx.uid}/{watch_label(ctx)}"])[0] == 0
         if kind == "agent":
             act["label"] = ctx.label
             act["loaded"] = launchctl_loaded(ctx)
@@ -1292,6 +1315,11 @@ def plan_uninstall(ctx: Context, receipt: dict[str, Any] | None) -> list[dict[st
         state, note = "kept", "not installed by this command, or changed since"
     actions.append({"kind": "agent", "label": ctx.label, "path": plist, "state": state, "note": note,
                     "loaded": launchctl_loaded(ctx)})
+    for watch in [a for a in receipt.get("actions", []) if a.get("kind") == "watch" and a.get("owned")]:
+        current = sha256_file(Path(str(watch.get("path"))))
+        state = "absent" if current is None else "remove" if current == watch.get("ownedSha256") else "kept"
+        actions.append({"kind": "watch", "label": watch.get("label"), "path": watch.get("path"), "state": state,
+                        "note": "changed since this command wrote it" if state == "kept" else ""})
 
     ours = owned_dir(ctx, receipt)
     registered = receipt.get("registration") or {}
@@ -1430,6 +1458,8 @@ def register(ctx: Context, act: dict[str, Any]) -> None:
             "--work", "_work"]
     if ctx.org and ctx.group:
         argv += ["--runnergroup", ctx.group]
+    if dedicated_of(ctx):  # exactly the declared labels: no self-hosted, macOS or ARM64
+        argv.append("--no-default-labels")
     if ctx.replace or act.get("replace"):
         argv.append("--replace")
     code, out = run_with_token(argv, token, ctx.runner_dir)
@@ -1562,6 +1592,8 @@ def relabel(ctx: Context, act: dict[str, Any]) -> None:
         ctx.agent_started = False  # stopped now, whatever the plan saw; the agent step reads this
     act["replace"] = True
     register(ctx, act)
+    if act["state"] != "failed" and dedicated_of(ctx):
+        keep_runner_env(ctx)
     if act["state"] == "failed":
         act["note"] += ("; the old registration is still on GitHub and this runner is stopped: re-run with a "
                         "fresh token (it re-registers the same name with --replace)")
@@ -1676,6 +1708,15 @@ def apply_install(ctx: Context, actions: list[dict[str, Any]], receipt_doc: dict
             if adopted:
                 receipt_doc["registration"] = adopted
                 act["note"] = "adopted the registration an interrupted --apply finished in this directory"
+        elif kind == "watch" and state in {"create", "update"}:
+            data, mode = desired_files(ctx)[Path(act["path"])]
+            write_atomic(Path(act["path"]), data, mode)
+            act["applied"] = act["owned"] = True
+            act["ownedSha256"] = act["sha256"]
+            if not ctx.skip_launchctl:
+                restart_watch(ctx, act)
+        elif kind == "watch" and state == "unchanged" and not ctx.skip_launchctl and not act.get("loaded"):
+            restart_watch(ctx, act)
         elif kind == "agent" and state in {"create", "update"} and not ctx.skip_launchctl \
                 and (act.get("loaded") or getattr(ctx, "agent_started", False)) and not stop_if_idle(ctx):
             # loaded at plan time, or started since by a relabel: a bootout now would cancel its job
@@ -1704,6 +1745,8 @@ def apply_install(ctx: Context, actions: list[dict[str, Any]], receipt_doc: dict
                     act["state"], act["note"] = "failed", why[:400]
         if kind == "agent" and getattr(ctx, "enabled_label", False):
             act["wasDisabled"] = act["enabled"] = True
+        if kind == "register" and dedicated_of(ctx) and act["state"] != "failed":
+            keep_runner_env(ctx)  # before the agent starts the runner, which reads .env once
         if act["state"] == "failed":
             failed = True
         if kind == "verify":
@@ -1827,6 +1870,11 @@ def apply_uninstall(ctx: Context, actions: list[dict[str, Any]]) -> None:
             if held_marker(ctx).is_file():  # a later install of this directory must not start out held
                 held_marker(ctx).unlink()
                 act["heldMarkRemoved"] = True
+        elif act["kind"] == "watch":
+            if not ctx.skip_launchctl:
+                run([LAUNCHCTL, "bootout", f"gui/{ctx.uid}/{act['label']}"])
+            Path(act["path"]).unlink(missing_ok=True)
+            act["applied"] = True
         elif act["kind"] == "deregister":
             token = ctx.take_token(f"{ctx.scope_api}/actions/runners/remove-token")
             code, out = (1, "no removal token")
@@ -2247,6 +2295,9 @@ def parser() -> argparse.ArgumentParser:
                    help="weighted capacity the job-started hook shares across this mini's runners "
                         "(default: the manifest class's capacityUnits with --manifest, else one job at a time)")
     p.add_argument("--capacity-dir", help="shared capacity ledger path (default: $GLAEDA_FLEET_CAPACITY_DIR or the fleet path)")
+    p.add_argument("--dedicated", metavar="NAME",
+                   help="install the member's runner.dedicated runner NAME (with --manifest and --member) instead of "
+                        "a pool instance: its exact labels, scope and admission, ~/actions-runner-glaeda-NAME")
     p.add_argument("--replace", action="store_true", help="replace an existing runner with the same name")
     p.add_argument("--runner-dir", type=Path, help="install directory (default ~/actions-runner-glaeda)")
     p.add_argument("--runner-version", help="pin a runner version such as 2.328.0 (default: one this mini already "
@@ -2325,8 +2376,22 @@ def main(argv: list[str] | None = None) -> int:
     if bool(args.manifest) != bool(args.member):
         print("glaeda-cmux-runner: --manifest and --member go together", file=sys.stderr)
         return 2
+    if args.dedicated is not None and (not args.manifest or args.instance or args.headless or args.labels):
+        print("glaeda-cmux-runner: --dedicated needs --manifest and --member, and takes no --instance, --headless or "
+              "--labels", file=sys.stderr)
+        return 2
     ctx = Context(args)
-    if args.manifest:
+    if args.manifest and args.dedicated is not None:
+        try:
+            manifest = json.loads(args.manifest.expanduser().read_text())
+        except (OSError, ValueError) as error:
+            print(f"glaeda-cmux-runner: cannot read manifest: {type(error).__name__}", file=sys.stderr)
+            return 2
+        why = dedicated_context(ctx, args, manifest)
+        if why:
+            print(f"glaeda-cmux-runner: {why}", file=sys.stderr)
+            return 2
+    elif args.manifest:
         try:
             manifest = json.loads(args.manifest.expanduser().read_text())
         except (OSError, ValueError) as error:
@@ -2386,6 +2451,109 @@ def main(argv: list[str] | None = None) -> int:
     # Every --apply and --uninstall holds the runner lock from its plan to its receipt (runner_lock).
     with runner_lock(ctx.home, wait=True) if args.apply else contextlib.nullcontext():
         return install_or_uninstall(ctx, args, raw_argv)
+
+
+def dedicated_context(ctx: Context, args: argparse.Namespace, manifest: Any) -> str | None:
+    """Point ctx at the member's runner.dedicated entry args.dedicated: its own directory, launchd label, receipt,
+    name, scope and exact labels. Why it cannot, or None."""
+    try:
+        entries, why = fleet_labels().dedicated_runners(manifest, args.member)
+    except Exception as error:  # noqa: BLE001  (a label module without dedicated_runners: explain, never a traceback)
+        return f"{LABELS_MODULE} beside this script cannot read runner.dedicated ({type(error).__name__})"
+    if why:
+        return why
+    entry = next((e for e in entries if e["name"] == args.dedicated), None)
+    if entry is None:
+        return f"{args.member} declares no runner.dedicated named {args.dedicated}"
+    name = entry["name"]
+    ctx.dedicated = entry
+    ctx.suffix = f"-{name}"
+    ctx.label = f"{LABEL}.dedicated.{name}"
+    ctx.runner_dir = (args.runner_dir or ctx.home / f"actions-runner-glaeda-{name}").expanduser().absolute()
+    ctx.hook_dir = ctx.runner_dir / HOOK_DIR
+    ctx.state = ctx.home / ".local/state/glaeda/cmux-runner" / f"instance-dedicated-{name}"  # refresh_hooks reads it
+    ctx.receipt_path = ctx.state / "receipt.json"
+    ctx.plist_path = ctx.service_plist_path = ctx.agents / f"{ctx.label}.plist"
+    ctx.log_path = ctx.logs / f"glaeda-cmux-runner-{name}.log"
+    ctx.name = args.name or f"{args.member}-glaeda-{name}"
+    ctx.org, ctx.repo, ctx.group = entry["org"], entry["repo"], entry["group"]
+    ctx.labels, ctx.labels_requested = list(entry["labels"]), True
+    ctx.capacity_units = 0  # never in the mini's capacity ledger: its jobs are the builder's, admitted by its hook
+    if not args.min_free_gib:
+        summary, _ = fleet_labels().member_labels(manifest, args.member, lambda app: True)
+        ctx.min_free_gib = float((summary or {}).get("minFreeGib") or 0)
+    return None
+
+
+def dedicated_of(ctx: Any) -> dict[str, Any] | None:
+    """ctx's runner.dedicated entry (--dedicated), or None for a pool instance."""
+    entry = getattr(ctx, "dedicated", None)
+    return entry if isinstance(entry, dict) else None
+
+
+def dedicated_word(ctx: Context, word: str) -> str:
+    """A runner.dedicated command word or env value: "~/" is this user's home, "{runnerDir}" the runner's directory."""
+    if word.startswith("~/"):
+        word = os.fspath(ctx.home / word[2:])
+    return word.replace("{runnerDir}", os.fspath(ctx.runner_dir))
+
+
+def dedicated_env(ctx: Context) -> dict[str, str]:
+    return {k: dedicated_word(ctx, v) for k, v in sorted(((dedicated_of(ctx) or {}).get("env") or {}).items())}
+
+
+def watch_label(ctx: Context) -> str:
+    return f"{ctx.label}.watch"
+
+
+def watch_plist_path(ctx: Context) -> Path | None:
+    """The dedicated runner's watch LaunchAgent (its builder's own loop), or None when it declares no watch."""
+    return ctx.agents / f"{watch_label(ctx)}.plist" if (dedicated_of(ctx) or {}).get("watch") else None
+
+
+def watch_plist(ctx: Context) -> dict[str, Any]:
+    return {"Label": watch_label(ctx),
+            "ProgramArguments": [dedicated_word(ctx, w) for w in ctx.dedicated["watch"]],
+            "WorkingDirectory": os.fspath(ctx.runner_dir), "RunAtLoad": True, "KeepAlive": True,
+            "ThrottleInterval": 10, "ProcessType": "Interactive",
+            "EnvironmentVariables": {"PATH": runner_path(ctx.home), **dedicated_env(ctx)},
+            "StandardOutPath": os.fspath(ctx.logs / f"glaeda-cmux-runner-{ctx.dedicated['name']}.watch.log"),
+            "StandardErrorPath": os.fspath(ctx.logs / f"glaeda-cmux-runner-{ctx.dedicated['name']}.watch.err")}
+
+
+def restart_watch(ctx: Context, act: dict[str, Any]) -> None:
+    """Load the watch agent afresh (bootout, then bootstrap). The watch loop holds no job, so it is never waited for."""
+    domain = f"gui/{ctx.uid}"
+    run([LAUNCHCTL, "bootout", f"{domain}/{watch_label(ctx)}"])
+    code, out = run([LAUNCHCTL, "bootstrap", domain, act["path"]])
+    act["bootstrapped"] = code == 0
+    if code != 0:
+        act["state"], act["note"] = "failed", ("launchctl bootstrap failed: " + out)[:400]
+
+
+def keep_runner_env(ctx: Context) -> None:
+    """Set the dedicated runner's declared env in its .env (config.sh writes the file; the runner reads it at start),
+    keeping every other line. A declared PATH goes to .path instead (the jobs' PATH), merged as runner_path does."""
+    env = dedicated_env(ctx)
+    path = ctx.runner_dir / ".env"
+    if not env or not (ctx.runner_dir / ".runner").is_file():
+        return
+    declared_path = env.pop("PATH", None)
+    if declared_path is not None:
+        merged = runner_path(ctx.home, declared_path, read_runner_path(ctx.runner_dir))
+        if merged != read_runner_path(ctx.runner_dir):
+            write_atomic(ctx.runner_dir / ".path", (merged + "\n").encode("utf-8", "surrogateescape"), 0o644,
+                         make_parent=False)
+    if not env:
+        return
+    try:
+        lines = path.read_text().splitlines()
+    except OSError:
+        lines = []
+    kept = [line for line in lines if line.split("=", 1)[0] not in env]
+    want = "\n".join([*kept, *(f"{k}={v}" for k, v in env.items())]) + "\n"
+    if want != ("\n".join(lines) + "\n" if lines else ""):
+        write_atomic(path, want.encode(), 0o644, make_parent=False)
 
 
 def dev_compile_instance(member: dict[str, Any], instance: int) -> bool:
@@ -2479,6 +2647,8 @@ def install_or_uninstall(ctx: Context, args: argparse.Namespace, raw_argv: list[
         "preflight": pre,
         "member": ctx.member or ((prior or {}).get("member") if owned_dir(ctx, prior) else None),
     }
+    if ctx.dedicated:
+        doc["dedicated"] = ctx.dedicated
     if ctx.copy is not None:
         doc["scriptCopy"] = {k: v for k, v in ctx.copy.items() if k != "releaseScriptPath"}
     if args.uninstall:
