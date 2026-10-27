@@ -1816,19 +1816,23 @@ def verify(ctx: Context, act: dict[str, Any], wait: bool) -> None:
 
 
 def apply_uninstall(ctx: Context, actions: list[dict[str, Any]]) -> None:
-    busy = False
+    # Nothing is removed under a job: the agent's bootout, the deregister and the directory each cancel one. One
+    # frozen look decides for every step: with launchctl, the agent is booted out under it (and its own step then
+    # only removes the plist); otherwise (--skip-launchctl, or a plist this install does not own) any listener
+    # still running refuses too, since deregistering under a live listener orphans it.
+    removing = [act for act in actions if act["state"] == "remove"]
+    agent = next((act for act in removing if act["kind"] == "agent"), None)
+    idle = not removing or stop_if_idle(ctx, (lambda: bootout(ctx)) if agent and not ctx.skip_launchctl
+                                        else (lambda: True), listener_ok=bool(agent) and not ctx.skip_launchctl)
     for act in actions:
         act["applied"] = False
         if act["state"] != "remove":
             continue
-        if busy:  # the agent kept its job: deregistering or deleting under it would cancel the job too
-            act["state"], act["note"] = "skipped", "the runner has a job; re-run when idle"
+        if not idle:
+            # failed, not skipped: a nonzero exit stops the fleet's migration before it registers the new scope
+            act["state"], act["note"] = "failed", "the runner has a job (or a listener runs); nothing removed, re-run when idle"
             continue
         if act["kind"] == "agent":
-            if not ctx.skip_launchctl and not stop_if_idle(ctx):  # a migration's deregister cancels no job
-                act["state"], act["note"] = "failed", "the runner has a job; nothing removed, re-run when idle"
-                busy = True
-                continue
             if ctx.headless:
                 code, out = run([SUDO, "/bin/rm", "-f", act["path"]])
                 if code != 0:

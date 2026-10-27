@@ -8591,13 +8591,25 @@ class RunnerTest(unittest.TestCase):
         self.assertEqual(self.by_kind(stale)["register"]["previousLabels"], ["glaeda-mini", "self-hosted"])
 
     def test_an_uninstall_never_stops_or_deregisters_a_runner_with_a_job(self) -> None:
+        for skip in (False, True):
+            ctx = mock.Mock(skip_launchctl=skip, headless=False)
+            actions = [{"kind": "agent", "state": "remove", "path": "/nonexistent.plist"},
+                       {"kind": "deregister", "state": "remove", "name": "x"}]
+            with mock.patch.object(cr, "listeners_frozen", return_value=contextlib.nullcontext(0)), \
+                    mock.patch.object(cr, "runner_busy", return_value=True), \
+                    mock.patch.object(cr, "bootout") as bootout, mock.patch.object(cr, "run_with_token") as config:
+                cr.apply_uninstall(ctx, actions)
+            bootout.assert_not_called()
+            config.assert_not_called()
+            self.assertEqual([a["state"] for a in actions], ["failed", "failed"], skip)
+        # a plist this install does not own (kept): a live listener refuses the deregister
         ctx = mock.Mock(skip_launchctl=False, headless=False)
-        actions = [{"kind": "agent", "state": "remove", "path": "/nonexistent.plist"},
-                   {"kind": "deregister", "state": "remove", "name": "x"}]
-        with mock.patch.object(cr, "stop_if_idle", return_value=False), mock.patch.object(cr, "bootout") as bootout:
+        actions = [{"kind": "agent", "state": "kept", "path": "/x.plist"}, {"kind": "deregister", "state": "remove"}]
+        with mock.patch.object(cr, "listeners_frozen", return_value=contextlib.nullcontext(1)), \
+                mock.patch.object(cr, "runner_busy", return_value=False), mock.patch.object(cr, "run_with_token") as config:
             cr.apply_uninstall(ctx, actions)
-        bootout.assert_not_called()
-        self.assertEqual([a["state"] for a in actions], ["failed", "skipped"])
+        config.assert_not_called()
+        self.assertEqual(actions[1]["state"], "failed")
 
     def test_fleet_labels_stand_in_for_a_runner_list_this_gh_cannot_read(self) -> None:
         with mock.patch.object(cr, "xcode_present", return_value=True):
