@@ -25,6 +25,10 @@
     "scripts/test-glaeda-cmux-runner.py": {
       "count": 4,
       "reason": "test fixtures: fake pkill and expected argv for the scoped SecurityAgent and Diagnostics Reporter kills; nothing is signalled"
+    },
+    "tools/polling-guard/block_polling.py": {
+      "count": 1,
+      "reason": "docstring: describes a command that only mentioned a loop; runs no pkill"
     }
   },
   "big-red": {
