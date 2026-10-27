@@ -10,8 +10,8 @@ serves this repository either. So:
   'blacksmith-<n>vcpu-ubuntu-2404' || 'ubuntu-24.04' }}` (macOS rows likewise, `blacksmith-6vcpu-macos-15`): Blacksmith
   there, the hosted image only here. That form, in runs-on or a matrix row, is the one hosted spelling accepted
   without an entry.
-- A job gated to this repository (`github.repository == 'teamleaderleo/glaeda'`), or one that measures the hosted
-  image itself, is listed in HOSTED_ALLOWED with its reason until the repository moves under an organization.
+- A job gated to this repository (`github.repository == 'teamleaderleo/glaeda'`), or one that measures or probes
+  the hosted image itself, is listed in HOSTED_ALLOWED with its reason until the repository moves under an organization.
 
 Any other job that names a hosted label fails CI. An entry whose job no longer names one fails too, so the list only
 shrinks. A runs-on or matrix value is read whole, and any expression in it other than the owner form (or `matrix.<axis>`
@@ -58,6 +58,8 @@ HOSTED_ON_PURPOSE = ("measures the developer loop on a GitHub-hosted runner, so 
                      "measured; it is dispatched or runs on pull requests that change the benchmark")
 HOSTED_BASELINE = ("the GitHub-hosted baseline the owned-runner JIT canary is compared with, so the hosted image is "
                    "the thing measured; dispatched by hand")
+HOSTED_PROBE = ("records evidence from a fresh GitHub-hosted Ubuntu 24.04 VM (GLAEDA_PROBE_PROVIDER=github-hosted-ubuntu): "
+                "the hosted image, its preinstalled packages and cgroup layout, is the thing probed")
 PERSONAL_MACOS = PERSONAL + "; builds the aarch64-apple-darwin target"
 
 # (workflow file, job id) -> why the job stays on a GitHub-hosted image.
@@ -66,6 +68,8 @@ HOSTED_ALLOWED: dict[tuple[str, str], str] = {
     ("control.yml", "control"): PERSONAL,
     ("developer-loop-benchmark.yml", "fresh-hosted"): HOSTED_ON_PURPOSE,
     ("developer-loop-benchmark.yml", "prepared-hosted"): HOSTED_ON_PURPOSE,
+    ("podman-closure-probe.yml", "ubuntu-package"): HOSTED_PROBE,
+    ("podman-container-closure-probe.yml", "ubuntu-container"): HOSTED_PROBE,
     ("promote.yml", "promote"): PERSONAL,
     ("release.yml", "build"): PERSONAL_MACOS,
     ("release.yml", "publish"): PERSONAL,
