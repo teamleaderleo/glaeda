@@ -6011,6 +6011,41 @@ class VolumeCensusTest(unittest.TestCase):
             self.assertTrue(gd.launch_background_census())
         self.assertIn("--census-lock-fd", popen.call_args.args[0])
 
+    def test_a_large_opened_dir_resumes_at_its_cursor(self) -> None:
+        for n in range(30):
+            self.write(f"held/f{n:02d}", 4096)
+        held = self.root / "held"
+        self.write("held/item/blob")
+        ticks = itertools.count(step=1.0)
+        state = None
+        rounds = 0
+        while not (state or {}).get("complete"):
+            rounds += 1
+            self.assertLess(rounds, 20)
+            with mock.patch.object(gd, "_census_du", return_value=(8192, True)):
+                state = gd.census_pass([self.root], {str(held / "item")}, state, budget_s=12,
+                                       now=1.0, clock=lambda: next(ticks), path=self.state)
+        self.assertGreater(rounds, 2)  # the 31-entry directory took several slices
+        files = state["rows"][str(held / gd.CENSUS_FILES)][0]
+        self.assertEqual(files, sum((held / f"f{n:02d}").stat().st_blocks * 512 for n in range(30))
+                         + held.lstat().st_blocks * 512)  # each file counted once across the slices
+
+    def test_a_measured_ancestor_of_the_shared_tree_leaves_coverage_out(self) -> None:
+        fs = self.fs(10 * gd.GIB)
+        gd.DARWIN = True
+        coverage = [{"scope": "shared-fleet", "complete": True,
+                     "children": [{"category": "cache", "bytes": 6 * gd.GIB}]}]
+        canon = gd.census_canon
+        with mock.patch.object(gd, "fixed_measurement_roots", return_value=[self.root]), \
+                mock.patch.object(gd, "du_bytes", return_value=8 * gd.GIB), \
+                mock.patch.object(gd, "accounting_coverage", return_value=coverage), \
+                mock.patch.object(gd, "apfs_container_capacity", return_value=None), \
+                mock.patch.object(gd, "census_canon", side_effect=lambda p: (
+                    "/Users" if p == str(self.root) else canon(p))):
+            got = gd.filesystem_accounting([fs], [])[0]
+        self.assertEqual(got["known_coverage"], 0)
+        self.assertEqual(got["accounting_gap"], 2 * gd.GIB)
+
     def test_a_sized_dir_whose_size_goes_is_walked_before_completion(self) -> None:
         a, b = self.write("a/blob").parent, self.write("b/blob").parent
         state = {"schema": "glaeda-disk-census/v1", "started_at": 1.0, "dev": self.root.stat().st_dev,
