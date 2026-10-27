@@ -610,6 +610,43 @@ class CheckTests(unittest.TestCase):
             self.assertEqual(len(ssh), 1, ssh)
             self.assertIn("lacks its declared options", ssh[0]["detail"])
 
+    LOOPBACK = 'from="127.0.0.1,::1",no-agent-forwarding,no-X11-forwarding'
+
+    def test_a_declared_loopback_key_is_not_drift_and_any_other_option_still_is(self) -> None:
+        self.manifest["defaults"]["authorized_keys"]["loopback_options"] = self.LOOPBACK
+        self.manifest["defaults"]["authorized_keys"]["exclusive"] = True
+        own = f"ak_key\tauthorized_keys|{mf.options_digest(self.LOOPBACK)}|256 {STRAY} cmux-loopback@m (ED25519)\n"
+        self.assertFalse([i for i in self.issues(probe_text() + own) if i["area"] == "ssh"])
+        wide = mf.options_digest('from="10.0.0.0/8"')
+        wider = f"ak_key\tauthorized_keys|{wide}|256 {STRAY} x (ED25519)\n"
+        ssh = [i["detail"] for i in self.issues(probe_text() + wider) if i["area"] == "ssh"]
+        self.assertTrue(any("not allowed" in d for d in ssh), ssh)
+        bare = f"ak_key\tauthorized_keys|no|256 {STRAY} cmux-loopback@m (ED25519)\n"
+        for lines in (own + bare, bare + own):  # the same key on an unrestricted line too, either order
+            ssh = [i["detail"] for i in self.issues(probe_text() + lines) if i["area"] == "ssh"]
+            self.assertEqual(sum("not allowed" in d for d in ssh), 1, ssh)
+        # a listed key restricted to loopback is still drift: it would not reach the host from anywhere else
+        listed = f"ak_key\tauthorized_keys|{mf.options_digest(self.LOOPBACK)}|256 {FP['coordinator']} c (ED25519)\n"
+        text = "\n".join(l for l in probe_text().splitlines() if FP["coordinator"] not in l) + "\n" + listed
+        ssh = [i["detail"] for i in self.issues(text) if i["area"] == "ssh"]
+        self.assertTrue(any("carries options" in d for d in ssh), ssh)
+        del self.manifest["defaults"]["authorized_keys"]["loopback_options"]
+        ssh = [i["detail"] for i in self.issues(probe_text() + own) if i["area"] == "ssh"]
+        self.assertTrue(any("not allowed" in d for d in ssh), ssh)
+
+    def test_loopback_options_must_take_keys_only_from_loopback(self) -> None:
+        self.assertTrue(mf.loopback_only(self.LOOPBACK))
+        for bad in ('from="127.0.0.1,10.0.0.1"', 'from="*"', 'from="!10.0.0.1,127.0.0.1"', "no-pty", 'from=""',
+                    'from="127.0.0.1",from="10.0.0.1"', 7, " " + self.LOOPBACK,
+                    'from="127.0.0.1,::1",FROM="10.0.0.1"', 'from=127.0.0.1', 'From="10.0.0.1"'):
+            data = copy.deepcopy(self.manifest)
+            data["defaults"]["authorized_keys"]["loopback_options"] = bad
+            with tempfile.TemporaryDirectory() as tmp:
+                path = Path(tmp) / "m.json"
+                path.write_text(json.dumps(data))
+                with self.assertRaisesRegex(mf.Failure, "loopback_options"):
+                    mf.load_manifest(path)
+
     def test_options_must_be_one_printable_field(self) -> None:
         for bad in ("", " no-pty", "no-pty\nssh-ed25519 AAAA x", 7, 'command="x', 'no-pty, from="x"'):
             data = copy.deepcopy(self.manifest)
@@ -1188,6 +1225,7 @@ def preflight_text(user: str = "builder", brew_owner: str | None = "builder", zi
                    brew_python3: bool = True, glaeda_lacking: str | None = "", glaeda_dirty: int = 0,
                    pins: tuple[str, ...] = ("rustup|pinned", "zig|pinned", "python@3.13|pinned"),
                    brew_dir: str | None = None, gh: str | None = "/opt/homebrew/bin/gh", secrets: tuple[str, ...] = (),
+                   git: str | None = "/usr/bin/git", submodule_skipped: bool = False,
                    **probe: object) -> str:
     """A probe plus preflight section for a host that is ready unless told otherwise."""
     lines = [probe_text(**probe).rstrip("\n").replace("user\tbuilder", f"user\t{user}"), READY_XCODE.rstrip("\n")]
@@ -1214,6 +1252,10 @@ def preflight_text(user: str = "builder", brew_owner: str | None = "builder", zi
         lines.append("pf_brew_python3\t/opt/homebrew/bin/python3.13")
     if gh is not None:
         lines.append(f"pf_gh\t{gh}")
+    if git is not None:
+        lines.append(f"pf_git\t{git}")
+    if submodule_skipped:
+        lines.append("pf_submodule_skipped\tgit")
     lines += ["pf_cmux\tpresent", "pf_cmux_pin\t26", "pf_zig_min\t0.16.0" if submodules[0][0] == " " else "pf_zig_min\t"]
     lines += [f"pf_submodule\t{s}" for s in submodules]
     lines += [f"pf_setup_artifacts\t{'yes' if artifacts else 'no'}", f"pf_cmux_dirty\t{dirty}"]
@@ -1592,6 +1634,88 @@ class PreflightTests(unittest.TestCase):
         self.assertEqual(self.result(preflight_text(gh="/usr/local/bin/gh"))["checks"]["gh"]["state"], "ok")
         old = self.result(preflight_text(gh=None))
         self.assertEqual((old["checks"]["gh"]["state"], old["ready"]), ("unknown", True))
+
+    def test_homebrew_git_policy_installs_git_on_that_host_only(self) -> None:
+        # Xcode's git ran git submodule from inside Xcode.app, where each command waited on an unanswered privacy
+        # prompt (about 100 s per call); hosts with git.source homebrew get Homebrew's git first on the workload PATH.
+        plain = self.result(preflight_text())
+        self.assertEqual((plain["checks"]["git"]["state"], plain["ready"]), ("info", True))
+        self.manifest["hosts"]["build-mini-1"].setdefault("overrides", {})["git"] = {"source": "homebrew"}
+        result = self.result(preflight_text(brew_owner="admin"))
+        check = result["checks"]["git"]
+        self.assertFalse(result["ready"])
+        self.assertEqual((check["state"], check["group"], check["fix"]),
+                         ("fail", "password", "sudo -u admin brew install git"))
+        self.assertEqual(check["action"], {"kind": "brew", "formula": "git", "owner": "admin"})
+        _, root = mf.planned_actions(result)
+        self.assertEqual([(a["kind"], a["formulas"]) for a in root], [("brew", ["git"])])
+        script = mf.sudo_plan_script(self.manifest, "build-mini-1", result)
+        self.assertIn('[ -e "/opt/homebrew/bin/git" ] || brew_as link git', script)
+        self.assertNotIn("brew_as pin", script)  # no class receipt names git
+        subprocess.run(["bash", "-n"], input=script, text=True, check=True)
+        done = self.result(preflight_text(git="/opt/homebrew/bin/git"))
+        self.assertEqual((done["checks"]["git"]["state"], done["ready"]), ("ok", True))
+        old = self.result(preflight_text(git=None))
+        self.assertEqual((old["checks"]["git"]["state"], old["ready"]), ("fail", False))
+        del self.manifest["hosts"]["build-mini-1"]["overrides"]["git"]
+        self.assertEqual(self.result(preflight_text(git=None))["ready"], True)  # no policy: an old probe is fine
+
+    def test_the_preflight_probe_runs_the_workloads_git(self) -> None:
+        text = mf.PREFLIGHT_PROBE.read_text()
+        self.assertFalse(re.findall(r"(?<![w$])\bgit -C", text), "every git call goes through wgit (WORKLOAD_PATH)")
+        self.assertIn('wgit() { PATH="$WORKLOAD_PATH" git "$@"; }', text)
+
+    def test_a_homebrew_git_host_without_it_skips_the_checkout_walk_and_repairs_git_first(self) -> None:
+        self.manifest["hosts"]["build-mini-1"].setdefault("overrides", {})["git"] = {"source": "homebrew"}
+        self.assertIn(b"GIT_SOURCE=homebrew\n", mf.preflight_script(self.manifest, "build-mini-1"))
+        result = self.result(preflight_text(submodule_skipped=True))
+        self.assertEqual(result["checks"]["cmux"]["state"], "todo")
+        self.assertEqual(result["checks"]["git"]["state"], "fail")
+        self.assertEqual(mf.FIX_NEEDS["submodules"], ("git",))
+        self.assertLess(mf.FIX_ORDER.index("brew"), mf.FIX_ORDER.index("cmux_clone"))
+        self.assertLess(mf.FIX_ORDER.index("brew"), mf.FIX_ORDER.index("submodules"))
+        action = {"kind": "submodules", "root": "~/cmux", "depth": 1}
+        self.assertEqual(mf.waiting_on(action, result["checks"], set()), "git (fix)")
+        self.assertIsNone(mf.waiting_on(action, result["checks"], {"git"}))
+        # A host with no policy is not held: its git check is info.
+        del self.manifest["hosts"]["build-mini-1"]["overrides"]["git"]
+        self.assertIn(b"GIT_SOURCE=system\n", mf.preflight_script(self.manifest, "build-mini-1"))
+        plain = self.result(preflight_text())
+        self.assertIsNone(mf.waiting_on(action, plain["checks"], set()))
+
+    def test_the_probe_skips_the_walk_only_for_a_homebrew_host_without_it(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "cmux"
+            (root / ".git").mkdir(parents=True)
+            bin_dir = Path(tmp) / "bin"
+            bin_dir.mkdir()
+            calls = Path(tmp) / "calls"
+            (bin_dir / "git").write_text(f"#!/bin/sh\necho \"$@\" >> {calls}\n")
+            (bin_dir / "git").chmod(0o755)
+            for source, walked in (("homebrew", False), ("system", True)):
+                calls.unlink(missing_ok=True)
+                header = (f"CMUX_ROOT={root}\nXCODE_PIN=''\nWORKLOAD_PATH={bin_dir}:/usr/bin:/bin\nWORKLOAD_TOOLS=''\n"
+                          f"PYTHONS=''\nCANDIDATE_PIN=''\nENROLL_FLAGS=''\nPIN_FORMULAS=''\nGIT_SOURCE={source}\n")
+                script = mf.PROBE.read_text() + "\n" + header + mf.PREFLIGHT_PROBE.read_text()
+                out = subprocess.run(["bash", "-s"], input=script, capture_output=True, text=True,
+                                     env={"HOME": tmp, "PATH": "/usr/bin:/bin"}, timeout=60).stdout
+                ran = calls.read_text() if calls.exists() else ""
+                self.assertEqual("submodule status" in ran, walked, (source, ran))
+                self.assertEqual("pf_submodule_skipped\tgit" in out, not walked)
+
+    def test_git_policy_is_validated(self) -> None:
+        data = json.loads(EXAMPLE.read_text())
+        host = next(iter(data["hosts"].values()))
+        host.setdefault("overrides", {})["git"] = {"source": "brew"}
+        with self.assertRaisesRegex(mf.Failure, "git takes source"):
+            mf.load_manifest(EXAMPLE, json.dumps(data))
+        host["overrides"]["git"] = {"source": "homebrew", "note": "until the privacy grant is made"}
+        mf.load_manifest(EXAMPLE, json.dumps(data))
+        # A note-only override still inherits a bad default: the merged policy is what is checked.
+        data["defaults"]["git"] = {"source": "bogus"}
+        host["overrides"]["git"] = {"note": "only a note"}
+        with self.assertRaisesRegex(mf.Failure, "git takes source"):
+            mf.load_manifest(EXAMPLE, json.dumps(data))
 
     def test_an_old_glaeda_checkout_is_moved_before_enrolling(self) -> None:
         # An old ~/glaeda failed onboard with "unrecognized arguments: --class-receipt ...".

@@ -236,6 +236,20 @@ Each agent tick, for every live reservation on the routed repository:
   it ended `cancelled`, and (for a pull request) the pull request is still open at that head (a
   push during the cancel starts its own run, which must not be overwritten). The re-run is
   attempt 2 and lands on overflow as a whole run.
+- Never cancelled: a nightly or DEV reservation, and any run of a workflow that builds, signs or
+  publishes a feed (`nightly.yml`, `nightly-sign.yml`, `release.yml`, `cmux-next-dev-daily.yml`,
+  the nightly-next train, tick and canary, and `cmux-next.yml` push runs), is released instead of
+  rescued, in `held` and in `rescuing` alike (`never_cancelled()`). The rulebook allows cancelling a
+  started nightly, DEV or promote build only when it is stuck past its timeout or certain to fail;
+  cmux's own owned-pool rescue re-runs their refused or timed-out jobs elsewhere.
+  `test_nightly_dev_and_promote_runs_are_never_cancelled` lists them by name, so dropping one fails CI.
+- Every cancel and force-cancel goes through `scripts/glaeda_never_cancel.py` (`cancel_run`), the only
+  code in glaeda that cancels a run. It refuses a started run of a nightly, DEV or promote workflow on
+  any branch (the delivery list of cmux `scripts/ci/delivery_workflows.py`, plus `release.yml` and
+  `cmux-next.yml` push runs) unless one of its jobs has run past the longest job `timeout-minutes` of
+  its workflow at the run's own head. A job's wait for a runner never counts, and an unreadable jobs
+  list or workflow refuses. `scripts/test-glaeda-never-cancel.py` scans the repository for any other
+  cancel call, so a new path that skips the guard fails CI.
 
 This is cmux#14234's rule, moved into Glaeda and driven by the ledger instead of a marker
 artifact and a watcher workflow per run.
