@@ -1280,6 +1280,7 @@ class Daemon:
             if str(k).isdigit() and isinstance(v, int) and not isinstance(v, bool) and v > 0}
         self.saved_rest_minutes = dict(self.rest_minutes)
         self.writing = False  # inside the outbox: its requests are sessions' writes, not the daemon's polling
+        self.jobs_only: list[dict] = []  # failed runs whose job list is read though runs cannot be (due)
 
     # -- budget
 
@@ -1294,6 +1295,18 @@ class Daemon:
         floor, reserve = self.policy["floors"][bucket]
         remaining = seen.get("remaining", floor)
         return "stop" if remaining < reserve else "lean" if remaining < floor or capped else "normal"
+
+    def charge_rest(self, minute: int, n: int) -> None:
+        """Count n REST requests in that minute, on disk at once, so a daemon that dies mid-tick
+        hands its successor the spend it really made. One small file write per counted request
+        (about 2000 an hour at the cap) is nothing next to the request itself."""
+        left = self.rest_minutes.get(minute, 0) + n
+        if left > 0:
+            self.rest_minutes[minute] = left
+        else:
+            self.rest_minutes.pop(minute, None)
+        write_json(BASE / REST_SPEND_FILE, {str(m): c for m, c in self.rest_minutes.items()})
+        self.saved_rest_minutes = dict(self.rest_minutes)
 
     def clock(self) -> float:
         """Now, for the REST share: the wall clock, or the pinned one a test drives tick(now=...) with."""
@@ -1314,6 +1327,13 @@ class Daemon:
         once that read no longer fits, routing reads to REST would only defer them tick after tick
         while GraphQL could answer them."""
         return not self.rest_room(max(REST_READ_MAX.values()))
+
+    def failed_without_jobs(self, e: dict) -> bool:
+        """A cached run whose latest attempt failed and whose job list is an older attempt's."""
+        c = e["cache"] or {}
+        run = c.get("data") or {}
+        return (run.get("status") == "completed" and run.get("conclusion") not in RUN_OK
+                and jobs_attempt(c.get("jobs")) < (run.get("run_attempt") or 1))
 
     def rest_room(self, cost: int) -> bool:
         """Whether `cost` more counted REST requests fit in the share."""
@@ -1422,21 +1442,21 @@ class Daemon:
         raw_body = json.dumps(body).encode() if body is not None else None
         if raw_body is not None:
             headers["Content-Type"] = "application/json"
-        status, h, raw = self.transport(method, API + path, headers, raw_body)
         bucket = "graphql" if path == "/graphql" else "rest"
+        charged = bucket == "rest" and not free and not self.writing
+        if charged:
+            # Charged before it is sent, and refunded only when GitHub says it was free (a 304): a
+            # request whose answer never arrives (a body timeout) may still have been counted by
+            # GitHub. The request's own minute, not the tick's: a tick can run TICK_BUDGET past its
+            # start, and dating its requests early would let them leave the hour's window early.
+            minute = int(self.clock() // 60)
+            self.charge_rest(minute, 1)
+        status, h, raw = self.transport(method, API + path, headers, raw_body)
+        if charged and status == 304:
+            self.charge_rest(minute, -1)
         # `free` is /rate_limit, which costs no quota: counting it as a REST request would overstate
         # what the daemon spends.
         self.sent.append((self.now, "free" if free else "rest304" if bucket == "rest" and status == 304 else bucket))
-        if bucket == "rest" and not free and status != 304 and not self.writing:
-            # The request's own minute, not the tick's: a tick can run TICK_BUDGET past its start,
-            # and dating its requests early would let them leave the hour's window early.
-            minute = int(self.clock() // 60)
-            self.rest_minutes[minute] = self.rest_minutes.get(minute, 0) + 1
-            # On disk before the next request, so a daemon that dies mid-tick hands its successor the
-            # spend it really made. One small file write per counted request (about 2000 an hour at
-            # the cap) is nothing next to the request itself.
-            write_json(BASE / REST_SPEND_FILE, {str(m): n for m, n in self.rest_minutes.items()})
-            self.saved_rest_minutes = dict(self.rest_minutes)
         if status == 401:
             self.token = None  # re-read from gh next time
         if "x-ratelimit-remaining" in h and h.get("x-ratelimit-resource", "core") in {"core", "graphql"}:
@@ -1734,9 +1754,18 @@ class Daemon:
         mine = [e for e in entries if e["key"].startswith(kind + ":")]
         path = self.route(kind)
         mode = self.mode(path)
-        if mode == "stop" or (path == "rest" and kind in BALANCED and self.rest_capped()):
-            # Spent, or the daemon's REST share is: a kind with no GraphQL to go to (it is stopped too)
+        if mode == "stop":
+            return []
+        if path == "rest" and kind in BALANCED and self.rest_capped():
+            # The daemon's REST share is spent and GraphQL is stopped too: a kind with nowhere to go
             # waits for the share to free up rather than spend the REST the sessions are left with.
+            # Except a failed attempt whose job list is not read yet, the one read the share does not
+            # hold back: tick() reads just that list, from the run already cached.
+            if kind == "run":
+                self.jobs_only = [e for e in mine if self.failed_without_jobs(e)
+                                  and self.now - self.attempted.get(e["key"], float("-inf")) >= self.policy["cycles"]["run"]]
+                for e in self.jobs_only:
+                    self.attempted[e["key"]] = self.now
             return []
         if kind == "head":
             return self.due_heads(mine, mode)
@@ -1870,6 +1899,7 @@ class Daemon:
         self.tick_deadline = time.monotonic() + TICK_BUDGET
         self.errors = []
         self.policy = daemon_policy()
+        self.jobs_only = []
         if self.failing is None:
             # and again in serve_waits: a long read phase must not look like a dead daemon; ticks that
             # keep raising stop marking, so their blockers hand the wait back (resume_wait says why)
@@ -1910,6 +1940,11 @@ class Daemon:
                 break
             except Exception as error:  # noqa: BLE001
                 self.errors.append(f"{e['key']}: {describe(error)}")
+        for e in self.jobs_only:
+            try:
+                self.read_jobs(e, {}, False)  # read_jobs reads the list a failed attempt is missing
+            except Exception as error:  # noqa: BLE001
+                self.errors.append(f"{e['key']} jobs: {describe(error)}")
         # After the reads, so a busy daemon never pays for it: its own responses' x-ratelimit
         # headers have already brought the view up to date, and only an idle one goes stale.
         self.refresh_budget()

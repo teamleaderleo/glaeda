@@ -8182,6 +8182,45 @@ class DaemonPolicyTest(Base):
         self.assertEqual(len(self.gh.run_calls()), 14)
         self.assertEqual(self.daemon.deferred, set())
 
+    def test_a_request_whose_answer_never_arrives_is_still_counted(self) -> None:
+        self.daemon.now = NOW
+        def lost(*a):
+            raise gg.WatchError("request failed: TimeoutError")  # GitHub may have counted it anyway
+        self.daemon.transport = lost
+        with self.assertRaises(gg.WatchError):
+            self.daemon.request("GET", "/repos/o/r/pulls/1")
+        self.assertEqual(self.daemon.rest_spent(), 1)
+        self.daemon.transport = lambda *a: (304, {}, b"")
+        self.daemon.request("GET", "/repos/o/r/pulls/1", etag="x")
+        self.assertEqual(self.daemon.rest_spent(), 1)  # a 304 is refunded
+        self.assertEqual(gg.read_json(gg.BASE / gg.REST_SPEND_FILE), {str(int(NOW // 60)): 1})
+
+    def test_a_failed_attempt_gets_its_job_list_when_runs_cannot_be_read(self) -> None:
+        """Capped REST and a stopped GraphQL: runs wait, but a failed attempt's job list does not."""
+        failed = {"id": 7, "name": "CI", "display_title": "fix", "status": "completed", "conclusion": "failure",
+                  "html_url": "https://github.com/o/r/actions/runs/7", "head_sha": "b" * 40, "head_branch": "x",
+                  "event": "push", "run_attempt": 1, "created_at": iso(NOW - 99), "updated_at": iso(NOW - 9)}
+        self.gh.runs[7] = failed
+        self.gh.runs[8] = {**failed, "id": 8, "status": "in_progress", "conclusion": None}
+        self.gh.jobs[7] = [job("build")]
+        key, other = gg.parse_key("run", "o/r/7"), gg.parse_key("run", "o/r/8")
+        self.daemon.store(key, None, data=gg.slim_run(failed), dataAt=NOW - 5)  # as the controller filled it
+        self.daemon.store(other, None, data=gg.slim_run(self.gh.runs[8]), dataAt=NOW - 5)
+        gg.register(key)
+        gg.register(other)
+        self.daemon.budget = {"rest": {"limit": 5000, "remaining": 4500, "reset": NOW + 1800},
+                              "graphql": {"limit": 5000, "remaining": 10, "reset": NOW + 1800}}
+        self.daemon.paths["run"] = "rest"
+        self.spend_rest(2000, at=NOW)
+        self.daemon.tick(NOW)
+        self.assertEqual(self.gh.run_calls(), [])  # neither run itself is read
+        self.assertEqual(len(self.gh.job_calls()), 1)
+        self.assertIn("/runs/7/jobs", self.gh.job_calls()[0][1])
+        self.assertEqual(gg.read_cache(key)["jobs"][0]["name"], "build")
+        gg.register(key)
+        self.daemon.tick(NOW + 2 * gg.CYCLE)
+        self.assertEqual(len(self.gh.job_calls()), 1)  # once per attempt
+
     def test_a_request_is_dated_by_its_own_minute(self) -> None:
         self.daemon.now = NOW - 90  # the tick began 90 s ago
         self.daemon.transport = lambda *a: (200, {}, b"{}")
