@@ -544,7 +544,7 @@ NEXT's feed compiles from `cmux-next.yml` on `feat-cmux-next`:
 `release-compile` that gates the nightly-next promotion.
 
 DEV and ordinary jobs share the capacity ledger, but while the slot is idle its
-gate holds `capacity/fresh.reserve`, which keeps `FRESH_RESERVE_UNITS` (4, one
+gate holds `capacity/fresh.reserve`, which keeps `FRESH_RESERVE_UNITS` (3, one
 release-compile) from every other job and runner gate on the mini, like the gui
 runner's one-unit reserve. PR jobs beside it drain off those units instead of
 refilling them, so the slot keeps listening for the next feed compile; the slot
