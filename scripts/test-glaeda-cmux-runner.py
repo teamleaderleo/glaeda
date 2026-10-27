@@ -8590,6 +8590,25 @@ class RunnerTest(unittest.TestCase):
         self.assertEqual(self.by_kind(stale)["register"]["state"], "relabel")
         self.assertEqual(self.by_kind(stale)["register"]["previousLabels"], ["glaeda-mini", "self-hosted"])
 
+    def test_an_uninstall_never_stops_or_deregisters_a_runner_with_a_job(self) -> None:
+        ctx = mock.Mock(skip_launchctl=False, headless=False)
+        actions = [{"kind": "agent", "state": "remove", "path": "/nonexistent.plist"},
+                   {"kind": "deregister", "state": "remove", "name": "x"}]
+        with mock.patch.object(cr, "stop_if_idle", return_value=False), mock.patch.object(cr, "bootout") as bootout:
+            cr.apply_uninstall(ctx, actions)
+        bootout.assert_not_called()
+        self.assertEqual([a["state"] for a in actions], ["failed", "skipped"])
+
+    def test_fleet_labels_stand_in_for_a_runner_list_this_gh_cannot_read(self) -> None:
+        with mock.patch.object(cr, "xcode_present", return_value=True):
+            first = self.invoke("--apply", "--manifest", self.manifest(), "--member", "mini-std")
+            (self.state / "fail-list").touch()  # gh is logged in but cannot list runners
+            same = self.invoke("--apply", "--token-stdin", "--manifest", self.manifest(), "--member", "mini-std",
+                               "--github-labels=" + ",".join(first["registration"]["labels"]), stdin=REG_TOKEN,
+                               expect=1)  # verify reads the same broken list
+        self.assertEqual(self.by_kind(same)["register"]["state"], "unchanged", self.by_kind(same)["register"])
+        self.assertEqual(len(self.config_argvs()), 1, "no re-registration")
+
     def test_manifest_apply_with_token_relabels_when_github_lookup_is_unavailable(self) -> None:
         with mock.patch.object(cr, "xcode_present", return_value=True):
             self.invoke("--apply", "--manifest", self.manifest(), "--member", "mini-std")

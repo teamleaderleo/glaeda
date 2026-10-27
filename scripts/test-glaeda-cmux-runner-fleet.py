@@ -224,7 +224,7 @@ class FleetTest(unittest.TestCase):
         self.assertEqual(sum(1 for c in calls if c["tool"] == "gh"), 17,
                          "eight tokens, eight label reads and one release read")
         # the minis hold no gh login: each instance gets the labels GitHub lists for it, read here
-        self.assertTrue(all("--github-labels glaeda-mini,self-hosted " in c["remote"] for c in applies))
+        self.assertTrue(all("--github-labels=glaeda-mini,self-hosted " in c["remote"] for c in applies))
         reads = sorted(next(a for a in c["argv"] if "runners?name=" in a) for c in calls if c["tool"] == "gh"
                        and any("runners?name=" in a for a in c["argv"]))
         self.assertIn("repos/manaflow-ai/cmux/actions/runners?name=mini-a-glaeda-3&per_page=100", reads)

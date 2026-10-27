@@ -584,7 +584,7 @@ def apply_instance(member: str, instance: int, repo: str | None, extra: list[str
     version, sha, _ = latest_release()
     labels = None if deregistered else github_labels(scope_api(repo, org),
                                                      f"{member}-glaeda" + (f"-{instance}" if instance else ""))
-    observed = f"--github-labels {_quote(labels)} " if labels is not None else ""
+    observed = f"--github-labels={_quote(labels)} " if labels is not None else ""  # = : a label may start with -
     remote = (f"~/{REMOTE_DIR}/scripts/glaeda-cmux-runner --apply --token-stdin {scope} "
               f"--manifest ~/{REMOTE_DIR}/mini-fleet.json --member {_quote(member)} --instance {instance} "
               f"--latest-runner-version {_quote(version)} --latest-runner-sha256 {_quote(sha)} "

@@ -1182,9 +1182,10 @@ def plan_install(ctx: Context, receipt: dict[str, Any] | None) -> list[dict[str,
         # A local receipt records what this copy last requested, not what GitHub currently
         # holds.  Read the registration once and use that observation for reconciliation.
         github_listed, github_found = lookup_runner(ctx)
-    elif ours and configured and isinstance(getattr(ctx, "github_labels", None), str):
-        # the minis hold no gh login: the fleet read GitHub's labels with its own and passed them. Without them,
-        # every apply re-registered each idle runner in place (the token path below) whatever its labels were.
+    if ours and configured and not github_listed and isinstance(getattr(ctx, "github_labels", None), str):
+        # the minis hold no gh login (or one that cannot list runners): the fleet read GitHub's labels with its own
+        # and passed them. Without them, every apply re-registered each idle runner in place (the token path
+        # below) whatever its labels were.
         github_listed, github_found = True, {"labels": sorted({label.strip() for label in ctx.github_labels.split(",")
                                                               if label.strip()})}
     # This install registered that name before and lost its local .runner (an interrupted relabel):
@@ -1815,13 +1816,19 @@ def verify(ctx: Context, act: dict[str, Any], wait: bool) -> None:
 
 
 def apply_uninstall(ctx: Context, actions: list[dict[str, Any]]) -> None:
+    busy = False
     for act in actions:
         act["applied"] = False
         if act["state"] != "remove":
             continue
+        if busy:  # the agent kept its job: deregistering or deleting under it would cancel the job too
+            act["state"], act["note"] = "skipped", "the runner has a job; re-run when idle"
+            continue
         if act["kind"] == "agent":
-            if not ctx.skip_launchctl:
-                bootout(ctx)
+            if not ctx.skip_launchctl and not stop_if_idle(ctx):  # a migration's deregister cancels no job
+                act["state"], act["note"] = "failed", "the runner has a job; nothing removed, re-run when idle"
+                busy = True
+                continue
             if ctx.headless:
                 code, out = run([SUDO, "/bin/rm", "-f", act["path"]])
                 if code != 0:
