@@ -1359,7 +1359,8 @@ class Builder:
                 # under the member's name (glaeda-cmux-runner-fleet passes --member) or, for an older install, the
                 # host's own name (glaeda-cmux-runner's default): either registration is that instance
                 # (glaeda-cmux-runner's default takes the short hostname: worker.example.com registers worker-glaeda)
-                aliases = {short for a, owner in self.aliases.items() if owner == name for short in (a, a.split(".")[0])}
+                aliases = {short for a, owner in self.aliases.items() if owner == name
+                           for short in (a, re.sub(r"[^a-z0-9-]+", "-", a.split(".")[0]).strip("-"))}
                 count = min(declared, MAX_DECLARED_RUNNERS)
                 missing = [n for k, n in enumerate(runner_names(name, count))
                            if not any(norm(runner_names(a, k + 1)[k]) in registered for a in aliases)]

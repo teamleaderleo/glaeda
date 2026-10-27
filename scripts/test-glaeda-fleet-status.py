@@ -1234,6 +1234,12 @@ class DeclaredRunnerTests(unittest.TestCase):
         doc = fs.build({"schema": fs.SOURCES_SCHEMA, "collected_at": AT, "sources": {
             "manifest": src({"fleet": "test", "hosts": hosts, "never_touch": []}), "runners": src(data)}}, at=AT)
         self.assertFalse(by_id(doc, "runners.missing"))
+        hosts["mini-a"]["hostname"] = "studio_a.example.com"  # glaeda-cmux-runner's default_name: studio-a-glaeda
+        data["runners"] = [{"name": n, "status": "online", "busy": False, "labels": []}
+                           for n in ("mini-a-glaeda", "studio-a-glaeda-1", "mini-a-glaeda-2")]
+        doc = fs.build({"schema": fs.SOURCES_SCHEMA, "collected_at": AT, "sources": {
+            "manifest": src({"fleet": "test", "hosts": hosts, "never_touch": []}), "runners": src(data)}}, at=AT)
+        self.assertFalse(by_id(doc, "runners.missing"))
 
     def test_every_declared_instance_registered_is_not_a_finding(self):
         doc = declared_bundle(["mini-a-glaeda", "mini-a-glaeda-1", "mini-a-glaeda-2", "mini-a-glaeda-7"])

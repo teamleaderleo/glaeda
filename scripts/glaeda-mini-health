@@ -417,15 +417,14 @@ class Mini:
 
     def runner_registrations(self) -> list[dict[str, Any]]:
         """The listener gate's registration_deleted records (glaeda-cmux-runner-hook registration_file), one per
-        runner GitHub no longer knows."""
+        runner GitHub no longer knows, for the runners this tool watches (runner_dirs(), as runner_agents()). A
+        record whose runner was uninstalled (its directory or .runner gone) is stale: nothing will clear it."""
         out = []
+        dirs = {d.name: d for d in self.runner_dirs()}
         for path in sorted((self.home / ".local/state/glaeda/cmux-runner").glob("registration-*.json")):
             doc = load_json(path)
             name = path.name[len("registration-"):-len(".json")]
-            # an uninstalled runner (its directory removed) leaves a stale record that nothing will clear
-            recorded = doc.get("runner_dir")
-            runner_dir = Path(recorded) if isinstance(recorded, str) and recorded.startswith("/") else self.home / name
-            if doc.get("cause") == "registration_deleted" and (runner_dir / ".runner").is_file():
+            if doc.get("cause") == "registration_deleted" and name in dirs and (dirs[name] / ".runner").is_file():
                 out.append({**doc, "dir": name})
         return out
 

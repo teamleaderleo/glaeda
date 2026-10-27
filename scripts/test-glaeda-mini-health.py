@@ -1865,17 +1865,12 @@ class Runners(Base):
         (state / "registration-actions-runner-glaeda.json").write_text("{}")  # cleared or foreign: ignored
         (state / "registration-actions-runner-glaeda-3.json").write_text(json.dumps(
             {"cause": "registration_deleted", "runner": "mini-a-glaeda-3"}))  # uninstalled: no runner dir
-        (home / "actions-runner-glaeda-2").mkdir()
+        (home / "actions-runner-glaeda-2/glaeda-hooks").mkdir(parents=True)  # runner_dirs() finds it
         (home / "actions-runner-glaeda-2/.runner").write_text("{}")
-        custom = home / "runners/side"  # a --runner-dir outside the home's actions-runner-glaeda* names
-        custom.mkdir(parents=True)
-        (custom / ".runner").write_text("{}")
-        (state / "registration-side.json").write_text(json.dumps(
-            {"cause": "registration_deleted", "runner": "mini-a-side", "runner_dir": str(custom)}))
         self.mini.home = home
         report = self.run_once()
-        self.assertEqual(self.ids(report), ["registration_deleted:2", "registration_deleted:side"])
-        f = report["findings"][0]
+        self.assertEqual(self.ids(report), ["registration_deleted:2"])
+        [f] = report["findings"]
         self.assertEqual((f["severity"], f["auto_fix"]), ("error", "impossible"))
         self.assertIn("mini-a-glaeda-2", f["evidence"])
 
