@@ -240,12 +240,17 @@ class Mirror(unittest.TestCase):
         (self.mirror / "refs/heads/main.lock").write_text("")
         (self.mirror / "packed-refs.lock").write_text("")
         (self.mirror / "config.lock").write_text("")
+        (self.mirror / "HEAD.lock").write_text("")
+        abandoned = self.mirror.parent / ".seed-killed"
+        (abandoned / "cmux.git").mkdir(parents=True)
         (self.mirror / "shallow").write_text(sh("git", "-C", os.fspath(self.mirror), "rev-parse", "main") + "\n")
         result = gm.run(True, home=self.home)  # a repair, then the fetch
         self.assertEqual(result["state"], "applied", result)
         self.assertEqual(result["fetch"]["tries"], 1)
         self.assertFalse((self.mirror / "refs/heads/main.lock").exists())
         self.assertFalse((self.mirror / "config.lock").exists())
+        self.assertFalse((self.mirror / "HEAD.lock").exists())
+        self.assertFalse(abandoned.exists())
 
     def test_a_repair_killed_part_way_still_reads_as_broken(self) -> None:
         gm.run(True, home=self.home)
