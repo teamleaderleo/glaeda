@@ -3751,8 +3751,9 @@ def bounded_waiters(state_dir: Path, waiting: list[int] | set[int], now: float |
                     identity: Callable[[int], str | None] | None = None) -> list[int]:
     """The waiters still owed a yield. Each waiter's wait span is kept in WAITER_SPANS_FILE, updated under its
     flock so every runner's gate and job-started agree on it. A span is keyed by pid and process start
-    (process_identity), so a reused pid starts its own. Times are time.monotonic (system-wide, and immune to wall
-    clock steps); a reading earlier than a span's last sighting is a reboot and starts afresh. A span starts when a
+    (process_identity), so a reused pid starts its own, and a reboot leaves no span to match. Times are
+    time.monotonic (system-wide, immune to wall clock steps), read once the lock is held; a reading a little behind a
+    span's last sighting (a caller's own `now`) neither ends the span nor moves its sighting back. A span starts when a
     waiter is first seen and ends when it is not seen for GATE_WAITER_GAP_S. Within it the waiter is honoured for
     GATE_WAITER_MAX_HOLD_S, then ignored for GATE_WAITER_WAIVE_S, and so on; the first reading that ignores it in a
     cycle logs why, after the record holds that. A record that cannot be locked, read or written honours every
@@ -3760,7 +3761,6 @@ def bounded_waiters(state_dir: Path, waiting: list[int] | set[int], now: float |
     waiting = sorted(set(waiting))
     if not waiting:
         return []
-    now = time.monotonic() if now is None else now
     identity = identity or process_identity
     path = state_dir / WAITER_SPANS_FILE
     try:
@@ -3778,6 +3778,7 @@ def bounded_waiters(state_dir: Path, waiting: list[int] | set[int], now: float |
                 if time.monotonic() >= deadline:
                     return waiting
                 time.sleep(0.05)
+        now = time.monotonic() if now is None else now  # after the lock: no reader writes an older sighting
         try:
             record = json.loads(path.read_text())
             spans = record if isinstance(record, dict) else {}
@@ -3788,7 +3789,7 @@ def bounded_waiters(state_dir: Path, waiting: list[int] | set[int], now: float |
         kept: dict[str, dict[str, Any]] = {}
         for key, span in spans.items():  # spans of waiters this reading missed, still within the gap
             if isinstance(span, dict) and all(isinstance(span.get(k), (int, float)) for k in ("since", "seen")) \
-                    and span["since"] <= span["seen"] and 0 <= now - span["seen"] < GATE_WAITER_GAP_S:
+                    and span["since"] <= span["seen"] and abs(now - span["seen"]) < GATE_WAITER_GAP_S:
                 kept[key] = span
         owed: list[int] = []
         notes: list[str] = []
@@ -3800,9 +3801,9 @@ def bounded_waiters(state_dir: Path, waiting: list[int] | set[int], now: float |
                 continue
             key = f"{pid}:{who}"
             span = kept.get(key) or {"since": now}
-            span["seen"] = now
+            span["seen"] = max(span["seen"], now) if "seen" in span else now
             kept[key] = span
-            waited = now - span["since"]
+            waited = max(0.0, now - span["since"])
             if GATE_WAITER_MAX_HOLD_S <= 0 or cycle <= 0 or waited % cycle < GATE_WAITER_MAX_HOLD_S:
                 owed.append(pid)
                 continue

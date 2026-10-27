@@ -4873,12 +4873,38 @@ class GateTest(unittest.TestCase):
                                          notes=notes), [77])
         self.assertEqual(notes, [])
 
-    def test_concurrent_readers_keep_each_others_spans(self) -> None:
+    def test_concurrent_waiter_readers_keep_each_others_spans(self) -> None:
+        # Two gates read while a third holds the record's lock; the later-scheduled one sampled an older time.
         t0 = 4_000_000.0
+        hold = hook.GATE_WAITER_MAX_HOLD_S
         self.waited(t0, 0, 0, (77,))
-        self.waited(t0, 60, 60, (88,))  # another runner's gate saw only 88
-        self.assertEqual(self.waited(t0, hook.GATE_WAITER_MAX_HOLD_S + 1, hook.GATE_WAITER_MAX_HOLD_S + 1, (77,)), [],
-                         "77's span survived 88's update")
+        fd = os.open(self.state / (Path(hook.WAITER_SPANS_FILE).stem + ".lock"), os.O_RDWR)
+        self.addCleanup(os.close, fd)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        readers = [threading.Thread(target=self.waited, args=(t0, 90, 90, (88,))),
+                   threading.Thread(target=self.waited, args=(t0, 60, 60, (77,)))]
+        for reader in readers:
+            reader.start()
+        time.sleep(0.3)  # both block on the lock
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        for reader in readers:
+            reader.join(timeout=10)
+        spans = json.loads((self.state / hook.WAITER_SPANS_FILE).read_text())
+        self.assertEqual(sorted(spans), ["77:start-77", "88:start-88"], "neither update lost the other's span")
+        self.assertEqual(spans["77:start-77"]["since"], t0, "77's wait kept its start")
+        self.assertEqual(self.waited(t0, hold + 1, hold + 1, (77,)), [], "and is bounded from that start")
+
+    def test_a_stale_waiter_reading_neither_restarts_nor_rewinds_a_span(self) -> None:
+        t0 = 6_000_000.0
+        hold = hook.GATE_WAITER_MAX_HOLD_S
+        self.waited(t0, 0, 120)
+        self.assertEqual(self.waited(t0, 90, 90), [77])  # a reading sampled before the last sighting
+        spans = json.loads((self.state / hook.WAITER_SPANS_FILE).read_text())
+        self.assertEqual(spans["77:start-77"], {"since": t0, "seen": t0 + 120})
+        self.assertEqual(self.waited(t0, 150, hold + 1), [])
+        # bounded_waiters reads the clock itself only once it holds the lock
+        with mock.patch.object(hook.time, "monotonic", return_value=t0 + hold + 2):
+            self.assertEqual(hook.bounded_waiters(self.state, [77], identity=lambda pid: "start-77"), [])
 
     def test_the_gate_stops_yielding_to_a_waiter_past_the_hold(self) -> None:
         gate = hook.Gate(self.runner, os.fspath(self.lock), os.fspath(self.tmp / "none.json"), self.state)
