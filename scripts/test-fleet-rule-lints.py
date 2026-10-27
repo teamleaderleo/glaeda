@@ -85,8 +85,18 @@ def scan(root: Path) -> dict[str, dict[str, int]]:
     return found
 
 
+def bad_counts(allow: dict) -> list[str]:
+    """Every count is a positive int (not a bool, float or NaN, which would make every comparison false)."""
+    return [f"{rule}: {rel}: count must be a positive integer, not {entry.get('count')!r}"
+            for rule, entries in allow.items() if not rule.startswith("_")
+            for rel, entry in sorted(entries.items())
+            if type(entry.get("count")) is not int or entry["count"] < 1]
+
+
 def problems(found: dict[str, dict[str, int]], allow: dict) -> list[str]:
-    out = []
+    out = bad_counts(allow)
+    if out:
+        return out
     for rule in found:
         entries = allow.get(rule, {})
         for rel, n in sorted(found[rule].items()):
@@ -113,7 +123,9 @@ def growth(allow: dict, base: dict | None) -> list[str]:
     change that introduces the lint."""
     if base is None:
         return []
-    out = []
+    out = bad_counts(allow)
+    if out:
+        return out
     for rule, entries in allow.items():
         if rule.startswith("_"):
             continue
@@ -191,6 +203,14 @@ class FleetRuleLints(unittest.TestCase):
         self.assertIn("pkill: a.sh: 1 matches, allowlist says 2: lower it to 1",
                       problems({"pkill": {"a.sh": 1}, "keychain": {}, "big-red": {}},
                                {"pkill": {"a.sh": {"count": 2, "reason": "r"}}}))
+
+    def test_counts_must_be_positive_integers(self):
+        found = {"pkill": {"a.sh": 5}, "keychain": {}, "big-red": {}}
+        for count in (float("nan"), 1.5, True, 0, -1, "5", None):
+            allow = {"pkill": {"a.sh": {"count": count, "reason": "r"}}}
+            self.assertTrue(problems(found, allow), count)
+            self.assertTrue(growth(allow, {"pkill": {"a.sh": {"count": 5, "reason": "r"}}}), count)
+        self.assertTrue(problems(found, json.loads('{"pkill": {"a.sh": {"count": NaN, "reason": "r"}}}')))
 
     def test_the_allowlist_cannot_grow_against_the_base(self):
         base = {"pkill": {"a.sh": {"count": 2, "reason": "r"}}}
