@@ -521,6 +521,34 @@ class HookTest(unittest.TestCase):
             with self.subTest(overrides=overrides):
                 self.assertIsNotNone(hook.dev_compile_refusal(**{**args, **overrides}))
 
+    def test_feed_jobs_are_the_nightly_app_build_and_the_feed_compiles(self) -> None:
+        for branch in ("nightly-next", "main"):
+            ref = f"refs/heads/{branch}"
+            args = {"event_name": "push", "ref": ref, "repository": "manaflow-ai/cmux",
+                    "event": {"ref": ref, "repository": CMUX},
+                    "workflow_ref": f"manaflow-ai/cmux/.github/workflows/nightly.yml@{ref}", "job": "build-nightly-app"}
+            with self.subTest(branch=branch):
+                self.assertTrue(hook.feed_job(**args))
+                self.assertTrue(hook.feed_job(**{**args, "event_name": "schedule", "event": {"repository": CMUX}}))
+                self.assertTrue(hook.feed_job(**{**args, "event_name": "workflow_dispatch",
+                                                 "event": {"repository": CMUX}}))
+                for overrides in (
+                        {"job": "build-sign-notarize-nightly"}, {"event_name": "pull_request"},
+                        {"repository": "other/cmux"}, {"event": {"ref": "refs/heads/other", "repository": CMUX}},
+                        {"workflow_ref": args["workflow_ref"].replace("nightly.yml", "ci.yml")},
+                        {"workflow_ref": "manaflow-ai/cmux/.github/workflows/nightly.yml@refs/pull/1/merge"},
+                        {"ref": "refs/pull/1/merge"}, {"ref": "refs/heads/rc/1"}):
+                    with self.subTest(branch=branch, overrides=overrides):
+                        self.assertFalse(hook.feed_job(**{**args, **overrides}))
+        dev = {"event_name": "push", "ref": "refs/heads/feat-cmux-next", "repository": "manaflow-ai/cmux",
+               "event": {"ref": "refs/heads/feat-cmux-next", "repository": CMUX},
+               "workflow_ref": "manaflow-ai/cmux/.github/workflows/cmux-next.yml@refs/heads/feat-cmux-next",
+               "job": "cmux-scheme-compile"}
+        self.assertTrue(hook.feed_job(**dev))
+        self.assertTrue(hook.feed_job(**{**dev, "job": "release-compile"}))
+        self.assertFalse(hook.feed_job(**{**dev, "job": "swift-test"}))
+        self.assertFalse(hook.feed_job(**{**dev, "event_name": "pull_request"}))
+
     def test_dev_compile_instance_gate_leaves_ordinary_admission_unchanged(self) -> None:
         self.fleet()
         push = event(self.dir, "dev-push", {"repository": CMUX, "ref": "refs/heads/feat-cmux-next"})
@@ -2771,6 +2799,52 @@ time.sleep(60)
         self.assertIn("has waited longer here for units", hook.fair_turn(capacity, {"units"}, now))
         self.assertIsNone(hook.fair_turn(capacity, {"simulator"}, now), "no shared kind: no turn to wait for")
         self.assertIsNone(hook.fair_turn(capacity, {"root", "units"}, now - 60), "an older admission goes first")
+
+    def test_feed_builds_go_ahead_of_pr_waiters_until_the_jump_bound(self) -> None:
+        """FEED_FIRST: a feed build waiting for units goes ahead of a PR job that began to wait earlier, unless that
+        job has waited FEED_JUMP_S; a PR job never goes ahead of a waiting feed build it has not outwaited that long.
+        Feed builds keep arrival order among themselves, and nothing else in the queue changes."""
+        capacity = self.dir / "capacity"
+        capacity.mkdir()
+        now, bound = time.time(), hook.FEED_JUMP_S
+        marker = capacity / f"{hook.ADMIT_WANT}{os.getppid()}"
+
+        def waiting(since: float, feed: object = None) -> None:
+            want: dict[str, object] = {"since": since, "wants": ["units"], "who": "w0 job (run 1)"}
+            if feed is not None:
+                want["feed"] = feed
+            marker.write_text(json.dumps(want))
+
+        waiting(now - 60)  # a PR job, a minute in
+        self.assertIsNone(hook.fair_turn(capacity, {"units"}, now, feed=True), "a feed build goes first")
+        self.assertIn("has waited longer here for units", hook.fair_turn(capacity, {"units"}, now))
+        self.assertIsNone(hook.fair_turn(capacity, {"simulator"}, now, feed=True))
+        waiting(now - bound - 5)  # a PR job past the bound is not jumped
+        self.assertIn("has waited longer here for units", hook.fair_turn(capacity, {"units"}, now, feed=True))
+        waiting(now - 5, feed=True)  # a feed build that arrived after this PR job
+        self.assertIn("is a feed build and goes first here for units", hook.fair_turn(capacity, {"units"}, now - 60))
+        self.assertIsNone(hook.fair_turn(capacity, {"units"}, now - bound - 10), "past the bound: arrival order")
+        self.assertIsNone(hook.fair_turn(capacity, {"units"}, now - 60, feed=True), "feed builds: arrival order")
+        self.assertIn("has waited longer", hook.fair_turn(capacity, {"units"}, now, feed=True))
+        waiting(now - 5, feed="true")  # only a JSON true marks a feed build
+        self.assertEqual([w["feed"] for w in hook.admission_waiters(capacity)], [False])
+        self.assertIsNone(hook.fair_turn(capacity, {"units"}, now - 60))
+        # one total order: of any two waiters, exactly one is ahead
+        for a, b in ((False, True), (True, False), (True, True), (False, False)):
+            for age_a, age_b in ((60, 5), (bound + 60, 5), (bound + 60, bound + 5), (5, 60)):
+                ra = hook.admission_rank(a, now - age_a, 10, now)
+                rb = hook.admission_rank(b, now - age_b, 11, now)
+                self.assertNotEqual(ra < rb, rb < ra, (a, age_a, b, age_b))
+
+    def test_a_waiting_feed_build_marks_its_marker(self) -> None:
+        capacity = self.dir / "capacity"
+        capacity.mkdir()
+        marker = capacity / f"{hook.ADMIT_WANT}{os.getppid()}"
+        hook.write_want(marker, 1.0, ["units"])
+        self.assertNotIn("feed", json.loads(marker.read_text()))
+        hook.write_want(marker, 1.0, ["units"], feed=True)
+        self.assertIs(json.loads(marker.read_text())["feed"], True)
+        self.assertEqual([w["feed"] for w in hook.admission_waiters(capacity)], [True])
 
     def test_capacity_runners_wait_for_units(self) -> None:
         # a 4-core side lane waits for units instead of refusing, on a side runner (instance past
