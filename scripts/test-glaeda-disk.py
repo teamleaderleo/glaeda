@@ -5188,9 +5188,45 @@ class GlaedaDiskTest(unittest.TestCase):
         self.assertEqual((every["test_residue"], every["idle"], every["every_entry"]), (9, 8, True))
         self.assertIsNone(gd.tmp_test_residue_census(self.root / "missing"))
 
+    def test_tmpdir_test_residue_takes_any_words_uuid_name_on_every_host(self) -> None:
+        tmp = self.root / "T3"
+        reaped = [tmp / "cmux-screenshots-tests-FA6A171A-766D-46D5-8D5D-6035A5A74F9D",
+                  tmp / "phone-tests-0157d868-1a4f-4a4c-b017-9a3bb1b51aa6.sqlite"]
+        kept = [tmp / "com.apple.CoreSimulator.SimDevice.F1D60153-D8F6-4573-BE5E-7EBEC850026F",
+                tmp / "F1D60153-D8F6-4573-BE5E-7EBEC850026F",
+                tmp / "downloads-0157d868-1a4f-4a4c-b017-9a3bb1b51aa6.tar.gz"]  # two extensions: not a fixture name
+        reaped[0].mkdir(parents=True)
+        reaped[1].write_bytes(b"sqlite")
+        kept[0].mkdir()
+        kept[1].mkdir()
+        kept[2].write_bytes(b"gz")
+        for p in [*reaped, *kept]:
+            self._age(p, hours=72) if p.is_dir() else os.utime(p, (time.time() - 72 * 3600,) * 2)
+        receipt = self.receipt()
+        with contextlib.redirect_stdout(io.StringIO()):
+            gd.reap_tmpdir_test_residue(receipt, tmp, every_entry=False)
+        self.assertEqual([p.name for p in reaped if os.path.lexists(p)], [])
+        self.assertEqual([p.name for p in kept if not os.path.lexists(p)], [])
+        self.assertEqual(json.loads(receipt.read_text())["by_prefix"],
+                         {"cmux-screenshots-tests": 1, "phone-tests": 1})
+        # a runner host takes unkept names too, but never a dotted Apple name or a bare UUID
+        for p in kept[:2]:
+            self.assertIsNone(gd.tmp_test_residue_prefix(p.name, True), p.name)
+        # the same vetoes hold: an open fixture stays
+        live = tmp / "phone-tests-1157d868-1a4f-4a4c-b017-9a3bb1b51aa6.sqlite"
+        live.write_bytes(b"sqlite")
+        os.utime(live, (time.time() - 72 * 3600,) * 2)
+        gd.process_evidence = lambda: ([str(live)], "")
+        with contextlib.redirect_stdout(io.StringIO()):
+            gd.reap_tmpdir_test_residue(self.receipt(), tmp, every_entry=False)
+        self.assertTrue(live.is_file())
+
     def test_tmpdir_test_residue_prefix(self) -> None:
         self.assertEqual(gd.tmp_test_residue_prefix("cmux-screenshots-tests-0A1B", False), "cmux-screenshots-tests")
         self.assertIsNone(gd.tmp_test_residue_prefix("downloads-0A1B2C", False))
+        self.assertEqual(gd.tmp_test_residue_prefix("phone-tests-0157d868-1a4f-4a4c-b017-9a3bb1b51aa6.sqlite", False),
+                         "phone-tests")
+        self.assertIsNone(gd.tmp_test_residue_prefix("F1D60153-D8F6-4573-BE5E-7EBEC850026F", True))
         self.assertEqual(gd.tmp_test_residue_prefix("downloads-0A1B2C", True), gd.TMP_TEST_RESIDUE_OTHER)
         for keep in ("com.apple.WebKit", ".X", "TemporaryItems", "tmux-501", "ssh-abc", "xcrun_db"):
             self.assertIsNone(gd.tmp_test_residue_prefix(keep, True), keep)

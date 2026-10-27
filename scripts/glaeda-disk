@@ -93,7 +93,7 @@ git-pr-<uuid>, TemporaryDirectory.<rand>, ...): tens of thousands, each under th
 family reclaims them. user-tmp-test-residue removes entries named by TMP_TEST_RESIDUE on every apply (not only
 under pressure) once nothing in the whole entry changed for 12 hours and no process holds or names it. On a fleet
 mini with enrolled runners every entry is a candidate except the TMP_TEST_RESIDUE_KEEP names (com.apple.*, dot
-names, TemporaryItems, tmux/ssh sockets), and an unnamed one also stays while a socket sits in it or is one.
+names, TemporaryItems, tmux/ssh sockets, a bare UUID), and an unnamed one also stays while a socket sits in it or is one.
 An entry with a TemporaryItems child (macOS guards $TMPDIR/<entry>/TemporaryItems) is moved into a holding dir
 one level down (glaeda-tmp-hold-<pid>, itself named scratch if a pass dies), walked and judged there, and deleted
 there or moved back. Every report shows the count
@@ -2220,7 +2220,14 @@ TMP_TEST_RESIDUE = re.compile(
 # On a host with enrolled runners the runner user's $TMPDIR is test scratch, and new tests keep adding prefixes
 # no list names (~47k entries under ~60 prefixes on one CI mini, 2026-10-26): there every entry is a candidate
 # under the same 12 h idle and process rules, except these, which macOS and live daemons keep.
-TMP_TEST_RESIDUE_KEEP = re.compile(r"(?:\.|com\.apple\.|TemporaryItems$|tmux-|ssh-|launchd|xcrun_db)")
+# Any host: a test's fixture name is dash-separated words (no dots), a full UUID and at most a short extension
+# (phone-tests-<uuid>.sqlite). A dotted name (com.apple.CoreSimulator.SimDevice.<uuid>) or a bare UUID is no
+# test's. by_prefix counts by the words before the UUID.
+_UUID = r"[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}"
+TMP_TEST_UUID_NAME = re.compile(
+    r"(?P<prefix>[A-Za-z][A-Za-z0-9_]*(?:-[A-Za-z0-9_]+)*)-" + _UUID + r"(?:\.[A-Za-z0-9]{1,8})?")
+TMP_TEST_RESIDUE_KEEP = re.compile(r"(?:\.|com\.apple\.|TemporaryItems$|tmux-|ssh-|launchd|xcrun_db|"
+                                   + _UUID + r"$)")
 TMP_TEST_RESIDUE_OTHER = "unnamed"  # the receipt's by_prefix bucket for an entry no TMP_TEST_RESIDUE prefix names
 # macOS guards $TMPDIR/<entry>/TemporaryItems (a sandboxed app's temporary-items folder): listing, renaming or
 # removing it fails, and on macOS 27 the call blocks first. A test fixture that made one in its scratch dir left
@@ -2296,10 +2303,12 @@ def tmp_test_residue_veto(entry: Path, opened: frozenset[str], cmds: str, now: f
 
 
 def tmp_test_residue_prefix(name: str, every_entry: bool) -> str | None:
-    """The receipt prefix of a $TMPDIR entry the reaper may take, or None: a TMP_TEST_RESIDUE name, or with
-    every_entry (a runner host) any name TMP_TEST_RESIDUE_KEEP does not keep."""
+    """The receipt prefix of a $TMPDIR entry the reaper may take, or None: a TMP_TEST_RESIDUE name, a
+    TMP_TEST_UUID_NAME, or with every_entry (a runner host) any name TMP_TEST_RESIDUE_KEEP does not keep."""
     if m := TMP_TEST_RESIDUE.match(name):
         return m.group(0)[:-2]
+    if m := TMP_TEST_UUID_NAME.fullmatch(name):
+        return m.group("prefix")
     if every_entry and not TMP_TEST_RESIDUE_KEEP.match(name):
         return TMP_TEST_RESIDUE_OTHER
     return None
