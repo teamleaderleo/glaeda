@@ -296,6 +296,14 @@ class FleetTest(unittest.TestCase):
         self.assertTrue(all("--repo manaflow-ai/cmux" in c["remote"] and "--org" not in c["remote"]
                             for c in registers if c["host"] == "mini-b"))
         self.assertEqual(len(registers), 8)
+        # a trusted member whose own overrides name the org registers there (a trusted runner in the org's group)
+        self.log.unlink()
+        manifest["hosts"]["mini-b"]["overrides"]["runner"].update({"org": "manaflow-ai", "group": "glaeda-minis"})
+        self.manifest.write_text(json.dumps(manifest))
+        trusted = self.fleet("--apply", "--hosts", "mini-b", FAKE_GROUPS=GROUP)
+        self.assertEqual(trusted.returncode, 0, trusted.stdout + trusted.stderr)
+        self.assertTrue(all("--org manaflow-ai --group glaeda-minis" in c["remote"] for c in self.calls()
+                            if c["tool"] == "ssh" and "--apply" in c["remote"]))
         # a group the org lacks: nothing changes
         self.log.unlink()
         missing = self.fleet("--apply", "--hosts", "mini-a", FAKE_GROUPS="[]")

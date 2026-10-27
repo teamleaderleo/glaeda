@@ -347,7 +347,8 @@ DEFAULT_LABELS = ("self-hosted", "macos", "arm64", MINI_LABEL)
 
 # Where a member's pool instances register (glaeda-cmux-runner-fleet, when no --org/--repo is passed): the manifest's
 # runner.org and runner.group (defaults, or a host's overrides), so a re-apply keeps the scope the pools already have
-# and nobody passes flags by hand. A trusted-only member (runner.trustedRepo) stays on that repository. Neither set:
+# and nobody passes flags by hand. A trusted-only member (runner.trustedRepo) stays on that repository unless its own
+# overrides name runner.org (a trusted runner registered in the org's group). Neither set:
 # None, and the fleet tool falls back to its default repository as before.
 GROUP_RE = r"[A-Za-z0-9][A-Za-z0-9 ._-]*"
 ORG_RE = r"[A-Za-z0-9][A-Za-z0-9-]*"
@@ -370,8 +371,9 @@ def pool_scope(manifest: Any, member: str) -> tuple[dict[str, str | None] | None
         return None, f"{member} runner.org must be an organization login"
     if group is not None and (org is None or not (isinstance(group, str) and re.fullmatch(GROUP_RE, group))):
         return None, f"{member} runner.group must be a runner group name and goes with runner.org"
-    if isinstance(trusted, str) and re.fullmatch(REPO_RE, trusted):
-        return {"repo": trusted}, None
+    own = (overrides.get("runner") or {}) if isinstance(overrides.get("runner"), dict) else {}
+    if isinstance(trusted, str) and re.fullmatch(REPO_RE, trusted) and "org" not in own:
+        return {"repo": trusted}, None  # the defaults' org is for the pools; the host's own org says otherwise
     if org is None:
         return None, None
     return {"org": org, "group": group}, None
