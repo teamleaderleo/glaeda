@@ -74,9 +74,11 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     if: github.repository == 'teamleaderleo/glaeda' && github.ref == 'refs/heads/main'
-    # canary.json has this one writer; a newer push waiting here supersedes an older pending one
+    # One group per commit: a shared group let a newer push replace an older pending publish, so that
+    # commit never got its durable release. canary.json still only moves forward: the write below
+    # re-reads it and refuses a commit that does not descend from what it names.
     concurrency:
-      group: ota-canary
+      group: ota-canary-${{ github.sha }}
       cancel-in-progress: false
     permissions:
       contents: write
@@ -142,6 +144,24 @@ jobs:
             cat channels/err; exit 1
           fi
           python3 scripts/glaeda_release.py canary --release release-assets/release.json > channels/next.json
+          # Publishes of different commits run side by side: read canary.json again right before the write and
+          # never move it back to a commit the newer canary does not descend from.
+          if gh release download ota-channels --pattern canary.json --output channels/latest.json --clobber 2>channels/err; then
+            latest=$(python3 -c 'import json;print(json.load(open("channels/latest.json"))["source"])')
+            set +e
+            git merge-base --is-ancestor "$latest" "$GITHUB_SHA"
+            descends=$?
+            set -e
+            if [ "$descends" = 1 ]; then
+              echo "canary moved to $latest meanwhile; $GITHUB_SHA does not descend from it, canary stays" >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            elif [ "$descends" != 0 ]; then
+              echo "canary commit $latest is not in main's history (rewritten?); fix canary.json by hand" >&2
+              exit 1
+            fi
+          elif ! grep -q "no assets match" channels/err; then
+            cat channels/err; exit 1
+          fi
           mv channels/next.json channels/canary.json
           gh release upload ota-channels channels/canary.json --clobber
           cat channels/canary.json >> "$GITHUB_STEP_SUMMARY"
