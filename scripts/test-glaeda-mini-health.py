@@ -211,9 +211,13 @@ class FakeMini(health.Mini):
         return self.refusal
 
     toolchain: str | None = None
+    toolchain_gone: str | None = None
 
     def toolchain_mismatch(self):
         return self.toolchain
+
+    def toolchain_missing(self):
+        return self.toolchain_gone
 
     def install_rust_toolchain(self, toolchain):
         self.toolchain_installs.append(toolchain)
@@ -318,6 +322,28 @@ class NodeEligibility(unittest.TestCase):
         mini._hook.xcode_refusal = lambda xcode_app, env: 1 / 0
         self.assertIsNone(mini.toolchain_mismatch(), "a hook that cannot answer is no finding")
 
+    def test_a_missing_rust_toolchain_is_read_from_the_hook_for_a_fleet_node(self) -> None:
+        mini, _ = self.mini("exec /usr/bin/python3 hook job-started --require-eligible --fleet-class m4pro-48")
+        why = "node not eligible (Rust toolchain missing: /Users/cmux/.cargo/bin/rustup)"
+        homes: list[Path] = []
+        fleet_node = [True]
+        mini._hook.require_eligible_here = lambda home: fleet_node[0]
+
+        def toolchain_missing(env=None, home=None):
+            homes.append(home)
+            return why
+
+        mini._hook.toolchain_missing = toolchain_missing
+        self.assertEqual(mini.toolchain_missing(), why)
+        self.assertEqual(homes, [self.home], "the runner user's own ~/.cargo/bin")
+        fleet_node[0] = False
+        self.assertIsNone(mini.toolchain_missing(), "a mini with no fleet build runner needs no Rust")
+        fleet_node[0] = True
+        mini._hook.toolchain_missing = lambda env=None, home=None: 1 / 0
+        self.assertIsNone(mini.toolchain_missing(), "a hook that cannot answer is no finding")
+        del mini._hook.toolchain_missing
+        self.assertIsNone(mini.toolchain_missing(), "an older hook without the check is no finding")
+
     def test_a_runner_without_a_pool_xcode_has_no_toolchain_to_check(self) -> None:
         mini, _ = self.mini("exec /usr/bin/python3 hook job-started --allowed-owner manaflow-ai")
         mini._hook.xcode_refusal = lambda xcode_app, env: "toolchain: x"
@@ -407,6 +433,17 @@ class Detection(Base):
         f = report["findings"][0]
         self.assertEqual((f["severity"], f["auto_fix"]), ("error", "impossible"))
         self.assertIn("3809eed51fdd", f["evidence"])
+
+    def test_a_missing_rust_toolchain_is_a_named_error(self) -> None:
+        # 2026-10-26: ~/.cargo/bin/rustup was deleted on the runner minis and health said nothing
+        self.mini.toolchain_gone = ("node not eligible (Rust toolchain missing: /Users/cmux/.cargo/bin/rustup, "
+                                    "/Users/cmux/.cargo/bin/rustc (a link to rustup, which is gone))")
+        report = self.run_once()
+        self.assertEqual(self.ids(report), ["toolchain_missing"])
+        f = report["findings"][0]
+        self.assertEqual((f["severity"], f["auto_fix"]), ("error", "impossible"))
+        self.assertIn("/Users/cmux/.cargo/bin/rustup", f["evidence"])
+        self.assertIn("rustup", f["note"])
 
     def test_a_toolchain_outside_the_pool_xcode_is_an_error_this_user_cannot_heal(self) -> None:
         # cmux21, 2026-10-21: Command Line Tools 27 made xcrun resolve their SDK and Swift 6.4 past Xcode_26.6

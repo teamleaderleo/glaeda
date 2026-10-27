@@ -80,6 +80,11 @@ Each run checks, as the runner user and without sudo:
                                      (--require-eligible --fleet-class), names a reason, so job-started refuses every
                                      job here (a missing staged generation, a receipt that does not validate, a node
                                      that is not eligible). Restaging or re-enrolling is an operator's: reported only.
+  toolchain_missing                  rustup, rustc or cargo cannot run on a fleet build node (the runner hook's
+                                     toolchain_missing: neither the job PATH nor ~/.cargo/bin has it, or a link
+                                     there dangles; 2026-10-26, ~/.cargo/bin/rustup deleted fleet-wide). job-started
+                                     refuses every job, the gate holds the listeners off at once and ci-step fits
+                                     advertises nothing. Names each missing path. Reported only.
   toolchain_mismatch                 xcrun, in the env the runner gives its jobs (no SDKROOT or TOOLCHAINS,
                                      DEVELOPER_DIR on the job-started hook's --toolchain-xcode), resolves an SDK
                                      outside that Xcode, a swiftc of another Swift version than its toolchain's, an
@@ -547,6 +552,19 @@ class Mini:
             return None
         try:
             return refusal(xcode, clean(os.environ, xcode))
+        except Exception:  # noqa: BLE001  (a hook that cannot answer is no finding)
+            return None
+
+    def toolchain_missing(self) -> str | None:
+        """Why the runner hook's toolchain_missing says this fleet node cannot run rustup, rustc or cargo (each
+        missing path), or None when they run, no runner here requires eligibility, or the hook cannot answer."""
+        hook = self.hook()
+        missing = getattr(hook, "toolchain_missing", None) if hook is not None else None
+        here = getattr(hook, "require_eligible_here", None) if hook is not None else None
+        if missing is None or here is None:
+            return None
+        try:
+            return missing(home=self.home) if here(self.home) else None
         except Exception:  # noqa: BLE001  (a hook that cannot answer is no finding)
             return None
 
@@ -1175,6 +1193,16 @@ def check_node_eligibility(mini: Mini) -> list[dict[str, Any]]:
     return [finding("node_ineligible", "error", why, "impossible",
                     "job-started refuses every job here; restage the class receipt's generation or re-enroll "
                     "(docs/CMUX_FLEET_ENROLLMENT.md)")]
+
+
+def check_toolchain_missing(mini: Mini) -> list[dict[str, Any]]:
+    why = mini.toolchain_missing()
+    if not why:
+        return []
+    return [finding("toolchain_missing", "error", why, "impossible",
+                    "job-started refuses every job, the listener gate holds every runner off at once and ci-step fits "
+                    "advertises no class until rustup, rustc and cargo run again: reinstall rustup "
+                    "(glaeda-mini-setup, or rustup-init -y --no-modify-path), then the next poll admits the host")]
 
 
 def check_toolchain(mini: Mini) -> list[dict[str, Any]]:
@@ -1928,7 +1956,8 @@ def run(mini: Mini, apply: bool, now: float | None = None, state_path: Path = ST
         # keeps that probe nor reroutes on it until the tunnel is back (tailscale_no_route's restart may fix it)
         tunnel_down = any(f["code"] in TUNNEL_DOWN for f in tailnet)
         found = (check_console(mini) + check_power(mini) + tailnet + check_runners(mini)
-                 + check_node_eligibility(mini) + check_toolchain(mini) + check_leaked_test_apps(mini)
+                 + check_node_eligibility(mini) + check_toolchain_missing(mini) + check_toolchain(mini)
+                 + check_leaked_test_apps(mini)
                  + check_disk_accounting(mini)
                  + check_daemon_heal(mini) + check_ota(mini, now)
                  + check_claude_route(mini, now, apply and not tunnel_down, tunnel_down))

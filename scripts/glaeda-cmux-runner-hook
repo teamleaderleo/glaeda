@@ -39,7 +39,9 @@ re-runs it elsewhere) when:
     drifted from its class receipt, or gh is not on the job PATH. Eligibility is the node status that glaeda-mini-enroll reads, from the
     staged generation's cmux_fleet.py (state eligible, routingCandidateEligible true), and the enrollment
     must reference ~/.config/glaeda/cmux-fleet/class-acceptance/<class>.json. The toolchain check runs
-    rustc, cargo, zig, xcodebuild and xcrun and compares them with that receipt's strings, exactly.
+    rustc, cargo, zig, xcodebuild and xcrun and compares them with that receipt's strings, exactly. First,
+    rustup, rustc or cargo that cannot run at all (missing, or a link that dangles) refuses by path
+    (toolchain_missing); the gate then holds every such runner at once, and ci-step fits advertises nothing.
   * with --toolchain-xcode APP (the pool Xcode): the runner's environment sets TOOLCHAINS or an SDKROOT outside APP
     (leaked_toolchain_env; the xcrun shim's own SDKROOT does not count), or, with --require-eligible, xcrun in the
     job's clean env resolves an SDK outside APP, a swiftc of another Swift than APP's toolchain, or an SDK of a newer
@@ -1246,6 +1248,44 @@ def receipt_source(enrollment: dict[str, Any], acceptance: Any, receipt: dict[st
                for doc, field, key in SOURCE_BINDING)
 
 
+# A node that cannot run its Rust toolchain at all. 2026-10-26 21:26Z-00:48Z: ~/.cargo/bin/rustup was deleted on the
+# runner minis, so rustc and cargo (links to it) dangled, and job-started refused with "cannot name a toolchain",
+# which reads like a version drift. That is a definite answer, not a slow probe: the listener gate holds at once,
+# with no GATE_ELIGIBLE_EVERY_S wait and no GATE_ELIGIBLE_RECHECK_S look (Gate.ineligible); ci-step fits
+# advertises no class and admit refuses (step_refusal), so the controller stops leasing steps here; and
+# glaeda-mini-health reports toolchain_missing with the paths. A few stats, so the gate reads it every poll.
+# GLAEDA_RUNNER_TOOLCHAIN_GATE=0 turns all of it off (job-started still probes rustc as before).
+RUST_TOOLS = ("rustup", "rustc", "cargo")
+TOOLCHAIN_MISSING = "Rust toolchain missing"
+TOOLCHAIN_GATE = os.environ.get("GLAEDA_RUNNER_TOOLCHAIN_GATE", "1") != "0"
+
+
+def toolchain_missing(env: dict[str, str] | None = None, home: Path | None = None) -> str | None:
+    """Why this node cannot run rustup, rustc or cargo (the refusal names each missing path), or None. A tool counts
+    when the job PATH finds it or rustup's own bin dir ($CARGO_HOME/bin, else ~/.cargo/bin) holds it executable,
+    so a launchd PATH without ~/.cargo/bin (the build worker's, the health agent's) reads a healthy node as healthy.
+    A dangling link (rustc -> rustup with rustup gone) is missing."""
+    if not TOOLCHAIN_GATE:
+        return None
+    env = os.environ if env is None else env
+    bin_dir = Path(env.get("CARGO_HOME") or (home or Path.home()) / ".cargo") / "bin"
+    gone = []
+    for tool in RUST_TOOLS:
+        candidate = bin_dir / tool
+        if shutil.which(tool, path=env.get("PATH") or "") or os.access(candidate, os.X_OK):
+            continue
+        try:
+            gone.append(f"{candidate} (a link to {os.readlink(candidate)}, which is gone)")
+        except OSError:
+            gone.append(os.fspath(candidate))
+    return f"node not eligible ({TOOLCHAIN_MISSING}: {', '.join(gone)})" if gone else None
+
+
+def require_eligible_here(home: Path) -> bool:
+    """Whether any glaeda runner on this mini runs its jobs with --require-eligible (a fleet build node)."""
+    return any(eligibility_scope(d) is not None for d in sorted(home.glob("actions-runner-glaeda*")))
+
+
 def receipt_toolchain_name(want: dict[str, Any], env: dict[str, str], home: Path, deadline: float) -> str | None:
     """'1.98.1-<host triple>' for the receipt's rustc, the triple taken from rustup itself."""
     match = re.fullmatch(r"rustc (\d+\.\d+\.\d+)(?: .*)?", str(want.get("rustcVersion") or ""))
@@ -1262,6 +1302,9 @@ def toolchain_refusal(fleet_class: str | None, want: dict[str, Any], xcode_app: 
     deadline = time.monotonic() + ELIGIBILITY_BUDGET_S
     env = dict(os.environ)  # the runner's PATH, which is the job's (workload) PATH
     note = ""
+    missing = toolchain_missing(env, home)
+    if missing:
+        return missing, note
     if _probe(["rustc", "--version"], env, home, deadline) != str(want.get("rustcVersion")):
         toolchain = receipt_toolchain_name(want, env, home, deadline)
         if toolchain is None:
@@ -3307,6 +3350,15 @@ def step_runner_name(key: str) -> str:
     return "ci-step-" + hashlib.sha256(key.encode()).hexdigest()[:24]
 
 
+def step_refusal(home: Path | None = None) -> str | None:
+    """Why this mini takes no ci-step of any class whatever its capacity: a fleet build node (a --require-eligible
+    runner here) whose Rust toolchain is missing (toolchain_missing). fits then advertises nothing, so the controller
+    leases no step here and the worker's heartbeat shows why (`refusal`), and admit refuses. Steps the controller
+    leased to a mini that could not run cargo failed in seconds and were leased to it again."""
+    home = home or Path.home()
+    return toolchain_missing(home=home) if require_eligible_here(home) else None
+
+
 def step_fits(capacity_dir: Path, total: int, compile_slots: int, roots: int, host_lock: str, reservation: str,
               state_dir: Path, now: float) -> list[str] | Unknown:
     """The STEP_CLASSES this mini could admit right now, or UNKNOWN when an admission held admission.lock
@@ -3372,7 +3424,7 @@ def step_admit(klass: str, key: str, watch_pid: int, host_lock: str, reservation
         return refused("admit needs --capacity-units: this mini has no capacity ledger")
     if watch_pid <= 1 or not pid_alive(watch_pid):
         return refused(f"the watched pid {watch_pid} is not running")
-    why = reservation_refusal(reservation, time.time())
+    why = reservation_refusal(reservation, time.time()) or step_refusal()
     if why:
         return refused(why)
     taken: dict[str, Any] = {}
@@ -4108,6 +4160,7 @@ class Gate:
         self.console_at = -GATE_CONSOLE_EVERY_S
         self.eligible_why: str | None = os.environ.pop(GATE_INELIGIBLE_ENV, None) or None  # the held answer
         self.eligible_new: str | None = None  # a first refusal, held only once a recheck agrees
+        self.missing_why: str | None = None  # the last toolchain_missing answer, read every poll
         self.eligible_at = -GATE_ELIGIBLE_EVERY_S
         self.eligible_look: threading.Thread | None = None
         self.stale_env: str | None = None  # why an adopted listener's env is not listener_env's (listen())
@@ -4381,9 +4434,16 @@ class Gate:
             return f"listener env: {self.stale_env}; restarting it on the pool Xcode's env"
         scope = eligibility_scope(self.runner_dir)
         if scope is None:
-            self.eligible_why = None
+            self.eligible_why = self.missing_why = None
             return None
-        running = self.eligible_look is not None and self.eligible_look.is_alive()
+        missing = toolchain_missing()  # every poll: a few stats, and a definite answer that holds at once
+        if missing != self.missing_why:
+            gate_log(f"{missing}; held off at once so another runner takes the job (glaeda-mini-health: "
+                     "toolchain_missing)" if missing else "the Rust toolchain is back")
+            self.missing_why = missing
+        if missing:
+            return f"ineligible: {missing}"
+        running =self.eligible_look is not None and self.eligible_look.is_alive()
         if not running and time.monotonic() - self.eligible_at >= GATE_ELIGIBLE_EVERY_S:
             self.eligible_at = time.monotonic()
 
@@ -4393,8 +4453,9 @@ class Gate:
                 except Exception as error:  # noqa: BLE001 - a broken look must never stop the gate
                     why = None
                     gate_log(f"the eligibility look failed ({type(error).__name__}); not holding for it")
-                if why and not self.eligible_why and not self.eligible_new:
-                    self.eligible_new = why  # look again soon; hold only if that look refuses too
+                if why and TOOLCHAIN_MISSING not in why and not self.eligible_why and not self.eligible_new:
+                    self.eligible_new = why  # look again soon; hold only if that look refuses too (a missing
+                    # toolchain is no slow probe: it holds now)
                     self.eligible_at = time.monotonic() - GATE_ELIGIBLE_EVERY_S + GATE_ELIGIBLE_RECHECK_S
                     return
                 self.eligible_new = None
@@ -6342,11 +6403,16 @@ def main(argv: list[str] | None = None) -> int:
                           "released": release_host_lock(args.state_dir)}, sort_keys=True), flush=True)
         return 0
     if args.phase == "fits":
-        fits = step_fits(args.capacity_dir, args.capacity_units, args.compile_slots, args.canonical_roots,
-                         args.host_lock, args.reservation, args.state_dir, time.time())
+        why = step_refusal()
+        fits = [] if why else step_fits(args.capacity_dir, args.capacity_units, args.compile_slots,
+                                        args.canonical_roots, args.host_lock, args.reservation, args.state_dir,
+                                        time.time())
         unknown = isinstance(fits, Unknown)
-        print(json.dumps({"schema": STEP_FITS, "fits": [] if unknown else fits, "unknown": unknown}, sort_keys=True),
-              flush=True)
+        answer: dict[str, Any] = {"schema": STEP_FITS, "fits": [] if unknown else fits, "unknown": unknown}
+        if why:
+            answer["refusal"] = why[:400]
+            print(f"{PREFIX}: fits: {why}", file=sys.stderr, flush=True)
+        print(json.dumps(answer, sort_keys=True), flush=True)
         return 0
     if args.phase == "listen":
         if args.runner_dir is None:
