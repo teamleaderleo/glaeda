@@ -481,6 +481,25 @@ class Fetch(unittest.TestCase):
             self.assertEqual(gm.run_group(["/usr/bin/touch", os.fspath(marker)], 30)[0], 0)
             self.assertTrue(marker.exists())
 
+    def test_an_interrupted_pass_stops_its_child(self) -> None:
+        def interrupt(signum, frame):
+            raise KeyboardInterrupt
+        old = signal.signal(signal.SIGALRM, interrupt)
+        self.addCleanup(signal.signal, signal.SIGALRM, old)
+        started = []
+        real = gm.subprocess.Popen
+
+        def popen(*args, **kwargs):
+            started.append(real(*args, **kwargs))
+            return started[-1]
+
+        signal.alarm(1)
+        with mock.patch.object(gm.subprocess, "Popen", popen), self.assertRaises(KeyboardInterrupt):
+            gm.run_group(["/bin/sleep", "30"], timeout=60)
+        self.assertIsNotNone(started[0].poll())
+        with self.assertRaises(ProcessLookupError):
+            os.killpg(started[0].pid, 0)
+
     def test_run_group_kills_a_hung_command(self) -> None:
         status, why = gm.run_group(["sh", "-c", "sleep 30 & sleep 30"], timeout=1)
         self.assertEqual(status, 124)

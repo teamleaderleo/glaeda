@@ -157,6 +157,10 @@ def run_group(command: Sequence[str], timeout: float) -> tuple[int, str]:
         with_suppressed(lambda: os.killpg(process.pid, signal.SIGKILL))
         process.communicate()
         return 124, f"timed out after {timeout:.0f} s"
+    except BaseException:  # Ctrl-C or a signal on an on-demand pass: its child stops with it
+        with_suppressed(lambda: os.killpg(process.pid, signal.SIGKILL))
+        process.wait()
+        raise
     finally:
         with_suppressed(lambda: note_groups(own_group()))
 
