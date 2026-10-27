@@ -3279,18 +3279,20 @@ def admission_rank(tier: str, since: float, pid: int, now: float) -> tuple[int, 
 
 
 def fair_turn(capacity_dir: Path, needs: set[str], since: float, tier: str = "",
-              takes_units: bool = False) -> str | None:
+              takes_units: bool = False, new_job: bool = False) -> str | None:
     """Why an admission needing these kinds (tokens and "units") must wait behind a waiter ahead of it, or None.
     Ahead is older, except across tiers (FEED_FIRST, admission_rank). A waiting nightly job also stops every other
-    admission that takes a unit (takes_units), one the reserve its own gate holds would cover too."""
+    admission that takes a unit (takes_units), one the reserve its own gate holds would cover too, and every new job
+    of another tier (new_job: job-started), the fast tier on its own fast tokens too: no new PR job starts on a mini
+    where a nightly job waits. A ci-step lease inside a running job is not a new job, so it never waits on one."""
     now = time.time()
     mine = admission_rank(tier, since, os.getpid(), now)
     for waiter in admission_waiters(capacity_dir, os.getpid()):
         if admission_rank(waiter["tier"], waiter["since"], waiter["pid"], now) >= mine:
             continue
         shared = needs & set(waiter["wants"])
-        if waiter["tier"] == TIER_NIGHTLY and takes_units:  # a later nightly job too: arrival order among them
-            shared.add("units")
+        if waiter["tier"] == TIER_NIGHTLY and (takes_units or (new_job and tier != TIER_NIGHTLY)):
+            shared.add("units")  # a later nightly job too: arrival order among them
         if shared:
             who = waiter["who"] or "pid " + str(waiter["pid"])
             if (waiter["since"], waiter["pid"]) > (since, os.getpid()) or waiter["tier"] == TIER_NIGHTLY != tier:
@@ -3364,7 +3366,8 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
                   owned_state_dir: str = "", taken_out: dict[str, Any] | None = None,
                   warm_target: tuple[Any, ...] = ("", None, 0), klass: str | None = None,
                   one_holder: bool = False, since: float | None = None, gui_token: str = "gui",
-                  gui_runner: bool = False, fresh_runner: bool = False, tier: str = "") -> tuple[bool, str]:
+                  gui_runner: bool = False, fresh_runner: bool = False, tier: str = "",
+                  new_job: bool = False) -> tuple[bool, str]:
     """Weighted admission for one of several runners on this mini, without ever waiting on a job.
     When held, taken_out (if given) receives the units and tokens taken, for the job log; on a capacity refusal it
     receives "wants", the kinds a waiter marker names (CAPACITY_WAIT): the token kind or "units" it lacks, else
@@ -3424,7 +3427,7 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
         in_reserve = (own_reserve is not None and 0 < units <= reserve_units(f"{own_reserve}{GUI_RESERVE}")
                       and not probe(capacity_dir / f"{own_reserve}{GUI_RESERVE}"))
         needs = {*tokens, *(("units",) if units and not in_reserve else ())}
-        behind = fair_turn(capacity_dir, needs, time.time() if since is None else since, tier, units > 0)
+        behind = fair_turn(capacity_dir, needs, time.time() if since is None else since, tier, units > 0, new_job)
         if behind:
             # a waiter behind another names every kind it needs, units too: a newcomer that fits must not take the
             # units it waits for in the poll between the waiter ahead being admitted and this one's next try
@@ -4078,6 +4081,8 @@ def mini_full(capacity_dir: Path | None, total: int, scope: RunnerScope | None =
         if scope is not None and scope.fast:
             for waiter in admission_waiters(capacity_dir):
                 shared = set(FAST_TOKENS) & set(waiter["wants"])
+                if waiter["tier"] == TIER_NIGHTLY:  # no new job starts while a nightly job waits (FEED_FIRST)
+                    shared.add("units")
                 if shared:
                     return f"{waiter['who'] or 'a job'} waits here for {', '.join(sorted(shared))}"
             for name in FAST_TOKENS:
@@ -7290,7 +7295,7 @@ def main(argv: list[str] | None = None) -> int:
                                                warm_target=job_warm_target(event), since=since,
                                                gui_token=args.gui_token, klass=admit_class,
                                                gui_runner=args.gui_runner,
-                                               fresh_runner=args.dev_compile_runner, tier=tier)
+                                               fresh_runner=args.dev_compile_runner, tier=tier, new_job=True)
                     if held or not note.startswith("capacity:"):
                         break
                     waited = time.monotonic() - start

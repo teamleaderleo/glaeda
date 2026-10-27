@@ -589,6 +589,21 @@ class HookTest(unittest.TestCase):
         finally:
             self.finish("")
 
+    def test_a_waiting_nightly_job_holds_every_new_job_but_no_running_jobs_step(self) -> None:
+        """No new PR job starts on a mini where a nightly job waits: the fast tier on its own tokens (no units)
+        too. A ci-step lease inside a running job (new_job False) is not held, so it cannot deadlock the nightly
+        job waiting for that job's units."""
+        capacity = self.dir / "capacity"
+        waiters = [{"pid": os.getpid() + 1, "since": time.time(), "wants": ["units"],
+                    "who": "n2 build-nightly-app (run 9)", "tier": hook.TIER_NIGHTLY}]
+        with mock.patch.object(hook, "admission_waiters", return_value=waiters):
+            fast = set(hook.FAST_TOKENS)
+            self.assertIn("is a nightly job and goes first", hook.fair_turn(capacity, fast, time.time(), "", False, True))
+            self.assertIsNone(hook.fair_turn(capacity, fast, time.time(), "", False, False), "a ci-step lease")
+            self.assertIn("goes first", hook.fair_turn(capacity, {"units"}, time.time(), hook.TIER_DEV, True, True))
+            self.assertIsNone(hook.fair_turn(capacity, fast, time.time() + 1, hook.TIER_NIGHTLY, False, True),
+                              "a later nightly job that takes no unit does not wait on another nightly job")
+
     def test_the_nightly_slot_admits_only_nightly_jobs(self) -> None:
         self.assertIsNone(hook.nightly_slot_refusal(hook.TIER_NIGHTLY))
         for tier in (hook.TIER_DEV, ""):
@@ -6855,7 +6870,7 @@ class GateTest(unittest.TestCase):
              "tier": hook.TIER_NIGHTLY}) + "\n")
         for other in (hook.RunnerScope(10, 2, 2), hook.RunnerScope(10, 2, 2, root=True),
                       hook.RunnerScope(10, 2, 2, gui=True), hook.RunnerScope(10, 2, 2, fresh=True),
-                      hook.RunnerScope(10, 2, 2, session=True)):
+                      hook.RunnerScope(10, 2, 2, session=True), hook.RunnerScope(10, 2, 2, fast=True)):
             with self.subTest(other=other):
                 self.assertEqual(hook.mini_full(free, 10, other), "n2 build-nightly-app (run 9) waits here for units",
                                  "no new job starts on a mini where a nightly job waits")
