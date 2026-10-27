@@ -423,7 +423,9 @@ class Mini:
             doc = load_json(path)
             name = path.name[len("registration-"):-len(".json")]
             # an uninstalled runner (its directory removed) leaves a stale record that nothing will clear
-            if doc.get("cause") == "registration_deleted" and (self.home / name / ".runner").is_file():
+            recorded = doc.get("runner_dir")
+            runner_dir = Path(recorded) if isinstance(recorded, str) and recorded.startswith("/") else self.home / name
+            if doc.get("cause") == "registration_deleted" and (runner_dir / ".runner").is_file():
                 out.append({**doc, "dir": name})
         return out
 

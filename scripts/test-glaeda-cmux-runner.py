@@ -6376,6 +6376,23 @@ class GateTest(unittest.TestCase):
                 self.assertEqual(gate.step(), 1, "an orphaned Worker still runs: no backoff beside its job")
         self.assertFalse(hook.registration_file(self.state, self.runner).exists())
 
+    def test_an_adopted_listener_never_reads_a_diag_log_from_before_the_reload(self) -> None:
+        # a reload's exec adopts run.sh: an exit after it must not match an older start's deletion trace
+        self.deleted()
+        old = time.time() - 600
+        os.utime(self.runner / "_diag/Runner_20261024-010000-utc.log", (old, old))
+        seen = []
+        def step(gate):
+            seen.append(gate)
+            return 0
+        with mock.patch.object(hook.Gate, "step", step), mock.patch.object(hook.signal, "signal"), \
+                mock.patch.object(hook.signal, "pthread_sigmask"), mock.patch.dict(os.environ, {}):
+            hook.listen(self.runner, os.fspath(self.lock), "", self.state, False, adopt=os.getpid())
+        [gate] = seen
+        self.assertGreater(gate.started_wall, old)
+        self.assertIsNone(hook.registration_deleted(self.runner, gate.started_wall))
+        self.assertIsNotNone(hook.registration_deleted(self.runner, 0.0), "only the since bound keeps it out")
+
     def test_any_other_exit_still_goes_to_launchd(self) -> None:
         gate, _ = self.gate([None] * 4)
         with mock.patch.object(hook.subprocess, "Popen", return_value=gate.child):

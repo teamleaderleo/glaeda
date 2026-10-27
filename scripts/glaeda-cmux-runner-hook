@@ -4574,6 +4574,8 @@ def listen(runner_dir: Path, host_lock: str, reservation: str, state_dir: Path, 
     xcode = runner_xcode(runner_dir)
     if adopt:
         gate.child = Adopted(adopt)  # type: ignore[assignment]
+        # registration_deleted reads only a _diag log written since: never one from before this gate's exec
+        gate.started_wall = time.time()
         with contextlib.suppress(ValueError):  # the adopted listener keeps its first poll (GATE_FIRST_POLL_S)
             gate.listening_since = float(os.environ.get(GATE_LISTENING_SINCE_ENV, ""))
         gate.stale_env = adopted_env_stale(marker, os.environ, xcode)
