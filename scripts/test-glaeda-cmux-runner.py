@@ -5872,6 +5872,14 @@ class GateTest(unittest.TestCase):
             "someone/else", hook.DEFAULT_HOME_REPO, "workflow_dispatch", "refs/heads/main", {}, "verify",
             "cmux-next-dev-daily.yml"))
 
+    def test_the_dev_bound_holds_over_a_longer_explicit_wait(self) -> None:
+        bound = hook.DEV_COMPILE_CAPACITY_WAIT_S
+        self.assertEqual(hook.bounded_wait(None, bound), bound)
+        self.assertEqual(hook.bounded_wait(bound * 10, bound), bound)
+        self.assertEqual(hook.bounded_wait(5.0, bound), 5.0)
+        self.assertEqual(hook.bounded_wait(bound * 10, None), bound * 10)
+        self.assertIsNone(hook.bounded_wait(None, None))
+
     def test_every_job_on_the_freshness_slot_waits_a_bounded_time(self) -> None:
         """A push's release-compile on the slot is not a DEV compile (dev_compile_capacity_wait is None), but the
         slot still bounds its wait, so a mini that fills while it waits refuses it back to placement. An explicit

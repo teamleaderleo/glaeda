@@ -1065,11 +1065,13 @@ def watch_one(api: GitHub, entry: dict[str, Any], *, now: float, seen: dict[str,
             return {"state": "failed", "note": f"not rescued: {why}"}
         key = f"cancel:{repo.lower()}#{run_id}.{attempt}"
         mine = seen.get(key)
+        kept = never_cancelled(run, entry)
         if run.get("status") != "completed":
+            if kept:
+                # No cancel and no force-cancel, even after a cancel an older agent recorded: if that one lands,
+                # the finished run is re-run below, so it is never left cancelled.
+                return {"state": "released", "note": f"not rescued: {kept}"} if mine is None else None
             if mine is None:
-                kept = never_cancelled(run, entry)
-                if kept:
-                    return {"state": "released", "note": f"not rescued: {kept}"}
                 _, _, stuck, refused = pool_jobs(api, entry, now=now, seen=seen, rescue_seconds=rescue_seconds)
                 if not (stuck or refused):
                     return {"state": "released", "note": "no pool job is stuck any more"}
@@ -1089,6 +1091,10 @@ def watch_one(api: GitHub, entry: dict[str, Any], *, now: float, seen: dict[str,
             return None
         if mine is None:
             return {"state": "released", "note": "the run finished before this agent cancelled it"}
+        if kept and run.get("conclusion") == "cancelled":
+            # An older agent cancelled a protected run: restore it, whatever moved meanwhile.
+            api.ok("POST", f"/repos/{repo}/actions/runs/{run_id}/rerun")
+            return {"state": "rescued", "note": f"re-ran run {run_id}, which an older agent cancelled ({kept})"}
         if run.get("conclusion") != "cancelled":
             return {"state": "released", "note": f"the run finished on its own ({run.get('conclusion')})"}
         moved = pull_moved(api, repo, run)
