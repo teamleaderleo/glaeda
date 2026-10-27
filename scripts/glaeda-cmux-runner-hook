@@ -410,16 +410,18 @@ def reserve_units(name: str) -> int:
     return FRESH_RESERVE_UNITS if name == f"{FRESH_RESERVE_TOKEN}{GUI_RESERVE}" else GUI_RESERVE_UNITS
 
 
-def gui_reserved(capacity_dir: Path, own_token: str | None = None) -> int:
+def gui_reserved(capacity_dir: Path, own_token: str | None = None, feed: bool = False) -> int:
     """The units this mini keeps for idle reserving runners: reserve_units() for each <token>.reserve an idle gui
-    runner's (or the freshness slot's) gate holds, except own_token's (a runner's own job takes its own reserve).
+    runner's (or the freshness slot's) gate holds, except own_token's (a runner's own job takes its own reserve) and,
+    for a feed build (feed), the freshness slot's: that reserve is kept for feed builds, and one is waiting here.
     Never raises: an unreadable ledger reserves nothing."""
     try:
         paths = sorted(capacity_dir.glob(f"*{GUI_RESERVE}"))
     except OSError:
         return 0
-    own = f"{own_token}{GUI_RESERVE}" if own_token is not None else None
-    return sum(reserve_units(path.name) for path in paths if path.name != own and not probe(path))
+    own = {f"{own_token}{GUI_RESERVE}" if own_token is not None else None,
+           f"{FRESH_RESERVE_TOKEN}{GUI_RESERVE}" if feed else None}
+    return sum(reserve_units(path.name) for path in paths if path.name not in own and not probe(path))
 
 
 def reserve_for(reserved: int, units: int, total: int) -> int:
@@ -1135,7 +1137,8 @@ def dev_compile_refusal(event_name: str | None, ref: str | None, repository: str
 # push's DEV and Release compiles, a DEV daily's). Strict arrival order had them queue behind PR work: on 2026-10-27
 # from 04:27Z a nightly-next build-nightly-app sat 13+ min in this hook on a side runner behind a fast-tier, a
 # generated-files and a swift test job that had arrived first, while each feed must stay within 30 min of its branch.
-# Nothing running is preempted; a feed build only takes the next free units. A PR job that has waited FEED_JUMP_S is
+# Nothing running is preempted; a feed build only takes the next free units, and it does not keep the idle freshness
+# slot's reserve (gui_reserved), which exists for feed builds. A PR job that has waited FEED_JUMP_S is
 # no longer jumped: from then on it keeps its arrival order against feed builds too, so a stream of feed builds
 # cannot starve it.
 FEED_NIGHTLY_REFS = ("refs/heads/nightly-next", "refs/heads/main")
@@ -3126,7 +3129,7 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
     """Weighted admission for one of several runners on this mini, without ever waiting on a job.
     When held, taken_out (if given) receives the units and tokens taken, for the job log; on a capacity refusal it
     receives "wants", the kinds a waiter marker names (CAPACITY_WAIT): the token kind or "units" it lacks, else
-    every token kind its class takes. since is when this job began to wait (a
+    every kind it needs (behind another waiter: its class's tokens, and units). since is when this job began to wait (a
     waiter's own tries): it goes ahead of any admission that began later and behind any that began earlier and
     needs a kind it needs (fair_turn); None is a newcomer. feed (a feed build, feed_job) goes ahead of PR jobs that
     began to wait less than FEED_JUMP_S ago (FEED_FIRST). klass, when given,
@@ -3181,9 +3184,13 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
         own_reserve = gui_token if gui_runner else FRESH_RESERVE_TOKEN if fresh_runner else None
         in_reserve = (own_reserve is not None and 0 < units <= reserve_units(f"{own_reserve}{GUI_RESERVE}")
                       and not probe(capacity_dir / f"{own_reserve}{GUI_RESERVE}"))
-        behind = fair_turn(capacity_dir, {*tokens, *(("units",) if units and not in_reserve else ())},
-                           time.time() if since is None else since, feed)
+        needs = {*tokens, *(("units",) if units and not in_reserve else ())}
+        behind = fair_turn(capacity_dir, needs, time.time() if since is None else since, feed)
         if behind:
+            # a waiter behind another names every kind it needs, units too: a newcomer that fits must not take the
+            # units it waits for in the poll between the waiter ahead being admitted and this one's next try
+            if taken_out is not None:
+                taken_out["wants"] = sorted(needs)
             return False, behind
         yielded = yield_idle_warm(capacity_dir)  # under admission.lock, so a catch-up cannot start meanwhile
         if uses_gui:  # this job will drive the console session: the idle fuzzer's app must be gone first
@@ -3259,8 +3266,9 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
                 if taken_out is not None:
                     taken_out["wants"] = [token]
                 return False, f"capacity: {held} ({job or 'unknown job'} is {klass})"
-        # every job but a reserving runner's own leaves the idle reserves free (GUI_RESERVE, FRESH_RESERVE_TOKEN)
-        kept = reserve_for(gui_reserved(capacity_dir, own_reserve), units, total)
+        # every job but a reserving runner's own leaves the idle reserves free (GUI_RESERVE, FRESH_RESERVE_TOKEN); a
+        # feed build takes the freshness slot's too, which is kept for feed builds (FEED_FIRST)
+        kept = reserve_for(gui_reserved(capacity_dir, own_reserve, feed), units, total)
         got = spare = 0
         unit_fds: list[int] = []
         for slot in range(total):

@@ -1315,6 +1315,62 @@ class HookTest(unittest.TestCase):
             (self.dir / "capacity" / f"{hook.ADMIT_WANT}{os.getppid()}").unlink(missing_ok=True)
             self.finish("d0")
 
+    def test_a_waiting_nightly_build_goes_ahead_of_pr_waiters_and_takes_the_fresh_reserve(self) -> None:
+        """2026-10-27 04:27Z: a nightly-next build-nightly-app (isolated, 4 units) waited 13+ min on a side runner
+        behind PR jobs that reached the mini first, and the idle freshness slot kept 4 more units from it. A feed
+        build (FEED_FIRST) goes ahead of a younger-than-FEED_JUMP_S PR waiter and does not keep the fresh reserve;
+        the same job from a pull request does both."""
+        self.fleet()
+        self.take_units(7)
+        reserve = self.hold_gui_reserve(hook.FRESH_RESERVE_TOKEN)
+        self.addCleanup(os.close, reserve)
+        marker = self.dir / "capacity" / f"{hook.ADMIT_WANT}{os.getppid()}"
+        marker.write_text(json.dumps({"since": time.time() - 60, "wants": ["units"], "who": "s9 fast-tier (run 1)"})
+                          + "\n")
+
+        def nightly(ref: str, runner: str) -> subprocess.CompletedProcess:
+            push = event(self.dir, f"nightly-{runner}", {"repository": CMUX, "ref": ref})
+            return self.run_hook(
+                "job-started", "push", push, "--allowed-repo", "manaflow-ai/cmux", "--no-disk", "--state-dir",
+                os.fspath(self.dir / "state"), "--watch-pid", str(os.getpid()), "--gui-wait", "0",
+                "--capacity-units", "14", "--capacity-dir", os.fspath(self.dir / "capacity"), "--instance", "4",
+                repo="manaflow-ai/cmux",
+                env={"GITHUB_JOB": "build-nightly-app", "RUNNER_NAME": runner, "GITHUB_REF": ref,
+                     "GITHUB_WORKFLOW_REF": f"manaflow-ai/cmux/.github/workflows/nightly.yml@{ref}"})
+
+        try:
+            pr = nightly("refs/pull/1/merge", "p0")
+            self.assertEqual(pr.returncode, 1, pr.stdout)
+            self.assertIn("s9 fast-tier (run 1) has waited longer here for units", pr.stdout)
+            marker.unlink()
+            pr = nightly("refs/pull/1/merge", "p0")
+            self.assertEqual(pr.returncode, 1, pr.stdout)
+            self.assertIn("7 of 14 units free, build-nightly-app (isolated) needs 4 and 4 are kept", pr.stdout)
+            marker.write_text(json.dumps({"since": time.time() - 60, "wants": ["units"],
+                                          "who": "s9 fast-tier (run 1)"}) + "\n")
+            feed = nightly("refs/heads/nightly-next", "n0")
+            self.assertEqual(feed.returncode, 0, feed.stdout + feed.stderr)
+            self.assertIn("a feed build: it goes ahead of PR jobs waiting here", feed.stdout)
+            self.assertIn("holding 4/14 units for build-nightly-app (isolated", feed.stdout)
+        finally:
+            marker.unlink(missing_ok=True)
+            self.finish("n0")
+
+    def test_a_waiter_behind_another_names_the_units_it_needs(self) -> None:
+        """A waiter refused by fair_turn names every kind it needs, units too, so a newcomer that fits cannot take
+        its units in the poll after the waiter ahead of it is admitted (live 2026-10-27: such waiters named [])."""
+        capacity = self.dir / "capacity"
+        capacity.mkdir(parents=True, exist_ok=True)
+        (capacity / f"{hook.ADMIT_WANT}{os.getppid()}").write_text(
+            json.dumps({"since": time.time() - 60, "wants": ["units"], "who": "s9 fast-tier (run 1)"}))
+        taken: dict = {}
+        held, note = hook.take_capacity(os.fspath(self.dir / "no-fleet" / "host.lock"), capacity, 14,
+                                        "generated-files", os.getpid(), self.dir / "state", taken_out=taken,
+                                        since=time.time() - 5, klass="isolated")
+        self.assertFalse(held)
+        self.assertIn("has waited longer here for units", note)
+        self.assertEqual(taken["wants"], ["units"])
+
     def test_a_gui_runner_job_costlier_than_the_reserve_still_waits_its_turn(self) -> None:
         """The reserve is one unit: a gui-label job that costs more (cmux-next's swift test, isolated at 4) takes the
         reserved unit too, but waits behind an older job for the rest (fair_turn), so no lane jumps another for
