@@ -5879,6 +5879,8 @@ class GateTest(unittest.TestCase):
         self.assertEqual(hook.bounded_wait(5.0, bound), 5.0)
         self.assertEqual(hook.bounded_wait(bound * 10, None), bound * 10)
         self.assertIsNone(hook.bounded_wait(None, None))
+        # The worst case (the last try's admission.lock wait) stays far inside the DEV daily's 15-minute verify timeout.
+        self.assertLessEqual(hook.DEV_BOUND_WORST_S, 2 * 60)
 
     def test_every_job_on_the_freshness_slot_waits_a_bounded_time(self) -> None:
         """A push's release-compile on the slot is not a DEV compile (dev_compile_capacity_wait is None), but the

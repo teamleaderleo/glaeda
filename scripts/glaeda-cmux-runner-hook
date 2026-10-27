@@ -465,7 +465,9 @@ DEV_COMPILE_CAPACITY_WAIT_S = 60.0
 # timeout-minutes (15 and 20) count the wait inside "Set up runner". A full mini held tip-dmg-build there 19 min
 # (cmux run 40466210697, 2026-10-27) until GitHub timed it out and the DEV feed went stale. So every job of that
 # workflow waits DEV_COMPILE_CAPACITY_WAIT_S at most and is then refused; cmux's owned-pool rescue re-runs a refused
-# job, and attempt 2 takes Blacksmith.
+# job, and attempt 2 takes Blacksmith. The bound, like the DEV compile's, is when the last try starts: one try can
+# wait ADMISSION_WAIT_S more for admission.lock, so the refusal comes within DEV_BOUND_WORST_S, far inside the 15
+# and 20 minute timeouts it protects.
 DEV_DAILY_WORKFLOW = "cmux-next-dev-daily.yml"
 # CAPACITY_WAIT: an ordinary cmux job that finds its units or tokens taken waits for them, with no time limit,
 # instead of failing. The DEV cmux-next scheme compile is the bounded exception above: GitHub handed the job to
@@ -993,6 +995,8 @@ def export_root(name: str) -> str:
             pass
     return f"{CANONICAL_ROOT_ENV}={path} via {'+'.join(wrote) or 'nothing (no GITHUB_ENV or RUNNER_TEMP)'}"
 ADMISSION_WAIT_S = 30.0  # admissions are serialized briefly so two jobs never split the free units
+# A DEV-bounded job's worst wait before its refusal (DEV_DAILY_WORKFLOW's comment).
+DEV_BOUND_WORST_S = DEV_COMPILE_CAPACITY_WAIT_S + ADMISSION_WAIT_S + ADMIT_POLL_S
 # The listener gate reads its runner's --capacity-units from the job-started hook glaeda-cmux-runner wrote.
 RUNNER_HOOK_SCRIPT = "glaeda-hooks/job-started.sh"
 LISTEN_SCRIPT = "glaeda-hooks/listen.sh"
