@@ -4308,7 +4308,11 @@ def files_strict(d: Path) -> list[Path] | None:
     if not os.path.lexists(d):
         return []
     errors: list[OSError] = []
-    found = [Path(dp) / f for dp, _, fs in os.walk(d, onerror=errors.append) for f in fs]
+    found: list[Path] = []
+    for dp, dirs, fs in os.walk(d, onerror=errors.append):
+        if any(os.path.islink(os.path.join(dp, x)) for x in dirs):  # os.walk would not enter it: unread
+            return None
+        found += [Path(dp) / f for f in fs]
     return None if errors or d.is_symlink() else found
 
 
@@ -4769,9 +4773,18 @@ def mirror_repos(path: Path, linked_inside: tuple[Path, ...] = ()) -> tuple[str,
     for key, g in gitdirs.items():
         if (linked := _linked_trees_strict(g)) is None:
             return f"{key}: unreadable linked worktree records", {}, []
-        if any(t.exists() and not (os.path.realpath(t) + "/").startswith(inside) for t in linked):
+        present: list[Path] = []
+        for t in linked:
+            try:  # os.stat, not exists(): a tree we cannot read (EACCES, EIO) is not an absent one
+                os.stat(t)
+                present.append(t)
+            except FileNotFoundError:
+                continue
+            except OSError:
+                return f"{key}: unreadable linked worktree {t}", {}, []
+        if any(not (os.path.realpath(t) + "/").startswith(inside) for t in present):
             return f"{key}: a worktree outside this item uses it", {}, []
-        found += [t for t in linked if os.path.lexists(t) and os.path.realpath(t) not in seen]
+        found += [t for t in present if os.path.realpath(t) not in seen]
     if found:  # a linked worktree inside the item, even in ignored output: checked clean and unlocked too
         return mirror_repos(path, (*linked_inside, *found))
     return "", gitdirs, sorted(trees)

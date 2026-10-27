@@ -6069,6 +6069,28 @@ class LinuxLayoutTest(unittest.TestCase):
         self.git(clone, "worktree", "unlock", str(wt), env=env)
         self.assertEqual(gd.archive_mirror(unit)[0], "")
 
+    def test_a_symlinked_reflog_directory_keeps_the_mirror(self) -> None:
+        unit, clone, _ = self.mirror_unit()
+        heads = clone / ".git/logs/refs/heads"
+        shutil.move(os.fspath(heads), os.fspath(self.home / "heads-elsewhere"))
+        heads.symlink_to(self.home / "heads-elsewhere")
+        self.assertIsNone(gd.files_strict(clone / ".git/logs"))
+        self.assertIsNone(gd.local_tips(clone / ".git"))
+        self.assertTrue(gd.archive_mirror(unit)[0])
+
+    def test_an_unreadable_outside_linked_worktree_keeps_the_mirror(self) -> None:
+        unit, clone, env = self.mirror_unit()
+        parent = self.home / "locked-away"
+        parent.mkdir()
+        self.git(clone, "worktree", "add", "-q", "--detach", str(parent / "wt"), env=env)
+        os.chmod(parent, 0)
+        try:
+            why, bundles, _ = gd.archive_mirror(unit)
+        finally:
+            os.chmod(parent, 0o755)
+        self.assertIn("unreadable linked worktree", why)
+        self.assertEqual(bundles, [])
+
     def test_only_manifest_listed_bundles_at_their_hash_are_pruned_after_the_evidence_gate(self) -> None:
         archive = self.home / "archive/glaeda-disk"
         archive.mkdir(parents=True)
