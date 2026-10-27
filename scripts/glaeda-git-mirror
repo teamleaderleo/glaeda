@@ -25,6 +25,10 @@ fetch from GitHub never happens during a build.
   operator's fallback when the bucket has no bundle.
 - uploadpack.allowAnySHA1InWant is on, so `git fetch MIRROR <sha>` works for any commit it holds.
 - glaeda-disk keeps the mirror by role (family `cmux-git-mirror`, report only).
+- Nothing removes an object from it (gc.auto 0, gc.pruneExpire never, and the fold is
+  `repack --geometric`, which keeps every object of the packs it combines), so runner checkouts
+  may borrow its objects through objects/info/alternates. A reseed replaces a broken mirror; a
+  borrower that then misses an object is reset by the runner hook.
 
 It runs only where a GitHub Actions runner is installed (~/actions-runner*/.runner) and is a no-op
 anywhere else. One pass at a time (flock on GIT_DIR/.lock). It needs no credential: the repository and
@@ -56,7 +60,7 @@ REPO_URL = os.environ.get("GLAEDA_GIT_MIRROR_REPO", "https://github.com/manaflow
 # cmux's NEXT cache bucket (public reads; cmux git-mirror-bundle.yml writes it).
 BUCKET_URL = os.environ.get("GLAEDA_GIT_MIRROR_BUCKET_URL", "https://ci-cache-next.cmux.com")
 BUNDLE_PREFIX = "git-mirror-cmux-"
-BUNDLE_KEY = re.compile(r"git-mirror-cmux-[0-9]{10}-[0-9a-f]{12}")
+BUNDLE_KEY = re.compile(r"git-mirror-cmux-[0-9]{10}\.[0-9a-f]{12}")
 BUNDLE_FILE = "cmux.bundle"
 BRANCHES = ("main", "feat-cmux-next", "nightly-next")
 TOOL_PATH = "/opt/homebrew/bin:/usr/local/bin"
@@ -71,8 +75,19 @@ DOWNLOAD_TIMEOUT = 1800
 LOCK_WAIT = 900
 # A seed writes the bundle and its unpacked copy (2.4 GB each, 2026-10-27), with room to spare.
 SEED_MIN_FREE = 12 * 1024**3
+# Each pass's fetch writes a small pack. gc --auto would fold them with a full repack inside the bounded
+# fetch (2.2 GiB), so it is off and the pass folds them geometrically once PACK_LIMIT is passed.
+PACK_LIMIT = 24
+REPACK_TIMEOUT = 1200
 CONFIG = {
     "core.bare": "true",
+    "gc.auto": "0",
+    "maintenance.auto": "false",
+    # Runner checkouts borrow this object store (objects/info/alternates): nothing here ever deletes an
+    # object. A forced ref update leaves the old commits; the geometric fold keeps every object it packs.
+    "gc.pruneExpire": "never",
+    "gc.reflogExpire": "never",
+    "gc.reflogExpireUnreachable": "never",
     "gc.autoDetach": "false",
     "fetch.recurseSubmodules": "false",
     "uploadpack.allowAnySHA1InWant": "true",
@@ -255,6 +270,20 @@ def seed(mirror: Path, from_github: bool, fetch_url: Callable[[str, Path, float]
         shutil.rmtree(work, ignore_errors=True)
 
 
+def fold_packs(mirror: Path) -> dict | None:
+    """Fold small packs geometrically once there are more than PACK_LIMIT; readers keep working throughout."""
+    packs = list((mirror / "objects" / "pack").glob("*.pack"))
+    if len(packs) <= PACK_LIMIT:
+        return None
+    started = time.monotonic()
+    status, err = run_group([GIT, "-C", os.fspath(mirror), "repack", "-d", "-q", "--geometric=2"], REPACK_TIMEOUT)
+    if status != 0:
+        for leftover in (mirror / "objects" / "pack").glob("tmp_*"):
+            with_suppressed(leftover.unlink)
+    return {"packs": len(packs), "status": status, "seconds": round(time.monotonic() - started, 1),
+            **({"error": err.strip()[-200:]} if status else {})}
+
+
 def heads(mirror: Path) -> dict[str, str]:
     out = git(mirror, "for-each-ref", "--format=%(refname:short) %(objectname)", "refs/heads", timeout=30)
     return dict(line.split(" ", 1) for line in out.splitlines() if " " in line)
@@ -294,6 +323,9 @@ def run(apply: bool, *, wait: bool = False, from_github: bool = False, home: Pat
         configure(MIRROR)
         result = fetch(MIRROR, REPO_URL)
         record["fetch"] = result
+        folded = fold_packs(MIRROR)
+        if folded:
+            record["repack"] = folded
         record["heads"] = heads(MIRROR)
         record["state"] = "applied" if result["ok"] else "fetch-failed"
         incoming = RECORD.with_name(f".{RECORD.name}.{os.getpid()}")

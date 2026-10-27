@@ -51,7 +51,7 @@ class Mirror(unittest.TestCase):
         sh("git", "branch", "pr-only", cwd=self.upstream)
         # The bucket: a bundle of upstream, archived as r2-cache.sh saves a directory.
         self.bucket = root / "bucket"
-        self.key = "git-mirror-cmux-2026102709-" + sh("git", "rev-parse", "HEAD", cwd=self.upstream)[:12]
+        self.key = "git-mirror-cmux-2026102709." + sh("git", "rev-parse", "HEAD", cwd=self.upstream)[:12]
         staged = root / "staged"
         staged.mkdir()
         sh("git", "bundle", "create", os.fspath(staged / gm.BUNDLE_FILE), "--branches", cwd=self.upstream)
@@ -151,6 +151,28 @@ class Mirror(unittest.TestCase):
         result = gm.run(True, home=self.home)
         self.assertEqual(result["state"], "error")
         self.assertFalse(self.mirror.exists())
+
+    def test_many_packs_are_folded_and_gc_never_runs_inside_a_fetch(self) -> None:
+        gm.run(True, home=self.home)
+        self.assertEqual(sh("git", "-C", os.fspath(self.mirror), "config", "gc.auto"), "0")
+        self.assertEqual(sh("git", "-C", os.fspath(self.mirror), "config", "gc.pruneExpire"), "never")
+        # A commit only a since-forced nightly-next held survives the folds (borrowers may hold it).
+        sh("git", "checkout", "-q", "-b", "scratch", cwd=self.upstream)
+        orphan = self.commit("forced-away")
+        sh("git", "branch", "-f", "nightly-next", orphan, cwd=self.upstream)
+        gm.run(True, home=self.home)
+        sh("git", "branch", "-f", "nightly-next", "main", cwd=self.upstream)
+        sh("git", "checkout", "-q", "main", cwd=self.upstream)
+        old = gm.PACK_LIMIT
+        gm.PACK_LIMIT = 2
+        self.addCleanup(setattr, gm, "PACK_LIMIT", old)
+        for n in range(4):
+            self.commit(f"c{n}")
+            gm.run(True, home=self.home)
+        packs = list((self.mirror / "objects/pack").glob("*.pack"))
+        self.assertLessEqual(len(packs), 3)
+        sh("git", "-C", os.fspath(self.mirror), "cat-file", "-e", f"{orphan}^{{commit}}")
+        self.assertEqual(gm.healthy(self.mirror), "")
 
     def test_plan_changes_nothing(self) -> None:
         result = gm.run(False, home=self.home)
