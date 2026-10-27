@@ -67,6 +67,7 @@ os.environ["GLAEDA_RUNNER_IOREG"] = "/nonexistent/ioreg"
 # RustToolchainMissing tests turn it on against a fake bin dir. The hooks run_hook starts get a fake HOME and PATH.
 os.environ["GLAEDA_RUNNER_TOOLCHAIN_GATE"] = "0"
 hook = load("glaeda_cmux_runner_hook", HOOK)
+REAL_FIND_DISK = hook.find_disk
 # The gate evicts under its disk floor with whatever glaeda-disk it finds: in this process never this machine's own
 # (~/.local/bin); a test that wants one passes it explicitly or patches disk_pressure_run.
 hook.find_disk = lambda explicit: explicit if explicit and os.path.isfile(explicit) else None
@@ -4980,7 +4981,8 @@ class DiskPassCoalesceTest(unittest.TestCase):
         try:
             args = argparse.Namespace(disk="bin/glaeda-disk", runner_dir=None, dedicated_admit=Path("admit.sh"),
                                       job_log=Path("/abs/jobs.jsonl"), capacity_dir=Path("cap"), state_dir=None,
-                                      host_lock="host.lock", reservation="/r.json")
+                                      host_lock="host.lock", reservation="/r.json",
+                                      toolchain_xcode="Applications/Xcode.app")
             hook.leave_job_workspace(args)
             self.assertEqual(os.getcwd(), "/")
             real = os.path.realpath(workspace)
@@ -4991,12 +4993,33 @@ class DiskPassCoalesceTest(unittest.TestCase):
             self.assertIsInstance(args.disk, str)
             self.assertEqual(args.job_log, Path("/abs/jobs.jsonl"))
             self.assertEqual(os.path.realpath(args.host_lock), os.path.join(real, "host.lock"))
+            self.assertEqual(os.path.realpath(args.reservation), "/r.json")
+            self.assertEqual(os.path.realpath(args.toolchain_xcode), os.path.join(real, "Applications/Xcode.app"))
+            self.assertEqual(os.path.realpath(args.capacity_dir), os.path.join(real, "cap"))
+            self.assertIsNone(args.runner_dir)
             # the dedicated runner's admission still runs in the job's directory
             script = make_executable(workspace / "admit.sh", f"#!{sys.executable}\nimport os, sys\n"
                                      f"sys.exit(0 if os.path.realpath(os.getcwd()) == {real!r} else 7)\n")
             self.assertTrue(hook.dedicated_admission(script)[0])
         finally:
             hook.JOB_CWD = None
+            os.chdir(before)
+
+    def test_find_disk_is_absolute_for_a_relative_path_entry(self) -> None:
+        """A relative PATH entry (or --disk) must still name glaeda-disk after the hook leaves the workspace."""
+        bindir = self.dir / "rel-bin"
+        bindir.mkdir()
+        make_executable(bindir / "glaeda-disk", "")
+        before = os.getcwd()
+        os.chdir(self.dir)
+        try:
+            with mock.patch.dict(os.environ, {"PATH": "rel-bin"}), \
+                    mock.patch.object(hook.shutil, "which", return_value="rel-bin/glaeda-disk"):
+                found = REAL_FIND_DISK(None)
+            self.assertEqual(os.path.realpath(found), os.path.realpath(bindir / "glaeda-disk"))
+            self.assertTrue(os.path.isabs(found))
+            self.assertTrue(os.path.isabs(REAL_FIND_DISK("rel-bin/glaeda-disk")))
+        finally:
             os.chdir(before)
 
     def test_triggers_while_a_pass_runs_are_coalesced_not_dropped(self) -> None:

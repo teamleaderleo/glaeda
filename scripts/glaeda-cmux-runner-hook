@@ -6900,10 +6900,10 @@ def sweep_idle_leftovers(runner_dir: Path) -> list[str]:
 
 def find_disk(explicit: str | None) -> str | None:
     if explicit:
-        return explicit if os.path.isfile(explicit) else None
+        return os.path.abspath(explicit) if os.path.isfile(explicit) else None
     found = shutil.which("glaeda-disk")
     if found:
-        return found
+        return os.path.abspath(found)  # a relative PATH entry must survive a later chdir (leave_job_workspace)
     fallback = Path.home() / ".local/bin/glaeda-disk"
     return os.fspath(fallback) if fallback.is_file() else None
 
@@ -7263,7 +7263,7 @@ def leave_job_workspace(args: argparse.Namespace) -> None:
     except OSError:
         JOB_CWD = None
     for name in ("disk", "runner_dir", "dedicated_admit", "job_log", "capacity_dir", "state_dir", "host_lock",
-                 "reservation"):
+                 "reservation", "toolchain_xcode"):
         value = getattr(args, name, None)
         if value is not None:
             absolute = os.path.abspath(os.fspath(value))
