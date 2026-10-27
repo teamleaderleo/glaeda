@@ -1815,6 +1815,14 @@ class Daemon:
         at = e.get("waitedAt")
         return isinstance(at, (int, float)) and self.now - at < WAIT_INTEREST
 
+    @staticmethod
+    def last_read(e: dict) -> float:
+        """When GitHub was last read for this entry: a controller-fed run's REST clock, else its last fetch.
+        Never read (no cache) sorts first, so a new watch is filled at once."""
+        c = e.get("cache") or {}
+        at = c.get("restAt") if c.get("source") == "controller" else c.get("fetchedAt")
+        return float(at) if isinstance(at, (int, float)) else float("-inf")
+
     def due(self, kind: str, entries: list[dict]) -> list[dict]:
         mine = [e for e in entries if e["key"].startswith(kind + ":")]
         path = self.route(kind)
@@ -1998,6 +2006,10 @@ class Daemon:
             self.batched(kind, batch, fetch)
             self.post_between()
         over_rest = (prs if over["pr"] == "rest" else []) + (runs if over["run"] == "rest" else [])
+        # Waited keys first, then the longest unread: a tick that runs out of time defers the tail, and with PRs
+        # always ahead of runs a busy daemon read PRs tick after tick while a blocked `wait run` sat on a run
+        # nobody reached (2026-10-27: 581 s and counting, with STALE_RUN_REREAD due at 180 s).
+        over_rest.sort(key=lambda e: (not self.waited(e), self.last_read(e)))
         for i, e in enumerate(over_rest):
             # A read is admitted only when its worst case fits in the share, so the share holds at a
             # request, not at a batch; the rest go first next tick, over whichever bucket is richer.

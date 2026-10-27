@@ -2807,6 +2807,32 @@ class TickBudgetTest(Base):
         for k in keys:
             self.assertIsNone(gg.read_cache(k)["error"], k)
 
+    def test_a_busy_daemon_reads_the_waited_and_the_longest_unread_first(self) -> None:
+        """2026-10-27: with GraphQL stopped, every PR and run went over REST, PRs always ahead of runs; ticks ran out of
+        time on the PRs and a run a `wait run` was blocked on went unread for 581 s and counting."""
+        self.daemon.budget = {"rest": {"limit": 5000, "remaining": 4500, "reset": NOW + 1800},
+                              "graphql": {"limit": 5000, "remaining": 0, "reset": NOW + 1800}}  # GraphQL stopped
+        for n in range(1, 6):
+            gg.register(f"pr:o/r#{n}")
+        gg.register("run:o/r/1")
+        gg.register("run:o/r/2", waited=True)
+        order: list[str] = []
+
+        def read(e: dict) -> None:
+            order.append(e["key"])
+            self.daemon.store(e["key"], e["cache"], data={"status": "in_progress"}, dataAt=self.daemon.now)
+            if len(order) % 2 == 0:
+                raise gg.OutOfTime()  # two reads a tick, then the budget is spent
+
+        with mock.patch.object(self.daemon, "fetch_pr_rest", side_effect=read), \
+                mock.patch.object(self.daemon, "fetch_run", side_effect=read):
+            self.daemon.tick(NOW)
+            self.assertEqual(order[0], "run:o/r/2", "the waited run first, ahead of every PR")
+            for t in range(1, 4):
+                self.daemon.tick(NOW + t * gg.TICK)
+        self.assertEqual(sorted(set(order)), sorted([f"pr:o/r#{n}" for n in range(1, 6)] + ["run:o/r/1", "run:o/r/2"]),
+                         "every key is reached: a deferred key never starves behind the rest")
+
     def test_pr_batches_left_over_go_first_next_tick(self) -> None:
         keys = []
         for n in range(1, 31):
