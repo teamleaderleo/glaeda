@@ -1958,28 +1958,47 @@ def sim_device_items(devices: object, cmds: str, opened: frozenset[str], now: fl
     return items
 
 
-def erase_idle_sim_devices(receipt: Path, halt=None, budget_s: float = SIM_DEVICE_BUDGET_S, simctl=None) -> int:
-    """Erase each reclaimable device after judging it again on a fresh simctl reading and fresh process evidence,
-    largest first, for at most budget_s. Returns the data bytes released, as simctl reports them."""
+def erase_idle_sim_devices(receipt: Path, halt=None, budget_s: float = SIM_DEVICE_BUDGET_S, simctl=None,
+                           below_target=None) -> int:
+    """Erase each reclaimable device, largest first, while budget_s lasts (no new erase starts after it; one erase
+    may then run up to its own 300 s limit), and, when below_target is given, only while it says free space is still
+    short. Before each erase the device is judged again: process evidence first (lsof, the slow part), then the
+    reservation, a fresh `ps`, the capture leases and a fresh simctl reading, so the last readings are a fraction of
+    a second old when simctl starts. What can still slip between them and the erase is a job that picks this device
+    but has not booted it: simctl refuses to erase a Booted or Booting device, and an unbooted device holds only
+    state that went untouched for SIM_DEVICE_IDLE_HOURS, which this policy gives up. Returns the bytes simctl
+    reports released (0 for a device it cannot read back)."""
     if not DARWIN or not shutil.which("xcrun") or SIM_DEVICE_IDLE_HOURS == float("inf"):
         return 0
     simctl = (lambda: simctl_json("list", "devices")) if simctl is None else simctl
     started = time.monotonic()
     try:
-        first = sim_device_items(simctl(), *_sim_evidence())
+        cmds, opened = _sim_evidence()
     except NoEvidence as e:
         print(f"refusing to erase simulator devices: {e}", file=sys.stderr)
         return 0
+    first = sim_device_items(simctl(), cmds, opened)
     released = 0
     for i in sorted((x for x in first if x.verdict == "reclaimable"), key=lambda x: -x.bytes):
         if time.monotonic() - started > budget_s or (halt is not None and halt()):
             break  # a halt is a busy host (a CI job): the next idle sweep or pressure pass goes on
+        if below_target is not None and not below_target():
+            break
         try:
-            fresh = {x.path: x for x in sim_device_items(simctl(), *_sim_evidence())}
+            cmds, opened = _sim_evidence()
         except NoEvidence as e:
             print(f"refusing to erase simulator devices: {e}", file=sys.stderr)
             break
-        now = fresh.get(i.path)
+        if (why := host_reservation()):
+            print(f"refusing to erase simulator devices: {why}", file=sys.stderr)
+            break
+        try:
+            cmds += "\n" + subprocess.run(["ps", "-axww", "-o", "command="], capture_output=True, text=True,
+                                          timeout=30, check=True).stdout
+        except (OSError, subprocess.SubprocessError):
+            print("refusing to erase simulator devices: ps failed", file=sys.stderr)
+            break
+        now = {x.path: x for x in sim_device_items(simctl(), cmds, opened)}.get(i.path)
         size = 0
         if now is None or now.verdict != "reclaimable":
             outcome, reasons = "changed:in-use", (now.reasons if now else ["no longer listed"])
@@ -1991,8 +2010,11 @@ def erase_idle_sim_devices(receipt: Path, halt=None, budget_s: float = SIM_DEVIC
             except (OSError, subprocess.SubprocessError) as e:
                 outcome = f"incomplete:{e.__class__.__name__}"
             if outcome == "reclaimed":
-                after = {x.path: x for x in sim_device_items(simctl(), "", frozenset(), leases="")}
-                size = max(0, now.bytes - (after[i.path].bytes if i.path in after else 0))
+                after = {x.path: x for x in sim_device_items(simctl(), "", frozenset(), leases="")}.get(i.path)
+                if after is None:
+                    reasons = reasons + ["its size after the erase could not be read; counted 0"]
+                else:
+                    size = max(0, now.bytes - after.bytes)
                 released += size
         rec = {"at": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "host": platform.node(), "family": SIM_DEVICE_FAMILY,
                "path": i.path, "outcome": outcome, "bytes": size, "idle_hours": i.idle_hours,
@@ -2010,8 +2032,9 @@ CAPTURE_LEASE_ROOT = HOME / ".cache/cmux-capture-host"  # cmuxterm-hq build-flee
 
 
 def capture_lease_text(root: Path | None = None) -> str | None:
-    """The text of every small file in each capture lease directory, where a lease records what it holds; "" when
-    there is no lease root. None when the root or a lease cannot be listed: then nothing is erased."""
+    """The text of every file in each capture lease directory, where a lease records what it holds; "" when there
+    is no lease root. None when the root, a lease or any file in one cannot be read, or a file is too big to be a
+    lease record: then nothing is erased."""
     root = CAPTURE_LEASE_ROOT if root is None else root
     out = []
     try:
@@ -2021,12 +2044,14 @@ def capture_lease_text(root: Path | None = None) -> str | None:
             with os.scandir(lease) as it:
                 files = [Path(e.path) for e in it if e.is_file(follow_symlinks=False)]
             for f in files:
-                with contextlib.suppress(OSError, UnicodeDecodeError):
-                    if f.stat().st_size <= 65536:
-                        out.append(f.read_text())
+                if f.stat().st_size > 65536:
+                    return None
+                out.append(f.read_text())
     except FileNotFoundError:
-        return "\n".join(out)
-    except OSError:
+        if not root.exists():
+            return ""
+        return None  # a lease or file went away while it was read: read again next pass
+    except (OSError, UnicodeDecodeError):
         return None
     return "\n".join(out)
 
@@ -10173,11 +10198,18 @@ def _main_impl(argv: list[str] | None = None) -> int:
         # job and its floor eviction run this one (glaeda-fleet-cas-prune keeps its own working-set rule)
         if a.pressure and ROLE == "fleet-mini" and not RUNNER_CACHE_PROFILE and not a.cmux_next_drain and not a.family:
             logical_released += fleet_cas_node_cap()
-        # idle simulator devices, on every pressure pass and idle sweep: each device is judged on its own, so a busy
-        # mini (never idle) still gets them back
-        if ((sweep or a.pressure) and DARWIN and not RUNNER_CACHE_PROFILE and not a.cmux_next_drain and not reserved
-                and (not a.family or SIM_DEVICE_FAMILY in a.family)):
-            logical_released += erase_idle_sim_devices(a.receipt, halt)
+        # idle simulator devices, on every idle sweep and on a pressure pass while free space is still short of the
+        # target: each device is judged on its own, so a busy mini (never idle) still gets them back
+        if ((sweep or a.pressure) and DARWIN and ROLE == "fleet-mini" and not RUNNER_CACHE_PROFILE
+                and not a.cmux_next_drain and not reserved and (not a.family or SIM_DEVICE_FAMILY in a.family)):
+            def short_of_target() -> bool:
+                for fs in shown:
+                    with contextlib.suppress(OSError):
+                        if free_bytes(Path(fs.mount))[0] < fs.target:
+                            return True
+                return False
+            logical_released += erase_idle_sim_devices(a.receipt, halt,
+                                                       below_target=None if sweep else short_of_target)
         remaining = []
         for fs in shown:
             try:

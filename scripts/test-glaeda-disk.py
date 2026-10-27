@@ -62,8 +62,9 @@ _gc_home_clones = gd.gc_home_clones
 gd.gc_home_clones = lambda receipt, home=None, halt=None: 0 if home is None else _gc_home_clones(receipt, home, halt)
 # Nor erase the simulator devices of the host running the suite: only a test that passes its own simctl reading.
 _erase_idle_sim_devices = gd.erase_idle_sim_devices
-gd.erase_idle_sim_devices = (lambda receipt, halt=None, budget_s=gd.SIM_DEVICE_BUDGET_S, simctl=None:
-                             0 if simctl is None else _erase_idle_sim_devices(receipt, halt, budget_s, simctl))
+gd.erase_idle_sim_devices = (lambda receipt, halt=None, budget_s=gd.SIM_DEVICE_BUDGET_S, simctl=None, below_target=None:
+                             0 if simctl is None else _erase_idle_sim_devices(receipt, halt, budget_s, simctl,
+                                                                              below_target))
 
 
 def make(path: Path, mib: int = 1, age_hours: float = 48) -> Path:
@@ -6430,6 +6431,12 @@ class SimDeviceTest(unittest.TestCase):
         (root / "lease-1").mkdir(parents=True)
         (root / "lease-1/alias").write_text("sim 11592F6E-1A41-4215-BF7D-8BE182D2922E")
         self.assertIn("11592F6E", gd.capture_lease_text(root))
+        (root / "lease-1/huge").write_bytes(b"x" * 70000)  # not a lease record: doubt
+        self.assertIsNone(gd.capture_lease_text(root))
+        (root / "lease-1/huge").unlink()
+        (root / "lease-1/state").write_bytes(b"\xff\xfe")  # being written or not text: doubt
+        self.assertIsNone(gd.capture_lease_text(root))
+        (root / "lease-1/state").unlink()
         root.chmod(0)
         try:
             if os.access(root, os.R_OK):
@@ -6454,11 +6461,13 @@ class SimDeviceTest(unittest.TestCase):
         runs = []
 
         def run(argv, **kw):
-            runs.append(argv)
+            if argv[0] != "ps":
+                runs.append(argv)
             return subprocess.CompletedProcess(argv, 0, "", "")
         with mock.patch.object(gd, "DARWIN", True), mock.patch.object(gd.shutil, "which", return_value="/usr/bin/xcrun"), \
                 mock.patch.object(gd, "capture_lease_text", return_value=""), \
                 mock.patch.object(gd, "process_evidence", return_value=([], "")), \
+                mock.patch.object(gd, "host_reservation", return_value=""), \
                 mock.patch.object(gd.time, "time", return_value=SIM_NOW), \
                 mock.patch.object(gd.subprocess, "run", side_effect=run), \
                 contextlib.redirect_stdout(io.StringIO()):
@@ -6469,18 +6478,39 @@ class SimDeviceTest(unittest.TestCase):
         self.assertEqual([(r["path"][:8], r["outcome"]) for r in recs],
                          [("AAAAAAAA", "changed:in-use"), ("11592F6E", "reclaimed")])
 
-    def test_a_halt_or_evidence_failure_erases_nothing(self) -> None:
+    def test_a_halt_evidence_failure_reservation_or_reached_target_erases_nothing(self) -> None:
         def no_evidence():
             raise gd.NoEvidence("lsof failed")
-        for patch, halt in ((mock.patch.object(gd, "process_evidence", side_effect=no_evidence), None),
-                            (mock.patch.object(gd, "process_evidence", return_value=([], "")), lambda: "a CI job")):
-            with self.subTest(halt=bool(halt)), patch, mock.patch.object(gd, "DARWIN", True), \
+        ok = mock.patch.object(gd, "process_evidence", return_value=([], ""))
+        for name, patch, halt, reserved, short in (
+                ("evidence", mock.patch.object(gd, "process_evidence", side_effect=no_evidence), None, "", None),
+                ("halt", ok, lambda: "a CI job", "", None),
+                ("reserved mid-pass", ok, None, "reserved for someone (r1)", None),
+                ("target reached", ok, None, "", lambda: False)):
+            with self.subTest(name), patch, mock.patch.object(gd, "DARWIN", True), \
+                    mock.patch.object(gd, "host_reservation", return_value=reserved), \
                     mock.patch.object(gd.shutil, "which", return_value="/usr/bin/xcrun"), \
                     mock.patch.object(gd, "capture_lease_text", return_value=""), \
                     mock.patch.object(gd.time, "time", return_value=SIM_NOW), \
                     mock.patch.object(gd.subprocess, "run", side_effect=AssertionError("simctl ran")), \
                     contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-                self.assertEqual(gd.erase_idle_sim_devices(self.receipt, halt, simctl=lambda: SIM_REPLAY), 0)
+                self.assertEqual(gd.erase_idle_sim_devices(self.receipt, halt, simctl=lambda: SIM_REPLAY,
+                                                           below_target=short), 0)
+
+    def test_an_unreadable_size_after_the_erase_counts_zero(self) -> None:
+        readings = iter([SIM_REPLAY, SIM_REPLAY, None])
+        with mock.patch.object(gd, "DARWIN", True), mock.patch.object(gd.shutil, "which", return_value="/usr/bin/xcrun"), \
+                mock.patch.object(gd, "capture_lease_text", return_value=""), \
+                mock.patch.object(gd, "process_evidence", return_value=([], "")), \
+                mock.patch.object(gd, "host_reservation", return_value=""), \
+                mock.patch.object(gd.time, "time", return_value=SIM_NOW), \
+                mock.patch.object(gd.subprocess, "run",
+                                  side_effect=lambda argv, **kw: subprocess.CompletedProcess(argv, 0, "", "")), \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(gd.erase_idle_sim_devices(self.receipt, simctl=lambda: next(readings, None)), 0)
+        (rec,) = map(json.loads, self.receipt.read_text().splitlines())
+        self.assertEqual((rec["outcome"], rec["bytes"]), ("reclaimed", 0))
+        self.assertIn("could not be read", rec["reasons"][-1])
 
     def test_a_reserved_host_keeps_its_devices(self) -> None:
         self.assertEqual(gd.LEGACY_AGES["SIM_DEVICE_IDLE_HOURS"], float("inf"))
