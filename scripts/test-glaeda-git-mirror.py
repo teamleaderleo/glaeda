@@ -239,10 +239,13 @@ class Mirror(unittest.TestCase):
         self.commit("two")
         (self.mirror / "refs/heads/main.lock").write_text("")
         (self.mirror / "packed-refs.lock").write_text("")
-        result = gm.run(True, home=self.home)
-        self.assertTrue(result["fetch"]["ok"], result)
-        self.assertEqual(result["fetch"]["tries"], 2)
+        (self.mirror / "config.lock").write_text("")
+        (self.mirror / "shallow").write_text(sh("git", "-C", os.fspath(self.mirror), "rev-parse", "main") + "\n")
+        result = gm.run(True, home=self.home)  # a repair, then the fetch
+        self.assertEqual(result["state"], "applied", result)
+        self.assertEqual(result["fetch"]["tries"], 1)
         self.assertFalse((self.mirror / "refs/heads/main.lock").exists())
+        self.assertFalse((self.mirror / "config.lock").exists())
 
     def test_a_failed_repair_keeps_the_mirror_marked_broken(self) -> None:
         self.commit("two")

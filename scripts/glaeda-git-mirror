@@ -203,7 +203,7 @@ def drop_leftovers(mirror: Path) -> None:
     later fetch fail: temporary packs, ref locks ("cannot lock ref"), and git's own shallow.lock file
     (the guard is a directory there)."""
     for leftover in [*(mirror / "objects" / "pack").glob("tmp_*"), *(mirror / "refs").rglob("*.lock"),
-                     mirror / "packed-refs.lock", mirror / "shallow.lock"]:
+                     mirror / "packed-refs.lock", mirror / "shallow.lock", mirror / "config.lock"]:
         if leftover.is_file() and not leftover.is_symlink():
             with_suppressed(leftover.unlink)
 
@@ -443,6 +443,10 @@ def run(apply: bool, *, wait: bool = False, from_github: bool = False, home: Pat
     if fd is None:
         return {**record, "state": "busy", "reason": "another pass holds the lock"}
     try:
+        # Only a pass holding the flock writes the mirror (jobs only read it), so any lock git left is from a
+        # pass that was killed: clear them before anything else writes, or the repair itself would wedge.
+        if MIRROR.is_dir() and not MIRROR.is_symlink():
+            drop_leftovers(MIRROR)
         problem = healthy(MIRROR)
         if problem:
             record["seeded"] = {"because": problem, **seed(MIRROR, from_github)}
