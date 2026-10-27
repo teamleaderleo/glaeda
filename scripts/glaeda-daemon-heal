@@ -925,10 +925,13 @@ def fleet_ops_hold(now: float, fleet_root: Path = FLEET_ROOT, node: str | None =
     except (OSError, KeyError) as e:
         return f"no fleet user (owner of {fleet_root}): {type(e).__name__}"
     names = {(node if node is not None else platform_node()).split(".")[0].lower()}
-    with contextlib.suppress(OSError, ValueError, AttributeError):
-        host = json.loads(read_small(home / ".config/glaeda/update.json")).get("host")
-        if isinstance(host, str) and host:
-            names.add(host.lower())
+    try:  # every OTA host has it; without its host name a reservation naming only that could be missed
+        host = strict_json(read_small(home / ".config/glaeda/update.json")).get("host")
+        if not isinstance(host, str) or not host:
+            raise ValueError("no host")
+        names.add(host.lower())
+    except (OSError, ValueError, AttributeError) as e:
+        return f"glaeda update config unreadable ({type(e).__name__}); held as reserved"
     try:
         doc = strict_json(read_small(home / ".local/share/glaeda/fleet-reservations.json"))
         if not isinstance(doc, dict) or doc.get("schema") != RESERVATIONS_SCHEMA:
@@ -946,6 +949,8 @@ def fleet_ops_hold(now: float, fleet_root: Path = FLEET_ROOT, node: str | None =
             hosts = names_list(e["hosts"], "hosts")
             hosts |= {a for h in hosts for a in alias_of.get(h, ())}
             start, until = reservation_time(e["from"]), reservation_time(e["until"])
+            if start > until:
+                raise ValueError("an entry ends before it starts")
             if names & hosts and start <= now <= until and not reserved:
                 reserved = f"reserved until {e['until']}"
         if reserved:
@@ -959,6 +964,8 @@ def fleet_ops_hold(now: float, fleet_root: Path = FLEET_ROOT, node: str | None =
             if not isinstance(held, dict) or held.get("schema") != "glaeda-reservation/v1":
                 raise ValueError("schema")
             since, until = reservation_time(held["since"]), reservation_time(held["until"])
+            if since > until:
+                raise ValueError("ends before it starts")
         except (OSError, ValueError, KeyError, TypeError) as e:
             return f"host reservation unreadable ({type(e).__name__}); held as reserved"
         if since <= now < until:
@@ -983,16 +990,22 @@ def fleet_ops_eligible(ops_dir: Path) -> str:
     return ""
 
 
-def load_op(name: str, plist: Path, ctl, wait=time.sleep) -> str | None:
-    """Load plist as system/ai.manaflow.NAME afresh; None when it is loaded, else why not. A plist left that did
-    not load is removed, so the next pass sees it differ and tries again."""
+def unload_op(name: str, ctl, wait=time.sleep) -> bool:
+    """Boot out system/ai.manaflow.NAME and wait until launchd no longer lists it."""
     target = f"system/{op_label(name)}"
     ctl("bootout", target)
     for _ in range(40):  # launchd lets go of a booted-out job asynchronously
         if ctl("print", target)[0] != 0:
-            break
+            return True
         wait(0.25)
-    else:
+    return False
+
+
+def load_op(name: str, plist: Path, ctl, wait=time.sleep) -> str | None:
+    """Load plist as system/ai.manaflow.NAME afresh; None when it is loaded, else why not. A plist left that did
+    not load is removed, so the next pass sees it differ and tries again."""
+    target = f"system/{op_label(name)}"
+    if not unload_op(name, ctl, wait):
         with contextlib.suppress(FileNotFoundError):
             os.unlink(plist)
         return f"launchctl bootout {target} did not unload it"
@@ -1036,13 +1049,14 @@ def fleet_ops_pass(ops_path: Path, now: float, apply: bool, ops_dir: Path = FLEE
     managed = load_json(ledger).get("ops")
     managed = {n for n in managed if isinstance(n, str) and OP_NAME.fullmatch(n)} if isinstance(managed, list) else set()
     for name in sorted(managed - set(doc["ops"])):
-        target = f"system/{op_label(name)}"
-        ctl("bootout", target)
+        if not unload_op(name, ctl, wait):
+            out.setdefault("errors", []).append(f"{name}: launchctl bootout did not unload it; kept, tried again next pass")
+            continue
         for path in (plist_dir / f"{op_label(name)}.plist", ops_dir / name):
             if path.is_file() and not path.is_symlink():
                 os.unlink(path)
+        managed.discard(name)
         out.setdefault("removed", []).append(name)
-    managed &= set(doc["ops"])
     for name, op in sorted(doc["ops"].items()):
         target = ops_dir / name
         if target.is_symlink() or target.exists() and not target.is_file():
@@ -1099,6 +1113,14 @@ def run_pass(policy_path: Path, state_dir: Path, apply: bool, host: Host | None 
     # stages a new release with only the other two files, so its absence is reported, never a failed plan pass.
     ops_path = policy_path.with_name(FLEET_OPS_NAME)
     live = apply and root and install_dir == INSTALL_DIR
+    if live and fleet_ops is None and ops_path.exists():
+        # Root acts only on the bytes refresh() took from the verified release and recorded in installed.json,
+        # whatever put a file at this path (a hand install leaves the snapshot's as it was).
+        ident = load_json(install_dir / INSTALLED)
+        recorded = (ident.get("files") or {}).get(FLEET_OPS_NAME) if isinstance(ident.get("files"), dict) else None
+        if not recorded or recorded != sha256(read_bytes(ops_path) or b""):
+            live = False
+            fleet_ops = {"hold": lambda now: "fleet-ops.json is not the one its release installed; a pass restores it"}
     try:
         report["fleetOps"] = (fleet_ops_pass(ops_path, report_time(report), live, **(fleet_ops or {}))
                               if fleet_ops is not None or ops_path.exists() else {"error": f"no {ops_path}"})

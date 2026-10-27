@@ -655,6 +655,25 @@ class SelfUpdate(unittest.TestCase):
         self.assertEqual(self.verdict(report)["state"], "stale")
         self.assertIn("has not read its release channel", self.verdict(report)["why"])
 
+    def test_root_acts_only_on_the_fleet_ops_json_its_release_recorded(self) -> None:
+        """A fleet-ops.json that installed.json does not name (a hand install's leftovers, a file someone wrote)
+        never runs: the live pass holds and says so, and the next release pass restores the release's bytes."""
+        self.channel.publish(2)
+        self.run_pass()
+        calls = []
+        with mock.patch.object(heal, "fleet_ops_pass", side_effect=lambda *a, **k: calls.append((a, k)) or {}), \
+                mock.patch.object(heal, "INSTALL_DIR", self.dir), mock.patch.object(heal.os, "geteuid", return_value=0), \
+                mock.patch.object(heal, "schedule_reload", return_value=False), \
+                mock.patch.object(heal.os, "chown"):
+            heal.run_pass(self.dir / heal.POLICY_NAME, self.state_dir, True, self.host, install_dir=self.dir,
+                          get=self.channel.get, python=sys.executable)
+            self.assertTrue(calls[-1][0][2], "the release's own file: live")
+            (self.dir / heal.FLEET_OPS_NAME).write_bytes(OPS_BYTES.replace(b"glaeda-fleet-ops/v1", b"glaeda-fleet-ops/v1 "))
+            heal.run_pass(self.dir / heal.POLICY_NAME, self.state_dir, True, self.host, install_dir=self.dir,
+                          get=lambda u, n: (_ for _ in ()).throw(urllib.error.URLError("down")), python=sys.executable)
+            self.assertFalse(calls[-1][0][2], "a file the release did not record: never live")
+            self.assertIn("not the one its release installed", calls[-1][1]["hold"](0))
+
     def test_a_copy_from_before_fleet_ops_takes_the_file_from_its_own_release(self) -> None:
         """A mini whose snapshot is the script and policy only (installed.json names two files) gets
         fleet-ops.json from the same release, with no new tag, and a release without it takes it away again."""
@@ -783,6 +802,20 @@ class FleetOps(unittest.TestCase):
         self.assertNotIn("error", out["ops"]["console-unlock-guard"])
         self.assertIn("system/ai.manaflow.console-unlock-guard", self.loaded)
 
+    def test_a_dropped_op_that_will_not_unload_stays_in_the_ledger(self) -> None:
+        self.run_ops()
+        self.bootout_sticks = True
+        doc = copy.deepcopy(self.doc)
+        doc["ops"].pop("symbol-cache-cap")
+        self.path.write_text(json.dumps(doc))
+        out = self.run_ops()
+        self.assertNotIn("removed", out)
+        self.assertIn("did not unload", out["errors"][0])
+        self.assertTrue((self.ops_dir / "symbol-cache-cap").exists())
+        self.assertIn("symbol-cache-cap", json.loads(self.ledger.read_text())["ops"])
+        self.bootout_sticks = False
+        self.assertEqual(self.run_ops()["removed"], ["symbol-cache-cap"])
+
     def test_a_job_that_will_not_unload_is_not_bootstrapped_over(self) -> None:
         self.run_ops()
         self.bootout_sticks = True
@@ -853,8 +886,13 @@ class FleetOps(unittest.TestCase):
             path.unlink(missing_ok=True) if sys.version_info >= (3, 8) else None
         else:
             path.write_text(doc if isinstance(doc, str) else json.dumps(doc))
-        if update_host:
-            (home / ".config/glaeda/update.json").write_text(json.dumps({"host": update_host}))
+        update = home / ".config/glaeda/update.json"
+        if update_host is None:
+            update.write_text(json.dumps({"host": "build-mini-7"}))
+        elif update_host == "":
+            update.unlink(missing_ok=True)
+        else:
+            update.write_text(update_host if update_host.startswith("{") else json.dumps({"host": update_host}))
         if local is not None:
             (fleet / "reservation.json").write_text(json.dumps(local))
         user = mock.Mock(pw_dir=os.fspath(home))
@@ -883,6 +921,8 @@ class FleetOps(unittest.TestCase):
         self.assertIn("reserved", self.reservations(self.lst(reservations=[other], aliases={"build-mini-8": ["build-mini-7"]})))
         self.assertIn("reserved", self.reservations(self.lst(reservations=[other]), update_host="build-mini-8"),
                       "the update config's host name counts too")
+        self.assertIn("update config", self.reservations(self.lst(), update_host=""), "no update config: held")
+        self.assertIn("update config", self.reservations(self.lst(), update_host="{broken"))
         self.assertIn("host reservation", self.reservations(self.lst(), local={
             "schema": "glaeda-reservation/v1", "since": int(T0) - 60, "until": int(T0) + 60}))
         self.assertEqual(self.reservations(self.lst(), local={
@@ -898,10 +938,12 @@ class FleetOps(unittest.TestCase):
                     self.lst(reservations=[entry, "not an entry"]),
                     self.lst(reservations=[entry], aliases={"build-mini-8": "build-mini-7"}),
                     self.lst(reservations=[entry], aliases=[]),
-                    self.lst(expires=1e300)):
+                    self.lst(expires=1e300),
+                    self.lst(reservations=[{**entry, "from": heal.iso(T0 + 60), "until": heal.iso(T0 - 60)}])):
             with self.subTest(bad=str(bad)[:80]):
                 self.assertIn("held", self.reservations(bad))
         for local in ("not json", {"schema": "glaeda-reservation/v1", "since": "x", "until": 1},
+                      {"schema": "glaeda-reservation/v1", "since": int(T0) + 60, "until": int(T0) - 60},
                       {"schema": "other/v1"}, ["list"]):
             with self.subTest(local=local):
                 fleet = self.root / "fleet"

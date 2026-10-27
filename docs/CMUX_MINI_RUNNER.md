@@ -1486,7 +1486,9 @@ It acts only where all of the following hold. Otherwise it reports and changes n
   `/Users/Shared/cmux-build-fleet/reservation.json`. The list's writer refreshes it. Whatever these files say, the
   bytes installed are the pinned ones.
 
-Only the release chain installs `fleet-ops.json`. A hand `--install` takes the script and the policy and drops
+Only the release chain installs `fleet-ops.json`, and root acts only on a copy whose hash `installed.json`
+records for its release. The host's `~/.config/glaeda/update.json` must name it; without that the pass holds too,
+as it does for a reservation whose interval is reversed. A hand `--install` takes the script and the policy and drops
 the snapshot's `fleet-ops.json`; the next pass restores it from the release. An op that this pass installed (listed
 in the root-owned `state/fleet-ops-managed.json`) and that the file no longer lists is unloaded and removed.
 Nothing it did not install is touched. A plist that does not load is removed, so the next pass tries again.
