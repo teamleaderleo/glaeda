@@ -2122,15 +2122,38 @@ def runner_checkout_git_veto(checkout: Path) -> str:
         return subprocess.run(["git", "-C", os.fspath(checkout), *args], capture_output=True, text=True,
                               timeout=timeout, env=env, check=True).stdout
     try:
-        tips = git("for-each-ref", "--format=%(objectname)", "refs/heads", "refs/tags", "refs/stash").split()
         heads = [ln.split(" ", 1)[1] for ln in git("worktree", "list", "--porcelain").splitlines()
                  if ln.startswith("HEAD ")]
-        local = git("rev-list", "--max-count=1", "HEAD", *heads, *tips, "--not", "--remotes", timeout=120)
+        local = unpushed_commit(git, heads)
     except (OSError, subprocess.SubprocessError, IndexError):
         return "git could not say whether a commit is only here"
-    if local.strip():
+    if local:
         return "a commit here is on no remote-tracking ref"
     return submodule_git_veto(dotgit, env)
+
+
+def unpushed_commit(git, heads: list[str]) -> bool:
+    """Whether HEAD, `heads`, a local branch, the stash or a tag names a commit on no remote-tracking ref. A tag
+    counts only when origin does not have it at the same object: a full-history fetch brings every tag of origin,
+    including tags of commits on no branch (cmux's cmux-rbh-src-*, 270 of them on 2026-10-27), and those are not
+    only here. Asking origin is one `git ls-remote --tags` (0.3 s), made only when a tag names such a commit; with
+    the checkout's expired job token header cleared. Raises when git cannot say, which keeps the checkout."""
+    tips = git("for-each-ref", "--format=%(objectname)", "refs/heads", "refs/stash").split()
+    if git("rev-list", "--max-count=1", "HEAD", *heads, *tips, "--not", "--remotes", timeout=120).strip():
+        return True
+    tags = dict(ln.split(" ", 1)[::-1] for ln in
+                git("for-each-ref", "--format=%(objectname) %(refname)", "refs/tags").splitlines() if " " in ln)
+    if not tags or not git("rev-list", "--max-count=1", *tags.values(), "--not", "--remotes", timeout=120).strip():
+        return False
+    origin = {}
+    for ln in git("-c", "http.https://github.com/.extraheader=", "-c", "credential.helper=", "ls-remote",
+                  "--tags", "origin", timeout=60).splitlines():
+        sha, _, ref = ln.partition("\t")
+        if ref and not ref.endswith("^{}"):
+            origin[ref] = sha
+    only_here = [sha for ref, sha in tags.items() if origin.get(ref) != sha]
+    return bool(only_here) and bool(git("rev-list", "--max-count=1", *only_here, "--not", "--remotes",
+                                        timeout=120).strip())
 
 
 def submodule_git_veto(dotgit: Path, env: dict[str, str]) -> str:
@@ -2160,15 +2183,14 @@ def submodule_git_veto(dotgit: Path, env: dict[str, str]) -> str:
             if embedded.is_dir() and not embedded.is_symlink() and contained_directory(embedded, tree):
                 gitdirs.append((embedded.parent.name, embedded))
     for name, gitdir in gitdirs:
-        def git(*args: str) -> str:
+        def git(*args: str, timeout: int = 120, gitdir: Path = gitdir) -> str:
             return subprocess.run(["git", "--git-dir", os.fspath(gitdir), *args], capture_output=True, text=True,
-                                  timeout=120, env=env, check=True).stdout
+                                  timeout=timeout, env=env, check=True).stdout
         try:
-            tips = git("for-each-ref", "--format=%(objectname)", "refs/heads", "refs/tags", "refs/stash").split()
-            local = git("rev-list", "--max-count=1", "HEAD", *tips, "--not", "--remotes")
-        except (OSError, subprocess.SubprocessError):
+            local = unpushed_commit(git, [])
+        except (OSError, subprocess.SubprocessError, ValueError):
             return f"git could not say whether a commit in submodule {name} is only here"
-        if local.strip():
+        if local:
             return f"a commit in submodule {name} is on no remote-tracking ref"
     return ""
 

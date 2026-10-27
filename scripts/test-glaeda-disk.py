@@ -4842,6 +4842,40 @@ class GlaedaDiskTest(unittest.TestCase):
         git(embedded, "commit", "-q", "--allow-empty", "-m", "embedded, on no remote")
         self.assertEqual(gd.runner_checkout_git_veto(co), "a commit in submodule lib is on no remote-tracking ref")
 
+    def test_a_tag_origin_has_at_the_same_object_is_not_only_here(self) -> None:
+        """A full-history fetch brings origin's tags of commits on no branch (cmux-rbh-src-*): they keep nothing.
+        A tag origin lacks, or has at another object, still keeps the checkout; so does an origin git cannot ask."""
+        env = {"PATH": "/usr/bin:/bin:/opt/homebrew/bin", "HOME": os.fspath(self.root), "GIT_AUTHOR_NAME": "t",
+               "GIT_AUTHOR_EMAIL": "t@x", "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@x"}
+
+        def git(where: Path, *args: str) -> str:
+            return subprocess.run(["git", "-C", os.fspath(where), *args], env=env, check=True, capture_output=True,
+                                  text=True).stdout.strip()
+        co = self.root / "tags/_work/cmux/cmux"
+        self._git_checkout(co)
+        origin = self.root / "tags-origin.git"
+        subprocess.run(["git", "init", "-q", "--bare", os.fspath(origin)], env=env, check=True)
+        git(co, "remote", "add", "origin", os.fspath(origin))
+        git(co, "push", "-q", "origin", "HEAD:refs/heads/main")
+        git(co, "commit", "-q", "--allow-empty", "-m", "staging, on no branch")
+        git(co, "tag", "-a", "-m", "src", "cmux-rbh-src-1")
+        git(co, "push", "-q", "origin", "refs/tags/cmux-rbh-src-1")
+        git(co, "checkout", "-q", "--detach", "refs/remotes/origin/main")
+        self.assertEqual(gd.runner_checkout_git_veto(co), "")
+        git(co, "commit", "-q", "--allow-empty", "-m", "tagged here only")
+        git(co, "tag", "local-only")
+        git(co, "checkout", "-q", "--detach", "refs/remotes/origin/main")
+        self.assertEqual(gd.runner_checkout_git_veto(co), "a commit here is on no remote-tracking ref")
+        git(co, "push", "-q", "origin", "refs/tags/local-only")
+        self.assertEqual(gd.runner_checkout_git_veto(co), "")
+        git(co, "tag", "-f", "local-only", "refs/tags/cmux-rbh-src-1^{commit}")  # moved here: origin has it elsewhere
+        git(co, "commit", "-q", "--allow-empty", "-m", "another")
+        git(co, "tag", "-f", "local-only")
+        git(co, "checkout", "-q", "--detach", "refs/remotes/origin/main")
+        self.assertEqual(gd.runner_checkout_git_veto(co), "a commit here is on no remote-tracking ref")
+        git(co, "remote", "set-url", "origin", os.fspath(self.root / "gone.git"))
+        self.assertEqual(gd.runner_checkout_git_veto(co), "git could not say whether a commit is only here")
+
     def test_bloat_siblings_share_an_origin_and_an_unreadable_size_counts_none(self) -> None:
         root = self.root / "origin"
         cos = []
