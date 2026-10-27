@@ -4750,7 +4750,7 @@ def mirror_due(fam: Family, path: Path, idle_hours: float) -> bool:
     return (fam.mirror_idle_hours is not None and idle_hours >= fam.mirror_idle_hours
             and (not fam.mirror_include or path.name.startswith(fam.mirror_include))
             and path.name not in fam.mirror_exclude
-            and (not fam.mirror_include or path.is_dir())  # the hygiene rule takes trees, never a lone file
+            and (not (fam.files or fam.mirror_include) or (path.is_dir() and not path.is_symlink()))  # trees only
             and not derived_data(fam, path))
 
 
@@ -6090,9 +6090,8 @@ MOUNT_WALK_BUDGET = 2_000_000  # entries; a mirror too large to walk stays
 
 def mount_below(path: Path, budget: int = MOUNT_WALK_BUDGET) -> str:
     """Why a mirror item must stay because remove() could reach another filesystem through it ("" when none can):
-    a directory below it on another device, or more than budget entries to look at. A directory it cannot read is
-    left to mirror_repos, which keeps the tree for it (an unreadable submodule store is a failed bundle, and alerts);
-    remove() cannot descend into it either."""
+    a directory below it on another device, one it cannot read (it could hide a mount that a later remove() would
+    reach once it is readable), or more than budget entries to look at."""
     try:
         dev = path.lstat().st_dev
     except OSError as e:
@@ -6110,15 +6109,15 @@ def mount_below(path: Path, budget: int = MOUNT_WALK_BUDGET) -> str:
                     if e.stat(follow_symlinks=False).st_dev != dev:
                         return f"another filesystem is mounted below it ({os.path.relpath(e.path, path)})"
                     stack.append(e.path)
-        except OSError:
-            continue
+        except OSError as e:
+            return f"unreadable below it: {e.__class__.__name__}"
     return ""
 
 
 def mount_below_why(why: str) -> str:
     """why when it is one of mount_below's answers (a tree kept for what is below it, not a failed bundle), else ""."""
     return why if why.startswith(("another filesystem is mounted below it", "too large to rule out another",
-                                  "unreadable: ")) else ""
+                                  "unreadable below it", "unreadable: ")) else ""
 
 
 def archive_mirror(path: Path) -> tuple[str, list[Path], tuple]:
@@ -6126,10 +6125,10 @@ def archive_mirror(path: Path) -> tuple[str, list[Path], tuple]:
     uncommitted work, or whose repositories cannot all be found or bundled, is kept.
     ("" or why it must stay, the bundles written, what mirror_moved rechecks)."""
     none: tuple = ([], [], [], {}, None)
-    if (why := mount_below(path)):  # a mirror is git_exempt, so git_state's nested-filesystem check never ran
-        return why, [], none
     why, gitdirs, trees = mirror_repos(path)
     if why:
+        return why, [], none
+    if (why := mount_below(path)):  # a mirror is git_exempt, so git_state's nested-filesystem check never ran
         return why, [], none
     snap = mirror_git_snapshot(list(gitdirs.values()), trees)
     tips = mirror_tips(path, gitdirs)  # what the bundles and the servers cover, for mirror_rename_recheck
@@ -6170,6 +6169,8 @@ def mirror_moved(fam: Family, path: Path, recheck: tuple) -> str:
     if in_cwd(os.fspath(path), open_index(opened)) or named_by(os.fspath(path), cmds) or holds_socket(path) \
             or job_busy(fam, path):
         return "in use while its git work was bundled"
+    if (why := mount_below(path)):  # read again last: a mount may have appeared while the work was bundled
+        return why
     return ""
 
 

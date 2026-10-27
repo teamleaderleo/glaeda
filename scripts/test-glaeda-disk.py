@@ -8698,12 +8698,26 @@ class HygieneMirrorTest(unittest.TestCase):
             if name in items:
                 self.assertNotEqual(items[name].verdict, "reclaimable", (name, items[name].reasons))
 
-    def test_a_lone_file_never_takes_the_rule(self) -> None:
+    def test_a_lone_file_never_takes_the_rule_and_still_goes_by_age(self) -> None:
         caches = gd.HOME / "Library/Caches"
         caches.mkdir(parents=True)
         (caches / "cmux-notes.txt").write_text("x")
-        fam = self.families()["library-caches"]
-        self.assertFalse(gd.mirror_due(fam, caches / "cmux-notes.txt", 999.0))
+        self.assertFalse(gd.mirror_due(self.families()["library-caches"], caches / "cmux-notes.txt", 999.0))
+        files = {"fleet-artifacts": gd.FLEET_ROOT / "cache/old.tar", "cua-cache": gd.HOME / "Library/Caches/cmux/cmux-cua/f.bin"}
+        t = time.time() - 26 * 3600
+        for fid, f in files.items():
+            f.parent.mkdir(parents=True, exist_ok=True)
+            f.write_bytes(b"x" * 4096)
+            os.utime(f, (t, t))
+            fam = self.families()[fid]
+            self.assertFalse(gd.mirror_due(fam, f, 26.0), fid)
+            item = self.survey(fam)[f.name]
+            self.assertEqual(item.verdict, "reclaimable", (fid, item.reasons))
+            receipt = self.home / f"{fid}.jsonl"
+            with contextlib.redirect_stdout(io.StringIO()), \
+                    mock.patch.object(gd, "process_evidence", return_value=([], "")):
+                gd.apply([item], {fam.id: fam}, receipt, None, 24)
+            self.assertFalse(f.exists(), (fid, receipt.read_text()))
 
     def test_another_filesystem_below_a_mirror_keeps_it(self) -> None:
         tree = gd.FLEET_ROOT / "cache/split-spring-apps"
@@ -8743,6 +8757,17 @@ class HygieneMirrorTest(unittest.TestCase):
             gd.apply([item], {fam.id: fam}, receipt, None, 24)
         self.assertTrue((tree / "apps/vol").is_dir())
         self.assertIn("blocked:mount", receipt.read_text())
+        # an unreadable directory below it could hide a mount: inconclusive keeps it
+        os.chmod(tree / "apps/vol", 0)
+        try:
+            self.assertIn("unreadable below it", gd.mount_below(tree))
+            self.assertTrue(gd.archive_mirror(tree)[0])  # mirror_repos or mount_below refuses it, never a bundle
+        finally:
+            os.chmod(tree / "apps/vol", 0o755)
+        # and a mount that appears while the work is bundled keeps it at mirror_moved
+        with mock.patch.object(gd, "process_evidence", return_value=([], "")), \
+                mock.patch.object(gd, "mount_below", return_value="another filesystem is mounted below it (x)"):
+            self.assertIn("another filesystem", gd.mirror_moved(fam, tree, ([], [], [], {}, None)))
 
     def test_off_where_no_ci_runner_is_enrolled(self) -> None:
         (gd.HOME / "Library/Caches/cmux/cmux-cua").mkdir(parents=True)
