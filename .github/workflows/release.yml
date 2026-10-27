@@ -155,10 +155,8 @@ jobs:
               --title "OTA channels" --notes "canary.json, stable.json, control.json: what each glaeda-update ring installs (docs/GLAEDA_OTA.md)."
           fi
           previous=""
-          previous_tag=""
           if gh release download ota-channels --pattern canary.json --dir channels 2>channels/err; then
             previous=$(python3 -c 'import json;print(json.load(open("channels/canary.json"))["source"])')
-            previous_tag=$(python3 -c 'import json;print(json.load(open("channels/canary.json"))["tag"])')
             if ! git merge-base --is-ancestor "$previous" "$main" 2>/dev/null; then
               echo "canary commit $previous is not in main's history (rewritten?); fix canary.json by hand" >&2
               exit 1
@@ -166,19 +164,28 @@ jobs:
           elif ! grep -q "no assets match" channels/err; then
             cat channels/err; exit 1
           fi
-          # Newest first, down to the current canary's release.
-          gh release list --limit 40 --json tagName \
+          # Every release, not just the ones listed after the current canary: a newer commit's release can be
+          # created before an older one's and finish later. The tag names its commit (r-DATE-<12 hex>), so
+          # ancestry is decided locally and only the chosen release's manifest is downloaded.
+          gh release list --limit 1000 --json tagName \
             --jq '.[] | select(.tagName | test("^r-[0-9]{8}-[0-9a-f]{12}$")) | .tagName' > channels/tags.txt
-          best="" best_depth=-1 best_tag=""
+          : > channels/candidates.txt
           while read -r tag; do
-            [ "$tag" != "$previous_tag" ] || break
-            gh release download "$tag" --pattern release.json --output "channels/$tag.json" --clobber || continue
-            source=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["source"])' "channels/$tag.json")
+            source=$(git rev-parse --verify --quiet "${tag##*-}^{commit}" 2>/dev/null) || continue
             git merge-base --is-ancestor "$source" "$main" 2>/dev/null || continue
             if [ -n "$previous" ] && ! git merge-base --is-ancestor "$previous" "$source"; then continue; fi
-            depth=$(git rev-list --count "$source")
-            if [ "$depth" -gt "$best_depth" ]; then best="$source" best_depth="$depth" best_tag="$tag"; fi
+            echo "$(git rev-list --count "$source") $tag $source" >> channels/candidates.txt
           done < channels/tags.txt
+          best="" best_tag=""
+          # Deepest first; a release whose manifest is not uploaded yet (or names another commit) is passed over,
+          # and its own canary run moves canary when it is.
+          while read -r _ tag source; do
+            gh release download "$tag" --pattern release.json --output "channels/$tag.json" --clobber 2>/dev/null || continue
+            named=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["source"])' "channels/$tag.json") || continue
+            [ "$named" = "$source" ] || continue
+            best="$source" best_tag="$tag"
+            break
+          done < <(sort -rn channels/candidates.txt)
           if [ -z "$best" ] || [ "$best" = "$previous" ]; then
             echo "canary stays at ${previous:-none}: no newer release on main descends from it" >> "$GITHUB_STEP_SUMMARY"
             exit 0
