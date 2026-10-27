@@ -8239,6 +8239,30 @@ class DaemonPolicyTest(Base):
         self.assertEqual(self.gh.gql_calls(), [])
         self.assertEqual(len(self.gh.job_calls()), 1)
 
+    def test_an_unanswered_job_list_is_not_asked_again_at_the_cap(self) -> None:
+        failed = {"id": 7, "name": "CI", "display_title": "fix", "status": "completed", "conclusion": "failure",
+                  "html_url": "https://github.com/o/r/actions/runs/7", "head_sha": "b" * 40, "head_branch": "x",
+                  "event": "push", "run_attempt": 1, "created_at": iso(NOW - 99), "updated_at": iso(NOW - 9)}
+        self.gh.runs[7] = failed
+        self.gh.jobs[7] = []  # an empty answer leaves the attempt without jobs
+        key = gg.parse_key("run", "o/r/7")
+        self.daemon.store(key, None, data=gg.slim_run(failed), dataAt=NOW - 5)
+        self.daemon.budget = {"rest": {"limit": 5000, "remaining": 4500, "reset": NOW + 1800},
+                              "graphql": {"limit": 5000, "remaining": 10, "reset": NOW + 1800}}
+        self.daemon.paths["run"] = "rest"
+        self.spend_rest(2000, at=NOW)
+        for i in range(4):  # inside TERMINAL_GRACE, so the finished run stays watched
+            gg.register(key)
+            self.daemon.tick(NOW + i * 25)
+            self.assertEqual(self.daemon.jobs_tried, {key: 1})
+        self.assertEqual(len(self.gh.job_calls()), 1)
+        # a new attempt is a new exemption
+        cached = gg.read_cache(key)
+        self.daemon.store(key, cached, data={**cached["data"], "run_attempt": 2})
+        gg.register(key)
+        self.daemon.tick(NOW + 110)
+        self.assertEqual(len(self.gh.job_calls()), 2)
+
     def test_a_request_is_dated_by_its_own_minute(self) -> None:
         self.daemon.now = NOW - 90  # the tick began 90 s ago
         self.daemon.transport = lambda *a: (200, {}, b"{}")

@@ -1281,6 +1281,7 @@ class Daemon:
         self.saved_rest_minutes = dict(self.rest_minutes)
         self.writing = False  # inside the outbox: its requests are sessions' writes, not the daemon's polling
         self.jobs_only: list[dict] = []  # failed runs whose job list is read though runs cannot be (due)
+        self.jobs_tried: dict[str, int] = {}  # run key -> the attempt whose job list jobs_only last asked for
 
     # -- budget
 
@@ -1759,11 +1760,17 @@ class Daemon:
             # go waits rather than spend the REST the sessions are left with. Except a failed attempt
             # whose job list is not read yet, the one read the share does not hold back, whichever
             # bucket runs are routed to: tick() reads just that list, from the run already cached.
+            # Once per attempt, answered or not: an error or an empty list leaves the attempt without
+            # jobs, and asking again every cycle would make the exemption a loop past the share. A later
+            # read that the share admits (the run's own) still fills it in.
             if kind == "run" and self.mode("rest") != "stop":
                 self.jobs_only = [e for e in mine if self.failed_without_jobs(e)
-                                  and self.now - self.attempted.get(e["key"], float("-inf")) >= self.policy["cycles"]["run"]]
+                                  and self.jobs_tried.get(e["key"]) != ((e["cache"] or {}).get("data") or {}).get("run_attempt")]
                 for e in self.jobs_only:
                     self.attempted[e["key"]] = self.now
+                    self.jobs_tried[e["key"]] = (e["cache"].get("data") or {}).get("run_attempt")
+                live = {e["key"] for e in mine}
+                self.jobs_tried = {k: v for k, v in self.jobs_tried.items() if k in live}
             return []
         if kind == "head":
             return self.due_heads(mine, mode)
