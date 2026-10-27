@@ -2211,6 +2211,26 @@ TMP_TEST_RESIDUE = re.compile(
     r"|floating-chat|header-pr|picker-listing|swift-package-test\.XXXXXX|TemporaryDirectory|cmux-claude-hooks"
     r"|swift-crash-reproducer|cmux-shortcut-routing|cmux-agent-journal-test|cmux-git-active-pwd"
     r"|cmux-ssh-pty-replay)[-.][0-9A-Za-z]")
+# Most cmux test suites name their scratch <suite-name>-<UUID> (FileManager.temporaryDirectory plus UUID().uuidString:
+# cmux-screenshots-tests-, phone-tests-, cmux-chief-avatar-registry-, downloads-, project-, error-journal- and about 200
+# more), so a list of prefixes always lagged: on 2026-10-27 two std minis held 15-28k $TMPDIR entries, 4.5-5k of them
+# named here and the rest such suites. A name that is a plain dash-separated word list (letters, digits, underscores;
+# no dots, so no com.apple.* or reverse-DNS service dirs) ending in a full UUID is test scratch too, with the same
+# idle, open and named-by-a-command vetoes; its prefix in the receipt is the name before the UUID.
+TMP_TEST_RESIDUE_UUID = re.compile(
+    r"(?P<prefix>[A-Za-z][A-Za-z0-9_]*(?:-[A-Za-z0-9_]+)*)-"
+    r"[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}(?:\.[A-Za-z0-9]{1,8})?")
+
+
+def tmp_test_residue_prefix(name: str) -> str | None:
+    """The test-scratch prefix of a $TMPDIR entry's name (TMP_TEST_RESIDUE, else TMP_TEST_RESIDUE_UUID), or None."""
+    named = TMP_TEST_RESIDUE.match(name)
+    if named:
+        return named.group(0)[:-2]
+    suite = TMP_TEST_RESIDUE_UUID.fullmatch(name)
+    return suite.group("prefix") if suite else None
+
+
 TMP_TEST_RESIDUE_IDLE_HOURS = DEFAULT_AGE_HOURS  # nothing in the entry changed for this long: no test run uses it
 TMP_TEST_RESIDUE_WALK_BUDGET = 20_000  # entries walked per candidate; a bigger tree is not proven idle
 TMP_TEST_RESIDUE_EVIDENCE_S = 60.0  # process evidence is re-read at least this often during a pass
@@ -2271,7 +2291,8 @@ def tmp_test_residue_veto(entry: Path, opened: frozenset[str], cmds: str, now: f
 
 
 def reap_tmpdir_test_residue(receipt: Path, tmp: Path | None = None, halt=None) -> int:
-    """Remove test scratch the runner user's tests left in $TMPDIR: entries named by TMP_TEST_RESIDUE, whole
+    """Remove test scratch the runner user's tests left in $TMPDIR: entries named by TMP_TEST_RESIDUE or
+    TMP_TEST_RESIDUE_UUID (tmp_test_residue_prefix), whole
     trees unchanged for TMP_TEST_RESIDUE_IDLE_HOURS, held open and named by no process. Every candidate is
     walked and judged right before its own deletion; process evidence is never older than
     TMP_TEST_RESIDUE_EVIDENCE_S, and missing evidence stops the pass. One summary receipt line per pass."""
@@ -2283,7 +2304,7 @@ def reap_tmpdir_test_residue(receipt: Path, tmp: Path | None = None, halt=None) 
     try:
         with os.scandir(tmp) as it:
             for e in it:
-                if not TMP_TEST_RESIDUE.match(e.name):
+                if tmp_test_residue_prefix(e.name) is None:
                     continue
                 with contextlib.suppress(OSError):  # an entry a test removed mid-scan drops only itself
                     # an entry whose own mtime is recent cannot be idle; skip it without walking it
@@ -2314,7 +2335,7 @@ def reap_tmpdir_test_residue(receipt: Path, tmp: Path | None = None, halt=None) 
         entry = tmp / name
         why, used = tmp_test_residue_veto(entry, evidence[0], evidence[1], time.time(),
                                           deadline=start + TMP_TEST_RESIDUE_BUDGET_S)
-        prefix = TMP_TEST_RESIDUE.match(name).group(0)[:-2]
+        prefix = tmp_test_residue_prefix(name) or name
         if why:
             kept[why.split(" (")[0]] += 1
             continue

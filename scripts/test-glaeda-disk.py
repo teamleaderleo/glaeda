@@ -4947,6 +4947,14 @@ class GlaedaDiskTest(unittest.TestCase):
         e["unknown"].mkdir()
         e["apple"] = tmp / "com.apple.WebKit.Networking"
         e["apple"].mkdir()
+        e["suite"] = tmp / "cmux-screenshots-tests-FA6A171A-766D-46D5-8D5D-6035A5A74F9D"
+        (e["suite"] / "shots").mkdir(parents=True)
+        e["suite-lower"] = tmp / "phone-tests-0157d868-1a4f-4a4c-b017-9a3bb1b51aa6.sqlite"
+        e["suite-lower"].write_text("db")
+        e["simdevice"] = tmp / "com.apple.CoreSimulator.SimDevice.F1D60153-D8F6-4573-BE5E-7EBEC850026F"
+        e["simdevice"].mkdir()
+        e["bare-uuid"] = tmp / "F1D60153-D8F6-4573-BE5E-7EBEC850026F"
+        e["bare-uuid"].mkdir()
         e["dash"] = tmp / "--git-pr-0358FC19-C6D4-4553"
         e["dash"].mkdir()
         outside = self.root / "outside-clone"
@@ -4968,15 +4976,16 @@ class GlaedaDiskTest(unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()):
             released = gd.reap_tmpdir_test_residue(receipt, tmp)
         gone = {n for n, p in e.items() if not os.path.lexists(p)}
-        self.assertEqual(gone, {"socket", "git", "foundation", "file"})
+        self.assertEqual(gone, {"socket", "git", "foundation", "file", "suite", "suite-lower"})
         self.assertGreater(released, 0)
         self.assertTrue((self.root / "outside-clone/.git").is_dir())  # a symlinked entry is never followed
         self.assertTrue(tmp.is_dir())
         self.assertEqual(sorted(p.name for p in tmp.iterdir() if p.name.startswith(gd.DELETING_PREFIX)), [])
         rec = json.loads(receipt.read_text())
-        self.assertEqual((rec["family"], rec["outcome"], rec["items"]), (gd.TMP_TEST_RESIDUE_FAMILY, "reclaimed", 4))
+        self.assertEqual((rec["family"], rec["outcome"], rec["items"]), (gd.TMP_TEST_RESIDUE_FAMILY, "reclaimed", 6))
         self.assertEqual(rec["by_prefix"], {"cmux-cli-socket": 1, "git-pr": 1, "TemporaryDirectory": 1,
-                                            "cmux-shortcut-routing": 1})
+                                            "cmux-shortcut-routing": 1, "cmux-screenshots-tests": 1,
+                                            "phone-tests": 1})
         self.assertEqual(rec["kept"], {"a symlink": 1, f"changed within {gd.TMP_TEST_RESIDUE_IDLE_HOURS:g}h": 1})  # recent tops are never walked
 
     def test_tmpdir_test_residue_vetoes_open_and_named_entries(self) -> None:
