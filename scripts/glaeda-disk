@@ -3613,7 +3613,7 @@ def finish_deletion(path: Path) -> None:
         raise OSError("refusing a mount point")
     if not DELETING_RE.fullmatch(path.name):
         raise OSError("refusing a tree without the deleting name")
-    if os.path.lexists(path / MIRROR_KEEP):
+    if os.path.lexists(mirror_keep_marker(path)):
         raise OSError("refusing a tree glaeda-disk kept: its git work changed after bundling")
     if path.is_dir():
         shutil.rmtree(path, onerror=_chmod_retry)
@@ -3941,7 +3941,7 @@ def keep_verdict(fam: "Family", path: Path) -> str:
     if fam.id == "cmux-seeds":
         return seed_verdict(path)
     if fam.id == INTERRUPTED:
-        if os.path.lexists(path / MIRROR_KEEP):
+        if os.path.lexists(mirror_keep_marker(path)):
             return "glaeda-disk kept it: its git work changed after bundling"
         return deletion_owner_live(path)
     if fam.discover and stat_layout(os.fspath(path)) == "rustup-toolchain":
@@ -4689,29 +4689,41 @@ def _work_tree_dirty(root: Path) -> str:
     return ""
 
 
-MIRROR_KEEP = ".glaeda-disk-keep"  # in an aside tree: finish_deletion and interrupted-deletions never delete it
+MIRROR_KEEP = ".glaeda-disk-keep-"  # next to an aside tree: finish_deletion and interrupted-deletions never delete it
+
+
+def mirror_keep_marker(aside: Path) -> Path:
+    return aside.with_name(MIRROR_KEEP + aside.name)
 
 
 def repo_unborn(gitdir: Path) -> bool:
     """No ref, reflog or linked worktree, and HEAD a branch with no commit yet: a repository with nothing in it."""
-    return (_git_dir_run(gitdir, "for-each-ref", "--count=1") == ""
+    try:
+        if not stat.S_ISREG(os.lstat(gitdir / "HEAD").st_mode) or os.path.lexists(gitdir / "packed-refs"):
+            return False  # a symlinked HEAD or any packed-refs at all: not judged empty
+    except OSError:
+        return False
+    return (files_strict(gitdir / "refs") == [] and _git_dir_run(gitdir, "for-each-ref", "--count=1") == ""
             and _git_dir_run(gitdir, "rev-parse", "-q", "--verify", "HEAD") is None
             and _git_dir_run(gitdir, "symbolic-ref", "-q", "HEAD") is not None
             and files_strict(gitdir / "logs") == [] and not os.path.lexists(gitdir / "worktrees"))
 
 
-def mirror_tips(root: Path, gitdirs: dict[str, Path]) -> dict[str, list[str]] | None:
-    """Every commit each repository points at on its own (local_tips: refs, HEAD, reflogs, its worktrees'),
-    keyed by the git dir's path relative to root, so the same item can be read again after a rename."""
-    tips: dict[str, list[str]] = {}
+def mirror_tips(root: Path, gitdirs: dict[str, Path]) -> dict[str, tuple[list[str], str]] | None:
+    """Every commit each repository points at on its own (local_tips: refs, HEAD, reflogs, its worktrees'), and
+    its local refs by name, keyed by the git dir's path relative to root, so the same item can be read again
+    after a rename."""
+    tips: dict[str, tuple[list[str], str]] = {}
     for g in gitdirs.values():
         t = [] if repo_unborn(g) else local_tips(g)
         for wt in [p for p in (g / "worktrees").glob("*") if p.is_dir()] if t is not None else []:
             own = local_tips(wt, worktree_only=True)
             t = None if own is None else sorted({*t, *own})
-        if t is None:
+        refs = _git_dir_run(g, "for-each-ref", "--format=%(refname) %(objectname)")
+        if t is None or refs is None:
             return None
-        tips[os.path.relpath(g, root)] = t
+        tips[os.path.relpath(g, root)] = (t, "\n".join(
+            ln for ln in refs.splitlines() if not ln.startswith(("refs/remotes/", ARCHIVE_REF))))
     return tips
 
 
@@ -4719,22 +4731,29 @@ def mirror_rename_recheck(path: Path, recheck: tuple):
     """after_rename for a bundled mirror: the renamed tree gets the whole check archive_mirror made before its
     bundles again (a fresh strict scan of repositories and work trees, each clean and unlocked), and must hold
     the same repositories with no commit beyond what was bundled or left to the servers. Otherwise it goes back
-    to its path, or, when that fails, stays aside with MIRROR_KEEP so nothing deletes it."""
+    to its path, or, when that fails, stays aside: its keep marker is written before the rename (if that write
+    fails, nothing is renamed or deleted) and removed only once the check passes."""
     doomed = path.with_name(f"{DELETING_PREFIX}{path.name}-{os.getpid()}")
     before = recheck[4]
+    marker = mirror_keep_marker(doomed)
+    marker.write_text(f"kept by glaeda-disk {os.getpid()} until its git work is checked again\n")  # raises: kept
 
     def check() -> None:
         why, gitdirs, _ = mirror_repos(doomed)
         now = None if why else mirror_tips(doomed, gitdirs)
         if now is not None and before is not None and set(now) == set(before) \
-                and all(set(t) <= set(before[k]) for k, t in now.items()):
-            return
+                and all(set(t) <= set(before[k][0]) and refs == before[k][1] for k, (t, refs) in now.items()):
+            try:
+                marker.unlink()
+                return
+            except OSError as e:
+                why = f"its keep marker could not be removed ({e.strerror})"
         try:
             rename_noreplace(doomed, path)
         except OSError as e:
-            with contextlib.suppress(OSError):
-                (doomed / MIRROR_KEEP).write_text(f"kept by glaeda-disk {os.getpid()}: {why or 'git changed'}\n")
             raise SlotTaken(f"{path.name}: changed after bundling; kept aside as {doomed.name} ({e.strerror})")
+        with contextlib.suppress(OSError):
+            marker.unlink()
         raise SlotTaken(f"{path.name}: changed after bundling ({why or 'git changed'}); put back")
     return check
 

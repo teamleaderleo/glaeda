@@ -6184,13 +6184,37 @@ class LinuxLayoutTest(unittest.TestCase):
         self.assertEqual(rec["outcome"], "changed:in-use")
         aside = [p for p in unit.parent.iterdir() if p.name.startswith(gd.DELETING_PREFIX)]
         self.assertEqual(len(aside), 1)
-        self.assertTrue((aside[0] / gd.MIRROR_KEEP).exists())
+        self.assertTrue(gd.mirror_keep_marker(aside[0]).exists())
         with self.assertRaises(OSError):
             gd.finish_deletion(aside[0])
         fam = gd.Family(gd.INTERRUPTED, unit.parent, True, "x")
         self.assertIn("kept it", gd.keep_verdict(fam, aside[0]))
         self.assertTrue((aside[0] / "slot-1/.git").is_dir())
         del real_rename
+
+    def test_a_symlinked_packed_refs_is_never_judged_empty(self) -> None:
+        bare = self.home / "bare.git"
+        subprocess.run(["git", "init", "-q", "--bare", str(bare)], check=True)
+        (self.home / "packed").write_text("# pack-refs with: peeled\n")
+        (bare / "packed-refs").symlink_to(self.home / "packed")
+        self.assertFalse(gd.repo_unborn(bare))
+        self.assertTrue(gd.bundle_unpushed(bare, "k", []))
+
+    def test_a_branch_named_after_the_last_check_puts_the_mirror_back(self) -> None:
+        def name(doomed):
+            subprocess.run(["git", "-C", str(doomed / "slot-1"), "tag", "made-late", "HEAD"], check=True)
+        rec, unit = self.recheck_after_rename(name)
+        self.assertEqual(rec["outcome"], "changed:in-use")
+        self.assertIn("made-late", subprocess.run(["git", "-C", str(unit / "slot-1"), "tag"], capture_output=True,
+                                                  text=True, check=True).stdout)
+
+    def test_a_keep_marker_that_cannot_be_written_keeps_the_tree_in_place(self) -> None:
+        unit, clone, _ = self.mirror_unit()
+        with mock.patch.object(gd, "mirror_keep_marker", lambda aside: self.home / "no-such-dir" / "marker"):
+            rec, _ = self.apply_mirror(unit)
+        self.assertTrue(rec["outcome"].startswith("incomplete:"), rec["outcome"])
+        self.assertTrue((clone / ".git").is_dir())
+        self.assertEqual([p.name for p in unit.parent.iterdir() if p.name.startswith(gd.DELETING_PREFIX)], [])
 
     def test_only_manifest_listed_bundles_at_their_hash_are_pruned_after_the_evidence_gate(self) -> None:
         archive = self.home / "archive/glaeda-disk"
