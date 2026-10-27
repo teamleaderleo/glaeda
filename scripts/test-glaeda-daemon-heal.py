@@ -1189,6 +1189,14 @@ class RunnerHygiene(unittest.TestCase):
                                    sys.executable, lambda uid: "someone-else")
         self.assertEqual((report["accounts"]["501"]["state"], self.run.argv), ("error", []))
 
+    def test_an_unreadable_enrollment_directory_is_an_error_not_no_work(self) -> None:
+        self.hygiene_pass()
+        cache = dict(self.state["runner_hygiene"])
+        with mock.patch.object(heal.Path, "iterdir", side_effect=OSError(5, "Input/output error")):
+            report = self.hygiene_pass(now=T0 + 120)
+        self.assertIn("Input/output error", report["error"])
+        self.assertEqual(self.state["runner_hygiene"], cache, "the cache is kept")
+
     def test_no_enrolled_account_is_no_work(self) -> None:
         for p in (self.root / "501").iterdir():
             p.unlink()

@@ -2573,6 +2573,9 @@ class DaemonHeal(Base):
         self.assertEqual((f["disk_root_copy_stale:502"]["auto_fix"], f["disk_root_copy_stale:502"]["severity"]),
                          ("impossible", "error"))
         self.assertIn("--user ci --apply", f["disk_root_copy_stale:502"]["note"])
+        root.write_text(json.dumps({"runnerHygiene": {"accounts": {}, "error": "cannot list /x: EIO"}}))
+        f = self.run_once()["findings"]
+        self.assertEqual([(x["id"], x["severity"]) for x in f], [("disk_root_copy_stale:all", "error")])
 
 
 class DaemonHealLiveness(Base):

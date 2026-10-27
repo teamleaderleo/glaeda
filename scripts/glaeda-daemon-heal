@@ -1141,8 +1141,10 @@ def hygiene_pass(install_dir: Path, state: dict[str, Any], now: float, live: boo
     try:
         dirs = sorted((d for d in hygiene_root.iterdir() if d.name.isdigit() and (d / "manifest.json").is_file()),
                       key=lambda d: int(d.name))
-    except OSError:
-        dirs = []
+    except FileNotFoundError:
+        dirs = []  # no account was ever enrolled here
+    except OSError as e:  # unreadable: the accounts are not managed this pass; the cache stays, the report says so
+        return {"accounts": {}, "error": f"cannot list {hygiene_root}: {str(e)[:200]}"}
     ident = load_json(install_dir / INSTALLED)
     files = ident.get("files") if isinstance(ident.get("files"), dict) else {}
     tool, disk = install_dir / HYGIENE_NAME, install_dir / DISK_NAME

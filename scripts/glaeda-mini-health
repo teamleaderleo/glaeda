@@ -1875,6 +1875,11 @@ def check_daemon_heal(mini: Mini) -> list[dict[str, Any]]:
             for h in report.get("healed") or [] if isinstance(h, dict) and h.get("name")]
         hygiene = report.get("runnerHygiene") if isinstance(report.get("runnerHygiene"), dict) else {}
         accounts = hygiene.get("accounts") if isinstance(hygiene.get("accounts"), dict) else {}
+        if hygiene.get("error"):
+            out.append(finding("disk_root_copy_stale:all", "error",
+                               f"the root pass could not check runner accounts' root-pinned glaeda-disk: "
+                               f"{str(hygiene['error'])[:200]}", "impossible",
+                               "glaeda-daemon-heal's report runnerHygiene.error"))
         for uid, a in sorted(accounts.items()):
             if not isinstance(a, dict) or a.get("state") not in ("stale", "error"):
                 continue
