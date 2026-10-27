@@ -621,6 +621,10 @@ class CheckTests(unittest.TestCase):
         wider = f"ak_key\tauthorized_keys|{wide}|256 {STRAY} x (ED25519)\n"
         ssh = [i["detail"] for i in self.issues(probe_text() + wider) if i["area"] == "ssh"]
         self.assertTrue(any("not allowed" in d for d in ssh), ssh)
+        bare = f"ak_key\tauthorized_keys|no|256 {STRAY} cmux-loopback@m (ED25519)\n"
+        for lines in (own + bare, bare + own):  # the same key on an unrestricted line too, either order
+            ssh = [i["detail"] for i in self.issues(probe_text() + lines) if i["area"] == "ssh"]
+            self.assertEqual(sum("not allowed" in d for d in ssh), 1, ssh)
         del self.manifest["defaults"]["authorized_keys"]["loopback_options"]
         ssh = [i["detail"] for i in self.issues(probe_text() + own) if i["area"] == "ssh"]
         self.assertTrue(any("not allowed" in d for d in ssh), ssh)

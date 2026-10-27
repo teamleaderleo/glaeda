@@ -1186,10 +1186,16 @@ def check_host(manifest: dict[str, Any], name: str, obs: dict[str, Any]) -> list
     # is matched by its declared loopback-only options, which the probe reports as a digest.
     loopback = options_digest(keys["loopback_options"]) if keys.get("loopback_options") else None
     if keys.get("exclusive"):
-        for fp, k in by_fp.items():
-            if fp not in allowed and not (loopback and k["options"] == loopback):
-                label = known.get(fp, "unlisted")
-                drift("ssh", f"{label} key {fp[7:19]} ({k['comment']}) not allowed here", f"remove key {fp}")
+        # Every line, not one per fingerprint: the same key on a second, unrestricted line would let it in from
+        # anywhere while its loopback line looked fine.
+        flagged: set[str] = set()
+        for k in obs["authorized_keys"]:
+            fp = k.get("fingerprint")
+            if not fp or fp in allowed or fp in flagged or (loopback and k["options"] == loopback):
+                continue
+            flagged.add(fp)
+            label = known.get(fp, "unlisted")
+            drift("ssh", f"{label} key {fp[7:19]} ({k['comment']}) not allowed here", f"remove key {fp}")
     for k in obs["authorized_keys"]:
         if not k.get("fingerprint"):
             drift("ssh", "authorized_keys has an unparseable line")
