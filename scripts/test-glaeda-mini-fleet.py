@@ -1617,7 +1617,14 @@ class PreflightTests(unittest.TestCase):
         done = self.result(preflight_text(git="/opt/homebrew/bin/git"))
         self.assertEqual((done["checks"]["git"]["state"], done["ready"]), ("ok", True))
         old = self.result(preflight_text(git=None))
-        self.assertEqual((old["checks"]["git"]["state"], old["ready"]), ("unknown", True))
+        self.assertEqual((old["checks"]["git"]["state"], old["ready"]), ("fail", False))
+        del self.manifest["hosts"]["build-mini-1"]["overrides"]["git"]
+        self.assertEqual(self.result(preflight_text(git=None))["ready"], True)  # no policy: an old probe is fine
+
+    def test_the_preflight_probe_runs_the_workloads_git(self) -> None:
+        text = mf.PREFLIGHT_PROBE.read_text()
+        self.assertFalse(re.findall(r"(?<![w$])\bgit -C", text), "every git call goes through wgit (WORKLOAD_PATH)")
+        self.assertIn('wgit() { PATH="$WORKLOAD_PATH" git "$@"; }', text)
 
     def test_git_policy_is_validated(self) -> None:
         data = json.loads(EXAMPLE.read_text())
@@ -1627,6 +1634,11 @@ class PreflightTests(unittest.TestCase):
             mf.load_manifest(EXAMPLE, json.dumps(data))
         host["overrides"]["git"] = {"source": "homebrew", "note": "until the privacy grant is made"}
         mf.load_manifest(EXAMPLE, json.dumps(data))
+        # A note-only override still inherits a bad default: the merged policy is what is checked.
+        data["defaults"]["git"] = {"source": "bogus"}
+        host["overrides"]["git"] = {"note": "only a note"}
+        with self.assertRaisesRegex(mf.Failure, "git takes source"):
+            mf.load_manifest(EXAMPLE, json.dumps(data))
 
     def test_an_old_glaeda_checkout_is_moved_before_enrolling(self) -> None:
         # An old ~/glaeda failed onboard with "unrecognized arguments: --class-receipt ...".

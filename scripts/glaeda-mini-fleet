@@ -562,8 +562,9 @@ def validate_onboarding(path: Path, data: dict[str, Any]) -> None:
             and re.fullmatch(r"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ)?", str(pin.get("expires", "")))):
         raise Failure(f"{path}: candidate needs source (40 hex), sha256 (64 hex), run, artifact and repo, "
                       "and optionally expires (an ISO time such as 2026-10-24T15:15:27Z)")
-    for name, host in data["hosts"].items():
-        git = (host.get("overrides") or {}).get("git", data.get("defaults", {}).get("git"))
+    for name, host in [("defaults", {"overrides": {}}), *data["hosts"].items()]:
+        # The policy git_source reads: defaults merged with the host's overrides, as host_policy does.
+        git = merge(data.get("defaults") or {}, host.get("overrides") or {}).get("git")
         if git is not None and not (isinstance(git, dict) and set(git) <= {"source", "note"}
                                     and git.get("source", "system") in GIT_SOURCES):
             raise Failure(f"{path}: host {name} git takes source ({' or '.join(GIT_SOURCES)}) and note")
@@ -2416,8 +2417,8 @@ def preflight_host(manifest: dict[str, Any], name: str, obs: dict[str, Any],
     git = pf.get("git")
     if git_source(manifest, name) != "homebrew":
         put("git", "info", git or "none on the workload PATH")
-    elif git is None:
-        put("git", "unknown", "the probe predates this check; rerun preflight")
+    elif git is None:  # the policy asks for a git this probe cannot show: not ready until a fresh probe does
+        put("git", "fail", "the probe predates this check; rerun preflight", "rerun glaeda-mini-fleet preflight", "self")
     elif git == HOMEBREW_GIT:
         put("git", "ok", f"{git} (policy git.source homebrew)")
     else:

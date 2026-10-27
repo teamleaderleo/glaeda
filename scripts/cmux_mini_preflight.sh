@@ -95,12 +95,15 @@ e pf_python3 "$p3|$v3"
 e pf_gh "$(PATH="$WORKLOAD_PATH" command -v gh 2>/dev/null)"
 # git as the workload resolves it (a host policy may ask for Homebrew's); only its path, so nothing runs.
 e pf_git "$(PATH="$WORKLOAD_PATH" command -v git 2>/dev/null)"
+# The git calls below run the workload's git too: on a host with git.source homebrew, Xcode's git waits on privacy
+# prompts (about 100 s per git submodule call), and that is what the jobs run anyway.
+wgit() { PATH="$WORKLOAD_PATH" git "$@"; }
 
 # The cmux checkout: submodules, setup artifacts and local changes. Then the pinned candidate.
 if [ -e "$CMUX_ROOT/.git" ]; then
   e pf_cmux present
   e pf_cmux_pin "$(cat "$CMUX_ROOT/.xcode-version" 2>/dev/null)"
-  git -C "$CMUX_ROOT" submodule status --recursive 2>&1 | while IFS= read -r line; do e pf_submodule "$line"; done
+  wgit -C "$CMUX_ROOT" submodule status --recursive 2>&1 | while IFS= read -r line; do e pf_submodule "$line"; done
   e pf_zig_min "$(sed -nE 's/^[[:space:]]*\.minimum_zig_version[[:space:]]*=[[:space:]]*"([0-9.]+)".*/\1/p' "$CMUX_ROOT/ghostty/build.zig.zon" 2>/dev/null | head -1)"
   artifacts=no
   if [ -f "$CMUX_ROOT/ghostty/include/ghostty.h" ]; then
@@ -109,7 +112,7 @@ if [ -e "$CMUX_ROOT/.git" ]; then
     done
   fi
   e pf_setup_artifacts "$artifacts"
-  e pf_cmux_dirty "$(git -C "$CMUX_ROOT" status --porcelain=v1 --untracked-files=all 2>/dev/null | wc -l | tr -d ' ')"
+  e pf_cmux_dirty "$(wgit -C "$CMUX_ROOT" status --porcelain=v1 --untracked-files=all 2>/dev/null | wc -l | tr -d ' ')"
 else
   e pf_cmux missing
 fi
@@ -124,13 +127,13 @@ if [ -n "$source" ]; then
   [ "$staged" = yes ] && [ -f "$bin" ] && e pf_candidate_generation "sha256:$(shasum -a 256 "$bin" | cut -d' ' -f1)"
 fi
 [ -f "$HOME/glaeda/scripts/cmux_fleet.py" ] && e pf_glaeda present || e pf_glaeda missing
-[ -e "$HOME/glaeda/.git" ] && e pf_glaeda_head "$(git -C "$HOME/glaeda" rev-parse -q --verify HEAD 2>/dev/null)"
+[ -e "$HOME/glaeda/.git" ] && e pf_glaeda_head "$(wgit -C "$HOME/glaeda" rev-parse -q --verify HEAD 2>/dev/null)"
 # The options an old ~/glaeda cannot run ("unrecognized arguments"), and whether it could be moved.
 if [ -f "$HOME/glaeda/scripts/glaeda-mini-enroll" ]; then
   lacking=""
   for f in $ENROLL_FLAGS; do grep -qF -- "\"$f\"" "$HOME/glaeda/scripts/glaeda-mini-enroll" || lacking="$lacking $f"; done
   e pf_glaeda_lacking "${lacking# }"
-  e pf_glaeda_dirty "$(git -C "$HOME/glaeda" status --porcelain=v1 --untracked-files=no 2>/dev/null | wc -l | tr -d ' ')"
+  e pf_glaeda_dirty "$(wgit -C "$HOME/glaeda" status --porcelain=v1 --untracked-files=no 2>/dev/null | wc -l | tr -d ' ')"
 fi
 [ -d "$HOME/.cache/glaeda/cmux-native-cache" ] && e pf_cache_root present || e pf_cache_root missing
 
