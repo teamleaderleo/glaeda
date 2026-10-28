@@ -9043,6 +9043,22 @@ class HygieneMirrorTest(unittest.TestCase):
                                         (first.st_dev, first.st_ino), digest)
         self.assertEqual(f.read_text(), "new")
 
+    def test_a_directory_swapped_for_a_fresh_file_after_its_look_is_kept(self) -> None:
+        archive = gd.HOME / "archive"
+        old = archive / "old"
+        old.mkdir(parents=True)
+        (old / "a.patch").write_text("diff")
+        real = gd.mount_below
+
+        def swap(path, *a, **k):  # after the age was judged, before the rename
+            if path == old and old.is_dir():
+                shutil.rmtree(old)
+                old.write_text("fresh data")
+            return real(path, *a, **k)
+        with mock.patch.object(gd, "mount_below", side_effect=swap), contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(gd.prune_foreign_archives(now=time.time() + 31 * 86400), [])
+        self.assertEqual(old.read_text(), "fresh data")
+
     def test_existing_archive_dirs_and_manifest_are_tightened(self) -> None:
         root = gd.mirror_archive()
         root.mkdir(parents=True)

@@ -5782,14 +5782,22 @@ def prune_foreign_archives(now: float | None = None, in_use=lambda p: False) -> 
             digest = None if p.is_dir() else _sha256(p)  # read before the rename, after its age was judged
             if not p.is_dir() and _newest_change(p) != newest:
                 continue  # changed while it was hashed
-            check = (lambda q=p, n=newest, i=ident, d=digest: _foreign_archive_recheck(q, root_id, n, in_use, i, d))
-            if p.is_dir():
-                remove(p, after_rename=check)
-            else:  # remove() unlinks a file in place; this one is renamed aside and checked again first
-                doomed = p.with_name(f"{DELETING_PREFIX}{p.name}-{os.getpid()}")
-                rename_noreplace(p, doomed)
-                check()
+            # every entry is renamed aside first and judged as what was renamed (its inode, and for a file its
+            # bytes), never by a second lstat of the name: a swap between the look and the rename is put back
+            doomed = p.with_name(f"{DELETING_PREFIX}{p.name}-{os.getpid()}")
+            rename_noreplace(p, doomed)
+            _foreign_archive_recheck(p, root_id, newest, in_use, ident, digest)
+            st = os.lstat(doomed)
+            if stat.S_ISDIR(st.st_mode) and digest is None:
+                if os.path.ismount(doomed) or st.st_dev != os.lstat(doomed.parent).st_dev:
+                    rename_noreplace(doomed, p)
+                    raise OSError("refusing a mount point")
+                shutil.rmtree(doomed, onerror=_chmod_retry)
+            elif stat.S_ISREG(st.st_mode) and digest is not None:
                 doomed.unlink()
+            else:
+                rename_noreplace(doomed, p)
+                raise OSError("its type changed")
             gone.append(os.fspath(p))
         except (OSError, SlotTaken) as err:
             print(f"glaeda-disk: kept expired archive {p}: {err}", file=sys.stderr)
