@@ -5699,9 +5699,11 @@ def _sha256(path: Path) -> str:
     return h.hexdigest()
 
 
-def prune_mirror_archive(today: str | None = None) -> int:
-    """Delete the bundles manifest.jsonl lists whose expiry has passed, each only while it is a regular file
-    with the sha256 the manifest recorded for it; nothing the manifest does not list, nothing else in ~/archive."""
+def prune_mirror_archive(today: str | None = None, in_use=lambda p: False) -> int:
+    """Delete the archives manifest.jsonl lists whose expiry has passed, each only while it is a regular file
+    with the sha256 the manifest recorded for it and nothing has it open (in_use); nothing the manifest does not
+    list, nothing else in ~/archive. The file is renamed aside before it is hashed, so what is hashed is what goes;
+    one that does not match goes back."""
     today = today or time.strftime("%Y-%m-%d")
     root, gone, kept = mirror_archive(), 0, []
     manifest = root / "manifest.jsonl"
@@ -5721,14 +5723,26 @@ def prune_mirror_archive(today: str | None = None) -> int:
         f = root / name
         if not MIRROR_BUNDLE_RE.fullmatch(name) or expires >= today:
             kept.append(line)
-        elif f.is_file() and not f.is_symlink():
+        elif not os.path.lexists(f):
+            continue  # already gone: nothing to list
+        elif not f.is_file() or f.is_symlink() or in_use(f):
+            kept.append(line)  # still listed: in use now, or not a plain file to judge
+        else:
+            aside = f.with_name(f".{name}.{os.getpid()}.expiring")
             try:
-                if _sha256(f) == sha:
-                    f.unlink()
+                os.rename(f, aside)
+            except OSError:
+                kept.append(line)
+                continue
+            try:
+                if stat.S_ISREG(os.lstat(aside).st_mode) and _sha256(aside) == sha:
+                    aside.unlink()
                     gone += 1
                     continue
             except OSError:
                 pass
+            with contextlib.suppress(OSError):
+                rename_noreplace(aside, f)
             kept.append(line)  # changed or unreadable: never deleted, still listed
     with contextlib.suppress(OSError):
         tmp = manifest.with_name(f".manifest.{os.getpid()}.tmp")
@@ -5744,36 +5758,68 @@ def prune_foreign_archives(now: float | None = None, in_use=lambda p: False) -> 
     Kept: anything newer, a symlink, anything unreadable, another filesystem below it, and anything in_use.
     The paths deleted."""
     now, root, gone = time.time() if now is None else now, HOME / "archive", []
-    if root.is_symlink() or not root.is_dir():
+    try:
+        st = os.lstat(root)
+    except OSError:
         return gone
-    cutoff = now - MIRROR_ARCHIVE_DAYS * 86400
+    if not stat.S_ISDIR(st.st_mode):  # a symlink too
+        return gone
+    root_id, cutoff = (st.st_dev, st.st_ino), now - MIRROR_ARCHIVE_DAYS * 86400
     try:
         entries = sorted(os.scandir(root), key=lambda e: e.name)
     except OSError:
         return gone
     for e in entries:
         p = Path(e.path)
-        if e.name == mirror_archive().name or e.is_symlink():
+        if e.name == mirror_archive().name or e.is_symlink() or e.name.startswith((DELETING_PREFIX, MIRROR_KEEP)):
             continue
-        newest, errors = 0.0, []
-        try:
-            st = os.lstat(p)
-            newest = max(st.st_mtime, st.st_ctime)
-            if stat.S_ISDIR(st.st_mode):
-                for dp, dirs, files in os.walk(p, onerror=errors.append):
-                    for n in dirs + files:
-                        st = os.lstat(os.path.join(dp, n))
-                        newest = max(newest, st.st_mtime, st.st_ctime)
-        except OSError as err:
-            errors.append(err)
-        if errors or newest >= cutoff or mount_below(p) or in_use(p):
+        newest = _newest_change(p)
+        if newest is None or newest >= cutoff or mount_below(p) or in_use(p):
             continue
         try:
-            remove(p)
+            remove(p, after_rename=lambda q=p: _foreign_archive_recheck(q, root_id, cutoff, in_use))
             gone.append(os.fspath(p))
-        except OSError as err:
+        except (OSError, SlotTaken) as err:
             print(f"glaeda-disk: kept expired archive {p}: {err}", file=sys.stderr)
     return gone
+
+
+def _newest_change(p: Path) -> float | None:
+    """The newest mtime or ctime of p and everything below it; None when any of it cannot be read or a socket is
+    below it (something may be serving from it)."""
+    errors: list[OSError] = []
+    try:
+        st = os.lstat(p)
+        newest = max(st.st_mtime, st.st_ctime)
+        if stat.S_ISDIR(st.st_mode):
+            for dp, dirs, files in os.walk(p, onerror=errors.append):
+                for n in dirs + files:
+                    st = os.lstat(os.path.join(dp, n))
+                    if stat.S_ISSOCK(st.st_mode):
+                        return None
+                    newest = max(newest, st.st_mtime, st.st_ctime)
+    except OSError:
+        return None
+    return None if errors else newest
+
+
+def _foreign_archive_recheck(path: Path, root_id: tuple[int, int], cutoff: float, in_use) -> None:
+    """after_rename for an expired archive: the renamed entry is still in the same ~/archive directory (not one
+    swapped in through a symlink), nothing below it changed, no mount, and nothing uses it; else it goes back."""
+    doomed = path.with_name(f"{DELETING_PREFIX}{path.name}-{os.getpid()}")
+    try:
+        parent = os.lstat(doomed.parent)
+        same = (parent.st_dev, parent.st_ino) == root_id and not stat.S_ISLNK(parent.st_mode)
+    except OSError:
+        same = False
+    newest = _newest_change(doomed) if same else None
+    if same and newest is not None and newest < cutoff and not mount_below(doomed) and not in_use(doomed):
+        return
+    try:
+        rename_noreplace(doomed, path)
+    except OSError as e:
+        raise SlotTaken(f"{path.name}: changed or in use while it expired; kept aside as {doomed.name} ({e.strerror})")
+    raise SlotTaken(f"{path.name}: changed or in use while it expired; put back")
 
 
 def _bundle_name(key: str, ref: str = "") -> str:
@@ -5781,6 +5827,39 @@ def _bundle_name(key: str, ref: str = "") -> str:
     digest = hashlib.sha256(f"{key}\0{ref}".encode()).hexdigest()[:16]
     tail = re.sub(r"[^A-Za-z0-9._-]+", "_", f"{key}{'-' + ref if ref else ''}").strip("_")[-80:]
     return f"{time.strftime('%Y%m%dT%H%M%S')}-{os.getpid()}-{digest}-{tail}"
+
+
+def archive_root_why(item: Path | None = None) -> str:
+    """Why archives cannot be written or pruned safely right now ("" when they can): ~/archive or
+    ~/archive/glaeda-disk or its manifest a symlink or not what it should be, or the archive inside the item
+    about to be deleted."""
+    root = mirror_archive()
+    for p in (root.parent, root, root / "manifest.jsonl"):
+        try:
+            st = os.lstat(p)
+        except FileNotFoundError:
+            continue
+        except OSError as e:
+            return f"unreadable {p}: {e.__class__.__name__}"
+        if stat.S_ISLNK(st.st_mode) or not (stat.S_ISREG(st.st_mode) if p.name == "manifest.jsonl"
+                                            else stat.S_ISDIR(st.st_mode)):
+            return f"{p} is a symlink or not a {'file' if p.name == 'manifest.jsonl' else 'directory'}"
+    if item is not None and (os.path.realpath(root) + "/").startswith(os.path.realpath(item) + "/"):
+        return f"the archive {root} is inside {item}"
+    return ""
+
+
+def archives_intact(archives: dict[str, str]) -> str:
+    """Right before the delete: every archive written for the item is still a regular file with its sha256."""
+    if (why := archive_root_why()):
+        return why
+    for f, sha in archives.items():
+        try:
+            if not stat.S_ISREG(os.lstat(f).st_mode) or _sha256(Path(f)) != sha:
+                return f"its archive {f} changed"
+        except OSError:
+            return f"its archive {f} is gone or unreadable"
+    return ""
 
 
 def _archive_expires() -> str:
@@ -5854,8 +5933,10 @@ def work_tree_changes(root: Path, trees: set[str]) -> tuple[str, bytes, list[tup
                 digest = hashlib.sha256(os.fsencode(os.readlink(f))).hexdigest()
             elif stat.S_ISREG(st.st_mode):
                 digest = _sha256(f)
+            elif stat.S_ISSOCK(st.st_mode):
+                continue  # a socket holds no data (and a live one keeps the tree: holds_socket)
             else:
-                continue  # a socket or FIFO holds no data
+                return f"an untracked FIFO or device no archive holds ({rel})", b"", []
         except OSError:
             return f"unreadable untracked file {rel}", b"", []
         files.append((rel, f, digest))
@@ -5881,7 +5962,9 @@ def archive_work_tree(root: Path, inside: Path, trees: set[str], written: list[P
     fingerprint = (hashlib.sha256(patch).hexdigest(), tuple((r, d) for r, _, d in files))
     if not patch and not files:
         return "", fingerprint
-    head = (_git_dir_run(root / ".git", "rev-parse", "HEAD") or "").strip()
+    head = (_git_dir_run(root / ".git", "rev-parse", "-q", "--verify", "HEAD^{commit}") or "").strip()
+    if not re.fullmatch(r"[0-9a-f]{40}([0-9a-f]{24})?", head):
+        return f"uncommitted: {where}: no readable HEAD to restore its changes onto", fingerprint
     name, expires = _bundle_name(os.path.realpath(root), "worktree"), _archive_expires()
     about = {"tree": os.fspath(root), "head": head}
     tmps: list[Path] = []
@@ -6135,7 +6218,14 @@ def mirror_rename_recheck(path: Path, recheck: tuple):
 
     def check() -> None:
         why, gitdirs, now_trees = mirror_repos(doomed)
-        now = None if why or not work_unchanged(doomed, now_trees, recheck[5]) else mirror_tips(doomed, gitdirs)
+        try:
+            opened, cmds = process_evidence()  # after the rename: a process that came in meanwhile is in doomed now
+            busy = in_cwd(os.fspath(doomed), open_index(opened)) or named_by(os.fspath(path), cmds) \
+                or holds_socket(doomed)
+        except NoEvidence:
+            busy = True
+        now = None if why or busy or not work_unchanged(doomed, now_trees, recheck[5]) \
+            or archives_intact(recheck[6]) else mirror_tips(doomed, gitdirs)
         if now is not None and before is not None and set(now) == set(before) \
                 and all(set(t) <= set(before[k][0]) and refs == before[k][1] for k, (t, refs) in now.items()):
             try:
@@ -6298,7 +6388,9 @@ def archive_mirror(path: Path) -> tuple[str, list[Path], tuple]:
     """Before a mirror item goes: bundle_unpushed for every repository mirror_repos finds. A tree with
     uncommitted work no archive can hold, or whose repositories or work cannot all be found or archived, is kept.
     ("" or why it must stay, the bundles written, what mirror_moved rechecks)."""
-    none: tuple = ([], [], [], {}, None, {})
+    none: tuple = ([], [], [], {}, None, {}, {})
+    if (why := archive_root_why(path)):
+        return why, [], none
     why, gitdirs, trees = mirror_repos(path)
     if why:
         return why, [], none
@@ -6320,7 +6412,11 @@ def archive_mirror(path: Path) -> tuple[str, list[Path], tuple]:
         if why:
             return why, bundles, none
         work[os.path.relpath(t, path)] = fingerprint
-    return "", bundles, (list(gitdirs.values()), trees, snap, relied, tips, work)
+    try:
+        archives = {os.fspath(b): _sha256(b) for b in bundles}
+    except OSError as e:
+        return f"an archive is unreadable: {e.__class__.__name__}", bundles, none
+    return "", bundles, (list(gitdirs.values()), trees, snap, relied, tips, work, archives)
 
 
 def work_unchanged(path: Path, trees: list[Path], work: dict[str, tuple]) -> bool:
@@ -6334,7 +6430,7 @@ def mirror_moved(fam: Family, path: Path, recheck: tuple) -> str:
     """Right before a bundled mirror goes, everything the bundling took time over is read again: process
     evidence, the family's owner and artifact references, and its repositories, found afresh (the same set,
     every work tree clean) and as at bundle time, and the servers, asked again for what the bundles left to them."""
-    gitdirs, trees, snap, relied, _, work = recheck
+    gitdirs, trees, snap, relied, _, work, archives = recheck
     for g, commits in relied.items():  # the slow network first, then git, then the quick process checks last
         if (why := server_still_holds(g, commits)):
             return why
@@ -6361,7 +6457,7 @@ def mirror_moved(fam: Family, path: Path, recheck: tuple) -> str:
         return "in use while its git work was bundled"
     if (why := mount_below(path)):  # read again last: a mount may have appeared while the work was bundled
         return why
-    return ""
+    return archives_intact(archives)
 
 
 def submodule_loss(worktree: Path, gitdir: Path, seen: set[str] | None = None,
@@ -8666,9 +8762,15 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
         return 0
     cwds = open_index(cwds)
     if any(f.mirror_idle_hours is not None for f in every):
-        prune_mirror_archive()
-        if (expired := prune_foreign_archives(in_use=lambda q: in_cwd(os.fspath(q), cwds)
-                                              or named_by(os.fspath(q), cmds) or holds_socket(q))):
+        def archive_in_use(q: Path) -> bool:
+            try:
+                o, c = process_evidence()  # fresh: the pass's own evidence is minutes old by now
+            except NoEvidence:
+                return True
+            return in_cwd(os.fspath(q), open_index(o)) or named_by(os.fspath(q), c)  # sockets: _newest_change
+        if not archive_root_why():
+            prune_mirror_archive(in_use=archive_in_use)
+        if (expired := prune_foreign_archives(in_use=archive_in_use)):
             RUN.setdefault("archives_expired", []).extend(expired)
     lsof_at, lsof_items = time.monotonic(), 0
     archived = archived_seeds() if any(i.family == "cmux-seeds" for i in items) else frozenset()

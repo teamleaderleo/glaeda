@@ -7668,6 +7668,57 @@ class LinuxLayoutTest(unittest.TestCase):
         self.assertIn("its uncommitted work changed while it was archived", rec["reasons"])
         self.assertEqual((clone / "tracked.txt").read_text(), "v3, edited while it was archived\n")
 
+    def test_an_archive_that_changes_before_the_delete_keeps_the_mirror(self) -> None:
+        unit, clone, _ = self.dirty_mirror()
+        why, written, recheck = gd.archive_mirror(unit)
+        self.assertEqual(why, "")
+        tar = next(w for w in written if w.name.endswith(".tar.gz"))
+        with mock.patch.object(gd, "process_evidence", return_value=([], "")), \
+                mock.patch.object(gd, "server_still_holds", return_value=""):
+            self.assertEqual(gd.mirror_moved(self.families_job(), unit, recheck), "")
+            tar.write_bytes(b"truncated")
+            self.assertIn("changed", gd.mirror_moved(self.families_job(), unit, recheck))
+            tar.unlink()
+            self.assertIn("gone", gd.mirror_moved(self.families_job(), unit, recheck))
+
+    def families_job(self):
+        return next(f for f in gd.default_families() if f.id == "cmux-job-cache")
+
+    def test_a_symlinked_or_inside_archive_keeps_the_mirror(self) -> None:
+        unit, clone, _ = self.dirty_mirror()
+        (self.home / "archive").mkdir()
+        (self.home / "archive/glaeda-disk").symlink_to(clone)  # its archive would go with the tree
+        self.assertIn("symlink", gd.archive_mirror(unit)[0])
+        (self.home / "archive/glaeda-disk").unlink()
+        (self.home / "archive/glaeda-disk").mkdir()
+        (self.home / "archive/glaeda-disk/manifest.jsonl").symlink_to(self.home / "elsewhere.jsonl")
+        self.assertIn("symlink", gd.archive_mirror(unit)[0])
+        self.assertTrue((clone / "notes.txt").exists())
+
+    def test_a_process_that_comes_in_during_the_rename_puts_the_mirror_back(self) -> None:
+        unit, clone, _ = self.dirty_mirror()
+        calls = []
+
+        def evidence():
+            calls.append(1)  # the pass's own reads find nothing; the read after the rename finds a shell in it
+            doomed = unit.with_name(f"{gd.DELETING_PREFIX}{unit.name}-{os.getpid()}")
+            return ([os.fspath(doomed / "slot-1")] if doomed.exists() else []), ""
+        with mock.patch.object(gd, "process_evidence", side_effect=evidence):
+            rec, _ = self.apply_mirror(unit)
+        self.assertNotEqual(rec["outcome"], "reclaimed")
+        self.assertTrue((clone / "notes.txt").exists())
+
+    def test_an_expired_archive_in_use_or_changed_is_kept(self) -> None:
+        unit, _, _ = self.dirty_mirror()
+        self.assertEqual(gd.archive_mirror(unit)[0], "")
+        archive = self.home / "archive/glaeda-disk"
+        files = sorted(p for p in archive.iterdir() if p.name != "manifest.jsonl")
+        self.assertEqual(gd.prune_mirror_archive("9999-12-31", in_use=lambda p: True), 0)
+        files[0].write_bytes(b"changed since")
+        self.assertEqual(gd.prune_mirror_archive("9999-12-31"), len(files) - 1)
+        self.assertEqual(sorted(p for p in archive.iterdir() if p.name != "manifest.jsonl"), [files[0]])
+        self.assertEqual(files[0].read_bytes(), b"changed since")
+
     def test_a_checkout_in_ignored_files_has_its_local_refs_bundled(self) -> None:
         unit, clone, env = self.mirror_unit()
         with (clone / ".git/info/exclude").open("a") as f:
@@ -8842,7 +8893,7 @@ class HygieneMirrorTest(unittest.TestCase):
         # and a mount that appears while the work is bundled keeps it at mirror_moved
         with mock.patch.object(gd, "process_evidence", return_value=([], "")), \
                 mock.patch.object(gd, "mount_below", return_value="another filesystem is mounted below it (x)"):
-            self.assertIn("another filesystem", gd.mirror_moved(fam, tree, ([], [], [], {}, None, {})))
+            self.assertIn("another filesystem", gd.mirror_moved(fam, tree, ([], [], [], {}, None, {}, {})))
 
     def test_other_archives_expire_30_days_after_their_newest_change_and_never_sooner(self) -> None:
         archive = gd.HOME / "archive"
@@ -8877,6 +8928,31 @@ class HygieneMirrorTest(unittest.TestCase):
         self.assertEqual(sorted(p.name for p in archive.iterdir()),
                          ["fresh", "glaeda-disk", "held", "link", "locked"])
         self.assertTrue((archive / "glaeda-disk/kept.bundle").exists() and outside.is_dir())
+
+    def test_an_archive_that_comes_into_use_or_changes_while_it_expires_goes_back(self) -> None:
+        archive = gd.HOME / "archive"
+        old = archive / "old"
+        old.mkdir(parents=True)
+        (old / "a.patch").write_text("diff")
+        calls = []
+
+        def busy_on_recheck(p: Path) -> bool:
+            calls.append(p.name)
+            return len(calls) > 1  # free at the first look, in use after the rename
+        self.assertEqual(gd.prune_foreign_archives(now=time.time() + 31 * 86400, in_use=busy_on_recheck), [])
+        self.assertEqual(sorted(p.name for p in archive.iterdir()), ["old"])
+        self.assertEqual((old / "a.patch").read_text(), "diff")
+        import socket
+        sock = socket.socket(socket.AF_UNIX)
+        self.addCleanup(sock.close)
+        short = Path(tempfile.mkdtemp(dir="/tmp"))
+        self.addCleanup(shutil.rmtree, short, True)
+        sock.bind(os.fspath(short / "s"))
+        os.rename(short / "s", old / "s")
+        self.assertEqual(gd.prune_foreign_archives(now=time.time() + 31 * 86400), [])  # a socket below it
+        (old / "s").unlink()
+        self.assertEqual(len(gd.prune_foreign_archives(now=time.time() + 31 * 86400)), 1)
+        self.assertEqual(list(archive.iterdir()), [])
 
     def test_off_where_no_ci_runner_is_enrolled(self) -> None:
         (gd.HOME / "Library/Caches/cmux/cmux-cua").mkdir(parents=True)
