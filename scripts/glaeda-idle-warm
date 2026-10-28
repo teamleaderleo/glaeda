@@ -555,7 +555,8 @@ def kill_build(passes: int = 3) -> bool:
         except (OSError, subprocess.SubprocessError):
             with contextlib.suppress(OSError):
                 ps.kill()
-            ps.wait()
+            with contextlib.suppress(OSError, subprocess.SubprocessError):  # bounded: the caller escalates
+                ps.wait(timeout=2)
             return False
         if ps.returncode != 0:  # a failed ps lists nothing, which is not an empty group
             return False

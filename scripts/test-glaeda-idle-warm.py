@@ -407,6 +407,12 @@ class RunTest(Base):
                     def broken(*a, **k):
                         raise OSError("read failed")
                     proc.communicate = broken
+                    if mode == "stuck":  # a ps that is never reaped
+                        def never(timeout=None):
+                            if timeout is None:
+                                raise AssertionError("an unbounded wait on ps")
+                            raise warm.subprocess.TimeoutExpired(args, timeout)
+                        proc.wait = never
                     return proc
                 warm.subprocess.Popen = no_ps
             warm._grouped = warm.own_group()
@@ -427,7 +433,7 @@ class RunTest(Base):
 
     @unittest.skipUnless(sys.platform == "darwin", "runs only on macOS")
     def test_a_finished_build_whose_group_it_cannot_list_ends_with_the_catch_up(self) -> None:
-        for mode in ("spawn", "read", "exit"):
+        for mode in ("spawn", "read", "stuck", "exit"):
             with self.subTest(ps=mode):
                 result = self.grouped_build(self.fake_setup() if mode == "spawn" else self.state / ".catch-up" / "cmux",
                                             "100 * 1024 ** 3", "0", no_ps=mode)
