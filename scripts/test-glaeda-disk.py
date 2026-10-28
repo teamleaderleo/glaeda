@@ -7579,21 +7579,94 @@ class LinuxLayoutTest(unittest.TestCase):
         self.assertIn("FileExistsError", gd._write_bundle(*args))
         self.assertEqual((written, written[0].read_bytes()), ([written[0]], first))
 
-    def test_a_mirror_with_uncommitted_work_is_kept_but_ignored_output_goes(self) -> None:
-        unit, clone, _ = self.mirror_unit()
+    def dirty_mirror(self) -> tuple[Path, Path, dict]:
+        """A mirror whose clone has a committed text and binary file, then uncommitted edits, a staged new file,
+        untracked notes, and untracked build output (ignored, a CACHEDIR.TAG tree, node_modules)."""
+        unit, clone, env = self.mirror_unit()
+        self.git(clone, "config", "core.autocrlf", "false")
+        (clone / "tracked.txt").write_text("v1\n")
+        (clone / "bin.dat").write_bytes(bytes(range(256)))
+        (clone / "gone.txt").write_text("deleted later\n")
+        self.git(clone, "add", ".", env=env)
+        self.git(clone, "commit", "-q", "-m", "files", env=env)
+        (clone / "tracked.txt").write_text("v2, edited on a laptop\n")
+        (clone / "bin.dat").write_bytes(bytes(reversed(range(256))))
+        (clone / "gone.txt").unlink()
+        (clone / "staged.txt").write_text("staged\n")
+        self.git(clone, "add", "staged.txt", env=env)
+        (clone / "notes.txt").write_text("untracked notes\n")
+        (clone / "sub").mkdir()
+        (clone / "sub/deep.txt").write_text("deep\n")
         with (clone / ".git/info/exclude").open("a") as f:
             f.write("build/\n")
         (clone / "build").mkdir()
         (clone / "build/out.o").write_text("x")
-        (clone / "notes.txt").write_text("edited on a laptop")
+        (clone / ".cargo-target/release").mkdir(parents=True)
+        (clone / ".cargo-target/CACHEDIR.TAG").write_bytes(gd.CACHEDIR_TAG + b"\n")
+        (clone / ".cargo-target/release/big.rlib").write_bytes(b"\0" * 4096)
+        (clone / "node_modules").mkdir()
+        (clone / "node_modules/x.js").write_text("x")
+        return unit, clone, env
+
+    def test_a_mirrors_uncommitted_work_is_archived_then_it_goes_and_the_archive_restores_it(self) -> None:
+        unit, clone, env = self.dirty_mirror()
+        want = {n: (clone / n).read_bytes() for n in ("tracked.txt", "bin.dat", "staged.txt", "notes.txt",
+                                                      "sub/deep.txt")}
+        gd.RUN.pop("bundle_failed", None)
+        rec, err = self.apply_mirror(unit)
+        self.assertEqual(rec["outcome"], "reclaimed", rec["reasons"])
+        self.assertFalse(unit.exists())
+        self.assertNotIn("ALERT", err)
+        archive = self.home / "archive/glaeda-disk"
+        patches, tars = sorted(archive.glob("*.patch")), sorted(archive.glob("*.tar.gz"))
+        self.assertEqual((len(patches), len(tars)), (1, 1))
+        manifest = [json.loads(ln) for ln in (archive / "manifest.jsonl").read_text().splitlines()]
+        listed = {e["name"]: e for e in manifest}
+        for f in (*patches, *tars):
+            self.assertRegex(f.name, gd.MIRROR_BUNDLE_RE)
+            self.assertEqual(listed[f.name]["sha256"], gd._sha256(f))
+        import tarfile
+        with tarfile.open(tars[0]) as t:
+            self.assertEqual(sorted(t.getnames()), ["notes.txt", "sub/deep.txt"])  # never build output
+        # restore: the bundled commit, then the patch, then the untracked files
+        restored = self.home / "restored"
+        self.git(self.home, "clone", "-q", str(self.home / "srv"), str(restored), env=env)
+        bundle = next(archive.glob("*.bundle"))
+        self.git(restored, "fetch", "-q", str(bundle), "refs/heads/main:refs/heads/restored", env=env)
+        self.git(restored, "checkout", "-q", "restored", env=env)
+        self.assertEqual(self.git(restored, "rev-parse", "HEAD"), listed[patches[0].name]["head"])
+        self.git(restored, "apply", "--binary", str(patches[0]), env=env)
+        subprocess.run(["tar", "-xzf", str(tars[0]), "-C", str(restored)], check=True)
+        self.assertEqual({n: (restored / n).read_bytes() for n in want}, want)
+        self.assertFalse((restored / "gone.txt").exists())
+        # and they expire with the bundles
+        self.assertEqual(gd.prune_mirror_archive(today="9999-12-31"), 3)
+        self.assertEqual(sorted(p.name for p in archive.iterdir()), ["manifest.jsonl"])
+
+    def test_uncommitted_work_no_patch_can_hold_keeps_the_mirror(self) -> None:
+        unit, clone, env = self.dirty_mirror()
+        self.git(clone, "update-index", "--assume-unchanged", "tracked.txt", env=env)
         gd.RUN.pop("bundle_failed", None)
         rec, err = self.apply_mirror(unit)
         self.assertEqual((rec["outcome"], rec["verdict"]), ("blocked:uncommitted", "blocked"))
+        self.assertTrue(any("hidden from status" in r for r in rec["reasons"]))
         self.assertTrue((clone / "notes.txt").exists())
         self.assertNotIn("bundle_failed", gd.RUN)
-        (clone / "notes.txt").unlink()
-        rec, _ = self.apply_mirror(unit)
-        self.assertEqual(rec["outcome"], "reclaimed")
+        self.assertNotIn("ALERT", err)
+
+    def test_uncommitted_work_that_changes_after_its_archive_keeps_the_mirror(self) -> None:
+        unit, clone, _ = self.dirty_mirror()
+        real = gd.archive_work_tree
+
+        def then_edit(*args):
+            out = real(*args)
+            (clone / "tracked.txt").write_text("v3, edited while it was archived\n")  # same status line
+            return out
+        with mock.patch.object(gd, "archive_work_tree", side_effect=then_edit):
+            rec, _ = self.apply_mirror(unit)
+        self.assertEqual(rec["outcome"], "changed:in-use")
+        self.assertIn("its uncommitted work changed while it was archived", rec["reasons"])
+        self.assertEqual((clone / "tracked.txt").read_text(), "v3, edited while it was archived\n")
 
     def test_a_checkout_in_ignored_files_has_its_local_refs_bundled(self) -> None:
         unit, clone, env = self.mirror_unit()
@@ -7670,20 +7743,22 @@ class LinuxLayoutTest(unittest.TestCase):
         self.assertTrue(any("repositories changed" in r for r in rec["reasons"]))
         self.assertTrue((unit / "slot-2/.git").is_dir())
 
-    def test_a_tree_dirtied_before_its_snapshot_is_kept(self) -> None:
+    def test_a_tree_dirtied_before_its_snapshot_has_that_work_archived(self) -> None:
         unit, clone, _ = self.mirror_unit()
         real = gd.mirror_git_snapshot
         calls = []
 
         def dirtying(gitdirs, trees):
-            if not calls:  # after the clean check, before the baseline: the baseline itself is dirty
+            if not calls:  # after the scan, before the baseline: the baseline and the archive both hold it
                 (clone / "notes.txt").write_text("edited")
             calls.append(1)
             return real(gitdirs, trees)
         with mock.patch.object(gd, "mirror_git_snapshot", dirtying):
             rec, _ = self.apply_mirror(unit)
-        self.assertEqual(rec["outcome"], "changed:in-use")
-        self.assertTrue((clone / "notes.txt").exists())
+        self.assertEqual(rec["outcome"], "reclaimed", rec["reasons"])
+        import tarfile
+        with tarfile.open(next((self.home / "archive/glaeda-disk").glob("*.tar.gz"))) as t:
+            self.assertEqual(t.extractfile("notes.txt").read(), b"edited")
 
     def test_a_mirrors_owner_and_references_are_read_again_after_bundling(self) -> None:
         unit, _, _ = self.mirror_unit()
@@ -8767,7 +8842,41 @@ class HygieneMirrorTest(unittest.TestCase):
         # and a mount that appears while the work is bundled keeps it at mirror_moved
         with mock.patch.object(gd, "process_evidence", return_value=([], "")), \
                 mock.patch.object(gd, "mount_below", return_value="another filesystem is mounted below it (x)"):
-            self.assertIn("another filesystem", gd.mirror_moved(fam, tree, ([], [], [], {}, None)))
+            self.assertIn("another filesystem", gd.mirror_moved(fam, tree, ([], [], [], {}, None, {})))
+
+    def test_other_archives_expire_30_days_after_their_newest_change_and_never_sooner(self) -> None:
+        archive = gd.HOME / "archive"
+        manual = archive / "cnx-wg-aziz-20261027"
+        manual.mkdir(parents=True)
+        (manual / "uncommitted.patch").write_text("diff")
+        (manual / "head.bundle").write_bytes(b"bundle")
+        (archive / "loose.tar.gz").write_bytes(b"x")
+        fresh = archive / "fresh"
+        (fresh / "deep").mkdir(parents=True)
+        (fresh / "deep/new.txt").write_text("touched two days from now")
+        later = time.time() + 2 * 86400
+        os.utime(fresh / "deep/new.txt", (later, later))
+        (archive / "glaeda-disk").mkdir()
+        (archive / "glaeda-disk/kept.bundle").write_bytes(b"listed or not, the manifest decides")
+        outside = gd.HOME / "elsewhere"
+        outside.mkdir()
+        (archive / "link").symlink_to(outside)
+        held = archive / "held"
+        held.mkdir()
+        locked = archive / "locked"
+        (locked / "inner").mkdir(parents=True)
+        everything = sorted(p.name for p in archive.iterdir())
+        self.assertEqual(gd.prune_foreign_archives(now=time.time() + 29 * 86400), [])
+        self.assertEqual(sorted(p.name for p in archive.iterdir()), everything)
+        os.chmod(locked / "inner", 0)  # unreadable: kept, whatever its age
+        try:
+            gone = gd.prune_foreign_archives(now=time.time() + 31 * 86400, in_use=lambda p: p == held)
+        finally:
+            os.chmod(locked / "inner", 0o755)
+        self.assertEqual(sorted(Path(p).name for p in gone), ["cnx-wg-aziz-20261027", "loose.tar.gz"])
+        self.assertEqual(sorted(p.name for p in archive.iterdir()),
+                         ["fresh", "glaeda-disk", "held", "link", "locked"])
+        self.assertTrue((archive / "glaeda-disk/kept.bundle").exists() and outside.is_dir())
 
     def test_off_where_no_ci_runner_is_enrolled(self) -> None:
         (gd.HOME / "Library/Caches/cmux/cmux-cua").mkdir(parents=True)
