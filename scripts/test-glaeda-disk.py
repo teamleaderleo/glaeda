@@ -9203,6 +9203,186 @@ class HygieneMirrorTest(unittest.TestCase):
         self.assertEqual(self.survey(fams["fleet-artifacts"])["ios-workspaces"].verdict, "git-checkout")
 
 
+class HomeScratchTest(unittest.TestCase):
+    """Folders lanes leave directly in a CI mini's home go after 12 h idle, unpushed commits bundled first; a process,
+    configuration that names it, and the folders kept by role stay (cmuxs-mac-mini-3, 2026-10-28: 60 GiB of cnx-*,
+    wgmedia-swift and smooth-tabs* trees idle 1-14 days that no family listed)."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.home = Path(os.path.realpath(self.tmp.name))
+        self.saved = (gd.HOME, gd.FLEET_ROOT, gd.DARWIN, gd.ROLE)
+        gd.HOME, gd.FLEET_ROOT, gd.DARWIN, gd.ROLE = self.home, self.home / ".shared-fleet", True, "fleet-mini"
+        gd._DISCOVERED.clear()
+        self.env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+                    "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
+        self.daemons = mock.patch.object(gd, "home_scratch_reference_files", wraps=self._reference_files)
+        self.daemons.start()
+
+    def tearDown(self) -> None:
+        self.daemons.stop()
+        gd.HOME, gd.FLEET_ROOT, gd.DARWIN, gd.ROLE = self.saved
+        gd._DISCOVERED.clear()
+        self.tmp.cleanup()
+
+    def _reference_files(self) -> list[Path]:
+        """The real list, minus the suite host's own /Library/LaunchDaemons."""
+        with mock.patch.object(gd.Path, "glob", lambda p, pat: [] if str(p) == "/Library/LaunchDaemons"
+                               else _real_glob(p, pat)):
+            return _real_home_scratch_reference_files()
+
+    def age(self, tree: Path, hours: float = 26) -> None:
+        t = time.time() - hours * 3600
+        for dirpath, dirnames, filenames in os.walk(tree):
+            for n in dirnames + filenames:
+                os.utime(os.path.join(dirpath, n), (t, t), follow_symlinks=False)
+        os.utime(tree, (t, t))
+
+    def tree(self, name: str, git: bool = False, hours: float = 26) -> Path:
+        tree = self.home / name
+        tree.mkdir(parents=True)
+        (tree / "evidence.bin").write_bytes(b"e" * 4096)
+        if git:
+            subprocess.run(["git", "init", "-q", str(tree / "src")], check=True, env=self.env)
+            (tree / "src/f").write_text("x")
+            subprocess.run(["git", "-C", str(tree / "src"), "add", "f"], check=True, env=self.env)
+            subprocess.run(["git", "-C", str(tree / "src"), "commit", "-qm", "local only"], check=True, env=self.env)
+        self.age(tree, hours)
+        return tree
+
+    def family(self, runners: bool = True) -> gd.Family | None:
+        with mock.patch.object(gd, "enrolled_runners", return_value=[self.home / "actions-runner-glaeda"] if runners
+                               else []):
+            return next((f for f in gd.default_families() if f.id == gd.HOME_SCRATCH_FAMILY), None)
+
+    def survey(self, fam: gd.Family, cmds: str = "", opened: list[str] | None = None) -> dict[str, gd.Item]:
+        with mock.patch.object(gd, "process_evidence", return_value=(opened or [], cmds)):
+            return {Path(i.path).name: i for i in gd.survey([fam], 24, 0)}
+
+    def apply(self, fam: gd.Family, item: gd.Item, cmds: str = "") -> str:
+        receipt = self.home / ".receipt.jsonl"
+        with contextlib.redirect_stdout(io.StringIO()), \
+                mock.patch.object(gd, "process_evidence", return_value=([], cmds)):
+            gd.apply([item], {fam.id: fam}, receipt, None, 24)
+        return receipt.read_text() if receipt.exists() else ""
+
+    def test_only_a_ci_mini_with_enrolled_runners_has_the_family(self) -> None:
+        self.tree("cnx-redial")
+        self.assertIsNotNone(self.family())
+        self.assertIsNone(self.family(runners=False))
+        gd.ROLE = "devbox"
+        with mock.patch.object(gd, "enrolled_runners", return_value=[self.home / "actions-runner-glaeda"]):
+            self.assertFalse(any(f.id == gd.HOME_SCRATCH_FAMILY for f in gd.default_families("devbox")))
+
+    def test_an_idle_evidence_tree_goes_and_a_fresh_one_stays(self) -> None:
+        old = self.tree("cnx-tv-evidence-20261019")
+        self.tree("smooth-tabs", hours=2)
+        fam = self.family()
+        items = self.survey(fam)
+        self.assertEqual(items["cnx-tv-evidence-20261019"].verdict, "reclaimable",
+                         items["cnx-tv-evidence-20261019"].reasons)
+        self.assertEqual(items["smooth-tabs"].verdict, "recent")
+        self.apply(fam, items["cnx-tv-evidence-20261019"])
+        self.assertFalse(old.exists())
+
+    def test_an_idle_clone_with_unpushed_commits_is_bundled_then_removed(self) -> None:
+        tree = self.tree("wgmedia-swift", git=True)
+        fam = self.family()
+        item = self.survey(fam)["wgmedia-swift"]
+        self.assertEqual(item.verdict, "reclaimable", item.reasons)
+        self.assertTrue(any("mirrors" in r for r in item.reasons))
+        self.apply(fam, item)
+        self.assertFalse(tree.exists())
+        bundles = sorted((self.home / "archive/glaeda-disk").glob("*.bundle"))
+        self.assertEqual(len(bundles), 1)
+
+    def test_kept_by_role_never_listed(self) -> None:
+        for name in (*gd.HOME_SCRATCH_KEEP, ".cache", ".rustup", "actions-runner-glaeda-3"):
+            self.tree(name)
+        items = self.survey(self.family())
+        self.assertEqual(items, {})
+
+    def test_a_process_in_it_keeps_it_at_survey_and_at_apply(self) -> None:
+        tree = self.tree("cnx-ios-e2e")
+        fam = self.family()
+        self.assertEqual(self.survey(fam, opened=[os.fspath(tree)])["cnx-ios-e2e"].verdict, "in-use")
+        item = self.survey(fam)["cnx-ios-e2e"]
+        receipt = self.apply(fam, item, cmds=f"python3 {tree}/run.py\n")
+        self.assertTrue(tree.exists())
+        self.assertIn("changed:in-use", receipt)
+
+    def test_configuration_that_names_it_keeps_it(self) -> None:
+        agents = self.home / "Library/LaunchAgents"
+        agents.mkdir(parents=True)
+        self.tree("perf-worker")
+        with (agents / "ai.manaflow.perf.plist").open("wb") as f:
+            plistlib.dump({"Label": "ai.manaflow.perf", "ProgramArguments": ["/usr/bin/python3",
+                           f"{self.home}/perf-worker/worker.py"]}, f, fmt=plistlib.FMT_BINARY)
+        self.tree("cnx-ios-builds")
+        hooks = self.home / "actions-runner-glaeda-ios-internal/glaeda-hooks"
+        hooks.mkdir(parents=True)
+        (hooks / "dedicated-admit.sh").write_text("export CNX_BUILDS_ROOT=~/cnx-ios-builds\n")
+        self.tree("cnx-tool")
+        (self.home / ".local/bin").mkdir(parents=True)
+        (self.home / ".local/bin/cnx-tool").symlink_to(self.home / "cnx-tool/evidence.bin")
+        self.tree("cnx-tooling-old")  # a longer name that starts with a named one is not named
+        items = self.survey(self.family())
+        for name in ("perf-worker", "cnx-ios-builds", "cnx-tool"):
+            self.assertEqual(items[name].verdict, "in-use", (name, items[name].reasons))
+            self.assertTrue(any(r.startswith("named by") for r in items[name].reasons), items[name].reasons)
+        self.assertEqual(items["cnx-tooling-old"].verdict, "reclaimable", items["cnx-tooling-old"].reasons)
+
+    def test_a_mention_that_appears_before_the_delete_keeps_it(self) -> None:
+        tree = self.tree("cnx-hybrid")
+        fam = self.family()
+        item = self.survey(fam)["cnx-hybrid"]
+        self.assertEqual(item.verdict, "reclaimable")
+        (self.home / ".zshrc").write_text(f'export PATH="$HOME/cnx-hybrid/bin:$PATH"\n')
+        receipt = self.apply(fam, item)
+        self.assertTrue(tree.exists())
+        self.assertIn("changed:referenced", receipt)
+
+    def retired(self, runners: bool = True) -> gd.Family | None:
+        with mock.patch.object(gd, "enrolled_runners", return_value=[self.home / "actions-runner-glaeda"] if runners
+                               else []):
+            return next((f for f in gd.default_families() if f.id == gd.RETIRED_RUNNER_FAMILY), None)
+
+    def test_a_hand_made_runner_nothing_runs_goes_and_glaedas_own_never_do(self) -> None:
+        old = self.tree("actions-runner-ios-internal")
+        (old / ".runner").write_text('{"agentName": "cmux9s-mac-mini-ios-internal", "workFolder": "_work"}')
+        (old / "run.sh").write_text(f"cd {old} && ./bin/Runner.Listener run\n")  # its own scripts never keep it
+        self.age(old)
+        self.tree("actions-runner-glaeda-ios-internal")
+        self.tree("actions-runner-glaeda-3")
+        fam = self.retired()
+        self.assertIsNone(self.retired(runners=False))
+        items = self.survey(fam)
+        self.assertEqual(set(items), {"actions-runner-ios-internal"})
+        self.assertEqual(items["actions-runner-ios-internal"].verdict, "reclaimable",
+                         items["actions-runner-ios-internal"].reasons)
+        self.assertNotIn("actions-runner-ios-internal", self.survey(self.family()))  # not home-scratch's too
+        self.apply(fam, items["actions-runner-ios-internal"])
+        self.assertFalse(old.exists())
+
+    def test_a_hand_made_runner_a_plist_or_listener_names_stays(self) -> None:
+        old = self.tree("actions-runner-nightly-next")
+        agents = self.home / "Library/LaunchAgents"
+        agents.mkdir(parents=True)
+        with (agents / "ai.manaflow.nightly-builder.runner.plist").open("wb") as f:
+            plistlib.dump({"Label": "ai.manaflow.nightly-builder.runner",
+                           "ProgramArguments": [f"{old}/run.sh"]}, f)
+        fam = self.retired()
+        self.assertEqual(self.survey(fam)["actions-runner-nightly-next"].verdict, "in-use")
+        (agents / "ai.manaflow.nightly-builder.runner.plist").unlink()
+        listener = f"{old}/bin/Runner.Listener run --startuptype service\n"
+        self.assertEqual(self.survey(fam, cmds=listener)["actions-runner-nightly-next"].verdict, "in-use")
+        self.assertEqual(self.survey(fam)["actions-runner-nightly-next"].verdict, "reclaimable")
+
+
+_real_glob = Path.glob
+_real_home_scratch_reference_files = gd.home_scratch_reference_files
+
+
 class NightlyNextFallbackTest(unittest.TestCase):
     """~/Library/Caches/cmux-nightly-next: the dedicated builder's tree is kept by role, a pool runner's goes once idle
     DEFAULT_AGE_HOURS, and nothing changes until disk-policy names the routing label."""

@@ -107,6 +107,16 @@ on the clone with the most packs once it has ten, at most one per idle sweep or 
 eviction lock is released, when no lock, missing work tree, process, command or hour-old git activity touches
 it or its linked work trees. Only a home with enrolled runners. A slow gc runs on; it is never killed.
 
+The folders lanes leave directly in a fleet mini's home (home-scratch: ~/cnx-*-evidence, an ad-hoc clone, a build
+root), on a mini with enrolled runners only, follow the same 12 h rule: idle 12 h, unpushed commits are bundled and
+uncommitted work archived into ~/archive, then the tree goes, on every pressure pass and idle sweep. A process, an
+open file, a running command, a socket, a linked worktree elsewhere, or a mention in a launch agent or daemon, a
+shell or agent config, a runner's scripts or glaeda hooks, or a ~/.local/bin symlink keeps it. Dot folders, the
+runners, the macOS folders, ~/Projects, ~/archive, ~/cmux, ~/go and the tools services run from (HOME_SCRATCH_KEEP)
+are never its items. A runner directory glaeda did not install (retired-runner: not actions-runner-glaeda*) that no
+launchd job, process or configuration names goes the same way once idle 12 h: the hand-made runner its glaeda
+install replaced.
+
 The runner-account profile is intentionally narrower than the normal user profile:
 it covers only DerivedData, cmux reload/GhosttyKit caches, and CUA recordings/frame
 caches, with a DEFAULT_AGE_HOURS (12 h) minimum idle age. Git index refreshes are ignored for that
@@ -457,7 +467,12 @@ def _reference_spellings(path: Path) -> tuple[str, ...]:
 
 
 def _reference_mentions(text: str, path: Path) -> bool:
-    for spelling in _reference_spellings(path):
+    return _mentions_any(text, _reference_spellings(path))
+
+
+def _mentions_any(text: str, spellings) -> bool:
+    """One of spellings appears in text as a whole path (bounded by quotes, separators or a further path part)."""
+    for spelling in spellings:
         start = 0
         while (index := text.find(spelling, start)) >= 0:
             before = text[index - 1] if index else ""
@@ -3616,6 +3631,78 @@ def hygiene_mirror_host() -> bool:
     return DARWIN and ROLE == "fleet-mini" and bool(enrolled_runners())
 
 
+# The same 12 h rule for the folders lanes leave directly in a CI mini's home (Leo, 2026-10-26: "Just throw it away.
+# Just delete more stuff, more often, more often. Fix glaeda."; 2026-10-27: "how can <100gb be free on >256gb minis
+# all the time"). No family listed them, so they sat outside every count ("unclassified") and grew for weeks:
+# cmuxs-mac-mini-3, 2026-10-28, 60 GiB of cnx-* evidence, build and e2e trees, wgmedia-swift and smooth-tabs*, idle
+# 1-14 days, with 58 GiB free of 460. Past 12 h idle a tree goes the mirror way: unpushed commits bundled and
+# uncommitted work archived into ~/archive first; a process, an open file, a running command, a socket or a mention
+# in launchd, shell or runner configuration keeps it. The folders below stay by role, whatever their age.
+HOME_SCRATCH_FAMILY = "home-scratch"
+HOME_SCRATCH_KEEP = (
+    "Library", "Applications", "Desktop", "Documents", "Downloads", "Movies", "Music", "Pictures", "Public",
+    "Projects",  # the projects and worktrees families
+    "archive",  # glaeda-disk's own archives and anything else under ~/archive (30-day expiry)
+    "cmux",  # the home clone: home-clone-gc keeps it packed
+    "go",  # home-caches takes its module cache
+    "glaeda", "vmpause", "nightly-builder", "ios-internal-builder",  # tools launchd and runner admissions run
+    "cmux-browser-fleet", "depot_tools",  # NEVER_DELETE too
+)
+HOME_SCRATCH_KEEP_PREFIXES = (".", "actions-runner")  # dot folders: tools' own state; the runners and their work
+# A runner directory glaeda did not install and nothing runs any more: a hand-made runner replaced by its glaeda
+# install (Leo, 2026-10-27: "why the fuck not manage it with glaeda????????"). Its LaunchAgents went, its directory
+# stayed: cmux9s ~/actions-runner-ios-internal 9.5 GiB, cmux22 ~/actions-runner-nightly-next 16 GiB and cmux23
+# ~/actions-runner-ios-internal 9.3 GiB, 2026-10-28. Same 12 h rule; a plist, a running Listener or any other mention
+# keeps it, and glaeda's own runner directories (actions-runner-glaeda*) are never its items.
+RETIRED_RUNNER_FAMILY = "retired-runner"
+HOME_SCRATCH_FAMILIES = (HOME_SCRATCH_FAMILY, RETIRED_RUNNER_FAMILY)
+
+
+def home_scratch_reference_files() -> list[Path]:
+    """Configuration that can name a home folder a service needs: the user's shell, agent and launch agent files,
+    the system launch daemons, and each runner's own scripts, env and glaeda hooks (a dedicated runner's admission
+    names its builder folder there, e.g. CNX_BUILDS_ROOT)."""
+    files = [*_reference_files(), *sorted(Path("/Library/LaunchDaemons").glob("*.plist"))]
+    for runner in sorted(HOME.glob("actions-runner*")):
+        if runner.is_symlink() or not runner.is_dir():
+            continue
+        for d in (runner, runner / "glaeda-hooks"):
+            if d.is_symlink() or not d.is_dir():
+                continue
+            files += [f for f in sorted(d.iterdir()) if not f.name.startswith(".credentials")
+                      and (f.suffix in (".sh", ".env", ".path", ".json", "") or f.name in (".env", ".path"))]
+    return [f for f in dict.fromkeys(files) if f.is_file() and not f.is_symlink()]
+
+
+def home_scratch_referenced(path: Path) -> str:
+    """Why a home-scratch folder stays because configuration names it ("" when nothing does): a launchd job, a shell
+    or agent config, a runner script or hook, or a ~/.local/bin symlink into it. Unreadable configuration keeps it."""
+    spellings = (*_reference_spellings(path), f"~/{path.name}", f"$HOME/{path.name}", "${HOME}/" + path.name)
+    try:
+        real = path.resolve()
+        local_bin = HOME / ".local/bin"
+        if local_bin.is_dir():
+            for entry in local_bin.iterdir():
+                if entry.is_symlink() and Path(os.path.realpath(entry)).is_relative_to(real):
+                    return f"named by {entry}"
+    except OSError:
+        return "home folder references unreadable"
+    inside = os.path.realpath(path) + "/"
+    for config in home_scratch_reference_files():
+        if os.path.realpath(config).startswith(inside):
+            continue  # a folder's own scripts (a runner's run.sh, .runner, .env) never keep it
+        try:
+            data = config.read_bytes()
+            if config.suffix == ".plist" or data.startswith(b"bplist"):
+                with contextlib.suppress(ValueError, plistlib.InvalidFileException):
+                    data = json.dumps(plistlib.loads(data), default=str).encode()
+            if _mentions_any(data.decode(errors="ignore"), spellings):
+                return f"named by {config}"
+        except OSError:
+            return "home folder references unreadable"
+    return ""
+
+
 def transcript_candidates(root: Path, archives: bool = False) -> list[Path]:
     """Return regular transcript files without treating the Codex tree as a cache."""
     roots = [root / "archive"] if archives else [root / "sessions", root / "thread_history"]
@@ -3824,6 +3911,18 @@ def default_families(role: str = "fleet-mini") -> list[Family]:
         fams.append(Family("cmux-node-products", Path("/Users/Shared/cmux-build-fleet/node-products"), False,
                            "report only: its owner evicts LRU to a 24 GiB budget",
                            owner="cmux node_product_cache.py", platform="macos"))
+        if mirror_host:
+            fams.append(Family(HOME_SCRATCH_FAMILY, HOME, True, "the lane that left it clones or builds it again",
+                               skip=HOME_SCRATCH_KEEP, skip_prefixes=HOME_SCRATCH_KEEP_PREFIXES, git_disposable=True,
+                               nested_git=True, min_idle_hours=DEFAULT_AGE_HOURS,
+                               mirror_idle_hours=CMUX_JOB_MIRROR_HOURS,
+                               owner="agent lanes and hand-run jobs on the mini", rebuild_minutes=10,
+                               platform="macos"))
+            fams.append(Family(RETIRED_RUNNER_FAMILY, HOME, True, "nothing runs it: glaeda's runner replaced it",
+                               include=("actions-runner",), skip_prefixes=("actions-runner-glaeda",),
+                               git_disposable=True, nested_git=True, min_idle_hours=DEFAULT_AGE_HOURS,
+                               mirror_idle_hours=CMUX_JOB_MIRROR_HOURS, owner="a hand-made GitHub runner",
+                               rebuild_minutes=10, platform="macos"))
     for root in wt_roots:
         fams.append(Family("worktrees", root, False,
                            "run glaeda-worktree-reclaim-all (report only)", platform="shared"))
@@ -6583,6 +6682,8 @@ def mirror_moved(fam: Family, path: Path, recheck: tuple) -> str:
         return "its uncommitted work changed while it was archived"
     if fam.git_disposable and (ref := referenced_main_checkout(path, nested=fam.nested_git)):
         return f"referenced while its git work was bundled: {ref}"
+    if fam.id in HOME_SCRATCH_FAMILIES and (ref := home_scratch_referenced(path)):
+        return f"referenced while its git work was bundled: {ref}"
     if fam.retired_only and not owner_retired(fam):
         return "its owner loaded while its git work was bundled"
     if fam.reference_root is not None and artifact_referenced(path, fresh_artifact_references(fam.reference_root)):
@@ -7306,6 +7407,8 @@ def _survey(families, idle_hours, min_bytes, known, evidence, defer_bulk=False,
             reasons.append(("runner build output" if fam.id == RUNNER_BUILD_FAMILY else "package cache")
                            + ": pressure-only policy")
         if fam.git_disposable and (reference := referenced_main_checkout(path, nested=fam.nested_git)):
+            reasons.append(reference)
+        if fam.id in HOME_SCRATCH_FAMILIES and (reference := home_scratch_referenced(path)):
             reasons.append(reference)
         policy_note = ""
         if ROLE == "devbox" and (fam.id == "xcode-derived-data" or
@@ -9062,8 +9165,9 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
                 or (i.family == CANONICAL_ADMISSION and canonical_root_held(p))
                 or (tmp_canonical_root(fam, p) and canonical_root_held(p, whole_root=True))):
             outcome = "changed:in-use"
-        elif (families[i.family].git_disposable
-              and referenced_main_checkout(p, nested=families[i.family].nested_git)):
+        elif ((families[i.family].git_disposable
+               and referenced_main_checkout(p, nested=families[i.family].nested_git))
+              or (i.family in HOME_SCRATCH_FAMILIES and home_scratch_referenced(p))):
             outcome = "changed:referenced"
         elif not item_due(fam, (idle_now := (time.time() - item_mtime(fam, p)) / 3600),
                           item_window(fam, p, idle_hours, archived))[0]:
