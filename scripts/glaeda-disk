@@ -3674,7 +3674,9 @@ def default_families(role: str = "fleet-mini") -> list[Family]:
         # devbox, where a tag may be a developer's live test session.
         *([] if role == "devbox" else [
             Family(f"cmux-debug-app-data-{app}", HOME / "Library/Application Support" / app, True,
-                   "the next tagged DEV build recreates it", include=(CMUX_DEBUG_APP_PREFIX,),
+                   # an installed app copy is too deep for the git search to finish and holds no checkout, so it
+                   # is build output (as code-sign-clones); the process and open-file checks still keep a live tag
+                   "the next tagged DEV build recreates it", include=(CMUX_DEBUG_APP_PREFIX,), build_output=True,
                    min_idle_hours=DEFAULT_AGE_HOURS, owner="cmux tagged DEV builds (reload.sh --tag, CI capture)",
                    rebuild_minutes=2, platform="macos")
             for app in ("cmux-next", "cmux")]),

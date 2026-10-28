@@ -1837,6 +1837,19 @@ class GlaedaDiskTest(unittest.TestCase):
                 self.assertEqual([p.name for p in gd.candidates(fam)], ["com.cmuxterm.app.debug.pcrim3.capslot1"])
             devbox = {f.id for f in gd.default_families("devbox")}
             self.assertFalse({i for i in devbox if i.startswith("cmux-debug-app-data")}, "never on a devbox")
+            # the survey verdict on a realistic tree: an installed app copy far deeper than the git search goes
+            fam = fams["cmux-debug-app-data-cmux-next"]
+            tag = fam.root / "com.cmuxterm.app.debug.pcrim3.capslot1"
+            deep = tag / "versions/108/cmux DEV pcrim3.app/Contents/Frameworks/X.framework/Versions/A/Resources/r"
+            deep.mkdir(parents=True)
+            (deep / "blob").write_bytes(b"x" * (2 << 20))
+            stamp = time.time() - (gd.DEFAULT_AGE_HOURS + 6) * 3600
+            for d, _, files in list(os.walk(tag))[::-1]:
+                for f in files:
+                    os.utime(Path(d) / f, (stamp, stamp))
+                os.utime(d, (stamp, stamp))
+            verdicts = {Path(i.path).name: i.verdict for i in gd.survey([fam], 6, 0)}
+            self.assertEqual(verdicts, {"com.cmuxterm.app.debug.pcrim3.capslot1": "reclaimable"})
         finally:
             gd.HOME, gd.FLEET_ROOT, gd.DARWIN = saved
 
