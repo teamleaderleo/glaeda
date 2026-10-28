@@ -6503,7 +6503,7 @@ class GateTest(unittest.TestCase):
         self.assertIsNone(gates[1].full(), "a claim let go is room again")
         self.assertIsNotNone(gates[2].full())
         # a claim past the listener's first poll (no job queued for its label) keeps nothing from the others
-        stale = time.time() - hook.LISTEN_CLAIM_FRESH_S - 1
+        stale = time.time() - hook.GATE_FIRST_POLL_S - 1
         os.utime(gates[1].claim_at, (stale, stale))
         self.assertEqual(hook.listen_claims(capacity), 0)
         self.assertIsNone(gates[2].full())
@@ -6548,10 +6548,23 @@ class GateTest(unittest.TestCase):
 
     def test_job_completed_leaves_the_job_end_marker_beside_the_hook(self) -> None:
         source = HOOK.read_text()
-        self.assertIn("(Path(__file__).resolve().parent / JOB_ENDING).touch()", source)
+        self.assertIn("(hook_dir / JOB_ENDING).touch()", source)
         self.assertLess(source.index("print(f\"{PREFIX}: {release_host_lock(args.state_dir)}\""),
-                        source.index("(Path(__file__).resolve().parent / JOB_ENDING).touch()"),
+                        source.index("(hook_dir / JOB_ENDING).touch()"),
                         "the job's units are released before the gate is told to look")
+
+    def test_a_job_that_ended_between_polls_still_gets_its_look(self) -> None:
+        capacity = self.units(10)
+        gate = hook.Gate(self.side_runner(3), os.fspath(self.lock), os.fspath(self.tmp / "none.json"), self.state,
+                         waiters=False, capacity_dir=capacity)
+        gate.child = mock.Mock(poll=mock.Mock(return_value=None), pid=0)
+        gate.job_end_marker().touch()  # the Worker exited before any poll saw the runner busy
+        stops: list[str] = []
+        with mock.patch.object(gate, "busy", return_value=False), mock.patch.object(gate, "reload"), \
+                mock.patch.object(gate, "stop", side_effect=lambda why: stops.append(why) or True):
+            self.assertIsNone(gate.step())
+        self.assertEqual(stops, ["only 4 of 14 capacity units on this mini are free; its next job needs 5"])
+        self.assertFalse(gate.job_end_marker().exists())
 
     def test_a_plain_side_runner_listens_only_with_room_for_the_side_labels_costliest_job(self) -> None:
         # The side label's jobs as the hook costs them: the fit follows JOB_CORES, never a copy of it.

@@ -4416,14 +4416,13 @@ def side_fit_units(scope: RunnerScope) -> int:
 # admission takes real units and never waits for a claim. A claim is let go once the gate holds its listener off,
 # and LISTEN_CLAIM_HANDOFF_S into the runner's own job, by when the job's admission holds its units or waits for
 # them (CAPACITY_WAIT, whose marker holds the other gates anyway). A claim counts for the others only while it is
-# fresh (LISTEN_CLAIM_FRESH_S, the listener's first poll, GATE_FIRST_POLL_S): a queued job reaches a new listener on
+# fresh (the listener's first poll, GATE_FIRST_POLL_S): a queued job reaches a new listener on
 # that poll, and a listener idle past it has no job waiting for its label, so its claim must not keep the mini's other
 # labels from listening (a std mini's two idle root listeners would otherwise hold 10 of 14 units from the side label).
 LISTEN_LOCK = "listen.lock"
 LISTEN_CLAIM_PREFIX = "listen."
 LISTEN_CLAIM_SUFFIX = ".claim"
 LISTEN_CLAIM_HANDOFF_S = 30.0
-LISTEN_CLAIM_FRESH_S = GATE_FIRST_POLL_S
 # JOB_ENDING: job-completed, which releases the job's units, leaves this marker in the runner's glaeda-hooks/; the
 # gate then watches the job's Runner.Worker closely and, the moment it exits, looks at the mini again and stops the
 # listener before it takes the next job when that job would not fit (Gate.job_end). Without it the listener took the
@@ -4463,7 +4462,7 @@ def listen_claims(capacity_dir: Path, own: Path | None = None) -> int:
             continue
         units = path.name[:-len(LISTEN_CLAIM_SUFFIX)].rsplit(".", 1)[-1]
         try:
-            fresh = time.time() - path.stat().st_mtime < LISTEN_CLAIM_FRESH_S
+            fresh = time.time() - path.stat().st_mtime < GATE_FIRST_POLL_S
         except OSError:
             continue
         if fresh and units.isdigit() and not probe(path):
@@ -5741,9 +5740,9 @@ class Gate:
         with contextlib.suppress(OSError):
             fd = lock_file(path, fcntl.LOCK_EX)
             if fd is not None:
+                self.claim_fd, self.claim_at = fd, path  # stored first: unclaim() always closes it
                 os.set_inheritable(fd, False)
-                os.utime(path)  # fresh from now (LISTEN_CLAIM_FRESH_S)
-                self.claim_fd, self.claim_at = fd, path
+                os.utime(path)  # fresh from now (GATE_FIRST_POLL_S)
 
     def unclaim(self) -> None:
         if self.claim_fd is not None:
@@ -6018,6 +6017,7 @@ class Gate:
                         self.kill()
                 return None
             if self.terminating:
+                self.unclaim()
                 self.stop("the runner agent is stopping")
                 return None
             if (self.watching or self.job_waited or self.job_ending) and not self.busy():
@@ -6064,10 +6064,12 @@ class Gate:
                     self.reserve(True)
                 return None
             self.busy_since = None
-            if self.job_ending or self.job_end_marker().exists():  # a marker the job's own end did not consume
-                self.job_ending = False
-                with contextlib.suppress(OSError):
-                    self.job_end_marker().unlink()
+            if self.job_ending or self.job_end_marker().exists():
+                # a job that ended between two polls, before the gate saw its marker: the same look (job_end)
+                if ending := self.job_end():
+                    self.unclaim()
+                    self.stop(ending)
+                    return None
             why = self.claimed()
             if self.reserves(why):
                 self.reserve(True)
@@ -8279,8 +8281,10 @@ def main(argv: list[str] | None = None) -> int:
         print(f"{PREFIX}: {release_host_lock(args.state_dir)}", flush=True)
     skip_disk = False
     if args.phase == "job-completed":
-        with contextlib.suppress(OSError):  # the job's units are back: the gate looks again as its Worker exits
-            (Path(__file__).resolve().parent / JOB_ENDING).touch()
+        hook_dir = Path(__file__).resolve().parent
+        if hook_dir.name == "glaeda-hooks":  # a runner's install, never a source tree's copy
+            with contextlib.suppress(OSError):  # the job's units are back: the gate looks again as its Worker exits
+                (hook_dir / JOB_ENDING).touch()
         current_worker = runner_worker_pid()
         for note in cleanup_leaked_test_apps({current_worker} if current_worker else set()):
             print(f"{PREFIX}: {note}", flush=True)
