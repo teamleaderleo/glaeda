@@ -225,6 +225,13 @@ print("registered with token " + token)  # a leaky runner must still not leak it
 '''
 
 
+def write_hook(runner: Path, text: str) -> None:
+    """A runner's job-started hook script, as glaeda-cmux-runner writes it (runner_scope reads it)."""
+    script = runner / hook.RUNNER_HOOK_SCRIPT
+    script.parent.mkdir(parents=True, exist_ok=True)
+    script.write_text(text)
+
+
 def make_executable(path: Path, text: str) -> Path:
     path.write_text(text)
     path.chmod(0o755)
@@ -1017,6 +1024,83 @@ class HookTest(unittest.TestCase):
                                env={hook.DISK_JOB_PEAK_ENV: "10000"})
         self.assertEqual(result.returncode, 1, result.stdout)
         self.assertEqual(marker.read_text(), "--pressure --apply --top 0")
+
+    def test_a_nightly_job_short_of_disk_takes_idle_runners_work_then_is_admitted(self) -> None:
+        """NIGHTLY_DISK_RESERVE, the 2026-10-28 00:04Z refusal: the dedicated nightly builder's job found 20 GiB free
+        under its 30 GiB floor and was refused. It now holds every other job off the mini while it frees space
+        (its nightly waiter marker), removes what idle PR runners left in their _work first, and is admitted once
+        that made room, with no refusal and no glaeda-disk pass needed. A busy runner's work is never touched."""
+        self.fleet()
+        idle = self.dir / "actions-runner-glaeda-1" / "_work" / "cmux" / "cmux"
+        busy = self.dir / "actions-runner-glaeda-2" / "_work" / "cmux" / "cmux"
+        for checkout in (idle, busy):
+            checkout.mkdir(parents=True)
+            (checkout / "big").write_text("x")
+        os.utime(busy.parent.parent, (1, 1))  # least recently used: looked at first, and kept as busy
+        builder = self.dir / "actions-runner-glaeda-nightly-next"
+        builder.mkdir()
+        write_hook(builder, "exec python3 /hook job-started --min-free-gib 30 "
+                                                        "--dedicated-admit /admit.sh\n")
+        capacity = self.dir / "fleet" / "capacity"
+        seen: list[str | None] = []
+
+        def runner_busy(runner: Path) -> bool:
+            seen.append(hook.nightly_disk_waiter(capacity))  # the marker is up while it frees space
+            return runner.name == "actions-runner-glaeda-2"
+        free = lambda _path: 20.0 if idle.exists() else 45.0  # noqa: E731
+        push = event(self.dir, "push", {"repository": CMUX, "ref": "refs/heads/nightly-next"})
+        env = {"PATH": "/usr/bin:/bin", "HOME": os.fspath(self.dir), "GLAEDA_RUNNER_TELEMETRY": "0",
+               "GLAEDA_CANONICAL_ROOT_PARENT": NO_ROOTS, "GLAEDA_FLEET_DIR": os.fspath(self.dir / "fleet"),
+               "GITHUB_EVENT_NAME": "push", "GITHUB_EVENT_PATH": os.fspath(push), "GITHUB_REPOSITORY": "manaflow-ai/cmux"}
+        admit = make_executable(self.dir / "admit.sh", "#!/bin/sh\nexit 0\n")
+        with mock.patch.dict(os.environ, env, clear=True), \
+                mock.patch.object(hook, "free_gib", side_effect=free), \
+                mock.patch.object(hook, "runner_busy_now", side_effect=runner_busy), \
+                mock.patch.object(hook, "evict", return_value="glaeda-disk") as ev, \
+                mock.patch.object(hook, "prejob_evict", return_value=None), \
+                mock.patch.object(hook, "dedicated_admission", return_value=(True, "admitted")), \
+                mock.patch.object(hook, "start_runner_parent_watchdog"), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            code = hook.main(["job-started", "--allowed-repo", "manaflow-ai/cmux", "--dedicated-admit", os.fspath(admit),
+                              "--reservation", os.fspath(self.dir / "fleet" / "reservation.json"),
+                              "--host-lock", os.fspath(self.dir / "fleet" / "host.lock"), "--min-free-gib", "30",
+                              "--capacity-dir", os.fspath(capacity), "--no-telemetry",
+                              "--state-dir", os.fspath(self.dir / "state"), "--watch-pid", str(os.getpid())])
+        text = out.getvalue()
+        self.assertEqual(code, 0, text)
+        self.assertNotIn("refused", text)
+        self.assertIn("removed 1 idle runners' work dir(s), skipped 1 busy runner(s), freed 25.0 GiB", text)
+        ev.assert_not_called()
+        self.assertFalse(idle.exists(), "the idle runner's checkout went")
+        self.assertTrue((busy / "big").exists(), "the busy runner's checkout stays")
+        self.assertTrue(seen and all(seen), "no new job starts on this mini while the nightly job frees disk")
+        self.assertIsNone(hook.nightly_disk_waiter(capacity), "the marker goes with the wait")
+        self.assertEqual(list((self.dir / "actions-runner-glaeda-1" / "_work").glob(f"{hook.IDLE_EVICT_TRASH}*")), [])
+
+    def test_idle_runner_eviction_spares_dedicated_runners_tools_and_symlinks(self) -> None:
+        builder = self.dir / "actions-runner-glaeda-nightly-next"
+        (builder / "_work" / "cmux" / "cmux").mkdir(parents=True)
+        write_hook(builder, "exec python3 /hook job-started --dedicated-admit /a.sh\n")
+        pr = self.dir / "actions-runner-glaeda-3"
+        for keep in ("_tool/node", "_actions/a"):
+            (pr / "_work" / keep).mkdir(parents=True)
+        (pr / "_work" / "cmux" / ".glaeda-state" / "release-derived-data").mkdir(parents=True)
+        (pr / "_work" / "cmux" / ".glaeda-state" / "receipt").mkdir(parents=True)
+        outside = self.dir / "outside"
+        outside.mkdir()
+        (pr / "_work" / "hq").mkdir()
+        (pr / "_work" / "hq" / "hq").symlink_to(outside)
+        (pr / "_work" / f"{hook.IDLE_EVICT_TRASH}1-0").mkdir()
+        with mock.patch.object(hook, "free_gib", return_value=1.0):
+            note = hook.evict_idle_runners(self.dir, os.fspath(self.dir), 30, time.monotonic() + 60,
+                                           busy=lambda _runner: False)
+        self.assertIn("removed 1 idle runners' work dir(s)", note)
+        self.assertTrue((builder / "_work" / "cmux" / "cmux").exists(), "a dedicated builder's work is its own")
+        self.assertTrue((pr / "_work" / "_tool" / "node").exists() and (pr / "_work" / "_actions" / "a").exists())
+        self.assertTrue((pr / "_work" / "cmux" / ".glaeda-state" / "receipt").exists())
+        self.assertFalse((pr / "_work" / "cmux" / ".glaeda-state" / "release-derived-data").exists())
+        self.assertTrue(outside.exists(), "never through a symlink")
+        self.assertFalse((pr / "_work" / f"{hook.IDLE_EVICT_TRASH}1-0").exists(), "a dead hook's trash goes")
 
     def hold_evict_lock(self, seconds: float) -> subprocess.Popen:
         """A glaeda-disk --apply as job-completed's detached pass leaves it: holding evict.lock under this HOME."""
@@ -6844,6 +6928,40 @@ class GateTest(unittest.TestCase):
                 mock.patch.object(gate, "evict_in_background"):
             self.assertEqual(gate.low_disk(), f"disk: {tour - 5:.1f} GiB free, {tour:g} GiB required",
                              "between the fleet floor and the tour's, the session runner is held")
+
+    def test_a_pr_runner_leaves_the_dedicated_builders_disk_reserve_and_yields_to_a_nightly_waiter(self) -> None:
+        """NIGHTLY_DISK_RESERVE: on a mini with a dedicated nightly builder, every other runner stops listening while
+        free disk is under the builder's floor plus one job's measured growth, and while a nightly job waits here for
+        free disk; the builder itself and a mini without one keep the runner's own floor."""
+        write_hook(self.runner, "exec python3 /hook job-started --min-free-gib 30 --capacity-units 10\n")
+        capacity = self.tmp / "capacity"
+        capacity.mkdir()
+        gate = hook.Gate(self.runner, os.fspath(self.lock), os.fspath(self.tmp / "none.json"), self.state,
+                         capacity_dir=capacity)
+        gate.child = mock.Mock(pid=1)  # listening: no resume margin
+        free = {"gib": 50.0}
+        usage = lambda _path: mock.Mock(free=int(free["gib"] * 1024**3))  # noqa: E731
+        with mock.patch.object(hook.shutil, "disk_usage", side_effect=usage), \
+                mock.patch.object(gate, "evict_in_background") as background, \
+                mock.patch.dict(os.environ, {hook.DISK_JOB_PEAK_ENV: "20"}):
+            self.assertIsNone(gate.low_disk(), "no builder on this mini: its own 30 GiB floor")
+            builder = self.tmp / "actions-runner-glaeda-nightly-next"
+            builder.mkdir()
+            write_hook(builder, "exec python3 /hook job-started --min-free-gib 40 "
+                                                            "--dedicated-admit /admit.sh\n")
+            self.assertEqual(gate.low_disk(), "disk: 50.0 GiB free, 60 GiB required (the dedicated builder's 40 GiB "
+                                              "floor + 20 GiB for a job here)")
+            background.assert_called_with(os.path.dirname(os.fspath(self.lock)), 60.0)
+            free["gib"] = 61.0
+            self.assertIsNone(gate.low_disk(), "past the reserve it listens")
+            hook.write_want(capacity / f"{hook.ADMIT_WANT}{os.getpid()}", time.time(), [hook.NIGHTLY_DISK_WANT],
+                            hook.TIER_NIGHTLY)
+            self.assertIn("a nightly job waits here for free disk", gate.low_disk() or "")
+            ours = hook.Gate(builder, os.fspath(self.lock), os.fspath(self.tmp / "none.json"), self.state,
+                             capacity_dir=capacity)
+            ours.child = mock.Mock(pid=1)
+            with mock.patch.object(ours, "evict_in_background"):
+                self.assertIsNone(ours.low_disk(), "the builder is never held by its own reserve or waiter")
 
     def test_a_disk_hold_resumes_above_the_floor_and_logs_a_long_hold_once(self) -> None:
         script = self.runner / hook.RUNNER_HOOK_SCRIPT
