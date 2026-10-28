@@ -301,6 +301,7 @@ DISK_PASS_STALE_S = 26 * 3600  # glaeda-disk's LaunchAgent runs every 15 min; a 
 # a mirror whose last good fetch is older than this is stalled (cmuxterm-hq docs/repo-mirrors.md: fresh within 30).
 GIT_MIRROR_STALE_S = 30 * 60
 GIT_MIRROR_SOURCE = ".config/glaeda/lan-cache/config.json"  # glaeda-git-mirror's SOURCE_CONFIG, under HOME
+GIT_MIRROR_SOURCES = ("direct",)  # glaeda-git-mirror's SOURCES
 DISK_AGENT = "com.teamleaderleo.glaeda.disk-pressure"  # glaeda-mini-setup's 15-minute glaeda-disk pass
 DISK_CACHE = ".cache/glaeda-disk"  # glaeda-disk's sizes.json and accounting.json, under HOME
 RUNNER_HYGIENE = "com.teamleaderleo.glaeda.runner-hygiene"  # glaeda-runner-hygiene's LABEL_PREFIX (.<uid>)
@@ -1028,9 +1029,9 @@ class Mini:
     def git_mirror(self) -> dict[str, Any] | None:
         """glaeda-git-mirror's record (FLEET_DIR/git/cmux.json) and whether a pass is running now, or None where no
         mirror is kept: not macOS, or no mirror source configured (glaeda-git-mirror does nothing there)."""
-        if sys.platform != "darwin" or not isinstance(source := load_json(self.home / GIT_MIRROR_SOURCE).get("source"), str) \
-                or not source:
-            return None
+        config = load_json(self.home / GIT_MIRROR_SOURCE)
+        if sys.platform != "darwin" or config.get("schema") != 1 or config.get("source") not in GIT_MIRROR_SOURCES:
+            return None  # glaeda-git-mirror's source(): it does nothing without one of these
         git_dir = FLEET_DIR / "git"
         running = False
         try:
@@ -1507,9 +1508,13 @@ def check_git_mirror(mini: Mini, now: float) -> list[dict[str, Any]]:
     if fetched is None and (record.get("fetch") or {}).get("ok") is True:
         fetched = record.get("time")  # a record from before fetched_at
     at = utc(fetched)
-    if at is not None and now - at <= GIT_MIRROR_STALE_S:
+    # a repair whose pass is gone (it failed or was killed) left the mirror incomplete, however fresh its tips
+    stopped = record.get("state") == "repairing" and not facts.get("running")
+    if at is not None and now - at <= GIT_MIRROR_STALE_S and not stopped:
         return []
     age = "no good fetch on record" if at is None else f"last good fetch {(now - at) / 60:.0f} min ago"
+    if stopped:
+        age = f"a repair stopped part way, {age}"
     state = f"last pass {record.get('state') or '?'}" + (f": {str(record.get('reason'))[:120]}" if record.get("reason") else "")
     return [finding("git_mirror_stale", "warn",
                     f"{age} (fresh within {GIT_MIRROR_STALE_S // 60}); {state}; "

@@ -642,6 +642,25 @@ class DiskAndLeaks(Base):
         self.assertIn("last good fetch 180 min ago", f["evidence"])
         self.assertEqual(f["auto_fix"], "impossible")
 
+    def test_a_repair_that_stopped_part_way_is_a_finding_however_fresh(self) -> None:
+        self.mini.mirror_facts = {"record": {"time": self.stamp(NOW - 120), "fetched_at": self.stamp(NOW - 120),
+                                             "fetch": {"ok": True}, "state": "repairing"}, "running": False}
+        f = self.run_once()["findings"][0]
+        self.assertEqual(f["id"], "git_mirror_stale")
+        self.assertIn("a repair stopped part way", f["evidence"])
+        self.mini.mirror_facts["running"] = True  # still repairing: the fresh tips are enough
+        self.assertEqual(self.run_once(NOW + 1)["findings"], [])
+
+    def test_only_a_source_glaeda_git_mirror_acts_on_turns_the_check_on(self) -> None:
+        home = self.dir / "home"
+        config = home / health.GIT_MIRROR_SOURCE
+        config.parent.mkdir(parents=True)
+        with mock.patch.object(health.sys, "platform", "darwin"):
+            for doc, on in (({"schema": 1, "source": "direct"}, True), ({"schema": 1, "source": "lan"}, False),
+                            ({"source": "direct"}, False)):
+                config.write_text(json.dumps(doc))
+                self.assertEqual(health.Mini(home).git_mirror() is not None, on, doc)
+
     def test_a_runner_mirror_with_no_record_is_a_finding(self) -> None:
         self.mini.mirror_facts = {"record": {}, "running": False}
         f = self.run_once()["findings"][0]

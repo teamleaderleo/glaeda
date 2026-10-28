@@ -300,7 +300,7 @@ class Mirror(unittest.TestCase):
         self.assertIn("slow", result)
         self.assertEqual(result["heads"]["feat-cmux-next"], sh("git", "rev-parse", "feat-cmux-next", cwd=self.upstream))
         self.assertEqual(result["heads"]["main"], head)
-        self.assertEqual(result["fetched_at"], result["time"])
+        self.assertGreaterEqual(result["fetched_at"], result["time"])  # when the fetch was written, not the start
 
     def test_a_connectivity_walk_that_times_out_is_not_missing_objects(self) -> None:
         gm.run(True, home=self.home)
@@ -342,7 +342,31 @@ class Mirror(unittest.TestCase):
         self.assertEqual(seen["main"], head)
         self.assertEqual(seen["record"]["state"], "repairing")
         self.assertTrue(seen["record"]["fetch"]["ok"])
-        self.assertEqual(seen["record"]["fetched_at"], seen["record"]["time"])
+        self.assertGreaterEqual(seen["record"]["fetched_at"], seen["record"]["time"])
+
+    def test_a_repair_whose_last_fetch_fails_keeps_the_early_fetch_s_tips(self) -> None:
+        gm.run(True, home=self.home)
+        head = self.commit("newer than the bundle")
+        (self.mirror / gm.REPAIR_PENDING).write_text("x\n")
+        real_seed, real_fetch = gm.seed, gm.fetch
+        calls = []
+
+        def fetching(mirror, url, **kw):
+            calls.append(url)
+            return real_fetch(mirror, url, **kw) if len(calls) == 1 else {"ok": False, "tries": 1, "errors": ["x"]}
+        gm.fetch = fetching
+        try:
+            result = gm.run(True, home=self.home)
+        finally:
+            gm.fetch = real_fetch
+        self.assertEqual(result["state"], "fetch-failed", result)
+        self.assertEqual(result["seeded"]["because"], "repair pending")
+        self.assertEqual(sh("git", "-C", os.fspath(self.mirror), "rev-parse", "main"), head)  # not the bundle's
+
+    def test_a_record_from_before_fetched_at_carries_its_fetch_time(self) -> None:
+        gm.RECORD.write_text(json.dumps({"time": "2026-10-27T20:13:00Z", "fetch": {"ok": True}}) + "\n")
+        written = gm.write_record({"time": "2026-10-27T20:20:00Z", "fetch": {"ok": False}}, gm.last_record())
+        self.assertEqual(written["fetched_at"], "2026-10-27T20:13:00Z")
 
     def test_a_shallow_or_partial_repair_does_not_fetch_first(self) -> None:
         gm.run(True, home=self.home)

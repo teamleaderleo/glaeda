@@ -634,7 +634,12 @@ def write_record(record: dict, previous: dict) -> dict:
     """Write RECORD whole. fetched_at is when a fetch last succeeded, carried over a failed one, so a stalled
     mirror reads as stale (glaeda-mini-health git_mirror_stale) however its passes end."""
     ok = (record.get("fetch") or {}).get("ok") is True
-    record = {**record, "fetched_at": record["time"] if ok else previous.get("fetched_at")}
+    before = previous.get("fetched_at")
+    if before is None and isinstance(previous.get("fetch"), dict) and previous["fetch"].get("ok") is True:
+        before = previous.get("time")  # a record from before fetched_at: its pass fetched
+    # when this write happens, not the pass's start: a pass that repaired first ends hours after it began
+    at = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    record = {**record, "fetched_at": at if ok else before}
     incoming = RECORD.with_name(f".{RECORD.name}.{os.getpid()}")
     incoming.write_text(json.dumps(record) + "\n")
     incoming.rename(RECORD)
@@ -743,16 +748,24 @@ def run(apply: bool, *, wait: bool = False, from_github: bool = False, home: Pat
                 (MIRROR / VERIFIED).write_text(dt.datetime.now(dt.timezone.utc).isoformat() + "\n")
             elif whole is False:
                 problem = "missing objects"
+        early_heads: dict[str, str] = {}
         if early_fetch(problem):
             # A repair in place runs for up to DOWNLOAD_TIMEOUT under the flock, so no later pass fetches until it
             # ends: fetch the new commits first (a fetch only adds objects) and record them, so the mirror's tips
             # stay current while it repairs. Jobs still wait for the repair (the runner hook reads REPAIR_PENDING).
             early = fetch(MIRROR, REPO_URL, tries=1)
-            write_record({**record, "fetch": early, "state": "repairing"}, previous)
+            if early["ok"]:
+                early_heads = heads(MIRROR)
+            previous = write_record({**record, "fetch": early, "state": "repairing"}, previous)
         if problem:
             record["seeded"] = {"because": problem, **seed(MIRROR, from_github)}
         configure(MIRROR)
         result = fetch(MIRROR, REPO_URL)
+        if not result["ok"]:
+            # The bundle set the branches to its own (older) tips: put back what the early fetch brought.
+            for branch, sha in early_heads.items():
+                if branch in BRANCHES:
+                    git(MIRROR, "update-ref", f"refs/heads/{branch}", sha, timeout=60)
         record["fetch"] = result
         folded = fold_packs(MIRROR)
         if folded:
