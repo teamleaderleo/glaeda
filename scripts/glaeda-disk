@@ -3658,25 +3658,53 @@ RETIRED_RUNNER_FAMILY = "retired-runner"
 HOME_SCRATCH_FAMILIES = (HOME_SCRATCH_FAMILY, RETIRED_RUNNER_FAMILY)
 
 
+HOME_SCRATCH_REF_MAX_BYTES = 4 * 2**20  # a configuration file larger than this is not text a person wrote: skipped
+_HOME_SCRATCH_REF_TEXT: dict[str, tuple[tuple, str]] = {}  # path -> (stat key, decoded text), re-read when it changes
+
+
 def home_scratch_reference_files() -> list[Path]:
     """Configuration that can name a home folder a service needs: the user's shell, agent and launch agent files,
-    the system launch daemons, and each runner's own scripts, env and glaeda hooks (a dedicated runner's admission
-    names its builder folder there, e.g. CNX_BUILDS_ROOT)."""
-    files = [*_reference_files(), *sorted(Path("/Library/LaunchDaemons").glob("*.plist"))]
+    /Library's launch agents and daemons, and every file at the top of each runner directory and its glaeda-hooks
+    (a dedicated runner's admission names its builder folder there, e.g. CNX_BUILDS_ROOT), whatever its suffix.
+    Symlinks are followed for reading; the runner's credential files are never read."""
+    files = [*_reference_files(), *sorted(Path("/Library/LaunchAgents").glob("*.plist")),
+             *sorted(Path("/Library/LaunchDaemons").glob("*.plist")),
+             *sorted((HOME / "Library/LaunchAgents").glob("*.plist"))]
     for runner in sorted(HOME.glob("actions-runner*")):
-        if runner.is_symlink() or not runner.is_dir():
-            continue
         for d in (runner, runner / "glaeda-hooks"):
-            if d.is_symlink() or not d.is_dir():
+            if not d.is_dir():
                 continue
-            files += [f for f in sorted(d.iterdir()) if not f.name.startswith(".credentials")
-                      and (f.suffix in (".sh", ".env", ".path", ".json", "") or f.name in (".env", ".path"))]
-    return [f for f in dict.fromkeys(files) if f.is_file() and not f.is_symlink()]
+            files += [f for f in sorted(d.iterdir()) if not f.name.startswith(".credentials")]
+    return [f for f in dict.fromkeys(files) if f.is_file()]
+
+
+def _home_scratch_ref_text(config: Path) -> str | None:
+    """A configuration file's text (a plist decoded to JSON), read again only when its stat changed; None when it
+    cannot be read. Larger than HOME_SCRATCH_REF_MAX_BYTES: "" (a binary, not configuration)."""
+    try:
+        st = config.stat()
+        key = (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
+        cached = _HOME_SCRATCH_REF_TEXT.get(os.fspath(config))
+        if cached and cached[0] == key:
+            return cached[1]
+        if st.st_size > HOME_SCRATCH_REF_MAX_BYTES:
+            text = ""
+        else:
+            data = config.read_bytes()
+            if config.suffix == ".plist" or data.startswith(b"bplist"):
+                with contextlib.suppress(ValueError, plistlib.InvalidFileException):
+                    data = json.dumps(plistlib.loads(data), default=str).encode()
+            text = data.decode(errors="ignore")
+    except OSError:
+        return None
+    _HOME_SCRATCH_REF_TEXT[os.fspath(config)] = (key, text)
+    return text
 
 
 def home_scratch_referenced(path: Path) -> str:
     """Why a home-scratch folder stays because configuration names it ("" when nothing does): a launchd job, a shell
-    or agent config, a runner script or hook, or a ~/.local/bin symlink into it. Unreadable configuration keeps it."""
+    or agent config, a runner script or hook, or a ~/.local/bin symlink into it. Unreadable configuration keeps it.
+    Each file is re-read only when it changed since the last item (survey, apply and the final recheck all ask)."""
     spellings = (*_reference_spellings(path), f"~/{path.name}", f"$HOME/{path.name}", "${HOME}/" + path.name)
     try:
         real = path.resolve()
@@ -3685,21 +3713,18 @@ def home_scratch_referenced(path: Path) -> str:
             for entry in local_bin.iterdir():
                 if entry.is_symlink() and Path(os.path.realpath(entry)).is_relative_to(real):
                     return f"named by {entry}"
+        files = home_scratch_reference_files()
     except OSError:
         return "home folder references unreadable"
     inside = os.path.realpath(path) + "/"
-    for config in home_scratch_reference_files():
+    for config in files:
         if os.path.realpath(config).startswith(inside):
             continue  # a folder's own scripts (a runner's run.sh, .runner, .env) never keep it
-        try:
-            data = config.read_bytes()
-            if config.suffix == ".plist" or data.startswith(b"bplist"):
-                with contextlib.suppress(ValueError, plistlib.InvalidFileException):
-                    data = json.dumps(plistlib.loads(data), default=str).encode()
-            if _mentions_any(data.decode(errors="ignore"), spellings):
-                return f"named by {config}"
-        except OSError:
+        text = _home_scratch_ref_text(config)
+        if text is None:
             return "home folder references unreadable"
+        if _mentions_any(text, spellings):
+            return f"named by {config}"
     return ""
 
 

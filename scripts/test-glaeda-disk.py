@@ -9227,7 +9227,8 @@ class HomeScratchTest(unittest.TestCase):
 
     def _reference_files(self) -> list[Path]:
         """The real list, minus the suite host's own /Library/LaunchDaemons."""
-        with mock.patch.object(gd.Path, "glob", lambda p, pat: [] if str(p) == "/Library/LaunchDaemons"
+        with mock.patch.object(gd.Path, "glob", lambda p, pat: [] if str(p) in ("/Library/LaunchDaemons",
+                                                                                 "/Library/LaunchAgents")
                                else _real_glob(p, pat)):
             return _real_home_scratch_reference_files()
 
@@ -9325,12 +9326,41 @@ class HomeScratchTest(unittest.TestCase):
         self.tree("cnx-tool")
         (self.home / ".local/bin").mkdir(parents=True)
         (self.home / ".local/bin/cnx-tool").symlink_to(self.home / "cnx-tool/evidence.bin")
+        self.tree("cnx-hook-py")
+        (hooks / "admit_helper.py").write_text('ROOT = "~/cnx-hook-py"\n')  # any suffix in the hooks is read
+        self.tree("cnx-linked-plist")
+        real_plist = self.home / ".plists/ai.manaflow.linked.plist"
+        real_plist.parent.mkdir()
+        with real_plist.open("wb") as f:
+            plistlib.dump({"Label": "ai.manaflow.linked", "WorkingDirectory": f"{self.home}/cnx-linked-plist"}, f)
+        (agents / "ai.manaflow.linked.plist").symlink_to(real_plist)  # a symlinked plist is read through
         self.tree("cnx-tooling-old")  # a longer name that starts with a named one is not named
         items = self.survey(self.family())
-        for name in ("perf-worker", "cnx-ios-builds", "cnx-tool"):
+        for name in ("perf-worker", "cnx-ios-builds", "cnx-tool", "cnx-hook-py", "cnx-linked-plist"):
             self.assertEqual(items[name].verdict, "in-use", (name, items[name].reasons))
             self.assertTrue(any(r.startswith("named by") for r in items[name].reasons), items[name].reasons)
         self.assertEqual(items["cnx-tooling-old"].verdict, "reclaimable", items["cnx-tooling-old"].reasons)
+
+    def test_a_system_launch_agent_that_names_it_keeps_it(self) -> None:
+        self.tree("cnx-global")
+        system = self.home / ".system-agents"
+        system.mkdir()
+        with (system / "ai.manaflow.global.plist").open("wb") as f:
+            plistlib.dump({"Label": "ai.manaflow.global", "ProgramArguments": [f"{self.home}/cnx-global/run"]}, f)
+        self.daemons.stop()  # the real list, with /Library's agents read from this test's folder
+        try:
+            with mock.patch.object(gd.Path, "glob", lambda p, pat: _real_glob(system, pat)
+                                   if str(p) == "/Library/LaunchAgents" else [] if str(p) == "/Library/LaunchDaemons"
+                                   else _real_glob(p, pat)):
+                self.assertEqual(self.survey(self.family())["cnx-global"].verdict, "in-use")
+        finally:
+            self.daemons.start()
+
+    def test_unreadable_configuration_keeps_it(self) -> None:
+        self.tree("cnx-locked")
+        (self.home / ".zshrc").write_text("export X=1\n")
+        with mock.patch.object(gd, "_home_scratch_ref_text", return_value=None):
+            self.assertEqual(gd.home_scratch_referenced(self.home / "cnx-locked"), "home folder references unreadable")
 
     def test_a_mention_that_appears_before_the_delete_keeps_it(self) -> None:
         tree = self.tree("cnx-hybrid")
