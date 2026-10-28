@@ -10,6 +10,7 @@ import importlib.util
 import json
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -374,7 +375,8 @@ class LanCacheTest(unittest.TestCase):
                   f"loader = importlib.machinery.SourceFileLoader('s', {os.fspath(SERVE)!r})\n"
                   "spec = importlib.util.spec_from_loader('s', loader); m = importlib.util.module_from_spec(spec)\n"
                   "loader.exec_module(m)\n"
-                  f"part = m.Path({os.fspath(self.base / 'live-part')!r}); part.write_bytes(b'x')\n"
+                  f"part = m.Path({os.fspath(self.base / 'live-part')!r}); part.mkdir()\n"
+                  "(part / m.STAGED).write_bytes(b'x')\n"
                   "for _ in range(20000): m.report(part)\n"
                   "sys.stderr.write('done')\n")
         read, write = os.pipe()  # never read: the pipe fills after a few KB
@@ -406,26 +408,25 @@ class LanCacheTest(unittest.TestCase):
         serve.stored(self.cache, name).write_bytes(b"y" * 5000)  # one kept before the cap
         self.assertIsNone(serve.open_cached(self.cache, name))
 
-    def test_a_replaced_partial_file_never_becomes_dest(self):
+    def test_the_transfer_is_staged_in_a_private_directory_and_never_seen_half_written(self):
         data = os.urandom(20000)
         name = self.put(data)
         real = lf.cache_transfer
+        seen = []
 
-        def swap(config, address, name, fd, deadline, cancel):
+        def look(config, address, name, fd, deadline, cancel):
             result = real(config, address, name, fd, deadline, cancel)
-            if not result[0]:  # the host that answered: swap the file its bytes went to
-                partial = next(p for p in self.out.iterdir() if p.name.startswith(".archive.lan-")
-                               and os.stat(p).st_ino == os.fstat(fd).st_ino)
-                partial.unlink()
-                partial.write_bytes(b"planted")
+            stage = next(p for p in self.out.iterdir() if p.name.startswith(".archive.lan-"))
+            seen.append((stat.S_IMODE(stage.lstat().st_mode), stage.is_dir(), (self.out / "archive").exists()))
             return result
 
-        with mock.patch.object(lf, "cache_transfer", swap):
+        with mock.patch.object(lf, "cache_transfer", look):
             code, record, dest = self.fetch(name)
-        # DEST is copied from the descriptor the bytes went to, never from whatever now has the partial's name.
         self.assertEqual(code, 0, record)
+        # private, and DEST absent until the file was whole (one stage per address tried: the first is down)
+        self.assertEqual(set(seen), {(0o700, True, False)})
         self.assertEqual(dest.read_bytes(), data)
-        self.assertEqual(next(self.out.glob(".archive.lan-*")).read_bytes(), b"planted")  # not ours to remove
+        self.assertEqual([p.name for p in self.out.iterdir()], ["archive"])  # the stage is removed
 
     def test_a_redirect_is_never_kept_as_an_object(self):
         name = self.put(b"<html>moved</html>")
@@ -443,12 +444,14 @@ class LanCacheTest(unittest.TestCase):
         objects = self.cache / "objects"
         objects.mkdir(parents=True, exist_ok=True)
         other = serve.part_of(self.cache, "ci-cache.cmux.com/ns/other.tar.zst")
-        other.write_bytes(b"x" * 10)  # a fill running now
+        other.mkdir()
+        (other / serve.STAGED).write_bytes(b"x" * 10)  # a fill running now
         free = serve.CACHE_MIN_FREE + serve.FILL_MAX_BYTES + 1000  # room for one fill, not two
         usage = shutil.disk_usage(self.cache)._replace(free=free)
         with mock.patch.object(serve.shutil, "disk_usage", lambda path: usage):
             self.assertEqual(serve.fill(self.cache, name, curl=os.environ["FAKE_CURL"]), "no room for a fill")
-            os.utime(other, (0, 0))  # its fill died long ago: no longer holds room, and is removed
+            os.utime(other / serve.STAGED, (0, 0))  # its fill died long ago: no longer holds room, and is removed
+            os.utime(other, (0, 0))
             self.assertEqual(serve.fill(self.cache, name, curl=os.environ["FAKE_CURL"]), "")
         self.assertFalse(other.exists())
 
@@ -495,13 +498,15 @@ class LanCacheTest(unittest.TestCase):
     def test_progress_is_only_reported_for_a_running_fill_of_the_same_object(self):
         part = self.base / "part"
         self.assertIsNone(serve.live_fill(part))
-        part.write_bytes(b"abc")
+        part.mkdir()
+        (part / serve.STAGED).write_bytes(b"abc")
         self.assertEqual(serve.live_fill(part), 3)
-        os.utime(part, (0, 0))  # a dead fill's part
+        os.utime(part / serve.STAGED, (0, 0))  # a dead fill's part
         self.assertIsNone(serve.live_fill(part))
-        part.unlink()
+        shutil.rmtree(part)
+        (self.base / "elsewhere").mkdir()
+        (self.base / "elsewhere" / serve.STAGED).write_bytes(b"abcdef")
         part.symlink_to(self.base / "elsewhere")
-        (self.base / "elsewhere").write_bytes(b"abcdef")
         self.assertIsNone(serve.live_fill(part))  # a symlink is never followed
 
     def test_a_fill_never_follows_a_symlink(self):
@@ -512,6 +517,7 @@ class LanCacheTest(unittest.TestCase):
         outside.write_bytes(b"keep")
         serve.part_of(self.cache, name).symlink_to(outside)  # raced in before the fill
         self.assertEqual(serve.fill(self.cache, name, curl=os.environ["FAKE_CURL"]), "")
+        self.assertFalse(os.path.lexists(serve.part_of(self.cache, name)))  # the stage is gone after success
         self.assertEqual(outside.read_bytes(), b"keep")
         self.assertEqual(serve.stored(self.cache, name).read_bytes(), b"u" * 5000)
         self.assertFalse(serve.stored(self.cache, name).is_symlink())

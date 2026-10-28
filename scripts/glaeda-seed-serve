@@ -1009,12 +1009,9 @@ def reserved(cache: Path, mine: Path) -> int:
     grown for longer than curl's low-speed abort allows is not a running fill's."""
     total = 0
     for path in (cache / "objects").glob(".fill-*"):
-        try:
-            info = path.lstat()
-        except OSError:
-            continue
-        if path != mine and stat.S_ISREG(info.st_mode) and time.time() - info.st_mtime < 300:
-            total += max(0, FILL_MAX_BYTES - info.st_size)
+        size = live_fill(path) if path != mine else None
+        if size is not None:
+            total += max(0, FILL_MAX_BYTES - size)
     return total
 
 
@@ -1036,8 +1033,12 @@ def missed_recently(cache: Path, name: str) -> bool:
 
 
 def part_of(cache: Path, name: str) -> Path:
+    """The private 0700 stage directory of NAME's fill; the part is STAGED inside it."""
     path = stored(cache, name)
     return path.with_name(".fill-" + path.name)
+
+
+STAGED = "object"
 
 
 # A part that has not grown for this long belongs to no running fill (curl aborts below 10 KB/s for 120 s).
@@ -1048,10 +1049,12 @@ ADMIT_WAIT = 15
 
 
 def live_fill(part: Path) -> int | None:
-    """The bytes a running fill of this object has written, or None when none runs: a regular file (never
-    a symlink followed) that grew within FILL_LIVE seconds."""
+    """The bytes a running fill of this object has written, or None when none runs: a stage directory (never
+    a symlink followed) whose staged file grew within FILL_LIVE seconds."""
     try:
-        info = part.lstat()
+        if not stat.S_ISDIR(part.lstat().st_mode):
+            return None
+        info = (part / STAGED).lstat()
     except OSError:
         return None
     if not stat.S_ISREG(info.st_mode) or time.time() - info.st_mtime >= FILL_LIVE:
@@ -1076,6 +1079,22 @@ def objects_dir(cache: Path) -> int | None:
 def remove_name(parent: int, name: str) -> None:
     with contextlib.suppress(OSError):
         os.unlink(name, dir_fd=parent)
+
+
+def remove_stage(parent: int, name: str) -> None:
+    """Remove the stage directory NAME in PARENT with its staged file; anything else at NAME (a symlink, an
+    older release's part file) is unlinked, never followed."""
+    try:
+        fd = os.open(name, DIR_FLAGS, dir_fd=parent)
+    except OSError:
+        remove_name(parent, name)
+        return
+    try:
+        remove_name(fd, STAGED)
+    finally:
+        os.close(fd)
+    with contextlib.suppress(OSError):
+        os.rmdir(name, dir_fd=parent)
 
 
 def report(part: Path) -> bool:
@@ -1139,7 +1158,7 @@ def fill(cache: Path, name: str, timeout: float = FILL_TIMEOUT, curl: str = CURL
     try:
         return fill_part(cache, name, timeout, curl, parent)
     except BaseException:
-        remove_name(parent, part_of(cache, name).name)
+        remove_stage(parent, part_of(cache, name).name)
         raise
     finally:
         os.close(parent)
@@ -1148,68 +1167,61 @@ def fill(cache: Path, name: str, timeout: float = FILL_TIMEOUT, curl: str = CURL
 def fill_part(cache: Path, name: str, timeout: float, curl: str, parent: int) -> str:
     """Download NAME from its bucket into the cache; '' when it is there, 'miss' for a 404, else why not.
 
-    Into a temporary name beside it, so a reader never sees a part. Every name is made, renamed and removed
-    relative to PARENT (the objects directory, opened with no symlink on the way), the part is created
-    exclusively with O_NOFOLLOW, and curl writes only to that descriptor: a symlink raced into the directory
-    is never followed. curl keeps a low-speed abort.
+    Into a private 0700 stage directory made for this fill in PARENT (the objects directory, opened with no
+    symlink on the way); the part is created there exclusively and curl writes only to its descriptor, then
+    one rename moves it into place. No other user can reach the staged file, a reader never sees a part,
+    and every way out but success removes the stage. curl keeps a low-speed abort.
     """
     bucket, ns, file = name.split("/")
-    part_name, final_name = part_of(cache, name).name, stored(cache, name).name
-    remove_name(parent, part_name)
+    stage_name, final_name = part_of(cache, name).name, stored(cache, name).name
+    remove_stage(parent, stage_name)  # a killed fill's (this request holds the object's fill lock)
     try:
-        # The part exists before the check, so fills starting together each count the others' room.
-        out = os.open(part_name, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=parent)
+        os.mkdir(stage_name, 0o700, dir_fd=parent)
+        stage = os.open(stage_name, DIR_FLAGS, dir_fd=parent)
     except OSError as error:
-        return f"part: {type(error).__name__}"
-    mine = os.fstat(out)
+        remove_stage(parent, stage_name)
+        return f"stage: {type(error).__name__}"
     try:
-        need = CACHE_MIN_FREE + FILL_MAX_BYTES + reserved(cache, part_of(cache, name))
-        prune_cache(cache, "", min_free=need)
-        if shutil.disk_usage(cache).free < need:
-            remove_name(parent, part_name)
-            return "no room for a fill"
         try:
-            # No --location: a redirect could send the fetch to any host, past the bucket allow list. The body
-            # goes to stdout (the part's descriptor), the status code to stderr.
-            proc = subprocess.Popen([curl, "--silent", "--fail", "--proto", "=https",
-                                     "--connect-timeout", "15", "--speed-limit", "10240", "--speed-time", "120",
-                                     "--max-time", str(int(timeout)), "--max-filesize", str(FILL_MAX_BYTES),
-                                     "--write-out", "%{stderr}%{http_code}", "--output", "-",
-                                     f"https://{bucket}/v1/{ns}/objects/{file}"],
-                                    stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.PIPE,
-                                    text=True, start_new_session=True)
+            # The part exists before the check, so fills starting together each count the others' room.
+            out = os.open(STAGED, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=stage)
         except OSError as error:
-            remove_name(parent, part_name)
-            return type(error).__name__
+            return f"part: {type(error).__name__}"
         try:
-            why = watch_fill(proc, out, timeout)
-        finally:  # whatever ends this request (its alarm included), its curl ends with it
-            with contextlib.suppress(OSError):
-                os.killpg(proc.pid, signal.SIGKILL)
-            proc.wait()
-            if proc.stderr:
-                proc.stderr.close()
-        if why:
-            remove_name(parent, part_name)
-            return why
-        try:
-            now = os.stat(part_name, dir_fd=parent, follow_symlinks=False)
-        except OSError:
-            return "the part was removed"
-        if not stat.S_ISREG(now.st_mode) or (now.st_dev, now.st_ino) != (mine.st_dev, mine.st_ino):
-            return "the part was replaced"
-        os.replace(part_name, final_name, src_dir_fd=parent, dst_dir_fd=parent)
-        try:
-            kept = os.stat(final_name, dir_fd=parent, follow_symlinks=False)
-        except OSError:
-            return "the object was removed"
-        if (kept.st_dev, kept.st_ino) != (mine.st_dev, mine.st_ino):
-            # Swapped between the check and the rename: what was renamed is not ours, so it is not kept.
-            remove_name(parent, final_name)
-            return "the part was replaced"
-        return ""
+            need = CACHE_MIN_FREE + FILL_MAX_BYTES + reserved(cache, part_of(cache, name))
+            prune_cache(cache, "", min_free=need)
+            if shutil.disk_usage(cache).free < need:
+                return "no room for a fill"
+            try:
+                # No --location: a redirect could send the fetch to any host, past the bucket allow list. The
+                # body goes to stdout (the part's descriptor), the status code to stderr.
+                proc = subprocess.Popen([curl, "--silent", "--fail", "--proto", "=https",
+                                         "--connect-timeout", "15", "--speed-limit", "10240", "--speed-time", "120",
+                                         "--max-time", str(int(timeout)), "--max-filesize", str(FILL_MAX_BYTES),
+                                         "--write-out", "%{stderr}%{http_code}", "--output", "-",
+                                         f"https://{bucket}/v1/{ns}/objects/{file}"],
+                                        stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.PIPE,
+                                        text=True, start_new_session=True)
+            except OSError as error:
+                return type(error).__name__
+            try:
+                why = watch_fill(proc, out, timeout)
+            finally:  # whatever ends this request (its alarm included), its curl ends with it
+                with contextlib.suppress(OSError):
+                    os.killpg(proc.pid, signal.SIGKILL)
+                proc.wait()
+                if proc.stderr:
+                    proc.stderr.close()
+            if why:
+                return why
+            os.fchmod(out, 0o644)
+            os.replace(STAGED, final_name, src_dir_fd=stage, dst_dir_fd=parent)
+            return ""
+        finally:
+            os.close(out)
     finally:
-        os.close(out)
+        os.close(stage)
+        remove_stage(parent, stage_name)  # after a success only the empty directory is left to remove
 
 
 def watch_fill(proc: subprocess.Popen, out: int, timeout: float) -> str:
@@ -1247,13 +1259,19 @@ def prune_cache(cache: Path, keep: str, budget: int = CACHE_BYTES, min_free: int
             info = path.lstat()
         except OSError:
             continue
-        if not stat.S_ISREG(info.st_mode):
-            continue
         age = time.time() - info.st_mtime
         if path.name.startswith(".fill-"):
-            if age > FILL_TIMEOUT + 600:  # a killed fill's part: no fill lives this long
-                path.unlink(missing_ok=True)
-        elif path.name.startswith(".miss-"):
+            if age > FILL_TIMEOUT + 600 and live_fill(path) is None:  # a killed fill's: no fill lives this long
+                parent = objects_dir(cache)
+                if parent is not None:
+                    try:
+                        remove_stage(parent, path.name)
+                    finally:
+                        os.close(parent)
+            continue
+        if not stat.S_ISREG(info.st_mode):
+            continue
+        if path.name.startswith(".miss-"):
             if age > MISS_TTL:
                 path.unlink(missing_ok=True)
         else:

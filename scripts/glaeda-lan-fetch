@@ -653,46 +653,6 @@ def cache_transfer(config: dict, address: str, name: str, partial: int, deadline
         proc.wait()
 
 
-def same_file(parent: int, name: str, info: os.stat_result) -> bool:
-    try:
-        now = os.stat(name, dir_fd=parent, follow_symlinks=False)
-    except OSError:
-        return False
-    return stat.S_ISREG(now.st_mode) and (now.st_dev, now.st_ino) == (info.st_dev, info.st_ino)
-
-
-def publish(fd: int, size: int, parent: int, dest: str) -> None:
-    """Copy the SIZE bytes of the open file FD into DEST, created here (no-replace, no symlink followed).
-
-    Copied from the descriptor rather than linked by name: a name can be swapped between a check and a link,
-    so whatever is at the partial's name never becomes DEST. A failed copy removes only the DEST it created.
-    """
-    if os.fstat(fd).st_size != size:
-        raise OSError("the partial file is not the announced size")
-    out = os.open(dest, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644, dir_fd=parent)
-    made = os.fstat(out)
-    try:
-        offset = 0
-        while offset < size:
-            chunk = os.pread(fd, min(1 << 20, size - offset), offset)
-            if not chunk:
-                raise OSError("the partial file shrank")
-            view = memoryview(chunk)
-            while view:
-                view = view[os.write(out, view):]
-            offset += len(chunk)
-        os.fsync(out)
-        if os.fstat(out).st_size != size:
-            raise OSError("DEST is not the announced size")
-    except BaseException:
-        if same_file(parent, dest, made):
-            with contextlib.suppress(OSError):
-                os.unlink(dest, dir_fd=parent)
-        raise
-    finally:
-        os.close(out)
-
-
 def fetch_cache(name: str, dest: Path, config: dict | None, deadline: float | None = None,
                 cancel: threading.Event | None = None) -> tuple[int, dict]:
     """(exit code, record). Writes DEST, whole, with the LAN cache host's copy of NAME (BUCKET/NS/FILE).
@@ -722,6 +682,24 @@ def fetch_cache(name: str, dest: Path, config: dict | None, deadline: float | No
         os.close(parent)
 
 
+def remove_stage(parent: int, stage: str) -> None:
+    """Remove this call's private stage directory STAGE (in PARENT) and the one file it may hold."""
+    try:
+        fd = os.open(stage, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)
+    except OSError:
+        return
+    try:
+        with contextlib.suppress(OSError):
+            os.unlink(STAGED, dir_fd=fd)
+    finally:
+        os.close(fd)
+    with contextlib.suppress(OSError):
+        os.rmdir(stage, dir_fd=parent)
+
+
+STAGED = "object"
+
+
 def fetch_cache_into(name: str, parent: int, dest: str, config: dict, record: dict, started: float,
                      deadline: float, cancel: threading.Event) -> tuple[int, dict]:
     errors = []
@@ -729,30 +707,37 @@ def fetch_cache_into(name: str, parent: int, dest: str, config: dict, record: di
         if cancel.is_set() or time.monotonic() >= deadline:
             errors.append("cancelled" if cancel.is_set() else "deadline passed")
             break
-        partial = f".{dest}.lan-{os.getpid()}-{threading.get_ident()}-{secrets.token_hex(6)}"
+        # The transfer goes into a private 0700 directory this call makes beside DEST, and DEST is linked
+        # (no-replace) from there once the file is whole: no other user can reach the staged file, and DEST
+        # never shows a partial object.
+        stage_name = f".{dest}.lan-{os.getpid()}-{threading.get_ident()}-{secrets.token_hex(6)}"
         try:
-            fd = os.open(partial, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644, dir_fd=parent)
+            os.mkdir(stage_name, 0o700, dir_fd=parent)
         except OSError as error:
-            return EXIT_ERROR, {**record, "error": f"partial file: {type(error).__name__}"}
-        # Written through the descriptor this call created, never reopened by name; DEST is a copy made from
-        # that same descriptor (publish).
-        mine = os.fstat(fd)
+            return EXIT_ERROR, {**record, "error": f"stage directory: {type(error).__name__}"}
+        stage = fd = None
         try:
+            stage = os.open(stage_name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)
+            fd = os.open(STAGED, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=stage)
             why, size, wait = cache_transfer(config, address, name, fd, deadline, cancel)
             if why == "miss":
                 return EXIT_MISS, {**record, "reason": "not in the bucket", "seconds": round(time.monotonic() - started, 3)}
             if not why:
-                publish(fd, size, parent, dest)
+                if os.fstat(fd).st_size != size:
+                    raise OSError("the staged file is not the announced size")
+                os.fchmod(fd, 0o644)
+                # no-replace: fails if DEST appeared meanwhile
+                os.link(STAGED, dest, src_dir_fd=stage, dst_dir_fd=parent, follow_symlinks=False)
                 return EXIT_HIT, {**record, "address": address, "bytes": size, "wait_seconds": round(wait, 3),
                                   "seconds": round(time.monotonic() - started, 3)}
             errors.append(f"{address}: {why}")
         except OSError as error:
             errors.append(f"{address}: {type(error).__name__}")
         finally:
-            os.close(fd)
-            if same_file(parent, partial, mine):
-                with contextlib.suppress(OSError):
-                    os.unlink(partial, dir_fd=parent)
+            for held in (fd, stage):
+                if held is not None:
+                    os.close(held)
+            remove_stage(parent, stage_name)
     return EXIT_ERROR, {**record, "error": "; ".join(errors)[:400], "seconds": round(time.monotonic() - started, 3)}
 
 
