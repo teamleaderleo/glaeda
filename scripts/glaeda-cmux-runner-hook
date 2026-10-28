@@ -5422,6 +5422,7 @@ class Gate:
         self.listener_pids: tuple[int, ...] = ()
         self.job_request: str | None = None
         self.frozen: tuple[int, ...] = ()  # listeners the gate froze at a Worker's exit, thawed when step() returns
+        self.done: tuple[int, ...] = ()  # the Workers whose exit woke nap(), unreaped while their listener is frozen
         self.listening_since: float | None = None  # when start() last started run.sh (GATE_FIRST_POLL_S)
         self.first_poll_noted = False
         self.swept_at = time.monotonic() - GATE_SWEEP_S + GATE_POLL_S  # first sweep on the second poll
@@ -6011,12 +6012,13 @@ class Gate:
         return found or self.taking() is not None
 
     def worker(self) -> bool:
-        """A Runner.Worker under this runner's tree. A failed look counts as busy."""
+        """A Runner.Worker under this runner's tree. A failed look counts as busy. A Worker nap() saw exit (done) is
+        none: under a frozen listener it stays a zombie until the listener reaps it."""
         try:
             pids, table = self.tree()
         except Exception:  # noqa: BLE001
             return True
-        return any(runner_worker(self.runner_dir, table[pid][1]) for pid in pids)
+        return any(runner_worker(self.runner_dir, table[pid][1]) for pid in pids if pid not in self.done)
 
     def taking(self) -> str | None:
         """The runner request the listener has acknowledged and not finished (listener_request). An unreadable
@@ -6094,7 +6096,7 @@ class Gate:
         for pid in self.frozen:  # after stop()'s SIGINT, which the listener takes as it thaws
             with contextlib.suppress(OSError):
                 os.kill(pid, signal.SIGCONT)
-        self.frozen = ()
+        self.frozen, self.done = (), ()  # thawed, the listener reaps the exited Workers before the next nap()
 
     def stop(self, why: str, finished: str | None = None) -> bool:
         """SIGINT to the listener: its graceful exit ends its session, so GitHub stops routing here. With no
@@ -6217,7 +6219,8 @@ class Gate:
                 reserved = self.still_reserved()
                 self.job_waited = bool(self.waiting) or reserved is not None
                 low = self.low_disk()
-                workers = tuple(self.worker_pids()) if self.waiting or reserved or low or self.job_ending else ()
+                workers = tuple(pid for pid in self.worker_pids() if pid not in self.done) \
+                    if self.waiting or reserved or low or self.job_ending else ()
                 if workers:
                     if workers != self.watching:  # once per job: the request its Worker runs, and who runs it
                         self.job_request, self.listener_pids = self.taking(), self.listener_list()
@@ -6308,6 +6311,8 @@ class Gate:
                     break
                 time.sleep(GATE_WATCH_S)
         if exited:
+            # the exited ones, so the next poll neither counts their zombies as a job nor waits on them again
+            self.done = tuple(pid for pid in self.watching if not pid_alive(pid) or self._zombie(pid)) or self.watching
             self.freeze()
 
     @staticmethod

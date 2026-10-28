@@ -7573,6 +7573,34 @@ class GateTest(unittest.TestCase):
         self.assertFalse(self.stat(listener.pid).startswith("T"), "thawed")
         self.assertEqual(gate.frozen, ())
 
+    def test_an_unreaped_worker_under_the_frozen_listener_is_not_waited_on_again(self) -> None:
+        """Frozen, the listener cannot reap its exited Worker, so the zombie stays in ps. The next poll must not take
+        it for a running job and re-arm the freeze on it, or nap() would wake and freeze again at once."""
+        gate, stops = self.gate([None] * 3, busy=[True, True, True])
+        worker, listener = self.sleeper(), self.sleeper()
+        gate.worker_pids = lambda: [worker.pid]
+        gate.listener_list = lambda: (listener.pid,)
+        with mock.patch.object(hook, "host_waiters", return_value=set()), \
+                mock.patch.object(hook, "reservation_refusal", return_value="host reserved by a soak"):
+            gate.reservation = os.fspath(self.tmp / "reservation.json")
+            gate.step()
+            self.assertEqual((gate.watching, gate.freeze_at_exit), ((worker.pid,), True))
+            worker.kill()  # not reaped: a zombie, as under a frozen listener
+            with mock.patch.object(hook, "GATE_POLL_S", 30.0):
+                started = time.monotonic()
+                gate.nap()
+                self.assertLess(time.monotonic() - started, 5.0)
+            self.assertEqual((gate.done, gate.frozen), ((worker.pid,), (listener.pid,)))
+            gate.poll()  # busy (the mock), but its only Worker is the exited one: nothing to wait on
+            self.assertEqual((gate.watching, gate.freeze_at_exit), ((), False))
+            gate.thaw()
+            self.assertEqual((gate.done, gate.frozen), ((), ()))
+            with mock.patch.object(hook, "GATE_POLL_S", 0.2):
+                started = time.monotonic()
+                gate.nap()
+                self.assertGreaterEqual(time.monotonic() - started, 0.19, "a plain poll, no second freeze")
+            self.assertEqual(gate.frozen, ())
+
     def test_with_nothing_to_watch_the_gate_naps_one_plain_poll(self) -> None:
         gate = hook.Gate(self.runner, os.fspath(self.lock), "", self.state)
         gate.child = mock.Mock(pid=1)
