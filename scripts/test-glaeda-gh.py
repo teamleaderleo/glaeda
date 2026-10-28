@@ -265,10 +265,12 @@ class FakeGitHub:
         runs = {c["checkSuite"]["workflowRun"]["databaseId"]: c for c in contexts
                 if ((c.get("checkSuite") or {}).get("workflowRun") or {}).get("databaseId")}
         if what == "actions":
-            return {"workflow_runs": [{"id": rid, "name": "run-name " + str(rid),  # REST: the run-name
+            page = int(path.split("page=")[-1]) if "&page=" in path else 1
+            listed = list(runs.items())[100 * (page - 1):100 * page]
+            return {"total_count": len(runs), "workflow_runs": [{"id": rid, "name": "run-name " + str(rid),  # REST: the run-name
                                        "workflow_id": {"CI": 77, "Lint": 78}.get(c["checkSuite"]["workflowRun"]["workflow"]["name"]),
                                        "check_suite_id": rid, "conclusion": (c["checkSuite"].get("conclusion") or "").lower() or None}
-                                      for rid, c in runs.items()]}
+                                      for rid, c in listed]}
         if parts[-1] == "status":
             listed = [c for c in contexts if c["__typename"] == "StatusContext"]
             page = int(path.split("page=")[-1]) if "&page=" in path else 1
@@ -1569,7 +1571,7 @@ class BalanceTest(Base):
         self.daemon.tick(NOW + gg.CYCLE)
         paths = [c[1].split("/o/r/", 1)[1] for c in self.gh.rest_calls()]
         self.assertEqual(paths, ["pulls/1", f"commits/{'a' * 40}/check-runs?filter=all&per_page=100",
-                                 f"commits/{'a' * 40}/status?per_page=100&page=1", f"actions/runs?head_sha={'a' * 40}&per_page=100",
+                                 f"commits/{'a' * 40}/status?per_page=100&page=1", f"actions/runs?head_sha={'a' * 40}&per_page=100&page=1",
                                  "actions/workflows?per_page=100", "rules/branches/main?per_page=100", "branches/main"])
         over_rest = gg.read_cache(key)["data"]
         self.assertEqual(over_rest["checkState"], "FAILURE")  # computed: a failed check outranks pending ones
@@ -1926,12 +1928,38 @@ class FallbackTest(Base):
         self.daemon.tick(NOW)
         head = gg.read_cache(f"head:o/r@{'c' * 40}")
         self.assertIsNone(head["data"])
-        self.assertIn("statuses over REST", head["error"])
+        self.assertIn("statuses", head["error"])
         pr = gg.read_cache("pr:o/r#3")
         self.assertEqual(pr["via"], "rest")
         self.assertTrue(pr["data"]["checksTruncated"])
         self.assertIsNone(gg.verdict("pr", pr["data"]))  # pending, never green
         self.assertEqual(len([c for c in self.gh.rest_calls() if "/status?" in c[1] and c[1].endswith("page=2")]), 2)
+
+    def test_more_workflow_runs_than_rest_reads_is_never_a_verdict(self) -> None:
+        many = [workflow_check("build", 1000 + i, workflow="CI" if i else "Lint", conclusion="SUCCESS") for i in range(250)]
+        many[0]["checkSuite"]["conclusion"] = many[0]["conclusion"] = "FAILURE"
+        for c in many:
+            c["checkSuite"]["app"] = {"slug": "github-actions"}
+        self.gh.heads[("o", "r", "d" * 40)] = many
+        self.force_low()
+        gg.register(f"head:o/r@{'d' * 40}", consumer="autoland")
+        self.daemon.tick(NOW)
+        head = gg.read_cache(f"head:o/r@{'d' * 40}")
+        self.assertIsNone(head["data"])
+        self.assertIn("workflow runs over REST", head["error"])
+        # the 200 statuses case says the same: the third page of runs was never read
+        self.assertEqual(len([c for c in self.gh.rest_calls() if "actions/runs?" in c[1]]), gg.REST_RUN_PAGES)
+
+    def test_a_write_refused_by_the_secondary_limit_holds_the_reads_too(self) -> None:
+        self.daemon.now = NOW
+        self.gh.throttle["rest"] = self.SECONDARY
+        self.daemon.writing = True
+        self.daemon.request("POST", "/repos/o/r/issues/1/comments", {"body": "x"}, content=True)
+        self.daemon.writing = False
+        self.assertFalse(self.daemon.secondary_admit("graphql", 1))
+        self.register_all()
+        self.daemon.tick(NOW + gg.TICK)
+        self.assertEqual(len(self.gh.calls), 1)
 
     def test_a_malformed_force_low_never_stops_the_daemon(self) -> None:
         for value in (True, 1, None, {"graphql": 1}, "graphql"):
@@ -8225,7 +8253,8 @@ class PostTest(unittest.TestCase):
                           "--reviewer", "lawrencecchen")
         too_quick = (422, {}, {"message": "Validation Failed",
                                "errors": [{"message": "was submitted too quickly"}]})
-        d, t = self.daemon(too_quick, (403, {"retry-after": "120"}, {"message": "You have exceeded a secondary rate limit"}),
+        d, t = self.daemon(too_quick, (403, {"retry-after": "120"}, {"message": (
+            "You have exceeded a secondary rate limit and have been temporarily blocked from content creation.")}),
                            (201, {}, {"html_url": "https://github.com/o/r/pull/9", "number": 9}), (201, {}, {}))
         self.step(d, NOW)
         self.assertEqual(d.post_hold, NOW + gg.POST_BACKOFF)
