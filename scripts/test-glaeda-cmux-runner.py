@@ -1111,7 +1111,11 @@ class HookTest(unittest.TestCase):
         self.assertFalse((pr / "_work" / f"{hook.IDLE_EVICT_TRASH}1-0").exists(), "a dead hook's trash goes")
         self.assertTrue((pr / "_work" / "_temp" / "being-set-up").exists(), "the runner writes _temp before a hook")
         self.assertTrue((outside / f"{hook.IDLE_EVICT_TRASH}9-0").exists(), "never through a symlinked _work")
-        # the deadline bounds the deletion too: past it nothing more goes
+        # the deadline bounds the deletion too: past it nothing more goes, not even one file or a symlink
+        gone = self.dir / "file-past-the-deadline"
+        gone.write_text("x")
+        self.assertFalse(hook.remove_bounded(gone, time.monotonic() - 1))
+        self.assertTrue(gone.exists())
         (pr / "_work" / "cmux" / "cmux").mkdir()
         with mock.patch.object(hook, "free_gib", return_value=1.0):
             hook.evict_idle_runners(self.dir, os.fspath(self.dir), 30, time.monotonic() - 1, busy=lambda _r: False)
@@ -1129,8 +1133,7 @@ class HookTest(unittest.TestCase):
         self.assertTrue((workspace / "big").exists())
         fd = hook.lock_file(runner / hook.EVICT_RUNNER_LOCK, fcntl.LOCK_EX)
         self.assertIsNone(hook.take_runner_work(runner, busy=lambda _r: False), "another eviction holds it")
-        self.assertEqual(hook.wait_runner_work(workspace, wait_s=0.3),
-                         "a nightly job's eviction still holds this runner's work; going on")
+        self.assertEqual(hook.wait_runner_work(workspace, wait_s=0.3), hook.RUNNER_WORK_HELD, "then it is refused")
         os.close(fd)
         trash = hook.take_runner_work(runner, busy=lambda _r: False)
         self.assertEqual(len(trash or []), 1)

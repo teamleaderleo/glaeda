@@ -2148,25 +2148,29 @@ def nightly_disk_wait(capacity_dir: Path, on: bool):
         yield
         return
     marker = capacity_dir / f"{ADMIT_WANT}{os.getpid()}"
-    since, done = time.time(), threading.Event()
+    since, done, writing = time.time(), threading.Event(), threading.Lock()
     with contextlib.suppress(OSError):
         capacity_dir.mkdir(parents=True, exist_ok=True)
     write_want(marker, since, [NIGHTLY_DISK_WANT, "units"], TIER_NIGHTLY)
 
     def refresh() -> None:
-        while not done.wait(ADMIT_POLL_S) and not done.is_set():
-            write_want(marker, since, [NIGHTLY_DISK_WANT, "units"], TIER_NIGHTLY)
+        while not done.wait(ADMIT_POLL_S):
+            with writing:  # the unlink below takes this too, so no write lands after it
+                if done.is_set():
+                    return
+                write_want(marker, since, [NIGHTLY_DISK_WANT, "units"], TIER_NIGHTLY)
     thread = threading.Thread(target=refresh, daemon=True)
     thread.start()
     try:
         yield
     finally:
-        done.set()
-        thread.join(timeout=5)
-        with contextlib.suppress(OSError):
-            marker.unlink()
+        with writing:
+            done.set()
+            with contextlib.suppress(OSError):
+                marker.unlink()
 
 
+RUNNER_WORK_HELD = "a nightly job's eviction still holds this runner's work"  # job-started refuses on it
 EVICT_RUNNER_LOCK = ".glaeda-evict.lock"  # <runner>/: held while another runner's job takes this runner's work away
 
 
@@ -2193,22 +2197,31 @@ def idle_work_dirs(runner: Path) -> list[Path]:
 
 
 def remove_bounded(top: Path, deadline: float) -> bool:
-    """Delete the tree at top, deepest first, never following a symlink (one is unlinked as a name), stopping at the
-    deadline (monotonic). True when it is gone; what is left is a later call's (the stale trash sweep)."""
+    """Delete the tree at top, deepest first, never following a symlink (one is unlinked as a name), with the deadline
+    (monotonic) checked before every deletion. True when it is gone; what is left is a later call's (the stale trash
+    sweep)."""
+    def due() -> bool:
+        return time.monotonic() >= deadline
     try:
+        if due():
+            return False
         if top.is_symlink() or not top.is_dir():
             top.unlink(missing_ok=True)
             return True
         for root, dirs, files in os.walk(top, topdown=False, followlinks=False):
-            if time.monotonic() >= deadline:
-                return False
             for name in files:
+                if due():
+                    return False
                 with contextlib.suppress(OSError):
                     os.unlink(os.path.join(root, name))
             for name in dirs:
+                if due():
+                    return False
                 path = os.path.join(root, name)
                 with contextlib.suppress(OSError):
                     os.unlink(path) if os.path.islink(path) else os.rmdir(path)
+        if due():
+            return False
         top.rmdir()
         return True
     except OSError:
@@ -2259,7 +2272,7 @@ def wait_runner_work(workspace: Path | None, wait_s: float = EVICT_TIMEOUT_S) ->
                 os.close(fd)
                 break
             if time.monotonic() >= deadline:
-                return "a nightly job's eviction still holds this runner's work; going on"
+                return RUNNER_WORK_HELD
             waited = True
             time.sleep(0.2)
         if not workspace.exists():
@@ -7644,9 +7657,14 @@ def main(argv: list[str] | None = None) -> int:
     if args.phase in ("job-started", "job-completed"):
         leave_job_workspace(args)
     if args.phase == "job-started" and not args.dedicated_admit:
-        with contextlib.suppress(Exception):  # never fail the job on housekeeping
-            if note := wait_runner_work(JOB_CWD):
-                print(f"{PREFIX}: {note}", flush=True)
+        note = None
+        with contextlib.suppress(Exception):  # housekeeping that cannot look never fails the job
+            note = wait_runner_work(JOB_CWD)
+        if note == RUNNER_WORK_HELD:  # its workspace may still be taken away: run it elsewhere
+            print(f"{PREFIX}: refused: {note}", flush=True)
+            return 1
+        if note:
+            print(f"{PREFIX}: {note}", flush=True)
 
     owner: JobOwner | None = None
     if args.phase == "job-started":
