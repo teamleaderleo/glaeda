@@ -130,6 +130,18 @@ class GateTest(Base):
                                         builder_reserve_gib=lambda home: 40.0, job_disk_gib=lambda: 20.0)
         self.assertIn("a nightly job waits here for free disk (build-nightly-app)", warm.nightly_reserve_refusal(waiting))
 
+    def test_a_reserve_that_cannot_be_read_keeps_the_catch_up_off(self) -> None:
+        def broken() -> float:
+            raise OSError("transient")
+        for bad in (types.SimpleNamespace(builder_reserve_gib=lambda home: broken(), job_disk_gib=lambda: 20.0),
+                    types.SimpleNamespace(builder_reserve_gib=lambda home: float("nan"), job_disk_gib=lambda: 20.0),
+                    types.SimpleNamespace(builder_reserve_gib=lambda home: 40.0, job_disk_gib=lambda: -1.0)):
+            self.assertIsNone(warm.nightly_reserve(bad))
+            self.assertIn("cannot read the dedicated nightly builder's disk reserve", warm.nightly_reserve_refusal(bad))
+        waiter_broken = types.SimpleNamespace(nightly_disk_waiter=lambda capacity: broken(),
+                                              builder_reserve_gib=lambda home: 0.0, job_disk_gib=lambda: 20.0)
+        self.assertIn("cannot read the nightly disk waiters", warm.nightly_reserve_refusal(waiter_broken))
+
     def test_no_dedicated_builder_or_an_older_hook_keeps_no_reserve(self) -> None:
         warm.free_bytes = lambda path: 1024 ** 3
         self.runner("actions-runner-glaeda", "--min-free-gib 30 --capacity-units 4")
@@ -376,8 +388,46 @@ class RunTest(Base):
             os.environ["FAKE_SLEEP"] = "0"
             self.assertEqual(warm.build(checkout, 2, self.state, "/x.app", log, stop_below=40 * 1024 ** 3)["kept"],
                              "true", "room to spare: the build finishes")
+            saved_timeout = warm.BUILD_TIMEOUT_S
+            try:
+                warm.BUILD_TIMEOUT_S = 1
+                os.environ["FAKE_SLEEP"] = "30"
+                timed = warm.build(checkout, 2, self.state, "/x.app", log, stop_below=40 * 1024 ** 3)
+                self.assertEqual((timed["kept"], timed["reason"]), ("false", "timed out after 1 s"))
+            finally:
+                warm.BUILD_TIMEOUT_S = saved_timeout
         finally:
             warm.BUILD_DISK_WATCH_S = saved
+
+    @unittest.skipUnless(sys.platform == "darwin", "runs only on macOS")
+    def test_unknown_free_disk_stops_the_whole_build_group(self) -> None:
+        # In a driver that leads its own process group, as the LaunchAgent run does, so kill_build ends the
+        # fake build's `sleep` grandchild too, not only the shell.
+        checkout = self.fake_setup()
+        driver = self.dir / "glaeda-idle-warm-watch-driver.py"
+        driver.write_text(textwrap.dedent(f"""
+            import importlib.machinery, importlib.util, json
+            from pathlib import Path
+            loader = importlib.machinery.SourceFileLoader("w", {os.fspath(ROOT / 'scripts' / 'glaeda-idle-warm')!r})
+            spec = importlib.util.spec_from_loader("w", loader)
+            warm = importlib.util.module_from_spec(spec)
+            loader.exec_module(warm)
+            warm.FLEET_DIR = Path({os.fspath(self.dir / 'fleet')!r})
+            warm.BUILD_DISK_WATCH_S = 0.2
+            warm.free_bytes = lambda path: None
+            warm._grouped = warm.own_group()
+            assert warm._grouped
+            print(json.dumps(warm.build(Path({os.fspath(checkout)!r}), 2, Path({os.fspath(self.state)!r}), "/x.app",
+                                        Path({os.fspath(self.dir / 'watch.log')!r}), stop_below=40 * 1024 ** 3)))
+        """))
+        proc = subprocess.run([sys.executable, os.fspath(driver)], capture_output=True, text=True, timeout=60,
+                              env={**os.environ, "FAKE_SLEEP": "137"})
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        result = json.loads(proc.stdout.strip().splitlines()[-1])
+        self.assertEqual(result["kept"], "false")
+        self.assertIn("cannot read free disk", result["reason"])
+        leftover = subprocess.run(["/usr/bin/pgrep", "-f", "sleep 137"], capture_output=True, text=True).stdout
+        self.assertEqual(leftover.strip(), "", "the build's whole process group was killed")
 
     def test_kill_switch_and_no_owned_state(self) -> None:
         if sys.platform != "darwin":

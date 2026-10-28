@@ -54,6 +54,7 @@ import fcntl
 import importlib.machinery
 import importlib.util
 import json
+import math
 import os
 import platform
 import re
@@ -297,14 +298,19 @@ def idle_refusal(hook: Any, now: float, state: Path) -> str:
     return ""
 
 
-def nightly_reserve(hook: Any) -> tuple[float, float]:
+def nightly_reserve(hook: Any) -> tuple[float, float] | None:
     """(the dedicated nightly builder's disk floor here, one job's growth) in GiB from the runners' own hook
-    (builder_reserve_gib, job_disk_gib), or (0, 0) with no dedicated builder or a hook that predates them."""
+    (builder_reserve_gib, job_disk_gib); (0, 0) with no dedicated builder or a hook that predates those helpers;
+    None when they fail or answer something that is not a finite number, which keeps a catch-up from starting."""
+    if not (hasattr(hook, "builder_reserve_gib") and hasattr(hook, "job_disk_gib")):
+        return 0.0, 0.0
     try:
         builder = float(hook.builder_reserve_gib(HOME))
         growth = float(hook.job_disk_gib())
-    except Exception:  # noqa: BLE001 - an older hook has no reserve to keep
-        return 0.0, 0.0
+    except Exception:  # noqa: BLE001 - a reserve we cannot read is not a reserve we may ignore
+        return None
+    if not (math.isfinite(builder) and math.isfinite(growth)) or builder < 0 or growth < 0:
+        return None
     return (builder, growth) if builder > 0 else (0.0, 0.0)
 
 
@@ -314,12 +320,17 @@ def nightly_reserve_refusal(hook: Any) -> str:
     nightly job frees disk (the hook's NIGHTLY_DISK_RESERVE, Gate.low_disk); a catch-up is a compile like theirs.
     On 2026-10-28 cmux7s's catch-up took free disk from 46 to 31 GiB while its builder needed 42, so the builder's
     listener was held off and every PR runner with it."""
-    waiter = None
-    with contextlib.suppress(Exception):
-        waiter = hook.nightly_disk_waiter(FLEET_DIR / "capacity")
-    if waiter:
-        return f"a nightly job waits here for free disk ({waiter})"
-    builder, growth = nightly_reserve(hook)
+    if hasattr(hook, "nightly_disk_waiter"):
+        try:
+            waiter = hook.nightly_disk_waiter(FLEET_DIR / "capacity")
+        except Exception as error:  # noqa: BLE001
+            return f"cannot read the nightly disk waiters ({type(error).__name__})"
+        if waiter:
+            return f"a nightly job waits here for free disk ({waiter})"
+    reserve = nightly_reserve(hook)
+    if reserve is None:
+        return "cannot read the dedicated nightly builder's disk reserve"
+    builder, growth = reserve
     if builder <= 0:
         return ""
     free = free_bytes(FLEET_DIR)
@@ -636,6 +647,23 @@ def last_result(log: Path) -> dict[str, Any]:
 
 
 BUILD_DISK_WATCH_S = 15.0
+END_CHILD_WAIT_S = 10.0
+
+
+def end_child() -> None:
+    """Kill the build (its whole group when we lead one, and the child itself either way) and reap it. A child
+    that outlives END_CHILD_WAIT_S ends with our group, us included, so its locks go with it (as stop() does)."""
+    assert _child is not None
+    if _grouped:
+        kill_build()
+    with contextlib.suppress(OSError):
+        _child.kill()
+    try:
+        _child.wait(timeout=END_CHILD_WAIT_S)
+    except subprocess.TimeoutExpired:
+        if _grouped:
+            os.killpg(os.getpid(), signal.SIGKILL)
+        raise
 
 
 def build(checkout: Path, root: int, state: Path, xcode: str, log: Path,
@@ -660,12 +688,16 @@ def build(checkout: Path, root: int, state: Path, xcode: str, log: Path,
             except subprocess.TimeoutExpired:
                 pass
             free = free_bytes(FLEET_DIR) if stop_below else None
-            low = free is not None and stop_below is not None and free < stop_below
+            low = stop_below is not None and (free is None or free < stop_below)  # unknown free disk is short
             if low or time.monotonic() >= deadline:
-                kill_build() if _grouped else _child.kill()
-                _child.wait()
-                reason = (f"stopped at {free / 1024 ** 3:.1f} GiB free, under the dedicated nightly builder's "
-                          f"{stop_below / 1024 ** 3:g} GiB floor" if low else f"timed out after {BUILD_TIMEOUT_S} s")
+                end_child()
+                if not low:
+                    reason = f"timed out after {BUILD_TIMEOUT_S} s"
+                elif free is None:
+                    reason = "stopped: cannot read free disk while the dedicated nightly builder keeps a floor"
+                else:
+                    reason = (f"stopped at {free / 1024 ** 3:.1f} GiB free, under the dedicated nightly builder's "
+                              f"{stop_below / 1024 ** 3:g} GiB floor")
                 return {"kept": "false", "reason": reason, "wall_seconds": round(time.monotonic() - started, 1)}
     finally:
         _child = None
@@ -1332,6 +1364,10 @@ def run(apply: bool, state: Path, now: float | None = None) -> dict[str, Any]:
             busy = running()  # a job that started while the locks were taken: it will ask for them
             if busy:
                 return {**base, "state": "skip", "reason": f"busy: {busy}"}
+            reserve = nightly_reserve(hook)
+            if reserve is None:  # read moments ago in idle_refusal; gone unreadable since
+                return {**base, "state": "skip", "reason": "cannot read the dedicated nightly builder's disk reserve"}
+            builder = reserve[0]
             logs = work / "logs"
             logs.mkdir(exist_ok=True)
             log = logs / f"{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}-root-{root}.log"
@@ -1339,7 +1375,6 @@ def run(apply: bool, state: Path, now: float | None = None) -> dict[str, Any]:
             # failed try of this head on the next run, so it is not rebuilt into the same kill forever.
             memory["attempt"] = {"root": root, "head": head, "at": int(time.time())}
             save_memory(memory_path, memory)
-            builder, _growth = nightly_reserve(hook)
             result = build(work / "cmux", root, state, scope["xcode"], log,
                            stop_below=int(builder * 1024 ** 3) if builder > 0 else None)
             memory.pop("attempt", None)
