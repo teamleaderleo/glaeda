@@ -141,6 +141,13 @@ class GateTest(Base):
         waiter_broken = types.SimpleNamespace(nightly_disk_waiter=lambda capacity: broken(),
                                               builder_reserve_gib=lambda home: 0.0, job_disk_gib=lambda: 20.0)
         self.assertIn("cannot read the nightly disk waiters", warm.nightly_reserve_refusal(waiter_broken))
+        # The hook's own reader takes an unreadable capacity directory for no waiter; a catch-up does not.
+        quiet = types.SimpleNamespace(nightly_disk_waiter=lambda capacity: None,
+                                      builder_reserve_gib=lambda home: 0.0, job_disk_gib=lambda: 20.0)
+        self.assertEqual(warm.nightly_reserve_refusal(quiet), "", "no capacity directory yet: nothing waits")
+        (warm.FLEET_DIR / "capacity").mkdir(parents=True, exist_ok=True)
+        with unittest.mock.patch.object(warm.os, "scandir", side_effect=PermissionError("denied")):
+            self.assertIn("cannot read the nightly disk waiters (PermissionError)", warm.nightly_reserve_refusal(quiet))
 
     def test_no_dedicated_builder_or_an_older_hook_keeps_no_reserve(self) -> None:
         warm.free_bytes = lambda path: 1024 ** 3
@@ -369,41 +376,9 @@ class RunTest(Base):
         self.assertEqual(paused["state"], "skip")
         self.assertIn("paused", paused["reason"])
 
-    @unittest.skipUnless(sys.platform == "darwin", "runs only on macOS")
-    def test_a_build_under_the_builders_floor_is_stopped(self) -> None:
-        checkout = self.fake_setup(sleep="30")
-        saved = warm.BUILD_DISK_WATCH_S
-        try:
-            warm.BUILD_DISK_WATCH_S = 0.2
-            warm.free_bytes = lambda path: 39 * 1024 ** 3
-            log = self.dir / "build.log"
-            started = time.monotonic()
-            result = warm.build(checkout, 2, self.state, "/Applications/Xcode_26.6.app", log,
-                                stop_below=40 * 1024 ** 3)
-            self.assertLess(time.monotonic() - started, 20, "stopped long before the fake build ends")
-            self.assertEqual(result["kept"], "false")
-            self.assertIn("stopped at 39.0 GiB free, under the dedicated nightly builder's 40 GiB floor",
-                          result["reason"])
-            warm.free_bytes = lambda path: 100 * 1024 ** 3
-            os.environ["FAKE_SLEEP"] = "0"
-            self.assertEqual(warm.build(checkout, 2, self.state, "/x.app", log, stop_below=40 * 1024 ** 3)["kept"],
-                             "true", "room to spare: the build finishes")
-            saved_timeout = warm.BUILD_TIMEOUT_S
-            try:
-                warm.BUILD_TIMEOUT_S = 1
-                os.environ["FAKE_SLEEP"] = "30"
-                timed = warm.build(checkout, 2, self.state, "/x.app", log, stop_below=40 * 1024 ** 3)
-                self.assertEqual((timed["kept"], timed["reason"]), ("false", "timed out after 1 s"))
-            finally:
-                warm.BUILD_TIMEOUT_S = saved_timeout
-        finally:
-            warm.BUILD_DISK_WATCH_S = saved
-
-    @unittest.skipUnless(sys.platform == "darwin", "runs only on macOS")
-    def test_unknown_free_disk_stops_the_whole_build_group(self) -> None:
-        # In a driver that leads its own process group, as the LaunchAgent run does, so kill_build ends the
-        # fake build's `sleep` grandchild too, not only the shell.
-        checkout = self.fake_setup()
+    def grouped_build(self, checkout: Path, free: str, sleep: str, timeout_s: int | None = None) -> dict:
+        """build() in a driver that leads its own process group, as the LaunchAgent run does, so kill_build ends
+        the fake build's `sleep` grandchild too; asserts no `sleep SLEEP` is left."""
         driver = self.dir / "glaeda-idle-warm-watch-driver.py"
         driver.write_text(textwrap.dedent(f"""
             import importlib.machinery, importlib.util, json
@@ -414,20 +389,42 @@ class RunTest(Base):
             loader.exec_module(warm)
             warm.FLEET_DIR = Path({os.fspath(self.dir / 'fleet')!r})
             warm.BUILD_DISK_WATCH_S = 0.2
-            warm.free_bytes = lambda path: None
+            if {timeout_s!r} is not None:
+                warm.BUILD_TIMEOUT_S = {timeout_s!r}
+            warm.free_bytes = lambda path: {free}
             warm._grouped = warm.own_group()
             assert warm._grouped
             print(json.dumps(warm.build(Path({os.fspath(checkout)!r}), 2, Path({os.fspath(self.state)!r}), "/x.app",
                                         Path({os.fspath(self.dir / 'watch.log')!r}), stop_below=40 * 1024 ** 3)))
         """))
         proc = subprocess.run([sys.executable, os.fspath(driver)], capture_output=True, text=True, timeout=60,
-                              env={**os.environ, "FAKE_SLEEP": "137"})
+                              env={**os.environ, "FAKE_SLEEP": sleep})
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        result = json.loads(proc.stdout.strip().splitlines()[-1])
+        leftover = subprocess.run(["/usr/bin/pgrep", "-f", f"sleep {sleep}$"], capture_output=True, text=True).stdout
+        self.assertEqual(leftover.strip(), "", "the build's whole process group was killed")
+        return json.loads(proc.stdout.strip().splitlines()[-1])
+
+    @unittest.skipUnless(sys.platform == "darwin", "runs only on macOS")
+    def test_a_build_under_the_builders_floor_is_stopped(self) -> None:
+        checkout = self.fake_setup()
+        started = time.monotonic()
+        result = self.grouped_build(checkout, "39 * 1024 ** 3", "131")
+        self.assertLess(time.monotonic() - started, 30, "stopped long before the fake build ends")
+        self.assertEqual(result["kept"], "false")
+        self.assertIn("stopped at 39.0 GiB free, under the dedicated nightly builder's 40 GiB floor", result["reason"])
+        self.assertEqual(self.grouped_build(checkout, "100 * 1024 ** 3", "0")["kept"], "true",
+                         "room to spare: the build finishes")
+
+    @unittest.skipUnless(sys.platform == "darwin", "runs only on macOS")
+    def test_a_watched_build_still_times_out(self) -> None:
+        result = self.grouped_build(self.fake_setup(), "100 * 1024 ** 3", "133", timeout_s=1)
+        self.assertEqual((result["kept"], result["reason"]), ("false", "timed out after 1 s"))
+
+    @unittest.skipUnless(sys.platform == "darwin", "runs only on macOS")
+    def test_unknown_free_disk_stops_the_whole_build_group(self) -> None:
+        result = self.grouped_build(self.fake_setup(), "None", "137")
         self.assertEqual(result["kept"], "false")
         self.assertIn("cannot read free disk", result["reason"])
-        leftover = subprocess.run(["/usr/bin/pgrep", "-f", "sleep 137"], capture_output=True, text=True).stdout
-        self.assertEqual(leftover.strip(), "", "the build's whole process group was killed")
 
     def test_kill_switch_and_no_owned_state(self) -> None:
         if sys.platform != "darwin":

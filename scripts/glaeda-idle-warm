@@ -322,6 +322,14 @@ def nightly_reserve_refusal(hook: Any) -> str:
     listener was held off and every PR runner with it."""
     if hasattr(hook, "nightly_disk_waiter"):
         try:
+            # the hook's reader takes an unreadable directory for no waiter; here that is unknown, so short
+            with os.scandir(FLEET_DIR / "capacity"):
+                pass
+        except FileNotFoundError:
+            pass
+        except OSError as error:
+            return f"cannot read the nightly disk waiters ({type(error).__name__})"
+        try:
             waiter = hook.nightly_disk_waiter(FLEET_DIR / "capacity")
         except Exception as error:  # noqa: BLE001
             return f"cannot read the nightly disk waiters ({type(error).__name__})"
