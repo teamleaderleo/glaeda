@@ -3686,13 +3686,29 @@ def home_scratch_reference_files() -> list[Path]:
     (a dedicated runner's admission names its builder folder there, e.g. CNX_BUILDS_ROOT), whatever its suffix.
     Symlinks are followed for reading; the runner's credential files are never read. A folder that exists but cannot
     be listed raises OSError, so the caller keeps the item."""
-    files = [*_reference_files(), *_strict_entries(Path("/Library/LaunchAgents"), "*.plist"),
+    files = [HOME / ".codex/hooks.json", HOME / ".codex/config.toml", HOME / ".claude/settings.json",
+             *(HOME / n for n in (".profile", ".bashrc", ".bash_profile", ".bash_login", ".zshrc", ".zprofile",
+                                  ".zlogin", ".zshenv", ".kshrc")), HOME / ".config/fish/config.fish",
+             *_strict_entries(Path("/Library/LaunchAgents"), "*.plist"),
              *_strict_entries(Path("/Library/LaunchDaemons"), "*.plist"),
              *_strict_entries(HOME / "Library/LaunchAgents", "*.plist")]
+    systemd = HOME / ".config/systemd/user"
+    if systemd.exists():
+        def fail(error: OSError) -> None:
+            raise error
+        for dirpath, _, filenames in os.walk(systemd, onerror=fail, followlinks=True):
+            files += [Path(dirpath) / n for n in sorted(filenames)]
     for runner in _strict_entries(HOME, "actions-runner*"):
         for d in (runner, runner / "glaeda-hooks"):
             files += [f for f in _strict_entries(d) if not f.name.startswith(".credentials")]
-    return [f for f in dict.fromkeys(files) if f.is_file()]
+    out = []
+    for f in dict.fromkeys(files):
+        try:
+            if stat.S_ISREG(f.stat().st_mode):  # through a link; a broken link names nothing
+                out.append(f)
+        except FileNotFoundError:
+            continue
+    return out  # any other stat failure raised OSError above: the caller keeps the item
 
 
 def _home_scratch_ref_text(config: Path) -> str | None:
@@ -3724,17 +3740,19 @@ def home_scratch_referenced(path: Path) -> str:
     """Why a home-scratch folder stays because configuration names it ("" when nothing does): a launchd job, a shell
     or agent config, a runner script or hook, or a ~/.local/bin symlink into it. Unreadable configuration keeps it.
     Each file is re-read only when it changed since the last item (survey, apply and the final recheck all ask)."""
-    spellings = (*_reference_spellings(path), f"~/{path.name}", f"$HOME/{path.name}", "${HOME}/" + path.name)
     try:
         real = path.resolve()
-        local_bin = HOME / ".local/bin"
-        if local_bin.is_dir():
-            for entry in local_bin.iterdir():
-                if entry.is_symlink() and Path(os.path.realpath(entry)).is_relative_to(real):
-                    return f"named by {entry}"
+        for entry in _strict_entries(HOME / ".local/bin"):
+            if entry.is_symlink() and Path(os.path.realpath(entry)).is_relative_to(real):
+                return f"named by {entry}"
+        # a link at the top of HOME into the folder (~/runner-link -> ~/actions-runner-x) is another name for it
+        aliases = [e for e in _strict_entries(HOME) if e.is_symlink() and e != path
+                   and Path(os.path.realpath(e)).is_relative_to(real)]
         files = home_scratch_reference_files()
     except OSError:
         return "home folder references unreadable"
+    spellings = tuple(dict.fromkeys(s for p in (path, *aliases) for s in (
+        *_reference_spellings(p), f"~/{p.name}", f"$HOME/{p.name}", "${HOME}/" + p.name)))
     inside = (os.path.abspath(path) + "/", os.path.realpath(path) + "/")
     for config in files:
         if os.path.abspath(config).startswith(inside):
@@ -3964,6 +3982,7 @@ def default_families(role: str = "fleet-mini") -> list[Family]:
                                platform="macos"))
             fams.append(Family(RETIRED_RUNNER_FAMILY, HOME, True, "nothing runs it: glaeda's runner replaced it",
                                include=("actions-runner",), skip_prefixes=("actions-runner-glaeda",),
+                               skip=tuple(r.name for r in enrolled_runners()),  # glaeda's, whatever --runner-dir
                                git_disposable=True, nested_git=True, min_idle_hours=DEFAULT_AGE_HOURS,
                                mirror_idle_hours=CMUX_JOB_MIRROR_HOURS, owner="a hand-made GitHub runner",
                                rebuild_minutes=10, platform="macos"))

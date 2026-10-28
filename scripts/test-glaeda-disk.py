@@ -9402,6 +9402,32 @@ class HomeScratchTest(unittest.TestCase):
         self.assertEqual(set(kept), {os.fspath(self.home / p) for p in
                                      ("Library/Caches/x", "actions-runner-glaeda-2/_work", ".cache/y")})
 
+    def test_a_glaeda_runner_in_a_custom_directory_is_never_a_retired_runner(self) -> None:
+        custom = self.tree("actions-runner-custom")
+        (custom / ".runner").write_text("{}")
+        (custom / "glaeda-hooks").mkdir()
+        self.age(custom)
+        with mock.patch.object(gd, "enrolled_runners", return_value=[custom]):
+            fam = next(f for f in gd.default_families() if f.id == gd.RETIRED_RUNNER_FAMILY)
+        self.assertNotIn("actions-runner-custom", self.survey(fam))
+
+    def test_a_link_alias_named_by_configuration_keeps_it(self) -> None:
+        tree = self.tree("cnx-aliased")
+        (self.home / "runner-link").symlink_to(tree)
+        (self.home / ".zshrc").write_text("export ROOT=~/runner-link/bin\n")
+        self.assertEqual(gd.home_scratch_referenced(tree), f"named by {self.home / '.zshrc'}")
+
+    def test_a_configuration_file_that_cannot_be_stat_keeps_it(self) -> None:
+        tree = self.tree("cnx-stat")
+        (self.home / ".zshrc").write_text("x\n")
+        real_stat = gd.Path.stat
+        def stat(p, *a, **k):
+            if p == self.home / ".zshrc":
+                raise PermissionError(13, "denied")
+            return real_stat(p, *a, **k)
+        with mock.patch.object(gd.Path, "stat", stat):
+            self.assertEqual(gd.home_scratch_referenced(tree), "home folder references unreadable")
+
     def test_unreadable_configuration_keeps_it(self) -> None:
         self.tree("cnx-locked")
         (self.home / ".zshrc").write_text("export X=1\n")
