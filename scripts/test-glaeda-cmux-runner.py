@@ -5046,6 +5046,7 @@ class MirrorBorrowTest(unittest.TestCase):
         self.assertFalse((self.ws / ".git").exists())
         self.assertTrue((self.ws / "local.txt").exists())  # only .git goes; checkout clones into the workspace
 
+    @unittest.skipUnless(hasattr(os.stat("."), "st_birthtime"), "the device counts where there is no birth time")
     def test_a_reboot_that_renumbers_the_volume_keeps_the_borrower(self) -> None:
         """2026-10-28 15:41Z: a reboot changed the mirror volume's device number, and every borrower on the
         mini lost its .git at its next job-started (a 463 s refetch and dangling submodule gitfiles)."""
@@ -5100,12 +5101,37 @@ class MirrorBorrowTest(unittest.TestCase):
         real_run = subprocess.run
         failing = lambda argv, *a, **k: (subprocess.CompletedProcess(argv, 1) if argv[:2] == ["git", "init"]  # noqa: E731
                                          else real_run(argv, *a, **k))
+        (self.ws / ".glaeda-git-swap-1").mkdir()  # someone's directory with the scratch prefix stays
+        (self.ws / ".glaeda-git-swap-1/keep").write_text("x\n")
         with mock.patch.object(hook.subprocess, "run", side_effect=failing):
             note = hook.guard_borrowed_checkout(os.fspath(self.ws), self.mirror)
         self.assertIn("OSError", note)
+        self.assertEqual((self.ws / ".glaeda-git-swap-1/keep").read_text(), "x\n")
+        shutil.rmtree(self.ws / ".glaeda-git-swap-1")
         self.assertTrue((self.ws / ".git/modules/ghostty/HEAD").is_file())
         self.assertEqual(hook.alternates_of(self.ws / ".git"), [os.fspath(self.mirror / "objects")])
         self.assertFalse(any(p.name.startswith(".glaeda-") for p in self.ws.iterdir()))
+
+    def test_a_failed_move_puts_the_submodule_stores_back(self) -> None:
+        self.borrow()
+        (self.ws / ".git/modules/ghostty").mkdir(parents=True)
+        (self.ws / ".git/modules/ghostty/HEAD").write_text("ref: refs/heads/main\n")
+        real_rename = os.rename
+        for failing_call in (2, 3):
+            with self.subTest(failing_call=failing_call):
+                calls = []
+
+                def rename(src, dst, calls=calls, failing_call=failing_call):
+                    calls.append((src, dst))
+                    if len(calls) == failing_call:
+                        raise OSError("injected")
+                    return real_rename(src, dst)
+                with mock.patch.object(hook.os, "rename", side_effect=rename):
+                    with self.assertRaises(OSError):
+                        hook.drop_checkout_store(self.ws / ".git")
+                self.assertTrue((self.ws / ".git/modules/ghostty/HEAD").is_file())
+                self.assertEqual(hook.alternates_of(self.ws / ".git"), [os.fspath(self.mirror / "objects")])
+                self.assertFalse(any(p.name.startswith(".glaeda-") for p in self.ws.iterdir()))
 
     def test_without_a_birth_time_the_device_still_counts(self) -> None:
         self.borrow()

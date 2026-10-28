@@ -215,6 +215,7 @@ import stat
 import struct
 import subprocess
 import sys
+import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor, wait
 from dataclasses import asdict, dataclass, field, replace
@@ -821,7 +822,7 @@ CMUX_NEXT_DRAIN_HOOK_SHA256 = frozenset({
     "95b700d406639698456d2d536eea9d698b329191a732b24608a673c1e9353d98",
     "ea3e56492347b8a0b68427496eb010eec75b6dc9e3733989c47d0f6f78e18fc9",
     "116bd4fa210f949c76cf3a90d73999f5f22e06cb38ff2c7320dee32af449c285",
-    "9141428846ac72068c86d5ed1a2b98ef98c2950b72909327b9f311f86d8b8504",
+    "f0399a101d657f73563eaef43c8d08129609657e4b206db4e413b42b1b1c4ccc",
 })
 CMUX_NEXT_CI_PRESERVED_NAMES = frozenset({
     "SourcePackages", "ModuleCache.noindex", "SDKStatCaches.noindex",
@@ -3035,31 +3036,45 @@ def live_linked_worktrees(checkout: Path) -> list[str] | None:
 def remove_checkout_store(checkout: Path) -> str:
     """Remove a runner checkout's own git store and leave an empty repository in its place, keeping its submodules'
     stores (.git/modules) so no submodule gitfile in the workspace names a store that is gone. Returns what was kept,
-    or "". Raises OSError, with the store untouched when git cannot make the empty repository."""
+    or "". Raises OSError, with the store whole, when git cannot make the empty repository or a move fails."""
     git_dir = checkout / ".git"
     modules = git_dir / "modules"
     if modules.is_symlink() or not modules.is_dir():
         remove(git_dir)
         return ""
-    # The fresh repository is made first, beside the old one: if git cannot make it, nothing has been removed
-    # (OSError), and the old store stays whole for the next pass. Then three renames on one filesystem put it in
-    # place with the submodule stores moved into it, and only the old store's remainder is deleted.
-    scratch = git_dir.with_name(f".glaeda-fresh-git-{os.getpid()}")
+    # remove()'s refusals, on the store where it is, before anything moves
+    if toolchain_held(git_dir, fresh=True) or git_dir.is_symlink() or os.path.ismount(git_dir) \
+            or git_dir.lstat().st_dev != checkout.stat().st_dev:
+        raise OSError("refusing a kept, linked or mounted store")
+    # The fresh repository is made first, in a directory made for this call alone (mkdtemp): if git cannot make
+    # it, only that directory goes and the old store stays whole. Then the submodule stores move into the fresh
+    # repository, the old store moves out and the fresh one takes its place: renames within the workspace, each
+    # undone if a later one fails, so an error never leaves the workspace without its submodule stores.
+    work = Path(tempfile.mkdtemp(prefix=".glaeda-git-swap-", dir=git_dir.parent))
+    fresh, old = work / "fresh", work / "old"
     env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
     try:
-        made = subprocess.run(["git", "init", "-q", os.fspath(scratch)], capture_output=True, timeout=60, env=env,
-                              check=False).returncode == 0 and (scratch / ".git" / "HEAD").is_file()
+        made = subprocess.run(["git", "init", "-q", os.fspath(fresh)], capture_output=True, timeout=60, env=env,
+                              check=False).returncode == 0 and (fresh / ".git" / "HEAD").is_file()
     except (OSError, subprocess.SubprocessError):
         made = False
     if not made:
-        shutil.rmtree(scratch, ignore_errors=True)
+        shutil.rmtree(work, ignore_errors=True)
         raise OSError("git init failed; the checkout's store was kept")
-    doomed = git_dir.with_name(f".glaeda-old-git-{os.getpid()}")
-    os.rename(git_dir, doomed)
-    os.rename(scratch / ".git", git_dir)
-    os.rename(doomed / "modules", git_dir / "modules")
-    scratch.rmdir()
-    remove(doomed)
+    os.rename(modules, fresh / ".git" / "modules")
+    try:
+        os.rename(git_dir, old)
+        try:
+            os.rename(fresh / ".git", git_dir)
+        except OSError:
+            os.rename(old, git_dir)
+            raise
+    except OSError:
+        os.rename(fresh / ".git" / "modules", modules)
+        shutil.rmtree(work, ignore_errors=True)
+        raise
+    remove(old)
+    shutil.rmtree(work, ignore_errors=True)
     return "kept its submodule stores (.git/modules)"
 
 

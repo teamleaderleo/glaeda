@@ -5249,13 +5249,23 @@ class GlaedaDiskTest(unittest.TestCase):
         with patches[0], patches[1], mock.patch.object(gd, "host_reservation", return_value=""), self._starting():
             note = gd.evict_own_runner_checkout(bloated, self.receipt(), home)
         self.assertIn("kept its submodule stores", note)
-        self.assertEqual([Path(r).name for r in removed], [f".glaeda-old-git-{os.getpid()}"])  # the old store only
+        self.assertEqual([(Path(r).name, Path(r).parent.parent) for r in removed], [("old", bloated)])  # old store only
         self.assertFalse(any(p.name.startswith(".glaeda-") for p in bloated.iterdir()))
         self.assertTrue((store / "HEAD").is_file())
         self.assertEqual(gd.git_pack_bytes(bloated / ".git"), 0)  # the bloat is gone
         run = lambda *a: subprocess.run(["git", *a], capture_output=True, text=True, env=env)  # noqa: E731
         self.assertEqual(run("-C", os.fspath(bloated), "rev-parse", "--git-dir").returncode, 0)  # a repository still
         self.assertEqual(run("-C", os.fspath(bloated / "ghostty"), "rev-parse", "--git-dir").returncode, 0)
+
+    def test_a_kept_store_is_refused_before_anything_moves(self) -> None:
+        co = self.root / "ws"
+        (co / ".git/modules/ghostty").mkdir(parents=True)
+        (co / ".git/HEAD").write_text("ref: refs/heads/main\n")
+        with mock.patch.object(gd, "toolchain_held", side_effect=lambda p, fresh=False: p == co / ".git"):
+            with self.assertRaises(OSError):
+                gd.remove_checkout_store(co)
+        self.assertEqual(sorted(p.name for p in (co / ".git").iterdir()), ["HEAD", "modules"])
+        self.assertEqual([p.name for p in co.iterdir()], [".git"])
 
     def test_the_job_start_keeps_the_whole_store_when_git_cannot_make_a_new_one(self) -> None:
         home, cos = self._own_checkout_fixture()
