@@ -5778,7 +5778,8 @@ def prune_foreign_archives(now: float | None = None, in_use=lambda p: False) -> 
         if newest is None or newest >= cutoff or mount_below(p) or in_use(p):
             continue
         try:
-            check = (lambda q=p, n=newest: _foreign_archive_recheck(q, root_id, n, in_use))
+            ident = (e.inode(), os.lstat(p).st_dev)[::-1]
+            check = (lambda q=p, n=newest, i=ident: _foreign_archive_recheck(q, root_id, n, in_use, i))
             if p.is_dir():
                 remove(p, after_rename=check)
             else:  # remove() unlinks a file in place; this one is renamed aside and checked again first
@@ -5811,14 +5812,16 @@ def _newest_change(p: Path, top_ctime: bool = True) -> float | None:
     return None if errors else newest
 
 
-def _foreign_archive_recheck(path: Path, root_id: tuple[int, int], newest_before: float, in_use) -> None:
+def _foreign_archive_recheck(path: Path, root_id: tuple[int, int], newest_before: float, in_use,
+                             entry_id: tuple[int, int] | None = None) -> None:
     """after_rename for an expired archive: the renamed entry is still in the same ~/archive directory (not one
     swapped in through a symlink), nothing below it changed since the first look (the rename itself sets the
     entry's own ctime, so its ctime is not read again), no mount, and nothing uses it; else it goes back."""
     doomed = path.with_name(f"{DELETING_PREFIX}{path.name}-{os.getpid()}")
     try:
-        parent = os.lstat(doomed.parent)
-        same = (parent.st_dev, parent.st_ino) == root_id and not stat.S_ISLNK(parent.st_mode)
+        parent, entry = os.lstat(doomed.parent), os.lstat(doomed)
+        same = (parent.st_dev, parent.st_ino) == root_id and not stat.S_ISLNK(parent.st_mode) and (
+            entry_id is None or (entry.st_dev, entry.st_ino) == entry_id)  # not one swapped in before the rename
     except OSError:
         same = False
     newest = _newest_change(doomed, top_ctime=False) if same else None
@@ -5923,6 +5926,14 @@ def work_tree_changes(root: Path, trees: set[str]) -> tuple[str, bytes, list[tup
     if any(f[0] == ":160000" or (len(f) > 1 and f[1] == "160000")
            for f in (ln.split() for ln in raw.splitlines()) if f):
         return "a submodule pointer changed", b"", []
+    # the patch is the work tree against HEAD: a staged path whose work-tree copy differs from the index holds
+    # content only the index has, which no patch of the work tree carries
+    staged = _git_dir_run(g, "--work-tree", str(root), "diff", "--cached", "--name-only", "-z", "HEAD")
+    unstaged = _git_dir_run(g, "--work-tree", str(root), "diff", "--name-only", "-z")
+    if staged is None or unstaged is None:
+        return "unreadable index", b"", []
+    if (both := set(filter(None, staged.split("\0"))) & set(filter(None, unstaged.split("\0")))):
+        return f"staged content differs from the work tree ({sorted(both)[0]})", b"", []
     env = {**os.environ, "GIT_OPTIONAL_LOCKS": "0", "GIT_TERMINAL_PROMPT": "0"}
     try:
         diff = subprocess.run(["git", "--git-dir", str(g), "--work-tree", str(root), "diff", "HEAD", "--binary",

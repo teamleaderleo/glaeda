@@ -7674,6 +7674,14 @@ class LinuxLayoutTest(unittest.TestCase):
         self.assertIn("its uncommitted work changed while it was archived", rec["reasons"])
         self.assertEqual((clone / "tracked.txt").read_text(), "v3, edited while it was archived\n")
 
+    def test_staged_content_the_work_tree_no_longer_has_keeps_the_mirror(self) -> None:
+        unit, clone, env = self.dirty_mirror()
+        (clone / "staged.txt").unlink()  # AD: the staged blob is only in the index
+        rec, _ = self.apply_mirror(unit)
+        self.assertEqual(rec["outcome"], "blocked:uncommitted")
+        self.assertTrue(any("staged content differs" in r for r in rec["reasons"]))
+        self.assertTrue((clone / ".git").is_dir())
+
     def test_an_archive_that_changes_before_the_delete_keeps_the_mirror(self) -> None:
         unit, clone, _ = self.dirty_mirror()
         why, written, recheck = gd.archive_mirror(unit)
@@ -8981,13 +8989,41 @@ class HygieneMirrorTest(unittest.TestCase):
         root = os.lstat(archive)
         doomed = old.with_name(f"{gd.DELETING_PREFIX}old-{os.getpid()}")
         os.rename(old, doomed)
-        os.chmod(doomed, 0o755)  # a ctime-only change of the entry itself, as the rename makes
-        self.assertGreater(gd._newest_change(doomed), newest)  # read with its ctime, it looks new
-        gd._foreign_archive_recheck(old, (root.st_dev, root.st_ino), newest, lambda p: False)  # passes: no raise
+        st = os.lstat(doomed)
+        later = newest + 3600  # the rename's ctime, made deterministic: never read as the entry's age
+        real = os.lstat
+
+        def lstat(q, *a, **k):
+            r = real(q, *a, **k)
+            return os.stat_result((*r[:9], later)) if os.fspath(q) == os.fspath(doomed) else r
+        with mock.patch.object(gd.os, "lstat", side_effect=lstat):
+            gd._foreign_archive_recheck(old, (root.st_dev, root.st_ino), newest, lambda p: False,
+                                        (st.st_dev, st.st_ino))  # passes: no raise
         (doomed / "a.patch").write_text("changed")
+        later = newest + 3600
+        os.utime(doomed / "a.patch", (later, later))
         with self.assertRaises(gd.SlotTaken):
             gd._foreign_archive_recheck(old, (root.st_dev, root.st_ino), newest, lambda p: False)
         self.assertEqual((old / "a.patch").read_text(), "changed")  # put back
+
+    def test_an_archive_swapped_for_another_before_its_rename_is_kept(self) -> None:
+        archive = gd.HOME / "archive"
+        archive.mkdir(parents=True)
+        f = archive / "loose.patch"
+        f.write_text("old")
+        first = os.lstat(f)
+        f.unlink()
+        f.write_text("new contents")  # a fresh file at the same name, its mtime set back
+        os.utime(f, (first.st_mtime, first.st_mtime))
+        root = os.lstat(archive)
+        doomed = f.with_name(f"{gd.DELETING_PREFIX}{f.name}-{os.getpid()}")
+        os.rename(f, doomed)
+        if (os.lstat(doomed).st_ino) == first.st_ino:
+            self.skipTest("the filesystem reused the inode")
+        with self.assertRaises(gd.SlotTaken):
+            gd._foreign_archive_recheck(f, (root.st_dev, root.st_ino), first.st_mtime + 1, lambda p: False,
+                                        (first.st_dev, first.st_ino))
+        self.assertEqual(f.read_text(), "new contents")
 
     def test_existing_archive_dirs_and_manifest_are_tightened(self) -> None:
         root = gd.mirror_archive()
