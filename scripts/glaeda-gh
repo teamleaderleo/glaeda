@@ -370,6 +370,7 @@ CONTENT_ONLY = re.compile(r"content creation", re.I)  # "...temporarily blocked 
 PACE_FILE = "pace.json"
 PACE_CLI = Path.home() / ".local/lib/gh-quota/bin/gh"  # a link into the pacer's checkout, next to gh_quota.py
 PACE_DEADLINE = 5
+PACE_HOLD_MAX = 3600
 # A private repository on a plan without branch protection or rulesets answers 403 with this: there are
 # no requirements to read, as for a deleted base branch.
 NO_FEATURE = re.compile(r"Upgrade to GitHub Pro|make this repository public to enable this feature", re.I)
@@ -1408,6 +1409,8 @@ class Daemon:
             str(k): [float(t) for t in v if isinstance(t, (int, float))]
             for k, v in (spends or {}).items() if isinstance(v, list)}
         self.payer: dict[str, tuple[str, float]] = {}  # head key -> (consumer, time) charged for a read in flight
+        self.spill: list[dict] = []  # entries a fetch could not finish because GraphQL stopped partway
+        self.refunded: dict[str, str] = {}  # head key -> the consumer a failed read refunded, this tick
         self.denied: dict[str, float] = {}  # consumer -> when a head read it needed was refused for budget
         self.saved_consumers: str = ""
         self.policy = daemon_policy()  # re-read at the start of every tick
@@ -1676,7 +1679,7 @@ class Daemon:
         hold = doc.get("hold") if isinstance(doc, dict) else None
         until = hold.get("until") if isinstance(hold, dict) else None
         if isinstance(until, (int, float)) and not isinstance(until, bool) and until > max(self.clock(), self.secondary_until):
-            until = min(until, self.clock() + SECONDARY_BACKOFF_MAX)  # a corrupt far future holds no longer than ours
+            until = min(until, self.clock() + PACE_HOLD_MAX)  # a corrupt far future holds an hour at most
             if until > self.secondary_until:
                 self.secondary_until = until
                 for b in self.backoff:
@@ -2109,6 +2112,14 @@ class Daemon:
         paid = self.payer.pop(key, None)
         if paid and paid[1] in self.head_spend.get(paid[0], []):
             self.head_spend[paid[0]].remove(paid[1])
+            self.refunded[key] = paid[0]
+
+    def head_answered(self, key: str) -> None:
+        """A head read answered: its charge stands, and one a failed read on the other bucket refunded this tick
+        is charged again, so a fallback never reads a head for free past its consumer's cap."""
+        if self.payer.pop(key, None) is None and key in self.refunded:
+            self.head_spend.setdefault(self.refunded[key], []).append(self.now)
+        self.refunded.pop(key, None)
 
     def due_heads(self, mine: list[dict], mode: str) -> list[dict]:
         """Heads somebody asked for recently whose answer is missing or older than its TTL. One read serves
@@ -2169,6 +2180,8 @@ class Daemon:
         self.clock_real = now is None
         self.tick_deadline = time.monotonic() + TICK_BUDGET
         self.errors = []
+        self.refunded = {}
+        self.spill = []
         self.policy = daemon_policy()
         self.jobs_only = []
         if self.failing is None:
@@ -2502,6 +2515,7 @@ class Daemon:
                 return chunk + [e for c in queue for e in c]
             try:
                 error = fetch(chunk)
+                spilled, self.spill = self.spill, []
             except OutOfTime:
                 self.defer(chunk + [e for c in queue for e in c])
                 return []
@@ -2510,6 +2524,8 @@ class Daemon:
                 continue
             if error and self.mode("graphql") == "stop":
                 return chunk + [e for c in queue for e in c]  # this query hit the limit: nothing was read
+            if spilled:
+                return spilled + [e for c in queue for e in c]
             if len(chunk) == 1 and chunk[0]["key"] in self.heavy or (len(chunk) == 1 and error and SLOW.search(error)):
                 # a lone read says nothing about the batch size; it only judges this entry
                 h = self.heavy.setdefault(chunk[0]["key"], {"at": self.now, "fails": 0, "oks": 0})
@@ -2681,9 +2697,11 @@ class Daemon:
             if isinstance(result, str):
                 self.store(e["key"], e["cache"], error=result)
                 self.refund(e["key"])
+                if self.mode("graphql") == "stop":
+                    self.spill.append(e)  # a later page met the limit: REST reads it this tick
             else:
                 self.store(e["key"], e["cache"], error=None, dataAt=self.now, data=result, restParts=None, via="graphql")
-                self.payer.pop(e["key"], None)  # answered: the charge stands
+                self.head_answered(e["key"])
 
     def head_pages(self, owner: str, repo: str, sha: str, contexts: dict) -> dict | str:
         """A head's data from its first page of contexts, following the rest page by page; an error message
@@ -2961,7 +2979,7 @@ class Daemon:
         fold_contexts(rest_contexts(checks, statuses, runs, set(), workflows), found, statuses_by, ids)
         self.store(e["key"], e["cache"], error=None, dataAt=self.now, data=head_data(sha, found, statuses_by, ids),
                    restParts=parts, via="rest")
-        self.payer.pop(e["key"], None)  # answered: the charge stands
+        self.head_answered(e["key"])
 
     def fetch_comment_rest(self, e: dict) -> None:
         """One comment watch over REST, for when GraphQL is low or throttled: the issue (its state and comment

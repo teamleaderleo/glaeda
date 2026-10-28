@@ -1961,6 +1961,33 @@ class FallbackTest(Base):
         self.daemon.tick(NOW + gg.TICK)
         self.assertEqual(len(self.gh.calls), 1)
 
+    def test_a_head_whose_second_page_meets_the_limit_is_read_over_rest_and_charged_once(self) -> None:
+        many = [check_run(f"CI / job-{i}") for i in range(150)]
+        self.gh.heads[("o", "r", "e" * 40)] = many
+        key = f"head:o/r@{'e' * 40}"
+        gg.register(key, consumer="session-1")
+        real = self.gh.__call__
+        def second_page_spent(method, url, headers, body):
+            if url.endswith("/graphql") and b'after:' in (body or b""):
+                return self.GQL_SPENT
+            return real(method, url, headers, body)
+        self.daemon.transport = second_page_spent
+        self.daemon.tick(NOW)
+        entry = gg.read_cache(key)
+        self.assertEqual(entry["via"], "rest")
+        self.assertEqual(len(entry["data"]["found"]), 150)
+        self.assertEqual(len(self.daemon.head_spend["session-1"]), 1)  # refunded by the failure, charged by REST
+
+    def test_a_long_pacer_hold_is_honoured(self) -> None:
+        gg.BASE.mkdir(parents=True, exist_ok=True)
+        self.daemon.clock_real = True
+        gg.write_json(gg.BASE / gg.PACE_FILE, {"hold": {"until": time.time() + 1800}})
+        self.daemon.adopt_pace_hold()
+        self.assertGreater(self.daemon.secondary_until, time.time() + 1700)
+        gg.write_json(gg.BASE / gg.PACE_FILE, {"hold": {"until": time.time() + 10 ** 9}})
+        self.daemon.adopt_pace_hold()
+        self.assertLessEqual(self.daemon.secondary_until, time.time() + gg.PACE_HOLD_MAX)
+
     def test_a_malformed_force_low_never_stops_the_daemon(self) -> None:
         for value in (True, 1, None, {"graphql": 1}, "graphql"):
             gg.write_json(gg.DAEMON_CONFIG, {"forceLow": value})
