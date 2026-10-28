@@ -1998,7 +1998,7 @@ def export_job_claim(capacity_units: int, taken: dict[str, Any], note: str) -> s
     if capacity_units > 0:
         whole = taken.get("class") == EXCLUSIVE_CLASS and taken.get("units") == capacity_units
     else:
-        whole = not note.startswith("no fleet host lock")
+        whole = note.startswith(HOST_LOCK_HELD)  # take_host_lock's own note: never a dedicated runner's, which holds nothing
     target = os.environ.get("GITHUB_ENV")
     if not whole or not target:
         return ""
@@ -3698,6 +3698,9 @@ def close_all(fds: list[int]) -> None:
             os.close(fd)
 
 
+HOST_LOCK_HELD = "holding the fleet host lock for this job"
+
+
 def take_host_lock(path: str, watch_pid: int | JobOwner, state_dir: Path) -> tuple[bool, str]:
     """Take the fleet host lock without waiting and leave it with a detached holder for this job.
     Admitted only once the holder itself reports its pid, so a holder that died never counts."""
@@ -3726,7 +3729,7 @@ def take_host_lock(path: str, watch_pid: int | JobOwner, state_dir: Path) -> tup
             os.close(fd)
             return False, "another build holds the fleet host lock"
     held, note = hold([fd], watch_pid, state_dir)
-    return held, (f"holding the fleet host lock for this job ({note})" if held else note)
+    return held, (f"{HOST_LOCK_HELD} ({note})" if held else note)
 
 
 def lock_file(path: Path, mode: int) -> int | None:

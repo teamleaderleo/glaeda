@@ -2106,9 +2106,13 @@ class HookTest(unittest.TestCase):
             self.assertEqual(hook.export_job_claim(14, {"class": "exclusive", "units": 13}, ""), "")
             self.assertEqual(hook.export_job_claim(14, {"class": "light", "units": 14}, ""), "")
             self.assertEqual(hook.export_job_claim(0, {}, "no fleet host lock on this machine"), "")
+            # a dedicated runner holds neither capacity nor the host lock (dedicated_admission's note)
+            self.assertEqual(hook.export_job_claim(
+                0, {}, "dedicated runner: admitted by its own admission, no host lock or capacity taken"), "")
+            self.assertEqual(hook.export_job_claim(0, {}, "another build holds the fleet host lock"), "")
             self.assertFalse(github_env.exists())
             self.assertIn("holds the whole mini", hook.export_job_claim(14, {"class": "exclusive", "units": 14}, ""))
-            self.assertIn("holds the whole mini", hook.export_job_claim(0, {}, "held the fleet host lock"))
+            self.assertIn("holds the whole mini", hook.export_job_claim(0, {}, f"{hook.HOST_LOCK_HELD} (held)"))
         self.assertEqual(github_env.read_text(), "GLAEDA_JOB_CLAIM=exclusive\n" * 2)
         with mock.patch.dict(os.environ, {}, clear=True):
             self.assertEqual(hook.export_job_claim(14, {"class": "exclusive", "units": 14}, ""), "")
