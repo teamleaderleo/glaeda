@@ -821,7 +821,7 @@ CMUX_NEXT_DRAIN_HOOK_SHA256 = frozenset({
     "95b700d406639698456d2d536eea9d698b329191a732b24608a673c1e9353d98",
     "ea3e56492347b8a0b68427496eb010eec75b6dc9e3733989c47d0f6f78e18fc9",
     "116bd4fa210f949c76cf3a90d73999f5f22e06cb38ff2c7320dee32af449c285",
-    "6d48fdb64151a03325b81c58202571a821d6e1ebee97257afe12329a4a3e8c52",
+    "9141428846ac72068c86d5ed1a2b98ef98c2950b72909327b9f311f86d8b8504",
 })
 CMUX_NEXT_CI_PRESERVED_NAMES = frozenset({
     "SourcePackages", "ModuleCache.noindex", "SDKStatCaches.noindex",
@@ -3034,32 +3034,33 @@ def live_linked_worktrees(checkout: Path) -> list[str] | None:
 
 def remove_checkout_store(checkout: Path) -> str:
     """Remove a runner checkout's own git store and leave an empty repository in its place, keeping its submodules'
-    stores (.git/modules) so no submodule gitfile in the workspace names a store that is gone. When git cannot make
-    the repository again, the submodule stores go too, and the workspace's top-level submodule checkouts with them,
-    so nothing points into a missing store. Returns what was kept, or "". Raises OSError."""
+    stores (.git/modules) so no submodule gitfile in the workspace names a store that is gone. Returns what was kept,
+    or "". Raises OSError, with the store untouched when git cannot make the empty repository."""
     git_dir = checkout / ".git"
     modules = git_dir / "modules"
     if modules.is_symlink() or not modules.is_dir():
         remove(git_dir)
         return ""
-    for child in sorted(git_dir.iterdir()):
-        if child.name != "modules":
-            remove(child)
+    # The fresh repository is made first, beside the old one: if git cannot make it, nothing has been removed
+    # (OSError), and the old store stays whole for the next pass. Then three renames on one filesystem put it in
+    # place with the submodule stores moved into it, and only the old store's remainder is deleted.
+    scratch = git_dir.with_name(f".glaeda-fresh-git-{os.getpid()}")
     env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
     try:
-        ok = subprocess.run(["git", "init", "-q", os.fspath(checkout)], capture_output=True, timeout=60, env=env,
-                            check=False).returncode == 0 \
-            and subprocess.run(["git", "-C", os.fspath(checkout), "rev-parse", "--git-dir"], capture_output=True,
-                               timeout=60, env=env, check=False).returncode == 0
+        made = subprocess.run(["git", "init", "-q", os.fspath(scratch)], capture_output=True, timeout=60, env=env,
+                              check=False).returncode == 0 and (scratch / ".git" / "HEAD").is_file()
     except (OSError, subprocess.SubprocessError):
-        ok = False
-    if ok:
-        return "kept its submodule stores (.git/modules)"
-    for gitfile in checkout.glob("*/.git"):
-        if gitfile.is_file() and not gitfile.is_symlink() and ".git/modules/" in gitfile.read_text(errors="replace"):
-            remove(gitfile.parent)
-    remove(git_dir)
-    return "git init failed, so its submodule stores and checkouts went too"
+        made = False
+    if not made:
+        shutil.rmtree(scratch, ignore_errors=True)
+        raise OSError("git init failed; the checkout's store was kept")
+    doomed = git_dir.with_name(f".glaeda-old-git-{os.getpid()}")
+    os.rename(git_dir, doomed)
+    os.rename(scratch / ".git", git_dir)
+    os.rename(doomed / "modules", git_dir / "modules")
+    scratch.rmdir()
+    remove(doomed)
+    return "kept its submodule stores (.git/modules)"
 
 
 def evict_own_runner_checkout(workspace: Path, receipt: Path, home: Path | None = None) -> str:

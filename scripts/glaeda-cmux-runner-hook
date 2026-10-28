@@ -2801,46 +2801,45 @@ def mirror_identity(mirror: Path = MIRROR_DIR) -> dict | None:
 
 
 def same_mirror(recorded: object, st: os.stat_result) -> bool:
-    """Whether a borrow record names the directory st is: the same inode, and the same birth time when both have one.
-    The device number is not compared, since a reboot renumbers volumes."""
+    """Whether a borrow record names the directory st is: the same inode and birth time (a record from before the birth
+    time was kept matches on the inode). The device number is compared only where there is no birth time, since a
+    reboot renumbers volumes."""
     if not isinstance(recorded, dict) or not stat.S_ISDIR(st.st_mode) or recorded.get("ino") != st.st_ino:
         return False
     birth = getattr(st, "st_birthtime", None)
-    return "birth" not in recorded or birth is None or recorded["birth"] == birth
+    if birth is None:  # no birth time (Linux): the inode alone could be another filesystem's, so the device counts
+        return recorded.get("dev") == st.st_dev
+    return recorded.get("birth", birth) == birth
 
 
 def drop_checkout_store(git_dir: Path) -> str:
     """Remove a runner checkout's own git store and leave an empty repository in its place, keeping its submodules'
-    stores (git_dir/modules) so no submodule gitfile in the workspace names a store that is gone. When git cannot
-    make the repository again, the submodule stores go too, and the workspace's top-level submodule checkouts with
-    them, so nothing points into a missing store. Returns what was kept, or "". Raises OSError."""
+    stores (.git/modules) so no submodule gitfile in the workspace names a store that is gone. Returns what was kept,
+    or "". Raises OSError, with the store untouched when git cannot make the empty repository."""
     modules = git_dir / "modules"
     if modules.is_symlink() or not modules.is_dir():
         shutil.rmtree(git_dir)
         return ""
-    for child in git_dir.iterdir():
-        if child.name == "modules":
-            continue
-        if child.is_dir() and not child.is_symlink():
-            shutil.rmtree(child)
-        else:
-            child.unlink()
+    # The fresh repository is made first, beside the old one: if git cannot make it, nothing has been removed
+    # (OSError), and the old store stays whole for the next pass. Then three renames on one filesystem put it in
+    # place with the submodule stores moved into it, and only the old store's remainder is deleted.
+    scratch = git_dir.with_name(f".glaeda-fresh-git-{os.getpid()}")
     env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
-    workspace = git_dir.parent
     try:
-        ok = subprocess.run(["git", "init", "-q", os.fspath(workspace)], capture_output=True, timeout=60, env=env,
-                            check=False).returncode == 0 \
-            and subprocess.run(["git", "-C", os.fspath(workspace), "rev-parse", "--git-dir"], capture_output=True,
-                               timeout=60, env=env, check=False).returncode == 0
+        made = subprocess.run(["git", "init", "-q", os.fspath(scratch)], capture_output=True, timeout=60, env=env,
+                              check=False).returncode == 0 and (scratch / ".git" / "HEAD").is_file()
     except (OSError, subprocess.SubprocessError):
-        ok = False
-    if ok:
-        return "kept its submodule stores (.git/modules)"
-    for gitfile in workspace.glob("*/.git"):
-        if gitfile.is_file() and not gitfile.is_symlink() and ".git/modules/" in gitfile.read_text(errors="replace"):
-            shutil.rmtree(gitfile.parent)
-    shutil.rmtree(git_dir)
-    return "git init failed, so its submodule stores and checkouts went too"
+        made = False
+    if not made:
+        shutil.rmtree(scratch, ignore_errors=True)
+        raise OSError("git init failed; the checkout's store was kept")
+    doomed = git_dir.with_name(f".glaeda-old-git-{os.getpid()}")
+    os.rename(git_dir, doomed)
+    os.rename(scratch / ".git", git_dir)
+    os.rename(doomed / "modules", git_dir / "modules")
+    scratch.rmdir()
+    shutil.rmtree(doomed)
+    return "kept its submodule stores (.git/modules)"
 
 
 def runner_git_dir(workspace: str | None) -> Path | None:

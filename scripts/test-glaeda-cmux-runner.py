@@ -5091,6 +5091,34 @@ class MirrorBorrowTest(unittest.TestCase):
         self.git(self.ws, "-c", "protocol.file.allow=always", "submodule", "update", "-q", "--init", "--force")
         self.assertEqual((self.ws / "ghostty/s.txt").read_text(), "sub\n")
 
+    def test_a_failed_git_init_keeps_the_rebuilt_mirrors_borrower_whole(self) -> None:
+        self.borrow()
+        (self.ws / ".git/modules/ghostty").mkdir(parents=True)
+        (self.ws / ".git/modules/ghostty/HEAD").write_text("ref: refs/heads/main\n")
+        (self.mirror / "objects").rename(self.mirror / "objects.old")
+        shutil.copytree(self.mirror / "objects.old", self.mirror / "objects")
+        real_run = subprocess.run
+        failing = lambda argv, *a, **k: (subprocess.CompletedProcess(argv, 1) if argv[:2] == ["git", "init"]  # noqa: E731
+                                         else real_run(argv, *a, **k))
+        with mock.patch.object(hook.subprocess, "run", side_effect=failing):
+            note = hook.guard_borrowed_checkout(os.fspath(self.ws), self.mirror)
+        self.assertIn("OSError", note)
+        self.assertTrue((self.ws / ".git/modules/ghostty/HEAD").is_file())
+        self.assertEqual(hook.alternates_of(self.ws / ".git"), [os.fspath(self.mirror / "objects")])
+        self.assertFalse(any(p.name.startswith(".glaeda-") for p in self.ws.iterdir()))
+
+    def test_without_a_birth_time_the_device_still_counts(self) -> None:
+        self.borrow()
+        st = os.stat(self.mirror / "objects")
+        fields = {"st_mode": st.st_mode, "st_ino": st.st_ino, "st_dev": st.st_dev}
+        linux = type("Stat", (), fields)()  # no st_birthtime
+        record = {"ino": st.st_ino, "dev": st.st_dev}
+        self.assertTrue(hook.same_mirror(record, linux))
+        self.assertFalse(hook.same_mirror({**record, "dev": st.st_dev + 1}, linux))
+        if hasattr(st, "st_birthtime"):
+            self.assertTrue(hook.same_mirror({**record, "dev": st.st_dev + 1, "birth": st.st_birthtime}, st))
+            self.assertFalse(hook.same_mirror({**record, "birth": st.st_birthtime + 1}, st))
+
     def test_a_missing_mirror_resets_the_borrower(self) -> None:
         self.borrow()
         shutil.rmtree(self.mirror)
