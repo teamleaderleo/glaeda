@@ -17,6 +17,7 @@ import threading
 import time
 import types
 import unittest
+import unittest.mock
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -106,6 +107,47 @@ class GateTest(Base):
         self.assertEqual(warm.runner_setup([single]), "runners are not in capacity mode")
         unpinned = self.runner("actions-runner-glaeda-5", "--capacity-units 4")
         self.assertEqual(warm.runner_setup([unpinned]), "no toolchain Xcode pin in the runner hooks")
+
+    def test_a_catch_up_keeps_the_nightly_builders_reserve(self) -> None:
+        # The runners' own hook says where the reserve is: a dedicated builder's 40 GiB floor + 20 GiB growth.
+        self.runner("actions-runner-glaeda", "--min-free-gib 30 --capacity-units 4")
+        self.runner("actions-runner-glaeda-nightly-next", "--min-free-gib 40 --dedicated-admit /admit.sh")
+        self.assertEqual(hook.builder_reserve_gib(self.dir), 40)
+        gib = 1024 ** 3
+        warm.free_bytes = lambda path: 31 * gib  # cmux7s on 2026-10-28
+        why = warm.nightly_reserve_refusal(hook)
+        self.assertIn("31.0 GiB free", why)
+        self.assertIn("40 GiB floor + 20 GiB", why)
+        warm.free_bytes = lambda path: 59 * gib
+        self.assertIn("59.0 GiB free", warm.nightly_reserve_refusal(hook))
+        warm.free_bytes = lambda path: 61 * gib
+        self.assertEqual(warm.nightly_reserve_refusal(hook), "")
+        warm.free_bytes = lambda path: None
+        self.assertIn("under the dedicated nightly builder", warm.nightly_reserve_refusal(hook), "unknown is short")
+        # A nightly job freeing disk here goes first, whatever is free.
+        warm.free_bytes = lambda path: 400 * gib
+        waiting = types.SimpleNamespace(nightly_disk_waiter=lambda capacity: "build-nightly-app",
+                                        builder_reserve_gib=lambda home: 40.0, job_disk_gib=lambda: 20.0)
+        self.assertIn("a nightly job waits here for free disk (build-nightly-app)", warm.nightly_reserve_refusal(waiting))
+
+    def test_no_dedicated_builder_or_an_older_hook_keeps_no_reserve(self) -> None:
+        warm.free_bytes = lambda path: 1024 ** 3
+        self.runner("actions-runner-glaeda", "--min-free-gib 30 --capacity-units 4")
+        self.assertEqual(warm.nightly_reserve_refusal(hook), "", "no dedicated builder: disk-pressure's job alone")
+        self.assertEqual(warm.nightly_reserve(types.SimpleNamespace()), (0.0, 0.0))
+        self.assertEqual(warm.nightly_reserve_refusal(types.SimpleNamespace()), "")
+
+    def test_idle_refusal_answers_with_the_reserve(self) -> None:
+        saved = warm.compile_state, warm.nightly_reserve_refusal
+        stub = types.SimpleNamespace(thermal_pressure_level=lambda: 0)
+        try:
+            warm.running = lambda: ""
+            warm.compile_state = lambda now=None: (None, "")
+            warm.nightly_reserve_refusal = lambda hook_module: "31.0 GiB free, under the reserve"
+            with unittest.mock.patch.object(warm.os, "getloadavg", return_value=(0.0, 0.0, 0.0)):
+                self.assertEqual(warm.idle_refusal(stub, 5000.0, self.state), "31.0 GiB free, under the reserve")
+        finally:
+            warm.compile_state, warm.nightly_reserve_refusal = saved
 
     def test_last_job_reads_the_telemetry_tail(self) -> None:
         log = self.dir / "jobs.jsonl"
@@ -314,6 +356,28 @@ class RunTest(Base):
         paused = warm.run(True, self.state)
         self.assertEqual(paused["state"], "skip")
         self.assertIn("paused", paused["reason"])
+
+    @unittest.skipUnless(sys.platform == "darwin", "runs only on macOS")
+    def test_a_build_under_the_builders_floor_is_stopped(self) -> None:
+        checkout = self.fake_setup(sleep="30")
+        saved = warm.BUILD_DISK_WATCH_S
+        try:
+            warm.BUILD_DISK_WATCH_S = 0.2
+            warm.free_bytes = lambda path: 39 * 1024 ** 3
+            log = self.dir / "build.log"
+            started = time.monotonic()
+            result = warm.build(checkout, 2, self.state, "/Applications/Xcode_26.6.app", log,
+                                stop_below=40 * 1024 ** 3)
+            self.assertLess(time.monotonic() - started, 20, "stopped long before the fake build ends")
+            self.assertEqual(result["kept"], "false")
+            self.assertIn("stopped at 39.0 GiB free, under the dedicated nightly builder's 40 GiB floor",
+                          result["reason"])
+            warm.free_bytes = lambda path: 100 * 1024 ** 3
+            os.environ["FAKE_SLEEP"] = "0"
+            self.assertEqual(warm.build(checkout, 2, self.state, "/x.app", log, stop_below=40 * 1024 ** 3)["kept"],
+                             "true", "room to spare: the build finishes")
+        finally:
+            warm.BUILD_DISK_WATCH_S = saved
 
     def test_kill_switch_and_no_owned_state(self) -> None:
         if sys.platform != "darwin":

@@ -283,14 +283,50 @@ def idle_refusal(hook: Any, now: float, state: Path) -> str:
     level = hook.thermal_pressure_level()
     if level is None or level > 0:
         return f"thermal pressure {level if level is not None else 'unknown'}"
-    # No free-disk gate of its own: a catch-up rebuilds a kept root in place, and disk-pressure keeps the
-    # fleet's free-space policy (2026-09-27: the old 136 GiB floor kept cmux14, 460 GiB, from ever warming).
+    # No free-disk floor of its own (2026-09-27: the old 136 GiB floor kept cmux14, 460 GiB, from ever warming),
+    # but the nightly reserve every PR runner keeps (nightly_reserve_refusal) holds here too.
+    why = nightly_reserve_refusal(hook)
+    if why:
+        return why
     host_lock = os.fspath(FLEET_DIR / "host.lock")
     held = hook.host_held(host_lock, os.fspath(FLEET_DIR / "reservation.json"), now)
     if held:
         return held
     if os.path.exists(host_lock) and hook.lock_waiters(host_lock, set()):
         return "a fleet build is waiting for the host lock"  # flock has no writer preference: let it in
+    return ""
+
+
+def nightly_reserve(hook: Any) -> tuple[float, float]:
+    """(the dedicated nightly builder's disk floor here, one job's growth) in GiB from the runners' own hook
+    (builder_reserve_gib, job_disk_gib), or (0, 0) with no dedicated builder or a hook that predates them."""
+    try:
+        builder = float(hook.builder_reserve_gib(HOME))
+        growth = float(hook.job_disk_gib())
+    except Exception:  # noqa: BLE001 - an older hook has no reserve to keep
+        return 0.0, 0.0
+    return (builder, growth) if builder > 0 else (0.0, 0.0)
+
+
+def nightly_reserve_refusal(hook: Any) -> str:
+    """Why a catch-up must not start for the nightly builder's disk, or ''. A PR runner on a mini with a dedicated
+    nightly builder listens only with the builder's floor plus one job's growth free, and none starts while a
+    nightly job frees disk (the hook's NIGHTLY_DISK_RESERVE, Gate.low_disk); a catch-up is a compile like theirs.
+    On 2026-10-28 cmux7s's catch-up took free disk from 46 to 31 GiB while its builder needed 42, so the builder's
+    listener was held off and every PR runner with it."""
+    waiter = None
+    with contextlib.suppress(Exception):
+        waiter = hook.nightly_disk_waiter(FLEET_DIR / "capacity")
+    if waiter:
+        return f"a nightly job waits here for free disk ({waiter})"
+    builder, growth = nightly_reserve(hook)
+    if builder <= 0:
+        return ""
+    free = free_bytes(FLEET_DIR)
+    need = (builder + growth) * 1024 ** 3
+    if free is None or free < need:
+        return (f"{(free or 0) / 1024 ** 3:.1f} GiB free, under the dedicated nightly builder's {builder:g} GiB "
+                f"floor + {growth:g} GiB for a build")
     return ""
 
 
@@ -599,8 +635,13 @@ def last_result(log: Path) -> dict[str, Any]:
     return {}
 
 
-def build(checkout: Path, root: int, state: Path, xcode: str, log: Path) -> dict[str, Any]:
-    """Run cmux's owned_catch_up.sh in our process group, its output appended to LOG; its result line."""
+BUILD_DISK_WATCH_S = 15.0
+
+
+def build(checkout: Path, root: int, state: Path, xcode: str, log: Path,
+          stop_below: int | None = None) -> dict[str, Any]:
+    """Run cmux's owned_catch_up.sh in our process group, its output appended to LOG; its result line. With
+    stop_below, the build is killed once free disk drops under it (one statvfs every BUILD_DISK_WATCH_S)."""
     global _child
     env = {key: value for key, value in os.environ.items() if not key.startswith(("GITHUB_", "RUNNER_", "CMUX_"))}
     env.update(PATH=PATH, CMUX_CI_XCODE_APP=xcode, CMUX_CATCH_UP_LOG=os.fspath(log))
@@ -609,13 +650,23 @@ def build(checkout: Path, root: int, state: Path, xcode: str, log: Path) -> dict
         _child = subprocess.Popen(["/usr/bin/nice", "-n", "5", "/bin/bash", "scripts/ci/owned_catch_up.sh", str(root),
                                    os.fspath(state)], cwd=checkout, env=env, stdin=subprocess.DEVNULL,
                                   stdout=output, stderr=subprocess.STDOUT)
+    deadline = started + BUILD_TIMEOUT_S
     try:
-        code = _child.wait(timeout=BUILD_TIMEOUT_S)
-    except subprocess.TimeoutExpired:
-        kill_build() if _grouped else _child.kill()
-        _child.wait()
-        return {"kept": "false", "reason": f"timed out after {BUILD_TIMEOUT_S} s",
-                "wall_seconds": round(time.monotonic() - started, 1)}
+        while True:
+            try:
+                code = _child.wait(timeout=max(0.0, min(BUILD_DISK_WATCH_S if stop_below else BUILD_TIMEOUT_S,
+                                                        deadline - time.monotonic())))
+                break
+            except subprocess.TimeoutExpired:
+                pass
+            free = free_bytes(FLEET_DIR) if stop_below else None
+            low = free is not None and stop_below is not None and free < stop_below
+            if low or time.monotonic() >= deadline:
+                kill_build() if _grouped else _child.kill()
+                _child.wait()
+                reason = (f"stopped at {free / 1024 ** 3:.1f} GiB free, under the dedicated nightly builder's "
+                          f"{stop_below / 1024 ** 3:g} GiB floor" if low else f"timed out after {BUILD_TIMEOUT_S} s")
+                return {"kept": "false", "reason": reason, "wall_seconds": round(time.monotonic() - started, 1)}
     finally:
         _child = None
     kill_build()  # anything the build left running in our group (a detached build service)
@@ -1288,7 +1339,9 @@ def run(apply: bool, state: Path, now: float | None = None) -> dict[str, Any]:
             # failed try of this head on the next run, so it is not rebuilt into the same kill forever.
             memory["attempt"] = {"root": root, "head": head, "at": int(time.time())}
             save_memory(memory_path, memory)
-            result = build(work / "cmux", root, state, scope["xcode"], log)
+            builder, _growth = nightly_reserve(hook)
+            result = build(work / "cmux", root, state, scope["xcode"], log,
+                           stop_below=int(builder * 1024 ** 3) if builder > 0 else None)
             memory.pop("attempt", None)
             trim_logs(logs)
         finally:
