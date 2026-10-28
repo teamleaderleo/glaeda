@@ -376,7 +376,8 @@ class RunTest(Base):
         self.assertEqual(paused["state"], "skip")
         self.assertIn("paused", paused["reason"])
 
-    def grouped_build(self, checkout: Path, free: str, sleep: str, timeout_s: int | None = None) -> dict:
+    def grouped_build(self, checkout: Path, free: str, sleep: str, timeout_s: int | None = None,
+                      no_ps: bool = False) -> dict:
         """build() in a driver that leads its own process group, as the LaunchAgent run does, so kill_build ends
         the fake build's `sleep` grandchild too; asserts no `sleep SLEEP` is left."""
         driver = self.dir / "glaeda-idle-warm-watch-driver.py"
@@ -392,6 +393,13 @@ class RunTest(Base):
             if {timeout_s!r} is not None:
                 warm.BUILD_TIMEOUT_S = {timeout_s!r}
             warm.free_bytes = lambda path: {free}
+            if {no_ps!r}:
+                real_popen = warm.subprocess.Popen
+                def no_ps(args, *rest, **kwargs):
+                    if args and args[0] == "/bin/ps":
+                        raise OSError("ps failed")
+                    return real_popen(args, *rest, **kwargs)
+                warm.subprocess.Popen = no_ps
             warm._grouped = warm.own_group()
             assert warm._grouped
             print(json.dumps(warm.build(Path({os.fspath(checkout)!r}), 2, Path({os.fspath(self.state)!r}), "/x.app",
@@ -399,10 +407,19 @@ class RunTest(Base):
         """))
         proc = subprocess.run([sys.executable, os.fspath(driver)], capture_output=True, text=True, timeout=60,
                               env={**os.environ, "FAKE_SLEEP": sleep})
-        self.assertEqual(proc.returncode, 0, proc.stderr)
+        time.sleep(0.2)
         leftover = subprocess.run(["/usr/bin/pgrep", "-f", f"sleep {sleep}$"], capture_output=True, text=True).stdout
         self.assertEqual(leftover.strip(), "", "the build's whole process group was killed")
+        if no_ps:
+            return {"returncode": proc.returncode}
+        self.assertEqual(proc.returncode, 0, proc.stderr)
         return json.loads(proc.stdout.strip().splitlines()[-1])
+
+    @unittest.skipUnless(sys.platform == "darwin", "runs only on macOS")
+    def test_a_group_it_cannot_list_ends_with_the_catch_up(self) -> None:
+        # ps fails: the group cannot be seen empty, so the catch-up ends its whole group, itself included.
+        result = self.grouped_build(self.fake_setup(), "39 * 1024 ** 3", "139", no_ps=True)
+        self.assertEqual(result["returncode"], -signal.SIGKILL)
 
     @unittest.skipUnless(sys.platform == "darwin", "runs only on macOS")
     def test_a_build_under_the_builders_floor_is_stopped(self) -> None:

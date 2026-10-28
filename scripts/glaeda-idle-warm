@@ -533,22 +533,31 @@ def own_group() -> bool:
         return False
 
 
-def kill_build(passes: int = 3) -> None:
-    """SIGKILL every other process in our group (the build and anything it started)."""
+def kill_build(passes: int = 3) -> bool:
+    """SIGKILL every other process in our group (the build and anything it started); whether the group was seen
+    empty (False when ps failed or members outlived every pass)."""
     me = os.getpid()
     for _ in range(passes):
         try:
-            out = subprocess.run(["/bin/ps", "-axo", "pid=,pgid="], capture_output=True, text=True, timeout=2).stdout
-        except (OSError, subprocess.SubprocessError):
-            return
+            ps = subprocess.Popen(["/bin/ps", "-axo", "pid=,pgid="], stdout=subprocess.PIPE, text=True)
+        except OSError:
+            return False
+        try:
+            out, _ = ps.communicate(timeout=2)
+        except subprocess.SubprocessError:
+            ps.kill()
+            ps.wait()
+            return False
+        # ps runs in our group too: it is not a member to kill or to wait for
         members = [int(pid) for pid, pgid in (line.split() for line in out.splitlines() if len(line.split()) == 2)
-                   if pgid.isdigit() and pid.isdigit() and int(pgid) == me and int(pid) != me]
+                   if pgid.isdigit() and pid.isdigit() and int(pgid) == me and int(pid) not in (me, ps.pid)]
         if not members:
-            return
+            return True
         for pid in members:
             with contextlib.suppress(OSError):
                 os.kill(pid, signal.SIGKILL)
         time.sleep(0.05)
+    return False
 
 
 def stop_fuzz_child() -> None:
@@ -659,11 +668,10 @@ END_CHILD_WAIT_S = 10.0
 
 
 def end_child() -> None:
-    """Kill the build (its whole group when we lead one, and the child itself either way) and reap it. A child
-    that outlives END_CHILD_WAIT_S ends with our group, us included, so its locks go with it (as stop() does)."""
+    """Kill the build and reap it, then kill what is left of our group (anything the build started; reaping the
+    child first, so its zombie is not counted). When the child outlives END_CHILD_WAIT_S, or the group cannot be
+    seen empty, our whole group ends, us included, so no build process outlives the locks we hold (as stop() does)."""
     assert _child is not None
-    if _grouped:
-        kill_build()
     with contextlib.suppress(OSError):
         _child.kill()
     try:
@@ -672,6 +680,8 @@ def end_child() -> None:
         if _grouped:
             os.killpg(os.getpid(), signal.SIGKILL)
         raise
+    if _grouped and not kill_build():
+        os.killpg(os.getpid(), signal.SIGKILL)
 
 
 def build(checkout: Path, root: int, state: Path, xcode: str, log: Path,
