@@ -4147,6 +4147,14 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
                 if taken_out is not None:
                     taken_out["wants"] = [token]
                 return refused(f"capacity: {held} ({job or 'unknown job'} is {klass})")
+        if "gui" in taken or gui_token in taken:
+            # The idle fuzzer writes its holder (FUZZ_HOLDER), then looks at gui.token, before it starts its app. One
+            # that looked between the yield above and this token missed us, so look for its holder again now that
+            # the token is ours: either it sees the token taken, or its holder is there for this yield to stop.
+            again = yield_idle_fuzz(capacity_dir)
+            if klass == EXCLUSIVE_CLASS and "did not stop" in again:
+                return refused(f"capacity: {again.lstrip('; ')}, and a signing job runs beside nothing")
+            yielded += again
         # every job but a reserving runner's own leaves the idle reserves free (GUI_RESERVE, FRESH_RESERVE_TOKEN); a
         # nightly job keeps none (FEED_FIRST)
         def kept_now() -> int:

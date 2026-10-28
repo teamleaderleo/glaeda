@@ -2064,6 +2064,42 @@ class HookTest(unittest.TestCase):
         finally:
             self.finish("s3")
 
+    def test_a_gui_job_looks_for_the_idle_fuzzer_again_once_it_holds_the_gui_token(self) -> None:
+        """A fuzzer that writes its holder after the first yield and looked at gui.token before this job took it is
+        stopped by the second look, made while the token is held, so a signing job never runs beside it."""
+        self.fleet()
+        capacity = self.dir / "capacity"
+        capacity.mkdir(parents=True, exist_ok=True)
+        looks: list[bool] = []
+
+        def held(fds: list[int], *args: object, **kwargs: object) -> tuple[bool, str]:
+            hook.close_all(fds)  # the job has ended before the next one comes
+            return True, "held"
+
+        def look(where: Path) -> str:
+            looks.append(hook.probe(where / "gui.token"))  # True: the token is still free
+            return "" if len(looks) == 1 else "; stopped the idle fuzzer (pid 4242)"
+
+        with mock.patch.object(hook, "yield_idle_fuzz", side_effect=look), \
+                mock.patch.object(hook, "fair_turn", return_value=None), \
+                mock.patch.object(hook, "hold", side_effect=held):
+            ok, why = hook.take_capacity(os.fspath(self.dir / "fleet" / "host.lock"), capacity, 14,
+                                         "sign-nightly-identity-legacy", os.getpid(), self.dir / "state",
+                                         workflow="nightly.yml", klass="exclusive")
+        self.assertTrue(ok, why)
+        self.assertEqual(looks, [True, False], "once before the gui token, once while holding it")
+        self.assertIn("stopped the idle fuzzer (pid 4242)", why)
+        looks.clear()
+        with mock.patch.object(hook, "yield_idle_fuzz", side_effect=lambda where: (
+                looks.append(True), "; the idle fuzzer (pid 4242) did not stop")[1]), \
+                mock.patch.object(hook, "fair_turn", return_value=None), \
+                mock.patch.object(hook, "hold", side_effect=held):
+            ok, why = hook.take_capacity(os.fspath(self.dir / "fleet" / "host.lock"), capacity, 14,
+                                         "sign-nightly-identity-legacy", os.getpid(), self.dir / "state",
+                                         workflow="nightly.yml", klass="exclusive")
+        self.assertFalse(ok, why)
+        self.assertIn("a signing job runs beside nothing", why)
+
     def test_job_claim_names_only_a_whole_mini(self) -> None:
         github_env = self.dir / "env"
         with mock.patch.dict(os.environ, {"GITHUB_ENV": os.fspath(github_env)}):
