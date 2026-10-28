@@ -5046,6 +5046,51 @@ class MirrorBorrowTest(unittest.TestCase):
         self.assertFalse((self.ws / ".git").exists())
         self.assertTrue((self.ws / "local.txt").exists())  # only .git goes; checkout clones into the workspace
 
+    def test_a_reboot_that_renumbers_the_volume_keeps_the_borrower(self) -> None:
+        """cmux7s, 2026-10-28 15:41Z: a reboot changed the mirror volume's device number, and every borrower on the
+        mini lost its .git at its next job-started (a 463 s refetch and dangling submodule gitfiles)."""
+        self.borrow()
+        record = self.ws / ".git" / hook.BORROW_RECORD
+        stale = json.loads(record.read_text())
+        stale["dev"] += 1
+        stale.pop("birth", None)  # a record written before the birth time was kept
+        record.write_text(json.dumps(stale) + "\n")
+        self.assertEqual(hook.guard_borrowed_checkout(os.fspath(self.ws), self.mirror), "")
+        self.assertTrue((self.ws / ".git" / "HEAD").is_file())
+        self.borrow()  # job-completed brings the record up to date
+        self.assertEqual(json.loads(record.read_text()), hook.mirror_identity(self.mirror))
+
+    def test_a_rebuilt_mirrors_borrower_keeps_its_submodule_stores(self) -> None:
+        """Only the checkout's own store goes. The submodules' stores stay under an empty repository, so the warm
+        checkout (fetch, checkout, submodule update) works where `ghostty/../.git/modules/ghostty` was missing."""
+        sub = self.dir / "sub"
+        sub.mkdir()
+        self.git(sub, "init", "-q", "-b", "main")
+        (sub / "s.txt").write_text("sub\n")
+        self.git(sub, "add", "-A")
+        self.git(sub, "commit", "-qm", "s")
+        src = self.dir / "src"
+        self.git(src, "-c", "protocol.file.allow=always", "submodule", "add", "-q", os.fspath(sub), "ghostty")
+        self.git(src, "commit", "-qm", "add ghostty")
+        self.git(self.ws, "fetch", "-q", os.fspath(src), "main")
+        self.git(self.ws, "checkout", "-q", "--detach", "FETCH_HEAD")
+        self.git(self.ws, "-c", "protocol.file.allow=always", "submodule", "update", "-q", "--init")
+        self.assertTrue((self.ws / ".git/modules/ghostty").is_dir())
+        self.borrow()
+        (self.mirror / "objects").rename(self.mirror / "objects.old")
+        shutil.copytree(self.mirror / "objects.old", self.mirror / "objects")  # a reseed: a new objects directory
+        note = hook.guard_borrowed_checkout(os.fspath(self.ws), self.mirror)
+        self.assertIn("gone or was rebuilt", note)
+        self.assertIn("kept its submodule stores", note)
+        self.assertTrue((self.ws / ".git/modules/ghostty/HEAD").is_file())
+        self.assertEqual(hook.alternates_of(self.ws / ".git"), [])
+        self.assertEqual(self.git(self.ws, "rev-parse", "--is-inside-work-tree"), "true")
+        # the warm checkout's own steps, from the empty repository
+        self.git(self.ws, "fetch", "-q", os.fspath(src), "main")
+        self.git(self.ws, "checkout", "-q", "--force", "--detach", "FETCH_HEAD")
+        self.git(self.ws, "-c", "protocol.file.allow=always", "submodule", "update", "-q", "--init", "--force")
+        self.assertEqual((self.ws / "ghostty/s.txt").read_text(), "sub\n")
+
     def test_a_missing_mirror_resets_the_borrower(self) -> None:
         self.borrow()
         shutil.rmtree(self.mirror)
