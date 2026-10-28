@@ -1891,18 +1891,53 @@ class HookTest(unittest.TestCase):
         self.assertIn(f"{hook.FRESH_RESERVE_UNITS} are kept for an idle reserving runner", why)
 
     def test_a_nightly_job_is_admitted_ahead_of_a_waiting_fleet_build(self) -> None:
-        """Nightly jobs come first on the fleet: a waiting fleet build refuses every other job, never a nightly one."""
+        """Nightly jobs come first on the fleet: a waiting fleet build refuses every other job, never a nightly one
+        that holds its capacity at once, and a nightly one at most NIGHTLY_WAITER_PASSES times per waiter."""
         self.fleet()
-        for tier, admitted in ((hook.TIER_NIGHTLY, True), (hook.TIER_DEV, False), ("", False)):
-            with self.subTest(tier=tier), mock.patch.object(hook, "bounded_waiters", return_value=[77]), \
+        waiter = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+        self.addCleanup(waiter.wait)
+        self.addCleanup(waiter.kill)
+
+        def held(fds: list[int], *args: object, **kwargs: object) -> tuple[bool, str]:
+            hook.close_all(fds)  # each pass's job has ended before the next comes
+            return True, "held"
+
+        def take(tier: str) -> tuple[bool, str]:
+            with mock.patch.object(hook, "bounded_waiters", return_value=[waiter.pid]), \
                     mock.patch.object(hook, "fair_turn", return_value=None), \
-                    mock.patch.object(hook, "hold", return_value=(True, "held")):
-                ok, why = hook.take_capacity(os.fspath(self.dir / "fleet" / "host.lock"), self.dir / "capacity", 14,
-                                             "signer-dmg-image", os.getpid(), self.dir / "state",
-                                             workflow="nightly.yml", tier=tier)
-                self.assertEqual(ok, admitted, why)
-                if not admitted:
-                    self.assertEqual(why, f"{hook.WAITER_REFUSAL} (pid 77)")
+                    mock.patch.object(hook, "hold", side_effect=held):
+                return hook.take_capacity(os.fspath(self.dir / "fleet" / "host.lock"), self.dir / "capacity", 14,
+                                          "signer-dmg-image", os.getpid(), self.dir / "state",
+                                          workflow="nightly.yml", tier=tier)
+
+        refusal = f"{hook.WAITER_REFUSAL} (pid {waiter.pid})"
+        for tier in (hook.TIER_DEV, ""):
+            with self.subTest(tier=tier):
+                self.assertEqual(take(tier), (False, refusal))
+        for n in range(hook.NIGHTLY_WAITER_PASSES):
+            ok, why = take(hook.TIER_NIGHTLY)
+            self.assertTrue(ok, why)
+            self.assertIn(f"admitted ahead of the fleet build waiting for the host (pid {waiter.pid})", why)
+        self.assertEqual(take(hook.TIER_NIGHTLY), (False, refusal), "the waiter is not passed for good")
+        self.assertEqual(hook.job_class("signer-dmg-image", hook.DEFAULT_HOME_REPO, hook.DEFAULT_HOME_REPO,
+                                        "nightly.yml")[0], "light", "a DMG from a signed app is no compile")
+
+    def test_a_nightly_job_that_must_wait_for_capacity_is_refused_for_the_waiter(self) -> None:
+        """A lend drain waits for Runner.Worker to exit: a nightly job admitted ahead of the waiter must hold its
+        capacity at once or be refused (not retryably), never wait in admission."""
+        self.fleet()
+        self.take_units(14)
+        waiter = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+        self.addCleanup(waiter.wait)
+        self.addCleanup(waiter.kill)
+        with mock.patch.object(hook, "bounded_waiters", return_value=[waiter.pid]), \
+                mock.patch.object(hook, "fair_turn", return_value=None):
+            ok, why = hook.take_capacity(os.fspath(self.dir / "fleet" / "host.lock"), self.dir / "capacity", 14,
+                                         "signer-dmg-image", os.getpid(), self.dir / "state",
+                                         workflow="nightly.yml", tier=hook.TIER_NIGHTLY)
+        self.assertEqual((ok, why), (False, f"{hook.WAITER_REFUSAL} (pid {waiter.pid})"))
+        self.assertFalse(why.startswith("capacity:"), "not a retryable refusal")
+        self.assertEqual(hook.nightly_passes(self.dir / "state"), {}, "a refusal is not a pass")
 
     def test_a_waiter_marker_with_a_since_past_float_range_is_skipped(self) -> None:
         """A marker is written by a job on this mini, so it is untrusted: a since too large for a float raised
