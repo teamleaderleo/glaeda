@@ -1040,13 +1040,51 @@ def part_of(cache: Path, name: str) -> Path:
     return path.with_name(".fill-" + path.name)
 
 
-def report(part: Path) -> None:
-    """One progress line for a waiting client, dropped when the client is not reading (a full pipe): a
-    client that stops reading, or hung up, never stalls the fill."""
+# A part that has not grown for this long belongs to no running fill (curl aborts below 10 KB/s for 120 s).
+FILL_LIVE = 300
+# How long a request waits for a fill lock or slot while no fill of its own object runs: past this the
+# client is told busy and downloads directly, so a small object or a 404 never waits behind other fills.
+ADMIT_WAIT = 15
+
+
+def live_fill(part: Path) -> int | None:
+    """The bytes a running fill of this object has written, or None when none runs: a regular file (never
+    a symlink followed) that grew within FILL_LIVE seconds."""
     try:
-        size = part.stat().st_size
+        info = part.lstat()
     except OSError:
-        size = 0
+        return None
+    if not stat.S_ISREG(info.st_mode) or time.time() - info.st_mtime >= FILL_LIVE:
+        return None
+    return info.st_size
+
+
+def objects_dir(cache: Path) -> int | None:
+    """An fd for CACHE/objects, made 0700 if absent, walked from / with no symlink and owned by us; None if
+    it is anything else. Every name the fill makes or removes is relative to it."""
+    with contextlib.suppress(OSError):
+        (cache / "objects").mkdir(parents=True, exist_ok=True, mode=0o700)
+    fd = open_dir_path(cache / "objects")
+    if fd is None:
+        return None
+    if os.fstat(fd).st_uid != os.getuid():
+        os.close(fd)
+        return None
+    return fd
+
+
+def remove_name(parent: int, name: str) -> None:
+    with contextlib.suppress(OSError):
+        os.unlink(name, dir_fd=parent)
+
+
+def report(part: Path) -> bool:
+    """One progress line for a waiting client while a fill of its own object runs; False (and no line) when
+    none does. Dropped when the client is not reading (a full pipe): a client that stops reading, or hung up,
+    never stalls the fill."""
+    size = live_fill(part)
+    if size is None:
+        return False
     blocking = os.get_blocking(1)
     try:
         os.set_blocking(1, False)
@@ -1056,85 +1094,147 @@ def report(part: Path) -> None:
     finally:
         with contextlib.suppress(OSError):
             os.set_blocking(1, blocking)
+    return True
+
+
+def fill_report(fd: int) -> None:
+    """report() for the fill this request runs itself, read from its own descriptor."""
+    blocking = os.get_blocking(1)
+    try:
+        os.set_blocking(1, False)
+        os.write(1, f"{HEADER} filling {os.fstat(fd).st_size}\n".encode())
+    except OSError:
+        pass
+    finally:
+        with contextlib.suppress(OSError):
+            os.set_blocking(1, blocking)
+
+
+def touch_miss(cache: Path, name: str) -> None:
+    """Remember a bucket miss for MISS_TTL: created or refreshed in the objects directory, no symlink followed."""
+    parent = objects_dir(cache)
+    if parent is None:
+        return
+    try:
+        fd = os.open(miss_of(cache, name).name, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600,
+                     dir_fd=parent)
+    except OSError:
+        return
+    finally:
+        os.close(parent)
+    try:
+        if stat.S_ISREG(os.fstat(fd).st_mode):
+            os.utime(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
 
 
 def fill(cache: Path, name: str, timeout: float = FILL_TIMEOUT, curl: str = CURL) -> str:
     """fill_part, and no part left behind whatever stops it (the request's alarm included)."""
+    parent = objects_dir(cache)
+    if parent is None:
+        return "the cache directory is not ours"
     try:
-        return fill_part(cache, name, timeout, curl)
+        return fill_part(cache, name, timeout, curl, parent)
     except BaseException:
-        part_of(cache, name).unlink(missing_ok=True)
+        remove_name(parent, part_of(cache, name).name)
         raise
+    finally:
+        os.close(parent)
 
 
-def fill_part(cache: Path, name: str, timeout: float, curl: str) -> str:
+def fill_part(cache: Path, name: str, timeout: float, curl: str, parent: int) -> str:
     """Download NAME from its bucket into the cache; '' when it is there, 'miss' for a 404, else why not.
 
-    Into a temporary name beside it, so a reader never sees a part. curl keeps a low-speed abort.
+    Into a temporary name beside it, so a reader never sees a part. Every name is made, renamed and removed
+    relative to PARENT (the objects directory, opened with no symlink on the way), the part is created
+    exclusively with O_NOFOLLOW, and curl writes only to that descriptor: a symlink raced into the directory
+    is never followed. curl keeps a low-speed abort.
     """
     bucket, ns, file = name.split("/")
-    part = part_of(cache, name)
-    part.parent.mkdir(parents=True, exist_ok=True)
-    part.unlink(missing_ok=True)
-    # The part exists before the check, so fills starting together each count the others' room.
-    part.touch()
-    need = CACHE_MIN_FREE + FILL_MAX_BYTES + reserved(cache, part)
-    prune_cache(cache, "", min_free=need)
-    if shutil.disk_usage(cache).free < need:
-        part.unlink(missing_ok=True)
-        return "no room for a fill"
+    part_name, final_name = part_of(cache, name).name, stored(cache, name).name
+    remove_name(parent, part_name)
     try:
-        # No --location: a redirect could send the fetch to any host, past the bucket allow list.
-        proc = subprocess.Popen([curl, "--silent", "--fail", "--proto", "=https",
-                                 "--connect-timeout", "15", "--speed-limit", "10240", "--speed-time", "120",
-                                 "--max-time", str(int(timeout)), "--max-filesize", str(FILL_MAX_BYTES),
-                                 "--write-out", "%{http_code}", "--output", os.fspath(part),
-                                 f"https://{bucket}/v1/{ns}/objects/{file}"],
-                                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                                text=True, start_new_session=True)
+        # The part exists before the check, so fills starting together each count the others' room.
+        out = os.open(part_name, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=parent)
     except OSError as error:
-        part.unlink(missing_ok=True)
-        return type(error).__name__
+        return f"part: {type(error).__name__}"
+    mine = os.fstat(out)
     try:
-        return watch_fill(proc, cache, name, part, timeout)
-    finally:  # whatever ends this request (its alarm included), its curl ends with it
-        with contextlib.suppress(OSError):
-            os.killpg(proc.pid, signal.SIGKILL)
-        proc.wait()
-        if proc.stdout:
-            proc.stdout.close()
+        need = CACHE_MIN_FREE + FILL_MAX_BYTES + reserved(cache, part_of(cache, name))
+        prune_cache(cache, "", min_free=need)
+        if shutil.disk_usage(cache).free < need:
+            remove_name(parent, part_name)
+            return "no room for a fill"
+        try:
+            # No --location: a redirect could send the fetch to any host, past the bucket allow list. The body
+            # goes to stdout (the part's descriptor), the status code to stderr.
+            proc = subprocess.Popen([curl, "--silent", "--fail", "--proto", "=https",
+                                     "--connect-timeout", "15", "--speed-limit", "10240", "--speed-time", "120",
+                                     "--max-time", str(int(timeout)), "--max-filesize", str(FILL_MAX_BYTES),
+                                     "--write-out", "%{stderr}%{http_code}", "--output", "-",
+                                     f"https://{bucket}/v1/{ns}/objects/{file}"],
+                                    stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.PIPE,
+                                    text=True, start_new_session=True)
+        except OSError as error:
+            remove_name(parent, part_name)
+            return type(error).__name__
+        try:
+            why = watch_fill(proc, out, timeout)
+        finally:  # whatever ends this request (its alarm included), its curl ends with it
+            with contextlib.suppress(OSError):
+                os.killpg(proc.pid, signal.SIGKILL)
+            proc.wait()
+            if proc.stderr:
+                proc.stderr.close()
+        if why:
+            remove_name(parent, part_name)
+            return why
+        try:
+            now = os.stat(part_name, dir_fd=parent, follow_symlinks=False)
+        except OSError:
+            return "the part was removed"
+        if not stat.S_ISREG(now.st_mode) or (now.st_dev, now.st_ino) != (mine.st_dev, mine.st_ino):
+            return "the part was replaced"
+        os.replace(part_name, final_name, src_dir_fd=parent, dst_dir_fd=parent)
+        try:
+            kept = os.stat(final_name, dir_fd=parent, follow_symlinks=False)
+        except OSError:
+            return "the object was removed"
+        if (kept.st_dev, kept.st_ino) != (mine.st_dev, mine.st_ino):
+            # Swapped between the check and the rename: what was renamed is not ours, so it is not kept.
+            remove_name(parent, final_name)
+            return "the part was replaced"
+        return ""
+    finally:
+        os.close(out)
 
 
-def watch_fill(proc: subprocess.Popen, cache: Path, name: str, part: Path, timeout: float) -> str:
+def watch_fill(proc: subprocess.Popen, out: int, timeout: float) -> str:
+    """'' once curl wrote a whole 200 answer into OUT, else why not ('miss' for a 404)."""
     deadline = time.monotonic() + timeout + 30
     while True:
         try:
             code = proc.wait(timeout=FILL_REPORT)
             break
         except subprocess.TimeoutExpired:
-            try:
-                written = part.stat().st_size
-            except OSError:
-                written = 0
+            written = os.fstat(out).st_size
             # curl's --max-filesize holds only when the size is announced; a chunked answer is cut here.
             if time.monotonic() >= deadline or written > FILL_MAX_BYTES:
                 with contextlib.suppress(OSError):
                     os.killpg(proc.pid, signal.SIGKILL)
                 proc.wait()
-                proc.stdout.close()
-                part.unlink(missing_ok=True)
                 return "timed out" if written <= FILL_MAX_BYTES else "larger than a cache object may be"
-            report(part)
-    with proc.stdout:
-        http = (proc.stdout.read() or "").strip()
+            fill_report(out)
+    http = (proc.stderr.read() or "").strip()[-3:] if proc.stderr else ""
+    size = os.fstat(out).st_size
     # Only a 200 is an object: with no redirects followed, a 3xx would otherwise be kept as its body.
-    if code != 0 or http != "200" or not part.is_file() or part.stat().st_size == 0:
-        part.unlink(missing_ok=True)
+    if code != 0 or http != "200" or size == 0:
         return "miss" if http == "404" else f"curl exit {code} http {http}"
-    if part.stat().st_size > FILL_MAX_BYTES:  # a chunked answer that finished between two polls
-        part.unlink(missing_ok=True)
+    if size > FILL_MAX_BYTES:  # a chunked answer that finished between two polls
         return "larger than a cache object may be"
-    os.replace(part, stored(cache, name))
     return ""
 
 
@@ -1205,11 +1305,14 @@ def serve_cache(name: str, cache: Path, run_dir: Path, client: str, record: dict
                         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
                         break
                     except OSError:
-                        if time.monotonic() - started >= FILL_TIMEOUT:
+                        waited = time.monotonic() - started
+                        # The stripe may be held by another object's fill: only a fill of this object is
+                        # worth waiting for (and reporting); otherwise the client downloads directly.
+                        if waited >= FILL_TIMEOUT or (waited >= ADMIT_WAIT and live_fill(part_of(cache, name)) is None):
                             say("busy")
                             log(run_dir, {**record, "outcome": "busy", "why": "fill lock"})
                             return 4
-                        time.sleep(FILL_REPORT)
+                        time.sleep(min(FILL_REPORT, ADMIT_WAIT))
                         report(part_of(cache, name))
                 opened = open_cached(cache, name)  # filled while we waited
                 if opened is None and missed_recently(cache, name):  # or found missing while we waited
@@ -1224,19 +1327,18 @@ def serve_cache(name: str, cache: Path, run_dir: Path, client: str, record: dict
                             if slot is not None:
                                 break
                         else:
-                            if time.monotonic() - started >= FILL_TIMEOUT:
+                            # Every slot fills other objects (this one holds its lock): no waiting behind them.
+                            if time.monotonic() - started >= ADMIT_WAIT:
                                 say("busy")
                                 log(run_dir, {**record, "outcome": "busy", "why": "fill slots"})
                                 return 4
-                            time.sleep(FILL_REPORT)
-                            report(part_of(cache, name))
+                            time.sleep(1)
                     try:
                         filled = fill(cache, name, curl=curl)
                     finally:
                         os.close(slot)
                     if filled == "miss":
-                        with contextlib.suppress(OSError):
-                            miss_of(cache, name).touch()
+                        touch_miss(cache, name)
                         say("miss")
                         log(run_dir, {**record, "outcome": "miss", "seconds": round(time.monotonic() - started, 1)})
                         return 3

@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import importlib.machinery
 import importlib.util
@@ -213,19 +214,20 @@ class ProductServeTest(unittest.TestCase):
 FAKE_CURL = """import os, sys, time
 args = sys.argv[1:]
 out, url = args[args.index("--output") + 1], args[-1]
+code_to = sys.stderr if "%{stderr}" in args[args.index("--write-out") + 1] else sys.stdout
 with open(os.environ["FAKE_CURL_LOG"], "a") as log:
     log.write(url + "\\n")
 bucket, rest = url.removeprefix("https://").split("/", 1)
 ns, file = rest.removeprefix("v1/").split("/objects/")
 source = os.path.join(os.environ["FAKE_BUCKETS"], bucket, ns, file)
 if not os.path.exists(source):
-    sys.stdout.write("404"); sys.exit(22)
+    code_to.write("404"); sys.exit(22)
 data = open(source, "rb").read()
-with open(out, "wb") as f:
+with (os.fdopen(1, "wb", closefd=False) if out == "-" else open(out, "wb")) as f:
     for i in range(0, len(data), 4096):
         f.write(data[i:i + 4096]); f.flush()
         time.sleep(float(os.environ.get("FAKE_CURL_DELAY", "0")))
-sys.stdout.write("200")
+code_to.write("200")
 """
 
 # Stands in for /usr/bin/ssh to the cache host: the real serve script answers as its forced command would.
@@ -372,7 +374,8 @@ class LanCacheTest(unittest.TestCase):
                   f"loader = importlib.machinery.SourceFileLoader('s', {os.fspath(SERVE)!r})\n"
                   "spec = importlib.util.spec_from_loader('s', loader); m = importlib.util.module_from_spec(spec)\n"
                   "loader.exec_module(m)\n"
-                  "for _ in range(20000): m.report(m.Path('/nonexistent'))\n"
+                  f"part = m.Path({os.fspath(self.base / 'live-part')!r}); part.write_bytes(b'x')\n"
+                  "for _ in range(20000): m.report(part)\n"
                   "sys.stderr.write('done')\n")
         read, write = os.pipe()  # never read: the pipe fills after a few KB
         proc = subprocess.run([sys.executable, "-c", script], stdout=write, stderr=subprocess.PIPE, timeout=30)
@@ -403,7 +406,7 @@ class LanCacheTest(unittest.TestCase):
         serve.stored(self.cache, name).write_bytes(b"y" * 5000)  # one kept before the cap
         self.assertIsNone(serve.open_cached(self.cache, name))
 
-    def test_a_replaced_partial_file_is_never_linked_to_dest(self):
+    def test_a_replaced_partial_file_never_becomes_dest(self):
         data = os.urandom(20000)
         name = self.put(data)
         real = lf.cache_transfer
@@ -419,16 +422,18 @@ class LanCacheTest(unittest.TestCase):
 
         with mock.patch.object(lf, "cache_transfer", swap):
             code, record, dest = self.fetch(name)
-        self.assertEqual(code, 1, record)
-        self.assertFalse(dest.exists())
+        # DEST is copied from the descriptor the bytes went to, never from whatever now has the partial's name.
+        self.assertEqual(code, 0, record)
+        self.assertEqual(dest.read_bytes(), data)
         self.assertEqual(next(self.out.glob(".archive.lan-*")).read_bytes(), b"planted")  # not ours to remove
 
     def test_a_redirect_is_never_kept_as_an_object(self):
         name = self.put(b"<html>moved</html>")
         curl = self.base / "fake-redirect-curl"
         curl.write_text(f"#!{sys.executable}\nimport sys\nargs = sys.argv[1:]\n"
-                        "open(args[args.index('--output') + 1], 'wb').write(b'<html>moved</html>')\n"
-                        "sys.stdout.write('302')\n")
+                        "out = args[args.index('--output') + 1]\n"
+                        "(open(1, 'wb', closefd=False) if out == '-' else open(out, 'wb')).write(b'<html>moved</html>')\n"
+                        "sys.stderr.write('302')\n")
         curl.chmod(0o755)
         self.assertEqual(serve.fill(self.cache, name, curl=os.fspath(curl)), "curl exit 0 http 302")
         self.assertFalse(serve.stored(self.cache, name).exists())
@@ -446,6 +451,81 @@ class LanCacheTest(unittest.TestCase):
             os.utime(other, (0, 0))  # its fill died long ago: no longer holds room, and is removed
             self.assertEqual(serve.fill(self.cache, name, curl=os.environ["FAKE_CURL"]), "")
         self.assertFalse(other.exists())
+
+    def test_a_request_never_waits_behind_other_objects_fills(self):
+        run_dir = Path(os.environ["FAKE_CACHE"] + ".run")
+        run_dir.mkdir(parents=True, exist_ok=True)
+        name = self.put(b"s" * 100)
+        held = []
+        for index in range(serve.FILL_SLOTS):  # every fill slot taken by other objects' fills
+            fd = os.open(run_dir / f"fill-slot-{index}.lock", os.O_RDONLY | os.O_CREAT, 0o600)
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            held.append(fd)
+        try:
+            started = time.monotonic()
+            code, record, dest = self.fetch(name)
+            took = time.monotonic() - started
+        finally:
+            for fd in held:
+                os.close(fd)
+        self.assertEqual(code, 1, record)
+        self.assertIn("busy", record["error"])
+        self.assertLess(took, serve.ADMIT_WAIT + 10)  # told busy, not kept alive by progress lines for the others
+        self.assertFalse(dest.exists())
+        self.assertEqual(self.downloads(), [])
+        self.assertEqual(self.fetch(name, "later")[0], 0)  # once a slot is free it fills
+
+    def test_a_request_behind_another_objects_fill_lock_is_told_busy(self):
+        run_dir = Path(os.environ["FAKE_CACHE"] + ".run")
+        run_dir.mkdir(parents=True, exist_ok=True)
+        name = self.put(b"t" * 100)
+        stripe = int(hashlib.sha256(name.encode()).hexdigest()[:24], 16) % serve.FILL_LOCKS
+        fd = os.open(run_dir / f"fill-{stripe}.lock", os.O_RDONLY | os.O_CREAT, 0o600)
+        fcntl.flock(fd, fcntl.LOCK_EX)  # held by a fill of another object in the same stripe: no part of ours
+        try:
+            started = time.monotonic()
+            code, record, _ = self.fetch(name)
+            took = time.monotonic() - started
+        finally:
+            os.close(fd)
+        self.assertEqual(code, 1, record)
+        self.assertIn("busy", record["error"])
+        self.assertLess(took, serve.ADMIT_WAIT + 15)
+
+    def test_progress_is_only_reported_for_a_running_fill_of_the_same_object(self):
+        part = self.base / "part"
+        self.assertIsNone(serve.live_fill(part))
+        part.write_bytes(b"abc")
+        self.assertEqual(serve.live_fill(part), 3)
+        os.utime(part, (0, 0))  # a dead fill's part
+        self.assertIsNone(serve.live_fill(part))
+        part.unlink()
+        part.symlink_to(self.base / "elsewhere")
+        (self.base / "elsewhere").write_bytes(b"abcdef")
+        self.assertIsNone(serve.live_fill(part))  # a symlink is never followed
+
+    def test_a_fill_never_follows_a_symlink(self):
+        name = self.put(b"u" * 5000)
+        objects = self.cache / "objects"
+        objects.mkdir(parents=True, exist_ok=True)
+        outside = self.base / "outside"
+        outside.write_bytes(b"keep")
+        serve.part_of(self.cache, name).symlink_to(outside)  # raced in before the fill
+        self.assertEqual(serve.fill(self.cache, name, curl=os.environ["FAKE_CURL"]), "")
+        self.assertEqual(outside.read_bytes(), b"keep")
+        self.assertEqual(serve.stored(self.cache, name).read_bytes(), b"u" * 5000)
+        self.assertFalse(serve.stored(self.cache, name).is_symlink())
+        missing = "ci-cache.cmux.com/macOS-ARM64/gone.tar.zst"
+        serve.miss_of(self.cache, missing).symlink_to(self.base / "planted-miss")
+        serve.touch_miss(self.cache, missing)
+        self.assertFalse((self.base / "planted-miss").exists())
+        # An objects directory that is a symlink is not ours: nothing is filled through it.
+        other = self.base / "other-cache"
+        (other).mkdir()
+        (self.base / "elsewhere-objects").mkdir()
+        (other / "objects").symlink_to(self.base / "elsewhere-objects")
+        self.assertEqual(serve.fill(other, name, curl=os.environ["FAKE_CURL"]), "the cache directory is not ours")
+        self.assertEqual(list((self.base / "elsewhere-objects").iterdir()), [])
 
     def test_a_miss_is_shared_by_the_requests_behind_it(self):
         name = "ci-cache.cmux.com/macOS-ARM64/none.tar.zst"

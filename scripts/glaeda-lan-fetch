@@ -661,6 +661,38 @@ def same_file(parent: int, name: str, info: os.stat_result) -> bool:
     return stat.S_ISREG(now.st_mode) and (now.st_dev, now.st_ino) == (info.st_dev, info.st_ino)
 
 
+def publish(fd: int, size: int, parent: int, dest: str) -> None:
+    """Copy the SIZE bytes of the open file FD into DEST, created here (no-replace, no symlink followed).
+
+    Copied from the descriptor rather than linked by name: a name can be swapped between a check and a link,
+    so whatever is at the partial's name never becomes DEST. A failed copy removes only the DEST it created.
+    """
+    if os.fstat(fd).st_size != size:
+        raise OSError("the partial file is not the announced size")
+    out = os.open(dest, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644, dir_fd=parent)
+    made = os.fstat(out)
+    try:
+        offset = 0
+        while offset < size:
+            chunk = os.pread(fd, min(1 << 20, size - offset), offset)
+            if not chunk:
+                raise OSError("the partial file shrank")
+            view = memoryview(chunk)
+            while view:
+                view = view[os.write(out, view):]
+            offset += len(chunk)
+        os.fsync(out)
+        if os.fstat(out).st_size != size:
+            raise OSError("DEST is not the announced size")
+    except BaseException:
+        if same_file(parent, dest, made):
+            with contextlib.suppress(OSError):
+                os.unlink(dest, dir_fd=parent)
+        raise
+    finally:
+        os.close(out)
+
+
 def fetch_cache(name: str, dest: Path, config: dict | None, deadline: float | None = None,
                 cancel: threading.Event | None = None) -> tuple[int, dict]:
     """(exit code, record). Writes DEST, whole, with the LAN cache host's copy of NAME (BUCKET/NS/FILE).
@@ -702,18 +734,15 @@ def fetch_cache_into(name: str, parent: int, dest: str, config: dict, record: di
             fd = os.open(partial, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644, dir_fd=parent)
         except OSError as error:
             return EXIT_ERROR, {**record, "error": f"partial file: {type(error).__name__}"}
-        # Written through the descriptor this call created, never reopened by name; DEST is linked only to
-        # that same file, checked by inode first.
+        # Written through the descriptor this call created, never reopened by name; DEST is a copy made from
+        # that same descriptor (publish).
         mine = os.fstat(fd)
         try:
             why, size, wait = cache_transfer(config, address, name, fd, deadline, cancel)
             if why == "miss":
                 return EXIT_MISS, {**record, "reason": "not in the bucket", "seconds": round(time.monotonic() - started, 3)}
             if not why:
-                if not same_file(parent, partial, mine):
-                    raise FileNotFoundError("the partial file was replaced")
-                # no-replace: fails if DEST appeared meanwhile
-                os.link(partial, dest, src_dir_fd=parent, dst_dir_fd=parent, follow_symlinks=False)
+                publish(fd, size, parent, dest)
                 return EXIT_HIT, {**record, "address": address, "bytes": size, "wait_seconds": round(wait, 3),
                                   "seconds": round(time.monotonic() - started, 3)}
             errors.append(f"{address}: {why}")
