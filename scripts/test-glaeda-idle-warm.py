@@ -416,6 +416,11 @@ class RunTest(Base):
         return json.loads(proc.stdout.strip().splitlines()[-1])
 
     @unittest.skipUnless(sys.platform == "darwin", "runs only on macOS")
+    def test_a_finished_build_whose_group_it_cannot_list_ends_with_the_catch_up(self) -> None:
+        result = self.grouped_build(self.fake_setup(), "100 * 1024 ** 3", "0", no_ps=True)
+        self.assertEqual(result["returncode"], -signal.SIGKILL)
+
+    @unittest.skipUnless(sys.platform == "darwin", "runs only on macOS")
     def test_a_group_it_cannot_list_ends_with_the_catch_up(self) -> None:
         # ps fails: the group cannot be seen empty, so the catch-up ends its whole group, itself included.
         result = self.grouped_build(self.fake_setup(), "39 * 1024 ** 3", "139", no_ps=True)

@@ -719,7 +719,10 @@ def build(checkout: Path, root: int, state: Path, xcode: str, log: Path,
                 return {"kept": "false", "reason": reason, "wall_seconds": round(time.monotonic() - started, 1)}
     finally:
         _child = None
-    kill_build()  # anything the build left running in our group (a detached build service)
+    # anything the build left running in our group (a detached build service); a group that cannot be seen
+    # empty ends whole, us included, so nothing of the build outlives the locks (the attempt stays recorded)
+    if _grouped and not kill_build():
+        os.killpg(os.getpid(), signal.SIGKILL)
     result = last_result(log)
     if not result:
         result = {"kept": "false", "reason": f"exit {code}, no result line"}
