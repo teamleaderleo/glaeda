@@ -9025,6 +9025,24 @@ class HygieneMirrorTest(unittest.TestCase):
                                         (first.st_dev, first.st_ino))
         self.assertEqual(f.read_text(), "new contents")
 
+    def test_a_file_rewritten_in_place_with_its_old_mtime_is_kept(self) -> None:
+        archive = gd.HOME / "archive"
+        archive.mkdir(parents=True)
+        f = archive / "loose.patch"
+        f.write_text("old")
+        first = os.lstat(f)
+        digest = gd._sha256(f)
+        with f.open("r+") as h:  # same inode, new bytes, old mtime
+            h.write("new")
+        os.utime(f, (first.st_mtime, first.st_mtime))
+        root = os.lstat(archive)
+        doomed = f.with_name(f"{gd.DELETING_PREFIX}{f.name}-{os.getpid()}")
+        os.rename(f, doomed)
+        with self.assertRaises(gd.SlotTaken):
+            gd._foreign_archive_recheck(f, (root.st_dev, root.st_ino), first.st_mtime + 1, lambda p: False,
+                                        (first.st_dev, first.st_ino), digest)
+        self.assertEqual(f.read_text(), "new")
+
     def test_existing_archive_dirs_and_manifest_are_tightened(self) -> None:
         root = gd.mirror_archive()
         root.mkdir(parents=True)
