@@ -9227,9 +9227,8 @@ class HomeScratchTest(unittest.TestCase):
 
     def _reference_files(self) -> list[Path]:
         """The real list, minus the suite host's own /Library/LaunchDaemons."""
-        with mock.patch.object(gd.Path, "glob", lambda p, pat: [] if str(p) in ("/Library/LaunchDaemons",
-                                                                                 "/Library/LaunchAgents")
-                               else _real_glob(p, pat)):
+        with mock.patch.object(gd, "_strict_entries", lambda f, pat="*": [] if str(f).startswith("/Library/")
+                               else _real_strict_entries(f, pat)):
             return _real_home_scratch_reference_files()
 
     def age(self, tree: Path, hours: float = 26) -> None:
@@ -9349,12 +9348,59 @@ class HomeScratchTest(unittest.TestCase):
             plistlib.dump({"Label": "ai.manaflow.global", "ProgramArguments": [f"{self.home}/cnx-global/run"]}, f)
         self.daemons.stop()  # the real list, with /Library's agents read from this test's folder
         try:
-            with mock.patch.object(gd.Path, "glob", lambda p, pat: _real_glob(system, pat)
-                                   if str(p) == "/Library/LaunchAgents" else [] if str(p) == "/Library/LaunchDaemons"
-                                   else _real_glob(p, pat)):
+            with mock.patch.object(gd, "_strict_entries", lambda f, pat="*": _real_strict_entries(system, pat)
+                                   if str(f) == "/Library/LaunchAgents" else [] if str(f).startswith("/Library/")
+                                   else _real_strict_entries(f, pat)):
                 self.assertEqual(self.survey(self.family())["cnx-global"].verdict, "in-use")
         finally:
             self.daemons.start()
+
+    def test_an_installed_link_into_the_folder_keeps_it(self) -> None:
+        """A launch agent installed as a symlink to a plist inside the folder names it: only files that sit inside
+        the folder are its own."""
+        tree = self.tree("service-tree")
+        with (tree / "service.plist").open("wb") as f:
+            plistlib.dump({"Label": "ai.manaflow.svc", "ProgramArguments": [f"{tree}/run"]}, f)
+        self.age(tree)
+        agents = self.home / "Library/LaunchAgents"
+        agents.mkdir(parents=True)
+        (agents / "ai.manaflow.svc.plist").symlink_to(tree / "service.plist")
+        self.assertEqual(self.survey(self.family())["service-tree"].verdict, "in-use")
+
+    def test_a_configuration_folder_that_cannot_be_listed_keeps_it(self) -> None:
+        self.tree("cnx-unlisted")
+        def failing(folder, pattern="*"):
+            if folder == self.home / "Library/LaunchAgents":
+                raise PermissionError(13, "denied")
+            return [] if str(folder).startswith("/Library/") else _real_strict_entries(folder, pattern)
+        self.daemons.stop()  # the real list, with this test's listing failure
+        try:
+            with mock.patch.object(gd, "_strict_entries", failing):
+                self.assertEqual(gd.home_scratch_referenced(self.home / "cnx-unlisted"),
+                                 "home folder references unreadable")
+                self.assertEqual(self.survey(self.family())["cnx-unlisted"].verdict, "in-use")
+        finally:
+            self.daemons.start()
+
+    def test_large_configuration_is_unread_unless_an_archive_or_binary(self) -> None:
+        self.tree("cnx-big")
+        runner = self.home / "actions-runner-glaeda-3"
+        runner.mkdir()
+        with mock.patch.object(gd, "HOME_SCRATCH_REF_MAX_BYTES", 16):
+            (runner / "actions-runner-osx-arm64.tar.gz").write_bytes(b"\x1f\x8b" + b"\0" * 64)
+            self.assertEqual(gd.home_scratch_referenced(self.home / "cnx-big"), "")
+            (runner / "generated.env").write_text("X=1\n" * 16 + f"ROOT={self.home}/cnx-big\n")
+            self.assertEqual(gd.home_scratch_referenced(self.home / "cnx-big"), "home folder references unreadable")
+
+    def test_apply_keeps_the_snapshot_sizes_of_folders_neither_family_lists(self) -> None:
+        self.tree("cnx-a")
+        fams = [f for f in (self.family(), self.retired()) if f is not None]
+        known = {os.fspath(self.home / "Library/Caches/x"): 1, os.fspath(self.home / "actions-runner-glaeda-2/_work"): 2,
+                 os.fspath(self.home / ".cache/y"): 3, os.fspath(self.home / "cnx-a"): 4,
+                 os.fspath(self.home / "actions-runner-old/_work"): 5}
+        kept = gd.fresh_for_apply(known, fams)
+        self.assertEqual(set(kept), {os.fspath(self.home / p) for p in
+                                     ("Library/Caches/x", "actions-runner-glaeda-2/_work", ".cache/y")})
 
     def test_unreadable_configuration_keeps_it(self) -> None:
         self.tree("cnx-locked")
@@ -9410,6 +9456,7 @@ class HomeScratchTest(unittest.TestCase):
 
 
 _real_glob = Path.glob
+_real_strict_entries = gd._strict_entries
 _real_home_scratch_reference_files = gd.home_scratch_reference_files
 
 

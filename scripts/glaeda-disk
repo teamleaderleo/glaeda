@@ -208,6 +208,7 @@ import contextlib
 import ctypes
 import errno
 import fcntl
+import fnmatch
 import glob
 import gzip
 import hashlib
@@ -3658,37 +3659,55 @@ RETIRED_RUNNER_FAMILY = "retired-runner"
 HOME_SCRATCH_FAMILIES = (HOME_SCRATCH_FAMILY, RETIRED_RUNNER_FAMILY)
 
 
-HOME_SCRATCH_REF_MAX_BYTES = 4 * 2**20  # a configuration file larger than this is not text a person wrote: skipped
-_HOME_SCRATCH_REF_TEXT: dict[str, tuple[tuple, str]] = {}  # path -> (stat key, decoded text), re-read when it changes
+HOME_SCRATCH_REF_MAX_BYTES = 4 * 2**20  # larger configuration is read only to tell an archive or binary
+# Magic numbers of what a larger file may be without being configuration: gzip, zip, xz, bzip2, Mach-O (both byte
+# orders, 32/64 and universal), ELF. Any other file over the bound is unread, which keeps the folder.
+HOME_SCRATCH_BINARY_MAGIC = (b"\x1f\x8b", b"PK\x03\x04", b"\xfd7zXZ", b"BZh", b"\xcf\xfa\xed\xfe", b"\xce\xfa\xed\xfe",
+                             b"\xfe\xed\xfa\xcf", b"\xfe\xed\xfa\xce", b"\xca\xfe\xba\xbe", b"\x7fELF")
+_HOME_SCRATCH_REF_TEXT: dict[str, tuple[tuple, str | None]] = {}  # path -> (stat key, text), re-read when it changes
+
+
+def _strict_entries(folder: Path, pattern: str = "*") -> list[Path]:
+    """The entries of folder matching pattern; [] when folder does not exist. Any other failure to list it raises
+    OSError (Path.glob would swallow it and read as "nothing names it")."""
+    try:
+        with os.scandir(folder) as it:
+            names = [e.name for e in it]
+    except FileNotFoundError:
+        return []
+    except NotADirectoryError:
+        return []
+    return sorted(folder / n for n in names if fnmatch.fnmatchcase(n, pattern))
 
 
 def home_scratch_reference_files() -> list[Path]:
     """Configuration that can name a home folder a service needs: the user's shell, agent and launch agent files,
     /Library's launch agents and daemons, and every file at the top of each runner directory and its glaeda-hooks
     (a dedicated runner's admission names its builder folder there, e.g. CNX_BUILDS_ROOT), whatever its suffix.
-    Symlinks are followed for reading; the runner's credential files are never read."""
-    files = [*_reference_files(), *sorted(Path("/Library/LaunchAgents").glob("*.plist")),
-             *sorted(Path("/Library/LaunchDaemons").glob("*.plist")),
-             *sorted((HOME / "Library/LaunchAgents").glob("*.plist"))]
-    for runner in sorted(HOME.glob("actions-runner*")):
+    Symlinks are followed for reading; the runner's credential files are never read. A folder that exists but cannot
+    be listed raises OSError, so the caller keeps the item."""
+    files = [*_reference_files(), *_strict_entries(Path("/Library/LaunchAgents"), "*.plist"),
+             *_strict_entries(Path("/Library/LaunchDaemons"), "*.plist"),
+             *_strict_entries(HOME / "Library/LaunchAgents", "*.plist")]
+    for runner in _strict_entries(HOME, "actions-runner*"):
         for d in (runner, runner / "glaeda-hooks"):
-            if not d.is_dir():
-                continue
-            files += [f for f in sorted(d.iterdir()) if not f.name.startswith(".credentials")]
+            files += [f for f in _strict_entries(d) if not f.name.startswith(".credentials")]
     return [f for f in dict.fromkeys(files) if f.is_file()]
 
 
 def _home_scratch_ref_text(config: Path) -> str | None:
     """A configuration file's text (a plist decoded to JSON), read again only when its stat changed; None when it
-    cannot be read. Larger than HOME_SCRATCH_REF_MAX_BYTES: "" (a binary, not configuration)."""
+    cannot be read, or is over HOME_SCRATCH_REF_MAX_BYTES and not a known archive or binary ("" for those)."""
     try:
         st = config.stat()
         key = (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
         cached = _HOME_SCRATCH_REF_TEXT.get(os.fspath(config))
         if cached and cached[0] == key:
             return cached[1]
+        text: str | None
         if st.st_size > HOME_SCRATCH_REF_MAX_BYTES:
-            text = ""
+            with open(config, "rb") as handle:
+                text = "" if handle.read(8).startswith(HOME_SCRATCH_BINARY_MAGIC) else None
         else:
             data = config.read_bytes()
             if config.suffix == ".plist" or data.startswith(b"bplist"):
@@ -3716,10 +3735,10 @@ def home_scratch_referenced(path: Path) -> str:
         files = home_scratch_reference_files()
     except OSError:
         return "home folder references unreadable"
-    inside = os.path.realpath(path) + "/"
+    inside = (os.path.abspath(path) + "/", os.path.realpath(path) + "/")
     for config in files:
-        if os.path.realpath(config).startswith(inside):
-            continue  # a folder's own scripts (a runner's run.sh, .runner, .env) never keep it
+        if os.path.abspath(config).startswith(inside):
+            continue  # a folder's own scripts (a runner's run.sh, .runner, .env), where they sit, never keep it
         text = _home_scratch_ref_text(config)
         if text is None:
             return "home folder references unreadable"
@@ -7103,7 +7122,11 @@ def fresh_for_apply(known: dict[str, int], fams: list[Family]) -> dict[str, int]
             if not f.reclaimable or f.discover or f.checkout_builds or f.transcripts or f.transcript_archives:
                 continue
             root = str(f.root) + "/"
-            if k.startswith(root) and k[len(root):].split("/")[0] not in f.skip:
+            if not k.startswith(root):
+                continue
+            top = k[len(root):].split("/")[0]  # the candidate it is in or below, by candidates()' own filters
+            if top not in f.skip and not (f.skip_prefixes and top.startswith(f.skip_prefixes)) \
+                    and (not f.include or top.startswith(f.include)):
                 return True
         return False
     return {k: v for k, v in known.items() if not candidate_of_selected(k)}
