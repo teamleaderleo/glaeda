@@ -428,6 +428,24 @@ class LanCacheTest(unittest.TestCase):
         self.assertEqual(dest.read_bytes(), data)
         self.assertEqual([p.name for p in self.out.iterdir()], ["archive"])  # the stage is removed
 
+    def test_a_stage_directory_open_to_others_is_never_used(self):
+        name = self.put(b"v" * 100)
+        real_mkdir = os.mkdir
+
+        def lax(path, mode=0o777, *, dir_fd=None):  # as if another user swapped in a directory anyone can write
+            real_mkdir(path, mode, dir_fd=dir_fd)
+            os.chmod(path, 0o777, dir_fd=dir_fd)
+
+        with mock.patch.object(lf.os, "mkdir", lax):
+            code, record, dest = self.fetch(name)
+        self.assertEqual(code, 1, record)
+        self.assertIn("PermissionError", record["error"])
+        self.assertFalse(dest.exists())
+        with mock.patch.object(serve.os, "mkdir", lax):
+            self.assertEqual(serve.fill(self.cache, name, curl=os.environ["FAKE_CURL"]),
+                             "the stage directory is not this fill's own")
+        self.assertFalse(serve.stored(self.cache, name).exists())
+
     def test_a_redirect_is_never_kept_as_an_object(self):
         name = self.put(b"<html>moved</html>")
         curl = self.base / "fake-redirect-curl"
