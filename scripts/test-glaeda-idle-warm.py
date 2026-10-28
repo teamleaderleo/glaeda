@@ -377,7 +377,7 @@ class RunTest(Base):
         self.assertIn("paused", paused["reason"])
 
     def grouped_build(self, checkout: Path, free: str, sleep: str, timeout_s: int | None = None,
-                      no_ps: bool = False) -> dict:
+                      no_ps: str = "", waiter: str = "None") -> dict:
         """build() in a driver that leads its own process group, as the LaunchAgent run does, so kill_build ends
         the fake build's `sleep` grandchild too; asserts no `sleep SLEEP` is left."""
         driver = self.dir / "glaeda-idle-warm-watch-driver.py"
@@ -393,17 +393,27 @@ class RunTest(Base):
             if {timeout_s!r} is not None:
                 warm.BUILD_TIMEOUT_S = {timeout_s!r}
             warm.free_bytes = lambda path: {free}
-            if {no_ps!r}:
+            mode = {no_ps!r}
+            if mode:
                 real_popen = warm.subprocess.Popen
                 def no_ps(args, *rest, **kwargs):
-                    if args and args[0] == "/bin/ps":
+                    if not (args and args[0] == "/bin/ps"):
+                        return real_popen(args, *rest, **kwargs)
+                    if mode == "spawn":
                         raise OSError("ps failed")
-                    return real_popen(args, *rest, **kwargs)
+                    if mode == "exit":  # ps runs, lists nothing and fails
+                        return real_popen(["/bin/sh", "-c", "exit 1"], *rest, **kwargs)
+                    proc = real_popen(args, *rest, **kwargs)
+                    def broken(*a, **k):
+                        raise OSError("read failed")
+                    proc.communicate = broken
+                    return proc
                 warm.subprocess.Popen = no_ps
             warm._grouped = warm.own_group()
             assert warm._grouped
             print(json.dumps(warm.build(Path({os.fspath(checkout)!r}), 2, Path({os.fspath(self.state)!r}), "/x.app",
-                                        Path({os.fspath(self.dir / 'watch.log')!r}), stop_below=40 * 1024 ** 3)))
+                                        Path({os.fspath(self.dir / 'watch.log')!r}), stop_below=40 * 1024 ** 3,
+                                        nightly_waiter={waiter})))
         """))
         proc = subprocess.run([sys.executable, os.fspath(driver)], capture_output=True, text=True, timeout=60,
                               env={**os.environ, "FAKE_SLEEP": sleep})
@@ -417,13 +427,42 @@ class RunTest(Base):
 
     @unittest.skipUnless(sys.platform == "darwin", "runs only on macOS")
     def test_a_finished_build_whose_group_it_cannot_list_ends_with_the_catch_up(self) -> None:
-        result = self.grouped_build(self.fake_setup(), "100 * 1024 ** 3", "0", no_ps=True)
-        self.assertEqual(result["returncode"], -signal.SIGKILL)
+        for mode in ("spawn", "read", "exit"):
+            with self.subTest(ps=mode):
+                result = self.grouped_build(self.fake_setup() if mode == "spawn" else self.state / ".catch-up" / "cmux",
+                                            "100 * 1024 ** 3", "0", no_ps=mode)
+                self.assertEqual(result["returncode"], -signal.SIGKILL)
+
+    @unittest.skipUnless(sys.platform == "darwin", "runs only on macOS")
+    def test_a_nightly_job_waiting_for_disk_stops_the_build(self) -> None:
+        result = self.grouped_build(self.fake_setup(), "100 * 1024 ** 3", "143",
+                                    waiter="lambda: 'a nightly job waits here for free disk (build-nightly-app)'")
+        self.assertEqual(result["kept"], "false")
+        self.assertEqual(result["reason"], "stopped: a nightly job waits here for free disk (build-nightly-app)")
+
+    def test_the_reserve_is_read_again_once_the_locks_are_taken(self) -> None:
+        # A nightly waiter that appears between the idle check and the locks keeps the build from starting.
+        if sys.platform != "darwin":
+            return
+        self.fake_setup()
+        calls = []
+        def refusal(hook_module):
+            calls.append(1)
+            return "a nightly job waits here for free disk (late)"
+        saved = warm.nightly_reserve_refusal
+        try:
+            warm.nightly_reserve_refusal = refusal
+            done = warm.run(True, self.state)
+        finally:
+            warm.nightly_reserve_refusal = saved
+        self.assertEqual((done["state"], done["reason"]), ("skip", "a nightly job waits here for free disk (late)"))
+        self.assertTrue(calls)
+        self.assertFalse((self.dir / "calls").exists(), "no build started")
 
     @unittest.skipUnless(sys.platform == "darwin", "runs only on macOS")
     def test_a_group_it_cannot_list_ends_with_the_catch_up(self) -> None:
         # ps fails: the group cannot be seen empty, so the catch-up ends its whole group, itself included.
-        result = self.grouped_build(self.fake_setup(), "39 * 1024 ** 3", "139", no_ps=True)
+        result = self.grouped_build(self.fake_setup(), "39 * 1024 ** 3", "139", no_ps="spawn")
         self.assertEqual(result["returncode"], -signal.SIGKILL)
 
     @unittest.skipUnless(sys.platform == "darwin", "runs only on macOS")

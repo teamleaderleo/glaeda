@@ -314,27 +314,35 @@ def nightly_reserve(hook: Any) -> tuple[float, float] | None:
     return (builder, growth) if builder > 0 else (0.0, 0.0)
 
 
+def nightly_waiter_refusal(hook: Any) -> str:
+    """Why a nightly job's wait for free disk keeps a catch-up off (it waits, or its markers cannot be read), or ''.
+    A hook without nightly_disk_waiter predates the reserve: nothing to read."""
+    if not hasattr(hook, "nightly_disk_waiter"):
+        return ""
+    try:
+        # the hook's reader takes an unreadable directory for no waiter; here that is unknown, so short
+        with os.scandir(FLEET_DIR / "capacity"):
+            pass
+    except FileNotFoundError:
+        pass
+    except OSError as error:
+        return f"cannot read the nightly disk waiters ({type(error).__name__})"
+    try:
+        waiter = hook.nightly_disk_waiter(FLEET_DIR / "capacity")
+    except Exception as error:  # noqa: BLE001
+        return f"cannot read the nightly disk waiters ({type(error).__name__})"
+    return f"a nightly job waits here for free disk ({waiter})" if waiter else ""
+
+
 def nightly_reserve_refusal(hook: Any) -> str:
     """Why a catch-up must not start for the nightly builder's disk, or ''. A PR runner on a mini with a dedicated
     nightly builder listens only with the builder's floor plus one job's growth free, and none starts while a
     nightly job frees disk (the hook's NIGHTLY_DISK_RESERVE, Gate.low_disk); a catch-up is a compile like theirs.
     On 2026-10-28 cmux7s's catch-up took free disk from 46 to 31 GiB while its builder needed 42, so the builder's
     listener was held off and every PR runner with it."""
-    if hasattr(hook, "nightly_disk_waiter"):
-        try:
-            # the hook's reader takes an unreadable directory for no waiter; here that is unknown, so short
-            with os.scandir(FLEET_DIR / "capacity"):
-                pass
-        except FileNotFoundError:
-            pass
-        except OSError as error:
-            return f"cannot read the nightly disk waiters ({type(error).__name__})"
-        try:
-            waiter = hook.nightly_disk_waiter(FLEET_DIR / "capacity")
-        except Exception as error:  # noqa: BLE001
-            return f"cannot read the nightly disk waiters ({type(error).__name__})"
-        if waiter:
-            return f"a nightly job waits here for free disk ({waiter})"
+    why = nightly_waiter_refusal(hook)
+    if why:
+        return why
     reserve = nightly_reserve(hook)
     if reserve is None:
         return "cannot read the dedicated nightly builder's disk reserve"
@@ -544,9 +552,12 @@ def kill_build(passes: int = 3) -> bool:
             return False
         try:
             out, _ = ps.communicate(timeout=2)
-        except subprocess.SubprocessError:
-            ps.kill()
+        except (OSError, subprocess.SubprocessError):
+            with contextlib.suppress(OSError):
+                ps.kill()
             ps.wait()
+            return False
+        if ps.returncode != 0:  # a failed ps lists nothing, which is not an empty group
             return False
         # ps runs in our group too: it is not a member to kill or to wait for
         members = [int(pid) for pid, pgid in (line.split() for line in out.splitlines() if len(line.split()) == 2)
@@ -684,10 +695,11 @@ def end_child() -> None:
         os.killpg(os.getpid(), signal.SIGKILL)
 
 
-def build(checkout: Path, root: int, state: Path, xcode: str, log: Path,
-          stop_below: int | None = None) -> dict[str, Any]:
+def build(checkout: Path, root: int, state: Path, xcode: str, log: Path, stop_below: int | None = None,
+          nightly_waiter: Any = None) -> dict[str, Any]:
     """Run cmux's owned_catch_up.sh in our process group, its output appended to LOG; its result line. With
-    stop_below, the build is killed once free disk drops under it (one statvfs every BUILD_DISK_WATCH_S)."""
+    stop_below, the build is killed once free disk drops under it, and with nightly_waiter (a callable: why, or
+    ''), once a nightly job waits for free disk; both are read every BUILD_DISK_WATCH_S."""
     global _child
     env = {key: value for key, value in os.environ.items() if not key.startswith(("GITHUB_", "RUNNER_", "CMUX_"))}
     env.update(PATH=PATH, CMUX_CI_XCODE_APP=xcode, CMUX_CATCH_UP_LOG=os.fspath(log))
@@ -700,16 +712,20 @@ def build(checkout: Path, root: int, state: Path, xcode: str, log: Path,
     try:
         while True:
             try:
-                code = _child.wait(timeout=max(0.0, min(BUILD_DISK_WATCH_S if stop_below else BUILD_TIMEOUT_S,
+                watched = stop_below is not None or nightly_waiter is not None
+                code = _child.wait(timeout=max(0.0, min(BUILD_DISK_WATCH_S if watched else BUILD_TIMEOUT_S,
                                                         deadline - time.monotonic())))
                 break
             except subprocess.TimeoutExpired:
                 pass
             free = free_bytes(FLEET_DIR) if stop_below else None
             low = stop_below is not None and (free is None or free < stop_below)  # unknown free disk is short
-            if low or time.monotonic() >= deadline:
+            waiting = nightly_waiter() if nightly_waiter is not None and not low else ""
+            if low or waiting or time.monotonic() >= deadline:
                 end_child()
-                if not low:
+                if waiting:
+                    reason = f"stopped: {waiting}"
+                elif not low:
                     reason = f"timed out after {BUILD_TIMEOUT_S} s"
                 elif free is None:
                     reason = "stopped: cannot read free disk while the dedicated nightly builder keeps a floor"
@@ -1385,8 +1401,12 @@ def run(apply: bool, state: Path, now: float | None = None) -> dict[str, Any]:
             busy = running()  # a job that started while the locks were taken: it will ask for them
             if busy:
                 return {**base, "state": "skip", "reason": f"busy: {busy}"}
+            # the reserve and the nightly waiters again, now the locks are ours: either may have changed since
+            why = nightly_reserve_refusal(hook)
+            if why:
+                return {**base, "state": "skip", "reason": why}
             reserve = nightly_reserve(hook)
-            if reserve is None:  # read moments ago in idle_refusal; gone unreadable since
+            if reserve is None:
                 return {**base, "state": "skip", "reason": "cannot read the dedicated nightly builder's disk reserve"}
             builder = reserve[0]
             logs = work / "logs"
@@ -1397,7 +1417,8 @@ def run(apply: bool, state: Path, now: float | None = None) -> dict[str, Any]:
             memory["attempt"] = {"root": root, "head": head, "at": int(time.time())}
             save_memory(memory_path, memory)
             result = build(work / "cmux", root, state, scope["xcode"], log,
-                           stop_below=int(builder * 1024 ** 3) if builder > 0 else None)
+                           stop_below=int(builder * 1024 ** 3) if builder > 0 else None,
+                           nightly_waiter=(lambda: nightly_waiter_refusal(hook)) if builder > 0 else None)
             memory.pop("attempt", None)
             trim_logs(logs)
         finally:
