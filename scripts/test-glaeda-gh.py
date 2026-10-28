@@ -1494,12 +1494,12 @@ class BalanceTest(Base):
                               "graphql": {"limit": 5000, "remaining": graphql[0], "reset": NOW + graphql[1]}}
 
     def test_richness_is_what_is_left_over_the_time_to_reset(self) -> None:
-        self.budgets(rest=(600, 120), graphql=(600, 3000))  # same count: 2 minutes to go is rich
+        self.budgets(rest=(1600, 120), graphql=(1600, 3000))  # same count, both above their floors: 2 minutes to go is rich
         self.assertGreater(self.daemon.richness("rest"), 10 * self.daemon.richness("graphql"))
         self.assertEqual(self.daemon.route("pr"), "rest")
         self.assertEqual(self.daemon.route("run"), "rest")
         self.assertEqual(self.daemon.route("comment"), "graphql")  # comment watches never move
-        self.budgets(rest=(600, 3000), graphql=(600, 120))
+        self.budgets(rest=(1600, 3000), graphql=(1600, 120))
         self.assertEqual(self.daemon.route("pr"), "graphql")
         self.assertEqual(self.daemon.route("run"), "graphql")
         # a bucket below its reserve is stopped whatever its time left; the other takes every read
@@ -1977,6 +1977,31 @@ class FallbackTest(Base):
         self.assertEqual(entry["via"], "rest")
         self.assertEqual(len(entry["data"]["found"]), 150)
         self.assertEqual(len(self.daemon.head_spend["session-1"]), 1)  # refunded by the failure, charged by REST
+
+    def test_a_rate_limited_answer_with_partial_data_still_spills_to_rest(self) -> None:
+        partial = (200, {"x-ratelimit-remaining": "0", "x-ratelimit-resource": "graphql",
+                         "x-ratelimit-reset": str(int(NOW + 1800))},
+                   json.dumps({"data": {"rateLimit": {"limit": 5000, "remaining": 0, "resetAt": iso(NOW + 1800), "cost": 1},
+                                        "p0": None, "h0": None, "c0": None, "w0": None},
+                               "errors": [{"type": "RATE_LIMITED", "message": "API rate limit exceeded"}]}).encode())
+        self.register_all()
+        self.daemon.paths = {kind: "graphql" for kind in gg.CYCLES}
+        self.gh.throttle["graphql"] = partial
+        self.daemon.tick(NOW)
+        for kind, key in self.keys.items():
+            entry = gg.read_cache(key)
+            self.assertEqual((entry["via"], entry["error"]), ("rest", None), kind)
+            self.assertFalse(entry.get("missing"), kind)
+
+    def test_a_low_bucket_always_hands_its_reads_over_and_never_takes_them_back_by_margin(self) -> None:
+        self.daemon.now = NOW
+        # GraphQL below its floor but about to reset, so "richer" per second than a normal REST
+        self.daemon.budget = {"rest": {"limit": 5000, "remaining": 2000, "reset": NOW + 3000},
+                              "graphql": {"limit": 5000, "remaining": 450, "reset": NOW + 60}}
+        self.assertGreater(self.daemon.richness("graphql"), self.daemon.richness("rest"))
+        self.daemon.paths["pr"] = "graphql"
+        self.assertEqual(self.daemon.route("pr"), "rest")
+        self.assertEqual(self.daemon.route("pr"), "rest")  # and stays: no flapping back by the margin
 
     def test_a_long_pacer_hold_is_honoured(self) -> None:
         gg.BASE.mkdir(parents=True, exist_ok=True)

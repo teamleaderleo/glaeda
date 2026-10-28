@@ -1410,6 +1410,7 @@ class Daemon:
             for k, v in (spends or {}).items() if isinstance(v, list)}
         self.payer: dict[str, tuple[str, float]] = {}  # head key -> (consumer, time) charged for a read in flight
         self.spill: list[dict] = []  # entries a fetch could not finish because GraphQL stopped partway
+        self.gql_limited = False  # a GraphQL answer since the last fetch began said the primary limit is reached
         self.refunded: dict[str, str] = {}  # head key -> the consumer a failed read refunded, this tick
         self.denied: dict[str, float] = {}  # consumer -> when a head read it needed was refused for budget
         self.saved_consumers: str = ""
@@ -1525,11 +1526,11 @@ class Daemon:
                 self.paths[kind] = current = want
         if kind in BALANCED:
             here, there = self.richness(current), self.richness(OTHER[current])
-            # Below its floor while the other bucket is not: move without waiting for the margin, unless this
-            # one is still clearly richer (about to reset), when the margin would only move it straight back.
-            low = (self.mode(current) != "normal" and self.mode(OTHER[current]) == "normal"
-                   and there * SWITCH_MARGIN >= here)
-            if there >= 0 and (here < 0 or low or there > here * SWITCH_MARGIN):
+            # Below its floor while the other bucket is not: move, whatever the margin says. The reverse never
+            # moves by the margin (a low bucket about to reset can look richer), so the two cannot flap.
+            low = self.mode(current) != "normal" and self.mode(OTHER[current]) == "normal"
+            into_low = self.mode(OTHER[current]) != "normal" and self.mode(current) == "normal"
+            if there >= 0 and (here < 0 or low or (not into_low and there > here * SWITCH_MARGIN)):
                 log({"event": "route", "kind": kind, "from": current, "to": OTHER[current],
                      "perMinute": {current: round(here * 60, 1), OTHER[current]: round(there * 60, 1)}})
                 self.paths[kind] = current = OTHER[current]
@@ -1658,6 +1659,7 @@ class Daemon:
         elif (status in {403, 429} and not content and (h.get("retry-after") or h.get("x-ratelimit-remaining") == "0")) \
                 or limited:
             # the primary limit: this bucket only; its reads move to the other one (route, tick)
+            self.gql_limited = self.gql_limited or bucket == "graphql"
             try:
                 wait = float(h["retry-after"]) if h.get("retry-after") else float(h.get("x-ratelimit-reset", 0)) - self.now
             except ValueError:
@@ -2513,6 +2515,7 @@ class Daemon:
             chunk = queue.pop(0)
             if self.mode("graphql") == "stop":
                 return chunk + [e for c in queue for e in c]
+            self.gql_limited = False
             try:
                 error = fetch(chunk)
                 spilled, self.spill = self.spill, []
@@ -2522,8 +2525,10 @@ class Daemon:
             except Exception as failure:  # noqa: BLE001  one bad batch must not stop the rest
                 self.errors.append(f"graphql: {describe(failure)}")
                 continue
-            if error and self.mode("graphql") == "stop":
-                return chunk + [e for c in queue for e in c]  # this query hit the limit: nothing was read
+            if (error or self.gql_limited) and self.mode("graphql") == "stop":
+                # this query hit the limit (a RATE_LIMITED answer can still carry data.rateLimit and null aliases):
+                # whatever it stored for them, REST reads them this tick and replaces it
+                return chunk + [e for c in queue for e in c]
             if spilled:
                 return spilled + [e for c in queue for e in c]
             if len(chunk) == 1 and chunk[0]["key"] in self.heavy or (len(chunk) == 1 and error and SLOW.search(error)):
