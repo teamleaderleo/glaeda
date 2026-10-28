@@ -1182,7 +1182,7 @@ def fill_part(cache: Path, name: str, timeout: float, curl: str, parent: int) ->
         remove_stage(parent, stage_name)
         return f"stage: {type(error).__name__}"
     info = os.fstat(stage)
-    if info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) & 0o077:
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) & 0o077:
         os.close(stage)  # swapped in by someone else between the mkdir and the open: not ours to use or remove
         return "the stage directory is not this fill's own"
     try:
