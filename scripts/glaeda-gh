@@ -2907,7 +2907,9 @@ class Daemon:
             required = set(self.rest_part(old, parts, rules, slim_rules, []))
             required |= set(self.rest_part(old, parts, protection, slim_branch, []))
             if parts[rules].get("unavailable") and parts[protection].get("unavailable"):
-                # a private repository on a plan without either: GraphQL still names them, so keep its last word
+                # A private repository on a plan without either feature: GitHub enforces no required check there,
+                # so none is the true answer. GraphQL's last word is kept all the same (it can name a rule that
+                # predates a plan change); a first read with no GraphQL answer has none, and none is enforced.
                 before = prior.get("data") or {}
                 required = {c.get("name") for c in before.get("checks") or [] if c.get("required")}
                 required |= set(before.get("requiredMissing") or [])

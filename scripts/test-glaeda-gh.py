@@ -8807,6 +8807,12 @@ class DaemonPolicyTest(Base):
                               "graphql": {"limit": 5000, "remaining": 10, "reset": NOW + 1800}}
         self.assertTrue(self.daemon.rest_room(2))
         self.assertFalse(self.daemon.rest_room(21))  # it would take REST below its floor
+        # nor is REST "capped" for routing then: every kind, the GraphQL ones too, goes to REST
+        self.daemon.budget["rest"]["remaining"] = 4000
+        self.assertFalse(self.daemon.rest_capped())
+        self.assertEqual({k: self.daemon.route(k) for k in gg.CYCLES},
+                         {"pr": "rest", "run": "rest", "comment": "rest", "head": "rest"})
+        self.daemon.budget["rest"]["remaining"] = floor + 20
         self.daemon.budget["graphql"]["remaining"] = 4000  # GraphQL can read: the share holds again
         self.assertFalse(self.daemon.rest_room(1))
         self.daemon.budget["graphql"]["remaining"] = 10
