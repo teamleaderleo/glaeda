@@ -757,15 +757,22 @@ def run(apply: bool, *, wait: bool = False, from_github: bool = False, home: Pat
             if early["ok"]:
                 early_heads = heads(MIRROR)
             previous = write_record({**record, "fetch": early, "state": "repairing"}, previous)
-        if problem:
-            record["seeded"] = {"because": problem, **seed(MIRROR, from_github)}
-        configure(MIRROR)
-        result = fetch(MIRROR, REPO_URL)
-        if not result["ok"]:
-            # The bundle set the branches to its own (older) tips: put back what the early fetch brought.
-            for branch, sha in early_heads.items():
-                if branch in BRANCHES:
-                    git(MIRROR, "update-ref", f"refs/heads/{branch}", sha, timeout=60)
+        result: dict = {"ok": False}
+        try:
+            if problem:
+                record["seeded"] = {"because": problem, **seed(MIRROR, from_github)}
+            configure(MIRROR)
+            result = fetch(MIRROR, REPO_URL)
+        finally:
+            if not result["ok"]:
+                # The bundle set the branches to its own (older) tips, and nothing fetched since: put back what the
+                # early fetch brought, whether the repair failed or the last fetch did.
+                for branch, sha in early_heads.items():
+                    if branch in BRANCHES:
+                        try:
+                            git(MIRROR, "update-ref", f"refs/heads/{branch}", sha, timeout=60)
+                        except (OSError, subprocess.SubprocessError):
+                            pass  # the next pass fetches the tips again
         record["fetch"] = result
         folded = fold_packs(MIRROR)
         if folded:

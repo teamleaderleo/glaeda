@@ -363,6 +363,23 @@ class Mirror(unittest.TestCase):
         self.assertEqual(result["seeded"]["because"], "repair pending")
         self.assertEqual(sh("git", "-C", os.fspath(self.mirror), "rev-parse", "main"), head)  # not the bundle's
 
+    def test_a_repair_that_fails_keeps_the_early_fetch_s_tips(self) -> None:
+        gm.run(True, home=self.home)
+        head = self.commit("newer than the bundle")
+        (self.mirror / gm.REPAIR_PENDING).write_text("x\n")
+        real = gm.seed
+
+        def failing(mirror, from_github, fetch_url=self.fake_download):
+            sh("git", "-C", os.fspath(mirror), "update-ref", "refs/heads/main", "main~1")  # as the bundle's tips do
+            raise RuntimeError("bundle unreadable")
+        gm.seed = failing
+        try:
+            result = gm.run(True, home=self.home)
+        finally:
+            gm.seed = real
+        self.assertEqual(result["state"], "error", result)
+        self.assertEqual(sh("git", "-C", os.fspath(self.mirror), "rev-parse", "main"), head)
+
     def test_a_record_from_before_fetched_at_carries_its_fetch_time(self) -> None:
         gm.RECORD.write_text(json.dumps({"time": "2026-10-27T20:13:00Z", "fetch": {"ok": True}}) + "\n")
         written = gm.write_record({"time": "2026-10-27T20:20:00Z", "fetch": {"ok": False}}, gm.last_record())
