@@ -6006,16 +6006,28 @@ def _bundle_refs(path: Path) -> tuple[frozenset[str], frozenset[str]] | None:
     return None
 
 
-def superseded_bundles(names: list[str], root: Path) -> set[str]:
+def superseded_bundles(listed: dict[str, str], root: Path) -> set[str]:
     """Bundles a newer bundle of the same repository and ref holds entirely: the same heads (name and commit), and
     prerequisites that are a subset of the older one's, so the newer bundle carries every commit the older one does.
-    Only .bundle files the manifest lists, grouped by the repository-and-ref digest in their name."""
+    Only .bundle files the manifest lists (name -> sha256), grouped by the whole repository-and-ref part of their name
+    (digest and readable tail). A newer bundle counts only while it is a regular file at the sha256 the manifest
+    recorded when _write_bundle had verified it, so a damaged or replaced one supersedes nothing."""
     groups: dict[str, list[str]] = {}
-    for name in names:
-        m = re.fullmatch(r"(\d{8}T\d{6})-\d+-([0-9a-f]{16})-.*\.bundle", name)
+    for name in listed:
+        m = re.fullmatch(r"(\d{8}T\d{6})-\d+-([0-9a-f]{16}-.*)\.expires-\d{4}-\d{2}-\d{2}\.bundle", name)
         if m and MIRROR_BUNDLE_RE.fullmatch(name):
             groups.setdefault(m.group(2), []).append(name)
     out: set[str] = set()
+    intact: dict[str, bool] = {}
+
+    def whole(name: str) -> bool:
+        if name not in intact:
+            f = root / name
+            try:
+                intact[name] = stat.S_ISREG(os.lstat(f).st_mode) and _sha256(f) == listed[name]
+            except OSError:
+                intact[name] = False
+        return intact[name]
     for group in groups.values():
         if len(group) < 2:
             continue
@@ -6023,7 +6035,7 @@ def superseded_bundles(names: list[str], root: Path) -> set[str]:
         ordered = sorted((n for n in group if refs[n] is not None), reverse=True)  # newest first, by stamp
         for i, older in enumerate(ordered):
             heads, prereqs = refs[older]
-            if any(refs[newer][0] == heads and refs[newer][1] <= prereqs for newer in ordered[:i]):
+            if any(refs[newer][0] == heads and refs[newer][1] <= prereqs and whole(newer) for newer in ordered[:i]):
                 out.add(older)
     return out
 
@@ -6042,10 +6054,11 @@ def prune_mirror_archive(today: str | None = None, in_use=lambda p: False) -> in
         lines = manifest.read_text().splitlines()
     except OSError:
         return 0
-    listed = []
+    listed: dict[str, str] = {}
     for line in lines:
         with contextlib.suppress(ValueError, KeyError, TypeError, AttributeError):
-            listed.append(str(json.loads(line)["name"]))
+            e = json.loads(line)
+            listed[str(e["name"])] = str(e["sha256"])
     superseded = superseded_bundles(listed, root)
     for line in lines:
         try:
@@ -9424,6 +9437,8 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
                                    capture_output=True, timeout=60)
             except SlotTaken:
                 outcome = "changed:in-use"
+                if mirror_due(fam, p, idle_now) and bundled[1] and p.is_dir() and not p.is_symlink():
+                    drop_unused_archives(bundled[1])  # put back whole: never when it was left aside under another name
             except SlotNotNeeded:
                 continue  # as the stop check before the rename
             except (OSError, subprocess.SubprocessError) as e:

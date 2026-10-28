@@ -9248,6 +9248,21 @@ class HygieneMirrorTest(unittest.TestCase):
         self.assertTrue(other[0].exists())  # another repository's bundle is never another's superseder
         self.assertNotIn(written[0].name, (archive / "manifest.jsonl").read_text())
 
+    def test_a_damaged_newer_bundle_supersedes_nothing(self) -> None:
+        repo = self.checkout(gd.FLEET_ROOT / "cache/w")
+        written: list[Path] = []
+        real_strftime = time.strftime
+        with mock.patch.object(gd.time, "strftime", side_effect=lambda f, *a: "20261027T100000" if "T" in f
+                               else real_strftime(f, *a)):
+            self.assertEqual(gd._write_bundle(repo / ".git", gd._bundle_name("k"), ["--all"], set(), written), "")
+        self.assertEqual(gd._write_bundle(repo / ".git", gd._bundle_name("k"), ["--all"], set(), written), "")
+        newer = written[1]
+        data = newer.read_bytes()
+        newer.write_bytes(data[:-64] + b"\0" * 64)  # same header, damaged pack
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(gd.prune_mirror_archive(), 0)
+        self.assertTrue(written[0].exists())
+
     def commit_more(self, repo: Path) -> None:
         (repo / "g").write_text("y")
         subprocess.run(["git", "-C", str(repo), "add", "g"], check=True, env=self.env)
