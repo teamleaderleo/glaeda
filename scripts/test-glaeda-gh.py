@@ -270,8 +270,11 @@ class FakeGitHub:
                                        "check_suite_id": rid, "conclusion": (c["checkSuite"].get("conclusion") or "").lower() or None}
                                       for rid, c in runs.items()]}
         if parts[-1] == "status":
-            return {"statuses": [{"context": c["context"], "state": c["state"].lower(), "target_url": c.get("targetUrl"),
-                                  "created_at": c.get("createdAt")} for c in contexts if c["__typename"] == "StatusContext"]}
+            listed = [c for c in contexts if c["__typename"] == "StatusContext"]
+            page = int(path.split("page=")[-1]) if "&page=" in path else 1
+            return {"total_count": len(listed), "statuses": [
+                {"context": c["context"], "state": c["state"].lower(), "target_url": c.get("targetUrl"),
+                 "created_at": c.get("createdAt")} for c in listed[100 * (page - 1):100 * page]]}
         checks = [c for c in contexts if c["__typename"] == "CheckRun"]
         page = int(path.split("page=")[-1]) if "&page=" in path else 1
         checks_page = checks[100 * (page - 1):100 * page]
@@ -1566,7 +1569,7 @@ class BalanceTest(Base):
         self.daemon.tick(NOW + gg.CYCLE)
         paths = [c[1].split("/o/r/", 1)[1] for c in self.gh.rest_calls()]
         self.assertEqual(paths, ["pulls/1", f"commits/{'a' * 40}/check-runs?filter=all&per_page=100",
-                                 f"commits/{'a' * 40}/status?per_page=100", f"actions/runs?head_sha={'a' * 40}&per_page=100",
+                                 f"commits/{'a' * 40}/status?per_page=100&page=1", f"actions/runs?head_sha={'a' * 40}&per_page=100",
                                  "actions/workflows?per_page=100", "rules/branches/main?per_page=100", "branches/main"])
         over_rest = gg.read_cache(key)["data"]
         self.assertEqual(over_rest["checkState"], "FAILURE")  # computed: a failed check outranks pending ones
@@ -1862,8 +1865,6 @@ class FallbackTest(Base):
         with self.assertRaises(gg.WatchError):
             self.daemon.request("GET", "/repos/o/r/pulls/1")
         self.assertEqual(self.gh.calls, [])
-        self.daemon.request("GET", "/rate_limit", free=True)  # free, and how the daemon learns it is over
-        self.assertEqual(len(self.gh.calls), 1)
 
     def test_the_pacers_hold_stops_every_read_and_a_secondary_403_is_reported_to_it(self) -> None:
         self.register_all()
@@ -1888,6 +1889,55 @@ class FallbackTest(Base):
         self.assertEqual(len(ran), 1)
         self.assertEqual(ran[0][2:], [os.fspath(cli.resolve()), "secondary", "--retry-after", str(gg.SECONDARY_BACKOFF),
                                       "--source", "glaeda-gh"])
+
+    def test_a_hold_stops_free_reads_and_writes_too(self) -> None:
+        """The secondary limit counts every request: /rate_limit (free only against the primary limits) and the
+        outbox wait the hold out as well."""
+        self.daemon.now = NOW
+        self.daemon.secondary_hit("rest", None)
+        with self.assertRaises(gg.WatchError):
+            self.daemon.request("GET", "/rate_limit", free=True)
+        gg.BUDGET_REFRESH = 120
+        self.daemon.budget = {}
+        self.daemon.refresh_budget()
+        self.daemon.writing = True
+        with self.assertRaises(gg.WatchError):
+            self.daemon.request("POST", "/repos/o/r/issues/1/comments", {"body": "x"}, content=True)
+        self.daemon.writing = False
+        self.daemon.post_tick()
+        self.assertEqual(self.gh.calls, [])
+
+    def test_a_refusal_late_in_a_tick_holds_from_when_it_arrived(self) -> None:
+        self.daemon.clock_real = True
+        self.daemon.now = time.time() - 70  # the tick began 70 s ago
+        self.daemon.secondary_hit("graphql", None)
+        self.assertGreaterEqual(self.daemon.secondary_until, time.time() + gg.SECONDARY_BACKOFF - 1)
+        self.assertFalse(self.daemon.secondary_admit("rest", 1))
+
+    def test_more_statuses_than_rest_reads_is_never_a_verdict(self) -> None:
+        many = [{"__typename": "StatusContext", "context": f"ci/{i}", "state": "SUCCESS", "targetUrl": "t",
+                 "createdAt": iso(NOW)} for i in range(250)]
+        many[240]["state"] = "FAILURE"  # on the third page, past what REST reads
+        self.gh.heads[("o", "r", "c" * 40)] = many
+        self.gh.prs[("o", "r", 3)] = {**pr_node(3, checks=many), "headRefOid": "c" * 40}
+        self.force_low()
+        gg.register(f"head:o/r@{'c' * 40}", consumer="autoland")
+        gg.register("pr:o/r#3")
+        self.daemon.tick(NOW)
+        head = gg.read_cache(f"head:o/r@{'c' * 40}")
+        self.assertIsNone(head["data"])
+        self.assertIn("statuses over REST", head["error"])
+        pr = gg.read_cache("pr:o/r#3")
+        self.assertEqual(pr["via"], "rest")
+        self.assertTrue(pr["data"]["checksTruncated"])
+        self.assertIsNone(gg.verdict("pr", pr["data"]))  # pending, never green
+        self.assertEqual(len([c for c in self.gh.rest_calls() if "/status?" in c[1] and c[1].endswith("page=2")]), 2)
+
+    def test_a_malformed_force_low_never_stops_the_daemon(self) -> None:
+        for value in (True, 1, None, {"graphql": 1}, "graphql"):
+            gg.write_json(gg.DAEMON_CONFIG, {"forceLow": value})
+            self.assertEqual(gg.daemon_policy()["forceLow"], (), value)
+        gg.DAEMON_CONFIG.unlink()
 
     def test_a_plan_without_rulesets_keeps_graphqls_required_checks(self) -> None:
         gg.register(self.keys["pr"])
@@ -8493,7 +8543,9 @@ class RiskReceiptPostTest(unittest.TestCase):
                 self.assertEqual((state["state"], state["riskRegrade"]["state"]), ("posted", "failed"))
                 self.assertEqual(len(t.calls), 2)
                 if isinstance(answer, tuple) and answer[0] == 429:
-                    self.assertEqual(d.backoff["rest"], NOW + 120)
+                    # held from when the refusal arrived (the real clock, a moment after the tick's NOW)
+                    self.assertGreaterEqual(d.backoff["rest"], NOW + 120)
+                    self.assertLess(d.backoff["rest"], NOW + 130)
 
     def test_risk_receipt_label_throttle_holds_other_writes_without_replaying_delivery(self) -> None:
         item = self.queue("comment", "manaflow-ai/cmux#7", "--body", self.receipt()["body"])

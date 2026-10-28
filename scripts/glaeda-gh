@@ -376,13 +376,15 @@ RICH_WINDOW_MIN = 60  # seconds: a bucket about to reset is rich, but not infini
 FULL_WINDOW = 3600  # a bucket not seen yet, or past its reset, counts as a full hour's quota
 SWITCH_MARGIN = 1.25  # a kind moves to the other bucket only when that one is this much richer
 REST_CHECK_PAGES = 5  # check-run pages (100 each) one PR read over REST takes at most
+REST_STATUS_PAGES = 2  # commit-status pages (100 each) likewise
 REST_STEPS_MAX = 10  # failed or cancelled jobs whose steps one PR read over REST looks up at most
 # The most counted REST requests one read can make before its step lookups, which are admitted one
 # at a time: a PR is its pull, REST_CHECK_PAGES of check runs, statuses, runs, workflows, rules and
 # the branch; a run is the run and its job list. The share admits a read only when this much fits.
 # A comment watch is the issue and at most two pages of its comments; a head is REST_CHECK_PAGES of check
 # runs, its statuses, its workflow runs and the workflow names.
-REST_READ_MAX = {"pr": REST_CHECK_PAGES + 6, "run": 2, "comment": 3, "head": REST_CHECK_PAGES + 3}
+REST_READ_MAX = {"pr": REST_CHECK_PAGES + REST_STATUS_PAGES + 5, "run": 2, "comment": 3,
+                 "head": REST_CHECK_PAGES + REST_STATUS_PAGES + 2}
 
 # NUM is the alias's PR-number variable: isRequired needs it
 PR_FIELDS = """number url title state isDraft merged mergedAt mergeable mergeStateStatus headRefOid
@@ -949,6 +951,11 @@ def slim_statuses(doc: dict) -> list[dict]:
             for c in doc.get("statuses") or [] if isinstance(c, dict)]
 
 
+def slim_status_page(doc: dict) -> dict:
+    """One page of a commit's combined status, with the total it says there is."""
+    return {"total": doc.get("total_count"), "statuses": slim_statuses(doc)}
+
+
 def slim_head_runs(doc: dict) -> list[dict]:
     return [{k: r.get(k) for k in ("id", "name", "workflow_id", "check_suite_id", "conclusion")}
             for r in doc.get("workflow_runs") or [] if isinstance(r, dict)]
@@ -1314,8 +1321,8 @@ def daemon_policy() -> dict:
     return {"cycle": cycle, "commentCycle": comment,
             "cycles": {"pr": cycle, "run": cycle, "comment": comment, "head": cycle},
             "floors": floors, "restShare": float(_bounded(doc.get("restShare"), REST_SHARE, 0.0, 1.0)),
-            "forceLow": tuple(b for b in ("rest", "graphql") if b in (doc.get("forceLow") or ())
-                              and isinstance(doc.get("forceLow"), list))}
+            "forceLow": tuple(b for b in ("rest", "graphql")
+                              if isinstance(doc.get("forceLow"), list) and b in doc["forceLow"])}
 
 
 def consumer_policy() -> dict:
@@ -1541,7 +1548,7 @@ class Daemon:
         the quota came back. A refusal (a dead token, a secondary limit) backs off instead of
         being retried and re-reported every tick.
         """
-        if BUDGET_REFRESH <= 0 or self.now < self.budget_retry:
+        if BUDGET_REFRESH <= 0 or self.now < self.budget_retry or self.clock() < self.secondary_until:
             return
         seen = [(self.budget.get(b) or {}).get("seenAt") for b in ("rest", "graphql")]
         ages = [self.now - t for t in seen if isinstance(t, (int, float))]
@@ -1584,9 +1591,9 @@ class Daemon:
         if time.monotonic() >= self.tick_deadline:
             raise OutOfTime
         bucket = "graphql" if path == "/graphql" else "rest"
-        if not free and not content and not self.writing and not self.secondary_admit(bucket, 1):
-            # never sent: a read during a secondary hold would only extend it
-            raise WatchError(f"held: GitHub's secondary rate limit, {max(0, int(self.secondary_until - self.now))}s left")
+        if not self.secondary_admit(bucket, 1):
+            # never sent: any request during a secondary hold (a write, a free /rate_limit) would only extend it
+            raise WatchError(f"held: GitHub's secondary rate limit, {max(0, int(self.secondary_until - self.clock()))}s left")
         if self.upstream() is not None:
             raise WatchError("this host reads GitHub through its upstream (upstream.json) and has no login")
         if self.token is None:
@@ -1652,7 +1659,7 @@ class Daemon:
         """Whether n more read requests may go to GitHub now: not while this daemon's own secondary hold
         lasts, nor while the host's pacer (PACE_FILE) holds every caller on the account."""
         self.adopt_pace_hold()
-        return self.now >= self.secondary_until
+        return self.clock() >= self.secondary_until
 
     def adopt_pace_hold(self) -> None:
         """Take on the pacer's hold (another caller met the secondary limit), so both buckets stop for it."""
@@ -1686,17 +1693,21 @@ class Daemon:
         except ValueError:
             told = 0.0
         hold = max(told, min(SECONDARY_BACKOFF_MAX, SECONDARY_BACKOFF * 2 ** (self.secondary_strikes - 1)))
-        self.secondary_until = max(self.secondary_until, self.now + hold)
+        # from when the refusal arrived: a tick can run TICK_BUDGET past self.now, its start
+        self.secondary_until = max(self.secondary_until, self.clock() + hold)
         for b in self.backoff:
             self.backoff[b] = max(self.backoff[b], self.secondary_until)
         log({"event": "secondary", "bucket": bucket, "hold": round(hold), "strikes": self.secondary_strikes})
-        self.report_secondary(self.secondary_until - self.now)
+        self.report_secondary(self.secondary_until - self.clock())
 
     # -- the outbox: content writes (comments, PRs, reviews) queued by `glaeda-gh post`
 
     def post_tick(self) -> None:
         """Send at most one queued write per tick, POST_SPACING after the last one and never while GitHub's
         secondary limit holds the outbox. Oldest first; a write waiting out its own retry is skipped."""
+        self.adopt_pace_hold()
+        if self.clock() < self.secondary_until:
+            return  # a read met the secondary limit: writes wait it out too, as one account's
         if self.now < max(self.post_hold, self.post_at + POST_SPACING):
             return
         for path in sorted(outbox_dir().glob("*.json")) if outbox_dir().is_dir() else []:
@@ -2894,7 +2905,17 @@ class Daemon:
         for page in range(2, min(REST_CHECK_PAGES, -(-(checks.get("total_count") or 0) // 100)) + 1):
             listed += self.rest_part(old, parts, f"{path}&page={page}", slim_check_runs).get("check_runs") or []
         checks = {"total_count": checks.get("total_count"), "check_runs": listed}
-        statuses = self.rest_part(old, parts, f"{root}/commits/{sha}/status?per_page=100", slim_statuses)
+        statuses: list[dict] = []
+        total = 0
+        for page in range(1, REST_STATUS_PAGES + 1):
+            got = self.rest_part(old, parts, f"{root}/commits/{sha}/status?per_page=100&page={page}", slim_status_page)
+            statuses += got.get("statuses") or []
+            total = int(got.get("total") or 0)
+            if len(statuses) >= total or not got.get("statuses"):
+                break
+        if total > len(statuses):
+            # a partial list would read as a smaller, greener head
+            checks = {**checks, "total_count": max(int(checks.get("total_count") or 0), len(checks["check_runs"]) + 1)}
         runs = self.rest_part(old, parts, f"{root}/actions/runs?head_sha={sha}&per_page=100", slim_head_runs)
         workflows = self.rest_part(old, parts, f"{root}/actions/workflows?per_page=100", slim_workflows)
         return checks, statuses, runs, workflows
@@ -2915,7 +2936,7 @@ class Daemon:
                               missing=missing)
         if (checks.get("total_count") or 0) > len(checks["check_runs"]):
             self.refund(e["key"])  # a partial list would read as a smaller, greener head
-            return self.store(e["key"], e["cache"], error=f"more than {REST_CHECK_PAGES * 100} checks over REST")
+            return self.store(e["key"], e["cache"], error=f"more than {REST_CHECK_PAGES * 100} checks or {REST_STATUS_PAGES * 100} statuses over REST")
         found: dict = {}
         statuses_by: dict = {}
         ids: dict = {}
