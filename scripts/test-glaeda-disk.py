@@ -7666,6 +7666,12 @@ class LinuxLayoutTest(unittest.TestCase):
             rec, _ = self.apply_mirror(unit)
         self.assertEqual(rec["outcome"], "changed:in-use")
         self.assertIn("its uncommitted work changed while it was archived", rec["reasons"])
+        # a mode change alone, same bytes, is a change too
+        found = {os.path.realpath(clone)}
+        before = gd.work_tree_fingerprint(clone, found)
+        os.chmod(clone / "notes.txt", 0o755)
+        self.assertNotEqual(gd.work_tree_fingerprint(clone, found), before)
+        self.assertIn("its uncommitted work changed while it was archived", rec["reasons"])
         self.assertEqual((clone / "tracked.txt").read_text(), "v3, edited while it was archived\n")
 
     def test_an_archive_that_changes_before_the_delete_keeps_the_mirror(self) -> None:
@@ -7714,6 +7720,11 @@ class LinuxLayoutTest(unittest.TestCase):
         archive = self.home / "archive/glaeda-disk"
         files = sorted(p for p in archive.iterdir() if p.name != "manifest.jsonl")
         self.assertEqual(gd.prune_mirror_archive("9999-12-31", in_use=lambda p: True), 0)
+        self.assertEqual(gd.prune_mirror_archive("9999-12-31", in_use=lambda p: p.name.endswith(".expiring")), 0)
+        self.assertEqual(sorted(p for p in archive.iterdir() if p.name != "manifest.jsonl"), files)
+        self.assertEqual(stat.S_IMODE(archive.stat().st_mode), 0o700)
+        for f in archive.iterdir():
+            self.assertEqual(stat.S_IMODE(f.stat().st_mode), 0o600, f.name)
         files[0].write_bytes(b"changed since")
         self.assertEqual(gd.prune_mirror_archive("9999-12-31"), len(files) - 1)
         self.assertEqual(sorted(p for p in archive.iterdir() if p.name != "manifest.jsonl"), [files[0]])
@@ -8902,6 +8913,7 @@ class HygieneMirrorTest(unittest.TestCase):
         (manual / "uncommitted.patch").write_text("diff")
         (manual / "head.bundle").write_bytes(b"bundle")
         (archive / "loose.tar.gz").write_bytes(b"x")
+        (archive / "busy.patch").write_bytes(b"x")
         fresh = archive / "fresh"
         (fresh / "deep").mkdir(parents=True)
         (fresh / "deep/new.txt").write_text("touched two days from now")
@@ -8919,14 +8931,16 @@ class HygieneMirrorTest(unittest.TestCase):
         everything = sorted(p.name for p in archive.iterdir())
         self.assertEqual(gd.prune_foreign_archives(now=time.time() + 29 * 86400), [])
         self.assertEqual(sorted(p.name for p in archive.iterdir()), everything)
+        def in_use(p: Path) -> bool:  # busy.patch comes into use only after it is renamed aside
+            return p == held or p.name.startswith(gd.DELETING_PREFIX + "busy.patch")
         os.chmod(locked / "inner", 0)  # unreadable: kept, whatever its age
         try:
-            gone = gd.prune_foreign_archives(now=time.time() + 31 * 86400, in_use=lambda p: p == held)
+            gone = gd.prune_foreign_archives(now=time.time() + 31 * 86400, in_use=in_use)
         finally:
             os.chmod(locked / "inner", 0o755)
         self.assertEqual(sorted(Path(p).name for p in gone), ["cnx-wg-aziz-20261027", "loose.tar.gz"])
         self.assertEqual(sorted(p.name for p in archive.iterdir()),
-                         ["fresh", "glaeda-disk", "held", "link", "locked"])
+                         ["busy.patch", "fresh", "glaeda-disk", "held", "link", "locked"])
         self.assertTrue((archive / "glaeda-disk/kept.bundle").exists() and outside.is_dir())
 
     def test_an_archive_that_comes_into_use_or_changes_while_it_expires_goes_back(self) -> None:
@@ -8945,10 +8959,12 @@ class HygieneMirrorTest(unittest.TestCase):
         import socket
         sock = socket.socket(socket.AF_UNIX)
         self.addCleanup(sock.close)
-        short = Path(tempfile.mkdtemp(dir="/tmp"))
-        self.addCleanup(shutil.rmtree, short, True)
-        sock.bind(os.fspath(short / "s"))
-        os.rename(short / "s", old / "s")
+        cwd = os.getcwd()
+        os.chdir(old)  # a relative name: the temp path may be past the AF_UNIX length limit
+        try:
+            sock.bind("s")
+        finally:
+            os.chdir(cwd)
         self.assertEqual(gd.prune_foreign_archives(now=time.time() + 31 * 86400), [])  # a socket below it
         (old / "s").unlink()
         self.assertEqual(len(gd.prune_foreign_archives(now=time.time() + 31 * 86400)), 1)

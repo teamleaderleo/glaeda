@@ -5735,7 +5735,7 @@ def prune_mirror_archive(today: str | None = None, in_use=lambda p: False) -> in
                 kept.append(line)
                 continue
             try:
-                if stat.S_ISREG(os.lstat(aside).st_mode) and _sha256(aside) == sha:
+                if stat.S_ISREG(os.lstat(aside).st_mode) and not in_use(aside) and _sha256(aside) == sha:
                     aside.unlink()
                     gone += 1
                     continue
@@ -5747,6 +5747,7 @@ def prune_mirror_archive(today: str | None = None, in_use=lambda p: False) -> in
     with contextlib.suppress(OSError):
         tmp = manifest.with_name(f".manifest.{os.getpid()}.tmp")
         tmp.write_text("".join(ln + "\n" for ln in kept))
+        os.chmod(tmp, 0o600)
         os.replace(tmp, manifest)
     return gone
 
@@ -5777,7 +5778,14 @@ def prune_foreign_archives(now: float | None = None, in_use=lambda p: False) -> 
         if newest is None or newest >= cutoff or mount_below(p) or in_use(p):
             continue
         try:
-            remove(p, after_rename=lambda q=p: _foreign_archive_recheck(q, root_id, cutoff, in_use))
+            check = (lambda q=p: _foreign_archive_recheck(q, root_id, cutoff, in_use))
+            if p.is_dir():
+                remove(p, after_rename=check)
+            else:  # remove() unlinks a file in place; this one is renamed aside and checked again first
+                doomed = p.with_name(f"{DELETING_PREFIX}{p.name}-{os.getpid()}")
+                rename_noreplace(p, doomed)
+                check()
+                doomed.unlink()
             gone.append(os.fspath(p))
         except (OSError, SlotTaken) as err:
             print(f"glaeda-disk: kept expired archive {p}: {err}", file=sys.stderr)
@@ -5849,9 +5857,10 @@ def archive_root_why(item: Path | None = None) -> str:
     return ""
 
 
-def archives_intact(archives: dict[str, str]) -> str:
-    """Right before the delete: every archive written for the item is still a regular file with its sha256."""
-    if (why := archive_root_why()):
+def archives_intact(archives: dict[str, str], item: Path) -> str:
+    """Right before the delete: every archive written for the item is still a regular file with its sha256, and
+    the archive is still where it should be, outside the item."""
+    if (why := archive_root_why(item)):
         return why
     for f, sha in archives.items():
         try:
@@ -5866,12 +5875,25 @@ def _archive_expires() -> str:
     return time.strftime("%Y-%m-%d", time.localtime(time.time() + MIRROR_ARCHIVE_DAYS * 86400))
 
 
+def _private_archive_dir() -> Path:
+    """~/archive/glaeda-disk, made if missing, owner-only (it holds private source); raises OSError."""
+    root = mirror_archive()
+    root.parent.mkdir(mode=0o700, exist_ok=True)
+    root.mkdir(mode=0o700, exist_ok=True)
+    if (why := archive_root_why()):
+        raise OSError(errno.EPERM, why)
+    os.chmod(root, 0o700)
+    return root
+
+
 def _keep_archive(tmp: Path, dest: Path, expires: str, written: list[Path], **about: str) -> None:
-    """Link a checked temp file to its archive name (never over an existing file) and list it in the manifest,
-    so prune_mirror_archive takes it once it expires. Raises OSError."""
+    """Link a checked temp file to its archive name (never over an existing file), owner-only, and list it in
+    the manifest, so prune_mirror_archive takes it once it expires. Raises OSError."""
+    os.chmod(tmp, 0o600)
     os.link(tmp, dest)  # FileExistsError rather than replacing another archive
     written.append(dest)
-    with (dest.parent / "manifest.jsonl").open("a") as m:
+    fd = os.open(dest.parent / "manifest.jsonl", os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "a") as m:
         m.write(json.dumps({"name": dest.name, "sha256": _sha256(dest), "expires": expires, **about}) + "\n")
 
 
@@ -5930,13 +5952,13 @@ def work_tree_changes(root: Path, trees: set[str]) -> tuple[str, bytes, list[tup
         try:
             st = os.lstat(f)
             if stat.S_ISLNK(st.st_mode):
-                digest = hashlib.sha256(os.fsencode(os.readlink(f))).hexdigest()
+                digest = "l:" + hashlib.sha256(os.fsencode(os.readlink(f))).hexdigest()
             elif stat.S_ISREG(st.st_mode):
-                digest = _sha256(f)
-            elif stat.S_ISSOCK(st.st_mode):
-                continue  # a socket holds no data (and a live one keeps the tree: holds_socket)
+                digest = f"f{stat.S_IMODE(st.st_mode) & 0o777:o}:" + _sha256(f)
+            elif stat.S_ISSOCK(st.st_mode) or stat.S_ISFIFO(st.st_mode):
+                continue  # holds no data (git does not even list a FIFO); a live socket keeps the tree: holds_socket
             else:
-                return f"an untracked FIFO or device no archive holds ({rel})", b"", []
+                return f"an untracked device file no archive holds ({rel})", b"", []
         except OSError:
             return f"unreadable untracked file {rel}", b"", []
         files.append((rel, f, digest))
@@ -5969,7 +5991,7 @@ def archive_work_tree(root: Path, inside: Path, trees: set[str], written: list[P
     about = {"tree": os.fspath(root), "head": head}
     tmps: list[Path] = []
     try:
-        mirror_archive().mkdir(parents=True, exist_ok=True)
+        _private_archive_dir()
         if patch:
             dest = mirror_archive() / f"{name}.expires-{expires}.patch"
             tmp = dest.with_name(f".{dest.name}.{os.getpid()}.tmp")
@@ -5993,10 +6015,12 @@ def archive_work_tree(root: Path, inside: Path, trees: set[str], written: list[P
             with tarfile.open(tmp, "r:gz") as t:
                 for m in t:
                     if m.issym():
-                        got[m.name] = hashlib.sha256(os.fsencode(m.linkname)).hexdigest()
+                        got[m.name] = "l:" + hashlib.sha256(os.fsencode(m.linkname)).hexdigest()
                     elif m.isfile() and (fo := t.extractfile(m)) is not None:
-                        got[m.name] = hashlib.file_digest(fo, "sha256").hexdigest() if hasattr(
-                            hashlib, "file_digest") else hashlib.sha256(fo.read()).hexdigest()
+                        got[m.name] = f"f{m.mode & 0o777:o}:" + (hashlib.file_digest(fo, "sha256").hexdigest() if hasattr(
+                            hashlib, "file_digest") else hashlib.sha256(fo.read()).hexdigest())
+                    else:
+                        got[m.name] = "?"
             if got != want:
                 return f"the untracked files of {root} do not read back from their tar", fingerprint
             _keep_archive(tmp, dest, expires, written, **about)
@@ -6018,7 +6042,7 @@ def _write_bundle(gitdir: Path, name: str, revs: list[str], heads: set[str], wri
     dest = mirror_archive() / f"{name}.expires-{expires}.bundle"
     tmp = dest.with_name(f".{dest.name}.{os.getpid()}.tmp")
     try:
-        dest.parent.mkdir(parents=True, exist_ok=True)
+        _private_archive_dir()
         if _git_dir_run(gitdir, "bundle", "create", str(tmp), "--stdin", stdin="\n".join(revs) + "\n",
                         timeout=600) is None or _git_dir_run(gitdir, "bundle", "verify", str(tmp), timeout=600) is None:
             return f"git bundle create or verify failed for {gitdir}"
@@ -6225,7 +6249,7 @@ def mirror_rename_recheck(path: Path, recheck: tuple):
         except NoEvidence:
             busy = True
         now = None if why or busy or not work_unchanged(doomed, now_trees, recheck[5]) \
-            or archives_intact(recheck[6]) else mirror_tips(doomed, gitdirs)
+            or archives_intact(recheck[6], doomed) else mirror_tips(doomed, gitdirs)
         if now is not None and before is not None and set(now) == set(before) \
                 and all(set(t) <= set(before[k][0]) and refs == before[k][1] for k, (t, refs) in now.items()):
             try:
@@ -6457,7 +6481,7 @@ def mirror_moved(fam: Family, path: Path, recheck: tuple) -> str:
         return "in use while its git work was bundled"
     if (why := mount_below(path)):  # read again last: a mount may have appeared while the work was bundled
         return why
-    return archives_intact(archives)
+    return archives_intact(archives, path)
 
 
 def submodule_loss(worktree: Path, gitdir: Path, seen: set[str] | None = None,
