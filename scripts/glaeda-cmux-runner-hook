@@ -2770,7 +2770,7 @@ def evict_own_checkout(workspace: str | None, explicit: str | None, timeout: flo
 # A borrower records which mirror it borrowed (its objects directory's inode and birth time). At job-started, a
 # borrower whose mirror is gone or was rebuilt (a reseed is a new directory and may lack a force-pushed commit) loses
 # its own git store, before any step reads it, so checkout fetches it again. The device number is recorded but never
-# compared: a reboot renumbers volumes, and cmux7s's reboot (2026-10-28 15:41Z) made every borrower on the mini read
+# compared: a reboot renumbers volumes, and one mini's reboot (2026-10-28 15:41Z) made every borrower on the mini read
 # as rebuilt. Its submodules' stores (.git/modules) stay: they never borrow the mirror, and dropping them under the
 # submodule checkouts' gitfiles left `fatal: not a git repository: ghostty/../.git/modules/ghostty` for the warm
 # nightly-next builder (run 40718624408) and every reused workspace on the mini.

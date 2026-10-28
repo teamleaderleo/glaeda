@@ -821,7 +821,7 @@ CMUX_NEXT_DRAIN_HOOK_SHA256 = frozenset({
     "95b700d406639698456d2d536eea9d698b329191a732b24608a673c1e9353d98",
     "ea3e56492347b8a0b68427496eb010eec75b6dc9e3733989c47d0f6f78e18fc9",
     "116bd4fa210f949c76cf3a90d73999f5f22e06cb38ff2c7320dee32af449c285",
-    "59a787d87132fe248e863c5075ce45f37bd12d76164bb08e725ae01fbe383158",
+    "6d48fdb64151a03325b81c58202571a821d6e1ebee97257afe12329a4a3e8c52",
 })
 CMUX_NEXT_CI_PRESERVED_NAMES = frozenset({
     "SourcePackages", "ModuleCache.noindex", "SDKStatCaches.noindex",
@@ -2934,7 +2934,7 @@ def evict_idle_runner_checkouts(receipt: Path, floor_gib: float, home: Path | No
 # for the steps that run before checkout, and checkout, finding an empty repository there, fetches at the job's depth.
 # Its submodules' stores (.git/modules) stay too (remove_checkout_store): git metadata a live runner workspace's
 # submodule checkouts point at is never stale cache. Dropping them under the submodule gitfiles broke the warm
-# nightly-next builder with `fatal: not a git repository: ghostty/../.git/modules/ghostty` (cmux7s, 2026-10-28).
+# nightly-next builder with `fatal: not a git repository: ghostty/../.git/modules/ghostty` (2026-10-28).
 RUNNER_CHECKOUT_AT_START_FAMILY = "runner-bloated-checkout-at-start"
 # The job must be starting: its Runner.Worker began at most this long ago, and nothing in the checkout's git
 # bookkeeping is newer than that start (a checkout step rewrites the index, HEAD and FETCH_HEAD). A later step of

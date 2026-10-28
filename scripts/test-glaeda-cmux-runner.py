@@ -5047,7 +5047,7 @@ class MirrorBorrowTest(unittest.TestCase):
         self.assertTrue((self.ws / "local.txt").exists())  # only .git goes; checkout clones into the workspace
 
     def test_a_reboot_that_renumbers_the_volume_keeps_the_borrower(self) -> None:
-        """cmux7s, 2026-10-28 15:41Z: a reboot changed the mirror volume's device number, and every borrower on the
+        """2026-10-28 15:41Z: a reboot changed the mirror volume's device number, and every borrower on the
         mini lost its .git at its next job-started (a 463 s refetch and dangling submodule gitfiles)."""
         self.borrow()
         record = self.ws / ".git" / hook.BORROW_RECORD

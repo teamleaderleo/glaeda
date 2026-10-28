@@ -4865,7 +4865,7 @@ class GlaedaDiskTest(unittest.TestCase):
     def test_a_hygiene_pass_keeps_runner_submodule_stores_and_still_prunes_build_output(self) -> None:
         """Git metadata in a runner workspace is never stale cache: .git/modules (the stores its submodule checkouts'
         gitfiles name) survives a pressure pass however old, while DerivedData and other build output still go.
-        cmux7s, 2026-10-28: a workspace without .git/modules failed the warm nightly-next checkout with `fatal: not a
+        2026-10-28: a workspace without .git/modules failed the warm nightly-next checkout with `fatal: not a
         git repository: ghostty/../.git/modules/ghostty`."""
         home, fams = self._runner_checkouts()
         idle = home / "actions-runner-glaeda/_work/cmux/cmux"
