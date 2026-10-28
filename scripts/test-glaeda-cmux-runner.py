@@ -1890,6 +1890,20 @@ class HookTest(unittest.TestCase):
         self.assertFalse(ok, why)
         self.assertIn(f"{hook.FRESH_RESERVE_UNITS} are kept for an idle reserving runner", why)
 
+    def test_a_nightly_job_is_admitted_ahead_of_a_waiting_fleet_build(self) -> None:
+        """Nightly jobs come first on the fleet: a waiting fleet build refuses every other job, never a nightly one."""
+        self.fleet()
+        for tier, admitted in ((hook.TIER_NIGHTLY, True), (hook.TIER_DEV, False), ("", False)):
+            with self.subTest(tier=tier), mock.patch.object(hook, "bounded_waiters", return_value=[77]), \
+                    mock.patch.object(hook, "fair_turn", return_value=None), \
+                    mock.patch.object(hook, "hold", return_value=(True, "held")):
+                ok, why = hook.take_capacity(os.fspath(self.dir / "fleet" / "host.lock"), self.dir / "capacity", 14,
+                                             "signer-dmg-image", os.getpid(), self.dir / "state",
+                                             workflow="nightly.yml", tier=tier)
+                self.assertEqual(ok, admitted, why)
+                if not admitted:
+                    self.assertEqual(why, f"{hook.WAITER_REFUSAL} (pid 77)")
+
     def test_a_waiter_marker_with_a_since_past_float_range_is_skipped(self) -> None:
         """A marker is written by a job on this mini, so it is untrusted: a since too large for a float raised
         OverflowError out of admission_waiters (and every gate and admission that reads it)."""

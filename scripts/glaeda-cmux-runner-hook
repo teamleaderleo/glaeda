@@ -3905,7 +3905,13 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
             waiting = bounded_waiters(state_dir, lock_waiters(host_lock, holder_pids(state_dir) | yielding_family(host_lock)),
                                       log=lambda note: print(f"{PREFIX}: {note}", flush=True))
             # lsof sees only this user's processes, which is how the fleet worker runs today.
-            if waiting:  # flock has no writer preference: stop admitting so the build worker gets in
+            if waiting and tier == TIER_NIGHTLY:
+                # Nightly jobs come first on the fleet (Leo, 2026-10-27): a nightly job runs ahead of a waiting
+                # fleet build, which gets the host when it ends. 2026-10-28 run 40623850717's signer-dmg-image was
+                # refused this way on cmux12s, and nightly-next's DMG fell back to a queued Blacksmith Mac.
+                print(f"{PREFIX}: a nightly job: admitted ahead of the fleet build waiting for the host "
+                      f"(pid {waiting[0]})", flush=True)
+            elif waiting:  # flock has no writer preference: stop admitting so the build worker gets in
                 # This must not be a retryable capacity refusal: a draining fleet
                 # worker waits for our parent Runner.Worker to exit before claiming.
                 return False, f"{WAITER_REFUSAL} (pid {waiting[0]})"
