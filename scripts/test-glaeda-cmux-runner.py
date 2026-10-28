@@ -1090,7 +1090,15 @@ class HookTest(unittest.TestCase):
         outside.mkdir()
         (pr / "_work" / "hq").mkdir()
         (pr / "_work" / "hq" / "hq").symlink_to(outside)
-        (pr / "_work" / f"{hook.IDLE_EVICT_TRASH}1-0").mkdir()
+        (pr / "_work" / f"{hook.IDLE_EVICT_TRASH}1-0" / "sub").mkdir(parents=True)
+        (pr / "_work" / f"{hook.IDLE_EVICT_TRASH}1-0" / "sub" / "file").write_text("x")
+        (pr / "_work" / "_temp").mkdir()
+        (pr / "_work" / "_temp" / "being-set-up").write_text("x")
+        # a runner whose _work is a symlink: neither its work nor anything named like trash outside is touched
+        linked = self.dir / "actions-runner-glaeda-4"
+        linked.mkdir()
+        (outside / f"{hook.IDLE_EVICT_TRASH}9-0").mkdir()
+        (linked / "_work").symlink_to(outside)
         with mock.patch.object(hook, "free_gib", return_value=1.0):
             note = hook.evict_idle_runners(self.dir, os.fspath(self.dir), 30, time.monotonic() + 60,
                                            busy=lambda _runner: False)
@@ -1101,6 +1109,36 @@ class HookTest(unittest.TestCase):
         self.assertFalse((pr / "_work" / "cmux" / ".glaeda-state" / "release-derived-data").exists())
         self.assertTrue(outside.exists(), "never through a symlink")
         self.assertFalse((pr / "_work" / f"{hook.IDLE_EVICT_TRASH}1-0").exists(), "a dead hook's trash goes")
+        self.assertTrue((pr / "_work" / "_temp" / "being-set-up").exists(), "the runner writes _temp before a hook")
+        self.assertTrue((outside / f"{hook.IDLE_EVICT_TRASH}9-0").exists(), "never through a symlinked _work")
+        # the deadline bounds the deletion too: past it nothing more goes
+        (pr / "_work" / "cmux" / "cmux").mkdir()
+        with mock.patch.object(hook, "free_gib", return_value=1.0):
+            hook.evict_idle_runners(self.dir, os.fspath(self.dir), 30, time.monotonic() - 1, busy=lambda _r: False)
+        self.assertTrue((pr / "_work" / "cmux" / "cmux").exists())
+
+    def test_a_job_the_runner_takes_during_an_eviction_waits_for_it_and_gets_its_workspace_back(self) -> None:
+        """The busy check and the rename are one step under the runner's EVICT_RUNNER_LOCK: a job the runner acquires
+        meanwhile waits in job-started for that lock (wait_runner_work) before any of its steps runs, and finds its
+        workspace made again; a runner whose lock is taken is skipped, and a busy one keeps its work."""
+        runner = self.dir / "actions-runner-glaeda-5"
+        workspace = runner / "_work" / "cmux" / "cmux"
+        workspace.mkdir(parents=True)
+        (workspace / "big").write_text("x")
+        self.assertIsNone(hook.take_runner_work(runner, busy=lambda _r: True), "a busy runner keeps its work")
+        self.assertTrue((workspace / "big").exists())
+        fd = hook.lock_file(runner / hook.EVICT_RUNNER_LOCK, fcntl.LOCK_EX)
+        self.assertIsNone(hook.take_runner_work(runner, busy=lambda _r: False), "another eviction holds it")
+        self.assertEqual(hook.wait_runner_work(workspace, wait_s=0.3),
+                         "a nightly job's eviction still holds this runner's work; going on")
+        os.close(fd)
+        trash = hook.take_runner_work(runner, busy=lambda _r: False)
+        self.assertEqual(len(trash or []), 1)
+        self.assertFalse(workspace.exists())
+        self.assertEqual(hook.wait_runner_work(workspace),
+                         "a nightly job's eviction took this runner's idle checkout; the job clones it again")
+        self.assertTrue(workspace.is_dir() and not any(workspace.iterdir()))
+        self.assertIsNone(hook.wait_runner_work(self.dir / "elsewhere"), "not a runner workspace: nothing to do")
 
     def hold_evict_lock(self, seconds: float) -> subprocess.Popen:
         """A glaeda-disk --apply as job-completed's detached pass leaves it: holding evict.lock under this HOME."""

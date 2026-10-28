@@ -2154,7 +2154,7 @@ def nightly_disk_wait(capacity_dir: Path, on: bool):
     write_want(marker, since, [NIGHTLY_DISK_WANT, "units"], TIER_NIGHTLY)
 
     def refresh() -> None:
-        while not done.wait(ADMIT_POLL_S):
+        while not done.wait(ADMIT_POLL_S) and not done.is_set():
             write_want(marker, since, [NIGHTLY_DISK_WANT, "units"], TIER_NIGHTLY)
     thread = threading.Thread(target=refresh, daemon=True)
     thread.start()
@@ -2167,13 +2167,16 @@ def nightly_disk_wait(capacity_dir: Path, on: bool):
             marker.unlink()
 
 
+EVICT_RUNNER_LOCK = ".glaeda-evict.lock"  # <runner>/: held while another runner's job takes this runner's work away
+
+
 def idle_work_dirs(runner: Path) -> list[Path]:
-    """What an idle runner's jobs left in its _work that the next job makes again: each actions/checkout
-    _work/<repo>/<repo>, the DerivedData a workflow keeps in _work/<repo>/.glaeda-state, and _work/_temp's entries.
-    Never _tool, _actions or anything reached through a symlink."""
+    """What an idle runner's jobs left in its _work that its next job makes again: each actions/checkout
+    _work/<repo>/<repo> and the DerivedData a workflow keeps in _work/<repo>/.glaeda-state. Never _tool, _actions or
+    _temp (the runner writes those while it sets a job up, before any hook runs), and never through a symlink."""
     work = runner / "_work"
     found: list[Path] = []
-    if work.is_symlink() or not work.is_dir():
+    if runner.is_symlink() or work.is_symlink() or not work.is_dir():
         return found
     with contextlib.suppress(OSError):
         for repo in sorted(work.iterdir()):
@@ -2186,50 +2189,119 @@ def idle_work_dirs(runner: Path) -> list[Path]:
             if state.is_dir() and not state.is_symlink():
                 found.extend(d for d in sorted(state.iterdir())
                              if "derived-data" in d.name and d.is_dir() and not d.is_symlink())
-        temp = work / "_temp"
-        if temp.is_dir() and not temp.is_symlink():
-            found.extend(sorted(temp.iterdir()))
     return found
+
+
+def remove_bounded(top: Path, deadline: float) -> bool:
+    """Delete the tree at top, deepest first, never following a symlink (one is unlinked as a name), stopping at the
+    deadline (monotonic). True when it is gone; what is left is a later call's (the stale trash sweep)."""
+    try:
+        if top.is_symlink() or not top.is_dir():
+            top.unlink(missing_ok=True)
+            return True
+        for root, dirs, files in os.walk(top, topdown=False, followlinks=False):
+            if time.monotonic() >= deadline:
+                return False
+            for name in files:
+                with contextlib.suppress(OSError):
+                    os.unlink(os.path.join(root, name))
+            for name in dirs:
+                path = os.path.join(root, name)
+                with contextlib.suppress(OSError):
+                    os.unlink(path) if os.path.islink(path) else os.rmdir(path)
+        top.rmdir()
+        return True
+    except OSError:
+        return False
+
+
+def take_runner_work(runner: Path, busy: Callable[[Path], bool]) -> list[Path] | None:
+    """Move an idle runner's idle_work_dirs aside (to <runner>/_work/IDLE_EVICT_TRASH*), under EVICT_RUNNER_LOCK, and
+    return the trash; None when the runner has a job or the lock is taken. The lock closes the race with a job the
+    runner acquires meanwhile: that job's job-started waits for it (wait_runner_work) before any of its steps runs,
+    and then makes its workspace again; a job acquired before the lock is seen by busy (a Worker, or a request its
+    listener took)."""
+    try:
+        fd = lock_file(runner / EVICT_RUNNER_LOCK, fcntl.LOCK_EX)
+    except OSError:
+        return None
+    if fd is None:
+        return None
+    try:
+        if busy(runner):
+            return None
+        trash: list[Path] = []
+        for n, victim in enumerate(idle_work_dirs(runner)):
+            target = runner / "_work" / f"{IDLE_EVICT_TRASH}{os.getpid()}-{time.monotonic_ns()}-{n}"
+            with contextlib.suppress(OSError):
+                victim.rename(target)
+                trash.append(target)
+        return trash
+    finally:
+        os.close(fd)
+
+
+def wait_runner_work(workspace: Path | None, wait_s: float = EVICT_TIMEOUT_S) -> str | None:
+    """job-started on a pool runner: wait (at most wait_s) while a nightly job's eviction holds this runner's
+    EVICT_RUNNER_LOCK (take_runner_work), then make the job's workspace again if that eviction took it. workspace is
+    the directory the runner started the hook in, <runner>/_work/<repo>/<repo>. A note, or None; never raises."""
+    if workspace is None or workspace.parent.parent.name != "_work":
+        return None
+    runner = workspace.parent.parent.parent
+    lock = runner / EVICT_RUNNER_LOCK
+    if not os.path.lexists(lock):
+        return None
+    deadline, waited = time.monotonic() + wait_s, False
+    try:
+        while True:
+            fd = lock_file(lock, fcntl.LOCK_EX)
+            if fd is not None:
+                os.close(fd)
+                break
+            if time.monotonic() >= deadline:
+                return "a nightly job's eviction still holds this runner's work; going on"
+            waited = True
+            time.sleep(0.2)
+        if not workspace.exists():
+            workspace.mkdir(parents=True, exist_ok=True)
+            return "a nightly job's eviction took this runner's idle checkout; the job clones it again"
+    except OSError as error:
+        return f"cannot look at this runner's eviction lock ({type(error).__name__})"
+    return "waited for a nightly job's eviction of this runner's work" if waited else None
 
 
 def evict_idle_runners(home: Path, path: str, target_gib: float, deadline: float,
                        busy: Callable[[Path], bool] | None = None) -> str:
-    """For a nightly job short of disk (NIGHTLY_DISK_RESERVE): remove idle_work_dirs of every runner under home that
-    is not a dedicated builder and has no job (runner_busy_now, which counts anything it cannot read as busy), least
-    recently used runner first, until free disk reaches target_gib or the deadline (monotonic) passes. Each dir is
-    renamed aside before it is deleted, so a job that starts on that runner meanwhile clones afresh instead of
-    reading a half-deleted tree. A one-line note; never raises."""
+    """For a nightly job short of disk (NIGHTLY_DISK_RESERVE): take the idle_work_dirs of every runner under home
+    that is not a dedicated builder and has no job (take_runner_work; runner_busy_now counts anything it cannot read
+    as busy), least recently used runner first, and delete them, until free disk reaches target_gib or the deadline
+    (monotonic) passes. A note; never raises."""
     busy = busy or runner_busy_now
     before = free_or_none(path)
     removed, skipped = 0, 0
     try:
         runners = []
         for runner in home.glob("actions-runner-glaeda*"):
-            if runner.is_symlink() or not runner.is_dir() or runner_scope(runner).dedicated:
+            work = runner / "_work"
+            if runner.is_symlink() or work.is_symlink() or not work.is_dir() or runner_scope(runner).dedicated:
                 continue
-            for trash in (runner / "_work").glob(f"{IDLE_EVICT_TRASH}*"):
-                shutil.rmtree(trash, ignore_errors=True)  # an earlier hook died while deleting it
+            for trash in work.glob(f"{IDLE_EVICT_TRASH}*"):  # an earlier eviction ran out of time or died
+                if time.monotonic() < deadline:
+                    remove_bounded(trash, deadline)
             with contextlib.suppress(OSError):
-                runners.append(((runner / "_work").stat().st_mtime, runner))
+                runners.append((work.stat().st_mtime, runner))
         for _, runner in sorted(runners):
             if not disk_refusal(path, target_gib) or time.monotonic() >= deadline:
                 break
-            dirs = idle_work_dirs(runner)
-            if not dirs:
+            if not idle_work_dirs(runner):
                 continue
-            if busy(runner):
+            trash = take_runner_work(runner, busy)
+            if trash is None:
                 skipped += 1
                 continue
-            for n, victim in enumerate(dirs):
-                if not disk_refusal(path, target_gib) or time.monotonic() >= deadline:
-                    break
-                trash = runner / "_work" / f"{IDLE_EVICT_TRASH}{os.getpid()}-{n}"
-                try:
-                    victim.rename(trash)
-                except OSError:
-                    continue
-                shutil.rmtree(trash, ignore_errors=True)
-                removed += 1
+            for item in trash:
+                if remove_bounded(item, deadline):
+                    removed += 1
     except Exception as error:  # noqa: BLE001  (never fail the job on housekeeping)
         return f"idle runners' work dirs: stopped on {type(error).__name__}"
     after = free_or_none(path)
@@ -5259,7 +5331,7 @@ class Gate:
         if why:
             why += reserve
             self.evict_in_background(path, floor)
-            if scope.dedicated:
+            if scope.dedicated or reserve:  # the builder short of disk, or the reserve that keeps it room
                 self.evict_idle_in_background(path, floor + GATE_DISK_RESUME_GIB)
         if why is None or not holding:
             return f"disk: {why}" if why else None
@@ -5273,7 +5345,7 @@ class Gate:
         return f"disk: {why}"
 
     def evict_idle_in_background(self, path: str, target: float) -> None:
-        """A dedicated builder held off under its floor also takes what idle PR runners left in their _work
+        """A dedicated builder held off under its floor, or a runner held for its reserve, takes what idle PR runners left in their _work
         (evict_idle_runners, NIGHTLY_DISK_RESERVE) in a thread, at most every GATE_DISK_EVICT_EVERY_S, so it listens
         again even when glaeda-disk's pass frees nothing."""
         now = time.monotonic()
@@ -7571,6 +7643,10 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.phase in ("job-started", "job-completed"):
         leave_job_workspace(args)
+    if args.phase == "job-started" and not args.dedicated_admit:
+        with contextlib.suppress(Exception):  # never fail the job on housekeeping
+            if note := wait_runner_work(JOB_CWD):
+                print(f"{PREFIX}: {note}", flush=True)
 
     owner: JobOwner | None = None
     if args.phase == "job-started":
