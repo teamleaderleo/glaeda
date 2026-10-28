@@ -1937,7 +1937,22 @@ class HookTest(unittest.TestCase):
                                          workflow="nightly.yml", tier=hook.TIER_NIGHTLY)
         self.assertEqual((ok, why), (False, f"{hook.WAITER_REFUSAL} (pid {waiter.pid})"))
         self.assertFalse(why.startswith("capacity:"), "not a retryable refusal")
-        self.assertEqual(hook.nightly_passes(self.dir / "state"), {}, "a refusal is not a pass")
+        self.assertIn(hook.nightly_passes(self.dir / "state"), ({}, {f"{waiter.pid}:{hook.process_identity(waiter.pid)}": 0}),
+                      "a refusal gives its pass back")
+
+    def test_an_unreadable_pass_record_passes_no_waiter(self) -> None:
+        """The pass record fails closed: corrupt, or not writable, and a nightly job waits like any other."""
+        state = self.dir / "state"
+        state.mkdir(parents=True)
+        waiter = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+        self.addCleanup(waiter.wait)
+        self.addCleanup(waiter.kill)
+        (state / hook.NIGHTLY_PASSES_FILE).write_text("{torn")
+        self.assertFalse(hook.nightly_pass(state, waiter.pid))
+        (state / hook.NIGHTLY_PASSES_FILE).unlink()
+        with mock.patch.object(hook.os, "replace", side_effect=OSError("read-only")):
+            self.assertFalse(hook.nightly_pass(state, waiter.pid))
+        self.assertTrue(hook.nightly_pass(state, waiter.pid))
 
     def test_a_waiter_marker_with_a_since_past_float_range_is_skipped(self) -> None:
         """A marker is written by a job on this mini, so it is untrusted: a since too large for a float raised

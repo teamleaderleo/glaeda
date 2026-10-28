@@ -3859,8 +3859,12 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
 
     def refused(note: str) -> tuple[bool, str]:
         """A refusal; a nightly job admitted ahead of a waiter that cannot hold its capacity at once is refused for
-        the waiter instead (not retryable), so it never waits in admission while a drain waits for it to exit."""
-        return False, (f"{WAITER_REFUSAL} (pid {passed})" if passed is not None else note)
+        the waiter instead (not retryable), so it never waits in admission while a drain waits for it to exit, and
+        gives its reserved pass back."""
+        if passed is None:
+            return False, note
+        nightly_pass(state_dir, passed, -1)
+        return False, f"{WAITER_REFUSAL} (pid {passed})"
 
     # pinned: home-repo workflows the hook does not know use /private/tmp/cmux-ci itself
     try:
@@ -3921,7 +3925,7 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
             waiting = bounded_waiters(state_dir, lock_waiters(host_lock, holder_pids(state_dir) | yielding_family(host_lock)),
                                       log=lambda note: print(f"{PREFIX}: {note}", flush=True))
             # lsof sees only this user's processes, which is how the fleet worker runs today.
-            if waiting and tier == TIER_NIGHTLY and nightly_may_pass(state_dir, waiting[0]):
+            if waiting and tier == TIER_NIGHTLY and nightly_pass(state_dir, waiting[0]):
                 # NIGHTLY_WAITER_PASSES: 2026-10-28 run 40623850717's signer-dmg-image was refused for a waiter on
                 # cmux12s, and nightly-next's DMG fell back to a queued Blacksmith Mac.
                 passed = waiting[0]
@@ -4031,8 +4035,9 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
                 release_holder(holder_file(state_dir))
                 note = why
         what = "+".join([f"{units}/{total} units", *taken]) + warm_note
+        if not held and passed is not None:
+            nightly_pass(state_dir, passed, -1)
         if held and passed is not None:
-            nightly_passed(state_dir, passed)
             note += f"; a nightly job, admitted ahead of the fleet build waiting for the host (pid {passed})"
         if held and taken_out is not None:
             taken_out.update(units=units, units_total=total, tokens=list(taken))
@@ -4780,13 +4785,17 @@ def host_waiters(host_lock: str, state_dir: Path) -> set[int]:
                                log=gate_log))
 
 
-def nightly_passes(state_dir: Path) -> dict[str, int]:
+def nightly_passes(state_dir: Path) -> dict[str, int] | None:
+    """The passes per waiter; {} when there is no file yet, None when it cannot be read or parsed (fail closed)."""
     try:
         record = json.loads((state_dir / NIGHTLY_PASSES_FILE).read_text())
-    except (OSError, ValueError):
+    except FileNotFoundError:
         return {}
-    return {k: v for k, v in record.items() if isinstance(k, str) and isinstance(v, int)} \
-        if isinstance(record, dict) else {}
+    except (OSError, ValueError):
+        return None
+    if not isinstance(record, dict):
+        return None
+    return {k: v for k, v in record.items() if isinstance(k, str) and isinstance(v, int)}
 
 
 def nightly_waiter_key(pid: int) -> str | None:
@@ -4794,31 +4803,33 @@ def nightly_waiter_key(pid: int) -> str | None:
     return f"{pid}:{start}" if start else None
 
 
-def nightly_may_pass(state_dir: Path, pid: int) -> bool:
-    """A nightly job may be admitted ahead of this waiter (NIGHTLY_WAITER_PASSES). Read under take_capacity's
-    admission.lock; a waiter with no stable identity is never passed."""
+def nightly_pass(state_dir: Path, pid: int, delta: int = 1) -> bool:
+    """Reserve (delta 1) or give back (delta -1) one admission of a nightly job ahead of this waiter
+    (NIGHTLY_WAITER_PASSES), under take_capacity's admission.lock. Fails closed: a waiter with no stable identity, a
+    pass record that cannot be read, or one that cannot be written is never passed. Entries of waiters no longer
+    alive are dropped (a new process start is a new key)."""
     key = nightly_waiter_key(pid)
-    return key is not None and nightly_passes(state_dir).get(key, 0) < NIGHTLY_WAITER_PASSES
+    passes = nightly_passes(state_dir)
+    if key is None or passes is None:
+        return False
+    if delta > 0 and passes.get(key, 0) >= NIGHTLY_WAITER_PASSES:
+        return False
 
-
-def nightly_passed(state_dir: Path, pid: int) -> None:
-    """Count one admission ahead of this waiter, dropping entries of waiters no longer alive (pid reuse aside, a
-    new process start is a new key)."""
-    key = nightly_waiter_key(pid)
-    if key is None:
-        return
     def alive(k: str) -> bool:
         pid_text = k.split(":", 1)[0]
         return pid_text.isdigit() and nightly_waiter_key(int(pid_text)) == k
 
-    passes = {k: v for k, v in nightly_passes(state_dir).items() if k == key or alive(k)}
-    passes[key] = passes.get(key, 0) + 1
+    passes = {k: v for k, v in passes.items() if k == key or alive(k)}
+    passes[key] = max(0, passes.get(key, 0) + delta)
     path = state_dir / NIGHTLY_PASSES_FILE
-    with contextlib.suppress(OSError):
+    try:
         state_dir.mkdir(parents=True, exist_ok=True)
         tmp = path.with_suffix(f".{os.getpid()}.tmp")
         tmp.write_text(json.dumps(passes))
         os.replace(tmp, path)
+    except OSError:
+        return False
+    return True
 
 
 def bounded_waiters(state_dir: Path, waiting: list[int] | set[int], now: float | None = None,
