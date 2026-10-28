@@ -7517,7 +7517,7 @@ def fleet_reservations_path() -> Path:
 def hygiene_only_mac(path: Path | None = None) -> bool:
     """A personal Mac set up with glaeda-mini-setup --hygiene-only (as glaeda-local-guard reads update.json): not a
     fleet host, so it never receives the fleet's reservation list."""
-    with contextlib.suppress(OSError, ValueError, AttributeError):
+    with contextlib.suppress(OSError, ValueError, AttributeError, TypeError):
         return "--hygiene-only" in (json.loads((UPDATE_CONFIG if path is None else path).read_text())
                                     .get("setupArgs") or [])
     return False
