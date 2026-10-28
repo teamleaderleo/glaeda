@@ -5778,7 +5778,7 @@ def prune_foreign_archives(now: float | None = None, in_use=lambda p: False) -> 
         if newest is None or newest >= cutoff or mount_below(p) or in_use(p):
             continue
         try:
-            check = (lambda q=p: _foreign_archive_recheck(q, root_id, cutoff, in_use))
+            check = (lambda q=p, n=newest: _foreign_archive_recheck(q, root_id, n, in_use))
             if p.is_dir():
                 remove(p, after_rename=check)
             else:  # remove() unlinks a file in place; this one is renamed aside and checked again first
@@ -5792,13 +5792,13 @@ def prune_foreign_archives(now: float | None = None, in_use=lambda p: False) -> 
     return gone
 
 
-def _newest_change(p: Path) -> float | None:
+def _newest_change(p: Path, top_ctime: bool = True) -> float | None:
     """The newest mtime or ctime of p and everything below it; None when any of it cannot be read or a socket is
     below it (something may be serving from it)."""
     errors: list[OSError] = []
     try:
         st = os.lstat(p)
-        newest = max(st.st_mtime, st.st_ctime)
+        newest = max(st.st_mtime, st.st_ctime) if top_ctime else st.st_mtime
         if stat.S_ISDIR(st.st_mode):
             for dp, dirs, files in os.walk(p, onerror=errors.append):
                 for n in dirs + files:
@@ -5811,17 +5811,18 @@ def _newest_change(p: Path) -> float | None:
     return None if errors else newest
 
 
-def _foreign_archive_recheck(path: Path, root_id: tuple[int, int], cutoff: float, in_use) -> None:
+def _foreign_archive_recheck(path: Path, root_id: tuple[int, int], newest_before: float, in_use) -> None:
     """after_rename for an expired archive: the renamed entry is still in the same ~/archive directory (not one
-    swapped in through a symlink), nothing below it changed, no mount, and nothing uses it; else it goes back."""
+    swapped in through a symlink), nothing below it changed since the first look (the rename itself sets the
+    entry's own ctime, so its ctime is not read again), no mount, and nothing uses it; else it goes back."""
     doomed = path.with_name(f"{DELETING_PREFIX}{path.name}-{os.getpid()}")
     try:
         parent = os.lstat(doomed.parent)
         same = (parent.st_dev, parent.st_ino) == root_id and not stat.S_ISLNK(parent.st_mode)
     except OSError:
         same = False
-    newest = _newest_change(doomed) if same else None
-    if same and newest is not None and newest < cutoff and not mount_below(doomed) and not in_use(doomed):
+    newest = _newest_change(doomed, top_ctime=False) if same else None
+    if same and newest is not None and newest <= newest_before and not mount_below(doomed) and not in_use(doomed):
         return
     try:
         rename_noreplace(doomed, path)
@@ -5882,7 +5883,8 @@ def _private_archive_dir() -> Path:
     root.mkdir(mode=0o700, exist_ok=True)
     if (why := archive_root_why()):
         raise OSError(errno.EPERM, why)
-    os.chmod(root, 0o700)
+    for d in (root.parent, root):  # an existing one keeps its old mode through mkdir: tighten it
+        os.chmod(d, 0o700)  # archive_root_why just refused a symlink at either
     return root
 
 
@@ -5893,6 +5895,7 @@ def _keep_archive(tmp: Path, dest: Path, expires: str, written: list[Path], **ab
     os.link(tmp, dest)  # FileExistsError rather than replacing another archive
     written.append(dest)
     fd = os.open(dest.parent / "manifest.jsonl", os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    os.fchmod(fd, 0o600)  # an existing manifest keeps its old mode through O_CREAT
     with os.fdopen(fd, "a") as m:
         m.write(json.dumps({"name": dest.name, "sha256": _sha256(dest), "expires": expires, **about}) + "\n")
 
@@ -6245,7 +6248,7 @@ def mirror_rename_recheck(path: Path, recheck: tuple):
         try:
             opened, cmds = process_evidence()  # after the rename: a process that came in meanwhile is in doomed now
             busy = in_cwd(os.fspath(doomed), open_index(opened)) or named_by(os.fspath(path), cmds) \
-                or holds_socket(doomed)
+                or named_by(os.fspath(doomed), cmds) or holds_socket(doomed)
         except NoEvidence:
             busy = True
         now = None if why or busy or not work_unchanged(doomed, now_trees, recheck[5]) \

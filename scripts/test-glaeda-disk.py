@@ -8963,12 +8963,45 @@ class HygieneMirrorTest(unittest.TestCase):
         os.chdir(old)  # a relative name: the temp path may be past the AF_UNIX length limit
         try:
             sock.bind("s")
+        except PermissionError:
+            self.skipTest("this sandbox refuses AF_UNIX binds")
         finally:
             os.chdir(cwd)
         self.assertEqual(gd.prune_foreign_archives(now=time.time() + 31 * 86400), [])  # a socket below it
         (old / "s").unlink()
         self.assertEqual(len(gd.prune_foreign_archives(now=time.time() + 31 * 86400)), 1)
         self.assertEqual(list(archive.iterdir()), [])
+
+    def test_the_renames_own_ctime_never_reads_as_a_change(self) -> None:
+        archive = gd.HOME / "archive"
+        old = archive / "old"
+        old.mkdir(parents=True)
+        (old / "a.patch").write_text("diff")
+        newest = gd._newest_change(old)
+        root = os.lstat(archive)
+        doomed = old.with_name(f"{gd.DELETING_PREFIX}old-{os.getpid()}")
+        os.rename(old, doomed)
+        os.chmod(doomed, 0o755)  # a ctime-only change of the entry itself, as the rename makes
+        self.assertGreater(gd._newest_change(doomed), newest)  # read with its ctime, it looks new
+        gd._foreign_archive_recheck(old, (root.st_dev, root.st_ino), newest, lambda p: False)  # passes: no raise
+        (doomed / "a.patch").write_text("changed")
+        with self.assertRaises(gd.SlotTaken):
+            gd._foreign_archive_recheck(old, (root.st_dev, root.st_ino), newest, lambda p: False)
+        self.assertEqual((old / "a.patch").read_text(), "changed")  # put back
+
+    def test_existing_archive_dirs_and_manifest_are_tightened(self) -> None:
+        root = gd.mirror_archive()
+        root.mkdir(parents=True)
+        os.chmod(root.parent, 0o755)
+        os.chmod(root, 0o755)
+        (root / "manifest.jsonl").write_text("")
+        os.chmod(root / "manifest.jsonl", 0o644)
+        tmp = root / ".t.tmp"
+        tmp.write_text("x")
+        gd._private_archive_dir()
+        gd._keep_archive(tmp, root / "x.expires-2099-01-01.patch", "2099-01-01", [])
+        self.assertEqual([stat.S_IMODE(os.stat(p).st_mode) for p in (root.parent, root, root / "manifest.jsonl")],
+                         [0o700, 0o700, 0o600])
 
     def test_off_where_no_ci_runner_is_enrolled(self) -> None:
         (gd.HOME / "Library/Caches/cmux/cmux-cua").mkdir(parents=True)
