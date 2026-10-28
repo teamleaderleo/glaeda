@@ -6626,13 +6626,13 @@ class GateTest(unittest.TestCase):
         gate.child = mock.Mock(poll=mock.Mock(return_value=None), pid=0)
         busy = [True, True, False]
         stops: list[str] = []
-        with mock.patch.object(gate, "busy", side_effect=lambda: busy[0] if len(busy) == 1 else busy.pop(0)), \
+        with mock.patch.object(gate, "busy", side_effect=lambda *_: busy[0] if len(busy) == 1 else busy.pop(0)), \
                 mock.patch.object(gate, "worker_pids", return_value=()), \
                 mock.patch.object(gate, "reload"), mock.patch.object(gate, "locked", return_value=None), \
                 mock.patch.object(gate, "low_disk", return_value=None), \
                 mock.patch.object(gate, "still_waiting", return_value=None), \
                 mock.patch.object(gate, "still_reserved", return_value=None), \
-                mock.patch.object(gate, "stop", side_effect=lambda why: stops.append(why) or True):
+                mock.patch.object(gate, "stop", side_effect=lambda why, *_: stops.append(why) or True):
             self.assertIsNone(gate.step(), "a job runs")
             self.assertFalse(gate.job_ending)
             gate.job_end_marker().touch()  # job-completed gave the job's units back
@@ -6661,7 +6661,7 @@ class GateTest(unittest.TestCase):
         gate.job_end_marker().touch()  # the Worker exited before any poll saw the runner busy
         stops: list[str] = []
         with mock.patch.object(gate, "busy", return_value=False), mock.patch.object(gate, "reload"), \
-                mock.patch.object(gate, "stop", side_effect=lambda why: stops.append(why) or True):
+                mock.patch.object(gate, "stop", side_effect=lambda why, *_: stops.append(why) or True):
             self.assertIsNone(gate.step())
         self.assertEqual(stops, ["only 4 of 14 capacity units on this mini are free; its next job needs 5"])
         self.assertFalse(gate.job_end_marker().exists())
@@ -8078,7 +8078,7 @@ class GateTest(unittest.TestCase):
         with mock.patch.object(gate, "start"), mock.patch.object(gate, "stop"), \
                 mock.patch.object(gate, "reload"), mock.patch.object(gate, "saturated", return_value=None), \
                 mock.patch.object(hook, "console_refusal", return_value=None), \
-                mock.patch.object(gate, "busy", side_effect=lambda: busy[0]):
+                mock.patch.object(gate, "busy", side_effect=lambda *_: busy[0]):
             gate.step()
             self.assertFalse(hook.probe(reserve), "idle: held")
             gate.child = mock.Mock(poll=mock.Mock(return_value=None))
@@ -8109,7 +8109,7 @@ class GateTest(unittest.TestCase):
                 mock.patch.object(gate, "reload"), mock.patch.object(gate, "saturated", return_value=None), \
                 mock.patch.object(gate, "first_poll", return_value=False), \
                 mock.patch.object(hook, "console_refusal", return_value=None), \
-                mock.patch.object(gate, "busy", side_effect=lambda: busy[0]):
+                mock.patch.object(gate, "busy", side_effect=lambda *_: busy[0]):
             gate.step()
             self.assertFalse(hook.probe(reserve), "idle: held")
             gate.child = mock.Mock(poll=mock.Mock(return_value=None))
@@ -8139,7 +8139,7 @@ class GateTest(unittest.TestCase):
         with mock.patch.object(gate, "start"), mock.patch.object(gate, "stop"), \
                 mock.patch.object(gate, "reload"), mock.patch.object(gate, "saturated", return_value=None), \
                 mock.patch.object(hook, "console_refusal", return_value=None), \
-                mock.patch.object(gate, "busy", side_effect=lambda: busy[0]):
+                mock.patch.object(gate, "busy", side_effect=lambda *_: busy[0]):
             gate.step()
             self.assertFalse(hook.probe(reserve), "idle: held")
             gate.child = mock.Mock(poll=mock.Mock(return_value=None))
