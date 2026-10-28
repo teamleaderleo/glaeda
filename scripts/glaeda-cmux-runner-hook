@@ -451,7 +451,8 @@ WORKFLOW_JOB_CLASSES = {("cmux-tui.yml", "lint"): "isolated", ("cmux-tui.yml", "
 FAST_TOKENS = ("fast-0", "fast-1")
 FAST_JOBS = {("cmux-next.yml", "fast-tier")}
 # exclusive (SIGNING_JOBS): more units than any mini has, so admission caps it at the mini's whole count, plus both
-# fast tokens, the one capacity a 0-unit job takes. The gui runner's reserve never applies (reserve_for leaves none
+# fast tokens, the one capacity a 0-unit job takes, and the gui token, which the idle fuzzer (glaeda-idle-warm
+# gui_refusal) checks before it starts and while it runs, so it never starts again beside the job. The gui runner's reserve never applies (reserve_for leaves none
 # beside a job of every unit).
 EXCLUSIVE_UNITS = 1 << 16
 EXCLUSIVE_CLASS = "exclusive"
@@ -461,7 +462,7 @@ CLASS_COST: dict[str, tuple[int, tuple[str, ...]]] = {
     "compile": (5, ("persistent-dd", "root")), "gui": (1, ("gui", "root")), "product": (1, ("gui", "root")),
     "compile-gui": (4, ("root",)), "gui-step": (1, ("gui", "root")),
     "isolated": (4, ()), "simulator": (1, ("simulator",)), "light": (2, ()), "seed": (5, ()),
-    "fast": (0, FAST_TOKENS), "exclusive": (EXCLUSIVE_UNITS, FAST_TOKENS)}
+    "fast": (0, FAST_TOKENS), "exclusive": (EXCLUSIVE_UNITS, (*FAST_TOKENS, "gui"))}
 # A job's own cost in cores, where it is far enough from its class's: keyed by (workflow file, job id) for the home
 # repository, (repository, workflow file, job id) for a guest. Only units change: the job keeps its class's tokens
 # (cli-regressions is a compile at 0.16 cores and still holds persistent-dd and a root). Same window as CLASS_COST;
@@ -4007,6 +4008,8 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
     uses_gui = "gui" in tokens
     if uses_gui:
         tokens = tuple(gui_token if token == "gui" else token for token in tokens)
+        if klass == EXCLUSIVE_CLASS and gui_token != "gui":
+            tokens = (*tokens, "gui")  # the idle fuzzer looks at gui.token itself: hold it whatever this runner's is
     units = min(units, total)
     if roots > 1 and klass in ROOT_CONSUMERS:
         # a consumer must use the producer's root, which only its restore step knows: it takes that root

@@ -2042,7 +2042,7 @@ class HookTest(unittest.TestCase):
         try:
             admitted = self.job("sign-nightly-identity-legacy", "s0", 14, None, "--gui-wait", "0", env=legacy)
             self.assertEqual(admitted.returncode, 0, admitted.stdout + admitted.stderr)
-            self.assertIn("holding 14/14 units+fast-0+fast-1 for sign-nightly-identity-legacy (exclusive",
+            self.assertIn("holding 14/14 units+fast-0+fast-1+gui for sign-nightly-identity-legacy (exclusive",
                           admitted.stdout)
             self.assertIn("GLAEDA_JOB_CLAIM=exclusive for the job", admitted.stdout)
             self.assertIn("GLAEDA_JOB_CLAIM=exclusive\n", github_env.read_text())
@@ -2051,6 +2051,7 @@ class HookTest(unittest.TestCase):
                 self.assertEqual(beside.returncode, 1, beside.stdout + beside.stderr)
                 self.assertIn("0 of 14 units free", beside.stdout)
             self.assertTrue(self.shared_lock_blocks_exclusive(), "a fleet build waits for the signing job too")
+            self.assertFalse(hook.probe(capacity / "gui.token"), "the idle fuzzer sees the gui token taken")
         finally:
             self.finish("s0")
         github_env.unlink()
