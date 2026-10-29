@@ -3294,13 +3294,17 @@ def stray_job_processes(home: Path, owner_pid: int) -> list[int] | None:
                               capture_output=True, text=True, timeout=10, check=False)
     except (OSError, subprocess.TimeoutExpired):
         return None
+    # Both must have answered in full: a failed or partial listing would read as "nothing in _work". This process
+    # always has a cwd, so a cwd listing that does not name it is not a whole one.
+    if listing.returncode != 0 or cwds.returncode != 0 or f"p{os.getpid()}" not in cwds.stdout.split():
+        return None
     parent: dict[int, int] = {}
     command: dict[int, str] = {}
     for line in listing.stdout.splitlines():
         parts = line.split(None, 2)
         if len(parts) >= 2 and parts[0].isdigit() and parts[1].isdigit():
             parent[int(parts[0])], command[int(parts[0])] = int(parts[1]), parts[2] if len(parts) == 3 else ""
-    if not parent:
+    if os.getpid() not in parent:
         return None
     users = {pid for pid, argv in command.items() if any(inside in argv for inside in insides)}
     pid = 0

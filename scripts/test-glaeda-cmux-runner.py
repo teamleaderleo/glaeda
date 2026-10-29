@@ -2141,6 +2141,16 @@ class HookTest(unittest.TestCase):
         finally:
             self.finish("s0")
 
+    def test_stray_job_processes_refuses_when_ps_or_lsof_cannot_answer_in_full(self) -> None:
+        """A failed, partial or empty listing must never read as "nothing in _work" (it refuses the signing job)."""
+        (self.dir / "actions-runner-glaeda-7" / "_work").mkdir(parents=True)
+        self.assertEqual(hook.stray_job_processes(self.dir, os.getpid()), [])
+        self.assertEqual(hook.stray_job_processes(self.dir / "no-runners", os.getpid()), [], "no runner: nothing to see")
+        for name, value in (("PS", "/usr/bin/false"), ("LSOF", "/usr/bin/false"), ("PS", "/usr/bin/true"),
+                            ("LSOF", "/usr/bin/true"), ("LSOF", "/nonexistent/lsof")):
+            with self.subTest(name=name, value=value), mock.patch.object(hook, name, value):
+                self.assertIsNone(hook.stray_job_processes(self.dir, os.getpid()))
+
     def test_job_claim_names_only_a_whole_mini(self) -> None:
         github_env = self.dir / "env"
         with mock.patch.dict(os.environ, {"GITHUB_ENV": os.fspath(github_env)}):
