@@ -3853,6 +3853,10 @@ time.sleep(60)
         tier = hook.stack_blocker_tier
         self.assertEqual(tier("pull_request", "manaflow-ai/cmux", event(label)), hook.TIER_STACK)
         self.assertEqual(tier("pull_request", "Manaflow-AI/cmux", event([{"name": "x"}, *label])), hook.TIER_STACK)
+        for name in ("Stack-Blocker", "STACK-BLOCKER"):  # GitHub label names are case-insensitive
+            with self.subTest(name=name):
+                self.assertEqual(tier("pull_request", "manaflow-ai/cmux", event([{"name": name}])), hook.TIER_STACK)
+        self.assertEqual(tier("pull_request", "manaflow-ai/cmux", event([{"name": None}, {"name": 3}])), "")
         for name, args in (("no label", ("pull_request", "manaflow-ai/cmux", event([{"name": "full-ci"}]))),
                            ("a fork", ("pull_request", "manaflow-ai/cmux", event(label, fork))),
                            ("a push", ("push", "manaflow-ai/cmux", event(label))),

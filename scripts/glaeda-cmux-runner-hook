@@ -1450,8 +1450,10 @@ def stack_blocker_tier(event_name: str | None, repository: str | None, event: An
             or _repo_name(head.get("repo")) != STACK_BLOCKER_REPO or _repo_name(base.get("repo")) != STACK_BLOCKER_REPO:
         return ""
     labels = pr.get("labels")
-    names = {label.get("name") for label in labels if isinstance(label, dict)} if isinstance(labels, list) else set()
-    return TIER_STACK if STACK_BLOCKER_LABEL in names else ""
+    # GitHub label names are case-insensitive (`Stack-Blocker` is the same label), so both sides are folded.
+    names = {label["name"].casefold() for label in labels
+             if isinstance(label, dict) and isinstance(label.get("name"), str)} if isinstance(labels, list) else set()
+    return TIER_STACK if STACK_BLOCKER_LABEL.casefold() in names else ""
 
 
 def nightly_slot_refusal(tier: str) -> str | None:
