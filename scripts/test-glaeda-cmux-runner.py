@@ -2224,7 +2224,7 @@ class HookTest(unittest.TestCase):
         self.fleet()
         self.take_units(1)  # a PR job that outlasts the bound
         signer = self.nightly_signer("n0", "1", "--nightly-runner")
-        marker = self.wait_for_want(signer)
+        marker = self.dir / "capacity" / f"{hook.ADMIT_WANT}{signer.pid}"
         out, _ = signer.communicate(timeout=30)
         self.assertEqual(signer.returncode, 1, out)
         self.assertIn("refused", out)
