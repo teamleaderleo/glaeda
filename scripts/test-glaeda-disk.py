@@ -9664,7 +9664,8 @@ class SupersededChromiumTest(unittest.TestCase):
         self.assertIn(os.fspath(old), gd.CHROMIUM_ASIDES.read_text())  # recorded before its rename
         self.assertEqual(gd.chromium_asides(), [])  # and dropped once the delete finished
         archive = self.home / "archive/glaeda-disk"
-        self.assertEqual(len(list(archive.glob("*.bundle"))), 1)
+        # no server holds either repository's commits here (no remote): src's and the DEPS checkout's are bundled
+        self.assertEqual(len(list(archive.glob("*.bundle"))), 2)
         self.assertEqual(len(list(archive.glob("*.tar.gz"))), 1)
 
     def test_a_tree_alone_in_its_group_or_younger_than_12_h_stays(self) -> None:
@@ -9689,7 +9690,7 @@ class SupersededChromiumTest(unittest.TestCase):
         items = self.survey(self.family())
         self.assertEqual(items["chromium-old"].verdict, "kept")
 
-    def test_a_dirty_or_moved_deps_checkout_keeps_the_tree(self) -> None:
+    def test_a_moved_deps_checkout_is_bundled_and_an_unpinned_one_keeps_the_tree(self) -> None:
         dirty = self.tree("chromium-dirty", hours=60)
         (dirty / "src/third_party/dep/d").write_text("edited")
         moved = self.tree("chromium-moved", hours=60)
@@ -9704,14 +9705,52 @@ class SupersededChromiumTest(unittest.TestCase):
         fam = self.family()
         items = self.survey(fam)
         receipt = self.apply(fam, items["chromium-moved"])
-        self.assertTrue(moved.exists())
-        self.assertIn("beyond its pinned revision", receipt)
+        self.assertFalse(moved.exists(), receipt)
+        self.assertIn("beyond the pin", self.bundled_messages())
         receipt = self.apply(fam, items["chromium-unpinned"])
         self.assertTrue(unpinned.exists())
         self.assertIn("did not pin", receipt)
         receipt = self.apply(fam, items["chromium-dirty"])  # its edit is archived as a patch, then the tree goes
         self.assertFalse(dirty.exists(), receipt)
         self.assertEqual(len(list((self.home / "archive/glaeda-disk").glob("*.patch"))), 1)
+
+    def bundled_messages(self) -> str:
+        """The commit messages every bundle in the archive holds."""
+        out = []
+        for b in (self.home / "archive/glaeda-disk").glob("*.bundle"):
+            clone = self.home / ".clones" / b.name
+            subprocess.run(["git", "clone", "-q", "--mirror", os.fspath(b), os.fspath(clone)], check=True,
+                           env=self.env, capture_output=True)
+            out.append(self.git(clone, "log", "--all", "--format=%s"))
+        return "\n".join(out)
+
+    def test_a_commit_only_a_local_tag_holds_is_bundled_and_a_pin_changed_while_archiving_keeps_it(self) -> None:
+        tagged = self.tree("chromium-tagged", hours=60)
+        dep = tagged / "src/third_party/dep"
+        (dep / "t").write_text("t")
+        self.git(dep, "add", "t")
+        self.git(dep, "commit", "-qm", "only a local tag holds this")
+        self.git(dep, "tag", "local-only")
+        self.git(dep, "checkout", "-q", "HEAD~1")
+        self.git(dep, "reflog", "expire", "--expire=now", "--all")
+        repinned = self.tree("chromium-repinned", hours=60)
+        self.age(tagged, 60)
+        self.tree("chromium-new", hours=13)
+        fam = self.family()
+        items = self.survey(fam)
+        receipt = self.apply(fam, items["chromium-tagged"])
+        self.assertFalse(tagged.exists(), receipt)  # a local tag is unique work: bundled, never taken as the server's
+        self.assertIn("only a local tag holds this", self.bundled_messages())
+        real = gd.archive_chromium
+
+        def repin(tree: Path):
+            out = real(tree)
+            (tree / ".gclient_entries").write_text((tree / ".gclient_entries").read_text().replace("@", "@0"))
+            return out
+        with mock.patch.object(gd, "archive_chromium", repin):
+            receipt = self.apply(fam, items["chromium-repinned"])
+        self.assertTrue(repinned.exists())
+        self.assertIn(".gclient_entries changed", receipt)
 
     def test_a_held_sync_lock_build_marker_or_process_keeps_it(self) -> None:
         a = self.tree("cache/chromium/aaaa", hours=60)

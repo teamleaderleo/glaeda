@@ -120,9 +120,8 @@ install replaced.
 A Chromium or CEF tree (superseded-chromium: a gclient root in a fleet mini's home with enrolled runners) is no
 longer kept for its name alone. Trees are grouped by solution URL and the branch src (and src/cef) is on; the most
 recently used tree of each group stays by role, and so does ~/cmux-browser-fleet/build (NEVER_DELETE's paths). Any
-other tree of a group goes once idle 12 h: src's unpushed commits bundled and every checkout's uncommitted work
-archived into ~/archive first, every DEPS checkout at the revision .gclient_entries pins or holding nothing beyond
-its server's history, else it stays. A recipe sync lock (<name>.sync.lock), .build.active, a process, a socket, a
+other tree of a group goes once idle 12 h: every checkout's commits, branches and tags no server confirms bundled and
+its uncommitted work archived into ~/archive first; a checkout .gclient_entries does not pin keeps it. A recipe sync lock (<name>.sync.lock), .build.active, a process, a socket, a
 lease or a configuration mention keeps it. depot_tools, siso, vpython and cipd caches outside a superseded tree stay.
 
 The runner-account profile is intentionally narrower than the normal user profile:
@@ -3795,12 +3794,12 @@ def home_scratch_referenced(path: Path) -> str:
 # solution URL and the branch src (and src/cef) is on; per group the most recently used tree stays by role, and so
 # does every tree under NEVER_DELETE's paths (~/cmux-browser-fleet/build, the browser worker's warm tree), which counts
 # as a group member all the same. Any other tree of a group, idle DEFAULT_AGE_HOURS, goes once its work is safe:
-# the top repositories' (src, src/cef) unpushed commits are bundled and their uncommitted work archived into ~/archive;
-# every DEPS repository must sit at the revision .gclient_entries pins (or hold nothing beyond it), and its own
-# uncommitted work is archived too. A tree gclient did not record, an unpinned dependency, a held recipe sync lock
+# every repository's (src, src/cef and each DEPS checkout) commits, branches and tags no server confirms are bundled
+# and its uncommitted work archived into ~/archive; every DEPS checkout must be one .gclient_entries pins, and that
+# file must not change while the tree is archived. A tree gclient did not record, an unpinned checkout, a held recipe sync lock
 # (<name>.sync.lock beside it), a .build.active marker, a process, a socket, a lease or a configuration mention keeps it.
 CHROMIUM_FAMILY = "superseded-chromium"
-CHROMIUM_TOPS = ("src", "src/cef")  # repositories whose work is bundled; every other one is a pinned DEPS checkout
+CHROMIUM_TOPS = ("src", "src/cef")  # the solution checkouts; every other repository must be a pinned DEPS checkout
 CHROMIUM_WALK_DEPTH = 4  # ~/cmux-browser-fleet/build/chromium is 3 down, ~/x/chromium_git/chromium too
 CHROMIUM_WALK_BUDGET = 200_000
 CHROMIUM_WALK_SKIP = frozenset(("Library", "Applications", "Desktop", "Documents", "Downloads", "Movies", "Music",
@@ -3977,8 +3976,8 @@ def _chromium_repos(tree: Path) -> list[Path] | None:
 
 
 def archive_chromium(tree: Path) -> tuple[str, list[Path], tuple]:
-    """Before a superseded tree goes: bundle the top repositories' unpushed commits, archive every repository's
-    uncommitted work, and check that every DEPS repository holds nothing beyond its pinned revision.
+    """Before a superseded tree goes: check every DEPS repository is one gclient pinned, bundle what no server
+    holds of every repository, and archive every repository's uncommitted work.
     ("" or why it must stay, the archives written, what chromium_moved rechecks)."""
     none: tuple = ([], [], [], {})
     if (why := archive_root_why(tree)):
@@ -4008,22 +4007,20 @@ def archive_chromium(tree: Path) -> tuple[str, list[Path], tuple]:
         pin = entries.get(rel)
         if not isinstance(pin, str) or "@" not in pin:
             return f"{rel}: a checkout gclient did not pin", [], none
-        sha = pin.rsplit("@", 1)[1]
-        # a DEPS checkout loses nothing when every commit it points at (HEAD, refs, reflogs) is its pin's history or
-        # was fetched from its server (remote-tracking refs, tags); its uncommitted work is archived below
-        own = (_git_dir_run(r / ".git", "rev-parse", "--absolute-git-dir") or "").strip()
-        tips = local_tips(Path(own)) if own else None
-        extra = None if tips is None else _git_dir_run(r / ".git", "rev-list", "-n1", "--stdin", stdin="\n".join(
-            [*tips, "--not", sha, "--remotes", "--tags"]) + "\n")
-        if extra is None or extra.strip():
-            return f"{rel}: commits beyond its pinned revision {sha[:12]} that no server holds", [], none
     gitdirs = [r / ".git" for r in repos]
     trees = sorted(repos)
     snap = mirror_git_snapshot(gitdirs, trees)
     found = {os.path.realpath(t) for t in trees}
+    tips = mirror_tips(tree, {os.path.realpath(g): g for g in gitdirs})
+    if tips is None:
+        return "unreadable refs", [], none
+    # Every repository, src and each DEPS checkout alike: what no server confirms it holds (ls-remote and fetch
+    # --negotiate-only, never a local remote-tracking ref or tag) goes to a verified bundle, every local branch and
+    # tag the servers lack included; what the bundles leave to the servers is asked again right before the delete.
     bundles: list[Path] = []
-    for top in CHROMIUM_TOPS:
-        if top in rels and (why := bundle_unpushed(rels[top] / ".git", os.path.realpath(rels[top]), bundles)):
+    relied: dict[Path, list[str]] = {}
+    for g in gitdirs:
+        if (why := bundle_unpushed(g, os.path.realpath(g.parent), bundles, relied.setdefault(g, []))):
             return why, bundles, none
     work: dict[str, tuple] = {}
     for t in trees:
@@ -4033,18 +4030,28 @@ def archive_chromium(tree: Path) -> tuple[str, list[Path], tuple]:
         work[os.path.relpath(t, tree)] = fingerprint
     try:
         archives = {os.fspath(b): _sha256(b) for b in bundles}
+        pins = (tree / ".gclient_entries").read_bytes()  # what the DEPS checks were judged against
     except OSError as e:
-        return f"an archive is unreadable: {e.__class__.__name__}", bundles, none
-    return "", bundles, (gitdirs, trees, snap, (work, archives))
+        return f"an archive or .gclient_entries is unreadable: {e.__class__.__name__}", bundles, none
+    return "", bundles, (gitdirs, trees, snap, (work, archives, pins, relied, tips))
 
 
 def chromium_moved(fam: Family, tree: Path, recheck: tuple) -> str:
     """Right before the delete: the same repositories, refs and work trees as when archived, the archives intact, and
     nothing using, naming or locking the tree."""
-    gitdirs, trees, snap, (work, archives) = recheck
+    gitdirs, trees, snap, (work, archives, pins, relied, tips) = recheck
+    for g, commits in relied.items():  # the slow network first, the quick checks last
+        if (why := server_still_holds(g, commits)):
+            return why
+    try:
+        if (tree / ".gclient_entries").read_bytes() != pins:
+            return "its .gclient_entries changed while it was archived"
+    except OSError:
+        return "its .gclient_entries became unreadable while it was archived"
     if sorted(_chromium_repos(tree) or []) != trees:
         return "its checkouts changed while they were archived"
-    if None in snap or mirror_git_snapshot(gitdirs, trees) != snap:
+    if None in snap or mirror_git_snapshot(gitdirs, trees) != snap \
+            or mirror_tips(tree, {os.path.realpath(g): g for g in gitdirs}) != tips:
         return "its git refs or work trees changed while they were archived"
     found = {os.path.realpath(t) for t in trees}
     if any(work_tree_fingerprint(t, found, same_gitlinks_ok=True) != work[os.path.relpath(t, tree)] for t in trees):
@@ -7971,8 +7978,8 @@ def _survey(families, idle_hours, min_bytes, known, evidence, defer_bulk=False,
                 reasons.append(f"cmux-next-ci is {gib(cmux_next_ci_over()).strip()} over its size cap "
                                "(least recently used first)")
             if fam.chromium_trees:
-                reasons.append("superseded by a newer Chromium tree of its group (unpushed src work goes to a "
-                               "verified bundle in ~/archive first; DEPS checkouts must sit at their pins)")
+                reasons.append("superseded by a newer Chromium tree of its group (unpushed git work goes to a "
+                               "verified bundle in ~/archive first; every DEPS checkout must be pinned)")
             if mirror_due(fam, path, idle):
                 reasons.append(f"idle {fam.mirror_idle_hours:g}h+: its checkouts are mirrors "
                                "(unpushed commits go to a verified bundle in ~/archive first)")
