@@ -2807,7 +2807,11 @@ def run(mini: Mini, apply: bool, now: float | None = None, state_path: Path = ST
         carried = tm is None and "testmanagerd_wedged" in previous  # a test runs, or the log was unreadable: no heal
         found += [previous["testmanagerd_wedged"]] if carried else tm or []
     else:  # no glaeda runner here, yet a hand-made one is still a fault (it may be the only runner on the host)
-        found = check_claude_missing(mini) + check_claude_route(mini, now, apply) + check_foreign_runners(mini)
+        # Its Tailscale findings are not this pass's to report, but a tunnel that is down still holds Claude's
+        # install and reroute here, as on a runner host (a probe through it hangs and spends a try).
+        tunnel_down = any(f["code"] in TUNNEL_DOWN for f in check_tailscale(mini))
+        found = (check_claude_missing(mini) + check_claude_route(mini, now, apply and not tunnel_down, tunnel_down)
+                 + check_foreign_runners(mini))
 
     findings, heals = [], []
     route_healed = False  # heal_tailscale_route ran this pass (it looks after the drain itself)

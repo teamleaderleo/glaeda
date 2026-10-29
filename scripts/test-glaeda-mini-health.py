@@ -3031,6 +3031,14 @@ class ClaudeMissing(Base):
             report = health.run(self.mini, True, now=NOW, state_path=self.state, report_path=self.report, runner=False)
         self.assertEqual([h["code"] for h in report["healed"]], ["claude_missing"])
 
+    def test_a_capture_only_mini_holds_the_install_while_its_tunnel_is_down(self) -> None:
+        self.mini.route = "en0"
+        with mock.patch.object(self.mini, "foreign_runners", return_value=[], create=True):
+            report = health.run(self.mini, True, now=NOW, state_path=self.state, report_path=self.report, runner=False)
+        self.assertEqual([f["code"] for f in report["findings"]], ["claude_missing"], "no Tailscale finding here")
+        self.assertIn("not installed while the tunnel is down", report["findings"][0]["note"])
+        self.assertFalse([d for d in self.mini.did if d.startswith(("install ", "probe ", "route "))])
+
     def test_main_on_a_capture_only_mini_runs_the_claude_pass(self) -> None:
         # main(): no runner dirs, no Claude yet; the claude_missing check alone opens the pass.
         mini = self.mini
