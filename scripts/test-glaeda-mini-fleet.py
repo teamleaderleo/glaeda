@@ -2672,14 +2672,53 @@ while :; do sleep 0.1; done
             while not (home / "download-start").exists() and time.monotonic() < deadline:
                 time.sleep(0.05)
             self.assertTrue((home / "download-start").exists())
-            perl = subprocess.run(["pgrep", "-f", "-n", "MFcntl=:flock"], capture_output=True, text=True).stdout.split()
-            self.assertTrue(perl)
-            os.kill(int(perl[0]), signal.SIGTERM)
+            # The guardian is the pid its own waiter entry in this test's fleet dir names.
+            waiters = [e.name for e in (home / "fleet/host.lock.waiters").iterdir()]
+            self.assertEqual(len(waiters), 1, waiters)
+            guardian = int(waiters[0].split("-", 1)[0])
+            self.assertEqual(subprocess.run(["ps", "-o", "ppid=", "-p", str(guardian)], capture_output=True,
+                                            text=True).stdout.split(), [str(proc.pid)])
+            os.kill(guardian, signal.SIGTERM)
             with open(home / "fleet/host.lock") as build:
                 fcntl.flock(build, fcntl.LOCK_EX)  # a build gets the lock only once the download has ended
                 self.assertTrue((home / "download-end").exists())
             proc.communicate(timeout=20)
             self.assertNotEqual(proc.returncode, 0)
+            self.assertEqual(list((home / "fleet/host.lock.waiters").iterdir()), [])
+
+    @unittest.skipUnless(shutil.which("perl"), "needs perl")
+    def test_ios_runtime_kills_a_download_that_ignores_term_and_holds_the_lock_until_it_is_gone(self) -> None:
+        import fcntl
+        import signal
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            bin_dir = self.ios_sandbox(home)
+            # The download and a helper it starts both ignore TERM; only the group KILL ends them.
+            (bin_dir / "xcodebuild").write_text(f"""#!/bin/sh
+trap '' TERM
+(trap '' TERM; while :; do sleep 0.1; done) &
+echo $! > {home}/helper-pid
+echo started > {home}/download-start
+while :; do sleep 0.1; done
+""")
+            with mock.patch.object(mf, "ssh_stream", return_value=0) as ssh:
+                with mock.patch.object(mf.bootstrap, "CMUX_WORKLOAD_TOOL_PATH", f"{bin_dir}:/usr/bin:/bin"):
+                    mf.fix_call("h", "u", "ios_runtime", ["/dev", "23F77", "20", "30", "3", "1"], None, 10)
+            proc = subprocess.Popen(["bash", "-c", ssh.call_args.args[2]], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                    env={"HOME": os.fspath(home), "PATH": "/usr/bin:/bin",
+                                         "GLAEDA_FLEET_DIR": os.fspath(home / "fleet")})
+            deadline = time.monotonic() + 20
+            while not (home / "download-start").exists() and time.monotonic() < deadline:
+                time.sleep(0.05)
+            guardian = int(next((home / "fleet/host.lock.waiters").iterdir()).name.split("-", 1)[0])
+            helper = int((home / "helper-pid").read_text())
+            os.kill(guardian, signal.SIGTERM)
+            with open(home / "fleet/host.lock") as build:
+                fcntl.flock(build, fcntl.LOCK_EX)  # granted only once the whole group is gone
+                with self.assertRaises(ProcessLookupError):
+                    os.kill(helper, 0)
+            proc.communicate(timeout=20)
+            self.assertIn(proc.returncode, (128 + signal.SIGTERM, 128 + signal.SIGKILL))
             self.assertEqual(list((home / "fleet/host.lock.waiters").iterdir()), [])
 
     @unittest.skipUnless(shutil.which("perl"), "needs perl")
