@@ -3813,11 +3813,15 @@ CHROMIUM_USE_GLOBS = (".gclient", ".gclient_entries", ".seed-ready", ".build.act
 
 def _literal_assign(path: Path, name: str) -> Any:
     """The literal a gclient file assigns to name (gclient's files are Python); raises OSError or ValueError."""
-    for node in ast.parse(path.read_text()).body:
+    return _literal_bytes(path.read_bytes(), name)
+
+
+def _literal_bytes(text: bytes, name: str) -> Any:
+    for node in ast.parse(text).body:
         if (isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name)
                 and node.targets[0].id == name):
             return ast.literal_eval(node.value)
-    raise ValueError(f"{path.name} assigns no {name}")
+    raise ValueError(f"assigns no {name}")
 
 
 def chromium_roots(root: Path) -> list[Path]:
@@ -3952,12 +3956,16 @@ def chromium_verdict(fam: Family, tree: Path, fresh: bool = False) -> str:
     return _CHROMIUM_GROUPS[key].get(os.fspath(tree), "not found among the gclient roots")
 
 
+class ChromiumSocket(Exception):
+    """A Unix socket somewhere in a Chromium tree: something is serving from it."""
+
+
 def _chromium_repos(tree: Path) -> list[Path] | None:
-    """Every checkout in the tree (a .git file or directory), not entering src/out; None past the budget or on a
-    directory that cannot be read (it could hide one)."""
+    """Every checkout in the whole tree (a .git file or directory), build output included; None past the budget or
+    on a directory that cannot be read (it could hide one). Raises ChromiumSocket on a socket at any depth: the
+    walk reads every entry anyway, so in-use is judged in full here, never by a budgeted look that gives up."""
     found: list[Path] = []
     stack, budget = [os.fspath(tree)], CHROMIUM_REPO_BUDGET
-    out = os.path.join(os.fspath(tree), "src", "out")
     while stack:
         d = stack.pop()
         try:
@@ -3968,11 +3976,25 @@ def _chromium_repos(tree: Path) -> list[Path] | None:
                         return None
                     if e.name == ".git":
                         found.append(Path(d))
-                    elif e.is_dir(follow_symlinks=False) and e.path != out:
-                        stack.append(e.path)
+                    if e.is_dir(follow_symlinks=False):
+                        if e.name != ".git":
+                            stack.append(e.path)
+                    elif e.is_symlink():
+                        continue
+                    elif stat.S_ISSOCK(e.stat(follow_symlinks=False).st_mode):
+                        raise ChromiumSocket(e.path)
         except OSError:
             return None
     return found
+
+
+def chromium_repos(tree: Path) -> tuple[str, list[Path]]:
+    """("" or why the tree must stay, its checkouts)."""
+    try:
+        repos = _chromium_repos(tree)
+    except ChromiumSocket as e:
+        return f"holds a socket ({os.path.relpath(str(e), tree)})", []
+    return ("too large or unreadable to find every checkout", []) if repos is None else ("", repos)
 
 
 def archive_chromium(tree: Path) -> tuple[str, list[Path], tuple]:
@@ -3983,14 +4005,15 @@ def archive_chromium(tree: Path) -> tuple[str, list[Path], tuple]:
     if (why := archive_root_why(tree)):
         return why, [], none
     try:
-        entries = _literal_assign(tree / ".gclient_entries", "entries")
+        pins = (tree / ".gclient_entries").read_bytes()  # one read: what is judged is what the recheck compares
+        entries = _literal_bytes(pins, "entries")
         if not isinstance(entries, dict):
             raise ValueError("not a dict")
     except (OSError, ValueError, SyntaxError) as e:
         return f"no readable .gclient_entries ({e.__class__.__name__}): its dependencies cannot be checked", [], none
-    repos = _chromium_repos(tree)
-    if repos is None:
-        return "too large or unreadable to find every checkout", [], none
+    why, repos = chromium_repos(tree)
+    if why:
+        return why, [], none
     rels = {os.path.relpath(r, tree): r for r in repos}
     if not any(r in rels for r in CHROMIUM_TOPS):
         return "no src checkout", [], none
@@ -4030,10 +4053,32 @@ def archive_chromium(tree: Path) -> tuple[str, list[Path], tuple]:
         work[os.path.relpath(t, tree)] = fingerprint
     try:
         archives = {os.fspath(b): _sha256(b) for b in bundles}
-        pins = (tree / ".gclient_entries").read_bytes()  # what the DEPS checks were judged against
     except OSError as e:
-        return f"an archive or .gclient_entries is unreadable: {e.__class__.__name__}", bundles, none
+        return f"an archive is unreadable: {e.__class__.__name__}", bundles, none
     return "", bundles, (gitdirs, trees, snap, (work, archives, pins, relied, tips))
+
+
+def chromium_rename_recheck(tree: Path):
+    """after_rename for a Chromium tree: a process that came in between the last check and the rename is in the
+    aside now (its cwd, an open file, a command naming either path, a socket); then the tree goes back to its path
+    and nothing is deleted."""
+    doomed = tree.with_name(f"{DELETING_PREFIX}{tree.name}-{os.getpid()}")
+
+    def check() -> None:
+        try:
+            opened, cmds = process_evidence()
+            busy = (in_cwd(os.fspath(doomed), open_index(opened)) or named_by(os.fspath(tree), cmds)
+                    or named_by(os.fspath(doomed), cmds) or bool(chromium_repos(doomed)[0]))
+        except NoEvidence:
+            busy = True
+        if not busy:
+            return
+        try:
+            rename_noreplace(doomed, tree)
+        except OSError as e:
+            raise SlotTaken(f"{tree.name}: in use after its rename; kept aside as {doomed.name} ({e.strerror})")
+        raise SlotTaken(f"{tree.name}: in use after its rename; put back")
+    return check
 
 
 def chromium_moved(fam: Family, tree: Path, recheck: tuple) -> str:
@@ -4048,7 +4093,10 @@ def chromium_moved(fam: Family, tree: Path, recheck: tuple) -> str:
             return "its .gclient_entries changed while it was archived"
     except OSError:
         return "its .gclient_entries became unreadable while it was archived"
-    if sorted(_chromium_repos(tree) or []) != trees:
+    why, now = chromium_repos(tree)
+    if why:
+        return why
+    if sorted(now) != trees:
         return "its checkouts changed while they were archived"
     if None in snap or mirror_git_snapshot(gitdirs, trees) != snap \
             or mirror_tips(tree, {os.path.realpath(g): g for g in gitdirs}) != tips:
@@ -9751,6 +9799,7 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
                            if whole_state
                            else cmux_next_ci_child_recheck(fam, p) if fam.id == CMUX_NEXT_CI_FAMILY
                            else mirror_rename_recheck(p, bundled[2]) if mirror_due(fam, p, idle_now)
+                           else chromium_rename_recheck(p) if fam.chromium_trees
                            else None if stale_hash is None else lambda h=stale_hash: h.unlink(missing_ok=True))
                     gone = True
                     if fam.id == CMUX_NEXT_CI_FAMILY and p.parent.parent.parent in tuple(
@@ -9779,7 +9828,8 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
                                    capture_output=True, timeout=60)
             except SlotTaken:
                 outcome = "changed:in-use"
-                if mirror_due(fam, p, idle_now) and bundled[1] and p.is_dir() and not p.is_symlink():
+                if (mirror_due(fam, p, idle_now) or fam.chromium_trees) and bundled[1] and p.is_dir() \
+                        and not p.is_symlink():
                     drop_unused_archives(bundled[1])  # put back whole: never when it was left aside under another name
             except SlotNotNeeded:
                 continue  # as the stop check before the rename

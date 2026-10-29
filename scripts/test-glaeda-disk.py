@@ -9752,6 +9752,60 @@ class SupersededChromiumTest(unittest.TestCase):
         self.assertTrue(repinned.exists())
         self.assertIn(".gclient_entries changed", receipt)
 
+    def test_a_checkout_in_build_output_or_a_deep_socket_keeps_it(self) -> None:
+        nested = self.tree("chromium-nested", hours=60)
+        self.repo(nested / "src/out/Release/gen/stray")  # never pinned, never bundled: the tree stays
+        sock_tree = self.tree("chromium-socket", hours=60)
+        deep = sock_tree / "src/out/Release/a/b/c"
+        deep.mkdir(parents=True)
+        server = socket.socket(socket.AF_UNIX)
+        self.addCleanup(server.close)
+        server.bind(os.fspath(deep / "s"))
+        self.age(nested, 60), self.age(sock_tree, 60)
+        self.tree("chromium-new", hours=13)
+        fam = self.family()
+        items = self.survey(fam)
+        receipt = self.apply(fam, items["chromium-nested"])
+        self.assertTrue(nested.exists())
+        self.assertIn("did not pin", receipt)
+        receipt = self.apply(fam, items["chromium-socket"])
+        self.assertTrue(sock_tree.exists())
+        self.assertIn("holds a socket", receipt)
+
+    def test_gclient_entries_rewritten_while_it_is_judged_keeps_it(self) -> None:
+        tree = self.tree("chromium-old", hours=60)
+        self.tree("chromium-new", hours=13)
+        fam = self.family()
+        item = self.survey(fam)["chromium-old"]
+        real = gd.chromium_repos
+
+        def sync_meanwhile(t: Path):  # a gclient sync rewrites the pins after they were read
+            (t / ".gclient_entries").write_text((t / ".gclient_entries").read_text().replace("@", "@0"))
+            return real(t)
+        with mock.patch.object(gd, "chromium_repos", side_effect=sync_meanwhile):
+            receipt = self.apply(fam, item)
+        self.assertTrue(tree.exists())
+        self.assertIn(".gclient_entries changed", receipt)
+
+    def test_a_process_that_comes_in_before_the_rename_puts_the_tree_back(self) -> None:
+        tree = self.tree("chromium-old", hours=60)
+        self.tree("chromium-new", hours=13)
+        fam = self.family()
+        item = self.survey(fam)["chromium-old"]
+        calls = {"n": 0}
+        aside = os.fspath(tree.with_name(f"{gd.DELETING_PREFIX}{tree.name}-{os.getpid()}"))
+
+        def evidence():
+            calls["n"] += 1
+            return ([], f"ninja -C {aside}/src/out/Release\n") if os.path.lexists(aside) else ([], "")
+        receipt = self.home / ".receipt.jsonl"
+        with contextlib.redirect_stdout(io.StringIO()), mock.patch.object(gd, "process_evidence", evidence):
+            gd.apply([item], {fam.id: fam}, receipt, None, 24)
+        self.assertTrue(tree.exists())
+        self.assertFalse(os.path.lexists(aside))
+        self.assertIn("changed:in-use", receipt.read_text())
+        self.assertEqual(list((self.home / "archive/glaeda-disk").glob("*.bundle")), [])  # dropped: the tree stays
+
     def test_a_held_sync_lock_build_marker_or_process_keeps_it(self) -> None:
         a = self.tree("cache/chromium/aaaa", hours=60)
         b = self.tree("cache/chromium/bbbb", hours=60)
