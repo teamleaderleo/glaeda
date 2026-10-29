@@ -9738,8 +9738,21 @@ class SupersededChromiumTest(unittest.TestCase):
     def test_an_interrupted_delete_of_a_chromium_tree_is_finished(self) -> None:
         self.tree("chromium-new", hours=13)
         aside = self.tree(f"{gd.DELETING_PREFIX}chromium-old-999999", hours=60)
+        # alone in its folder: no sibling tree left to lead interrupted_families there
+        lone = self.tree(f"cache/chromium/{gd.DELETING_PREFIX}old-999998", hours=60)
         fams = gd.interrupted_families([self.family()])
-        self.assertEqual([gd.candidates(f) for f in fams], [[aside]])
+        self.assertEqual(sorted(p for f in fams for p in gd.candidates(f)), sorted([aside, lone]))
+        self.assertNotIn(os.path.relpath(aside, self.home), self.survey(self.family()))
+
+    def test_a_repository_with_linked_worktrees_keeps_the_tree(self) -> None:
+        old = self.tree("chromium-old", hours=60)
+        self.git(old / "src", "worktree", "add", "-q", os.fspath(self.home / "elsewhere"), "-b", "side")
+        self.age(old, 60)
+        self.tree("chromium-new", hours=13)
+        fam = self.family()
+        receipt = self.apply(fam, self.survey(fam)["chromium-old"])
+        self.assertTrue(old.exists())
+        self.assertIn("linked worktrees", receipt)
 
 
 class NightlyNextFallbackTest(unittest.TestCase):

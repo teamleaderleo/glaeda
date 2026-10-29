@@ -3823,7 +3823,9 @@ def _literal_assign(path: Path, name: str) -> Any:
 
 def chromium_roots(root: Path) -> list[Path]:
     """Every gclient root up to CHROMIUM_WALK_DEPTH below root, a found root not searched further, symlinks not
-    followed. A walk past its budget returns what it found: a tree only goes for a newer one found beside it."""
+    followed, and every tree remove() left aside there (DELETING_RE), so interrupted_families finishes one with no
+    sibling tree left. A walk past its budget returns what it found: a tree only goes for a newer one found beside
+    it."""
     found: list[Path] = []
     frontier, budget = [os.fspath(root)], CHROMIUM_WALK_BUDGET
     for _ in range(CHROMIUM_WALK_DEPTH + 1):
@@ -3838,7 +3840,9 @@ def chromium_roots(root: Path) -> list[Path]:
                         budget -= 1
                         if budget < 0:
                             return found
-                        if (e.is_dir(follow_symlinks=False) and e.name not in CHROMIUM_WALK_SKIP
+                        if DELETING_RE.fullmatch(e.name) and e.is_dir(follow_symlinks=False):
+                            found.append(Path(e.path))
+                        elif (e.is_dir(follow_symlinks=False) and e.name not in CHROMIUM_WALK_SKIP
                                 and not e.name.startswith((".", "actions-runner"))):
                             nxt.append(e.path)
             except OSError:
@@ -3956,6 +3960,11 @@ def archive_chromium(tree: Path) -> tuple[str, list[Path], tuple]:
     for rel, r in sorted(rels.items()):
         if (r / ".git").is_symlink():
             return f"{rel}: .git is a symlink", [], none
+        if not (r / ".git").is_dir():  # a linked worktree or a gitfile submodule: its repository may sit elsewhere
+            return f"{rel}: .git is not a directory", [], none
+        if (linked := _linked_trees_strict(r / ".git")) is None or linked:
+            # deleting the repository would orphan its linked worktrees, whose work is outside the tree
+            return f"{rel}: has linked worktrees or unreadable worktree records", [], none
         if rel in CHROMIUM_TOPS:
             continue
         pin = entries.get(rel)
