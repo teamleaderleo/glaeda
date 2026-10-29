@@ -7579,14 +7579,15 @@ def body_guard_refusal(item: dict) -> str | None:
         return f"the body guard {path} could not be loaded"
     guard = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(guard)
-    with tempfile.NamedTemporaryFile("w", suffix=".md", delete=False) as fh:
-        fh.write(item["body"])
+    fd, name = tempfile.mkstemp(suffix=".md", prefix="glaeda-post-")
     try:
-        args = body_guard_args(item, fh.name)
+        with os.fdopen(fd, "w") as fh:  # inside the try: a failed write still removes the file
+            fh.write(item["body"])
+        args = body_guard_args(item, name)
         return guard.refusal(args, os.environ) or guard.footer_refusal(args, os.environ)
     finally:
         with contextlib.suppress(OSError):
-            os.unlink(fh.name)
+            os.unlink(name)
 
 
 def cmd_post(args: argparse.Namespace) -> int:

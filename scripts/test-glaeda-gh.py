@@ -8684,6 +8684,16 @@ class PostBodyGuardTest(unittest.TestCase):
         self.assertIn("is missing", self.post("comment", "pub/cmux#7", "--body", "x")[1])
         self.assertEqual(self.queued(), 0)
 
+    def test_the_body_file_is_removed_even_when_the_write_fails(self) -> None:
+        tmp = Path(self.tmp.name) / "t"
+        tmp.mkdir()
+        with mock.patch.object(gg.tempfile, "tempdir", str(tmp)), \
+                mock.patch.object(gg.os, "fdopen", side_effect=OSError(28, "No space left on device")):
+            code, err = self.post("comment", "pub/cmux#7", "--body", "x")
+        self.assertEqual(code, 3)
+        self.assertIn("No space left on device", err)
+        self.assertEqual(list(tmp.iterdir()), [])
+
     def test_no_guard_on_the_host_posts_as_before(self) -> None:
         with mock.patch.dict(os.environ, {gg.BODY_GUARD_ENV: ""}), \
                 mock.patch.object(gg, "PACE_CLI", Path(self.tmp.name) / "nowhere" / "gh"):
