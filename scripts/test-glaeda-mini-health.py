@@ -2950,16 +2950,31 @@ class ClaudeMissing(Base):
         self.assertTrue(source["downloads"].startswith("https://"))
         self.assertIn(source["channel"], ("stable", "latest"))
 
-    def test_a_fleet_mini_without_claude_installs_it_then_routes_it(self) -> None:
+    def test_a_fleet_mini_without_claude_installs_it_and_routes_it_in_one_heal(self) -> None:
+        # Healed only once the new Claude goes through a fleet route: a clean report never means unrouted.
         report = self.run_once()
         self.assertEqual(self.codes(report), [])
         self.assertEqual([h["code"] for h in report["healed"]], ["claude_missing"])
-        self.assertEqual(self.mini.did, ["install claude stable"])
-        # the next pass finds Claude with no route and routes it through the first fleet gateway that answers
-        report = self.run_once(at=NOW + 120)
-        self.assertEqual(self.codes(report), [])
         self.assertEqual(self.mini.did, ["install claude stable", "probe " + SR2, "route " + SR2])
         self.assertEqual(self.mini.claude_env, {"ANTHROPIC_BASE_URL": SR2, "ANTHROPIC_AUTH_TOKEN": "subrouter"})
+        self.assertEqual(self.codes(self.run_once(at=NOW + 120)), [])
+
+    def test_an_install_whose_route_does_not_answer_stays_a_finding(self) -> None:
+        self.mini.answers = {SR2: False, POOL: False}
+        report = self.run_once()
+        self.assertIn("claude_missing", self.codes(report))
+        self.assertNotIn("claude_missing", [h["code"] for h in report["healed"]])
+        missing = [f for f in report["findings"] if f["code"] == "claude_missing"]
+        self.assertIn("not routed yet", missing[0]["note"])
+        # the next pass sees Claude installed: claude_route keeps capture-host closed and its heal takes over
+        self.mini.answers = {SR2: True, POOL: True}
+        self.assertEqual(self.codes(self.run_once(at=NOW + health.HEAL_EVERY_S)), [])
+
+    def test_the_real_config_turns_the_check_on_for_every_test_mini(self) -> None:
+        # FakeMini hides claude_code by default; the shipped config names it, so a real fleet mini is checked.
+        self.assertIsInstance(ROUTES.get("claude_code"), dict)
+        self.mini.claude_source = False
+        self.assertEqual(self.codes(self.run_once(apply=False)), [])
 
     def test_a_failed_install_stays_a_finding_and_is_retried_at_the_heal_pace(self) -> None:
         self.mini.install_ok = False
@@ -2985,6 +3000,18 @@ class ClaudeMissing(Base):
             report = health.run(self.mini, True, now=NOW, state_path=self.state, report_path=self.report, runner=False)
         self.assertEqual([h["code"] for h in report["healed"]], ["claude_missing"])
 
+    def test_main_on_a_capture_only_mini_runs_the_claude_pass(self) -> None:
+        # main(): no runner dirs, no Claude yet; the claude_missing check alone opens the pass.
+        mini = self.mini
+        mini.runner_dirs = lambda: []  # type: ignore[method-assign]
+        with mock.patch.object(health, "Mini", return_value=mini), \
+                mock.patch.object(health, "check_daemon_heal", return_value=[]), \
+                mock.patch.object(health, "check_foreign_runners", return_value=[]), \
+                mock.patch.object(health, "STATE", self.state), mock.patch.object(health, "REPORT", self.report), \
+                mock.patch.object(health, "KILL_SWITCH", self.dir / "off"):
+            self.assertEqual(health.main(["--apply"]), 0)
+        self.assertEqual(mini.did[0], "install claude stable")
+
 
 class ClaudeInstallOnDisk(unittest.TestCase):
     """install_claude keeps only a binary whose sha256 matches its manifest, and runs nothing else."""
@@ -3007,23 +3034,41 @@ class ClaudeInstallOnDisk(unittest.TestCase):
                            {"platforms": {"darwin-arm64": {"checksum": checksum}}}).encode(),
                        f"{base}/{version}/darwin-arm64/claude": self.body}
 
-    def install(self) -> tuple[bool, str]:
+    def install(self, fail_after: int | None = None) -> tuple[bool, str]:
         import io
-        def urlopen(url, timeout=None):
-            if url not in self.served:
-                raise OSError(f"404 {url}")
-            return io.BytesIO(self.served[url])
+        envs = self.envs = []
+        class Body(io.BytesIO):
+            def __init__(self, data, cut):
+                super().__init__(data)
+                self.cut = cut
+            def read(self, n=-1):
+                if self.cut is not None and self.tell() >= self.cut:
+                    raise ConnectionResetError("reset mid-download")
+                return super().read(min(n, self.cut - self.tell()) if self.cut is not None and n > 0 else n)
+        served = self.served
+        class Opener:
+            def open(self, url, timeout=None):
+                if url not in served:
+                    raise OSError(f"404 {url}")
+                return Body(served[url], fail_after if url.endswith("/claude") else None)
         def sh(argv, timeout=15, env=None, cwd=None):
             self.ran.append(list(argv))
+            envs.append(dict(env or {}))
             link = self.home / ".local/bin/claude"
             link.parent.mkdir(parents=True, exist_ok=True)
             link.write_text("#!/bin/sh\n")
             link.chmod(0o755)
             return 0, "installed"
-        with mock.patch("urllib.request.urlopen", side_effect=urlopen), mock.patch.object(health, "sh", side_effect=sh), \
+        with mock.patch("urllib.request.build_opener", return_value=Opener()), \
+                mock.patch.object(health, "sh", side_effect=sh), \
                 mock.patch.object(health.sys, "platform", "darwin"), \
-                mock.patch.object(health.os, "uname", return_value=mock.Mock(machine="arm64")):
+                mock.patch.object(health.os, "uname", return_value=mock.Mock(machine="arm64")), \
+                mock.patch.dict(os.environ, {"CLAUDE_CODE_OAUTH_TOKEN": "personal"}):
             return self.mini.install_claude({"downloads": "https://downloads.example/r", "channel": "stable"})
+
+    def leftovers(self) -> list[Path]:
+        folder = self.home / ".local/share/glaeda/claude-install"
+        return list(folder.iterdir()) if folder.exists() else []
 
     def test_a_binary_matching_its_manifest_is_installed_and_removed_after(self) -> None:
         import hashlib
@@ -3033,7 +3078,48 @@ class ClaudeInstallOnDisk(unittest.TestCase):
         self.assertIn("2.1.308", what)
         self.assertEqual(len(self.ran), 1)
         self.assertEqual(self.ran[0][1:], ["install", "2.1.308"])
-        self.assertFalse(list((self.home / ".local/share/glaeda/claude-install").iterdir()), "the download is gone")
+        self.assertNotIn("CLAUDE_CODE_OAUTH_TOKEN", self.envs[0], "a personal login never reaches the install")
+        self.assertEqual(self.leftovers(), [], "the download is gone")
+
+    def test_a_download_cut_short_leaves_nothing_and_runs_nothing(self) -> None:
+        import hashlib
+        self.body = b"x" * (3 << 20)
+        self.serve("2.1.308", hashlib.sha256(self.body).hexdigest())
+        ok, what = self.install(fail_after=1 << 20)
+        self.assertFalse(ok)
+        self.assertIn("ConnectionResetError", what)
+        self.assertEqual((self.ran, self.leftovers()), ([], []))
+
+    def test_a_manifest_of_another_shape_is_a_failed_heal_not_a_crash(self) -> None:
+        for manifest in ([], {"platforms": []}, {"platforms": {"darwin-arm64": "x"}}, "x"):
+            with self.subTest(manifest=manifest):
+                self.serve("2.1.308", "0" * 64)
+                self.served["https://downloads.example/r/2.1.308/manifest.json"] = json.dumps(manifest).encode()
+                ok, what = self.install()
+                self.assertFalse(ok)
+                self.assertIn("no darwin-arm64 checksum", what)
+        self.serve("2.1.308", "0" * 64)
+        self.served["https://downloads.example/r/2.1.308/manifest.json"] = b'{"platforms": {"darw'
+        self.assertFalse(self.install()[0])
+        self.assertEqual(self.ran, [])
+
+    def test_a_redirect_off_https_is_refused(self) -> None:
+        handler = None
+        def capture(h):
+            nonlocal handler
+            handler = h
+            raise RuntimeError("stop")
+        with mock.patch("urllib.request.build_opener", side_effect=capture), \
+                mock.patch.object(health.sys, "platform", "darwin"), \
+                mock.patch.object(health.os, "uname", return_value=mock.Mock(machine="arm64")):
+            with self.assertRaises(RuntimeError):
+                self.mini.install_claude({"downloads": "https://downloads.example/r", "channel": "stable"})
+        import urllib.error
+        import urllib.request
+        req = urllib.request.Request("https://downloads.example/r/stable")
+        with self.assertRaises(urllib.error.URLError):
+            handler().redirect_request(req, None, 302, "Found", {}, "http://evil.example/stable")
+        self.assertIsNotNone(handler().redirect_request(req, None, 302, "Found", {}, "https://cdn.example/stable"))
 
     def test_a_binary_that_does_not_match_is_never_run(self) -> None:
         self.serve("2.1.308", "0" * 64)
@@ -3041,7 +3127,7 @@ class ClaudeInstallOnDisk(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("did not match", what)
         self.assertEqual(self.ran, [])
-        self.assertFalse(list((self.home / ".local/share/glaeda/claude-install").iterdir()))
+        self.assertEqual(self.leftovers(), [])
 
     def test_odd_channel_answers_and_sources_are_refused(self) -> None:
         self.serve("<html>", "0" * 64)

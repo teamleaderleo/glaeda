@@ -914,8 +914,10 @@ class Mini:
     def install_claude(self, source: dict[str, Any]) -> tuple[bool, str]:
         """Claude Code for the runner user, as install.sh does it: SOURCE's channel (config/claude-routes.json
         claude_code) names a version, its manifest the platform binary's sha256; a binary that does not match is
-        deleted unrun. `claude install VERSION` then links ~/.local/bin/claude. Logs in nobody."""
+        deleted unrun. `claude install VERSION` then links ~/.local/bin/claude. Logs in nobody. Every request stays
+        on https (a redirect elsewhere is refused), and the download is removed whatever happens."""
         import hashlib  # noqa: PLC0415
+        import urllib.error  # noqa: PLC0415
         import urllib.request  # noqa: PLC0415
         base, channel = str(source.get("downloads") or ""), str(source.get("channel") or "")
         if not base.startswith("https://") or not re.fullmatch(r"stable|latest", channel):
@@ -925,39 +927,50 @@ class Mini:
         if platform is None:
             return False, f"no Claude Code build for {sys.platform}/{machine} here"
 
+        class HttpsOnly(urllib.request.HTTPRedirectHandler):
+            def redirect_request(self, req, fp, code, msg, headers, newurl):  # type: ignore[override]
+                if not str(newurl).startswith("https://"):
+                    raise urllib.error.URLError(f"refused a redirect off https to {str(newurl)[:80]}")
+                return super().redirect_request(req, fp, code, msg, headers, newurl)
+        opener = urllib.request.build_opener(HttpsOnly)
+
         def fetch(url: str) -> bytes:
-            with urllib.request.urlopen(url, timeout=60) as r:  # noqa: S310 (https only, checked above)
+            with opener.open(url, timeout=60) as r:
                 return r.read()
+        folder = self.home / ".local/share/glaeda/claude-install"
+        binary: Path | None = None
         try:
             version = fetch(f"{base}/{channel}").decode().strip()
             if not CLAUDE_VERSION.fullmatch(version):
                 return False, f"the {channel} channel named no version"
             manifest = json.loads(fetch(f"{base}/{version}/manifest.json"))
-            want = ((manifest.get("platforms") or {}).get(platform) or {}).get("checksum")
+            platforms = manifest.get("platforms") if isinstance(manifest, dict) else None
+            entry = platforms.get(platform) if isinstance(platforms, dict) else None
+            want = entry.get("checksum") if isinstance(entry, dict) else None
             if not isinstance(want, str) or not re.fullmatch(r"[0-9a-f]{64}", want):
                 return False, f"the {version} manifest has no {platform} checksum"
-            folder = self.home / ".local/share/glaeda/claude-install"
             folder.mkdir(parents=True, exist_ok=True)
             binary = folder / f"claude-{version}-{platform}"
             digest = hashlib.sha256()
-            with urllib.request.urlopen(f"{base}/{version}/{platform}/claude", timeout=CLAUDE_INSTALL_S) as r, \
-                    open(binary, "wb") as out:  # noqa: S310
+            with opener.open(f"{base}/{version}/{platform}/claude", timeout=CLAUDE_INSTALL_S) as r, \
+                    open(binary, "wb") as out:
                 for chunk in iter(lambda: r.read(1 << 20), b""):
                     digest.update(chunk)
                     out.write(chunk)
-        except (OSError, ValueError) as e:
-            return False, f"Claude Code download failed: {e}"[:200]
-        try:
             if digest.hexdigest() != want:
                 return False, f"Claude Code {version} for {platform} did not match its manifest's sha256; not run"
             binary.chmod(0o755)
             env = {k: v for k, v in os.environ.items() if k not in CLAUDE_PERSONAL}
-            code, out = sh([os.fspath(binary), "install", version], timeout=CLAUDE_INSTALL_S, env=env,
-                           cwd=tempfile.gettempdir())
+            code, out_text = sh([os.fspath(binary), "install", version], timeout=CLAUDE_INSTALL_S, env=env,
+                                cwd=tempfile.gettempdir())
+        except Exception as e:  # noqa: BLE001  any transport, disk or shape failure is a failed heal, never a crash
+            return False, f"Claude Code download failed: {type(e).__name__}: {e}"[:200]
         finally:
-            binary.unlink(missing_ok=True)
+            if binary is not None:
+                with contextlib.suppress(OSError):
+                    binary.unlink()
         if code != 0:
-            return False, f"`claude install {version}` exit {code}: {' '.join(out.split())[-160:]}"
+            return False, f"`claude install {version}` exit {code}: {' '.join(out_text.split())[-160:]}"
         if self.claude_bin() is None:
             return False, f"`claude install {version}` left no ~/.local/bin/claude"
         return True, f"installed Claude Code {version} ({platform}, sha256 checked) at ~/.local/bin/claude"
@@ -2187,7 +2200,13 @@ def heal_claude_route(mini: Mini, f: dict[str, Any]) -> tuple[bool, str]:
 
 
 def heal_claude_missing(mini: Mini, f: dict[str, Any]) -> tuple[bool, str]:
-    return mini.install_claude(mini.claude_routes().get("claude_code") or {})
+    """Install Claude Code, then route it at once: the finding is healed only when the new Claude goes through a
+    fleet route that answers, so capture-host never admits a host whose Claude is installed but unrouted."""
+    ok, what = mini.install_claude(mini.claude_routes().get("claude_code") or {})
+    if not ok:
+        return False, what
+    routed, how = heal_claude_route(mini, {"evidence": "installed just now"})
+    return routed, f"{what}; {how}" if routed else f"{what}, but not routed yet: {how}"
 
 
 def heal_testmanagerd(mini: Mini, f: dict[str, Any]) -> tuple[bool, str]:
