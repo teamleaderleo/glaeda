@@ -2520,7 +2520,7 @@ class FixLibraryTests(unittest.TestCase):
                           'rm -f "$(held_dir)/$(basename "$dir")"',
                           'rm -f "$(held_dir)/$(basename "$dir")"'])
         # ...and perl's unlink of the drain waiter entry ios_runtime itself published.
-        self.assertEqual([line.strip() for line in body if "unlink" in line], ['unlink $waiter if $waiter ne "";'] * 2)
+        self.assertEqual([line.strip() for line in body if "unlink" in line], ['sub leave { unlink $waiter if $waiter ne ""; print STDERR "glaeda-mini-fleet: $_[1]\\n" if $_[1]; exit $_[0] }'])
         self.assertFalse([line for line in body if "simctl runtime delete" in line or "simctl delete" in line])
 
     def test_glaeda_setup_preserves_headless_mode(self) -> None:
@@ -2648,6 +2648,63 @@ echo "/dev/disk3s1 482344960 1000 $(( {free_gib} * 1048576 - $(cat {home}/downlo
                 self.assertEqual(again.returncode, 0, again.stderr)
                 self.assertIn("unchanged", again.stdout)
                 self.assertEqual(len((home / "download-argv").read_text().splitlines()), 1)
+
+    @unittest.skipUnless(shutil.which("perl"), "needs perl")
+    def test_ios_runtime_keeps_the_lock_until_a_signalled_download_has_ended(self) -> None:
+        import fcntl
+        import signal
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            bin_dir = self.ios_sandbox(home)
+            # A download that ignores the first TERM for a moment, the way a busy xcodebuild finishes a write.
+            (bin_dir / "xcodebuild").write_text(f"""#!/bin/sh
+trap 'sleep 1; echo stopped > {home}/download-end; exit 143' TERM
+echo started > {home}/download-start
+while :; do sleep 0.1; done
+""")
+            with mock.patch.object(mf, "ssh_stream", return_value=0) as ssh:
+                with mock.patch.object(mf.bootstrap, "CMUX_WORKLOAD_TOOL_PATH", f"{bin_dir}:/usr/bin:/bin"):
+                    mf.fix_call("h", "u", "ios_runtime", ["/dev", "23F77", "20", "30", "3"], None, 10)
+            proc = subprocess.Popen(["bash", "-c", ssh.call_args.args[2]], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                    env={"HOME": os.fspath(home), "PATH": "/usr/bin:/bin",
+                                         "GLAEDA_FLEET_DIR": os.fspath(home / "fleet")})
+            deadline = time.monotonic() + 20
+            while not (home / "download-start").exists() and time.monotonic() < deadline:
+                time.sleep(0.05)
+            self.assertTrue((home / "download-start").exists())
+            perl = subprocess.run(["pgrep", "-f", "-n", "MFcntl=:flock"], capture_output=True, text=True).stdout.split()
+            self.assertTrue(perl)
+            os.kill(int(perl[0]), signal.SIGTERM)
+            with open(home / "fleet/host.lock") as build:
+                fcntl.flock(build, fcntl.LOCK_EX)  # a build gets the lock only once the download has ended
+                self.assertTrue((home / "download-end").exists())
+            proc.communicate(timeout=20)
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertEqual(list((home / "fleet/host.lock.waiters").iterdir()), [])
+
+    @unittest.skipUnless(shutil.which("perl"), "needs perl")
+    def test_ios_runtime_creates_an_absent_host_lock_and_holds_it(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            bin_dir = self.ios_sandbox(home)
+            (home / "fleet/host.lock").unlink()
+            # The download tries the lock the way a worker starting meanwhile would (it creates the file too).
+            (bin_dir / "xcodebuild").write_text(f"""#!/bin/sh
+/usr/bin/perl -MFcntl=:flock -e 'open(my $f, ">>", shift) or exit 2; exit(flock($f, LOCK_SH | LOCK_NB) ? 1 : 0)' \
+  {home}/fleet/host.lock && echo excluded > {home}/worker-saw
+echo 23F77 > {home}/runtime
+""")
+            with mock.patch.object(mf.bootstrap, "CMUX_WORKLOAD_TOOL_PATH", f"{bin_dir}:/usr/bin:/bin"):
+                done = self.call(home, "ios_runtime", "/dev", "23F77", "20", "30", "3")
+            self.assertEqual(done.returncode, 0, done.stderr)
+            self.assertEqual((home / "worker-saw").read_text(), "excluded\n")
+            self.assertEqual((home / "fleet/host.lock").stat().st_mode & 0o777, 0o660 & ~self.umask())
+
+    @staticmethod
+    def umask() -> int:
+        mask = os.umask(0)
+        os.umask(mask)
+        return mask
 
     @unittest.skipUnless(shutil.which("perl"), "needs perl")
     def test_ios_runtime_refuses_a_booted_simulator_short_disk_and_a_wrong_build(self) -> None:

@@ -425,33 +425,47 @@ ios_runtime_install() {  # DEVELOPER_DIR BUILD NEED_GIB FLOOR_GIB: the download 
   say "iOS simulator runtime $2 available; used $(((before - after) * 1024)) bytes, $((after / 1048576)) GiB free"
 }
 ios_runtime() {  # DEVELOPER_DIR BUILD NEED_GIB FLOOR_GIB WAIT_SECONDS: add the pinned Xcode's iOS runtime, never remove one
-  local lock="$GLAEDA_FLEET_DIR/host.lock"
   if ios_runtime_ready "$1" "$2"; then say "unchanged: iOS simulator runtime $2 available"; return; fi
   if pgrep -x launchd_sim >/dev/null 2>&1; then held_refuse "a simulator is running"; fi
-  [ -e "$lock" ] || { ios_runtime_install "$1" "$2" "$3" "$4"; return; }
+  # No fleet dir: nothing here takes the fleet host lock (the build worker, its run-worker.sh and the runner hook's
+  # ledger all live in that dir), so there is nothing to drain.
+  [ -d "$GLAEDA_FLEET_DIR" ] || { ios_runtime_install "$1" "$2" "$3" "$4"; return; }
   # The fleet host lock, held exclusively for the whole download, so no build or ci-step runs beside it (each holds it,
-  # steps shared). First a host.lock.waiters entry <pid>-ios-runtime, live while perl's pid is: the build worker then
-  # leases no new job or step here, and what runs finishes. perl waits up to WAIT_SECONDS for the lock, then runs the
-  # download as its child (the lock fd is close-on-exec, so nothing the download starts keeps it) and removes the entry.
-  perl -MFcntl=:flock -e '
+  # steps shared); perl creates it (0660, as the worker does) when it is absent. First a host.lock.waiters entry
+  # <pid>-ios-runtime, live while perl's pid is: the build worker then leases no new job or step here, and what runs
+  # finishes. perl waits up to WAIT_SECONDS for the lock, then runs the download as a child in its own process group
+  # (the lock fd is close-on-exec, so nothing the download starts keeps it). A TERM, INT or HUP to perl (an ssh drop,
+  # the step's timeout) goes on to that group, and perl keeps the lock and the entry until every process of the group
+  # has ended (KILL after 60 s), so no build starts beside a download that outlives its caller.
+  perl -MFcntl=:flock,O_RDONLY,O_CREAT,O_NOFOLLOW -e '
     my ($lock, $wait) = splice(@ARGV, 0, 2);
-    open(my $fh, "<", $lock) or do { print STDERR "glaeda-mini-fleet: held: cannot open $lock, skipped\n"; exit 20 };
-    my $waiter = -d "$lock.waiters" ? "$lock.waiters/$$-ios-runtime" : "";
-    if ($waiter ne "") { my $w; if (open($w, ">", $waiter)) { close($w) } else { $waiter = "" } }
+    my $waiter = "";
+    sub leave { unlink $waiter if $waiter ne ""; print STDERR "glaeda-mini-fleet: $_[1]\n" if $_[1]; exit $_[0] }
+    my $fh;
+    sysopen($fh, $lock, O_RDONLY | O_CREAT | O_NOFOLLOW, 0660) or leave(20, "held: cannot open $lock ($!), skipped");
+    if (-d "$lock.waiters") {
+      my $w; $waiter = "$lock.waiters/$$-ios-runtime";
+      if (open($w, ">", $waiter)) { close($w) } else { $waiter = "" }
+    }
     my ($deadline, $said) = (time() + $wait, 0);
     until (flock($fh, LOCK_EX | LOCK_NB)) {
-      if (time() >= $deadline) {
-        unlink $waiter if $waiter ne "";
-        print STDERR "glaeda-mini-fleet: held: $lock still held after ${wait}s, skipped\n";
-        exit 20;
-      }
+      leave(20, "held: $lock still held after ${wait}s, skipped") if time() >= $deadline;
       print "glaeda-mini-fleet: waiting for the jobs holding $lock to finish (no new ones start)\n" unless $said++;
       sleep 2;
     }
-    my $rc = system(@ARGV);
-    unlink $waiter if $waiter ne "";
-    exit($rc == -1 ? 127 : $rc & 127 ? 128 + ($rc & 127) : $rc >> 8);
-  ' "$lock" "$5" /bin/bash -c "$(declare -f say refuse held_refuse data_free_kib ios_runtime_ready ios_runtime_install)
+    my $pid = fork();
+    defined $pid or leave(3, "refused: fork: $!");
+    if (!$pid) { setpgrp(0, 0); exec { $ARGV[0] } @ARGV; exit 127 }
+    my $stopped = 0;
+    $SIG{$_} = sub { $stopped = 1; kill "TERM", -$pid } for qw(TERM INT HUP);
+    $SIG{PIPE} = "IGNORE";
+    while (waitpid($pid, 0) == -1 && $!{EINTR}) {}
+    my $rc = $?;
+    my $end = time() + 60;
+    while (kill(0, -$pid) && time() < $end) { select(undef, undef, undef, 0.2) }
+    if (kill(0, -$pid)) { kill "KILL", -$pid; select(undef, undef, undef, 1) }
+    leave($stopped && !$rc ? 143 : $rc & 127 ? 128 + ($rc & 127) : $rc >> 8);
+  ' "$GLAEDA_FLEET_DIR/host.lock" "$5" /bin/bash -c "$(declare -f say refuse held_refuse data_free_kib ios_runtime_ready ios_runtime_install)
 set -euo pipefail; ios_runtime_install \"\$@\"" ios_runtime "$1" "$2" "$3" "$4"
 }
 # cmux scripts/setup.sh builds GhosttyKit, the artifacts the bootstrap checks for.
