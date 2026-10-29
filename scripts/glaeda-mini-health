@@ -923,8 +923,7 @@ class Mini:
         claude_code) names a version, its manifest the platform binary's sha256; a binary that does not match is
         deleted unrun. `claude install VERSION` then links ~/.local/bin/claude, with no credential in its
         environment (install_env). Logs in nobody. Every request stays on https (a redirect elsewhere is refused),
-        and the download is unlinked on every path (best effort: an unlink that fails is left to the next try,
-        which writes the same name)."""
+        and the download is removed on every path; one that cannot be removed fails the heal."""
         import hashlib  # noqa: PLC0415
         import urllib.error  # noqa: PLC0415
         import urllib.request  # noqa: PLC0415
@@ -947,8 +946,9 @@ class Mini:
             with opener.open(url, timeout=60) as r:
                 return r.read()
         folder = self.home / ".local/share/glaeda/claude-install"
-        binary: Path | None = None
-        try:
+        made: list[Path] = []  # the download, once it exists
+
+        def attempt() -> tuple[bool, str] | tuple[int, str, str]:
             version = fetch(f"{base}/{channel}").decode().strip()
             if not CLAUDE_VERSION.fullmatch(version):
                 return False, f"the {channel} channel named no version"
@@ -960,6 +960,7 @@ class Mini:
                 return False, f"the {version} manifest has no {platform} checksum"
             folder.mkdir(parents=True, exist_ok=True)
             binary = folder / f"claude-{version}-{platform}"
+            made.append(binary)
             digest = hashlib.sha256()
             with opener.open(f"{base}/{version}/{platform}/claude", timeout=CLAUDE_INSTALL_S) as r, \
                     open(binary, "wb") as out:
@@ -972,12 +973,20 @@ class Mini:
             code, out_text = sh([os.fspath(binary), "install", version], timeout=CLAUDE_INSTALL_S,
                                 env=install_env(dict(os.environ)),
                                 cwd=tempfile.gettempdir())
+            return code, out_text, version
+        try:
+            result = attempt()
         except Exception as e:  # noqa: BLE001  any transport, disk or shape failure is a failed heal, never a crash
-            return False, f"Claude Code download failed: {type(e).__name__}: {e}"[:200]
-        finally:
-            if binary is not None:
-                with contextlib.suppress(OSError):
-                    binary.unlink()
+            result = (False, f"Claude Code download failed: {type(e).__name__}: {e}"[:200])
+        for path in made:
+            with contextlib.suppress(FileNotFoundError):
+                try:
+                    path.unlink()
+                except OSError as e:  # a download left behind (a mismatched one above all) is never healed
+                    return False, f"could not remove the download {path.name}: {e}"[:200]
+        if len(result) == 2:
+            return result  # type: ignore[return-value]
+        code, out_text, version = result  # type: ignore[misc]
         if code != 0:
             return False, f"`claude install {version}` exit {code}: {' '.join(out_text.split())[-160:]}"
         if self.claude_bin() is None:
@@ -2825,9 +2834,10 @@ def run(mini: Mini, apply: bool, now: float | None = None, state_path: Path = ST
                 continue
             findings.append(f)
             continue
-        if f["code"] == "claude_route" and tunnel_down:
-            f["note"] = (f"not rerouted while the tunnel is down ({', '.join(sorted(TUNNEL_DOWN))}): the route may "
-                         "answer once Tailscale is back")[:300]
+        if f["code"] in ("claude_route", "claude_missing") and tunnel_down:
+            # claude_missing's heal ends in a route probe: neither installs nor reroutes until the tunnel is back
+            f["note"] = (f"not {'rerouted' if f['code'] == 'claude_route' else 'installed'} while the tunnel is down "
+                         f"({', '.join(sorted(TUNNEL_DOWN))}): the route may answer once Tailscale is back")[:300]
             findings.append(f)
             continue
         heal = HEALS.get(f["code"])

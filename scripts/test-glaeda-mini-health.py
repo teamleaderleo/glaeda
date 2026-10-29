@@ -2979,6 +2979,19 @@ class ClaudeMissing(Base):
         self.assertEqual(len(missing), 1, "a failed route write never reads as healthy")
         self.assertIn("No space left", missing[0]["note"])
 
+    def test_a_tunnel_that_is_down_holds_the_install_too(self) -> None:
+        # The heal ends in a route probe, which hangs through a broken tunnel: no install, no try spent.
+        self.mini.route = "en0"
+        self.mini.opt_in = (None, "no ~/.config/glaeda/tailscale-self-heal.json")
+        for at in (NOW, NOW + 120):
+            missing = [f for f in self.run_once(at=at)["findings"] if f["code"] == "claude_missing"]
+            self.assertEqual(len(missing), 1)
+            self.assertIn("not installed while the tunnel is down", missing[0]["note"])
+        self.assertFalse([d for d in self.mini.did if d.startswith(("install ", "probe ", "route "))])
+        self.mini.route = "utun4"
+        self.assertEqual(self.codes(self.run_once(at=NOW + 240)), [])
+        self.assertEqual(self.mini.did[0], "install claude stable")
+
     def test_the_real_config_turns_the_check_on_for_every_test_mini(self) -> None:
         # FakeMini hides claude_code by default; the shipped config names it, so a real fleet mini is checked.
         self.assertIsInstance(ROUTES.get("claude_code"), dict)
@@ -3147,6 +3160,19 @@ class ClaudeInstallOnDisk(unittest.TestCase):
         with self.assertRaises(urllib.error.URLError):
             handler().redirect_request(req, None, 302, "Found", {}, "http://evil.example/stable")
         self.assertIsNotNone(handler().redirect_request(req, None, 302, "Found", {}, "https://cdn.example/stable"))
+
+    def test_a_download_that_cannot_be_removed_fails_the_heal(self) -> None:
+        import hashlib
+        self.serve("2.1.308", hashlib.sha256(self.body).hexdigest())
+        real = Path.unlink
+        def stuck(path, *a, **k):
+            if path.name.startswith("claude-2.1.308"):
+                raise PermissionError(13, "Operation not permitted")
+            return real(path, *a, **k)
+        with mock.patch.object(Path, "unlink", stuck):
+            ok, what = self.install()
+        self.assertFalse(ok)
+        self.assertIn("could not remove the download claude-2.1.308-darwin-arm64", what)
 
     def test_a_binary_that_does_not_match_is_never_run(self) -> None:
         self.serve("2.1.308", "0" * 64)
