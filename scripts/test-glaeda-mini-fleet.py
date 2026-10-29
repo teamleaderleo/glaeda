@@ -1301,6 +1301,37 @@ class PreflightTests(unittest.TestCase):
     def states(self, text: str, **kwargs: object) -> dict[str, str]:
         return {k: v["state"] for k, v in self.result(text, **kwargs)["checks"].items()}
 
+    def test_a_declared_ios_runtime_missing_is_a_fix_step_never_a_delete(self) -> None:
+        self.manifest["defaults"]["ios_simulator"] = {"runtimes": ["23F77"], "exclusive": True}
+        self.assertEqual(self.result(preflight_text())["checks"]["simulator"]["state"], "todo")
+        extra = "ios_runtime\t26.3|26.3.1|23D8133|com.apple.CoreSimulator.SimRuntime.iOS-26-3\n"
+        result = self.result(preflight_text() + extra)
+        check = result["checks"]["simulator"]
+        self.assertTrue(result["ready"], "a host without the runtime is still a build host")
+        self.assertEqual((check["state"], check["group"], check["detail"]), ("todo", "self", "iOS simulator runtime 23F77 missing"))
+        self.assertEqual(check["action"], {"kind": "ios_runtime", "developer": "/Applications/Xcode.app/Contents/Developer",
+                                           "build": "23F77", "need_gib": mf.IOS_RUNTIME_DOWNLOAD_GIB, "floor_gib": 30})
+        mine, _ = mf.planned_actions(result)
+        self.assertEqual([a["kind"] for a in mine], ["ios_runtime"])
+        self.assertNotIn("delete", mf.describe(mine[0]))
+        present = "ios_runtime\t26.5|26.5|23F77|com.apple.CoreSimulator.SimRuntime.iOS-26-5\n"
+        self.assertEqual(self.result(preflight_text() + extra + present)["checks"]["simulator"]["state"], "ok")
+        # An unavailable copy of the build is still missing.
+        unavailable = present.rstrip("\n") + "|unavailable\n"
+        self.assertEqual(self.result(preflight_text() + unavailable)["checks"]["simulator"]["state"], "todo")
+        del self.manifest["defaults"]["ios_simulator"]
+        self.assertEqual(self.result(preflight_text())["checks"]["simulator"]["state"], "info")
+
+    def test_an_ios_runtime_download_waits_for_its_disk(self) -> None:
+        self.manifest["defaults"]["ios_simulator"] = {"runtimes": ["23F77"]}
+        floor = self.manifest["defaults"]["disk"]["min_free_gib"] if "disk" in self.manifest["defaults"] else 30
+        short = preflight_text().replace("disk\t/System/Volumes/Data|460|220",
+                                         f"disk\t/System/Volumes/Data|460|{floor + mf.IOS_RUNTIME_DOWNLOAD_GIB - 1}")
+        check = self.result(short)["checks"]["simulator"]
+        self.assertEqual((check["state"], check["group"]), ("todo", "person"))
+        self.assertNotIn("action", check)
+        self.assertIn(f"the download needs {floor + mf.IOS_RUNTIME_DOWNLOAD_GIB}", check["detail"])
+
     def test_ready_host_passes_every_check(self) -> None:
         result = self.result(preflight_text())
         self.assertTrue(result["ready"], result)
@@ -2483,10 +2514,14 @@ class FixLibraryTests(unittest.TestCase):
         self.assertEqual([line for line in body if "sudo -n launchctl" in line],
                          ['    /Library/LaunchDaemons/*) sudo -n launchctl "$@" ;;'])
         # The only removals are the step lock's own pid file and directory, and the runner held marks it writes.
-        self.assertEqual([line.strip() for line in body if "rm " in line and "rm -r" not in line],
+        # (an rm command, not the "rm " that ends -downloadPlatform)
+        self.assertEqual([line.strip() for line in body if re.search(r"(^|[\s;('])rm ", line) and "rm -r" not in line],
                          ["""trap 'rm -f "$HOME/.local/state/glaeda/mini-fleet/step.lock/pid"; rmdir "$HOME/.local/state/glaeda/mini-fleet/step.lock" 2>/dev/null || true' EXIT""",
                           'rm -f "$(held_dir)/$(basename "$dir")"',
                           'rm -f "$(held_dir)/$(basename "$dir")"'])
+        # ...and perl's unlink of the drain waiter entry ios_runtime itself published.
+        self.assertEqual([line.strip() for line in body if "unlink" in line], ['unlink $waiter if $waiter ne "";'] * 2)
+        self.assertFalse([line for line in body if "simctl runtime delete" in line or "simctl delete" in line])
 
     def test_glaeda_setup_preserves_headless_mode(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -2541,6 +2576,92 @@ class FixLibraryTests(unittest.TestCase):
             self.assertEqual(os.readlink(home / ".local/bin/python3"), f"{dist}/python3")
             # Idempotent: its own link is replaced, not refused.
             self.assertEqual(self.call(home, "python_link", "~/.local/python-3.14", "3.13").returncode, 0)
+
+    def ios_sandbox(self, home: Path, available: bool = False, booted: bool = False, free_gib: int = 220,
+                    yields: str = "23F77") -> Path:
+        """Stand-ins for xcrun, xcodebuild, pgrep and df on the workload PATH; the download records its argv."""
+        bin_dir = home / "bin"
+        bin_dir.mkdir()
+        state = home / "runtime"
+        if available:
+            state.write_text(yields)
+        scripts = {
+            "xcrun": f"""#!/bin/sh
+[ "$1 $2 $3" = "simctl list runtimes" ] || exit 2
+echo "== Runtimes =="
+[ -f {state} ] && echo "iOS 26.5 (26.5 - $(cat {state})) - com.apple.CoreSimulator.SimRuntime.iOS-26-5"
+exit 0
+""",
+            "xcodebuild": f"""#!/bin/sh
+echo "$DEVELOPER_DIR $*" >> {home}/download-argv
+ls {home}/fleet/host.lock.waiters >> {home}/waiters-seen
+echo {yields} > {state}
+""",
+            "pgrep": f"#!/bin/sh\n{'exit 0' if booted else 'exit 1'}\n",
+            "df": f"""#!/bin/sh
+echo "Filesystem 1024-blocks Used Available Capacity Mounted on"
+echo "/dev/disk3s1 482344960 1000 $(( {free_gib} * 1048576 - $(cat {home}/download-argv 2>/dev/null | wc -l) * 8388608 )) 1% $2"
+""",
+        }
+        for tool, text in scripts.items():
+            (bin_dir / tool).write_text(text)
+            (bin_dir / tool).chmod(0o755)
+        (home / "fleet/host.lock.waiters").mkdir(parents=True)
+        (home / "fleet/host.lock").write_text("")
+        return bin_dir
+
+    @unittest.skipUnless(shutil.which("perl"), "needs perl")
+    def test_ios_runtime_downloads_once_and_never_beside_a_build_or_a_simulator(self) -> None:
+        dev = "/Applications/Xcode_26.6.app/Contents/Developer"
+        args = (dev, "23F77", "20", "30", "3")
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            bin_dir = self.ios_sandbox(home)
+            with mock.patch.object(mf.bootstrap, "CMUX_WORKLOAD_TOOL_PATH", f"{bin_dir}:/usr/bin:/bin"):
+                import fcntl
+                with open(home / "fleet/host.lock") as held:  # a build holds the fleet host lock
+                    fcntl.flock(held, fcntl.LOCK_EX)
+                    refused = self.call(home, "ios_runtime", *args)
+                self.assertEqual(refused.returncode, mf.HELD_EXIT, refused.stderr)
+                with open(home / "fleet/host.lock") as step:  # a ci-step holds it shared: still refused
+                    fcntl.flock(step, fcntl.LOCK_SH)
+                    refused = self.call(home, "ios_runtime", *args)
+                self.assertEqual(refused.returncode, mf.HELD_EXIT, refused.stderr)
+                self.assertFalse((home / "download-argv").exists())
+                self.assertEqual(list((home / "fleet/host.lock.waiters").iterdir()), [])  # a refusal leaves no waiter
+                # A step that ends within the wait is drained: the download runs once it has the lock alone.
+                step = subprocess.Popen([sys.executable, "-c", "import fcntl, sys, time; f = open(sys.argv[1]); "
+                                         "fcntl.flock(f, fcntl.LOCK_SH); print('held', flush=True); time.sleep(1.5)",
+                                         os.fspath(home / "fleet/host.lock")], stdout=subprocess.PIPE, text=True)
+                self.assertEqual(step.stdout.readline(), "held\n")
+                done = self.call(home, "ios_runtime", *args)
+                step.wait()
+                step.stdout.close()
+                self.assertEqual(done.returncode, 0, done.stderr)
+                self.assertIn("waiting for the jobs holding", done.stdout)
+                self.assertEqual((home / "download-argv").read_text(), f"{dev} -downloadPlatform iOS\n")
+                self.assertIn("iOS simulator runtime 23F77 available; used 8589934592 bytes", done.stdout)
+                # The worker saw a drain waiter during the download, and it is gone after.
+                self.assertRegex((home / "waiters-seen").read_text(), r"\A[0-9]+-ios-runtime\n\Z")
+                self.assertEqual(list((home / "fleet/host.lock.waiters").iterdir()), [])
+                again = self.call(home, "ios_runtime", *args)
+                self.assertEqual(again.returncode, 0, again.stderr)
+                self.assertIn("unchanged", again.stdout)
+                self.assertEqual(len((home / "download-argv").read_text().splitlines()), 1)
+
+    @unittest.skipUnless(shutil.which("perl"), "needs perl")
+    def test_ios_runtime_refuses_a_booted_simulator_short_disk_and_a_wrong_build(self) -> None:
+        dev = "/Applications/Xcode_26.6.app/Contents/Developer"
+        for kwargs, code, words in (({"booted": True}, mf.HELD_EXIT, "a simulator is running"),
+                                    ({"free_gib": 49}, 3, "49 GiB free on the Data volume; the download needs 50"),
+                                    ({"yields": "23F5"}, 3, "runtime 23F77 is not available")):
+            with self.subTest(kwargs), tempfile.TemporaryDirectory() as tmp:
+                home = Path(tmp)
+                bin_dir = self.ios_sandbox(home, **kwargs)
+                with mock.patch.object(mf.bootstrap, "CMUX_WORKLOAD_TOOL_PATH", f"{bin_dir}:/usr/bin:/bin"):
+                    result = self.call(home, "ios_runtime", dev, "23F77", "20", "30", "3")
+                self.assertEqual(result.returncode, code, result.stderr)
+                self.assertIn(words, result.stderr)
 
     def test_a_running_step_holds_the_host_lock(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

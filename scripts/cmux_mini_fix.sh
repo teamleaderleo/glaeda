@@ -402,6 +402,58 @@ metal() {  # DEVELOPER_DIR
   DEVELOPER_DIR="$1" xcrun metal --version | head -1
 }
 
+ios_runtime_ready() {  # DEVELOPER_DIR BUILD: the runtime is listed and available (the probe's own reading)
+  DEVELOPER_DIR="$1" xcrun simctl list runtimes </dev/null 2>/dev/null |
+    grep -E "^iOS [0-9.]+ \([0-9.]+ - $2\) - com\.apple\.[A-Za-z0-9.-]+ *\$" >/dev/null  # no -q: pipefail
+}
+data_free_kib() {
+  df -k /System/Volumes/Data 2>/dev/null | awk 'NR == 2 { print $4; found = 1 } END { exit !found }' ||
+    df -k / | awk 'NR == 2 { print $4 }'
+}
+ios_runtime_install() {  # DEVELOPER_DIR BUILD NEED_GIB FLOOR_GIB: the download itself, with the host already drained
+  local before after
+  # A booted simulator runs launchd_sim; adding a runtime under it can restart CoreSimulatorService.
+  if pgrep -x launchd_sim >/dev/null 2>&1; then held_refuse "a simulator is running"; fi
+  before=$(data_free_kib)
+  if [ "$before" -lt $((($3 + $4) * 1048576)) ]; then
+    refuse "$((before / 1048576)) GiB free on the Data volume; the download needs $(($3 + $4)) ($3 above the $4 GiB floor)"
+  fi
+  DEVELOPER_DIR="$1" xcodebuild -downloadPlatform iOS
+  after=$(data_free_kib)
+  ios_runtime_ready "$1" "$2" ||
+    refuse "the download finished but runtime $2 is not available; this Xcode yields: $(DEVELOPER_DIR="$1" xcrun simctl list runtimes </dev/null 2>/dev/null | grep '^iOS' | tr '\n' ';')"
+  say "iOS simulator runtime $2 available; used $(((before - after) * 1024)) bytes, $((after / 1048576)) GiB free"
+}
+ios_runtime() {  # DEVELOPER_DIR BUILD NEED_GIB FLOOR_GIB WAIT_SECONDS: add the pinned Xcode's iOS runtime, never remove one
+  local lock="$GLAEDA_FLEET_DIR/host.lock"
+  if ios_runtime_ready "$1" "$2"; then say "unchanged: iOS simulator runtime $2 available"; return; fi
+  if pgrep -x launchd_sim >/dev/null 2>&1; then held_refuse "a simulator is running"; fi
+  [ -e "$lock" ] || { ios_runtime_install "$1" "$2" "$3" "$4"; return; }
+  # The fleet host lock, held exclusively for the whole download, so no build or ci-step runs beside it (each holds it,
+  # steps shared). First a host.lock.waiters entry <pid>-ios-runtime, live while perl's pid is: the build worker then
+  # leases no new job or step here, and what runs finishes. perl waits up to WAIT_SECONDS for the lock, then runs the
+  # download as its child (the lock fd is close-on-exec, so nothing the download starts keeps it) and removes the entry.
+  perl -MFcntl=:flock -e '
+    my ($lock, $wait) = splice(@ARGV, 0, 2);
+    open(my $fh, "<", $lock) or do { print STDERR "glaeda-mini-fleet: held: cannot open $lock, skipped\n"; exit 20 };
+    my $waiter = -d "$lock.waiters" ? "$lock.waiters/$$-ios-runtime" : "";
+    if ($waiter ne "") { my $w; if (open($w, ">", $waiter)) { close($w) } else { $waiter = "" } }
+    my ($deadline, $said) = (time() + $wait, 0);
+    until (flock($fh, LOCK_EX | LOCK_NB)) {
+      if (time() >= $deadline) {
+        unlink $waiter if $waiter ne "";
+        print STDERR "glaeda-mini-fleet: held: $lock still held after ${wait}s, skipped\n";
+        exit 20;
+      }
+      print "glaeda-mini-fleet: waiting for the jobs holding $lock to finish (no new ones start)\n" unless $said++;
+      sleep 2;
+    }
+    my $rc = system(@ARGV);
+    unlink $waiter if $waiter ne "";
+    exit($rc == -1 ? 127 : $rc & 127 ? 128 + ($rc & 127) : $rc >> 8);
+  ' "$lock" "$5" /bin/bash -c "$(declare -f say refuse held_refuse data_free_kib ios_runtime_ready ios_runtime_install)
+set -euo pipefail; ios_runtime_install \"\$@\"" ios_runtime "$1" "$2" "$3" "$4"
+}
 # cmux scripts/setup.sh builds GhosttyKit, the artifacts the bootstrap checks for.
 cmux_setup() {  # ROOT DEVELOPER_DIR
   cd "$(home "$1")" && DEVELOPER_DIR="$2" ./scripts/setup.sh
