@@ -9583,8 +9583,11 @@ class SupersededChromiumTest(unittest.TestCase):
                     "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
         self.refs = mock.patch.object(gd, "home_scratch_reference_files", return_value=[])
         self.refs.start()
+        self.journal = mock.patch.object(gd, "CHROMIUM_ASIDES", self.home / ".local/state/glaeda/disk/asides.jsonl")
+        self.journal.start()
 
     def tearDown(self) -> None:
+        self.journal.stop()
         self.refs.stop()
         gd.HOME, gd.FLEET_ROOT, gd.DARWIN, gd.ROLE = self.saved
         gd._DISCOVERED.clear()
@@ -9658,6 +9661,8 @@ class SupersededChromiumTest(unittest.TestCase):
         receipt = self.apply(fam, item)
         self.assertIn('"reclaimed"', receipt)
         self.assertFalse(old.exists())
+        self.assertIn(os.fspath(old), gd.CHROMIUM_ASIDES.read_text())  # recorded before its rename
+        self.assertEqual(gd.chromium_asides(), [])  # and dropped once the delete finished
         archive = self.home / "archive/glaeda-disk"
         self.assertEqual(len(list(archive.glob("*.bundle"))), 1)
         self.assertEqual(len(list(archive.glob("*.tar.gz"))), 1)
@@ -9743,6 +9748,22 @@ class SupersededChromiumTest(unittest.TestCase):
         fams = gd.interrupted_families([self.family()])
         self.assertEqual(sorted(p for f in fams for p in gd.candidates(f)), sorted([aside, lone]))
         self.assertNotIn(os.path.relpath(aside, self.home), self.survey(self.family()))
+
+    def test_a_chromium_delete_records_its_aside_and_an_interrupted_one_is_resumed_from_the_record(self) -> None:
+        journal = gd.CHROMIUM_ASIDES
+        old = self.tree("deep/a/b/chromium-old", hours=60)  # below the walk's depth: only the record finds it
+        self.tree("deep/a/b/chromium-new", hours=13)
+        fam = self.family()
+        gd.record_chromium_aside(old)
+        aside = old.with_name(f"{gd.DELETING_PREFIX}{old.name}-{os.getpid()}")
+        os.rename(old, aside)  # the delete was interrupted right after its rename
+        self.assertEqual(gd.chromium_asides(), [aside])
+        with mock.patch.object(gd, "chromium_roots", return_value=[]):
+            fams = gd.interrupted_families([fam])
+        self.assertIn(aside, [p for f in fams for p in gd.candidates(f)])
+        shutil.rmtree(aside)
+        self.assertEqual(gd.chromium_asides(), [])
+        self.assertEqual(journal.read_text(), "")
 
     def test_a_repository_with_linked_worktrees_keeps_the_tree(self) -> None:
         old = self.tree("chromium-old", hours=60)

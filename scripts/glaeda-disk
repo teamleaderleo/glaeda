@@ -3878,6 +3878,44 @@ def chromium_group(tree: Path) -> str | None:
     return " ".join(urls + branches)
 
 
+# Every aside a Chromium delete is about to make, written before remove()'s rename (a failed write renames nothing):
+# interrupted_families resumes each one from here, whatever the discovery walk finds, and drops entries that are gone.
+CHROMIUM_ASIDES = HOME / ".local/state/glaeda/disk/chromium-asides.jsonl"
+
+
+def record_chromium_aside(tree: Path) -> None:
+    """Note the aside remove() is about to rename tree to; raises OSError when it cannot be noted."""
+    CHROMIUM_ASIDES.parent.mkdir(parents=True, exist_ok=True)
+    aside = tree.with_name(f"{DELETING_PREFIX}{tree.name}-{os.getpid()}")
+    with CHROMIUM_ASIDES.open("a") as f:
+        f.write(json.dumps({"aside": os.fspath(aside), "tree": os.fspath(tree), "at": int(time.time())}) + "\n")
+        f.flush()
+        os.fsync(f.fileno())
+
+
+def chromium_asides() -> list[Path]:
+    """The recorded asides still on disk; the journal is rewritten without the ones that are gone."""
+    try:
+        lines = CHROMIUM_ASIDES.read_text().splitlines()
+    except FileNotFoundError:
+        return []
+    except OSError:
+        return []
+    keep, out = [], []
+    for line in lines:
+        with contextlib.suppress(ValueError, TypeError, KeyError):
+            aside = Path(json.loads(line)["aside"])
+            if os.path.lexists(aside) and DELETING_RE.fullmatch(aside.name):
+                keep.append(line)
+                out.append(aside)
+    if len(keep) != len(lines):
+        with contextlib.suppress(OSError):
+            tmp = CHROMIUM_ASIDES.with_name(CHROMIUM_ASIDES.name + f".{os.getpid()}.tmp")
+            tmp.write_text("".join(ln + "\n" for ln in keep))
+            os.replace(tmp, CHROMIUM_ASIDES)
+    return out
+
+
 _CHROMIUM_GROUPS: dict[str, dict[str, str]] = {}  # root -> {tree: why it stays by role, "" when superseded}
 
 
@@ -5314,8 +5352,9 @@ def interrupted_families(fams: list[Family]) -> list[Family]:
             dirs.update(cmux_next_ci_host_parents(fam.root))
         if fam.discover or fam.checkout_builds:
             dirs.update(p.parent for p in candidates(fam))
-        elif fam.chromium_trees:  # an aside tree is still a gclient root: its parent is where it sat
+        elif fam.chromium_trees:  # an aside is resumed from the journal, and from the walk for one made before it
             dirs.update(p.parent for p in chromium_roots(fam.root))
+            dirs.update(p.parent for p in chromium_asides())
         else:  # a match family's candidates sit within depth levels too: an aside one left no candidate behind
             level = [fam.root]
             for _ in range(fam.depth - 1):
@@ -9699,6 +9738,8 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
                     # the moment the toolchain is renamed away, so an interrupted delete cannot leave it behind
                     stale_hash = (p.parent.parent / "update-hashes" / p.name
                                   if fresh_layout == "rustup-toolchain" else None)
+                    if fam.chromium_trees:
+                        record_chromium_aside(p)  # before the rename: an interrupted delete is resumed from it
                     remove(p, after_rename=cmux_next_ci_slot_recheck(fam, p, floor=cmux_next_ci_floor_slot(fam, p))
                            if whole_state
                            else cmux_next_ci_child_recheck(fam, p) if fam.id == CMUX_NEXT_CI_FAMILY
