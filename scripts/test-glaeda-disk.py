@@ -9565,6 +9565,183 @@ _real_strict_entries = gd._strict_entries
 _real_home_scratch_reference_files = gd.home_scratch_reference_files
 
 
+class SupersededChromiumTest(unittest.TestCase):
+    """A Chromium or CEF tree a newer tree of its group replaced goes after 12 h idle, src's unpushed work bundled
+    first; the newest tree per group, the browser worker's warm tree, a dirty or moved DEPS checkout, a recipe sync
+    lock and .build.active keep it (Leo, 2026-10-27: "they're touchable now. we all own these")."""
+
+    URL = "https://chromium.googlesource.com/chromium/src.git"
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.home = Path(os.path.realpath(self.tmp.name))
+        self.saved = (gd.HOME, gd.FLEET_ROOT, gd.DARWIN, gd.ROLE)
+        gd.HOME, gd.FLEET_ROOT, gd.DARWIN, gd.ROLE = self.home, self.home / ".shared-fleet", True, "fleet-mini"
+        gd._DISCOVERED.clear()
+        gd._CHROMIUM_GROUPS.clear()
+        self.env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+                    "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
+        self.refs = mock.patch.object(gd, "home_scratch_reference_files", return_value=[])
+        self.refs.start()
+
+    def tearDown(self) -> None:
+        self.refs.stop()
+        gd.HOME, gd.FLEET_ROOT, gd.DARWIN, gd.ROLE = self.saved
+        gd._DISCOVERED.clear()
+        gd._CHROMIUM_GROUPS.clear()
+        self.tmp.cleanup()
+
+    def git(self, repo: Path, *args: str) -> str:
+        return subprocess.run(["git", "-C", str(repo), *args], check=True, env=self.env, capture_output=True,
+                              text=True).stdout.strip()
+
+    def repo(self, path: Path, name: str = "f") -> str:
+        subprocess.run(["git", "init", "-q", str(path)], check=True, env=self.env)
+        (path / name).write_text(name)
+        self.git(path, "add", name)
+        self.git(path, "commit", "-qm", "c")
+        return self.git(path, "rev-parse", "HEAD")
+
+    def age(self, tree: Path, hours: float) -> None:
+        t = time.time() - hours * 3600
+        for dirpath, dirnames, filenames in os.walk(tree):
+            for n in dirnames + filenames:
+                os.utime(os.path.join(dirpath, n), (t, t), follow_symlinks=False)
+        os.utime(tree, (t, t))
+
+    def tree(self, rel: str, hours: float = 30, url: str = URL) -> Path:
+        tree = self.home / rel
+        tree.mkdir(parents=True)
+        (tree / ".gclient").write_text(f'solutions = [{{"name": "src", "url": "{url}", "custom_deps": {{}}}}]\n')
+        self.repo(tree / "src")
+        (tree / "src/.gitignore").write_text("third_party/\nout/\n")
+        self.git(tree / "src", "add", ".gitignore")
+        self.git(tree / "src", "commit", "-qm", "ignore deps")
+        dep = tree / "src/third_party/dep"
+        dep.parent.mkdir(parents=True)
+        pin = self.repo(dep, "d")
+        (tree / ".gclient_entries").write_text(
+            "entries = {\n  'src': '%s',\n  'src/third_party/dep': 'https://example.invalid/dep.git@%s',\n}\n"
+            % (url, pin))
+        (tree / "src/out/Release").mkdir(parents=True)
+        (tree / "src/out/Release/obj.o").write_bytes(b"o" * 4096)
+        self.age(tree, hours)
+        return tree
+
+    def family(self) -> gd.Family:
+        with mock.patch.object(gd, "enrolled_runners", return_value=[self.home / "actions-runner-glaeda"]):
+            return next(f for f in gd.default_families() if f.id == gd.CHROMIUM_FAMILY)
+
+    def survey(self, fam: gd.Family, opened: list[str] | None = None) -> dict[str, gd.Item]:
+        with mock.patch.object(gd, "process_evidence", return_value=(opened or [], "")):
+            return {os.path.relpath(i.path, self.home): i for i in gd.survey([fam], 24, 0)}
+
+    def apply(self, fam: gd.Family, item: gd.Item) -> str:
+        receipt = self.home / ".receipt.jsonl"
+        with contextlib.redirect_stdout(io.StringIO()), mock.patch.object(gd, "process_evidence", return_value=([], "")):
+            gd.apply([item], {fam.id: fam}, receipt, None, 24)
+        return receipt.read_text() if receipt.exists() else ""
+
+    def test_the_newest_tree_of_a_group_stays_and_an_older_idle_one_goes_after_its_bundle(self) -> None:
+        old = self.tree("cef-old/chromium_git/chromium", hours=40)
+        (old / "src/local.txt").write_text("unpushed")
+        self.git(old / "src", "add", "local.txt")
+        self.git(old / "src", "commit", "-qm", "local only")
+        (old / "src/notes.md").write_text("untracked work")
+        self.age(old, 40)
+        self.tree("cef-new/chromium_git/chromium", hours=14)
+        fam = self.family()
+        items = self.survey(fam)
+        self.assertEqual(items["cef-new/chromium_git/chromium"].verdict, "kept")
+        item = items["cef-old/chromium_git/chromium"]
+        self.assertEqual(item.verdict, "reclaimable", item.reasons)
+        receipt = self.apply(fam, item)
+        self.assertIn('"reclaimed"', receipt)
+        self.assertFalse(old.exists())
+        archive = self.home / "archive/glaeda-disk"
+        self.assertEqual(len(list(archive.glob("*.bundle"))), 1)
+        self.assertEqual(len(list(archive.glob("*.tar.gz"))), 1)
+
+    def test_a_tree_alone_in_its_group_or_younger_than_12_h_stays(self) -> None:
+        self.tree("chromium-a", hours=50)
+        self.tree("other/chromium", hours=50, url="https://example.invalid/fork/src.git")
+        self.tree("recent-1", hours=6, url="https://example.invalid/r.git")
+        self.tree("recent-2", hours=5, url="https://example.invalid/r.git")
+        items = self.survey(self.family())
+        self.assertEqual(items["chromium-a"].verdict, "kept")
+        self.assertEqual(items["other/chromium"].verdict, "kept")
+        self.assertEqual(items["recent-1"].verdict, "recent")
+
+    def test_the_browser_workers_warm_tree_is_never_an_item_and_counts_as_its_groups_newest(self) -> None:
+        warm = self.tree("cmux-browser-fleet/build/chromium", hours=20)
+        old = self.tree("chromium-old", hours=60)
+        items = self.survey(self.family())
+        self.assertNotIn("cmux-browser-fleet/build/chromium", items)
+        self.assertEqual(items["chromium-old"].verdict, "reclaimable", items["chromium-old"].reasons)
+        self.age(old, 10)  # used after the warm tree: it is the group's newest now, and the warm tree still stays
+        self.age(warm, 30)
+        gd._CHROMIUM_GROUPS.clear()
+        items = self.survey(self.family())
+        self.assertEqual(items["chromium-old"].verdict, "kept")
+
+    def test_a_dirty_or_moved_deps_checkout_keeps_the_tree(self) -> None:
+        dirty = self.tree("chromium-dirty", hours=60)
+        (dirty / "src/third_party/dep/d").write_text("edited")
+        moved = self.tree("chromium-moved", hours=60)
+        dep = moved / "src/third_party/dep"
+        (dep / "e").write_text("e")
+        self.git(dep, "add", "e")
+        self.git(dep, "commit", "-qm", "beyond the pin")
+        unpinned = self.tree("chromium-unpinned", hours=60)
+        self.repo(unpinned / "src/third_party/stray")
+        self.age(dirty, 60), self.age(moved, 60), self.age(unpinned, 60)
+        self.tree("chromium-new", hours=13)
+        fam = self.family()
+        items = self.survey(fam)
+        receipt = self.apply(fam, items["chromium-moved"])
+        self.assertTrue(moved.exists())
+        self.assertIn("beyond its pinned revision", receipt)
+        receipt = self.apply(fam, items["chromium-unpinned"])
+        self.assertTrue(unpinned.exists())
+        self.assertIn("did not pin", receipt)
+        receipt = self.apply(fam, items["chromium-dirty"])  # its edit is archived as a patch, then the tree goes
+        self.assertFalse(dirty.exists(), receipt)
+        self.assertEqual(len(list((self.home / "archive/glaeda-disk").glob("*.patch"))), 1)
+
+    def test_a_held_sync_lock_build_marker_or_process_keeps_it(self) -> None:
+        a = self.tree("cache/chromium/aaaa", hours=60)
+        b = self.tree("cache/chromium/bbbb", hours=60)
+        c = self.tree("cache/chromium/cccc", hours=60)
+        self.tree("cache/chromium/dddd", hours=13)
+        (b / ".build.active").write_text("")
+        self.age(b, 60)
+        lock = a.parent / "aaaa.sync.lock"
+        lock.write_text("")
+        fam = self.family()
+        with lock.open("a") as held:  # flock is per open file: the recipe's hold blocks a second open in-process
+            fcntl.flock(held, fcntl.LOCK_EX)
+            items = self.survey(fam, opened=[os.fspath(c)])
+        gd._CHROMIUM_GROUPS.clear()
+        self.assertEqual(self.survey(fam)["cache/chromium/aaaa"].verdict, "reclaimable")  # released: it goes
+        self.assertEqual(items["cache/chromium/aaaa"].verdict, "kept")
+        self.assertIn("sync.lock", " ".join(items["cache/chromium/aaaa"].reasons))
+        self.assertEqual(items["cache/chromium/bbbb"].verdict, "kept")
+        self.assertEqual(items["cache/chromium/cccc"].verdict, "in-use")
+
+    def test_only_this_family_lifts_the_name_veto(self) -> None:
+        tree = self.tree("chromium", hours=60)
+        self.assertTrue(gd.never_delete(tree))
+        self.assertFalse(gd.never_delete(tree, names=False))
+        self.assertTrue(gd.never_delete(self.home / "cmux-browser-fleet/build/chromium", names=False))
+        self.assertTrue(gd.NEVER_DELETE_NAMES.search("depot_tools"))
+
+    def test_an_interrupted_delete_of_a_chromium_tree_is_finished(self) -> None:
+        self.tree("chromium-new", hours=13)
+        aside = self.tree(f"{gd.DELETING_PREFIX}chromium-old-999999", hours=60)
+        fams = gd.interrupted_families([self.family()])
+        self.assertEqual([gd.candidates(f) for f in fams], [[aside]])
+
+
 class NightlyNextFallbackTest(unittest.TestCase):
     """~/Library/Caches/cmux-nightly-next: the dedicated builder's tree is kept by role, a pool runner's goes once idle
     DEFAULT_AGE_HOURS, and nothing changes until disk-policy names the routing label."""
