@@ -2921,7 +2921,7 @@ echo 23F77 > {home}/runtime
                 fcntl.flock(fd, fcntl.LOCK_EX)
                 locked = self.call(home, "host_check")
                 self.assertEqual(locked.returncode, 20)
-                self.assertIn("held by another build (fleet host lock", locked.stdout)
+                self.assertIn(mf.BUSY_HOST_LOCK, locked.stdout)  # the reason fix reads as "busy, no reservation"
                 # A drain honors only reservations: it waits out the job that holds the lock.
                 gate = subprocess.run(["bash", "-c", 'say() { :; }; eval "$(sed -n "/^# >>> host gate/,/^# <<< host gate/p" '
                                        f'{mf.FIX_LIBRARY})"; host_held reservation || echo free'],
