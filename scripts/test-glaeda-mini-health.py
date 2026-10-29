@@ -2970,11 +2970,29 @@ class ClaudeMissing(Base):
         self.mini.answers = {SR2: True, POOL: True}
         self.assertEqual(self.codes(self.run_once(at=NOW + health.HEAL_EVERY_S)), [])
 
+    def test_a_route_write_that_fails_after_the_install_keeps_the_finding(self) -> None:
+        def broken(url, token):
+            raise OSError(28, "No space left on device")
+        self.mini.set_claude_route = broken  # type: ignore[method-assign]
+        report = self.run_once()
+        missing = [f for f in report["findings"] if f["code"] == "claude_missing"]
+        self.assertEqual(len(missing), 1, "a failed route write never reads as healthy")
+        self.assertIn("No space left", missing[0]["note"])
+
     def test_the_real_config_turns_the_check_on_for_every_test_mini(self) -> None:
         # FakeMini hides claude_code by default; the shipped config names it, so a real fleet mini is checked.
         self.assertIsInstance(ROUTES.get("claude_code"), dict)
         self.mini.claude_source = False
         self.assertEqual(self.codes(self.run_once(apply=False)), [])
+
+    def test_with_the_shipped_config_a_routed_mini_reports_nothing_new(self) -> None:
+        # The other tests' minis run with claude_code hidden; with it on, a mini that has a routed Claude is
+        # exactly as healthy as before (only a mini without Claude gains a finding).
+        self.mini.claude = "/Users/cmux/.local/bin/claude"
+        self.mini.claude_env = {"ANTHROPIC_BASE_URL": SR2, "ANTHROPIC_AUTH_TOKEN": "subrouter"}
+        report = self.run_once()
+        self.assertEqual(report["findings"], [])
+        self.assertEqual(self.mini.did, ["probe " + SR2])
 
     def test_a_failed_install_stays_a_finding_and_is_retried_at_the_heal_pace(self) -> None:
         self.mini.install_ok = False
@@ -3063,7 +3081,9 @@ class ClaudeInstallOnDisk(unittest.TestCase):
                 mock.patch.object(health, "sh", side_effect=sh), \
                 mock.patch.object(health.sys, "platform", "darwin"), \
                 mock.patch.object(health.os, "uname", return_value=mock.Mock(machine="arm64")), \
-                mock.patch.dict(os.environ, {"CLAUDE_CODE_OAUTH_TOKEN": "personal"}):
+                mock.patch.dict(os.environ, {"CLAUDE_CODE_OAUTH_TOKEN": "personal", "ANTHROPIC_AUTH_TOKEN": "tok",
+                                             "ANTHROPIC_API_KEY": "key", "ANTHROPIC_BASE_URL": "http://x",
+                                             "PATH": "/usr/bin"}):
             return self.mini.install_claude({"downloads": "https://downloads.example/r", "channel": "stable"})
 
     def leftovers(self) -> list[Path]:
@@ -3078,7 +3098,14 @@ class ClaudeInstallOnDisk(unittest.TestCase):
         self.assertIn("2.1.308", what)
         self.assertEqual(len(self.ran), 1)
         self.assertEqual(self.ran[0][1:], ["install", "2.1.308"])
-        self.assertNotIn("CLAUDE_CODE_OAUTH_TOKEN", self.envs[0], "a personal login never reaches the install")
+        for key in ("CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL"):
+            self.assertNotIn(key, self.envs[0], "no credential or route reaches the downloaded binary")
+        self.assertEqual(self.envs[0].get("PATH"), "/usr/bin")
+
+    def test_a_prerelease_version_is_accepted_and_odd_ones_refused(self) -> None:
+        self.assertTrue(health.CLAUDE_VERSION.fullmatch("2.2.0-beta.1"))
+        for odd in ("2.2", "2.2.0;rm", "2.2.0-", "2.2.0-a/b", "<html>"):
+            self.assertIsNone(health.CLAUDE_VERSION.fullmatch(odd), odd)
         self.assertEqual(self.leftovers(), [], "the download is gone")
 
     def test_a_download_cut_short_leaves_nothing_and_runs_nothing(self) -> None:
