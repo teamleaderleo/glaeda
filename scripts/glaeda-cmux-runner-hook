@@ -1449,6 +1449,15 @@ NIGHTLY_REFS = ("refs/heads/nightly-next", "refs/heads/main")
 NIGHTLY_EVENTS = ("push", "schedule", "workflow_dispatch")
 NIGHTLY_WORKFLOW = "manaflow-ai/cmux/.github/workflows/nightly.yml"
 DEV_DAILY_WORKFLOW_PATH = f"manaflow-ai/cmux/.github/workflows/{DEV_DAILY_WORKFLOW}"
+# The nightly verify jobs that run after a nightly-next build is published: the post-publication canary and the launch
+# smoke, scheduled (or dispatched) from main's own copy of their workflows. They verify the nightly feed, so they rank
+# with nightly jobs and the nightly slot admits them (Leo, 2026-10-27: "a waiting nightly, promote or nightly
+# sign/verify job is admitted on a mini ahead of every PR, DEV and side job"). On 2026-10-29 the canary of build
+# 4095550219401 (cmux run 40959228667) sat queued on the side label from 21:46Z behind 43 PR jobs with no side runner
+# running, while the nightly slots listened idle.
+NIGHTLY_VERIFY_WORKFLOWS = ("nightly-next-canary.yml", "nightly-next-launch-smoke.yml")
+NIGHTLY_VERIFY_REF = "refs/heads/main"
+NIGHTLY_VERIFY_EVENTS = ("schedule", "workflow_dispatch")
 PROMOTE_COMPILE = "release-compile"  # cmux-next.yml's, on a feat-cmux-next push: nightly-next's promote gate
 TIER_NIGHTLY, TIER_DEV, TIER_STACK = "nightly", "dev", "stack"
 FEED_JUMP_S = 20 * 60.0
@@ -1486,7 +1495,7 @@ def nightly_slot_refusal(tier: str) -> str | None:
     if tier == TIER_NIGHTLY:
         return None
     return ("the nightly slot admits only nightly jobs (nightly.yml on nightly-next or main, main's DEV daily publish, "
-            "and the Release compile that gates nightly-next's promotion)")
+            "main's nightly-next canary and launch smoke, and the Release compile that gates nightly-next's promotion)")
 
 
 def job_tier(event_name: str | None, ref: str | None, repository: str | None, event: Any,
@@ -1503,6 +1512,10 @@ def job_tier(event_name: str | None, ref: str | None, repository: str | None, ev
         return ""
     if workflow_ref == f"{DEV_DAILY_WORKFLOW_PATH}@{DEV_DAILY_REF}":
         return TIER_NIGHTLY if dev_daily_feed(event_name, ref) else ""
+    if any(workflow_ref == f"manaflow-ai/cmux/.github/workflows/{name}@{NIGHTLY_VERIFY_REF}"
+           for name in NIGHTLY_VERIFY_WORKFLOWS):
+        # main's merged copy, on main's own ref, from a schedule or a dispatch: never a pull request's copy
+        return TIER_NIGHTLY if ref == NIGHTLY_VERIFY_REF and event_name in NIGHTLY_VERIFY_EVENTS else ""
     if ref not in NIGHTLY_REFS or workflow_ref != f"{NIGHTLY_WORKFLOW}@{ref}":
         return ""
     if event_name == "push" and event.get("ref") != ref:
