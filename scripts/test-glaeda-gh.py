@@ -8626,8 +8626,8 @@ class PostBodyGuardTest(unittest.TestCase):
         "def refusal(args, env):\n"
         "    CALLS.append(list(args))\n"
         "    repo = args[args.index('-R') + 1]\n"
-        "    if repo.startswith('pub/') and re.search(r'(?<![\\w-])big-red(?![\\w-])', _body(args)):\n"
-        "        return 'public-body-guard: refused: ' + repo + ' is public and this text names fleet host big-red'\n"
+        "    if repo.startswith('pub/') and re.search(r'(?<![\\w-])cmux-mini-7(?![\\w-])', _body(args)):\n"
+        "        return 'public-body-guard: refused: ' + repo + ' is public and this text names fleet host cmux-mini-7'\n"
         "def footer_refusal(args, env):\n"
         "    if args[:2] == ['pr', 'create'] and 'Agent session:' not in _body(args):\n"
         "        return 'pr-footer-guard: refused: no footer'\n"
@@ -8656,18 +8656,18 @@ class PostBodyGuardTest(unittest.TestCase):
         return len(list(gg.outbox_dir().glob("*.json"))) if gg.outbox_dir().is_dir() else 0
 
     def test_a_comment_naming_a_host_in_a_public_repo_is_refused_and_not_queued(self) -> None:
-        code, err = self.post("comment", "pub/cmux#7", "--body", "built on big-red")
+        code, err = self.post("comment", "pub/cmux#7", "--body", "built on cmux-mini-7")
         self.assertEqual(code, 3)
         self.assertIn("not queued: public-body-guard: refused: pub/cmux is public", err)
         self.assertEqual(self.queued(), 0)
 
     def test_the_same_text_in_a_private_repo_or_clean_text_is_queued(self) -> None:
-        self.assertEqual(self.post("comment", "priv/hq#7", "--body", "built on big-red")[0], 0)
+        self.assertEqual(self.post("comment", "priv/hq#7", "--body", "built on cmux-mini-7")[0], 0)
         self.assertEqual(self.post("comment", "pub/cmux#7", "--body", "built on the fleet")[0], 0)
         self.assertEqual(self.queued(), 2)
 
     def test_reviews_and_prs_are_checked_as_the_gh_calls_they_stand_for(self) -> None:
-        self.assertEqual(self.post("review", "pub/cmux#7", "--body", "big-red")[0], 3)
+        self.assertEqual(self.post("review", "pub/cmux#7", "--body", "cmux-mini-7")[0], 3)
         code, err = self.post("pr", "pub/cmux", "--head", "h", "--base", "b", "--title", "t", "--body", "x")
         self.assertEqual(code, 3)
         self.assertIn("pr-footer-guard", err)
@@ -8697,7 +8697,7 @@ class PostBodyGuardTest(unittest.TestCase):
     def test_no_guard_on_the_host_posts_as_before(self) -> None:
         with mock.patch.dict(os.environ, {gg.BODY_GUARD_ENV: ""}), \
                 mock.patch.object(gg, "PACE_CLI", Path(self.tmp.name) / "nowhere" / "gh"):
-            self.assertEqual(self.post("comment", "pub/cmux#7", "--body", "big-red")[0], 0)
+            self.assertEqual(self.post("comment", "pub/cmux#7", "--body", "cmux-mini-7")[0], 0)
 
     def test_the_args_are_the_gh_calls_the_shim_guards(self) -> None:
         item = {"repo": "o/r", "kind": "comment", "number": 5}
