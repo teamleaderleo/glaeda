@@ -3960,6 +3960,10 @@ class ChromiumSocket(Exception):
     """A Unix socket somewhere in a Chromium tree: something is serving from it."""
 
 
+class ChromiumBare(Exception):
+    """A bare repository (or a copied git dir) somewhere in a Chromium tree: nothing here bundles it."""
+
+
 def _chromium_repos(tree: Path) -> list[Path] | None:
     """Every checkout in the whole tree (a .git file or directory), build output included; None past the budget or
     on a directory that cannot be read (it could hide one). Raises ChromiumSocket on a socket at any depth: the
@@ -3978,6 +3982,8 @@ def _chromium_repos(tree: Path) -> list[Path] | None:
                         found.append(Path(d))
                     if e.is_dir(follow_symlinks=False):
                         if e.name != ".git":
+                            if looks_like_repository(e.path):  # a bare repository: its refs are no checkout's
+                                raise ChromiumBare(e.path)
                             stack.append(e.path)
                     elif e.is_symlink():
                         continue
@@ -3994,6 +4000,8 @@ def chromium_repos(tree: Path) -> tuple[str, list[Path]]:
         repos = _chromium_repos(tree)
     except ChromiumSocket as e:
         return f"holds a socket ({os.path.relpath(str(e), tree)})", []
+    except ChromiumBare as e:
+        return f"holds a bare repository ({os.path.relpath(str(e), tree)})", []
     return ("too large or unreadable to find every checkout", []) if repos is None else ("", repos)
 
 
@@ -4058,26 +4066,65 @@ def archive_chromium(tree: Path) -> tuple[str, list[Path], tuple]:
     return "", bundles, (gitdirs, trees, snap, (work, archives, pins, relied, tips))
 
 
-def chromium_rename_recheck(tree: Path):
-    """after_rename for a Chromium tree: a process that came in between the last check and the rename is in the
-    aside now (its cwd, an open file, a command naming either path, a socket); then the tree goes back to its path
-    and nothing is deleted."""
+def chromium_rename_recheck(fam: Family, tree: Path, recheck: tuple):
+    """after_rename for a Chromium tree: everything that keeps a tree is read again on the aside (a process's cwd, an
+    open file or a command naming either path, a socket, a bare repository, the same checkouts, .build.active, the
+    recipe's sync lock, a lease, a configuration mention, .gclient_entries). On any of them the tree goes back to its
+    path, or, when that fails, stays aside: its keep marker is written before the rename (if that write fails,
+    nothing is renamed) and removed only once the check passes, so the interrupted-deletions family never finishes a
+    tree whose work this pass did not clear."""
     doomed = tree.with_name(f"{DELETING_PREFIX}{tree.name}-{os.getpid()}")
+    marker = mirror_keep_marker(doomed)
+    marker.write_text(f"kept by glaeda-disk {os.getpid()} until its Chromium tree is checked again\n")  # raises: kept
+    trees, pins = recheck[1], recheck[3][2]
 
-    def check() -> None:
+    def why_busy() -> str:
         try:
             opened, cmds = process_evidence()
-            busy = (in_cwd(os.fspath(doomed), open_index(opened)) or named_by(os.fspath(tree), cmds)
-                    or named_by(os.fspath(doomed), cmds) or bool(chromium_repos(doomed)[0]))
-        except NoEvidence:
-            busy = True
-        if not busy:
-            return
+        except NoEvidence as e:
+            return f"no process evidence: {e}"
+        if in_cwd(os.fspath(doomed), open_index(opened)) or named_by(os.fspath(tree), cmds) \
+                or named_by(os.fspath(doomed), cmds):
+            return "a process uses it"
+        why, now = chromium_repos(doomed)
+        if why:
+            return why
+        if sorted(os.path.relpath(r, doomed) for r in now) != sorted(os.path.relpath(t, tree) for t in trees):
+            return "its checkouts changed"
+        if (doomed / ".build.active").exists():
+            return "a Chromium build started in it"
+        lock = tree.parent / f"{tree.name}.sync.lock"
+        if lock.exists():
+            try:
+                with lock.open("rb") as f:
+                    fcntl.flock(f, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            except OSError:
+                return f"a Chromium recipe holds {lock.name}"
+        try:
+            if (doomed / ".gclient_entries").read_bytes() != pins:
+                return "its .gclient_entries changed"
+        except OSError:
+            return "its .gclient_entries is unreadable"
+        if fam.reference_root is not None and any(artifact_referenced(q, fresh_artifact_references(fam.reference_root))
+                                                  for q in (tree, doomed)):
+            return "a lease names it"
+        return home_scratch_referenced(tree) or home_scratch_referenced(doomed)
+
+    def check() -> None:
+        why = why_busy()
+        if not why:
+            try:
+                marker.unlink()
+                return
+            except OSError as e:
+                why = f"its keep marker could not be removed ({e.strerror})"
         try:
             rename_noreplace(doomed, tree)
         except OSError as e:
-            raise SlotTaken(f"{tree.name}: in use after its rename; kept aside as {doomed.name} ({e.strerror})")
-        raise SlotTaken(f"{tree.name}: in use after its rename; put back")
+            raise SlotTaken(f"{tree.name}: {why} after its rename; kept aside as {doomed.name} ({e.strerror})")
+        with contextlib.suppress(OSError):
+            marker.unlink()
+        raise SlotTaken(f"{tree.name}: {why} after its rename; put back")
     return check
 
 
@@ -9799,7 +9846,7 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
                            if whole_state
                            else cmux_next_ci_child_recheck(fam, p) if fam.id == CMUX_NEXT_CI_FAMILY
                            else mirror_rename_recheck(p, bundled[2]) if mirror_due(fam, p, idle_now)
-                           else chromium_rename_recheck(p) if fam.chromium_trees
+                           else chromium_rename_recheck(fam, p, bundled[2]) if fam.chromium_trees
                            else None if stale_hash is None else lambda h=stale_hash: h.unlink(missing_ok=True))
                     gone = True
                     if fam.id == CMUX_NEXT_CI_FAMILY and p.parent.parent.parent in tuple(
@@ -9826,10 +9873,13 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
                 if common:  # drop the deleted worktree's record from its repository
                     subprocess.run(["git", "--git-dir", common, "worktree", "prune"],
                                    capture_output=True, timeout=60)
-            except SlotTaken:
+            except SlotTaken as e:
                 outcome = "changed:in-use"
+                if fam.chromium_trees and str(e):
+                    i.reasons.append(str(e))
+                aside = p.with_name(f"{DELETING_PREFIX}{p.name}-{os.getpid()}")
                 if (mirror_due(fam, p, idle_now) or fam.chromium_trees) and bundled[1] and p.is_dir() \
-                        and not p.is_symlink():
+                        and not p.is_symlink() and not os.path.lexists(aside):
                     drop_unused_archives(bundled[1])  # put back whole: never when it was left aside under another name
             except SlotNotNeeded:
                 continue  # as the stop check before the rename

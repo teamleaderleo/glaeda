@@ -9806,6 +9806,62 @@ class SupersededChromiumTest(unittest.TestCase):
         self.assertIn("changed:in-use", receipt.read_text())
         self.assertEqual(list((self.home / "archive/glaeda-disk").glob("*.bundle")), [])  # dropped: the tree stays
 
+    def test_a_bare_repository_anywhere_keeps_it(self) -> None:
+        tree = self.tree("chromium-old", hours=60)
+        subprocess.run(["git", "init", "-q", "--bare", os.fspath(tree / "src/out/Release/mirror.git")], check=True,
+                       env=self.env)
+        self.age(tree, 60)
+        self.tree("chromium-new", hours=13)
+        fam = self.family()
+        receipt = self.apply(fam, self.survey(fam)["chromium-old"])
+        self.assertTrue(tree.exists())
+        self.assertIn("bare repository", receipt)
+
+    def test_a_build_marker_after_the_rename_puts_it_back(self) -> None:
+        tree = self.tree("chromium-old", hours=60)
+        self.tree("chromium-new", hours=13)
+        fam = self.family()
+        item = self.survey(fam)["chromium-old"]
+        real = gd.remove
+
+        def build_starts(path: Path, after_rename=None):
+            def then():
+                aside = path.with_name(f"{gd.DELETING_PREFIX}{path.name}-{os.getpid()}")
+                (aside / ".build.active").write_text("")
+                after_rename()
+            return real(path, after_rename=then)
+        with mock.patch.object(gd, "remove", build_starts):
+            receipt = self.apply(fam, item)
+        self.assertTrue((tree / ".build.active").exists())
+        self.assertIn("build started", receipt)
+
+    def test_an_aside_that_cannot_be_put_back_keeps_its_archives_and_is_never_finished(self) -> None:
+        tree = self.tree("chromium-old", hours=60)
+        (tree / "src/local.txt").write_text("unpushed")
+        self.git(tree / "src", "add", "local.txt")
+        self.git(tree / "src", "commit", "-qm", "local only")
+        self.age(tree, 60)
+        self.tree("chromium-new", hours=13)
+        fam = self.family()
+        item = self.survey(fam)["chromium-old"]
+        real = gd.remove
+        aside = tree.with_name(f"{gd.DELETING_PREFIX}{tree.name}-{os.getpid()}")
+
+        def recreated(path: Path, after_rename=None):
+            def then():
+                path.mkdir()  # a new tree appears at the old path, and something is using the aside
+                (aside / ".build.active").write_text("")
+                after_rename()
+            return real(path, after_rename=then)
+        with mock.patch.object(gd, "remove", recreated):
+            receipt = self.apply(fam, item)
+        self.assertTrue(aside.exists(), receipt)
+        self.assertIn("kept aside", receipt)
+        self.assertEqual(len(list((self.home / "archive/glaeda-disk").glob("*.bundle"))), 2)  # not dropped
+        inter = [f for f in gd.interrupted_families([fam]) if aside in gd.candidates(f)]
+        self.assertTrue(inter)
+        self.assertIn("kept it", gd.keep_verdict(inter[0], aside))
+
     def test_a_held_sync_lock_build_marker_or_process_keeps_it(self) -> None:
         a = self.tree("cache/chromium/aaaa", hours=60)
         b = self.tree("cache/chromium/bbbb", hours=60)
