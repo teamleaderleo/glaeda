@@ -371,7 +371,8 @@ What `--apply` does:
        of its jobs: generated files and action exports), a job here waits for units, or the
        console is locked. **SESSION_FIRST:** when units are what holds the session runners
        off, one of them per mini (the holder of `capacity/session-first.lock`, an flock that
-       dies with its gate) listens anyway. Before, the side runners won the race for every
+       dies with its gate, is handed to the new gate on a reload, and is kept through the
+       runner's own job, whose admit.want marker exists only once it waits) listens anyway. Before, the side runners won the race for every
        unit that freed up on a busy mini: on 2026-10-29 no session runner listened anywhere
        and a daemon test queued on the session label for hours. Now GitHub hands that runner a
        session job only when one is queued, the job waits here for units, and its admit.want

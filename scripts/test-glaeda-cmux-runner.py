@@ -8310,6 +8310,29 @@ class GateTest(unittest.TestCase):
         self.assertIn("capacity units on this mini", first.full() or "")
         second.unclaim()
         self.assertIsNone(first.full())
+        # through its own job the lock stays (a job in setup has no admit.want marker yet); only the claim goes
+        first.unclaim(keep_first=True)
+        self.assertIsNotNone(first.first_fd)
+        self.assertIn("capacity units on this mini", second.full() or "", "still one listener without room")
+        # a reload hands the lock to the new gate with the listener: no window for a second listener
+        fd = first.first_fd
+        os.set_inheritable(fd, True)
+        reloaded = self.session_gate(6, busy)
+        first.first_fd = None  # the old gate is gone; its fd now belongs to the new one
+        reloaded.adopt_session_first(str(fd))
+        self.assertEqual(reloaded.first_fd, fd)
+        self.assertFalse(os.get_inheritable(fd), "the listener it starts never holds it")
+        self.assertIn("capacity units on this mini", second.full() or "")
+        stray = os.open(self.tmp / "stray", os.O_RDONLY | os.O_CREAT, 0o644)
+        other = self.session_gate(9, busy)
+        other.adopt_session_first(str(stray))
+        self.assertIsNone(other.first_fd, "an fd on another file is not the lock")
+        with self.assertRaises(OSError):
+            os.fstat(stray)  # and is closed
+        other.adopt_session_first("not-a-number")
+        self.assertIsNone(other.first_fd)
+        reloaded.unclaim()
+        self.assertIsNone(second.full(), "let go: the next session runner takes it")
         roomy = self.units(4)  # 10 free: room claims as before, no lock
         third = self.session_gate(8, roomy)
         self.assertIsNone(third.full())

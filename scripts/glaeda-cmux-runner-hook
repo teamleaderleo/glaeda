@@ -1271,6 +1271,7 @@ GATE_INELIGIBLE_ENV = "GLAEDA_RUNNER_GATE_INELIGIBLE"
 # Across a reload: "clean" when this gate started its listener with listener_env, else why its env is stale.
 GATE_LISTENER_ENV = "GLAEDA_RUNNER_GATE_LISTENER_ENV"
 GATE_RESERVE_FD_ENV = "GLAEDA_RUNNER_GATE_RESERVE_FD"  # a reload hands its reserve flock's fd to the new gate
+GATE_SESSION_FIRST_FD_ENV = "GLAEDA_RUNNER_GATE_SESSION_FIRST_FD"  # and its SESSION_FIRST_LOCK flock's fd
 
 
 def _repo_name(repo: Any) -> str | None:
@@ -5725,6 +5726,10 @@ class Gate:
             with contextlib.suppress(OSError):
                 os.set_inheritable(self.reserve_fd, True)
                 os.environ[GATE_RESERVE_FD_ENV] = str(self.reserve_fd)
+        if self.first_fd is not None:  # the listener stays up across the exec, so its SESSION_FIRST_LOCK does too
+            with contextlib.suppress(OSError):
+                os.set_inheritable(self.first_fd, True)
+                os.environ[GATE_SESSION_FIRST_FD_ENV] = str(self.first_fd)
         try:
             os.execv(sys.executable, [sys.executable, *argv])
         except OSError:
@@ -5732,9 +5737,11 @@ class Gate:
             os.environ.pop(GATE_INELIGIBLE_ENV, None)
             os.environ.pop(GATE_LISTENER_ENV, None)
             os.environ.pop(GATE_RESERVE_FD_ENV, None)
-            if self.reserve_fd is not None:
-                with contextlib.suppress(OSError):
-                    os.set_inheritable(self.reserve_fd, False)
+            os.environ.pop(GATE_SESSION_FIRST_FD_ENV, None)
+            for fd in (self.reserve_fd, self.first_fd):
+                if fd is not None:
+                    with contextlib.suppress(OSError):
+                        os.set_inheritable(fd, False)
             signal.pthread_sigmask(signal.SIG_UNBLOCK, blocked)
             gate_log("the reload failed; keeping this gate")
 
@@ -6151,16 +6158,17 @@ class Gate:
                 os.set_inheritable(fd, False)
                 os.utime(path)  # fresh from now (GATE_FIRST_POLL_S)
 
-    def unclaim(self) -> None:
-        """Let go of this gate's listen claim and, on a session runner, its SESSION_FIRST_LOCK. Never raises."""
+    def unclaim(self, keep_first: bool = False) -> None:
+        """Let go of this gate's listen claim and, unless keep_first, a session runner's SESSION_FIRST_LOCK. Never
+        raises."""
         if self.claim_fd is not None:
             with contextlib.suppress(OSError):
                 os.close(self.claim_fd)
         self.claim_fd, self.claim_at = None, None
-        if self.first_fd is not None:
+        if self.first_fd is not None and not keep_first:
             with contextlib.suppress(OSError):
                 os.close(self.first_fd)
-        self.first_fd = None
+            self.first_fd = None
 
     def job_end_marker(self) -> Path:
         return self.runner_dir / "glaeda-hooks" / JOB_ENDING
@@ -6217,6 +6225,30 @@ class Gate:
         with contextlib.suppress(OSError):
             os.set_inheritable(fd, False)
         self.reserve_fd = fd
+
+    def adopt_session_first(self, handed: str | None) -> None:
+        """Take over the SESSION_FIRST_LOCK flock the gate before a reload held (GATE_SESSION_FIRST_FD_ENV): its
+        listener, listening without room, stays up across the exec, so no other session runner on the mini may take
+        the lock meanwhile. Only an fd open on this mini's capacity/SESSION_FIRST_LOCK is kept; anything else is
+        closed if it was a number, and ignored otherwise. Never raises."""
+        try:
+            fd = int(handed or "")
+        except ValueError:
+            return
+        if fd < 3:
+            return
+        try:
+            same = self.capacity_dir is not None and os.path.samestat(
+                os.fstat(fd), os.stat(self.capacity_dir / SESSION_FIRST_LOCK, follow_symlinks=False))
+        except OSError:
+            same = False
+        if not same:
+            with contextlib.suppress(OSError):
+                os.close(fd)
+            return
+        with contextlib.suppress(OSError):
+            os.set_inheritable(fd, False)
+        self.first_fd = fd
 
     def reserve_path(self) -> Path | None:
         """This runner's capacity/<token>.reserve, or None when it reserves nothing (reserve())."""
@@ -6518,7 +6550,11 @@ class Gate:
                 now = time.monotonic()
                 self.busy_since = self.busy_since if self.busy_since is not None else now
                 if now - self.busy_since >= LISTEN_CLAIM_HANDOFF_S:
-                    self.unclaim()  # the job's admission holds its units by now, or waits for them in the open
+                    # the job's admission holds its units by now, or waits for them in the open. The SESSION_FIRST
+                    # lock stays through the job: a job still in setup has no admit.want marker yet, so letting it go
+                    # here could let a second session runner take a job onto this full mini. The idle look after the
+                    # job lets it go (session_look) when that is due.
+                    self.unclaim(keep_first=True)
                 self.load_since = None  # the hold limit times a pause, never a job
                 # the reserve stays held through the runner's own job: its admission lends it (RESERVE_LENT), so it
                 # keeps nothing while that job holds its units and is whole the moment they go back. One the job could
@@ -6637,6 +6673,7 @@ def listen(runner_dir: Path, host_lock: str, reservation: str, state_dir: Path, 
            adopt: int = 0, capacity_dir: Path | None = None, fit_units: int = 1) -> int:
     gate = Gate(runner_dir, host_lock, reservation, state_dir, waiters, capacity_dir, fit_units)
     gate.adopt_reserve(os.environ.pop(GATE_RESERVE_FD_ENV, None))
+    gate.adopt_session_first(os.environ.pop(GATE_SESSION_FIRST_FD_ENV, None))
     marker = os.environ.pop(GATE_LISTENER_ENV, None)
     xcode = runner_xcode(runner_dir)
     if adopt:
