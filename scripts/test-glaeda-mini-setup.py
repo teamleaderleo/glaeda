@@ -1380,8 +1380,12 @@ class TimedOutInstallTest(unittest.TestCase):
         pidfd (Linux) and without one (macOS)."""
         no_pidfd = mock.patch.object(ms, "hasattr", lambda obj, name: False if "pidfd" in name else hasattr(obj, name),
                                      create=True)
-        for patch in (contextlib.nullcontext(), no_pidfd):
-            with self.subTest(pidfd=patch is not no_pidfd), patch:
+        # Python has pidfd_open but the call fails (an old kernel: ENOSYS; no fd to spare: EMFILE)
+        failing_pidfd = mock.patch.object(ms.os, "pidfd_open", mock.Mock(side_effect=OSError(24, "EMFILE")),
+                                          create=True)
+        for label, patch in (("pidfd", contextlib.nullcontext()), ("no pidfd", no_pidfd),
+                             ("pidfd_open fails", failing_pidfd)):
+            with self.subTest(label), patch:
                 other = subprocess.Popen(["sleep", "30"], start_new_session=True)
                 self.addCleanup(other.wait)
                 self.addCleanup(other.kill)

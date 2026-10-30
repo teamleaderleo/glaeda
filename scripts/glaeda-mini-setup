@@ -576,11 +576,15 @@ def signal_session_member(pid: int, sid: int, sig: int) -> None:
     calls goes to a new process only after the counter has passed every other pid once: about 100,000 forks
     inside the microseconds between getsid and kill. The leader's own group is signalled with killpg instead
     (reap_session), which is pinned because the leader is not reaped until the reap is over."""
+    fd = None
     if hasattr(os, "pidfd_open") and hasattr(signal, "pidfd_send_signal"):
         try:
             fd = os.pidfd_open(pid)
+        except ProcessLookupError:
+            return  # it has exited
         except OSError:
-            return
+            fd = None  # a kernel without pidfds, or no fd to spare (EMFILE): check and signal the plain way
+    if fd is not None:
         try:
             if os.getsid(pid) == sid:
                 signal.pidfd_send_signal(fd, sig)
