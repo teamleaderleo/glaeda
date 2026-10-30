@@ -8071,12 +8071,14 @@ class GateTest(unittest.TestCase):
     def test_a_waiter_seen_during_a_job_stops_the_frozen_listener_right_after_the_worker_exits(self) -> None:
         gate, _ = self.gate([None] * 3)
         busy = iter([True, False])
+        worker = iter([True, False])
         gate.busy = lambda finished=None: next(busy) if finished is None else False
+        gate.worker = lambda: next(worker, False)
         gate.worker_pids = lambda: [4242]
         gate.taking = lambda: "b43ca05a"
         gate.listener_list = lambda: (4343,)
         stops: list[tuple[str, str | None]] = []
-        gate.stop = lambda why, finished=None: stops.append((why, finished))
+        gate.stop = lambda why, finished=None, handback=False: stops.append((why, finished))
         gate.freeze = lambda: setattr(gate, "frozen", (4343,))
         gate.thaw = lambda: setattr(gate, "frozen", ())
         with mock.patch.object(hook, "host_waiters", return_value={6755}):
@@ -9336,6 +9338,15 @@ class GateTest(unittest.TestCase):
         self.assertIsNone(gate.stop_deadline)
         log.write_text(log.read_text() + ACQUIRE_FAILED)
         self.assertTrue(gate.stop("all 2 canonical roots on this mini are taken"))
+        self.assertIsNotNone(gate.child.wait(timeout=10))
+
+    def test_a_waiter_hands_back_an_acknowledged_request_before_worker_start(self) -> None:
+        """A fleet waiter must return an acknowledged request to GitHub's queue, rather than let job-started refuse it.
+        Other holds keep the existing acquisition safety rule and wait for the request to settle."""
+        gate = self.started_gate()
+        self.diag(MID_ACQUIRE_DIAG)
+        with mock.patch.object(hook, "host_waiters", return_value={6755}):
+            gate.step()
         self.assertIsNotNone(gate.child.wait(timeout=10))
 
     def test_the_agent_stopping_waits_out_an_acquisition_but_not_a_running_job(self) -> None:
