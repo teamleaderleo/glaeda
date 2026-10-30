@@ -1212,6 +1212,30 @@ class MiniSetupTest(unittest.TestCase):
                                ms.CMUX_XCODE_APP, 50, hygiene_only=True, platform_name="linux")
             self.assertIn("ppa:git-core/ppa", ms.plan_git(linux)["note"])
 
+    def test_a_git_too_slow_to_answer_is_never_reinstalled(self) -> None:
+        """cmux9s at load 100-200: Homebrew's git 2.55 missed the version probe's deadline, /usr/bin/git 2.50.1
+        answered, and setup ran brew install git, which timed out at 600 s inside the update agent and the
+        release update rolled back (2026-10-30). A git that is there is never reinstalled for a slow answer."""
+        ctx = ms.Context(self.home, False, "/usr/bin/python3", True, self.reclaim, None, None,
+                         ms.CMUX_XCODE_APP, 50, hygiene_only=True)
+        ctx.sandbox = False
+        probes = {"/opt/homebrew/bin/git": None, "/usr/bin/git": (2, 50, 1)}  # None: no answer in time
+        with mock.patch.object(ms, "GIT_CANDIDATES", tuple(probes)), \
+                mock.patch.object(ms.shutil, "which", lambda name: None), \
+                mock.patch.object(ms.os, "access", lambda path, mode: path in probes), \
+                mock.patch.object(ms, "git_version", probes.get), \
+                mock.patch.object(ms, "owned_brew", lambda: "/opt/homebrew/bin/brew"):
+            act = ms.plan_git(ctx)
+        self.assertEqual((act["state"], act["value"]), ("skipped", "/opt/homebrew/bin/git"))
+        self.assertIn("did not answer", act["note"])
+        probes["/opt/homebrew/bin/git"] = (2, 50, 1)  # every git answered and all are old: install
+        with mock.patch.object(ms, "GIT_CANDIDATES", tuple(probes)), \
+                mock.patch.object(ms.shutil, "which", lambda name: None), \
+                mock.patch.object(ms.os, "access", lambda path, mode: path in probes), \
+                mock.patch.object(ms, "git_version", probes.get), \
+                mock.patch.object(ms, "owned_brew", lambda: "/opt/homebrew/bin/brew"):
+            self.assertEqual(ms.plan_git(ctx)["state"], "create")
+
     def test_brew_git_apply_upgrades_an_outdated_keg(self) -> None:
         ctx = ms.Context(self.home, True, "/usr/bin/python3", True, self.reclaim, None, None,
                          ms.CMUX_XCODE_APP, 50, hygiene_only=True)
