@@ -17,6 +17,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -1271,6 +1272,94 @@ class MiniSetupTest(unittest.TestCase):
     def test_no_em_dashes(self) -> None:
         for name in ("glaeda-mini-setup", "glaeda-worktree-reclaim-all", "test-glaeda-mini-setup.py"):
             self.assertNotIn(chr(0x2014), (ROOT / "scripts" / name).read_text(), name)
+
+
+FAKE_INSTALLER = """#!/usr/bin/env python3
+# A brew that hangs: like Homebrew's sandbox_operation.rb children on cmux9s (2026-10-30), its grandchild moves to a
+# process group of its own, ignores TERM and HUP, outlives its parent and keeps the output pipe open.
+import os, signal, sys, time
+pid_file = os.environ["FAKE_INSTALLER_PIDS"]
+child = os.fork()
+if child == 0:
+    os.setpgid(0, 0)
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    signal.signal(signal.SIGHUP, signal.SIG_IGN)
+    with open(pid_file, "a") as f:
+        f.write(f"grandchild {os.getpid()}\\n")
+    time.sleep(300)
+    os._exit(0)
+with open(pid_file, "a") as f:
+    f.write(f"installer {os.getpid()}\\n")
+print("pouring git", flush=True)
+time.sleep(300)
+"""
+
+
+def live(pid: int) -> bool:
+    """pid names a process that has not exited (a zombie waiting on a reaper that is not ours has exited)."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    state = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True).stdout.strip()
+    return bool(state) and not state.startswith("Z")
+
+
+class TimedOutInstallTest(unittest.TestCase):
+    """A timed-out install is stopped with every process it started. brew install git ran past GIT_BREW_TIMEOUT on
+    cmux9s (2026-10-30); the timeout killed only brew, and three `sandbox_operation.rb extract` rubies, each in a
+    process group of its own, were left running under launchd."""
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="mini-setup-reap-"))
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.brew = self.tmp / "brew"
+        self.brew.write_text(FAKE_INSTALLER)
+        self.brew.chmod(0o755)
+        self.pid_file = self.tmp / "pids"
+        os.environ["FAKE_INSTALLER_PIDS"] = os.fspath(self.pid_file)
+        self.addCleanup(os.environ.pop, "FAKE_INSTALLER_PIDS", None)
+        self.addCleanup(self.kill_started)
+
+    def started(self) -> dict[str, int]:
+        lines = self.pid_file.read_text().split() if self.pid_file.exists() else []
+        return dict(zip(lines[::2], map(int, lines[1::2])))
+
+    def kill_started(self) -> None:
+        # a failing run must not leak the fakes this test started (by their recorded pids, never by name)
+        for pid in self.started().values():
+            with contextlib.suppress(OSError):
+                os.kill(pid, signal.SIGKILL)
+
+    def test_a_timed_out_brew_leaves_no_process_behind(self) -> None:
+        log = io.StringIO()
+        with mock.patch.object(ms, "REAP_GRACE_S", 1.0), contextlib.redirect_stderr(log):
+            code, out = ms.brew_install(os.fspath(self.brew), "git", timeout=2)
+        self.assertIn(f"reaped session {self.started()['installer']}", log.getvalue())
+        started = self.started()
+        self.assertEqual(set(started), {"installer", "grandchild"}, out)
+        self.assertEqual(code, 1)
+        self.assertIn("timed out after 2 s", out)
+        for name, pid in started.items():
+            self.assertFalse(live(pid), f"{name} {pid} outlived the timeout: {out}")
+        self.assertEqual(ms.session_members(started["installer"]), [])
+        # the log names what it stopped: the session, each pid with its group and command, and the time it ran
+        self.assertIn(f"session {started['installer']}", out)
+        self.assertIn(f"pid {started['grandchild']} pgid {started['grandchild']}", out)
+        self.assertIn(os.fspath(self.brew), out)
+        self.assertIn("pouring git", out)
+
+    def test_an_install_that_finishes_in_time_is_left_alone(self) -> None:
+        quick = self.tmp / "quick-brew"
+        quick.write_text("#!/bin/sh\necho \"$1 $2 done\"\n")
+        quick.chmod(0o755)
+        self.assertEqual(ms.brew_install(os.fspath(quick), "git", timeout=30), (0, "install git done\n"))
+
+    def test_the_reap_never_signals_this_process_own_session(self) -> None:
+        with self.assertRaises(ValueError):
+            ms.reap_session(os.getsid(0), time.monotonic())
 
 
 if __name__ == "__main__":
