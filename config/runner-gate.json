@@ -8,39 +8,48 @@
   "hosts": {
     "cmux16": {
       "cpuHold": true,
-      "why": "Reserved for perf work: keeps the 85/80 CPU hold so this change does not move its measurements; drop the entry when the reservation lapses."
+      "why": "Reserved for perf work until 20:50Z (the fleet registry's reservation, which lapses then): keeps the 85/80 CPU hold so this change does not move its measurements; the entry lapses with it, so move both together if the reservation is extended.",
+      "until": "2026-10-30T20:50:00Z"
     },
     "cmux17": {
       "cpuHold": true,
-      "why": "Reserved for perf work: keeps the 85/80 CPU hold so this change does not move its measurements; drop the entry when the reservation lapses."
+      "why": "Reserved for perf work until 20:50Z (the fleet registry's reservation, which lapses then): keeps the 85/80 CPU hold so this change does not move its measurements; the entry lapses with it, so move both together if the reservation is extended.",
+      "until": "2026-10-30T20:50:00Z"
     },
     "cmux18": {
       "cpuHold": true,
-      "why": "Reserved for perf work: keeps the 85/80 CPU hold so this change does not move its measurements; drop the entry when the reservation lapses."
+      "why": "Reserved for perf work until 20:50Z (the fleet registry's reservation, which lapses then): keeps the 85/80 CPU hold so this change does not move its measurements; the entry lapses with it, so move both together if the reservation is extended.",
+      "until": "2026-10-30T20:50:00Z"
     },
     "cmux19": {
       "cpuHold": true,
-      "why": "Reserved for perf work: keeps the 85/80 CPU hold so this change does not move its measurements; drop the entry when the reservation lapses."
+      "why": "Reserved for perf work until 20:50Z (the fleet registry's reservation, which lapses then): keeps the 85/80 CPU hold so this change does not move its measurements; the entry lapses with it, so move both together if the reservation is extended.",
+      "until": "2026-10-30T20:50:00Z"
     },
     "cmux20": {
       "cpuHold": true,
-      "why": "Reserved for perf work: keeps the 85/80 CPU hold so this change does not move its measurements; drop the entry when the reservation lapses."
+      "why": "Reserved for perf work until 20:50Z (the fleet registry's reservation, which lapses then): keeps the 85/80 CPU hold so this change does not move its measurements; the entry lapses with it, so move both together if the reservation is extended.",
+      "until": "2026-10-30T20:50:00Z"
     },
     "cmux21": {
       "cpuHold": true,
-      "why": "Reserved for perf work: keeps the 85/80 CPU hold so this change does not move its measurements; drop the entry when the reservation lapses."
+      "why": "Reserved for perf work until 20:50Z (the fleet registry's reservation, which lapses then): keeps the 85/80 CPU hold so this change does not move its measurements; the entry lapses with it, so move both together if the reservation is extended.",
+      "until": "2026-10-30T20:50:00Z"
     },
     "cmux22": {
       "cpuHold": true,
-      "why": "Reserved for perf work: keeps the 85/80 CPU hold so this change does not move its measurements; drop the entry when the reservation lapses."
+      "why": "Reserved for perf work until 20:50Z (the fleet registry's reservation, which lapses then): keeps the 85/80 CPU hold so this change does not move its measurements; the entry lapses with it, so move both together if the reservation is extended.",
+      "until": "2026-10-30T20:50:00Z"
     },
     "cmux23": {
       "cpuHold": true,
-      "why": "Reserved for perf work: keeps the 85/80 CPU hold so this change does not move its measurements; drop the entry when the reservation lapses."
+      "why": "Reserved for perf work until 20:50Z (the fleet registry's reservation, which lapses then): keeps the 85/80 CPU hold so this change does not move its measurements; the entry lapses with it, so move both together if the reservation is extended.",
+      "until": "2026-10-30T20:50:00Z"
     },
     "cmux24": {
       "cpuHold": true,
-      "why": "Reserved for perf work: keeps the 85/80 CPU hold so this change does not move its measurements; drop the entry when the reservation lapses."
+      "why": "Reserved for perf work until 20:50Z (the fleet registry's reservation, which lapses then): keeps the 85/80 CPU hold so this change does not move its measurements; the entry lapses with it, so move both together if the reservation is extended.",
+      "until": "2026-10-30T20:50:00Z"
     }
   }
 }
