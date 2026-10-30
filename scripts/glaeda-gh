@@ -1606,6 +1606,8 @@ class Daemon:
             # replace the poorest one with a figure mode() treats as no reading at all.
             if not rest_counters(self.budget):
                 self.budget[bucket] = seen
+            else:
+                self.settle_rest()  # still drop a counter whose window ended, so the poorest live one shows
             return
         self.budget["restCounters"] = merge_counter(rest_counters(self.budget), seen)
         self.settle_rest()

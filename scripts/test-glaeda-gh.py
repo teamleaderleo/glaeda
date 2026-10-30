@@ -5823,6 +5823,15 @@ class RestCountersTest(Base):
         self.assertEqual(self.daemon.budget["rest"]["remaining"], 40)
         self.assertEqual(self.daemon.mode("rest"), "stop")
 
+    def test_a_reading_without_a_reset_still_drops_an_expired_counter(self) -> None:
+        self.daemon.now = NOW
+        self.daemon.note_budget("rest", 5000, 5, NOW + 60)     # expires first
+        self.daemon.note_budget("rest", 5000, 100, NOW + 2400)  # live, below the reserve
+        self.daemon.now = NOW + 61
+        self.daemon.note_budget("rest", 5000, 4000, None)
+        self.assertEqual(self.daemon.budget["rest"]["remaining"], 100)
+        self.assertEqual(self.daemon.mode("rest"), "stop")
+
     def test_a_late_higher_reading_of_a_counter_does_not_raise_it(self) -> None:
         """Within one window a counter only goes down: a delayed answer must not lift what a later one saw."""
         self.daemon.now = NOW
