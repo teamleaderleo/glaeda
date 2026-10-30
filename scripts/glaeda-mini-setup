@@ -470,21 +470,35 @@ def git_version(git: str) -> tuple[int, ...] | None:
     return tuple(int(x) for x in found.groups() if x is not None) if found else None
 
 
+def git_candidates() -> list[str]:
+    """Every executable git on PATH and in the usual install locations."""
+    return list(dict.fromkeys(g for g in (shutil.which("git"), *GIT_CANDIDATES) if g and os.access(g, os.X_OK)))
+
+
+def probe_gits() -> tuple[str | None, tuple[int, ...] | None, list[str]]:
+    """The newest git that answered its version check, and every git that did not."""
+    best: tuple[str | None, tuple[int, ...] | None] = (None, None)
+    unanswered: list[str] = []
+    for git in git_candidates():
+        version = git_version(git)
+        if version is None:
+            unanswered.append(git)
+        elif best[1] is None or version > best[1]:
+            best = (git, version)
+    return best[0], best[1], unanswered
+
+
 def newest_git() -> tuple[str | None, tuple[int, ...] | None]:
     """The newest git among PATH and the usual install locations."""
-    best: tuple[str | None, tuple[int, ...] | None] = (None, None)
-    for git in dict.fromkeys(g for g in (shutil.which("git"), *GIT_CANDIDATES) if g and os.access(g, os.X_OK)):
-        version = git_version(git)
-        if version and (best[1] is None or version > best[1]):
-            best = (git, version)
-    return best
+    git, version, _ = probe_gits()
+    return git, version
 
 
 def plan_git(ctx: Context) -> dict[str, Any]:
     """git >= 2.55 on every host; Homebrew installs it when this user owns Homebrew."""
     need = ".".join(map(str, MIN_GIT))
     act: dict[str, Any] = {"kind": "gitpkg", "key": f"git>={need}", "formula": "git"}
-    git, version = newest_git()
+    git, version, unanswered = probe_gits()
     shown = f"{git} {'.'.join(map(str, version))}" if version else "none"
     if version and version >= MIN_GIT:
         on_path = shutil.which("git")
@@ -492,6 +506,13 @@ def plan_git(ctx: Context) -> dict[str, Any]:
         note = "" if not path_version or path_version >= MIN_GIT else (
             f"PATH resolves {on_path} {'.'.join(map(str, path_version))}: put {Path(git).parent} first")
         return {**act, "state": "unchanged", "value": shown, "note": note}
+    if unanswered:
+        # A loaded host (cmux9s, load 100-200) missed the probe's deadline for Homebrew's git 2.55 while
+        # /usr/bin/git 2.50.1 answered; brew install git then timed out at 600 s inside glaeda-update and its
+        # release rolled back (2026-10-30). A git that is there is never reinstalled for a slow answer.
+        return {**act, "state": "skipped", "value": unanswered[0],
+                "note": f"{', '.join(unanswered)} did not answer its version check in time (a loaded host); "
+                        "not reinstalled, the next run checks again"}
     if ctx.platform == "linux":
         return {**act, "state": "blocked", "value": shown,
                 "note": f"git {need}+ fixes a git maintenance memory bug: sudo add-apt-repository ppa:git-core/ppa "

@@ -1198,15 +1198,15 @@ class MiniSetupTest(unittest.TestCase):
     def test_git_below_2_55_is_installed_with_our_brew_or_handed_to_the_operator(self) -> None:
         ctx = ms.Context(self.home, False, "/usr/bin/python3", True, self.reclaim, None, None,
                          ms.CMUX_XCODE_APP, 50, hygiene_only=True)
-        with mock.patch.object(ms, "newest_git", lambda: ("/usr/bin/git", (2, 55, 0))):
+        with mock.patch.object(ms, "probe_gits", lambda: ("/usr/bin/git", (2, 55, 0), [])):
             self.assertEqual(ms.plan_git(ctx)["state"], "unchanged")
-        old = lambda: ("/usr/bin/git", (2, 50, 1))
-        with mock.patch.object(ms, "newest_git", old), mock.patch.object(ms, "owned_brew", lambda: "/opt/homebrew/bin/brew"):
+        old = lambda: ("/usr/bin/git", (2, 50, 1), [])
+        with mock.patch.object(ms, "probe_gits", old), mock.patch.object(ms, "owned_brew", lambda: "/opt/homebrew/bin/brew"):
             self.assertEqual(ms.plan_git(ctx)["state"], "blocked")  # sandbox HOME never runs brew
             ctx.sandbox = False
             act = ms.plan_git(ctx)
             self.assertEqual((act["state"], act["brew"]), ("create", "/opt/homebrew/bin/brew"))
-        with mock.patch.object(ms, "newest_git", old), mock.patch.object(ms, "owned_brew", lambda: None):
+        with mock.patch.object(ms, "probe_gits", old), mock.patch.object(ms, "owned_brew", lambda: None):
             self.assertIn("Homebrew owner", ms.plan_git(ctx)["note"])
             linux = ms.Context(self.home, False, "/usr/bin/python3", True, self.reclaim, None, None,
                                ms.CMUX_XCODE_APP, 50, hygiene_only=True, platform_name="linux")
