@@ -9242,23 +9242,28 @@ class GateTest(unittest.TestCase):
         gate.child = mock.Mock(pid=4321)
         gate.source = (0, 0, 0)
         gate.listening_since = time.monotonic() - 5.0
+        gate.job_done_at = time.monotonic() - 1.0  # a job that ended in the poll that reloads (claim_stamp)
         mask = signal.pthread_sigmask(signal.SIG_BLOCK, [])
         self.addCleanup(signal.pthread_sigmask, signal.SIG_SETMASK, mask)
         self.addCleanup(os.environ.pop, hook.GATE_LISTENING_SINCE_ENV, None)
-        handed: list[str | None] = []
+        self.addCleanup(os.environ.pop, hook.GATE_JOB_DONE_AT_ENV, None)
+        handed: list[tuple[str | None, str | None]] = []
         with mock.patch.object(hook.os, "execv",
-                               side_effect=lambda *_: handed.append(os.environ.get(hook.GATE_LISTENING_SINCE_ENV))), \
+                               side_effect=lambda *_: handed.append((os.environ.get(hook.GATE_LISTENING_SINCE_ENV),
+                                                                     os.environ.get(hook.GATE_JOB_DONE_AT_ENV)))), \
                 mock.patch.object(hook.sys, "argv", [os.fspath(HOOK), "listen"]):
             gate.reload()
-        self.assertEqual(handed, [repr(gate.listening_since)])
-        seen: list[float | None] = []
+        self.assertEqual(handed, [(repr(gate.listening_since), repr(gate.job_done_at))])
+        seen: list[tuple[float | None, float | None]] = []
         def step(new: hook.Gate) -> int:
-            seen.append(new.listening_since)
+            seen.append((new.listening_since, new.job_done_at))
             return 0
         with mock.patch.object(hook.Gate, "step", step), mock.patch.object(hook, "Adopted", return_value=mock.Mock()):
             self.assertEqual(hook.listen(self.runner, os.fspath(self.lock), "", self.state, True, adopt=4321), 0)
-        self.assertEqual(seen, [gate.listening_since], "the adopted listener keeps its first poll")
+        self.assertEqual(seen, [(gate.listening_since, gate.job_done_at)],
+                         "the adopted listener keeps its first poll, and its claim its last job's end")
         self.assertNotIn(hook.GATE_LISTENING_SINCE_ENV, os.environ, "read once; run.sh's children never see it")
+        self.assertNotIn(hook.GATE_JOB_DONE_AT_ENV, os.environ)
 
     def test_an_ios_sim_or_session_runner_listens_only_with_room_for_its_costliest_job(self) -> None:
         self.assertNotIn("--fit-units", self.listen_sh(sys.executable).read_text())

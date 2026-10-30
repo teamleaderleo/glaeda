@@ -1207,6 +1207,7 @@ GATE_RESTART_FREE_S = float(os.environ.get("GLAEDA_RUNNER_GATE_RESTART_FREE_S") 
 # reload() hands the listener's start (time.monotonic, system-wide) to the re-executed gate here, not in argv, so a
 # rollback to a hook without it still accepts the exec.
 GATE_LISTENING_SINCE_ENV = "GLAEDA_RUNNER_GATE_LISTENING_SINCE"
+GATE_JOB_DONE_AT_ENV = "GLAEDA_RUNNER_GATE_JOB_DONE_AT"  # and when its last job ended (Gate.claim_stamp), the same way
 GATE_WATCH_S = 0.1  # while a job is below the disk floor, notice its Worker exit promptly
 GATE_WAITER_EVERY_S = 30.0
 # The yield to a fleet build waiting for the host lock is bounded (policy, declared here; env overrides it). A waiter
@@ -5752,6 +5753,8 @@ class Gate:
             return
         if self.listening_since is not None:
             os.environ[GATE_LISTENING_SINCE_ENV] = repr(self.listening_since)
+        if self.job_done_at is not None:
+            os.environ[GATE_JOB_DONE_AT_ENV] = repr(self.job_done_at)
         if self.eligible_why:
             os.environ[GATE_INELIGIBLE_ENV] = self.eligible_why
         if self.child is not None:
@@ -5768,6 +5771,7 @@ class Gate:
             os.execv(sys.executable, [sys.executable, *argv])
         except OSError:
             os.environ.pop(GATE_LISTENING_SINCE_ENV, None)
+            os.environ.pop(GATE_JOB_DONE_AT_ENV, None)
             os.environ.pop(GATE_INELIGIBLE_ENV, None)
             os.environ.pop(GATE_LISTENER_ENV, None)
             os.environ.pop(GATE_RESERVE_FD_ENV, None)
@@ -6743,10 +6747,13 @@ def listen(runner_dir: Path, host_lock: str, reservation: str, state_dir: Path, 
         gate.started_wall = time.time()
         with contextlib.suppress(ValueError):  # the adopted listener keeps its first poll (GATE_FIRST_POLL_S)
             gate.listening_since = float(os.environ.get(GATE_LISTENING_SINCE_ENV, ""))
+        with contextlib.suppress(ValueError):  # and its claim still counts from its last job's end (claim_stamp)
+            gate.job_done_at = float(os.environ.get(GATE_JOB_DONE_AT_ENV, ""))
         gate.stale_env = adopted_env_stale(marker, os.environ, xcode)
         if gate.stale_env:
             gate_log(f"the adopted listener's env is stale ({gate.stale_env}); restarting it once it is idle")
     os.environ.pop(GATE_LISTENING_SINCE_ENV, None)
+    os.environ.pop(GATE_JOB_DONE_AT_ENV, None)
     # The gate's own env too (the /usr/bin/python3 shim exports SDKROOT): its eligibility probes see the job's env.
     clean = listener_env(os.environ, xcode)
     os.environ.clear()
