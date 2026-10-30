@@ -69,7 +69,10 @@ the daemon is the only process that talks to GitHub, and clients only read its c
 - The X-RateLimit headers and the GraphQL rateLimit field drive a budget guard: below the floor
   (REST 1500 left, GraphQL 500) the daemon polls four times less often and skips job lists; below
   the reserve (REST 300, GraphQL 100) it stops that API until the quota resets. The quota is shared,
-  so this also protects every other tool on the account.
+  so this also protects every other tool on the account. GitHub answers one token's REST calls from
+  two "core" counters with their own hourly windows (run and workflow reads report one; /rate_limit,
+  pulls and job lists the other), so budget.json keeps each live counter in restCounters and "rest"
+  is the poorest of them, never just the last answer.
 - The daemon's own REST polling is capped at restShare (0.4) of the hourly REST limit: the read
   requests it sent over the last hour that GitHub counted (a 304 is free and is not counted, nor is
   the outbox -- writes sessions asked for and their dedupe lookups -- which the share never holds),
@@ -222,6 +225,7 @@ REST_SPEND_FILE = "rest-spend.json"  # the daemon's counted REST requests per mi
 # interval is the secondary limit, which one call every two minutes is nowhere near. 0 turns it off.
 BUDGET_REFRESH = 120.0
 BUDGET_RETRY = 900.0  # after a refused /rate_limit, how long before asking again
+REST_COUNTERS = 4  # most core counters budget.json keeps (GitHub showed two per token on 2026-10-30)
 GQL_BATCH = 15  # most PRs (or runs, or comment watches) per GraphQL query
 # GitHub answers 504 when a query runs past ~10 s. Measured 2026-10-19 on cosmic-gray: 25 PRs per
 # query took 10-11 s (half answered 504), 10 took 4-6 s, 5 took 2-3 s; each cost 1 point. So each
@@ -1370,6 +1374,16 @@ def consumer_policy() -> dict:
     return policy
 
 
+def rest_counters(budget: dict) -> list[dict]:
+    """The well-formed entries of budget["restCounters"] (Daemon.settle_rest)."""
+    out = []
+    for c in budget.get("restCounters") or []:
+        if (isinstance(c, dict) and isinstance(c.get("reset"), (int, float)) and isinstance(c.get("remaining"), int)
+                and isinstance(c.get("seenAt"), (int, float))):
+            out.append(c)
+    return out
+
+
 class Daemon:
     def __init__(self, transport: Callable = http, token: Callable[[], str] = gh_token,
                  controller: Any = "env", upstream: Any = "config") -> None:
@@ -1562,9 +1576,42 @@ class Daemon:
 
     def note_budget(self, bucket: str, limit: Any, remaining: Any, reset: float | None) -> None:
         try:
-            self.budget[bucket] = {"limit": int(limit), "remaining": int(remaining), "reset": reset, "seenAt": self.now}
+            seen = {"limit": int(limit), "remaining": int(remaining), "reset": reset, "seenAt": self.now}
         except (TypeError, ValueError):
-            pass
+            return
+        if bucket != "rest" or not isinstance(reset, (int, float)):
+            self.budget[bucket] = seen
+            return
+        counters = {int(c["reset"]): c for c in rest_counters(self.budget)}
+        counters[int(reset)] = seen
+        self.budget["restCounters"] = sorted(counters.values(), key=lambda c: c["reset"])
+        self.settle_rest()
+
+    def settle_rest(self) -> None:
+        """budget["rest"] is the core counter with the least left. GitHub answers one token's REST calls from
+        two "core" counters with their own hourly windows (measured 2026-10-30: /actions/runs/N and
+        /actions/workflows/N report one, resetting at :44; /rate_limit, pulls, jobs and check runs report the
+        other, resetting at :10), and the headers and /rate_limit name both "core". Keeping only the last
+        answer made the shared reading jump between them (3126 left at 05:28Z, 0 at 05:33Z), which read as a
+        3000-call burst nobody logged, and let the gh guard and this daemon spend freely from a counter that
+        was already spent. Every live counter is kept (restCounters, at most REST_COUNTERS) and the poorest
+        one is what everything else reads; a counter past its reset is dropped."""
+        counters = {int(c["reset"]): c for c in rest_counters(self.budget)}
+        cur = self.budget.get("rest")
+        if isinstance(cur, dict) and isinstance(cur.get("reset"), (int, float)) and isinstance(cur.get("remaining"), int):
+            # the reading itself counts too (a budget.json from before restCounters, or one lowered in place):
+            # within one window a counter only goes down, so the lower of two readings of it is the truer one
+            have = counters.get(int(cur["reset"]))
+            if have is None or cur["remaining"] < have["remaining"]:
+                seen_at = cur.get("seenAt")
+                counters[int(cur["reset"])] = {**cur, "seenAt": seen_at if isinstance(seen_at, (int, float)) else self.now}
+        live = [c for c in counters.values() if c["reset"] > self.now]
+        live = sorted(live, key=lambda c: c["seenAt"], reverse=True)[:REST_COUNTERS]
+        if not live:
+            self.budget.pop("restCounters", None)
+            return
+        self.budget["restCounters"] = sorted(live, key=lambda c: c["reset"])
+        self.budget["rest"] = dict(min(live, key=lambda c: (c["remaining"], -c["seenAt"])))
 
     def refresh_budget(self) -> None:
         """Read the quota from GitHub when this host's view has gone stale.
@@ -1585,7 +1632,11 @@ class Daemon:
         """
         if BUDGET_REFRESH <= 0 or self.now < self.budget_retry or self.clock() < self.secondary_until:
             return
-        seen = [(self.budget.get(b) or {}).get("seenAt") for b in ("rest", "graphql")]
+        # The freshest REST view counts: /rate_limit reports only one of the core counters (settle_rest),
+        # so the other one's age is not something a refresh could fix.
+        rest = [c["seenAt"] for c in rest_counters(self.budget)] + [(self.budget.get("rest") or {}).get("seenAt")]
+        seen = [max((t for t in rest if isinstance(t, (int, float))), default=None),
+                (self.budget.get("graphql") or {}).get("seenAt")]
         ages = [self.now - t for t in seen if isinstance(t, (int, float))]
         if len(ages) == 2 and max(ages) < BUDGET_REFRESH:
             return  # every bucket's view is recent enough; a bucket never seen always refreshes
@@ -2210,6 +2261,7 @@ class Daemon:
         self.spill = []
         self.policy = daemon_policy()
         self.jobs_only = []
+        self.settle_rest()  # a counter whose window ended leaves the reading to the others
         if self.failing is None:
             # and again in serve_waits: a long read phase must not look like a dead daemon; ticks that
             # keep raising stop marking, so their blockers hand the wait back (resume_wait says why)
@@ -4938,6 +4990,11 @@ def cmd_budget(as_json: bool) -> int:
             rate = (status.get("perMinute") or {}).get(bucket)
             spend = f", {rate}/min to spend until then" if isinstance(rate, (int, float)) and rate >= 0 else ""
             print(f"{bucket:<8} {b.get('remaining')}/{b.get('limit')} left, resets {when}{spend}, seen {age(b.get('seenAt'))}")
+            counters = rest_counters(budget) if bucket == "rest" else []
+            if len(counters) > 1:
+                print("         core counters (the poorest is the one above): " + "; ".join(
+                    f"{c['remaining']}/{c.get('limit')} until "
+                    f"{dt.datetime.fromtimestamp(c['reset'], dt.timezone.utc).strftime('%H:%M:%SZ')}" for c in counters))
         paths, reads = status.get("paths"), status.get("reads")
         if isinstance(paths, dict):
             name = {"graphql": "GraphQL", "rest": "REST"}

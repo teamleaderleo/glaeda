@@ -1243,6 +1243,7 @@ class DaemonTest(Base):
         self.daemon.tick(NOW)  # both buckets below their reserve: nothing is read
         self.assertEqual(self.gh.calls, [])
         self.daemon.budget.pop("rest")
+        self.daemon.budget.pop("restCounters", None)  # forget every core counter, not only the reading
         (gg.watch_dir() / gg.file_name("pr:o/r#1")).unlink()  # else it, too, would now go over REST
 
         def limited(method, url, headers, body):
@@ -5755,6 +5756,65 @@ class BudgetRefreshTest(Base):
         status = self.daemon.tick(NOW + 10 * gg.BUDGET_REFRESH)
         self.assertEqual(self.daemon.budget["rest"], kept)
         self.assertTrue(any("rate_limit: HTTP 403" in e for e in status["errors"]))
+
+
+class RestCountersTest(Base):
+    """One token's REST calls are answered from two "core" counters with their own windows (2026-10-30:
+    /actions/runs/N reported 3068 left until :44 while /rate_limit and pulls reported 2737 until :10, both
+    "core"). The reading must be the poorest live counter, not whichever answered last: the last-answer
+    reading jumped from 3126 to 0 in five minutes and was chased as a 3000-call burst nobody logged."""
+
+    def test_the_poorer_counter_is_the_reading_whichever_answered_last(self) -> None:
+        self.daemon.now = NOW
+        self.daemon.note_budget("rest", 5000, 0, NOW + 600)      # /rate_limit's counter: spent
+        self.daemon.note_budget("rest", 5000, 3126, NOW + 2400)  # a run read's counter, answered later
+        self.assertEqual(self.daemon.budget["rest"]["remaining"], 0)
+        self.assertEqual(self.daemon.budget["rest"]["reset"], NOW + 600)
+        self.assertEqual(self.daemon.mode("rest"), "stop")
+        self.assertEqual([c["remaining"] for c in self.daemon.budget["restCounters"]], [0, 3126])
+
+    def test_one_counter_answering_again_is_updated_not_duplicated(self) -> None:
+        self.daemon.now = NOW
+        self.daemon.note_budget("rest", 5000, 3000, NOW + 600)
+        self.daemon.note_budget("rest", 5000, 2900, NOW + 600)
+        self.assertEqual(len(self.daemon.budget["restCounters"]), 1)
+        self.assertEqual(self.daemon.budget["rest"]["remaining"], 2900)
+
+    def test_a_counter_past_its_reset_leaves_the_reading_to_the_other(self) -> None:
+        self.daemon.now = NOW
+        self.daemon.note_budget("rest", 5000, 10, NOW + 60)
+        self.daemon.note_budget("rest", 5000, 2500, NOW + 2400)
+        self.assertEqual(self.daemon.budget["rest"]["remaining"], 10)
+        self.daemon.now = NOW + 61
+        self.daemon.settle_rest()
+        self.assertEqual(self.daemon.budget["rest"]["remaining"], 2500)
+        self.assertEqual(len(self.daemon.budget["restCounters"]), 1)
+
+    def test_budget_json_carries_the_poorest_counter_for_every_reader(self) -> None:
+        """gh-quota (leo-workspace tools/gh_quota.py) and the gh broker read budget.json's "rest" only."""
+        gg.BUDGET_REFRESH = 120.0
+        self.gh.rest_remaining = 4000  # /rate_limit's counter, reset NOW + 1800 in the fake
+        self.daemon.now = NOW
+        self.daemon.note_budget("rest", 5000, 120, NOW + 3000)  # the other counter, nearly spent
+        self.daemon.tick(NOW)
+        doc = gg.read_json(gg.BASE / "budget.json")
+        self.assertEqual(doc["rest"]["remaining"], 120)
+        self.assertEqual(sorted(c["remaining"] for c in doc["restCounters"]), [120, 4000])
+
+    def test_a_stale_counter_rate_limit_cannot_see_does_not_force_a_refresh_every_tick(self) -> None:
+        gg.BUDGET_REFRESH = 120.0
+        self.daemon.now = NOW - 10 * gg.BUDGET_REFRESH
+        self.daemon.note_budget("rest", 5000, 50, NOW + 3000)  # seen long ago from a run read's headers
+        self.daemon.tick(NOW)
+        self.assertEqual(self.gh.rate_limit_calls, 1)
+        self.daemon.tick(NOW + gg.BUDGET_REFRESH / 2)
+        self.assertEqual(self.gh.rate_limit_calls, 1, "the /rate_limit counter is fresh; the other one cannot be refreshed")
+        self.assertEqual(self.daemon.budget["rest"]["remaining"], 50)
+
+    def test_a_reading_without_a_reset_still_counts(self) -> None:
+        self.daemon.now = NOW
+        self.daemon.note_budget("rest", 5000, 77, None)
+        self.assertEqual(self.daemon.budget["rest"]["remaining"], 77)
 
 
 class BrokerBase(Base):
