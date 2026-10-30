@@ -5816,6 +5816,44 @@ class RestCountersTest(Base):
         self.daemon.note_budget("rest", 5000, 77, None)
         self.assertEqual(self.daemon.budget["rest"]["remaining"], 77)
 
+    def test_a_reading_without_a_reset_does_not_replace_a_known_counter(self) -> None:
+        self.daemon.now = NOW
+        self.daemon.note_budget("rest", 5000, 40, NOW + 600)
+        self.daemon.note_budget("rest", 5000, 4000, None)
+        self.assertEqual(self.daemon.budget["rest"]["remaining"], 40)
+        self.assertEqual(self.daemon.mode("rest"), "stop")
+
+    def test_a_late_higher_reading_of_a_counter_does_not_raise_it(self) -> None:
+        """Within one window a counter only goes down: a delayed answer must not lift what a later one saw."""
+        self.daemon.now = NOW
+        self.daemon.note_budget("rest", 5000, 100, NOW + 2400)  # counter A
+        self.daemon.note_budget("rest", 5000, 50, NOW + 600)    # counter B, the poorer
+        self.daemon.note_budget("rest", 5000, 200, NOW + 2400)  # a delayed answer from A
+        self.daemon.now = NOW + 601
+        self.daemon.settle_rest()  # B's window ended
+        self.assertEqual(self.daemon.budget["rest"]["remaining"], 100)
+
+    def test_a_reset_one_second_off_is_the_same_counter(self) -> None:
+        self.daemon.now = NOW
+        self.daemon.note_budget("rest", 5000, 300, NOW + 600)
+        self.daemon.note_budget("rest", 5000, 290, NOW + 601)
+        self.assertEqual(len(self.daemon.budget["restCounters"]), 1)
+        self.assertEqual(self.daemon.budget["rest"]["remaining"], 290)
+        self.assertEqual(self.daemon.budget["rest"]["reset"], NOW + 601)
+
+    def test_a_fresh_hidden_counter_does_not_keep_the_visible_one_from_refreshing(self) -> None:
+        gg.BUDGET_REFRESH = 120.0
+        self.daemon.tick(NOW)  # /rate_limit: its counter, reset NOW + 1800 in the fake
+        self.assertEqual(self.gh.rate_limit_calls, 1)
+        later = NOW + 10 * gg.BUDGET_REFRESH
+        self.daemon.now = later
+        self.daemon.note_budget("rest", 5000, 3000, NOW + 3000)  # a run read's counter, just seen
+        self.daemon.note_budget("graphql", 5000, 4000, NOW + 3000)
+        self.gh.rest_remaining = 900
+        self.daemon.tick(later)
+        self.assertEqual(self.gh.rate_limit_calls, 2, "the /rate_limit counter was stale, so it is read again")
+        self.assertEqual(self.daemon.budget["rest"]["remaining"], 900)
+
 
 class BrokerBase(Base):
     """`glaeda-gh gh ARG...` in front of one real gh call."""
