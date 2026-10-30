@@ -117,6 +117,13 @@ are never its items. A runner directory glaeda did not install (retired-runner: 
 launchd job, process or configuration names goes the same way once idle 12 h: the hand-made runner its glaeda
 install replaced.
 
+A Chromium or CEF tree (superseded-chromium: a gclient root in a fleet mini's home with enrolled runners) is no
+longer kept for its name alone. Trees are grouped by solution URL and the branch src (and src/cef) is on; the most
+recently used tree of each group stays by role, and so does ~/cmux-browser-fleet/build (NEVER_DELETE's paths). Any
+other tree of a group goes once idle 12 h: every checkout's commits, branches and tags no server confirms bundled and
+its uncommitted work archived into ~/archive first; a checkout .gclient_entries does not pin keeps it. A recipe sync lock (<name>.sync.lock), .build.active, a process, a socket, a
+lease or a configuration mention keeps it. depot_tools, siso, vpython and cipd caches outside a superseded tree stay.
+
 The runner-account profile is intentionally narrower than the normal user profile:
 it covers only DerivedData, cmux reload/GhosttyKit caches, and CUA recordings/frame
 caches, with a DEFAULT_AGE_HOURS (12 h) minimum idle age. Git index refreshes are ignored for that
@@ -141,7 +148,7 @@ trusted seeder, a seed its serve log shows streamed whole to the seed archive (c
 reclaimable at once instead of after the idle window: the PR minis restore it from there over the LAN.
 SwiftPM scratch (spm-scratch/<fingerprint>) that no job holds by its lock ages like any cache, and goes
 whatever its age once free space is below the emergency floor. The Chromium source tree under
-cmux-browser-fleet/build and protected release-support caches are never deleted. Small top-level
+cmux-browser-fleet/build and protected release-support caches are never deleted (other Chromium trees: superseded-chromium). Small top-level
 browser tour artifacts and fleet cache entries older than the 2026-09-17 migration cutoff are
 disposable; newer ones stay when a live reservation or lease names them.
 
@@ -425,6 +432,9 @@ class Family:
     # entries follow the normal idle window and are protected when a live lease names them.
     stale_before: float | None = None
     allow_stale_protected: bool = False  # permit an explicit family below NEVER_DELETE roots
+    # candidates are the gclient roots below root (chromium_roots): NEVER_DELETE_NAMES does not veto them (its paths
+    # still do), and archive_chromium, not git_state, decides what deleting one loses
+    chromium_trees: bool = False
     reference_root: Path | None = None  # root containing lease/job markers for this family
     # Past this idle age the checkouts inside an item are mirrors (a GitHub clone, a laptop's synced tree)
     # and no git check keeps it; process, socket and job-marker checks still do.
@@ -664,10 +674,11 @@ def toolchain_within(path: Path) -> bool:
                for p in {os.path.abspath(path), os.path.realpath(path)} for k in toolchain_keep())
 
 
-def never_delete(path: Path, walk: bool = False) -> bool:
+def never_delete(path: Path, walk: bool = False, names: bool = True) -> bool:
     """With walk (a discovery walk asking whether to descend), a directory only above the job toolchain is not
-    kept from the walk, only from being taken itself."""
-    if NEVER_DELETE_NAMES.search(path.name):
+    kept from the walk, only from being taken itself. Without names, only NEVER_DELETE's paths and the toolchain
+    keep it (the superseded-chromium family: a Chromium tree by name is its very item)."""
+    if names and NEVER_DELETE_NAMES.search(path.name):
         return True
     return (_at_inside_or_above(path, [os.path.realpath(HOME / keep) for keep in NEVER_DELETE])
             or (toolchain_within(path) if walk else toolchain_held(path)))
@@ -3787,6 +3798,387 @@ def home_scratch_referenced(path: Path) -> str:
     return ""
 
 
+# Superseded Chromium and CEF trees (Leo, 2026-10-27, on the Macs' old Chromium and CEF trees: "just fucking clean it
+# up directly. they are now touch if shit's superseded ... they're touchable now. we all own these"; 2026-10-28, on a
+# mini kept as the only Chromium worker: "we do this so infrequently it's asinine to reserve it 'just in case' when
+# the case is 'once in blue moon'"). NEVER_DELETE_NAMES kept every Chromium tree whatever its age, so a tree a newer
+# one replaced (40-70 GiB each) stayed for good. A tree is a gclient root: a folder holding .gclient and src/.git
+# (a Chromium checkout, CMUX's recipe work dirs, a CEF automate chromium_git/chromium). Trees are grouped by their
+# solution URL and the branch src (and src/cef) is on; per group the most recently used tree stays by role, and so
+# does every tree under NEVER_DELETE's paths (~/cmux-browser-fleet/build, the browser worker's warm tree), which counts
+# as a group member all the same. Any other tree of a group, idle DEFAULT_AGE_HOURS, goes once its work is safe:
+# every repository's (src, src/cef and each DEPS checkout) commits, branches and tags no server confirms are bundled
+# and its uncommitted work archived into ~/archive; every DEPS checkout must be one .gclient_entries pins, and that
+# file must not change while the tree is archived. A tree gclient did not record, an unpinned checkout, a held recipe sync lock
+# (<name>.sync.lock beside it), a .build.active marker, a process, a socket, a lease or a configuration mention keeps it.
+CHROMIUM_FAMILY = "superseded-chromium"
+CHROMIUM_TOPS = ("src", "src/cef")  # the solution checkouts; every other repository must be a pinned DEPS checkout
+CHROMIUM_WALK_DEPTH = 4  # ~/cmux-browser-fleet/build/chromium is 3 down, ~/x/chromium_git/chromium too
+CHROMIUM_WALK_BUDGET = 200_000
+CHROMIUM_WALK_SKIP = frozenset(("Library", "Applications", "Desktop", "Documents", "Downloads", "Movies", "Music",
+                                "Pictures", "Public", "Projects", "archive", "node_modules"))
+CHROMIUM_REPO_BUDGET = 5_000_000  # a full Chromium checkout, out/ included, is ~1-2 M entries
+# What a sync, a build or a recipe step rewrites: a tree's last use is the newest of these and the files in its top
+# two levels. Never a file in a .git: archive_chromium's own git reads and bundles must not make a tree the newest.
+CHROMIUM_USE_GLOBS = (".gclient", ".gclient_entries", ".seed-ready", ".build.active", ".warm-output-ready.json",
+                      "src/out/*/.ninja_log", "src/out/*/.ninja_deps", "src/out/*/build.ninja", "src/out/*/args.gn")
+
+
+def _literal_assign(path: Path, name: str) -> Any:
+    """The literal a gclient file assigns to name (gclient's files are Python); raises OSError or ValueError."""
+    return _literal_bytes(path.read_bytes(), name)
+
+
+def _literal_bytes(text: bytes, name: str) -> Any:
+    for node in ast.parse(text).body:
+        if (isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name)
+                and node.targets[0].id == name):
+            return ast.literal_eval(node.value)
+    raise ValueError(f"assigns no {name}")
+
+
+def chromium_roots(root: Path) -> list[Path]:
+    """Every gclient root up to CHROMIUM_WALK_DEPTH below root, a found root not searched further, symlinks not
+    followed, and every tree remove() left aside there (DELETING_RE), so interrupted_families finishes one with no
+    sibling tree left. A walk past its budget returns what it found: a tree only goes for a newer one found beside
+    it."""
+    found: list[Path] = []
+    frontier, budget = [os.fspath(root)], CHROMIUM_WALK_BUDGET
+    for _ in range(CHROMIUM_WALK_DEPTH + 1):
+        nxt: list[str] = []
+        for d in frontier:
+            if d != os.fspath(root) and os.path.isfile(os.path.join(d, ".gclient")):
+                found.append(Path(d))
+                continue
+            try:
+                with os.scandir(d) as it:
+                    for e in it:
+                        budget -= 1
+                        if budget < 0:
+                            return found
+                        if DELETING_RE.fullmatch(e.name) and e.is_dir(follow_symlinks=False):
+                            found.append(Path(e.path))
+                        elif (e.is_dir(follow_symlinks=False) and e.name not in CHROMIUM_WALK_SKIP
+                                and not e.name.startswith((".", "actions-runner"))):
+                            nxt.append(e.path)
+            except OSError:
+                continue
+        frontier = nxt
+    return found
+
+
+def chromium_last_use(tree: Path) -> float:
+    newest = newest_mtime(tree, 2, 3000, skip_names=frozenset(VCS_MARKERS))
+    for pattern in CHROMIUM_USE_GLOBS:
+        for f in glob.glob(os.path.join(glob.escape(os.fspath(tree)), pattern)):
+            with contextlib.suppress(OSError):
+                newest = max(newest, os.lstat(f).st_mtime)
+    return newest
+
+
+def chromium_group(tree: Path) -> str | None:
+    """Which trees replace each other: the solution URLs and the branch src (and src/cef) is on (a detached HEAD,
+    a recipe's pinned tag, is no branch). None when .gclient or src cannot be read: never superseded."""
+    try:
+        solutions = _literal_assign(tree / ".gclient", "solutions")
+        urls = sorted(str(s["url"]).rstrip("/").removesuffix(".git") for s in solutions)
+    except (OSError, ValueError, SyntaxError, TypeError, KeyError):
+        return None
+    if not urls or not (tree / "src/.git").exists():
+        return None
+    branches = []
+    for top in CHROMIUM_TOPS:
+        if (tree / top / ".git").exists():
+            ref = _git_dir_run(tree / top / ".git", "symbolic-ref", "-q", "HEAD")
+            branches.append(f"{top}={(ref or '').strip()}")
+    return " ".join(urls + branches)
+
+
+# Every aside a Chromium delete is about to make, written before remove()'s rename (a failed write renames nothing):
+# interrupted_families resumes each one from here, whatever the discovery walk finds, and drops entries that are gone.
+CHROMIUM_ASIDES = HOME / ".local/state/glaeda/disk/chromium-asides.jsonl"
+
+
+def record_chromium_aside(tree: Path) -> None:
+    """Note the aside remove() is about to rename tree to; raises OSError when it cannot be noted."""
+    CHROMIUM_ASIDES.parent.mkdir(parents=True, exist_ok=True)
+    aside = tree.with_name(f"{DELETING_PREFIX}{tree.name}-{os.getpid()}")
+    with CHROMIUM_ASIDES.open("a") as f:
+        f.write(json.dumps({"aside": os.fspath(aside), "tree": os.fspath(tree), "at": int(time.time())}) + "\n")
+        f.flush()
+        os.fsync(f.fileno())
+
+
+def chromium_asides() -> list[Path]:
+    """The recorded asides still on disk; the journal is rewritten without the ones that are gone."""
+    try:
+        lines = CHROMIUM_ASIDES.read_text().splitlines()
+    except FileNotFoundError:
+        return []
+    except OSError:
+        return []
+    keep, out = [], []
+    for line in lines:
+        with contextlib.suppress(ValueError, TypeError, KeyError):
+            aside = Path(json.loads(line)["aside"])
+            if os.path.lexists(aside) and DELETING_RE.fullmatch(aside.name):
+                keep.append(line)
+                out.append(aside)
+    if len(keep) != len(lines):
+        with contextlib.suppress(OSError):
+            tmp = CHROMIUM_ASIDES.with_name(CHROMIUM_ASIDES.name + f".{os.getpid()}.tmp")
+            tmp.write_text("".join(ln + "\n" for ln in keep))
+            os.replace(tmp, CHROMIUM_ASIDES)
+    return out
+
+
+_CHROMIUM_GROUPS: dict[str, dict[str, str]] = {}  # root -> {tree: why it stays by role, "" when superseded}
+
+
+def chromium_verdict(fam: Family, tree: Path, fresh: bool = False) -> str:
+    """Why a Chromium tree stays whatever its age ("" when a newer tree of its group replaced it). The groups are
+    read once per survey; fresh reads them again (apply's last check before the delete)."""
+    if (tree / ".build.active").exists():
+        return "a Chromium build is active in it (.build.active)"
+    lock = tree.parent / f"{tree.name}.sync.lock"
+    if lock.exists():
+        try:
+            with lock.open("rb") as f:
+                fcntl.flock(f, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except OSError:
+            return f"a Chromium recipe holds {lock.name}"
+    key = os.fspath(fam.root)
+    if fresh:
+        _CHROMIUM_GROUPS.pop(key, None)
+    if key not in _CHROMIUM_GROUPS:
+        trees = [t for t in chromium_roots(fam.root) if not DELETING_RE.fullmatch(t.name)]
+        groups: dict[str, list[Path]] = {}
+        verdicts: dict[str, str] = {}
+        for t in trees:
+            g = chromium_group(t)
+            if g is None:
+                verdicts[os.fspath(t)] = "unreadable .gclient or src: not known to be superseded"
+            else:
+                groups.setdefault(g, []).append(t)
+        for g, members in groups.items():
+            newest = max(members, key=chromium_last_use)
+            for t in members:
+                verdicts[os.fspath(t)] = (f"the newest Chromium tree of its group ({g}): kept by role" if t == newest
+                                          else "")
+        _CHROMIUM_GROUPS[key] = verdicts
+    return _CHROMIUM_GROUPS[key].get(os.fspath(tree), "not found among the gclient roots")
+
+
+class ChromiumSocket(Exception):
+    """A Unix socket somewhere in a Chromium tree: something is serving from it."""
+
+
+class ChromiumBare(Exception):
+    """A bare repository (or a copied git dir) somewhere in a Chromium tree: nothing here bundles it."""
+
+
+def _chromium_repos(tree: Path) -> list[Path] | None:
+    """Every checkout in the whole tree (a .git file or directory), build output included; None past the budget or
+    on a directory that cannot be read (it could hide one). Raises ChromiumSocket on a socket at any depth: the
+    walk reads every entry anyway, so in-use is judged in full here, never by a budgeted look that gives up."""
+    found: list[Path] = []
+    stack, budget = [os.fspath(tree)], CHROMIUM_REPO_BUDGET
+    while stack:
+        d = stack.pop()
+        try:
+            with os.scandir(d) as it:
+                for e in it:
+                    budget -= 1
+                    if budget < 0:
+                        return None
+                    if e.name == ".git":
+                        found.append(Path(d))
+                    if e.is_dir(follow_symlinks=False):
+                        if e.name != ".git":
+                            if looks_like_repository(e.path):  # a bare repository: its refs are no checkout's
+                                raise ChromiumBare(e.path)
+                            stack.append(e.path)
+                    elif e.is_symlink():
+                        continue
+                    elif stat.S_ISSOCK(e.stat(follow_symlinks=False).st_mode):
+                        raise ChromiumSocket(e.path)
+        except OSError:
+            return None
+    return found
+
+
+def chromium_repos(tree: Path) -> tuple[str, list[Path]]:
+    """("" or why the tree must stay, its checkouts)."""
+    try:
+        repos = _chromium_repos(tree)
+    except ChromiumSocket as e:
+        return f"holds a socket ({os.path.relpath(str(e), tree)})", []
+    except ChromiumBare as e:
+        return f"holds a bare repository ({os.path.relpath(str(e), tree)})", []
+    return ("too large or unreadable to find every checkout", []) if repos is None else ("", repos)
+
+
+def archive_chromium(tree: Path) -> tuple[str, list[Path], tuple]:
+    """Before a superseded tree goes: check every DEPS repository is one gclient pinned, bundle what no server
+    holds of every repository, and archive every repository's uncommitted work.
+    ("" or why it must stay, the archives written, what chromium_moved rechecks)."""
+    none: tuple = ([], [], [], {})
+    if (why := archive_root_why(tree)):
+        return why, [], none
+    try:
+        pins = (tree / ".gclient_entries").read_bytes()  # one read: what is judged is what the recheck compares
+        entries = _literal_bytes(pins, "entries")
+        if not isinstance(entries, dict):
+            raise ValueError("not a dict")
+    except (OSError, ValueError, SyntaxError) as e:
+        return f"no readable .gclient_entries ({e.__class__.__name__}): its dependencies cannot be checked", [], none
+    why, repos = chromium_repos(tree)
+    if why:
+        return why, [], none
+    rels = {os.path.relpath(r, tree): r for r in repos}
+    if not any(r in rels for r in CHROMIUM_TOPS):
+        return "no src checkout", [], none
+    for rel, r in sorted(rels.items()):
+        if (r / ".git").is_symlink():
+            return f"{rel}: .git is a symlink", [], none
+        if not (r / ".git").is_dir():  # a linked worktree or a gitfile submodule: its repository may sit elsewhere
+            return f"{rel}: .git is not a directory", [], none
+        if (linked := _linked_trees_strict(r / ".git")) is None or linked:
+            # deleting the repository would orphan its linked worktrees, whose work is outside the tree
+            return f"{rel}: has linked worktrees or unreadable worktree records", [], none
+        if rel in CHROMIUM_TOPS:
+            continue
+        pin = entries.get(rel)
+        if not isinstance(pin, str) or "@" not in pin:
+            return f"{rel}: a checkout gclient did not pin", [], none
+    gitdirs = [r / ".git" for r in repos]
+    trees = sorted(repos)
+    snap = mirror_git_snapshot(gitdirs, trees)
+    found = {os.path.realpath(t) for t in trees}
+    tips = mirror_tips(tree, {os.path.realpath(g): g for g in gitdirs})
+    if tips is None:
+        return "unreadable refs", [], none
+    # Every repository, src and each DEPS checkout alike: what no server confirms it holds (ls-remote and fetch
+    # --negotiate-only, never a local remote-tracking ref or tag) goes to a verified bundle, every local branch and
+    # tag the servers lack included; what the bundles leave to the servers is asked again right before the delete.
+    bundles: list[Path] = []
+    relied: dict[Path, list[str]] = {}
+    for g in gitdirs:
+        if (why := bundle_unpushed(g, os.path.realpath(g.parent), bundles, relied.setdefault(g, []))):
+            return why, bundles, none
+    work: dict[str, tuple] = {}
+    for t in trees:
+        why, fingerprint = archive_work_tree(t, tree, found, bundles, same_gitlinks_ok=True)
+        if why:
+            return why, bundles, none
+        work[os.path.relpath(t, tree)] = fingerprint
+    try:
+        archives = {os.fspath(b): _sha256(b) for b in bundles}
+    except OSError as e:
+        return f"an archive is unreadable: {e.__class__.__name__}", bundles, none
+    return "", bundles, (gitdirs, trees, snap, (work, archives, pins, relied, tips))
+
+
+def chromium_rename_recheck(fam: Family, tree: Path, recheck: tuple):
+    """after_rename for a Chromium tree: everything that keeps a tree is read again on the aside (a process's cwd, an
+    open file or a command naming either path, a socket, a bare repository, the same checkouts, .build.active, the
+    recipe's sync lock, a lease, a configuration mention, .gclient_entries). On any of them the tree goes back to its
+    path, or, when that fails, stays aside: its keep marker is written before the rename (if that write fails,
+    nothing is renamed) and removed only once the check passes, so the interrupted-deletions family never finishes a
+    tree whose work this pass did not clear."""
+    doomed = tree.with_name(f"{DELETING_PREFIX}{tree.name}-{os.getpid()}")
+    marker = mirror_keep_marker(doomed)
+    marker.write_text(f"kept by glaeda-disk {os.getpid()} until its Chromium tree is checked again\n")  # raises: kept
+    trees, pins = recheck[1], recheck[3][2]
+
+    def why_busy() -> str:
+        try:
+            opened, cmds = process_evidence()
+        except NoEvidence as e:
+            return f"no process evidence: {e}"
+        if in_cwd(os.fspath(doomed), open_index(opened)) or named_by(os.fspath(tree), cmds) \
+                or named_by(os.fspath(doomed), cmds):
+            return "a process uses it"
+        why, now = chromium_repos(doomed)
+        if why:
+            return why
+        if sorted(os.path.relpath(r, doomed) for r in now) != sorted(os.path.relpath(t, tree) for t in trees):
+            return "its checkouts changed"
+        if (doomed / ".build.active").exists():
+            return "a Chromium build started in it"
+        lock = tree.parent / f"{tree.name}.sync.lock"
+        if lock.exists():
+            try:
+                with lock.open("rb") as f:
+                    fcntl.flock(f, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            except OSError:
+                return f"a Chromium recipe holds {lock.name}"
+        try:
+            if (doomed / ".gclient_entries").read_bytes() != pins:
+                return "its .gclient_entries changed"
+        except OSError:
+            return "its .gclient_entries is unreadable"
+        if fam.reference_root is not None and any(artifact_referenced(q, fresh_artifact_references(fam.reference_root))
+                                                  for q in (tree, doomed)):
+            return "a lease names it"
+        return home_scratch_referenced(tree) or home_scratch_referenced(doomed)
+
+    def check() -> None:
+        why = why_busy()
+        if not why:
+            try:
+                marker.unlink()
+                return
+            except OSError as e:
+                why = f"its keep marker could not be removed ({e.strerror})"
+        try:
+            rename_noreplace(doomed, tree)
+        except OSError as e:
+            raise SlotTaken(f"{tree.name}: {why} after its rename; kept aside as {doomed.name} ({e.strerror})")
+        with contextlib.suppress(OSError):
+            marker.unlink()
+        raise SlotTaken(f"{tree.name}: {why} after its rename; put back")
+    return check
+
+
+def chromium_moved(fam: Family, tree: Path, recheck: tuple) -> str:
+    """Right before the delete: the same repositories, refs and work trees as when archived, the archives intact, and
+    nothing using, naming or locking the tree."""
+    gitdirs, trees, snap, (work, archives, pins, relied, tips) = recheck
+    for g, commits in relied.items():  # the slow network first, the quick checks last
+        if (why := server_still_holds(g, commits)):
+            return why
+    try:
+        if (tree / ".gclient_entries").read_bytes() != pins:
+            return "its .gclient_entries changed while it was archived"
+    except OSError:
+        return "its .gclient_entries became unreadable while it was archived"
+    why, now = chromium_repos(tree)
+    if why:
+        return why
+    if sorted(now) != trees:
+        return "its checkouts changed while they were archived"
+    if None in snap or mirror_git_snapshot(gitdirs, trees) != snap \
+            or mirror_tips(tree, {os.path.realpath(g): g for g in gitdirs}) != tips:
+        return "its git refs or work trees changed while they were archived"
+    found = {os.path.realpath(t) for t in trees}
+    if any(work_tree_fingerprint(t, found, same_gitlinks_ok=True) != work[os.path.relpath(t, tree)] for t in trees):
+        return "its uncommitted work changed while it was archived"
+    if (why := chromium_verdict(fam, tree, fresh=True)) or (why := home_scratch_referenced(tree)):
+        return why
+    if fam.reference_root is not None and artifact_referenced(tree, fresh_artifact_references(fam.reference_root)):
+        return "referenced while its git work was archived"
+    try:
+        opened, cmds = process_evidence()
+    except NoEvidence as e:
+        return f"no process evidence: {e}"
+    if in_cwd(os.fspath(tree), open_index(opened)) or named_by(os.fspath(tree), cmds) or holds_socket(tree):
+        return "in use while its git work was archived"
+    if (why := mount_below(tree, CHROMIUM_REPO_BUDGET)):
+        return why
+    return archives_intact(archives, tree)
+
+
 def transcript_candidates(root: Path, archives: bool = False) -> list[Path]:
     """Return regular transcript files without treating the Codex tree as a cache."""
     roots = [root / "archive"] if archives else [root / "sessions", root / "thread_history"]
@@ -4003,6 +4395,9 @@ def default_families(role: str = "fleet-mini") -> list[Family]:
                                mirror_idle_hours=CMUX_JOB_MIRROR_HOURS,
                                owner="agent lanes and hand-run jobs on the mini", rebuild_minutes=10,
                                platform="macos"))
+            fams.append(Family(CHROMIUM_FAMILY, HOME, True, "a newer Chromium tree of its group replaced it",
+                               chromium_trees=True, min_idle_hours=DEFAULT_AGE_HOURS, reference_root=FLEET_ROOT,
+                               owner="Chromium and CEF builds (gclient)", rebuild_minutes=120, platform="macos"))
             fams.append(Family(RETIRED_RUNNER_FAMILY, HOME, True, "nothing runs it: glaeda's runner replaced it",
                                include=("actions-runner",), skip_prefixes=("actions-runner-glaeda",),
                                skip=tuple(r.name for r in enrolled_runners()),  # glaeda's, whatever --runner-dir
@@ -4492,6 +4887,8 @@ def item_mtime(fam: Family, path: Path) -> float:
             newest = max(newest, spm_lock(path).stat().st_mtime)
     if fam.id == NIGHTLY_NEXT_FAMILY:
         newest = max(newest, nightly_next_last_use(path))
+    if fam.chromium_trees:
+        newest = max(newest, chromium_last_use(path))
     return newest
 
 
@@ -5023,7 +5420,7 @@ def mirror_due(fam: Family, path: Path, idle_hours: float) -> bool:
 
 def git_exempt(fam: Family, path: Path, idle_hours: float) -> bool:
     """No git check applies: build output (derived_data), or a mirror (mirror_due), whose apply bundles first."""
-    return derived_data(fam, path) or mirror_due(fam, path, idle_hours)
+    return derived_data(fam, path) or mirror_due(fam, path, idle_hours) or fam.chromium_trees
 
 
 # A deletion interrupted after remove()'s rename (the process killed, the host rebooted) leaves the tree under
@@ -5070,6 +5467,9 @@ def interrupted_families(fams: list[Family]) -> list[Family]:
             dirs.update(cmux_next_ci_host_parents(fam.root))
         if fam.discover or fam.checkout_builds:
             dirs.update(p.parent for p in candidates(fam))
+        elif fam.chromium_trees:  # an aside is resumed from the journal, and from the walk for one made before it
+            dirs.update(p.parent for p in chromium_roots(fam.root))
+            dirs.update(p.parent for p in chromium_asides())
         else:  # a match family's candidates sit within depth levels too: an aside one left no candidate behind
             level = [fam.root]
             for _ in range(fam.depth - 1):
@@ -5434,6 +5834,8 @@ def keep_verdict(fam: "Family", path: Path) -> str:
         return rustup_verdict(path)
     if fam.checkout_builds and path.parent.name == "cache" and path.parent.parent.name == "apple-build":
         return apple_build_verdict(path)
+    if fam.chromium_trees:
+        return chromium_verdict(fam, path)
     return ""
 
 
@@ -6296,11 +6698,14 @@ def _build_output_dir(d: str) -> bool:
                                                              len(CACHEDIR_TAG)) == CACHEDIR_TAG
 
 
-def work_tree_changes(root: Path, trees: set[str]) -> tuple[str, bytes, list[tuple[str, Path, str]]]:
+def work_tree_changes(root: Path, trees: set[str],
+                      same_gitlinks_ok: bool = False) -> tuple[str, bytes, list[tuple[str, Path, str]]]:
     """What deleting this work tree loses that no bundle holds: ("" or why no patch can hold it, its tracked
     changes as a binary patch against HEAD, its untracked files that are neither ignored nor build output (a
     directory named in REPRODUCIBLE_DIRS or tagged with a CACHEDIR.TAG) as (path relative to root, path, sha256)).
-    An untracked checkout is skipped only when it is one of trees (bundled and archived on its own)."""
+    An untracked checkout is skipped only when it is one of trees (bundled and archived on its own). With
+    same_gitlinks_ok, a submodule whose commit is unchanged but whose own work tree is dirty is allowed (the caller
+    archives that checkout on its own); a moved submodule pointer still is not."""
     g = root / ".git"
     flags = _git_dir_run(g, "--work-tree", str(root), "ls-files", "-v")
     if _git_dir_run(g, "rev-parse", "-q", "--verify", "HEAD^{commit}") is None:  # unborn: no patch base
@@ -6311,7 +6716,8 @@ def work_tree_changes(root: Path, trees: set[str]) -> tuple[str, bytes, list[tup
         return "unreadable work tree", b"", []
     if any(ln[:1].islower() or ln[:1] == "S" for ln in flags.splitlines()):
         return "files hidden from status (assume-unchanged or skip-worktree)", b"", []
-    if any(f[0] == ":160000" or (len(f) > 1 and f[1] == "160000")
+    if any((f[0] == ":160000" or (len(f) > 1 and f[1] == "160000"))
+           and not (same_gitlinks_ok and len(f) > 3 and f[:2] == [":160000", "160000"] and f[2] == f[3])
            for f in (ln.split() for ln in raw.splitlines()) if f):
         return "a submodule pointer changed", b"", []
     # the patch is the work tree against HEAD: a staged path whose work-tree copy differs from the index holds
@@ -6367,19 +6773,20 @@ def work_tree_changes(root: Path, trees: set[str]) -> tuple[str, bytes, list[tup
     return "", diff.stdout, files
 
 
-def work_tree_fingerprint(root: Path, trees: set[str]) -> tuple | None:
+def work_tree_fingerprint(root: Path, trees: set[str], same_gitlinks_ok: bool = False) -> tuple | None:
     """What archive_work_tree archived of this tree, to compare right before the delete; None if unreadable."""
-    why, patch, files = work_tree_changes(root, trees)
+    why, patch, files = work_tree_changes(root, trees, same_gitlinks_ok)
     return None if why else (hashlib.sha256(patch).hexdigest(), tuple((r, d) for r, _, d in files))
 
 
-def archive_work_tree(root: Path, inside: Path, trees: set[str], written: list[Path]) -> tuple[str, tuple | None]:
+def archive_work_tree(root: Path, inside: Path, trees: set[str], written: list[Path],
+                      same_gitlinks_ok: bool = False) -> tuple[str, tuple | None]:
     """Archive a dirty work tree's uncommitted work under ~/archive/glaeda-disk before it goes: its tracked
     changes as <name>.expires-<date>.patch (`git apply --binary` onto its HEAD, named in the manifest, restores
     them; checked here by `git apply --check -R` against the tree itself) and its untracked files as
     <name>.expires-<date>.tar.gz (`tar -xzf` into the tree; read back here, every file's sha256 matched).
     ("" | "uncommitted: why no patch holds it" | why writing failed, its fingerprint)."""
-    why, patch, files = work_tree_changes(root, trees)
+    why, patch, files = work_tree_changes(root, trees, same_gitlinks_ok)
     where = os.path.relpath(root, inside)
     if why:
         return f"uncommitted: {where}: {why}", None
@@ -7106,6 +7513,8 @@ def job_busy(fam: Family, path: Path) -> bool:
         return False
     if fam.id == INTERRUPTED:  # renamed away from every job's path; its deleter's pid is its in-use signal
         return False
+    if fam.chromium_trees:  # far wider than the budget; its sync lock, .build.active and processes are its signals
+        return False
     if media_tour_dd(fam, path):
         # A tour's DerivedData holds hundreds of module cache directories within three levels, wider than
         # cmux_active's budget, so every media dir read as busy and a host the media role left never evicted its
@@ -7204,6 +7613,11 @@ def candidates(fam: Family) -> list[Path]:
         level = list(_DISCOVERED[key])
     elif fam.match:
         level = _search(fam)
+    elif fam.chromium_trees:
+        key = f"chromium:{os.fspath(fam.root)}"
+        if key not in _DISCOVERED:
+            _DISCOVERED[key] = chromium_roots(fam.root)
+        level = list(_DISCOVERED[key])
     else:
         level = [fam.root]
         for _ in range(fam.depth):
@@ -7227,7 +7641,10 @@ def candidates(fam: Family) -> list[Path]:
     uid = os.getuid()
     owned = []
     for p in level:
-        if (never_delete(p) and not fam.allow_stale_protected) or toolchain_held(p):
+        # an aside tree is one remove() already decided to delete, so its name (.glaeda-disk-deleting-chromium-<pid>)
+        # vetoes nothing; NEVER_DELETE's paths still do
+        if (never_delete(p, names=not (fam.chromium_trees or fam.id == INTERRUPTED))
+                and not fam.allow_stale_protected) or toolchain_held(p):
             continue
         try:
             if p.lstat().st_uid == uid:
@@ -7256,14 +7673,16 @@ def fresh_for_apply(known: dict[str, int], fams: list[Family]) -> dict[str, int]
     reclaimable candidate is re-measured. A discovering family's root is the whole home directory, so
     only its current candidates are dropped, not every size below it (that re-measured the report-only
     checkouts too and ran past the hooks' timeout on the minis)."""
-    drop = {os.fspath(p) for f in fams if f.reclaimable and (f.discover or f.checkout_builds or f.transcripts or f.transcript_archives)
+    drop = {os.fspath(p) for f in fams if f.reclaimable and (f.discover or f.checkout_builds or f.transcripts
+                                                             or f.transcript_archives or f.chromium_trees)
             for p in candidates(f)}
 
     def candidate_of_selected(k: str) -> bool:
         if k in drop:
             return True
         for f in fams:
-            if not f.reclaimable or f.discover or f.checkout_builds or f.transcripts or f.transcript_archives:
+            if (not f.reclaimable or f.discover or f.checkout_builds or f.transcripts or f.transcript_archives
+                    or f.chromium_trees):
                 continue
             root = str(f.root) + "/"
             if not k.startswith(root):
@@ -7503,6 +7922,7 @@ def _survey(families, idle_hours, min_bytes, known, evidence, defer_bulk=False,
     global _MEASURE_BUDGET_REACHED
     _MEASURE_BUDGET_REACHED = False
     _NESTED_WALKS.clear()
+    _CHROMIUM_GROUPS.clear()
     now = time.time()
     items: list[Item] = []
     known = known if known is not None else {}
@@ -7600,7 +8020,7 @@ def _survey(families, idle_hours, min_bytes, known, evidence, defer_bulk=False,
                            + ": pressure-only policy")
         if fam.git_disposable and (reference := referenced_main_checkout(path, nested=fam.nested_git)):
             reasons.append(reference)
-        if fam.id in HOME_SCRATCH_FAMILIES and (reference := home_scratch_referenced(path)):
+        if (fam.id in HOME_SCRATCH_FAMILIES or fam.chromium_trees) and (reference := home_scratch_referenced(path)):
             reasons.append(reference)
         policy_note = ""
         if ROLE == "devbox" and (fam.id == "xcode-derived-data" or
@@ -7665,6 +8085,9 @@ def _survey(families, idle_hours, min_bytes, known, evidence, defer_bulk=False,
             elif cmux_next_cap_only(fam, path, idle, idle_hours):
                 reasons.append(f"cmux-next-ci is {gib(cmux_next_ci_over()).strip()} over its size cap "
                                "(least recently used first)")
+            if fam.chromium_trees:
+                reasons.append("superseded by a newer Chromium tree of its group (unpushed git work goes to a "
+                               "verified bundle in ~/archive first; every DEPS checkout must be pinned)")
             if mirror_due(fam, path, idle):
                 reasons.append(f"idle {fam.mirror_idle_hours:g}h+: its checkouts are mirrors "
                                "(unpushed commits go to a verified bundle in ~/archive first)")
@@ -9359,7 +9782,7 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
             outcome = "changed:in-use"
         elif ((families[i.family].git_disposable
                and referenced_main_checkout(p, nested=families[i.family].nested_git))
-              or (i.family in HOME_SCRATCH_FAMILIES and home_scratch_referenced(p))):
+              or ((i.family in HOME_SCRATCH_FAMILIES or fam.chromium_trees) and home_scratch_referenced(p))):
             outcome = "changed:referenced"
         elif not item_due(fam, (idle_now := (time.time() - item_mtime(fam, p)) / 3600),
                           item_window(fam, p, idle_hours, archived))[0]:
@@ -9376,6 +9799,14 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
               and (g := family_git_state(fam, p)) != "none"
               and (g != "git" or family_git_loss(fam, p))):
             outcome = "changed:git"  # the checkout gained something to lose since the survey
+        elif fam.chromium_trees and (bundled := archive_chromium(p))[0]:
+            drop_unused_archives(bundled[1])  # kept whole: the tree still holds what was archived for it
+            outcome = "blocked:uncommitted" if bundled[0].startswith("uncommitted: ") else "blocked:chromium"
+            i.reasons.append(bundled[0])
+        elif fam.chromium_trees and (moved := chromium_moved(fam, p, bundled[2])):
+            outcome = "changed:in-use"
+            i.reasons.append(moved)
+            drop_unused_archives(bundled[1])
         elif mirror_due(fam, p, idle_now) and (bundled := archive_mirror(p))[0]:
             # never deleted without a verified bundle of what is unpushed; uncommitted work no bundle holds
             drop_unused_archives(bundled[1])  # the tree stays whole: what was bundled for it so far is not needed
@@ -9392,7 +9823,7 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
             i.reasons.append(moved)
             drop_unused_archives(bundled[1])
         else:
-            if mirror_due(fam, p, idle_now) and bundled[1]:
+            if (mirror_due(fam, p, idle_now) or fam.chromium_trees) and bundled[1]:
                 i.reasons.append("unpushed git work bundled to " + ", ".join(map(os.fspath, bundled[1])))
             whole_state = fam.id == CMUX_NEXT_CI_FAMILY and p in cmux_next_ci_state_roots(fam.root)
             try:
@@ -9422,10 +9853,13 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
                     # the moment the toolchain is renamed away, so an interrupted delete cannot leave it behind
                     stale_hash = (p.parent.parent / "update-hashes" / p.name
                                   if fresh_layout == "rustup-toolchain" else None)
+                    if fam.chromium_trees:
+                        record_chromium_aside(p)  # before the rename: an interrupted delete is resumed from it
                     remove(p, after_rename=cmux_next_ci_slot_recheck(fam, p, floor=cmux_next_ci_floor_slot(fam, p))
                            if whole_state
                            else cmux_next_ci_child_recheck(fam, p) if fam.id == CMUX_NEXT_CI_FAMILY
                            else mirror_rename_recheck(p, bundled[2]) if mirror_due(fam, p, idle_now)
+                           else chromium_rename_recheck(fam, p, bundled[2]) if fam.chromium_trees
                            else None if stale_hash is None else lambda h=stale_hash: h.unlink(missing_ok=True))
                     gone = True
                     if fam.id == CMUX_NEXT_CI_FAMILY and p.parent.parent.parent in tuple(
@@ -9452,9 +9886,13 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
                 if common:  # drop the deleted worktree's record from its repository
                     subprocess.run(["git", "--git-dir", common, "worktree", "prune"],
                                    capture_output=True, timeout=60)
-            except SlotTaken:
+            except SlotTaken as e:
                 outcome = "changed:in-use"
-                if mirror_due(fam, p, idle_now) and bundled[1] and p.is_dir() and not p.is_symlink():
+                if fam.chromium_trees and str(e):
+                    i.reasons.append(str(e))
+                aside = p.with_name(f"{DELETING_PREFIX}{p.name}-{os.getpid()}")
+                if (mirror_due(fam, p, idle_now) or fam.chromium_trees) and bundled[1] and p.is_dir() \
+                        and not p.is_symlink() and not os.path.lexists(aside):
                     drop_unused_archives(bundled[1])  # put back whole: never when it was left aside under another name
             except SlotNotNeeded:
                 continue  # as the stop check before the rename
