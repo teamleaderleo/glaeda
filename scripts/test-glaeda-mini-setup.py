@@ -1351,6 +1351,46 @@ class TimedOutInstallTest(unittest.TestCase):
         self.assertIn(os.fspath(self.brew), out)
         self.assertIn("pouring git", out)
 
+    def test_a_failed_process_listing_never_ends_the_reap_early(self) -> None:
+        """ps failing right after TERM (a loaded host) must not read as an empty session: KILL still goes out."""
+        real = ms.session_members
+        calls = []
+
+        def flaky(sid: int):
+            calls.append(sid)
+            return None if len(calls) == 2 else real(sid)  # the first listing after TERM fails
+
+        log = io.StringIO()
+        with mock.patch.object(ms, "REAP_GRACE_S", 1.0), mock.patch.object(ms, "session_members", flaky), \
+                contextlib.redirect_stderr(log):
+            code, out = ms.brew_install(os.fspath(self.brew), "git", timeout=2)
+        self.assertEqual(code, 1)
+        for name, pid in self.started().items():
+            self.assertFalse(live(pid), f"{name} {pid} outlived the timeout: {out}")
+        with mock.patch.object(ms, "REAP_GRACE_S", 0.3), mock.patch.object(ms, "session_members", lambda sid: None), \
+                contextlib.redirect_stderr(io.StringIO()):
+            sleeper = subprocess.Popen(["sleep", "30"], start_new_session=True)
+            self.addCleanup(sleeper.wait)
+            note = ms.reap_session(sleeper.pid, time.monotonic())
+        self.assertIn("not confirmed", note)  # never "reaped" with nothing checked
+        self.assertEqual(sleeper.wait(timeout=5), -signal.SIGTERM)  # the leader's group is still signalled
+
+    def test_a_pid_outside_the_session_is_never_signalled(self) -> None:
+        """A pid listed earlier that exited and was reused belongs to another session and is left alone, with a
+        pidfd (Linux) and without one (macOS)."""
+        no_pidfd = mock.patch.object(ms, "hasattr", lambda obj, name: False if "pidfd" in name else hasattr(obj, name),
+                                     create=True)
+        for patch in (contextlib.nullcontext(), no_pidfd):
+            with self.subTest(pidfd=patch is not no_pidfd), patch:
+                other = subprocess.Popen(["sleep", "30"], start_new_session=True)
+                self.addCleanup(other.wait)
+                self.addCleanup(other.kill)
+                ms.signal_session_member(other.pid, other.pid + 1, signal.SIGKILL)
+                time.sleep(0.2)
+                self.assertIsNone(other.poll())
+                ms.signal_session_member(other.pid, other.pid, signal.SIGKILL)
+                self.assertEqual(other.wait(timeout=5), -signal.SIGKILL)
+
     def test_an_install_that_finishes_in_time_is_left_alone(self) -> None:
         quick = self.tmp / "quick-brew"
         quick.write_text("#!/bin/sh\necho \"$1 $2 done\"\n")
