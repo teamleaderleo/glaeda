@@ -40,8 +40,9 @@
 #         misses), the same as a dead store; fleet-cas-settings.sh still answers only when the node
 #         does. Without --relay the role removes the relay.
 #         A store with a custom root (--store-root on the rollout) also gets
-#         com.teamleaderleo.glaeda.fleet-cas-prune: hourly `glaeda-fleet-cas-prune --apply
-#         --store-gc-only`, the daily fleet-cas gc of that store and nothing else.
+#         com.teamleaderleo.glaeda.fleet-cas-store-gc: hourly `glaeda-fleet-cas-prune --apply
+#         --store-gc-only`, the daily fleet-cas gc of that store and nothing else (its own label,
+#         so it never replaces a mini's fleet-cas-prune agent from glaeda-mini-setup).
 # The node and writer roles write xcode/fleet-cas.env (store address, trusted keys, signing
 # key path) for the scripts above.
 # Design: docs/CMUX_BUILD_SLOT_MODES.md. Prototype: tools/fleet-cas-prototype.
@@ -335,8 +336,8 @@ write_relay() {  # LAN_IP:PORT, or empty to remove
 # The relay carries the store's protocol, not only a TCP connect: a marker lookup through it
 # answers 0 (present) or 1 (absent) only from a fleet-cas store; a transport error is 2.
 check_relay() {  # LAN_IP:PORT
-  local status=0 i
-  for i in $(seq 1 20); do
+  local status=0
+  for _ in $(seq 1 20); do
     status=0
     "$BIN/fleet-cas" marker get "http://$RELAY_LISTEN" "glaeda-relay-check/$(hostname -s)" \
       --trusted-keys "${trusted:-0000000000000000000000000000000000000000000000000000000000000000}" >/dev/null 2>&1 || status=$?
@@ -349,9 +350,9 @@ check_relay() {  # LAN_IP:PORT
 }
 
 # The store host's prune (custom store roots only; the minis get theirs from glaeda-mini-setup).
-PRUNE_LABEL=com.teamleaderleo.glaeda.fleet-cas-prune
+PRUNE_LABEL=com.teamleaderleo.glaeda.fleet-cas-store-gc
 prune_plist() {
-  local log=$LOGS/glaeda-fleet-cas-prune.jsonl
+  local log=$LOGS/glaeda-fleet-cas-store-gc.jsonl
   printf '%s\n' '<?xml version="1.0" encoding="UTF-8"?>' \
     '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">' \
     '<plist version="1.0">' '<dict>' \
@@ -366,7 +367,7 @@ prune_plist() {
     '    <key>ProcessType</key>' '    <string>Background</string>' \
     '    <key>LowPriorityIO</key>' '    <true/>' \
     '    <key>StandardOutPath</key>' "    <string>$log</string>" \
-    '    <key>StandardErrorPath</key>' "    <string>$LOGS/glaeda-fleet-cas-prune.err</string>" '</dict>' '</plist>'
+    '    <key>StandardErrorPath</key>' "    <string>$LOGS/glaeda-fleet-cas-store-gc.err</string>" '</dict>' '</plist>'
 }
 write_store_prune() {
   [ -n "${FLEET_CAS_ROOT:-}" ] || return 0
@@ -518,9 +519,12 @@ install_binaries() {
 }
 
 write_env() {  # store HOST:PORT, signing key path or empty
-  say "write $ROOT/fleet-cas.env: store $1, trusted keys ${trusted:-none}${2:+, signing key $2}"
+  # FLEET_CAS_RELAY names the store behind the relay, so the fleet check (glaeda-mini-fleet) can
+  # match it against the manifest's compiler-cas endpoint; the scripts read only FLEET_CAS_STORE.
+  say "write $ROOT/fleet-cas.env: store $1${relay:+ (relay to $relay)}, trusted keys ${trusted:-none}${2:+, signing key $2}"
   [ -n "$apply" ] || return 0
-  printf 'FLEET_CAS_STORE=%s\nFLEET_CAS_TRUSTED_KEYS=%s\nFLEET_CAS_SIGN_KEY=%s\n' "$1" "$trusted" "$2" \
+  { printf 'FLEET_CAS_STORE=%s\nFLEET_CAS_TRUSTED_KEYS=%s\nFLEET_CAS_SIGN_KEY=%s\n' "$1" "$trusted" "$2"
+    [ -z "$relay" ] || printf 'FLEET_CAS_RELAY=%s\n' "$relay"; } \
     >"$ROOT/fleet-cas.env.tmp" && mv "$ROOT/fleet-cas.env.tmp" "$ROOT/fleet-cas.env"
 }
 
@@ -601,7 +605,7 @@ case $role in
       write_relay ""
     fi
     if [ "$uninstall_scope" = store ] || [ "$uninstall_scope" = all ]; then
-      if [ -e "$AGENTS/$PRUNE_LABEL.plist" ] && grep -q -- --store-gc-only "$AGENTS/$PRUNE_LABEL.plist"; then
+      if [ -e "$AGENTS/$PRUNE_LABEL.plist" ]; then
         say "stop and remove $PRUNE_LABEL (the store host's gc)"
         [ -z "$apply" ] || { launchctl bootout "gui/$(id -u)/$PRUNE_LABEL" 2>/dev/null || true; rm -f "$AGENTS/$PRUNE_LABEL.plist"; }
       fi
