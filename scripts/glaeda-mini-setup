@@ -464,10 +464,22 @@ def brew_allowed(ctx: Context) -> bool:
     return not ctx.sandbox
 
 
+def git_probe(git: str) -> tuple[tuple[int, ...] | None, bool]:
+    """(version or None, whether the version check ran out of time). Only a timeout is a slow answer;
+    a git that exits with an error or prints no version answered, and it does not count."""
+    try:
+        result = subprocess.run([git, "--version"], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, text=True, timeout=RUN_TIMEOUT, check=False)
+    except subprocess.TimeoutExpired:
+        return None, True
+    except OSError:
+        return None, False
+    found = re.search(r"git version (\d+)\.(\d+)(?:\.(\d+))?", result.stdout) if result.returncode == 0 else None
+    return (tuple(int(x) for x in found.groups() if x is not None) if found else None), False
+
+
 def git_version(git: str) -> tuple[int, ...] | None:
-    code, out = run([git, "--version"])
-    found = re.search(r"git version (\d+)\.(\d+)(?:\.(\d+))?", out) if code == 0 else None
-    return tuple(int(x) for x in found.groups() if x is not None) if found else None
+    return git_probe(git)[0]
 
 
 def git_candidates() -> list[str]:
@@ -476,14 +488,14 @@ def git_candidates() -> list[str]:
 
 
 def probe_gits() -> tuple[str | None, tuple[int, ...] | None, list[str]]:
-    """The newest git that answered its version check, and every git that did not."""
+    """The newest git that answered its version check, and every git whose check ran out of time."""
     best: tuple[str | None, tuple[int, ...] | None] = (None, None)
     unanswered: list[str] = []
     for git in git_candidates():
-        version = git_version(git)
-        if version is None:
+        version, timed_out = git_probe(git)
+        if timed_out:
             unanswered.append(git)
-        elif best[1] is None or version > best[1]:
+        elif version and (best[1] is None or version > best[1]):
             best = (git, version)
     return best[0], best[1], unanswered
 
