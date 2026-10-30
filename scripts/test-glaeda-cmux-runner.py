@@ -7039,6 +7039,59 @@ class GateTest(unittest.TestCase):
         self.assertTrue(hook.claims_room(hook.RunnerScope(14, 2, 2, False, session=True)), "a session runner claims")
         self.assertFalse(hook.claims_room(hook.RunnerScope()), "no ledger, no claim")
 
+    def test_an_idle_claim_yields_to_the_other_labels(self) -> None:
+        # 2026-10-29, two std minis: the std and side gates logged 7,221 and 6,328 unit holds
+        # naming listening runners' claims, 6,377 and 5,442 of which would have fitted without them, while 281 and
+        # 298 jobs ran on all of each mini's runners. Each claim was stamped fresh whenever it was taken again, so a
+        # stopped gate waiting out GATE_RESTART_FREE_S, and an idle listener after any momentary hold, kept its
+        # units from the others for as long as it was idle.
+        capacity = self.units(5)  # 9 of 14 free: room for one 5-unit side job, not two
+        waiting, listening, other = (hook.Gate(self.side_runner(i), os.fspath(self.lock),
+                                               os.fspath(self.tmp / "none.json"), self.state, capacity_dir=capacity)
+                                     for i in (3, 4, 5))
+        # a gate that stopped its listener and is waiting out its free span claims nothing: no job can reach it
+        waiting.held, waiting.stopped_one, waiting.streak, waiting.free_since = "held", True, 1, time.monotonic()
+        self.assertIsNone(waiting.full())
+        self.assertIsNone(waiting.claim_fd, "a gate whose look does not start its listener holds no claim")
+        self.assertEqual(hook.listen_claims(capacity), 0)
+        # an idle listener past its first poll: nothing is queued for its label, so its claim keeps nothing
+        listening.child = mock.Mock(pid=1)
+        listening.listening_since = time.monotonic() - hook.GATE_FIRST_POLL_S - 1
+        self.assertIsNone(listening.full())
+        self.assertIsNotNone(listening.claim_fd)
+        self.assertEqual(hook.listen_claims(capacity), 0, "an idle listener's claim lapses with its first poll")
+        listening.unclaim()  # a momentary hold let it go
+        self.assertIsNone(listening.full())
+        self.assertEqual(hook.listen_claims(capacity), 0, "taking it again does not renew it")
+        self.assertIsNone(other.full(), "so the other labels' gates may listen")
+        other.unclaim()
+        # a job that just ended: the listener's next poll may carry the next job, so its claim counts again
+        listening.unclaim()
+        listening.job_done_at = time.monotonic()
+        self.assertIsNone(listening.full())
+        self.assertEqual(hook.listen_claims(capacity), 5)
+        listening.unclaim()
+        # the look that starts the waiting gate's listener claims, fresh, so no other gate starts on the same room
+        waiting.free_since = time.monotonic() - hook.GATE_RESTART_FREE_S - 1
+        self.assertTrue(waiting.start_due())
+        waiting.reload = lambda: None
+        started = mock.Mock(pid=2, poll=mock.Mock(return_value=None))
+        with mock.patch.object(waiting, "start", side_effect=lambda: setattr(waiting, "child", started)), \
+                mock.patch.object(waiting, "shed", return_value=None), \
+                mock.patch.object(waiting, "locked", return_value=None), \
+                mock.patch.object(waiting, "hot", return_value=None), \
+                mock.patch.object(waiting, "low_disk", return_value=None), \
+                mock.patch.object(waiting, "ineligible", return_value=None), \
+                mock.patch.object(waiting, "registration_wait", return_value=False):
+            waiting.step()
+        self.assertIsNotNone(waiting.child, "the poll started the listener")
+        self.assertIsNotNone(waiting.claim_fd)
+        self.assertEqual(hook.listen_claims(capacity), 5)
+        self.assertEqual(other.full(), "only 9 of 14 capacity units on this mini are free; its next job needs 5 "
+                                       "and 5 are claimed by listening runners")
+        for gate in (waiting, listening, other):
+            gate.unclaim()
+
     def test_the_gate_looks_again_between_jobs_and_stops_the_listener_before_a_job_that_would_not_fit(self) -> None:
         capacity = self.units(0)
         runner = self.side_runner(3)
