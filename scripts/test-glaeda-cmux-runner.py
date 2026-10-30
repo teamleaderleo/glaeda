@@ -7080,9 +7080,13 @@ class GateTest(unittest.TestCase):
         self.assertEqual(hook.listen_claims(capacity), 0, "taking it again does not renew it")
         self.assertIsNone(other.full(), "so the other labels' gates may listen")
         other.unclaim()
-        # a job that just ended: the listener's next poll may carry the next job, so its claim counts again
-        listening.unclaim()
+        # a job that just ended: the listener's next poll may carry the next job, so its claim counts again, also
+        # when the job was short enough that the gate kept its claim through it (LISTEN_CLAIM_HANDOFF_S)
+        self.assertIsNotNone(listening.claim_fd, "still held, stale")
         listening.job_done_at = time.monotonic()
+        self.assertIsNone(listening.full())
+        self.assertEqual(hook.listen_claims(capacity), 5, "a held claim takes the job end's stamp")
+        listening.unclaim()
         self.assertIsNone(listening.full())
         self.assertEqual(hook.listen_claims(capacity), 5)
         listening.unclaim()
