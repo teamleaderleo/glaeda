@@ -569,7 +569,13 @@ def session_members(sid: int) -> list[tuple[int, int, str]] | None:
 def signal_session_member(pid: int, sid: int, sig: int) -> None:
     """Signal pid only if it is still in session sid. A pid from an earlier listing may have exited and been reused;
     a reused pid is in another session (a session is joined only by forking from a member), so the session is
-    checked again right before the signal. On Linux a pidfd pins the process between that check and the signal."""
+    checked again right before the signal. On Linux a pidfd pins the process between that check and the signal.
+
+    macOS has no pidfd, so there the check and the signal are two calls back to back. XNU hands out pids in order
+    (nextpid counts up and wraps only at PID_MAX, 99999; bsd/kern/kern_fork.c), so a pid freed between those two
+    calls goes to a new process only after the counter has passed every other pid once: about 100,000 forks
+    inside the microseconds between getsid and kill. The leader's own group is signalled with killpg instead
+    (reap_session), which is pinned because the leader is not reaped until the reap is over."""
     if hasattr(os, "pidfd_open") and hasattr(signal, "pidfd_send_signal"):
         try:
             fd = os.pidfd_open(pid)
@@ -608,8 +614,9 @@ def reap_session(sid: int, started: float) -> str:
                 seen.setdefault(pid, (pgid, command))
             with contextlib.suppress(OSError):
                 os.killpg(sid, sig)  # the leader's own group, even when ps could not list the session
-            for pid, _, _ in members or ():
-                signal_session_member(pid, sid, sig)
+            for pid, pgid, _ in members or ():
+                if pgid != sid:  # the leader's group had its signal from killpg above
+                    signal_session_member(pid, sid, sig)
             time.sleep(0.1)
             left = members = session_members(sid)
             if left == [] or time.monotonic() >= deadline:
