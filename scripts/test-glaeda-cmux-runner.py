@@ -13609,6 +13609,19 @@ class JobTelemetryTest(unittest.TestCase):
         receipt.write_text(" " * (self.hook.WARM_START_MAX_BYTES + 1))
         with mock.patch.dict(self.hook.os.environ, {"RUNNER_TEMP": str(self.dir)}, clear=False):
             self.assertIsNone(self.hook.warm_start_receipt({"run_id": "42", "run_attempt": "1"}))
+        # a job controls the file: a FIFO never blocks the sampler, and a symlink is never followed (only it goes)
+        receipt.unlink(missing_ok=True)
+        os.mkfifo(receipt)
+        with mock.patch.dict(self.hook.os.environ, {"RUNNER_TEMP": str(self.dir)}, clear=False):
+            self.assertIsNone(self.hook.warm_start_receipt({"run_id": "42", "run_attempt": "1"}))
+        self.assertFalse(receipt.exists())
+        target = self.dir / "elsewhere.json"
+        target.write_text(json.dumps(payload))
+        receipt.symlink_to(target)
+        with mock.patch.dict(self.hook.os.environ, {"RUNNER_TEMP": str(self.dir)}, clear=False):
+            self.assertIsNone(self.hook.warm_start_receipt({"run_id": "42", "run_attempt": "1"}))
+        self.assertFalse(receipt.is_symlink())
+        self.assertTrue(target.exists())
 
     def test_completed_record_accepts_legacy_v1_telemetry(self) -> None:
         telemetry = self.dir / self.hook.COMPILE_TELEMETRY_FILE

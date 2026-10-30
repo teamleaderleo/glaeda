@@ -966,16 +966,18 @@ def read_warm_model(state_dir: str = "") -> dict[str, Any]:
         return dict(WARM_DEFAULT_MODEL)
 
 
-def read_bounded(path: Path) -> bytes | None:
-    """A regular file's bytes, at most STAMP_MAX_BYTES, never blocking on a FIFO; None otherwise."""
+def read_bounded(path: Path, limit: int | None = None) -> bytes | None:
+    """A regular file's bytes, at most LIMIT (STAMP_MAX_BYTES), never blocking on a FIFO or following a symlink;
+    None otherwise."""
+    limit = STAMP_MAX_BYTES if limit is None else limit
     fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     try:
         if not stat.S_ISREG(os.fstat(fd).st_mode):
             return None
-        raw = os.read(fd, STAMP_MAX_BYTES + 1)
+        raw = os.read(fd, limit + 1)
     finally:
         os.close(fd)
-    return raw if len(raw) <= STAMP_MAX_BYTES else None
+    return raw if len(raw) <= limit else None
 
 
 def root_stamp(k: int, state_dir: str = "", number: int | None = None) -> dict[str, Any] | None:
@@ -7778,9 +7780,12 @@ def warm_start_receipt(meta: dict[str, Any]) -> dict[str, Any] | None:
         return None
     path = Path(temp) / WARM_START_FILE
     try:
-        if path.stat().st_size > WARM_START_MAX_BYTES:
+        # a job writes this file, so it may be a FIFO, a symlink or swapped after a stat: open it once, without
+        # blocking or following, and read the bounded bytes of that same regular file (router-review, #1764)
+        raw = read_bounded(path, WARM_START_MAX_BYTES)
+        if raw is None:
             return None
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload = json.loads(raw.decode("utf-8"))
     except (OSError, ValueError, UnicodeDecodeError):
         return None
     finally:
