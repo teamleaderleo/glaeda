@@ -7096,6 +7096,12 @@ SAMPLER_FILE = "job-sampler"
 COMPILE_TELEMETRY_SCHEMA = "cmux-compile-telemetry/v1"
 COMPILE_TELEMETRY_FILE = "glaeda-compile-telemetry.json"
 COMPILE_TELEMETRY_MAX_BYTES = 16 * 1024
+# cmux's warm-start receipt: whether the job started from warm build state (its SwiftPM scratch first; other sources
+# later), written once before the build. ci-dash's CI health turns it into each job class's cold-start share.
+WARM_START_SCHEMA = "cmux-warm-start/v1"
+WARM_START_FILE = "glaeda-warm-start.json"
+WARM_START_MAX_BYTES = 4 * 1024
+WARM_START_STATES = ("warm", "seeded", "cold")
 SAMPLE_S = 10.0
 THERMAL_EVERY = 6  # pmset -g therm every Nth sample
 DYNAMIC_WARMUP_S = float(os.environ.get("GLAEDA_DYNAMIC_WARMUP_S") or 120.0)
@@ -7760,6 +7766,39 @@ def compile_telemetry(meta: dict[str, Any]) -> dict[str, Any] | None:
     return result
 
 
+def warm_start_receipt(meta: dict[str, Any]) -> dict[str, Any] | None:
+    """Read the warm-start receipt left in RUNNER_TEMP, if it is this job's; observation only, like compile_telemetry.
+
+    Kept fields: source and reason (short strings), state (warm, seeded or cold) and bytes (the state's size at start).
+    Anything malformed, oversized or from another run is dropped and never changes the job."""
+    temp = os.environ.get("RUNNER_TEMP", "")
+    if not temp:
+        return None
+    path = Path(temp) / WARM_START_FILE
+    try:
+        if path.stat().st_size > WARM_START_MAX_BYTES:
+            return None
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, UnicodeDecodeError):
+        return None
+    finally:
+        with contextlib.suppress(OSError):
+            path.unlink()
+    if not isinstance(payload, dict) or payload.get("schema") != WARM_START_SCHEMA:
+        return None
+    for key in ("run_id", "run_attempt"):
+        expected = meta.get(key)
+        if expected and payload.get(key) != expected:
+            return None
+    state, source, reason, size = (payload.get(k) for k in ("state", "source", "reason", "bytes"))
+    if state not in WARM_START_STATES or not isinstance(source, str) or not 0 < len(source) <= 40:
+        return None
+    if not isinstance(size, int) or isinstance(size, bool) or not 0 <= size <= 1 << 50:
+        return None
+    return {"schema": WARM_START_SCHEMA, "source": source, "state": state, "bytes": size,
+            "reason": reason[:200] if isinstance(reason, str) else ""}
+
+
 def held_roots(state_dir: Path) -> list[str]:
     """The canonical roots (root-k) the runner's .roots file names now; take-root --switch rewrites it mid-job."""
     try:
@@ -7902,6 +7941,9 @@ def start_sampler(watch_pid: int, state_dir: Path, meta: dict[str, Any], log: Pa
         metrics = compile_telemetry(record)
         if metrics is not None:
             record["compile"] = metrics
+        warm = warm_start_receipt(record)
+        if warm is not None:
+            record["warm_start"] = warm
         append_job_record(record, log)
     except Exception:  # noqa: BLE001
         pass
