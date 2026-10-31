@@ -9055,8 +9055,11 @@ class RiskReceiptPostTest(unittest.TestCase):
                 self.assertEqual(gg.post_state(item["id"])["state"], "posted")
 
     def test_risk_receipt_reads_fresh_identity_and_only_removes_one_current_tier(self) -> None:
+        # Only risk:high reads a receipt (cmux scripts/ci/risk_tier.py), so low and normal are left alone: their
+        # label churn re-ran every labeled-triggered workflow (a whole CI run) and changed no verdict.
         for pull, label in ((self.pull(), "risk:high"),
-                            (self.pull(labels=[{"name": "risk:normal"}]), "risk:normal"),
+                            (self.pull(labels=[{"name": "risk:normal"}]), None),
+                            (self.pull(labels=[{"name": "risk:low"}]), None),
                             (self.pull(state="closed"), None),
                             (self.pull(base={"ref": "main"}), None),
                             (self.pull(head={"sha": "b" * 40}), None),
