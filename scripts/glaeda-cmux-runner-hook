@@ -6732,14 +6732,16 @@ class Gate:
                 os.kill(pid, signal.SIGCONT)
         self.frozen, self.done = (), ()  # thawed, the listener reaps the exited Workers before the next nap()
 
-    def stop(self, why: str, finished: str | None = None) -> bool:
+    def stop(self, why: str, finished: str | None = None, handback: bool = False) -> bool:
         """SIGINT to the listener: its graceful exit ends its session, so GitHub stops routing here. With no
         listener (run-helper.sh between listeners), SIGTERM the whole tree so nothing starts one later.
         A listener can take a job at any moment, and a SIGINT between its acknowledge and its Worker loses that
         job (listener_request). So the listener is frozen (SIGSTOP) for the last look: frozen, it can neither
         acknowledge a request nor start a Worker, and its trace shows every acknowledge it has sent. A listener
         with a job, or taking one, is thawed and kept; an idle one gets the SIGINT before it is thawed. When the
-        agent is stopping, a running job is cancelled as before, but an acquisition is still waited out.
+        agent is stopping, a running job is cancelled as before, but an acquisition is still waited out. A fleet
+        waiter is different: an acknowledged request with no Worker is handed back to GitHub by stopping the
+        listener, so the job returns to the queue instead of entering job-started and failing there.
         `finished` is the request of a Worker that has exited (busy()): it is not one the listener is taking.
         Returns whether it signalled; step() tries again on a later poll."""
         pids, table = self.tree()
@@ -6755,7 +6757,7 @@ class Gate:
                 request, worker = self.taking(), self.worker()
                 if request is not None and request == finished and not worker:
                     request = None
-                if (worker and not self.terminating) or (request is not None and not worker):
+                if (worker and not self.terminating) or (request is not None and not worker and not handback):
                     if not self.defer_noted:
                         gate_log(f"not stopping the listener ({why}): it is taking job request {request}"
                                  if request is not None and not worker else
@@ -6763,6 +6765,8 @@ class Gate:
                         self.defer_noted = True
                     self.streak = 0
                     return False
+                if request is not None and not worker and handback:
+                    gate_log(f"handing the acknowledged job request {request} back to the queue ({why})")
             gate_log(f"stopping the idle listener: {why}")
             self.held, self.stop_deadline, self.worker_noted = why, time.monotonic() + GATE_STOP_WAIT_S, False
             self.defer_noted = False
@@ -6834,7 +6838,7 @@ class Gate:
                 ending = self.job_end() if self.job_ending else None
                 if (why := self.low_disk() or self.still_waiting() or self.still_reserved() or ending):
                     self.unclaim()
-                    self.stop(why, finished)
+                    self.stop(why, finished, handback=why.startswith(WAITER_REFUSAL))
                     return None
             self.reload()
             if self.busy():
@@ -6850,6 +6854,14 @@ class Gate:
                     self.waiting_at = -GATE_WAITER_EVERY_S  # and read the waiters afresh before it does
                 if self.waiters and self.waiters_due():
                     self.waiting, self.waiting_at = self.blocking_waiters(), time.monotonic()
+                # The listener can acknowledge the next request after the waiter look but before it has started a
+                # Worker. Stop it in that small window and let GitHub queue the request again. Leaving the listener
+                # alive here sends the request into job-started, whose non-zero refusal turns a handback into a red job.
+                if self.waiting and self.taking() is not None and not self.worker():
+                    why = f"a fleet build is waiting for the host (pid {min(self.waiting)})"
+                    self.unclaim()
+                    if self.stop(why, handback=True):
+                        return None
                 reserved = self.still_reserved()
                 self.job_waited = bool(self.waiting) or reserved is not None
                 low = self.low_disk()
@@ -6897,7 +6909,7 @@ class Gate:
                 why = self.confirmed()
                 if why and not self.busy():  # the fresh look and the busy check right before the signal
                     self.unclaim()
-                    self.stop(why)
+                    self.stop(why, handback=why.startswith(WAITER_REFUSAL))
             # let go only after the last look (confirmed() included), and never with a job of its own arrived
             # (keeps_reserve); a job that beats even this busy() check gets it back on its first busy poll
             self.reserve(self.keeps_reserve(why))
