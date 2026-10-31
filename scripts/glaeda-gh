@@ -6656,7 +6656,12 @@ GH_CACHE_BOOL_FLAGS = {"--log", "--log-failed", "--exit-status", "--paginate", "
 # Two spellings of one flag, beyond the pair broker_words knows: only those that mean the same in
 # every read gh has. `-b` is `--body` in one command and `--branch` in another, so it stays as typed;
 # `-f` and `-F` are not aliases (a string and a typed value) and stay apart.
-GH_CACHE_FLAG_ALIAS = {**BROKER_FLAG_ALIAS, "-q": "--jq", "-t": "--template", "-L": "--limit", "-H": "--header"}
+GH_CACHE_FLAG_ALIAS = {**BROKER_FLAG_ALIAS, "-q": "--jq", "-t": "--template", "-L": "--limit", "-H": "--header",
+                       "-f": "--raw-field", "-F": "--field"}
+# Request fields, string or typed: one ordered group, because gh sends them in the order given and the
+# last of a repeated name wins whichever of the two spellings carried it. Sorting them apart by flag
+# name answered `-f state=open --raw-field state=closed` with `--raw-field state=closed -f state=open`.
+GH_CACHE_FIELD_GROUP = {"--raw-field", "--field"}
 # The subcommand verbs that change one PR or issue named on the line, and nothing else about the
 # repository but its lists.
 GH_CACHE_TARGET_WRITES = {"comment", "edit", "ready", "close", "reopen", "review", "lock", "unlock"}
@@ -6907,7 +6912,8 @@ def gh_cache_canonical(args: list[str]) -> list | None:
         if match and f"/{kind}/" in words[2]:
             words[2] = match.group(3)
             flags.append(("--repo", f"{match.group(1)}/{match.group(2)}".lower()))
-    flags.sort(key=lambda flag: flag[0])  # stable: one flag's repeats keep their order
+    # Stable: one flag's repeats keep their order, and so do all request fields together.
+    flags.sort(key=lambda flag: "--field" if flag[0] in GH_CACHE_FIELD_GROUP else flag[0])
     return ["canonical", words, [list(flag) for flag in flags]]
 
 
@@ -6978,9 +6984,11 @@ def gh_cache_write_scope(args: list[str], words: list[str], method: str,
         if len(tail) >= 2 and tail[0] in ("pulls", "issues") and tail[1].isdigit():
             if tail[0] == "pulls" and tail[2:3] and tail[2] in GH_CACHE_BASE_WRITES:
                 return repo, [f"pr {int(tail[1])}", "prs", "runlists", "other"]
-            if tail[0] == "pulls" and not tail[2:]:
-                return repo, [f"pr {int(tail[1])}", "runlists", "other"]  # an edit: a label can start a workflow
-            return repo, [f"pr {int(tail[1])}", "other"]
+            # An edit, a label, a comment or a review: each can start a workflow (pull_request,
+            # issues, issue_comment, pull_request_review), so the run lists go with them.
+            return repo, [f"pr {int(tail[1])}", "runlists", "other"]
+        if tail in (["issues"], ["pulls"]):
+            return repo, ["runlists", "other"]  # a new issue or PR: issues.opened, pull_request
         if len(tail) >= 3 and tail[:2] == ["actions", "runs"] and tail[2].isdigit():
             return repo, [f"run {tail[2]}", "runlists", "jobs", "prs", "other"]
         if len(tail) >= 3 and tail[:2] == ["actions", "jobs"] and tail[2].isdigit():
@@ -7004,7 +7012,7 @@ def gh_cache_write_scope(args: list[str], words: list[str], method: str,
             # (pull_request, issue_comment, pull_request_review): the run lists go with them.
             return repo, [f"pr {int(number)}", "runlists", "other"]
     if (first, second) in {("pr", "create"), ("issue", "create")}:
-        return repo, ["runlists", "other"] if first == "pr" else ["other"]
+        return repo, ["runlists", "other"]  # pull_request, issues.opened
     if first == "run" and second in GH_CACHE_RUN_WRITES and rest[:1] and rest[0].isdigit() and len(rest) == 1:
         return repo, [f"run {rest[0]}", "runlists", "jobs", "prs", "other"]
     if (first, second) == ("workflow", "run"):

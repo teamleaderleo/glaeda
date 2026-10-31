@@ -10041,9 +10041,15 @@ class BrokerAnswerHitRateTest(CountingGhBase):
                      ["api", "https://api.github.com/repos/o/r/pulls/7"],
                      ["api", "repos/o/r/pulls/7"],
                      ["issue", "view", "https://github.com/o/r/pull/7", "--json", "title"],
-                     ["pr", "view", "7", "-R", "o/r", "--json", "state", "--jq", ".state"]):
+                     ["pr", "view", "7", "-R", "o/r", "--json", "state", "--jq", ".state"],
+                     # the last of a repeated field wins, whichever spelling carried it
+                     ["api", "-X", "GET", "repos/o/r/issues", "-f", "state=open", "--raw-field", "state=closed"],
+                     ["api", "-X", "GET", "repos/o/r/issues", "--raw-field", "state=closed", "-f", "state=open"],
+                     ["api", "-X", "GET", "repos/o/r/issues", "-F", "per_page=5", "-f", "per_page=6"]):
             self.run_gh(args)
-        self.assertEqual(self.runs(), 12)
+        self.assertEqual(self.runs(), 15)
+        self.run_gh(["api", "-X", "GET", "repos/o/r/issues", "--raw-field", "state=open", "--raw-field", "state=closed"])
+        self.assertEqual(self.runs(), 15, "-f and --raw-field are one flag")
 
     def test_a_line_with_a_flag_it_does_not_know_is_kept_as_typed(self) -> None:
         """`--unknown 7` could be a flag with a value: moving it could make 7 the PR number."""
@@ -10106,7 +10112,11 @@ class BrokerAnswerHitRateTest(CountingGhBase):
             return {0: False, len(lists): True}[self.runs() - before]
         fetched()
         for write, starts in ((["pr", "comment", "7", "-R", "o/r", "--body", "x"], True),
-                              (["issue", "create", "-R", "o/r", "--title", "t", "--body", "b"], False),
+                              (["issue", "create", "-R", "o/r", "--title", "t", "--body", "b"], True),
+                              (["api", "-X", "POST", "repos/o/r/issues/7/comments", "-f", "body=x"], True),
+                              (["api", "-X", "POST", "repos/o/r/issues", "-f", "title=t"], True),
+                              (["api", "-X", "POST", "repos/o/r/pulls/7/reviews", "-f", "event=COMMENT"], True),
+                              (["api", "-X", "PUT", "repos/o/r/branches/main/protection"], True),
                               (["pr", "edit", "7", "-R", "o/r", "--add-label", "full-ci"], True),
                               (["workflow", "run", "ci.yml", "-R", "o/r"], True),
                               (["api", "-X", "POST", "repos/o/r/actions/workflows/ci.yml/dispatches", "-f", "ref=main"], True),
