@@ -5861,6 +5861,21 @@ class MirrorBorrowTest(unittest.TestCase):
         self.git(self.ws, "fsck", "--connectivity-only", "--no-dangling")  # an empty store reads whole again
         self.assertNotIn("reset", self.borrow())  # nothing left to repack: the next pass is quiet
 
+    def test_a_damaged_borrower_without_submodule_stores_is_reset_too(self) -> None:
+        """Without .git/modules, drop_checkout_store removes the store outright: the reset makes the empty
+        repository itself, so origin, the reset record and the retried borrow still land (review of #1770)."""
+        self.borrow()
+        for pack in (self.mirror / "objects" / "pack").iterdir():
+            pack.unlink()
+        note = self.borrow()
+        self.assertIn("reset", note)
+        self.assertIn("retried:", note)
+        git_dir = self.ws / ".git"
+        self.assertTrue((git_dir / "HEAD").is_file())
+        self.assertEqual(self.git(self.ws, "config", "--get", "remote.origin.url"), "https://github.com/manaflow-ai/cmux")
+        self.assertEqual(hook.alternates_of(git_dir), [os.fspath(self.mirror / "objects")])
+        self.assertTrue((git_dir / hook.BORROW_RESET_RECORD).is_file())
+
     def test_a_repack_failure_that_is_not_damage_keeps_the_store(self) -> None:
         real = subprocess.Popen
 

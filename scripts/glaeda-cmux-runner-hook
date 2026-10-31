@@ -3161,6 +3161,10 @@ def reset_damaged_borrower(git_dir: Path, origin: str, error: str) -> str:
     """Replace a borrower's damaged store with an empty repository that keeps origin, and record why. Returns the
     note. Raises OSError, with the store whole, when the reset cannot be made."""
     kept = drop_checkout_store(git_dir)
+    if not git_dir.is_dir():  # no submodule stores: drop_checkout_store removed the store outright
+        env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+        subprocess.run(["git", "init", "-q", os.fspath(git_dir.parent)], capture_output=True, timeout=60, env=env,
+                       check=False)
     subprocess.run(["git", "--git-dir", os.fspath(git_dir), "config", "remote.origin.url", origin],
                    capture_output=True, timeout=30, check=False)
     subprocess.run(["git", "--git-dir", os.fspath(git_dir), "config", "remote.origin.fetch",
