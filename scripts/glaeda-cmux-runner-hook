@@ -358,9 +358,12 @@ JOB_CLASSES = {"macos-compile-admission": "compile", "app-host-unit-tests": "gui
 # then is refused so its re-run takes Blacksmith. Admitted, it tells the job through $GITHUB_ENV
 # (GLAEDA_JOB_CLAIM=exclusive); cmux's signing jobs refuse to touch the key on an owned Mac without it, so a hook
 # from before this class never signs beside a PR job.
+# generate-nightly-deltas holds a Sparkle private key (it signs every delta a feed serves) and makes no keychain: on a
+# shared mini any other job could read the key from its environment, so it is exclusive too (cmux #NNNNN).
 SIGNING_JOBS = (("nightly.yml", "build-sign-notarize-nightly"), ("nightly.yml", "recover-nightly-next-notarization"),
-                ("nightly.yml", "sign-nightly-identity-legacy"), ("release.yml", "build-sign-notarize"),
-                ("repair-v0-64-25-helper-rpaths.yml", "repair"), ("cmux-next-dev-daily.yml", "sign"))
+                ("nightly.yml", "sign-nightly-identity-legacy"), ("nightly.yml", "generate-nightly-deltas"),
+                ("release.yml", "build-sign-notarize"), ("repair-v0-64-25-helper-rpaths.yml", "repair"),
+                ("cmux-next-dev-daily.yml", "sign"))
 WORKFLOW_JOB_CLASSES = {("cmux-tui.yml", "lint"): "isolated", ("cmux-tui.yml", "test"): "isolated",
                         ("cmux-tui.yml", "build"): "isolated", ("cmux-tui.yml", "cdp-browser-smoke"): "isolated",
                         ("cmux-tui.yml", "macos-relay"): "isolated",
@@ -400,8 +403,8 @@ WORKFLOW_JOB_CLASSES = {("cmux-tui.yml", "lint"): "isolated", ("cmux-tui.yml", "
                         # codesign, notarytool, hdiutil and scripts, in the workspace and $RUNNER_TEMP. No compile,
                         # canonical root, kept DerivedData or XCTest. As unknown jobs they were compiles (5 units,
                         # persistent-dd and a root), so a nightly verify first in line (FEED_FIRST) still waited for
-                        # a PR compile's persistent-dd and root, which it never uses. generate-nightly-deltas runs
-                        # Sparkle's BinaryDelta over whole apps: isolated.
+                        # a PR compile's persistent-dd and root, which it never uses. generate-nightly-deltas holds a
+                        # Sparkle private key: exclusive (SIGNING_JOBS).
                         # main's post-publication canary and launch smoke (NIGHTLY_VERIFY_WORKFLOWS) download a published
                         # DMG and run the app in it from $RUNNER_TEMP with its own HOME: no compile, canonical root or
                         # kept DerivedData. As unknown jobs they were compiles (5 units, persistent-dd and a root).
@@ -414,7 +417,6 @@ WORKFLOW_JOB_CLASSES = {("cmux-tui.yml", "lint"): "isolated", ("cmux-tui.yml", "
                         ("nightly.yml", "signer-dmg-image"): "light",
                         ("nightly.yml", "verify-recovered-nightly-next"): "light",
                         ("nightly.yml", "verify-nightly-identity-legacy"): "light",
-                        ("nightly.yml", "generate-nightly-deltas"): "isolated",
                         # SIGNING_JOBS: the jobs that import the Developer ID key into a temporary keychain take the
                         # whole mini (the exclusive class, below).
                         **{key: "exclusive" for key in SIGNING_JOBS}}
