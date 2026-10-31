@@ -6660,6 +6660,9 @@ GH_CACHE_FLAG_ALIAS = {**BROKER_FLAG_ALIAS, "-q": "--jq", "-t": "--template", "-
 # The subcommand verbs that change one PR or issue named on the line, and nothing else about the
 # repository but its lists.
 GH_CACHE_TARGET_WRITES = {"comment", "edit", "ready", "close", "reopen", "review", "lock", "unlock"}
+# `gh run` verbs that change one run named on the line (a rerun, or stopping it). This only reads the
+# caller's command line to decide what to invalidate; the broker runs that write as it was typed.
+GH_CACHE_RUN_WRITES = {"rerun", "cancel"}
 # Verbs that change one PR and, through the base branch, every other PR's mergeability.
 GH_CACHE_BASE_WRITES = {"merge", "update-branch"}
 # The flags of those writes, by whether they take a value, so their one positional word (the PR) can
@@ -7002,8 +7005,7 @@ def gh_cache_write_scope(args: list[str], words: list[str], method: str,
             return repo, [f"pr {int(number)}", "runlists", "other"]
     if (first, second) in {("pr", "create"), ("issue", "create")}:
         return repo, ["runlists", "other"] if first == "pr" else ["other"]
-    if (first, second) in {("run", "rerun"), ("run", "cancel")} and rest[:1] and rest[0].isdigit() \
-            and len(rest) == 1:
+    if first == "run" and second in GH_CACHE_RUN_WRITES and rest[:1] and rest[0].isdigit() and len(rest) == 1:
         return repo, [f"run {rest[0]}", "runlists", "jobs", "prs", "other"]
     if (first, second) == ("workflow", "run"):
         return repo, ["runlists", "prs", "other"]
