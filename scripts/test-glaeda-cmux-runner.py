@@ -984,6 +984,25 @@ class HookTest(unittest.TestCase):
         self.assertIsNotNone(hook.reservation_refusal(os.fspath(marker), time.time()))
         self.assertIsNone(hook.reservation_refusal(os.fspath(marker), time.time(), taken_job=True))
 
+    def test_a_nightly_signing_reservation_admits_only_the_nightly_slot(self) -> None:
+        marker = self.dir / "reservation.json"
+        now = int(time.time())
+        doc = {"schema": "glaeda-reservation/v1", "owner": "cmux-nightly", "purpose": "nightly signing: cmux12s",
+               "since": now - 5, "until": now + 600}
+        marker.write_text(json.dumps(doc))
+        path = os.fspath(marker)
+        self.assertIsNone(hook.reservation_refusal(path, time.time(), nightly_slot=True))
+        self.assertIsNone(hook.reservation_refusal(path, time.time(), taken_job=True, nightly_slot=True))
+        self.assertIn("host reserved by cmux-nightly", hook.reservation_refusal(path, time.time()) or "")
+        self.assertIsNotNone(hook.reservation_refusal(path, time.time(), taken_job=True))
+        # Another purpose never opens the nightly slot; an expired marker refuses nobody.
+        marker.write_text(json.dumps({**doc, "purpose": "soak"}))
+        self.assertIsNotNone(hook.reservation_refusal(path, time.time(), nightly_slot=True))
+        marker.write_text(json.dumps({**doc, "until": now - 1}))
+        self.assertIsNone(hook.reservation_refusal(path, time.time()))
+        marker.write_text("{}")
+        self.assertIsNotNone(hook.reservation_refusal(path, time.time(), nightly_slot=True))
+
     def test_marker_without_the_parser_refuses(self) -> None:
         fleet = self.fleet()
         (fleet / "reservation.json").write_text("{}")
