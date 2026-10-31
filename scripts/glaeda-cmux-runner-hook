@@ -359,7 +359,7 @@ JOB_CLASSES = {"macos-compile-admission": "compile", "app-host-unit-tests": "gui
 # (GLAEDA_JOB_CLAIM=exclusive); cmux's signing jobs refuse to touch the key on an owned Mac without it, so a hook
 # from before this class never signs beside a PR job.
 # generate-nightly-deltas holds a Sparkle private key (it signs every delta a feed serves) and makes no keychain: on a
-# shared mini any other job could read the key from its environment, so it is exclusive too (cmux #NNNNN).
+# shared mini any other job could read the key from its environment, so it is exclusive too (manaflow-ai/cmux#29261).
 SIGNING_JOBS = (("nightly.yml", "build-sign-notarize-nightly"), ("nightly.yml", "recover-nightly-next-notarization"),
                 ("nightly.yml", "sign-nightly-identity-legacy"), ("nightly.yml", "generate-nightly-deltas"),
                 ("release.yml", "build-sign-notarize"), ("repair-v0-64-25-helper-rpaths.yml", "repair"),
