@@ -2876,8 +2876,8 @@ GUI_UNLOCK_SCRIPT = ('/usr/bin/security unlock-keychain -p "" "$1" || exit 1\n'
 
 def unlock_test_keychain_in_gui(home: Path, uid: int | None = None) -> str:
     """Unlock the test keychain in the GUI (Aqua) security session too, and cancel keychain prompts queued there
-    while it was locked. Unlock state is per security session, and every runner's LaunchAgent but the gui and
-    session runners' has SessionCreate, so their job-started unlock never reaches the desktop: there the user's default keychain stays locked and
+    while it was locked. Unlock state is per security session, and each runner's LaunchAgent has SessionCreate,
+    so the job-started unlock never reaches the desktop: there the user's default keychain stays locked and
     Spotlight or assistantd asks for its password over UI tests. A LaunchAgent limited to Aqua runs the unlock in
     that session: RunAtLoad covers every login, and the kickstart here covers a keychain made since.
     Daemons ask for the default keychain within seconds of login, often before that agent runs, and securityd
