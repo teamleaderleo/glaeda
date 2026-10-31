@@ -10096,6 +10096,12 @@ class BrokerAnswerHitRateTest(CountingGhBase):
         self.run_gh(["pr", "comment", "7", "--weird-flag", "8", "-R", "o/r", "--body", "x"])
         self.assertEqual(fresh(), {"pr7": True, "pr8": True, "run5": True, "list": True},
                          "an unknown flag could make any word the PR: the whole repository")
+        self.run_gh(["pr", "comment", "7", "--weird-flag=8", "-R", "o/r", "--body", "x"])
+        self.assertEqual(fresh(), {"pr7": True, "pr8": True, "run5": True, "list": True},
+                         "an unknown flag with its value attached is as wide: it may change more than PR 7")
+        self.run_gh(["pr", "comment", "7", "--body=x", "-R", "o/r"])
+        self.assertEqual(fresh(), {"pr7": True, "pr8": False, "run5": False, "list": True},
+                         "a known flag with its value attached keeps the write to its PR")
         self.run_gh(["api", "graphql", "-f", "query=mutation{x}"])
         self.assertEqual(fresh(), {"pr7": True, "pr8": True, "run5": True, "list": True},
                          "a mutation names no repository: every answer")
