@@ -7023,7 +7023,8 @@ def gh_cache_write_scope(args: list[str], words: list[str], method: str,
 def gh_cache_write_positionals(args: list[str]) -> list[str] | None:
     """The positional words of a `gh pr|issue|run|workflow` write, or None when a flag on it is in
     neither GH_CACHE_WRITE_VALUE_FLAGS nor GH_CACHE_WRITE_BOOL_FLAGS (its value could be read as the
-    PR's number) or the line has a `--`."""
+    PR's number, and a flag this does not know may change more than one PR, even written `--flag=value`)
+    or the line has a `--`."""
     words, i = [], 0
     while i < len(args):
         arg = args[i]
@@ -7032,7 +7033,8 @@ def gh_cache_write_positionals(args: list[str]) -> list[str] | None:
         if arg.startswith("-") and arg != "-":
             name = arg.split("=", 1)[0]
             if "=" in arg and name.startswith("--"):
-                pass
+                if name not in GH_CACHE_WRITE_VALUE_FLAGS:
+                    return None  # `--new-flag=x`: a flag this does not know may change more than one PR
             elif not name.startswith("--") and len(name) > 2:
                 if name[:2] not in GH_CACHE_WRITE_VALUE_FLAGS:
                     return None  # `-abc`, or a glued value on a flag this does not know
