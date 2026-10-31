@@ -6997,10 +6997,9 @@ def gh_cache_write_scope(args: list[str], words: list[str], method: str,
         if first == "pr" and second in GH_CACHE_BASE_WRITES:
             return repo, [f"pr {int(number)}", "prs", "runlists", "other"]
         if second in GH_CACHE_TARGET_WRITES:
-            # A label, a ready-for-review or a reopen can start a workflow; a comment or review
-            # only one that listens to comments, which the TTL bounds.
-            starts_runs = first == "pr" and second in {"edit", "ready", "close", "reopen"}
-            return repo, [f"pr {int(number)}", *(["runlists"] if starts_runs else []), "other"]
+            # A label, a ready-for-review, a reopen, a comment or a review can each start a workflow
+            # (pull_request, issue_comment, pull_request_review): the run lists go with them.
+            return repo, [f"pr {int(number)}", "runlists", "other"]
     if (first, second) in {("pr", "create"), ("issue", "create")}:
         return repo, ["runlists", "other"] if first == "pr" else ["other"]
     if (first, second) in {("run", "rerun"), ("run", "cancel")} and rest[:1] and rest[0].isdigit() \
@@ -7038,13 +7037,14 @@ def gh_cache_write_positionals(args: list[str]) -> list[str] | None:
 
 
 def gh_cache_post_scopes(item: dict) -> list[str]:
-    """What a queued `post` changes: a comment or review changes its PR or issue and the lists; a new PR
-    the lists. Anything else stamps the whole repository."""
+    """What a queued `post` changes, as gh_cache_write_scope has it for the same write made directly: a
+    comment or review its PR or issue, the lists and the run lists (it can start a workflow); a new PR
+    the lists and the run lists. Anything else stamps the whole repository."""
     number = item.get("number")
     if item.get("kind") in ("comment", "review") and isinstance(number, int) and not isinstance(number, bool):
-        return [f"pr {number}", "other"]
+        return [f"pr {number}", "runlists", "other"]
     if item.get("kind") == "pr":
-        return ["other"]
+        return ["runlists", "other"]
     return []
 
 

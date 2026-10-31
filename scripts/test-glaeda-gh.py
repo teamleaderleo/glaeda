@@ -9893,7 +9893,7 @@ class BrokerAnswerCacheTest(CountingGhBase):
         with mock.patch.object(gg, "daemon_running", return_value=False), \
                 contextlib.redirect_stderr(io.StringIO()):
             gg.cmd_post(args)
-        self.assertEqual(set(gg.gh_cache_writes()), {"o/r pr 7", "o/r other"})
+        self.assertEqual(set(gg.gh_cache_writes()), {"o/r pr 7", "o/r runlists", "o/r other"})
 
     def test_another_token_is_another_question(self) -> None:
         args = ["api", "repos/o/r/pulls/7"]
@@ -10074,6 +10074,8 @@ class BrokerAnswerHitRateTest(CountingGhBase):
         fresh()
         self.run_gh(["pr", "comment", "7", "-R", "o/r", "--body", "hi"])
         self.assertEqual(fresh(), {"pr7": True, "pr8": False, "run5": False, "list": True})
+        self.assertEqual(gg.gh_cache_post_scopes({"kind": "pr", "repo": "o/r"}), ["runlists", "other"],
+                         "a queued PR stamps what `pr create` does")
         self.run_gh(["pr", "merge", "8", "-R", "o/r", "--squash", "--match-head-commit", "a" * 40])
         self.assertEqual(fresh(), {"pr7": True, "pr8": True, "run5": False, "list": True},
                          "a merge moves the base: every PR's mergeability, not the runs")
@@ -10103,7 +10105,7 @@ class BrokerAnswerHitRateTest(CountingGhBase):
                 self.run_gh(args)
             return {0: False, len(lists): True}[self.runs() - before]
         fetched()
-        for write, starts in ((["pr", "comment", "7", "-R", "o/r", "--body", "x"], False),
+        for write, starts in ((["pr", "comment", "7", "-R", "o/r", "--body", "x"], True),
                               (["issue", "create", "-R", "o/r", "--title", "t", "--body", "b"], False),
                               (["pr", "edit", "7", "-R", "o/r", "--add-label", "full-ci"], True),
                               (["workflow", "run", "ci.yml", "-R", "o/r"], True),
