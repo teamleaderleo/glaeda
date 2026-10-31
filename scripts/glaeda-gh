@@ -1993,6 +1993,13 @@ class Daemon:
         if len(labels) != 1:
             regrade.update(state="skipped", reason="no single current risk tier")
             return
+        if labels[0] != "risk:high":
+            # Only risk:high reads a receipt (cmux scripts/ci/risk_tier.py: "Only looked up for high"). A low or
+            # normal label removal changed no verdict, but its unlabeled and the grader's relabel each started
+            # every labeled-triggered workflow again: a whole CI run, webview suite included, that merge-guard
+            # then waited on (cmux#29666, 2026-10-31).
+            regrade.update(state="skipped", reason=f"{labels[0]} reads no receipt")
+            return
         if self.mode("rest") == "stop":
             regrade.update(state="failed", error="REST budget stopped")
             return
