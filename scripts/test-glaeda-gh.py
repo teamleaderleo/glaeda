@@ -10092,6 +10092,29 @@ class BrokerAnswerHitRateTest(CountingGhBase):
         self.assertEqual(fresh(), {"pr7": True, "pr8": True, "run5": True, "list": True},
                          "a mutation names no repository: every answer")
 
+    def test_a_list_of_runs_is_stamped_only_by_writes_that_make_runs(self) -> None:
+        lists = (["run", "list", "-R", "o/r", "--workflow", "ci.yml", "--json", "databaseId"],
+                 ["api", "repos/o/r/actions/workflows/ci.yml/runs?per_page=5"],
+                 ["api", "repos/o/r/actions/runs?branch=main"])
+
+        def fetched() -> bool:
+            before = self.runs()
+            for args in lists:
+                self.run_gh(args)
+            return {0: False, len(lists): True}[self.runs() - before]
+        fetched()
+        for write, starts in ((["pr", "comment", "7", "-R", "o/r", "--body", "x"], False),
+                              (["issue", "create", "-R", "o/r", "--title", "t", "--body", "b"], False),
+                              (["pr", "edit", "7", "-R", "o/r", "--add-label", "full-ci"], True),
+                              (["workflow", "run", "ci.yml", "-R", "o/r"], True),
+                              (["api", "-X", "POST", "repos/o/r/actions/workflows/ci.yml/dispatches", "-f", "ref=main"], True),
+                              (["run", "rerun", "5", "-R", "o/r"], True),
+                              (["pr", "merge", "7", "-R", "o/r", "--squash"], True),
+                              (["pr", "create", "-R", "o/r", "--title", "t", "--body", "b"], True)):
+            with self.subTest(write=write):
+                self.run_gh(write)
+                self.assertEqual(fetched(), starts)
+
     def test_a_write_still_runs_every_time_and_never_reads_the_cache(self) -> None:
         merge = ["pr", "merge", "7", "-R", "o/r", "--squash", "--match-head-commit", "b" * 40]
         self.run_gh(["pr", "view", "7", "-R", "o/r", "--json", "headRefOid"])

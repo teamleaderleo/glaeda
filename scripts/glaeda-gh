@@ -6636,6 +6636,10 @@ GH_CACHE_API_PR_RE = re.compile(rf"^(?:https?://api\.github\.com/)?/?repos/({NAM
 GH_CACHE_API_RUN_RE = re.compile(rf"^(?:https?://api\.github\.com/)?/?repos/({NAME})/({NAME})/actions/runs/(\d+)(?:[/?]|$)")
 GH_CACHE_API_JOB_RE = re.compile(rf"^(?:https?://api\.github\.com/)?/?repos/({NAME})/({NAME})/actions/jobs/(\d+)(?:[/?]|$)")
 GH_CACHE_PR_URL_RE = re.compile(rf"^https://github\.com/({NAME})/({NAME})/(?:pull|issues)/(\d+)/?$")
+# Lists of workflow runs: the REST reads repeated most on cosmic-gray (1,092 of 1,400 within 90 s over
+# 8 hours, 2026-10-30), which a comment or a label cannot change.
+GH_CACHE_API_RUNS_LIST_RE = re.compile(
+    rf"^(?:https?://api\.github\.com/)?/?repos/({NAME})/({NAME})/actions/(?:workflows/[^/?]+/)?runs/?(?:\?.*)?$")
 # Reads that never change what GitHub holds, so they stamp nothing. `auth git-credential` is git
 # asking gh for a password on every https fetch: it stamped every answer on the host, about once
 # every 40 minutes on cosmic-gray.
@@ -6929,9 +6933,14 @@ def gh_cache_target(words: list[str], values: dict[str, str], repo: str | None) 
     return None
 
 
-def gh_cache_stamps(target: list | None, repo: str | None) -> list[str] | None:
+def gh_cache_stamps(target: list | None, repo: str | None, words: list[str] | None = None) -> list[str] | None:
     """The writes.json entries that make an answer old: one about `target`, or about `repo` when it
-    is about nothing narrower. None when the answer names no repository (every write counts)."""
+    is about nothing narrower (a list of workflow runs has a scope of its own, "runlists"). None when the
+    answer names no repository (every write counts)."""
+    if target is None and repo and words and (
+            tuple(words[:2]) == ("run", "list")
+            or (words[:1] == ["api"] and len(words) > 1 and GH_CACHE_API_RUNS_LIST_RE.match(words[1]))):
+        return ["*", repo, f"{repo} runlists"]
     if target:
         kind, repo, ident = target
         narrow = {"pr": [f"{repo} pr {ident}", f"{repo} prs"], "run": [f"{repo} run {ident}", f"{repo} runs"],
@@ -6945,7 +6954,8 @@ def gh_cache_stamps(target: list | None, repo: str | None) -> list[str] | None:
 def gh_cache_write_scope(args: list[str], words: list[str], method: str,
                          values: dict[str, str]) -> tuple[str | None, list[str]]:
     """(repository or None, the scopes this write stamps): "pr N", "run ID", "prs" (every PR's
-    mergeability or checks), "runs", "jobs", and "other" (lists and everything not one target). [] is
+    mergeability or checks), "runs" (every run), "jobs", "runlists" (the lists of workflow runs: a
+    write that can start one) and "other" (the other lists, and everything not one target). [] is
     the whole repository, as every write was before; a write naming no repository stamps every one.
 
     Narrow only where what the write changes is known: anything else, a GraphQL mutation included,
@@ -6964,14 +6974,16 @@ def gh_cache_write_scope(args: list[str], words: list[str], method: str,
         tail = path.split("/")[3:]  # after repos/OWNER/REPO
         if len(tail) >= 2 and tail[0] in ("pulls", "issues") and tail[1].isdigit():
             if tail[0] == "pulls" and tail[2:3] and tail[2] in GH_CACHE_BASE_WRITES:
-                return repo, [f"pr {int(tail[1])}", "prs", "other"]
+                return repo, [f"pr {int(tail[1])}", "prs", "runlists", "other"]
+            if tail[0] == "pulls" and not tail[2:]:
+                return repo, [f"pr {int(tail[1])}", "runlists", "other"]  # an edit: a label can start a workflow
             return repo, [f"pr {int(tail[1])}", "other"]
         if len(tail) >= 3 and tail[:2] == ["actions", "runs"] and tail[2].isdigit():
-            return repo, [f"run {tail[2]}", "jobs", "prs", "other"]
+            return repo, [f"run {tail[2]}", "runlists", "jobs", "prs", "other"]
         if len(tail) >= 3 and tail[:2] == ["actions", "jobs"] and tail[2].isdigit():
-            return repo, ["runs", "jobs", "prs", "other"]
+            return repo, ["runs", "runlists", "jobs", "prs", "other"]
         if len(tail) >= 4 and tail[:2] == ["actions", "workflows"] and tail[3] == "dispatches":
-            return repo, ["prs", "other"]  # a new run: its checks reach a PR on that branch
+            return repo, ["runlists", "prs", "other"]  # a new run: its checks reach a PR on that branch
         return repo, []
     rest = gh_cache_write_positionals(args)
     if rest is None:
@@ -6983,16 +6995,19 @@ def gh_cache_write_scope(args: list[str], words: list[str], method: str,
         number = url.group(3)
     if first in ("pr", "issue") and number is not None and len(rest) == 1:
         if first == "pr" and second in GH_CACHE_BASE_WRITES:
-            return repo, [f"pr {int(number)}", "prs", "other"]
+            return repo, [f"pr {int(number)}", "prs", "runlists", "other"]
         if second in GH_CACHE_TARGET_WRITES:
-            return repo, [f"pr {int(number)}", "other"]
+            # A label, a ready-for-review or a reopen can start a workflow; a comment or review
+            # only one that listens to comments, which the TTL bounds.
+            starts_runs = first == "pr" and second in {"edit", "ready", "close", "reopen"}
+            return repo, [f"pr {int(number)}", *(["runlists"] if starts_runs else []), "other"]
     if (first, second) in {("pr", "create"), ("issue", "create")}:
-        return repo, ["other"]
+        return repo, ["runlists", "other"] if first == "pr" else ["other"]
     if (first, second) in {("run", "rerun"), ("run", "cancel")} and rest[:1] and rest[0].isdigit() \
             and len(rest) == 1:
-        return repo, [f"run {rest[0]}", "jobs", "prs", "other"]
+        return repo, [f"run {rest[0]}", "runlists", "jobs", "prs", "other"]
     if (first, second) == ("workflow", "run"):
-        return repo, ["prs", "other"]
+        return repo, ["runlists", "prs", "other"]
     return repo, []
 
 
@@ -7177,7 +7192,7 @@ def gh_cache_meta(words: list[str], values: dict[str, str], repo: str | None) ->
     the daemon sees afterwards always drops it -- never the other way round."""
     target = gh_cache_target(words, values, repo)
     meta: dict[str, Any] = {}
-    stamps = gh_cache_stamps(target, repo)
+    stamps = gh_cache_stamps(target, repo, words)
     if stamps is not None:
         meta["stamps"] = stamps
     held = gh_cache_watch(target)
