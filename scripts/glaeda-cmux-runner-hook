@@ -1607,15 +1607,32 @@ DRAIN_OWNER = "glaeda-mini-health"
 DRAIN_PURPOSE = "drain for a Tailscale restart: "  # glaeda-mini-health start_drain's purpose, exactly this prefix
 
 
+# NIGHTLY_SIGNING: cmux's nightly signing jobs need the whole mini (the exclusive class). On a mini under steady PR
+# load the SIGNING_DRAIN wait never got it: cmux runs 41161589041 and 41161558229 (2026-10-31) were refused with "6 of
+# 14 units free" and "10 of 14 units free" after 600 s, and nightlies may not fall back to Blacksmith (Lawrence,
+# 2026-10-30). A reservation whose purpose starts with this prefix holds every runner of the mini off (as any
+# reservation does) except the nightly slot, which keeps listening and admits nightly-tier jobs only; so the
+# mini runs nothing but nightly jobs and a signing job finds it whole. Written by `glaeda-mini-fleet reserve`
+# (or by hand) with an until in the future; removing the file ends it.
+NIGHTLY_SIGNING_PURPOSE = "nightly signing: "
+
+
 def drain_marker(marker: dict[str, Any]) -> bool:
     return marker.get("owner") == DRAIN_OWNER and str(marker.get("purpose") or "").startswith(DRAIN_PURPOSE)
 
 
-def reservation_refusal(path: str, now: float, taken_job: bool = False) -> str | None:
+def nightly_signing_marker(marker: dict[str, Any]) -> bool:
+    """A NIGHTLY_SIGNING reservation: it keeps every runner but the mini's nightly slot off the host."""
+    return str(marker.get("purpose") or "").startswith(NIGHTLY_SIGNING_PURPOSE)
+
+
+def reservation_refusal(path: str, now: float, taken_job: bool = False, nightly_slot: bool = False) -> str | None:
     """Why an active or unreadable reservation refuses this job, or None. Parsed by glaeda_reservation,
     shared with glaeda-mini-fleet, which the installer copies next to this hook. taken_job (job-started only):
-    a valid, active drain marker (drain_marker) admits the job a listener already took; any other marker, and
-    an unreadable or invalid one, refuses as before."""
+    a valid, active drain marker (drain_marker) admits the job a listener already took; nightly_slot (the mini's
+    nightly slot, --nightly-runner): a valid, active NIGHTLY_SIGNING marker admits it, and nightly_slot_refusal
+    still keeps that runner to nightly-tier jobs; any other marker, and an unreadable or invalid one, refuses as
+    before."""
     try:
         text = Path(path).read_text(encoding="utf-8")
     except FileNotFoundError:
@@ -1634,6 +1651,8 @@ def reservation_refusal(path: str, now: float, taken_job: bool = False) -> str |
     if marker is None:
         return f"reservation {path} is not a valid {reservation.SCHEMA} marker ({why})"
     if not reservation.active(marker, now):
+        return None
+    if nightly_slot and nightly_signing_marker(marker):
         return None
     if taken_job and drain_marker(marker):
         print(f"{PREFIX}: host draining ({reservation.describe(marker)}); admitting the job this runner already "
@@ -6177,9 +6196,10 @@ class Gate:
     def still_reserved(self) -> str | None:
         """The host's reservation, read afresh (one small file): why it holds the host, or None. A dedicated runner
         never yields to one (claimed)."""
-        if runner_scope(self.runner_dir).dedicated:
+        scope = runner_scope(self.runner_dir)
+        if scope.dedicated:
             return None
-        return reservation_refusal(self.reservation, time.time()) if self.reservation else None
+        return reservation_refusal(self.reservation, time.time(), nightly_slot=scope.nightly) if self.reservation else None
 
     def low_disk(self) -> str | None:
         """Why job-started would refuse every job for free disk (disk_refusal against this runner's own
@@ -9040,7 +9060,8 @@ def main(argv: list[str] | None = None) -> int:
             if why:
                 return refused(why)
         # a dedicated builder is not a pool runner: a reservation of the mini's pool never refuses its one job shape
-        why = None if args.dedicated_admit else reservation_refusal(args.reservation, time.time(), taken_job=True)
+        why = None if args.dedicated_admit else reservation_refusal(args.reservation, time.time(), taken_job=True,
+                                                                    nightly_slot=bool(args.nightly_runner))
         disk_path = os.path.dirname(args.host_lock)
         disk_deadline = time.monotonic() + EVICT_TIMEOUT_S  # one budget for every eviction of this job-started
         # a nightly job short of disk goes first here (NIGHTLY_DISK_RESERVE): no new job starts on this mini while it
