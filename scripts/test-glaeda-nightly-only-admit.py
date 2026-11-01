@@ -310,7 +310,7 @@ class DedicatedOnlyApplyTest(unittest.TestCase):
         self.assertIsNone(got["exit"])
         self.assertIn("no deregistration plan", got["state"])
 
-    def one_member(self, retired_exit):
+    def one_member(self, retired_exit, relisted=([], None)):
         summary = {"class": "std", "runners": 4, "gatewayRunners": 0, "capacityUnits": 14, "dedicatedOnly": True}
         args = SimpleNamespace(scope_flags=False, apply=True, include_ineligible=False, allow_downgrade=None,
                                guard={"head": "h", "refusals": []}, skip_launchctl=False, org=None,
@@ -319,7 +319,7 @@ class DedicatedOnlyApplyTest(unittest.TestCase):
         with mock.patch.object(fleet, "check", return_value=(True, "ok")), \
                 mock.patch.object(fleet, "stage", return_value=None), \
                 mock.patch.object(fleet, "prepare_headless", return_value=None), \
-                mock.patch.object(fleet, "installed_pool_instances", return_value=([0, 1], None)), \
+                mock.patch.object(fleet, "installed_pool_instances", side_effect=[([0, 1], None), relisted]), \
                 mock.patch.object(fleet, "retire_instance",
                                   side_effect=lambda m, k: {"instance": k, "exit": retired_exit, "state": "x"}), \
                 mock.patch.object(fleet, "apply_dedicated",
@@ -335,6 +335,15 @@ class DedicatedOnlyApplyTest(unittest.TestCase):
         row, dedicated = self.one_member(0)
         dedicated.assert_called_once()
         self.assertEqual(row["action"], "applied")
+
+    def test_a_pool_instance_installed_after_the_snapshot_holds_the_dedicated_runners(self):
+        # review of 8c6009cd: every recorded retirement succeeded, but a concurrent apply added instance 5 meanwhile
+        for relisted in (([5], None), (None, "cannot list its runner receipts")):
+            with self.subTest(relisted=relisted):
+                row, dedicated = self.one_member(0, relisted)
+                dedicated.assert_not_called()
+                self.assertEqual(row["action"], "failed")
+                self.assertIn("still has pool instances", row["instances"][-1]["state"])
 
 
 TRUSTED = {"name": "trusted-main", "repo": REPO, "trustedRef": "refs/heads/main", "trustedRepo": REPO,

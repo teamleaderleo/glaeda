@@ -864,11 +864,19 @@ def one_member(member: str, summary: dict[str, Any], args: argparse.Namespace, m
         with concurrent.futures.ThreadPoolExecutor(max_workers=instances) as pool:
             results = list(pool.map(lambda k: apply_instance(member, k, repo, extra, org, group,
                                                              args.migrate_from_repo), range(instances)))
+    held = None
     if summary.get("dedicatedOnly") and not all(r["exit"] == 0 for r in results):
+        held = "held: pool instances are not all retired; drain the mini and re-run"
+    elif summary.get("dedicatedOnly"):
+        # re-list the whole pool set right before the dedicated runners: the snapshot above is not the mini now (a
+        # concurrent or stale apply may have installed another pool instance since; review of 8c6009cd)
+        left, why = installed_pool_instances(member)
+        if left is None or left:
+            held = f"held: the mini still has pool instances ({why or left}); drain the mini and re-run"
+    if held:
         # DEDICATED_ONLY: a pool instance still installed (busy, or unreadable) can take a signing job whose whole-mini
         # claim the dedicated runners never join, so no dedicated runner is (re)applied until every one is retired
-        results.append({"dedicated": "*", "exit": None,
-                        "state": "held: pool instances are not all retired; drain the mini and re-run"})
+        results.append({"dedicated": "*", "exit": None, "state": held})
     else:
         # a dedicated runner keeps its own scope (never --org/--migrate-from-repo) and its own labels
         results += [apply_dedicated(member, entry, extra) for entry in dedicated]
