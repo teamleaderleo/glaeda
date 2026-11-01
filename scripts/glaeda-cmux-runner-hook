@@ -2186,7 +2186,10 @@ def export_job_claim(capacity_units: int, taken: dict[str, Any], note: str) -> s
     with contextlib.suppress(OSError):
         lines = f"{JOB_CLAIM_ENV}={EXCLUSIVE_CLASS}\n"
         with contextlib.suppress(OSError):  # an unreadable hook writes no sha, and a job that needs one refuses itself
-            lines += f"{HOOK_SHA_ENV}={hashlib.sha256(Path(__file__).resolve().read_bytes()).hexdigest()}\n"
+            running = hashlib.sha256(Path(__file__).resolve().read_bytes()).hexdigest()
+            # a retained version (RETAINED_HOOKS) names itself only when the file it runs is the one selected
+            if os.environ.get(HOOK_SELECTED_ENV, running) == running:
+                lines += f"{HOOK_SHA_ENV}={running}\n"
         with open(target, "a", encoding="utf-8") as env_file:
             env_file.write(lines)
         return f"{JOB_CLAIM_ENV}={EXCLUSIVE_CLASS} for the job (it holds the whole mini)"
@@ -2224,8 +2227,13 @@ def signing_hook_listed(repo: str | None, sha: str | None, hook: str | None = No
     list or the hook's own sha cannot be read, which the caller treats as no answer. The same read as cmux's claim
     gate (curl from raw.githubusercontent.com at the run's commit), bounded to SIGNING_HOOKS_FETCH_S."""
     hook = hook if hook is not None else hook_sha256()
-    if not hook or not repo or not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo) \
-            or not sha or not GIT_SHA.fullmatch(sha):
+    listed = signing_hooks_list(repo, sha) if hook else None
+    return None if listed is None else hook in listed
+
+
+def signing_hooks_list(repo: str | None, sha: str | None) -> frozenset[str] | None:
+    """The hook sha256s glaeda-signing-hooks.txt lists at repo@sha, or None when it cannot be read or lists none."""
+    if not repo or not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo) or not sha or not GIT_SHA.fullmatch(sha):
         return None
     template = os.environ.get(SIGNING_HOOKS_URL_ENV) or SIGNING_HOOKS_URL
     protocols = "=https,file" if os.environ.get(SIGNING_HOOKS_URL_ENV) else "=https"
@@ -2238,11 +2246,247 @@ def signing_hook_listed(repo: str | None, sha: str | None, hook: str | None = No
         return None
     if fetched.returncode != 0:
         return None
-    listed = {line.split(None, 1)[0] for line in fetched.stdout.splitlines()
-              if line.strip() and not line.lstrip().startswith("#")}
+    listed = frozenset(line.split(None, 1)[0] for line in fetched.stdout.splitlines()
+                       if line.strip() and not line.lstrip().startswith("#"))
     if not listed:
         return None  # an empty answer is not a list (the claim gate would refuse every hook on it)
-    return hook in listed
+    return listed
+
+
+# RETAINED_HOOKS: a nightly, DEV or promote run trusts only the hooks glaeda-signing-hooks.txt lists at its own commit,
+# and a run that started before a hook rollout can reach its signing job after it (manaflow-ai/cmux run 41256487647:
+# sign-nightly-identity-legacy, attempt 3, found the new hook on every mini and the whole mini was refused). So each
+# hook version a mini ran or was given stays there as an immutable copy, content-addressed by its sha256
+# (~/glaeda-runner/hooks/<sha256>/, with the reservation module it ran beside; read-only and never overwritten), and
+# a signing job whose commit does not list the installed hook runs the newest retained version its commit does list:
+# that copy must hash to its name and accept the job's arguments (--parse-only), and the job-started process execs it,
+# so the hook that admits the job and names itself in the claim (HOOK_SHA_ENV, the sha256 of the file it runs) is
+# exactly a listed one. A previous digest never vouches for other bytes: no listed copy, and the job is refused as
+# before (SIGNING_HOOKS). The fleet's stage keeps the installed and the new hook (retain-hooks) before an --apply
+# replaces one; job-completed keeps its own hook. A version is retired only RETAINED_KEEP_S after it was last
+# installed and after the last job of every run recorded against it (retained.json; GitHub lets a run be re-run for
+# 30 days, and the minis hold no gh login to ask whether one finished).
+RETAINED_HOOKS_DIR = "glaeda-runner/hooks"  # under the runner user's home
+RETAINED_STATE = "retained.json"
+RETAINED_SCHEMA = "glaeda-retained-hooks/v1"
+RETAINED_KEEP_S = 30 * 86400
+RETAINED_MAINTAIN_S = 3600  # job-completed keeps its hook and prunes at most this often
+RETAINED_LOCK_WAIT_S = 5.0
+HOOK_SELECTED_ENV = "GLAEDA_HOOK_SELECTED"  # set across the exec: the retained digest the job runs
+RESERVATION_MODULE = "glaeda_reservation.py"
+SHA256_HEX = re.compile(r"[0-9a-f]{64}")
+
+
+def retained_store() -> Path:
+    return Path.home() / RETAINED_HOOKS_DIR
+
+
+def _retained_versions(store: Path) -> dict[str, dict[str, Any]]:
+    """retained.json's versions, cleaned: {sha256: {retainedAt, lastCurrent, runs: {run id: last seen}}}."""
+    try:
+        doc = json.loads((store / RETAINED_STATE).read_text())
+    except (OSError, ValueError):
+        doc = None
+    found = doc.get("versions") if isinstance(doc, dict) and doc.get("schema") == RETAINED_SCHEMA else None
+    number = lambda value: float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else 0.0
+    versions: dict[str, dict[str, Any]] = {}
+    for digest, entry in (found if isinstance(found, dict) else {}).items():
+        if SHA256_HEX.fullmatch(str(digest)) and isinstance(entry, dict):
+            runs = entry.get("runs") if isinstance(entry.get("runs"), dict) else {}
+            versions[digest] = {"retainedAt": number(entry.get("retainedAt")),
+                                "lastCurrent": number(entry.get("lastCurrent")),
+                                "runs": {str(r): number(t) for r, t in runs.items() if str(r).isdigit()}}
+    return versions
+
+
+@contextlib.contextmanager
+def retained_ledger(store: Path):
+    """retained.json's versions under the store's flock (bounded wait); written back atomically when changed."""
+    store.mkdir(parents=True, exist_ok=True)
+    fd = os.open(store / ".lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o644)
+    try:
+        deadline = time.monotonic() + RETAINED_LOCK_WAIT_S
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() > deadline:
+                    raise OSError(errno.EWOULDBLOCK, "the retained hooks ledger is busy") from None
+                time.sleep(0.05)
+        versions = _retained_versions(store)
+        before = json.dumps(versions, sort_keys=True)
+        yield versions
+        if json.dumps(versions, sort_keys=True) != before:
+            tmp = store / f".{RETAINED_STATE}.{os.getpid()}"
+            tmp.write_text(json.dumps({"schema": RETAINED_SCHEMA, "versions": versions}, sort_keys=True) + "\n")
+            os.replace(tmp, store / RETAINED_STATE)
+    finally:
+        os.close(fd)
+
+
+def retain_hook(source: Path, store: Path, now: float) -> str:
+    """Keep source (a hook file) as store/<its sha256>/, read-only, with the reservation module beside it; an existing
+    copy is never overwritten. Returns the sha256."""
+    data = source.read_bytes()
+    digest = hashlib.sha256(data).hexdigest()
+    dest = store / digest
+    store.mkdir(parents=True, exist_ok=True)
+    if not dest.is_dir():
+        tmp = Path(tempfile.mkdtemp(prefix=f".{digest[:12]}.", dir=store))
+        try:
+            (tmp / PREFIX).write_bytes(data)
+            os.chmod(tmp / PREFIX, 0o555)
+            module = source.parent / RESERVATION_MODULE
+            if module.is_file():
+                (tmp / RESERVATION_MODULE).write_bytes(module.read_bytes())
+                os.chmod(tmp / RESERVATION_MODULE, 0o444)
+            os.chmod(tmp, 0o555)
+            os.rename(tmp, dest)  # an existing copy (another hook kept it first) is never replaced
+        except OSError:
+            if not dest.is_dir():
+                raise
+        finally:
+            if tmp.exists():
+                os.chmod(tmp, 0o755)
+                shutil.rmtree(tmp, ignore_errors=True)
+    with retained_ledger(store) as versions:
+        versions.setdefault(digest, {"retainedAt": now, "lastCurrent": now, "runs": {}})
+    return digest
+
+
+def retained_candidates(store: Path) -> list[tuple[str, Path]]:
+    """(sha256, hook path) of every retained version, newest first (retained.json's retainedAt, else the copy's
+    mtime). Names only: the caller hashes what it would run."""
+    versions = _retained_versions(store)
+    found = []
+    with contextlib.suppress(OSError):
+        for entry in store.iterdir():
+            if SHA256_HEX.fullmatch(entry.name) and (entry / PREFIX).is_file():
+                when = versions.get(entry.name, {}).get("retainedAt") or entry.stat().st_mtime
+                found.append((when, entry.name, entry / PREFIX))
+    return [(digest, path) for _, digest, path in sorted(found, reverse=True)]
+
+
+def record_hook_run(store: Path, digest: str, run_id: str | None, now: float) -> None:
+    """Note that run run_id ran a job under hook digest (a retained version is kept while its runs may re-run)."""
+    if not run_id or not run_id.isdigit():
+        return
+    with retained_ledger(store) as versions:
+        entry = versions.setdefault(digest, {"retainedAt": now, "lastCurrent": now, "runs": {}})
+        entry["runs"][run_id] = now
+
+
+def installed_hooks(home: Path) -> list[Path]:
+    """Every runner install's hook on this Mac and the fleet's staged copy."""
+    found = sorted(home.glob(f"actions-runner-glaeda*/glaeda-hooks/{PREFIX}"))
+    staged = home / "glaeda-runner" / "scripts" / PREFIX
+    return found + ([staged] if staged.is_file() else [])
+
+
+def prune_retained(store: Path, installed: set[str], now: float) -> list[str]:
+    """Retire the versions no runner has installed for RETAINED_KEEP_S whose recorded runs all ran their last job
+    RETAINED_KEEP_S ago; copies with no ledger entry join it (they are kept a full window). Returns the retired."""
+    retired = []
+    with retained_ledger(store) as versions:
+        with contextlib.suppress(OSError):
+            for entry in store.iterdir():
+                if SHA256_HEX.fullmatch(entry.name) and entry.is_dir():
+                    versions.setdefault(entry.name, {"retainedAt": now, "lastCurrent": now, "runs": {}})
+        for digest, entry in list(versions.items()):
+            if digest in installed:
+                entry["lastCurrent"] = now
+                continue
+            if now - max(entry["retainedAt"], entry["lastCurrent"], *entry["runs"].values()) < RETAINED_KEEP_S:
+                continue
+            path = store / digest
+            if path.is_dir():
+                with contextlib.suppress(OSError):
+                    os.chmod(path, 0o755)
+                shutil.rmtree(path)
+            del versions[digest]
+            retired.append(digest)
+        for entry in versions.values():
+            entry["runs"] = {r: t for r, t in entry["runs"].items() if now - t < RETAINED_KEEP_S}
+    return retired
+
+
+def retain_installed(home: Path, extra: list[Path], now: float) -> str:
+    """retain-hooks (the fleet's stage, before an --apply replaces a hook): keep every installed hook and extra, then
+    prune. One summary line."""
+    store = retained_store()
+    kept: set[str] = set()
+    for path in [*installed_hooks(home), *extra]:
+        kept.add(retain_hook(path, store, now))
+    retired = prune_retained(store, kept, now)
+    return (f"retained {len(kept)} hook version(s) ({', '.join(sorted(d[:12] for d in kept))}) in ~/{RETAINED_HOOKS_DIR}"
+            + (f"; retired {', '.join(d[:12] for d in retired)}" if retired else ""))
+
+
+def maintain_retained(hook_file: Path, home: Path, now: float) -> None:
+    """job-completed: keep this installed hook (before install_staged_hook may replace it), and prune at most every
+    RETAINED_MAINTAIN_S."""
+    store = retained_store()
+    retain_hook(hook_file, store, now)
+    marker = store / ".maintained"
+    with contextlib.suppress(OSError):
+        if now - marker.stat().st_mtime < RETAINED_MAINTAIN_S:
+            return
+    prune_retained(store, {hashlib.sha256(p.read_bytes()).hexdigest() for p in installed_hooks(home)}
+                   | {hashlib.sha256(hook_file.read_bytes()).hexdigest()}, now)
+    marker.touch()
+    os.utime(marker, (now, now))
+
+
+def select_hook_version(argv: list[str], home_repo: str) -> str | None:
+    """job-started, before anything else (RETAINED_HOOKS): for a signing job of the home repository whose commit's
+    glaeda-signing-hooks.txt does not list this hook, exec the newest retained version it lists. Returns a note when
+    this hook runs the job itself (or None); on a selection it does not return."""
+    if os.environ.get(HOOK_SELECTED_ENV):
+        return None  # already the selected version
+    repo = os.environ.get("GITHUB_REPOSITORY")
+    if is_guest(repo, home_repo) or job_class(os.environ.get("GITHUB_JOB", ""), repo, home_repo,
+                                               job_workflow())[0] != EXCLUSIVE_CLASS:
+        return None
+    listed, mine = signing_hooks_list(repo, os.environ.get("GITHUB_SHA")), hook_sha256()
+    run_id, store, now = os.environ.get("GITHUB_RUN_ID"), retained_store(), time.time()
+    if listed is None or mine is None:
+        return None  # no answer: the SIGNING_HOOKS check and the claim gate decide, as before
+    if mine in listed:
+        with contextlib.suppress(OSError):
+            record_hook_run(store, mine, run_id, now)
+        return None
+    notes = []
+    for digest, path in retained_candidates(store):
+        if digest not in listed:
+            continue
+        try:
+            same = hashlib.sha256(path.read_bytes()).hexdigest() == digest
+        except OSError:
+            same = False
+        if not same:
+            notes.append(f"retained hook {digest[:12]} does not hash to its name; not run")
+            continue
+        try:
+            check = subprocess.run([sys.executable, os.fspath(path), *argv, "--parse-only"], stdin=subprocess.DEVNULL,
+                                   capture_output=True, timeout=60, check=False)
+            accepts = check.returncode == 0
+        except (OSError, subprocess.SubprocessError):
+            accepts = False
+        if not accepts:
+            notes.append(f"retained hook {digest[:12]} does not accept this job's arguments; not run")
+            continue
+        with contextlib.suppress(OSError):
+            record_hook_run(store, digest, run_id, now)
+        print(f"{PREFIX}: {SIGNING_HOOKS_PATH} at this run's commit lists not this hook ({mine[:12]}) but the "
+              f"retained hook {digest[:12]}; running that version for the job (RETAINED_HOOKS)", flush=True)
+        os.environ[HOOK_SELECTED_ENV] = digest
+        try:
+            os.execv(sys.executable, [sys.executable, os.fspath(path), *argv])
+        except OSError as error:  # this hook goes on, and its SIGNING_HOOKS check refuses the job as before
+            os.environ.pop(HOOK_SELECTED_ENV, None)
+            notes.append(f"cannot run the retained hook {digest[:12]} ({type(error).__name__})")
+    return "; ".join(notes) or None
 
 
 def runner_xcode(runner_dir: Path) -> str | None:
@@ -8882,11 +9126,13 @@ def leave_job_workspace(args: argparse.Namespace) -> None:
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog=PREFIX)
     p.add_argument("phase", choices=("job-started", "job-completed", "check", "listen", "take-root", "take-gui",
-                                     "admit", "release", "fits", "busy"),
+                                     "admit", "release", "fits", "busy", "retain-hooks"),
                    help="check: the eligibility gate only, read-only (no lock, no rustup change); "
                         "listen: run the runner's run.sh under the listener gate (the LaunchAgent's program); "
                         "admit, release, fits: the build worker's ci-step admission (one JSON line each); "
-                        "busy --runner-dir D: exit 3 when that runner is idle, 0 when it has a job or it cannot tell")
+                        "busy --runner-dir D: exit 3 when that runner is idle, 0 when it has a job or it cannot tell; "
+                        "retain-hooks: keep this hook and every installed one in ~/glaeda-runner/hooks, then prune "
+                        "(RETAINED_HOOKS)")
     p.add_argument("--class", dest="step_class", choices=STEP_CLASSES, help="admit: the ci-step's class")
     p.add_argument("--job-key", help="admit, release: the ci-step's key (runner name, run id and attempt)")
     p.add_argument("--runner-dir", type=Path, help="listen: the runner directory whose run.sh the gate runs")
@@ -8978,6 +9224,17 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.phase == "busy":
         return runner_busy_main([os.fspath(args.runner_dir)] if args.runner_dir else [])
+    if args.phase == "retain-hooks":
+        try:
+            print(f"{PREFIX}: {retain_installed(Path.home(), [Path(__file__).resolve()], time.time())}", flush=True)
+        except OSError as error:
+            print(f"{PREFIX}: cannot retain the hooks ({type(error).__name__}: {error})", file=sys.stderr, flush=True)
+            return 1
+        return 0
+    if args.phase == "job-started" and not args.dedicated_admit:
+        note = select_hook_version(list(sys.argv[1:] if argv is None else argv), args.home_repo)
+        if note:
+            print(f"{PREFIX}: {note}", flush=True)
     args.min_free_gib = runner_floor_gib(args.min_free_gib, args.gui_runner or args.session_runner)
     # the floor a job is refused under, after eviction (DISK_JOB_PEAK_GIB); a tour runner's floor is cmux's measure
     admit_floor = admit_floor_gib(args.min_free_gib, args.gui_runner or args.session_runner)
@@ -9415,6 +9672,9 @@ def main(argv: list[str] | None = None) -> int:
         note = disk_pressure_detached(args.disk)
         print(f"{PREFIX}: {note}", flush=True)
     if args.phase == "job-completed":  # last: between this job and the next
+        if Path(__file__).resolve().parent.name == "glaeda-hooks":  # a runner's install keeps its version
+            with contextlib.suppress(Exception):  # RETAINED_HOOKS housekeeping never fails the job
+                maintain_retained(Path(__file__).resolve(), Path.home(), time.time())
         note = install_staged_hook(Path(__file__).resolve().parent)
         if note:
             print(f"{PREFIX}: {note}", flush=True)

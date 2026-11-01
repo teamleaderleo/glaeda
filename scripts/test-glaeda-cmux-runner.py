@@ -24,6 +24,7 @@ import re
 import shlex
 import signal
 import shutil
+import stat
 import subprocess
 import sys
 import tarfile
@@ -316,7 +317,8 @@ class HookTest(unittest.TestCase):
         self.tmp.cleanup()
 
     def run_hook(self, phase: str, event_name: str | None, event_path: Path | None,
-                 *extra: str, repo: str | None = None, env: dict | None = None) -> subprocess.CompletedProcess:
+                 *extra: str, repo: str | None = None, env: dict | None = None,
+                 hook_file: Path | None = None) -> subprocess.CompletedProcess:
         environ = {"PATH": "/usr/bin:/bin", "HOME": os.fspath(self.dir), "GLAEDA_RUNNER_TELEMETRY": "0",
                    "GLAEDA_CANONICAL_ROOT_PARENT": NO_ROOTS, "GLAEDA_FLEET_DIR": os.fspath(self.dir / "fleet"),
                    # the xcrun shim the toolchain check runs: the fake node's python3, never this host's real one
@@ -330,7 +332,7 @@ class HookTest(unittest.TestCase):
         if repo:
             environ["GITHUB_REPOSITORY"] = repo
         environ.update(env or {})
-        return subprocess.run([sys.executable, os.fspath(HOOK), phase, *extra], env=environ,
+        return subprocess.run([sys.executable, os.fspath(hook_file or HOOK), phase, *extra], env=environ,
                               capture_output=True, text=True, timeout=60, check=False)
 
     def test_sample_events(self) -> None:
@@ -1625,13 +1627,20 @@ class HookTest(unittest.TestCase):
     # ------------------------------------------------------------ weighted capacity
 
     def job(self, name: str, runner: str, units: int = 4, watch: int | None = None, *extra: str,
-            env: dict | None = None) -> subprocess.CompletedProcess:
+            env: dict | None = None, hook_file: Path | None = None) -> subprocess.CompletedProcess:
+        if hook_file is not None:  # another hook version (CrossVersion tests): the same arguments as started()
+            return self.run_hook("job-started", "push", event(self.dir, "push", {"repository": CMUX}),
+                                 "--allowed-repo", "manaflow-ai/cmux", "--no-disk", "--state-dir",
+                                 os.fspath(self.dir / "state"), "--watch-pid", str(watch or os.getpid()),
+                                 "--gui-wait", "0", "--capacity-units", str(units), "--capacity-dir",
+                                 os.fspath(self.dir / "capacity"), *extra, repo="manaflow-ai/cmux",
+                                 env={"GITHUB_JOB": name, "RUNNER_NAME": runner, **(env or {})}, hook_file=hook_file)
         return self.started("--capacity-units", str(units), "--capacity-dir", os.fspath(self.dir / "capacity"), *extra,
                             watch=watch, env={"GITHUB_JOB": name, "RUNNER_NAME": runner, **(env or {})})
 
-    def finish(self, runner: str) -> str:
+    def finish(self, runner: str, hook_file: Path | None = None) -> str:
         return self.run_hook("job-completed", None, None, "--no-disk", "--state-dir", os.fspath(self.dir / "state"),
-                             env={"RUNNER_NAME": runner}).stdout
+                             env={"RUNNER_NAME": runner}, hook_file=hook_file).stdout
 
     def shared_lock_blocks_exclusive(self) -> bool:
         return not self.lock_free()
@@ -2290,7 +2299,8 @@ class HookTest(unittest.TestCase):
         finally:
             self.finish("s0")
 
-    def nightly_signer(self, runner: str, wait: str, *extra: str, env: dict | None = None) -> subprocess.Popen:
+    def nightly_signer(self, runner: str, wait: str, *extra: str, env: dict | None = None,
+                       hook_file: Path | None = None) -> subprocess.Popen:
         """sign-nightly-identity-legacy of a nightly-next push on this mini's nightly slot, started in the background."""
         push = event(self.dir, f"sign-{runner}", {"repository": CMUX, "ref": hook.NIGHTLY_NEXT_REF})
         ref = hook.NIGHTLY_NEXT_REF
@@ -2303,8 +2313,9 @@ class HookTest(unittest.TestCase):
                    "GITHUB_ENV": os.fspath(self.dir / f"github-env-{runner}"),
                    "GITHUB_WORKFLOW_REF": f"manaflow-ai/cmux/.github/workflows/nightly.yml@{ref}", **(env or {})}
         proc = subprocess.Popen(
-            [sys.executable, os.fspath(HOOK), "job-started", "--allowed-repo", "manaflow-ai/cmux", "--no-disk",
-             "--state-dir", os.fspath(self.dir / "state"), "--watch-pid", str(os.getpid()), "--gui-wait", wait,
+            [sys.executable, os.fspath(hook_file or HOOK), "job-started", "--allowed-repo", "manaflow-ai/cmux",
+             "--no-disk", "--state-dir", os.fspath(self.dir / "state"), "--watch-pid", str(os.getpid()),
+             "--gui-wait", wait,
              "--capacity-units", "14", "--capacity-dir", os.fspath(self.dir / "capacity"), "--instance", "4",
              *extra], env=environ, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
         self.addCleanup(lambda: (proc.poll() is None and proc.kill(), proc.wait(), proc.stdout.close()))
@@ -2499,6 +2510,129 @@ class HookTest(unittest.TestCase):
         finally:
             self.finish("n1")
         self.assertTrue(self.lock_free())
+
+    # ------------------------------------------------------------ retained hook versions (RETAINED_HOOKS)
+
+    def older_hook(self, name: str, tail: bytes = b"# an older reviewed version\n") -> Path:
+        """A hook file whose bytes differ from HOOK's (so its own sha256), with the reservation module beside it."""
+        source = self.dir / name / hook.PREFIX
+        source.parent.mkdir(parents=True)
+        source.write_bytes(HOOK.read_bytes() + tail)
+        shutil.copy2(ROOT / "scripts" / hook.RESERVATION_MODULE, source.parent / hook.RESERVATION_MODULE)
+        return source
+
+    def retain(self, source: Path, when: float | None = None) -> str:
+        with mock.patch.dict(os.environ, {"HOME": os.fspath(self.dir)}):
+            return hook.retain_hook(source, hook.retained_store(), time.time() if when is None else when)
+
+    def test_a_run_from_before_the_rollout_signs_with_the_retained_hook_its_commit_lists(self) -> None:
+        """manaflow-ai/cmux run 41256487647: sign-nightly-identity-legacy (attempt 3) of a run whose commit listed only
+        the old hook reached a mini after the fleet moved to a new one, and the whole mini was refused. With the old
+        version retained, the new hook runs that exact copy for the job: it admits the job and the claim names the
+        copy's own sha256, which the run's list trusts. Of two listed copies the newest is chosen, the run is recorded
+        against it, and the installed hook's job-completed releases what the copy took."""
+        if not os.path.exists(hook.CURL):
+            self.skipTest(f"no {hook.CURL}")
+        self.fleet()
+        older = self.retain(self.older_hook("v1", b"# the version before\n"), time.time() - 600)
+        old = self.retain(self.older_hook("v2"))
+        mine = hashlib.sha256(HOOK.read_bytes()).hexdigest()
+        self.assertEqual(len({older, old, mine}), 3)
+        listed, _ = self.signing_hooks(older, old)
+        signer = self.nightly_signer("n0", "60", "--nightly-runner", env={**listed, "GITHUB_RUN_ID": "41256487647"})
+        out, _ = signer.communicate(timeout=60)
+        try:
+            self.assertEqual(signer.returncode, 0, out)
+            self.assertIn(f"lists not this hook ({mine[:12]}) but the retained hook {old[:12]}", out)
+            self.assertIn("holding 14/14 units", out)
+            self.assertEqual((self.dir / "github-env-n0").read_text(),
+                             f"GLAEDA_JOB_CLAIM=exclusive\nGLAEDA_HOOK_SHA256={old}\n",
+                             "the claim names the bytes that ran, which the run's list trusts")
+            state = json.loads((self.dir / hook.RETAINED_HOOKS_DIR / hook.RETAINED_STATE).read_text())
+            self.assertIn("41256487647", state["versions"][old]["runs"])
+            self.assertEqual(state["versions"][older]["runs"], {})
+        finally:
+            self.finish("n0")
+        self.assertTrue(self.lock_free(), "the installed hook's job-completed released the copy's hold")
+        self.assertIsNone(hook.mini_full(self.dir / "capacity", 14, hook.RunnerScope(14, 2, 2, fast=True)))
+        # A run whose list names this hook runs it, as before, and is recorded against it.
+        current, _ = self.signing_hooks(old, mine)
+        signer = self.nightly_signer("n1", "60", "--nightly-runner", env={**current, "GITHUB_RUN_ID": "7"})
+        out, _ = signer.communicate(timeout=60)
+        try:
+            self.assertEqual(signer.returncode, 0, out)
+            self.assertNotIn("RETAINED_HOOKS", out)
+            self.assertIn(f"GLAEDA_HOOK_SHA256={mine}\n", (self.dir / "github-env-n1").read_text())
+        finally:
+            self.finish("n1")
+
+    def test_retained_bytes_the_run_does_not_list_are_refused(self) -> None:
+        """No previous digest vouches for other bytes: a run whose list names neither this hook nor a retained copy is
+        refused as before, and so is a listed copy whose bytes no longer hash to its name or that refuses the job's
+        arguments. Nothing is held, and no claim is written."""
+        if not os.path.exists(hook.CURL):
+            self.skipTest(f"no {hook.CURL}")
+        self.fleet()
+        old = self.retain(self.older_hook("v1"))
+        cases = {}
+        cases["unlisted"], _ = self.signing_hooks("e" * 64)
+        stranger = self.dir / "stranger" / hook.PREFIX  # listed, but it rejects every argument
+        stranger.parent.mkdir()
+        stranger.write_text("import sys\nsys.exit(2)\n")
+        cases["arguments"], _ = self.signing_hooks(self.retain(stranger))
+        for name, env in cases.items():
+            with self.subTest(name):
+                signer = self.nightly_signer(f"r-{name}", "60", "--nightly-runner", env=env)
+                out, _ = signer.communicate(timeout=60)
+                self.assertEqual(signer.returncode, 1, out)
+                self.assertIn("does not list this hook", out)
+                self.assertNotIn("RETAINED_HOOKS)", out)
+                if name == "arguments":
+                    self.assertIn("does not accept this job's arguments", out)
+                self.assertFalse((self.dir / f"github-env-r-{name}").exists())
+        # the copy's bytes changed after it was kept: it does not hash to its name, so it never runs
+        copy = self.dir / hook.RETAINED_HOOKS_DIR / old
+        os.chmod(copy, 0o755)
+        os.chmod(copy / hook.PREFIX, 0o755)
+        (copy / hook.PREFIX).write_bytes(HOOK.read_bytes() + b"# tampered\n")
+        listed, _ = self.signing_hooks(old)
+        signer = self.nightly_signer("r-tampered", "60", "--nightly-runner", env=listed)
+        out, _ = signer.communicate(timeout=60)
+        self.assertEqual(signer.returncode, 1, out)
+        self.assertIn(f"retained hook {old[:12]} does not hash to its name; not run", out)
+        self.assertIn("does not list this hook", out)
+        self.assertFalse((self.dir / "github-env-r-tampered").exists())
+        self.assertTrue(self.lock_free())
+        self.assertEqual(hook.admission_waiters(self.dir / "capacity"), [])
+
+    def test_a_retained_version_is_immutable_and_retired_only_after_its_runs(self) -> None:
+        """A kept copy is read-only and never overwritten. It is retired only RETAINED_KEEP_S after it was last
+        installed and after the last job of each run recorded against it; an installed version is never retired.
+        retain-hooks keeps every installed hook and its own file."""
+        day, t0 = 86400.0, 1_800_000_000.0
+        store = self.dir / hook.RETAINED_HOOKS_DIR
+        old = self.retain(self.older_hook("v1"), t0)
+        self.assertEqual(stat.S_IMODE(os.stat(store / old).st_mode), 0o555)
+        self.assertEqual(stat.S_IMODE(os.stat(store / old / hook.PREFIX).st_mode), 0o555)
+        self.assertTrue((store / old / hook.RESERVATION_MODULE).is_file())
+        self.assertEqual(self.retain(self.older_hook("again"), t0 + 5), old, "same bytes, same copy")
+        installed = self.retain(self.older_hook("v2", b"# the installed version\n"), t0)
+        self.assertNotEqual(installed, old)
+        hook.record_hook_run(store, old, "41256487647", t0 + 10 * day)
+        self.assertEqual(hook.prune_retained(store, {installed}, t0 + 31 * day), [], "its run may still re-run")
+        self.assertEqual(hook.prune_retained(store, set(), t0 + 39 * day), [], "installed 8 days ago")
+        self.assertEqual(hook.prune_retained(store, set(), t0 + 41 * day), [old])
+        self.assertFalse((store / old).exists())
+        self.assertEqual(hook.prune_retained(store, set(), t0 + 70 * day), [installed])
+        runner = self.dir / "actions-runner-glaeda-2" / "glaeda-hooks"
+        runner.mkdir(parents=True)
+        shutil.copy2(self.older_hook("v3", b"# a runner's installed version\n"), runner / hook.PREFIX)
+        result = self.run_hook("retain-hooks", None, None)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("retained 2 hook version(s)", result.stdout)
+        kept = {p.name for p in store.iterdir() if hook.SHA256_HEX.fullmatch(p.name)}
+        self.assertEqual(kept, {hashlib.sha256((runner / hook.PREFIX).read_bytes()).hexdigest(),
+                                hashlib.sha256(HOOK.read_bytes()).hexdigest()})
 
     def test_stray_job_processes_refuses_when_ps_or_lsof_cannot_answer_in_full(self) -> None:
         """A failed, partial or empty listing must never read as "nothing in _work" (it refuses the signing job)."""
@@ -13453,6 +13587,74 @@ class ConsoleTest(unittest.TestCase):
             self.assertIsNone(hook.console_refusal())
         with mock.patch.object(hook, "IOREG", "/nonexistent/ioreg"):
             self.assertIsNone(hook.console_state())
+
+
+def previous_hook(dest: Path) -> Path | None:
+    """The hook (and reservation module) as the commit before this one had them, the version a retained copy on a mini
+    most likely is: HEAD^1 (a PR's merge base in CI), else HEAD when the working tree changed the hook. None without
+    git history."""
+    for rev in ("HEAD^1", "HEAD"):
+        files = {}
+        for name in ("glaeda-cmux-runner-hook", "glaeda_reservation.py"):
+            shown = subprocess.run(["git", "-C", os.fspath(ROOT), "show", f"{rev}:scripts/{name}"],
+                                   capture_output=True, timeout=60, check=False)
+            files[name] = shown.stdout if shown.returncode == 0 else None
+        if files["glaeda-cmux-runner-hook"] and files["glaeda-cmux-runner-hook"] != HOOK.read_bytes():
+            dest.mkdir(parents=True, exist_ok=True)
+            for name, data in files.items():
+                if data:
+                    (dest / name).write_bytes(data)
+            return dest / "glaeda-cmux-runner-hook"
+    return None
+
+
+class CrossVersionHookTest(unittest.TestCase):
+    """RETAINED_HOOKS: a job admitted by a retained (older) hook ends under the installed (newer) one, and the other way
+    round during a rollout. Each reads the other's capacity ledger and lock holders: the full mini one admitted is full
+    to the other, and the other's job-completed gives every unit back."""
+
+    setUp_dirs, tearDown = HookTest.setUp, HookTest.tearDown
+    run_hook, started, job, finish, fleet, lock_free, nightly_signer = (
+        HookTest.run_hook, HookTest.started, HookTest.job, HookTest.finish, HookTest.fleet, HookTest.lock_free,
+        HookTest.nightly_signer)
+
+    def setUp(self) -> None:
+        self.setUp_dirs()
+        self.previous = previous_hook(self.dir / "previous")
+        if self.previous is None:
+            self.skipTest("no earlier hook version in this checkout's history")
+
+    def signer_then_pr(self, starts: Path, ends: Path) -> None:
+        self.fleet()
+        signer = self.nightly_signer("n0", "60", "--nightly-runner", hook_file=starts)
+        out, _ = signer.communicate(timeout=60)
+        try:
+            self.assertEqual(signer.returncode, 0, out)
+            self.assertIn("holding 14/14 units", out)
+            self.assertIn("GLAEDA_JOB_CLAIM=exclusive\n", (self.dir / "github-env-n0").read_text())
+            full = self.job("cli-pipe-regressions", "p0", 14, None, hook_file=ends)
+            self.assertEqual(full.returncode, 1, full.stdout + full.stderr)
+            self.assertIn("refused", full.stdout)
+        finally:
+            self.finish("n0", hook_file=ends)
+        self.assertTrue(self.lock_free(), "the other version's job-completed released the whole mini")
+        self.assertIsNone(hook.mini_full(self.dir / "capacity", 14, hook.RunnerScope(14, 2, 2, fast=True)))
+        try:
+            pr = self.job("cli-pipe-regressions", "p1", 14, None, hook_file=starts)
+            self.assertEqual(pr.returncode, 0, pr.stdout + pr.stderr)
+            again = self.job("cli-pipe-regressions", "p2", 14, None, hook_file=ends)
+            self.assertEqual(again.returncode, 0, again.stdout + again.stderr)
+        finally:
+            self.finish("p1", hook_file=ends)
+            self.finish("p2", hook_file=starts)
+        self.assertTrue(self.lock_free())
+        self.assertIsNone(hook.mini_full(self.dir / "capacity", 14, hook.RunnerScope(14, 2, 2, fast=True)))
+
+    def test_a_job_the_previous_version_admitted_ends_under_this_one(self) -> None:
+        self.signer_then_pr(self.previous, HOOK)
+
+    def test_a_job_this_version_admitted_ends_under_the_previous_one(self) -> None:
+        self.signer_then_pr(HOOK, self.previous)
 
 
 class NoEmDashTest(unittest.TestCase):

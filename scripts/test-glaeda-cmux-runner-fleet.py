@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import importlib.machinery
 import importlib.util
 import json
@@ -91,8 +92,23 @@ if dest.endswith("mini-fleet.json"):
 FAKE_GH = """#!{python}
 import json, os, sys
 open(os.environ["FAKE_LOG"], "a").write(json.dumps({{"tool": "gh", "argv": sys.argv[1:]}}) + "\\n")
-path = next((a for a in sys.argv[2:] if "/" in a and not a.startswith("-")), "")
-if path.startswith("orgs/") and path.endswith("runner-groups?per_page=100"):
+path = next((a for a in sys.argv[2:] if "/" in a and not a.startswith("-") and not a.startswith("Accept:")), "")
+if "cancel" in path or "-X" in sys.argv and "/actions/runs/" in path:  # the rollout barrier never touches a run
+    sys.exit(99)
+if "/actions/workflows/" in path and "/runs?" in path:  # FAKE_RUNS: {{workflow: [run, ...]}}
+    if os.environ.get("FAKE_RUNS_FAIL"):
+        sys.exit(1)
+    workflow = path.split("/actions/workflows/", 1)[1].split("/", 1)[0]
+    status = path.split("status=", 1)[1].split("&", 1)[0]
+    found = [r for r in json.loads(os.environ.get("FAKE_RUNS", "{{}}")).get(workflow, []) if r["status"] == status]
+    print(json.dumps({{"total_count": int(os.environ.get("FAKE_RUNS_TOTAL", len(found))), "workflow_runs": found}}))
+elif "/contents/scripts/ci/glaeda-signing-hooks.txt?ref=" in path:  # FAKE_HOOK_LISTS: {{sha: [digest, ...]}}
+    lists = json.loads(os.environ.get("FAKE_HOOK_LISTS", "{{}}"))
+    ref = path.split("ref=", 1)[1]
+    if ref not in lists:
+        sys.stderr.write("gh: Not Found (HTTP 404)\\n"); sys.exit(1)
+    print("# glaeda runner hooks\\n" + "".join(d + " glaeda test\\n" for d in lists[ref]))
+elif path.startswith("orgs/") and path.endswith("runner-groups?per_page=100"):
     groups = json.loads(os.environ.get("FAKE_GROUPS", "[]"))
     print(json.dumps({{"runner_groups": groups}}))
 elif path == "repos/actions/runner/releases/latest":
@@ -131,6 +147,19 @@ def load_runner_module():
     module = importlib.util.module_from_spec(spec)
     loader.exec_module(module)
     return module
+
+
+def load_fleet_module():
+    loader = importlib.machinery.SourceFileLoader("glaeda_cmux_runner_fleet_t", os.fspath(TOOL))
+    spec = importlib.util.spec_from_loader("glaeda_cmux_runner_fleet_t", loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+FLEET = load_fleet_module()
+HOOK_DIGEST = hashlib.sha256((ROOT / "scripts" / "glaeda-cmux-runner-hook").read_bytes()).hexdigest()
+OLD_DIGEST = "091eec20" + "0" * 56
 
 
 class FleetTest(unittest.TestCase):
@@ -228,8 +257,9 @@ class FleetTest(unittest.TestCase):
         # "latest" is read once for the whole apply, through the operator's gh, and every instance is told it
         releases = [c for c in calls if c["tool"] == "gh" and "repos/actions/runner/releases/latest" in c["argv"]]
         self.assertEqual(len(releases), 1)
-        self.assertEqual(sum(1 for c in calls if c["tool"] == "gh"), 10,
-                         "one token, eight label reads and one release read")
+        barrier = len(FLEET.ROLLOUT_BARRIER_WORKFLOWS) * len(FLEET.ACTIVE_RUN_STATUSES)
+        self.assertEqual(sum(1 for c in calls if c["tool"] == "gh"), 10 + barrier,
+                         "one token, eight label reads, one release read and the barrier's runs lists")
         # the minis hold no gh login: each instance gets the labels GitHub lists for it, read here
         self.assertTrue(all("--github-labels=glaeda-mini,self-hosted " in c["remote"] for c in applies))
         reads = sorted(next(a for a in c["argv"] if "runners?name=" in a) for c in calls if c["tool"] == "gh"
@@ -450,7 +480,8 @@ class FleetTest(unittest.TestCase):
     def test_a_failed_instance_fails_the_run(self) -> None:
         bad = self.dir / "bin" / "gh"
         bad.write_text(f"#!{sys.executable}\nprint('not a token!')\n")
-        result = self.fleet("--apply", "--hosts", "mini-a")
+        # a gh that answers nothing also fails the rollout barrier closed: skipped here to reach the token
+        result = self.fleet("--apply", "--hosts", "mini-a", "--skip-rollout-barrier", "a gh that answers nothing")
         self.assertEqual(result.returncode, 1)
         states = [i["state"] for i in json.loads(result.stdout)["members"][0]["instances"]]
         self.assertTrue(all("no registration token" in s for s in states))
@@ -698,6 +729,108 @@ def load_fleet_module():
     module = importlib.util.module_from_spec(spec)
     loader.exec_module(module)
     return module
+
+
+class RolloutBarrierTest(unittest.TestCase):
+    """The rollout barrier: --apply refuses, changing nothing, while an active nightly, DEV or promote run's
+    glaeda-signing-hooks.txt does not list the hook being rolled out, fails closed when it cannot read GitHub, and never
+    cancels a run."""
+
+    # FleetTest's checkout, fakes and helpers, without running its own cases again
+    setUp, tearDown, git, commit, fleet, calls, assert_nothing_changed = (
+        FleetTest.setUp, FleetTest.tearDown, FleetTest.git, FleetTest.commit, FleetTest.fleet, FleetTest.calls,
+        FleetTest.assert_nothing_changed)
+
+    def runs(self, *rows: tuple[str, int, str, str]) -> str:
+        return json.dumps({wf: [{"id": rid, "status": status, "head_sha": sha, "run_attempt": 1}
+                                for w, rid, status, sha in rows if w == wf] for wf, *_ in rows})
+
+    def assert_no_run_touched(self) -> None:
+        gh = [c["argv"] for c in self.calls() if c["tool"] == "gh"]
+        self.assertFalse(any("cancel" in " ".join(a) or ("-X" in a and any("/actions/runs/" in x for x in a))
+                             for a in gh), "the barrier never cancels or changes a run")
+        self.assertFalse(any("/jobs" in " ".join(a) for a in gh), "it never reads jobs: an uncreated job is no answer")
+
+    def test_the_set_covers_every_workflow_with_a_signing_job(self) -> None:
+        loader = importlib.machinery.SourceFileLoader("glaeda_hook_for_barrier",
+                                                      os.fspath(ROOT / "scripts" / "glaeda-cmux-runner-hook"))
+        spec = importlib.util.spec_from_loader("glaeda_hook_for_barrier", loader)
+        hook = importlib.util.module_from_spec(spec)
+        loader.exec_module(hook)
+        self.assertLessEqual({workflow for workflow, _ in hook.SIGNING_JOBS}, set(FLEET.ROLLOUT_BARRIER_WORKFLOWS))
+        self.assertIn("cmux-next-dev-daily.yml", FLEET.ROLLOUT_BARRIER_WORKFLOWS)
+
+    def test_an_active_run_whose_list_lacks_the_new_hook_refuses_until_every_run_lists_it(self) -> None:
+        """manaflow-ai/cmux run 41256487647 is queued at a commit that lists only the old hook; its signing job is not
+        created yet (blocked on needs), which must not read as nothing pending. A DEV run in progress at a commit that
+        lists both is fine. The list is read once per distinct commit."""
+        a, b = "a" * 40, "b" * 40
+        runs = self.runs(("nightly.yml", 41256487647, "queued", a), ("nightly.yml", 41256487648, "waiting", a),
+                         ("cmux-next-dev-daily.yml", 5, "in_progress", b))
+        lists = {a: [OLD_DIGEST], b: [OLD_DIGEST, HOOK_DIGEST]}
+        result = self.fleet("--apply", FAKE_RUNS=runs, FAKE_HOOK_LISTS=json.dumps(lists))
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn(f"run 41256487647 (nightly.yml, queued, commit {a[:12]}) does not list hook {HOOK_DIGEST[:12]}; "
+                      f"it trusts {OLD_DIGEST[:12]}", result.stderr)
+        self.assertIn("run 41256487648 (nightly.yml, waiting", result.stderr)
+        self.assertNotIn("run 5 ", result.stderr)
+        self.assertIn("nothing changed", result.stderr)
+        self.assertIn("never cancel them", result.stderr)
+        calls = self.calls()
+        self.assertFalse(any(c["tool"] == "scp" for c in calls), "nothing staged")
+        self.assertFalse(any(c["tool"] == "ssh" and ("--apply" in c["remote"] or "mkdir" in c["remote"]
+                                                     or "retain-hooks" in c["remote"]) for c in calls))
+        reads = [c for c in calls if c["tool"] == "gh" and any("/contents/" in a for a in c["argv"])]
+        self.assertEqual(len(reads), 2, "one read per distinct head commit")
+        self.assertFalse(any("registration-token" in " ".join(c["argv"]) for c in calls if c["tool"] == "gh"))
+        self.assert_no_run_touched()
+        # the new digest lands in the queued run's list: the apply goes ahead, retaining hooks before it applies
+        lists[a].append(HOOK_DIGEST)
+        result = self.fleet("--apply", FAKE_RUNS=runs, FAKE_HOOK_LISTS=json.dumps(lists))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        barrier = json.loads(result.stdout)["rolloutBarrier"]
+        self.assertEqual((barrier["digest"], barrier["blocking"], len(barrier["runs"])), (HOOK_DIGEST, [], 3))
+        ssh = [c["remote"] for c in self.calls() if c["tool"] == "ssh" and c["host"] == "mini-a"]
+        retain = next(i for i, r in enumerate(ssh) if "retain-hooks" in r)
+        self.assertLess(retain, next(i for i, r in enumerate(ssh) if "--apply" in r), "kept before any apply")
+        self.assert_no_run_touched()
+
+    def test_the_barrier_fails_closed_when_it_cannot_read_github(self) -> None:
+        a = "a" * 40
+        runs = self.runs(("nightly.yml", 9, "in_progress", a))
+        for name, env in {"runs list": {"FAKE_RUNS_FAIL": "1"},
+                          "more than a page": {"FAKE_RUNS": runs, "FAKE_RUNS_TOTAL": "101",
+                                               "FAKE_HOOK_LISTS": json.dumps({a: [HOOK_DIGEST]})},
+                          "list at the commit": {"FAKE_RUNS": runs, "FAKE_HOOK_LISTS": "{}"}}.items():
+            with self.subTest(name):
+                self.log.unlink(missing_ok=True)
+                result = self.fleet("--apply", **env)
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                self.assertIn("it fails closed", result.stderr)
+                self.assertIn("nothing changed", result.stderr)
+                self.assertFalse(any(c["tool"] == "scp" for c in self.calls()))
+                self.assert_no_run_touched()
+
+    def test_skip_rollout_barrier_needs_a_reason_and_is_recorded(self) -> None:
+        a = "a" * 40
+        env = {"FAKE_RUNS": self.runs(("nightly.yml", 9, "in_progress", a)),
+               "FAKE_HOOK_LISTS": json.dumps({a: [OLD_DIGEST]})}
+        blank = self.fleet("--apply", "--skip-rollout-barrier", " ", **env)
+        self.assertEqual(blank.returncode, 2)
+        self.assertIn("--skip-rollout-barrier needs a reason", blank.stderr)
+        self.assert_nothing_changed()
+        result = self.fleet("--apply", "--skip-rollout-barrier", "hook fix for a broken mini", **env)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("--skip-rollout-barrier (hook fix for a broken mini) overrides", result.stderr)
+        self.assertIn("run 9 (nightly.yml", result.stderr)
+        barrier = json.loads(result.stdout)["rolloutBarrier"]
+        self.assertEqual((barrier["skipped"], barrier["blocking"]), ("hook fix for a broken mini", [9]))
+        self.assert_no_run_touched()
+
+    def test_a_plan_never_reads_github(self) -> None:
+        result = self.fleet(FAKE_RUNS_FAIL="1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(any(c["tool"] == "gh" for c in self.calls()))
 
 
 class ProcessBoundTest(unittest.TestCase):

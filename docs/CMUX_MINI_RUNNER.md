@@ -801,6 +801,34 @@ needs `--allow-downgrade`. A shallow checkout fails closed: an older stamp beyon
 reads as not an ancestor, so fetch the full history (`git fetch --unshallow`). Automatic rollout
 on merge is proposed in #1385.
 
+Rollout barrier and retained hook versions. cmux's owned-Mac signing jobs trust only the hook
+digests `scripts/ci/glaeda-signing-hooks.txt` lists at the run's own commit, so a nightly, DEV or
+promote run that started before a hook rollout and reaches its signing job after it would find a
+hook its commit never listed (manaflow-ai/cmux run 41256487647, `sign-nightly-identity-legacy`
+attempt 3, was refused by the whole mini that way). Two things keep such a run signing:
+
+- Before `--apply` changes any member, the fleet tool lists every active run (queued, in progress,
+  waiting, requested or pending) of `ROLLOUT_BARRIER_WORKFLOWS` (every cmux workflow with a
+  `SIGNING_JOBS` job; a test keeps them in step), reads that list at each run's head commit (one
+  read per commit), and refuses, changing nothing, while any run does not list the hook being
+  rolled out. The refusal names each run and the digests it trusts. It never reads a run's jobs (a
+  signing job blocked on `needs` does not exist yet) and treats a started run as needing its hook
+  until the run completes. Any read that fails refuses (fail closed). It never cancels a run.
+  `--skip-rollout-barrier "REASON"` deploys anyway, printing the reason and keeping it in the JSON
+  output (`rolloutBarrier.skipped`). A plan does not read GitHub.
+- Each mini keeps every hook version it was given or ran as an immutable copy,
+  `~/glaeda-runner/hooks/<sha256>/` (the hook and the reservation module it ran beside, read-only,
+  never overwritten): the fleet's stage runs `glaeda-cmux-runner-hook retain-hooks` before any
+  instance's `--apply` replaces a hook, and job-completed keeps the installed hook. When a signing
+  job's commit does not list the installed hook, job-started runs the newest retained copy that
+  commit does list: the copy must hash to its name and accept the job's arguments (`--parse-only`),
+  and the job-started process execs it, so the claim names the sha256 of exactly the bytes that
+  admitted the job. No listed copy, and the job is refused as before; a previous digest never
+  vouches for other bytes. `retained.json` beside the copies records the runs that used each one;
+  a copy is retired 30 days (GitHub's re-run window) after it was last installed and after the
+  last job of every run recorded against it, in `retain-hooks` and at most hourly in job-completed.
+  The minis hold no gh login, so a run's end is read as that window passing.
+
 The fleet is registered at org scope (section 2e2), so an apply names that scope. Without
 `--org`, the apply asks for the repository scope, finds each runner's org-scope receipt, and refuses
 every instance ("this Mac already has a runner install ... on manaflow-ai") before changing
