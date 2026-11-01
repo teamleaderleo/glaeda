@@ -8,8 +8,8 @@
 # Extra arguments (for example --apply or --output json) pass through.
 # Dry run by default, exactly like the underlying command.
 # Under disk pressure (the projects disk at least GLAEDA_RECLAIM_PRESSURE_PERCENT used, default
-# 90) unfinished but fully pushed work waits GLAEDA_RECLAIM_PRESSURE_IDLE_SECONDS (default 12 h)
-# instead of the command's 72 h: cmux16 sat at 98% with nothing reclaimed. Every other veto
+# 85, matching the shared 15% free threshold) unfinished but fully pushed work waits GLAEDA_RECLAIM_PRESSURE_IDLE_SECONDS (default 12 h)
+# instead of the command's 48 h: cmux16 sat at 98% with nothing reclaimed. Every other veto
 # (changes, untracked files, unpushed commits, a process inside) still holds. Depth-1 checkouts
 # come first; a clone nested in a checkout is a checkout too.
 # A checkout Git cannot read (cosmic-gray, 2026-10-22: a clone whose commit-graph chain was gone)
@@ -60,9 +60,9 @@ case " $* " in
   *" --minimum-idle-seconds"*) ;;
   *)
     used=$(df -Pk "$projects" 2>/dev/null | awk 'NR == 2 { sub("%", "", $5); print $5 }' || true)
-    limit=${GLAEDA_RECLAIM_PRESSURE_PERCENT:-90}
+    limit=${GLAEDA_RECLAIM_PRESSURE_PERCENT:-85}
     idle=${GLAEDA_RECLAIM_PRESSURE_IDLE_SECONDS:-43200}
-    [[ "$limit" =~ ^[0-9]+$ ]] || limit=90
+    [[ "$limit" =~ ^[0-9]+$ ]] || limit=85
     # The command refuses a window under an hour, which would stop every sweep.
     [[ "$idle" =~ ^[0-9]+$ ]] && (( idle >= 3600 )) || idle=43200
     if [[ "$used" =~ ^[0-9]+$ ]] && (( used >= limit )); then

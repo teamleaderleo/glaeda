@@ -1,6 +1,8 @@
 #[cfg(not(unix))]
 compile_error!("glaeda-worktree-reclaim requires a Unix host");
 
+use std::env;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -23,12 +25,12 @@ const REPORT_SCHEMA_VERSION: u8 = 1;
 const GIT_PROGRAM: &str = "/usr/bin/git";
 const MAX_REPOSITORIES: usize = 32;
 
-/// Default idle window for unfinished work: three days.
+/// Default idle window for unfinished work: the shared hygiene policy's 48 hours.
 ///
 /// Every eligible worktree is already clean and preserved, so the window only weighs disruption:
 /// someone may come back to unfinished work, and a worktree a process is working in is refused
 /// outright however old its Git activity looks. Under disk pressure a caller passes a shorter one.
-const DEFAULT_IDLE_SECONDS: i64 = 3 * 24 * 60 * 60;
+const DEFAULT_IDLE_SECONDS: i64 = 48 * 60 * 60;
 
 /// Default idle window for finished work (landed in a remote default branch, squash-merged, or
 /// upstream deleted): an hour, the policy floor. Nobody returns to it, so it is only clutter.
@@ -64,6 +66,90 @@ const COMPENSATION: &str = "git_worktree_add_at_preserved_commit";
 
 // A deleted branch comes back with `git branch <name> <commit>` from the receipt.
 const BRANCH_COMPENSATION: &str = "git_branch_at_receipt_commit";
+
+fn archive_unpushed_worktree(path: &Path) -> Result<PathBuf, String> {
+    let home = env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or("HOME is unset")?;
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| "clock before epoch")?
+        .as_nanos();
+    let pid = std::process::id();
+    let archive = home.join("archive").join(format!(
+        "{stamp}-{pid}-{}",
+        path.file_name().unwrap_or_default().to_string_lossy()
+    ));
+    fs::create_dir_all(&archive).map_err(|e| format!("create archive: {e}"))?;
+    let run = |args: &[&str]| -> Result<Vec<u8>, String> {
+        let output = std::process::Command::new(GIT_PROGRAM)
+            .arg("-C")
+            .arg(path)
+            .args(args)
+            .output()
+            .map_err(|e| format!("git: {e}"))?;
+        if !output.status.success() {
+            return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+        }
+        Ok(output.stdout)
+    };
+    let bundle = archive.join("snapshot.bundle");
+    let output = std::process::Command::new(GIT_PROGRAM)
+        .arg("-C")
+        .arg(path)
+        .arg("bundle")
+        .arg("create")
+        .arg(&bundle)
+        .arg("--all")
+        .output()
+        .map_err(|e| format!("bundle: {e}"))?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+    }
+    fs::write(
+        archive.join("working.patch"),
+        run(&["diff", "--binary", "HEAD"])?,
+    )
+    .map_err(|e| format!("working patch: {e}"))?;
+    fs::write(
+        archive.join("staged.patch"),
+        run(&["diff", "--binary", "--cached"])?,
+    )
+    .map_err(|e| format!("staged patch: {e}"))?;
+    fs::write(
+        archive.join("status.txt"),
+        run(&["status", "--short", "--branch"])?,
+    )
+    .map_err(|e| format!("status: {e}"))?;
+    fs::write(
+        archive.join("manifest.json"),
+        format!(
+            "{{\"schema\":\"leo-hygiene-archive/v1\",\"path\":{:?},\"created_ns\":{stamp}}}\n",
+            path.display()
+        ),
+    )
+    .map_err(|e| format!("manifest: {e}"))?;
+    Ok(archive)
+}
+
+fn prune_archives() {
+    let Some(home) = env::var_os("HOME").map(PathBuf::from) else {
+        return;
+    };
+    let root = home.join("archive");
+    let cutoff = SystemTime::now().checked_sub(std::time::Duration::from_secs(30 * 86400));
+    let Ok(entries) = fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        if metadata.is_dir() && cutoff.is_some_and(|c| metadata.modified().is_ok_and(|m| m < c)) {
+            let _ = fs::remove_dir_all(entry.path());
+        }
+    }
+}
 
 #[derive(Debug, Parser)]
 #[command(
@@ -159,6 +245,8 @@ enum WorktreeResult {
         decision: LinkedWorktreeReclaimDecision,
         #[serde(skip_serializing_if = "Option::is_none")]
         reclaim: Option<LinkedWorktreeReclaimOutcome>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        archive: Option<String>,
     },
     /// The registration is stale; see `LinkedWorktreeEntry::prunable`. Nothing here recommends
     /// pruning, which deletes per-worktree refs and logs.
@@ -256,6 +344,7 @@ struct Report {
 }
 
 fn main() -> ExitCode {
+    prune_archives();
     let cli = Cli::parse();
     if cli.repositories.len() > MAX_REPOSITORIES {
         return fail(
@@ -391,6 +480,7 @@ fn main() -> ExitCode {
                 }) {
                     Ok((facts, decision)) => {
                         let mut reclaim = None;
+                        let mut archive = None;
                         match &decision {
                             LinkedWorktreeReclaimDecision::Eligible { compensation, .. } => {
                                 summary.eligible += 1;
@@ -401,6 +491,21 @@ fn main() -> ExitCode {
                                 if cli.apply && !circuit_breaker_tripped {
                                     if remaining_budget == 0 {
                                         budget_exhausted = true;
+                                    } else if *compensation
+                                        == LinkedWorktreeReclaimCompensation::PinHeadCommit
+                                        && match archive_unpushed_worktree(entry.path()) {
+                                            Ok(path) => {
+                                                archive = Some(path.display().to_string());
+                                                false
+                                            }
+                                            Err(_) => true,
+                                        }
+                                    {
+                                        eprintln!(
+                                            "glaeda-worktree-reclaim: kept {} because its archive could not be written",
+                                            entry.path().display()
+                                        );
+                                        circuit_breaker_tripped = true;
                                     } else {
                                         remaining_budget -= 1;
                                         let outcome = reclaim_linked_worktree(
@@ -429,6 +534,7 @@ fn main() -> ExitCode {
                             facts,
                             decision,
                             reclaim,
+                            archive,
                         }
                     }
                     Err(error) => {
