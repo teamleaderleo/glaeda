@@ -11,7 +11,9 @@ proven". The tests now call this: test-glaeda-cmux-runner.py and test-glaeda-dis
 run on a checkout (so changing the hook and running its tests leaves the pin in the diff), and only check
 under CI, where a missing pin fails with the command to run.
 
-It appends the current hook's sha and keeps every released pin (runners that have not refreshed their hook
+It appends the current hook's sha (or moves it last when it is pinned higher up: the list is oldest first, and
+cmuxterm-hq's glaeda-signing-hooks sync trusts only pins after the newest one cmux lists, so a pin added at the
+top, as #1774's was, never reached cmux) and keeps every released pin (runners that have not refreshed their hook
 still drain). A sha it pinned for an earlier draft of the same change is dropped again: a pin stays only if
 origin/main already has it or some version of the hook on origin/main hashes to it, so editing the hook twice
 before merging leaves one new pin, not a trail of drafts nobody reviewed. Without origin/main it only appends.
@@ -45,12 +47,10 @@ def pinned(text: str) -> list[str]:
 
 
 def pin(text: str, sha: str, released: set[str] | None = None) -> str:
-    """text with sha appended to the allowlist and, when released is known, any pin outside it dropped (an earlier
-    draft's sha); unchanged when sha is there and nothing is dropped."""
+    """text with sha last in the allowlist (appended, or moved there when it was pinned higher up) and, when released
+    is known, any pin outside it dropped (an earlier draft's sha); unchanged when sha is last and nothing is dropped."""
     pins = pinned(text)
-    keep = [p for p in pins if released is None or p in released or p == sha]
-    if sha not in keep:
-        keep.append(sha)
+    keep = [p for p in pins if p != sha and (released is None or p in released)] + [sha]
     if keep == pins:
         return text
     match = BLOCK.search(text)
@@ -94,8 +94,12 @@ def ensure(check: bool, hook: Path | None = None, disk: Path | None = None, base
     hook, disk = hook or HOOK, disk or DISK
     sha, text = hook_sha(hook), disk.read_text()
     if check:
-        if sha in pinned(text):
+        pins = pinned(text)
+        if pins and pins[-1] == sha:
             return None
+        if sha in pins:
+            return (f"scripts/glaeda-cmux-runner-hook ({sha}) is pinned but not last in CMUX_NEXT_DRAIN_HOOK_SHA256 "
+                    f"(cmuxterm-hq's glaeda-signing-hooks sync reads it oldest first); run {COMMAND}")
         return f"scripts/glaeda-cmux-runner-hook ({sha}) is not in CMUX_NEXT_DRAIN_HOOK_SHA256; run {COMMAND}"
     if sha in pinned(text) and pinned(text)[-1] == sha:
         return None  # the usual case: nothing to pin, and no git calls on every test run

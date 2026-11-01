@@ -75,6 +75,20 @@ class PinTest(unittest.TestCase):
         self.assertIn(hp.hook_sha(), shas | set(hp.pinned(hp.DISK.read_text())))
         self.assertGreater(len(shas), 10)
 
+    def test_a_pin_added_at_the_top_is_moved_last(self) -> None:
+        """The list is oldest first: cmuxterm-hq's signing-hooks sync trusts only pins after the newest one cmux lists,
+        so #1774's pin, added at the top, never reached cmux. --check refuses it there and the fix moves it last."""
+        self.disk.write_text(DISK.replace(f'    "{OLD}",\n', f'    "{self.sha}",\n    "{OLD}",\n', 1))
+        problem = hp.ensure(check=True, hook=self.hook, disk=self.disk)
+        self.assertIn("not last", problem)
+        self.assertIn(hp.COMMAND, problem)
+        self.assertIsNone(hp.ensure(check=False, hook=self.hook, disk=self.disk))
+        self.assertEqual(hp.pinned(self.disk.read_text()), [OLD, self.sha])
+        self.assertIsNone(hp.ensure(check=True, hook=self.hook, disk=self.disk))
+
+    def test_the_repo_hook_is_the_last_pin(self) -> None:
+        self.assertEqual(hp.pinned(hp.DISK.read_text())[-1], hp.hook_sha())
+
     def test_check_names_the_sha_and_writes_nothing(self) -> None:
         problem = hp.ensure(check=True, hook=self.hook, disk=self.disk)
         self.assertIn(self.sha, problem)
