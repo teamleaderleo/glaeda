@@ -2193,6 +2193,131 @@ def export_job_claim(capacity_units: int, taken: dict[str, Any], note: str) -> s
     return ""
 
 
+# PROMOTION_LEASE: HQ leases a whole owned Mac for one exact nightly promote job (cmux nightly.yml
+# promote-nightly-next, a SIGNING_JOBS entry) through scripts/glaeda-promotion-admit. That helper takes the mini's
+# exclusive claim first (every unit, both fast and gateway tokens, the gui token: the same take_capacity a signing job
+# makes), then starts a JIT listener that serves only the lease's unique label, under this hook. The claim's holder is
+# the ordinary holder process for the lease runner's RUNNER_NAME, so it never moves: when the job starts on that
+# runner, job-started (--promotion-lease DIR) checks the job against the lease (repository, run id, attempt, source sha,
+# job and workflow, runner name), records its Runner.Worker as the claim's owner under the lease lock, and tells the
+# job GLAEDA_JOB_CLAIM=exclusive. It takes nothing and waits for nothing itself: a second take_capacity would wait
+# behind the lease's own claim. A job that does not match is refused before any step runs. job-completed leaves the
+# claim alone; the lease's supervisor lets it go once the adopted Runner.Worker has exited.
+PROMOTION_LEASE_FILE = "lease.json"  # the request's identity, no JIT config (written once by the helper)
+PROMOTION_STATE_FILE = "state.json"  # phase, holder, units, adopted Worker (rewritten atomically under the lock)
+PROMOTION_LOCK = "lease.lock"
+PROMOTION_LIVE = ("starting", "ready")  # the claim is held and not yet withdrawn
+PROMOTION_LOCK_WAIT_S = 10.0
+PROMOTION_WORKFLOW = "nightly.yml"
+
+
+def promotion_write_state(lease_dir: Path, state: dict[str, Any]) -> None:
+    """Replace the lease's state file atomically (a reader sees the old or the new one, never a torn one)."""
+    path = lease_dir / PROMOTION_STATE_FILE
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as out:
+        json.dump(state, out, sort_keys=True)
+        out.write("\n")
+        out.flush()
+        os.fsync(out.fileno())
+    os.replace(tmp, path)
+
+
+@contextlib.contextmanager
+def promotion_locked(lease_dir: Path, wait_s: float = PROMOTION_LOCK_WAIT_S):
+    """The lease lock: adoption here and the supervisor's withdrawal exclude each other, so a listener is never
+    withdrawn after its job was adopted, and no job is adopted after the claim was let go."""
+    fd = os.open(lease_dir / PROMOTION_LOCK, os.O_RDONLY | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    try:
+        deadline = time.monotonic() + wait_s
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("the lease lock is held") from None
+                time.sleep(0.05)
+        yield
+    finally:
+        os.close(fd)
+
+
+def promotion_adopted_alive(lease_dir: Path) -> bool:
+    """Whether the Runner.Worker that adopted this lease's claim is still running (False with none adopted). A pid
+    whose start token cannot be read now counts as alive (JobOwner.gone), never as a reason to let the claim go."""
+    try:
+        adopted = json.loads((lease_dir / PROMOTION_STATE_FILE).read_text()).get("adopted")
+        if not isinstance(adopted, dict) or not isinstance(adopted.get("pid"), int) or adopted["pid"] <= 1:
+            return False
+        return not JobOwner(adopted["pid"], str(adopted.get("identity") or "")).gone()
+    except (OSError, ValueError, AttributeError):
+        return False
+
+
+def promotion_identity_refusal(lease: dict[str, Any], environ: Any) -> str | None:
+    """Why this job is not the lease's job, or None. Every field must match exactly."""
+    want = (("GITHUB_REPOSITORY", lease.get("repository")), ("GITHUB_RUN_ID", str(lease.get("run_id"))),
+            ("GITHUB_RUN_ATTEMPT", str(lease.get("run_attempt"))), ("GITHUB_SHA", lease.get("source_sha")),
+            ("GITHUB_JOB", lease.get("job")), ("RUNNER_NAME", lease.get("runner_name")))
+    for name, value in want:
+        got = environ.get(name)
+        if not isinstance(value, str) or got != value:
+            return f"this job's {name} ({str(got)[:80]!r}) is not the lease's ({str(value)[:80]!r})"
+    workflow_ref = environ.get("GITHUB_WORKFLOW_REF") or ""
+    if not workflow_ref.startswith(f"{lease['repository']}/.github/workflows/{PROMOTION_WORKFLOW}@"):
+        return f"this job's workflow ({workflow_ref[:120]!r}) is not {lease['repository']}'s {PROMOTION_WORKFLOW}"
+    if (PROMOTION_WORKFLOW, lease["job"]) not in SIGNING_JOBS:
+        return f"{PROMOTION_WORKFLOW} {lease['job']} is not a signing job"
+    return None
+
+
+def promotion_adopt(lease_dir: Path, owner: JobOwner, state_dir: Path,
+                    environ: Any = None) -> tuple[bool, str, dict[str, Any]]:
+    """job-started on a lease runner: adopt the lease's exclusive claim for this job, or refuse it. Never takes or
+    waits for capacity. Returns (admitted, note, taken) where taken is what export_job_claim reads."""
+    environ = os.environ if environ is None else environ
+    try:
+        lease = json.loads((lease_dir / PROMOTION_LEASE_FILE).read_text())
+        if not isinstance(lease, dict):
+            raise ValueError("not an object")
+    except (OSError, ValueError) as error:
+        return False, f"promotion lease: cannot read the lease ({type(error).__name__})", {}
+    why = promotion_identity_refusal(lease, environ)
+    if why:
+        return False, f"promotion lease {str(lease.get('lease_id'))[:24]}: {why}", {}
+    try:
+        with promotion_locked(lease_dir):
+            state = json.loads((lease_dir / PROMOTION_STATE_FILE).read_text())
+            if not isinstance(state, dict):
+                raise ValueError("not an object")
+            phase = state.get("phase")
+            if phase not in PROMOTION_LIVE:
+                return False, f"promotion lease {lease['lease_id']}: the claim is {phase!r}, not held", {}
+            adopted = state.get("adopted")
+            if isinstance(adopted, dict) and adopted.get("pid") != owner.pid:
+                return False, f"promotion lease {lease['lease_id']}: already adopted by another job", {}
+            pid_file = holder_file(state_dir, lease["runner_name"])
+            try:
+                holder = int(pid_file.read_text().strip())
+            except (OSError, ValueError):
+                holder = 0
+            if not holder or holder != state.get("holder_pid") or not pid_alive(holder):
+                return False, f"promotion lease {lease['lease_id']}: its claim holder is gone", {}
+            units, total = state.get("units"), state.get("units_total")
+            if not isinstance(units, int) or isinstance(units, bool) or units <= 0 or units != total:
+                return False, f"promotion lease {lease['lease_id']}: the claim does not hold the whole mini", {}
+            state["adopted"] = {"pid": owner.pid, "identity": owner.identity, "at": time.time(),
+                                "run_id": lease["run_id"], "run_attempt": lease["run_attempt"]}
+            promotion_write_state(lease_dir, state)
+    except (OSError, ValueError, TimeoutError) as error:
+        return False, f"promotion lease: cannot adopt the claim ({type(error).__name__})", {}
+    return True, (f"adopted promotion lease {lease['lease_id']}'s exclusive claim (holder {holder}, {units}/{total} "
+                  "units+every token, held since before the listener started); nothing taken or waited for"), \
+        {"class": EXCLUSIVE_CLASS, "units": units, "units_total": total}
+
+
 # SIGNING_HOOKS: cmux's signing jobs accept a whole-mini claim only from a hook that scripts/ci/glaeda-signing-hooks.txt
 # lists at the run's own commit (cmux CLAIM_GATE, signing-runner-claim.sh); a job admitted by any other hook fails its
 # first step in under a second and the run's Blacksmith twin signs. That list follows glaeda's releases by a cmux PR
@@ -3520,7 +3645,8 @@ def root_users(path: str) -> list[int] | None:
 # So an exclusive job is admitted only while no process of this user works in (lsof cwd) or names (ps) any
 # runner's _work, other than this job's own (under its Runner.Worker) and the hook's own; it waits for them like
 # for units, EXCLUSIVE_CAPACITY_WAIT_S at most, then is refused. None when ps cannot tell, which refuses too.
-RUNNER_WORK_GLOBS = ("actions-runner-glaeda*/_work", "glaeda-runner/_work")
+RUNNER_WORK_GLOBS = ("actions-runner-glaeda*/_work", "glaeda-runner/_work",
+                     ".local/state/glaeda/promotion/*/runner/_work")  # a promotion lease's runner (PROMOTION_LEASE)
 
 
 def stray_job_processes(home: Path, owner_pid: int) -> list[int] | None:
@@ -4338,7 +4464,8 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
                   warm_target: tuple[Any, ...] = ("", None, 0), klass: str | None = None,
                   one_holder: bool = False, since: float | None = None, gui_token: str = "gui",
                   gui_runner: bool = False, fresh_runner: bool = False, tier: str = "",
-                  new_job: bool = False, nightly_runner: bool = False) -> tuple[bool, str]:
+                  new_job: bool = False, nightly_runner: bool = False,
+                  keep_while: Path | None = None) -> tuple[bool, str]:
     """Weighted admission for one of several runners on this mini, without ever waiting on a job.
     When held, taken_out (if given) receives the units and tokens taken, for the job log; on a capacity refusal it
     receives "wants", the kinds a waiter marker names (CAPACITY_WAIT): the token kind or "units" it lacks, else
@@ -4573,7 +4700,7 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
         held, note = hold(fds, watch_pid, state_dir, drop=(admission,) if split is None else (admission, split),
                           release_fds=[] if own_reserve is not None and units > 0 or klass == EXCLUSIVE_CLASS
                           else unit_fds,
-                          close_first=(lent,) if lent is not None else ())
+                          close_first=(lent,) if lent is not None else (), keep_while=keep_while)
         fds = [] if split is None else [split]  # the holder has them now, or hold closed them
         if held and split is not None:
             held, why = hold(fds, watch_pid, state_dir, drop=(admission,), pid_file=root_holder_file(state_dir, root),
@@ -4610,14 +4737,16 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
 
 def hold(fds: list[int], watch: int | JobOwner, state_dir: Path, drop: tuple[int, ...] = (),
          pid_file: Path | None = None, release_fds: list[int] | None = None,
-         close_first: tuple[int, ...] = ()) -> tuple[bool, str]:
+         close_first: tuple[int, ...] = (), keep_while: Path | None = None) -> tuple[bool, str]:
     """Hand the locked fds to a detached holder that keeps them until job-completed or the job's owner exits.
     watch is the owner job-started pinned (JobOwner), or a pid a step resolved just now (take-root, take-gui).
     Closes this process's copies either way. The holder closes `drop` (locks that must not outlive the
     admission). Succeeds only once the holder reports its own pid. pid_file defaults to the runner's
     holder file; take-root passes its own so a second holder for the same job lives beside it. close_first (fds
     among fds) are let go before every other lock when the holder ends (the reserve's lend, RESERVE_LENT, so no
-    reader sees the job's units free while the reserve still counts as lent)."""
+    reader sees the job's units free while the reserve still counts as lent). keep_while, a promotion lease's dir
+    (PROMOTION_LEASE): the holder also stays while the Runner.Worker that adopted the lease's claim lives, so a lease
+    supervisor that dies mid-job never frees the mini under the job."""
     owner = watch if isinstance(watch, JobOwner) else JobOwner.of(watch)
     if owner is None:
         close_all(fds)
@@ -4662,7 +4791,8 @@ def hold(fds: list[int], watch: int | JobOwner, state_dir: Path, drop: tuple[int
             deadline = time.monotonic() + HOLDER_MAX_S
             # owner.gone(), not process_alive: a /bin/ps that times out or fails under load (a busy mini's
             # load reaches 200+) is unknown, not gone, and must never hand a live job's units back to the ledger
-            while not owner.gone() and time.monotonic() < deadline:
+            while (not owner.gone() or (keep_while is not None and promotion_adopted_alive(keep_while))) \
+                    and time.monotonic() < deadline:
                 try:
                     if pid_file.read_text().strip() != me:
                         break  # job-completed released it
@@ -8870,7 +9000,7 @@ def leave_job_workspace(args: argparse.Namespace) -> None:
         # (find_disk(None), shutil.which) and every child the hook starts
         os.environ["PATH"] = absolute_path_entries(os.environ["PATH"], JOB_CWD)
     for name in ("disk", "runner_dir", "dedicated_admit", "job_log", "capacity_dir", "state_dir", "host_lock",
-                 "reservation", "toolchain_xcode"):
+                 "reservation", "toolchain_xcode", "promotion_lease"):
         value = getattr(args, name, None)
         if value is not None:
             absolute = os.path.abspath(os.fspath(value))
@@ -8971,6 +9101,10 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--state-dir", type=Path, default=Path.home() / ".local/state/glaeda/cmux-runner",
                    help=argparse.SUPPRESS)
     p.add_argument("--watch-pid", type=int, default=0, help=argparse.SUPPRESS)
+    p.add_argument("--promotion-lease", type=Path,
+                   help="job-started, job-completed: this runner is a nightly promotion lease's JIT runner "
+                        "(glaeda-promotion-admit): adopt the lease's exclusive claim for its one matching job "
+                        "(PROMOTION_LEASE), refuse any other, and leave the release to the lease")
     args = p.parse_args(argv)
     if not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", args.gui_token) or args.gui_token == FRESH_RESERVE_TOKEN:
         p.error(f"--gui-token must be a simple capacity token name other than {FRESH_RESERVE_TOKEN}")
@@ -9098,6 +9232,17 @@ def main(argv: list[str] | None = None) -> int:
                                tuple(args.allow_event))
         if not admit:
             return refused(reason)
+        if args.promotion_lease is not None:
+            # PROMOTION_LEASE: the claim is already held for this job; adopt it at once or refuse
+            if owner is None:
+                return refused(f"cannot pin this job's Runner.Worker (pid {args.watch_pid or os.getppid()})")
+            adopted, note, taken = promotion_adopt(args.promotion_lease, owner, args.state_dir)
+            if not adopted:
+                return refused(note)
+            if claim := export_job_claim(int(taken["units_total"]), taken, note):
+                note += f"; {claim}"
+            print(f"{PREFIX}: admitted: {reason}; {note}", flush=True)
+            return 0
         if args.gateway_runner and (is_guest(repo, args.home_repo)
                                     or (job_workflow(), os.environ.get("GITHUB_JOB", "")) not in GATEWAY_JOBS):
             # GATEWAY: thin cmux-ci clients only. It listens through CPU saturation and a full mini, so any other job
@@ -9385,7 +9530,11 @@ def main(argv: list[str] | None = None) -> int:
     else:
         if telemetry:
             print(f"{PREFIX}: {finish_sampler(args.state_dir)}", flush=True)
-        print(f"{PREFIX}: {release_host_lock(args.state_dir)}", flush=True)
+        if args.promotion_lease is not None:  # PROMOTION_LEASE: released by the lease once the Runner.Worker ends
+            print(f"{PREFIX}: the promotion lease keeps its exclusive claim until this job's Runner.Worker ends",
+                  flush=True)
+        else:
+            print(f"{PREFIX}: {release_host_lock(args.state_dir)}", flush=True)
     skip_disk = False
     if args.phase == "job-completed":
         hook_dir = Path(__file__).resolve().parent
@@ -9414,7 +9563,7 @@ def main(argv: list[str] | None = None) -> int:
         # came within 150 s of a job start); under the floor, evict() above still frees space before admitting
         note = disk_pressure_detached(args.disk)
         print(f"{PREFIX}: {note}", flush=True)
-    if args.phase == "job-completed":  # last: between this job and the next
+    if args.phase == "job-completed" and args.promotion_lease is None:  # last: between this job and the next
         note = install_staged_hook(Path(__file__).resolve().parent)
         if note:
             print(f"{PREFIX}: {note}", flush=True)

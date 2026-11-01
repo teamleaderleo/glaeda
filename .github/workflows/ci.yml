@@ -218,6 +218,8 @@ jobs:
               Path("scripts/test-glaeda-cmux-runner.py"),
               Path("scripts/glaeda-cmux-runner-fleet"),
               Path("scripts/test-glaeda-cmux-runner-fleet.py"),
+              Path("scripts/glaeda-promotion-admit"),
+              Path("scripts/test-glaeda-promotion-admit.py"),
               Path("scripts/glaeda-runner-hook-lag"),
               Path("scripts/test-glaeda-runner-hook-lag.py"),
               Path("scripts/glaeda-mini-fleet"),
@@ -382,6 +384,7 @@ jobs:
           suite python3 scripts/test-glaeda-mini-setup.py
           suite python3 scripts/test-glaeda-mini-enroll.py
           suite python3 scripts/test-glaeda-cmux-runner-fleet.py
+          suite python3 scripts/test-glaeda-promotion-admit.py
           suite python3 scripts/test-glaeda-runner-hook-lag.py
           suite python3 scripts/test-glaeda-mini-fleet.py
           suite python3 scripts/test-glaeda-fleet-status.py
