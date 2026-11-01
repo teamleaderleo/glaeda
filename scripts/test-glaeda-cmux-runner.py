@@ -4718,6 +4718,13 @@ time.sleep(60)
         # the nightly app build compiles in its own workspace: no root a seed on the trusted mini waits for
         self.assertEqual(hook.job_class("build-nightly-app", home, home, "nightly.yml"), ("isolated", False))
         self.assertEqual(hook.job_class("build-nightly-app", home, home, "other.yml"), ("compile", True))
+        # The decision and artifact handoff controls may use a picked owned Mac, but do no app compile.
+        # Their measured p75 is one core, so a queued PR compile cannot strand them on persistent-dd/root.
+        for job in ("decide", "build-nightly-remote-daemon", "await-nightly-tree-marker"):
+            with self.subTest(job=job):
+                self.assertEqual(hook.job_class(job, home, home, "nightly.yml"), ("light", False))
+                self.assertEqual(hook.job_units("light", job, home, home, "nightly.yml"), 1)
+                self.assertEqual(hook.job_class(job, home, home, "other.yml"), ("compile", True))
         # the nightly Ghostty helper runs Zig in its workspace: light (no root), sized by its measured cores
         self.assertEqual(hook.job_class("build-nightly-ghostty-cli-helper", home, home, "nightly.yml"), ("light", False))
         self.assertEqual(hook.job_units("light", "build-nightly-ghostty-cli-helper", home, home, "nightly.yml"), 4)
