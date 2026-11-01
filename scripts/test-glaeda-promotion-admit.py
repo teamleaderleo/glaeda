@@ -19,6 +19,7 @@ import importlib.util
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -718,7 +719,8 @@ class PromotionTest(unittest.TestCase):
         listener = self.state()["listener_pid"]
         (first / "runner" / ".credentials").write_text("{}")  # what the JIT listener decodes there
         os.kill(self.supervisor_pid(), 9)
-        self.wait_for(lambda: not any(self.units_held()), why="the claim follows its dead supervisor")
+        time.sleep(5)  # past two holder looks: no unclaimed window before recovery's frozen proof
+        self.assertEqual(self.units_held(), [True] * UNITS)
         self.assertTrue(self.listener_alive(), "its listener is left behind until a request recovers it")
         other = "fedcba9876543210fedcba98"
         result = self.run_admit(self.request(lease_id=other))
@@ -727,6 +729,145 @@ class PromotionTest(unittest.TestCase):
         self.assertFalse(any(pgid == listener for _, pgid, _ in admit.ps_table() or []), "the listener is stopped")
         self.assertFalse((first / "runner").exists(), "the runner tree, .credentials included, is removed")
         self.assertEqual(self.units_held(), [True] * UNITS, "the next lease holds the mini")
+
+    def test_recovery_preserves_acknowledged_listener_and_claim_before_adoption(self) -> None:
+        """#1788: supervisor dies after an acknowledgement persisted, before a Worker or job-start hook exists."""
+        self.ready()
+        (self.control / "ack").touch()
+        self.controller.answer = (200, {"status": "overflow"}, {})
+        self.wait_for(lambda: isinstance(self.state().get("assigned"), dict), why="sticky assigned marker")
+        assigned = self.state()["assigned"]
+        (self.control / "skip").touch()
+        self.wait_for(lambda: (self.control / "skip.taken").exists(), why="trace closed; sticky marker is authority")
+        os.kill(self.supervisor_pid(), 9)
+        time.sleep(5)
+        self.assertEqual(self.units_held(), [True] * UNITS, "claim survives the pre-adoption supervisor crash")
+        hook = load("glaeda_cmux_runner_hook_assigned_recovery", HOOK)
+        lease = admit.Lease(self.state_root, self.lease_id)
+        # A previous recovery could crash after persisting assigned but before its finally resumes the group.
+        os.killpg(self.state()["listener_pid"], signal.SIGSTOP)
+        with mock.patch.dict(os.environ, self.env):
+            note = admit.recover(lease, hook)
+        self.assertIn("assigned", note)
+        self.assertTrue(self.listener_alive())
+        self.assertEqual(self.state()["assigned"], assigned)
+        self.assertEqual(self.units_held(), [True] * UNITS)
+        self.assign()
+        self.assertEqual(self.started()["rc"], 0, "the acknowledged job can still adopt its uninterrupted claim")
+        (self.control / "finish").touch()
+        (self.control / "worker-exit").touch()
+        self.wait_for(lambda: not self.listener_alive(), why="the ephemeral listener exits after its job")
+        self.wait_for(lambda: not any(self.units_held()), why="claim follows the job and listener out")
+        with mock.patch.dict(os.environ, self.env):
+            self.assertIn("recovered", admit.recover(lease, hook))
+        self.assertFalse(lease.runner_dir.exists())
+
+    def test_recovery_claiming_holder_releases_after_supervisor_crash(self) -> None:
+        """The holder exists before claiming becomes starting; no listener can own it in that interval."""
+        lease = admit.Lease(self.state_root, self.lease_id)
+        lease.dir.mkdir(parents=True)
+        (lease.dir / "state.json").write_text(json.dumps({"phase": "claiming"}))
+        hook = load("glaeda_cmux_runner_hook_claiming_recovery", HOOK)
+        supervisor = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"],
+                                      stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                      stderr=subprocess.DEVNULL)
+        try:
+            owner = admit.promotion_claim_owner(hook, lease, hook.JobOwner.of(supervisor.pid))
+            fds = []
+            for unit in range(UNITS):
+                fd = os.open(self.capacity / f"unit-{unit}", os.O_RDONLY | os.O_CREAT, 0o600)
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fds.append(fd)
+            state_dir = self.home / ".local/state/glaeda/cmux-runner"
+            held, note = hook.hold(fds, owner, state_dir, keep_while=lease.dir)
+            self.assertTrue(held, note)
+            self.assertEqual(self.units_held(), [True] * UNITS)
+            supervisor.kill()
+            supervisor.wait(timeout=5)
+            self.wait_for(lambda: not any(self.units_held()), timeout=8,
+                          why="claiming holder follows its supervisor out before a listener starts")
+        finally:
+            if supervisor.poll() is None:
+                supervisor.kill()
+            supervisor.wait(timeout=5)
+
+    def test_recovery_rechecks_assignment_when_supervisor_dies_before_marker(self) -> None:
+        self.ready()
+        os.kill(self.supervisor_pid(), 9)
+        (self.control / "ack").touch()
+        self.wait_for(lambda: (self.control / "ack.taken").exists(), why="acknowledgement after supervisor crash")
+        self.assertNotIn("assigned", self.state())
+        hook = load("glaeda_cmux_runner_hook_unmarked_recovery", HOOK)
+        lease = admit.Lease(self.state_root, self.lease_id)
+        with mock.patch.dict(os.environ, self.env):
+            self.assertIn("assigned", admit.recover(lease, hook))
+        self.assertIsInstance(self.state().get("assigned"), dict)
+        self.assertTrue(self.listener_alive())
+        time.sleep(5)
+        self.assertEqual(self.units_held(), [True] * UNITS)
+        # A retained frozen listener was resumed; it can still take its exact job.
+        self.assign()
+        self.assertEqual(self.started()["rc"], 0)
+
+    def test_recovery_unknown_assignment_keeps_listener_and_claim(self) -> None:
+        (self.control / "no-diag").touch()
+        self.ready()
+        os.kill(self.supervisor_pid(), 9)
+        hook = load("glaeda_cmux_runner_hook_unknown_recovery", HOOK)
+        lease = admit.Lease(self.state_root, self.lease_id)
+        with mock.patch.dict(os.environ, self.env):
+            self.assertIn("unknown", admit.recover(lease, hook))
+        time.sleep(5)
+        self.assertTrue(self.listener_alive())
+        self.assertEqual(self.units_held(), [True] * UNITS)
+        self.assertTrue(lease.runner_dir.exists())
+        with mock.patch.object(admit, "ps_table", return_value=None):
+            self.assertIn("unknown", admit.recover(lease, hook))
+            owner = admit.promotion_claim_owner(hook, lease, hook.JobOwner(999999999, "gone"))
+            self.assertFalse(owner.gone(), "an unreadable process table is not proof to free the mini")
+        state_path = lease.dir / "state.json"
+        saved_state = state_path.read_text()
+        try:
+            state_path.write_text("{")
+            self.assertIn("unknown", admit.recover(lease, hook))
+            self.assertFalse(owner.gone(), "unreadable lease state keeps the claim too")
+        finally:
+            state_path.write_text(saved_state)
+
+    def test_recovery_process_identity_rejects_reused_pid_and_keeps_unknown(self) -> None:
+        runner = self.lease_dir() / "runner"
+        rows = [(1234, 1234, str(runner / "run.sh")), (1235, 1234, "./bin/Runner.Listener")]
+        with mock.patch.object(admit, "ps_table", return_value=rows):
+            with mock.patch.object(admit, "process_identity", return_value="proc:old"):
+                self.assertEqual(admit.listener_group(runner, 1234, "proc:old"), [1234, 1235])
+            with mock.patch.object(admit, "process_identity", return_value="proc:new"):
+                self.assertEqual(admit.listener_group(runner, 1234, "proc:old"), [])
+            with mock.patch.object(admit, "process_identity", return_value=None):
+                self.assertIsNone(admit.listener_group(runner, 1234, "proc:old"))
+        with mock.patch.object(admit, "process_identity", return_value=None):
+            with mock.patch.object(admit, "ps_table", return_value=[(1235, 1234, "./bin/Runner.Listener")]):
+                self.assertIsNone(admit.listener_group(runner, 1234, "proc:old"))
+            with mock.patch.object(admit, "ps_table", return_value=[]):
+                self.assertEqual(admit.listener_group(runner, 1234, "proc:old"), [])
+
+    def test_recovery_never_releases_before_exit_is_observed(self) -> None:
+        lease = admit.Lease(self.state_root, self.lease_id)
+        lease.dir.mkdir(parents=True)
+        lease.runner_dir.mkdir()
+        (lease.dir / "state.json").write_text(json.dumps({"phase": "ready", "listener_pid": 1234,
+                                                        "listener_identity": "proc:old"}))
+        hook = mock.Mock()
+        hook.promotion_locked.return_value = contextlib.nullcontext()
+        hook.promotion_adopted_alive.return_value = False
+        for observed in ([1234], None):
+            with mock.patch.object(admit, "listener_group", side_effect=[[1234], observed]), \
+                    mock.patch.object(admit.Supervisor, "assignment", return_value=("unassigned", "test")), \
+                    mock.patch.object(admit.os, "kill"), mock.patch.object(admit.os, "killpg"), \
+                    mock.patch.object(admit, "STOP_WAIT_S", 0):
+                self.assertIn("not yet proven", admit.recover(lease, hook))
+            hook.release_holder.assert_not_called()
+            hook.promotion_write_state.assert_not_called()
+            self.assertTrue(lease.runner_dir.exists())
 
     def test_a_half_made_lease_dir_is_made_again_and_stale_temp_dirs_pruned(self) -> None:
         self.state_root.mkdir(parents=True)
