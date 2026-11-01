@@ -2321,7 +2321,6 @@ class Daemon:
         for e in due + (soon if due else []):
             asked = {n: t for n, t in e["consumers"].items() if self.now - t < HEAD_INTEREST}
             c = e["cache"] or {}
-            self.nudged.discard(e["key"])
             retry = HEAD_MISSING_RETRY if c.get("missing") else self.policy["cycles"]["head"]
             if e["key"] in self.deferred:
                 self.deferred.discard(e["key"])  # the last tick ran out of time for it: no cycle to wait
@@ -2337,6 +2336,7 @@ class Daemon:
             self.head_spend.setdefault(payer, []).append(self.now)
             self.payer[e["key"]] = (payer, self.now)
             self.attempted[e["key"]] = self.now
+            self.nudged.discard(e["key"])  # (kept until it is read: a check event inside the retry gate still counts)
             out.append(e)
         return out
 
@@ -3328,6 +3328,8 @@ class Daemon:
              "to": getattr(current, "base", None)})
         self.controller = current
         self.controller_cursor, self.controller_seen = None, {}
+        # coverage is the old controller's: the new one's feed has to show it again (fed())
+        self.fed_repos, self.controller_ok_at = {}, float("-inf")
         self.controller_down_until, self.controller_failures = 0.0, 0
         self.controller_status = {"state": "off" if current is None else "starting"}
 
@@ -7659,6 +7661,8 @@ def cmd_gh(args: list[str]) -> int:
                         None if words[:1] == ["api"] and not any("{" in a for a in args) else broker_repo(values))
                     answer = gh_cache_get(cache_key, cache_repo, now)
                     if answer is not None:
+                        if key is not None:
+                            touch_interest(key)  # a read all the same: the daemon's watch stays wanted
                         broker_note({"route": "cache", **said})
                         return gh_cache_emit(answer)
                 refusal = gh_sweep_refusal(words, method, now)

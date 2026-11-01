@@ -994,6 +994,33 @@ class GraphqlDietTest(Base):
         self.assertEqual(len(self.gh.gql_calls()), 2)  # its check event re-read it at once
         self.assertTrue(gg.read_cache(key)["data"]["settled"])
 
+    def test_a_check_event_inside_the_retry_gate_is_kept_until_the_head_is_read(self) -> None:
+        sha = "a" * 40
+        self.gh.heads[("o", "r", sha)] = [check_run("CI / build", "IN_PROGRESS", None)]
+        key = gg.parse_key("head", f"o/r@{sha}")
+        self.daemon.tick(NOW)
+        self.feed_covers()
+        gg.register(key, consumer="merge-guard")
+        self.daemon.tick(NOW + gg.TICK)
+        self.assertEqual(len(self.gh.gql_calls()), 1)
+        self.ctl.suites.append({"id": 3, "repo": "o/r", "head_sha": sha, "status": "in_progress"})
+        gg.register(key, consumer="merge-guard")
+        self.daemon.tick(NOW + gg.TICK + gg.NUDGE_MIN)  # nudged, but inside the head's retry gate
+        self.assertEqual(len(self.gh.gql_calls()), 1)
+        self.daemon.tick(NOW + gg.TICK + gg.CYCLE)  # the gate opens: the event still counts
+        self.assertEqual(len(self.gh.gql_calls()), 2)
+
+    def test_a_new_controller_has_to_show_its_coverage_again(self) -> None:
+        self.daemon.tick(NOW)
+        self.feed_covers()
+        self.daemon.tick(NOW + gg.TICK)
+        self.assertTrue(self.daemon.fed("comment:o/r#1"))
+        other = FakeController()
+        self.daemon.controller_source = lambda: other
+        other.base = "http://elsewhere"
+        self.daemon.tick(NOW + 2 * gg.TICK)
+        self.assertFalse(self.daemon.fed("comment:o/r#1"))
+
     def test_a_running_head_elsewhere_keeps_its_ttl(self) -> None:
         sha = "a" * 40
         self.gh.heads[("o", "r", sha)] = [check_run("CI / build", "IN_PROGRESS", None)]
@@ -9870,6 +9897,18 @@ class BrokerAnswerCacheTest(CountingGhBase):
         self.assertEqual(self.runs(), 1)
         routes = [json.loads(line).get("route") for line in gg.broker_log().read_text().splitlines()]
         self.assertIn("cache", routes)
+
+    def test_an_answer_from_the_cache_still_counts_as_interest(self) -> None:
+        """glaeda#1791: a read the answer cache serves keeps the daemon's watch wanted (its idle backoff and
+        IDLE_EXPIRY go by the watch's mtime)."""
+        args = ["pr", "view", "7", "-R", "o/r", "--json", "state,title"]
+        self.run_gh(args)
+        gg.register("pr:o/r#7")
+        path = gg.watch_dir() / gg.file_name("pr:o/r#7")
+        os.utime(path, (time.time() - 600,) * 2)
+        self.run_gh(args)
+        self.assertEqual(self.runs(), 1)  # answered from the cache
+        self.assertLess(time.time() - path.stat().st_mtime, 60)
 
     def test_pr_view_and_run_view_are_kept(self) -> None:
         for args in (["pr", "view", "7", "-R", "o/r", "--json", "body"],
