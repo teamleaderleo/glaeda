@@ -6600,6 +6600,19 @@ def broker_is_wrapper(candidate: Path) -> bool:
     return BROKER_MARK.encode() in head or b"gh guard" in head
 
 
+# lane-vm-bootstrap's credential chain on a lane VM: gh with a per-command token from the lane-gh broker.
+# GLAEDA_GH_LANE_CHAIN names another path (tests point it into their own HOME).
+LANE_VM_GH = Path(".local/lib/lane-gh/bin/gh")
+
+
+def lane_vm_gh() -> str | None:
+    """The lane VM credential chain's gh, or None off a lane VM."""
+    candidate = Path(os.environ.get("GLAEDA_GH_LANE_CHAIN") or Path.home() / LANE_VM_GH)
+    if candidate.is_file() and os.access(candidate, os.X_OK) and not broker_is_wrapper(candidate):
+        return str(candidate)
+    return None
+
+
 def broker_real_gh() -> str:
     """The real gh: the binary a guard that delegated here named in GLAEDA_GH_REAL, else the next
     `gh` on PATH that is not a wrapper, else one of the usual install paths (a LaunchAgent's PATH
@@ -6612,6 +6625,15 @@ def broker_real_gh() -> str:
     if named and os.access(named, os.X_OK) and not Path(named).is_dir() \
             and not broker_is_wrapper(Path(named)):
         return named
+    # A lane VM holds no GitHub login: its gh is lane-vm-bootstrap's wrapper (a "gh guard", stepped over below), and
+    # the authenticated gh is the credential chain behind it. Only the wrapper names that in GLAEDA_GH_REAL, so a call
+    # that reached the broker another way (`glaeda-gh gh ...` typed directly, the daemon's own reads) found the
+    # distribution's /usr/bin/gh next, which is signed in to nothing: cloud-item-5 on gcp-codex-lane-1, 2026-11-01,
+    # `glaeda-gh gh api repos/O/R/issues/N/comments` answered "To get started with GitHub CLI, please run: gh auth
+    # login". Where the chain exists it is the real gh.
+    lane = lane_vm_gh()
+    if lane is not None:
+        return lane
     on_path = [Path(entry) / "gh" for entry in os.environ.get("PATH", "").split(os.pathsep) if entry]
     elsewhere = [Path.home() / ".local/bin/gh", Path("/opt/homebrew/bin/gh"),
                  Path("/usr/local/bin/gh"), Path("/usr/bin/gh")]

@@ -6231,6 +6231,7 @@ class BrokerBase(Base):
             # gh_default_host). Pointed at an empty directory here: these tests are about
             # github.com, and none of them should depend on what this machine is logged in to.
             "GH_CONFIG_DIR": str(self.home / "gh-config"),
+            "GLAEDA_GH_LANE_CHAIN": str(self.home / ".local/lib/lane-gh/bin/gh"),  # never the host's own chain
             # The broker asks git what a checkout's remotes are (git_remotes), and git composes
             # every config scope -- so without these the answers would depend on whoever's
             # `~/.gitconfig` the suite happens to run under, and an `insteadOf` there would change
@@ -7850,6 +7851,27 @@ class BrokerLoopTest(BrokerBase):
         self.assertFalse(gg.broker_is_wrapper(opaque))
         with mock.patch.object(gg.Path, "open", side_effect=OSError("permission denied")):
             self.assertFalse(gg.broker_is_wrapper(opaque))
+
+    def test_a_lane_vm_uses_its_credential_chain_not_the_unauthenticated_gh(self) -> None:
+        """On a lane VM, `glaeda-gh gh ...` with no GLAEDA_GH_REAL stepped over the lane wrapper and ran the
+        distribution's /usr/bin/gh, signed in to nothing ("please run: gh auth login"; gcp-codex-lane-1,
+        2026-11-01). The credential chain behind the wrapper is the real gh there."""
+        wrapper_dir = self.home / ".local/bin"
+        wrapper_dir.mkdir(parents=True, exist_ok=True)
+        (wrapper_dir / "gh").write_text("#!/bin/sh\n# gh guard: lane VM broker chain\nexit 9\n")
+        (wrapper_dir / "gh").chmod(0o755)
+        chain = self.home / ".local/lib/lane-gh/bin/gh"
+        chain.parent.mkdir(parents=True)
+        chain.write_text("#!/bin/sh\nexec lane-gh-credential gh \"$@\"\n")
+        chain.chmod(0o755)
+        with mock.patch.dict(os.environ, {"PATH": f"{wrapper_dir}:{self.home / 'bin'}"}), \
+                mock.patch.object(gg.Path, "home", staticmethod(lambda: self.home)):
+            os.environ.pop("GLAEDA_GH_REAL", None)
+            self.assertEqual(gg.broker_real_gh(), str(chain))
+            with mock.patch.dict(os.environ, {"GLAEDA_GH_REAL": str(self.home / "bin" / "gh")}):
+                self.assertEqual(gg.broker_real_gh(), str(self.home / "bin" / "gh"), "a named real gh still wins")
+            chain.unlink()
+            self.assertEqual(gg.broker_real_gh(), str(self.home / "bin" / "gh"), "off a lane VM nothing changes")
 
     def test_a_gh_nowhere_on_path_is_still_found_where_it_is_installed(self) -> None:
         """A LaunchAgent's PATH is nearly empty; /usr/bin/gh is where the host actually has it."""
