@@ -207,12 +207,13 @@ class DedicatedOnlyTest(unittest.TestCase):
 
     def test_installed_pool_instances_lists_only_pool_receipts(self):
         out = ("receipt receipt.json\nreceipt instance-3/receipt.json\nreceipt instance-12/receipt.json\n"
-               "dir actions-runner-glaeda\ndir actions-runner-glaeda-3\ndir actions-runner-glaeda-nightly-next\n")
+               "dir actions-runner-glaeda\ndir actions-runner-glaeda-3\ndir actions-runner-glaeda-nightly-next\n"
+               "receipt instance-dedicated-nightly-next/receipt.json\nend\n")
         with mock.patch.object(fleet, "run", return_value=(0, out, "")) as run:
             self.assertEqual(fleet.installed_pool_instances("m"), ([0, 3, 12], None))
         self.assertIn("instance-*/receipt.json", run.call_args[0][0][-1])
         with mock.patch.object(fleet, "run", return_value=(0, "receipt receipt.json\ndir actions-runner-glaeda\n"
-                                                              "dir actions-runner-glaeda-5\n", "")):
+                                                              "dir actions-runner-glaeda-5\nend\n", "")):
             got, why = fleet.installed_pool_instances("m")
         self.assertIsNone(got)
         self.assertIn("no receipt (instances [5])", why)
@@ -220,12 +221,21 @@ class DedicatedOnlyTest(unittest.TestCase):
             got, why = fleet.installed_pool_instances("m")
         self.assertIsNone(got)
         self.assertIn("no route", why)
+        # review of 5758205: an incomplete or odd listing is unknown state, never "no pool instances"
+        for out, needle in (("", "did not complete"), ("receipt receipt.json\n", "did not complete"),
+                            ("cd: permission denied\nend\n", "cannot read")):
+            with self.subTest(out=out), mock.patch.object(fleet, "run", return_value=(0, out, "")):
+                got, why = fleet.installed_pool_instances("m")
+            self.assertIsNone(got)
+            self.assertIn(needle, why)
 
     def test_retire_mints_a_remove_token_for_the_receipts_scope_and_never_names_the_manifest(self):
         calls = []
 
         def fake_run(argv, timeout, stdin=None):
             calls.append((argv[-1], stdin))
+            if argv[-1] == fleet.POOL_RECEIPTS:
+                return 0, "end\n", ""
             if "--apply" not in argv[-1]:
                 return 0, json.dumps({"actions": [{"kind": "deregister", "state": "remove",
                                                    "scope": "manaflow-ai"}]}), ""
@@ -270,13 +280,30 @@ class DedicatedOnlyApplyTest(unittest.TestCase):
                                      capture_output=True, text=True, timeout=30, check=False)
                 self.assertEqual(got.returncode, 0, got.stderr)
                 self.assertEqual(got.stdout.splitlines(),
-                                 [f"receipt {f}" for f in files] + ["dir actions-runner-glaeda-nightly-next"])
+                                 [f"receipt {f}" for f in files] + ["dir actions-runner-glaeda-nightly-next", "end"])
+
+    def test_an_unreadable_state_directory_fails_the_listing(self):
+        with tempfile.TemporaryDirectory() as home:
+            state = Path(home) / ".local/state/glaeda/cmux-runner"
+            state.mkdir(parents=True)
+            state.chmod(0)
+            try:
+                got = subprocess.run(["/bin/bash", "-c", fleet.POOL_RECEIPTS],
+                                     env={"HOME": home, "PATH": "/usr/bin:/bin"}, capture_output=True, text=True,
+                                     timeout=30, check=False)
+            finally:
+                state.chmod(0o700)
+            if os.geteuid() != 0:  # root enters any directory
+                self.assertEqual(got.returncode, 3, got.stdout + got.stderr)
+                self.assertNotIn("end", got.stdout)
 
     def test_an_unregistered_instance_is_retired_without_a_token(self):
         calls = []
 
         def fake_run(argv, timeout, stdin=None):
             calls.append((argv[-1], stdin))
+            if argv[-1] == fleet.POOL_RECEIPTS:
+                return 0, "end\n", ""
             if "--apply" not in argv[-1]:
                 return 0, json.dumps({"actions": [{"kind": "deregister", "state": "kept"}]}), ""
             return 0, "{}", ""
@@ -292,7 +319,7 @@ class DedicatedOnlyApplyTest(unittest.TestCase):
                                 ("dir actions-runner-glaeda-3", "no receipt")):
             def fake_run(argv, timeout, stdin=None, listing=listing):
                 if argv[-1] == fleet.POOL_RECEIPTS:
-                    return 0, listing, ""
+                    return 0, listing + "\nend\n", ""
                 if "--apply" not in argv[-1]:
                     return 0, json.dumps({"actions": [{"kind": "deregister", "state": "kept"}]}), ""
                 return 0, "{}", ""  # kept a directory it does not own, and exited 0
@@ -445,6 +472,9 @@ class TrustedAdmitTest(unittest.TestCase):
                            "dispatch": job("build", workflow="cmux-next-dev-daily.yml", ref="refs/heads/main",
                                            event_name="workflow_dispatch"),
                            "nightly-next": job("build-nightly-app"),
+                           "a main push side job": job("build", workflow="ci.yml", ref="refs/heads/main"),
+                           "a main schedule side job": dict(job("report", workflow="ci-health-report.yml",
+                                                                ref="refs/heads/main", event_name="schedule")),
                            "signing": job("build-sign-notarize-nightly", ref="refs/heads/main")}.items():
             with self.subTest(name):
                 self.assertIsNotNone(self.why(**case))

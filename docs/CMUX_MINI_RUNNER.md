@@ -989,7 +989,9 @@ runner even on a member that is not trusted-only, so the hook takes only that re
 that branch, never PR code. Such an entry, and only such an entry, may carry a trusted pool label
 (`glaeda-trusted-...`) when every member that declares that pool is trusted-only on the same ref and repository; any
 other pool label stays refused. Its admit runs `glaeda-nightly-only-admit --trusted-ref REF --trusted-repo REPO`,
-which admits what the hook's `trusted_refusal` admits and still refuses a signing job. This is how a second mini
+which admits what the hook's `trusted_refusal` admits, and of that only nightly.yml and the trusted seed
+(seed-derived-data.yml), so a host dedicated to the nightly runs no other main push or schedule job there; it still
+refuses a signing job. This is how a second mini
 serves main's trusted seed pool and the trusted nightly app build's runner label without a trusted pool of its own.
 Like every dedicated runner it takes no capacity units, so its jobs run beside the host's other dedicated runners.
 

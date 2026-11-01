@@ -26,9 +26,12 @@ route and claim instead of running here beside other nightly jobs.
 
 With --trusted-ref REF --trusted-repo OWNER/NAME it is instead the admission of a trusted runner.dedicated entry (one
 that serves a trusted pool's labels on a second host, such as main's DerivedData seed and the trusted nightly app
-build): it admits exactly what the hook's trusted_refusal admits for that ref and repository (that repository's push
-and schedule jobs on that branch, never PR code), which the hook has already checked with the same arguments, and it
-still refuses a signing job, for the same reason as above.
+build): it admits what the hook's trusted_refusal admits for that ref and repository (that repository's push and
+schedule jobs on that branch, never PR code), which the hook has already checked with the same arguments, and of those
+only TRUSTED_WORKFLOWS: the nightly itself (nightly.yml) and the trusted DerivedData seed (seed-derived-data.yml, the
+job CI_SEED_TRUSTED_POOL names, which warms the trusted nightly app build). Every other main push or schedule job is
+refused, so a host dedicated to the nightly runs no side work here. It still refuses a signing job, for the same
+reason as above.
 
 It reuses the hook's own pieces (job_tier, dev_compile_refusal, job_class, load_event) by loading the hook file the
 runner actually runs, so the two never disagree on what a nightly job is, and the hook's bytes (pinned by the
@@ -77,6 +80,10 @@ def refusal(hook: Any, event_name: str | None, ref: str | None, repository: str 
     return None
 
 
+# The workflows a trusted nightly-only runner takes (--trusted-ref): the nightly and the trusted seed it is warmed by.
+TRUSTED_WORKFLOWS = ("nightly.yml", "seed-derived-data.yml")
+
+
 def trusted_refusal(hook: Any, event_name: str | None, ref: str | None, repository: str | None, event: Any,
                     workflow_ref: str | None, job: str | None, run_attempt: str | None, trusted_ref: str,
                     trusted_repo: str) -> str | None:
@@ -86,6 +93,9 @@ def trusted_refusal(hook: Any, event_name: str | None, ref: str | None, reposito
     if why:
         return why
     workflow = hook.workflow_file(workflow_ref)
+    if workflow not in TRUSTED_WORKFLOWS:
+        return (f"this trusted runner is dedicated to the nightly: it takes only {', '.join(TRUSTED_WORKFLOWS)}; "
+                f"{workflow or 'this workflow'} is not one")
     if hook.job_class(job or "", repository, hook.DEFAULT_HOME_REPO, workflow)[0] == hook.EXCLUSIVE_CLASS:
         return (f"{workflow} {job} is a signing job: it takes the whole mini through the capacity ledger "
                 "(GLAEDA_JOB_CLAIM=exclusive), which a dedicated runner never holds; it keeps its own route")
