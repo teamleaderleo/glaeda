@@ -68,6 +68,12 @@ but still installs through `glaeda-mini-fleet upgrade` (below).
    refreshed, a newer one kept) and `hook-history.json` (the SHA-256 of every version of those two
    files, so a newer hook is never downgraded). The canary hosts run no runners, so a hook change is
    gated by CI, the signed policy soak and these checks, not by a canary status.
+   The same run brings `~/.local/bin/glaeda-promotion-admit` (HQ's nightly promotion lease runs it
+   over ssh; `glaeda-cmux-runner-fleet --apply` installs it on every member it stages) to the
+   release's bytes on those runner minis: installed when missing, replaced when `hook-history.json`
+   lists its digest, kept when newer. It is swapped under the helper's `admit.lock` and never while
+   a lease's supervisor runs; the copy and the installed file are both checked against the release's
+   SHA-256, and converge.json's `running.promotionAdmit` shows the installed and release digests.
    **Convergence.** Each run then records `~/.local/state/glaeda/update/converge.json`: what the
    host actually runs, by content (the SHA-256 of each installed tool and of each runner's installed
    hook files, each against the installed release's bytes), the tag its ring wants, whether they

@@ -86,7 +86,7 @@ class Server:
     def publish(self, source: str, health_code: int = 0, archive: bytes | None = None,
                 runner_files: dict[str, bytes] | None = None, ancestry: list[str] | None = None,
                 hook_history: dict[str, list[bytes]] | None = None,
-                support_headless: bool = True) -> dict:
+                support_headless: bool = True, promotion_admit: bytes | None = None) -> dict:
         tag = gr.release_tag(source, dt.datetime(2026, 9, 25))
         runner = {f"glaeda/scripts/{name}": ((runner_files or {}).get(name, f"{name} at {source}".encode()),
                                              0o755 if "." not in name else 0o644)
@@ -98,6 +98,12 @@ class Server:
             history = {name: sorted({gr.sha256(runner[f"glaeda/scripts/{name}"][0])}
                                     | {gr.sha256(v) for v in (hook_history or {}).get(name, [])})
                        for name in gr.HOOK_FILES}
+            extra["hook-history.json"] = (gr.canonical(history), 0o644)
+        if promotion_admit is not None:  # step 6b's helper, and its older versions the test names
+            runner[f"glaeda/scripts/{gu.PROMOTION_ADMIT}"] = (promotion_admit, 0o755)
+            history = json.loads(extra["hook-history.json"][0]) if "hook-history.json" in extra else {}
+            history[gu.PROMOTION_ADMIT] = sorted({gr.sha256(promotion_admit)} | {
+                gr.sha256(v) for v in (hook_history or {}).get(gu.PROMOTION_ADMIT, [])})
             extra["hook-history.json"] = (gr.canonical(history), 0o644)
         archive = archive or tar_gz({
             "glaeda/scripts/glaeda-mini-setup":
@@ -539,8 +545,9 @@ class UpdateTest(unittest.TestCase):
         entry = self.server.publish(SOURCES[0], runner_files=self.runner_files("the fixed release"),
                                     hook_history=self.older())
         self.assertEqual(self.run_update()["result"], "updated")
-        self.assertEqual(gu.runner_steps(self.state, staged, home),
-                         {"runnerScripts": f"refreshed to {entry['tag']}", "runnerHooks": f"{entry['tag']}: 1 updated"})
+        self.assertEqual(gu.runner_steps(self.state, staged, home, bin_dir=self.bin),
+                         {"runnerScripts": f"refreshed to {entry['tag']}", "runnerHooks": f"{entry['tag']}: 1 updated",
+                          "promotionAdmit": f"{entry['tag']} has no {gu.PROMOTION_ADMIT}"})
         self.assertEqual(hook.read_bytes(), self.runner_files("the fixed release")["glaeda-cmux-runner-hook"])
         self.assertEqual(os.stat(hook).st_mode & 0o777, 0o755)
         self.assertEqual((hook.parent / "job-started.sh").read_bytes(), wrapper, "wrappers are --apply's")
@@ -568,9 +575,110 @@ class UpdateTest(unittest.TestCase):
         newer = self.server.publish(SOURCES[1], runner_files=self.runner_files("the next release"),
                                     ancestry=[SOURCES[1], SOURCES[0], "d" * 40], hook_history=self.older())
         self.assertEqual(self.run_update()["result"], "updated")
-        self.assertEqual(gu.runner_steps(self.state, staged, home),
-                         {"runnerScripts": f"refreshed to {newer['tag']}", "runnerHooks": f"{newer['tag']}: 1 updated"})
+        self.assertEqual(gu.runner_steps(self.state, staged, home, bin_dir=self.bin),
+                         {"runnerScripts": f"refreshed to {newer['tag']}", "runnerHooks": f"{newer['tag']}: 1 updated",
+                          "promotionAdmit": f"{newer['tag']} has no {gu.PROMOTION_ADMIT}"})
         self.assertEqual(hook.read_bytes(), self.runner_files("the next release")["glaeda-cmux-runner-hook"])
+
+    # ---- step 6b: glaeda-promotion-admit (2026-11-01: #1780 and #1794 merged, and every promotion-eligible mini
+    # still had no ~/.local/bin/glaeda-promotion-admit: only glaeda-cmux-runner-fleet --apply installed it)
+
+    HELPER = b"#!/usr/bin/env python3\n# glaeda-promotion-admit at the release\n"
+    OLD_HELPER = b"#!/usr/bin/env python3\n# glaeda-promotion-admit, an older release\n"
+
+    def helper_release(self, **kw) -> tuple[dict, Path, Path, Path]:
+        home, staged, _ = self.runner_mini()
+        entry = self.server.publish(SOURCES[0], runner_files=self.runner_files("the release"),
+                                    hook_history={**self.older(), gu.PROMOTION_ADMIT: [self.OLD_HELPER]},
+                                    promotion_admit=self.HELPER, **kw)
+        self.assertEqual(self.run_update()["result"], "updated")
+        return entry, home, staged, self.bin / gu.PROMOTION_ADMIT
+
+    def step(self, home: Path, staged: Path) -> str:
+        return gu.refresh_promotion_admit(self.state, staged, self.bin, home)
+
+    def test_the_promotion_helper_is_installed_where_missing_and_only_on_a_runner_mini(self) -> None:
+        entry, home, staged, helper = self.helper_release()
+        self.assertEqual(self.step(home, self.root / "nowhere"), "absent")  # no staged runner copy: not a runner mini
+        self.assertFalse(helper.exists())
+        self.assertEqual(self.step(home, staged), f"installed {entry['tag']}'s {gr.sha256(self.HELPER)[:12]}")
+        self.assertEqual(helper.read_bytes(), self.HELPER)
+        self.assertEqual(os.stat(helper).st_mode & 0o777, 0o755)
+        self.assertEqual([p.name for p in self.bin.iterdir() if p.name.startswith(".")], [])  # no temp left
+
+    def test_a_stale_promotion_helper_is_replaced_and_a_current_one_left_alone(self) -> None:
+        entry, home, staged, helper = self.helper_release()
+        self.bin.mkdir(parents=True, exist_ok=True)
+        helper.write_bytes(self.OLD_HELPER)
+        self.assertEqual(self.step(home, staged), f"replaced {entry['tag']}'s {gr.sha256(self.HELPER)[:12]}")
+        self.assertEqual(helper.read_bytes(), self.HELPER)
+        before = os.stat(helper)
+        self.assertEqual(self.step(home, staged), "current")
+        after = os.stat(helper)
+        self.assertEqual((before.st_ino, before.st_mtime_ns), (after.st_ino, after.st_mtime_ns))
+
+    def test_a_promotion_helper_newer_than_the_release_is_never_downgraded(self) -> None:
+        _, home, staged, helper = self.helper_release()
+        self.bin.mkdir(parents=True, exist_ok=True)
+        helper.write_bytes(b"# from main, after the release\n")  # a fleet --apply from main
+        self.assertTrue(self.step(home, staged).startswith("kept ("))
+        self.assertEqual(helper.read_bytes(), b"# from main, after the release\n")
+
+    def test_the_promotion_helper_waits_while_a_request_or_lease_runs(self) -> None:
+        entry, home, staged, helper = self.helper_release()
+        self.bin.mkdir(parents=True, exist_ok=True)
+        helper.write_bytes(self.OLD_HELPER)
+        root = home / gu.PROMOTION_ROOT
+        lease = root / ("a" * 24)
+        lease.mkdir(parents=True)
+        (lease / "supervisor.json").write_text(json.dumps({"pid": os.getpid(), "identity": None}))
+        self.assertIn("supervisor", self.step(home, staged))
+        self.assertTrue(self.step(home, staged).startswith("deferred ("))
+        self.assertEqual(helper.read_bytes(), self.OLD_HELPER)
+        ended = subprocess.Popen([sys.executable, "-c", "pass"])
+        ended.wait()
+        (lease / "supervisor.json").write_text(json.dumps({"pid": ended.pid, "identity": None}))
+        import fcntl
+        fd = os.open(root / "admit.lock", os.O_RDONLY | os.O_CREAT, 0o600)  # a request being admitted
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            self.assertEqual(self.step(home, staged), "deferred (a promotion request holds admit.lock)")
+        finally:
+            os.close(fd)
+        self.assertEqual(helper.read_bytes(), self.OLD_HELPER)
+        self.assertEqual(self.step(home, staged), f"replaced {entry['tag']}'s {gr.sha256(self.HELPER)[:12]}")
+
+    def test_a_promotion_helper_copy_with_the_wrong_digest_installs_nothing(self) -> None:
+        entry, home, staged, helper = self.helper_release()
+        real = gu.file_sha256
+        with mock.patch.object(gu, "file_sha256",
+                               side_effect=lambda p: "0" * 64 if p.name.endswith(".glaeda-update") else real(p)):
+            result = self.step(home, staged)
+        self.assertTrue(result.startswith("failed ("), result)
+        self.assertFalse(helper.exists())
+        self.assertEqual([p.name for p in self.bin.iterdir() if p.name.startswith(".")], [])
+        self.assertEqual(self.step(home, staged), f"installed {entry['tag']}'s {gr.sha256(self.HELPER)[:12]}")
+
+    def test_the_promotion_helper_is_in_converge_and_status(self) -> None:
+        home, staged, _ = self.runner_mini()
+        entry = self.server.publish(SOURCES[0], runner_files=self.runner_files("the release"),
+                                    hook_history=self.older(), promotion_admit=self.HELPER)
+        lease = home / gu.PROMOTION_ROOT / ("b" * 24)
+        lease.mkdir(parents=True)
+        (lease / "supervisor.json").write_text(json.dumps({"pid": os.getpid()}))
+        result = self.apply(1_800_000_000.0, home, staged)
+        self.assertTrue(result["promotionAdmit"].startswith("deferred ("), result)
+        doc = self.converge()
+        self.assertFalse(doc["converged"])
+        self.assertFalse(doc["blocking"])  # a lease holds it: the next run swaps it
+        self.assertEqual(doc["running"]["promotionAdmit"],
+                         {"installedSha256": None, "releaseSha256": gr.sha256(self.HELPER), "current": False})
+        self.assertIn(f"{gu.PROMOTION_ADMIT} missing is not {entry['tag']}'s", " ".join(doc["why"]))
+        (lease / "supervisor.json").unlink()
+        result = self.apply(1_800_000_000.0 + 60, home, staged)
+        self.assertTrue(result["promotionAdmit"].startswith("installed "), result)
+        self.assertTrue(self.converge()["converged"], self.converge()["why"])
+        self.assertTrue(gu.observe(self.state, self.bin, home, staged)["promotionAdmit"]["current"])
 
     def test_unhealthy_release_rolls_back_and_is_quarantined(self) -> None:
         good = self.server.publish(SOURCES[0])

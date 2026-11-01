@@ -105,12 +105,14 @@ ANCESTRY_MAX = 5000
 # kept #1716's hook aa68db0113a4 after sync merge 81f4721 took manaflow-ai's side, and #1722 never rolled out).
 HOOK_HISTORY = "hook-history.json"
 HOOK_FILES = ("glaeda-cmux-runner-hook", "glaeda_reservation.py")
+# glaeda-update installs ~/.local/bin/glaeda-promotion-admit on runner minis by the same never-downgrade rule
+HISTORY_FILES = (*HOOK_FILES, "glaeda-promotion-admit")
 HOOK_HISTORY_MAX = 1000
 
 
 def hook_history(root: Path, source: str) -> bytes:
     history = {}
-    for name in HOOK_FILES:
+    for name in HISTORY_FILES:
         path = f"scripts/{name}"
         commits = subprocess.run(["git", "-C", str(root), "rev-list", "--full-history", f"--max-count={HOOK_HISTORY_MAX}",
                                   source,
