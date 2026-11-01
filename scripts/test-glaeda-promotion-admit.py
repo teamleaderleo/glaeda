@@ -66,11 +66,25 @@ jit = os.environ.get("ACTIONS_RUNNER_INPUT_JITCONFIG", "")
 (control / "listener-start.json").write_text(json.dumps({{
     "argv": sys.argv, "jit_sha": hashlib.sha256(jit.encode()).hexdigest(), "units_held": held,
     "hook_started": os.environ.get("ACTIONS_RUNNER_HOOK_JOB_STARTED")}}))
+trace = runner / "_diag" / "Runner_20261101-000000-utc.log"
 if not (control / "never-online").exists():
+    if not (control / "no-diag").exists():  # the real listener writes its _diag trace from its first line
+        trace.parent.mkdir(exist_ok=True)
+        trace.write_text("[2026-11-01 00:00:00Z INFO Terminal] WRITE LINE: Listening for Jobs\\n")
     print("Connected to GitHub", flush=True)
     print("Current runner version: '2.338.0'", flush=True)
     print("Listening for Jobs", flush=True)
 while True:
+    for name in ("ack", "skip"):  # broker trace lines with no Runner.Worker and no job-start log yet
+        if (control / name).exists():
+            line = ("[2026-11-01 00:00:01Z INFO BrokerMessageListener] Acknowledging runner request 'req-1'."
+                    if name == "ack" else "[2026-11-01 00:00:02Z INFO Runner] Skipping message Job.")
+            with open(trace, "a") as out:
+                out.write(line + "\\n")
+            (control / name).rename(control / (name + ".taken"))
+    if (control / "running").exists():
+        print("2026-11-01 00:00:03Z: Running job: promote-nightly-next", flush=True)
+        (control / "running").rename(control / "running.taken")
     job = control / "assign.json"
     if job.exists():
         spec = json.loads(job.read_text())
@@ -502,11 +516,55 @@ class PromotionTest(unittest.TestCase):
     # ---------------------------------------------------------------- (5) status after the receipt
 
     def test_overflow_withdraws_an_unassigned_listener(self) -> None:
+        """Proven unassigned: its _diag trace is read and shows no acknowledged request, no Worker, no Running job."""
         self.ready()
         self.controller.answer = (200, {"status": "overflow"}, {})
         self.wait_for(lambda: self.state().get("phase") == "withdrawn", why="overflow withdrawal")
         self.wait_for(lambda: not any(self.units_held()), why="units free")
         self.assertFalse(self.listener_alive())
+        self.assertNotIn("assigned", self.state())
+
+    def keeps_listener_and_claim(self, answer: tuple) -> None:
+        self.controller.answer = answer
+        hits = len(self.controller.hits)
+        self.wait_for(lambda: len(self.controller.hits) >= hits + 3, why="status reads")
+        self.assertEqual(self.state()["phase"], "ready", answer)
+        self.assertEqual(self.units_held(), [True] * UNITS, answer)
+        self.assertTrue(self.listener_alive(), answer)
+
+    def test_an_assigned_listener_with_no_job_start_log_keeps_its_claim(self) -> None:
+        """glaeda#1782: the listener acknowledged the job but no Runner.Worker, Running job or job-started hook has
+        followed yet. overflow and parent_completed both keep it, and the persisted marker keeps it even once the
+        trace no longer shows an open request."""
+        self.ready()
+        (self.control / "ack").touch()
+        self.wait_for(lambda: (self.control / "ack.taken").exists(), why="the acknowledge")
+        self.keeps_listener_and_claim((200, {"status": "overflow"}, {}))
+        assigned = self.state().get("assigned")
+        self.assertIsInstance(assigned, dict, "the assignment is persisted before the decision")
+        self.assertIn("req-1", assigned["evidence"])
+        (self.control / "skip").touch()  # the trace closes the request: the marker still holds
+        self.wait_for(lambda: (self.control / "skip.taken").exists(), why="the skip line")
+        self.keeps_listener_and_claim((200, {"status": "fleet", "parent_completed": True}, {}))
+        self.assertEqual(self.state()["assigned"], assigned)
+
+    def test_a_running_job_line_alone_keeps_the_claim(self) -> None:
+        self.ready()
+        (self.control / "running").touch()
+        self.wait_for(lambda: (self.control / "running.taken").exists(), why="the Running job line")
+        self.keeps_listener_and_claim((200, {"status": "overflow"}, {}))
+        self.assertIn("Running job", self.state()["assigned"]["evidence"])
+
+    def test_an_unreadable_assignment_state_keeps_the_listener(self) -> None:
+        """Fail closed: a listener with a session but no readable _diag trace is never withdrawn, and nothing is
+        marked assigned (an unknown is not a job)."""
+        (self.control / "no-diag").touch()
+        self.ready()
+        self.keeps_listener_and_claim((200, {"status": "overflow"}, {}))
+        self.keeps_listener_and_claim((200, {"status": "fleet", "parent_completed": True}, {}))
+        self.assertNotIn("assigned", self.state())
+        log = (self.lease_dir() / "supervisor.log").read_text()
+        self.assertIn("cannot prove the listener unassigned", log)
 
     def test_fleet_keeps_an_unassigned_listener_and_its_claim(self) -> None:
         self.ready()
@@ -522,6 +580,8 @@ class PromotionTest(unittest.TestCase):
         self.controller.answer = (200, {"status": "fleet", "parent_completed": True}, {})
         self.wait_for(lambda: self.state().get("phase") == "withdrawn", why="parent_completed withdrawal")
         self.wait_for(lambda: not any(self.units_held()), why="units free")
+        self.assertFalse(self.listener_alive())
+        self.assertNotIn("assigned", self.state())
 
     def test_an_unreachable_controller_keeps_the_claim(self) -> None:
         self.ready()

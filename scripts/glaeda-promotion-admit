@@ -32,12 +32,19 @@ What it does, in order (the hook's PROMOTION_LEASE has the job side):
 4. The matching job's job-started hook adopts the claim under the lease lock: the holder process never changes, so
    there is no gap, and the job sees GLAEDA_JOB_CLAIM=exclusive. Any other job on the runner is refused.
 5. Before a receipt, past expires_at with no readiness, it withdraws only its own listener, and only while that
-   listener has no job (frozen while it looks), then lets the claim go. After a receipt the deadline never releases
-   anything: it reads the controller's status (plain GET over the tailnet). "overflow" lets it withdraw its
+   listener has no session yet (frozen while it looks), then lets the claim go. After a receipt the deadline never
+   releases anything: it reads the controller's status (plain GET over the tailnet). "overflow" lets it withdraw its
    unassigned listener; "fleet" keeps listener and claim, unless parent_completed is true and the listener is still
    unassigned; anything else (unreachable, a non-2xx, bad or future-dated JSON) keeps the claim. A Runner.Worker of
    the lease runner keeps the claim whatever the status, until it ends. The claim is let go after the adopted
    Runner.Worker has exited.
+6. "Unassigned" is proved, never assumed (glaeda#1782): under the lease lock, with the listener frozen, its process
+   table, its own log and its _diag trace must all be read and show no Runner.Worker, no "Running job" and no
+   acknowledged runner request. Anything unreadable keeps the listener and the claim. Any sign of a job is first
+   persisted in state.json as "assigned", and from then on no withdrawal stops that listener, even if the job-start
+   log is late or never comes; only the listener's own exit (an ephemeral runner ends after its one job) lets go.
+   A message the broker delivered but the listener has not yet acknowledged is not assigned: until the acknowledge
+   the broker redelivers it (glaeda-cmux-runner-hook LISTENER_TAKES).
 
 It never cancels a GitHub run or job, and makes no GitHub call at all.
 
@@ -100,6 +107,7 @@ ADMIT_LOCK_S = 30.0
 ANSWER_GRACE_S = 60.0  # the foreground waits for readiness until expires_at plus this
 TERMINAL = ("expired", "withdrawn", "released", "failed")
 LISTENING = "Listening for Jobs"  # glaeda-cmux-runner LISTENING
+RUNNING_JOB = "Running job: "  # the listener's terminal line when it hands a job to a Runner.Worker
 WORKLOAD_PATH = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 JIT_ENV = "ACTIONS_RUNNER_INPUT_JITCONFIG"
 COPY_SKIP = {"_work", "_diag", "glaeda-hooks", ".env", ".path", ".runner", ".runner_migrated", ".service", "svc.sh"}
@@ -861,18 +869,71 @@ class Supervisor:
         with contextlib.suppress(subprocess.TimeoutExpired):
             self.listener.wait(timeout=5)
 
-    def withdraw(self, why: str, phase: str = "withdrawn") -> bool:
-        """Stop our own listener only while it has no job, then let the claim go. Under the lease lock, so a job is
-        never adopted after this, and this never runs after one was. False when the listener has a job."""
+    def assignment(self) -> tuple[str, str]:
+        """("assigned" | "unassigned" | "no-session" | "unknown", evidence) for our listener, read while it is frozen.
+        Only "unassigned" and "no-session" (it never logged Listening for Jobs, so nothing can have reached it) let a
+        withdrawal stop it; "unknown" (anything unreadable) keeps it, like "assigned"."""
+        try:
+            commands = subprocess.run(["/bin/ps", "-axww", "-o", "command="], stdin=subprocess.DEVNULL,
+                                      capture_output=True, text=True, timeout=60, check=True).stdout.splitlines()
+        except Exception as error:  # noqa: BLE001
+            return "unknown", f"the process table is unreadable ({type(error).__name__})"
+        try:
+            log = self.lease.listener_log.read_bytes()
+        except OSError as error:
+            return "unknown", f"the listener log is unreadable ({type(error).__name__})"
+        runner_dir = self.lease.runner_dir
+        if any(self.hook.runner_worker(runner_dir, command) for command in commands):
+            return "assigned", "a Runner.Worker of the lease runner runs"
+        if RUNNING_JOB.encode() in log:
+            return "assigned", "the listener logged Running job"
+        if LISTENING.encode() not in log:
+            return "no-session", "the listener has no session yet"
+        try:
+            traces = [n for n in os.listdir(runner_dir / "_diag") if n.startswith("Runner_") and n.endswith(".log")]
+        except OSError as error:
+            return "unknown", f"the listener's _diag is unreadable ({type(error).__name__})"
+        if not traces:
+            return "unknown", "the listener has a session but no _diag/Runner_*.log"
+        try:
+            request = self.hook.listener_request(runner_dir)
+        except Exception as error:  # noqa: BLE001
+            return "unknown", f"the listener's _diag trace is unreadable ({type(error).__name__})"
+        if request is not None:
+            return "assigned", f"the listener acknowledged runner request {request[:80]}"
+        return "unassigned", "no Runner.Worker, no Running job and no acknowledged request in the listener's trace"
+
+    def mark_assigned(self, state: dict[str, Any], evidence: str) -> dict[str, Any]:
+        """Persist that a job reached our listener (call under the lease lock). Sticky: it is never cleared."""
+        if isinstance(state.get("assigned"), dict):
+            return state
+        state = {**state, "assigned": {"at": time.time(), "evidence": evidence[:300]}}
+        self.hook.promotion_write_state(self.lease.dir, state)
+        self.say(f"a job reached the listener ({evidence[:200]}); keeping the listener and the claim")
+        return state
+
+    def withdraw(self, why: str, phase: str = "withdrawn", session_ok: bool = False) -> bool:
+        """Stop our own listener only while it is proven unassigned, then let the claim go. Under the lease lock, so
+        a job is never adopted after this, and this never runs after one was. False when the listener has, or may
+        have, a job. A listener that has a session (logged Listening for Jobs) is stopped only when session_ok: the
+        controller released the lease (overflow, or parent_completed), or the claim is already lost or never was
+        whole (a dead holder, a failed start). A deadline alone never stops a listener that can take a job."""
         with self.hook.promotion_locked(self.lease.dir, wait_s=60.0):
             self.owned()
             state = self.lease.state()
             if isinstance(state.get("adopted"), dict):
                 return False
             if self.listener_pids():
+                if isinstance(state.get("assigned"), dict):
+                    return False  # a job reached it: keep it, even with no job-start log yet
                 self.signal_listener(signal.SIGSTOP)  # it can take no job while it is looked at
-                if self.hook.runner_busy_now(self.lease.runner_dir):
+                verdict, evidence = self.assignment()
+                if verdict == "assigned":
+                    self.mark_assigned(state, evidence)
+                if not (verdict == "no-session" or verdict == "unassigned" and session_ok):
                     self.signal_listener(signal.SIGCONT)
+                    if verdict == "unknown":
+                        self.say(f"cannot prove the listener unassigned ({evidence[:200]}); keeping it")
                     return False
                 self.stop_listener()
             released = self.release_claim()
@@ -930,7 +991,7 @@ class Supervisor:
             return False
         if not self.holder_alive(state):
             # the claim is gone (a holder killed by hand): nothing may run here as if it held the mini
-            return not self.withdraw("the claim's holder exited", phase="failed")
+            return not self.withdraw("the claim's holder exited", phase="failed", session_ok=True)
         if phase == "starting":
             if self.online():
                 self.write_receipt()
@@ -942,6 +1003,10 @@ class Supervisor:
             return True
         # ready: a receipt was given, so the deadline releases nothing
         if hook.runner_busy_now(self.lease.runner_dir):
+            if not isinstance(state.get("assigned"), dict):
+                with hook.promotion_locked(self.lease.dir):
+                    self.owned()
+                    self.mark_assigned(self.lease.state(), "a Runner.Worker, or a request its listener took")
             return True  # a Runner.Worker (or a job its listener took) keeps the claim until it ends
         if not self.listener_pids():  # nothing can take the job here any more: never hold the mini for nothing
             return not self.withdraw("the listener exited with no adopted job", phase="failed")
@@ -950,9 +1015,9 @@ class Supervisor:
         last_status[0] = time.monotonic()
         status = controller_status(self.request["controller_url"], self.request["status_path"], self.lease_id)
         if status["status"] == "overflow":
-            return not self.withdraw("the controller sent the job to overflow")
+            return not self.withdraw("the controller sent the job to overflow", session_ok=True)
         if status["status"] == "fleet" and status["parent_completed"]:
-            return not self.withdraw("the controller saw the parent run complete")
+            return not self.withdraw("the controller saw the parent run complete", session_ok=True)
         if status["status"] == "unreachable":
             self.say(f"controller unreachable ({status['why'][:160]}); keeping the claim")
         return True
@@ -980,7 +1045,7 @@ class Supervisor:
             self.say(f"could not start the listener: {type(error).__name__}")
             try:
                 if self.listener is not None:
-                    self.withdraw(f"start failed ({type(error).__name__})", phase="failed")
+                    self.withdraw(f"start failed ({type(error).__name__})", phase="failed", session_ok=True)
                 else:
                     self.release_claim()
                     self.update(phase="failed", reason=f"start failed ({type(error).__name__})")
