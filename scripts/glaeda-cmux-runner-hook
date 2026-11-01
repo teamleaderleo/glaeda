@@ -368,9 +368,9 @@ WORKFLOW_JOB_CLASSES = {("cmux-tui.yml", "lint"): "isolated", ("cmux-tui.yml", "
                         ("test-e2e.yml", "build"): "compile-gui", ("test-e2e.yml", "test"): "gui-step",
                         ("seed-derived-data.yml", "seed"): "seed",
                         ("nightly.yml", "build-nightly-app"): "isolated",
-                        # Nightly control jobs do not compile or take a canonical root. They can land on an owned
-                        # Mac through the build runner picker, so keep them in the measured light class instead of
-                        # the unknown-job compile default (which held persistent-dd and a root while waiting).
+                        # Nightly control and artifact jobs do not run an Xcode app compile or take a canonical root.
+                        # They can land on an owned Mac through the build runner picker, so keep them in the measured
+                        # light class instead of the unknown-job compile default (which held persistent-dd and a root).
                         ("nightly.yml", "decide"): "light",
                         ("nightly.yml", "build-nightly-remote-daemon"): "light",
                         ("nightly.yml", "await-nightly-tree-marker"): "light",
@@ -559,9 +559,9 @@ JOB_CORES: dict[tuple[str, ...], int] = {
     ("ci.yml", "release-build"): 3,  # isolated: 28, 1.92/2.04/2.08
     # No mini telemetry yet (it ran on Blacksmith macOS 15): its cold universal build on an owned macOS 26 mini
     # measured 422 s user + 46 s sys over 133 s wall, 3.51 cores (2026-10-27); a helper cache hit is near 0.
-    # Measured p75 control cost is one core; these jobs only resolve, attest or publish artifacts.
+    # Resolver and marker controls measure at one core p75. The remote-daemon artifact job uses the light
+    # class's measured two-core default because it runs concurrent Go cross-builds.
     ("nightly.yml", "decide"): 1,
-    ("nightly.yml", "build-nightly-remote-daemon"): 1,
     ("nightly.yml", "await-nightly-tree-marker"): 1,
     ("nightly.yml", "build-nightly-ghostty-cli-helper"): 4,
     ("manaflow-ai/cmuxterm-hq", "build-fleet-go.yml", "test"): 1,  # guest isolated: 919, 0.24/0.42/0.52
