@@ -211,7 +211,7 @@ class DedicatedOnlyTest(unittest.TestCase):
                "receipt instance-dedicated-nightly-next/receipt.json\nend\n")
         with mock.patch.object(fleet, "run", return_value=(0, out, "")) as run:
             self.assertEqual(fleet.installed_pool_instances("m"), ([0, 3, 12], None))
-        self.assertIn("instance-*/receipt.json", run.call_args[0][0][-1])
+        self.assertIn("ls -1A", run.call_args[0][0][-1])  # ls, never a glob: an unreadable directory fails
         with mock.patch.object(fleet, "run", return_value=(0, "receipt receipt.json\ndir actions-runner-glaeda\n"
                                                               "dir actions-runner-glaeda-5\nend\n", "")):
             got, why = fleet.installed_pool_instances("m")
@@ -279,14 +279,14 @@ class DedicatedOnlyApplyTest(unittest.TestCase):
                 got = subprocess.run(["/bin/bash", "-c", fleet.POOL_RECEIPTS], env={"HOME": home, "PATH": "/usr/bin:/bin"},
                                      capture_output=True, text=True, timeout=30, check=False)
                 self.assertEqual(got.returncode, 0, got.stderr)
-                self.assertEqual(got.stdout.splitlines(),
-                                 [f"receipt {f}" for f in files] + ["dir actions-runner-glaeda-nightly-next", "end"])
+                self.assertEqual(sorted(got.stdout.splitlines()[:-2]), sorted(f"receipt {f}" for f in files))
+                self.assertEqual(got.stdout.splitlines()[-2:], ["dir actions-runner-glaeda-nightly-next", "end"])
 
     def test_an_unreadable_state_directory_fails_the_listing(self):
         with tempfile.TemporaryDirectory() as home:
             state = Path(home) / ".local/state/glaeda/cmux-runner"
             state.mkdir(parents=True)
-            state.chmod(0)
+            state.chmod(0o300)  # enterable but not readable: a glob would list nothing and exit 0 (a1de21e4)
             try:
                 got = subprocess.run(["/bin/bash", "-c", fleet.POOL_RECEIPTS],
                                      env={"HOME": home, "PATH": "/usr/bin:/bin"}, capture_output=True, text=True,
@@ -547,6 +547,42 @@ class RetirementRaceTest(unittest.TestCase):
                 self.assertEqual(runner.main(["--manifest", os.fspath(man), "--member", "m", "--dedicated",
                                               "nightly-only-1", "--apply", "--skip-launchctl"]), 0)
             install.assert_called_once()
+
+    def test_pool_installs_fails_closed_on_an_unreadable_directory(self):
+        runner = load("glaeda_cmux_runner_pool_installs_unreadable", ROOT / "scripts" / "glaeda-cmux-runner")
+        for target in ("state", "home"):
+            with self.subTest(target=target), tempfile.TemporaryDirectory() as tmp:
+                home = Path(tmp) / "h"
+                state = home / ".local/state/glaeda/cmux-runner"
+                (state / "instance-2").mkdir(parents=True)
+                (state / "instance-2/receipt.json").write_text("{}")
+                path = state if target == "state" else home
+                path.chmod(0o300)
+                try:
+                    got = runner.pool_installs(home)
+                finally:
+                    path.chmod(0o700)
+                if os.geteuid() != 0:
+                    self.assertTrue(got and got[0].startswith("unreadable"), got)
+
+    def test_a_stale_pool_apply_refuses_once_the_mac_is_dedicated_only(self):
+        runner = load("glaeda_cmux_runner_marker", ROOT / "scripts" / "glaeda-cmux-runner")
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            def args(**kw):
+                return SimpleNamespace(**{"apply": True, "uninstall": False, "clear_dedicated_only": False,
+                                          "member": "m", "dedicated": None, **kw})
+            pool = SimpleNamespace(home=home, dedicated=None)
+            dedicated = SimpleNamespace(home=home, dedicated=NIGHTLY_ONLY, dedicated_only=True)
+            self.assertIsNone(runner.dedicated_only_refusal(pool, args()))  # no marker: pool applies as before
+            self.assertIsNone(runner.dedicated_only_refusal(dedicated, args(dedicated="nightly-only-1")))
+            marker = home / ".local/state/glaeda/cmux-runner" / runner.DEDICATED_ONLY_MARKER
+            self.assertTrue(marker.exists())
+            # a pool apply that read the old manifest before it waited for the lock is refused under it
+            self.assertIn("dedicatedOnly", runner.dedicated_only_refusal(pool, args()))
+            self.assertIsNone(runner.dedicated_only_refusal(pool, args(uninstall=True)))  # retiring still works
+            self.assertIsNone(runner.dedicated_only_refusal(pool, args(clear_dedicated_only=True)))
+            self.assertFalse(marker.exists())
 
     def test_a_recorded_registration_without_its_directory_is_not_retired(self):
         plan = {"actions": [{"kind": "deregister", "state": "kept", "registered": True, "scope": "manaflow-ai"}]}

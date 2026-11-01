@@ -660,11 +660,16 @@ def uninstall_instance(member: str, instance: int, repo: str) -> str | None:
 # the instance. Run by /bin/sh, never the login shell: zsh fails an unmatched glob ("no matches found").
 # Fails closed (review of 5758205): a state directory that exists but cannot be entered, or a home that cannot, exits 3;
 # an absent state directory is a mini with no receipts. The final "end" line proves the listing ran to completion.
+# Fails closed (reviews of 5758205 and a1de21e4): ls, not a glob, enumerates each directory, so one it cannot read or
+# enter exits 3 (a glob would skip it silently); an absent state directory is a mini with no receipts. The final "end"
+# line proves the listing ran to completion.
 POOL_RECEIPTS = ("/bin/sh -c 's=\"$HOME/.local/state/glaeda/cmux-runner\"; "
-                 "if [ -e \"$s\" ]; then cd \"$s\" || exit 3; "
-                 "for f in receipt.json instance-*/receipt.json; do [ -f \"$f\" ] && echo \"receipt $f\"; done; fi; "
-                 "cd \"$HOME\" || exit 3; for d in actions-runner-glaeda actions-runner-glaeda-*; do [ -d \"$d\" ] && "
-                 "echo \"dir $d\"; done; echo end; exit 0'")
+                 "if [ -e \"$s\" ]; then l=$(ls -1A \"$s\") || exit 3; for n in $l; do case $n in "
+                 "receipt.json) echo \"receipt $n\";; instance-*) [ -d \"$s/$n\" ] || continue; "
+                 "c=$(ls -1A \"$s/$n\") || exit 3; case \" $(echo $c) \" in *\" receipt.json \"*) "
+                 "echo \"receipt $n/receipt.json\";; esac;; esac; done; fi; "
+                 "h=$(ls -1A \"$HOME\") || exit 3; for n in $h; do case $n in actions-runner-glaeda*) "
+                 "[ -d \"$HOME/$n\" ] && echo \"dir $n\";; esac; done; echo end; exit 0'")
 POOL_RECEIPT_RE = re.compile(r"receipt (?:instance-(\d+)/)?receipt\.json")
 POOL_DIR_RE = re.compile(r"dir actions-runner-glaeda(?:-(\d+))?")
 # what else the listing may name: a dedicated runner's receipt and directory (glaeda_fleet_labels DEDICATED_NAME_RE)
