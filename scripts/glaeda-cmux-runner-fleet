@@ -602,13 +602,14 @@ def prepare_headless(member: str, summary: dict[str, Any], manifest: dict[str, A
     return None if code == 0 else f"headless preparation failed: {err.strip()[-240:]}"
 
 
-def _uninstall_cmd(member: str, instance: int, apply: bool, receipt_only: bool = False) -> str:
+def _uninstall_cmd(member: str, instance: int, apply: bool, receipt_only: bool = False, token: bool = True) -> str:
     # --token-stdin even for the plan: without gh on the mini, a plan lacking it reads "blocked", and a plan
     # never reads stdin. receipt_only: no --manifest (a dedicatedOnly member declares no pool instance to name);
     # an uninstall acts only on what the instance's receipt recorded anyway.
     named = "" if receipt_only else f"--manifest ~/{REMOTE_DIR}/mini-fleet.json --member {_quote(member)} "
-    return (f"~/{REMOTE_DIR}/scripts/glaeda-cmux-runner --uninstall {'--apply ' if apply else ''}--token-stdin "
-            f"{named}--instance {instance} --output json")
+    # token=False: an instance with no registration to deregister (an interrupted install) takes no token
+    return (f"~/{REMOTE_DIR}/scripts/glaeda-cmux-runner --uninstall {'--apply ' if apply else ''}"
+            f"{'--token-stdin ' if token else ''}{named}--instance {instance} --output json")
 
 
 def _failed_note(out: str, err: str, code: int) -> str:
@@ -649,8 +650,9 @@ def uninstall_instance(member: str, instance: int, repo: str) -> str | None:
 
 
 # DEDICATED_ONLY (glaeda_fleet_labels): the pool instances' receipts on a member, instance 0's at the top
-POOL_RECEIPTS = ("cd ~/.local/state/glaeda/cmux-runner 2>/dev/null && "
-                 "for f in receipt.json instance-*/receipt.json; do [ -f \"$f\" ] && echo \"$f\"; done; true")
+# run by /bin/sh, never the login shell: zsh fails an unmatched glob ("no matches found") where sh keeps it literal
+POOL_RECEIPTS = ("/bin/sh -c 'cd ~/.local/state/glaeda/cmux-runner 2>/dev/null || exit 0; "
+                 "for f in receipt.json instance-*/receipt.json; do [ -f \"$f\" ] && echo \"$f\"; done; exit 0'")
 POOL_RECEIPT_RE = re.compile(r"(?:instance-(\d+)/)?receipt\.json")
 
 
@@ -674,8 +676,9 @@ def retire_instance(member: str, instance: int) -> dict[str, Any]:
     token = mint(scope_api(None, scope) if "/" not in scope else scope_api(scope, None), "remove-token") if scope else ""
     if token is None:
         return {"instance": instance, "exit": None, "state": f"retire: no remove token for {scope}; nothing changed"}
-    code, out, err = run(["ssh", *SSH_OPTIONS, member, _uninstall_cmd(member, instance, True, receipt_only=True)],
-                         APPLY_TIMEOUT_S, stdin=token + "\n")
+    code, out, err = run(["ssh", *SSH_OPTIONS, member,
+                          _uninstall_cmd(member, instance, True, receipt_only=True, token=bool(scope))],
+                         APPLY_TIMEOUT_S, stdin=token + "\n" if scope else None)
     del token
     state = "retired" if code == 0 else f"retire failed ({_failed_note(out, err, code)})"
     return {"instance": instance, "exit": code, "state": state, "name": None}
@@ -839,8 +842,14 @@ def one_member(member: str, summary: dict[str, Any], args: argparse.Namespace, m
         with concurrent.futures.ThreadPoolExecutor(max_workers=instances) as pool:
             results = list(pool.map(lambda k: apply_instance(member, k, repo, extra, org, group,
                                                              args.migrate_from_repo), range(instances)))
-    # a dedicated runner keeps its own scope (never --org/--migrate-from-repo) and its own labels
-    results += [apply_dedicated(member, entry, extra) for entry in dedicated]
+    if summary.get("dedicatedOnly") and not all(r["exit"] == 0 for r in results):
+        # DEDICATED_ONLY: a pool instance still installed (busy, or unreadable) can take a signing job whose whole-mini
+        # claim the dedicated runners never join, so no dedicated runner is (re)applied until every one is retired
+        results.append({"dedicated": "*", "exit": None,
+                        "state": "held: pool instances are not all retired; drain the mini and re-run"})
+    else:
+        # a dedicated runner keeps its own scope (never --org/--migrate-from-repo) and its own labels
+        results += [apply_dedicated(member, entry, extra) for entry in dedicated]
     row["instances"] = results
     row["action"] = "applied" if all(r["exit"] == 0 for r in results) else "failed"
     row["seconds"] = round(time.monotonic() - started, 1)

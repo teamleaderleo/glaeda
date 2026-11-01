@@ -235,6 +235,63 @@ class DedicatedOnlyTest(unittest.TestCase):
         self.assertIn("has a job", got["state"])
 
 
+class DedicatedOnlyApplyTest(unittest.TestCase):
+    def test_the_receipt_listing_survives_an_unmatched_glob(self):
+        for files in ([], ["receipt.json"], ["receipt.json", "instance-2/receipt.json"]):
+            with self.subTest(files=files), tempfile.TemporaryDirectory() as home:
+                state = Path(home) / ".local/state/glaeda/cmux-runner"
+                state.mkdir(parents=True)
+                for name in files:
+                    (state / name).parent.mkdir(parents=True, exist_ok=True)
+                    (state / name).write_text("{}")
+                # the login shell parses the command first (zsh on a mini); sh then expands the glob
+                got = subprocess.run(["/bin/bash", "-c", fleet.POOL_RECEIPTS], env={"HOME": home, "PATH": "/usr/bin:/bin"},
+                                     capture_output=True, text=True, timeout=30, check=False)
+                self.assertEqual(got.returncode, 0, got.stderr)
+                self.assertEqual(got.stdout.split(), files)
+
+    def test_an_unregistered_instance_is_retired_without_a_token(self):
+        calls = []
+
+        def fake_run(argv, timeout, stdin=None):
+            calls.append((argv[-1], stdin))
+            if "--apply" not in argv[-1]:
+                return 0, json.dumps({"actions": [{"kind": "deregister", "state": "kept"}]}), ""
+            return 0, "{}", ""
+        with mock.patch.object(fleet, "run", side_effect=fake_run), mock.patch.object(fleet, "mint") as mint:
+            got = fleet.retire_instance("m", 2)
+        self.assertEqual(got["state"], "retired")
+        mint.assert_not_called()
+        self.assertNotIn("--token-stdin", calls[-1][0])
+        self.assertIsNone(calls[-1][1])
+
+    def one_member(self, retired_exit):
+        summary = {"class": "std", "runners": 4, "gatewayRunners": 0, "capacityUnits": 14, "dedicatedOnly": True}
+        args = SimpleNamespace(scope_flags=False, apply=True, include_ineligible=False, allow_downgrade=None,
+                               guard={"head": "h", "refusals": []}, skip_launchctl=False, org=None,
+                               migrate_from_repo=None)
+        man = manifest({"dedicatedOnly": True, "dedicated": [NIGHTLY_ONLY]})
+        with mock.patch.object(fleet, "check", return_value=(True, "ok")), \
+                mock.patch.object(fleet, "stage", return_value=None), \
+                mock.patch.object(fleet, "prepare_headless", return_value=None), \
+                mock.patch.object(fleet, "installed_pool_instances", return_value=([0, 1], None)), \
+                mock.patch.object(fleet, "retire_instance",
+                                  side_effect=lambda m, k: {"instance": k, "exit": retired_exit, "state": "x"}), \
+                mock.patch.object(fleet, "apply_dedicated",
+                                  return_value={"dedicated": "nightly-only-1", "exit": 0, "state": "ok"}) as dedicated:
+            row = fleet.one_member("m", summary, args, man, Path("/nonexistent"))
+        return row, dedicated
+
+    def test_dedicated_runners_wait_until_every_pool_instance_is_retired(self):
+        row, dedicated = self.one_member(1)
+        dedicated.assert_not_called()
+        self.assertEqual(row["action"], "failed")
+        self.assertIn("held", row["instances"][-1]["state"])
+        row, dedicated = self.one_member(0)
+        dedicated.assert_called_once()
+        self.assertEqual(row["action"], "applied")
+
+
 class NoEmDashTest(unittest.TestCase):
     def test_no_em_dash(self):
         for path in (ADMIT, Path(__file__)):
