@@ -1378,6 +1378,12 @@ def plan_uninstall(ctx: Context, receipt: dict[str, Any] | None) -> list[dict[st
         # config.sh finished after this command gave up on it: the directory is ours, so is its .runner
         actions.append({"kind": "deregister", "state": "remove", "name": local.get("agentName"),
                         "runnerId": local.get("agentId"), "note": "registered by an interrupted --apply"})
+    elif registered.get("owned"):
+        # the receipt records a registration this command made, but its runner directory is gone (or not ours): the
+        # GitHub registration may still exist and nothing here can deregister it, so a retirement must not read this as
+        # "never registered" (glaeda-cmux-runner-fleet registered_scope; review of 611e013e)
+        actions.append({"kind": "deregister", "state": "kept", "registered": True, "scope": registered.get("scope"),
+                        "note": "the receipt records a registration, but its runner directory is gone or not ours"})
     else:
         actions.append({"kind": "deregister", "state": "kept",
                         "note": "no registration owned by this command in this runner directory"})
@@ -2521,6 +2527,8 @@ def main(argv: list[str] | None = None) -> int:
         if why:
             print(f"glaeda-cmux-runner: {why}", file=sys.stderr)
             return 2
+        summary, _ = member_labels(manifest, args.member, [])
+        ctx.dedicated_only = bool((summary or {}).get("dedicatedOnly"))
     elif args.manifest:
         try:
             manifest = json.loads(args.manifest.expanduser().read_text())
@@ -2594,7 +2602,32 @@ def main(argv: list[str] | None = None) -> int:
         ctx.gh, ctx.gh_state = None, "installed, not logged in"  # a logged-out gh is no gh
     # Every --apply and --uninstall holds the runner lock from its plan to its receipt (runner_lock).
     with runner_lock(ctx.home, wait=True) if args.apply else contextlib.nullcontext():
+        if args.apply and not args.uninstall and getattr(ctx, "dedicated_only", False):
+            # DEDICATED_ONLY: checked under the runner lock every pool --apply also holds, so no pool instance can
+            # appear between this check and the dedicated runner's install (review of 611e013e)
+            left = pool_installs(ctx.home)
+            if left:
+                print(f"glaeda-cmux-runner: {args.member} declares runner.dedicatedOnly and still has pool instances "
+                      f"({', '.join(left)}): retire them first (glaeda-cmux-runner-fleet, fleet runner heal)",
+                      file=sys.stderr)
+                return 2
         return install_or_uninstall(ctx, args, raw_argv)
+
+
+def pool_installs(home: Path) -> list[str]:
+    """Every pool instance this Mac has (a receipt under instance-N or the first install's, or a pool runner directory
+    actions-runner-glaeda[-N]), as names. A dedicated runner (instance-dedicated-NAME, actions-runner-glaeda-NAME) is
+    not one. Read-only; an unreadable home counts as one, so a dedicatedOnly member fails closed."""
+    state = home / ".local/state/glaeda/cmux-runner"
+    try:
+        found = (["receipt.json"] if (state / "receipt.json").exists() else []) + sorted(
+            f"{p.name}/receipt.json" for p in state.glob("instance-*") if re.fullmatch(r"instance-\d+", p.name)
+            and (p / "receipt.json").exists())
+        found += sorted(p.name for p in home.glob("actions-runner-glaeda*")
+                        if re.fullmatch(r"actions-runner-glaeda(?:-\d+)?", p.name))
+    except OSError as error:
+        return [f"unreadable ({type(error).__name__})"]
+    return found
 
 
 def dedicated_context(ctx: Context, args: argparse.Namespace, manifest: Any) -> str | None:

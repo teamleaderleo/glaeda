@@ -9,6 +9,7 @@ subprocess with a fake event file, the way dedicated-admit.sh runs it.
 from __future__ import annotations
 
 import importlib.machinery
+import io
 import importlib.util
 import json
 import os
@@ -469,6 +470,62 @@ class TrustedAdmitTest(unittest.TestCase):
     def test_ota_ships_the_admission_with_the_runner_files(self):
         update = load("glaeda_update_nightly_only", ROOT / "scripts" / "glaeda-update")
         self.assertIn("glaeda-nightly-only-admit", update.RUNNER_FILES)
+
+
+class RetirementRaceTest(unittest.TestCase):
+    """Review of 611e013e: the dedicatedOnly invariant is held on the mini, and a recorded registration with no
+    runner directory is never read as unregistered."""
+
+    def test_pool_installs_lists_pool_receipts_and_dirs_only(self):
+        runner = load("glaeda_cmux_runner_pool_installs", ROOT / "scripts" / "glaeda-cmux-runner")
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            state = home / ".local/state/glaeda/cmux-runner"
+            (state / "instance-dedicated-nightly-only-1").mkdir(parents=True)
+            (state / "instance-dedicated-nightly-only-1/receipt.json").write_text("{}")
+            (home / "actions-runner-glaeda-nightly-only-1").mkdir()
+            self.assertEqual(runner.pool_installs(home), [])
+            (state / "instance-3").mkdir()
+            (state / "instance-3/receipt.json").write_text("{}")
+            (home / "actions-runner-glaeda").mkdir()
+            self.assertEqual(runner.pool_installs(home), ["instance-3/receipt.json", "actions-runner-glaeda"])
+
+    def test_a_dedicated_apply_on_a_dedicated_only_member_refuses_beside_a_pool_instance(self):
+        runner = load("glaeda_cmux_runner_dedicated_only_lock", ROOT / "scripts" / "glaeda-cmux-runner")
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            (home / "actions-runner-glaeda-2").mkdir()
+            man = Path(tmp) / "m.json"
+            man.write_text(json.dumps(manifest({"dedicatedOnly": True, "dedicated": [NIGHTLY_ONLY]})))
+            with mock.patch.object(runner.Path, "home", return_value=home), \
+                    mock.patch.object(runner, "DARWIN_REQUIRED", False), \
+                    mock.patch.dict(os.environ, {"HOME": tmp}), \
+                    mock.patch.object(runner, "install_or_uninstall", return_value=0) as install, \
+                    mock.patch.object(runner, "run", return_value=(1, "")), \
+                    mock.patch("sys.stderr", new_callable=io.StringIO) as err:
+                code = runner.main(["--manifest", os.fspath(man), "--member", "m", "--dedicated", "nightly-only-1",
+                                    "--apply", "--skip-launchctl"])
+            self.assertEqual(code, 2)
+            install.assert_not_called()
+            self.assertIn("still has pool instances", err.getvalue())
+            (home / "actions-runner-glaeda-2").rmdir()  # retired: the same apply now proceeds
+            with mock.patch.object(runner.Path, "home", return_value=home), \
+                    mock.patch.object(runner, "DARWIN_REQUIRED", False), \
+                    mock.patch.dict(os.environ, {"HOME": tmp}), \
+                    mock.patch.object(runner, "install_or_uninstall", return_value=0) as install, \
+                    mock.patch.object(runner, "run", return_value=(1, "")):
+                self.assertEqual(runner.main(["--manifest", os.fspath(man), "--member", "m", "--dedicated",
+                                              "nightly-only-1", "--apply", "--skip-launchctl"]), 0)
+            install.assert_called_once()
+
+    def test_a_recorded_registration_without_its_directory_is_not_retired(self):
+        plan = {"actions": [{"kind": "deregister", "state": "kept", "registered": True, "scope": "manaflow-ai"}]}
+        with mock.patch.object(fleet, "run", return_value=(0, json.dumps(plan), "")), \
+                mock.patch.object(fleet, "mint") as mint:
+            got = fleet.retire_instance("m", 6)
+        mint.assert_not_called()
+        self.assertIsNone(got["exit"])
+        self.assertIn("records a registration", got["state"])
 
 
 class NoEmDashTest(unittest.TestCase):

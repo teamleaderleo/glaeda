@@ -633,6 +633,10 @@ def registered_scope(member: str, instance: int, receipt_only: bool = False) -> 
     if not acts and receipt_only:  # retiring: no deregister plan at all is unknown state, never "unregistered"
         return None, f"no deregistration plan for instance {instance} ({_failed_note(out, err, code)})"
     act = acts[0] if acts else {"state": "kept"}
+    if act.get("state") == "kept" and act.get("registered") and receipt_only:
+        # retiring: a recorded registration with no runner directory to deregister from is unknown state on GitHub
+        return None, (f"instance {instance}'s receipt records a registration ({act.get('scope') or '?'}) but its runner "
+                      "directory is gone: delete that runner on GitHub by hand, then remove the receipt")
     if act.get("state") == "kept":
         return "", None
     if act.get("state") == "remove" and isinstance(act.get("scope"), str) and act["scope"]:
