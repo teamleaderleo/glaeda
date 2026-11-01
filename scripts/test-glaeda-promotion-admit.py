@@ -762,6 +762,35 @@ class PromotionTest(unittest.TestCase):
             self.assertIn("recovered", admit.recover(lease, hook))
         self.assertFalse(lease.runner_dir.exists())
 
+    def test_recovery_claiming_holder_releases_after_supervisor_crash(self) -> None:
+        """The holder exists before claiming becomes starting; no listener can own it in that interval."""
+        lease = admit.Lease(self.state_root, self.lease_id)
+        lease.dir.mkdir(parents=True)
+        (lease.dir / "state.json").write_text(json.dumps({"phase": "claiming"}))
+        hook = load("glaeda_cmux_runner_hook_claiming_recovery", HOOK)
+        supervisor = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"],
+                                      stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                      stderr=subprocess.DEVNULL)
+        try:
+            owner = admit.promotion_claim_owner(hook, lease, hook.JobOwner.of(supervisor.pid))
+            fds = []
+            for unit in range(UNITS):
+                fd = os.open(self.capacity / f"unit-{unit}", os.O_RDONLY | os.O_CREAT, 0o600)
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fds.append(fd)
+            state_dir = self.home / ".local/state/glaeda/cmux-runner"
+            held, note = hook.hold(fds, owner, state_dir, keep_while=lease.dir)
+            self.assertTrue(held, note)
+            self.assertEqual(self.units_held(), [True] * UNITS)
+            supervisor.kill()
+            supervisor.wait(timeout=5)
+            self.wait_for(lambda: not any(self.units_held()), timeout=8,
+                          why="claiming holder follows its supervisor out before a listener starts")
+        finally:
+            if supervisor.poll() is None:
+                supervisor.kill()
+            supervisor.wait(timeout=5)
+
     def test_recovery_rechecks_assignment_when_supervisor_dies_before_marker(self) -> None:
         self.ready()
         os.kill(self.supervisor_pid(), 9)

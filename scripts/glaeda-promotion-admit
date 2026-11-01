@@ -531,7 +531,7 @@ def promotion_claim_owner(hook: Any, lease: Lease, owner: Any) -> Any:
                 return False
             try:
                 state = json.loads((lease.dir / "state.json").read_text())
-                if not state or state.get("phase") not in ("starting", "ready", *TERMINAL):
+                if not state or state.get("phase") not in ("claiming", "starting", "ready", *TERMINAL):
                     return False
                 group = listener_group(lease.runner_dir, state.get("listener_pid"), state.get("listener_identity"))
             except (OSError, ValueError, AttributeError):
