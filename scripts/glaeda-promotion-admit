@@ -498,8 +498,8 @@ def recorded_supervisor(lease_dir: Path) -> int | None:
 
 
 def listener_group(runner_dir: Path, pgid: Any, ident: Any) -> list[int] | None:
-    """A dead supervisor's listener: its group while the leader's start token matches, otherwise remaining
-    members running the lease runner's tree. None when ps cannot tell; [] only when nothing is left."""
+    """A dead supervisor's listener: its group while the leader's start token matches, otherwise a group with
+    remaining members running the lease runner's tree. Unidentified survivors are unknown, not absence."""
     if not isinstance(pgid, int) or pgid <= 1:
         return []
     rows = ps_table()
@@ -513,7 +513,10 @@ def listener_group(runner_dir: Path, pgid: Any, ident: Any) -> list[int] | None:
         if current != ident:
             return []  # the recorded group leader's PID has been reused
     leader = bool(ident) and current == ident
-    return sorted({pid for pid, group, command in rows if group == pgid and (leader or tree in command)})
+    members = [(pid, command) for pid, group, command in rows if group == pgid]
+    if members and not leader and not any(tree in command for _, command in members):
+        return None
+    return sorted({pid for pid, _ in members})
 
 
 def promotion_claim_owner(hook: Any, lease: Lease, owner: Any) -> Any:
@@ -528,6 +531,8 @@ def promotion_claim_owner(hook: Any, lease: Lease, owner: Any) -> Any:
                 return False
             try:
                 state = json.loads((lease.dir / "state.json").read_text())
+                if not state or state.get("phase") not in ("starting", "ready", *TERMINAL):
+                    return False
                 group = listener_group(lease.runner_dir, state.get("listener_pid"), state.get("listener_identity"))
             except (OSError, ValueError, AttributeError):
                 return False  # unknown lease state must not release a possibly active claim
@@ -543,6 +548,8 @@ def recover(lease: Lease, hook: Any) -> str:
         if supervisor_alive(lease.dir):
             return "its supervisor lives"
         state = lease.state()
+        if not state:
+            return "its lease state is unknown; keeping the listener and claim"
         if state.get("phase") in TERMINAL:
             return f"already {state.get('phase')}"
         if hook.promotion_adopted_alive(lease.dir):
@@ -552,12 +559,14 @@ def recover(lease: Lease, hook: Any) -> str:
             return "its listener process state is unknown; keeping the listener and claim"
         if group:
             if isinstance(state.get("assigned"), dict):
+                # A previous recovery may have died after marking assignment while the group was frozen.
+                with contextlib.suppress(ProcessLookupError):
+                    os.killpg(state["listener_pid"], signal.SIGCONT)
                 return "its listener was assigned; keeping the listener and claim until it exits"
-            frozen = list(group)
             stop_allowed = False
             try:
-                for pid in frozen:
-                    os.kill(pid, signal.SIGSTOP)
+                # Freeze the whole verified group, including a child forked since ps_table().
+                os.killpg(state["listener_pid"], signal.SIGSTOP)
                 # Same frozen proof as normal withdrawal; a crash can precede the sticky marker write.
                 probe = object.__new__(Supervisor)
                 probe.hook, probe.lease = hook, lease
@@ -574,22 +583,21 @@ def recover(lease: Lease, hook: Any) -> str:
                 # Keep proven-unassigned listeners frozen through termination below, but never leave
                 # a retained listener frozen after an unreadable proof, failed marker write or signal.
                 if not stop_allowed:
-                    for pid in frozen:
-                        with contextlib.suppress(OSError):
-                            os.kill(pid, signal.SIGCONT)
+                    with contextlib.suppress(OSError):
+                        os.killpg(state["listener_pid"], signal.SIGCONT)
         for signum in (signal.SIGTERM, signal.SIGCONT):
-            for pid in group:
+            if group:
                 with contextlib.suppress(OSError):
-                    os.kill(pid, signum)
+                    os.killpg(state["listener_pid"], signum)
         deadline = time.monotonic() + STOP_WAIT_S
         while group and time.monotonic() < deadline:
             time.sleep(0.2)
             group = listener_group(lease.runner_dir, state.get("listener_pid"), state.get("listener_identity"))
             if group is None:
                 return "listener exit is unknown; keeping its runner tree and claim"
-        for pid in group:
+        if group:
             with contextlib.suppress(OSError):
-                os.kill(pid, signal.SIGKILL)
+                os.killpg(state["listener_pid"], signal.SIGKILL)
         if group:
             group = listener_group(lease.runner_dir, state.get("listener_pid"), state.get("listener_identity"))
             if group is None or group:

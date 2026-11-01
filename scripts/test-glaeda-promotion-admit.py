@@ -19,6 +19,7 @@ import importlib.util
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -743,6 +744,8 @@ class PromotionTest(unittest.TestCase):
         self.assertEqual(self.units_held(), [True] * UNITS, "claim survives the pre-adoption supervisor crash")
         hook = load("glaeda_cmux_runner_hook_assigned_recovery", HOOK)
         lease = admit.Lease(self.state_root, self.lease_id)
+        # A previous recovery could crash after persisting assigned but before its finally resumes the group.
+        os.killpg(self.state()["listener_pid"], signal.SIGSTOP)
         with mock.patch.dict(os.environ, self.env):
             note = admit.recover(lease, hook)
         self.assertIn("assigned", note)
@@ -793,6 +796,14 @@ class PromotionTest(unittest.TestCase):
             self.assertIn("unknown", admit.recover(lease, hook))
             owner = admit.promotion_claim_owner(hook, lease, hook.JobOwner(999999999, "gone"))
             self.assertFalse(owner.gone(), "an unreadable process table is not proof to free the mini")
+        state_path = lease.dir / "state.json"
+        saved_state = state_path.read_text()
+        try:
+            state_path.write_text("{")
+            self.assertIn("unknown", admit.recover(lease, hook))
+            self.assertFalse(owner.gone(), "unreadable lease state keeps the claim too")
+        finally:
+            state_path.write_text(saved_state)
 
     def test_recovery_process_identity_rejects_reused_pid_and_keeps_unknown(self) -> None:
         runner = self.lease_dir() / "runner"
@@ -804,6 +815,11 @@ class PromotionTest(unittest.TestCase):
                 self.assertEqual(admit.listener_group(runner, 1234, "proc:old"), [])
             with mock.patch.object(admit, "process_identity", return_value=None):
                 self.assertIsNone(admit.listener_group(runner, 1234, "proc:old"))
+        with mock.patch.object(admit, "process_identity", return_value=None):
+            with mock.patch.object(admit, "ps_table", return_value=[(1235, 1234, "./bin/Runner.Listener")]):
+                self.assertIsNone(admit.listener_group(runner, 1234, "proc:old"))
+            with mock.patch.object(admit, "ps_table", return_value=[]):
+                self.assertEqual(admit.listener_group(runner, 1234, "proc:old"), [])
 
     def test_recovery_never_releases_before_exit_is_observed(self) -> None:
         lease = admit.Lease(self.state_root, self.lease_id)
@@ -817,7 +833,8 @@ class PromotionTest(unittest.TestCase):
         for observed in ([1234], None):
             with mock.patch.object(admit, "listener_group", side_effect=[[1234], observed]), \
                     mock.patch.object(admit.Supervisor, "assignment", return_value=("unassigned", "test")), \
-                    mock.patch.object(admit.os, "kill"), mock.patch.object(admit, "STOP_WAIT_S", 0):
+                    mock.patch.object(admit.os, "kill"), mock.patch.object(admit.os, "killpg"), \
+                    mock.patch.object(admit, "STOP_WAIT_S", 0):
                 self.assertIn("not yet proven", admit.recover(lease, hook))
             hook.release_holder.assert_not_called()
             hook.promotion_write_state.assert_not_called()
