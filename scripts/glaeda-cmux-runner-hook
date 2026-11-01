@@ -140,7 +140,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable, NamedTuple
 
-DISK_TIMEOUT_S = 120  # a pass a hook or the gate waits on or reaps
+DISK_TIMEOUT_S = 120  # a synchronous hook pass
 # job-completed's detached pass, which nothing waits on: a whole pass took 192-685 s on cmux14 under the floor, so at
 # DISK_TIMEOUT_S every one (a pass per job) was killed mid-apply while holding evict.lock, and the LaunchAgent's pass,
 # which has no bound, skipped as busy (274 of 277 passes on 2026-10-26, none finished for over an hour)
@@ -6358,13 +6358,18 @@ class Gate:
         self.evicting = (proc, now, before)
 
     def reap_eviction(self, path: str, floor: float) -> None:
-        """Log a finished eviction with the space it freed; kill one running past DISK_TIMEOUT_S."""
+        """Reap a background pass within the background cleanup budget.
+
+        Like job-completed's pass, this runs without blocking a caller. Cutting
+        it at the synchronous hook's 120 s repeatedly interrupted pressure
+        passes already measured to take 192-685 s, before cleanup could finish.
+        """
         if self.evicting is None:
             return
         proc, started, before = self.evicting
         code = proc.poll()
         if code is None:
-            if time.monotonic() - started < DISK_TIMEOUT_S:
+            if time.monotonic() - started < BACKGROUND_DISK_TIMEOUT_S:
                 return
             with contextlib.suppress(OSError):
                 proc.kill()

@@ -8803,6 +8803,10 @@ class GateTest(unittest.TestCase):
             self.assertEqual(len(procs), 2, "retried every GATE_DISK_EVICT_EVERY_S")
             clock["t"] += hook.DISK_TIMEOUT_S
             self.assertIsNotNone(gate.low_disk())
+            procs[1].kill.assert_not_called()
+            self.assertEqual(len(procs), 2, "a slow pass keeps running alone past the synchronous timeout")
+            clock["t"] += hook.BACKGROUND_DISK_TIMEOUT_S - hook.DISK_TIMEOUT_S
+            gate.reap_eviction(os.path.dirname(os.fspath(self.lock)), 100)
             procs[1].kill.assert_called_once()
             self.assertEqual(logs[-1], "under the 100 GiB disk floor: glaeda-disk timed out, freed 0.0 GiB")
             self.assertIsNone(gate.evicting)
