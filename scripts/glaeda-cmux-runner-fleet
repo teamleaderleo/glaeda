@@ -67,12 +67,14 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import errno
 import functools
 import importlib.machinery
 import importlib.util
 import json
 import os
 import re
+import resource
 import subprocess
 import sys
 import tempfile
@@ -121,15 +123,63 @@ def load_runner() -> Any:
     return module
 
 
+# Members and their instances run at once, so a big rollout would start hundreds of ssh and scp children together,
+# each holding pipes. One semaphore bounds the children across the whole run, sized from the open-file limit, so an
+# operator Mac with a low limit does not fail launches with EMFILE (2026-11-01: "[Errno 24] Too many open files").
+MAX_PROCS_ENV = "GLAEDA_FLEET_MAX_PROCS"
+MAX_PROCS_RANGE = (4, 128)
+NOFILE_TARGET = 10240  # macOS refuses a soft limit above OPEN_MAX even when the hard limit is unlimited
+EMFILE_BACKOFF_S = 2.0
+_PROCS: threading.BoundedSemaphore | None = None
+
+
+def raise_nofile() -> int:
+    """Raise the soft open-file limit toward the hard one; return the soft limit in force."""
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    want = NOFILE_TARGET if hard == resource.RLIM_INFINITY else min(hard, NOFILE_TARGET)
+    if soft != resource.RLIM_INFINITY and soft < want:
+        try:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (want, hard))
+            soft = want
+        except (OSError, ValueError):
+            pass
+    return NOFILE_TARGET if soft == resource.RLIM_INFINITY else soft
+
+
+def max_procs(nofile: int, override: int | None = None) -> int:
+    """Children at once: an explicit override, else an eighth of the open-file limit, clamped."""
+    if override is not None:
+        return max(1, override)
+    low, high = MAX_PROCS_RANGE
+    return max(low, min(high, nofile // 8))
+
+
+def set_max_procs(limit: int) -> None:
+    global _PROCS
+    _PROCS = threading.BoundedSemaphore(max(1, limit))
+
+
+def _launch(argv: list[str], timeout: float, stdin: str | None) -> subprocess.CompletedProcess:
+    if _PROCS is None:
+        set_max_procs(max_procs(raise_nofile()))
+    with _PROCS:  # type: ignore[union-attr]
+        return subprocess.run(argv, input=stdin if stdin is not None else "", capture_output=True, text=True,
+                              timeout=timeout, check=False)
+
+
 def run(argv: list[str], timeout: float, stdin: str | None = None) -> tuple[int, str, str]:
-    try:
-        out = subprocess.run(argv, input=stdin if stdin is not None else "", capture_output=True, text=True,
-                             timeout=timeout, check=False)
-    except subprocess.TimeoutExpired:
-        return 124, "", f"timed out after {timeout:g}s"
-    except OSError as error:
-        return 127, "", str(error)
-    return out.returncode, out.stdout, out.stderr
+    for attempt in (0, 1):
+        try:
+            out = _launch(argv, timeout, stdin)
+        except subprocess.TimeoutExpired:
+            return 124, "", f"timed out after {timeout:g}s"
+        except OSError as error:
+            if attempt == 0 and error.errno in (errno.EMFILE, errno.ENFILE):
+                time.sleep(EMFILE_BACKOFF_S)  # the launch never started; another child's pipes free up meanwhile
+                continue
+            return 127, "", str(error)
+        return out.returncode, out.stdout, out.stderr
+    raise AssertionError("unreachable")
 
 
 def members(manifest: dict[str, Any], labels: Any, only: list[str] | None,
@@ -758,8 +808,21 @@ def main(argv: list[str] | None = None) -> int:
                    help="deploy although HEAD is not origin/main or a member's stamp is not an ancestor of HEAD; "
                         "the reason is printed and recorded in the stamp")
     p.add_argument("--jobs", type=int, default=16, help="members at once")
+    p.add_argument("--max-procs", type=int, default=None,
+                   help=f"ssh/scp/gh children at once across the run (default: ${MAX_PROCS_ENV}, else the open-file "
+                        f"limit / 8, clamped to {MAX_PROCS_RANGE[0]}-{MAX_PROCS_RANGE[1]})")
     p.add_argument("--output", choices=("human", "json"), default="human")
     args = p.parse_args(argv)
+    if args.max_procs is None and os.environ.get(MAX_PROCS_ENV, "").strip():
+        try:
+            args.max_procs = int(os.environ[MAX_PROCS_ENV])
+        except ValueError:
+            print(f"glaeda-cmux-runner-fleet: ${MAX_PROCS_ENV} must be a whole number", file=sys.stderr)
+            return 2
+    if args.max_procs is not None and args.max_procs < 1:
+        print("glaeda-cmux-runner-fleet: --max-procs must be at least 1", file=sys.stderr)
+        return 2
+    set_max_procs(max_procs(raise_nofile(), args.max_procs))
     args.scope_flags = bool(args.org or args.repo)  # else each member's scope comes from the manifest (member_scope)
     try:
         manifest = json.loads(args.manifest.expanduser().read_text())

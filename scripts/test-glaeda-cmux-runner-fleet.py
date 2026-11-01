@@ -666,5 +666,69 @@ class FleetTest(unittest.TestCase):
         self.assert_nothing_changed()
 
 
+def load_fleet_module():
+    loader = importlib.machinery.SourceFileLoader("fleet_procs_under_test", os.fspath(TOOL))
+    spec = importlib.util.spec_from_loader("fleet_procs_under_test", loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+class ProcessBoundTest(unittest.TestCase):
+    """Every member and instance runs at once, but the children they launch are bounded across the run."""
+
+    def test_children_at_once_never_exceed_the_bound(self) -> None:
+        import threading
+        fleet = load_fleet_module()
+        fleet.set_max_procs(3)
+        lock, live, peak, calls = threading.Lock(), [0], [0], [0]
+
+        def fake_run(argv, **kwargs):
+            with lock:
+                live[0] += 1
+                calls[0] += 1
+                peak[0] = max(peak[0], live[0])
+            time.sleep(0.02)
+            with lock:
+                live[0] -= 1
+            return subprocess.CompletedProcess(argv, 0, "ok", "")
+
+        with mock.patch.object(fleet.subprocess, "run", side_effect=fake_run):
+            threads = [threading.Thread(target=fleet.run, args=(["ssh", f"m{i}"], 5)) for i in range(40)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+        self.assertEqual(calls[0], 40)
+        self.assertEqual(peak[0], 3, "the bound holds and is used")
+
+    def test_a_launch_that_hits_emfile_is_retried_once(self) -> None:
+        import errno
+        fleet = load_fleet_module()
+        fleet.set_max_procs(2)
+        emfile = OSError(errno.EMFILE, "Too many open files")
+        ok = subprocess.CompletedProcess(["scp"], 0, "done", "")
+        with mock.patch.object(fleet, "EMFILE_BACKOFF_S", 0), \
+                mock.patch.object(fleet.subprocess, "run", side_effect=[emfile, ok]) as launched:
+            self.assertEqual(fleet.run(["scp", "x"], 5), (0, "done", ""))
+            self.assertEqual(launched.call_count, 2)
+        with mock.patch.object(fleet, "EMFILE_BACKOFF_S", 0), \
+                mock.patch.object(fleet.subprocess, "run", side_effect=[emfile, emfile, ok]) as launched:
+            code, _, err = fleet.run(["scp", "x"], 5)
+            self.assertEqual((code, launched.call_count), (127, 2), "one retry, then a failure as before")
+            self.assertIn("Too many open files", err)
+        with mock.patch.object(fleet.subprocess, "run", side_effect=FileNotFoundError(errno.ENOENT, "no ssh")) as launched:
+            self.assertEqual(fleet.run(["ssh"], 5)[0], 127)
+            self.assertEqual(launched.call_count, 1, "other launch errors are not retried")
+
+    def test_the_bound_follows_the_open_file_limit_and_the_override(self) -> None:
+        fleet = load_fleet_module()
+        self.assertEqual(fleet.max_procs(256), 32)
+        self.assertEqual(fleet.max_procs(16), 4)
+        self.assertEqual(fleet.max_procs(1_000_000), 128)
+        self.assertEqual(fleet.max_procs(256, 7), 7)
+        self.assertGreaterEqual(fleet.raise_nofile(), 1)
+
+
 if __name__ == "__main__":
     unittest.main()
