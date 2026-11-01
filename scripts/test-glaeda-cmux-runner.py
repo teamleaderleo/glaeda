@@ -2477,7 +2477,8 @@ class HookTest(unittest.TestCase):
             self.assertIsNotNone(fd)
             self.addCleanup(os.close, fd)
         try:
-            for job, runner in (("verify-signed-nightly", "n1"), ("verify-final-dmg-nightly", "n2")):
+            for job, runner in (("verify-signed-nightly", "n1"), ("verify-final-dmg-nightly", "n2"),
+                                ("decide", "n3")):
                 with self.subTest(job=job):
                     admitted = self.nightly_job("refs/heads/nightly-next", runner, job)
                     self.assertEqual(admitted.returncode, 0, admitted.stdout + admitted.stderr)
@@ -2485,7 +2486,7 @@ class HookTest(unittest.TestCase):
                     self.assertIn(f"holding 2/14 units for {job} (light", admitted.stdout)
                     self.finish(runner)
         finally:
-            for runner in ("n1", "n2"):
+            for runner in ("n1", "n2", "n3"):
                 self.finish(runner)
 
     def dev_daily_job(self, runner: str, job: str = "verify", *extra: str) -> subprocess.CompletedProcess:
