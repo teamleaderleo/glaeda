@@ -159,12 +159,21 @@ class DedicatedOnlyTest(unittest.TestCase):
         self.assertTrue(summary["dedicatedOnly"])
         self.assertEqual(summary["pools"], [])  # in no pool: declared_pools and capacity totals leave it out
         self.assertEqual(labels.declared_pools(manifest({"dedicatedOnly": True, "dedicated": [NIGHTLY_ONLY]})), {})
-        trusted = manifest({"dedicatedOnly": True, "dedicated": [NIGHTLY_ONLY], "trustedRef": "refs/heads/main",
-                            "trustedRepo": REPO})
-        trusted["defaults"]["runner"] = {"classes": {"std": {"gatewayRunners": 1}}}  # the pools' default
-        summary, why = labels.member_labels(trusted, "m", lambda app: True)
+        pooled = manifest({"dedicatedOnly": True, "dedicated": [NIGHTLY_ONLY]})
+        pooled["defaults"]["runner"] = {"classes": {"std": {"gatewayRunners": 1}}}  # the pools' default
+        summary, why = labels.member_labels(pooled, "m", lambda app: True)
         self.assertIsNone(why)
         self.assertEqual(summary["gatewayRunners"], 0)
+        # a trusted-only pool is the only server of its trusted labels: never retired by dedicatedOnly
+        trusted = manifest({"dedicatedOnly": True, "dedicated": [NIGHTLY_ONLY], "trustedRef": "refs/heads/main",
+                            "trustedRepo": REPO})
+        summary, why = labels.member_labels(trusted, "m", lambda app: True)
+        self.assertIsNone(summary)
+        self.assertIn("trusted-only pool", why)
+        trusted["hosts"]["m"]["overrides"]["runner"].pop("dedicatedOnly")
+        summary, why = labels.member_labels(trusted, "m", lambda app: True)
+        self.assertIsNone(why)
+        self.assertTrue(summary["pools"])  # it keeps its trusted pool beside the dedicated runners
         summary, _ = labels.member_labels(manifest({}), "m", lambda app: True)
         self.assertFalse(summary["dedicatedOnly"])
         for bad in ({"dedicatedOnly": "yes", "dedicated": [NIGHTLY_ONLY]}, {"dedicatedOnly": True},

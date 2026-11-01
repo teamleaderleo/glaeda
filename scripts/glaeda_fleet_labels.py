@@ -273,6 +273,11 @@ def member_labels(manifest: Any, member: str, xcode_ok: Callable[[dict[str, Any]
         return None, f"{member} runner.dedicatedOnly must be boolean"
     if dedicated_only and not (isinstance(runner.get("dedicated"), list) and runner["dedicated"]):
         return None, f"{member} runner.dedicatedOnly needs at least one runner.dedicated entry"
+    if dedicated_only and trusted_ref is not None:
+        # a trusted-only member's pool is the only server of its trusted labels (a main seed, a trusted nightly
+        # runner): dedicatedOnly would retire it, so such a member keeps its pool beside its dedicated runners
+        return None, (f"{member} runner.dedicatedOnly cannot retire a trusted-only pool (runner.trustedRef): its "
+                      "runners serve the trusted labels; keep them beside the dedicated runners")
     if dedicated_only and (dev_compile or nightly_slot):
         return None, f"{member} runner.dedicatedOnly has no pool instances, so no devCompile or nightlySlot"
     pool_prefix = runner.get("poolPrefix", "") if isinstance(runner, dict) else ""
