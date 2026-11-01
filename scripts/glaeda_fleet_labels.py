@@ -289,7 +289,9 @@ def member_labels(manifest: Any, member: str, xcode_ok: Callable[[dict[str, Any]
     ready = [a for a in apps if re.fullmatch(VERSION_RE, str(a.get("version") or "")) and xcode_ok(a)]
     versions = [str(a["version"]) for a in ready]
     # Opportunistic members never carry a pool label, so they never receive a required job.
-    pools = [pool_label(klass, v, bool(trusted_ref), normal_pool_prefix) for v in versions] if availability == "dedicated" else []
+    # A dedicatedOnly member has no pool instance, so it is in no pool (declared_pools, capacity totals)
+    pools = ([pool_label(klass, v, bool(trusted_ref), normal_pool_prefix) for v in versions]
+             if availability == "dedicated" and not dedicated_only else [])
     dev_pools = ([pool_label(klass, v, False, DEV_COMPILE_POOL_PREFIX) for v in versions]
                  if dev_compile and availability == "dedicated" else [])
     nightly_pools = ([pool_label(klass, v, False, NIGHTLY_POOL_PREFIX) for v in versions]

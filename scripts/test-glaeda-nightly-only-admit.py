@@ -157,6 +157,8 @@ class DedicatedOnlyTest(unittest.TestCase):
                                             lambda app: True)
         self.assertIsNone(why)
         self.assertTrue(summary["dedicatedOnly"])
+        self.assertEqual(summary["pools"], [])  # in no pool: declared_pools and capacity totals leave it out
+        self.assertEqual(labels.declared_pools(manifest({"dedicatedOnly": True, "dedicated": [NIGHTLY_ONLY]})), {})
         trusted = manifest({"dedicatedOnly": True, "dedicated": [NIGHTLY_ONLY], "trustedRef": "refs/heads/main",
                             "trustedRepo": REPO})
         trusted["defaults"]["runner"] = {"classes": {"std": {"gatewayRunners": 1}}}  # the pools' default
@@ -194,10 +196,16 @@ class DedicatedOnlyTest(unittest.TestCase):
         self.assertIn("glaeda-nightly-only-admit", fleet.STAGED)
 
     def test_installed_pool_instances_lists_only_pool_receipts(self):
-        out = "receipt.json\ninstance-3/receipt.json\ninstance-12/receipt.json\n"
+        out = ("receipt receipt.json\nreceipt instance-3/receipt.json\nreceipt instance-12/receipt.json\n"
+               "dir actions-runner-glaeda\ndir actions-runner-glaeda-3\ndir actions-runner-glaeda-nightly-next\n")
         with mock.patch.object(fleet, "run", return_value=(0, out, "")) as run:
             self.assertEqual(fleet.installed_pool_instances("m"), ([0, 3, 12], None))
         self.assertIn("instance-*/receipt.json", run.call_args[0][0][-1])
+        with mock.patch.object(fleet, "run", return_value=(0, "receipt receipt.json\ndir actions-runner-glaeda\n"
+                                                              "dir actions-runner-glaeda-5\n", "")):
+            got, why = fleet.installed_pool_instances("m")
+        self.assertIsNone(got)
+        self.assertIn("no receipt (instances [5])", why)
         with mock.patch.object(fleet, "run", return_value=(255, "", "no route")):
             got, why = fleet.installed_pool_instances("m")
         self.assertIsNone(got)
@@ -239,6 +247,7 @@ class DedicatedOnlyApplyTest(unittest.TestCase):
     def test_the_receipt_listing_survives_an_unmatched_glob(self):
         for files in ([], ["receipt.json"], ["receipt.json", "instance-2/receipt.json"]):
             with self.subTest(files=files), tempfile.TemporaryDirectory() as home:
+                (Path(home) / "actions-runner-glaeda-nightly-next").mkdir()
                 state = Path(home) / ".local/state/glaeda/cmux-runner"
                 state.mkdir(parents=True)
                 for name in files:
@@ -248,7 +257,8 @@ class DedicatedOnlyApplyTest(unittest.TestCase):
                 got = subprocess.run(["/bin/bash", "-c", fleet.POOL_RECEIPTS], env={"HOME": home, "PATH": "/usr/bin:/bin"},
                                      capture_output=True, text=True, timeout=30, check=False)
                 self.assertEqual(got.returncode, 0, got.stderr)
-                self.assertEqual(got.stdout.split(), files)
+                self.assertEqual(got.stdout.splitlines(),
+                                 [f"receipt {f}" for f in files] + ["dir actions-runner-glaeda-nightly-next"])
 
     def test_an_unregistered_instance_is_retired_without_a_token(self):
         calls = []
@@ -264,6 +274,14 @@ class DedicatedOnlyApplyTest(unittest.TestCase):
         mint.assert_not_called()
         self.assertNotIn("--token-stdin", calls[-1][0])
         self.assertIsNone(calls[-1][1])
+
+    def test_a_retirement_with_no_deregistration_plan_fails_closed(self):
+        with mock.patch.object(fleet, "run", return_value=(0, json.dumps({"actions": [{"kind": "note"}]}), "")), \
+                mock.patch.object(fleet, "mint") as mint:
+            got = fleet.retire_instance("m", 1)
+        mint.assert_not_called()
+        self.assertIsNone(got["exit"])
+        self.assertIn("no deregistration plan", got["state"])
 
     def one_member(self, retired_exit):
         summary = {"class": "std", "runners": 4, "gatewayRunners": 0, "capacityUnits": 14, "dedicatedOnly": True}

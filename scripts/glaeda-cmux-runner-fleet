@@ -630,6 +630,8 @@ def registered_scope(member: str, instance: int, receipt_only: bool = False) -> 
         acts = [a for a in json.loads(out).get("actions", []) if isinstance(a, dict) and a.get("kind") == "deregister"]
     except (ValueError, AttributeError):
         return None, f"cannot read its registration: {_failed_note(out, err, code)}"
+    if not acts and receipt_only:  # retiring: no deregister plan at all is unknown state, never "unregistered"
+        return None, f"no deregistration plan for instance {instance} ({_failed_note(out, err, code)})"
     act = acts[0] if acts else {"state": "kept"}
     if act.get("state") == "kept":
         return "", None
@@ -649,21 +651,33 @@ def uninstall_instance(member: str, instance: int, repo: str) -> str | None:
     return None if code == 0 else f"uninstall failed ({_failed_note(out, err, code)})"
 
 
-# DEDICATED_ONLY (glaeda_fleet_labels): the pool instances' receipts on a member, instance 0's at the top
-# run by /bin/sh, never the login shell: zsh fails an unmatched glob ("no matches found") where sh keeps it literal
-POOL_RECEIPTS = ("/bin/sh -c 'cd ~/.local/state/glaeda/cmux-runner 2>/dev/null || exit 0; "
-                 "for f in receipt.json instance-*/receipt.json; do [ -f \"$f\" ] && echo \"$f\"; done; exit 0'")
-POOL_RECEIPT_RE = re.compile(r"(?:instance-(\d+)/)?receipt\.json")
+# DEDICATED_ONLY (glaeda_fleet_labels): the pool instances' receipts on a member (instance 0's at the top), and the
+# pool runner directories (~/actions-runner-glaeda, ~/actions-runner-glaeda-K), which glaeda-cmux-runner names after
+# the instance. Run by /bin/sh, never the login shell: zsh fails an unmatched glob ("no matches found").
+POOL_RECEIPTS = ("/bin/sh -c 'cd ~/.local/state/glaeda/cmux-runner 2>/dev/null && "
+                 "for f in receipt.json instance-*/receipt.json; do [ -f \"$f\" ] && echo \"receipt $f\"; done; "
+                 "cd ~ && for d in actions-runner-glaeda actions-runner-glaeda-*; do [ -d \"$d\" ] && echo \"dir $d\"; "
+                 "done; exit 0'")
+POOL_RECEIPT_RE = re.compile(r"receipt (?:instance-(\d+)/)?receipt\.json")
+POOL_DIR_RE = re.compile(r"dir actions-runner-glaeda(?:-(\d+))?")
 
 
 def installed_pool_instances(member: str) -> tuple[list[int] | None, str | None]:
-    """([instance numbers with a pool receipt], None) or (None, why it could not be read). Read-only. A dedicated
-    runner's receipt (instance-dedicated-NAME) is not a pool instance and never listed."""
+    """([instance numbers with a pool receipt], None) or (None, why it could not be read or is not safe). Read-only.
+    A dedicated runner (instance-dedicated-NAME, actions-runner-glaeda-NAME) is not a pool instance and never listed. A
+    pool runner directory with no receipt (an interrupted install) is unknown state: (None, why), which holds the
+    dedicated runners off until an operator removes it (fails closed)."""
     code, out, err = run(["ssh", *SSH_OPTIONS, member, POOL_RECEIPTS], CHECK_TIMEOUT_S)
     if code != 0:
         return None, f"cannot list its runner receipts (exit {code}: {(err or out).strip()[-160:]})"
-    found = [POOL_RECEIPT_RE.fullmatch(line.strip()) for line in out.splitlines() if line.strip()]
-    return sorted({int(m[1] or 0) for m in found if m}), None
+    lines = [line.strip() for line in out.splitlines() if line.strip()]
+    receipts = {int(m[1] or 0) for m in map(POOL_RECEIPT_RE.fullmatch, lines) if m}
+    dirs = {int(m[1] or 0) for m in map(POOL_DIR_RE.fullmatch, lines) if m}
+    orphans = sorted(dirs - receipts)
+    if orphans:
+        return None, (f"pool runner directories with no receipt (instances {orphans}): unknown state, remove them by "
+                      "hand while idle (deregister any .runner), then re-run")
+    return sorted(receipts), None
 
 
 def retire_instance(member: str, instance: int) -> dict[str, Any]:
