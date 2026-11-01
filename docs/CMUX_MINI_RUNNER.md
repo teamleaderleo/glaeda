@@ -946,6 +946,62 @@ To move a hand-made runner over: declare the entry with the old runner's labels 
 repos/OWNER/REPO/actions/runners/ID`), apply it so the glaeda runner is online beside the old one, then, while the old
 runner has no `Runner.Worker`, boot out and archive its LaunchAgents and remove its registration.
 
+### Dedicated-only members (`runner.dedicatedOnly`)
+
+`"runner": {"dedicatedOnly": true, "dedicated": [...]}` makes a member run only its dedicated runners: no pool
+instance, no devCompile, nightlySlot or gateway runner. `glaeda-cmux-runner-fleet --apply` stages the scripts, then
+deregisters and removes every pool instance it finds on the member (by each instance's receipt, with a remove token for
+the receipt's own scope), then applies the dedicated entries. An instance with a job is never stopped: its uninstall
+fails ("the runner has a job") and changes nothing, so drain the mini first (`cmux-ci drain --hosts M`) and re-run.
+`glaeda-cmux-runner --apply` refuses a pool instance on such a member; `--uninstall` still removes one.
+
+On the mini, under the runner lock every `--apply` holds:
+- A dedicated `--apply` refuses while any pool receipt or pool runner directory is there. It enumerates them with
+  `os.listdir` (the fleet's listing with `ls`), so an unreadable directory refuses too.
+- Otherwise the dedicated `--apply` writes `~/.local/state/glaeda/cmux-runner/dedicated-only.json`. From then on,
+  every pool `--apply` on that Mac refuses, whatever manifest it read.
+- `glaeda-cmux-runner --clear-dedicated-only --apply` removes the marker deliberately and installs nothing.
+
+A dedicated command's first word may be `{python}`: the hook's own interpreter (`hook_python`), so a command that
+loads the hook runs on the Python the hook runs on.
+
+### The nightly-only runners (`glaeda-nightly-only-m4pro`)
+
+Leo, 2026-11-01: "ok just dedicate at least one m4 pro mini just completely to the nightly situation idgaf anymore",
+then "i thought 7 and 15 were both capable of being dedicated". cmux7s-mac-mini and cmux15 declare N dedicated
+entries each (cmux7s-mac-mini also `dedicatedOnly`; cmux15 keeps its trusted-only pool, which `dedicatedOnly` may
+never retire), sharing the label `glaeda-nightly-only-m4pro` plus one `glaeda-runner-<member>-<name>` label per
+runner, with:
+
+```json
+"admit": ["{python}", "~/glaeda-runner/scripts/glaeda-nightly-only-admit",
+          "--hook", "{runnerDir}/glaeda-hooks/glaeda-cmux-runner-hook"]
+```
+
+`scripts/glaeda-nightly-only-admit` loads the runner's own hook and reuses its `job_tier`, `dev_compile_refusal` and
+`job_class`. It admits only nightly.yml of manaflow-ai/cmux on nightly-next or main from that ref's own nightly.yml
+(the reusable workflows it calls run under its workflow ref, so they come with it), and cmux-next.yml's
+release-compile on a feat-cmux-next push (nightly-next's promotion gate). It refuses main's DEV daily, the
+nightly-next canary and launch smoke, every PR, DEV and side job, and every signing job (the exclusive class): a
+signing job needs the whole mini through the capacity ledger, which a dedicated runner never holds, so it keeps its
+existing route and claim. The hook's bytes do not change, so the signing-hook trust list needs no new pin. A hook it
+cannot load refuses. glaeda-update ships the script with the runner files (`RUNNER_FILES`) into
+`~/glaeda-runner/scripts`, so a merged fix to it reaches the minis by OTA.
+
+### Trusted dedicated entries (a second host for a trusted pool)
+
+A runner.dedicated entry may declare `trustedRef` and `trustedRepo` (together; `trustedRepo` is the entry's own
+`repo`, never an org). glaeda-cmux-runner then gives the job-started hook `--trusted-ref`/`--trusted-repo` for that
+runner even on a member that is not trusted-only, so the hook takes only that repository's push and schedule jobs on
+that branch, never PR code. Such an entry, and only such an entry, may carry a trusted pool label
+(`glaeda-trusted-...`) when every member that declares that pool is trusted-only on the same ref and repository; any
+other pool label stays refused. Its admit runs `glaeda-nightly-only-admit --trusted-ref REF --trusted-repo REPO`,
+which admits what the hook's `trusted_refusal` admits, and of that only nightly.yml and the trusted seed
+(seed-derived-data.yml), so a host dedicated to the nightly runs no other main push or schedule job there; it still
+refuses a signing job. This is how a second mini
+serves main's trusted seed pool and the trusted nightly app build's runner label without a trusted pool of its own.
+Like every dedicated runner it takes no capacity units, so its jobs run beside the host's other dedicated runners.
+
 ## 2e2. Other repositories on the same minis (org scope)
 
 Registered to `manaflow-ai/cmux`, the runners serve only cmux. To let another repository of the org use

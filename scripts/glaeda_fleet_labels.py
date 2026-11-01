@@ -266,6 +266,20 @@ def member_labels(manifest: Any, member: str, xcode_ok: Callable[[dict[str, Any]
         return None, f"{member} runner.nightlySlot must be boolean"
     if nightly_slot and (availability != "dedicated" or trusted_ref is not None):
         return None, f"{member} runner.nightlySlot needs a dedicated runner without trustedRef"
+    # DEDICATED_ONLY: the member runs only its runner.dedicated runners; glaeda-cmux-runner-fleet installs no pool
+    # instance there and deregisters any it finds (each only while idle), and glaeda-cmux-runner refuses to install one.
+    dedicated_only = runner.get("dedicatedOnly", False) if isinstance(runner, dict) else False
+    if not isinstance(dedicated_only, bool):
+        return None, f"{member} runner.dedicatedOnly must be boolean"
+    if dedicated_only and not (isinstance(runner.get("dedicated"), list) and runner["dedicated"]):
+        return None, f"{member} runner.dedicatedOnly needs at least one runner.dedicated entry"
+    if dedicated_only and trusted_ref is not None:
+        # a trusted-only member's pool is the only server of its trusted labels (a main seed, a trusted nightly
+        # runner): dedicatedOnly would retire it, so such a member keeps its pool beside its dedicated runners
+        return None, (f"{member} runner.dedicatedOnly cannot retire a trusted-only pool (runner.trustedRef): its "
+                      "runners serve the trusted labels; keep them beside the dedicated runners")
+    if dedicated_only and (dev_compile or nightly_slot):
+        return None, f"{member} runner.dedicatedOnly has no pool instances, so no devCompile or nightlySlot"
     pool_prefix = runner.get("poolPrefix", "") if isinstance(runner, dict) else ""
     prefix_ok = isinstance(pool_prefix, str) and (pool_prefix == "" or (
         re.fullmatch(POOL_PREFIX_RE, pool_prefix) and
@@ -280,7 +294,9 @@ def member_labels(manifest: Any, member: str, xcode_ok: Callable[[dict[str, Any]
     ready = [a for a in apps if re.fullmatch(VERSION_RE, str(a.get("version") or "")) and xcode_ok(a)]
     versions = [str(a["version"]) for a in ready]
     # Opportunistic members never carry a pool label, so they never receive a required job.
-    pools = [pool_label(klass, v, bool(trusted_ref), normal_pool_prefix) for v in versions] if availability == "dedicated" else []
+    # A dedicatedOnly member has no pool instance, so it is in no pool (declared_pools, capacity totals)
+    pools = ([pool_label(klass, v, bool(trusted_ref), normal_pool_prefix) for v in versions]
+             if availability == "dedicated" and not dedicated_only else [])
     dev_pools = ([pool_label(klass, v, False, DEV_COMPILE_POOL_PREFIX) for v in versions]
                  if dev_compile and availability == "dedicated" else [])
     nightly_pools = ([pool_label(klass, v, False, NIGHTLY_POOL_PREFIX) for v in versions]
@@ -316,6 +332,8 @@ def member_labels(manifest: Any, member: str, xcode_ok: Callable[[dict[str, Any]
         gateway = declared.get("gatewayRunners", 0)
     else:
         compile_slots, roots, gui, fast, gateway = 1, 1, 0, 0, 0
+    if dedicated_only:
+        gateway = 0  # DEDICATED_ONLY: no pool instance, so no gateway runner after them either
     if not (isinstance(runners, int) and not isinstance(runners, bool) and 1 <= runners <= MAX_RUNNERS):
         return None, f"runner.classes.{klass}.runners must be 1 to {MAX_RUNNERS}"
     # every mini holds at least one compile slot, so it needs a compile's cores; glaeda-route checks the same
@@ -351,6 +369,7 @@ def member_labels(manifest: Any, member: str, xcode_ok: Callable[[dict[str, Any]
     return {"member": member, "class": klass, "availability": availability, "roles": roles,
             "labels": list(dict.fromkeys(labels)), "pools": list(dict.fromkeys(pools)),
             "devPools": list(dict.fromkeys(dev_pools)), "nightlyPools": list(dict.fromkeys(nightly_pools)),
+            "dedicatedOnly": dedicated_only,
             "nightlySlot": nightly_slot, "nightlyInstance": roots + int(dev_compile) if nightly_slot else None,
             "minFreeGib": floor if isinstance(floor, (int, float)) and floor > 0 else None,
             "hardware": hardware, "xcodeApps": [str(a.get("path")) for a in ready], "iosSim": ios_sim,
@@ -395,6 +414,9 @@ DEDICATED_POOL_SUFFIX_RE = r"(?:^|-)glaeda(?:-\d+)?$"  # <member>-glaeda-<name> 
 RUNNER_LABEL_RE = r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}"
 ENV_NAME_RE = r"[A-Z_][A-Z0-9_]{0,63}"
 DEFAULT_LABELS = ("self-hosted", "macos", "arm64", MINI_LABEL)
+# A dedicated command's first word may be this: the runner's own hook interpreter (glaeda-cmux-runner hook_python), so
+# a command that loads the hook runs on the Python the hook runs on, never a pinned path.
+PYTHON_WORD = "{python}"
 
 
 # Where a member's pool instances register (glaeda-cmux-runner-fleet, when no --org/--repo is passed): the manifest's
@@ -458,7 +480,7 @@ def dedicated_runners(manifest: Any, member: str) -> tuple[list[dict[str, Any]],
         if not isinstance(entry, dict):
             return [], f"{where} is not an object"
         unknown = sorted(set(entry) - {"name", "repo", "org", "group", "labels", "admit", "watch", "env", "keep",
-                                       "minFreeGib", "note"})
+                                       "minFreeGib", "note", "trustedRef", "trustedRepo"})
         if unknown:
             return [], f"{where} has unknown keys: {', '.join(unknown)}"
         name, repo, org, group = entry.get("name"), entry.get("repo"), entry.get("org"), entry.get("group")
@@ -476,6 +498,18 @@ def dedicated_runners(manifest: Any, member: str) -> tuple[list[dict[str, Any]],
             return [], f"{where}.org must be an organization login"
         if group is not None and (org is None or not isinstance(group, str) or not group.strip()):
             return [], f"{where}.group goes with org"
+        # DEDICATED_TRUSTED: trustedRef and trustedRepo make the entry a trusted-only runner, like a trusted member's
+        # pool: the hook gets --trusted-ref/--trusted-repo, so it takes only that repository's push and schedule jobs
+        # on that branch. It registers at that repository (repo, never org) and may carry a trusted pool label whose
+        # every declaring member has the same trust, so a second host can serve a trusted pool without a pool there.
+        trusted_ref, trusted_repo = entry.get("trustedRef"), entry.get("trustedRepo")
+        if (trusted_ref is None) != (trusted_repo is None):
+            return [], f"{where}.trustedRef and {where}.trustedRepo go together"
+        if trusted_ref is not None and not (
+                isinstance(trusted_ref, str) and re.fullmatch(TRUSTED_REF_RE, trusted_ref)
+                and isinstance(trusted_repo, str) and re.fullmatch(REPO_RE, trusted_repo) and repo == trusted_repo):
+            return [], (f"{where}.trustedRef must be a branch ref (refs/heads/...) and trustedRepo owner/name, the "
+                        "entry's own repo (a trusted runner registers at that repository, never at an org)")
         labels = entry.get("labels")
         if not (isinstance(labels, list) and labels and all(isinstance(x, str) and re.fullmatch(RUNNER_LABEL_RE, x)
                                                             for x in labels)):
@@ -485,7 +519,8 @@ def dedicated_runners(manifest: Any, member: str) -> tuple[list[dict[str, Any]],
                         "runner takes only the jobs that name its own labels")
         if pools is None:
             pools = {label.lower() for label in declared_pools(manifest)}
-        shared = sorted(x for x in labels if x.lower() in pools)
+        shared = sorted(x for x in labels if x.lower() in pools and not (
+            trusted_ref is not None and trusted_pool_matches(manifest, x, trusted_ref, trusted_repo)))
         if shared:
             return [], (f"{where}.labels must leave out the manifest's pool labels ({', '.join(shared)}): a pool job "
                         "would land on the builder, outside pool capacity and reservations")
@@ -496,8 +531,9 @@ def dedicated_runners(manifest: Any, member: str) -> tuple[list[dict[str, Any]],
                 continue
             if not (isinstance(argv, list) and argv and all(isinstance(w, str) and w and "\n" not in w and "\0" not in w
                                                            for w in argv)
-                    and (argv[0].startswith("/") or argv[0].startswith("~/"))):
-                return [], f"{where}.{key} must be a command (a list of words, the first an absolute or ~/ path)"
+                    and (argv[0].startswith("/") or argv[0].startswith("~/") or argv[0] == PYTHON_WORD)):
+                return [], (f"{where}.{key} must be a command (a list of words, the first an absolute or ~/ path, "
+                            f"or {PYTHON_WORD})")
             commands[key] = list(argv)
         env = entry.get("env", {})
         if not (isinstance(env, dict) and all(isinstance(k, str) and re.fullmatch(ENV_NAME_RE, k) and isinstance(v, str)
@@ -518,5 +554,21 @@ def dedicated_runners(manifest: Any, member: str) -> tuple[list[dict[str, Any]],
             return [], f"{where}.minFreeGib must be a number of GiB above 0 and at most 10000"
         out.append({"name": name, "repo": repo, "org": org, "group": group, "labels": list(labels),
                     "admit": commands["admit"], "watch": commands.get("watch"), "env": dict(env),
-                    "keep": list(keep), "minFreeGib": None if floor is None else float(floor)})
+                    "keep": list(keep), "minFreeGib": None if floor is None else float(floor),
+                    "trustedRef": trusted_ref, "trustedRepo": trusted_repo})
     return out, None
+
+
+def trusted_pool_matches(manifest: Any, label: str, trusted_ref: str, trusted_repo: str) -> bool:
+    """Whether `label` is a trusted pool label (glaeda-trusted-...) and every member that declares it is trusted-only
+    on exactly trusted_ref of trusted_repo: only then may a trusted runner.dedicated entry carry it."""
+    if not label.lower().startswith("glaeda-trusted-"):
+        return False
+    members = declared_pools(manifest).get(label) or declared_pools(manifest).get(label.lower()) or []
+    if not members:
+        return False
+    for member in members:
+        summary, _ = member_labels(manifest, member, lambda app: True)
+        if not summary or summary.get("trustedRef") != trusted_ref or summary.get("trustedRepo") != trusted_repo:
+            return False
+    return True

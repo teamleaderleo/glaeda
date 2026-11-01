@@ -1687,6 +1687,9 @@ def borrow_candidates(manifest: dict[str, Any], observed: dict[str, Any], hosts:
         if summary.get("trustedRef"):
             excluded[name] = "trusted-only runner"
             continue
+        if summary.get("dedicatedOnly"):
+            excluded[name] = "dedicated-only member (runner.dedicatedOnly)"
+            continue
         floor = summary.get("minFreeGib")
         disk = (obs.get("disk") or {}).get("/System/Volumes/Data") or (obs.get("disk") or {}).get("/")
         if floor is not None and (not isinstance(disk, dict) or disk.get("free_gib", 0) < floor):

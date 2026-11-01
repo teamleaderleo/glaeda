@@ -737,11 +737,19 @@ def hook_wrappers(ctx: Context) -> dict[str, bytes]:
     dedicated = dedicated_of(ctx)
     if dedicated:  # glaeda's checks, then the builder's own admission (dedicated-admit.sh below)
         scope += f" --dedicated-admit {shlex.quote(os.fspath(ctx.hook_dir / DEDICATED_ADMIT))}"
+    trusted_entry = dedicated if (dedicated or {}).get("trustedRef") else None
+    if trusted_entry:
+        # A trusted runner.dedicated entry (glaeda_fleet_labels DEDICATED_TRUSTED) holds a trusted pool's labels:
+        # only jobs on its branch, never PR code. Independent of ctx.member, which a dedicated runner does not set.
+        scope += (f" --trusted-ref {shlex.quote(trusted_entry['trustedRef'])}"
+                  f" --trusted-repo {shlex.quote(trusted_entry['trustedRepo'])}")
     if ctx.member:  # a fleet member runs PR jobs only while it is an eligible node on its class toolchain
         scope += f" --require-eligible --fleet-class {shlex.quote(ctx.member['hardware'])}"
         if ctx.member.get("xcodeApps"):
             scope += f" --toolchain-xcode {shlex.quote(ctx.member['xcodeApps'][0])}"
-        if ctx.member.get("trustedRef"):  # this mini holds a secret: only jobs on that branch, never PR code
+        if trusted_entry:
+            pass  # its trust arguments are above; never a PR runner's setup
+        elif ctx.member.get("trustedRef"):  # this mini holds a secret: only jobs on that branch, never PR code
             scope += (f" --trusted-ref {shlex.quote(ctx.member['trustedRef'])}"
                       f" --trusted-repo {shlex.quote(ctx.member['trustedRepo'])}")
             if ctx.member.get("trustedNextNightly"):
@@ -1370,6 +1378,12 @@ def plan_uninstall(ctx: Context, receipt: dict[str, Any] | None) -> list[dict[st
         # config.sh finished after this command gave up on it: the directory is ours, so is its .runner
         actions.append({"kind": "deregister", "state": "remove", "name": local.get("agentName"),
                         "runnerId": local.get("agentId"), "note": "registered by an interrupted --apply"})
+    elif registered.get("owned"):
+        # the receipt records a registration this command made, but its runner directory is gone (or not ours): the
+        # GitHub registration may still exist and nothing here can deregister it, so a retirement must not read this as
+        # "never registered" (glaeda-cmux-runner-fleet registered_scope; review of 611e013e)
+        actions.append({"kind": "deregister", "state": "kept", "registered": True, "scope": registered.get("scope"),
+                        "note": "the receipt records a registration, but its runner directory is gone or not ours"})
     else:
         actions.append({"kind": "deregister", "state": "kept",
                         "note": "no registration owned by this command in this runner directory"})
@@ -2035,6 +2049,10 @@ HOOK_CHECK_SLOW = "the new hook's argument check did not finish in time"
 NEXT_SUFFIX = ".next"
 NEXT_RECORD = ".hook-next.json"
 RUNNER_LOCK = "runner.lock"
+# DEDICATED_ONLY marker, written under the runner lock by the first dedicated --apply on a dedicatedOnly member: from
+# then on every pool --apply on this Mac refuses, whatever manifest it read (a stale one names no dedicatedOnly).
+# Only --clear-dedicated-only (a deliberate operator step, under the same lock) removes it. Review of a1de21e4.
+DEDICATED_ONLY_MARKER = "dedicated-only.json"
 STAGE_SUFFIX = ".cmux-runner.tmp"
 
 
@@ -2391,6 +2409,8 @@ def parser() -> argparse.ArgumentParser:
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--apply", action="store_true", help="make the changes (default is plan only)")
     p.add_argument("--uninstall", action="store_true", help="deregister and remove what --apply installed")
+    p.add_argument("--clear-dedicated-only", action="store_true",
+                   help="remove this Mac's dedicatedOnly marker, so pool instances may be installed again (with --apply)")
     p.add_argument("--output", choices=("human", "json"), default="human")
     scope = p.add_mutually_exclusive_group()
     scope.add_argument("--repo", help=f"register to OWNER/REPO (default {DEFAULT_REPO})")
@@ -2513,6 +2533,8 @@ def main(argv: list[str] | None = None) -> int:
         if why:
             print(f"glaeda-cmux-runner: {why}", file=sys.stderr)
             return 2
+        summary, _ = member_labels(manifest, args.member, [])
+        ctx.dedicated_only = bool((summary or {}).get("dedicatedOnly"))
     elif args.manifest:
         try:
             manifest = json.loads(args.manifest.expanduser().read_text())
@@ -2524,6 +2546,11 @@ def main(argv: list[str] | None = None) -> int:
                                     ((early or {}).get("registration") or {}).get("labels") or [])
         if member is None:
             print(f"glaeda-cmux-runner: {why}", file=sys.stderr)
+            return 2
+        if member.get("dedicatedOnly") and not args.uninstall:
+            # DEDICATED_ONLY (glaeda_fleet_labels): no pool instance here; --uninstall still removes an old one
+            print(f"glaeda-cmux-runner: {args.member} declares runner.dedicatedOnly: it runs only its runner.dedicated "
+                  "runners (--dedicated NAME), no pool instance", file=sys.stderr)
             return 2
         ctx.member = member
         if not args.min_free_gib:
@@ -2581,7 +2608,74 @@ def main(argv: list[str] | None = None) -> int:
         ctx.gh, ctx.gh_state = None, "installed, not logged in"  # a logged-out gh is no gh
     # Every --apply and --uninstall holds the runner lock from its plan to its receipt (runner_lock).
     with runner_lock(ctx.home, wait=True) if args.apply else contextlib.nullcontext():
+        why = dedicated_only_refusal(ctx, args)
+        if why:
+            print(f"glaeda-cmux-runner: {why}", file=sys.stderr)
+            return 2
+        if getattr(args, "clear_dedicated_only", False):
+            print("glaeda-cmux-runner: " + ("removed the dedicatedOnly marker" if args.apply else
+                                           "--clear-dedicated-only needs --apply; nothing changed"))
+            return 0  # only the marker: installing is a separate, later --apply
         return install_or_uninstall(ctx, args, raw_argv)
+
+
+def dedicated_only_refusal(ctx: Any, args: argparse.Namespace) -> str | None:
+    """DEDICATED_ONLY under the runner lock (every --apply holds it), or None. A dedicated --apply on a dedicatedOnly
+    member refuses while any pool instance is on this Mac, and otherwise writes the marker first; a pool --apply
+    refuses while the marker is there, whatever manifest it read. Reviews of 611e013e and a1de21e4."""
+    marker = ctx.home / ".local/state/glaeda/cmux-runner" / DEDICATED_ONLY_MARKER
+    if not args.apply or args.uninstall:
+        return None
+    if getattr(args, "clear_dedicated_only", False):
+        marker.unlink(missing_ok=True)
+        return None
+    if dedicated_of(ctx) is not None:
+        if not getattr(ctx, "dedicated_only", False):
+            return None
+        left = pool_installs(ctx.home)
+        if left:
+            return (f"{args.member} declares runner.dedicatedOnly and still has pool instances ({', '.join(left)}): "
+                    "retire them first (glaeda-cmux-runner-fleet, fleet runner heal)")
+        marker.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        marker.write_text(json.dumps({"member": args.member, "dedicated": args.dedicated}) + "\n")
+        return None
+    try:
+        present = marker.exists()
+    except OSError:
+        present = True  # unreadable: fail closed
+    if present:
+        return ("this Mac is dedicatedOnly (" + os.fspath(marker).replace(os.fspath(ctx.home), "~", 1) + "): no pool "
+                "instance is installed here; --clear-dedicated-only --apply removes the marker deliberately")
+    return None
+
+
+def pool_installs(home: Path) -> list[str]:
+    """Every pool instance this Mac has (a receipt under instance-N or the first install's, or a pool runner directory
+    actions-runner-glaeda[-N]), as names. A dedicated runner (instance-dedicated-NAME, actions-runner-glaeda-NAME) is
+    not one. Read-only. Enumerates with os.listdir, which raises on a directory it cannot read (a glob would skip it
+    silently: review of a1de21e4), so an unreadable home or state counts as one and a dedicatedOnly member fails
+    closed."""
+    state = home / ".local/state/glaeda/cmux-runner"
+    found: list[str] = []
+    try:
+        try:
+            names = sorted(os.listdir(state))
+        except FileNotFoundError:
+            names = []
+        for name in names:
+            if name == "receipt.json" or re.fullmatch(r"instance-\d+", name):
+                path = state / name if name == "receipt.json" else state / name / "receipt.json"
+                if name != "receipt.json":
+                    os.listdir(state / name)  # raises when it cannot be read
+                try:
+                    os.stat(path)
+                    found.append(name if name == "receipt.json" else f"{name}/receipt.json")
+                except FileNotFoundError:
+                    pass
+        found += [n for n in sorted(os.listdir(home)) if re.fullmatch(r"actions-runner-glaeda(?:-\d+)?", n)]
+    except OSError as error:
+        return [f"unreadable ({type(error).__name__})"]
+    return found
 
 
 def dedicated_context(ctx: Context, args: argparse.Namespace, manifest: Any) -> str | None:
@@ -2624,7 +2718,10 @@ def dedicated_of(ctx: Any) -> dict[str, Any] | None:
 
 
 def dedicated_word(ctx: Context, word: str) -> str:
-    """A runner.dedicated command word or env value: "~/" is this user's home, "{runnerDir}" the runner's directory."""
+    """A runner.dedicated command word or env value: "~/" is this user's home, "{runnerDir}" the runner's directory,
+    and a whole word "{python}" the hook's own interpreter (the one job-started.sh execs the hook with)."""
+    if word == "{python}":  # glaeda_fleet_labels.PYTHON_WORD
+        return ctx.python or "/usr/bin/python3"
     if word.startswith("~/"):
         word = os.fspath(ctx.home / word[2:])
     return word.replace("{runnerDir}", os.fspath(ctx.runner_dir))

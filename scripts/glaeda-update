@@ -57,7 +57,7 @@ What one run does, and what it refuses:
 
 6. A mini that runs GitHub runners keeps the copy of glaeda-cmux-runner it is re-registered from in
    ~/glaeda-runner/scripts (glaeda-cmux-runner-fleet stages it). After an update, and on every run that
-   finds the release current, that copy is brought to the installed release's four runner files when
+   finds the release current, that copy is brought to the installed release's runner files (RUNNER_FILES) when
    it is older, so a relabel never runs from a stale copy. A copy an operator staged (its
    .glaeda-source.json stamp not written here) dated the release's day or later is kept, unless its
    commit is one the release descends from (the release's ancestry.txt). Only that directory, and only
@@ -146,7 +146,10 @@ BIN = HOME / ".local/bin"
 GH_POLICY = "config/gh-daemon.json"  # in the release tree; setup installs it beside BIN, in ../share/glaeda
 # The runner copy glaeda-cmux-runner-fleet stages (its STAGED and REMOTE_DIR), refreshed in step 6.
 RUNNER_SCRIPTS = HOME / "glaeda-runner/scripts"
-RUNNER_FILES = ("glaeda-cmux-runner", "glaeda-cmux-runner-hook", "glaeda_fleet_labels.py", "glaeda_reservation.py")
+# glaeda-nightly-only-admit: the admit command of the nightly-only and trusted runner.dedicated entries (run from this
+# copy, fresh per job), so a merged fix to it reaches the minis by OTA with the runner files, never a fleet --apply.
+RUNNER_FILES = ("glaeda-cmux-runner", "glaeda-cmux-runner-hook", "glaeda_fleet_labels.py", "glaeda_reservation.py",
+                "glaeda-nightly-only-admit")
 SOURCE_STAMP = ".glaeda-source.json"
 STAMP_BY = "glaeda-update"
 ANCESTRY = "ancestry.txt"  # glaeda_release.ANCESTRY: the release's commit and its ancestors
