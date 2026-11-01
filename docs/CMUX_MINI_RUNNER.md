@@ -946,6 +946,39 @@ To move a hand-made runner over: declare the entry with the old runner's labels 
 repos/OWNER/REPO/actions/runners/ID`), apply it so the glaeda runner is online beside the old one, then, while the old
 runner has no `Runner.Worker`, boot out and archive its LaunchAgents and remove its registration.
 
+### Dedicated-only members (`runner.dedicatedOnly`)
+
+`"runner": {"dedicatedOnly": true, "dedicated": [...]}` makes a member run only its dedicated runners: no pool
+instance, no devCompile, nightlySlot or gateway runner. `glaeda-cmux-runner-fleet --apply` stages the scripts, then
+deregisters and removes every pool instance it finds on the member (by each instance's receipt, with a remove token for
+the receipt's own scope), then applies the dedicated entries. An instance with a job is never stopped: its uninstall
+fails ("the runner has a job") and changes nothing, so drain the mini first (`cmux-ci drain --hosts M`) and re-run.
+`glaeda-cmux-runner --apply` refuses a pool instance on such a member; `--uninstall` still removes one.
+
+A dedicated command's first word may be `{python}`: the hook's own interpreter (`hook_python`), so a command that
+loads the hook runs on the Python the hook runs on.
+
+### The nightly-only runners (`glaeda-nightly-only-m4pro`)
+
+Leo, 2026-11-01: "ok just dedicate at least one m4 pro mini just completely to the nightly situation idgaf anymore",
+then "i thought 7 and 15 were both capable of being dedicated". cmux7s-mac-mini and cmux15 declare
+`dedicatedOnly` and N dedicated entries each, sharing the label `glaeda-nightly-only-m4pro` plus one
+`glaeda-runner-<member>-<name>` label per runner, with:
+
+```json
+"admit": ["{python}", "~/glaeda-runner/scripts/glaeda-nightly-only-admit",
+          "--hook", "{runnerDir}/glaeda-hooks/glaeda-cmux-runner-hook"]
+```
+
+`scripts/glaeda-nightly-only-admit` loads the runner's own hook and reuses its `job_tier`, `dev_compile_refusal` and
+`job_class`. It admits only nightly.yml of manaflow-ai/cmux on nightly-next or main from that ref's own nightly.yml
+(the reusable workflows it calls run under its workflow ref, so they come with it), and cmux-next.yml's
+release-compile on a feat-cmux-next push (nightly-next's promotion gate). It refuses main's DEV daily, the
+nightly-next canary and launch smoke, every PR, DEV and side job, and every signing job (the exclusive class): a
+signing job needs the whole mini through the capacity ledger, which a dedicated runner never holds, so it keeps its
+existing route and claim. The hook's bytes do not change, so the signing-hook trust list needs no new pin. A hook it
+cannot load refuses.
+
 ## 2e2. Other repositories on the same minis (org scope)
 
 Registered to `manaflow-ai/cmux`, the runners serve only cmux. To let another repository of the org use

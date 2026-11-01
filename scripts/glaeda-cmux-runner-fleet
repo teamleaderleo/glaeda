@@ -88,7 +88,7 @@ from typing import Any
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 STAGED = ("glaeda-cmux-runner", "glaeda-cmux-runner-hook", "glaeda_fleet_labels.py", "glaeda_reservation.py",
-          "glaeda-promotion-admit")
+          "glaeda-promotion-admit", "glaeda-nightly-only-admit")
 # HQ's nightly promotion lease runs ~/.local/bin/glaeda-promotion-admit over ssh: every stage installs the staged copy
 # there (a temp file renamed into place, so a running request never reads a half-written file)
 PROMOTION_ADMIT = "glaeda-promotion-admit"
@@ -602,11 +602,13 @@ def prepare_headless(member: str, summary: dict[str, Any], manifest: dict[str, A
     return None if code == 0 else f"headless preparation failed: {err.strip()[-240:]}"
 
 
-def _uninstall_cmd(member: str, instance: int, apply: bool) -> str:
+def _uninstall_cmd(member: str, instance: int, apply: bool, receipt_only: bool = False) -> str:
     # --token-stdin even for the plan: without gh on the mini, a plan lacking it reads "blocked", and a plan
-    # never reads stdin
+    # never reads stdin. receipt_only: no --manifest (a dedicatedOnly member declares no pool instance to name);
+    # an uninstall acts only on what the instance's receipt recorded anyway.
+    named = "" if receipt_only else f"--manifest ~/{REMOTE_DIR}/mini-fleet.json --member {_quote(member)} "
     return (f"~/{REMOTE_DIR}/scripts/glaeda-cmux-runner --uninstall {'--apply ' if apply else ''}--token-stdin "
-            f"--manifest ~/{REMOTE_DIR}/mini-fleet.json --member {_quote(member)} --instance {instance} --output json")
+            f"{named}--instance {instance} --output json")
 
 
 def _failed_note(out: str, err: str, code: int) -> str:
@@ -618,10 +620,11 @@ def _failed_note(out: str, err: str, code: int) -> str:
     return "; ".join(notes)[-200:] or f"exit {code}: {(err or out).strip()[-200:]}"
 
 
-def registered_scope(member: str, instance: int) -> tuple[str | None, str | None]:
+def registered_scope(member: str, instance: int, receipt_only: bool = False) -> tuple[str | None, str | None]:
     """(scope the instance is registered to, "" when none; or None and why it could not be read). Read-only:
     the single-mini uninstall plan, which follows the instance's receipt."""
-    code, out, err = run(["ssh", *SSH_OPTIONS, member, _uninstall_cmd(member, instance, False)], CHECK_TIMEOUT_S)
+    code, out, err = run(["ssh", *SSH_OPTIONS, member, _uninstall_cmd(member, instance, False, receipt_only)],
+                         CHECK_TIMEOUT_S)
     try:
         acts = [a for a in json.loads(out).get("actions", []) if isinstance(a, dict) and a.get("kind") == "deregister"]
     except (ValueError, AttributeError):
@@ -643,6 +646,39 @@ def uninstall_instance(member: str, instance: int, repo: str) -> str | None:
                          stdin=token + "\n")
     del token
     return None if code == 0 else f"uninstall failed ({_failed_note(out, err, code)})"
+
+
+# DEDICATED_ONLY (glaeda_fleet_labels): the pool instances' receipts on a member, instance 0's at the top
+POOL_RECEIPTS = ("cd ~/.local/state/glaeda/cmux-runner 2>/dev/null && "
+                 "for f in receipt.json instance-*/receipt.json; do [ -f \"$f\" ] && echo \"$f\"; done; true")
+POOL_RECEIPT_RE = re.compile(r"(?:instance-(\d+)/)?receipt\.json")
+
+
+def installed_pool_instances(member: str) -> tuple[list[int] | None, str | None]:
+    """([instance numbers with a pool receipt], None) or (None, why it could not be read). Read-only. A dedicated
+    runner's receipt (instance-dedicated-NAME) is not a pool instance and never listed."""
+    code, out, err = run(["ssh", *SSH_OPTIONS, member, POOL_RECEIPTS], CHECK_TIMEOUT_S)
+    if code != 0:
+        return None, f"cannot list its runner receipts (exit {code}: {(err or out).strip()[-160:]})"
+    found = [POOL_RECEIPT_RE.fullmatch(line.strip()) for line in out.splitlines() if line.strip()]
+    return sorted({int(m[1] or 0) for m in found if m}), None
+
+
+def retire_instance(member: str, instance: int) -> dict[str, Any]:
+    """Deregister and remove one pool instance of a dedicatedOnly member, by its receipt. A runner with a job is never
+    stopped: glaeda-cmux-runner's uninstall fails ("the runner has a job") and changes nothing; drain the mini
+    (cmux-ci drain) and re-run."""
+    scope, why = registered_scope(member, instance, receipt_only=True)
+    if scope is None:
+        return {"instance": instance, "exit": None, "state": f"retire: {why}; nothing changed"}
+    token = mint(scope_api(None, scope) if "/" not in scope else scope_api(scope, None), "remove-token") if scope else ""
+    if token is None:
+        return {"instance": instance, "exit": None, "state": f"retire: no remove token for {scope}; nothing changed"}
+    code, out, err = run(["ssh", *SSH_OPTIONS, member, _uninstall_cmd(member, instance, True, receipt_only=True)],
+                         APPLY_TIMEOUT_S, stdin=token + "\n")
+    del token
+    state = "retired" if code == 0 else f"retire failed ({_failed_note(out, err, code)})"
+    return {"instance": instance, "exit": code, "state": state, "name": None}
 
 
 def apply_instance(member: str, instance: int, repo: str | None, extra: list[str], org: str | None = None,
@@ -761,8 +797,15 @@ def one_member(member: str, summary: dict[str, Any], args: argparse.Namespace, m
     if args.org and summary.get("trustedRepo"):
         row["action"] = f"skip (trusted-only runner stays on {summary['trustedRepo']})"
         return row
+    if summary.get("dedicatedOnly"):
+        row["runners"], row["gatewayRunners"] = 0, 0
+        installed, why = installed_pool_instances(member)
+        row["retire"] = installed if installed is not None else why
     if not args.apply:
         row["action"] = "would apply" if eligible or args.include_ineligible else "skip (not eligible)"
+        if summary.get("dedicatedOnly"):
+            row["action"] += (f"; dedicated only, retire pool instances {row['retire'] or 'none'}"
+                              if isinstance(row["retire"], list) else f"; dedicated only, {row['retire']}")
         return row
     if not (eligible or args.include_ineligible):
         row["action"] = "skipped (not eligible)"
@@ -784,11 +827,18 @@ def one_member(member: str, summary: dict[str, Any], args: argparse.Namespace, m
         extra.append("--skip-launchctl")
     repo, org, group = member_scope(args, manifest, member)
     row["scope"] = f"{org}/{group}" if org and group else org or repo
-    # the pool instances, then the gateway runners after them (gatewayRunners: instances runners and on)
-    instances = row["runners"] + row["gatewayRunners"]
-    with concurrent.futures.ThreadPoolExecutor(max_workers=instances) as pool:
-        results = list(pool.map(lambda k: apply_instance(member, k, repo, extra, org, group,
-                                                         args.migrate_from_repo), range(instances)))
+    if summary.get("dedicatedOnly"):
+        # DEDICATED_ONLY: no pool instance; each installed one is deregistered and removed, only while it is idle
+        retire = row["retire"] if isinstance(row["retire"], list) else []
+        results = [retire_instance(member, k) for k in retire]
+        if not isinstance(row["retire"], list):
+            results.append({"instance": None, "exit": None, "state": f"retire: {row['retire']}"})
+    else:
+        # the pool instances, then the gateway runners after them (gatewayRunners: instances runners and on)
+        instances = row["runners"] + row["gatewayRunners"]
+        with concurrent.futures.ThreadPoolExecutor(max_workers=instances) as pool:
+            results = list(pool.map(lambda k: apply_instance(member, k, repo, extra, org, group,
+                                                             args.migrate_from_repo), range(instances)))
     # a dedicated runner keeps its own scope (never --org/--migrate-from-repo) and its own labels
     results += [apply_dedicated(member, entry, extra) for entry in dedicated]
     row["instances"] = results

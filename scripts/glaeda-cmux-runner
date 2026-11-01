@@ -2525,6 +2525,11 @@ def main(argv: list[str] | None = None) -> int:
         if member is None:
             print(f"glaeda-cmux-runner: {why}", file=sys.stderr)
             return 2
+        if member.get("dedicatedOnly") and not args.uninstall:
+            # DEDICATED_ONLY (glaeda_fleet_labels): no pool instance here; --uninstall still removes an old one
+            print(f"glaeda-cmux-runner: {args.member} declares runner.dedicatedOnly: it runs only its runner.dedicated "
+                  "runners (--dedicated NAME), no pool instance", file=sys.stderr)
+            return 2
         ctx.member = member
         if not args.min_free_gib:
             ctx.min_free_gib = float(member.get("minFreeGib") or 0)
@@ -2624,7 +2629,10 @@ def dedicated_of(ctx: Any) -> dict[str, Any] | None:
 
 
 def dedicated_word(ctx: Context, word: str) -> str:
-    """A runner.dedicated command word or env value: "~/" is this user's home, "{runnerDir}" the runner's directory."""
+    """A runner.dedicated command word or env value: "~/" is this user's home, "{runnerDir}" the runner's directory,
+    and a whole word "{python}" the hook's own interpreter (the one job-started.sh execs the hook with)."""
+    if word == "{python}":  # glaeda_fleet_labels.PYTHON_WORD
+        return ctx.python or "/usr/bin/python3"
     if word.startswith("~/"):
         word = os.fspath(ctx.home / word[2:])
     return word.replace("{runnerDir}", os.fspath(ctx.runner_dir))

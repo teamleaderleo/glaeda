@@ -266,6 +266,15 @@ def member_labels(manifest: Any, member: str, xcode_ok: Callable[[dict[str, Any]
         return None, f"{member} runner.nightlySlot must be boolean"
     if nightly_slot and (availability != "dedicated" or trusted_ref is not None):
         return None, f"{member} runner.nightlySlot needs a dedicated runner without trustedRef"
+    # DEDICATED_ONLY: the member runs only its runner.dedicated runners; glaeda-cmux-runner-fleet installs no pool
+    # instance there and deregisters any it finds (each only while idle), and glaeda-cmux-runner refuses to install one.
+    dedicated_only = runner.get("dedicatedOnly", False) if isinstance(runner, dict) else False
+    if not isinstance(dedicated_only, bool):
+        return None, f"{member} runner.dedicatedOnly must be boolean"
+    if dedicated_only and not (isinstance(runner.get("dedicated"), list) and runner["dedicated"]):
+        return None, f"{member} runner.dedicatedOnly needs at least one runner.dedicated entry"
+    if dedicated_only and (dev_compile or nightly_slot):
+        return None, f"{member} runner.dedicatedOnly has no pool instances, so no devCompile or nightlySlot"
     pool_prefix = runner.get("poolPrefix", "") if isinstance(runner, dict) else ""
     prefix_ok = isinstance(pool_prefix, str) and (pool_prefix == "" or (
         re.fullmatch(POOL_PREFIX_RE, pool_prefix) and
@@ -351,6 +360,7 @@ def member_labels(manifest: Any, member: str, xcode_ok: Callable[[dict[str, Any]
     return {"member": member, "class": klass, "availability": availability, "roles": roles,
             "labels": list(dict.fromkeys(labels)), "pools": list(dict.fromkeys(pools)),
             "devPools": list(dict.fromkeys(dev_pools)), "nightlyPools": list(dict.fromkeys(nightly_pools)),
+            "dedicatedOnly": dedicated_only,
             "nightlySlot": nightly_slot, "nightlyInstance": roots + int(dev_compile) if nightly_slot else None,
             "minFreeGib": floor if isinstance(floor, (int, float)) and floor > 0 else None,
             "hardware": hardware, "xcodeApps": [str(a.get("path")) for a in ready], "iosSim": ios_sim,
@@ -395,6 +405,9 @@ DEDICATED_POOL_SUFFIX_RE = r"(?:^|-)glaeda(?:-\d+)?$"  # <member>-glaeda-<name> 
 RUNNER_LABEL_RE = r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}"
 ENV_NAME_RE = r"[A-Z_][A-Z0-9_]{0,63}"
 DEFAULT_LABELS = ("self-hosted", "macos", "arm64", MINI_LABEL)
+# A dedicated command's first word may be this: the runner's own hook interpreter (glaeda-cmux-runner hook_python), so
+# a command that loads the hook runs on the Python the hook runs on, never a pinned path.
+PYTHON_WORD = "{python}"
 
 
 # Where a member's pool instances register (glaeda-cmux-runner-fleet, when no --org/--repo is passed): the manifest's
@@ -496,8 +509,9 @@ def dedicated_runners(manifest: Any, member: str) -> tuple[list[dict[str, Any]],
                 continue
             if not (isinstance(argv, list) and argv and all(isinstance(w, str) and w and "\n" not in w and "\0" not in w
                                                            for w in argv)
-                    and (argv[0].startswith("/") or argv[0].startswith("~/"))):
-                return [], f"{where}.{key} must be a command (a list of words, the first an absolute or ~/ path)"
+                    and (argv[0].startswith("/") or argv[0].startswith("~/") or argv[0] == PYTHON_WORD)):
+                return [], (f"{where}.{key} must be a command (a list of words, the first an absolute or ~/ path, "
+                            f"or {PYTHON_WORD})")
             commands[key] = list(argv)
         env = entry.get("env", {})
         if not (isinstance(env, dict) and all(isinstance(k, str) and re.fullmatch(ENV_NAME_RE, k) and isinstance(v, str)

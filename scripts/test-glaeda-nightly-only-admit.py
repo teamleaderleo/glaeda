@@ -1,0 +1,239 @@
+#!/usr/bin/env python3
+"""Contract tests for scripts/glaeda-nightly-only-admit (the nightly-only dedicated runners' admission) and the
+DEDICATED_ONLY member declaration it ships with (glaeda_fleet_labels, glaeda-cmux-runner, glaeda-cmux-runner-fleet).
+
+Runs on Linux CI: the admission is pure given the job's environment and event payload, and the CLI is run as a
+subprocess with a fake event file, the way dedicated-admit.sh runs it.
+"""
+
+from __future__ import annotations
+
+import importlib.machinery
+import importlib.util
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
+
+ROOT = Path(__file__).resolve().parents[1]
+ADMIT = ROOT / "scripts" / "glaeda-nightly-only-admit"
+HOOK = ROOT / "scripts" / "glaeda-cmux-runner-hook"
+REPO = "manaflow-ai/cmux"
+
+
+def load(name: str, path: Path):
+    loader = importlib.machinery.SourceFileLoader(name, os.fspath(path))
+    spec = importlib.util.spec_from_loader(name, loader)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    loader.exec_module(module)
+    return module
+
+
+admit = load("glaeda_nightly_only_admit", ADMIT)
+hook = admit.load_hook(HOOK)
+labels = load("glaeda_fleet_labels", ROOT / "scripts" / "glaeda_fleet_labels.py")
+fleet = load("glaeda_cmux_runner_fleet_nightly_only", ROOT / "scripts" / "glaeda-cmux-runner-fleet")
+
+
+def job(job_name: str, workflow: str = "nightly.yml", ref: str = "refs/heads/nightly-next", event_name: str = "push",
+        workflow_ref_branch: str | None = None, repository: str = REPO, **payload):
+    event = {"repository": {"full_name": repository}, **payload}
+    if event_name == "push":
+        event.setdefault("ref", ref)
+    return dict(event_name=event_name, ref=ref, repository=repository, event=event,
+                workflow_ref=f"{repository}/.github/workflows/{workflow}@{workflow_ref_branch or ref}", job=job_name)
+
+
+class RefusalTest(unittest.TestCase):
+    def why(self, **kw):
+        return admit.refusal(hook, kw["event_name"], kw["ref"], kw["repository"], kw["event"], kw["workflow_ref"],
+                             kw["job"])
+
+    def test_nightly_jobs_on_nightly_next_and_main_are_admitted(self):
+        for ref in ("refs/heads/nightly-next", "refs/heads/main"):
+            for name in ("decide", "build-nightly-app", "build-nightly-ghostty-cli-helper", "pick-nightly-build-runner",
+                         "resolve-nightly-cmux-tui-client", "find-nightly-next-recovery", "build-nightly-inputs"):
+                with self.subTest(ref=ref, job=name):
+                    self.assertIsNone(self.why(**job(name, ref=ref)))
+        self.assertIsNone(self.why(**job("decide", event_name="workflow_dispatch")))
+        self.assertIsNone(self.why(**job("decide", ref="refs/heads/main", event_name="schedule")))
+
+    def test_a_called_workflow_runs_under_the_callers_workflow_ref(self):
+        # nightly.yml's `uses: ./.github/workflows/nightly-tag-permission-probe.yml`: GITHUB_WORKFLOW_REF stays the
+        # caller's, so a required child is admitted with nightly.yml and never on its own
+        self.assertIsNone(self.why(**job("probe", ref="refs/heads/nightly-next")))
+        self.assertIsNotNone(self.why(**job("probe", workflow="nightly-tag-permission-probe.yml")))
+
+    def test_the_promotion_release_compile_is_admitted_only_on_a_feat_cmux_next_push(self):
+        ok = job("release-compile", workflow="cmux-next.yml", ref="refs/heads/feat-cmux-next")
+        self.assertIsNone(self.why(**ok))
+        self.assertIsNotNone(self.why(**job("cmux-scheme-compile", workflow="cmux-next.yml",
+                                            ref="refs/heads/feat-cmux-next")))
+        self.assertIsNotNone(self.why(**job("release-compile", workflow="cmux-next.yml", ref="refs/heads/feat-cmux-next",
+                                            event_name="workflow_dispatch", inputs={"dev_daily": "true"})))
+
+    def test_dev_daily_canary_and_launch_smoke_are_refused(self):
+        for case in (job("sign", workflow="cmux-next-dev-daily.yml", ref="refs/heads/main",
+                         event_name="workflow_dispatch"),
+                     job("verify", workflow="nightly-next-canary.yml", ref="refs/heads/main", event_name="schedule"),
+                     job("smoke", workflow="nightly-next-launch-smoke.yml", ref="refs/heads/main",
+                         event_name="schedule")):
+            with self.subTest(case=case["workflow_ref"]):
+                why = self.why(**case)
+                self.assertIsNotNone(why)
+                self.assertIn("not the nightly itself", why)
+
+    def test_pr_dev_and_foreign_jobs_are_refused(self):
+        cases = {
+            "pull request": job("decide", event_name="pull_request", ref="refs/pull/1/merge",
+                                pull_request={"number": 1}),
+            "a nightly payload with a pull request": job("decide", pull_request={"number": 1}),
+            "workflow_run": job("decide", workflow_run={"id": 1}),
+            "another branch": job("decide", ref="refs/heads/feature", workflow_ref_branch="refs/heads/feature"),
+            "nightly.yml from another ref": job("decide", workflow_ref_branch="refs/heads/feature"),
+            "another repository": job("decide", repository="manaflow-ai/other"),
+            "a fork's push": dict(job("decide"), event={"repository": {"full_name": "someone/cmux"},
+                                                         "ref": "refs/heads/nightly-next"}),
+            "a DEV compile": job("cmux-scheme-compile", workflow="cmux-next.yml", ref="refs/heads/feat-cmux-next"),
+            "a PR test workflow": job("swift-tests", workflow="ci.yml", ref="refs/heads/main"),
+        }
+        for name, case in cases.items():
+            with self.subTest(name):
+                self.assertIsNotNone(self.why(**case))
+
+    def test_signing_jobs_keep_their_exclusive_route(self):
+        for workflow, name in hook.SIGNING_JOBS:
+            if workflow != "nightly.yml":
+                continue
+            with self.subTest(job=name):
+                why = self.why(**job(name))
+                self.assertIsNotNone(why)
+                self.assertIn("signing job", why)
+
+    def test_cli_admits_and_refuses_from_the_job_environment(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            def run(case):
+                path = Path(tmp) / "event.json"
+                path.write_text(json.dumps(case["event"]))
+                env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "GITHUB_EVENT_PATH": os.fspath(path),
+                       "GITHUB_EVENT_NAME": case["event_name"], "GITHUB_REF": case["ref"],
+                       "GITHUB_REPOSITORY": case["repository"], "GITHUB_WORKFLOW_REF": case["workflow_ref"],
+                       "GITHUB_JOB": case["job"]}
+                return subprocess.run([sys.executable, os.fspath(ADMIT), "--hook", os.fspath(HOOK)], env=env,
+                                      capture_output=True, text=True, timeout=60, check=False)
+            got = run(job("build-nightly-app"))
+            self.assertEqual(got.returncode, 0, got.stdout + got.stderr)
+            self.assertIn("admitted", got.stdout)
+            got = run(job("verify", workflow="nightly-next-canary.yml", ref="refs/heads/main", event_name="schedule"))
+            self.assertEqual(got.returncode, 1, got.stdout + got.stderr)
+            self.assertIn("refused", got.stdout)
+            got = subprocess.run([sys.executable, os.fspath(ADMIT), "--hook", os.fspath(Path(tmp) / "missing")],
+                                 env={"PATH": "/usr/bin:/bin"}, capture_output=True, text=True, timeout=60, check=False)
+            self.assertEqual(got.returncode, 1)
+            self.assertIn("cannot load the runner hook", got.stdout)
+
+
+def manifest(runner: dict) -> dict:
+    return {"defaults": {"xcode": {"apps": [{"path": "/Applications/Xcode_26.6.app", "version": "26.6"}]}},
+            "hosts": {"m": {"class": "std", "availability": "dedicated", "roles": ["ci-runner"], "hardware": "m4pro-48",
+                            "overrides": {"runner": runner}}}}
+
+
+NIGHTLY_ONLY = {"name": "nightly-only-1", "repo": REPO, "labels": ["glaeda-nightly-only-m4pro",
+                                                                  "glaeda-runner-m-nightly-only-1"],
+                "admit": ["{python}", "~/glaeda-runner/scripts/glaeda-nightly-only-admit",
+                          "--hook", "{runnerDir}/glaeda-hooks/glaeda-cmux-runner-hook"]}
+
+
+class DedicatedOnlyTest(unittest.TestCase):
+    def test_member_labels_reports_dedicated_only_and_validates_it(self):
+        summary, why = labels.member_labels(manifest({"dedicatedOnly": True, "dedicated": [NIGHTLY_ONLY]}), "m",
+                                            lambda app: True)
+        self.assertIsNone(why)
+        self.assertTrue(summary["dedicatedOnly"])
+        summary, _ = labels.member_labels(manifest({}), "m", lambda app: True)
+        self.assertFalse(summary["dedicatedOnly"])
+        for bad in ({"dedicatedOnly": "yes", "dedicated": [NIGHTLY_ONLY]}, {"dedicatedOnly": True},
+                    {"dedicatedOnly": True, "dedicated": [NIGHTLY_ONLY], "nightlySlot": True}):
+            with self.subTest(bad=bad):
+                summary, why = labels.member_labels(manifest(bad), "m", lambda app: True)
+                self.assertIsNone(summary)
+                self.assertIn("dedicatedOnly", why)
+
+    def test_a_dedicated_command_may_start_with_the_hook_python(self):
+        entries, why = labels.dedicated_runners(manifest({"dedicatedOnly": True, "dedicated": [NIGHTLY_ONLY]}), "m")
+        self.assertIsNone(why)
+        self.assertEqual(entries[0]["admit"][0], "{python}")
+        bad = dict(NIGHTLY_ONLY, admit=["python3", "x"])
+        _, why = labels.dedicated_runners(manifest({"dedicated": [bad]}), "m")
+        self.assertIn("{python}", why)
+
+    def test_the_runner_expands_the_hook_python_word(self):
+        runner = load("glaeda_cmux_runner_nightly_only", ROOT / "scripts" / "glaeda-cmux-runner")
+        ctx = SimpleNamespace(python="/opt/homebrew/bin/python3", home=Path("/Users/cmux"),
+                              runner_dir=Path("/Users/cmux/actions-runner-glaeda-nightly-only-1"))
+        words = [runner.dedicated_word(ctx, w) for w in NIGHTLY_ONLY["admit"]]
+        self.assertEqual(words, ["/opt/homebrew/bin/python3", "/Users/cmux/glaeda-runner/scripts/glaeda-nightly-only-admit",
+                                 "--hook", "/Users/cmux/actions-runner-glaeda-nightly-only-1/glaeda-hooks/"
+                                           "glaeda-cmux-runner-hook"])
+        self.assertEqual(runner.dedicated_word(ctx, "x{python}"), "x{python}")  # only a whole word
+
+    def test_the_fleet_stages_the_admission_beside_the_hook(self):
+        self.assertIn("glaeda-nightly-only-admit", fleet.STAGED)
+
+    def test_installed_pool_instances_lists_only_pool_receipts(self):
+        out = "receipt.json\ninstance-3/receipt.json\ninstance-12/receipt.json\n"
+        with mock.patch.object(fleet, "run", return_value=(0, out, "")) as run:
+            self.assertEqual(fleet.installed_pool_instances("m"), ([0, 3, 12], None))
+        self.assertIn("instance-*/receipt.json", run.call_args[0][0][-1])
+        with mock.patch.object(fleet, "run", return_value=(255, "", "no route")):
+            got, why = fleet.installed_pool_instances("m")
+        self.assertIsNone(got)
+        self.assertIn("no route", why)
+
+    def test_retire_mints_a_remove_token_for_the_receipts_scope_and_never_names_the_manifest(self):
+        calls = []
+
+        def fake_run(argv, timeout, stdin=None):
+            calls.append((argv[-1], stdin))
+            if "--apply" not in argv[-1]:
+                return 0, json.dumps({"actions": [{"kind": "deregister", "state": "remove",
+                                                   "scope": "manaflow-ai"}]}), ""
+            return 0, "{}", ""
+        with mock.patch.object(fleet, "run", side_effect=fake_run), \
+                mock.patch.object(fleet, "mint", return_value="tok") as mint:
+            got = fleet.retire_instance("m", 4)
+        self.assertEqual(got["state"], "retired")
+        mint.assert_called_once_with("orgs/manaflow-ai", "remove-token")
+        self.assertTrue(all("--manifest" not in cmd and "--instance 4" in cmd for cmd, _ in calls))
+        self.assertEqual(calls[-1][1], "tok\n")
+
+    def test_a_busy_instance_is_left_alone(self):
+        def fake_run(argv, timeout, stdin=None):
+            if "--apply" not in argv[-1]:
+                return 0, json.dumps({"actions": [{"kind": "deregister", "state": "remove",
+                                                   "scope": "manaflow-ai/cmux"}]}), ""
+            return 1, json.dumps({"actions": [{"kind": "agent", "state": "failed",
+                                               "note": "the runner has a job (or a listener runs); nothing removed"}]}), ""
+        with mock.patch.object(fleet, "run", side_effect=fake_run), \
+                mock.patch.object(fleet, "mint", return_value="tok") as mint:
+            got = fleet.retire_instance("m", 0)
+        mint.assert_called_once_with("repos/manaflow-ai/cmux", "remove-token")
+        self.assertEqual(got["exit"], 1)
+        self.assertIn("has a job", got["state"])
+
+
+class NoEmDashTest(unittest.TestCase):
+    def test_no_em_dash(self):
+        for path in (ADMIT, Path(__file__)):
+            self.assertNotIn(chr(0x2014), path.read_text(encoding="utf-8"), path.name)
+
+
+if __name__ == "__main__":
+    unittest.main()

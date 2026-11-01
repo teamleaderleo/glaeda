@@ -285,6 +285,8 @@ jobs:
               Path("scripts/test-glaeda-gh.py"),
               Path("scripts/glaeda-wallpaper-rotate"),
               Path("scripts/glaeda-sync-main"),
+              Path("scripts/glaeda-nightly-only-admit"),
+              Path("scripts/test-glaeda-nightly-only-admit.py"),
               Path("scripts/test-glaeda-sync-main.py"),
               Path("scripts/test-glaeda-wallpaper-rotate.py"),
               Path("scripts/test-verify.py"),
@@ -385,6 +387,7 @@ jobs:
           suite python3 scripts/test-glaeda-mini-enroll.py
           suite python3 scripts/test-glaeda-cmux-runner-fleet.py
           suite python3 scripts/test-glaeda-promotion-admit.py
+          suite python3 scripts/test-glaeda-nightly-only-admit.py
           suite python3 scripts/test-glaeda-runner-hook-lag.py
           suite python3 scripts/test-glaeda-mini-fleet.py
           suite python3 scripts/test-glaeda-fleet-status.py

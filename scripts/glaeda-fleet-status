@@ -329,6 +329,8 @@ def declared_runners(manifest: dict[str, Any], name: str) -> int | None:
         summary, _ = fleet_labels().member_labels(manifest, name, lambda app: True)
     except Exception:  # noqa: BLE001  (a malformed manifest leaves the count unknown, never the document)
         return None
+    if (summary or {}).get("dedicatedOnly"):  # no pool instance is declared there (glaeda_fleet_labels DEDICATED_ONLY)
+        return None
     runners = (summary or {}).get("runners")
     if not (isinstance(runners, int) and not isinstance(runners, bool) and runners > 0):
         return None
