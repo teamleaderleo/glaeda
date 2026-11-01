@@ -955,6 +955,13 @@ the receipt's own scope), then applies the dedicated entries. An instance with a
 fails ("the runner has a job") and changes nothing, so drain the mini first (`cmux-ci drain --hosts M`) and re-run.
 `glaeda-cmux-runner --apply` refuses a pool instance on such a member; `--uninstall` still removes one.
 
+On the mini, under the runner lock every `--apply` holds:
+- A dedicated `--apply` refuses while any pool receipt or pool runner directory is there. It enumerates them with
+  `os.listdir` (the fleet's listing with `ls`), so an unreadable directory refuses too.
+- Otherwise the dedicated `--apply` writes `~/.local/state/glaeda/cmux-runner/dedicated-only.json`. From then on,
+  every pool `--apply` on that Mac refuses, whatever manifest it read.
+- `glaeda-cmux-runner --clear-dedicated-only --apply` removes the marker deliberately and installs nothing.
+
 A dedicated command's first word may be `{python}`: the hook's own interpreter (`hook_python`), so a command that
 loads the hook runs on the Python the hook runs on.
 
