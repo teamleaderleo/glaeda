@@ -1379,6 +1379,36 @@ class HookTest(unittest.TestCase):
         self.assertIn(f"25.0 GiB free, 30 GiB required: another job admitted under the disk floor still runs here "
                       f"(pid {holder.pid})", out.getvalue())
 
+    def test_nightly_spends_the_disk_reserve_without_waiting_for_cleanup(self) -> None:
+        self.fleet()
+        push = event(self.dir, "push", {"repository": CMUX, "ref": "refs/heads/nightly-next"})
+        env = {"PATH": "/usr/bin:/bin", "HOME": os.fspath(self.dir), "GLAEDA_RUNNER_TELEMETRY": "0",
+               "GLAEDA_CANONICAL_ROOT_PARENT": NO_ROOTS, "GLAEDA_FLEET_DIR": os.fspath(self.dir / "fleet"),
+               "GITHUB_EVENT_NAME": "push", "GITHUB_EVENT_PATH": os.fspath(push),
+               "GITHUB_REF": "refs/heads/nightly-next", "GITHUB_REPOSITORY": "manaflow-ai/cmux",
+               "GITHUB_JOB": "decide",
+               "GITHUB_WORKFLOW_REF": "manaflow-ai/cmux/.github/workflows/nightly.yml@refs/heads/nightly-next"}
+        capacity = self.dir / "capacity"
+        with mock.patch.dict(os.environ, env, clear=True), \
+                mock.patch.object(hook, "free_gib", return_value=24.0), \
+                mock.patch.object(hook, "evict_idle_runners") as idle, \
+                mock.patch.object(hook, "evict") as evict, \
+                mock.patch.object(hook, "prejob_evict", return_value=None) as prejob, \
+                mock.patch.object(hook, "take_host_lock", return_value=(True, "admitted")), \
+                mock.patch.object(hook, "start_runner_parent_watchdog"), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            code = hook.main(["job-started", "--allowed-repo", "manaflow-ai/cmux",
+                              "--reservation", os.fspath(self.dir / "fleet" / "reservation.json"),
+                              "--host-lock", os.fspath(self.dir / "fleet" / "host.lock"), "--min-free-gib", "30",
+                              "--capacity-dir", os.fspath(capacity), "--state-dir", os.fspath(self.dir / "state"),
+                              "--watch-pid", str(os.getpid()), "--gui-wait", "0"])
+        self.assertEqual(code, 0, out.getvalue())
+        idle.assert_not_called()
+        evict.assert_not_called()
+        prejob.assert_called_once_with(os.fspath(self.dir / "fleet"), 20.0, None, wait_s=0)
+        self.assertTrue((capacity / f"{hook.DISK_LOW}-{os.getpid()}").exists(),
+                        "the reserve is spent only with a pinned disk-ledger turn")
+
     def test_the_admission_floor_is_one_jobs_measured_disk_growth(self) -> None:
         """The runner floor (the manifest's 30 GiB) decides when to evict; a job is refused only under what one job
         has been measured to write (DISK_JOB_PEAK_GIB, max 18.7 GiB), or a tour runner's own floor."""
@@ -8359,6 +8389,21 @@ class GateTest(unittest.TestCase):
             ours.child = mock.Mock(pid=1)
             with mock.patch.object(ours, "evict_in_background"):
                 self.assertIsNone(ours.low_disk(), "the builder is never held by its own reserve or waiter")
+
+    def test_nightly_listener_spends_reserve_but_keeps_measured_disk_floor(self) -> None:
+        write_hook(self.runner, "exec python3 /hook job-started --min-free-gib 30 --nightly-runner\n")
+        gate = hook.Gate(self.runner, os.fspath(self.lock), os.fspath(self.tmp / "none.json"), self.state)
+        gate.held = "disk: 24 GiB free, 32 GiB required"
+        free = {"gib": 24.0}
+        usage = lambda _path: mock.Mock(free=int(free["gib"] * 1024**3))
+        with mock.patch.object(hook.shutil, "disk_usage", side_effect=usage), \
+                mock.patch.object(gate, "evict_in_background"), \
+                mock.patch.dict(os.environ, {hook.DISK_JOB_PEAK_ENV: "20"}):
+            self.assertIsNone(gate.low_disk(), "a held nightly listener resumes within the 30 GiB reserve")
+            free["gib"] = 19.0
+            self.assertIn("22 GiB required", gate.low_disk() or "", "resume hysteresis still applies")
+            gate.child = mock.Mock(pid=1)
+            self.assertIn("20 GiB required", gate.low_disk() or "", "a listening nightly keeps the measured floor")
 
     def test_a_disk_hold_resumes_above_the_floor_and_logs_a_long_hold_once(self) -> None:
         script = self.runner / hook.RUNNER_HOOK_SCRIPT

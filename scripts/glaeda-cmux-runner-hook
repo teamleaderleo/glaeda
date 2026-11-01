@@ -6271,6 +6271,11 @@ class Gate:
             self.disk_since, self.disk_noted = None, False
         scope = runner_scope(self.runner_dir)
         floor, reserve = scope.min_free_gib, ""
+        if scope.nightly and not scope.dedicated:
+            # The nightly-only listener must reach job-started when the job fits,
+            # even while cleanup is trying to restore the larger runner reserve.
+            # job-started still takes the disk-low ledger's single-job turn.
+            floor = admit_floor_gib(floor, scope.gui or scope.session)
         if not scope.dedicated and not scope.nightly:
             # NIGHTLY_DISK_RESERVE: a nightly job freeing disk here goes first, and every other runner leaves the
             # dedicated builder's floor plus one job's growth free
@@ -9120,18 +9125,23 @@ def main(argv: list[str] | None = None) -> int:
         nightly_disk = bool(args.dedicated_admit) or job_tier(
             os.environ.get("GITHUB_EVENT_NAME"), os.environ.get("GITHUB_REF"), os.environ.get("GITHUB_REPOSITORY"),
             event, os.environ.get("GITHUB_WORKFLOW_REF"), os.environ.get("GITHUB_JOB")) == TIER_NIGHTLY
+        # Nightlies can spend the housekeeping reserve. Keep the measured job
+        # floor and the disk-low ledger; a dedicated builder keeps its declared
+        # floor too. Cleanup still runs, but filling a reserve cannot hold a job
+        # that already fits for the eviction budget.
+        eviction_floor = admit_floor if nightly_disk else args.min_free_gib
 
         def floor_evict() -> None:
             """Under the floor: free space before the refusal looks (evict; a nightly job first takes idle runners')."""
             with nightly_disk_wait(args.capacity_dir, nightly_disk):
                 if nightly_disk:
                     print(f"{PREFIX}: " + evict_idle_runners(Path.home(), disk_path,
-                                                             args.min_free_gib + GATE_DISK_RESUME_GIB, disk_deadline),
+                                                             eviction_floor + GATE_DISK_RESUME_GIB, disk_deadline),
                           flush=True)
-                if disk_refusal(disk_path, args.min_free_gib):
-                    print(f"{PREFIX}: {evict(disk_path, args.min_free_gib, args.disk, disk_deadline)}", flush=True)
+                if disk_refusal(disk_path, eviction_floor):
+                    print(f"{PREFIX}: {evict(disk_path, eviction_floor, args.disk, disk_deadline)}", flush=True)
 
-        if not why and not args.no_disk and disk_refusal(disk_path, args.min_free_gib):
+        if not why and not args.no_disk and disk_refusal(disk_path, eviction_floor):
             floor_evict()
         if why:
             return refused(why)
@@ -9152,11 +9162,12 @@ def main(argv: list[str] | None = None) -> int:
         why = disk_why()
         if why:
             return refused(why, disk=True)
-        prejob = None if args.no_disk else prejob_evict(disk_path, args.min_free_gib, args.disk)
+        prejob = None if args.no_disk else prejob_evict(
+            disk_path, eviction_floor, args.disk, wait_s=0 if nightly_disk else PREJOB_WAIT_S)
         if prejob:
             print(f"{PREFIX}: {prejob}", flush=True)
             # the jobs already running may have written the disk below the floor while this one waited
-            if disk_refusal(disk_path, args.min_free_gib):
+            if disk_refusal(disk_path, eviction_floor):
                 floor_evict()
                 why = disk_why()
                 if why:
