@@ -497,21 +497,48 @@ def recorded_supervisor(lease_dir: Path) -> int | None:
     return pid if isinstance(pid, int) else None
 
 
-def listener_group(runner_dir: Path, pgid: Any, ident: Any) -> list[int]:
-    """A dead supervisor's listener: its recorded process group, only members that run the lease runner's tree
-    (and the leader while its start token still matches). [] when ps cannot tell or nothing is left."""
+def listener_group(runner_dir: Path, pgid: Any, ident: Any) -> list[int] | None:
+    """A dead supervisor's listener: its group while the leader's start token matches, otherwise remaining
+    members running the lease runner's tree. None when ps cannot tell; [] only when nothing is left."""
     if not isinstance(pgid, int) or pgid <= 1:
         return []
-    rows = ps_table() or []
+    rows = ps_table()
+    if rows is None:
+        return None
     tree = os.fspath(runner_dir)
-    leader = bool(ident) and process_identity(pgid) == ident
-    return sorted({pid for pid, group, command in rows if group == pgid and (tree in command or (pid == pgid and leader))})
+    current = process_identity(pgid)
+    if any(pid == pgid for pid, _, _ in rows):
+        if not ident or current is None:
+            return None
+        if current != ident:
+            return []  # the recorded group leader's PID has been reused
+    leader = bool(ident) and current == ident
+    return sorted({pid for pid, group, command in rows if group == pgid and (leader or tree in command)})
+
+
+def promotion_claim_owner(hook: Any, lease: Lease, owner: Any) -> Any:
+    """The existing holder follows this exact supervisor, then its recorded listener group until recovery proves
+    it safe to stop. This also covers acknowledgement before the assigned marker or job-started adoption. The
+    helper supplies a JobOwner to the unchanged hook; no hook bytes or signing trust are changed."""
+    class PromotionOwner(hook.JobOwner):
+        __slots__ = ()
+
+        def gone(self) -> bool:
+            if not super().gone():
+                return False
+            try:
+                state = json.loads((lease.dir / "state.json").read_text())
+                group = listener_group(lease.runner_dir, state.get("listener_pid"), state.get("listener_identity"))
+            except (OSError, ValueError, AttributeError):
+                return False  # unknown lease state must not release a possibly active claim
+            return group == []
+
+    return PromotionOwner(owner.pid, owner.identity)
 
 
 def recover(lease: Lease, hook: Any) -> str:
-    """A lease whose supervisor died while it was starting or ready: stop its leftover listener, let its claim go and
-    remove its runner tree (the decoded .credentials with it). A job that adopted the claim and still runs keeps all
-    of it: its holder stays while that Runner.Worker lives (PROMOTION_LEASE) and nothing here touches it."""
+    """Recover only a proven-unassigned listener after its supervisor dies. Assigned or unknown listeners keep
+    their runner tree and exclusive claim; an acknowledged job may not have reached job-started adoption yet."""
     with hook.promotion_locked(lease.dir, wait_s=60.0):
         if supervisor_alive(lease.dir):
             return "its supervisor lives"
@@ -521,6 +548,35 @@ def recover(lease: Lease, hook: Any) -> str:
         if hook.promotion_adopted_alive(lease.dir):
             return "its adopted Runner.Worker still runs; its holder keeps the claim until that ends"
         group = listener_group(lease.runner_dir, state.get("listener_pid"), state.get("listener_identity"))
+        if group is None:
+            return "its listener process state is unknown; keeping the listener and claim"
+        if group:
+            if isinstance(state.get("assigned"), dict):
+                return "its listener was assigned; keeping the listener and claim until it exits"
+            frozen = list(group)
+            stop_allowed = False
+            try:
+                for pid in frozen:
+                    os.kill(pid, signal.SIGSTOP)
+                # Same frozen proof as normal withdrawal; a crash can precede the sticky marker write.
+                probe = object.__new__(Supervisor)
+                probe.hook, probe.lease = hook, lease
+                verdict, evidence = probe.assignment()
+                if verdict == "assigned":
+                    state = {**state, "assigned": {"at": time.time(), "evidence": evidence[:300]}}
+                    hook.promotion_write_state(lease.dir, state)
+                if verdict not in ("unassigned", "no-session"):
+                    return f"its listener assignment is {verdict}; keeping the listener and claim"
+                stop_allowed = True
+            except OSError:
+                return "could not freeze its listener; keeping the listener and claim"
+            finally:
+                # Keep proven-unassigned listeners frozen through termination below, but never leave
+                # a retained listener frozen after an unreadable proof, failed marker write or signal.
+                if not stop_allowed:
+                    for pid in frozen:
+                        with contextlib.suppress(OSError):
+                            os.kill(pid, signal.SIGCONT)
         for signum in (signal.SIGTERM, signal.SIGCONT):
             for pid in group:
                 with contextlib.suppress(OSError):
@@ -529,9 +585,15 @@ def recover(lease: Lease, hook: Any) -> str:
         while group and time.monotonic() < deadline:
             time.sleep(0.2)
             group = listener_group(lease.runner_dir, state.get("listener_pid"), state.get("listener_identity"))
+            if group is None:
+                return "listener exit is unknown; keeping its runner tree and claim"
         for pid in group:
             with contextlib.suppress(OSError):
                 os.kill(pid, signal.SIGKILL)
+        if group:
+            group = listener_group(lease.runner_dir, state.get("listener_pid"), state.get("listener_identity"))
+            if group is None or group:
+                return "listener exit is not yet proven; keeping its runner tree and claim"
         runner = str(lease.lease().get("runner_name") or "")
         released = hook.release_holder(hook.holder_file(Path.home() / ".local/state/glaeda/cmux-runner", runner)) \
             if runner else "no runner name to release"
@@ -724,6 +786,7 @@ class Supervisor:
         if me is None:
             self.update(phase="failed", reason="cannot pin the supervisor's own identity")
             return False
+        me = promotion_claim_owner(hook, self.lease, me)
         since = time.time()
         marker = self.capacity_dir / f"{hook.ADMIT_WANT}{os.getpid()}"
         shown = ""
