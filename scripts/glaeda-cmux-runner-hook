@@ -374,6 +374,12 @@ WORKFLOW_JOB_CLASSES = {("cmux-tui.yml", "lint"): "isolated", ("cmux-tui.yml", "
                         ("nightly.yml", "decide"): "light",
                         ("nightly.yml", "build-nightly-remote-daemon"): "light",
                         ("nightly.yml", "await-nightly-tree-marker"): "light",
+                        # Portable nightly controls are also light if a fallback ever places them on an owned Mac.
+                        ("nightly.yml", "resolve-nightly-cmux-tui-client"): "light",
+                        ("nightly.yml", "find-nightly-next-recovery"): "light",
+                        ("nightly.yml", "build-nightly-inputs"): "light",
+                        ("nightly.yml", "pick-nightly-build-runner"): "light",
+                        ("nightly.yml", "resolve-nightly-ghostty-cli-helper"): "light",
                         ("nightly.yml", "build-nightly-ghostty-cli-helper"): "light",
                         ("cmux-next.yml", "swift-test"): "isolated", ("cmux-next.yml", "release-compile"): "isolated",
                         ("cmux-next.yml", "cmux-scheme-compile"): "isolated",
@@ -559,8 +565,6 @@ JOB_CORES: dict[tuple[str, ...], int] = {
     ("ci.yml", "release-build"): 3,  # isolated: 28, 1.92/2.04/2.08
     # No mini telemetry yet (it ran on Blacksmith macOS 15): its cold universal build on an owned macOS 26 mini
     # measured 422 s user + 46 s sys over 133 s wall, 3.51 cores (2026-10-27); a helper cache hit is near 0.
-    # These controls use the light class's measured two-core p75. The remote-daemon artifact job runs concurrent
-    # Go cross-builds, and the resolver/marker controls stay within the same measured light class.
     ("nightly.yml", "build-nightly-ghostty-cli-helper"): 4,
     ("manaflow-ai/cmuxterm-hq", "build-fleet-go.yml", "test"): 1,  # guest isolated: 919, 0.24/0.42/0.52
 }
