@@ -325,6 +325,8 @@ def member_labels(manifest: Any, member: str, xcode_ok: Callable[[dict[str, Any]
         gateway = declared.get("gatewayRunners", 0)
     else:
         compile_slots, roots, gui, fast, gateway = 1, 1, 0, 0, 0
+    if dedicated_only:
+        gateway = 0  # DEDICATED_ONLY: no pool instance, so no gateway runner after them either
     if not (isinstance(runners, int) and not isinstance(runners, bool) and 1 <= runners <= MAX_RUNNERS):
         return None, f"runner.classes.{klass}.runners must be 1 to {MAX_RUNNERS}"
     # every mini holds at least one compile slot, so it needs a compile's cores; glaeda-route checks the same

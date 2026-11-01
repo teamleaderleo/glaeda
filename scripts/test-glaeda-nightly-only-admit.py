@@ -157,6 +157,12 @@ class DedicatedOnlyTest(unittest.TestCase):
                                             lambda app: True)
         self.assertIsNone(why)
         self.assertTrue(summary["dedicatedOnly"])
+        trusted = manifest({"dedicatedOnly": True, "dedicated": [NIGHTLY_ONLY], "trustedRef": "refs/heads/main",
+                            "trustedRepo": REPO})
+        trusted["defaults"]["runner"] = {"classes": {"std": {"gatewayRunners": 1}}}  # the pools' default
+        summary, why = labels.member_labels(trusted, "m", lambda app: True)
+        self.assertIsNone(why)
+        self.assertEqual(summary["gatewayRunners"], 0)
         summary, _ = labels.member_labels(manifest({}), "m", lambda app: True)
         self.assertFalse(summary["dedicatedOnly"])
         for bad in ({"dedicatedOnly": "yes", "dedicated": [NIGHTLY_ONLY]}, {"dedicatedOnly": True},
