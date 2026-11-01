@@ -427,7 +427,7 @@ PR_FIELDS = """number url title state isDraft merged mergedAt mergeable mergeSta
 headRefName reviewDecision updatedAt baseRef { branchProtectionRule { requiredStatusCheckContexts }
 rules(first: 50) { nodes { type parameters { ... on RequiredStatusChecksParameters {
   requiredStatusChecks { context } } } } } } commits(last: 1) { nodes { commit { statusCheckRollup { state
-contexts(first: 100) { totalCount pageInfo { hasNextPage } nodes { __typename
+contexts(first: 100) { totalCount pageInfo { hasNextPage endCursor } nodes { __typename
 ... on CheckRun { id name status conclusion detailsUrl databaseId startedAt completedAt
   isRequired(pullRequestNumber: NUM) checkSuite { conclusion workflowRun { databaseId workflow { name databaseId } } } }
 ... on StatusContext { context state targetUrl createdAt isRequired(pullRequestNumber: NUM) } } } } } } }"""
@@ -1295,11 +1295,20 @@ HEAD_CONTEXTS = """statusCheckRollup{contexts(first:100%s){pageInfo{hasNextPage 
 ... on CheckRun{databaseId name status conclusion checkSuite{app{slug} workflowRun{workflow{name}}}}
 ... on StatusContext{context state}}}}"""
 
+PR_CONTEXT_MAX_PAGES = 20  # 2,000 contexts per PR; beyond that the cache stays explicitly partial
 
-def head_query(owner: str, repo: str, sha: str, cursor: str | None = None) -> str:
+
+def head_query(owner: str, repo: str, sha: str, cursor: str | None = None,
+               pull_number: int | None = None) -> str:
     after = f', after:"{cursor}"' if cursor else ""
+    required = f" isRequired(pullRequestNumber:{pull_number})" if pull_number is not None else ""
+    contexts = (HEAD_CONTEXTS % after).replace("databaseId name status conclusion",
+                                                f"databaseId name status conclusion{required}")
+    if required:
+        contexts = contexts.replace("... on StatusContext{context state}",
+                                    f"... on StatusContext{{context state{required}}}")
     return (f'repository(owner:"{owner}",name:"{repo}"){{object(oid:"{sha}"){{... on Commit{{'
-            + HEAD_CONTEXTS % after + "}}}")
+            + contexts + "}}}")
 
 
 def fold_contexts(nodes: list, runs: dict, statuses: dict, ids: dict, prefix: str = "") -> None:
@@ -2853,7 +2862,12 @@ class Daemon:
         for i, e in enumerate(entries):
             node = (data.get(f"{alias}{i}") or {}).get(field)
             if node:
+                page_error = None
+                if kind == "pr":
+                    page_error = self.extend_pr_contexts(e, node)
                 parsed[i] = parse_pr(node) if kind == "pr" else parse_comments(node)
+                if page_error:
+                    parsed[i]["checksPageError"] = page_error
         if kind == "pr":
             self.fill_steps([(entries[i], d) for i, d in parsed.items()])
         for i, e in enumerate(entries):
@@ -2866,6 +2880,62 @@ class Daemon:
             # only GitHub saying NOT_FOUND for this alias means it does not exist (or is not visible)
             self.store(e["key"], e["cache"], error=str(err.get("message") or f"no data for this {what}")[:200],
                        missing=err.get("type") == "NOT_FOUND")
+
+    def extend_pr_contexts(self, entry: dict, node: dict) -> str | None:
+        """Follow a PR's cached statusCheckRollup pages so status pr sees required checks beyond 100.
+
+        The first PR query is deliberately batched. Follow-up pages use the already-known exact head
+        commit and are bounded; a partial page is retained with an explicit error and never treated as
+        a green verdict. This keeps the normal path brokered and avoids REST fallback for large rolls.
+        """
+        commits = ((node.get("commits") or {}).get("nodes") or [{}])
+        commit = (commits[0] or {}).get("commit") or {}
+        rollup = commit.get("statusCheckRollup") or {}
+        contexts = rollup.get("contexts") or {}
+        page = contexts.get("pageInfo") or {}
+        sha = node.get("headRefOid")
+        if not page.get("hasNextPage") or not sha or not re.fullmatch(r"[0-9a-fA-F]{40}", str(sha)):
+            return None
+        _, owner, repo, number = split_key(entry["key"])
+        nodes = list(contexts.get("nodes") or [])
+        base = node.get("baseRef") or {}
+        required = set((base.get("branchProtectionRule") or {}).get("requiredStatusCheckContexts") or [])
+        for rule in ((base.get("rules") or {}).get("nodes") or []):
+            for item in ((rule.get("parameters") or {}).get("requiredStatusChecks") or []):
+                if item.get("context"):
+                    required.add(item["context"])
+        reported = {c.get("name") or c.get("context") for c in nodes}
+        # Once every required context is in the first page, keep the cache to one cheap query. The
+        # rollup's totalCount/pageInfo still tell callers that optional contexts are only a slice.
+        if required and required.issubset(reported):
+            return None
+        cursor = page.get("endCursor")
+        for _ in range(PR_CONTEXT_MAX_PAGES - 1):
+            if not cursor:
+                return "graphql: PR check page has no cursor"
+            reason, self.gql_reason = self.gql_reason, "pr-pages"
+            try:
+                more, error = self.graphql("query{" + head_query(owner, repo, str(sha), cursor, int(number)) + "}", {})
+            finally:
+                self.gql_reason = reason
+            if more is None:
+                return error or "graphql: PR check page unavailable"
+            rollup_more = (((more.get("data") or {}).get("repository") or {}).get("object") or {}).get("statusCheckRollup")
+            contexts_more = (rollup_more or {}).get("contexts") or {}
+            if more.get("errors") or not rollup_more:
+                return "graphql: PR check page unavailable"
+            nodes.extend(contexts_more.get("nodes") or [])
+            reported |= {c.get("name") or c.get("context") for c in contexts_more.get("nodes") or []}
+            page = contexts_more.get("pageInfo") or {}
+            cursor = page.get("endCursor")
+            contexts["nodes"] = nodes
+            contexts["totalCount"] = contexts_more.get("totalCount", contexts.get("totalCount", len(nodes)))
+            contexts["pageInfo"] = page
+            if not page.get("hasNextPage"):
+                return None
+            if required and required.issubset(reported):
+                return None
+        return f"graphql: more than {PR_CONTEXT_MAX_PAGES * 100} PR checks"
 
     def fetch_prs(self, entries: list[dict]) -> str | None:
         return self.fetch_aliased(entries, "pr")
@@ -4064,6 +4134,8 @@ def check_verdict(data: dict, until: str = "green", now: float | None = None,
                   grace: float = RESCUE_GRACE) -> int | None:
     """The checks alone, whatever the PR's state or head: EXIT_OK, EXIT_FAIL, or None while pending."""
     checks = data.get("checks") or []
+    if data.get("checksPageError"):
+        return None  # a partial cached rollup is not evidence of a green head
     if data.get("checksTruncated"):
         # More than 100 checks: only the first 100 are here, so GitHub's rollup decides, except that a
         # check shown as held or still running defers its FAILURE (manaflow-ai/cmux#20733: a queued fast
