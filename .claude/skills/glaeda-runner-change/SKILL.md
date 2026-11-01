@@ -60,6 +60,10 @@ scripts/glaeda-cmux-runner-fleet --apply --org manaflow-ai --group glaeda-minis 
 scripts/glaeda-cmux-runner-fleet --apply --org manaflow-ai --group glaeda-minis              # then the rest
 ```
 
+`--apply` refuses while an active cmux nightly, DEV or promote run's `glaeda-signing-hooks.txt` does not list the hook
+being rolled out (the rollout barrier, `docs/CMUX_MINI_RUNNER.md`); wait for those runs or land the digest in cmux,
+never cancel them. `--skip-rollout-barrier "REASON"` is for a deliberate deploy past it.
+
 The runners are org-scoped. An apply without `--org` refuses every instance ("already has a runner install")
 and changes nothing. Run it from a worktree at `origin/main`, not the shared base checkout.
 

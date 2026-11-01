@@ -62,6 +62,18 @@ stamp (allowDowngrade). The stamp names the HEAD the guard checked. A copy outsi
 release) has no HEAD to check, so it needs --allow-downgrade. A shallow checkout fails closed: an older stamp
 beyond its history reads as not an ancestor; fetch the full history. A plan reports the same findings and does
 not fail.
+
+Rollout barrier. cmux's owned-Mac signing jobs trust only the hook digests scripts/ci/glaeda-signing-hooks.txt lists
+at the run's own commit (cmux's claim gate reads GLAEDA_HOOK_SHA256 against it). A nightly, DEV or promote run that
+started before a hook rollout and reaches its signing job after it would find a hook its commit never listed, and the
+whole mini refuses it (manaflow-ai/cmux run 41256487647: sign-nightly-identity-legacy, attempt 3). So before --apply
+changes any member, it lists every active run (queued, in progress, waiting, requested or pending) of the
+ROLLOUT_BARRIER_WORKFLOWS, reads that list at each run's head commit, and refuses, changing nothing, while any of them
+does not list the hook being rolled out. It never looks at a run's jobs: a signing job blocked on `needs` is not
+created yet, and a started run keeps needing its hook until the run itself completes. A read that fails refuses too
+(fail closed). It never cancels a run. --skip-rollout-barrier REASON deploys anyway, with the reason printed and kept
+in the output. A previous digest is never taken as leave for new bytes: the barrier waits, and the minis keep each
+hook version they ran (glaeda-cmux-runner-hook retain-hooks) for those runs.
 """
 
 from __future__ import annotations
@@ -70,6 +82,7 @@ import argparse
 import concurrent.futures
 import errno
 import functools
+import hashlib
 import importlib.machinery
 import importlib.util
 import json
@@ -102,6 +115,17 @@ SHA_RE = re.compile(r"[0-9a-f]{7,40}")
 STAMP_READ = f"head -c 4096 ~/{REMOTE_DIR}/scripts/{SOURCE_STAMP} 2>/dev/null || echo @no-stamp"  # read-only
 MAX_REASON = 200
 HOST_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+# The rollout barrier (docstring): every cmux workflow with a job the hook gives a whole mini to sign (the hook's
+# SIGNING_JOBS: nightly and its promote job, the DEV build, release and the rpath repair). A test keeps this set a
+# superset of SIGNING_JOBS' workflows.
+BARRIER_REPO = "manaflow-ai/cmux"
+ROLLOUT_BARRIER_WORKFLOWS = ("nightly.yml", "cmux-next-dev-daily.yml", "release.yml",
+                             "repair-v0-64-25-helper-rpaths.yml")
+# A run that has not completed. GitHub's runs list filters on one status at a time, so one list per workflow and
+# status; each is complete in one page or the barrier refuses.
+ACTIVE_RUN_STATUSES = ("queued", "in_progress", "waiting", "requested", "pending")
+SIGNING_HOOKS_PATH = "scripts/ci/glaeda-signing-hooks.txt"
+BARRIER_PAGE = 100
 
 
 def load_labels() -> Any:
@@ -513,6 +537,72 @@ def refusal_lines(guard: dict[str, Any], applied: bool) -> list[str]:
     return [head, *(f"  {r['text']}" for r in guard["refusals"])]
 
 
+def listed_digests(text: str) -> set[str]:
+    """The sha256s glaeda-signing-hooks.txt lists: the first word of each line that is not blank or a comment."""
+    return {line.split(None, 1)[0] for line in text.splitlines()
+            if line.strip() and not line.lstrip().startswith("#")}
+
+
+def rollout_barrier(digest: str, repo: str = BARRIER_REPO) -> dict[str, Any]:
+    """{digest, runs: [{id, workflow, status, headSha, trusts}], blocking: [run ids], error}. Lists every active run
+    of ROLLOUT_BARRIER_WORKFLOWS and reads glaeda-signing-hooks.txt once per distinct head commit. Read-only: it
+    never cancels or changes a run. error is why it could not tell (then the apply must refuse)."""
+    doc: dict[str, Any] = {"digest": digest, "runs": [], "blocking": [], "error": None}
+    runs: dict[int, dict[str, Any]] = {}
+    for workflow in ROLLOUT_BARRIER_WORKFLOWS:
+        for status in ACTIVE_RUN_STATUSES:
+            code, out, _ = run(["gh", "api", f"repos/{repo}/actions/workflows/{workflow}/runs"
+                                f"?status={status}&per_page={BARRIER_PAGE}"], 60)
+            try:
+                page = json.loads(out) if code == 0 else None
+                listed = page.get("workflow_runs") if isinstance(page, dict) else None
+                total = page.get("total_count") if isinstance(page, dict) else None
+            except ValueError:
+                listed = total = None
+            if not isinstance(listed, list) or not isinstance(total, int):
+                doc["error"] = f"cannot list {status} runs of {workflow} (gh exit {code})"
+                return doc
+            if total > len(listed):
+                doc["error"] = f"{total} {status} runs of {workflow}, more than one page; cannot read them all"
+                return doc
+            for found in listed:
+                rid, sha = (found.get("id"), found.get("head_sha")) if isinstance(found, dict) else (None, None)
+                if not isinstance(rid, int) or not isinstance(sha, str) or not re.fullmatch(r"[0-9a-f]{40}", sha):
+                    doc["error"] = f"an active run of {workflow} names no run id or head commit"
+                    return doc
+                runs[rid] = {"id": rid, "workflow": workflow, "status": str(found.get("status") or status),
+                             "attempt": found.get("run_attempt"), "headSha": sha}
+    trusted: dict[str, list[str]] = {}
+    for sha in sorted({r["headSha"] for r in runs.values()}):
+        code, out, _ = run(["gh", "api", "-H", "Accept: application/vnd.github.raw",
+                            f"repos/{repo}/contents/{SIGNING_HOOKS_PATH}?ref={sha}"], 60)
+        if code != 0:
+            doc["error"] = f"cannot read {SIGNING_HOOKS_PATH} at {sha} (gh exit {code})"
+            return doc
+        trusted[sha] = sorted(listed_digests(out))
+    for rid in sorted(runs):
+        row = {**runs[rid], "trusts": trusted[runs[rid]["headSha"]]}
+        doc["runs"].append(row)
+        if digest not in row["trusts"]:
+            doc["blocking"].append(rid)
+    return doc
+
+
+def barrier_lines(doc: dict[str, Any]) -> list[str]:
+    """Why the barrier refuses: the read that failed, or each run whose list lacks the digest and what it trusts."""
+    if doc.get("error"):
+        return [f"rollout barrier: {doc['error']}; it fails closed"]
+    lines = []
+    for row in doc["runs"]:
+        if row["id"] in doc["blocking"]:
+            trusts = ", ".join(t[:12] for t in row["trusts"][-4:]) or "no hook"
+            more = len(row["trusts"]) - 4
+            lines.append(f"rollout barrier: {BARRIER_REPO} run {row['id']} ({row['workflow']}, {row['status']}, "
+                         f"commit {row['headSha'][:12]}) does not list hook {doc['digest'][:12]}; it trusts "
+                         f"{trusts}" + (f" and {more} older" if more > 0 else ""))
+    return lines
+
+
 def stage(member: str, manifest: dict[str, Any], scratch: Path,
           override: dict[str, Any] | None = None, head: str | None = None) -> str | None:
     """Copy the scripts, their source stamp and the member's trimmed manifest. Returns why it failed, or None.
@@ -544,7 +634,14 @@ def stage(member: str, manifest: dict[str, Any], scratch: Path,
                             f"~/{REMOTE_DIR}/scripts/glaeda_reservation.py"], 60)
     if code == 0:
         code, _, err = run(["scp", "-q", *SSH_OPTIONS, os.fspath(local), f"{member}:{REMOTE_DIR}/mini-fleet.json"], 60)
-    return None if code == 0 else f"scp: {err.strip()[-200:]}"
+    if code != 0:
+        return f"scp: {err.strip()[-200:]}"
+    # Before any instance's --apply replaces its hook: keep the hook every runner has now and the staged one as
+    # immutable copies (glaeda-cmux-runner-hook retain-hooks), so a run that started under the old hook still finds
+    # the version its commit lists when its signing job lands here.
+    code, _, err = run(["ssh", *SSH_OPTIONS, member, f"PATH={WORKLOAD_PATH} /usr/bin/python3 "
+                        f"~/{REMOTE_DIR}/scripts/glaeda-cmux-runner-hook retain-hooks"], 120)
+    return None if code == 0 else f"retain-hooks: {err.strip()[-200:]}"
 
 
 def prepare_headless(member: str, summary: dict[str, Any], manifest: dict[str, Any]) -> str | None:
@@ -829,6 +926,10 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--allow-downgrade", metavar="REASON",
                    help="deploy although HEAD is not origin/main or a member's stamp is not an ancestor of HEAD; "
                         "the reason is printed and recorded in the stamp")
+    p.add_argument("--skip-rollout-barrier", metavar="REASON",
+                   help="deploy although an active nightly, DEV or promote run's glaeda-signing-hooks.txt does not "
+                        "list the hook being rolled out (or the barrier cannot read GitHub); the reason is printed "
+                        "and kept in the output")
     p.add_argument("--jobs", type=int, default=16, help="members at once")
     p.add_argument("--max-procs", type=int, default=None,
                    help=f"ssh/scp/gh children at once across the run (default: ${MAX_PROCS_ENV}, else the open-file "
@@ -877,6 +978,13 @@ def main(argv: list[str] | None = None) -> int:
             print(f"glaeda-cmux-runner-fleet: --allow-downgrade needs a reason, at most {MAX_REASON} characters",
                   file=sys.stderr)
             return 2
+    if args.skip_rollout_barrier is not None:
+        reason = " ".join(args.skip_rollout_barrier.split())
+        args.skip_rollout_barrier = clean_reason(reason)
+        if not args.skip_rollout_barrier or len(reason) > MAX_REASON:
+            print(f"glaeda-cmux-runner-fleet: --skip-rollout-barrier needs a reason, at most {MAX_REASON} characters",
+                  file=sys.stderr)
+            return 2
     try:  # its release parsing and pin: a broken copy fails here, before any token is minted
         load_runner()
     except Exception as error:  # noqa: BLE001
@@ -901,6 +1009,29 @@ def main(argv: list[str] | None = None) -> int:
             print("glaeda-cmux-runner-fleet: nothing changed; pass --allow-downgrade REASON to deploy anyway",
                   file=sys.stderr)
             return 2
+    barrier: dict[str, Any] | None = None
+    if args.apply and chosen:  # the rollout barrier (docstring), before any member is touched
+        try:
+            digest = hashlib.sha256((SCRIPT_DIR / "glaeda-cmux-runner-hook").read_bytes()).hexdigest()
+        except OSError as error:
+            print(f"glaeda-cmux-runner-fleet: cannot read the hook to roll out ({type(error).__name__}); "
+                  "nothing changed", file=sys.stderr)
+            return 2
+        barrier = rollout_barrier(digest)
+        refusals = barrier_lines(barrier)
+        if refusals and args.skip_rollout_barrier is None:
+            for line in refusals:
+                print(f"glaeda-cmux-runner-fleet: {line}", file=sys.stderr)
+            print("glaeda-cmux-runner-fleet: refused --apply, nothing changed; wait for those runs to complete (never "
+                  "cancel them), land the digest in cmux's glaeda-signing-hooks.txt for new runs, or pass "
+                  "--skip-rollout-barrier REASON", file=sys.stderr)
+            return 2
+        if refusals:
+            barrier["skipped"] = args.skip_rollout_barrier
+            print(f"glaeda-cmux-runner-fleet: --skip-rollout-barrier ({args.skip_rollout_barrier}) overrides:",
+                  file=sys.stderr)
+            for line in refusals:
+                print(f"glaeda-cmux-runner-fleet:   {line}", file=sys.stderr)
     if args.apply:  # every org group a member would register into, checked before any member is touched
         groups = {member_scope(args, manifest, m)[1:] for m in chosen}
         for org, group in sorted((o, g) for o, g in groups if o and g):
@@ -916,9 +1047,12 @@ def main(argv: list[str] | None = None) -> int:
     if args.output == "json":
         release = dict(zip(("version", "sha256", "from"), _RELEASE[0])) if _RELEASE else None
         print(json.dumps({"applied": args.apply, "members": rows, "skipped": skipped, "source": guard,
-                          "runnerRelease": release}, indent=2, sort_keys=True))
+                          "runnerRelease": release, "rolloutBarrier": barrier}, indent=2, sort_keys=True))
     else:
         print(render(rows, skipped, args.apply, guard))
+        if barrier is not None:
+            print(f"rollout barrier: hook {barrier['digest'][:12]}, {len(barrier['runs'])} active run(s) checked"
+                  + (f"; skipped ({barrier['skipped']})" if barrier.get("skipped") else ""))
     failed = any(r.get("action") == "failed" or str(r.get("action", "")).startswith("stage failed")
                  or (args.apply and r.get("action") == "unreachable") for r in rows)
     return 1 if failed else 0
