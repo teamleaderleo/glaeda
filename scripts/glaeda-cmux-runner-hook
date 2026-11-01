@@ -350,7 +350,8 @@ JOB_CLASSES = {"macos-compile-admission": "compile", "app-host-unit-tests": "gui
 # since the module file was built", cmux#21686) and the hook needs no tour token: tours are isolated, as many on
 # a mini as its units allow.
 # SIGNING_JOBS: cmux's release-environment jobs that import the Developer ID certificate into a per-job temporary
-# keychain and sign with it (cmux tests/test_ci_signing_owned_mac.py lists the same jobs). Leo, 2026-10-28, on letting
+# keychain and sign with it, or hold the Release App key in memory (nightly.yml's promote-nightly-next), as cmux's
+# tests/test_ci_signing_owned_mac.py lists them. Leo, 2026-10-28, on letting
 # them run on owned Macs while Blacksmith is starved: "ok ... we can just read the code". On an owned Mac such a job
 # takes the exclusive class: every capacity unit and both fast tokens, so no other runner job, ci-step or idle lane
 # (catch-up, fuzzer) runs on the mini while the key is in its keychain, and the job's units are never given back
@@ -358,7 +359,8 @@ JOB_CLASSES = {"macos-compile-admission": "compile", "app-host-unit-tests": "gui
 # then is refused so its re-run takes Blacksmith. Admitted, it tells the job through $GITHUB_ENV
 # (GLAEDA_JOB_CLAIM=exclusive); cmux's signing jobs refuse to touch the key on an owned Mac without it, so a hook
 # from before this class never signs beside a PR job.
-SIGNING_JOBS = (("nightly.yml", "build-sign-notarize-nightly"), ("nightly.yml", "recover-nightly-next-notarization"),
+SIGNING_JOBS = (("nightly.yml", "promote-nightly-next"), ("nightly.yml", "build-sign-notarize-nightly"),
+                ("nightly.yml", "recover-nightly-next-notarization"),
                 ("nightly.yml", "sign-nightly-identity-legacy"), ("release.yml", "build-sign-notarize"),
                 ("repair-v0-64-25-helper-rpaths.yml", "repair"), ("cmux-next-dev-daily.yml", "sign"))
 WORKFLOW_JOB_CLASSES = {("cmux-tui.yml", "lint"): "isolated", ("cmux-tui.yml", "test"): "isolated",

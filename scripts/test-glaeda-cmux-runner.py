@@ -2138,6 +2138,40 @@ class HookTest(unittest.TestCase):
         finally:
             self.finish("s3")
 
+    def test_nightly_promotion_holds_the_whole_mini_before_credentials(self) -> None:
+        """The Release App job needs the same exclusive admission as certificate signing."""
+        job = "promote-nightly-next"
+        self.assertEqual(hook.job_class(job, "manaflow-ai/cmux", workflow="nightly.yml"),
+                         ("exclusive", False))
+        self.assertNotEqual(hook.job_class(job, "manaflow-ai/cmux", workflow="other.yml")[0], "exclusive")
+        self.assertNotEqual(hook.job_class(job, "outside/cmux", workflow="nightly.yml")[0], "exclusive")
+        self.fleet()
+        capacity = self.dir / "capacity"
+        capacity.mkdir(parents=True, exist_ok=True)
+        github_env = self.dir / "promotion-env"
+        env = {"GITHUB_JOB": job, "GITHUB_ENV": os.fspath(github_env), "GITHUB_REF": "refs/heads/main",
+               "GITHUB_WORKFLOW_REF": "manaflow-ai/cmux/.github/workflows/nightly.yml@refs/heads/main"}
+        busy = hook.lock_file(capacity / "unit-13", fcntl.LOCK_EX)
+        self.assertIsNotNone(busy)
+        try:
+            refused = self.job(job, "p0", 14, None, "--gui-wait", "0", env=env)
+            self.assertEqual(refused.returncode, 1, refused.stdout + refused.stderr)
+            self.assertNotIn("GLAEDA_JOB_CLAIM", github_env.read_text() if github_env.exists() else "")
+        finally:
+            os.close(busy)
+        try:
+            admitted = self.job(job, "p0", 14, None, "--gui-wait", "0", env=env)
+            self.assertEqual(admitted.returncode, 0, admitted.stdout + admitted.stderr)
+            self.assertIn("holding 14/14 units+fast-0+fast-1+gui+gateway-0+gateway-1", admitted.stdout)
+            self.assertIn("GLAEDA_JOB_CLAIM=exclusive\n", github_env.read_text())
+            for other, runner in (("swift-package-tests", "p1"), ("verify-signed-nightly", "p2")):
+                beside = self.job(other, runner, 14, None, "--gui-wait", "0")
+                self.assertEqual(beside.returncode, 1, beside.stdout + beside.stderr)
+                self.assertIn("0 of 14 units free", beside.stdout)
+            self.assertTrue(self.shared_lock_blocks_exclusive())
+        finally:
+            self.finish("p0")
+
     def test_a_gui_job_looks_for_the_idle_fuzzer_again_once_it_holds_the_gui_token(self) -> None:
         """A fuzzer that writes its holder after the first yield and looked at gui.token before this job took it is
         stopped by the second look, made while the token is held, so a signing job never runs beside it."""
