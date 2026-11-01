@@ -224,12 +224,12 @@ class FleetTest(unittest.TestCase):
         self.assertEqual(len(applies), 8)
         self.assertTrue(all(c["stdin"].strip() == TOKEN for c in applies))
         tokens = [c for c in calls if c["tool"] == "gh" and "registration-token" in " ".join(c["argv"])]
-        self.assertEqual(len(tokens), 8, "one token per instance")
+        self.assertEqual(len(tokens), 1, "one token per scope, shared by every instance")
         # "latest" is read once for the whole apply, through the operator's gh, and every instance is told it
         releases = [c for c in calls if c["tool"] == "gh" and "repos/actions/runner/releases/latest" in c["argv"]]
         self.assertEqual(len(releases), 1)
-        self.assertEqual(sum(1 for c in calls if c["tool"] == "gh"), 17,
-                         "eight tokens, eight label reads and one release read")
+        self.assertEqual(sum(1 for c in calls if c["tool"] == "gh"), 10,
+                         "one token, eight label reads and one release read")
         # the minis hold no gh login: each instance gets the labels GitHub lists for it, read here
         self.assertTrue(all("--github-labels=glaeda-mini,self-hosted " in c["remote"] for c in applies))
         reads = sorted(next(a for a in c["argv"] if "runners?name=" in a) for c in calls if c["tool"] == "gh"
@@ -381,8 +381,9 @@ class FleetTest(unittest.TestCase):
         calls = self.calls()
         gh = [c["argv"][3] for c in calls if c["tool"] == "gh" and len(c["argv"]) > 3]
         # mini-b instance 1 already moved and instance 2 has no registration: only 6 deregistrations
-        self.assertEqual(gh.count("repos/manaflow-ai/cmux/actions/runners/remove-token"), 6)
-        self.assertEqual(gh.count("orgs/manaflow-ai/actions/runners/registration-token"), 8)
+        # one token per scope and kind for the run, however many instances move
+        self.assertEqual(gh.count("repos/manaflow-ai/cmux/actions/runners/remove-token"), 1)
+        self.assertEqual(gh.count("orgs/manaflow-ai/actions/runners/registration-token"), 1)
         ssh = [c for c in calls if c["tool"] == "ssh" and "--apply" in c["remote"]]
         self.assertNotIn("mini-t", {c["host"] for c in ssh})
         registers = [c for c in ssh if "--uninstall" not in c["remote"]]
@@ -657,6 +658,31 @@ class FleetTest(unittest.TestCase):
         self.assertEqual(fleet.stamp_for(self.head)["source"], self.head)
         # no git checkout (an OTA release copy, run with --allow-downgrade): the copy's own record is all there is
         self.assertEqual(fleet.stamp_for(None)["source"], "a" * 40)
+
+    def test_a_token_is_minted_once_per_scope_and_kind_and_a_failure_is_not_kept(self) -> None:
+        """A quota shim refused one POST per instance on 29 instances; a run now asks once per scope and kind."""
+        loader = importlib.machinery.SourceFileLoader("fleet_mint_under_test", os.fspath(self.tool))
+        spec = importlib.util.spec_from_loader("fleet_mint_under_test", loader)
+        fleet = importlib.util.module_from_spec(spec)
+        loader.exec_module(fleet)
+        answers = [(1, "", "refused"), (0, TOKEN + "\n", ""), (0, "REMOVE1\n", ""), (0, "FRESH2\n", "")]
+        asked: list[list[str]] = []
+
+        def fake_run(argv, timeout, stdin=None):
+            asked.append(argv)
+            return answers.pop(0)
+
+        clock = [1000.0]
+        with mock.patch.object(fleet, "run", side_effect=fake_run), \
+                mock.patch.object(fleet.time, "monotonic", side_effect=lambda: clock[0]):
+            self.assertIsNone(fleet.mint("orgs/o"), "the refusal comes back as no token")
+            self.assertEqual(fleet.mint("orgs/o"), TOKEN, "and is not kept: the next instance asks again")
+            self.assertEqual([fleet.mint("orgs/o") for _ in range(5)], [TOKEN] * 5)
+            self.assertEqual(fleet.mint("repos/o/r", "remove-token"), "REMOVE1", "another kind is its own token")
+            self.assertEqual(len(asked), 3)
+            clock[0] += fleet.TOKEN_REUSE_S
+            self.assertEqual(fleet.mint("orgs/o"), "FRESH2", "a token near its hour's end is minted again")
+        self.assertEqual(len(asked), 4)
 
     def test_apply_refuses_when_origin_main_cannot_be_read(self) -> None:
         self.git("remote", "set-url", "origin", os.fspath(self.dir / "gone.git"))

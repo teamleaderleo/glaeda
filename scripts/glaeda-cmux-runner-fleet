@@ -35,7 +35,8 @@ its hook and their two modules into ~/glaeda-runner/scripts, with a .glaeda-sour
 commit and its date (glaeda-cmux-runner blocks a copy older than the mini's OTA release; glaeda-update
 refreshes one), and a manifest trimmed to that member (its own
 entry and the xcode, disk and runner defaults: never other hosts, keys or people), mints one registration token
-per instance here and pipes it over SSH (never an argv or a file), and applies --instance K for every K.
+per scope here (reused for its hour) and pipes it over SSH (never an argv or a file), and applies --instance K
+for every K.
 The gate checks the manifest's first Xcode for the member; if that app is missing there, the member reads as
 not eligible even when a later one would do (safe side). A member that SSH cannot reach is "unreachable", which
 fails an --apply run. Nothing here routes a job: pool variables stay with whoever owns routing.
@@ -204,11 +205,32 @@ def latest_release() -> tuple[str, str, str]:
         return _RELEASE[0]
 
 
+# GitHub's registration and remove tokens last one hour and register or remove any number of runners in that
+# hour, so a run mints each (scope, kind) once and reuses it until shortly before it expires. One POST per
+# instance spent the operator's shared gh quota, and a quota shim that refuses calls under a floor then left
+# every later instance with "no registration token". A failed mint is not cached: the next instance asks again.
+TOKEN_REUSE_S = 50 * 60
+_MINTED: dict[tuple[str, str], tuple[str, float]] = {}
+_MINT_LOCKS: dict[tuple[str, str], threading.Lock] = {}
+_MINT_LOCKS_GUARD = threading.Lock()
+
+
 def mint(scope: str, kind: str = "registration-token") -> str | None:
-    # gh's stderr is dropped: it never carries the token, but keep it quiet
-    code, out, _ = run(["gh", "api", "-X", "POST", f"{scope}/actions/runners/{kind}", "--jq", ".token"], 60)
-    token = out.strip()
-    return token if code == 0 and TOKEN_RE.fullmatch(token) else None
+    key = (scope, kind)
+    with _MINT_LOCKS_GUARD:
+        lock = _MINT_LOCKS.setdefault(key, threading.Lock())
+    with lock:  # instances run at once: one mint per key in flight, the rest wait for its answer
+        cached = _MINTED.get(key)
+        if cached and time.monotonic() - cached[1] < TOKEN_REUSE_S:
+            return cached[0]
+        # gh's stderr is dropped: it never carries the token, but keep it quiet
+        code, out, _ = run(["gh", "api", "-X", "POST", f"{scope}/actions/runners/{kind}", "--jq", ".token"], 60)
+        token = out.strip()
+        if code != 0 or not TOKEN_RE.fullmatch(token):
+            _MINTED.pop(key, None)
+            return None
+        _MINTED[key] = (token, time.monotonic())
+        return token
 
 
 def github_labels(scope: str, name: str) -> str | None:
