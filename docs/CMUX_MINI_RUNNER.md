@@ -961,9 +961,10 @@ loads the hook runs on the Python the hook runs on.
 ### The nightly-only runners (`glaeda-nightly-only-m4pro`)
 
 Leo, 2026-11-01: "ok just dedicate at least one m4 pro mini just completely to the nightly situation idgaf anymore",
-then "i thought 7 and 15 were both capable of being dedicated". cmux7s-mac-mini and cmux15 declare
-`dedicatedOnly` and N dedicated entries each, sharing the label `glaeda-nightly-only-m4pro` plus one
-`glaeda-runner-<member>-<name>` label per runner, with:
+then "i thought 7 and 15 were both capable of being dedicated". cmux7s-mac-mini and cmux15 declare N dedicated
+entries each (cmux7s-mac-mini also `dedicatedOnly`; cmux15 keeps its trusted-only pool, which `dedicatedOnly` may
+never retire), sharing the label `glaeda-nightly-only-m4pro` plus one `glaeda-runner-<member>-<name>` label per
+runner, with:
 
 ```json
 "admit": ["{python}", "~/glaeda-runner/scripts/glaeda-nightly-only-admit",
@@ -977,7 +978,20 @@ release-compile on a feat-cmux-next push (nightly-next's promotion gate). It ref
 nightly-next canary and launch smoke, every PR, DEV and side job, and every signing job (the exclusive class): a
 signing job needs the whole mini through the capacity ledger, which a dedicated runner never holds, so it keeps its
 existing route and claim. The hook's bytes do not change, so the signing-hook trust list needs no new pin. A hook it
-cannot load refuses.
+cannot load refuses. glaeda-update ships the script with the runner files (`RUNNER_FILES`) into
+`~/glaeda-runner/scripts`, so a merged fix to it reaches the minis by OTA.
+
+### Trusted dedicated entries (a second host for a trusted pool)
+
+A runner.dedicated entry may declare `trustedRef` and `trustedRepo` (together; `trustedRepo` is the entry's own
+`repo`, never an org). glaeda-cmux-runner then gives the job-started hook `--trusted-ref`/`--trusted-repo` for that
+runner even on a member that is not trusted-only, so the hook takes only that repository's push and schedule jobs on
+that branch, never PR code. Such an entry, and only such an entry, may carry a trusted pool label
+(`glaeda-trusted-...`) when every member that declares that pool is trusted-only on the same ref and repository; any
+other pool label stays refused. Its admit runs `glaeda-nightly-only-admit --trusted-ref REF --trusted-repo REPO`,
+which admits what the hook's `trusted_refusal` admits and still refuses a signing job. This is how a second mini
+serves main's trusted seed pool and the trusted nightly app build's runner label without a trusted pool of its own.
+Like every dedicated runner it takes no capacity units, so its jobs run beside the host's other dedicated runners.
 
 ## 2e2. Other repositories on the same minis (org scope)
 

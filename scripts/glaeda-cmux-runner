@@ -741,10 +741,13 @@ def hook_wrappers(ctx: Context) -> dict[str, bytes]:
         scope += f" --require-eligible --fleet-class {shlex.quote(ctx.member['hardware'])}"
         if ctx.member.get("xcodeApps"):
             scope += f" --toolchain-xcode {shlex.quote(ctx.member['xcodeApps'][0])}"
-        if ctx.member.get("trustedRef"):  # this mini holds a secret: only jobs on that branch, never PR code
-            scope += (f" --trusted-ref {shlex.quote(ctx.member['trustedRef'])}"
-                      f" --trusted-repo {shlex.quote(ctx.member['trustedRepo'])}")
-            if ctx.member.get("trustedNextNightly"):
+        if ctx.member.get("trustedRef") or (dedicated or {}).get("trustedRef"):
+            # this runner holds a secret: only jobs on that branch, never PR code. A trusted runner.dedicated entry
+            # (glaeda_fleet_labels DEDICATED_TRUSTED) is trusted on its own ref even on a member that is not.
+            trust = dedicated if (dedicated or {}).get("trustedRef") else ctx.member
+            scope += (f" --trusted-ref {shlex.quote(trust['trustedRef'])}"
+                      f" --trusted-repo {shlex.quote(trust['trustedRepo'])}")
+            if trust is ctx.member and ctx.member.get("trustedNextNightly"):
                 scope += " --trusted-next-nightly"
         elif dev_compile_instance(ctx.member, ctx.instance):
             scope += " --dev-compile-runner"

@@ -319,6 +319,118 @@ class DedicatedOnlyApplyTest(unittest.TestCase):
         self.assertEqual(row["action"], "applied")
 
 
+TRUSTED = {"name": "trusted-main", "repo": REPO, "trustedRef": "refs/heads/main", "trustedRepo": REPO,
+           "labels": ["glaeda-trusted-std-xcode-26.6", "glaeda-runner-t-glaeda"],
+           "admit": ["{python}", "~/glaeda-runner/scripts/glaeda-nightly-only-admit", "--hook",
+                     "{runnerDir}/glaeda-hooks/glaeda-cmux-runner-hook", "--trusted-ref", "refs/heads/main",
+                     "--trusted-repo", REPO]}
+
+
+def two_hosts(entry: dict, trusted_ref: str = "refs/heads/main") -> dict:
+    """A trusted-only member t (its pool serves glaeda-trusted-std-xcode-26.6) and a dedicatedOnly member m."""
+    doc = manifest({"dedicatedOnly": True, "dedicated": [NIGHTLY_ONLY, entry]})
+    doc["hosts"]["t"] = {"class": "std", "availability": "dedicated", "roles": ["ci-runner"], "hardware": "m4pro-48",
+                         "overrides": {"runner": {"trustedRef": trusted_ref, "trustedRepo": REPO}}}
+    return doc
+
+
+class TrustedDedicatedTest(unittest.TestCase):
+    """DEDICATED_TRUSTED: a second host serves a trusted pool's labels through a trusted runner.dedicated entry."""
+
+    def test_a_trusted_entry_may_carry_a_trusted_pool_label_of_the_same_trust(self):
+        self.assertIn("glaeda-trusted-std-xcode-26.6", labels.declared_pools(two_hosts(TRUSTED)))
+        entries, why = labels.dedicated_runners(two_hosts(TRUSTED), "m")
+        self.assertIsNone(why)
+        entry = next(e for e in entries if e["name"] == "trusted-main")
+        self.assertEqual((entry["trustedRef"], entry["trustedRepo"]), ("refs/heads/main", REPO))
+        self.assertIsNone(next(e for e in entries if e["name"] == "nightly-only-1")["trustedRef"])
+
+    def test_the_pool_label_stays_refused_without_matching_trust(self):
+        untrusted = {k: v for k, v in TRUSTED.items() if k not in ("trustedRef", "trustedRepo")}
+        cases = {"no trust": (untrusted, "refs/heads/main"),
+                 "another ref than the pool's": (dict(TRUSTED, trustedRef="refs/heads/feat-cmux-next"), "refs/heads/main"),
+                 "an untrusted pool label": (dict(TRUSTED, labels=["glaeda-std-xcode-26.6"]), "refs/heads/main")}
+        for name, (entry, ref) in cases.items():
+            with self.subTest(name):
+                doc = two_hosts(entry, ref)
+                if name == "an untrusted pool label":
+                    doc["hosts"]["u"] = {"class": "std", "availability": "dedicated", "roles": ["ci-runner"],
+                                         "hardware": "m4pro-48"}
+                _, why = labels.dedicated_runners(doc, "m")
+                self.assertIn("pool labels", why or "")
+
+    def test_trust_needs_both_fields_and_a_repo_scope(self):
+        for bad in ({k: v for k, v in TRUSTED.items() if k != "trustedRepo"},
+                    dict(TRUSTED, trustedRepo="other/repo"),
+                    dict({k: v for k, v in TRUSTED.items() if k != "repo"}, org="manaflow-ai"),
+                    dict(TRUSTED, trustedRef="main")):
+            with self.subTest(bad=bad):
+                _, why = labels.dedicated_runners(two_hosts(bad), "m")
+                self.assertIn("trusted", why or "")
+
+    def test_the_hook_gets_the_entrys_trust_on_an_untrusted_member(self):
+        runner = load("glaeda_cmux_runner_trusted_dedicated", ROOT / "scripts" / "glaeda-cmux-runner")
+        home = Path("/Users/cmux")
+
+        def started(entry):
+            ctx = mock.Mock(python=sys.executable, home=home, hook_dir=home / "h",
+                            runner_dir=home / "actions-runner-glaeda-x",
+                            org=None, repo=REPO, min_free_gib=0, capacity_units=0, labels=list(entry["labels"]),
+                            session_runner=False, dedicated=entry, instance=None, gateway_runner=False,
+                            member={"hardware": "m4pro-48", "xcodeApps": [], "trustedRef": None})
+            return b"".join(runner.hook_wrappers(ctx).values()).decode()
+        text = started(dict(TRUSTED))
+        self.assertIn("--trusted-ref refs/heads/main --trusted-repo manaflow-ai/cmux", text)
+        self.assertNotIn("--trusted-next-nightly", text)
+        self.assertNotIn("--trusted-ref", started(dict(NIGHTLY_ONLY, trustedRef=None, trustedRepo=None)))
+
+
+class TrustedAdmitTest(unittest.TestCase):
+    def why(self, run_attempt="1", **kw):
+        return admit.trusted_refusal(hook, kw["event_name"], kw["ref"], kw["repository"], kw["event"],
+                                     kw["workflow_ref"], kw["job"], run_attempt, "refs/heads/main", REPO)
+
+    def test_main_push_and_schedule_jobs_are_admitted(self):
+        self.assertIsNone(self.why(**job("seed", workflow="seed-derived-data.yml", ref="refs/heads/main")))
+        self.assertIsNone(self.why(**job("build-nightly-app", ref="refs/heads/main")))
+        sched = job("build-nightly-app", ref="refs/heads/main", event_name="schedule")
+        sched["event"]["repository"]["default_branch"] = "main"
+        self.assertIsNone(self.why(**sched))
+
+    def test_pr_dispatch_other_refs_and_signing_are_refused(self):
+        pr = job("build", workflow="ci.yml", ref="refs/pull/1/merge", event_name="pull_request",
+                 pull_request={"head": {"repo": {"full_name": REPO}}})
+        for name, case in {"pull request": pr,
+                           "dispatch": job("build", workflow="cmux-next-dev-daily.yml", ref="refs/heads/main",
+                                           event_name="workflow_dispatch"),
+                           "nightly-next": job("build-nightly-app"),
+                           "signing": job("build-sign-notarize-nightly", ref="refs/heads/main")}.items():
+            with self.subTest(name):
+                self.assertIsNotNone(self.why(**case))
+
+    def test_cli_trusted_mode(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            case = job("seed", workflow="seed-derived-data.yml", ref="refs/heads/main")
+            path = Path(tmp) / "event.json"
+            path.write_text(json.dumps(case["event"]))
+            env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "GITHUB_EVENT_PATH": os.fspath(path),
+                   "GITHUB_EVENT_NAME": "push", "GITHUB_REF": case["ref"], "GITHUB_REPOSITORY": REPO,
+                   "GITHUB_WORKFLOW_REF": case["workflow_ref"], "GITHUB_JOB": "seed", "GITHUB_RUN_ATTEMPT": "1"}
+            base = [sys.executable, os.fspath(ADMIT), "--hook", os.fspath(HOOK)]
+            got = subprocess.run(base + ["--trusted-ref", "refs/heads/main", "--trusted-repo", REPO], env=env,
+                                 capture_output=True, text=True, timeout=60, check=False)
+            self.assertEqual(got.returncode, 0, got.stdout + got.stderr)
+            got = subprocess.run(base, env=env, capture_output=True, text=True, timeout=60, check=False)
+            self.assertEqual(got.returncode, 1, "the nightly-only mode refuses a seed")
+            got = subprocess.run(base + ["--trusted-ref", "refs/heads/main"], env=env, capture_output=True, text=True,
+                                 timeout=60, check=False)
+            self.assertEqual(got.returncode, 2)
+
+    def test_ota_ships_the_admission_with_the_runner_files(self):
+        update = load("glaeda_update_nightly_only", ROOT / "scripts" / "glaeda-update")
+        self.assertIn("glaeda-nightly-only-admit", update.RUNNER_FILES)
+
+
 class NoEmDashTest(unittest.TestCase):
     def test_no_em_dash(self):
         for path in (ADMIT, Path(__file__)):

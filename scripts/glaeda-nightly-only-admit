@@ -24,6 +24,12 @@ also refuses a signing job (the hook's exclusive class, SIGNING_JOBS): such a jo
 the capacity ledger (GLAEDA_JOB_CLAIM=exclusive), which a dedicated runner never takes, so it keeps its existing
 route and claim instead of running here beside other nightly jobs.
 
+With --trusted-ref REF --trusted-repo OWNER/NAME it is instead the admission of a trusted runner.dedicated entry (one
+that serves a trusted pool's labels on a second host, such as main's DerivedData seed and the trusted nightly app
+build): it admits exactly what the hook's trusted_refusal admits for that ref and repository (that repository's push
+and schedule jobs on that branch, never PR code), which the hook has already checked with the same arguments, and it
+still refuses a signing job, for the same reason as above.
+
 It reuses the hook's own pieces (job_tier, dev_compile_refusal, job_class, load_event) by loading the hook file the
 runner actually runs, so the two never disagree on what a nightly job is, and the hook's bytes (pinned by the
 signing-hook trust list) do not change.
@@ -71,10 +77,30 @@ def refusal(hook: Any, event_name: str | None, ref: str | None, repository: str 
     return None
 
 
+def trusted_refusal(hook: Any, event_name: str | None, ref: str | None, repository: str | None, event: Any,
+                    workflow_ref: str | None, job: str | None, run_attempt: str | None, trusted_ref: str,
+                    trusted_repo: str) -> str | None:
+    """Why the trusted dedicated runner refuses this job, or None to admit it. Pure (given the hook module)."""
+    why = hook.trusted_refusal(event_name, ref, repository, event, trusted_ref, trusted_repo,
+                               workflow_ref=workflow_ref, job=job, run_attempt=run_attempt)
+    if why:
+        return why
+    workflow = hook.workflow_file(workflow_ref)
+    if hook.job_class(job or "", repository, hook.DEFAULT_HOME_REPO, workflow)[0] == hook.EXCLUSIVE_CLASS:
+        return (f"{workflow} {job} is a signing job: it takes the whole mini through the capacity ledger "
+                "(GLAEDA_JOB_CLAIM=exclusive), which a dedicated runner never holds; it keeps its own route")
+    return None
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog=PREFIX, description="admit only NEXT nightly work (exit 0), else refuse (1)")
     p.add_argument("--hook", type=Path, required=True, help="the runner's glaeda-cmux-runner-hook")
+    p.add_argument("--trusted-ref", help="admit as a trusted runner on this branch ref (with --trusted-repo)")
+    p.add_argument("--trusted-repo", help="the trusted repository, owner/name (with --trusted-ref)")
     args = p.parse_args(argv)
+    if (args.trusted_ref is None) != (args.trusted_repo is None):
+        print(f"{PREFIX}: refused: --trusted-ref and --trusted-repo go together", flush=True)
+        return 2
     try:
         hook = load_hook(args.hook)
     except Exception as error:  # noqa: BLE001  (a hook we cannot load refuses: never admit unchecked)
@@ -82,14 +108,20 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     env = os.environ
     event = hook.load_event(env.get("GITHUB_EVENT_PATH"))
-    why = refusal(hook, env.get("GITHUB_EVENT_NAME"), env.get("GITHUB_REF"), env.get("GITHUB_REPOSITORY"), event,
-                  env.get("GITHUB_WORKFLOW_REF"), env.get("GITHUB_JOB"))
+    if args.trusted_ref is not None:
+        why = trusted_refusal(hook, env.get("GITHUB_EVENT_NAME"), env.get("GITHUB_REF"), env.get("GITHUB_REPOSITORY"),
+                              event, env.get("GITHUB_WORKFLOW_REF"), env.get("GITHUB_JOB"), env.get("GITHUB_RUN_ATTEMPT"),
+                              args.trusted_ref, args.trusted_repo)
+    else:
+        why = refusal(hook, env.get("GITHUB_EVENT_NAME"), env.get("GITHUB_REF"), env.get("GITHUB_REPOSITORY"), event,
+                      env.get("GITHUB_WORKFLOW_REF"), env.get("GITHUB_JOB"))
     if why:
         print(f"{PREFIX}: refused: {why}", flush=True)
         print(f"::error::{PREFIX}: refused: {why}", flush=True)
         return 1
     print(f"{PREFIX}: admitted: {hook.workflow_file(env.get('GITHUB_WORKFLOW_REF'))} {env.get('GITHUB_JOB')} on "
-          f"{env.get('GITHUB_REF')} ({NIGHTLY_ONLY_LABEL})", flush=True)
+          f"{env.get('GITHUB_REF')} ({'trusted ' + args.trusted_ref if args.trusted_ref else NIGHTLY_ONLY_LABEL})",
+          flush=True)
     return 0
 
 

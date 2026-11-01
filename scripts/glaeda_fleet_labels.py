@@ -480,7 +480,7 @@ def dedicated_runners(manifest: Any, member: str) -> tuple[list[dict[str, Any]],
         if not isinstance(entry, dict):
             return [], f"{where} is not an object"
         unknown = sorted(set(entry) - {"name", "repo", "org", "group", "labels", "admit", "watch", "env", "keep",
-                                       "minFreeGib", "note"})
+                                       "minFreeGib", "note", "trustedRef", "trustedRepo"})
         if unknown:
             return [], f"{where} has unknown keys: {', '.join(unknown)}"
         name, repo, org, group = entry.get("name"), entry.get("repo"), entry.get("org"), entry.get("group")
@@ -498,6 +498,18 @@ def dedicated_runners(manifest: Any, member: str) -> tuple[list[dict[str, Any]],
             return [], f"{where}.org must be an organization login"
         if group is not None and (org is None or not isinstance(group, str) or not group.strip()):
             return [], f"{where}.group goes with org"
+        # DEDICATED_TRUSTED: trustedRef and trustedRepo make the entry a trusted-only runner, like a trusted member's
+        # pool: the hook gets --trusted-ref/--trusted-repo, so it takes only that repository's push and schedule jobs
+        # on that branch. It registers at that repository (repo, never org) and may carry a trusted pool label whose
+        # every declaring member has the same trust, so a second host can serve a trusted pool without a pool there.
+        trusted_ref, trusted_repo = entry.get("trustedRef"), entry.get("trustedRepo")
+        if (trusted_ref is None) != (trusted_repo is None):
+            return [], f"{where}.trustedRef and {where}.trustedRepo go together"
+        if trusted_ref is not None and not (
+                isinstance(trusted_ref, str) and re.fullmatch(TRUSTED_REF_RE, trusted_ref)
+                and isinstance(trusted_repo, str) and re.fullmatch(REPO_RE, trusted_repo) and repo == trusted_repo):
+            return [], (f"{where}.trustedRef must be a branch ref (refs/heads/...) and trustedRepo owner/name, the "
+                        "entry's own repo (a trusted runner registers at that repository, never at an org)")
         labels = entry.get("labels")
         if not (isinstance(labels, list) and labels and all(isinstance(x, str) and re.fullmatch(RUNNER_LABEL_RE, x)
                                                             for x in labels)):
@@ -507,7 +519,8 @@ def dedicated_runners(manifest: Any, member: str) -> tuple[list[dict[str, Any]],
                         "runner takes only the jobs that name its own labels")
         if pools is None:
             pools = {label.lower() for label in declared_pools(manifest)}
-        shared = sorted(x for x in labels if x.lower() in pools)
+        shared = sorted(x for x in labels if x.lower() in pools and not (
+            trusted_ref is not None and trusted_pool_matches(manifest, x, trusted_ref, trusted_repo)))
         if shared:
             return [], (f"{where}.labels must leave out the manifest's pool labels ({', '.join(shared)}): a pool job "
                         "would land on the builder, outside pool capacity and reservations")
@@ -541,5 +554,21 @@ def dedicated_runners(manifest: Any, member: str) -> tuple[list[dict[str, Any]],
             return [], f"{where}.minFreeGib must be a number of GiB above 0 and at most 10000"
         out.append({"name": name, "repo": repo, "org": org, "group": group, "labels": list(labels),
                     "admit": commands["admit"], "watch": commands.get("watch"), "env": dict(env),
-                    "keep": list(keep), "minFreeGib": None if floor is None else float(floor)})
+                    "keep": list(keep), "minFreeGib": None if floor is None else float(floor),
+                    "trustedRef": trusted_ref, "trustedRepo": trusted_repo})
     return out, None
+
+
+def trusted_pool_matches(manifest: Any, label: str, trusted_ref: str, trusted_repo: str) -> bool:
+    """Whether `label` is a trusted pool label (glaeda-trusted-...) and every member that declares it is trusted-only
+    on exactly trusted_ref of trusted_repo: only then may a trusted runner.dedicated entry carry it."""
+    if not label.lower().startswith("glaeda-trusted-"):
+        return False
+    members = declared_pools(manifest).get(label) or declared_pools(manifest).get(label.lower()) or []
+    if not members:
+        return False
+    for member in members:
+        summary, _ = member_labels(manifest, member, lambda app: True)
+        if not summary or summary.get("trustedRef") != trusted_ref or summary.get("trustedRepo") != trusted_repo:
+            return False
+    return True
