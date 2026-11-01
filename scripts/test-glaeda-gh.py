@@ -866,6 +866,209 @@ class ControllerTest(Base):
                 os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
 
 
+class GraphqlDietTest(Base):
+    """2026-11-01: the daemons on huge-blue and cosmic-gray were the account's biggest GraphQL spenders (938 and 833
+    queries an hour) while their clients read about two dozen PRs. Idle watches back off, a comment wait on a
+    repository the controller covers relies on its webhooks, a running head there is re-read on its own check
+    events, heads due close together share a query, and daemon.json says what each query was for."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.ctl = FakeController()
+        feed_every, gg.CONTROLLER_FEED_EVERY = gg.CONTROLLER_FEED_EVERY, 0
+        self.addCleanup(setattr, gg, "CONTROLLER_FEED_EVERY", feed_every)
+        self.daemon = gg.Daemon(transport=self.gh, token=lambda: TOKEN, controller=self.ctl)
+        self.saved_config = gg.CONSUMERS_CONFIG
+        gg.CONSUMERS_CONFIG = Path(self.tmp.name) / "consumers.json"
+        self.addCleanup(setattr, gg, "CONSUMERS_CONFIG", self.saved_config)
+
+    def touch(self, key: str, at: float) -> None:
+        os.utime(gg.watch_dir() / gg.file_name(key), (at, at))
+
+    def feed_covers(self, repo: str = "o/r") -> None:
+        """A delivery for `repo`: the controller's webhooks cover it from now on."""
+        self.ctl.suites.append({"id": 99, "repo": repo, "head_sha": "f" * 40, "status": "completed"})
+
+    def pr_reads(self) -> int:
+        return sum(1 for c in self.gh.gql_calls() if "pullRequest(number:" in json.loads(c[3])["query"])
+
+    def test_an_unread_pr_backs_off_and_a_read_brings_it_back(self) -> None:
+        self.gh.prs[("o", "r", 1)] = pr_node(1)
+        gg.register("pr:o/r#1")
+        for i in range(15):  # nobody reads it after registering: 15 cycles to IDLE_EXPIRY
+            self.daemon.tick(NOW + i * gg.CYCLE)
+        idle = self.pr_reads()
+        self.assertLessEqual(idle, 8)  # every cycle for IDLE_BACKOFF_AFTER, then about as often as it was last read
+        self.assertGreaterEqual(idle, 6)
+        # a read (the broker serving it from the cache touches the watch) puts it back on every cycle
+        before = self.pr_reads()
+        gg.touch_interest("pr:o/r#1")
+        self.touch("pr:o/r#1", NOW + 14 * gg.CYCLE)
+        for i in range(15, 18):
+            self.daemon.tick(NOW + i * gg.CYCLE)
+        self.assertEqual(self.pr_reads() - before, 3)
+
+    def test_a_waited_pr_never_backs_off(self) -> None:
+        self.gh.prs[("o", "r", 1)] = pr_node(1)
+        for i in range(12):
+            if i % 3 == 0:
+                gg.register("pr:o/r#1", waited=True)
+                self.touch("pr:o/r#1", NOW)  # the wait's own touch is old; its waitedAt is what counts
+                gg.write_json(gg.watch_dir() / gg.file_name("pr:o/r#1"),
+                              {**gg.read_json(gg.watch_dir() / gg.file_name("pr:o/r#1")), "waitedAt": NOW + i * gg.CYCLE})
+                self.touch("pr:o/r#1", NOW)
+            self.daemon.tick(NOW + i * gg.CYCLE)
+        self.assertEqual(self.pr_reads(), 12)
+
+    def test_an_idle_pr_ignores_check_event_nudges(self) -> None:
+        node = pr_node(1)
+        node["headRefName"] = "feat/x"
+        self.gh.prs[("o", "r", 1)] = node
+        gg.register("pr:o/r#1")
+        self.daemon.tick(NOW)
+        start = NOW + gg.IDLE_BACKOFF_AFTER + gg.CYCLE
+        self.daemon.tick(start)
+        reads = self.pr_reads()
+        self.ctl.suites.append({"id": 1, "repo": "o/r", "head_sha": "a" * 40, "status": "completed"})
+        self.daemon.tick(start + gg.NUDGE_MIN)
+        self.assertEqual(self.pr_reads(), reads)  # unread for over IDLE_BACKOFF_AFTER: its slower cycle stands
+        self.touch("pr:o/r#1", start + gg.NUDGE_MIN)  # someone reads it again: nudges count again
+        self.ctl.suites.append({"id": 2, "repo": "o/r", "head_sha": "a" * 40, "status": "completed"})
+        self.daemon.tick(start + 2 * gg.NUDGE_MIN)
+        self.assertEqual(self.pr_reads(), reads + 1)
+
+    def test_a_closed_or_merged_pr_is_dropped_after_its_last_reader(self) -> None:
+        self.gh.prs[("o", "r", 1)] = pr_node(1, state="MERGED")
+        gg.register("pr:o/r#1")
+        self.daemon.tick(NOW)
+        self.assertEqual(self.daemon.tick(NOW + gg.TERMINAL_GRACE + 1)["watching"], 0)
+        self.assertEqual(self.pr_reads(), 1)
+
+    def test_a_comment_wait_on_a_covered_repository_polls_only_as_a_safety_net(self) -> None:
+        self.gh.issues[("o", "r", 7)] = {"__typename": "Issue", "url": "u", "state": "OPEN",
+                                         "comments": {"totalCount": 0, "nodes": []}}
+        self.daemon.tick(NOW)  # the feed's first read only learns the cursor
+        self.feed_covers()
+        key = "comment:o/r#7"
+        reads = []
+        for i in range(0, 241, gg.COMMENT_CYCLE):
+            gg.register(key)
+            self.touch(key, NOW + i)  # the wait touches it every TOUCH_EVERY
+            self.daemon.tick(NOW + i + 1)
+            reads.append(len(self.gh.gql_calls()))
+        self.assertLessEqual(reads[-1], 3)  # 0 s, then every COMMENT_FED_CYCLE: 240 s
+        # a comment the webhook delivers reaches the cache at once, with no GitHub read
+        self.ctl.comments.append({"repo": "o/r", "number": 7, "id": 5, "url": "c", "created_at": "2026-11-01T00:00:00Z",
+                                  "author": "x", "body": "done"})
+        self.daemon.tick(NOW + 243)
+        self.assertEqual(gg.read_cache(key)["data"]["comments"][-1]["body"], "done")
+        self.assertEqual(len(self.gh.gql_calls()), reads[-1])
+
+    def test_a_comment_wait_elsewhere_keeps_its_fast_cycle(self) -> None:
+        self.gh.issues[("t", "s", 7)] = {"__typename": "Issue", "url": "u", "state": "OPEN",
+                                         "comments": {"totalCount": 0, "nodes": []}}
+        self.daemon.tick(NOW)
+        self.feed_covers("o/r")  # the controller covers o/r, not t/s
+        key = "comment:t/s#7"
+        for i in range(0, 61, gg.COMMENT_CYCLE):
+            gg.register(key)
+            self.touch(key, NOW + i)
+            self.daemon.tick(NOW + i + 1)
+        self.assertEqual(len(self.gh.gql_calls()), 5)  # every COMMENT_CYCLE, as before
+
+    def test_a_running_head_on_a_covered_repository_waits_for_its_check_events(self) -> None:
+        sha = "a" * 40
+        self.gh.heads[("o", "r", sha)] = [check_run("CI / build", "IN_PROGRESS", None)]
+        key = gg.parse_key("head", f"o/r@{sha}")
+        self.daemon.tick(NOW)
+        self.feed_covers()
+        gg.register(key, consumer="merge-guard")
+        self.daemon.tick(NOW + gg.TICK)
+        self.assertEqual(len(self.gh.gql_calls()), 1)
+        gg.register(key, consumer="merge-guard")
+        self.daemon.tick(NOW + gg.TICK + gg.HEAD_PENDING_TTL)
+        self.assertEqual(len(self.gh.gql_calls()), 1)  # covered: the pending TTL is HEAD_PENDING_FED_TTL
+        self.gh.heads[("o", "r", sha)] = [check_run("CI / build")]
+        self.ctl.suites.append({"id": 3, "repo": "o/r", "head_sha": sha, "status": "completed"})
+        self.daemon.tick(NOW + 2 * gg.TICK + gg.HEAD_PENDING_TTL)
+        self.assertEqual(len(self.gh.gql_calls()), 2)  # its check event re-read it at once
+        self.assertTrue(gg.read_cache(key)["data"]["settled"])
+
+    def test_a_running_head_elsewhere_keeps_its_ttl(self) -> None:
+        sha = "a" * 40
+        self.gh.heads[("o", "r", sha)] = [check_run("CI / build", "IN_PROGRESS", None)]
+        key = gg.parse_key("head", f"o/r@{sha}")
+        gg.register(key, consumer="merge-guard")
+        self.daemon.tick(NOW)
+        gg.register(key, consumer="merge-guard")
+        self.daemon.tick(NOW + gg.HEAD_PENDING_TTL + gg.TICK)
+        self.assertEqual(len(self.gh.gql_calls()), 2)
+
+    def test_heads_due_close_together_share_one_query(self) -> None:
+        shas = ["a" * 40, "b" * 40]
+        for sha in shas:
+            self.gh.heads[("o", "r", sha)] = [check_run("CI / build", "IN_PROGRESS", None)]
+        gg.register(gg.parse_key("head", f"o/r@{shas[0]}"), consumer="c")
+        self.daemon.tick(NOW)
+        gg.register(gg.parse_key("head", f"o/r@{shas[1]}"), consumer="c")
+        self.daemon.tick(NOW + 20)  # each read alone so far
+        self.assertEqual(len(self.gh.gql_calls()), 2)
+        for sha in shas:
+            gg.register(gg.parse_key("head", f"o/r@{sha}"), consumer="c")
+        self.daemon.tick(NOW + gg.HEAD_PENDING_TTL + gg.TICK)  # the first is due; the second is due in 18 s
+        self.assertEqual(len(self.gh.gql_calls()), 3)
+        self.daemon.tick(NOW + gg.HEAD_PENDING_TTL + 20 + gg.TICK)
+        self.assertEqual(len(self.gh.gql_calls()), 3)  # it rode along: no second query
+        self.assertNotIn("c", self.daemon.denied)
+
+    def test_daemon_json_says_what_each_query_was_for(self) -> None:
+        self.gh.prs[("o", "r", 1)] = pr_node(1)
+        gg.register("pr:o/r#1")
+        status = self.daemon.tick(NOW)
+        self.assertEqual(status["graphqlBy"]["pr"]["queries"], 1)
+        self.assertGreaterEqual(status["graphqlBy"]["pr"]["points"], 1)
+
+    def test_a_fleet_of_watches_stays_well_under_300_queries_an_hour(self) -> None:
+        """The shape measured on huge-blue (2026-11-01 05:00Z): 31 PRs (9 waited, 11 unread for 10 minutes or
+        more), 40 heads asked for every minute, and a comment wait, on repositories the controller covers."""
+        for n in range(1, 32):
+            self.gh.prs[("o", "r", n)] = pr_node(n)
+        heads = [f"{n:040x}" for n in range(1, 41)]
+        for sha in heads:
+            self.gh.heads[("o", "r", sha)] = [check_run("CI / build", "IN_PROGRESS", None)]
+        self.gh.issues[("o", "r", 900)] = {"__typename": "Issue", "url": "u", "state": "OPEN",
+                                           "comments": {"totalCount": 0, "nodes": []}}
+        self.daemon.tick(NOW)
+        self.feed_covers()
+        for n in range(1, 32):
+            gg.register(f"pr:o/r#{n}", waited=n <= 9)
+            if n > 20:
+                self.touch(f"pr:o/r#{n}", NOW - 600)
+        t = NOW
+        while t < NOW + 3600:
+            t += gg.TICK
+            minute = int(t - NOW) % 60 < gg.TICK
+            if int(t - NOW) % gg.TOUCH_EVERY < gg.TICK:
+                for n in range(1, 21):  # nine waits and eleven readers keep reading
+                    gg.register(f"pr:o/r#{n}", waited=n <= 9) if n <= 9 else self.touch(f"pr:o/r#{n}", t)
+                gg.register("comment:o/r#900")
+                self.touch("comment:o/r#900", t)
+            if minute:
+                for i, sha in enumerate(heads):
+                    gg.register(gg.parse_key("head", f"o/r@{sha}"), consumer=f"c{i % 4}")
+                    self.touch(gg.parse_key("head", f"o/r@{sha}"), t)
+            for n in range(1, 21):
+                path = gg.watch_dir() / gg.file_name(f"pr:o/r#{n}")
+                doc = gg.read_json(path)
+                if n <= 9 and doc is not None:
+                    doc["waitedAt"] = t
+                    gg.write_json(path, doc)
+                    self.touch(f"pr:o/r#{n}", t)
+            self.daemon.tick(t)
+        hour = len(self.gh.gql_calls())
+        self.assertLess(hour, 300, self.daemon.status.get("graphqlBy"))
+
+
 class UpstreamTest(Base):
     """A host with no login reads through upstream.json's program: one request per tick, never GitHub."""
 
@@ -3160,6 +3363,8 @@ class OverloadTest(Base):
         lone = []
         for cycle in range(0, 12):
             sizes.clear()
+            for n in range(1, 7):  # its readers keep reading: no idle backoff
+                os.utime(gg.watch_dir() / gg.file_name(f"pr:o/r#{n}"), (NOW + cycle * gg.CYCLE,) * 2)
             self.daemon.tick(NOW + cycle * gg.CYCLE)
             lone.append(sizes.count(1))
         self.assertEqual(self.daemon.heavy["pr:o/r#3"]["fails"] >= gg.HEAVY_AFTER, True)
@@ -3167,6 +3372,8 @@ class OverloadTest(Base):
         self.assertLess(sum(lone[gg.HEAVY_AFTER + 1:]), len(lone) - gg.HEAVY_AFTER - 1)
         poison.clear()  # it answers again: two lone answers put it back into the batches
         for cycle in range(12, 12 + 2 * gg.LEAN_FACTOR + 2):
+            for n in range(1, 7):
+                os.utime(gg.watch_dir() / gg.file_name(f"pr:o/r#{n}"), (NOW + cycle * gg.CYCLE,) * 2)
             self.daemon.tick(NOW + cycle * gg.CYCLE)
         self.assertNotIn("pr:o/r#3", self.daemon.heavy)
 

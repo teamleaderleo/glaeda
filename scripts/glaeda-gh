@@ -69,6 +69,14 @@ the daemon is the only process that talks to GitHub, and clients only read its c
   60 s doubling to 15 min, whichever is longer, and no read is sent during it.
 - Comment watches (an issue's or PR's latest 50 comments) are one batched GraphQL query every 15 s
   (over REST: the issue and the page or two holding them), and last only while someone waits on them.
+- Reads follow interest. A PR nobody has waited on or read for IDLE_BACKOFF_AFTER (5 minutes) is polled about
+  as often as it was last read, up to every 10 minutes, and its check events no longer re-read it early; a read
+  (a `status`, a wait, the broker answering from the cache) puts it back on every cycle. A comment wait on a
+  repository the controller's webhooks cover (its feed answered within a minute and delivered an event for
+  that repository within the hour) gets new comments from the feed and polls GitHub every 2 minutes as a
+  safety net; a running head there is re-read on its own check events and otherwise every 3 minutes, and a head
+  due within 30 s rides along in the query of one due now. daemon.json's graphqlBy says what the last hour's
+  queries read (pr, run, comment, head, steps, head-pages) and the points GitHub charged for them.
 - The X-RateLimit headers and the GraphQL rateLimit field drive a budget guard: below the floor
   (REST 1500 left, GraphQL 500) the daemon polls four times less often and skips job lists; below
   the reserve (REST 300, GraphQL 100) it stops that API until the quota resets. The quota is shared,
@@ -322,6 +330,18 @@ WAIT_INTEREST = CLIENT_RUN_LONG_POLL + 2 * TOUCH_EVERY
 CONTROLLER_ABSENT = 900  # a controller without the run-events receiver (404, 503) is asked again this rarely
 FEED_PAGES = 5  # feed pages read per tick at most; a longer backlog continues on the next tick
 NUDGE_MIN = 20  # a PR a check event nudged is re-read at most this often (GraphQL points)
+# GraphQL diet (2026-11-01: the daemons on huge-blue and cosmic-gray spent 938 and 833 GraphQL queries an hour, the
+# account's biggest spenders, while their clients read about two dozen PRs). A watch nobody has read lately is
+# polled about as often as it was last read, a comment wait on a repository the controller's webhooks cover
+# relies on them and polls GitHub only as a safety net, and a running head the controller covers is re-read on
+# its own check events, so the TTL is only the safety net there too.
+IDLE_BACKOFF_AFTER = 300  # a PR nobody has read or waited on for this long is polled as often as it was last read
+IDLE_BACKOFF_MAX = 600  # ... but no less often than this (it expires at IDLE_EXPIRY)
+COMMENT_FED_CYCLE = 120  # comment watches on a repository the controller's issue_comment webhooks cover
+HEAD_PENDING_FED_TTL = 180  # a running head on such a repository: its check events re-read it sooner
+HEAD_ALIGN = 30  # a head read also takes the heads due within this long, so they share one query
+CONTROLLER_FRESH = 60  # the controller's feed answered this recently: its webhooks are flowing
+FED_REPO_KEEP = 3600  # a repository the feed delivered an event for this recently is one the controller covers
 # Head check reads (`glaeda-gh checks`): every session that wants a commit's checks asks the daemon, which
 # reads each head once for all of them, in batched GraphQL queries, and keeps the answer. Each asker names
 # a consumer; a consumer has an hourly budget of head reads. A reserved consumer (next-autoland) is always
@@ -470,6 +490,15 @@ def posted_dir() -> Path:
 
 def file_name(key: str) -> str:
     return hashlib.sha256(key.encode()).hexdigest()[:32] + ".json"
+
+
+def touch_interest(key: str) -> None:
+    """A read the cache answered still counts as interest: the watch's mtime is its last read (the daemon's idle
+    backoff and IDLE_EXPIRY go by it). Only an existing watch is touched, and a failure costs nothing."""
+    try:
+        os.utime(watch_dir() / file_name(key))
+    except OSError:
+        pass
 
 
 def write_json(path: Path, doc: Any) -> None:
@@ -1426,7 +1455,11 @@ class Daemon:
         self.controller_cursor: int | None = None
         self.controller_seen: dict[str, bool] = {}  # watched run key -> the controller knows the run
         self.controller_status: dict[str, Any] = {"state": "off" if self.controller is None else "starting"}
-        self.nudged: set[str] = set()  # PRs a check event touched since their last fetch
+        self.nudged: set[str] = set()  # PRs (and heads) a check event touched since their last fetch
+        self.controller_ok_at = float("-inf")  # the last time the change feed answered
+        self.fed_repos: dict[str, float] = {}  # owner/repo (lowercase) -> the last event the feed delivered for it
+        self.gql_reason = "other"  # what the GraphQL query being sent reads, for daemon.json graphqlBy
+        self.gql_log: list[tuple[float, str, int]] = []  # (time, reason, points) per GraphQL query, last hour
         self.token_source = token
         self.token: str | None = None
         doc = read_json(BASE / "budget.json")
@@ -2134,6 +2167,23 @@ class Daemon:
                                               self.last_read(e) - (WAIT_PRIORITY if self.waited(e) else 0),
                                               not self.waited(e)))
 
+    def fed(self, key: str) -> bool:
+        """Whether the controller's webhooks cover this key's repository now: its feed answered within
+        CONTROLLER_FRESH and delivered an event for the repository within FED_REPO_KEEP."""
+        if self.now - self.controller_ok_at > CONTROLLER_FRESH:
+            return False
+        _, owner, repo, _ = split_key(key)
+        return self.now - self.fed_repos.get(f"{owner}/{repo}".lower(), float("-inf")) <= FED_REPO_KEEP
+
+    def idle_interval(self, e: dict, interval: float) -> float:
+        """How often an open PR is polled: every cycle while a wait is on it or someone read it lately; an
+        unwaited one nobody has read for a while as often as it was last read (its readers touch the watch, and
+        broker answers from the cache touch it too), up to IDLE_BACKOFF_MAX. IDLE_EXPIRY drops it after that."""
+        idle = self.now - e["touched"]
+        if self.waited(e) or idle < IDLE_BACKOFF_AFTER:
+            return interval
+        return min(max(IDLE_BACKOFF_MAX, interval), max(interval, idle))
+
     def due(self, kind: str, entries: list[dict]) -> list[dict]:
         mine = [e for e in entries if e["key"].startswith(kind + ":")]
         path = self.route(kind)
@@ -2168,8 +2218,9 @@ class Daemon:
             if (kind == "pr" and c is not None and e["key"] in self.nudged
                     and self.now - self.attempted.get(e["key"], float("-inf")) >= NUDGE_MIN):
                 self.nudged.discard(e["key"])  # a check event on its head: re-read now, not at the cycle
-                out.append(e)
-                continue
+                if self.idle_interval(e, interval) <= interval:  # (an idle one keeps its slower cycle)
+                    out.append(e)
+                    continue
             if kind == "run" and c is not None and e["key"] in self.controller_filled and c.get("source") == "controller":
                 # (a run REST has shown newer than the controller's record keeps its normal cycle below: the
                 # controller missed that attempt's deliveries, so it is not the source for it)
@@ -2206,6 +2257,12 @@ class Daemon:
             elif full and (not terminal(kind, c.get("data")) or self.now - c.get("fetchedAt", 0) >= TERMINAL_REFRESH
                            # a reader came after the last fetch: a rerun or reopen may have changed it
                            or e["touched"] > c.get("fetchedAt", 0)):
+                since = self.now - c.get("fetchedAt", 0)
+                if kind == "comment" and self.fed(e["key"]) and since < COMMENT_FED_CYCLE - TICK:
+                    continue  # the controller's issue_comment webhooks carry its new comments (merge_comments)
+                want = self.idle_interval(e, interval) if kind == "pr" and not terminal(kind, c.get("data")) else interval
+                if want > interval and since < want - interval / 2:
+                    continue  # unread and unwaited: polled about as often as it was last read
                 out.append(e)
         for e in out:
             self.attempted[e["key"]] = self.now
@@ -2247,15 +2304,24 @@ class Daemon:
             if self.now - at > 2 * self.policy["cycle"]:  # a read that raised never reported back
                 self.refund(key)
         out = []
+        due, soon = [], []
         for e in mine:
+            c = e["cache"] or {}
+            if not any(self.now - t < HEAD_INTEREST for t in e["consumers"].values()):
+                continue
+            if not c.get("data"):
+                due.append(e)
+                continue
+            ttl, age = self.head_ttl(e), self.now - (c.get("dataAt") or 0)
+            if age >= ttl or (e["key"] in self.nudged and age >= NUDGE_MIN):
+                due.append(e)
+            elif age >= ttl - HEAD_ALIGN:
+                soon.append(e)  # due shortly: it rides along with a head due now, one query instead of two
+        due_keys = {e["key"] for e in due}
+        for e in due + (soon if due else []):
             asked = {n: t for n, t in e["consumers"].items() if self.now - t < HEAD_INTEREST}
             c = e["cache"] or {}
-            if not asked:
-                continue
-            if c.get("data"):
-                ttl = HEAD_SETTLED_TTL if c["data"].get("settled") else HEAD_PENDING_TTL
-                if self.now - (c.get("dataAt") or 0) < ttl:
-                    continue
+            self.nudged.discard(e["key"])
             retry = HEAD_MISSING_RETRY if c.get("missing") else self.policy["cycles"]["head"]
             if e["key"] in self.deferred:
                 self.deferred.discard(e["key"])  # the last tick ran out of time for it: no cycle to wait
@@ -2264,14 +2330,24 @@ class Daemon:
             payer = next((n for n in sorted(asked, key=lambda n: (n not in policy["reserved"], n))
                           if self.head_allowed(n, mode, policy)), None)
             if payer is None:
-                for n in asked:
-                    self.denied[n] = self.now
+                if e["key"] in due_keys:  # (a head only riding along was not refused anything: its TTL has not run out)
+                    for n in asked:
+                        self.denied[n] = self.now
                 continue
             self.head_spend.setdefault(payer, []).append(self.now)
             self.payer[e["key"]] = (payer, self.now)
             self.attempted[e["key"]] = self.now
             out.append(e)
         return out
+
+    def head_ttl(self, e: dict) -> float:
+        """How long a head's answer stands: a settled one HEAD_SETTLED_TTL; a running one HEAD_PENDING_TTL, or
+        HEAD_PENDING_FED_TTL where the controller's webhooks cover its repository and re-read it on its own check
+        events (nudge)."""
+        data = (e["cache"] or {}).get("data") or {}
+        if data.get("settled"):
+            return HEAD_SETTLED_TTL
+        return HEAD_PENDING_FED_TTL if self.fed(e["key"]) else HEAD_PENDING_TTL
 
     def write_consumers(self) -> None:
         policy = consumer_policy()
@@ -2397,6 +2473,7 @@ class Daemon:
             waiting = None
             self.errors.append(f"waits: {describe(error)} at {error_site(error)}")
         self.deferred &= {e["key"] for e in entries}
+        self.nudged &= {e["key"] for e in entries}
         self.attempted = {k: t for k, t in self.attempted.items() if self.now - t < 2 * IDLE_EXPIRY}
         self.rest_tried = {k: t for k, t in self.rest_tried.items() if self.now - t < 2 * IDLE_EXPIRY}
         oldest = self.oldest_data(entries, {e["key"] for e in prs + runs + comments + heads})
@@ -2415,6 +2492,13 @@ class Daemon:
         hour = {what: sum(1 for _, w in self.sent if w == what)
                 for what in ("rest", "rest304", "graphql", "free", "write")}
         self.reads = [r for r in self.reads if self.now - r[0] < 3600]
+        self.gql_log = [g for g in self.gql_log if self.now - g[0] < 3600]
+        graphql_by: dict[str, dict[str, int]] = {}
+        for _, why, points in self.gql_log:
+            mine = graphql_by.setdefault(why, {"queries": 0, "points": 0})
+            mine["queries"] += 1
+            mine["points"] += points
+        self.fed_repos = {r: t for r, t in self.fed_repos.items() if self.now - t < FED_REPO_KEEP}
         reads = {kind: {b: sum(1 for _, k, w in self.reads if k == kind and w == b) for b in ("graphql", "rest")}
                  for kind in CYCLES}
         status = {"pid": os.getpid(), "at": self.now, "watching": len(entries), "waits": WAITS_CONTRACT,
@@ -2427,7 +2511,7 @@ class Daemon:
                   "lastHour": hour,
                   "restShare": {"spent": self.rest_spent(), "cap": self.rest_cap(),
                                 "share": self.policy["restShare"], "capped": self.rest_capped()},
-                  "heartbeat": HEARTBEAT_EVERY, "paths": dict(self.paths), "reads": reads,
+                  "heartbeat": HEARTBEAT_EVERY, "paths": dict(self.paths), "reads": reads, "graphqlBy": graphql_by,
                   "perMinute": {b: round(self.richness(b) * 60, 1) for b in ("rest", "graphql")},
                   "batch": dict(self.batch), "oldestData": oldest, "deferred": len(self.deferred),
                   "outbox": {"queued": len(list(outbox_dir().glob("*.json"))) if outbox_dir().is_dir() else 0,
@@ -2631,6 +2715,7 @@ class Daemon:
             if self.mode("graphql") == "stop":
                 return chunk + [e for c in queue for e in c]
             self.gql_limited = False
+            self.gql_reason = kind
             try:
                 error = fetch(chunk)
                 spilled, self.spill = self.spill, []
@@ -2734,11 +2819,14 @@ class Daemon:
         """(doc, None) or (None, error message). Notes the rateLimit field when the query asks for it."""
         try:
             status, _, doc = self.request("POST", "/graphql", {"query": query, "variables": variables})
-        except (WatchError, OSError) as error:
+        except (WatchError, OSError) as error:  # (a held or timed-out query is not counted: it may not have run)
             return None, f"graphql: {describe(error)}"
+        rate = ((doc.get("data") or {}).get("rateLimit") or {}) if isinstance(doc, dict) else {}
+        cost = rate.get("cost") if isinstance(rate, dict) else None
+        self.gql_log.append((self.now, self.gql_reason,
+                             cost if isinstance(cost, int) and not isinstance(cost, bool) and cost > 0 else 1))
         if status != 200 or not isinstance(doc, dict):
             return None, f"graphql: HTTP {status}"
-        rate = (doc.get("data") or {}).get("rateLimit") or {}
         if rate:
             self.note_budget("graphql", rate.get("limit"), rate.get("remaining"), iso_epoch(rate.get("resetAt")))
         return doc, None
@@ -2858,7 +2946,11 @@ class Daemon:
                 page = contexts.get("pageInfo") or {}
                 if not page.get("hasNextPage"):
                     break
-                more, error = self.graphql("query{" + head_query(owner, repo, sha, page.get("endCursor")) + "}", {})
+                reason, self.gql_reason = self.gql_reason, "head-pages"
+                try:
+                    more, error = self.graphql("query{" + head_query(owner, repo, sha, page.get("endCursor")) + "}", {})
+                finally:
+                    self.gql_reason = reason
                 if more is None:
                     return error or "graphql: no response"
                 rollup = ((((more.get("data") or {}).get("repository") or {}).get("object") or {}).get("statusCheckRollup"))
@@ -2890,7 +2982,11 @@ class Daemon:
             if self.mode("graphql") == "stop":
                 return
             try:
-                doc, error = self.graphql(STEPS_QUERY, {"ids": ids[i:i + STEPS_BATCH]})
+                reason, self.gql_reason = self.gql_reason, "steps"
+                try:
+                    doc, error = self.graphql(STEPS_QUERY, {"ids": ids[i:i + STEPS_BATCH]})
+                finally:
+                    self.gql_reason = reason
             except OutOfTime:  # the checks go without their steps; their PRs go first next tick
                 for check_id in ids[i:]:
                     self.deferred.update(owners[check_id])
@@ -3251,6 +3347,12 @@ class Daemon:
             except WatchError as error:
                 return self.controller_down(error)
             self.controller_failures = 0
+            self.controller_ok_at = self.now
+            for page in pages:
+                for item in (page.get("runs") or []) + (page.get("suites") or []) + (page.get("comments") or []):
+                    repo = str(item.get("repo") or "").lower()
+                    if "/" in repo:
+                        self.fed_repos[repo] = self.now
         runs = {e["key"]: e for e in entries if e["key"].startswith("run:") and not e["jobs"]}
         self.controller_seen = {k: v for k, v in self.controller_seen.items() if k in runs}
         for key, e in runs.items():
@@ -3310,6 +3412,11 @@ class Daemon:
         if not touched:
             return
         for e in entries:
+            if e["key"].startswith("head:"):
+                _, owner, repo, sha = split_key(e["key"])
+                if (f"{owner}/{repo}".lower(), "sha:" + sha) in touched:
+                    self.nudged.add(e["key"])  # a check event on this commit: its rollup changed
+                continue
             data = (e["cache"] or {}).get("data") or {}
             if not e["key"].startswith("pr:") or not data:
                 continue
@@ -7528,6 +7635,8 @@ def cmd_gh(args: list[str]) -> int:
                 print(payload, file=sys.stderr)
                 return BROKER_EXIT_REFUSED
             if route == "serve":
+                if key is not None:
+                    touch_interest(key)
                 broker_note({"route": "serve", "key": key, **said})
                 print(payload)
                 return EXIT_OK
