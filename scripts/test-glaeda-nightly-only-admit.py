@@ -234,6 +234,8 @@ class DedicatedOnlyTest(unittest.TestCase):
             got = fleet.retire_instance("m", 4)
         self.assertEqual(got["state"], "retired")
         mint.assert_called_once_with("orgs/manaflow-ai", "remove-token")
+        self.assertEqual(calls[-1][0], fleet.POOL_RECEIPTS)  # the retirement is confirmed on the mini afterwards
+        calls = calls[:-1]
         self.assertTrue(all("--manifest" not in cmd and "--instance 4" in cmd for cmd, _ in calls))
         self.assertEqual(calls[-1][1], "tok\n")
 
@@ -281,8 +283,24 @@ class DedicatedOnlyApplyTest(unittest.TestCase):
             got = fleet.retire_instance("m", 2)
         self.assertEqual(got["state"], "retired")
         mint.assert_not_called()
-        self.assertNotIn("--token-stdin", calls[-1][0])
-        self.assertIsNone(calls[-1][1])
+        self.assertNotIn("--token-stdin", calls[-2][0])
+        self.assertIsNone(calls[-2][1])
+
+    def test_an_uninstall_that_exits_0_but_leaves_the_runner_is_not_retired(self):
+        for listing, needle in (("receipt instance-3/receipt.json\ndir actions-runner-glaeda-3", "still there"),
+                                ("dir actions-runner-glaeda-3", "no receipt")):
+            def fake_run(argv, timeout, stdin=None, listing=listing):
+                if argv[-1] == fleet.POOL_RECEIPTS:
+                    return 0, listing, ""
+                if "--apply" not in argv[-1]:
+                    return 0, json.dumps({"actions": [{"kind": "deregister", "state": "kept"}]}), ""
+                return 0, "{}", ""  # kept a directory it does not own, and exited 0
+            with self.subTest(listing=listing), mock.patch.object(fleet, "run", side_effect=fake_run), \
+                    mock.patch.object(fleet, "mint"):
+                got = fleet.retire_instance("m", 3)
+            self.assertEqual(got["exit"], 1)
+            self.assertIn("unconfirmed", got["state"])
+            self.assertIn(needle, got["state"])
 
     def test_a_retirement_with_no_deregistration_plan_fails_closed(self):
         with mock.patch.object(fleet, "run", return_value=(0, json.dumps({"actions": [{"kind": "note"}]}), "")), \
@@ -379,7 +397,20 @@ class TrustedDedicatedTest(unittest.TestCase):
                             session_runner=False, dedicated=entry, instance=None, gateway_runner=False,
                             member={"hardware": "m4pro-48", "xcodeApps": [], "trustedRef": None})
             return b"".join(runner.hook_wrappers(ctx).values()).decode()
-        text = started(dict(TRUSTED))
+        member_ctx = started  # the member summary path below; the real dedicated path leaves ctx.member None
+
+        def dedicated_path(entry):
+            ctx = mock.Mock(python=sys.executable, home=home, hook_dir=home / "h",
+                            runner_dir=home / "actions-runner-glaeda-x", org=None, repo=REPO, min_free_gib=0,
+                            capacity_units=0, labels=list(entry["labels"]), session_runner=False, dedicated=entry,
+                            instance=None, gateway_runner=False, member=None)
+            return b"".join(runner.hook_wrappers(ctx).values()).decode()
+        # as dedicated_context() builds it (review of d24d574e: the trust arguments must not need ctx.member)
+        text = dedicated_path(dict(TRUSTED))
+        self.assertIn("--trusted-ref refs/heads/main --trusted-repo manaflow-ai/cmux", text)
+        self.assertNotIn("--trusted-ref", dedicated_path(dict(NIGHTLY_ONLY, trustedRef=None, trustedRepo=None)))
+        text = member_ctx(dict(TRUSTED))
+        self.assertNotIn("--test-keychain", text)
         self.assertIn("--trusted-ref refs/heads/main --trusted-repo manaflow-ai/cmux", text)
         self.assertNotIn("--trusted-next-nightly", text)
         self.assertNotIn("--trusted-ref", started(dict(NIGHTLY_ONLY, trustedRef=None, trustedRepo=None)))

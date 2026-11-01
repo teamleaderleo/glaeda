@@ -694,8 +694,16 @@ def retire_instance(member: str, instance: int) -> dict[str, Any]:
                           _uninstall_cmd(member, instance, True, receipt_only=True, token=bool(scope))],
                          APPLY_TIMEOUT_S, stdin=token + "\n" if scope else None)
     del token
-    state = "retired" if code == 0 else f"retire failed ({_failed_note(out, err, code)})"
-    return {"instance": instance, "exit": code, "state": state, "name": None}
+    if code != 0:
+        return {"instance": instance, "exit": code, "state": f"retire failed ({_failed_note(out, err, code)})",
+                "name": None}
+    # Exit 0 is no proof: an uninstall that keeps a directory it does not own (a missing or foreign ownership marker)
+    # also exits 0. Retired means the mini lists neither its receipt nor a pool directory without one.
+    left, why = installed_pool_instances(member)
+    if left is None or instance in left:
+        return {"instance": instance, "exit": 1, "name": None,
+                "state": f"retire unconfirmed ({why or 'its receipt is still there'}); dedicated runners held"}
+    return {"instance": instance, "exit": 0, "state": "retired", "name": None}
 
 
 def apply_instance(member: str, instance: int, repo: str | None, extra: list[str], org: str | None = None,
