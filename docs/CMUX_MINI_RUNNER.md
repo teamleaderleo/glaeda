@@ -206,7 +206,14 @@ What `--apply` does:
      refused at once when that list does not name this hook: its claim gate would fail it after the drain anyway, so
      the run's Blacksmith job signs minutes sooner and no PR job waits behind it. A list it cannot read changes nothing.
      Admitted, the hook writes `GLAEDA_JOB_CLAIM=exclusive` to `$GITHUB_ENV`, and cmux's signing jobs check it
-     before they touch the key, so a mini on an older hook never signs beside another job. The hook's `JOB_CORES` table gives a job its own measured
+     before they touch the key, so a mini on an older hook never signs beside another job. A nightly promotion lease
+     (`PROMOTION_LEASE`, `~/.local/bin/glaeda-promotion-admit --request-stdin`, which every runner-fleet stage
+     installs) takes the same exclusive claim for one exact `promote-nightly-next` job before it starts a unique JIT
+     listener; that job's job-started (`--promotion-lease`) adopts the held claim under the lease lock instead of
+     taking its own, any other job on that runner is refused, and the lease lets the claim go once the adopted
+     Runner.Worker has exited. The claim's holder stays while that adopted Runner.Worker lives even if the lease's
+     supervisor dies, a listener that exits while ready with no job lets the claim go, and the next request stops a
+     dead supervisor's leftover listener and removes its runner tree. See the helper's docstring for the request, receipt and withdrawal rules. The hook's `JOB_CORES` table gives a job its own measured
      cost where it is far from its class's: cmux-next's generated files, both autofix
      workflows' action exports and cmux-tui's `macos` 6, cmux-next's `fast-tier` (off the fast
      runner) and `daemon-test` 5, `cmux-scheme-compile`, the iOS builds, cmux-tui's `macos-relay`

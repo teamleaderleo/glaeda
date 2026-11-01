@@ -21,7 +21,7 @@ TOOL = ROOT / "scripts" / "glaeda-cmux-runner-fleet"
 # What the tool needs beside itself: the staged files and the labels module. Each test runs a copy from its own
 # git checkout with a local bare origin, so HEAD and origin's main are whatever the test makes them.
 CHECKOUT_FILES = ("glaeda-cmux-runner-fleet", "glaeda-cmux-runner", "glaeda-cmux-runner-hook",
-                  "glaeda_fleet_labels.py", "glaeda_reservation.py")
+                  "glaeda_fleet_labels.py", "glaeda_reservation.py", "glaeda-promotion-admit")
 TOKEN = "AAAREGTOKEN123"
 MANIFEST = {
     "defaults": {"xcode": {"apps": [{"path": "/Applications/Xcode_26.6.app", "version": "26.6", "build": "17F113"}]},
@@ -456,6 +456,18 @@ class FleetTest(unittest.TestCase):
         self.assertTrue(all("no registration token" in s for s in states))
         self.assertFalse(any(c["tool"] == "ssh" and "--apply" in c["remote"] for c in self.calls()))
 
+
+    def test_stage_installs_the_promotion_admit_helper(self) -> None:
+        """HQ's promotion lease runs ~/.local/bin/glaeda-promotion-admit: every stage copies it with the runner
+        scripts and installs it there by an atomic rename."""
+        result = self.fleet("--apply", "--hosts", "mini-a")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        calls = self.calls()
+        scp = [c for c in calls if c["tool"] == "scp" and any(a.endswith("/glaeda-cmux-runner-hook") for a in c["argv"])]
+        self.assertTrue(scp and any(a.endswith("/glaeda-promotion-admit") for a in scp[0]["argv"]), scp)
+        install = [c["remote"] for c in calls if c["tool"] == "ssh" and "~/.local/bin/glaeda-promotion-admit" in c["remote"]]
+        self.assertEqual(len(install), 1, install)
+        self.assertIn("mv -f ~/.local/bin/.glaeda-promotion-admit.tmp ~/.local/bin/glaeda-promotion-admit", install[0])
 
     def test_an_unreadable_latest_release_tells_every_instance_the_pin(self) -> None:
         result = self.fleet("--apply", "--hosts", "mini-a", FAKE_NO_RELEASE="1")

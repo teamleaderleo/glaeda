@@ -2172,6 +2172,43 @@ class HookTest(unittest.TestCase):
         finally:
             self.finish("p0")
 
+    def test_a_promotion_lease_runner_adopts_or_refuses_and_never_takes_capacity(self) -> None:
+        """PROMOTION_LEASE: job-started on a lease runner never queues for units (the lease holds them); with no lease
+        to adopt it refuses at once, and job-completed there leaves the lease's claim alone."""
+        self.fleet()
+        capacity = self.dir / "capacity"
+        capacity.mkdir(parents=True, exist_ok=True)
+        busy = [hook.lock_file(capacity / f"unit-{n}", fcntl.LOCK_EX) for n in range(4)]  # the mini is full
+        try:
+            env = {"GITHUB_JOB": "promote-nightly-next", "GITHUB_ENV": os.fspath(self.dir / "lease-env"),
+                   "GITHUB_WORKFLOW_REF": "manaflow-ai/cmux/.github/workflows/nightly.yml@refs/heads/main"}
+            start = time.monotonic()
+            refused = self.job("promote-nightly-next", "cmux-promotion-x", 4, None, "--promotion-lease",
+                               os.fspath(self.dir / "no-lease"), env=env)
+            self.assertEqual(refused.returncode, 1, refused.stdout + refused.stderr)
+            self.assertLess(time.monotonic() - start, 15)
+            self.assertIn("promotion lease: cannot read the lease", refused.stdout)
+            self.assertNotIn("waiting", refused.stdout)
+            self.assertFalse((self.dir / "lease-env").exists())
+        finally:
+            for fd in busy:
+                os.close(fd)
+        state = self.dir / "state"
+        state.mkdir(exist_ok=True)
+        holder = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+        try:
+            pid_file = hook.holder_file(state, "cmux-promotion-x")
+            pid_file.write_text(f"{holder.pid}\n")
+            done = self.run_hook("job-completed", None, None, "--no-disk", "--state-dir", os.fspath(state),
+                                 "--promotion-lease", os.fspath(self.dir / "no-lease"),
+                                 env={"RUNNER_NAME": "cmux-promotion-x"})
+            self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+            self.assertIn("keeps its exclusive claim", done.stdout)
+            self.assertEqual(pid_file.read_text().strip(), str(holder.pid), "the lease's holder is untouched")
+        finally:
+            holder.kill()
+            holder.wait()
+
     def _assert_nightly_job_holds_the_whole_mini(self, job: str) -> None:
         self.assertEqual(hook.job_class(job, "manaflow-ai/cmux", workflow="nightly.yml"), ("exclusive", False))
         self.assertNotEqual(hook.job_class(job, "manaflow-ai/cmux", workflow="other.yml")[0], "exclusive")
