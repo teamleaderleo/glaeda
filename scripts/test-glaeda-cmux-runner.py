@@ -2477,7 +2477,8 @@ class HookTest(unittest.TestCase):
             self.assertIsNotNone(fd)
             self.addCleanup(os.close, fd)
         try:
-            for job, runner in (("verify-signed-nightly", "n1"), ("verify-final-dmg-nightly", "n2")):
+            for job, runner in (("verify-signed-nightly", "n1"), ("verify-final-dmg-nightly", "n2"),
+                                ("decide", "n3")):
                 with self.subTest(job=job):
                     admitted = self.nightly_job("refs/heads/nightly-next", runner, job)
                     self.assertEqual(admitted.returncode, 0, admitted.stdout + admitted.stderr)
@@ -2485,7 +2486,7 @@ class HookTest(unittest.TestCase):
                     self.assertIn(f"holding 2/14 units for {job} (light", admitted.stdout)
                     self.finish(runner)
         finally:
-            for runner in ("n1", "n2"):
+            for runner in ("n1", "n2", "n3"):
                 self.finish(runner)
 
     def dev_daily_job(self, runner: str, job: str = "verify", *extra: str) -> subprocess.CompletedProcess:
@@ -4718,6 +4719,15 @@ time.sleep(60)
         # the nightly app build compiles in its own workspace: no root a seed on the trusted mini waits for
         self.assertEqual(hook.job_class("build-nightly-app", home, home, "nightly.yml"), ("isolated", False))
         self.assertEqual(hook.job_class("build-nightly-app", home, home, "other.yml"), ("compile", True))
+        # These controls may use a picked owned Mac, but do no Xcode app compile or root work. They use the
+        # light class's measured two-core p75; the remote daemon runs concurrent Go cross-builds.
+        for job in ("decide", "build-nightly-remote-daemon", "await-nightly-tree-marker",
+                    "resolve-nightly-cmux-tui-client", "find-nightly-next-recovery", "build-nightly-inputs",
+                    "pick-nightly-build-runner", "resolve-nightly-ghostty-cli-helper"):
+            with self.subTest(job=job):
+                self.assertEqual(hook.job_class(job, home, home, "nightly.yml"), ("light", False))
+                self.assertEqual(hook.job_units("light", job, home, home, "nightly.yml"), hook.CLASS_COST["light"][0])
+                self.assertEqual(hook.job_class(job, home, home, "other.yml"), ("compile", True))
         # the nightly Ghostty helper runs Zig in its workspace: light (no root), sized by its measured cores
         self.assertEqual(hook.job_class("build-nightly-ghostty-cli-helper", home, home, "nightly.yml"), ("light", False))
         self.assertEqual(hook.job_units("light", "build-nightly-ghostty-cli-helper", home, home, "nightly.yml"), 4)
