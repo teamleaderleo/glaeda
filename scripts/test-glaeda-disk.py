@@ -7151,6 +7151,11 @@ class VolumeCensusTest(unittest.TestCase):
         self.assertFalse(run(skipped="eviction_busy"))
         self.assertFalse(run(off=True, skipped="off"))
 
+    def test_a_census_state_with_bad_times_is_due(self) -> None:
+        self.assertTrue(gd.census_due({"complete": True, "started_at": "x"}, 0.0))
+        self.assertTrue(gd.census_due({"slice_at": None}, 0.0))
+        self.assertTrue(gd.census_due({"slice_at": [1]}, 0.0))
+
     def test_a_running_slice_blocks_another_launch(self) -> None:
         saved = (gd.CENSUS_LOCK, gd.CENSUS_AUTOLAUNCH, gd.census_roots)
         gd.CENSUS_LOCK, gd.CENSUS_AUTOLAUNCH = Path(self.tmp.name) / "census.lock", True
@@ -9542,8 +9547,7 @@ class HomeScratchTest(unittest.TestCase):
         patches = [mock.patch.object(gd, "LAUNCHD_SYSTEM_DIRS", (daemons, self.home / "LaunchAgents")),
                    mock.patch.object(gd, "_owned_query", query),
                    mock.patch.object(gd, "_home_scratch_ref_text",
-                                     lambda c: None if c == plist else real_text(c)),
-                   mock.patch.dict(gd._LAUNCHD_LOADED_TEXT, clear=True)]
+                                     lambda c: None if c == plist else real_text(c))]
         for p in patches:
             p.start()
             self.addCleanup(p.stop)
@@ -9560,10 +9564,13 @@ class HomeScratchTest(unittest.TestCase):
         daemons.mkdir()
         loaded = (f"system/com.tailscale.tailscaled = {{\n\tpath = {daemons}/com.tailscale.tailscaled.plist\n"
                   "\tprogram = /usr/local/bin/tailscaled\n\targuments = {\n\t\t/usr/local/bin/tailscaled\n\t}\n}\n")
-        _, calls = self.launchd_print(daemons, {"system/com.tailscale.tailscaled": (0, loaded)})
+        outputs = {"system/com.tailscale.tailscaled": (0, loaded)}
+        plist, calls = self.launchd_print(daemons, outputs)
         self.assertEqual(gd.home_scratch_referenced(tree), "")
-        self.assertEqual(gd.home_scratch_referenced(tree), "")
-        self.assertEqual(len(calls), 1)  # once per run
+        self.assertEqual(calls, [["/bin/launchctl", "print", "system/com.tailscale.tailscaled"]])
+        # reloaded mid-run with a working directory in the folder: the recheck before a delete asks launchd again
+        outputs["system/com.tailscale.tailscaled"] = (0, loaded.replace("}\n", f"\tworking directory = {tree}\n}}\n", 1))
+        self.assertEqual(gd.home_scratch_referenced(tree), f"named by {plist}")
 
     def test_a_loaded_job_that_names_the_folder_keeps_it(self) -> None:
         tree = self.tree("cnx-served")
@@ -9581,7 +9588,6 @@ class HomeScratchTest(unittest.TestCase):
         other = (f"system/com.tailscale.tailscaled = {{\n\tpath = /Library/LaunchDaemons/elsewhere.plist\n}}\n")
         self.launchd_print(daemons, {"system/com.tailscale.tailscaled": (0, other)})
         self.assertEqual(gd.home_scratch_referenced(tree), "home folder references unreadable")
-        gd._LAUNCHD_LOADED_TEXT.clear()
         with mock.patch.object(gd, "_owned_query", side_effect=subprocess.TimeoutExpired("launchctl", 5)):
             self.assertEqual(gd.home_scratch_referenced(tree), "home folder references unreadable")
 

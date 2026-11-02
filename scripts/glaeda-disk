@@ -3771,28 +3771,24 @@ def _home_scratch_ref_text(config: Path) -> str | None:
 # stayed (cmux15, 2026-11-02: 49.8 GiB of folders idle 2-35 days, with 62 GiB free against a 207 GiB target). launchd
 # shows any user the job it loaded from that plist (`launchctl print`: program, arguments, working directory,
 # environment, log paths), which is everything in it that can name a folder, so that text stands in for the file.
-# A job launchd has not loaded, or one loaded from another path, still keeps the folder.
+# A job launchd has not loaded, or one loaded from another path, still keeps the folder. launchd is asked again on
+# every check, the recheck before a delete included, so a job reloaded mid-run is read as it is then.
 LAUNCHD_SYSTEM_DIRS = (Path("/Library/LaunchDaemons"), Path("/Library/LaunchAgents"))
 LAUNCHCTL_PRINT_TIMEOUT_S = 5.0
-_LAUNCHD_LOADED_TEXT: dict[str, str | None] = {}  # path -> launchctl's text, once per run (survey, apply, recheck)
 
 
 def _launchd_loaded_text(config: Path) -> str | None:
     """What launchd loaded from an unreadable /Library launchd plist, or None when it cannot say."""
     if not DARWIN or config.parent not in LAUNCHD_SYSTEM_DIRS or config.suffix != ".plist":
         return None
-    if os.fspath(config) in _LAUNCHD_LOADED_TEXT:
-        return _LAUNCHD_LOADED_TEXT[os.fspath(config)]
     domain = "system" if config.parent == LAUNCHD_SYSTEM_DIRS[0] else f"gui/{os.getuid()}"
-    text = None
     try:
         rc, out = _owned_query(["/bin/launchctl", "print", f"{domain}/{config.stem}"], LAUNCHCTL_PRINT_TIMEOUT_S)
     except (OSError, subprocess.SubprocessError):
-        rc, out = 1, ""
-    if rc == 0 and re.search(rf"^\s*path = {re.escape(os.fspath(config))}\s*$", out, re.M):
-        text = out
-    _LAUNCHD_LOADED_TEXT[os.fspath(config)] = text
-    return text
+        return None
+    if rc != 0 or not re.search(rf"^\s*path = {re.escape(os.fspath(config))}\s*$", out, re.M):
+        return None
+    return out
 
 
 def home_scratch_referenced(path: Path) -> str:
@@ -8325,9 +8321,14 @@ def save_census(state: dict[str, Any], path: Path | None = None) -> None:
 
 
 def census_due(state: dict[str, Any], now: float) -> bool:
-    if state.get("complete"):
-        return now - float(state.get("started_at", 0)) >= CENSUS_EVERY_S
-    return now - float(state.get("slice_at", 0)) >= CENSUS_RESUME_S
+    """A state whose times are not numbers is due: the slice starts over (census_pass) instead of failing the caller,
+    which may be an apply pass."""
+    try:
+        if state.get("complete"):
+            return now - float(state.get("started_at", 0)) >= CENSUS_EVERY_S
+        return now - float(state.get("slice_at", 0)) >= CENSUS_RESUME_S
+    except (TypeError, ValueError):
+        return True
 
 
 def census_covered() -> set[str]:
