@@ -3766,6 +3766,35 @@ def _home_scratch_ref_text(config: Path) -> str | None:
     return text
 
 
+# A launchd job another user installed may keep its plist root-only: Tailscale's com.tailscale.tailscaled.plist is
+# mode 0600 on cmux14 and cmux15, so every home-scratch folder there read "home folder references unreadable" and
+# stayed (cmux15, 2026-11-02: 49.8 GiB of folders idle 2-35 days, with 62 GiB free against a 207 GiB target). launchd
+# shows any user the job it loaded from that plist (`launchctl print`: program, arguments, working directory,
+# environment, log paths), which is everything in it that can name a folder, so that text stands in for the file.
+# A job launchd has not loaded, or one loaded from another path, still keeps the folder.
+LAUNCHD_SYSTEM_DIRS = (Path("/Library/LaunchDaemons"), Path("/Library/LaunchAgents"))
+LAUNCHCTL_PRINT_TIMEOUT_S = 5.0
+_LAUNCHD_LOADED_TEXT: dict[str, str | None] = {}  # path -> launchctl's text, once per run (survey, apply, recheck)
+
+
+def _launchd_loaded_text(config: Path) -> str | None:
+    """What launchd loaded from an unreadable /Library launchd plist, or None when it cannot say."""
+    if not DARWIN or config.parent not in LAUNCHD_SYSTEM_DIRS or config.suffix != ".plist":
+        return None
+    if os.fspath(config) in _LAUNCHD_LOADED_TEXT:
+        return _LAUNCHD_LOADED_TEXT[os.fspath(config)]
+    domain = "system" if config.parent == LAUNCHD_SYSTEM_DIRS[0] else f"gui/{os.getuid()}"
+    text = None
+    try:
+        rc, out = _owned_query(["/bin/launchctl", "print", f"{domain}/{config.stem}"], LAUNCHCTL_PRINT_TIMEOUT_S)
+    except (OSError, subprocess.SubprocessError):
+        rc, out = 1, ""
+    if rc == 0 and re.search(rf"^\s*path = {re.escape(os.fspath(config))}\s*$", out, re.M):
+        text = out
+    _LAUNCHD_LOADED_TEXT[os.fspath(config)] = text
+    return text
+
+
 def home_scratch_referenced(path: Path) -> str:
     """Why a home-scratch folder stays because configuration names it ("" when nothing does): a launchd job, a shell
     or agent config, a runner script or hook, or a ~/.local/bin symlink into it. Unreadable configuration keeps it.
@@ -3788,6 +3817,8 @@ def home_scratch_referenced(path: Path) -> str:
         if os.path.abspath(config).startswith(inside):
             continue  # a folder's own scripts (a runner's run.sh, .runner, .env), where they sit, never keep it
         text = _home_scratch_ref_text(config)
+        if text is None:
+            text = _launchd_loaded_text(config)
         if text is None:
             return "home folder references unreadable"
         if _mentions_any(text, spellings):
@@ -8224,6 +8255,7 @@ CENSUS_ROWS_SHOWN = 48
 CENSUS_SCOPE = "volume-census"
 CENSUS_FILES = ".glaeda-census-files"  # pseudo child naming the loose files of an opened directory
 CENSUS_AUTOLAUNCH = True
+CENSUS_AFTER_SKIPS = (None, "no pressure", "no pressure; idle sweep ran within the hour")  # apply runs it follows
 DATA_VOLUME = Path("/System/Volumes/Data")
 APFS_INVISIBLE = "apfs-invisible (open-deleted/purgeable)"
 
@@ -11577,6 +11609,13 @@ def _logged_main(args: list[str]) -> int:
     try:
         status = _main_impl(args)
         release_hook_pass(served=status == 0 and RUN.get("skipped") not in UNSERVED)
+        # A CI mini only ever runs --apply passes (the runner hooks and the pressure agent), never the report that
+        # starts the census, so its accounting said "unwalked (no volume census yet)" for 258-291 GiB on cmux15,
+        # cmux10s, cmux8s and cmuxs-6 (2026-11-02). A pass that ran starts the slice once its deletions are done;
+        # the census stays once a day, resumed at most hourly, and never overlaps itself (its lock). A pass that
+        # coalesced into a running one, or deferred, does not start it: that one may still be deleting.
+        if status == 0 and RUN.get("apply") and not RUN.get("off") and RUN.get("skipped") in CENSUS_AFTER_SKIPS:
+            launch_background_census()
         return status
     except BaseException as e:
         RUN.setdefault("skipped", f"error: {type(e).__name__}")

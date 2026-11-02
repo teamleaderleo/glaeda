@@ -7134,6 +7134,23 @@ class VolumeCensusTest(unittest.TestCase):
         self.assertEqual(got["accounting_gap"], 4 * gd.GIB)
         self.assertTrue(got["residual"]["category"].startswith("unwalked"))
 
+    def test_a_finished_apply_pass_starts_the_census(self) -> None:
+        # CI minis run only --apply passes, so the census never ran there (cmux15, 2026-11-02: 258 GiB "unwalked")
+        def run(**fields):
+            def impl(args):
+                gd.RUN.update(apply=True, **fields)
+                return 0
+            with mock.patch.object(gd, "_main_impl", impl), mock.patch.object(gd, "release_hook_pass"), \
+                    mock.patch.object(gd, "write_run_line"), \
+                    mock.patch.object(gd, "launch_background_census") as launch:
+                self.assertEqual(gd._logged_main(["--pressure", "--apply"]), 0)
+            return launch.called
+        self.assertTrue(run())
+        self.assertTrue(run(skipped="no pressure"))
+        self.assertFalse(run(skipped="coalesced into the running pass (runner hook)"))
+        self.assertFalse(run(skipped="eviction_busy"))
+        self.assertFalse(run(off=True, skipped="off"))
+
     def test_a_running_slice_blocks_another_launch(self) -> None:
         saved = (gd.CENSUS_LOCK, gd.CENSUS_AUTOLAUNCH, gd.census_roots)
         gd.CENSUS_LOCK, gd.CENSUS_AUTOLAUNCH = Path(self.tmp.name) / "census.lock", True
@@ -9512,6 +9529,69 @@ class HomeScratchTest(unittest.TestCase):
         (self.home / ".zshrc").write_text("export X=1\n")
         with mock.patch.object(gd, "_home_scratch_ref_text", return_value=None):
             self.assertEqual(gd.home_scratch_referenced(self.home / "cnx-locked"), "home folder references unreadable")
+
+    def launchd_print(self, daemons: Path, outputs: dict[str, tuple[int, str]]):
+        """A root-only plist in daemons/ that the test cannot read, and launchctl print answering from outputs."""
+        plist = daemons / "com.tailscale.tailscaled.plist"
+        plist.write_text("<plist/>")
+        calls: list[list[str]] = []
+        def query(argv, timeout):
+            calls.append(argv)
+            return outputs.get(argv[-1], (113, "Could not find service"))
+        real_text = gd._home_scratch_ref_text
+        patches = [mock.patch.object(gd, "LAUNCHD_SYSTEM_DIRS", (daemons, self.home / "LaunchAgents")),
+                   mock.patch.object(gd, "_owned_query", query),
+                   mock.patch.object(gd, "_home_scratch_ref_text",
+                                     lambda c: None if c == plist else real_text(c)),
+                   mock.patch.dict(gd._LAUNCHD_LOADED_TEXT, clear=True)]
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+        self.daemons.stop()
+        self.daemons = mock.patch.object(gd, "home_scratch_reference_files",
+                                         wraps=lambda: [*self._reference_files(), plist])
+        self.daemons.start()
+        return plist, calls
+
+    def test_a_root_only_launchd_plist_is_read_through_launchctl(self) -> None:
+        # cmux15, 2026-11-02: Tailscale's 0600 plist kept 49.8 GiB of idle folders as "references unreadable"
+        tree = self.tree("cnx-approvals")
+        daemons = self.home / "LaunchDaemons"
+        daemons.mkdir()
+        loaded = (f"system/com.tailscale.tailscaled = {{\n\tpath = {daemons}/com.tailscale.tailscaled.plist\n"
+                  "\tprogram = /usr/local/bin/tailscaled\n\targuments = {\n\t\t/usr/local/bin/tailscaled\n\t}\n}\n")
+        _, calls = self.launchd_print(daemons, {"system/com.tailscale.tailscaled": (0, loaded)})
+        self.assertEqual(gd.home_scratch_referenced(tree), "")
+        self.assertEqual(gd.home_scratch_referenced(tree), "")
+        self.assertEqual(len(calls), 1)  # once per run
+
+    def test_a_loaded_job_that_names_the_folder_keeps_it(self) -> None:
+        tree = self.tree("cnx-served")
+        daemons = self.home / "LaunchDaemons"
+        daemons.mkdir()
+        loaded = (f"system/com.tailscale.tailscaled = {{\n\tpath = {daemons}/com.tailscale.tailscaled.plist\n"
+                  f"\tworking directory = {tree}\n}}\n")
+        plist, _ = self.launchd_print(daemons, {"system/com.tailscale.tailscaled": (0, loaded)})
+        self.assertEqual(gd.home_scratch_referenced(tree), f"named by {plist}")
+
+    def test_a_root_only_plist_launchd_did_not_load_from_it_still_keeps_it(self) -> None:
+        tree = self.tree("cnx-unloaded")
+        daemons = self.home / "LaunchDaemons"
+        daemons.mkdir()
+        other = (f"system/com.tailscale.tailscaled = {{\n\tpath = /Library/LaunchDaemons/elsewhere.plist\n}}\n")
+        self.launchd_print(daemons, {"system/com.tailscale.tailscaled": (0, other)})
+        self.assertEqual(gd.home_scratch_referenced(tree), "home folder references unreadable")
+        gd._LAUNCHD_LOADED_TEXT.clear()
+        with mock.patch.object(gd, "_owned_query", side_effect=subprocess.TimeoutExpired("launchctl", 5)):
+            self.assertEqual(gd.home_scratch_referenced(tree), "home folder references unreadable")
+
+    def test_a_root_only_plist_launchd_has_not_loaded_keeps_it(self) -> None:
+        tree = self.tree("cnx-notloaded")
+        daemons = self.home / "LaunchDaemons"
+        daemons.mkdir()
+        self.launchd_print(daemons, {})
+        self.assertEqual(gd.home_scratch_referenced(tree), "home folder references unreadable")
+        self.assertEqual(self.survey(self.family())["cnx-notloaded"].verdict, "in-use")
 
     def test_a_mention_that_appears_before_the_delete_keeps_it(self) -> None:
         tree = self.tree("cnx-hybrid")
