@@ -33,10 +33,9 @@ job CI_SEED_TRUSTED_POOL names, which warms the trusted nightly app build). Ever
 refused, so a host dedicated to the nightly runs no side work here. It still refuses a signing job, for the same
 reason as above.
 
-On attempt 1 of a nightly-next push it also lets an older run yield to a newer one (newest run first,
-newest_first_refusal): a pre-publish job of a run the cmux NEXT feed has already overtaken, or a job before the build of
-a run whose newer sibling is already building on this mini, is refused in seconds, so the runner takes the next queued
-job instead. See the block above newest_first_refusal.
+On attempt 1 of a nightly-next push it also lets an overtaken run yield to a newer one (newest run first,
+newest_first_refusal): a pre-publish job of a run whose build is already below the cmux NEXT feed's highest is refused
+in seconds, so the runner takes the next queued job instead. See the block above newest_first_refusal.
 
 It reuses the hook's own pieces (job_tier, dev_compile_refusal, job_class, load_event) by loading the hook file the
 runner actually runs, so the two never disagree on what a nightly job is, and the hook's bytes (pinned by the
@@ -47,12 +46,10 @@ from __future__ import annotations
 import argparse
 import importlib.machinery
 import importlib.util
-import json
 import os
 import re
 import subprocess
 import sys
-import time
 from pathlib import Path
 from typing import Any
 
@@ -114,37 +111,29 @@ def trusted_refusal(hook: Any, event_name: str | None, ref: str | None, reposito
 # Newest run first (claude-sr2-coord, 2026-11-03). nightly-next is promoted about every 6 minutes and a run takes 40-55,
 # so 5-6 runs share these minis' slots at once, and GitHub hands an idle runner the oldest queued job: run 41655282358
 # (#15807) took 39 min from landing to the feed, about 6 of them queued behind older runs. The runners cannot pick a
-# job, so the admission refuses, in seconds, the jobs of an older run that cannot win, and the slot goes to the next
-# queued job. Only attempt 1 of a nightly-next push of the nightly is ever refused this way (a re-run is someone's
-# deliberate choice), and only for one of two reasons, each of which some newer run already beats:
+# job, so the admission refuses, in seconds, the jobs of an older run that is certain not to publish, and the slot goes
+# to the next queued job. Only attempt 1 of a nightly-next push of the nightly is ever refused this way (a re-run is
+# someone's deliberate choice), and only when it is overtaken: the cmux NEXT feed already lists a build above this
+# run's (CFBundleVersion is the run id then the attempt in two digits, nightly_version.py). Publication is
+# latest-wins, so this run can never publish, and cmux's own sign-pick-overtaken.sh already skips its signing for the
+# same reason. Every job up to publish-nightly that takes these runners (BEFORE_PUBLISH_JOBS) yields; post-publication
+# jobs (legacy identity, deltas, reports) never do.
 #
-#   - overtaken: the cmux NEXT feed already lists a build above this run's (CFBundleVersion is the run id then the
-#     attempt in two digits, nightly_version.py). Publication is latest-wins, so this run can never publish, and cmux's
-#     own sign-pick-overtaken.sh already skips its signing for the same reason. Every job up to publish-nightly that
-#     takes these runners (BEFORE_PUBLISH_JOBS) yields. Post-publication jobs (legacy identity, deltas, reports) never do.
-#   - passed: a newer run's build-nightly-app is running on this mini (the job log), and this job comes before this
-#     run's own build (BEFORE_BUILD_JOBS: build-nightly-app and its only ancestors on these runners), so this run's
-#     build has not started. A newer push alone never counts: when every run skipped for a newer push, promotions
-#     outran the pre-build phase and nothing built (cmux #28961). Here the newest run that reaches its build always
-#     keeps it, so some run always builds.
-#
-# Started jobs are never touched; the admission sees only a job about to start. Every read is bounded and any doubt
-# (feed unreadable, log unreadable, an id that is not a number) admits as before.
+# A newer push, or a newer build merely running, never makes a run yield: that newer build may still fail, and when
+# every run skipped for a newer push, promotions outran the pre-build phase and nothing built (cmux #28961). Started
+# jobs are never touched; the admission sees only a job about to start. The read is bounded and any doubt (feed
+# unreadable, an id that is not a number) admits as before.
 NIGHTLY_NEXT_FEED_URL = "https://files-next.cmux.com/nightly-next/next/appcast-arm64.xml"
 FEED_URL_ENV = "GLAEDA_NIGHTLY_NEXT_FEED_URL"  # tests point it at a file:// feed
 FEED_FETCH_S = 8
 FEED_MAX_BYTES = 4 << 20
-JOB_LOG_TAIL_BYTES = 2 << 20  # the job log's newest lines: hours of started/completed lines on a busy mini
-NEWER_BUILD_FRESH_S = 3 * 3600  # a build started longer ago with no completed line lost that line; it is not running
-BEFORE_BUILD_JOBS = frozenset({"resolve-nightly-cmux-tui-client", "pick-nightly-build-runner", "build-nightly-app"})
-BEFORE_PUBLISH_JOBS = BEFORE_BUILD_JOBS | frozenset({
-    "find-nightly-next-recovery", "resolve-nightly-ghostty-cli-helper", "build-nightly-ghostty-cli-helper",
-    "build-nightly-inputs", "check-nightly-webviews", "await-nightly-tree-marker", "prepare-nightly-variant-primary",
-    "prepare-nightly-variant", "signer-dmg-image", "verify-signed-nightly", "verify-final-dmg-nightly",
-    "launch-smoke-nightly"})
+BEFORE_PUBLISH_JOBS = frozenset({
+    "resolve-nightly-cmux-tui-client", "pick-nightly-build-runner", "build-nightly-app", "find-nightly-next-recovery",
+    "resolve-nightly-ghostty-cli-helper", "build-nightly-ghostty-cli-helper", "build-nightly-inputs",
+    "check-nightly-webviews", "await-nightly-tree-marker", "prepare-nightly-variant-primary", "prepare-nightly-variant",
+    "signer-dmg-image", "verify-signed-nightly", "verify-final-dmg-nightly", "launch-smoke-nightly"})
 YIELD_REPOSITORY = "manaflow-ai/cmux"
 NIGHTLY_NEXT_REF = "refs/heads/nightly-next"
-NIGHTLY_APP_JOB = "build-nightly-app"
 SPARKLE_VERSION = re.compile(r"<sparkle:version>\s*([0-9]{1,18})\s*</sparkle:version>")
 
 
@@ -169,51 +158,13 @@ def feed_highest(text: str) -> int | None:
     return max(versions) if versions else None
 
 
-def newer_build_running(lines: list[str], run_id: int, now: float) -> str | None:
-    """The run id of a newer nightly-next push run whose build-nightly-app started on this mini (the job log) within
-    NEWER_BUILD_FRESH_S and has no completed line yet, or None. The log is written by this mini's own hooks; every
-    field is checked anyway, and a line that does not parse is skipped."""
-    started: dict[tuple[str, str, str], int] = {}
-    for line in lines:
-        try:
-            record = json.loads(line)
-        except ValueError:
-            continue
-        if not isinstance(record, dict) or record.get("job") != NIGHTLY_APP_JOB \
-                or record.get("ref") != NIGHTLY_NEXT_REF or record.get("event_name") != "push" \
-                or record.get("repository") != YIELD_REPOSITORY:
-            continue
-        rid, attempt, runner = (str(record.get(key) or "") for key in ("run_id", "run_attempt", "runner"))
-        if not rid.isdigit() or len(rid) > 16 or int(rid) <= run_id:
-            continue
-        key = (rid, attempt, runner)
-        if record.get("event") == "started":
-            at = record.get("at")
-            if isinstance(at, (int, float)) and not isinstance(at, bool) and 0 <= now - at <= NEWER_BUILD_FRESH_S:
-                started[key] = int(rid)
-            else:
-                started.pop(key, None)
-        elif record.get("event") == "completed":
-            started.pop(key, None)
-    return str(max(started.values())) if started else None
-
-
-def yield_refusal(job: str | None, run_id: str | None, run_attempt: str | None, highest: int | None,
-                  log_lines: list[str] | None, now: float) -> str | None:
-    """Why this in-scope job yields to a newer run (overtaken, or passed before its build), or None. Pure."""
+def yield_refusal(job: str | None, run_id: str | None, run_attempt: str | None, highest: int | None) -> str | None:
+    """Why this in-scope job yields to a newer run (the feed already has a newer build), or None. Pure."""
     build = run_build(run_id, run_attempt)
-    if build is None or job not in BEFORE_PUBLISH_JOBS:
+    if build is None or job not in BEFORE_PUBLISH_JOBS or highest is None or highest <= build:
         return None
-    if highest is not None and highest > build:
-        return (f"yielded to a newer run: the cmux NEXT feed already has build {highest}, above this run's {build}, so "
-                "this run can never publish (latest-wins); its slot goes to a newer run's job")
-    if job in BEFORE_BUILD_JOBS and log_lines:
-        newer = newer_build_running(log_lines, build // 100, now)
-        if newer:
-            return (f"yielded to a newer run: run {newer}'s build-nightly-app is building on this mini and this run's "
-                    f"build has not started ({job} comes before it), so this run would not publish first; its slot "
-                    "goes to a newer run's job")
-    return None
+    return (f"yielded to a newer run: the cmux NEXT feed already has build {highest}, above this run's {build}, so this "
+            "run can never publish (latest-wins); its slot goes to a newer run's job")
 
 
 def read_feed_highest(hook: Any) -> int | None:
@@ -231,31 +182,15 @@ def read_feed_highest(hook: Any) -> int | None:
     return feed_highest(fetched.stdout) if fetched.returncode == 0 else None
 
 
-def read_log_tail(path: Path) -> list[str] | None:
-    """The job log's newest whole lines (at most JOB_LOG_TAIL_BYTES), or None when it cannot be read."""
-    try:
-        with open(path, "rb") as handle:
-            size = os.fstat(handle.fileno()).st_size
-            handle.seek(max(0, size - JOB_LOG_TAIL_BYTES))
-            data = handle.read(JOB_LOG_TAIL_BYTES)
-    except OSError:
-        return None
-    lines = data.decode("utf-8", "replace").splitlines()
-    return lines[1:] if size > JOB_LOG_TAIL_BYTES else lines  # the first may be cut
-
-
-def newest_first_refusal(hook: Any, env: Any, log_path: Path | None = None) -> str | None:
-    """yield_refusal for the job in env, reading the feed and this mini's job log only when the job is in scope.
-    Never raises: any failure admits."""
+def newest_first_refusal(hook: Any, env: Any) -> str | None:
+    """yield_refusal for the job in env, reading the feed only when the job is in scope. Never raises: any failure
+    admits."""
     try:
         if not yield_scope(env.get("GITHUB_EVENT_NAME"), env.get("GITHUB_REF"), env.get("GITHUB_REPOSITORY"),
                            env.get("GITHUB_WORKFLOW_REF"), env.get("GITHUB_JOB"), env.get("GITHUB_RUN_ATTEMPT")):
             return None
-        job = env.get("GITHUB_JOB")
-        lines = read_log_tail(log_path or getattr(hook, "JOB_LOG", Path.home() / "Library/Logs/glaeda-cmux-jobs.jsonl")) \
-            if job in BEFORE_BUILD_JOBS else None
-        return yield_refusal(job, env.get("GITHUB_RUN_ID"), env.get("GITHUB_RUN_ATTEMPT"), read_feed_highest(hook),
-                             lines, time.time())
+        return yield_refusal(env.get("GITHUB_JOB"), env.get("GITHUB_RUN_ID"), env.get("GITHUB_RUN_ATTEMPT"),
+                             read_feed_highest(hook))
     except Exception:  # noqa: BLE001  (an ordering hint must never refuse a job by failing)
         return None
 
