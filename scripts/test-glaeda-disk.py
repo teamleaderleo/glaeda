@@ -1908,6 +1908,49 @@ class GlaedaDiskTest(unittest.TestCase):
         finally:
             gd.HOME, gd.FLEET_ROOT, gd.DARWIN = saved
 
+    def test_tart_survey_judges_tarts_access_date_not_its_own_du(self) -> None:
+        """Router review of #1811: the survey's du lists every digest directory, moving the atime it then judged, so a
+        30-day-old image read as recent. The first reading of this run is judged and handed back to the directory;
+        an aside image under a nested namespace is found by the interrupted-deletions pass."""
+        saved = (gd.HOME, gd.FLEET_ROOT, gd.DARWIN, gd.TART_RUN_STARTED)
+        gd.HOME = self.root / "home"
+        gd.FLEET_ROOT = self.root / "shared-fleet"
+        gd.DARWIN = True
+        gd.TART_ACCESS.clear()
+        try:
+            image = gd.HOME / ".tart/cache/OCIs/ghcr.io/org/team/macos-sequoia-vanilla"
+            digest = image / "sha256:abc"
+            (digest / "blobs").mkdir(parents=True)
+            (digest / "disk.img").write_bytes(b"x" * 4096)
+            (image / "latest").symlink_to("sha256:abc")
+            old = time.time() - 30 * 86400
+            for p in (digest / "blobs", digest / "disk.img", digest, image / "latest", image):
+                os.utime(p, (old, old), follow_symlinks=False)
+            gd.TART_RUN_STARTED = time.time() - 1
+            with mock.patch.object(gd, "tart_installed", return_value=True):
+                fam = next(f for f in gd.default_families() if f.id == "tart-images")
+                real_du = gd._measure_missing
+
+                def du_then_touch(paths, deadline=None):
+                    now = time.time()
+                    for p in paths:  # what du's readdir does to an atime-updating filesystem
+                        os.utime(Path(p) / "sha256:abc", (now, old), follow_symlinks=False)
+                    return real_du(paths, deadline)
+                with mock.patch.object(gd, "_measure_missing", side_effect=du_then_touch):
+                    items = gd.survey([fam], fam.min_idle_hours, 0)
+                item = next(i for i in items if i.path == os.fspath(image))
+                self.assertGreater(item.idle_hours, 29 * 24, "judged by Tart's date, not the survey's own du")
+                gd.tart_restore_access()  # what the run's exit does
+                self.assertLess(digest.lstat().st_atime, old + 1, "the date is handed back for the next run")
+            # remove() leaves an aside tree beside the image, under a nested namespace
+            aside = image.parent / f"{gd.DELETING_PREFIX}macos-sequoia-vanilla-1"
+            image.rename(aside)
+            found = [f.root for f in gd.interrupted_families([fam])]
+            self.assertIn(image.parent, found)
+        finally:
+            gd.HOME, gd.FLEET_ROOT, gd.DARWIN, gd.TART_RUN_STARTED = saved
+            gd.TART_ACCESS.clear()
+
     def test_tagged_debug_app_data_is_a_family_but_release_and_next_app_data_never_are(self) -> None:
         saved = (gd.HOME, gd.FLEET_ROOT, gd.DARWIN)
         gd.HOME = self.root

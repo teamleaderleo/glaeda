@@ -5128,7 +5128,10 @@ def interrupted_families(fams: list[Family]) -> list[Family]:
         if fam.id == CMUX_NEXT_CI_FAMILY:  # a whole state set aside leaves no candidate where it sat
             dirs.update(cmux_next_ci_state_parents(fam.root))
             dirs.update(cmux_next_ci_host_parents(fam.root))
-        if fam.discover or fam.checkout_builds:
+        if fam.id == TART_IMAGES:  # an image sits at any depth: every namespace directory above one
+            if tart_root_safe(fam.root):
+                dirs.update(tart_walk(fam.root)[1])
+        elif fam.discover or fam.checkout_builds:
             dirs.update(p.parent for p in candidates(fam))
         else:  # a match family's candidates sit within depth levels too: an aside one left no candidate behind
             level = [fam.root]
@@ -7269,12 +7272,15 @@ def tart_root_safe(root: Path) -> bool:
     return real != home and home in real.parents and real.is_dir()
 
 
-def tart_image_dirs(root: Path) -> list[Path]:
-    """Each image repository under Tart's OCI cache: a directory with a sha256:<digest> child (a pulled manifest;
-    its tag links point at those), found at any depth up to TART_SEARCH_DEPTH and never descended into, never through
-    a symlink. Deleting the repository as one item removes its tags with their digests, so no tag is left dangling,
-    and a nested registry path (ghcr.io/org/team/image) is one item at the image, not at a namespace above it."""
+def tart_walk(root: Path) -> tuple[list[Path], list[Path]]:
+    """(image repositories, the namespace directories above them) under Tart's OCI cache. An image repository is a
+    directory with a sha256:<digest> child (a pulled manifest; its tag links point at those), found at any depth up to
+    TART_SEARCH_DEPTH and never descended into, never through a symlink and never inside an aside tree. Deleting the
+    repository as one item removes its tags with their digests, so no tag is left dangling, and a nested registry path
+    (ghcr.io/org/team/image) is one item at the image, not at a namespace above it. The namespace directories are
+    where remove() leaves an aside image, so interrupted_families looks there."""
     found: list[Path] = []
+    spaces: list[Path] = [root]
     level = [root]
     for _ in range(TART_SEARCH_DEPTH):
         nxt: list[Path] = []
@@ -7283,9 +7289,16 @@ def tart_image_dirs(root: Path) -> list[Path]:
             if d != root and any(p.name.startswith(TART_DIGEST_PREFIX) for p in subdirs):
                 found.append(d)
                 continue
+            if d != root:
+                spaces.append(d)
             nxt.extend(p for p in subdirs if not DELETING_RE.fullmatch(p.name))
         level = nxt
-    return found
+    return found, spaces
+
+
+def tart_image_dirs(root: Path) -> list[Path]:
+    """The image repositories under Tart's OCI cache (tart_walk)."""
+    return tart_walk(root)[0]
 
 
 def tart_last_use(path: Path) -> float:
@@ -7306,8 +7319,42 @@ def tart_last_use(path: Path) -> float:
                 est = e.stat(follow_symlinks=False)
                 # Without Tart nothing on the host reads the cache but glaeda-disk's own walks (the survey's du), which
                 # move atime themselves: only mtime counts then.
-                newest = max(newest, est.st_mtime, est.st_atime if access else 0.0)
+                newest = max(newest, est.st_mtime, tart_access(Path(e.path), est) if access else 0.0)
     return newest
+
+
+# TART_ACCESS: the digest directories' access dates as this run first saw them, before any walk of its own (the
+# survey's du lists every digest directory and so moves its atime). tart_last_use judges by the first reading, and
+# the run's end hands the date back to each directory its walks moved (tart_restore_access), so the next run sees
+# Tart's own date and not glaeda-disk's: otherwise every pass would make every image look used. A Tart access during this very
+# run (after RUN_STARTED) that a later walk moved again is the one date this can hand back wrongly; the live process
+# and open-file checks still keep an image Tart is using, and a wrongly reclaimed image is pulled again.
+TART_ACCESS: dict[str, float] = {}
+TART_RUN_STARTED = time.time()
+
+
+def tart_access(digest: Path, st: os.stat_result) -> float:
+    """The digest directory's access date as Tart left it (TART_ACCESS). Never raises."""
+    if not TART_ACCESS:
+        atexit.register(tart_restore_access)
+    return TART_ACCESS.setdefault(os.fspath(digest), st.st_atime)
+
+
+def tart_restore_access() -> None:
+    """At the end of the run, hand each digest directory the access date Tart left it, where only this run's walks
+    (the survey's du, the verdicts' checks) moved it since (TART_ACCESS). Never raises."""
+    for key, first in list(TART_ACCESS.items()):
+        with contextlib.suppress(OSError):
+            st = os.lstat(key)
+            if st.st_atime > first and st.st_atime >= TART_RUN_STARTED:
+                os.utime(key, (first, st.st_mtime), follow_symlinks=False)
+
+
+def tart_seen(fam: Family, items: list[Path]) -> None:
+    """Read each image's access dates before anything of this run walks it (TART_ACCESS)."""
+    if fam.id == TART_IMAGES:
+        for item in items:
+            tart_last_use(item)
 
 
 def tart_installed() -> bool:
@@ -7326,6 +7373,7 @@ def candidates(fam: Family) -> list[Path]:
         return []
     if fam.id == TART_IMAGES:
         level = tart_image_dirs(fam.root)
+        tart_seen(fam, level)
     elif fam.transcripts or fam.transcript_archives:
         level = transcript_candidates(fam.root, fam.transcript_archives)
     elif fam.discover:
