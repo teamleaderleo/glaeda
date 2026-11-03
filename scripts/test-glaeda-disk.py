@@ -1849,10 +1849,53 @@ class GlaedaDiskTest(unittest.TestCase):
             images, ipsws = fams["tart-images"], fams["tart-ipsws"]
             self.assertEqual(images.root, gd.HOME / ".tart/cache/OCIs")
             self.assertTrue(images.reclaimable and ipsws.reclaimable)
-            self.assertEqual((images.min_idle_hours, ipsws.min_idle_hours), (gd.DEFAULT_AGE_HOURS,) * 2)
+            self.assertEqual((images.min_idle_hours, ipsws.min_idle_hours), (gd.tart_idle_hours(),) * 2)
             self.assertEqual(sorted(p.name for p in gd.candidates(images)),
                              ["macos-sequoia-vanilla", "macos-sonoma-vanilla"], "one image at a time, never ~/.tart/vms")
             self.assertEqual([p.name for p in gd.candidates(ipsws)], ["UniversalMac.ipsw"])
+        finally:
+            gd.HOME, gd.FLEET_ROOT, gd.DARWIN = saved
+
+    def test_tart_images_nested_paths_access_dates_and_symlinked_roots(self) -> None:
+        """Review of #1809: a nested ghcr path is one item at the image, a clone's access date keeps an image, and a
+        symlinked ~/.tart is never walked."""
+        saved = (gd.HOME, gd.FLEET_ROOT, gd.DARWIN)
+        gd.HOME = self.root / "home"
+        gd.FLEET_ROOT = self.root / "shared-fleet"
+        gd.DARWIN = True
+        try:
+            oci = gd.HOME / ".tart/cache/OCIs"
+            nested = oci / "ghcr.io/org/team/macos-tahoe-xcode"
+            (nested / "sha256:def").mkdir(parents=True)
+            (nested / "sha256:def/disk.img").write_bytes(b"d")
+            (nested / "26.0").symlink_to("sha256:def")
+            flat = oci / "ghcr.io/cirruslabs/macos-sequoia-vanilla"
+            (flat / "sha256:abc").mkdir(parents=True)
+            (gd.HOME / ".tart/cache/IPSWs").mkdir(parents=True)
+            fams = {f.id: f for f in gd.default_families()}
+            images = fams["tart-images"]
+            self.assertEqual(sorted(str(p.relative_to(oci)) for p in gd.candidates(images)),
+                             ["ghcr.io/cirruslabs/macos-sequoia-vanilla", "ghcr.io/org/team/macos-tahoe-xcode"],
+                             "the image directory, never a namespace above it or a digest below it")
+            # `tart clone` moves no mtime, only the access date: the image is in use
+            old, now = time.time() - 30 * 86400, time.time()
+            for p in (nested / "26.0", nested / "sha256:def/disk.img", nested / "sha256:def", nested):
+                os.utime(p, (old, old), follow_symlinks=False)
+            self.assertLess(gd.tart_last_use(nested), old + 1)
+            os.utime(nested / "sha256:def", (now, old))  # Tart's contentAccessDate on the digest directory
+            self.assertGreaterEqual(gd.tart_last_use(nested), now - 1)
+            self.assertGreaterEqual(gd.item_mtime(images, nested), now - 1)
+            with mock.patch.object(gd, "tart_installed", return_value=True):
+                self.assertEqual(gd.tart_idle_hours(), gd.TART_IDLE_HOURS)
+            with mock.patch.object(gd, "tart_installed", return_value=False):
+                self.assertEqual(gd.tart_idle_hours(), gd.DEFAULT_AGE_HOURS)
+            # a symlinked ~/.tart (a shared or external store) is someone else's
+            store = self.root / "elsewhere"
+            (gd.HOME / ".tart").rename(store)
+            (gd.HOME / ".tart").symlink_to(store)
+            fams = {f.id: f for f in gd.default_families()}
+            self.assertEqual(gd.candidates(fams["tart-images"]), [])
+            self.assertEqual(gd.candidates(fams["tart-ipsws"]), [])
         finally:
             gd.HOME, gd.FLEET_ROOT, gd.DARWIN = saved
 

@@ -3933,12 +3933,17 @@ def default_families(role: str = "fleet-mini") -> list[Family]:
         # were refused at its 30 GiB floor and every pressure pass reached nothing. A VM made from an image is its own
         # copy under ~/.tart/vms, so the cached image goes once idle DEFAULT_AGE_HOURS (a live tart process or open
         # file still keeps it) and the next `tart clone` pulls it again.
-        Family("tart-images", HOME / ".tart/cache/OCIs", True, "the next tart clone or pull downloads it again",
-               depth=3, owner="Tart (tart pull)", rebuild_minutes=20, min_idle_hours=DEFAULT_AGE_HOURS,
-               platform="macos"),
-        Family("tart-ipsws", HOME / ".tart/cache/IPSWs", True, "the next tart create downloads it again",
+        # An item is one image repository (tart_image_dirs: the directory that holds the sha256:<digest> manifests
+        # and the tag links to them, at any depth, so a nested ghcr path is never cut above or below its image), and
+        # its last use is Tart's own access date on its digest directories (tart_last_use): `tart clone` leaves every
+        # mtime alone, so an image cloned daily would read as idle by mtime and be pulled again, tens of GiB each time.
+        # Where Tart is installed the window is TART_IDLE_HOURS (a week; APFS moves atime lazily), where it is not
+        # DEFAULT_AGE_HOURS (tart_idle_hours). A root that is a symlink or resolves outside HOME is never walked.
+        Family(TART_IMAGES, HOME / ".tart/cache/OCIs", True, "the next tart clone or pull downloads it again",
+               owner="Tart (tart pull)", rebuild_minutes=20, min_idle_hours=tart_idle_hours(), platform="macos"),
+        Family(TART_IPSWS, HOME / ".tart/cache/IPSWs", True, "the next tart create downloads it again",
                files=True, owner="Tart (tart create --from-ipsw)", rebuild_minutes=20,
-               min_idle_hours=DEFAULT_AGE_HOURS, platform="macos"),
+               min_idle_hours=tart_idle_hours(), platform="macos"),
         # Sealed caches (cache_layout) anywhere else in the home directory: ~/.npm/_cacache,
         # ~/.bun/install/cache, ~/.cargo/registry, ~/go/pkg/mod, rustup toolchains. Found by content,
         # so a tool this list never heard of is covered once its cache has a recognized layout.
@@ -4545,6 +4550,8 @@ def item_mtime(fam: Family, path: Path) -> float:
             newest = max(newest, spm_lock(path).stat().st_mtime)
     if fam.id == NIGHTLY_NEXT_FAMILY:
         newest = max(newest, nightly_next_last_use(path))
+    if fam.id in TART_FAMILIES:
+        newest = max(newest, tart_last_use(path))
     return newest
 
 
@@ -7236,8 +7243,88 @@ def _search(fam: Family, budget: int = 20000) -> list[Path]:
 _DISCOVERED: dict[str, list[Path]] = {}
 
 
+TART_IMAGES, TART_IPSWS = "tart-images", "tart-ipsws"
+TART_FAMILIES = frozenset({TART_IMAGES, TART_IPSWS})
+TART_IDLE_HOURS = 7 * 24.0  # a week past Tart's last access; APFS updates atime lazily
+TART_DIGEST_PREFIX = "sha256:"
+TART_SEARCH_DEPTH = 8  # registry/namespace.../image below OCIs; a deeper tree is not Tart's
+TART_BINARIES = ("/opt/homebrew/bin/tart", "/usr/local/bin/tart")
+
+
+def tart_root_safe(root: Path) -> bool:
+    """Whether a Tart cache root may be walked: it and every directory from HOME down to it are real directories
+    (no symlink anywhere on the way) and it resolves inside HOME. A ~/.tart linked to a shared or external store is
+    someone else's, and following it could delete what this host does not own."""
+    try:
+        home = Path(os.path.realpath(HOME))
+        rel = Path(os.path.abspath(root)).relative_to(os.path.abspath(HOME))
+    except ValueError:
+        return False
+    walk = Path(os.path.abspath(HOME))
+    for part in rel.parts:
+        walk = walk / part
+        if walk.is_symlink():
+            return False
+    real = Path(os.path.realpath(root))
+    return real != home and home in real.parents and real.is_dir()
+
+
+def tart_image_dirs(root: Path) -> list[Path]:
+    """Each image repository under Tart's OCI cache: a directory with a sha256:<digest> child (a pulled manifest;
+    its tag links point at those), found at any depth up to TART_SEARCH_DEPTH and never descended into, never through
+    a symlink. Deleting the repository as one item removes its tags with their digests, so no tag is left dangling,
+    and a nested registry path (ghcr.io/org/team/image) is one item at the image, not at a namespace above it."""
+    found: list[Path] = []
+    level = [root]
+    for _ in range(TART_SEARCH_DEPTH):
+        nxt: list[Path] = []
+        for d in level:
+            subdirs = [Path(e.path) for e in _entries(d) if e.is_dir(follow_symlinks=False)]
+            if d != root and any(p.name.startswith(TART_DIGEST_PREFIX) for p in subdirs):
+                found.append(d)
+                continue
+            nxt.extend(p for p in subdirs if not DELETING_RE.fullmatch(p.name))
+        level = nxt
+    return found
+
+
+def tart_last_use(path: Path) -> float:
+    """Tart's last use of a cached image repository: the newest mtime or atime of the repository and of each
+    sha256:<digest> directory in it, read with lstat only. Tart records its access date on the digest directory
+    (contentAccessDate) when it clones or runs from the cache, and `tart clone` changes no mtime. The digest
+    directories are never listed here, which would move the very atime being read. An IPSW is a file: its own times."""
+    try:
+        st = path.lstat()
+    except OSError:
+        return 0.0
+    if not stat.S_ISDIR(st.st_mode):
+        return max(st.st_mtime, st.st_atime)
+    newest = st.st_mtime
+    for e in _entries(path):
+        if e.name.startswith(TART_DIGEST_PREFIX):
+            with contextlib.suppress(OSError):
+                est = e.stat(follow_symlinks=False)
+                newest = max(newest, est.st_mtime, est.st_atime)
+    return newest
+
+
+def tart_installed() -> bool:
+    """Whether this host can run Tart (on PATH or in Homebrew's prefixes). Without it nothing reads the cache."""
+    return bool(shutil.which("tart")) or any(os.access(p, os.X_OK) for p in TART_BINARIES)
+
+
+def tart_idle_hours() -> float:
+    """The idle window of Tart's cache: TART_IDLE_HOURS where Tart is installed (a weekly clone keeps its image even
+    when APFS moved the access date late), DEFAULT_AGE_HOURS where it is not, since nothing on the host reads it."""
+    return TART_IDLE_HOURS if tart_installed() else DEFAULT_AGE_HOURS
+
+
 def candidates(fam: Family) -> list[Path]:
-    if fam.transcripts or fam.transcript_archives:
+    if fam.id in TART_FAMILIES and not tart_root_safe(fam.root):
+        return []
+    if fam.id == TART_IMAGES:
+        level = tart_image_dirs(fam.root)
+    elif fam.transcripts or fam.transcript_archives:
         level = transcript_candidates(fam.root, fam.transcript_archives)
     elif fam.discover:
         key = os.fspath(fam.root)
