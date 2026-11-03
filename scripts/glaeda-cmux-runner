@@ -1660,13 +1660,23 @@ def drain_marked(ctx: Context) -> bool:
         return False
 
 
-def end_drain(ctx: Context) -> bool:
-    """Remove this runner's drain marker; True when there was one."""
+def end_drain(ctx: Context) -> bool | None:
+    """Remove this runner's drain marker: True when it removed one, False when there was none, None when one is
+    there and could not be removed (its gate then stays held until the marker's expiry, which the note says)."""
     try:
         drain_marker_path(ctx).unlink()
-    except (OSError, TypeError):  # none there (FileNotFoundError), or none this can remove
+    except FileNotFoundError:
         return False
+    except (OSError, TypeError):
+        return None
     return True
+
+
+def note_drain_end(act: dict[str, Any], ended: bool | None) -> None:
+    act["drainEnded"] = ended
+    if ended is None:
+        act["note"] = "; ".join(filter(None, [act.get("note"), "its drain marker could not be removed; the runner "
+                                              f"stays held until it expires (at most {DRAIN_TTL_S / 60:g} min)"]))
 
 
 def stop_if_idle(ctx: Context, stop: Callable[[], bool] | None = None, listener_ok: bool = True) -> bool:
@@ -1695,7 +1705,7 @@ def relabel(ctx: Context, act: dict[str, Any], stopped: Callable[[], None] | Non
             act["note"] += f"; {DRAINING}"
             act["draining"] = True
         return
-    act["drainEnded"] = end_drain(ctx)  # stopped idle: the runner it starts again takes jobs under the new labels
+    note_drain_end(act, end_drain(ctx))  # stopped idle: the runner it starts again takes jobs under the new labels
     if not ctx.skip_launchctl:
         ctx.agent_started = False  # stopped now, whatever the plan saw; the agent step reads this
     if stopped is not None:
@@ -1787,7 +1797,7 @@ def apply_install(ctx: Context, actions: list[dict[str, Any]], receipt_doc: dict
     elif any(a["kind"] == "register" and a["state"] == "unchanged" for a in actions) and drain_marked(ctx):
         # its labels already match (another apply re-registered it): a drain left behind would keep it off
         for act in [a for a in actions if a["kind"] == "register"]:
-            act["drainEnded"] = end_drain(ctx)
+            note_drain_end(act, end_drain(ctx))
     if ctx.headless and not failed and not ctx.skip_launchctl:
         try:
             ensure_headless_helper(ctx)

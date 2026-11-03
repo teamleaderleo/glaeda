@@ -1643,19 +1643,31 @@ def job_tier(event_name: str | None, ref: str | None, repository: str | None, ev
 # expiry (DRAIN_TTL_S at most), so an apply that died never keeps a runner off for good.
 RUNNER_DRAIN_FILE = ".glaeda-drain"
 DRAIN_TTL_S = 3600.0
+DRAIN_MAX_BYTES = 4096
 
 
 def runner_drain(runner_dir: Path, now: float) -> str | None:
     """Why this runner is draining (RUNNER_DRAIN), or None: no marker, an expired one, or one that cannot be read."""
+    # a job runs as this user in this tree, so the read is bounded: no symlink, no FIFO or device, at most
+    # DRAIN_MAX_BYTES, and nothing in it can raise past here; a marker that is not a small regular file holds nothing
     try:
-        doc = json.loads((runner_dir / RUNNER_DRAIN_FILE).read_text())
-    except (OSError, ValueError):
-        return None
-    if not isinstance(doc, dict):
+        fd = os.open(runner_dir / RUNNER_DRAIN_FILE, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError:
         return None
     try:
-        until = float(doc.get("until") or 0)
-    except (TypeError, ValueError):
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return None
+        data = os.read(fd, DRAIN_MAX_BYTES + 1)
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+    if len(data) > DRAIN_MAX_BYTES:
+        return None
+    try:
+        doc = json.loads(data)
+        until = float(doc.get("until") or 0) if isinstance(doc, dict) else 0.0
+    except (ValueError, TypeError, OverflowError, AttributeError, RecursionError):
         return None
     if not math.isfinite(until) or until <= now or until > now + DRAIN_TTL_S + 60:
         return None
