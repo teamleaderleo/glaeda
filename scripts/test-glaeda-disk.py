@@ -1905,6 +1905,9 @@ class GlaedaDiskTest(unittest.TestCase):
             fams = {f.id: f for f in gd.default_families()}
             self.assertEqual(gd.candidates(fams["tart-images"]), [])
             self.assertEqual(gd.candidates(fams["tart-ipsws"]), [])
+            (store / "cache/OCIs" / f"{gd.DELETING_PREFIX}x-1").mkdir(parents=True)
+            self.assertEqual(gd.interrupted_families([fams["tart-images"], fams["tart-ipsws"]]), [],
+                             "no aside tree is finished through a symlinked ~/.tart")
         finally:
             gd.HOME, gd.FLEET_ROOT, gd.DARWIN = saved
 

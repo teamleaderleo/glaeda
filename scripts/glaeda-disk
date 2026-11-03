@@ -5124,13 +5124,14 @@ def interrupted_families(fams: list[Family]) -> list[Family]:
     for fam in fams:
         if not fam.reclaimable or fam.id == INTERRUPTED:
             continue
+        if fam.id in TART_FAMILIES and not tart_root_safe(fam.root):
+            continue  # a symlinked or out-of-HOME Tart store is someone else's, its aside trees too (#1813)
         dirs = {fam.root}
         if fam.id == CMUX_NEXT_CI_FAMILY:  # a whole state set aside leaves no candidate where it sat
             dirs.update(cmux_next_ci_state_parents(fam.root))
             dirs.update(cmux_next_ci_host_parents(fam.root))
         if fam.id == TART_IMAGES:  # an image sits at any depth: every namespace directory above one
-            if tart_root_safe(fam.root):
-                dirs.update(tart_walk(fam.root)[1])
+            dirs.update(tart_walk(fam.root)[1])
         elif fam.discover or fam.checkout_builds:
             dirs.update(p.parent for p in candidates(fam))
         else:  # a match family's candidates sit within depth levels too: an aside one left no candidate behind
