@@ -1657,7 +1657,7 @@ def runner_drain(runner_dir: Path, now: float) -> str | None:
         until = float(doc.get("until") or 0)
     except (TypeError, ValueError):
         return None
-    if until <= now or until > now + DRAIN_TTL_S + 60:
+    if not math.isfinite(until) or until <= now or until > now + DRAIN_TTL_S + 60:
         return None
     return f"draining for {str(doc.get('reason') or 'glaeda-cmux-runner --apply')[:200]}"
 

@@ -8687,6 +8687,8 @@ class GateTest(unittest.TestCase):
         self.assertIsNone(gate.draining(), "an expired drain holds nothing")
         self.drain(until=time.time() + hook.DRAIN_TTL_S * 10)
         self.assertIsNone(gate.draining(), "nor one past the longest a drain may last")
+        marker.write_text('{"until": NaN}')
+        self.assertIsNone(gate.draining(), "nor one that never expires")
         marker.write_text("{not json")
         self.assertIsNone(gate.draining())
         marker.unlink()

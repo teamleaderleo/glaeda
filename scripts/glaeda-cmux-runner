@@ -1621,6 +1621,11 @@ DRAIN_TTL_S = 3600.0
 DRAINING = "draining: it takes no new job once this one ends"
 
 
+def relabel_reason(ctx: Context) -> str:
+    labels = getattr(ctx, "labels", None)
+    return "a relabel to " + (",".join(map(str, labels)) if isinstance(labels, (list, tuple)) else "the manifest's labels")
+
+
 def drain_marker_path(ctx: Context) -> Path:
     return ctx.runner_dir / RUNNER_DRAIN_FILE
 
@@ -1686,7 +1691,7 @@ def relabel(ctx: Context, act: dict[str, Any], stopped: Callable[[], None] | Non
     # --skip-launchctl stops nothing, so a listener still running there refuses: --replace would orphan it
     if not stop_if_idle(ctx, stop, listener_ok=not ctx.skip_launchctl):
         act["state"], act["note"] = "failed", "the runner started a job (or a listener runs); nothing changed, re-run when idle"
-        if start_drain(ctx, f"a relabel to {','.join(ctx.labels)}"):
+        if start_drain(ctx, relabel_reason(ctx)):
             act["note"] += f"; {DRAINING}"
             act["draining"] = True
         return
@@ -1775,7 +1780,7 @@ def apply_install(ctx: Context, actions: list[dict[str, Any]], receipt_doc: dict
     failed = any(a["state"] == "blocked" for a in actions)
     busy = [a for a in actions if a["kind"] == "register" and a["state"] == "blocked" and a.get("busy")]
     if busy and all(a["state"] != "blocked" or a in busy for a in actions):
-        if start_drain(ctx, f"a relabel to {','.join(ctx.labels)}", actions):
+        if start_drain(ctx, relabel_reason(ctx), actions):
             for act in busy:
                 act["note"] = f"the runner is running a job; {DRAINING}, re-run when it is idle"
                 act["draining"] = True
