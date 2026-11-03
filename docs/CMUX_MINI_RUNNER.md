@@ -985,7 +985,19 @@ release-compile on a feat-cmux-next push (nightly-next's promotion gate). It ref
 nightly-next canary and launch smoke, every PR, DEV and side job, and every signing job (the exclusive class): a
 signing job needs the whole mini through the capacity ledger, which a dedicated runner never holds, so it keeps its
 existing route and claim. The hook's bytes do not change, so the signing-hook trust list needs no new pin. A hook it
-cannot load refuses. glaeda-update ships the script with the runner files (`RUNNER_FILES`) into
+cannot load refuses.
+
+Newest run first: nightly-next is promoted about every 6 minutes and a run takes 40-55, so 5-6 runs share these
+runners and GitHub gives an idle one the oldest queued job. The runners cannot choose, so on attempt 1 of a nightly-next
+push the admission refuses, in seconds, a job of an older run that a newer run already beats, and the runner takes the
+next queued job: (1) overtaken: the cmux NEXT feed (`appcast-arm64.xml`) lists a build above this run's (run id then
+the attempt in two digits), so publication, which is latest-wins, can never take it; every job up to publish-nightly
+that runs here yields (never the legacy-identity, deltas or report jobs); (2) passed: a newer run's
+`build-nightly-app` is running on this mini (its job log, `~/Library/Logs/glaeda-cmux-jobs.jsonl`) and the job is
+`build-nightly-app` or one of its only ancestors here (`resolve-nightly-cmux-tui-client`,
+`pick-nightly-build-runner`), so this run's build has not started. A newer push alone never makes a run yield (when
+every run skipped for one, promotions outran every build: cmux #28961), started jobs are never touched, and an
+unreadable feed or log admits. glaeda-update ships the script with the runner files (`RUNNER_FILES`) into
 `~/glaeda-runner/scripts`, so a merged fix to it reaches the minis by OTA.
 
 ### Trusted dedicated entries (a second host for a trusted pool)
