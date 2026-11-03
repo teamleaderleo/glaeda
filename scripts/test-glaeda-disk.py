@@ -4641,6 +4641,56 @@ class GlaedaDiskTest(unittest.TestCase):
         _, rows, _, _ = self._main_run(["--pressure", "--apply"], survey_effect=spent)
         self.assertTrue(rows[-1]["measure_budget_reached"])
 
+    def test_the_idle_sweep_and_the_callers_deadline_bound_the_survey(self) -> None:
+        """leo-workspace's hygiene reconciler runs `--pressure --idle --apply` with HYGIENE_RUN_DEADLINE and stops it at
+        900 s. With no pressure that is the idle sweep, whose survey had no bound: at load 200-300 an agent host's sweeps
+        ran 377-819 s and then past the stop, mid-walk, with no run line (leo-workspace#2682). The sweep now has the
+        pressure apply's measure and judge budgets, both inside the caller's deadline, and the later steps halt there."""
+        stamp = self.root / "idle.last"
+        sweep = ["--pressure", "--idle", "--apply"]
+        with mock.patch.object(gd, "IDLE_STAMP", stamp), mock.patch.object(gd, "host_busy", return_value=""), \
+                mock.patch.object(gd, "simulator_runtimes", return_value=[]), \
+                mock.patch.dict(os.environ, {gd.RUN_DEADLINE_ENV: ""}):
+            start = time.monotonic()
+            _, rows, survey, apply = self._main_run(sweep, free_gib=300.0)
+            self.assertEqual(rows[-1]["mode"], "idle")
+            kw = survey.call_args.kwargs
+            budget = gd.PRESSURE_MEASURE_BUDGET_S
+            self.assertGreaterEqual(kw["deadline"], start + budget)
+            self.assertAlmostEqual(kw["judge_deadline"] - kw["deadline"], budget, delta=0.01)
+            self.assertIsNone(apply.call_args[0][5], "no deadline, no busy hold: the sweep's deletions never halt")
+            self.assertFalse(rows[-1]["run_deadline_reached"])
+            # the caller's deadline 5 min away: walks get a third of the 240 s before its margin, verdicts two thirds
+            stamp.unlink()
+            with mock.patch.dict(os.environ, {gd.RUN_DEADLINE_ENV: f"{time.time() + 300:.0f}"}):
+                start = time.monotonic()
+                _, rows, survey, apply = self._main_run(sweep, free_gib=300.0)
+                kw = survey.call_args.kwargs
+                self.assertLessEqual(kw["deadline"], time.monotonic() + 81)
+                self.assertGreaterEqual(kw["deadline"], start + 78)
+                self.assertLessEqual(kw["judge_deadline"], time.monotonic() + 161)
+                halt = apply.call_args[0][5]
+                self.assertEqual(halt(), "")
+            # past it: nothing more is started, and the run line says why
+            with mock.patch.dict(os.environ, {gd.RUN_DEADLINE_ENV: f"{time.time() + 10:.0f}"}):
+                self.assertIn(gd.RUN_DEADLINE_ENV, halt())
+                measure, judge = gd.pressure_survey_deadlines()
+                self.assertLessEqual(judge, time.monotonic())
+                stamp.unlink()
+                def spent(*_args, **_kwargs):
+                    gd._MEASURE_BUDGET_REACHED = True
+                    return []
+                _, rows, survey, apply = self._main_run(sweep, free_gib=300.0, survey_effect=spent,
+                                                        policy={"pressure_measure_budget_s": 0.0})
+                self.assertLessEqual(survey.call_args.kwargs["judge_deadline"], time.monotonic(),
+                                     "a 0 budget still keeps the caller's deadline")
+                self.assertIn(gd.RUN_DEADLINE_ENV, apply.call_args[0][5]())
+                self.assertTrue(rows[-1]["run_deadline_reached"])
+        for raw in ("", "soon", "inf", "nan"):
+            with mock.patch.dict(os.environ, {gd.RUN_DEADLINE_ENV: raw}):
+                self.assertIsNone(gd.run_deadline_left(), raw)
+                self.assertIsNone(gd.with_run_deadline(None), raw)
+
     def test_the_run_line_says_when_its_targets_are_not_the_defaults(self) -> None:
         """The runner hook skips its pass on a run line's targets only when they are a plain --pressure --apply's
         under the same glaeda-disk and disk-policy.json (config_sha256)."""
@@ -5943,6 +5993,19 @@ class GlaedaDiskTest(unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(gd.reap_tmpdir_test_residue(self.receipt(), tmp, halt=lambda: "a CI job runs"), 0)
         self.assertTrue(e["socket"].is_dir())
+
+    def test_tmpdir_test_residue_stops_at_the_callers_deadline(self) -> None:
+        """The $TMPDIR pass's own 600 s budget ends inside the caller's deadline (HYGIENE_RUN_DEADLINE) too."""
+        tmp, e = self._tmp_residue()
+        receipt = self.receipt()
+        with mock.patch.dict(os.environ, {gd.RUN_DEADLINE_ENV: f"{time.time() + gd.RUN_DEADLINE_MARGIN_S - 5:.0f}"}), \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(gd.reap_tmpdir_test_residue(receipt, tmp), 0)
+        self.assertTrue(all(os.path.lexists(p) for p in e.values()))
+        self.assertIn(gd.RUN_DEADLINE_ENV, json.loads(receipt.read_text())["stopped"])
+        with mock.patch.dict(os.environ, {gd.RUN_DEADLINE_ENV: f"{time.time() + 3600:.0f}"}), \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertGreater(gd.reap_tmpdir_test_residue(self.receipt(), tmp), 0)
 
     def test_tmpdir_test_residue_rereads_evidence_during_a_pass(self) -> None:
         tmp, e = self._tmp_residue()

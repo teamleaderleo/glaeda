@@ -3435,13 +3435,17 @@ def reap_tmpdir_test_residue(receipt: Path, tmp: Path | None = None, halt=None,
     except OSError:
         return 0
     names.sort()
+    # within the caller's deadline too (run_deadline_left): the names not reached wait for the next pass
+    left = run_deadline_left()
+    budget_s = TMP_TEST_RESIDUE_BUDGET_S if left is None else max(0.0, min(TMP_TEST_RESIDUE_BUDGET_S, left))
     released, removed, kept, stopped = 0, collections.Counter(), collections.Counter(), ""
     evidence: tuple[frozenset[str], str] | None = None
     read_at = 0.0
     for name in names:
         now = time.time()
-        if now - start > TMP_TEST_RESIDUE_BUDGET_S:
-            stopped = f"pass budget {TMP_TEST_RESIDUE_BUDGET_S:g}s reached"
+        if now - start > budget_s or budget_s <= 0:
+            stopped = (f"pass budget {TMP_TEST_RESIDUE_BUDGET_S:g}s reached" if budget_s == TMP_TEST_RESIDUE_BUDGET_S
+                       else f"the run's deadline ({RUN_DEADLINE_ENV}) reached")
             break
         if evidence is None or now - read_at > TMP_TEST_RESIDUE_EVIDENCE_S:
             if halt is not None and (why := halt()):
@@ -3458,7 +3462,7 @@ def reap_tmpdir_test_residue(receipt: Path, tmp: Path | None = None, halt=None,
         prefix = tmp_test_residue_prefix(name, runner_host)
         try:
             why, used, entry = judge_tmp_entry(entry, hold, evidence[0], evidence[1], time.time(),
-                                               start + TMP_TEST_RESIDUE_BUDGET_S, tmp_socket_veto(name),
+                                               start + budget_s, tmp_socket_veto(name),
                                                tmp_hold_movable(name))
         except OSError as e:
             kept[f"incomplete:{e.__class__.__name__}"] += 1
@@ -7277,13 +7281,55 @@ def pressure_measure_budget_s() -> float:
     return float(POLICY.get("pressure_measure_budget_s", PRESSURE_MEASURE_BUDGET_S))
 
 
+# The caller's hard stop for this run, in epoch seconds. leo-workspace's hygiene reconciler runs
+# `glaeda-disk --pressure --idle --apply` on hosts it took over from glaeda's LaunchAgent, sets this, and stops the run
+# at 900 s. The idle sweep had no measure bound, so at load 200-300 an agent host's sweeps (377-819 s when they
+# finished) ran past it and were stopped mid-walk with no run line (leo-workspace#2682, 2026-11-03). With it set, a
+# run's walks get a third of what is left before RUN_DEADLINE_MARGIN_S of it, its verdicts two thirds, and every later
+# step stops on its halt there: what was measured is in the snapshot, so the next pass goes on from it.
+RUN_DEADLINE_ENV = "HYGIENE_RUN_DEADLINE"
+RUN_DEADLINE_MARGIN_S = 60.0
+
+
+def run_deadline_left(now: float | None = None) -> float | None:
+    """Seconds left until RUN_DEADLINE_MARGIN_S before the caller's deadline (RUN_DEADLINE_ENV), or None: none set."""
+    try:
+        deadline = float(os.environ.get(RUN_DEADLINE_ENV) or "")
+    except ValueError:
+        return None
+    if not math.isfinite(deadline):
+        return None
+    return deadline - RUN_DEADLINE_MARGIN_S - (time.time() if now is None else now)
+
+
+def run_deadline_halt() -> str:
+    """Why this run stops now for the caller's deadline, or ""."""
+    left = run_deadline_left()
+    if left is None or left > 0:
+        return ""
+    RUN["run_deadline_reached"] = True
+    return f"the run's deadline ({RUN_DEADLINE_ENV}) is {RUN_DEADLINE_MARGIN_S:g} s away; the next pass goes on"
+
+
+def with_run_deadline(halt):
+    """HALT (a callable naming why to stop, or None), also stopping at the caller's deadline when one is set."""
+    if run_deadline_left() is None:
+        return halt
+    return lambda: run_deadline_halt() or (halt() if halt is not None else "")
+
+
 def pressure_survey_deadlines(now: float | None = None) -> tuple[float | None, float | None]:
-    """A pressure apply's (measure, judge) deadlines: walks stop starting at the budget, verdicts at twice it."""
+    """An applying pass's (measure, judge) deadlines: walks stop starting at the budget, verdicts at twice it, and
+    both within the caller's deadline (run_deadline_left) when one is set."""
     budget = pressure_measure_budget_s()
-    if budget <= 0:
-        return None, None
     now = time.monotonic() if now is None else now
-    return now + budget, now + 2 * budget
+    measure, judge = (now + budget, now + 2 * budget) if budget > 0 else (None, None)
+    left = run_deadline_left()
+    if left is not None:
+        left = max(0.0, left)
+        measure = now + left / 3 if measure is None else min(measure, now + left / 3)
+        judge = now + 2 * left / 3 if judge is None else min(judge, now + 2 * left / 3)
+    return measure, judge
 
 
 def fresh_for_apply(known: dict[str, int], fams: list[Family]) -> dict[str, int]:
@@ -11329,10 +11375,12 @@ def _main_impl(argv: list[str] | None = None) -> int:
                 maintenance_handle.close()
             return result
         measure_lock = None
-    refresh_deadline = judge_deadline = None
+    refresh_deadline = judge_deadline = survey_left = None
     if a.refresh and a.refresh_budget_s > 0:
         refresh_deadline = time.monotonic() + a.refresh_budget_s
-    elif a.pressure and a.apply:
+    elif a.apply and (a.pressure or sweep):
+        # the idle sweep is bounded too: it walks every family (377-819 s at load on an agent host, unbounded)
+        survey_left = run_deadline_left()
         refresh_deadline, judge_deadline = pressure_survey_deadlines()
     background_refresh = a.refresh and not a.apply and a.refresh_lock_fd is not None
     if background_refresh:
@@ -11348,8 +11396,12 @@ def _main_impl(argv: list[str] | None = None) -> int:
                        judge_deadline=judge_deadline)
         if judge_deadline is not None and _MEASURE_BUDGET_REACHED:
             RUN["measure_budget_reached"] = True
+            budget = pressure_measure_budget_s()
+            if survey_left is not None and (budget <= 0 or max(0.0, survey_left) / 3 < budget):
+                RUN["run_deadline_reached"] = True  # the caller's deadline, not the budget, cut the walks
             if not a.json:
-                print(f"pressure measure budget ({pressure_measure_budget_s():g} s) reached: deleting from the "
+                print(f"{'idle sweep' if sweep else 'pressure'} measure budget "
+                      f"({pressure_measure_budget_s():g} s, or the run's deadline) reached: deleting from the "
                       "candidates measured so far; the rest stay unsized and are never deleted this pass\n")
     # Release the measurement lock before starting a background refresh. The child must be able to
     # acquire it, otherwise every stale report spawns a refresh that immediately skips.
@@ -11422,8 +11474,8 @@ def _main_impl(argv: list[str] | None = None) -> int:
             print(f"  {gib(t.bytes)}  {t.verdict:12s} {t.idle_hours:6.1f}h  {t.family} {t.path} ({', '.join(t.reasons)})")
     if a.apply:
         print()
-        halt = (cmux_next_drain_halt if a.cmux_next_drain
-                else host_busy if sweep and POLICY["defer_during_ci"] else None)
+        halt = with_run_deadline(cmux_next_drain_halt if a.cmux_next_drain
+                                 else host_busy if sweep and POLICY["defer_during_ci"] else None)
         by_id = {f.id: f for f in fams}
         # the per-host cmux-next build root goes after everything else, idle runners' whole checkouts included
         last = {id(i) for i in items if i.family in by_id and cmux_next_ci_host_root(by_id[i.family], Path(i.path))}
@@ -11496,7 +11548,7 @@ def _main_impl(argv: list[str] | None = None) -> int:
         if sweep:
             if not RUNNER_CACHE_PROFILE:
                 # deleting a runtime restarts CoreSimulatorService: never while a job may be using simulators
-                logical_released += apply_runtimes(tooling, a.receipt, host_busy)
+                logical_released += apply_runtimes(tooling, a.receipt, with_run_deadline(host_busy))
             IDLE_STAMP.parent.mkdir(parents=True, exist_ok=True)
             IDLE_STAMP.touch()
         # Re-observe after every destructive operation. The accounting and df delta are
@@ -11595,7 +11647,8 @@ def write_run_line(started: float, free_before: int | None) -> None:
            "skipped": RUN.get("skipped"), "cmux_next_ci_over_gib": RUN.get("cmux_next_ci_over_gib"),
            "caller": RUN.get("caller"), "evict_owner": _owner_line(RUN.get("evict_owner")),
            "bundle_failed": RUN.get("bundle_failed", []),
-           "measure_budget_reached": bool(RUN.get("measure_budget_reached"))}
+           "measure_budget_reached": bool(RUN.get("measure_budget_reached")),
+           "run_deadline_reached": bool(RUN.get("run_deadline_reached"))}
     with contextlib.suppress(OSError):
         RUN_LOG.parent.mkdir(parents=True, exist_ok=True)
         with RUN_LOG.open("a") as f:
