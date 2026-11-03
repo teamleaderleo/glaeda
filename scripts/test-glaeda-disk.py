@@ -1831,6 +1831,31 @@ class GlaedaDiskTest(unittest.TestCase):
         finally:
             gd.HOME, gd.FLEET_ROOT, gd.DARWIN = saved
 
+    def test_tart_images_are_a_family_one_candidate_per_pulled_image(self) -> None:
+        """2026-11-03: 53.5 GiB of Tart OCI images two weeks idle on a dedicated nightly mini, found by no family."""
+        saved = (gd.HOME, gd.FLEET_ROOT, gd.DARWIN)
+        gd.HOME = self.root
+        gd.FLEET_ROOT = self.root / "shared-fleet"
+        gd.DARWIN = True
+        try:
+            oci = gd.HOME / ".tart/cache/OCIs/ghcr.io/cirruslabs"
+            for image in ("macos-sequoia-vanilla", "macos-sonoma-vanilla"):
+                (oci / image / "sha256:abc").mkdir(parents=True)
+                (oci / image / "latest").symlink_to("sha256:abc")
+            (gd.HOME / ".tart/cache/IPSWs").mkdir(parents=True)
+            (gd.HOME / ".tart/cache/IPSWs/UniversalMac.ipsw").write_bytes(b"x")
+            (gd.HOME / ".tart/vms").mkdir(parents=True)
+            fams = {f.id: f for f in gd.default_families()}
+            images, ipsws = fams["tart-images"], fams["tart-ipsws"]
+            self.assertEqual(images.root, gd.HOME / ".tart/cache/OCIs")
+            self.assertTrue(images.reclaimable and ipsws.reclaimable)
+            self.assertEqual((images.min_idle_hours, ipsws.min_idle_hours), (gd.DEFAULT_AGE_HOURS,) * 2)
+            self.assertEqual(sorted(p.name for p in gd.candidates(images)),
+                             ["macos-sequoia-vanilla", "macos-sonoma-vanilla"], "one image at a time, never ~/.tart/vms")
+            self.assertEqual([p.name for p in gd.candidates(ipsws)], ["UniversalMac.ipsw"])
+        finally:
+            gd.HOME, gd.FLEET_ROOT, gd.DARWIN = saved
+
     def test_tagged_debug_app_data_is_a_family_but_release_and_next_app_data_never_are(self) -> None:
         saved = (gd.HOME, gd.FLEET_ROOT, gd.DARWIN)
         gd.HOME = self.root

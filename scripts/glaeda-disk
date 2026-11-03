@@ -3926,6 +3926,19 @@ def default_families(role: str = "fleet-mini") -> list[Family]:
                "the CUA client rebuilds its frame cache", depth=1, files=True,
                min_idle_hours=DEFAULT_AGE_HOURS, mirror_idle_hours=CMUX_JOB_MIRROR_HOURS if mirror_host else None,
                owner="cmux CUA", rebuild_minutes=1, platform="macos"),
+        # Tart's pulled VM images (`tart pull` / `tart clone` of an OCI ref: ~/.tart/cache/OCIs/<registry>/<org>/
+        # <image>, each a full macOS disk). home-caches never finds them: a dot directory with no sealed-cache layout.
+        # On a dedicated nightly mini (2026-11-03) four cirruslabs vanilla images pulled on 2026-10-19 held 53.5 GiB,
+        # untouched for two weeks with tart no longer installed and ~/.tart/vms empty, while the nightly's runners
+        # were refused at its 30 GiB floor and every pressure pass reached nothing. A VM made from an image is its own
+        # copy under ~/.tart/vms, so the cached image goes once idle DEFAULT_AGE_HOURS (a live tart process or open
+        # file still keeps it) and the next `tart clone` pulls it again.
+        Family("tart-images", HOME / ".tart/cache/OCIs", True, "the next tart clone or pull downloads it again",
+               depth=3, owner="Tart (tart pull)", rebuild_minutes=20, min_idle_hours=DEFAULT_AGE_HOURS,
+               platform="macos"),
+        Family("tart-ipsws", HOME / ".tart/cache/IPSWs", True, "the next tart create downloads it again",
+               files=True, owner="Tart (tart create --from-ipsw)", rebuild_minutes=20,
+               min_idle_hours=DEFAULT_AGE_HOURS, platform="macos"),
         # Sealed caches (cache_layout) anywhere else in the home directory: ~/.npm/_cacache,
         # ~/.bun/install/cache, ~/.cargo/registry, ~/go/pkg/mod, rustup toolchains. Found by content,
         # so a tool this list never heard of is covered once its cache has a recognized layout.
