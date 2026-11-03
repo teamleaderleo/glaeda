@@ -13323,6 +13323,29 @@ class FleetLabelsModuleTest(unittest.TestCase):
         self.assertEqual(fleet_labels.member_labels(manifest, "mini-std", lambda app: True)[0], after,
                          "the DEV namespace never moves neighboring instances out of their normal pool")
 
+    def test_an_xl_member_may_hold_the_dev_freshness_slot_and_answers_the_std_dev_label(self) -> None:
+        # An M5 Ultra compiles the DEV feed's Release build in 9.0 min against 16.4 min p50 on an M4 Pro, so an xl
+        # member may hold the freshness slot; it carries the std DEV label cmux queues on, and never a light one.
+        manifest = copy.deepcopy(MANIFEST)
+        manifest["hosts"]["ultra"] = {"class": "xl", "availability": "dedicated", "roles": ["ci-runner"],
+                                      "hardware": "m5ultra-96", "overrides": {"runner": {
+                                          "devCompile": True, "nightlySlot": True, "classes": {
+                                              "xl": {"runners": 6, "capacityUnits": 30, "compileSlots": 3,
+                                                     "canonicalRoots": 3, "gatewayRunners": 2}}}}}
+        ultra, why = fleet_labels.member_labels(manifest, "ultra", lambda app: True)
+        self.assertIsNone(why)
+        self.assertEqual(ultra["devPools"], ["glaeda-dev-xl-xcode-26.6", "glaeda-dev-std-xcode-26.6"])
+        self.assertEqual((ultra["devCompileInstance"], ultra["nightlyInstance"]), (3, 4))
+        self.assertEqual(ultra["pools"], ["glaeda-xl-xcode-26.6"], "no capacity added to any pool")
+        pools = fleet_labels.declared_pools(manifest)
+        self.assertIn("ultra", pools["glaeda-dev-std-xcode-26.6"])
+        self.assertNotIn("glaeda-dev-light-xcode-26.6", pools)
+        manifest["hosts"]["mini-light"]["availability"] = "dedicated"
+        manifest["hosts"]["mini-light"].setdefault("overrides", {})["runner"] = {"devCompile": True}
+        light, why = fleet_labels.member_labels(manifest, "mini-light", lambda app: True)
+        self.assertIsNone(light)
+        self.assertIn("dedicated std or xl runner", why)
+
     def test_an_xl_nightly_slot_also_answers_the_std_nightly_label_and_never_light(self) -> None:
         # The M5 Ultra Studios (class xl) take a nightly job queued on glaeda-nightly-std-xcode-<v>, the label cmux's
         # nightly picker offers, as their side runners already take side-std jobs; no slot answers a light nightly
@@ -13397,7 +13420,7 @@ class FleetLabelsModuleTest(unittest.TestCase):
             {"runners": 3, "canonicalRoots": 1, "guiRunners": 1, "fastRunners": 1})]
         cases += [({"devCompile": True, "poolPrefix": "aws-"}, {}, "devCompile uses poolPrefix"),
                   ({"devCompile": True, "trustedRef": "refs/heads/main", "trustedRepo": "manaflow-ai/cmux"},
-                   {}, "dedicated std runner without trustedRef")]
+                   {}, "dedicated std or xl runner without trustedRef")]
         for runner, shape, message in cases:
             with self.subTest(runner=runner, shape=shape):
                 manifest = copy.deepcopy(MANIFEST)

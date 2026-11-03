@@ -602,10 +602,14 @@ runner is named `<member>-glaeda` unless `--name` says otherwise:
 one a pool picker routes a whole run to. Opportunistic members never carry it, so
 they never receive a required job.
 
-`runner.devCompile: true` on a dedicated std member assigns its first existing
+`runner.devCompile: true` on a dedicated std or xl member assigns its first existing
 side instance (`instance == canonicalRoots`) to the DEV compile lane, the
 freshness slot. That instance carries `glaeda-dev-std-xcode-<version>` without
-ordinary pool, root, side, GUI, session, fast or iOS labels. Only its hook passes
+ordinary pool, root, side, GUI, session, fast or iOS labels. An xl slot (an M5
+Ultra Studio) carries `glaeda-dev-xl-xcode-<version>` and the std label too, so
+the feed's Release compile queued on the std label reaches an idle Ultra as well
+as an M4 Pro (an Ultra: 9.0 min against 16.4 min p50 on an M4 Pro, 2026-11-03).
+No light member holds the slot. Only its hook passes
 `--dev-compile-runner`; every other instance keeps its normal labels and hook.
 A shape with no side instance is refused. This reuses an instance and adds no
 runners, cores, compile slots or canonical roots. Its hook admits only cmux

@@ -76,6 +76,13 @@ POOL_PREFIX_RE = r"[a-z0-9]+-"
 RESERVED_POOL_PREFIXES = {"root-", "side-", "gui-", "fast-", "trusted-", "std-", "light-", "xl-", "dev-", "nightly-",
                           "gateway-"}
 DEV_COMPILE_POOL_PREFIX = "dev-"
+# The classes that may hold the DEV freshness slot (runner.devCompile). An xl slot (an M5 Ultra Studio) also carries
+# the std DEV label (nightly_classes, as its nightly slot does), so the feed's Release compile queued on
+# glaeda-dev-std-xcode-<v> (cmux's vars.CI_DEV_COMPILE_RUNNER) reaches an idle Ultra as well as an M4 Pro: an Ultra
+# measured 9.0 min for it against 16.4 min p50 on an M4 Pro (2026-11-03). cmux's placement still takes the slot only
+# while it has an idle runner and otherwise falls back, so this adds a server and pins nothing. Never light: a 16 GB
+# M4 cannot build the Release app.
+DEV_COMPILE_CLASSES = ("std", "xl")
 # A host's runner.nightlySlot: true gives its next side instance after canonicalRoots (after the freshness slot when
 # devCompile is set too) the nightly pool label glaeda-nightly-<class>-xcode-<version> instead of its side label. Only
 # cmux's nightly jobs (glaeda-cmux-runner-hook --nightly-runner: nightly.yml on nightly-next or main, and the Release
@@ -313,8 +320,9 @@ def member_labels(manifest: Any, member: str, xcode_ok: Callable[[dict[str, Any]
     dev_compile = runner.get("devCompile", False) if isinstance(runner, dict) else False
     if not isinstance(dev_compile, bool):
         return None, f"{member} runner.devCompile must be boolean"
-    if dev_compile and (klass != "std" or availability != "dedicated" or trusted_ref is not None):
-        return None, f"{member} runner.devCompile needs a dedicated std runner without trustedRef"
+    if dev_compile and (klass not in DEV_COMPILE_CLASSES or availability != "dedicated" or trusted_ref is not None):
+        return None, (f"{member} runner.devCompile needs a dedicated {' or '.join(DEV_COMPILE_CLASSES)} runner "
+                      "without trustedRef")
     nightly_slot = runner.get("nightlySlot", False) if isinstance(runner, dict) else False
     if not isinstance(nightly_slot, bool):
         return None, f"{member} runner.nightlySlot must be boolean"
@@ -351,7 +359,7 @@ def member_labels(manifest: Any, member: str, xcode_ok: Callable[[dict[str, Any]
     # A dedicatedOnly member has no pool instance, so it is in no pool (declared_pools, capacity totals)
     pools = ([pool_label(klass, v, bool(trusted_ref), normal_pool_prefix) for v in versions]
              if availability == "dedicated" and not dedicated_only else [])
-    dev_pools = ([pool_label(klass, v, False, DEV_COMPILE_POOL_PREFIX) for v in versions]
+    dev_pools = ([pool_label(k, v, False, DEV_COMPILE_POOL_PREFIX) for v in versions for k in nightly_classes(klass)]
                  if dev_compile and availability == "dedicated" else [])
     nightly_pools = ([pool_label(k, v, False, NIGHTLY_POOL_PREFIX) for v in versions for k in nightly_classes(klass)]
                      if nightly_slot and availability == "dedicated" else [])
