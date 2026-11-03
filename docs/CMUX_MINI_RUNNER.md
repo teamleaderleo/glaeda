@@ -536,6 +536,15 @@ What `--apply` does:
    - **Busy runners.** An `--apply` that would change a loaded plist while the runner
      has a job fails that runner's agent step, "the runner has a job; nothing changed,
      re-run when idle", so it never boots out a running job.
+   - **Draining.** A relabel (re-registration) or a retirement that finds the runner
+     with a job writes `.glaeda-drain` in the runner directory (a reason and an expiry,
+     one hour at most) and reports "draining". While it stands the gate takes no new
+     job: the running job finishes, the listener is frozen at its Worker's exit and
+     stopped, and stays off until the next `--apply` (the fleet retries a minute later)
+     re-registers or retires it and removes the marker. A runner on a busy label used
+     to take its next job seconds after each one ended, so the retries never saw it
+     idle (glaeda#1825). Before a drain, a non-dedicated runner's planned hook writes
+     land, so an older gate reloads one that reads the marker.
    - job-started still refuses a job handed over in the moment before a stop.
 5. Confirms through the GitHub API that the runner is listed with every label and
    waits up to 90 s for it to report online.

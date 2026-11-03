@@ -1634,6 +1634,34 @@ def job_tier(event_name: str | None, ref: str | None, repository: str | None, ev
     return TIER_NIGHTLY
 
 
+# RUNNER_DRAIN: glaeda-cmux-runner --apply must re-register (relabel) or retire a runner, and the runner has a job. A
+# runner on a busy label takes its next job within seconds of the last one ending, so the apply's retries never saw it
+# idle and gave up after 30 min (ultra2-glaeda-1 and -7, 2026-11-03, glaeda#1825). The apply writes this marker in
+# the runner's directory instead; while it stands, the gate takes no new job: the running job finishes (it is never
+# cancelled), the gate freezes the listener at its Worker's exit (JOB_END_FREEZE) and stops it, and holds it off
+# until the apply's next look re-registers or retires the runner and removes the marker. Every marker carries an
+# expiry (DRAIN_TTL_S at most), so an apply that died never keeps a runner off for good.
+RUNNER_DRAIN_FILE = ".glaeda-drain"
+DRAIN_TTL_S = 3600.0
+
+
+def runner_drain(runner_dir: Path, now: float) -> str | None:
+    """Why this runner is draining (RUNNER_DRAIN), or None: no marker, an expired one, or one that cannot be read."""
+    try:
+        doc = json.loads((runner_dir / RUNNER_DRAIN_FILE).read_text())
+    except (OSError, ValueError):
+        return None
+    if not isinstance(doc, dict):
+        return None
+    try:
+        until = float(doc.get("until") or 0)
+    except (TypeError, ValueError):
+        return None
+    if until <= now or until > now + DRAIN_TTL_S + 60:
+        return None
+    return f"draining for {str(doc.get('reason') or 'glaeda-cmux-runner --apply')[:200]}"
+
+
 # glaeda-mini-health's drain for a Tailscale restart (glaeda#1627): it wants the host idle, not jobs refused. The gate
 # stops idle listeners while the marker stands, so no new job comes; a job a listener already took before the gate
 # saw the marker is admitted and finishes (mini-health waits for it). Refusing it only failed that job: one
@@ -6207,6 +6235,8 @@ class Gate:
             gate_log("the reload failed; keeping this gate")
 
     def claimed(self) -> str | None:
+        if drain := self.draining():
+            return drain
         if runner_scope(self.runner_dir).dedicated:
             # a dedicated builder (a nightly or archive build) is not a pool runner: fleet builds, reservations,
             # load and heat never hold it off, only what would fail its job here (disk, a missing Rust toolchain)
@@ -6365,6 +6395,8 @@ class Gate:
     def confirmed(self) -> str | None:
         """A fresh reading right before a stop: the holder still holds, or a waiter seen at least one poll ago
         is still waiting (a job-started in flight, which lsof also lists, is gone by then)."""
+        if drain := self.draining():
+            return drain
         if runner_scope(self.runner_dir).dedicated:
             return self.claimed()
         why = host_held(self.host_lock, self.reservation, time.time(), self.state_dir)
@@ -6390,6 +6422,11 @@ class Gate:
         self.load_since = None
         self.yield_to_fleet()
         return f"a fleet build is waiting for the host (pid {min(again)})"
+
+    def draining(self) -> str | None:
+        """RUNNER_DRAIN: an apply waits to re-register or retire this runner. One small file, read every poll; a
+        dedicated runner drains too."""
+        return runner_drain(self.runner_dir, time.time())
 
     def still_reserved(self) -> str | None:
         """The host's reservation, read afresh (one small file): why it holds the host, or None. A dedicated runner
@@ -7061,7 +7098,8 @@ class Gate:
                 finished = self.job_request
                 self.watching, self.job_waited, self.freeze_at_exit, self.job_request = (), False, False, None
                 ending = self.job_end() if self.job_ending else None
-                if (why := self.low_disk() or self.still_waiting() or self.still_reserved() or ending):
+                if (why := self.draining() or self.low_disk() or self.still_waiting() or self.still_reserved()
+                        or ending):
                     self.unclaim()
                     self.stop(why, finished)
                     return None
@@ -7079,7 +7117,7 @@ class Gate:
                     self.waiting_at = -GATE_WAITER_EVERY_S  # and read the waiters afresh before it does
                 if self.waiters and self.waiters_due():
                     self.waiting, self.waiting_at = self.blocking_waiters(), time.monotonic()
-                reserved = self.still_reserved()
+                reserved = self.still_reserved() or self.draining()  # RUNNER_DRAIN stops it at the job's end too
                 self.job_waited = bool(self.waiting) or reserved is not None
                 low = self.low_disk()
                 workers = tuple(pid for pid in self.worker_pids() if pid not in self.done) \

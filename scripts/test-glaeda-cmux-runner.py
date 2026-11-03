@@ -8657,6 +8657,41 @@ class GateTest(unittest.TestCase):
             gate.step()  # the job ended
         self.assertEqual(stops, [reserved])
 
+    def drain(self, until: float | None = None, reason: str = "a relabel to a,b") -> Path:
+        marker = self.runner / hook.RUNNER_DRAIN_FILE
+        marker.write_text(json.dumps({"reason": reason, "until": until if until is not None else time.time() + 600}))
+        return marker
+
+    def test_a_drain_marked_during_a_job_stops_the_listener_as_the_job_ends(self) -> None:
+        """glaeda#1825: ultra2-glaeda-7 took its next job seconds after each one ended, so an apply's retries never
+        saw it idle. A drain the apply marks during a job stops the listener at that job's end; the job runs on."""
+        gate, stops = self.gate([None] * 3, busy=[True, True])
+        gate.worker_pids = lambda: [4343]
+        with mock.patch.object(hook, "host_waiters", return_value=set()):
+            gate.step()
+            self.drain()
+            gate.step()
+            self.assertEqual((stops, gate.watching), ([], (4343,)), "never stopped under its job; its Worker is watched")
+            gate.step()  # the job ended
+        self.assertEqual(stops, ["draining for a relabel to a,b"])
+
+    def test_a_drain_holds_an_idle_listener_off_until_its_marker_goes_or_expires(self) -> None:
+        gate = hook.Gate(self.runner, os.fspath(self.lock), "", self.state)
+        self.assertIsNone(gate.draining())
+        marker = self.drain()
+        self.assertEqual(gate.draining(), "draining for a relabel to a,b")
+        with mock.patch.object(hook, "host_held", return_value=None):
+            self.assertEqual(gate.claimed(), "draining for a relabel to a,b")
+            self.assertEqual(gate.confirmed(), "draining for a relabel to a,b")
+        self.drain(until=time.time() - 1)
+        self.assertIsNone(gate.draining(), "an expired drain holds nothing")
+        self.drain(until=time.time() + hook.DRAIN_TTL_S * 10)
+        self.assertIsNone(gate.draining(), "nor one past the longest a drain may last")
+        marker.write_text("{not json")
+        self.assertIsNone(gate.draining())
+        marker.unlink()
+        self.assertIsNone(gate.draining())
+
     def test_a_reservation_released_before_the_job_ends_keeps_the_listener(self) -> None:
         gate, stops = self.gate([None] * 3, busy=[True])
         self.reserve(gate)
@@ -12093,8 +12128,11 @@ class RunnerTest(unittest.TestCase):
         self.assertEqual(self.by_kind(stale)["register"]["previousLabels"], ["glaeda-mini", "self-hosted"])
 
     def test_an_uninstall_never_stops_or_deregisters_a_runner_with_a_job(self) -> None:
+        runner_dir = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, runner_dir, ignore_errors=True)
         for skip in (False, True):
-            ctx = mock.Mock(skip_launchctl=skip, headless=False, sandbox=True)
+            ctx = mock.Mock(skip_launchctl=skip, headless=False, sandbox=True, runner_dir=runner_dir)
+            ctx.name = "x"
             actions = [{"kind": "agent", "state": "remove", "path": "/nonexistent.plist"},
                        {"kind": "deregister", "state": "remove", "name": "x"}]
             with mock.patch.object(cr, "listeners_frozen", return_value=contextlib.nullcontext(0)), \
@@ -12104,6 +12142,9 @@ class RunnerTest(unittest.TestCase):
             bootout.assert_not_called()
             config.assert_not_called()
             self.assertEqual([a["state"] for a in actions], ["failed", "failed"], skip)
+            # glaeda#1825: and marks it draining, so its retirement finds it idle on the next look
+            self.assertTrue(all(a.get("draining") and "draining" in a["note"] for a in actions), actions)
+            self.assertEqual(json.loads((runner_dir / cr.RUNNER_DRAIN_FILE).read_text())["reason"], "its retirement")
         # a plist this install does not own, still loaded in launchd (KeepAlive restarts it): no deregister
         ctx = mock.Mock(skip_launchctl=False, headless=False, sandbox=False, label="x", uid=501)
         actions = [{"kind": "agent", "state": "kept", "path": "/x.plist"}, {"kind": "deregister", "state": "remove"}]
@@ -12163,6 +12204,21 @@ class RunnerTest(unittest.TestCase):
         self.assertEqual(register["state"], "blocked", register)
         self.assertIn("running a job", register["note"])
         self.assertNotIn("bootout", [e["argv"][0] for e in self.log() if e["tool"] == "launchctl"])
+        # glaeda#1825: it drains instead, so its gate takes no new job and the next look finds it idle
+        self.assertIn("draining", register["note"])
+        self.assertTrue(register.get("draining"), register)
+        marker = Path(first["runnerDir"]) / cr.RUNNER_DRAIN_FILE
+        drain = json.loads(marker.read_text())
+        self.assertIn("a relabel to", drain["reason"])
+        self.assertLessEqual(drain["until"], time.time() + cr.DRAIN_TTL_S + 1)
+        self.assertEqual(hook.runner_drain(Path(first["runnerDir"]), time.time()), f"draining for {drain['reason']}")
+        self.assertEqual((cr.RUNNER_DRAIN_FILE, cr.DRAIN_TTL_S), (hook.RUNNER_DRAIN_FILE, hook.DRAIN_TTL_S))
+        with mock.patch.object(cr, "xcode_present", return_value=True):
+            idle = self.invoke("--apply", "--token-stdin", "--manifest", self.manifest(),
+                               "--member", "mini-std", stdin=REG_TOKEN, expect=1)
+        self.assertEqual(self.by_kind(idle)["register"]["state"], "updated", self.by_kind(idle)["register"])
+        self.assertTrue(self.by_kind(idle)["register"].get("drainEnded"))
+        self.assertFalse(marker.exists(), "re-registered idle: the runner takes jobs again")
 
     def test_a_real_self_updated_worker_is_busy_and_its_listener_is_frozen_for_the_stop(self) -> None:
         runner = self.home / "actions-runner-glaeda-7"

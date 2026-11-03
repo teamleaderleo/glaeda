@@ -1244,7 +1244,7 @@ def plan_install(ctx: Context, receipt: dict[str, Any] | None) -> list[dict[str,
                 # not hold, so relabelling re-registers this same runner in place with --replace.
                 reg.update(state="relabel", previousLabels=actual)
                 if runner_busy(ctx):
-                    reg.update(state="blocked", note="the runner is running a job; re-run when it is idle")
+                    reg.update(state="blocked", busy=True, note="the runner is running a job; re-run when it is idle")
             else:
                 reg.update(state="unchanged")
         elif github_listed and github_found is None:
@@ -1256,7 +1256,7 @@ def plan_install(ctx: Context, receipt: dict[str, Any] | None) -> list[dict[str,
             reg.update(state="relabel", previousLabels=had or [],
                        note="GitHub labels could not be read; re-registering with the supplied token")
             if runner_busy(ctx):
-                reg.update(state="blocked", note="the runner is running a job; re-run when it is idle")
+                reg.update(state="blocked", busy=True, note="the runner is running a job; re-run when it is idle")
         else:
             reg.update(state="blocked", note="could not read GitHub labels; receipt labels are not authoritative; "
                        "re-run with GitHub access or --apply --token-stdin")
@@ -1613,6 +1613,57 @@ def listeners_frozen(runner_dir: Path) -> Iterator[int | None]:
                 os.kill(pid, signal.SIGCONT)
 
 
+# The hook's RUNNER_DRAIN marker (glaeda-cmux-runner-hook RUNNER_DRAIN_FILE, DRAIN_TTL_S): a re-registration or a
+# retirement this apply cannot do under a job marks the runner draining, so its gate takes no new job once the job
+# ends, and the next look (the fleet's retry, a minute later) finds it idle. The job is never cancelled.
+RUNNER_DRAIN_FILE = ".glaeda-drain"
+DRAIN_TTL_S = 3600.0
+DRAINING = "draining: it takes no new job once this one ends"
+
+
+def drain_marker_path(ctx: Context) -> Path:
+    return ctx.runner_dir / RUNNER_DRAIN_FILE
+
+
+def start_drain(ctx: Context, why: str, actions: list[dict[str, Any]] | None = None) -> bool:
+    """Mark this runner draining for `why` (RUNNER_DRAIN). With `actions`, a non-dedicated runner's planned hook
+    writes land first, so a gate running an older hook (which ignores the marker) reloads one that reads it: those
+    are the same writes an apply makes under any running job. A dedicated runner's hooks wait for its stop
+    (write_hooks in apply_install), so its drain needs a gate that already reads the marker. False when the marker
+    could not be written."""
+    if actions is not None and dedicated_of(ctx) is None:
+        for act in [a for a in actions if a["kind"] == "hook" and a["state"] in {"create", "update"}]:
+            try:
+                data, mode = desired_files(ctx)[Path(act["path"])]
+                write_atomic(Path(act["path"]), data, mode)
+            except (OSError, KeyError):
+                continue
+            act["applied"] = act["owned"] = True
+            act["ownedSha256"] = act["sha256"]
+    doc = {"reason": why, "until": time.time() + DRAIN_TTL_S, "by": "glaeda-cmux-runner --apply", "name": str(ctx.name)}
+    try:
+        write_atomic(drain_marker_path(ctx), (json.dumps(doc, sort_keys=True) + "\n").encode(), 0o644)
+    except (OSError, TypeError):  # never fails the apply: the runner only stays undrained, as before
+        return False
+    return True
+
+
+def drain_marked(ctx: Context) -> bool:
+    try:
+        return drain_marker_path(ctx).is_file()
+    except (OSError, TypeError):
+        return False
+
+
+def end_drain(ctx: Context) -> bool:
+    """Remove this runner's drain marker; True when there was one."""
+    try:
+        drain_marker_path(ctx).unlink()
+    except (OSError, TypeError):  # none there (FileNotFoundError), or none this can remove
+        return False
+    return True
+
+
 def stop_if_idle(ctx: Context, stop: Callable[[], bool] | None = None, listener_ok: bool = True) -> bool:
     """Run stop (default: boot this runner's agent out) only when it has no job, deciding with its listeners and
     their spawners frozen. listener_ok=False also refuses while a listener of it lives (a re-registration under a
@@ -1635,7 +1686,11 @@ def relabel(ctx: Context, act: dict[str, Any], stopped: Callable[[], None] | Non
     # --skip-launchctl stops nothing, so a listener still running there refuses: --replace would orphan it
     if not stop_if_idle(ctx, stop, listener_ok=not ctx.skip_launchctl):
         act["state"], act["note"] = "failed", "the runner started a job (or a listener runs); nothing changed, re-run when idle"
+        if start_drain(ctx, f"a relabel to {','.join(ctx.labels)}"):
+            act["note"] += f"; {DRAINING}"
+            act["draining"] = True
         return
+    act["drainEnded"] = end_drain(ctx)  # stopped idle: the runner it starts again takes jobs under the new labels
     if not ctx.skip_launchctl:
         ctx.agent_started = False  # stopped now, whatever the plan saw; the agent step reads this
     if stopped is not None:
@@ -1714,8 +1769,20 @@ def ensure_headless_helper(ctx: Context) -> None:
 
 
 def apply_install(ctx: Context, actions: list[dict[str, Any]], receipt_doc: dict[str, Any]) -> None:
-    # A plan with any blocked step applies nothing, so a half-installed runner never exists.
+    # A plan with any blocked step applies nothing, so a half-installed runner never exists. The one exception is
+    # a relabel blocked only by a running job: the runner drains (start_drain, with its hook writes), so the next
+    # look finds it idle instead of between two jobs it never sees.
     failed = any(a["state"] == "blocked" for a in actions)
+    busy = [a for a in actions if a["kind"] == "register" and a["state"] == "blocked" and a.get("busy")]
+    if busy and all(a["state"] != "blocked" or a in busy for a in actions):
+        if start_drain(ctx, f"a relabel to {','.join(ctx.labels)}", actions):
+            for act in busy:
+                act["note"] = f"the runner is running a job; {DRAINING}, re-run when it is idle"
+                act["draining"] = True
+    elif any(a["kind"] == "register" and a["state"] == "unchanged" for a in actions) and drain_marked(ctx):
+        # its labels already match (another apply re-registered it): a drain left behind would keep it off
+        for act in [a for a in actions if a["kind"] == "register"]:
+            act["drainEnded"] = end_drain(ctx)
     if ctx.headless and not failed and not ctx.skip_launchctl:
         try:
             ensure_headless_helper(ctx)
@@ -1968,6 +2035,7 @@ def apply_uninstall(ctx: Context, actions: list[dict[str, Any]]) -> None:
     booting_out = bool(agent) and not ctx.skip_launchctl
     idle = not removing or ((booting_out or not service_may_run(ctx)) and stop_if_idle(
         ctx, (lambda: bootout(ctx)) if booting_out else (lambda: True), listener_ok=booting_out))
+    drained: bool | None = None
     for act in actions:
         if act["kind"] == "watch":
             continue  # handled above
@@ -1977,6 +2045,11 @@ def apply_uninstall(ctx: Context, actions: list[dict[str, Any]]) -> None:
         if not idle:
             # failed, not skipped: a nonzero exit stops the fleet's migration before it registers the new scope
             act["state"], act["note"] = "failed", "the runner has a job (or a listener runs); nothing removed, re-run when idle"
+            if drained is None:
+                drained = start_drain(ctx, "its retirement")
+            if drained:
+                act["note"] += f"; {DRAINING}"
+                act["draining"] = True
             continue
         if act["kind"] == "agent":
             if ctx.headless:
