@@ -1849,7 +1849,10 @@ class GlaedaDiskTest(unittest.TestCase):
             images, ipsws = fams["tart-images"], fams["tart-ipsws"]
             self.assertEqual(images.root, gd.HOME / ".tart/cache/OCIs")
             self.assertTrue(images.reclaimable and ipsws.reclaimable)
-            self.assertEqual((images.min_idle_hours, ipsws.min_idle_hours), (gd.tart_idle_hours(),) * 2)
+            with mock.patch.object(gd, "tart_installed", return_value=True):
+                fams_tart = {f.id: f for f in gd.default_families()}
+            self.assertEqual(fams_tart["tart-images"].min_idle_hours, 7 * 24.0)
+            self.assertEqual(fams_tart["tart-ipsws"].min_idle_hours, 7 * 24.0)
             self.assertEqual(sorted(p.name for p in gd.candidates(images)),
                              ["macos-sequoia-vanilla", "macos-sonoma-vanilla"], "one image at a time, never ~/.tart/vms")
             self.assertEqual([p.name for p in gd.candidates(ipsws)], ["UniversalMac.ipsw"])
@@ -1881,10 +1884,16 @@ class GlaedaDiskTest(unittest.TestCase):
             old, now = time.time() - 30 * 86400, time.time()
             for p in (nested / "26.0", nested / "sha256:def/disk.img", nested / "sha256:def", nested):
                 os.utime(p, (old, old), follow_symlinks=False)
-            self.assertLess(gd.tart_last_use(nested), old + 1)
+            with mock.patch.object(gd, "tart_installed", return_value=False):
+                # no Tart: glaeda-disk's own walk moves no date it judges, and an old image reads old
+                self.assertLess(gd.item_mtime(images, nested), old + 1)
+                self.assertLess(gd.item_mtime(images, nested), old + 1, "a second look reads the same")
             os.utime(nested / "sha256:def", (now, old))  # Tart's contentAccessDate on the digest directory
-            self.assertGreaterEqual(gd.tart_last_use(nested), now - 1)
-            self.assertGreaterEqual(gd.item_mtime(images, nested), now - 1)
+            with mock.patch.object(gd, "tart_installed", return_value=True):
+                self.assertGreaterEqual(gd.tart_last_use(nested), now - 1)
+                self.assertGreaterEqual(gd.item_mtime(images, nested), now - 1)
+            with mock.patch.object(gd, "tart_installed", return_value=False):
+                self.assertLess(gd.item_mtime(images, nested), old + 1, "without Tart only mtime counts")
             with mock.patch.object(gd, "tart_installed", return_value=True):
                 self.assertEqual(gd.tart_idle_hours(), gd.TART_IDLE_HOURS)
             with mock.patch.object(gd, "tart_installed", return_value=False):

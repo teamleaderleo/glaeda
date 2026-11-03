@@ -4543,16 +4543,16 @@ def item_mtime(fam: Family, path: Path) -> float:
     # reuse window. Active jobs are still protected by process evidence and the
     # git-loss check before deletion.
     skip_names = frozenset(VCS_MARKERS) if (fam.id == "tmp" or RUNNER_CACHE_PROFILE) else frozenset()
-    newest = newest_mtime(path, 2 if fam.reclaimable else 1, 3000 if fam.reclaimable else 300,
-                          access=fam.discover, skip_names=skip_names)
+    # Tart's access date first, and a walk that never lists a digest directory, which would move that date
+    tart = tart_last_use(path) if fam.id in TART_FAMILIES else 0.0
+    newest = newest_mtime(path, 1 if fam.id in TART_FAMILIES else 2 if fam.reclaimable else 1,
+                          3000 if fam.reclaimable else 300, access=fam.discover, skip_names=skip_names)
     if fam.id == SPM_SCRATCH:
         with contextlib.suppress(OSError):
             newest = max(newest, spm_lock(path).stat().st_mtime)
     if fam.id == NIGHTLY_NEXT_FAMILY:
         newest = max(newest, nightly_next_last_use(path))
-    if fam.id in TART_FAMILIES:
-        newest = max(newest, tart_last_use(path))
-    return newest
+    return max(newest, tart)
 
 
 # Files every nightly-next build on a runner rewrites, below its tree (cmux nightly_build_state.py's layout), each
@@ -7299,12 +7299,14 @@ def tart_last_use(path: Path) -> float:
         return 0.0
     if not stat.S_ISDIR(st.st_mode):
         return max(st.st_mtime, st.st_atime)
-    newest = st.st_mtime
+    newest, access = st.st_mtime, tart_installed()
     for e in _entries(path):
         if e.name.startswith(TART_DIGEST_PREFIX):
             with contextlib.suppress(OSError):
                 est = e.stat(follow_symlinks=False)
-                newest = max(newest, est.st_mtime, est.st_atime)
+                # Without Tart nothing on the host reads the cache but glaeda-disk's own walks (the survey's du), which
+                # move atime themselves: only mtime counts then.
+                newest = max(newest, est.st_mtime, est.st_atime if access else 0.0)
     return newest
 
 
