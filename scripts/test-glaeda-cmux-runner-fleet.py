@@ -54,6 +54,27 @@ if " check " in remote:
     if host in os.environ.get("FAKE_ELIGIBLE", "").split(","):
         print("glaeda-cmux-runner-hook: eligible"); sys.exit(0)
     print("glaeda-cmux-runner-hook: refused: node not eligible (no Glaeda enrollment on this mini)"); sys.exit(1)
+if "actions-runner-glaeda*" in remote:  # POOL_RECEIPTS: FAKE_RECEIPTS seeds host=k:k:..., uninstalls remove
+    path = log + ".receipts." + host
+    if not os.path.exists(path):
+        seeds = dict(x.split("=") for x in os.environ.get("FAKE_RECEIPTS", "").split(",") if x)
+        open(path, "w").write(json.dumps([int(k) for k in seeds.get(host, "").split(":") if k]))
+    for k in json.load(open(path)):
+        print("receipt " + ("receipt.json" if k == 0 else "instance-%d/receipt.json" % k))
+        print("dir actions-runner-glaeda" + ("" if k == 0 else "-%d" % k))
+    print("end"); sys.exit(0)
+if "--uninstall --apply" in remote:
+    k = int(remote.split("--instance ")[1].split()[0])
+    if host + ":" + str(k) in os.environ.get("FAKE_BUSY", "").split(","):
+        print(json.dumps({{"actions": [{{"kind": "deregister", "state": "failed",
+                                        "note": "the runner has a job (or a listener runs); nothing removed, re-run when idle"}}]}}))
+        sys.exit(1)
+    path = log + ".receipts." + host
+    if os.path.exists(path):
+        kept = [x for x in json.load(open(path)) if x != k]
+        open(path, "w").write(json.dumps(kept))
+    print(json.dumps({{"actions": [{{"kind": "deregister", "state": "remove", "applied": True}}]}}))
+    sys.exit(0)
 if "--uninstall" in remote and "--apply" not in remote:
     k = remote.split("--instance ")[1].split()[0]
     scopes = dict(x.split("=") for x in os.environ.get("FAKE_SCOPES", "").split(",") if x)
@@ -271,6 +292,51 @@ class FleetTest(unittest.TestCase):
         self.assertEqual([i["instance"] for i in row["instances"]], [0, 1, 2, 3, 4, 5])
         applies = [c["remote"] for c in self.calls() if c["tool"] == "ssh" and "--apply" in c["remote"]]
         self.assertEqual(sorted(int(r.split("--instance ")[1].split()[0]) for r in applies), [0, 1, 2, 3, 4, 5])
+
+    def test_a_lowered_count_retires_the_idle_instances_past_it(self) -> None:
+        """#1821: after runners drops (an xl Studio from 10 to 6), the apply re-applies 0..count-1 and retires each
+        pool instance installed at or past the count, deregistering it; a busy one is left and reported, and does
+        not fail the apply."""
+        manifest = json.loads(json.dumps(MANIFEST))
+        manifest["defaults"]["runner"] = {"classes": {"std": {"runners": 4, "capacityUnits": 14,
+                                                              "gatewayRunners": 2}}}
+        self.manifest.write_text(json.dumps(manifest))
+        seeds = {"FAKE_RECEIPTS": "mini-a=" + ":".join(str(k) for k in range(10)), "FAKE_BUSY": "mini-a:9"}
+        plan = self.fleet("--hosts", "mini-a", **seeds)
+        self.assertEqual(plan.returncode, 0, plan.stdout + plan.stderr)
+        row = json.loads(plan.stdout)["members"][0]
+        self.assertEqual(row["retire"], [6, 7, 8, 9])
+        self.assertIn("retire surplus instances [6, 7, 8, 9] when idle", row["action"])
+        self.assertFalse(any("--uninstall --apply" in c.get("remote", "") for c in self.calls()), "plan is read-only")
+        result = self.fleet("--apply", "--hosts", "mini-a", **seeds)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        row = json.loads(result.stdout)["members"][0]
+        self.assertEqual(row["action"], "applied")
+        applied = [i for i in row["instances"] if not i.get("surplus")]
+        self.assertEqual([i["instance"] for i in applied], [0, 1, 2, 3, 4, 5])
+        surplus = {i["instance"]: i for i in row["instances"] if i.get("surplus")}
+        self.assertEqual(sorted(surplus), [6, 7, 8, 9])
+        self.assertEqual([surplus[k]["state"] for k in (6, 7, 8)], ["retired"] * 3)
+        self.assertTrue(surplus[9]["deferred"])
+        self.assertTrue(surplus[9]["state"].startswith("retire when idle"), surplus[9]["state"])
+        uninstalls = [c for c in self.calls() if "--uninstall --apply" in c.get("remote", "")]
+        self.assertEqual(sorted(int(c["remote"].split("--instance ")[1].split()[0]) for c in uninstalls),
+                         [6, 7, 8, 9])
+        self.assertTrue(all(c["stdin"].strip() == TOKEN for c in uninstalls), "remove token piped, never argv")
+        left = json.loads((self.dir / "calls.jsonl.receipts.mini-a").read_text())
+        self.assertEqual(left, [0, 1, 2, 3, 4, 5, 9])
+        again = self.fleet("--apply", "--hosts", "mini-a", FAKE_BUSY="")
+        self.assertEqual(again.returncode, 0, again.stdout + again.stderr)
+        self.assertEqual(json.loads((self.dir / "calls.jsonl.receipts.mini-a").read_text()), [0, 1, 2, 3, 4, 5])
+
+    def test_an_unregistered_surplus_instance_retires_with_no_token(self) -> None:
+        """A surplus instance with no registration (an interrupted install) is removed without a remove token."""
+        result = self.fleet("--apply", "--hosts", "mini-a", FAKE_RECEIPTS="mini-a=0:1:2:3:4",
+                            FAKE_SCOPES="mini-a:4=")
+        row = json.loads(result.stdout)["members"][0]
+        surplus = [i for i in row["instances"] if i.get("surplus")]
+        self.assertEqual([i["instance"] for i in surplus], [4])
+        self.assertEqual(surplus[0]["state"], "retired", "an unregistered surplus instance retires with no token")
 
     def test_apply_installs_a_members_dedicated_runners_on_their_own_scope(self) -> None:
         """Leo, 2026-10-27: "why the fuck not manage it with glaeda????????" A member's runner.dedicated runners (a

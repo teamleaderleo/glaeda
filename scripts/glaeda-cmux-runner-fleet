@@ -702,8 +702,9 @@ def installed_pool_instances(member: str) -> tuple[list[int] | None, str | None]
     return sorted(receipts), None
 
 
-def retire_instance(member: str, instance: int) -> dict[str, Any]:
-    """Deregister and remove one pool instance of a dedicatedOnly member, by its receipt. A runner with a job is never
+def retire_instance(member: str, instance: int, held: str = "dedicated runners held") -> dict[str, Any]:
+    """Deregister and remove one pool instance, by its receipt: every pool instance of a dedicatedOnly member, and on
+    any other member each instance at or past runners + gatewayRunners (SURPLUS). A runner with a job is never
     stopped: glaeda-cmux-runner's uninstall fails ("the runner has a job") and changes nothing; drain the mini
     (cmux-ci drain) and re-run."""
     scope, why = registered_scope(member, instance, receipt_only=True)
@@ -724,8 +725,41 @@ def retire_instance(member: str, instance: int) -> dict[str, Any]:
     left, why = installed_pool_instances(member)
     if left is None or instance in left:
         return {"instance": instance, "exit": 1, "name": None,
-                "state": f"retire unconfirmed ({why or 'its receipt is still there'}); dedicated runners held"}
+                "state": f"retire unconfirmed ({why or 'its receipt is still there'}); {held}"}
     return {"instance": instance, "exit": 0, "state": "retired", "name": None}
+
+
+# SURPLUS: the apply installs instances 0 .. runners + gatewayRunners - 1, so after a member's count drops (an xl
+# Studio from 10 to 6 runners, 2026-11-03) the instances past it kept their LaunchAgents and registrations, kept taking
+# side jobs and kept their listen claims, which held the root runners off: the problem the drop was meant to fix
+# (#1821). Each pool instance installed at or past the count is retired the way a dedicatedOnly member's are, only
+# while idle. A busy one is left installed and reported "retire when idle"; it does not fail the apply, and the next
+# apply retires it.
+SURPLUS_BUSY = "has a job"
+
+
+def surplus_instances(installed: list[int], count: int) -> list[int]:
+    """The installed pool instances past a member's declared count (runners + gatewayRunners)."""
+    return [k for k in installed if k >= count]
+
+
+def retire_surplus(member: str, count: int) -> list[dict[str, Any]]:
+    """Retire every idle pool instance at or past `count` on `member` (SURPLUS). Each result carries "surplus": True;
+    a busy one ("deferred": True) is reported "retire when idle" and left installed. A listing that cannot be read
+    retires nothing and says why, without failing the apply (deferred too)."""
+    installed, why = installed_pool_instances(member)
+    if installed is None:
+        return [{"instance": None, "exit": None, "surplus": True, "deferred": True,
+                 "state": f"surplus not checked: {why}"}]
+    results = []
+    for k in surplus_instances(installed, count):
+        result = retire_instance(member, k, held=f"past the declared {count} instances")
+        result["surplus"] = True
+        if result["exit"] != 0 and SURPLUS_BUSY in str(result.get("state")):
+            result["deferred"] = True
+            result["state"] = f"retire when idle (past the declared {count} instances): {result['state']}"
+        results.append(result)
+    return results
 
 
 def apply_instance(member: str, instance: int, repo: str | None, extra: list[str], org: str | None = None,
@@ -853,6 +887,13 @@ def one_member(member: str, summary: dict[str, Any], args: argparse.Namespace, m
         if summary.get("dedicatedOnly"):
             row["action"] += (f"; dedicated only, retire pool instances {row['retire'] or 'none'}"
                               if isinstance(row["retire"], list) else f"; dedicated only, {row['retire']}")
+        elif eligible or args.include_ineligible:
+            # SURPLUS: the plan names the instances an apply would retire (read-only listing)
+            installed, _ = installed_pool_instances(member)
+            surplus = surplus_instances(installed or [], row["runners"] + row["gatewayRunners"])
+            if surplus:
+                row["retire"] = surplus
+                row["action"] += f"; retire surplus instances {surplus} when idle"
         return row
     if not (eligible or args.include_ineligible):
         row["action"] = "skipped (not eligible)"
@@ -886,6 +927,7 @@ def one_member(member: str, summary: dict[str, Any], args: argparse.Namespace, m
         with concurrent.futures.ThreadPoolExecutor(max_workers=instances) as pool:
             results = list(pool.map(lambda k: apply_instance(member, k, repo, extra, org, group,
                                                              args.migrate_from_repo), range(instances)))
+        results += retire_surplus(member, instances)
     held = None
     if summary.get("dedicatedOnly") and not all(r["exit"] == 0 for r in results):
         held = "held: pool instances are not all retired; drain the mini and re-run"
@@ -903,7 +945,7 @@ def one_member(member: str, summary: dict[str, Any], args: argparse.Namespace, m
         # a dedicated runner keeps its own scope (never --org/--migrate-from-repo) and its own labels
         results += [apply_dedicated(member, entry, extra) for entry in dedicated]
     row["instances"] = results
-    row["action"] = "applied" if all(r["exit"] == 0 for r in results) else "failed"
+    row["action"] = "applied" if all(r["exit"] == 0 or r.get("deferred") for r in results) else "failed"
     row["seconds"] = round(time.monotonic() - started, 1)
     return row
 

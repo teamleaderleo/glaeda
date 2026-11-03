@@ -946,6 +946,16 @@ To move a hand-made runner over: declare the entry with the old runner's labels 
 repos/OWNER/REPO/actions/runners/ID`), apply it so the glaeda runner is online beside the old one, then, while the old
 runner has no `Runner.Worker`, boot out and archive its LaunchAgents and remove its registration.
 
+### A lowered runner count (surplus instances)
+
+`glaeda-cmux-runner-fleet --apply` installs instances `0 .. runners + gatewayRunners - 1`, then retires every pool
+instance it finds installed at or past that count, the same way a dedicated-only member's are retired (below): by the
+instance's receipt, with a remove token for the receipt's own scope, deregistered from GitHub and its LaunchAgent and
+directory removed. Before this, a count drop (an xl Studio from 10 to 6 runners, 2026-11-03, #1821) left the
+instances past it listening and taking side jobs, and their listen claims kept the root runners off. A surplus instance
+with a job is never stopped: it is left installed, reported `retire when idle`, does not fail the apply, and the next
+apply retires it. The plan (no `--apply`) names the instances an apply would retire.
+
 ### Dedicated-only members (`runner.dedicatedOnly`)
 
 `"runner": {"dedicatedOnly": true, "dedicated": [...]}` makes a member run only its dedicated runners: no pool
