@@ -13035,7 +13035,7 @@ class ManifestLabelsTest(unittest.TestCase):
     def test_side_labels_widen_to_narrower_classes_only(self) -> None:
         # One rule from the manifest's class order: a side runner carries its own class's side label and every
         # narrower class's, so GitHub hands a starved light queue to idle std side runners; a light runner never
-        # carries a std label, and root labels never widen.
+        # carries a std label, and root labels keep their class (xl's one spill: the next test).
         manifest = copy.deepcopy(MANIFEST)
         manifest["hosts"]["mini-light"]["availability"] = "dedicated"
         with mock.patch.object(cr, "xcode_present", return_value=True):
@@ -13061,6 +13061,38 @@ class ManifestLabelsTest(unittest.TestCase):
                           ["glaeda-session-std-xcode-26.6"], ["glaeda-std-xcode-26.6"], ["self-hosted", "macOS"],
                           ["glaeda-side-std"], ["x-side-std-xcode-26.6"]):
             self.assertEqual(fleet_labels.widened_labels(unchanged), unchanged)
+
+    def test_xl_root_runners_also_carry_the_std_root_label(self) -> None:
+        # cmux's picker has no xl pool, so an xl root runner carrying only glaeda-root-xl never got a job (the M5 Ultra
+        # Studios, 2026-11-03). It also carries std's root label; std's and light's root labels stay their own.
+        manifest = copy.deepcopy(MANIFEST)
+        manifest["hosts"]["mini-xl"] = {"class": "xl", "availability": "dedicated", "roles": ["ci-runner"],
+                                        "hardware": "m5ultra-96"}
+        manifest["defaults"]["runner"] = {"classes": {"xl": {"runners": 2, "capacityUnits": 30}}}
+        manifest["hosts"]["mini-light"]["availability"] = "dedicated"
+        with mock.patch.object(cr, "xcode_present", return_value=True):
+            xl, why = cr.member_labels(manifest, "mini-xl")
+            std, _ = cr.member_labels(manifest, "mini-std")
+            light, _ = cr.member_labels(manifest, "mini-light")
+        self.assertIsNotNone(xl, why)
+        self.assertEqual(xl["rootPools"], ["glaeda-root-xl-xcode-26.6", "glaeda-root-std-xcode-26.6"])
+        self.assertEqual(xl["sidePools"], ["glaeda-side-xl-xcode-26.6", "glaeda-side-std-xcode-26.6",
+                                           "glaeda-side-light-xcode-26.6"])
+        self.assertEqual(xl["pools"], ["glaeda-xl-xcode-26.6"], "the pool count stays the member's own class")
+        self.assertEqual(std["rootPools"], ["glaeda-root-std-xcode-26.6"])
+        self.assertEqual(light["rootPools"], ["glaeda-root-light-xcode-26.6"])
+        self.assertEqual(fleet_labels.root_classes("xl"), ("xl", "std"))
+        self.assertEqual(fleet_labels.root_classes("std"), ("std",))
+        self.assertEqual(fleet_labels.root_classes("dev"), ())
+        self.assertEqual(fleet_labels.root_pools("glaeda-aws-trusted-xl-xcode-26.6"),
+                         [fleet_labels.root_label("glaeda-aws-trusted-xl-xcode-26.6"),
+                          fleet_labels.root_label("glaeda-aws-trusted-std-xcode-26.6")])
+        # A registered xl root runner converges to what member_labels issues now, through the label API alone.
+        live = ["glaeda-xl-xcode-26.6", "glaeda-root-xl-xcode-26.6", "glaeda-runner-mini-xl-glaeda"]
+        once = fleet_labels.widened_labels(live)
+        self.assertEqual(once, [*live, "glaeda-root-std-xcode-26.6"])
+        self.assertEqual(fleet_labels.widened_labels(once), once)
+        self.assertEqual(fleet_labels.widened_labels(["glaeda-root-std-xcode-26.6"]), ["glaeda-root-std-xcode-26.6"])
 
     def test_runner_capacity_per_class(self) -> None:
         with mock.patch.object(cr, "xcode_present", return_value=True):

@@ -128,15 +128,49 @@ def side_classes(klass: str) -> tuple[str, ...]:
     light pool spills onto idle std side runners for every workflow, picker or not. On 2026-10-20 at 22:22Z the light
     side label had 133 jobs queued on 3 online runners while 51 std side runners sat idle. Only side labels widen:
     root, gui, session and fast labels keep their own class (canonical roots, the gui token and the fast tokens are
-    per class), and the pool namespace and trust stay the member's own (pool_label's arguments).
+    per class), and the pool namespace and trust stay the member's own (pool_label's arguments), except the one root
+    spill root_classes() names.
     """
     return RUNNER_CLASSES[RUNNER_CLASSES.index(klass):] if klass in RUNNER_CLASSES else ()
 
 
-def widened_labels(labels: list[str]) -> list[str]:
-    """`labels` plus every side label side_classes() adds to the side labels among them, in order, each once.
+# Root labels a class's root runners carry beyond their own. cmux's picker routes runs to std and light pools only
+# (scripts/ci/pr_runner_pool.py RUN_CLASSES); no job asks for glaeda-root-xl-xcode-<v>. So the xl members' root
+# runners (the M5 Ultra Mac Studios) took no job at all: no runner log either Studio's root runner kept, to
+# 2026-11-03 17:00Z, shows one, while one Studio's side runner ran 56 that day. An xl root runner
+# also carries the std root label, so GitHub's queue hands it std's compile admission and cli-product jobs. It is
+# extra capacity cmux's root count does not know of (CI_OWNED_POOL_SLOTS counts std's root runners), so it only
+# shortens the wait. std's root runners never take light's root jobs: light's roots are counted on their own.
+ROOT_SPILL = {"xl": ("std",)}
 
-    The registered labels of a runner installed before side_classes() lack the narrower classes' side labels.
+
+def root_classes(klass: str) -> tuple[str, ...]:
+    """The classes whose root label a `klass` root runner carries: its own, then ROOT_SPILL's for it."""
+    return (klass, *ROOT_SPILL.get(klass, ())) if klass in RUNNER_CLASSES else ()
+
+
+def _with_class(pool: str, old: str, new: str) -> str:
+    """`pool` with its class part `old` replaced by `new` (namespace, trust and Xcode kept)."""
+    parts = pool.split("-")
+    parts[parts.index(old)] = new
+    return "-".join(parts)
+
+
+def root_pools(pool: str) -> list[str]:
+    """The root labels a root runner of `pool` carries: root_label() of the pool and of each root_classes() spill."""
+    parts = pool.split("-")
+    klass = next((part for part in parts if part in RUNNER_CLASSES), None)
+    if klass is None:
+        return [root_label(pool)]
+    return [root_label(_with_class(pool, klass, k)) for k in root_classes(klass)]
+
+
+def widened_labels(labels: list[str]) -> list[str]:
+    """`labels` plus every side label side_classes() adds to the side labels among them, and every root label
+    root_classes() adds to the root labels among them, in order, each once.
+
+    The registered labels of a runner installed before side_classes() lack the narrower classes' side labels (and one
+    installed before root_classes() its root spill).
     A reconciler with the organization's runner-label permission (GitHub fixes labels at registration, and a
     mini holds no admin token) sets a runner's custom labels to this, so a manifest change reaches every
     registered runner without a relabel by hand. Pure and idempotent: widened_labels(widened_labels(x)) ==
@@ -146,18 +180,19 @@ def widened_labels(labels: list[str]) -> list[str]:
     for label in list(out):
         parts = label.split("-")
         index = next((i for i, part in enumerate(parts) if part in RUNNER_CLASSES), None)
-        if (index is None or parts[0] != "glaeda" or "side" not in parts[1:index]
-                or parts[index + 1:index + 2] != ["xcode"] or not re.fullmatch(VERSION_RE, "-".join(parts[index + 2:]))):
+        if (index is None or parts[0] != "glaeda" or parts[index + 1:index + 2] != ["xcode"]
+                or not re.fullmatch(VERSION_RE, "-".join(parts[index + 2:]))):
             continue
-        pool = "-".join(part for i, part in enumerate(parts) if not (part == "side" and 0 < i < index))
-        if side_label(pool) != label:
-            continue
-        for klass in side_classes(parts[index])[1:]:
-            narrower = pool.split("-")
-            narrower[narrower.index(parts[index])] = klass
-            wanted = side_label("-".join(narrower))
-            if wanted not in out:
-                out.append(wanted)
+        for role, make, classes in (("side", side_label, side_classes), ("root", root_label, root_classes)):
+            if role not in parts[1:index]:
+                continue
+            pool = "-".join(part for i, part in enumerate(parts) if not (part == role and 0 < i < index))
+            if make(pool) != label:
+                continue
+            for klass in classes(parts[index])[1:]:
+                wanted = make(_with_class(pool, parts[index], klass))
+                if wanted not in out:
+                    out.append(wanted)
     return out
 
 
@@ -376,7 +411,8 @@ def member_labels(manifest: Any, member: str, xcode_ok: Callable[[dict[str, Any]
             "runners": runners, "capacityUnits": units, "compileSlots": compile_slots,
             "trustedRef": trusted_ref, "trustedRepo": trusted_repo, "trustedNextNightly": next_nightly,
             "devCompile": dev_compile, "devCompileInstance": roots if dev_compile else None,
-            "canonicalRoots": roots, "rootPools": [root_label(label) for label in dict.fromkeys(pools)],
+            "canonicalRoots": roots,
+            "rootPools": list(dict.fromkeys(r for label in dict.fromkeys(pools) for r in root_pools(label))),
             "sidePools": list(dict.fromkeys(side_label(pool_label(k, v, bool(trusted_ref), normal_pool_prefix))
                                             for v in (versions if pools else []) for k in side_classes(klass))),
             "guiRunners": gui, "guiPools": [gui_label(label) for label in dict.fromkeys(pools)] if gui else [],
