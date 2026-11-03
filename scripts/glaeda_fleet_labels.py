@@ -176,11 +176,13 @@ def root_pools(pool: str) -> list[str]:
 
 
 def widened_labels(labels: list[str]) -> list[str]:
-    """`labels` plus every side label side_classes() adds to the side labels among them, and every root label
-    root_classes() adds to the root labels among them, in order, each once.
+    """`labels` plus every side label side_classes() adds to the side labels among them, every root label
+    root_classes() adds to the root labels among them, and every nightly slot label nightly_classes() adds to the
+    nightly slot labels among them, in order, each once.
 
-    The registered labels of a runner installed before side_classes() lack the narrower classes' side labels (and one
-    installed before root_classes() its root spill).
+    The registered labels of a runner installed before side_classes() lack the narrower classes' side labels (one
+    installed before root_classes() its root spill, and an xl nightly slot installed before nightly_classes() the std
+    nightly label, #1820).
     A reconciler with the organization's runner-label permission (GitHub fixes labels at registration, and a
     mini holds no admin token) sets a runner's custom labels to this, so a manifest change reaches every
     registered runner without a relabel by hand. Pure and idempotent: widened_labels(widened_labels(x)) ==
@@ -193,7 +195,8 @@ def widened_labels(labels: list[str]) -> list[str]:
         if (index is None or parts[0] != "glaeda" or parts[index + 1:index + 2] != ["xcode"]
                 or not re.fullmatch(VERSION_RE, "-".join(parts[index + 2:]))):
             continue
-        for role, make, classes in (("side", side_label, side_classes), ("root", root_label, root_classes)):
+        for role, make, classes in (("side", side_label, side_classes), ("root", root_label, root_classes),
+                                    ("nightly", nightly_label, nightly_classes)):
             if role not in parts[1:index]:
                 continue
             pool = "-".join(part for i, part in enumerate(parts) if not (part == role and 0 < i < index))
@@ -204,6 +207,12 @@ def widened_labels(labels: list[str]) -> list[str]:
                 if wanted not in out:
                     out.append(wanted)
     return out
+
+
+def nightly_label(pool: str) -> str:
+    """The nightly slot label of a role-free pool label: glaeda-std-xcode-26.6 -> glaeda-nightly-std-xcode-26.6, the
+    pool_label(klass, version, False, NIGHTLY_POOL_PREFIX) member_labels() issues to a nightly slot."""
+    return _role_label(pool, "nightly")
 
 
 def gui_label(pool: str) -> str:

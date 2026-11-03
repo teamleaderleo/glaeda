@@ -13341,6 +13341,15 @@ class FleetLabelsModuleTest(unittest.TestCase):
         self.assertEqual((ultra["nightlySlot"], ultra["nightlyInstance"]), (True, 3))
         self.assertEqual(ultra["rootPools"], ["glaeda-root-xl-xcode-26.6", "glaeda-root-std-xcode-26.6"])
         self.assertEqual(fleet_labels.widened_labels(ultra["nightlyPools"]), ultra["nightlyPools"])
+        # #1820: an xl slot registered before nightly_classes() converges through the label reconcile alone
+        live = ["glaeda-mini", "glaeda-class-xl", "glaeda-nightly-xl-xcode-26.6", "glaeda-runner-ultra-glaeda-3"]
+        once = fleet_labels.widened_labels(live)
+        self.assertEqual(once, [*live, "glaeda-nightly-std-xcode-26.6"])
+        self.assertEqual(fleet_labels.widened_labels(once), once)
+        self.assertEqual(fleet_labels.nightly_label("glaeda-xl-xcode-26.6"), ultra["nightlyPools"][0])
+        for unchanged in (["glaeda-nightly-std-xcode-26.6"], ["glaeda-nightly-light-xcode-26.6"],
+                          ["glaeda-nightly-xl"], ["glaeda-nightly-only-m4pro"]):
+            self.assertEqual(fleet_labels.widened_labels(unchanged), unchanged)
         pools = fleet_labels.declared_pools(manifest)
         self.assertIn("ultra", pools["glaeda-nightly-std-xcode-26.6"])
         self.assertIn("ultra", pools["glaeda-nightly-xl-xcode-26.6"])
