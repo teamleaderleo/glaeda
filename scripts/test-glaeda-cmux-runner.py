@@ -8524,7 +8524,8 @@ class GateTest(unittest.TestCase):
                 mock.patch.dict(os.environ, {hook.DISK_JOB_PEAK_ENV: "20"}):
             self.assertIsNone(gate.low_disk(), "a held nightly listener resumes within the 30 GiB reserve")
             free["gib"] = 19.0
-            self.assertIn("22 GiB required", gate.low_disk() or "", "resume hysteresis still applies")
+            self.assertIn("22 GiB required (20 GiB floor + 2 GiB to resume)", gate.low_disk() or "",
+                          "resume hysteresis still applies, and the hold names the floor job-started refuses under")
             gate.child = mock.Mock(pid=1)
             self.assertIn("20 GiB required", gate.low_disk() or "", "a listening nightly keeps the measured floor")
 

@@ -6435,7 +6435,9 @@ class Gate:
         self.reap_eviction(path, floor)
         why = disk_refusal(path, need)
         if why:
-            why += reserve
+            # a hold above the floor names the floor, so a reader (ci-dash disk_policy) shows the floor job-started
+            # refuses under, not the resume mark or the reserve (cmux15, 2026-11-03: a 52 GiB "floor" beside 30)
+            why += reserve or (f" ({floor:g} GiB floor + {need - floor:g} GiB to resume)" if need > floor else "")
             self.evict_in_background(path, floor)
             if scope.dedicated or reserve:  # the builder short of disk, or the reserve that keeps it room
                 self.evict_idle_in_background(path, floor + GATE_DISK_RESUME_GIB)
