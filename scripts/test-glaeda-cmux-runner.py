@@ -13323,6 +13323,29 @@ class FleetLabelsModuleTest(unittest.TestCase):
         self.assertEqual(fleet_labels.member_labels(manifest, "mini-std", lambda app: True)[0], after,
                          "the DEV namespace never moves neighboring instances out of their normal pool")
 
+    def test_an_xl_nightly_slot_also_answers_the_std_nightly_label_and_never_light(self) -> None:
+        # The M5 Ultra Studios (class xl) take a nightly job queued on glaeda-nightly-std-xcode-<v>, the label cmux's
+        # nightly picker offers, as their side runners already take side-std jobs; no slot answers a light nightly
+        # label from a wider class, and a std or light slot's labels do not change.
+        self.assertEqual(fleet_labels.nightly_classes("xl"), ("xl", "std"))
+        self.assertEqual(fleet_labels.nightly_classes("std"), ("std",))
+        self.assertEqual(fleet_labels.nightly_classes("light"), ("light",))
+        manifest = copy.deepcopy(MANIFEST)
+        manifest["hosts"]["ultra"] = {"class": "xl", "availability": "dedicated", "roles": ["ci-runner"],
+                                      "hardware": "m5ultra-96", "overrides": {"runner": {"nightlySlot": True, "classes": {
+                                          "xl": {"runners": 8, "capacityUnits": 30, "compileSlots": 3,
+                                                 "canonicalRoots": 3, "gatewayRunners": 2}}}}}
+        ultra, why = fleet_labels.member_labels(manifest, "ultra", lambda app: True)
+        self.assertIsNone(why)
+        self.assertEqual(ultra["nightlyPools"], ["glaeda-nightly-xl-xcode-26.6", "glaeda-nightly-std-xcode-26.6"])
+        self.assertEqual((ultra["nightlySlot"], ultra["nightlyInstance"]), (True, 3))
+        self.assertEqual(ultra["rootPools"], ["glaeda-root-xl-xcode-26.6", "glaeda-root-std-xcode-26.6"])
+        self.assertEqual(fleet_labels.widened_labels(ultra["nightlyPools"]), ultra["nightlyPools"])
+        pools = fleet_labels.declared_pools(manifest)
+        self.assertIn("ultra", pools["glaeda-nightly-std-xcode-26.6"])
+        self.assertIn("ultra", pools["glaeda-nightly-xl-xcode-26.6"])
+        self.assertNotIn("glaeda-nightly-light-xcode-26.6", pools)
+
     def test_the_nightly_slot_declares_its_own_pool_without_adding_capacity(self) -> None:
         manifest = copy.deepcopy(MANIFEST)
         before = fleet_labels.member_labels(manifest, "mini-std", lambda app: True)[0]

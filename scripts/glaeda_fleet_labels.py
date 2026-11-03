@@ -83,7 +83,9 @@ DEV_COMPILE_POOL_PREFIX = "dev-"
 # order, so a nightly job queued on a side label waited behind every PR job queued there before it (2026-10-27
 # 14:08Z: a nightly-next build-nightly-app on the light side label was never acquired by a runner while 37 side
 # runners ran PR jobs). No PR job carries this label, so the nightly job is the only one this runner can take; it
-# listens on a full mini, and its job waits there first in line (FEED_FIRST) while no other job takes a unit.
+# listens on a full mini, and its job waits there first in line (FEED_FIRST) while no other job takes a unit. An xl
+# slot also carries the std nightly label (nightly_classes), so a nightly job queued on glaeda-nightly-std-xcode-<v>
+# (cmux's vars.CI_NIGHTLY_NEXT_BUILD_RUNNER) reaches an idle M5 Ultra's slot as well as an M4 Pro's.
 NIGHTLY_POOL_PREFIX = "nightly-"
 
 
@@ -132,6 +134,14 @@ def side_classes(klass: str) -> tuple[str, ...]:
     spill root_classes() names.
     """
     return RUNNER_CLASSES[RUNNER_CLASSES.index(klass):] if klass in RUNNER_CLASSES else ()
+
+
+def nightly_classes(klass: str) -> tuple[str, ...]:
+    """The classes whose nightly slot label a `klass` nightly slot carries: its own, then each narrower class down to
+    std. As with side_classes(), a wider mini runs a narrower one's nightly job (an M5 Ultra, 96 GB, builds what an M4
+    Pro builds), but never down to light: a 16 GB M4 cannot build the nightly app, so no wider slot answers a light
+    nightly label, and a std slot's labels stay exactly what they were."""
+    return tuple(k for k in side_classes(klass) if k == klass or k != "light")
 
 
 # Root labels a class's root runners carry beyond their own. cmux's picker routes runs to std and light pools only
@@ -334,7 +344,7 @@ def member_labels(manifest: Any, member: str, xcode_ok: Callable[[dict[str, Any]
              if availability == "dedicated" and not dedicated_only else [])
     dev_pools = ([pool_label(klass, v, False, DEV_COMPILE_POOL_PREFIX) for v in versions]
                  if dev_compile and availability == "dedicated" else [])
-    nightly_pools = ([pool_label(klass, v, False, NIGHTLY_POOL_PREFIX) for v in versions]
+    nightly_pools = ([pool_label(k, v, False, NIGHTLY_POOL_PREFIX) for v in versions for k in nightly_classes(klass)]
                      if nightly_slot and availability == "dedicated" else [])
     # Declared (the ios-simulators role) and, when the caller can look (the installer on the mini), a simulator
     # runtime actually present: an iOS job routed here must be able to boot one. Without a check (the fleet
