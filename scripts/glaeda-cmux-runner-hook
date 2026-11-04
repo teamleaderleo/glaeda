@@ -5785,10 +5785,12 @@ def host_saturated(paused: bool, cpu_busy: float | None = None, memory_pressure:
     return f"{SATURATED} ({' and '.join(reasons)}; listening resumes below {GATE_CPU_RESUME:g}% CPU and normal memory pressure)"
 
 
-def host_held(host_lock: str, reservation: str, now: float, state_dir: Path | None = None) -> str | None:
+def host_held(host_lock: str, reservation: str, now: float, state_dir: Path | None = None,
+              nightly_slot: bool = False) -> str | None:
     """Why the fleet, not a PR job, holds this host right now, or None. Our own jobs hold the host lock
-    shared, so only an exclusive holder or a reservation counts. Microseconds: one non-blocking flock."""
-    why = reservation_refusal(reservation, now)
+    shared, so only an exclusive holder or a reservation counts. Microseconds: one non-blocking flock.
+    nightly_slot: the mini's nightly slot, which a NIGHTLY_SIGNING reservation does not hold off (reservation_refusal)."""
+    why = reservation_refusal(reservation, now, nightly_slot=nightly_slot)
     if why or not os.path.exists(host_lock):
         return why
     try:
@@ -6325,7 +6327,8 @@ class Gate:
             # a dedicated builder (a nightly or archive build) is not a pool runner: fleet builds, reservations,
             # load and heat never hold it off, only what would fail its job here (disk, a missing Rust toolchain)
             return self.low_disk() or self.dedicated_toolchain()
-        why = host_held(self.host_lock, self.reservation, time.time(), self.state_dir)
+        why = host_held(self.host_lock, self.reservation, time.time(), self.state_dir,
+                        nightly_slot=runner_scope(self.runner_dir).nightly)
         if why is None and self.waiters and self.waiters_due():
             self.waiting, self.waiting_at = self.blocking_waiters(), time.monotonic()
         if why is None and self.waiting:
@@ -6483,7 +6486,8 @@ class Gate:
             return drain
         if runner_scope(self.runner_dir).dedicated:
             return self.claimed()
-        why = host_held(self.host_lock, self.reservation, time.time(), self.state_dir)
+        why = host_held(self.host_lock, self.reservation, time.time(), self.state_dir,
+                        nightly_slot=runner_scope(self.runner_dir).nightly)
         if why is None and self.waiting:
             again = self.waiting & self.blocking_waiters()
             self.waiting, self.waiting_at = again, time.monotonic()

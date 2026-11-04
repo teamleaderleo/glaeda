@@ -8585,6 +8585,24 @@ class GateTest(unittest.TestCase):
             with mock.patch.object(ours, "evict_in_background"):
                 self.assertIsNone(ours.low_disk(), "the builder is never held by its own reserve or waiter")
 
+    def test_a_nightly_signing_reservation_holds_off_every_gate_but_the_nightly_slot(self) -> None:
+        """NIGHTLY_SIGNING: the gate's claimed() and confirmed() read the reservation through host_held, so they
+        must exempt the nightly slot as job-started does, or the reserved mini's nightly listener never starts."""
+        marker = self.tmp / "reservation.json"
+        now = int(time.time())
+        marker.write_text(json.dumps({"schema": "glaeda-reservation/v1", "owner": "cmux-nightly",
+                                      "purpose": "nightly signing: a mini", "since": now - 5, "until": now + 600}))
+        with mock.patch.object(hook, "host_waiters", return_value=set()):
+            pool = hook.Gate(self.runner, os.fspath(self.lock), os.fspath(marker), self.state)
+            self.assertIn("host reserved by cmux-nightly", pool.claimed() or "")
+            self.assertIn("host reserved by cmux-nightly", pool.confirmed() or "")
+            write_hook(self.runner, "exec python3 /hook job-started --nightly-runner\n")
+            nightly = hook.Gate(self.runner, os.fspath(self.lock), os.fspath(marker), self.state)
+            self.assertIsNone(nightly.claimed(), "the nightly slot keeps listening")
+            self.assertIsNone(nightly.confirmed())
+            marker.write_text(json.dumps({**json.loads(marker.read_text()), "purpose": "readiness soak"}))
+            self.assertIn("host reserved by cmux-nightly", nightly.claimed() or "", "any other purpose holds it")
+
     def test_nightly_listener_spends_reserve_but_keeps_measured_disk_floor(self) -> None:
         write_hook(self.runner, "exec python3 /hook job-started --min-free-gib 30 --nightly-runner\n")
         gate = hook.Gate(self.runner, os.fspath(self.lock), os.fspath(self.tmp / "none.json"), self.state)
