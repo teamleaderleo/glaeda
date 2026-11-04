@@ -1567,6 +1567,71 @@ NIGHTLY_VERIFY_EVENTS = ("schedule",)
 PROMOTE_COMPILE = "release-compile"  # cmux-next.yml's, on a feat-cmux-next push: nightly-next's promote gate
 TIER_NIGHTLY, TIER_DEV, TIER_STACK = "nightly", "dev", "stack"
 FEED_JUMP_S = 20 * 60.0
+
+# PRIORITY_BANDS is the declarative admission policy shared by the hook and the
+# runner picker.  The old ``tier`` field remains on disk for compatibility with
+# older hooks; new waiters also carry ``band`` so a promote can be distinguished
+# from the nightly feed it gates.  Quotas are a fraction of the mini's units,
+# with the top two bands allowed to use the whole mini.  The quota is an
+# admission hint (it never interrupts a started job) and is deliberately kept
+# here rather than in workflow-specific prose.
+PRIORITY_NIGHTLY = "nightly"
+PRIORITY_PROMOTE = "promote"
+PRIORITY_PR = "pr"
+PRIORITY_DEV = "dev"
+PRIORITY_SIDE_JOB = "side-job"
+PRIORITY_BANDS = (
+    PRIORITY_NIGHTLY,
+    PRIORITY_PROMOTE,
+    PRIORITY_PR,
+    PRIORITY_DEV,
+    PRIORITY_SIDE_JOB,
+)
+PRIORITY_RANK = {band: rank for rank, band in enumerate(PRIORITY_BANDS)}
+PRIORITY_QUOTA = {
+    PRIORITY_NIGHTLY: 1.0,
+    PRIORITY_PROMOTE: 1.0,
+    PRIORITY_PR: 0.5,
+    PRIORITY_DEV: 0.25,
+    PRIORITY_SIDE_JOB: 0.25,
+}
+
+
+def priority_quota(band: str, total: int) -> int:
+    """Return the declared queued quota for ``band`` on a mini of ``total`` units."""
+    share = PRIORITY_QUOTA.get(band, PRIORITY_QUOTA[PRIORITY_SIDE_JOB])
+    return max(1, min(max(0, int(total)), math.ceil(max(0, total) * share)))
+
+
+def priority_quota_remaining(capacity_dir: Path, band: str, total: int,
+                             skip_pid: int = 0) -> int:
+    """How many queued markers this band may still add before its quota."""
+    if band not in PRIORITY_RANK or total <= 0:
+        return 0
+    used = sum(waiter.get("band") == band for waiter in admission_waiters(capacity_dir, skip_pid))
+    return max(0, priority_quota(band, total) - used)
+
+
+def priority_band(tier: str = "", job: str | None = None, event_name: str | None = None,
+                  workflow: str = "", explicit: str = "") -> str:
+    """Map legacy hook inputs to one of the five declared priority bands.
+
+    ``explicit`` is used by tests and by callers that already classified the
+    workflow.  Pull requests are the PR band, while the existing stack tier is
+    also a PR band; unknown jobs are side jobs.  Release compile is a promote
+    job even though ``job_tier`` historically returns nightly for its slot.
+    """
+    if explicit in PRIORITY_RANK:
+        return explicit
+    if job == PROMOTE_COMPILE and tier == TIER_NIGHTLY:
+        return PRIORITY_PROMOTE
+    if tier == TIER_NIGHTLY:
+        return PRIORITY_NIGHTLY
+    if tier == TIER_STACK or event_name in STACK_BLOCKER_EVENTS or event_name == "pull_request":
+        return PRIORITY_PR
+    if tier == TIER_DEV:
+        return PRIORITY_DEV
+    return PRIORITY_SIDE_JOB
 # claude-sr2, 2026-10-29, after cmux#26809's swift test sat 45+ min queued behind ordinary PR swift tests while about
 # 15 reviewed PRs waited on it: "a PR that holds a stack ... is admitted ahead of ordinary PR swift tests, right after
 # nightly." Only a person with triage or write access on the repository can label a pull request, and the label is
@@ -2605,14 +2670,14 @@ def nightly_disk_wait(capacity_dir: Path, on: bool):
     since, done, writing = time.time(), threading.Event(), threading.Lock()
     with contextlib.suppress(OSError):
         capacity_dir.mkdir(parents=True, exist_ok=True)
-    write_want(marker, since, [NIGHTLY_DISK_WANT, "units"], TIER_NIGHTLY)
+    write_want(marker, since, [NIGHTLY_DISK_WANT, "units"], TIER_NIGHTLY, band=PRIORITY_NIGHTLY)
 
     def refresh() -> None:
         while not done.wait(ADMIT_POLL_S):
             with writing:  # the unlink below takes this too, so no write lands after it
                 if done.is_set():
                     return
-                write_want(marker, since, [NIGHTLY_DISK_WANT, "units"], TIER_NIGHTLY)
+                write_want(marker, since, [NIGHTLY_DISK_WANT, "units"], TIER_NIGHTLY, band=PRIORITY_NIGHTLY)
     thread = threading.Thread(target=refresh, daemon=True)
     thread.start()
     try:
@@ -4391,16 +4456,19 @@ def admission_waiters(capacity_dir: Path, skip_pid: int = 0) -> list[dict[str, A
         except (OSError, ValueError, TypeError, KeyError, AttributeError, OverflowError):
             continue  # OverflowError: a since too large for a float (an integer past 1e308)
         tier = data.get("tier") if data.get("tier") in (TIER_NIGHTLY, TIER_DEV, TIER_STACK) else ""
+        band = data.get("band") if data.get("band") in PRIORITY_RANK else ""
         lane = SESSION_LANE if data.get("lane") == SESSION_LANE else ""
         waiters.append({"pid": pid, "since": since, "wants": wants, "who": str(data.get("who") or "")[:200],
-                        "tier": tier, "lane": lane})
+                        "tier": tier, "band": band, "lane": lane})
     return sorted(waiters, key=lambda waiter: (waiter["since"], waiter["pid"]))
 
 
-def admission_rank(tier: str, since: float, pid: int, now: float) -> tuple[int, float, int]:
+def admission_rank(tier: str, since: float, pid: int, now: float, band: str = "") -> tuple[int, float, int]:
     """A waiter's place in the queue (FEED_FIRST): nightly jobs first; then stack-blocker PR jobs; then DEV compiles
     and other jobs that have waited FEED_JUMP_S; then the rest; each by arrival. One total order, so no two waiters
     each wait for the other."""
+    if band in PRIORITY_RANK:
+        return (PRIORITY_RANK[band], since, pid)
     if tier == TIER_NIGHTLY:
         return (0, since, pid)
     if tier == TIER_STACK:
@@ -4408,17 +4476,39 @@ def admission_rank(tier: str, since: float, pid: int, now: float) -> tuple[int, 
     return (2 if tier == TIER_DEV or now - since >= FEED_JUMP_S else 3, since, pid)
 
 
+def preempt_queued(capacity_dir: Path, band: str, skip_pid: int = 0, total: int = 0) -> list[int]:
+    """Remove lower-band queued markers; started jobs have no marker and are untouched."""
+    if band not in PRIORITY_RANK:
+        return []
+    rank = PRIORITY_RANK[band]
+    quota = priority_quota(band, total) if total > 0 else 0
+    waiters = admission_waiters(capacity_dir, skip_pid)
+    if quota and rank > 0 and sum(w.get("band") == band for w in waiters) >= quota:
+        return []
+    victims: list[int] = []
+    for waiter in waiters:
+        waiter_band = waiter.get("band") or ""
+        if waiter_band not in PRIORITY_RANK or PRIORITY_RANK[waiter_band] <= rank:
+            continue
+        try:
+            (capacity_dir / f"{ADMIT_WANT}{waiter['pid']}").unlink()
+        except (FileNotFoundError, OSError):
+            continue
+        victims.append(waiter["pid"])
+    return victims
+
+
 def fair_turn(capacity_dir: Path, needs: set[str], since: float, tier: str = "",
-              takes_units: bool = False, new_job: bool = False) -> str | None:
+              takes_units: bool = False, new_job: bool = False, band: str = "") -> str | None:
     """Why an admission needing these kinds (tokens and "units") must wait behind a waiter ahead of it, or None.
     Ahead is older, except across tiers (FEED_FIRST, admission_rank). A waiting nightly job also stops every other
     admission that takes a unit (takes_units), one the reserve its own gate holds would cover too, and every new job
     of another tier (new_job: job-started), the fast tier on its own fast tokens too: no new PR job starts on a mini
     where a nightly job waits. A ci-step lease inside a running job is not a new job, so it never waits on one."""
     now = time.time()
-    mine = admission_rank(tier, since, os.getpid(), now)
+    mine = admission_rank(tier, since, os.getpid(), now, band)
     for waiter in admission_waiters(capacity_dir, os.getpid()):
-        if admission_rank(waiter["tier"], waiter["since"], waiter["pid"], now) >= mine:
+        if admission_rank(waiter["tier"], waiter["since"], waiter["pid"], now, waiter.get("band", "")) >= mine:
             continue
         if session_first_lapsed(waiter, now):
             continue  # a session job past SESSION_FIRST_S still tries for units but no longer goes first
@@ -4441,12 +4531,15 @@ def job_who() -> str:
                                   f"(run {os.environ['GITHUB_RUN_ID']})" if os.environ.get("GITHUB_RUN_ID") else "")))
 
 
-def write_want(marker: Path, since: float, wants: list[str], tier: str = "", lane: str = "") -> None:
+def write_want(marker: Path, since: float, wants: list[str], tier: str = "", lane: str = "",
+               band: str = "") -> None:
     with contextlib.suppress(OSError):
         tmp = marker.with_name(marker.name + ".tmp")
         want: dict[str, Any] = {"since": since, "wants": wants, "who": job_who()}
         if tier:
             want["tier"] = tier
+        if band in PRIORITY_RANK:
+            want["band"] = band
         if lane:
             want["lane"] = lane
         tmp.write_text(json.dumps(want) + "\n")
@@ -4583,7 +4676,14 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
         # the gateway kind is any one gateway token: a waiter that wants a named one (a signing job) is ahead of it
         needs = {name for token in tokens for name in (GATEWAY_TOKENS if token == GATEWAY_TOKEN_KIND else (token,))}
         needs |= {"units"} if units and not in_reserve else set()
-        behind = fair_turn(capacity_dir, needs, time.time() if since is None else since, tier, units > 0, new_job)
+        band = priority_band(tier, job, os.environ.get("GITHUB_EVENT_NAME"), workflow)
+        # Only explicit queued markers are preempted; running jobs hold no
+        # marker and are never interrupted.
+        preempt_queued(capacity_dir, band, os.getpid(), total)
+        quota_left = priority_quota_remaining(capacity_dir, band, total, os.getpid())
+        behind = (f"capacity: {band} queue quota reached" if total > 0 and quota_left == 0 else
+                  fair_turn(capacity_dir, needs, time.time() if since is None else since,
+                            tier, units > 0, new_job, band))
         if behind:
             # a waiter behind another names every kind it needs, units too: a newcomer that fits must not take the
             # units it waits for in the poll between the waiter ahead being admitted and this one's next try
@@ -9499,7 +9599,7 @@ def main(argv: list[str] | None = None) -> int:
                         break
                     wants = list(taken.get("wants") or [])
                     if admit_class != GATEWAY_CLASS:  # a gateway client's wait holds no other runner (GATEWAY)
-                        write_want(marker, since, wants, tier, SESSION_LANE if args.session_runner else "")
+                        write_want(marker, since, wants, tier, SESSION_LANE if args.session_runner else "", band)
                     if note != shown or time.monotonic() - shown_at >= ADMIT_NOTE_S:
                         holders = ""
                         with contextlib.suppress(Exception):  # naming holders must never fail the wait

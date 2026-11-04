@@ -4458,6 +4458,37 @@ time.sleep(60)
         self.assertEqual(json.loads(marker.read_text())["tier"], hook.TIER_NIGHTLY)
         self.assertEqual([w["tier"] for w in hook.admission_waiters(capacity)], [hook.TIER_NIGHTLY])
 
+    def test_declared_priority_bands_order_and_quota(self) -> None:
+        bands = hook.PRIORITY_BANDS
+        self.assertEqual(bands, (hook.PRIORITY_NIGHTLY, hook.PRIORITY_PROMOTE,
+                                 hook.PRIORITY_PR, hook.PRIORITY_DEV, hook.PRIORITY_SIDE_JOB))
+        now = time.time()
+        ranks = [hook.admission_rank("", now, 1, now, band) for band in bands]
+        self.assertEqual(ranks, sorted(ranks), "nightly > promote > PR > DEV > side-job")
+        self.assertEqual(hook.priority_quota(hook.PRIORITY_NIGHTLY, 14), 14)
+        self.assertEqual(hook.priority_quota(hook.PRIORITY_PROMOTE, 14), 14)
+        self.assertEqual(hook.priority_quota(hook.PRIORITY_PR, 14), 7)
+        self.assertEqual(hook.priority_quota(hook.PRIORITY_DEV, 14), 4)
+        capacity = self.dir / "quota-capacity"
+        capacity.mkdir()
+        marker = capacity / f"{hook.ADMIT_WANT}{os.getppid()}"
+        hook.write_want(marker, now, ["units"], band=hook.PRIORITY_DEV)
+        self.assertEqual(hook.priority_quota_remaining(capacity, hook.PRIORITY_DEV, 14), 3)
+        self.assertEqual(hook.priority_band(hook.TIER_NIGHTLY, hook.PROMOTE_COMPILE), hook.PRIORITY_PROMOTE)
+        self.assertEqual(hook.priority_band(hook.TIER_STACK, "swift-test", "pull_request"), hook.PRIORITY_PR)
+
+    def test_priority_preempts_only_queued_lower_bands(self) -> None:
+        capacity = self.dir / "capacity"
+        capacity.mkdir()
+        now = time.time()
+        queued = capacity / f"{hook.ADMIT_WANT}{os.getppid()}"
+        hook.write_want(queued, now, ["units"], band=hook.PRIORITY_SIDE_JOB)
+        victims = hook.preempt_queued(capacity, hook.PRIORITY_NIGHTLY, total=14)
+        self.assertEqual(victims, [os.getppid()])
+        self.assertFalse(queued.exists(), "a queued lower-band marker is preempted")
+        # A started job has no admit.want marker and therefore cannot be selected.
+        self.assertEqual(hook.preempt_queued(capacity, hook.PRIORITY_NIGHTLY, total=14), [])
+
     def test_capacity_runners_wait_for_units(self) -> None:
         # a 4-core side lane waits for units instead of refusing, on a side runner (instance past
         # --canonical-roots) and on a root runner alike
