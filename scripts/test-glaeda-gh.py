@@ -1919,6 +1919,26 @@ class BalanceTest(Base):
         self.assertEqual(data["requiredMissing"], [])
         self.assertEqual(len(self.gh.gql_calls()), 1)
 
+    def test_status_pr_does_not_page_when_the_base_requires_no_check(self) -> None:
+        """No required context: the rollup's first 100 and checkState decide, with no follow-up pages."""
+        checks = [workflow_check(f"job-{i}", 5) for i in range(150)]
+        first = pr_node(10, checks=checks[:100])
+        contexts = first["commits"]["nodes"][0]["commit"]["statusCheckRollup"]["contexts"]
+        contexts["totalCount"] = len(checks)
+        contexts["pageInfo"] = {"hasNextPage": True, "endCursor": "100"}
+        first["baseRef"] = {"branchProtectionRule": None, "rules": {"nodes": []}}
+        self.gh.prs[("o", "r", 10)] = first
+        self.gh.heads[("o", "r", "a" * 40)] = checks
+        self.budgets(rest=(300, 3000), graphql=(4000, 3000))
+        gg.register("pr:o/r#10")
+        self.daemon.tick(NOW)
+        data = gg.read_cache("pr:o/r#10")["data"]
+        self.assertEqual(len(data["checks"]), 100)
+        self.assertTrue(data["checksTruncated"])
+        self.assertEqual(data["requiredMissing"], [])
+        self.assertNotIn("checksPageError", data)
+        self.assertEqual(len(self.gh.gql_calls()), 1)
+
     def test_steps_come_from_rest_so_a_refused_check_is_still_held(self) -> None:
         """PRs move to REST when GraphQL is stopped; the failed steps must not need GraphQL."""
         now = time.time()

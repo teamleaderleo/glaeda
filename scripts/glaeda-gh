@@ -2906,8 +2906,13 @@ class Daemon:
                     required.add(item["context"])
         reported = {c.get("name") or c.get("context") for c in nodes}
         # Once every required context is in the first page, keep the cache to one cheap query. The
-        # rollup's totalCount/pageInfo still tell callers that optional contexts are only a slice.
-        if required and required.issubset(reported):
+        # rollup's totalCount/pageInfo still tell callers that optional contexts are only a slice, and a
+        # truncated rollup's verdict comes from GitHub's checkState (check_verdict). A base that requires
+        # no context has nothing to find past the first page either: paging every such PR on every
+        # cycle was 1678 of one daemon's 1958 GraphQL points an hour (2026-11-04 03:33Z, 139 cmux PRs
+        # over 100 checks on feat-cmux-next, which requires none), and ran the shared login's GraphQL
+        # hour out before landings could read their gates.
+        if not required or required.issubset(reported):
             return None
         cursor = page.get("endCursor")
         for _ in range(PR_CONTEXT_MAX_PAGES - 1):
