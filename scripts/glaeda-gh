@@ -1688,7 +1688,7 @@ class Daemon:
             self.budget["graphqlCounters"] = merge_counter(rest_counters(self.budget, "graphqlCounters"), seen)
             self.settle_counters("graphql")
             return
-        if bucket == "rest" and ACTIONS_COUNTER_PATH.fullmatch(path):
+        if bucket == "rest" and isinstance(reset, (int, float)) and ACTIONS_COUNTER_PATH.fullmatch(path):
             seen["counters"] = ["actions"]
         if bucket != "rest":
             self.budget[bucket] = seen
