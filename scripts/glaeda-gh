@@ -2471,14 +2471,20 @@ class Daemon:
         first = getattr(self, "gql_first", 0) % len(kinds)
         self.gql_paced = None
         sent = len(self.gql_log)
+        paced_sent = False  # whether the kind the ceiling held had sent a query of its own first, this tick
         for kind in kinds[first:] + kinds[:first]:
             if over[kind] == "graphql":
+                before = len(self.gql_log)
                 spilled += self.batched(kind, due[kind], self.graphql_fetch[kind])
+                if self.gql_paced == kind:
+                    paced_sent = len(self.gql_log) > before
                 self.post_between()
         # Only a tick that sent a query moves the order: one that met the ceiling before reading anything (most ticks
-        # in a full minute, TICK is 2 s) leaves it, or the count of empty ticks would decide who reads next.
+        # in a full minute, TICK is 2 s) leaves it, or the count of empty ticks would decide who reads next. The kind
+        # the ceiling held goes first next time when it read nothing itself (it was starved), the one after it when it
+        # had its turn: a round robin over the kinds with something due.
         if self.gql_paced is not None and len(self.gql_log) > sent:
-            self.gql_first = (kinds.index(self.gql_paced) + 1) % len(kinds)
+            self.gql_first = (kinds.index(self.gql_paced) + (1 if paced_sent else 0)) % len(kinds)
         over_rest = [e for kind in ("pr", "run", "comment", "head") if over[kind] == "rest" for e in due[kind]]
         # GraphQL ran out of primary quota partway: REST reads what it could not, this tick. A secondary
         # hold stops REST too, so the REST loop below defers them instead.

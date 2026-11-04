@@ -1976,6 +1976,34 @@ class BalanceTest(Base):
         self.daemon.refresh_budget()
         self.assertEqual(len([c for c in self.gh.calls if c[1].endswith("/rate_limit")]), before)
 
+    def test_the_ceiling_takes_every_kind_in_turn(self) -> None:
+        """Review of #1834 at e482a2a: with every kind due each tick and a full ceiling, the order skipped a held kind
+        that had read nothing (pchch...: runs never read). Every kind reads within a few minutes."""
+        reads: list[str] = []
+
+        def fetcher(kind: str):
+            def fetch(chunk: list[dict]) -> None:
+                reads.append(kind)
+                self.daemon.gql_log.append((self.daemon.now, kind, 1))
+            return fetch
+
+        fetchers = {k: fetcher(k) for k in ("pr", "comment", "run", "head")}
+        keys = {"pr": [f"pr:o/r#{n}" for n in range(30)], "comment": ["comment:o/r#1"], "run": ["run:o/r/1"],
+                "head": ["head:o/r@" + "a" * 40]}
+        due = lambda kind, entries: [{"key": k, "cache": None} for k in keys[kind]]  # noqa: E731
+        self.budgets(rest=(300, 3000), graphql=(4000, 3000))
+        self.daemon.paths.update({k: "graphql" for k in keys})
+        self.daemon.batch["pr"] = 10
+        policy = {**self.daemon.policy, "graphqlPerMinute": 1, "restShare": 0.0}
+        with mock.patch.object(gg, "daemon_policy", return_value=policy), \
+                mock.patch.object(gg.Daemon, "graphql_fetch", property(lambda d: fetchers)), \
+                mock.patch.object(self.daemon, "due", side_effect=due), \
+                mock.patch.object(self.daemon, "serve_waits", return_value=0):
+            for t in range(0, 8 * 60, 2):
+                self.daemon.tick(NOW + t)
+        self.assertEqual(set(reads), {"pr", "comment", "run", "head"}, "".join(k[0] for k in reads))
+        self.assertTrue(all(reads.count(k) >= 1 for k in ("comment", "run", "head")), reads)
+
     def test_pr_refreshes_paced_by_the_ceiling_do_not_starve_runs(self) -> None:
         """Review of #1834: with the ceiling held by PR batches every minute, a watched run stayed unread for minutes.
         The kind after the one the ceiling held goes first next tick."""
