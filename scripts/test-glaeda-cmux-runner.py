@@ -13655,9 +13655,18 @@ class FleetLabelsModuleTest(unittest.TestCase):
         self.assertEqual(ultra["rootPools"], ["glaeda-root-xl-xcode-26.6", "glaeda-root-std-xcode-26.6"])
         self.assertNotIn("glaeda-nightly-std-xcode-26.6", ultra["labels"])
         self.assertEqual(fleet_labels.widened_labels(ultra["nightlyPools"]), ultra["nightlyPools"])
-        # The label reconcile never adds the std nightly label to a registered xl slot either.
+        # The label reconcile never adds the std nightly label to a registered xl slot, and takes it off one
+        # registered with it (#1819 to this change), keeping every other label and the order.
         live = ["glaeda-mini", "glaeda-class-xl", "glaeda-nightly-xl-xcode-26.6", "glaeda-runner-ultra-glaeda-3"]
         self.assertEqual(fleet_labels.widened_labels(live), live)
+        stale = [*live[:3], "glaeda-nightly-std-xcode-26.6", live[3]]
+        self.assertEqual(fleet_labels.widened_labels(stale), live)
+        self.assertEqual(fleet_labels.widened_labels(fleet_labels.widened_labels(stale)), live)
+        # Another Xcode's std label is not this pool's spill, and a std slot keeps its own label.
+        other = [*live, "glaeda-nightly-std-xcode-26.3"]
+        self.assertEqual(fleet_labels.widened_labels(other), other)
+        std_slot = ["glaeda-mini", "glaeda-nightly-std-xcode-26.6", "glaeda-runner-mini-std-glaeda-1"]
+        self.assertEqual(fleet_labels.widened_labels(std_slot), std_slot)
         self.assertEqual(fleet_labels.nightly_label("glaeda-xl-xcode-26.6"), ultra["nightlyPools"][0])
         for unchanged in (["glaeda-nightly-std-xcode-26.6"], ["glaeda-nightly-light-xcode-26.6"],
                           ["glaeda-nightly-xl"], ["glaeda-nightly-only-m4pro"]):

@@ -200,14 +200,17 @@ def root_pools(pool: str) -> list[str]:
 def widened_labels(labels: list[str]) -> list[str]:
     """`labels` plus every side label side_classes() adds to the side labels among them and every root label
     root_classes() adds to the root labels among them, in order, each once. A nightly slot label is never widened
-    (nightly_classes()).
+    (nightly_classes()), and a narrower class's nightly label beside a wider one's on the same runner is dropped: an
+    xl slot registered between #1819 and nightly_classes()'s narrowing carries glaeda-nightly-std-xcode-<v> too, the
+    label cmux's signing jobs queue on, and the reconcile takes it off instead of keeping it until a reinstall.
 
     The registered labels of a runner installed before side_classes() lack the narrower classes' side labels (one
     installed before root_classes() its root spill).
     A reconciler with the organization's runner-label permission (GitHub fixes labels at registration, and a
     mini holds no admin token) sets a runner's custom labels to this, so a manifest change reaches every
     registered runner without a relabel by hand. Pure and idempotent: widened_labels(widened_labels(x)) ==
-    widened_labels(x), and it only adds a label member_labels() would itself issue for that runner.
+    widened_labels(x), and it only adds a label member_labels() would itself issue for that runner; the one label it
+    removes is that stale nightly spill.
     """
     out = list(dict.fromkeys(labels))
     for label in list(out):
@@ -226,7 +229,22 @@ def widened_labels(labels: list[str]) -> list[str]:
                 wanted = make(_with_class(pool, parts[index], klass))
                 if wanted not in out:
                     out.append(wanted)
-    return out
+    return [label for label in out if not _stale_nightly_spill(label, out)]
+
+
+def _stale_nightly_spill(label: str, labels: list[str]) -> bool:
+    """Whether `label` is a nightly slot label whose pool, at a wider class, is also among `labels`'s nightly slot
+    labels (widened_labels())."""
+    parts = label.split("-")
+    index = next((i for i, part in enumerate(parts) if part in RUNNER_CLASSES), None)
+    if (index is None or parts[0] != "glaeda" or "nightly" not in parts[1:index]
+            or parts[index + 1:index + 2] != ["xcode"] or not re.fullmatch(VERSION_RE, "-".join(parts[index + 2:]))):
+        return False
+    pool = "-".join(part for i, part in enumerate(parts) if not (part == "nightly" and 0 < i < index))
+    if nightly_label(pool) != label:
+        return False
+    wider = RUNNER_CLASSES[:RUNNER_CLASSES.index(parts[index])]
+    return any(nightly_label(_with_class(pool, parts[index], k)) in labels for k in wider)
 
 
 def nightly_label(pool: str) -> str:
