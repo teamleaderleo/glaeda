@@ -640,6 +640,15 @@ label and Blacksmith, so no job waits on the reservation. A DEV hook waiting
 for capacity uses the existing `admit.want` fairness mechanism, then refuses
 after 60 seconds so the workflow can use its normal fallback.
 
+`runner.rootsTakeSide: true` on a dedicated member (no `trustedRef`) gives its
+root runners (instances below `canonicalRoots`) the member's side labels as
+well as their root labels, so an idle root runner takes a queued side-lane job
+(work stealing; the per-host trial of cmuxterm-hq#6740). Nothing else changes:
+the root listener gate still listens only with `ROOT_FIT_UNITS`, a
+persistent-dd token and a canonical root free, the hook admits each job by its
+own cost, nightly-first holds the mini's listeners while a nightly job waits,
+and every other instance keeps its labels and hooks. Off by default.
+
 `runner.nightlySlot: true` on a dedicated member (no `trustedRef`, no
 `poolPrefix`) gives its next side instance after `canonicalRoots`, after the
 freshness slot when `devCompile` is set too, the nightly pool label

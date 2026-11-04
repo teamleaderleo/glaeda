@@ -2669,7 +2669,8 @@ def main(argv: list[str] | None = None) -> int:
                  else [*member.get("guiPools", []), *(member.get("sessionPools", []) if console_session else [])]
                  if ctx.gui_runner
                  else member.get("sessionPools", []) if ctx.session_runner
-                 else member.get("rootPools", []) if is_root else member.get("sidePools", []))
+                 else [*member.get("rootPools", []), *(member.get("sidePools", []) if member.get("rootsTakeSide") else [])]
+                 if is_root else member.get("sidePools", []))
         # Dedicated roles leave out ordinary pool and iOS labels, so those jobs cannot take a DEV, GUI or fast
         # instance. The pool's live count includes only the root and side instances it can route to.
         own = ([label for label in member["labels"] if label not in member.get("pools", []) and label != IOS_SIM_JOB_LABEL]

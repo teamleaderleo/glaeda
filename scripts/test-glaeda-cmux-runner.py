@@ -11528,6 +11528,34 @@ class RunnerTest(unittest.TestCase):
         self.assertEqual(session_create, {0: True, 2: True, 4: False},
                          "the gui runner runs in the console session, where LaunchServices can launch its UI tests")
 
+    def test_roots_take_side_gives_only_the_root_runners_the_side_labels_too(self) -> None:
+        # runner.rootsTakeSide (cmuxterm-hq#6740's work-stealing trial): an idle root runner also takes queued side
+        # work. Side, nightly-slot, gui and gateway runners keep exactly the labels they had, and so do the hooks.
+        base = {"runners": 6, "capacityUnits": 14, "compileSlots": 2, "canonicalRoots": 2, "guiRunners": 1,
+                "gatewayRunners": 1}
+        roles = lambda l: [x for x in l if x.startswith(("glaeda-std", "glaeda-root", "glaeda-side", "glaeda-gui",
+                                                          "glaeda-session", "glaeda-nightly", "glaeda-gateway"))]
+        plain, plain_hooks = self.fast_labels(base, "roots-plain", nightly_slot=True)
+        stealing, hooks = self.fast_labels(base, "roots-side", nightly_slot=True, roots_take_side=True)
+        side = ["glaeda-side-std-xcode-26.6", "glaeda-side-light-xcode-26.6"]
+        self.assertEqual([roles(l) for l in stealing[:2]],
+                         [["glaeda-std-xcode-26.6", "glaeda-root-std-xcode-26.6", *side]] * 2)
+        self.assertEqual([roles(l) for l in stealing[2:]], [roles(l) for l in plain[2:]],
+                         "every other instance keeps its labels: the nightly slot, side, gui and gateway runners")
+        self.assertIn("glaeda-nightly-std-xcode-26.6", stealing[2])
+        self.assertFalse([x for x in stealing[2] if x.startswith(("glaeda-side-", "glaeda-root-"))])
+        self.assertEqual(hooks, plain_hooks, "admission is unchanged: same hook flags on every instance")
+        self.assertTrue(all(l.count("glaeda-runner-") <= 1 for l in stealing))
+        with mock.patch.object(cr, "xcode_present", return_value=True):
+            manifest = json.loads(json.dumps(MANIFEST))
+            manifest["hosts"]["mini-std"].setdefault("overrides", {})["runner"] = {"rootsTakeSide": "yes"}
+            self.assertEqual(cr.member_labels(manifest, "mini-std")[1], "mini-std runner.rootsTakeSide must be boolean")
+            manifest["hosts"]["mini-std"]["overrides"]["runner"] = {
+                "rootsTakeSide": True, "trustedRef": "refs/heads/main", "trustedRepo": "manaflow-ai/cmux"}
+            self.assertIn("rootsTakeSide needs a dedicated runner without trustedRef",
+                          cr.member_labels(manifest, "mini-std")[1])
+            self.assertFalse(cr.member_labels(MANIFEST, "mini-std")[0]["rootsTakeSide"], "off by default")
+
     def test_gui_runners_two_adds_a_session_runner_beside_the_console_one(self) -> None:
         base = {"runners": 6, "capacityUnits": 10, "compileSlots": 2, "canonicalRoots": 2}
         labels, hooks = self.fast_labels({**base, "guiRunners": 2}, "gui2")
@@ -11557,7 +11585,8 @@ class RunnerTest(unittest.TestCase):
                          "the session and console gui runners have no session of their own; a side runner keeps one")
 
     def fast_labels(self, classes: dict, name: str, *, dev_compile: bool = False,
-                    ios_sim: bool = False, nightly_slot: bool = False) -> tuple[list[list[str]], list[str]]:
+                    ios_sim: bool = False, nightly_slot: bool = False,
+                    roots_take_side: bool = False) -> tuple[list[list[str]], list[str]]:
         """Apply every instance of mini-std under these runner classes: (labels per instance, job-started.sh texts)."""
         manifest = json.loads(json.dumps(MANIFEST))
         manifest["defaults"]["runner"] = {"classes": {"std": classes}}
@@ -11565,6 +11594,8 @@ class RunnerTest(unittest.TestCase):
             manifest["hosts"]["mini-std"].setdefault("overrides", {})["runner"] = {"devCompile": True}
         if nightly_slot:
             manifest["hosts"]["mini-std"].setdefault("overrides", {}).setdefault("runner", {})["nightlySlot"] = True
+        if roots_take_side:
+            manifest["hosts"]["mini-std"].setdefault("overrides", {}).setdefault("runner", {})["rootsTakeSide"] = True
         if ios_sim:
             manifest["hosts"]["mini-std"]["roles"].append("ios-simulators")
             manifest["defaults"]["ios_simulator"] = {"runtimes": ["23F77"]}

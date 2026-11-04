@@ -328,6 +328,17 @@ def member_labels(manifest: Any, member: str, xcode_ok: Callable[[dict[str, Any]
         return None, f"{member} runner.nightlySlot must be boolean"
     if nightly_slot and (availability != "dedicated" or trusted_ref is not None):
         return None, f"{member} runner.nightlySlot needs a dedicated runner without trustedRef"
+    # ROOTS_TAKE_SIDE: runner.rootsTakeSide: true gives this member's root runners its side labels too, so an idle root
+    # runner takes a queued side-lane job instead of sitting idle while the side queue waits (work stealing,
+    # cmuxterm-hq#6740: in the CI scheduler replay, std root runners taking side-std work were the largest share of
+    # useful steals). Admission is unchanged: the root listener gate still listens only with ROOT_FIT_UNITS, a
+    # persistent-dd token and a canonical root free, the hook admits each job by its own cost, and nightly-first
+    # (FEED_FIRST) holds every listener on the mini while a nightly job waits. A per-host trial knob, off by default.
+    roots_take_side = runner.get("rootsTakeSide", False) if isinstance(runner, dict) else False
+    if not isinstance(roots_take_side, bool):
+        return None, f"{member} runner.rootsTakeSide must be boolean"
+    if roots_take_side and (availability != "dedicated" or trusted_ref is not None):
+        return None, f"{member} runner.rootsTakeSide needs a dedicated runner without trustedRef"
     # DEDICATED_ONLY: the member runs only its runner.dedicated runners; glaeda-cmux-runner-fleet installs no pool
     # instance there and deregisters any it finds (each only while idle), and glaeda-cmux-runner refuses to install one.
     dedicated_only = runner.get("dedicatedOnly", False) if isinstance(runner, dict) else False
@@ -438,7 +449,7 @@ def member_labels(manifest: Any, member: str, xcode_ok: Callable[[dict[str, Any]
             "runners": runners, "capacityUnits": units, "compileSlots": compile_slots,
             "trustedRef": trusted_ref, "trustedRepo": trusted_repo, "trustedNextNightly": next_nightly,
             "devCompile": dev_compile, "devCompileInstance": roots if dev_compile else None,
-            "canonicalRoots": roots,
+            "canonicalRoots": roots, "rootsTakeSide": roots_take_side,
             "rootPools": list(dict.fromkeys(r for label in dict.fromkeys(pools) for r in root_pools(label))),
             "sidePools": list(dict.fromkeys(side_label(pool_label(k, v, bool(trusted_ref), normal_pool_prefix))
                                             for v in (versions if pools else []) for k in side_classes(klass))),
