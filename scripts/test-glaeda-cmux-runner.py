@@ -4467,13 +4467,23 @@ time.sleep(60)
         self.assertEqual(ranks, sorted(ranks), "nightly > promote > PR > DEV > side-job")
         self.assertEqual(hook.priority_quota(hook.PRIORITY_NIGHTLY, 14), 14)
         self.assertEqual(hook.priority_quota(hook.PRIORITY_PROMOTE, 14), 14)
-        self.assertEqual(hook.priority_quota(hook.PRIORITY_PR, 14), 7)
+        self.assertEqual(hook.priority_quota(hook.PRIORITY_PR, 14), 14)
         self.assertEqual(hook.priority_quota(hook.PRIORITY_DEV, 14), 4)
         capacity = self.dir / "quota-capacity"
         capacity.mkdir()
         marker = capacity / f"{hook.ADMIT_WANT}{os.getppid()}"
         hook.write_want(marker, now, ["units"], band=hook.PRIORITY_DEV)
         self.assertEqual(hook.priority_quota_remaining(capacity, hook.PRIORITY_DEV, 14), 3)
+        # A new ticket is blocked at a full DEV quota, but once its failed
+        # attempt publishes its own marker the next retry is allowed through.
+        dev_capacity = self.dir / "dev-quota-capacity"
+        dev_capacity.mkdir()
+        peers = [{"band": hook.PRIORITY_DEV}] * 4
+        with mock.patch.object(hook, "admission_waiters", return_value=peers):
+            self.assertTrue(hook.priority_quota_blocks(dev_capacity, hook.PRIORITY_DEV, 14, 999999))
+            own = dev_capacity / f"{hook.ADMIT_WANT}{os.getppid()}"
+            own.write_text("{}")
+            self.assertFalse(hook.priority_quota_blocks(dev_capacity, hook.PRIORITY_DEV, 14, os.getppid()))
         self.assertEqual(hook.priority_band(hook.TIER_NIGHTLY, hook.PROMOTE_COMPILE), hook.PRIORITY_PROMOTE)
         self.assertEqual(hook.priority_band(hook.TIER_STACK, "swift-test", "pull_request"), hook.PRIORITY_PR)
 

@@ -1591,7 +1591,9 @@ PRIORITY_RANK = {band: rank for rank, band in enumerate(PRIORITY_BANDS)}
 PRIORITY_QUOTA = {
     PRIORITY_NIGHTLY: 1.0,
     PRIORITY_PROMOTE: 1.0,
-    PRIORITY_PR: 0.5,
+    # PR work may fill the owned queue.  Its lower rank still yields to
+    # nightly/promote, while DEV and side jobs retain bounded queue shares.
+    PRIORITY_PR: 1.0,
     PRIORITY_DEV: 0.25,
     PRIORITY_SIDE_JOB: 0.25,
 }
@@ -1610,6 +1612,21 @@ def priority_quota_remaining(capacity_dir: Path, band: str, total: int,
         return 0
     used = sum(waiter.get("band") == band for waiter in admission_waiters(capacity_dir, skip_pid))
     return max(0, priority_quota(band, total) - used)
+
+
+def priority_quota_blocks(capacity_dir: Path, band: str, total: int,
+                          pid: int | None = None) -> bool:
+    """Whether a new waiter is outside its queued quota.
+
+    Existing waiters are allowed through so a full queue drains.  The marker
+    check is deliberately separate from ``priority_quota_remaining`` because
+    the latter counts peers and cannot distinguish a new admission from one
+    that is retrying after it published its marker.
+    """
+    pid = os.getpid() if pid is None else pid
+    if total <= 0 or priority_quota_remaining(capacity_dir, band, total, pid) > 0:
+        return False
+    return not (capacity_dir / f"{ADMIT_WANT}{pid}").exists()
 
 
 def priority_band(tier: str = "", job: str | None = None, event_name: str | None = None,
@@ -4680,8 +4697,12 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
         # Only explicit queued markers are preempted; running jobs hold no
         # marker and are never interrupted.
         preempt_queued(capacity_dir, band, os.getpid(), total)
-        quota_left = priority_quota_remaining(capacity_dir, band, total, os.getpid())
-        behind = (f"capacity: {band} queue quota reached" if total > 0 and quota_left == 0 else
+        # A waiter that already published its marker is admitted through the
+        # quota check. Otherwise a full quota would make every peer observe the
+        # same predecessors and refuse forever (the marker is written only
+        # after this call returns).
+        quota_blocked = priority_quota_blocks(capacity_dir, band, total, os.getpid())
+        behind = (f"capacity: {band} queue quota reached" if quota_blocked else
                   fair_turn(capacity_dir, needs, time.time() if since is None else since,
                             tier, units > 0, new_job, band))
         if behind:
