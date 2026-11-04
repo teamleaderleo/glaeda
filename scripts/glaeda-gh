@@ -86,8 +86,9 @@ the daemon is the only process that talks to GitHub, and clients only read its c
   (40) points in any 60 s; past it the rest of a tick's reads wait, first next tick, so a refresh of every
   entry after a reset, a re-exec or a stop is spread over minutes instead of sent at once. GitHub answers one token's REST calls from
   two "core" counters with their own hourly windows (run and workflow reads report one; /rate_limit,
-  pulls and job lists the other), so budget.json keeps each live counter in restCounters and "rest"
-  is the poorest of them, never just the last answer.
+  pulls and job lists mostly the other), so budget.json keeps each live counter in restCounters and "rest"
+  is the poorest of them, never just the last answer. The counter the Actions endpoints answer from
+  (ACTIONS_COUNTER_PATH) is tagged "counters": ["actions"], so the gh guard holds each call to its own.
 - The daemon's own REST polling is capped at restShare (0.4) of the hourly REST limit: the read
   requests it sent over the last hour that GitHub counted (a 304 is free and is not counted, nor is
   the outbox -- writes sessions asked for and their dedupe lookups -- which the share never holds),
@@ -251,6 +252,13 @@ BUDGET_REFRESH = 120.0
 BUDGET_RETRY = 900.0  # after a refused /rate_limit, how long before asking again
 REST_COUNTERS = 4  # most core counters budget.json keeps (GitHub showed two per token on 2026-10-30)
 RESET_JITTER = 2  # seconds: two readings whose resets differ by at most this are one core counter
+# The REST paths GitHub always answered from one core counter, the "actions" one (X-RateLimit-Reset of real answers,
+# cosmic-gray 2026-11-04 06:15-06:20Z, 28 of 28): a run, its attempts and artifacts, and workflows (a list, one, its
+# runs, its dispatches). Pulls, a repo, check runs, the runs list, a run's jobs and /rate_limit answered mostly from
+# the other counter and now and then from this one, so no reading of theirs can name a counter. A reading from one of
+# these paths tags its counter "actions" in restCounters, so gh-quota (leo-workspace tools/gh_quota.py rest_reading)
+# can hold a call to the counter it spends rather than the poorest.
+ACTIONS_COUNTER_PATH = re.compile(r"/repos/[^/]+/[^/]+/actions/(?:workflows(?:/[^?]*)?|runs/\d+(?:/attempts/\d+|/artifacts)?)(?:\?.*)?")
 GQL_BATCH = 15  # most PRs (or runs, or comment watches) per GraphQL query
 # GitHub answers 504 when a query runs past ~10 s. Measured 2026-10-19 on cosmic-gray: 25 PRs per
 # query took 10-11 s (half answered 504), 10 took 4-6 s, 5 took 2-3 s; each cost 1 point. So each
@@ -1445,6 +1453,9 @@ def merge_counter(counters: list[dict], seen: dict) -> list[dict]:
         if not merged and abs(c["reset"] - seen["reset"]) <= RESET_JITTER:
             c = {**c, "limit": seen.get("limit", c.get("limit")), "remaining": min(c["remaining"], seen["remaining"]),
                  "reset": max(c["reset"], seen["reset"]), "seenAt": max(c["seenAt"], seen["seenAt"])}
+            tags = sorted(set(c.get("counters") or []) | set(seen.get("counters") or []))
+            if tags:
+                c["counters"] = tags  # a counter keeps the tag any of its readings gave it (ACTIONS_COUNTER_PATH)
             merged = True
         out.append(c)
     if not merged:
@@ -1659,7 +1670,7 @@ class Daemon:
                 self.paths[kind] = current = OTHER[current]
         return current
 
-    def note_budget(self, bucket: str, limit: Any, remaining: Any, reset: float | None) -> None:
+    def note_budget(self, bucket: str, limit: Any, remaining: Any, reset: float | None, path: str = "") -> None:
         try:
             seen = {"limit": int(limit), "remaining": int(remaining), "reset": reset, "seenAt": self.now}
         except (TypeError, ValueError):
@@ -1677,6 +1688,8 @@ class Daemon:
             self.budget["graphqlCounters"] = merge_counter(rest_counters(self.budget, "graphqlCounters"), seen)
             self.settle_counters("graphql")
             return
+        if bucket == "rest" and ACTIONS_COUNTER_PATH.fullmatch(path):
+            seen["counters"] = ["actions"]
         if bucket != "rest":
             self.budget[bucket] = seen
             return
@@ -1839,7 +1852,7 @@ class Daemon:
                 reset = float(h.get("x-ratelimit-reset", ""))
             except ValueError:
                 reset = None
-            self.note_budget(bucket, h.get("x-ratelimit-limit"), h.get("x-ratelimit-remaining"), reset)
+            self.note_budget(bucket, h.get("x-ratelimit-limit"), h.get("x-ratelimit-remaining"), reset, path)
         try:
             doc = json.loads(raw) if raw else None
         except ValueError:

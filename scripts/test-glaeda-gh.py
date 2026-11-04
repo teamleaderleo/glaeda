@@ -6324,6 +6324,24 @@ class RestCountersTest(Base):
         self.assertEqual(self.daemon.mode("rest"), "stop")
         self.assertEqual([c["remaining"] for c in self.daemon.budget["restCounters"]], [0, 3126])
 
+    def test_an_actions_read_tags_its_counter_and_the_tag_survives_other_readings(self) -> None:
+        """2026-11-04 06:15-06:20Z: runs/N, attempts, artifacts and workflows always answered from one counter;
+        pulls and /rate_limit mostly from the other. Only an Actions read names its counter."""
+        self.daemon.now = NOW
+        self.daemon.note_budget("rest", 5000, 0, NOW + 600, "/repos/o/r/pulls?per_page=1")
+        self.daemon.note_budget("rest", 5000, 4911, NOW + 2400, "/repos/o/r/actions/runs/5?exclude_pull_requests=true")
+        self.daemon.note_budget("rest", 5000, 4900, NOW + 2400, "/repos/o/r/pulls/3")  # a pull answered from it too
+        self.daemon.note_budget("rest", 5000, 4890, NOW + 2401, "/repos/o/r/actions/workflows/7/dispatches")
+        tags = {c["reset"]: c.get("counters") for c in self.daemon.budget["restCounters"]}
+        self.assertEqual(tags, {NOW + 600: None, NOW + 2401: ["actions"]})
+        self.assertEqual(self.daemon.budget["rest"]["remaining"], 0)  # the poorest is still the reading
+        for path in ("/repos/o/r/actions/runs?per_page=1", "/repos/o/r/actions/runs/5/jobs", "/rate_limit",
+                     "/repos/o/r/actions/runs/5/logs"):
+            self.assertIsNone(gg.ACTIONS_COUNTER_PATH.fullmatch(path), path)
+        for path in ("/repos/o/r/actions/workflows", "/repos/o/r/actions/workflows/ci.yml/runs?per_page=1",
+                     "/repos/o/r/actions/runs/5/attempts/2", "/repos/o/r/actions/runs/5/artifacts?per_page=100"):
+            self.assertIsNotNone(gg.ACTIONS_COUNTER_PATH.fullmatch(path), path)
+
     def test_one_counter_answering_again_is_updated_not_duplicated(self) -> None:
         self.daemon.now = NOW
         self.daemon.note_budget("rest", 5000, 3000, NOW + 600)
