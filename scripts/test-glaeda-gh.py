@@ -1940,7 +1940,7 @@ class BalanceTest(Base):
         self.assertEqual(len(self.gh.gql_calls()), 1)
 
     def test_status_pr_check_pages_stop_at_their_hourly_share(self) -> None:
-        """Past PR_PAGES_POINTS_PER_HOUR the follow-up pages stop and the truncated rollup stands."""
+        """Past PR_PAGES_POINTS_PER_HOUR the follow-up pages stop, and the PR reads pending, never green."""
         checks = [workflow_check(f"job-{i}", 5) for i in range(150)]
         first = pr_node(11, checks=checks[:100])
         contexts = first["commits"]["nodes"][0]["commit"]["statusCheckRollup"]["contexts"]
@@ -1955,8 +1955,9 @@ class BalanceTest(Base):
         self.daemon.tick(NOW)
         data = gg.read_cache("pr:o/r#11")["data"]
         self.assertEqual(len(data["checks"]), 100)
-        self.assertTrue(data["checksTruncated"])
-        self.assertNotIn("checksPageError", data)
+        self.assertEqual(data["checksPageError"], "graphql: PR check pages over their hourly share")
+        self.assertIsNone(gg.verdict("pr", data))  # a required check past the first page is unread: pending
+        self.assertIsNone(gg.verdict("pr", data, until="required"))
         self.assertEqual(len(self.gh.gql_calls()), 1)
 
     def test_steps_come_from_rest_so_a_refused_check_is_still_held(self) -> None:
