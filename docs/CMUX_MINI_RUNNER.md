@@ -677,6 +677,18 @@ no other admission takes a unit, every other runner's gate on the mini holds,
 and it keeps no reserve. NEXT's app build on attempt 1 still waits at most
 `NIGHTLY_CAPACITY_WAIT_S`, then is refused so its re-run takes Blacksmith.
 
+A nightly slot carries only its own class's nightly label (`nightly_classes()`): an xl slot is
+`glaeda-nightly-xl-xcode-<version>` alone, and the label reconcile (`widened_labels()`) takes a
+stale `glaeda-nightly-std-xcode-<version>` off one registered with it. `runner.nightlySigning: true`
+(it needs `nightlySlot`) gives the slot one more label, `glaeda-signing-xcode-<version>`, which no
+other runner carries and which has no class spill. cmux's secret-bearing nightly jobs (the hook's
+`SIGNING_JOBS` for `nightly.yml`) queue on it, resume and re-run fallbacks included, and their
+owned pick offers only it, so GitHub delivers signing secrets only to a host the manifest enrolled
+for signing. The std nightly, side, root and DEV labels are shared with build and PR jobs and
+widen across classes, so they are never a signing route. On 2026-11-04 eleven
+`sign-nightly-identity-legacy` jobs queued on the std nightly label reached an M5 Ultra's slot,
+a host never enrolled for signing.
+
 Right after nightly jobs in that line come stack-blocker jobs: a `manaflow-ai/cmux`
 pull request job (same repository, not a fork) whose PR carries the `stack-blocker` label
 in the job's own event payload (`GITHUB_EVENT_PATH`, no API call). They go ahead of DEV

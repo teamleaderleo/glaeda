@@ -76,7 +76,7 @@ TRUSTED_REF_RE = r"refs/heads/[A-Za-z0-9._/-]+"
 REPO_RE = r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+"
 POOL_PREFIX_RE = r"[a-z0-9]+-"
 RESERVED_POOL_PREFIXES = {"root-", "side-", "gui-", "fast-", "trusted-", "std-", "light-", "xl-", "dev-", "nightly-",
-                          "gateway-"}
+                          "gateway-", "signing-"}
 DEV_COMPILE_POOL_PREFIX = "dev-"
 # The classes that may hold the DEV freshness slot (runner.devCompile). An xl slot (an M5 Ultra Studio) also carries
 # the std DEV label (dev_classes), so the feed's Release compile queued on
@@ -102,6 +102,15 @@ DEV_COMPILE_CLASSES = ("std", "xl")
 # to the runner. The std label stays on the std (M4 Pro) slots that sign today. An xl slot keeps its own nightly
 # label, which no signing job asks for, so a build-only route to it (a picker offering the xl label) stays open.
 NIGHTLY_POOL_PREFIX = "nightly-"
+# NIGHTLY_SIGNING: a host's runner.nightlySigning: true (it needs runner.nightlySlot) gives its nightly slot one more
+# label, glaeda-signing-xcode-<version> (signing_label()), and no other runner anywhere carries it. It is the label
+# cmux's secret-bearing nightly jobs (the hook's SIGNING_JOBS for nightly.yml) queue on, their resume and re-run
+# fallback included, and the only label their owned pick offers, so GitHub delivers signing secrets only to a host
+# the manifest enrolled for signing. Every other label (std nightly, side, root, DEV, pool) is shared with build and
+# PR jobs and widened across classes, so routing signing by any of them reaches whatever host carries it: an M5
+# Ultra's side runners carry glaeda-side-std-xcode-<v> (side_classes()), which was a signing fallback too. Off by
+# default; no class spill (the label has no class part, and widened_labels() never adds it).
+SIGNING_POOL_PREFIX = "signing-"
 
 
 def merge(base: dict[str, Any], over: dict[str, Any]) -> dict[str, Any]:
@@ -247,6 +256,12 @@ def _stale_nightly_spill(label: str, labels: list[str]) -> bool:
     return any(nightly_label(_with_class(pool, parts[index], k)) in labels for k in wider)
 
 
+def signing_label(version: str) -> str:
+    """The nightly signing label of an Xcode version (NIGHTLY_SIGNING): glaeda-signing-xcode-26.6. No class: a
+    signing job runs the same on any enrolled slot."""
+    return f"glaeda-{SIGNING_POOL_PREFIX}xcode-{version}"
+
+
 def nightly_label(pool: str) -> str:
     """The nightly slot label of a role-free pool label: glaeda-std-xcode-26.6 -> glaeda-nightly-std-xcode-26.6, the
     pool_label(klass, version, False, NIGHTLY_POOL_PREFIX) member_labels() issues to a nightly slot."""
@@ -367,6 +382,11 @@ def member_labels(manifest: Any, member: str, xcode_ok: Callable[[dict[str, Any]
         return None, f"{member} runner.nightlySlot must be boolean"
     if nightly_slot and (availability != "dedicated" or trusted_ref is not None):
         return None, f"{member} runner.nightlySlot needs a dedicated runner without trustedRef"
+    nightly_signing = runner.get("nightlySigning", False) if isinstance(runner, dict) else False
+    if not isinstance(nightly_signing, bool):
+        return None, f"{member} runner.nightlySigning must be boolean"
+    if nightly_signing and not nightly_slot:
+        return None, f"{member} runner.nightlySigning needs runner.nightlySlot (only the nightly slot carries it)"
     # ROOTS_TAKE_SIDE: runner.rootsTakeSide: true gives this member's root runners its side labels too, so an idle root
     # runner takes a queued side-lane job instead of sitting idle while the side queue waits (work stealing,
     # cmuxterm-hq#6740: in the CI scheduler replay, std root runners taking side-std work were the largest share of
@@ -413,6 +433,8 @@ def member_labels(manifest: Any, member: str, xcode_ok: Callable[[dict[str, Any]
                  if dev_compile and availability == "dedicated" else [])
     nightly_pools = ([pool_label(k, v, False, NIGHTLY_POOL_PREFIX) for v in versions for k in nightly_classes(klass)]
                      if nightly_slot and availability == "dedicated" else [])
+    if nightly_signing and nightly_pools:
+        nightly_pools += [signing_label(v) for v in versions]
     # Declared (the ios-simulators role) and, when the caller can look (the installer on the mini), a simulator
     # runtime actually present: an iOS job routed here must be able to boot one. Without a check (the fleet
     # plan) this is the declared view.
@@ -483,7 +505,8 @@ def member_labels(manifest: Any, member: str, xcode_ok: Callable[[dict[str, Any]
             "labels": list(dict.fromkeys(labels)), "pools": list(dict.fromkeys(pools)),
             "devPools": list(dict.fromkeys(dev_pools)), "nightlyPools": list(dict.fromkeys(nightly_pools)),
             "dedicatedOnly": dedicated_only,
-            "nightlySlot": nightly_slot, "nightlyInstance": roots + int(dev_compile) if nightly_slot else None,
+            "nightlySlot": nightly_slot, "nightlySigning": nightly_signing,
+            "nightlyInstance": roots + int(dev_compile) if nightly_slot else None,
             "minFreeGib": floor if isinstance(floor, (int, float)) and floor > 0 else None,
             "hardware": hardware, "xcodeApps": [str(a.get("path")) for a in ready], "iosSim": ios_sim,
             "runners": runners, "capacityUnits": units, "compileSlots": compile_slots,
