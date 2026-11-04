@@ -1960,6 +1960,41 @@ class BalanceTest(Base):
         self.assertIsNone(gg.verdict("pr", data, until="required"))
         self.assertEqual(len(self.gh.gql_calls()), 1)
 
+    def test_a_stale_graphql_counter_rate_limit_cannot_see_does_not_force_a_read_every_tick(self) -> None:
+        """Review of #1834 (F3): a poorer GraphQL counter seen long ago, which /rate_limit does not report, made every
+        tick ask /rate_limit. Like REST's counters, a recent /rate_limit answer makes it fresh enough."""
+        self.addCleanup(setattr, gg, "BUDGET_REFRESH", gg.BUDGET_REFRESH)
+        gg.BUDGET_REFRESH = 120.0
+        self.daemon.now = NOW
+        self.daemon.budget = {"rest": {"limit": 5000, "remaining": 4000, "reset": NOW + 900, "seenAt": NOW - 1}}
+        self.daemon.note_budget("graphql", 5000, 1200, NOW + 1500)
+        self.daemon.now = NOW + 2 * gg.BUDGET_REFRESH
+        self.daemon.budget["rest"]["seenAt"] = self.daemon.now - 1
+        self.daemon.note_budget("graphql", 5000, 4000, NOW + 3000)  # the counter /rate_limit sees, fresh
+        self.daemon.rate_limit_at = self.daemon.now - 1
+        before = len([c for c in self.gh.calls if c[1].endswith("/rate_limit")])
+        self.daemon.refresh_budget()
+        self.assertEqual(len([c for c in self.gh.calls if c[1].endswith("/rate_limit")]), before)
+
+    def test_pr_refreshes_paced_by_the_ceiling_do_not_starve_runs(self) -> None:
+        """Review of #1834: with the ceiling held by PR batches every minute, a watched run stayed unread for minutes.
+        The kind after the one the ceiling held goes first next tick."""
+        for n in range(30, 60):
+            self.gh.prs[("o", "r", n)] = pr_node(n, checks=[workflow_check("build", 5)])
+            gg.register(f"pr:o/r#{n}")
+        self.gh.runs[7] = {"id": 7, "status": "in_progress", "conclusion": None, "run_attempt": 1,
+                           "html_url": "https://github.com/o/r/actions/runs/7", "name": "ci"}
+        gg.register("run:o/r/7")
+        self.budgets(rest=(300, 3000), graphql=(4000, 3000))
+        self.daemon.paths["run"] = "graphql"
+        self.daemon.policy = {**self.daemon.policy, "graphqlPerMinute": 1, "restShare": 0.0}
+        self.daemon.batch["pr"] = 10
+        with mock.patch.object(gg, "daemon_policy", return_value=self.daemon.policy):
+            self.daemon.tick(NOW)  # PRs first: one query, then the ceiling holds the rest and the run
+            self.assertIsNone((gg.read_cache("run:o/r/7") or {}).get("data"))
+            self.daemon.tick(NOW + 61)  # PR was held: the comment, run and head kinds go first now
+        self.assertIsNotNone((gg.read_cache("run:o/r/7") or {}).get("data"))
+
     def test_two_graphql_counters_read_as_the_poorer_one(self) -> None:
         """2026-11-04 06:02Z: one daemon's GraphQL reading jumped to the other counter (3938 left, :21 reset) while
         the counter /graphql spends had 1664 (:26 reset). The poorer live counter is the reading, both are kept,

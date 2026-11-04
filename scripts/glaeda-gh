@@ -1531,6 +1531,8 @@ class Daemon:
             for k, v in (spends or {}).items() if isinstance(v, list)}
         self.payer: dict[str, tuple[str, float]] = {}  # head key -> (consumer, time) charged for a read in flight
         self.spill: list[dict] = []  # entries a fetch could not finish because GraphQL stopped partway
+        self.gql_first = 0  # index of the kind read first next tick (rotates after the per-minute ceiling held one)
+        self.gql_paced: str | None = None  # the kind the ceiling held this tick
         self.gql_limited = False  # a GraphQL answer since the last fetch began said the primary limit is reached
         self.refunded: dict[str, str] = {}  # head key -> the consumer a failed read refunded, this tick
         self.denied: dict[str, float] = {}  # consumer -> when a head read it needed was refused for budget
@@ -1746,7 +1748,15 @@ class Daemon:
             rest_seen = max(oldest, self.rate_limit_at) if self.rate_limit_at > float("-inf") else oldest
         else:
             rest_seen = (self.budget.get("rest") or {}).get("seenAt")
-        seen = [rest_seen, (self.budget.get("graphql") or {}).get("seenAt")]
+        # GraphQL the same way (graphqlCounters): /rate_limit reports one of its two counters, so a poorer one it cannot
+        # see is fresh enough once /rate_limit answered lately, or that counter would force a read every tick.
+        gql = rest_counters(self.budget, "graphqlCounters")
+        if gql:
+            oldest = min(c["seenAt"] for c in gql)
+            gql_seen = max(oldest, self.rate_limit_at) if self.rate_limit_at > float("-inf") else oldest
+        else:
+            gql_seen = (self.budget.get("graphql") or {}).get("seenAt")
+        seen = [rest_seen, gql_seen]
         ages = [self.now - t for t in seen if isinstance(t, (int, float))]
         if len(ages) == 2 and max(ages) < BUDGET_REFRESH:
             return  # every bucket's view is recent enough; a bucket never seen always refreshes
@@ -2455,10 +2465,17 @@ class Daemon:
         due = {"pr": prs, "run": runs, "comment": comments, "head": heads}
         over = {kind: self.paths[kind] for kind in due}  # due() routed each kind
         spilled: list[dict] = []
-        for kind in ("pr", "comment", "run", "head"):
+        # The per-minute ceiling (graphqlPerMinute) can hold a tick partway. The kind after the one it held goes first
+        # next tick, so PR refreshes cannot take every minute's points while a run, comment or head waits behind them.
+        kinds = ("pr", "comment", "run", "head")
+        first = getattr(self, "gql_first", 0) % len(kinds)
+        self.gql_paced = None
+        for kind in kinds[first:] + kinds[:first]:
             if over[kind] == "graphql":
                 spilled += self.batched(kind, due[kind], self.graphql_fetch[kind])
                 self.post_between()
+        if self.gql_paced is not None:
+            self.gql_first = (kinds.index(self.gql_paced) + 1) % len(kinds)
         over_rest = [e for kind in ("pr", "run", "comment", "head") if over[kind] == "rest" for e in due[kind]]
         # GraphQL ran out of primary quota partway: REST reads what it could not, this tick. A secondary
         # hold stops REST too, so the REST loop below defers them instead.
@@ -2769,6 +2786,8 @@ class Daemon:
                 # Over the per-minute ceiling: the rest wait, first next tick. Not REST's to read: GraphQL is not
                 # spent, only paced, and a REST spill of a whole post-reset refresh would be the same burst there.
                 self.defer(chunk + [e for c in queue for e in c])
+                if getattr(self, "gql_paced", None) is None:
+                    self.gql_paced = kind
                 return []
             self.gql_limited = False
             self.gql_reason = kind
