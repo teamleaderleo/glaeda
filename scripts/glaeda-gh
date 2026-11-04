@@ -1296,6 +1296,11 @@ HEAD_CONTEXTS = """statusCheckRollup{contexts(first:100%s){pageInfo{hasNextPage 
 ... on StatusContext{context state}}}}"""
 
 PR_CONTEXT_MAX_PAGES = 20  # 2,000 contexts per PR; beyond that the cache stays explicitly partial
+# The follow-up pages' own share of the shared login's GraphQL hour, in points over the last hour. Past it a PR keeps its
+# first 100 contexts (checksTruncated, so GitHub's checkState decides) until the hour frees room: paging every
+# watched PR every cycle once spent 1678 of one daemon's 1958 points an hour (#1830), and the landers that need the
+# same hour to read their gates must never be starved by a completeness read.
+PR_PAGES_POINTS_PER_HOUR = 300
 
 
 def head_query(owner: str, repo: str, sha: str, cursor: str | None = None,
@@ -2881,6 +2886,10 @@ class Daemon:
             self.store(e["key"], e["cache"], error=str(err.get("message") or f"no data for this {what}")[:200],
                        missing=err.get("type") == "NOT_FOUND")
 
+    def pr_pages_points(self) -> int:
+        """GraphQL points the follow-up check pages spent in the last hour (PR_PAGES_POINTS_PER_HOUR)."""
+        return sum(points for at, why, points in self.gql_log if why == "pr-pages" and self.now - at < 3600)
+
     def extend_pr_contexts(self, entry: dict, node: dict) -> str | None:
         """Follow a PR's cached statusCheckRollup pages so status pr sees required checks beyond 100.
 
@@ -2918,6 +2927,8 @@ class Daemon:
         for _ in range(PR_CONTEXT_MAX_PAGES - 1):
             if not cursor:
                 return "graphql: PR check page has no cursor"
+            if self.pr_pages_points() >= PR_PAGES_POINTS_PER_HOUR:
+                return None  # over its hourly share: the truncated rollup stands, as with nothing required
             reason, self.gql_reason = self.gql_reason, "pr-pages"
             try:
                 more, error = self.graphql("query{" + head_query(owner, repo, str(sha), cursor, int(number)) + "}", {})
