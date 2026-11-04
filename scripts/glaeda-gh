@@ -78,9 +78,13 @@ the daemon is the only process that talks to GitHub, and clients only read its c
   due within 30 s rides along in the query of one due now. daemon.json's graphqlBy says what the last hour's
   queries read (pr, run, comment, head, steps, head-pages) and the points GitHub charged for them.
 - The X-RateLimit headers and the GraphQL rateLimit field drive a budget guard: below the floor
-  (REST 1500 left, GraphQL 500) the daemon polls four times less often and skips job lists; below
-  the reserve (REST 300, GraphQL 100) it stops that API until the quota resets. The quota is shared,
-  so this also protects every other tool on the account. GitHub answers one token's REST calls from
+  (REST 1500 left, GraphQL 500; the fleet config raises GraphQL to 1500) the daemon polls four times less
+  often and skips job lists; below the reserve (REST 300, GraphQL 100; the fleet config: 1000) it stops that
+  API until the quota resets. The quota is shared, so this also protects every other tool on the account:
+  the fleet's GraphQL 1000 is kept for lands (merges and
+  the gate reads lane VMs land through). The daemon's own GraphQL spend is also held to graphqlPerMinute
+  (40) points in any 60 s; past it the rest of a tick's reads wait, first next tick, so a refresh of every
+  entry after a reset, a re-exec or a stop is spread over minutes instead of sent at once. GitHub answers one token's REST calls from
   two "core" counters with their own hourly windows (run and workflow reads report one; /rate_limit,
   pulls and job lists the other), so budget.json keeps each live counter in restCounters and "rest"
   is the poorest of them, never just the last answer.
@@ -220,7 +224,16 @@ TERMINAL_GRACE = 120  # drop a merged, closed or completed entry (or a comment w
 TERMINAL_REFRESH = 600  # a terminal entry still watched is re-read this rarely (a rerun reopens a run)
 CACHE_KEEP = 3600  # unwatched cache files are removed after this long
 LEAN_FACTOR = 4  # below the floor, poll this many times less often
-FLOORS = {"rest": (1500, 300), "graphql": (500, 100)}  # (floor, reserve) per quota: the defaults
+FLOORS = {"rest": (1500, 300), "graphql": (500, 100)}  # (floor, reserve) per quota: the module defaults
+# The fleet's config/gh-daemon.json raises GraphQL's to floor 1500, reserve 1000: the share of the shared login's hour
+# kept for lands. Below it the daemon sends no GraphQL read (its PR reads go over REST, or wait for the reset), so the
+# merges and gate reads lane VMs land through on the broker host never meet an hour the daemon's polling emptied. On
+# 2026-11-04 the account's /graphql counter hit 0 minutes before each :26 reset and the lane-gh broker refused
+# cmux#34340's and #34805's lands for it (04:23Z, 05:21Z, 05:22Z).
+# The daemon's own GraphQL points in any 60 s, at most. Spread over the minute instead of spent at once: after a
+# reset (or a re-exec, or a stop below the reserve) every watched PR is due in the same tick, and a burst of them is
+# what the shared login cannot spend for lands. Past it the reads wait for the next tick, first in line (deferred).
+GRAPHQL_PER_MINUTE = 40
 # The daemon's own counted REST requests in the last hour stay under this share of the hourly limit.
 # Measured 2026-10-27: the daemon spent 2549 REST requests of one hour's 5000 (756 more were free
 # 304s) on PR reads the balancer had sent to REST, and the account ran out under a nightly re-run.
@@ -1401,7 +1414,8 @@ def daemon_policy() -> dict:
         f = int(_bounded(one.get("floor"), floor, 0, 100000))
         r = int(_bounded(one.get("reserve"), reserve, 0, 100000))
         floors[bucket] = (f, r) if r <= f else (floor, reserve)
-    return {"cycle": cycle, "commentCycle": comment,
+    per_minute = int(_bounded(doc.get("graphqlPerMinute"), GRAPHQL_PER_MINUTE, 1, 5000))
+    return {"cycle": cycle, "commentCycle": comment, "graphqlPerMinute": per_minute,
             "cycles": {"pr": cycle, "run": cycle, "comment": comment, "head": cycle},
             "floors": floors, "restShare": float(_bounded(doc.get("restShare"), REST_SHARE, 0.0, 1.0)),
             "forceLow": tuple(b for b in ("rest", "graphql")
@@ -1438,10 +1452,10 @@ def merge_counter(counters: list[dict], seen: dict) -> list[dict]:
     return sorted(out, key=lambda c: c["reset"])
 
 
-def rest_counters(budget: dict) -> list[dict]:
-    """The well-formed entries of budget["restCounters"] (Daemon.settle_rest)."""
+def rest_counters(budget: dict, key: str = "restCounters") -> list[dict]:
+    """The well-formed entries of budget["restCounters"] (Daemon.settle_rest), or of budget["graphqlCounters"]."""
     out = []
-    for c in budget.get("restCounters") or []:
+    for c in budget.get(key) or []:
         if (isinstance(c, dict) and isinstance(c.get("reset"), (int, float)) and isinstance(c.get("remaining"), int)
                 and isinstance(c.get("seenAt"), (int, float))):
             out.append(c)
@@ -1648,6 +1662,19 @@ class Daemon:
             seen = {"limit": int(limit), "remaining": int(remaining), "reset": reset, "seenAt": self.now}
         except (TypeError, ValueError):
             return
+        if bucket == "graphql":
+            # GraphQL too answers one token from two counters with their own hourly windows: on 2026-11-04 the one
+            # /graphql requests spend reset at :26:29 while /rate_limit and some answers reported one resetting at
+            # :21 (cosmic-gray's reading jumped from 3850 left to 3938 between them at 06:02Z while the spending one
+            # had 1664). The last answer alone let the daemon, and the gh guard reading budget.json, spend from a
+            # counter that was nearly gone; every live one is kept and the poorest is the reading, as for REST.
+            if not isinstance(reset, (int, float)):
+                if not rest_counters(self.budget, "graphqlCounters"):
+                    self.budget[bucket] = seen
+                return
+            self.budget["graphqlCounters"] = merge_counter(rest_counters(self.budget, "graphqlCounters"), seen)
+            self.settle_counters("graphql")
+            return
         if bucket != "rest":
             self.budget[bucket] = seen
             return
@@ -1672,8 +1699,13 @@ class Daemon:
         was already spent. Every live counter is kept (restCounters, at most REST_COUNTERS) and the poorest
         one is what everything else reads; a counter past its reset is dropped. With no live counter the last
         reading stays as it was before restCounters existed (mode() treats a passed reset as a fresh hour)."""
-        counters = rest_counters(self.budget)
-        cur = self.budget.get("rest")
+        self.settle_counters("rest")
+
+    def settle_counters(self, bucket: str) -> None:
+        """settle_rest for BUCKET ("rest": restCounters, "graphql": graphqlCounters)."""
+        key = "restCounters" if bucket == "rest" else "graphqlCounters"
+        counters = rest_counters(self.budget, key)
+        cur = self.budget.get(bucket)
         if isinstance(cur, dict) and isinstance(cur.get("reset"), (int, float)) and isinstance(cur.get("remaining"), int):
             # the reading itself counts too: a budget.json from before restCounters, or one lowered in place
             seen_at = cur.get("seenAt")
@@ -1681,10 +1713,10 @@ class Daemon:
         live = [c for c in counters if c["reset"] > self.now]
         live = sorted(live, key=lambda c: c["seenAt"], reverse=True)[:REST_COUNTERS]
         if not live:
-            self.budget.pop("restCounters", None)
+            self.budget.pop(key, None)
             return
-        self.budget["restCounters"] = sorted(live, key=lambda c: c["reset"])
-        self.budget["rest"] = dict(min(live, key=lambda c: (c["remaining"], -c["seenAt"])))
+        self.budget[key] = sorted(live, key=lambda c: c["reset"])
+        self.budget[bucket] = dict(min(live, key=lambda c: (c["remaining"], -c["seenAt"])))
 
     def refresh_budget(self) -> None:
         """Read the quota from GitHub when this host's view has gone stale.
@@ -2223,6 +2255,10 @@ class Daemon:
         if full:
             self.last_cycle[kind] = self.now
         out = [e for e in mine if e["key"] in self.deferred]  # the last tick ran out of time for these
+        # Oldest deferral first: a refresh paced over minutes (graphqlPerMinute) defers again whatever came due
+        # meanwhile, and in watch order those re-due keys went ahead of keys deferred ticks earlier, unread since.
+        since = getattr(self, "deferred_since", {})
+        out.sort(key=lambda e: since.get(e["key"], self.now))
         first = {e["key"] for e in out}
         self.deferred -= first
         for e in mine:
@@ -2391,6 +2427,7 @@ class Daemon:
         self.policy = daemon_policy()
         self.jobs_only = []
         self.settle_rest()  # a counter whose window ended leaves the reading to the others
+        self.settle_counters("graphql")
         if self.failing is None:
             # and again in serve_waits: a long read phase must not look like a dead daemon; ticks that
             # keep raising stop marking, so their blockers hand the wait back (resume_wait says why)
@@ -2728,6 +2765,11 @@ class Daemon:
             chunk = queue.pop(0)
             if self.mode("graphql") == "stop":
                 return chunk + [e for c in queue for e in c]
+            if not self.gql_room():
+                # Over the per-minute ceiling: the rest wait, first next tick. Not REST's to read: GraphQL is not
+                # spent, only paced, and a REST spill of a whole post-reset refresh would be the same burst there.
+                self.defer(chunk + [e for c in queue for e in c])
+                return []
             self.gql_limited = False
             self.gql_reason = kind
             try:
@@ -2886,6 +2928,14 @@ class Daemon:
             self.store(e["key"], e["cache"], error=str(err.get("message") or f"no data for this {what}")[:200],
                        missing=err.get("type") == "NOT_FOUND")
 
+    def gql_minute_points(self) -> int:
+        """GraphQL points this daemon spent in the last 60 s (graphqlPerMinute)."""
+        return sum(points for at, _why, points in self.gql_log if self.now - at < 60)
+
+    def gql_room(self) -> bool:
+        """Whether one more GraphQL query fits under the per-minute ceiling (policy graphqlPerMinute)."""
+        return self.gql_minute_points() < self.policy.get("graphqlPerMinute", GRAPHQL_PER_MINUTE)
+
     def pr_pages_points(self) -> int:
         """GraphQL points the follow-up check pages spent in the last hour (PR_PAGES_POINTS_PER_HOUR)."""
         return sum(points for at, why, points in self.gql_log if why == "pr-pages" and self.now - at < 3600)
@@ -2931,6 +2981,8 @@ class Daemon:
                 # Over its hourly share: a required context may sit past this page, so the PR reads pending
                 # (checksPageError), never green on a partial rollup, until the rolling hour frees room.
                 return "graphql: PR check pages over their hourly share"
+            if not self.gql_room():
+                return "graphql: PR check pages wait for the per-minute ceiling"
             reason, self.gql_reason = self.gql_reason, "pr-pages"
             try:
                 more, error = self.graphql("query{" + head_query(owner, repo, str(sha), cursor, int(number)) + "}", {})

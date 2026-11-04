@@ -1960,6 +1960,60 @@ class BalanceTest(Base):
         self.assertIsNone(gg.verdict("pr", data, until="required"))
         self.assertEqual(len(self.gh.gql_calls()), 1)
 
+    def test_two_graphql_counters_read_as_the_poorer_one(self) -> None:
+        """2026-11-04 06:02Z: one daemon's GraphQL reading jumped to the other counter (3938 left, :21 reset) while
+        the counter /graphql spends had 1664 (:26 reset). The poorer live counter is the reading, both are kept,
+        and one past its reset leaves the other."""
+        self.daemon.now = NOW
+        self.daemon.budget = {}
+        self.daemon.note_budget("graphql", 5000, 1664, NOW + 1440)
+        self.daemon.note_budget("graphql", 5000, 3938, NOW + 1140)
+        self.assertEqual(self.daemon.budget["graphql"]["remaining"], 1664)
+        self.assertEqual(len(self.daemon.budget["graphqlCounters"]), 2)
+        self.daemon.note_budget("graphql", 5000, 900, NOW + 1440)  # the spending counter goes on down
+        self.assertEqual(self.daemon.budget["graphql"]["remaining"], 900)
+        self.daemon.note_budget("graphql", 5000, 400, NOW + 1140)  # now the other counter is the poorer
+        self.assertEqual(self.daemon.budget["graphql"]["remaining"], 400)
+        self.daemon.now = NOW + 1141  # its window ended; the one still live is the reading
+        self.daemon.settle_counters("graphql")
+        self.assertEqual(self.daemon.budget["graphql"]["remaining"], 900)
+        self.assertEqual(len(self.daemon.budget["graphqlCounters"]), 1)
+
+    def test_graphql_reads_past_the_per_minute_ceiling_wait_for_the_next_minute(self) -> None:
+        """A tick that would spend past graphqlPerMinute sends nothing more: its reads are deferred (first next tick),
+        not spilled to REST, and once the minute has passed they are read."""
+        self.gh.prs[("o", "r", 21)] = pr_node(21, checks=[workflow_check("build", 5)])
+        self.budgets(rest=(300, 3000), graphql=(4000, 3000))
+        self.daemon.gql_log = [(NOW - 30, "pr", gg.GRAPHQL_PER_MINUTE)]  # this minute's points already spent
+        gg.register("pr:o/r#21")
+        self.daemon.tick(NOW)
+        self.assertEqual(self.gh.gql_calls(), [])
+        self.assertEqual([c for c in self.gh.rest_calls() if "/pulls/" in c[1]], [])  # paced, not spilled to REST
+        self.assertIn("pr:o/r#21", self.daemon.deferred)
+        self.daemon.tick(NOW + 31)  # the spent points are a minute old
+        self.assertEqual(len(self.gh.gql_calls()), 1)
+        self.assertEqual(gg.read_cache("pr:o/r#21")["data"]["number"], 21)
+
+    def test_a_refresh_of_every_pr_after_a_reset_is_spread_over_minutes(self) -> None:
+        """Every watched PR due at once (a reset, a re-exec, a stop below the reserve): at most graphqlPerMinute
+        points a minute go out, the rest first in line next tick, so the shared login sees no burst."""
+        for n in range(30, 60):
+            self.gh.prs[("o", "r", n)] = pr_node(n, checks=[workflow_check("build", 5)])
+            gg.register(f"pr:o/r#{n}")
+        self.budgets(rest=(300, 3000), graphql=(4000, 3000))
+        self.daemon.policy = {**self.daemon.policy, "graphqlPerMinute": 1}
+        self.daemon.batch["pr"] = 10
+        with mock.patch.object(gg, "daemon_policy", return_value=self.daemon.policy):
+            self.daemon.tick(NOW)
+            self.assertEqual(len(self.gh.gql_calls()), 1)  # one query (10 PRs); 20 wait
+            self.assertEqual(len(self.daemon.deferred), 20)
+            self.daemon.tick(NOW + 61)
+            self.assertEqual(len(self.gh.gql_calls()), 2)
+            self.daemon.tick(NOW + 122)
+            self.assertEqual(len(self.gh.gql_calls()), 3)
+        unread = [n for n in range(30, 60) if (gg.read_cache(f"pr:o/r#{n}") or {}).get("data") is None]
+        self.assertEqual(unread, [], [len(q[1].get("query", "")) if isinstance(q[1], dict) else q for q in self.gh.gql_calls()])
+
     def test_steps_come_from_rest_so_a_refused_check_is_still_held(self) -> None:
         """PRs move to REST when GraphQL is stopped; the failed steps must not need GraphQL."""
         now = time.time()
@@ -9563,6 +9617,26 @@ class DaemonPolicyTest(Base):
         self.assertLessEqual(sum(shares), doc["maxRestShare"])
         # 0.1: REST is what gh, landers and reruns must use; the daemons read over GraphQL (2026-10-30)
         self.assertLessEqual(doc["maxRestShare"], 0.1)
+
+    def test_the_shipped_fleet_policy_keeps_a_graphql_reserve_for_lands(self) -> None:
+        """config/gh-daemon.json: every daemon stops GraphQL below 1000 left, the share of the hour kept for lands,
+        and the per-minute ceiling is read from the policy."""
+        gg.FLEET_POLICY.write_text((ROOT / "config" / "gh-daemon.json").read_text())
+        gg.UPDATE_CONFIG.write_text(json.dumps({"host": "not-named"}))
+        policy = gg.daemon_policy()
+        self.assertGreaterEqual(policy["floors"]["graphql"][1], 1000)
+        self.assertGreater(policy["floors"]["graphql"][0], policy["floors"]["graphql"][1])
+        self.assertEqual(policy["graphqlPerMinute"], gg.GRAPHQL_PER_MINUTE)
+        self.daemon.policy = policy
+        self.daemon.now = NOW
+        self.daemon.budget = {"graphql": {"limit": 5000, "remaining": 999, "reset": NOW + 600}}
+        self.assertEqual(self.daemon.mode("graphql"), "stop")
+        self.daemon.budget["graphql"]["remaining"] = 1200
+        self.assertEqual(self.daemon.mode("graphql"), "lean")
+        self.configure({"graphqlPerMinute": 12})
+        self.assertEqual(self.daemon.policy["graphqlPerMinute"], 12)
+        self.configure({"graphqlPerMinute": 0})  # out of range: the default
+        self.assertEqual(self.daemon.policy["graphqlPerMinute"], gg.GRAPHQL_PER_MINUTE)
 
     def test_a_zero_share_reads_prs_and_runs_over_graphql(self) -> None:
         """A host the fleet policy does not name: every PR and run read is GraphQL. The one REST read left
