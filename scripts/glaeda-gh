@@ -2470,11 +2470,14 @@ class Daemon:
         kinds = ("pr", "comment", "run", "head")
         first = getattr(self, "gql_first", 0) % len(kinds)
         self.gql_paced = None
+        sent = len(self.gql_log)
         for kind in kinds[first:] + kinds[:first]:
             if over[kind] == "graphql":
                 spilled += self.batched(kind, due[kind], self.graphql_fetch[kind])
                 self.post_between()
-        if self.gql_paced is not None:
+        # Only a tick that sent a query moves the order: one that met the ceiling before reading anything (most ticks
+        # in a full minute, TICK is 2 s) leaves it, or the count of empty ticks would decide who reads next.
+        if self.gql_paced is not None and len(self.gql_log) > sent:
             self.gql_first = (kinds.index(self.gql_paced) + 1) % len(kinds)
         over_rest = [e for kind in ("pr", "run", "comment", "head") if over[kind] == "rest" for e in due[kind]]
         # GraphQL ran out of primary quota partway: REST reads what it could not, this tick. A secondary

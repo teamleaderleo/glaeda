@@ -1992,6 +1992,8 @@ class BalanceTest(Base):
         with mock.patch.object(gg, "daemon_policy", return_value=self.daemon.policy):
             self.daemon.tick(NOW)  # PRs first: one query, then the ceiling holds the rest and the run
             self.assertIsNone((gg.read_cache("run:o/r/7") or {}).get("data"))
+            for empty in range(2, 60, 2):  # the daemon ticks every 2 s; these meet a full ceiling and read nothing
+                self.daemon.tick(NOW + empty)
             self.daemon.tick(NOW + 61)  # PR was held: the comment, run and head kinds go first now
         self.assertIsNotNone((gg.read_cache("run:o/r/7") or {}).get("data"))
 
