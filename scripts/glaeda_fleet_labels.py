@@ -79,7 +79,7 @@ RESERVED_POOL_PREFIXES = {"root-", "side-", "gui-", "fast-", "trusted-", "std-",
                           "gateway-"}
 DEV_COMPILE_POOL_PREFIX = "dev-"
 # The classes that may hold the DEV freshness slot (runner.devCompile). An xl slot (an M5 Ultra Studio) also carries
-# the std DEV label (nightly_classes, as its nightly slot does), so the feed's Release compile queued on
+# the std DEV label (dev_classes), so the feed's Release compile queued on
 # glaeda-dev-std-xcode-<v> (cmux's vars.CI_DEV_COMPILE_RUNNER) reaches an idle Ultra as well as an M4 Pro: an Ultra
 # measured 9.0 min for it against 16.4 min p50 on an M4 Pro (2026-11-03). cmux's placement still takes the slot only
 # while it has an idle runner and otherwise falls back, so this adds a server and pins nothing. Never light: a 16 GB
@@ -92,9 +92,15 @@ DEV_COMPILE_CLASSES = ("std", "xl")
 # order, so a nightly job queued on a side label waited behind every PR job queued there before it (2026-10-27
 # 14:08Z: a nightly-next build-nightly-app on the light side label was never acquired by a runner while 37 side
 # runners ran PR jobs). No PR job carries this label, so the nightly job is the only one this runner can take; it
-# listens on a full mini, and its job waits there first in line (FEED_FIRST) while no other job takes a unit. An xl
-# slot also carries the std nightly label (nightly_classes), so a nightly job queued on glaeda-nightly-std-xcode-<v>
-# (cmux's vars.CI_NIGHTLY_NEXT_BUILD_RUNNER) reaches an idle M5 Ultra's slot as well as an M4 Pro's.
+# listens on a full mini, and its job waits there first in line (FEED_FIRST) while no other job takes a unit. A slot
+# carries only its own class's nightly label (nightly_classes): an xl slot is glaeda-nightly-xl-xcode-<v> alone and
+# never answers glaeda-nightly-std-xcode-<v>. cmux's nightly-next signing jobs queue on that std label
+# (vars.CI_NIGHTLY_NEXT_BUILD_RUNNER is their runs-on fallback and an OWNED_LABELS entry of their owned pick), so
+# GitHub hands the job, signing secrets included, to whichever runner carries it. From #1819 an xl slot did: on
+# 2026-11-04 from 18:12Z to 19:01Z eleven sign-nightly-identity-legacy jobs went to an M5 Ultra's slot, a host never
+# enrolled for signing; the hook refused each before a step ran, but GitHub had already delivered the job's secrets
+# to the runner. The std label stays on the std (M4 Pro) slots that sign today. An xl slot keeps its own nightly
+# label, which no signing job asks for, so a build-only route to it (a picker offering the xl label) stays open.
 NIGHTLY_POOL_PREFIX = "nightly-"
 
 
@@ -145,12 +151,19 @@ def side_classes(klass: str) -> tuple[str, ...]:
     return RUNNER_CLASSES[RUNNER_CLASSES.index(klass):] if klass in RUNNER_CLASSES else ()
 
 
-def nightly_classes(klass: str) -> tuple[str, ...]:
-    """The classes whose nightly slot label a `klass` nightly slot carries: its own, then each narrower class down to
-    std. As with side_classes(), a wider mini runs a narrower one's nightly job (an M5 Ultra, 96 GB, builds what an M4
-    Pro builds), but never down to light: a 16 GB M4 cannot build the nightly app, so no wider slot answers a light
-    nightly label, and a std slot's labels stay exactly what they were."""
+def dev_classes(klass: str) -> tuple[str, ...]:
+    """The classes whose DEV freshness label a `klass` DEV slot carries: its own, then each narrower class down to std.
+    As with side_classes(), a wider mini runs a narrower one's DEV compile (an M5 Ultra, 96 GB, builds what an M4 Pro
+    builds), but never down to light: a 16 GB M4 cannot build the Release app, so no wider slot answers a light DEV
+    label, and a std slot's labels stay exactly what they were."""
     return tuple(k for k in side_classes(klass) if k == klass or k != "light")
+
+
+def nightly_classes(klass: str) -> tuple[str, ...]:
+    """The classes whose nightly slot label a `klass` nightly slot carries: its own only (NIGHTLY_POOL_PREFIX's
+    comment). cmux's nightly signing jobs share the std nightly label with its nightly builds, so a wider slot that
+    answered it would take signing jobs, and their secrets, on a host that holds no signing trust."""
+    return (klass,) if klass in RUNNER_CLASSES else ()
 
 
 # Root labels a class's root runners carry beyond their own. cmux's picker routes runs to std and light pools only
@@ -185,13 +198,12 @@ def root_pools(pool: str) -> list[str]:
 
 
 def widened_labels(labels: list[str]) -> list[str]:
-    """`labels` plus every side label side_classes() adds to the side labels among them, every root label
-    root_classes() adds to the root labels among them, and every nightly slot label nightly_classes() adds to the
-    nightly slot labels among them, in order, each once.
+    """`labels` plus every side label side_classes() adds to the side labels among them and every root label
+    root_classes() adds to the root labels among them, in order, each once. A nightly slot label is never widened
+    (nightly_classes()).
 
     The registered labels of a runner installed before side_classes() lack the narrower classes' side labels (one
-    installed before root_classes() its root spill, and an xl nightly slot installed before nightly_classes() the std
-    nightly label, #1820).
+    installed before root_classes() its root spill).
     A reconciler with the organization's runner-label permission (GitHub fixes labels at registration, and a
     mini holds no admin token) sets a runner's custom labels to this, so a manifest change reaches every
     registered runner without a relabel by hand. Pure and idempotent: widened_labels(widened_labels(x)) ==
@@ -204,8 +216,7 @@ def widened_labels(labels: list[str]) -> list[str]:
         if (index is None or parts[0] != "glaeda" or parts[index + 1:index + 2] != ["xcode"]
                 or not re.fullmatch(VERSION_RE, "-".join(parts[index + 2:]))):
             continue
-        for role, make, classes in (("side", side_label, side_classes), ("root", root_label, root_classes),
-                                    ("nightly", nightly_label, nightly_classes)):
+        for role, make, classes in (("side", side_label, side_classes), ("root", root_label, root_classes)):
             if role not in parts[1:index]:
                 continue
             pool = "-".join(part for i, part in enumerate(parts) if not (part == role and 0 < i < index))
@@ -380,7 +391,7 @@ def member_labels(manifest: Any, member: str, xcode_ok: Callable[[dict[str, Any]
     # A dedicatedOnly member has no pool instance, so it is in no pool (declared_pools, capacity totals)
     pools = ([pool_label(klass, v, bool(trusted_ref), normal_pool_prefix) for v in versions]
              if availability == "dedicated" and not dedicated_only else [])
-    dev_pools = ([pool_label(k, v, False, DEV_COMPILE_POOL_PREFIX) for v in versions for k in nightly_classes(klass)]
+    dev_pools = ([pool_label(k, v, False, DEV_COMPILE_POOL_PREFIX) for v in versions for k in dev_classes(klass)]
                  if dev_compile and availability == "dedicated" else [])
     nightly_pools = ([pool_label(k, v, False, NIGHTLY_POOL_PREFIX) for v in versions for k in nightly_classes(klass)]
                      if nightly_slot and availability == "dedicated" else [])

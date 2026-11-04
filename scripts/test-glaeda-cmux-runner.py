@@ -13633,13 +13633,16 @@ class FleetLabelsModuleTest(unittest.TestCase):
         self.assertIsNone(light)
         self.assertIn("dedicated std or xl runner", why)
 
-    def test_an_xl_nightly_slot_also_answers_the_std_nightly_label_and_never_light(self) -> None:
-        # The M5 Ultra Studios (class xl) take a nightly job queued on glaeda-nightly-std-xcode-<v>, the label cmux's
-        # nightly picker offers, as their side runners already take side-std jobs; no slot answers a light nightly
-        # label from a wider class, and a std or light slot's labels do not change.
-        self.assertEqual(fleet_labels.nightly_classes("xl"), ("xl", "std"))
+    def test_an_xl_nightly_slot_never_answers_the_std_nightly_label(self) -> None:
+        # cmux's nightly-next signing jobs queue on glaeda-nightly-std-xcode-<v> (vars.CI_NIGHTLY_NEXT_BUILD_RUNNER),
+        # so a slot answering it receives their secrets. From #1819 an xl slot did, and on 2026-11-04 it took eleven
+        # sign-nightly-identity-legacy jobs on a host never enrolled for signing. A slot carries only its own class's
+        # nightly label; the DEV slot's std spill (dev_classes) and the root spill stay.
+        self.assertEqual(fleet_labels.nightly_classes("xl"), ("xl",))
         self.assertEqual(fleet_labels.nightly_classes("std"), ("std",))
         self.assertEqual(fleet_labels.nightly_classes("light"), ("light",))
+        self.assertEqual(fleet_labels.nightly_classes("tiny"), ())
+        self.assertEqual(fleet_labels.dev_classes("xl"), ("xl", "std"))
         manifest = copy.deepcopy(MANIFEST)
         manifest["hosts"]["ultra"] = {"class": "xl", "availability": "dedicated", "roles": ["ci-runner"],
                                       "hardware": "m5ultra-96", "overrides": {"runner": {"nightlySlot": True, "classes": {
@@ -13647,21 +13650,20 @@ class FleetLabelsModuleTest(unittest.TestCase):
                                                  "canonicalRoots": 3, "gatewayRunners": 2}}}}}
         ultra, why = fleet_labels.member_labels(manifest, "ultra", lambda app: True)
         self.assertIsNone(why)
-        self.assertEqual(ultra["nightlyPools"], ["glaeda-nightly-xl-xcode-26.6", "glaeda-nightly-std-xcode-26.6"])
+        self.assertEqual(ultra["nightlyPools"], ["glaeda-nightly-xl-xcode-26.6"])
         self.assertEqual((ultra["nightlySlot"], ultra["nightlyInstance"]), (True, 3))
         self.assertEqual(ultra["rootPools"], ["glaeda-root-xl-xcode-26.6", "glaeda-root-std-xcode-26.6"])
+        self.assertNotIn("glaeda-nightly-std-xcode-26.6", ultra["labels"])
         self.assertEqual(fleet_labels.widened_labels(ultra["nightlyPools"]), ultra["nightlyPools"])
-        # #1820: an xl slot registered before nightly_classes() converges through the label reconcile alone
+        # The label reconcile never adds the std nightly label to a registered xl slot either.
         live = ["glaeda-mini", "glaeda-class-xl", "glaeda-nightly-xl-xcode-26.6", "glaeda-runner-ultra-glaeda-3"]
-        once = fleet_labels.widened_labels(live)
-        self.assertEqual(once, [*live, "glaeda-nightly-std-xcode-26.6"])
-        self.assertEqual(fleet_labels.widened_labels(once), once)
+        self.assertEqual(fleet_labels.widened_labels(live), live)
         self.assertEqual(fleet_labels.nightly_label("glaeda-xl-xcode-26.6"), ultra["nightlyPools"][0])
         for unchanged in (["glaeda-nightly-std-xcode-26.6"], ["glaeda-nightly-light-xcode-26.6"],
                           ["glaeda-nightly-xl"], ["glaeda-nightly-only-m4pro"]):
             self.assertEqual(fleet_labels.widened_labels(unchanged), unchanged)
         pools = fleet_labels.declared_pools(manifest)
-        self.assertIn("ultra", pools["glaeda-nightly-std-xcode-26.6"])
+        self.assertNotIn("ultra", pools.get("glaeda-nightly-std-xcode-26.6", []))
         self.assertIn("ultra", pools["glaeda-nightly-xl-xcode-26.6"])
         self.assertNotIn("glaeda-nightly-light-xcode-26.6", pools)
 
