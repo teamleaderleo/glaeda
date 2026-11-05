@@ -4390,6 +4390,48 @@ time.sleep(60)
         self.assertIsNone(hook.fair_turn(capacity, {"simulator"}, now), "no shared kind: no turn to wait for")
         self.assertIsNone(hook.fair_turn(capacity, {"root", "units"}, now - 60), "an older admission goes first")
 
+    def test_a_trusted_signing_job_goes_ahead_of_other_waiting_nightly_jobs(self) -> None:
+        """SIGNS_FIRST (cmuxterm-hq#7156 option A): on a mini whose signing runner carries --trusted-next-signing, a
+        waiting signing job is admitted ahead of an older waiting nightly job (cmux15 2026-11-05: a built run's sign
+        queued up to 1920 s behind build-nightly-app and prepare-nightly-variant). Nothing is reserved: with no signer
+        waiting the order is arrival again, and an exclusive job from any other runner keeps arrival order."""
+        capacity = self.dir / "capacity"
+        capacity.mkdir()
+        now, nightly = time.time(), hook.TIER_NIGHTLY
+        marker = capacity / f"{hook.ADMIT_WANT}{os.getppid()}"
+
+        def waiting(since: float, klass: str = "", signs_first: bool = False) -> None:
+            want: dict[str, object] = {"since": since, "wants": ["units"], "who": "w0 job (run 1)", "tier": nightly}
+            if klass:
+                want["class"] = klass
+            if signs_first:
+                want["signs_first"] = True
+            marker.write_text(json.dumps(want))
+
+        # A newer trusted signing job waits: an older nightly build behind it waits too, the sign itself does not.
+        waiting(now, hook.EXCLUSIVE_CLASS, True)
+        self.assertIn("is a signing job and goes first here for units",
+                      hook.fair_turn(capacity, {"units"}, now - 600, nightly, True, True))
+        # An older nightly build waits: the newer trusted signing job goes ahead of it.
+        waiting(now - 600)
+        self.assertIsNone(hook.fair_turn(capacity, {"units"}, now, nightly, True, True, signs_first=True))
+        # Without the trusted signer flag the same exclusive job keeps arrival order (any other mini).
+        self.assertIn("has waited longer here for units",
+                      hook.fair_turn(capacity, {"units"}, now, nightly, True, True))
+        waiting(now, hook.EXCLUSIVE_CLASS)
+        self.assertIsNone(hook.fair_turn(capacity, {"units"}, now - 600, nightly, True, True),
+                          "an exclusive waiter without signs_first: arrival order")
+        # A marker claiming signs_first without the exclusive class is not trusted.
+        waiting(now, "", True)
+        self.assertIsNone(hook.fair_turn(capacity, {"units"}, now - 600, nightly, True, True),
+                          "signs_first without the exclusive class is ignored")
+        # Two trusted signing jobs: arrival order between them.
+        waiting(now - 600, hook.EXCLUSIVE_CLASS, True)
+        self.assertIn("has waited longer here for units",
+                      hook.fair_turn(capacity, {"units"}, now, nightly, True, True, signs_first=True))
+        # Still a nightly job: it goes ahead of a PR job's admission as before.
+        self.assertIn("goes first", hook.fair_turn(capacity, {"units"}, now - 3600, "", True, True))
+
     def test_tiers_order_the_admission_queue(self) -> None:
         """FEED_FIRST: a nightly job goes ahead of every waiter however long it has waited, and while one waits no
         admission of another tier takes a unit, not even one its own gate's reserve covers. A DEV compile goes ahead
