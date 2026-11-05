@@ -4457,7 +4457,7 @@ def fair_turn(capacity_dir: Path, needs: set[str], since: float, tier: str = "",
     now = time.time()
     mine = admission_rank(tier, since, os.getpid(), now, signs_first and tier == TIER_NIGHTLY)
     for waiter in admission_waiters(capacity_dir, os.getpid()):
-        if admission_rank(waiter["tier"], waiter["since"], waiter["pid"], now, waiter["signs_first"]) >= mine:
+        if admission_rank(waiter["tier"], waiter["since"], waiter["pid"], now, waiter.get("signs_first", False)) >= mine:
             continue
         if session_first_lapsed(waiter, now):
             continue  # a session job past SESSION_FIRST_S still tries for units but no longer goes first
@@ -4466,7 +4466,7 @@ def fair_turn(capacity_dir: Path, needs: set[str], since: float, tier: str = "",
             shared.add("units")  # a later nightly job too: arrival order among them
         if shared:
             who = waiter["who"] or "pid " + str(waiter["pid"])
-            if waiter["signs_first"] and not (signs_first and tier == TIER_NIGHTLY):
+            if waiter.get("signs_first", False) and not (signs_first and tier == TIER_NIGHTLY):
                 return f"capacity: {who} is a signing job and goes first here for {', '.join(sorted(shared))}"
             if (waiter["since"], waiter["pid"]) > (since, os.getpid()) or waiter["tier"] == TIER_NIGHTLY != tier:
                 kind = {TIER_NIGHTLY: "a nightly job", TIER_STACK: "a stack-blocker PR job"}.get(waiter["tier"],
