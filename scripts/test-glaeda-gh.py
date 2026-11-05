@@ -121,6 +121,7 @@ class FakeGitHub:
         self.heads: dict[tuple[str, str, str], list] = {}  # (owner, repo, sha) -> that commit's check contexts
         # sha -> that commit's check suites [{"id", "latest": runs in its newest attempt, "runs": every attempt's}]
         self.suites: dict[str, list] = {}
+        self.suites_unread = False  # GitHub failed the checkSuites field: null beside an error
         self.rate_limit_calls = 0  # GET /rate_limit: free, so it is counted separately
         self.throttle: dict[str, tuple[int, dict, bytes]] = {}  # "rest"|"graphql" -> the answer every read gets
         self.no_protection_feature = False  # a private repository's plan: rules and protection answer 403
@@ -185,7 +186,7 @@ class FakeGitHub:
                 node = table.get((v[f"o{i}"], v[f"r{i}"], v[f"n{i}"]))
                 if comments and node is not None:  # comments(last: COMMENTS_LAST)
                     node = {**node, "comments": {**node["comments"], "nodes": node["comments"]["nodes"][-gg.COMMENTS_LAST:]}}
-                if not comments and node is not None and node["headRefOid"] in self.suites:
+                if not comments and node is not None:
                     node = copy.deepcopy(node)
                     node["commits"]["nodes"][0]["commit"].update(self.suite_counts(node["headRefOid"]))
                 data[f"{alias}{i}"] = {field: node}
@@ -236,9 +237,9 @@ class FakeGitHub:
     def suite_counts(self, sha: str, repo: str | None = None) -> dict:
         """A commit's checkSuites as SUITE_ATTEMPTS asks: each suite's check runs in its newest attempt and in all
         (only the suites of REPO when a suite names its "repo"; "more": True cuts the page past 100 suites)."""
-        if sha not in self.suites:
-            return {}
-        suites = [suite for suite in self.suites[sha] if repo is None or suite.get("repo", repo) == repo]
+        if self.suites_unread:
+            return {"checkSuites": None}
+        suites = [suite for suite in self.suites.get(sha, []) if repo is None or suite.get("repo", repo) == repo]
         return {"checkSuites": {"pageInfo": {"hasNextPage": any(suite.get("more") for suite in suites)}, "nodes": [
             {"id": suite["id"], "latest": {"totalCount": suite["latest"]}, "every": {"totalCount": len(suite["runs"])}}
             for suite in suites]}}
@@ -5403,6 +5404,32 @@ class HeadChecksTest(Base):
         self.daemon.tick(NOW + gg.CYCLE)
         data = gg.read_cache(key)["data"]
         self.assertNotIn(gg.check_verdict(data, "required"), (gg.EXIT_FAIL,))
+        self.assertEqual(gg.check_verdict(data, "green"), gg.EXIT_FAIL)
+
+    def test_an_unread_check_suites_field_is_an_error_not_a_greener_read(self) -> None:
+        # Review finding F2 on glaeda#1842 at 3af96afb: a null checkSuites beside an error hid nothing as "no suites".
+        self.gh.heads[("o", "r", SHA_A)] = [check_run("CI / build")]
+        self.gh.suites_unread = True
+        gg.register(self.key(SHA_A), consumer="autoland")
+        key = gg.parse_key("pr", "o/r#1")
+        self.gh.prs[("o", "r", 1)] = pr_node(1, rollup="SUCCESS", checks=[check_run("build")])
+        gg.register(key)
+        self.daemon.tick(NOW)
+        self.assertIn("check suites could not be read", gg.read_cache(self.key(SHA_A))["error"])
+        data = gg.read_cache(key)["data"]
+        self.assertIn("check suites could not be read", data["checksPageError"])
+        self.assertIsNone(gg.check_verdict(data, "green"))
+
+    def test_until_done_waits_for_running_checks_beside_a_recovered_red(self) -> None:
+        # Review finding F1 on glaeda#1842 at 3af96afb.
+        node = pr_node(1, rollup="PENDING", checks=[check_run("build", "IN_PROGRESS", None)])
+        self.gh.prs[("o", "r", 1)] = node
+        self.gh.suites[node["headRefOid"]] = [{"id": "S1", "latest": 0, "runs": [self.red_publish()]}]
+        key = gg.parse_key("pr", "o/r#1")
+        gg.register(key)
+        self.daemon.tick(NOW)
+        data = gg.read_cache(key)["data"]
+        self.assertIsNone(gg.check_verdict(data, "done"))
         self.assertEqual(gg.check_verdict(data, "green"), gg.EXIT_FAIL)
 
     def test_an_unknown_commit_is_missing_not_pending(self) -> None:
