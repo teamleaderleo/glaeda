@@ -5714,7 +5714,9 @@ def claim_reacquire(state_dir: Path, watch_pid: int, wait_s: float | None) -> tu
         write_claim_record(path, record)
     except OSError as error:
         return 1, f"cannot write the claim record ({type(error).__name__})"
-    bound = record["drain_bound"] if wait_s is None else max(0.0, wait_s)
+    # --claim-wait only shortens the job's own drain bound, never lengthens it
+    bound = record["drain_bound"] if wait_s is None or not math.isfinite(wait_s) \
+        else min(record["drain_bound"], max(0.0, wait_s))
     tier = record["tier"] if record["tier"] in (TIER_NIGHTLY, TIER_DEV, TIER_STACK) else ""
     start, since = time.monotonic(), time.time()
     marker = capacity_dir / f"{ADMIT_WANT}{os.getpid()}"
@@ -9677,7 +9679,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--forbid-env", action="append", default=[],
                    help="claim-release: a variable no process of the job may still have (its credentials' names)")
     p.add_argument("--claim-wait", type=float, default=None,
-                   help="claim-reacquire: seconds to wait for the whole Mac (default: the job's own drain bound)")
+                   help="claim-reacquire: seconds to wait for the whole Mac, at most the job's own drain bound (the default)")
     p.add_argument("--class", dest="step_class", choices=STEP_CLASSES, help="admit: the ci-step's class")
     p.add_argument("--job-key", help="admit, release: the ci-step's key (runner name, run id and attempt)")
     p.add_argument("--runner-dir", type=Path, help="listen: the runner directory whose run.sh the gate runs")
