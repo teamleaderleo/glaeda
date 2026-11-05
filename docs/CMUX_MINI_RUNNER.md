@@ -827,8 +827,11 @@ a run from main replaces the canary, so re-stage it afterwards if it should keep
 stamp names the HEAD the guard checked, never an untracked stamp or `release.json` beside the
 scripts; if the commit's stamp cannot be built, none is written. Running from an OTA release copy, which has no git checkout,
 needs `--allow-downgrade`. A shallow checkout fails closed: an older stamp beyond its history
-reads as not an ancestor, so fetch the full history (`git fetch --unshallow`). Automatic rollout
-on merge is proposed in #1385.
+reads as not an ancestor, so fetch the full history (`git fetch --unshallow`). A merge reaches
+the fleet without this command: `glaeda-update` brings every runner mini's staged copy and hook
+files to the installed release every 10 minutes ("Hook fixes roll out without `--apply`" above,
+and `docs/GLAEDA_OTA.md`). Run `--apply` for what that does not cover: new runners, labels,
+capacity, or a deliberate canary or rollback.
 
 The fleet is registered at org scope (section 2e2), so an apply names that scope. Without
 `--org`, the apply asks for the repository scope, finds each runner's org-scope receipt, and refuses

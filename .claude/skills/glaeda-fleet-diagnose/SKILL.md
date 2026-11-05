@@ -96,8 +96,11 @@ person use the Lawrence route for bounded host-process evidence; preserve the
 exact command and timestamp in the receipt.
 
 - Worker logs give each slot's job windows, so overlaps are visible after the fact.
-- `capacity/` holds the unit and token files of running jobs (`glaeda-cmux-runner-hook` CLASS_COST: a compile
-  costs 2 of 4 units plus the persistent-dd and root tokens).
+- `capacity/` holds the unit and token files of running jobs. Units are cores: a mini's total is its manifest
+  class's `capacityUnits`, and `glaeda-cmux-runner-hook` CLASS_COST prices each class (a compile takes 5 units
+  plus the persistent-dd and root tokens, an isolated job 4, light 2, gui 1 plus the gui and root tokens).
+  JOB_CORES overrides the units of individually measured jobs (a cmux-next `release-compile` takes 3). The job
+  record's `units` says what a job actually held.
 - `uptime` and `ps` show only now; the job record (step 2) is the history.
 
 ## Rules

@@ -31,6 +31,7 @@ glaeda-gh status pr OWNER/REPO#12 13 --field head,checks.state,checks.failed   #
 glaeda-gh status run OWNER/REPO/RUN_ID --jobs
 glaeda-gh status comment OWNER/REPO#N            # the latest comments
 glaeda-gh budget                                 # REST and GraphQL left, the daemon's own use, its heartbeat
+glaeda-gh runners OWNER[/REPO] [--label L] [--json]  # online, busy and idle self-hosted runners per label
 ```
 
 - `wait` exits 0 on success (or a matching comment), 1 on failure (including a PR closed without
@@ -63,6 +64,11 @@ glaeda-gh budget                                 # REST and GraphQL left, the da
   when an optional check never finishes. The headline (`checks SUCCESS: ...`) is the verdict
   `wait` used; when GitHub's own rollup differs, the line says so. Attempts a newer attempt or
   run replaced are listed as `superseded` and not counted.
+- A check reads as its last real attempt left it. An attempt that ended in `startup_failure` ran
+  no jobs, so it is no result and never green: when a check suite's newest attempt ran nothing
+  but an older one ran something, the older attempt's check runs decide (glaeda#1842). GitHub's
+  own rollup shows only the newest attempt, so a red can vanish there after a rerun that failed
+  to start; `wait` and `status` keep it.
 - `wait` only rules on data fetched after it started. For a run wait on a configured controller, the
   client makes one bounded long-poll request to the existing run endpoint (up to 300 seconds), then
   uses the normal cache verdict path; unknown or unavailable controllers fall back to the daemon's

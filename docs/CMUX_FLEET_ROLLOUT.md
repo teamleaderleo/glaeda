@@ -1,6 +1,10 @@
 # cmux fleet rollout: merged means deployed
 
-Status: design. Owner issue: #149 (automated updates with canary checks and rollback).
+Status: superseded by [`GLAEDA_OTA.md`](GLAEDA_OTA.md), which now owns #149: every merge to `main`
+is released, canaried, promoted and pulled by `glaeda-update` on every host every 10 minutes,
+including the runner minis' staged copy and hook files. This page is the September design record;
+only "Recovery route for a paused runner" below is still a current procedure.
+Original status: design. Owner issue: #149 (automated updates with canary checks and rollback).
 Builds on [host reconciliation](HOST_RECONCILIATION.md), [fleet distribution](FLEET_DISTRIBUTION.md),
 the mini-fleet manifest, host reservations (`scripts/glaeda_reservation.py`), and the journaled
 service updater (`src/disposable_launchd_service/upgrade.rs`, #1131).

@@ -1,9 +1,13 @@
-# Fleet compilation-cache prototype
+# Fleet compilation cache (fleet-cas)
 
-Throwaway measurement tool for the fleet-shared compilation cache experiment
-([`docs/experiments/fleet-compilation-cache-2026-09-23.md`](../../docs/experiments/fleet-compilation-cache-2026-09-23.md)).
-It is not part of the `glaeda` crate, is not built by `scripts/verify`, and is
-not a supported service.
+The production fleet compilation cache for the cmux runner minis. It began as the
+measurement tool for the fleet-shared compilation cache experiment
+([`docs/experiments/fleet-compilation-cache-2026-09-23.md`](../../docs/experiments/fleet-compilation-cache-2026-09-23.md)),
+which is why the directory keeps the name `fleet-cas-prototype`. It is its own crate,
+not part of `glaeda`: the Verify workflow tests it, every release publishes its prebuilt
+bundle (`scripts/fleet_cas_bundle.py`), and `scripts/glaeda-fleet-cas` installs it on a mini as
+the node, writer, store and relay services (design:
+[`docs/CMUX_BUILD_SLOT_MODES.md`](../../docs/CMUX_BUILD_SLOT_MODES.md)).
 
 It serves the two gRPC services Xcode's `COMPILATION_CACHE_REMOTE_SERVICE_PATH`
 talks to, from swiftlang/llvm-project
@@ -142,7 +146,7 @@ DerivedData; see the 2026-09-24 experiment. On a cmux build fleet mini,
 `scripts/with-fleet-lock.pl` keeps the fleet worker from starting a job
 during a measurement.
 
-Known prototype gaps: the node daemon must run on the same host as the build
+Known gaps: the node daemon must run on the same host as the build
 (the client sends large blobs as local file paths, and the node reads whatever
 path it is given, so run it only for your own user; the TCP fleet store
 refuses file-path uploads); object uploads are gated only by the peer address

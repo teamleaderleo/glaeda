@@ -11,7 +11,7 @@ mini. Keep changes small, observable and reversible.
 ## Before editing
 
 - Read `AGENTS.md` and the contract doc for the surface: `docs/CMUX_MINI_RUNNER.md` (hook, runner, capacity,
-  telemetry), `docs/FLEET_STATUS.md` (status sources and findings), `docs/CMUX_FLEET_ROLLOUT.md` (deploys).
+  telemetry), `docs/FLEET_STATUS.md` (status sources and findings), `docs/GLAEDA_OTA.md` (deploys).
 - Work in your own worktree from `origin/main` (`~/.local/bin/glaeda-worktree add --no-build <glaeda checkout> NAME origin/main`,
   then `git switch -c BRANCH`). The main checkout may be in use by fleet jobs.
 - Never cap GUI capture concurrency with a fixed runner or unit count; gate it on measured CPU and memory
@@ -78,7 +78,13 @@ active, unmerged canary by design, so re-stage the canary afterwards if it shoul
 copy (no git checkout) needs `--allow-downgrade`. A shallow checkout fails closed (an older stamp reads as not an
 ancestor): `git fetch --unshallow` first.
 `glaeda-fleet-status` reports members whose stamp is behind or off origin/main (`tooling.behind`,
-`tooling.not_ancestor`). Automatic rollout on merge is proposed in #1385.
+`tooling.not_ancestor`).
+
+A merged hook or runner change needs no `--apply`: `glaeda-update` (`docs/GLAEDA_OTA.md`) brings every
+runner mini's `~/glaeda-runner/scripts` copy and the runners' hook files to the installed release every 10
+minutes, swapping a busy runner's hook in its next gap between jobs. Use `--apply` for new runners, labels or
+capacity, and for a deliberate canary or rollback. A hook installed from a newer commit or edited by hand is
+kept, not downgraded.
 
 job-started.sh runs the hook file fresh for every job, so a staged hook takes effect for the next job without a
 restart. After the canary, run a job there and check the new behavior on the host (for telemetry:

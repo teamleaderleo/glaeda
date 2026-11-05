@@ -16,25 +16,51 @@ and avoids initializing Ghostty on no-build machines. Run `~/.local/bin/glaeda-p
 report before reorganizing older checkouts. In zsh, `"$var:refs/..."` applies the `:r` modifier;
 write `"${var}:refs/..."` in scripts and one-liners.
 
+Most current work is the fleet track in `scripts/`:
+
+| Work surface | Read next |
+| --- | --- |
+| Waiting on CI, PR checks, runs or comments | `skills/github-ci-wait/SKILL.md` (`glaeda-gh`) |
+| cmux runner, job hook, capacity ledger, runner rollout | `docs/CMUX_MINI_RUNNER.md` and `.claude/skills/glaeda-runner-change` |
+| A slow, stuck or refused fleet job; fleet health | `docs/FLEET_STATUS.md` and `.claude/skills/glaeda-fleet-diagnose` |
+| Fleet operator commands (status, disk, runners, seeds) | `docs/FLEET_OPERATIONS.md` |
+| Where a cmux job runs (`glaeda-route`) | `docs/GLAEDA_ROUTE.md` |
+| Releases and host updates (`glaeda-update`, deploys) | `docs/GLAEDA_OTA.md` |
+| Disk and checkout hygiene (`glaeda-disk`, `glaeda-projects`, `glaeda-worktree`) | `docs/DEVBOX_DISK_AND_PROJECTS.md` |
+
+The paused Rust/Lima runtime track (`src/`, `docs/ROADMAP.md`):
+
 | Work surface | Read next |
 | --- | --- |
 | Hostile/disposable execution | `docs/THREAT_MODEL.md` plus applicable `docs/DISPOSABLE_*.md` |
 | Residency, reuse, cache, performance | `docs/BLAZINGLY_HOT.md` plus the owning issue |
 | Workspace bootstrap | `docs/WORKSPACE_BOOTSTRAP.md` |
 | Ownership, persistence, mutation, recovery, subprocesses, physical experiments | `docs/AGENT_EXECUTION_SAFETY.md` |
-| Delegation and multi-agent work | `docs/AGENT_COORDINATION.md` |
 | Lease transitions | `docs/adr/0004-lease-lifecycle-core.md` |
 | Adding, exporting, or retiring a public module | `docs/MODULE_INVENTORY.md` (generated; do not hand-edit) |
+
+`docs/AGENT_COORDINATION.md` is an older delegation protocol; read it only when a task
+hands work to another agent.
 
 Changing coordination belongs in current issues and PRs. Keep broad document
 preloading out of the normal startup path.
 
 ## Product boundary
 
-Glaeda is a Rust compute runtime with three execution classes: hostile/unknown,
-trusted repeatable, and ultra-trusted resident. GitHub Actions remains the normal
-workflow scheduler and check surface; Glaeda owns compute-side admission,
-lifecycle, reusable-state policy, and recovery.
+Glaeda runs trust-tiered work on operator-controlled compute: today the cmux Mac
+mini runner fleet, its routing, OTA updates and host hygiene; the paused Rust runtime
+defines three execution classes:
+
+- Hostile/unknown work: one fresh isolated Linux worker, one bounded job, exact teardown.
+- Trusted CI: prepared workers and reviewed reusable generations with a clean job boundary.
+- Ultra-trusted project work: resident project state under explicit lease, validity, reset,
+  and revalidation rules.
+
+GitHub Actions remains the scheduler, workflow language and check surface; Glaeda
+owns compute-side admission, execution policy, identity, lifecycle, reusable-state
+policy, and recovery. Do not build a new pipeline language, runner protocol,
+container/hypervisor runtime, Kubernetes controller, public multi-tenant platform,
+or generic cloud scheduler.
 
 Product details live in `README.md` and `docs/COMPUTE_RUNTIME.md`.
 
@@ -106,6 +132,28 @@ Documentation-only changes follow the repository docs-only policy. Record when
 GitHub's normal Verify workflow is intentionally absent for Markdown/`docs/**`
 changes.
 
+## Work rules
+
+- Hostile jobs receive no host integrations or unrelated secrets; constrain
+  network and resources, and destroy useful hostile writable persistence after
+  the job.
+- Every hot-state family needs canonical rebuild inputs and bounded reset,
+  revalidation and eviction. Losing hot state may cost time, never truth.
+- Invalid or irreversible mutation plans fail before the first executor call.
+  Mutations need exact ownership, plan/dry-run behavior, rollback or accurately
+  named compensation, and fresh post-action evidence.
+- Use absolute executable paths and argument vectors; child environments start
+  empty and receive only allowlisted values.
+- Tests must not require privileged or physical infrastructure unless explicitly
+  isolated and opted into. Planning must not mutate host, GitHub, fleet,
+  provider, release, or durable state.
+- Measure complete comparable loops: baseline and candidate identity, fixed work,
+  semantic validation, latency, resource and storage effects, and reset/fallback.
+  Physical experiments need explicit boundaries and cleanup/rebuild evidence.
+- Prefer mature OS, filesystem, service-manager and runtime primitives. Add
+  dependencies or competing control machinery only for a measured gap.
+- Never upgrade a failed or blocked result into a pass.
+
 ## Finish
 
 - Complete work in the active session or leave one exact durable blocked
@@ -117,8 +165,9 @@ changes.
 - Low-risk repository edits may use self-review. Privilege, ownership/adoption,
   persistence/recovery, rollback, secrets, concurrency, and destructive changes
   use the independent review required by their owning contract.
-- Ordinary repository writes and merges follow repository authority and the
-  expected reviewed head. An explicitly authorized task may perform a named,
+- Merge only the reviewed expected head when GitHub reports it mergeable and
+  required checks pass. Ordinary repository writes and merges follow repository
+  authority and that head. An explicitly authorized task may perform a named,
   host-scoped service, network, or cleanup mutation when it records the exact
   scope, bounded command, receipt, and fresh post-state verification. That
   authorization does not widen credentials or access, approve material spend,
