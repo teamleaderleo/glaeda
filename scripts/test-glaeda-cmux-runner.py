@@ -41,6 +41,8 @@ WORKER_STEP_EXIT = "runner-worker-step-exit "  # the Runner.Worker stand-in's la
 # Where the hook looks for leftover processes in canonical roots (settle_root): nowhere real, so no test run
 # stops a process in this machine's own /private/tmp/cmux-ci. test_taking_a_root_stops_its_leftovers sets its own.
 NO_ROOTS = "/nonexistent/glaeda-test-canonical-roots"
+# Stands in for a credential: plainly fake, so no secret scanner matches it, and tests assert it is never printed.
+NOT_A_KEY = "TEST-NOT-A-KEY"
 
 
 def load(name: str, path: Path):
@@ -2604,7 +2606,7 @@ class HookTest(unittest.TestCase):
             beside = self.job("swift-package-tests", "s1", 14, None, "--gui-wait", "0")
             self.assertEqual(beside.returncode, 1, beside.stdout + beside.stderr)
             key = self.dir / "AuthKey_TEST.p8"
-            key.write_text("-----BEGIN PRIVATE KEY-----\n")
+            key.write_text(f"{NOT_A_KEY}\n")  # only its presence matters
             nothing = self.claim("claim-release", "s0")
             self.assertEqual(nothing.returncode, 2, nothing.stdout + nothing.stderr)
             kept = self.claim("claim-release", "s0", "--removed", os.fspath(key))
@@ -2613,11 +2615,11 @@ class HookTest(unittest.TestCase):
             self.assertFalse(self.whole_mini_free(), "a key file still on disk keeps the claim")
             key.unlink()
             proof = ("--removed", os.fspath(key), "--forbid-env", "ASC_API_KEY_P8_BASE64")
-            kept = self.claim("claim-release", "s0", *proof, env={"ASC_API_KEY_P8_BASE64": "c2VjcmV0LWtleQ=="})
+            kept = self.claim("claim-release", "s0", *proof, env={"ASC_API_KEY_P8_BASE64": NOT_A_KEY})
             self.assertEqual(kept.returncode, 1, kept.stdout + kept.stderr)
             self.assertIn("still has a credential in its environment", kept.stderr)
             self.assertIn("ASC_API_KEY_P8_BASE64", kept.stderr)
-            self.assertNotIn("c2VjcmV0LWtleQ==", kept.stdout + kept.stderr, "the value is never printed")
+            self.assertNotIn(NOT_A_KEY, kept.stdout + kept.stderr, "the value is never printed")
             self.assertFalse(self.whole_mini_free(), "a credential still in a job process's environment keeps the claim")
             (state / hook.CLAIM_RELEASE_OFF).touch()
             kept = self.claim("claim-release", "s0", *proof)
