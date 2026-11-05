@@ -146,8 +146,10 @@ the default); it is kept in `update.json` as `source` the same way.
 
 The Manaflow minis install from [manaflow-ai/glaeda](https://github.com/manaflow-ai/glaeda), a fork
 of this repository in the Manaflow organization, so the fleet does not depend on a personal
-repository. Changes merge only here; the sync fast-forwards the fork's `main` to match. Releases,
-attestations and promotions also happen only in this repository.
+repository. Changes merge only here, and the sync keeps the fork's `main` equal to this one
+(Sync of `main`, below: usually a fast-forward; a divergence becomes a merge commit or, on a
+conflict, a tracking issue). Releases, attestations and promotions also happen only in this
+repository.
 
 **The fork's `main` takes no merges.** Its ruleset 26619652 ("main: deploy keys only") blocks
 every update to `main` except a push made with a deploy key. A pull request opened in the fork
