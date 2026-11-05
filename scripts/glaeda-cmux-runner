@@ -2288,8 +2288,9 @@ def sync_dir(path: Path) -> None:
 # signs them. It never changes what is admitted: the hook and the claim gate are untouched, and a commit that lists
 # neither hook is refused as before. The hold ends when every active run lists the new hook, or SIGN_HOLD_CAP_S after
 # its first deferral of that hook (installed then, with a loud line), so a rollout can never be held for good.
-# Reads are anonymous (the minis have no gh): one runs list, then one raw read per head commit, cached in the state
-# file (a commit's list never changes) and memoised for SIGN_HOLD_MEMO_S, inside the 60/h unauthenticated limit. A read
+# Reads are anonymous (the minis have no gh): one runs list per active status (five, more only past 100 runs of one),
+# then one raw read per head commit, cached in the state file (a commit's list never changes), all memoised for
+# SIGN_HOLD_MEMO_S and made only while a signing runner has a new hook pending: inside the 60/h unauthenticated limit. A read
 # that fails holds nothing: the refresh installs as it did before this hold existed (fail-open by design) and says so.
 SIGN_HOLD_REPO = "manaflow-ai/cmux"
 SIGN_HOLD_RUNS_URL = ("https://api.github.com/repos/{repo}/actions/workflows/nightly.yml/runs"
@@ -2334,27 +2335,32 @@ def sign_hold_fetch(url: str) -> str | None:
 
 
 def sign_hold_runs() -> list[dict] | None:
-    """The active nightly.yml runs on nightly-next, newest first, or None when they cannot all be read. Pages are read
-    (newest first) until one ends on a finished run; more than SIGN_HOLD_PAGES pages of active runs is no answer."""
-    active: list[dict] = []
-    for page in range(1, SIGN_HOLD_PAGES + 1):
-        body = sign_hold_fetch(SIGN_HOLD_RUNS_URL.format(repo=SIGN_HOLD_REPO) + f"&page={page}")
-        try:
-            runs = json.loads(body)["workflow_runs"] if body is not None else None
-        except (ValueError, KeyError, TypeError):
-            runs = None
-        if not isinstance(runs, list) or not all(isinstance(run, dict) for run in runs):
+    """The active nightly.yml runs on nightly-next, or None when they cannot all be read. GitHub lists runs by creation
+    time, not status, so an old queued run can sit behind newer finished ones (2026-11-05: five runs queued for hours
+    while every newer one was cancelled). So each active status is listed on its own with `status=`: every run on such
+    a page is active, and a status is read whole once a page comes back short. More than SIGN_HOLD_PAGES pages of one
+    status is no answer (glaeda#1852)."""
+    active: dict[int, dict] = {}
+    for status in sorted(SIGN_HOLD_ACTIVE):
+        for page in range(1, SIGN_HOLD_PAGES + 1):
+            body = sign_hold_fetch(SIGN_HOLD_RUNS_URL.format(repo=SIGN_HOLD_REPO) + f"&status={status}&page={page}")
+            try:
+                runs = json.loads(body)["workflow_runs"] if body is not None else None
+            except (ValueError, KeyError, TypeError):
+                runs = None
+            if not isinstance(runs, list) or not all(isinstance(run, dict) for run in runs):
+                return None
+            for run in runs:
+                rid, sha = run.get("id"), str(run.get("head_sha") or "")
+                if not isinstance(rid, int) or isinstance(rid, bool) or not re.fullmatch(r"[0-9a-f]{40}", sha):
+                    return None  # malformed run data is an unreadable answer, never a crash
+                if run.get("status") in SIGN_HOLD_ACTIVE:  # a run that finished between two reads holds nothing
+                    active[rid] = {"id": rid, "head_sha": sha}
+            if len(runs) < SIGN_HOLD_PAGE_SIZE:
+                break
+        else:
             return None
-        for run in runs:
-            if run.get("status") not in SIGN_HOLD_ACTIVE:
-                continue
-            rid, sha = run.get("id"), str(run.get("head_sha") or "")
-            if not isinstance(rid, int) or isinstance(rid, bool) or not re.fullmatch(r"[0-9a-f]{40}", sha):
-                return None  # malformed run data is an unreadable answer, never a crash
-            active.append({"id": rid, "head_sha": sha})
-        if len(runs) < SIGN_HOLD_PAGE_SIZE or runs[-1].get("status") not in SIGN_HOLD_ACTIVE:
-            return active  # the last page, or one that ends on a finished run: older runs are finished too
-    return None
+    return sorted(active.values(), key=lambda run: -run["id"])
 
 
 def sign_hold_blockers(digest: str, cache: dict[str, bool]) -> list[tuple[int, str]] | None:

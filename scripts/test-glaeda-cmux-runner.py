@@ -31,6 +31,7 @@ import tempfile
 import threading
 import time
 import unittest
+import urllib.parse
 from pathlib import Path
 from unittest import mock
 
@@ -10878,6 +10879,16 @@ class RunnerTest(unittest.TestCase):
         self.addCleanup(memo.stop)
         return hooks
 
+    @staticmethod
+    def runs_page(url: str, runs: list[tuple[int, str, str]]) -> str:
+        """GitHub's runs list as the API pages it: newest first by creation, filtered by `status=`, 100 a page."""
+        query = urllib.parse.parse_qs(urllib.parse.urlsplit(url).query)
+        status, page = query.get("status", [None])[0], int(query.get("page", ["1"])[0])
+        chosen = [r for r in sorted(runs, key=lambda r: -r[0]) if status is None or r[1] == status]
+        size = cr.SIGN_HOLD_PAGE_SIZE
+        return json.dumps({"workflow_runs": [{"id": i, "status": st, "head_sha": sha}
+                                             for i, st, sha in chosen[(page - 1) * size:page * size]]})
+
     def github(self, runs: list[tuple[int, str, str]], lists: dict[str, str] | None, fail: str = ""):
         """A fake anonymous GitHub: runs [(id, status, head sha)], lists {sha: glaeda-signing-hooks.txt}; a url
         containing fail answers None. Returns the reads it was asked for."""
@@ -10888,7 +10899,7 @@ class RunnerTest(unittest.TestCase):
             if fail and fail in url:
                 return None
             if "/actions/workflows/nightly.yml/runs" in url:
-                return json.dumps({"workflow_runs": [{"id": i, "status": st, "head_sha": sha} for i, st, sha in runs]})
+                return self.runs_page(url, runs)
             sha = url.split("/")[-4]
             return (lists or {}).get(sha)
 
@@ -10915,12 +10926,14 @@ class RunnerTest(unittest.TestCase):
         self.assertNotIn("41982716550", done["note"])
         self.assertEqual((hooks / cr.HOOK_NAME).read_text(), self.OLDER_HOOK)
         self.assertFalse(any(hooks.glob("*" + cr.NEXT_SUFFIX)) or (hooks / cr.NEXT_RECORD).exists(), "nothing staged")
-        self.assertEqual(len(reads), 3, "one runs list, one list read per active head commit, none for a finished run")
-        # a commit's list is cached: the next refresh (past the memo) reads only the runs list
+        statuses = len(cr.SIGN_HOLD_ACTIVE)
+        self.assertEqual(len(reads), statuses + 2,
+                         "a runs list per active status, one list read per active head commit, none for a finished run")
+        # a commit's list is cached: the next refresh (past the memo) reads only the runs lists
         cr._SIGN_HOLD_MEMO.clear()
         reads.clear()
         self.assertEqual(self.invoke("--refresh-hooks", "--apply")["runners"][0]["state"], "deferred")
-        self.assertEqual(len(reads), 1)
+        self.assertEqual(len(reads), statuses)
 
     def test_sign_hold_installs_once_every_active_run_lists_the_new_hook(self) -> None:
         hooks = self.signing_install()
@@ -10964,31 +10977,34 @@ class RunnerTest(unittest.TestCase):
         self.assertEqual((hooks / cr.HOOK_NAME).read_bytes(), HOOK.read_bytes())
         self.assertEqual(reads, [], "a runner that does not sign reads nothing")
 
-    def test_sign_hold_reads_every_page_of_active_runs(self) -> None:
+    def test_sign_hold_finds_an_old_queued_run_behind_newer_finished_ones(self) -> None:
+        """glaeda#1852: GitHub lists runs by creation time, not status. A queued run older than a full page of newer
+        finished runs (2026-11-05: old runs queued for hours while each newer one was cancelled) still holds the hook."""
+        hooks = self.signing_install()
+        finished = [(2000 + i, "completed", "c" * 40) for i in range(cr.SIGN_HOLD_PAGE_SIZE)]
+        reads = self.github([(7, "queued", self.OLD_SHA), *finished], {self.OLD_SHA: f"{self.older_digest()} old\n"})
+        done = self.invoke("--refresh-hooks", "--apply")["runners"][0]
+        self.assertEqual(done["state"], "deferred")
+        self.assertIn("run 7 at aaaaaaaaaaaa", done["note"])
+        self.assertEqual((hooks / cr.HOOK_NAME).read_text(), self.OLDER_HOOK)
+        self.assertTrue(all("status=" in u for u in reads if "/runs" in u), "every runs list filters by status")
+
+    def test_sign_hold_reads_every_page_of_one_status(self) -> None:
         self.signing_install()
-        full = [(1000 + i, "queued", self.NEW_SHA) for i in range(cr.SIGN_HOLD_PAGE_SIZE)]
-        pages = {1: full, 2: [(7, "queued", self.OLD_SHA), (6, "completed", "c" * 40)]}
-        reads: list[str] = []
-
-        def fetch(url: str) -> str | None:
-            reads.append(url)
-            if "/runs" in url:
-                page = int(url.rsplit("&page=", 1)[1])
-                return json.dumps({"workflow_runs": [{"id": i, "status": st, "head_sha": sha}
-                                                     for i, st, sha in pages.get(page, full)]})
-            return {self.OLD_SHA: f"{self.older_digest()} old\n",
-                    self.NEW_SHA: f"{self.older_digest()} old\n{self.new_digest()} new\n"}[url.split("/")[-4]]
-
-        with mock.patch.object(cr, "sign_hold_fetch", fetch):
-            done = self.invoke("--refresh-hooks", "--apply")["runners"][0]
-            self.assertEqual(done["state"], "deferred")
-            self.assertIn("run 7 at aaaaaaaaaaaa", done["note"])
-            self.assertEqual(sum("/runs" in u for u in reads), 2)
-            # more pages of active runs than it reads is no answer: it installs (fail-open)
-            pages.clear()
-            cr._SIGN_HOLD_MEMO.clear()
-            with contextlib.redirect_stderr(io.StringIO()):
-                self.assertEqual(self.invoke("--refresh-hooks", "--apply")["runners"][0]["state"], "updated")
+        runs = [(1000 + i, "queued", self.NEW_SHA) for i in range(cr.SIGN_HOLD_PAGE_SIZE)] + [(7, "queued", self.OLD_SHA)]
+        reads = self.github(runs, {self.OLD_SHA: f"{self.older_digest()} old\n",
+                                   self.NEW_SHA: f"{self.older_digest()} old\n{self.new_digest()} new\n"})
+        done = self.invoke("--refresh-hooks", "--apply")["runners"][0]
+        self.assertEqual(done["state"], "deferred")
+        self.assertIn("run 7 at aaaaaaaaaaaa", done["note"])
+        self.assertEqual(sum("status=queued" in u for u in reads), 2)
+        # more pages of one status than it reads is no answer: it installs (fail-open)
+        cr._SIGN_HOLD_MEMO.clear()
+        self.github([(5000 + i, "queued", self.NEW_SHA) for i in range(cr.SIGN_HOLD_PAGE_SIZE * cr.SIGN_HOLD_PAGES)],
+                    {self.NEW_SHA: f"{self.older_digest()} old\n"})
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            self.assertEqual(self.invoke("--refresh-hooks", "--apply")["runners"][0]["state"], "updated")
+        self.assertIn("fail-open", err.getvalue())
 
     def test_sign_hold_takes_malformed_run_data_as_unreadable(self) -> None:
         hooks = self.signing_install()
