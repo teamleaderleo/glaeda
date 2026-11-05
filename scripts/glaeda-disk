@@ -6827,20 +6827,29 @@ def renamed_alternates(path: Path, doomed: Path):
     borrows from repositories/<pkg> by absolute path, so after the rename git could not read the checkout
     (cmuxs-3 ~/cnx-hybrid, 2026-11-05). Only stores that exist below doomed are added; nothing on disk changes."""
     old, new = os.fspath(path) + "/", os.fspath(doomed) + "/"
+    real_new = os.path.realpath(doomed) + "/"
     stores: list[str] = []
     budget = ALTERNATES_WALK_BUDGET
-    for dirpath, dirnames, filenames in os.walk(doomed):
-        budget -= len(dirnames) + len(filenames)
-        if budget < 0:
-            break
-        if dirpath.endswith("/objects/info") and "alternates" in filenames:
-            try:
-                lines = Path(dirpath, "alternates").read_text().splitlines()
-            except OSError:
-                continue
-            for ln in (x.strip() for x in lines):
-                if ln.startswith(old) and os.path.isdir(moved := new + ln[len(old):]) and moved not in stores:
-                    stores.append(moved)
+    try:
+        for dirpath, dirnames, filenames in os.walk(doomed):
+            budget -= len(dirnames) + len(filenames)
+            if budget < 0:
+                break
+            if dirpath.endswith("/objects/info") and "alternates" in filenames:
+                try:
+                    lines = Path(dirpath, "alternates").read_text().splitlines()
+                except (OSError, ValueError):  # unreadable or not text: that checkout stays unreadable, kept
+                    continue
+                for ln in (x.strip() for x in lines):
+                    if not ln.startswith(old):
+                        continue
+                    moved = new + ln[len(old):]
+                    # only a store that really is below the renamed tree: no "..", no symlink out of it
+                    if os.path.isdir(moved) and (os.path.realpath(moved) + "/").startswith(real_new) \
+                            and moved not in stores:
+                        stores.append(moved)
+    except (OSError, ValueError):
+        stores = []  # the recheck runs without them and, failing to read a checkout, puts the tree back
     saved = os.environ.get("GIT_ALTERNATE_OBJECT_DIRECTORIES")
     if stores:
         os.environ["GIT_ALTERNATE_OBJECT_DIRECTORIES"] = os.pathsep.join([*stores, *([saved] if saved else [])])

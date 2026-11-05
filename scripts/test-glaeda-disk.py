@@ -7995,6 +7995,25 @@ class LinuxLayoutTest(unittest.TestCase):
         self.assertEqual(rec["outcome"], "reclaimed", (rec["reasons"], err))
         self.assertFalse(unit.exists())
 
+    def test_renamed_alternates_ignore_undecodable_files_and_stores_outside_the_tree(self) -> None:
+        """Review of #1881: a non-UTF-8 alternates file must not crash the recheck after the rename, and a path that
+        leaves the renamed tree (.., a symlink) is never offered."""
+        old, doomed = self.home / "item", self.home / "aside"
+        outside = self.home / "outside/objects"
+        outside.mkdir(parents=True)
+        (doomed / "a/.git/objects/info").mkdir(parents=True)
+        (doomed / "b/.git/objects/info").mkdir(parents=True)
+        (doomed / "store/objects").mkdir(parents=True)
+        (doomed / "link").symlink_to(self.home / "outside")
+        (doomed / "a/.git/objects/info/alternates").write_bytes(b"\xff\xfe\x00bad")
+        (doomed / "b/.git/objects/info/alternates").write_text(
+            f"{old}/../outside/objects\n{old}/link/objects\n{old}/store/objects\n")
+        saved = os.environ.pop("GIT_ALTERNATE_OBJECT_DIRECTORIES", None)
+        self.addCleanup(lambda: saved is not None and os.environ.__setitem__("GIT_ALTERNATE_OBJECT_DIRECTORIES", saved))
+        with gd.renamed_alternates(old, doomed):
+            self.assertEqual(os.environ.get("GIT_ALTERNATE_OBJECT_DIRECTORIES"), f"{doomed}/store/objects")
+        self.assertNotIn("GIT_ALTERNATE_OBJECT_DIRECTORIES", os.environ)
+
     def test_a_tree_the_rename_recheck_puts_back_says_why_in_its_receipt(self) -> None:
         unit, _, _ = self.mirror_unit()
         with mock.patch.object(gd, "mirror_rename_recheck",
