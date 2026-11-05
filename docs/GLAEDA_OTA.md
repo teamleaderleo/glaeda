@@ -146,12 +146,16 @@ the default); it is kept in `update.json` as `source` the same way.
 
 The Manaflow minis install from [manaflow-ai/glaeda](https://github.com/manaflow-ai/glaeda), a fork
 of this repository in the Manaflow organization, so the fleet does not depend on a personal
-repository. Both repositories take pull requests, and their `main` branches are kept equal in both
-directions. Releases, attestations and promotions still happen only in this repository.
+repository. Changes merge only here; the sync fast-forwards the fork's `main` to match. Releases,
+attestations and promotions also happen only in this repository.
 
-**Anything merged to either `main` ships to the fleet.** A merge in the fork reaches this
-repository's `main` within a minute or two (Sync of `main`, below; until the fork has
-its dispatch token, when this repository's sync next runs), and every push to this `main` is released as above:
+**The fork's `main` takes no merges.** Its ruleset 26619652 ("main: sync bot only") blocks every
+update to `main` except a deploy-key push, which is the sync's. A pull request opened in the fork
+still runs Verify but cannot merge ("Cannot update this protected ref."): merge it here instead.
+On 11-04 two pull requests merged straight into the fork's `main` and stalled the sync for about
+20 hours on a conflict.
+
+**Anything merged to `main` ships to the fleet.** Every push to this `main` is released as above:
 canary hosts install it within about an hour, and the minis (stable) after the 15-minute canary
 window once both required host statuses are healthy. There is no separate approval step after the merge. To hold a release
 back, pause the rollout (`control.yml`, below).
@@ -188,7 +192,7 @@ back, pause the rollout (`control.yml`, below).
   at a commit is its check of record in both repositories, and `glaeda-gh checks teamleaderleo/glaeda
   SHA` reads the fork's checks for that commit too. Opening a pull request in the
   fork keeps its Verify on Blacksmith as well. `release.yml`, `promote.yml` and `control.yml` run only here. The
-  fork's `main` takes changes only through pull requests and the sync's deploy key. A deploy-key
+  fork's `main` takes changes only through the sync's deploy key (ruleset 26619652). A deploy-key
   push starts the fork's push workflows, so gate every new push-triggered workflow (or its jobs)
   with `github.repository == 'teamleaderleo/glaeda'`.
 - **Releases and rings.** `.github/workflows/mirror.yml` runs only in the fork, every 15 minutes
