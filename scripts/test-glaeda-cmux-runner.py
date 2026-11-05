@@ -2613,7 +2613,7 @@ class HookTest(unittest.TestCase):
             self.assertEqual(nothing.returncode, 2, nothing.stdout + nothing.stderr)
             kept = self.claim("claim-release", "s0", "--removed", os.fspath(key))
             self.assertEqual(kept.returncode, 1, kept.stdout + kept.stderr)
-            self.assertIn(f"still present, so the job keeps the whole Mac: {key}", kept.stderr)
+            self.assertIn(f"still present or not checkable, so the job keeps the whole Mac: {key}", kept.stderr)
             self.assertFalse(self.whole_mini_free(), "a key file still on disk keeps the claim")
             key.unlink()
             proof = ("--removed", os.fspath(key), "--forbid-env", "ASC_API_KEY_P8_BASE64")

@@ -5575,6 +5575,18 @@ def job_environment_holders(owner_pid: int, names: set[str]) -> list[tuple[int, 
     return found
 
 
+def path_proven_absent(path: str) -> bool:
+    """True only when lstat says the path does not exist (ENOENT); a path that cannot be checked (EACCES, an I/O error,
+    a component that is not a directory) is not proven gone."""
+    try:
+        os.lstat(path)
+    except FileNotFoundError:
+        return True
+    except (OSError, ValueError):
+        return False
+    return False
+
+
 def claim_owner_refusal(record: dict[str, Any] | None, owner: JobOwner | None) -> str | None:
     if owner is None:
         return "not inside a runner job (no Runner.Worker with a start token above this step)"
@@ -5638,9 +5650,9 @@ def claim_release(state_dir: Path, watch_pid: int, removed: list[str], forbid_en
         # while it sleeps other jobs run as this user and could rewrite the code in its _work that it runs with the key
         # after claim-reacquire; on a trusted-only runner (--trusted-ref) every such job is merged trusted code
         return 1, "claim release needs a trusted-only runner (--trusted-ref); the job keeps the whole Mac"
-    left = [p for p in removed if os.path.lexists(p)]
+    left = [p for p in removed if not path_proven_absent(p)]
     if left:
-        return 1, f"still present, so the job keeps the whole Mac: {', '.join(left[:8])}"
+        return 1, f"still present or not checkable, so the job keeps the whole Mac: {', '.join(left[:8])}"
     if forbid_env:
         holders = job_environment_holders(owner.pid, set(forbid_env))
         if holders is None:
