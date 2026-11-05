@@ -2870,6 +2870,26 @@ class HookTest(unittest.TestCase):
         state, path = self.claim_fixture(state="released")
         self.assertEqual(hook.sleeping_owners(state), {os.getpid()}, "a sane record is still honoured")
 
+    def test_claim_wait_never_outlasts_the_recorded_drain_bound(self) -> None:
+        """CLAIM_SLEEP review F4: --claim-wait only shortens the reacquire's wait. A larger value is cut to the job's
+        recorded drain bound, so its marker never holds the gates past the bound."""
+        state, path = self.claim_fixture(state="released", drain_bound=5.0)
+        clock = [1000.0]
+
+        def sleep(seconds: float) -> None:
+            clock[0] += seconds
+            if clock[0] - 1000.0 > 60:
+                raise AssertionError("the reacquire waited past the recorded drain bound")
+
+        with mock.patch.dict(os.environ, {"RUNNER_NAME": "c0"}), \
+                mock.patch.object(hook, "take_capacity", return_value=(False, "capacity: busy")), \
+                mock.patch.object(hook.time, "monotonic", side_effect=lambda: clock[0]), \
+                mock.patch.object(hook.time, "sleep", side_effect=sleep):
+            code, why = hook.claim_reacquire(state, os.getpid(), 10 ** 6)
+        self.assertEqual(code, 1, why)
+        self.assertLessEqual(clock[0] - 1000.0, 5.0 + hook.ADMIT_POLL_S)
+        self.assertEqual(hook.read_claim_record(path)["state"], "released")
+
     def signing_hooks(self, *shas: str) -> tuple[dict, str]:
         """A glaeda-signing-hooks.txt at manaflow-ai/cmux@SHA listing these hook shas, served through
         GLAEDA_SIGNING_HOOKS_URL as cmux's claim gate reads it, and the env that points a signer at it."""
