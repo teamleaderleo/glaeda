@@ -241,7 +241,7 @@ class FakeGitHub:
             return {"checkSuites": None}
         suites = [suite for suite in self.suites.get(sha, []) if repo is None or suite.get("repo", repo) == repo]
         return {"checkSuites": {"pageInfo": {"hasNextPage": any(suite.get("more") for suite in suites)}, "nodes": [
-            {"id": suite["id"], "latest": {"totalCount": suite["latest"]}, "every": {"totalCount": len(suite["runs"])}}
+            {"id": suite["id"], "latest": suite["latest"] if suite["latest"] is None else {"totalCount": suite["latest"]}, "every": {"totalCount": len(suite["runs"])}}
             for suite in suites]}}
 
     def rest_issue(self, parts: list[str], path: str) -> Any:
@@ -5405,6 +5405,53 @@ class HeadChecksTest(Base):
         data = gg.read_cache(key)["data"]
         self.assertNotIn(gg.check_verdict(data, "required"), (gg.EXIT_FAIL,))
         self.assertEqual(gg.check_verdict(data, "green"), gg.EXIT_FAIL)
+
+    def test_a_malformed_suite_count_is_an_error_not_a_complete_read(self) -> None:
+        # Review finding F1 on glaeda#1844: a null or missing count (a nested GraphQL error) read as zero, so a partial
+        # suite read looked complete and could hide an older red attempt.
+        def broken(suite: dict) -> list[dict | None]:
+            good = {"id": "S1", "latest": {"totalCount": 0}, "every": {"totalCount": 1}}
+            return [None, {**good, "latest": None}, {**good, "every": None}, {k: v for k, v in good.items() if k != "latest"},
+                    {**good, "latest": {"totalCount": None}}, {**good, "every": {}}, {**good, "every": {"totalCount": "1"}},
+                    {**good, "latest": {"totalCount": -1}}, {**good, "latest": {"totalCount": True}}]
+        for bad in broken({}):
+            with self.subTest(suite=bad):
+                found = gg.ran_nothing_suites({"checkSuites": {"pageInfo": {"hasNextPage": False}, "nodes": [bad]}})
+                self.assertIsInstance(found, str)
+                self.assertIn("malformed", found)
+        for nodes in (None, "x", {}):
+            with self.subTest(nodes=nodes):
+                found = gg.ran_nothing_suites({"checkSuites": {"pageInfo": {"hasNextPage": False}, "nodes": nodes}})
+                self.assertIsInstance(found, str)
+        # well formed: the same answers as before
+        ok = {"id": "S1", "latest": {"totalCount": 0}, "every": {"totalCount": 1}}
+        self.assertEqual(gg.ran_nothing_suites({"checkSuites": {"pageInfo": {"hasNextPage": False}, "nodes": [ok]}}), ["S1"])
+        self.assertEqual(gg.ran_nothing_suites({"checkSuites": {"pageInfo": {"hasNextPage": False}, "nodes": []}}), [])
+
+    def test_a_malformed_suite_count_in_a_tick_is_an_error_not_a_green_head(self) -> None:
+        self.gh.heads[("o", "r", SHA_A)] = [check_run("CI / build")]
+        self.gh.suites[SHA_A] = [{"id": "S1", "latest": None, "runs": [self.red_publish()]}]
+        gg.register(self.key(SHA_A), consumer="autoland")
+        self.daemon.tick(NOW)
+        self.assertIn("malformed", gg.read_cache(self.key(SHA_A))["error"] or "")
+
+    def test_the_recovery_query_is_paced_by_graphql_per_minute(self) -> None:
+        # Review finding F2 on glaeda#1844: last_real_contexts sent its query without checking the per-minute ceiling,
+        # so a batch of heads with startup_failure suites could spend past graphqlPerMinute.
+        self.daemon.policy = {**self.daemon.policy, "graphqlPerMinute": 3}
+        self.daemon.gql_log = [(NOW - 30, "pr", 3)]  # this minute's points already spent
+        self.daemon.now = NOW
+        before = len(self.gh.gql_calls())
+        nodes, error = self.daemon.last_real_contexts(["S1"])
+        self.assertEqual(nodes, [])
+        self.assertIn("graphqlPerMinute", error or "")
+        self.assertEqual(len(self.gh.gql_calls()), before)  # nothing sent
+        # with room, it reads
+        self.gh.suites[SHA_A] = [{"id": "S1", "latest": 0, "runs": [self.red_publish()]}]
+        self.daemon.gql_log = []
+        nodes, error = self.daemon.last_real_contexts(["S1"])
+        self.assertIsNone(error)
+        self.assertEqual([n["name"] for n in nodes], ["publish"])
 
     def test_an_unread_check_suites_field_is_an_error_not_a_greener_read(self) -> None:
         # Review finding F2 on glaeda#1842 at 3af96afb: a null checkSuites beside an error hid nothing as "no suites".
