@@ -2972,6 +2972,20 @@ class HookTest(unittest.TestCase):
             with mock.patch.dict(os.environ, {"RUNNER_NAME": "c0"}):
                 hook.release_host_lock(state)
 
+    def test_a_sleeper_whose_identity_cannot_be_read_is_not_honoured_nor_forgotten(self) -> None:
+        """CLAIM_SLEEP review 3 F2: a record is a sleeper only after a positive identity match. When the owner's start
+        token cannot be read (a ps timeout under load), the pid may now be another signing job, so the record is not a
+        sleeper (its processes count toward the drain) and is not removed either; only a pid proven gone, or proven to
+        be another process, removes it."""
+        state, path = self.claim_fixture(state="released")
+        self.assertEqual(hook.sleeping_owners(state), {os.getpid()}, "read and equal: a sleeper")
+        with mock.patch.object(hook, "process_identity", return_value=None):
+            self.assertEqual(hook.sleeping_owners(state), set(), "unreadable: not a sleeper")
+        self.assertTrue(path.exists(), "unreadable: not forgotten")
+        with mock.patch.object(hook, "process_identity", return_value="proc:another-process"):
+            self.assertEqual(hook.sleeping_owners(state), set())
+        self.assertFalse(path.exists(), "proven another process: removed")
+
     def signing_hooks(self, *shas: str) -> tuple[dict, str]:
         """A glaeda-signing-hooks.txt at manaflow-ai/cmux@SHA listing these hook shas, served through
         GLAEDA_SIGNING_HOOKS_URL as cmux's claim gate reads it, and the env that points a signer at it."""
