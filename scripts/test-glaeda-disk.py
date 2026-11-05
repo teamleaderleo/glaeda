@@ -7957,6 +7957,30 @@ class LinuxLayoutTest(unittest.TestCase):
         self.git(restored, "fetch", "-q", str(bundle), f"{gd.ARCHIVE_REF}{lost}:refs/heads/back", env=env)
         self.assertEqual(self.git(restored, "rev-parse", "back"), lost)
 
+    def test_an_item_that_is_itself_a_worktree_with_reflog_commits_and_edits_goes(self) -> None:
+        """cmuxs-3 ~/cnx-hybrid, 2026-11-05: the item is a worktree of ~/cmux itself, with reflog-only commits and
+        uncommitted work; everything was archived, yet the post-rename recheck put it back every pass."""
+        unit, clone, env = self.mirror_unit()
+        shutil.rmtree(unit)
+        main = self.home / "main"
+        subprocess.run(["git", "clone", "-q", str(self.home / "srv"), str(main)], check=True, env=env)
+        self.git(main, "worktree", "add", "-q", "--detach", str(unit), env=env)
+        self.git(unit, "commit", "-q", "--allow-empty", "-m", "only the worktree reflog", env=env)
+        lost = self.git(unit, "rev-parse", "HEAD")
+        self.git(unit, "checkout", "-q", "--detach", "origin/main", env=env)
+        (unit / "notes.txt").write_text("untracked work\n")
+        rec, err = self.apply_mirror(unit)
+        self.assertEqual(rec["outcome"], "reclaimed", (rec["reasons"], err))
+        self.assertEqual(self.bundle_heads().get(gd.ARCHIVE_REF + lost), lost)
+
+    def test_a_tree_the_rename_recheck_puts_back_says_why_in_its_receipt(self) -> None:
+        unit, _, _ = self.mirror_unit()
+        with mock.patch.object(gd, "mirror_rename_recheck",
+                               lambda path, recheck: (lambda: (_ for _ in ()).throw(gd.SlotTaken("cmuxs-3 reason")))):
+            rec, _ = self.apply_mirror(unit)
+        self.assertEqual(rec["outcome"], "changed:in-use")
+        self.assertIn("cmuxs-3 reason", rec["reasons"])
+
     def test_a_reflog_only_commit_made_after_the_bundle_keeps_the_tree(self) -> None:
         unit, clone, env = self.mirror_unit()
         shutil.rmtree(clone)

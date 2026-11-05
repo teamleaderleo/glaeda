@@ -9958,8 +9958,10 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
                 if common:  # drop the deleted worktree's record from its repository
                     subprocess.run(["git", "--git-dir", common, "worktree", "prune"],
                                    capture_output=True, timeout=60)
-            except SlotTaken:
+            except SlotTaken as e:
                 outcome = "changed:in-use"
+                if str(e):
+                    i.reasons.append(str(e))  # why the recheck after the rename put it back (or left it aside)
                 if mirror_due(fam, p, idle_now) and bundled[1] and p.is_dir() and not p.is_symlink():
                     drop_unused_archives(bundled[1])  # put back whole: never when it was left aside under another name
             except SlotNotNeeded:
