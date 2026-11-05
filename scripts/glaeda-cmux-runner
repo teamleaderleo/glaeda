@@ -2284,15 +2284,17 @@ def sync_dir(path: Path) -> None:
 # pushed before cmux listed a new hook is still queued when the OTA refresh installs it. On 2026-11-05 cmux15 took hook
 # aff786ca at 06:49Z and refused the sign jobs of five such runs at 06:51-06:53Z (cmux 41967127267 to 41976650433),
 # each queued since 04:19-05:51Z. So on a --trusted-next-signing runner the refresh holds a new hook back while any
-# active nightly.yml run on nightly-next has a head commit whose list lacks it; the old hook, which those commits list,
-# signs them. It never changes what is admitted: the hook and the claim gate are untouched, and a commit that lists
-# neither hook is refused as before. The hold ends when every active run lists the new hook, or SIGN_HOLD_CAP_S after
-# its first deferral of that hook (installed then, with a loud line), so a rollout can never be held for good.
-# Reads are anonymous (the minis have no gh): one runs list per active status (five, more only past 100 runs of one),
-# then one raw read per head commit, cached in the state file (a commit's list never changes), all memoised for
-# SIGN_HOLD_MEMO_S and made only while a signing runner has a new hook pending: inside the 60/h unauthenticated limit. A read
-# that fails is retried once, then holds like a blocker, inside the same cap (2026-11-05 10:16Z: a failed read let a
-# signing runner take hook bcdd1aac over a run in progress that lacked it).
+# active run of a SIGN_HOLD_SOURCES workflow has a head commit whose list lacks it but carries the hook on disk; that
+# old hook signs them. It never changes what is admitted: the hook and the claim gate are untouched, and a commit that
+# lists neither hook is refused as before, which is why such a run is not a blocker (sign_hold_blockers): holding the
+# old hook cannot serve it, and treating it as one would strand every rollout for as long as cmux's list trailed.
+# The hold ends when no active run needs it, or SIGN_HOLD_CAP_S after its first deferral of that hook (installed then,
+# with a loud line), so a rollout can never be held for good.
+# Reads are anonymous (the minis have no gh): one runs list per active status per source, then one raw read per head
+# commit, cached in the state file (a commit's list never changes), all memoised for SIGN_HOLD_MEMO_S and made only
+# while a signing runner has a new hook pending, with a known blocker rechecked through the build controller at no
+# GitHub cost (glaeda#1864). A read that fails is retried once, then holds like a blocker, inside the same cap
+# (2026-11-05 10:16Z: a failed read let a signing runner take hook bcdd1aac over a run in progress that lacked it).
 SIGN_HOLD_REPO = "manaflow-ai/cmux"
 # SIGN_HOLD_SOURCES: the (workflow file, the branches whose runs hold) the hold reads. One entry per workflow whose
 # signing jobs this runner admits, so the hold covers every one of them: nightly.yml on nightly-next (TRUSTED_NEXT_SIGNING)
@@ -2396,8 +2398,8 @@ def sign_hold_runs() -> list[dict] | None:
                     if not isinstance(rid, int) or isinstance(rid, bool) or not re.fullmatch(r"[0-9a-f]{40}", sha):
                         return None  # malformed run data is an unreadable answer, never a crash
                     branch = run.get("head_branch")
-                    if branch is not None and not isinstance(branch, str):
-                        return None
+                    if not isinstance(branch, str):
+                        return None  # GitHub types head_branch nullable; which branch a run is on is not optional here
                     if branch not in branches:  # another branch's run of this workflow holds nothing
                         continue
                     if run.get("status") in SIGN_HOLD_ACTIVE:  # a run that finished between two reads holds nothing
@@ -2444,11 +2446,15 @@ def sign_hold_recheck(home: Path, known: list[tuple[int, str]]) -> list[tuple[in
 
 
 def sign_hold_blockers(digest: str, cache: dict[str, bool], home: Path | None = None,
-                       known: list[tuple[int, str]] | None = None) -> list[tuple[int, str]] | None:
-    """[(run id, head sha)] of the active runs of every SIGN_HOLD_SOURCES (workflow, branches) pair whose list lacks
-    digest, or None when a read failed. cache maps a head sha to whether its list carries digest, so two sources at one
-    commit read it once; new answers are added to it. Known blockers (the last answer's) still running by the
-    controller are the answer, with no anonymous read, whichever source listed them."""
+                       known: list[tuple[int, str]] | None = None,
+                       installed: str | None = None) -> list[tuple[int, str]] | None:
+    """[(run id, head sha)] of the active runs of every SIGN_HOLD_SOURCES (workflow, branches) pair that holding the
+    installed hook would serve, or None when a read failed. A run holds only when its commit's list lacks digest (the
+    hook about to be installed) *and* carries installed (the hook on disk now): a commit listing neither is refused
+    whichever hook this runner holds, so keeping the old one buys that run nothing and only strands the rollout. cache
+    maps a head sha to that decision, so two sources at one commit read it once; new answers are added to it. Known
+    blockers (the last answer's) still running by the controller are the answer, with no anonymous read, whichever
+    source listed them."""
     if known and home is not None:
         still = sign_hold_recheck(home, known)
         if still is None:
@@ -2469,7 +2475,10 @@ def sign_hold_blockers(digest: str, cache: dict[str, bool], home: Path | None = 
             listed = {ln.split(None, 1)[0] for ln in text.splitlines() if ln.strip() and not ln.lstrip().startswith("#")}
             if not listed:
                 return None  # an empty answer is not a list
-            cache[sha] = digest in listed
+            # cache[sha] is "this commit needs no hold": it already lists the new hook, or it lists neither, so the
+            # old hook cannot serve it either (cmux main's list trailed nightly-next's by seven hooks on 2026-11-05,
+            # and every queued main run's commit listed neither bcdd1aac nor its successors).
+            cache[sha] = digest in listed or (installed is not None and installed not in listed)
         if not cache[sha]:
             blockers.append((run["id"], sha))
     return blockers
@@ -2482,10 +2491,11 @@ def sign_hold_event(line: str) -> None:
         _SIGN_HOLD_EVENTS.append(line)
 
 
-def sign_hold(home: Path, digest: str, now: Callable[[], float] = time.time) -> str | None:
-    """SIGN_HOLD: a deferral note while an active run of a SIGN_HOLD_SOURCES workflow lacks digest, else None (install).
-    Records the first
-    deferral of digest in the state file and stops holding SIGN_HOLD_CAP_S after it."""
+def sign_hold(home: Path, digest: str, installed: str | None = None,
+              now: Callable[[], float] = time.time) -> str | None:
+    """SIGN_HOLD: a deferral note while an active run of a SIGN_HOLD_SOURCES workflow lacks digest and the installed
+    hook would serve it, else None (install). Records the first deferral of digest in the state file and stops holding
+    SIGN_HOLD_CAP_S after it."""
     memo = _SIGN_HOLD_MEMO.get(digest)
     if memo and now() - memo[0] < SIGN_HOLD_MEMO_S:
         for line in memo[2]:  # a memoised answer is reported again: this refresh's "signHold" starts empty
@@ -2498,16 +2508,18 @@ def sign_hold(home: Path, digest: str, now: Callable[[], float] = time.time) -> 
             state = {}
     except (OSError, ValueError):
         state = {}
-    cache = state.get("listed") if isinstance(state.get("listed"), dict) else {}
+    # "serves", not the older "listed": the cached value now folds in the installed hook (sign_hold_blockers), so a
+    # state file written by an earlier release at this same digest must not be read as the new decision.
+    cache = state.get("serves") if isinstance(state.get("serves"), dict) else {}
     cache = {k: v for k, v in cache.items() if isinstance(v, bool)}
     known = [(rid, sha) for rid, sha in (state.get("blockers") or [])
              if isinstance(rid, int) and not isinstance(rid, bool) and isinstance(sha, str)] \
         if isinstance(state.get("blockers"), list) and all(isinstance(b, list) and len(b) == 2
                                                           for b in state["blockers"]) else []
-    blockers = sign_hold_blockers(digest, cache, home, known)
+    blockers = sign_hold_blockers(digest, cache, home, known, installed)
     if blockers is None:  # any unreadable answer (a failed read, malformed data, too many pages): one more pass
         time.sleep(SIGN_HOLD_RETRY_S)
-        blockers = sign_hold_blockers(digest, cache, home, known)
+        blockers = sign_hold_blockers(digest, cache, home, known, installed)
     note: str | None = None
     events_before = len(_SIGN_HOLD_EVENTS)
     since = state.get("since") if isinstance(state.get("since"), (int, float)) else None
@@ -2530,7 +2542,7 @@ def sign_hold(home: Path, digest: str, now: Callable[[], float] = time.time) -> 
     with contextlib.suppress(OSError):
         path.parent.mkdir(parents=True, exist_ok=True)
         kept = [[rid, sha] for rid, sha in blockers] if blockers else (known if blockers is None else [])
-        write_atomic(path, (json.dumps({"digest": digest, "since": since, "listed": cache, "blockers": kept})
+        write_atomic(path, (json.dumps({"digest": digest, "since": since, "serves": cache, "blockers": kept})
                             + "\n").encode(), 0o644)
     _SIGN_HOLD_MEMO[digest] = (now(), note, list(_SIGN_HOLD_EVENTS[events_before:]))
     return note
@@ -2578,7 +2590,13 @@ def refresh_hook_dir(runner_dir: Path, receipt: Any, apply: bool, sources: dict[
         return {**entry, "state": "unchanged"}
     entry["files"] = stale
     if apply and hold is not None and HOOK_NAME in stale and signing_runner(hook_dir):
-        held = hold(hashlib.sha256(sources[HOOK_NAME][0]).hexdigest())  # SIGN_HOLD: cmux lists bare hex
+        # SIGN_HOLD: cmux lists bare hex. The hook on disk goes too: a run whose commit lists neither it nor the new
+        # one is refused either way, so it must not hold the rollout (an unreadable one holds as before).
+        try:
+            installed_digest = hashlib.sha256((hook_dir / HOOK_NAME).read_bytes()).hexdigest()
+        except OSError:
+            installed_digest = None
+        held = hold(hashlib.sha256(sources[HOOK_NAME][0]).hexdigest(), installed_digest)
         if held:
             # nor may a job-completed install a copy an earlier, unheld refresh staged. The hook's install_staged_hook
             # takes no lock (changing the hook would need a new signing-hooks rollout), so one already past its checks

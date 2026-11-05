@@ -977,14 +977,17 @@ main as the default branch (`auto_resume_refusal`). Every job of that workflow c
 only the source run's artifacts, which `preflight` checks through the API first. The jobs rank as nightly
 (`job_tier`).
 
-- On a `--trusted-next-signing` runner, and only there, every job that holds a release key (Apple certificate,
-  notary API key, Sparkle key, R2 key or the release app key): `AUTO_RESUME_TRUSTED_JOBS`. They split by what they
-  do, not by whether they hold a key.
+- On a `--trusted-next-signing` runner, and only there, the jobs that hold a release key (Apple certificate,
+  notary API key, Sparkle key, R2 key or the release app key) *and* do work with it: `AUTO_RESUME_SIGNING_JOBS`,
+  which `trusted_refusal` admits and nothing else. Holding a key is not the test; what the job does with it is.
   - `wait-and-staple`, `staple-outer`, `staple-stapled`, `publish`, `generate-deltas`, `republish-deltas`
     (`AUTO_RESUME_SIGNING_JOBS`): they staple, sign or publish, so each is a `SIGNING_JOBS` entry, exclusive
     class, one drain of the mini.
-- `poll`, `poll-outer` and `poll-stapled` (`AUTO_RESUME_HOSTED_JOBS`) are refused on every glaeda runner and
-  keep their hosted route. They hold the notary key, but each only asks Apple whether a submission is done, and
+- `poll`, `poll-outer` and `poll-stapled` (`AUTO_RESUME_HOSTED_JOBS`) keep their hosted route in cmux, and are
+  refused by `trusted_refusal` on a `--trusted-next-signing` runner and by `glaeda-nightly-only-admit` on a
+  nightly-only one, so no runner cmux routes this workflow to admits one. A general pool runner applies neither
+  check, as for any other job, which is why they also carry a `light` class: were one to reach a pool mini it
+  would hold 2 units and no root, not a compile's 5 and a canonical root, for up to its 6 h Apple-queue timeout. They hold the notary key, but each only asks Apple whether a submission is done, and
   its timeout is Apple's queue rather than work: 90, 360 and 360 minutes. No class puts them on the one nightly
   mini without stopping the nightly.
   - Exclusive, the claim holds the whole mini for that long. The exclusive class bounds how long a job *waits*

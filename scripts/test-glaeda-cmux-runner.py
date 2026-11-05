@@ -11358,6 +11358,8 @@ class RunnerTest(unittest.TestCase):
         self.addCleanup(retry.stop)
         return hooks
 
+    ABSENT_BRANCH = object()  # a runs row with no head_branch key at all
+
     @staticmethod
     def _run_row(row: tuple) -> tuple[int, str, str, str, str]:
         """(id, status, head sha) with the defaults a SIGN_HOLD test needs, or the full
@@ -11376,7 +11378,14 @@ class RunnerTest(unittest.TestCase):
         chosen = [r for r in sorted(rows, key=lambda r: -r[0])
                   if r[3] == workflow and (status is None or r[1] == status)]
         size = cr.SIGN_HOLD_PAGE_SIZE
-        return json.dumps({"workflow_runs": [{"id": i, "status": st, "head_sha": sha, "head_branch": branch}
+
+        def row(i, st, sha, branch):
+            # cls.ABSENT_BRANCH leaves head_branch out altogether, as GitHub may; anything else goes through as given,
+            # None included (the schema types it nullable).
+            got = {"id": i, "status": st, "head_sha": sha}
+            return got if branch is cls.ABSENT_BRANCH else {**got, "head_branch": branch}
+
+        return json.dumps({"workflow_runs": [row(i, st, sha, branch)
                                              for i, st, sha, _, branch in chosen[(page - 1) * size:page * size]]})
 
     def github(self, runs: list[tuple], lists: dict[str, str] | None, fail: str = "",
@@ -11398,7 +11407,7 @@ class RunnerTest(unittest.TestCase):
                     return None
                 return json.dumps({"known": True, "terminal": match[0][1] not in cr.SIGN_HOLD_ACTIVE,
                                    "run": {"id": rid, "status": match[0][1], "head_sha": match[0][2]}})
-            if "/actions/workflows/" in url:
+            if "/actions/workflows/" in url and "/runs?" in url:
                 return self.runs_page(url, runs)
             sha = url.split("/")[-4]
             return (lists or {}).get(sha)
@@ -11467,6 +11476,44 @@ class RunnerTest(unittest.TestCase):
                 self.github([run], lists)
                 self.assertEqual(self.invoke("--refresh-hooks", "--apply")["runners"][0]["state"], "updated")
                 self.assertEqual((hooks / cr.HOOK_NAME).read_bytes(), HOOK.read_bytes())
+
+    def test_sign_hold_ignores_a_run_whose_commit_lists_neither_hook(self) -> None:
+        # A commit that lists neither the installed hook nor the new one refuses this runner's sign job whichever hook
+        # it holds, so holding the old one serves that run nothing and must not strand the rollout. cmux main's list
+        # trailed nightly-next's by seven hooks on 2026-11-05 and every queued main run's commit was in exactly this
+        # state, so with main a source a digest-keyed 3 h hold would have restarted on every glaeda merge.
+        other = "c" * 40
+        hooks = self.signing_install()
+        reads = self.github([(41990000006, "queued", other, "nightly.yml", "main")],
+                            {other: f"{'9' * 64} glaeda someone else's hook\n"})
+        done = self.invoke("--refresh-hooks", "--apply")["runners"][0]
+        self.assertEqual(done["state"], "updated", "a run the old hook cannot serve either does not hold")
+        self.assertEqual((hooks / cr.HOOK_NAME).read_bytes(), HOOK.read_bytes())
+        self.assertIn(cr.SIGN_HOLD_LIST_URL.format(repo=cr.SIGN_HOLD_REPO, sha=other), reads,
+                      "the decision is read, not assumed")
+        # a run whose commit does list the installed hook holds: the gate is what the installed hook can serve, not
+        # which branch or workflow the run came from. A different commit, since a commit's list never changes and the
+        # answer above is cached against it.
+        served = "d" * 40
+        cr._SIGN_HOLD_MEMO.clear()
+        hooks = self.signing_install()
+        self.github([(41990000008, "queued", served, "nightly.yml", "main")],
+                    {served: f"{'9' * 64} other\n{self.older_digest()} glaeda installed\n"})
+        self.assertEqual(self.invoke("--refresh-hooks", "--apply")["runners"][0]["state"], "deferred")
+        self.assertEqual((hooks / cr.HOOK_NAME).read_text(), self.OLDER_HOOK)
+
+    def test_sign_hold_holds_when_a_run_does_not_say_which_branch_it_is_on(self) -> None:
+        # head_branch is nullable in GitHub's schema. Which branch a run is on decides whether it holds, so an answer
+        # without it is an unreadable answer (hold), never "some branch no entry names" (install).
+        for name, branch in (("absent", self.ABSENT_BRANCH), ("null", None), ("wrong type", 7)):
+            with self.subTest(head_branch=name):
+                hooks = self.signing_install()
+                row = (41990000007, "queued", self.OLD_SHA, "nightly.yml", branch)
+                self.github([row], {self.OLD_SHA: f"{self.older_digest()} glaeda old\n"})
+                done = self.invoke("--refresh-hooks", "--apply")["runners"][0]
+                self.assertEqual(done["state"], "deferred")
+                self.assertIn("could not read the active runs", done["note"])
+                self.assertEqual((hooks / cr.HOOK_NAME).read_text(), self.OLDER_HOOK)
 
     def test_sign_hold_installs_once_every_active_run_lists_the_new_hook(self) -> None:
         hooks = self.signing_install()
