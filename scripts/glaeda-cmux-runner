@@ -2334,7 +2334,7 @@ SIGN_HOLD_STATE = "sign-hold.json"
 SIGN_HOLD_CONTROLLER_DEFAULT = "http://100.89.225.106:18765"
 SIGN_HOLD_CONTROLLER_CONFIG = Path(".local/share/cmux-fleet-client/client.json")  # under HOME, as glaeda-gh reads it
 SIGN_HOLD_FLAG = "--trusted-next-signing"
-_SIGN_HOLD_MEMO: dict[str, tuple[float, Any, list[str]]] = {}
+_SIGN_HOLD_MEMO: dict[tuple[str, str | None], tuple[float, Any, list[str]]] = {}
 SIGN_HOLD_RETRY_S = 3.0  # one retry of a failed read before the hold fails open
 # What the hold did in this refresh (a deferral, or an install at its cap), for --refresh-hooks' "signHold":
 # glaeda-update writes it to its jsonl and converge.json. Its stderr lines are not kept (2026-11-05 10:16Z: a signing
@@ -2496,7 +2496,9 @@ def sign_hold(home: Path, digest: str, installed: str | None = None,
     """SIGN_HOLD: a deferral note while an active run of a SIGN_HOLD_SOURCES workflow lacks digest and the installed
     hook would serve it, else None (install). Records the first deferral of digest in the state file and stops holding
     SIGN_HOLD_CAP_S after it."""
-    memo = _SIGN_HOLD_MEMO.get(digest)
+    # keyed on both hooks: a cached decision folds in the installed one (sign_hold_blockers), so it is not the
+    # answer once a different hook is on disk, even for the same incoming digest
+    memo = _SIGN_HOLD_MEMO.get((digest, installed))
     if memo and now() - memo[0] < SIGN_HOLD_MEMO_S:
         for line in memo[2]:  # a memoised answer is reported again: this refresh's "signHold" starts empty
             sign_hold_event(line)
@@ -2504,12 +2506,14 @@ def sign_hold(home: Path, digest: str, installed: str | None = None,
     path = home / ".local/state/glaeda/cmux-runner" / SIGN_HOLD_STATE
     try:
         state = json.loads(path.read_text())
-        if not isinstance(state, dict) or state.get("digest") != digest:
+        if not isinstance(state, dict) or state.get("digest") != digest or state.get("installed") != installed:
             state = {}
     except (OSError, ValueError):
         state = {}
     # "serves", not the older "listed": the cached value now folds in the installed hook (sign_hold_blockers), so a
-    # state file written by an earlier release at this same digest must not be read as the new decision.
+    # state file written by an earlier release at this same digest must not be read as the new decision. The state is
+    # kept only while *both* hook identities match: a run's commit can list the hook now on disk and not the one that
+    # wrote this entry, so a decision taken against a different installed hook is not this hook's decision.
     cache = state.get("serves") if isinstance(state.get("serves"), dict) else {}
     cache = {k: v for k, v in cache.items() if isinstance(v, bool)}
     known = [(rid, sha) for rid, sha in (state.get("blockers") or [])
@@ -2542,9 +2546,9 @@ def sign_hold(home: Path, digest: str, installed: str | None = None,
     with contextlib.suppress(OSError):
         path.parent.mkdir(parents=True, exist_ok=True)
         kept = [[rid, sha] for rid, sha in blockers] if blockers else (known if blockers is None else [])
-        write_atomic(path, (json.dumps({"digest": digest, "since": since, "serves": cache, "blockers": kept})
-                            + "\n").encode(), 0o644)
-    _SIGN_HOLD_MEMO[digest] = (now(), note, list(_SIGN_HOLD_EVENTS[events_before:]))
+        write_atomic(path, (json.dumps({"digest": digest, "installed": installed, "since": since, "serves": cache,
+                                        "blockers": kept}) + "\n").encode(), 0o644)
+    _SIGN_HOLD_MEMO[(digest, installed)] = (now(), note, list(_SIGN_HOLD_EVENTS[events_before:]))
     return note
 
 

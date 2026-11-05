@@ -11575,6 +11575,34 @@ class RunnerTest(unittest.TestCase):
         self.assertEqual(self.invoke("--refresh-hooks", "--apply")["runners"][0]["state"], "deferred")
         self.assertEqual((hooks / cr.HOOK_NAME).read_text(), self.OLDER_HOOK)
 
+    MID_HOOK = HOOK.read_text() + "\n# a hook installed between the two refreshes\n"
+
+    def mid_digest(self) -> str:
+        return hashlib.sha256(self.MID_HOOK.encode()).hexdigest()
+
+    def test_sign_hold_decides_again_once_a_different_hook_is_on_disk(self) -> None:
+        # A cached decision folds in the installed hook, so it belongs to that hook and not merely to the digest being
+        # rolled out. A run whose commit lists only the hook that lands on disk between two refreshes needs the hold
+        # the second time though it needed none the first, so a decision keyed on the incoming digest alone installs
+        # over its sign job. The memo is keyed on both for the same reason.
+        mid, sha = self.mid_digest(), "e" * 40
+        hooks = self.signing_install()
+        self.hook_history(self.OLDER_HOOK, self.MID_HOOK)
+        self.github([(41990000009, "queued", sha, "nightly.yml", "nightly-next")],
+                    {sha: f"{mid} glaeda the hook that lands next\n"})
+        # the hook on disk is the older one, which that commit does not list: holding it serves the run nothing
+        done = self.invoke("--refresh-hooks", "--apply")["runners"][0]
+        self.assertEqual(done["state"], "updated", "a run the installed hook cannot serve does not hold")
+        self.assertEqual((hooks / cr.HOOK_NAME).read_bytes(), HOOK.read_bytes())
+        # that same run is still active, and now the hook it does list is the one on disk (an --apply from a newer
+        # copy, or a relabel; the rollout keeps such a hook). The decision is the opposite one.
+        (hooks / cr.HOOK_NAME).write_text(self.MID_HOOK)
+        done = self.invoke("--refresh-hooks", "--apply")["runners"][0]
+        self.assertEqual(done["state"], "deferred",
+                         "the cached decision belonged to the hook that was on disk when it was taken")
+        self.assertIn(f"run 41990000009 at {sha[:12]}", done["note"])
+        self.assertEqual((hooks / cr.HOOK_NAME).read_text(), self.MID_HOOK, "its sign job keeps the hook it lists")
+
     def test_sign_hold_holds_when_a_run_does_not_say_which_branch_it_is_on(self) -> None:
         # head_branch is nullable in GitHub's schema. Which branch a run is on decides whether it holds, so an answer
         # without it is an unreadable answer (hold), never "some branch no entry names" (install).
