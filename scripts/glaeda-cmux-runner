@@ -2550,7 +2550,7 @@ def sign_hold(home: Path, digest: str, installed: str | None = None,
 
 def refresh_hook_dir(runner_dir: Path, receipt: Any, apply: bool, sources: dict[str, tuple[bytes, int]],
                      history: dict[str, set[str]],
-                     hold: Callable[[str], str | None] | None = None) -> dict[str, Any]:
+                     hold: Callable[[str, str | None], str | None] | None = None) -> dict[str, Any]:
     """Plan (and with apply, make) one runner install's hook files match this copy's. Caller holds runner_lock."""
     entry: dict[str, Any] = {"runnerDir": os.fspath(runner_dir)}
     if not isinstance(receipt, dict) or not runner_dir.is_absolute() or not owns_runner_dir(runner_dir, receipt):

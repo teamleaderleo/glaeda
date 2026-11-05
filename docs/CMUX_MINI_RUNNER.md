@@ -987,9 +987,11 @@ only the source run's artifacts, which `preflight` checks through the API first.
   refused by `trusted_refusal` on a `--trusted-next-signing` runner and by `glaeda-nightly-only-admit` on a
   nightly-only one, so no runner cmux routes this workflow to admits one. A general pool runner applies neither
   check, as for any other job, which is why they also carry a `light` class: were one to reach a pool mini it
-  would hold 2 units and no root, not a compile's 5 and a canonical root, for up to its 6 h Apple-queue timeout. They hold the notary key, but each only asks Apple whether a submission is done, and
-  its timeout is Apple's queue rather than work: 90, 360 and 360 minutes. No class puts them on the one nightly
-  mini without stopping the nightly.
+  would hold 2 units and no root, not a compile's 5 and a canonical root. `job_tier` also gives them no tier, so
+  such a job cannot outrank a PR job on that runner either.
+  They hold the notary key, but each only asks Apple whether a submission is done, so its timeout is Apple's
+  queue rather than work: 90, 360 and 360 minutes. No class puts them on the one nightly runner without stopping
+  the nightly.
   - Exclusive, the claim holds the whole mini for that long. The exclusive class bounds how long a job *waits*
     for the mini (`SIGNING_DRAIN_WAIT_S`), never how long it then holds it, and every `yieldToExclusive`
     dedicated runner there starts nothing while a claim is held (`YIELD_TO_EXCLUSIVE`, bound 3 h, then it
