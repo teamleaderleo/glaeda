@@ -967,10 +967,14 @@ that holds every unit a claim record (`<state dir>/host-lock-holder-<runner>.cla
 "$GLAEDA_CLAIM_PYTHON" "$GLAEDA_CLAIM_HOOK" claim-reacquire --state-dir "$GLAEDA_CLAIM_STATE_DIR"
 ```
 
-- `claim-release` lets go of every unit and token and the host lock only after it proves the credentials are gone:
-  every `--removed` path is absent, and no process of the job (its Runner.Worker and descendants, this step included)
-  has a `--forbid-env` variable in its environment. Any proof that fails or cannot be read keeps the claim (exit 1).
-  It writes `GLAEDA_JOB_CLAIM=released` to `$GITHUB_ENV`, which cmux's claim gate refuses. It refuses on a runner
+- `claim-release` writes `GLAEDA_JOB_CLAIM=released` to `$GITHUB_ENV` (flushed and read back; cmux's claim gate
+  refuses it) and only then lets go of every unit and token and the host lock. Before either it proves the credentials
+  are gone: every `--removed` path gives ENOENT, and no process of the job lives but its Runner.Worker and the release
+  step's own chain. That process set is the proof: a step's secrets reach only its own processes, so the steps that
+  held them must have exited (a background child, a daemon or a sleep they left keeps the claim; an environment read
+  could not prove a credential gone, since a process can set one after it starts). `--forbid-env` names are checked
+  only in the release step's own chain, which catches a workflow passing a secret to that step. Any proof that fails
+  or cannot be read keeps the claim (exit 1), as does a missing or unwritable `$GITHUB_ENV`. It refuses on a runner
   without `--trusted-ref` (on a PR mini a PR job could rewrite the sleeping job's `_work` before it reacquires), and
   while `<state dir>/claim-release.off` exists.
 - `claim-reacquire` waits as a fresh signing job does: the exclusive class, the job's own tier and SIGNS_FIRST, an
