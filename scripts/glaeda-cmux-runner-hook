@@ -1809,12 +1809,16 @@ def job_tier(event_name: str | None, ref: str | None, repository: str | None, ev
     never one of them, nor is a payload that carries a pull request, a workflow_run or a merge group. The one
     workflow_run is AUTO_RESUME's exact continuation of main's own nightly (auto_resume_refusal)."""
     if job and auto_resume_refusal(event_name, ref, repository, event, workflow_ref) is None:
+        # Only the signing and light sets rank a tier, decided from those allowlists rather than by carving the hosted
+        # polls out of everything else: a job added to this workflow later, or routed here by accident, then reaches
+        # no nightly slot until it is listed, since nightly_slot_refusal gates on the tier alone and FEED_FIRST would
+        # otherwise place it ahead of every PR job.
         # AUTO_RESUME_HOSTED_JOBS rank no tier: each only asks Apple whether a submission is done, so its timeout is
         # the notary queue rather than work (90, 360 and 360 minutes). cmux runs all three on ubuntu and the two
         # runner classes that check trust refuse them (trusted_refusal, glaeda-nightly-only-admit), but a general pool
         # runner applies neither, and FEED_FIRST would then put a six-hour wait ahead of every PR job on that mini.
         # Their light class keeps the cost at 2 units and no root; this keeps them out of the priority order too.
-        return "" if job in AUTO_RESUME_HOSTED_JOBS else TIER_NIGHTLY
+        return TIER_NIGHTLY if job in (*AUTO_RESUME_SIGNING_JOBS, *AUTO_RESUME_LIGHT_JOBS) else ""
     if not isinstance(event, dict) or any(key in event for key in UNTRUSTED_PAYLOAD_KEYS):
         return ""
     if dev_compile_refusal(event_name, ref, repository, event, workflow_ref, job) is None:

@@ -1042,6 +1042,32 @@ class HookTest(unittest.TestCase):
             with self.subTest(works=job):
                 self.assertEqual(tier(job), hook.TIER_NIGHTLY, "a job that does the nightly's work still ranks")
 
+    def test_classic_auto_resume_ranks_no_tier_for_a_job_not_on_its_allowlists(self) -> None:
+        """A job of that workflow which is on none of its three sets ranks no tier, so it reaches no nightly slot.
+
+        job_tier used to carve only AUTO_RESUME_HOSTED_JOBS out and rank everything else TIER_NIGHTLY, and
+        nightly_slot_refusal gates on the tier alone. Every job the workflow defines today is on one of the three
+        sets, so nothing was mis-tiered in practice; a job added to it later, or routed there by accident, would
+        have been admitted on the nightly slot and placed ahead of PR jobs by FEED_FIRST without ever being
+        listed. Deciding the tier from the signing and light allowlists makes a new job inert until it is added.
+        """
+        ref = "refs/heads/main"
+        workflow_ref = f"manaflow-ai/cmux/.github/workflows/auto-resume-nightly-notarization.yml@{ref}"
+        event = {"action": "completed", "repository": {**CMUX, "default_branch": "main"},
+                 "workflow_run": {"path": ".github/workflows/nightly.yml", "head_branch": "main", "event": "push",
+                                  "head_repository": dict(CMUX), "repository": dict(CMUX)}}
+        tier = functools.partial(hook.job_tier, "workflow_run", ref, "manaflow-ai/cmux", event, workflow_ref)
+        # the payload is the admitted one, so a "" below is the job's own doing and not a refused payload
+        self.assertIsNone(hook.auto_resume_refusal("workflow_run", ref, "manaflow-ai/cmux", event, workflow_ref))
+        listed = (*hook.AUTO_RESUME_SIGNING_JOBS, *hook.AUTO_RESUME_LIGHT_JOBS, *hook.AUTO_RESUME_HOSTED_JOBS)
+        for job in ("generate-deltas-v2", "staple-inner", "upload", "a-job-nobody-has-written-yet"):
+            with self.subTest(unlisted=job):
+                self.assertNotIn(job, listed, "this case only means anything while the job is unlisted")
+                self.assertEqual(tier(job), "", "an unlisted job of this workflow never ranks on the nightly slot")
+        for job in (*hook.AUTO_RESUME_SIGNING_JOBS, *hook.AUTO_RESUME_LIGHT_JOBS):
+            with self.subTest(listed=job):
+                self.assertEqual(tier(job), hook.TIER_NIGHTLY, "a listed job that does the work still ranks")
+
     def test_classic_auto_resume_refuses_malformed_source_metadata(self) -> None:
         """AUTO_RESUME fails closed on every missing, null or wrong-typed field of the triggering run.
 
