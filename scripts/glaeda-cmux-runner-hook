@@ -5652,6 +5652,16 @@ def append_github_env(lines: str) -> bool:
     return False
 
 
+def claim_env_lines() -> str | None:
+    """The lines job-started's export_job_claim gives a job holding the whole Mac, or None when this hook's bytes
+    cannot be read (a job that needs the hook's sha must not get the claim without it)."""
+    try:
+        sha = hashlib.sha256(Path(__file__).resolve().read_bytes()).hexdigest()
+    except OSError:
+        return None
+    return f"{JOB_CLAIM_ENV}={EXCLUSIVE_CLASS}\n{HOOK_SHA_ENV}={sha}\n"
+
+
 def append_github_env_confirmed(lines: str) -> bool:
     """append_github_env, then proof it landed: flushed to disk and the file now ends with lines. False when there is no
     $GITHUB_ENV or any of it fails, so a caller that must tell later steps first can fail closed."""
@@ -5743,8 +5753,8 @@ def claim_reacquire(state_dir: Path, watch_pid: int, wait_s: float | None) -> tu
     assert owner is not None and record is not None
     total = record["capacity_units"]
     if record["state"] == CLAIM_HELD and holder_alive(holder_file(state_dir)):
-        claim = export_job_claim(total, {"class": EXCLUSIVE_CLASS, "units": total}, "")
-        return 0, "this job already holds the whole Mac" + (f"; {claim}" if claim else "")
+        # held since job-started or a reacquire that told later steps, proven; nothing to take or tell
+        return 0, "this job already holds the whole Mac"
     capacity_dir = Path(record["capacity_dir"])
     record.update(state=CLAIM_REACQUIRING, reacquiring_at=time.time())
     try:
@@ -5799,16 +5809,25 @@ def claim_reacquire(state_dir: Path, watch_pid: int, wait_s: float | None) -> tu
     if held and (taken.get("class") != EXCLUSIVE_CLASS or taken.get("units") != total):
         release_host_lock(state_dir)
         held, note = False, f"took {taken.get('units')} of {total} units, not the whole Mac"
+    if held:
+        # exit 0 lets the job read its key again, so later steps must have been told, proven; else give the Mac back
+        # and leave the job exactly released
+        lines = claim_env_lines()
+        if lines is None or not append_github_env_confirmed(lines):
+            release_host_lock(state_dir)
+            held = False
+            note = (f"could not tell later steps {JOB_CLAIM_ENV}={EXCLUSIVE_CLASS} and {HOOK_SHA_ENV} through "
+                    "$GITHUB_ENV (unset, unwritable, or this hook unreadable), so the whole Mac was given back")
     current = read_claim_record(path)
     if current is not None and (current["owner_pid"], current["owner_identity"]) == (owner.pid, owner.identity):
-        current.update(state=CLAIM_HELD if held else CLAIM_RELEASED, units=taken.get("units"),
-                       tokens=taken.get("tokens"))
+        current.update(state=CLAIM_HELD if held else CLAIM_RELEASED, units=taken.get("units") if held else None,
+                       tokens=taken.get("tokens") if held else None)
         with contextlib.suppress(OSError):
             write_claim_record(path, current)
     if not held:
         return 1, f"not reacquired, so the job holds nothing and must not read a credential: {note}"
-    claim = export_job_claim(total, taken, note)
-    return 0, f"holding the whole Mac again ({note})" + (f"; {claim}" if claim else "")
+    return 0, (f"holding the whole Mac again ({note}); later steps see {JOB_CLAIM_ENV}={EXCLUSIVE_CLASS} and "
+               f"{HOOK_SHA_ENV}")
 
 
 def runner_scope(runner_dir: Path) -> RunnerScope:
