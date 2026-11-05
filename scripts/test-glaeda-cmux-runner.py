@@ -2938,6 +2938,40 @@ class HookTest(unittest.TestCase):
         self.assertEqual(code_, 0, why)
         release.assert_called_once()
 
+    def test_claim_reacquire_that_cannot_tell_later_steps_gives_the_mac_back(self) -> None:
+        """CLAIM_SLEEP review 2 F2: exit 0 from claim-reacquire is what lets the job read its key again, so it means
+        later steps were told GLAEDA_JOB_CLAIM=exclusive and the hook's sha, proven. With no $GITHUB_ENV, or one that
+        cannot be written, it exits 1 and leaves the job exactly released: the whole Mac free and the record released."""
+        self.fleet()
+        state, path = self.claim_fixture(state="released", drain_bound=5.0)
+        unwritable = self.dir / "github-env-is-a-dir"
+        unwritable.mkdir()
+        for github_env in (None, os.fspath(unwritable)):
+            with self.subTest(github_env=github_env):
+                environ = {"RUNNER_NAME": "c0", **({"GITHUB_ENV": github_env} if github_env else {})}
+                with mock.patch.dict(os.environ, environ), \
+                        mock.patch.object(hook, "stray_job_processes", return_value=[]):
+                    if github_env is None:
+                        os.environ.pop("GITHUB_ENV", None)
+                    code, why = hook.claim_reacquire(state, os.getpid(), 5)
+                self.assertEqual(code, 1, why)
+                self.assertTrue(self.whole_mini_free(), "nothing it took is kept")
+                self.assertTrue(self.lock_free(), "nor the host lock")
+                self.assertEqual(hook.read_claim_record(path)["state"], "released")
+        told = self.dir / "github-env"
+        try:
+            with mock.patch.dict(os.environ, {"RUNNER_NAME": "c0", "GITHUB_ENV": os.fspath(told)}), \
+                    mock.patch.object(hook, "stray_job_processes", return_value=[]):
+                code, why = hook.claim_reacquire(state, os.getpid(), 5)
+            self.assertEqual(code, 0, why)
+            self.assertEqual(told.read_text(), "GLAEDA_JOB_CLAIM=exclusive\n"
+                             f"GLAEDA_HOOK_SHA256={hashlib.sha256(HOOK.read_bytes()).hexdigest()}\n")
+            self.assertFalse(self.whole_mini_free())
+            self.assertEqual(hook.read_claim_record(path)["state"], "held")
+        finally:
+            with mock.patch.dict(os.environ, {"RUNNER_NAME": "c0"}):
+                hook.release_host_lock(state)
+
     def signing_hooks(self, *shas: str) -> tuple[dict, str]:
         """A glaeda-signing-hooks.txt at manaflow-ai/cmux@SHA listing these hook shas, served through
         GLAEDA_SIGNING_HOOKS_URL as cmux's claim gate reads it, and the env that points a signer at it."""
