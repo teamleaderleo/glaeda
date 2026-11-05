@@ -1776,7 +1776,7 @@ def nightly_slot_refusal(tier: str) -> str | None:
             "main's nightly-next canary and launch smoke, and the Release compile that gates nightly-next's promotion)")
 
 
-def hosted_route_refusal(ref: str | None, workflow_ref: str | None, job: str | None) -> str | None:
+def hosted_route_refusal(workflow_ref: str | None, job: str | None) -> str | None:
     """Why no glaeda runner takes this job whatever its class, or None. Pure.
 
     AUTO_RESUME_HOSTED_JOBS keep cmux's hosted route. Each only asks Apple whether a submission is done, so its
@@ -1787,14 +1787,16 @@ def hosted_route_refusal(ref: str | None, workflow_ref: str | None, job: str | N
     invariant holds for every class: cmux routes these three to ubuntu, and if that ever changed by accident the job
     is refused here and requeued rather than quietly parking a mini.
 
-    Scoped by the workflow's own identity (its ref and workflow_ref), which is enough to tell these three jobs from a
-    job that merely shares one of those names in another workflow, and deliberately *not* by auto_resume_refusal: that
-    one also validates the triggering run's metadata, which says nothing about which job this is. Gating on it left
-    the hole this closes, since a poll of exactly this workflow whose source run was malformed got no refusal here and
-    the general pool applies no other check. So the identity decides, and a bad payload cannot buy a mini-long park.
+    Scoped by the workflow file these jobs live in, and deliberately *not* by auto_resume_refusal: that one also
+    validates the triggering run's metadata, which says nothing about which job this is. Gating on it left a hole,
+    since a poll of exactly this workflow whose source run was malformed got no refusal here and the general pool
+    applies no other check. Nor by the ref: no copy of these three on any branch does work a runner should take, and
+    a workflow_dispatch of this file from another branch would otherwise escape (a workflow_run always runs on the
+    default branch, so only a dispatch gets here). The file and the job name decide, so neither a bad payload nor an
+    off-main dispatch can buy a mini-long park, while a job merely sharing one of those names in another workflow is
+    untouched.
     """
-    if job in AUTO_RESUME_HOSTED_JOBS and ref == AUTO_RESUME_REF \
-            and workflow_ref == f"{AUTO_RESUME_WORKFLOW}@{AUTO_RESUME_REF}":
+    if job in AUTO_RESUME_HOSTED_JOBS and workflow_file(workflow_ref) == AUTO_RESUME_FILE:
         return (f"{AUTO_RESUME_FILE}'s {job} keeps its hosted route: it only waits on Apple's notary queue, so no "
                 f"glaeda runner takes one ({', '.join(AUTO_RESUME_HOSTED_JOBS)})")
     return None
@@ -9753,8 +9755,7 @@ def main(argv: list[str] | None = None) -> int:
                            f"{job_workflow() or 'an unknown workflow'} {os.environ.get('GITHUB_JOB') or 'job'} "
                            "is not one")
         # every class, the general pool included: a job cmux routes to a hosted runner is never taken here
-        if why := hosted_route_refusal(os.environ.get("GITHUB_REF"), os.environ.get("GITHUB_WORKFLOW_REF"),
-                                       os.environ.get("GITHUB_JOB")):
+        if why := hosted_route_refusal(os.environ.get("GITHUB_WORKFLOW_REF"), os.environ.get("GITHUB_JOB")):
             return refused(why)
         if args.nightly_runner:
             why = nightly_slot_refusal(job_tier(os.environ.get("GITHUB_EVENT_NAME"), os.environ.get("GITHUB_REF"),

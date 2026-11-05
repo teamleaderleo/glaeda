@@ -929,7 +929,7 @@ class HookTest(unittest.TestCase):
                                                                   payload, workflow_ref),
                                          "this fixture is meant to be a run auto_resume_refusal refuses")
                     # the pure gate decides on identity alone, so it refuses whatever the payload holds
-                    self.assertIsNotNone(hook.hosted_route_refusal(ref, workflow_ref, job))
+                    self.assertIsNotNone(hook.hosted_route_refusal(workflow_ref, job))
                     # and on the common path the job is refused, by this guard or by an earlier one that
                     # rejects the malformed payload outright; either way no mini takes it
                     got = self.run_hook("job-started", "workflow_run", path, "--allowed-repo", "manaflow-ai/cmux",
@@ -940,20 +940,32 @@ class HookTest(unittest.TestCase):
     def test_hosted_route_refusal_leaves_another_workflows_job_of_the_same_name_alone(self) -> None:
         # the scope is the workflow's identity, so a job named "poll" elsewhere is still admitted
         ref = "refs/heads/main"
-        for name, (r, wf) in {
-            "another workflow on main": (ref, f"manaflow-ai/cmux/.github/workflows/ci.yml@{ref}"),
-            "this workflow off main": ("refs/heads/topic",
-                                       "manaflow-ai/cmux/.github/workflows/"
-                                       "auto-resume-nightly-notarization.yml@refs/heads/topic"),
-            "no workflow ref": (ref, None),
+        for name, wf in {
+            "another workflow on main": f"manaflow-ai/cmux/.github/workflows/ci.yml@{ref}",
+            "a workflow whose name merely ends the same way":
+                f"manaflow-ai/cmux/.github/workflows/not-auto-resume-nightly-notarization.yml@{ref}",
+            "no workflow ref": None,
+            "not a workflow ref at all": "manaflow-ai/cmux@refs/heads/main",
         }.items():
             for job in hook.AUTO_RESUME_HOSTED_JOBS:
-                with self.subTest(case=name, job=job):
-                    self.assertIsNone(hook.hosted_route_refusal(r, wf, job))
-        for job in hook.AUTO_RESUME_HOSTED_JOBS:
-            with self.subTest(exact=job):
-                self.assertIsNotNone(hook.hosted_route_refusal(
-                    ref, f"manaflow-ai/cmux/.github/workflows/auto-resume-nightly-notarization.yml@{ref}", job))
+                with self.subTest(untouched=name, job=job):
+                    self.assertIsNone(hook.hosted_route_refusal(wf, job))
+        # this file's copy is refused on every ref, not only main: a workflow_dispatch of it from another
+        # branch would otherwise park a mini for the length of Apple's queue, and no ref's copy of these
+        # three does work a runner should take
+        for branch in ("refs/heads/main", "refs/heads/topic", "refs/tags/v1", "refs/pull/7/merge"):
+            for job in hook.AUTO_RESUME_HOSTED_JOBS:
+                with self.subTest(refused_on=branch, job=job):
+                    self.assertIsNotNone(hook.hosted_route_refusal(
+                        f"manaflow-ai/cmux/.github/workflows/"
+                        f"auto-resume-nightly-notarization.yml@{branch}", job))
+        # and a job of this file that does the nightly's work is still untouched on every ref
+        for branch in ("refs/heads/main", "refs/heads/topic"):
+            for job in (*hook.AUTO_RESUME_SIGNING_JOBS, *hook.AUTO_RESUME_LIGHT_JOBS):
+                with self.subTest(works=job, ref=branch):
+                    self.assertIsNone(hook.hosted_route_refusal(
+                        f"manaflow-ai/cmux/.github/workflows/"
+                        f"auto-resume-nightly-notarization.yml@{branch}", job))
 
     def test_classic_auto_resume_hosted_polls_are_refused_on_every_runner_class(self) -> None:
         """No glaeda runner class takes poll, poll-outer or poll-stapled, the general pool included.
@@ -985,17 +997,23 @@ class HookTest(unittest.TestCase):
                     trusted_next_signing=True, workflow_ref=workflow_ref, job=job, run_attempt="1"))
             # the pure gate, for every class at once
             with self.subTest(any_class=job):
-                self.assertIsNotNone(hook.hosted_route_refusal(ref, workflow_ref, job))
-        # a job that does the nightly's work is untouched on the common path, so this refuses by name and payload
-        # rather than refusing the whole workflow
+                self.assertIsNotNone(hook.hosted_route_refusal(workflow_ref, job))
+        # a job that does the nightly's work is untouched, so this refuses by name rather than refusing the
+        # whole workflow
         for job in (*hook.AUTO_RESUME_SIGNING_JOBS, *hook.AUTO_RESUME_LIGHT_JOBS):
             with self.subTest(works=job):
-                self.assertIsNone(hook.hosted_route_refusal(ref, workflow_ref, job))
-        # and a job merely sharing the name in another workflow is untouched: the scope is main's auto-resume copy
-        for other in (f"manaflow-ai/cmux/.github/workflows/nightly.yml@{ref}",
-                      f"manaflow-ai/cmux/.github/workflows/auto-resume-nightly-notarization.yml@refs/heads/other"):
-            with self.subTest(elsewhere=other):
-                self.assertIsNone(hook.hosted_route_refusal(ref, other, "poll"))
+                self.assertIsNone(hook.hosted_route_refusal(workflow_ref, job))
+        # a job merely sharing the name in another workflow is untouched: the scope is this workflow file
+        with self.subTest(elsewhere="nightly.yml"):
+            self.assertIsNone(hook.hosted_route_refusal(
+                f"manaflow-ai/cmux/.github/workflows/nightly.yml@{ref}", "poll"))
+        # but this file's own copy is refused on any ref, not only main: a workflow_dispatch of it from another
+        # branch reaches a runner with GITHUB_REF set to that branch, and no ref's copy of these three does work
+        # a runner should take
+        with self.subTest(elsewhere="this file off main"):
+            self.assertIsNotNone(hook.hosted_route_refusal(
+                "manaflow-ai/cmux/.github/workflows/auto-resume-nightly-notarization.yml@refs/heads/other",
+                "poll"))
 
     def test_classic_auto_resume_hosted_polls_rank_no_tier_on_any_runner(self) -> None:
         """AUTO_RESUME_HOSTED_JOBS get no FEED_FIRST tier, so a pool runner cannot prioritise a 6 h Apple wait.
