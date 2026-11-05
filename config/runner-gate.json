@@ -1,9 +1,15 @@
 {
   "schema": "glaeda-runner-gate/v1",
-  "note": "Per-mini listener-gate settings, read by scripts/glaeda-cmux-runner-hook from the release glaeda-update installed (docs/CMUX_MINI_RUNNER.md, 'Per-mini gate settings'). Keys under hosts are the short, lowercased hostname (hostname -s), not the manifest member name. cpuHold false: the CPU marks (85/80 over 60 s) never hold that mini's listeners; units, memory pressure, heat, disk and the fleet's holds still do. A host entry with an until (UTC) is ignored past it, so a trial ends by itself.",
+  "note": "Per-mini listener-gate settings, read by scripts/glaeda-cmux-runner-hook from the release glaeda-update installed (docs/CMUX_MINI_RUNNER.md, 'Per-mini gate settings'). Keys under hosts are the short, lowercased hostname (hostname -s), not the manifest member name. cpuHold false: the CPU marks (85/80 over 60 s) never hold that mini's listeners; units, memory pressure, heat, disk and the fleet's holds still do. A host entry with an until (UTC) is ignored past it, so a trial ends by itself. overloadHold (on with or without the CPU hold; side and root runners only, as gui, session, freshness, nightly and gateway runners are exempt like the CPU hold): an idle listener stops while the 1-minute load is at least pausePerCore x cores and CPU busy is at least cpuAtLeast %, and listens again below resumePerCore x cores; false turns it off, per host as well. A hold past 30 min listens anyway until the load falls (GATE_LOAD_MAX_HOLD_S), so no label is stranded.",
   "defaults": {
     "cpuHold": false,
-    "why": "2026-10-30 A/B (glaeda#1757): with the CPU hold off, 3 std minis started 15% more jobs per mini-hour than 3 matched controls (difference-in-differences against the 2 h before), with no rise in failures, no slower normalized p90 and shorter nightly waits. Units, memory pressure, heat, disk and the fleet's holds still gate every listener."
+    "why": "2026-10-30 A/B (glaeda#1757): with the CPU hold off, 3 std minis started 15% more jobs per mini-hour than 3 matched controls (difference-in-differences against the 2 h before), with no rise in failures, no slower normalized p90 and shorter nightly waits. Units, memory pressure, heat, disk and the fleet's holds still gate every listener.",
+    "overloadHold": {
+      "pausePerCore": 2.0,
+      "resumePerCore": 1.5,
+      "cpuAtLeast": 80,
+      "why": "2026-11-05 (Leo: \"i meant can you do all of htem\", research/2026-11-05-where-we-stand.md section 4, route by pressure): cmux8s-14 took jobs at loads 90-122 on 14 cores (cmux14 8.5 per core, 100% CPU, 13 of 14 units) while other Macs idled. Past twice the cores another job only slows the running ones; held off, the job goes to a mini with room or the overflow. The CPU must agree because the 09-28 load-only gate held 578 runner-hours at 34-59% CPU."
+    }
   },
   "hosts": {
     "cmux16": {

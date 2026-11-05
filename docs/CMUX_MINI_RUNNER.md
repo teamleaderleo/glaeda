@@ -398,6 +398,15 @@ What `--apply` does:
        off started 15% more jobs per mini-hour than three matched controls, with no rise in
        failures, no slower normalized p90 and shorter nightly waits; the units ledger and memory
        pressure were the binding limits. Reserved minis keep the hold by host entry.
+     - **Overload hold** (`overloadHold` in the same file, on with or without the CPU hold). A
+       side or root listener stops while the 1-minute load is at least `pausePerCore` times the
+       cores (2.0) and CPU busy is at least `cpuAtLeast` (80%), and listens again below
+       `resumePerCore` (1.5). Without the CPU check, the old load-only gate held 578 runner-hours on
+       09-28 at 34-59% CPU. On 2026-11-05 the units ledger let cmux8s-14 take jobs at loads of
+       90-122 on 14 cores while other Macs idled. The gui, session, freshness, nightly and
+       gateway runners are exempt, as they are from the CPU hold, because their labels have few
+       other runners. A hold longer than `GATE_LOAD_MAX_HOLD_S` (30 min) listens anyway until the
+       load falls, so no label is stranded. `false` turns the hold off, by default or per host.
      - The gui runner is never held for CPU saturation (85% busy), only for memory
        pressure: its jobs come one per mini and are admitted by units like any other,
        and the CPU mark held it whenever the other lanes kept the mini busy. Nothing

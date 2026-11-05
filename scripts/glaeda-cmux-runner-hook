@@ -1264,9 +1264,18 @@ GATE_SETTINGS_DIR = os.environ.get("GLAEDA_RUNNER_GATE_SETTINGS_DIR") or ""
 GATE_SETTINGS_FILE = "glaeda/config/runner-gate.json"
 GATE_SETTINGS_SCHEMA = "glaeda-runner-gate/v1"
 GATE_SETTINGS_EVERY_S = 60.0
-# Kept for the pure mini_saturated helper and old operator tooling; the listener gate no longer uses load average.
+# The overload hold's code default (config/runner-gate.json's overloadHold overrides it; gate_overload_marks): an idle
+# listener stops once the 1-minute load is at least GATE_LOAD_PAUSE per core while host CPU busy is at least
+# GATE_OVERLOAD_CPU_MIN %, and listens again below GATE_LOAD_RESUME per core. It applies even with the CPU hold off.
+# The old load-only gate held 578 runner-hours on 09-28 at 34-59% CPU (load counted threads in I/O wait), so the
+# CPU must agree; an unreadable CPU sample leaves the load to decide, an unreadable load never holds.
+# 2026-11-05 07:43-08:20Z: units let cmux8s-14 take jobs at loads 90-122 on 14 cores (cmux14 8.5 per core at 100%
+# CPU, 13 of 14 units) while other Macs idled; past twice the cores another job only slows the ones running.
+# mini_saturated (old operator tooling) keeps the same marks.
 GATE_LOAD_PAUSE = float(os.environ.get("GLAEDA_RUNNER_GATE_LOAD_PAUSE") or 2.0)
 GATE_LOAD_RESUME = float(os.environ.get("GLAEDA_RUNNER_GATE_LOAD_RESUME") or 1.5)
+GATE_OVERLOAD_CPU_MIN = float(os.environ.get("GLAEDA_RUNNER_GATE_OVERLOAD_CPU_MIN") or 80.0)
+OVERLOADED = "the mini is overloaded"
 SATURATED = "the mini is saturated"
 # A load hold longer than this is not a compile (measured compile p99 is about 18 min): something outside CI (a leaked process,
 # Spotlight, a software update) is loading the mini. The gate then listens anyway, logs it, and only pauses for
@@ -5777,6 +5786,86 @@ def gate_cpu_hold(doc: dict[str, Any] | None, host: str, now: float) -> tuple[bo
     return entry["cpuHold"], f"runner-gate.json hosts.{host}"
 
 
+def _live_entry(entry: Any, now: float) -> bool:
+    """Whether a runner-gate.json host entry applies at `now` (epoch seconds): no "until", or an aware "until"
+    still ahead. An "until" that does not parse, or has no zone, never applies."""
+    until = entry.get("until") if isinstance(entry, dict) else None
+    if until is None:
+        return isinstance(entry, dict)
+    try:
+        ends = datetime.datetime.fromisoformat(str(until).replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    return ends.tzinfo is not None and now < ends.timestamp()
+
+
+def _overload_marks(value: Any) -> tuple[float, float, float] | None | bool:
+    """One overloadHold value read: false is off (None), true is the code marks, and a dict sets pausePerCore >=
+    resumePerCore > 0 and cpuAtLeast (0-100), each defaulting to the code mark. Anything else is not a setting
+    (False), which the caller ignores."""
+    code = (GATE_LOAD_PAUSE, GATE_LOAD_RESUME, GATE_OVERLOAD_CPU_MIN)
+    if value is True:
+        return code
+    if value is False:
+        return None
+    if not isinstance(value, dict):
+        return False
+    try:
+        pause = float(value.get("pausePerCore", code[0]))
+        resume = float(value.get("resumePerCore", code[1]))
+        cpu = float(value.get("cpuAtLeast", code[2]))
+    except (TypeError, ValueError):
+        return False
+    if not (0 < resume <= pause and math.isfinite(pause) and 0 <= cpu <= 100):
+        return False
+    return pause, resume, cpu
+
+
+def gate_overload_marks(doc: dict[str, Any] | None, host: str, now: float) -> tuple[float, float, float] | None:
+    """The overload hold's (pause per core, resume per core, CPU busy % at least) for this mini, or None when it is
+    off: the host's live overloadHold entry, else defaults.overloadHold, else the code marks. A value that is not a
+    bool or a valid dict is ignored, like an "until" that does not parse."""
+    marks: tuple[float, float, float] | None = (GATE_LOAD_PAUSE, GATE_LOAD_RESUME, GATE_OVERLOAD_CPU_MIN)
+    if not isinstance(doc, dict):
+        return marks
+    defaults = doc.get("defaults")
+    if isinstance(defaults, dict) and "overloadHold" in defaults:
+        got = _overload_marks(defaults["overloadHold"])
+        if got is not False:
+            marks = got  # type: ignore[assignment]
+    hosts = doc.get("hosts")
+    entry = hosts.get(host) if isinstance(hosts, dict) else None
+    if isinstance(entry, dict) and "overloadHold" in entry and _live_entry(entry, now):
+        got = _overload_marks(entry["overloadHold"])
+        if got is not False:
+            marks = got  # type: ignore[assignment]
+    return marks
+
+
+def host_overloaded(paused: bool, load: float | None, cores: int | None, cpu_busy: float | None,
+                    marks: tuple[float, float, float] | None) -> str | None:
+    """Why the listener should pause because the mini runs well past its cores, or None: the 1-minute load is at
+    least marks[0] per core (marks[1] once `paused`, so it does not flap) and CPU busy, when readable, is at least
+    marks[2] %. No marks, no load or no core count never holds. The text is stable, so a held gate logs it once."""
+    if marks is None or load is None or not cores or cores <= 0:
+        return None
+    pause, resume, cpu_min = marks
+    if load < (resume if paused else pause) * cores:
+        return None
+    if cpu_busy is not None and cpu_busy < cpu_min:
+        return None
+    return (f"{SATURATED}: {OVERLOADED} (1-minute load at least {pause:g} per core on {cores} cores with CPU busy at "
+            f"least {cpu_min:g}%; listening resumes below {resume:g} per core)")
+
+
+def load_average() -> float | None:
+    """The 1-minute load average, or None when it cannot be read."""
+    try:
+        return os.getloadavg()[0]
+    except OSError:
+        return None
+
+
 def host_saturated(paused: bool, cpu_busy: float | None = None, memory_pressure: int | None = None) -> str | None:
     """Why the listener should pause from measured host pressure, or None when it has headroom.
 
@@ -6236,6 +6325,9 @@ class Gate:
         self.memory_at = -GATE_CPU_EVERY_S
         self.cpu_hold = True  # config/runner-gate.json's cpuHold for this mini (cpu_holds), read every GATE_SETTINGS_EVERY_S
         self.cpu_hold_why = "the code default"
+        # config/runner-gate.json's overloadHold for this mini (gate_overload_marks), read with cpuHold
+        self.overload: tuple[float, float, float] | None = (GATE_LOAD_PAUSE, GATE_LOAD_RESUME, GATE_OVERLOAD_CPU_MIN)
+        self.load1: float | None = None
         self.settings_at = -GATE_SETTINGS_EVERY_S
         self.console_why: str | None = None  # the last console_refusal, read at most every GATE_CONSOLE_EVERY_S
         self.console_at = -GATE_CONSOLE_EVERY_S
@@ -6426,6 +6518,11 @@ class Gate:
         if (hold, why) != (self.cpu_hold, self.cpu_hold_why):
             gate_log(f"the CPU hold is {'on' if hold else 'off'} on this mini ({why})")
         self.cpu_hold, self.cpu_hold_why = hold, why
+        overload = gate_overload_marks(doc, gate_host(), time.time())
+        if overload != self.overload:
+            gate_log("the overload hold is " + (f"at {overload[0]:g} per core (resume {overload[1]:g}, CPU at least "
+                                                f"{overload[2]:g}%)" if overload else "off") + " on this mini")
+        self.overload = overload
         return hold
 
     def saturated(self) -> str | None:
@@ -6454,16 +6551,22 @@ class Gate:
         about no CPU, and the build they submit runs wherever the controller has room."""
         now = time.monotonic()
         scope = runner_scope(self.runner_dir)
-        if scope.gui or scope.session or scope.fresh or scope.nightly or scope.gateway or not self.cpu_holds():
-            self.cpu_busy = None
+        exempt = scope.gui or scope.session or scope.fresh or scope.nightly or scope.gateway
+        cpu_hold = not exempt and self.cpu_holds()
+        overload = None if exempt else self.overload  # cpu_holds() above refreshed it
+        if not cpu_hold and overload is None:
+            self.cpu_busy, self.load1 = None, None
         elif now - self.cpu_at >= GATE_CPU_EVERY_S:
             self.cpu_busy = self.cpu_look(now)
+            self.load1 = load_average()
             self.cpu_at = now
         if now - self.memory_at >= GATE_CPU_EVERY_S:
             self.memory_pressure = memory_pressure_level()
             self.memory_at = now
-        why = host_saturated(paused=self.load_since is not None or self.load_waived,
-                             cpu_busy=self.cpu_busy, memory_pressure=self.memory_pressure)
+        paused = self.load_since is not None or self.load_waived
+        why = (host_saturated(paused=paused, cpu_busy=self.cpu_busy if cpu_hold else None,
+                              memory_pressure=self.memory_pressure)
+               or host_overloaded(paused, self.load1, os.cpu_count(), self.cpu_busy, overload))
         if why is None:
             if self.load_waived:
                 gate_log("host pressure fell below the resume mark; pressure holds apply again")

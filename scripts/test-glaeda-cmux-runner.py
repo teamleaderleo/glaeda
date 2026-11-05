@@ -7879,6 +7879,7 @@ class GateTest(unittest.TestCase):
                 mock.patch.object(fresh, "host_cpu_ticks", return_value=None), \
                 mock.patch.object(fresh, "host_io", side_effect=lambda: (0.0, busy[0])), \
                 mock.patch.object(fresh, "memory_pressure_level", return_value=1), \
+                mock.patch.object(fresh, "load_average", return_value=1.0), \
                 mock.patch.object(fresh, "thermal_pressure_level", return_value=0):
             for cpu, held in ((84.9, False), (85.0, True), (82.0, True), (80.0, True), (79.9, False), (84.0, False),
                               (90.0, True)):
@@ -7932,7 +7933,7 @@ class GateTest(unittest.TestCase):
             patcher.start()
             self.addCleanup(patcher.stop)
         for name, fake in (("host_io", lambda: (0.0, busy[0])), ("memory_pressure_level", lambda: pressure[0]),
-                           ("gate_host", lambda: host[0])):
+                           ("gate_host", lambda: host[0]), ("load_average", lambda: 1.0)):
             patcher = mock.patch.object(hook, name, side_effect=fake)
             patcher.start()
             self.addCleanup(patcher.stop)
@@ -7954,11 +7955,86 @@ class GateTest(unittest.TestCase):
         doc = json.loads((ROOT / "config" / "runner-gate.json").read_text())
         self.assertEqual(doc["schema"], hook.GATE_SETTINGS_SCHEMA)
         self.assertIsInstance(doc["defaults"]["cpuHold"], bool)
+        self.assertIsNot(hook._overload_marks(doc["defaults"].get("overloadHold", True)), False,
+                         "defaults.overloadHold is false, true or a valid dict")
+        self.assertEqual(hook.gate_overload_marks(doc, "any-std-mini", 1_800_000_000.0), (2.0, 1.5, 80.0),
+                         "the declared marks: hold past twice the cores")
         for host, entry in doc.get("hosts", {}).items():
             self.assertRegex(host, r"^[a-z0-9-]+$", "keys are hostname -s, lowercased")
             self.assertIsInstance(entry["cpuHold"], bool, host)
             if "until" in entry:
                 self.assertIsNotNone(datetime.datetime.fromisoformat(entry["until"].replace("Z", "+00:00")).tzinfo, host)
+
+    def test_overload_hold_marks_come_from_runner_gate_json(self) -> None:
+        now = 1_800_000_000.0
+        later = datetime.datetime.fromtimestamp(now + 3600, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        earlier = datetime.datetime.fromtimestamp(now - 1, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        code = (hook.GATE_LOAD_PAUSE, hook.GATE_LOAD_RESUME, hook.GATE_OVERLOAD_CPU_MIN)
+        self.assertEqual(hook.gate_overload_marks(None, "x", now), code, "no settings: the code marks")
+        doc = {"schema": hook.GATE_SETTINGS_SCHEMA,
+               "defaults": {"overloadHold": {"pausePerCore": 3, "resumePerCore": 2, "cpuAtLeast": 90}},
+               "hosts": {"off": {"overloadHold": False}, "trial": {"overloadHold": False, "until": later},
+                         "over": {"overloadHold": False, "until": earlier}, "junk": {"overloadHold": "no"},
+                         "bad": {"overloadHold": {"pausePerCore": 1, "resumePerCore": 2}},
+                         "on": {"overloadHold": True}}}
+        self.assertEqual(hook.gate_overload_marks(doc, "other", now), (3.0, 2.0, 90.0))
+        self.assertIsNone(hook.gate_overload_marks(doc, "off", now))
+        self.assertIsNone(hook.gate_overload_marks(doc, "trial", now))
+        for host in ("over", "junk", "bad"):
+            self.assertEqual(hook.gate_overload_marks(doc, host, now), (3.0, 2.0, 90.0), f"{host}: ignored")
+        self.assertEqual(hook.gate_overload_marks(doc, "on", now), code)
+        self.assertIsNone(hook.gate_overload_marks({"defaults": {"overloadHold": False}}, "x", now))
+
+    def test_an_overloaded_mini_holds_side_listeners_past_twice_its_cores(self) -> None:
+        marks = (2.0, 1.5, 80.0)
+        self.assertIsNone(hook.host_overloaded(False, 27.9, 14, 100.0, marks))
+        why = hook.host_overloaded(False, 28.0, 14, 100.0, marks)
+        self.assertTrue(why and why.startswith(hook.SATURATED) and hook.OVERLOADED in why, why)
+        self.assertEqual(why, hook.host_overloaded(False, 119.0, 14, 100.0, marks), "stable text, logged once")
+        self.assertIsNone(hook.host_overloaded(False, 119.0, 14, 59.0, marks),
+                          "load with idle CPU (threads in I/O wait, 09-28) holds nothing")
+        self.assertIsNotNone(hook.host_overloaded(False, 119.0, 14, None, marks), "unreadable CPU: the load decides")
+        self.assertIsNotNone(hook.host_overloaded(True, 21.0, 14, 100.0, marks), "held: resumes below 1.5 per core")
+        self.assertIsNone(hook.host_overloaded(True, 20.9, 14, 100.0, marks))
+        for load, cores, m in ((None, 14, marks), (99.0, 0, marks), (99.0, None, marks), (99.0, 14, None)):
+            self.assertIsNone(hook.host_overloaded(False, load, cores, 100.0, m))
+        with mock.patch.object(hook.os, "getloadavg", side_effect=OSError):
+            self.assertIsNone(hook.load_average())
+
+        # the gate: with the CPU hold off (the declared default) a side listener is still held for overload,
+        # a gui runner is not, and a hold past GATE_LOAD_MAX_HOLD_S listens anyway so no label is stranded
+        update = self.gate_settings_release({"schema": hook.GATE_SETTINGS_SCHEMA, "defaults": {
+            "cpuHold": False, "overloadHold": {"pausePerCore": 2.0, "resumePerCore": 1.5, "cpuAtLeast": 80}}})
+        load = [100.0]
+        for name, value in (("GATE_CPU_EVERY_S", 0.0), ("GATE_SETTINGS_EVERY_S", 0.0),
+                            ("GATE_SETTINGS_DIR", os.fspath(update))):
+            patcher = mock.patch.object(hook, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        for name, fake in (("host_io", lambda: (0.0, 100.0)), ("host_cpu_ticks", lambda: None),
+                           ("memory_pressure_level", lambda: 1), ("load_average", lambda: load[0]),
+                           ("gate_host", lambda: "std")):
+            patcher = mock.patch.object(hook, name, side_effect=fake)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        patcher = mock.patch.object(hook.os, "cpu_count", return_value=14)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        gate = hook.Gate(self.runner, os.fspath(self.lock), os.fspath(self.tmp / "none.json"), self.state)
+        with mock.patch.object(hook, "gate_log"):
+            why = gate.saturated()
+            self.assertTrue(why and hook.OVERLOADED in why, why)
+            load[0] = 22.0
+            self.assertIsNotNone(gate.saturated(), "between the marks a held gate stays held")
+            load[0] = 20.0
+            self.assertIsNone(gate.saturated(), "below 1.5 per core it listens again")
+            load[0] = 100.0
+            self.assertIsNotNone(gate.saturated())
+            gate.load_since -= hook.GATE_LOAD_MAX_HOLD_S
+            self.assertIsNone(gate.saturated(), "past the max hold it listens anyway")
+            gate.load_since, gate.load_waived = None, False
+            with mock.patch.object(hook, "runner_scope", return_value=hook.RunnerScope(gui=True)):
+                self.assertIsNone(gate.saturated(), "a gui runner (its label has no other runners) is exempt")
 
     def test_host_pressure_gate_uses_cpu_and_memory_not_load_average(self) -> None:
         with mock.patch.object(hook, "GATE_CPU_PAUSE", 80.0), mock.patch.object(hook, "GATE_CPU_RESUME", 70.0):
