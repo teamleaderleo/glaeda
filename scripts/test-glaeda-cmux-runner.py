@@ -2552,8 +2552,10 @@ class HookTest(unittest.TestCase):
     def claim(self, verb: str, runner: str, *extra: str, watch: int | None = None,
               env: dict | None = None) -> subprocess.CompletedProcess:
         """A job step calling claim-release or claim-reacquire, for the job whose Runner.Worker is watch."""
+        told = {"GITHUB_ENV": os.fspath(self.dir / f"claim-env-{runner}")}  # a runner step always has one
         return self.run_hook(verb, None, None, "--state-dir", os.fspath(self.dir / "state"),
-                             "--watch-pid", str(watch or os.getpid()), *extra, env={"RUNNER_NAME": runner, **(env or {})})
+                             "--watch-pid", str(watch or os.getpid()), *extra,
+                             env={"RUNNER_NAME": runner, **told, **(env or {})})
 
     def orphan_in_work(self) -> int:
         """A process working in a runner's _work whose parent is gone (so it descends from no test process, which a
@@ -2791,6 +2793,49 @@ class HookTest(unittest.TestCase):
             self.finish("s2")
             self.finish("s0")
         self.assertTrue(self.whole_mini_free())
+
+    def claim_fixture(self, runner: str = "c0", **fields) -> tuple[Path, Path]:
+        """A claim record for a job whose Runner.Worker is this test process, written as job-started writes it, on a
+        trusted-only runner; returns (state dir, record path). In-process callers patch RUNNER_NAME to runner."""
+        state, capacity = self.dir / "state", self.dir / "capacity"
+        state.mkdir(parents=True, exist_ok=True)
+        capacity.mkdir(parents=True, exist_ok=True)
+        owner = hook.JobOwner.of(os.getpid())
+        record = hook.claim_record(owner, {"units": 14, "tokens": []}, capacity_dir=capacity,
+                                   host_lock=os.fspath(self.fleet() / "host.lock"), total=14, compile_slots=1, roots=1,
+                                   instance=0, job="sign-nightly-identity-legacy", workflow="nightly.yml",
+                                   repo="manaflow-ai/cmux", home_repo="manaflow-ai/cmux", tier=hook.TIER_NIGHTLY,
+                                   signs_first=True, nightly_runner=True, gui_token="gui", drain_bound=1.0,
+                                   trusted=True)
+        record.update(fields)
+        path = hook.claim_record_file(state, runner)
+        path.write_text(json.dumps(record) + "\n")
+        return state, path
+
+    def test_claim_release_keeps_the_claim_when_later_steps_cannot_be_told(self) -> None:
+        """CLAIM_SLEEP review F1: later steps must see GLAEDA_JOB_CLAIM=released before anything is let go. With no
+        $GITHUB_ENV, or one that cannot be written, claim-release keeps the claim and exits 1."""
+        state, path = self.claim_fixture()
+        unwritable = self.dir / "github-env-is-a-dir"
+        unwritable.mkdir()
+        for github_env in (None, os.fspath(unwritable)):
+            with self.subTest(github_env=github_env):
+                environ = {"RUNNER_NAME": "c0", **({"GITHUB_ENV": github_env} if github_env else {})}
+                with mock.patch.dict(os.environ, environ), mock.patch.object(hook, "release_host_lock") as release:
+                    if github_env is None:
+                        os.environ.pop("GITHUB_ENV", None)
+                    code, why = hook.claim_release(state, os.getpid(), [os.fspath(self.dir / "gone.p8")], [])
+                self.assertEqual(code, 1, why)
+                self.assertIn("keeps the whole Mac", why)
+                release.assert_not_called()
+                self.assertEqual(hook.read_claim_record(path)["state"], "held")
+        told = self.dir / "github-env"
+        with mock.patch.dict(os.environ, {"RUNNER_NAME": "c0", "GITHUB_ENV": os.fspath(told)}), \
+                mock.patch.object(hook, "release_host_lock", return_value="released") as release:
+            code, why = hook.claim_release(state, os.getpid(), [os.fspath(self.dir / "gone.p8")], [])
+        self.assertEqual(code, 0, why)
+        release.assert_called_once()
+        self.assertEqual(told.read_text(), "GLAEDA_JOB_CLAIM=released\n")
 
     def signing_hooks(self, *shas: str) -> tuple[dict, str]:
         """A glaeda-signing-hooks.txt at manaflow-ai/cmux@SHA listing these hook shas, served through
