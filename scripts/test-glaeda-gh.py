@@ -7432,7 +7432,10 @@ class BrokerMergeGuardTest(BrokerBase):
                      ["api", "graphql?x=y", "-f", "query=mutation { mergePullRequest(input: {}) { clientMutationId } }"],
                      # F2 on #1878: a file is the guard's to read (it snapshots it), whatever it says now
                      ["api", "graphql", "-F", "query=@" + str(self.home / "benign.graphql")],
-                     ["api", "graphql", "--input=" + str(self.home / "benign.json")]):
+                     ["api", "graphql", "--input=" + str(self.home / "benign.json")],
+                     ["api", "-X", "PUT", "HTTPS://API.GITHUB.COM/repos/o/r/pulls/5/merge"],  # second review F1
+                     ["api", "HTTPS://api.github.com/graphql", "-f", "query=mutation { mergePullRequest(input: {}) "
+                      "{ clientMutationId } }"]):
             with self.subTest(args=args):
                 code, _err, path, passed = self.route(args)
                 self.assertIsNone(code)
@@ -7463,6 +7466,22 @@ class BrokerMergeGuardTest(BrokerBase):
         _code, _err, path, passed = self.route(args)
         self.assertEqual(path, os.environ["GLAEDA_GH_REAL"])
         self.assertEqual(passed, args)
+
+    def test_a_guard_lookup_that_fails_refuses_the_merge(self) -> None:
+        os.environ["GLAEDA_MERGE_GUARD"] = "/" + "x" * 5000  # is_file() raises: name too long
+        code, err, path, _passed = self.route(["pr", "merge", "7", "-R", "o/r", "--squash"])
+        self.assertEqual(code, gg.BROKER_EXIT_REFUSED)
+        self.assertIsNone(path)
+        self.assertIn("refused", err)
+
+    def test_a_help_request_is_never_a_merge(self) -> None:
+        os.environ["GLAEDA_MERGE_GUARD"] = str(self.home / "nowhere" / "gh")
+        for args in (["pr", "merge", "--help"], ["pr", "merge", "-h"],
+                     ["api", "-X", "PUT", "repos/o/r/pulls/5/merge", "--help"]):
+            with self.subTest(args=args):
+                code, _err, path, _passed = self.route(args)
+                self.assertNotEqual(code, gg.BROKER_EXIT_REFUSED)
+                self.assertNotEqual(path, str(self.home / "nowhere" / "gh"))
 
     def test_no_guard_on_the_host_refuses_the_merge(self) -> None:
         os.environ["GLAEDA_MERGE_GUARD"] = str(self.home / "nowhere" / "gh")

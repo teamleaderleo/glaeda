@@ -8079,12 +8079,16 @@ def broker_merge_call(args: list[str]) -> bool:
     that names a merge mutation inline or reads any file or stdin (`--input`, `-F k=@F`). A file is never read here:
     it could change between this read and gh's (router-review F2 on #1878), so the guard, which snapshots it before it
     judges (merge_hold.snapshot), gets every such call. A `?query` suffix on the endpoint is ignored (F1)."""
-    words, method, _seen, _values = broker_words(args)
+    words, method, seen, _values = broker_words(args)
+    if "--help" in seen or "-h" in seen or any(a.lower() in ("--help=true", "--help=1") for a in args):
+        return False  # gh prints help and does nothing else (router-review F3 on #1878)
     if words[:2] == ["pr", "merge"]:
         return True
     if words[:1] != ["api"] or len(words) < 2:
         return False
     endpoint = words[1].split("?", 1)[0].split("#", 1)[0]
+    # gh takes `HTTPS://API.GITHUB.COM/...` as well: the scheme and host are matched lowercased (F1, second review).
+    endpoint = re.sub(r"^[A-Za-z][A-Za-z0-9+.-]*://[^/]*", lambda m: m.group(0).lower(), endpoint)
     if method != "GET" and BROKER_REST_MERGE.match(endpoint):
         return True
     if not AUDIT_GRAPHQL_RE.match(endpoint):
@@ -8109,16 +8113,23 @@ def broker_merge_handoff(args: list[str]) -> int | None:
     when the call is no such merge."""
     if os.environ.get("GH_QUOTA_CHECKED") or not broker_merge_call(args):
         return None
-    guard = Path(os.environ.get(MERGE_GUARD_ENV) or PACE_CLI)
-    if not (guard.is_file() and os.access(guard, os.X_OK)):
+    # From here the call is a merge: anything that fails refuses it, never runs it unguarded (F2, second review).
+    try:
+        guard = Path(os.environ.get(MERGE_GUARD_ENV) or PACE_CLI)
+        usable = guard.is_file() and os.access(guard, os.X_OK)
+    except Exception as error:  # noqa: BLE001
+        print(f"glaeda-gh: refused: {' '.join(['gh', *args][:3])} merges, and the gh-quota guard could not be "
+              f"found: {describe(error)}", file=sys.stderr)
+        return BROKER_EXIT_REFUSED
+    if not usable:
         print(f"glaeda-gh: refused: {' '.join(['gh', *args][:3])} merges, and merges go through the host's gh-quota "
               f"guard (merge_hold), which is not at {guard}. Run `gh pr merge N --squash --match-head-commit SHA` "
               f"on a host with the guard (leo-workspace tools/host-baseline gh-quota).", file=sys.stderr)
         return BROKER_EXIT_REFUSED
-    os.environ["PATH"] = os.pathsep.join([str(guard.parent), os.environ.get("PATH", "")])
     try:
+        os.environ["PATH"] = os.pathsep.join([str(guard.parent), os.environ.get("PATH", "")])
         os.execv(str(guard), [str(guard), *args])
-    except OSError as error:
+    except Exception as error:  # noqa: BLE001
         print(f"glaeda-gh: refused: cannot run the merge guard {guard}: {describe(error)}", file=sys.stderr)
         return BROKER_EXIT_REFUSED
     return EXIT_OK  # unreachable: execv replaces this process
