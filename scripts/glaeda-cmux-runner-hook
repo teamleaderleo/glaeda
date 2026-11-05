@@ -5596,6 +5596,26 @@ def append_github_env(lines: str) -> bool:
     return False
 
 
+def append_github_env_confirmed(lines: str) -> bool:
+    """append_github_env, then proof it landed: flushed to disk and the file now ends with lines. False when there is no
+    $GITHUB_ENV or any of it fails, so a caller that must tell later steps first can fail closed."""
+    target = os.environ.get("GITHUB_ENV")
+    if not target:
+        return False
+    try:
+        with open(target, "a", encoding="utf-8") as env_file:
+            env_file.write(lines)
+            env_file.flush()
+            os.fsync(env_file.fileno())
+        with open(target, "rb") as env_file:
+            size = os.fstat(env_file.fileno()).st_size
+            data = lines.encode()
+            env_file.seek(max(0, size - len(data)))
+            return env_file.read() == data
+    except OSError:
+        return False
+
+
 def claim_release(state_dir: Path, watch_pid: int, removed: list[str], forbid_env: list[str]) -> tuple[int, str]:
     """claim-release: (0, note) once this job's whole-Mac claim is let go, (1, why) when it keeps it, (2, why) for a
     call that is wrong. Never releases before every proof holds."""
@@ -5628,17 +5648,21 @@ def claim_release(state_dir: Path, watch_pid: int, removed: list[str], forbid_en
         if holders:
             return 1, ("a process of this job still has a credential in its environment, so the job keeps the whole "
                        "Mac: " + ", ".join(f"pid {pid} {name}" for pid, name in holders[:8]))
-    # released first: from here another signing job's drain does not wait on this job's own processes
+    # later steps are told first, and the claim is let go only once that write is proven: a step after a release that
+    # still saw GLAEDA_JOB_CLAIM=exclusive could read a key beside other jobs
+    if not append_github_env_confirmed(f"{JOB_CLAIM_ENV}={CLAIM_RELEASED_ENV}\n"):
+        return 1, (f"cannot tell later steps {JOB_CLAIM_ENV}={CLAIM_RELEASED_ENV} through $GITHUB_ENV, so the job keeps "
+                   "the whole Mac")
+    # then the record: from here another signing job's drain does not wait on this job's own processes
     record.update(state=CLAIM_RELEASED, released_at=time.time())
     try:
         write_claim_record(path, record)
     except OSError as error:
         return 1, f"cannot write the claim record ({type(error).__name__}); the job keeps the whole Mac"
     note = release_host_lock(state_dir)
-    told = append_github_env(f"{JOB_CLAIM_ENV}={CLAIM_RELEASED_ENV}\n")
     return 0, (f"released the whole Mac while this job sleeps ({note}); proven: {len(removed)} path(s) absent, "
-               f"{len(forbid_env)} variable(s) in no process of the job"
-               + (f"; later steps see {JOB_CLAIM_ENV}={CLAIM_RELEASED_ENV}" if told else ""))
+               f"{len(forbid_env)} variable(s) in no process of the job; later steps see "
+               f"{JOB_CLAIM_ENV}={CLAIM_RELEASED_ENV}")
 
 
 def claim_reacquire(state_dir: Path, watch_pid: int, wait_s: float | None) -> tuple[int, str]:
