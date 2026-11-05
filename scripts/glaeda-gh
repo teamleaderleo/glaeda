@@ -479,15 +479,31 @@ def ran_nothing_suites(commit: dict | None) -> list[str] | str:
         return "graphql: last real attempt: the commit's check suites could not be read"
     if (suites.get("pageInfo") or {}).get("hasNextPage"):
         return "graphql: last real attempt: more than 100 check suites on one commit"
+    nodes = suites.get("nodes")
+    if not isinstance(nodes, list):
+        return "graphql: last real attempt: malformed check suites (no node list)"
     out = []
-    for suite in (suites.get("nodes") or []):
-        if not suite:
-            continue
-        latest = ((suite.get("latest") or {}).get("totalCount")) or 0
-        every = ((suite.get("every") or {}).get("totalCount")) or 0
-        if latest == 0 and every > 0 and suite.get("id"):
+    for suite in nodes:
+        # A null node, or a null, missing or non-count total, is GitHub failing that field beside a nested error:
+        # read as zero it made a partial read look complete and could hide an older red (glaeda#1844 F1).
+        latest = count_field(suite, "latest")
+        every = count_field(suite, "every")
+        if latest is None or every is None:
+            return "graphql: last real attempt: malformed check suite counts (a partial read)"
+        if latest == 0 and every > 0:
+            if not suite.get("id"):
+                return "graphql: last real attempt: malformed check suite (no id)"
             out.append(suite["id"])
     return out
+
+
+def count_field(suite: object, field: str) -> int | None:
+    """SUITE's FIELD.totalCount when it is a whole number of zero or more, else None (unread or malformed)."""
+    if not isinstance(suite, dict):
+        return None
+    holder = suite.get(field)
+    total = holder.get("totalCount") if isinstance(holder, dict) else None
+    return total if type(total) is int and total >= 0 else None
 
 
 COMMENT_FIELDS = f"""comments(last: {COMMENTS_LAST}) {{ totalCount nodes {{ databaseId url createdAt
@@ -3193,6 +3209,10 @@ class Daemon:
             return [], suites
         if not suites:
             return [], None
+        if not self.gql_room():
+            # Paced like every other query (glaeda#1844 F2): a batch of heads with startup_failure suites must not spend
+            # past graphqlPerMinute. Unread is partial, never green; the next cycle reads it.
+            return [], "graphql: last real attempt: held by graphqlPerMinute; read next cycle"
         reason, self.gql_reason = self.gql_reason, "last-real-attempt"
         try:
             doc, error = self.graphql(SUITE_RUNS, {"suites": suites})
