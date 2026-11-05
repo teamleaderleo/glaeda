@@ -2294,8 +2294,27 @@ def sync_dir(path: Path) -> None:
 # that fails is retried once, then holds like a blocker, inside the same cap (2026-11-05 10:16Z: a failed read let a
 # signing runner take hook bcdd1aac over a run in progress that lacked it).
 SIGN_HOLD_REPO = "manaflow-ai/cmux"
-SIGN_HOLD_RUNS_URL = ("https://api.github.com/repos/{repo}/actions/workflows/nightly.yml/runs"
-                      "?branch=nightly-next&per_page=100")
+# SIGN_HOLD_SOURCES: the (workflow file, the branches whose runs hold) the hold reads. One entry per workflow whose
+# signing jobs this runner admits, so the hold covers every one of them: nightly.yml on nightly-next (TRUSTED_NEXT_SIGNING)
+# and on main, and auto-resume-nightly-notarization.yml on main (ONE_MINI_NIGHTLY, AUTO_RESUME). With nightly-next alone,
+# a hook rolled here while cmux main's list lacked it refused main's signing jobs instead of holding the old hook: that
+# list trails nightly-next's by several releases (091eec20 against bcdd1aac on 2026-11-05), so every classic signing job
+# would have been refused until a cmux pull request landed, and the job then requeues rather than reaching a signer.
+# Branches are filtered here, not in the query, so one runs-list pass per workflow covers all of its branches: nightly.yml
+# costs the same reads for both branches as it did for one. A workflow's runs are listed per active status
+# (sign_hold_runs), so a discovery pass is len(SIGN_HOLD_SOURCES) * len(SIGN_HOLD_ACTIVE) list reads (10, against 5 for
+# nightly-next alone) plus one raw read per distinct head commit, cached in the state file and shared across the sources.
+# That pass is not periodic: refresh_hook_dir consults the hold only while a signing runner's installed hook differs from
+# the release's, so a converged host reads nothing, and once a blocker is known glaeda#1864 rechecks it through the build
+# controller over the tailnet at no GitHub cost. So a rollout window costs the 10 once, not 10 per refresh, well inside the
+# 60/h unauthenticated limit that HTTP 403 spent at 11:00Z on 2026-11-05. A controller that cannot answer for the whole
+# window falls back to this list every refresh (6/h), which is that limit exactly: its own residual, tracked with #1864.
+SIGN_HOLD_SOURCES: tuple[tuple[str, frozenset[str]], ...] = (
+    ("nightly.yml", frozenset({"nightly-next", "main"})),
+    ("auto-resume-nightly-notarization.yml", frozenset({"main"})),
+)
+SIGN_HOLD_RUNS_URL = ("https://api.github.com/repos/{repo}/actions/workflows/{workflow}/runs"
+                      "?per_page=100")
 SIGN_HOLD_PAGE_SIZE = 100
 SIGN_HOLD_PAGES = 3
 SIGN_HOLD_LIST_URL = "https://raw.githubusercontent.com/{repo}/{sha}/scripts/ci/glaeda-signing-hooks.txt"
@@ -2354,31 +2373,39 @@ def sign_hold_read(url: str) -> str | None:
 
 
 def sign_hold_runs() -> list[dict] | None:
-    """The active nightly.yml runs on nightly-next, or None when they cannot all be read. GitHub lists runs by creation
-    time, not status, so an old queued run can sit behind newer finished ones (2026-11-05: five runs queued for hours
-    while every newer one was cancelled). So each active status is listed on its own with `status=`: every run on such
-    a page is active, and a status is read whole once a page comes back short. More than SIGN_HOLD_PAGES pages of one
-    status is no answer (glaeda#1852)."""
+    """The active runs of every SIGN_HOLD_SOURCES workflow, on the branches that entry names, or None when they cannot
+    all be read. GitHub lists runs by creation time, not status, so an old queued run can sit behind newer finished ones
+    (2026-11-05: five runs queued for hours while every newer one was cancelled). So each active status is listed on its
+    own with `status=`: every run on such a page is active, and a status is read whole once a page comes back short. More
+    than SIGN_HOLD_PAGES pages of one status is no answer (glaeda#1852). A run of a branch the entry does not name is
+    skipped here rather than in the query, so one pass covers every branch of that workflow."""
     active: dict[int, dict] = {}
-    for status in sorted(SIGN_HOLD_ACTIVE):
-        for page in range(1, SIGN_HOLD_PAGES + 1):
-            body = sign_hold_read(SIGN_HOLD_RUNS_URL.format(repo=SIGN_HOLD_REPO) + f"&status={status}&page={page}")
-            try:
-                runs = json.loads(body)["workflow_runs"] if body is not None else None
-            except (ValueError, KeyError, TypeError):
-                runs = None
-            if not isinstance(runs, list) or not all(isinstance(run, dict) for run in runs):
+    for workflow, branches in SIGN_HOLD_SOURCES:
+        url = SIGN_HOLD_RUNS_URL.format(repo=SIGN_HOLD_REPO, workflow=workflow)
+        for status in sorted(SIGN_HOLD_ACTIVE):
+            for page in range(1, SIGN_HOLD_PAGES + 1):
+                body = sign_hold_read(url + f"&status={status}&page={page}")
+                try:
+                    runs = json.loads(body)["workflow_runs"] if body is not None else None
+                except (ValueError, KeyError, TypeError):
+                    runs = None
+                if not isinstance(runs, list) or not all(isinstance(run, dict) for run in runs):
+                    return None
+                for run in runs:
+                    rid, sha = run.get("id"), str(run.get("head_sha") or "")
+                    if not isinstance(rid, int) or isinstance(rid, bool) or not re.fullmatch(r"[0-9a-f]{40}", sha):
+                        return None  # malformed run data is an unreadable answer, never a crash
+                    branch = run.get("head_branch")
+                    if branch is not None and not isinstance(branch, str):
+                        return None
+                    if branch not in branches:  # another branch's run of this workflow holds nothing
+                        continue
+                    if run.get("status") in SIGN_HOLD_ACTIVE:  # a run that finished between two reads holds nothing
+                        active[rid] = {"id": rid, "head_sha": sha, "workflow": workflow, "branch": branch}
+                if len(runs) < SIGN_HOLD_PAGE_SIZE:
+                    break
+            else:
                 return None
-            for run in runs:
-                rid, sha = run.get("id"), str(run.get("head_sha") or "")
-                if not isinstance(rid, int) or isinstance(rid, bool) or not re.fullmatch(r"[0-9a-f]{40}", sha):
-                    return None  # malformed run data is an unreadable answer, never a crash
-                if run.get("status") in SIGN_HOLD_ACTIVE:  # a run that finished between two reads holds nothing
-                    active[rid] = {"id": rid, "head_sha": sha}
-            if len(runs) < SIGN_HOLD_PAGE_SIZE:
-                break
-        else:
-            return None
     return sorted(active.values(), key=lambda run: -run["id"])
 
 
@@ -2418,9 +2445,10 @@ def sign_hold_recheck(home: Path, known: list[tuple[int, str]]) -> list[tuple[in
 
 def sign_hold_blockers(digest: str, cache: dict[str, bool], home: Path | None = None,
                        known: list[tuple[int, str]] | None = None) -> list[tuple[int, str]] | None:
-    """[(run id, head sha)] of the active nightly-next nightly.yml runs whose list lacks digest, or None when a read
-    failed. cache maps a head sha to whether its list carries digest; new answers are added to it. Known blockers
-    (the last answer's) still running by the controller are the answer, with no anonymous read."""
+    """[(run id, head sha)] of the active runs of every SIGN_HOLD_SOURCES (workflow, branches) pair whose list lacks
+    digest, or None when a read failed. cache maps a head sha to whether its list carries digest, so two sources at one
+    commit read it once; new answers are added to it. Known blockers (the last answer's) still running by the
+    controller are the answer, with no anonymous read, whichever source listed them."""
     if known and home is not None:
         still = sign_hold_recheck(home, known)
         if still is None:
@@ -2455,7 +2483,8 @@ def sign_hold_event(line: str) -> None:
 
 
 def sign_hold(home: Path, digest: str, now: Callable[[], float] = time.time) -> str | None:
-    """SIGN_HOLD: a deferral note while active nightly-next runs lack digest, else None (install). Records the first
+    """SIGN_HOLD: a deferral note while an active run of a SIGN_HOLD_SOURCES workflow lacks digest, else None (install).
+    Records the first
     deferral of digest in the state file and stops holding SIGN_HOLD_CAP_S after it."""
     memo = _SIGN_HOLD_MEMO.get(digest)
     if memo and now() - memo[0] < SIGN_HOLD_MEMO_S:
@@ -2487,9 +2516,9 @@ def sign_hold(home: Path, digest: str, now: Callable[[], float] = time.time) -> 
         # longer costs nothing, and installing over a run that lacks the new one strands its sign job (10:16Z)
         since = since if since is not None else now()
         held_since = f"{datetime.datetime.fromtimestamp(since, datetime.timezone.utc):%H:%M:%SZ}"
-        why = (f"could not read nightly-next's active runs or their signing-hook lists (after one retry)"
+        why = ("could not read the active runs of a signing workflow or their signing-hook lists (after one retry)"
                if blockers is None else
-               "a nightly-next run's commit does not list hook " + digest[:12] + " ("
+               "an active signing run's commit does not list hook " + digest[:12] + " ("
                + ", ".join(f"run {rid} at {sha[:12]}" for rid, sha in blockers) + ")")
         if now() - since >= SIGN_HOLD_CAP_S:
             sign_hold_event(f"SIGN HOLD CAP: hook {digest[:12]} held {SIGN_HOLD_CAP_S / 3600:g} h since {held_since}; "
