@@ -761,23 +761,25 @@ class HookTest(unittest.TestCase):
         # cmux #36561 (main 7badd980) made poll-outer, poll-stapled and publish run on a mini's /bin/bash 3.2
         signing = ("wait-and-staple", "staple-outer", "staple-stapled", "publish", "generate-deltas",
                    "republish-deltas")
-        # AUTO_RESUME_HOSTED_JOBS: a key, but only Apple's queue to wait on, so no glaeda runner admits them
+        # AUTO_RESUME_HOSTED_JOBS: a key, but only Apple's queue to wait on, so they keep their hosted route
         polls = ("poll", "poll-outer", "poll-stapled")
         self.assertEqual(set(hook.AUTO_RESUME_SIGNING_JOBS), set(signing))
         self.assertEqual(set(hook.AUTO_RESUME_HOSTED_JOBS), set(polls))
-        self.assertEqual(set(hook.AUTO_RESUME_TRUSTED_JOBS), set(signing))
         self.assertEqual(set(hook.AUTO_RESUME_LIGHT_JOBS), {"preflight", "verify-stapled"})
         for job in polls:
             self.assertNotIn(("auto-resume-nightly-notarization.yml", job), hook.SIGNING_JOBS)
-            # neither exclusive (the claim would hold the mini for Apple's queue) nor admitted at all
-            self.assertNotEqual(hook.job_class(job, "manaflow-ai/cmux", hook.DEFAULT_HOME_REPO,
-                                               "auto-resume-nightly-notarization.yml")[0], hook.EXCLUSIVE_CLASS)
+            # the trusted signing runner refuses them
             for event_name, payload in payloads.items():
                 with self.subTest(hosted=job, event_name=event_name):
                     why = hook.trusted_refusal(**{**args, "event_name": event_name, "event": payload, "job": job})
                     self.assertIsNotNone(why)
                     self.assertIn("untrusted:", why)
-        for job in hook.AUTO_RESUME_TRUSTED_JOBS:
+            # and they are never an exclusive claim, nor a compile: with no class they would fall back to one
+            # (5 units, persistent-dd and a root), and job_tier ranks this workflow nightly, so a 6 h poll
+            # reaching any mini would pin a canonical root ahead of every PR job
+            self.assertEqual(hook.job_class(job, "manaflow-ai/cmux", hook.DEFAULT_HOME_REPO,
+                                            "auto-resume-nightly-notarization.yml")[0], "light")
+        for job in hook.AUTO_RESUME_SIGNING_JOBS:
             if job in signing:
                 self.assertIn(("auto-resume-nightly-notarization.yml", job), hook.SIGNING_JOBS)
                 self.assertEqual(hook.job_class(job, "manaflow-ai/cmux", hook.DEFAULT_HOME_REPO,
@@ -790,22 +792,41 @@ class HookTest(unittest.TestCase):
                         # a nightly job (FEED_FIRST): it drains the mini for SIGNING_DRAIN_WAIT_S, not 300 s
                         self.assertEqual(hook.job_tier(event_name, ref, "manaflow-ai/cmux", payload, workflow_ref,
                                                        job), hook.TIER_NIGHTLY)
-        # A run's pull_requests is every pull request that contains its head commit, in any repository, so a
-        # push run on main carries each fork's open main-to-main pull request. cmux's nightly.yml run
-        # 37603581609 (a push on main, 2026-10-07) listed exactly these four, all forks'. Reading the list as
-        # "this was a pull request run" refuses every real main run, so only this repository's entries count.
-        forks = [{"number": n, "url": f"https://api.github.com/repos/{owner}/cmux/pulls/{n}",
-                  "base": {"ref": "main", "repo": {"full_name": f"{owner}/cmux"}},
-                  "head": {"ref": "main", "repo": {"full_name": f"{owner}/cmux"}}}
-                 for owner, n in (("nonomal", 5), ("IrvanFza", 53), ("ericmjl", 4), ("HexSleeves", 24))]
-        self.assertFalse(hook.own_repo_pulls(forks, "manaflow-ai/cmux"))
-        self.assertFalse(hook.own_repo_pulls([], "manaflow-ai/cmux"))
-        for job in signing:
-            with self.subTest(fork_pulls=job):
-                self.assertIsNone(hook.trusted_refusal(
-                    **{**args, "event_name": "workflow_run", "job": job,
-                       "event": {**run_payload, "workflow_run": {**source, "event": "push",
-                                                                 "pull_requests": forks}}}))
+        # A run's pull_requests is every pull request whose head is its commit, in any repository, so a push
+        # run on main lists each fork's open main-to-main sync pull request. These four are the verbatim
+        # entries of cmux's nightly.yml run 37603581609 (a push on main, 2026-10-07), in GitHub's real shape:
+        # PullRequestMinimal, whose per-side repo carries id, name and url and never full_name, and whose
+        # head.repo is manaflow-ai/cmux (the fork is the base). So no reading of this list tells our code from
+        # a fork's, and it is not consulted at all; such a run is admitted.
+        forks = [{"id": pid, "number": n, "url": f"https://api.github.com/repos/{owner}/cmux/pulls/{n}",
+                  "head": {"ref": "main", "sha": "5d12d7b4087fffbac3a90d638768823adddbd054",
+                           "repo": {"id": 1144115288, "name": "cmux",
+                                    "url": "https://api.github.com/repos/manaflow-ai/cmux"}},
+                  "base": {"ref": "main", "sha": "5d12d7b4087fffbac3a90d638768823adddbd054",
+                           "repo": {"id": fid, "name": "cmux",
+                                    "url": f"https://api.github.com/repos/{owner}/cmux"}}}
+                 for owner, n, pid, fid in (("nonomal", 5, 3842472500, 1264114693),
+                                            ("IrvanFza", 53, 3434148026, 1264114694),
+                                            ("ericmjl", 4, 3433951196, 1264114695),
+                                            ("HexSleeves", 24, 3433623160, 1264114696))]
+        # and a contributor's own pull request into our main, whose url and base are ours, is equally not a
+        # reason to refuse: the run's event is still a push of main's own commit
+        ours = [{"id": 1, "number": 7000, "url": "https://api.github.com/repos/manaflow-ai/cmux/pulls/7000",
+                 "head": {"ref": "main", "repo": {"id": 999, "name": "cmux",
+                                                  "url": "https://api.github.com/repos/contributor/cmux"}},
+                 "base": {"ref": "main", "repo": {"id": 1144115288, "name": "cmux",
+                                                  "url": "https://api.github.com/repos/manaflow-ai/cmux"}}}]
+        for name, pulls in (("forks", forks), ("ours", ours), ("empty", []), ("absent", None)):
+            for job in signing:
+                with self.subTest(pulls=name, job=job):
+                    run = {**source, "event": "push"}
+                    if pulls is None:
+                        run.pop("pull_requests", None)
+                    else:
+                        run["pull_requests"] = pulls
+                    self.assertIsNone(hook.trusted_refusal(
+                        **{**args, "event_name": "workflow_run", "job": job,
+                           "event": {**run_payload, "workflow_run": run}}))
         for job in hook.AUTO_RESUME_LIGHT_JOBS:
             self.assertEqual(hook.job_class(job, "manaflow-ai/cmux", hook.DEFAULT_HOME_REPO,
                                             "auto-resume-nightly-notarization.yml")[0], "light")
@@ -836,14 +857,6 @@ class HookTest(unittest.TestCase):
             {"event": run_with(repository={"full_name": "manaflow-ai/other"})},
             {"event": run_with(event="pull_request")}, {"event": run_with(event="pull_request_target")},
             {"event": run_with(event="workflow_run")},
-            # a pull request of this repository itself, by either side or by its url
-            {"event": run_with(pull_requests=[{"number": 1, "base": {"repo": dict(CMUX)}}])},
-            {"event": run_with(pull_requests=[{"number": 1, "head": {"repo": dict(CMUX)}}])},
-            {"event": run_with(pull_requests=[
-                {"number": 1, "url": "https://api.github.com/repos/manaflow-ai/cmux/pulls/1"}])},
-            # an unexpected shape, or one that names no repository at all: fail closed
-            {"event": run_with(pull_requests=[{"number": 1}])},
-            {"event": run_with(pull_requests=[42])}, {"event": run_with(pull_requests="many")},
             {"event": {**run_payload, "workflow_run": None}},
             {"event": {k: v for k, v in run_payload.items() if k != "workflow_run"}},
             {"event": {**run_payload, "action": "requested"}},
@@ -11279,20 +11292,32 @@ class RunnerTest(unittest.TestCase):
         return hooks
 
     @staticmethod
-    def runs_page(url: str, runs: list[tuple[int, str, str]]) -> str:
-        """GitHub's runs list as the API pages it: newest first by creation, filtered by `status=`, 100 a page."""
+    def _run_row(row: tuple) -> tuple[int, str, str, str, str]:
+        """(id, status, head sha) with the defaults a SIGN_HOLD test needs, or the full
+        (id, status, head sha, workflow, branch)."""
+        return row if len(row) == 5 else (*row, "nightly.yml", "nightly-next")
+
+    @classmethod
+    def runs_page(cls, url: str, runs: list[tuple]) -> str:
+        """GitHub's runs list as the API pages it: newest first by creation, filtered by `status=`, 100 a page. The
+        query carries no branch (SIGN_HOLD_SOURCES filters those itself), so every branch's run of that workflow is
+        listed, each with its head_branch."""
         query = urllib.parse.parse_qs(urllib.parse.urlsplit(url).query)
         status, page = query.get("status", [None])[0], int(query.get("page", ["1"])[0])
-        chosen = [r for r in sorted(runs, key=lambda r: -r[0]) if status is None or r[1] == status]
+        workflow = url.split("/actions/workflows/", 1)[1].split("/", 1)[0]
+        rows = [cls._run_row(r) for r in runs]
+        chosen = [r for r in sorted(rows, key=lambda r: -r[0])
+                  if r[3] == workflow and (status is None or r[1] == status)]
         size = cr.SIGN_HOLD_PAGE_SIZE
-        return json.dumps({"workflow_runs": [{"id": i, "status": st, "head_sha": sha}
-                                             for i, st, sha in chosen[(page - 1) * size:page * size]]})
+        return json.dumps({"workflow_runs": [{"id": i, "status": st, "head_sha": sha, "head_branch": branch}
+                                             for i, st, sha, _, branch in chosen[(page - 1) * size:page * size]]})
 
-    def github(self, runs: list[tuple[int, str, str]], lists: dict[str, str] | None, fail: str = "",
+    def github(self, runs: list[tuple], lists: dict[str, str] | None, fail: str = "",
                controller: str = "follows"):
-        """A fake anonymous GitHub and build controller: runs [(id, status, head sha)], lists {sha:
-        glaeda-signing-hooks.txt}; a url containing fail answers None. The controller answers a run's status from runs
-        ("follows"), or nothing ("down"). Returns the reads it was asked for."""
+        """A fake anonymous GitHub and build controller: runs [(id, status, head sha)] (nightly.yml on nightly-next)
+        or [(id, status, head sha, workflow, branch)], lists {sha: glaeda-signing-hooks.txt}; a url containing fail
+        answers None. The controller answers a run's status from runs ("follows"), or nothing ("down"). Returns the
+        reads it was asked for."""
         reads: list[str] = []
 
         def fetch(url: str, **_kw) -> str | None:
@@ -11306,7 +11331,7 @@ class RunnerTest(unittest.TestCase):
                     return None
                 return json.dumps({"known": True, "terminal": match[0][1] not in cr.SIGN_HOLD_ACTIVE,
                                    "run": {"id": rid, "status": match[0][1], "head_sha": match[0][2]}})
-            if "/actions/workflows/nightly.yml/runs" in url:
+            if "/actions/workflows/" in url:
                 return self.runs_page(url, runs)
             sha = url.split("/")[-4]
             return (lists or {}).get(sha)
@@ -11334,14 +11359,47 @@ class RunnerTest(unittest.TestCase):
         self.assertNotIn("41982716550", done["note"])
         self.assertEqual((hooks / cr.HOOK_NAME).read_text(), self.OLDER_HOOK)
         self.assertFalse(any(hooks.glob("*" + cr.NEXT_SUFFIX)) or (hooks / cr.NEXT_RECORD).exists(), "nothing staged")
-        statuses = len(cr.SIGN_HOLD_ACTIVE)
+        statuses = len(cr.SIGN_HOLD_ACTIVE) * len(cr.SIGN_HOLD_SOURCES)
         self.assertEqual(len(reads), statuses + 2,
-                         "a runs list per active status, one list read per active head commit, none for a finished run")
+                         "a runs list per active status per source, one list read per active head commit, none for a "
+                         "finished run")
         # the next refresh (past the memo) rechecks the known blocker through the controller: no anonymous read
         cr._SIGN_HOLD_MEMO.clear()
         reads.clear()
         self.assertEqual(self.invoke("--refresh-hooks", "--apply")["runners"][0]["state"], "deferred")
         self.assertEqual(reads, [f"{cr.SIGN_HOLD_CONTROLLER_DEFAULT}/v1/github/runs/41976650433?wait=0"])
+
+    def test_sign_hold_covers_every_workflow_whose_signing_jobs_this_runner_admits(self) -> None:
+        # ONE_MINI_NIGHTLY, AUTO_RESUME: this runner admits main's nightly.yml signing jobs and main's
+        # auto-resume-nightly-notarization.yml ones, so a run of either holds a hook its commit does not list. With
+        # nightly-next alone, cmux main's list (several releases behind nightly-next's) would have refused every
+        # classic signing job instead.
+        self.assertEqual(dict(cr.SIGN_HOLD_SOURCES),
+                         {"nightly.yml": frozenset({"nightly-next", "main"}),
+                          "auto-resume-nightly-notarization.yml": frozenset({"main"})})
+        lists = {self.OLD_SHA: f"{self.older_digest()} glaeda old\n",
+                 self.NEW_SHA: f"{self.older_digest()} old\n{self.new_digest()} new\n"}
+        for name, run in (("main's classic nightly", (41990000001, "queued", self.OLD_SHA, "nightly.yml", "main")),
+                          ("main's auto-resume", (41990000002, "in_progress", self.OLD_SHA,
+                                                  "auto-resume-nightly-notarization.yml", "main"))):
+            with self.subTest(holds=name):
+                hooks = self.signing_install()
+                self.github([run], lists)
+                done = self.invoke("--refresh-hooks", "--apply")["runners"][0]
+                self.assertEqual(done["state"], "deferred")
+                self.assertIn(f"run {run[0]} at aaaaaaaaaaaa", done["note"])
+                self.assertEqual((hooks / cr.HOOK_NAME).read_text(), self.OLDER_HOOK)
+        # a branch no entry names, and a workflow no entry names, hold nothing
+        for name, run in (("rc/1.2's nightly", (41990000003, "queued", self.OLD_SHA, "nightly.yml", "rc/1.2")),
+                          ("a feature branch's nightly", (41990000004, "queued", self.OLD_SHA, "nightly.yml",
+                                                          "feat-x")),
+                          ("nightly-next's auto-resume", (41990000005, "queued", self.OLD_SHA,
+                                                          "auto-resume-nightly-notarization.yml", "nightly-next"))):
+            with self.subTest(holds_nothing=name):
+                hooks = self.signing_install()
+                self.github([run], lists)
+                self.assertEqual(self.invoke("--refresh-hooks", "--apply")["runners"][0]["state"], "updated")
+                self.assertEqual((hooks / cr.HOOK_NAME).read_bytes(), HOOK.read_bytes())
 
     def test_sign_hold_installs_once_every_active_run_lists_the_new_hook(self) -> None:
         hooks = self.signing_install()
@@ -11407,7 +11465,9 @@ class RunnerTest(unittest.TestCase):
         done = self.invoke("--refresh-hooks", "--apply")["runners"][0]
         self.assertEqual(done["state"], "deferred")
         self.assertIn("run 7 at aaaaaaaaaaaa", done["note"])
-        self.assertEqual(sum("status=queued" in u for u in reads), 2)
+        # two pages of nightly.yml's queued runs, and one of every other source's (none of which came back full)
+        self.assertEqual(sum("status=queued" in u and "/nightly.yml/" in u for u in reads), 2)
+        self.assertEqual(sum("status=queued" in u for u in reads), len(cr.SIGN_HOLD_SOURCES) + 1)
         # more pages of one status than it reads is no answer, which holds like a failed read
         cr._SIGN_HOLD_MEMO.clear()
         self.github([(5000 + i, "queued", self.NEW_SHA) for i in range(cr.SIGN_HOLD_PAGE_SIZE * cr.SIGN_HOLD_PAGES)],

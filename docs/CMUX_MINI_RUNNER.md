@@ -1001,6 +1001,25 @@ only the source run's artifacts, which `preflight` checks through the API first.
   ("Apple queue latency never reserves signing workers"). Taking them off Blacksmith too needs the waiting split
   from the acting on the cmux side, so the mini is claimed for the stapling and not for Apple's queue. cmux
   gives the claim gate to the exclusive six, not to these three.
+
+  The same reasoning is only partly discharged for the six. `wait-and-staple` (job timeout 180 min, an inner
+  `notarytool` wait of 150) and `staple-outer` (150, inner 120) are exclusive and also wait on Apple inside the
+  job, so one can hold the mini for hours, against `YIELD_TO_EXCLUSIVE_WAIT_S`'s 3 h. They stay exclusive
+  because they do staple with a key, and the fix is the same cmux-side split; until it lands, a classic
+  notarization that outlives its run is a multi-hour stall mode for the one-mini nightly. `publish` and
+  `republish-deltas` are exclusive too and cmux runs them on ubuntu today, so like the three above they only
+  reach this runner once cmux reroutes them, and `publish` has no `timeout-minutes` at all (GitHub's 360
+  default), which it needs before it is routed here.
+
+- A run's `pull_requests` is deliberately not read. It is every pull request whose head is that run's commit, in
+  any repository, so a push run on main lists each fork's open main-to-main sync pull request (cmux's
+  `nightly.yml` run 37603581609 listed four) and a contributor's open pull request into our main lists too.
+  Reading it as "this was a pull request run" refuses every real run, and narrowing it is not sound either: an
+  entry's url names its base repository, so our own main is the base of a contributor's, while `head.repo` is
+  ours for a fork's sync one (`PullRequestMinimal` carries `id`, `name` and `url` per side, never `full_name`).
+  It would buy nothing: the run's `event` is already `push`, `schedule` or `workflow_dispatch`, which excludes a
+  pull_request run, and its `head_branch`, both repositories and this payload's own `pull_request` and
+  `merge_group` keys are checked.
 - On the nightly-only runners (`glaeda-nightly-only-admit`): `preflight` and `verify-stapled`
   (`AUTO_RESUME_LIGHT_JOBS`), light; they hold no key.
 - The ubuntu jobs run on a mini's `/bin/bash` 3.2: `poll-outer`, `poll-stapled` and `publish` since cmux #36561

@@ -158,7 +158,7 @@ class RefusalTest(unittest.TestCase):
                 self.assertIsNotNone(self.why(**resume(name)))
         for changes in ({"head_branch": "nightly-next"}, {"head_branch": "feat-x"},
                         {"path": ".github/workflows/ci.yml"}, {"event": "pull_request"},
-                        {"head_repository": {"full_name": "someone/cmux"}}, {"pull_requests": [{"number": 1}]}):
+                        {"head_repository": {"full_name": "someone/cmux"}}):
             with self.subTest(source=changes):
                 self.assertIsNotNone(self.why(**resume("preflight", **changes)))
         other_branch = resume("preflight")

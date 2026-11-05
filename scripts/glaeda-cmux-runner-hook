@@ -454,6 +454,13 @@ WORKFLOW_JOB_CLASSES = {("cmux-tui.yml", "lint"): "isolated", ("cmux-tui.yml", "
                         # verify-stapled launches the stapled DMG with no secret (the nightly-only runners take them)
                         ("auto-resume-nightly-notarization.yml", "preflight"): "light",
                         ("auto-resume-nightly-notarization.yml", "verify-stapled"): "light",
+                        # AUTO_RESUME_HOSTED_JOBS keep their hosted route, so no runner should see one. A class
+                        # anyway: with none they fall back to a compile (5 units, persistent-dd and a root), and
+                        # job_tier ranks this workflow nightly, so one 6 h poll reaching a general mini would pin
+                        # a canonical root ahead of every PR job. Light costs 2 units and no root.
+                        ("auto-resume-nightly-notarization.yml", "poll"): "light",
+                        ("auto-resume-nightly-notarization.yml", "poll-outer"): "light",
+                        ("auto-resume-nightly-notarization.yml", "poll-stapled"): "light",
                         ("nightly.yml", "verify-final-dmg-nightly"): "light",
                         # nightly-next's Linux signer path: its one Mac job builds the DMG from the signed app with
                         # hdiutil (cmux nightly.yml signer-dmg-image; was a compile, 5 units + persistent-dd + root)
@@ -1507,7 +1514,9 @@ AUTO_RESUME_SOURCE_PATH = ".github/workflows/nightly.yml"
 AUTO_RESUME_SOURCE_EVENTS = ("push", "schedule", "workflow_dispatch")
 AUTO_RESUME_SIGNING_JOBS = tuple(job for workflow, job in SIGNING_JOBS if workflow == AUTO_RESUME_FILE)
 AUTO_RESUME_LIGHT_JOBS = ("preflight", "verify-stapled")
-# AUTO_RESUME_HOSTED_JOBS: the three jobs no glaeda runner admits, so they keep their hosted route. Each holds the
+# AUTO_RESUME_HOSTED_JOBS: the three jobs no runner cmux routes this workflow to admits, so they keep their
+# hosted route (the trusted signing runner refuses them; a general runner's own trust rules are unchanged, and
+# WORKFLOW_JOB_CLASSES above keeps them light there). Each holds the
 # ASC notary API key, but each only asks Apple whether a submission is done, and its timeout is Apple's queue rather
 # than work: poll 90 min, poll-outer and poll-stapled 360 min each (cmux auto-resume-nightly-notarization.yml).
 # No class puts them on the one nightly mini without stopping the nightly:
@@ -1522,32 +1531,6 @@ AUTO_RESUME_LIGHT_JOBS = ("preflight", "verify-stapled")
 # queue latency never reserves signing workers"); they stay there. Taking them off Blacksmith too needs the waiting
 # split from the acting on the cmux side, so the mini is claimed for the stapling and not for Apple's queue.
 AUTO_RESUME_HOSTED_JOBS = ("poll", "poll-outer", "poll-stapled")
-AUTO_RESUME_TRUSTED_JOBS = AUTO_RESUME_SIGNING_JOBS
-
-
-def own_repo_pulls(pulls: Any, repo: str) -> bool:
-    """Whether a run's `pull_requests` names a pull request of repo itself. Pure.
-
-    A run's `pull_requests` is every pull request that contains its head commit, in any repository, so a push
-    run on main carries each fork's open main-to-main pull request: cmux's nightly.yml run 37603581609 (a push
-    on main, 2026-10-07) listed four, all of them forks' (nonomal, IrvanFza, ericmjl, HexSleeves). Reading the
-    list as "this was a pull request run" therefore refuses every real main run, which is why only this
-    repository's entries count. The run's own `event` already excludes a pull_request run."""
-    if not isinstance(pulls, list):
-        return bool(pulls)  # an unexpected shape is not an empty list: fail closed
-    for pull in pulls:
-        if not isinstance(pull, dict):
-            return True
-        for key in ("base", "head"):
-            side = pull.get(key)
-            if isinstance(side, dict) and _repo_name(side.get("repo")) == repo:
-                return True
-        url = pull.get("url")
-        if isinstance(url, str) and f"/repos/{repo}/pulls/" in url:
-            return True
-        if not any(isinstance(pull.get(key), dict) for key in ("base", "head")) and not isinstance(url, str):
-            return True  # no field names a repository: fail closed
-    return False
 
 
 def auto_resume_refusal(event_name: str | None, ref: str | None, repository: str | None, event: Any,
@@ -1582,10 +1565,16 @@ def auto_resume_refusal(event_name: str | None, ref: str | None, repository: str
             or run.get("event") not in AUTO_RESUME_SOURCE_EVENTS):
         return (f"the triggering run is not {repo}'s {AUTO_RESUME_SOURCE_PATH} on main from "
                 f"{', '.join(AUTO_RESUME_SOURCE_EVENTS)}")
-    if own_repo_pulls(run.get("pull_requests"), repo):
-        # The run's event above already excludes a pull_request run, so this only catches a run GitHub also
-        # attributed to a pull request of this repository.
-        return f"the triggering run also names a {repo} pull request"
+    # Not run["pull_requests"]: that is every pull request whose head is this run's commit, in any repository,
+    # so a push run on main lists each fork's open main-to-main sync pull request (cmux's nightly.yml run
+    # 37603581609, a push on main, listed four: nonomal, IrvanFza, ericmjl, HexSleeves) and a contributor's open
+    # pull request into our main lists too. Reading it as "this was a pull request run" refuses every real run,
+    # and no narrowing of it is sound either: an entry's url names its base repository, so our own main is the
+    # base of a contributor's, while its head.repo is ours for a fork's sync one (PullRequestMinimal carries
+    # id, name and url per side, never full_name). It would also buy nothing: the run's event above is already
+    # push, schedule or workflow_dispatch, which excludes a pull_request run, and its head_branch, both
+    # repositories and this payload's own pull_request and merge_group keys are checked. Bookkeeping about other
+    # refs cannot make this run's code untrusted.
     return None
 
 
@@ -1606,8 +1595,8 @@ def trusted_refusal(event_name: str | None, ref: str | None, repository: str | N
         resume_why = auto_resume_refusal(event_name, ref, repository, event, workflow_ref)
         if resume_why:
             return f"{why}; {AUTO_RESUME_FILE}: {resume_why}"
-        if job not in AUTO_RESUME_TRUSTED_JOBS:
-            return f"{why}; {AUTO_RESUME_FILE} only for its key-holding jobs ({', '.join(AUTO_RESUME_TRUSTED_JOBS)})"
+        if job not in AUTO_RESUME_SIGNING_JOBS:
+            return f"{why}; {AUTO_RESUME_FILE} only for its key-holding jobs ({', '.join(AUTO_RESUME_SIGNING_JOBS)})"
         return None
     # ONE_MINI_NIGHTLY: a signing runner checks a dispatch below like a push: payload, exact workflow, job
     dispatch = trusted_next_signing and event_name == "workflow_dispatch"
@@ -9520,7 +9509,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--trusted-next-signing", action="store_true",
                    help="also admit cmux nightly-next's own nightly.yml signing and publishing jobs (SIGNING_JOBS) "
                         "on its push or dispatch, any attempt, main's nightly.yml CLASSIC_SIGNING_JOBS on its "
-                        "dispatch, and main's auto-resume-nightly-notarization.yml AUTO_RESUME_TRUSTED_JOBS on its "
+                        "dispatch, and main's auto-resume-nightly-notarization.yml AUTO_RESUME_SIGNING_JOBS on its "
                         "workflow_run after main's nightly or its dispatch, which drain the mini like the nightly "
                         "slot's (TRUSTED_NEXT_SIGNING, ONE_MINI_NIGHTLY, AUTO_RESUME)")
     p.add_argument("--yield-to-exclusive", action="store_true",
