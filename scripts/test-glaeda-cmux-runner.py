@@ -11141,6 +11141,31 @@ class RunnerTest(unittest.TestCase):
         self.assertEqual(doc["runners"][0]["state"], "updated")
         self.assertIn("SIGN HOLD CAP", doc["signHold"][0])
 
+    def test_malformed_run_data_is_retried_once_too(self) -> None:
+        hooks = self.signing_install()
+        good = self.runs_page
+        bodies = iter([json.dumps({"workflow_runs": [{"id": "x", "status": "queued", "head_sha": self.OLD_SHA}]})])
+
+        def fetch(url: str) -> str | None:
+            if "/runs" in url:
+                bad = next(bodies, None)  # the first runs list of the refresh is malformed, the retry reads
+                return bad if bad is not None else good(url, [(7, "queued", self.OLD_SHA)])
+            return f"{self.older_digest()} old\n"
+
+        with mock.patch.object(cr, "sign_hold_fetch", fetch):
+            done = self.invoke("--refresh-hooks", "--apply")["runners"][0]
+        self.assertEqual(done["state"], "deferred")
+        self.assertIn("run 7 at aaaaaaaaaaaa", done["note"])
+        self.assertEqual((hooks / cr.HOOK_NAME).read_text(), self.OLDER_HOOK)
+
+    def test_a_memoised_hold_is_still_reported(self) -> None:
+        self.signing_install()
+        self.github([(7, "queued", self.OLD_SHA)], {self.OLD_SHA: f"{self.older_digest()} old\n"})
+        first = self.invoke("--refresh-hooks", "--apply")
+        second = self.invoke("--refresh-hooks", "--apply")  # inside SIGN_HOLD_MEMO_S: the memo answers
+        self.assertEqual(second["runners"][0]["state"], "deferred")
+        self.assertEqual(second["signHold"], first["signHold"])
+
     def test_a_failed_read_never_holds_a_runner_that_does_not_sign(self) -> None:
         hooks = self.signing_install(signing=False)
         reads = self.github([(7, "queued", self.OLD_SHA)], {}, fail="/")

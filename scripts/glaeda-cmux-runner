@@ -2305,7 +2305,7 @@ SIGN_HOLD_MEMO_S = 300.0
 SIGN_HOLD_FETCH_S = 15
 SIGN_HOLD_STATE = "sign-hold.json"
 SIGN_HOLD_FLAG = "--trusted-next-signing"
-_SIGN_HOLD_MEMO: dict[str, tuple[float, Any]] = {}
+_SIGN_HOLD_MEMO: dict[str, tuple[float, Any, list[str]]] = {}
 SIGN_HOLD_RETRY_S = 3.0  # one retry of a failed read before the hold fails open
 # What the hold did in this refresh (a deferral, or an install at its cap), for --refresh-hooks' "signHold":
 # glaeda-update writes it to its jsonl and converge.json. Its stderr lines are not kept (2026-11-05 10:16Z: a signing
@@ -2341,12 +2341,8 @@ def sign_hold_fetch(url: str) -> str | None:
 
 
 def sign_hold_read(url: str) -> str | None:
-    """sign_hold_fetch, retried once after SIGN_HOLD_RETRY_S: a lone transient failure does not fail the hold open."""
-    body = sign_hold_fetch(url)
-    if body is None:
-        time.sleep(SIGN_HOLD_RETRY_S)
-        body = sign_hold_fetch(url)
-    return body
+    """One anonymous read for the hold (sign_hold_blockers' whole pass is what is retried)."""
+    return sign_hold_fetch(url)
 
 
 def sign_hold_runs() -> list[dict] | None:
@@ -2412,6 +2408,8 @@ def sign_hold(home: Path, digest: str, now: Callable[[], float] = time.time) -> 
     deferral of digest in the state file and stops holding SIGN_HOLD_CAP_S after it."""
     memo = _SIGN_HOLD_MEMO.get(digest)
     if memo and now() - memo[0] < SIGN_HOLD_MEMO_S:
+        for line in memo[2]:  # a memoised answer is reported again: this refresh's "signHold" starts empty
+            sign_hold_event(line)
         return memo[1]
     path = home / ".local/state/glaeda/cmux-runner" / SIGN_HOLD_STATE
     try:
@@ -2423,7 +2421,11 @@ def sign_hold(home: Path, digest: str, now: Callable[[], float] = time.time) -> 
     cache = state.get("listed") if isinstance(state.get("listed"), dict) else {}
     cache = {k: v for k, v in cache.items() if isinstance(v, bool)}
     blockers = sign_hold_blockers(digest, cache)
+    if blockers is None:  # any unreadable answer (a failed read, malformed data, too many pages): one more pass
+        time.sleep(SIGN_HOLD_RETRY_S)
+        blockers = sign_hold_blockers(digest, cache)
     note: str | None = None
+    events_before = len(_SIGN_HOLD_EVENTS)
     since = state.get("since") if isinstance(state.get("since"), (int, float)) else None
     if blockers is None or blockers:
         # an unreadable answer holds too, inside the same cap: on a signing runner keeping the old hook a little
@@ -2444,7 +2446,7 @@ def sign_hold(home: Path, digest: str, now: Callable[[], float] = time.time) -> 
     with contextlib.suppress(OSError):
         path.parent.mkdir(parents=True, exist_ok=True)
         write_atomic(path, (json.dumps({"digest": digest, "since": since, "listed": cache}) + "\n").encode(), 0o644)
-    _SIGN_HOLD_MEMO[digest] = (now(), note)
+    _SIGN_HOLD_MEMO[digest] = (now(), note, list(_SIGN_HOLD_EVENTS[events_before:]))
     return note
 
 
