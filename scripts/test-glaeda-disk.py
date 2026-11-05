@@ -7923,6 +7923,16 @@ class LinuxLayoutTest(unittest.TestCase):
         self.assertIsNone(gd.recent_bundle_failure(os.fspath(unit), gd.item_mtime(fam, unit)))
         self.assertEqual(gd.remembered_failure_sizes([(fam, unit)]), {})
 
+    def test_a_bundle_that_failed_on_a_silent_remote_is_retried_after_an_hour(self) -> None:
+        """cmux11s, 2026-11-05: a SwiftPM repository's ls-remote timed out once on the loaded uplink; that is not
+        held for 12 h."""
+        path, mtime = os.fspath(self.home / "tree"), 100.0
+        gd.remember_bundle_failure(path, mtime, "remote origin of x did not answer", 5)
+        self.assertIsNotNone(gd.recent_bundle_failure(path, mtime, now=time.time() + 1800))
+        self.assertIsNone(gd.recent_bundle_failure(path, mtime, now=time.time() + 3700))
+        gd.remember_bundle_failure(path, mtime, "unreadable refs", 5)
+        self.assertIsNotNone(gd.recent_bundle_failure(path, mtime, now=time.time() + 3700))
+
     def test_a_worktree_reflog_only_commit_of_an_outside_repository_goes_to_a_bundle(self) -> None:
         """cmux10s ~/cnx-macnext, cmux13s chiefinv/src, cmuxs-3 ~/cnx-hybrid: a worktree of ~/cmux whose detached
         commits only its reflog holds kept the tree forever, since git bundle had no ref to name."""

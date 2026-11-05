@@ -7049,6 +7049,11 @@ def external_unbundled(now: dict[str, tuple[Path, list[str]]], bundled: dict[str
 
 
 BUNDLE_FAILURE_RETRY_S = 12 * 3600  # a tree whose bundle failed is not bundled again for this long unless it changes
+NETWORK_FAILURE_RETRY_S = 3600  # sooner when a remote did not answer: a slow uplink or a timeout passes
+
+
+def bundle_failure_retry_s(why: str) -> int:
+    return NETWORK_FAILURE_RETRY_S if " did not answer" in why else BUNDLE_FAILURE_RETRY_S
 
 
 def bundle_failures_path() -> Path:
@@ -7069,7 +7074,8 @@ def recent_bundle_failure(path: str, mtime: float, now: float | None = None) -> 
     now = time.time() if now is None else now
     got = load_bundle_failures().get(path)
     try:
-        if got and float(got["mtime"]) == mtime and 0 <= now - float(got["at"]) < BUNDLE_FAILURE_RETRY_S:
+        if got and float(got["mtime"]) == mtime and \
+                0 <= now - float(got["at"]) < bundle_failure_retry_s(str(got.get("why", ""))):
             return got
     except (KeyError, TypeError, ValueError):
         pass
@@ -7105,7 +7111,8 @@ def remembered_failure_sizes(work: list[tuple[Family, Path]]) -> dict[str, int]:
         if not got or not isinstance(got.get("size"), int):
             continue
         try:
-            if now - float(got["at"]) >= BUNDLE_FAILURE_RETRY_S or item_mtime(fam, p) != float(got["mtime"]):
+            if now - float(got["at"]) >= bundle_failure_retry_s(str(got.get("why", ""))) \
+                    or item_mtime(fam, p) != float(got["mtime"]):
                 continue
         except (KeyError, TypeError, ValueError, OSError):
             continue
@@ -9870,7 +9877,7 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
             outcome = "blocked:bundle-failed"
             i.reasons.append(f"bundling failed at {time.strftime('%Y-%m-%dT%H:%M:%S', time.localtime(failed['at']))}"
                              f" and the tree has not changed since; retried after "
-                             f"{BUNDLE_FAILURE_RETRY_S // 3600} h: {failed.get('why', '')}")
+                             f"{bundle_failure_retry_s(str(failed.get('why', ''))) // 3600} h: {failed.get('why', '')}")
             RUN.setdefault("bundle_failed", []).append(i.path)
             RUN.setdefault("bundle_failed_remembered", []).append(i.path)
         elif mirror_due(fam, p, idle_now) and (bundled := archive_mirror(p))[0]:
