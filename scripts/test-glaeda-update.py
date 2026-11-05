@@ -988,6 +988,41 @@ class UpdateTest(unittest.TestCase):
         self.assertEqual(self.health_findings(1_800_000_000.0 + 10 * gu.ALERT_AFTER_S)[1:], [])
         self.assertEqual(entry["tag"], doc["running"]["tag"])
 
+    def test_the_runner_sign_hold_is_kept_in_the_run_log_and_converge_without_unconverging_it(self) -> None:
+        """2026-11-05 10:16Z: the runner's sign hold failed open on a signing runner and only said so on a stderr
+        this script does not keep. Its "signHold" lines now reach runnerHooks (the jsonl) and converge.json, beside
+        `why`: an install at its cap leaves the host converged."""
+        home, staged, hook = self.runner_mini()
+        self.server.publish(SOURCES[0], runner_files=self.runner_files("new"), hook_history=self.older())
+        line = "SIGN HOLD CAP: hook bcdd1aacb203 held 3 h since 10:26:14Z; installing it now"
+
+        def refreshed(state_dir, home_dir, detail):
+            hook.write_bytes(self.runner_files("new")["glaeda-cmux-runner-hook"])
+            detail.append({"runnerDir": str(hook.parent.parent), "state": "updated", "note": ""})
+            detail.append({"signHold": line})
+            return "tag: 1 updated; sign hold: " + line
+
+        with mock.patch.object(gu, "refresh_runner_hooks", side_effect=refreshed):
+            result = self.apply(1_800_000_000.0, home, staged)
+        self.assertIn("sign hold: " + line, result["runnerHooks"])
+        doc = self.converge()
+        self.assertTrue(doc["converged"], doc["why"])
+        self.assertEqual(doc["signHold"], [line])
+        self.assertEqual(doc["why"], [])
+
+    def test_refresh_runner_hooks_carries_the_sign_hold_lines(self) -> None:
+        home, staged, hook = self.runner_mini()
+        entry = self.server.publish(SOURCES[0], runner_files=self.runner_files("new"), hook_history=self.older())
+        self.assertEqual(self.run_update()["result"], "updated")
+        report = {"runners": [{"runnerDir": str(hook.parent.parent), "state": "deferred", "note": "held"}],
+                  "signHold": ["deferred: a nightly-next run's commit does not list hook bcdd1aacb203 (run 1 at aaa)"]}
+        done = subprocess.CompletedProcess([], 0, stdout=json.dumps(report) + "\n", stderr="")
+        detail: list = []
+        with mock.patch.object(gu.subprocess, "run", return_value=done):
+            summary = gu.refresh_runner_hooks(self.state, home, detail)
+        self.assertEqual(summary, f"{entry['tag']}: 1 deferred; sign hold: " + report["signHold"][0])
+        self.assertIn({"signHold": report["signHold"][0]}, detail)
+
     def test_a_deferred_hook_converges_on_a_later_run_between_jobs(self) -> None:
         home, staged, hook = self.runner_mini()
         self.server.publish(SOURCES[0], runner_files=self.runner_files("new"), hook_history=self.older())

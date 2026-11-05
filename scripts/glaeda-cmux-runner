@@ -2291,7 +2291,8 @@ def sync_dir(path: Path) -> None:
 # Reads are anonymous (the minis have no gh): one runs list per active status (five, more only past 100 runs of one),
 # then one raw read per head commit, cached in the state file (a commit's list never changes), all memoised for
 # SIGN_HOLD_MEMO_S and made only while a signing runner has a new hook pending: inside the 60/h unauthenticated limit. A read
-# that fails holds nothing: the refresh installs as it did before this hold existed (fail-open by design) and says so.
+# that fails is retried once, then holds like a blocker, inside the same cap (2026-11-05 10:16Z: a failed read let a
+# signing runner take hook bcdd1aac over a run in progress that lacked it).
 SIGN_HOLD_REPO = "manaflow-ai/cmux"
 SIGN_HOLD_RUNS_URL = ("https://api.github.com/repos/{repo}/actions/workflows/nightly.yml/runs"
                       "?branch=nightly-next&per_page=100")
@@ -2305,6 +2306,11 @@ SIGN_HOLD_FETCH_S = 15
 SIGN_HOLD_STATE = "sign-hold.json"
 SIGN_HOLD_FLAG = "--trusted-next-signing"
 _SIGN_HOLD_MEMO: dict[str, tuple[float, Any]] = {}
+SIGN_HOLD_RETRY_S = 3.0  # one retry of a failed read before the hold fails open
+# What the hold did in this refresh (a deferral, or an install at its cap), for --refresh-hooks' "signHold":
+# glaeda-update writes it to its jsonl and converge.json. Its stderr lines are not kept (2026-11-05 10:16Z: a signing
+# runner took hook bcdd1aac over an active run that lacked it, and nothing on the host said why).
+_SIGN_HOLD_EVENTS: list[str] = []
 
 
 def signing_runner(hook_dir: Path) -> bool:
@@ -2334,6 +2340,15 @@ def sign_hold_fetch(url: str) -> str | None:
     return got.stdout if got.returncode == 0 else None
 
 
+def sign_hold_read(url: str) -> str | None:
+    """sign_hold_fetch, retried once after SIGN_HOLD_RETRY_S: a lone transient failure does not fail the hold open."""
+    body = sign_hold_fetch(url)
+    if body is None:
+        time.sleep(SIGN_HOLD_RETRY_S)
+        body = sign_hold_fetch(url)
+    return body
+
+
 def sign_hold_runs() -> list[dict] | None:
     """The active nightly.yml runs on nightly-next, or None when they cannot all be read. GitHub lists runs by creation
     time, not status, so an old queued run can sit behind newer finished ones (2026-11-05: five runs queued for hours
@@ -2343,7 +2358,7 @@ def sign_hold_runs() -> list[dict] | None:
     active: dict[int, dict] = {}
     for status in sorted(SIGN_HOLD_ACTIVE):
         for page in range(1, SIGN_HOLD_PAGES + 1):
-            body = sign_hold_fetch(SIGN_HOLD_RUNS_URL.format(repo=SIGN_HOLD_REPO) + f"&status={status}&page={page}")
+            body = sign_hold_read(SIGN_HOLD_RUNS_URL.format(repo=SIGN_HOLD_REPO) + f"&status={status}&page={page}")
             try:
                 runs = json.loads(body)["workflow_runs"] if body is not None else None
             except (ValueError, KeyError, TypeError):
@@ -2373,7 +2388,7 @@ def sign_hold_blockers(digest: str, cache: dict[str, bool]) -> list[tuple[int, s
     for run in runs:
         sha = run["head_sha"]
         if sha not in cache:
-            text = sign_hold_fetch(SIGN_HOLD_LIST_URL.format(repo=SIGN_HOLD_REPO, sha=sha))
+            text = sign_hold_read(SIGN_HOLD_LIST_URL.format(repo=SIGN_HOLD_REPO, sha=sha))
             if text is None:
                 return None
             listed = {ln.split(None, 1)[0] for ln in text.splitlines() if ln.strip() and not ln.lstrip().startswith("#")}
@@ -2383,6 +2398,13 @@ def sign_hold_blockers(digest: str, cache: dict[str, bool]) -> list[tuple[int, s
         if not cache[sha]:
             blockers.append((run["id"], sha))
     return blockers
+
+
+def sign_hold_event(line: str) -> None:
+    """Say what the hold did: on stderr, and in this refresh's "signHold" report."""
+    print(f"glaeda-cmux-runner: sign hold: {line}", file=sys.stderr, flush=True)
+    if line not in _SIGN_HOLD_EVENTS:
+        _SIGN_HOLD_EVENTS.append(line)
 
 
 def sign_hold(home: Path, digest: str, now: Callable[[], float] = time.time) -> str | None:
@@ -2403,21 +2425,22 @@ def sign_hold(home: Path, digest: str, now: Callable[[], float] = time.time) -> 
     blockers = sign_hold_blockers(digest, cache)
     note: str | None = None
     since = state.get("since") if isinstance(state.get("since"), (int, float)) else None
-    if blockers is None:
-        print(f"glaeda-cmux-runner: sign hold: could not read nightly-next's active runs or their signing-hook lists; "
-              f"installing hook {digest[:12]} as before (fail-open)", file=sys.stderr, flush=True)
-    elif blockers:
+    if blockers is None or blockers:
+        # an unreadable answer holds too, inside the same cap: on a signing runner keeping the old hook a little
+        # longer costs nothing, and installing over a run that lacks the new one strands its sign job (10:16Z)
         since = since if since is not None else now()
-        named = ", ".join(f"run {rid} at {sha[:12]}" for rid, sha in blockers)
+        held_since = f"{datetime.datetime.fromtimestamp(since, datetime.timezone.utc):%H:%M:%SZ}"
+        why = (f"could not read nightly-next's active runs or their signing-hook lists (after one retry)"
+               if blockers is None else
+               "a nightly-next run's commit does not list hook " + digest[:12] + " ("
+               + ", ".join(f"run {rid} at {sha[:12]}" for rid, sha in blockers) + ")")
         if now() - since >= SIGN_HOLD_CAP_S:
-            print(f"glaeda-cmux-runner: SIGN HOLD CAP: hook {digest[:12]} held {SIGN_HOLD_CAP_S / 3600:g} h for "
-                  f"nightly-next runs whose commits do not list it ({named}); installing it now, and their sign jobs "
-                  "will be refused", file=sys.stderr, flush=True)
+            sign_hold_event(f"SIGN HOLD CAP: hook {digest[:12]} held {SIGN_HOLD_CAP_S / 3600:g} h since {held_since}; "
+                            f"installing it now, though {why}: a sign job whose commit does not list it will be refused")
         else:
-            note = (f"deferred: a nightly-next run's commit does not list hook {digest[:12]} ({named}); the old hook "
-                    f"stays for its sign job (held since {datetime.datetime.fromtimestamp(since, datetime.timezone.utc):%H:%M:%SZ}, "
+            note = (f"deferred: {why}; the old hook stays for its sign job (held since {held_since}, "
                     f"cap {SIGN_HOLD_CAP_S / 3600:g} h)")
-            print(f"glaeda-cmux-runner: sign hold: {note}", file=sys.stderr, flush=True)
+            sign_hold_event(note)
     with contextlib.suppress(OSError):
         path.parent.mkdir(parents=True, exist_ok=True)
         write_atomic(path, (json.dumps({"digest": digest, "since": since, "listed": cache}) + "\n").encode(), 0o644)
@@ -2537,6 +2560,7 @@ def refresh_hooks(home: Path, apply: bool) -> dict[str, Any]:
     sources = hook_sources()
     doc["hookSha256"] = sha256_bytes(sources[HOOK_NAME][0])
     hold = functools.partial(sign_hold, home)
+    _SIGN_HOLD_EVENTS.clear()
     with runner_lock(home, wait=False) as held:
         if not held:
             return {**doc, "error": "an --apply or --uninstall holds the runner lock; a later run refreshes"}
@@ -2566,6 +2590,8 @@ def refresh_hooks(home: Path, apply: bool) -> dict[str, Any]:
                 doc["runners"][index] = {"receipt": doc["runners"][index]["receipt"], **entry}
                 if entry.get("note") != JOB_RUNNING:
                     waiting.remove(item)
+    if _SIGN_HOLD_EVENTS:
+        doc["signHold"] = list(_SIGN_HOLD_EVENTS)
     return doc
 
 

@@ -834,13 +834,19 @@ def refresh_runner_hooks(state_dir: Path = STATE_DIR, home: Path = HOME, detail:
         if detail is not None and isinstance(runner, dict):
             detail.append({"runnerDir": str(runner.get("runnerDir") or runner.get("receipt") or "?")[:300],
                            "state": str(runner.get("state")), "note": str(runner.get("note") or "")[:200]})
+    # the runner's sign hold (glaeda-cmux-runner SIGN_HOLD): a deferral, or an install at its cap
+    held = [str(line)[:400] for line in doc.get("signHold") or [] if isinstance(line, str)][:8] \
+        if isinstance(doc.get("signHold"), list) else []
+    if detail is not None:
+        detail.extend({"signHold": line} for line in held)
     if doc.get("error"):
         return f"not refreshed ({str(doc['error'])[:300]})"
     if not counts:
         return "no runners"
     notes = sorted({str(r.get("note"))[:160] for r in runners if r.get("state") in ("blocked", "kept", "skipped") and r.get("note")})
     return f"{tag}: " + ", ".join(f"{n} {state}" for state, n in sorted(counts.items())) + \
-        ("" if not notes else " (" + "; ".join(notes)[:400] + ")")
+        ("" if not notes else " (" + "; ".join(notes)[:400] + ")") + \
+        ("" if not held else "; sign hold: " + " | ".join(held)[:800])
 
 
 def release_history(gen: Path, name: str) -> set[str] | None:
@@ -1055,7 +1061,7 @@ def convergence(result: dict, running: dict, wants: dict | None, hook_states: li
         why.append(f"installed tools differ from {running.get('tag')}: {', '.join(tools['drift'])}"
                    + (f" ({result['repair']})" if result.get("repair") else ""))
         blocking = blocking or str(result.get("repair", "")).startswith("failed")
-    states = {h.get("runnerDir"): h for h in hook_states}
+    states = {h.get("runnerDir"): h for h in hook_states if "runnerDir" in h}
     for hook in running.get("hooks") or []:
         if hook.get("current"):
             continue
@@ -1099,6 +1105,11 @@ def record_convergence(config: dict, result: dict, wants: dict | None, previous:
     for key in ("nudged",):
         if key in previous:
             doc[key] = previous[key]
+    # what the runners' sign hold did this run. Kept beside `why`, not in it: an install at the cap leaves the host
+    # converged, and a line in `why` would mark it unconverged and back it off; a deferral is already in `why`.
+    held = [h["signHold"] for h in hook_states if isinstance(h, dict) and isinstance(h.get("signHold"), str)]
+    if held:
+        doc["signHold"] = held
     doc["staleAfter"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now + STALE_AFTER_S))
     if converged:
         doc.update(since=None, attempts=0, nextAttempt=None, alertAfter=None)
