@@ -5462,6 +5462,7 @@ CLAIM_SCHEMA = "glaeda-claim-sleep/v1"
 CLAIM_HELD, CLAIM_RELEASED, CLAIM_REACQUIRING = "held", "released", "reacquiring"
 CLAIM_RELEASE_OFF = "claim-release.off"
 CLAIM_RECORD_MAX_BYTES = 16 * 1024
+CLAIM_DRAIN_MAX_S = YIELD_TO_EXCLUSIVE_WAIT_S  # a record's drain bound past this (or below 0) is invalid
 CLAIM_ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,127}")
 CLAIM_RELEASED_ENV = "released"  # JOB_CLAIM_ENV's value after claim-release: cmux's claim gate refuses it
 # How a step calls the hook mid-job: job-started gives an exclusive job these through $GITHUB_ENV.
@@ -5496,8 +5497,19 @@ def read_claim_record(path: Path) -> dict[str, Any] | None:
             or not isinstance(data.get("trusted"), bool) \
             or not isinstance(data.get("drain_bound"), (int, float)) or isinstance(data.get("drain_bound"), bool):
         return None
-    if data["state"] not in (CLAIM_HELD, CLAIM_RELEASED, CLAIM_REACQUIRING) or data["owner_pid"] <= 1 \
-            or data["capacity_units"] <= 0 or not math.isfinite(data["drain_bound"]):
+    # every number in its range before anything uses it: a pid past 2**31 overflows os.kill, an integer past 1e308
+    # overflows a float; any such record is invalid, never an exception in an admission
+    try:
+        bounds = {"owner_pid": (2, 2 ** 31 - 1), "capacity_units": (1, EXCLUSIVE_UNITS), "compile_slots": (1, 1024),
+                  "roots": (1, 1024), "instance": (0, 1024)}
+        if any(not lo <= data[k] <= hi for k, (lo, hi) in bounds.items()):
+            return None
+        drain = float(data["drain_bound"])
+        if not math.isfinite(drain) or not 0.0 <= drain <= CLAIM_DRAIN_MAX_S:
+            return None
+    except (OverflowError, TypeError, ValueError):
+        return None
+    if data["state"] not in (CLAIM_HELD, CLAIM_RELEASED, CLAIM_REACQUIRING):
         return None
     return data
 
@@ -5526,7 +5538,11 @@ def sleeping_owners(state_dir: Path) -> set[int]:
         if record is None:
             continue
         owner = JobOwner(record["owner_pid"], record["owner_identity"])
-        if owner.gone():
+        try:
+            gone = owner.gone()
+        except (OverflowError, OSError, ValueError):
+            continue  # never an exception in an admission; a record that cannot be judged is not honoured
+        if gone:
             with contextlib.suppress(OSError):
                 path.unlink()  # a cancelled or crashed job's record: nothing to honour
             continue
