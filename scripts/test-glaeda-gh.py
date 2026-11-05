@@ -52,6 +52,8 @@ gg.DAEMON_CONFIG = Path(tempfile.gettempdir()) / f"glaeda-gh-test-no-daemon-conf
 gg.FLEET_POLICY = Path(tempfile.gettempdir()) / f"glaeda-gh-test-no-fleet-policy-{os.getpid()}.json"
 # Nor may a host's own pacer hear about the tests' secondary 403s.
 gg.PACE_CLI = Path(tempfile.gettempdir()) / f"glaeda-gh-test-no-pacer-{os.getpid()}" / "gh"
+# Nor may a host's own expected-contexts.json add contexts the tests do not post.
+gg.EXPECTED_CONFIG = Path(tempfile.gettempdir()) / f"glaeda-gh-test-no-expected-{os.getpid()}.json"
 
 TOKEN = "ghp_faketoken_must_never_touch_disk"
 NOW = float(int(time.time()))  # watch files carry real mtimes
@@ -99,6 +101,11 @@ def cached(*jobs: dict) -> dict:
 def refused(name: str = "build", **kw) -> dict:
     """What glaeda's runner hook leaves when it refuses a job: Set up runner failed within seconds."""
     return job(name, failed_step="Set up runner", seconds=7, **kw)
+
+
+def status_context(context: str, state: str = "SUCCESS") -> dict:
+    return {"__typename": "StatusContext", "context": context, "state": state, "targetUrl": f"https://ci/{context}",
+            "createdAt": "2026-11-05T14:28:31Z"}
 
 
 class FakeGitHub:
@@ -369,6 +376,101 @@ class Base(unittest.TestCase):
         2 of a subprocess, where no patch of ours is in effect."""
         with mock.patch.object(gg, "say_waiting", lambda line: print(line, file=buffer)):
             yield
+
+
+class UnfinishedStatusTest(Base):
+    """teamleaderleo/leo-workspace#3538 at f40f2a3d (2026-11-05): `wait pr --sha` returned success on GitGuardian's
+    pass alone, before the fleet-reconciler posted the ws-check status its merges wait on. A pending status, an
+    expected status not posted yet, and a head with nothing on it are never success."""
+
+    SHA = "f" * 40
+
+    def data(self, *nodes: dict, repo: str = "o/r", pushed: float | None = None) -> dict:
+        node = pr_node(3538, checks=list(nodes))
+        node.update(url=f"https://github.com/{repo}/pull/3538", headRefOid=self.SHA, mergeStateStatus="UNSTABLE",
+                    updatedAt=iso(NOW if pushed is None else pushed))
+        return gg.parse_pr(node)
+
+    def test_a_pending_status_is_not_success(self) -> None:
+        data = self.data(check_run("GitGuardian Security Checks"), status_context("ws-check", "PENDING"))
+        for until in ("green", "done", "required"):
+            self.assertIsNone(gg.verdict("pr", data, until, self.SHA, now=NOW), until)
+        view = gg.status_view("pr:o/r#3538", {"data": data})
+        self.assertEqual(view["checks"]["state"], "PENDING")
+        self.assertEqual([c["name"] for c in view["checks"]["pending"]], ["ws-check"])
+
+    def test_an_expected_status_not_posted_yet_is_not_success(self) -> None:
+        # the #3538 head at 14:28: only GitGuardian had reported, ws-check was not posted yet
+        data = self.data(check_run("GitGuardian Security Checks"), repo="teamleaderleo/leo-workspace",
+                         pushed=NOW - 1500)
+        self.assertIsNone(gg.verdict("pr", data, "green", self.SHA, now=NOW))
+        self.assertEqual(gg.status_view("pr:teamleaderleo/leo-workspace#3538", {"data": data})["checks"]["state"],
+                         "PENDING")
+        self.assertIn("expected, not posted yet: ws-check",
+                      gg.summary("pr:teamleaderleo/leo-workspace#3538", {"data": data}))
+        posted = self.data(check_run("GitGuardian Security Checks"), status_context("ws-check", "PENDING"),
+                           repo="teamleaderleo/leo-workspace", pushed=NOW - 1500)
+        self.assertIsNone(gg.verdict("pr", posted, "green", self.SHA, now=NOW))
+        green = self.data(check_run("GitGuardian Security Checks"), status_context("ws-check"),
+                          repo="teamleaderleo/leo-workspace", pushed=NOW - 1500)
+        self.assertEqual(gg.verdict("pr", green, "green", self.SHA, now=NOW), gg.EXIT_OK)
+        red = self.data(check_run("GitGuardian Security Checks"), status_context("ws-check", "FAILURE"),
+                        repo="teamleaderleo/leo-workspace", pushed=NOW - 1500)
+        self.assertEqual(gg.verdict("pr", red, "green", self.SHA, now=NOW), gg.EXIT_FAIL)
+        # the config file names a repo's contexts, and wins over the built-in list
+        gg.write_json(gg.EXPECTED_CONFIG, {"o/r": ["deploy-check"], "teamleaderleo/leo-workspace": []})
+        self.addCleanup(gg.EXPECTED_CONFIG.unlink)
+        self.assertEqual(gg.verdict("pr", data, "green", self.SHA, now=NOW), gg.EXIT_OK)
+        self.assertIsNone(gg.verdict("pr", self.data(check_run("ci")), "green", self.SHA, now=NOW))
+
+    def test_an_empty_head_inside_the_settle_window_is_not_started(self) -> None:
+        data = self.data(pushed=NOW - 60)
+        self.assertIsNone(gg.verdict("pr", data, "green", self.SHA, now=NOW))
+        self.assertIn("not started", gg.summary("pr:o/r#3538", {"data": data}))
+        # past the window it says nothing reported, a distinct code, never success
+        late = NOW - 60 + gg.SETTLE_GRACE + 1
+        self.assertEqual(gg.verdict("pr", data, "green", self.SHA, now=late), gg.EXIT_NOTHING)
+        self.assertNotIn(gg.EXIT_NOTHING, (gg.EXIT_OK, gg.EXIT_FAIL, gg.EXIT_TIMEOUT, gg.EXIT_DOWN, gg.EXIT_CONFLICT))
+        self.assertEqual(gg.verdict("pr", data, "green", self.SHA, now=NOW, settle=30), gg.EXIT_NOTHING)
+        # the daemon's first sighting of the head bounds the push when the PR's updatedAt moved later (a comment)
+        seen = {**self.data(pushed=NOW), "headSeenAt": NOW - gg.SETTLE_GRACE - 5}
+        self.assertEqual(gg.verdict("pr", seen, "green", self.SHA, now=NOW), gg.EXIT_NOTHING)
+
+    def test_green_statuses_and_green_checks_are_success(self) -> None:
+        data = self.data(check_run("build"), check_run("lint", conclusion="SKIPPED"), status_context("ci/legacy"),
+                         pushed=NOW - 5)
+        for until in ("green", "done", "required"):
+            self.assertEqual(gg.verdict("pr", data, until, self.SHA, now=NOW), gg.EXIT_OK, until)
+
+    def test_the_wait_says_so(self) -> None:
+        key = "pr:o/r#3538"
+        req = gg.wait_request("pr", "o/r#3538", "green", 60, False, False, self.SHA, True, gg.RESCUE_GRACE, settle=0)
+        req["began"] = NOW - 5
+
+        def cached(data: dict) -> None:
+            gg.write_json(gg.cache_dir() / gg.file_name(key),
+                          {"key": key, "fetchedAt": NOW, "dataAt": NOW, "data": data, "error": None})
+
+        cached(self.data(check_run("GitGuardian Security Checks"), status_context("ws-check", "PENDING")))
+        self.assertIsNone(gg.wait_step(req, NOW))
+        cached(self.data(pushed=NOW - 60))
+        code, text = gg.wait_step(req, NOW)
+        self.assertEqual(code, gg.EXIT_NOTHING)
+        self.assertIn("result: nothing-reported", text)
+        self.assertIn("not a pass", text)
+        cached(self.data(check_run("GitGuardian Security Checks"), status_context("ws-check")))
+        self.assertEqual(gg.wait_step(req, NOW)[0], gg.EXIT_OK)
+
+    def test_the_daemon_keeps_the_first_sighting_of_a_head(self) -> None:
+        key = "pr:o/r#3538"
+        self.daemon.now = NOW - 100
+        self.daemon.store(key, None, data={"headRefOid": "a" * 40, "checks": []}, dataAt=NOW - 100)
+        self.assertEqual(gg.read_cache(key)["data"]["headSeenAt"], NOW - 100)
+        self.daemon.now = NOW
+        self.daemon.store(key, None, data={"headRefOid": "a" * 40, "checks": []}, dataAt=NOW)
+        self.assertEqual(gg.read_cache(key)["data"]["headSeenAt"], NOW - 100)
+        self.daemon.store(key, None, data={"headRefOid": "b" * 40, "checks": []}, dataAt=NOW)
+        self.assertEqual(gg.read_cache(key)["data"]["headSeenAt"], NOW)
 
 
 class FakeController:

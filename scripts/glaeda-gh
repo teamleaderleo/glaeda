@@ -153,8 +153,12 @@ the daemon is the only process that talks to GitHub, and clients only read its c
 Clients make no API calls. When the daemon is not running they say so and exit 3 rather than
 fall back to polling. `wait` exits 0 on success (or a matching comment), 1 on failure (a failed
 check, a failed run, a PR closed without being merged, an issue that does not exist), 2 on timeout,
-4 when the PR conflicts with its base. --until green (default) fails as soon as any completed check
+4 when the PR conflicts with its base, 6 when no check or status ever reported on the PR's head
+(--settle seconds after its push, default SETTLE_GRACE: its CI has not started, which is not a pass).
+--until green (default) fails as soon as any completed check
 failed, required or not, and succeeds once every check finished with success, neutral or skipped;
+a pending commit status is unfinished like a running check, and so is one of the repo's
+EXPECTED_CONTEXTS (leo-workspace's ws-check) that has not been posted yet;
 done waits for every check to finish; required lets only the checks GitHub requires decide (when
 any are marked); merged waits for the merge.
 
@@ -318,6 +322,18 @@ COMMENTS_LAST = 50  # comments per issue per read: more than this within one 15 
 COMMENT_BODY_MAX = 4000
 STEPS_BATCH = 50  # check runs per steps query
 EXIT_OK, EXIT_FAIL, EXIT_TIMEOUT, EXIT_DOWN, EXIT_CONFLICT = 0, 1, 2, 3, 4
+EXIT_NOTHING = 6  # `wait pr`: the head's settle window passed and no check or status ever reported on it
+# A green head is green only once nothing more is coming. teamleaderleo/leo-workspace#3538 (2026-11-05): a `wait pr
+# --sha f40f2a3d` returned success on GitGuardian's pass alone, before the fleet-reconciler (cmuxterm-hq
+# fleet-reconciler-ws-check.yml) got round to posting the `ws-check` status its merges wait on: the head was pushed
+# at 14:02, ws-check went pending at 14:28:31, and leo-workspace requires no check, so nothing said one was missing.
+# A repo's EXPECTED_CONTEXTS (built in, or ~/.config/glaeda/expected-contexts.json {"OWNER/REPO": ["context", ...]},
+# which wins) are unfinished on an open PR until they report, as a required check is. A pending status was already
+# unfinished. A head with nothing at all on it is "not started" for SETTLE_GRACE after its push (bounded above by
+# the PR's updatedAt and the daemon's first sighting of the head, headSeenAt), then exits EXIT_NOTHING: never 0.
+SETTLE_GRACE = 420
+EXPECTED_CONTEXTS: dict[str, tuple[str, ...]] = {"teamleaderleo/leo-workspace": ("ws-check",)}
+EXPECTED_CONFIG = Path.home() / ".config/glaeda/expected-contexts.json"
 UPSTREAM_CONFIG = Path.home() / ".config/glaeda/upstream.json"  # {"command": [...]}: read through it, no token
 UPSTREAM_EVERY = 20  # seconds between upstream reads of every watched key (the upstream polls each PR every 60)
 UPSTREAM_NEW = 3  # a key with no data yet is asked for again this soon: the upstream fills it within a tick or two
@@ -3001,6 +3017,12 @@ class Daemon:
                 entry.update({k: base[k] for k in ("dataAt", "data", "etag", "jobs", "jobsEtag", "jobsAt", "jobsTried", "restAt", "source", "restParts", "restRun", "origin", "via")
                               if k in base})
             entry.update(fields)
+            if key.startswith("pr:") and isinstance(entry.get("data"), dict) and "data" in fields:
+                old = (base or {}).get("data") if isinstance((base or {}).get("data"), dict) else {}
+                head = entry["data"].get("headRefOid")
+                seen = old.get("headSeenAt") if head and old.get("headRefOid") == head else None
+                if head and entry["data"].get("headSeenAt") is None:
+                    entry["data"] = {**entry["data"], "headSeenAt": seen if seen is not None else self.now}
             write_json(cache, entry)
 
     def fail(self, entries: list[dict], message: str) -> None:
@@ -4402,9 +4424,45 @@ def classify(data: dict, now: float | None = None, grace: float = RESCUE_GRACE) 
     return out
 
 
+def expected_contexts(repo: str) -> tuple[str, ...]:
+    """The checks or statuses every head of REPO gets (EXPECTED_CONTEXTS, and EXPECTED_CONFIG's entry, which wins)."""
+    doc = read_json(EXPECTED_CONFIG)
+    if isinstance(doc, dict) and isinstance(doc.get(repo), list):
+        return tuple(str(c) for c in doc[repo] if c)
+    return EXPECTED_CONTEXTS.get(repo, ())
+
+
+def pr_repo(data: dict) -> str:
+    match = re.match(r"https://github\.com/([^/]+/[^/]+)/pull/", str(data.get("url") or ""))
+    return match.group(1) if match else ""
+
+
+def expected_missing(data: dict) -> list[str]:
+    reported = {c.get("name") for c in data.get("checks") or []}
+    return [name for name in expected_contexts(pr_repo(data)) if name not in reported]
+
+
+def pushed_by(data: dict) -> float | None:
+    """The latest the head can have been pushed: the PR's updatedAt (a push updates it) and the daemon's first
+    sighting of the head, whichever is earlier; None when neither is known."""
+    known = [t for t in (iso_epoch(data.get("updatedAt")), data.get("headSeenAt")) if isinstance(t, (int, float))]
+    return min(known) if known else None
+
+
+def settling(data: dict, now: float, settle: float = SETTLE_GRACE) -> float | None:
+    """Seconds left of the head's settle window (SETTLE_GRACE), or None once it is over or cannot be placed."""
+    pushed = pushed_by(data)
+    if pushed is None:
+        return None
+    left = pushed + settle - now
+    return left if left > 0 else None
+
+
 def check_verdict(data: dict, until: str = "green", now: float | None = None,
-                  grace: float = RESCUE_GRACE) -> int | None:
-    """The checks alone, whatever the PR's state or head: EXIT_OK, EXIT_FAIL, or None while pending."""
+                  grace: float = RESCUE_GRACE, settle: float = SETTLE_GRACE) -> int | None:
+    """The checks alone, whatever the PR's state or head: EXIT_OK, EXIT_FAIL, EXIT_NOTHING (nothing reported on the
+    head past its settle window), or None while pending."""
+    now = time.time() if now is None else now
     checks = data.get("checks") or []
     if data.get("checksPageError"):
         return None  # a partial cached rollup is not evidence of a green head
@@ -4439,7 +4497,8 @@ def check_verdict(data: dict, until: str = "green", now: float | None = None,
             return None
         return None if groups["held"] else EXIT_FAIL
     if not checks:
-        return None  # nothing has reported yet
+        # nothing has reported yet: not started while the head settles (or its push time is unknown), then said so
+        return None if settling(data, now, settle) is not None or pushed_by(data) is None else EXIT_NOTHING
     marked = any(c.get("required") for c in checks)
 
     def decides(c: dict) -> bool:
@@ -4460,7 +4519,11 @@ def check_verdict(data: dict, until: str = "green", now: float | None = None,
         return None
     if data.get("requiredMissing") and data.get("state") == "OPEN" and data.get("mergeStateStatus") == "DIRTY":
         return EXIT_FAIL  # merge conflicts: the required checks will not run until the next push
-    return EXIT_FAIL if bad else EXIT_OK
+    if bad:
+        return EXIT_FAIL
+    if data.get("state") == "OPEN" and expected_missing(data):
+        return None  # a status every head of this repo gets has not been posted yet: unfinished, like a required one
+    return EXIT_OK
 
 
 def run_hold(data: dict, jobs: list[dict] | None, now: float | None = None,
@@ -4483,7 +4546,7 @@ def run_hold(data: dict, jobs: list[dict] | None, now: float | None = None,
 
 def verdict(kind: str, data: dict | None, until: str = "green", sha: str | None = None,
             jobs: list[dict] | None = None, now: float | None = None, grace: float = RESCUE_GRACE,
-            repo: str = "") -> int | None:
+            repo: str = "", settle: float = SETTLE_GRACE) -> int | None:
     """EXIT_OK, EXIT_FAIL, EXIT_CONFLICT (a PR that conflicts with its base), or None while still pending.
     A run is `sha`'s when its head is, or when it is a dispatch naming `sha` of `repo` (run_tests_commit)."""
     if not data:
@@ -4504,7 +4567,7 @@ def verdict(kind: str, data: dict | None, until: str = "green", sha: str | None 
         return None  # the push has not reached GitHub yet, or these are an older commit's checks
     if conflicting(data):
         return EXIT_CONFLICT  # no pull_request workflow runs until the next push
-    return check_verdict(data, until, now, grace)
+    return check_verdict(data, until, now, grace, settle)
 
 
 def conflicting(data: dict) -> bool:
@@ -4569,7 +4632,11 @@ def summary(key: str, entry: dict | None, until: str = "done", grace: float = RE
                          f"{len(groups['pending'])} pending{held} (of {len(checks)}{more}, "
                          f"{sum(1 for c in checks if c.get('required'))} required){differs}")
         else:
-            lines.append("checks: none reported yet for this head commit")
+            left = settling(data, now)
+            lines.append("checks: none reported yet for this head commit"
+                         + (f" (not started; settles in {int(left)}s)" if left is not None else ""))
+        if data.get("state") == "OPEN" and expected_missing(data):
+            lines.append(f"  expected, not posted yet: {', '.join(expected_missing(data))}")
         if data.get("requiredMissing"):
             why = " (merge conflicts: they run after the next push)" if data.get("mergeStateStatus") == "DIRTY" else ""
             lines.append(f"  required, not reported yet: {', '.join(data['requiredMissing'])}{why}")
@@ -4926,11 +4993,12 @@ def say_waiting(line: str) -> None:
 
 
 def wait_request(kind: str, target: str, until: str, timeout: float, jobs: bool, as_json: bool,
-                 sha: str | None, exact: bool, grace: float) -> dict:
+                 sha: str | None, exact: bool, grace: float, settle: float = SETTLE_GRACE) -> dict:
     """What a `wait pr|run` is ruled on: the same fields whether the client polls (cmd_wait) or the
     daemon rules on it (subscribe_wait). `began` is wall-clock time: only data fetched after it counts."""
     return {"key": parse_key(kind, target), "kind": kind, "target": target, "until": until, "timeout": timeout,
-            "jobs": jobs, "json": as_json, "sha": sha, "exact": exact, "grace": grace, "began": time.time()}
+            "jobs": jobs, "json": as_json, "sha": sha, "exact": exact, "grace": grace, "settle": settle,
+            "began": time.time()}
 
 
 def rest_run(data: dict | None) -> dict:
@@ -4994,12 +5062,17 @@ def wait_step(req: dict, now: float) -> tuple[int, str] | None:
         elif head and not exact:
             # resolved: a later push now counts as pending, as for a full id
             req["sha"], req["exact"] = sha, exact = head, True
-    result = (verdict(kind, data, until, sha, (entry or {}).get("jobs"), time.time(), grace, f"{owner}/{repo}")
+    settle = float(req.get("settle", SETTLE_GRACE))
+    result = (verdict(kind, data, until, sha, (entry or {}).get("jobs"), time.time(), grace, f"{owner}/{repo}", settle)
               if usable else None)
     if result is not None:
-        outcome_name = {EXIT_OK: "success", EXIT_CONFLICT: "conflict"}.get(result, "failure")
+        outcome_name = {EXIT_OK: "success", EXIT_CONFLICT: "conflict", EXIT_NOTHING: "nothing-reported"}.get(
+            result, "failure")
         extra: dict[str, Any] = {"result": outcome_name, "waited_s": waited}
-        if kind == "pr" and result == EXIT_CONFLICT:
+        if kind == "pr" and result == EXIT_NOTHING:
+            extra["note"] = (f"no check or status reported on this head within {int(settle)}s of its push: "
+                             "its CI has not started (not a pass)")
+        elif kind == "pr" and result == EXIT_CONFLICT:
             extra["note"] = ("PR conflicts with its base (mergeable CONFLICTING): no checks run until you "
                              "merge or rebase onto the base and push")
         elif kind == "pr" and data.get("state") == "CLOSED":
@@ -5018,7 +5091,7 @@ def wait_step(req: dict, now: float) -> tuple[int, str] | None:
 
 
 def cmd_wait(kind: str, target: str, until: str, timeout: float, jobs: bool, as_json: bool,
-             sha: str | None = None, grace: float = RESCUE_GRACE) -> int:
+             sha: str | None = None, grace: float = RESCUE_GRACE, settle: float = SETTLE_GRACE) -> int:
     """The polling wait: this process re-reads the cache until wait_step decides. `wait pr|run` uses it
     only when the daemon cannot rule on the wait itself (subscribe_wait). Says the waiting line once,
     before it blocks; poll_wait does not, so a wait handed back to it (resume_wait) is not said twice."""
@@ -5027,7 +5100,7 @@ def cmd_wait(kind: str, target: str, until: str, timeout: float, jobs: bool, as_
     if sha:
         sha, exact = resolve_sha(sha)
     say_waiting(waiting_line(key, until, sha, exact, timeout))
-    return poll_wait(wait_request(kind, target, until, timeout, jobs, as_json, sha, exact, grace))
+    return poll_wait(wait_request(kind, target, until, timeout, jobs, as_json, sha, exact, grace, settle))
 
 
 def poll_wait(req: dict) -> int:
@@ -5127,10 +5200,11 @@ def waits_dir() -> Path:
 
 
 def write_wait_request(kind: str, target: str, until: str, timeout: float, jobs: bool, as_json: bool,
-                       sha: str | None, exact: bool, grace: float, pid: int, began: float | None = None) -> str:
+                       sha: str | None, exact: bool, grace: float, pid: int, began: float | None = None,
+                       settle: float = SETTLE_GRACE) -> str:
     """Leave a wait for the daemon: its FIFO first, then the request, so the daemon never sees a request
     without one. Interest is registered at once, as a polling wait does. Returns the request's id."""
-    req = wait_request(kind, target, until, timeout, jobs, as_json, sha, exact, grace)
+    req = wait_request(kind, target, until, timeout, jobs, as_json, sha, exact, grace, settle)
     if began is not None:  # a handoff keeps the wait's start (data read since then still counts), same deadline
         req["timeout"] += max(0.0, req["began"] - began)
         req["began"] = began
@@ -5210,7 +5284,7 @@ def controller_wait_run(key: str, timeout: float) -> dict | None:
 
 
 def subscribe_wait(kind: str, target: str, until: str, timeout: float, jobs: bool, as_json: bool,
-                   sha: str | None = None, grace: float = RESCUE_GRACE) -> int:
+                   sha: str | None = None, grace: float = RESCUE_GRACE, settle: float = SETTLE_GRACE) -> int:
     """`wait pr|run` as a request the daemon rules on: this process writes it and becomes BLOCKER, a bash
     asleep on a FIFO, instead of a Python interpreter re-reading the cache every WAIT_POLL (89 of those
     held 1.6 GB on cosmic-gray, 2026-10-21). Same arguments, output and exit codes as cmd_wait, which it
@@ -5223,13 +5297,13 @@ def subscribe_wait(kind: str, target: str, until: str, timeout: float, jobs: boo
     otherwise -- say_waiting writes fd 2 directly, so nothing is left buffered across the exec -- and
     not again on the late fallback, which goes straight to poll_wait."""
     if not (0 <= timeout <= WAITS_MAX_TIMEOUT) or not os.access(BASH, os.X_OK) or not serving_waits():
-        return cmd_wait(kind, target, until, timeout, jobs, as_json, sha, grace)
+        return cmd_wait(kind, target, until, timeout, jobs, as_json, sha, grace, settle)
     key = parse_key(kind, target)
     exact = True
     if sha:
         sha, exact = resolve_sha(sha)
     say_waiting(waiting_line(key, until, sha, exact, timeout))
-    req = wait_request(kind, target, until, timeout, jobs, as_json, sha, exact, grace)
+    req = wait_request(kind, target, until, timeout, jobs, as_json, sha, exact, grace, settle)
     if kind == "run" and not jobs:
         # the daemon keeps reading while this blocks (a lost finish is re-read past STALE_RUN_REREAD)
         register(key, jobs, waited=True)
@@ -5244,9 +5318,9 @@ def subscribe_wait(kind: str, target: str, until: str, timeout: float, jobs: boo
         timeout = max(0.0, timeout - (time.monotonic() - started))
     try:
         rid = write_wait_request(kind, target, until, timeout, jobs, as_json, sha, exact, grace, os.getpid(),
-                                 began=req["began"])
+                                 began=req["began"], settle=settle)
     except OSError:
-        late = wait_request(kind, target, until, timeout, jobs, as_json, sha, exact, grace)
+        late = wait_request(kind, target, until, timeout, jobs, as_json, sha, exact, grace, settle)
         late["timeout"] += max(0.0, late["began"] - req["began"])
         late["began"] = req["began"]
         return poll_wait(late)
@@ -8907,6 +8981,9 @@ def parser() -> argparse.ArgumentParser:
             s.add_argument("--rescue-grace", type=float, default=RESCUE_GRACE, metavar="S",
                            help=f"hold a failure caused only by a glaeda runner refusing a job at setup this long "
                                 f"for a rescue re-run (default {RESCUE_GRACE}; 0 rules on each attempt)")
+            s.add_argument("--settle", type=float, default=SETTLE_GRACE, metavar="S",
+                           help=f"PRs: a head with no check or status is not started for this long after its "
+                                f"push, then exits {EXIT_NOTHING} (nothing reported; default {SETTLE_GRACE})")
             s.add_argument("--author", help="comments: only this author (github-actions[bot] or github-actions)")
             s.add_argument("--match", help="comments: a regular expression the body must contain")
             s.add_argument("--since", help="comments: after this comment id or URL, ISO time, or duration "
@@ -9018,6 +9095,8 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_status(args.kind, args.target, args.jobs, args.json, fields=parse_fields(args.field))
         if args.rescue_grace < 0:
             raise WatchError("--rescue-grace must be 0 or more seconds")
+        if args.settle < 0:
+            raise WatchError("--settle must be 0 or more seconds")
         if args.kind == "file":
             if args.exists and args.gone:
                 raise WatchError("wait file takes one of --exists and --gone")
@@ -9034,7 +9113,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.author or args.match or args.since:
             raise WatchError("--author, --match and --since are for wait comment")
         return subscribe_wait(args.kind, args.target, args.until, args.timeout, args.jobs, args.json, args.sha,
-                              args.rescue_grace)
+                              args.rescue_grace, args.settle)
     except WatchError as error:
         # Through say_waiting for its stdout reason: this handler covers `wait --json`, so with
         # stderr closed `print(file=None)` made a bad-argument message the first line of the
