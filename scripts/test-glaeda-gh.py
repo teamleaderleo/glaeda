@@ -174,7 +174,7 @@ class FakeGitHub:
                     start = int(after or 0)
                     node = None if nodes is None else {"statusCheckRollup": {"contexts": {
                         "pageInfo": {"hasNextPage": start + 100 < len(nodes), "endCursor": str(start + 100)},
-                        "nodes": nodes[start:start + 100]}}, **self.suite_counts(sha)}
+                        "nodes": nodes[start:start + 100]}}, **self.suite_counts(sha, f"{owner}/{repo}")}
                     data["repository" if alias is None else alias] = {"object": node}
                 out = {"data": data}
                 return 200, self.rate("graphql", self.graphql_remaining), json.dumps(out).encode()
@@ -233,13 +233,15 @@ class FakeGitHub:
         self.rest_remaining -= 1
         return 200, {**self.rate("core", self.rest_remaining), "etag": etag}, json.dumps(payload).encode()
 
-    def suite_counts(self, sha: str) -> dict:
-        """A commit's checkSuites as SUITE_ATTEMPTS asks: each suite's check runs in its newest attempt and in all."""
+    def suite_counts(self, sha: str, repo: str | None = None) -> dict:
+        """A commit's checkSuites as SUITE_ATTEMPTS asks: each suite's check runs in its newest attempt and in all
+        (only the suites of REPO when a suite names its "repo"; "more": True cuts the page past 100 suites)."""
         if sha not in self.suites:
             return {}
-        return {"checkSuites": {"pageInfo": {"hasNextPage": False}, "nodes": [
+        suites = [suite for suite in self.suites[sha] if repo is None or suite.get("repo", repo) == repo]
+        return {"checkSuites": {"pageInfo": {"hasNextPage": any(suite.get("more") for suite in suites)}, "nodes": [
             {"id": suite["id"], "latest": {"totalCount": suite["latest"]}, "every": {"totalCount": len(suite["runs"])}}
-            for suite in self.suites[sha]]}}
+            for suite in suites]}}
 
     def rest_issue(self, parts: list[str], path: str) -> Any:
         """The REST view of the GraphQL issue nodes in self.issues: the issue, or a page of its comments."""
@@ -5364,6 +5366,44 @@ class HeadChecksTest(Base):
         self.assertIn(("publish", "FAILURE"), [(c["name"], c["conclusion"]) for c in data["checks"]])
         self.assertEqual(gg.check_verdict(data, "green"), gg.EXIT_FAIL)
         self.assertEqual(gg.check_verdict({**data, "checksTruncated": True}, "green"), gg.EXIT_FAIL)
+
+    def test_a_red_under_startup_failure_reruns_in_the_check_of_record_repository_still_reads_red(self) -> None:
+        # Review finding F1 on glaeda#1842: the fork's suites are read too, under its prefix.
+        self.gh.heads[("teamleaderleo", "glaeda", SHA_A)] = [check_run("Release / build")]
+        self.gh.heads[("manaflow-ai", "glaeda", SHA_A)] = [check_run("Verify / build")]
+        self.gh.suites[SHA_A] = [{"id": "S9", "latest": 0, "runs": [self.red_publish()], "repo": "manaflow-ai/glaeda"}]
+        key = gg.parse_key("head", f"teamleaderleo/glaeda@{SHA_A}")
+        gg.register(key, consumer="autoland")
+        self.daemon.tick(NOW)
+        found = gg.read_cache(key)["data"]["found"]
+        self.assertEqual(found["manaflow-ai/glaeda: CI / publish"], ["completed", "failure"])
+        self.assertNotIn("CI / publish", found)
+
+    def test_more_suites_than_one_page_is_an_error_not_a_greener_head(self) -> None:
+        # Review finding F3 on glaeda#1842: a ran-nothing suite past the first 100 could hide its red.
+        self.gh.heads[("o", "r", SHA_A)] = [check_run("CI / build")]
+        self.gh.suites[SHA_A] = [{"id": "S1", "latest": 1, "runs": [self.red_publish(1, "SUCCESS")], "more": True}]
+        gg.register(self.key(SHA_A), consumer="autoland")
+        self.daemon.tick(NOW)
+        self.assertIn("more than 100 check suites", gg.read_cache(self.key(SHA_A))["error"])
+
+    def test_a_required_red_under_startup_failure_reruns_fails_until_required(self) -> None:
+        # Review finding F2 on glaeda#1842: a run read by suite id has no isRequired; the base's rules decide.
+        node = pr_node(1, rollup="SUCCESS", checks=[{**check_run("build"), "isRequired": True}])
+        node["baseRef"] = {"branchProtectionRule": {"requiredStatusCheckContexts": ["publish"]}, "rules": {"nodes": []}}
+        self.gh.prs[("o", "r", 1)] = node
+        self.gh.suites[node["headRefOid"]] = [{"id": "S1", "latest": 0, "runs": [self.red_publish()]}]
+        key = gg.parse_key("pr", "o/r#1")
+        gg.register(key)
+        self.daemon.tick(NOW)
+        data = gg.read_cache(key)["data"]
+        self.assertEqual(gg.check_verdict(data, "required"), gg.EXIT_FAIL)
+        # one the base does not require does not decide --until required while others are marked required
+        node["baseRef"] = {"branchProtectionRule": {"requiredStatusCheckContexts": ["build"]}, "rules": {"nodes": []}}
+        self.daemon.tick(NOW + gg.CYCLE)
+        data = gg.read_cache(key)["data"]
+        self.assertNotIn(gg.check_verdict(data, "required"), (gg.EXIT_FAIL,))
+        self.assertEqual(gg.check_verdict(data, "green"), gg.EXIT_FAIL)
 
     def test_an_unknown_commit_is_missing_not_pending(self) -> None:
         gg.register(self.key("d" * 40), consumer="autoland")
