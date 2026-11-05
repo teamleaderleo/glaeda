@@ -5858,8 +5858,9 @@ def host_overloaded(paused: bool, load: float | None, cores: int | None, cpu_bus
             f"least {cpu_min:g}%; listening resumes below {resume:g} per core)")
 
 
-def load_average() -> float | None:
-    """The 1-minute load average, or None when it cannot be read."""
+def load_1min() -> float | None:
+    """The 1-minute load average from getloadavg (no process: the gate reads it every GATE_CPU_EVERY_S on every
+    runner), or None when it cannot be read. load_average below is the sysctl read the health sampler keeps."""
     try:
         return os.getloadavg()[0]
     except OSError:
@@ -6558,7 +6559,7 @@ class Gate:
             self.cpu_busy, self.load1 = None, None
         elif now - self.cpu_at >= GATE_CPU_EVERY_S:
             self.cpu_busy = self.cpu_look(now)
-            self.load1 = load_average()
+            self.load1 = load_1min()
             self.cpu_at = now
         if now - self.memory_at >= GATE_CPU_EVERY_S:
             self.memory_pressure = memory_pressure_level()

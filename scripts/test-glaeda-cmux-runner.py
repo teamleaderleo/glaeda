@@ -7879,7 +7879,7 @@ class GateTest(unittest.TestCase):
                 mock.patch.object(fresh, "host_cpu_ticks", return_value=None), \
                 mock.patch.object(fresh, "host_io", side_effect=lambda: (0.0, busy[0])), \
                 mock.patch.object(fresh, "memory_pressure_level", return_value=1), \
-                mock.patch.object(fresh, "load_average", return_value=1.0), \
+                mock.patch.object(fresh, "load_1min", return_value=1.0), \
                 mock.patch.object(fresh, "thermal_pressure_level", return_value=0):
             for cpu, held in ((84.9, False), (85.0, True), (82.0, True), (80.0, True), (79.9, False), (84.0, False),
                               (90.0, True)):
@@ -7933,7 +7933,7 @@ class GateTest(unittest.TestCase):
             patcher.start()
             self.addCleanup(patcher.stop)
         for name, fake in (("host_io", lambda: (0.0, busy[0])), ("memory_pressure_level", lambda: pressure[0]),
-                           ("gate_host", lambda: host[0]), ("load_average", lambda: 1.0)):
+                           ("gate_host", lambda: host[0]), ("load_1min", lambda: 1.0)):
             patcher = mock.patch.object(hook, name, side_effect=fake)
             patcher.start()
             self.addCleanup(patcher.stop)
@@ -7999,7 +7999,7 @@ class GateTest(unittest.TestCase):
         for load, cores, m in ((None, 14, marks), (99.0, 0, marks), (99.0, None, marks), (99.0, 14, None)):
             self.assertIsNone(hook.host_overloaded(False, load, cores, 100.0, m))
         with mock.patch.object(hook.os, "getloadavg", side_effect=OSError):
-            self.assertIsNone(hook.load_average())
+            self.assertIsNone(hook.load_1min())
 
         # the gate: with the CPU hold off (the declared default) a side listener is still held for overload,
         # a gui runner is not, and a hold past GATE_LOAD_MAX_HOLD_S listens anyway so no label is stranded
@@ -8012,7 +8012,7 @@ class GateTest(unittest.TestCase):
             patcher.start()
             self.addCleanup(patcher.stop)
         for name, fake in (("host_io", lambda: (0.0, 100.0)), ("host_cpu_ticks", lambda: None),
-                           ("memory_pressure_level", lambda: 1), ("load_average", lambda: load[0]),
+                           ("memory_pressure_level", lambda: 1), ("load_1min", lambda: load[0]),
                            ("gate_host", lambda: "std")):
             patcher = mock.patch.object(hook, name, side_effect=fake)
             patcher.start()
