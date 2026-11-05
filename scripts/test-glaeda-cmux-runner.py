@@ -10964,6 +10964,57 @@ class RunnerTest(unittest.TestCase):
         self.assertEqual((hooks / cr.HOOK_NAME).read_bytes(), HOOK.read_bytes())
         self.assertEqual(reads, [], "a runner that does not sign reads nothing")
 
+    def test_sign_hold_reads_every_page_of_active_runs(self) -> None:
+        self.signing_install()
+        full = [(1000 + i, "queued", self.NEW_SHA) for i in range(cr.SIGN_HOLD_PAGE_SIZE)]
+        pages = {1: full, 2: [(7, "queued", self.OLD_SHA), (6, "completed", "c" * 40)]}
+        reads: list[str] = []
+
+        def fetch(url: str) -> str | None:
+            reads.append(url)
+            if "/runs" in url:
+                page = int(url.rsplit("&page=", 1)[1])
+                return json.dumps({"workflow_runs": [{"id": i, "status": st, "head_sha": sha}
+                                                     for i, st, sha in pages.get(page, full)]})
+            return {self.OLD_SHA: f"{self.older_digest()} old\n",
+                    self.NEW_SHA: f"{self.older_digest()} old\n{self.new_digest()} new\n"}[url.split("/")[-4]]
+
+        with mock.patch.object(cr, "sign_hold_fetch", fetch):
+            done = self.invoke("--refresh-hooks", "--apply")["runners"][0]
+            self.assertEqual(done["state"], "deferred")
+            self.assertIn("run 7 at aaaaaaaaaaaa", done["note"])
+            self.assertEqual(sum("/runs" in u for u in reads), 2)
+            # more pages of active runs than it reads is no answer: it installs (fail-open)
+            pages.clear()
+            cr._SIGN_HOLD_MEMO.clear()
+            with contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(self.invoke("--refresh-hooks", "--apply")["runners"][0]["state"], "updated")
+
+    def test_sign_hold_takes_malformed_run_data_as_unreadable(self) -> None:
+        hooks = self.signing_install()
+        body = json.dumps({"workflow_runs": [{"id": "41976650433", "status": "queued", "head_sha": self.OLD_SHA}]})
+        with mock.patch.object(cr, "sign_hold_fetch", lambda url: body if "/runs" in url else None), \
+                contextlib.redirect_stderr(io.StringIO()) as err:
+            self.assertEqual(self.invoke("--refresh-hooks", "--apply")["runners"][0]["state"], "updated")
+        self.assertIn("fail-open", err.getvalue())
+        self.assertEqual((hooks / cr.HOOK_NAME).read_bytes(), HOOK.read_bytes())
+
+    def test_sign_hold_reports_a_staged_copy_a_job_completed_installed_first(self) -> None:
+        """The hook's install_staged_hook takes no lock: one past its checks can land a copy staged before the hold
+        while the hold clears it. The refresh reads the hook back and says it was installed, never that it held."""
+        hooks = self.signing_install()
+        self.github([(7, "queued", self.OLD_SHA)], {self.OLD_SHA: f"{self.older_digest()} old\n"})
+        real = cr.clear_next
+
+        def raced(hook_dir: Path) -> None:
+            (hook_dir / cr.HOOK_NAME).write_bytes(HOOK.read_bytes())  # job-completed won the race
+            real(hook_dir)
+
+        with mock.patch.object(cr, "clear_next", raced):
+            done = self.invoke("--refresh-hooks", "--apply")["runners"][0]
+        self.assertEqual(done["state"], "updated")
+        self.assertIn("staged before the sign hold", done["note"])
+
     def test_sign_hold_never_changes_the_hook_trust_rule(self) -> None:
         """The hold only picks which listed hook stays installed: the hook still refuses a commit whose list names
         neither the old hook nor the new one (SIGNING_HOOKS), so nothing it holds admits an unlisted hook."""

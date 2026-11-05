@@ -2294,6 +2294,8 @@ def sync_dir(path: Path) -> None:
 SIGN_HOLD_REPO = "manaflow-ai/cmux"
 SIGN_HOLD_RUNS_URL = ("https://api.github.com/repos/{repo}/actions/workflows/nightly.yml/runs"
                       "?branch=nightly-next&per_page=100")
+SIGN_HOLD_PAGE_SIZE = 100
+SIGN_HOLD_PAGES = 3
 SIGN_HOLD_LIST_URL = "https://raw.githubusercontent.com/{repo}/{sha}/scripts/ci/glaeda-signing-hooks.txt"
 SIGN_HOLD_ACTIVE = frozenset({"queued", "in_progress", "waiting", "requested", "pending"})
 SIGN_HOLD_CAP_S = 3 * 3600.0
@@ -2331,23 +2333,39 @@ def sign_hold_fetch(url: str) -> str | None:
     return got.stdout if got.returncode == 0 else None
 
 
+def sign_hold_runs() -> list[dict] | None:
+    """The active nightly.yml runs on nightly-next, newest first, or None when they cannot all be read. Pages are read
+    (newest first) until one ends on a finished run; more than SIGN_HOLD_PAGES pages of active runs is no answer."""
+    active: list[dict] = []
+    for page in range(1, SIGN_HOLD_PAGES + 1):
+        body = sign_hold_fetch(SIGN_HOLD_RUNS_URL.format(repo=SIGN_HOLD_REPO) + f"&page={page}")
+        try:
+            runs = json.loads(body)["workflow_runs"] if body is not None else None
+        except (ValueError, KeyError, TypeError):
+            runs = None
+        if not isinstance(runs, list) or not all(isinstance(run, dict) for run in runs):
+            return None
+        for run in runs:
+            if run.get("status") not in SIGN_HOLD_ACTIVE:
+                continue
+            rid, sha = run.get("id"), str(run.get("head_sha") or "")
+            if not isinstance(rid, int) or isinstance(rid, bool) or not re.fullmatch(r"[0-9a-f]{40}", sha):
+                return None  # malformed run data is an unreadable answer, never a crash
+            active.append({"id": rid, "head_sha": sha})
+        if len(runs) < SIGN_HOLD_PAGE_SIZE or runs[-1].get("status") not in SIGN_HOLD_ACTIVE:
+            return active  # the last page, or one that ends on a finished run: older runs are finished too
+    return None
+
+
 def sign_hold_blockers(digest: str, cache: dict[str, bool]) -> list[tuple[int, str]] | None:
     """[(run id, head sha)] of the active nightly-next nightly.yml runs whose list lacks digest, or None when a read
     failed. cache maps a head sha to whether its list carries digest; new answers are added to it."""
-    body = sign_hold_fetch(SIGN_HOLD_RUNS_URL.format(repo=SIGN_HOLD_REPO))
-    try:
-        runs = json.loads(body)["workflow_runs"] if body is not None else None
-    except (ValueError, KeyError, TypeError):
-        runs = None
-    if not isinstance(runs, list):
+    runs = sign_hold_runs()
+    if runs is None:
         return None
     blockers = []
     for run in runs:
-        if not isinstance(run, dict) or run.get("status") not in SIGN_HOLD_ACTIVE:
-            continue
-        sha = str(run.get("head_sha") or "")
-        if not re.fullmatch(r"[0-9a-f]{40}", sha):
-            return None
+        sha = run["head_sha"]
         if sha not in cache:
             text = sign_hold_fetch(SIGN_HOLD_LIST_URL.format(repo=SIGN_HOLD_REPO, sha=sha))
             if text is None:
@@ -2357,7 +2375,7 @@ def sign_hold_blockers(digest: str, cache: dict[str, bool]) -> list[tuple[int, s
                 return None  # an empty answer is not a list
             cache[sha] = digest in listed
         if not cache[sha]:
-            blockers.append((int(run.get("id") or 0), sha))
+            blockers.append((run["id"], sha))
     return blockers
 
 
@@ -2445,7 +2463,14 @@ def refresh_hook_dir(runner_dir: Path, receipt: Any, apply: bool, sources: dict[
     if apply and hold is not None and HOOK_NAME in stale and signing_runner(hook_dir):
         held = hold(hashlib.sha256(sources[HOOK_NAME][0]).hexdigest())  # SIGN_HOLD: cmux lists bare hex
         if held:
-            clear_next(hook_dir)  # nor may a job-completed install a copy an earlier refresh staged
+            # nor may a job-completed install a copy an earlier, unheld refresh staged. The hook's install_staged_hook
+            # takes no lock (changing the hook would need a new signing-hooks rollout), so one already past its checks
+            # can still land the copy: that is read back and reported as installed, never as held.
+            clear_next(hook_dir)
+            if hashlib.sha256((hook_dir / HOOK_NAME).read_bytes()).hexdigest() == \
+                    hashlib.sha256(sources[HOOK_NAME][0]).hexdigest():
+                return {**entry, "state": "updated", "note": "a job-completed installed the copy staged before the "
+                                                             "sign hold; " + held}
             return {**entry, "state": "deferred", "note": held}
     # A job's hooks run from these files: job-started under one version, job-completed under the next. The
     # gate takes a swap mid-job (it re-execs in place and adopts its runner), but the job hooks are only ever
