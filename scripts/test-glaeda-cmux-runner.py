@@ -3606,7 +3606,7 @@ class HookTest(unittest.TestCase):
             self.finish("k0")
             self.assertIn("root-1", self.job("cli-product-tests", "k5", 14).stdout)
             two = self.job("macos-compile-admission", "k6", 14, None, "--canonical-roots", "2", "--compile-slots", "2",
-                           env={"GITHUB_ENV": os.fspath(env_file)})
+                           env={"GITHUB_ENV": os.fspath(env_file), "GLAEDA_JOB_SHARE": "0"})
             self.assertIn("persistent-dd+root-2", two.stdout)
             self.assertIn("CMUX_CI_CANONICAL_ROOT=/private/tmp/cmux-ci-2 via GITHUB_ENV", two.stdout)
             self.assertTrue(env_file.read_text().endswith("CMUX_CI_CANONICAL_ROOT=/private/tmp/cmux-ci-2\n"))
