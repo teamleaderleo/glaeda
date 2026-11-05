@@ -10,3 +10,5 @@ from workspace_bootstrap.cli import main
 
 if __name__ == "__main__":
     raise SystemExit(main(sys.argv[1:]))
+
+# Probe: force the Rust job set for a base measurement of the test job on this runner class. Not for merge.
