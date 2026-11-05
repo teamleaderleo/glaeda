@@ -761,16 +761,22 @@ class HookTest(unittest.TestCase):
         # cmux #36561 (main 7badd980) made poll-outer, poll-stapled and publish run on a mini's /bin/bash 3.2
         signing = ("wait-and-staple", "staple-outer", "staple-stapled", "publish", "generate-deltas",
                    "republish-deltas")
-        # AUTO_RESUME_POLL_JOBS: a key, but only Apple's queue to wait on, so light and never an exclusive claim
+        # AUTO_RESUME_HOSTED_JOBS: a key, but only Apple's queue to wait on, so no glaeda runner admits them
         polls = ("poll", "poll-outer", "poll-stapled")
         self.assertEqual(set(hook.AUTO_RESUME_SIGNING_JOBS), set(signing))
-        self.assertEqual(set(hook.AUTO_RESUME_POLL_JOBS), set(polls))
-        self.assertEqual(set(hook.AUTO_RESUME_TRUSTED_JOBS), set(signing) | set(polls))
+        self.assertEqual(set(hook.AUTO_RESUME_HOSTED_JOBS), set(polls))
+        self.assertEqual(set(hook.AUTO_RESUME_TRUSTED_JOBS), set(signing))
         self.assertEqual(set(hook.AUTO_RESUME_LIGHT_JOBS), {"preflight", "verify-stapled"})
         for job in polls:
             self.assertNotIn(("auto-resume-nightly-notarization.yml", job), hook.SIGNING_JOBS)
-            self.assertEqual(hook.job_class(job, "manaflow-ai/cmux", hook.DEFAULT_HOME_REPO,
-                                            "auto-resume-nightly-notarization.yml")[0], "light")
+            # neither exclusive (the claim would hold the mini for Apple's queue) nor admitted at all
+            self.assertNotEqual(hook.job_class(job, "manaflow-ai/cmux", hook.DEFAULT_HOME_REPO,
+                                               "auto-resume-nightly-notarization.yml")[0], hook.EXCLUSIVE_CLASS)
+            for event_name, payload in payloads.items():
+                with self.subTest(hosted=job, event_name=event_name):
+                    why = hook.trusted_refusal(**{**args, "event_name": event_name, "event": payload, "job": job})
+                    self.assertIsNotNone(why)
+                    self.assertIn("untrusted:", why)
         for job in hook.AUTO_RESUME_TRUSTED_JOBS:
             if job in signing:
                 self.assertIn(("auto-resume-nightly-notarization.yml", job), hook.SIGNING_JOBS)

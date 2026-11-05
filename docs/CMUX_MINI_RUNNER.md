@@ -983,16 +983,24 @@ only the source run's artifacts, which `preflight` checks through the API first.
   - `wait-and-staple`, `staple-outer`, `staple-stapled`, `publish`, `generate-deltas`, `republish-deltas`
     (`AUTO_RESUME_SIGNING_JOBS`): they staple, sign or publish, so each is a `SIGNING_JOBS` entry, exclusive
     class, one drain of the mini.
-  - `poll`, `poll-outer`, `poll-stapled` (`AUTO_RESUME_POLL_JOBS`): light. They only ask Apple whether a
-    submission is done, and their timeouts are Apple's queue, not work: 90, 360 and 360 minutes. An exclusive
-    class bounds how long a job *waits* for the mini (`SIGNING_DRAIN_WAIT_S`), never how long it then holds it,
-    so exclusive they would stop the one-mini nightly, classic and NEXT, for up to those 6 hours: every
-    `yieldToExclusive` dedicated runner on the mini starts nothing while an exclusive claim is held
-    (`YIELD_TO_EXCLUSIVE`, bound 3 h), and a nightly signing job arriving behind one waits
-    `SIGNING_DRAIN_WAIT_S` and is then refused to Blacksmith, which is what the one-mini nightly exists to end.
-    cmux's workflow put them on ubuntu for the same reason ("Apple queue latency never reserves signing
-    workers"). Light, they run beside the nightly with only the notary key in memory. cmux therefore gives the
-    claim gate to the exclusive six, not to these three.
+- `poll`, `poll-outer` and `poll-stapled` (`AUTO_RESUME_HOSTED_JOBS`) are refused on every glaeda runner and
+  keep their hosted route. They hold the notary key, but each only asks Apple whether a submission is done, and
+  its timeout is Apple's queue rather than work: 90, 360 and 360 minutes. No class puts them on the one nightly
+  mini without stopping the nightly.
+  - Exclusive, the claim holds the whole mini for that long. The exclusive class bounds how long a job *waits*
+    for the mini (`SIGNING_DRAIN_WAIT_S`), never how long it then holds it, and every `yieldToExclusive`
+    dedicated runner there starts nothing while a claim is held (`YIELD_TO_EXCLUSIVE`, bound 3 h, then it
+    refuses its own job), so the nightly, classic and NEXT, stops.
+  - Light, the claim is gone but the job's processes are not: an exclusive job needs no process of another job
+    in any runner's `_work` before it may hold the mini (`stray_job_processes`), so a 6 hour poll means every
+    nightly signing job behind it waits `SIGNING_DRAIN_WAIT_S` and is then refused so the run's Blacksmith job
+    signs.
+
+  Either way the mini sends signing to Blacksmith for hours, which is what the one-mini nightly exists to end,
+  and the 30 minute feed freshness bound cannot hold. cmux's workflow put these three on ubuntu for this reason
+  ("Apple queue latency never reserves signing workers"). Taking them off Blacksmith too needs the waiting split
+  from the acting on the cmux side, so the mini is claimed for the stapling and not for Apple's queue. cmux
+  gives the claim gate to the exclusive six, not to these three.
 - On the nightly-only runners (`glaeda-nightly-only-admit`): `preflight` and `verify-stapled`
   (`AUTO_RESUME_LIGHT_JOBS`), light; they hold no key.
 - The ubuntu jobs run on a mini's `/bin/bash` 3.2: `poll-outer`, `poll-stapled` and `publish` since cmux #36561

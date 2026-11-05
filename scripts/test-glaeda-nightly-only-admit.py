@@ -147,9 +147,8 @@ class RefusalTest(unittest.TestCase):
         for name in ("staple-outer", "staple-stapled", "publish"):
             with self.subTest(signing_now=name):
                 self.assertIn("signing job", self.why(**resume(name)))
-        # AUTO_RESUME_POLL_JOBS hold the notary key, so they keep the trusted signing runner even though they
-        # are light: this runner names the two jobs it takes and refuses them
-        for name in hook.AUTO_RESUME_POLL_JOBS:
+        # AUTO_RESUME_HOSTED_JOBS keep their hosted route: no glaeda runner admits them, this one included
+        for name in hook.AUTO_RESUME_HOSTED_JOBS:
             with self.subTest(poll=name):
                 why = self.why(**resume(name))
                 self.assertIsNotNone(why)
