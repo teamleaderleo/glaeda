@@ -5913,6 +5913,15 @@ def files_strict(d: Path) -> list[Path] | None:
     return None if errors or d.is_symlink() else found
 
 
+def _refs_peeled(gitdir: Path, *patterns: str) -> str | None:
+    """for-each-ref as refname TAB object TAB peeled commit. Peeling a ref whose object is gone fails (git 2.4x
+    aborts outright), so then the refs are read unpeeled: a tag's own id is still a tip, and rev-list peels it."""
+    out = _git_dir_run(gitdir, "for-each-ref", "--format=%(refname)%09%(objectname)%09%(*objectname)", *patterns)
+    if out is None:
+        out = _git_dir_run(gitdir, "for-each-ref", "--format=%(refname)%09%(objectname)%09", *patterns)
+    return out
+
+
 # refs a linked worktree keeps for itself; they are deleted with it
 WORKTREE_REFS = ("refs/bisect", "refs/worktree", "refs/rewritten")
 
@@ -5931,9 +5940,7 @@ def local_tips(gitdir: Path, worktree_only: bool = False) -> list[str] | None:
                 return None
         except OSError:
             return None
-    refs = _git_dir_run(gitdir, "for-each-ref",
-                        "--format=%(refname)%09%(objectname)%09%(*objectname)",
-                        *(WORKTREE_REFS if worktree_only else ()))
+    refs = _refs_peeled(gitdir, *(WORKTREE_REFS if worktree_only else ()))
     head = _git_dir_run(gitdir, "rev-parse", "--verify", "-q", "HEAD")
     if refs is None or head is None:
         return None
@@ -6639,7 +6646,7 @@ def repo_damage(gitdir: Path) -> list[str]:
         out = ""
     lines = [" ".join(ln.split()) for ln in out.splitlines()]
     for i, ln in enumerate(lines):
-        if ln.startswith("missing "):
+        if ln.startswith("missing ") or "invalid sha1 pointer" in ln or ln.startswith(("bad object", "fatal: bad object")):
             found.append(ln)
         elif ln.startswith("broken link from"):
             nxt = lines[i + 1] if i + 1 < len(lines) and lines[i + 1].startswith("to ") else ""
@@ -6663,7 +6670,7 @@ def archive_git_dir(gitdir: Path, key: str, written: list[Path], damage: list[st
         with tarfile.open(tmp, "w:gz") as t:
             t.add(os.fspath(gitdir), arcname="git", recursive=True)
         with tarfile.open(tmp, "r:gz") as t:
-            got = {m.name for m in t.getmembers() if m.isfile()}
+            got = {m.name for m in t.getmembers() if m.isreg() or m.islnk()}  # a second link to a file is a link
         if got != {"git/" + os.path.relpath(f, gitdir) for f in want}:
             return f"tar of {gitdir} does not hold every file of its git dir"
         _keep_archive(tmp, dest, expires, written, kind="damaged git dir", gitdir=os.fspath(gitdir),
@@ -6700,9 +6707,10 @@ def bundle_unpushed(gitdir: Path, key: str, written: list[Path], relied: list[st
         own = local_tips(wt, worktree_only=True)
         tips = None if own is None else sorted({*tips, *own})
     remotes = network_remotes(gitdir)
-    refs = _git_dir_run(gitdir, "for-each-ref", "--format=%(refname)%09%(objectname)%09%(*objectname)")
+    refs = _refs_peeled(gitdir)
     if tips is None or remotes is None or refs is None:
-        return f"unreadable refs or remotes in {gitdir}"
+        # a ref or HEAD on an object that is gone fails here, before any history is read
+        return salvage_damaged(gitdir, key, written, f"unreadable refs or remotes in {gitdir}")
     local: dict[str, tuple[str, str]] = {}  # refname -> (object, commit)
     tracking: set[str] = set()
     for line in refs.splitlines():

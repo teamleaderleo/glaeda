@@ -8000,6 +8000,35 @@ class LinuxLayoutTest(unittest.TestCase):
                                         capture_output=True, text=True).stdout.strip(), "commit")
         self.assertEqual(os.listdir(out), ["git"])  # its git dir only, never the work tree
 
+    def test_a_repository_whose_branch_object_is_gone_goes_to_a_tar_with_its_hard_links(self) -> None:
+        """Review of #1865 (F1, F2): a branch whose object is gone fails before any history is read, and a
+        git dir with hard-linked files (a local clone's objects) is still archived."""
+        unit, clone, env = self.mirror_unit()
+        self.git(clone, "checkout", "-q", "-b", "side", env=env)
+        self.git(clone, "commit", "-q", "--allow-empty", "-m", "unpushed", env=env)
+        head = self.git(clone, "rev-parse", "HEAD")
+        self.git(clone, "checkout", "-q", "main", env=env)  # the work tree stays readable; only `side` breaks
+        loose = clone / ".git/objects" / head[:2] / head[2:]
+        os.link(loose, clone / ".git/objects/info/linked-copy")  # a hard link inside the git dir
+        loose.unlink()
+        self.assertTrue(gd.repo_damage(clone / ".git"))
+        rec, err = self.apply_mirror(unit)
+        self.assertEqual(rec["outcome"], "reclaimed", rec["reasons"])
+        self.assertNotIn("ALERT", err)
+        archive = self.home / "archive/glaeda-disk"
+        self.assertEqual(len(list(archive.glob("*.gitdir.expires-*.tar.gz"))), 1)
+        entry = [json.loads(ln) for ln in (archive / "manifest.jsonl").read_text().splitlines()][-1]
+        self.assertEqual(entry["kind"], "damaged git dir")
+        self.assertTrue(entry["missing"])
+
+    def test_a_git_dir_with_hard_linked_files_archives_whole(self) -> None:
+        _, clone, _ = self.mirror_unit()
+        head = clone / ".git/HEAD"
+        os.link(head, clone / ".git/HEAD-link")
+        written: list[Path] = []
+        self.assertEqual(gd.archive_git_dir(clone / ".git", "k", written, ["missing commit x"]), "")
+        self.assertEqual(len(written), 1)
+
     def test_a_repository_that_only_fails_for_other_reasons_is_not_called_damaged(self) -> None:
         _, clone, _ = self.mirror_unit()
         self.assertEqual(gd.repo_damage(clone / ".git"), [])
