@@ -5529,7 +5529,10 @@ def claim_record(owner: JobOwner, taken: dict[str, Any], *, capacity_dir: Path, 
 
 def sleeping_owners(state_dir: Path) -> set[int]:
     """The Runner.Workers of this mini's signing jobs that gave their claim up to sleep (claim record released or
-    reacquiring, owner still the same live process). A record whose owner is gone is removed."""
+    reacquiring). A record is honoured only after a positive match: its pid is alive and its start token reads and
+    equals the recorded one. An unreadable token (a ps timeout under load) is no match, since the pid may now be another
+    signing job: the record is not a sleeper (its processes count toward the drain) and is kept. A record is removed
+    only when its pid is proven gone or proven to be another process."""
     owners: set[int] = set()
     if not state_dir.is_dir():
         return owners
@@ -5537,17 +5540,18 @@ def sleeping_owners(state_dir: Path) -> set[int]:
         record = read_claim_record(path)
         if record is None:
             continue
-        owner = JobOwner(record["owner_pid"], record["owner_identity"])
+        pid, recorded = record["owner_pid"], record["owner_identity"]
         try:
-            gone = owner.gone()
+            alive = pid_alive(pid)
+            current = process_identity(pid) if alive else None
         except (OverflowError, OSError, ValueError):
             continue  # never an exception in an admission; a record that cannot be judged is not honoured
-        if gone:
+        if not alive or (current is not None and current != recorded):
             with contextlib.suppress(OSError):
-                path.unlink()  # a cancelled or crashed job's record: nothing to honour
+                path.unlink()  # a cancelled or crashed job's record, or a reused pid: nothing to honour
             continue
-        if record["state"] in (CLAIM_RELEASED, CLAIM_REACQUIRING):
-            owners.add(owner.pid)
+        if current == recorded and record["state"] in (CLAIM_RELEASED, CLAIM_REACQUIRING):
+            owners.add(pid)
     return owners
 
 
