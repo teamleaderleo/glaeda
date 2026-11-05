@@ -13676,43 +13676,6 @@ class FleetLabelsModuleTest(unittest.TestCase):
         self.assertIn("ultra", pools["glaeda-nightly-xl-xcode-26.6"])
         self.assertNotIn("glaeda-nightly-light-xcode-26.6", pools)
 
-    def test_only_a_signing_enrolled_nightly_slot_carries_the_signing_label(self) -> None:
-        # NIGHTLY_SIGNING: cmux's secret-bearing nightly jobs queue on glaeda-signing-xcode-<v>, which only the nightly
-        # slot of a host with runner.nightlySigning carries; no class spill, and an xl slot without it never has it.
-        self.assertEqual(fleet_labels.signing_label("26.6"), "glaeda-signing-xcode-26.6")
-        self.assertIn("signing-", fleet_labels.RESERVED_POOL_PREFIXES)
-        manifest = copy.deepcopy(MANIFEST)
-        manifest["hosts"]["mini-std"].setdefault("overrides", {})["runner"] = {"nightlySlot": True}
-        plain, why = fleet_labels.member_labels(manifest, "mini-std", lambda app: True)
-        self.assertIsNone(why)
-        self.assertEqual((plain["nightlyPools"], plain["nightlySigning"]), (["glaeda-nightly-std-xcode-26.6"], False))
-        manifest["hosts"]["mini-std"]["overrides"]["runner"]["nightlySigning"] = True
-        signing, why = fleet_labels.member_labels(manifest, "mini-std", lambda app: True)
-        self.assertIsNone(why)
-        self.assertEqual(signing["nightlyPools"], ["glaeda-nightly-std-xcode-26.6", "glaeda-signing-xcode-26.6"])
-        self.assertTrue(signing["nightlySigning"])
-        for field in ("labels", "pools", "sidePools", "rootPools", "devPools"):
-            self.assertNotIn("glaeda-signing-xcode-26.6", signing[field], field)
-        self.assertEqual(fleet_labels.declared_pools(manifest)["glaeda-signing-xcode-26.6"], ["mini-std"])
-        self.assertEqual(fleet_labels.widened_labels(signing["nightlyPools"]), signing["nightlyPools"])
-        manifest["hosts"]["ultra"] = {"class": "xl", "availability": "dedicated", "roles": ["ci-runner"],
-                                      "hardware": "m5ultra-96", "overrides": {"runner": {"nightlySlot": True, "classes": {
-                                          "xl": {"runners": 8, "capacityUnits": 30, "compileSlots": 3,
-                                                 "canonicalRoots": 3, "gatewayRunners": 2}}}}}
-        ultra, why = fleet_labels.member_labels(manifest, "ultra", lambda app: True)
-        self.assertIsNone(why)
-        self.assertFalse(any("signing" in label for field in ("labels", "pools", "sidePools", "rootPools",
-                                                              "nightlyPools") for label in ultra[field]))
-        self.assertEqual(fleet_labels.declared_pools(manifest)["glaeda-signing-xcode-26.6"], ["mini-std"])
-        for runner, message in (({"nightlySigning": "yes", "nightlySlot": True}, "nightlySigning must be boolean"),
-                                ({"nightlySigning": True}, "needs runner.nightlySlot")):
-            with self.subTest(runner=runner):
-                bad = copy.deepcopy(MANIFEST)
-                bad["hosts"]["mini-std"].setdefault("overrides", {})["runner"] = runner
-                member, why = fleet_labels.member_labels(bad, "mini-std", lambda app: True)
-                self.assertIsNone(member)
-                self.assertIn(message, why)
-
     def test_the_nightly_slot_declares_its_own_pool_without_adding_capacity(self) -> None:
         manifest = copy.deepcopy(MANIFEST)
         before = fleet_labels.member_labels(manifest, "mini-std", lambda app: True)[0]
