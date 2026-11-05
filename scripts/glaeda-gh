@@ -471,7 +471,12 @@ checkRuns(first: 100, filterBy: { checkType: ALL }) { pageInfo { hasNextPage } n
 def ran_nothing_suites(commit: dict | None) -> list[str] | str:
     """The ids of COMMIT's check suites whose newest attempt ran no check run while an older attempt ran some; an
     error message when COMMIT has more suites than one page shows (one past it could hide a red: never greener)."""
-    suites = (commit or {}).get("checkSuites") or {}
+    if commit is None:
+        return []  # no such commit here (a fork that lacks it): nothing to read
+    suites = commit.get("checkSuites")
+    if not isinstance(suites, dict):
+        # GitHub answers a field it failed to read as null beside an error: an unread field is never "none ran nothing"
+        return "graphql: last real attempt: the commit's check suites could not be read"
     if (suites.get("pageInfo") or {}).get("hasNextPage"):
         return "graphql: last real attempt: more than 100 check suites on one commit"
     out = []
@@ -4348,9 +4353,13 @@ def check_verdict(data: dict, until: str = "green", now: float | None = None,
     if data.get("checksPageError"):
         return None  # a partial cached rollup is not evidence of a green head
     marked_required = any(c.get("required") for c in checks)
+    shown = classify(data, now, grace)
     if any(c.get("lastRealAttempt") and (until != "required" or c.get("required") or not marked_required)
-           for c in classify(data, now, grace)["failed"]):
-        # A red whose suite's newest attempt ran nothing (startup_failure): GitHub's rollup state omits it, it stands.
+           for c in shown["failed"]):
+        # A red whose suite's newest attempt ran nothing (startup_failure): GitHub's rollup state omits it, it stands;
+        # --until done still waits for every shown check to finish first.
+        if until == "done" and (shown["pending"] or shown["held"]):
+            return None
         return EXIT_FAIL
     if data.get("checksTruncated"):
         # More than 100 checks: only the first 100 are here, so GitHub's rollup decides, except that a
