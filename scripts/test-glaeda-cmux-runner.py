@@ -2837,6 +2837,27 @@ class HookTest(unittest.TestCase):
         release.assert_called_once()
         self.assertEqual(told.read_text(), "GLAEDA_JOB_CLAIM=released\n")
 
+    def test_claim_release_counts_only_a_proven_missing_path_as_removed(self) -> None:
+        """CLAIM_SLEEP review F2: a key path that cannot be checked (EACCES, an I/O error) is not proven gone, so the
+        claim is kept; only ENOENT counts as removed."""
+        if os.geteuid() == 0:
+            self.skipTest("root reads a mode-000 directory")
+        state, path = self.claim_fixture()
+        locked = self.dir / "locked"
+        locked.mkdir()
+        (locked / "AuthKey.p8").write_text(f"{NOT_A_KEY}\n")
+        environ = {"RUNNER_NAME": "c0", "GITHUB_ENV": os.fspath(self.dir / "github-env")}
+        locked.chmod(0)
+        try:
+            with mock.patch.dict(os.environ, environ), mock.patch.object(hook, "release_host_lock") as release:
+                code, why = hook.claim_release(state, os.getpid(), [os.fspath(locked / "AuthKey.p8")], [])
+        finally:
+            locked.chmod(0o700)
+        self.assertEqual(code, 1, why)
+        self.assertIn(os.fspath(locked / "AuthKey.p8"), why)
+        release.assert_not_called()
+        self.assertEqual(hook.read_claim_record(path)["state"], "held")
+
     def signing_hooks(self, *shas: str) -> tuple[dict, str]:
         """A glaeda-signing-hooks.txt at manaflow-ai/cmux@SHA listing these hook shas, served through
         GLAEDA_SIGNING_HOOKS_URL as cmux's claim gate reads it, and the env that points a signer at it."""
