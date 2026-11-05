@@ -468,10 +468,14 @@ checkRuns(first: 100, filterBy: { checkType: ALL }) { pageInfo { hasNextPage } n
   detailsUrl databaseId startedAt completedAt } } } } }"""
 
 
-def ran_nothing_suites(commit: dict | None) -> list[str]:
-    """The ids of COMMIT's check suites whose newest attempt ran no check run while an older attempt ran some."""
+def ran_nothing_suites(commit: dict | None) -> list[str] | str:
+    """The ids of COMMIT's check suites whose newest attempt ran no check run while an older attempt ran some; an
+    error message when COMMIT has more suites than one page shows (one past it could hide a red: never greener)."""
+    suites = (commit or {}).get("checkSuites") or {}
+    if (suites.get("pageInfo") or {}).get("hasNextPage"):
+        return "graphql: last real attempt: more than 100 check suites on one commit"
     out = []
-    for suite in (((commit or {}).get("checkSuites") or {}).get("nodes") or []):
+    for suite in (suites.get("nodes") or []):
         if not suite:
             continue
         latest = ((suite.get("latest") or {}).get("totalCount")) or 0
@@ -1274,6 +1278,9 @@ def parse_pr(node: dict) -> dict:
             required.add(item.get("context"))
     # A required check that has not reported yet (ci-status appears only when its run reaches it)
     # is pending, not absent: judging only the required checks present would call a run green early.
+    for check in checks:
+        if check.get("lastRealAttempt") and check.get("name") in required:
+            check["required"] = True  # no isRequired on a run read by suite id: the base's rules decide
     reported = {c.get("name") for c in checks}
     return {
         "requiredMissing": sorted(name for name in required if name and name not in reported),
@@ -3145,7 +3152,16 @@ class Daemon:
                 commit = (data.get(f"m{i}") or {}).get("object")
                 record = (commit or {}).get("statusCheckRollup") or {}
                 sources.append((*CHECKS_OF_RECORD[(owner, repo)], record.get("contexts") or {}))
-            extra, extra_error = self.last_real_contexts(ran_nothing_suites((data.get(f"h{i}") or {}).get("object")))
+            # Suites whose newest attempt ran nothing, in each source (the check-of-record one under its prefix).
+            extra, extra_error = [], None
+            objects = [("", (data.get(f"h{i}") or {}).get("object"))]
+            if (owner, repo) in CHECKS_OF_RECORD:
+                objects.append(("{}/{}: ".format(*CHECKS_OF_RECORD[(owner, repo)]), commit))
+            for prefix, obj in objects:
+                nodes, extra_error = self.last_real_contexts(ran_nothing_suites(obj))
+                if extra_error:
+                    break
+                extra.append((prefix, nodes))
             if extra_error:
                 self.store(e["key"], e["cache"], error=extra_error)
                 self.refund(e["key"])
@@ -3164,10 +3180,12 @@ class Daemon:
                 self.store(e["key"], e["cache"], error=None, dataAt=self.now, data=result, restParts=None, via="graphql")
                 self.head_answered(e["key"])
 
-    def last_real_contexts(self, suites: list[str]) -> tuple[list[dict], str | None]:
+    def last_real_contexts(self, suites: list[str] | str) -> tuple[list[dict], str | None]:
         """Check-run context nodes (statusCheckRollup's shape, marked lastRealAttempt) for every attempt of SUITES,
         suites whose newest attempt ran nothing (ran_nothing_suites). ([], error) when they cannot all be read: a
         partial read would be a smaller, greener head."""
+        if isinstance(suites, str):
+            return [], suites
         if not suites:
             return [], None
         reason, self.gql_reason = self.gql_reason, "last-real-attempt"
@@ -3192,7 +3210,8 @@ class Daemon:
                       for run in runs.get("nodes") or [] if run]
         return nodes, None
 
-    def head_pages(self, sha: str, sources: list[tuple[str, str, dict]], extra: list[dict] = ()) -> dict | str:
+    def head_pages(self, sha: str, sources: list[tuple[str, str, dict]],
+                   extra: list[tuple[str, list[dict]]] = ()) -> dict | str:
         """A head's data from the first page of its contexts in each repository of `sources` ((owner, repo,
         contexts): the head's own, then its CHECKS_OF_RECORD repository's), following the rest page by page; an
         error message when a later page cannot be read (the head keeps its older answer)."""
@@ -3219,7 +3238,8 @@ class Daemon:
                 contexts = rollup.get("contexts") or {}
             else:
                 return f"more than {HEAD_BATCH_MAX_CONTEXTS_PAGES * 100} checks on one commit"
-        fold_contexts(list(extra), runs, statuses, ids)  # suites whose newest attempt ran nothing (last_real_contexts)
+        for prefix, nodes in extra:  # suites whose newest attempt ran nothing (last_real_contexts), per source
+            fold_contexts(nodes, runs, statuses, ids, prefix)
         return head_data(sha, runs, statuses, ids)
 
     def fill_steps(self, pairs: list[tuple[dict, dict]]) -> None:
@@ -4327,7 +4347,9 @@ def check_verdict(data: dict, until: str = "green", now: float | None = None,
     checks = data.get("checks") or []
     if data.get("checksPageError"):
         return None  # a partial cached rollup is not evidence of a green head
-    if until != "required" and any(c.get("lastRealAttempt") for c in classify(data, now, grace)["failed"]):
+    marked_required = any(c.get("required") for c in checks)
+    if any(c.get("lastRealAttempt") and (until != "required" or c.get("required") or not marked_required)
+           for c in classify(data, now, grace)["failed"]):
         # A red whose suite's newest attempt ran nothing (startup_failure): GitHub's rollup state omits it, it stands.
         return EXIT_FAIL
     if data.get("checksTruncated"):
