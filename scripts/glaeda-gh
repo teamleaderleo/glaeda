@@ -447,11 +447,40 @@ REST_READ_MAX = {"pr": REST_CHECK_PAGES + REST_STATUS_PAGES + REST_RUN_PAGES + 4
 PR_FIELDS = """number url title state isDraft merged mergedAt mergeable mergeStateStatus headRefOid
 headRefName reviewDecision updatedAt baseRef { branchProtectionRule { requiredStatusCheckContexts }
 rules(first: 50) { nodes { type parameters { ... on RequiredStatusChecksParameters {
-  requiredStatusChecks { context } } } } } } commits(last: 1) { nodes { commit { statusCheckRollup { state
+  requiredStatusChecks { context } } } } } } commits(last: 1) { nodes { commit { SUITE_ATTEMPTS statusCheckRollup { state
 contexts(first: 100) { totalCount pageInfo { hasNextPage endCursor } nodes { __typename
 ... on CheckRun { id name status conclusion detailsUrl databaseId startedAt completedAt
   isRequired(pullRequestNumber: NUM) checkSuite { conclusion workflowRun { databaseId workflow { name databaseId } } } }
 ... on StatusContext { context state targetUrl createdAt isRequired(pullRequestNumber: NUM) } } } } } } }"""
+# A check reads as its last real attempt left it (2026-11-05). statusCheckRollup, like every latest-attempt view, lists
+# only each check suite's newest attempt, and one that ended in startup_failure ran no jobs: after two such reruns of
+# run 41931705470, cmux#35906's "publish tree-addressed cmux-tui" red was gone from it, and the PR merged as 633d5e38
+# at e1d1894a with that red not excused. Such an attempt is no result, never green. So each read also counts every
+# suite's check runs in its newest attempt and in all of them; a suite whose newest attempt ran nothing but an older
+# one ran something has its check runs (every attempt) read by id (last_real_contexts) and folded in, newest per name.
+SUITE_ATTEMPTS = ("checkSuites(first: 100) { pageInfo { hasNextPage } nodes { id "
+                  "latest: checkRuns(first: 1) { totalCount } "
+                  "every: checkRuns(first: 1, filterBy: { checkType: ALL }) { totalCount } } }")
+PR_FIELDS = PR_FIELDS.replace("SUITE_ATTEMPTS", SUITE_ATTEMPTS)
+SUITE_RUNS = """query($suites: [ID!]!) { rateLimit { limit remaining resetAt cost } suiteRuns: nodes(ids: $suites) {
+... on CheckSuite { id conclusion app { slug } workflowRun { databaseId workflow { name databaseId } }
+checkRuns(first: 100, filterBy: { checkType: ALL }) { pageInfo { hasNextPage } nodes { id name status conclusion
+  detailsUrl databaseId startedAt completedAt } } } } }"""
+
+
+def ran_nothing_suites(commit: dict | None) -> list[str]:
+    """The ids of COMMIT's check suites whose newest attempt ran no check run while an older attempt ran some."""
+    out = []
+    for suite in (((commit or {}).get("checkSuites") or {}).get("nodes") or []):
+        if not suite:
+            continue
+        latest = ((suite.get("latest") or {}).get("totalCount")) or 0
+        every = ((suite.get("every") or {}).get("totalCount")) or 0
+        if latest == 0 and every > 0 and suite.get("id"):
+            out.append(suite["id"])
+    return out
+
+
 COMMENT_FIELDS = f"""comments(last: {COMMENTS_LAST}) {{ totalCount nodes {{ databaseId url createdAt
 author {{ login }} body }} }}"""
 ISSUE_FIELDS = f"""__typename ... on Issue {{ url state {COMMENT_FIELDS} }}
@@ -1216,6 +1245,8 @@ def parse_pr(node: dict) -> dict:
             # databaseId first: a queued rerun has no startedAt yet but is still the newer attempt
             order = (c.get("databaseId") or 0, c.get("startedAt") or "")
         check["required"] = bool(c.get("isRequired"))
+        if c.get("lastRealAttempt"):
+            check["lastRealAttempt"] = True  # its suite's newest attempt ran nothing: GitHub's rollup state omits it
         if ((c.get("checkSuite") or {}).get("conclusion") == "CANCELLED" and workflow_key and run_id
                 and run_id < newest[workflow_key]):
             superseded.append(check)
@@ -1333,8 +1364,9 @@ def head_query(owner: str, repo: str, sha: str, cursor: str | None = None,
     if required:
         contexts = contexts.replace("... on StatusContext{context state}",
                                     f"... on StatusContext{{context state{required}}}")
+    suites = "" if cursor else " " + SUITE_ATTEMPTS
     return (f'repository(owner:"{owner}",name:"{repo}"){{object(oid:"{sha}"){{... on Commit{{'
-            + contexts + "}}}")
+            + contexts + suites + "}}}")
 
 
 def fold_contexts(nodes: list, runs: dict, statuses: dict, ids: dict, prefix: str = "") -> None:
@@ -2953,6 +2985,7 @@ class Daemon:
                 page_error = None
                 if kind == "pr":
                     page_error = self.extend_pr_contexts(e, node)
+                    page_error = self.add_last_real_contexts(node) or page_error
                 parsed[i] = parse_pr(node) if kind == "pr" else parse_comments(node)
                 if page_error:
                     parsed[i]["checksPageError"] = page_error
@@ -2980,6 +3013,19 @@ class Daemon:
     def pr_pages_points(self) -> int:
         """GraphQL points the follow-up check pages spent in the last hour (PR_PAGES_POINTS_PER_HOUR)."""
         return sum(points for at, why, points in self.gql_log if why == "pr-pages" and self.now - at < 3600)
+
+    def add_last_real_contexts(self, node: dict) -> str | None:
+        """Add to a PR node's rollup the check runs of the suites whose newest attempt ran nothing (last_real_contexts);
+        the error when they cannot be read, so the cached rollup is partial, never green."""
+        commit = (((node.get("commits") or {}).get("nodes") or [{}])[0] or {}).get("commit") or {}
+        extra, error = self.last_real_contexts(ran_nothing_suites(commit))
+        if extra:
+            rollup = commit.get("statusCheckRollup")
+            if not isinstance(rollup, dict):
+                rollup = commit["statusCheckRollup"] = {"state": None, "contexts": {"nodes": []}}
+            contexts = rollup.setdefault("contexts", {})
+            contexts["nodes"] = list(contexts.get("nodes") or []) + extra
+        return error
 
     def extend_pr_contexts(self, entry: dict, node: dict) -> str | None:
         """Follow a PR's cached statusCheckRollup pages so status pr sees required checks beyond 100.
@@ -3099,7 +3145,12 @@ class Daemon:
                 commit = (data.get(f"m{i}") or {}).get("object")
                 record = (commit or {}).get("statusCheckRollup") or {}
                 sources.append((*CHECKS_OF_RECORD[(owner, repo)], record.get("contexts") or {}))
-            result = self.head_pages(sha, sources)
+            extra, extra_error = self.last_real_contexts(ran_nothing_suites((data.get(f"h{i}") or {}).get("object")))
+            if extra_error:
+                self.store(e["key"], e["cache"], error=extra_error)
+                self.refund(e["key"])
+                continue
+            result = self.head_pages(sha, sources, extra)
             if (owner, repo) in CHECKS_OF_RECORD and commit and isinstance(result, dict) \
                     and not ((record.get("contexts") or {}).get("nodes")):
                 # the fork has the commit but its checks have not started: not settled on this repository's alone
@@ -3113,7 +3164,35 @@ class Daemon:
                 self.store(e["key"], e["cache"], error=None, dataAt=self.now, data=result, restParts=None, via="graphql")
                 self.head_answered(e["key"])
 
-    def head_pages(self, sha: str, sources: list[tuple[str, str, dict]]) -> dict | str:
+    def last_real_contexts(self, suites: list[str]) -> tuple[list[dict], str | None]:
+        """Check-run context nodes (statusCheckRollup's shape, marked lastRealAttempt) for every attempt of SUITES,
+        suites whose newest attempt ran nothing (ran_nothing_suites). ([], error) when they cannot all be read: a
+        partial read would be a smaller, greener head."""
+        if not suites:
+            return [], None
+        reason, self.gql_reason = self.gql_reason, "last-real-attempt"
+        try:
+            doc, error = self.graphql(SUITE_RUNS, {"suites": suites})
+        finally:
+            self.gql_reason = reason
+        if doc is None:
+            return [], error or "graphql: no response"
+        found = (doc.get("data") or {}).get("suiteRuns")
+        if doc.get("errors") or not isinstance(found, list) or len(found) != len(suites) or not all(found):
+            message = str(((doc.get("errors") or [{}])[0] or {}).get("message") or "a suite could not be read")
+            return [], "graphql: last real attempt: " + message[:200]
+        nodes = []
+        for suite in found:
+            runs = suite.get("checkRuns") or {}
+            if (runs.get("pageInfo") or {}).get("hasNextPage"):
+                return [], "graphql: last real attempt: more than 100 check runs in one suite"
+            context = {"conclusion": suite.get("conclusion"), "app": suite.get("app"),
+                       "workflowRun": suite.get("workflowRun")}
+            nodes += [{"__typename": "CheckRun", **run, "checkSuite": context, "lastRealAttempt": True}
+                      for run in runs.get("nodes") or [] if run]
+        return nodes, None
+
+    def head_pages(self, sha: str, sources: list[tuple[str, str, dict]], extra: list[dict] = ()) -> dict | str:
         """A head's data from the first page of its contexts in each repository of `sources` ((owner, repo,
         contexts): the head's own, then its CHECKS_OF_RECORD repository's), following the rest page by page; an
         error message when a later page cannot be read (the head keeps its older answer)."""
@@ -3140,6 +3219,7 @@ class Daemon:
                 contexts = rollup.get("contexts") or {}
             else:
                 return f"more than {HEAD_BATCH_MAX_CONTEXTS_PAGES * 100} checks on one commit"
+        fold_contexts(list(extra), runs, statuses, ids)  # suites whose newest attempt ran nothing (last_real_contexts)
         return head_data(sha, runs, statuses, ids)
 
     def fill_steps(self, pairs: list[tuple[dict, dict]]) -> None:
@@ -4247,6 +4327,9 @@ def check_verdict(data: dict, until: str = "green", now: float | None = None,
     checks = data.get("checks") or []
     if data.get("checksPageError"):
         return None  # a partial cached rollup is not evidence of a green head
+    if until != "required" and any(c.get("lastRealAttempt") for c in classify(data, now, grace)["failed"]):
+        # A red whose suite's newest attempt ran nothing (startup_failure): GitHub's rollup state omits it, it stands.
+        return EXIT_FAIL
     if data.get("checksTruncated"):
         # More than 100 checks: only the first 100 are here, so GitHub's rollup decides, except that a
         # check shown as held or still running defers its FAILURE (manaflow-ai/cmux#20733: a queued fast
