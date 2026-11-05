@@ -6817,6 +6817,43 @@ def mirror_tips(root: Path, gitdirs: dict[str, Path]) -> dict[str, tuple[list[st
     return tips
 
 
+ALTERNATES_WALK_BUDGET = 200_000  # entries looked at for alternates files below a renamed-aside tree
+
+
+@contextlib.contextmanager
+def renamed_alternates(path: Path, doomed: Path):
+    """While a renamed-aside tree is read again: every object store an alternates file below it names inside the
+    item's old path is offered at its new path too (GIT_ALTERNATE_OBJECT_DIRECTORIES). SwiftPM's checkouts/<pkg>
+    borrows from repositories/<pkg> by absolute path, so after the rename git could not read the checkout
+    (cmuxs-3 ~/cnx-hybrid, 2026-11-05). Only stores that exist below doomed are added; nothing on disk changes."""
+    old, new = os.fspath(path) + "/", os.fspath(doomed) + "/"
+    stores: list[str] = []
+    budget = ALTERNATES_WALK_BUDGET
+    for dirpath, dirnames, filenames in os.walk(doomed):
+        budget -= len(dirnames) + len(filenames)
+        if budget < 0:
+            break
+        if dirpath.endswith("/objects/info") and "alternates" in filenames:
+            try:
+                lines = Path(dirpath, "alternates").read_text().splitlines()
+            except OSError:
+                continue
+            for ln in (x.strip() for x in lines):
+                if ln.startswith(old) and os.path.isdir(moved := new + ln[len(old):]) and moved not in stores:
+                    stores.append(moved)
+    saved = os.environ.get("GIT_ALTERNATE_OBJECT_DIRECTORIES")
+    if stores:
+        os.environ["GIT_ALTERNATE_OBJECT_DIRECTORIES"] = os.pathsep.join([*stores, *([saved] if saved else [])])
+    try:
+        yield
+    finally:
+        if stores:
+            if saved is None:
+                os.environ.pop("GIT_ALTERNATE_OBJECT_DIRECTORIES", None)
+            else:
+                os.environ["GIT_ALTERNATE_OBJECT_DIRECTORIES"] = saved
+
+
 def mirror_rename_recheck(path: Path, recheck: tuple):
     """after_rename for a bundled mirror: the renamed tree gets the whole check archive_mirror made before its
     bundles again (a fresh strict scan of repositories and work trees, each unlocked and holding just the
@@ -6830,6 +6867,10 @@ def mirror_rename_recheck(path: Path, recheck: tuple):
     marker.write_text(f"kept by glaeda-disk {os.getpid()} until its git work is checked again\n")  # raises: kept
 
     def check() -> None:
+        with renamed_alternates(path, doomed):
+            checked()
+
+    def checked() -> None:
         now_external: dict[str, tuple[Path, list[str]]] = {}
         why, gitdirs, now_trees = mirror_repos(doomed, now_external)
         why = why or external_unbundled(now_external, recheck[7])

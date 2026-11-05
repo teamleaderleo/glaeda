@@ -7973,6 +7973,28 @@ class LinuxLayoutTest(unittest.TestCase):
         self.assertEqual(rec["outcome"], "reclaimed", (rec["reasons"], err))
         self.assertEqual(self.bundle_heads().get(gd.ARCHIVE_REF + lost), lost)
 
+    def test_a_swiftpm_checkout_sharing_objects_inside_the_item_survives_the_rename_recheck(self) -> None:
+        """cmuxs-3 ~/cnx-hybrid, cmux10s ~/cnx-macnext, 2026-11-05: SwiftPM's checkouts/<pkg> borrows objects from
+        repositories/<pkg> through an absolute alternates path inside the item, so after the rename aside git could
+        not read the checkout and the recheck put the tree back on every pass."""
+        unit, clone, env = self.mirror_unit()
+        with (clone / ".git/info/exclude").open("a") as f:
+            f.write("build/\n")
+        pkgsrv = self.home / "pkgsrv"
+        subprocess.run(["git", "init", "-q", "-b", "main", str(pkgsrv)], check=True, env=env)
+        subprocess.run(["git", "-C", str(pkgsrv), "commit", "-q", "--allow-empty", "-m", "p0"], check=True, env=env)
+        repos = clone / "build/SourcePackages/repositories/pkg-1234"
+        subprocess.run(["git", "clone", "-q", "--mirror", str(pkgsrv), str(repos)], check=True, env=env)
+        co = clone / "build/SourcePackages/checkouts/pkg"
+        subprocess.run(["git", "clone", "-q", "--shared", "--no-checkout", str(repos), str(co)], check=True, env=env)
+        self.git(co, "remote", "set-url", "origin", str(pkgsrv))
+        self.git(co, "checkout", "-q", "main", env=env)
+        self.assertTrue((co / ".git/objects/info/alternates").read_text().startswith(os.fspath(repos)))
+        gd.TRUSTED_LOCAL_REMOTES = (*gd.TRUSTED_LOCAL_REMOTES, str(pkgsrv))
+        rec, err = self.apply_mirror(unit)
+        self.assertEqual(rec["outcome"], "reclaimed", (rec["reasons"], err))
+        self.assertFalse(unit.exists())
+
     def test_a_tree_the_rename_recheck_puts_back_says_why_in_its_receipt(self) -> None:
         unit, _, _ = self.mirror_unit()
         with mock.patch.object(gd, "mirror_rename_recheck",
