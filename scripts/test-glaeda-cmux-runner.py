@@ -10968,15 +10968,24 @@ class RunnerTest(unittest.TestCase):
         return json.dumps({"workflow_runs": [{"id": i, "status": st, "head_sha": sha}
                                              for i, st, sha in chosen[(page - 1) * size:page * size]]})
 
-    def github(self, runs: list[tuple[int, str, str]], lists: dict[str, str] | None, fail: str = ""):
-        """A fake anonymous GitHub: runs [(id, status, head sha)], lists {sha: glaeda-signing-hooks.txt}; a url
-        containing fail answers None. Returns the reads it was asked for."""
+    def github(self, runs: list[tuple[int, str, str]], lists: dict[str, str] | None, fail: str = "",
+               controller: str = "follows"):
+        """A fake anonymous GitHub and build controller: runs [(id, status, head sha)], lists {sha:
+        glaeda-signing-hooks.txt}; a url containing fail answers None. The controller answers a run's status from runs
+        ("follows"), or nothing ("down"). Returns the reads it was asked for."""
         reads: list[str] = []
 
-        def fetch(url: str) -> str | None:
+        def fetch(url: str, **_kw) -> str | None:
             reads.append(url)
             if fail and fail in url:
                 return None
+            if "/v1/github/runs/" in url:
+                rid = int(url.rsplit("/", 1)[1].split("?")[0])
+                match = [r for r in runs if r[0] == rid]
+                if controller == "down" or not match:
+                    return None
+                return json.dumps({"known": True, "terminal": match[0][1] not in cr.SIGN_HOLD_ACTIVE,
+                                   "run": {"id": rid, "status": match[0][1], "head_sha": match[0][2]}})
             if "/actions/workflows/nightly.yml/runs" in url:
                 return self.runs_page(url, runs)
             sha = url.split("/")[-4]
@@ -11008,11 +11017,11 @@ class RunnerTest(unittest.TestCase):
         statuses = len(cr.SIGN_HOLD_ACTIVE)
         self.assertEqual(len(reads), statuses + 2,
                          "a runs list per active status, one list read per active head commit, none for a finished run")
-        # a commit's list is cached: the next refresh (past the memo) reads only the runs lists
+        # the next refresh (past the memo) rechecks the known blocker through the controller: no anonymous read
         cr._SIGN_HOLD_MEMO.clear()
         reads.clear()
         self.assertEqual(self.invoke("--refresh-hooks", "--apply")["runners"][0]["state"], "deferred")
-        self.assertEqual(len(reads), statuses)
+        self.assertEqual(reads, [f"{cr.SIGN_HOLD_CONTROLLER_DEFAULT}/v1/github/runs/41976650433?wait=0"])
 
     def test_sign_hold_installs_once_every_active_run_lists_the_new_hook(self) -> None:
         hooks = self.signing_install()
@@ -11091,7 +11100,7 @@ class RunnerTest(unittest.TestCase):
     def test_sign_hold_takes_malformed_run_data_as_unreadable(self) -> None:
         hooks = self.signing_install()
         body = json.dumps({"workflow_runs": [{"id": "41976650433", "status": "queued", "head_sha": self.OLD_SHA}]})
-        with mock.patch.object(cr, "sign_hold_fetch", lambda url: body if "/runs" in url else None), \
+        with mock.patch.object(cr, "sign_hold_fetch", lambda url, **_kw: body if "/workflows/" in url else None), \
                 contextlib.redirect_stderr(io.StringIO()) as err:
             self.assertEqual(self.invoke("--refresh-hooks", "--apply")["runners"][0]["state"], "deferred")
         self.assertIn("could not read", err.getvalue())
@@ -11146,7 +11155,7 @@ class RunnerTest(unittest.TestCase):
         good = self.runs_page
         bodies = iter([json.dumps({"workflow_runs": [{"id": "x", "status": "queued", "head_sha": self.OLD_SHA}]})])
 
-        def fetch(url: str) -> str | None:
+        def fetch(url: str, **_kw) -> str | None:
             if "/runs" in url:
                 bad = next(bodies, None)  # the first runs list of the refresh is malformed, the retry reads
                 return bad if bad is not None else good(url, [(7, "queued", self.OLD_SHA)])
@@ -11181,7 +11190,8 @@ class RunnerTest(unittest.TestCase):
         self.assertFalse(any("/jobs" in u for u in reads), "the run's status holds, not the jobs queued at the check")
         # the next refresh finds the budget spent (curl -f on a 403 answers nothing): the hook is still held
         cr._SIGN_HOLD_MEMO.clear()
-        self.github(tail, {self.OLD_SHA: f"{self.older_digest()} glaeda 99d1e407\n"}, fail="api.github.com")
+        self.github(tail, {self.OLD_SHA: f"{self.older_digest()} glaeda 99d1e407\n"}, fail="api.github.com",
+                    controller="down")
         with contextlib.redirect_stderr(io.StringIO()):
             doc = self.invoke("--refresh-hooks", "--apply")
         self.assertEqual(doc["runners"][0]["state"], "deferred")
@@ -11194,6 +11204,64 @@ class RunnerTest(unittest.TestCase):
         self.github([(42004172890, "completed", self.OLD_SHA)], {})
         self.assertEqual(self.invoke("--refresh-hooks", "--apply")["runners"][0]["state"], "updated")
         self.assertEqual((hooks / cr.HOOK_NAME).read_bytes(), HOOK.read_bytes())
+
+    def test_known_blockers_are_rechecked_through_the_controller_with_no_anonymous_read(self) -> None:
+        hooks = self.signing_install()
+        runs = [(42004172890, "in_progress", self.OLD_SHA)]
+        lists = {self.OLD_SHA: f"{self.older_digest()} old\n"}
+        self.github(runs, lists)
+        self.assertEqual(self.invoke("--refresh-hooks", "--apply")["runners"][0]["state"], "deferred")
+        # the anonymous budget is spent: the controller still says the run is going, so it holds, quietly
+        cr._SIGN_HOLD_MEMO.clear()
+        reads = self.github(runs, lists, fail="api.github.com")
+        done = self.invoke("--refresh-hooks", "--apply")["runners"][0]
+        self.assertEqual(done["state"], "deferred")
+        self.assertIn("run 42004172890", done["note"])
+        self.assertFalse(any("api.github.com" in u for u in reads))
+        # the run ends: the controller says so, and the full anonymous list is read before anything installs
+        cr._SIGN_HOLD_MEMO.clear()
+        runs[0] = (42004172890, "completed", self.OLD_SHA)
+        reads = self.github(runs, lists)
+        self.assertEqual(self.invoke("--refresh-hooks", "--apply")["runners"][0]["state"], "updated")
+        self.assertTrue(any("api.github.com" in u for u in reads), "no known blocker: the list is read again")
+        self.assertEqual((hooks / cr.HOOK_NAME).read_bytes(), HOOK.read_bytes())
+
+    def test_a_new_run_after_the_known_blocker_ends_is_found_by_the_list(self) -> None:
+        """No fail-open window: the controller only shortens a hold that is holding anyway. When the known blocker
+        is done, a run that appeared since is found by the full list, so the hook stays."""
+        hooks = self.signing_install()
+        lists = {self.OLD_SHA: f"{self.older_digest()} old\n"}
+        self.github([(7, "in_progress", self.OLD_SHA)], lists)
+        self.invoke("--refresh-hooks", "--apply")
+        cr._SIGN_HOLD_MEMO.clear()
+        self.github([(7, "completed", self.OLD_SHA), (8, "queued", self.OLD_SHA)], lists)
+        done = self.invoke("--refresh-hooks", "--apply")["runners"][0]
+        self.assertEqual(done["state"], "deferred")
+        self.assertIn("run 8 at aaaaaaaaaaaa", done["note"])
+        self.assertEqual((hooks / cr.HOOK_NAME).read_text(), self.OLDER_HOOK)
+
+    def test_a_controller_that_cannot_answer_is_retried_then_the_list_decides(self) -> None:
+        hooks = self.signing_install()
+        runs = [(7, "in_progress", self.OLD_SHA)]
+        lists = {self.OLD_SHA: f"{self.older_digest()} old\n"}
+        self.github(runs, lists)
+        self.invoke("--refresh-hooks", "--apply")
+        # controller down, list readable: the controller is asked twice, then the list holds
+        cr._SIGN_HOLD_MEMO.clear()
+        reads = self.github(runs, lists, controller="down")
+        self.assertEqual(self.invoke("--refresh-hooks", "--apply")["runners"][0]["state"], "deferred")
+        self.assertEqual(sum("/v1/github/runs/7" in u for u in reads), 2)
+        # controller down and the list unreadable: it still holds (never fails open), and says why
+        cr._SIGN_HOLD_MEMO.clear()
+        self.github(runs, lists, controller="down", fail="api.github.com")
+        with contextlib.redirect_stderr(io.StringIO()):
+            doc = self.invoke("--refresh-hooks", "--apply")
+        self.assertEqual(doc["runners"][0]["state"], "deferred")
+        self.assertIn("could not read", doc["signHold"][0])
+        self.assertEqual((hooks / cr.HOOK_NAME).read_text(), self.OLDER_HOOK)
+        # and the known blocker is kept for the next refresh
+        state = json.loads((self.home / ".local/state/glaeda/cmux-runner" / cr.SIGN_HOLD_STATE).read_text())
+        self.assertEqual(state["blockers"], [[7, self.OLD_SHA]])
 
     def test_a_failed_read_never_holds_a_runner_that_does_not_sign(self) -> None:
         hooks = self.signing_install(signing=False)
@@ -11210,11 +11278,11 @@ class RunnerTest(unittest.TestCase):
         fetch = cr.sign_hold_fetch
         failed: list[str] = []
 
-        def flaky(url: str) -> str | None:
+        def flaky(url: str, **_kw) -> str | None:
             if not failed:  # the first read of the refresh fails once
                 failed.append(url)
                 return None
-            return fetch(url)
+            return fetch(url, **_kw)
 
         with mock.patch.object(cr, "sign_hold_fetch", flaky):
             doc = self.invoke("--refresh-hooks", "--apply")

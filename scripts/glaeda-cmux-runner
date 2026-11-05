@@ -2304,6 +2304,14 @@ SIGN_HOLD_CAP_S = 3 * 3600.0
 SIGN_HOLD_MEMO_S = 300.0
 SIGN_HOLD_FETCH_S = 15
 SIGN_HOLD_STATE = "sign-hold.json"
+# Known blockers are rechecked through the cmux build controller (glaeda-gh's Controller: run status from GitHub's
+# webhooks over the tailnet, no GitHub quota) instead of re-listing runs anonymously: the office minis share one IP's
+# 60/h anonymous budget, and a spent one (HTTP 403) is what let hook bcdd1aac in at 11:00Z on 2026-11-05. While any
+# known blocker is still running the hold is holding anyway, so a run that appeared since cannot slip through; once
+# none is, the full anonymous list is read again before anything installs. A controller that cannot answer is retried
+# once, then the list is read; an unreadable list retries once more and then holds (never fails open).
+SIGN_HOLD_CONTROLLER_DEFAULT = "http://100.89.225.106:18765"
+SIGN_HOLD_CONTROLLER_CONFIG = Path(".local/share/cmux-fleet-client/client.json")  # under HOME, as glaeda-gh reads it
 SIGN_HOLD_FLAG = "--trusted-next-signing"
 _SIGN_HOLD_MEMO: dict[str, tuple[float, Any, list[str]]] = {}
 SIGN_HOLD_RETRY_S = 3.0  # one retry of a failed read before the hold fails open
@@ -2328,10 +2336,10 @@ def signing_runner(hook_dir: Path) -> bool:
     return False
 
 
-def sign_hold_fetch(url: str) -> str | None:
+def sign_hold_fetch(url: str, protocols: str = "=https") -> str | None:
     """The body at url, read anonymously with curl, or None on any failure."""
     try:
-        got = subprocess.run([CURL, "-fsSL", "--proto", "=https", "--max-time", str(SIGN_HOLD_FETCH_S),
+        got = subprocess.run([CURL, "-fsSL", "--proto", protocols, "--max-time", str(SIGN_HOLD_FETCH_S),
                               "--max-filesize", "4194304", "-H", "Accept: application/vnd.github+json", url],
                              stdin=subprocess.DEVNULL, capture_output=True, text=True, errors="replace",
                              timeout=SIGN_HOLD_FETCH_S + 5, check=False)
@@ -2374,9 +2382,52 @@ def sign_hold_runs() -> list[dict] | None:
     return sorted(active.values(), key=lambda run: -run["id"])
 
 
-def sign_hold_blockers(digest: str, cache: dict[str, bool]) -> list[tuple[int, str]] | None:
+def sign_hold_controller(home: Path) -> str | None:
+    """The build controller's base URL ($CMUX_CI_CONTROLLER, else glaeda-gh's client.json, else the default)."""
+    base = os.environ.get("CMUX_CI_CONTROLLER", "").strip()
+    if not base:
+        try:
+            doc = json.loads((home / SIGN_HOLD_CONTROLLER_CONFIG).read_text())
+            base = doc.get("controller") if isinstance(doc, dict) else None
+        except (OSError, ValueError):
+            base = None
+        base = base or SIGN_HOLD_CONTROLLER_DEFAULT
+    return base.rstrip("/") if isinstance(base, str) and base.startswith(("http://", "https://")) else None
+
+
+def sign_hold_recheck(home: Path, known: list[tuple[int, str]]) -> list[tuple[int, str]] | None:
+    """The known blockers the controller still has running, or None when it cannot answer for every one of them."""
+    base = sign_hold_controller(home)
+    if base is None:
+        return None
+    still = []
+    for rid, sha in known:
+        body = sign_hold_fetch(f"{base}/v1/github/runs/{int(rid)}?wait=0", protocols="=http,https")
+        try:
+            doc = json.loads(body) if body is not None else None
+        except ValueError:
+            doc = None
+        run = doc.get("run") if isinstance(doc, dict) else None
+        if not isinstance(doc, dict) or doc.get("known") is not True or not isinstance(doc.get("terminal"), bool) \
+                or not isinstance(run, dict) or run.get("id") != rid:
+            return None  # not known to it, or not an answer: the anonymous list decides
+        if not doc["terminal"]:
+            still.append((rid, sha))
+    return still
+
+
+def sign_hold_blockers(digest: str, cache: dict[str, bool], home: Path | None = None,
+                       known: list[tuple[int, str]] | None = None) -> list[tuple[int, str]] | None:
     """[(run id, head sha)] of the active nightly-next nightly.yml runs whose list lacks digest, or None when a read
-    failed. cache maps a head sha to whether its list carries digest; new answers are added to it."""
+    failed. cache maps a head sha to whether its list carries digest; new answers are added to it. Known blockers
+    (the last answer's) still running by the controller are the answer, with no anonymous read."""
+    if known and home is not None:
+        still = sign_hold_recheck(home, known)
+        if still is None:
+            time.sleep(SIGN_HOLD_RETRY_S)
+            still = sign_hold_recheck(home, known)
+        if still:
+            return still
     runs = sign_hold_runs()
     if runs is None:
         return None
@@ -2420,10 +2471,14 @@ def sign_hold(home: Path, digest: str, now: Callable[[], float] = time.time) -> 
         state = {}
     cache = state.get("listed") if isinstance(state.get("listed"), dict) else {}
     cache = {k: v for k, v in cache.items() if isinstance(v, bool)}
-    blockers = sign_hold_blockers(digest, cache)
+    known = [(rid, sha) for rid, sha in (state.get("blockers") or [])
+             if isinstance(rid, int) and not isinstance(rid, bool) and isinstance(sha, str)] \
+        if isinstance(state.get("blockers"), list) and all(isinstance(b, list) and len(b) == 2
+                                                          for b in state["blockers"]) else []
+    blockers = sign_hold_blockers(digest, cache, home, known)
     if blockers is None:  # any unreadable answer (a failed read, malformed data, too many pages): one more pass
         time.sleep(SIGN_HOLD_RETRY_S)
-        blockers = sign_hold_blockers(digest, cache)
+        blockers = sign_hold_blockers(digest, cache, home, known)
     note: str | None = None
     events_before = len(_SIGN_HOLD_EVENTS)
     since = state.get("since") if isinstance(state.get("since"), (int, float)) else None
@@ -2445,7 +2500,9 @@ def sign_hold(home: Path, digest: str, now: Callable[[], float] = time.time) -> 
             sign_hold_event(note)
     with contextlib.suppress(OSError):
         path.parent.mkdir(parents=True, exist_ok=True)
-        write_atomic(path, (json.dumps({"digest": digest, "since": since, "listed": cache}) + "\n").encode(), 0o644)
+        kept = [[rid, sha] for rid, sha in blockers] if blockers else (known if blockers is None else [])
+        write_atomic(path, (json.dumps({"digest": digest, "since": since, "listed": cache, "blockers": kept})
+                            + "\n").encode(), 0o644)
     _SIGN_HOLD_MEMO[digest] = (now(), note, list(_SIGN_HOLD_EVENTS[events_before:]))
     return note
 
