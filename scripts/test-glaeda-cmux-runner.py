@@ -790,6 +790,22 @@ class HookTest(unittest.TestCase):
                         # a nightly job (FEED_FIRST): it drains the mini for SIGNING_DRAIN_WAIT_S, not 300 s
                         self.assertEqual(hook.job_tier(event_name, ref, "manaflow-ai/cmux", payload, workflow_ref,
                                                        job), hook.TIER_NIGHTLY)
+        # A run's pull_requests is every pull request that contains its head commit, in any repository, so a
+        # push run on main carries each fork's open main-to-main pull request. cmux's nightly.yml run
+        # 37603581609 (a push on main, 2026-10-07) listed exactly these four, all forks'. Reading the list as
+        # "this was a pull request run" refuses every real main run, so only this repository's entries count.
+        forks = [{"number": n, "url": f"https://api.github.com/repos/{owner}/cmux/pulls/{n}",
+                  "base": {"ref": "main", "repo": {"full_name": f"{owner}/cmux"}},
+                  "head": {"ref": "main", "repo": {"full_name": f"{owner}/cmux"}}}
+                 for owner, n in (("nonomal", 5), ("IrvanFza", 53), ("ericmjl", 4), ("HexSleeves", 24))]
+        self.assertFalse(hook.own_repo_pulls(forks, "manaflow-ai/cmux"))
+        self.assertFalse(hook.own_repo_pulls([], "manaflow-ai/cmux"))
+        for job in signing:
+            with self.subTest(fork_pulls=job):
+                self.assertIsNone(hook.trusted_refusal(
+                    **{**args, "event_name": "workflow_run", "job": job,
+                       "event": {**run_payload, "workflow_run": {**source, "event": "push",
+                                                                 "pull_requests": forks}}}))
         for job in hook.AUTO_RESUME_LIGHT_JOBS:
             self.assertEqual(hook.job_class(job, "manaflow-ai/cmux", hook.DEFAULT_HOME_REPO,
                                             "auto-resume-nightly-notarization.yml")[0], "light")
@@ -819,7 +835,15 @@ class HookTest(unittest.TestCase):
             {"event": run_with(head_repository={"full_name": "someone/cmux", "fork": True})},
             {"event": run_with(repository={"full_name": "manaflow-ai/other"})},
             {"event": run_with(event="pull_request")}, {"event": run_with(event="pull_request_target")},
-            {"event": run_with(event="workflow_run")}, {"event": run_with(pull_requests=[{"number": 1}])},
+            {"event": run_with(event="workflow_run")},
+            # a pull request of this repository itself, by either side or by its url
+            {"event": run_with(pull_requests=[{"number": 1, "base": {"repo": dict(CMUX)}}])},
+            {"event": run_with(pull_requests=[{"number": 1, "head": {"repo": dict(CMUX)}}])},
+            {"event": run_with(pull_requests=[
+                {"number": 1, "url": "https://api.github.com/repos/manaflow-ai/cmux/pulls/1"}])},
+            # an unexpected shape, or one that names no repository at all: fail closed
+            {"event": run_with(pull_requests=[{"number": 1}])},
+            {"event": run_with(pull_requests=[42])}, {"event": run_with(pull_requests="many")},
             {"event": {**run_payload, "workflow_run": None}},
             {"event": {k: v for k, v in run_payload.items() if k != "workflow_run"}},
             {"event": {**run_payload, "action": "requested"}},

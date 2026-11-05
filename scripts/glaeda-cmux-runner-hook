@@ -1525,6 +1525,31 @@ AUTO_RESUME_HOSTED_JOBS = ("poll", "poll-outer", "poll-stapled")
 AUTO_RESUME_TRUSTED_JOBS = AUTO_RESUME_SIGNING_JOBS
 
 
+def own_repo_pulls(pulls: Any, repo: str) -> bool:
+    """Whether a run's `pull_requests` names a pull request of repo itself. Pure.
+
+    A run's `pull_requests` is every pull request that contains its head commit, in any repository, so a push
+    run on main carries each fork's open main-to-main pull request: cmux's nightly.yml run 37603581609 (a push
+    on main, 2026-10-07) listed four, all of them forks' (nonomal, IrvanFza, ericmjl, HexSleeves). Reading the
+    list as "this was a pull request run" therefore refuses every real main run, which is why only this
+    repository's entries count. The run's own `event` already excludes a pull_request run."""
+    if not isinstance(pulls, list):
+        return bool(pulls)  # an unexpected shape is not an empty list: fail closed
+    for pull in pulls:
+        if not isinstance(pull, dict):
+            return True
+        for key in ("base", "head"):
+            side = pull.get(key)
+            if isinstance(side, dict) and _repo_name(side.get("repo")) == repo:
+                return True
+        url = pull.get("url")
+        if isinstance(url, str) and f"/repos/{repo}/pulls/" in url:
+            return True
+        if not any(isinstance(pull.get(key), dict) for key in ("base", "head")) and not isinstance(url, str):
+            return True  # no field names a repository: fail closed
+    return False
+
+
 def auto_resume_refusal(event_name: str | None, ref: str | None, repository: str | None, event: Any,
                         workflow_ref: str | None) -> str | None:
     """Why this is not main's exact auto-resume-nightly-notarization.yml after main's own nightly.yml run, or None.
@@ -1554,9 +1579,13 @@ def auto_resume_refusal(event_name: str | None, ref: str | None, repository: str
         return "a workflow_run without a completed run"
     if (run.get("path") != AUTO_RESUME_SOURCE_PATH or run.get("head_branch") != "main"
             or _repo_name(run.get("head_repository")) != repo or _repo_name(run.get("repository")) != repo
-            or run.get("event") not in AUTO_RESUME_SOURCE_EVENTS or run.get("pull_requests")):
+            or run.get("event") not in AUTO_RESUME_SOURCE_EVENTS):
         return (f"the triggering run is not {repo}'s {AUTO_RESUME_SOURCE_PATH} on main from "
                 f"{', '.join(AUTO_RESUME_SOURCE_EVENTS)}")
+    if own_repo_pulls(run.get("pull_requests"), repo):
+        # The run's event above already excludes a pull_request run, so this only catches a run GitHub also
+        # attributed to a pull request of this repository.
+        return f"the triggering run also names a {repo} pull request"
     return None
 
 
