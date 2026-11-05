@@ -6762,6 +6762,10 @@ class BrokerBase(Base):
         os.environ["GLAEDA_GH_CACHE_TTL"] = "0"
         for name in ("GLAEDA_GH_CACHE_DISABLE", "GH_TOKEN", "GITHUB_TOKEN", "GH_REPO", "GH_HOST"):
             os.environ.pop(name, None)
+        # As on a host, where gh reaches this broker through the gh-quota guard, which exports this once it has
+        # judged the call. BrokerMergeGuardTest takes it away: a merge typed as `glaeda-gh gh ...` goes to the guard.
+        os.environ["GH_QUOTA_CHECKED"] = "1"
+        os.environ.pop("GLAEDA_MERGE_GUARD", None)
 
     def fake_gh(self) -> Path:
         """A stand-in for the real gh that records the arguments it was handed."""
@@ -7375,6 +7379,90 @@ class BrokerFailOpenTest(BrokerBase):
         _code, out, _err, passed = self.run_gh(["pr", "view", "7", "-R", "o/r", "--json", "state"])
         self.assertEqual(out, "")
         self.assertIsNotNone(passed)
+
+
+class BrokerMergeGuardTest(BrokerBase):
+    """A merge typed as `glaeda-gh gh ...` is handed to the gh-quota guard, never run on the real gh unjudged."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        os.environ.pop("GH_QUOTA_CHECKED", None)
+        self.guard = self.home / "quota" / "gh"
+        self.guard.parent.mkdir(parents=True)
+        self.guard.write_text("#!/bin/sh\n# gh guard: gh-quota (a test stand-in)\nexit 0\n")
+        self.guard.chmod(0o755)
+        os.environ["GLAEDA_MERGE_GUARD"] = str(self.guard)
+
+    def route(self, args: list[str]) -> tuple[int | None, str, str | None, list[str] | None]:
+        """(exit code, stderr, the path exec'd, its arguments)."""
+        out, err, execed = io.StringIO(), io.StringIO(), []
+        os.environ.pop(gg.BROKER_MARK, None)
+        os.environ.pop(gg.BROKER_DEPTH, None)
+
+        def execv(path: str, argv: list[str]) -> None:
+            execed.append((path, argv))
+            raise SystemExit(0)
+
+        with mock.patch.object(os, "execv", execv), contextlib.redirect_stdout(out), \
+                contextlib.redirect_stderr(err):
+            try:
+                code = gg.cmd_gh(args)
+            except SystemExit:
+                code = None
+        return code, err.getvalue(), (execed[0][0] if execed else None), (execed[0][1][1:] if execed else None)
+
+    def test_every_merge_route_goes_to_the_guard(self) -> None:
+        query = tempfile.NamedTemporaryFile("w", suffix=".json", dir=self.home, delete=False)
+        query.write(json.dumps({"query": "mutation { mergePullRequest(input: {pullRequestId: \"X\"}) { clientMutationId } }"}))
+        query.close()
+        gql = self.home / "q.graphql"
+        gql.write_text("mutation($id: ID!) { enablePullRequestAutoMerge(input: {pullRequestId: $id}) { clientMutationId } }")
+        for args in (["pr", "merge", "3589", "-R", "o/r", "--squash", "--match-head-commit", "a" * 40],
+                     ["api", "--method", "PUT", "repos/o/r/pulls/3589/merge", "-f", "sha=" + "a" * 40],
+                     ["api", "-X", "PUT", "/repos/o/r/pulls/3589/merge/", "-f", "sha=" + "a" * 40],
+                     ["api", "-XPUT", "https://api.github.com/repos/o/r/pulls/3589/merge"],
+                     ["api", "graphql", "-f", "query=mutation { mergePullRequest(input: {pullRequestId: \"X\", "
+                      "expectedHeadOid: \"" + "a" * 40 + "\"}) { clientMutationId } }"],
+                     ["api", "graphql", "--input", query.name],
+                     ["api", "graphql", "-F", "query=@" + str(gql), "-f", "id=X"],
+                     ["api", "graphql", "--input", "-"]):
+            with self.subTest(args=args):
+                code, _err, path, passed = self.route(args)
+                self.assertIsNone(code)
+                self.assertEqual(path, str(self.guard))
+                self.assertEqual(passed, args)
+                self.assertEqual(os.environ["PATH"].split(os.pathsep)[0], str(self.guard.parent))
+
+    def test_the_switch_that_skips_the_broker_never_skips_the_guard(self) -> None:
+        os.environ["CMUX_GH_BROKER_DISABLE"] = "1"
+        self.addCleanup(os.environ.pop, "CMUX_GH_BROKER_DISABLE", None)
+        _code, _err, path, _passed = self.route(["pr", "merge", "7", "-R", "o/r", "--squash"])
+        self.assertEqual(path, str(self.guard))
+
+    def test_reads_and_other_writes_never_go_to_the_guard(self) -> None:
+        for args in (["pr", "view", "7", "-R", "o/r", "--json", "state"],
+                     ["api", "repos/o/r/pulls/7/merge"],  # GET: whether it merged
+                     ["api", "-X", "PUT", "repos/o/r/pulls/7/update-branch"],
+                     ["api", "graphql", "-f", "query=query { viewer { login } }"],
+                     ["api", "graphql", "-f", "query=mutation { addComment(input: {subjectId: \"X\", body: \"mergePull\"}) "
+                      "{ clientMutationId } }"]):
+            with self.subTest(args=args):
+                _code, _err, path, _passed = self.route(args)
+                self.assertNotEqual(path, str(self.guard))
+
+    def test_a_merge_the_guard_judged_passes_to_the_real_gh(self) -> None:
+        os.environ["GH_QUOTA_CHECKED"] = "1"
+        args = ["pr", "merge", "7", "-R", "o/r", "--squash", "--match-head-commit", "a" * 40]
+        _code, _err, path, passed = self.route(args)
+        self.assertEqual(path, os.environ["GLAEDA_GH_REAL"])
+        self.assertEqual(passed, args)
+
+    def test_no_guard_on_the_host_refuses_the_merge(self) -> None:
+        os.environ["GLAEDA_MERGE_GUARD"] = str(self.home / "nowhere" / "gh")
+        code, err, path, _passed = self.route(["api", "--method", "PUT", "repos/o/r/pulls/7/merge", "-f", "sha=x"])
+        self.assertEqual(code, gg.BROKER_EXIT_REFUSED)
+        self.assertIsNone(path)
+        self.assertIn("gh-quota guard", err)
 
 
 class BrokerArgumentTest(unittest.TestCase):
