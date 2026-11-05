@@ -979,9 +979,10 @@ that holds every unit a claim record (`<state dir>/host-lock-holder-<runner>.cla
   while `<state dir>/claim-release.off` exists.
 - `claim-reacquire` waits as a fresh signing job does: the exclusive class, the job's own tier and SIGNS_FIRST, an
   `admit.want` marker that holds every gate and yielding runner, then no process of an earlier job in any `_work`.
-  It waits the job's own drain bound (`--claim-wait S` to shorten it). On success it writes
-  `GLAEDA_JOB_CLAIM=exclusive` and `GLAEDA_HOOK_SHA256` again (exit 0); only then may the job read a credential.
-  Exit 1 means nothing is held.
+  It waits the job's own drain bound at most (`--claim-wait S` can only shorten it; one try can still run up to about
+  70 s past it, glaeda#1880). Exit 0 only once `GLAEDA_JOB_CLAIM=exclusive` and `GLAEDA_HOOK_SHA256` are written to
+  `$GITHUB_ENV` and read back; only then may the job read a credential. Exit 1 means nothing is held: a reacquire
+  that took the Mac but could not tell later steps gives it back and leaves the record `released`.
 - While the record is `released` or `reacquiring`, another signing job's drain does not count the sleeping job's
   own processes as an earlier job's, and the sleeper's reacquire never counts its own, so neither waits on the other.
   A record whose Runner.Worker is gone is ignored and removed; job-completed and the runner's next job-started remove
