@@ -2986,6 +2986,64 @@ class HookTest(unittest.TestCase):
             self.assertEqual(hook.sleeping_owners(state), set())
         self.assertFalse(path.exists(), "proven another process: removed")
 
+    def test_claim_release_keeps_the_claim_while_a_daemon_the_job_started_lives(self) -> None:
+        """CLAIM_SLEEP review 3 F1: a credential-bearing daemon can double-fork and be reparented to launchd, so it is
+        no descendant of the Runner.Worker. While the job holds the whole Mac no other job runs as this user, so every
+        process of this user that started after the Runner.Worker came from the job: each must be the release step's own
+        chain or this job's lock holder, else it keeps the claim. With the daemon gone the claim releases; a start time
+        that cannot be read keeps it."""
+        state, path = self.claim_fixture()
+        environ = {"RUNNER_NAME": "c0", "GITHUB_ENV": os.fspath(self.dir / "github-env")}
+        forker = subprocess.run([sys.executable, "-c",
+                                 "import os, sys, time\n"
+                                 "if os.fork():\n    os._exit(0)\n"
+                                 "os.setsid()\n"
+                                 "if os.fork():\n    os._exit(0)\n"
+                                 "os.environ['ASC_API_KEY_P8_BASE64'] = 'TEST-NOT-A-KEY'\n"
+                                 "print(os.getpid(), flush=True)\n"
+                                 "os.close(1)\n"
+                                 "time.sleep(60)\n"], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                stderr=subprocess.DEVNULL, text=True, timeout=30, check=True)
+        daemon = int(forker.stdout.split()[0])
+
+        def end() -> None:
+            with contextlib.suppress(OSError):
+                os.kill(daemon, signal.SIGKILL)
+        self.addCleanup(end)
+        self.assertTrue(hook.pid_alive(daemon))
+        self.assertNotIn(daemon, hook.descendants(os.getpid(), hook.processes()), "reparented: no descendant")
+        with mock.patch.dict(os.environ, environ), mock.patch.object(hook, "release_host_lock") as release:
+            code, why = hook.claim_release(state, os.getpid(), [os.fspath(self.dir / "gone.p8")], [])
+        self.assertEqual(code, 1, why)
+        self.assertIn(f"pid {daemon} ", why)
+        release.assert_not_called()
+        self.assertEqual(hook.read_claim_record(path)["state"], "held")
+        end()
+        deadline = time.monotonic() + 10
+        while hook.pid_alive(daemon) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        if hook.pid_alive(daemon):
+            self.skipTest("nothing reaps an orphan on this host (a zombie keeps its pid)")
+        real = hook.user_processes
+
+        def unreadable() -> dict | None:
+            table = real()
+            if table is None:
+                return None
+            pid = next(iter(table))
+            table[pid] = (table[pid][0], None, table[pid][2])
+            return table
+        with mock.patch.dict(os.environ, environ), mock.patch.object(hook, "user_processes", side_effect=unreadable), \
+                mock.patch.object(hook, "release_host_lock") as release:
+            code, why = hook.claim_release(state, os.getpid(), [os.fspath(self.dir / "gone.p8")], [])
+        self.assertEqual(code, 1, "a start time that cannot be read keeps the claim")
+        release.assert_not_called()
+        with mock.patch.dict(os.environ, environ), \
+                mock.patch.object(hook, "release_host_lock", return_value="released") as release:
+            code, why = hook.claim_release(state, os.getpid(), [os.fspath(self.dir / "gone.p8")], [])
+        self.assertEqual(code, 0, why)
+        release.assert_called_once()
+
     def signing_hooks(self, *shas: str) -> tuple[dict, str]:
         """A glaeda-signing-hooks.txt at manaflow-ai/cmux@SHA listing these hook shas, served through
         GLAEDA_SIGNING_HOOKS_URL as cmux's claim gate reads it, and the env that points a signer at it."""
