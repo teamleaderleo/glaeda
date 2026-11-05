@@ -144,9 +144,16 @@ class RefusalTest(unittest.TestCase):
         for name in hook.AUTO_RESUME_SIGNING_JOBS:
             with self.subTest(signing=name):
                 self.assertIn("signing job", self.why(**resume(name)))
-        for name in ("poll-outer", "poll-stapled", "publish"):
+        for name in ("staple-outer", "staple-stapled", "publish"):
             with self.subTest(signing_now=name):
                 self.assertIn("signing job", self.why(**resume(name)))
+        # AUTO_RESUME_POLL_JOBS hold the notary key, so they keep the trusted signing runner even though they
+        # are light: this runner names the two jobs it takes and refuses them
+        for name in hook.AUTO_RESUME_POLL_JOBS:
+            with self.subTest(poll=name):
+                why = self.why(**resume(name))
+                self.assertIsNotNone(why)
+                self.assertIn("preflight, verify-stapled", why)
         for name in ("decide",):
             with self.subTest(other=name):
                 self.assertIsNotNone(self.why(**resume(name)))

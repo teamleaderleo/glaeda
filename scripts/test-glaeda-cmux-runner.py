@@ -759,14 +759,23 @@ class HookTest(unittest.TestCase):
         args = {"ref": ref, "repository": "manaflow-ai/cmux", "trusted_ref": ref, "trusted_repo": "manaflow-ai/cmux",
                 "trusted_next_signing": True, "workflow_ref": workflow_ref, "run_attempt": "1"}
         # cmux #36561 (main 7badd980) made poll-outer, poll-stapled and publish run on a mini's /bin/bash 3.2
-        signing = ("poll", "wait-and-staple", "poll-outer", "staple-outer", "poll-stapled", "staple-stapled",
-                   "publish", "generate-deltas", "republish-deltas")
+        signing = ("wait-and-staple", "staple-outer", "staple-stapled", "publish", "generate-deltas",
+                   "republish-deltas")
+        # AUTO_RESUME_POLL_JOBS: a key, but only Apple's queue to wait on, so light and never an exclusive claim
+        polls = ("poll", "poll-outer", "poll-stapled")
         self.assertEqual(set(hook.AUTO_RESUME_SIGNING_JOBS), set(signing))
+        self.assertEqual(set(hook.AUTO_RESUME_POLL_JOBS), set(polls))
+        self.assertEqual(set(hook.AUTO_RESUME_TRUSTED_JOBS), set(signing) | set(polls))
         self.assertEqual(set(hook.AUTO_RESUME_LIGHT_JOBS), {"preflight", "verify-stapled"})
-        for job in signing:
-            self.assertIn(("auto-resume-nightly-notarization.yml", job), hook.SIGNING_JOBS)
+        for job in polls:
+            self.assertNotIn(("auto-resume-nightly-notarization.yml", job), hook.SIGNING_JOBS)
             self.assertEqual(hook.job_class(job, "manaflow-ai/cmux", hook.DEFAULT_HOME_REPO,
-                                            "auto-resume-nightly-notarization.yml")[0], hook.EXCLUSIVE_CLASS)
+                                            "auto-resume-nightly-notarization.yml")[0], "light")
+        for job in hook.AUTO_RESUME_TRUSTED_JOBS:
+            if job in signing:
+                self.assertIn(("auto-resume-nightly-notarization.yml", job), hook.SIGNING_JOBS)
+                self.assertEqual(hook.job_class(job, "manaflow-ai/cmux", hook.DEFAULT_HOME_REPO,
+                                                "auto-resume-nightly-notarization.yml")[0], hook.EXCLUSIVE_CLASS)
             for event_name, payload in payloads.items():
                 for attempt in ("1", "2"):
                     with self.subTest(job=job, event_name=event_name, attempt=attempt):

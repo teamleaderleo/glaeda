@@ -977,10 +977,22 @@ main as the default branch (`auto_resume_refusal`). Every job of that workflow c
 only the source run's artifacts, which `preflight` checks through the API first. The jobs rank as nightly
 (`job_tier`).
 
-- On a `--trusted-next-signing` runner: `poll`, `wait-and-staple`, `poll-outer`, `staple-outer`, `poll-stapled`,
-  `staple-stapled`, `publish`, `generate-deltas`, `republish-deltas` (`AUTO_RESUME_SIGNING_JOBS`). Each holds a
-  release key (Apple certificate, notary API key, Sparkle key, R2 key or the release app key), so each is a
-  `SIGNING_JOBS` entry: exclusive class, one drain of the mini.
+- On a `--trusted-next-signing` runner, and only there, every job that holds a release key (Apple certificate,
+  notary API key, Sparkle key, R2 key or the release app key): `AUTO_RESUME_TRUSTED_JOBS`. They split by what they
+  do, not by whether they hold a key.
+  - `wait-and-staple`, `staple-outer`, `staple-stapled`, `publish`, `generate-deltas`, `republish-deltas`
+    (`AUTO_RESUME_SIGNING_JOBS`): they staple, sign or publish, so each is a `SIGNING_JOBS` entry, exclusive
+    class, one drain of the mini.
+  - `poll`, `poll-outer`, `poll-stapled` (`AUTO_RESUME_POLL_JOBS`): light. They only ask Apple whether a
+    submission is done, and their timeouts are Apple's queue, not work: 90, 360 and 360 minutes. An exclusive
+    class bounds how long a job *waits* for the mini (`SIGNING_DRAIN_WAIT_S`), never how long it then holds it,
+    so exclusive they would stop the one-mini nightly, classic and NEXT, for up to those 6 hours: every
+    `yieldToExclusive` dedicated runner on the mini starts nothing while an exclusive claim is held
+    (`YIELD_TO_EXCLUSIVE`, bound 3 h), and a nightly signing job arriving behind one waits
+    `SIGNING_DRAIN_WAIT_S` and is then refused to Blacksmith, which is what the one-mini nightly exists to end.
+    cmux's workflow put them on ubuntu for the same reason ("Apple queue latency never reserves signing
+    workers"). Light, they run beside the nightly with only the notary key in memory. cmux therefore gives the
+    claim gate to the exclusive six, not to these three.
 - On the nightly-only runners (`glaeda-nightly-only-admit`): `preflight` and `verify-stapled`
   (`AUTO_RESUME_LIGHT_JOBS`), light; they hold no key.
 - The ubuntu jobs run on a mini's `/bin/bash` 3.2: `poll-outer`, `poll-stapled` and `publish` since cmux #36561
