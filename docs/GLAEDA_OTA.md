@@ -149,11 +149,15 @@ of this repository in the Manaflow organization, so the fleet does not depend on
 repository. Changes merge only here; the sync fast-forwards the fork's `main` to match. Releases,
 attestations and promotions also happen only in this repository.
 
-**The fork's `main` takes no merges.** Its ruleset 26619652 ("main: sync bot only") blocks every
-update to `main` except a deploy-key push, which is the sync's. A pull request opened in the fork
+**The fork's `main` takes no merges.** Its ruleset 26619652 ("main: deploy keys only") blocks
+every update to `main` except a push made with a deploy key. A pull request opened in the fork
 still runs Verify but cannot merge ("Cannot update this protected ref."): merge it here instead.
 On 11-04 two pull requests merged straight into the fork's `main` and stalled the sync for about
-20 hours on a conflict.
+20 hours on a conflict. A ruleset cannot name one deploy key, so the bypass covers both of the
+fork's write keys: the sync's (`SYNC_MIRROR_DEPLOY_KEY`, kept here) and `mirror.yml`'s tag key
+(`MIRROR_DEPLOY_KEY`, kept in the fork). Only the sync uses one to push `main`; that is a
+convention of the workflows, not something the ruleset checks. The ruleset stops the mistakes that
+happen (a merge button, a direct push), not a fork admin or a workflow written to push `main`.
 
 **Anything merged to `main` ships to the fleet.** Every push to this `main` is released as above:
 canary hosts install it within about an hour, and the minis (stable) after the 15-minute canary
@@ -192,7 +196,7 @@ back, pause the rollout (`control.yml`, below).
   at a commit is its check of record in both repositories, and `glaeda-gh checks teamleaderleo/glaeda
   SHA` reads the fork's checks for that commit too. Opening a pull request in the
   fork keeps its Verify on Blacksmith as well. `release.yml`, `promote.yml` and `control.yml` run only here. The
-  fork's `main` takes changes only through the sync's deploy key (ruleset 26619652). A deploy-key
+  fork's `main` takes changes only through a deploy-key push (ruleset 26619652), which only the sync makes. A deploy-key
   push starts the fork's push workflows, so gate every new push-triggered workflow (or its jobs)
   with `github.repository == 'teamleaderleo/glaeda'`.
 - **Releases and rings.** `.github/workflows/mirror.yml` runs only in the fork, every 15 minutes
