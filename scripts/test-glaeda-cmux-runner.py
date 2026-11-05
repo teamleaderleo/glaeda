@@ -2644,6 +2644,60 @@ class HookTest(unittest.TestCase):
         self.assertEqual(github_env.read_text(), "GLAEDA_JOB_CLAIM=exclusive\n",
                          "a hook that cannot read itself names no sha, so a job that needs one refuses itself")
 
+    def test_job_cpu_share_is_cores_times_units_over_the_minis_units(self) -> None:
+        """JOB_SHARE: an admitted job compiles with its share of the cores, never under JOB_SHARE_MIN, and no cap at
+        all when it holds the whole mini or no shared unit."""
+        cases = {  # (units, total, cores): share
+            (5, 14, 14): 5, (4, 14, 14): 4, (3, 14, 14): 3, (2, 14, 14): 2, (1, 14, 14): 2,  # a std mini: its units
+            (5, 10, 10): 5, (2, 10, 10): 2, (6, 22, 22): 6,  # light and xl classes
+            (5, 14, 28): 10, (4, 14, 10): 2, (1, 14, 32): 2, (13, 14, 14): 13,  # cores other than units: the share
+            (14, 14, 14): None, (20, 14, 14): None,  # the whole mini (exclusive): no cap
+            (0, 14, 14): None, (5, 0, 14): None, (5, 14, 0): None, (5, 14, None): None,  # fast, gateway, unknowable
+            (1, 14, 2): None,  # the minimum would be the whole host
+        }
+        for (units, total, cores), share in cases.items():
+            with self.subTest(units=units, total=total, cores=cores):
+                self.assertEqual(hook.job_cpu_share(units, total, cores), share)
+
+    def test_job_share_never_overrides_what_the_runner_sets(self) -> None:
+        github_env = self.dir / "share-env"
+        taken = {"class": "compile", "units": 5, "units_total": 14}
+        with mock.patch.dict(os.environ, {"GITHUB_ENV": os.fspath(github_env)}, clear=True):
+            self.assertEqual(hook.export_job_share(taken, cores=14), "compiles with 5 cores (CMUX_CI_CPU_BUDGET, 7 variables)")
+        self.assertEqual(github_env.read_text(), "CMUX_CI_CPU_BUDGET=5\nCARGO_BUILD_JOBS=5\nCMAKE_BUILD_PARALLEL_LEVEL=5\n"
+                         "MAKEFLAGS=-j5\nGIT_CONFIG_COUNT=1\nGIT_CONFIG_KEY_0=pack.threads\nGIT_CONFIG_VALUE_0=5\n")
+        github_env.unlink()
+        own = {"GITHUB_ENV": os.fspath(github_env), "CARGO_BUILD_JOBS": "8", "MAKEFLAGS": "-j1", "GIT_CONFIG_COUNT": "2"}
+        with mock.patch.dict(os.environ, own, clear=True):
+            self.assertIn("2 variables", hook.export_job_share(taken, cores=14))
+        self.assertEqual(github_env.read_text(), "CMUX_CI_CPU_BUDGET=5\nCMAKE_BUILD_PARALLEL_LEVEL=5\n",
+                         "a variable the runner sets, and git config the runner already counts, are left alone")
+        github_env.unlink()
+        for env, units in (({"GITHUB_ENV": os.fspath(github_env), "GLAEDA_JOB_SHARE": "0"}, 5),  # kill switch
+                           ({"GITHUB_ENV": os.fspath(github_env)}, 14),  # exclusive: the whole mini
+                           ({"GITHUB_ENV": os.fspath(github_env)}, 0),  # fast or gateway: no shared unit
+                           ({}, 5)):  # no $GITHUB_ENV
+            with self.subTest(env=env, units=units), mock.patch.dict(os.environ, env, clear=True):
+                self.assertEqual(hook.export_job_share({"units": units, "units_total": 14}, cores=14), "")
+        self.assertFalse(github_env.exists())
+
+    def test_an_admitted_job_gets_its_cpu_share(self) -> None:
+        """job-started writes the share (JOB_SHARE) to $GITHUB_ENV and logs it."""
+        self.fleet()
+        env_file = self.dir / "github_env"
+        share = hook.job_cpu_share(2, 14, os.cpu_count())  # a light job: 2 of 14 units
+        try:
+            light = self.job("cli-pipe-regressions", "j0", 14, None, env={"GITHUB_ENV": os.fspath(env_file)})
+            self.assertEqual(light.returncode, 0, light.stdout)
+            self.assertIn("holding 2/14 units", light.stdout)
+            if share is None:  # a host too small for any cap
+                self.assertNotIn("compiles with", light.stdout)
+            else:
+                self.assertIn(f"compiles with {share} cores", light.stdout)
+                self.assertIn(f"CMUX_CI_CPU_BUDGET={share}\nCARGO_BUILD_JOBS={share}\n", env_file.read_text())
+        finally:
+            self.finish("j0")
+
     def test_a_nightly_sign_or_verify_job_needs_no_compile_tokens(self) -> None:
         """nightly.yml's sign and verify jobs were unknown jobs, so compiles: first in line, they still waited for the
         persistent-dd and canonical root a PR compile held, though they never use either. Light now: with both held
@@ -3539,7 +3593,8 @@ class HookTest(unittest.TestCase):
         temp.mkdir()
         try:
             compile_ = self.job("macos-compile-admission", "k0", 14, None,
-                                env={"GITHUB_ENV": os.fspath(env_file), "RUNNER_TEMP": os.fspath(temp)})
+                                env={"GITHUB_ENV": os.fspath(env_file), "RUNNER_TEMP": os.fspath(temp),
+                                     "GLAEDA_JOB_SHARE": "0"})
             self.assertIn("CMUX_CI_CANONICAL_ROOT=/private/tmp/cmux-ci via GITHUB_ENV+RUNNER_TEMP", compile_.stdout)
             self.assertEqual(env_file.read_text(), "CMUX_CI_CANONICAL_ROOT=/private/tmp/cmux-ci\n")
             self.assertEqual((temp / "glaeda-canonical-root").read_text(), "/private/tmp/cmux-ci\n")
@@ -4780,7 +4835,8 @@ time.sleep(60)
         env_file = self.dir / "github_env"
         state = self.dir / "state"
         try:
-            build = self.job("build", "e0", 12, None, *two, env={**e2e, "GITHUB_ENV": os.fspath(env_file)})
+            build = self.job("build", "e0", 12, None, *two,
+                             env={**e2e, "GITHUB_ENV": os.fspath(env_file), "GLAEDA_JOB_SHARE": "0"})
             self.assertEqual(build.returncode, 0, build.stdout)
             self.assertIn("holding 4/12 units+root-1 for build (compile-gui", build.stdout)
             self.assertNotIn("gui+", build.stdout)
@@ -5081,6 +5137,8 @@ time.sleep(60)
             self.assertEqual(self.fits(), ["light", "isolated"], "five of seven units are free")
             status, second = self.ci_step("admit", "--class", "isolated", "--job-key", "r1-101-1", *watch)
             self.assertEqual((status, second["units"]), (0, 4), second)
+            self.assertEqual(second.get("cpu"), hook.job_cpu_share(4, 7, os.cpu_count()),
+                             "the step's cores to compile with (JOB_SHARE), for the worker's grant")
             self.assertEqual(self.fits(), [], "one unit is left: too few for any step")
             start = time.monotonic()
             status, full = self.ci_step("admit", "--class", "light", "--job-key", "r1-102-1", *watch)

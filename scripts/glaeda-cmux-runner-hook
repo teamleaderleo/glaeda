@@ -138,7 +138,7 @@ import tempfile
 import threading
 import time
 from pathlib import Path
-from typing import Any, Callable, NamedTuple
+from typing import Any, Callable, Mapping, NamedTuple
 
 DISK_TIMEOUT_S = 120  # a synchronous hook pass
 # job-completed's detached pass, which nothing waits on: a whole pass took 192-685 s on cmux14 under the floor, so at
@@ -2247,6 +2247,59 @@ def export_developer_dir(xcode_app: str) -> str:
         with open(target, "a", encoding="utf-8") as env_file:
             env_file.write(f"DEVELOPER_DIR={developer}\n")
         return f"DEVELOPER_DIR={developer} for the job"
+    return ""
+
+
+# JOB_SHARE: capacity units cap how many jobs a mini runs, not how many threads each one starts. Every admitted
+# job's swift-frontend, rustc, make and git used to start one thread per core, so on 2026-11-05 the 14-core CI minis
+# ran at load 40 to 208 with three to five jobs each compiling at full width. So an admitted job is told its share
+# of the cores through $GITHUB_ENV: cores x its units / the mini's units (units are cores, so on a std mini that is
+# its units), at least JOB_SHARE_MIN. A job that holds every unit (the exclusive class) or none (fast, gateway: they
+# sit outside the shared units) gets no cap. CMUX_CI_CPU_BUDGET is the knob cmux's own scripts read (swift build
+# and test --jobs, Swift Testing suites, webview test files); the rest are the toolchains' own. A variable the
+# runner's environment already sets is left alone. $GITHUB_ENV ranks below a step's env: and an inline assignment,
+# so a step that sizes itself (cmux-tui's cargo test sets CARGO_BUILD_JOBS) keeps its own value; a job-level env:
+# ranks below it (no cmux workflow sets these there, 2026-11-05). Kill switch without a redeploy: GLAEDA_JOB_SHARE=0
+# in the runner LaunchAgent environment.
+JOB_SHARE_MIN = 2
+JOB_SHARE_ENV = "CMUX_CI_CPU_BUDGET"
+
+
+def job_cpu_share(units: int, total: int, cores: int | None) -> int | None:
+    """The cores an admitted job of `units` on a mini of `total` units and `cores` cores should compile with, or
+    None for no cap: max(JOB_SHARE_MIN, cores * units // total), and None when that is the whole mini or the job
+    holds no shared unit."""
+    if not cores or cores <= 0 or total <= 0 or units <= 0:
+        return None
+    share = max(JOB_SHARE_MIN, cores * units // total)
+    return None if share >= cores else share
+
+
+def job_share_env(share: int, environ: Mapping[str, str]) -> list[tuple[str, str]]:
+    """The (name, value) pairs that cap a job at `share` cores, minus any the runner's environment already sets."""
+    pairs = [(JOB_SHARE_ENV, str(share)), ("CARGO_BUILD_JOBS", str(share)),
+             ("CMAKE_BUILD_PARALLEL_LEVEL", str(share)), ("MAKEFLAGS", f"-j{share}")]
+    if "GIT_CONFIG_COUNT" not in environ:  # git's pack.threads (index-pack and pack-objects) through env config
+        pairs += [("GIT_CONFIG_COUNT", "1"), ("GIT_CONFIG_KEY_0", "pack.threads"), ("GIT_CONFIG_VALUE_0", str(share))]
+    return [(name, value) for name, value in pairs if name not in environ]
+
+
+def export_job_share(taken: dict[str, Any], cores: int | None = None) -> str:
+    """Write the job's share (JOB_SHARE) to $GITHUB_ENV. Returns a note, or '' (no cap, or no $GITHUB_ENV)."""
+    if os.environ.get("GLAEDA_JOB_SHARE", "1") == "0":
+        return ""
+    share = job_cpu_share(int(taken.get("units") or 0), int(taken.get("units_total") or 0),
+                          os.cpu_count() if cores is None else cores)
+    target = os.environ.get("GITHUB_ENV")
+    if share is None or not target:
+        return ""
+    pairs = job_share_env(share, os.environ)
+    if not pairs:
+        return ""
+    with contextlib.suppress(OSError):
+        with open(target, "a", encoding="utf-8") as env_file:
+            env_file.write("".join(f"{name}={value}\n" for name, value in pairs))
+        return f"compiles with {share} cores ({JOB_SHARE_ENV}, {len(pairs)} variables)"
     return ""
 
 
@@ -5129,6 +5182,9 @@ def step_admit(klass: str, key: str, watch_pid: int, host_lock: str, reservation
         result["holder_pid"] = int(holder.read_text().strip())
     result.update(admitted=True, units=taken.get("units"), units_total=taken.get("units_total"),
                   tokens=taken.get("tokens", []), note=note[:400])
+    # the cores the step compiles with (JOB_SHARE); the build worker hands it to the step as its CPU grant
+    if (share := job_cpu_share(int(taken.get("units") or 0), int(taken.get("units_total") or 0), os.cpu_count())):
+        result["cpu"] = share
     return 0, result
 
 
@@ -9753,6 +9809,8 @@ def main(argv: list[str] | None = None) -> int:
             note += f"; {pinned}"
         if claim := export_job_claim(args.capacity_units, taken, note):
             note += f"; {claim}"
+        if args.capacity_units > 0 and (share := export_job_share(taken)):
+            note += f"; {share}"
         for root in held_roots(args.state_dir):
             settled = settle_root(int(root.rsplit("-", 1)[1]))
             if settled:

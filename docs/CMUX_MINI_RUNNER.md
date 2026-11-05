@@ -867,6 +867,20 @@ count is refused. Every instance bakes the same `--capacity-units`, so the mini
 never runs more than its units, however many runners pick up jobs. Uninstall one
 with `--uninstall --apply --instance K`.
 
+### Each admitted job compiles with its share of the cores
+
+Units cap how many jobs a mini runs, not how many threads each starts: before this, every admitted job's
+swift-frontend, rustc, make and git started one thread per core, and the 14-core minis ran at load 40 to 208
+(2026-11-05). So `job-started` writes the job's share to `$GITHUB_ENV`: cores times its units over the mini's
+units (units are cores, so a std mini's compile gets 5), at least 2. It sets `CMUX_CI_CPU_BUDGET` (cmux's own
+scripts size swift build and test `--jobs`, Swift Testing suites and webview test files to it),
+`CARGO_BUILD_JOBS`, `CMAKE_BUILD_PARALLEL_LEVEL`, `MAKEFLAGS=-jN` and git's `pack.threads` (through
+`GIT_CONFIG_COUNT`/`KEY_0`/`VALUE_0`, only when the runner sets no `GIT_CONFIG_COUNT`). A variable the runner's
+environment already sets is left alone, and a step's own `env:` or inline value wins over `$GITHUB_ENV`. A job
+holding the whole mini (exclusive) or no shared unit (fast, gateway) gets no cap. The job log's admitted line says
+`compiles with N cores`. `GLAEDA_JOB_SHARE=0` in the runner LaunchAgent environment turns it off without a
+redeploy. A ci-step `admit` reports the same share as `cpu`, the build worker's grant for the step.
+
 ### Build worker steps on the same ledger (cmuxterm-hq#794)
 
 The build worker can run CI steps (cmuxterm-hq `ci-step` jobs) beside the runners' jobs, admitted by the
