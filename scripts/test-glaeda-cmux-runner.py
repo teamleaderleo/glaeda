@@ -11166,6 +11166,35 @@ class RunnerTest(unittest.TestCase):
         self.assertEqual(second["runners"][0]["state"], "deferred")
         self.assertEqual(second["signHold"], first["signHold"])
 
+    def test_a_rate_limited_read_keeps_the_hook_for_a_runs_post_publish_tail(self) -> None:
+        """2026-11-05 11:00Z replay: run 42004172890 (commit 42abbd2b, listing only aff786ca) had signed at 10:07Z and was
+        still in progress for its post-publish tail. cmux15's shared anonymous API budget was spent (HTTP 403), the hold
+        failed open, the runner staged bcdd1aac, a job-completed installed it at 11:17:27Z, and the run's
+        publish-nightly-next-github was refused at 11:17:38Z. The run's own status, in progress until its last job,
+        is what holds; a spent budget now holds too, and nothing is staged for a job-completed to install."""
+        hooks = self.signing_install()
+        tail = [(42004172890, "in_progress", self.OLD_SHA)]  # sign job done, publish tail still to come
+        reads = self.github(tail, {self.OLD_SHA: f"{self.older_digest()} glaeda 99d1e407\n"})
+        held = self.invoke("--refresh-hooks", "--apply")["runners"][0]
+        self.assertEqual(held["state"], "deferred")
+        self.assertIn("run 42004172890 at aaaaaaaaaaaa", held["note"])
+        self.assertFalse(any("/jobs" in u for u in reads), "the run's status holds, not the jobs queued at the check")
+        # the next refresh finds the budget spent (curl -f on a 403 answers nothing): the hook is still held
+        cr._SIGN_HOLD_MEMO.clear()
+        self.github(tail, {self.OLD_SHA: f"{self.older_digest()} glaeda 99d1e407\n"}, fail="api.github.com")
+        with contextlib.redirect_stderr(io.StringIO()):
+            doc = self.invoke("--refresh-hooks", "--apply")
+        self.assertEqual(doc["runners"][0]["state"], "deferred")
+        self.assertIn("could not read", doc["signHold"][0])
+        self.assertEqual((hooks / cr.HOOK_NAME).read_text(), self.OLDER_HOOK)
+        self.assertFalse(any(hooks.glob("*" + cr.NEXT_SUFFIX)) or (hooks / cr.NEXT_RECORD).exists(),
+                         "nothing staged for a job-completed to install")
+        # once the run completes, the next refresh installs
+        cr._SIGN_HOLD_MEMO.clear()
+        self.github([(42004172890, "completed", self.OLD_SHA)], {})
+        self.assertEqual(self.invoke("--refresh-hooks", "--apply")["runners"][0]["state"], "updated")
+        self.assertEqual((hooks / cr.HOOK_NAME).read_bytes(), HOOK.read_bytes())
+
     def test_a_failed_read_never_holds_a_runner_that_does_not_sign(self) -> None:
         hooks = self.signing_install(signing=False)
         reads = self.github([(7, "queued", self.OLD_SHA)], {}, fail="/")
