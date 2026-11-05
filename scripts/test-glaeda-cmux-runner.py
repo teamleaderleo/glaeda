@@ -10861,6 +10861,118 @@ class RunnerTest(unittest.TestCase):
         self.assertEqual(len(self.log()), calls, "no gh, launchctl or config.sh")
         self.assertEqual([r["state"] for r in self.invoke("--refresh-hooks", "--apply")["runners"]], ["unchanged"])
 
+    # SIGN_HOLD: 2026-11-05, cmux15 took hook aff786ca at 06:49Z by this refresh and refused the queued sign jobs of
+    # five nightly-next runs whose commits listed only the old hook (06:51-06:53Z).
+    OLD_SHA, NEW_SHA = "a" * 40, "b" * 40
+
+    def signing_install(self, signing: bool = True) -> Path:
+        hooks = self.installed_with_an_older_hook()
+        if signing:
+            started = hooks / "job-started.sh"
+            text = started.read_text()
+            line = next(ln for ln in text.splitlines() if ln.startswith("exec "))
+            started.write_text(text.replace(line, line + " --trusted-ref refs/heads/main --trusted-repo manaflow-ai/cmux"
+                                            " --trusted-next-signing", 1))
+        memo = mock.patch.dict(cr._SIGN_HOLD_MEMO, clear=True)
+        memo.start()
+        self.addCleanup(memo.stop)
+        return hooks
+
+    def github(self, runs: list[tuple[int, str, str]], lists: dict[str, str] | None, fail: str = ""):
+        """A fake anonymous GitHub: runs [(id, status, head sha)], lists {sha: glaeda-signing-hooks.txt}; a url
+        containing fail answers None. Returns the reads it was asked for."""
+        reads: list[str] = []
+
+        def fetch(url: str) -> str | None:
+            reads.append(url)
+            if fail and fail in url:
+                return None
+            if "/actions/workflows/nightly.yml/runs" in url:
+                return json.dumps({"workflow_runs": [{"id": i, "status": st, "head_sha": sha} for i, st, sha in runs]})
+            sha = url.split("/")[-4]
+            return (lists or {}).get(sha)
+
+        patch = mock.patch.object(cr, "sign_hold_fetch", fetch)
+        patch.start()
+        self.addCleanup(patch.stop)
+        return reads
+
+    def new_digest(self) -> str:
+        return hashlib.sha256(HOOK.read_bytes()).hexdigest()
+
+    def older_digest(self) -> str:
+        return hashlib.sha256(self.OLDER_HOOK.encode()).hexdigest()
+
+    def test_sign_hold_keeps_the_old_hook_while_a_queued_run_lacks_the_new_one(self) -> None:
+        hooks = self.signing_install()
+        reads = self.github([(41976650433, "queued", self.OLD_SHA), (41982716550, "in_progress", self.NEW_SHA),
+                             (41970000000, "completed", "c" * 40)],
+                            {self.OLD_SHA: f"{self.older_digest()} glaeda old\n",
+                             self.NEW_SHA: f"{self.older_digest()} old\n{self.new_digest()} new\n"})
+        done = self.invoke("--refresh-hooks", "--apply")["runners"][0]
+        self.assertEqual(done["state"], "deferred")
+        self.assertIn("run 41976650433 at aaaaaaaaaaaa", done["note"])
+        self.assertNotIn("41982716550", done["note"])
+        self.assertEqual((hooks / cr.HOOK_NAME).read_text(), self.OLDER_HOOK)
+        self.assertFalse(any(hooks.glob("*" + cr.NEXT_SUFFIX)) or (hooks / cr.NEXT_RECORD).exists(), "nothing staged")
+        self.assertEqual(len(reads), 3, "one runs list, one list read per active head commit, none for a finished run")
+        # a commit's list is cached: the next refresh (past the memo) reads only the runs list
+        cr._SIGN_HOLD_MEMO.clear()
+        reads.clear()
+        self.assertEqual(self.invoke("--refresh-hooks", "--apply")["runners"][0]["state"], "deferred")
+        self.assertEqual(len(reads), 1)
+
+    def test_sign_hold_installs_once_every_active_run_lists_the_new_hook(self) -> None:
+        hooks = self.signing_install()
+        self.github([(1, "queued", self.NEW_SHA), (2, "waiting", self.NEW_SHA)],
+                    {self.NEW_SHA: f"{self.older_digest()} old\n{self.new_digest()} new\n"})
+        self.assertEqual(self.invoke("--refresh-hooks", "--apply")["runners"][0]["state"], "updated")
+        self.assertEqual((hooks / cr.HOOK_NAME).read_bytes(), HOOK.read_bytes())
+
+    def test_sign_hold_ends_at_its_cap(self) -> None:
+        hooks = self.signing_install()
+        self.github([(7, "queued", self.OLD_SHA)], {self.OLD_SHA: f"{self.older_digest()} old\n"})
+        state = self.home / ".local/state/glaeda/cmux-runner" / cr.SIGN_HOLD_STATE
+        self.assertEqual(self.invoke("--refresh-hooks", "--apply")["runners"][0]["state"], "deferred")
+        first = json.loads(state.read_text())
+        self.assertEqual(first["digest"], self.new_digest())
+        # three hours after the first deferral of this hook, it installs (loudly) though the run still lacks it
+        first["since"] -= cr.SIGN_HOLD_CAP_S
+        state.write_text(json.dumps(first))
+        cr._SIGN_HOLD_MEMO.clear()
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertEqual(self.invoke("--refresh-hooks", "--apply")["runners"][0]["state"], "updated")
+        self.assertIn("SIGN HOLD CAP", err.getvalue())
+        self.assertEqual((hooks / cr.HOOK_NAME).read_bytes(), HOOK.read_bytes())
+
+    def test_sign_hold_installs_when_github_cannot_be_read(self) -> None:
+        for fail in ("/actions/workflows/", "raw.githubusercontent.com"):
+            with self.subTest(fail=fail):
+                hooks = self.signing_install()
+                self.github([(7, "queued", self.OLD_SHA)], {self.OLD_SHA: f"{self.older_digest()} old\n"}, fail=fail)
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err):
+                    self.assertEqual(self.invoke("--refresh-hooks", "--apply")["runners"][0]["state"], "updated")
+                self.assertIn("fail-open", err.getvalue())
+                self.assertEqual((hooks / cr.HOOK_NAME).read_bytes(), HOOK.read_bytes())
+
+    def test_sign_hold_never_holds_a_runner_that_does_not_sign(self) -> None:
+        hooks = self.signing_install(signing=False)
+        reads = self.github([(7, "queued", self.OLD_SHA)], {self.OLD_SHA: f"{self.older_digest()} old\n"})
+        self.assertEqual(self.invoke("--refresh-hooks", "--apply")["runners"][0]["state"], "updated")
+        self.assertEqual((hooks / cr.HOOK_NAME).read_bytes(), HOOK.read_bytes())
+        self.assertEqual(reads, [], "a runner that does not sign reads nothing")
+
+    def test_sign_hold_never_changes_the_hook_trust_rule(self) -> None:
+        """The hold only picks which listed hook stays installed: the hook still refuses a commit whose list names
+        neither the old hook nor the new one (SIGNING_HOOKS), so nothing it holds admits an unlisted hook."""
+        listing = self.state / "neither.txt"
+        listing.write_text(f"{'1' * 64} some other hook\n")
+        with mock.patch.dict(os.environ, {hook.SIGNING_HOOKS_URL_ENV: listing.as_uri()}):
+            self.assertIs(hook.signing_hook_listed("manaflow-ai/cmux", self.OLD_SHA, self.older_digest()), False)
+            self.assertIs(hook.signing_hook_listed("manaflow-ai/cmux", self.OLD_SHA, self.new_digest()), False)
+
     def test_refresh_hooks_never_downgrades_a_hook_it_does_not_know(self) -> None:
         hooks = self.installed_with_an_older_hook()
         newer = HOOK.read_text() + "\n# from main, newer than this release\n"

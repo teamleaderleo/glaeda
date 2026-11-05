@@ -2279,8 +2279,131 @@ def sync_dir(path: Path) -> None:
             os.close(fd)
 
 
+# SIGN_HOLD: cmux's claim gate admits a signing job only when glaeda-signing-hooks.txt at the run's own commit lists the
+# hook that runs it (SIGNING_HOOKS in the hook). A nightly-next run's sign job can wait hours for a signing mini, so a run
+# pushed before cmux listed a new hook is still queued when the OTA refresh installs it. On 2026-11-05 cmux15 took hook
+# aff786ca at 06:49Z and refused the sign jobs of five such runs at 06:51-06:53Z (cmux 41967127267 to 41976650433),
+# each queued since 04:19-05:51Z. So on a --trusted-next-signing runner the refresh holds a new hook back while any
+# active nightly.yml run on nightly-next has a head commit whose list lacks it; the old hook, which those commits list,
+# signs them. It never changes what is admitted: the hook and the claim gate are untouched, and a commit that lists
+# neither hook is refused as before. The hold ends when every active run lists the new hook, or SIGN_HOLD_CAP_S after
+# its first deferral of that hook (installed then, with a loud line), so a rollout can never be held for good.
+# Reads are anonymous (the minis have no gh): one runs list, then one raw read per head commit, cached in the state
+# file (a commit's list never changes) and memoised for SIGN_HOLD_MEMO_S, inside the 60/h unauthenticated limit. A read
+# that fails holds nothing: the refresh installs as it did before this hold existed (fail-open by design) and says so.
+SIGN_HOLD_REPO = "manaflow-ai/cmux"
+SIGN_HOLD_RUNS_URL = ("https://api.github.com/repos/{repo}/actions/workflows/nightly.yml/runs"
+                      "?branch=nightly-next&per_page=100")
+SIGN_HOLD_LIST_URL = "https://raw.githubusercontent.com/{repo}/{sha}/scripts/ci/glaeda-signing-hooks.txt"
+SIGN_HOLD_ACTIVE = frozenset({"queued", "in_progress", "waiting", "requested", "pending"})
+SIGN_HOLD_CAP_S = 3 * 3600.0
+SIGN_HOLD_MEMO_S = 300.0
+SIGN_HOLD_FETCH_S = 15
+SIGN_HOLD_STATE = "sign-hold.json"
+SIGN_HOLD_FLAG = "--trusted-next-signing"
+_SIGN_HOLD_MEMO: dict[str, tuple[float, Any]] = {}
+
+
+def signing_runner(hook_dir: Path) -> bool:
+    """Whether this install's job-started runs the hook with --trusted-next-signing (the nightly signing runner)."""
+    try:
+        text = (hook_dir / "job-started.sh").read_text()
+    except (OSError, UnicodeDecodeError):
+        return False
+    for line in text.splitlines():
+        try:
+            if SIGN_HOLD_FLAG in shlex.split(line, comments=True):
+                return True
+        except ValueError:
+            continue
+    return False
+
+
+def sign_hold_fetch(url: str) -> str | None:
+    """The body at url, read anonymously with curl, or None on any failure."""
+    try:
+        got = subprocess.run([CURL, "-fsSL", "--proto", "=https", "--max-time", str(SIGN_HOLD_FETCH_S),
+                              "--max-filesize", "4194304", "-H", "Accept: application/vnd.github+json", url],
+                             stdin=subprocess.DEVNULL, capture_output=True, text=True, errors="replace",
+                             timeout=SIGN_HOLD_FETCH_S + 5, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return got.stdout if got.returncode == 0 else None
+
+
+def sign_hold_blockers(digest: str, cache: dict[str, bool]) -> list[tuple[int, str]] | None:
+    """[(run id, head sha)] of the active nightly-next nightly.yml runs whose list lacks digest, or None when a read
+    failed. cache maps a head sha to whether its list carries digest; new answers are added to it."""
+    body = sign_hold_fetch(SIGN_HOLD_RUNS_URL.format(repo=SIGN_HOLD_REPO))
+    try:
+        runs = json.loads(body)["workflow_runs"] if body is not None else None
+    except (ValueError, KeyError, TypeError):
+        runs = None
+    if not isinstance(runs, list):
+        return None
+    blockers = []
+    for run in runs:
+        if not isinstance(run, dict) or run.get("status") not in SIGN_HOLD_ACTIVE:
+            continue
+        sha = str(run.get("head_sha") or "")
+        if not re.fullmatch(r"[0-9a-f]{40}", sha):
+            return None
+        if sha not in cache:
+            text = sign_hold_fetch(SIGN_HOLD_LIST_URL.format(repo=SIGN_HOLD_REPO, sha=sha))
+            if text is None:
+                return None
+            listed = {ln.split(None, 1)[0] for ln in text.splitlines() if ln.strip() and not ln.lstrip().startswith("#")}
+            if not listed:
+                return None  # an empty answer is not a list
+            cache[sha] = digest in listed
+        if not cache[sha]:
+            blockers.append((int(run.get("id") or 0), sha))
+    return blockers
+
+
+def sign_hold(home: Path, digest: str, now: Callable[[], float] = time.time) -> str | None:
+    """SIGN_HOLD: a deferral note while active nightly-next runs lack digest, else None (install). Records the first
+    deferral of digest in the state file and stops holding SIGN_HOLD_CAP_S after it."""
+    memo = _SIGN_HOLD_MEMO.get(digest)
+    if memo and now() - memo[0] < SIGN_HOLD_MEMO_S:
+        return memo[1]
+    path = home / ".local/state/glaeda/cmux-runner" / SIGN_HOLD_STATE
+    try:
+        state = json.loads(path.read_text())
+        if not isinstance(state, dict) or state.get("digest") != digest:
+            state = {}
+    except (OSError, ValueError):
+        state = {}
+    cache = state.get("listed") if isinstance(state.get("listed"), dict) else {}
+    cache = {k: v for k, v in cache.items() if isinstance(v, bool)}
+    blockers = sign_hold_blockers(digest, cache)
+    note: str | None = None
+    since = state.get("since") if isinstance(state.get("since"), (int, float)) else None
+    if blockers is None:
+        print(f"glaeda-cmux-runner: sign hold: could not read nightly-next's active runs or their signing-hook lists; "
+              f"installing hook {digest[:12]} as before (fail-open)", file=sys.stderr, flush=True)
+    elif blockers:
+        since = since if since is not None else now()
+        named = ", ".join(f"run {rid} at {sha[:12]}" for rid, sha in blockers)
+        if now() - since >= SIGN_HOLD_CAP_S:
+            print(f"glaeda-cmux-runner: SIGN HOLD CAP: hook {digest[:12]} held {SIGN_HOLD_CAP_S / 3600:g} h for "
+                  f"nightly-next runs whose commits do not list it ({named}); installing it now, and their sign jobs "
+                  "will be refused", file=sys.stderr, flush=True)
+        else:
+            note = (f"deferred: a nightly-next run's commit does not list hook {digest[:12]} ({named}); the old hook "
+                    f"stays for its sign job (held since {datetime.datetime.fromtimestamp(since, datetime.timezone.utc):%H:%M:%SZ}, "
+                    f"cap {SIGN_HOLD_CAP_S / 3600:g} h)")
+            print(f"glaeda-cmux-runner: sign hold: {note}", file=sys.stderr, flush=True)
+    with contextlib.suppress(OSError):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        write_atomic(path, (json.dumps({"digest": digest, "since": since, "listed": cache}) + "\n").encode(), 0o644)
+    _SIGN_HOLD_MEMO[digest] = (now(), note)
+    return note
+
+
 def refresh_hook_dir(runner_dir: Path, receipt: Any, apply: bool, sources: dict[str, tuple[bytes, int]],
-                     history: dict[str, set[str]]) -> dict[str, Any]:
+                     history: dict[str, set[str]],
+                     hold: Callable[[str], str | None] | None = None) -> dict[str, Any]:
     """Plan (and with apply, make) one runner install's hook files match this copy's. Caller holds runner_lock."""
     entry: dict[str, Any] = {"runnerDir": os.fspath(runner_dir)}
     if not isinstance(receipt, dict) or not runner_dir.is_absolute() or not owns_runner_dir(runner_dir, receipt):
@@ -2319,6 +2442,11 @@ def refresh_hook_dir(runner_dir: Path, receipt: Any, apply: bool, sources: dict[
             clear_next(hook_dir)
         return {**entry, "state": "unchanged"}
     entry["files"] = stale
+    if apply and hold is not None and HOOK_NAME in stale and signing_runner(hook_dir):
+        held = hold(hashlib.sha256(sources[HOOK_NAME][0]).hexdigest())  # SIGN_HOLD: cmux lists bare hex
+        if held:
+            clear_next(hook_dir)  # nor may a job-completed install a copy an earlier refresh staged
+            return {**entry, "state": "deferred", "note": held}
     # A job's hooks run from these files: job-started under one version, job-completed under the next. The
     # gate takes a swap mid-job (it re-execs in place and adopts its runner), but the job hooks are only ever
     # swapped between jobs. A job that starts after the last look runs one whole file or the other. A runner with a
@@ -2377,6 +2505,7 @@ def refresh_hooks(home: Path, apply: bool) -> dict[str, Any]:
         return {**doc, "error": f"no {HOOK_HISTORY.name} beside this copy: only a release's copy refreshes hooks"}
     sources = hook_sources()
     doc["hookSha256"] = sha256_bytes(sources[HOOK_NAME][0])
+    hold = functools.partial(sign_hold, home)
     with runner_lock(home, wait=False) as held:
         if not held:
             return {**doc, "error": "an --apply or --uninstall holds the runner lock; a later run refreshes"}
@@ -2391,7 +2520,7 @@ def refresh_hooks(home: Path, apply: bool) -> dict[str, Any]:
                 continue
             runner_dir = Path(str(receipt.get("runnerDir") or "")) if isinstance(receipt, dict) else Path()
             doc["runners"].append({"receipt": os.fspath(path),
-                                   **refresh_hook_dir(runner_dir, receipt, apply, sources, history)})
+                                   **refresh_hook_dir(runner_dir, receipt, apply, sources, history, hold)})
             if apply and doc["runners"][-1].get("note") == JOB_RUNNING:
                 waiting.append((len(doc["runners"]) - 1, receipt, runner_dir))
         # a busy runner is swapped in the gap between its jobs, not only if a run happens to land in one
@@ -2402,7 +2531,7 @@ def refresh_hooks(home: Path, apply: bool) -> dict[str, Any]:
                 index, receipt, runner_dir = item
                 if worker_running(runner_dir):
                     continue
-                entry = refresh_hook_dir(runner_dir, receipt, apply, sources, history)
+                entry = refresh_hook_dir(runner_dir, receipt, apply, sources, history, hold)
                 doc["runners"][index] = {"receipt": doc["runners"][index]["receipt"], **entry}
                 if entry.get("note") != JOB_RUNNING:
                     waiting.remove(item)
