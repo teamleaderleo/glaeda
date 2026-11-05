@@ -2858,6 +2858,18 @@ class HookTest(unittest.TestCase):
         release.assert_not_called()
         self.assertEqual(hook.read_claim_record(path)["state"], "held")
 
+    def test_a_claim_record_with_huge_numbers_is_invalid_and_never_crashes_admission(self) -> None:
+        """CLAIM_SLEEP review F3: the record is untrusted. A number too large for a float or a pid (an OverflowError in
+        math.isfinite or os.kill) makes the record invalid; sleeping_owners, which signing admission calls, skips it."""
+        for field, value in (("drain_bound", 10 ** 400), ("owner_pid", 10 ** 30), ("capacity_units", 10 ** 30),
+                             ("instance", 10 ** 30), ("drain_bound", -1)):
+            with self.subTest(field=field, value=value):
+                state, path = self.claim_fixture(**{field: value}, state="released")
+                self.assertIsNone(hook.read_claim_record(path))
+                self.assertEqual(hook.sleeping_owners(state), set())
+        state, path = self.claim_fixture(state="released")
+        self.assertEqual(hook.sleeping_owners(state), {os.getpid()}, "a sane record is still honoured")
+
     def signing_hooks(self, *shas: str) -> tuple[dict, str]:
         """A glaeda-signing-hooks.txt at manaflow-ai/cmux@SHA listing these hook shas, served through
         GLAEDA_SIGNING_HOOKS_URL as cmux's claim gate reads it, and the env that points a signer at it."""
