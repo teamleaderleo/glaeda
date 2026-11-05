@@ -2633,6 +2633,8 @@ class HookTest(unittest.TestCase):
             stranger = self.claim("claim-release", "s0", *proof, watch=other_job.pid)
             self.assertEqual(stranger.returncode, 1, "another job's step cannot release this job's claim")
             self.assertIn("the claim record belongs to another job", stranger.stderr)
+            other_job.kill()  # this test process is the job's Runner.Worker: no other process of it may outlive a release
+            other_job.wait()
             self.assertFalse(self.whole_mini_free())
             released = self.claim("claim-release", "s0", *proof, env={"GITHUB_ENV": os.fspath(github_env)})
             self.assertEqual(released.returncode, 0, released.stdout + released.stderr)
@@ -2889,6 +2891,52 @@ class HookTest(unittest.TestCase):
         self.assertEqual(code, 1, why)
         self.assertLessEqual(clock[0] - 1000.0, 5.0 + hook.ADMIT_POLL_S)
         self.assertEqual(hook.read_claim_record(path)["state"], "released")
+
+    def test_claim_release_keeps_the_claim_while_any_other_process_of_the_job_lives(self) -> None:
+        """CLAIM_SLEEP review 2 F1: an environment read shows only a process's starting environment, so it cannot prove
+        a credential is gone (a child can setenv one after it starts). The proof is the process set: a step's secrets
+        reach only its own processes, so every process of the job other than its Runner.Worker and the release step's
+        own chain must have exited. A leftover background child keeps the claim, a child that set the credential's name
+        after it started keeps it too, and the same job with no such child releases."""
+        state, path = self.claim_fixture()
+        github_env = self.dir / "github-env"
+        environ = {"RUNNER_NAME": "c0", "GITHUB_ENV": os.fspath(github_env)}
+        children = {
+            "a background child an earlier step left": "import time; time.sleep(60)",
+            "a child that set the credential after it started":
+                "import os, time; os.environ['ASC_API_KEY_P8_BASE64'] = 'TEST-NOT-A-KEY'; print('set', flush=True); "
+                "time.sleep(60)",
+        }
+        for name, code in children.items():
+            with self.subTest(name):
+                child = subprocess.Popen([sys.executable, "-c", code], stdout=subprocess.PIPE, text=True)
+                try:
+                    if "setenv" in name or "set the credential" in name:
+                        self.assertEqual(child.stdout.readline().strip(), "set")
+                    with mock.patch.dict(os.environ, environ), \
+                            mock.patch.object(hook, "release_host_lock") as release:
+                        code_, why = hook.claim_release(state, os.getpid(), [os.fspath(self.dir / "gone.p8")],
+                                                        ["ASC_API_KEY_P8_BASE64"])
+                    self.assertEqual(code_, 1, why)
+                    self.assertIn(f"pid {child.pid} ", why)
+                    release.assert_not_called()
+                    self.assertEqual(hook.read_claim_record(path)["state"], "held")
+                finally:
+                    child.kill()
+                    child.wait()
+                    child.stdout.close()
+        with mock.patch.dict(os.environ, environ), \
+                mock.patch.object(hook, "processes", side_effect=subprocess.TimeoutExpired("/bin/ps", 30)), \
+                mock.patch.object(hook, "release_host_lock") as release:
+            code_, why = hook.claim_release(state, os.getpid(), [os.fspath(self.dir / "gone.p8")], [])
+        self.assertEqual(code_, 1, "a process table that cannot be read keeps the claim")
+        release.assert_not_called()
+        with mock.patch.dict(os.environ, environ), \
+                mock.patch.object(hook, "release_host_lock", return_value="released") as release:
+            code_, why = hook.claim_release(state, os.getpid(), [os.fspath(self.dir / "gone.p8")],
+                                            ["ASC_API_KEY_P8_BASE64"])
+        self.assertEqual(code_, 0, why)
+        release.assert_called_once()
 
     def signing_hooks(self, *shas: str) -> tuple[dict, str]:
         """A glaeda-signing-hooks.txt at manaflow-ai/cmux@SHA listing these hook shas, served through
