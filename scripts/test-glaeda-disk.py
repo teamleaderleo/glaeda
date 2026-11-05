@@ -7881,6 +7881,140 @@ class LinuxLayoutTest(unittest.TestCase):
         self.assertEqual(subprocess.run(["git", "-C", str(clone), "for-each-ref", gd.ARCHIVE_REF],
                                         capture_output=True, text=True).stdout, "")
 
+    def test_a_failed_bundle_is_remembered_and_not_retried_or_walked_until_the_tree_changes(self) -> None:
+        """cmux8s/10s/11s/13s, cmuxs-3, 2026-11-05: every pressure pass re-walked the same 16-42 GiB scratch trees
+        with du and failed the same bundle again."""
+        unit, clone, env = self.mirror_unit()
+        subprocess.run(["git", "-C", str(clone), "commit", "-q", "--allow-empty", "-m", "unpushed"], check=True, env=env)
+        (self.home / "archive").write_text("not a directory")  # the bundle cannot be written
+        gd.RUN.pop("bundle_failed", None)
+        rec, err = self.apply_mirror(unit)
+        self.assertEqual(rec["outcome"], "blocked:bundle-failed")
+        self.assertIn("ALERT", err)
+        memo = gd.load_bundle_failures()[os.fspath(unit)]
+        self.assertIsInstance(memo["size"], int)
+        gd.RUN.pop("bundle_failed", None)
+        fam = next(f for f in gd.default_families() if f.id == "cmux-job-cache")
+        items = [i for i in gd.survey([fam], 24, 0) if i.path == os.fspath(unit)]
+        mtime = gd.item_mtime(fam, unit)
+        self.assertEqual(memo["mtime"], mtime)
+        # unchanged: neither bundled again nor walked with du, and still listed as failed
+        walked = []
+        real_du = gd.du_bytes
+        with mock.patch.object(gd, "du_bytes", lambda p: walked.append(p) or real_du(p)):
+            self.assertEqual([i.path for i in gd.survey([fam], 24, 0, {}) if i.path == os.fspath(unit)],
+                             [os.fspath(unit)])
+        self.assertNotIn(unit, walked)
+        receipt, err = self.home / "receipt2.jsonl", io.StringIO()
+        with mock.patch.object(gd, "archive_mirror", side_effect=AssertionError("bundled again")), \
+                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+            gd.apply(items, {fam.id: fam}, receipt, None, 24)
+        rec = json.loads(receipt.read_text().splitlines()[-1])
+        self.assertEqual(rec["outcome"], "blocked:bundle-failed")
+        self.assertTrue(any("has not changed since" in r for r in rec["reasons"]), rec["reasons"])
+        self.assertEqual(gd.RUN.pop("bundle_failed"), [os.fspath(unit)])
+        self.assertEqual(gd.RUN.pop("bundle_failed_remembered"), [os.fspath(unit)])
+        self.assertNotIn("ALERT", err.getvalue())
+        # past the retry age, or once the tree changes, it is bundled again (and the archive works now)
+        self.assertIsNone(gd.recent_bundle_failure(os.fspath(unit), mtime, now=time.time() + 13 * 3600))
+        (self.home / "archive").unlink()
+        (clone / "touched").write_text("x")
+        os.utime(clone, (mtime + 10, mtime + 10))
+        self.assertIsNone(gd.recent_bundle_failure(os.fspath(unit), gd.item_mtime(fam, unit)))
+        self.assertEqual(gd.remembered_failure_sizes([(fam, unit)]), {})
+
+    def test_a_worktree_reflog_only_commit_of_an_outside_repository_goes_to_a_bundle(self) -> None:
+        """cmux10s ~/cnx-macnext, cmux13s chiefinv/src, cmuxs-3 ~/cnx-hybrid: a worktree of ~/cmux whose detached
+        commits only its reflog holds kept the tree forever, since git bundle had no ref to name."""
+        unit, clone, env = self.mirror_unit()
+        shutil.rmtree(clone)
+        main = self.home / "main"
+        subprocess.run(["git", "clone", "-q", str(self.home / "srv"), str(main)], check=True, env=env)
+        wt = unit / "slot-1"
+        self.git(main, "worktree", "add", "-q", "--detach", str(wt), env=env)
+        self.git(wt, "commit", "-q", "--allow-empty", "-m", "only the worktree reflog", env=env)
+        lost = self.git(wt, "rev-parse", "HEAD")
+        self.git(wt, "checkout", "-q", "--detach", "origin/main", env=env)
+        self.assertIn("reflog holds", gd.mirror_repos(unit)[0])  # still refused where nothing bundles it
+        rec, _ = self.apply_mirror(unit)
+        self.assertEqual(rec["outcome"], "reclaimed", rec["reasons"])
+        self.assertFalse(unit.exists())
+        self.assertEqual(self.bundle_heads().get(gd.ARCHIVE_REF + lost), lost)
+        self.assertEqual(self.git(main, "for-each-ref", gd.ARCHIVE_REF), "")  # the names were removed again
+        restored = self.home / "restored"
+        subprocess.run(["git", "clone", "-q", str(self.home / "srv"), str(restored)], check=True, env=env)
+        bundle = next(b for b in (self.home / "archive/glaeda-disk").glob("*.bundle"))
+        self.git(restored, "fetch", "-q", str(bundle), f"{gd.ARCHIVE_REF}{lost}:refs/heads/back", env=env)
+        self.assertEqual(self.git(restored, "rev-parse", "back"), lost)
+
+    def test_a_reflog_only_commit_made_after_the_bundle_keeps_the_tree(self) -> None:
+        unit, clone, env = self.mirror_unit()
+        shutil.rmtree(clone)
+        main = self.home / "main"
+        subprocess.run(["git", "clone", "-q", str(self.home / "srv"), str(main)], check=True, env=env)
+        wt = unit / "slot-1"
+        self.git(main, "worktree", "add", "-q", "--detach", str(wt), env=env)
+        self.git(wt, "commit", "-q", "--allow-empty", "-m", "bundled", env=env)
+        self.git(wt, "checkout", "-q", "--detach", "origin/main", env=env)
+        why, _, recheck = gd.archive_mirror(unit)
+        self.assertEqual(why, "")
+        self.git(wt, "commit", "-q", "--allow-empty", "-m", "after the bundle", env=env)
+        self.git(wt, "checkout", "-q", "--detach", "origin/main", env=env)
+        with mock.patch.object(gd, "process_evidence", return_value=([], "")):
+            self.assertIn("came in after the bundle", gd.mirror_moved(self.families_job(), unit, recheck))
+
+    def test_a_repository_with_missing_objects_goes_to_a_tar_of_its_git_dir(self) -> None:
+        """cmux11s ~/cmux-next-ios-e2e/chats/src: its .git borrowed objects from a ~/cmux/.git/objects since removed,
+        so rev-list failed (missing parent 2d9b4e88) and the 41.6 GiB tree stayed on every pass."""
+        unit, clone, env = self.mirror_unit()
+        shutil.rmtree(clone)
+        borrowed = self.home / "borrowed.git"
+        subprocess.run(["git", "clone", "-q", "--bare", str(self.home / "srv"), str(borrowed)], check=True, env=env)
+        # file://, so git borrows from the reference instead of hard-linking a local clone's objects
+        subprocess.run(["git", "clone", "-q", "--reference", str(borrowed), f"file://{self.home / 'srv'}",
+                        str(clone)], check=True, env=env)
+        self.git(clone, "remote", "set-url", "origin", str(self.home / "srv"))  # the trusted stand-in
+        self.git(clone, "commit", "-q", "--allow-empty", "-m", "unpushed, on borrowed history", env=env)
+        local = self.git(clone, "rev-parse", "HEAD")
+        # as there: every ref's commit is in the clone's own store, its parent only in the borrowed one
+        self.git(clone, "update-ref", "-d", "refs/remotes/origin/HEAD")
+        self.git(clone, "update-ref", "-d", "refs/remotes/origin/main")
+        shutil.rmtree(borrowed)  # the alternate goes; the server copy stands in for origin but lacks `local`
+        self.assertIn("alternate object store gone", " ".join(gd.repo_damage(clone / ".git")))
+        rec, err = self.apply_mirror(unit)
+        self.assertEqual(rec["outcome"], "reclaimed", rec["reasons"])
+        self.assertNotIn("ALERT", err)
+        archive = self.home / "archive/glaeda-disk"
+        tars = sorted(archive.glob("*.gitdir.expires-*.tar.gz"))
+        self.assertEqual(len(tars), 1)
+        self.assertRegex(tars[0].name, gd.MIRROR_BUNDLE_RE)
+        entry = next(json.loads(ln) for ln in (archive / "manifest.jsonl").read_text().splitlines()
+                     if json.loads(ln)["name"] == tars[0].name)
+        self.assertEqual(entry["sha256"], gd._sha256(tars[0]))
+        self.assertIn("alternate object store gone", entry["missing"])
+        self.assertEqual(entry["kind"], "damaged git dir")
+        out = self.home / "out"
+        out.mkdir()
+        subprocess.run(["tar", "-xzf", str(tars[0]), "-C", str(out)], check=True)
+        self.assertEqual(subprocess.run(["git", "--git-dir", str(out / "git"), "cat-file", "-t", local],
+                                        capture_output=True, text=True).stdout.strip(), "commit")
+        self.assertEqual(os.listdir(out), ["git"])  # its git dir only, never the work tree
+
+    def test_a_repository_that_only_fails_for_other_reasons_is_not_called_damaged(self) -> None:
+        _, clone, _ = self.mirror_unit()
+        self.assertEqual(gd.repo_damage(clone / ".git"), [])
+        self.assertEqual(gd.salvage_damaged(clone / ".git", "k", [], "remote origin did not answer"),
+                         "remote origin did not answer")
+
+    def test_a_submodule_store_whose_work_tree_is_gone_is_still_read(self) -> None:
+        """cmux8s cache/cmux-workspaces: modules/vendor/bonsplit's core.worktree was deleted, so git chdir'd there
+        and failed every command ("unreadable refs")."""
+        _, clone, _ = self.mirror_unit()
+        self.git(clone, "config", "core.worktree", "../../gone/vendor/bonsplit")
+        self.assertIsNotNone(gd.local_tips(clone / ".git"))
+        self.assertIsNotNone(gd._git_dir_run(clone / ".git", "-c", "protocol.version=2", "for-each-ref"))
+        self.assertIsNone(gd._git_dir_run(clone / ".git", "status"))  # a command that reads the work tree still fails
+
     def test_a_mirror_with_nothing_unpushed_goes_without_a_bundle(self) -> None:
         unit, _, _ = self.mirror_unit()
         rec, _ = self.apply_mirror(unit)
@@ -9254,7 +9388,7 @@ class HygieneMirrorTest(unittest.TestCase):
         # and a mount that appears while the work is bundled keeps it at mirror_moved
         with mock.patch.object(gd, "process_evidence", return_value=([], "")), \
                 mock.patch.object(gd, "mount_below", return_value="another filesystem is mounted below it (x)"):
-            self.assertIn("another filesystem", gd.mirror_moved(fam, tree, ([], [], [], {}, None, {}, {})))
+            self.assertIn("another filesystem", gd.mirror_moved(fam, tree, ([], [], [], {}, None, {}, {}, {})))
 
     def test_other_archives_expire_30_days_after_their_newest_change_and_never_sooner(self) -> None:
         archive = gd.HOME / "archive"

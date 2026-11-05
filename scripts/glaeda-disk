@@ -187,7 +187,13 @@ whole, but first archive_mirror writes every commit no remote holds, and every b
 has (what the servers confirm, never a local remote-tracking ref), into git bundles under ~/archive/glaeda-disk,
 each checked with `git bundle verify`, never written over another, and listed with its sha256 in manifest.jsonl;
 only listed bundles at that hash are pruned, MIRROR_ARCHIVE_DAYS later. A bundle that fails keeps the tree:
-the receipt says blocked:bundle-failed, the run line lists it, and stderr alerts. Uncommitted work goes to the
+the receipt says blocked:bundle-failed, the run line lists it, and stderr alerts. That failure is remembered
+(~/.cache/glaeda-disk/bundle-failures.json, by path and item_mtime) for BUNDLE_FAILURE_RETRY_S: while the tree
+is unchanged, later passes neither bundle it again nor walk it with du (its remembered size stands). A linked
+worktree whose repository is outside the item and whose commits only its own HEAD or reflogs hold has those
+commits bundled through refs named for them in that repository (bundle_worktree_reflog). A repository git
+cannot read whole (an alternate object store that is gone, objects fsck finds missing) goes to a compressed tar
+of its git dir alone, whose manifest line names what was missing (archive_git_dir). Uncommitted work goes to the
 same archive first (archive_work_tree): each work tree's tracked changes as a binary patch against HEAD and its
 untracked files that are not ignored or build output as a tar, each read back and checked before the tree goes;
 work no patch can hold (files hidden from status, a moved submodule pointer, no HEAD) keeps the tree
@@ -5857,9 +5863,28 @@ def _git_dir_run(gitdir: Path, *args: str, timeout: int = 60,
     try:
         r = subprocess.run(["git", "--git-dir", str(gitdir), *args], capture_output=True,
                            text=True, timeout=timeout, env=env, input=stdin)
+        if r.returncode != 0 and "cannot chdir to" in r.stderr and "GIT_WORK_TREE" not in env \
+                and _git_subcommand(args) in WORK_TREE_FREE:
+            # a submodule store whose core.worktree was deinitialized or deleted: git chdirs there before any
+            # command, so even for-each-ref fails. These commands never read a work tree; the git dir stands in.
+            r = subprocess.run(["git", "--git-dir", str(gitdir), *args], capture_output=True, text=True,
+                               timeout=timeout, env={**env, "GIT_WORK_TREE": str(gitdir)}, input=stdin)
     except (OSError, subprocess.TimeoutExpired):
         return None
     return r.stdout if r.returncode == 0 else None
+
+
+# git commands that read only the repository, never its work tree (_git_dir_run's missing core.worktree retry)
+WORK_TREE_FREE = frozenset({"for-each-ref", "rev-parse", "rev-list", "cat-file", "bundle", "update-ref",
+                            "ls-remote", "fetch", "symbolic-ref", "show-ref", "fsck", "log"})
+
+
+def _git_subcommand(args: tuple[str, ...]) -> str:
+    """The git subcommand in args, past any leading `-c name=value` options."""
+    i = 0
+    while i < len(args) and args[i].startswith("-"):
+        i += 2 if args[i] == "-c" else 1
+    return args[i] if i < len(args) else ""
 
 
 ZERO = re.compile(r"0{40}(0{24})?$")
@@ -6570,7 +6595,10 @@ def _server_known(gitdir: Path, remotes: list[str], asked: set[str]) -> tuple[st
 
 def server_still_holds(gitdir: Path, relied: list[str]) -> str:
     """Right before the delete: every commit the bundles left to the servers (their prerequisites and the
-    tips no bundle holds) is still on a server, asked again."""
+    tips no bundle holds) is still on a server, asked again. Nothing relied on (an unborn repository, or a
+    damaged one whose whole git dir went to a tar) asks nothing."""
+    if not relied:
+        return ""
     remotes = network_remotes(gitdir)
     if remotes is None:
         return f"unreadable remotes in {gitdir}"
@@ -6580,6 +6608,81 @@ def server_still_holds(gitdir: Path, relied: list[str]) -> str:
     out = _git_dir_run(gitdir, "rev-list", "--stdin", stdin="\n".join([*relied, "--not", *known]) + "\n",
                        timeout=600) if relied else ""
     return "" if out == "" else f"a commit left to the servers is no longer on one ({gitdir})"
+
+
+DAMAGE_LINES = 20  # missing objects listed in the manifest for a damaged repository's tar
+
+
+def repo_damage(gitdir: Path) -> list[str]:
+    """Why git cannot read this repository's whole history: an alternate object store that is gone, and the
+    objects `git fsck --connectivity-only` finds missing or links it finds broken. [] when nothing is shown to
+    be missing (a failure for any other reason, a remote that did not answer say, is not damage)."""
+    found: list[str] = []
+    try:
+        alternates = (gitdir / "objects/info/alternates").read_text().splitlines()
+    except OSError:
+        alternates = []
+    for alt in (a.strip() for a in alternates):
+        if alt and not alt.startswith("#"):
+            store = alt if os.path.isabs(alt) else os.path.normpath(os.path.join(gitdir, "objects", alt))
+            if not os.path.isdir(store):
+                found.append(f"alternate object store gone: {store}")
+    try:
+        r = subprocess.run(["git", "--git-dir", str(gitdir), "fsck", "--connectivity-only", "--no-dangling",
+                            "--no-progress"], capture_output=True, text=True, timeout=900,
+                           env={**os.environ, "GIT_OPTIONAL_LOCKS": "0", "GIT_WORK_TREE": str(gitdir)})
+        out = r.stdout + r.stderr
+    except (OSError, subprocess.TimeoutExpired):
+        out = ""
+    lines = [" ".join(ln.split()) for ln in out.splitlines()]
+    for i, ln in enumerate(lines):
+        if ln.startswith("missing "):
+            found.append(ln)
+        elif ln.startswith("broken link from"):
+            nxt = lines[i + 1] if i + 1 < len(lines) and lines[i + 1].startswith("to ") else ""
+            found.append(f"{ln} {nxt}".strip())
+    return found
+
+
+def archive_git_dir(gitdir: Path, key: str, written: list[Path], damage: list[str]) -> str:
+    """A damaged repository's whole git directory (never its work tree) as a compressed tar, checked by reading it
+    back, so whatever git can still read from it is kept: its refs, reflogs and every object present. The
+    manifest names what was missing. "" or why it failed."""
+    expires = _archive_expires()
+    dest = mirror_archive() / f"{_bundle_name(key)}.gitdir.expires-{expires}.tar.gz"
+    tmp = dest.with_name(f".{dest.name}.{os.getpid()}.tmp")
+    try:
+        import tarfile
+        _private_archive_dir()
+        want = files_strict(gitdir)
+        if want is None:
+            return f"git dir of {gitdir} has an unreadable or special file; no tar can hold it"
+        with tarfile.open(tmp, "w:gz") as t:
+            t.add(os.fspath(gitdir), arcname="git", recursive=True)
+        with tarfile.open(tmp, "r:gz") as t:
+            got = {m.name for m in t.getmembers() if m.isfile()}
+        if got != {"git/" + os.path.relpath(f, gitdir) for f in want}:
+            return f"tar of {gitdir} does not hold every file of its git dir"
+        _keep_archive(tmp, dest, expires, written, kind="damaged git dir", gitdir=os.fspath(gitdir),
+                      missing="; ".join(damage[:DAMAGE_LINES])
+                      + (f"; and {len(damage) - DAMAGE_LINES} more" if len(damage) > DAMAGE_LINES else ""))
+        return ""
+    except OSError as e:
+        return f"tar of {gitdir}: {e.__class__.__name__}"
+    except Exception as e:  # tarfile.TarError and friends: never deleted on a doubt
+        return f"tar of {gitdir}: {e.__class__.__name__}"
+    finally:
+        with contextlib.suppress(OSError):
+            tmp.unlink(missing_ok=True)
+
+
+def salvage_damaged(gitdir: Path, key: str, written: list[Path], why: str) -> str:
+    """why stands when the repository shows no missing object; when it does, its git dir goes to a tar instead
+    (archive_git_dir), and "" (archived) or why that failed."""
+    damage = repo_damage(gitdir)
+    if not damage:
+        return why
+    return archive_git_dir(gitdir, key, written, damage)
 
 
 def bundle_unpushed(gitdir: Path, key: str, written: list[Path], relied: list[str] | None = None) -> str:
@@ -6606,13 +6709,15 @@ def bundle_unpushed(gitdir: Path, key: str, written: list[Path], relied: list[st
         else:
             local[name] = (obj, peeled or obj)
     why, held, known = _server_known(gitdir, remotes, {*tips, *tracking})
+    if why.startswith("unreadable objects"):
+        return salvage_damaged(gitdir, key, written, why)  # nothing left to the servers: the tar holds it all
     if why:
         return why
     # --boundary: the server-held commits the unpushed history stops at, which its bundle requires
     out = _git_dir_run(gitdir, "rev-list", "--boundary", "--stdin",
                        stdin="\n".join([*tips, "--not", *known]) + "\n", timeout=600)
     if out is None:
-        return f"unreadable history in {gitdir}"
+        return salvage_damaged(gitdir, key, written, f"unreadable history in {gitdir}")
     unpushed = {c for c in out.split() if not c.startswith("-")}
     if relied is not None:
         relied += sorted({c[1:] for c in out.split() if c.startswith("-")} | ({*tips} - unpushed))
@@ -6712,7 +6817,9 @@ def mirror_rename_recheck(path: Path, recheck: tuple):
     marker.write_text(f"kept by glaeda-disk {os.getpid()} until its git work is checked again\n")  # raises: kept
 
     def check() -> None:
-        why, gitdirs, now_trees = mirror_repos(doomed)
+        now_external: dict[str, tuple[Path, list[str]]] = {}
+        why, gitdirs, now_trees = mirror_repos(doomed, now_external)
+        why = why or external_unbundled(now_external, recheck[7])
         try:
             opened, cmds = process_evidence()  # after the rename: a process that came in meanwhile is in doomed now
             busy = in_cwd(os.fspath(doomed), open_index(opened)) or named_by(os.fspath(path), cmds) \
@@ -6773,11 +6880,16 @@ def _linked_trees_strict(gitdir: Path) -> list[Path] | None:
         return None
 
 
-def mirror_repos(path: Path) -> tuple[str, dict[str, Path], list[Path]]:
+def mirror_repos(path: Path, external: dict[str, tuple[Path, list[str]]] | None = None
+                 ) -> tuple[str, dict[str, Path], list[Path]]:
     """Every repository a mirror item takes along, found as _nested_loss finds them (checkouts, bare
     repositories, a linked worktree's repository inside it, checkouts in ignored directories, submodule stores
     and initialized submodules, recursively), and its work trees.
-    ("" or why it must stay, real git dir -> git dir, work trees)."""
+    ("" or why it must stay, real git dir -> git dir, work trees).
+    A linked worktree whose repository is outside the item takes along only what its own HEAD and reflogs hold.
+    With external given, a worktree that holds commits no branch, tag or remote-tracking ref of that repository
+    reaches is listed there (its path relative to the item -> (that repository, those commits)) for
+    bundle_worktree_reflog to bundle; without it, such a worktree keeps the item."""
     queue = checkouts(path, NESTED_DEPTH, NESTED_BUDGET, strict=True)  # an unreadable directory may hide one
     if queue is None:
         return "too deep, large or unreadable to find every checkout", {}, []
@@ -6820,9 +6932,15 @@ def mirror_repos(path: Path) -> tuple[str, dict[str, Path], list[Path]]:
             gitdirs[os.path.realpath(common)] = Path(common)
             continue
         tips = local_tips(Path(own.strip()), worktree_only=True)
+        if tips and external is not None:
+            tips = _present_commits(Path(common), tips)  # a reflog entry gc already took is lost already
         left = None if tips is None else _git_dir_run(
-            Path(common), "rev-list", "-n1", *tips, "--not", "--branches", "--tags", "--remotes") if tips else ""
-        if left is None or left.strip():
+            Path(common), "rev-list", *tips, "--not", "--branches", "--tags", "--remotes",
+            timeout=600) if tips else ""
+        if left is not None and left.strip() and external is not None:
+            only = set(left.split())
+            external[os.fspath(where)] = (Path(common), sorted(t for t in tips if t in only))
+        elif left is None or left.strip():
             return f"{where}: commits only this worktree's reflog holds", {}, []
     unreadable: list[str] = []
     for g in list(gitdirs.values()):  # submodule stores: modules/<name>, nested ones too
@@ -6879,14 +6997,119 @@ def mount_below_why(why: str) -> str:
                                   "unreadable below it", "unreadable: ")) else ""
 
 
+def _present_commits(gitdir: Path, commits: list[str]) -> list[str] | None:
+    """The commits among these the repository holds; None when it cannot be asked."""
+    out = _git_dir_run(gitdir, "cat-file", "--batch-check=%(objectname) %(objecttype)",
+                       stdin="\n".join(commits) + "\n")
+    return None if out is None else sorted({ln.split()[0] for ln in out.splitlines() if ln.endswith(" commit")})
+
+
+def bundle_worktree_reflog(common: Path, key: str, tips: list[str], written: list[Path]) -> str:
+    """Bundle the commits only a linked worktree's HEAD or reflogs hold (its repository, outside the item, stays):
+    each tip is named under ARCHIVE_REF in that repository for the bundle (a reflog entry is no ref, so git
+    bundle has nothing to name), down to the commits its branches, tags and remote-tracking refs reach, which
+    stay in it. The names are deleted again. "" or why it failed."""
+    if not tips:
+        return ""
+    out = _git_dir_run(common, "rev-list", "--boundary", *tips, "--not", "--branches", "--tags", "--remotes",
+                       timeout=600)
+    if out is None:
+        return f"unreadable history in {common}"
+    boundary = sorted({c[1:] for c in out.split() if c.startswith("-")})
+    if _git_dir_run(common, "update-ref", "--stdin", stdin="".join(
+            f"create {ARCHIVE_REF}{t} {t}\n" for t in tips)) is None:
+        return f"cannot name the reflog-only commits in {common}"
+    try:
+        heads = {ARCHIVE_REF + t for t in tips}
+        return _write_bundle(common, _bundle_name(key, "worktree-reflog"), [*sorted(heads), "--not", *boundary],
+                             heads, written)
+    finally:
+        _git_dir_run(common, "update-ref", "--stdin", stdin="".join(f"delete {ARCHIVE_REF}{t}\n" for t in tips))
+
+
+def external_unbundled(now: dict[str, tuple[Path, list[str]]], bundled: dict[str, list[str]]) -> str:
+    """Why the item's outside-repository worktrees (mirror_repos' external, read again) now hold a reflog-only
+    commit no bundle took ("" when none)."""
+    for where, (_, tips) in now.items():
+        if not set(tips) <= set(bundled.get(where, ())):
+            return f"{where}: a commit only its worktree's reflog holds came in after the bundle"
+    return ""
+
+
+BUNDLE_FAILURE_RETRY_S = 12 * 3600  # a tree whose bundle failed is not bundled again for this long unless it changes
+
+
+def bundle_failures_path() -> Path:
+    return HOME / ".cache/glaeda-disk/bundle-failures.json"
+
+
+def load_bundle_failures() -> dict[str, dict]:
+    try:
+        doc = json.loads(bundle_failures_path().read_text())
+    except (OSError, ValueError):
+        return {}
+    return {k: v for k, v in doc.items() if isinstance(v, dict)} if isinstance(doc, dict) else {}
+
+
+def recent_bundle_failure(path: str, mtime: float, now: float | None = None) -> dict | None:
+    """The failure remembered for this tree when it is under BUNDLE_FAILURE_RETRY_S old and the tree's newest
+    mtime (item_mtime) is the one it failed at; else None, and the tree is bundled again."""
+    now = time.time() if now is None else now
+    got = load_bundle_failures().get(path)
+    try:
+        if got and float(got["mtime"]) == mtime and 0 <= now - float(got["at"]) < BUNDLE_FAILURE_RETRY_S:
+            return got
+    except (KeyError, TypeError, ValueError):
+        pass
+    return None
+
+
+def remember_bundle_failure(path: str, mtime: float, why: str, size: int | None = None) -> None:
+    """Record a tree's bundle failure, so the next passes neither bundle it nor walk it with du again while it
+    is unchanged. Entries past their retry age are dropped as the file is written."""
+    now = time.time()
+    doc = {k: v for k, v in load_bundle_failures().items()
+           if isinstance(v.get("at"), (int, float)) and now - v["at"] < BUNDLE_FAILURE_RETRY_S}
+    doc[path] = {"mtime": mtime, "at": now, "why": why[:500], **({"size": size} if size is not None else {})}
+    target = bundle_failures_path()
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        tmp = target.with_name(f".{target.name}.{os.getpid()}.tmp")
+        tmp.write_text(json.dumps(doc))
+        os.replace(tmp, target)
+    except OSError:
+        pass  # only a cache: the next pass bundles it again
+
+
+def remembered_failure_sizes(work: list[tuple[Family, Path]]) -> dict[str, int]:
+    """Sizes of trees whose bundle failure is still remembered and that have not changed since (their newest
+    mtime near the top, as item_mtime reads it, is the one recorded): not walked with du again, since no pass
+    deletes them before the failure expires or the tree changes."""
+    memo = load_bundle_failures()
+    out: dict[str, int] = {}
+    now = time.time()
+    for fam, p in work:
+        got = memo.get(os.fspath(p)) if memo else None
+        if not got or not isinstance(got.get("size"), int):
+            continue
+        try:
+            if now - float(got["at"]) >= BUNDLE_FAILURE_RETRY_S or item_mtime(fam, p) != float(got["mtime"]):
+                continue
+        except (KeyError, TypeError, ValueError, OSError):
+            continue
+        out[os.fspath(p)] = got["size"]
+    return out
+
+
 def archive_mirror(path: Path) -> tuple[str, list[Path], tuple]:
     """Before a mirror item goes: bundle_unpushed for every repository mirror_repos finds. A tree with
     uncommitted work no archive can hold, or whose repositories or work cannot all be found or archived, is kept.
     ("" or why it must stay, the bundles written, what mirror_moved rechecks)."""
-    none: tuple = ([], [], [], {}, None, {}, {})
+    none: tuple = ([], [], [], {}, None, {}, {}, {})
     if (why := archive_root_why(path)):
         return why, [], none
-    why, gitdirs, trees = mirror_repos(path)
+    external: dict[str, tuple[Path, list[str]]] = {}
+    why, gitdirs, trees = mirror_repos(path, external)
     if why:
         return why, [], none
     if (why := mount_below(path)):  # a mirror is git_exempt, so git_state's nested-filesystem check never ran
@@ -6900,6 +7123,9 @@ def archive_mirror(path: Path) -> tuple[str, list[Path], tuple]:
     for key, g in sorted(gitdirs.items()):
         if (why := bundle_unpushed(g, key, bundles, relied.setdefault(g, []))):
             return why, bundles, none
+    for where, (common, commits) in sorted(external.items()):
+        if (why := bundle_worktree_reflog(common, os.path.join(os.fspath(path), where), commits, bundles)):
+            return f"{where}: {why}", bundles, none
     found = {os.path.realpath(t) for t in trees}
     work: dict[str, tuple] = {}
     for t in trees:
@@ -6911,7 +7137,8 @@ def archive_mirror(path: Path) -> tuple[str, list[Path], tuple]:
         archives = {os.fspath(b): _sha256(b) for b in bundles}
     except OSError as e:
         return f"an archive is unreadable: {e.__class__.__name__}", bundles, none
-    return "", bundles, (list(gitdirs.values()), trees, snap, relied, tips, work, archives)
+    return "", bundles, (list(gitdirs.values()), trees, snap, relied, tips, work, archives,
+                         {w: c for w, (_, c) in external.items()})
 
 
 def work_unchanged(path: Path, trees: list[Path], work: dict[str, tuple]) -> bool:
@@ -6925,11 +7152,14 @@ def mirror_moved(fam: Family, path: Path, recheck: tuple) -> str:
     """Right before a bundled mirror goes, everything the bundling took time over is read again: process
     evidence, the family's owner and artifact references, and its repositories, found afresh (the same set,
     every work tree clean) and as at bundle time, and the servers, asked again for what the bundles left to them."""
-    gitdirs, trees, snap, relied, _, work, archives = recheck
+    gitdirs, trees, snap, relied, _, work, archives, external = recheck
     for g, commits in relied.items():  # the slow network first, then git, then the quick process checks last
         if (why := server_still_holds(g, commits)):
             return why
-    why, now, now_trees = mirror_repos(path)
+    now_external: dict[str, tuple[Path, list[str]]] = {}
+    why, now, now_trees = mirror_repos(path, now_external)
+    if not why and (moved := external_unbundled(now_external, external)):
+        return f"its worktrees changed while they were bundled: {moved}"
     if why or {os.path.realpath(g) for g in now.values()} != {os.path.realpath(g) for g in gitdirs} \
             or now_trees != trees:
         return f"its repositories changed while they were bundled{': ' + why if why else ''}"
@@ -7756,6 +7986,9 @@ def _survey(families, idle_hours, min_bytes, known, evidence, defer_bulk=False,
             walked = du_children(fam.root)
             if walked is not None:
                 known.update({k: v for k, v in walked.items() if k not in known})
+    # a tree whose bundle failed and that has not changed since keeps its remembered size: no pass deletes it
+    # before the failure expires, so walking it again (150-900 s for a 40 GiB scratch tree) buys nothing
+    known.update(remembered_failure_sizes([(fam, path) for fam, path in work if str(path) not in known]))
     missing = [path for _, path in work if str(path) not in known]
     if deadline is not None and time.monotonic() >= deadline:
         _MEASURE_BUDGET_REACHED = True
@@ -9620,6 +9853,14 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
               and (g := family_git_state(fam, p)) != "none"
               and (g != "git" or family_git_loss(fam, p))):
             outcome = "changed:git"  # the checkout gained something to lose since the survey
+        elif mirror_due(fam, p, idle_now) and (failed := recent_bundle_failure(i.path, item_mtime(fam, p))):
+            # bundling this unchanged tree failed within BUNDLE_FAILURE_RETRY_S: kept without trying again
+            outcome = "blocked:bundle-failed"
+            i.reasons.append(f"bundling failed at {time.strftime('%Y-%m-%dT%H:%M:%S', time.localtime(failed['at']))}"
+                             f" and the tree has not changed since; retried after "
+                             f"{BUNDLE_FAILURE_RETRY_S // 3600} h: {failed.get('why', '')}")
+            RUN.setdefault("bundle_failed", []).append(i.path)
+            RUN.setdefault("bundle_failed_remembered", []).append(i.path)
         elif mirror_due(fam, p, idle_now) and (bundled := archive_mirror(p))[0]:
             # never deleted without a verified bundle of what is unpushed; uncommitted work no bundle holds
             drop_unused_archives(bundled[1])  # the tree stays whole: what was bundled for it so far is not needed
@@ -9628,6 +9869,7 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
             outcome = "blocked:uncommitted" if dirty else "blocked:mount" if mounted else "blocked:bundle-failed"
             i.reasons.append(bundled[0])
             if not dirty and not mounted:
+                remember_bundle_failure(i.path, item_mtime(fam, p), bundled[0], i.bytes)
                 RUN.setdefault("bundle_failed", []).append(i.path)
                 print(f"glaeda-disk: ALERT: kept {i.path}: bundling its unpushed git work failed: {bundled[0]}",
                       file=sys.stderr)
@@ -11804,6 +12046,7 @@ def write_run_line(started: float, free_before: int | None) -> None:
            "skipped": RUN.get("skipped"), "cmux_next_ci_over_gib": RUN.get("cmux_next_ci_over_gib"),
            "caller": RUN.get("caller"), "evict_owner": _owner_line(RUN.get("evict_owner")),
            "bundle_failed": RUN.get("bundle_failed", []),
+           "bundle_failed_remembered": RUN.get("bundle_failed_remembered", []),
            "measure_budget_reached": bool(RUN.get("measure_budget_reached")),
            "run_deadline_reached": bool(RUN.get("run_deadline_reached"))}
     with contextlib.suppress(OSError):
