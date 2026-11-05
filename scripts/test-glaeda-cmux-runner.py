@@ -895,6 +895,73 @@ class HookTest(unittest.TestCase):
                                            "--no-disk", repo="manaflow-ai/cmux", env=environ)
                     self.assertEqual(result.returncode == 0, admitted, result.stdout + result.stderr)
 
+    def test_classic_auto_resume_refuses_malformed_source_metadata(self) -> None:
+        """AUTO_RESUME fails closed on every missing, null or wrong-typed field of the triggering run.
+
+        The gate no longer reads the run's `pull_requests` (that list is every pull request whose head is this
+        run's commit, in any repository, so it says nothing about this run's code: see auto_resume_refusal).
+        What stands in its place are the checks below, and each one must refuse rather than admit when the
+        payload does not carry what it reads. Together they pin that an auto-resume job is admitted only when
+        the triggering run is positively identified as main's own nightly.yml run of this repository: a field
+        that is absent, null, empty or of another type can never satisfy one of them.
+        """
+        ref = "refs/heads/main"
+        workflow_ref = f"manaflow-ai/cmux/.github/workflows/auto-resume-nightly-notarization.yml@{ref}"
+        source = {"path": ".github/workflows/nightly.yml", "head_branch": "main", "event": "push",
+                  "head_repository": dict(CMUX), "repository": dict(CMUX)}
+        payload = {"action": "completed", "repository": {**CMUX, "default_branch": "main"}}
+        args = {"ref": ref, "repository": "manaflow-ai/cmux", "trusted_ref": ref,
+                "trusted_repo": "manaflow-ai/cmux", "trusted_next_signing": True, "workflow_ref": workflow_ref,
+                "run_attempt": "1", "event_name": "workflow_run", "job": "publish"}
+        # the well-formed run is admitted, so each case below refuses for its own change and nothing else
+        self.assertIsNone(hook.trusted_refusal(**{**args, "event": {**payload, "workflow_run": dict(source)}}))
+        # every field auto_resume_refusal reads, each absent, null, empty and wrong-typed
+        for field in ("path", "head_branch", "event", "head_repository", "repository"):
+            for name, change in (("absent", ...), ("null", None), ("empty dict", {}), ("empty str", ""),
+                                 ("a string", "manaflow-ai/cmux"), ("a list", []), ("a number", 1),
+                                 ("full_name not a string", {"full_name": 1})):
+                run = dict(source)
+                if change is ...:
+                    run.pop(field)
+                else:
+                    run[field] = change
+                with self.subTest(field=field, shape=name):
+                    why = hook.trusted_refusal(**{**args, "event": {**payload, "workflow_run": run}})
+                    self.assertIsNotNone(why, f"{field} {name} must refuse")
+                    self.assertIn("untrusted:", why)
+        # the run object itself, and the payload around it
+        for name, event in (("workflow_run absent", {k: v for k, v in payload.items()}),
+                            ("workflow_run null", {**payload, "workflow_run": None}),
+                            ("workflow_run empty", {**payload, "workflow_run": {}}),
+                            ("workflow_run a string", {**payload, "workflow_run": "x"}),
+                            ("workflow_run a list", {**payload, "workflow_run": []}),
+                            ("action absent", {"repository": {**CMUX, "default_branch": "main"},
+                                               "workflow_run": dict(source)}),
+                            ("action null", {**payload, "action": None, "workflow_run": dict(source)}),
+                            ("payload repository null", {**payload, "repository": None,
+                                                         "workflow_run": dict(source)}),
+                            ("payload repository empty", {**payload, "repository": {},
+                                                          "workflow_run": dict(source)}),
+                            ("default_branch absent", {**payload, "repository": dict(CMUX),
+                                                       "workflow_run": dict(source)}),
+                            ("default_branch null", {**payload, "repository": {**CMUX, "default_branch": None},
+                                                     "workflow_run": dict(source)}),
+                            ("payload null", None), ("payload a string", "x"), ("payload a list", [])):
+            with self.subTest(payload=name):
+                why = hook.trusted_refusal(**{**args, "event": event})
+                self.assertIsNotNone(why, f"{name} must refuse")
+                self.assertIn("untrusted:", why)
+        # and a pull_requests of any shape changes nothing: it is not read, so a malformed one neither
+        # admits a run the checks above refuse nor refuses one they admit
+        for pulls in (None, [], {}, "many", [None], [{}], [{"number": 1}], [{"head": {}, "base": {}}],
+                      [{"head": None, "base": None}], [{"url": None}], 42):
+            with self.subTest(pull_requests=pulls):
+                self.assertIsNone(hook.trusted_refusal(
+                    **{**args, "event": {**payload, "workflow_run": {**source, "pull_requests": pulls}}}))
+                self.assertIsNotNone(hook.trusted_refusal(
+                    **{**args, "event": {**payload, "workflow_run": {**source, "pull_requests": pulls,
+                                                                     "head_branch": "nightly-next"}}}))
+
     def test_dev_compile_runner_is_exact_job_and_event(self) -> None:
         workflow = "manaflow-ai/cmux/.github/workflows/cmux-next.yml@refs/heads/feat-cmux-next"
         push = {"ref": "refs/heads/feat-cmux-next", "repository": CMUX}

@@ -161,6 +161,26 @@ class RefusalTest(unittest.TestCase):
                         {"head_repository": {"full_name": "someone/cmux"}}):
             with self.subTest(source=changes):
                 self.assertIsNotNone(self.why(**resume("preflight", **changes)))
+        # AUTO_RESUME fails closed here too: a malformed triggering run refuses, and pull_requests, which the
+        # hook deliberately does not read, neither admits nor refuses one on its own
+        for field in ("path", "head_branch", "event", "head_repository", "repository"):
+            for shape in (None, {}, "", [], 1):
+                with self.subTest(field=field, shape=shape):
+                    self.assertIsNotNone(self.why(**resume("preflight", **{field: shape})))
+        for name, event in (("workflow_run null", {"action": "completed", "repository": repository,
+                                                   "workflow_run": None}),
+                            ("workflow_run empty", {"action": "completed", "repository": repository,
+                                                    "workflow_run": {}}),
+                            ("payload null", None), ("payload a string", "x")):
+            case = resume("preflight")
+            case["event"] = event
+            with self.subTest(payload=name):
+                self.assertIsNotNone(self.why(**case))
+        for pulls in (None, [], {}, "many", [None], [{}], [{"number": 1}], [{"head": {}, "base": {}}], 42):
+            with self.subTest(pull_requests=pulls):
+                self.assertIsNone(self.why(**resume("preflight", pull_requests=pulls)))
+                self.assertIsNotNone(self.why(**resume("preflight", pull_requests=pulls,
+                                                       head_branch="nightly-next")))
         other_branch = resume("preflight")
         other_branch["workflow_ref"] = (f"{REPO}/.github/workflows/auto-resume-nightly-notarization.yml"
                                         "@refs/heads/feat-x")
