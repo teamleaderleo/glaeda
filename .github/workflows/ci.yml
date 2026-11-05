@@ -7,6 +7,10 @@ on:
     paths-ignore:
       - "docs/**"
       - "**/*.md"
+  # A hand-run Verify of main in the fork (`gh workflow run ci.yml -R manaflow-ai/glaeda --ref main`): main's check of
+  # record when the push Verify there did not run, as when Sync main was red (glaeda#1859). It runs every job, as a
+  # main push does. Dispatched here, in teamleaderleo/glaeda, every job is skipped, like a main push (see below).
+  workflow_dispatch:
 
 # Keep pull requests active for documentation-only changes so the required
 # `ci-status` check is reported. Main pushes retain the path filter because
@@ -23,7 +27,8 @@ permissions:
 # whose heads exist only here. The jobs that need no other job carry the gate; the rest are skipped with them.
 
 concurrency:
-  group: verify-${{ github.workflow }}-${{ github.ref }}
+  # A hand-run Verify never cancels the push Verify of the same ref, nor the other way round.
+  group: verify-${{ github.workflow }}-${{ github.event_name == 'workflow_dispatch' && 'dispatch-' || '' }}${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
