@@ -2926,7 +2926,7 @@ class HookTest(unittest.TestCase):
                     child.wait()
                     child.stdout.close()
         with mock.patch.dict(os.environ, environ), \
-                mock.patch.object(hook, "processes", side_effect=subprocess.TimeoutExpired("/bin/ps", 30)), \
+                mock.patch.object(hook, "user_processes", return_value=None), \
                 mock.patch.object(hook, "release_host_lock") as release:
             code_, why = hook.claim_release(state, os.getpid(), [os.fspath(self.dir / "gone.p8")], [])
         self.assertEqual(code_, 1, "a process table that cannot be read keeps the claim")
@@ -3030,9 +3030,7 @@ class HookTest(unittest.TestCase):
             table = real()
             if table is None:
                 return None
-            pid = next(iter(table))
-            table[pid] = (table[pid][0], None, table[pid][2])
-            return table
+            return {pid: (ppid, None, command) for pid, (ppid, _, command) in table.items()}
         with mock.patch.dict(os.environ, environ), mock.patch.object(hook, "user_processes", side_effect=unreadable), \
                 mock.patch.object(hook, "release_host_lock") as release:
             code, why = hook.claim_release(state, os.getpid(), [os.fspath(self.dir / "gone.p8")], [])

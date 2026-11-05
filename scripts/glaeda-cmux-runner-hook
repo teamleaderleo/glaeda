@@ -114,6 +114,7 @@ runner's reserve; for a root runner it also means the mini cannot admit a compil
 from __future__ import annotations
 
 import argparse
+import calendar
 import contextlib
 import datetime
 import errno
@@ -5579,35 +5580,83 @@ def process_environment_names(pid: int, names: set[str]) -> set[str] | None:
     return {name for name in names if any(word.startswith(name + "=") for word in words)}
 
 
-def job_process_set(owner_pid: int) -> tuple[list[tuple[int, str]], list[int]] | None:
-    """The proof claim-release rests on. A step's secrets reach only that step's own processes, so once the steps that
-    held a credential have ended, every live process of the job (owner_pid and its descendants) is the owner Runner.Worker,
-    this process, or an ancestor of this process (the release step's own shell chain). Returns (leftovers, chain):
-    leftovers are the job's other live processes as (pid, command), any of which keeps the claim (a background child an
-    earlier step left, a daemon, a sleep, a child that set a credential after it started); chain is the job's processes
-    that are this process or its ancestors, which the --forbid-env check reads. None when the process table cannot be
-    read in full (the release then keeps the claim)."""
+LSTART_FORMAT = "%a %b %d %H:%M:%S %Y"  # ps -o lstart= under LC_ALL=C: "Thu Nov  5 08:49:35 2026"
+
+
+def user_processes() -> dict[int, tuple[int, float | None, str]] | None:
+    """pid -> (ppid, start time in Unix seconds or None when it cannot be read, command) for every process of this user,
+    from one ps listing (LC_ALL=C, absolute path, timeout); None when ps cannot answer in full."""
     try:
-        table = processes()
-    except (OSError, subprocess.SubprocessError, ValueError):
+        result = subprocess.run([PS, "-U", str(os.getuid()), "-ww", "-o", "pid=,ppid=,lstart=,command="],
+                                stdin=subprocess.DEVNULL, capture_output=True, text=True, errors="replace", timeout=30,
+                                check=False, env={"LC_ALL": "C", "TZ": "UTC"})
+    except (OSError, subprocess.TimeoutExpired):
         return None
+    if result.returncode != 0:
+        return None
+    table: dict[int, tuple[int, float | None, str]] = {}
+    for line in result.stdout.splitlines():
+        parts = line.split(None, 7)
+        if len(parts) < 7 or not parts[0].isdigit() or not parts[1].isdigit():
+            return None  # a row it cannot read: not a whole listing
+        try:
+            started: float | None = calendar.timegm(time.strptime(" ".join(parts[2:7]), LSTART_FORMAT))
+        except (ValueError, OverflowError):
+            started = None
+        table[int(parts[0])] = (int(parts[1]), started, parts[7] if len(parts) == 8 else "")
+    return table
+
+
+def job_process_set(owner_pid: int, state_dir: Path) -> tuple[list[tuple[int, str]], list[int]] | None:
+    """The proof claim-release rests on. A step's secrets reach only that step's own processes, and while the job holds
+    the whole Mac no other job runs as this user, so every process of this user that started after the owner
+    Runner.Worker came from the job, wherever it was reparented (a daemon that double-forked to launchd included). Each
+    such live process must be the owner, this process or one of its ancestors up to the owner (the release step's own
+    shell chain), or this runner's own lock holders (and their descendants); any other keeps the claim. Returns
+    (leftovers, chain): leftovers as (pid, command); chain is the release step's own processes, which the --forbid-env
+    check reads. None when the listing or any start time it needs cannot be read (the claim is kept). The start times
+    have one-second resolution, and a process started in the owner's own second counts as the job's: a false keep is
+    today's behaviour, a false release is not. Processes this job leaves running keep the claim too (a bounded disk pass
+    job-started began, a sleep), so the release step runs after them."""
+    table = user_processes()
     me = os.getpid()
-    if me not in table:
+    if table is None or me not in table or owner_pid not in table or table[owner_pid][1] is None:
         return None
-    allowed, walk = {owner_pid, me}, me
+    owner_start = table[owner_pid][1]
+    chain, walk = {owner_pid, me}, me
     for _ in range(256):  # this process's ancestors, up to the owner (or launchd when it is not under the owner)
-        parent = table.get(walk, (0, ""))[0]
+        parent = table.get(walk, (0, None, ""))[0]
         if parent <= 1 or parent == owner_pid:
             break
-        allowed.add(parent)
+        chain.add(parent)
         walk = parent
-    job = [owner_pid, *descendants(owner_pid, table)]
-    # a process in the table that has exited since (the ps that listed it) is not live
-    leftovers = [(pid, table[pid][1]) for pid in job if pid not in allowed and pid_alive(pid)]
-    chain = [pid for pid in job if pid in allowed and pid != owner_pid]
-    if me not in chain:
-        chain.append(me)
-    return leftovers, chain
+    main = holder_file(state_dir)
+    holders: set[int] = set()
+    for pid_file in [*state_dir.glob(f"{main.stem}.pid"), *state_dir.glob(f"{main.stem}-*.pid"),
+                     sampler_file(state_dir)]:
+        with contextlib.suppress(OSError, ValueError):
+            holders.add(int(pid_file.read_text().strip()))
+
+    def held(pid: int) -> bool:
+        for _ in range(256):
+            if pid in holders:
+                return True
+            if pid <= 1 or pid not in table:
+                return False
+            pid = table[pid][0]
+        return False
+
+    leftovers: list[tuple[int, str]] = []
+    for pid, (_, started, command) in table.items():
+        if pid <= 1 or pid in chain or held(pid):  # launchd (init) is never a job's process
+            continue
+        if started is None:
+            if pid_alive(pid):
+                return None  # a live process whose start cannot be read: not proven older than the job
+            continue
+        if started >= owner_start and pid_alive(pid):  # one that has exited since the listing (ps itself) is gone
+            leftovers.append((pid, command))
+    return leftovers, sorted(pid for pid in chain if pid != owner_pid)
 
 
 def chain_environment_holders(chain: list[int], names: set[str]) -> list[tuple[int, str]] | None:
@@ -5713,13 +5762,13 @@ def claim_release(state_dir: Path, watch_pid: int, removed: list[str], forbid_en
     left = [p for p in removed if not path_proven_absent(p)]
     if left:
         return 1, f"still present or not checkable, so the job keeps the whole Mac: {', '.join(left[:8])}"
-    found = job_process_set(owner.pid)
+    found = job_process_set(owner.pid, state_dir)
     if found is None:
-        return 1, "cannot read the whole process table, so the job keeps the whole Mac"
+        return 1, "cannot read the whole process table or a start time in it, so the job keeps the whole Mac"
     leftovers, chain = found
     if leftovers:
-        return 1, ("another process of this job still runs, and a credential may live in it, so the job keeps the whole "
-                   "Mac: " + "; ".join(f"pid {pid} {executable_name(command)}" for pid, command in leftovers[:8]))
+        return 1, ("another process started during this job still runs, and a credential may live in it, so the job "
+                   "keeps the whole Mac: " + "; ".join(f"pid {pid} {executable_name(command)}" for pid, command in leftovers[:8]))
     if forbid_env:
         holders = chain_environment_holders(chain, set(forbid_env))
         if holders is None:
