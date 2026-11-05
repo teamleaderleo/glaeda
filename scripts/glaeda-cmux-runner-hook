@@ -3783,9 +3783,10 @@ RUNNER_WORK_GLOBS = ("actions-runner-glaeda*/_work", "glaeda-runner/_work",
                      ".local/state/glaeda/promotion/*/runner/_work")  # a promotion lease's runner (PROMOTION_LEASE)
 
 
-def stray_job_processes(home: Path, owner_pid: int) -> list[int] | None:
+def stray_job_processes(home: Path, owner_pid: int, sleepers: set[int] | frozenset[int] = frozenset()) -> list[int] | None:
     """This user's processes working in or naming a runner's _work under home that are not this job's (under
-    owner_pid) and not the hook's or this process's ancestors. None when ps or lsof cannot tell."""
+    owner_pid), not a sleeping signing job's (under a pid in sleepers: CLAIM_SLEEP) and not the hook's or this
+    process's ancestors. None when ps or lsof cannot tell."""
     works = sorted({os.path.realpath(w) for pattern in RUNNER_WORK_GLOBS for w in home.glob(pattern) if w.is_dir()})
     if not works:
         return []
@@ -3830,7 +3831,7 @@ def stray_job_processes(home: Path, owner_pid: int) -> list[int] | None:
 
     def ours(pid: int) -> bool:
         for _ in range(256):
-            if (pid == owner_pid and pid > 1) or pid in mine:
+            if (pid == owner_pid and pid > 1) or pid in mine or (pid > 1 and pid in sleepers):
                 return True
             if pid <= 1 or pid not in parent:
                 return False
@@ -5429,6 +5430,294 @@ def yield_to_exclusive(capacity_dir: Path, owner: Any, cap: float | None) -> tup
             shown = why
         time.sleep(min(ADMIT_POLL_S, max(0.0, bound - waited)))
     return True, ""
+
+
+# CLAIM_SLEEP (cmuxterm coordinator, 2026-11-05, for cmux main's auto-resume notarization on cmux15, manaflow-ai/cmux
+# #36648): a signing job that waits hours on Apple (wait-and-staple, staple-outer, the poll jobs) holds the whole Mac
+# for the whole wait, so on the one nightly mini every other nightly job waits behind a sleep. The trust model stays
+# "hold the whole Mac before any credential", so such a job gives its claim up only while it holds no credential:
+#   claim-release: the job proves its credentials are gone (every --removed path is absent, and no process of the
+#     job, this one included, has a --forbid-env variable in its environment), then the hook lets go of the job's
+#     holder (every unit and token, the host lock), and tells later steps GLAEDA_JOB_CLAIM=released through
+#     $GITHUB_ENV, which cmux's claim gate refuses. A proof that fails, or cannot be read, keeps the claim (exit 1):
+#     the job sleeps holding the Mac, as it did before.
+#   claim-reacquire: the job waits for the whole Mac again exactly as a fresh signing job does (take_capacity with the
+#     exclusive class, its own tier and SIGNS_FIRST, an admit.want marker that holds every gate and yielding runner,
+#     then no process of an earlier job in any runner's _work), and on success tells later steps
+#     GLAEDA_JOB_CLAIM=exclusive and GLAEDA_HOOK_SHA256 again. Only then may the job read the key again.
+# What the job was admitted with is kept in its claim record (claim_record_file, one per runner, written by
+# job-started for an exclusive job holding every unit). The record's state is held, released or reacquiring; while it
+# is released or reacquiring, another signing job's drain does not count the sleeping job's own processes (its
+# Runner.Worker's tree) as an earlier job's (sleeping_owners), so neither job waits on the other: the sleeper's are
+# trusted signing-job processes that hold no credential. The record never holds anything: a cancelled or crashed job
+# leaves no holder (its holder went at claim-release), its marker goes with its pid (admission_waiters), and a record
+# whose Runner.Worker is gone is ignored and removed by the next reader; job-completed and the runner's next
+# job-started remove it too. A file CLAIM_RELEASE_OFF in the state dir turns claim-release off on a mini (it then
+# refuses and the job keeps the Mac); claim-reacquire always works, so a job released before the switch still gets
+# back. Only a trusted-only runner (--trusted-ref, cmux15's pool) may release: while the job sleeps other jobs run as
+# the same user, and on a PR mini a PR job could rewrite the code in the sleeping job's _work that it runs with the key
+# once it has reacquired. On a trusted-only runner every job is merged code of the trusted repository and ref.
+CLAIM_RECORD_SUFFIX = ".claim.json"
+CLAIM_SCHEMA = "glaeda-claim-sleep/v1"
+CLAIM_HELD, CLAIM_RELEASED, CLAIM_REACQUIRING = "held", "released", "reacquiring"
+CLAIM_RELEASE_OFF = "claim-release.off"
+CLAIM_RECORD_MAX_BYTES = 16 * 1024
+CLAIM_ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,127}")
+CLAIM_RELEASED_ENV = "released"  # JOB_CLAIM_ENV's value after claim-release: cmux's claim gate refuses it
+# How a step calls the hook mid-job: job-started gives an exclusive job these through $GITHUB_ENV.
+CLAIM_PYTHON_ENV, CLAIM_HOOK_ENV, CLAIM_STATE_ENV = "GLAEDA_CLAIM_PYTHON", "GLAEDA_CLAIM_HOOK", "GLAEDA_CLAIM_STATE_DIR"
+
+
+def claim_record_file(state_dir: Path, runner: str | None = None) -> Path:
+    main = holder_file(state_dir, runner)
+    return main.with_name(main.stem + CLAIM_RECORD_SUFFIX)
+
+
+def write_claim_record(path: Path, record: dict[str, Any]) -> None:
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(record, sort_keys=True) + "\n")
+    tmp.replace(path)
+
+
+def read_claim_record(path: Path) -> dict[str, Any] | None:
+    """The claim record at path, or None when it is missing or malformed (a record is read as untrusted)."""
+    try:
+        data = json.loads(read_bounded(path, CLAIM_RECORD_MAX_BYTES) or b"")
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict) or data.get("schema") != CLAIM_SCHEMA:
+        return None
+    ints = ("owner_pid", "capacity_units", "compile_slots", "roots", "instance")
+    strs = ("owner_identity", "state", "capacity_dir", "host_lock", "job", "workflow", "repo", "home_repo", "tier",
+            "gui_token")
+    if any(not isinstance(data.get(k), int) or isinstance(data.get(k), bool) for k in ints) \
+            or any(not isinstance(data.get(k), str) for k in strs) \
+            or not isinstance(data.get("signs_first"), bool) or not isinstance(data.get("nightly_runner"), bool) \
+            or not isinstance(data.get("trusted"), bool) \
+            or not isinstance(data.get("drain_bound"), (int, float)) or isinstance(data.get("drain_bound"), bool):
+        return None
+    if data["state"] not in (CLAIM_HELD, CLAIM_RELEASED, CLAIM_REACQUIRING) or data["owner_pid"] <= 1 \
+            or data["capacity_units"] <= 0 or not math.isfinite(data["drain_bound"]):
+        return None
+    return data
+
+
+def claim_record(owner: JobOwner, taken: dict[str, Any], *, capacity_dir: Path, host_lock: str, total: int,
+                 compile_slots: int, roots: int, instance: int, job: str, workflow: str, repo: str | None,
+                 home_repo: str, tier: str, signs_first: bool, nightly_runner: bool, gui_token: str,
+                 drain_bound: float, trusted: bool = False) -> dict[str, Any]:
+    return {"schema": CLAIM_SCHEMA, "state": CLAIM_HELD, "since": time.time(), "owner_pid": owner.pid,
+            "owner_identity": owner.identity, "capacity_dir": os.fspath(capacity_dir), "host_lock": host_lock,
+            "capacity_units": total, "compile_slots": compile_slots, "roots": roots, "instance": instance,
+            "job": job, "workflow": workflow, "repo": repo or "", "home_repo": home_repo, "tier": tier,
+            "signs_first": bool(signs_first), "nightly_runner": bool(nightly_runner), "gui_token": gui_token,
+            "drain_bound": drain_bound, "trusted": bool(trusted), "units": taken.get("units"),
+            "tokens": taken.get("tokens")}
+
+
+def sleeping_owners(state_dir: Path) -> set[int]:
+    """The Runner.Workers of this mini's signing jobs that gave their claim up to sleep (claim record released or
+    reacquiring, owner still the same live process). A record whose owner is gone is removed."""
+    owners: set[int] = set()
+    if not state_dir.is_dir():
+        return owners
+    for path in state_dir.glob(f"{HOLDER_FILE}*{CLAIM_RECORD_SUFFIX}"):
+        record = read_claim_record(path)
+        if record is None:
+            continue
+        owner = JobOwner(record["owner_pid"], record["owner_identity"])
+        if owner.gone():
+            with contextlib.suppress(OSError):
+                path.unlink()  # a cancelled or crashed job's record: nothing to honour
+            continue
+        if record["state"] in (CLAIM_RELEASED, CLAIM_REACQUIRING):
+            owners.add(owner.pid)
+    return owners
+
+
+def process_environment_names(pid: int, names: set[str]) -> set[str] | None:
+    """Which of names are set in pid's environment; None when it cannot be read (a gone process reads as empty).
+    /proc where there is one (Linux), else `ps -E` (this user's processes on macOS), read as words."""
+    environ = Path(f"/proc/{pid}/environ")
+    if Path("/proc/self/environ").exists():
+        try:
+            entries = environ.read_bytes().split(b"\0")
+        except FileNotFoundError:
+            return set()
+        except OSError:
+            return set() if not pid_alive(pid) else None
+        return {name for name in names if any(entry.startswith(name.encode() + b"=") for entry in entries)}
+    try:
+        result = subprocess.run([PS, "-E", "-ww", "-o", "command=", "-p", str(pid)], stdin=subprocess.DEVNULL,
+                                capture_output=True, text=True, errors="replace", timeout=10, check=False,
+                                env={"LC_ALL": "C"})
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0 or not result.stdout.strip():
+        return set() if not pid_alive(pid) else None
+    words = result.stdout.split()
+    return {name for name in names if any(word.startswith(name + "=") for word in words)}
+
+
+def job_environment_holders(owner_pid: int, names: set[str]) -> list[tuple[int, str]] | None:
+    """(pid, name) for every process of the job (owner_pid and its descendants) whose environment sets one of names;
+    None when the process table or any environment cannot be read (the release then keeps the claim)."""
+    try:
+        table = processes()
+    except (OSError, subprocess.SubprocessError):
+        return None
+    found: list[tuple[int, str]] = []
+    for pid in [owner_pid, *descendants(owner_pid, table)]:
+        held = process_environment_names(pid, names)
+        if held is None:
+            return None
+        found += [(pid, name) for name in sorted(held)]
+    return found
+
+
+def claim_owner_refusal(record: dict[str, Any] | None, owner: JobOwner | None) -> str | None:
+    if owner is None:
+        return "not inside a runner job (no Runner.Worker with a start token above this step)"
+    if record is None:
+        return ("this job holds no claim it can give up (no claim record: only an exclusive job that holds every unit "
+                "has one)")
+    if (record["owner_pid"], record["owner_identity"]) != (owner.pid, owner.identity):
+        return f"the claim record belongs to another job (Runner.Worker {record['owner_pid']}, not {owner.pid})"
+    return None
+
+
+def append_github_env(lines: str) -> bool:
+    target = os.environ.get("GITHUB_ENV")
+    if not target:
+        return False
+    with contextlib.suppress(OSError), open(target, "a", encoding="utf-8") as env_file:
+        env_file.write(lines)
+        return True
+    return False
+
+
+def claim_release(state_dir: Path, watch_pid: int, removed: list[str], forbid_env: list[str]) -> tuple[int, str]:
+    """claim-release: (0, note) once this job's whole-Mac claim is let go, (1, why) when it keeps it, (2, why) for a
+    call that is wrong. Never releases before every proof holds."""
+    if not os.environ.get("RUNNER_NAME"):
+        return 2, "RUNNER_NAME is not set (not a runner job step)"
+    if not removed and not forbid_env:
+        return 2, "name what the job removed (--removed PATH) or must not hold (--forbid-env NAME); nothing is proven"
+    bad = [path for path in removed if not os.path.isabs(path)] + [n for n in forbid_env if not CLAIM_ENV_NAME.fullmatch(n)]
+    if bad:
+        return 2, f"not an absolute path or an environment variable name: {', '.join(map(repr, bad[:4]))}"
+    if (state_dir / CLAIM_RELEASE_OFF).exists():
+        return 1, f"claim release is off on this mini ({state_dir / CLAIM_RELEASE_OFF}); the job keeps the whole Mac"
+    owner = JobOwner.of(watch_pid or runner_worker_pid() or 0)
+    path = claim_record_file(state_dir)
+    record = read_claim_record(path)
+    if why := claim_owner_refusal(record, owner):
+        return 1, why
+    assert owner is not None and record is not None
+    if not record["trusted"]:
+        # while it sleeps other jobs run as this user and could rewrite the code in its _work that it runs with the key
+        # after claim-reacquire; on a trusted-only runner (--trusted-ref) every such job is merged trusted code
+        return 1, "claim release needs a trusted-only runner (--trusted-ref); the job keeps the whole Mac"
+    left = [p for p in removed if os.path.lexists(p)]
+    if left:
+        return 1, f"still present, so the job keeps the whole Mac: {', '.join(left[:8])}"
+    if forbid_env:
+        holders = job_environment_holders(owner.pid, set(forbid_env))
+        if holders is None:
+            return 1, "cannot read every environment of this job's processes, so the job keeps the whole Mac"
+        if holders:
+            return 1, ("a process of this job still has a credential in its environment, so the job keeps the whole "
+                       "Mac: " + ", ".join(f"pid {pid} {name}" for pid, name in holders[:8]))
+    # released first: from here another signing job's drain does not wait on this job's own processes
+    record.update(state=CLAIM_RELEASED, released_at=time.time())
+    try:
+        write_claim_record(path, record)
+    except OSError as error:
+        return 1, f"cannot write the claim record ({type(error).__name__}); the job keeps the whole Mac"
+    note = release_host_lock(state_dir)
+    told = append_github_env(f"{JOB_CLAIM_ENV}={CLAIM_RELEASED_ENV}\n")
+    return 0, (f"released the whole Mac while this job sleeps ({note}); proven: {len(removed)} path(s) absent, "
+               f"{len(forbid_env)} variable(s) in no process of the job"
+               + (f"; later steps see {JOB_CLAIM_ENV}={CLAIM_RELEASED_ENV}" if told else ""))
+
+
+def claim_reacquire(state_dir: Path, watch_pid: int, wait_s: float | None) -> tuple[int, str]:
+    """claim-reacquire: (0, note) once this job holds the whole Mac again, under the queue rules of a fresh signing
+    job; (1, why) when it does not (it then holds nothing and must not read a credential)."""
+    if not os.environ.get("RUNNER_NAME"):
+        return 2, "RUNNER_NAME is not set (not a runner job step)"
+    owner = JobOwner.of(watch_pid or runner_worker_pid() or 0)
+    path = claim_record_file(state_dir)
+    record = read_claim_record(path)
+    if why := claim_owner_refusal(record, owner):
+        return 1, why
+    assert owner is not None and record is not None
+    total = record["capacity_units"]
+    if record["state"] == CLAIM_HELD and holder_alive(holder_file(state_dir)):
+        claim = export_job_claim(total, {"class": EXCLUSIVE_CLASS, "units": total}, "")
+        return 0, "this job already holds the whole Mac" + (f"; {claim}" if claim else "")
+    capacity_dir = Path(record["capacity_dir"])
+    record.update(state=CLAIM_REACQUIRING, reacquiring_at=time.time())
+    try:
+        write_claim_record(path, record)
+    except OSError as error:
+        return 1, f"cannot write the claim record ({type(error).__name__})"
+    bound = record["drain_bound"] if wait_s is None else max(0.0, wait_s)
+    tier = record["tier"] if record["tier"] in (TIER_NIGHTLY, TIER_DEV, TIER_STACK) else ""
+    start, since = time.monotonic(), time.time()
+    marker = capacity_dir / f"{ADMIT_WANT}{os.getpid()}"
+    shown, shown_at = "", 0.0
+    taken: dict[str, Any] = {}
+    held, note = False, ""
+    print(f"{PREFIX}: claim-reacquire: waiting for the whole Mac as a fresh signing job, {bound:g} s at most", flush=True)
+    try:
+        while True:
+            if owner.gone():
+                note = f"{OWNER_GONE} (pid {owner.pid}); nothing held"
+                break
+            taken.clear()
+            held, note = take_capacity(record["host_lock"], capacity_dir, total, record["job"], owner, state_dir,
+                                       record["compile_slots"], record["roots"], record["repo"] or None,
+                                       record["home_repo"], instance=record["instance"], workflow=record["workflow"],
+                                       taken_out=taken, since=since, gui_token=record["gui_token"],
+                                       klass=EXCLUSIVE_CLASS, tier=tier, new_job=True,
+                                       nightly_runner=record["nightly_runner"], signs_first=record["signs_first"])
+            if held:
+                stray = stray_job_processes(Path.home(), owner.pid, sleeping_owners(state_dir) - {owner.pid})
+                if stray is None or stray:
+                    release_host_lock(state_dir)
+                    held = False
+                    note = ("capacity: cannot list the processes in the runners' _work, so the mini is not known to be "
+                            "drained" if stray is None else
+                            f"capacity: {len(stray)} process(es) of an earlier job still run in a runner's _work "
+                            f"(pids {', '.join(map(str, stray[:8]))}), so the mini is not drained")
+            if held or not note.startswith("capacity:"):
+                break
+            left = bound - (time.monotonic() - start)
+            if left <= 0:
+                break
+            write_want(marker, since, list(taken.get("wants") or []), tier, "", EXCLUSIVE_CLASS, record["signs_first"])
+            if note != shown or time.monotonic() - shown_at >= ADMIT_NOTE_S:
+                print(f"{PREFIX}: claim-reacquire: waiting ({time.monotonic() - start:.0f} s so far): "
+                      f"{note.removeprefix('capacity: ')}", flush=True)
+                shown, shown_at = note, time.monotonic()
+            time.sleep(min(ADMIT_POLL_S, left))
+    finally:
+        with contextlib.suppress(OSError):
+            marker.unlink()
+    if held and (taken.get("class") != EXCLUSIVE_CLASS or taken.get("units") != total):
+        release_host_lock(state_dir)
+        held, note = False, f"took {taken.get('units')} of {total} units, not the whole Mac"
+    current = read_claim_record(path)
+    if current is not None and (current["owner_pid"], current["owner_identity"]) == (owner.pid, owner.identity):
+        current.update(state=CLAIM_HELD if held else CLAIM_RELEASED, units=taken.get("units"),
+                       tokens=taken.get("tokens"))
+        with contextlib.suppress(OSError):
+            write_claim_record(path, current)
+    if not held:
+        return 1, f"not reacquired, so the job holds nothing and must not read a credential: {note}"
+    claim = export_job_claim(total, taken, note)
+    return 0, f"holding the whole Mac again ({note})" + (f"; {claim}" if claim else "")
 
 
 def runner_scope(runner_dir: Path) -> RunnerScope:
@@ -9324,11 +9613,19 @@ def leave_job_workspace(args: argparse.Namespace) -> None:
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog=PREFIX)
     p.add_argument("phase", choices=("job-started", "job-completed", "check", "listen", "take-root", "take-gui",
-                                     "admit", "release", "fits", "busy"),
+                                     "admit", "release", "fits", "busy", "claim-release", "claim-reacquire"),
                    help="check: the eligibility gate only, read-only (no lock, no rustup change); "
                         "listen: run the runner's run.sh under the listener gate (the LaunchAgent's program); "
                         "admit, release, fits: the build worker's ci-step admission (one JSON line each); "
-                        "busy --runner-dir D: exit 3 when that runner is idle, 0 when it has a job or it cannot tell")
+                        "busy --runner-dir D: exit 3 when that runner is idle, 0 when it has a job or it cannot tell; "
+                        "claim-release, claim-reacquire: a step of an exclusive job gives the whole Mac up while it "
+                        "sleeps and takes it back (CLAIM_SLEEP)")
+    p.add_argument("--removed", action="append", default=[],
+                   help="claim-release: an absolute path the job removed (its keychain, key file); present refuses")
+    p.add_argument("--forbid-env", action="append", default=[],
+                   help="claim-release: a variable no process of the job may still have (its credentials' names)")
+    p.add_argument("--claim-wait", type=float, default=None,
+                   help="claim-reacquire: seconds to wait for the whole Mac (default: the job's own drain bound)")
     p.add_argument("--class", dest="step_class", choices=STEP_CLASSES, help="admit: the ci-step's class")
     p.add_argument("--job-key", help="admit, release: the ci-step's key (runner name, run id and attempt)")
     p.add_argument("--runner-dir", type=Path, help="listen: the runner directory whose run.sh the gate runs")
@@ -9492,6 +9789,12 @@ def main(argv: list[str] | None = None) -> int:
             print(f"{PREFIX}: fits: {why}", file=sys.stderr, flush=True)
         print(json.dumps(answer, sort_keys=True), flush=True)
         return 0
+    if args.phase in ("claim-release", "claim-reacquire"):
+        code, note = (claim_release(args.state_dir, args.watch_pid, args.removed, args.forbid_env)
+                      if args.phase == "claim-release" else
+                      claim_reacquire(args.state_dir, args.watch_pid, args.claim_wait))
+        print(f"{PREFIX}: {args.phase}: {note}", file=sys.stdout if code == 0 else sys.stderr, flush=True)
+        return code
     if args.phase == "listen":
         if args.runner_dir is None:
             p.error("listen needs --runner-dir")
@@ -9685,6 +9988,8 @@ def main(argv: list[str] | None = None) -> int:
         if args.capacity_units > 0:
             roots_file(args.state_dir).unlink(missing_ok=True)  # a crashed job's record must not look held
             gui_file(args.state_dir).unlink(missing_ok=True)
+            with contextlib.suppress(OSError):  # nor its claim record look like a sleeping signing job (CLAIM_SLEEP)
+                claim_record_file(args.state_dir).unlink(missing_ok=True)
             ensure_root_shim(Path(FLEET_DIR) / "bin")
             # A cmux job waits for capacity with no limit (CAPACITY_WAIT); a guest has no rescue workflow, so it
             # waits GUEST_WAIT_S for room and is then refused.
@@ -9753,7 +10058,9 @@ def main(argv: list[str] | None = None) -> int:
                                                nightly_runner=args.nightly_runner,
                                                signs_first=args.trusted_next_signing)
                     if held and claim_class == EXCLUSIVE_CLASS:
-                        stray = stray_job_processes(Path.home(), owner.pid if owner else 0)
+                        # a sleeping signing job's own processes are not an earlier job's (CLAIM_SLEEP)
+                        stray = stray_job_processes(Path.home(), owner.pid if owner else 0,
+                                                    sleeping_owners(args.state_dir) - {owner.pid})
                         if stray is None or stray:
                             release_host_lock(args.state_dir)
                             held = False
@@ -9813,6 +10120,24 @@ def main(argv: list[str] | None = None) -> int:
             note += f"; {claim}"
         if args.capacity_units > 0 and (share := export_job_share(taken)):
             note += f"; {share}"
+        if args.capacity_units > 0 and taken.get("class") == EXCLUSIVE_CLASS \
+                and taken.get("units") == args.capacity_units and owner is not None:
+            # CLAIM_SLEEP: what it was admitted with, for claim-release and claim-reacquire, and how to call them
+            try:
+                write_claim_record(claim_record_file(args.state_dir), claim_record(
+                    owner, taken, capacity_dir=args.capacity_dir, host_lock=args.host_lock,
+                    total=args.capacity_units, compile_slots=args.compile_slots, roots=args.canonical_roots,
+                    instance=args.instance, job=os.environ.get("GITHUB_JOB", ""), workflow=job_workflow(),
+                    repo=repo, home_repo=args.home_repo, tier=tier, signs_first=args.trusted_next_signing,
+                    nightly_runner=args.nightly_runner or args.trusted_next_signing, gui_token=args.gui_token,
+                    drain_bound=exclusive_capacity_wait(tier, args.nightly_runner or args.trusted_next_signing),
+                    trusted=bool(args.trusted_ref and args.trusted_repo)))
+                if append_github_env(f"{CLAIM_PYTHON_ENV}={sys.executable}\n"
+                                     f"{CLAIM_HOOK_ENV}={Path(__file__).resolve()}\n"
+                                     f"{CLAIM_STATE_ENV}={args.state_dir}\n"):
+                    note += "; it may give the Mac up while it sleeps (claim-release, claim-reacquire)"
+            except OSError as error:
+                note += f"; no claim record ({type(error).__name__}), so it keeps the Mac for the whole job"
         for root in held_roots(args.state_dir):
             settled = settle_root(int(root.rsplit("-", 1)[1]))
             if settled:
@@ -9866,6 +10191,8 @@ def main(argv: list[str] | None = None) -> int:
                   flush=True)
         else:
             print(f"{PREFIX}: {release_host_lock(args.state_dir)}", flush=True)
+            with contextlib.suppress(OSError):  # a sleeping signing job's record ends with the job (CLAIM_SLEEP)
+                claim_record_file(args.state_dir).unlink(missing_ok=True)
     skip_disk = False
     if args.phase == "job-completed":
         hook_dir = Path(__file__).resolve().parent

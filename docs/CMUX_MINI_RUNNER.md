@@ -950,6 +950,40 @@ there while it waits, and waits `SIGNING_DRAIN_WAIT_S` at most, like a nightly-s
 declare `yieldToExclusive` (section 2e1) so they start nothing while it waits or signs. The hook's bytes change, so
 cmux's `scripts/ci/glaeda-signing-hooks.txt` must list the new sha256 at nightly-next before the OTA.
 
+### A signing job that sleeps unclaimed (`claim-release`, `claim-reacquire`)
+
+A signing job that waits hours on Apple (cmux main's auto-resume notarization: `wait-and-staple`, `staple-outer`,
+the poll jobs) would hold the whole Mac for the whole wait. On a trusted-only runner (`--trusted-ref`) it can give
+the claim up while it sleeps and take it back to poll (the hook's `CLAIM_SLEEP`). job-started gives an exclusive job
+that holds every unit a claim record (`<state dir>/host-lock-holder-<runner>.claim.json`) and, through `$GITHUB_ENV`,
+`GLAEDA_CLAIM_PYTHON`, `GLAEDA_CLAIM_HOOK` and `GLAEDA_CLAIM_STATE_DIR`. A step then runs:
+
+```bash
+# after it deleted its keychain and key file, in a step that names no secret
+"$GLAEDA_CLAIM_PYTHON" "$GLAEDA_CLAIM_HOOK" claim-release --state-dir "$GLAEDA_CLAIM_STATE_DIR" \
+  --removed "$RUNNER_TEMP/AuthKey.p8" --removed "$HOME/Library/Keychains/build.keychain-db" \
+  --forbid-env ASC_API_KEY_P8_BASE64 --forbid-env ASC_API_KEY_ID
+# ... sleep ...
+"$GLAEDA_CLAIM_PYTHON" "$GLAEDA_CLAIM_HOOK" claim-reacquire --state-dir "$GLAEDA_CLAIM_STATE_DIR"
+```
+
+- `claim-release` lets go of every unit and token and the host lock only after it proves the credentials are gone:
+  every `--removed` path is absent, and no process of the job (its Runner.Worker and descendants, this step included)
+  has a `--forbid-env` variable in its environment. Any proof that fails or cannot be read keeps the claim (exit 1).
+  It writes `GLAEDA_JOB_CLAIM=released` to `$GITHUB_ENV`, which cmux's claim gate refuses. It refuses on a runner
+  without `--trusted-ref` (on a PR mini a PR job could rewrite the sleeping job's `_work` before it reacquires), and
+  while `<state dir>/claim-release.off` exists.
+- `claim-reacquire` waits as a fresh signing job does: the exclusive class, the job's own tier and SIGNS_FIRST, an
+  `admit.want` marker that holds every gate and yielding runner, then no process of an earlier job in any `_work`.
+  It waits the job's own drain bound (`--claim-wait S` to shorten it). On success it writes
+  `GLAEDA_JOB_CLAIM=exclusive` and `GLAEDA_HOOK_SHA256` again (exit 0); only then may the job read a credential.
+  Exit 1 means nothing is held.
+- While the record is `released` or `reacquiring`, another signing job's drain does not count the sleeping job's
+  own processes as an earlier job's, and the sleeper's reacquire never counts its own, so neither waits on the other.
+  A record whose Runner.Worker is gone is ignored and removed; job-completed and the runner's next job-started remove
+  it too. A cancelled or crashed job mid-sleep holds nothing: its holder went at release, and a killed reacquire's
+  marker goes with its pid.
+
 What the gate cannot see, and the operator must keep true:
 
 - The trust boundary is whoever can push to main: main's ruleset must block direct pushes, with no

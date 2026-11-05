@@ -2530,6 +2530,266 @@ class HookTest(unittest.TestCase):
             self.finish("n0")
         self.assertTrue(self.lock_free(), "the fleet build gets the host once the signer ends")
 
+    # ------------------------------------------------------------ CLAIM_SLEEP: an exclusive job sleeps unclaimed
+
+    SIGN_ENV = {"GITHUB_JOB": "sign-nightly-identity-legacy", "GITHUB_REF": "refs/heads/main",
+                "GITHUB_WORKFLOW_REF": "manaflow-ai/cmux/.github/workflows/nightly.yml@refs/heads/main"}
+    TRUSTED = ("--trusted-ref", "refs/heads/main", "--trusted-repo", "manaflow-ai/cmux")
+
+    def signer(self, runner: str, watch: int | None = None, *extra: str, env: dict | None = None,
+               trusted: bool = True) -> subprocess.CompletedProcess:
+        """A signing job of a main push on a trusted-only runner (cmux15's pool), admitted at once or refused."""
+        push = event(self.dir, f"main-push-{runner}", {"repository": {**CMUX, "default_branch": "main"},
+                                                      "ref": "refs/heads/main"})
+        args = ["--allowed-repo", "manaflow-ai/cmux", "--no-disk", "--state-dir", os.fspath(self.dir / "state"),
+                "--watch-pid", str(watch or os.getpid()), "--gui-wait", "0", "--capacity-units", "14",
+                "--capacity-dir", os.fspath(self.dir / "capacity"), *(self.TRUSTED if trusted else ()), *extra]
+        return self.run_hook("job-started", "push", push, *args, repo="manaflow-ai/cmux",
+                             env={**self.SIGN_ENV, "RUNNER_NAME": runner, **(env or {})})
+
+    def claim(self, verb: str, runner: str, *extra: str, watch: int | None = None,
+              env: dict | None = None) -> subprocess.CompletedProcess:
+        """A job step calling claim-release or claim-reacquire, for the job whose Runner.Worker is watch."""
+        return self.run_hook(verb, None, None, "--state-dir", os.fspath(self.dir / "state"),
+                             "--watch-pid", str(watch or os.getpid()), *extra, env={"RUNNER_NAME": runner, **(env or {})})
+
+    def orphan_in_work(self) -> int:
+        """A process working in a runner's _work whose parent is gone (so it descends from no test process, which a
+        hook started by this test counts as its own ancestor): the sleeping job's Runner.Worker stand-in."""
+        work = self.dir / "actions-runner-glaeda-7" / "_work" / "cmux" / "cmux"
+        work.mkdir(parents=True, exist_ok=True)
+        started = subprocess.run(["/bin/sh", "-c", "/bin/sleep 600 >/dev/null 2>&1 & echo $!"], cwd=work,
+                                 capture_output=True, text=True, check=True)
+        pid = int(started.stdout.strip())
+
+        def end() -> None:
+            with contextlib.suppress(OSError):
+                os.kill(pid, signal.SIGKILL)
+        self.addCleanup(end)
+        return pid
+
+    def whole_mini_free(self) -> bool:
+        capacity = self.dir / "capacity"
+        return all(hook.probe(capacity / f"{name}.token") for name in (*hook.GATEWAY_TOKENS, *hook.FAST_TOKENS, "gui")) \
+            and all(hook.probe(capacity / f"unit-{slot}") for slot in range(14)) and hook.exclusive_claim(capacity) is None
+
+    def test_claim_release_frees_the_mini_only_once_the_credentials_are_gone(self) -> None:
+        """CLAIM_SLEEP, release on sleep: a signing job that proves its key file is gone and that no process of the job
+        has the key in its environment gives up every unit and token; the gates listen again and another job is
+        admitted. Every failed or unreadable proof keeps the claim, and later steps are told GLAEDA_JOB_CLAIM=released,
+        which cmux's claim gate refuses."""
+        self.fleet()
+        capacity, state = self.dir / "capacity", self.dir / "state"
+        capacity.mkdir(parents=True, exist_ok=True)
+        github_env = self.dir / "github-env"
+        untrusted = self.signer("u0", None, trusted=False)
+        try:
+            self.assertEqual(untrusted.returncode, 0, untrusted.stdout + untrusted.stderr)
+            kept = self.claim("claim-release", "u0", "--forbid-env", "ASC_API_KEY_P8_BASE64")
+            self.assertEqual(kept.returncode, 1, kept.stdout + kept.stderr)
+            self.assertIn("claim release needs a trusted-only runner", kept.stderr)
+            self.assertFalse(self.whole_mini_free(), "a PR mini's signing job keeps the whole Mac while it sleeps")
+        finally:
+            self.finish("u0")
+        admitted = self.signer("s0", None, env={"GITHUB_ENV": os.fspath(github_env)})
+        try:
+            self.assertEqual(admitted.returncode, 0, admitted.stdout + admitted.stderr)
+            self.assertIn("it may give the Mac up while it sleeps (claim-release, claim-reacquire)", admitted.stdout)
+            told = github_env.read_text()
+            self.assertIn(f"GLAEDA_CLAIM_HOOK={HOOK.resolve()}\n", told)
+            self.assertIn(f"GLAEDA_CLAIM_STATE_DIR={state}\n", told)
+            self.assertIn(f"GLAEDA_CLAIM_PYTHON={sys.executable}\n", told)
+            record = hook.read_claim_record(hook.claim_record_file(state, "s0"))
+            self.assertEqual((record["state"], record["owner_pid"], record["capacity_units"]), ("held", os.getpid(), 14))
+            beside = self.job("swift-package-tests", "s1", 14, None, "--gui-wait", "0")
+            self.assertEqual(beside.returncode, 1, beside.stdout + beside.stderr)
+            key = self.dir / "AuthKey_TEST.p8"
+            key.write_text("-----BEGIN PRIVATE KEY-----\n")
+            nothing = self.claim("claim-release", "s0")
+            self.assertEqual(nothing.returncode, 2, nothing.stdout + nothing.stderr)
+            kept = self.claim("claim-release", "s0", "--removed", os.fspath(key))
+            self.assertEqual(kept.returncode, 1, kept.stdout + kept.stderr)
+            self.assertIn(f"still present, so the job keeps the whole Mac: {key}", kept.stderr)
+            self.assertFalse(self.whole_mini_free(), "a key file still on disk keeps the claim")
+            key.unlink()
+            proof = ("--removed", os.fspath(key), "--forbid-env", "ASC_API_KEY_P8_BASE64")
+            kept = self.claim("claim-release", "s0", *proof, env={"ASC_API_KEY_P8_BASE64": "c2VjcmV0LWtleQ=="})
+            self.assertEqual(kept.returncode, 1, kept.stdout + kept.stderr)
+            self.assertIn("still has a credential in its environment", kept.stderr)
+            self.assertIn("ASC_API_KEY_P8_BASE64", kept.stderr)
+            self.assertNotIn("c2VjcmV0LWtleQ==", kept.stdout + kept.stderr, "the value is never printed")
+            self.assertFalse(self.whole_mini_free(), "a credential still in a job process's environment keeps the claim")
+            (state / hook.CLAIM_RELEASE_OFF).touch()
+            kept = self.claim("claim-release", "s0", *proof)
+            self.assertEqual(kept.returncode, 1, kept.stdout + kept.stderr)
+            self.assertIn("claim release is off on this mini", kept.stderr)
+            (state / hook.CLAIM_RELEASE_OFF).unlink()
+            other_job = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+            self.addCleanup(lambda: (other_job.kill(), other_job.wait()))
+            stranger = self.claim("claim-release", "s0", *proof, watch=other_job.pid)
+            self.assertEqual(stranger.returncode, 1, "another job's step cannot release this job's claim")
+            self.assertIn("the claim record belongs to another job", stranger.stderr)
+            self.assertFalse(self.whole_mini_free())
+            released = self.claim("claim-release", "s0", *proof, env={"GITHUB_ENV": os.fspath(github_env)})
+            self.assertEqual(released.returncode, 0, released.stdout + released.stderr)
+            self.assertIn("released the whole Mac while this job sleeps", released.stdout)
+            self.assertTrue(github_env.read_text().endswith("GLAEDA_JOB_CLAIM=released\n"))
+            self.assertTrue(self.whole_mini_free(), "every unit and token is free")
+            self.assertTrue(self.lock_free(), "and the host lock")
+            self.assertFalse(hook.holder_file(state, "s0").exists())
+            self.assertEqual(hook.read_claim_record(hook.claim_record_file(state, "s0"))["state"], "released")
+            for scope in (hook.RunnerScope(14, 2, 2), hook.RunnerScope(14, 2, 2, fast=True),
+                          hook.RunnerScope(14, 2, 2, gui=True)):
+                self.assertIsNone(hook.mini_full(capacity, 14, scope), "the gates listen again")
+            other = self.job("swift-package-tests", "s1", 14, None, "--gui-wait", "0")
+            self.assertEqual(other.returncode, 0, other.stdout + other.stderr)
+            self.finish("s1")
+        finally:
+            self.finish("s0")
+        self.assertFalse(hook.claim_record_file(state, "s0").exists(), "job-completed removes the record")
+
+    def test_claim_reacquire_waits_its_turn_like_a_fresh_signing_job(self) -> None:
+        """CLAIM_SLEEP, reacquire: the sleeping job takes the whole Mac back under a fresh signing job's queue rules.
+        A signing job that began waiting before it goes first (arrival among SIGNS_FIRST jobs); an earlier nightly job
+        that is not a signing job does not (SIGNS_FIRST); its own process in its runner's _work never holds it up."""
+        self.fleet()
+        capacity, state = self.dir / "capacity", self.dir / "state"
+        capacity.mkdir(parents=True, exist_ok=True)
+        worker = self.orphan_in_work()
+        signer = self.nightly_signer("n0", "0", "--trusted-ref", "refs/heads/main", "--trusted-repo",
+                                     "manaflow-ai/cmux", "--trusted-next-signing", "--watch-pid", str(worker))
+        out, _ = signer.communicate(timeout=60)
+        try:
+            self.assertEqual(signer.returncode, 0, out)
+            record = hook.read_claim_record(hook.claim_record_file(state, "n0"))
+            self.assertEqual((record["tier"], record["signs_first"]), (hook.TIER_NIGHTLY, True))
+            released = self.claim("claim-release", "n0", "--removed", os.fspath(self.dir / "gone.p8"), watch=worker)
+            self.assertEqual(released.returncode, 0, released.stdout + released.stderr)
+            self.assertTrue(self.whole_mini_free())
+            earlier = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"])
+            self.addCleanup(lambda: (earlier.kill(), earlier.wait()))
+            marker = capacity / f"{hook.ADMIT_WANT}{earlier.pid}"
+            marker.write_text(json.dumps({"since": time.time() - 100, "wants": ["units"], "who": "an earlier signer",
+                                          "tier": hook.TIER_NIGHTLY, "class": hook.EXCLUSIVE_CLASS,
+                                          "signs_first": True}))
+            behind = self.claim("claim-reacquire", "n0", "--claim-wait", "1", watch=worker)
+            self.assertEqual(behind.returncode, 1, behind.stdout + behind.stderr)
+            self.assertIn("an earlier signer has waited longer here for units", behind.stderr)
+            self.assertIn("must not read a credential", behind.stderr)
+            self.assertTrue(all(hook.probe(capacity / f"{t}.token") for t in hook.GATEWAY_TOKENS),
+                            "behind the earlier signer it holds nothing")
+            self.assertEqual([w["pid"] for w in hook.admission_waiters(capacity)], [earlier.pid],
+                             "and its own marker is gone")
+            self.assertEqual(hook.read_claim_record(hook.claim_record_file(state, "n0"))["state"], "released")
+            marker.write_text(json.dumps({"since": time.time() - 100, "wants": ["units"],
+                                          "who": "an earlier nightly job", "tier": hook.TIER_NIGHTLY}))
+            github_env = self.dir / "github-env-n0-again"
+            back = self.claim("claim-reacquire", "n0", "--claim-wait", "10", watch=worker,
+                              env={"GITHUB_ENV": os.fspath(github_env)})
+            self.assertEqual(back.returncode, 0, back.stdout + back.stderr)
+            self.assertIn("holding the whole Mac again", back.stdout)
+            self.assertIn("holding 14/14 units+fast-0+fast-1+gui+gateway-0+gateway-1", back.stdout)
+            self.assertEqual(github_env.read_text(), "GLAEDA_JOB_CLAIM=exclusive\n"
+                             f"GLAEDA_HOOK_SHA256={hashlib.sha256(HOOK.read_bytes()).hexdigest()}\n")
+            self.assertEqual(hook.read_claim_record(hook.claim_record_file(state, "n0"))["state"], "held")
+            beside = self.job("swift-package-tests", "s1", 14, None, "--gui-wait", "0")
+            self.assertEqual(beside.returncode, 1, beside.stdout + beside.stderr)
+            again = self.claim("claim-reacquire", "n0", watch=worker)
+            self.assertEqual(again.returncode, 0, again.stdout + again.stderr)
+            self.assertIn("already holds the whole Mac", again.stdout)
+        finally:
+            self.finish("n0")
+        self.assertTrue(self.whole_mini_free())
+
+    def test_a_cancel_or_crash_mid_sleep_leaves_nothing_held(self) -> None:
+        """CLAIM_SLEEP: a sleeping job holds nothing, so a step killed while it waits to reacquire leaves no token and
+        no admit.want marker, and a job whose Runner.Worker dies mid-sleep leaves no record that any later admission
+        honours; a fresh signing job is then admitted at once."""
+        self.fleet()
+        capacity, state = self.dir / "capacity", self.dir / "state"
+        capacity.mkdir(parents=True, exist_ok=True)
+        worker = self.orphan_in_work()
+        admitted = self.signer("s0", worker)
+        self.assertEqual(admitted.returncode, 0, admitted.stdout + admitted.stderr)
+        released = self.claim("claim-release", "s0", "--forbid-env", "ASC_API_KEY_P8_BASE64", watch=worker)
+        self.assertEqual(released.returncode, 0, released.stdout + released.stderr)
+        busy = hook.lock_file(capacity / "unit-0", fcntl.LOCK_EX)  # a job started while it slept
+        self.assertIsNotNone(busy)
+        environ = {"PATH": "/usr/bin:/bin", "HOME": os.fspath(self.dir), "GLAEDA_RUNNER_TELEMETRY": "0",
+                   "GLAEDA_FLEET_DIR": os.fspath(self.dir / "fleet"), "RUNNER_NAME": "s0"}
+        step = subprocess.Popen([sys.executable, os.fspath(HOOK), "claim-reacquire", "--state-dir", os.fspath(state),
+                                 "--watch-pid", str(worker), "--claim-wait", "60"], env=environ,
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.addCleanup(lambda: (step.poll() is None and step.kill(), step.wait()))
+        marker = capacity / f"{hook.ADMIT_WANT}{step.pid}"
+        deadline = time.monotonic() + 30
+        while not marker.exists():
+            self.assertIsNone(step.poll(), "the reacquire must still be waiting")
+            self.assertLess(time.monotonic(), deadline, "the reacquire never started waiting")
+            time.sleep(0.05)
+        self.assertIn("waits for this mini to drain", hook.exclusive_claim(capacity) or "",
+                      "while it waits to reacquire, yielding runners hold off as for any signing job")
+        step.kill()  # the job is cancelled mid-reacquire
+        step.wait()
+        os.close(busy)
+        self.assertEqual(hook.admission_waiters(capacity), [], "a killed reacquire's marker goes with its pid")
+        self.assertFalse(marker.exists())
+        self.assertTrue(self.whole_mini_free(), "a killed reacquire holds nothing")
+        os.kill(worker, signal.SIGKILL)  # then the runner crashes: the job's Runner.Worker is gone mid-sleep
+        deadline = time.monotonic() + 10
+        while hook.pid_alive(worker) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        if hook.pid_alive(worker):
+            self.skipTest("nothing reaps an orphan on this host (a zombie keeps its pid)")
+        self.assertEqual(hook.sleeping_owners(state), set(), "a dead job's record is not honoured")
+        self.assertFalse(hook.claim_record_file(state, "s0").exists(), "and it is removed")
+        fresh = self.signer("s1")
+        try:
+            self.assertEqual(fresh.returncode, 0, fresh.stdout + fresh.stderr)
+        finally:
+            self.finish("s1")
+            self.finish("s0")
+        self.assertTrue(self.whole_mini_free())
+
+    def test_another_signing_job_claims_while_the_first_sleeps_and_each_drains_past_the_other(self) -> None:
+        """CLAIM_SLEEP, the drain: a sleeping job's own processes still run in its runner's _work. Another signing job
+        does not wait on them while the sleeper holds no claim (its record is released or reacquiring), and the
+        sleeper's reacquire never waits on its own: neither deadlocks on the other. A sleeper that holds its claim
+        again excuses nothing."""
+        self.fleet()
+        capacity, state = self.dir / "capacity", self.dir / "state"
+        capacity.mkdir(parents=True, exist_ok=True)
+        worker = self.orphan_in_work()
+        first = self.signer("s0", worker)
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        self.assertIn(worker, hook.stray_job_processes(self.dir, os.getpid()), "the sleeper's process is in _work")
+        self.assertEqual(hook.sleeping_owners(state), set(), "holding its claim, it is no sleeper")
+        released = self.claim("claim-release", "s0", "--forbid-env", "ASC_API_KEY_P8_BASE64", watch=worker)
+        self.assertEqual(released.returncode, 0, released.stdout + released.stderr)
+        self.assertEqual(hook.sleeping_owners(state), {worker})
+        self.assertNotIn(worker, hook.stray_job_processes(self.dir, os.getpid(), hook.sleeping_owners(state)))
+        try:
+            second = self.signer("s1")
+            self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
+            self.assertIn("holding 14/14 units", second.stdout)
+            self.assertNotIn("of an earlier job still run", second.stdout)
+            behind = self.claim("claim-reacquire", "s0", "--claim-wait", "1", watch=worker)
+            self.assertEqual(behind.returncode, 1, behind.stdout + behind.stderr)
+            self.assertIn("not reacquired", behind.stderr)
+            self.assertEqual(hook.read_claim_record(hook.claim_record_file(state, "s0"))["state"], "released")
+        finally:
+            self.finish("s1")
+        try:
+            back = self.claim("claim-reacquire", "s0", "--claim-wait", "10", watch=worker)
+            self.assertEqual(back.returncode, 0, back.stdout + back.stderr)
+            self.assertEqual(hook.sleeping_owners(state), set(), "holding again, its processes count as before")
+            third = self.signer("s2")
+            self.assertEqual(third.returncode, 1, third.stdout + third.stderr)
+        finally:
+            self.finish("s2")
+            self.finish("s0")
+        self.assertTrue(self.whole_mini_free())
+
     def signing_hooks(self, *shas: str) -> tuple[dict, str]:
         """A glaeda-signing-hooks.txt at manaflow-ai/cmux@SHA listing these hook shas, served through
         GLAEDA_SIGNING_HOOKS_URL as cmux's claim gate reads it, and the env that points a signer at it."""
