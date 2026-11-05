@@ -2672,6 +2672,11 @@ class HookTest(unittest.TestCase):
             self.assertIn("2 variables", hook.export_job_share(taken, cores=14))
         self.assertEqual(github_env.read_text(), "CMUX_CI_CPU_BUDGET=5\nCMAKE_BUILD_PARALLEL_LEVEL=5\n",
                          "a variable the runner sets, and git config the runner already counts, are left alone")
+        for partial in ({"GIT_CONFIG_KEY_0": "core.autocrlf"}, {"GIT_CONFIG_VALUE_0": "false"},
+                        {"GIT_CONFIG_PARAMETERS": "'core.quotepath'='off'"}):
+            with self.subTest(partial=partial), mock.patch.dict(os.environ, partial, clear=True):
+                self.assertNotIn(("GIT_CONFIG_COUNT", "1"), hook.job_share_env(5, os.environ),
+                                 "a partial GIT_CONFIG_* env is the runner's: no count or entry is written over it")
         github_env.unlink()
         for env, units in (({"GITHUB_ENV": os.fspath(github_env), "GLAEDA_JOB_SHARE": "0"}, 5),  # kill switch
                            ({"GITHUB_ENV": os.fspath(github_env)}, 14),  # exclusive: the whole mini

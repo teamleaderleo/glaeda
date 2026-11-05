@@ -2279,7 +2279,9 @@ def job_share_env(share: int, environ: Mapping[str, str]) -> list[tuple[str, str
     """The (name, value) pairs that cap a job at `share` cores, minus any the runner's environment already sets."""
     pairs = [(JOB_SHARE_ENV, str(share)), ("CARGO_BUILD_JOBS", str(share)),
              ("CMAKE_BUILD_PARALLEL_LEVEL", str(share)), ("MAKEFLAGS", f"-j{share}")]
-    if "GIT_CONFIG_COUNT" not in environ:  # git's pack.threads (index-pack and pack-objects) through env config
+    # git's pack.threads (index-pack and pack-objects) through env config, only when the runner sets no GIT_CONFIG_*
+    # at all: a stray GIT_CONFIG_KEY_0 or GIT_CONFIG_VALUE_0 without a count would otherwise be overwritten
+    if not any(name.startswith("GIT_CONFIG_") for name in environ):
         pairs += [("GIT_CONFIG_COUNT", "1"), ("GIT_CONFIG_KEY_0", "pack.threads"), ("GIT_CONFIG_VALUE_0", str(share))]
     return [(name, value) for name, value in pairs if name not in environ]
 
