@@ -8076,39 +8076,32 @@ BROKER_REST_MERGE = re.compile(r"^/?(?:https?://[^/]+/(?:api/v3/)?)?repos/[^/]+/
 
 def broker_merge_call(args: list[str]) -> bool:
     """Whether this gh call can merge a PR: `gh pr merge`, a non-GET `gh api .../pulls/N/merge`, or a `gh api graphql`
-    that names a merge mutation inline, in a file it reads (`--input F`, `-F k=@F`), or that reads stdin (unseen here,
-    so it is the guard's to judge: it saves stdin and reads it)."""
+    that names a merge mutation inline or reads any file or stdin (`--input`, `-F k=@F`). A file is never read here:
+    it could change between this read and gh's (router-review F2 on #1878), so the guard, which snapshots it before it
+    judges (merge_hold.snapshot), gets every such call. A `?query` suffix on the endpoint is ignored (F1)."""
     words, method, _seen, _values = broker_words(args)
     if words[:2] == ["pr", "merge"]:
         return True
     if words[:1] != ["api"] or len(words) < 2:
         return False
-    if method != "GET" and BROKER_REST_MERGE.match(words[1]):
+    endpoint = words[1].split("?", 1)[0].split("#", 1)[0]
+    if method != "GET" and BROKER_REST_MERGE.match(endpoint):
         return True
-    if not AUDIT_GRAPHQL_RE.match(words[1]):
+    if not AUDIT_GRAPHQL_RE.match(endpoint):
         return False
-    texts = []
     for i, arg in enumerate(args):
+        if arg == "--input" or arg.startswith("--input="):
+            return True
         value = None
-        if arg == "--input" and i + 1 < len(args):
-            value = "@" + args[i + 1]
-        elif arg.startswith("--input="):
-            value = "@" + arg.split("=", 1)[1]
-        elif arg in ("-F", "--field") and i + 1 < len(args):
+        if arg in ("-F", "--field") and i + 1 < len(args):
             value = args[i + 1].partition("=")[2]
         elif arg.startswith("--field="):
             value = arg[len("--field="):].partition("=")[2]
         elif arg.startswith("-F") and len(arg) > 2:
             value = arg[2:].partition("=")[2]
         if value and value.startswith("@"):
-            if value == "@-":
-                return True
-            try:
-                texts.append(Path(value[1:]).read_text(errors="replace"))
-            except OSError:
-                return True  # gh will fail on it too; the guard says so
-        texts.append(arg)
-    return bool(BROKER_MERGE_MUTATIONS.search("\n".join(texts)))
+            return True
+    return bool(BROKER_MERGE_MUTATIONS.search("\n".join(args)))
 
 
 def broker_merge_handoff(args: list[str]) -> int | None:

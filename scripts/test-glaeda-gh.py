@@ -7417,6 +7417,8 @@ class BrokerMergeGuardTest(BrokerBase):
         query.close()
         gql = self.home / "q.graphql"
         gql.write_text("mutation($id: ID!) { enablePullRequestAutoMerge(input: {pullRequestId: $id}) { clientMutationId } }")
+        (self.home / "benign.graphql").write_text("query { viewer { login } }")
+        (self.home / "benign.json").write_text(json.dumps({"query": "query { viewer { login } }"}))
         for args in (["pr", "merge", "3589", "-R", "o/r", "--squash", "--match-head-commit", "a" * 40],
                      ["api", "--method", "PUT", "repos/o/r/pulls/3589/merge", "-f", "sha=" + "a" * 40],
                      ["api", "-X", "PUT", "/repos/o/r/pulls/3589/merge/", "-f", "sha=" + "a" * 40],
@@ -7425,7 +7427,12 @@ class BrokerMergeGuardTest(BrokerBase):
                       "expectedHeadOid: \"" + "a" * 40 + "\"}) { clientMutationId } }"],
                      ["api", "graphql", "--input", query.name],
                      ["api", "graphql", "-F", "query=@" + str(gql), "-f", "id=X"],
-                     ["api", "graphql", "--input", "-"]):
+                     ["api", "graphql", "--input", "-"],
+                     ["api", "-X", "PUT", "repos/o/r/pulls/3589/merge?x=y", "-f", "sha=" + "a" * 40],  # F1 on #1878
+                     ["api", "graphql?x=y", "-f", "query=mutation { mergePullRequest(input: {}) { clientMutationId } }"],
+                     # F2 on #1878: a file is the guard's to read (it snapshots it), whatever it says now
+                     ["api", "graphql", "-F", "query=@" + str(self.home / "benign.graphql")],
+                     ["api", "graphql", "--input=" + str(self.home / "benign.json")]):
             with self.subTest(args=args):
                 code, _err, path, passed = self.route(args)
                 self.assertIsNone(code)
