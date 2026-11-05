@@ -13,6 +13,7 @@ import contextlib
 import copy
 import datetime
 import fcntl
+import functools
 import hashlib
 import importlib.machinery
 import importlib.util
@@ -894,6 +895,33 @@ class HookTest(unittest.TestCase):
                                            "--trusted-ref", ref, "--trusted-repo", "manaflow-ai/cmux", *flags,
                                            "--no-disk", repo="manaflow-ai/cmux", env=environ)
                     self.assertEqual(result.returncode == 0, admitted, result.stdout + result.stderr)
+
+    def test_classic_auto_resume_hosted_polls_rank_no_tier_on_any_runner(self) -> None:
+        """AUTO_RESUME_HOSTED_JOBS get no FEED_FIRST tier, so a pool runner cannot prioritise a 6 h Apple wait.
+
+        cmux runs poll, poll-outer and poll-stapled on ubuntu, and the two runner classes that check trust
+        refuse them (trusted_refusal here, glaeda-nightly-only-admit's refusal in its own suite). A general
+        pool runner applies neither check, so if one ever reached a mini it would be admitted; job_tier must
+        then not rank it, or FEED_FIRST would put a job whose timeout is the notary queue (90, 360, 360
+        minutes) ahead of every PR job on that mini. The jobs that do work with a key still rank nightly.
+        """
+        ref = "refs/heads/main"
+        workflow_ref = f"manaflow-ai/cmux/.github/workflows/auto-resume-nightly-notarization.yml@{ref}"
+        event = {"action": "completed", "repository": {**CMUX, "default_branch": "main"},
+                 "workflow_run": {"path": ".github/workflows/nightly.yml", "head_branch": "main", "event": "push",
+                                  "head_repository": dict(CMUX), "repository": dict(CMUX)}}
+        tier = functools.partial(hook.job_tier, "workflow_run", ref, "manaflow-ai/cmux", event, workflow_ref)
+        # the payload is the admitted one, so a "" below is the job's own doing and not a refused payload
+        self.assertIsNone(hook.auto_resume_refusal("workflow_run", ref, "manaflow-ai/cmux", event, workflow_ref))
+        for job in hook.AUTO_RESUME_HOSTED_JOBS:
+            with self.subTest(hosted=job):
+                self.assertEqual(tier(job), "", "an Apple-queue wait never outranks a PR job")
+                self.assertEqual(hook.job_class(job, "manaflow-ai/cmux", hook.DEFAULT_HOME_REPO,
+                                                hook.AUTO_RESUME_FILE)[0], "light",
+                                 "and it costs a light job, not a compile with a canonical root")
+        for job in (*hook.AUTO_RESUME_SIGNING_JOBS, *hook.AUTO_RESUME_LIGHT_JOBS):
+            with self.subTest(works=job):
+                self.assertEqual(tier(job), hook.TIER_NIGHTLY, "a job that does the nightly's work still ranks")
 
     def test_classic_auto_resume_refuses_malformed_source_metadata(self) -> None:
         """AUTO_RESUME fails closed on every missing, null or wrong-typed field of the triggering run.

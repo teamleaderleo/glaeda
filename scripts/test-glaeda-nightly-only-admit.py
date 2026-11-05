@@ -147,12 +147,17 @@ class RefusalTest(unittest.TestCase):
         for name in ("staple-outer", "staple-stapled", "publish"):
             with self.subTest(signing_now=name):
                 self.assertIn("signing job", self.why(**resume(name)))
-        # AUTO_RESUME_HOSTED_JOBS keep their hosted route: no glaeda runner admits them, this one included
+        # AUTO_RESUME_HOSTED_JOBS keep their hosted route: no glaeda runner admits them, this one included. The
+        # refusal now comes from the tier, not the job list: job_tier gives them no tier at all (an Apple-queue wait
+        # must not outrank a PR job on a general pool runner either), and a nightly-only runner takes nightly work
+        # only, so they are refused one step earlier than the other non-key-free jobs.
         for name in hook.AUTO_RESUME_HOSTED_JOBS:
             with self.subTest(poll=name):
                 why = self.why(**resume(name))
                 self.assertIsNotNone(why)
-                self.assertIn("preflight, verify-stapled", why)
+                self.assertIn("this job is not nightly work", why)
+                self.assertEqual(hook.job_tier("workflow_run", hook.AUTO_RESUME_REF, REPO,
+                                               resume(name)["event"], resume(name)["workflow_ref"], name), "")
         for name in ("decide",):
             with self.subTest(other=name):
                 self.assertIsNotNone(self.why(**resume(name)))
