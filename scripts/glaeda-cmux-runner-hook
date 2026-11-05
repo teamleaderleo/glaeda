@@ -1776,6 +1776,28 @@ def nightly_slot_refusal(tier: str) -> str | None:
             "main's nightly-next canary and launch smoke, and the Release compile that gates nightly-next's promotion)")
 
 
+def hosted_route_refusal(event_name: str | None, ref: str | None, repository: str | None, event: Any,
+                         workflow_ref: str | None, job: str | None) -> str | None:
+    """Why no glaeda runner takes this job whatever its class, or None. Pure.
+
+    AUTO_RESUME_HOSTED_JOBS keep cmux's hosted route. Each only asks Apple whether a submission is done, so its
+    timeout is the notary queue rather than work (90, 360 and 360 minutes), and a runner that took one would hold a
+    slot on the one nightly runner for hours without doing any of the nightly's work. trusted_refusal and
+    glaeda-nightly-only-admit already refuse them, and job_tier gives them no tier so they cannot outrank a PR job,
+    but neither of those covers a general pool runner, which applies no trust check at all. This does, so the
+    invariant holds for every class: cmux routes these three to ubuntu, and if that ever changed by accident the job
+    is refused here and requeued rather than quietly parking a mini.
+
+    Scoped to main's auto-resume continuation by auto_resume_refusal, so a job that merely shares one of those names
+    in another workflow is untouched.
+    """
+    if job in AUTO_RESUME_HOSTED_JOBS and auto_resume_refusal(event_name, ref, repository, event,
+                                                              workflow_ref) is None:
+        return (f"{AUTO_RESUME_FILE}'s {job} keeps its hosted route: it only waits on Apple's notary queue, so no "
+                f"glaeda runner takes one ({', '.join(AUTO_RESUME_HOSTED_JOBS)})")
+    return None
+
+
 def job_tier(event_name: str | None, ref: str | None, repository: str | None, event: Any,
              workflow_ref: str | None, job: str | None) -> str:
     """This job's admission tier (FEED_FIRST): TIER_NIGHTLY, TIER_DEV or "". Pure. Only merged workflow code on a
@@ -9728,6 +9750,11 @@ def main(argv: list[str] | None = None) -> int:
             return refused(f"the gateway runner takes only thin cmux-ci client jobs ({gateway_jobs_note()}); "
                            f"{job_workflow() or 'an unknown workflow'} {os.environ.get('GITHUB_JOB') or 'job'} "
                            "is not one")
+        # every class, the general pool included: a job cmux routes to a hosted runner is never taken here
+        if why := hosted_route_refusal(os.environ.get("GITHUB_EVENT_NAME"), os.environ.get("GITHUB_REF"),
+                                       os.environ.get("GITHUB_REPOSITORY"), event,
+                                       os.environ.get("GITHUB_WORKFLOW_REF"), os.environ.get("GITHUB_JOB")):
+            return refused(why)
         if args.nightly_runner:
             why = nightly_slot_refusal(job_tier(os.environ.get("GITHUB_EVENT_NAME"), os.environ.get("GITHUB_REF"),
                                                 os.environ.get("GITHUB_REPOSITORY"), event,

@@ -896,6 +896,51 @@ class HookTest(unittest.TestCase):
                                            "--no-disk", repo="manaflow-ai/cmux", env=environ)
                     self.assertEqual(result.returncode == 0, admitted, result.stdout + result.stderr)
 
+    def test_classic_auto_resume_hosted_polls_are_refused_on_every_runner_class(self) -> None:
+        """No glaeda runner class takes poll, poll-outer or poll-stapled, the general pool included.
+
+        An empty job_tier only stops them outranking a PR job; it refuses nothing on the common path, and a
+        general pool runner applies no trust check, so without hosted_route_refusal one routed here by accident
+        would be admitted and hold a slot for as long as Apple's notary queue kept it (90, 360, 360 minutes).
+        """
+        ref = "refs/heads/main"
+        workflow_ref = f"manaflow-ai/cmux/.github/workflows/auto-resume-nightly-notarization.yml@{ref}"
+        source = {"path": ".github/workflows/nightly.yml", "head_branch": "main", "event": "push",
+                  "head_repository": dict(CMUX), "repository": dict(CMUX)}
+        payload = {"action": "completed", "repository": {**CMUX, "default_branch": "main"},
+                   "workflow_run": dict(source)}
+        env = {"GITHUB_WORKFLOW_REF": workflow_ref, "GITHUB_REF": ref, "GITHUB_RUN_ATTEMPT": "1"}
+        path = event(self.dir, "auto-resume-hosted", payload)
+        for job in hook.AUTO_RESUME_HOSTED_JOBS:
+            # the common path: a plain pool runner, no trust flag of any kind
+            with self.subTest(general_pool=job):
+                got = self.run_hook("job-started", "workflow_run", path, "--allowed-repo", "manaflow-ai/cmux",
+                                    "--no-disk", repo="manaflow-ai/cmux",
+                                    env={**env, "GITHUB_JOB": job})
+                self.assertNotEqual(got.returncode, 0, got.stdout + got.stderr)
+                self.assertIn("keeps its hosted route", got.stdout)
+            # and the trusted signing runner, which refuses it for its own reason as well
+            with self.subTest(trusted_signing=job):
+                self.assertIsNotNone(hook.trusted_refusal(
+                    "workflow_run", ref, "manaflow-ai/cmux", payload, ref, "manaflow-ai/cmux",
+                    trusted_next_signing=True, workflow_ref=workflow_ref, job=job, run_attempt="1"))
+            # the pure gate, for every class at once
+            with self.subTest(any_class=job):
+                self.assertIsNotNone(hook.hosted_route_refusal("workflow_run", ref, "manaflow-ai/cmux", payload,
+                                                               workflow_ref, job))
+        # a job that does the nightly's work is untouched on the common path, so this refuses by name and payload
+        # rather than refusing the whole workflow
+        for job in (*hook.AUTO_RESUME_SIGNING_JOBS, *hook.AUTO_RESUME_LIGHT_JOBS):
+            with self.subTest(works=job):
+                self.assertIsNone(hook.hosted_route_refusal("workflow_run", ref, "manaflow-ai/cmux", payload,
+                                                            workflow_ref, job))
+        # and a job merely sharing the name in another workflow is untouched: the scope is main's auto-resume copy
+        for other in (f"manaflow-ai/cmux/.github/workflows/nightly.yml@{ref}",
+                      f"manaflow-ai/cmux/.github/workflows/auto-resume-nightly-notarization.yml@refs/heads/other"):
+            with self.subTest(elsewhere=other):
+                self.assertIsNone(hook.hosted_route_refusal("workflow_run", ref, "manaflow-ai/cmux", payload,
+                                                            other, "poll"))
+
     def test_classic_auto_resume_hosted_polls_rank_no_tier_on_any_runner(self) -> None:
         """AUTO_RESUME_HOSTED_JOBS get no FEED_FIRST tier, so a pool runner cannot prioritise a 6 h Apple wait.
 

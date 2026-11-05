@@ -974,8 +974,9 @@ copy (`GITHUB_WORKFLOW_REF` `...@refs/heads/main`, `GITHUB_REF` main, a dispatch
 `workflow_run` must name exactly `manaflow-ai/cmux`'s `.github/workflows/nightly.yml` run on `main` (head and base
 repository `manaflow-ai/cmux`, source event push, schedule or dispatch, no pull request), with action `completed` and
 main as the default branch (`auto_resume_refusal`). Every job of that workflow checks out `refs/heads/main` and reads
-only the source run's artifacts, which `preflight` checks through the API first. The jobs rank as nightly
-(`job_tier`).
+only the source run's artifacts, which `preflight` checks through the API first. The jobs that do the nightly's
+work rank as nightly (`job_tier`); its three Apple-queue poll jobs rank no tier and are refused on every runner
+class (below).
 
 - On a `--trusted-next-signing` runner, and only there, the jobs that hold a release key (Apple certificate,
   notary API key, Sparkle key, R2 key or the release app key) *and* do work with it: `AUTO_RESUME_SIGNING_JOBS`,
@@ -983,12 +984,13 @@ only the source run's artifacts, which `preflight` checks through the API first.
   - `wait-and-staple`, `staple-outer`, `staple-stapled`, `publish`, `generate-deltas`, `republish-deltas`
     (`AUTO_RESUME_SIGNING_JOBS`): they staple, sign or publish, so each is a `SIGNING_JOBS` entry, exclusive
     class, one drain of the mini.
-- `poll`, `poll-outer` and `poll-stapled` (`AUTO_RESUME_HOSTED_JOBS`) keep their hosted route in cmux, and are
-  refused by `trusted_refusal` on a `--trusted-next-signing` runner and by `glaeda-nightly-only-admit` on a
-  nightly-only one, so no runner cmux routes this workflow to admits one. A general pool runner applies neither
-  check, as for any other job, which is why they also carry a `light` class: were one to reach a pool mini it
-  would hold 2 units and no root, not a compile's 5 and a canonical root. `job_tier` also gives them no tier, so
-  such a job cannot outrank a PR job on that runner either.
+- `poll`, `poll-outer` and `poll-stapled` (`AUTO_RESUME_HOSTED_JOBS`) keep their hosted route in cmux, and no
+  glaeda runner class takes one. `hosted_route_refusal` refuses them on the common path, before any class check,
+  so the general pool is covered too, not only the classes that check trust (`trusted_refusal` on a
+  `--trusted-next-signing` runner, `glaeda-nightly-only-admit` on a nightly-only one, both of which also refuse
+  them). `job_tier` gives them no tier, so they cannot outrank a PR job, and their `light` class keeps the cost
+  at 2 units and no root. Belt and braces on purpose: cmux routes all three to ubuntu today, and if that ever
+  changed by accident the job is refused and requeued rather than parking a runner for hours.
   They hold the notary key, but each only asks Apple whether a submission is done, so its timeout is Apple's
   queue rather than work: 90, 360 and 360 minutes. No class puts them on the one nightly runner without stopping
   the nightly.
