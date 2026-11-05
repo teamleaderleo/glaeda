@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import contextlib
+import copy
 import fcntl
 import importlib.machinery
 import importlib.util
@@ -118,6 +119,8 @@ class FakeGitHub:
         self.job_steps: dict[int, list] = {}  # job (check run) database id -> steps, for GET .../actions/jobs/ID
         self.base_gone = False  # the base branch was deleted: its rules and protection answer 404
         self.heads: dict[tuple[str, str, str], list] = {}  # (owner, repo, sha) -> that commit's check contexts
+        # sha -> that commit's check suites [{"id", "latest": runs in its newest attempt, "runs": every attempt's}]
+        self.suites: dict[str, list] = {}
         self.rate_limit_calls = 0  # GET /rate_limit: free, so it is counted separately
         self.throttle: dict[str, tuple[int, dict, bytes]] = {}  # "rest"|"graphql" -> the answer every read gets
         self.no_protection_feature = False  # a private repository's plan: rules and protection answer 403
@@ -137,6 +140,15 @@ class FakeGitHub:
             v, data, errors = doc["variables"], {}, []
             self.graphql_remaining -= 1
             data["rateLimit"] = {"limit": 5000, "remaining": self.graphql_remaining, "resetAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(NOW + 1800)), "cost": 1}
+            if "suites" in v:  # every attempt's check runs of some suites, by id
+                by_id = {suite["id"]: suite for suites in self.suites.values() for suite in suites}
+                data["suiteRuns"] = [None if i not in by_id else {
+                    "id": i, "conclusion": by_id[i].get("conclusion", "STARTUP_FAILURE"), "app": {"slug": "github-actions"},
+                    "workflowRun": {"databaseId": by_id[i].get("run", 1), "workflow": {"name": "CI", "databaseId": 77}},
+                    "checkRuns": {"pageInfo": {"hasNextPage": False},
+                                  "nodes": [{k: v for k, v in r.items() if k not in ("__typename", "checkSuite")}
+                                            for r in by_id[i]["runs"]]}} for i in v["suites"]]
+                return 200, self.rate("graphql", self.graphql_remaining), json.dumps({"data": data}).encode()
             if "nodes(ids:" in doc["query"]:
                 self.step_queries.append(list(v["ids"]))
                 data["nodes"] = [{"id": i, "steps": {"nodes": self.steps[i]}} if i in self.steps else None
@@ -162,7 +174,7 @@ class FakeGitHub:
                     start = int(after or 0)
                     node = None if nodes is None else {"statusCheckRollup": {"contexts": {
                         "pageInfo": {"hasNextPage": start + 100 < len(nodes), "endCursor": str(start + 100)},
-                        "nodes": nodes[start:start + 100]}}}
+                        "nodes": nodes[start:start + 100]}}, **self.suite_counts(sha)}
                     data["repository" if alias is None else alias] = {"object": node}
                 out = {"data": data}
                 return 200, self.rate("graphql", self.graphql_remaining), json.dumps(out).encode()
@@ -173,6 +185,9 @@ class FakeGitHub:
                 node = table.get((v[f"o{i}"], v[f"r{i}"], v[f"n{i}"]))
                 if comments and node is not None:  # comments(last: COMMENTS_LAST)
                     node = {**node, "comments": {**node["comments"], "nodes": node["comments"]["nodes"][-gg.COMMENTS_LAST:]}}
+                if not comments and node is not None and node["headRefOid"] in self.suites:
+                    node = copy.deepcopy(node)
+                    node["commits"]["nodes"][0]["commit"].update(self.suite_counts(node["headRefOid"]))
                 data[f"{alias}{i}"] = {field: node}
                 if node is None:
                     errors.append({"type": "NOT_FOUND", "path": [f"{alias}{i}", field], "message": "Could not resolve"})
@@ -217,6 +232,14 @@ class FakeGitHub:
             return 304, self.rate("core", self.rest_remaining), b""
         self.rest_remaining -= 1
         return 200, {**self.rate("core", self.rest_remaining), "etag": etag}, json.dumps(payload).encode()
+
+    def suite_counts(self, sha: str) -> dict:
+        """A commit's checkSuites as SUITE_ATTEMPTS asks: each suite's check runs in its newest attempt and in all."""
+        if sha not in self.suites:
+            return {}
+        return {"checkSuites": {"pageInfo": {"hasNextPage": False}, "nodes": [
+            {"id": suite["id"], "latest": {"totalCount": suite["latest"]}, "every": {"totalCount": len(suite["runs"])}}
+            for suite in self.suites[sha]]}}
 
     def rest_issue(self, parts: list[str], path: str) -> Any:
         """The REST view of the GraphQL issue nodes in self.issues: the issue, or a page of its comments."""
@@ -5288,6 +5311,59 @@ class HeadChecksTest(Base):
         entry = gg.read_cache(self.key(SHA_A))
         self.assertIsNone(entry["data"])
         self.assertIn("more than", entry["error"])
+
+    # cmux#35906 merged as 633d5e38 pinned at e1d1894a with its "publish tree-addressed cmux-tui" red in run
+    # 41931705470 unexcused: two reruns ended in startup_failure with no jobs, and statusCheckRollup (each suite's newest
+    # attempt only) dropped the red. A check reads as its last real attempt left it; a startup_failure is no result.
+    def red_publish(self, run_id: int = 1, conclusion: str = "FAILURE") -> dict:
+        return {**check_run("publish", "COMPLETED", conclusion), "id": f"CR{run_id}", "databaseId": run_id}
+
+    def test_a_red_under_startup_failure_reruns_still_reads_red(self) -> None:
+        self.gh.heads[("o", "r", SHA_A)] = [check_run("CI / build")]
+        self.gh.suites[SHA_A] = [{"id": "S1", "latest": 0, "runs": [self.red_publish()]}]
+        gg.register(self.key(SHA_A), consumer="autoland")
+        self.daemon.tick(NOW)
+        entry = gg.read_cache(self.key(SHA_A))
+        self.assertIsNone(entry.get("error"))
+        self.assertEqual(entry["data"]["found"]["CI / publish"], ["completed", "failure"])
+
+    def test_a_red_then_a_real_green_rerun_reads_green(self) -> None:
+        # the green attempt is the suite's newest real one: GitHub's rollup shows it, and nothing more is read
+        self.gh.heads[("o", "r", SHA_A)] = [check_run("CI / build"), self.red_publish(2, "SUCCESS")]
+        self.gh.suites[SHA_A] = [{"id": "S1", "latest": 2, "runs": [self.red_publish(1), self.red_publish(2, "SUCCESS")]}]
+        gg.register(self.key(SHA_A), consumer="autoland")
+        self.daemon.tick(NOW)
+        found = gg.read_cache(self.key(SHA_A))["data"]["found"]
+        self.assertEqual(found["check / publish"], ["completed", "success"])
+        self.assertNotIn("CI / publish", found)
+        # red, then green, then a startup_failure: the green is still the last real attempt
+        self.gh.heads[("o", "r", SHA_B)] = [check_run("CI / build")]
+        self.gh.suites[SHA_B] = [{"id": "S2", "latest": 0, "runs": [self.red_publish(1), self.red_publish(2, "SUCCESS")]}]
+        gg.register(self.key(SHA_B), consumer="autoland")
+        self.daemon.tick(NOW)
+        self.assertEqual(gg.read_cache(self.key(SHA_B))["data"]["found"]["CI / publish"], ["completed", "success"])
+
+    def test_a_startup_failure_alone_is_no_result_not_green(self) -> None:
+        self.gh.heads[("o", "r", SHA_A)] = []
+        self.gh.suites[SHA_A] = [{"id": "S1", "latest": 0, "runs": []}]
+        gg.register(self.key(SHA_A), consumer="autoland")
+        self.daemon.tick(NOW)
+        data = gg.read_cache(self.key(SHA_A))["data"]
+        self.assertEqual(data["found"], {})
+        self.assertFalse(data["settled"])
+        self.assertEqual(len(self.gh.gql_calls()), 1)  # nothing ran in any attempt: nothing more to read
+
+    def test_a_pr_with_a_red_under_startup_failure_reruns_is_not_green(self) -> None:
+        node = pr_node(1, rollup="SUCCESS", checks=[check_run("build")])
+        self.gh.prs[("o", "r", 1)] = node
+        self.gh.suites[node["headRefOid"]] = [{"id": "S1", "latest": 0, "runs": [self.red_publish()]}]
+        key = gg.parse_key("pr", "o/r#1")
+        gg.register(key)
+        self.daemon.tick(NOW)
+        data = gg.read_cache(key)["data"]
+        self.assertIn(("publish", "FAILURE"), [(c["name"], c["conclusion"]) for c in data["checks"]])
+        self.assertEqual(gg.check_verdict(data, "green"), gg.EXIT_FAIL)
+        self.assertEqual(gg.check_verdict({**data, "checksTruncated": True}, "green"), gg.EXIT_FAIL)
 
     def test_an_unknown_commit_is_missing_not_pending(self) -> None:
         gg.register(self.key("d" * 40), consumer="autoland")
