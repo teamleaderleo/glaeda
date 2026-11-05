@@ -896,6 +896,65 @@ class HookTest(unittest.TestCase):
                                            "--no-disk", repo="manaflow-ai/cmux", env=environ)
                     self.assertEqual(result.returncode == 0, admitted, result.stdout + result.stderr)
 
+    def test_classic_auto_resume_hosted_polls_are_refused_though_the_source_run_is_malformed(self) -> None:
+        """A poll of exactly this workflow is refused on the common path whatever its triggering run looks like.
+
+        The refusal is scoped by the workflow's own identity, not by auto_resume_refusal: that one also validates
+        the triggering run's metadata, which says nothing about which job this is. While it gated this refusal, a
+        poll of exactly this workflow whose source run was malformed got no refusal here, and a general pool runner
+        applies no other check, so a bad payload bought a mini-long park on Apple's notary queue.
+        """
+        ref = "refs/heads/main"
+        workflow_ref = f"manaflow-ai/cmux/.github/workflows/auto-resume-nightly-notarization.yml@{ref}"
+        env = {"GITHUB_WORKFLOW_REF": workflow_ref, "GITHUB_REF": ref, "GITHUB_RUN_ATTEMPT": "1"}
+        good = {"path": ".github/workflows/nightly.yml", "head_branch": "main", "event": "push",
+                "head_repository": dict(CMUX), "repository": dict(CMUX)}
+        # each of these makes auto_resume_refusal refuse, so none of them may decide this one
+        bad_runs = {
+            "a source path that is not the nightly": {**good, "path": ".github/workflows/something-else.yml"},
+            "a source branch that is not main": {**good, "head_branch": "topic"},
+            "a source event that is not a push": {**good, "event": "pull_request"},
+            "a forked source repository": {**good, "head_repository": {"full_name": "someone/cmux"}},
+            "no source run at all": None,
+            "a source run of the wrong type": "not-a-dict",
+        }
+        for name, run in bad_runs.items():
+            payload = {"action": "completed", "repository": {**CMUX, "default_branch": "main"}}
+            if run is not None:
+                payload["workflow_run"] = run
+            path = event(self.dir, f"auto-resume-malformed-{abs(hash(name))}", payload)
+            for job in hook.AUTO_RESUME_HOSTED_JOBS:
+                with self.subTest(source=name, job=job):
+                    self.assertIsNotNone(hook.auto_resume_refusal("workflow_run", ref, "manaflow-ai/cmux",
+                                                                  payload, workflow_ref),
+                                         "this fixture is meant to be a run auto_resume_refusal refuses")
+                    # the pure gate decides on identity alone, so it refuses whatever the payload holds
+                    self.assertIsNotNone(hook.hosted_route_refusal(ref, workflow_ref, job))
+                    # and on the common path the job is refused, by this guard or by an earlier one that
+                    # rejects the malformed payload outright; either way no mini takes it
+                    got = self.run_hook("job-started", "workflow_run", path, "--allowed-repo", "manaflow-ai/cmux",
+                                        "--no-disk", repo="manaflow-ai/cmux", env={**env, "GITHUB_JOB": job})
+                    self.assertNotEqual(got.returncode, 0, got.stdout + got.stderr)
+                    self.assertIn("refused", got.stdout)
+
+    def test_hosted_route_refusal_leaves_another_workflows_job_of_the_same_name_alone(self) -> None:
+        # the scope is the workflow's identity, so a job named "poll" elsewhere is still admitted
+        ref = "refs/heads/main"
+        for name, (r, wf) in {
+            "another workflow on main": (ref, f"manaflow-ai/cmux/.github/workflows/ci.yml@{ref}"),
+            "this workflow off main": ("refs/heads/topic",
+                                       "manaflow-ai/cmux/.github/workflows/"
+                                       "auto-resume-nightly-notarization.yml@refs/heads/topic"),
+            "no workflow ref": (ref, None),
+        }.items():
+            for job in hook.AUTO_RESUME_HOSTED_JOBS:
+                with self.subTest(case=name, job=job):
+                    self.assertIsNone(hook.hosted_route_refusal(r, wf, job))
+        for job in hook.AUTO_RESUME_HOSTED_JOBS:
+            with self.subTest(exact=job):
+                self.assertIsNotNone(hook.hosted_route_refusal(
+                    ref, f"manaflow-ai/cmux/.github/workflows/auto-resume-nightly-notarization.yml@{ref}", job))
+
     def test_classic_auto_resume_hosted_polls_are_refused_on_every_runner_class(self) -> None:
         """No glaeda runner class takes poll, poll-outer or poll-stapled, the general pool included.
 
@@ -926,20 +985,17 @@ class HookTest(unittest.TestCase):
                     trusted_next_signing=True, workflow_ref=workflow_ref, job=job, run_attempt="1"))
             # the pure gate, for every class at once
             with self.subTest(any_class=job):
-                self.assertIsNotNone(hook.hosted_route_refusal("workflow_run", ref, "manaflow-ai/cmux", payload,
-                                                               workflow_ref, job))
+                self.assertIsNotNone(hook.hosted_route_refusal(ref, workflow_ref, job))
         # a job that does the nightly's work is untouched on the common path, so this refuses by name and payload
         # rather than refusing the whole workflow
         for job in (*hook.AUTO_RESUME_SIGNING_JOBS, *hook.AUTO_RESUME_LIGHT_JOBS):
             with self.subTest(works=job):
-                self.assertIsNone(hook.hosted_route_refusal("workflow_run", ref, "manaflow-ai/cmux", payload,
-                                                            workflow_ref, job))
+                self.assertIsNone(hook.hosted_route_refusal(ref, workflow_ref, job))
         # and a job merely sharing the name in another workflow is untouched: the scope is main's auto-resume copy
         for other in (f"manaflow-ai/cmux/.github/workflows/nightly.yml@{ref}",
                       f"manaflow-ai/cmux/.github/workflows/auto-resume-nightly-notarization.yml@refs/heads/other"):
             with self.subTest(elsewhere=other):
-                self.assertIsNone(hook.hosted_route_refusal("workflow_run", ref, "manaflow-ai/cmux", payload,
-                                                            other, "poll"))
+                self.assertIsNone(hook.hosted_route_refusal(ref, other, "poll"))
 
     def test_classic_auto_resume_hosted_polls_rank_no_tier_on_any_runner(self) -> None:
         """AUTO_RESUME_HOSTED_JOBS get no FEED_FIRST tier, so a pool runner cannot prioritise a 6 h Apple wait.
@@ -11579,6 +11635,34 @@ class RunnerTest(unittest.TestCase):
 
     def mid_digest(self) -> str:
         return hashlib.sha256(self.MID_HOOK.encode()).hexdigest()
+
+    def test_sign_hold_cap_still_fires_when_two_instances_sit_at_different_hooks(self) -> None:
+        """One state file serves every instance, so an instance at another hook must not reset the cap window.
+
+        refresh_hooks calls sign_hold once per receipt (the install's own and every instance-*), against one
+        sign-hold.json. The cached decisions are per (rolled-out, installed) pair, but the cap window is not: if a
+        change of the installed hook reset "since" too, two instances sitting at different hooks would reset it for
+        each other about six times an hour and the 3 h cap would never fire, so a blocked run could hold a rollout
+        for good. Keyed this way the window belongs to the hook being rolled out and ages normally.
+        """
+        home, digest = self.home, "d" * 64
+        h0, h1 = "0" * 64, "1" * 64
+        clock = [1000.0]
+        self.github([(7, "queued", self.OLD_SHA)], {self.OLD_SHA: f"{h0} old\n{h1} other\n"})
+        notes = []
+        # the two instances alternate for well past the cap, as every refresh would
+        for i in range(12):
+            for installed in (h1, h0):
+                notes.append(cr.sign_hold(home, digest, installed, now=lambda: clock[0]))
+                cr._SIGN_HOLD_MEMO.clear()  # a later refresh, not this one's memo
+            clock[0] += cr.SIGN_HOLD_CAP_S / 6
+        self.assertTrue(any(n is None for n in notes),
+                        "the cap must fire for one of the pairs once the window has aged past it; "
+                        f"every call deferred instead ({len(notes)} calls over "
+                        f"{(clock[0] - 1000.0) / 3600:g} h)")
+        held = json.loads((home / ".local/state/glaeda/cmux-runner" / cr.SIGN_HOLD_STATE).read_text())
+        self.assertEqual(held["digest"], digest)
+        self.assertLessEqual(held["since"], 1000.0, "the window is the rolled-out hook's, so it is never restarted")
 
     def test_sign_hold_decides_again_once_a_different_hook_is_on_disk(self) -> None:
         # A cached decision folds in the installed hook, so it belongs to that hook and not merely to the digest being

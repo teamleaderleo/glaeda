@@ -2506,14 +2506,19 @@ def sign_hold(home: Path, digest: str, installed: str | None = None,
     path = home / ".local/state/glaeda/cmux-runner" / SIGN_HOLD_STATE
     try:
         state = json.loads(path.read_text())
-        if not isinstance(state, dict) or state.get("digest") != digest or state.get("installed") != installed:
+        if not isinstance(state, dict) or state.get("digest") != digest:
             state = {}
+        elif state.get("installed") != installed:
+            # The cap window belongs to the hook being rolled out, so it survives a change of the hook on disk: one
+            # state file serves every instance of this install (refresh_hooks calls this once per receipt), and two
+            # instances sitting at different hooks would otherwise reset "since" for each other on every refresh, so
+            # the cap would never fire and a rollout could be held for good. The cached decisions are the opposite
+            # case: each folds in the hook on disk, so they are this pair's and are dropped here.
+            state = {"digest": digest, "since": state.get("since")}
     except (OSError, ValueError):
         state = {}
     # "serves", not the older "listed": the cached value now folds in the installed hook (sign_hold_blockers), so a
-    # state file written by an earlier release at this same digest must not be read as the new decision. The state is
-    # kept only while *both* hook identities match: a run's commit can list the hook now on disk and not the one that
-    # wrote this entry, so a decision taken against a different installed hook is not this hook's decision.
+    # state file written by an earlier release at this same digest must not be read as the new decision.
     cache = state.get("serves") if isinstance(state.get("serves"), dict) else {}
     cache = {k: v for k, v in cache.items() if isinstance(v, bool)}
     known = [(rid, sha) for rid, sha in (state.get("blockers") or [])
