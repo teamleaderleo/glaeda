@@ -4680,7 +4680,8 @@ def admission_waiters(capacity_dir: Path, skip_pid: int = 0) -> list[dict[str, A
                         "tier": tier, "lane": lane,
                         "class": EXCLUSIVE_CLASS if data.get("class") == EXCLUSIVE_CLASS else "",
                         "signs_first": (data.get("signs_first") is True and tier == TIER_NIGHTLY
-                                        and data.get("class") == EXCLUSIVE_CLASS)})
+                                        and data.get("class") == EXCLUSIVE_CLASS),
+                        "follows": data.get("follows") is True and data.get("class") == EXCLUSIVE_CLASS})
     return sorted(waiters, key=lambda waiter: (waiter["since"], waiter["pid"]))
 
 
@@ -4691,6 +4692,33 @@ def admission_waiters(capacity_dir: Path, skip_pid: int = 0) -> list[dict[str, A
 # Earlier holds and reservations idled capacity (nightlySlot, GUI_RESERVE, SIGNING_DRAIN's hour; #7156), so this
 # one is an order and nothing more. On 2026-11-05 a built run's sign queued behind light nightly jobs on cmux15 for
 # up to 1920 s while the NEXT feed went 5 h without a publish.
+
+
+# FOLLOWS_LAST (cmux15, 2026-11-06): a dispatched nightly.yml run that follows a published build, the post-publish
+# tail (inputs.nightly_next_post_publish: the GitHub release names, deltas, notes) or an unsigned resume of an older
+# failed run (inputs.nightly_next_unsigned_run), signs or publishes for a build the newest push run's own build
+# follows or supersedes. Its signing jobs took the mini ahead of that push run: push run 42244796779's
+# prepare-nightly-variant waited 23 min and pick-nightly-sign-runner 12 min in "Set up runner" behind a tail's
+# publish-nightly-next-github and generate-nightly-deltas, and its publish-nightly 23 min behind a resume's sign, so
+# it reached the feed 128 min after its push. Such a job keeps the exclusive class and every drain (nothing runs
+# beside its key), but for FOLLOWS_LAST_S after it begins to wait it gives up SIGNS_FIRST (a push run's signing job
+# that waits too goes first) and holds no yielding dedicated runner (YIELD_TO_EXCLUSIVE), so the push run's own jobs
+# keep starting. Past the window it ranks and holds like any signing job again, so it is never starved, and its
+# drain bound grows by the window. Told apart from the job's own payload, so it costs no API call.
+FOLLOWS_LAST_S = 45 * 60.0
+FOLLOWS_INPUTS = ("nightly_next_post_publish", "nightly_next_unsigned_run")
+
+
+def follows_run(event_name: str | None, workflow: str, event: Any) -> bool:
+    """Whether this job is of a nightly.yml dispatch that follows a published build (FOLLOWS_LAST). Pure."""
+    inputs = event.get("inputs") if isinstance(event, dict) else None
+    return (event_name == "workflow_dispatch" and workflow == "nightly.yml" and isinstance(inputs, dict)
+            and any(str(inputs.get(name) or "").strip() for name in FOLLOWS_INPUTS))
+
+
+def follows_within(follows: bool, since: float, now: float) -> bool:
+    """Whether a FOLLOWS_LAST waiter is still inside its window."""
+    return follows and now - since < FOLLOWS_LAST_S
 
 
 def admission_rank(tier: str, since: float, pid: int, now: float,
@@ -4706,16 +4734,20 @@ def admission_rank(tier: str, since: float, pid: int, now: float,
 
 
 def fair_turn(capacity_dir: Path, needs: set[str], since: float, tier: str = "",
-              takes_units: bool = False, new_job: bool = False, signs_first: bool = False) -> str | None:
+              takes_units: bool = False, new_job: bool = False, signs_first: bool = False,
+              follows: bool = False) -> str | None:
     """Why an admission needing these kinds (tokens and "units") must wait behind a waiter ahead of it, or None.
     Ahead is older, except across tiers (FEED_FIRST, admission_rank). A waiting nightly job also stops every other
     admission that takes a unit (takes_units), one the reserve its own gate holds would cover too, and every new job
     of another tier (new_job: job-started), the fast tier on its own fast tokens too: no new PR job starts on a mini
     where a nightly job waits. A ci-step lease inside a running job is not a new job, so it never waits on one."""
     now = time.time()
-    mine = admission_rank(tier, since, os.getpid(), now, signs_first and tier == TIER_NIGHTLY)
+    leads = signs_first and tier == TIER_NIGHTLY and not follows_within(follows, since, now)  # FOLLOWS_LAST
+    mine = admission_rank(tier, since, os.getpid(), now, leads)
     for waiter in admission_waiters(capacity_dir, os.getpid()):
-        if admission_rank(waiter["tier"], waiter["since"], waiter["pid"], now, waiter.get("signs_first", False)) >= mine:
+        waiter_leads = waiter.get("signs_first", False) and not follows_within(waiter.get("follows", False),
+                                                                                waiter["since"], now)
+        if admission_rank(waiter["tier"], waiter["since"], waiter["pid"], now, waiter_leads) >= mine:
             continue
         if session_first_lapsed(waiter, now):
             continue  # a session job past SESSION_FIRST_S still tries for units but no longer goes first
@@ -4724,7 +4756,7 @@ def fair_turn(capacity_dir: Path, needs: set[str], since: float, tier: str = "",
             shared.add("units")  # a later nightly job too: arrival order among them
         if shared:
             who = waiter["who"] or "pid " + str(waiter["pid"])
-            if waiter.get("signs_first", False) and not (signs_first and tier == TIER_NIGHTLY):
+            if waiter_leads and not leads:
                 return f"capacity: {who} is a signing job and goes first here for {', '.join(sorted(shared))}"
             if (waiter["since"], waiter["pid"]) > (since, os.getpid()) or waiter["tier"] == TIER_NIGHTLY != tier:
                 kind = {TIER_NIGHTLY: "a nightly job", TIER_STACK: "a stack-blocker PR job"}.get(waiter["tier"],
@@ -4741,7 +4773,7 @@ def job_who() -> str:
 
 
 def write_want(marker: Path, since: float, wants: list[str], tier: str = "", lane: str = "",
-               klass: str = "", signs_first: bool = False) -> None:
+               klass: str = "", signs_first: bool = False, follows: bool = False) -> None:
     with contextlib.suppress(OSError):
         tmp = marker.with_name(marker.name + ".tmp")
         want: dict[str, Any] = {"since": since, "wants": wants, "who": job_who()}
@@ -4753,6 +4785,8 @@ def write_want(marker: Path, since: float, wants: list[str], tier: str = "", lan
             want["class"] = klass
             if signs_first and tier == TIER_NIGHTLY:  # SIGNS_FIRST
                 want["signs_first"] = True
+            if follows:  # FOLLOWS_LAST
+                want["follows"] = True
         tmp.write_text(json.dumps(want) + "\n")
         tmp.replace(marker)
 
@@ -4809,7 +4843,8 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
                   one_holder: bool = False, since: float | None = None, gui_token: str = "gui",
                   gui_runner: bool = False, fresh_runner: bool = False, tier: str = "",
                   new_job: bool = False, nightly_runner: bool = False,
-                  keep_while: Path | None = None, signs_first: bool = False) -> tuple[bool, str]:
+                  keep_while: Path | None = None, signs_first: bool = False,
+                  follows: bool = False) -> tuple[bool, str]:
     """Weighted admission for one of several runners on this mini, without ever waiting on a job.
     When held, taken_out (if given) receives the units and tokens taken, for the job log; on a capacity refusal it
     receives "wants", the kinds a waiter marker names (CAPACITY_WAIT): the token kind or "units" it lacks, else
@@ -4888,7 +4923,7 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
         needs = {name for token in tokens for name in (GATEWAY_TOKENS if token == GATEWAY_TOKEN_KIND else (token,))}
         needs |= {"units"} if units and not in_reserve else set()
         behind = fair_turn(capacity_dir, needs, time.time() if since is None else since, tier, units > 0, new_job,
-                           signs_first and klass == EXCLUSIVE_CLASS)
+                           signs_first and klass == EXCLUSIVE_CLASS, follows and klass == EXCLUSIVE_CLASS)
         if behind:
             # a waiter behind another names every kind it needs, units too: a newcomer that fits must not take the
             # units it waits for in the poll between the waiter ahead being admitted and this one's next try
@@ -5595,8 +5630,10 @@ ABANDONED = "abandoned"
 def exclusive_claim(capacity_dir: Path) -> str | None:
     """Why a yielding dedicated runner holds off now (a signing job waits for this mini or holds it), or None."""
     with contextlib.suppress(OSError):
+        now = time.time()
         for waiter in admission_waiters(capacity_dir):
-            if waiter.get("class") == EXCLUSIVE_CLASS:
+            if waiter.get("class") == EXCLUSIVE_CLASS and not follows_within(waiter.get("follows", False),
+                                                                              waiter["since"], now):
                 return f"a signing job waits for this mini to drain ({waiter.get('who') or 'pid ' + str(waiter['pid'])})"
     if all((capacity_dir / f"{token}.token").exists() and not probe(capacity_dir / f"{token}.token")
            for token in GATEWAY_TOKENS):
@@ -9916,8 +9953,15 @@ def main(argv: list[str] | None = None) -> int:
                     return refused(f"{SIGNING_HOOKS_PATH} at this run's commit does not list this hook "
                                    f"({(hook or '')[:12]}), so the job's claim gate would refuse the whole mini; "
                                    "refused before draining it, so the run's Blacksmith job signs now")
+            follows = (claim_class == EXCLUSIVE_CLASS and args.trusted_next_signing
+                       and follows_run(os.environ.get("GITHUB_EVENT_NAME"), job_workflow(), event))
             if claim_class == EXCLUSIVE_CLASS:
                 drain_bound = exclusive_capacity_wait(tier, args.nightly_runner or args.trusted_next_signing)
+                if follows:
+                    drain_bound += FOLLOWS_LAST_S
+                    print(f"{PREFIX}: a signing job of a run that follows a published build (FOLLOWS_LAST): for "
+                          f"{FOLLOWS_LAST_S / 60:g} min a push run's signing job goes first and the nightly-only "
+                          "runners keep starting jobs; nothing runs beside it once it holds the mini", flush=True)
                 cap = bounded_wait(cap, drain_bound)
                 print(f"{PREFIX}: a signing job: it takes the whole mini (every unit, fast and gateway token), so no "
                       f"other job runs here beside it; it waits {drain_bound:g} s at most for the mini to drain, "
@@ -9953,7 +9997,7 @@ def main(argv: list[str] | None = None) -> int:
                                                gui_runner=args.gui_runner,
                                                fresh_runner=args.dev_compile_runner, tier=tier, new_job=True,
                                                nightly_runner=args.nightly_runner,
-                                               signs_first=args.trusted_next_signing)
+                                               signs_first=args.trusted_next_signing, follows=follows)
                     if held and claim_class == EXCLUSIVE_CLASS:
                         stray = stray_job_processes(Path.home(), owner.pid if owner else 0)
                         if stray is None or stray:
@@ -9972,7 +10016,7 @@ def main(argv: list[str] | None = None) -> int:
                     wants = list(taken.get("wants") or [])
                     if admit_class != GATEWAY_CLASS:  # a gateway client's wait holds no other runner (GATEWAY)
                         write_want(marker, since, wants, tier, SESSION_LANE if args.session_runner else "",
-                                   claim_class, args.trusted_next_signing)
+                                   claim_class, args.trusted_next_signing, follows)
                     if note != shown or time.monotonic() - shown_at >= ADMIT_NOTE_S:
                         holders = ""
                         with contextlib.suppress(Exception):  # naming holders must never fail the wait
