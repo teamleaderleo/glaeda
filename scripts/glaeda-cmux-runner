@@ -983,6 +983,9 @@ def desired_files(ctx: Context) -> dict[Path, tuple[bytes, int]]:
     watch = watch_plist_path(ctx)
     if watch is not None:
         files[watch] = (plistlib.dumps(watch_plist(ctx), sort_keys=True), 0o644)
+    relay = relay_plist_path(ctx)
+    if relay is not None:
+        files[relay] = (plistlib.dumps(relay_plist(ctx), sort_keys=True), 0o644)
     return files
 
 
@@ -1299,9 +1302,10 @@ def plan_install(ctx: Context, receipt: dict[str, Any] | None) -> list[dict[str,
     actions.append(reg)
 
     prior = {a.get("path"): a.get("ownedSha256") for a in (receipt or {}).get("actions", [])
-             if a.get("kind") in {"hook", "agent", "watch"} and a.get("owned")}
+             if a.get("kind") in {"hook", "agent", *COMPANIONS} and a.get("owned")}
+    companions = companion_paths(ctx)
     for path, (data, mode) in desired_files(ctx).items():
-        kind = "agent" if path == ctx.service_plist_path else "watch" if path == watch_plist_path(ctx) else "hook"
+        kind = "agent" if path == ctx.service_plist_path else companions[path][0] if path in companions else "hook"
         current, want = sha256_file(path), sha256_bytes(data)
         if current is None:
             state = "create"
@@ -1318,10 +1322,10 @@ def plan_install(ctx: Context, receipt: dict[str, Any] | None) -> list[dict[str,
                "mode": oct(mode), "owned": owned, "ownedSha256": current if owned else None}
         if state == "blocked" and not blocked_dir:
             act["note"] = "exists and was not written by this command"
-        if kind == "watch":
-            act["label"] = watch_label(ctx)
+        if kind in COMPANIONS:
+            act["label"] = companions[path][1]
             act["loaded"] = None if ctx.skip_launchctl else run(
-                [LAUNCHCTL, "print", f"gui/{ctx.uid}/{watch_label(ctx)}"])[0] == 0
+                [LAUNCHCTL, "print", f"gui/{ctx.uid}/{act['label']}"])[0] == 0
         if kind == "agent":
             act["label"] = ctx.label
             act["loaded"] = launchctl_loaded(ctx)
@@ -1331,14 +1335,16 @@ def plan_install(ctx: Context, receipt: dict[str, Any] | None) -> list[dict[str,
             if act["disabled"] and not act["held"] and not act.get("note"):
                 act["note"] = "launchd has this label disabled with no hold mark; --apply enables it before bootstrap"
         actions.append(act)
-    if dedicated_of(ctx) is not None and watch_plist_path(ctx) is None:
-        # the manifest dropped its watch loop: stop and remove the agent this install wrote, if it is unchanged
-        for old in [a for a in (receipt or {}).get("actions", []) if a.get("kind") == "watch" and a.get("owned")]:
+    declared = {kind for kind, _ in companions.values()}
+    if dedicated_of(ctx) is not None:
+        # the manifest dropped its watch loop or its relay: stop and remove the agent this install wrote, if unchanged
+        for old in [a for a in (receipt or {}).get("actions", [])
+                    if a.get("kind") in COMPANIONS and a.get("kind") not in declared and a.get("owned")]:
             current = sha256_file(Path(str(old.get("path"))))
             if current is not None:
                 ours = current == old.get("ownedSha256")
                 # owned until the removal is applied, so a skipped removal (an earlier step failed) is planned again
-                actions.append({"kind": "watch", "label": old.get("label"), "path": old.get("path"),
+                actions.append({"kind": old["kind"], "label": old.get("label"), "path": old.get("path"),
                                 "state": "remove" if ours else "kept", "owned": ours,
                                 "ownedSha256": current if ours else None,
                                 "note": "" if ours else "changed since this command wrote it"})
@@ -1363,10 +1369,10 @@ def plan_uninstall(ctx: Context, receipt: dict[str, Any] | None) -> list[dict[st
         state, note = "kept", "not installed by this command, or changed since"
     actions.append({"kind": "agent", "label": ctx.label, "path": plist, "state": state, "note": note,
                     "loaded": launchctl_loaded(ctx)})
-    for watch in [a for a in receipt.get("actions", []) if a.get("kind") == "watch" and a.get("owned")]:
+    for watch in [a for a in receipt.get("actions", []) if a.get("kind") in COMPANIONS and a.get("owned")]:
         current = sha256_file(Path(str(watch.get("path"))))
         state = "absent" if current is None else "remove" if current == watch.get("ownedSha256") else "kept"
-        actions.append({"kind": "watch", "label": watch.get("label"), "path": watch.get("path"), "state": state,
+        actions.append({"kind": watch["kind"], "label": watch.get("label"), "path": watch.get("path"), "state": state,
                         "note": "changed since this command wrote it" if state == "kept" else ""})
 
     ours = owned_dir(ctx, receipt)
@@ -1853,11 +1859,13 @@ def apply_install(ctx: Context, actions: list[dict[str, Any]], receipt_doc: dict
             if adopted:
                 receipt_doc["registration"] = adopted
                 act["note"] = "adopted the registration an interrupted --apply finished in this directory"
-        elif kind == "watch" and state in {"create", "update"}:
+        elif kind in COMPANIONS and state in {"create", "update"}:
             # unloaded first, confirmed: a watch launchd still runs keeps its old plist on disk, so the next apply
             # sees the change again instead of an "unchanged" plist under an old process
-            if not ctx.skip_launchctl and not bootout_watch(ctx, watch_label(ctx)):
-                act["state"], act["note"] = "failed", "launchd still has the old watch agent; nothing written, re-run"
+            if not ctx.skip_launchctl and not bootout_watch(ctx, act["label"]):
+                act["state"], act["note"] = "failed", f"launchd still has the old {kind} agent; nothing written, re-run"
+            elif kind == "relay" and (why := prepare_relay_dir(ctx)):
+                act["state"], act["note"] = "failed", why[:400]
             else:
                 data, mode = desired_files(ctx)[Path(act["path"])]
                 write_atomic(Path(act["path"]), data, mode)
@@ -1865,14 +1873,19 @@ def apply_install(ctx: Context, actions: list[dict[str, Any]], receipt_doc: dict
                 act["ownedSha256"] = act["sha256"]
                 if not ctx.skip_launchctl:
                     restart_watch(ctx, act)
-        elif kind == "watch" and state == "unchanged" and not ctx.skip_launchctl and not act.get("loaded"):
-            restart_watch(ctx, act)
-        elif kind == "watch" and state == "remove":
+        elif kind in COMPANIONS and state == "unchanged" and not ctx.skip_launchctl and not act.get("loaded"):
+            if kind == "relay" and (why := prepare_relay_dir(ctx)):
+                act["state"], act["note"] = "failed", why[:400]
+            else:
+                restart_watch(ctx, act)
+        elif kind in COMPANIONS and state == "remove":
             if not ctx.skip_launchctl and not bootout_watch(ctx, act["label"]):
                 # still owned, plist kept: the next apply plans the removal again
-                act["state"], act["note"] = "failed", "launchd still has the watch agent; its plist is kept, re-run"
+                act["state"], act["note"] = "failed", f"launchd still has the {kind} agent; its plist is kept, re-run"
             else:
                 Path(act["path"]).unlink(missing_ok=True)
+                if kind == "relay":
+                    remove_relay_socket(ctx)
                 act["applied"], act["owned"], act["ownedSha256"] = True, False, None
         elif kind == "agent" and state in {"create", "update"} and not ctx.skip_launchctl \
                 and (act.get("loaded") or getattr(ctx, "agent_started", False)) and not stop_if_idle(ctx):
@@ -2039,24 +2052,26 @@ def apply_uninstall(ctx: Context, actions: list[dict[str, Any]]) -> None:
     removing = [act for act in actions if act["state"] == "remove"]
     # a dedicated runner's watch loop goes first, confirmed: one launchd keeps would outlive everything below it,
     # so the uninstall stops there and keeps the receipt, the registration and the directory for a re-run
-    for act in [a for a in removing if a["kind"] == "watch"]:
+    for act in [a for a in removing if a["kind"] in COMPANIONS]:
         act["applied"] = False
         if not ctx.skip_launchctl and not bootout_watch(ctx, act["label"]):
             for other in removing:
                 other["state"], other["note"] = "failed", (
-                    "launchd still has the watch agent; nothing else removed, re-run" if other is act
-                    else "kept: the watch agent did not unload")
+                    f"launchd still has the {act['kind']} agent; nothing else removed, re-run" if other is act
+                    else f"kept: the {act['kind']} agent did not unload")
             return
         Path(act["path"]).unlink(missing_ok=True)
+        if act["kind"] == "relay":
+            remove_relay_socket(ctx)
         act["applied"] = True
-    removing = [act for act in removing if act["kind"] != "watch"]
+    removing = [act for act in removing if act["kind"] not in COMPANIONS]
     agent = next((act for act in removing if act["kind"] == "agent"), None)
     booting_out = bool(agent) and not ctx.skip_launchctl
     idle = not removing or ((booting_out or not service_may_run(ctx)) and stop_if_idle(
         ctx, (lambda: bootout(ctx)) if booting_out else (lambda: True), listener_ok=booting_out))
     drained: bool | None = None
     for act in actions:
-        if act["kind"] == "watch":
+        if act["kind"] in COMPANIONS:
             continue  # handled above
         act["applied"] = False
         if act["state"] != "remove":
@@ -3212,6 +3227,88 @@ def restart_watch(ctx: Context, act: dict[str, Any]) -> None:
     act["bootstrapped"] = code == 0
     if code != 0:
         act["state"], act["note"] = "failed", ("launchctl bootstrap failed: " + out)[:400]
+
+
+# LAN_RELAY (glaeda_fleet_labels.lan_relay): a dedicated entry's lanRelay is <agent label>.relay, a socket-activated
+# LaunchAgent. launchd owns a Unix socket in a directory only this user can enter (0700, the socket 0600), and for each
+# connection starts Apple's /usr/bin/nc to the entry's one address and port with the connection as its stdin and stdout
+# (inetdCompatibility). launchd starts nc directly, so it has no non-Apple ancestor and Local Network privacy lets it
+# through; a job connects to the socket (`ssh -o ProxyCommand='/usr/bin/nc -U SOCKET'`), and a Unix socket is not the
+# LAN. Nothing the job sends picks the destination, and the relay holds no key. Each connection ends at either side's
+# EOF, after LAN_RELAY_CONNECT_S without a connect, or after LAN_RELAY_IDLE_S with no byte either way (nc -w).
+LAN_RELAY_DIR = ".local/state/glaeda/lan-relay"  # under HOME; the socket is <entry name>.sock
+LAN_RELAY_NC = "/usr/bin/nc"
+LAN_RELAY_CONNECT_S = 5
+LAN_RELAY_IDLE_S = 900  # an ssh session quiet this long is closed; ssh's ServerAliveInterval keeps a live one open
+SOCKET_PATH_MAX = 103  # sockaddr_un.sun_path on macOS is 104 bytes with its NUL
+
+
+def relay_of(ctx: Any) -> str | None:
+    return (dedicated_of(ctx) or {}).get("lanRelay")
+
+
+def relay_label(ctx: Context) -> str:
+    return f"{ctx.label}.relay"
+
+
+def relay_socket(ctx: Context) -> Path:
+    return ctx.home / LAN_RELAY_DIR / f"{ctx.dedicated['name']}.sock"
+
+
+def relay_plist_path(ctx: Context) -> Path | None:
+    """The dedicated runner's LAN relay LaunchAgent, or None when its entry declares no lanRelay."""
+    return ctx.agents / f"{relay_label(ctx)}.plist" if relay_of(ctx) else None
+
+
+def relay_plist(ctx: Context) -> dict[str, Any]:
+    address, port = relay_of(ctx).rsplit(":", 1)
+    return {"Label": relay_label(ctx),
+            "ProgramArguments": [LAN_RELAY_NC, "-G", str(LAN_RELAY_CONNECT_S), "-w", str(LAN_RELAY_IDLE_S),
+                                 address, port],
+            "inetdCompatibility": {"Wait": False},
+            "Sockets": {"Listener": {"SockPathName": os.fspath(relay_socket(ctx)), "SockPathMode": 0o600,
+                                     "SockType": "stream"}},
+            "ProcessType": "Interactive",
+            "StandardErrorPath": os.fspath(ctx.logs / f"glaeda-cmux-runner-{ctx.dedicated['name']}.relay.err")}
+
+
+def prepare_relay_dir(ctx: Context) -> str | None:
+    """Make the socket's directory this user's own, mode 0700, before launchd binds the socket; why it cannot, or
+    None. A symlink or a directory another user owns is refused, never repaired."""
+    path = relay_socket(ctx)
+    if len(os.fsencode(path)) > SOCKET_PATH_MAX:
+        return f"the relay socket path {path} is longer than a Unix socket path may be"
+    try:
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        info = path.parent.lstat()
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
+            return f"{path.parent} is not a directory this user owns"
+        os.chmod(path.parent, 0o700)
+        with contextlib.suppress(FileNotFoundError):
+            if stat.S_ISSOCK(path.lstat().st_mode):
+                path.unlink()  # a socket a booted-out relay left: launchd binds a fresh one
+    except OSError as error:
+        return f"cannot prepare {path.parent}: {error}"
+    return None
+
+
+def remove_relay_socket(ctx: Context) -> None:
+    """After the relay agent is gone: the socket file launchd may leave behind (only a socket, never anything else)."""
+    path = relay_socket(ctx)
+    with contextlib.suppress(OSError):
+        if stat.S_ISSOCK(path.lstat().st_mode):
+            path.unlink()
+
+
+# COMPANIONS: the LaunchAgents a dedicated runner may have beside its runner agent, by receipt kind: its builder's watch
+# loop and its LAN relay. Each is planned, (re)loaded and removed the same way.
+COMPANIONS = ("watch", "relay")
+
+
+def companion_paths(ctx: Context) -> dict[Path, tuple[str, str]]:
+    """{plist path: (kind, label)} for the companions this install declares."""
+    pairs = (("watch", watch_plist_path(ctx), watch_label), ("relay", relay_plist_path(ctx), relay_label))
+    return {path: (kind, label(ctx)) for kind, path, label in pairs if path is not None}
 
 
 ROLE_KEEP_MARKER = ".glaeda-keep.json"  # glaeda-disk ROLE_KEEP_MARKER: the warm state it keeps by role

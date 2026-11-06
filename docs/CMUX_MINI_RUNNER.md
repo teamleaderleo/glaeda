@@ -1175,6 +1175,28 @@ class) or holds it (both gateway tokens taken, which only the exclusive class ta
 `YIELD_TO_EXCLUSIVE_WAIT_S` (3 h) at most, then refuses. cmux15's nightly-only runners declare it, with
 `trustedNextSigning` on its pool (section 2e). Without the key nothing changes.
 
+### A LAN relay for an owner-only runner (`lanRelay`)
+
+macOS Local Network privacy refuses a LAN connection from every process under a runner, Apple's `/usr/bin/ssh` and
+`/usr/bin/nc` included (Local Network Privacy, below). A trusted runner.dedicated entry on a `dedicatedOnly` member may
+declare `"lanRelay": "A.B.C.D:PORT"`, one private (RFC 1918) address and port, and its jobs reach exactly that port:
+
+- glaeda-cmux-runner installs `<agent label>.relay` beside the runner agent, a socket-activated LaunchAgent with no
+  key and no environment. launchd owns the Unix socket `~/.local/state/glaeda/lan-relay/<name>.sock` (mode 0600, in
+  a 0700 directory of the runner's user). For each connection it starts `/usr/bin/nc -G 5 -w 900 A.B.C.D PORT`
+  (`inetdCompatibility`), so nc has no non-Apple ancestor and Local Network privacy lets it through.
+- A job connects with `ssh -o ProxyCommand='/usr/bin/nc -U <socket>'`. A Unix socket is not the LAN, and ssh still
+  checks the host key it pins.
+- Nothing a job sends chooses the destination, and the address is in the member's manifest entry, never in a job.
+- Each connection ends at either side's EOF, after 5 s with no connect, or after 900 s with no byte either way. Between
+  connections launchd only holds the socket.
+- Refused: any address outside RFC 1918, an entry without `trustedRef` (so a pull request's code never runs beside the
+  relay), and a member without `runner.dedicatedOnly` (so no other runner of the same user shares the Mac).
+- `glaeda-cmux-runner-fleet --apply --hosts M` installs it. Dropping the key, or `--uninstall`, boots it out and
+  removes its plist and socket. mini-health counts it as glaeda's (`com.teamleaderleo.glaeda.*`).
+
+This deliberately crosses macOS Local Network privacy for one address and port on an owner-only mini.
+
 ## 2e2. Other repositories on the same minis (org scope)
 
 Registered to `manaflow-ai/cmux`, the runners serve only cmux. To let another repository of the org use

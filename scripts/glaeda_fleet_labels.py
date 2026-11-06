@@ -571,9 +571,10 @@ def pool_scope(manifest: Any, member: str) -> tuple[dict[str, str | None] | None
 
 
 def dedicated_runners(manifest: Any, member: str) -> tuple[list[dict[str, Any]], str | None]:
-    """([{name, repo, org, group, labels, admit, watch, env, keep, minFreeGib}], None), or ([], why the member's list
-    is unusable). Pure. A member with no runner.dedicated has none. minFreeGib is the entry's own disk floor, or None
-    for the member's disk.min_free_gib."""
+    """([{name, repo, org, group, labels, admit, watch, env, keep, minFreeGib, lanRelay}], None), or ([], why the
+    member's list is unusable). Pure. A member with no runner.dedicated has none. minFreeGib is the entry's own disk
+    floor, or None for the member's disk.min_free_gib. lanRelay is the one private LAN IPv4:port the entry's relay
+    agent forwards to (LAN_RELAY), or None."""
     hosts = manifest.get("hosts") if isinstance(manifest, dict) else None
     host = hosts.get(member) if isinstance(hosts, dict) else None
     if not isinstance(host, dict):
@@ -595,7 +596,8 @@ def dedicated_runners(manifest: Any, member: str) -> tuple[list[dict[str, Any]],
         if not isinstance(entry, dict):
             return [], f"{where} is not an object"
         unknown = sorted(set(entry) - {"name", "repo", "org", "group", "labels", "admit", "watch", "env", "keep",
-                                       "minFreeGib", "note", "trustedRef", "trustedRepo", "yieldToExclusive"})
+                                       "minFreeGib", "note", "trustedRef", "trustedRepo", "yieldToExclusive",
+                                       "lanRelay"})
         if unknown:
             return [], f"{where} has unknown keys: {', '.join(unknown)}"
         name, repo, org, group = entry.get("name"), entry.get("repo"), entry.get("org"), entry.get("group")
@@ -671,11 +673,42 @@ def dedicated_runners(manifest: Any, member: str) -> tuple[list[dict[str, Any]],
         yields = entry.get("yieldToExclusive", False)
         if not isinstance(yields, bool):
             return [], f"{where}.yieldToExclusive must be boolean"
+        relay, why = lan_relay(entry.get("lanRelay"), where, trusted_ref is not None, bool(runner.get("dedicatedOnly")))
+        if why:
+            return [], why
         out.append({"name": name, "repo": repo, "org": org, "group": group, "labels": list(labels),
                     "admit": commands["admit"], "watch": commands.get("watch"), "env": dict(env),
                     "keep": list(keep), "minFreeGib": None if floor is None else float(floor),
-                    "trustedRef": trusted_ref, "trustedRepo": trusted_repo, "yieldToExclusive": yields})
+                    "trustedRef": trusted_ref, "trustedRepo": trusted_repo, "yieldToExclusive": yields,
+                    "lanRelay": relay})
     return out, None
+
+
+# LAN_RELAY: a runner.dedicated entry's "lanRelay": "A.B.C.D:PORT" gives its runner one way past macOS Local Network
+# privacy, which refuses a LAN connect from every process under the runner (docs/CMUX_MINI_RUNNER.md, Local Network
+# Privacy). glaeda-cmux-runner installs <agent label>.relay: launchd listens on a Unix socket only the runner's user can
+# open, and starts Apple's /usr/bin/nc to that one address and port per connection. Nothing in a job can choose another
+# destination. It is allowed only where a job's code is the trusted branch's (trustedRef) and no other runner shares the
+# Mac (runner.dedicatedOnly), and only to a private (RFC 1918) address.
+LAN_RELAY_RE = r"((?:[0-9]{1,3}\.){3}[0-9]{1,3}):([0-9]{1,5})"
+
+
+def lan_relay(value: Any, where: str, trusted: bool, dedicated_only: bool) -> tuple[str | None, str | None]:
+    """(the normalised "A.B.C.D:PORT", None), (None, None) when the entry has none, or (None, why it is refused)."""
+    if value is None:
+        return None, None
+    match = re.fullmatch(LAN_RELAY_RE, value) if isinstance(value, str) else None
+    octets = [int(x) for x in match.group(1).split(".")] if match else []
+    port = int(match.group(2)) if match else 0
+    if not match or any(x > 255 for x in octets) or not 0 < port < 65536:
+        return None, f"{where}.lanRelay must be IPv4:PORT"
+    first, second = octets[0], octets[1]
+    if not (first == 10 or (first == 172 and 16 <= second <= 31) or (first == 192 and second == 168)):
+        return None, f"{where}.lanRelay must be a private (RFC 1918) LAN address"
+    if not trusted or not dedicated_only:
+        return None, (f"{where}.lanRelay needs trustedRef on an entry of a runner.dedicatedOnly member: the relay "
+                      "crosses Local Network privacy only where no other runner shares the Mac")
+    return ".".join(str(x) for x in octets) + f":{port}", None
 
 
 def trusted_pool_matches(manifest: Any, label: str, trusted_ref: str, trusted_repo: str) -> bool:
