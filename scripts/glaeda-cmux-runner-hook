@@ -5413,6 +5413,7 @@ class RunnerScope(NamedTuple):
     dedicated: bool = False
     nightly: bool = False
     gateway: bool = False
+    trusted_signing: bool = False
 
 
 def reserve_token(scope: RunnerScope | None) -> str | None:
@@ -5646,7 +5647,8 @@ def runner_scope(runner_dir: Path) -> RunnerScope:
                        instance < roots and not gui and not fast and not session and not dedicated and not nightly
                        and not gateway,
                        gui, runner_floor_gib(min_free_gib(text), gui or session), gui_token,
-                       fast, session, fresh, dedicated, nightly, gateway)
+                       fast, session, fresh, dedicated, nightly, gateway,
+                       re.search(r"\s--trusted-next-signing(?:\s|$)", text) is not None)
 
 
 def eligibility_scope(runner_dir: Path) -> tuple[str, str | None] | None:
@@ -6910,12 +6912,16 @@ class Gate:
             self.disk_since, self.disk_noted = None, False
         scope = runner_scope(self.runner_dir)
         floor, reserve = scope.min_free_gib, ""
-        if scope.nightly and not scope.dedicated:
+        # The nightly's own listeners: the nightly-only runner and the trusted signing runner, which takes the
+        # nightly's sign and publish jobs. The builder's reserve below keeps other runners off the nightly's disk;
+        # holding the nightly's own publish for it cost publish-nightly 10-12 min on 3 of 7 cmux15 runs (2026-11-05).
+        nightly_own = (scope.nightly or scope.trusted_signing) and not scope.dedicated
+        if nightly_own:
             # The nightly-only listener must reach job-started when the job fits,
             # even while cleanup is trying to restore the larger runner reserve.
             # job-started still takes the disk-low ledger's single-job turn.
             floor = admit_floor_gib(floor, scope.gui or scope.session)
-        if not scope.dedicated and not scope.nightly:
+        if not scope.dedicated and not nightly_own:
             # NIGHTLY_DISK_RESERVE: a nightly job freeing disk here goes first, and every other runner leaves the
             # dedicated builder's floor plus one job's growth free
             waiter = nightly_disk_waiter(self.capacity_dir or Path(FLEET_DIR) / "capacity")
