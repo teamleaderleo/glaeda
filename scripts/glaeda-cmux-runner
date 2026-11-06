@@ -1324,6 +1324,8 @@ def plan_install(ctx: Context, receipt: dict[str, Any] | None) -> list[dict[str,
             act["note"] = "exists and was not written by this command"
         if kind in COMPANIONS:
             act["label"] = companions[path][1]
+            if kind == "relay":
+                act["socket"] = os.fspath(relay_socket(ctx))
             act["loaded"] = None if ctx.skip_launchctl else run(
                 [LAUNCHCTL, "print", f"gui/{ctx.uid}/{act['label']}"])[0] == 0
         if kind == "agent":
@@ -1348,6 +1350,7 @@ def plan_install(ctx: Context, receipt: dict[str, Any] | None) -> list[dict[str,
                 # owned until the removal is applied, so a skipped removal (an earlier step failed) is planned again
                 actions.append({"kind": old["kind"], "label": old.get("label"), "path": old.get("path"),
                                 "state": "remove" if ours else "kept", "owned": ours, "loaded": loaded,
+                                "socket": old.get("socket"),
                                 "ownedSha256": current if ours else None,
                                 "note": "" if ours else "changed since this command wrote it"})
     actions.append({"kind": "verify", "state": "pending", "note": f"GET {ctx.scope_api}/actions/runners, name {ctx.name}"})
@@ -1377,6 +1380,7 @@ def plan_uninstall(ctx: Context, receipt: dict[str, Any] | None) -> list[dict[st
         state = ("remove" if loaded else "absent") if current is None else \
             "remove" if current == watch.get("ownedSha256") else "kept"
         actions.append({"kind": watch["kind"], "label": watch.get("label"), "path": watch.get("path"), "state": state,
+                        "socket": watch.get("socket"),
                         "note": "changed since this command wrote it" if state == "kept" else ""})
 
     ours = owned_dir(ctx, receipt)
@@ -1863,7 +1867,7 @@ def apply_install(ctx: Context, actions: list[dict[str, Any]], receipt_doc: dict
             if adopted:
                 receipt_doc["registration"] = adopted
                 act["note"] = "adopted the registration an interrupted --apply finished in this directory"
-        elif kind == "relay" and state in {"update", "remove"} and act.get("loaded") and runner_busy(ctx):
+        elif kind == "relay" and state in {"create", "update", "remove"} and act.get("loaded") and runner_busy(ctx):
             # a job may be talking through the relay: unloading it now would cut that connection
             act["state"], act["note"] = "failed", ("the runner has a job that may use the relay; nothing changed, "
                                                    "re-run when idle")
@@ -1893,7 +1897,7 @@ def apply_install(ctx: Context, actions: list[dict[str, Any]], receipt_doc: dict
             else:
                 Path(act["path"]).unlink(missing_ok=True)
                 if kind == "relay":
-                    remove_relay_socket(ctx)
+                    remove_relay_socket(ctx, act)
                 act["applied"], act["owned"], act["ownedSha256"] = True, False, None
         elif kind == "agent" and state in {"create", "update"} and not ctx.skip_launchctl \
                 and (act.get("loaded") or getattr(ctx, "agent_started", False)) and not stop_if_idle(ctx):
@@ -2077,7 +2081,7 @@ def apply_uninstall(ctx: Context, actions: list[dict[str, Any]]) -> None:
             return
         Path(act["path"]).unlink(missing_ok=True)
         if act["kind"] == "relay":
-            remove_relay_socket(ctx)
+            remove_relay_socket(ctx, act)
         act["applied"] = True
     removing = [act for act in removing if act["kind"] not in COMPANIONS]
     agent = next((act for act in removing if act["kind"] == "agent"), None)
@@ -3307,9 +3311,15 @@ def prepare_relay_dir(ctx: Context) -> str | None:
     return None
 
 
-def remove_relay_socket(ctx: Context) -> None:
-    """After the relay agent is gone: the socket file launchd may leave behind (only a socket, never anything else)."""
-    path = relay_socket(ctx)
+def remove_relay_socket(ctx: Context, act: dict[str, Any]) -> None:
+    """After the relay agent is gone: the socket file launchd may leave behind (only a socket, never anything else).
+    The path is the one the receipt recorded (an uninstall by receipt has no manifest entry), else the label's name;
+    only a path in this user's LAN_RELAY_DIR is touched."""
+    label = str(act.get("label") or "")
+    name = label[len(f"{LABEL}.dedicated."):-len(".relay")] if label.startswith(f"{LABEL}.dedicated.") else ""
+    path = Path(str(act.get("socket") or (ctx.home / LAN_RELAY_DIR / f"{name}.sock")))
+    if not name and not act.get("socket") or path.parent != ctx.home / LAN_RELAY_DIR:
+        return
     with contextlib.suppress(OSError):
         if stat.S_ISSOCK(path.lstat().st_mode):
             path.unlink()

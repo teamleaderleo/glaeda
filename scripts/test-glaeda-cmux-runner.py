@@ -14572,6 +14572,22 @@ class DedicatedRunnerTest(unittest.TestCase):
             self.invoke("--uninstall", "--apply", "--manifest", write(relayed), *args)
         self.assertFalse((agents / f"{label}.relay.plist").exists())
         self.assertFalse((agents / f"{label}.plist").exists())
+        self.assertEqual(self.by_kind(receipt)["relay"]["socket"], os.fspath(socket_dir / "fleet-route.sock"))
+        # by receipt alone (no manifest entry in ctx): the recorded socket, else the label's name, and only a socket
+        # in this user's relay directory
+        ctx = mock.Mock(home=self.home, dedicated=None)
+        for act in ({"label": f"{label}.relay", "socket": os.fspath(socket_dir / "fleet-route.sock")},
+                    {"label": f"{label}.relay"}):
+            with self.subTest(act=act), socket.socket(socket.AF_UNIX) as left:
+                left.bind(os.fspath(socket_dir / "fleet-route.sock"))
+                cr.remove_relay_socket(ctx, act)
+                self.assertFalse((socket_dir / "fleet-route.sock").exists())
+        elsewhere = self.home / "other.sock"
+        with socket.socket(socket.AF_UNIX) as other:
+            other.bind(os.fspath(elsewhere))
+            cr.remove_relay_socket(ctx, {"label": f"{label}.relay", "socket": os.fspath(elsewhere)})
+            self.assertTrue(elsewhere.exists(), "never outside the relay directory")
+            cr.remove_relay_socket(ctx, {"label": "unrelated"})
 
     def test_keep_paths_are_written_for_glaeda_disk_and_validated(self) -> None:
         fake_pw = mock.Mock(pw_dir=os.fspath(self.home))
