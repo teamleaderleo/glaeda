@@ -11840,6 +11840,14 @@ class RunnerTest(unittest.TestCase):
         self.assertIn("nightly-next at its tip does not list hook", done["note"])
         self.assertEqual((hooks / cr.HOOK_NAME).read_text(), self.OLDER_HOOK)
 
+    def test_sign_hold_reads_each_branch_tip_once_whatever_hook_is_on_disk(self) -> None:
+        # two signing runners at different hooks ask about the same rollout: the tips are read once, not once each
+        reads = self.github([], {})
+        tip_reads = lambda: [u for u in reads if "/nightly-next/" in u or "/main/" in u]
+        self.assertEqual(cr.sign_hold_tips(self.new_digest(), self.older_digest()), [])
+        self.assertEqual(cr.sign_hold_tips(self.new_digest(), "e" * 64), [])
+        self.assertEqual(len(tip_reads()), 2, "one raw read per branch tip, shared by every installed hook")
+
     def test_sign_hold_keeps_the_old_hook_when_github_cannot_be_read(self) -> None:
         for fail in ("/actions/workflows/", "raw.githubusercontent.com"):
             with self.subTest(fail=fail):
