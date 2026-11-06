@@ -1302,7 +1302,9 @@ in at the producer's root. So one root job per root per mini:
   wait with about no CPU on the mini (the hook's `GATEWAY_JOBS`, by workflow file and job id: `cmux-next.yml`'s
   `app-compile-fleet`, `swift-canary-fleet`, `release-compile-fast`, `fast-tier-fleet`, `swift-test-fleet` and
   `daemon-test-fleet`, `fleet-compile-check.yml`'s `compile-check`, `fleet-test-compile.yml`'s `compile` and
-  `cmux-next-tip-test-compile.yml`'s `compile`); job-started refuses any other job at once. Its gate is never held
+  `cmux-next-tip-test-compile.yml`'s `compile`, and the feat-cmux-next evals on `CI_EVAL_STEP_GATEWAY`:
+  `cmux-next-perf-bench.yml`'s `bench`, `cu-driver-eval.yml`'s `eval` and `screen-stream-eval.yml`'s `eval`, whose
+  steps run on the bench mini or a measure worker); job-started refuses any other job at once. Its gate is never held
   for CPU saturation or the shared units, only for memory pressure, the disk floor, heat, the fleet's host claim,
   a nightly job waiting on the mini, a signing job waiting for the gateway tokens, or both gateway tokens taken.
   Its job is admitted as class `gateway`: one of the mini's two tokens `gateway-0`/`gateway-1` and no shared unit;
