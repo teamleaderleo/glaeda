@@ -382,7 +382,8 @@ class FleetTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         row = json.loads(result.stdout)["members"][0]
         self.assertEqual(row["instances"][-1]["dedicated"], "fleet-route")
-        self.assertFalse([c for c in self.calls() if c["tool"] == "gh" and any("runner-groups" in a for a in c["argv"])])
+        self.assertFalse([c for c in self.calls()
+                          if c["tool"] == "gh" and any("runner-groups" in a for a in c["argv"])])
         applies = [c for c in self.calls() if c["tool"] == "ssh" and "--dedicated" in c["remote"]]
         self.assertIn("--repo manaflow-ai/other", applies[0]["remote"])
         # a pool instance still installed there: the apply would retire it, so the group is checked again
