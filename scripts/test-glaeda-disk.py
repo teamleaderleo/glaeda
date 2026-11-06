@@ -9854,7 +9854,7 @@ class HomeScratchTest(unittest.TestCase):
         tree = self.tree("actions-runner-nightly-next", hours=0.5)
         self.retire("ai.manaflow.nightly-builder.runner", tree)
         live = self.retire("ai.manaflow.nightly-builder.watch", tree, where="Library/LaunchAgents")
-        fam = self.family()
+        fam = self.retired()  # a hand-made runner directory is the retired-runner family's, not home-scratch's
         item = self.survey(fam)["actions-runner-nightly-next"]
         self.assertEqual(item.verdict, "in-use")
         self.assertIn(f"named by {live}", item.reasons)
@@ -9864,6 +9864,11 @@ class HomeScratchTest(unittest.TestCase):
         self.assertIn("open by a process", item.reasons)
         item = self.survey(fam, cmds=f"/bin/sh {tree}/run.sh")["actions-runner-nightly-next"]
         self.assertEqual(item.verdict, "in-use")
+        # Nothing live left: the retired runner directory goes on this pass, 0.5 h after its last touch.
+        item = self.survey(fam)["actions-runner-nightly-next"]
+        self.assertEqual(item.verdict, "reclaimable", item.reasons)
+        self.apply(fam, item)
+        self.assertFalse(tree.exists())
 
     def test_only_the_retired_directory_counts_and_only_for_home_folders(self) -> None:
         tree = self.tree("cnx-elsewhere", hours=0.5)
