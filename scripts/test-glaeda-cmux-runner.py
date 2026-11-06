@@ -11613,6 +11613,9 @@ class RunnerTest(unittest.TestCase):
             if "/actions/workflows/" in url and "/runs?" in url:
                 return self.runs_page(url, runs)
             sha = url.split("/")[-4]
+            if sha in {b for _, branches in cr.SIGN_HOLD_SOURCES for b in branches} and sha not in (lists or {}):
+                # a branch tip a test does not name has caught up: it lists both hooks (sign_hold_tips)
+                return f"{self.older_digest()} old\n{self.new_digest()} new\n"
             return (lists or {}).get(sha)
 
         patch = mock.patch.object(cr, "sign_hold_fetch", fetch)
@@ -11783,9 +11786,7 @@ class RunnerTest(unittest.TestCase):
 
     def test_sign_hold_ends_at_its_cap(self) -> None:
         hooks = self.signing_install()
-        tip = f"{self.older_digest()} old\n{self.new_digest()} new\n"
-        self.github([(7, "queued", self.OLD_SHA)], {self.OLD_SHA: f"{self.older_digest()} old\n",
-                                                   **{branch: tip for branch in ("nightly-next", "main")}})
+        self.github([(7, "queued", self.OLD_SHA)], {self.OLD_SHA: f"{self.older_digest()} old\n"})
         state = self.home / ".local/state/glaeda/cmux-runner" / cr.SIGN_HOLD_STATE
         self.assertEqual(self.invoke("--refresh-hooks", "--apply")["runners"][0]["state"], "deferred")
         first = json.loads(state.read_text())
@@ -11829,6 +11830,15 @@ class RunnerTest(unittest.TestCase):
         with contextlib.redirect_stderr(io.StringIO()):
             self.assertEqual(self.invoke("--refresh-hooks", "--apply")["runners"][0]["state"], "updated")
         self.assertEqual((hooks / cr.HOOK_NAME).read_bytes(), HOOK.read_bytes())
+
+    def test_sign_hold_never_installs_a_hook_the_tip_does_not_list_with_no_run_queued(self) -> None:
+        # no active run needs the old hook, but the next push would: nightly-next's tip lists only the old one
+        hooks = self.signing_install()
+        self.github([], {"nightly-next": f"{self.older_digest()} old\n"})
+        done = self.invoke("--refresh-hooks", "--apply")["runners"][0]
+        self.assertEqual(done["state"], "deferred")
+        self.assertIn("nightly-next at its tip does not list hook", done["note"])
+        self.assertEqual((hooks / cr.HOOK_NAME).read_text(), self.OLDER_HOOK)
 
     def test_sign_hold_keeps_the_old_hook_when_github_cannot_be_read(self) -> None:
         for fail in ("/actions/workflows/", "raw.githubusercontent.com"):

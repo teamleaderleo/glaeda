@@ -2289,7 +2289,10 @@ def sync_dir(path: Path) -> None:
 # lists neither hook is refused as before, which is why such a run is not a blocker (sign_hold_blockers): holding the
 # old hook cannot serve it, and treating it as one would strand every rollout for as long as cmux's list trailed.
 # The hold ends when no active run needs it, or SIGN_HOLD_CAP_S after its first deferral of that hook (installed then,
-# with a loud line), so a rollout can never be held for good.
+# with a loud line), so a rollout can never be held for good by old queued runs. The cap never installs a hook that the
+# tip of a branch this runner signs for lacks while it lists the hook on disk (sign_hold_tips): that would refuse every
+# new run of the branch too. On 2026-11-06 the cap installed 5836275a on cmux15 at 11:17Z while nightly-next's list
+# lacked it, and every nightly-next sign job was refused for hours (cmux 42235384601 to 42238047014).
 # Reads are anonymous (the minis have no gh): one runs list per active status per source, then one raw read per head
 # commit, cached in the state file (a commit's list never changes), all memoised for SIGN_HOLD_MEMO_S and made only
 # while a signing runner has a new hook pending, with a known blocker rechecked through the build controller at no
@@ -2484,6 +2487,23 @@ def sign_hold_blockers(digest: str, cache: dict[str, bool], home: Path | None = 
     return blockers
 
 
+def sign_hold_tips(digest: str, installed: str | None) -> list[str] | None:
+    """The SIGN_HOLD_SOURCES branches whose tip lists installed (the hook on disk) and not digest (the one about to be
+    installed), or None when a tip's list cannot be read. A tip that lists neither is refused whichever hook is on disk,
+    so it holds nothing (as in sign_hold_blockers)."""
+    held = []
+    for branch in sorted({b for _, branches in SIGN_HOLD_SOURCES for b in branches}):
+        text = sign_hold_read(SIGN_HOLD_LIST_URL.format(repo=SIGN_HOLD_REPO, sha=branch))
+        if text is None:
+            return None
+        listed = {ln.split(None, 1)[0] for ln in text.splitlines() if ln.strip() and not ln.lstrip().startswith("#")}
+        if not listed:
+            return None  # an empty answer is not a list
+        if digest not in listed and installed is not None and installed in listed:
+            held.append(branch)
+    return held
+
+
 def sign_hold_event(line: str) -> None:
     """Say what the hold did: on stderr, and in this refresh's "signHold" report."""
     print(f"glaeda-cmux-runner: sign hold: {line}", file=sys.stderr, flush=True)
@@ -2532,6 +2552,7 @@ def sign_hold(home: Path, digest: str, installed: str | None = None,
     note: str | None = None
     events_before = len(_SIGN_HOLD_EVENTS)
     since = state.get("since") if isinstance(state.get("since"), (int, float)) else None
+    capped = False
     if blockers is None or blockers:
         # an unreadable answer holds too, inside the same cap: on a signing runner keeping the old hook a little
         # longer costs nothing, and installing over a run that lacks the new one strands its sign job (10:16Z)
@@ -2541,13 +2562,25 @@ def sign_hold(home: Path, digest: str, installed: str | None = None,
                if blockers is None else
                "an active signing run's commit does not list hook " + digest[:12] + " ("
                + ", ".join(f"run {rid} at {sha[:12]}" for rid, sha in blockers) + ")")
-        if now() - since >= SIGN_HOLD_CAP_S:
-            sign_hold_event(f"SIGN HOLD CAP: hook {digest[:12]} held {SIGN_HOLD_CAP_S / 3600:g} h since {held_since}; "
-                            f"installing it now, though {why}: a sign job whose commit does not list it will be refused")
-        else:
+        if now() - since < SIGN_HOLD_CAP_S:
             note = (f"deferred: {why}; the old hook stays for its sign job (held since {held_since}, "
                     f"cap {SIGN_HOLD_CAP_S / 3600:g} h)")
             sign_hold_event(note)
+        else:
+            capped = True
+    if note is None:
+        # about to install: never a hook a signing branch's tip lacks while it lists the one on disk, cap or not
+        tips = sign_hold_tips(digest, installed)
+        if tips is None or tips:
+            since = since if since is not None else now()
+            held_since = f"{datetime.datetime.fromtimestamp(since, datetime.timezone.utc):%H:%M:%SZ}"
+            why = (f"{', '.join(tips)} at its tip does not list hook {digest[:12]}" if tips else
+                   "a signing branch's tip list cannot be read")
+            note = f"deferred: {why}; the old hook stays until it does (held since {held_since}, no cap)"
+            sign_hold_event(note)
+        elif capped:
+            sign_hold_event(f"SIGN HOLD CAP: hook {digest[:12]} held {SIGN_HOLD_CAP_S / 3600:g} h since {held_since}; "
+                            f"installing it now, though {why}: a sign job whose commit does not list it will be refused")
     with contextlib.suppress(OSError):
         path.parent.mkdir(parents=True, exist_ok=True)
         kept = [[rid, sha] for rid, sha in blockers] if blockers else (known if blockers is None else [])
