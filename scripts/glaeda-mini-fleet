@@ -198,6 +198,7 @@ import importlib.util
 import ipaddress
 import json
 import os
+import posixpath
 import re
 import shlex
 import shutil
@@ -3430,6 +3431,9 @@ NO_CANDIDATE = "the fleet manifest pins no candidate; glaeda-mini-fleet upgrade 
 # The Glaeda commit the operator pins every host's ~/glaeda to (glaeda-mini-enroll runs from there), from
 # --glaeda-ref; main sets it for each run. Without it, a step that moves ~/glaeda reads main's tip once per run.
 GLAEDA_REF: str | None = None
+# The manifest file this run loaded; main sets it. A relative hardware.<class>.acceptance.receipt resolves
+# against its directory (class_receipt_bytes).
+MANIFEST_PATH: Path | None = None
 GLAEDA_MAIN: dict[str, str] = {}
 GLAEDA_MAIN_LOCK = threading.Lock()
 
@@ -4129,11 +4133,33 @@ def class_acceptance(manifest: dict[str, Any], name: str) -> tuple[dict[str, Any
     return recorded, f"class {klass} accepted on {recorded.get('node')} (Xcode {build}, candidate {source12})"
 
 
-def class_receipt_bytes(recorded: dict[str, Any], klass: str) -> tuple[bytes | None, str]:
-    """The class acceptance receipt a host of `klass` is sent, checked against the recorded digest."""
-    path = Path(str(recorded["receipt"])).expanduser()
+def read_class_receipt(receipt: str, manifest_path: Path | None) -> tuple[bytes, str]:
+    """(the receipt file's bytes, where they came from). An absolute (or ~) path is read as is. A relative one is
+    relative to the manifest's directory, as cmuxterm-hq's build-fleet/mini-fleet.json records it
+    (class-acceptance/<class>-<candidate>.json): read beside the manifest when it is there, else from cmuxterm-hq
+    main beside its manifest (fetch_hq_file), so an operator's synced copy of the manifest finds it too."""
+    path = Path(receipt).expanduser()
+    if path.is_absolute():
+        return path.read_bytes(), os.fspath(path)
+    rel = posixpath.normpath(receipt)
+    if rel.startswith("../") or rel in {".", ".."}:
+        raise OSError(f"{receipt}: a relative receipt must stay inside the manifest's directory")
+    base = (manifest_path or DEFAULT_MANIFEST).expanduser().resolve().parent
+    with contextlib.suppress(FileNotFoundError):
+        return (base / rel).read_bytes(), os.fspath(base / rel)
     try:
-        data = path.read_bytes()
+        text, source = fetch_hq_file(posixpath.join(posixpath.dirname(HQ_MANIFEST), rel))
+    except Failure as error:
+        raise OSError(f"not in {base} and not readable from cmuxterm-hq main ({error})") from None
+    return text.encode(), source
+
+
+def class_receipt_bytes(recorded: dict[str, Any], klass: str,
+                        manifest_path: Path | None = None) -> tuple[bytes | None, str]:
+    """The class acceptance receipt a host of `klass` is sent, checked against the recorded digest."""
+    path = str(recorded["receipt"])
+    try:
+        data, path = read_class_receipt(path, manifest_path or MANIFEST_PATH)
         doc = json.loads(data)
     except (OSError, ValueError) as error:
         return None, f"class {klass} receipt {path}: {error}"
@@ -4833,8 +4859,13 @@ def rewrite_manifest(path: Path, change: Any, write: bool = True) -> str:
 
 
 def fetch_hq_manifest() -> tuple[str, str]:
-    """(cmuxterm-hq main's manifest text, where it came from): gh api, else a local checkout's origin/main, all
-    within HQ_CHECK_BUDGET_S."""
+    """(cmuxterm-hq main's manifest text, where it came from)."""
+    return fetch_hq_file(HQ_MANIFEST)
+
+
+def fetch_hq_file(rel: str) -> tuple[str, str]:
+    """(the text of cmuxterm-hq main's file at rel, where it came from): gh api, else a local checkout's
+    origin/main, all within HQ_CHECK_BUDGET_S."""
     deadline = time.monotonic() + HQ_CHECK_BUDGET_S
     errors = []
 
@@ -4848,7 +4879,7 @@ def fetch_hq_manifest() -> tuple[str, str]:
     if gh:
         try:
             proc = run([gh, "api", "-H", "Accept: application/vnd.github.raw+json",
-                        f"repos/{HQ_REPO}/contents/{HQ_MANIFEST}?ref=main"], HQ_GH_TIMEOUT_S)
+                        f"repos/{HQ_REPO}/contents/{rel}?ref=main"], HQ_GH_TIMEOUT_S)
             if proc.returncode == 0 and proc.stdout.strip():
                 return proc.stdout, f"{HQ_REPO} main"
             errors.append(f"gh api: {(proc.stderr.strip().splitlines() or ['exit ' + str(proc.returncode)])[-1]}")
@@ -4862,13 +4893,13 @@ def fetch_hq_manifest() -> tuple[str, str]:
     if (checkout / ".git").exists():
         git = ["git", "-C", os.fspath(checkout)]
         try:
-            show = run([*git, "show", f"origin/main:{HQ_MANIFEST}"])
+            show = run([*git, "show", f"origin/main:{rel}"])
             if show.returncode == 0 and show.stdout.strip():
                 with contextlib.suppress(subprocess.SubprocessError, OSError):
                     head = run([*git, "log", "-1", "--format=%h %cs", "origin/main"]).stdout.strip()
                     return show.stdout, f"{checkout} origin/main {head} (as of its last fetch)"
                 return show.stdout, f"{checkout} origin/main (as of its last fetch)"
-            errors.append(f"{checkout}: no {HQ_MANIFEST} on origin/main")
+            errors.append(f"{checkout}: no {rel} on origin/main")
         except subprocess.TimeoutExpired:
             errors.append(f"{checkout}: out of the {HQ_CHECK_BUDGET_S} s budget")
         except (OSError, subprocess.SubprocessError) as error:
@@ -5004,13 +5035,22 @@ def class_receipt_path(manifest_path: Path, klass: str, source12: str) -> Path:
     return manifest_path.expanduser().resolve().parent / "class-acceptance" / f"{klass}-{source12}.json"
 
 
-def acceptance_entry(manifest: dict[str, Any], seed: str, candidate: dict[str, str], receipt: Path,
-                     receipt_sha256: str) -> dict[str, str]:
+def recorded_receipt(manifest_path: Path, receipt: Path) -> str:
+    """How the manifest records the receipt file: relative to its own directory when the file is inside it (so the
+    committed manifest names no operator's home), else the absolute path."""
+    try:
+        return receipt.relative_to(manifest_path.expanduser().resolve().parent).as_posix()
+    except ValueError:
+        return os.fspath(receipt)
+
+
+def acceptance_entry(manifest: dict[str, Any], manifest_path: Path, seed: str, candidate: dict[str, str],
+                     receipt: Path, receipt_sha256: str) -> dict[str, str]:
     build = (toolchain(manifest, seed).get("xcode") or {}).get("build")
     if not build:
         raise Failure(f"{seed}: declare toolchain.xcode (app, version, build); class acceptance is recorded per Xcode build")
     return {"xcode_build": build, "candidate": candidate["source"][:12], "node": manifest["hosts"][seed]["node_id"],
-            "receipt": os.fspath(receipt), "receipt_sha256": receipt_sha256}
+            "receipt": recorded_receipt(manifest_path, receipt), "receipt_sha256": receipt_sha256}
 
 
 def record_class_acceptance(manifest_path: Path, manifest: dict[str, Any], klass: str, entry: dict[str, str],
@@ -5149,7 +5189,7 @@ def cmd_upgrade(manifest: dict[str, Any], manifest_path: Path, wanted: list[str]
                 rows[name]["result"] = blocked
             continue
         recorded, _ = class_acceptance(manifest, members[0])
-        data = class_receipt_bytes(recorded, klass)[0] if recorded and "receipt" in recorded else None
+        data = class_receipt_bytes(recorded, klass, manifest_path)[0] if recorded and "receipt" in recorded else None
         if data is not None:
             plan[klass] = None
             receipts[klass] = (klass, recorded["receipt_sha256"], data)
@@ -5180,7 +5220,8 @@ def cmd_upgrade(manifest: dict[str, Any], manifest_path: Path, wanted: list[str]
                                else [f"renew + adopt class {klass} receipt"]), "start runner"]
                 rows[name].update(step="plan", result="would: " + ", ".join(steps))
             if seed:
-                entry = acceptance_entry(manifest, seed, candidate, class_receipt_path(manifest_path, klass, source12),
+                entry = acceptance_entry(manifest, manifest_path, seed, candidate,
+                                         class_receipt_path(manifest_path, klass, source12),
                                          "sha256:<from the export>")
                 print(f"class {klass}: seed {seed}; the manifest would change like this:")
                 print(record_class_acceptance(manifest_path, manifest, klass, entry, candidate, write=False) or "(no change)")
@@ -5211,7 +5252,8 @@ def cmd_upgrade(manifest: dict[str, Any], manifest_path: Path, wanted: list[str]
                 sha = json.loads(data)["receiptSha256"]
                 with manifest_lock:
                     diff = record_class_acceptance(manifest_path, manifest, klass,
-                                                   acceptance_entry(manifest, name, candidate, receipt, sha), candidate)
+                                                   acceptance_entry(manifest, manifest_path, name, candidate, receipt, sha),
+                                                   candidate)
                     say(f"class {klass}: recorded in {manifest_path}\n{diff}")
             except (Failure, OSError, ValueError) as error:
                 return False, "export", f"eligible on {source12}, but the class receipt was not recorded: {error}"
@@ -5339,7 +5381,7 @@ def main(argv: list[str] | None = None) -> int:
         thing, args.names = args.names[0], args.names[1:]
     if args.names:
         args.hosts = [*(args.hosts or []), *args.names]
-    global PINNED_CANDIDATE, GLAEDA_REF
+    global PINNED_CANDIDATE, GLAEDA_REF, MANIFEST_PATH
     if args.command == "manifest-sync":
         try:
             return cmd_manifest_sync(args.manifest or DEFAULT_MANIFEST, args.yes)
@@ -5363,6 +5405,7 @@ def main(argv: list[str] | None = None) -> int:
         GLAEDA_REF = args.glaeda_ref
         GLAEDA_MAIN.clear()
         manifest = load_manifest(args.manifest)
+        MANIFEST_PATH = args.manifest
         PINNED_CANDIDATE = manifest.get("candidate")
         hosts = select_hosts(manifest, args.hosts)
         if args.command == "apply":

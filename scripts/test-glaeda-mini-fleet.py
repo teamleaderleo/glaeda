@@ -3412,6 +3412,52 @@ class OnboardTests(unittest.TestCase):
         self.assertIn("is not the recorded", out)
         self.assertFalse(calls_to(calls, ENROLL))
 
+    def test_a_relative_class_receipt_is_read_beside_the_manifest(self) -> None:
+        receipt = {"schema": "glaeda-cmux-fleet-class-acceptance/v1", "fleetClass": "m4pro-48",
+                   "receiptSha256": "sha256:" + "c" * 64}
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "class-acceptance").mkdir()
+            receipt_path = Path(tmp) / "class-acceptance" / "m4pro-48.json"
+            receipt_path.write_text(json.dumps(receipt))
+            data = copy.deepcopy(self.manifest)
+            data["hardware"]["m4pro-48"]["acceptance"].update(receipt="class-acceptance/m4pro-48.json",
+                                                             receipt_sha256=receipt["receiptSha256"])
+            path = write_manifest(tmp, data)
+            fetch = mock.patch.object(mf, "fetch_hq_file", side_effect=AssertionError("read locally"))
+            with fetch, mock.patch.object(mf, "MANIFEST_PATH", path), contextlib.chdir("/"):
+                code, out, calls = self.run_onboard({"build-mini-1": self.fresh()}, "--yes", manifest=path)
+            self.assertEqual(code, 0, out)
+            enroll = calls_to(calls, ENROLL)
+            self.assertEqual(enroll[0][2], receipt_path.read_bytes())
+
+    def test_class_receipt_resolution(self) -> None:
+        receipt = json.dumps({"fleetClass": "m6-16", "receiptSha256": "sha256:" + "e" * 64})
+        recorded = {"receipt": "class-acceptance/m6-16.json", "receipt_sha256": "sha256:" + "e" * 64}
+        with tempfile.TemporaryDirectory() as tmp:
+            copy_path = Path(tmp) / "mini-fleet.json"  # an operator's synced copy: no class-acceptance/ beside it
+            with mock.patch.object(mf, "fetch_hq_file", return_value=(receipt, "hq main")) as fetch:
+                data, why = mf.class_receipt_bytes(recorded, "m6-16", copy_path)
+            self.assertEqual((data, why), (receipt.encode(), "ok"))
+            fetch.assert_called_once_with("build-fleet/class-acceptance/m6-16.json")
+            # The digest is still checked on what main returns.
+            with mock.patch.object(mf, "fetch_hq_file", return_value=(receipt.replace("e" * 64, "f" * 64), "hq")):
+                data, why = mf.class_receipt_bytes(recorded, "m6-16", copy_path)
+            self.assertIsNone(data)
+            self.assertIn("is not the recorded", why)
+            # Main unreachable: blocked with both places named.
+            with mock.patch.object(mf, "fetch_hq_file", side_effect=mf.Failure("no gh")):
+                data, why = mf.class_receipt_bytes(recorded, "m6-16", copy_path)
+            self.assertIsNone(data)
+            self.assertIn(f"not in {Path(tmp).resolve()}", why)
+            # A relative path never climbs out of the manifest's directory.
+            with mock.patch.object(mf, "fetch_hq_file", side_effect=AssertionError("not fetched")):
+                data, why = mf.class_receipt_bytes({**recorded, "receipt": "../../etc/x.json"}, "m6-16", copy_path)
+            self.assertIsNone(data)
+            self.assertIn("inside the manifest's directory", why)
+        self.assertEqual(mf.recorded_receipt(Path("/a/b/m.json"), Path("/a/b/class-acceptance/k.json")),
+                         "class-acceptance/k.json")
+        self.assertEqual(mf.recorded_receipt(Path("/a/b/m.json"), Path("/elsewhere/k.json")), "/elsewhere/k.json")
+
     def test_node_mode_accepts_and_the_registration_hook_gets_the_token_on_stdin(self) -> None:
         minted: list = []
         hook = mock.patch.object(mf, "runner_register_command", return_value="IFS= read -r TOKEN; register")
@@ -3787,8 +3833,11 @@ class UpgradeTests(unittest.TestCase):
         acceptance = data["hardware"]["m4pro-48"]["acceptance"]
         self.assertEqual((acceptance["candidate"], acceptance["node"], acceptance["receipt_sha256"]),
                          ("3809eed51fdd", "cmux-mac-001", RECEIPT_SHA))
-        self.assertEqual(Path(acceptance["receipt"]).read_bytes(), self.receipt)
-        self.assertEqual(Path(acceptance["receipt"]).stat().st_mode & 0o777, 0o600)
+        # Recorded relative to the manifest's directory, so a committed manifest names no operator's home.
+        self.assertEqual(acceptance["receipt"], "class-acceptance/m4pro-48-3809eed51fdd.json")
+        receipt_file = self.manifest.parent / acceptance["receipt"]
+        self.assertEqual(receipt_file.read_bytes(), self.receipt)
+        self.assertEqual(receipt_file.stat().st_mode & 0o777, 0o600)
         self.assertEqual(data["candidate"], {**self.RUN, "sha256": "a" * 64})
         self.assertIn(f"+  \"candidate\": {{", out)  # the diff is printed
         rows = {line.split()[0]: line for line in out.splitlines() if line.startswith("build-mini-")}
