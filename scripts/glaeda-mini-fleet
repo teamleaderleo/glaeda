@@ -4145,8 +4145,11 @@ def read_class_receipt(receipt: str, manifest_path: Path | None) -> tuple[bytes,
     if rel.startswith("../") or rel in {".", ".."}:
         raise OSError(f"{receipt}: a relative receipt must stay inside the manifest's directory")
     base = (manifest_path or DEFAULT_MANIFEST).expanduser().resolve().parent
+    local = (base / rel).resolve()
+    if not local.is_relative_to(base):  # a symlinked directory or file that leads out of it
+        raise OSError(f"{receipt}: resolves to {local}, outside the manifest's directory {base}")
     with contextlib.suppress(FileNotFoundError):
-        return (base / rel).read_bytes(), os.fspath(base / rel)
+        return local.read_bytes(), os.fspath(local)
     try:
         text, source = fetch_hq_file(posixpath.join(posixpath.dirname(HQ_MANIFEST), rel))
     except Failure as error:

@@ -3454,6 +3454,16 @@ class OnboardTests(unittest.TestCase):
                 data, why = mf.class_receipt_bytes({**recorded, "receipt": "../../etc/x.json"}, "m6-16", copy_path)
             self.assertIsNone(data)
             self.assertIn("inside the manifest's directory", why)
+            # Nor through a symlink that leads out of it.
+            outside = Path(tmp) / "outside"
+            outside.mkdir()
+            (outside / "m6-16.json").write_text(receipt)
+            (Path(tmp) / "fleet").mkdir()
+            (Path(tmp) / "fleet" / "class-acceptance").symlink_to(outside)
+            with mock.patch.object(mf, "fetch_hq_file", side_effect=AssertionError("not fetched")):
+                data, why = mf.class_receipt_bytes(recorded, "m6-16", Path(tmp) / "fleet" / "mini-fleet.json")
+            self.assertIsNone(data)
+            self.assertIn("outside the manifest's directory", why)
         self.assertEqual(mf.recorded_receipt(Path("/a/b/m.json"), Path("/a/b/class-acceptance/k.json")),
                          "class-acceptance/k.json")
         self.assertEqual(mf.recorded_receipt(Path("/a/b/m.json"), Path("/elsewhere/k.json")), "/elsewhere/k.json")
