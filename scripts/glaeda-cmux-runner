@@ -2493,12 +2493,20 @@ def sign_hold_tips(digest: str, installed: str | None) -> list[str] | None:
     so it holds nothing (as in sign_hold_blockers)."""
     held = []
     for branch in sorted({b for _, branches in SIGN_HOLD_SOURCES for b in branches}):
-        text = sign_hold_read(SIGN_HOLD_LIST_URL.format(repo=SIGN_HOLD_REPO, sha=branch))
-        if text is None:
-            return None
-        listed = {ln.split(None, 1)[0] for ln in text.splitlines() if ln.strip() and not ln.lstrip().startswith("#")}
-        if not listed:
-            return None  # an empty answer is not a list
+        # one read per tip for SIGN_HOLD_MEMO_S, shared by every runner whatever hook it has on disk (the memo's
+        # ("tip", branch) entries, cleared with it)
+        memo = _SIGN_HOLD_MEMO.get(("tip", branch))
+        if memo and time.time() - memo[0] < SIGN_HOLD_MEMO_S:
+            listed = memo[1]
+        else:
+            text = sign_hold_read(SIGN_HOLD_LIST_URL.format(repo=SIGN_HOLD_REPO, sha=branch))
+            if text is None:
+                return None
+            listed = frozenset(ln.split(None, 1)[0] for ln in text.splitlines()
+                               if ln.strip() and not ln.lstrip().startswith("#"))
+            if not listed:
+                return None  # an empty answer is not a list
+            _SIGN_HOLD_MEMO[("tip", branch)] = (time.time(), listed, [])
         if digest not in listed and installed is not None and installed in listed:
             held.append(branch)
     return held
