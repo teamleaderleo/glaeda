@@ -525,7 +525,11 @@ FAST_JOBS = {("cmux-next.yml", "fast-tier")}
 # Mac test jobs (fast-tier-fleet, swift-test-fleet, daemon-test-fleet; the bare fast-tier, swift-test and daemon-test
 # build on the mini and are refused here); fleet-compile-check.yml,
 # fleet-test-compile.yml (vars.CI_TEST_COMPILE_GATEWAY) and cmux-next-tip-test-compile.yml, whose gateway jobs run on
-# vars.CI_COMPILE_CHECK_GATEWAY's label once it names the gateway label.
+# vars.CI_COMPILE_CHECK_GATEWAY's label once it names the gateway label; and the feat-cmux-next evals on
+# vars.CI_EVAL_STEP_GATEWAY (cmux#36955): cmux-next-perf-bench.yml's bench (cmux-ci run --label bench, the bench mini),
+# cu-driver-eval.yml's and screen-stream-eval.yml's eval (cmux-ci run --label measure). Each only submits its step and
+# waits, but waits longer than a compile client (job timeouts 420, 150 and 300 min), holding one gateway token; a
+# nightly signing drain on that mini then waits its hour. They start once a day each, one at a time per workflow.
 GATEWAY_CLASS = "gateway"
 GATEWAY_TOKEN_KIND = "gateway"  # CLASS_COST's token kind: any one of GATEWAY_TOKENS
 GATEWAY_TOKENS = ("gateway-0", "gateway-1")
@@ -533,7 +537,8 @@ GATEWAY_JOBS = frozenset({("cmux-next.yml", "app-compile-fleet"), ("cmux-next.ym
                           ("cmux-next.yml", "release-compile-fast"), ("cmux-next.yml", "fast-tier-fleet"),
                           ("cmux-next.yml", "swift-test-fleet"), ("cmux-next.yml", "daemon-test-fleet"),
                           ("fleet-compile-check.yml", "compile-check"), ("fleet-test-compile.yml", "compile"),
-                          ("cmux-next-tip-test-compile.yml", "compile")})
+                          ("cmux-next-tip-test-compile.yml", "compile"), ("cmux-next-perf-bench.yml", "bench"),
+                          ("cu-driver-eval.yml", "eval"), ("screen-stream-eval.yml", "eval")})
 GATEWAY_CAPACITY_WAIT_S = 600.0  # SIGNING_DRAIN_WAIT_S: the longest a nightly signing job waits here to drain the mini
 # exclusive (SIGNING_JOBS): more units than any mini has, so admission caps it at the mini's whole count, plus both
 # fast tokens and both gateway tokens, the capacity 0-unit jobs take (no PR client runs beside the key either), and
