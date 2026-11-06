@@ -1341,11 +1341,13 @@ def plan_install(ctx: Context, receipt: dict[str, Any] | None) -> list[dict[str,
         for old in [a for a in (receipt or {}).get("actions", [])
                     if a.get("kind") in COMPANIONS and a.get("kind") not in declared and a.get("owned")]:
             current = sha256_file(Path(str(old.get("path"))))
-            if current is not None:
-                ours = current == old.get("ownedSha256")
+            loaded = not ctx.skip_launchctl and run([LAUNCHCTL, "print", f"gui/{ctx.uid}/{old.get('label')}"])[0] == 0
+            if current is not None or loaded:
+                # a plist removed by hand while launchd still runs the job: ours by the receipt, booted out all the same
+                ours = current is None or current == old.get("ownedSha256")
                 # owned until the removal is applied, so a skipped removal (an earlier step failed) is planned again
                 actions.append({"kind": old["kind"], "label": old.get("label"), "path": old.get("path"),
-                                "state": "remove" if ours else "kept", "owned": ours,
+                                "state": "remove" if ours else "kept", "owned": ours, "loaded": loaded,
                                 "ownedSha256": current if ours else None,
                                 "note": "" if ours else "changed since this command wrote it"})
     actions.append({"kind": "verify", "state": "pending", "note": f"GET {ctx.scope_api}/actions/runners, name {ctx.name}"})
@@ -1371,7 +1373,9 @@ def plan_uninstall(ctx: Context, receipt: dict[str, Any] | None) -> list[dict[st
                     "loaded": launchctl_loaded(ctx)})
     for watch in [a for a in receipt.get("actions", []) if a.get("kind") in COMPANIONS and a.get("owned")]:
         current = sha256_file(Path(str(watch.get("path"))))
-        state = "absent" if current is None else "remove" if current == watch.get("ownedSha256") else "kept"
+        loaded = not ctx.skip_launchctl and run([LAUNCHCTL, "print", f"gui/{ctx.uid}/{watch.get('label')}"])[0] == 0
+        state = ("remove" if loaded else "absent") if current is None else \
+            "remove" if current == watch.get("ownedSha256") else "kept"
         actions.append({"kind": watch["kind"], "label": watch.get("label"), "path": watch.get("path"), "state": state,
                         "note": "changed since this command wrote it" if state == "kept" else ""})
 
@@ -1859,6 +1863,10 @@ def apply_install(ctx: Context, actions: list[dict[str, Any]], receipt_doc: dict
             if adopted:
                 receipt_doc["registration"] = adopted
                 act["note"] = "adopted the registration an interrupted --apply finished in this directory"
+        elif kind == "relay" and state in {"update", "remove"} and act.get("loaded") and runner_busy(ctx):
+            # a job may be talking through the relay: unloading it now would cut that connection
+            act["state"], act["note"] = "failed", ("the runner has a job that may use the relay; nothing changed, "
+                                                   "re-run when idle")
         elif kind in COMPANIONS and state in {"create", "update"}:
             # unloaded first, confirmed: a watch launchd still runs keeps its old plist on disk, so the next apply
             # sees the change again instead of an "unchanged" plist under an old process
@@ -2052,6 +2060,13 @@ def apply_uninstall(ctx: Context, actions: list[dict[str, Any]]) -> None:
     removing = [act for act in actions if act["state"] == "remove"]
     # a dedicated runner's watch loop goes first, confirmed: one launchd keeps would outlive everything below it,
     # so the uninstall stops there and keeps the receipt, the registration and the directory for a re-run
+    if any(a["kind"] == "relay" for a in removing) and runner_busy(ctx):
+        # the relay goes before the idle check below, so it waits for idle itself: a job may be using it
+        for other in removing:
+            other["applied"] = False
+            other["state"], other["note"] = "failed", ("the runner has a job that may use the relay; nothing removed, "
+                                                       "re-run when idle")
+        return
     for act in [a for a in removing if a["kind"] in COMPANIONS]:
         act["applied"] = False
         if not ctx.skip_launchctl and not bootout_watch(ctx, act["label"]):

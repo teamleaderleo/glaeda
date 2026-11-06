@@ -14486,8 +14486,15 @@ class DedicatedRunnerTest(unittest.TestCase):
         for ok in ("10.0.0.1:22", "192.168.4.2:2222", "172.31.255.255:22"):
             self.assertIsNone(fleet_labels.dedicated_runners(manifest_doc({**route, "lanRelay": ok}), "mini-std")[1])
         untrusted = {k: v for k, v in relayed.items() if k not in ("trustedRef", "trustedRepo")}
-        for doc in (manifest_doc(untrusted), manifest_doc(relayed, dedicated_only=False)):
+        for doc in (manifest_doc(untrusted), manifest_doc(relayed, dedicated_only=False),
+                    manifest_doc(relayed, dedicated_only="yes")):
             self.assertIn("runner.dedicatedOnly", fleet_labels.dedicated_runners(doc, "mini-std")[1] or "")
+        # a sibling dedicated runner without trustedRef runs as the same user and could open the socket
+        sibling = manifest_doc(relayed)
+        sibling["hosts"]["mini-std"]["overrides"]["runner"]["dedicated"].append(
+            {**NIGHTLY, "labels": ["glaeda-runner-mini-std-nightly-next"]})
+        self.assertIn("beside untrusted dedicated runner nightly-next",
+                      fleet_labels.dedicated_runners(sibling, "mini-std")[1] or "")
 
         def write(entry: dict) -> str:
             path = self.state / "mini-fleet.json"
@@ -14528,6 +14535,19 @@ class DedicatedRunnerTest(unittest.TestCase):
         self.assertIn("172.20.1.6", plistlib.loads((agents / f"{label}.relay.plist").read_bytes())["ProgramArguments"])
         self.assertFalse((socket_dir / "fleet-route.sock").exists())
         self.assertEqual(stat.S_IMODE(socket_dir.stat().st_mode), 0o700)
+        # a relay update while the runner has a job (that may be using it) changes nothing
+        (self.state / "loaded.json").write_text(json.dumps([label, f"{label}.relay"]))
+        with mock.patch.object(cr.pwd, "getpwuid", return_value=fake_pw), \
+                mock.patch.object(cr, "SOCKET_PATH_MAX", 4096), mock.patch.object(cr, "runner_busy", return_value=True):
+            busy = self.invoke("--apply", "--manifest", write(relayed), *args, expect=1)
+        self.assertEqual(self.by_kind(busy)["relay"]["state"], "failed")
+        self.assertIn("172.20.1.6", plistlib.loads((agents / f"{label}.relay.plist").read_bytes())["ProgramArguments"])
+        with mock.patch.object(cr.pwd, "getpwuid", return_value=fake_pw), \
+                mock.patch.object(cr, "runner_busy", return_value=True):
+            busy = self.invoke("--uninstall", "--apply", "--manifest", write(relayed), *args, expect=1)
+        self.assertTrue((agents / f"{label}.relay.plist").exists(), "nothing removed under a job")
+        self.assertTrue((agents / f"{label}.plist").exists())
+        (self.state / "loaded.json").unlink()
         # a socket path longer than sun_path refuses the relay, and nothing is written
         with mock.patch.object(cr.pwd, "getpwuid", return_value=fake_pw), mock.patch.object(cr, "SOCKET_PATH_MAX", 10):
             long = self.invoke("--apply", "--manifest", write(relayed), *args, expect=1)
@@ -14535,7 +14555,10 @@ class DedicatedRunnerTest(unittest.TestCase):
         with mock.patch.object(cr.pwd, "getpwuid", return_value=fake_pw), \
                 mock.patch.object(cr, "SOCKET_PATH_MAX", 4096):
             self.invoke("--apply", "--manifest", write(relayed), *args)
-        # the manifest drops lanRelay: the relay agent this install wrote is booted out and removed
+        # the manifest drops lanRelay: the relay agent this install wrote is booted out and removed, even when its
+        # plist was deleted by hand while launchd still runs it
+        (agents / f"{label}.relay.plist").unlink()
+        (self.state / "loaded.json").write_text(json.dumps([f"{label}.relay"]))
         with mock.patch.object(cr.pwd, "getpwuid", return_value=fake_pw):
             dropped = self.invoke("--apply", "--manifest", write(route), *args)
         self.assertEqual(self.by_kind(dropped)["relay"]["state"], "remove")

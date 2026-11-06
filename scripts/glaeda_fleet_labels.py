@@ -673,7 +673,8 @@ def dedicated_runners(manifest: Any, member: str) -> tuple[list[dict[str, Any]],
         yields = entry.get("yieldToExclusive", False)
         if not isinstance(yields, bool):
             return [], f"{where}.yieldToExclusive must be boolean"
-        relay, why = lan_relay(entry.get("lanRelay"), where, trusted_ref is not None, bool(runner.get("dedicatedOnly")))
+        relay, why = lan_relay(entry.get("lanRelay"), where, trusted_ref is not None,
+                               runner.get("dedicatedOnly") is True)
         if why:
             return [], why
         out.append({"name": name, "repo": repo, "org": org, "group": group, "labels": list(labels),
@@ -681,6 +682,12 @@ def dedicated_runners(manifest: Any, member: str) -> tuple[list[dict[str, Any]],
                     "keep": list(keep), "minFreeGib": None if floor is None else float(floor),
                     "trustedRef": trusted_ref, "trustedRepo": trusted_repo, "yieldToExclusive": yields,
                     "lanRelay": relay})
+    # LAN_RELAY: every runner of a member runs as the one macOS user, so any of them could open a relay's socket. A
+    # relay is allowed only when every dedicated entry beside it is trusted too (dedicatedOnly leaves no pool instance).
+    relays, untrusted = [d["name"] for d in out if d["lanRelay"]], [d["name"] for d in out if d["trustedRef"] is None]
+    if relays and untrusted:
+        return [], (f"{member} runner.dedicated {', '.join(relays)} declares lanRelay beside untrusted dedicated "
+                    f"runner {', '.join(untrusted)}, which runs as the same user and could open the relay's socket")
     return out, None
 
 
@@ -705,7 +712,7 @@ def lan_relay(value: Any, where: str, trusted: bool, dedicated_only: bool) -> tu
     first, second = octets[0], octets[1]
     if not (first == 10 or (first == 172 and 16 <= second <= 31) or (first == 192 and second == 168)):
         return None, f"{where}.lanRelay must be a private (RFC 1918) LAN address"
-    if not trusted or not dedicated_only:
+    if not trusted or not dedicated_only:  # dedicated_only: runner.dedicatedOnly is exactly true
         return None, (f"{where}.lanRelay needs trustedRef on an entry of a runner.dedicatedOnly member: the relay "
                       "crosses Local Network privacy only where no other runner shares the Mac")
     return ".".join(str(x) for x in octets) + f":{port}", None
