@@ -5005,6 +5005,46 @@ time.sleep(60)
         # Still a nightly job: it goes ahead of a PR job's admission as before.
         self.assertIn("goes first", hook.fair_turn(capacity, {"units"}, now - 3600, "", True, True))
 
+    def test_a_tail_or_resume_signing_job_goes_after_the_newest_push_runs_signing(self) -> None:
+        """FOLLOWS_LAST: a signing job of a dispatched tail or resume run (inputs nightly_next_post_publish or
+        nightly_next_unsigned_run) gives up SIGNS_FIRST for FOLLOWS_LAST_S, so a push run's sign or publish that
+        waits after it still goes first (cmux15 2026-11-06: push run 42244796779's sign and publish waited behind
+        a tail's publish-nightly-next-github and generate-nightly-deltas, and a resume's sign). Past the window it
+        ranks as any trusted signing job again, so it is never starved."""
+        capacity = self.dir / "capacity"
+        capacity.mkdir()
+        now, nightly = time.time(), hook.TIER_NIGHTLY
+        marker = capacity / f"{hook.ADMIT_WANT}{os.getppid()}"
+        hook.write_want(marker, now - 600, ["units"], nightly, klass=hook.EXCLUSIVE_CLASS, signs_first=True,
+                        follows=True)
+        self.assertIsNone(hook.fair_turn(capacity, {"units"}, now, nightly, True, True, signs_first=True),
+                          "a push run's sign goes ahead of an older tail signing job")
+        self.assertIn("goes first", hook.fair_turn(capacity, {"units"}, now, "", True, True),
+                      "still a nightly job: it goes ahead of a PR job's admission as before")
+        hook.write_want(marker, now - hook.FOLLOWS_LAST_S - 1, ["units"], nightly, klass=hook.EXCLUSIVE_CLASS,
+                        signs_first=True, follows=True)
+        self.assertIn("has waited longer here for units",
+                      hook.fair_turn(capacity, {"units"}, now, nightly, True, True, signs_first=True),
+                      "past FOLLOWS_LAST_S: arrival order among signing jobs again")
+        # The follower's own rank: behind a waiting push-run signer, whatever their arrival.
+        hook.write_want(marker, now, ["units"], nightly, klass=hook.EXCLUSIVE_CLASS, signs_first=True)
+        self.assertIn("is a signing job and goes first here for units",
+                      hook.fair_turn(capacity, {"units"}, now - 600, nightly, True, True, signs_first=True,
+                                     follows=True))
+
+    def test_a_tail_or_resume_run_is_told_apart_from_its_own_payload(self) -> None:
+        def payload(**inputs: str) -> dict[str, object]:
+            return {"repository": {"full_name": CMUX}, "ref": "refs/heads/nightly-next", "inputs": inputs}
+        self.assertTrue(hook.follows_run("workflow_dispatch", "nightly.yml",
+                                         payload(nightly_next_post_publish='{"source_run": "1"}')))
+        self.assertTrue(hook.follows_run("workflow_dispatch", "nightly.yml",
+                                         payload(nightly_next_unsigned_run="42240790163")))
+        self.assertFalse(hook.follows_run("workflow_dispatch", "nightly.yml",
+                                          payload(nightly_next_post_publish="", nightly_next_unsigned_run="")))
+        self.assertFalse(hook.follows_run("push", "nightly.yml", payload(nightly_next_unsigned_run="1")))
+        self.assertFalse(hook.follows_run("workflow_dispatch", "release.yml", payload(nightly_next_unsigned_run="1")))
+        self.assertFalse(hook.follows_run("workflow_dispatch", "nightly.yml", None))
+
     def test_tiers_order_the_admission_queue(self) -> None:
         """FEED_FIRST: a nightly job goes ahead of every waiter however long it has waited, and while one waits no
         admission of another tier takes a unit, not even one its own gate's reserve covers. A DEV compile goes ahead
@@ -14582,6 +14622,27 @@ class DedicatedHookTest(unittest.TestCase):
             for fd in fds:
                 os.close(fd)
         self.assertIsNone(hook.exclusive_claim(capacity))
+
+    def test_a_yielding_dedicated_runner_does_not_wait_for_a_tail_signing_job_in_its_window(self) -> None:
+        # FOLLOWS_LAST: a waiting tail or resume signing job does not hold the nightly-only runners for
+        # FOLLOWS_LAST_S, so the newest push run's own jobs keep going (cmux15 2026-11-06: prepare-nightly-variant
+        # waited 23 min and pick-nightly-sign-runner 12 min behind a tail run). Holding the mini still holds them.
+        capacity = self.dir / "capacity"
+        capacity.mkdir()
+        marker = capacity / f"{hook.ADMIT_WANT}{os.getpid()}"
+        hook.write_want(marker, time.time(), ["units"], hook.TIER_NIGHTLY, klass=hook.EXCLUSIVE_CLASS,
+                        signs_first=True, follows=True)
+        self.assertIsNone(hook.exclusive_claim(capacity))
+        hook.write_want(marker, time.time() - hook.FOLLOWS_LAST_S - 1, ["units"], hook.TIER_NIGHTLY,
+                        klass=hook.EXCLUSIVE_CLASS, signs_first=True, follows=True)
+        self.assertIn("waits for this mini", hook.exclusive_claim(capacity))
+        marker.unlink()
+        fds = [hook.lock_file(capacity / f"{token}.token", fcntl.LOCK_EX) for token in hook.GATEWAY_TOKENS]
+        try:
+            self.assertIn("holds this mini", hook.exclusive_claim(capacity))
+        finally:
+            for fd in fds:
+                os.close(fd)
 
     def test_the_gate_never_holds_a_dedicated_runner_for_the_pool(self) -> None:
         runner = self.dir / "actions-runner-glaeda-nightly-next"
