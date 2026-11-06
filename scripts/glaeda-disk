@@ -4555,9 +4555,40 @@ def newest_mtime(path: Path, levels: int = 2, budget: int = 3000, access: bool =
     return newest
 
 
+# A retired service's launchd plist, moved out of ~/Library/LaunchAgents by the tool that retired it (a fleet
+# manifest's declared retirement, applied by its heal step), lands here. A home folder only such a plist names has
+# no owner left to come back: its idle clock does not apply, so it goes on the next pass instead of 12 h after its
+# last stray touch (an evicting cache pass inside it restarted that clock every day). Everything else still holds:
+# a live configuration naming it (home_scratch_referenced), an open file, a running command, a socket, a lease, and
+# the mirror rule's bundle of unpushed git work before the delete.
+RETIRED_OWNER_DIR = ".local/state/fleet-retired-workers"  # under HOME
+
+
+def retired_owner(path: Path) -> str:
+    """The retired plist that names this home folder ("" when none does or the folder is not directly in HOME)."""
+    try:
+        if path.parent != HOME or path.is_symlink():
+            return ""
+        plists = _strict_entries(HOME / RETIRED_OWNER_DIR, "*.plist")
+    except OSError:
+        return ""
+    spellings = tuple(dict.fromkeys((*_reference_spellings(path), f"~/{path.name}", f"$HOME/{path.name}",
+                                     "${HOME}/" + path.name)))
+    for plist in plists:
+        if plist.is_symlink():
+            continue
+        text = _home_scratch_ref_text(plist)
+        if text and _mentions_any(text, spellings):
+            return plist.name
+    return ""
+
+
 def item_mtime(fam: Family, path: Path) -> float:
     """An item's last use as survey and apply judge it: its newest mtime near the top, and for SwiftPM scratch
-    also its lock, which owned_spm_scratch touches whenever a job links the directory."""
+    also its lock, which owned_spm_scratch touches whenever a job links the directory. A home folder whose only
+    owner retired (retired_owner) counts as unused since the epoch."""
+    if fam.id in HOME_SCRATCH_FAMILIES and retired_owner(path):
+        return 0.0
     # Git's index refresh rewrites metadata without using the build output. In
     # the enrolled-account profile that bookkeeping must not extend the cache's
     # reuse window. Active jobs are still protected by process evidence and the
@@ -8215,6 +8246,8 @@ def _survey(families, idle_hours, min_bytes, known, evidence, defer_bulk=False,
                                "(unpushed commits go to a verified bundle in ~/archive first)")
         if jobs is not None and verdict in ("recent", "reclaimable"):
             reasons.append(reasons_jobs)
+        if fam.id in HOME_SCRATCH_FAMILIES and (gone := retired_owner(path)):
+            reasons.append(f"its owner retired (~/{RETIRED_OWNER_DIR}/{gone}): no idle clock")
         if policy_note:
             reasons.append(policy_note)
         items.append(Item(fam.id, sp, size, round(idle, 1), verdict, reasons, jobs,

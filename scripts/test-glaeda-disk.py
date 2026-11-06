@@ -9821,6 +9821,60 @@ class HomeScratchTest(unittest.TestCase):
         bundles = sorted((self.home / "archive/glaeda-disk").glob("*.bundle"))
         self.assertEqual(len(bundles), 1)
 
+    def retire(self, label: str, tree: Path, where: str = ".local/state/fleet-retired-workers") -> Path:
+        """A worker plist naming tree (work root and working directory), as a fleet heal step moves it out of
+        ~/Library/LaunchAgents once its manifest retires the label."""
+        d = self.home / where
+        d.mkdir(parents=True, exist_ok=True)
+        plist = d / f"{label}.plist"
+        plist.write_bytes(plistlib.dumps({"Label": label, "WorkingDirectory": str(tree),
+                                          "ProgramArguments": [f"{tree}/run.sh"],
+                                          "EnvironmentVariables": {"CMUX_CI_WORK_ROOT": str(tree)}}))
+        return plist
+
+    def test_a_folder_only_a_retired_plist_names_goes_without_its_idle_clock(self) -> None:
+        # The perf worker's work root, 2026-11-06: its plist was retired, but a cache pass inside it had touched
+        # it 1.8 h before, so the 12 h clock held 10-37 GiB per mini under the runner floor for half a day.
+        tree = self.tree("cmux-ci-perf", git=True, hours=0.5)
+        fresh = self.tree("cnx-fresh", hours=0.5)
+        self.retire("ai.manaflow.cmux-perf-worker", tree)
+        fam = self.family()
+        items = self.survey(fam)
+        item = items["cmux-ci-perf"]
+        self.assertEqual(item.verdict, "reclaimable", item.reasons)
+        self.assertTrue(any("its owner retired" in r for r in item.reasons), item.reasons)
+        self.assertTrue(any("mirrors" in r for r in item.reasons), item.reasons)  # unpushed work is bundled first
+        self.assertEqual(items["cnx-fresh"].verdict, "recent")  # nothing retired names it: the clock still holds
+        self.apply(fam, item)
+        self.assertFalse(tree.exists())
+        self.assertTrue(fresh.exists())
+        self.assertEqual(len(sorted((self.home / "archive/glaeda-disk").glob("*.bundle"))), 1)
+
+    def test_a_retired_owner_never_overrides_a_live_reference_or_an_open_file(self) -> None:
+        tree = self.tree("actions-runner-nightly-next", hours=0.5)
+        self.retire("ai.manaflow.nightly-builder.runner", tree)
+        live = self.retire("ai.manaflow.nightly-builder.watch", tree, where="Library/LaunchAgents")
+        fam = self.family()
+        item = self.survey(fam)["actions-runner-nightly-next"]
+        self.assertEqual(item.verdict, "in-use")
+        self.assertIn(f"named by {live}", item.reasons)
+        live.unlink()
+        item = self.survey(fam, opened=[str(tree / "evidence.bin")])["actions-runner-nightly-next"]
+        self.assertEqual(item.verdict, "in-use")
+        self.assertIn("open by a process", item.reasons)
+        item = self.survey(fam, cmds=f"/bin/sh {tree}/run.sh")["actions-runner-nightly-next"]
+        self.assertEqual(item.verdict, "in-use")
+
+    def test_only_the_retired_directory_counts_and_only_for_home_folders(self) -> None:
+        tree = self.tree("cnx-elsewhere", hours=0.5)
+        self.retire("ai.manaflow.cmux-perf-worker", tree, where=".local/state/other")
+        self.assertEqual(gd.retired_owner(tree), "")
+        self.assertEqual(self.survey(self.family())["cnx-elsewhere"].verdict, "recent")
+        nested = self.home / "cnx-elsewhere/inner"
+        nested.mkdir()
+        self.retire("ai.manaflow.x-worker", nested)
+        self.assertEqual(gd.retired_owner(nested), "")  # never an item below the top of HOME
+
     def test_kept_by_role_never_listed(self) -> None:
         for name in (*gd.HOME_SCRATCH_KEEP, ".cache", ".rustup", "actions-runner-glaeda-3"):
             self.tree(name)
