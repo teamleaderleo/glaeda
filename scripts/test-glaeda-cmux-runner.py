@@ -9295,6 +9295,32 @@ class GateTest(unittest.TestCase):
             marker.write_text(json.dumps({**json.loads(marker.read_text()), "purpose": "readiness soak"}))
             self.assertIn("host reserved by cmux-nightly", nightly.claimed() or "", "any other purpose holds it")
 
+    def test_the_trusted_signing_runner_spends_the_builders_reserve_but_keeps_its_measured_floor(self) -> None:
+        """The nightly's own sign and publish jobs run on the --trusted-next-signing runner. The builder's reserve keeps
+        other runners off the nightly's disk, so it must not hold the nightly itself: on cmux15 at 42-46 GiB free the
+        reserve (30 + 20, 52 to resume) held both trusted listeners 03:41-03:55Z and publish-nightly waited 10.5 min
+        (cmux run 42149108998; 10.1 and 12.3 min on two more of seven runs). Like a nightly-only listener (#1774), it
+        keeps the measured single-job floor and the resume margin."""
+        write_hook(self.runner, "exec python3 /hook job-started --min-free-gib 30 --capacity-units 14 "
+                                "--trusted-next-signing\n")
+        builder = self.tmp / "actions-runner-glaeda-nightly-next"
+        builder.mkdir()
+        write_hook(builder, "exec python3 /hook job-started --min-free-gib 30 --dedicated-admit /admit.sh\n")
+        gate = hook.Gate(self.runner, os.fspath(self.lock), os.fspath(self.tmp / "none.json"), self.state)
+        gate.held = "disk: 42.7 GiB free, 52 GiB required"
+        free = {"gib": 42.7}
+        usage = lambda _path: mock.Mock(free=int(free["gib"] * 1024**3))  # noqa: E731
+        with mock.patch.object(hook.shutil, "disk_usage", side_effect=usage), \
+                mock.patch.object(gate, "evict_in_background"), \
+                mock.patch.object(gate, "evict_idle_in_background"), \
+                mock.patch.dict(os.environ, {hook.DISK_JOB_PEAK_ENV: "20"}):
+            self.assertIsNone(gate.low_disk(), "a held trusted signing listener resumes within the builder's reserve")
+            free["gib"] = 19.0
+            self.assertIn("22 GiB required (20 GiB floor + 2 GiB to resume)", gate.low_disk() or "",
+                          "resume hysteresis still applies, and the hold names the floor job-started refuses under")
+            gate.child = mock.Mock(pid=1)
+            self.assertIn("20 GiB required", gate.low_disk() or "", "a listening signer keeps the measured floor")
+
     def test_nightly_listener_spends_reserve_but_keeps_measured_disk_floor(self) -> None:
         write_hook(self.runner, "exec python3 /hook job-started --min-free-gib 30 --nightly-runner\n")
         gate = hook.Gate(self.runner, os.fspath(self.lock), os.fspath(self.tmp / "none.json"), self.state)
