@@ -702,6 +702,19 @@ def installed_pool_instances(member: str) -> tuple[list[int] | None, str | None]
     return sorted(receipts), None
 
 
+def repo_dedicated_only(member: str, summary: dict[str, Any], manifest: dict[str, Any]) -> bool:
+    """REPO_DEDICATED_ONLY: whether every runner an apply would touch on the member is a repository-scoped dedicated
+    runner: runner.dedicatedOnly, at least one dedicated entry and none at org scope, and no pool instance installed
+    (read on the member; unreadable is False, so the org group check stays)."""
+    if summary.get("dedicatedOnly") is not True:
+        return False
+    entries, bad = load_labels().dedicated_runners(manifest, member)
+    if bad or not entries or any(e.get("org") for e in entries):
+        return False
+    installed, _ = installed_pool_instances(member)
+    return installed == []
+
+
 def retire_instance(member: str, instance: int, held: str = "dedicated runners held") -> dict[str, Any]:
     """Deregister and remove one pool instance, by its receipt: every pool instance of a dedicatedOnly member, and on
     any other member each instance at or past runners + gatewayRunners (SURPLUS). A runner with a job is never
@@ -1063,7 +1076,10 @@ def main(argv: list[str] | None = None) -> int:
                   file=sys.stderr)
             return 2
     if args.apply:  # every org group a member would register into, checked before any member is touched
-        groups = {member_scope(args, manifest, m)[1:] for m in chosen}
+        # REPO_DEDICATED_ONLY: a member the apply touches only through repository-scoped dedicated runners registers
+        # nothing in the org group, so the group is not its to check (and listing it needs an org admin it never uses)
+        groups = {member_scope(args, manifest, m)[1:] for m, s in chosen.items()
+                  if args.migrate_from_repo or not repo_dedicated_only(m, s, manifest)}
         for org, group in sorted((o, g) for o, g in groups if o and g):
             why = group_refusal(org, group, args.migrate_from_repo)
             if why:

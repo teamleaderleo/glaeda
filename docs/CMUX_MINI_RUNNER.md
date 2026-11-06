@@ -1108,6 +1108,9 @@ deregisters and removes every pool instance it finds on the member (by each inst
 the receipt's own scope), then applies the dedicated entries. An instance with a job is never stopped: its uninstall
 fails ("the runner has a job") and changes nothing, so drain the mini first (`cmux-ci drain --hosts M`) and re-run.
 `glaeda-cmux-runner --apply` refuses a pool instance on such a member; `--uninstall` still removes one.
+When every runner the apply would touch on such a member is a repository-scoped dedicated runner (no org-scoped entry,
+no pool instance installed), the fleet apply skips the org runner-group check for it: it registers nothing in that
+group, and the check is an org-admin read. Every other member keeps the check.
 
 On the mini, under the runner lock every `--apply` holds:
 - A dedicated `--apply` refuses while any pool receipt or pool runner directory is there. It enumerates them with

@@ -368,6 +368,36 @@ class FleetTest(unittest.TestCase):
         staged = json.loads((self.dir / "calls.jsonl.mini-a.manifest").read_text())
         self.assertEqual(staged["hosts"]["mini-a"]["overrides"]["runner"]["dedicated"][0]["name"], "nightly-next")
 
+    def test_a_repo_dedicated_only_member_needs_no_org_group_but_every_other_member_does(self) -> None:
+        """REPO_DEDICATED_ONLY: a dedicatedOnly member whose only runners are repository-scoped dedicated ones
+        registers nothing in the org group, so the apply neither lists the group (an org-admin read) nor refuses on
+        it. A pool instance still installed there, an org-scoped entry, or any other member keeps the check."""
+        manifest = json.loads(json.dumps(MANIFEST))
+        manifest["defaults"]["runner"] = {"org": "manaflow-ai", "group": "glaeda-minis"}
+        entry = {"name": "fleet-route", "repo": "manaflow-ai/other", "trustedRef": "refs/heads/main",
+                 "trustedRepo": "manaflow-ai/other", "labels": ["glaeda-fleet-route"], "admit": ["/usr/bin/true"]}
+        manifest["hosts"]["mini-a"]["overrides"] = {"runner": {"dedicatedOnly": True, "dedicated": [entry]}}
+        self.manifest.write_text(json.dumps(manifest))
+        result = self.fleet("--apply", "--hosts", "mini-a", FAKE_GROUPS="[]")  # no group is visible to this login
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        row = json.loads(result.stdout)["members"][0]
+        self.assertEqual(row["instances"][-1]["dedicated"], "fleet-route")
+        self.assertFalse([c for c in self.calls() if c["tool"] == "gh" and any("runner-groups" in a for a in c["argv"])])
+        applies = [c for c in self.calls() if c["tool"] == "ssh" and "--dedicated" in c["remote"]]
+        self.assertIn("--repo manaflow-ai/other", applies[0]["remote"])
+        # a pool instance still installed there: the apply would retire it, so the group is checked again
+        self.log.unlink()
+        Path(f"{self.log}.receipts.mini-a").unlink(missing_ok=True)
+        refused = self.fleet("--apply", "--hosts", "mini-a", FAKE_GROUPS="[]", FAKE_RECEIPTS="mini-a=0")
+        self.assertEqual(refused.returncode, 2, refused.stdout + refused.stderr)
+        self.assertIn("no runner group named 'glaeda-minis'", refused.stderr)
+        # an org-scoped dedicated entry, and a member with pool runners, keep the check
+        org_entry = {k: v for k, v in entry.items() if k not in ("repo", "trustedRef", "trustedRepo")}
+        manifest["hosts"]["mini-a"]["overrides"]["runner"]["dedicated"] = [{**org_entry, "org": "manaflow-ai"}]
+        self.manifest.write_text(json.dumps(manifest))
+        self.assertIn("no runner group", self.fleet("--apply", "--hosts", "mini-a", FAKE_GROUPS="[]").stderr)
+        self.assertIn("no runner group", self.fleet("--apply", "--hosts", "mini-b", FAKE_GROUPS="[]").stderr)
+
     def test_with_no_scope_flags_each_member_registers_where_the_manifest_says(self) -> None:
         """A re-apply needs no --org/--group: runner.org and runner.group come from the manifest (defaults or a host's
         overrides), a trusted-only member stays on its repository, and the group is checked before anything changes."""
