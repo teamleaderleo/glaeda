@@ -11783,7 +11783,9 @@ class RunnerTest(unittest.TestCase):
 
     def test_sign_hold_ends_at_its_cap(self) -> None:
         hooks = self.signing_install()
-        self.github([(7, "queued", self.OLD_SHA)], {self.OLD_SHA: f"{self.older_digest()} old\n"})
+        tip = f"{self.older_digest()} old\n{self.new_digest()} new\n"
+        self.github([(7, "queued", self.OLD_SHA)], {self.OLD_SHA: f"{self.older_digest()} old\n",
+                                                   **{branch: tip for branch in ("nightly-next", "main")}})
         state = self.home / ".local/state/glaeda/cmux-runner" / cr.SIGN_HOLD_STATE
         self.assertEqual(self.invoke("--refresh-hooks", "--apply")["runners"][0]["state"], "deferred")
         first = json.loads(state.read_text())
@@ -11796,6 +11798,36 @@ class RunnerTest(unittest.TestCase):
         with contextlib.redirect_stderr(err):
             self.assertEqual(self.invoke("--refresh-hooks", "--apply")["runners"][0]["state"], "updated")
         self.assertIn("SIGN HOLD CAP", err.getvalue())
+        self.assertEqual((hooks / cr.HOOK_NAME).read_bytes(), HOOK.read_bytes())
+
+    def test_sign_hold_cap_never_installs_a_hook_a_signing_branch_tip_does_not_list(self) -> None:
+        # 2026-11-06: the cap installed hook 5836275a on cmux15's signing runners at 11:17Z while nightly-next's list
+        # lacked it, and every nightly-next sign job after that was refused at "Set up runner" for hours (cmux
+        # 42235384601 to 42238047014). Past the cap the hold still keeps the old hook while a branch whose signing
+        # jobs this runner admits lists the old hook at its tip and not the new one: installing would refuse every
+        # new run of that branch too, not only the queued ones.
+        hooks = self.signing_install()
+        old_only = f"{self.older_digest()} old\n"
+        lists = {self.OLD_SHA: old_only, "nightly-next": old_only, "main": "f" * 64 + " neither\n"}
+        self.github([(7, "queued", self.OLD_SHA)], lists)
+        state = self.home / ".local/state/glaeda/cmux-runner" / cr.SIGN_HOLD_STATE
+        self.assertEqual(self.invoke("--refresh-hooks", "--apply")["runners"][0]["state"], "deferred")
+        first = json.loads(state.read_text())
+        first["since"] -= cr.SIGN_HOLD_CAP_S
+        state.write_text(json.dumps(first))
+        cr._SIGN_HOLD_MEMO.clear()
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            done = self.invoke("--refresh-hooks", "--apply")["runners"][0]
+        self.assertEqual(done["state"], "deferred")
+        self.assertIn("nightly-next", done["note"])
+        self.assertNotIn("SIGN HOLD CAP: hook", err.getvalue())
+        self.assertEqual((hooks / cr.HOOK_NAME).read_text(), self.OLDER_HOOK)
+        # once the tip lists the new hook, the capped hold installs it
+        lists["nightly-next"] = f"{self.older_digest()} old\n{self.new_digest()} new\n"
+        cr._SIGN_HOLD_MEMO.clear()
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(self.invoke("--refresh-hooks", "--apply")["runners"][0]["state"], "updated")
         self.assertEqual((hooks / cr.HOOK_NAME).read_bytes(), HOOK.read_bytes())
 
     def test_sign_hold_keeps_the_old_hook_when_github_cannot_be_read(self) -> None:
