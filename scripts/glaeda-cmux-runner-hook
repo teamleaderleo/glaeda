@@ -155,9 +155,10 @@ BACKGROUND_DISK_TIMEOUT_ENV = "GLAEDA_RUNNER_BACKGROUND_DISK_TIMEOUT"  # GLAEDA_
 # retries its own while it skips as busy, within this budget.
 EVICT_TIMEOUT_S = 300
 EVICT_BUSY_PAUSE_S = 2.0  # between a pass of evict()'s own that skipped as busy and its next look
-# The free disk a job is refused under, after eviction: the measured disk growth of one CMUX job, rounded up (p99
-# 10.8 GiB, max 18.7 GiB). The runner floor (--min-free-gib, the manifest's disk.min_free_gib, 30 GiB since HQ #967, a
-# judgement rather than a measurement) still decides when to evict, the pre-job target and when the gate warns; it no longer refuses a job that fits. A runner that takes cmux's tours keeps the tour floor
+# The free disk under which a job is admitted with a warning, after eviction: the measured disk growth of one CMUX job,
+# rounded up (p99 10.8 GiB, max 18.7 GiB). The runner floor (--min-free-gib, the manifest's disk.min_free_gib, 30 GiB
+# since HQ #967, a judgement rather than a measurement) still decides when to evict, the pre-job target and when the
+# gate warns; no disk floor refuses a job (2026-11-07). A runner that takes cmux's tours keeps the tour floor
 # (runner_floor_gib), which cmux measured for those jobs. glaeda-cmux-job/v1 completed lines record disk_free_start_gib,
 # disk_free_end_gib (#1650) and disk_free_min_gib, so this can be resized from build-nightly-app's own peak.
 DISK_JOB_PEAK_GIB = 20.0
@@ -264,14 +265,14 @@ def wait_disk_low_turn(capacity_dir: Path, worker: int, still_low: Callable[[], 
 
 
 def admit_floor_gib(min_free_gib: float, takes_tours: bool) -> float:
-    """The free disk a job is refused under after eviction: the runner floor, capped at one job's measured disk
+    """The free disk a job is warned under after eviction: the runner floor, capped at one job's measured disk
     growth (job_disk_gib), except on a runner that takes cmux's tours, whose floor is cmux's own measure."""
     return min_free_gib if takes_tours else min(min_free_gib, job_disk_gib())
 # Before every job, not after it (Leo, 2026-10-26: "Just throw it away. Just delete more stuff, more often"): free disk
 # is brought to the pre-job target, the floor plus PREJOB_MARGIN_GIB, before a job is admitted. Only checking the floor
 # admitted several jobs at 31 GiB under a 30 GiB floor, and together they wrote the disk down to 0.1 GiB while every
 # pass skipped as busy (cmuxs-mac-mini-6, 2026-10-25 18:46-19:02). Above the floor a job waits at most PREJOB_WAIT_S
-# for the queued pass and is then admitted; under it, evict() and the floor refusal (the job runs elsewhere) apply.
+# for the queued pass and is then admitted; under it, evict() runs and the job is admitted with a warning.
 PREJOB_MARGIN_GIB = 20.0  # glaeda-disk's target_margin_gib, the room it frees above the floor
 PREJOB_MARGIN_ENV = "GLAEDA_RUNNER_PREJOB_MARGIN_GIB"
 PREJOB_WAIT_S = 30.0
@@ -9652,11 +9653,11 @@ def main(argv: list[str] | None = None) -> int:
     if args.phase == "busy":
         return runner_busy_main([os.fspath(args.runner_dir)] if args.runner_dir else [])
     args.min_free_gib = runner_floor_gib(args.min_free_gib, args.gui_runner or args.session_runner)
-    # the floor a job is refused under, after eviction (DISK_JOB_PEAK_GIB); a tour runner's floor is cmux's measure
+    # the floor a job is warned under, after eviction (DISK_JOB_PEAK_GIB); a tour runner's floor is cmux's measure
     admit_floor = admit_floor_gib(args.min_free_gib, args.gui_runner or args.session_runner)
     if args.dedicated_admit:
         # a dedicated runner's floor is its builder's own (runner.dedicated minFreeGib): never capped at one job's
-        # measured growth, so the hook refuses where the builder would, and the gate holds the runner off there
+        # measured growth, so the hook warns where the builder would refuse, and the gate holds the runner off there
         admit_floor = args.min_free_gib
     # the runner LaunchAgent's environment can switch sampling off fleet-wide without a reinstall
     telemetry = not args.no_telemetry and os.environ.get("GLAEDA_RUNNER_TELEMETRY", "1") != "0"
@@ -9856,12 +9857,18 @@ def main(argv: list[str] | None = None) -> int:
             return refused(why)
 
         def disk_why() -> str | None:
-            """The refusal for this job's disk, after eviction: under the admission floor. Under the runner floor this
-            job first waits for the disk ledger's turn (wait_disk_low_turn) and is admitted with a warning if it never
-            comes."""
+            """After eviction a disk floor warns and never refuses: a busy machine makes a job slower, never makes it
+            fail (cmux's fleet/test-compile failed at "Set up runner" on cmux22 at 17.8 GiB free under the 20 GiB
+            admission floor, 2026-11-07). Under the admission floor the job is admitted at once with a warning; under
+            the runner floor it first waits for the disk ledger's turn (wait_disk_low_turn). The one refusal left is
+            an unpinned Runner.Worker's, which the capacity admission refuses anyway."""
             low = disk_refusal(disk_path, admit_floor)
-            if low or admit_floor >= args.min_free_gib or not disk_refusal(disk_path, args.min_free_gib):
-                return low
+            if low:
+                print(f"{PREFIX}: warning: {low}: admitted under the admission floor after eviction "
+                      "(a disk floor warns, never refuses)", flush=True)
+                return None
+            if admit_floor >= args.min_free_gib or not disk_refusal(disk_path, args.min_free_gib):
+                return None
             # only a pinned Runner.Worker takes the ledger's turn: its marker lives exactly as long as that job
             if owner is None:
                 return f"{disk_refusal(disk_path, args.min_free_gib) or 'under the disk floor'}: " \
@@ -9875,10 +9882,13 @@ def main(argv: list[str] | None = None) -> int:
                                       0.0 if nightly_disk else min(DISK_LOW_WAIT_S, max(0.0, disk_deadline - started)))
             disk_low_waited[0] += time.monotonic() - started
             low = disk_refusal(disk_path, admit_floor)  # read again: it may have waited for the ledger
-            if turn and not low:
+            if low:
+                print(f"{PREFIX}: warning: {low}: admitted under the admission floor after waiting for the disk "
+                      "ledger's turn (a disk floor warns, never refuses)", flush=True)
+            elif turn:
                 print(f"{PREFIX}: warning: {under}: {turn}; admitted without the disk ledger's turn after waiting "
                       "for it (a disk floor warns, never refuses)", flush=True)
-            return low
+            return None
 
         disk_low_waited = [0.0]  # seconds disk_why spent waiting for the disk ledger's turn
         why = disk_why()

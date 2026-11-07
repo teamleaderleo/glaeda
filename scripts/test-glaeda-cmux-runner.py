@@ -1583,13 +1583,25 @@ class HookTest(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertIn("glaeda_reservation.py is missing", result.stdout)
 
-    def test_disk_floor_refuses(self) -> None:
+    def worker_stand_in(self) -> subprocess.Popen:
+        """A stand-in Runner.Worker an admitted job's holder watches, ended at cleanup so the holder lets go."""
+        proc = subprocess.Popen(["/bin/sleep", "60"])
+        self.addCleanup(proc.wait)
+        self.addCleanup(proc.kill)
+        return proc
+
+    def test_disk_floor_warns_and_admits(self) -> None:
+        """A disk floor warns, never refuses (cmux22, 2026-11-07: fleet/test-compile failed in "Set up runner" at
+        17.8 GiB free under the 20 GiB admission floor)."""
         self.fleet()
-        result = self.started("--min-free-gib", "999999999", env={hook.DISK_JOB_PEAK_ENV: "10000"})
-        self.assertEqual(result.returncode, 1)
-        self.assertIn("GiB required", result.stdout)
-        self.assertNotIn("disk floor", result.stdout, "--no-disk: no eviction either")
-        self.assertTrue(self.lock_free())
+        result = self.started("--min-free-gib", "999999999", watch=self.worker_stand_in().pid,
+                              env={hook.DISK_JOB_PEAK_ENV: "10000"})
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertRegex(result.stdout, r"warning: [0-9.]+ GiB free, 10000 GiB required: admitted under the "
+                                        r"admission floor after eviction \(a disk floor warns, never refuses\)\n")
+        self.assertIn("admitted: push on manaflow-ai/cmux", result.stdout)
+        self.assertNotIn("refused", result.stdout)
+        self.assertNotIn("disk floor:", result.stdout, "--no-disk: no eviction either")
 
     def test_the_gui_and_session_runners_refuse_under_the_floor_a_cmux_next_tour_needs(self) -> None:
         """job-started holds the runners that take cmux-next tours to cmux's tour-requirements.json floor (vendored
@@ -1621,7 +1633,7 @@ class HookTest(unittest.TestCase):
                 self.assertEqual(code, 1)
                 self.assertEqual(floors, [floor])
 
-    def test_disk_floor_evicts_before_refusing(self) -> None:
+    def test_disk_floor_evicts_before_warning(self) -> None:
         self.fleet()
         marker = self.dir / "disk-ran"
         disk = make_executable(self.dir / "glaeda-disk-fake", "import pathlib, sys\n"
@@ -1629,15 +1641,14 @@ class HookTest(unittest.TestCase):
         push = event(self.dir, "push", {"repository": CMUX})
         result = self.run_hook("job-started", "push", push, "--allowed-repo", "manaflow-ai/cmux", "--disk",
                                os.fspath(disk), "--min-free-gib", "999999999", "--state-dir",
-                               os.fspath(self.dir / "state"), "--watch-pid", str(os.getpid()), repo="manaflow-ai/cmux",
-                               env={hook.DISK_JOB_PEAK_ENV: "10000"})
-        self.assertEqual(result.returncode, 1, result.stdout)
+                               os.fspath(self.dir / "state"), "--watch-pid", str(self.worker_stand_in().pid),
+                               repo="manaflow-ai/cmux", env={hook.DISK_JOB_PEAK_ENV: "10000"})
+        self.assertEqual(result.returncode, 0, result.stdout)
         self.assertRegex(result.stdout, r"under the 1e\+09 GiB disk floor: glaeda-disk exited 0, freed -?[0-9.]+ GiB\n")
         self.assertEqual(marker.read_text(), "--pressure --apply --top 0 --floor-gib 1e+09",
                          "told the floor, so it does not wait for the job that holds this runner")
-        self.assertLess(result.stdout.index("disk floor"), result.stdout.index("refused"), "evicted, then refused")
-        self.assertIn("GiB required", result.stdout)
-        self.assertTrue(self.lock_free())
+        self.assertLess(result.stdout.index("disk floor"), result.stdout.index("warning:"), "evicted, then warned")
+        self.assertIn("GiB required: admitted under the admission floor", result.stdout)
         # the runner hooks already carry this floor, which glaeda-disk reads itself: no --floor-gib, so a
         # glaeda-disk from before it still runs
         own = self.dir / "actions-runner" / hook.RUNNER_HOOK_SCRIPT
@@ -1792,13 +1803,13 @@ class HookTest(unittest.TestCase):
         push = event(self.dir, "push", {"repository": CMUX})
         result = self.run_hook("job-started", "push", push, "--allowed-repo", "manaflow-ai/cmux", "--disk",
                                os.fspath(disk), "--min-free-gib", "999999999", "--state-dir",
-                               os.fspath(self.dir / "state"), "--watch-pid", str(os.getpid()), repo="manaflow-ai/cmux",
-                               env={hook.DISK_JOB_PEAK_ENV: "10000"})
-        self.assertEqual(result.returncode, 1, result.stdout)
+                               os.fspath(self.dir / "state"), "--watch-pid", str(self.worker_stand_in().pid),
+                               repo="manaflow-ai/cmux", env={hook.DISK_JOB_PEAK_ENV: "10000"})
+        self.assertEqual(result.returncode, 0, result.stdout)
         self.assertRegex(result.stdout, r"disk floor: waited [0-9]+ s for a running glaeda-disk pass; "
                                         r"glaeda-disk exited 0, freed")
         self.assertGreater(float(marker.read_text()), released, "its own pass ran only once the lock was free")
-        self.assertIn("GiB required", result.stdout)
+        self.assertIn("GiB required: admitted under the admission floor", result.stdout)
 
     def test_floor_eviction_skips_its_own_pass_when_the_running_one_freed_enough(self) -> None:
         self.hold_evict_lock(1)
@@ -1979,6 +1990,7 @@ class HookTest(unittest.TestCase):
 
     def test_job_started_stops_waiting_for_the_turn_once_the_disk_is_under_the_admission_floor(self) -> None:
         self.fleet()
+        job = self.worker_stand_in()
         args = ("--min-free-gib", "30", "--capacity-dir", os.fspath(self.dir / "capacity"))
         holder = subprocess.Popen(["/bin/sleep", "60"])
         self.addCleanup(holder.wait)
@@ -2012,13 +2024,15 @@ class HookTest(unittest.TestCase):
                 code = hook.main(["job-started", "--allowed-repo", "manaflow-ai/cmux", "--no-disk",
                                   "--reservation", os.fspath(self.dir / "fleet" / "reservation.json"),
                                   "--host-lock", os.fspath(self.dir / "fleet" / "host.lock"), *args,
-                                  "--state-dir", os.fspath(self.dir / "state"), "--watch-pid", str(os.getpid()),
+                                  "--state-dir", os.fspath(self.dir / "state"), "--watch-pid", str(job.pid),
                                   "--gui-wait", "0"])
-        # refused at once under the admission floor, not after the rest of the 30 s wait, and with no "admitted" line
+        # admitted at once under the admission floor, not after the rest of the 30 s wait, with that one warning
         self.assertLess(time.monotonic() - start, 10.0)
-        self.assertEqual(code, 1, out.getvalue())
-        self.assertIn("refused: 1.0 GiB free", out.getvalue())
+        self.assertEqual(code, 0, out.getvalue())
+        self.assertIn("warning: 1.0 GiB free, 20 GiB required: admitted under the admission floor after waiting",
+                      out.getvalue())
         self.assertNotIn("admitted without the disk ledger's turn", out.getvalue())
+        self.assertNotIn("refused", out.getvalue())
 
     def test_wait_disk_low_turn_takes_the_turn_once_the_other_job_ends(self) -> None:
         capacity = self.dir / "capacity"
@@ -2191,9 +2205,10 @@ class HookTest(unittest.TestCase):
             self.assertFalse(hook.pass_active())
 
     def test_the_floor_is_checked_again_after_the_prejob_wait(self) -> None:
-        """Running jobs can write the disk below the floor while this one waits: it then evicts and is refused, as
-        under the floor before the wait."""
+        """Running jobs can write the disk below the floor while this one waits: it then evicts and is admitted with
+        a warning, as under the floor before the wait."""
         self.fleet()
+        job = self.worker_stand_in()
         frees = iter([35.0, 35.0, 35.0, 15.0])  # the three floor checks, then the one after the wait
         last = [35.0]
 
@@ -2213,13 +2228,13 @@ class HookTest(unittest.TestCase):
             code = hook.main(["job-started", "--allowed-repo", "manaflow-ai/cmux",
                               "--reservation", os.fspath(self.dir / "fleet" / "reservation.json"),
                               "--host-lock", os.fspath(self.dir / "fleet" / "host.lock"), "--min-free-gib", "30",
-                              "--state-dir", os.fspath(self.dir / "state"), "--watch-pid", str(os.getpid())])
-        self.assertEqual(code, 1, out.getvalue())
+                              "--state-dir", os.fspath(self.dir / "state"), "--watch-pid", str(job.pid)])
+        self.assertEqual(code, 0, out.getvalue())
         ev.assert_called_once()
         text = out.getvalue()
         self.assertLess(text.index("pre-job target"), text.index("disk floor"))
-        self.assertIn("15.0 GiB free, 20 GiB required", text, "refused under one job's measured disk growth")
-        self.assertTrue(self.lock_free())
+        self.assertIn("warning: 15.0 GiB free, 20 GiB required: admitted under the admission floor", text,
+                      "warned under one job's measured disk growth")
 
     def test_prejob_margin_override_is_bounded(self) -> None:
         for value, want in (("5", 5.0), ("0", 0.0), ("-1", 20.0), ("501", 20.0), ("nan", 20.0), ("x", 20.0)):
