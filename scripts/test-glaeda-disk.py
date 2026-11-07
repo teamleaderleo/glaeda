@@ -4709,8 +4709,9 @@ class GlaedaDiskTest(unittest.TestCase):
                 mock.patch.object(gd, "evict_idle_runner_checkouts", return_value=0), \
                 mock.patch.object(gd, "clear_stale_build_markers", return_value=0), \
                 mock.patch.object(gd, "repack_runner_checkouts", return_value=0), \
-                mock.patch.object(gd, "notify_disk"), contextlib.redirect_stdout(io.StringIO()):
+                mock.patch.object(gd, "notify_disk"), contextlib.redirect_stdout(out := io.StringIO()):
             status = gd.main(argv + ["--no-snapshot", "--top", "0", "--receipt", os.fspath(self.receipt())])
+        self.said = out.getvalue()  # what the run printed, for a test that checks its wording
         rows = [json.loads(x) for x in log.read_text().splitlines()] if log.exists() else []
         return status, rows, survey, apply
 
@@ -5164,6 +5165,54 @@ class GlaedaDiskTest(unittest.TestCase):
                          (os.getpid(), "glaeda-disk --pressure --apply --top 0"))
         self.assertIsNotNone(row["evict_owner"]["since"])
         cap.assert_not_called()
+        survey.assert_not_called()
+
+    def test_a_floor_run_waits_for_the_running_eviction_and_then_takes_its_turn(self) -> None:
+        """A mini at 47.8 GiB free against a 50 GiB floor skipped every out-of-band run as eviction_busy while the
+        holder evicted families the floor did not need (glaeda#1897 F2). A run the floor needs waits for its turn."""
+        _, _, p_lock, p_pending = self._queue()
+        with p_lock, p_pending, mock.patch.dict(os.environ, {gd.CALLER_ENV: "test"}), \
+                mock.patch.object(gd, "EVICT_WAIT_POLL_S", 0.01), \
+                mock.patch.object(gd, "eviction_lock_is_held", side_effect=[True, True, False]) as held, \
+                mock.patch.object(gd, "cmux_next_ci_cap_state", return_value=None):
+            status, rows, survey, _ = self._main_run(["--pressure", "--apply"], free_gib=28.0)
+        self.assertEqual(status, 0)
+        row = rows[-1]
+        self.assertEqual(row["skipped"], None, "it waited for the lock and ran; it did not skip")
+        self.assertEqual(row["evict_floor_wait"], "took its turn")
+        self.assertGreater(held.call_count, 1, "it probed again instead of giving up on the first answer")
+        survey.assert_called()
+
+    def test_a_floor_runs_wait_that_expires_says_the_holders_pass_serves_the_floor(self) -> None:
+        """The wait is bounded: it never blocks a floor run behind a long eviction, and the line says who serves."""
+        _, _, p_lock, p_pending = self._queue()
+        lock = self.root / "evict.lock"
+        with p_lock, p_pending, lock.open("a") as busy, mock.patch.dict(os.environ, {gd.CALLER_ENV: "test"}), \
+                mock.patch.object(gd, "EVICT_WAIT_FLOOR_S", 0.05), \
+                mock.patch.object(gd, "EVICT_WAIT_POLL_S", 0.01), \
+                mock.patch.object(gd, "cmux_next_ci_cap_state", return_value=None):
+            fcntl.flock(busy, fcntl.LOCK_EX)
+            status, rows, survey, _ = self._main_run(["--pressure", "--apply"], free_gib=28.0)
+        self.assertEqual(status, 0)
+        row = rows[-1]
+        self.assertEqual((row["skipped"], row["evict_floor_wait"]), ("eviction_busy", "expired"))
+        self.assertIn("its pass serves this floor", self.said)
+        survey.assert_not_called()
+
+    def test_a_run_above_the_floor_still_skips_a_held_lock_at_once(self) -> None:
+        """Manual and LaunchAgent runs above the floor keep today's behaviour: no wait, no sleep."""
+        _, _, p_lock, p_pending = self._queue()
+        lock = self.root / "evict.lock"
+        with p_lock, p_pending, lock.open("a") as busy, mock.patch.dict(os.environ, {gd.CALLER_ENV: "test"}), \
+                mock.patch.object(gd.time, "sleep") as slept, \
+                mock.patch.object(gd, "cmux_next_ci_cap_state", return_value=None):
+            fcntl.flock(busy, fcntl.LOCK_EX)
+            status, rows, survey, _ = self._main_run(["--pressure", "--apply"], free_gib=100.0)
+        self.assertEqual(status, 0)
+        row = rows[-1]
+        self.assertEqual((row["skipped"], row["evict_floor_wait"]), ("eviction_busy", None))
+        self.assertNotIn("serves this floor", self.said)
+        slept.assert_not_called()
         survey.assert_not_called()
 
     def test_the_run_line_names_its_caller_without_the_variable(self) -> None:

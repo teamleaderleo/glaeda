@@ -301,7 +301,12 @@ What `--apply` does:
      one, the disk-pressure LaunchAgent's, idle-repair's, the hook's own floor evictions) reclaims
      out of band instead of queueing behind it -- the families no job owns
      (glaeda-disk `OUT_OF_BAND_FAMILY_IDS`, none under a runner's `_work`, nothing a live job holds
-     open or names), with its reason in the run line's `out_of_band`. An exclusive signing job used
+     open or names), with its reason in the run line's `out_of_band`. A run the floor needs (`FLOOR_HOLD`, or one of the
+     gate's own floor callers) does not skip at once as `eviction_busy` when another eviction holds `evict.lock`: it
+     waits up to `EVICT_WAIT_FLOOR_S` (120 s), never past the caller's deadline, and takes its turn if the holder
+     releases, since the holder picks its own families and need not free what the floor needs. When the wait ends with
+     the holder still evicting, the line says so and the holder's pass serves the floor. Manual and LaunchAgent runs
+     above the floor still skip at once. The run line's `evict_floor_wait` is `took its turn` or `expired`. An exclusive signing job used
      to hold the queue for hours while every run in it freed nothing. The two-minute `glaeda-mini-health` agent repeats
      that ownership check when a post-job hook was skipped, and the listener gate sweeps its
      own idle runner's `_work` for such orphans every ten minutes (never while that runner has
