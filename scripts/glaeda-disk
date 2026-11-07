@@ -11859,7 +11859,10 @@ def _main_impl(argv: list[str] | None = None) -> int:
                 # the same scope as `--family <those ids>`, so the pass's steps outside the families stay with the
                 # hook's pass too: idle runner checkouts, $TMPDIR test scratch, home clone gc and checkout repack
                 # (minutes of git beside the job's compile), the fleet CAS prune, simulator devices
-                a.family = ids
+                # INTERRUPTED stays in scope whatever `ids` holds: those families are derived from these roots
+                # below (interrupted_families), never present yet, so without it an aside tree a killed deletion
+                # left in one of them would be left for the queue's pass.
+                a.family = sorted({*ids, INTERRUPTED})
             elif queued:
                 return deferred(COALESCED_INTO_HOOK, "a runner hook pass is under way; this run joins its queue")
             else:

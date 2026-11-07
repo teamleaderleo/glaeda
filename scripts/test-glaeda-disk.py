@@ -4993,6 +4993,10 @@ class GlaedaDiskTest(unittest.TestCase):
         self.assertEqual([f.root for f in survey.call_args[0][0] if f.id != gd.INTERRUPTED], [fams[0].root],
                          "only the disposable family; the job-owned dirs stay with the hook's pass")
         self.assertTrue(pending.exists(), "the hook's pass still gets its follow-up for the job-owned dirs")
+        aside = [f for f in survey.call_args[0][0] if f.id == gd.INTERRUPTED]
+        self.assertTrue(all(f.root.is_relative_to(fams[0].root) for f in aside), aside)
+        self.assertIn(gd.INTERRUPTED, gd.OUT_OF_BAND_FAMILY_IDS,
+                      "an aside tree a killed deletion left in those roots is still finished out of band")
 
     def test_a_running_ci_job_sends_every_run_but_the_queues_own_pass_out_of_band(self) -> None:
         """The hook's bound treats the CI deferral as busy and keeps holding the queue, so a run that defers too
