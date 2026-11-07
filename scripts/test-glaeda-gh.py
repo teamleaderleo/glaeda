@@ -1278,15 +1278,21 @@ class UpstreamTest(Base):
         self.answers["run:o/r/9"] = {**self.answers["run:o/r/9"],
                                      "restRun": {"run_attempt": 1, "status": "completed", "conclusion": "cancelled"}}
         self.daemon.tick(now=NOW + gg.UPSTREAM_EVERY + 1)
+        # a GitHub read with no time (an older upstream) may be from before a rerun: not ruled on until the bound
+        self.assertIsNone(gg.wait_step(req, time.time()))
+        self.assertIsNotNone(gg.wait_step(req, req["began"] + gg.RUN_CONFIRM_MAX + 1))
+        self.answers["run:o/r/9"] = {**self.answers["run:o/r/9"], "restRunAt": now - 1}  # read since the wait began
+        self.daemon.tick(now=NOW + 2 * gg.UPSTREAM_EVERY + 2)
+        self.assertEqual(gg.read_cache("run:o/r/9")["restRunAt"], now - 1)
         self.assertIsNotNone(gg.wait_step(req, time.time()))
         # an upstream that does not say where the data came from (an older version) is not trusted for a finish
         self.answers["run:o/r/9"] = {"data": done, "dataAt": time.time() - 5}
-        self.daemon.tick(now=NOW + 2 * gg.UPSTREAM_EVERY + 2)
+        self.daemon.tick(now=NOW + 3 * gg.UPSTREAM_EVERY + 3)
         self.assertIsNone(gg.read_cache("run:o/r/9").get("origin"))
         self.assertTrue(gg.controller_unconfirmed(gg.read_cache("run:o/r/9"), time.time()))
         self.answers["run:o/r/9"] = {**self.answers["run:o/r/9"], "origin": "controller",
                                      "restRun": {"run_attempt": 1, "status": "completed", "conclusion": "cancelled"}}
-        self.daemon.tick(now=NOW + 3 * gg.UPSTREAM_EVERY + 3)
+        self.daemon.tick(now=NOW + 4 * gg.UPSTREAM_EVERY + 4)
         # what this host serves to its own downstream says where the data came from
         out = io.StringIO()
         with contextlib.redirect_stdout(out), mock.patch.object(gg, "daemon_running", return_value=True), \
@@ -2659,6 +2665,13 @@ class ClientTest(Base):
 
     def put(self, key: str, data: dict | None, at: float | None = None, **extra) -> None:
         at = time.time() if at is None else at
+        if key.startswith("run:") and gg.terminal("run", data):
+            # what the daemon's own GitHub read of a finished run leaves (run_unconfirmed); a controller's record
+            # has no restRun unless a test gives it one
+            if "restRun" not in extra and extra.get("source") != "controller":
+                extra["restRun"] = gg.rest_run(data)
+            if extra.get("restRun") is not None:
+                extra.setdefault("restRunAt", at)
         gg.write_json(gg.cache_dir() / gg.file_name(key), {"key": key, "fetchedAt": at,
                                                           "dataAt": at if data else None, "data": data, "error": None, **extra})
 
@@ -5868,6 +5881,115 @@ class DaemonDiagnosticOnFd2Test(unittest.TestCase):
             once, _ = cli_run(self.ghdir, "wait", "file", str(self.dir / "x"), "--timeout", "0",
                               "--json", stderr=fh)
         self.assertEqual(once.returncode, gg.EXIT_TIMEOUT, once.stdout)
+
+
+class RerunWaitTest(Base):
+    """2026-11-07: `glaeda-gh wait run manaflow-ai/cmux/42368426030` right after `gh run rerun --failed` returned
+    attempt 1's failure at once (waited_s 0, "data 0s ago") while GitHub had attempt 2 queued. The client's
+    controller long-poll stored the controller's attempt-1 record as new data, and the restRun of an earlier REST
+    read of that same attempt passed it as GitHub's word. A wait now rules on a finish only once GitHub has shown
+    it since the wait began (restRunAt), and the daemon reads it once for that."""
+
+    KEY = "run:o/r/50"
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.ctl = FakeController()
+        feed_every, gg.CONTROLLER_FEED_EVERY = gg.CONTROLLER_FEED_EVERY, 0
+        self.addCleanup(setattr, gg, "CONTROLLER_FEED_EVERY", feed_every)
+        self.daemon = gg.Daemon(transport=self.gh, token=lambda: TOKEN, controller=self.ctl)
+        self.old = time.time() - 600
+        attempt1 = {"id": 50, "status": "completed", "conclusion": "failure", "run_attempt": 1,
+                    "updated_at": iso(self.old)}
+        self.ctl.runs[50] = {**ctl_run(50, "completed", "failure", iso(self.old)), "attempt": 1}
+        # what an earlier REST read of attempt 1 left: GitHub's own word, ten minutes old
+        gg.write_json(gg.cache_dir() / gg.file_name(self.KEY), {
+            "key": self.KEY, "fetchedAt": self.old, "dataAt": self.old, "restAt": self.old, "source": "rest",
+            "data": attempt1, "restRun": gg.rest_run(attempt1), "restRunAt": self.old, "error": None})
+
+    def begin(self) -> dict:
+        """A `wait run` as subscribe_wait starts it: interest, then the client's controller long-poll."""
+        req = gg.wait_request("run", "o/r/50", "green", 600, False, False, None, True, 0)
+        gg.register(self.KEY, waited=True)
+        controller = mock.Mock()
+        controller.run.return_value = self.ctl.runs[50]  # the controller has not heard of the rerun
+        with mock.patch.object(gg.Controller, "from_env", return_value=controller):
+            gg.controller_wait_run(self.KEY, 5)
+        return req
+
+    def rerun(self, status: str = "queued", conclusion: str | None = None, at: float | None = None) -> None:
+        self.gh.runs[50] = {"id": 50, "status": status, "conclusion": conclusion, "run_attempt": 2,
+                            "updated_at": iso(time.time() if at is None else at)}
+
+    def test_a_wait_right_after_a_rerun_blocks_until_attempt_2_ends(self) -> None:
+        self.rerun()
+        req = self.begin()
+        self.assertEqual(gg.read_cache(self.KEY)["data"]["run_attempt"], 1, "the long-poll stored attempt 1")
+        self.assertIsNone(gg.wait_step(req, time.time()), "attempt 1's finish decided a wait after its rerun")
+        self.daemon.tick(time.time() + 1)
+        entry = gg.read_cache(self.KEY)
+        self.assertEqual((entry["data"]["run_attempt"], entry["data"]["status"]), (2, "queued"))
+        self.assertEqual(len(self.gh.run_calls()), 1, "the wait's one GitHub read")
+        self.assertIsNone(gg.wait_step(req, time.time() + 1))
+        self.rerun("completed", "success", at=time.time() + 2)
+        self.ctl.runs[50] = {**ctl_run(50, "completed", "success", iso(time.time() + 2)), "attempt": 2}
+        self.daemon.tick(time.time() + 3 + gg.CYCLE)
+        code, text = gg.wait_step(req, time.time() + 3 + gg.CYCLE)
+        self.assertEqual(code, gg.EXIT_OK, text)
+        self.assertIn("attempt 2", text)
+
+    def test_a_cancelled_attempt_2_is_its_result(self) -> None:
+        self.rerun()
+        req = self.begin()
+        self.daemon.tick(time.time() + 1)
+        self.assertIsNone(gg.wait_step(req, time.time() + 1))
+        self.rerun("completed", "cancelled", at=time.time() + 2)
+        self.daemon.tick(time.time() + 3 + gg.CYCLE)
+        code, text = gg.wait_step(req, time.time() + 3 + gg.CYCLE)
+        self.assertEqual(code, gg.EXIT_FAIL, text)
+        self.assertIn("cancelled", text)
+        self.assertIn("attempt 2", text)
+
+    def test_a_final_attempt_with_no_rerun_rules_on_the_first_tick(self) -> None:
+        self.gh.runs[50] = {"id": 50, "status": "completed", "conclusion": "failure", "run_attempt": 1,
+                            "updated_at": iso(self.old)}
+        req = self.begin()
+        self.daemon.tick(time.time() + 1)
+        self.assertEqual(len(self.gh.run_calls()), 1)
+        code, text = gg.wait_step(req, time.time() + 1)
+        self.assertEqual(code, gg.EXIT_FAIL, text)
+        self.assertIn("attempt 1", text)
+
+    def test_a_finish_github_showed_after_the_wait_began_rules_without_a_read(self) -> None:
+        req = gg.wait_request("run", "o/r/50", "green", 600, False, False, None, True, 0)
+        entry = gg.read_cache(self.KEY)
+        gg.write_json(gg.cache_dir() / gg.file_name(self.KEY),
+                      {**entry, "fetchedAt": req["began"] + 1, "dataAt": req["began"] + 1, "restRunAt": req["began"] + 1})
+        self.assertEqual(gg.wait_step(req, req["began"] + 1)[0], gg.EXIT_FAIL)
+
+    def test_a_brokered_rerun_makes_the_cached_finish_unknown(self) -> None:
+        req = gg.wait_request("run", "o/r/50", "green", 600, False, False, None, True, 0)
+        entry = gg.read_cache(self.KEY)
+        gg.write_json(gg.cache_dir() / gg.file_name(self.KEY),
+                      {**entry, "fetchedAt": req["began"] + 1, "dataAt": req["began"] + 1, "restRunAt": req["began"] + 1})
+        gg.note_run_rerun("o/r", ["run 50", "runlists", "jobs", "prs", "other"], ["run", "rerun", "50"], req["began"] + 2)
+        self.assertEqual(gg.read_cache(self.KEY)["rerunAt"], req["began"] + 2)
+        self.assertIsNone(gg.wait_step(req, req["began"] + 3), "the finish from before the rerun decided the wait")
+        # the API form counts too; other writes on the run do not
+        gg.note_run_rerun("o/r", ["run 50"], ["api", "repos/o/r/actions/runs/50/rerun-failed-jobs"], req["began"] + 4)
+        self.assertEqual(gg.read_cache(self.KEY)["rerunAt"], req["began"] + 4)
+        gg.note_run_rerun("o/r", ["run 50"], ["run", "cancel", "50"], req["began"] + 9)
+        self.assertEqual(gg.read_cache(self.KEY)["rerunAt"], req["began"] + 4)
+        self.rerun()
+        gg.register(self.KEY)  # a reader, not a wait
+        self.daemon.tick(req["began"] + 5)  # the rerun is read even with no wait on it
+        self.assertEqual(gg.read_cache(self.KEY)["data"]["run_attempt"], 2)
+
+    def test_with_github_unreadable_the_wait_still_rules_after_the_bound(self) -> None:
+        req = self.begin()
+        self.assertIsNone(gg.wait_step(req, req["began"] + 1))
+        code, _ = gg.wait_step(req, req["began"] + gg.RUN_CONFIRM_MAX + 1)
+        self.assertEqual(code, gg.EXIT_FAIL)
 
 
 class WaitSubscriptionTest(Base):
@@ -10999,7 +11121,12 @@ class BrokerAnswerHitRateTest(CountingGhBase):
         self.run_gh(["pr", "merge", "8", "-R", "o/r", "--squash", "--match-head-commit", "a" * 40])
         self.assertEqual(fresh(), {"pr7": True, "pr8": True, "run5": False, "list": True},
                          "a merge moves the base: every PR's mergeability, not the runs")
+        done = {"id": 5, "status": "completed", "conclusion": "failure", "run_attempt": 1}
+        gg.write_json(gg.cache_dir() / gg.file_name("run:o/r/5"), {"key": "run:o/r/5", "data": done, "fetchedAt": 1})
+        before = time.time()
         self.run_gh(["run", "rerun", "5", "-R", "o/r", "--failed"])
+        self.assertGreaterEqual(gg.read_cache("run:o/r/5").get("rerunAt") or 0, before,
+                                "the watched run's cached finish is marked as a superseded attempt's")
         self.assertEqual(fresh(), {"pr7": True, "pr8": True, "run5": True, "list": True},
                          "a rerun changes the run and the checks of the PRs it reports to")
         self.run_gh(["api", "-X", "POST", "repos/o/r/issues/8/comments", "-f", "body=x"])

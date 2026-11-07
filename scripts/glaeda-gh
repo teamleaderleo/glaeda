@@ -355,6 +355,12 @@ REST_SAFETY = 900  # a run the controller tracks is still read over REST this of
 # was read from GitHub for this long, is read once more (a lost completion delivery: manaflow-ai/cmux run
 # 40557947333, 2026-10-27, finished on GitHub while the controller kept it in_progress and its waiter blocked).
 STALE_RUN_REREAD = 180
+# A wait rules on a finished run only once GitHub itself has shown that finish since the wait began (or since a
+# `gh run rerun` this host brokered): a cached or controller-fed finish can be the attempt a rerun superseded
+# (manaflow-ai/cmux run 42368426030, 2026-11-07: `wait run` right after `gh run rerun --failed` returned attempt 1's
+# failure at once, "data 0s ago", while GitHub had attempt 2 queued). The daemon reads it once for that
+# (Daemon.due); when GitHub cannot be read this long (a spent quota), the wait rules on what it has, as before.
+RUN_CONFIRM_MAX = STALE_RUN_REREAD
 WAIT_PRIORITY = STALE_RUN_REREAD  # in a busy tick, a waited key is read as if this much longer unread
 # The client's own controller long-poll before it hands its wait to the daemon (subscribe_wait). That poll does not
 # see the cache, so a finish the daemon reads from GitHub (a lost delivery, STALE_RUN_REREAD) reaches the waiter
@@ -969,7 +975,7 @@ def cmd_read(text: str) -> int:
         register(key, jobs, waited=wait)
         cached = read_cache(key)
         entries[key] = None if cached is None else {
-            k: cached.get(k) for k in ("data", "dataAt", "error", "fetchedAt", "jobs", "missing", "restRun") if k in cached}
+            k: cached.get(k) for k in ("data", "dataAt", "error", "fetchedAt", "jobs", "missing", "restRun", "restRunAt") if k in cached}
         if cached is not None and cached.get("source"):  # where the data came from, so a downstream wait can
             entries[key]["origin"] = cached.get("origin") if cached.get("source") == "upstream" else cached["source"]
     print(json.dumps({"entries": entries}, sort_keys=True))
@@ -2400,6 +2406,10 @@ class Daemon:
             c = e["cache"]
             if e["key"] in first:
                 continue
+            if kind == "run" and c is not None and self.run_needs_confirm(e) \
+                    and self.now - self.attempted.get(e["key"], float("-inf")) >= self.policy["cycles"][kind]:
+                out.append(e)  # a wait (or a rerun) since GitHub last showed this finish: read it once now
+                continue
             if (kind == "pr" and c is not None and e["key"] in self.nudged
                     and self.now - self.attempted.get(e["key"], float("-inf")) >= NUDGE_MIN):
                 self.nudged.discard(e["key"])  # a check event on its head: re-read now, not at the cycle
@@ -2452,6 +2462,18 @@ class Daemon:
         for e in out:
             self.attempted[e["key"]] = self.now
         return out
+
+    def run_needs_confirm(self, e: dict) -> bool:
+        """A finished run a wait blocks on, or a rerun was brokered for, after GitHub last showed it (restRunAt): its
+        newest attempt may be queued again (RUN_CONFIRM_MAX). Read once per wait; a failed read is paced by due()."""
+        c = e.get("cache") or {}
+        if not terminal("run", c.get("data")):
+            return False
+        rest_at = c.get("restRunAt") if isinstance(c.get("restRunAt"), (int, float)) else float("-inf")
+        if c.get("restRun") != rest_run(c.get("data")):
+            rest_at = float("-inf")  # GitHub never showed this finish (the controller's, or an upstream's)
+        waited = e.get("waitedAt") if self.waited(e) else None
+        return max(waited or float("-inf"), run_confirmed_since(c) or float("-inf")) > rest_at
 
     def head_allowed(self, name: str, mode: str, policy: dict) -> bool:
         """Whether this consumer may be charged one more head read now. A reserved consumer has its own
@@ -2800,6 +2822,9 @@ class Daemon:
                                       "restRun": entry.get("restRun") if isinstance(entry.get("restRun"), dict) else None}
             if isinstance(fetched, (int, float)):
                 fields["fetchedAt"] = min(self.now, float(fetched))  # a wait rules only on reads after it began
+            shown = entry.get("restRunAt")  # when the upstream's GitHub read last showed restRun (run_unconfirmed)
+            fields["restRunAt"] = (min(self.now, float(shown))
+                                   if isinstance(shown, (int, float)) and not isinstance(shown, bool) else None)
             if data is not None:
                 fields.update(data=data, dataAt=float(at) if isinstance(at, (int, float)) else self.now)
             if isinstance(entry.get("jobs"), list):
@@ -3014,7 +3039,7 @@ class Daemon:
             base = current if isinstance(current, dict) else prior
             entry = {"key": key, "fetchedAt": self.now, "dataAt": None, "data": None, "error": None}
             if base:
-                entry.update({k: base[k] for k in ("dataAt", "data", "etag", "jobs", "jobsEtag", "jobsAt", "jobsTried", "restAt", "source", "restParts", "restRun", "origin", "via")
+                entry.update({k: base[k] for k in ("dataAt", "data", "etag", "jobs", "jobsEtag", "jobsAt", "jobsTried", "restAt", "source", "restParts", "restRun", "restRunAt", "origin", "via", "rerunAt")
                               if k in base})
             entry.update(fields)
             if key.startswith("pr:") and isinstance(entry.get("data"), dict) and "data" in fields:
@@ -3396,10 +3421,13 @@ class Daemon:
         if state == "fresh":
             fields["data"] = slim_run(doc)
             fields["restRun"] = rest_run(fields["data"])
+            fields["restRunAt"] = self.now
             # a run the controller tracks keeps that source; REST was only the safety-net check
             if prior.get("source") != "controller" or \
                     (iso_epoch(doc.get("updated_at")) or 0) > (iso_epoch((prior.get("data") or {}).get("updated_at")) or 0):
                 fields["source"] = "rest"
+        elif prior.get("restRun") is not None:
+            fields["restRunAt"] = self.now  # a 304: what the ETag's read showed is still GitHub's
         self.read_jobs(e, fields, state == "fresh")
 
     def fetch_runs_graphql(self, entries: list[dict]) -> str | None:
@@ -3430,7 +3458,7 @@ class Daemon:
             run["head_branch"] = run["head_branch"] or before.get("head_branch") or ""
             fresh = any(run.get(k) != before.get(k) for k in ("status", "conclusion", "run_attempt", "updated_at"))
             fields: dict[str, Any] = {"error": None, "data": run, "dataAt": self.now, "restAt": self.now,
-                                      "restRun": rest_run(run), "via": "graphql"}
+                                      "restRun": rest_run(run), "restRunAt": self.now, "via": "graphql"}
             if prior.get("source") != "controller" or \
                     (iso_epoch(run.get("updated_at")) or 0) > (iso_epoch(before.get("updated_at")) or 0):
                 fields["source"] = "graphql"
@@ -5024,6 +5052,28 @@ def controller_unconfirmed(entry: dict | None, now: float | None = None) -> bool
     return (time.time() if now is None else now) - (entry.get("dataAt") or 0) < REST_SAFETY
 
 
+def run_confirmed_since(entry: dict | None) -> float:
+    """When a wait may last have been answered by an older attempt: a `gh run rerun` this host brokered (rerunAt)."""
+    at = (entry or {}).get("rerunAt")
+    return float(at) if isinstance(at, (int, float)) and not isinstance(at, bool) else 0.0
+
+
+def run_unconfirmed(entry: dict | None, since: float, now: float) -> bool:
+    """A finished run that no direct GitHub read (restRun, at restRunAt) has shown since SINCE, nor since the last rerun:
+    the newest attempt may not be this one (RUN_CONFIRM_MAX). Bounded, so a wait still rules when GitHub cannot be
+    read."""
+    entry = entry or {}
+    data = entry.get("data")
+    if not terminal("run", data):
+        return False
+    since = max(since, run_confirmed_since(entry))
+    shown = entry.get("restRunAt")
+    if (isinstance(shown, (int, float)) and not isinstance(shown, bool) and shown >= since
+            and entry.get("restRun") == rest_run(data)):
+        return False
+    return now - since < RUN_CONFIRM_MAX
+
+
 def wait_step(req: dict, now: float) -> tuple[int, str] | None:
     """One look at a `wait pr|run` (wait_request): (exit code, what it prints) once it is decided or out
     of time, else None. Rules only on data the daemon fetched after the wait began, never on an older
@@ -5042,6 +5092,8 @@ def wait_step(req: dict, now: float) -> tuple[int, str] | None:
     usable = data and ((entry.get("dataAt") or 0) >= began or final)
     if usable and kind == "run" and controller_unconfirmed(entry, now):
         usable = False  # the daemon reads it over REST first (Daemon.due's confirm)
+    if usable and kind == "run" and run_unconfirmed(entry, began, now):
+        usable = False  # maybe a superseded attempt: the daemon reads GitHub once first (Daemon.due)
     _, owner, repo, _ = split_key(key)
     if usable and sha:
         head = str(data.get("headRefOid" if kind == "pr" else "head_sha") or "").lower()
@@ -5276,7 +5328,7 @@ def controller_wait_run(key: str, timeout: float) -> dict | None:
                 rest_at = prior["restAt"]
         entry = {"key": key, "fetchedAt": now, "dataAt": data_at, "restAt": rest_at,
                  "data": candidate, "error": None, "source": "controller"}
-        for field in ("etag", "jobs", "jobsEtag", "jobsAt", "jobsTried", "restParts", "restRun"):
+        for field in ("etag", "jobs", "jobsEtag", "jobsAt", "jobsTried", "restParts", "restRun", "restRunAt", "rerunAt"):
             if field in prior:
                 entry[field] = prior[field]
         write_json(cache, entry)
@@ -7688,6 +7740,27 @@ def gh_cache_writes() -> dict[str, float]:
             if isinstance(v, (int, float)) and not isinstance(v, bool)}
 
 
+GH_RERUN_API_RE = re.compile(r"^/?repos/[^/]+/[^/]+/actions/runs/\d+/rerun(?:-failed-jobs)?/?$")
+
+
+def note_run_rerun(repo: str | None, scopes: list[str] | None, words: list[str], now: float) -> None:
+    """A brokered `gh run rerun N` (or its API POST) on a run this host caches: stamp the entry rerunAt, so a wait
+    and `Daemon.due` treat its cached finish as attempt-unknown until GitHub is read again (run_unconfirmed).
+    Stamped when the write starts and again when it ends (gh_cache_write), so a read while it was in flight does not
+    count; a rerun that fails costs one more read, never a wrong answer."""
+    rerun = (words[:2] == ["run", "rerun"]
+             or (words[:1] == ["api"] and len(words) > 1 and bool(GH_RERUN_API_RE.match(words[1]))))
+    run_id = next((x.split(" ", 1)[1] for x in scopes or [] if x.startswith("run ")), None)
+    if not rerun or not repo or not run_id:
+        return
+    key = f"run:{repo}/{run_id}"
+    cache = cache_dir() / file_name(key)
+    with contextlib.suppress(OSError), bounded_lock(cache_dir() / ".write.lock") as held:
+        entry = read_json(cache) if held and cache.exists() else None
+        if isinstance(entry, dict):
+            write_json(cache, {**entry, "rerunAt": now})
+
+
 def gh_cache_note_write(repo: str | None, now: float, scopes: list[str] | None = None) -> None:
     """Stamp a write, so no answer read before it is served after it. A write is stamped when it
     starts and again when it finishes (gh_cache_write), so a read that began while it was in flight
@@ -7943,9 +8016,9 @@ def gh_cache_fill(real: str, args: list[str], key: str, repo: str | None, ran: l
 
 
 def gh_cache_write(real: str, args: list[str], repo: str | None, ran: list[int],
-                   scopes: list[str] | None = None) -> int:
+                   scopes: list[str] | None = None, words: list[str] | None = None) -> int:
     """Run a write as a child and stamp it again once it finished, so nothing read while it was in
-    flight outlives it."""
+    flight outlives it (a rerun's run entry too: note_run_rerun)."""
     try:
         rc, _out, _err = gh_cache_child(real, args, False, None)
         ran.append(rc)
@@ -7953,6 +8026,8 @@ def gh_cache_write(real: str, args: list[str], repo: str | None, ran: list[int],
         if ran:
             with contextlib.suppress(Exception):
                 gh_cache_note_write(repo, time.time(), scopes)
+            with contextlib.suppress(Exception):
+                note_run_rerun(repo, scopes, words or [], time.time())
     return rc
 
 
@@ -8197,6 +8272,7 @@ def cmd_gh(args: list[str]) -> int:
             if gh_cache_is_write(args, words, method):
                 write_repo, write_scopes = gh_cache_write_scope(args, words, method, values)
                 gh_cache_note_write(write_repo, now, write_scopes)
+                note_run_rerun(write_repo, write_scopes, words, now)
                 writing = gh_cache_ttl() > 0
             else:
                 cache_key = gh_cache_key(args, words, values, seen, method, real)
@@ -8265,7 +8341,7 @@ def cmd_gh(args: list[str]) -> int:
         ran: list[int] = []
         try:
             if writing:
-                return gh_cache_write(real, args, write_repo, ran, write_scopes)
+                return gh_cache_write(real, args, write_repo, ran, write_scopes, words)
             filled = gh_cache_fill(real, args, cache_key, cache_repo, ran, pending)
             if filled is not None:
                 return filled
