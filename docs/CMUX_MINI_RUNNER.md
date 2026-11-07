@@ -303,8 +303,8 @@ What `--apply` does:
      (glaeda-disk `OUT_OF_BAND_FAMILY_IDS`, none under a runner's `_work`, nothing a live job holds
      open or names), with its reason in the run line's `out_of_band`. A run the floor needs (`FLOOR_HOLD`, or one of the
      gate's own floor callers) does not skip at once as `eviction_busy` when another eviction holds `evict.lock`: it
-     waits up to `EVICT_WAIT_FLOOR_S` (120 s), never past what its caller allows (`GLAEDA_DISK_FLOOR_WAIT_S`,
-     half the gate's own timeout) or the run deadline, and takes its turn if the holder
+     waits up to `EVICT_WAIT_FLOOR_S` (120 s), never past what its caller allows (`GLAEDA_DISK_FLOOR_WAIT_UNTIL`,
+     when half the gate's own timeout runs out) or the run deadline, and takes its turn if the holder
      releases, since the holder picks its own families and need not free what the floor needs. When the wait ends with
      the holder still evicting, the line says so and the holder's pass serves the floor. Manual and LaunchAgent runs
      above the floor still skip at once. The run line's `evict_floor_wait` is `took its turn` or `expired`. An exclusive signing job used

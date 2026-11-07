@@ -272,10 +272,11 @@ CI_DEFER_MARK = "deferred: a CI job is running"  # the hook's bound reads this (
 # (glaeda#1897 F2). Manual and LaunchAgent runs above the floor still skip at once.
 EVICT_WAIT_FLOOR_S = 120.0
 EVICT_WAIT_POLL_S = 2.0
-# A caller that bounds the run says here how long its child may wait (the hook's floor_disk_env, half its timeout):
-# the run deadline would do it, but that one bounds every walk and verdict too and would stop a short pass from
-# reclaiming anything.
-FLOOR_WAIT_ENV = "GLAEDA_DISK_FLOOR_WAIT_S"
+# When a caller that bounds the run says this run's wait for another eviction runs out (the hook's floor_disk_env,
+# half its own timeout, as a wall-clock time because its timeout started at launch and this run reaches its wait
+# later). The run deadline would do it, but that one bounds every walk and verdict too and would stop a short pass
+# from reclaiming anything.
+FLOOR_WAIT_ENV = "GLAEDA_DISK_FLOOR_WAIT_UNTIL"
 
 RUNNER_WORK_DIR = "_work"  # <runner>/_work: a job's workspace, its RUNNER_TEMP and its build output, all job-owned
 UNSERVED = ("eviction_busy", "measurement_busy", "defer_during_ci")  # a run that skipped these did no pass
@@ -907,7 +908,7 @@ CMUX_NEXT_DRAIN_HOOK_SHA256 = frozenset({
     "7c0d9d8cae04254e76666b002b90f3d734a293bdcc0cee45175c01df67761bba",
     "79313d0b9048d3a3dd3f9483434f9bbf4e4e684fc68cac061ce80336f5acab54",
     "9118658689a903190cad26154ac9068d984f12543ae57aa1d4f90ff2ab67cce0",
-    "78772256a122f9f2cd20c1ae39be3629f2d7b872e2d8d6e401400281c298c502",
+    "c3efaff090a931a4af225e06e8a2b904c4b87aacbfaa72f8dab01c099b1cb652",
 })
 CMUX_NEXT_CI_PRESERVED_NAMES = frozenset({
     "SourcePackages", "ModuleCache.noindex", "SDKStatCaches.noindex",
@@ -9627,13 +9628,16 @@ def _write_evict_owner() -> None:
     os.replace(tmp, EVICT_OWNER)
 
 
-def caller_floor_wait_s() -> float | None:
-    """The longest this run's caller allows it to wait for another eviction (FLOOR_WAIT_ENV), or None: unset."""
+def caller_floor_wait_s(now: float | None = None) -> float | None:
+    """Seconds left of what this run's caller allows it to wait for another eviction (FLOOR_WAIT_ENV, a wall-clock
+    cutoff), or None when it set none. Negative once that time has passed, so the wait is skipped."""
     try:
-        seconds = float(os.environ.get(FLOOR_WAIT_ENV) or "")
+        until = float(os.environ.get(FLOOR_WAIT_ENV) or "")
     except ValueError:
         return None
-    return seconds if math.isfinite(seconds) else None
+    if not math.isfinite(until):
+        return None
+    return until - (time.time() if now is None else now)
 
 
 def floor_evict_wait_until(apply_: bool) -> float:

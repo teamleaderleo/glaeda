@@ -9173,15 +9173,17 @@ def floor_disk_env(caller: str, timeout: float | None = None) -> dict[str, str]:
     """A floor eviction's environment: it must free space now, so glaeda-disk never folds it into the queued pass
     (GLAEDA_DISK_HOOK_PASS, as the queue's own pass), and its run line names the caller.
 
-    A caller that bounds the run gives the child half of that bound as the longest it may wait for another eviction
-    (GLAEDA_DISK_FLOOR_WAIT_S, glaeda-disk's floor_evict_wait_until), so a 30 s gate never leaves its child waiting
-    past the kill and the other half is still there to evict with. It is deliberately not HYGIENE_RUN_DEADLINE: that
-    one bounds every walk and verdict too, and its fixed margin would stop an ordinary pass of this length from
-    reclaiming anything at all.
+    A caller that bounds the run gives the child the time half of that bound runs out at, as the longest it may wait
+    for another eviction (GLAEDA_DISK_FLOOR_WAIT_UNTIL, glaeda-disk's floor_evict_wait_until), so a 30 s gate never
+    leaves its child waiting past the kill and the other half is still there to evict with. The cutoff is absolute
+    because the caller's timeout starts here, at launch, while the child reaches its wait later: a duration would
+    have let a slow start push the wait past the kill, with no `expired` line to read. It is deliberately not
+    HYGIENE_RUN_DEADLINE: that one bounds every walk and verdict too, and its fixed margin would stop an ordinary
+    pass of this length from reclaiming anything at all.
     """
     env = {**os.environ, "GLAEDA_DISK_HOOK_PASS": "1", "GLAEDA_DISK_CALLER": caller}
     if timeout is not None and math.isfinite(timeout) and timeout > 0:
-        env["GLAEDA_DISK_FLOOR_WAIT_S"] = repr(timeout / 2)
+        env["GLAEDA_DISK_FLOOR_WAIT_UNTIL"] = repr(time.time() + timeout / 2)
     return env
 
 

@@ -5196,16 +5196,20 @@ class GlaedaDiskTest(unittest.TestCase):
         waiting past the kill, and the run deadline still bounds it when one is set (router-review F2 on #1902)."""
         self.addCleanup(setattr, gd, "FLOOR_HOLD", gd.FLOOR_HOLD)
         gd.FLOOR_HOLD = {1: 1}
-        for env, floor, why in (
-                ({gd.FLOOR_WAIT_ENV: "0"}, 0.0, "a caller with no room to wait"),
-                ({gd.FLOOR_WAIT_ENV: "-5"}, 0.0, "a caller already out of time"),
-                ({gd.RUN_DEADLINE_ENV: repr(time.time() + 30.0)}, 0.0, "less time left than the deadline margin"),
+        for env, why in (
+                ({gd.FLOOR_WAIT_ENV: repr(time.time())}, "a caller with no room to wait"),
+                ({gd.FLOOR_WAIT_ENV: repr(time.time() - 5.0)}, "a caller already out of time"),
+                ({gd.RUN_DEADLINE_ENV: repr(time.time() + 30.0)}, "less time left than the deadline margin"),
         ):
             with mock.patch.dict(os.environ, env):
                 self.assertEqual(gd.floor_evict_wait_until(True), 0.0, why)
-        with mock.patch.dict(os.environ, {gd.FLOOR_WAIT_ENV: "10"}):
+        with mock.patch.dict(os.environ, {gd.FLOOR_WAIT_ENV: repr(time.time() + 10.0)}):
             left = gd.floor_evict_wait_until(True) - time.monotonic()
             self.assertTrue(0 < left <= 10.0, f"its caller's 10 s, not {gd.EVICT_WAIT_FLOOR_S:g}: {left}")
+        # the caller's timeout starts at its launch, so a slow start eats the wait instead of pushing it past the kill
+        with mock.patch.dict(os.environ, {gd.FLOOR_WAIT_ENV: repr(time.time() + 15.0)}), \
+                mock.patch.object(gd.time, "time", return_value=time.time() + 20.0):
+            self.assertEqual(gd.floor_evict_wait_until(True), 0.0, "20 s of start-up spent the 15 s cutoff")
         with mock.patch.dict(os.environ, {gd.FLOOR_WAIT_ENV: "not a number"}):
             left = gd.floor_evict_wait_until(True) - time.monotonic()
             self.assertTrue(0 < left <= gd.EVICT_WAIT_FLOOR_S, f"unreadable: the plain budget, not none: {left}")
