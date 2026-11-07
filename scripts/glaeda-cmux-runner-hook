@@ -234,6 +234,28 @@ def disk_low_turn(capacity_dir: Path, worker: int) -> str | None:
         os.close(lock)
 
 
+# A job under the runner floor waits this long for the disk ledger's turn and is then admitted with a warning: a busy
+# machine makes a job slower, never makes it fail (cmux's fast tier went red at "Set up runner" when the turn refused
+# it, 2026-11-07: "another job admitted under the disk floor still runs here").
+DISK_LOW_WAIT_S = 600.0
+DISK_LOW_POLL_S = 5.0
+
+
+def wait_disk_low_turn(capacity_dir: Path, worker: int, still_low: Callable[[], bool], gone: Callable[[], bool],
+                       wait_s: float | None = None) -> str | None:
+    """disk_low_turn, retried every DISK_LOW_POLL_S for at most wait_s (DISK_LOW_WAIT_S). None once this job has the
+    turn or the disk is back over the runner floor; else the last refusal, when the job's Worker is gone or the wait
+    ran out. The caller admits on that refusal with a warning; it never refuses the job."""
+    deadline = time.monotonic() + (DISK_LOW_WAIT_S if wait_s is None else wait_s)
+    while True:
+        turn = disk_low_turn(capacity_dir, worker)
+        if turn is None or not still_low():
+            return None
+        if gone() or time.monotonic() >= deadline:
+            return turn
+        time.sleep(DISK_LOW_POLL_S)
+
+
 def admit_floor_gib(min_free_gib: float, takes_tours: bool) -> float:
     """The free disk a job is refused under after eviction: the runner floor, capped at one job's measured disk
     growth (job_disk_gib), except on a runner that takes cmux's tours, whose floor is cmux's own measure."""
@@ -9815,16 +9837,22 @@ def main(argv: list[str] | None = None) -> int:
             return refused(why)
 
         def disk_why() -> str | None:
-            """The refusal for this job's disk, after eviction: under the admission floor, or under the runner floor
-            while another job admitted there still runs (disk_low_turn)."""
+            """The refusal for this job's disk, after eviction: under the admission floor. Under the runner floor this
+            job first waits for the disk ledger's turn (wait_disk_low_turn) and is admitted with a warning if it never
+            comes."""
             low = disk_refusal(disk_path, admit_floor)
             if low or admit_floor >= args.min_free_gib or not disk_refusal(disk_path, args.min_free_gib):
                 return low
             # only a pinned Runner.Worker takes the ledger's turn: its marker lives exactly as long as that job
-            turn = disk_low_turn(args.capacity_dir, owner.pid) if owner is not None \
-                else "this job's Runner.Worker is not pinned, so it cannot take the disk ledger's turn"
+            if owner is None:
+                return f"{disk_refusal(disk_path, args.min_free_gib) or 'under the disk floor'}: " \
+                       "this job's Runner.Worker is not pinned, so it cannot take the disk ledger's turn"
+            under = disk_refusal(disk_path, args.min_free_gib) or "under the disk floor"
+            turn = wait_disk_low_turn(args.capacity_dir, owner.pid,
+                                      lambda: bool(disk_refusal(disk_path, args.min_free_gib)), owner.gone)
             if turn:
-                return f"{disk_refusal(disk_path, args.min_free_gib) or 'under the disk floor'}: {turn}"
+                print(f"{PREFIX}: warning: {under}: {turn}; admitted without the disk ledger's turn after waiting "
+                      "for it (a disk floor warns, never refuses)", flush=True)
             return disk_refusal(disk_path, admit_floor)  # read again: it may have waited for the ledger
 
         why = disk_why()

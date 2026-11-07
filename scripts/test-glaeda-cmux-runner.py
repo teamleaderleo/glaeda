@@ -1936,7 +1936,7 @@ class HookTest(unittest.TestCase):
         self.assertIn("is not pinned, so it cannot take the disk ledger's turn", out.getvalue())
         self.assertEqual(list((self.dir / "capacity").glob(f"{hook.DISK_LOW}-*")), [])
 
-    def test_job_started_admits_under_the_runner_floor_only_one_job_at_a_time(self) -> None:
+    def test_job_started_under_the_runner_floor_waits_for_the_turn_then_warns_and_admits(self) -> None:
         self.fleet()
         args = ("--min-free-gib", "30", "--capacity-dir", os.fspath(self.dir / "capacity"))
         holder = subprocess.Popen(["/bin/sleep", "60"])
@@ -1951,6 +1951,7 @@ class HookTest(unittest.TestCase):
                    "GITHUB_EVENT_NAME": "push", "GITHUB_EVENT_PATH": os.fspath(push),
                    "GITHUB_REPOSITORY": "manaflow-ai/cmux"}
             with mock.patch.dict(os.environ, env, clear=True), \
+                    mock.patch.object(hook, "DISK_LOW_WAIT_S", 0.0), \
                     mock.patch.object(hook, "start_runner_parent_watchdog"), \
                     contextlib.redirect_stdout(io.StringIO()) as out:
                 code = hook.main(["job-started", "--allowed-repo", "manaflow-ai/cmux", "--no-disk",
@@ -1958,9 +1959,40 @@ class HookTest(unittest.TestCase):
                                   "--host-lock", os.fspath(self.dir / "fleet" / "host.lock"), *args,
                                   "--state-dir", os.fspath(self.dir / "state"), "--watch-pid", str(os.getpid()),
                                   "--gui-wait", "0"])
-        self.assertEqual(code, 1, out.getvalue())
-        self.assertIn(f"25.0 GiB free, 30 GiB required: another job admitted under the disk floor still runs here "
-                      f"(pid {holder.pid})", out.getvalue())
+        # A disk floor warns, never refuses: the second job is admitted once its wait for the turn runs out.
+        self.assertEqual(code, 0, out.getvalue())
+        self.assertIn(f"warning: 25.0 GiB free, 30 GiB required: another job admitted under the disk floor still runs "
+                      f"here (pid {holder.pid}); admitted without the disk ledger's turn", out.getvalue())
+        self.assertNotIn("refused", out.getvalue())
+
+    def test_wait_disk_low_turn_takes_the_turn_once_the_other_job_ends(self) -> None:
+        capacity = self.dir / "capacity"
+        holder = subprocess.Popen(["/bin/sleep", "60"])
+        self.addCleanup(holder.wait)
+        self.addCleanup(holder.kill)
+        waiter = subprocess.Popen(["/bin/sleep", "60"])
+        self.addCleanup(waiter.wait)
+        self.addCleanup(waiter.kill)
+        self.assertIsNone(hook.disk_low_turn(capacity, holder.pid))
+        polls: list[int] = []
+
+        def still_low() -> bool:
+            polls.append(1)
+            if len(polls) == 2:  # the other job ends while this one waits
+                holder.kill()
+                holder.wait()
+            return True
+
+        with mock.patch.object(hook, "DISK_LOW_POLL_S", 0.0):
+            self.assertIsNone(hook.wait_disk_low_turn(capacity, waiter.pid, still_low, lambda: False, wait_s=30.0))
+        self.assertEqual(sorted(m.name for m in capacity.glob(f"{hook.DISK_LOW}-*")), [f"{hook.DISK_LOW}-{waiter.pid}"])
+        # The disk back over the runner floor ends the wait with no turn needed; a gone Worker ends it with the refusal.
+        self.assertIsNone(hook.wait_disk_low_turn(capacity, holder.pid, lambda: False, lambda: False, wait_s=30.0))
+        third = subprocess.Popen(["/bin/sleep", "60"])
+        self.addCleanup(third.wait)
+        self.addCleanup(third.kill)
+        why = hook.wait_disk_low_turn(capacity, third.pid, lambda: True, lambda: True, wait_s=30.0)
+        self.assertEqual(why, f"another job admitted under the disk floor still runs here (pid {waiter.pid})")
 
     def test_nightly_spends_the_disk_reserve_without_waiting_for_cleanup(self) -> None:
         self.fleet()
