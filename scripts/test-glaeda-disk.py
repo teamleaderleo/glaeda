@@ -5001,10 +5001,13 @@ class GlaedaDiskTest(unittest.TestCase):
     def test_a_running_ci_job_sends_every_run_but_the_queues_own_pass_out_of_band(self) -> None:
         """The hook's bound treats the CI deferral as busy and keeps holding the queue, so a run that defers too
         frees nothing. Only that bound waits now: it is the one that comes back for the job-owned dirs."""
-        _, _, p_lock, p_pending = self._queue()
+        lock, pending, p_lock, p_pending = self._queue()
+        claimed = Path(f"{pending}.claimed")
+        pending.touch()  # a trigger the free lock lets this run claim before the CI job narrows it
         fams = self._oob_families()
         defer = f"{gd.CI_DEFER_MARK} (/Users/cmux/actions-runner/bin/Runner.Worker)"
         with p_lock, p_pending, mock.patch.object(gd, "HOME", self.root), \
+                mock.patch.object(gd, "HOOK_PASS_CLAIMED", claimed), \
                 mock.patch.object(gd, "cmux_next_ci_cap_state", return_value=None), \
                 mock.patch.object(gd, "ci_defer", return_value=defer):
             os.environ.pop(gd.HOOK_PASS_ENV, None)
@@ -5016,6 +5019,8 @@ class GlaedaDiskTest(unittest.TestCase):
             self.assertNotIn(gd.CI_DEFER_MARK, rows[-1]["out_of_band"],
                              "the hook's bound reads that phrase as 'nothing was freed'")
             self.assertEqual([f.root for f in survey.call_args[0][0] if f.id != gd.INTERRUPTED], [fams[0].root])
+            self.assertTrue(claimed.exists() or pending.exists(),
+                            "it skipped the job-owned families, so the queue's trigger is kept for a full pass")
             # the hook's floor evictions must free space now, so they go out of band too
             with mock.patch.dict(os.environ, {gd.HOOK_PASS_ENV: "1",
                                               gd.CALLER_ENV: "runner hook floor eviction"}):
@@ -5090,6 +5095,47 @@ class GlaedaDiskTest(unittest.TestCase):
         self.assertTrue(extract.exists(), "a held extract stays")
         self.assertEqual(items[0].verdict, "blocked")
         self.assertIn("changed:in-use", items[0].reasons)
+
+    def test_an_out_of_band_run_re_reads_the_open_files_before_every_item(self) -> None:
+        """glaeda#1895's first head deleted an extract a job opened during the pass: apply()'s one snapshot was
+        from its start, and sparkle-appcast is not a discover family, so nothing re-read it."""
+        appcast = self.root / "Library/Caches/Sparkle_generate_appcast"
+        big, held = appcast / "first", appcast / "second"
+        old = time.time() - 100 * 3600
+        for d in (big, held):
+            d.mkdir(parents=True)
+            (d / "cmux.app").write_text("x")
+            for q in (d / "cmux.app", d, appcast):
+                os.utime(q, (old, old))
+        fam = gd.Family("sparkle-appcast", appcast, True, "the next appcast run extracts it again")
+        items = [gd.Item(fam.id, os.fspath(big), 40 * gd.GIB, 99.0, "reclaimable", []),
+                 gd.Item(fam.id, os.fspath(held), 10 * gd.GIB, 99.0, "reclaimable", [])]
+        job = "/Users/cmux/actions-runner/bin/Runner.Worker sign-nightly-identity"
+        calls = itertools.count()
+        # the job opens the second extract only after the pass started on the first
+        gd.process_evidence = lambda: (([os.fspath(held / "cmux.app")], job) if next(calls) >= 2 else ([], job))
+        with mock.patch.object(gd, "OUT_OF_BAND_RUN", "a runner hook pass is under way"), \
+                contextlib.redirect_stdout(io.StringIO()):
+            gd.apply(items, {fam.id: fam}, self.receipt(), None, 6, all_families=[fam])
+        self.assertFalse(big.exists(), "the first extract, held by nobody, goes")
+        self.assertTrue(held.exists(), "the one the job opened mid-pass stays")
+        self.assertIn("changed:in-use", items[1].reasons)
+
+    def test_an_out_of_band_run_refuses_a_discovered_cache_inside_a_jobs_work_dir(self) -> None:
+        """home-caches is rooted at the home, and discovery descends into the runners: the family root passing
+        job_owned_root is not enough (glaeda#1895 review F2)."""
+        inside = self.root / "actions-runner-2/_work/_temp/cargo-cache"
+        inside.mkdir(parents=True)
+        (inside / "CACHEDIR.TAG").write_text("Signature: 8a477f597d28d172789f06886806bc55")
+        fam = gd.Family("home-caches", self.root, True, "the tool re-downloads it", discover=True)
+        items = [gd.Item(fam.id, os.fspath(inside), 12 * gd.GIB, 99.0, "reclaimable", [])]
+        self.assertTrue(gd.job_owned_root(inside))
+        with mock.patch.object(gd, "OUT_OF_BAND_RUN", "a CI job is running"), \
+                mock.patch.object(gd, "discoverable", return_value="cachedir-tag"), \
+                contextlib.redirect_stdout(io.StringIO()):
+            gd.apply(items, {fam.id: fam}, self.receipt(), None, 6, all_families=[fam])
+        self.assertTrue(inside.exists())
+        self.assertIn("changed:job-owned", items[0].reasons)
 
     def test_the_hook_reads_the_ci_deferral_phrase_glaeda_disk_prints(self) -> None:
         """The hook's DISK_BOUND keeps its trigger on that exact phrase; an out-of-band run must not print it."""
@@ -10668,7 +10714,7 @@ class ActivityClockTest(unittest.TestCase):
 
 MAIN_GLOBALS = ("ROLE", "RUNNER_CACHE_PROFILE", "CMUX_NEXT_CI_DRAIN", "ACTIVITY_MODE", "EMERGENCY_DEVS", "FLOOR_HOLD",
                 "CMUX_NEXT_HOST_FLOOR", "CMUX_NEXT_CI_OVER", "_JOB_STARTS", "_JOB_STARTS_READ", "_RUNNING_JOB_HOURS",
-                "_MEASURE_BUDGET_REACHED", "_EVICT_HANDLE", "_HOOK_PASS_FD")
+                "_MEASURE_BUDGET_REACHED", "_EVICT_HANDLE", "_HOOK_PASS_FD", "OUT_OF_BAND_RUN")
 
 
 def keep_main_globals(stack: contextlib.ExitStack) -> None:

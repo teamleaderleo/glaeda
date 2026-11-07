@@ -1627,6 +1627,10 @@ POLICY_DEFAULTS: dict[str, Any] = {
     "dedupe_capture_budget_minutes": 20.0,
 }
 ACTIVITY_MODE: str | None = None  # "pressure" or "sweep" while main acts; None keeps the wall-clock rule
+# Why this run reclaims out of band (OUT_OF_BAND), "" for every other run. apply() reads it: such a run deletes
+# beside a live job, so it re-takes its process evidence on the discover cadence and refuses a candidate inside a
+# runner's _work, whatever family discovered it.
+OUT_OF_BAND_RUN = ""
 ROLE = "fleet-mini"
 DEVBOX_TRANSCRIPT_DAYS = 30
 DEVBOX_TRANSCRIPT_DELETE_DAYS = 180
@@ -9965,14 +9969,19 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
                 print("refusing to delete the rest: ps failed", file=sys.stderr)
                 break
         fresh_layout = ""
-        if fam.discover:
+        if fam.discover or OUT_OF_BAND_RUN:
             # a discovered cache is deleted only on its own layout, so both are re-read now: the layout,
             # and the open files (a build may have started using it since the survey's lsof)
             # (lsof costs seconds on a loaded mini, so it is re-taken every APPLY_LSOF_ITEMS items or
             # APPLY_LSOF_S seconds, keeping --pressure --apply inside the hooks' timeout; ps is per item)
-            fresh_layout = discoverable(i.path)
+            # An out-of-band run deletes while a job runs, so every one of its items gets that same cadence: one
+            # snapshot from the start of the pass would be minutes old, and a job that opened an extract since
+            # (the signing job's own appcast run) must still hold it.
+            fresh_layout = discoverable(i.path) if fam.discover else ""
             lsof_items += 1
-            if lsof_items >= APPLY_LSOF_ITEMS or time.monotonic() - lsof_at >= APPLY_LSOF_S:
+            # out of band it is every item, not the cadence: eight items of leeway is enough for a job to open an
+            # extract this pass then lose it (the finding that blocked glaeda#1895's first head)
+            if OUT_OF_BAND_RUN or lsof_items >= APPLY_LSOF_ITEMS or time.monotonic() - lsof_at >= APPLY_LSOF_S:
                 try:
                     opened, cmds = process_evidence()
                 except NoEvidence as e:
@@ -9989,6 +9998,10 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
             outcome = "changed:owner-loaded"
         elif fam.discover and not fresh_layout:
             outcome = "changed:layout"
+        elif OUT_OF_BAND_RUN and job_owned_root(p):
+            # discovery descends into runner directories (home-caches is rooted at the home), so the family's own
+            # root passing job_owned_root is not enough: a cache inside a job's _work stays with the hook's pass
+            outcome = "changed:job-owned"
         elif (cmux_next_ci_busy(fam, p, cwds, cmds)
                 or (fam.id == INTERRUPTED and cmux_next_ci_aside_busy(p, cwds, cmds))
                 or (fam.id == RUNNER_BUILD_FAMILY and runner_job_live(fam.root.parent, cmds))
@@ -11816,7 +11829,7 @@ def _main_impl(argv: list[str] | None = None) -> int:
             print(f"idle sweep: the last one ran within {IDLE_SWEEP_EVERY_S // 60} min")
             RUN["skipped"] = "no pressure; idle sweep ran within the hour"
             return 0
-    global ACTIVITY_MODE, EMERGENCY_DEVS, FLOOR_HOLD, CMUX_NEXT_HOST_FLOOR
+    global ACTIVITY_MODE, EMERGENCY_DEVS, FLOOR_HOLD, CMUX_NEXT_HOST_FLOOR, OUT_OF_BAND_RUN
     ACTIVITY_MODE = "sweep" if sweep else "pressure" if a.pressure else None
     # the idle sweep judges by reuse windows alone; a pressure run or a report sees the emergency floor
     EMERGENCY_DEVS = frozenset() if sweep else emergency_devs(fss, a.emergency, floor_gib)
@@ -11855,6 +11868,7 @@ def _main_impl(argv: list[str] | None = None) -> int:
                 ids = sorted({f.id for f in disposable})
                 print(f"{OUT_OF_BAND}: {out_of_band}; only the families no job owns ({', '.join(ids)})")
                 RUN["out_of_band"] = out_of_band
+                OUT_OF_BAND_RUN = out_of_band  # apply(): fresh evidence per item, and no candidate under a _work
                 fams = disposable
                 # the same scope as `--family <those ids>`, so the pass's steps outside the families stay with the
                 # hook's pass too: idle runner checkouts, $TMPDIR test scratch, home clone gc and checkout repack
@@ -12254,12 +12268,17 @@ def write_run_line(started: float, free_before: int | None) -> None:
 
 def _logged_main(args: list[str]) -> int:
     """_main_impl, then one run line when it was an --apply run (whatever it did, or why it skipped)."""
+    global OUT_OF_BAND_RUN
     RUN.clear()
+    OUT_OF_BAND_RUN = ""  # one reset per run, before any early return of _main_impl can leave a stale reason
     RUN["caller"] = run_caller()
     started, before = time.time(), _home_free()
     try:
         status = _main_impl(args)
-        release_hook_pass(served=status == 0 and RUN.get("skipped") not in UNSERVED)
+        # an out-of-band run skipped the job-owned families, so it never serves the queue's triggers: one claimed
+        # before the run narrowed (the lock was free, then a CI job sent it out of band) is left for a full pass
+        release_hook_pass(served=status == 0 and RUN.get("skipped") not in UNSERVED
+                          and not RUN.get("out_of_band"))
         # A CI mini only ever runs --apply passes (the runner hooks and the pressure agent), never the report that
         # starts the census, so its accounting said "unwalked (no volume census yet)" for 258-291 GiB on cmux15,
         # cmux10s, cmux8s and cmuxs-6 (2026-11-02). A pass that ran starts the slice once its deletions are done;
