@@ -9173,12 +9173,15 @@ def floor_disk_env(caller: str, timeout: float | None = None) -> dict[str, str]:
     """A floor eviction's environment: it must free space now, so glaeda-disk never folds it into the queued pass
     (GLAEDA_DISK_HOOK_PASS, as the queue's own pass), and its run line names the caller.
 
-    A caller that bounds the run hands over its deadline (HYGIENE_RUN_DEADLINE, glaeda-disk's run_deadline_left), so
-    the child's own waits and walks end inside it and it still writes its run line instead of being killed mid-pass.
+    A caller that bounds the run gives the child half of that bound as the longest it may wait for another eviction
+    (GLAEDA_DISK_FLOOR_WAIT_S, glaeda-disk's floor_evict_wait_until), so a 30 s gate never leaves its child waiting
+    past the kill and the other half is still there to evict with. It is deliberately not HYGIENE_RUN_DEADLINE: that
+    one bounds every walk and verdict too, and its fixed margin would stop an ordinary pass of this length from
+    reclaiming anything at all.
     """
     env = {**os.environ, "GLAEDA_DISK_HOOK_PASS": "1", "GLAEDA_DISK_CALLER": caller}
     if timeout is not None and math.isfinite(timeout) and timeout > 0:
-        env["HYGIENE_RUN_DEADLINE"] = repr(time.time() + timeout)
+        env["GLAEDA_DISK_FLOOR_WAIT_S"] = repr(timeout / 2)
     return env
 
 

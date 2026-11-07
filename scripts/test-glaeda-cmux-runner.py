@@ -7256,17 +7256,17 @@ class DiskPassCoalesceTest(unittest.TestCase):
     def test_floor_evictions_are_never_queued(self) -> None:
         env = hook.floor_disk_env("runner hook floor eviction")
         self.assertEqual((env["GLAEDA_DISK_HOOK_PASS"], env["GLAEDA_DISK_CALLER"]), ("1", "runner hook floor eviction"))
-        self.assertNotIn("HYGIENE_RUN_DEADLINE", env, "no bound given, so the child keeps its own")
+        self.assertNotIn("GLAEDA_DISK_FLOOR_WAIT_S", env, "no bound given, so the child keeps its own")
 
-    def test_a_bounded_floor_eviction_hands_its_deadline_to_the_child(self) -> None:
-        """glaeda-disk's own waits and walks read HYGIENE_RUN_DEADLINE (run_deadline_left), so a child of a 30 s
-        gate ends inside it and writes its run line instead of being killed mid-pass."""
-        before = time.time()
+    def test_a_bounded_floor_eviction_gives_the_child_half_its_bound_to_wait(self) -> None:
+        """The child may wait for another eviction (glaeda-disk's floor_evict_wait_until), so a 30 s gate must not
+        leave it waiting past the kill; half the bound keeps the other half to evict with. Never the run deadline:
+        that one bounds every walk and verdict, and its margin would stop a pass this short reclaiming anything."""
         env = hook.floor_disk_env("runner hook floor eviction", 30.0)
-        self.assertLessEqual(before + 30.0, float(env["HYGIENE_RUN_DEADLINE"]))
-        self.assertLessEqual(float(env["HYGIENE_RUN_DEADLINE"]), time.time() + 30.0)
+        self.assertEqual(float(env["GLAEDA_DISK_FLOOR_WAIT_S"]), 15.0)
+        self.assertNotIn("HYGIENE_RUN_DEADLINE", env)
         for bad in (0.0, -1.0, float("inf")):
-            self.assertNotIn("HYGIENE_RUN_DEADLINE", hook.floor_disk_env("c", bad), bad)
+            self.assertNotIn("GLAEDA_DISK_FLOOR_WAIT_S", hook.floor_disk_env("c", bad), bad)
 
     def test_a_pass_that_could_not_start_keeps_its_trigger(self) -> None:
         disk = self.fake_disk()

@@ -5191,18 +5191,28 @@ class GlaedaDiskTest(unittest.TestCase):
                              "free, but only after the deadline")
             self.assertTrue(gd.wait_for_evict_lock(time.monotonic() + 5.0))
 
-    def test_the_floor_wait_is_zero_when_the_callers_deadline_cannot_hold_it(self) -> None:
-        """The gate hands over its own timeout (floor_disk_env), so a 30 s gate never gives its child a 120 s wait
-        and then kills it before its run line (router-review F2 on glaeda#1902)."""
+    def test_the_floor_wait_is_bounded_by_what_its_caller_allows(self) -> None:
+        """The gate gives half its timeout as the wait (floor_disk_env), so a short gate never leaves its child
+        waiting past the kill, and the run deadline still bounds it when one is set (router-review F2 on #1902)."""
         self.addCleanup(setattr, gd, "FLOOR_HOLD", gd.FLOOR_HOLD)
         gd.FLOOR_HOLD = {1: 1}
-        with mock.patch.dict(os.environ, {gd.RUN_DEADLINE_ENV: repr(time.time() + 30.0)}):
-            self.assertEqual(gd.floor_evict_wait_until(True), 0.0, "30 s, less than the margin: no wait at all")
-        with mock.patch.dict(os.environ, {gd.RUN_DEADLINE_ENV: repr(time.time() + 300.0)}):
-            self.assertGreater(gd.floor_evict_wait_until(True), time.monotonic(), "room for the wait")
+        for env, floor, why in (
+                ({gd.FLOOR_WAIT_ENV: "0"}, 0.0, "a caller with no room to wait"),
+                ({gd.FLOOR_WAIT_ENV: "-5"}, 0.0, "a caller already out of time"),
+                ({gd.RUN_DEADLINE_ENV: repr(time.time() + 30.0)}, 0.0, "less time left than the deadline margin"),
+        ):
+            with mock.patch.dict(os.environ, env):
+                self.assertEqual(gd.floor_evict_wait_until(True), 0.0, why)
+        with mock.patch.dict(os.environ, {gd.FLOOR_WAIT_ENV: "10"}):
+            left = gd.floor_evict_wait_until(True) - time.monotonic()
+            self.assertTrue(0 < left <= 10.0, f"its caller's 10 s, not {gd.EVICT_WAIT_FLOOR_S:g}: {left}")
+        with mock.patch.dict(os.environ, {gd.FLOOR_WAIT_ENV: "not a number"}):
+            left = gd.floor_evict_wait_until(True) - time.monotonic()
+            self.assertTrue(0 < left <= gd.EVICT_WAIT_FLOOR_S, f"unreadable: the plain budget, not none: {left}")
         with mock.patch.dict(os.environ, {}, clear=False):
-            os.environ.pop(gd.RUN_DEADLINE_ENV, None)
-            self.assertGreater(gd.floor_evict_wait_until(True), time.monotonic(), "no deadline: the full budget")
+            for name in (gd.FLOOR_WAIT_ENV, gd.RUN_DEADLINE_ENV):
+                os.environ.pop(name, None)
+            self.assertGreater(gd.floor_evict_wait_until(True), time.monotonic(), "unbounded caller: the full budget")
 
     def test_a_wait_at_the_acquisition_measures_the_cap_again(self) -> None:
         """The holder was evicting while this run waited, so a cap measured before it is spent: a waiter that kept
@@ -5221,8 +5231,28 @@ class GlaedaDiskTest(unittest.TestCase):
         self.assertEqual(status, 0)
         self.assertEqual(rows[-1]["evict_floor_wait"], "took its turn")
         self.assertEqual(measured.call_count, 2, "once before the wait, once after it")
+        self.assertEqual(rows[-1]["cmux_next_ci_over_gib"], 0.0, "the fresh reading, not the one from before")
         self.assertTrue(all(call.kwargs.get("measure") for call in measured.call_args_list),
                         "the second reading is a fresh measurement, not the stale snapshot")
+        survey.assert_called()
+
+    def test_a_cap_reading_that_fails_after_the_wait_takes_the_budget_with_it(self) -> None:
+        """A du that failed or timed out gives None: reading `over` from it raised, and keeping the stale budget
+        would delete output the holder already freed (router-review F2 on glaeda#1902)."""
+        _, _, p_lock, p_pending = self._queue()
+        first = {"used": 6 * gd.GIB, "cap": 4 * gd.GIB, "over": 2 * gd.GIB, "at": time.time()}
+        taken = (self.root / "taken.lock").open("a")
+        self.addCleanup(taken.close)
+        with p_lock, p_pending, mock.patch.dict(os.environ, {gd.CALLER_ENV: "test"}), \
+                mock.patch.object(gd, "eviction_lock_is_held", return_value=False), \
+                mock.patch.object(gd, "acquire_evict_lock", side_effect=[None, taken]), \
+                mock.patch.object(gd, "release_evict_lock"), \
+                mock.patch.object(gd, "wait_for_evict_lock", return_value=True), \
+                mock.patch.object(gd, "cmux_next_ci_cap_state", side_effect=[first, None]):
+            status, rows, survey, _ = self._main_run(["--pressure", "--apply"], free_gib=28.0)
+        self.assertEqual(status, 0, "the run goes on; an unreadable cap is not a crash")
+        self.assertEqual(rows[-1]["cmux_next_ci_over_gib"], None, "no budget from a reading it does not have")
+        self.assertEqual(gd.CMUX_NEXT_CI_OVER, 0)
         survey.assert_called()
 
     def test_a_floor_runs_wait_that_expires_says_the_holders_pass_serves_the_floor(self) -> None:
