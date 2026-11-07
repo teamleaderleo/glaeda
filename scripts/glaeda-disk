@@ -5444,6 +5444,23 @@ def cache_layout(path: Path | str) -> str:
 
 REPRODUCIBLE_DIRS = frozenset({"node_modules", ".build", "DerivedData", "target", ".venv",
                                "__pycache__", ".gradle", "Pods"})
+# Clones a package manager fetched from upstream and fetches again: SwiftPM's checkouts and repositories (under
+# .spm-cache, SourcePackages or .build) and cargo's git db and checkouts (under cargo or .cargo). Nobody works in
+# them, so no scan takes one for a checkout to bundle or a work tree to archive (cmux22, 2026-11-07: a retired runner's
+# .spm-cache/checkouts/Sparkle kept 15.7 GiB as "an untracked checkout no scan found", and a perf worker's
+# cargo/git/db kept 10 GiB as "unreadable refs").
+DEPENDENCY_CLONE_DIRS = {("checkouts", ".spm-cache"), ("repositories", ".spm-cache"),
+                         ("checkouts", "SourcePackages"), ("repositories", "SourcePackages"),
+                         ("checkouts", ".build"), ("repositories", ".build")}
+CARGO_HOMES = frozenset({"cargo", ".cargo"})
+
+
+def dependency_clones(d: str | os.PathLike[str]) -> bool:
+    """d is a package manager's directory of upstream clones (DEPENDENCY_CLONE_DIRS, cargo's git/db and git/checkouts)."""
+    parts = os.path.normpath(os.fspath(d)).split(os.sep)
+    if len(parts) >= 2 and (parts[-1], parts[-2]) in DEPENDENCY_CLONE_DIRS:
+        return True
+    return len(parts) >= 3 and parts[-1] in ("db", "checkouts") and parts[-2] == "git" and parts[-3] in CARGO_HOMES
 
 
 # Never searched by discover_caches, relative to the home directory: secrets and credentials,
@@ -5729,6 +5746,8 @@ def git_state(path: Path, depth: int = 5, budget: int = 20000, sealed: bool = Fa
                     return "git"
                 continue
             for e in dirs:
+                if dependency_clones(e.path):
+                    continue  # upstream clones a package manager fetches again
                 if e.name in REPRODUCIBLE_DIRS:
                     if vcs_at(e.path):
                         return "git"  # e.g. `git clone x target`; not searched deeper
@@ -5763,6 +5782,8 @@ def checkouts(path: Path, depth: int = 5, budget: int = 20000, strict: bool = Fa
                         if budget < 0:
                             return None
                         if e.is_dir(follow_symlinks=False):
+                            if dependency_clones(e.path):
+                                continue  # upstream clones a package manager fetches again
                             if e.name not in REPRODUCIBLE_DIRS:
                                 nxt.append(e.path)
                             elif os.path.lexists(os.path.join(e.path, ".git")) or looks_like_repository(e.path):
@@ -5863,7 +5884,7 @@ def ignored_checkout_loss(root: Path) -> str:
         if not entry.startswith("!! ") or not entry.endswith("/"):
             continue
         rel = entry[3:].rstrip("/")
-        if Path(rel).name in REPRODUCIBLE_DIRS:
+        if Path(rel).name in REPRODUCIBLE_DIRS or under_dependency_clones(rel):
             continue
         inner = checkouts(root / rel, NESTED_DEPTH, NESTED_BUDGET)
         if inner is None:
@@ -6506,8 +6527,14 @@ def _keep_archive(tmp: Path, dest: Path, expires: str, written: list[Path], **ab
 
 
 def _build_output_dir(d: str) -> bool:
-    return os.path.basename(d) in REPRODUCIBLE_DIRS or _head(os.path.join(d, "CACHEDIR.TAG"),
-                                                             len(CACHEDIR_TAG)) == CACHEDIR_TAG
+    return os.path.basename(d) in REPRODUCIBLE_DIRS or dependency_clones(d) or _head(
+        os.path.join(d, "CACHEDIR.TAG"), len(CACHEDIR_TAG)) == CACHEDIR_TAG
+
+
+def under_dependency_clones(rel: str) -> bool:
+    """A path (relative to a work tree) at or below a package manager's directory of upstream clones."""
+    parts = rel.strip("/").split("/")
+    return any(dependency_clones(os.path.join(*parts[:k])) for k in range(2, len(parts) + 1))
 
 
 def work_tree_changes(root: Path, trees: set[str]) -> tuple[str, bytes, list[tuple[str, Path, str]]]:
@@ -6553,6 +6580,8 @@ def work_tree_changes(root: Path, trees: set[str]) -> tuple[str, bytes, list[tup
         if not rel:
             continue
         if rel.endswith("/"):  # an untracked checkout: git lists it whole
+            if under_dependency_clones(rel):
+                continue  # an upstream clone a package manager fetches again (DEPENDENCY_CLONE_DIRS)
             if os.path.realpath(root / rel) not in trees:
                 return f"an untracked checkout no scan found ({rel})", b"", []
             continue
@@ -6880,7 +6909,8 @@ def _ignored_checkouts(root: Path) -> list[Path] | None:
         return None
     found: list[Path] = []
     for entry in r.stdout.split("\0"):
-        if entry.startswith("!! ") and entry.endswith("/") and Path(entry[3:-1]).name not in REPRODUCIBLE_DIRS:
+        if (entry.startswith("!! ") and entry.endswith("/") and Path(entry[3:-1]).name not in REPRODUCIBLE_DIRS
+                and not under_dependency_clones(entry[3:-1])):
             if (inner := checkouts(root / entry[3:-1], NESTED_DEPTH, NESTED_BUDGET, strict=True)) is None:
                 return None
             found += inner

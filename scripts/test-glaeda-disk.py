@@ -8632,6 +8632,29 @@ class LinuxLayoutTest(unittest.TestCase):
         self.assertIn("its uncommitted work changed while it was archived", rec["reasons"])
         self.assertEqual((clone / "tracked.txt").read_text(), "v3, edited while it was archived\n")
 
+    def test_package_manager_clones_in_a_mirror_are_not_checkouts_to_keep_it_for(self) -> None:
+        """cmux22, 2026-11-07: a retired runner's checkout kept 15.7 GiB as "an untracked checkout no scan found
+        (.spm-cache/checkouts/Sparkle/)". SwiftPM and cargo clones are fetched again; the work is still archived."""
+        unit, clone, env = self.dirty_mirror()
+        for rel in (".spm-cache/checkouts/Sparkle", ".spm-cache/repositories/Sparkle-1a2b",
+                    ".cargo/git/checkouts/acp-8bd5/0f1e"):
+            dep = clone / rel
+            dep.mkdir(parents=True)
+            self.git(dep, "init", "-q", env=env)
+            (dep / "Package.swift").write_text("// upstream\n")
+            self.git(dep, "add", ".", env=env)
+            self.git(dep, "commit", "-q", "-m", "upstream", env=env)
+        bare = clone / ".cargo/git/db/acp-8bd5"
+        subprocess.run(["git", "init", "-q", "--bare", str(bare)], check=True, env=env)
+        self.assertTrue(gd.dependency_clones(clone / ".spm-cache/checkouts"))
+        self.assertTrue(gd.dependency_clones(clone / ".cargo/git/db"))
+        self.assertFalse(gd.dependency_clones(clone / "checkouts"), "a checkouts dir of its own is searched")
+        self.assertFalse(gd.dependency_clones(clone / "git/db"), "git/db outside a cargo home is searched")
+        rec, _ = self.apply_mirror(unit)
+        self.assertEqual(rec["outcome"], "reclaimed", rec["reasons"])
+        self.assertFalse(clone.exists())
+        self.assertTrue(list((self.home / "archive/glaeda-disk").glob("*.tar.gz")), "the clone's own work is archived")
+
     def test_staged_content_the_work_tree_no_longer_has_keeps_the_mirror(self) -> None:
         unit, clone, env = self.dirty_mirror()
         (clone / "staged.txt").unlink()  # AD: the staged blob is only in the index
@@ -10216,6 +10239,26 @@ class HomeScratchTest(unittest.TestCase):
                 self.assertIn("blocked:bundle-failed", receipt)
                 self.assertIn("unreadable refs in src/.git; kept for owner recovery", receipt)
                 self.assertTrue(tree.exists(), "apply cannot delete a tree whose nested refs cannot be archived")
+
+    def test_a_cargo_git_db_in_a_legacy_home_tree_is_not_read_for_refs(self) -> None:
+        """cmux22, 2026-11-07: cmux-ci-perf kept 10 GiB as "unreadable refs in cache/cargo/git/db/...". Cargo's git
+        db holds upstream clones it fetches again, so its refs are never read; the tree's own checkout still is."""
+        tree = self.tree("cmux-ci-perf", git=True)
+        db = tree / "cache/cargo/git/db/cmux-codex-acp-8bd52ecc83e39be7"
+        db.parent.mkdir(parents=True)
+        subprocess.run(["git", "clone", "-q", "--bare", str(tree / "src"), str(db)], check=True, capture_output=True,
+                       env=self.env)  # as cargo's db: a bare clone with commits
+        self.age(tree, 26)
+        real = gd.local_tips
+        with mock.patch.object(gd, "local_tips",
+                               side_effect=lambda g, *a, **k: None if "cargo/git/db" in os.fspath(g) else real(g, *a, **k)):
+            fam = self.family()
+            item = self.survey(fam)["cmux-ci-perf"]
+            self.assertEqual(item.verdict, "reclaimable", item.reasons)
+            receipt = self.apply(fam, item)
+        self.assertNotIn("unreadable refs", receipt)
+        self.assertFalse(tree.exists(), receipt)
+        self.assertEqual(len(list((self.home / "archive/glaeda-disk").glob("*.bundle"))), 1, "src's commits bundled")
 
     def retire(self, label: str, tree: Path, where: str = ".local/state/fleet-retired-workers") -> Path:
         """A worker plist naming tree (work root and working directory), as a fleet heal step moves it out of
