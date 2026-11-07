@@ -236,8 +236,11 @@ def disk_low_turn(capacity_dir: Path, worker: int) -> str | None:
 
 # A job under the runner floor waits this long for the disk ledger's turn and is then admitted with a warning: a busy
 # machine makes a job slower, never makes it fail (cmux's fast tier went red at "Set up runner" when the turn refused
-# it, 2026-11-07: "another job admitted under the disk floor still runs here").
-DISK_LOW_WAIT_S = 600.0
+# it, 2026-11-07: "another job admitted under the disk floor still runs here"). The wait also ends at the job's
+# eviction deadline (EVICT_TIMEOUT_S, one budget for the disk phase), a nightly job skips it (it goes first on disk),
+# and a bounded capacity wait after it is shortened by it, so a refusal still comes inside cmux's rescue window
+# (REFUSAL_SECONDS, NIGHTLY_BOUND_WORST_S).
+DISK_LOW_WAIT_S = 300.0
 DISK_LOW_POLL_S = 5.0
 
 
@@ -9848,13 +9851,17 @@ def main(argv: list[str] | None = None) -> int:
                 return f"{disk_refusal(disk_path, args.min_free_gib) or 'under the disk floor'}: " \
                        "this job's Runner.Worker is not pinned, so it cannot take the disk ledger's turn"
             under = disk_refusal(disk_path, args.min_free_gib) or "under the disk floor"
+            started = time.monotonic()
             turn = wait_disk_low_turn(args.capacity_dir, owner.pid,
-                                      lambda: bool(disk_refusal(disk_path, args.min_free_gib)), owner.gone)
+                                      lambda: bool(disk_refusal(disk_path, args.min_free_gib)), owner.gone,
+                                      0.0 if nightly_disk else min(DISK_LOW_WAIT_S, max(0.0, disk_deadline - started)))
+            disk_low_waited[0] += time.monotonic() - started
             if turn:
                 print(f"{PREFIX}: warning: {under}: {turn}; admitted without the disk ledger's turn after waiting "
                       "for it (a disk floor warns, never refuses)", flush=True)
             return disk_refusal(disk_path, admit_floor)  # read again: it may have waited for the ledger
 
+        disk_low_waited = [0.0]  # seconds disk_why spent waiting for the disk ledger's turn
         why = disk_why()
         if why:
             return refused(why, disk=True)
@@ -9932,6 +9939,8 @@ def main(argv: list[str] | None = None) -> int:
                       + ("holding every other admission here meanwhile, then is refused so the run's Blacksmith job "
                          "signs" if drain_bound == SIGNING_DRAIN_WAIT_S else
                          "then is refused so its re-run takes Blacksmith"), flush=True)
+            if cap is not None and disk_low_waited[0] > 0:
+                cap = max(0.0, cap - disk_low_waited[0])  # one setup budget: the disk turn's wait counts against it
             if tier == TIER_NIGHTLY:
                 print(f"{PREFIX}: a nightly job: it goes ahead of every other job waiting here, no other job takes a "
                       f"unit while it waits, and it keeps no idle reserve"

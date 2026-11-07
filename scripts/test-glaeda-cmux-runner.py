@@ -1950,8 +1950,15 @@ class HookTest(unittest.TestCase):
                    "GLAEDA_CANONICAL_ROOT_PARENT": NO_ROOTS, "GLAEDA_FLEET_DIR": os.fspath(self.dir / "fleet"),
                    "GITHUB_EVENT_NAME": "push", "GITHUB_EVENT_PATH": os.fspath(push),
                    "GITHUB_REPOSITORY": "manaflow-ai/cmux"}
+            original = hook.wait_disk_low_turn
+            asked: list[float | None] = []
+
+            def no_wait(capacity_dir, worker, still_low, gone, wait_s=None):  # type: ignore[no-untyped-def]
+                asked.append(wait_s)
+                return original(capacity_dir, worker, still_low, gone, 0.0)
+
             with mock.patch.dict(os.environ, env, clear=True), \
-                    mock.patch.object(hook, "DISK_LOW_WAIT_S", 0.0), \
+                    mock.patch.object(hook, "wait_disk_low_turn", side_effect=no_wait), \
                     mock.patch.object(hook, "start_runner_parent_watchdog"), \
                     contextlib.redirect_stdout(io.StringIO()) as out:
                 code = hook.main(["job-started", "--allowed-repo", "manaflow-ai/cmux", "--no-disk",
@@ -1964,6 +1971,11 @@ class HookTest(unittest.TestCase):
         self.assertIn(f"warning: 25.0 GiB free, 30 GiB required: another job admitted under the disk floor still runs "
                       f"here (pid {holder.pid}); admitted without the disk ledger's turn", out.getvalue())
         self.assertNotIn("refused", out.getvalue())
+        # the wait shares the job's disk budget: never past its eviction deadline, so a refusal after it stays in
+        # cmux's rescue window
+        self.assertEqual(len(asked), 1)
+        self.assertGreater(asked[0], 0.0)
+        self.assertLessEqual(asked[0], min(hook.DISK_LOW_WAIT_S, hook.EVICT_TIMEOUT_S))
 
     def test_wait_disk_low_turn_takes_the_turn_once_the_other_job_ends(self) -> None:
         capacity = self.dir / "capacity"
