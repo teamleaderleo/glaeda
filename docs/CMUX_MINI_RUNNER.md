@@ -296,7 +296,13 @@ What `--apply` does:
      disk pressure pass detached and always exits 0. One pass runs at a time per host
      (`~/.cache/glaeda-disk/hook-pass.lock`): a trigger at or above glaeda-disk's target is
      skipped, and triggers that arrive while a pass runs leave one `hook-pass.pending` the
-     running pass serves with a single follow-up; both skips get a line in glaeda-disk's run log. The two-minute `glaeda-mini-health` agent repeats
+     running pass serves with a single follow-up; both skips get a line in glaeda-disk's run log.
+     Only that queued pass waits for a running job: every other `--pressure --apply` run (a manual
+     one, the disk-pressure LaunchAgent's, idle-repair's, the hook's own floor evictions) reclaims
+     out of band instead of queueing behind it -- the families no job owns
+     (glaeda-disk `OUT_OF_BAND_FAMILY_IDS`, none under a runner's `_work`, nothing a live job holds
+     open or names), with its reason in the run line's `out_of_band`. An exclusive signing job used
+     to hold the queue for hours while every run in it freed nothing. The two-minute `glaeda-mini-health` agent repeats
      that ownership check when a post-job hook was skipped, and the listener gate sweeps its
      own idle runner's `_work` for such orphans every ten minutes (never while that runner has
      a Runner.Worker, and never without ps and lsof evidence).

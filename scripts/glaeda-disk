@@ -257,6 +257,16 @@ HOOK_PASS_ENV = "GLAEDA_DISK_HOOK_PASS"  # "1" in the hook's own pass and its fl
 # it and the hook's pass never overlap, or leaves its trigger to the pass that holds it.
 CALLER_ENV = "GLAEDA_DISK_CALLER"  # who started this run, for its run line; else the parent's command
 COALESCED_INTO_HOOK = "coalesced into the running pass (glaeda-disk)"
+# Only the queue's own pass (the hook's DISK_BOUND) waits for a running job or holds the queue. Every other pressure
+# --apply run -- a manual one, the LaunchAgent's, idle-repair's, the hook's floor evictions -- reclaims out of band
+# instead of joining that queue: the families no job owns (OUT_OF_BAND_FAMILY_IDS), never a path a live job holds,
+# and never waiting on HOOK_PASS_LOCK. The bound holds the lock for up to DISK_PASS_LIFETIME_FACTOR pass bounds and
+# treats a CI deferral as busy, so during an exclusive signing job every other run coalesced into it and freed
+# nothing for hours (two minis, 2026-11-07: "a runner hook pass is under way; this run joins its queue").
+OUT_OF_BAND = "out of band"
+FLOOR_CALLER_MARK = "floor eviction"  # the hook's floor_disk_env callers: they must free space now, so never the queue
+CI_DEFER_MARK = "deferred: a CI job is running"  # the hook's bound reads this (DISK_BOUND's BUSY) to keep its trigger
+RUNNER_WORK_DIR = "_work"  # <runner>/_work: a job's workspace, its RUNNER_TEMP and its build output, all job-owned
 UNSERVED = ("eviction_busy", "measurement_busy", "defer_during_ci")  # a run that skipped these did no pass
 EVICT_OWNER = HOME / ".cache/glaeda-disk/evict.owner.json"
 EVICT_OWNER_STALE_S = 30 * 60
@@ -5151,6 +5161,41 @@ def git_exempt(fam: Family, path: Path, idle_hours: float) -> bool:
 # on cmux8s and 7.8 GiB on cmuxs-mac-mini-3 sat there for days (2026-10-11). Once its pid is gone, the
 # interrupted-deletions family finishes it in place.
 INTERRUPTED = "interrupted-deletions"
+# What an out-of-band run (OUT_OF_BAND) may reclaim: disposable caches and extracts a running job never owns, so
+# freeing them competes with no job's workspace and needs no place in the hook's queue. Fails closed: a family not
+# listed here waits for the queue's own pass, whatever the pressure. Job-owned state (runner workspaces, a job's
+# DerivedData and $TMPDIR, the warm build stores) stays with that pass, and an item a live job holds open or names is
+# still refused per item (apply's fresh process evidence).
+OUT_OF_BAND_FAMILY_IDS = frozenset({
+    "sparkle-appcast",     # Sparkle_generate_appcast extracts: the next appcast run extracts again
+    "library-caches",      # ~/Library/Caches: the app re-downloads or rebuilds it
+    "home-caches",         # the discovered sealed caches in the home
+    "user-cache",          # ~/.cache
+    "cua-cache",
+    "cmux-ghosttykit-cache",
+    INTERRUPTED,           # aside trees a killed deletion left; its own owner check still applies
+})
+
+
+def job_owned_root(root: Path) -> bool:
+    """True when root is inside some runner's _work: a job's workspace, its RUNNER_TEMP or its build output. Such a
+    family is the hook pass's, never an out-of-band run's, whatever its id."""
+    for parent in (root, *root.parents):
+        if parent.name == RUNNER_WORK_DIR and parent.parent.name.startswith("actions-runner"):
+            return True
+    return False
+
+
+def out_of_band_families(fams: list[Family]) -> list[Family]:
+    """The families of `fams` an out-of-band run may reclaim (OUT_OF_BAND_FAMILY_IDS, none under a runner's _work)."""
+    return [f for f in fams if f.id in OUT_OF_BAND_FAMILY_IDS and not job_owned_root(f.root)]
+
+
+def queue_pass() -> bool:
+    """True when this run is the runner hook queue's own pass (its DISK_BOUND sets HOOK_PASS_ENV). It is the one run
+    that keeps its trigger and waits for a running job, so the job-owned dirs are reclaimed once that job is gone.
+    The hook's floor evictions set HOOK_PASS_ENV too, but they must free space now (floor_disk_env's caller)."""
+    return os.environ.get(HOOK_PASS_ENV) == "1" and FLOOR_CALLER_MARK not in (os.environ.get(CALLER_ENV) or "")
 
 
 def deleting_pid(name: str) -> int | None:
@@ -8382,7 +8427,8 @@ def ci_defer(fss: dict[int, Fs], jobs: list[str], emergency: str, floor_gib: flo
         return ""
     if any(fs.under and fs.free < emergency_bytes(fs, emergency, floor_gib) for fs in fss.values()):
         return ""
-    return f"deferred: a CI job is running ({jobs[0]}); pressure deletes wait unless free drops below {emergency} or {POLICY['target_margin_gib']:g} GiB above a runner floor"
+    return (f"{CI_DEFER_MARK} ({jobs[0]}); pressure deletes wait unless free drops below {emergency} or "
+            f"{POLICY['target_margin_gib']:g} GiB above a runner floor")
 
 
 def mount_point(path: Path) -> Path:
@@ -11784,20 +11830,38 @@ def _main_impl(argv: list[str] | None = None) -> int:
             return 0
         a.pressure = False  # the sweep reports and acts on every filesystem, without targets
         fams = idle_families(fams)
+    out_of_band = ""  # why this run reclaims out of band: a held hook pass, or a running job's deferral
     if a.pressure:
         # only families on a filesystem under pressure are surveyed or touched
         fams = [f for f in fams if fss[f.root.stat().st_dev].under]
         # Before the cap's du (10-20 s on a mini): a run that would only find evict.lock taken stops here. Another
-        # caller's pressure run (the LaunchAgent's, idle-repair's) joins the runner hook's queue while a hook pass is
-        # under way, so that pass serves it with its one follow-up rather than this run skipping as busy. It does so
-        # before any deferral, so a deferred run's trigger is still left (or kept claimed) for a later pass.
-        if a.apply and not a.cmux_next_drain and not RUNNER_CACHE_PROFILE \
-                and os.environ.get(HOOK_PASS_ENV) != "1" and take_hook_pass() is False:
-            return deferred(COALESCED_INTO_HOOK, "a runner hook pass is under way; this run joins its queue")
+        # caller's pressure run (the LaunchAgent's, idle-repair's) leaves its trigger for the runner hook's queue
+        # while a hook pass is under way, so that pass serves the job-owned dirs with its one follow-up rather than
+        # this run racing it. It does so before any deferral, so a deferred run's trigger is still left (or kept
+        # claimed) for a later pass. This run itself no longer waits for that pass: it goes on out of band.
+        queued = a.apply and not a.cmux_next_drain and not RUNNER_CACHE_PROFILE \
+            and os.environ.get(HOOK_PASS_ENV) != "1" and take_hook_pass() is False
+        if queued:
+            out_of_band = "a runner hook pass is under way"
         if a.apply and POLICY["defer_during_ci"] and (why := ci_defer(fss, ci_jobs(), a.emergency, floor_gib)):
-            print(why)
-            RUN["skipped"] = "defer_during_ci"
-            return 0
+            if queue_pass():  # the one run that comes back for the job-owned dirs once the job is gone
+                print(why)
+                RUN["skipped"] = "defer_during_ci"
+                return 0
+            # the job owns its workspace, not the disposable caches: free those now instead of waiting for it
+            out_of_band = out_of_band or why.replace(CI_DEFER_MARK, "a CI job is running", 1)
+        if out_of_band:
+            if (disposable := out_of_band_families(fams)):
+                print(f"{OUT_OF_BAND}: {out_of_band}; only the families no job owns "
+                      f"({', '.join(sorted({f.id for f in disposable}))})")
+                RUN["out_of_band"] = out_of_band
+                fams = disposable
+            elif queued:
+                return deferred(COALESCED_INTO_HOOK, "a runner hook pass is under way; this run joins its queue")
+            else:
+                print(why)
+                RUN["skipped"] = "defer_during_ci"
+                return 0
         if a.apply and not a.cmux_next_drain and not RUNNER_CACHE_PROFILE:
             if eviction_lock_is_held():
                 owner = eviction_owner_status()
@@ -12171,6 +12235,7 @@ def write_run_line(started: float, free_before: int | None) -> None:
            "caller": RUN.get("caller"), "evict_owner": _owner_line(RUN.get("evict_owner")),
            "bundle_failed": RUN.get("bundle_failed", []),
            "bundle_failed_remembered": RUN.get("bundle_failed_remembered", []),
+           "out_of_band": RUN.get("out_of_band"),
            "measure_budget_reached": bool(RUN.get("measure_budget_reached")),
            "run_deadline_reached": bool(RUN.get("run_deadline_reached"))}
     with contextlib.suppress(OSError):
