@@ -7636,6 +7636,7 @@ class SparkleAppcastTest(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.home = Path(os.path.realpath(self.tmp.name))
+        (self.home / "Library/Caches/Sparkle_generate_appcast").mkdir(parents=True)
         for key, value in (("HOME", self.home), ("DARWIN", True), ("ROLE", "fleet-mini")):
             patch = mock.patch.object(gd, key, value)
             patch.start()
