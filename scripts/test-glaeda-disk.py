@@ -7644,6 +7644,9 @@ class SparkleAppcastTest(unittest.TestCase):
             families = {f.id: f for f in gd.default_families()}
         self.fam = families["sparkle-appcast"]
         self.assertIn("Sparkle_generate_appcast", families["library-caches"].skip)
+        with mock.patch.object(gd, "enrolled_runners", return_value=[]):
+            devbox = next(f for f in gd.default_families("devbox") if f.id == "sparkle-appcast")
+        self.assertTrue(devbox.pressure_only, "keep the existing devbox cache policy")
 
     def extract(self, name: str, hours: float) -> Path:
         path = self.fam.root / name
@@ -9876,6 +9879,13 @@ class HomeScratchTest(unittest.TestCase):
                 self.assertEqual(why, "unreadable refs in src/.git; kept for owner recovery")
                 self.assertEqual(written, [])
                 self.assertTrue((tree / "src/.git").is_dir())
+                fam = self.family()
+                item = self.survey(fam)[name]
+                with mock.patch.object(gd, "local_tips", return_value=None):
+                    receipt = self.apply(fam, item)
+                self.assertIn("blocked:bundle-failed", receipt)
+                self.assertIn("unreadable refs in src/.git; kept for owner recovery", receipt)
+                self.assertTrue(tree.exists(), "apply cannot delete a tree whose nested refs cannot be archived")
 
     def retire(self, label: str, tree: Path, where: str = ".local/state/fleet-retired-workers") -> Path:
         """A worker plist naming tree (work root and working directory), as a fleet heal step moves it out of

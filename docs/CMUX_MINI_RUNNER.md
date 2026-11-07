@@ -441,7 +441,7 @@ What `--apply` does:
        (`capacity/fast-0.token`, `fast-1.token`): it stops while either is taken or a job
        here waits for one, and listens with every shared unit taken. No other runner,
        `fits` or `admit` counts the fast tokens. The host lock, reservation, drain,
-       saturation and disk holds apply to it as to every runner.
+       saturation holds and disk cleanup warnings apply to it as to every runner.
    - **When the console session cannot run GUI tests** (gui runner only). GUI jobs run
      in the console user's session, and a mini whose auto-login session is screen-locked
      (display sleep, then the lock) or sits at the login window fails every one

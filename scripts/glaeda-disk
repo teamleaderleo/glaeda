@@ -883,7 +883,7 @@ CMUX_NEXT_DRAIN_HOOK_SHA256 = frozenset({
     "7430aae2e88ee40ebe760349388ca02fb183ac1489e0c786bcc0c14c95a8c84a",
     "9b2b2be376e509f71771643c1c03d478c690bbfed04d66bc53c914777eb5504e",
     "5836275a0e05566b11a120996d96904ba60ac906353698cc58c2ca6c70949b10",
-    "94582b292d438a24fe9f8e2aae9b9edaa4fd1c27e954b1b26cd7d142f80cc5b5",
+    "7c0d9d8cae04254e76666b002b90f3d734a293bdcc0cee45175c01df67761bba",
 })
 CMUX_NEXT_CI_PRESERVED_NAMES = frozenset({
     "SourcePackages", "ModuleCache.noindex", "SDKStatCaches.noindex",
@@ -1163,7 +1163,7 @@ FLOOR_HOLD: dict[int, int] = {}
 # Filesystems under FLOOR_HOLD -> the runner floor itself (floor_gib), in bytes: a per-host cmux-next build root
 # younger than its idle window goes only while free is still below it, after everything else (cmux_next_ci_host_roots).
 CMUX_NEXT_HOST_FLOOR: dict[int, int] = {}
-GATE_DISK_RESUME_GIB = 2.0  # glaeda-cmux-runner-hook's: a disk hold ends only this far above the floor
+GATE_DISK_RESUME_GIB = 2.0  # glaeda-cmux-runner-hook's cleanup headroom above the floor
 
 
 def floor_hold(fss: "dict[int, Fs]", floor_gib: float, home: Path | None = None) -> dict[int, int]:
@@ -3944,7 +3944,7 @@ def default_families(role: str = "fleet-mini") -> list[Family]:
         Family("sparkle-appcast", HOME / "Library/Caches/Sparkle_generate_appcast", True,
                "generate_appcast extracts the published application again", depth=1, build_output=True,
                min_idle_hours=6.0, max_idle_hours=6.0, owner="Sparkle generate_appcast", rebuild_minutes=1,
-               platform="macos"),
+               pressure_only=role == "devbox", platform="macos"),
         # CUA recordings and frame caches are runner tooling residue, not private user data needed
         # by CI. Keep them separate from the generic Application Support/Cache totals so operators
         # can see their age and reclaim them after the normal process/open-file gate passes.

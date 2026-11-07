@@ -105,8 +105,8 @@ the mini and keep the gui label queued. A fast runner (--fast-runner) runs cmux-
 (FAST_TOKENS) instead of the shared units, and its gate looks at those tokens, never at the units. A gateway runner
 (--gateway-runner) runs only cmux's thin cmux-ci client jobs (GATEWAY_JOBS) on a gateway token (GATEWAY_TOKENS) and no
 shared unit; its gate is never held for CPU saturation or the units (GATEWAY).
-Every runner also stops listening while free disk is under its job-started hook's --min-free-gib,
-and starts the same eviction in the background, listening again once it made room (Gate.low_disk). Full means every
+Every runner warns while free disk is under its job-started hook's --min-free-gib and starts the same bounded
+eviction in the background while it keeps listening (Gate.low_disk). Full means every
 unit this runner's own --capacity-units scans, read from its job-started hook, is taken or kept for an idle gui
 runner's reserve; for a root runner it also means the mini cannot admit a compile or an app-host shard (mini_full).
 """
@@ -2843,10 +2843,10 @@ def prejob_evict(path: str, min_free_gib: float, explicit: str | None, wait_s: f
 # that mini swung between 17 and 44 GiB within minutes and every glaeda-disk pass there freed nothing. Leo, 2026-10-27:
 # "a waiting nightly, promote or nightly sign/verify job is admitted on a mini ahead of every PR, DEV and side job and
 # may use any reserve, and no new PR job starts on a mini where a nightly job waits." So:
-#   - every other runner's gate on a mini with a dedicated builder holds its listener while free disk is under the
-#     builder's floor plus one job's measured growth (job_disk_gib), so PR jobs leave that room (Gate.low_disk);
+#   - every other runner's gate on a mini with a dedicated builder requests cleanup below the builder's floor plus
+#     one job's measured growth (job_disk_gib); the disk reading never stops its listener (Gate.low_disk);
 #   - a nightly job short of disk in job-started leaves a nightly waiter marker (NIGHTLY_DISK_WANT) for as long as it
-#     frees space, so no new PR job starts here meanwhile (fair_turn, mini_full, Gate.low_disk), and it first removes
+#     frees space, so no new PR job starts here meanwhile (fair_turn, mini_full), and it first removes
 #     what idle PR runners left in their _work (evict_idle_runners), then runs the usual glaeda-disk pass, and is
 #     refused only if both left it short.
 NIGHTLY_DISK_WANT = "disk"
@@ -6938,9 +6938,9 @@ class Gate:
         return None
 
     def evict_idle_in_background(self, path: str, target: float) -> None:
-        """A dedicated builder held off under its floor, or a runner held for its reserve, takes what idle PR runners left in their _work
-        (evict_idle_runners, NIGHTLY_DISK_RESERVE) in a thread, at most every GATE_DISK_EVICT_EVERY_S, so it listens
-        again even when glaeda-disk's pass frees nothing."""
+        """Below a builder's floor or reserve, reclaim idle PR runners' _work in a bounded thread
+        (evict_idle_runners, NIGHTLY_DISK_RESERVE), at most every GATE_DISK_EVICT_EVERY_S. The listener stays online
+        even when cleanup frees nothing."""
         now = time.monotonic()
         if (self.idle_evict is not None and self.idle_evict.is_alive()) or \
                 now - self.idle_evicted_at < GATE_DISK_EVICT_EVERY_S:
@@ -7341,7 +7341,7 @@ class Gate:
         return any(runner_worker(self.runner_dir, table[pid][1], "Listener") for pid in pids)
 
     def worker_pids(self) -> tuple[int, ...]:
-        """Runner.Worker descendants, used to wake a disk hold when the job exits."""
+        """Runner.Worker descendants, used to act on pending holds when the job exits."""
         try:
             pids, table = self.tree()
         except Exception:  # noqa: BLE001
@@ -7567,9 +7567,9 @@ class Gate:
                     self.waiting, self.waiting_at = self.blocking_waiters(), time.monotonic()
                 reserved = self.still_reserved() or self.draining()  # RUNNER_DRAIN stops it at the job's end too
                 self.job_waited = bool(self.waiting) or reserved is not None
-                low = self.low_disk()
+                self.low_disk()  # advisory cleanup only: never watch or freeze a Worker for disk
                 workers = tuple(pid for pid in self.worker_pids() if pid not in self.done) \
-                    if self.waiting or reserved or low or self.job_ending else ()
+                    if self.waiting or reserved or self.job_ending else ()
                 if workers:
                     if workers != self.watching:  # once per job: the request its Worker runs, and who runs it
                         self.job_request, self.listener_pids = self.taking(), self.listener_list()
