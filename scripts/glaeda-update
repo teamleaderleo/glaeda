@@ -188,7 +188,14 @@ RATE_WAIT_MAX = 5 * 60  # a spent quota that resets this soon is waited for; a l
 # A failure is waited out to the reset (at most an hour): unposted, another canary's success would
 # promote the release after the 15-minute soak, before the next run could post it.
 FAILURE_WAIT_MAX = 60 * 60
-RATE_MARKERS = ("api rate limit", "rate limit exceeded", "secondary rate limit", "http 429")
+# Our own gh is the broker chain (the gh-quota shim, the local-build guard, glaeda's broker), and the shim refuses a
+# call in its own words when a shared pool is under its low-water floor. That refusal is a spent quota, not a verdict:
+# read as one, `gh attestation verify`'s non-zero exit looked like a failed verification, so a canary quarantined a
+# good release for good and posted a canary failure that holds stable for the whole fleet (big-red, 2026-11-07,
+# r-20261107-ac67c27f2d27: "refused: build-provenance attestation did not verify: gh-quota: refused").
+RATE_MARKERS = ("api rate limit", "rate limit exceeded", "secondary rate limit", "http 429",
+                "gh-quota: refused")
+BROKER_MARKER = "gh-quota: "  # any word from the shim, whatever it adds later: it answered, GitHub did not
 TRANSIENT_MARKERS = ("http 500", "http 502", "http 503", "http 504", "timeout", "timed out", "connection",
                      "network", "temporarily unavailable", "eof")
 MAX_UNREPORTED = 5
@@ -432,6 +439,10 @@ def attestation(path: Path) -> tuple[bool | None, str]:
     if result.returncode == 0:
         return True, "verified"
     message = (result.stderr or result.stdout).strip()[:200]
+    if BROKER_MARKER in message.lower():
+        # our own shim refused or answered instead of GitHub (a spent pool, a guard): nothing was verified either
+        # way, and a refusal must never read as a failed verification
+        return None, f"gh did not reach GitHub: {message}"
     if any(marker in message.lower() for marker in ("http 401", "http 403", "permission denied")):
         return None, f"gh cannot read attestations: {message}"
     if 'unknown command "attestation"' in message or message.startswith("unknown flag"):

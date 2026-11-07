@@ -261,6 +261,36 @@ class UpdateTest(unittest.TestCase):
         self.assertIn("no matching attestations", why)
         sleep.assert_not_called()
 
+    # big-red, 2026-11-07: the gh-quota shim refused `gh attestation verify` for glaeda-update while the shared REST
+    # pool was under its low-water floor. gh_kind did not know the shim's words, so the non-zero exit read as a failed
+    # verification: the host quarantined r-20261107-ac67c27f2d27 for good ("this release failed here before") and
+    # posted a canary failure, which holds stable for every mini.
+    SHIM_REFUSAL = ("gh-quota: refused for tool:glaeda-update (budget 600/h, used 0 in the last hour): the shared "
+                    "REST quota is under its low-water floor (195 of 5000 calls) and this call has no GraphQL "
+                    "equivalent")
+
+    def test_the_quota_shims_refusal_is_a_spent_quota_not_a_failed_verification(self) -> None:
+        self.assertEqual(gu.gh_kind(self.SHIM_REFUSAL), "rate-limited")
+        run = self.gh((0, ""), *[(1, self.SHIM_REFUSAL)] * (len(gu.GH_BACKOFF) + 1))
+        with mock.patch.object(gu, "find_gh", return_value="/usr/bin/gh"), \
+                mock.patch.object(gu, "rate_limit_reset", return_value=None), \
+                mock.patch.object(gu.subprocess, "run", run), mock.patch.object(gu.time, "sleep"):
+            verdict, why = self.saved[1](Path("/tmp/a.tar.gz"))
+        self.assertIsNone(verdict, "None is 'could not ask': a canary stays inconclusive and quarantines nothing")
+        self.assertTrue(why.startswith("rate-limited: "), why)
+
+    def test_any_answer_from_the_broker_instead_of_github_is_not_a_verdict(self) -> None:
+        """Whatever wording the shim or the local guards grow, nothing verified GitHub's attestation."""
+        message = "gh-quota: a word we have not written yet"  # no RATE_MARKERS hit, so gh_call returns the exit
+        self.assertIsNone(gu.gh_kind(message), "this one is not retried: the attestation check itself must judge it")
+        run = self.gh((0, ""), (1, message))
+        with mock.patch.object(gu, "find_gh", return_value="/usr/bin/gh"), \
+                mock.patch.object(gu, "rate_limit_reset", return_value=None), \
+                mock.patch.object(gu.subprocess, "run", run), mock.patch.object(gu.time, "sleep"):
+            verdict, why = self.saved[1](Path("/tmp/a.tar.gz"))
+        self.assertIsNone(verdict, "our own shim answered, so GitHub verified nothing: never False")
+        self.assertIn("gh did not reach GitHub", why)
+
     def test_persistent_rate_limit_stays_inconclusive_after_bounded_backoff(self) -> None:
         limited = (1, "HTTP 403: API rate limit exceeded")
         run = self.gh((0, ""), *[limited] * (len(gu.GH_BACKOFF) + 1))
