@@ -9646,7 +9646,8 @@ def wait_for_evict_lock(until: float) -> bool:
         if left <= 0:
             return False
         time.sleep(min(EVICT_WAIT_POLL_S, left))
-    return True
+    # a probe that saw it free after `until` is still too late: the deadline bounds the whole run, not just the wait
+    return time.monotonic() < until
 
 
 def acquire_evict_lock():

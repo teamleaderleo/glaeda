@@ -5183,6 +5183,14 @@ class GlaedaDiskTest(unittest.TestCase):
         self.assertGreater(held.call_count, 1, "it probed again instead of giving up on the first answer")
         survey.assert_called()
 
+    def test_the_floor_wait_refuses_a_lock_that_came_free_after_the_deadline(self) -> None:
+        """The deadline bounds the whole run, not just the wait: a holder that releases a moment too late does not
+        buy this run a cap measurement and an eviction past it (router-review F1 on glaeda#1902)."""
+        with mock.patch.object(gd, "eviction_lock_is_held", return_value=False):
+            self.assertFalse(gd.wait_for_evict_lock(time.monotonic() - 0.01),
+                             "free, but only after the deadline")
+            self.assertTrue(gd.wait_for_evict_lock(time.monotonic() + 5.0))
+
     def test_a_floor_runs_wait_that_expires_says_the_holders_pass_serves_the_floor(self) -> None:
         """The wait is bounded: it never blocks a floor run behind a long eviction, and the line says who serves."""
         _, _, p_lock, p_pending = self._queue()
