@@ -261,7 +261,7 @@ class UpdateTest(unittest.TestCase):
         self.assertIn("no matching attestations", why)
         sleep.assert_not_called()
 
-    # big-red, 2026-11-07: the gh-quota shim refused `gh attestation verify` for glaeda-update while the shared REST
+    # A canary host, 2026-11-07: the gh-quota shim refused `gh attestation verify` for glaeda-update while the shared REST
     # pool was under its low-water floor. gh_kind did not know the shim's words, so the non-zero exit read as a failed
     # verification: the host quarantined r-20261107-ac67c27f2d27 for good ("this release failed here before") and
     # posted a canary failure, which holds stable for every mini.

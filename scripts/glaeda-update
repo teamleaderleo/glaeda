@@ -191,7 +191,7 @@ FAILURE_WAIT_MAX = 60 * 60
 # Our own gh is the broker chain (the gh-quota shim, the local-build guard, glaeda's broker), and the shim refuses a
 # call in its own words when a shared pool is under its low-water floor. That refusal is a spent quota, not a verdict:
 # read as one, `gh attestation verify`'s non-zero exit looked like a failed verification, so a canary quarantined a
-# good release for good and posted a canary failure that holds stable for the whole fleet (big-red, 2026-11-07,
+# good release for good and posted a canary failure that holds stable for the whole fleet (a canary host, 2026-11-07,
 # r-20261107-ac67c27f2d27: "refused: build-provenance attestation did not verify: gh-quota: refused").
 RATE_MARKERS = ("api rate limit", "rate limit exceeded", "secondary rate limit", "http 429",
                 "gh-quota: refused")
