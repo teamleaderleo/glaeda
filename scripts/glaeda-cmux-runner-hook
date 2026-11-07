@@ -9856,14 +9856,17 @@ def main(argv: list[str] | None = None) -> int:
                        "this job's Runner.Worker is not pinned, so it cannot take the disk ledger's turn"
             under = disk_refusal(disk_path, args.min_free_gib) or "under the disk floor"
             started = time.monotonic()
+            # the wait ends once the disk is back over the runner floor, or under the admission floor (refused below)
             turn = wait_disk_low_turn(args.capacity_dir, owner.pid,
-                                      lambda: bool(disk_refusal(disk_path, args.min_free_gib)), owner.gone,
+                                      lambda: bool(disk_refusal(disk_path, args.min_free_gib))
+                                      and not disk_refusal(disk_path, admit_floor), owner.gone,
                                       0.0 if nightly_disk else min(DISK_LOW_WAIT_S, max(0.0, disk_deadline - started)))
             disk_low_waited[0] += time.monotonic() - started
-            if turn:
+            low = disk_refusal(disk_path, admit_floor)  # read again: it may have waited for the ledger
+            if turn and not low:
                 print(f"{PREFIX}: warning: {under}: {turn}; admitted without the disk ledger's turn after waiting "
                       "for it (a disk floor warns, never refuses)", flush=True)
-            return disk_refusal(disk_path, admit_floor)  # read again: it may have waited for the ledger
+            return low
 
         disk_low_waited = [0.0]  # seconds disk_why spent waiting for the disk ledger's turn
         why = disk_why()

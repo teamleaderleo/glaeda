@@ -1977,6 +1977,49 @@ class HookTest(unittest.TestCase):
         self.assertGreater(asked[0], 0.0)
         self.assertLessEqual(asked[0], min(hook.DISK_LOW_WAIT_S, hook.EVICT_TIMEOUT_S))
 
+    def test_job_started_stops_waiting_for_the_turn_once_the_disk_is_under_the_admission_floor(self) -> None:
+        self.fleet()
+        args = ("--min-free-gib", "30", "--capacity-dir", os.fspath(self.dir / "capacity"))
+        holder = subprocess.Popen(["/bin/sleep", "60"])
+        self.addCleanup(holder.wait)
+        self.addCleanup(holder.kill)
+        free = [25.0]
+        polls: list[int] = []
+        original = hook.wait_disk_low_turn
+
+        def dropping(capacity_dir, worker, still_low, gone, wait_s=None):  # type: ignore[no-untyped-def]
+            def low() -> bool:
+                polls.append(1)
+                if len(polls) == 2:
+                    free[0] = 1.0  # another job writes the disk under the admission floor while this one waits
+                return still_low()
+            return original(capacity_dir, worker, low, gone, 30.0)
+
+        with mock.patch.object(hook, "free_gib", side_effect=lambda *_: free[0]):
+            (self.dir / "capacity").mkdir(parents=True, exist_ok=True)
+            self.assertIsNone(hook.disk_low_turn(self.dir / "capacity", holder.pid))
+            push = event(self.dir, "push", {"repository": CMUX})
+            env = {"PATH": "/usr/bin:/bin", "HOME": os.fspath(self.dir), "GLAEDA_RUNNER_TELEMETRY": "0",
+                   "GLAEDA_CANONICAL_ROOT_PARENT": NO_ROOTS, "GLAEDA_FLEET_DIR": os.fspath(self.dir / "fleet"),
+                   "GITHUB_EVENT_NAME": "push", "GITHUB_EVENT_PATH": os.fspath(push),
+                   "GITHUB_REPOSITORY": "manaflow-ai/cmux"}
+            start = time.monotonic()
+            with mock.patch.dict(os.environ, env, clear=True), \
+                    mock.patch.object(hook, "DISK_LOW_POLL_S", 0.0), \
+                    mock.patch.object(hook, "wait_disk_low_turn", side_effect=dropping), \
+                    mock.patch.object(hook, "start_runner_parent_watchdog"), \
+                    contextlib.redirect_stdout(io.StringIO()) as out:
+                code = hook.main(["job-started", "--allowed-repo", "manaflow-ai/cmux", "--no-disk",
+                                  "--reservation", os.fspath(self.dir / "fleet" / "reservation.json"),
+                                  "--host-lock", os.fspath(self.dir / "fleet" / "host.lock"), *args,
+                                  "--state-dir", os.fspath(self.dir / "state"), "--watch-pid", str(os.getpid()),
+                                  "--gui-wait", "0"])
+        # refused at once under the admission floor, not after the rest of the 30 s wait, and with no "admitted" line
+        self.assertLess(time.monotonic() - start, 10.0)
+        self.assertEqual(code, 1, out.getvalue())
+        self.assertIn("refused: 1.0 GiB free", out.getvalue())
+        self.assertNotIn("admitted without the disk ledger's turn", out.getvalue())
+
     def test_wait_disk_low_turn_takes_the_turn_once_the_other_job_ends(self) -> None:
         capacity = self.dir / "capacity"
         holder = subprocess.Popen(["/bin/sleep", "60"])
