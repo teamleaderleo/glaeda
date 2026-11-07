@@ -2006,6 +2006,29 @@ class HookTest(unittest.TestCase):
         why = hook.wait_disk_low_turn(capacity, third.pid, lambda: True, lambda: True, wait_s=30.0)
         self.assertEqual(why, f"another job admitted under the disk floor still runs here (pid {waiter.pid})")
 
+    def test_wait_disk_low_turn_spends_no_more_than_its_budget(self) -> None:
+        capacity = self.dir / "capacity"
+        holder = subprocess.Popen(["/bin/sleep", "60"])
+        self.addCleanup(holder.wait)
+        self.addCleanup(holder.kill)
+        waiter = subprocess.Popen(["/bin/sleep", "60"])
+        self.addCleanup(waiter.wait)
+        self.addCleanup(waiter.kill)
+        self.assertIsNone(hook.disk_low_turn(capacity, holder.pid))
+        # an occupied marker: a 0.2 s budget ends in about 0.2 s, not after a whole poll
+        start = time.monotonic()
+        why = hook.wait_disk_low_turn(capacity, waiter.pid, lambda: True, lambda: False, wait_s=0.2)
+        self.assertIn(f"(pid {holder.pid})", why or "")
+        self.assertLess(time.monotonic() - start, 2.0)
+        # a held ledger lock: a zero budget makes one try, not ADMISSION_WAIT_S of them
+        lock = os.open(capacity / f"{hook.DISK_LOW}.lock", os.O_RDONLY)
+        self.addCleanup(os.close, lock)
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        start = time.monotonic()
+        why = hook.wait_disk_low_turn(capacity, waiter.pid, lambda: True, lambda: False, wait_s=0.0)
+        self.assertEqual(why, "another admission holds the disk ledger")
+        self.assertLess(time.monotonic() - start, 2.0)
+
     def test_nightly_spends_the_disk_reserve_without_waiting_for_cleanup(self) -> None:
         self.fleet()
         push = event(self.dir, "push", {"repository": CMUX, "ref": "refs/heads/nightly-next"})

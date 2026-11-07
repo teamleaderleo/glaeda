@@ -176,20 +176,22 @@ def job_disk_gib() -> float:
 DISK_LOW = "disk-low"  # capacity/disk-low.lock and capacity/disk-low-<pid>: jobs admitted under the runner floor
 
 
-def disk_low_turn(capacity_dir: Path, worker: int) -> str | None:
+def disk_low_turn(capacity_dir: Path, worker: int, lock_wait_s: float | None = None) -> str | None:
     """Admit at most one job at a time between the admission floor and the runner floor: the capacity ledger counts
     cores, not disk, so two jobs admitted together at 25 GiB could write past the disk between them (each may write
     up to DISK_JOB_PEAK_GIB). Under capacity/disk-low.lock (taken without blocking, retried for ADMISSION_WAIT_S), a
     marker of another job refuses this one unless that job is proven gone: its pid is dead, or alive with another
     start identity (process_identity). An unreadable marker or an identity that cannot be read refuses too. Otherwise
-    this job's Worker leaves its own marker. Returns the refusal, or None (admitted, marker written)."""
+    this job's Worker leaves its own marker. lock_wait_s caps the ledger lock's wait below ADMISSION_WAIT_S (a caller's
+    remaining budget). Returns the refusal, or None (admitted, marker written)."""
     try:
         capacity_dir.mkdir(parents=True, exist_ok=True)
         lock = os.open(capacity_dir / f"{DISK_LOW}.lock", os.O_RDONLY | os.O_CREAT | os.O_NOFOLLOW, 0o644)
     except OSError as error:
         return f"cannot open the disk ledger ({type(error).__name__})"
     try:
-        deadline = time.monotonic() + ADMISSION_WAIT_S
+        deadline = time.monotonic() + (ADMISSION_WAIT_S if lock_wait_s is None
+                                       else max(0.0, min(ADMISSION_WAIT_S, lock_wait_s)))
         while True:
             try:
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -251,12 +253,14 @@ def wait_disk_low_turn(capacity_dir: Path, worker: int, still_low: Callable[[], 
     ran out. The caller admits on that refusal with a warning; it never refuses the job."""
     deadline = time.monotonic() + (DISK_LOW_WAIT_S if wait_s is None else wait_s)
     while True:
-        turn = disk_low_turn(capacity_dir, worker)
+        # the ledger lock's wait and the sleep come out of the same budget, so a zero budget makes one try
+        turn = disk_low_turn(capacity_dir, worker, lock_wait_s=deadline - time.monotonic())
         if turn is None or not still_low():
             return None
-        if gone() or time.monotonic() >= deadline:
+        left = deadline - time.monotonic()
+        if gone() or left <= 0:
             return turn
-        time.sleep(DISK_LOW_POLL_S)
+        time.sleep(min(DISK_LOW_POLL_S, left))
 
 
 def admit_floor_gib(min_free_gib: float, takes_tours: bool) -> float:
