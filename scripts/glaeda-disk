@@ -11852,10 +11852,14 @@ def _main_impl(argv: list[str] | None = None) -> int:
             out_of_band = out_of_band or why.replace(CI_DEFER_MARK, "a CI job is running", 1)
         if out_of_band:
             if (disposable := out_of_band_families(fams)):
-                print(f"{OUT_OF_BAND}: {out_of_band}; only the families no job owns "
-                      f"({', '.join(sorted({f.id for f in disposable}))})")
+                ids = sorted({f.id for f in disposable})
+                print(f"{OUT_OF_BAND}: {out_of_band}; only the families no job owns ({', '.join(ids)})")
                 RUN["out_of_band"] = out_of_band
                 fams = disposable
+                # the same scope as `--family <those ids>`, so the pass's steps outside the families stay with the
+                # hook's pass too: idle runner checkouts, $TMPDIR test scratch, home clone gc and checkout repack
+                # (minutes of git beside the job's compile), the fleet CAS prune, simulator devices
+                a.family = ids
             elif queued:
                 return deferred(COALESCED_INTO_HOOK, "a runner hook pass is under way; this run joins its queue")
             else:
@@ -11919,7 +11923,8 @@ def _main_impl(argv: list[str] | None = None) -> int:
                 fcntl.flock(maintenance_handle, fcntl.LOCK_UN)
                 maintenance_handle.close()
             return result
-        if not reserved:  # a reserved host gets the floor-pressure pass and nothing else
+        if not reserved and not out_of_band:  # a reserved host gets the floor-pressure pass and nothing else, and
+            # an out-of-band run leaves the job-owned build markers to the hook's pass
             stale_marker_released = clear_stale_build_markers(a.receipt)
     idle = a.idle_hours if a.idle_hours is not None else IDLE_SWEEP_HOURS if sweep else (6 if under else DEFAULT_AGE_HOURS)
     at, known, measured_at = (0.0, {}, {}) if a.refresh or a.no_snapshot else load_snapshot_meta()
@@ -12075,7 +12080,7 @@ def _main_impl(argv: list[str] | None = None) -> int:
         logical_released = stale_marker_released + apply_pass([i for i in items if id(i) not in last])
         # A drained runner is explicitly held by cmux_mini_fix; once its listener and worker
         # are absent, its disposable checkout can be cleared under this same eviction lock.
-        if not RUNNER_CACHE_PROFILE and not reserved:
+        if not RUNNER_CACHE_PROFILE and not reserved and not out_of_band:  # a held runner's _work is job-owned
             logical_released += cleanup_paused_runner_work(a.receipt)
         # test scratch left in $TMPDIR, two days untouched: too small per entry for any family's size floor
         if not RUNNER_CACHE_PROFILE and not a.cmux_next_drain and not reserved \

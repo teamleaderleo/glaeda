@@ -5026,6 +5026,30 @@ class GlaedaDiskTest(unittest.TestCase):
             self.assertEqual((rows[-1]["skipped"], rows[-1]["out_of_band"]), ("defer_during_ci", None))
             survey.assert_not_called()
 
+    def test_an_out_of_band_run_leaves_the_pass_steps_outside_its_families_to_the_hook_pass(self) -> None:
+        """A pressure pass also reaps $TMPDIR test scratch, idle runner checkouts, clone gc and the CAS prune --
+        job-adjacent work, some of it minutes of git beside the job's compile. Out of band it does none of them."""
+        lock, _, p_lock, p_pending = self._queue()
+        fams = self._oob_families()
+        steps = dict(reap_tmpdir_test_residue=mock.DEFAULT, gc_home_clones=mock.DEFAULT)
+        with p_lock, p_pending, mock.patch.object(gd, "HOME", self.root), \
+                mock.patch.object(gd, "cmux_next_ci_cap_state", return_value=None), \
+                mock.patch.multiple(gd, **{k: mock.DEFAULT for k in steps}) as mocks:
+            os.environ.pop(gd.HOOK_PASS_ENV, None)
+            for m in mocks.values():
+                m.return_value = 0
+            _, rows, _, _ = self._main_run(["--pressure", "--apply"], free_gib=100.0, families=fams)
+            self.assertEqual(rows[-1]["out_of_band"], None, "a plain pass: every step runs")
+            for name, m in mocks.items():
+                m.assert_called()
+                m.reset_mock()
+            with lock.open("a") as held:
+                fcntl.flock(held, fcntl.LOCK_EX)
+                _, rows, _, _ = self._main_run(["--pressure", "--apply"], free_gib=100.0, families=fams)
+            self.assertTrue(rows[-1]["out_of_band"])
+            for name, m in mocks.items():
+                m.assert_not_called()
+
     def test_a_run_with_nothing_disposable_left_still_joins_the_queue_or_defers(self) -> None:
         """With no family of its own to free, the old behaviour stands: the trigger goes to the running pass."""
         lock, pending, p_lock, p_pending = self._queue()
