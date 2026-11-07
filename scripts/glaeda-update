@@ -442,16 +442,17 @@ def attestation(path: Path) -> tuple[bool | None, str]:
                                "--signer-workflow", SIGNER_WORKFLOW, "--source-ref", "refs/heads/main"], 120)
     if result is None:
         return None, why
+    full = gh_output(result).lower()  # classify the whole output; only the diagnostic below is truncated
     message = gh_output(result)[:200]
     if result.returncode == 0:
         return True, "verified"  # gh ran and verified it: only its own zero exit says that
-    if BROKER_MARKER in message.lower():
+    if BROKER_MARKER in full:
         # our own shim refused or answered instead of GitHub (a spent pool, a guard): nothing was verified either
         # way, and a refusal must never read as a failed verification
         return None, f"gh did not reach GitHub: {message}"
-    if any(marker in message.lower() for marker in ("http 401", "http 403", "permission denied")):
+    if any(marker in full for marker in ("http 401", "http 403", "permission denied")):
         return None, f"gh cannot read attestations: {message}"
-    if 'unknown command "attestation"' in message or message.startswith("unknown flag"):
+    if 'unknown command "attestation"' in full or full.startswith("unknown flag"):
         # an older gh (Ubuntu 24.04's apt gh is 2.45, before `gh attestation`; or one before a flag above): it
         # cannot ask, which is not a failed verification. gh says so while parsing argv, before reading the archive.
         return None, f"gh is too old to verify attestations: {message.splitlines()[0]}"

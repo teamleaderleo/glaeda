@@ -294,8 +294,9 @@ class UpdateTest(unittest.TestCase):
     def test_a_refusal_on_stdout_is_read_even_when_stderr_holds_something_else(self) -> None:
         """gh writes its errors to stderr, but the shim in front of it may answer on stdout: reading one
         stream only let a refusal read as a failed verification (router-review F1 on glaeda#1898)."""
+        # a warning longer than the 200-character diagnostic: the whole output is classified, not the cut
         refused = subprocess.CompletedProcess(
-            [], 1, "gh-quota: a word we have not written yet", "gh: a warning about something else")
+            [], 1, "gh-quota: a word we have not written yet", "gh: a warning " + "about something else " * 12)
         run = mock.Mock(side_effect=[subprocess.CompletedProcess([], 0, "", ""), refused])
         with mock.patch.object(gu, "find_gh", return_value="/usr/bin/gh"), \
                 mock.patch.object(gu, "rate_limit_reset", return_value=None), \
