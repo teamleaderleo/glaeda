@@ -5191,6 +5191,40 @@ class GlaedaDiskTest(unittest.TestCase):
                              "free, but only after the deadline")
             self.assertTrue(gd.wait_for_evict_lock(time.monotonic() + 5.0))
 
+    def test_the_floor_wait_is_zero_when_the_callers_deadline_cannot_hold_it(self) -> None:
+        """The gate hands over its own timeout (floor_disk_env), so a 30 s gate never gives its child a 120 s wait
+        and then kills it before its run line (router-review F2 on glaeda#1902)."""
+        self.addCleanup(setattr, gd, "FLOOR_HOLD", gd.FLOOR_HOLD)
+        gd.FLOOR_HOLD = {1: 1}
+        with mock.patch.dict(os.environ, {gd.RUN_DEADLINE_ENV: repr(time.time() + 30.0)}):
+            self.assertEqual(gd.floor_evict_wait_until(True), 0.0, "30 s, less than the margin: no wait at all")
+        with mock.patch.dict(os.environ, {gd.RUN_DEADLINE_ENV: repr(time.time() + 300.0)}):
+            self.assertGreater(gd.floor_evict_wait_until(True), time.monotonic(), "room for the wait")
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(gd.RUN_DEADLINE_ENV, None)
+            self.assertGreater(gd.floor_evict_wait_until(True), time.monotonic(), "no deadline: the full budget")
+
+    def test_a_wait_at_the_acquisition_measures_the_cap_again(self) -> None:
+        """The holder was evicting while this run waited, so a cap measured before it is spent: a waiter that kept
+        its old budget took young build output the holder had already freed (router-review F1 on glaeda#1902)."""
+        _, _, p_lock, p_pending = self._queue()
+        cap = {"used": 3 * gd.GIB, "cap": 4 * gd.GIB, "over": 0, "at": time.time()}
+        taken = (self.root / "taken.lock").open("a")
+        self.addCleanup(taken.close)
+        with p_lock, p_pending, mock.patch.dict(os.environ, {gd.CALLER_ENV: "test"}), \
+                mock.patch.object(gd, "eviction_lock_is_held", return_value=False), \
+                mock.patch.object(gd, "acquire_evict_lock", side_effect=[None, taken]), \
+                mock.patch.object(gd, "release_evict_lock"), \
+                mock.patch.object(gd, "wait_for_evict_lock", return_value=True), \
+                mock.patch.object(gd, "cmux_next_ci_cap_state", return_value=cap) as measured:
+            status, rows, survey, _ = self._main_run(["--pressure", "--apply"], free_gib=28.0)
+        self.assertEqual(status, 0)
+        self.assertEqual(rows[-1]["evict_floor_wait"], "took its turn")
+        self.assertEqual(measured.call_count, 2, "once before the wait, once after it")
+        self.assertTrue(all(call.kwargs.get("measure") for call in measured.call_args_list),
+                        "the second reading is a fresh measurement, not the stale snapshot")
+        survey.assert_called()
+
     def test_a_floor_runs_wait_that_expires_says_the_holders_pass_serves_the_floor(self) -> None:
         """The wait is bounded: it never blocks a floor run behind a long eviction, and the line says who serves."""
         _, _, p_lock, p_pending = self._queue()

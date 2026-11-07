@@ -903,6 +903,7 @@ CMUX_NEXT_DRAIN_HOOK_SHA256 = frozenset({
     "7c0d9d8cae04254e76666b002b90f3d734a293bdcc0cee45175c01df67761bba",
     "79313d0b9048d3a3dd3f9483434f9bbf4e4e684fc68cac061ce80336f5acab54",
     "9118658689a903190cad26154ac9068d984f12543ae57aa1d4f90ff2ab67cce0",
+    "92813c5f46d935fca684bf8cf526ba5875fa9dd592d074f1a30ba610ed5d6509",
 })
 CMUX_NEXT_CI_PRESERVED_NAMES = frozenset({
     "SourcePackages", "ModuleCache.noindex", "SDKStatCaches.noindex",
@@ -11984,6 +11985,15 @@ def _main_impl(argv: list[str] | None = None) -> int:
             handle = acquire_evict_lock()  # one more turn: the holder released within the floor's wait
             if handle is not None:
                 RUN["evict_floor_wait"] = "took its turn"
+                if cap is not None and pressure:
+                    # the holder was evicting while this run waited, so the cap measured before it is spent: a
+                    # waiter that kept its old budget would take young build output the holder had already freed
+                    cap = cmux_next_ci_cap_state(fams, a.cmux_next_cap_gib, measure=True)
+                    CMUX_NEXT_CI_OVER = cap["over"]
+                    RUN["cmux_next_ci_over_gib"] = round(cap["over"] / GIB, 1)
+                    if not a.json:
+                        print(f"cmux-next-ci: {gib(cap['used']).strip()} of its {cap['cap'] / GIB:g} GiB cap "
+                              f"({gib(cap['over']).strip()} over), measured again after the wait")
         if handle is None:
             if floor_evict_until:
                 RUN["evict_floor_wait"] = "expired"

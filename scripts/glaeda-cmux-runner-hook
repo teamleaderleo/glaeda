@@ -9169,10 +9169,17 @@ def disk_argv(explicit: str | None, floor_gib: float = 0.0) -> list[str] | None:
     return [sys.executable, disk, "--pressure", "--apply", "--top", "0", *floor]
 
 
-def floor_disk_env(caller: str) -> dict[str, str]:
+def floor_disk_env(caller: str, timeout: float | None = None) -> dict[str, str]:
     """A floor eviction's environment: it must free space now, so glaeda-disk never folds it into the queued pass
-    (GLAEDA_DISK_HOOK_PASS, as the queue's own pass), and its run line names the caller."""
-    return {**os.environ, "GLAEDA_DISK_HOOK_PASS": "1", "GLAEDA_DISK_CALLER": caller}
+    (GLAEDA_DISK_HOOK_PASS, as the queue's own pass), and its run line names the caller.
+
+    A caller that bounds the run hands over its deadline (HYGIENE_RUN_DEADLINE, glaeda-disk's run_deadline_left), so
+    the child's own waits and walks end inside it and it still writes its run line instead of being killed mid-pass.
+    """
+    env = {**os.environ, "GLAEDA_DISK_HOOK_PASS": "1", "GLAEDA_DISK_CALLER": caller}
+    if timeout is not None and math.isfinite(timeout) and timeout > 0:
+        env["HYGIENE_RUN_DEADLINE"] = repr(time.time() + timeout)
+    return env
 
 
 # glaeda-disk's answers when it ran no pass because another holds evict.lock or measure.lock (DISK_BOUND's BUSY)
@@ -9193,7 +9200,7 @@ def disk_pressure_run(explicit: str | None, floor_gib: float = 0.0,
         result = subprocess.run(
             argv,
             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-            timeout=timeout, check=False, env=floor_disk_env("runner hook floor eviction"),
+            timeout=timeout, check=False, env=floor_disk_env("runner hook floor eviction", timeout),
         )
         out = result.stdout if isinstance(result.stdout, bytes) else b""
         skipped = any(mark in out for mark in DISK_BUSY)

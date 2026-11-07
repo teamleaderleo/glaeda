@@ -7256,6 +7256,17 @@ class DiskPassCoalesceTest(unittest.TestCase):
     def test_floor_evictions_are_never_queued(self) -> None:
         env = hook.floor_disk_env("runner hook floor eviction")
         self.assertEqual((env["GLAEDA_DISK_HOOK_PASS"], env["GLAEDA_DISK_CALLER"]), ("1", "runner hook floor eviction"))
+        self.assertNotIn("HYGIENE_RUN_DEADLINE", env, "no bound given, so the child keeps its own")
+
+    def test_a_bounded_floor_eviction_hands_its_deadline_to_the_child(self) -> None:
+        """glaeda-disk's own waits and walks read HYGIENE_RUN_DEADLINE (run_deadline_left), so a child of a 30 s
+        gate ends inside it and writes its run line instead of being killed mid-pass."""
+        before = time.time()
+        env = hook.floor_disk_env("runner hook floor eviction", 30.0)
+        self.assertLessEqual(before + 30.0, float(env["HYGIENE_RUN_DEADLINE"]))
+        self.assertLessEqual(float(env["HYGIENE_RUN_DEADLINE"]), time.time() + 30.0)
+        for bad in (0.0, -1.0, float("inf")):
+            self.assertNotIn("HYGIENE_RUN_DEADLINE", hook.floor_disk_env("c", bad), bad)
 
     def test_a_pass_that_could_not_start_keeps_its_trigger(self) -> None:
         disk = self.fake_disk()
