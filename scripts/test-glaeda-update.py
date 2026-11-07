@@ -291,6 +291,19 @@ class UpdateTest(unittest.TestCase):
         self.assertIsNone(verdict, "our own shim answered, so GitHub verified nothing: never False")
         self.assertIn("gh did not reach GitHub", why)
 
+    def test_a_refusal_on_stdout_is_read_even_when_stderr_holds_something_else(self) -> None:
+        """gh writes its errors to stderr, but the shim in front of it may answer on stdout: reading one
+        stream only let a refusal read as a failed verification (router-review F1 on glaeda#1898)."""
+        refused = subprocess.CompletedProcess(
+            [], 1, "gh-quota: a word we have not written yet", "gh: a warning about something else")
+        run = mock.Mock(side_effect=[subprocess.CompletedProcess([], 0, "", ""), refused])
+        with mock.patch.object(gu, "find_gh", return_value="/usr/bin/gh"), \
+                mock.patch.object(gu, "rate_limit_reset", return_value=None), \
+                mock.patch.object(gu.subprocess, "run", run), mock.patch.object(gu.time, "sleep"):
+            verdict, why = self.saved[1](Path("/tmp/a.tar.gz"))
+        self.assertIsNone(verdict, "the refusal was on stdout; nothing was verified")
+        self.assertIn("gh did not reach GitHub", why)
+
     def test_persistent_rate_limit_stays_inconclusive_after_bounded_backoff(self) -> None:
         limited = (1, "HTTP 403: API rate limit exceeded")
         run = self.gh((0, ""), *[limited] * (len(gu.GH_BACKOFF) + 1))

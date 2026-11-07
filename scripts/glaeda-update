@@ -388,6 +388,12 @@ def gh_kind(text: str) -> str | None:
     return None
 
 
+def gh_output(result: "subprocess.CompletedProcess[str]") -> str:
+    """Both of gh's streams. gh writes its own errors to stderr, but the quota shim in front of it may
+    answer on either, and one stream holding a warning must not hide the other's refusal."""
+    return "\n".join(part for part in (result.stderr, result.stdout) if part).strip()
+
+
 def gh_call(gh: str, args: list[str], timeout: int,
             max_wait: float = RATE_WAIT_MAX) -> tuple[subprocess.CompletedProcess | None, str]:
     """Run gh, riding out a spent quota or a transient error: (result, "") when it ran to a verdict,
@@ -411,7 +417,7 @@ def gh_call(gh: str, args: list[str], timeout: int,
             continue
         except OSError as e:
             return None, f"transient: {type(e).__name__}: {e}"
-        message = (result.stderr or result.stdout).strip()
+        message = gh_output(result)
         kind = gh_kind(message) if result.returncode != 0 else None
         if kind is None:
             return result, ""
@@ -436,9 +442,9 @@ def attestation(path: Path) -> tuple[bool | None, str]:
                                "--signer-workflow", SIGNER_WORKFLOW, "--source-ref", "refs/heads/main"], 120)
     if result is None:
         return None, why
+    message = gh_output(result)[:200]
     if result.returncode == 0:
-        return True, "verified"
-    message = (result.stderr or result.stdout).strip()[:200]
+        return True, "verified"  # gh ran and verified it: only its own zero exit says that
     if BROKER_MARKER in message.lower():
         # our own shim refused or answered instead of GitHub (a spent pool, a guard): nothing was verified either
         # way, and a refusal must never read as a failed verification
