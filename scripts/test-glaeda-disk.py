@@ -8655,6 +8655,27 @@ class LinuxLayoutTest(unittest.TestCase):
         self.assertFalse(clone.exists())
         self.assertTrue(list((self.home / "archive/glaeda-disk").glob("*.tar.gz")), "the clone's own work is archived")
 
+    def test_a_repository_rooted_at_a_dependency_clone_dir_is_still_bundled(self) -> None:
+        """Review of the dependency-clone skip: a repository at .spm-cache/checkouts itself is someone's, not a clone
+        below it; the mirror is kept with its local-only commit, as at base."""
+        unit, clone, env = self.dirty_mirror()
+        own = clone / ".spm-cache/checkouts"
+        own.mkdir(parents=True)
+        self.git(own, "init", "-q", env=env)
+        (own / "mine.txt").write_text("local only\n")
+        self.git(own, "add", ".", env=env)
+        self.git(own, "commit", "-q", "-m", "local only", env=env)
+        sha = self.git(own, "rev-parse", "HEAD").strip()
+        self.assertTrue(gd.dependency_clones(own))
+        self.assertEqual(gd.checkouts(clone / ".spm-cache", gd.NESTED_DEPTH, gd.NESTED_BUDGET, strict=True), [own])
+        self.assertFalse(gd.under_dependency_clones(".spm-cache/checkouts/"), "the directory itself is not below it")
+        self.assertTrue(gd.under_dependency_clones(".spm-cache/checkouts/Sparkle/"))
+        rec, _ = self.apply_mirror(unit)
+        # as at base: an untracked checkout of its own keeps the mirror, never deleted unarchived
+        self.assertEqual(rec["outcome"], "blocked:uncommitted", rec["reasons"])
+        self.assertTrue(any("an untracked checkout no scan found (.spm-cache/checkouts/)" in r for r in rec["reasons"]))
+        self.assertEqual(self.git(own, "rev-parse", "HEAD").strip(), sha)
+
     def test_staged_content_the_work_tree_no_longer_has_keeps_the_mirror(self) -> None:
         unit, clone, env = self.dirty_mirror()
         (clone / "staged.txt").unlink()  # AD: the staged blob is only in the index

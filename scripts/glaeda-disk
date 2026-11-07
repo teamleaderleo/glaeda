@@ -5747,7 +5747,9 @@ def git_state(path: Path, depth: int = 5, budget: int = 20000, sealed: bool = Fa
                 continue
             for e in dirs:
                 if dependency_clones(e.path):
-                    continue  # upstream clones a package manager fetches again
+                    if vcs_at(e.path):
+                        return "git"  # its own repository; only the upstream clones below it are skipped
+                    continue
                 if e.name in REPRODUCIBLE_DIRS:
                     if vcs_at(e.path):
                         return "git"  # e.g. `git clone x target`; not searched deeper
@@ -5775,6 +5777,8 @@ def checkouts(path: Path, depth: int = 5, budget: int = 20000, strict: bool = Fa
             if os.path.lexists(os.path.join(d, ".git")) or looks_like_repository(d):
                 found.append(Path(d))
                 continue
+            if dependency_clones(d):
+                continue  # the upstream clones below it a package manager fetches again; its own repository is above
             try:
                 with os.scandir(d) as it:
                     for e in it:
@@ -5782,8 +5786,6 @@ def checkouts(path: Path, depth: int = 5, budget: int = 20000, strict: bool = Fa
                         if budget < 0:
                             return None
                         if e.is_dir(follow_symlinks=False):
-                            if dependency_clones(e.path):
-                                continue  # upstream clones a package manager fetches again
                             if e.name not in REPRODUCIBLE_DIRS:
                                 nxt.append(e.path)
                             elif os.path.lexists(os.path.join(e.path, ".git")) or looks_like_repository(e.path):
@@ -6532,9 +6534,10 @@ def _build_output_dir(d: str) -> bool:
 
 
 def under_dependency_clones(rel: str) -> bool:
-    """A path (relative to a work tree) at or below a package manager's directory of upstream clones."""
+    """A path (relative to a work tree) below a package manager's directory of upstream clones, never that directory
+    itself: a repository rooted there is someone's, and is found and bundled like any other."""
     parts = rel.strip("/").split("/")
-    return any(dependency_clones(os.path.join(*parts[:k])) for k in range(2, len(parts) + 1))
+    return any(dependency_clones(os.path.join(*parts[:k])) for k in range(2, len(parts)))
 
 
 def work_tree_changes(root: Path, trees: set[str]) -> tuple[str, bytes, list[tuple[str, Path, str]]]:
