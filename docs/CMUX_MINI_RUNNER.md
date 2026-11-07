@@ -456,19 +456,15 @@ What `--apply` does:
      frame-pacing `bench`) is admitted as `light` instead of refused, so its `take-gui`
      gives way and the nightly skips rather than fails. An unreadable state changes nothing;
      `GLAEDA_RUNNER_CONSOLE_GATE=0` in the runner LaunchAgent turns it off.
-   - **When free disk is under the floor** (every runner). The gate reads the
-     `--min-free-gib` of the runner's own job-started hook and `statvfs` on every poll,
-     and holds the listener while free disk is below it, since job-started would refuse
-     every job. On 2026-09-27, 68 of the fleet's 151 refusals in 24 h were this one,
-     mostly seeds on cmuxs-mac-mini-6 at 134 of 150 GiB. A hold ends only 2 GiB above the
-     floor, so a mini at the edge does not flap. `glaeda-disk --pressure` reads the highest
-     floor among the user's runner hooks (`~/actions-runner*`, the default runner dirs) and,
-     on HOME's volume, starts freeing at floor + 4 GiB, up to floor + 20 GiB (never past half
-     the disk), whatever its `--low` and `--target`: otherwise a 460 GiB mini between the default
-     low (about 115 GiB) and a 150 GiB floor would stay held with nothing freed. A hold past
-     30 min logs once that space must be freed by hand. It no longer waits for CI to finish
-     (`defer_during_ci`, default false in `~/.config/glaeda/disk-policy.json`): a busy mini frees
-     space while jobs run, holding only what a job uses. cmux CI's hot tier (parked PR builds,
+   - **When free disk is under the housekeeping target** (every runner). The gate reads the runner's
+     `--min-free-gib` and warns, requesting the existing bounded background cleanup at most every 15 minutes.
+     It keeps listeners online, never arms the Worker-exit freeze for a disk reading, and has no disk resume
+     hysteresis. Unresolved warnings repeat at most every 30 minutes. The builder reserve remains a cleanup
+     target. Job admission retains its existing measured job-growth floor (normally 20 GiB), tour and dedicated
+     builder requirements, and single-job disk-low ledger; this change adds no hard-stop threshold.
+     `glaeda-disk --pressure` reads the highest floor among the user's runner hooks and starts freeing at floor
+     + 4 GiB, up to floor + 20 GiB (never past half the disk). Cleanup can run during CI and protects live work.
+     cmux CI's hot tier (parked PR builds,
      seeds, kept builds) ages in host CI jobs since last use rather than hours: under pressure an
      item used in the last 30 minutes stays; older parked PR builds and other reproducible hot
      state are then ranked by reuse distance and idle time until the target is reached. Pressure

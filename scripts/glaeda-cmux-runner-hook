@@ -157,8 +157,7 @@ EVICT_TIMEOUT_S = 300
 EVICT_BUSY_PAUSE_S = 2.0  # between a pass of evict()'s own that skipped as busy and its next look
 # The free disk a job is refused under, after eviction: the measured disk growth of one CMUX job, rounded up (p99
 # 10.8 GiB, max 18.7 GiB). The runner floor (--min-free-gib, the manifest's disk.min_free_gib, 30 GiB since HQ #967, a
-# judgement rather than a measurement) still decides when to evict, the pre-job target and when the gate stops
-# listening; it no longer refuses a job that fits. A runner that takes cmux's tours keeps the tour floor
+# judgement rather than a measurement) still decides when to evict, the pre-job target and when the gate warns; it no longer refuses a job that fits. A runner that takes cmux's tours keeps the tour floor
 # (runner_floor_gib), which cmux measured for those jobs. glaeda-cmux-job/v1 completed lines record disk_free_start_gib,
 # disk_free_end_gib (#1650) and disk_free_min_gib, so this can be resized from build-nightly-app's own peak.
 DISK_JOB_PEAK_GIB = 20.0
@@ -6528,8 +6527,8 @@ def note_registration_deleted(state_dir: Path, runner_dir: Path, evidence: str, 
     return doc
 
 
-GATE_DISK_RESUME_GIB = 2.0  # a disk hold ends only this far above the floor
-GATE_DISK_NOTE_S = 30 * 60  # two evictions that did not end the hold
+GATE_DISK_RESUME_GIB = 2.0  # cleanup headroom above the floor; no listener resume hysteresis
+GATE_DISK_NOTE_S = 30 * 60  # repeat an unresolved disk warning at most this often
 GATE_DISK_EVICT_EVERY_S = 15 * 60  # an eviction that left the disk short is retried this often, not every poll
 
 
@@ -6594,8 +6593,7 @@ class Gate:
         self.eligible_at = -GATE_ELIGIBLE_EVERY_S
         self.eligible_look: threading.Thread | None = None
         self.stale_env: str | None = None  # why an adopted listener's env is not listener_env's (listen())
-        self.disk_since: float | None = None  # when the current disk hold began
-        self.disk_noted = False  # the hold ran past GATE_DISK_NOTE_S and said so once
+        self.disk_warned_at: float | None = None  # when the last low-disk warning was logged
         self.disk_evicted_at = -GATE_DISK_EVICT_EVERY_S  # when the last eviction under the floor started
         self.idle_evict: threading.Thread | None = None  # a dedicated builder's evict_idle_runners, while it runs
         self.idle_evicted_at = -GATE_DISK_EVICT_EVERY_S
@@ -6900,21 +6898,11 @@ class Gate:
         return reservation_refusal(self.reservation, time.time(), nightly_slot=scope.nightly) if self.reservation else None
 
     def low_disk(self) -> str | None:
-        """Why job-started would refuse every job for free disk (disk_refusal against this runner's own
-        --min-free-gib), or None. A listening runner under the floor took every job its label brought and refused
-        it: 68 of the fleet's 151 refusals in the 24 h to 2026-09-27 18:00Z, mostly seeds on cmuxs-mac-mini-6 at
-        134 of 150 GiB. Under the floor the gate starts an eviction of idle caches (evict_in_background, at most
-        every GATE_DISK_EVICT_EVERY_S) and holds while the disk is short; the hold ends once an eviction makes room.
-        Held off, the job goes to another runner or waits in GitHub's queue. statvfs is cheap, so every poll reads
-        it.
-        A hold resumes only at GATE_DISK_RESUME_GIB above the floor, so a mini at the edge does not flap. glaeda-disk
-        --pressure frees space well past it; a hold past GATE_DISK_NOTE_S logs once that it could not, so an
-        operator frees space by hand."""
-        # the margin and the hold timer apply only while the listener is actually held off for disk, so a
-        # listening runner that dips once is stopped only on two readings under the floor itself
-        holding = self.child is None and (self.held or "").startswith("disk:")
-        if not holding:
-            self.disk_since, self.disk_noted = None, False
+        """Warn and request bounded cleanup below this runner's disk target, never hold its listener.
+        The housekeeping floor is advisory: stopping the listener at 30 GiB (and resuming at 32) left usable
+        minis idle and froze listeners at their running Worker's exit. Job admission keeps its existing
+        measured disk-growth checks and disk-low ledger. Disk observations never arm JOB_END_FREEZE.
+        """
         scope = runner_scope(self.runner_dir)
         floor, reserve = scope.min_free_gib, ""
         # The nightly's own listeners: the nightly-only runner and the trusted signing runner, which takes the
@@ -6927,35 +6915,27 @@ class Gate:
             # job-started still takes the disk-low ledger's single-job turn.
             floor = admit_floor_gib(floor, scope.gui or scope.session)
         if not scope.dedicated and not nightly_own:
-            # NIGHTLY_DISK_RESERVE: a nightly job freeing disk here goes first, and every other runner leaves the
-            # dedicated builder's floor plus one job's growth free
+            # NIGHTLY_DISK_RESERVE remains a cleanup target: the dedicated builder's floor plus one job's growth.
+            # Its disk waiter is advisory here too; admission retains the existing disk-low turn.
             waiter = nightly_disk_waiter(self.capacity_dir or Path(FLEET_DIR) / "capacity")
             if waiter:
-                return f"disk: a nightly job waits here for free disk ({waiter})"
+                reserve = f" (a nightly job waits here for free disk: {waiter})"
             builder = builder_reserve_gib(self.runner_dir.parent, self.runner_dir)
             if builder > 0 and builder + job_disk_gib() > floor:
                 floor = builder + job_disk_gib()
                 reserve = f" (the dedicated builder's {builder:g} GiB floor + {job_disk_gib():g} GiB for a job here)"
-        path, need = os.path.dirname(self.host_lock), floor + GATE_DISK_RESUME_GIB if floor > 0 and holding else floor
+        path = os.path.dirname(self.host_lock)
         self.reap_eviction(path, floor)
-        why = disk_refusal(path, need)
+        why = disk_refusal(path, floor)
         if why:
-            # a hold above the floor names the floor, so a reader (ci-dash disk_policy) shows the floor job-started
-            # refuses under, not the resume mark or the reserve (cmux15, 2026-11-03: a 52 GiB "floor" beside 30)
-            why += reserve or (f" ({floor:g} GiB floor + {need - floor:g} GiB to resume)" if need > floor else "")
             self.evict_in_background(path, floor)
-            if scope.dedicated or reserve:  # the builder short of disk, or the reserve that keeps it room
+            if scope.dedicated or reserve:
                 self.evict_idle_in_background(path, floor + GATE_DISK_RESUME_GIB)
-        if why is None or not holding:
-            return f"disk: {why}" if why else None
-        now = time.monotonic()
-        if self.disk_since is None:
-            self.disk_since = now
-        elif not self.disk_noted and now - self.disk_since >= GATE_DISK_NOTE_S:
-            gate_log(f"held for free disk over {GATE_DISK_NOTE_S / 60:g} min ({why}): evicting idle caches has not "
-                     "freed enough; check with glaeda-disk --top 25")
-            self.disk_noted = True
-        return f"disk: {why}"
+            now = time.monotonic()
+            if self.disk_warned_at is None or now - self.disk_warned_at >= GATE_DISK_NOTE_S:
+                gate_log(f"disk warning: {why}{reserve}; keeping the listener online and requesting cleanup")
+                self.disk_warned_at = now
+        return None
 
     def evict_idle_in_background(self, path: str, target: float) -> None:
         """A dedicated builder held off under its floor, or a runner held for its reserve, takes what idle PR runners left in their _work

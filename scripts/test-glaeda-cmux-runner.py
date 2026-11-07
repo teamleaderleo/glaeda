@@ -9196,7 +9196,7 @@ class GateTest(unittest.TestCase):
         self.assertIsNone(gate.stale_env)
         self.assertIsNone(gate.ineligible())
 
-    def test_every_runner_holds_while_free_disk_is_under_its_floor(self) -> None:
+    def test_every_runner_warns_while_free_disk_is_under_its_floor(self) -> None:
         script = self.runner / hook.RUNNER_HOOK_SCRIPT
         script.parent.mkdir(parents=True, exist_ok=True)
         gate = hook.Gate(self.runner, os.fspath(self.lock), os.fspath(self.tmp / "none.json"), self.state)
@@ -9206,9 +9206,8 @@ class GateTest(unittest.TestCase):
                           "--trusted-ref refs/heads/main --trusted-repo manaflow-ai/cmux\n")
         self.assertEqual(hook.runner_scope(self.runner).min_free_gib, 999999999.5)
         why = gate.claimed()
-        self.assertIsNotNone(why)
-        self.assertRegex(why, r"^disk: [0-9.]+ GiB free, 1e\+09 GiB required$")
-        self.assertEqual(gate.confirmed(), why, "the look right before a stop sees it too")
+        self.assertIsNone(why, "a housekeeping target never holds the listener")
+        self.assertIsNone(gate.confirmed(), "the final stop check is advisory too")
         script.write_text("exec python3 /hook job-started --allowed-owner manaflow-ai --min-free-gib 1\n")
         self.assertIsNone(gate.claimed(), "read on every poll: a re-apply that lowers the floor counts at once")
         self.assertEqual(hook.min_free_gib(" --min-free-gib 100 --min-free-gib 1e+03 "), 1000.0, "the last one wins")
@@ -9246,13 +9245,10 @@ class GateTest(unittest.TestCase):
         usage = lambda _path: mock.Mock(free=int((tour - 5) * 1024**3))  # noqa: E731
         with mock.patch.object(hook.shutil, "disk_usage", side_effect=usage), \
                 mock.patch.object(gate, "evict_in_background"):
-            self.assertEqual(gate.low_disk(), f"disk: {tour - 5:.1f} GiB free, {tour:g} GiB required",
-                             "between the fleet floor and the tour's, the session runner is held")
+            self.assertIsNone(gate.low_disk(), "tour admission keeps its floor; its listener stays online")
 
-    def test_a_pr_runner_leaves_the_dedicated_builders_disk_reserve_and_yields_to_a_nightly_waiter(self) -> None:
-        """NIGHTLY_DISK_RESERVE: on a mini with a dedicated nightly builder, every other runner stops listening while
-        free disk is under the builder's floor plus one job's measured growth, and while a nightly job waits here for
-        free disk; the builder itself and a mini without one keep the runner's own floor."""
+    def test_a_pr_runner_cleans_the_dedicated_builders_disk_reserve_without_a_hold(self) -> None:
+        """NIGHTLY_DISK_RESERVE remains a cleanup target, without stopping listeners."""
         write_hook(self.runner, "exec python3 /hook job-started --min-free-gib 30 --capacity-units 10\n")
         capacity = self.tmp / "capacity"
         capacity.mkdir()
@@ -9269,14 +9265,13 @@ class GateTest(unittest.TestCase):
             builder.mkdir()
             write_hook(builder, "exec python3 /hook job-started --min-free-gib 40 "
                                                             "--dedicated-admit /admit.sh\n")
-            self.assertEqual(gate.low_disk(), "disk: 50.0 GiB free, 60 GiB required (the dedicated builder's 40 GiB "
-                                              "floor + 20 GiB for a job here)")
+            self.assertIsNone(gate.low_disk(), "the builder reserve triggers cleanup, never a listener hold")
             background.assert_called_with(os.path.dirname(os.fspath(self.lock)), 60.0)
             free["gib"] = 61.0
             self.assertIsNone(gate.low_disk(), "past the reserve it listens")
             hook.write_want(capacity / f"{hook.ADMIT_WANT}{os.getpid()}", time.time(), [hook.NIGHTLY_DISK_WANT],
                             hook.TIER_NIGHTLY)
-            self.assertIn("a nightly job waits here for free disk", gate.low_disk() or "")
+            self.assertIsNone(gate.low_disk(), "a nightly disk waiter cannot turn an observation into a hold")
             ours = hook.Gate(builder, os.fspath(self.lock), os.fspath(self.tmp / "none.json"), self.state,
                              capacity_dir=capacity)
             ours.child = mock.Mock(pid=1)
@@ -9322,10 +9317,9 @@ class GateTest(unittest.TestCase):
                 mock.patch.dict(os.environ, {hook.DISK_JOB_PEAK_ENV: "20"}):
             self.assertIsNone(gate.low_disk(), "a held trusted signing listener resumes within the builder's reserve")
             free["gib"] = 19.0
-            self.assertIn("22 GiB required (20 GiB floor + 2 GiB to resume)", gate.low_disk() or "",
-                          "resume hysteresis still applies, and the hold names the floor job-started refuses under")
+            self.assertIsNone(gate.low_disk(), "no disk hold or resume hysteresis")
             gate.child = mock.Mock(pid=1)
-            self.assertIn("20 GiB required", gate.low_disk() or "", "a listening signer keeps the measured floor")
+            self.assertIsNone(gate.low_disk(), "a listening signer stays online")
 
     def test_nightly_listener_spends_reserve_but_keeps_measured_disk_floor(self) -> None:
         write_hook(self.runner, "exec python3 /hook job-started --min-free-gib 30 --nightly-runner\n")
@@ -9338,78 +9332,46 @@ class GateTest(unittest.TestCase):
                 mock.patch.dict(os.environ, {hook.DISK_JOB_PEAK_ENV: "20"}):
             self.assertIsNone(gate.low_disk(), "a held nightly listener resumes within the 30 GiB reserve")
             free["gib"] = 19.0
-            self.assertIn("22 GiB required (20 GiB floor + 2 GiB to resume)", gate.low_disk() or "",
-                          "resume hysteresis still applies, and the hold names the floor job-started refuses under")
+            self.assertIsNone(gate.low_disk(), "no disk hold or resume hysteresis")
             gate.child = mock.Mock(pid=1)
-            self.assertIn("20 GiB required", gate.low_disk() or "", "a listening nightly keeps the measured floor")
+            self.assertIsNone(gate.low_disk(), "a listening nightly stays online")
 
-    def test_a_disk_hold_resumes_above_the_floor_and_logs_a_long_hold_once(self) -> None:
-        script = self.runner / hook.RUNNER_HOOK_SCRIPT
-        script.parent.mkdir(parents=True, exist_ok=True)
-        script.write_text("exec python3 /hook job-started --min-free-gib 100\n")
-        gate = hook.Gate(self.runner, os.fspath(self.lock), os.fspath(self.tmp / "none.json"), self.state)
-        free = {"gib": 99.0}
-        usage = lambda _path: mock.Mock(free=int(free["gib"] * 1024**3))  # noqa: E731
-        logs: list[str] = []
-        clock = {"t": 1000.0}
-        with mock.patch.object(hook.shutil, "disk_usage", side_effect=usage), \
+    def test_a_disk_warning_is_bounded_and_never_uses_resume_hysteresis(self) -> None:
+        write_hook(self.runner, "exec python3 /hook job-started --min-free-gib 30\n")
+        gate = hook.Gate(self.runner, os.fspath(self.lock), "", self.state)
+        free, clock, logs = {"gib": 29.0}, {"t": 1000.0}, []
+        with mock.patch.object(hook.shutil, "disk_usage", side_effect=lambda _: mock.Mock(free=free["gib"] * 1024**3)), \
+                mock.patch.object(gate, "evict_in_background") as cleanup, \
                 mock.patch.object(hook, "gate_log", side_effect=logs.append), \
                 mock.patch.object(hook.time, "monotonic", side_effect=lambda: clock["t"]):
-            # listening (a child runs): only the floor itself counts, so a dip that recovers never stops it
-            gate.child = mock.Mock(pid=1)
-            why = gate.low_disk()
-            self.assertIn("100 GiB required", why)
-            free["gib"] = 101.0
-            self.assertIsNone(gate.low_disk(), "a listening runner back above the floor is not stopped")
-            # held off for disk: it resumes only 2 GiB above the floor
-            gate.child, gate.held = None, why
-            self.assertIn("102 GiB required", gate.low_disk(), "a hold resumes only 2 GiB above the floor")
+            for _ in range(5):
+                self.assertIsNone(gate.low_disk())
+            self.assertEqual(len(logs), 1)
+            self.assertIn("keeping the listener online", logs[0])
+            cleanup.assert_called_with(os.path.dirname(os.fspath(self.lock)), 30)
             clock["t"] += hook.GATE_DISK_NOTE_S
-            gate.low_disk()
-            gate.low_disk()
-            held = [line for line in logs if line.startswith("held for free disk")]
-            self.assertEqual(len(held), 1, "a long hold is logged once")
-            self.assertIn("glaeda-disk --top 25", held[0])
-            free["gib"] = 102.0
             self.assertIsNone(gate.low_disk())
-            # held for something else: no margin, and the disk timer does not run
-            gate.held = "a fleet build holds the host lock"
-            free["gib"] = 101.0
+            self.assertEqual(len(logs), 2, "unresolved warnings repeat only at the bounded interval")
+            free["gib"], gate.held = 31.0, "disk: 29 GiB free, 32 GiB required"
+            self.assertIsNone(gate.low_disk(), "an old disk hold clears without the old 32 GiB resume mark")
+            free["gib"] = 29.0
             self.assertIsNone(gate.low_disk())
-            self.assertIsNone(gate.disk_since)
+            self.assertEqual(len(logs), 2, "flapping around the target cannot flood the log")
 
-    def test_the_first_idle_reading_under_the_disk_floor_stops_the_listener(self) -> None:
-        """cmux9s, 2026-09-30: a job ended under the 30 GiB floor, the listener took the next one 2 s later, and
-        job-started refused it; the gate had waited for a second idle poll, behind a capacity hold."""
-        script = self.runner / hook.RUNNER_HOOK_SCRIPT
-        script.parent.mkdir(parents=True, exist_ok=True)
-        script.write_text("exec python3 /hook job-started --min-free-gib 30 --capacity-units 5\n")
-        free = {"gib": 50.0}
-        usage = lambda _path: mock.Mock(free=int(free["gib"] * 1024**3))  # noqa: E731
-        full = "all 5 capacity units on this mini are taken"
-        with mock.patch.object(hook.shutil, "disk_usage", side_effect=usage):
-            gate, stops = self.gate([full] * 3)
-            gate.step()
-            self.assertEqual(stops, [], "any other hold still waits for GATE_CONFIRM idle polls")
-            gate.step()
-            self.assertEqual(stops, ["held"])
-
-            free["gib"] = 21.9
-            gate, stops = self.gate([full] * 3, busy=[True])
+    def test_low_disk_never_freezes_or_stops_a_running_job_or_its_listener(self) -> None:
+        write_hook(self.runner, "exec python3 /hook job-started --min-free-gib 30 --capacity-units 5\n")
+        with mock.patch.object(hook.shutil, "disk_usage", return_value=mock.Mock(free=29 * 1024**3)):
+            gate, stops = self.gate([None] * 3, busy=[True])
             gate.worker_pids = lambda: [4242]
-            gate.step()
-            self.assertEqual(stops, [], "a runner with a job is never stopped")
-            self.assertEqual(gate.watching, (4242,), "under the floor the gate watches the job's worker")
-            gate.step()  # the worker exited
-            self.assertEqual(stops, ["disk: 21.9 GiB free, 30 GiB required"], "at once, ahead of the capacity hold")
-
-            free["gib"] = 31.0
-            gate, stops = self.gate([None], busy=[True])
-            gate.worker_pids = lambda: [4242]
-            gate.step()
-            self.assertEqual(gate.watching, (), "above the floor a job is polled as usual")
-            gate.step()
-            self.assertEqual(stops, [], "and a runner above its floor keeps listening")
+            with mock.patch.object(gate, "evict_in_background") as cleanup:
+                gate.step()
+                self.assertEqual(stops, [])
+                self.assertEqual(gate.watching, ())
+                self.assertFalse(gate.freeze_at_exit, "a low-disk reading must not arm JOB_END_FREEZE")
+                cleanup.assert_called_once()
+                gate.step()  # the worker exited: its listener stays online
+                self.assertEqual(stops, [])
+                self.assertIsNone(gate.low_disk())
 
     def test_a_fleet_waiter_seen_during_a_job_stops_the_listener_as_the_job_ends(self) -> None:
         """cmux11s, 2026-10-06: a fleet build waited 13 minutes while three runners kept taking queued jobs and
@@ -9753,7 +9715,7 @@ class GateTest(unittest.TestCase):
             gate.step()  # the Worker exited
         self.assertEqual(stops, ["a fleet build is waiting for the host (pid 6755)"])
 
-    def test_the_gate_evicts_in_the_background_before_it_listens_again(self) -> None:
+    def test_the_gate_evicts_in_the_background_while_it_keeps_listening(self) -> None:
         script = self.runner / hook.RUNNER_HOOK_SCRIPT
         script.parent.mkdir(parents=True, exist_ok=True)
         script.write_text("exec python3 /hook job-started --min-free-gib 100\n")
@@ -9777,25 +9739,26 @@ class GateTest(unittest.TestCase):
                 mock.patch.object(hook, "gate_log", side_effect=logs.append), \
                 mock.patch.object(hook.time, "monotonic", side_effect=lambda: clock["t"]):
             gate.child = mock.Mock(pid=1)
-            self.assertIn("99.0 GiB free, 100 GiB required", gate.low_disk(), "short while the eviction runs")
+            self.assertIsNone(gate.low_disk(), "listening while the eviction runs")
             self.assertEqual([p.argv for p in procs], [["glaeda-disk", "100"]], "told the runner's floor, detached")
             clock["t"] += 30
-            self.assertIsNotNone(gate.low_disk())
+            self.assertIsNone(gate.low_disk())
             self.assertEqual(len(procs), 1, "one eviction at a time; the poll does not wait on it")
             procs[0].poll.return_value, free["gib"] = 0, 130.0
             self.assertIsNone(gate.low_disk(), "the eviction made room: listening again")
-            self.assertEqual(logs, ["under the 100 GiB disk floor: glaeda-disk exited 0, freed 31.0 GiB"])
+            self.assertEqual([line for line in logs if not line.startswith("disk warning:")],
+                             ["under the 100 GiB disk floor: glaeda-disk exited 0, freed 31.0 GiB"])
             # short again soon after: hold, but no new eviction until GATE_DISK_EVICT_EVERY_S has passed
             free["gib"] = 99.0
             why = gate.low_disk()
             gate.child, gate.held = None, why
-            self.assertIn("102 GiB required", gate.low_disk(), "a held runner still resumes only 2 GiB above")
+            self.assertIsNone(gate.low_disk(), "cleanup retry never holds the listener")
             self.assertEqual(len(procs), 1)
             clock["t"] += hook.GATE_DISK_EVICT_EVERY_S
             gate.low_disk()
             self.assertEqual(len(procs), 2, "retried every GATE_DISK_EVICT_EVERY_S")
             clock["t"] += hook.DISK_TIMEOUT_S
-            self.assertIsNotNone(gate.low_disk())
+            self.assertIsNone(gate.low_disk())
             procs[1].kill.assert_not_called()
             self.assertEqual(len(procs), 2, "a slow pass keeps running alone past the synchronous timeout")
             clock["t"] += hook.BACKGROUND_DISK_TIMEOUT_S - hook.DISK_TIMEOUT_S
@@ -9833,11 +9796,12 @@ class GateTest(unittest.TestCase):
                 mock.patch.object(hook.time, "monotonic", side_effect=lambda: clock["t"]):
             gate.child = mock.Mock(pid=1)
             for _ in range(5):
-                self.assertIsNotNone(gate.low_disk())
+                self.assertIsNone(gate.low_disk())
                 clock["t"] += 30
             self.assertEqual(procs, [], "no run of its own while a pass runs")
             trigger.assert_called_once()
-            self.assertEqual(logs, ["under the 100 GiB disk floor: a glaeda-disk pass is running; waiting for it "
+            self.assertEqual([line for line in logs if not line.startswith("disk warning:")],
+                             ["under the 100 GiB disk floor: a glaeda-disk pass is running; waiting for it "
                                     "(coalesced)"])
             active["on"] = False
             gate.low_disk()
@@ -10604,9 +10568,9 @@ class GateTest(unittest.TestCase):
                 self.assertNotIn("CPU busy", why)
             with mock.patch.object(hook, "memory_pressure_level", return_value=1), \
                     mock.patch.object(hook, "disk_refusal", return_value="only 12.0 GiB free, under 30 GiB"):
-                self.assertTrue((gateway.low_disk() or "").startswith("disk:"), "the disk floor holds it")
+                self.assertIsNone(gateway.low_disk(), "the disk floor is advisory")
                 why = gateway.claimed()
-                self.assertTrue((why or "").startswith("disk:"), why)
+                self.assertIsNone(why)
             with mock.patch.object(hook, "memory_pressure_level", return_value=1), \
                     mock.patch.object(hook, "disk_refusal", return_value=None), \
                     mock.patch.object(hook, "host_held", return_value="a fleet build holds the host"):

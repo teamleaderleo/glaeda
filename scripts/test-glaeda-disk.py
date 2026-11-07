@@ -7631,6 +7631,51 @@ class MediaTourDerivedDataTest(unittest.TestCase):
             self.assertTrue(gd.floor_hold_only(self.fam, item, 12), "it waits for the floor stop like warm builds")
 
 
+class SparkleAppcastTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.home = Path(os.path.realpath(self.tmp.name))
+        for key, value in (("HOME", self.home), ("DARWIN", True), ("ROLE", "fleet-mini")):
+            patch = mock.patch.object(gd, key, value)
+            patch.start()
+            self.addCleanup(patch.stop)
+        with mock.patch.object(gd, "enrolled_runners", return_value=[]):
+            families = {f.id: f for f in gd.default_families()}
+        self.fam = families["sparkle-appcast"]
+        self.assertIn("Sparkle_generate_appcast", families["library-caches"].skip)
+
+    def extract(self, name: str, hours: float) -> Path:
+        path = self.fam.root / name
+        make(path / "cmux NIGHTLY.app/Contents/Frameworks/Sparkle.framework/Versions/B/Resources", age_hours=hours)
+        stamp = time.time() - hours * 3600
+        for folder, dirs, files in os.walk(path):
+            for child in dirs + files:
+                os.utime(Path(folder) / child, (stamp, stamp))
+            os.utime(folder, (stamp, stamp))
+        return path
+
+    def test_extracted_apps_go_after_six_hours_even_with_deep_generated_bundles(self) -> None:
+        old, recent = self.extract("old", 7), self.extract("recent", 5)
+        with mock.patch.object(gd, "process_evidence", return_value=([], "")):
+            items = gd.survey([self.fam], 24, 0)
+            by_path = {i.path: i for i in items}
+            self.assertEqual(by_path[str(old)].verdict, "reclaimable", by_path[str(old)].reasons)
+            self.assertEqual(by_path[str(recent)].verdict, "recent")
+            gd.apply(items, {self.fam.id: self.fam}, self.home / "receipt.jsonl", None, 24)
+        self.assertFalse(old.exists())
+        self.assertTrue(recent.exists())
+
+    def test_an_app_used_after_the_survey_is_kept(self) -> None:
+        path = self.extract("in-flight", 7)
+        with mock.patch.object(gd, "process_evidence", return_value=([], "")):
+            items = gd.survey([self.fam], 24, 0)
+        self.assertEqual([i.verdict for i in items], ["reclaimable"])
+        with mock.patch.object(gd, "process_evidence", return_value=([str(path / "cmux NIGHTLY.app")], "")):
+            gd.apply(items, {self.fam.id: self.fam}, self.home / "receipt.jsonl", None, 24)
+        self.assertTrue(path.exists(), "live appcast generation keeps its extraction")
+
+
 class LinuxLayoutTest(unittest.TestCase):
     """The Linux layout, checked on every platform by pointing HOME and DARWIN at a fake host."""
 
@@ -9820,6 +9865,17 @@ class HomeScratchTest(unittest.TestCase):
         self.assertFalse(tree.exists())
         bundles = sorted((self.home / "archive/glaeda-disk").glob("*.bundle"))
         self.assertEqual(len(bundles), 1)
+
+    def test_unreadable_nested_refs_in_legacy_home_trees_alert_instead_of_deleting(self) -> None:
+        for name in ("cmux-ci-perf", "agent-work", "toolchain-quarantine-20260925", "fun"):
+            with self.subTest(name=name):
+                tree = self.tree(name, git=True)
+                self.assertFalse((tree / ".git").exists(), "a container is not itself a checkout")
+                with mock.patch.object(gd, "local_tips", return_value=None):
+                    why, written, _ = gd.archive_mirror(tree)
+                self.assertEqual(why, "unreadable refs in src/.git; kept for owner recovery")
+                self.assertEqual(written, [])
+                self.assertTrue((tree / "src/.git").is_dir())
 
     def retire(self, label: str, tree: Path, where: str = ".local/state/fleet-retired-workers") -> Path:
         """A worker plist naming tree (work root and working directory), as a fleet heal step moves it out of

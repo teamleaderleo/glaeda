@@ -883,6 +883,7 @@ CMUX_NEXT_DRAIN_HOOK_SHA256 = frozenset({
     "7430aae2e88ee40ebe760349388ca02fb183ac1489e0c786bcc0c14c95a8c84a",
     "9b2b2be376e509f71771643c1c03d478c690bbfed04d66bc53c914777eb5504e",
     "5836275a0e05566b11a120996d96904ba60ac906353698cc58c2ca6c70949b10",
+    "94582b292d438a24fe9f8e2aae9b9edaa4fd1c27e954b1b26cd7d142f80cc5b5",
 })
 CMUX_NEXT_CI_PRESERVED_NAMES = frozenset({
     "SourcePackages", "ModuleCache.noindex", "SDKStatCaches.noindex",
@@ -3931,11 +3932,19 @@ def default_families(role: str = "fleet-mini") -> list[Family]:
                mirror_exclude=HYGIENE_MIRROR_KEEP,
                # glaeda: OTA candidates and LAN seed stages; PassKit: web service cookies; tidy-branches:
                # a deletion receipt; the rest are Apple daemons without the com.apple. prefix
-               skip=("glaeda", "cmux-next-ci", "PassKit", "tidy-branches", "CloudKit", "GeoServices", "FamilyCircle",
+               skip=("glaeda", "cmux-next-ci", "Sparkle_generate_appcast", "PassKit", "tidy-branches", "CloudKit",
+                     "GeoServices", "FamilyCircle",
                      "familycircled", "GameKit", "askpermissiond", "mbuseragent", "AMSDataMigratorTool",
                      "PHTPhenotype", "SharedImageCache", "Animoji", "SiriTTS", "GIPPseudonymousID"),
                skip_prefixes=("com.apple.",), owner="apps", rebuild_minutes=5,
                stale_before=ARTIFACT_CUTOFF, reference_root=FLEET_ROOT, pressure_only=role == "devbox", platform="macos"),
+        # generate_appcast extracts one application per delta into this producer-owned cache. Its deep
+        # bundle layout is generated output, not a checkout: the generic library walker could not prove
+        # that within its git-search budget and kept tens of GiB forever. Live-process checks still apply.
+        Family("sparkle-appcast", HOME / "Library/Caches/Sparkle_generate_appcast", True,
+               "generate_appcast extracts the published application again", depth=1, build_output=True,
+               min_idle_hours=6.0, max_idle_hours=6.0, owner="Sparkle generate_appcast", rebuild_minutes=1,
+               platform="macos"),
         # CUA recordings and frame caches are runner tooling residue, not private user data needed
         # by CI. Keep them separate from the generic Application Support/Cache totals so operators
         # can see their age and reclaim them after the normal process/open-file gate passes.
@@ -6834,7 +6843,8 @@ def repo_unborn(gitdir: Path) -> bool:
             and files_strict(gitdir / "logs") == [] and not os.path.lexists(gitdir / "worktrees"))
 
 
-def mirror_tips(root: Path, gitdirs: dict[str, Path]) -> dict[str, tuple[list[str], str]] | None:
+def mirror_tips(root: Path, gitdirs: dict[str, Path], unreadable: list[str] | None = None
+                ) -> dict[str, tuple[list[str], str]] | None:
     """Every commit each repository points at on its own (local_tips: refs, HEAD, reflogs, its worktrees'), and
     its local refs by name, keyed by the git dir's path relative to root, so the same item can be read again
     after a rename."""
@@ -6846,6 +6856,8 @@ def mirror_tips(root: Path, gitdirs: dict[str, Path]) -> dict[str, tuple[list[st
             t = None if own is None else sorted({*t, *own})
         refs = _git_dir_run(g, "for-each-ref", "--format=%(refname) %(objectname)")
         if t is None or refs is None:
+            if unreadable is not None:
+                unreadable.append(os.path.relpath(g, root))
             return None
         tips[os.path.relpath(g, root)] = (t, "\n".join(
             ln for ln in refs.splitlines() if not ln.startswith(("refs/remotes/", ARCHIVE_REF))))
@@ -7220,9 +7232,12 @@ def archive_mirror(path: Path) -> tuple[str, list[Path], tuple]:
     if (why := mount_below(path)):  # a mirror is git_exempt, so git_state's nested-filesystem check never ran
         return why, [], none
     snap = mirror_git_snapshot(list(gitdirs.values()), trees)
-    tips = mirror_tips(path, gitdirs)  # what the bundles and the servers cover, for mirror_rename_recheck
+    unreadable: list[str] = []
+    tips = mirror_tips(path, gitdirs, unreadable)  # what the bundles and servers cover, for mirror_rename_recheck
     if tips is None:
-        return "unreadable refs", [], none
+        # A container with no top-level .git may still own nested repositories. Never infer disposal
+        # authority from its name (cmux-ci-perf, agent-work, toolchain-quarantine-* or fun) or its size.
+        return f"unreadable refs in {unreadable[0]}; kept for owner recovery", [], none
     bundles: list[Path] = []
     relied: dict[Path, list[str]] = {}
     for key, g in sorted(gitdirs.items()):

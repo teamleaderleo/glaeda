@@ -63,3 +63,15 @@ hostile or disposable CI job, developer credentials are never inherited by one, 
 checkout, cache, alias or directory name never proves project ownership or verification
 authority. The older catalog and `glaeda project enter` design (issue #372) was never built and
 is retired; recover it from Git history if that work resumes.
+
+## Appcast extracts and legacy home trees
+
+`Sparkle_generate_appcast` has its own `sparkle-appcast` family: one generated extraction per item,
+six hours idle, checked for live processes again before removal. The generic Library cache family skips it.
+The next appcast generation re-extracts the published app; deep bundle contents are generated build output.
+
+On an enrolled fleet mini, `cmux-ci-perf`, `agent-work`, `toolchain-quarantine-*` and `fun` follow the
+existing home-scratch policy, with no name-based deletion exception. No top-level `.git` does not mean no Git
+work: nested repositories must be readable and archived before the idle tree can go. Unreadable refs keep the
+tree and the receipt now names the nested git directory for owner recovery. Configuration references, live
+processes, sockets, mounts and the post-archive rechecks still veto deletion.
