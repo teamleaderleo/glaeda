@@ -3290,7 +3290,7 @@ class ClientTest(Base):
         fields = gg.parse_fields("head,checks.failed")
         self.assertEqual(self.status("pr", "o/r#1", False, False, fields=fields), (0, f"{'a' * 40}\tlint,test\n"))
         code, text = self.status("pr", ["o/r#1", "2", "3"], False, False, fields=gg.parse_fields("state,checks.state"))
-        self.assertEqual(code, 1)  # #3 has no data yet: an empty row, not an error
+        self.assertEqual(code, gg.EXIT_DOWN)  # #3 has no data yet: an empty row, and a target not judged (3)
         self.assertEqual(text, "o/r#1\tOPEN\tFAILURE\no/r#2\tMERGED\tSUCCESS\no/r#3\t\t\n")
         code, text = self.status("pr", "o/r#2", False, False, fields=gg.parse_fields("isDraft,checks.total,url"))
         self.assertEqual(text, "false\t1\thttps://github.com/o/r/pull/2\n")
@@ -3305,7 +3305,7 @@ class ClientTest(Base):
         with self.assertRaisesRegex(gg.WatchError, r"no 'hed' at the top level; valid keys there: .*\bhead\b"):
             self.status("pr", ["o/r#1", "9"], False, False, fields=["head", "hed"])
         self.assertEqual(self.status("pr", "o/r#9", False, False, fields=["head", "checks.failed", "mergeable"]),
-                         (1, "\t\t\n"))
+                         (gg.EXIT_DOWN, "\t\t\n"))
         for bad in ("", "head,", "checks..failed"):
             with self.subTest(bad=bad), self.assertRaises(gg.WatchError):
                 gg.parse_fields(bad)
@@ -5921,6 +5921,10 @@ class DaemonDiagnosticOnFd2Test(unittest.TestCase):
                 done, _ = cli_run(self.ghdir, *args, "--json",
                                   shell_prefix=("/bin/sh", "-c", 'exec 2>&-; exec "$@"', "sh"))
                 self.assertEqual(done.returncode, 3, done.stdout)
+                if args[0] in ("wait", "status"):
+                    # the agent output contract: the one {ok, code, reason, next} object, and only it
+                    assert_json_refusal(self, done.stdout, "daemon-down")
+                    continue
                 self.assertNotIn("daemon is not running", done.stdout,
                                  "the daemon-down notice went to stdout")
                 # `budget --json` answers with a document even when the daemon is down, so the
