@@ -36,7 +36,16 @@ glaeda-gh runners OWNER[/REPO] [--label L] [--json]  # online, busy and idle sel
 
 - `wait` exits 0 on success (or a matching comment), 1 on failure (including a PR closed without
   being merged), 2 on timeout (`--timeout S`, default 3600), 3 when the daemon is down, 4 when the
-  PR conflicts with its base, 64 on bad arguments.
+  PR conflicts with its base, 6 when no CI ever reported on the head, 64 on bad arguments.
+- Every non-zero exit of `status` and `wait pr|run` ends with a line saying what is wrong and a last line
+  `next: <command>` (or `next: none (why)`), and with `--json` its one object carries `ok`, `code`, `reason`
+  and `next` (codes: `not-found`, `timeout`, `checks-failed`, `run-failed`, `pr-closed`, `conflict`,
+  `nothing-reported`, `no-data-yet`, `usage`, `refused`, `daemon-down`). A PR or run GitHub does not know is
+  `not-found` (exit 1) on the daemon's first read of it, not a wait to the timeout. `status` exits 3 when
+  the daemon has not read a target yet. Deadlines are UTC with a Z (`17:55:00Z`).
+- While it blocks, a `wait pr|run` prints `glaeda-gh: still waiting on KEY: 240s of 1800s, deadline
+  17:55:00Z; <state>` every 120 s on stderr, the stream of its waiting line; a timeout's last lines say
+  `waited N s for ... (deadline ...Z); last seen: ...` and `next:` the same wait again.
 - Run one background `wait` per PR, run or comment (Bash `run_in_background`), not one wait
   looping over several: each then notifies you on its own when it exits, and you carry on meanwhile.
 - Every `wait` prints one line on **stderr** before it blocks, naming what it is waiting for, its

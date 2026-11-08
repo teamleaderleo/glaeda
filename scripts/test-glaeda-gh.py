@@ -2962,6 +2962,101 @@ class ClientTest(Base):
         code, text = self.wait("pr", "o/r#404", fill=(None, {"error": "Could not resolve", "missing": True}))
         self.assertEqual(code, 1)
         self.assertIn("Could not resolve", text)
+        # the agent output contract: what is wrong, then `next:` last, on the stream the answer uses
+        lines = text.strip().splitlines()
+        self.assertEqual(lines[-1], "next: gh pr list -R o/r --state all --limit 5")
+        self.assertIn("no such PR or issue on GitHub", lines[-2])
+
+    def test_a_missing_pr_is_not_found_in_json(self) -> None:
+        self.put("pr:o/r#404", None, error="Could not resolve", missing=True)
+        req = gg.wait_request("pr", "o/r#404", "green", 60, False, True, None, True, 0)
+        req["began"] -= 5
+        code, out = gg.wait_step(req, time.time())
+        doc = json.loads(out)
+        self.assertEqual(code, gg.EXIT_FAIL)
+        self.assertEqual((doc["ok"], doc["code"], doc["result"]), (False, "not-found", "failure"))
+        self.assertEqual(doc["next"], "gh pr list -R o/r --state all --limit 5")
+        run = gg.wait_request("run", "o/r/9", "green", 60, False, True, None, True, 0)
+        self.assertEqual(gg.not_found_fields(run["key"])["next"], "gh run list -R o/r --limit 5")
+
+    def test_a_timeout_names_its_deadline_and_the_wait_to_run_again(self) -> None:
+        running = gg.parse_pr(pr_node(1, rollup="PENDING", checks=[check_run("a", "IN_PROGRESS", None)]))
+        code, text = self.wait("pr", "o/r#1", fill=(running, {}), timeout=0.3)
+        self.assertEqual(code, gg.EXIT_TIMEOUT)
+        lines = text.strip().splitlines()
+        self.assertEqual(lines[-1], "next: glaeda-gh wait pr o/r#1 --timeout 0.3")
+        self.assertRegex(lines[-2], r"^glaeda-gh: waited 0 s for o/r#1 \(deadline \d\d:\d\d:\d\dZ\); last seen: ")
+        self.assertIn("checks PENDING", lines[-2])
+
+    def test_a_wait_says_how_it_stands_while_it_blocks(self) -> None:
+        running = gg.parse_pr(pr_node(1, rollup="PENDING", checks=[check_run("a", "IN_PROGRESS", None)]))
+        with mock.patch.object(gg, "WAIT_PROGRESS_EVERY", 0.1):
+            code, text = self.wait("pr", "o/r#1", fill=(running, {}), timeout=0.5)
+        self.assertEqual(code, gg.EXIT_TIMEOUT)
+        progress = [line for line in text.splitlines() if line.startswith("glaeda-gh: still waiting on pr:o/r#1: ")]
+        self.assertTrue(progress, text)
+        self.assertRegex(progress[0], r"\d+s of 0.5s, deadline \d\d:\d\d:\d\dZ; o/r#1 OPEN .*; checks PENDING")
+
+    def test_a_daemon_ruled_wait_keeps_the_state_its_blocker_prints(self) -> None:
+        running = gg.parse_pr(pr_node(1, rollup="PENDING", checks=[check_run("a", "IN_PROGRESS", None)]))
+        self.put("pr:o/r#1", running)
+        req = gg.wait_request("pr", "o/r#1", "green", 60, False, False, None, True, 0)
+        d = gg.waits_dir()
+        d.mkdir(parents=True, exist_ok=True)
+        gg.Daemon.note_wait_state(d, "1-x", req)
+        state = (d / "1-x.out.state").read_text()
+        self.assertTrue(state.startswith("o/r#1 OPEN") and state.count("\n") == 1, state)
+        self.assertIn("checks PENDING", state)
+        self.assertIn(".out.state", gg.WAIT_FILES)
+        self.assertIn('$out.state', gg.BLOCKER)
+
+    def test_status_says_not_found_and_could_not_judge_apart(self) -> None:
+        self.put("pr:o/r#404", None, error="Could not resolve", missing=True)
+        self.put("pr:o/r#5", None, error="graphql: HTTP 502")
+        out = io.StringIO()
+        with mock.patch.object(gg, "daemon_running", return_value=True), \
+                mock.patch.object(gg, "daemon_failing", return_value=None), \
+                mock.patch.object(gg, "daemon_stale", return_value=None), contextlib.redirect_stdout(out):
+            self.assertEqual(gg.cmd_status("pr", "o/r#404", False, False, first_wait=0), gg.EXIT_FAIL)
+            self.assertEqual(gg.cmd_status("pr", "o/r#5", False, True, first_wait=0), gg.EXIT_DOWN)
+        plain, doc = out.getvalue().split("\n{", 1)
+        self.assertEqual(plain.strip().splitlines()[-1], "next: gh pr list -R o/r --state all --limit 5")
+        doc = json.loads("{" + doc)
+        self.assertEqual((doc["ok"], doc["code"], doc["next"]), (False, "no-data-yet", "glaeda-gh wait pr o/r#5 --timeout 600"))
+
+    def test_a_run_github_cannot_resolve_is_missing_only_when_never_read(self) -> None:
+        self.daemon.now = NOW
+        entries = [{"key": "run:o/r/1", "cache": None}, {"key": "run:o/r/2", "cache": {"data": {"id": 2}}}]
+        with mock.patch.object(self.daemon, "graphql", return_value=({"data": {"w0": None, "w1": None}}, None)):
+            self.daemon.fetch_runs_graphql(entries)
+        self.assertTrue(gg.read_cache("run:o/r/1")["missing"])
+        self.assertFalse(gg.read_cache("run:o/r/2").get("missing"))  # it had data: an error, not gone
+        limited = {"data": {"w0": None}, "errors": [{"type": "RATE_LIMITED", "message": "API rate limit exceeded"}]}
+        with mock.patch.object(self.daemon, "graphql", return_value=(limited, None)):
+            self.daemon.fetch_runs_graphql([{"key": "run:o/r/3", "cache": None}])
+        self.assertFalse(gg.read_cache("run:o/r/3").get("missing"))
+
+    def test_a_never_read_key_a_wait_is_on_goes_ahead_of_deferred_ones(self) -> None:
+        self.daemon.now = NOW
+        old = [{"key": f"pr:o/r#{n}", "cache": {"data": {}, "fetchedAt": NOW - 999}, "touched": NOW} for n in range(1, 4)]
+        new = {"key": "pr:o/r#999", "cache": None, "touched": NOW, "waitedAt": NOW}
+        self.daemon.deferred = {e["key"] for e in old}
+        due = [e["key"] for e in self.daemon.due("pr", old + [new])]
+        self.assertEqual(due[0], "pr:o/r#999")
+        self.assertEqual(due[1:], [e["key"] for e in old])
+
+    def test_a_usage_error_names_the_right_form(self) -> None:
+        self.assertEqual(gg.usage_next(["wait", "pr", "manaflow-ai/cmuxterm-hq", "0"]),
+                         "glaeda-gh wait pr manaflow-ai/cmuxterm-hq#0 --timeout 1800")
+        self.assertEqual(gg.usage_next(["status", "pr", "o/r", "#7", "--json"]), "glaeda-gh status pr o/r#7 --json")
+        self.assertEqual(gg.usage_next(["wait", "bogus"]), "glaeda-gh wait --help")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), mock.patch.object(gg, "say_waiting"), self.assertRaises(SystemExit) as exit_:
+            gg.main(["wait", "pr", "o/r", "3", "--json"])
+        self.assertEqual(exit_.exception.code, 64)
+        doc = json.loads(out.getvalue())
+        self.assertEqual((doc["ok"], doc["code"]), (False, "usage"))
+        self.assertEqual(doc["next"], "glaeda-gh wait pr o/r#3 --json --timeout 1800")
 
     def test_rerun_after_cancel_counts_the_latest_attempt(self) -> None:
         old = {**check_run("Web complexity", conclusion="CANCELLED"), "databaseId": 1, "startedAt": "2026-09-25T10:00:00Z"}
@@ -6516,8 +6611,8 @@ class FileAndPidWaitTest(unittest.TestCase):
         The deadline is a wall-clock time as well as a duration because the duration alone cannot
         be compared with anything: a reader looking at a line in a file does not know when the
         process started."""
-        at = time.mktime((2026, 10, 21, 13, 0, 0, 0, 0, -1))
-        self.assertEqual(gg.deadline_clock(90, at), "13:01:30")
+        at = 1792587600.0  # 2026-10-21T13:00:00Z: the deadline is UTC with a Z (agent output contract)
+        self.assertEqual(gg.deadline_clock(90, at), "13:01:30Z")
         for timeout in (float("inf"), float("nan"), 1e300):
             self.assertEqual(gg.deadline_clock(timeout, at), "unknown", timeout)
         full, short = "a" * 40, "abc1234"
@@ -6534,7 +6629,7 @@ class FileAndPidWaitTest(unittest.TestCase):
                 # Every kind carries the deadline, not just the helper that formats it: a mutation
                 # dropping the `(at ...)` clause from the line left the suite green while
                 # `deadline_clock`'s own assertions above still passed.
-                self.assertRegex(line, r"giving up after 60s \(at \d\d:\d\d:\d\d\)")
+                self.assertRegex(line, r"giving up after 60s \(at \d\d:\d\d:\d\dZ\)")
         self.assertNotIn(" at ", gg.waiting_line("pid 7", "it exits", None, True, 60).split(" (at ")[0],
                          "a wait with no sha claimed one")
 
