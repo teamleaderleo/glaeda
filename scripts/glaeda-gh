@@ -5404,7 +5404,8 @@ BASH = "/bin/bash"
 # one line the daemon keeps in $out.state (serve_wait), in progress_line's words. The printf runs in the
 # background with SIGPIPE ignored and fd 1 and 3 not held, and only one at a time: like say_waiting, a closed
 # or full stderr never stops or delays the wait. One still blocked on a full stderr when the wait ends is
-# killed, so repeated waits leave no writers behind.
+# killed, so repeated waits leave no writers behind: only while that PID is still this shell's child, so a
+# writer that already exited and whose PID was reused is never signalled.
 BLOCKER = r"""fifo=$1 out=$2 limit=$3 served=$4 check=$5
 shift 5
 trap '' PIPE
@@ -5432,7 +5433,9 @@ while :; do
     fi
   fi
 done
-[ -n "$sayer" ] && kill "$sayer" 2>/dev/null && wait "$sayer" 2>/dev/null
+if [ -n "$sayer" ] && [ "$(ps -o ppid= -p "$sayer" 2>/dev/null | tr -d ' ')" = "$$" ]; then
+  kill "$sayer" 2>/dev/null && wait "$sayer" 2>/dev/null
+fi
 exec 3<&-
 rm -f "$mark" "$out.state"
 case "$rc" in ''|*[!0-9]*) exec "$@" ;; esac
