@@ -381,6 +381,19 @@ class FakeGitHub:
         return [c for c in self.rest_calls() if "/jobs" in c[1]]
 
 
+def assert_json_refusal(test: unittest.TestCase, stdout: str, code: str | None) -> None:
+    """stdout is exactly one agent-output-contract object (ok false, code, reason, next) and nothing else: no
+    usage text, notice or waiting line leaked into the document."""
+    doc = json.loads(stdout)
+    test.assertEqual(stdout.count("\n"), 1, stdout)
+    test.assertIs(doc["ok"], False)
+    test.assertTrue(doc["next"] and doc["reason"], doc)
+    if code is not None:
+        test.assertEqual(doc["code"], code)
+    test.assertNotIn("usage:", stdout)
+    test.assertNotIn("waiting on", stdout)
+
+
 class Base(unittest.TestCase):
     def setUp(self) -> None:
         # watch files carry real mtimes, so the fake clock starts at each test, not at import:
@@ -3253,16 +3266,19 @@ class ClientTest(Base):
         doc = json.loads(text)
         self.assertEqual([d["key"] for d in doc], ["pr:o/r#1", "pr:o/r#2"])
         self.assertEqual(doc[1]["data"]["checkState"], "FAILURE")
-        # one without data yet: its entry is still listed, and the exit says not everything was there
+        # one without data yet: its entry is still listed, and the exit says not everything was there (3: a
+        # target the daemon has not read is one it could not judge, not a failure)
         code, text = self.status("pr", ["o/r#1", "3"], False, True)
-        self.assertEqual(code, 1)
+        self.assertEqual(code, gg.EXIT_DOWN)
         self.assertEqual([d["key"] for d in json.loads(text)], ["pr:o/r#1", "pr:o/r#3"])
 
     def test_one_target_prints_exactly_what_it_always_has(self) -> None:
         self.put("pr:o/r#1", gg.parse_pr(pr_node(1, rollup="PENDING", checks=[check_run("a")])))
         entry = gg.read_cache("pr:o/r#1")
-        self.assertEqual(self.status("pr", "o/r#1", False, True), (0, gg.render("pr:o/r#1", entry, True)))
-        self.assertEqual(self.status("pr", ["o/r#1"], False, True), (0, gg.render("pr:o/r#1", entry, True)))
+        # --json adds the agent output contract's ok, code, reason and next to the same object
+        ok = gg.ok_fields()
+        self.assertEqual(self.status("pr", "o/r#1", False, True), (0, gg.render("pr:o/r#1", entry, True, ok)))
+        self.assertEqual(self.status("pr", ["o/r#1"], False, True), (0, gg.render("pr:o/r#1", entry, True, ok)))
         self.assertEqual(self.status("pr", ["o/r#1"], False, False), (0, gg.render("pr:o/r#1", entry, False)))
 
     def test_field_prints_just_those_values(self) -> None:
@@ -5952,7 +5968,7 @@ class DaemonDiagnosticOnFd2Test(unittest.TestCase):
                             f"{gg.DOWN_GRACE + 2:g}", "--json",
                             shell_prefix=("/bin/sh", "-c", 'exec 2>&-; exec "$@"', "sh"))
         self.assertEqual(closed.returncode, 3, closed.stdout)
-        self.assertEqual(closed.stdout, "", "the restart notice went to stdout")
+        assert_json_refusal(self, closed.stdout, "daemon-down")
 
     def with_a_daemon(self, daemon_json: dict) -> None:
         """A held lock and a `daemon.json`, which is all the CLI reads to decide the daemon is
@@ -5992,7 +6008,10 @@ class DaemonDiagnosticOnFd2Test(unittest.TestCase):
                                     "--json",
                                     shell_prefix=("/bin/sh", "-c", 'exec 2>&-; exec "$@"', "sh"))
                 self.assertEqual(closed.returncode, code, closed.stdout)
-                self.assertNotIn(want, closed.stdout, f"{name}: the notice went to stdout")
+                if name == "failing":  # --json: the agent output contract's one object, and only it
+                    assert_json_refusal(self, closed.stdout, "daemon-failing")
+                else:
+                    self.assertNotIn(want, closed.stdout, f"{name}: the notice went to stdout")
                 if closed.stdout:
                     json.loads(closed.stdout)  # and the document is still one document
 
@@ -6012,7 +6031,8 @@ class DaemonDiagnosticOnFd2Test(unittest.TestCase):
                     done, _ = cli_run(self.ghdir, "wait", "file", str(self.dir / "x"),
                                       "--timeout", bad, "--json", stderr=fh)
                 self.assertEqual(done.returncode, 64, done.stdout)
-                self.assertEqual(done.stdout, "", "the usage error went to stdout")
+                # the agent output contract: --json is one {ok, code, reason, next} object, and no diagnostic
+                assert_json_refusal(self, done.stdout, "usage")
                 said = err.read_text()
                 self.assertIn("is not a number of seconds", said)
                 # The usage text as well as the reason: a message naming a flag, with no shape of
@@ -6029,14 +6049,14 @@ class DaemonDiagnosticOnFd2Test(unittest.TestCase):
                 with err.open("w") as fh:
                     done, _ = cli_run(self.ghdir, *args, "--json", stderr=fh)
                 self.assertEqual(done.returncode, 64, done.stdout)
-                self.assertEqual(done.stdout, "", "the refusal went to stdout")
+                assert_json_refusal(self, done.stdout, "refused")
                 self.assertIn(reason, err.read_text())
         for args in (["wait", "file", str(self.dir / "x"), "--timeout", "-5"],
                      ["wait", "pr", "o/r#1", "--author", "x"]):
             closed, _ = cli_run(self.ghdir, *args, "--json",
                                 shell_prefix=("/bin/sh", "-c", 'exec 2>&-; exec "$@"', "sh"))
             self.assertEqual(closed.returncode, 64)
-            self.assertEqual(closed.stdout, "", args)
+            assert_json_refusal(self, closed.stdout, None)
         # A timeout that is merely 0 is a legitimate "look once", not a bad argument.
         with (self.dir / "once.txt").open("w") as fh:
             once, _ = cli_run(self.ghdir, "wait", "file", str(self.dir / "x"), "--timeout", "0",
@@ -6456,7 +6476,7 @@ class WaitSubscriptionTest(Base):
     def test_the_subscribe_path_says_the_line_once_before_it_blocks(self) -> None:
         said: list[str] = []
         with mock.patch.object(gg, "say_waiting", said.append), \
-                mock.patch.object(gg, "block", side_effect=lambda rid, left: said.append("block")):
+                mock.patch.object(gg, "block", side_effect=lambda rid, left, *rest: said.append("block")):
             gg.subscribe_wait("pr", "o/r#1", "green", 60, False, False, None, gg.RESCUE_GRACE)
         self.assertEqual(len([s for s in said if "waiting on" in s]), 1, said)
         self.assertEqual(said[-1], "block", "the line came after the wait blocked")

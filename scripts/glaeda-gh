@@ -5367,7 +5367,7 @@ def poll_wait(req: dict) -> int:
         down_since = None
         broken = daemon_failing()
         if broken is not None:
-            say_waiting(failing_message(broken))
+            say_daemon_problem("daemon-failing", failing_message(broken), bool(req.get("json")))
             return EXIT_DOWN
         lag = daemon_stale()
         if lag is not None and not warned:
