@@ -2170,7 +2170,9 @@ def run_fleet_bootstrap(ctx: Context) -> dict[str, Any] | None:
         return {"state": "unparsed", "note": "bootstrap output was not JSON", "raw": result.stdout[-2000:]}
     return {"state": "observed", "schema": doc.get("schema"),
             "eligibleForEnrollment": doc.get("eligibleForEnrollment"),
-            "blockingChecks": doc.get("blockingChecks")}
+            "blockingChecks": doc.get("blockingChecks"),
+            # the disk floors: they warn and never block enrollment (cmux_fleet_bootstrap WARNING_CHECKS)
+            "warningChecks": doc.get("warningChecks") if isinstance(doc.get("warningChecks"), list) else []}
 
 
 # ---------------------------------------------------------------- output
@@ -2201,7 +2203,9 @@ def render(ctx: Context, receipt: dict[str, Any]) -> str:
     for name, slot in receipt["reserved"].items():
         extra = ""
         if slot.get("state") == "observed":
-            extra = f" eligible={slot['eligibleForEnrollment']} blocking={','.join(slot['blockingChecks']) or 'none'}"
+            extra = f" eligible={slot['eligibleForEnrollment']} blocking={','.join(slot['blockingChecks'] or []) or 'none'}"
+            if slot.get("warningChecks"):
+                extra += f" warning={','.join(slot['warningChecks'])} (a disk floor warns, never refuses)"
         lines.append(f"  {name}: {slot['state']}{extra}  {slot.get('note', '')}".rstrip())
     lines.append("ready: " + ("yes" if receipt["ready"] else "no, blocking: " + ", ".join(receipt["blocking"])))
     if receipt["applied"]:

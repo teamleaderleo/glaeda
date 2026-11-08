@@ -1406,5 +1406,27 @@ class TimedOutInstallTest(unittest.TestCase):
             ms.reap_session(os.getsid(0), time.monotonic())
 
 
+
+class FleetBootstrapWarnings(unittest.TestCase):
+    """A disk floor warns, never refuses: the bootstrap's warningChecks reach the setup receipt (#1909 F1)."""
+
+    def test_warning_checks_are_carried_into_the_receipt(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            glaeda = root / "glaeda"
+            glaeda.write_text("")
+            (root / "cache").mkdir()
+            ctx = mock.Mock(cmux_root=root, glaeda_bin=glaeda, cache_root=root / "cache", show=str)
+            doc = {"schema": "s", "eligibleForEnrollment": True, "blockingChecks": [], "warningChecks": ["diskAdmission"]}
+            done = subprocess.CompletedProcess([], 0, stdout=json.dumps(doc), stderr="")
+            with mock.patch.object(ms.subprocess, "run", return_value=done):
+                slot = ms.run_fleet_bootstrap(ctx)
+            self.assertEqual(slot["warningChecks"], ["diskAdmission"])
+            self.assertTrue(slot["eligibleForEnrollment"])
+            doc.pop("warningChecks")
+            done = subprocess.CompletedProcess([], 0, stdout=json.dumps(doc), stderr="")
+            with mock.patch.object(ms.subprocess, "run", return_value=done):
+                self.assertEqual(ms.run_fleet_bootstrap(ctx)["warningChecks"], [])
+
 if __name__ == "__main__":
     unittest.main()
