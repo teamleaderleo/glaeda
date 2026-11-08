@@ -1350,8 +1350,9 @@ def parse_pr(node: dict) -> dict:
     # error to chase, whichever of the pair has the higher id
     superseded = [{**brief(c), "ranNothing": bool(c.get("completedAt") and c.get("startedAt") == c.get("completedAt"))}
                   for c in superseded if (c.get("conclusion") or "").upper() not in PASSED]
-    # the cache keeps 20; the count line says "20+" when more were dropped, so it never reads low
-    superseded_omitted, superseded = max(0, len(superseded) - 20), superseded[:20]
+    # the cache keeps 20; the ones dropped past that that status would count still reach its count line
+    superseded_omitted = sum(1 for c in superseded[20:] if not c["ranNothing"])
+    superseded = superseded[:20]
     base = node.get("baseRef") or {}
     required = set((base.get("branchProtectionRule") or {}).get("requiredStatusCheckContexts") or [])
     for rule in ((base.get("rules") or {}).get("nodes") or []):
@@ -4708,9 +4709,9 @@ def summary(key: str, entry: dict | None, until: str = "done", grace: float = RE
             lines.append(f"  superseded: {label(c)} {outcome(c.get('conclusion')) if c.get('conclusion') else 'pending'}"
                          f"{optional}, "
                          "replaced by a newer attempt or run (not counted)")
-        if replaced and not verbose:
-            more = "+" if data.get("supersededOmitted") else ""
-            lines.append(f"  {len(replaced)}{more} superseded, replaced by a newer attempt or run "
+        replaced_count = len(replaced) + int(data.get("supersededOmitted") or 0)
+        if replaced_count and not verbose:
+            lines.append(f"  {replaced_count} superseded, replaced by a newer attempt or run "
                          "(not counted; --verbose lists up to 10)")
         lines.append(str(data.get("url") or ""))
     elif kind == "comment":

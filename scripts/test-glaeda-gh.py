@@ -3495,12 +3495,15 @@ class ClientTest(Base):
             terse = gg.summary("pr:o/r#1", {"data": data}, "required")
         self.assertNotIn("superseded: Web complexity", terse)
         self.assertIn("  1 superseded, replaced by a newer attempt or run (not counted; --verbose lists up to 10)", terse)
-        # parse_pr keeps 20; past that the count says so instead of reading low
+        # parse_pr keeps 20; the count line still counts the ones dropped past that
         many = gg.parse_pr(pr_node(1, rollup="FAILURE", checks=[web(n, "CANCELLED") for n in range(1, 26)]
                                    + [web(26, "SUCCESS"), {**check_run("build"), "isRequired": True}]))
         self.assertEqual((len(many["superseded"]), many["supersededOmitted"]), (20, 5))
         with mock.patch.dict(os.environ, {"AGENT_VERBOSE": ""}):
-            self.assertIn("  20+ superseded, replaced", gg.summary("pr:o/r#1", {"data": many}, "required"))
+            self.assertIn("  25 superseded, replaced", gg.summary("pr:o/r#1", {"data": many}, "required"))
+            # kept ones that ran nothing are not counted; dropped real ones still are
+            kept_empty = {**many, "superseded": [{**c, "ranNothing": True} for c in many["superseded"]]}
+            self.assertIn("  5 superseded, replaced", gg.summary("pr:o/r#1", {"data": kept_empty}, "required"))
         self.assertEqual(data["supersededOmitted"], 0)
         self.assertIn("cancelled: lint (not required)", terse)
         with mock.patch.dict(os.environ, {"AGENT_VERBOSE": "1"}):
