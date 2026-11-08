@@ -76,6 +76,34 @@ def check_run(name: str, status: str = "COMPLETED", conclusion: str | None = "SU
             "detailsUrl": f"https://ci/{name}"}
 
 
+def graphql_requests(query: str, lists: dict[str, int] | None = None) -> int:
+    """The requests GitHub counts for QUERY: each connection (a field with first: or last:, or nodes(ids:) over a
+    list variable sized in LISTS) costs the product of the sizes of the connections it is nested in."""
+    total, stack, pending = 0, [1], 1
+    for m in re.finditer(r"(\w+)\s*(\((?:[^()]|\([^()]*\))*\))?|[{}]", query):
+        token, args = m.group(0), m.group(2) or ""
+        if token == "{":
+            stack.append(stack[-1] * pending)
+            pending = 1
+        elif token == "}":
+            stack.pop()
+            pending = 1
+        else:
+            size = re.search(r"\b(?:first|last):\s*(\d+)", args)
+            ids = re.search(r"\bids:\s*(\$\w+)", args)
+            if size or ids:
+                total += stack[-1]
+                pending = int(size.group(1)) if size else (lists or {})[ids.group(1)]
+            elif m.group(1) not in ("on",):
+                pending = 1
+    return total
+
+
+def graphql_cost(query: str, lists: dict[str, int] | None = None) -> int:
+    """GitHub's points for QUERY: its requests over 100, rounded, and at least 1."""
+    return max(1, round(graphql_requests(query, lists) / 100))
+
+
 class AgentSummaryTest(unittest.TestCase):
     """The text summary is read by agents: it lists what needs action and counts the rest (--verbose lists all)."""
 
@@ -290,13 +318,13 @@ class FakeGitHub:
         return 200, {**self.rate("core", self.rest_remaining), "etag": etag}, json.dumps(payload).encode()
 
     def suite_counts(self, sha: str, repo: str | None = None) -> dict:
-        """A commit's checkSuites as SUITE_ATTEMPTS asks: each suite's check runs in its newest attempt and in all
+        """A commit's checkSuites as SUITE_ATTEMPTS asks: each suite's check runs in its newest attempt
         (only the suites of REPO when a suite names its "repo"; "more": True cuts the page past 100 suites)."""
         if self.suites_unread:
             return {"checkSuites": None}
         suites = [suite for suite in self.suites.get(sha, []) if repo is None or suite.get("repo", repo) == repo]
         return {"checkSuites": {"pageInfo": {"hasNextPage": any(suite.get("more") for suite in suites)}, "nodes": [
-            {"id": suite["id"], "latest": suite["latest"] if suite["latest"] is None else {"totalCount": suite["latest"]}, "every": {"totalCount": len(suite["runs"])}}
+            {"id": suite["id"], "latest": suite["latest"] if suite["latest"] is None else {"totalCount": suite["latest"]}}
             for suite in suites]}}
 
     def rest_issue(self, parts: list[str], path: str) -> Any:
@@ -5535,7 +5563,8 @@ class HeadChecksTest(Base):
         data = gg.read_cache(self.key(SHA_A))["data"]
         self.assertEqual(data["found"], {})
         self.assertFalse(data["settled"])
-        self.assertEqual(len(self.gh.gql_calls()), 1)  # nothing ran in any attempt: nothing more to read
+        # the batch's one follow-up read finds nothing ran in any attempt, and adds nothing
+        self.assertEqual(len(self.gh.gql_calls()), 2)
 
     def test_a_pr_with_a_red_under_startup_failure_reruns_is_not_green(self) -> None:
         node = pr_node(1, rollup="SUCCESS", checks=[check_run("build")])
@@ -5591,9 +5620,9 @@ class HeadChecksTest(Base):
         # Review finding F1 on glaeda#1844: a null or missing count (a nested GraphQL error) read as zero, so a partial
         # suite read looked complete and could hide an older red attempt.
         def broken(suite: dict) -> list[dict | None]:
-            good = {"id": "S1", "latest": {"totalCount": 0}, "every": {"totalCount": 1}}
-            return [None, {**good, "latest": None}, {**good, "every": None}, {k: v for k, v in good.items() if k != "latest"},
-                    {**good, "latest": {"totalCount": None}}, {**good, "every": {}}, {**good, "every": {"totalCount": "1"}},
+            good = {"id": "S1", "latest": {"totalCount": 0}}
+            return [None, {**good, "latest": None}, {k: v for k, v in good.items() if k != "latest"},
+                    {**good, "latest": {"totalCount": None}}, {**good, "latest": {}}, {**good, "latest": {"totalCount": "0"}},
                     {**good, "latest": {"totalCount": -1}}, {**good, "latest": {"totalCount": True}}]
         for bad in broken({}):
             with self.subTest(suite=bad):
@@ -5605,8 +5634,11 @@ class HeadChecksTest(Base):
                 found = gg.ran_nothing_suites({"checkSuites": {"pageInfo": {"hasNextPage": False}, "nodes": nodes}})
                 self.assertIsInstance(found, str)
         # well formed: the same answers as before
-        ok = {"id": "S1", "latest": {"totalCount": 0}, "every": {"totalCount": 1}}
+        ok = {"id": "S1", "latest": {"totalCount": 0}}
         self.assertEqual(gg.ran_nothing_suites({"checkSuites": {"pageInfo": {"hasNextPage": False}, "nodes": [ok]}}), ["S1"])
+        ran = {"id": "S2", "latest": {"totalCount": 3}}
+        self.assertEqual(gg.ran_nothing_suites({"checkSuites": {"pageInfo": {"hasNextPage": False}, "nodes": [ok, ran]}}),
+                         ["S1"])
         self.assertEqual(gg.ran_nothing_suites({"checkSuites": {"pageInfo": {"hasNextPage": False}, "nodes": []}}), [])
 
     def test_a_malformed_suite_count_in_a_tick_is_an_error_not_a_green_head(self) -> None:
@@ -5615,6 +5647,58 @@ class HeadChecksTest(Base):
         gg.register(self.key(SHA_A), consumer="autoland")
         self.daemon.tick(NOW)
         self.assertIn("malformed", gg.read_cache(self.key(SHA_A))["error"] or "")
+
+    def test_a_batch_of_prs_reads_its_ran_nothing_suites_in_one_query(self) -> None:
+        """The batched PR read no longer counts every attempt's runs per suite (100 requests per PR each); the suites
+        whose newest attempt ran nothing are read by id, once for the whole batch, and a red under them still counts."""
+        for n in (1, 2, 3):
+            node = pr_node(n, rollup="SUCCESS", checks=[check_run("build")])
+            node["headRefOid"] = f"{n}" * 40
+            self.gh.prs[("o", "r", n)] = node
+            # an app's suite that never ran anything, beside (on PR 2) a red under a startup_failure rerun
+            self.gh.suites[node["headRefOid"]] = [{"id": f"APP{n}", "latest": 0, "runs": []},
+                                                  {"id": f"CI{n}", "latest": 1 if n != 2 else 0,
+                                                   "runs": [self.red_publish(n)] if n == 2 else [check_run("build")]}]
+            gg.register(gg.parse_key("pr", f"o/r#{n}"))
+        self.daemon.tick(NOW)
+        suite_reads = [json.loads(c[3])["variables"]["suites"] for c in self.gh.gql_calls()
+                       if "suites" in json.loads(c[3])["variables"]]
+        self.assertEqual(len(suite_reads), 1)  # one query for the batch, in the scheduler's order
+        self.assertEqual(sorted(suite_reads[0]), ["APP1", "APP2", "APP3", "CI2"])
+        for n in (1, 2, 3):
+            data = gg.read_cache(gg.parse_key("pr", f"o/r#{n}"))["data"]
+            self.assertNotIn("checksPageError", data)
+            red = ("publish", "FAILURE") in [(c["name"], c["conclusion"]) for c in data["checks"]]
+            self.assertEqual(red, n == 2)
+            self.assertEqual(gg.check_verdict(data, "green"), gg.EXIT_FAIL if n == 2 else 0)
+
+    def test_the_batch_follow_up_is_not_held_by_the_minute_its_own_read_spent(self) -> None:
+        """The follow-up belongs to the read the per-minute ceiling admitted: holding it would leave the whole batch
+        partial whenever the main query used the minute's last room."""
+        node = pr_node(1, rollup="SUCCESS", checks=[check_run("build")])
+        self.gh.prs[("o", "r", 1)] = node
+        self.gh.suites[node["headRefOid"]] = [{"id": "S1", "latest": 0, "runs": [self.red_publish()]}]
+        self.daemon.policy = {**self.daemon.policy, "graphqlPerMinute": 1}
+        gg.register(gg.parse_key("pr", "o/r#1"))
+        self.daemon.tick(NOW)
+        data = gg.read_cache(gg.parse_key("pr", "o/r#1"))["data"]
+        self.assertNotIn("checksPageError", data)
+        self.assertEqual(gg.check_verdict(data, "green"), gg.EXIT_FAIL)
+
+    def test_the_batched_pr_read_costs_one_point_per_pr(self) -> None:
+        """GitHub prices a query by the requests its connections need: each connection costs the product of the
+        first/last of the connections above it, the sum over 100 is the points. The suites' count of every attempt's
+        runs, a second connection under checkSuites(first: 100), was 100 more requests per PR: a batch of ten PRs cost
+        20 points (the daemon logged 1160 points over 58 PR queries on 2026-11-08). Without it the batch costs 10."""
+        keys = [f"pr:o/r#{n}" for n in range(10)]
+        query, _ = gg.pr_query(keys)
+        self.assertEqual(graphql_requests(gg.pr_query(keys[:1])[0]), 104)  # rules, commits, suites, latest x100, contexts
+        self.assertEqual(graphql_cost(query), 10)
+        old = query.replace("latest: checkRuns(first: 1) { totalCount }", "latest: checkRuns(first: 1) { totalCount } "
+                            "every: checkRuns(first: 1, filterBy: { checkType: ALL }) { totalCount }")
+        self.assertEqual(graphql_cost(old), 20)  # the query this replaced, for the record
+        # the batch's follow-up reads up to SUITE_RUNS_BATCH suites by id for one point
+        self.assertEqual(graphql_cost(gg.SUITE_RUNS, {"$suites": gg.SUITE_RUNS_BATCH}), 1)
 
     def test_the_recovery_query_is_paced_by_graphql_per_minute(self) -> None:
         # Review finding F2 on glaeda#1844: last_real_contexts sent its query without checking the per-minute ceiling,
