@@ -9144,7 +9144,7 @@ def cmd_post_status(post_id: str | None, wait: float, as_json: bool, queued: boo
 # CI failed (cmux #38625 and #38619 stopped on it). The build controller reads a finished job's log once with its own
 # App token (a quota apart from the user's), keeps it 72 h, and serves it on the tailnet (cmuxterm-hq
 # build-fleet/github-events/README.md, job-log and run-jobs). `log` lists the run's jobs there and prints the failed
-# ones' logs. Most failed jobs run on hosted runners (93% on Blacksmith on 2026-11-08), whose logs exist only at
+# ones' logs. Most failed jobs run on hosted runners (93% of them on 2026-11-08), whose logs exist only at
 # GitHub, so the controller reads every job's log the same way. A job it cannot serve is read over REST only with
 # --rest, and the cost is named first.
 

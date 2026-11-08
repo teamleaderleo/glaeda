@@ -93,7 +93,7 @@ glaeda-gh log o/r/RUN_ID --job 'swift tests'          # one job by name (exact, 
 
 - It costs no user quota: the build controller lists the run's jobs from its webhooks and reads each
   finished job's log once with its own App token, then keeps it 72 h for every session. Every runner
-  is covered alike (owned minis, Blacksmith, GitHub-hosted).
+  is covered alike, self-hosted and hosted.
 - Use it instead of `gh run view --log-failed` or `gh api .../actions/jobs/ID/logs`: those spend the shared
   REST quota, which is out most of every hour, and job logs have no GraphQL read.
 - When the controller cannot serve a job (a run finished over 6 h ago with no `--job`, a job over 8 days
