@@ -3494,7 +3494,14 @@ class ClientTest(Base):
         with mock.patch.dict(os.environ, {"AGENT_VERBOSE": ""}):
             terse = gg.summary("pr:o/r#1", {"data": data}, "required")
         self.assertNotIn("superseded: Web complexity", terse)
-        self.assertIn("  1 superseded, replaced by a newer attempt or run (not counted; --verbose lists them)", terse)
+        self.assertIn("  1 superseded, replaced by a newer attempt or run (not counted; --verbose lists up to 10)", terse)
+        # parse_pr keeps 20; past that the count says so instead of reading low
+        many = gg.parse_pr(pr_node(1, rollup="FAILURE", checks=[web(n, "CANCELLED") for n in range(1, 26)]
+                                   + [web(26, "SUCCESS"), {**check_run("build"), "isRequired": True}]))
+        self.assertEqual((len(many["superseded"]), many["supersededOmitted"]), (20, 5))
+        with mock.patch.dict(os.environ, {"AGENT_VERBOSE": ""}):
+            self.assertIn("  20+ superseded, replaced", gg.summary("pr:o/r#1", {"data": many}, "required"))
+        self.assertEqual(data["supersededOmitted"], 0)
         self.assertIn("cancelled: lint (not required)", terse)
         with mock.patch.dict(os.environ, {"AGENT_VERBOSE": "1"}):
             self.assertIn("superseded: Web complexity", gg.summary("pr:o/r#1", {"data": data}, "required"))

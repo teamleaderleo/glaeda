@@ -1349,7 +1349,9 @@ def parse_pr(node: dict) -> dict:
     # for check_verdict (the rollup still counts it) but is marked so status never names it: it has no
     # error to chase, whichever of the pair has the higher id
     superseded = [{**brief(c), "ranNothing": bool(c.get("completedAt") and c.get("startedAt") == c.get("completedAt"))}
-                  for c in superseded if (c.get("conclusion") or "").upper() not in PASSED][:20]
+                  for c in superseded if (c.get("conclusion") or "").upper() not in PASSED]
+    # the cache keeps 20; the count line says "20+" when more were dropped, so it never reads low
+    superseded_omitted, superseded = max(0, len(superseded) - 20), superseded[:20]
     base = node.get("baseRef") or {}
     required = set((base.get("branchProtectionRule") or {}).get("requiredStatusCheckContexts") or [])
     for rule in ((base.get("rules") or {}).get("nodes") or []):
@@ -1370,6 +1372,7 @@ def parse_pr(node: dict) -> dict:
         "headRefName": node.get("headRefName"),
         "reviewDecision": node.get("reviewDecision"), "updatedAt": node.get("updatedAt"),
         "checkState": rollup.get("state"), "checks": checks, "superseded": superseded,
+        "supersededOmitted": superseded_omitted,
         "checksTotal": contexts.get("totalCount", len(checks)),
         "checksTruncated": bool((contexts.get("pageInfo") or {}).get("hasNextPage")),
     }
@@ -4706,7 +4709,9 @@ def summary(key: str, entry: dict | None, until: str = "done", grace: float = RE
                          f"{optional}, "
                          "replaced by a newer attempt or run (not counted)")
         if replaced and not verbose:
-            lines.append(f"  {len(replaced)} superseded, replaced by a newer attempt or run (not counted; --verbose lists them)")
+            more = "+" if data.get("supersededOmitted") else ""
+            lines.append(f"  {len(replaced)}{more} superseded, replaced by a newer attempt or run "
+                         "(not counted; --verbose lists up to 10)")
         lines.append(str(data.get("url") or ""))
     elif kind == "comment":
         lines.append(f"{name} {str(data.get('type') or '').lower()} {data.get('state')}: "
@@ -9154,7 +9159,7 @@ def parser() -> argparse.ArgumentParser:
         s.add_argument("--jobs", action="store_true", help="runs: also track the job list")
         s.add_argument("--json", action="store_true")
         s.add_argument("--verbose", action="store_true",
-                       help="list every superseded attempt and up to 20 failed checks (as AGENT_VERBOSE=1); "
+                       help="list up to 10 superseded attempts and up to 20 failed checks (as AGENT_VERBOSE=1); "
                             "by default the summary counts the superseded ones and lists 10 failures")
         if name == "wait":
             s.add_argument("--until", choices=("green", "done", "required", "merged"), default="green",
