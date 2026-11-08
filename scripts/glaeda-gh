@@ -4628,7 +4628,23 @@ def outcome(conclusion: str | None) -> str:
     return "failed" if text in {"failure", "error", ""} else text
 
 
-def summary(key: str, entry: dict | None, until: str = "done", grace: float = RESCUE_GRACE) -> str:
+# What a text summary lists by default. Agents read it, so it names the checks that need action and counts the rest:
+# a superseded attempt is not counted toward the verdict, so it is one count line, not one line each (a green
+# cmux PR printed seven of them, half its summary). --verbose or AGENT_VERBOSE=1 lists them all, as before; --json
+# and --field never change.
+SUMMARY_FAILED = 10
+SUMMARY_FAILED_VERBOSE = 20
+
+
+def full_output() -> bool:
+    """True when the caller asked for every line (`--verbose`, or AGENT_VERBOSE=1 in its environment)."""
+    return os.environ.get("AGENT_VERBOSE") == "1"
+
+
+def summary(key: str, entry: dict | None, until: str = "done", grace: float = RESCUE_GRACE,
+            verbose: bool | None = None) -> str:
+    verbose = full_output() if verbose is None else verbose
+    shown_failed = SUMMARY_FAILED_VERBOSE if verbose else SUMMARY_FAILED
     kind, owner, repo, number = split_key(key)
     name = f"{owner}/{repo}{'/' if kind == 'run' else '#'}{number}"
     if not entry:
@@ -4668,24 +4684,29 @@ def summary(key: str, entry: dict | None, until: str = "done", grace: float = RE
         if data.get("requiredMissing"):
             why = " (merge conflicts: they run after the next push)" if data.get("mergeStateStatus") == "DIRTY" else ""
             lines.append(f"  required, not reported yet: {', '.join(data['requiredMissing'])}{why}")
-        bad = groups["failed"]
-        for c in bad[:20]:
+        # Required checks first, then real failures before cancelled ones: the capped list leads with what to fix.
+        bad = sorted(groups["failed"], key=lambda c: (marked and not c.get("required"),
+                                                      str(c.get("conclusion") or "").lower() == "cancelled"))
+        for c in bad[:shown_failed]:
             optional = " (not required)" if marked and not c.get("required") else ""
             lines.append(f"  {outcome(c.get('conclusion'))}: {label(c)}{steps_note(c)}{optional}  {c.get('url') or ''}".rstrip())
-        if len(bad) > 20:
-            lines.append(f"  ... {len(bad) - 20} more failed")
-        for c in groups["held"][:20]:
+        if len(bad) > shown_failed:
+            lines.append(f"  ... {len(bad) - shown_failed} more failed (--json lists them)")
+        for c in groups["held"][:shown_failed]:
             refused = any(refused_check(o) and o.get("runId") == c.get("runId") for o in checks)
             why = ("cancelled before any step ran" if cancelled_unstarted(c)
                    else "its run had a job refused at runner setup" if refused
                    else "its run was cancelled while a job was still queued")
             lines.append(f"  held: {label(c)}{steps_note(c)}: {why}; "
                          f"pending up to {int(grace)}s for the re-run  {c.get('url') or ''}".rstrip())
-        for c in [c for c in data.get("superseded") or [] if not c.get("ranNothing")][:10]:
+        replaced = [c for c in data.get("superseded") or [] if not c.get("ranNothing")]
+        for c in replaced[:10] if verbose else []:
             optional = " (not required)" if marked and not c.get("required") else ""
             lines.append(f"  superseded: {label(c)} {outcome(c.get('conclusion')) if c.get('conclusion') else 'pending'}"
                          f"{optional}, "
                          "replaced by a newer attempt or run (not counted)")
+        if replaced and not verbose:
+            lines.append(f"  {len(replaced)} superseded, replaced by a newer attempt or run (not counted; --verbose lists them)")
         lines.append(str(data.get("url") or ""))
     elif kind == "comment":
         lines.append(f"{name} {str(data.get('type') or '').lower()} {data.get('state')}: "
@@ -4705,7 +4726,7 @@ def summary(key: str, entry: dict | None, until: str = "done", grace: float = RE
             stale = (f" (from attempt {covered}; attempt {data.get('run_attempt')} not read yet)"
                      if 0 < covered < (data.get("run_attempt") or 1) else "")
             lines.append(f"jobs: {len(jobs)} total, {len(bad)} failed, {len(live)} not finished{stale}")
-            for j in bad[:20]:
+            for j in bad[:shown_failed]:
                 refused = f" (refused by {j.get('runner_name')})" if refused_job(j) else ""
                 lines.append(f"  {outcome(j.get('conclusion'))}: {j.get('name')}{steps_note(j)}{refused}  "
                              f"{j.get('html_url') or ''}".rstrip())
@@ -4722,10 +4743,10 @@ def summary(key: str, entry: dict | None, until: str = "done", grace: float = RE
 
 
 def render(key: str, entry: dict | None, as_json: bool, extra: dict | None = None, until: str = "done",
-           grace: float = RESCUE_GRACE) -> str:
+           grace: float = RESCUE_GRACE, verbose: bool | None = None) -> str:
     if as_json:
         return json.dumps({"key": key, **(entry or {}), **(extra or {})}, sort_keys=True) + "\n"
-    return "".join(f"{line}\n" for line in [summary(key, entry, until, grace)]
+    return "".join(f"{line}\n" for line in [summary(key, entry, until, grace, verbose)]
                    + [f"{k}: {v}" for k, v in (extra or {}).items()])
 
 
@@ -5026,7 +5047,7 @@ def wait_request(kind: str, target: str, until: str, timeout: float, jobs: bool,
     daemon rules on it (subscribe_wait). `began` is wall-clock time: only data fetched after it counts."""
     return {"key": parse_key(kind, target), "kind": kind, "target": target, "until": until, "timeout": timeout,
             "jobs": jobs, "json": as_json, "sha": sha, "exact": exact, "grace": grace, "settle": settle,
-            "began": time.time()}
+            "began": time.time(), "verbose": full_output()}
 
 
 def rest_run(data: dict | None) -> dict:
@@ -5085,7 +5106,7 @@ def wait_step(req: dict, now: float) -> tuple[int, str] | None:
     waited = int(max(0.0, now - began))
     if fresh and not entry.get("data") and entry.get("missing"):
         # GitHub says NOT_FOUND; transport errors and 5xx stay pending
-        return EXIT_FAIL, render(key, entry, as_json, {"result": "failure", "waited_s": waited}, until, grace)
+        return EXIT_FAIL, render(key, entry, as_json, {"result": "failure", "waited_s": waited}, until, grace, bool(req.get("verbose")))
     data = (entry or {}).get("data")
     # only a merge is final; a completed run can be rerun and a closed PR reopened
     final = kind == "pr" and data and data.get("state") == "MERGED"
@@ -5131,14 +5152,14 @@ def wait_step(req: dict, now: float) -> tuple[int, str] | None:
             extra["note"] = "PR was closed without being merged"
         if kind == "run" and result == EXIT_FAIL and grace > 0 and run_hold(data, entry.get("jobs"), time.time(), float("inf")):
             extra["note"] = f"a glaeda runner refused this attempt at setup and no rescue attempt followed within {int(grace)}s"
-        return result, render(key, entry, as_json, extra, until, grace)
+        return result, render(key, entry, as_json, extra, until, grace, bool(req.get("verbose")))
     if now - began >= req["timeout"]:
         extra = {"result": "timeout", "waited_s": waited}
         if sha and entry and entry.get("data"):
             head = entry["data"].get("headRefOid") or entry["data"].get("head_sha") or ""
             if not str(head).startswith(sha) and not (kind == "run" and run_tests_commit(entry["data"], f"{owner}/{repo}", sha)):
                 extra["note"] = f"GitHub still shows head {str(head)[:10]}, not {sha[:10]}"
-        return EXIT_TIMEOUT, render(key, entry, as_json, extra, until, grace)
+        return EXIT_TIMEOUT, render(key, entry, as_json, extra, until, grace, bool(req.get("verbose")))
     return None
 
 
@@ -9130,6 +9151,9 @@ def parser() -> argparse.ArgumentParser:
             s.add_argument("target", help="OWNER/REPO#N, OWNER/REPO/RUN_ID, or a GitHub URL")
         s.add_argument("--jobs", action="store_true", help="runs: also track the job list")
         s.add_argument("--json", action="store_true")
+        s.add_argument("--verbose", action="store_true",
+                       help="list every superseded attempt and up to 20 failed checks (as AGENT_VERBOSE=1); "
+                            "by default the summary counts the superseded ones and lists 10 failures")
         if name == "wait":
             s.add_argument("--until", choices=("green", "done", "required", "merged"), default="green",
                            help="PRs: green (every check passes; fail fast), done (every check finished), "
@@ -9219,6 +9243,8 @@ def main(argv: list[str] | None = None) -> int:
         except KeyboardInterrupt:
             return 130
     args = parser().parse_args(argv)
+    if getattr(args, "verbose", False):
+        os.environ["AGENT_VERBOSE"] = "1"  # summary() and wait_request() read it, here and in the daemon's request
     try:
         if args.command == "serve":
             if not args.foreground_ok and not under_service() and service_loaded():

@@ -76,6 +76,44 @@ def check_run(name: str, status: str = "COMPLETED", conclusion: str | None = "SU
             "detailsUrl": f"https://ci/{name}"}
 
 
+class AgentSummaryTest(unittest.TestCase):
+    """The text summary is read by agents: it lists what needs action and counts the rest (--verbose lists all)."""
+
+    def test_failed_checks_are_capped_at_ten_unless_verbose(self):
+        data = gg.parse_pr(pr_node(1, rollup="FAILURE",
+                                   checks=[check_run(f"job{i:02d}", conclusion="FAILURE") for i in range(15)]))
+        with mock.patch.dict(os.environ, {"AGENT_VERBOSE": ""}):
+            terse = gg.summary("pr:o/r#1", {"data": data})
+        self.assertEqual(terse.count("  failed: "), gg.SUMMARY_FAILED)
+        self.assertIn("  ... 5 more failed (--json lists them)", terse)
+        full = gg.summary("pr:o/r#1", {"data": data}, verbose=True)
+        self.assertEqual(full.count("  failed: "), 15)
+        self.assertNotIn("more failed", full)
+
+    def test_the_capped_list_leads_with_required_then_real_failures(self):
+        checks = ([check_run(f"cancel{i:02d}", conclusion="CANCELLED") for i in range(12)]
+                  + [check_run("lint", conclusion="FAILURE"), {**check_run("build", conclusion="FAILURE"), "isRequired": True}])
+        data = gg.parse_pr(pr_node(1, rollup="FAILURE", checks=checks))
+        listed = [line for line in gg.summary("pr:o/r#1", {"data": data}, verbose=False).splitlines()
+                  if line.startswith(("  failed: ", "  cancelled: "))]
+        self.assertTrue(listed[0].startswith("  failed: build"), listed[0])
+        self.assertTrue(listed[1].startswith("  failed: lint (not required)"), listed[1])
+        self.assertEqual(len(listed), gg.SUMMARY_FAILED)
+
+    def test_the_wait_request_carries_verbose_to_the_daemon(self):
+        with mock.patch.dict(os.environ, {"AGENT_VERBOSE": "1"}):
+            self.assertTrue(gg.wait_request("run", "o/r/1", "done", 5, False, False, None, True, 0)["verbose"])
+        with mock.patch.dict(os.environ, {"AGENT_VERBOSE": ""}):
+            self.assertFalse(gg.wait_request("run", "o/r/1", "done", 5, False, False, None, True, 0)["verbose"])
+
+    def test_verbose_flag_sets_agent_verbose(self):
+        with mock.patch.dict(os.environ, {"AGENT_VERBOSE": ""}), \
+                mock.patch.object(gg, "cmd_status", return_value=0) as status:
+            gg.main(["status", "pr", "o/r#1", "--verbose"])
+            self.assertEqual(os.environ["AGENT_VERBOSE"], "1")
+        status.assert_called_once()
+
+
 def iso(epoch: float) -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(epoch))
 
@@ -3011,7 +3049,7 @@ class ClientTest(Base):
             self.assertIsNone(gg.check_verdict({**data, "checkState": "FAILURE", "checksTruncated": True}, "done"))
             self.assertIsNone(gg.check_verdict({**data, "checkState": "FAILURE", "checksTruncated": True}, "green"))
         # A pending check that is superseded reads as pending, never as failed.
-        line = gg.summary("pr:o/r#1", {"data": {**data, "superseded": [gg.brief(data["checks"][0])]}})
+        line = gg.summary("pr:o/r#1", {"data": {**data, "superseded": [gg.brief(data["checks"][0])]}}, verbose=True)
         self.assertIn(f"superseded: cmux-next / {name} pending", line)
         # The head reading picks the running job over the skipped twin too.
         self.assertEqual(gg.newest_verdict([(121636522702, "queued", ""), (121636524434, "completed", "skipped")]),
@@ -3438,10 +3476,18 @@ class ClientTest(Base):
         node["mergeStateStatus"] = "CLEAN"
         data = gg.parse_pr(node)
         self.assertEqual(gg.verdict("pr", data, "required"), 0)
-        text = gg.summary("pr:o/r#1", {"data": data}, "required")
+        text = gg.summary("pr:o/r#1", {"data": data}, "required", verbose=True)
         self.assertIn("checks SUCCESS: 2 passed, 1 failed, 0 pending (of 3, 2 required); GitHub's rollup says FAILURE", text)
         self.assertIn("cancelled: lint (not required)", text)
         self.assertIn("superseded: Web complexity / Web complexity cancelled, replaced by a newer attempt or run", text)
+        # By default (an agent's read) the superseded attempts are one count line, not one line each.
+        with mock.patch.dict(os.environ, {"AGENT_VERBOSE": ""}):
+            terse = gg.summary("pr:o/r#1", {"data": data}, "required")
+        self.assertNotIn("superseded: Web complexity", terse)
+        self.assertIn("  1 superseded, replaced by a newer attempt or run (not counted; --verbose lists them)", terse)
+        self.assertIn("cancelled: lint (not required)", terse)
+        with mock.patch.dict(os.environ, {"AGENT_VERBOSE": "1"}):
+            self.assertIn("superseded: Web complexity", gg.summary("pr:o/r#1", {"data": data}, "required"))
         self.assertNotIn("checks FAILURE", text)
         # the cancelled optional lint fails every other mode, and the headline says so
         self.assertEqual(gg.verdict("pr", data, "done"), 1)
