@@ -4720,7 +4720,9 @@ def summary(key: str, entry: dict | None, until: str = "done", grace: float = RE
                      f"  attempt {data.get('run_attempt')}  {data.get('head_branch')} {str(data.get('head_sha') or '')[:10]}")
         jobs = entry.get("jobs")
         if jobs is not None:
-            bad = [j for j in jobs if j.get("conclusion") not in (None, *RUN_OK)]
+            # Real failures before cancelled jobs: the capped list leads with what to fix.
+            bad = sorted((j for j in jobs if j.get("conclusion") not in (None, *RUN_OK)),
+                         key=lambda j: str(j.get("conclusion") or "").lower() == "cancelled")
             live = [j for j in jobs if j.get("status") != "completed"]
             covered = jobs_attempt(jobs)
             stale = (f" (from attempt {covered}; attempt {data.get('run_attempt')} not read yet)"

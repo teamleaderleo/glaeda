@@ -100,6 +100,16 @@ class AgentSummaryTest(unittest.TestCase):
         self.assertTrue(listed[1].startswith("  failed: lint (not required)"), listed[1])
         self.assertEqual(len(listed), gg.SUMMARY_FAILED)
 
+    def test_a_run_lists_its_real_failure_before_cancelled_jobs(self):
+        jobs = ([{"name": f"cancel{i:02d}", "status": "completed", "conclusion": "cancelled"} for i in range(10)]
+                + [{"name": "build", "status": "completed", "conclusion": "failure"}])
+        data = {"name": "CI", "status": "completed", "conclusion": "failure", "run_attempt": 1,
+                "head_branch": "b", "head_sha": "a" * 40, "html_url": "https://x"}
+        text = gg.summary("run:o/r/1", {"data": data, "jobs": jobs}, verbose=False)
+        listed = [line for line in text.splitlines() if line.startswith(("  failed: ", "  cancelled: "))]
+        self.assertTrue(listed[0].startswith("  failed: build"), listed[0])
+        self.assertEqual(len(listed), gg.SUMMARY_FAILED)
+
     def test_the_wait_request_carries_verbose_to_the_daemon(self):
         with mock.patch.dict(os.environ, {"AGENT_VERBOSE": "1"}):
             self.assertTrue(gg.wait_request("run", "o/r/1", "done", 5, False, False, None, True, 0)["verbose"])
