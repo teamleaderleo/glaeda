@@ -11718,5 +11718,94 @@ class QuietWritesTest(Base):
         self.assertLess(gg.SERVED_QUIET + gg.TICK, gg.WAITS_CHECK / 2)
 
 
+class LogTest(Base):
+    """`log`: the failed jobs' logs from the build controller, REST only with --rest and its cost named."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        import http.server
+        self.asked: list[str] = []
+        logs = {"7": "2026-11-08T12:00:00Z ##[group]Run tests\n2026-11-08T12:00:09Z ##[error]Process completed with exit code 1.\n"}
+        jobs = {"known": True, "jobs": [
+            {"id": 7, "name": "unit", "conclusion": "failure", "status": "completed"},
+            {"id": 8, "name": "lint", "conclusion": "success", "status": "completed"},
+            {"id": 9, "name": "ui tests", "conclusion": "timed_out", "status": "completed"}]}
+        asked = self.asked
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *args: Any) -> None:
+                pass
+
+            def do_GET(self) -> None:
+                asked.append(self.path)
+                if self.path.startswith("/v1/github/run-jobs?repo=o/r&run=42"):
+                    code, body = 200, json.dumps(jobs)
+                elif self.path.startswith("/v1/github/run-jobs"):
+                    code, body = 200, json.dumps({"known": False, "jobs": []})
+                elif self.path.startswith("/v1/github/job-log?repo=o/r&id="):
+                    job = self.path.rsplit("=", 1)[1]
+                    code, body = (200, logs[job]) if job in logs else (429, "log read budget spent; try later")
+                else:
+                    code, body = 404, "404 page not found"
+                data = body.encode()
+                self.send_response(code)
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.addCleanup(self.server.server_close)
+        self.addCleanup(self.server.shutdown)
+        ctl = gg.Controller(f"http://127.0.0.1:{self.server.server_address[1]}", None)
+        patch = mock.patch.object(gg.Controller, "from_env", return_value=ctl)
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def run_log(self, *argv: str) -> tuple[int, str, str]:
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = gg.main(["log", *argv])
+        return code, out.getvalue(), err.getvalue()
+
+    def test_prints_the_failed_jobs_and_never_spends_rest_unasked(self) -> None:
+        with mock.patch.object(gg, "rest_text", side_effect=AssertionError("REST without --rest")):
+            code, out, err = self.run_log("o/r/42")
+        self.assertEqual(code, gg.EXIT_FAIL)  # job 9 has no copy
+        self.assertIn("== unit (job 7, failure, from the build controller) ==", out)
+        self.assertIn("##[error]Process completed with exit code 1.", out)
+        self.assertNotIn("lint", out + err)
+        self.assertIn("ui tests (job 9, timed_out) no fleet copy", err)
+        self.assertIn("--rest reads it over REST: 1 call of the shared 5000/h", err)
+
+    def test_rest_reads_only_what_the_controller_could_not_serve(self) -> None:
+        with mock.patch.object(gg, "rest_text", return_value=(True, "rest log line\n")) as rest:
+            code, out, _ = self.run_log("https://github.com/o/r/actions/runs/42", "--rest", "--tail", "1")
+        self.assertEqual(code, gg.EXIT_OK)
+        rest.assert_called_once_with(["repos/o/r/actions/jobs/9/logs"])
+        self.assertIn("exit code 1.", out)
+        self.assertNotIn("##[group]Run tests", out)  # --tail 1
+        self.assertIn("== ui tests (job 9, timed_out, from REST) ==", out)
+
+    def test_a_job_url_or_id_needs_no_job_list(self) -> None:
+        code, out, _ = self.run_log("https://github.com/o/r/actions/runs/42/job/7", "--json")
+        self.assertEqual(code, gg.EXIT_OK)
+        doc = json.loads(out)
+        self.assertEqual([j["id"] for j in doc["jobs"]], [7])
+        self.assertEqual(doc["jobs"][0]["source"], "controller")
+        self.assertFalse(any(p.startswith("/v1/github/run-jobs") for p in self.asked))
+        code, out, _ = self.run_log("o/r/42", "--job", "unit")
+        self.assertEqual(code, gg.EXIT_OK)
+        self.assertIn("== unit (job 7", out)
+
+    def test_an_unknown_run_names_the_way_on(self) -> None:
+        with mock.patch.object(gg, "rest_text", side_effect=AssertionError("REST without --rest")):
+            code, _, err = self.run_log("o/r/43")
+        self.assertEqual(code, gg.EXIT_FAIL)
+        self.assertIn("holds no jobs of this run", err)
+        self.assertIn("Pass --job ID", err)
+        self.assertIn("--rest to list them over REST (1 call", err)
+
+
 if __name__ == "__main__":
     unittest.main()
