@@ -1343,6 +1343,141 @@ class FleetOps(unittest.TestCase):
                 self.assertEqual(re.findall(pattern, text), [], pattern)
 
 
+class Updater(unittest.TestCase):
+    """The fleet user's glaeda-update: re-enabled and bootstrapped once no reservation holds the host, never while
+    one does, and only from that user's own plist."""
+
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.home = Path(tmp.name)
+        self.uid = os.getuid()
+        self.account = mock.Mock(pw_uid=self.uid, pw_dir=os.fspath(self.home), pw_name="runner")
+        agents = self.home / "Library" / "LaunchAgents"
+        agents.mkdir(parents=True)
+        self.plist = agents / f"{heal.UPDATER_LABEL}.plist"
+        self.plist.write_bytes(plistlib.dumps({"Label": heal.UPDATER_LABEL, "ProgramArguments": ["/bin/true"]}))
+        self.disabled, self.loaded = True, False
+        self.fail: set[str] = set()
+        self.calls: list[tuple] = []
+        self.state: dict = {}
+
+    def ctl(self, *args: str):
+        self.calls.append(args)
+        if args[0] in self.fail:
+            return 5, f"{args[0]} failed"
+        if args[0] == "print-disabled":
+            return 0, ('disabled services = {\n\t\t"com.teamleaderleo.glaeda.wallpaper" => disabled\n'
+                       f'\t\t"{heal.UPDATER_LABEL}" => {"disabled" if self.disabled else "enabled"}\n}}\n')
+        if args[0] == "enable":
+            self.disabled = False
+        if args[0] == "print":
+            return (0, "") if self.loaded else (113, "Could not find service")
+        if args[0] == "bootstrap":
+            self.loaded = True
+        return 0, ""
+
+    def run_updater(self, hold: str = "", now: float = T0, apply: bool = True) -> dict:
+        return heal.updater_pass(now, apply, self.state, hold=lambda t: hold, user=lambda: self.account, ctl=self.ctl)
+
+    def mutations(self) -> list[tuple]:
+        return [c for c in self.calls if c[0] in ("enable", "bootstrap")]
+
+    def test_a_disabled_updater_with_no_reservation_is_enabled_and_bootstrapped(self) -> None:
+        out = self.run_updater()
+        target = f"gui/{self.uid}/{heal.UPDATER_LABEL}"
+        self.assertEqual(self.mutations(),
+                         [("enable", target), ("bootstrap", f"gui/{self.uid}", os.fspath(self.plist))])
+        self.assertTrue(out["enabled"] and out["bootstrapped"])
+        self.assertIn("re-enabled", out["line"])
+        self.assertEqual(self.state, {})
+        self.calls.clear()
+        self.assertEqual(self.run_updater(), {"state": "enabled"}, "the next pass changes nothing")
+        self.assertEqual(self.mutations(), [])
+
+    def test_never_while_a_reservation_holds(self) -> None:
+        for why in ("reserved until 2026-10-30T00:00:00Z",
+                    "fleet reservations unreadable (ValueError); held as reserved"):
+            with self.subTest(why=why):
+                out = self.run_updater(hold=why)
+                self.assertEqual(out["held"], why)
+                self.assertNotIn("line", out)
+                self.assertEqual(self.mutations(), [])
+                self.assertTrue(self.disabled)
+
+    def test_an_enabled_updater_is_left_alone_and_the_hold_not_read(self) -> None:
+        self.disabled = False
+        holds: list[float] = []
+        out = heal.updater_pass(T0, True, self.state, hold=lambda t: holds.append(t) or "", user=lambda: self.account,
+                                ctl=self.ctl)
+        self.assertEqual((out, holds, self.mutations()), ({"state": "enabled"}, [], []))
+
+    def test_an_already_loaded_agent_is_only_enabled(self) -> None:
+        self.loaded = True
+        out = self.run_updater()
+        self.assertEqual([c[0] for c in self.mutations()], ["enable"])
+        self.assertIn("already loaded", out["line"])
+
+    def test_a_failed_bootstrap_is_retried_after_the_backoff_until_it_loads(self) -> None:
+        self.fail = {"bootstrap"}
+        out = self.run_updater()
+        self.assertFalse(out["bootstrapped"])
+        self.assertTrue(self.state["updater"]["bootstrapPending"])
+        self.assertFalse(self.disabled, "the enable stands: launchd loads it at the next login anyway")
+        self.calls.clear()
+        self.assertIn("retryAt", self.run_updater(now=T0 + 60))
+        self.assertEqual(self.mutations(), [])
+        self.fail = set()
+        out = self.run_updater(now=T0 + heal.UPDATER_RETRY_S)
+        self.assertEqual([c[0] for c in self.mutations()], ["bootstrap"])
+        self.assertTrue(out["bootstrapped"])
+        self.assertEqual(self.state, {})
+
+    def test_a_failed_enable_is_reported_and_backed_off(self) -> None:
+        self.fail = {"enable"}
+        out = self.run_updater()
+        self.assertIn("launchctl enable", out["error"])
+        self.assertIn("line", out)
+        self.assertNotIn("bootstrap", [c[0] for c in self.calls])
+        self.calls.clear()
+        self.assertIn("retryAt", self.run_updater(now=T0 + 1))
+        self.assertEqual(self.mutations(), [])
+
+    def test_a_plan_pass_changes_nothing(self) -> None:
+        out = self.run_updater(apply=False)
+        self.assertEqual(out["would"], "enable and bootstrap")
+        self.assertEqual(self.mutations(), [])
+
+    def test_only_the_users_own_updater_plist(self) -> None:
+        other = self.home / "elsewhere.plist"
+        other.write_bytes(self.plist.read_bytes())
+        self.plist.unlink()
+        self.assertEqual(self.run_updater(), {"state": "not installed"})
+        self.plist.symlink_to(other)
+        self.assertEqual(self.run_updater()["state"], "left alone", "a symlink is not the user's plist")
+        self.plist.unlink()
+        self.plist.write_bytes(plistlib.dumps({"Label": "com.example.other"}))
+        self.assertEqual(self.run_updater()["state"], "left alone", "another Label")
+        self.plist.write_bytes(b"not a plist")
+        self.assertEqual(self.run_updater()["state"], "left alone")
+        self.assertEqual(self.mutations(), [])
+
+    def test_print_disabled_is_read_like_the_runner(self) -> None:
+        listing = f'\t"{heal.UPDATER_LABEL}.extra" => disabled\n\t"{heal.UPDATER_LABEL}" => enabled\n'
+        self.assertFalse(heal.label_disabled(listing, heal.UPDATER_LABEL))
+        self.assertTrue(heal.label_disabled(f'"{heal.UPDATER_LABEL}" => true', heal.UPDATER_LABEL))
+        self.assertFalse(heal.label_disabled("", heal.UPDATER_LABEL))
+
+    def test_run_pass_reports_it_and_keeps_its_state(self) -> None:
+        self.fail = {"bootstrap"}
+        with tempfile.TemporaryDirectory() as d:
+            updater = {"hold": lambda t: "", "user": lambda: self.account, "ctl": self.ctl}
+            report = heal.run_pass(POLICY_PATH, Path(d) / "state", True, FakeHost(), updater=updater)
+            self.assertFalse(report["updater"]["bootstrapped"])
+            saved = json.loads((Path(d) / "state" / "state.json").read_text())
+            self.assertTrue(saved["updater"]["bootstrapPending"], "state.json carries the backoff")
+
+
 class Judge(unittest.TestCase):
     def report(self, **release) -> dict:
         rel = {"tag": "r-1", "wants": "r-1", "okAt": heal.iso(T0), "behindSince": None, "error": None,

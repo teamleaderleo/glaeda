@@ -51,6 +51,10 @@ this snapshot; for every account that already has a job, that glaeda-runner-hygi
 and plist with what its --apply leaves, and a stale job is reinstalled by its --apply. A second pass finds them
 current and changes nothing. The report's runnerHygiene says per account: current, stale (with why), or error;
 glaeda-mini-health turns a stale or failed one into disk_root_copy_stale.
+The same pass keeps the fleet user's glaeda-update LaunchAgent running (updater_pass): when launchd has it
+disabled and no fleet or host-local reservation holds the host (fleet_ops_hold, failing closed), it enables it and
+bootstraps it into that user's gui domain, with one line in the log. A host whose updater stayed disabled after a
+reservation ended otherwise stays on its old release for good, since that release is what the updater would change.
 The same pass keeps sandboxd answering (policy `sandbox_probe`). Homebrew pours every bottle under sandbox-exec, and a
 sandboxd whose approval queue waits forever on one tccd request hangs every sandboxed process that touches a denied
 mach service: brew sat 8 h in "Pouring" on austin-0 and austin-1 (2026-10-27; sample: 64 sandboxd.approval threads
@@ -1446,6 +1450,113 @@ def fleet_ops_pass(ops_path: Path, now: float, apply: bool, ops_dir: Path = FLEE
     return out
 
 
+# ---------------------------------------------------------------- the fleet user's OTA updater
+
+UPDATER_LABEL = "com.teamleaderleo.glaeda.update"  # glaeda-update LABEL (glaeda-mini-setup LABEL_PREFIX + "update")
+UPDATER_RETRY_S = 900  # a failed enable or bootstrap is tried again this long after, not every pass
+
+
+def launchctl_full(*args: str) -> tuple[int, str]:
+    """launchctl with its whole answer on success: print-disabled lists every label, and launchctl() keeps only the
+    last 200 characters."""
+    code, out, err = sh(["/bin/launchctl", *args], timeout=20)
+    return code, out if code == 0 else (err or out).strip()[-200:]
+
+
+def label_disabled(listing: str, label: str) -> bool:
+    """Whether a `launchctl print-disabled` listing has label disabled (glaeda-cmux-runner launchctl_disabled)."""
+    found = re.search(r'"' + re.escape(label) + r'"\s*=>\s*(\w+)', listing)
+    return bool(found) and found.group(1) in {"disabled", "true"}
+
+
+def fleet_user(fleet_root: Path = FLEET_ROOT) -> pwd.struct_passwd:
+    """The account glaeda-update runs as: the owner of the fleet root, as fleet_ops_hold reads it."""
+    return pwd.getpwuid(os.stat(fleet_root).st_uid)
+
+
+def updater_pass(now: float, apply: bool, state: dict[str, Any], hold=fleet_ops_hold, user=fleet_user,
+                 ctl=None) -> dict[str, Any]:
+    """Re-enable the fleet user's glaeda-update LaunchAgent when launchd has it disabled and no reservation holds
+    this host, then bootstrap it into gui/<uid>.
+
+    A disabled updater freezes the host on whatever release it last installed, hook included, and nothing in the
+    user's own release can undo that (the updater is how that release would change). A mini sat on an old runner
+    hook for two weeks that way: its updater was disabled during a perf reservation and left disabled after the
+    reservation ended. glaeda's reservation writers disable nothing, so the heal does not
+    depend on who disabled it: while fleet_ops_hold finds a reservation (or cannot read the list: fails closed), the
+    updater stays as it is; once none holds, a disabled updater is enabled. Root acts only on the fleet user's own
+    plist (a regular file of that user with the updater's Label) and loads it into that user's gui domain, where
+    launchd runs it as that user, so nothing here runs as root. state["updater"] keeps a failed attempt, retried
+    every UPDATER_RETRY_S; a bootstrap that failed (no GUI session yet) is retried until launchd lists the agent."""
+    ctl = ctl or launchctl_full
+    try:
+        account = user()
+    except (OSError, KeyError) as e:
+        return {"state": "no fleet user", "why": type(e).__name__}
+    uid, home = account.pw_uid, Path(account.pw_dir)
+    plist = home / "Library" / "LaunchAgents" / f"{UPDATER_LABEL}.plist"
+    try:
+        info = os.lstat(plist)
+    except FileNotFoundError:
+        return {"state": "not installed"}
+    except OSError as e:
+        return {"state": "unknown", "error": f"{plist}: {type(e).__name__}"}
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != uid:
+        return {"state": "left alone", "why": f"{plist} is not a regular file of {account.pw_name}"}
+    try:
+        label = plistlib.loads(read_small(plist)).get("Label")
+    except Exception as e:  # noqa: BLE001 (any unreadable or unparsable plist is one to leave alone)
+        return {"state": "left alone", "why": f"{plist} does not parse ({type(e).__name__})"}
+    if label != UPDATER_LABEL:
+        return {"state": "left alone", "why": f"{plist} has Label {label!r}"}
+    code, listing = ctl("print-disabled", f"gui/{uid}")
+    if code != 0:
+        return {"state": "unknown", "error": f"launchctl print-disabled gui/{uid}: {listing}"}
+    disabled = label_disabled(listing, UPDATER_LABEL)
+    mine = state.get("updater") if isinstance(state.get("updater"), dict) else {}
+    pending = bool(mine.get("bootstrapPending"))
+    if not disabled and not pending:
+        state.pop("updater", None)
+        return {"state": "enabled"}
+    out: dict[str, Any] = {"state": "disabled" if disabled else "enabled, not loaded"}
+    why = hold(now)
+    if why:
+        out["held"] = why
+        return out
+    tried = mine.get("tried")
+    if isinstance(tried, (int, float)) and 0 <= now - tried < UPDATER_RETRY_S:
+        out["retryAt"] = iso(tried + UPDATER_RETRY_S)
+        return out
+    if not apply:
+        out["would"] = "enable and bootstrap" if disabled else "bootstrap"
+        return out
+    target = f"gui/{uid}/{UPDATER_LABEL}"
+    if disabled:
+        code, said = ctl("enable", target)
+        if code != 0:
+            state["updater"] = {"tried": now}
+            out.update(error=f"launchctl enable {target}: {said}",
+                       line=f"{target} is disabled with no reservation on this host; launchctl enable failed: {said}")
+            return out
+        out["enabled"] = True
+    if ctl("print", target)[0] == 0:
+        state.pop("updater", None)
+        out["bootstrapped"] = False  # already loaded
+    else:
+        code, said = ctl("bootstrap", f"gui/{uid}", os.fspath(plist))
+        if code != 0:
+            state["updater"] = {"bootstrapPending": True, "tried": now}
+            out["error"] = f"launchctl bootstrap gui/{uid}: {said}"
+        else:
+            state.pop("updater", None)
+        out["bootstrapped"] = code == 0
+    out["line"] = (f"{target}: " + ("re-enabled (disabled with no reservation on this host)" if disabled else
+                                    "enabled but not loaded")
+                   + ("; bootstrapped" if out["bootstrapped"] else "; already loaded" if "error" not in out
+                      else f"; {out['error']}, retried in {UPDATER_RETRY_S} s"))
+    return out
+
+
 # ---------------------------------------------------------------- runner accounts' root-pinned glaeda-disk
 
 
@@ -1552,7 +1663,8 @@ def hygiene_pass(install_dir: Path, state: dict[str, Any], now: float, live: boo
 
 def run_pass(policy_path: Path, state_dir: Path, apply: bool, host: Host | None = None,
              install_dir: Path | None = None, fleet_ops: dict[str, Any] | None = None,
-             hygiene: dict[str, Any] | None = None, **release: Any) -> dict[str, Any]:
+             hygiene: dict[str, Any] | None = None, updater: dict[str, Any] | None = None,
+             **release: Any) -> dict[str, Any]:
     """One pass. The installed root copy (or a test's install_dir) also keeps itself on the release."""
     policy = load_policy(policy_path)
     state = load_json(state_dir / "state.json")
@@ -1563,7 +1675,7 @@ def run_pass(policy_path: Path, state_dir: Path, apply: bool, host: Host | None 
     root = os.geteuid() == 0
     if install_dir is None and root and Path(__file__).resolve() == (INSTALL_DIR / SCRIPT_NAME).resolve():
         install_dir = INSTALL_DIR
-    for key in ("release", "reload_at", "runner_hygiene"):
+    for key in ("release", "reload_at", "runner_hygiene", "updater"):
         if key in state:
             new_state[key] = state[key]
     if apply and install_dir is not None:
@@ -1599,6 +1711,12 @@ def run_pass(policy_path: Path, state_dir: Path, apply: bool, host: Host | None 
                                                    **{"live": root_live, **(hygiene or {})})
         except (HealError, OSError, ValueError) as e:  # never at the cost of this pass's report
             report["runnerHygiene"] = {"error": str(e)[:300], "accounts": {}}
+    # The fleet user's glaeda-update, re-enabled once no reservation holds the host (a test passes updater).
+    if apply and (root_live or updater is not None):
+        try:
+            report["updater"] = updater_pass(report_time(report), True, new_state, **(updater or {}))
+        except (HealError, OSError, ValueError) as e:  # never at the cost of this pass's report
+            report["updater"] = {"error": str(e)[:300]}
     report["staleAfterS"] = policy["report_stale_passes"] * policy["every_s"]
     report["follows"] = RING  # stage_check: a release whose code says so keeps itself current once installed
     if "release" in new_state:
@@ -1657,6 +1775,9 @@ def main(argv: list[str] | None = None) -> int:
             if args.apply:
                 if out["actions"]:
                     print(json.dumps({"at": out["at"], "actions": out["actions"]}, separators=(",", ":")), flush=True)
+                if (out.get("updater") or {}).get("line"):
+                    print(json.dumps({"at": out["at"], "updater": out["updater"]["line"]}, separators=(",", ":")),
+                          flush=True)
                 return 0
     except (HealError, OSError, ValueError) as e:
         print(json.dumps({"schema": SCHEMA, "error": str(e)}), file=sys.stderr)
