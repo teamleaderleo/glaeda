@@ -464,6 +464,17 @@ class BootstrapProblem(unittest.TestCase):
     def test_eligible_output_is_no_problem(self) -> None:
         self.assertIsNone(me.bootstrap_problem(0, json.dumps({"eligibleForEnrollment": True}), ""))
 
+    def test_a_host_under_the_disk_floor_enrolls_with_a_warning(self) -> None:
+        doc = json.dumps({"eligibleForEnrollment": True, "blockingChecks": [], "warningChecks": ["diskAdmission"]})
+        self.assertIsNone(me.bootstrap_problem(0, doc, ""))
+        warnings = me.bootstrap_warnings(doc)
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("diskAdmission", warnings[0])
+        self.assertIn("glaeda-disk", warnings[0])
+        self.assertIn("never refuses", warnings[0])
+        self.assertEqual(me.bootstrap_warnings(json.dumps({"eligibleForEnrollment": True})), [])
+        self.assertEqual(me.bootstrap_warnings("not json"), [])
+
     def test_blocking_checks_come_with_their_fixes(self) -> None:
         doc = {"eligibleForEnrollment": False, "blockingChecks": ["metalToolchain", "workloadToolPath"],
                "observed": {"toolsMissingFromWorkloadPath": ["cargo", "zig"]}}

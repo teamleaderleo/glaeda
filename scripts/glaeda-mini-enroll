@@ -376,6 +376,8 @@ class Runner:
         problem = bootstrap_problem(result.returncode, result.stdout, result.stderr)
         if problem:
             raise Stop(problem)
+        for line in bootstrap_warnings(result.stdout):
+            print(line, file=sys.stderr, flush=True)
         path = self.paths.fleet / "bootstrap.json"
         self.write_private(path, result.stdout)
         return path
@@ -485,6 +487,16 @@ def glaeda_digest(path: Path) -> str | None:
     except OSError:
         return None
     return "sha256:" + digest.hexdigest()
+
+
+def bootstrap_warnings(stdout: str) -> list[str]:
+    """A warning line for each check the bootstrap lists in warningChecks (the disk floors): they never stop
+    enrollment (a disk floor warns, never refuses); glaeda-disk's pressure pass frees space once jobs run."""
+    doc = read_json_text(stdout)
+    checks = doc.get("warningChecks") if isinstance(doc, dict) else None
+    return [f"warning: {check}: {fleet_bootstrap.BLOCKING_FIXES.get(check, 'see docs/CMUX_FLEET_ENROLLMENT.md')}"
+            f" (enrolling anyway: a disk floor warns, never refuses)"
+            for check in (checks if isinstance(checks, list) else []) if isinstance(check, str)]
 
 
 def bootstrap_problem(code: int, stdout: str, stderr: str) -> str | None:
