@@ -2018,7 +2018,8 @@ class BalanceTest(Base):
         self.daemon.tick(NOW + gg.TERMINAL_REFRESH + gg.CYCLE)
         missing = gg.read_cache("run:o/r/404")
         self.assertIn("no workflow run", missing["error"])
-        self.assertFalse(missing.get("missing"))  # as REST's 404: an error, not a verdict
+        # never shown by any read: missing (wait's not-found), as REST's 404 for such a run now is
+        self.assertTrue(missing.get("missing"))
 
     def test_prs_over_rest_when_graphql_is_poorer_read_the_same(self) -> None:
         checks = [workflow_check("build", 11), workflow_check("test", 11, conclusion="FAILURE"),
