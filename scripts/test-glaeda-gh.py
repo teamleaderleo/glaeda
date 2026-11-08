@@ -6444,6 +6444,48 @@ class WaitSubscriptionTest(Base):
         self.assertIn("every cycle since", err)
         self.assertEqual(list(gg.waits_dir().glob(f"{rid}*")), [])
 
+    def test_the_blocker_leaves_no_progress_writer_behind_on_a_full_stderr(self) -> None:
+        """A reader that is alive but never reads: the progress printf blocks on the full pipe. Once the
+        wait hands back, that writer is gone, so repeated waits do not pile up blocked children."""
+        rid = gg.write_wait_request("pr", "o/r#1", "green", 60, False, False, None, True, gg.RESCUE_GRACE, os.getpid())
+        d = gg.waits_dir()
+        reader, writer = os.pipe()
+        os.set_blocking(writer, False)
+        with contextlib.suppress(BlockingIOError):
+            while True:
+                os.write(writer, b"x" * 4096)
+        os.set_blocking(writer, True)
+        stop = threading.Event()
+
+        def ticks() -> None:
+            while not stop.wait(0.2):
+                (d / ".served").touch()
+        ticker = threading.Thread(target=ticks)
+        ticker.start()
+        env = dict(os.environ, GLAEDA_WAIT_PROGRESS="1", GLAEDA_WAIT_KEY="pr:o/r#1", GLAEDA_WAIT_TIMEOUT="60",
+                   GLAEDA_WAIT_DEADLINE="00:00:00Z")
+        children = "import os, subprocess; print(subprocess.run(['pgrep', '-P', str(os.getpid())], capture_output=True, text=True).stdout.strip() or 'none')"
+        try:
+            done = subprocess.run([gg.BASH, "-c", gg.BLOCKER, "glaeda-gh-wait", os.fspath(d / f"{rid}.fifo"),
+                                   os.fspath(d / f"{rid}.out"), "4", os.fspath(d / ".served"), "2",
+                                   sys.executable, "-c", children],
+                                  stdout=subprocess.PIPE, stderr=writer, text=True, timeout=30, env=env)
+        finally:
+            stop.set()
+            ticker.join()
+            os.close(writer)
+            os.close(reader)
+        self.assertEqual((done.returncode, done.stdout), (0, "none\n"))
+
+    def test_a_resumed_json_wait_that_is_refused_prints_its_object(self) -> None:
+        rid = gg.write_wait_request("run", "o/r/1", "green", 60, False, True, "a" * 40, True, gg.RESCUE_GRACE, os.getpid())
+        with mock.patch.object(gg, "serving_waits", return_value=False), \
+                mock.patch.object(gg, "poll_wait", side_effect=gg.WatchError("--sha does not match run o/r/1")):
+            code, out, err = self.resume(rid)
+        self.assertEqual(code, 64)
+        assert_json_refusal(self, out, "refused")
+        self.assertEqual(err.strip().splitlines()[-1], "next: glaeda-gh wait --help")
+
     def test_resume_at_the_deadline_times_out_as_the_polling_wait_does(self) -> None:
         rid = gg.write_wait_request("pr", "o/r#1", "green", 0, False, False, None, True, gg.RESCUE_GRACE, os.getpid())
         code, out, _ = self.resume(rid)

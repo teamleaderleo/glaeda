@@ -5403,7 +5403,8 @@ BASH = "/bin/bash"
 # Every GLAEDA_WAIT_PROGRESS seconds (env, set by block) it says how the wait stands on fd 2, from the
 # one line the daemon keeps in $out.state (serve_wait), in progress_line's words. The printf runs in the
 # background with SIGPIPE ignored and fd 1 and 3 not held, and only one at a time: like say_waiting, a closed
-# or full stderr never stops or delays the wait.
+# or full stderr never stops or delays the wait. One still blocked on a full stderr when the wait ends is
+# killed, so repeated waits leave no writers behind.
 BLOCKER = r"""fifo=$1 out=$2 limit=$3 served=$4 check=$5
 shift 5
 trap '' PIPE
@@ -5431,6 +5432,7 @@ while :; do
     fi
   fi
 done
+[ -n "$sayer" ] && kill "$sayer" 2>/dev/null && wait "$sayer" 2>/dev/null
 exec 3<&-
 rm -f "$mark" "$out.state"
 case "$rc" in ''|*[!0-9]*) exec "$@" ;; esac
@@ -5637,13 +5639,19 @@ def resume_wait(rid: str) -> int:
     if not isinstance(req, dict) or not all(k in req for k in ("key", "kind", "began", "timeout", "until", "grace")):
         drop_wait(rid)
         say_waiting("glaeda-gh: this wait's request is gone; run the wait again")
+        say_waiting("next: glaeda-gh wait --help")
         return EXIT_DOWN
     left = float(req["began"]) + float(req["timeout"]) - time.time()
     if left > 0 and serving_waits():
         register(req["key"], bool(req.get("jobs")), waited=True)
         block(rid, left, req)
     drop_wait(rid)
-    return poll_wait(req)
+    try:
+        return poll_wait(req)
+    except WatchError as error:
+        if req.get("json"):  # main's wait-resume handler says it on fd 2; the saved request knows --json
+            print_json_error("refused", str(error), "glaeda-gh wait --help")
+        raise
 
 
 def waiter_alive(pid: Any) -> bool:
