@@ -3920,6 +3920,10 @@ def hq_cache_family(root: Path | None = None) -> Family:
 CMUX_DEBUG_APP_PREFIX = "com.cmuxterm.app.debug."  # a tagged DEV build's bundle id, never a release app's
 
 
+PERSONAL_BUILD_FAMILY = "personal-build"
+PERSONAL_BUILDS = ("cmux-personal-build",)  # ~/Projects/<name>: someone's own build tree, kept and named
+
+
 def default_families(role: str = "fleet-mini") -> list[Family]:
     tmp = Path("/private/tmp") if DARWIN else Path("/tmp")
     tmpfs = tmp.is_dir() and fs_type(tmp) == "tmpfs"
@@ -4028,8 +4032,11 @@ def default_families(role: str = "fleet-mini") -> list[Family]:
             for app in ("cmux-next", "cmux")]),
         Family("simulators", HOME / "Library/Developer/CoreSimulator", False,
                "use `xcrun simctl delete unavailable` (report only)", platform="macos"),
+        # Kept, with an owner, so the accounting names it rather than leaving it in the gap (cmux16, 2026-11-08).
+        Family(PERSONAL_BUILD_FAMILY, projects, False, "report only: not glaeda's to reclaim",
+               include=PERSONAL_BUILDS, owner="a person's own cmux build checkout (not ours)", platform="shared"),
         Family("projects", projects, False, "checkouts (report only)",
-               skip=tuple(r.name for r in wt_roots), platform="shared"),
+               skip=(*(r.name for r in wt_roots), *PERSONAL_BUILDS), platform="shared"),
     ]
     cmux_next_ci = HOME / "Library/Caches" / CMUX_NEXT_CI_ROOT
     if DARWIN and cmux_next_ci.is_dir():
@@ -6547,7 +6554,7 @@ def work_tree_changes(root: Path, trees: set[str]) -> tuple[str, bytes, list[tup
     changes as a binary patch against HEAD, its untracked files that are neither ignored nor build output (a
     directory named in REPRODUCIBLE_DIRS or tagged with a CACHEDIR.TAG) as (path relative to root, path, sha256)).
     An untracked checkout is skipped only when it is one of trees (bundled and archived on its own)."""
-    g = root / ".git"
+    g = tree_git_dir(root)
     flags = _git_dir_run(g, "--work-tree", str(root), "ls-files", "-v")
     if _git_dir_run(g, "rev-parse", "-q", "--verify", "HEAD^{commit}") is None:  # unborn: no patch base
         status = _git_dir_run(g, "--work-tree", str(root), "status", "--porcelain", "--untracked-files=all")
@@ -6904,8 +6911,10 @@ def bundle_unpushed(gitdir: Path, key: str, written: list[Path], relied: list[st
 def _ignored_checkouts(root: Path) -> list[Path] | None:
     """Checkouts inside a checkout's ignored directories (vendor/ in .gitignore), as ignored_checkout_loss
     finds them; build-output directories are skipped as there. None when they cannot all be found."""
+    g = tree_git_dir(root)
+    explicit = ["--git-dir", str(g), "--work-tree", str(root)] if g != root / ".git" else []
     try:
-        r = subprocess.run(["git", "-C", str(root), "status", "--porcelain", "-z", "--ignored=matching",
+        r = subprocess.run(["git", "-C", str(root), *explicit, "status", "--porcelain", "-z", "--ignored=matching",
                             "--untracked-files=normal"], capture_output=True, text=True, timeout=60,
                            env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"})
     except (OSError, subprocess.TimeoutExpired):
@@ -6961,6 +6970,48 @@ def mirror_tips(root: Path, gitdirs: dict[str, Path], unreadable: list[str] | No
         tips[os.path.relpath(g, root)] = (t, "\n".join(
             ln for ln in refs.splitlines() if not ln.startswith(("refs/remotes/", ARCHIVE_REF))))
     return tips
+
+
+GITFILE_MOVES: list[tuple[str, str]] = []  # (old prefix/, renamed prefix/) while a renamed-aside tree is read again
+
+
+@contextlib.contextmanager
+def renamed_gitfiles(path: Path, doomed: Path):
+    """While a renamed-aside tree is read again: a linked worktree's .git file, and its repository's record of
+    it, name the item's old absolute path; tree_git_dir and moved_git_path read them at the new one. Nothing on
+    disk changes."""
+    moves = [(p.rstrip("/") + "/", os.fspath(doomed) + "/")
+             for p in dict.fromkeys((os.fspath(path), os.path.realpath(path)))]
+    GITFILE_MOVES[:0] = moves
+    try:
+        yield
+    finally:
+        del GITFILE_MOVES[:len(moves)]
+
+
+def moved_git_path(p: str) -> str:
+    """p at its renamed-aside path while renamed_gitfiles is in effect; else p."""
+    for old, new in GITFILE_MOVES:
+        if p.startswith(old):
+            return new + p[len(old):]
+    return p
+
+
+def tree_git_dir(root: Path) -> Path:
+    """The git dir to hand git for this work tree: root/.git, except a linked worktree's while renamed_gitfiles
+    is in effect and its .git file names a git dir under the item's old path."""
+    dotgit = root / ".git"
+    if not GITFILE_MOVES or dotgit.is_symlink() or not dotgit.is_file():
+        return dotgit
+    try:
+        text = dotgit.read_text()
+    except (OSError, ValueError):
+        return dotgit
+    if not text.startswith("gitdir:"):
+        return dotgit
+    named = text.split(":", 1)[1].strip()
+    moved = moved_git_path(named)
+    return Path(moved) if moved != named else dotgit
 
 
 ALTERNATES_WALK_BUDGET = 200_000  # entries looked at for alternates files below a renamed-aside tree
@@ -7022,7 +7073,7 @@ def mirror_rename_recheck(path: Path, recheck: tuple):
     marker.write_text(f"kept by glaeda-disk {os.getpid()} until its git work is checked again\n")  # raises: kept
 
     def check() -> None:
-        with renamed_alternates(path, doomed):
+        with renamed_alternates(path, doomed), renamed_gitfiles(path, doomed):
             checked()
 
     def checked() -> None:
@@ -7070,7 +7121,7 @@ def mirror_git_snapshot(gitdirs: list[Path], trees: list[Path]) -> list[str | No
                 snap.append(None if files is None else " ".join(f"{f}:{f.stat().st_size}" for f in sorted(files)))
             except OSError:
                 snap.append(None)  # unreadable: never matches, so the tree stays
-    snap += [_git_dir_run(t / ".git", "--work-tree", str(t), "status", "--porcelain", "--untracked-files=all")
+    snap += [_git_dir_run(tree_git_dir(t), "--work-tree", str(t), "status", "--porcelain", "--untracked-files=all")
              for t in trees]
     return snap
 
@@ -7121,8 +7172,8 @@ def mirror_repos(path: Path, external: dict[str, tuple[Path, list[str]]] | None 
         if (inner := _ignored_checkouts(root)) is None:
             return f"{where}: too deep or large to find every checkout in its ignored files", {}, []
         queue += inner
-        own = _git_dir_run(dotgit, "rev-parse", "--absolute-git-dir")
-        links = _git_dir_run(dotgit, "--work-tree", str(root), "ls-files", "-s")
+        own = _git_dir_run(tree_git_dir(root), "rev-parse", "--absolute-git-dir")
+        links = _git_dir_run(tree_git_dir(root), "--work-tree", str(root), "ls-files", "-s")
         if own is None or links is None:
             return f"{where}: unreadable git dir or index", {}, []
         # initialized submodules, embedded (.git a directory) or stored in modules/ (.git a file), and theirs
@@ -7163,11 +7214,18 @@ def mirror_repos(path: Path, external: dict[str, tuple[Path, list[str]]] | None 
                 dirnames[:] = ["modules"] if "modules" in dirnames else []
     if [u for u in unreadable if os.path.lexists(u)]:  # a missing modules/ is no submodule store
         return f"unreadable submodule store {unreadable[0]}", {}, []
+    found = {os.path.realpath(t) for t in trees}
     for key, g in gitdirs.items():
         if (linked := _linked_trees_strict(g)) is None:
             return f"{key}: unreadable linked worktree records", {}, []
-        if linked:  # the records name absolute paths, so after the rename its worktrees can't be checked again
-            return f"{key}: has linked worktrees ({', '.join(map(os.fspath, linked[:3]))}); kept", {}, []
+        # A worktree this scan found inside the item goes with it, its uncommitted work archived like any tree
+        # (cmux16 ~/lane-host-mguard: hq with hq-base and hq-skip beside it, kept on every pass, 2026-11-08).
+        # One elsewhere, or a record whose tree is gone, would lose its repository: kept. The records name
+        # absolute paths; after the rename aside, renamed_gitfiles reads them at the new path.
+        outside = [w for w in linked if os.path.realpath(moved_git_path(os.fspath(w))) not in found]
+        if outside:
+            return (f"{key}: has linked worktrees outside it or missing "
+                    f"({', '.join(map(os.fspath, outside[:3]))}); kept"), {}, []
     return "", gitdirs, sorted(trees)
 
 
@@ -7464,8 +7522,10 @@ def git_common_dir(path: Path) -> str:
     """The repository of a linked worktree, so its record can be pruned after deletion."""
     if not (path / ".git").is_file():
         return ""
+    g = tree_git_dir(path)
+    explicit = ["--git-dir", str(g)] if g != path / ".git" else []
     try:
-        r = subprocess.run(["git", "-C", str(path), "rev-parse", "--path-format=absolute",
+        r = subprocess.run(["git", "-C", str(path), *explicit, "rev-parse", "--path-format=absolute",
                             "--git-common-dir"], capture_output=True, text=True, timeout=60)
     except (OSError, subprocess.TimeoutExpired):
         return ""  # callers treat an unknown repository as one to keep
@@ -8759,6 +8819,114 @@ def apfs_container_capacity(mount: str, now: float | None = None) -> dict[str, A
     return dict(entry)
 
 
+_APFS_VOLUMES_MEM: dict[str, tuple[float, list[dict[str, Any]] | None]] = {}
+APFS_VOLUME_OWNERS = {  # the container's other volumes: macOS's own, never glaeda's to reclaim
+    "System": "macOS (the sealed system volume)", "Preboot": "macOS (boot support, cryptexes)",
+    "Recovery": "macOS (recovery)", "VM": "macOS (swap and sleep image)", "Update": "macOS (staged updates)",
+}
+APFS_VOLUMES_SCOPE = "apfs-volumes"
+
+
+def apfs_sibling_volumes(mount: str, now: float | None = None) -> list[dict[str, Any]] | None:
+    """The other volumes in the APFS container that holds mount, each {"role", "name", "bytes", "owner"}: their
+    blocks are in the container's used space (total - free) that no walk of the Data volume can see, so the
+    accounting names them instead of leaving them in the gap (cmux16, 2026-11-08: System 12.7G, Preboot 10.4G,
+    VM 7.0G and Recovery 1.8G were 32G of a 71.8G "apfs-invisible" gap). The mount's own volume (Data, or the
+    System snapshot's Data sibling) is left out. One `diskutil apfs list -plist` (0.1 s), cached as the
+    container reading is; None when it cannot be read or off macOS."""
+    if not DARWIN:
+        return None
+    now = time.time() if now is None else now
+    cached = _APFS_VOLUMES_MEM.get(mount)
+    if cached is not None and now - cached[0] < ACCOUNTING_MAX_AGE_S:
+        return cached[1]
+    got: list[dict[str, Any]] | None = None
+    try:
+        info = plistlib.loads(subprocess.run(["/usr/sbin/diskutil", "info", "-plist", mount], capture_output=True,
+                                             timeout=15, check=True).stdout)
+        listed = plistlib.loads(subprocess.run(["/usr/sbin/diskutil", "apfs", "list", "-plist"],
+                                               capture_output=True, timeout=15, check=True).stdout)
+        container = str(info["APFSContainerReference"])
+        for c in listed.get("Containers", []):
+            if c.get("ContainerReference") != container:
+                continue
+            vols = c.get("Volumes", [])
+            got = []
+            for v in vols:
+                roles = [str(r) for r in v.get("Roles", [])]
+                if "Data" in roles:
+                    continue  # the volume the walks measure
+                role = roles[0] if roles else "other"
+                size = int(v.get("CapacityInUse", 0))
+                if size >= 64 * 1024 * 1024:  # an empty Update or xART volume names nothing
+                    got.append({"role": role, "name": str(v.get("Name", "")), "bytes": size,
+                                "owner": APFS_VOLUME_OWNERS.get(role, "macOS or an app (no role)")})
+            if not any("Data" in [str(r) for r in v.get("Roles", [])] for v in vols):
+                got = None  # not the boot container: nothing here is the walked Data volume's sibling
+            break
+    except (OSError, ValueError, TypeError, KeyError, AttributeError, plistlib.InvalidFileException,
+            subprocess.SubprocessError):
+        got = None
+    if got is not None:
+        got.sort(key=lambda v: -v["bytes"])
+    _APFS_VOLUMES_MEM[mount] = (now, got)
+    return got
+
+
+SIM_RUNTIME_IMAGES = "/System/Library/AssetsV2/com_apple_MobileAsset_iOSSimulatorRuntime/*/AssetData/Restore/*.dmg"
+SIM_RUNTIME_SCOPE = "kept-system"
+SIM_RUNTIME_OWNER = "Xcode's installed iOS simulator runtime (sim jobs mount it; never reclaimed)"
+
+
+def sim_runtime_row(now: float) -> dict[str, Any] | None:
+    """The installed iOS simulator runtimes' disk images, as a kept coverage row with its owner. They are
+    MobileAsset files owned by _nsurlsessiond, so no family (which lists only this account's files) can hold
+    them; they sit inside the census's /System/Volumes/Data/System row, so the row is named, never added to
+    measured. A glob and a stat per image; None when there are none."""
+    total = 0
+    for image in glob.glob(SIM_RUNTIME_IMAGES):
+        try:
+            total += os.lstat(image).st_blocks * 512
+        except OSError:
+            continue
+    if not total:
+        return None
+    return {"scope": SIM_RUNTIME_SCOPE, "complete": True, "at": now, "platform": "macos",
+            "children": [{"category": "keep:ios-simulator-runtime", "bytes": total, "private": False,
+                          "classification": "keep", "owner": SIM_RUNTIME_OWNER}]}
+
+
+# Whom a census row belongs to, by path prefix (after census_canon), so a row is reported as kept with an owner
+# rather than as unclassified. Report only: nothing here makes a path reclaimable or protects it.
+CENSUS_OWNERS: tuple[tuple[str, str], ...] = (
+    ("/System/Volumes/Data/System/Library/AssetsV2", "macOS MobileAssets, the iOS simulator runtime among them "
+                                                     "(sim jobs need it; never reclaimed)"),
+    ("/System/Volumes/Data/System", "macOS assets, the iOS simulator runtime among them (never reclaimed)"),
+    ("/Library/Developer/CoreSimulator", "the installed iOS simulator runtimes (sim jobs need them; never reclaimed)"),
+    ("/Library/Developer", "Xcode command line tools and simulator support (never reclaimed)"),
+    ("/Library", "macOS and installed apps' system-wide data (never reclaimed)"),
+    ("/Applications", "installed apps (Xcode among them; never reclaimed)"),
+    ("/opt", "Homebrew and system packages (never reclaimed)"),
+    ("/private/var/db", "macOS (never reclaimed)"),
+    ("/private/var/folders", "per-user temporary and cache dirs (other accounts' are root-only)"),
+    (str(HOME / ".acpmux"), "acpmux sessions (acpmux_store_reclaim)"),
+    (str(HOME / ".codex"), "Codex CLI state"),
+    (str(HOME / ".claude"), "Claude Code state"),
+    (str(HOME / "Applications"), "user-installed apps"),
+    (str(HOME / ".rustup"), "rustup toolchains (home-caches reclaims stale ones)"),
+    (str(HOME / ".local"), "installed tools (glaeda's bin among them)"),
+)
+
+
+def census_owner(path: str) -> str:
+    """The owner CENSUS_OWNERS names for this path (the longest matching prefix), or ""."""
+    best, hit = "", ""
+    for prefix, owner in CENSUS_OWNERS:
+        if (path == prefix or path.startswith(prefix.rstrip("/") + "/")) and len(prefix) > len(best):
+            best, hit = prefix, owner
+    return hit
+
+
 def accounting_coverage(dev: int, now: float) -> list[dict[str, Any]]:
     """Collect bounded, report-only Data-volume categories for the operator view.
 
@@ -9193,6 +9361,20 @@ def census_catalogue(census: dict[str, Any] | None) -> list[tuple[Path, int, str
     return out
 
 
+def census_unreadable_named(census: dict[str, Any], shown: int = 3) -> str:
+    """The largest unreadable census rows, as "; largest: <path> >=N.NG (owner), ..." ("" when none): what the
+    gap sits under, since du's figure for a root-only tree is only what it could read."""
+    rows = sorted(((int(row[0]), key) for key, row in census["rows"].items()
+                   if isinstance(row, list) and len(row) > 1 and row[1] == "unreadable"
+                   and isinstance(row[0], int) and row[0] > 0), reverse=True)[:shown]
+    named = []
+    for size, key in rows:
+        label = _census_label(key, "unreadable").split(":", 1)[1]
+        owner = census_owner(label)
+        named.append(f"{label} >={size / GIB:.1f}G" + (f" ({owner})" if owner else ""))
+    return "; largest: " + ", ".join(named) if named else ""
+
+
 def census_coverage_row(census: dict[str, Any]) -> dict[str, Any]:
     merged: dict[str, list[Any]] = {}
     for key, row in census["rows"].items():
@@ -9201,7 +9383,9 @@ def census_coverage_row(census: dict[str, Any]) -> dict[str, Any]:
         hit[0] += int(row[0])
     ranked = sorted(merged.items(), key=lambda kv: -kv[1][0])
     children = [{"category": label, "bytes": size, "private": label.endswith(":private-user-data"),
-                 "classification": kind} for label, (size, kind) in ranked[:CENSUS_ROWS_SHOWN]
+                 "classification": kind,
+                 **({"owner": owner} if (owner := census_owner(label.split(":", 1)[1])) else {})}
+                for label, (size, kind) in ranked[:CENSUS_ROWS_SHOWN]
                 if size or kind != "unclassified"]  # an unreadable or skipped tree stays named at 0 bytes
     rest = sum(size for _, (size, _) in ranked[CENSUS_ROWS_SHOWN:])
     if rest:
@@ -9413,7 +9597,8 @@ def filesystem_accounting(fss: list[Fs], items: list[Item],
                 sized_rows.append((Path(census_canon(row["path"])), row["bytes"], "sized"))
         sized_rows.extend(census_catalogue(census))
         outermost = top_level_catalogued(sorted(sized_rows, key=lambda row: (len(row[0].parts), str(row[0]))))
-        measured = sum(size for _, size, _ in outermost)
+        volumes = None if RUNNER_CACHE_PROFILE else apfs_sibling_volumes(fs.mount, now)
+        measured = sum(size for _, size, _ in outermost) + sum(v["bytes"] for v in volumes or [])
         shared = Path("/Users/Shared")
         measured_shared = (math.inf if any(path in shared.parents for path, _, _ in outermost) else
                            sum(size for path, size, _ in outermost if path == shared or shared in path.parents))
@@ -9439,23 +9624,32 @@ def filesystem_accounting(fss: list[Fs], items: list[Item],
             coverage = accounting_coverage(fs.dev, now)
             coverage_at = now if coverage else 0.0
         _ACCOUNTING_COVERAGE_MEM[(fs.dev, fs.mount)] = (coverage_at, coverage)
-        coverage = [row for row in coverage if row.get("scope") != CENSUS_SCOPE]
+        coverage = [row for row in coverage
+                    if row.get("scope") not in (CENSUS_SCOPE, APFS_VOLUMES_SCOPE, SIM_RUNTIME_SCOPE)]
         unclassified = max(0, used - measured)
         # The shared-runner coverage rows have no paths: subtract only what they hold beyond the sized
         # paths already measured inside /Users/Shared, or the same bytes would leave the gap twice.
         known_coverage = min(unclassified, int(max(0, reconciled_known_coverage(coverage) - measured_shared)))
         if census is not None:
             coverage = [*coverage, census_coverage_row(census)]
+        if DARWIN and not RUNNER_CACHE_PROFILE and (sim := sim_runtime_row(now)):
+            coverage = [*coverage, sim]
+        if volumes:
+            coverage = [*coverage, {"scope": APFS_VOLUMES_SCOPE, "complete": True, "at": now, "platform": "macos",
+                                    "children": [{"category": f"volume:{v['role']} ({v['name']})", "bytes": v["bytes"],
+                                                  "private": False, "classification": "keep", "owner": v["owner"]}
+                                                 for v in volumes]}]
         if census is not None and census["complete"]:
             # The census already sized the shared tree by path, so the path-less coverage rows add nothing.
             gap = unclassified
             unreadable = sum(1 for row in census["rows"].values() if row[1] in ("unreadable", "skipped"))
             residual = APFS_INVISIBLE + (f" and {unreadable} unreadable or skipped dirs (lower bounds)"
-                                         if unreadable else "")
+                                         if unreadable else "") + census_unreadable_named(census)
         else:
             gap = max(0, unclassified - known_coverage)
             residual = "unwalked (volume census in progress)" if census else "unwalked (no volume census yet)"
         entry = {"dev": fs.dev, "mount": fs.mount, "used": used, "measured": measured,
+                 **({"apfs_volumes": volumes} if volumes is not None else {}),
                  "unmeasured": unclassified, "unclassified": unclassified,
                  "known_coverage": known_coverage,
                  "accounting_gap": gap,
@@ -9784,7 +9978,8 @@ def report(items: list[Item], fss: list[Fs], limit: int, idle_hours: float,
             for child in coverage.get("children", []):
                 category = child.get("category", "unknown")
                 private = " private" if child.get("private") else ""
-                print(f"    {gib(int(child.get('bytes', 0))).strip()}  {category}{private}")
+                owner = f"  keep, owner: {child['owner']}" if child.get("owner") else ""
+                print(f"    {gib(int(child.get('bytes', 0))).strip()}  {category}{private}{owner}")
     by_fam: dict[str, int] = {}
     for i in items:
         by_fam[i.family] = by_fam.get(i.family, 0) + i.bytes
@@ -9824,6 +10019,20 @@ def notify_disk(title: str, body: str) -> None:
                        env={"PATH": "/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin", "LC_ALL": "C"})
     except (OSError, subprocess.SubprocessError):
         pass
+
+def gap_named(accounting: list[dict[str, Any]]) -> str:
+    """" (...)" naming where the used space outside the walked directories is: the container's other APFS
+    volumes (attributed, so outside the gap) and what the gap sits under; "" when there is nothing to name."""
+    parts = []
+    volumes = [v for a in accounting for v in a.get("apfs_volumes") or []]
+    if volumes:
+        parts.append("outside it, APFS volumes " + ", ".join(f"{v['role']} {v['bytes'] / GIB:.1f}G" for v in volumes))
+    residual = next((a["residual"]["category"] for a in accounting if int(a.get("accounting_gap", 0)) > 0
+                     and isinstance(a.get("residual"), dict)), "")
+    if residual:
+        parts.append(residual)
+    return f" ({'; '.join(parts)})" if parts else ""
+
 
 def write_eviction_summary(receipt: Path, operation: str, logical_released: int,
                             before_fs: list[dict[str, Any]], after_fs: list[dict[str, Any]],
@@ -12298,7 +12507,8 @@ def _main_impl(argv: list[str] | None = None) -> int:
         print(f"eviction summary: logical released {logical_released} bytes ({gib(logical_released).strip()}); "
               f"physical df delta {physical_text}; blocked {gib(summary['blocked_bytes']).strip()} "
               f"(unchecked {gib(summary['unchecked_bytes']).strip()}); "
-              f"accounting gap {gib(summary['accounting_gap_bytes']).strip()}; receipt {a.receipt}")
+              f"accounting gap {gib(summary['accounting_gap_bytes']).strip()}{gap_named(after_accounting)}; "
+              f"receipt {a.receipt}")
         release_evict_lock(_EVICT_HANDLE)
         if maintenance_handle is not None:
             fcntl.flock(maintenance_handle, fcntl.LOCK_UN)

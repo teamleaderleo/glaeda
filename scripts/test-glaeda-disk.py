@@ -7616,6 +7616,88 @@ class VolumeCensusTest(unittest.TestCase):
         self.assertIn(f"unreadable:{locked}", [c["category"] for c in row["children"]])
         self.assertIn("unreadable", got["residual"]["category"])
 
+    def test_sibling_apfs_volumes_are_attributed_and_the_gap_names_what_it_sits_under(self) -> None:
+        """cmux16, 2026-11-08: a 71.8G gap called "apfs-invisible" held 32G of the container's System, Preboot, VM
+        and Recovery volumes, and named none of the root-only trees the rest sits under."""
+        locked = self.root / "locked"
+        locked.mkdir()
+        census = {"complete": True, "at": 1.0, "rows": {
+            "/System/Volumes/Data/System": [3 * gd.GIB, "unreadable", False],
+            str(locked): [gd.GIB, "unreadable", False],
+            str(self.root / "gone"): [5 * gd.GIB, "unclassified", True]}}  # no longer on disk: not counted
+        volumes = [{"role": "System", "name": "Macintosh HD", "bytes": 12 * gd.GIB, "owner": "macOS"},
+                   {"role": "VM", "name": "VM", "bytes": 7 * gd.GIB, "owner": "macOS"}]
+        with mock.patch.object(gd, "census_for", return_value=census), \
+                mock.patch.object(gd, "census_catalogue", return_value=[(locked, gd.GIB, "census")]), \
+                mock.patch.object(gd, "apfs_sibling_volumes", return_value=volumes):
+            got = gd.filesystem_accounting([self.fs(30 * gd.GIB)], [])[0]
+        self.assertEqual(got["measured"], 20 * gd.GIB)  # 1G walked + 19G of sibling volumes
+        self.assertEqual(got["accounting_gap"], 10 * gd.GIB)
+        self.assertEqual(got["apfs_volumes"], volumes)
+        self.assertTrue(got["residual"]["category"].startswith(gd.APFS_INVISIBLE))  # mini-health keys on it
+        self.assertIn("largest: /System/Volumes/Data/System >=3.0G (macOS assets, the iOS simulator runtime",
+                      got["residual"]["category"])
+        row = next(r for r in got["coverage"] if r["scope"] == gd.APFS_VOLUMES_SCOPE)
+        self.assertEqual([(c["category"], c["owner"]) for c in row["children"]],
+                         [("volume:System (Macintosh HD)", "macOS"), ("volume:VM (VM)", "macOS")])
+        named = gd.gap_named([got])
+        self.assertIn("APFS volumes System 12.0G, VM 7.0G", named)
+        self.assertIn("largest: /System/Volumes/Data/System", named)
+        self.assertEqual(gd.gap_named([{"accounting_gap": 0}]), "")
+
+    def test_apfs_sibling_volumes_reads_the_boot_container_once(self) -> None:
+        gd.DARWIN = True
+        gd._APFS_VOLUMES_MEM.clear()
+        self.addCleanup(gd._APFS_VOLUMES_MEM.clear)
+        info = plistlib.dumps({"APFSContainerReference": "disk3"})
+        listed = plistlib.dumps({"Containers": [
+            {"ContainerReference": "disk5", "Volumes": [{"Roles": [], "Name": "Cryptex", "CapacityInUse": 2 * gd.GIB}]},
+            {"ContainerReference": "disk3", "Volumes": [
+                {"Roles": ["System"], "Name": "Macintosh HD", "CapacityInUse": 12 * gd.GIB},
+                {"Roles": ["Data"], "Name": "Data", "CapacityInUse": 170 * gd.GIB},
+                {"Roles": ["Preboot"], "Name": "Preboot", "CapacityInUse": 10 * gd.GIB},
+                {"Roles": ["Update"], "Name": "Update", "CapacityInUse": 0}]}]})
+        outs = [subprocess.CompletedProcess([], 0, info, b""), subprocess.CompletedProcess([], 0, listed, b"")]
+        with mock.patch.object(gd.subprocess, "run", side_effect=outs) as run:
+            got = gd.apfs_sibling_volumes("/", now=100.0)
+            again = gd.apfs_sibling_volumes("/", now=200.0)
+        self.assertEqual([(v["role"], v["bytes"]) for v in got], [("System", 12 * gd.GIB), ("Preboot", 10 * gd.GIB)])
+        self.assertEqual(got[0]["owner"], gd.APFS_VOLUME_OWNERS["System"])
+        self.assertIs(again, got)
+        self.assertEqual(run.call_count, 2)
+        gd._APFS_VOLUMES_MEM.clear()
+        with mock.patch.object(gd.subprocess, "run", side_effect=subprocess.CalledProcessError(1, "diskutil")):
+            self.assertIsNone(gd.apfs_sibling_volumes("/", now=300.0))
+        gd.DARWIN = False
+        self.assertIsNone(gd.apfs_sibling_volumes("/x", now=300.0))
+
+    def test_census_rows_name_an_owner_by_longest_prefix(self) -> None:
+        self.assertIn("simulator", gd.census_owner("/Library/Developer/CoreSimulator/Volumes/iOS_23F77"))
+        self.assertIn("Xcode command line", gd.census_owner("/Library/Developer/CommandLineTools"))
+        self.assertIn("installed apps", gd.census_owner("/Applications"))
+        self.assertEqual(gd.census_owner("/Applicationsx"), "")
+        self.assertEqual(gd.census_owner(str(gd.HOME / ".acpmux")), "acpmux sessions (acpmux_store_reclaim)")
+        census = {"complete": True, "at": 1.0, "rows": {"/opt": [gd.GIB, "unclassified", True]}}
+        child = gd.census_coverage_row(census)["children"][0]
+        self.assertEqual((child["category"], child["owner"]), ("unclassified:/opt", gd.census_owner("/opt")))
+
+    def test_the_simulator_runtime_and_personal_builds_are_kept_with_an_owner(self) -> None:
+        real = gd.Path.is_dir
+        with mock.patch.object(gd.Path, "is_dir", lambda p: p == gd.HOME / "Projects" or real(p)):
+            fams = {f.id: f for f in gd.default_families()}
+        personal = fams[gd.PERSONAL_BUILD_FAMILY]
+        self.assertFalse(personal.reclaimable)
+        self.assertTrue(personal.owner)
+        self.assertEqual(personal.include, ("cmux-personal-build",))
+        self.assertIn("cmux-personal-build", fams["projects"].skip)  # listed once, under its own family
+        image = self.write("AssetsV2/rt/AssetData/Restore/runtime.dmg", 16384)
+        with mock.patch.object(gd, "SIM_RUNTIME_IMAGES", str(self.root / "AssetsV2/*/AssetData/Restore/*.dmg")):
+            row = gd.sim_runtime_row(1.0)
+            self.assertEqual(row["children"][0]["bytes"], image.stat().st_blocks * 512)
+            self.assertEqual(row["children"][0]["owner"], gd.SIM_RUNTIME_OWNER)
+            image.unlink()
+            self.assertIsNone(gd.sim_runtime_row(1.0))
+
     def test_paths_share_one_namespace_and_other_homes_stay_private(self) -> None:
         gd._CENSUS_FIRMLINK_MEM.clear()
         self.addCleanup(gd._CENSUS_FIRMLINK_MEM.clear)
@@ -8996,20 +9078,62 @@ class LinuxLayoutTest(unittest.TestCase):
         self.assertTrue(why)
         self.assertEqual(bundles, [])
 
-    def test_a_linked_worktree_inside_the_mirror_keeps_it_however_clean(self) -> None:
-        """Its record names an absolute path, so once the item is renamed the worktree cannot be checked again."""
+    def test_a_linked_worktree_inside_the_mirror_goes_with_it_after_the_rename_recheck(self) -> None:
+        """Its record names an absolute path; after the rename aside, renamed_gitfiles reads it at the new one, so
+        the worktree is checked again there instead of keeping the item forever."""
         unit, clone, env = self.mirror_unit()
         with (clone / ".git/info/exclude").open("a") as f:
-            f.write("target/\n")
-        wt = clone / "target/wt"
+            f.write("target/\nwts/\n")
+        built = clone / "target/wt"  # build output is not scanned for checkouts, so a worktree there keeps it
+        self.git(clone, "worktree", "add", "-q", "--detach", str(built), env=env)
+        self.assertIn("has linked worktrees outside it or missing", gd.mirror_repos(unit)[0])
+        self.git(clone, "worktree", "remove", "--force", str(built), env=env)
+        wt = clone / "wts/wt"
         self.git(clone, "worktree", "add", "-q", "--detach", str(wt), env=env)
         (wt / "edit.txt").write_text("uncommitted")
-        self.assertTrue(gd.archive_mirror(unit)[0])
-        (wt / "edit.txt").unlink()
-        self.assertIn("has linked worktrees", gd.archive_mirror(unit)[0])
+        self.assertEqual(gd.mirror_repos(unit)[0], "")
+        rec, err = self.apply_mirror(unit)
+        self.assertEqual(rec["outcome"], "reclaimed", (rec["reasons"], err))
+        self.assertFalse(unit.exists())
+
+    def test_sibling_worktrees_of_a_repository_inside_the_item_are_bundled_and_go(self) -> None:
+        """cmux16 ~/lane-host-mguard, 2026-11-08: hq with linked worktrees hq-base (detached) and hq-skip (a branch
+        the server lacks, uncommitted edits) beside it, all inside the item, was kept on every pass as
+        blocked:bundle-failed "has linked worktrees". Everything is archived, then the item goes."""
+        unit, clone, env = self.mirror_unit()
+        base, skip = unit / "hq-base", unit / "hq-skip"
+        self.git(clone, "worktree", "add", "-q", "--detach", str(base), env=env)
+        self.git(clone, "worktree", "add", "-q", "-b", "gate-skipped", str(skip), env=env)
+        self.git(skip, "commit", "-q", "--allow-empty", "-m", "only here", env=env)
+        lost = self.git(skip, "rev-parse", "HEAD")
+        (skip / "notes.txt").write_text("untracked work\n")
+        rec, err = self.apply_mirror(unit)
+        self.assertEqual(rec["outcome"], "reclaimed", (rec["reasons"], err))
+        self.assertFalse(unit.exists())
+        self.assertEqual(self.bundle_heads().get("refs/heads/gate-skipped"), lost)
+        self.assertTrue(list((self.home / "archive/glaeda-disk").glob("*.tar.gz")))
+
+    def test_a_worktree_outside_the_item_keeps_its_repository_inside_it(self) -> None:
+        """Deleting the repository would orphan a worktree elsewhere; a record whose tree is gone is kept too."""
+        unit, clone, env = self.mirror_unit()
+        outside = self.home / "elsewhere"
+        self.git(clone, "worktree", "add", "-q", "--detach", str(outside), env=env)
+        self.assertIn("has linked worktrees outside it", gd.mirror_repos(unit)[0])
         rec, _ = self.apply_mirror(unit)
         self.assertEqual(rec["outcome"], "blocked:bundle-failed")
-        self.assertTrue((wt / ".git").is_file())
+        self.assertTrue((outside / ".git").is_file())
+        shutil.rmtree(outside)  # a stale record: git worktree prune would drop it, but its HEAD is not judged here
+        self.assertIn("has linked worktrees outside it or missing", gd.mirror_repos(unit)[0])
+
+    def test_tree_git_dir_reads_a_moved_gitfile_only_while_renamed(self) -> None:
+        old, doomed = self.home / "item", self.home / "aside"
+        (doomed / "wt").mkdir(parents=True)
+        (doomed / "wt/.git").write_text(f"gitdir: {old}/repo/.git/worktrees/wt\n")
+        self.assertEqual(gd.tree_git_dir(doomed / "wt"), doomed / "wt/.git")
+        with gd.renamed_gitfiles(old, doomed):
+            self.assertEqual(gd.tree_git_dir(doomed / "wt"), doomed / "repo/.git/worktrees/wt")
+            self.assertEqual(gd.moved_git_path(f"{old}x/y"), f"{old}x/y")  # a sibling with a longer name
+        self.assertEqual(gd.GITFILE_MOVES, [])
 
     def test_a_symlinked_reflog_directory_keeps_the_mirror(self) -> None:
         unit, clone, _ = self.mirror_unit()
