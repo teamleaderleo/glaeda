@@ -3838,6 +3838,78 @@ class OverloadTest(Base):
             self.daemon.tick(NOW + cycle * gg.CYCLE)
         self.assertNotIn("pr:o/r#3", self.daemon.heavy)
 
+    def resource_limited(self, partial):
+        """Answer PR queries as GitHub does past its per-query resource limit: 200, with each PR `partial(prs)` names
+        missing a field (its check rollup, null) beside an error of type RESOURCE_LIMITS_EXCEEDED for it."""
+        sizes = []
+
+        def transport(method, url, headers, body):
+            status, h, out = self.gh(method, url, headers, body)
+            if url.endswith("/graphql"):
+                doc = json.loads(body)
+                if "pullRequest(number:" in doc["query"]:
+                    prs = [doc["variables"][f"n{i}"] for i in range(sum(k.startswith("n") for k in doc["variables"]))]
+                    sizes.append(len(prs))
+                    answer = json.loads(out)
+                    for i, n in enumerate(prs):
+                        if n in partial(prs):
+                            path = [f"p{i}", "pullRequest", "commits", "nodes", 0, "commit", "statusCheckRollup"]
+                            answer["data"][f"p{i}"]["pullRequest"]["commits"]["nodes"][0]["commit"][path[-1]] = None
+                            answer.setdefault("errors", []).append({
+                                "type": "RESOURCE_LIMITS_EXCEEDED", "path": path, "locations": [{"line": 1, "column": 2}],
+                                "message": "Resource limits for this query exceeded."})
+                    out = json.dumps(answer).encode()
+            return status, h, out
+        self.daemon.transport = transport
+        return sizes
+
+    def test_a_resource_limit_halves_the_batch_and_rereads_only_the_partial_prs(self) -> None:
+        """Measured 2026-11-08 on ten large cmux PRs read ten to a query: 5 of the 10 came back partial."""
+        keys = self.watch(10)
+        sizes = self.resource_limited(lambda prs: {2, 5, 7, 9} if len(prs) > 5 else set())
+        self.daemon.tick(NOW)
+        self.assertEqual(sizes, [10, 4])  # the four partial PRs again, in one query at the halved size; no others
+        self.assertEqual(self.daemon.batch["pr"], 5)
+        self.assertEqual(gg.read_json(gg.BASE / "daemon.json")["batch"]["pr"], 5)
+        for key in keys:
+            entry = gg.read_cache(key)
+            self.assertIsNotNone(entry["data"], key)
+            self.assertNotIn("checksPageError", entry["data"], key)  # every PR whole on this tick
+        sizes.clear()
+        self.daemon.tick(NOW + gg.CYCLE)
+        self.assertEqual(sizes, [5, 5])  # the next cycle reads at the smaller size: nothing partial, nothing re-read
+
+    def test_clean_batches_grow_the_batch_back(self) -> None:
+        self.watch(10)
+        limit = [5]
+        self.resource_limited(lambda prs: set(prs) if len(prs) > limit[0] else set())
+        self.daemon.tick(NOW)
+        self.assertEqual(self.daemon.batch["pr"], 5)
+        limit[0] = 100  # GitHub answers whole again
+        for cycle in range(1, 4):
+            for n in range(1, 11):
+                os.utime(gg.watch_dir() / gg.file_name(f"pr:o/r#{n}"), (NOW + cycle * gg.CYCLE,) * 2)
+            self.daemon.tick(NOW + cycle * gg.CYCLE)
+        self.assertEqual(self.daemon.batch["pr"], 6)  # one more after GQL_GROW_AFTER clean queries, not a jump
+        self.assertEqual(gg.read_json(gg.BASE / "daemon.json")["batch"]["pr"], 6)
+
+    def test_a_pr_partial_even_alone_is_stored_partial_and_not_reread_again(self) -> None:
+        keys = self.watch(4)
+        sizes = self.resource_limited(lambda prs: {3} & set(prs))
+        self.daemon.tick(NOW)
+        self.assertEqual(sizes, [4, 1])  # #3 once more, alone; then it waits for the next cycle
+        entry = gg.read_cache("pr:o/r#3")
+        self.assertIn("Resource limits for this query exceeded", entry["data"]["checksPageError"])  # pending, not green
+        for key in keys:
+            if key != "pr:o/r#3":
+                self.assertNotIn("checksPageError", gg.read_cache(key)["data"], key)
+        self.daemon.batch["pr"] = 1
+        sizes.clear()
+        self.daemon.tick(NOW + gg.CYCLE)
+        self.assertEqual(sizes, [1, 1, 1, 1])  # at the floor: one query a PR, #3 not read twice
+        self.assertEqual(self.daemon.batch["pr"], 1)
+        self.assertIn("Resource limits", gg.read_cache("pr:o/r#3")["data"]["checksPageError"])
+
     def test_a_pr_never_read_counts_in_the_oldest_data(self) -> None:
         self.watch(1)
         self.overloaded(poison=1)
