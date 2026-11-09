@@ -4282,6 +4282,51 @@ class TickBudgetTest(Base):
         self.daemon.now = NOW + gg.TICK
         self.assertFalse(self.daemon.wait_confirms(entry), "one read per wait: then it is an ordinary key")
 
+    def test_a_wait_held_on_a_confirmed_run_does_not_keep_it_first(self) -> None:
+        """Review of glaeda#1924: a wait held on a finished run (rescue grace) touches waitedAt every 30 s, so the run
+        needs confirming again after each successful read. Put first for every touch, two such runs took each tick's
+        one read (1, 2, 1, 2) and a healthy deferred wait timed out. Priority is once per finish and wait start."""
+        self.daemon.budget = {"rest": {"limit": 5000, "remaining": 4500, "reset": NOW + 1800},
+                              "graphql": {"limit": 5000, "remaining": 0, "reset": NOW + 1800}}
+        held = ("run:o/r/1", "run:o/r/2")
+        for n, key in enumerate(held, 1):
+            done = {"id": n, "status": "completed", "conclusion": "failure", "run_attempt": 1}
+            gg.write_json(gg.cache_dir() / gg.file_name(key), {
+                "key": key, "fetchedAt": NOW - 60, "dataAt": NOW - 60, "restAt": NOW - 60, "error": None,
+                "source": "rest", "data": done, "restRun": gg.rest_run(done), "restRunAt": NOW - 60})
+            with mock.patch.object(gg.time, "time", return_value=NOW):
+                gg.register(key, waited=True, began=NOW)
+        healthy = "run:o/r/3"
+        gg.write_json(gg.cache_dir() / gg.file_name(healthy), {"key": healthy, "fetchedAt": NOW - 2 * gg.CYCLE,
+                                                               "dataAt": NOW - 2 * gg.CYCLE, "error": None,
+                                                               "data": {"status": "in_progress"}})
+        gg.register(healthy, waited=True)
+        self.daemon.deferred.add(healthy)
+        self.daemon.deferred_since[healthy] = NOW - 60
+        order: list[str] = []
+
+        def read(e: dict) -> None:
+            if order and order[-1] == "cut":
+                order.pop()
+                raise gg.OutOfTime()  # one read a tick
+            order.extend([e["key"], "cut"])
+            data = (e["cache"] or {}).get("data")
+            self.daemon.store(e["key"], e["cache"], data=data, dataAt=self.daemon.now, restAt=self.daemon.now,
+                              restRun=gg.rest_run(data), restRunAt=self.daemon.now)  # confirmed: still failed
+
+        with mock.patch.object(self.daemon, "fetch_run", side_effect=read):
+            for t in range(4):
+                at = NOW + t * (gg.CYCLE + gg.TICK)
+                for key in (*held, healthy):  # the held waits keep touching
+                    with mock.patch.object(gg.time, "time", return_value=at):
+                        gg.register(key, waited=True)
+                    os.utime(gg.watch_dir() / gg.file_name(key), (at, at))
+                self.daemon.tick(at)
+                if order and order[-1] == "cut":
+                    order.pop()
+        self.assertEqual(sorted(order[:2]), list(held), "each held run gets its one read ahead")
+        self.assertEqual(order[2], healthy, "then the deferred run, not the held runs again")
+
     def test_a_failing_confirmation_is_put_first_once_not_every_cycle(self) -> None:
         """Review of glaeda#1924: a failed read keeps restRunAt, so the run still needs confirming. With absolute priority
         every time, two runs GitHub keeps refusing took each tick's one read (1, 2, 1, 2) once ticks outlasted the retry

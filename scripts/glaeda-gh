@@ -2550,18 +2550,16 @@ class Daemon:
     def wait_confirms(self, e: dict) -> bool:
         """A finished run a wait is blocked on that GitHub has not shown since the wait (run_needs_confirm): the cache
         holds the answer, and wait_step rules on it after one read. That read goes ahead of every other, deferred keys
-        included; then the run is an ordinary key again. Once per finish: a confirming read that failed (restRunAt
-        still older than it, confirm_tried) is retried with the normal aging and deferral, or a run GitHub keeps
-        refusing would take the head of every tick ahead of healthy deferred work (review of glaeda#1924)."""
+        included; then the run is an ordinary key again. Once per finish and wait (confirm_tried, waitBegan): a wait's
+        touches move waitedAt, so a wait held on (rescue grace), or a run GitHub keeps refusing, would otherwise take
+        the head of every cycle ahead of healthy deferred work (review of glaeda#1924). Later reads age and defer."""
         if not (e["key"].startswith("run:") and self.waited(e) and self.run_needs_confirm(e)):
             return False
-        c = e.get("cache") or {}
         tried = self.confirm_tried.get(e["key"])
-        if tried is None or tried[1] != rest_run(c.get("data")):
+        if tried is None or tried[1] != rest_run((e.get("cache") or {}).get("data")):
             return True  # (a new finish, a rerun's say, gets its own first read)
-        shown = c.get("restRunAt")
-        shown = float(shown) if isinstance(shown, (int, float)) and not isinstance(shown, bool) else float("-inf")
-        return tried[0] <= shown
+        began = e.get("waitBegan")
+        return isinstance(began, (int, float)) and began > tried[0]  # a new wait since
 
     def first_confirm(self, e: dict) -> bool:
         """A wait that began after this run's last read (waitBegan, which touches leave) and needs its finish
