@@ -1453,7 +1453,8 @@ def cmux_next_cap_only(fam: Family, path: Path, idle: float, idle_hours: float) 
     generated output younger than the family's own window. apply stops these once the cache is under the cap."""
     return (fam.id == CMUX_NEXT_CI_FAMILY and cmux_next_ci_over() > 0 and not cmux_next_ci_floor_slot(fam, path)
             and not cmux_next_ci_host_root(fam, path)
-            and (cmux_next_ci_state_for(path, fam.root) is None or idle < idle_window(fam, idle_hours)))
+            and ((cmux_next_ci_state_for(path, fam.root) is None and not cmux_next_ci_tui_tree(fam, path))
+                 or idle < idle_window(fam, idle_hours)))
 
 
 # The idle sweep (--idle): windows from how often each family is read again, not from free space.

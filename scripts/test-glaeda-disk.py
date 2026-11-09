@@ -4567,6 +4567,24 @@ class GlaedaDiskTest(unittest.TestCase):
         self.assertFalse(tui["tui-2"].exists())
         self.assertTrue((tui["tui-1"] / "debug/deps/libcmux.rlib/blob").is_file())
 
+    def test_cmux_tui_targets_past_their_window_are_not_held_to_the_cap(self) -> None:
+        # one byte over the cap must not stop expired trees once the cap is met: they are due by their own window
+        home, fam, _ = self._cmux_next_cap_tree()
+        tui = self._cmux_tui_trees(home, fam)
+        for tree in tui.values():
+            self._age(tree, hours=30)
+        receipt = self.receipt()
+        with mock.patch.object(gd, "HOME", home), mock.patch.object(gd, "process_evidence", return_value=([], "")), \
+                mock.patch.object(gd, "command_lines", return_value=""), \
+                mock.patch.object(gd, "ACTIVITY_MODE", "pressure"), mock.patch.object(gd, "CMUX_NEXT_CI_OVER", 1), \
+                contextlib.redirect_stdout(io.StringIO()):
+            gd._DISCOVERED.clear()
+            items = [i for i in gd.survey([fam], 24, 0) if Path(i.path) in tui.values()]
+            self.assertFalse(any(gd.cmux_next_cap_only(fam, Path(i.path), i.idle_hours, 24) for i in items))
+            gd.apply(items, {fam.id: fam}, receipt, None, 24, all_families=[fam])
+        for tree in tui.values():
+            self.assertFalse(tree.exists(), tree)
+
     def test_cmux_tui_target_goes_back_when_its_runner_takes_a_job_after_the_rename(self) -> None:
         home, fam, _ = self._cmux_next_cap_tree()
         tui = self._cmux_tui_trees(home, fam)
