@@ -1731,6 +1731,10 @@ def plan_uninstall(ctx: Context) -> list[dict[str, Any]]:
         ctx.role = role
         labels.update(agent_names(ctx))
     ctx.role = original_role
+    # and every agent the receipt owns, so one agent_names() no longer lists (a runner-only agent on a host
+    # whose glaeda runner is gone) is still removed with its tool
+    labels.update(a["label"] for a in (receipt or {}).get("actions", [])
+                  if a.get("kind") == "agent" and a.get("owned") and a.get("label"))
     for label in sorted(labels):
         path = agent_path(ctx, label)
         actions.append({"kind": "agent", "label": label, "path": os.fspath(path),

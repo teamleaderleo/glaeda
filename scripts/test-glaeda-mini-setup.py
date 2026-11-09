@@ -752,6 +752,11 @@ class MiniSetupTest(unittest.TestCase):
         self.invoke("--hygiene-only", "--apply")
         for label in runner_only:
             self.assertTrue((agents / f"{label}.plist").is_file(), label)
+        # uninstall after the runner is gone still removes the agents the receipt owns
+        (runner / "glaeda-hooks").rmdir()
+        self.invoke("--hygiene-only", "--uninstall", "--apply")
+        for label in runner_only:
+            self.assertFalse((agents / f"{label}.plist").exists(), label)
 
     def test_hygiene_only_still_blocks_without_python(self) -> None:
         self.patches[0].stop()
