@@ -10637,6 +10637,28 @@ class DaemonPolicyTest(Base):
         self.daemon.tick(NOW + gg.CYCLE * gg.LEAN_FACTOR + 1)
         self.assertEqual(len(self.gh.run_calls()), 2)
 
+    def test_a_yielding_share_admits_head_consumers_and_paces_every_head(self) -> None:
+        """Review F1/F2 at 99070e23: lean only for being past the share must still admit an unreserved consumer, and a
+        reserved one's head must be read at most once per lean cycle too."""
+        self.configure({"restShare": 0.0})
+        sha = "a" * 40
+        for consumer in ("session-1", "autoland"):
+            self.daemon.now = NOW
+            self.daemon.budget = {"rest": {"limit": 5000, "remaining": 4000, "reset": NOW + 3000},
+                                  "graphql": {"limit": 5000, "remaining": 10, "reset": NOW + 3000}}
+            self.daemon.attempted.clear()
+            self.daemon.head_spend = {}
+            entry = {"key": f"head:o/r@{sha}", "cache": None, "consumers": {consumer: NOW}}
+            self.assertEqual(self.daemon.mode("rest"), "lean")
+            self.assertEqual([e["key"] for e in self.daemon.due("head", [entry])], [entry["key"]], consumer)
+            for later in (NOW + 91, NOW + 182):
+                self.daemon.now = later
+                entry["consumers"] = {consumer: later}
+                self.assertEqual(self.daemon.due("head", [entry]), [], (consumer, later))
+            self.daemon.now = NOW + gg.CYCLE * gg.LEAN_FACTOR + 1
+            entry["consumers"] = {consumer: self.daemon.now}
+            self.assertEqual([e["key"] for e in self.daemon.due("head", [entry])], [entry["key"]], consumer)
+
     def test_within_its_share_the_daemon_reads_rest_at_the_full_cycle(self) -> None:
         self.configure({"restShare": 0.1})
         self.daemon.now = NOW
