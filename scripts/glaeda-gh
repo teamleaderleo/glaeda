@@ -3342,15 +3342,18 @@ class Daemon:
         nested error), SUITE_RUNS_BATCH suites per query. The second value is always None, kept for the callers.
 
         Paced like every other query (glaeda#1844 F2): past graphqlPerMinute it reads nothing, and unread is partial,
-        never green; the next cycle reads it. A batch's own follow-up (PACED false) takes its first query unpaced: it
-        is part of the read the ceiling already admitted, and holding it would turn the whole batch partial."""
+        never green; the next cycle reads it. A batch's own follow-up (PACED false) is never held: it is part of the
+        read the ceiling already admitted, and holding a later chunk starved the PRs whose suites sort last, which the
+        next cycle held the same way (router-review BLOCK on glaeda#1916 at 73069ea7). It is bounded by the batch: at
+        most GQL_BATCH PRs (or heads and their check-of-record commits) of at most 100 suites, so 2 * GQL_BATCH queries
+        of one point each, and far fewer in practice (a cmux head has about 15 such suites)."""
         suites = list(dict.fromkeys(suites))
         out: dict[str, list[dict] | str] = {}
         # Every failure is the error of the suites it left unread only (router-review BLOCKs on glaeda#1916 at
         # a01313fc and af5363f6): the batch holds many PRs' suites, and what was read stays read.
         for start in range(0, len(suites), SUITE_RUNS_BATCH):
             chunk = suites[start:start + SUITE_RUNS_BATCH]
-            if (paced or start) and not self.gql_room():
+            if paced and not self.gql_room():
                 for suite_id in suites[start:]:
                     out[suite_id] = "graphql: last real attempt: held by graphqlPerMinute; read next cycle"
                 break

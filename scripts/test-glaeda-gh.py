@@ -5710,9 +5710,10 @@ class HeadChecksTest(Base):
         self.assertNotIn("checksPageError", data)
         self.assertEqual(gg.check_verdict(data, "green"), gg.EXIT_FAIL)
 
-    def test_a_held_later_chunk_keeps_the_suites_already_read(self) -> None:
-        """Review on glaeda#1916 at af5363f6, F2: two green PRs of 60 empty suites each fill two suite queries; the
-        ceiling holds the second. PR 1's suites were all read in the first, so it stays green; PR 2 waits."""
+    def test_a_batch_follow_up_of_many_chunks_reads_every_pr_under_a_tight_ceiling(self) -> None:
+        """Review on glaeda#1916 at 73069ea7, F1: two green PRs of 60 empty suites each fill two suite queries. Holding
+        the second chunk under graphqlPerMinute 2 left PR 2 pending every cycle (the next one held it the same way).
+        The batch's follow-up is never held, so both PRs read green, cycle after cycle."""
         for n in (1, 2):
             node = pr_node(n, rollup="SUCCESS", checks=[check_run("build")])
             node["headRefOid"] = f"{n}" * 40
@@ -5720,12 +5721,25 @@ class HeadChecksTest(Base):
             self.gh.suites[node["headRefOid"]] = [{"id": f"E{n}-{k}", "latest": 0, "runs": []} for k in range(60)]
             gg.register(gg.parse_key("pr", f"o/r#{n}"))
         with mock.patch.object(gg, "daemon_policy", return_value={**gg.daemon_policy(), "graphqlPerMinute": 2}):
-            self.daemon.tick(NOW)
-        one = gg.read_cache(gg.parse_key("pr", "o/r#1"))["data"]
-        self.assertNotIn("checksPageError", one)
-        self.assertEqual(gg.check_verdict(one, "green"), 0)
-        two = gg.read_cache(gg.parse_key("pr", "o/r#2"))["data"]
-        self.assertIn("graphqlPerMinute", two.get("checksPageError") or "")
+            for minute in range(3):
+                self.daemon.tick(NOW + 61 * minute)
+                for n in (1, 2):
+                    data = gg.read_cache(gg.parse_key("pr", f"o/r#{n}"))["data"]
+                    self.assertNotIn("checksPageError", data)
+                    self.assertEqual(gg.check_verdict(data, "green"), 0)
+
+    def test_a_held_paced_chunk_keeps_the_suites_already_read(self) -> None:
+        """A paced read (last_real_contexts) that the ceiling stops after its first chunk keeps what that chunk read;
+        only the unread suites carry the hold (review on glaeda#1916 at af5363f6, F2)."""
+        ids = [f"S{k}" for k in range(120)]
+        self.gh.suites[SHA_A] = [{"id": i, "latest": 0, "runs": []} for i in ids]
+        self.daemon.now = NOW
+        room = iter([True, False])
+        with mock.patch.object(self.daemon, "gql_room", side_effect=lambda: next(room)):
+            runs, error = self.daemon.suite_runs(ids)
+        self.assertIsNone(error)
+        self.assertEqual([runs[i] for i in ids[:100]], [[]] * 100)
+        self.assertTrue(all("graphqlPerMinute" in runs[i] for i in ids[100:]))
 
     def test_a_nested_error_on_a_suite_is_partial_not_an_empty_green_suite(self) -> None:
         """Review on glaeda#1916 at af5363f6, F1: GitHub returned the suite with a null checkRuns beside an error, and
