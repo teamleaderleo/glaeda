@@ -4327,6 +4327,45 @@ class TickBudgetTest(Base):
         self.assertEqual(sorted(order[:2]), ["run:o/r/1", "run:o/r/2"], "each failing run gets its first read ahead")
         self.assertEqual(order[2], healthy, "then the deferred run goes ahead of the failed confirmations")
 
+    def test_a_wait_that_begins_just_after_a_read_gets_its_confirmation_within_the_cycle(self) -> None:
+        """Review of glaeda#1924 (F1): the daemon read the finished run a moment before the wait began, and the read
+        that confirms it for the wait was paced a whole cycle, as long as a 60 s confirmation wait. A new wait
+        (waitBegan) gets that read at once, and only once: its touches do not buy more."""
+        key = "run:o/r/9"
+        sha = "a" * 40
+        self.gh.runs[9] = {"id": 9, "status": "completed", "conclusion": "failure", "run_attempt": 1, "head_sha": sha}
+        gg.register(key)
+        self.daemon.tick(NOW)
+        reads = lambda: len([c for c in self.gh.rest_calls() if c[1].endswith("/actions/runs/9")])
+        self.assertEqual(reads(), 1)
+        req = gg.wait_request("run", "o/r/9", "green", 60, False, True, sha, True, 0)
+        req["began"] = NOW + 1
+        with mock.patch.object(gg.time, "time", return_value=NOW + 1):
+            gg.register(key, waited=True, began=req["began"])
+        self.assertIsNone(gg.wait_step(req, NOW + 1), "the read came before the wait began")
+        self.daemon.tick(NOW + gg.TICK)
+        self.assertEqual(reads(), 2, "confirmed at once, not a cycle later")
+        code, _ = gg.wait_step(req, NOW + gg.TICK)
+        self.assertEqual(code, gg.EXIT_FAIL)
+        with mock.patch.object(gg.time, "time", return_value=NOW + 30):
+            gg.register(key, waited=True)  # a touch: a later waitedAt, the same waitBegan
+        self.daemon.tick(NOW + 30)
+        self.assertEqual(reads(), 2, "a touch is not a new wait: the cycle paces it again")
+
+    def test_a_new_finish_gets_its_own_first_confirmation(self) -> None:
+        """Review of glaeda#1924 (F2): a confirmation that failed is not put first again for the same finish, but a
+        rerun's new finish (another restRun) is."""
+        self.daemon.now = NOW
+        done = {"id": 9, "status": "completed", "conclusion": "failure", "run_attempt": 1}
+        cache = {"data": done, "restRun": gg.rest_run(done), "restRunAt": NOW - 60, "source": "rest"}
+        e = {"key": "run:o/r/9", "cache": cache, "waitedAt": NOW}
+        self.assertTrue(self.daemon.wait_confirms(e))
+        self.daemon.confirm_tried["run:o/r/9"] = (NOW - 2, gg.rest_run(done))  # tried, and the read failed
+        self.assertFalse(self.daemon.wait_confirms(e))
+        rerun = {**done, "run_attempt": 2, "conclusion": "cancelled"}
+        e["cache"] = {**cache, "data": rerun, "source": "controller"}  # the controller's word of a new attempt
+        self.assertTrue(self.daemon.wait_confirms(e))
+
     def entry(self, key: str, source: str, at: float, waited: bool = False, deferred: bool = False) -> dict:
         if deferred:
             self.daemon.deferred_before[key] = NOW - 10
