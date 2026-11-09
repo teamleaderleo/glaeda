@@ -2526,7 +2526,7 @@ class Daemon:
         # Bounded: its first read stores an answer (or an error), and then it is an ordinary key.
         # So does a finished run a wait is blocked on that GitHub has not shown since (run_needs_confirm): wait_step will
         # not rule on it until that read, and behind 88 deferred keys on a lean daemon (2026-11-09, a 60 s confirmation
-        # wait on manaflow-ai/cmuxterm-hq run 42584435480) it timed out every time while the cache held its failure.
+        # wait on a CI run) it timed out every time while the cache held its failure.
         # Bounded too: the read stores restRunAt, and then the run no longer needs confirming for that wait.
         out.sort(key=lambda e: not (self.wait_confirms(e) or (e["cache"] is None and self.waited(e))))
         for e in out:

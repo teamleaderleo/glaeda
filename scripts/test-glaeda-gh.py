@@ -4244,7 +4244,7 @@ class TickBudgetTest(Base):
                          "every key is reached: a deferred key never starves behind the rest")
 
     def test_a_wait_on_a_finished_run_is_confirmed_ahead_of_deferred_reads(self) -> None:
-        """2026-11-09, manaflow-ai/cmuxterm-hq run 42584435480: a 60 s confirmation wait on a run whose failure the cache
+        """2026-11-09: a 60 s confirmation wait on a run whose failure the cache
         already held (read just before the wait began) timed out every time on a daemon with 88 deferred reads, because
         the confirming read (run_needs_confirm) queued behind every deferred key. It now goes first, and the wait rules."""
         self.daemon.budget = {"rest": {"limit": 5000, "remaining": 4500, "reset": NOW + 1800},
