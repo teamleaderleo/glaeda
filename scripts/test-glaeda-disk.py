@@ -7128,7 +7128,7 @@ class GlaedaDiskTest(unittest.TestCase):
         return home, mirror, loose
 
     def test_shared_mirror_compact_folds_a_wt_mirror_and_loses_nothing(self) -> None:
-        # gcp-agent-lane-4, 2026-11-09: the cmuxterm-hq mirror's 42 packs, 5.4 GiB, were 3.5 GiB as one pack
+        # an agent lane host, 2026-11-09: the cmuxterm-hq mirror's 42 packs, 5.4 GiB, were 3.5 GiB as one pack
         home, mirror, loose = self._shared_mirror(4)
         (home / "Projects/.wt-mirrors/o/link.git").symlink_to(mirror)  # never through a symlink
         self.assertEqual(gd.shared_mirrors(home), [mirror])

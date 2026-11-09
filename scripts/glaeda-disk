@@ -4994,7 +4994,7 @@ def repack_runner_checkouts(receipt: Path, home: Path | None = None, halt=None) 
 
 # The shared repository copies every checkout on a host borrows from: tools/wt's bare mirrors
 # (<root>/.wt-mirrors/<owner>/<repo>.git, every role). Their fetches pile up packs that git's hourly geometric
-# repack folds but never merges into one, so objects stay duplicated across packs. gcp-agent-lane-4's
+# repack folds but never merges into one, so objects stay duplicated across packs. An agent lane host's
 # cmuxterm-hq mirror held 42 packs, 5.4 GiB, that `git repack -a -d -k -l` made one pack of 3.5 GiB in 3 min
 # 16 s (2026-11-09). -k keeps every unreachable object: a worktree's commit no ref names yet stays. Only under
 # the floor (Leo, 2026-11-08: "Below the free-space floor it will: compact the shared repo copies").
