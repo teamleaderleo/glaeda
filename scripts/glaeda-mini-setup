@@ -1139,7 +1139,7 @@ def agent_plists(ctx: Context) -> dict[str, dict[str, Any]]:
 # Agents that only do work beside glaeda runners on a fleet Mac: each exits at once anywhere else, but still wakes
 # every 30 s to 5 min. A --hygiene-only Mac without a glaeda runner (Leo's laptop and desktops) does not get them;
 # a headless EC2 runner Mac is --hygiene-only too, so the runners decide, not the profile (Leo, 2026-11-08:
-# "Airblue can probably be cleaned up a lot ... It's just, like, random garbage that was accumulated").
+# "It's just, like, random garbage that was accumulated").
 RUNNER_ONLY_AGENTS = frozenset(LABEL_PREFIX + name for name in (
     "idle-warm", "idle-fuzz", "mini-health", "git-mirror", "seed-prefetch", "lan-fetch", "fleet-cas-prune",
     "wallpaper"))
