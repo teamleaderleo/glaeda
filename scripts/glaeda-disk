@@ -113,8 +113,9 @@ it or its linked work trees. Only a home with enrolled runners. A slow gc runs o
 Below the floor, on every role, shared-mirror-compact folds the shared repository copies every checkout borrows
 from (tools/wt's bare mirrors, <root>/.wt-mirrors/<owner>/<repo>.git) into one pack each with
 `git repack -a -d -k -l` (keeps every object), the one with the most object bytes and at least four packs per
-pass, after the eviction lock is released. It holds objects/maintenance.lock while git runs, and waits while a
-gc, git maintenance run, pack write or command in the mirror is going. Fetches and worktree reads go on beside it.
+pass, after the eviction lock is released. It holds objects/maintenance.lock while git runs, and waits only while
+another repack, gc or git maintenance run works on that mirror. Fetches (a fetch loop too) and worktree reads go
+on beside it.
 
 The folders lanes leave directly in a fleet mini's home (home-scratch: ~/cnx-*-evidence, an ad-hoc clone, a build
 root), on a mini with enrolled runners only, follow the same 12 h rule: idle 12 h, unpushed commits are bundled and
@@ -5004,7 +5005,10 @@ SHARED_MIRROR_GLOBS = (".wt-mirrors/*/*.git", "*/.wt-mirrors/*/*.git")  # wt's r
 # The full repack's memory: unbounded, the cmuxterm-hq mirror's took 9.6 GB resident; two threads with a
 # bounded delta window took 5.3 GB and 209 s for the same 3.5 GiB pack, a background job beside builds.
 SHARED_MIRROR_REPACK_ARGS = ("repack", "-a", "-d", "-k", "-l", "-q", "--threads=2", "--window-memory=256m")
-SHARED_MIRROR_TMP_STALE_S = 3600  # a temporary pack this young is a fetch or repack still writing
+SHARED_MIRROR_TMP_STALE_S = 3600  # a repack's temporary pack this young is a repack still writing
+# A fetch loop must not hold the fold off: cmux16's cmux mirror gained ~700 packs an hour from one (2026-11-08), and
+# that is the mirror that most needs it. Only another fold of the same packs waits: these subcommands on its path.
+SHARED_MIRROR_BUSY_GIT = re.compile(r"(?:^|\s)(repack|gc|maintenance|multi-pack-index|prune|pack-redundant)(?=\s|$)")
 
 
 def shared_mirrors(home: Path) -> list[Path]:
@@ -5020,9 +5024,10 @@ def shared_mirrors(home: Path) -> list[Path]:
 
 
 def shared_mirror_veto(gitdir: Path, opened: frozenset[str], cmds: str, now: float) -> str:
-    """Why a shared mirror must not be repacked now, or "". Fetches and worktree reads go on beside a repack
-    (it deletes only packs it folded, and -k keeps what they write); another repack, gc or git maintenance
-    run must not, and neither may a command run in or on the mirror itself."""
+    """Why a shared mirror must not be repacked now, or "". Fetches, their temporary packs and worktree reads
+    go on beside a repack (it deletes only packs it folded, and -k keeps what they write); another repack, gc
+    or git maintenance run on it must not: gc.pid, objects/maintenance.lock, a repack's own young .tmp- pack,
+    or a running command naming the mirror with one of SHARED_MIRROR_BUSY_GIT's subcommands."""
     with contextlib.suppress(OSError):
         if now - (gitdir / "gc.pid").lstat().st_mtime < HOME_CLONE_GC_PID_STALE_S:
             return "a git operation holds gc.pid"
@@ -5030,15 +5035,14 @@ def shared_mirror_veto(gitdir: Path, opened: frozenset[str], cmds: str, now: flo
         return "git maintenance holds objects/maintenance.lock"
     with contextlib.suppress(OSError), os.scandir(gitdir / "objects/pack") as it:
         for e in it:
-            if e.name.startswith(("tmp_", ".tmp-")):
+            if e.name.startswith(".tmp-"):
                 with contextlib.suppress(OSError):
                     if now - e.stat(follow_symlinks=False).st_mtime < SHARED_MIRROR_TMP_STALE_S:
-                        return "a git operation is writing a pack"
+                        return "a repack is writing a pack"
     p, resolved = os.fspath(gitdir), os.fspath(gitdir.resolve())
-    if in_cwd(p, opened) or in_cwd(resolved, opened):
-        return f"a working directory of a process: {p}"
-    if named_by(p, cmds) or named_by(resolved, cmds):
-        return f"named by a running command: {p}"
+    for line in cmds.splitlines():
+        if SHARED_MIRROR_BUSY_GIT.search(line) and (named_by(p, line) or named_by(resolved, line)):
+            return f"a repack, gc or maintenance command runs on it: {p}"
     return ""
 
 

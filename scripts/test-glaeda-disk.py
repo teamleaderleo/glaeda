@@ -7158,9 +7158,9 @@ class GlaedaDiskTest(unittest.TestCase):
         cases = {
             "holds gc.pid": lambda m: (m / "gc.pid").write_text("1 host"),
             "holds objects/maintenance.lock": lambda m: (m / "objects/maintenance.lock").write_text(""),
-            "writing a pack": lambda m: (m / "objects/pack/tmp_pack_abc123").write_text(""),
-            "named by a running command": lambda m: setattr(
-                gd, "process_evidence", lambda: ([], f"git -C {m} fetch origin\n")),
+            "a repack is writing a pack": lambda m: (m / "objects/pack/.tmp-77-pack-abc").write_text(""),
+            "a repack, gc or maintenance command": lambda m: setattr(
+                gd, "process_evidence", lambda: ([], f"git -C {m} repack -d --geometric=2\n")),
         }
         for reason, make_busy in cases.items():
             with self.subTest(reason):
@@ -7175,12 +7175,24 @@ class GlaedaDiskTest(unittest.TestCase):
                     self.assertEqual(gd.compact_shared_mirrors(receipt, home), 0)
                 self.assertEqual(gd.git_pack_count(mirror), 4)
                 self.assertIn(reason, json.loads(receipt.read_text())["reasons"][0])
-        # a temporary pack a killed fetch left an hour ago is no writer
-        tmp = mirror / "objects/pack/tmp_pack_abc123"
-        tmp.write_text("")
-        os.utime(tmp, (time.time() - 2 * 3600,) * 2)
-        gd.process_evidence = lambda: ([], "")
-        self.assertEqual(gd.shared_mirror_veto(mirror, frozenset(), "", time.time()), "")
+        # a fetch loop never holds it off (cmux16, 2026-11-08: ~700 packs an hour): its command, its cwd, its
+        # temporary pack; nor does a repack's temporary pack a killed run left two hours ago
+        shutil.rmtree(self.root / "home", ignore_errors=True)
+        shutil.rmtree(self.root / "src", ignore_errors=True)
+        home, mirror, _ = self._shared_mirror(4)
+        (mirror / "objects/pack/tmp_pack_abc123").write_text("")
+        stale = mirror / "objects/pack/.tmp-1-pack-old"
+        stale.write_text("")
+        os.utime(stale, (time.time() - 2 * 3600,) * 2)
+        fetch = f"git -C {mirror} fetch --prune origin\n"
+        self.assertEqual(gd.shared_mirror_veto(mirror, frozenset([os.fspath(mirror)]), fetch, time.time()), "")
+        gd.process_evidence = lambda: ([os.fspath(mirror)], fetch)
+        receipt = self.receipt()
+        receipt.unlink(missing_ok=True)
+        with self._gc_log(), contextlib.redirect_stdout(io.StringIO()):
+            gd.compact_shared_mirrors(receipt, home)
+        self.assertEqual(json.loads(receipt.read_text())["outcome"], "reclaimed")
+        self.assertEqual(gd.git_pack_count(mirror), 1)
 
     def test_shared_mirror_compact_runs_under_the_floor_on_every_role_only(self) -> None:
         dev = gd.HOME.stat().st_dev
