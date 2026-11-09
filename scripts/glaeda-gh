@@ -543,8 +543,11 @@ def suites_contexts(suites: list[str] | str, runs: dict[str, list[dict]],
         return [], None
     if runs_error:
         return [], runs_error
-    if any(s not in runs for s in suites):
-        return [], "graphql: last real attempt: a suite could not be read"
+    for s in suites:
+        if s not in runs:
+            return [], "graphql: last real attempt: a suite could not be read"
+        if isinstance(runs[s], str):
+            return [], runs[s]
     return [node for s in suites for node in runs[s]], None
 
 
@@ -3333,9 +3336,10 @@ class Daemon:
         runs, error = self.suite_runs(suites)
         return suites_contexts(suites, runs, error)
 
-    def suite_runs(self, suites: list[str], paced: bool = True) -> tuple[dict[str, list[dict]], str | None]:
+    def suite_runs(self, suites: list[str], paced: bool = True) -> tuple[dict[str, list[dict] | str], str | None]:
         """Suite id -> its check-run context nodes over every attempt (statusCheckRollup's shape, marked
-        lastRealAttempt), SUITE_RUNS_BATCH suites per query; ({}, error) when they cannot all be read.
+        lastRealAttempt), or the error that suite alone could not be read with, SUITE_RUNS_BATCH suites per query;
+        ({}, error) when no suite could be read (held by the pace, or no response).
 
         Paced like every other query (glaeda#1844 F2): past graphqlPerMinute it reads nothing, and unread is partial,
         never green; the next cycle reads it. A batch's own follow-up (PACED false) takes its first query unpaced: it
@@ -3354,13 +3358,20 @@ class Daemon:
             if doc is None:
                 return {}, error or "graphql: no response"
             found = (doc.get("data") or {}).get("suiteRuns")
-            if doc.get("errors") or not isinstance(found, list) or len(found) != len(chunk) or not all(found):
-                message = str(((doc.get("errors") or [{}])[0] or {}).get("message") or "a suite could not be read")
-                return {}, "graphql: last real attempt: " + message[:200]
+            message = "graphql: last real attempt: " + str(
+                ((doc.get("errors") or [{}])[0] or {}).get("message") or "a suite could not be read")[:200]
+            if not isinstance(found, list) or len(found) != len(chunk):
+                found = [None] * len(chunk)
+            # A suite that cannot be read is that suite's error only (router-review BLOCK on glaeda#1916 at a01313fc):
+            # the batch holds many PRs' suites, and one bad suite must not make every other PR in it partial.
             for suite_id, suite in zip(chunk, found):
+                if not isinstance(suite, dict):
+                    out[suite_id] = message
+                    continue
                 runs = suite.get("checkRuns") or {}
                 if (runs.get("pageInfo") or {}).get("hasNextPage"):
-                    return {}, "graphql: last real attempt: more than 100 check runs in one suite"
+                    out[suite_id] = "graphql: last real attempt: more than 100 check runs in one suite"
+                    continue
                 context = {"conclusion": suite.get("conclusion"), "app": suite.get("app"),
                            "workflowRun": suite.get("workflowRun")}
                 out[suite_id] = [{"__typename": "CheckRun", **run, "checkSuite": context, "lastRealAttempt": True}

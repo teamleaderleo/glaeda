@@ -229,7 +229,7 @@ class FakeGitHub:
                 data["suiteRuns"] = [None if i not in by_id else {
                     "id": i, "conclusion": by_id[i].get("conclusion", "STARTUP_FAILURE"), "app": {"slug": "github-actions"},
                     "workflowRun": {"databaseId": by_id[i].get("run", 1), "workflow": {"name": "CI", "databaseId": 77}},
-                    "checkRuns": {"pageInfo": {"hasNextPage": False},
+                    "checkRuns": {"pageInfo": {"hasNextPage": bool(by_id[i].get("runs_more"))},
                                   "nodes": [{k: v for k, v in r.items() if k not in ("__typename", "checkSuite")}
                                             for r in by_id[i]["runs"]]}} for i in v["suites"]]
                 return 200, self.rate("graphql", self.graphql_remaining), json.dumps({"data": data}).encode()
@@ -5671,6 +5671,25 @@ class HeadChecksTest(Base):
             red = ("publish", "FAILURE") in [(c["name"], c["conclusion"]) for c in data["checks"]]
             self.assertEqual(red, n == 2)
             self.assertEqual(gg.check_verdict(data, "green"), gg.EXIT_FAIL if n == 2 else 0)
+
+    def test_one_unreadable_suite_in_a_batch_makes_only_its_own_pr_partial(self) -> None:
+        """Router-review BLOCK on glaeda#1916 at a01313fc: the batch reads every PR's ran-nothing suites in one query,
+        and a suite with more than 100 runs (PR 2's startup_failure suite) made every PR in the batch partial, so PR 1,
+        green with only an empty app suite, read checksPageError. Each suite's error is now its own PR's."""
+        for n in (1, 2):
+            node = pr_node(n, rollup="SUCCESS", checks=[check_run("build")])
+            node["headRefOid"] = f"{n}" * 40
+            self.gh.prs[("o", "r", n)] = node
+            gg.register(gg.parse_key("pr", f"o/r#{n}"))
+        self.gh.suites["1" * 40] = [{"id": "APP1", "latest": 0, "runs": []}]
+        self.gh.suites["2" * 40] = [{"id": "SF2", "latest": 0, "runs": [self.red_publish(2)], "runs_more": True}]
+        self.daemon.tick(NOW)
+        one = gg.read_cache(gg.parse_key("pr", "o/r#1"))["data"]
+        self.assertNotIn("checksPageError", one)
+        self.assertEqual(gg.check_verdict(one, "green"), 0)
+        two = gg.read_cache(gg.parse_key("pr", "o/r#2"))["data"]
+        self.assertIn("more than 100 check runs", two.get("checksPageError") or "")
+        self.assertNotEqual(gg.check_verdict(two, "green"), 0)
 
     def test_the_batch_follow_up_is_not_held_by_the_minute_its_own_read_spent(self) -> None:
         """The follow-up belongs to the read the per-minute ceiling admitted: holding it would leave the whole batch
