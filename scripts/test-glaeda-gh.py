@@ -4286,6 +4286,14 @@ class TickBudgetTest(Base):
         """Review of glaeda#1924: a wait held on a finished run (rescue grace) touches waitedAt every 30 s, so the run
         needs confirming again after each successful read. Put first for every touch, two such runs took each tick's
         one read (1, 2, 1, 2) and a healthy deferred wait timed out. Priority is once per finish and wait start."""
+        self.held_waits(jobs_deferred=False)
+
+    def test_a_confirmation_whose_jobs_read_is_deferred_has_had_its_turn(self) -> None:
+        """Review of glaeda#1924: the run read answered but its failed attempt's jobs read ran out of time, so the key
+        was deferred, and a deferred confirming read did not count as made: a held `--jobs` wait took the head again."""
+        self.held_waits(jobs_deferred=True)
+
+    def held_waits(self, jobs_deferred: bool) -> None:
         self.daemon.budget = {"rest": {"limit": 5000, "remaining": 4500, "reset": NOW + 1800},
                               "graphql": {"limit": 5000, "remaining": 0, "reset": NOW + 1800}}
         held = ("run:o/r/1", "run:o/r/2")
@@ -4313,6 +4321,8 @@ class TickBudgetTest(Base):
             data = (e["cache"] or {}).get("data")
             self.daemon.store(e["key"], e["cache"], data=data, dataAt=self.daemon.now, restAt=self.daemon.now,
                               restRun=gg.rest_run(data), restRunAt=self.daemon.now)  # confirmed: still failed
+            if jobs_deferred and e["key"] != healthy:
+                self.daemon.deferred.add(e["key"])  # read_jobs: out of time for the jobs, left for next tick
 
         with mock.patch.object(self.daemon, "fetch_run", side_effect=read):
             for t in range(4):

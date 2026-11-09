@@ -1676,7 +1676,8 @@ class Daemon:
         # when a confirming read (wait_confirms) of each run was last made ahead of the rest, and the finish it was
         # for (rest_run): one such read per finish
         self.confirm_tried: dict[str, tuple[float, dict]] = {}
-        self.confirming: dict[str, dict] = {}  # the runs this tick's due() put first as confirming reads, and their finish
+        # the runs this tick's due() put first as confirming reads: their finish, and their cache's fetchedAt then
+        self.confirming: dict[str, tuple[dict, Any]] = {}
         self.repo_parts: dict[str, dict] = {}  # REST path -> {"at", "part"}: repo/base-level answers every PR shares
         self.deferred_before: dict[str, float] = {}  # deferred by the last tick: when each was first deferred
         self.deferred_since: dict[str, float] = {}  # when each key still deferred was first deferred
@@ -2542,7 +2543,8 @@ class Daemon:
         # Bounded too: the read stores restRunAt, and then the run no longer needs confirming for that wait.
         out.sort(key=lambda e: not (self.wait_confirms(e) or (e["cache"] is None and self.waited(e))))
         if kind == "run":
-            self.confirming = {e["key"]: rest_run((e["cache"] or {}).get("data")) for e in out if self.wait_confirms(e)}
+            self.confirming = {e["key"]: (rest_run((e["cache"] or {}).get("data")), (e["cache"] or {}).get("fetchedAt"))
+                               for e in out if self.wait_confirms(e)}
         for e in out:
             self.attempted[e["key"]] = self.now
         return out
@@ -2804,9 +2806,11 @@ class Daemon:
         except Exception as error:  # noqa: BLE001  the waits are the clients' business; the reads go on
             waiting = None
             self.errors.append(f"waits: {describe(error)} at {error_site(error)}")
-        # a confirming read that was made (not deferred unread) has had its turn ahead of the rest (wait_confirms)
-        for key, finish in self.confirming.items():
-            if key not in self.deferred:
+        # A confirming read that was made has had its turn ahead of the rest (wait_confirms): it stored an answer or
+        # an error (fetchedAt moved), even if what it read next (a failed attempt's jobs) is deferred. One cut off
+        # before its request keeps its place.
+        for key, (finish, fetched) in self.confirming.items():
+            if key not in self.deferred or (read_cache(key) or {}).get("fetchedAt") != fetched:
                 self.confirm_tried[key] = (self.now, finish)
         self.confirming = {}
         self.deferred &= {e["key"] for e in entries}
