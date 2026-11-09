@@ -5558,7 +5558,7 @@ def poll_wait(req: dict) -> int:
             warned = True
         now = time.monotonic()
         if now - touched >= TOUCH_EVERY:
-            register(req["key"], jobs, waited=True)
+            register(req["key"], jobs, waited=True, began=req["began"])  # (the same start every touch)
             touched = now
         done = wait_step(req, time.time())
         if done is not None:
