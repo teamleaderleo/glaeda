@@ -4243,6 +4243,45 @@ class TickBudgetTest(Base):
         self.assertEqual(sorted(set(order)), sorted([f"pr:o/r#{n}" for n in range(1, 6)] + ["run:o/r/1", "run:o/r/2"]),
                          "every key is reached: a deferred key never starves behind the rest")
 
+    def test_a_wait_on_a_finished_run_is_confirmed_ahead_of_deferred_reads(self) -> None:
+        """2026-11-09, manaflow-ai/cmuxterm-hq run 42584435480: a 60 s confirmation wait on a run whose failure the cache
+        already held (read just before the wait began) timed out every time on a daemon with 88 deferred reads, because
+        the confirming read (run_needs_confirm) queued behind every deferred key. It now goes first, and the wait rules."""
+        self.daemon.budget = {"rest": {"limit": 5000, "remaining": 4500, "reset": NOW + 1800},
+                              "graphql": {"limit": 5000, "remaining": 0, "reset": NOW + 1800}}  # all over REST
+        sha = "a" * 40
+        for n in range(1, 6):  # a backlog: read long ago, deferred by earlier ticks
+            key = f"run:o/r/{n}"
+            self.gh.runs[n] = {"id": n, "status": "in_progress", "conclusion": None, "run_attempt": 1}
+            gg.register(key)
+            gg.write_json(gg.cache_dir() / gg.file_name(key), {"key": key, "fetchedAt": NOW - 2 * gg.CYCLE,
+                                                               "dataAt": NOW - 2 * gg.CYCLE, "error": None,
+                                                               "data": {"status": "in_progress"}})
+            self.daemon.deferred.add(key)
+            self.daemon.deferred_since[key] = NOW - 60
+        done = {"id": 9, "status": "completed", "conclusion": "failure", "run_attempt": 1, "head_sha": sha,
+                "updated_at": iso(NOW - 600)}
+        self.gh.runs[9] = dict(done)
+        key = "run:o/r/9"
+        gg.write_json(gg.cache_dir() / gg.file_name(key), {
+            "key": key, "fetchedAt": NOW - 1, "dataAt": NOW - 1, "restAt": NOW - 1, "error": None, "source": "rest",
+            "data": done, "restRun": gg.rest_run(done), "restRunAt": NOW - 1})  # GitHub showed it a second too early
+        req = gg.wait_request("run", "o/r/9", "green", 60, False, True, sha, True, 0)
+        req["began"] = NOW
+        gg.register(key, waited=True)
+        self.assertIsNone(gg.wait_step(req, NOW), "a finish read before the wait began is not ruled on (a rerun?)")
+        self.spend_budget_after(1)  # one read a tick: the backlog keeps the daemon behind
+        status = self.daemon.tick(NOW + gg.TICK)
+        self.assertEqual(status["fetched"]["run"], 6)
+        self.assertEqual(gg.read_cache(key)["restRunAt"], NOW + gg.TICK, "the waited finished run is read first")
+        self.assertTrue(all(f"run:o/r/{n}" in self.daemon.deferred for n in range(1, 6)), "the backlog waits a tick")
+        code, text = gg.wait_step(req, NOW + gg.TICK)
+        self.assertEqual(code, gg.EXIT_FAIL)
+        self.assertEqual(json.loads(text)["result"], "failure")
+        entry = next(e for e in self.daemon.watches() if e["key"] == key)
+        self.daemon.now = NOW + gg.TICK
+        self.assertFalse(self.daemon.wait_confirms(entry), "one read per wait: then it is an ordinary key")
+
     def entry(self, key: str, source: str, at: float, waited: bool = False, deferred: bool = False) -> dict:
         if deferred:
             self.daemon.deferred_before[key] = NOW - 10
