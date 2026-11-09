@@ -73,6 +73,9 @@ The per-host build root (cmux_next_ci_host_roots, default dev-daily-release/host
 compiles share under flock on its lock, so their compilation cache hits) is never the cap's: it goes whole, after
 everything else, only while free is still under the runner floor (exempt from age by role: the newest warm cache),
 and never while its lock is held. Per-instance dev-daily-release states, now its fallback only, go first.
+cmux-tui's Cargo targets (cmux-tui-cargo/<runner key>/rust-<toolchain key>, cmux-tui-warm-target.sh) are
+generated output listed whole: the window, the cap and the floor hold as above, never one written in the last
+hour, never while its runner has a job.
 
 Each enrolled GitHub runner's checkout (~/actions-runner*/_work/<repo>/<repo>) has two families.
 runner-checkout-build is SwiftPM's Packages/*/.build and Packages/*/*/.build plus cargo-tagged target
@@ -1393,6 +1396,12 @@ def item_window(fam: Family, path: Path, idle_hours: float, archived: frozenset[
                 return 0.0
         window = float(POLICY["cmux_next_ci_host_idle_hours"])
         return max(window, fam.min_idle_hours) if RUNNER_CACHE_PROFILE else window  # that profile's minimum age
+    if cmux_next_ci_tui_tree(fam, path):  # the cap or the floor hold drops its window, never its settle
+        window = idle_window(fam, idle_hours)
+        with contextlib.suppress(OSError):
+            if cmux_next_ci_over() or fam.root.stat().st_dev in FLOOR_HOLD:
+                window = 0.0
+        return max(window, CMUX_TUI_SETTLE_HOURS)
     if fam.id == CMUX_NEXT_CI_FAMILY and (CMUX_NEXT_CI_DRAIN or cmux_next_ci_over()):
         return 0.0
     if fam.id == SPM_SCRATCH:
@@ -1422,7 +1431,8 @@ def floor_hold_family(fam: Family, path: Path) -> bool:
         token = canonical_root_token(path)
         return token is not None and token.is_file() and not token.is_symlink()
     return fam.id == CMUX_NEXT_CI_FAMILY and not CMUX_NEXT_CI_DRAIN and (
-        cmux_next_ci_runner(path, fam.root) is not None or cmux_next_ci_floor_slot(fam, path))
+        cmux_next_ci_runner(path, fam.root) is not None or cmux_next_ci_floor_slot(fam, path)
+        or cmux_next_ci_tui_tree(fam, path))
 
 
 def floor_hold_only(fam: Family, item: "Item", idle_hours: float) -> bool:
@@ -5261,8 +5271,7 @@ def interrupted_families(fams: list[Family]) -> list[Family]:
             continue  # a symlinked or out-of-HOME Tart store is someone else's, its aside trees too (#1813)
         dirs = {fam.root}
         if fam.id == CMUX_NEXT_CI_FAMILY:  # a whole state set aside leaves no candidate where it sat
-            dirs.update(cmux_next_ci_state_parents(fam.root))
-            dirs.update(cmux_next_ci_host_parents(fam.root))
+            dirs.update(cmux_next_ci_aside_parents(fam.root))
         if fam.id == TART_IMAGES:  # an image sits at any depth: every namespace directory above one
             dirs.update(tart_walk(fam.root)[1])
         elif fam.discover or fam.checkout_builds:
@@ -7693,7 +7702,7 @@ def job_busy(fam: Family, path: Path) -> bool:
     if fam.id == DEDICATED_RUNNER_TEMP:  # a job's scratch can be wider than the budget; a running job is seen by
         return False                     # its processes and open files, and nothing here is younger than 12 h
     if fam.id == CMUX_NEXT_CI_FAMILY and (path in cmux_next_ci_state_roots(fam.root)
-                                         or cmux_next_ci_host_root(fam, path)):
+                                         or cmux_next_ci_host_root(fam, path) or cmux_next_ci_tui_tree(fam, path)):
         return False  # a whole state's inputs are wider than the budget; cmux_next_ci_busy is its signal
     return fam.reclaimable and not fam.discover and cmux_active(path)
 
@@ -8415,6 +8424,8 @@ def _survey(families, idle_hours, min_bytes, known, evidence, defer_bulk=False,
             elif cmux_next_cap_only(fam, path, idle, idle_hours):
                 reasons.append(f"cmux-next-ci is {gib(cmux_next_ci_over()).strip()} over its size cap "
                                "(least recently used first)")
+            if cmux_next_ci_tui_tree(fam, path):
+                reasons.append("a cmux-tui Cargo target, whole: its runner's next cmux-tui job builds cold")
             if mirror_due(fam, path, idle):
                 reasons.append(f"idle {fam.mirror_idle_hours:g}h+: its checkouts are mirrors "
                                "(unpushed commits go to a verified bundle in ~/archive first)")
@@ -10250,8 +10261,7 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
         if fam.id in FLEET_FAMILY_IDS or fam.id in (CMUX_NEXT_CI_FAMILY, HQ_CACHE_FAMILY, CANONICAL_ADMISSION,
                                                      NIGHTLY_NEXT_FAMILY) \
                 or media_tour_dd(fam, p) or (
-                fam.id == INTERRUPTED and fam.root in (cmux_next_ci_state_parents(HOME / "Library/Caches" / CMUX_NEXT_CI_ROOT)
-                                                       + cmux_next_ci_host_parents(HOME / "Library/Caches" / CMUX_NEXT_CI_ROOT))):
+                fam.id == INTERRUPTED and fam.root in cmux_next_ci_aside_parents(HOME / "Library/Caches" / CMUX_NEXT_CI_ROOT)):
             # Pressure eligibility is intentionally broad, so take fresh cwd/open-file evidence immediately
             # before each rename. A job may start using a candidate after the survey or during a long pass.
             try:
@@ -10392,6 +10402,7 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
                                   if fresh_layout == "rustup-toolchain" else None)
                     remove(p, after_rename=cmux_next_ci_slot_recheck(fam, p, floor=cmux_next_ci_floor_slot(fam, p))
                            if whole_state
+                           else cmux_next_ci_tui_recheck(fam, p) if cmux_next_ci_tui_tree(fam, p)
                            else cmux_next_ci_child_recheck(fam, p) if fam.id == CMUX_NEXT_CI_FAMILY
                            else mirror_rename_recheck(p, bundled[2]) if mirror_due(fam, p, idle_now)
                            else None if stale_hash is None else lambda h=stale_hash: h.unlink(missing_ok=True))
@@ -10411,9 +10422,8 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
                         else:
                             taken_in[p.parent] = taken_in.get(p.parent, 0) + took
                         cap_left -= took
-                    elif gone and fam.id == INTERRUPTED and p.parent in (
-                            cmux_next_ci_state_parents(HOME / "Library/Caches" / CMUX_NEXT_CI_ROOT)
-                            + cmux_next_ci_host_parents(HOME / "Library/Caches" / CMUX_NEXT_CI_ROOT)):
+                    elif gone and fam.id == INTERRUPTED and p.parent in cmux_next_ci_aside_parents(
+                            HOME / "Library/Caches" / CMUX_NEXT_CI_ROOT):
                         cap_left -= took  # an aside slot was part of the cache the cap measured
                         taken_in[p.parent] = taken_in.get(p.parent, 0) + took  # a host root's measure held it too
                     released += took if gone else 0
@@ -10468,6 +10478,8 @@ def cmux_next_ci_aside_busy(path: Path, opened: list[str] | frozenset[str], comm
     original = path.with_name(path.name[len(DELETING_PREFIX):m.start(1) - 1])
     if path.parent in cmux_next_ci_host_roots(root):  # a host root's child set aside: its builds' lock, on the root
         return cmux_next_ci_host_lock_held(path.parent)
+    if path.parent in cmux_next_ci_tui_workers(root):  # a cmux-tui Cargo target set aside: its runner's vetoes
+        return cmux_next_ci_tui_busy(original, opened, commands)
     if path.parent not in cmux_next_ci_state_parents(root):
         return ""
     runner = cmux_next_ci_owner(original, root)
@@ -10743,6 +10755,98 @@ def cmux_next_ci_fallback_item(fam: Family, path: Path) -> bool:
             and any(h.parent == fam.root / rel[0] for h in cmux_next_ci_host_roots(fam.root)))
 
 
+# cmux's scripts/ci/cmux-tui-warm-target.sh keeps cmux-tui's Cargo target between jobs on an owned Mac, one tree per
+# runner and workspace and toolchain: cmux-tui-cargo/<worker key>/rust-<toolchain key>. Each tree is generated
+# output, listed whole (a Cargo target has no inputs worth keeping apart), under the family's window, the size cap
+# and the floor hold like the rest. A Mac Studio, 2026-11-08: five trees held 118 GiB of a 195 GiB cache against its
+# 40 GiB cap, every one an unknown path the family never listed, so each pressure run reclaimed 0.
+CMUX_TUI_CARGO = "cmux-tui-cargo"
+CMUX_TUI_TREE_RE = re.compile(r"rust-[0-9a-f]{16}")
+CMUX_TUI_KEY_RE = re.compile(r"[0-9a-f]{16}")
+# A tree written this recently is never taken, not even over the cap or under the floor: a cmux-tui job between
+# its Runner.Worker checks may be about to build into it again (cargo rewrites target/debug/deps as it links).
+CMUX_TUI_SETTLE_HOURS = 1.0
+
+
+def cmux_next_ci_tui_workers(root: Path) -> list[Path]:
+    """cmux-tui-cargo/<worker key> directories under ROOT: real directories, 16-hex names, no symlink from ROOT."""
+    base = root / CMUX_TUI_CARGO
+    if root.is_symlink() or not root.is_dir() or base.is_symlink() or not base.is_dir():
+        return []
+    return [w for w in _children(base)
+            if CMUX_TUI_KEY_RE.fullmatch(w.name) and w.is_dir() and not w.is_symlink()]
+
+
+def cmux_next_ci_tui_trees(root: Path) -> list[Path]:
+    """Every cmux-tui Cargo target tree under ROOT (cmux-tui-cargo/<worker key>/rust-<toolchain key>), whole."""
+    return [t for w in cmux_next_ci_tui_workers(root) for t in _children(w)
+            if CMUX_TUI_TREE_RE.fullmatch(t.name) and t.is_dir() and not t.is_symlink()]
+
+
+def cmux_next_ci_tui_tree(fam: Family, path: Path) -> bool:
+    """Whether PATH is a cmux-tui Cargo target tree of the cmux-next family."""
+    return (fam.id == CMUX_NEXT_CI_FAMILY and path.parent.parent == fam.root / CMUX_TUI_CARGO
+            and CMUX_TUI_TREE_RE.fullmatch(path.name) is not None and CMUX_TUI_KEY_RE.fullmatch(path.parent.name)
+            is not None and path in cmux_next_ci_tui_trees(fam.root))
+
+
+def cmux_next_ci_tui_owner(worker: Path) -> Path | None:
+    """The enrolled runner whose cmux-tui worker directory WORKER is: the warm-target script's worker key is
+    sha256("$RUNNER_NAME\\n$repo_root\\n")[:16], the release key's shape with the checkout as $GITHUB_WORKSPACE
+    (cmux_next_ci_release_keys). None for a key no enrolled runner has; OWNER_UNKNOWN when a .runner could not be
+    read in the same read (the tree may be that runner's)."""
+    roster = enrolled_runner_roster()
+    owner = cmux_next_ci_release_keys(roster).get(worker.name)
+    return owner if owner is not None or roster[1] else OWNER_UNKNOWN
+
+
+def cmux_next_ci_tui_busy(tree: Path, opened: list[str] | frozenset[str], commands: str,
+                          owner: Path | None = None) -> str:
+    """Why a cmux-tui Cargo target tree is in use, or "": its runner has a job (its Runner.Worker; one runner runs
+    one job, so only that runner writes the tree), whose it is cannot be told, or a process is open in or names its
+    worker directory (cargo holds target/debug/.cargo-lock open while it builds; rustc names its --out-dir)."""
+    runner = cmux_next_ci_tui_owner(tree.parent) if owner is None else owner
+    if runner == OWNER_UNKNOWN:
+        return "an enrolled runner's .runner names no agent: whose cmux-tui target this is is unknown"
+    if runner is not None and (why := runner_job_live(runner, commands)):
+        return why
+    worker = os.fspath(tree.parent)
+    if in_cwd(worker, opened) or named_by(worker, commands):
+        return "cmux-tui target is referenced by a process"
+    return ""
+
+
+def cmux_next_ci_tui_recheck(fam: Family, path: Path):
+    """after_rename for a cmux-tui Cargo target tree: fresh evidence once it is aside. Its runner took a job, its
+    owner changed from the one vetted, or a process is open in or names it, and it goes back (or, when a new tree
+    already stands at its path, stays aside for interrupted-deletions)."""
+    doomed = path.with_name(f"{DELETING_PREFIX}{path.name}-{os.getpid()}")
+    vetted = CMUX_NEXT_CI_VETTED_OWNER.get(path, OWNER_UNKNOWN)
+
+    def recheck() -> None:
+        try:
+            opened, cmds = process_evidence()
+        except NoEvidence:
+            opened, cmds = None, ""
+        owner = cmux_next_ci_tui_owner(path.parent)
+        taken = (opened is None or OWNER_UNKNOWN in (owner, vetted) or owner != vetted
+                 or bool(cmux_next_ci_tui_busy(path, open_index(opened), cmds, owner=owner))
+                 or in_cwd(os.fspath(doomed), open_index(opened)) or named_by(os.fspath(doomed), cmds))
+        if not taken:
+            return
+        try:
+            rename_noreplace(doomed, path)
+        except OSError as e:
+            raise SlotTaken(f"{path.name}: could not be put back ({e.strerror}); left aside as {doomed.name}")
+        raise SlotTaken(f"{path.name}: its runner took a job or a process opened it; put back")
+    return recheck
+
+
+def cmux_next_ci_aside_parents(root: Path) -> list[Path]:
+    """Where a cmux-next removal renames a whole item aside: state parents, host roots, cmux-tui worker dirs."""
+    return cmux_next_ci_state_parents(root) + cmux_next_ci_host_parents(root) + cmux_next_ci_tui_workers(root)
+
+
 def cmux_next_ci_host_lock_held(host: Path) -> str:
     """Why a host root's builds hold it, from flock(2) on <root>/lock, or "". cmux's host_build_lock.py takes it
     exclusive without waiting, and the clone, xcodebuild and ditto inherit it, so the kernel holds it until the last
@@ -11000,6 +11104,7 @@ def cmux_next_ci_generated_paths(root: Path, whole_stale: bool = False) -> list[
     found.extend(slot for slot in cmux_next_ci_floor_slots(root) if slot not in stale)
     if not CMUX_NEXT_CI_DRAIN:  # listed whole and always, so a report shows it; its window decides (item_window)
         found.extend(cmux_next_ci_host_roots(root))
+        found.extend(cmux_next_ci_tui_trees(root))  # each Cargo target whole; a drain takes Xcode output only
     return found
 
 
@@ -11136,6 +11241,9 @@ def cmux_next_ci_busy(fam: Family, path: Path, opened: list[str] | frozenset[str
         return ""
     if cmux_next_ci_host_root(fam, path):  # no runner's state: its builds' flock is its in-use signal
         return cmux_next_ci_host_lock_held(path)
+    if cmux_next_ci_tui_tree(fam, path):  # one runner's Cargo target: that runner's job, open files, command lines
+        CMUX_NEXT_CI_VETTED_OWNER[path] = owner = cmux_next_ci_tui_owner(path.parent)
+        return cmux_next_ci_tui_busy(path, opened, commands, owner=owner)
     state = cmux_next_ci_state_for(path, fam.root)
     if state is None and cmux_next_ci_over() and path in cmux_next_ci_stale_roots(fam.root):
         state = path  # an unowned state root the cap takes whole: the same vetoes, on the root itself

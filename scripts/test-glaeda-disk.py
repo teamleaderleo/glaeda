@@ -4473,6 +4473,121 @@ class GlaedaDiskTest(unittest.TestCase):
         for key in ("daily", "release-new"):
             self.assertTrue((st[key] / "Build").is_dir(), key)
 
+    def _cmux_tui_trees(self, home: Path, fam: "gd.Family") -> dict[str, Path]:
+        """A Mac Studio's layout, 2026-11-08: cmux-tui-cargo/<worker key>/rust-<toolchain key>, one Cargo target per
+        runner (keyed as cmux's cmux-tui-warm-target.sh keys it) and one of a runner no longer enrolled; 1 MiB
+        each, idle 5 h (runner 1), 4 h (runner 2) and 9 h (gone)."""
+        toolchain = "rust-ad584c1c79663752"
+        trees = {
+            "tui-1": (fam.root / "cmux-tui-cargo" / self._release_key("mini-glaeda", home / "actions-runner-glaeda")
+                      / toolchain, 5),
+            "tui-2": (fam.root / "cmux-tui-cargo" / self._release_key("mini-glaeda-2", home / "actions-runner-glaeda-2")
+                      / toolchain, 4),
+            "tui-gone": (fam.root / "cmux-tui-cargo/bbbbbbbbbbbbbbbb" / toolchain, 9),
+        }
+        for tree, hours in trees.values():
+            make(tree / "debug/deps/libcmux.rlib", age_hours=hours)
+            (tree / "CACHEDIR.TAG").write_text("Signature: 8a477f597d28d172789f06886806bc55\n")
+            self._age(tree, hours=hours)
+        return {k: t for k, (t, _) in trees.items()}
+
+    def test_cmux_tui_targets_are_listed_whole_and_keyed_to_their_runner(self) -> None:
+        # A Mac Studio, 2026-11-08: 118 GiB of cmux-tui-cargo trees, "cmux_next_ci_over_gib": 119.2, "reclaimed_gib": 0.0
+        home, fam, _ = self._cmux_next_cap_tree()
+        tui = self._cmux_tui_trees(home, fam)
+        (fam.root / "cmux-tui-cargo/not-a-key/rust-ad584c1c79663752").mkdir(parents=True)  # another layout: never
+        (fam.root / "cmux-tui-cargo" / tui["tui-1"].parent.name / "notes").mkdir()
+        with mock.patch.object(gd, "HOME", home):
+            self.assertEqual(sorted(gd.cmux_next_ci_tui_trees(fam.root)), sorted(tui.values()))
+            self.assertEqual(gd.cmux_next_ci_tui_owner(tui["tui-1"].parent), home / "actions-runner-glaeda")
+            self.assertEqual(gd.cmux_next_ci_tui_owner(tui["tui-2"].parent), home / "actions-runner-glaeda-2")
+            self.assertIsNone(gd.cmux_next_ci_tui_owner(tui["tui-gone"].parent))
+            for tree in tui.values():
+                self.assertIn(tree, gd.cmux_next_ci_generated_paths(fam.root))
+                self.assertTrue(gd.cmux_next_ci_tui_tree(fam, tree))
+            self.assertFalse(gd.cmux_next_ci_tui_tree(fam, tui["tui-1"] / "debug"))
+
+    def test_cmux_tui_targets_age_out_and_go_least_recently_written_first_over_the_cap(self) -> None:
+        home, fam, st = self._cmux_next_cap_tree()
+        tui = self._cmux_tui_trees(home, fam)
+        worker = f"{home}/actions-runner-glaeda-2/bin/Runner.Worker spawnclient 1 2\n"
+
+        def verdicts(over, opened=(), cmds=worker):
+            gd._DISCOVERED.clear()
+            with mock.patch.object(gd, "HOME", home), \
+                    mock.patch.object(gd, "process_evidence", return_value=(list(opened), cmds)), \
+                    mock.patch.object(gd, "ACTIVITY_MODE", "pressure"), mock.patch.object(gd, "CMUX_NEXT_CI_OVER", over):
+                return {Path(i.path): (i.verdict, i.reasons) for i in gd.survey([fam], 24, 0)}
+        # within the cap: each waits out the family's window (24 h here)
+        v = verdicts(0)
+        self.assertEqual(v[tui["tui-1"]][0], "recent")
+        self.assertEqual(v[tui["tui-gone"]][0], "recent")
+        self._age(tui["tui-gone"], hours=25)
+        self.assertEqual(verdicts(0)[tui["tui-gone"]][0], "reclaimable")
+        # over the cap the window gives way; the runner with a job keeps its tree
+        v = verdicts(5 * gd.GIB)
+        self.assertEqual(v[tui["tui-1"]][0], "reclaimable")
+        self.assertTrue(any("cmux-tui Cargo target" in r for r in v[tui["tui-1"]][1]))
+        self.assertEqual(v[tui["tui-2"]], ("in-use", ["actions-runner-glaeda-2 is running a job (Runner.Worker)"]))
+        # a tree written within the settle window stays, even over the cap
+        self._age(tui["tui-1"], hours=0.5)
+        self.assertEqual(verdicts(5 * gd.GIB)[tui["tui-1"]][0], "recent")
+        self._age(tui["tui-1"], hours=5)
+        # an open file in it (cargo's .cargo-lock) or a command naming it keeps it
+        lock = tui["tui-1"] / "debug/.cargo-lock"
+        self.assertEqual(verdicts(5 * gd.GIB, opened=[os.fspath(lock)], cmds="")[tui["tui-1"]][0], "in-use")
+        rustc = f"rustc --out-dir {tui['tui-gone']}/debug/deps src/lib.rs\n"
+        self.assertEqual(verdicts(5 * gd.GIB, cmds=rustc)[tui["tui-gone"]][0], "in-use")
+        # a .runner that cannot be read: whose tree this is is unknown, so none goes
+        (home / "actions-runner-glaeda/.runner").write_text("{")
+        self.assertEqual(verdicts(5 * gd.GIB, cmds="")[tui["tui-gone"]][0], "in-use")
+
+    def test_cmux_tui_targets_are_evicted_whole_least_recently_written_first(self) -> None:
+        home, fam, st = self._cmux_next_cap_tree()
+        tui = self._cmux_tui_trees(home, fam)
+        self._age(tui["tui-gone"], hours=9)
+        over = int(1.5 * 1024 * 1024)  # two 1 MiB entries bring it under
+        receipt = self.receipt()
+        with mock.patch.object(gd, "HOME", home), mock.patch.object(gd, "process_evidence", return_value=([], "")), \
+                mock.patch.object(gd, "command_lines", return_value=""), \
+                mock.patch.object(gd, "ACTIVITY_MODE", "pressure"), mock.patch.object(gd, "CMUX_NEXT_CI_OVER", over), \
+                contextlib.redirect_stdout(io.StringIO()):
+            gd._DISCOVERED.clear()
+            items = [i for i in gd.survey([fam], 6, 0) if Path(i.path) in tui.values()]
+            # runner 1 takes a job after the survey: the fresh recheck keeps its tree
+            worker = f"{home}/actions-runner-glaeda/bin/Runner.Worker spawnclient 1 2\n"
+            with mock.patch.object(gd, "process_evidence", return_value=([], worker)):
+                gd.apply(items, {fam.id: fam}, receipt, None, 6, all_families=[fam])
+        records = [json.loads(line) for line in receipt.read_text().splitlines()]
+        self.assertEqual([(Path(r["path"]), r["outcome"]) for r in records],
+                         [(tui["tui-gone"], "reclaimed"),  # 9 h, the least recently written
+                          (tui["tui-1"], "changed:in-use"),  # 5 h, but its runner has a job now
+                          (tui["tui-2"], "reclaimed")])  # 4 h: now under the cap
+        self.assertFalse(tui["tui-gone"].exists())
+        self.assertFalse(tui["tui-2"].exists())
+        self.assertTrue((tui["tui-1"] / "debug/deps/libcmux.rlib/blob").is_file())
+
+    def test_cmux_tui_target_goes_back_when_its_runner_takes_a_job_after_the_rename(self) -> None:
+        home, fam, _ = self._cmux_next_cap_tree()
+        tui = self._cmux_tui_trees(home, fam)
+        tree = tui["tui-1"]
+        worker = f"{home}/actions-runner-glaeda/bin/Runner.Worker spawnclient 1 2\n"
+        with mock.patch.object(gd, "HOME", home):
+            gd.CMUX_NEXT_CI_VETTED_OWNER[tree] = home / "actions-runner-glaeda"
+            recheck = gd.cmux_next_ci_tui_recheck(fam, tree)
+            doomed = tree.with_name(f"{gd.DELETING_PREFIX}{tree.name}-{os.getpid()}")
+            os.rename(tree, doomed)
+            with mock.patch.object(gd, "process_evidence", return_value=([], worker)):
+                with self.assertRaises(gd.SlotTaken):
+                    recheck()
+            self.assertTrue(tree.is_dir())
+            self.assertFalse(doomed.exists())
+            # an aside tree an interrupted removal left keeps its runner's vetoes too
+            os.rename(tree, doomed)
+            self.assertIn("Runner.Worker", gd.cmux_next_ci_aside_busy(doomed, [], worker))
+            self.assertEqual(gd.cmux_next_ci_aside_busy(doomed, [], ""), "")
+            self.assertIn(tree.parent, gd.cmux_next_ci_aside_parents(fam.root))
+
     def test_runner_job_started_reads_the_workers_start_from_ps(self) -> None:
         runner = self.root / "actions-runner-glaeda-2"
         out = (f"Tue Oct 27 01:10:26 2026 {runner}/bin.2.338.0/Runner.Worker spawnclient 1 2\n"

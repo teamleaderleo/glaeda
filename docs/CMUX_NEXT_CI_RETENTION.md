@@ -7,6 +7,9 @@
 - `dev-daily-release/<hex key>/Release/<hex Xcode hash>`;
 - `release-compile/<hex key>/Release/<hex Xcode hash>`.
 
+Beside them it lists each cmux-tui Cargo target,
+`cmux-tui-cargo/<hex key>/rust-<hex toolchain key>`, whole (below).
+
 The key is one per runner and workspace, not a source fingerprint: cmux's
 `scripts/cmux-next/release-derived-data-path.sh` names it
 `sha256("$RUNNER_NAME\n$GITHUB_WORKSPACE\n")[:16]`. glaeda-disk computes it for
@@ -79,6 +82,34 @@ cmux14 (2026-10-27) eight states of five runners held 4-5 GiB of
 runner's running job included (above). An unmeasurable
 cache keeps the 72-hour window. cmux11s refused jobs at 21 GiB free under a
 40 GiB floor with 78 GiB here and nothing reclaimable (2026-10-21).
+
+## cmux-tui Cargo targets
+
+cmux's `scripts/ci/cmux-tui-warm-target.sh` keeps cmux-tui's Cargo target
+between jobs on an owned Mac, at
+`cmux-tui-cargo/<worker key>/rust-<toolchain key>` (both 16 hex). The worker
+key is `sha256("$RUNNER_NAME\n$repo_root\n")[:16]`, the release key's shape, so
+glaeda-disk maps each tree to its enrolled runner the same way. Each tree is
+generated output and one item, listed whole:
+
+- it goes once idle the family's window, and while the cache is over its cap
+  or under the runner floor hold the window gives way, least recently written
+  first, as for the rest of the family;
+- a tree written in the last hour (`CMUX_TUI_SETTLE_HOURS`, its newest mtime
+  two levels down, `debug/deps` included) is never taken;
+- its runner's running job (`Runner.Worker`) keeps it, with no "job predates"
+  exception: the job may not have reached its cmux-tui step yet;
+- a process open in or naming its worker directory keeps it (cargo holds
+  `target/debug/.cargo-lock` open while it builds; rustc names `--out-dir`);
+- a tree whose worker key no enrolled runner has keeps only the process,
+  open-file and settle vetoes; while a `.runner` cannot be read, none goes.
+
+Apply takes fresh process evidence before the rename and again after it; a
+runner that took a job meanwhile, or a process open in it, puts the tree back.
+A drain never lists these trees. A removed tree costs that runner's next
+cmux-tui job a cold build, about 10-15 minutes. A Mac Studio, 2026-11-08: five trees
+held 118 GiB of a 195 GiB cache against the 40 GiB cap, outside every layout
+the family knew, so every pressure run reclaimed 0.
 
 ## The per-host build root
 
