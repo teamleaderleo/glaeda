@@ -5016,8 +5016,9 @@ def shared_mirrors(home: Path) -> list[Path]:
     found: dict[str, Path] = {}
     for pattern in SHARED_MIRROR_GLOBS:
         for gitdir in sorted(home.glob(pattern)):
-            if any(p.is_symlink() for p in (gitdir, gitdir.parent, gitdir.parent.parent)):
-                continue
+            rel = gitdir.relative_to(home)
+            if any((home / q).is_symlink() for q in (rel, *list(rel.parents)[:-1])):
+                continue  # every folder between home and the mirror: a symlinked ~/Projects leads outside home
             if gitdir.is_dir() and (gitdir / "objects/pack").is_dir() and (gitdir / "HEAD").is_file():
                 found.setdefault(os.fspath(gitdir.resolve()), gitdir)
     return list(found.values())
@@ -5046,6 +5047,37 @@ def shared_mirror_veto(gitdir: Path, opened: frozenset[str], cmds: str, now: flo
     return ""
 
 
+SHARED_MIRROR_LOCK_MARK = "glaeda-disk"  # the text of a maintenance.lock this family took; git's own are not it
+
+
+def release_abandoned_compact_lock(lock: Path) -> bool:
+    """Remove a maintenance.lock this family took whose holder is gone (SIGKILL, a reboot): its text names the
+    wrapper's pid, and that pid no longer runs; or it names none (the wrapper never started) and is an hour old.
+    A lock git or anyone else took is never touched."""
+    try:
+        text = lock.read_text(errors="replace").strip()
+        age = time.time() - lock.lstat().st_mtime
+    except OSError:
+        return False
+    word, _, pid = text.partition(" ")
+    if word != SHARED_MIRROR_LOCK_MARK:
+        return False
+    if pid.isdigit():
+        try:
+            os.kill(int(pid), 0)
+            return False
+        except ProcessLookupError:
+            pass
+        except OSError:  # it runs as someone else: alive
+            return False
+    elif age < SHARED_MIRROR_TMP_STALE_S:
+        return False
+    with contextlib.suppress(OSError):
+        lock.unlink()
+        return True
+    return False
+
+
 def compact_shared_mirrors(receipt: Path, home: Path | None = None, halt=None) -> int:
     """Under the floor, fold the shared mirror with the most object bytes once it has SHARED_MIRROR_COMPACT_PACKS
     packs into one pack (SHARED_MIRROR_REPACK_ARGS: every object kept). It holds objects/maintenance.lock while
@@ -5054,6 +5086,7 @@ def compact_shared_mirrors(receipt: Path, home: Path | None = None, halt=None) -
     home = HOME if home is None else home
     clones = []
     for gitdir in shared_mirrors(home):
+        release_abandoned_compact_lock(gitdir / "objects/maintenance.lock")
         packs = git_pack_count(gitdir)
         if packs >= SHARED_MIRROR_COMPACT_PACKS:
             clones.append((git_object_bytes(gitdir), packs, gitdir))
@@ -5099,7 +5132,10 @@ def _gc_clones(receipt: Path, clones: list[tuple[int, Path, Path]], family: str,
         held = lock(gitdir) if lock is not None and not why else None
         if held is not None:
             try:
-                os.close(os.open(held, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644))
+                fd = os.open(held, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+                with contextlib.suppress(OSError):
+                    os.write(fd, SHARED_MIRROR_LOCK_MARK.encode() + b"\n")
+                os.close(fd)
             except FileExistsError:
                 why, held = f"a git operation holds {os.path.relpath(held, gitdir)}", None
             except OSError as e:
@@ -5112,8 +5148,11 @@ def _gc_clones(receipt: Path, clones: list[tuple[int, Path, Path]], family: str,
             nice = shutil.which("nice")
             argv = [*([nice, "-n", "15"] if nice else []), git, "-c", "gc.worktreePruneExpire=never",
                     "-C", os.fspath(tree), *git_args(tree)]
-            if held is not None:  # the lock goes when git exits, also when it outlives this pass
-                argv = ["/bin/sh", "-c", '"$@"; s=$?; rm -f "$0"; exit $s', os.fspath(held), *argv]
+            if held is not None:  # the lock goes when git exits or the wrapper is stopped, also after this pass;
+                # it names the wrapper's pid, so release_abandoned_compact_lock frees it after a SIGKILL or reboot
+                argv = ["/bin/sh", "-c", f'echo "{SHARED_MIRROR_LOCK_MARK} $$" > "$0"; '
+                        'trap \'rm -f "$0"; exit 143\' HUP INT TERM; "$@"; s=$?; rm -f "$0"; exit $s',
+                        os.fspath(held), *argv]
             proc = None
             try:
                 HOME_CLONE_GC_LOG.parent.mkdir(parents=True, exist_ok=True)

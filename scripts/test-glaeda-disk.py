@@ -7146,6 +7146,51 @@ class GlaedaDiskTest(unittest.TestCase):
         self.assertEqual(self._git("--git-dir", os.fspath(mirror), "rev-list", "--all").split(), heads)
         self._git("--git-dir", os.fspath(mirror), "fsck", "--no-progress")
 
+    def test_shared_mirrors_never_lie_beneath_a_symlinked_folder(self) -> None:
+        home, mirror, _ = self._shared_mirror(4)
+        outside = self.root / "outside"
+        shutil.move(os.fspath(home / "Projects"), os.fspath(outside))
+        (home / "Projects").symlink_to(outside)  # ~/Projects leads outside home (review F2)
+        self.assertEqual(gd.shared_mirrors(home), [])
+
+    def test_shared_mirror_compact_lock_is_freed_when_its_holder_is_gone(self) -> None:
+        home, mirror, _ = self._shared_mirror(4)
+        lock = mirror / "objects/maintenance.lock"
+        # stopped with SIGTERM: the wrapper's trap removes the lock (review F1)
+        argv = ["/bin/sh", "-c", f'echo "{gd.SHARED_MIRROR_LOCK_MARK} $$" > "$0"; '
+                'trap \'rm -f "$0"; exit 143\' HUP INT TERM; "$@"; s=$?; rm -f "$0"; exit $s',
+                os.fspath(lock), "sleep", "2"]
+        lock.write_text(gd.SHARED_MIRROR_LOCK_MARK + "\n")
+        proc = subprocess.Popen(argv)
+        for _ in range(200):
+            if lock.read_text().strip() != gd.SHARED_MIRROR_LOCK_MARK:
+                break
+            time.sleep(0.01)
+        self.assertFalse(gd.release_abandoned_compact_lock(lock))  # its holder runs
+        proc.terminate()
+        proc.wait(timeout=10)  # sh runs the trap once its child (git) exits
+        self.assertFalse(lock.exists())
+        # killed outright, or a reboot: the pid it names is gone, so the next pass frees it
+        dead = subprocess.Popen(["true"])
+        dead.wait()
+        lock.write_text(f"{gd.SHARED_MIRROR_LOCK_MARK} {dead.pid}\n")
+        self.assertTrue(gd.release_abandoned_compact_lock(lock))
+        # git's own lock, and ours before the wrapper started (under an hour), stay
+        lock.write_text("")
+        self.assertFalse(gd.release_abandoned_compact_lock(lock))
+        lock.write_text(gd.SHARED_MIRROR_LOCK_MARK + "\n")
+        self.assertFalse(gd.release_abandoned_compact_lock(lock))
+        os.utime(lock, (time.time() - 2 * 3600,) * 2)
+        self.assertTrue(gd.release_abandoned_compact_lock(lock))
+        # a pass after a SIGKILL compacts again
+        lock.write_text(f"{gd.SHARED_MIRROR_LOCK_MARK} {dead.pid}\n")
+        gd.process_evidence = lambda: ([], "")
+        receipt = self.receipt()
+        with self._gc_log(), contextlib.redirect_stdout(io.StringIO()):
+            gd.compact_shared_mirrors(receipt, home)
+        self.assertEqual(gd.git_pack_count(mirror), 1)
+        self.assertFalse(lock.exists())
+
     def test_shared_mirror_compact_below_the_pack_threshold_does_nothing(self) -> None:
         home, mirror, _ = self._shared_mirror(3)
         receipt = self.receipt()
