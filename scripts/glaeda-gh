@@ -1667,6 +1667,9 @@ class Daemon:
         self.errors: list[str] = []
         self.attempted: dict[str, float] = {}  # when each key was last fetched: a new one at most once per cycle
         self.rest_tried: dict[str, float] = {}  # when a REST read of each key last ended, answered or failed
+        # when a confirming read (wait_confirms) of each run was last made ahead of the rest: one such read per finish
+        self.confirm_tried: dict[str, float] = {}
+        self.confirming: set[str] = set()  # the runs this tick's due() put first as confirming reads
         self.repo_parts: dict[str, dict] = {}  # REST path -> {"at", "part"}: repo/base-level answers every PR shares
         self.deferred_before: dict[str, float] = {}  # deferred by the last tick: when each was first deferred
         self.deferred_since: dict[str, float] = {}  # when each key still deferred was first deferred
@@ -2529,6 +2532,8 @@ class Daemon:
         # wait on a CI run) it timed out every time while the cache held its failure.
         # Bounded too: the read stores restRunAt, and then the run no longer needs confirming for that wait.
         out.sort(key=lambda e: not (self.wait_confirms(e) or (e["cache"] is None and self.waited(e))))
+        if kind == "run":
+            self.confirming = {e["key"] for e in out if self.wait_confirms(e)}
         for e in out:
             self.attempted[e["key"]] = self.now
         return out
@@ -2536,8 +2541,14 @@ class Daemon:
     def wait_confirms(self, e: dict) -> bool:
         """A finished run a wait is blocked on that GitHub has not shown since the wait (run_needs_confirm): the cache
         holds the answer, and wait_step rules on it after one read. That read goes ahead of every other, deferred keys
-        included; then the run is an ordinary key again."""
-        return e["key"].startswith("run:") and self.waited(e) and self.run_needs_confirm(e)
+        included; then the run is an ordinary key again. Once per finish: a confirming read that failed (restRunAt
+        still older than it, confirm_tried) is retried with the normal aging and deferral, or a run GitHub keeps
+        refusing would take the head of every tick ahead of healthy deferred work (review of glaeda#1924)."""
+        if not (e["key"].startswith("run:") and self.waited(e) and self.run_needs_confirm(e)):
+            return False
+        shown = (e.get("cache") or {}).get("restRunAt")
+        shown = float(shown) if isinstance(shown, (int, float)) and not isinstance(shown, bool) else float("-inf")
+        return self.confirm_tried.get(e["key"], float("-inf")) <= shown
 
     def run_needs_confirm(self, e: dict) -> bool:
         """A finished run a wait blocks on, or a rerun was brokered for, after GitHub last showed it (restRunAt): its
@@ -2774,10 +2785,15 @@ class Daemon:
         except Exception as error:  # noqa: BLE001  the waits are the clients' business; the reads go on
             waiting = None
             self.errors.append(f"waits: {describe(error)} at {error_site(error)}")
+        # a confirming read that was made (not deferred unread) has had its turn ahead of the rest (wait_confirms)
+        for key in self.confirming - self.deferred:
+            self.confirm_tried[key] = self.now
+        self.confirming = set()
         self.deferred &= {e["key"] for e in entries}
         self.nudged &= {e["key"] for e in entries}
         self.attempted = {k: t for k, t in self.attempted.items() if self.now - t < 2 * IDLE_EXPIRY}
         self.rest_tried = {k: t for k, t in self.rest_tried.items() if self.now - t < 2 * IDLE_EXPIRY}
+        self.confirm_tried = {k: t for k, t in self.confirm_tried.items() if self.now - t < 2 * IDLE_EXPIRY}
         oldest = self.oldest_data(entries, {e["key"] for e in prs + runs + comments + heads})
         self.prune({e["key"] for e in entries})
         self.post_prune()
