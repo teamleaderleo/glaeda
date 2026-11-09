@@ -73,6 +73,18 @@ class IdleRepairTest(unittest.TestCase):
             self.assertEqual(idle.main(["--status"]), 0)
         load.assert_not_called()
 
+    def test_idle_runs_worktree_reclaim_after_disk_and_health(self) -> None:
+        disk = mock.Mock()
+        disk.host_busy.return_value = ""
+        reclaim = self.tmp.name + "/reclaim"
+        Path(reclaim).write_text("#!/bin/sh\n")
+        with mock.patch.object(idle, "load_disk_module", return_value=disk), \
+             mock.patch.dict(idle.os.environ, {"GLAEDA_WORKTREE_RECLAIM_ALL": reclaim}), \
+             mock.patch.object(idle, "run", side_effect=[(0, "disk", ""), (0, "health", ""), (0, "reclaim", "")]) as run:
+            self.assertEqual(idle.main(["--apply"]), 0)
+        self.assertEqual(run.call_count, 3)
+        self.assertEqual(run.call_args_list[-1].args[0][0:4], ["/bin/bash", reclaim, "--apply", "--output"])
+
 
 if __name__ == "__main__":
     unittest.main()
