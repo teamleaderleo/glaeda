@@ -232,7 +232,12 @@ class FakeGitHub:
                     "checkRuns": {"pageInfo": {"hasNextPage": bool(by_id[i].get("runs_more"))},
                                   "nodes": [{k: v for k, v in r.items() if k not in ("__typename", "checkSuite")}
                                             for r in by_id[i]["runs"]]}} for i in v["suites"]]
-                return 200, self.rate("graphql", self.graphql_remaining), json.dumps({"data": data}).encode()
+                for n, i in enumerate(v["suites"]):  # a suite GitHub fails a field of: null beside a nested error
+                    if by_id.get(i, {}).get("null_runs"):
+                        data["suiteRuns"][n]["checkRuns"] = None
+                        errors.append({"message": "Something went wrong", "path": ["suiteRuns", n, "checkRuns"]})
+                body = {"data": data, **({"errors": errors} if errors else {})}
+                return 200, self.rate("graphql", self.graphql_remaining), json.dumps(body).encode()
             if "nodes(ids:" in doc["query"]:
                 self.step_queries.append(list(v["ids"]))
                 data["nodes"] = [{"id": i, "steps": {"nodes": self.steps[i]}} if i in self.steps else None
@@ -5697,12 +5702,43 @@ class HeadChecksTest(Base):
         node = pr_node(1, rollup="SUCCESS", checks=[check_run("build")])
         self.gh.prs[("o", "r", 1)] = node
         self.gh.suites[node["headRefOid"]] = [{"id": "S1", "latest": 0, "runs": [self.red_publish()]}]
-        self.daemon.policy = {**self.daemon.policy, "graphqlPerMinute": 1}
         gg.register(gg.parse_key("pr", "o/r#1"))
-        self.daemon.tick(NOW)
+        # tick() reads the policy afresh: the ceiling is set where it reads it (review on glaeda#1916 at af5363f6, F3)
+        with mock.patch.object(gg, "daemon_policy", return_value={**gg.daemon_policy(), "graphqlPerMinute": 1}):
+            self.daemon.tick(NOW)
         data = gg.read_cache(gg.parse_key("pr", "o/r#1"))["data"]
         self.assertNotIn("checksPageError", data)
         self.assertEqual(gg.check_verdict(data, "green"), gg.EXIT_FAIL)
+
+    def test_a_held_later_chunk_keeps_the_suites_already_read(self) -> None:
+        """Review on glaeda#1916 at af5363f6, F2: two green PRs of 60 empty suites each fill two suite queries; the
+        ceiling holds the second. PR 1's suites were all read in the first, so it stays green; PR 2 waits."""
+        for n in (1, 2):
+            node = pr_node(n, rollup="SUCCESS", checks=[check_run("build")])
+            node["headRefOid"] = f"{n}" * 40
+            self.gh.prs[("o", "r", n)] = node
+            self.gh.suites[node["headRefOid"]] = [{"id": f"E{n}-{k}", "latest": 0, "runs": []} for k in range(60)]
+            gg.register(gg.parse_key("pr", f"o/r#{n}"))
+        with mock.patch.object(gg, "daemon_policy", return_value={**gg.daemon_policy(), "graphqlPerMinute": 2}):
+            self.daemon.tick(NOW)
+        one = gg.read_cache(gg.parse_key("pr", "o/r#1"))["data"]
+        self.assertNotIn("checksPageError", one)
+        self.assertEqual(gg.check_verdict(one, "green"), 0)
+        two = gg.read_cache(gg.parse_key("pr", "o/r#2"))["data"]
+        self.assertIn("graphqlPerMinute", two.get("checksPageError") or "")
+
+    def test_a_nested_error_on_a_suite_is_partial_not_an_empty_green_suite(self) -> None:
+        """Review on glaeda#1916 at af5363f6, F1: GitHub returned the suite with a null checkRuns beside an error, and
+        the reader took it for a suite that ran nothing, so an older failed attempt's red was gone: green."""
+        node = pr_node(1, rollup="SUCCESS", checks=[check_run("build")])
+        self.gh.prs[("o", "r", 1)] = node
+        self.gh.suites[node["headRefOid"]] = [{"id": "SF", "latest": 0, "runs": [self.red_publish()],
+                                               "null_runs": True}]
+        gg.register(gg.parse_key("pr", "o/r#1"))
+        self.daemon.tick(NOW)
+        data = gg.read_cache(gg.parse_key("pr", "o/r#1"))["data"]
+        self.assertIn("Something went wrong", data.get("checksPageError") or "")
+        self.assertNotEqual(gg.check_verdict(data, "green"), 0)
 
     def test_the_batched_pr_read_costs_one_point_per_pr(self) -> None:
         """GitHub prices a query by the requests its connections need: each connection costs the product of the

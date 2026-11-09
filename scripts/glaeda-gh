@@ -3338,44 +3338,58 @@ class Daemon:
 
     def suite_runs(self, suites: list[str], paced: bool = True) -> tuple[dict[str, list[dict] | str], str | None]:
         """Suite id -> its check-run context nodes over every attempt (statusCheckRollup's shape, marked
-        lastRealAttempt), or the error that suite alone could not be read with, SUITE_RUNS_BATCH suites per query;
-        ({}, error) when no suite could be read (held by the pace, or no response).
+        lastRealAttempt), or the error that suite alone could not be read with (held by the pace, no response, a
+        nested error), SUITE_RUNS_BATCH suites per query. The second value is always None, kept for the callers.
 
         Paced like every other query (glaeda#1844 F2): past graphqlPerMinute it reads nothing, and unread is partial,
         never green; the next cycle reads it. A batch's own follow-up (PACED false) takes its first query unpaced: it
         is part of the read the ceiling already admitted, and holding it would turn the whole batch partial."""
         suites = list(dict.fromkeys(suites))
-        out: dict[str, list[dict]] = {}
+        out: dict[str, list[dict] | str] = {}
+        # Every failure is the error of the suites it left unread only (router-review BLOCKs on glaeda#1916 at
+        # a01313fc and af5363f6): the batch holds many PRs' suites, and what was read stays read.
         for start in range(0, len(suites), SUITE_RUNS_BATCH):
             chunk = suites[start:start + SUITE_RUNS_BATCH]
             if (paced or start) and not self.gql_room():
-                return {}, "graphql: last real attempt: held by graphqlPerMinute; read next cycle"
+                for suite_id in suites[start:]:
+                    out[suite_id] = "graphql: last real attempt: held by graphqlPerMinute; read next cycle"
+                break
             reason, self.gql_reason = self.gql_reason, "last-real-attempt"
             try:
                 doc, error = self.graphql(SUITE_RUNS, {"suites": chunk})
             finally:
                 self.gql_reason = reason
             if doc is None:
-                return {}, error or "graphql: no response"
+                for suite_id in suites[start:]:
+                    out[suite_id] = error or "graphql: no response"
+                break
             found = (doc.get("data") or {}).get("suiteRuns")
+            errors = [e for e in doc.get("errors") or [] if isinstance(e, dict)]
             message = "graphql: last real attempt: " + str(
-                ((doc.get("errors") or [{}])[0] or {}).get("message") or "a suite could not be read")[:200]
+                (errors[0] if errors else {}).get("message") or "a suite could not be read")[:200]
+            # a nested error names its suite by path (["suiteRuns", i, ...]); one with no such path names them all
+            hit: set[int] = set()
+            for e in errors:
+                path = e.get("path")
+                if isinstance(path, list) and len(path) > 1 and path[0] == "suiteRuns" and type(path[1]) is int:
+                    hit.add(path[1])
+                else:
+                    hit.update(range(len(chunk)))
             if not isinstance(found, list) or len(found) != len(chunk):
                 found = [None] * len(chunk)
-            # A suite that cannot be read is that suite's error only (router-review BLOCK on glaeda#1916 at a01313fc):
-            # the batch holds many PRs' suites, and one bad suite must not make every other PR in it partial.
-            for suite_id, suite in zip(chunk, found):
-                if not isinstance(suite, dict):
-                    out[suite_id] = message
+            for n, (suite_id, suite) in enumerate(zip(chunk, found)):
+                runs = suite.get("checkRuns") if isinstance(suite, dict) else None
+                nodes = runs.get("nodes") if isinstance(runs, dict) else None
+                if n in hit or not isinstance(nodes, list) or not all(isinstance(r, dict) for r in nodes):
+                    out[suite_id] = message  # a null field beside an error is no empty suite: never greener
                     continue
-                runs = suite.get("checkRuns") or {}
                 if (runs.get("pageInfo") or {}).get("hasNextPage"):
                     out[suite_id] = "graphql: last real attempt: more than 100 check runs in one suite"
                     continue
                 context = {"conclusion": suite.get("conclusion"), "app": suite.get("app"),
                            "workflowRun": suite.get("workflowRun")}
                 out[suite_id] = [{"__typename": "CheckRun", **run, "checkSuite": context, "lastRealAttempt": True}
-                                 for run in runs.get("nodes") or [] if run]
+                                 for run in nodes]
         return out, None
 
     def head_pages(self, sha: str, sources: list[tuple[str, str, dict]],
