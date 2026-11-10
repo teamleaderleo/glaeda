@@ -10635,13 +10635,64 @@ class PostJoinTest(unittest.TestCase):
         self.step(d, NOW + gg.POST_SPACING)
         self.assertEqual([c[2]["body"] for c in t.calls], ["one", "running"])
 
-    def test_a_wait_sees_a_comment_edited_after_it_began(self) -> None:
-        old = {"id": 5, "createdAt": "2026-01-01T00:00:00Z", "editedAt": gg.dt.datetime.fromtimestamp(NOW + 10, gg.dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), "body": "verdict",
+    def test_a_wait_sees_a_comment_the_outbox_edited_after_it_began(self) -> None:
+        at = gg.dt.datetime.fromtimestamp(NOW + 10, gg.dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        old = {"id": 5, "createdAt": "2026-01-01T00:00:00Z", "editedAt": at, "body": "verdict",
                "author": {"login": "me"}}
-        self.assertTrue(gg.comment_matches(old, None, re.compile("verdict"), 5, None, NOW))
-        self.assertTrue(gg.comment_matches(old, None, None, None, NOW))
-        self.assertFalse(gg.comment_matches({**old, "editedAt": None}, None, None, None, NOW))
-        self.assertFalse(gg.comment_matches(old, None, None, 5, None))  # no wait start: as before
+        ours = frozenset({5})
+        self.assertTrue(gg.comment_matches(old, None, re.compile("verdict"), 5, None, NOW, ours))
+        self.assertTrue(gg.comment_matches(old, None, None, None, NOW, NOW, ours))
+        self.assertFalse(gg.comment_matches({**old, "editedAt": None}, None, None, None, NOW, NOW, ours))
+        self.assertFalse(gg.comment_matches(old, None, None, 5, None, None, ours))  # no wait start: as before
+        # anyone else's edit (a typo fix, a ticked box) is not a new comment
+        self.assertFalse(gg.comment_matches(old, None, None, 5, None, NOW))
+        self.assertFalse(gg.comment_matches(old, None, None, None, NOW, NOW))
+
+    def test_an_edit_in_place_is_recorded_for_the_waits(self) -> None:
+        d, t, first, second = self.status_pair("IC_1")
+        self.step(d, NOW + gg.POST_SPACING)
+        self.assertEqual(gg.outbox_edits(), frozenset({5}))
+
+    def test_a_risk_receipt_and_a_watched_thread_are_not_joined(self) -> None:
+        self.queue("comment", "o/r#7", "--body", "one")
+        self.queue("comment", "o/r#7", "--body", "Review (codex): SHIP " + "a" * 40)
+        self.queue("comment", "o/r#8", "--body", "one")
+        self.queue("comment", "o/r#8", "--body", "two")
+        gg.watch_dir().mkdir(parents=True, exist_ok=True)
+        (gg.watch_dir() / gg.file_name("comment:o/r#8")).write_text("{}")
+        ok = (201, {}, {"html_url": "u"})
+        d, t = self.daemon(ok, ok, ok, ok)
+        for n in range(4):
+            self.step(d, NOW + n * gg.POST_SPACING)
+        self.assertEqual([c[2]["body"] for c in t.calls], ["one", "Review (codex): SHIP " + "a" * 40, "one", "two"])
+
+    def test_a_crash_mid_join_releases_the_members(self) -> None:
+        a = self.queue("comment", "o/r#7", "--body", "one")
+        b = self.queue("comment", "o/r#7", "--body", "two")
+        d, t = self.daemon((201, {}, {"html_url": "u1"}), (201, {}, {"html_url": "u2"}))
+        d.now = NOW
+        real = gg.write_json
+
+        def crash(path, doc):  # the daemon dies after marking the members, before writing the leader
+            if Path(path).stem == a["id"]:
+                raise KeyboardInterrupt
+            real(path, doc)
+        with mock.patch.object(gg, "write_json", crash), self.assertRaises(KeyboardInterrupt):
+            d.post_join(gg.outbox_dir() / f"{a['id']}.json", gg.read_json(gg.outbox_dir() / f"{a['id']}.json"))
+        self.step(d, NOW)
+        self.step(d, NOW + gg.POST_SPACING)
+        self.assertEqual([c[2]["body"] for c in t.calls], ["one", "two"])
+        self.assertEqual([gg.post_state(i["id"])["url"] for i in (a, b)], ["u1", "u2"])
+
+    def test_a_lasting_graphql_refusal_fails_the_comment_not_the_outbox(self) -> None:
+        item = self.queue("comment", "o/r#7", "--body", "landed")
+        d, t = self.daemon(self.subject(), (403, {}, {"errors": [{"type": "FORBIDDEN", "message": "SAML enforcement"}]}))
+        self.rich(d)
+        self.step(d, NOW)
+        state = gg.post_state(item["id"])
+        self.assertEqual(state["state"], "failed")
+        self.assertIn("SAML", state["error"])
+        self.assertLessEqual(d.post_hold, NOW)
 
 
 class PostBodyGuardTest(unittest.TestCase):
