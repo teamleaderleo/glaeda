@@ -56,6 +56,8 @@ gg.PACE_CLI = Path(tempfile.gettempdir()) / f"glaeda-gh-test-no-pacer-{os.getpid
 gg.EXPECTED_CONFIG = Path(tempfile.gettempdir()) / f"glaeda-gh-test-no-expected-{os.getpid()}.json"
 # Nor may a test's alarm reach the host's coordinator, or its notices.
 gg.ALARM_CMD = Path(tempfile.gettempdir()) / f"glaeda-gh-test-no-alarm-{os.getpid()}" / "tell-coordinator"
+# Nor may a pool alarm run the host's own gh-quota for its spenders list.
+gg.SPENDERS_CMD = os.fspath(Path(tempfile.gettempdir()) / f"glaeda-gh-test-no-spenders-{os.getpid()}" / "gh-quota")
 _NOTICES = tempfile.TemporaryDirectory(prefix="glaeda-gh-test-notices-")  # removed when the run ends
 gg.NOTICES_DIR = Path(_NOTICES.name)
 
