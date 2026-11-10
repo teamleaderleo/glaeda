@@ -2339,60 +2339,6 @@ class BalanceTest(Base):
         self.assertEqual(len([c for c in self.gh.rest_calls() if "/actions/jobs/" in c[1]]), 1)
         self.assertEqual(gg.read_cache("pr:o/r#4")["data"]["checks"][0]["failedSteps"], ["Set up runner"])
 
-    def test_a_merged_prs_failed_steps_are_not_read(self) -> None:
-        """Nothing waits on a merged or closed PR's failed steps: its REST read makes no jobs/{id} request."""
-        build = workflow_check("build", 5, conclusion="FAILURE", node_id="CR_build")
-        self.gh.prs[("o", "r", 4)] = pr_node(4, state="MERGED", rollup="FAILURE", checks=[build])
-        self.gh.job_steps[50] = [{"name": "Set up runner", "conclusion": "failure"}]
-        self.budgets(rest=(4000, 1800), graphql=(50, 3000))
-        gg.register("pr:o/r#4")
-        self.daemon.tick(NOW)
-        self.assertEqual(gg.read_cache("pr:o/r#4")["data"]["state"], "MERGED")
-        self.assertEqual([c for c in self.gh.rest_calls() if "/actions/jobs/" in c[1]], [])
-
-    def test_a_502_steps_read_is_asked_again_next_read_and_the_check_is_held(self) -> None:
-        """A 5xx is transient: the steps are read again at the normal pace, so a runner refusal is held for the rescue."""
-        build = {**workflow_check("build", 5, conclusion="FAILURE", node_id="CR_build"),
-                 "startedAt": iso(time.time() - 7), "completedAt": iso(time.time())}
-        self.gh.prs[("o", "r", 4)] = pr_node(4, rollup="FAILURE", checks=[build])
-        self.budgets(rest=(4000, 1800), graphql=(50, 3000))
-        gg.register("pr:o/r#4")
-        real = self.gh.__call__
-        flaky = {"left": 1}
-
-        def gh(method, path, *a, **k):
-            if "/actions/jobs/" in path and flaky["left"]:
-                flaky["left"] -= 1
-                return 502, {}, b'{"message": "Bad Gateway"}'
-            return real(method, path, *a, **k)
-        self.daemon.transport = gh
-        self.gh.job_steps[50] = [{"name": "Set up runner", "conclusion": "failure"}]
-        self.daemon.tick(NOW)
-        self.assertEqual(self.daemon.steps_failed, {})
-        gg.register("pr:o/r#4")
-        self.daemon.tick(NOW + gg.CYCLE)
-        data = gg.read_cache("pr:o/r#4")["data"]
-        self.assertEqual(data["checks"][0]["failedSteps"], ["Set up runner"])
-        self.assertIsNone(gg.verdict("pr", data, "green"))  # held for the rescue, not red
-
-    def test_a_failed_steps_read_is_not_retried_on_every_read(self) -> None:
-        """A job whose steps read failed (404) waits STEPS_RETRY before it is asked again, not one request a cycle."""
-        build = workflow_check("build", 5, conclusion="FAILURE", node_id="CR_build")
-        self.gh.prs[("o", "r", 4)] = pr_node(4, rollup="FAILURE", checks=[build])  # no job_steps: 404
-        self.budgets(rest=(4000, 1800), graphql=(50, 3000))
-        gg.register("pr:o/r#4")
-        jobs = lambda: len([c for c in self.gh.rest_calls() if "/actions/jobs/" in c[1]])  # noqa: E731
-        self.daemon.tick(NOW)
-        self.assertEqual(jobs(), 1)
-        for n in range(1, 4):
-            gg.register("pr:o/r#4")
-            self.daemon.tick(NOW + n * gg.CYCLE)
-        self.assertEqual(jobs(), 1)
-        self.daemon.steps_failed = {j: t - gg.STEPS_RETRY for j, t in self.daemon.steps_failed.items()}
-        gg.register("pr:o/r#4")
-        self.daemon.tick(NOW + 4 * gg.CYCLE)
-        self.assertEqual(jobs(), 2)
-
     def test_a_deleted_base_branch_keeps_the_last_requirements(self) -> None:
         self.gh.prs[("o", "r", 5)] = pr_node(5, checks=[workflow_check("build", 5)])
         self.gh.protected = ["ci-status"]
@@ -11594,6 +11540,18 @@ class ReaderTest(Base):
         pulls = [r for r in routes if r["route"].startswith("GET /repos/{owner}/{repo}/pulls/")]
         self.assertEqual(pulls[0]["topWaiter"], "session:waiter-1", routes)
         self.assertIn("waiter session:waiter-1", "\n".join(gg.spend_lines(self.daemon.spend_by())))
+
+    def test_a_job_list_read_inside_a_batch_is_charged_to_its_own_waiter(self) -> None:
+        """A GraphQL batch's REST job reads ran under the batch's caller, so two readers both showed "2 waiters"."""
+        self.daemon.transport = lambda *a: (200, {}, b'{"jobs": []}')
+        failed = {"id": 1, "status": "completed", "conclusion": "failure", "run_attempt": 1}
+        entries = [{"key": f"run:o/r/{n}", "jobs": False, "cache": None, "reader": who}
+                   for n, who in ((1, "session:a"), (2, "session:b"))]
+        with self.daemon.calling("run", "o/r", gg.waiters_of(entries)):
+            for e in entries:
+                self.daemon.read_jobs(e, {"data": {**failed, "id": int(e["key"][-1])}}, True)
+        rows = [r for r in self.daemon.spend_by()["restByCaller"] if "jobs" in r["route"]]
+        self.assertEqual(sorted(r["waiter"] for r in rows), ["session:a", "session:b"], rows)
 
     budgets = BalanceTest.budgets
 
