@@ -11693,6 +11693,13 @@ class SpendAlarmTest(Base):
         self.assertEqual(gg.host_spenders(), ([], 0))  # it answered: this host spent nothing
         self.assertEqual(gg.unlogged_text(5000, 1000, NOW + 600, NOW, None), ("", None))
 
+    def test_a_counter_that_expired_during_the_usage_read_gives_no_gap(self) -> None:
+        # 4,500 requests, all logged; the tick began before the reset, usage finished after it and its rolling hour
+        # kept 3,300: the expired counter must not call 1,200 unlogged.
+        self.assertEqual(gg.unlogged_text(5000, 500, NOW, NOW + 5, 3300), ("", None))
+        self.assertEqual(gg.unlogged_text(5000, 500, NOW, NOW, 3300), ("", None))  # at the reset itself too
+        self.assertEqual(gg.unlogged_text(5000, 500, NOW + 5, NOW, 3300)[1], 1200)  # before it, the same numbers count
+
     def test_a_window_just_after_a_reset_is_too_early_to_measure(self) -> None:
         """#1937 review: two minutes after a reset, 100 spent and none logged is no measure; the alarm says it is too
         early, never that nothing is unlogged."""

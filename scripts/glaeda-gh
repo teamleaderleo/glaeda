@@ -805,8 +805,11 @@ def unlogged_text(limit: int | None, remaining: int | None, reset: float | None,
     """(" At least G of the U REST ... ", G) for the REST no log on this host holds, else ("", None). Both sides
     cover the same requests, so a burst is not taken for a rate (#1936 review): U is what GitHub says the pool spent
     since its window opened (LIMIT - REMAINING, at most an hour back from RESET), and HOST_REST is every logged call
-    on this host in the last hour, which holds that window. G = U - HOST_REST can only understate what is unlogged."""
+    on this host in the last hour, which holds that window. G = U - HOST_REST can only understate what is unlogged.
+    NOW is read after the usage read: a long tick can cross RESET first (#1937 review)."""
     if host_rest is None or not isinstance(limit, int) or not isinstance(remaining, int) or reset is None:
+        return "", None
+    if reset <= now:  # the counter expired while usage ran: the host's hour has dropped requests it still counts
         return "", None
     since = max(0.0, min(3600.0, 3600.0 - (reset - now)))
     if since < UNLOGGED_EARLY:  # a fresh window has spent too little to compare: say so, never "nothing unlogged"
@@ -2357,7 +2360,7 @@ class Daemon:
             if name == "pool":  # read only when it is sent: at most a few times an hour
                 spenders, host_rest = host_spenders()
                 gap_text, gap = unlogged_text((self.budget.get("rest") or {}).get("limit") or 5000,
-                                              data.get("remaining"), data.get("reset"), self.now, host_rest)
+                                              data.get("remaining"), data.get("reset"), self.clock(), host_rest)
                 data = {**data, "spenders": spenders, "hostRest": host_rest, "unlogged": gap}
                 text += " " + spenders_text(spenders) + gap_text
             self.send_alarm(name, level, text, data)
