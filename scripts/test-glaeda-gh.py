@@ -10506,6 +10506,144 @@ class PostTest(unittest.TestCase):
         self.assertEqual(status["outbox"], {"queued": 1, "holdUntil": None})
 
 
+class PostJoinTest(unittest.TestCase):
+    """Leo, 2026-11-09, on sessions' queued comments: "when things get queued, don't they go in batches?" The
+    outbox joins the comments queued for one thread, posts over GraphQL while it is richer, and edits a writer's
+    own status comment in place when it is still the thread's last."""
+
+    setUp, daemon, queue, step = PostTest.setUp, PostTest.daemon, PostTest.queue, PostTest.step
+
+    GQL_RICH = {"graphql": {"limit": 5000, "remaining": 4900, "reset": NOW + 3000},
+                "rest": {"limit": 5000, "remaining": 400, "reset": NOW + 3000}}
+
+    def rich(self, d: Any) -> Any:
+        d.budget = {k: dict(v) for k, v in self.GQL_RICH.items()}
+        return d
+
+    @staticmethod
+    def subject(last: str | None = None) -> tuple:
+        nodes = [{"id": last}] if last else []
+        return (200, {}, {"data": {"repository": {"issueOrPullRequest": {"id": "I_1", "comments": {"nodes": nodes}}}}})
+
+    @staticmethod
+    def made(node: str, url: str, edit: bool = False) -> tuple:
+        comment = {"id": node, "databaseId": 5, "url": url, "authorAssociation": "MEMBER",
+                   "author": {"__typename": "User", "login": "me"}}
+        data = {"updateIssueComment": {"issueComment": comment}} if edit else \
+            {"addComment": {"commentEdge": {"node": comment}}}
+        return (200, {}, {"data": data})
+
+    def test_comments_queued_for_one_thread_go_out_as_one(self) -> None:
+        a = self.queue("comment", "o/r#7", "--body", "one")
+        other = self.queue("comment", "o/r#8", "--body", "elsewhere")
+        b = self.queue("comment", "o/r#7", "--body", "two")
+        c = self.queue("comment", "o/r#7", "--body", "three")
+        d, t = self.daemon((201, {}, {"html_url": "https://github.com/o/r/pull/7#issuecomment-1"}),
+                           (201, {}, {"html_url": "https://github.com/o/r/pull/8#issuecomment-2"}))
+        self.step(d, NOW)
+        self.assertEqual(t.calls, [("POST", "/repos/o/r/issues/7/comments",
+                                    {"body": gg.POST_JOIN_RULE.join(["one", "two", "three"])})])
+        for item in (a, b, c):  # each caller gets the comment that holds its section
+            state = gg.post_state(item["id"])
+            self.assertEqual((state["state"], state["url"]), ("posted", "https://github.com/o/r/pull/7#issuecomment-1"))
+        self.assertEqual(gg.post_state(other["id"])["state"], "queued")
+        self.step(d, NOW + gg.POST_SPACING)
+        self.assertEqual(t.calls[1], ("POST", "/repos/o/r/issues/8/comments", {"body": "elsewhere"}))
+        self.assertEqual(list(gg.outbox_dir().glob("*.json")), [])
+
+    def test_markers_and_comments_queued_apart_are_not_joined(self) -> None:
+        self.queue("comment", "o/r#7", "--body", "one")
+        self.queue("comment", "o/r#7", "--body", "<!-- review-running sha=abc -->\nrunning")
+        late = self.queue("comment", "o/r#7", "--body", "much later")
+        late["queuedAt"] += gg.POST_JOIN_WINDOW + 1
+        gg.write_json(gg.outbox_dir() / f"{late['id']}.json", late)
+        ok = (201, {}, {"html_url": "u"})
+        d, t = self.daemon(ok, ok, ok)
+        for n in range(3):
+            self.step(d, NOW + n * gg.POST_SPACING)
+        self.assertEqual([c[2]["body"] for c in t.calls],
+                         ["one", "<!-- review-running sha=abc -->\nrunning", "much later"])
+
+    def test_a_member_whose_leader_dropped_it_is_sent_alone(self) -> None:
+        a = self.queue("comment", "o/r#7", "--body", "one")
+        b = self.queue("comment", "o/r#7", "--body", "two")
+        gg.write_json(gg.outbox_dir() / f"{b['id']}.json", {**b, "joinedInto": a["id"]})  # the leader never named it
+        ok = (201, {}, {"html_url": "u"})
+        d, t = self.daemon(ok, ok)
+        d.now = NOW
+        member = gg.read_json(gg.outbox_dir() / f"{b['id']}.json")
+        self.assertFalse(d.post_member(gg.outbox_dir() / f"{b['id']}.json", member))
+        self.assertNotIn("joinedInto", gg.read_json(gg.outbox_dir() / f"{b['id']}.json"))
+
+    def test_a_comment_goes_over_graphql_while_it_is_richer(self) -> None:
+        item = self.queue("comment", "o/r#7", "--body", "landed")
+        d, t = self.daemon(self.subject(), self.made("IC_1", "https://github.com/o/r/pull/7#issuecomment-5"))
+        self.rich(d)
+        self.step(d, NOW)
+        self.assertEqual([c[1] for c in t.calls], ["/graphql", "/graphql"])
+        self.assertIn("addComment", t.calls[1][2]["query"])
+        self.assertEqual(t.calls[1][2]["variables"], {"s": "I_1", "b": "landed"})
+        state = gg.post_state(item["id"])
+        self.assertEqual((state["state"], state["url"]), ("posted", "https://github.com/o/r/pull/7#issuecomment-5"))
+        again = self.queue("comment", "o/r#7", "--body", "again")  # the subject is cached: one request
+        d.transport.answers.append(self.made("IC_2", "u2"))
+        self.step(d, NOW + gg.POST_SPACING)
+        self.assertEqual(len(t.calls), 3)
+        self.assertEqual(gg.post_state(again["id"])["url"], "u2")
+
+    def test_no_graphql_reading_posts_over_rest(self) -> None:
+        self.queue("comment", "o/r#7", "--body", "landed")
+        d, t = self.daemon((201, {}, {"html_url": "u"}))
+        self.step(d, NOW)
+        self.assertEqual(t.calls[0][1], "/repos/o/r/issues/7/comments")
+
+    def status_pair(self, last_for_second: str) -> tuple[Any, Any, dict, dict]:
+        first = self.queue("comment", "o/r#7", "--body", "running", "--status-key", "review-run=abc")
+        d, t = self.daemon(self.subject(), self.made("IC_1", "u1"))
+        self.rich(d)
+        self.step(d, NOW)
+        second = self.queue("comment", "o/r#7", "--body", "verdict", "--status-key", "review-run=abc")
+        t.answers += [self.subject(last_for_second), self.made(last_for_second, "u2", edit=last_for_second == "IC_1")]
+        return d, t, first, second
+
+    def test_a_writers_status_is_edited_in_place_while_it_is_the_last_comment(self) -> None:
+        d, t, first, second = self.status_pair("IC_1")
+        self.step(d, NOW + gg.POST_SPACING)
+        self.assertIn("updateIssueComment", t.calls[3][2]["query"])
+        self.assertEqual(t.calls[3][2]["variables"], {"c": "IC_1", "b": "verdict"})
+        self.assertEqual(gg.post_state(second["id"])["url"], "u2")
+
+    def test_a_status_another_comment_followed_is_posted_new(self) -> None:
+        d, t, first, second = self.status_pair("IC_9")
+        self.step(d, NOW + gg.POST_SPACING)
+        self.assertIn("addComment", t.calls[3][2]["query"])
+
+    def test_a_watched_thread_gets_a_new_comment_not_an_edit(self) -> None:
+        d, t, first, second = self.status_pair("IC_1")
+        t.answers[-1] = self.made("IC_2", "u2")
+        gg.watch_dir().mkdir(parents=True, exist_ok=True)
+        (gg.watch_dir() / gg.file_name("comment:o/r#7")).write_text("{}")
+        self.step(d, NOW + gg.POST_SPACING)
+        self.assertIn("addComment", t.calls[-1][2]["query"])
+
+    def test_a_status_comment_is_never_joined(self) -> None:
+        self.queue("comment", "o/r#7", "--body", "one")
+        self.queue("comment", "o/r#7", "--body", "running", "--status-key", "k")
+        ok = (201, {}, {"html_url": "u"})
+        d, t = self.daemon(ok, ok)
+        self.step(d, NOW)
+        self.step(d, NOW + gg.POST_SPACING)
+        self.assertEqual([c[2]["body"] for c in t.calls], ["one", "running"])
+
+    def test_a_wait_sees_a_comment_edited_after_it_began(self) -> None:
+        old = {"id": 5, "createdAt": "2026-01-01T00:00:00Z", "editedAt": gg.dt.datetime.fromtimestamp(NOW + 10, gg.dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), "body": "verdict",
+               "author": {"login": "me"}}
+        self.assertTrue(gg.comment_matches(old, None, re.compile("verdict"), 5, None, NOW))
+        self.assertTrue(gg.comment_matches(old, None, None, None, NOW))
+        self.assertFalse(gg.comment_matches({**old, "editedAt": None}, None, None, None, NOW))
+        self.assertFalse(gg.comment_matches(old, None, None, 5, None))  # no wait start: as before
+
+
 class PostBodyGuardTest(unittest.TestCase):
     """`post` asks the host's public-body guard before it queues, as the gh shim does for `gh pr|issue` writes
     (cmuxterm-hq#4946: ten public cmux PRs named fleet hosts after `glaeda-gh post pr`)."""
