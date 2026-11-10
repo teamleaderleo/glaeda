@@ -11478,8 +11478,8 @@ class SpendByPathTest(Base):
         self.assertEqual(spend["rest"], {"requests": 4, "counted": 2})
         runs = [r for r in spend["restByRoute"] if r["route"] == "GET /repos/{owner}/{repo}/actions/runs/{id}"][0]
         self.assertEqual((runs["requests"], runs["counted"], runs["topCaller"]), (2, 1, "run o/r"))
-        self.assertIn({"route": "GET /repos/{owner}/{repo}/pulls/{id}", "kind": "pr", "repo": "o/q", "waiter": "",
-                       "requests": 1, "counted": 1}, spend["restByCaller"])
+        self.assertIn({"route": "GET /repos/{owner}/{repo}/pulls/{id}", "kind": "pr", "repo": "o/q",
+                       "requests": 1, "counted": 1, "waiters": []}, spend["restByCaller"])
         self.assertEqual(self.daemon.rest_spent(), 2)  # the share's own count agrees
 
     def test_a_tick_charges_rest_reads_to_their_watch_and_graphql_to_its_query(self) -> None:
@@ -11827,7 +11827,20 @@ class ReaderTest(Base):
             for e in entries:
                 self.daemon.read_jobs(e, {"data": {**failed, "id": int(e["key"][-1])}}, True)
         rows = [r for r in self.daemon.spend_by()["restByCaller"] if "jobs" in r["route"]]
-        self.assertEqual(sorted(r["waiter"] for r in rows), ["session:a", "session:b"], rows)
+        self.assertEqual(len(rows), 1, rows)  # one route, kind and repo: one row, its waiters inside
+        self.assertEqual(sorted(w["waiter"] for w in rows[0]["waiters"]), ["session:a", "session:b"], rows)
+
+    def test_one_query_for_many_waiters_ranks_as_one_row(self) -> None:
+        """#1931 review: the waiter in each spend key split twelve 1-point pr queries into twelve rows, so a costlier
+        query with one waiter outranked them. They merge per query, kind and repo, the top waiters inside."""
+        rows = [{"bucket": "graphql", "name": "pr", "kind": "pr", "repo": "o/r", "waiter": f"session:s{n}",
+                 "requests": 1, "points": 1, "counted": 0} for n in range(12)]
+        rows.append({"bucket": "graphql", "name": "run", "kind": "run", "repo": "o/r", "waiter": "session:big",
+                     "requests": 1, "points": 5, "counted": 0})
+        gql = gg.spend_summary(rows)["graphqlByQuery"]
+        self.assertEqual([(q["query"], q["points"], q["queries"]) for q in gql], [("pr", 12, 12), ("run", 5, 1)])
+        self.assertEqual(len(gql[0]["waiters"]), gg.SPEND_WAITERS_SHOWN)
+        self.assertIn("for session:s0 1, session:s1 1, session:s10 1", gg.spend_lines({"graphqlByQuery": gql})[1])
 
     budgets = BalanceTest.budgets
 

@@ -740,6 +740,9 @@ def load_spend(doc: Any) -> dict[int, dict[str, list[int]]]:
     return out
 
 
+SPEND_WAITERS_SHOWN = 3  # waiters named inside one restByCaller or graphqlByQuery row
+
+
 def spend_summary(rows: list[dict], seconds: float = 3600.0, top: int = SPEND_TOP) -> dict:
     """The spend log's tables, most spent first: REST by route (with the caller that spent most on it), REST by
     route and caller, GraphQL by query and caller, and each bucket's totals."""
@@ -764,15 +767,38 @@ def spend_summary(rows: list[dict], seconds: float = 3600.0, top: int = SPEND_TO
                          "topWaiter": held[0], "topWaiterCounted": held[1], "waiters": len(waiters)})
     def rank(r: dict, field: str) -> tuple:
         return (-r[field], -r["requests"], r.get("route") or r.get("name") or "", r.get("kind", ""), r.get("repo", ""))
+
+    def by_caller(rows: list[dict], field: str) -> list[dict]:
+        """ROWS merged per name, kind and repo before ranking, its waiters inside (most FIELD first): a key holds
+        the waiter too, so twelve 1-point pr queries for twelve waiters were twelve rows, not one of 12 (#1931)."""
+        merged: dict[tuple, dict] = {}
+        for r in rows:
+            row = merged.setdefault((r["name"], r["kind"], r["repo"]), {"name": r["name"], "kind": r["kind"],
+                                                                         "repo": r["repo"], "requests": 0,
+                                                                         field: 0, "waiters": {}})
+            row["requests"] += r["requests"]
+            row[field] += r[field]
+            if r.get("waiter"):
+                row["waiters"][r["waiter"]] = row["waiters"].get(r["waiter"], 0) + r[field]
+        out = sorted(merged.values(), key=lambda r: rank(r, field))[:top]
+        for row in out:
+            row["waiters"] = [{"waiter": w, field: n} for w, n in
+                              sorted(row["waiters"].items(), key=lambda kv: (-kv[1], kv[0]))[:SPEND_WAITERS_SHOWN]]
+        return out
     return {"window": int(seconds),
             "rest": {"requests": sum(r["requests"] for r in rest), "counted": sum(r["counted"] for r in rest)},
             "graphql": {"queries": sum(r["requests"] for r in gql), "points": sum(r["points"] for r in gql)},
             "restByRoute": sorted(by_route, key=lambda r: rank(r, "counted"))[:top],
-            "restByCaller": [{"route": r["name"], "kind": r["kind"], "repo": r["repo"], "waiter": r.get("waiter", ""),
-                              "requests": r["requests"], "counted": r["counted"]}
-                             for r in sorted(rest, key=lambda r: rank(r, "counted"))[:top]],
+            "restByCaller": [{"route": r["name"], "kind": r["kind"], "repo": r["repo"], "requests": r["requests"],
+                              "counted": r["counted"], "waiters": r["waiters"]} for r in by_caller(rest, "counted")],
             "graphqlByQuery": [{"query": r["name"], "kind": r["kind"], "repo": r["repo"], "queries": r["requests"],
-                                "points": r["points"]} for r in sorted(gql, key=lambda r: rank(r, "points"))[:top]]}
+                                "points": r["points"], "waiters": r["waiters"]} for r in by_caller(gql, "points")]}
+
+
+def waiters_text(r: dict, field: str) -> str:
+    """" for W1 5, W2 3" from a spend_summary row's top waiters."""
+    shown = [f"{w.get('waiter')} {w.get(field, 0)}" for w in r.get("waiters") or [] if isinstance(w, dict)]
+    return f" for {', '.join(shown)}" if shown else ""
 
 
 def route_waiter(r: dict) -> str:
@@ -7166,10 +7192,10 @@ def spend_lines(spend: Any) -> list[str]:
                    f"(most: {r.get('topCaller') or '?'} {r.get('topCallerCounted', 0)}; {r.get('callers', 0)} callers{held})")
     for r in spend.get("restByCaller") or []:
         out.append(f"  REST {r.get('counted', 0):>5} of {r.get('requests', 0):>5}  {r.get('route')}  "
-                   f"by {r.get('kind')} {r.get('repo') or ''}{' for ' + r['waiter'] if r.get('waiter') else ''}".rstrip())
+                   f"by {r.get('kind')} {r.get('repo') or ''}".rstrip() + waiters_text(r, "counted"))
     for r in spend.get("graphqlByQuery") or []:
         out.append(f"  GraphQL {r.get('points', 0):>5} points in {r.get('queries', 0):>4}  {r.get('query')}  "
-                   f"by {r.get('kind')} {r.get('repo') or ''}".rstrip())
+                   f"by {r.get('kind')} {r.get('repo') or ''}".rstrip() + waiters_text(r, "points"))
     return out
 
 
