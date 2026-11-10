@@ -56,7 +56,8 @@ gg.PACE_CLI = Path(tempfile.gettempdir()) / f"glaeda-gh-test-no-pacer-{os.getpid
 gg.EXPECTED_CONFIG = Path(tempfile.gettempdir()) / f"glaeda-gh-test-no-expected-{os.getpid()}.json"
 # Nor may a test's alarm reach the host's coordinator, or its notices.
 gg.ALARM_CMD = Path(tempfile.gettempdir()) / f"glaeda-gh-test-no-alarm-{os.getpid()}" / "tell-coordinator"
-gg.NOTICES_DIR = Path(tempfile.gettempdir()) / f"glaeda-gh-test-notices-{os.getpid()}"
+_NOTICES = tempfile.TemporaryDirectory(prefix="glaeda-gh-test-notices-")  # removed when the run ends
+gg.NOTICES_DIR = Path(_NOTICES.name)
 
 TOKEN = "ghp_faketoken_must_never_touch_disk"
 NOW = float(int(time.time()))  # watch files carry real mtimes
@@ -10905,6 +10906,27 @@ class SpendAlarmTest(Base):
         self.daemon.check_alarms()
         self.assertEqual(len(self.told_lines()), 1)
         self.assertEqual(gg.read_json(gg.BASE / gg.ALARMS_FILE)["pool"]["level"], "fire")
+
+    def test_another_rest_window_running_low_is_sent_again(self) -> None:
+        self.policy(pool=True)
+        self.seen(800, NOW, NOW + 1200)
+        self.daemon.check_alarms()
+        self.seen(900, NOW + 60, NOW + 2400)  # the other core counter, its own window
+        self.daemon.check_alarms()
+        self.assertEqual(len(self.told_lines()), 2)
+
+    def test_no_cleared_notice_in_the_minute_before_a_reset(self) -> None:
+        self.policy(pool=True)
+        self.seen(800, NOW, NOW + 100)
+        self.daemon.check_alarms()
+        self.seen(700, NOW + 50, NOW + 100)
+        self.daemon.check_alarms()
+        self.assertEqual([n["level"] for n in self.notice_lines()], ["warn"])
+
+    def test_a_malformed_alarms_file_is_dropped(self) -> None:
+        gg.write_json(gg.BASE / gg.ALARMS_FILE, {"pool": "x", "share": {"at": "soon"}})
+        again = gg.Daemon(transport=self.gh, token=lambda: TOKEN, controller=None)
+        self.assertEqual(again.alarms, {})
 
     def test_the_pool_alarm_fires_under_rest_left_and_only_where_the_policy_asks(self) -> None:
         self.seen(800, NOW, NOW + 1200)

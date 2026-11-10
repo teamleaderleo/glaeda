@@ -1839,7 +1839,9 @@ class Daemon:
         self.spend_dirty = False
         self.caller: tuple[str, str] = ("other", "")  # what the request being sent is for (calling)
         alarms = read_json(BASE / ALARMS_FILE)
-        self.alarms: dict[str, dict] = alarms if isinstance(alarms, dict) else {}  # alarm -> {"at", "level"}
+        self.alarms: dict[str, dict] = {  # alarm -> {"at", "level", ...}; a malformed entry is dropped, never fatal
+            str(k): v for k, v in (alarms if isinstance(alarms, dict) else {}).items()
+            if isinstance(v, dict) and isinstance(v.get("at"), (int, float)) and not isinstance(v.get("at"), bool)}
         self.pool_seen: list[tuple[float, int, float]] = []  # (seenAt, remaining, reset) of the poorest REST counter
         self.alarm_procs: list[subprocess.Popen] = []  # tell-coordinator runs not yet reaped
         self.writing = False  # inside the outbox: its requests are sessions' writes, not the daemon's polling
@@ -1899,7 +1901,7 @@ class Daemon:
 
     def spend_rows(self, seconds: float = 3600.0) -> list[dict]:
         """The spend log's rows over the last SECONDS (by the minute, as rest_spent counts), summed per key."""
-        first = int((self.clock() - seconds) // 60)
+        first = int((self.clock() - seconds) // 60) + 1  # whole minutes after the window's start, and this one
         total: dict[str, list[int]] = {}
         for minute, rows in self.spend.items():
             if minute >= first:
@@ -1970,6 +1972,9 @@ class Daemon:
                         if r["counted"]) or "no counted REST from this daemon"
         clock = lambda t: dt.datetime.fromtimestamp(t, dt.timezone.utc).strftime("%H:%MZ")  # noqa: E731
         pool = self.pool_projection()
+        held: set[str] = set()  # alarms neither sent nor cleared this tick
+        if policy.get("pool") and pool is not None and pool["reset"] - self.now <= 60:
+            held.add("pool")  # its window is about to reset: no news either way
         if policy.get("pool") and pool is not None and pool["reset"] - self.now > 60:
             left, reset = pool["remaining"], pool["reset"]
             low = left < policy.get("restLeft", ALARM_REST_LEFT)
@@ -1995,16 +2000,20 @@ class Daemon:
         changed = False
         for name, (level, text, data) in firing.items():
             last = self.alarms.get(name) or {}
-            worse = level == "fire" and last.get("level") != "fire"
+            # worse: it became a FIRE, or another REST window (GitHub keeps two core counters) is the one running dry
+            worse = level == "fire" and last.get("level") != "fire" or (
+                isinstance(last.get("reset"), (int, float)) and abs(last["reset"] - data.get("reset", last["reset"]))
+                > RESET_JITTER)
             if last.get("at") and self.now - float(last["at"]) < ALARM_EVERY and not worse:
                 if last.get("cleared"):  # back within the hour: still the alarm already sent
                     self.alarms[name] = {k: v for k, v in last.items() if k != "cleared"}
                     changed = True
                 continue
             self.send_alarm(name, level, text, data)
-            self.alarms[name] = {"at": self.now, "level": level, "text": text}
+            self.alarms[name] = {"at": self.now, "level": level, "text": text,
+                                 **({"reset": data["reset"]} if "reset" in data else {})}
             changed = True
-        for name in [n for n in self.alarms if n not in firing and not self.alarms[n].get("cleared")]:
+        for name in [n for n in self.alarms if n not in firing and n not in held and not self.alarms[n].get("cleared")]:
             if not self.alarms[name].get("clearSaid"):  # one "cleared" per alarm sent, however often it flaps
                 self.write_notice(name, "info", f"glaeda-gh on {policy_host()}: the {name} alarm cleared", {})
             self.alarms[name] = {**self.alarms[name], "cleared": self.now, "clearSaid": True}
