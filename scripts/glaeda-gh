@@ -162,7 +162,8 @@ the daemon is the only process that talks to GitHub, and clients only read its c
   are recorded separately; a failed or uncertain label effect is reported without replaying the receipt.
   Comments are cheaper three ways. Comments for one thread already queued together (within POST_JOIN_WINDOW)
   go out as one, each body whole and in order under a rule, and every caller gets that comment's URL; a body
-  that starts with a `<!--` marker is never joined. A comment goes through GraphQL's addComment while
+  that a wait, a bot or a reader keys on (a `<!--` marker, a slash command, an @mention, a review receipt) is
+  never joined, nor another writer's, nor any on a thread a comment wait watches. A comment goes through GraphQL's addComment while
   GraphQL is the richer bucket (the outbox's own reading: the daemon's REST share never holds writes). And a
   comment queued with --status-key KEY edits the same writer's earlier KEY comment in place, over GraphQL,
   while that is still the thread's last comment and no comment wait watches the thread. Comment waits see an
@@ -465,9 +466,12 @@ THROTTLED = re.compile(r"submitted too quickly|secondary rate limit|abuse detect
 # comment: each body whole, in queue order, under a rule. Only what is already queued is joined (no write waits for a
 # partner): over 2026-11-10 01:00-02:00Z, 110 comments went to 53 threads, and holding each for 60 s would have
 # joined 3 of them while delaying all 110. A body that starts with a machine-read marker (`<!--`: review-running,
-# pr-owner, risk receipts) or carries a status key is never joined: its readers read it whole, from its first line.
+# pr-owner, risk receipts), a slash command or an @mention, or carries a status key is never joined: its readers read
+# it whole, from its first line. Only one writer's comments are joined, and a join a wait began watching since is undone
+# before its retry (post_unjoin).
 POST_JOIN_WINDOW = 60
 POST_JOIN_RULE = "\n\n---\n\n"
+JOIN_MENTION = re.compile(r"(?<![\w.`])@[A-Za-z0-9][\w-]*")  # an @mention: a bot or a person is called; never joined
 # A comment queued with --status-key KEY is that writer's status on its thread: the next one from the same writer
 # ("by") with the same key edits it in place, over GraphQL, while it is still the thread's last comment, no comment
 # wait watches the thread, and it is under POST_STATUS_MAX old. router-review's review-running marker and its
@@ -2550,6 +2554,9 @@ class Daemon:
                 return
         if item["kind"] == "comment" and not item.get("group"):
             self.post_join(path, item)
+        elif item.get("group") and not item.get("uncertain") and not item.get("delivered") \
+                and self.thread_watched(str(item["repo"]), item["number"]):
+            self.post_unjoin(path, item)  # a wait began watching the thread since the join: each goes out alone
         if item["kind"] == "comment" and self.post_over_graphql(item):
             return self.post_comment_graphql(path, item)
         method, api, body = post_request(item)
@@ -2722,7 +2729,7 @@ class Daemon:
 
     def post_finish(self, path: Path, item: dict, url: str | None = None, number: Any = None,
                     note: str | None = None, error: str | None = None) -> None:
-        done = {k: v for k, v in item.items() if k not in {"body", "notBefore", "holdUntil"}}
+        done = {k: v for k, v in item.items() if k not in {"body", "ownBody", "notBefore", "holdUntil"}}
         done.update({"state": "failed" if error else "posted", "url": url, "number": number, "note": note,
                      "error": error, "finishedAt": self.now})
         write_json(posted_dir() / path.name, done)
@@ -2742,11 +2749,15 @@ class Daemon:
 
     @staticmethod
     def joinable(item: dict) -> bool:
+        """Plain prose only: never anything a wait, a bot or a reader keys on (a slash command, an @mention, an HTML
+        marker, a review receipt), nor a status, nor a write already tried."""
         body = str(item.get("body") or "")
+        first = next((line for line in body.splitlines() if line.strip()), "").strip()
         return (item.get("kind") == "comment" and not item.get("status") and not item.get("uncertain")
                 and not item.get("delivered") and not item.get("group") and not item.get("joinedInto")
-                and not int(item.get("attempts") or 0) and not body.lstrip().startswith("<!--")
-                and not RISK_RECEIPT.match(next((line for line in body.splitlines() if line.strip()), "")))
+                and not int(item.get("attempts") or 0) and isinstance(item.get("by"), str) and bool(item["by"])
+                and not first.startswith(("<!--", "/")) and not RISK_RECEIPT.match(first)
+                and not JOIN_MENTION.search(body))
 
     def post_join(self, path: Path, item: dict) -> None:
         """Join the comments queued for this thread within POST_JOIN_WINDOW of ITEM into ITEM's comment, in queue
@@ -2764,6 +2775,7 @@ class Daemon:
             other = read_json(other_path)
             if (not isinstance(other, dict) or other.get("id") != other_path.stem or not self.joinable(other)
                     or other.get("repo") != item.get("repo") or other.get("number") != item.get("number")
+                    or other.get("by") != item.get("by")
                     or (other.get("notBefore") or 0) > self.now
                     or not 0 <= float(other.get("queuedAt") or 0) - float(item.get("queuedAt") or 0) <= POST_JOIN_WINDOW):
                 continue
@@ -2777,9 +2789,18 @@ class Daemon:
         for other_path, other in members:
             write_json(other_path, {**other, "joinedInto": item["id"]})
         item["group"] = [other["id"] for _, other in members]
+        item["ownBody"] = item["body"]
         item["body"] = POST_JOIN_RULE.join([str(item["body"])] + [str(other["body"]) for _, other in members])
         write_json(path, item)
         log({"event": "post-join", "id": item["id"], "joined": item["group"]})
+
+    def post_unjoin(self, path: Path, item: dict) -> None:
+        """Undo a join not yet sent: the leader takes back its own body and its members, no longer named, are released
+        (post_member) and sent on their own."""
+        item["body"] = item.pop("ownBody", item["body"])
+        released = item.pop("group", [])
+        write_json(path, item)
+        log({"event": "post-unjoin", "id": item["id"], "released": released})
 
     def post_member(self, path: Path, item: dict) -> bool:
         """A member of a joined comment: True while its leader holds it (or once it took the leader's answer),

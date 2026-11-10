@@ -10511,7 +10511,17 @@ class PostJoinTest(unittest.TestCase):
     outbox joins the comments queued for one thread, posts over GraphQL while it is richer, and edits a writer's
     own status comment in place when it is still the thread's last."""
 
-    setUp, daemon, queue, step = PostTest.setUp, PostTest.daemon, PostTest.queue, PostTest.step
+    daemon, queue, step = PostTest.daemon, PostTest.queue, PostTest.step
+
+    def setUp(self) -> None:
+        PostTest.setUp(self)
+        env = mock.patch.dict(os.environ, {"CMUX_SURFACE_ID": "surface-1"})  # one writer, whatever host runs this
+        env.start()
+        self.addCleanup(env.stop)
+
+    def as_writer(self, who: str, *argv: str) -> dict:
+        with mock.patch.dict(os.environ, {"CMUX_SURFACE_ID": who}):
+            return self.queue(*argv)
 
     GQL_RICH = {"graphql": {"limit": 5000, "remaining": 4900, "reset": NOW + 3000},
                 "rest": {"limit": 5000, "remaining": 400, "reset": NOW + 3000}}
@@ -10789,6 +10799,36 @@ class PostJoinTest(unittest.TestCase):
         self.assertTrue(gg.comment_matches({"id": 10, "body": "READY-TO-LAND"[:gg.COMMENT_BODY_MAX]}, None,
                                            re.compile("READY-TO-LAND"), 9, None))
         self.assertEqual(gg.post_state(ready["id"])["state"], "posted")
+
+    def test_only_one_writers_plain_text_is_joined(self) -> None:
+        # Codex review of 3005c6c: two `/callsign reserve` requests joined into one comment gave both callers one
+        # receipt. Slash commands, @mentions and another writer's comments go out on their own.
+        bodies = ["/callsign reserve", "/callsign reserve", "cc @someone please look", "mine"]
+        for body in bodies:
+            self.queue("comment", "o/r#7", "--body", body)
+        self.as_writer("surface-2", "comment", "o/r#7", "--body", "theirs")
+        ok = (201, {}, {"html_url": "u"})
+        d, t = self.daemon(*[ok] * 5)
+        for n in range(5):
+            self.step(d, NOW + n * gg.POST_SPACING)
+        self.assertEqual([c[2]["body"] for c in t.calls], bodies + ["theirs"])
+
+    def test_a_join_a_wait_began_watching_since_is_undone_before_its_retry(self) -> None:
+        # Codex review of 3005c6c: `progress` and `READY` joined, the write was held, then a wait matching ^READY began
+        progress = self.queue("comment", "o/r#7", "--body", "progress")
+        ready = self.queue("comment", "o/r#7", "--body", "READY")
+        held = (403, {"retry-after": "60"}, {"message": "You have exceeded a secondary rate limit and have been "
+                                                        "temporarily blocked from content creation."})
+        ok = (201, {}, {"html_url": "u1"})
+        d, t = self.daemon(held, ok, (201, {}, {"html_url": "u2"}))
+        self.step(d, NOW)
+        self.assertEqual(t.calls[0][2]["body"], gg.POST_JOIN_RULE.join(["progress", "READY"]))
+        gg.watch_dir().mkdir(parents=True, exist_ok=True)
+        (gg.watch_dir() / gg.file_name("comment:o/r#7")).write_text("{}")
+        self.step(d, d.post_hold)
+        self.step(d, d.post_hold + gg.POST_SPACING)
+        self.assertEqual([c[2]["body"] for c in t.calls[1:]], ["progress", "READY"])
+        self.assertEqual([gg.post_state(i["id"])["url"] for i in (progress, ready)], ["u1", "u2"])
 
     def test_a_lasting_graphql_refusal_fails_the_comment_not_the_outbox(self) -> None:
         item = self.queue("comment", "o/r#7", "--body", "landed")
