@@ -12237,8 +12237,8 @@ class DaemonPolicyTest(Base):
         self.gh.jobs[7] = []  # an empty answer leaves the attempt without jobs
         key = gg.parse_key("run", "o/r/7")
         self.daemon.store(key, None, data=gg.slim_run(failed), dataAt=NOW - 5)
-        self.gh.rest_remaining = gg.FLOORS["rest"][0] + 100  # the pool above its floor: the exemption may read
-        self.daemon.budget = {"rest": {"limit": 5000, "remaining": gg.FLOORS["rest"][0] + 100, "reset": NOW + 1800},
+        self.gh.rest_remaining = gg.FLOORS["rest"][0]  # and GitHub agrees: REST is at its floor
+        self.daemon.budget = {"rest": {"limit": 5000, "remaining": gg.FLOORS["rest"][0], "reset": NOW + 1800},
                               "graphql": {"limit": 5000, "remaining": 10, "reset": NOW + 1800}}
         self.daemon.paths["run"] = "rest"
         self.spend_rest(2000, at=NOW)
@@ -12343,20 +12343,6 @@ class DaemonPolicyTest(Base):
         self.daemon.tick(NOW)
         self.assertEqual(self.gh.run_calls(), [])  # the run itself went over GraphQL
         self.assertEqual(len(self.gh.job_calls()), 1)
-
-    def test_a_failed_attempts_job_list_past_the_share_waits_while_the_pool_is_below_its_floor(self) -> None:
-        """hq#8948: the exemption is once per attempt, and never takes the shared pool below its floor."""
-        self.gh.runs[7] = {"id": 7, "name": "CI", "display_title": "fix", "status": "completed", "conclusion": "failure",
-                           "html_url": "https://github.com/o/r/actions/runs/7", "head_sha": "b" * 40, "head_branch": "x",
-                           "event": "push", "run_attempt": 1, "created_at": iso(NOW - 99), "updated_at": iso(NOW - 9)}
-        self.gh.jobs[7] = [job("build")]
-        self.daemon.budget = {"rest": {"limit": 5000, "remaining": gg.FLOORS["rest"][0] - 1, "reset": NOW + 1800},
-                              "graphql": {"limit": 5000, "remaining": 4000, "reset": NOW + 1800}}
-        self.spend_rest(2000, at=NOW)
-        gg.register("run:o/r/7")
-        self.daemon.tick(NOW)
-        self.assertEqual(self.gh.run_calls(), [])  # the run itself went over GraphQL
-        self.assertEqual(self.gh.job_calls(), [])  # and its job list waits for the pool
 
     def test_status_and_budget_show_the_share(self) -> None:
         self.spend_rest(990)

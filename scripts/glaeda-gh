@@ -95,8 +95,9 @@ the daemon is the only process that talks to GitHub, and clients only read its c
   kept per minute in rest-spend.json across restarts.
   A read starts only when its worst case fits. At the cap, PR and run reads move to GraphQL, or wait
   while GraphQL is stopped too, so the shared REST pool is left to `gh`, landers and nightly re-runs.
-  The one read the cap holds back only at the pool's floor is a failed attempt's job list (once per attempt). The
-  share is a hard cap: while GraphQL is low the daemon reads over GraphQL at the lean pace, and while GraphQL is
+  The one read the cap never holds back is a failed attempt's job list (once per attempt, and not below REST's
+  reserve): a wait cannot tell a runner's refusal from a failure without it, so it is bounded by failures, not
+  polling. Otherwise the share is a hard cap: while GraphQL is low the daemon reads over GraphQL at the lean pace, and while GraphQL is
   stopped too it serves what it holds and waits; it never spends the shared pool past its share (restYield, default
   0, is an operator's local override, and the fleet config may not set it). A yield of the cap again (the old default)
   doubled every daemon's REST spend in the hours GraphQL was low. The share
@@ -3424,8 +3425,7 @@ class Daemon:
             # Once per attempt, answered or not: an error or an empty list leaves the attempt without
             # jobs, and asking again every cycle would make the exemption a loop past the share. A later
             # read that the share admits (the run's own) still fills it in.
-            # Past the share, only while the shared pool is above its floor: the exemption never drains the pool.
-            if kind == "run" and self.mode("rest") != "stop" and self.rest_above_floor():
+            if kind == "run" and self.mode("rest") != "stop":
                 self.jobs_only = [e for e in mine if self.failed_without_jobs(e)
                                   and (e["cache"] or {}).get("jobsTried") != (((e["cache"] or {}).get("data") or {}).get("run_attempt") or 1)]
                 for e in self.jobs_only:
@@ -4704,7 +4704,7 @@ class Daemon:
                           and (fresh or jobs_attempt(prior.get("jobs")) < attempt)
                           # past the REST share, once per attempt, answered or not: an error or an empty
                           # list would otherwise be asked for again every cycle, past the share
-                          and (self.rest_room(1) or (prior.get("jobsTried") != attempt and self.rest_above_floor())))
+                          and (self.rest_room(1) or prior.get("jobsTried") != attempt))
         if (e["jobs"] and self.mode("rest") == "normal") or failed_attempt:
             try:
                 with self.calling(*caller_of(e["key"]), waiter_of(e)):  # its own waiter, inside a batch's call too
