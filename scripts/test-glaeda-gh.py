@@ -10756,6 +10756,25 @@ class PostJoinTest(unittest.TestCase):
         self.assertFalse(gg.Daemon.gql_transient([{"type": "UNPROCESSABLE", "message": "Body is too long, try again"}]))
         self.assertFalse(gg.Daemon.gql_transient([{"message": "Could not resolve to a node"}]))
 
+    def test_a_joined_callers_stdout_is_its_url_alone(self) -> None:
+        a = self.queue("comment", "o/r#7", "--body", "one")
+        b = self.queue("comment", "o/r#7", "--body", "two")
+        d, t = self.daemon((201, {}, {"html_url": "https://github.com/o/r/pull/7#issuecomment-5"}))
+        self.step(d, NOW)
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            self.assertEqual(gg.cmd_post_status(b["id"], 0, False), 0)
+        self.assertEqual(out.getvalue(), "https://github.com/o/r/pull/7#issuecomment-5\n")  # `--since "$url"` takes it
+        self.assertIn("posted in one comment", err.getvalue())
+
+    def test_a_status_is_edited_in_place_even_while_rest_is_richer(self) -> None:
+        d, t, first, second = self.status_pair("IC_1")
+        d.budget = {"graphql": {"limit": 5000, "remaining": 400, "reset": NOW + 3000},
+                    "rest": {"limit": 5000, "remaining": 4900, "reset": NOW + 3000}}
+        self.step(d, NOW + gg.POST_SPACING)
+        self.assertIn("updateIssueComment", t.calls[3][2]["query"])
+        self.assertFalse(d.post_over_graphql({"kind": "comment", "repo": "o/r", "number": 8, "body": "x"}))
+
     def test_a_lasting_graphql_refusal_fails_the_comment_not_the_outbox(self) -> None:
         item = self.queue("comment", "o/r#7", "--body", "landed")
         d, t = self.daemon(self.subject(), (403, {}, {"errors": [{"type": "FORBIDDEN", "message": "SAML enforcement"}]}))

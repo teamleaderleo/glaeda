@@ -2809,10 +2809,27 @@ class Daemon:
     def post_over_graphql(self, item: dict) -> bool:
         """A comment goes through GraphQL's addComment while GraphQL is the richer bucket, as the reads choose (a
         lost answer is looked for, and resent, over REST)."""
+        if item.get("uncertain"):
+            return False
+        if self.status_editable(item) and self.outbox_richness("graphql") > 0:
+            return True  # only GraphQL edits in place: a writer's status goes there while it has any points
         seen = self.budget.get("graphql") or {}
-        if item.get("uncertain") or not seen or (seen.get("reset") or 0) <= self.now:
+        if not seen or (seen.get("reset") or 0) <= self.now:
             return False  # no live GraphQL reading: REST, as before
         return self.outbox_richness("graphql") > max(self.outbox_richness("rest"), 0.0)
+
+    def status_editable(self, item: dict) -> dict | None:
+        """The writer's earlier status comment on this thread that ITEM may replace in place (not yet checked to be
+        the thread's last: post_comment_graphql reads that), else None."""
+        if item.get("kind") != "comment" or not item.get("status"):
+            return None
+        statuses = read_json(BASE / POST_STATUSES)
+        thread = f"{str(item['repo']).lower()}#{int(item['number'])}"
+        prior = statuses.get(thread) if isinstance(statuses, dict) else None
+        ok = (isinstance(prior, dict) and prior.get("key") == item["status"] and prior.get("by") == item.get("by")
+              and isinstance(prior.get("nodeId"), str) and self.now - float(prior.get("at") or 0) < POST_STATUS_MAX
+              and not self.thread_watched(str(item["repo"]), item["number"]))
+        return prior if ok else None
 
     def thread_watched(self, repo: str, number: Any) -> bool:
         """A comment wait is watching this thread: an edit in place would be a comment it never sees as new."""
@@ -2883,11 +2900,8 @@ class Daemon:
         thread = f"{repo.lower()}#{number}"
         subjects = read_json(BASE / POST_SUBJECTS)
         subjects = subjects if isinstance(subjects, dict) else {}
-        statuses = read_json(BASE / POST_STATUSES)
-        prior = (statuses or {}).get(thread) if isinstance(statuses, dict) and item.get("status") else None
-        editable = (isinstance(prior, dict) and prior.get("key") == item["status"] and prior.get("by") == item.get("by")
-                    and isinstance(prior.get("nodeId"), str) and self.now - float(prior.get("at") or 0) < POST_STATUS_MAX
-                    and not self.thread_watched(repo, number))
+        prior = self.status_editable(item)
+        editable = prior is not None
         subject, last = subjects.get(thread), None
         if subject is None or editable:
             try:
@@ -10185,6 +10199,12 @@ def cmd_post_status(post_id: str | None, wait: float, as_json: bool, queued: boo
         state = post_state(post_id) or state
     if as_json:
         print(json.dumps(state, indent=2, sort_keys=True))
+    elif state["state"] == "posted":
+        # stdout is the URL alone (`url=$(glaeda-gh post comment ...)`, then `wait comment --since "$url"`); a note
+        # (joined with other queued comments, an edit in place, an open PR found) goes to stderr
+        print(state.get("url") or "posted")
+        if state.get("note"):
+            print(f"glaeda-gh: {state['note']}", file=sys.stderr)
     else:
         print(post_line(state))
     if state["state"] == "queued" and queued and wait <= 0:
