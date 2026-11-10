@@ -69,8 +69,8 @@ the daemon is the only process that talks to GitHub, and clients only read its c
   60 s doubling to 15 min, whichever is longer, and no read is sent during it.
 - Comment watches (an issue's or PR's latest 50 comments) are one batched GraphQL query every 15 s
   (over REST: the issue and the page or two holding them), and last only while someone waits on them.
-- A merged or closed PR's failed steps are not read (nothing rules on them), and a job whose steps read failed
-  is not asked again for STEPS_RETRY (15 minutes).
+- A merged or closed PR's failed steps are not read (nothing rules on them), and a job whose steps read GitHub
+  refused for good (404, 410, 422) is not asked again for STEPS_RETRY (15 minutes); a 5xx is asked again next read.
 - Reads follow interest. A PR nobody has waited on or read for IDLE_BACKOFF_AFTER (5 minutes) is polled about
   as often as it was last read, up to every 10 minutes, and its check events no longer re-read it early; a read
   (a `status`, a wait, the broker answering from the cache) puts it back on every cycle. A comment wait on a
@@ -553,9 +553,11 @@ REST_CHECK_PAGES = 5  # check-run pages (100 each) one PR read over REST takes a
 REST_STATUS_PAGES = 2  # commit-status pages (100 each) likewise
 REST_RUN_PAGES = 2  # a commit's workflow-run pages (100 each) likewise: without its run a check has no workflow
 REST_STEPS_MAX = 10  # failed or cancelled jobs whose steps one PR read over REST looks up at most
-# A job whose steps read failed (a 404 for a job of a deleted run, a 403) is not asked again for this long: each such
-# read was retried on every read of its PR, a counted request each time.
+# A job whose steps read GitHub refused for good (404 for a job of a deleted run, 410, 422) is not asked again for
+# this long: each such read was retried on every read of its PR, a counted request each time. A 5xx or a transport
+# error is asked again at the normal pace: the steps hold a runner refusal for the rescue, whose grace is 360 s.
 STEPS_RETRY = 900.0
+STEPS_GONE = re.compile(r"HTTP (?:404|410|422)\b")
 # The most counted REST requests one read can make before its step lookups, which are admitted one
 # at a time: a PR is its pull, REST_CHECK_PAGES of check runs, statuses, runs, workflows, rules and
 # the branch; a run is the run and its job list. The share admits a read only when this much fits. The
@@ -868,9 +870,14 @@ def interest_fresh(path: Path, key: str, now: float | None = None) -> bool:
 # lane VMs and reconcilers kept those PRs watched. A reader already named within READER_REFRESH is not written again,
 # so a hot read stays a stat and a utime.
 READER_REFRESH = 300.0
-READER_MAX = 120
 READER_KEYS = ("ACPMUX_SESSION_NAME", "CMUX_AGENT_SESSION", "ACPMUX_SESSION_ID", "CLAUDE_SESSION_ID", "CODEX_THREAD_ID")
-READER_WRAPPERS = re.compile(r"(?i)(ba|z|da|)sh|python3?(\.\d+)?|env|xargs|timeout|nice|gh|glaeda-gh|-.*|\d+")
+READER_WRAPPERS = re.compile(r"(?i)(ba|z|da|)sh|python3?(\.\d+)?|env|xargs|timeout|nice|gh|glaeda-gh")
+# A reader's name is written to watch files, spend logs, upstream requests and alarms, so it never carries command-line
+# text: only a session's name or id, or an executable's or script's base name, each held to this shape. A parent
+# `bash -c 'TOKEN=... python3 probe.py'` once gave the reader `tool:TOKEN=... python3 probe.py` (review, glaeda#1931).
+READER_NAME = re.compile(r"[A-Za-z0-9._-]{1,64}")
+# A reader handed in (GLAEDA_GH_READER, a downstream HOST/READER over the upstream): KIND:NAME parts of that shape.
+READER_SAFE = re.compile(r"(?:[A-Za-z0-9._-]{1,64}/)?(?:session|tool):[A-Za-z0-9._-]{1,64}")
 _reader: str | None = None
 
 
@@ -902,25 +909,43 @@ def parent_pid(pid: int) -> int:
         return 0
 
 
+def safe_reader(text: Any) -> str:
+    """TEXT when it is a reader name of the safe shape (READER_SAFE), else ""."""
+    return text if isinstance(text, str) and READER_SAFE.fullmatch(text) else ""
+
+
+def command_tool(words: list[str]) -> str:
+    """The tool a command line runs: its executable's base name, or, behind an interpreter or wrapper, the next word's
+    (the script) when it is a path rather than a flag; "" when that is a wrapper too or not of the READER_NAME shape.
+    Nothing else of the command line is looked at, so no argument (an inline TOKEN=..., a -c program) is ever kept."""
+    for word in words[:2]:
+        name = Path(word).name
+        if word.startswith("-") or not READER_NAME.fullmatch(name):
+            return ""
+        if not READER_WRAPPERS.fullmatch(name):
+            return name
+    return ""
+
+
 def reader_name() -> str:
     """This process's reader: GLAEDA_GH_READER, else its agent session (session:NAME), else the first tool up its
-    process tree that is not a shell, interpreter or wrapper (tool:pr_owner.py). Worked out once per process."""
+    process tree that is not a shell, interpreter or wrapper (tool:pr_owner.py), else tool:unknown. Worked out once per
+    process, and always of the READER_SAFE shape."""
     global _reader
     if _reader is None:
-        named = os.environ.get("GLAEDA_GH_READER", "").strip()
+        named = safe_reader(os.environ.get("GLAEDA_GH_READER", "").strip())
         session = next((os.environ[k].strip() for k in READER_KEYS if os.environ.get(k, "").strip()), "")
-        _reader = named or (f"session:{session}" if session else "")
+        _reader = named or (f"session:{session}" if READER_NAME.fullmatch(session) else "")
         pid = os.getppid()
         for _ in range(4 if not _reader else 0):
-            words = parent_command(pid)
-            tool = next((Path(w).name for w in words if not READER_WRAPPERS.fullmatch(Path(w).name)), "")
+            tool = command_tool(parent_command(pid))
             if tool:
-                _reader = f"tool:{tool}"[:80]
+                _reader = f"tool:{tool}"
                 break
             pid = parent_pid(pid)
             if pid <= 1:
                 break
-        _reader = _reader or "tool:?"
+        _reader = _reader or "tool:unknown"
     return _reader
 
 
@@ -1066,7 +1091,7 @@ def _register_locked(path: Path, key: str, jobs: bool, consumer: str | None, wai
     prior = read_json(path) or {}
     doc: dict[str, Any] = {"key": key, "jobs": bool(jobs or prior.get("jobs"))}
     now = time.time()
-    reader = reader or reader_name()
+    reader = safe_reader(reader) or reader_name()
     readers = readers_of(prior, now)
     if reader_fresh(prior, reader, now):
         doc["reader"], doc["readerAt"] = reader, prior["readerAt"]
@@ -1312,9 +1337,9 @@ def read_readers(text: str) -> dict[str, str]:
     """{key: reader} of an upstream request line that read_request accepted: each item's `reader`, when it names one."""
     out = {}
     for item in json.loads(text).get("keys") or []:
-        reader = item.get("reader") if isinstance(item, dict) else None
-        if isinstance(reader, str) and reader.strip() and isinstance(item.get("key"), str):
-            out[item["key"]] = reader.strip()[:READER_MAX]
+        reader = safe_reader(item.get("reader") if isinstance(item, dict) else None)
+        if reader and isinstance(item.get("key"), str):
+            out[item["key"]] = reader
     return out
 
 
@@ -3762,7 +3787,8 @@ class Daemon:
 
     def upstream_read(self, ask: Callable[[dict], dict], due: list[dict]) -> None:
         request = {"keys": [{"key": e["key"], "jobs": e["jobs"], **({"wait": True} if self.waited(e) else {}),
-                             **({"reader": f"{policy_host()}/{waiter_of(e)}"[:READER_MAX]} if waiter_of(e) else {})}
+                             **({"reader": f"{policy_host()}/{waiter_of(e).split('/')[-1]}"}
+                                if safe_reader(f"{policy_host()}/{waiter_of(e).split('/')[-1]}") else {})}
                             for e in due]}
         try:
             answer = ask(request)
@@ -4749,7 +4775,8 @@ class Daemon:
                 return
             if state != "fresh" or not isinstance(doc, dict):
                 self.errors.append(f"{e['key']} steps: {doc}")
-                self.steps_failed[job_id] = self.now
+                if STEPS_GONE.match(str(doc)):
+                    self.steps_failed[job_id] = self.now
                 continue
             steps = doc.get("steps")
             c["failedSteps"], c["stepCount"] = failed_steps(steps), len(steps) if isinstance(steps, list) else None

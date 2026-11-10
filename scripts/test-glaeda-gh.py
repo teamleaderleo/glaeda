@@ -2350,6 +2350,31 @@ class BalanceTest(Base):
         self.assertEqual(gg.read_cache("pr:o/r#4")["data"]["state"], "MERGED")
         self.assertEqual([c for c in self.gh.rest_calls() if "/actions/jobs/" in c[1]], [])
 
+    def test_a_502_steps_read_is_asked_again_next_read_and_the_check_is_held(self) -> None:
+        """A 5xx is transient: the steps are read again at the normal pace, so a runner refusal is held for the rescue."""
+        build = {**workflow_check("build", 5, conclusion="FAILURE", node_id="CR_build"),
+                 "startedAt": iso(time.time() - 7), "completedAt": iso(time.time())}
+        self.gh.prs[("o", "r", 4)] = pr_node(4, rollup="FAILURE", checks=[build])
+        self.budgets(rest=(4000, 1800), graphql=(50, 3000))
+        gg.register("pr:o/r#4")
+        real = self.gh.__call__
+        flaky = {"left": 1}
+
+        def gh(method, path, *a, **k):
+            if "/actions/jobs/" in path and flaky["left"]:
+                flaky["left"] -= 1
+                return 502, {}, b'{"message": "Bad Gateway"}'
+            return real(method, path, *a, **k)
+        self.daemon.transport = gh
+        self.gh.job_steps[50] = [{"name": "Set up runner", "conclusion": "failure"}]
+        self.daemon.tick(NOW)
+        self.assertEqual(self.daemon.steps_failed, {})
+        gg.register("pr:o/r#4")
+        self.daemon.tick(NOW + gg.CYCLE)
+        data = gg.read_cache("pr:o/r#4")["data"]
+        self.assertEqual(data["checks"][0]["failedSteps"], ["Set up runner"])
+        self.assertIsNone(gg.verdict("pr", data, "green"))  # held for the rescue, not red
+
     def test_a_failed_steps_read_is_not_retried_on_every_read(self) -> None:
         """A job whose steps read failed (404) waits STEPS_RETRY before it is asked again, not one request a cycle."""
         build = workflow_check("build", 5, conclusion="FAILURE", node_id="CR_build")
@@ -11502,6 +11527,34 @@ class ReaderTest(Base):
         with mock.patch.dict(os.environ, {**env, "GLAEDA_GH_READER": ""}), \
                 mock.patch.object(gg, "parent_command", return_value=["/usr/bin/python3", "/x/tools/pr_owner.py", "sweep"]):
             self.assertEqual(gg.reader_name(), "tool:pr_owner.py")
+
+    def test_no_command_line_text_ever_becomes_a_reader(self) -> None:
+        """A parent `bash -c 'TOKEN=... python3 probe.py'` is tool:unknown: only a session's name or an executable's or
+        script's base name is kept, and the payload is in no file the watch, the spend log or an alarm writes."""
+        secret = "TOKEN=ghp_inline_secret_123"
+        env = {k: "" for k in gg.READER_KEYS}
+        for words in (["bash", "-c", f"{secret} python3 probe.py"], ["/bin/sh", f"{secret} x"], ["env", secret, "gh"]):
+            gg._reader = None
+            with mock.patch.dict(os.environ, {**env, "GLAEDA_GH_READER": ""}), \
+                    mock.patch.object(gg, "parent_command", return_value=words), \
+                    mock.patch.object(gg, "parent_pid", return_value=1):
+                self.assertEqual(gg.reader_name(), "tool:unknown", words)
+        gg._reader = None
+        with mock.patch.dict(os.environ, {**env, "GLAEDA_GH_READER": secret, "ACPMUX_SESSION_NAME": f"x {secret}"}), \
+                mock.patch.object(gg, "parent_command", return_value=["bash", "-c", secret]), \
+                mock.patch.object(gg, "parent_pid", return_value=1):
+            self.assertEqual(gg.reader_name(), "tool:unknown")
+            gg.register("pr:o/r#9")
+            gg.register("pr:o/r#9", reader=f"host/{secret}")  # a reader handed in is held to the same shape
+        line = json.dumps({"keys": [{"key": "pr:o/r#9", "jobs": False, "reader": f"host/tool:{secret}"}]})
+        self.assertEqual(gg.read_readers(line), {})
+        self.gh.prs[("o", "r", 9)] = pr_node(9, checks=[workflow_check("build", 5)])
+        self.budgets(rest=(4000, 1800), graphql=(50, 3000))
+        self.daemon.tick(NOW)
+        self.daemon.save_spend(force=True)
+        written = "".join(f.read_text(errors="replace") for f in gg.BASE.rglob("*") if f.is_file())
+        self.assertNotIn("ghp_inline_secret", written)
+        self.assertNotIn("ghp_inline_secret", "\n".join(gg.spend_lines(self.daemon.spend_by())))
 
     def test_register_and_a_cached_read_add_their_reader_once(self) -> None:
         gg._reader = "session:a"
