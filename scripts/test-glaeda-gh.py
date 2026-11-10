@@ -2453,6 +2453,89 @@ class BalanceTest(Base):
         self.assertEqual(len([c for c in self.gh.rest_calls() if "/actions/jobs/" in c[1]]), 1)
         self.assertEqual(gg.read_cache("pr:o/r#4")["data"]["checks"][0]["failedSteps"], ["Set up runner"])
 
+    def test_a_merged_prs_failed_steps_are_not_read(self) -> None:
+        """Nothing waits on a merged or closed PR's failed steps: its REST read makes no jobs/{id} request."""
+        build = workflow_check("build", 5, conclusion="FAILURE", node_id="CR_build")
+        self.gh.prs[("o", "r", 4)] = pr_node(4, state="MERGED", rollup="FAILURE", checks=[build])
+        self.gh.job_steps[50] = [{"name": "Set up runner", "conclusion": "failure"}]
+        self.budgets(rest=(4000, 1800), graphql=(50, 3000))
+        gg.register("pr:o/r#4")
+        self.daemon.tick(NOW)
+        self.assertEqual(gg.read_cache("pr:o/r#4")["data"]["state"], "MERGED")
+        self.assertEqual([c for c in self.gh.rest_calls() if "/actions/jobs/" in c[1]], [])
+
+    def test_a_502_steps_read_is_asked_again_next_read_and_the_check_is_held(self) -> None:
+        """A 5xx is transient: the steps are read again at the normal pace, so a runner refusal is held for the rescue."""
+        build = {**workflow_check("build", 5, conclusion="FAILURE", node_id="CR_build"),
+                 "startedAt": iso(time.time() - 7), "completedAt": iso(time.time())}
+        self.gh.prs[("o", "r", 4)] = pr_node(4, rollup="FAILURE", checks=[build])
+        self.budgets(rest=(4000, 1800), graphql=(50, 3000))
+        gg.register("pr:o/r#4")
+        real = self.gh.__call__
+        flaky = {"left": 1}
+
+        def gh(method, path, *a, **k):
+            if "/actions/jobs/" in path and flaky["left"]:
+                flaky["left"] -= 1
+                return 502, {}, b'{"message": "Bad Gateway"}'
+            return real(method, path, *a, **k)
+        self.daemon.transport = gh
+        self.gh.job_steps[50] = [{"name": "Set up runner", "conclusion": "failure"}]
+        self.daemon.tick(NOW)
+        self.assertEqual(self.daemon.steps_failed, {})
+        gg.register("pr:o/r#4")
+        self.daemon.tick(NOW + gg.CYCLE)
+        data = gg.read_cache("pr:o/r#4")["data"]
+        self.assertEqual(data["checks"][0]["failedSteps"], ["Set up runner"])
+        self.assertIsNone(gg.verdict("pr", data, "green"))  # held for the rescue, not red
+
+    def test_a_failed_steps_read_is_not_retried_on_every_read(self) -> None:
+        """A job whose steps read failed (404) waits STEPS_RETRY before it is asked again, not one request a cycle."""
+        build = workflow_check("build", 5, conclusion="FAILURE", node_id="CR_build")
+        self.gh.prs[("o", "r", 4)] = pr_node(4, rollup="FAILURE", checks=[build])  # no job_steps: 404
+        self.budgets(rest=(4000, 1800), graphql=(50, 3000))
+        gg.register("pr:o/r#4")
+        jobs = lambda: len([c for c in self.gh.rest_calls() if "/actions/jobs/" in c[1]])  # noqa: E731
+        self.daemon.tick(NOW)
+        self.assertEqual(jobs(), 1)
+        for n in range(1, 4):
+            gg.register("pr:o/r#4")
+            self.daemon.tick(NOW + n * gg.CYCLE)
+        self.assertEqual(jobs(), 1)
+        self.daemon.steps_failed = {j: t - gg.STEPS_RETRY for j, t in self.daemon.steps_failed.items()}
+        gg.register("pr:o/r#4")
+        self.daemon.tick(NOW + 4 * gg.CYCLE)
+        self.assertEqual(jobs(), 2)
+
+    def merges_with_a_cached_refusal(self, rest: tuple, graphql: tuple) -> None:
+        """Review, glaeda#1931: an OPEN to MERGED refresh dropped the cached failedSteps, so `wait pr --until green` on
+        the merged PR failed at once on a runner refusal still inside the rescue grace. The cached steps carry forward."""
+        now = time.time()
+        build = {**workflow_check("build", 5, conclusion="FAILURE", node_id="CR_build"),
+                 "startedAt": iso(now - 7), "completedAt": iso(now)}
+        self.gh.prs[("o", "r", 6)] = pr_node(6, rollup="FAILURE", checks=[build])
+        self.gh.job_steps[50] = [{"name": "Set up runner", "conclusion": "failure"}]
+        self.gh.steps["CR_build"] = [{"name": "Set up runner", "conclusion": "FAILURE"}]
+        self.budgets(rest=rest, graphql=graphql)
+        gg.register("pr:o/r#6")
+        self.daemon.tick(NOW)
+        data = gg.read_cache("pr:o/r#6")["data"]
+        self.assertEqual(data["checks"][0]["failedSteps"], ["Set up runner"])
+        held = gg.verdict("pr", data, "green")
+        self.gh.prs[("o", "r", 6)] = pr_node(6, state="MERGED", rollup="FAILURE", checks=[build])
+        gg.register("pr:o/r#6")
+        self.daemon.tick(NOW + 2 * gg.CYCLE)
+        merged = gg.read_cache("pr:o/r#6")["data"]
+        self.assertEqual(merged["state"], "MERGED")
+        self.assertEqual(merged["checks"][0]["failedSteps"], ["Set up runner"])
+        self.assertEqual(gg.verdict("pr", merged, "green"), held)
+
+    def test_a_pr_that_merges_keeps_its_cached_runner_refusal_over_rest(self) -> None:
+        self.merges_with_a_cached_refusal(rest=(4000, 1800), graphql=(50, 3000))
+
+    def test_a_pr_that_merges_keeps_its_cached_runner_refusal_over_graphql(self) -> None:
+        self.merges_with_a_cached_refusal(rest=(300, 3000), graphql=(4000, 3000))
+
     def test_a_deleted_base_branch_keeps_the_last_requirements(self) -> None:
         self.gh.prs[("o", "r", 5)] = pr_node(5, checks=[workflow_check("build", 5)])
         self.gh.protected = ["ci-status"]

@@ -69,6 +69,8 @@ the daemon is the only process that talks to GitHub, and clients only read its c
   60 s doubling to 15 min, whichever is longer, and no read is sent during it.
 - Comment watches (an issue's or PR's latest 50 comments) are one batched GraphQL query every 15 s
   (over REST: the issue and the page or two holding them), and last only while someone waits on them.
+- A merged or closed PR's failed steps are not read (its cached ones are kept), and a job whose steps read GitHub
+  refused for good (404, 410, 422) is not asked again for STEPS_RETRY (15 minutes); a 5xx is asked again next read.
 - Reads follow interest. A PR nobody has waited on or read for IDLE_BACKOFF_AFTER (5 minutes) is polled about
   as often as it was last read, up to every 10 minutes, and its check events no longer re-read it early; a read
   (a `status`, a wait, the broker answering from the cache) puts it back on every cycle. A comment wait on a
@@ -552,6 +554,11 @@ REST_CHECK_PAGES = 5  # check-run pages (100 each) one PR read over REST takes a
 REST_STATUS_PAGES = 2  # commit-status pages (100 each) likewise
 REST_RUN_PAGES = 2  # a commit's workflow-run pages (100 each) likewise: without its run a check has no workflow
 REST_STEPS_MAX = 10  # failed or cancelled jobs whose steps one PR read over REST looks up at most
+# A job whose steps read GitHub refused for good (404 for a job of a deleted run, 410, 422) is not asked again for
+# this long: each such read was retried on every read of its PR, a counted request each time. A 5xx or a transport
+# error is asked again at the normal pace: the steps hold a runner refusal for the rescue, whose grace is 360 s.
+STEPS_RETRY = 900.0
+STEPS_GONE = re.compile(r"HTTP (?:404|410|422)\b")
 # The most counted REST requests one read can make before its step lookups, which are admitted one
 # at a time: a PR is its pull, REST_CHECK_PAGES of check runs, statuses, runs, workflows, rules and
 # the branch; a run is the run and its job list. The share admits a read only when this much fits. The
@@ -1799,6 +1806,13 @@ def slim_run(doc: dict) -> dict:
     return {k: doc.get(k) for k in keep}
 
 
+def settled_pr(data: dict) -> bool:
+    """A merged or closed PR: its failed steps are not read from GitHub (on 2026-11-10 cosmic-gray's daemon read 54
+    jobs/{id} in ten minutes, most for merged cmux PRs). Steps already cached are still carried forward: `wait pr
+    --until green|done` rules on a merged PR too, and a runner refusal inside the rescue grace is held by them."""
+    return str(data.get("state") or "").upper() in {"MERGED", "CLOSED"}
+
+
 def wants_steps(c: dict) -> bool:
     """A check whose steps the daemon reads once: a failure (which steps failed) or a cancellation
     (did any step run: the owned-pool rescue cancels a job still queued for a runner, then re-runs it)."""
@@ -2109,6 +2123,7 @@ class Daemon:
         self.alarm_procs: list[subprocess.Popen] = []  # tell-coordinator runs not yet reaped
         self.writing = False  # inside the outbox: its requests are sessions' writes, not the daemon's polling
         self.jobs_only: list[dict] = []  # failed runs whose job list is read though runs cannot be (due)
+        self.steps_failed: dict[Any, float] = {}  # job id -> when GitHub refused its steps for good (STEPS_RETRY)
 
     # -- budget
 
@@ -4497,7 +4512,7 @@ class Daemon:
                     continue
                 if c["id"] in known:
                     c["failedSteps"], c["stepCount"] = known[c["id"]]
-                else:
+                elif not settled_pr(data):  # a settled PR keeps what is cached; nothing new is read for it
                     want.setdefault(c["id"], []).append(c)
                     owners.setdefault(c["id"], set()).add(e["key"])
         ids = list(want)[:2 * STEPS_BATCH]  # the rest wait a cycle (failed and cancelled checks; each is read once)
@@ -4817,14 +4832,19 @@ class Daemon:
         the rest on the next one. Without its steps a refused or never-started check cannot be held."""
         known = known_steps([(e, data)])
         left = REST_STEPS_MAX
+        self.steps_failed = {j: t for j, t in self.steps_failed.items() if self.now - t < STEPS_RETRY}
         for c in data.get("checks") or []:
             if not wants_steps(c):
                 continue
             if c["id"] in known:
                 c["failedSteps"], c["stepCount"] = known[c["id"]]
                 continue
+            if settled_pr(data):
+                continue  # kept above when cached; nothing new is read for a settled PR
             job_id = job_ids.get(c["id"])
             if not job_id or not c.get("runId") or left <= 0 or self.mode("rest") == "stop" or not self.rest_room(1):
+                continue
+            if job_id in self.steps_failed:
                 continue
             left -= 1
             try:
@@ -4834,6 +4854,8 @@ class Daemon:
                 return
             if state != "fresh" or not isinstance(doc, dict):
                 self.errors.append(f"{e['key']} steps: {doc}")
+                if STEPS_GONE.match(str(doc)):
+                    self.steps_failed[job_id] = self.now
                 continue
             steps = doc.get("steps")
             c["failedSteps"], c["stepCount"] = failed_steps(steps), len(steps) if isinstance(steps, list) else None
