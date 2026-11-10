@@ -293,7 +293,7 @@ SPEND_RECENT = 600  # seconds: the window an alarm names the top routes of, and 
 # leo-workspace tools/coord_inbox.py, delivered to the coordinator through acpmux) and written as a notice line
 # (~/.local/state/notices/glaeda-gh.jsonl, the schema of cmuxterm-hq tools/fleet-reconcilers/notices.py), at most
 # once per ALARM_EVERY for one alarm unless it gets worse. Policy "alarms" ({"pool": bool, "share": bool,
-# "restLeft": N}) turns each on; the pool is the whole account's, so one host (config/gh-daemon.json) watches it.
+# "restLeft": N, "paceShare": 0..1, 0 for off}) turns each on; the pool is the whole account's, so one host (config/gh-daemon.json) watches it.
 ALARM_CMD = Path(os.environ.get("GLAEDA_GH_ALARM_CMD") or Path.home() / ".local/bin/tell-coordinator")
 NOTICES_DIR = Path(os.environ.get("NOTICES_DIR") or Path.home() / ".local/state/notices")
 ALARMS_FILE = "alarms.json"  # when each alarm was last sent, so a restart does not send it again
@@ -799,9 +799,8 @@ def spenders_text(rows: list[dict]) -> str:
 
 
 def waiter_of(e: dict) -> str:
-    """The reader that read a watch entry last (Daemon.watches readers), "" when none is named."""
-    readers = e.get("readers") if isinstance(e.get("readers"), dict) else {}
-    return max(readers.items(), key=lambda kv: (kv[1], kv[0]))[0] if readers else ""
+    """The reader that read a watch entry last (the watch's `reader`), "" when none is named."""
+    return e.get("reader") if isinstance(e.get("reader"), str) else ""
 
 
 def waiters_of(entries: list[dict]) -> str:
@@ -933,8 +932,12 @@ def readers_of(doc: dict, now: float) -> dict[str, float]:
 
 
 def reader_fresh(doc: dict, reader: str, now: float) -> bool:
-    at = (doc.get("readers") or {}).get(reader) if isinstance(doc.get("readers"), dict) else None
-    return isinstance(at, (int, float)) and not isinstance(at, bool) and 0 <= now - at < READER_REFRESH
+    """Whether READER is the watch's latest reader already, named within READER_REFRESH: writing it again would change
+    nothing waiter_of decides. Another reader in between makes it stale at once, so a read is never charged to a
+    reader that came and went (A, then B, then A again: A is the latest)."""
+    at = doc.get("readerAt")
+    return doc.get("reader") == reader and isinstance(at, (int, float)) and not isinstance(at, bool) \
+        and 0 <= now - at < READER_REFRESH
 
 
 def touch_interest(key: str) -> None:
@@ -1065,10 +1068,12 @@ def _register_locked(path: Path, key: str, jobs: bool, consumer: str | None, wai
     now = time.time()
     reader = reader or reader_name()
     readers = readers_of(prior, now)
-    if not reader_fresh(prior, reader, now):
+    if reader_fresh(prior, reader, now):
+        doc["reader"], doc["readerAt"] = reader, prior["readerAt"]
+    else:
         readers[reader] = now
-    if readers:
-        doc["readers"] = readers
+        doc["reader"], doc["readerAt"] = reader, now
+    doc["readers"] = readers
     if waited:
         doc["waitedAt"] = time.time()
     elif isinstance(prior.get("waitedAt"), (int, float)):
@@ -1914,7 +1919,8 @@ def daemon_policy() -> dict:
     alarms = doc.get("alarms") if isinstance(doc.get("alarms"), dict) else {}
     return {"cycle": cycle, "commentCycle": comment, "graphqlPerMinute": per_minute,
             "alarms": {"pool": alarms.get("pool") is True, "share": alarms.get("share") is not False,
-                       "restLeft": int(_bounded(alarms.get("restLeft"), ALARM_REST_LEFT, 0, 100000))},
+                       "restLeft": int(_bounded(alarms.get("restLeft"), ALARM_REST_LEFT, 0, 100000)),
+                       "paceShare": float(_bounded(alarms.get("paceShare"), ALARM_PACE_SHARE, 0.0, 1.0))},
             "cycles": {"pr": cycle, "run": cycle, "comment": comment, "head": cycle},
             "floors": floors, "restShare": float(_bounded(doc.get("restShare"), REST_SHARE, 0.0, 1.0)),
             # restYield out of range (or not a number) is left out, so the default yield holds, never 0 by a typo
@@ -3231,6 +3237,7 @@ class Daemon:
             began = doc.get("waitBegan") if isinstance(doc.get("waitBegan"), (int, float)) else None
             out.append({"key": key, "jobs": bool(doc.get("jobs")), "cache": cached, "touched": self.now - age,
                         "waitedAt": waited, "waitBegan": began, "readers": readers_of(doc, time.time()),
+                        "reader": doc.get("reader") if isinstance(doc.get("reader"), str) else "",
                         "consumers": {str(k): float(v) for k, v in asked.items() if isinstance(v, (int, float))}})
         return out
 
