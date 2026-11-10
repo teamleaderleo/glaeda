@@ -797,6 +797,7 @@ def host_spenders(run: Callable[..., Any] = subprocess.run) -> tuple[list[dict],
 # cosmic-gray's logs held about 64 of the pool's 180 a minute, and every alarm named only those.
 UNLOGGED_SHARE = 0.25
 UNLOGGED_MIN = 300
+UNLOGGED_EARLY = 600  # a window younger than this is too early to measure (#1937 review)
 
 
 def unlogged_text(limit: int | None, remaining: int | None, reset: float | None, now: float,
@@ -807,11 +808,14 @@ def unlogged_text(limit: int | None, remaining: int | None, reset: float | None,
     on this host in the last hour, which holds that window. G = U - HOST_REST can only understate what is unlogged."""
     if host_rest is None or not isinstance(limit, int) or not isinstance(remaining, int) or reset is None:
         return "", None
+    since = max(0.0, min(3600.0, 3600.0 - (reset - now)))
+    if since < UNLOGGED_EARLY:  # a fresh window has spent too little to compare: say so, never "nothing unlogged"
+        return (f" Too early in GitHub's window ({since / 60:.0f} min old) to say how much REST no log on "
+                f"{policy_host()} holds.", None)
     used = limit - remaining
     gap = used - host_rest
     if gap < UNLOGGED_MIN or gap < UNLOGGED_SHARE * used:
         return "", None
-    since = max(0.0, min(3600.0, 3600.0 - (reset - now)))
     return (f" At least {gap} of the {used} REST the pool spent in the last {since / 60:.0f} min ({gap / used:.0%}) is "
             f"in no log on {policy_host()}: other hosts signed in to this login (their `{Path(SPENDERS_CMD).name} "
             f"usage`), or its token used outside gh.", gap)

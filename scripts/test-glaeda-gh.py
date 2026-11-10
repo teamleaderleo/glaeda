@@ -11693,6 +11693,15 @@ class SpendAlarmTest(Base):
         self.assertEqual(gg.host_spenders(), ([], 0))  # it answered: this host spent nothing
         self.assertEqual(gg.unlogged_text(5000, 1000, NOW + 600, NOW, None), ("", None))
 
+    def test_a_window_just_after_a_reset_is_too_early_to_measure(self) -> None:
+        """#1937 review: two minutes after a reset, 100 spent and none logged is no measure; the alarm says it is too
+        early, never that nothing is unlogged."""
+        text, gap = gg.unlogged_text(5000, 4900, NOW + 3480, NOW, 0)
+        self.assertIsNone(gap)
+        self.assertIn("Too early in GitHub's window (2 min old)", text)
+        self.assertEqual(gg.unlogged_text(5000, 4900, NOW + 3480, NOW, None), ("", None))  # unknown still says nothing
+        self.assertIsNotNone(gg.unlogged_text(5000, 3000, NOW + 2900, NOW, 0)[1])  # 11 min in: measured
+
     def test_the_pace_alarm_is_off_at_a_zero_share(self) -> None:
         for name in ("FLEET_POLICY", "UPDATE_CONFIG", "DAEMON_CONFIG"):
             self.addCleanup(setattr, gg, name, getattr(gg, name))
