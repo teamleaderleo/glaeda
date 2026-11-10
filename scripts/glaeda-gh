@@ -476,9 +476,9 @@ POST_JOIN_RULE = "\n\n---\n\n"
 POST_STATUS_MAX = 6 * 3600
 STATUS_KEY = re.compile(r"[\w.:=@/-]{1,120}")
 POST_STATUSES = "statuses.json"  # thread -> the last status comment the outbox posted there
-POST_SUBJECTS = "subjects.json"
+POST_SUBJECTS = "subjects.json"  # thread -> its GraphQL node id (an issue's or PR's id never changes)
 POST_EDITS = "edited.json"  # the comments the outbox edited in place: only their edits count as said again
-POST_EDITS_KEEP = 2000  # thread -> its GraphQL node id (an issue's or PR's id never changes)
+POST_EDITS_KEEP = 2000
 SUBJECT_QUERY = """query($o: String!, $r: String!, $n: Int!) { repository(owner: $o, name: $r) {
 issueOrPullRequest(number: $n) { ... on Issue { id comments(last: 1) { nodes { id } } }
 ... on PullRequest { id comments(last: 1) { nodes { id } } } } } }"""
@@ -2924,8 +2924,8 @@ class Daemon:
             self.note_status({**item, "status": None}, None, None, None)  # deleted: post it as a new comment
             write_json(path, item)
             return None
-        return self.post_finish(path, item, error="graphql: " + "; ".join(
-            str(e.get("message") or e.get("type")) for e in errors)[:300])
+        said = "; ".join(str(e.get("message") or e.get("type")) for e in errors) or str(doc.get("message") or "")
+        return self.post_finish(path, item, error=f"graphql: HTTP {status}: {said}"[:300])
 
     def post_prune(self) -> None:
         for path in posted_dir().glob("*.json") if posted_dir().is_dir() else []:
@@ -10006,10 +10006,13 @@ def post_item(args: argparse.Namespace) -> dict:
             raise WatchError("--head, --base, --title and --reviewer are for post pr")
         if args.kind == "comment" and args.event != "comment":
             raise WatchError("--event is for post review")
-        if getattr(args, "status_key", None):
-            if args.kind != "comment" or not STATUS_KEY.fullmatch(args.status_key):
+        key = getattr(args, "status_key", None)
+        if key is not None and not isinstance(key, str):
+            key = None  # a caller's own namespace without the flag (an older argv, a test's Mock)
+        if key:
+            if args.kind != "comment" or not STATUS_KEY.fullmatch(key):
                 raise WatchError("--status-key is for post comment: letters, digits and . : = @ / - (120 at most)")
-            item["status"] = args.status_key
+            item["status"] = key
         item.update(repo=f"{m.group(1)}/{m.group(2)}", number=int(m.group(3)))
         if args.kind == "review":
             item["event"] = args.event.upper().replace("-", "_")
