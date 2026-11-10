@@ -11277,6 +11277,13 @@ class SpendAlarmTest(Base):
             self.addCleanup(setattr, gg, name, getattr(gg, name))
             setattr(gg, name, value)
 
+    def tearDown(self) -> None:
+        # An alarm's tell-coordinator runs in the background and writes told.txt in the test's directory: a test that
+        # never read told_lines() left it running while tearDown removed that directory ("Directory not empty").
+        for p in self.daemon.alarm_procs:
+            p.wait(10)
+        super().tearDown()
+
     def policy(self, **alarms: Any) -> None:
         self.daemon.policy = {**self.daemon.policy, "alarms": {"pool": False, "share": True, "restLeft": 1000, **alarms}}
 
