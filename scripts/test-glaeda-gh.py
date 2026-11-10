@@ -11259,6 +11259,9 @@ class DaemonPolicyTest(Base):
         self.assertFalse(self.daemon.rest_room(2))
         self.configure({"restShare": 0.0, "restYield": 1000})
         self.assertTrue(self.daemon.rest_room(500))
+        for bad in (1e9, -5, float("nan"), "300"):  # a typo keeps the default yield, never turns it off
+            self.configure({"restShare": 0.0, "restYield": bad})
+            self.assertEqual(self.daemon.rest_yield(), gg.REST_YIELD_MIN, bad)
 
     def test_a_yielding_share_admits_head_consumers_and_paces_every_head(self) -> None:
         """Review F1/F2 at 99070e23: lean only for being past the share must still admit an unreserved consumer, and a
