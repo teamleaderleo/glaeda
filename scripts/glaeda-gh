@@ -2552,12 +2552,14 @@ class Daemon:
                 self.post_at = self.now
                 self.post_retry(path, item, "could not look for an earlier attempt", uncertain=True)
                 return
+        # a look that answered "not there": nothing landed, so a join may still be undone; it is resent over REST
+        resend = bool(item.pop("uncertain", False))
         if item["kind"] == "comment" and not item.get("group"):
             self.post_join(path, item)
-        elif item.get("group") and not item.get("uncertain") and not item.get("delivered") \
+        elif item.get("group") and not item.get("delivered") \
                 and self.thread_watched(str(item["repo"]), item["number"]):
             self.post_unjoin(path, item)  # a wait began watching the thread since the join: each goes out alone
-        if item["kind"] == "comment" and self.post_over_graphql(item):
+        if item["kind"] == "comment" and not resend and self.post_over_graphql(item):
             return self.post_comment_graphql(path, item)
         method, api, body = post_request(item)
         write_json(path, {**item, "uncertain": True})  # a daemon that dies mid-request looks it up first
@@ -2769,16 +2771,18 @@ class Daemon:
         # at most what every comment reader keeps of a body (COMMENT_BODY_MAX characters): a member past it would
         # drop out of the cached comment a wait matches (`--match READY` after a long comment)
         members, size = [], len(str(item["body"]))
-        for other_path in sorted(outbox_dir().glob("*.json")):
-            if other_path.name == path.name:
-                continue
+        for other_path in sorted(outbox_dir().glob("*.json")):  # queue order
+            if other_path.stem <= path.stem:
+                continue  # the leader, and what was queued before it
             other = read_json(other_path)
-            if (not isinstance(other, dict) or other.get("id") != other_path.stem or not self.joinable(other)
-                    or other.get("repo") != item.get("repo") or other.get("number") != item.get("number")
-                    or other.get("by") != item.get("by")
-                    or (other.get("notBefore") or 0) > self.now
-                    or not 0 <= float(other.get("queuedAt") or 0) - float(item.get("queuedAt") or 0) <= POST_JOIN_WINDOW):
+            if not isinstance(other, dict) or other.get("id") != other_path.stem:
                 continue
+            if other.get("kind") not in {"comment", "review"} or other.get("repo") != item.get("repo") \
+                    or other.get("number") != item.get("number"):
+                continue  # another thread's write: it does not stand between this thread's comments
+            if (not self.joinable(other) or other.get("by") != item.get("by") or (other.get("notBefore") or 0) > self.now
+                    or not 0 <= float(other.get("queuedAt") or 0) - float(item.get("queuedAt") or 0) <= POST_JOIN_WINDOW):
+                break  # a write to this thread that stays on its own: nothing queued after it moves ahead of it
             grown = size + len(POST_JOIN_RULE) + len(str(other["body"]))
             if grown > COMMENT_BODY_MAX:
                 break

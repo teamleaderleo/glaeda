@@ -10830,6 +10830,36 @@ class PostJoinTest(unittest.TestCase):
         self.assertEqual([c[2]["body"] for c in t.calls[1:]], ["progress", "READY"])
         self.assertEqual([gg.post_state(i["id"])["url"] for i in (progress, ready)], ["u1", "u2"])
 
+    def test_a_write_that_stays_alone_ends_the_join(self) -> None:
+        # Codex review of ee4cc19: `starting`, a running marker, then `finished` were sent as `starting...finished`
+        # and then the marker, after the work it announced was done
+        bodies = ["starting", "<!-- review-running sha=abc -->\nrunning", "finished"]
+        for body in bodies:
+            self.queue("comment", "o/r#7", "--body", body)
+        ok = (201, {}, {"html_url": "u"})
+        d, t = self.daemon(ok, ok, ok)
+        for n in range(3):
+            self.step(d, NOW + n * gg.POST_SPACING)
+        self.assertEqual([c[2]["body"] for c in t.calls], bodies)
+
+    def test_a_join_whose_answer_was_lost_is_undone_once_it_is_known_not_to_have_landed(self) -> None:
+        # Codex review of ee4cc19: the lost answer kept the join `uncertain`, so a wait matching ^READY registered
+        # since then saw the two resent as one comment
+        progress = self.queue("comment", "o/r#7", "--body", "progress")
+        ready = self.queue("comment", "o/r#7", "--body", "READY")
+        d, t = self.daemon(gg.WatchError("connection reset"), (200, {}, []),
+                           (201, {}, {"html_url": "u1"}), (201, {}, {"html_url": "u2"}))
+        self.step(d, NOW)
+        self.assertEqual(t.calls[0][2]["body"], gg.POST_JOIN_RULE.join(["progress", "READY"]))
+        gg.watch_dir().mkdir(parents=True, exist_ok=True)
+        (gg.watch_dir() / gg.file_name("comment:o/r#7")).write_text("{}")
+        leader = gg.read_json(gg.outbox_dir() / f"{progress['id']}.json")
+        for n in range(1, 4):
+            self.step(d, max(NOW + n * gg.POST_SPACING, float(leader.get("notBefore") or 0) + n * gg.POST_SPACING))
+        self.assertEqual(t.calls[1][0], "GET")  # looked first: not there
+        self.assertEqual([c[2]["body"] for c in t.calls[2:]], ["progress", "READY"])
+        self.assertEqual([gg.post_state(i["id"])["url"] for i in (progress, ready)], ["u1", "u2"])
+
     def test_a_lasting_graphql_refusal_fails_the_comment_not_the_outbox(self) -> None:
         item = self.queue("comment", "o/r#7", "--body", "landed")
         d, t = self.daemon(self.subject(), (403, {}, {"errors": [{"type": "FORBIDDEN", "message": "SAML enforcement"}]}))
