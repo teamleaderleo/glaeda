@@ -10640,13 +10640,15 @@ class PostJoinTest(unittest.TestCase):
         old = {"id": 5, "createdAt": "2026-01-01T00:00:00Z", "editedAt": at, "body": "verdict",
                "author": {"login": "me"}}
         ours = frozenset({5})
-        self.assertTrue(gg.comment_matches(old, None, re.compile("verdict"), 5, None, NOW, ours))
-        self.assertTrue(gg.comment_matches(old, None, None, None, NOW, NOW, ours))
-        self.assertFalse(gg.comment_matches({**old, "editedAt": None}, None, None, None, NOW, NOW, ours))
-        self.assertFalse(gg.comment_matches(old, None, None, 5, None, None, ours))  # no wait start: as before
+        # --since the edited comment itself: its edit is newer, even one finished before the wait began
+        self.assertTrue(gg.comment_matches(old, None, re.compile("verdict"), 5, None, ours))
+        self.assertFalse(gg.comment_matches(old, None, None, 6, None, ours))  # an older comment's edit preceded 6
+        self.assertTrue(gg.comment_matches(old, None, None, None, NOW, ours))  # edited after the wait began
+        self.assertFalse(gg.comment_matches(old, None, None, None, NOW + 20, ours))
+        self.assertFalse(gg.comment_matches({**old, "editedAt": None}, None, None, None, NOW, ours))
         # anyone else's edit (a typo fix, a ticked box) is not a new comment
-        self.assertFalse(gg.comment_matches(old, None, None, 5, None, NOW))
-        self.assertFalse(gg.comment_matches(old, None, None, None, NOW, NOW))
+        self.assertFalse(gg.comment_matches(old, None, None, 5, None))
+        self.assertFalse(gg.comment_matches(old, None, None, None, NOW))
 
     def test_an_edit_in_place_is_recorded_for_the_waits(self) -> None:
         d, t, first, second = self.status_pair("IC_1")
@@ -10710,6 +10712,28 @@ class PostJoinTest(unittest.TestCase):
                 self.assertEqual(state["state"], "queued")
                 self.assertIsNone(d.token)
                 self.assertFalse(gg.read_json(gg.outbox_dir() / f"{item['id']}.json").get("uncertain"))
+
+    def test_graphql_spent_routes_the_write_over_rest_not_a_hold(self) -> None:
+        item = self.queue("comment", "o/r#7", "--body", "landed")
+        spent = (403, {"x-ratelimit-remaining": "0", "x-ratelimit-reset": str(int(NOW + 900))},
+                 {"message": "API rate limit exceeded for user"})
+        d, t = self.daemon(self.subject(), spent, (201, {}, {"html_url": "u"}))
+        self.rich(d)
+        d.policy["floors"]["graphql"] = (0, 0)  # the reading says rich; the answer says spent
+        gg.write_json(gg.BASE / gg.POST_SUBJECTS, {})
+        self.step(d, NOW)
+        self.step(d, NOW + gg.POST_SPACING)
+        self.assertLessEqual(d.post_hold, NOW + gg.POST_SPACING)  # not held
+        self.assertGreaterEqual(d.backoff["graphql"], NOW + 900)
+        self.step(d, NOW + 2 * gg.POST_SPACING)
+        self.assertEqual(t.calls[-1][1], "/repos/o/r/issues/7/comments")
+        self.assertEqual(gg.post_state(item["id"])["state"], "posted")
+
+    def test_an_edit_is_recorded_before_it_is_sent(self) -> None:
+        d, t, first, second = self.status_pair("IC_1")
+        t.answers[-1] = gg.WatchError("connection reset")  # the answer to the edit is lost
+        self.step(d, NOW + gg.POST_SPACING)
+        self.assertEqual(gg.outbox_edits(), frozenset({5}))
 
     def test_a_lasting_graphql_refusal_fails_the_comment_not_the_outbox(self) -> None:
         item = self.queue("comment", "o/r#7", "--body", "landed")

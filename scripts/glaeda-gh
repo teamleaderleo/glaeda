@@ -2842,14 +2842,25 @@ class Daemon:
     def gql_throttled(status: int, h: dict, doc: Any) -> bool:
         """A secondary limit, as the REST path tells one: a lasting 403 (scope, SSO, a block) fails the item
         instead of holding every write."""
-        return (status == 429 or bool(h.get("retry-after")) or h.get("x-ratelimit-remaining") == "0"
+        return (status == 429 or bool(h.get("retry-after"))
                 or (status in {403, 422, 200} and bool(THROTTLED.search(json.dumps(doc)[:4000] if doc else ""))))
 
-    @staticmethod
-    def gql_out(doc: Any) -> bool:
-        """GraphQL's own limit (HTTP 200 with a RATE_LIMITED error): nothing ran."""
-        return isinstance(doc, dict) and any(isinstance(e, dict) and e.get("type") == "RATE_LIMITED"
-                                             for e in doc.get("errors") or [])
+    def gql_out(self, status: int, h: dict, doc: Any) -> bool:
+        """GraphQL's own hourly limit (a RATE_LIMITED error, or no points left and no secondary limit named): nothing
+        ran. GraphQL is backed off until its reset, so the next turn sends the write over REST (post_over_graphql)
+        instead of holding every queued write."""
+        limited = isinstance(doc, dict) and any(isinstance(e, dict) and e.get("type") == "RATE_LIMITED"
+                                                for e in doc.get("errors") or [])
+        spent = (h.get("x-ratelimit-remaining") == "0" and status in {200, 403}
+                 and not THROTTLED.search(json.dumps(doc)[:4000] if doc else ""))
+        if not (limited or spent):
+            return False
+        try:
+            until = float(h.get("x-ratelimit-reset") or 0)
+        except ValueError:
+            until = 0.0
+        self.backoff["graphql"] = max(self.backoff["graphql"], until, self.now + CYCLE)
+        return True
 
     def post_comment_graphql(self, path: Path, item: dict) -> None:
         """addComment (or, for the writer's own status, updateIssueComment) with the same queue semantics as REST:
@@ -2873,11 +2884,11 @@ class Daemon:
                 return self.post_retry(path, item, describe(error))  # a read: nothing was written
             node = (((doc.get("data") or {}).get("repository") or {}).get("issueOrPullRequest") or {}) \
                 if isinstance(doc, dict) else {}
+            if self.gql_out(status, h, doc):
+                write_json(path, item)  # GraphQL is out (backed off): the next turn posts over REST
+                return None
             if self.gql_throttled(status, h, doc):
                 return self.post_hold_for(h, path, item)
-            if self.gql_out(doc):
-                write_json(path, item)  # GraphQL is out (request() backed it off): the next turn posts over REST
-                return None
             if status == 401:
                 return self.post_retry(path, item, "graphql subject: HTTP 401")  # request() re-reads the token
             if status != 200 or not isinstance(node, dict) or not node.get("id"):
@@ -2890,6 +2901,11 @@ class Daemon:
             nodes = (node.get("comments") or {}).get("nodes") or []
             last = nodes[-1] if nodes and isinstance(nodes[-1], dict) else None
         edit = bool(editable and last and last.get("id") == prior.get("nodeId"))
+        if edit and isinstance(prior.get("id"), int):
+            # before the edit is sent: an edit that lands behind a lost answer is still one the waits see
+            edits = read_json(BASE / POST_EDITS)
+            edits = [x for x in edits if isinstance(x, int) and x != prior["id"]] if isinstance(edits, list) else []
+            write_json(BASE / POST_EDITS, (edits + [prior["id"]])[-POST_EDITS_KEEP:])
         write_json(path, {**item, "uncertain": True})
         try:
             if edit:
@@ -2914,11 +2930,7 @@ class Daemon:
             self.post_backoff = POST_BACKOFF
             self.note_status(item, made.get("id"), made.get("databaseId"), made.get("url"))
             note = "edited this writer's earlier status comment, the thread's last" if edit else None
-            if edit:
-                edits = read_json(BASE / POST_EDITS)
-                edits = [x for x in edits if isinstance(x, int)] if isinstance(edits, list) else []
-                if isinstance(made.get("databaseId"), int):
-                    write_json(BASE / POST_EDITS, (edits + [made["databaseId"]])[-POST_EDITS_KEEP:])
+
             author = made.get("author") if isinstance(made.get("author"), dict) else {}
             # the REST answer's shape, for post_delivered's risk-receipt check
             answer = {"html_url": made["url"], "author_association": made.get("authorAssociation"),
@@ -2926,11 +2938,11 @@ class Daemon:
             return self.post_delivered(path, item, answer, note=note)
         if status == 401:
             return self.post_retry(path, item, "graphql: HTTP 401")  # refused before it ran; request() re-reads the token
-        if self.gql_throttled(status, h, doc):
-            return self.post_hold_for(h, path, item)
-        if self.gql_out(doc):
+        if self.gql_out(status, h, doc):
             write_json(path, item)  # not run: GraphQL is out, so the next turn sends it over REST
             return None
+        if self.gql_throttled(status, h, doc):
+            return self.post_hold_for(h, path, item)
         if status >= 500 or (status == 200 and not errors):
             return self.post_retry(path, item, f"graphql: HTTP {status}", uncertain=True)
         if edit and any(e.get("type") == "NOT_FOUND" for e in errors):
@@ -6671,14 +6683,15 @@ def outbox_edits() -> frozenset:
 
 
 def comment_matches(c: dict, author: str | None, pattern: re.Pattern | None, since_id: int | None,
-                    since_time: float | None, edited_since: float | None = None,
-                    edited_ids: set | frozenset = frozenset()) -> bool:
+                    since_time: float | None, edited_ids: set | frozenset = frozenset()) -> bool:
     """A comment the outbox edited in place (a writer's status, POST_STATUS_MAX; its ids in EDITED_IDS) was said
-    again when it was edited, so a wait that began, or names a comment, before the edit sees the new text.
+    again when it was edited, so a wait that began before the edit, or names that comment, sees the new text.
     Anyone else's edit (a typo fix, a ticked box, a bot's sticky comment) is not a new comment."""
     edited = iso_epoch(c.get("editedAt")) if c.get("editedAt") and c.get("id") in edited_ids else None
     if since_id is not None and (c.get("id") or 0) <= since_id:
-        if edited is None or edited_since is None or edited < int(edited_since):
+        # `--since` this very comment: an outbox edit of it is newer than it, whenever the wait began. An older one's
+        # edit is not (the outbox edits a comment only while it is the thread's last, so before the named one).
+        if edited is None or (c.get("id") or 0) < since_id:
             return False
     if since_time is not None and max(iso_epoch(c.get("createdAt")) or 0, edited or 0) < int(since_time):
         return False
@@ -6733,7 +6746,7 @@ def cmd_wait_comment(target: str, timeout: float, as_json: bool, author: str | N
             return EXIT_FAIL
         comments = ((entry or {}).get("data") or {}).get("comments") or []
         edits = outbox_edits()
-        found = next((c for c in comments if comment_matches(c, author, pattern, since_id, since_time, began, edits)),
+        found = next((c for c in comments if comment_matches(c, author, pattern, since_id, since_time, edits)),
                      None)
         if found:
             if as_json:
@@ -6750,7 +6763,7 @@ def cmd_wait_comment(target: str, timeout: float, as_json: bool, author: str | N
                 print(f"result: success\nwaited_s: {waited}")
             return EXIT_OK
         if now - start >= timeout:
-            newer = sum(1 for c in comments if comment_matches(c, None, None, since_id, since_time, began, edits))
+            newer = sum(1 for c in comments if comment_matches(c, None, None, since_id, since_time, edits))
             where = "since the wait began" if not since else f"after {since}"
             hint = "; to include a reply posted before the wait, pass --since with your own comment's URL" if not since else ""
             emit(key, entry, as_json, {"result": "timeout", "waited_s": waited,
