@@ -10860,6 +10860,43 @@ class PostJoinTest(unittest.TestCase):
         self.assertEqual([c[2]["body"] for c in t.calls[2:]], ["progress", "READY"])
         self.assertEqual([gg.post_state(i["id"])["url"] for i in (progress, ready)], ["u1", "u2"])
 
+    def test_a_wait_that_registers_during_the_subject_lookup_splits_the_join(self) -> None:
+        # Codex review of a2ce203: the join was decided, then a wait matching ^READY registered while the subject
+        # was looked up, and the mutation sent `progress ... READY` as one comment
+        progress = self.queue("comment", "o/r#7", "--body", "progress")
+        ready = self.queue("comment", "o/r#7", "--body", "READY")
+
+        def subject_then_watch(*_a, **_k):
+            gg.watch_dir().mkdir(parents=True, exist_ok=True)
+            (gg.watch_dir() / gg.file_name("comment:o/r#7")).write_text("{}")
+            return self.subject()
+        d, t = self.daemon(self.subject(), self.made("IC_1", "u1"), self.made("IC_2", "u2"))
+        self.rich(d)
+        real = d.post_gql
+        calls = []
+
+        def gql(query, variables, reason):
+            calls.append(reason)
+            if reason == "outbox-subject":
+                subject_then_watch()
+            return real(query, variables, reason)
+        d.post_gql = gql
+        self.step(d, NOW)
+        self.assertEqual(t.calls[1][2]["variables"]["b"], "progress")
+        self.step(d, NOW + gg.POST_SPACING)
+        self.assertEqual(t.calls[-1][2]["variables"]["b"], "READY")
+        self.assertEqual([gg.post_state(i["id"])["url"] for i in (progress, ready)], ["u1", "u2"])
+
+    def test_an_internal_error_that_spent_the_last_point_stays_uncertain(self) -> None:
+        # Codex review of a2ce203: a 200 with an INTERNAL error and no points left may have written the comment
+        item = self.queue("comment", "o/r#7", "--body", "landed")
+        last = (200, {"x-ratelimit-remaining": "0", "x-ratelimit-reset": str(int(NOW + 900))},
+                {"data": {"addComment": None}, "errors": [{"type": "INTERNAL", "message": "Something went wrong"}]})
+        d, t = self.daemon(self.subject(), last)
+        self.rich(d)
+        self.step(d, NOW)
+        self.assertTrue(gg.read_json(gg.outbox_dir() / f"{item['id']}.json").get("uncertain"))  # post_find goes first
+
     def test_a_lasting_graphql_refusal_fails_the_comment_not_the_outbox(self) -> None:
         item = self.queue("comment", "o/r#7", "--body", "landed")
         d, t = self.daemon(self.subject(), (403, {}, {"errors": [{"type": "FORBIDDEN", "message": "SAML enforcement"}]}))

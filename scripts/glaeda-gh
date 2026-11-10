@@ -2906,9 +2906,11 @@ class Daemon:
         """GraphQL's own hourly limit (a RATE_LIMITED error, or no points left and no secondary limit named): nothing
         ran. GraphQL is backed off until its reset, so the next turn sends the write over REST (post_over_graphql)
         instead of holding every queued write."""
-        limited = isinstance(doc, dict) and any(isinstance(e, dict) and e.get("type") == "RATE_LIMITED"
-                                                for e in doc.get("errors") or [])
-        spent = (h.get("x-ratelimit-remaining") == "0" and status in {200, 403}
+        # only a definite refusal: every error is RATE_LIMITED, or a 403 for the spent counter. A 200 that spent the
+        # last point on an internal error may still have written: that one is retried uncertain (post_find first)
+        errors = [e for e in (doc.get("errors") or []) if isinstance(e, dict)] if isinstance(doc, dict) else []
+        limited = bool(errors) and all(e.get("type") == "RATE_LIMITED" for e in errors)
+        spent = (h.get("x-ratelimit-remaining") == "0" and status == 403
                  and not THROTTLED.search(json.dumps(doc)[:4000] if doc else ""))
         if not (limited or spent):
             return False
@@ -2955,6 +2957,8 @@ class Daemon:
             write_json(BASE / POST_SUBJECTS, dict(list(subjects.items())[-2000:]))
             nodes = (node.get("comments") or {}).get("nodes") or []
             last = nodes[-1] if nodes and isinstance(nodes[-1], dict) else None
+        if item.get("group") and self.thread_watched(repo, number):
+            self.post_unjoin(path, item)  # a wait began watching during the lookup: the leader goes out alone
         edit = bool(editable and last and last.get("id") == prior.get("nodeId"))
         if edit and isinstance(prior.get("id"), int):
             # before the edit is sent: an edit that lands behind a lost answer is still one the waits see
