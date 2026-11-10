@@ -10775,6 +10775,21 @@ class PostJoinTest(unittest.TestCase):
         self.assertIn("updateIssueComment", t.calls[3][2]["query"])
         self.assertFalse(d.post_over_graphql({"kind": "comment", "repo": "o/r", "number": 8, "body": "x"}))
 
+    def test_a_join_stays_within_what_the_comment_readers_keep(self) -> None:
+        long = "x" * 4000
+        self.queue("comment", "o/r#7", "--body", long)
+        ready = self.queue("comment", "o/r#7", "--body", "READY-TO-LAND")
+        ok = (201, {}, {"html_url": "u"})
+        d, t = self.daemon(ok, ok)
+        self.step(d, NOW)
+        self.step(d, NOW + gg.POST_SPACING)
+        self.assertEqual([c[2]["body"] for c in t.calls], [long, "READY-TO-LAND"])  # posted apart
+        # every posted body is one a wait reads back whole, so `--match READY-TO-LAND` sees the reply
+        self.assertTrue(all(len(c[2]["body"]) <= gg.COMMENT_BODY_MAX for c in t.calls))
+        self.assertTrue(gg.comment_matches({"id": 10, "body": "READY-TO-LAND"[:gg.COMMENT_BODY_MAX]}, None,
+                                           re.compile("READY-TO-LAND"), 9, None))
+        self.assertEqual(gg.post_state(ready["id"])["state"], "posted")
+
     def test_a_lasting_graphql_refusal_fails_the_comment_not_the_outbox(self) -> None:
         item = self.queue("comment", "o/r#7", "--body", "landed")
         d, t = self.daemon(self.subject(), (403, {}, {"errors": [{"type": "FORBIDDEN", "message": "SAML enforcement"}]}))

@@ -2755,7 +2755,9 @@ class Daemon:
         (post_member) instead of being posted twice."""
         if not self.joinable(item) or self.thread_watched(str(item["repo"]), item["number"]):
             return  # a wait watching the thread may match a member's first line: each goes out on its own
-        members, size = [], len(str(item["body"]).encode())
+        # at most what every comment reader keeps of a body (COMMENT_BODY_MAX characters): a member past it would
+        # drop out of the cached comment a wait matches (`--match READY` after a long comment)
+        members, size = [], len(str(item["body"]))
         for other_path in sorted(outbox_dir().glob("*.json")):
             if other_path.name == path.name:
                 continue
@@ -2765,8 +2767,8 @@ class Daemon:
                     or (other.get("notBefore") or 0) > self.now
                     or not 0 <= float(other.get("queuedAt") or 0) - float(item.get("queuedAt") or 0) <= POST_JOIN_WINDOW):
                 continue
-            grown = size + len(POST_JOIN_RULE.encode()) + len(str(other["body"]).encode())
-            if grown > POST_BODY_MAX:
+            grown = size + len(POST_JOIN_RULE) + len(str(other["body"]))
+            if grown > COMMENT_BODY_MAX:
                 break
             members.append((other_path, other))
             size = grown
