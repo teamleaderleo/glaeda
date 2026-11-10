@@ -2845,6 +2845,12 @@ class Daemon:
         return (status == 429 or bool(h.get("retry-after")) or h.get("x-ratelimit-remaining") == "0"
                 or (status in {403, 422, 200} and bool(THROTTLED.search(json.dumps(doc)[:4000] if doc else ""))))
 
+    @staticmethod
+    def gql_out(doc: Any) -> bool:
+        """GraphQL's own limit (HTTP 200 with a RATE_LIMITED error): nothing ran."""
+        return isinstance(doc, dict) and any(isinstance(e, dict) and e.get("type") == "RATE_LIMITED"
+                                             for e in doc.get("errors") or [])
+
     def post_comment_graphql(self, path: Path, item: dict) -> None:
         """addComment (or, for the writer's own status, updateIssueComment) with the same queue semantics as REST:
         uncertain while in flight, held on a secondary limit, retried on a 5xx, failed on a refusal."""
@@ -2869,6 +2875,11 @@ class Daemon:
                 if isinstance(doc, dict) else {}
             if self.gql_throttled(status, h, doc):
                 return self.post_hold_for(h, path, item)
+            if self.gql_out(doc):
+                write_json(path, item)  # GraphQL is out (request() backed it off): the next turn posts over REST
+                return None
+            if status == 401:
+                return self.post_retry(path, item, "graphql subject: HTTP 401")  # request() re-reads the token
             if status != 200 or not isinstance(node, dict) or not node.get("id"):
                 if status >= 500 or not isinstance(doc, dict) or not doc.get("errors"):
                     return self.post_retry(path, item, f"graphql subject: HTTP {status}")
@@ -2913,9 +2924,11 @@ class Daemon:
             answer = {"html_url": made["url"], "author_association": made.get("authorAssociation"),
                       "user": {"type": author.get("__typename"), "login": author.get("login")}}
             return self.post_delivered(path, item, answer, note=note)
+        if status == 401:
+            return self.post_retry(path, item, "graphql: HTTP 401")  # refused before it ran; request() re-reads the token
         if self.gql_throttled(status, h, doc):
             return self.post_hold_for(h, path, item)
-        if any(e.get("type") == "RATE_LIMITED" for e in errors):
+        if self.gql_out(doc):
             write_json(path, item)  # not run: GraphQL is out, so the next turn sends it over REST
             return None
         if status >= 500 or (status == 200 and not errors):

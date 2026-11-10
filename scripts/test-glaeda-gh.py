@@ -10684,6 +10684,33 @@ class PostJoinTest(unittest.TestCase):
         self.assertEqual([c[2]["body"] for c in t.calls], ["one", "two"])
         self.assertEqual([gg.post_state(i["id"])["url"] for i in (a, b)], ["u1", "u2"])
 
+    def test_graphql_out_at_the_subject_leaves_the_comment_for_rest(self) -> None:
+        item = self.queue("comment", "o/r#7", "--body", "landed")
+        out = (200, {}, {"data": None, "errors": [{"type": "RATE_LIMITED", "message": "API rate limit exceeded"}]})
+        d, t = self.daemon(out, (201, {}, {"html_url": "u"}))
+        self.rich(d)
+        self.step(d, NOW)
+        self.assertEqual(gg.post_state(item["id"])["state"], "queued")
+        self.assertGreater(d.backoff["graphql"], NOW)
+        self.step(d, NOW + gg.POST_SPACING)
+        self.assertEqual(t.calls[-1][1], "/repos/o/r/issues/7/comments")
+        self.assertEqual((gg.post_state(item["id"])["state"], gg.post_state(item["id"])["url"]), ("posted", "u"))
+
+    def test_a_401_retries_the_comment_with_a_fresh_token(self) -> None:
+        for answers in ([(401, {}, {"message": "Bad credentials"})],
+                        [self.subject(), (401, {}, {"message": "Bad credentials"})]):
+            with self.subTest(at=len(answers)):
+                for p in gg.outbox_dir().glob("*.json"):
+                    p.unlink()
+                item = self.queue("comment", "o/r#7", "--body", "landed")
+                d, t = self.daemon(*answers)
+                self.rich(d)
+                self.step(d, NOW)
+                state = gg.post_state(item["id"])
+                self.assertEqual(state["state"], "queued")
+                self.assertIsNone(d.token)
+                self.assertFalse(gg.read_json(gg.outbox_dir() / f"{item['id']}.json").get("uncertain"))
+
     def test_a_lasting_graphql_refusal_fails_the_comment_not_the_outbox(self) -> None:
         item = self.queue("comment", "o/r#7", "--body", "landed")
         d, t = self.daemon(self.subject(), (403, {}, {"errors": [{"type": "FORBIDDEN", "message": "SAML enforcement"}]}))
