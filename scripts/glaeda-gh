@@ -479,6 +479,11 @@ POST_STATUSES = "statuses.json"  # thread -> the last status comment the outbox 
 POST_SUBJECTS = "subjects.json"  # thread -> its GraphQL node id (an issue's or PR's id never changes)
 POST_EDITS = "edited.json"  # the comments the outbox edited in place: only their edits count as said again
 POST_EDITS_KEEP = 2000
+GQL_TRANSIENT = re.compile(r"something went wrong|timed? ?out|timeout|internal (?:server )?error|try (?:again|later)|"
+                           r"service unavailable|temporarily|loading", re.I)
+GQL_TRANSIENT_TYPES = frozenset({"INTERNAL", "INTERNAL_ERROR", "SERVICE_UNAVAILABLE", "TIMEOUT"})
+GQL_REFUSALS = frozenset({"NOT_FOUND", "FORBIDDEN", "UNPROCESSABLE", "ARGUMENT_ERROR", "INSUFFICIENT_SCOPES",
+                          "SAML_ERROR", "UNAUTHENTICATED"})
 SUBJECT_QUERY = """query($o: String!, $r: String!, $n: Int!) { repository(owner: $o, name: $r) {
 issueOrPullRequest(number: $n) { ... on Issue { id comments(last: 1) { nodes { id } } }
 ... on PullRequest { id comments(last: 1) { nodes { id } } } } } }"""
@@ -2845,6 +2850,14 @@ class Daemon:
         return (status == 429 or bool(h.get("retry-after"))
                 or (status in {403, 422, 200} and bool(THROTTLED.search(json.dumps(doc)[:4000] if doc else ""))))
 
+    @staticmethod
+    def gql_transient(errors: list[dict]) -> bool:
+        """GitHub's own failure answered as HTTP 200 (an internal error, a timeout): retried like a 5xx. A refusal
+        that names the request (NOT_FOUND, FORBIDDEN, a validation error) still fails the write."""
+        return bool(errors) and not any(e.get("type") in GQL_REFUSALS for e in errors) and all(
+            e.get("type") in GQL_TRANSIENT_TYPES or GQL_TRANSIENT.search(str(e.get("message") or ""))
+            for e in errors)
+
     def gql_out(self, status: int, h: dict, doc: Any) -> bool:
         """GraphQL's own hourly limit (a RATE_LIMITED error, or no points left and no secondary limit named): nothing
         ran. GraphQL is backed off until its reset, so the next turn sends the write over REST (post_over_graphql)
@@ -2892,7 +2905,8 @@ class Daemon:
             if status == 401:
                 return self.post_retry(path, item, "graphql subject: HTTP 401")  # request() re-reads the token
             if status != 200 or not isinstance(node, dict) or not node.get("id"):
-                if status >= 500 or not isinstance(doc, dict) or not doc.get("errors"):
+                if (status >= 500 or not isinstance(doc, dict) or not doc.get("errors")
+                        or self.gql_transient([e for e in doc["errors"] if isinstance(e, dict)])):
                     return self.post_retry(path, item, f"graphql subject: HTTP {status}")
                 message = str(((doc.get("errors") or [{}])[0] or {}).get("message") or "")[:200]
                 return self.post_finish(path, item, error=f"graphql: {message or 'no such issue or pull request'}")
@@ -2943,7 +2957,8 @@ class Daemon:
             return None
         if self.gql_throttled(status, h, doc):
             return self.post_hold_for(h, path, item)
-        if status >= 500 or (status == 200 and not errors):
+        if status >= 500 or (status == 200 and (not errors or self.gql_transient(errors))):
+            # it may have landed: the retry looks for it over REST first (post_find)
             return self.post_retry(path, item, f"graphql: HTTP {status}", uncertain=True)
         if edit and any(e.get("type") == "NOT_FOUND" for e in errors):
             self.note_status({**item, "status": None}, None, None, None)  # deleted: post it as a new comment

@@ -10735,6 +10735,27 @@ class PostJoinTest(unittest.TestCase):
         self.step(d, NOW + gg.POST_SPACING)
         self.assertEqual(gg.outbox_edits(), frozenset({5}))
 
+    def test_githubs_own_failure_over_graphql_is_retried_not_failed(self) -> None:
+        for answers, uncertain in (
+                ([(200, {}, {"data": None, "errors": [{"message": "Something went wrong while executing your query."
+                                                                  " Please include `ABC:1` when reporting this issue."}]})],
+                 False),
+                ([self.subject(), (200, {}, {"data": {"addComment": None},
+                                             "errors": [{"message": "Timeout on validation of query"}]})], True)):
+            with self.subTest(at=len(answers)):
+                for p in gg.outbox_dir().glob("*.json"):
+                    p.unlink()
+                gg.write_json(gg.BASE / gg.POST_SUBJECTS, {})
+                item = self.queue("comment", "o/r#7", "--body", "landed")
+                d, t = self.daemon(*answers)
+                self.rich(d)
+                self.step(d, NOW)
+                self.assertEqual(gg.post_state(item["id"])["state"], "queued")
+                queued = gg.read_json(gg.outbox_dir() / f"{item['id']}.json")
+                self.assertEqual(bool(queued.get("uncertain")), uncertain)  # a mutation's may have landed
+        self.assertFalse(gg.Daemon.gql_transient([{"type": "UNPROCESSABLE", "message": "Body is too long, try again"}]))
+        self.assertFalse(gg.Daemon.gql_transient([{"message": "Could not resolve to a node"}]))
+
     def test_a_lasting_graphql_refusal_fails_the_comment_not_the_outbox(self) -> None:
         item = self.queue("comment", "o/r#7", "--body", "landed")
         d, t = self.daemon(self.subject(), (403, {}, {"errors": [{"type": "FORBIDDEN", "message": "SAML enforcement"}]}))
