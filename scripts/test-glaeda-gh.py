@@ -2334,6 +2334,35 @@ class BalanceTest(Base):
         self.assertEqual(len([c for c in self.gh.rest_calls() if "/actions/jobs/" in c[1]]), 1)
         self.assertEqual(gg.read_cache("pr:o/r#4")["data"]["checks"][0]["failedSteps"], ["Set up runner"])
 
+    def test_a_merged_prs_failed_steps_are_not_read(self) -> None:
+        """Nothing waits on a merged or closed PR's failed steps: its REST read makes no jobs/{id} request."""
+        build = workflow_check("build", 5, conclusion="FAILURE", node_id="CR_build")
+        self.gh.prs[("o", "r", 4)] = pr_node(4, state="MERGED", rollup="FAILURE", checks=[build])
+        self.gh.job_steps[50] = [{"name": "Set up runner", "conclusion": "failure"}]
+        self.budgets(rest=(4000, 1800), graphql=(50, 3000))
+        gg.register("pr:o/r#4")
+        self.daemon.tick(NOW)
+        self.assertEqual(gg.read_cache("pr:o/r#4")["data"]["state"], "MERGED")
+        self.assertEqual([c for c in self.gh.rest_calls() if "/actions/jobs/" in c[1]], [])
+
+    def test_a_failed_steps_read_is_not_retried_on_every_read(self) -> None:
+        """A job whose steps read failed (404) waits STEPS_RETRY before it is asked again, not one request a cycle."""
+        build = workflow_check("build", 5, conclusion="FAILURE", node_id="CR_build")
+        self.gh.prs[("o", "r", 4)] = pr_node(4, rollup="FAILURE", checks=[build])  # no job_steps: 404
+        self.budgets(rest=(4000, 1800), graphql=(50, 3000))
+        gg.register("pr:o/r#4")
+        jobs = lambda: len([c for c in self.gh.rest_calls() if "/actions/jobs/" in c[1]])  # noqa: E731
+        self.daemon.tick(NOW)
+        self.assertEqual(jobs(), 1)
+        for n in range(1, 4):
+            gg.register("pr:o/r#4")
+            self.daemon.tick(NOW + n * gg.CYCLE)
+        self.assertEqual(jobs(), 1)
+        self.daemon.steps_failed = {j: t - gg.STEPS_RETRY for j, t in self.daemon.steps_failed.items()}
+        gg.register("pr:o/r#4")
+        self.daemon.tick(NOW + 4 * gg.CYCLE)
+        self.assertEqual(jobs(), 2)
+
     def test_a_deleted_base_branch_keeps_the_last_requirements(self) -> None:
         self.gh.prs[("o", "r", 5)] = pr_node(5, checks=[workflow_check("build", 5)])
         self.gh.protected = ["ci-status"]
@@ -11267,7 +11296,8 @@ class SpendAlarmTest(Base):
         cmd = Path(self.tmp.name) / "tell-coordinator"
         cmd.write_text(f"#!/bin/sh\nprintf '%s\\n' \"$*\" >> {self.told}\n")
         cmd.chmod(0o755)
-        for name, value in (("NOTICES_DIR", self.notices), ("ALARM_CMD", cmd)):
+        for name, value in (("NOTICES_DIR", self.notices), ("ALARM_CMD", cmd),
+                            ("SPENDERS_CMD", os.fspath(Path(self.tmp.name) / "no-gh-quota"))):
             self.addCleanup(setattr, gg, name, getattr(gg, name))
             setattr(gg, name, value)
 
@@ -11292,7 +11322,7 @@ class SpendAlarmTest(Base):
         reset = NOW + 3000
         self.seen(4000, NOW, reset)
         self.daemon.check_alarms()
-        self.seen(3700, NOW + 300, reset)  # 60 a minute: dry in about an hour, reset in 45 minutes: fine
+        self.seen(3800, NOW + 300, reset)  # 40 a minute: dry after the reset, and under half the limit's pace: fine
         self.daemon.check_alarms()
         self.assertEqual(self.told_lines(), [])
         self.seen(1500, NOW + 600, reset)  # 250 a minute over the 10 minutes: dry in 6 minutes
@@ -11373,6 +11403,59 @@ class SpendAlarmTest(Base):
         self.assertIn("480/h against its cap of 300", told[0])
         self.assertIn("GET /repos/{owner}/{repo}/actions/runs/{id}/jobs?per_page 80 (run o/r)", told[0])
 
+    def spenders(self, rows: list[dict]) -> None:
+        cmd = Path(self.tmp.name) / "gh-quota"
+        cmd.write_text(f"#!/bin/sh\ncat <<'EOF'\n{json.dumps(rows)}\nEOF\n")
+        cmd.chmod(0o755)
+        gg.SPENDERS_CMD = os.fspath(cmd)
+
+    def test_the_pool_alarm_fires_at_half_the_hourly_limit_and_names_who_spent_it(self) -> None:
+        """2026-11-10 11:23Z: the pool drained 158 a minute and the alarm came 25 minutes before dry, naming only this
+        daemon's routes. Past half the limit's pace it fires, and names the host's top callers and each route's waiter."""
+        self.policy(pool=True)
+        self.spenders([{"caller": "tool:pr_owner.py", "rest": 900, "graphql": 3, "source": "gh shim"},
+                       {"caller": "gcp-agent-lane-2", "rest": 1200, "graphql": 0, "source": "lane-gh-broker"},
+                       {"caller": "session:quiet", "rest": 0, "graphql": 40, "source": "gh shim"}])
+        reset = NOW + 3000
+        self.seen(4900, NOW, reset)
+        self.daemon.check_alarms()
+        self.seen(4700, NOW + 300, reset)  # 40 a minute: under half of 5000 an hour (41.7)
+        self.daemon.check_alarms()
+        self.assertEqual(self.told_lines(), [])
+        self.daemon.transport = lambda *a: (200, {}, b"{}")
+        with self.daemon.calling("pr", "o/r", "session:lane-7"):
+            for n in range(5):
+                self.daemon.request("GET", f"/repos/o/r/pulls/{n}")
+        self.seen(4300, NOW + 600, reset)  # 60 a minute over the 10: dry in 72 minutes, after the reset
+        self.daemon.check_alarms()
+        told = self.told_lines()
+        self.assertEqual(len(told), 1, told)
+        self.assertIn("--severity warn", told[0])
+        self.assertIn("draining 60.0/min (past 50% of its 5000 an hour, 42/min)", told[0])
+        self.assertIn("GET /repos/{owner}/{repo}/pulls/{id} 5 (pr o/r; waiter session:lane-7)", told[0])
+        self.assertIn("last hour: gcp-agent-lane-2 1200 (lane-gh-broker); tool:pr_owner.py 900 (gh shim).", told[0])
+        self.assertNotIn("session:quiet", told[0])
+        self.assertEqual(self.notice_lines()[-1]["data"]["spenders"][0]["caller"], "gcp-agent-lane-2")
+
+    def test_the_pace_alarm_is_off_at_a_zero_share(self) -> None:
+        self.policy(pool=True, paceShare=0)
+        self.spenders([])
+        reset = NOW + 3000
+        self.seen(4900, NOW, reset)
+        self.daemon.check_alarms()
+        self.seen(4300, NOW + 600, reset)
+        self.daemon.check_alarms()
+        self.assertEqual(self.told_lines(), [])
+
+    def test_an_unreadable_spenders_list_still_sends_the_alarm(self) -> None:
+        self.policy(pool=True)
+        self.seen(800, NOW, NOW + 1200)
+        self.daemon.check_alarms()
+        told = self.told_lines()
+        self.assertEqual(len(told), 1, told)
+        self.assertIn("Top REST callers on", told[0])
+        self.assertIn("unknown", told[0])
+
     def test_an_alarm_with_no_inbox_still_writes_its_notice(self) -> None:
         gg.ALARM_CMD = Path(self.tmp.name) / "missing"
         self.policy(pool=True)
@@ -11389,6 +11472,58 @@ class SpendAlarmTest(Base):
         gg.DAEMON_CONFIG.write_text(json.dumps({"alarms": {"pool": True, "share": False, "restLeft": 2000}}))
         self.assertEqual(gg.daemon_policy()["alarms"], {"pool": True, "share": False, "restLeft": 2000})
         del fleet
+
+
+class ReaderTest(Base):
+    """Each watch names who reads it, and the spend log charges each REST route to that waiter."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.addCleanup(setattr, gg, "_reader", None)
+
+    def readers(self, key: str) -> dict:
+        return gg.read_json(gg.watch_dir() / gg.file_name(key)).get("readers") or {}
+
+    def test_a_session_registers_by_its_name_and_a_tool_by_its_own(self) -> None:
+        gg._reader = None
+        with mock.patch.dict(os.environ, {"ACPMUX_SESSION_NAME": "lane-7", "GLAEDA_GH_READER": ""}):
+            self.assertEqual(gg.reader_name(), "session:lane-7")
+        gg._reader = None
+        env = {k: "" for k in gg.READER_KEYS}
+        with mock.patch.dict(os.environ, {**env, "GLAEDA_GH_READER": ""}), \
+                mock.patch.object(gg, "parent_command", return_value=["/usr/bin/python3", "/x/tools/pr_owner.py", "sweep"]):
+            self.assertEqual(gg.reader_name(), "tool:pr_owner.py")
+
+    def test_register_and_a_cached_read_add_their_reader_once(self) -> None:
+        gg._reader = "session:a"
+        gg.register("pr:o/r#1")
+        self.assertEqual(list(self.readers("pr:o/r#1")), ["session:a"])
+        gg._reader = "tool:merge_hold.py"
+        gg.touch_interest("pr:o/r#1")
+        self.assertEqual(sorted(self.readers("pr:o/r#1")), ["session:a", "tool:merge_hold.py"])
+        path = gg.watch_dir() / gg.file_name("pr:o/r#1")
+        before = path.read_text()
+        gg.touch_interest("pr:o/r#1")  # named within READER_REFRESH: the file is not rewritten
+        self.assertEqual(path.read_text(), before)
+
+    def test_an_upstream_read_names_the_downstream_waiter(self) -> None:
+        line = json.dumps({"keys": [{"key": "pr:o/r#2", "jobs": False, "reader": "gcp-agent-lane-2/session:x"},
+                                    {"key": "pr:o/r#3", "jobs": False}]})
+        self.assertEqual(gg.read_readers(line), {"pr:o/r#2": "gcp-agent-lane-2/session:x"})
+        gg.read_request(line)  # still a valid request
+
+    def test_the_spend_log_charges_a_rest_read_to_its_waiter(self) -> None:
+        self.gh.prs[("o", "r", 5)] = pr_node(5, checks=[workflow_check("build", 5)])
+        self.budgets(rest=(4000, 1800), graphql=(50, 3000))
+        gg._reader = "session:waiter-1"
+        gg.register("pr:o/r#5")
+        self.daemon.tick(NOW)
+        routes = self.daemon.spend_by()["restByRoute"]
+        pulls = [r for r in routes if r["route"].startswith("GET /repos/{owner}/{repo}/pulls/")]
+        self.assertEqual(pulls[0]["topWaiter"], "session:waiter-1", routes)
+        self.assertIn("waiter session:waiter-1", "\n".join(gg.spend_lines(self.daemon.spend_by())))
+
+    budgets = BalanceTest.budgets
 
 
 class DaemonPolicyTest(Base):
