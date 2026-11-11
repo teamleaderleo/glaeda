@@ -4038,8 +4038,7 @@ class Daemon:
                   "secondaryHold": {"until": self.secondary_until, "strikes": self.secondary_strikes}
                   if self.secondary_until > self.now else None, "forceLow": list(self.policy.get("forceLow", ())),
                   "lastHour": hour,
-                  "restShare": {"spent": self.share_spent(), "since": round(self.share_since()),
-                                "lastHour": self.rest_spent(), "cap": self.rest_cap(), "yield": self.rest_yield(),
+                  "restShare": {"spent": self.share_spent(), "cap": self.rest_cap(), "yield": self.rest_yield(),
                                 "share": self.policy["restShare"], "capped": self.rest_capped()},
                   "heartbeat": HEARTBEAT_EVERY, "paths": dict(self.paths), "reads": reads, "graphqlBy": graphql_by,
                   "spendBy": self.spend_by(), "alarms": self.alarms,
