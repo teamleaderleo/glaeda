@@ -2550,8 +2550,12 @@ class Daemon:
         if path == "rest" and kind in BALANCED + FALLBACK and self.rest_capped() and self.mode("graphql") != "normal":
             return f"this daemon's REST share is spent and GraphQL is {self.mode('graphql')}", self.mode("graphql") == "stop"
         if mode == "lean":
-            return (f"the shared {name} quota is under the daemon's floor: {left} left (below {floor}, waited reads keep "
-                    f"their cycle and the rest are read {LEAN_FACTOR} times less often){resets}"), False
+            if isinstance(left, int) and left < floor:
+                waited = "waited reads keep their cycle and " if path == "graphql" else ""
+                return (f"the shared {name} quota is under the daemon's floor: {left} left (below {floor}, {waited}"
+                        f"the rest are read {LEAN_FACTOR} times less often){resets}"), False
+            why = "is forced low by policy" if path in self.policy.get("forceLow", ()) else "is past this daemon's share"
+            return f"{name} {why} (read {LEAN_FACTOR} times less often)", False
         if self.gql_paced == kind:
             return (f"the daemon's GraphQL pace ({self.policy.get('graphqlPerMinute', GRAPHQL_PER_MINUTE)} points a "
                     "minute) held this tick's reads"), False
@@ -3763,7 +3767,7 @@ class Daemon:
         interval = self.policy["cycles"][kind] * (LEAN_FACTOR if mode == "lean" else 1)
         # GraphQL scarce (lean): what a session waits on keeps its cycle and goes first, oldest data first; the
         # unwaited rest takes the lean pace (huge-blue 2026-11-11: at the fleet's 1000 floor a waited PR was 2509 s old)
-        scarce = mode == "lean"
+        scarce = mode == "lean" and path == "graphql"  # (REST lean is the daemon's share: no faster reads there)
         full = self.now - self.last_cycle[kind] >= interval
         if full:
             self.last_cycle[kind] = self.now
