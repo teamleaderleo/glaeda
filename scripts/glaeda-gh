@@ -2048,6 +2048,7 @@ def parse_pr(node: dict) -> dict:
         "checkState": rollup.get("state"), "checks": checks, "superseded": superseded,
         "supersededOmitted": superseded_omitted,
         "checksTotal": contexts.get("totalCount", len(checks)),
+        "checkCounts": check_counts(contexts),
         "checksTruncated": bool((contexts.get("pageInfo") or {}).get("hasNextPage")),
     }
 
@@ -6403,6 +6404,37 @@ def settling(data: dict, now: float, settle: float = SETTLE_GRACE) -> float | No
     return left if left > 0 else None
 
 
+def check_counts(contexts: dict) -> dict | None:
+    """The rollup's check runs and statuses counted by state over every page (checkRunCountsByState,
+    statusContextCountsByState), or None when the read did not ask for them."""
+    runs, statuses = contexts.get("checkRunCountsByState"), contexts.get("statusContextCountsByState")
+    if not isinstance(runs, list) or not isinstance(statuses, list):
+        return None
+    tally = lambda rows: {str(r.get("state")): int(r.get("count") or 0) for r in rows  # noqa: E731
+                          if isinstance(r, dict) and isinstance(r.get("count"), int)}
+    return {"runs": tally(runs), "statuses": tally(statuses)}
+
+
+COUNT_PENDING = {"QUEUED", "IN_PROGRESS", "PENDING", "WAITING", "REQUESTED", "EXPECTED"}
+COUNT_BAD = {"FAILURE", "CANCELLED", "TIMED_OUT", "ACTION_REQUIRED", "STARTUP_FAILURE", "STALE", "ERROR"}
+
+
+def rollup_red_is_superseded(data: dict) -> bool:
+    """Whether a truncated rollup's FAILURE is only superseded attempts: over every page nothing is pending, and no
+    more contexts are red than the superseded red attempts shown. manaflow-ai/cmux#41298, 2026-11-11: 191 contexts,
+    85 counted checks all passing, and `wait --until done` failed on the rollup's FAILURE from a superseded,
+    cancelled "risk evidence" attempt a newer run had replaced. Unknown counts: False (the rollup decides)."""
+    counts = data.get("checkCounts")
+    if not isinstance(counts, dict):
+        return False
+    rows = [*(counts.get("runs") or {}).items(), *(counts.get("statuses") or {}).items()]
+    if any(state in COUNT_PENDING and n for state, n in rows):
+        return False
+    red = sum(n for state, n in rows if state in COUNT_BAD)
+    superseded = sum(1 for c in data.get("superseded") or [] if str(c.get("conclusion") or "").upper() in COUNT_BAD)
+    return red <= superseded
+
+
 def check_verdict(data: dict, until: str = "green", now: float | None = None,
                   grace: float = RESCUE_GRACE, settle: float = SETTLE_GRACE) -> int | None:
     """The checks alone, whatever the PR's state or head: EXIT_OK, EXIT_FAIL, EXIT_NOTHING (nothing reported on the
@@ -6440,6 +6472,8 @@ def check_verdict(data: dict, until: str = "green", now: float | None = None,
         # running, yet the wait exited 1 after 5s). A failure past the first 100 fails that much later.
         if not groups["failed"] and groups["pending"] and data.get("superseded"):
             return None
+        if not groups["failed"] and not groups["pending"] and not groups["held"] and rollup_red_is_superseded(data):
+            return EXIT_OK  # every red context on every page is a superseded attempt
         return None if groups["held"] else EXIT_FAIL
     if not checks:
         # nothing has reported yet: not started while the head settles (or its push time is unknown), then said so

@@ -4126,6 +4126,30 @@ class ClientTest(Base):
         self.assertEqual(gg.verdict("pr", {**done, "checksTruncated": True, "checkState": "FAILURE",
                                            "superseded": [cancelled]}, "green"), 1)
 
+    def test_over_100_checks_a_red_rollup_of_only_superseded_attempts_is_green(self) -> None:
+        """manaflow-ai/cmux#41298, 2026-11-11: 191 contexts, 85 counted checks all passing, and `wait --until done`
+        exited 1 ("0 check(s) failed") on the rollup's FAILURE from a superseded, cancelled "risk evidence" attempt.
+        The rollup's counts over every page say whether any red is left besides the superseded ones."""
+        cancelled = {"name": "risk evidence", "conclusion": "CANCELLED"}
+        done = gg.parse_pr(pr_node(5, rollup="FAILURE", checks=[check_run("build")]))
+        base = {**done, "checksTruncated": True, "checkState": "FAILURE", "superseded": [cancelled]}
+        only = {"runs": {"SUCCESS": 189, "CANCELLED": 1}, "statuses": {"SUCCESS": 1}}
+        for until in ("green", "done", "required"):
+            self.assertEqual(gg.verdict("pr", {**base, "checkCounts": only}, until), 0, until)
+        # a red past the first 100 besides the superseded one: still a failure
+        more = {"runs": {"SUCCESS": 188, "CANCELLED": 1, "FAILURE": 1}, "statuses": {}}
+        self.assertEqual(gg.verdict("pr", {**base, "checkCounts": more}, "green"), 1)
+        # something still running past the first 100: not decided by the counts
+        running = {"runs": {"SUCCESS": 188, "CANCELLED": 1, "IN_PROGRESS": 1}, "statuses": {}}
+        self.assertEqual(gg.verdict("pr", {**base, "checkCounts": running}, "green"), 1)
+        # no counts (an older read): the rollup decides, as before
+        self.assertEqual(gg.verdict("pr", base, "green"), 1)
+        # parse_pr keeps the counts a read asked for
+        node = pr_node(6, checks=[check_run("build")])
+        node["commits"]["nodes"][0]["commit"]["statusCheckRollup"]["contexts"].update(
+            checkRunCountsByState=[{"state": "SUCCESS", "count": 1}], statusContextCountsByState=[])
+        self.assertEqual(gg.parse_pr(node)["checkCounts"], {"runs": {"SUCCESS": 1}, "statuses": {}})
+
     def test_a_check_cancelled_before_any_step_is_held_for_the_rescue(self) -> None:
         """manaflow-ai/cmux#20608: the owned-pool rescue cancelled a fast tier still queued for a
         runner (no step ran) and re-ran it; a wait that read the gap exited 1 before the re-run."""
