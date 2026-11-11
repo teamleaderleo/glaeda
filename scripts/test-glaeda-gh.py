@@ -1629,21 +1629,25 @@ class UpstreamTest(Base):
 
     def test_a_downstream_jobs_look_is_answered_by_the_upstream_job_read(self) -> None:
         """Review of #1961 F1: jobsAt travels both ways, so a downstream `status run --jobs` look is answered once the
-        upstream has read the job list, and is not polled until IDLE_EXPIRY."""
-        now = time.time()
-        gg.register("run:o/r/9", jobs=True, once=True)
+        upstream has read the job list, and is not polled until IDLE_EXPIRY. On one fake clock: the look at NOW, the
+        upstream's reads at NOW + 1, the ticks after."""
+        key = "run:o/r/9"
+        with mock.patch.object(gg.time, "time", return_value=NOW):
+            gg.register(key, jobs=True, once=True)
+        path = gg.watch_dir() / gg.file_name(key)
+        os.utime(path, (NOW, NOW))
         run = {"id": 9, "status": "in_progress", "run_attempt": 1, "head_sha": "a" * 40}
-        self.answers["run:o/r/9"] = {"data": run, "dataAt": now, "fetchedAt": now, "jobs": [], "jobsAt": now}
-        self.daemon.tick(now=now + 1)
-        self.assertEqual(gg.read_cache("run:o/r/9")["jobsAt"], now)
-        self.daemon.tick(now=now + 2)
-        self.assertTrue(gg.read_json(gg.watch_dir() / gg.file_name("run:o/r/9")).get("dormant"))
+        self.answers[key] = {"data": run, "dataAt": NOW + 1, "fetchedAt": NOW + 1, "jobs": [], "jobsAt": NOW + 1}
+        self.daemon.tick(now=NOW + 2)
+        self.assertEqual(gg.read_cache(key)["jobsAt"], NOW + 1)
+        self.daemon.tick(now=NOW + 3)
+        self.assertTrue(gg.read_json(path).get("dormant"))
         # and this host serves it on to its own downstream
         out = io.StringIO()
         with contextlib.redirect_stdout(out), mock.patch.object(gg, "daemon_running", return_value=True), \
                 mock.patch.object(gg, "daemon_failing", return_value=None):
-            gg.cmd_read(json.dumps({"keys": [{"key": "run:o/r/9", "jobs": True}]}))
-        self.assertEqual(json.loads(out.getvalue())["entries"]["run:o/r/9"]["jobsAt"], now)
+            gg.cmd_read(json.dumps({"keys": [{"key": key, "jobs": True}]}))
+        self.assertEqual(json.loads(out.getvalue())["entries"][key]["jobsAt"], NOW + 1)
 
     def test_reads_are_paced_and_a_new_key_is_asked_for_soon(self) -> None:
         gg.register("pr:o/r#7")
