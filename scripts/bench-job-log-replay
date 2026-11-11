@@ -1,0 +1,243 @@
+#!/usr/bin/env python3
+"""bench-job-log-replay: what a replay of past base-red verdicts spends in API reads, without and with glaeda-gh's
+failed-job log cache. One harness for both, so the counts compare.
+
+    bench-job-log-replay select --repo OWNER/REPO --base BRANCH --n 200 --out runs.json
+        the N newest failed pull_request runs into BRANCH (one run-list read per 100 runs scanned)
+    bench-job-log-replay replay --runs runs.json --mode before|after [--limit N] [--cap READS] --state DIR --out R.json
+        before: each run's job list, then each failed job's log, over `gh api` (the replay of cmux#41244)
+        after:  each run's failed jobs' logs from `glaeda-gh log run REPO RUN --failed --json`, no API call
+        Stops before a read past --cap (cmux#41244's replay was capped at about 150). Prints and writes
+        {"runs", "completed", "reads", "readsByKind", "wall", "jobs", "missed"}.
+    bench-job-log-replay warm --runs runs.json [--limit N] --state DIR --glaeda-dir DIR
+        fills a glaeda-gh cache by the daemon's own path: each run's job list (kept by `replay --mode before` in
+        DIR) is stored as the daemon stores a run watch (Daemon.store, which queues each failed job's log), then
+        Daemon.job_log_pass reads the queue as a tick would, its clock moved on JOB_LOG_SPACING each pass. Its
+        transport is `gh api` (a lane VM has no token; the broker answers a log's text directly). Counts its reads.
+
+Every API read goes through a `gh` on PATH that this harness puts first and that logs each call
+(DIR/gh-calls.log) before running the real one: what is counted is what was sent, the same way in both modes.
+"""
+
+from __future__ import annotations
+
+import argparse
+import importlib.machinery
+import importlib.util
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+FAILED = {"failure", "timed_out", "startup_failure"}
+
+
+def counting_path(state: Path) -> dict:
+    """An environment whose `gh` logs each call to STATE/gh-calls.log, then runs the real gh."""
+    real = shutil.which("gh")
+    if real is None:
+        sys.exit("bench: no gh on PATH")
+    shim = state / "bin"
+    shim.mkdir(parents=True, exist_ok=True)
+    (shim / "gh").write_text(
+        "#!/bin/sh\n"
+        f"printf '%s\\n' \"$*\" >> {json.dumps(str(state / 'gh-calls.log'))}\n"
+        f"exec {json.dumps(real)} \"$@\"\n")
+    (shim / "gh").chmod(0o755)
+    return {**os.environ, "PATH": f"{shim}{os.pathsep}{os.environ.get('PATH', '')}"}
+
+
+def calls(state: Path) -> list[str]:
+    try:
+        return (state / "gh-calls.log").read_text().splitlines()
+    except OSError:
+        return []
+
+
+def kind_of(call: str) -> str:
+    if "/logs" in call:
+        return "log"
+    if "/jobs" in call:
+        return "job list"
+    if "/runs" in call:
+        return "run list"
+    return "other"
+
+
+def gh(env: dict, *args: str) -> tuple[int, bytes, str]:
+    done = subprocess.run(["gh", *args], env=env, capture_output=True, timeout=180, check=False)
+    return done.returncode, done.stdout, done.stderr.decode(errors="replace")
+
+
+def cmd_select(args: argparse.Namespace) -> int:
+    state = Path(tempfile.mkdtemp(prefix="bench-select-"))
+    env = counting_path(state)
+    found = []
+    for page in range(1, args.pages + 1):
+        code, out, err = gh(env, "api", f"repos/{args.repo}/actions/runs?event=pull_request&status=failure"
+                                         f"&per_page=100&page={page}")
+        if code != 0:
+            sys.exit(f"bench: run list: {err.strip()[-300:]}")
+        runs = json.loads(out).get("workflow_runs") or []
+        for run in runs:
+            bases = {(p.get("base") or {}).get("ref") for p in run.get("pull_requests") or []}
+            if args.base in bases and run.get("conclusion") in FAILED:
+                found.append({"id": run["id"], "name": run.get("name"), "pr": [p.get("number") for p in
+                              run.get("pull_requests") or []], "created_at": run.get("created_at")})
+        if len(found) >= args.n or len(runs) < 100:
+            break
+    found = found[:args.n]
+    Path(args.out).write_text(json.dumps({"repo": args.repo, "base": args.base, "runs": found}, indent=1) + "\n")
+    print(json.dumps({"runs": len(found), "reads": len(calls(state)),
+                      "span": [found[-1]["created_at"], found[0]["created_at"]] if found else None}))
+    return 0
+
+
+def cmd_replay(args: argparse.Namespace) -> int:
+    doc = json.loads(Path(args.runs).read_text())
+    repo, runs = doc["repo"], doc["runs"][:args.limit]
+    state = Path(args.state)
+    state.mkdir(parents=True, exist_ok=True)
+    (state / "gh-calls.log").unlink(missing_ok=True)
+    env = counting_path(state)
+    if args.glaeda_dir:
+        env["GLAEDA_GH_DIR"] = args.glaeda_dir
+    kept = state / "jobs"
+    kept.mkdir(exist_ok=True)
+    glaeda = os.fspath(HERE / "glaeda-gh")
+    completed, jobs, missed, stopped = 0, 0, [], None
+    began = time.monotonic()
+    for run in runs:
+        rid = run["id"]
+        if args.mode == "before":
+            if len(calls(state)) + 1 > args.cap:
+                stopped = f"cap {args.cap} before run {rid}'s job list"
+                break
+            code, out, err = gh(env, "api", f"repos/{repo}/actions/runs/{rid}/jobs?filter=latest&per_page=100")
+            if code != 0:
+                missed.append({"run": rid, "why": err.strip()[-200:]})
+                continue
+            (kept / f"{rid}.json").write_bytes(out)
+            failed = [j for j in json.loads(out).get("jobs") or [] if j.get("conclusion") in FAILED]
+            if len(calls(state)) + len(failed) > args.cap:
+                stopped = f"cap {args.cap} before run {rid}'s {len(failed)} logs"
+                break
+            ok = True
+            for j in failed:
+                code, out, err = gh(env, "api", "--allow-escape-sequences", f"repos/{repo}/actions/jobs/{j['id']}/logs")
+                ok = ok and code == 0
+                jobs += code == 0
+            completed += ok
+        else:
+            done = subprocess.run([sys.executable, glaeda, "log", "run", repo, str(rid), "--failed", "--json"],
+                                  env=env, capture_output=True, timeout=120, check=False)
+            got = json.loads(done.stdout or b"{}").get("jobs") or []
+            jobs += sum(1 for j in got if j.get("state") == "hit")
+            if done.returncode == 0 and got:
+                completed += 1
+            else:
+                missed.append({"run": rid, "exit": done.returncode})
+    wall = time.monotonic() - began
+    sent = calls(state)
+    by_kind: dict[str, int] = {}
+    for call in sent:
+        by_kind[kind_of(call)] = by_kind.get(kind_of(call), 0) + 1
+    result = {"mode": args.mode, "runs": len(runs), "completed": completed, "reads": len(sent), "readsByKind": by_kind,
+              "wall": round(wall, 1), "jobs": jobs, "missed": missed[:20], "missedCount": len(missed),
+              "stopped": stopped}
+    Path(args.out).write_text(json.dumps(result, indent=1) + "\n")
+    print(json.dumps({k: v for k, v in result.items() if k != "missed"}))
+    return 0
+
+
+def load_glaeda():
+    loader = importlib.machinery.SourceFileLoader("glaeda_gh", os.fspath(HERE / "glaeda-gh"))
+    spec = importlib.util.spec_from_loader("glaeda_gh", loader)
+    gg = importlib.util.module_from_spec(spec)
+    sys.modules["glaeda_gh"] = gg
+    loader.exec_module(gg)
+    return gg
+
+
+def cmd_warm(args: argparse.Namespace) -> int:
+    doc = json.loads(Path(args.runs).read_text())
+    repo, runs = doc["repo"], doc["runs"][:args.limit]
+    state = Path(args.state)
+    (state / "gh-calls.log").unlink(missing_ok=True)
+    env = counting_path(state)
+    os.environ["GLAEDA_GH_DIR"] = args.glaeda_dir
+    gg = load_glaeda()
+    gg.BASE = Path(args.glaeda_dir)
+    # the module defaults (restShare 0.4 of the hour, floors 1500/300), as on a host with a login: a lane VM's own
+    # gh-daemon.json gives its daemon no REST share at all
+    for name in ("DAEMON_CONFIG", "FLEET_POLICY", "UPSTREAM_CONFIG"):
+        setattr(gg, name, Path(args.glaeda_dir) / f"none-{name.lower()}.json")
+
+    def transport(method: str, url: str, headers: dict, body: bytes | None) -> tuple[int, dict, bytes]:
+        path = url.split("api.github.com/", 1)[1]
+        code, out, err = gh(env, "api", "--allow-escape-sequences", path)
+        if code == 0:
+            return 200, {}, out
+        for status in (404, 410, 403, 502):
+            if f"HTTP {status}" in err:
+                return status, {}, b""
+        return 500, {}, b""
+
+    daemon = gg.Daemon(transport=transport, token=lambda: "broker", controller=None, upstream=None)
+    daemon.clock_real = False
+    daemon.now = time.time()
+    for run in runs:
+        listed = state / "jobs" / f"{run['id']}.json"
+        if not listed.exists():
+            continue
+        jobs = gg.slim_jobs(json.loads(listed.read_text()))
+        daemon.store(f"run:{repo}/{run['id']}", None, data={"id": run["id"], "status": "completed",
+                                                           "conclusion": "failure"}, jobs=jobs, dataAt=daemon.now)
+    queued = len(daemon.job_logs_wanted)
+    began = time.monotonic()
+    passes = 0
+    while daemon.job_logs_wanted and passes < 10 * max(1, queued):
+        passes += 1
+        daemon.job_log_pass()
+        daemon.now += gg.JOB_LOG_SPACING
+        if daemon.job_logs_wanted and not daemon.job_logs_next(1):
+            break  # only failed reads left, waiting JOB_LOG_RETRY
+    print(json.dumps({"queued": queued, "kept": queued - len(daemon.job_logs_wanted), "reads": len(calls(state)),
+                      "wall": round(time.monotonic() - began, 1), "errors": daemon.errors[:5],
+                      "simulatedSpacing": passes * gg.JOB_LOG_SPACING}))
+    return 0
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest="command", required=True)
+    s = sub.add_parser("select")
+    s.add_argument("--repo", required=True)
+    s.add_argument("--base", required=True)
+    s.add_argument("--n", type=int, default=200)
+    s.add_argument("--pages", type=int, default=4)
+    s.add_argument("--out", required=True)
+    r = sub.add_parser("replay")
+    r.add_argument("--runs", required=True)
+    r.add_argument("--mode", choices=("before", "after"), required=True)
+    r.add_argument("--limit", type=int, default=200)
+    r.add_argument("--cap", type=int, default=150)
+    r.add_argument("--state", required=True)
+    r.add_argument("--glaeda-dir")
+    r.add_argument("--out", required=True)
+    w = sub.add_parser("warm")
+    w.add_argument("--runs", required=True)
+    w.add_argument("--limit", type=int, default=200)
+    w.add_argument("--state", required=True)
+    w.add_argument("--glaeda-dir", required=True)
+    args = p.parse_args()
+    return {"select": cmd_select, "replay": cmd_replay, "warm": cmd_warm}[args.command](args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
