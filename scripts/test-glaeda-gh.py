@@ -3379,6 +3379,28 @@ class ClientTest(Base):
         self.assertTrue(gg.controller_unconfirmed(entry, entry["dataAt"] + 1))
         self.assertFalse(gg.controller_unconfirmed(entry, entry["dataAt"] + gg.REST_SAFETY))
 
+    def test_a_finish_the_quota_keeps_from_being_confirmed_ends_the_wait(self) -> None:
+        """manaflow-ai/cmux run 43054254048, 2026-11-11 ~16:05Z: the controller showed completed/success at 253 s and
+        the wait ran past 857 s for a confirmation read the quota refused (GraphQL stopped, REST stopped)."""
+        run = {"id": 15, "name": "CI", "status": "completed", "conclusion": "success", "run_attempt": 1,
+               "head_sha": "a" * 40, "html_url": "https://github.com/o/r/actions/runs/15", "event": "push"}
+        req = gg.wait_request("run", "o/r/15", "green", 60, False, False, None, True, gg.RESCUE_GRACE)
+        self.put("run:o/r/15", run, source="controller")
+        status = {"pid": 1, "at": time.time(), "modes": {"graphql": "normal", "rest": "lean"}, "restShare": {"capped": False}}
+        gg.write_json(gg.BASE / "daemon.json", status)
+        self.assertIsNone(gg.wait_step(req, time.time()), "GitHub can be read: the finish is confirmed first")
+        gg.write_json(gg.BASE / "daemon.json", {**status, "modes": {"graphql": "stop", "rest": "stop"}, "x": 1})
+        code, text = gg.wait_step(req, time.time())
+        self.assertEqual(code, gg.EXIT_OK)
+        self.assertIn("finish not confirmed by a GitHub read: GitHub's quota stops the daemon's reads", text)
+        # REST at the daemon's share counts as stopped too; an upstream host never rules so (its upstream confirms)
+        gg.write_json(gg.BASE / "daemon.json", {**status, "modes": {"graphql": "stop", "rest": "lean"},
+                                                "restShare": {"capped": True}, "x": 22})
+        self.assertEqual(gg.wait_step(req, time.time())[0], gg.EXIT_OK)
+        gg.write_json(gg.BASE / "daemon.json", {**status, "modes": {"graphql": "stop", "rest": "stop"},
+                                                "upstream": {"state": "ok"}, "x": 333})
+        self.assertIsNone(gg.wait_step(req, time.time()))
+
     def test_the_handoff_keeps_the_wait_start_and_its_deadline(self) -> None:
         """After the long-poll, the daemon's request keeps the wait's own start: a controller finish read during the
         long-poll still counts once it is REST_SAFETY old, and the deadline does not move."""
