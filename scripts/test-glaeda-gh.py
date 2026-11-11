@@ -3403,6 +3403,10 @@ class ClientTest(Base):
         self.assertEqual(self.wait("pr", "o/r#2", until="done", fill=(running, {}), sha="b" * 40, timeout=5)[0], 0)
         red = gg.parse_pr(pr_node(3, state="MERGED", rollup="FAILURE", checks=[check_run("a", conclusion="FAILURE")]))
         self.assertEqual(self.wait("pr", "o/r#3", until="done", fill=(red, {}), timeout=5)[0], 1, "a finished red still fails")
+        mixed = gg.parse_pr(pr_node(4, state="MERGED", rollup="FAILURE", checks=[
+            check_run("a", conclusion="FAILURE"), check_run("b", "IN_PROGRESS", None)]))  # review of #1955
+        self.assertEqual(self.wait("pr", "o/r#4", until="done", fill=(mixed, {}), timeout=5)[0], 1,
+                         "a finished red fails at once beside a running check")
 
     def test_wait_ignores_cache_from_before_it_began(self) -> None:
         old_green = gg.parse_pr(pr_node(1, rollup="SUCCESS", checks=[check_run("a")]))

@@ -6476,7 +6476,8 @@ def verdict(kind: str, data: dict | None, until: str = "green", sha: str | None 
         # Nothing more runs for it: a merged PR is done whatever its head still shows (leo-workspace#4370, 2026-11-11:
         # `--until done` saw MERGED at 600 s, then waited 15 min more on "checks: none reported yet"). A finished red
         # still fails; a pending, missing or other-head check no longer holds the wait.
-        decided = check_verdict(data, until, now, grace, settle)
+        # (judged as green would: under "done" a red waits for the running checks, and that None would read as OK)
+        decided = check_verdict(data, "green", now, grace, settle)
         return EXIT_FAIL if decided == EXIT_FAIL else EXIT_OK
     if sha and not str(data.get("headRefOid") or "").startswith(sha):
         return None  # the push has not reached GitHub yet, or these are an older commit's checks
