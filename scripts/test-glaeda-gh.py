@@ -214,6 +214,8 @@ class FakeGitHub:
         self.rate_limit_calls = 0  # GET /rate_limit: free, so it is counted separately
         self.throttle: dict[str, tuple[int, dict, bytes]] = {}  # "rest"|"graphql" -> the answer every read gets
         self.no_protection_feature = False  # a private repository's plan: rules and protection answer 403
+        # job id -> its log (GET .../actions/jobs/ID/logs redirects to storage, as GitHub does) or an HTTP status
+        self.job_logs: dict[int, bytes | int] = {}
 
     def rate(self, resource: str, remaining: int) -> dict:
         return {"x-ratelimit-limit": "5000", "x-ratelimit-remaining": str(remaining),
@@ -308,6 +310,13 @@ class FakeGitHub:
             self.rest_remaining -= 1
             return 403, self.rate("core", self.rest_remaining), json.dumps({"message": (
                 "Upgrade to GitHub Pro or make this repository public to enable this feature.")}).encode()
+        elif parts[4] == "actions" and parts[5] == "jobs" and parts[-1] == "logs":
+            self.rest_remaining -= 1
+            log = self.job_logs.get(int(parts[6]), 404)
+            if isinstance(log, int):
+                return log, self.rate("core", self.rest_remaining), b'{"message": "Gone"}'
+            return 302, {**self.rate("core", self.rest_remaining),
+                         "location": f"https://results.blob.core.windows.net/logs/job-{parts[6]}?sig=s"}, b""
         elif parts[4] == "actions" and parts[5] == "jobs":
             steps = self.job_steps.get(int(parts[6]))
             payload = None if steps is None else {"id": int(parts[6]), "steps": steps}
@@ -441,6 +450,9 @@ class Base(unittest.TestCase):
         NOW = float(int(time.time()))
         self.tmp = tempfile.TemporaryDirectory()
         self.saved = (gg.BASE, gg.WAIT_POLL, gg.DOWN_GRACE, gg.DOWN_PATIENCE, gg.BUDGET_REFRESH)
+        # Failed jobs' logs are read only in JobLogCacheTest: the other tests count every request a tick makes.
+        self.saved_logs = (gg.JOB_LOG_SHARE, gg.UPSTREAM_LOGS_MAX)
+        gg.JOB_LOG_SHARE, gg.UPSTREAM_LOGS_MAX = 0.0, 0
         gg.BASE = Path(self.tmp.name) / "gh"
         gg.WAIT_POLL = 0.05
         gg.DOWN_GRACE = 0.3
@@ -459,6 +471,7 @@ class Base(unittest.TestCase):
 
     def tearDown(self) -> None:
         gg.BASE, gg.WAIT_POLL, gg.DOWN_GRACE, gg.DOWN_PATIENCE, gg.BUDGET_REFRESH = self.saved
+        gg.JOB_LOG_SHARE, gg.UPSTREAM_LOGS_MAX = self.saved_logs
         gg._reader = self.saved_reader
         self.tmp.cleanup()
 
@@ -13524,6 +13537,234 @@ class QuietWritesTest(Base):
         self.assertGreater(served.stat().st_mtime, old + 1)
         # Well under a blocker's look: a mark WAITS_CHECK old is always older than a live daemon's .served.
         self.assertLess(gg.SERVED_QUIET + gg.TICK, gg.WAITS_CHECK / 2)
+
+
+class JobLogCacheTest(Base):
+    """The daemon keeps each failed job's log it sees, read once, compressed and bounded; `log` serves it with no API
+    call. Replaying 200 base-red verdicts for cmux#41244 read every log again (about 150 reads, stopped at 51 runs)."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        gg.JOB_LOG_SHARE, gg.UPSTREAM_LOGS_MAX = self.saved_logs
+        self.blobs: list[str] = []
+
+        def blob(url: str) -> tuple[int, bytes]:
+            self.blobs.append(url)
+            job = int(url.split("job-", 1)[1].split("?", 1)[0])
+            return 200, self.gh.job_logs[job]
+
+        self.daemon.blob = blob
+
+    def failed_pr(self, *jobs: int, run: int = 5) -> dict:
+        return {"number": 1, "state": "OPEN", "headRefOid": "a" * 40, "checks": [
+            {"name": f"test {j}", "status": "COMPLETED", "conclusion": "FAILURE", "id": f"CR_{j}", "runId": run,
+             "url": f"https://github.com/o/r/actions/runs/{run}/job/{j}"} for j in jobs]}
+
+    def log_reads(self) -> list[str]:
+        return [url for _, url, _, _ in self.gh.calls if url.endswith("/logs")]
+
+    def run_log(self, *argv: str) -> tuple[int, bytes, str]:
+        buf = io.BytesIO()
+        out = io.TextIOWrapper(buf, encoding="utf-8")
+        err = io.StringIO()
+        with mock.patch.object(gg.sys, "stdout", out), contextlib.redirect_stderr(err):
+            code = gg.main(["log", *argv])
+            out.flush()
+        return code, buf.getvalue(), err.getvalue()
+
+    def test_a_failed_check_s_log_is_read_once_and_served_with_no_api_call(self) -> None:
+        self.gh.job_logs[77] = b"2026-11-11T07:05:01Z ##[error]boom\n" * 50
+        self.daemon.store("pr:o/r#1", None, data=self.failed_pr(77), dataAt=NOW)
+        self.daemon.tick(now=NOW)
+        self.assertEqual(self.log_reads(), ["https://api.github.com/repos/o/r/actions/jobs/77/logs"])
+        self.assertEqual(len(self.blobs), 1)
+        log_path, side = gg.job_log_paths("o/r", 77)
+        self.assertEqual(log_path.read_bytes()[:2], b"\x1f\x8b")  # gzip
+        self.assertLess(log_path.stat().st_size, len(self.gh.job_logs[77]))
+        self.assertEqual(json.loads(side.read_text())["run"], 5)
+        calls = len(self.gh.calls)
+        code, out, _ = self.run_log("job", "o/r", "77")
+        self.assertEqual((code, out), (0, self.gh.job_logs[77]))
+        code, out, _ = self.run_log("run", "O/R", "5", "--failed")
+        self.assertEqual(code, 0)
+        self.assertIn(b"==> o/r job 77 (test 77) <==\n", out)
+        self.assertEqual(len(self.gh.calls), calls)  # served with no request
+        # seen again, by this daemon and by a restarted one: never read again
+        for daemon, at in ((self.daemon, NOW + 100), (gg.Daemon(transport=self.gh, token=lambda: TOKEN,
+                                                                controller=None, blob=self.daemon.blob), NOW + 200)):
+            daemon.store("pr:o/r#1", None, data=self.failed_pr(77), dataAt=at)
+            daemon.tick(now=at)
+        self.assertEqual(len(self.log_reads()), 1)
+
+    def test_logs_are_spaced_and_held_under_the_floor_and_past_half_the_share(self) -> None:
+        for j in (1, 2, 3):
+            self.gh.job_logs[j] = f"log {j}\n".encode()
+        self.daemon.store("pr:o/r#1", None, data=self.failed_pr(1, 2, 3), dataAt=NOW)
+        self.daemon.tick(now=NOW)
+        self.daemon.tick(now=NOW + gg.JOB_LOG_SPACING / 2)
+        self.assertEqual(len(self.log_reads()), 1)  # one, then JOB_LOG_SPACING
+        self.daemon.budget["rest"] = {"limit": 5000, "remaining": gg.FLOORS["rest"][0] - 1, "reset": NOW + 3000}
+        self.daemon.tick(now=NOW + gg.JOB_LOG_SPACING)
+        self.assertEqual(len(self.log_reads()), 1)  # under the floor: none
+        self.daemon.budget["rest"] = {"limit": 5000, "remaining": 4000, "reset": NOW + 3000}
+        minute = int(self.daemon.clock() // 60)
+        self.daemon.rest_minutes[minute] = int(self.daemon.rest_cap() * gg.JOB_LOG_SHARE)
+        self.daemon.tick(now=NOW + 2 * gg.JOB_LOG_SPACING)
+        self.assertEqual(len(self.log_reads()), 1)  # half the share spent: none
+        self.daemon.rest_minutes[minute] = 0
+        self.daemon.tick(now=NOW + 3 * gg.JOB_LOG_SPACING)
+        self.assertEqual(len(self.log_reads()), 2)
+
+    def test_an_expired_log_is_recorded_once_and_never_read_again(self) -> None:
+        self.gh.job_logs[9] = 410
+        self.daemon.store("run:o/r/4", None, data={"id": 4, "status": "completed", "conclusion": "failure"},
+                          jobs=[{"id": 9, "name": "build", "conclusion": "failure"}])
+        self.daemon.tick(now=NOW)
+        self.assertEqual(len(self.log_reads()), 1)
+        self.assertEqual(self.blobs, [])
+        code, out, err = self.run_log("job", "o/r", "9")
+        self.assertEqual((code, out), (gg.EXIT_LOG_GONE, b""))
+        self.assertIn("expired", err)
+        again = gg.Daemon(transport=self.gh, token=lambda: TOKEN, controller=None, blob=self.daemon.blob)
+        for daemon in (self.daemon, again):
+            daemon.store("run:o/r/4", None, data={"id": 4, "status": "completed", "conclusion": "failure"},
+                         jobs=[{"id": 9, "name": "build", "conclusion": "failure"}])
+            daemon.tick(now=NOW + 10 * gg.JOB_LOG_SPACING)
+        self.assertEqual(len(self.log_reads()), 1)
+
+    def test_a_failed_read_is_retried_later_not_every_tick(self) -> None:
+        self.gh.job_logs[3] = 502
+        self.daemon.store("pr:o/r#1", None, data=self.failed_pr(3), dataAt=NOW)
+        for n in range(4):
+            self.daemon.tick(now=NOW + n * gg.JOB_LOG_SPACING)
+        self.assertEqual(len(self.log_reads()), 1)
+        self.gh.job_logs[3] = b"ok\n"
+        self.daemon.tick(now=NOW + gg.JOB_LOG_RETRY + 1)
+        self.assertEqual(len(self.log_reads()), 2)
+        self.assertEqual(gg.job_log_get("o/r", 3)[:2], ("hit", b"ok\n"))
+
+    def test_eviction_by_size_drops_the_oldest_first(self) -> None:
+        for j in range(1, 6):
+            gg.job_log_put("o/r", j, os.urandom(4000), {"run": 1})  # random: gzip keeps its size
+            for path in gg.job_log_paths("o/r", j):
+                os.utime(path, (NOW - 1000 + j, NOW - 1000 + j))
+        one = gg.job_log_paths("o/r", 1)[0].stat().st_size
+        result = gg.job_logs_evict(NOW, max_bytes=2 * one + 10, max_age=86400)
+        self.assertEqual(result["removed"], 3)
+        self.assertEqual([gg.job_log_get("o/r", j)[0] for j in range(1, 6)], ["miss"] * 3 + ["hit"] * 2)
+        self.assertFalse(gg.job_log_paths("o/r", 1)[1].exists())  # its sidecar too
+
+    def test_eviction_by_age_drops_logs_markers_and_stale_temporaries(self) -> None:
+        gg.job_log_put("o/r", 1, b"old\n", {})
+        gg.job_log_mark("o/r", 2, {}, gone="HTTP 410")
+        gg.job_log_put("o/r", 3, b"new\n", {})
+        tmp = gg.job_log_dir("o/r") / ".3.log.gz.1.2.3.tmp"
+        tmp.write_bytes(b"partial")
+        old = NOW - gg.JOB_LOG_MAX_AGE - 60
+        for path in [*gg.job_log_paths("o/r", 1), *gg.job_log_paths("o/r", 2), tmp]:
+            if path.exists():
+                os.utime(path, (old, old))
+        gg.job_logs_evict(NOW)
+        self.assertEqual([gg.job_log_get("o/r", j)[0] for j in (1, 2, 3)], ["miss", "miss", "hit"])
+        self.assertFalse(tmp.exists())
+
+    def test_a_reader_never_sees_part_of_a_log_being_written(self) -> None:
+        a, b = b"a" * 3_000_000, b"bb\n" * 700_000
+        gg.job_log_put("o/r", 5, a, {})
+        stop = threading.Event()
+        seen: list[Any] = []
+
+        def write() -> None:
+            for n in range(60):
+                gg.job_log_put("o/r", 5, b if n % 2 == 0 else a, {})
+            stop.set()
+
+        writer = threading.Thread(target=write)
+        writer.start()
+        while not stop.is_set():
+            state, text, _ = gg.job_log_get("o/r", 5)
+            seen.append(state if state != "hit" else "a" if text == a else "b" if text == b else "torn")
+        writer.join()
+        self.assertGreater(len(seen), 0)
+        self.assertEqual(set(seen) - {"a", "b"}, set())
+        self.assertEqual([p.name for p in gg.job_log_dir("o/r").iterdir() if p.name.endswith(".tmp")], [])
+
+    def test_a_miss_exits_7_with_no_api_call_and_fetch_reads_it_once(self) -> None:
+        code, out, err = self.run_log("job", "o/r", "123")
+        self.assertEqual((code, out), (gg.EXIT_LOG_MISS, b""))
+        self.assertIn("--fetch", err)
+        code, _, err = self.run_log("run", "o/r", "6", "--failed")
+        self.assertEqual(code, gg.EXIT_LOG_MISS)
+        self.assertEqual(self.gh.calls, [])
+        routes: list[str] = []
+
+        def gh_read(route: str) -> bytes:
+            routes.append(route)
+            return b"fetched\n"
+
+        with mock.patch.object(gg, "gh_read", gh_read):
+            code, out, _ = self.run_log("job", "o/r", "123", "--fetch")
+            self.assertEqual((code, out), (0, b"fetched\n"))
+            code, out, _ = self.run_log("job", "o/r", "123", "--fetch")
+        self.assertEqual(routes, ["repos/o/r/actions/jobs/123/logs"])  # kept: the second is a hit
+        self.assertEqual(self.gh.calls, [])
+
+    def test_fetch_records_an_expired_log(self) -> None:
+        with mock.patch.object(gg, "gh_read", side_effect=gg.WatchError("HTTP 410 gh api x: Gone")):
+            code, _, _ = self.run_log("job", "o/r", "8", "--fetch")
+        self.assertEqual(code, gg.EXIT_LOG_GONE)
+        self.assertEqual(gg.job_log_get("o/r", 8)[:2], ("gone", "HTTP 410"))
+
+    def test_a_head_s_failed_job_ids_and_a_run_s_failed_jobs_are_kept(self) -> None:
+        self.gh.job_logs.update({41: b"head\n", 42: b"run\n"})
+        self.daemon.store("head:o/r@" + "b" * 40, None, data={"sha": "b" * 40, "found": {}, "settled": True,
+                                                             "ids": {"CI / test": [41]}})
+        self.daemon.store("run:o/r/6", None, data={"id": 6}, jobs=[{"id": 42, "conclusion": "failure", "name": "t"},
+                                                                  {"id": 43, "conclusion": "success", "name": "u"}])
+        self.daemon.tick(now=NOW)
+        self.daemon.tick(now=NOW + gg.JOB_LOG_SPACING)
+        self.daemon.tick(now=NOW + 2 * gg.JOB_LOG_SPACING)
+        self.assertEqual(sorted(self.log_reads()), ["https://api.github.com/repos/o/r/actions/jobs/41/logs",
+                                                    "https://api.github.com/repos/o/r/actions/jobs/42/logs"])
+
+    def test_a_redirect_outside_github_s_log_storage_is_refused(self) -> None:
+        for url in ("https://evil.example/x", "http://results.blob.core.windows.net/x", ""):
+            with self.assertRaises(gg.WatchError):
+                gg.http_blob(url)
+
+    def test_a_host_with_an_upstream_pulls_the_upstream_s_kept_logs(self) -> None:
+        asked: list[dict] = []
+        gg.job_log_put("o/r", 77, b"upstream text\n", {"run": 5, "name": "test 77"})
+        served = gg.upstream_logs([("o/r", 77), ("o/r", 78)])
+        self.assertEqual(served["o/r/78"], None)
+        shutil_dir = gg.BASE / gg.JOB_LOG_DIR
+        for p in sorted(shutil_dir.rglob("*"), reverse=True):  # this host keeps nothing yet
+            p.unlink() if p.is_file() else p.rmdir()
+
+        def ask(request: dict) -> dict:
+            asked.append(request)
+            return {"entries": {}, "logs": served if request.get("logs") else None}
+
+        down = gg.Daemon(transport=self.gh, token=lambda: self.fail("read a token"), controller=None, upstream=ask)
+        down.store("pr:o/r#1", None, data=self.failed_pr(77, 78), dataAt=NOW)
+        down.tick(now=NOW)
+        self.assertEqual(self.gh.calls, [])
+        self.assertEqual([r["logs"] for r in asked if r.get("logs")],
+                         [[{"repo": "o/r", "job": 78}, {"repo": "o/r", "job": 77}]])
+        self.assertEqual(gg.job_log_get("o/r", 77)[:2], ("hit", b"upstream text\n"))
+        self.assertEqual(gg.job_log_get("o/r", 78)[0], "miss")
+        down.tick(now=NOW + gg.JOB_LOG_SPACING)
+        self.assertEqual(len([r for r in asked if r.get("logs")]), 1)  # 78 waits JOB_LOG_RETRY
+
+    def test_the_upstream_answers_logs_beside_entries_only_when_asked(self) -> None:
+        gg.job_log_put("o/r", 77, b"kept\n", {"run": 5})
+        self.assertEqual(gg.read_logs_request('{"keys": []}'), [])
+        self.assertEqual(gg.read_logs_request('{"keys": [], "logs": [{"repo": "O/R", "job": 77}]}'), [("o/r", 77)])
+        with self.assertRaises(gg.WatchError):
+            gg.read_logs_request('{"keys": [], "logs": [{"repo": "o/r", "job": "77"}]}')
+        got = gg.upstream_logs([("o/r", 77)])["o/r/77"]
+        self.assertEqual(gg.gzip.decompress(gg.base64.b64decode(got["gz"])), b"kept\n")
+        self.assertEqual(got["run"], 5)
 
 
 if __name__ == "__main__":
