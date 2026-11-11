@@ -1297,6 +1297,15 @@ class GraphqlDietTest(Base):
         self.assertFalse(self.daemon.make_dormant(path, doc, NOW - 1))
         self.assertTrue(gg.read_json(path).get("waitedAt"))
         self.assertFalse(gg.read_json(path).get("dormant"))
+        # A forwarded registration that adds a wait and a job list but keeps the mtime (an older downstream touch) is
+        # not set aside on the stale snapshot either (review of #1961 F2).
+        gg.write_json(path, doc)
+        os.utime(path, (NOW - 1, NOW - 1))
+        gg.register("pr:o/r#1", jobs=True, waited=True, at={"touched": NOW - 100, "waitedAt": NOW - 1})
+        os.utime(path, (NOW - 1, NOW - 1))
+        self.assertFalse(self.daemon.make_dormant(path, doc, NOW - 1))
+        self.assertTrue(gg.read_json(path).get("jobs"))
+        self.assertTrue(gg.read_json(path).get("waitedAt"))
 
     def test_a_watch_whose_wait_ended_leaves_once_read(self) -> None:
         """A wait that ended (no touch for WAIT_INTEREST) is no reason to keep polling until IDLE_EXPIRY."""
@@ -1617,6 +1626,24 @@ class UpstreamTest(Base):
         served = json.loads(out.getvalue())["entries"]["run:o/r/9"]
         self.assertEqual(served["origin"], "controller")
         self.assertEqual(served["restRun"]["conclusion"], "cancelled")
+
+    def test_a_downstream_jobs_look_is_answered_by_the_upstream_job_read(self) -> None:
+        """Review of #1961 F1: jobsAt travels both ways, so a downstream `status run --jobs` look is answered once the
+        upstream has read the job list, and is not polled until IDLE_EXPIRY."""
+        now = time.time()
+        gg.register("run:o/r/9", jobs=True, once=True)
+        run = {"id": 9, "status": "in_progress", "run_attempt": 1, "head_sha": "a" * 40}
+        self.answers["run:o/r/9"] = {"data": run, "dataAt": now, "fetchedAt": now, "jobs": [], "jobsAt": now}
+        self.daemon.tick(now=now + 1)
+        self.assertEqual(gg.read_cache("run:o/r/9")["jobsAt"], now)
+        self.daemon.tick(now=now + 2)
+        self.assertTrue(gg.read_json(gg.watch_dir() / gg.file_name("run:o/r/9")).get("dormant"))
+        # and this host serves it on to its own downstream
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), mock.patch.object(gg, "daemon_running", return_value=True), \
+                mock.patch.object(gg, "daemon_failing", return_value=None):
+            gg.cmd_read(json.dumps({"keys": [{"key": "run:o/r/9", "jobs": True}]}))
+        self.assertEqual(json.loads(out.getvalue())["entries"]["run:o/r/9"]["jobsAt"], now)
 
     def test_reads_are_paced_and_a_new_key_is_asked_for_soon(self) -> None:
         gg.register("pr:o/r#7")
