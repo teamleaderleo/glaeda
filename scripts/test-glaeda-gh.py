@@ -12699,7 +12699,7 @@ class DaemonPolicyTest(Base):
             with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()), \
                     mock.patch.object(gg, "daemon_stale", return_value=None):
                 gg.cmd_budget(False)
-            self.assertIn("daemon REST spend 990/2000 this hour (restShare 0.4)", out.getvalue())
+            self.assertIn("daemon REST spend 990/2000 this REST window (restShare 0.4)", out.getvalue())
         finally:
             lock.close()
 
