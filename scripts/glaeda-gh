@@ -15,6 +15,8 @@
     glaeda-gh wait pid PID [--timeout S]                a process to exit, instead of a `kill -0` loop
     glaeda-gh checks OWNER/REPO SHA... --consumer NAME [--max-age S] [--wait S] [--json]
                                                         every check of those commits, read once for all sessions
+    glaeda-gh log job OWNER/REPO JOB_ID [--fetch] [--json]   a failed job's log as the daemon kept it, no API call
+    glaeda-gh log run OWNER/REPO RUN_ID --failed [--fetch] [--json]   every failed job's log of a run
     glaeda-gh post comment OWNER/REPO#N --body-file F|- [--wait S]    queue a comment; the daemon posts it, paced
     glaeda-gh post pr OWNER/REPO --head B --base B --title T --body-file F [--reviewer LOGIN] [--wait S]
     glaeda-gh post review OWNER/REPO#N [--event comment|approve|request-changes] --body-file F [--wait S]
@@ -203,7 +205,15 @@ elsewhere by the repository's own rescue. `wait` holds such a failure as pending
 --rescue-grace seconds (default 360) and follows the next attempt; a failure with any other
 cause decides at once.
 
-State lives in ~/.cache/glaeda/gh (GLAEDA_GH_DIR overrides): watch/, cache/, budget.json,
+The daemon keeps the log of every failed Actions job it sees (a PR's failed checks, a run's failed jobs, a
+head's failed job ids), each read once (GET .../actions/jobs/ID/logs, one REST read) after the tick's reads,
+only while REST is at its normal pace and the daemon is under JOB_LOG_SHARE of its share, one per
+JOB_LOG_SPACING, gzip-compressed in logs/ (at most JOB_LOG_MAX_BYTES, oldest first out, none older than
+JOB_LOG_MAX_AGE). A log GitHub has expired (404/410) is recorded once and never read again. A host reading
+through an upstream asks the upstream for the logs it kept, which costs no GitHub read. `log` prints them
+without an API call; a miss exits 7 (--fetch reads it once through gh), an expired log exits 8.
+
+State lives in ~/.cache/glaeda/gh (GLAEDA_GH_DIR overrides): watch/, cache/, logs/, budget.json,
 daemon.json (a heartbeat and the last hour's request counts), spend.json, alarms.json and daemon.lock, which the daemon
 holds for its lifetime and names itself in. Every GitHub request has a hard deadline (HTTP_DEADLINE),
 every subprocess one too, and a tick starts no request after TICK_BUDGET (what it did not reach goes
@@ -226,6 +236,7 @@ import datetime as dt
 import faulthandler
 import fcntl
 import glob
+import gzip
 import hashlib
 from http.client import HTTPException  # the http() helper below shadows the `http` package
 import json
@@ -1071,6 +1082,228 @@ def read_cache(key: str) -> dict | None:
     return doc if isinstance(doc, dict) and doc.get("key") == key else None
 
 
+# ---------------------------------------------------------------- failed jobs' logs (the `log` command)
+
+# The daemon keeps the log of each failed Actions job it sees (a PR's failed checks, a head's failed job ids, a run's
+# failed jobs), read once and stored gzip-compressed under BASE/logs/OWNER/REPO/JOB.log.gz beside JOB.json (the run,
+# the job's name, when it was read, or why GitHub has none). `glaeda-gh log job|run` prints them with no API call:
+# replaying 200 base-red verdicts for cmux#41244 read every log again through the broker (about 150 reads, and it
+# stopped at 51 runs), though this daemon had seen the failures.
+JOB_LOG_DIR = "logs"
+# 512 MiB of compressed logs: a failed cmux job's log is 0.1-5 MB of text and gzip keeps about a tenth of it, so this
+# holds a few thousand failed jobs, more than a busy week of them. It bounds the disk on a quiet host and a red day.
+JOB_LOG_MAX_BYTES = 512 * 1024 * 1024
+# 7 days: replays and property checks look back hours to days (cmux#41244's 200 reds spanned 3.5 hours), and a
+# verdict older than a week is about a base that has moved on. GitHub keeps logs up to 90 days; this need not.
+JOB_LOG_MAX_AGE = 7 * 86400.0
+JOB_LOG_RAW_MAX = 64 * 1024 * 1024  # a larger log is noted (tooLarge) and never read again: --fetch prints it uncached
+JOB_LOG_SPACING = 20.0  # seconds between two log reads (or upstream pulls): at most 180 an hour, inside the share below
+JOB_LOG_SHARE = 0.5  # logs are read only while the daemon has spent under this part of its REST share this hour
+JOB_LOG_RETRY = 900.0  # a log whose read failed (not 404/410) is tried again after this
+JOB_LOG_QUEUE_MAX = 1000  # failed jobs waiting for their log; past it the oldest wait for a later sighting
+JOB_LOG_EVICT_EVERY = 300.0  # the daemon's size and age pass, at most this often (and after each log it stores)
+JOB_LOG_TMP_KEEP = 3600.0  # a writer's temporary file this old was left by a crash: eviction removes it
+JOB_LOG_FAILED = {"failure", "timed_out", "startup_failure"}
+JOB_LOG_GONE = re.compile(r"HTTP (?:404|410)\b")  # GitHub expired (or never kept) the log: recorded once, never re-read
+# Where GET .../actions/jobs/ID/logs redirects: signed URLs that need no token (and must never be sent one)
+JOB_LOG_BLOB_HOSTS = (".actions.githubusercontent.com", ".blob.core.windows.net")
+JOB_URL_RE = re.compile(r"/actions/runs/(\d+)/job/(\d+)")
+UPSTREAM_LOGS_MAX = 10  # logs one upstream read asks for
+UPSTREAM_LOG_BYTES = 8 * 1024 * 1024  # compressed log bytes one upstream answer carries at most; the rest wait
+EXIT_LOG_MISS = 7  # `log`: not cached (and no --fetch): read it yourself, or ask with --fetch
+EXIT_LOG_GONE = 8  # `log`: GitHub has no log for the job any more (404/410), recorded when it was read
+
+
+def job_log_dir(repo: str) -> Path:
+    owner, name = repo.split("/", 1)
+    return BASE / JOB_LOG_DIR / owner.lower() / name.lower()
+
+
+def job_log_paths(repo: str, job: int) -> tuple[Path, Path]:
+    """(the compressed log, its sidecar) of JOB in REPO."""
+    d = job_log_dir(repo)
+    return d / f"{int(job)}.log.gz", d / f"{int(job)}.json"
+
+
+def atomic_write(path: Path, data: bytes) -> None:
+    """Write DATA to PATH so a reader sees the old file, no file, or all of DATA: never part of it."""
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.{time.monotonic_ns()}.tmp")
+    try:
+        with open(tmp, "wb") as f:
+            f.write(data)
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            tmp.unlink()
+        raise
+
+
+def job_log_meta(repo: str, job: int) -> dict | None:
+    doc = read_json(job_log_paths(repo, job)[1])
+    return doc if isinstance(doc, dict) and doc.get("job") == int(job) else None
+
+
+def job_log_known(repo: str, job: int) -> bool:
+    """Whether JOB's log is stored, or known to be beyond reach (gone, too large): either way it is not read again."""
+    log_path, side = job_log_paths(repo, job)
+    return log_path.exists() or side.exists()
+
+
+def job_log_put(repo: str, job: int, text: bytes, meta: dict, now: float | None = None) -> int:
+    """Store JOB's log (the log first, then its sidecar, each replaced whole); the compressed size."""
+    log_path, side = job_log_paths(repo, job)
+    gz = gzip.compress(text, compresslevel=6, mtime=0)
+    atomic_write(log_path, gz)
+    doc = {**{k: v for k, v in meta.items() if k in ("run", "name")}, "repo": repo.lower(), "job": int(job),
+           "at": time.time() if now is None else now, "bytes": len(text), "gz": len(gz)}
+    atomic_write(side, (json.dumps(doc, sort_keys=True) + "\n").encode())
+    return len(gz)
+
+
+def job_log_mark(repo: str, job: int, meta: dict, now: float | None = None, **why: Any) -> None:
+    """Record that JOB has no log to keep (gone=the HTTP answer, or tooLarge=its size): it is never read again."""
+    doc = {**{k: v for k, v in meta.items() if k in ("run", "name")}, "repo": repo.lower(), "job": int(job),
+           "at": time.time() if now is None else now, **why}
+    atomic_write(job_log_paths(repo, job)[1], (json.dumps(doc, sort_keys=True) + "\n").encode())
+
+
+def job_log_get(repo: str, job: int) -> tuple[str, Any, dict | None]:
+    """("hit", text bytes, meta), ("gone", why, meta), ("large", bytes, meta) or ("miss", None, None). Reads only the
+    one file it opens: a log being replaced or evicted meanwhile is read whole from the inode it opened."""
+    log_path, _ = job_log_paths(repo, job)
+    try:
+        with open(log_path, "rb") as f:
+            gz = f.read()
+    except OSError:
+        gz = None
+    if gz is not None:
+        try:
+            return "hit", gzip.decompress(gz), job_log_meta(repo, job)
+        except (OSError, EOFError, ValueError):
+            pass  # a damaged file is a miss: --fetch replaces it
+    meta = job_log_meta(repo, job)
+    if meta and meta.get("gone"):
+        return "gone", meta["gone"], meta
+    if meta and meta.get("tooLarge"):
+        return "large", meta["tooLarge"], meta
+    return "miss", None, None
+
+
+def job_log_run_jobs(repo: str, run: int) -> list[dict]:
+    """The sidecars of RUN's jobs kept here, by job id."""
+    d = job_log_dir(repo)
+    found = []
+    with contextlib.suppress(OSError):
+        for p in d.iterdir():
+            if p.name.endswith(".json") and not p.name.startswith("."):
+                doc = read_json(p)
+                if isinstance(doc, dict) and doc.get("run") == int(run) and isinstance(doc.get("job"), int):
+                    found.append(doc)
+    return sorted(found, key=lambda d: d["job"])
+
+
+def job_logs_evict(now: float | None = None, max_bytes: int | None = None, max_age: float | None = None) -> dict:
+    """Remove logs (and markers) older than max_age, then the oldest logs until the rest fit in max_bytes, and
+    writers' temporary files a crash left. A reader that has a log open keeps reading it. {"removed", "bytes"}."""
+    now = time.time() if now is None else now
+    max_bytes = JOB_LOG_MAX_BYTES if max_bytes is None else max_bytes
+    max_age = JOB_LOG_MAX_AGE if max_age is None else max_age
+    root = BASE / JOB_LOG_DIR
+    jobs: dict[Path, dict] = {}  # (dir / job id) -> {"at": newest mtime, "size": compressed bytes, "paths": [...]}
+    removed = 0
+    with contextlib.suppress(OSError):
+        for owner in root.iterdir():
+            for repo in (owner.iterdir() if owner.is_dir() else ()):
+                for p in (repo.iterdir() if repo.is_dir() else ()):
+                    try:
+                        st = p.stat()
+                    except OSError:
+                        continue
+                    if p.name.startswith("."):
+                        if p.name.endswith(".tmp") and now - st.st_mtime > JOB_LOG_TMP_KEEP:
+                            with contextlib.suppress(OSError):
+                                p.unlink()
+                        continue
+                    stem = p.name.split(".", 1)[0]
+                    if not stem.isdigit():
+                        continue
+                    one = jobs.setdefault(repo / stem, {"at": 0.0, "size": 0, "paths": []})
+                    one["at"] = max(one["at"], st.st_mtime)
+                    one["paths"].append(p)
+                    if p.name.endswith(".log.gz"):
+                        one["size"] += st.st_size
+
+    def drop(one: dict) -> None:
+        nonlocal removed
+        # the log before its sidecar: a sidecar alone never claims a log that is not there (job_log_get)
+        for p in sorted(one["paths"], key=lambda p: not p.name.endswith(".log.gz")):
+            with contextlib.suppress(OSError):
+                p.unlink()
+        removed += 1
+
+    kept = []
+    for one in jobs.values():
+        if now - one["at"] > max_age:
+            drop(one)
+        else:
+            kept.append(one)
+    total = sum(one["size"] for one in kept)
+    for one in sorted(kept, key=lambda one: one["at"]):
+        if total <= max_bytes:
+            break
+        if one["size"]:
+            total -= one["size"]
+            drop(one)
+    return {"removed": removed, "bytes": total}
+
+
+def http_blob(url: str) -> tuple[int, bytes]:
+    """GET a log's signed storage URL (where .../actions/jobs/ID/logs redirects), with no token."""
+    parts = urllib.parse.urlsplit(str(url or ""))
+    host = (parts.hostname or "").lower()
+    if parts.scheme != "https" or not host.endswith(JOB_LOG_BLOB_HOSTS):
+        raise WatchError("refusing a log redirect outside GitHub's log storage")
+    request = urllib.request.Request(url, headers={"User-Agent": "glaeda-gh"})
+    try:
+        with hard_deadline(HTTP_DEADLINE):
+            try:
+                with OPENER.open(request, timeout=SOCKET_TIMEOUT) as response:
+                    return response.status, response.read(JOB_LOG_RAW_MAX + 1)
+            except urllib.error.HTTPError as error:
+                return error.code, b""
+    except (OSError, HTTPException, ValueError) as error:
+        raise WatchError(f"log download failed: {type(error).__name__}") from None
+
+
+def failed_jobs_of(key: str, entry: dict) -> list[tuple[int, int | None, str | None]]:
+    """(job id, run id or None, name) of each failed Actions job a cache entry shows: a PR's failed checks (their
+    details URL names run and job), a run's failed jobs, a head's failed job ids."""
+    try:
+        kind, _, _, number = split_key(key)
+    except (ValueError, IndexError):
+        return []
+    data = entry.get("data") if isinstance(entry.get("data"), dict) else {}
+    found: list[tuple[int, int | None, str | None]] = []
+    if kind == "pr":
+        for c in data.get("checks") or []:
+            if isinstance(c, dict) and str(c.get("conclusion") or "").lower() in JOB_LOG_FAILED:
+                m = JOB_URL_RE.search(str(c.get("url") or ""))
+                if m:
+                    found.append((int(m.group(2)), int(m.group(1)), c.get("name")))
+    elif kind == "run":
+        for j in entry.get("jobs") or []:
+            if isinstance(j, dict) and str(j.get("conclusion") or "").lower() in JOB_LOG_FAILED \
+                    and isinstance(j.get("id"), int):
+                found.append((j["id"], int(number), j.get("name")))
+    elif kind == "head":
+        for name, ids in (data.get("ids") or {}).items():
+            for i in ids if isinstance(ids, list) else []:
+                if isinstance(i, int) and not isinstance(i, bool):
+                    found.append((i, None, name))
+    return found
+
+
 LOCK_WAIT = 2.0  # how long a read-modify-write waits for a sibling before giving up on the lock
 LOCK_BUDGET = 2.0  # how long one gh call may spend waiting on all of these locks together
 _lock_deadline: float | None = None
@@ -1494,8 +1727,55 @@ def cmd_read(text: str) -> int:
             # consumer refused, not only the last one asked (upstream_denials)
             budgets[consumer] = {k: mine.get(k) for k in ("spent", "limit", "deniedAt")}
             entries[key] = {**(entries[key] or {}), "budgets": budgets}
-    print(json.dumps({"entries": entries}, sort_keys=True))
+    answer: dict[str, Any] = {"entries": entries}
+    logs = read_logs_request(text)
+    if logs:
+        answer["logs"] = upstream_logs(logs)
+    print(json.dumps(answer, sort_keys=True))
     return EXIT_OK
+
+
+def read_logs_request(text: str) -> list[tuple[str, int]]:
+    """The (owner/repo, job id) of each log an upstream request asks for ("logs"; an older downstream sends none)."""
+    doc = json.loads(text)
+    items = doc.get("logs") if isinstance(doc, dict) else None
+    if items is None:
+        return []
+    if not isinstance(items, list) or len(items) > UPSTREAM_LOGS_MAX:
+        raise WatchError(f"read serves at most {UPSTREAM_LOGS_MAX} logs a request")
+    out = []
+    for item in items:
+        repo = item.get("repo") if isinstance(item, dict) else None
+        job = item.get("job") if isinstance(item, dict) else None
+        if not isinstance(repo, str) or not re.fullmatch(rf"{NAME}/{NAME}", repo) \
+                or not isinstance(job, int) or isinstance(job, bool) or job <= 0:
+            raise WatchError(f"not a log: {str(item)[:80]!r}")
+        out.append((repo.lower(), job))
+    return out
+
+
+def upstream_logs(logs: list[tuple[str, int]]) -> dict[str, Any]:
+    """{"owner/repo/job": {"gz": base64, "run", "name"} | {"gone": why} | {"tooLarge": bytes} | None} of the logs kept
+    here; None for one not kept yet, or past UPSTREAM_LOG_BYTES in this answer (the downstream asks again)."""
+    out: dict[str, Any] = {}
+    room = UPSTREAM_LOG_BYTES
+    for repo, job in logs:
+        state, value, meta = job_log_get(repo, job)
+        extra = {k: meta[k] for k in ("run", "name") if meta and k in meta}
+        if state == "hit":
+            gz = gzip.compress(value, compresslevel=6, mtime=0)
+            if len(gz) > room:
+                out[f"{repo}/{job}"] = None
+                continue
+            room -= len(gz)
+            out[f"{repo}/{job}"] = {"gz": base64.b64encode(gz).decode(), **extra}
+        elif state == "gone":
+            out[f"{repo}/{job}"] = {"gone": str(value), **extra}
+        elif state == "large":
+            out[f"{repo}/{job}"] = {"tooLarge": int(value), **extra}
+        else:
+            out[f"{repo}/{job}"] = None
+    return out
 
 
 # ---------------------------------------------------------------- cmux build controller
@@ -2135,8 +2415,14 @@ def rest_counters(budget: dict, key: str = "restCounters") -> list[dict]:
 
 class Daemon:
     def __init__(self, transport: Callable = http, token: Callable[[], str] = gh_token,
-                 controller: Any = "env", upstream: Any = "config") -> None:
+                 controller: Any = "env", upstream: Any = "config", blob: Callable = http_blob) -> None:
         self.transport = transport
+        self.blob = blob  # a failed job's log, from the storage URL GitHub redirects to (job_log_pass)
+        # failed jobs whose log is not kept yet: (owner/repo, job id) -> {"run", "name", "since"} (want_job_logs)
+        self.job_logs_wanted: dict[tuple[str, int], dict] = {}
+        self.job_logs_tried: dict[tuple[str, int], float] = {}  # when a log read last failed (JOB_LOG_RETRY)
+        self.job_log_at = float("-inf")  # the last log read, or upstream pull (JOB_LOG_SPACING)
+        self.job_logs_evicted_at = float("-inf")
         # "config" re-reads UPSTREAM_CONFIG every tick, so writing or removing it switches the mode
         # without a restart; a test passes a callable (request -> answer) or None.
         self.upstream_source = upstream
@@ -2700,8 +2986,10 @@ class Daemon:
     # -- requests
 
     def request(self, method: str, path: str, body: dict | None = None, etag: str | None = None,
-                free: bool = False, content: bool = False) -> tuple[int, dict, Any]:
+                free: bool = False, content: bool = False, text: bool = False) -> tuple[int, dict, Any]:
         """One GitHub request.
+
+        text: answer the body's bytes, not its JSON (a job's log).
 
         content: a write from the outbox, whose throttling (GitHub's secondary limit on content
         creation) holds the outbox, not the read buckets.
@@ -2782,7 +3070,7 @@ class Daemon:
             self.backoff[bucket] = self.now + max(CYCLE, wait)
         elif status < 400 and not free:
             self.secondary_strikes = 0  # a clean answer: the next secondary hold starts short again
-        return status, h, doc
+        return status, h, (raw or b"") if text else doc
 
     def secondary_admit(self, bucket: str, n: int) -> bool:
         """Whether n more read requests may go to GitHub now: not while this daemon's own secondary hold
@@ -3811,6 +4099,10 @@ class Daemon:
                     self.read_jobs(e, {}, False)  # read_jobs reads the list a failed attempt is missing
             except Exception as error:  # noqa: BLE001
                 self.errors.append(f"{e['key']} jobs: {describe(error)}")
+        try:
+            self.job_log_pass()  # after the reads: a log is read only with room left over
+        except Exception as error:  # noqa: BLE001  the logs are extra: a fault there never stops the reads
+            self.errors.append(f"logs: {describe(error)} at {error_site(error)}")
         # After the reads, so a busy daemon never pays for it: its own responses' x-ratelimit
         # headers have already brought the view up to date, and only an idle one goes stale.
         self.refresh_budget()
@@ -3949,6 +4241,10 @@ class Daemon:
                     self.upstream_read(ask, part)
         self.attempted = {k: t for k, t in self.attempted.items() if self.now - t < 2 * IDLE_EXPIRY}
         self.consumer_sent = {k: t for k, t in self.consumer_sent.items() if self.now - t < 2 * HEAD_INTEREST}
+        try:
+            self.job_log_pull(ask)  # the upstream's kept logs: no GitHub read here
+        except Exception as error:  # noqa: BLE001  the logs are extra: a fault there never stops the reads
+            self.errors.append(f"logs: {describe(error)} at {error_site(error)}")
         kinds = {kind: [e for e in due if e["key"].startswith(kind + ":")] for kind in CYCLES}
         return self.finish_tick(entries, kinds["pr"], kinds["run"], kinds["comment"], [])
 
@@ -4274,6 +4570,10 @@ class Daemon:
                 if head and entry["data"].get("headSeenAt") is None:
                     entry["data"] = {**entry["data"], "headSeenAt": seen if seen is not None else self.now}
             write_json(cache, entry)
+        try:
+            self.want_job_logs(key, entry)
+        except Exception as error:  # noqa: BLE001  the logs are extra: a fault there never loses the entry
+            self.errors.append(f"{key} logs: {describe(error)} at {error_site(error)}")
 
     def fail(self, entries: list[dict], message: str) -> None:
         self.errors.append(message)
@@ -4986,6 +5286,126 @@ class Daemon:
                 continue
             steps = doc.get("steps")
             c["failedSteps"], c["stepCount"] = failed_steps(steps), len(steps) if isinstance(steps, list) else None
+
+    # -- failed jobs' logs (JOB_LOG_DIR): read once each, kept compressed, served by `log` with no API call
+
+    def want_job_logs(self, key: str, entry: dict) -> None:
+        """Queue the log of each failed job ENTRY shows that is not kept yet (store calls this for every entry)."""
+        for job, run, name in failed_jobs_of(key, entry):
+            _, owner, repo, _ = split_key(key)
+            slug = f"{owner}/{repo}".lower()
+            if (slug, job) in self.job_logs_wanted or job_log_known(slug, job):
+                continue
+            self.job_logs_wanted[(slug, job)] = {"run": run, "name": name, "since": self.now}
+        if len(self.job_logs_wanted) > JOB_LOG_QUEUE_MAX:  # the oldest wait for a later sighting
+            for k in sorted(self.job_logs_wanted, key=lambda k: self.job_logs_wanted[k]["since"])[
+                    :len(self.job_logs_wanted) - JOB_LOG_QUEUE_MAX]:
+                del self.job_logs_wanted[k]
+
+    def job_logs_next(self, n: int) -> list[tuple[str, int]]:
+        """Up to N queued logs to read now, the newest failure first; a log whose read failed waits JOB_LOG_RETRY."""
+        self.job_logs_tried = {k: t for k, t in self.job_logs_tried.items() if self.now - t < JOB_LOG_RETRY}
+        for k in [k for k in self.job_logs_wanted if job_log_known(*k)]:  # kept meanwhile (a `log --fetch`)
+            del self.job_logs_wanted[k]
+        ready = [k for k in self.job_logs_wanted if k not in self.job_logs_tried]
+        return sorted(ready, key=lambda k: (-self.job_logs_wanted[k]["since"], -k[1]))[:n]
+
+    def job_logs_evict_due(self) -> None:
+        if self.now - self.job_logs_evicted_at >= JOB_LOG_EVICT_EVERY:
+            self.job_logs_evicted_at = self.now
+            job_logs_evict(self.clock())
+
+    def job_log_room(self) -> bool:
+        """Whether one log read fits now: REST at its normal pace (above its floor, inside the daemon's share), the
+        daemon under JOB_LOG_SHARE of that share this hour, and JOB_LOG_SPACING since the last log read. The reads
+        the waits need come first: this runs after them, in the room they left."""
+        return (self.mode("rest") == "normal" and self.rest_room(1)
+                and self.rest_spent() + 1 <= self.rest_cap() * JOB_LOG_SHARE
+                and self.now - self.job_log_at >= JOB_LOG_SPACING)
+
+    def job_log_pass(self) -> None:
+        """Read at most one queued log this tick, when job_log_room allows it."""
+        self.job_logs_evict_due()
+        if not self.job_logs_wanted or not self.job_log_room():
+            return
+        picked = self.job_logs_next(1)
+        if not picked:
+            return
+        self.job_log_at = self.now
+        slug, job = picked[0]
+        with self.calling("log", slug):
+            self.fetch_job_log(slug, job)
+
+    def fetch_job_log(self, slug: str, job: int) -> None:
+        """GET .../actions/jobs/JOB/logs: one counted REST read. GitHub answers a redirect to signed storage, read
+        without the token; 404 or 410 (expired) is recorded and never read again; anything else is tried later."""
+        info = self.job_logs_wanted.get((slug, job)) or {}
+        try:
+            status, h, raw = self.request("GET", f"/repos/{slug}/actions/jobs/{job}/logs", text=True)
+            cap = MAX_BODY  # an answer read through http() stops at MAX_BODY: a log that long may be cut
+            if status in (301, 302, 303, 307, 308):
+                status, raw = self.blob(h.get("location") or "")
+                cap = JOB_LOG_RAW_MAX + 1
+        except OutOfTime:
+            return  # not sent (or cut off): it keeps its place
+        except (WatchError, OSError) as error:
+            self.job_logs_tried[(slug, job)] = self.now
+            self.errors.append(f"log {slug} job {job}: {describe(error)}")
+            return
+        if status in (404, 410):
+            job_log_mark(slug, job, info, self.clock(), gone=f"HTTP {status}")
+        elif status != 200:
+            self.job_logs_tried[(slug, job)] = self.now
+            self.errors.append(f"log {slug} job {job}: HTTP {status}")
+            return
+        elif len(raw) > JOB_LOG_RAW_MAX or len(raw) >= cap:
+            job_log_mark(slug, job, info, self.clock(), tooLarge=len(raw))
+        else:
+            job_log_put(slug, job, raw, info, self.clock())
+            self.job_logs_evicted_at = float("-inf")  # the size cap is checked after each log kept
+            self.job_logs_evict_due()
+        self.job_logs_wanted.pop((slug, job), None)
+
+    def job_log_pull(self, ask: Callable[[dict], dict]) -> None:
+        """With an upstream: ask it for up to UPSTREAM_LOGS_MAX queued logs it keeps (its daemon reads the same
+        failed jobs), every JOB_LOG_SPACING. No GitHub read here; one it does not have yet is asked again later."""
+        self.job_logs_evict_due()
+        if not self.job_logs_wanted or self.now - self.job_log_at < JOB_LOG_SPACING:
+            return
+        picked = self.job_logs_next(UPSTREAM_LOGS_MAX)
+        if not picked:
+            return
+        self.job_log_at = self.now
+        try:
+            answer = ask({"keys": [], "logs": [{"repo": slug, "job": job} for slug, job in picked]})
+        except WatchError as error:
+            for k in picked:
+                self.job_logs_tried[k] = self.now
+            self.errors.append(f"logs: {error}")
+            return
+        logs = answer.get("logs") if isinstance(answer, dict) else None
+        if not isinstance(logs, dict):  # an upstream older than logs: ask again after JOB_LOG_RETRY, not every pull
+            self.job_log_at = self.now + JOB_LOG_RETRY
+            return
+        for slug, job in picked:
+            got = logs.get(f"{slug}/{job}")
+            info = {**(self.job_logs_wanted.get((slug, job)) or {}), **(got if isinstance(got, dict) else {})}
+            try:
+                if isinstance(got, dict) and isinstance(got.get("gz"), str):
+                    job_log_put(slug, job, gzip.decompress(base64.b64decode(got["gz"], validate=True)), info,
+                                self.clock())
+                elif isinstance(got, dict) and isinstance(got.get("gone"), str):
+                    job_log_mark(slug, job, info, self.clock(), gone=got["gone"])
+                elif isinstance(got, dict) and isinstance(got.get("tooLarge"), int):
+                    job_log_mark(slug, job, info, self.clock(), tooLarge=got["tooLarge"])
+                else:
+                    self.job_logs_tried[(slug, job)] = self.now  # not there yet (or an older upstream)
+                    continue
+            except (OSError, EOFError, ValueError) as error:
+                self.job_logs_tried[(slug, job)] = self.now
+                self.errors.append(f"log {slug} job {job} from upstream: {describe(error)}")
+                continue
+            self.job_logs_wanted.pop((slug, job), None)
 
     def controller_down(self, error: Exception, site: str | None = None) -> None:
         """Leave the controller alone for a while; REST serves meanwhile. The cursor is kept, so the
@@ -10699,6 +11119,116 @@ class Parser(argparse.ArgumentParser):
         raise SystemExit(64)
 
 
+# ---------------------------------------------------------------- log: a failed job's kept log, with no API call
+
+LOG_FETCH_DEADLINE = 120  # one `gh api` read of a log (or of a run's job list) by `log --fetch`
+
+
+def gh_read(route: str) -> bytes:
+    """`log --fetch`: one `gh api ROUTE` read (gh follows the log's redirect without the token). WatchError("HTTP
+    404 ...") and the like on a refusal, naming GitHub's status when gh does."""
+    gh = find_gh()
+    if gh is None:
+        raise WatchError("gh not found: --fetch reads the log with gh")
+    for flags in (["--allow-escape-sequences"], []):  # gh 2.70+ refuses a log's colour codes without the flag
+        try:
+            done = subprocess.run([gh, "api", *flags, route], stdin=subprocess.DEVNULL, capture_output=True,
+                                  timeout=LOG_FETCH_DEADLINE, check=False)
+        except (OSError, subprocess.TimeoutExpired) as error:
+            raise WatchError(f"gh api {route}: {type(error).__name__}") from None
+        if done.returncode == 0:
+            return done.stdout
+        err = done.stderr.decode(errors="replace").strip()
+        if flags and "unknown flag" in err:
+            continue
+        m = re.search(r"HTTP (\d{3})", err)
+        raise WatchError((f"HTTP {m.group(1)} " if m else "") + f"gh api {route}: {err[-300:]}")
+    raise WatchError(f"gh api {route}: refused")
+
+
+def log_fetch(repo: str, job: int, meta: dict) -> tuple[str, Any]:
+    """Read JOB's log once over gh and keep it as the daemon would: ("hit", text) or ("gone", why)."""
+    try:
+        text = gh_read(f"repos/{repo}/actions/jobs/{job}/logs")
+    except WatchError as error:
+        if JOB_LOG_GONE.match(str(error)):
+            job_log_mark(repo, job, meta, gone=str(error)[:8])
+            return "gone", str(error)[:8]
+        raise
+    if len(text) > JOB_LOG_RAW_MAX:
+        return "hit", text  # printed, not kept (JOB_LOG_RAW_MAX)
+    job_log_put(repo, job, text, meta)
+    with contextlib.suppress(OSError):
+        job_logs_evict()
+    return "hit", text
+
+
+def run_failed_jobs(repo: str, run: int, fetch: bool) -> list[dict]:
+    """RUN's failed jobs as this host knows them ({"job", "name"}): the logs kept for it, and the failed jobs of the
+    run's cached watch. With --fetch and none known, one read of the run's job list."""
+    found = {d["job"]: {"job": d["job"], "name": d.get("name")} for d in job_log_run_jobs(repo, run)}
+    cached = read_cache(f"run:{repo}/{run}")
+    for job, _, name in failed_jobs_of(f"run:{repo}/{run}", cached or {}):
+        found.setdefault(job, {"job": job, "name": name})
+    if not found and fetch:
+        doc = json.loads(gh_read(f"repos/{repo}/actions/runs/{run}/jobs?filter=latest&per_page=100") or b"{}")
+        for j in (doc.get("jobs") or []) if isinstance(doc, dict) else []:
+            if isinstance(j, dict) and str(j.get("conclusion") or "").lower() in JOB_LOG_FAILED \
+                    and isinstance(j.get("id"), int):
+                found[j["id"]] = {"job": j["id"], "name": j.get("name")}
+    return [found[k] for k in sorted(found)]
+
+
+def cmd_log(kind: str, repo: str, ident: int, failed: bool, fetch: bool, as_json: bool) -> int:
+    """`log job|run`: print the kept log of a failed job (or of every failed job of a run). No API call: on a miss,
+    exit EXIT_LOG_MISS, unless --fetch, which reads it once (one REST read a log) and keeps it."""
+    repo = repo.lower()
+    if kind == "run" and not failed:
+        raise WatchError("log run keeps only failed jobs' logs: pass --failed")
+    jobs = [{"job": ident, "name": None}] if kind == "job" else run_failed_jobs(repo, ident, fetch)
+    results = []
+    for j in jobs:
+        state, value, meta = job_log_get(repo, j["job"])
+        name = j.get("name") or (meta or {}).get("name")
+        if state in ("miss", "large") and fetch:
+            state, value = log_fetch(repo, j["job"], {"run": ident if kind == "run" else None, "name": name})
+        results.append({"job": j["job"], "name": name, "state": state, "value": value})
+    missing = [r for r in results if r["state"] in ("miss", "large")]
+    gone = [r for r in results if r["state"] == "gone"]
+    if as_json:
+        print(json.dumps({"repo": repo, kind: ident, "jobs": [
+            {"id": r["job"], "name": r["name"], "state": "miss" if r["state"] == "large" else r["state"],
+             "log": r["value"].decode(errors="replace") if r["state"] == "hit" else None,
+             **({"why": r["value"]} if r["state"] == "gone" else {})} for r in results]}))
+    else:
+        out = sys.stdout.buffer
+        for r in results:
+            if r["state"] != "hit":
+                continue
+            if kind == "run":
+                out.write(f"==> {repo} job {r['job']} ({r['name'] or '?'}) <==\n".encode())
+            out.write(r["value"])
+            if kind == "run" and not r["value"].endswith(b"\n"):
+                out.write(b"\n")
+        out.flush()
+    what = f"job {ident}" if kind == "job" else f"run {ident}"
+    if not results:
+        print(f"glaeda-gh: no failed job of {repo} {what} is kept here (this host's daemon keeps the logs of the "
+              f"failed jobs it sees); --fetch reads them (one REST read for the job list, one a log)", file=sys.stderr)
+        return EXIT_LOG_MISS
+    if missing:
+        ids = ", ".join(str(r["job"]) for r in missing)
+        large = [r for r in missing if r["state"] == "large"]
+        print(f"glaeda-gh: no kept log for {repo} job {ids}" + (" (larger than this cache keeps)" if large else "")
+              + "; --fetch reads it once (one REST read a log)", file=sys.stderr)
+        return EXIT_LOG_MISS
+    if gone:
+        ids = ", ".join(f"{r['job']} ({r['value']})" for r in gone)
+        print(f"glaeda-gh: GitHub has no log for {repo} job {ids} any more (expired); none will be read", file=sys.stderr)
+        return EXIT_LOG_GONE
+    return EXIT_OK
+
+
 def print_json_error(code: str, reason: str, nxt: str) -> None:
     """The one --json object a refused call prints (agent output contract)."""
     with contextlib.suppress(OSError, ValueError):
@@ -10715,7 +11245,7 @@ def usage_next(argv: list[str], prog: str = "glaeda-gh") -> str:
         if words[0] == "wait" and "--timeout" not in fixed:
             fixed += ["--timeout", "1800"]
         return " ".join(["glaeda-gh"] + fixed)
-    if prog == "glaeda-gh" and words[:1] and words[0] in ("status", "wait", "checks", "post", "budget", "audit",
+    if prog == "glaeda-gh" and words[:1] and words[0] in ("status", "wait", "checks", "post", "budget", "audit", "log",
                                                           "runners", "restart", "serve"):
         return f"glaeda-gh {words[0]} --help"
     return f"{prog} --help"
@@ -10797,6 +11327,18 @@ def parser() -> argparse.ArgumentParser:
     po.add_argument("--json", action="store_true")
     sub.add_parser("read", help="an upstream's end: register the keys of one JSON request on stdin and print "
                                 "the cached entries (see upstream.json)")
+    lg = sub.add_parser("log", help="a failed job's log as the daemon kept it, with no API call: exit "
+                                    f"{EXIT_LOG_MISS} when it is not kept (--fetch reads it once), {EXIT_LOG_GONE} "
+                                    "when GitHub has expired it")
+    lg.add_argument("kind", choices=("job", "run"))
+    lg.add_argument("repo", metavar="OWNER/REPO")
+    lg.add_argument("id", metavar="ID", help="the job id (job), or the run id (run, with --failed)")
+    lg.add_argument("--failed", action="store_true", help="run: every failed job's log (the only ones kept)")
+    lg.add_argument("--fetch", action="store_true",
+                    help="on a miss read it once through gh (one REST read a log, plus the job list for a run "
+                         "nothing is known of) and keep it")
+    lg.add_argument("--json", action="store_true",
+                    help='{"repo", "job"|"run", "jobs": [{"id", "name", "state": hit|miss|gone, "log"}]}')
     b = sub.add_parser("budget", help="REST and GraphQL quota as the daemon last saw it")
     b.add_argument("--json", action="store_true")
     a = sub.add_parser("audit", help="what this host's gh traffic is, and how much of it a cache would answer")
@@ -10850,6 +11392,10 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_budget(args.json)
         if args.command == "read":
             return cmd_read(sys.stdin.readline())
+        if args.command == "log":
+            if not re.fullmatch(rf"{NAME}/{NAME}", args.repo) or not args.id.isdigit() or int(args.id) <= 0:
+                raise WatchError("log takes OWNER/REPO and a numeric job or run id")
+            return cmd_log(args.kind, args.repo, int(args.id), args.failed, args.fetch, args.json)
         if args.command == "audit":
             if args.last < 0:
                 raise WatchError("--last must be 0 (all of it) or more lines")
