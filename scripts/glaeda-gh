@@ -31,6 +31,9 @@
     glaeda-gh gh --probe                                whether this glaeda-gh has the broker, for a wrapper
                                                         deciding whether to hand its calls over
     glaeda-gh audit [--log PATH] [--last N] [--json]    this host's gh traffic, and what a cache would answer
+    glaeda-gh log OWNER/REPO/RUN_ID [--job NAME|ID] [--tail N] [--all] [--rest] [--json]
+                                                        the failed jobs' logs, from the build controller: no user
+                                                        REST quota; --rest reads what it cannot serve over REST
     glaeda-gh runners OWNER[/REPO] [--label L] [--json] busy and idle self-hosted runners, from one shared read
                                                         (instead of a jobs read per run: see GH_SWEEP_MAX)
 
@@ -5964,6 +5967,14 @@ def full_output() -> bool:
     return os.environ.get("AGENT_VERBOSE") == "1"
 
 
+def log_hint(urls: Any) -> str | None:
+    """The `glaeda-gh log` line for the first failed check that is an Actions job: its logs cost no REST."""
+    for url in urls:
+        if isinstance(url, str) and JOB_URL_RE.fullmatch(url):
+            return f"  logs: glaeda-gh log {url} (that job; OWNER/REPO/RUN_ID for every failed one; no REST quota)"
+    return None
+
+
 def summary(key: str, entry: dict | None, until: str = "done", grace: float = RESCUE_GRACE,
             verbose: bool | None = None) -> str:
     verbose = full_output() if verbose is None else verbose
@@ -6015,6 +6026,9 @@ def summary(key: str, entry: dict | None, until: str = "done", grace: float = RE
             lines.append(f"  {outcome(c.get('conclusion'))}: {label(c)}{steps_note(c)}{optional}  {c.get('url') or ''}".rstrip())
         if len(bad) > shown_failed:
             lines.append(f"  ... {len(bad) - shown_failed} more failed (--json lists them)")
+        hint = log_hint(c.get("url") for c in bad)
+        if hint:
+            lines.append(hint)
         for c in groups["held"][:shown_failed]:
             refused = any(refused_check(o) and o.get("runId") == c.get("runId") for o in checks)
             why = ("cancelled before any step ran" if cancelled_unstarted(c)
@@ -6057,6 +6071,8 @@ def summary(key: str, entry: dict | None, until: str = "done", grace: float = RE
                 refused = f" (refused by {j.get('runner_name')})" if refused_job(j) else ""
                 lines.append(f"  {outcome(j.get('conclusion'))}: {j.get('name')}{steps_note(j)}{refused}  "
                              f"{j.get('html_url') or ''}".rstrip())
+            if bad:
+                lines.append(f"  logs: glaeda-gh log {owner}/{repo}/{number} (no REST quota)")
         held = run_hold(data, jobs, now, grace)
         if held:
             lines.append(f"  held: attempt {data.get('run_attempt')} failed only because a glaeda runner refused "
@@ -10677,6 +10693,161 @@ def cmd_post_status(post_id: str | None, wait: float, as_json: bool, queued: boo
     return 0 if state["state"] == "posted" else 1 if state["state"] == "failed" else 2 if wait > 0 else 0
 
 
+# ---------------------------------------------------------------- log: failed job logs without the user's REST quota
+#
+# A job's log has no GraphQL read, and the shared REST quota is spent most of every hour, so a lane could not read why
+# CI failed (cmux #38625 and #38619 stopped on it). The build controller reads a finished job's log once with its own
+# App token (a quota apart from the user's), keeps it 72 h, and serves it on the tailnet (cmuxterm-hq
+# build-fleet/github-events/README.md, job-log and run-jobs). `log` lists the run's jobs there and prints the failed
+# ones' logs. Most failed jobs run on hosted runners (93% of them on 2026-11-08), whose logs exist only at
+# GitHub, so the controller reads every job's log the same way. A job it cannot serve is read over REST only with
+# --rest, and the cost is named first.
+
+LOG_FAILED = ("failure", "timed_out", "startup_failure")
+LOG_TIMEOUT = 200  # the controller's own GitHub read has a 3-minute deadline
+LOG_MAX = 80 * 1024 * 1024  # the controller cuts a log at 64 MiB and appends a note
+LOG_UNSERVED = "this build controller does not serve job logs yet (an older deploy)"
+JOB_URL_RE = re.compile(rf"(?:https://github\.com/)?({NAME})/({NAME})/actions/runs/(\d+)/job/(\d+)(?:[/?#].*)?")
+
+
+def controller_text(ctl: "Controller", path: str) -> tuple[int, str]:
+    """(HTTP status, body) of one controller read; status 0 with the reason when it did not answer."""
+    headers = {"Authorization": f"Bearer {ctl.token}"} if ctl.token else {}
+    request = urllib.request.Request(ctl.base + path, headers=headers)
+    try:
+        with hard_deadline(LOG_TIMEOUT + CONTROLLER_DEADLINE), OPENER.open(request, timeout=LOG_TIMEOUT) as response:
+            return response.status, response.read(LOG_MAX).decode("utf-8", "replace")
+    except urllib.error.HTTPError as error:
+        try:
+            body = error.read(600).decode("utf-8", "replace").strip()
+        except OSError:
+            body = ""
+        return error.code, body
+    except (OSError, HTTPException, ValueError) as error:  # DeadlineTimeout is an OSError
+        return 0, f"controller unreachable: {type(error).__name__}"
+
+
+def log_say(text: str) -> None:
+    print(text, file=sys.stderr, flush=True)
+
+
+def rest_left() -> str:
+    b = (read_json(BASE / "budget.json") or {}).get("rest") or {}
+    return f"{b.get('remaining')}/{b.get('limit')} left as last seen" if b.get("limit") else "left: see glaeda-gh budget"
+
+
+def rest_text(args: list[str]) -> tuple[bool, str]:
+    """One `gh api` read through the PATH gh (so the quota guard and the broker see it): (ok, stdout or why not)."""
+    gh = shutil.which("gh") or find_gh()
+    if gh is None:
+        return False, "gh not found"
+    try:
+        done = subprocess.run([gh, "api", *args], stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                              errors="replace", timeout=LOG_TIMEOUT)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        return False, f"gh api: {type(error).__name__}"
+    if done.returncode != 0:
+        return False, (done.stderr.strip() or f"gh api exited {done.returncode}")[:400]
+    return True, done.stdout
+
+
+def log_jobs(ctl: "Controller | None", repo: str, run: int, attempt: int | None, use_rest: bool) -> tuple[list[dict], str]:
+    """The run's jobs and where the list came from ("controller" or "rest"), or ([], why there is none)."""
+    why = "no build controller configured on this host"
+    if ctl is not None:
+        query = f"/v1/github/run-jobs?repo={repo}&run={run}" + (f"&attempt={attempt}" if attempt else "")
+        code, body = controller_text(ctl, query)
+        if code == 200:
+            try:
+                doc = json.loads(body)
+            except ValueError:
+                doc = {}
+            if doc.get("known"):
+                return list(doc.get("jobs") or []), "controller"
+            why = "the controller holds no jobs of this run (it keeps finished ones 6 h, and only for repositories it watches)"
+        else:
+            why = (LOG_UNSERVED if code == 404 and body.strip() == "404 page not found" else
+                   f"controller HTTP {code}: {body[:200]}" if code else body)
+    if not use_rest:
+        return [], why
+    path = f"repos/{repo}/actions/runs/{run}" + (f"/attempts/{attempt}" if attempt else "") + "/jobs?per_page=100"
+    ok, out = rest_text([path])
+    if not ok:
+        return [], f"{why}; REST: {out}"
+    try:
+        jobs = json.loads(out).get("jobs") or []
+    except (ValueError, AttributeError):
+        return [], f"{why}; REST: not a jobs list"
+    return [{"id": j.get("id"), "name": j.get("name"), "attempt": j.get("run_attempt"), "status": j.get("status"),
+             "conclusion": j.get("conclusion"), "runner": j.get("runner_name")} for j in jobs if isinstance(j, dict)], "rest"
+
+
+def cmd_log(target: str, job: str | None, attempt: int | None, every: bool, tail: int, use_rest: bool,
+            as_json: bool) -> int:
+    """Print the failed jobs' logs of a run (or one job's), from the build controller; REST only with --rest."""
+    pinned = JOB_URL_RE.fullmatch(target.strip())
+    if pinned:
+        owner, name, run, job = pinned.group(1), pinned.group(2), int(pinned.group(3)), pinned.group(4)
+    else:
+        _, owner, name, run = split_key(parse_key("run", target))
+    repo = f"{owner}/{name}"
+    ctl = Controller.from_env()
+    if job is not None and job.isdigit():
+        jobs, listed = [{"id": int(job), "name": f"job {job}"}], "given"
+    else:
+        jobs, listed = log_jobs(ctl, repo, run, attempt, use_rest)
+        if not jobs:
+            log_say(f"glaeda-gh log: no job list for {repo} run {run}: {listed}. Pass --job ID (the number after /job/ in "
+                f"the job's URL), or --rest to list them over REST (1 call of the shared 5000/h, {rest_left()}).")
+            return EXIT_FAIL
+        if job is not None:
+            jobs = [j for j in jobs if j.get("name") == job] or [j for j in jobs if job.lower() in str(j.get("name")).lower()]
+        elif not every:
+            jobs = [j for j in jobs if j.get("conclusion") in LOG_FAILED]
+        if not jobs:
+            log_say(f"glaeda-gh log: {repo} run {run}: no {'job named ' + repr(job) if job else 'failed job'} "
+                f"(listed from {listed}); --all prints every job")
+            return EXIT_FAIL
+    results, missing = [], 0
+    for j in jobs:
+        jid = int(j["id"])
+        code, body = controller_text(ctl, f"/v1/github/job-log?repo={repo}&id={jid}") if ctl else (0, "no controller")
+        source = "controller"
+        if code == 404 and body.strip() == "404 page not found":
+            code, body = 0, LOG_UNSERVED
+        if code != 200:
+            why = {404: "the controller does not know this job (finished over 8 days ago, or not a watched repository)",
+                   409: "the job is still running", 410: "GitHub no longer has this log",
+                   429: "the controller's hourly log reads are spent, or its token is under its rate floor; ask again later"
+                   }.get(code, f"controller HTTP {code}: {body[:200]}" if code else body)
+            if use_rest and code != 410:
+                ok, out = rest_text([f"repos/{repo}/actions/jobs/{jid}/logs"])
+                code, body, source = (200, out, "rest") if ok else (code, f"{why}; REST: {out}", source)
+            else:
+                body = (f"no fleet copy: {why}" + ("" if code == 410 else
+                        f". --rest reads it over REST: 1 call of the shared 5000/h ({rest_left()})"))
+        if code != 200:
+            missing += 1
+            results.append({"id": jid, "name": j.get("name"), "conclusion": j.get("conclusion"), "error": body})
+            continue
+        lines = body.splitlines()
+        if tail > 0:
+            lines = lines[-tail:]
+        results.append({"id": jid, "name": j.get("name"), "conclusion": j.get("conclusion"), "source": source,
+                        "log": "\n".join(lines)})
+    if as_json:
+        print(json.dumps({"repo": repo, "run": run, "jobs": results}))
+    else:
+        for r in results:
+            head = f"== {r['name']} (job {r['id']}" + (f", {r['conclusion']}" if r.get("conclusion") else "")
+            if "error" in r:
+                log_say(f"{head}) {r['error']}")
+                continue
+            print(f"{head}, from {'REST' if r['source'] == 'rest' else 'the build controller'}) ==", flush=True)
+            print(r["log"], flush=True)
+    return EXIT_FAIL if missing else EXIT_OK
+
+
 class Parser(argparse.ArgumentParser):
     """`argparse`'s parser, with a bad argument exiting 64 instead of 2.
 
@@ -10804,6 +10975,15 @@ def parser() -> argparse.ArgumentParser:
     a.add_argument("--last", type=int, default=200000, metavar="N",
                    help="only the last N lines (default 200000; 0 reads all of it)")
     a.add_argument("--json", action="store_true")
+    lg = sub.add_parser("log", help="the failed jobs' logs of a run, from the build controller (no user REST quota)")
+    lg.add_argument("target", help="OWNER/REPO/RUN_ID, a run URL, or a job URL (that job only)")
+    lg.add_argument("--job", metavar="NAME|ID", help="only this job: its id, or its name (exact, else a substring)")
+    lg.add_argument("--attempt", type=int, metavar="N", help="this run attempt (default the latest)")
+    lg.add_argument("--all", action="store_true", help="every job of the run, not only the failed ones")
+    lg.add_argument("--tail", type=int, default=0, metavar="N", help="only the last N lines of each log")
+    lg.add_argument("--rest", action="store_true",
+                    help="read what the controller cannot serve over REST (1 call per job of the shared quota)")
+    lg.add_argument("--json", action="store_true")
     rn = sub.add_parser("runners", help="busy and idle self-hosted runners per label, from one shared read")
     rn.add_argument("scope", metavar="OWNER[/REPO]")
     rn.add_argument("--label", default=None, help="only runners carrying this label")
@@ -10854,6 +11034,10 @@ def main(argv: list[str] | None = None) -> int:
             if args.last < 0:
                 raise WatchError("--last must be 0 (all of it) or more lines")
             return cmd_audit(args.log or guard_log(), args.last, args.json)
+        if args.command == "log":
+            if args.tail < 0 or (args.attempt is not None and args.attempt < 1):
+                raise WatchError("--tail takes 0 or more lines and --attempt a positive number")
+            return cmd_log(args.target, args.job, args.attempt, args.all, args.tail, args.rest, args.json)
         if args.command == "runners":
             return cmd_runners(args.scope, args.label, args.json)
         if args.command == "restart":

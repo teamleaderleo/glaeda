@@ -66,7 +66,7 @@ glaeda-gh runners OWNER[/REPO] [--label L] [--json]  # online, busy and idle sel
 - Exit 1 is a red, not a merge verdict. Where the repo's merge bar excuses base reds (cmux
   `feat-cmux-next`), compare the failed check with the base before holding the PR.
 - The summary names what failed and the failed step, e.g.
-  `failed: CI / build (step: Run selected tests)`, so you rarely need a REST call to see why.
+  `failed: CI / build (step: Run selected tests)`; for the log itself, `glaeda-gh log OWNER/REPO/RUN_ID`.
   Every check decides, required or not: a completed failure (`(not required)` ones too) exits 1,
   neutral and skipped pass, and a pending check is never a success. A merged PR went red when
   only required checks decided. `--until required` keeps that reading on request, for example
@@ -90,6 +90,24 @@ glaeda-gh runners OWNER[/REPO] [--label L] [--json]  # online, busy and idle sel
   (prefixed `OWNER/REPO#N` when there are several): `head`, `state`, `mergeable`, `url`, and
   `checks.state|failed|pending|passed|held|total`; lists print comma-joined names, instead of piping
   `--json` into python. A quoted `'#N'` works like a bare `N` (unquoted, the shell reads `#` as a comment).
+
+## Reading why a job failed: glaeda-gh log
+
+```bash
+glaeda-gh log manaflow-ai/cmux/RUN_ID                 # every failed job's log of the latest attempt
+glaeda-gh log manaflow-ai/cmux/RUN_ID --tail 200      # only each log's last 200 lines
+glaeda-gh log https://github.com/o/r/actions/runs/RUN/job/JOB    # one job, from its URL
+glaeda-gh log o/r/RUN_ID --job 'swift tests'          # one job by name (exact, else a substring) or id
+```
+
+- It costs no user quota: the build controller lists the run's jobs from its webhooks and reads each
+  finished job's log once with its own App token, then keeps it 72 h for every session. Every runner
+  is covered alike, self-hosted and hosted.
+- Use it instead of `gh run view --log-failed` or `gh api .../actions/jobs/ID/logs`: those spend the shared
+  REST quota, which is out most of every hour, and job logs have no GraphQL read.
+- When the controller cannot serve a job (a run finished over 6 h ago with no `--job`, a job over 8 days
+  old, its hourly log reads spent), it says why and what REST would cost. `--rest` then reads just those
+  jobs over REST, one call each; it never does so unasked. Exit 0 when every log printed, 1 otherwise.
 
 ## Waiting on a file or a process: no sleep loops
 
@@ -244,12 +262,13 @@ never a raw API loop:
   in a loop.
 - Per-PR REST scans: listing PRs, then `gh api repos/.../pulls/<n>/files` (or `/reviews`, `/commits`) for each.
 - `gh run view --json jobs` just to learn which step failed: the `wait` summary already names it.
+- `gh run view --log-failed` or `gh api .../actions/jobs/ID/logs` for a log: `glaeda-gh log` reads it without REST.
 - Calling the real gh by absolute path, or `CMUX_GH_BROKER_DISABLE=1`, to get past the broker.
 
 ## Fine to do directly
 
 - Single reads, merges, labels, and dispatches with `gh`. Comments, PRs and reviews: `glaeda-gh post`.
-- Logs: `gh run view RUN_ID --log-failed` once a run has failed.
+- Logs: `glaeda-gh log OWNER/REPO/RUN_ID` once a run has failed (no REST; see above).
 - One-off reads across many PRs: a single batched GraphQL query with aliases
   (`p0: repository(owner:, name:) { pullRequest(number:) { ... } } p1: ...`) through `gh api graphql`.
   GraphQL has its own 5000-point quota, and one aliased query costs about 1 point.
