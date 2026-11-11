@@ -4144,6 +4144,17 @@ class ClientTest(Base):
         self.assertEqual(gg.verdict("pr", {**base, "checkCounts": running}, "green"), 1)
         # no counts (an older read): the rollup decides, as before
         self.assertEqual(gg.verdict("pr", base, "green"), 1)
+        # a superseded red read by suite id (lastRealAttempt) is in no count: it never cancels a red past page 1
+        uncounted = {**base, "superseded": [{"name": "x", "conclusion": "FAILURE", "lastRealAttempt": True}],
+                     "checkCounts": {"runs": {"SUCCESS": 100, "FAILURE": 1}, "statuses": {}}}
+        self.assertEqual(gg.verdict("pr", uncounted, "green"), 1)
+        self.assertEqual(gg.verdict("pr", uncounted, "done"), 1)
+        last = {**check_run("x", conclusion="FAILURE"), "lastRealAttempt": True, "databaseId": 1,
+                "checkSuite": {"conclusion": "STARTUP_FAILURE", "workflowRun": {"databaseId": 7, "workflow": {"name": "CI"}}}}
+        newer = {**check_run("x"), "databaseId": 2,
+                 "checkSuite": {"conclusion": "SUCCESS", "workflowRun": {"databaseId": 7, "workflow": {"name": "CI"}}}}
+        parsed = gg.parse_pr(pr_node(7, checks=[last, newer]))
+        self.assertTrue(parsed["superseded"] and all(c.get("lastRealAttempt") for c in parsed["superseded"]), parsed)
         # parse_pr keeps the counts a read asked for
         node = pr_node(6, checks=[check_run("build")])
         node["commits"]["nodes"][0]["commit"]["statusCheckRollup"]["contexts"].update(

@@ -2021,7 +2021,9 @@ def parse_pr(node: dict) -> dict:
     # stamps it started and completed at once), such as a twin cancelled before it began, stays as evidence
     # for check_verdict (the rollup still counts it) but is marked so status never names it: it has no
     # error to chase, whichever of the pair has the higher id
-    superseded = [{**brief(c), "ranNothing": bool(c.get("completedAt") and c.get("startedAt") == c.get("completedAt"))}
+    superseded = [{**brief(c), "ranNothing": bool(c.get("completedAt") and c.get("startedAt") == c.get("completedAt")),
+                   # read by suite id, not from the rollup: not in its counts (rollup_red_is_superseded)
+                   **({"lastRealAttempt": True} if c.get("lastRealAttempt") else {})}
                   for c in superseded if (c.get("conclusion") or "").upper() not in PASSED]
     # the cache keeps 20; the ones dropped past that that status would count still reach its count line
     superseded_omitted = sum(1 for c in superseded[20:] if not c["ranNothing"])
@@ -6431,7 +6433,10 @@ def rollup_red_is_superseded(data: dict) -> bool:
     if any(state in COUNT_PENDING and n for state, n in rows):
         return False
     red = sum(n for state, n in rows if state in COUNT_BAD)
-    superseded = sum(1 for c in data.get("superseded") or [] if str(c.get("conclusion") or "").upper() in COUNT_BAD)
+    # only attempts the rollup itself listed: one add_last_real_contexts read by suite id is in no count (review of
+    # #1958: an uncounted superseded red cancelled a real red past page 1)
+    superseded = sum(1 for c in data.get("superseded") or []
+                     if str(c.get("conclusion") or "").upper() in COUNT_BAD and not c.get("lastRealAttempt"))
     return red <= superseded
 
 
