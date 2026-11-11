@@ -13603,10 +13603,11 @@ class JobLogCacheTest(Base):
         self.daemon.tick(now=NOW)
         self.daemon.tick(now=NOW + gg.JOB_LOG_SPACING / 2)
         self.assertEqual(len(self.log_reads()), 1)  # one, then JOB_LOG_SPACING
-        self.daemon.budget["rest"] = {"limit": 5000, "remaining": gg.FLOORS["rest"][0] - 1, "reset": NOW + 3000}
+        # the whole budget, counters too: a lowered reading is kept as the poorest counter (settle_counters)
+        self.daemon.budget = {"rest": {"limit": 5000, "remaining": gg.FLOORS["rest"][0] - 1, "reset": NOW + 3000}}
         self.daemon.tick(now=NOW + gg.JOB_LOG_SPACING)
         self.assertEqual(len(self.log_reads()), 1)  # under the floor: none
-        self.daemon.budget["rest"] = {"limit": 5000, "remaining": 4000, "reset": NOW + 3000}
+        self.daemon.budget = {"rest": {"limit": 5000, "remaining": 4000, "reset": NOW + 3000}}
         minute = int(self.daemon.clock() // 60)
         self.daemon.rest_minutes[minute] = int(self.daemon.rest_cap() * gg.JOB_LOG_SHARE)
         self.daemon.tick(now=NOW + 2 * gg.JOB_LOG_SPACING)
