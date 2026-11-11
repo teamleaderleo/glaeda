@@ -11985,6 +11985,17 @@ class SpendAlarmTest(Base):
         self.assertTrue(starved["quota"])
         self.assertIn("upstream", starved["why"])
 
+    def test_a_failing_upstream_link_still_raises_the_stale_alarm(self) -> None:
+        """The upstream never gets this host's waited keys while the link fails, so no alarm there covers them."""
+        self.policy()
+        self.daemon.upstream_status = {"state": "failing", "error": "unreachable", "at": NOW}
+        self.daemon.stale_waited = {"pr": 2000.0}
+        self.daemon.check_alarms()
+        self.assertEqual(len(self.told_lines()), 1)
+        starved = gg.daemon_starved({"at": time.time(), "staleWaited": {"pr": 2000.0},
+                                     "upstream": {"state": "failing"}, "modes": {"graphql": "normal", "rest": "normal"}})
+        self.assertFalse(starved["quota"])
+
     def test_the_pace_alarm_is_off_at_a_zero_share(self) -> None:
         for name in ("FLEET_POLICY", "UPDATE_CONFIG", "DAEMON_CONFIG"):
             self.addCleanup(setattr, gg, name, getattr(gg, name))

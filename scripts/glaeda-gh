@@ -2478,7 +2478,9 @@ class Daemon:
         """Why old waited data is not this daemon's fault, which neither a restart nor a wait's own read can fix:
         "quota" (quota_starved), or "upstream" (this host reads through another host's daemon, whose own alarm
         covers it). None when it is this daemon's to fix."""
-        if getattr(self, "upstream_status", None) is not None:
+        # Only a working upstream: one this host cannot reach never gets its waited keys, so nothing there alarms on
+        # them, and this host's alarm must (review of glaeda#1947).
+        if (getattr(self, "upstream_status", None) or {}).get("state") == "ok":
             return "upstream"
         return "quota" if self.quota_starved() else None
 
@@ -6021,7 +6023,7 @@ def daemon_starved(status: Any = None) -> dict | None:
     modes = status.get("modes") if isinstance(status.get("modes"), dict) else {}
     share = status.get("restShare") if isinstance(status.get("restShare"), dict) else {}
     quota = modes.get("graphql") == "stop" and (modes.get("rest") == "stop" or bool(share.get("capped")))
-    upstream = status.get("upstream") is not None
+    upstream = (status.get("upstream") if isinstance(status.get("upstream"), dict) else {}).get("state") == "ok"
     return {"kind": kind, "age": ages[kind], "quota": quota or upstream,
             "why": "this host reads GitHub through an upstream, whose daemon reads it" if upstream
             else "GitHub's quota is spent (GraphQL stopped, REST at its share)"}
