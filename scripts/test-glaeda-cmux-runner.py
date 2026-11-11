@@ -5663,6 +5663,10 @@ time.sleep(60)
         self.assertEqual(hook.job_class("cdp-browser-smoke", home, home, "cmux-tui.yml"), ("isolated", False))
         # cmux-tui's macOS relay lane only runs chatmux-relay Rust tests in the workspace: no root or GUI token.
         self.assertEqual(hook.job_class("macos-relay", home, home, "cmux-tui.yml"), ("isolated", False))
+        # its combined macOS lint and tests job builds and tests in the workspace too: no root, so jobs on one mini
+        # run side by side instead of waiting for root-1 inside their timeout; another workflow keeps the default
+        self.assertEqual(hook.job_class("macos", home, home, "cmux-tui.yml"), ("isolated", False))
+        self.assertEqual(hook.job_class("macos", home, home, "other.yml"), ("compile", True))
         self.assertEqual(hook.job_class("build", home, home, "reload-build.yml"), ("isolated", False))
         self.assertEqual(hook.job_class("build-mac", home, home, "ios-e2e.yml"), ("isolated", False))
         self.assertEqual(hook.job_class("build-mac", home, home, "other.yml"), ("compile", True))
@@ -5712,7 +5716,7 @@ time.sleep(60)
         self.assertEqual(hook.job_units("isolated", "test", hq, home, "other.yml"), 4, "else its class's")
         self.assertEqual(hook.job_units("isolated", "generated-files", hq, home, "cmux-next.yml"), 4,
                          "a home-repo entry never costs a guest")
-        self.assertEqual(hook.job_units("compile", "macos", home, home, "cmux-tui.yml"), 6)
+        self.assertEqual(hook.job_units("isolated", "macos", home, home, "cmux-tui.yml"), 6)
         self.assertEqual(hook.job_units("compile", "macos", home, home, "other.yml"), 5)
 
     def test_capacity_guest_repo_jobs_never_take_cmux_roots(self) -> None:

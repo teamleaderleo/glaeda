@@ -421,6 +421,11 @@ SIGNING_JOBS = (("nightly.yml", "promote-nightly-next"), ("nightly.yml", "build-
 WORKFLOW_JOB_CLASSES = {("cmux-tui.yml", "lint"): "isolated", ("cmux-tui.yml", "test"): "isolated",
                         ("cmux-tui.yml", "build"): "isolated", ("cmux-tui.yml", "cdp-browser-smoke"): "isolated",
                         ("cmux-tui.yml", "macos-relay"): "isolated",
+                        # cmux-tui's combined macOS lint and tests job (cmux #17051) runs cargo, Zig and its tests in
+                        # the workspace: no Xcode DerivedData or canonical root. As an unknown job it was a pinned
+                        # compile, so a second one on a mini waited in job-started for root-1 inside its 40 min
+                        # timeout (2026-11-09: 6 jobs cancelled after 23-33 min in "Set up runner").
+                        ("cmux-tui.yml", "macos"): "isolated",
                         ("reload-build.yml", "build"): "isolated", ("ios-e2e.yml", "build-mac"): "isolated",
                         ("app-host-test-rerun.yml", "rerun"): "gui",
                         ("test-e2e.yml", "build"): "compile-gui", ("test-e2e.yml", "test"): "gui-step",
@@ -627,7 +632,7 @@ JOB_CORES: dict[tuple[str, ...], int] = {
     ("cmux-next.yml", "release-compile"): 3,  # isolated: 6061, 2.57/2.96/3.28
     ("nightly.yml", "build-nightly-app"): 3,  # isolated: 341, 1.79/2.20/2.47
     ("cmux-next-media.yml", "tour"): 2,  # isolated: 618, 1.06/1.73/2.36
-    ("cmux-tui.yml", "macos"): 6,  # compile (an unknown job): 692, 4.91/5.53/6.11
+    ("cmux-tui.yml", "macos"): 6,  # isolated (compile as an unknown job when measured): 692, 4.91/5.53/6.11
     ("cmux-tui.yml", "build"): 2,  # isolated: 475, 1.36/1.46/1.53
     ("cmux-tui.yml", "macos-relay"): 3,  # isolated: 125, 1.75/2.07/2.60
     ("cmux-tui.yml", "lint"): 3,  # isolated: 56, 1.90/2.31/2.66
