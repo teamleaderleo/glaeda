@@ -13875,6 +13875,16 @@ class PrProbeTest(Base):
         self.daemon.tick(NOW + gg.CYCLE)
         self.assertEqual(gg.read_cache("pr:o/r#7")["via"], "graphql", "a partial PR is read in full again")
 
+    def test_an_upstream_answer_is_never_confirmed_against_this_hosts_fingerprint(self) -> None:
+        """Review of glaeda#1950 (F2): an upstream's answer kept this host's fp, fullAt and via."""
+        self.daemon.tick(NOW)
+        key = "pr:o/r#6"
+        cached = gg.read_cache(key)
+        self.daemon.now = NOW + 1
+        self.daemon.store(key, cached, dataAt=NOW + 1, data=cached["data"], source="upstream")
+        self.assertFalse(self.daemon.probe_ok({"key": key, "cache": gg.read_cache(key)}))
+        self.assertTrue(self.daemon.probe_ok({"key": "pr:o/r#5", "cache": gg.read_cache("pr:o/r#5")}))
+
     def test_a_failed_probe_fails_the_batch_and_spends_nothing_more(self) -> None:
         self.daemon.tick(NOW)
         self.gh.throttle["graphql"] = (502, self.gh.rate("graphql", 3000), b"bad gateway")

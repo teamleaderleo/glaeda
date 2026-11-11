@@ -4734,7 +4734,9 @@ class Daemon:
         failed or cancelled check's steps already read (fill_steps reads a few a cycle and only on a full read)."""
         c = e.get("cache") or {}
         data = c.get("data")
+        # (an answer from an upstream keeps this host's old fp: never confirmed against it)
         return (isinstance(c.get("fp"), str) and c.get("via") in ("graphql", "graphql-probe") and not c.get("error")
+                and c.get("source") != "upstream"
                 and isinstance(data, dict) and not data.get("checksPageError") and data.get("state") == "OPEN"
                 and isinstance(c.get("fullAt"), (int, float)) and self.now - c["fullAt"] < PR_FULL_EVERY
                 and not any(wants_steps(ch) and "failedSteps" not in ch for ch in data.get("checks") or []))
@@ -6512,7 +6514,8 @@ def summary(key: str, entry: dict | None, until: str = "done", grace: float = RE
                          "for a rescue attempt")
         lines.append(str(data.get("html_url") or ""))
     note = f"  (last error: {entry['error']})" if entry.get("error") else ""
-    via = {"rest": ", read over REST", "graphql": ", read over GraphQL"}.get(entry.get("via"), "")
+    via = {"rest": ", read over REST", "graphql": ", read over GraphQL",
+           "graphql-probe": ", confirmed unchanged over GraphQL"}.get(entry.get("via"), "")
     lines.append(f"data {age(entry.get('dataAt'))}{via}{note}")
     return "\n".join(lines)
 
