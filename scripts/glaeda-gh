@@ -92,7 +92,8 @@ the daemon is the only process that talks to GitHub, and clients only read its c
   is the poorest of them, never just the last answer. The counter the Actions endpoints answer from
   (ACTIONS_COUNTER_PATH) is tagged "counters": ["actions"], so the gh guard holds each call to its own.
 - The daemon's own REST polling is capped at restShare (0.4) of the hourly REST limit: the read
-  requests it sent over the last hour that GitHub counted (a 304 is free and is not counted, nor is
+  requests it sent in the REST window now open (from that window's start, not a rolling hour) that GitHub
+  counted (a 304 is free and is not counted, nor is
   the outbox -- writes sessions asked for and their dedupe lookups -- which the share never holds),
   kept per minute in rest-spend.json across restarts.
   A read starts only when its worst case fits. At the cap, PR and run reads move to GraphQL, or wait
@@ -271,7 +272,7 @@ FLOORS = {"rest": (1500, 300), "graphql": (500, 100)}  # (floor, reserve) per qu
 # reset (or a re-exec, or a stop below the reserve) every watched PR is due in the same tick, and a burst of them is
 # what the shared login cannot spend for lands. Past it the reads wait for the next tick, first in line (deferred).
 GRAPHQL_PER_MINUTE = 40
-# The daemon's own counted REST requests in the last hour stay under this share of the hourly limit.
+# The daemon's own counted REST requests in the REST window now open (share_since) stay under this share of its limit.
 # Measured 2026-10-27: the daemon spent 2549 REST requests of one hour's 5000 (756 more were free
 # 304s) on PR reads the balancer had sent to REST, and the account ran out under a nightly re-run.
 REST_SHARE = 0.4
@@ -2589,13 +2590,39 @@ class Daemon:
         oldest = int(self.clock() // 60) - 60
         return sum(n for minute, n in self.rest_minutes.items() if minute >= oldest)
 
+    def share_since(self) -> float:
+        """When the REST window the share is held to began: GitHub's hourly limit is a window that ends at its reset,
+        not a rolling hour. A live counter's window began FULL_WINDOW before its reset (the earliest, with two live:
+        that one counts the most); with none live, the latest reset seen began the window now open. Never more than
+        an hour back, and a reset more than an hour out (no window GitHub shows) is not a window start."""
+        now = self.clock()
+        start = now - FULL_WINDOW
+        seen = self.budget.get("rest") or {}
+        resets = [c["reset"] for c in rest_counters(self.budget)]
+        if isinstance(seen.get("reset"), (int, float)) and not isinstance(seen.get("reset"), bool):
+            resets.append(float(seen["reset"]))
+        live = [r for r in resets if r > now]
+        if live:
+            began = min(live) - FULL_WINDOW
+            return max(start, began) if began <= now else start
+        return max([start] + resets)
+
+    def share_spent(self) -> int:
+        """The daemon's counted REST in the REST window now open (share_since), by the minute: what its share of that
+        window's limit is held to. The minute the window began in counts whole, so this errs toward the cap.
+        rest_spent's rolling hour kept a daemon that spent its share before a reset capped for up to an hour into the
+        fresh window: on 2026-11-11 the pool reset at about 11:14Z, and with GraphQL out too nothing read a waited PR
+        (cmuxterm-hq#9258, a new head pushed at 11:15Z) until about 11:39Z."""
+        first = max(int(self.clock() // 60) - 60, int(self.share_since() // 60))
+        return sum(n for minute, n in self.rest_minutes.items() if minute >= first)
+
     def rest_cap(self) -> int:
         limit = (self.budget.get("rest") or {}).get("limit") or 5000
         return int(self.policy["restShare"] * limit)
 
     def past_share(self) -> bool:
         """The largest read no longer fits in the daemon's own REST share, whether or not the share yields."""
-        return self.rest_spent() + max(REST_READ_MAX.values()) > self.rest_cap()
+        return self.share_spent() + max(REST_READ_MAX.values()) > self.rest_cap()
 
     def rest_above_floor(self) -> bool:
         """REST is neither told to look low (forceLow) nor seen below its floor: what a fallback read over REST
@@ -2622,7 +2649,7 @@ class Daemon:
 
     def rest_room(self, cost: int) -> bool:
         """Whether `cost` more counted REST requests fit in the share, or the share yields to them."""
-        return self.rest_spent() + cost <= self.rest_cap() or self.share_yields(cost)
+        return self.share_spent() + cost <= self.rest_cap() or self.share_yields(cost)
 
     def rest_yield(self) -> int:
         """Counted REST the share may yield past its cap in an hour: policy restYield (a host's local override), else
@@ -2636,7 +2663,7 @@ class Daemon:
         gh calls keep. Only with a restYield set: by default nothing yields."""
         if self.mode("graphql") == "normal":
             return False
-        if self.rest_spent() + cost > self.rest_cap() + self.rest_yield():
+        if self.share_spent() + cost > self.rest_cap() + self.rest_yield():
             return False  # the yield is spent too: the rest wait for GraphQL, or the next hour
         seen = self.budget.get("rest") or {}
         if not seen or (seen.get("reset") or 0) <= self.now:
@@ -4011,7 +4038,8 @@ class Daemon:
                   "secondaryHold": {"until": self.secondary_until, "strikes": self.secondary_strikes}
                   if self.secondary_until > self.now else None, "forceLow": list(self.policy.get("forceLow", ())),
                   "lastHour": hour,
-                  "restShare": {"spent": self.rest_spent(), "cap": self.rest_cap(), "yield": self.rest_yield(),
+                  "restShare": {"spent": self.share_spent(), "since": round(self.share_since()),
+                                "lastHour": self.rest_spent(), "cap": self.rest_cap(), "yield": self.rest_yield(),
                                 "share": self.policy["restShare"], "capped": self.rest_capped()},
                   "heartbeat": HEARTBEAT_EVERY, "paths": dict(self.paths), "reads": reads, "graphqlBy": graphql_by,
                   "spendBy": self.spend_by(), "alarms": self.alarms,
@@ -7712,7 +7740,7 @@ def cmd_budget(as_json: bool) -> int:
                   f"{hour.get('free', 0)} rate_limit reads (free), {hour.get('write', 0)} REST for queued writes")
         share = status.get("restShare")
         if isinstance(share, dict):
-            print(f"daemon REST spend {share.get('spent', '?')}/{share.get('cap', '?')} this hour "
+            print(f"daemon REST spend {share.get('spent', '?')}/{share.get('cap', '?')} this REST window "
                   f"(restShare {share.get('share', '?')}"
                   + ("; at the cap, so REST is lean and PRs and runs read over GraphQL)" if share.get("capped") else ")"))
         for line in spend_lines(status.get("spendBy")):

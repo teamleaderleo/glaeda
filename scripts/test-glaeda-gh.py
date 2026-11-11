@@ -12422,6 +12422,59 @@ class DaemonPolicyTest(Base):
         gg.write_json(gg.BASE / "budget.json", {"rest": {"limit": 5000, "remaining": 1000, "reset": time.time() + 900}})
         self.assertEqual(gg.broker_max_age(["title"]), 300 * gg.LEAN_FACTOR + 30)  # lean polls that rarely
 
+    def test_a_stale_pr_is_read_within_one_cycle_of_the_rest_reset(self) -> None:
+        """2026-11-11: the shared REST pool ran dry and reset at about 11:14Z, and `wait pr cmuxterm-hq#9258` showed the
+        old head CONFLICTING for 20+ minutes while GitHub had a new one MERGEABLE. The share was a rolling hour, so a daemon
+        that spent it before the reset stayed capped into the fresh window and, with GraphQL out too, read nothing. The
+        share is held to the window the reset opens: the first tick after the reset reads the PR."""
+        old, new = "a" * 40, "b" * 40
+        node = pr_node(9258, checks=[check_run("build")])
+        node.update(headRefOid=old, mergeable="CONFLICTING", mergeStateStatus="DIRTY")
+        self.gh.prs[("o", "r", 9258)] = node
+        gg.register("pr:o/r#9258", waited=True)
+        self.daemon.tick(NOW)  # read while both quotas are fine
+        self.assertEqual(gg.read_cache("pr:o/r#9258")["data"]["headRefOid"], old)
+        # The outage: the daemon spent its share in the window that is ending; REST is at 0 until NOW + 90, and
+        # GraphQL is below its reserve. A new head lands meanwhile.
+        self.spend_rest(self.daemon.rest_cap() - 1, at=NOW - 10)
+        reset = NOW + 90
+        self.daemon.budget = {"rest": {"limit": 5000, "remaining": 0, "reset": reset, "seenAt": NOW},
+                              "graphql": {"limit": 5000, "remaining": gg.FLOORS["graphql"][1] - 1, "reset": NOW + 1800,
+                                          "seenAt": NOW}}
+        node.update(headRefOid=new, mergeable="MERGEABLE", mergeStateStatus="CLEAN")
+        calls = len(self.gh.calls)
+        self.daemon.tick(NOW + 30)
+        self.assertEqual(len(self.gh.calls), calls)  # both out: nothing is read
+        self.assertEqual(gg.read_cache("pr:o/r#9258")["data"]["headRefOid"], old)
+        # The quota recovers: GitHub answers from a fresh window. The first tick after the reset reads the PR.
+        self.gh.rest_remaining = 5000
+        self.gh.rate = lambda resource, remaining: {
+            "x-ratelimit-limit": "5000", "x-ratelimit-remaining": str(remaining),
+            "x-ratelimit-reset": str(int(reset + 3600)), "x-ratelimit-resource": resource}
+        self.daemon.tick(reset + gg.TICK)
+        data = gg.read_cache("pr:o/r#9258")["data"]
+        self.assertEqual((data["headRefOid"], data["mergeable"]), (new, "MERGEABLE"))
+        self.assertEqual(gg.read_cache("pr:o/r#9258")["via"], "rest")
+        self.assertLessEqual(self.daemon.share_spent(), gg.REST_READ_MAX["pr"])  # only this window's reads count
+        self.assertGreater(self.daemon.rest_spent(), self.daemon.rest_cap())  # the rolling hour still counts it all
+
+    def test_the_share_window_begins_at_the_live_counters_window(self) -> None:
+        """share_since: an hour before the earliest live counter's reset; the latest reset seen when none is live; a
+        rolling hour without a reading, or with a reset more than an hour out."""
+        self.daemon.now = NOW
+        self.daemon.budget = {}
+        self.assertEqual(self.daemon.share_since(), NOW - 3600)
+        self.daemon.budget = {"rest": {"limit": 5000, "remaining": 10, "reset": NOW + 600, "seenAt": NOW}}
+        self.assertEqual(self.daemon.share_since(), NOW - 3000)
+        self.daemon.budget = {"rest": {"limit": 5000, "remaining": 10, "reset": NOW - 120, "seenAt": NOW - 200}}
+        self.assertEqual(self.daemon.share_since(), NOW - 120)
+        self.daemon.budget = {"rest": {"limit": 5000, "remaining": 10, "reset": NOW + 9000, "seenAt": NOW}}
+        self.assertEqual(self.daemon.share_since(), NOW - 3600)
+        self.daemon.budget = {"rest": {"limit": 5000, "remaining": 10, "reset": NOW + 2400, "seenAt": NOW},
+                              "restCounters": [{"limit": 5000, "remaining": 900, "reset": NOW + 600, "seenAt": NOW},
+                                               {"limit": 5000, "remaining": 10, "reset": NOW + 2400, "seenAt": NOW}]}
+        self.assertEqual(self.daemon.share_since(), NOW - 3000)  # the earlier window counts more: it holds
+
     def test_reaching_the_share_mid_tick_defers_the_rest_reads(self) -> None:
         for n in range(1, 21):
             self.gh.runs[n] = {"id": n, "status": "in_progress", "html_url": f"u{n}"}
