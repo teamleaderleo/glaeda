@@ -5342,8 +5342,10 @@ class Daemon:
         info = self.job_logs_wanted.get((slug, job)) or {}
         try:
             status, h, raw = self.request("GET", f"/repos/{slug}/actions/jobs/{job}/logs", text=True)
+            cap = MAX_BODY  # an answer read through http() stops at MAX_BODY: a log that long may be cut
             if status in (301, 302, 303, 307, 308):
                 status, raw = self.blob(h.get("location") or "")
+                cap = JOB_LOG_RAW_MAX + 1
         except OutOfTime:
             return  # not sent (or cut off): it keeps its place
         except (WatchError, OSError) as error:
@@ -5356,7 +5358,7 @@ class Daemon:
             self.job_logs_tried[(slug, job)] = self.now
             self.errors.append(f"log {slug} job {job}: HTTP {status}")
             return
-        elif len(raw) > JOB_LOG_RAW_MAX:
+        elif len(raw) > JOB_LOG_RAW_MAX or len(raw) >= cap:
             job_log_mark(slug, job, info, self.clock(), tooLarge=len(raw))
         else:
             job_log_put(slug, job, raw, info, self.clock())
@@ -5382,8 +5384,11 @@ class Daemon:
             self.errors.append(f"logs: {error}")
             return
         logs = answer.get("logs") if isinstance(answer, dict) else None
+        if not isinstance(logs, dict):  # an upstream older than logs: ask again after JOB_LOG_RETRY, not every pull
+            self.job_log_at = self.now + JOB_LOG_RETRY
+            return
         for slug, job in picked:
-            got = logs.get(f"{slug}/{job}") if isinstance(logs, dict) else None
+            got = logs.get(f"{slug}/{job}")
             info = {**(self.job_logs_wanted.get((slug, job)) or {}), **(got if isinstance(got, dict) else {})}
             try:
                 if isinstance(got, dict) and isinstance(got.get("gz"), str):

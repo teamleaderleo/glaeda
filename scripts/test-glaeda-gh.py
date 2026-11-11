@@ -13756,6 +13756,19 @@ class JobLogCacheTest(Base):
         down.tick(now=NOW + gg.JOB_LOG_SPACING)
         self.assertEqual(len([r for r in asked if r.get("logs")]), 1)  # 78 waits JOB_LOG_RETRY
 
+    def test_an_upstream_older_than_logs_is_not_asked_every_pull(self) -> None:
+        asked: list[dict] = []
+
+        def ask(request: dict) -> dict:
+            asked.append(request)
+            return {"entries": {}}
+
+        down = gg.Daemon(transport=self.gh, token=lambda: self.fail("read a token"), controller=None, upstream=ask)
+        down.store("pr:o/r#1", None, data=self.failed_pr(*range(1, 30)), dataAt=NOW)
+        for n in range(5):
+            down.tick(now=NOW + n * gg.JOB_LOG_SPACING)
+        self.assertEqual(len([r for r in asked if r.get("logs")]), 1)
+
     def test_the_upstream_answers_logs_beside_entries_only_when_asked(self) -> None:
         gg.job_log_put("o/r", 77, b"kept\n", {"run": 5})
         self.assertEqual(gg.read_logs_request('{"keys": []}'), [])
