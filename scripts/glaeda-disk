@@ -4908,16 +4908,30 @@ def relief_room(path: Path, peak: int, slow: bool) -> str:
             f"is freed, plus a {gib(floor).strip()} floor), {gib(free).strip()} free")
 
 
-def git_relief_peak(gitdir: Path) -> int:
+def git_relief_peak(gitdir: Path, alternates: bool = False) -> int:
     """A repack or gc's peak: its new pack can hold every object (-k keeps the unreachable ones) and is written while
     the old packs stay, and a reader holding an old pack open keeps its bytes after the delete. So the whole object
-    store, or the pack directory's bytes when count-objects says less (or nothing)."""
-    packs = 0
-    with contextlib.suppress(OSError), os.scandir(gitdir / "objects/pack") as it:
-        for e in it:
-            with contextlib.suppress(OSError):
-                packs += e.stat(follow_symlinks=False).st_size
-    return max(git_object_bytes(gitdir), packs)
+    store in bytes: every file under objects/ (packs, indexes, loose objects, garbage), summed from lstat, never
+    count-objects' rounded KiB. A bundle's objects are a subset of the store it reads, so this bounds a bundle too
+    (`rev-list --disk-usage` does not: it counts the packed bytes as stored, not as written); with alternates, the
+    stores objects/info/alternates names are added, since a bundle takes objects from them."""
+    stores, total = [gitdir / "objects"], 0
+    if alternates:
+        with contextlib.suppress(OSError):
+            for line in (gitdir / "objects/info/alternates").read_text().splitlines():
+                if line.strip() and not line.startswith("#"):
+                    alt = Path(line.strip())
+                    stores.append(alt if alt.is_absolute() else gitdir / "objects" / alt)
+    seen: set[tuple[int, int]] = set()
+    for store in stores:
+        for dirpath, _, names in os.walk(store):
+            for name in names:
+                with contextlib.suppress(OSError):
+                    st = os.lstat(os.path.join(dirpath, name))
+                    if stat.S_ISREG(st.st_mode) and (st.st_dev, st.st_ino) not in seen:
+                        seen.add((st.st_dev, st.st_ino))
+                        total += st.st_size
+    return total
 
 
 def _ref_tree_state(root: Path) -> tuple[float, str] | None:
@@ -6939,11 +6953,7 @@ def _write_bundle(gitdir: Path, name: str, revs: list[str], heads: set[str], wri
     tmp = dest.with_name(f".{dest.name}.{os.getpid()}.tmp")
     try:
         _private_archive_dir()
-        # the bundle's bytes are about the packed bytes of the objects it takes; a git without --disk-usage: the store
-        size = _git_dir_run(gitdir, "rev-list", "--objects", "--disk-usage", "--stdin", stdin="\n".join(revs) + "\n",
-                            timeout=600)
-        peak = int(size.strip()) if size is not None and size.strip().isdigit() else git_relief_peak(gitdir)
-        if (why := relief_room(mirror_archive(), peak, slow=False)):
+        if (why := relief_room(mirror_archive(), git_relief_peak(gitdir, alternates=True), slow=False)):
             return f"bundle of {gitdir}: {why}"
         if _git_dir_run(gitdir, "bundle", "create", str(tmp), "--stdin", stdin="\n".join(revs) + "\n",
                         timeout=600) is None or _git_dir_run(gitdir, "bundle", "verify", str(tmp), timeout=600) is None:

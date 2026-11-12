@@ -7232,7 +7232,23 @@ class GlaedaDiskTest(unittest.TestCase):
         # space to 113 MB and the host's review service refused a review; a repack starts only with room for its peak
         home, mirror, _ = self._shared_mirror(4)
         peak = gd.git_relief_peak(mirror)
-        self.assertGreaterEqual(peak, gd.git_object_bytes(mirror))
+        # whole bytes of every object file, never count-objects' KiB (review F2): the packs and their indexes, and a
+        # loose object counts once a write adds it
+        files = [f for f in (mirror / "objects").rglob("*") if f.is_file()]
+        self.assertEqual(peak, sum(f.stat().st_size for f in files))
+        self.assertGreater(peak, sum(f.stat().st_size for f in files if f.suffix == ".pack"))
+        (self.root / "loose").write_text("loose\n")
+        self._git("--git-dir", os.fspath(mirror), "hash-object", "-w", os.fspath(self.root / "loose"))
+        loose = gd.git_relief_peak(mirror)
+        self.assertGreater(loose, peak)
+        peak = loose
+        # a bundle takes objects from the stores objects/info/alternates names, so its bound adds them (review F1)
+        borrower = self.root / "borrower.git"
+        self._git("init", "-q", "--bare", os.fspath(borrower))
+        (borrower / "objects/info/alternates").write_text(f"{mirror / 'objects'}\n")
+        self.assertLess(gd.git_relief_peak(borrower), peak)
+        self.assertGreaterEqual(gd.git_relief_peak(borrower, alternates=True), peak)
+        shutil.rmtree(borrower)
         real = gd.free_bytes
         gd.process_evidence = lambda: ([], "")
         for free, total in ((113 * 1024**2, 495 * gd.GIB), (peak + gd.RELIEF_SLOW_FLOOR - 1, 100 * gd.GIB),
