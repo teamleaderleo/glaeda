@@ -80,6 +80,7 @@ os.environ["GLAEDA_RUNNER_TOOLCHAIN_GATE"] = "0"
 # tailnet_look patched.
 os.environ["GLAEDA_RUNNER_GATE_TAILNET"] = "off"
 hook = load("glaeda_cmux_runner_hook", HOOK)
+hook.LOW_DISK_HOLD_S = 0.0  # in-process tests never sit in the low-disk hold; the tests of it pass hold_s
 REAL_FIND_DISK = hook.find_disk
 REAL_LEAVE_JOB_WORKSPACE = hook.leave_job_workspace
 
@@ -328,6 +329,8 @@ class HookTest(unittest.TestCase):
                    "GLAEDA_CANONICAL_ROOT_PARENT": NO_ROOTS, "GLAEDA_FLEET_DIR": os.fspath(self.dir / "fleet"),
                    # the xcrun shim the toolchain check runs: the fake node's python3, never this host's real one
                    "GLAEDA_RUNNER_SHIM_PYTHON": "python3",
+                   # the low-disk hold waits minutes; the tests that want it set their own
+                   hook.LOW_DISK_HOLD_ENV: "0",
                    # and the fake node's xcrun for the Xcode probe, which runs xcrun by absolute path
                    "GLAEDA_RUNNER_XCRUN": os.fspath(self.dir / "jobpath" / "xcrun")}
         if event_name is not None:
@@ -2238,6 +2241,42 @@ class HookTest(unittest.TestCase):
         self.assertLess(text.index("pre-job target"), text.index("disk floor"))
         self.assertIn("warning: 15.0 GiB free, 20 GiB required: admitted under the admission floor", text,
                       "warned under one job's measured disk growth")
+
+    def test_low_disk_hold_waits_for_space_then_ends(self) -> None:
+        """Under the admission floor the job waits (slower), evicting again, and goes ahead once space is back."""
+        free = iter([True, True, True, False])
+        evicted: list[int] = []
+        clock = [0.0]
+
+        def sleep(s: float) -> None:
+            clock[0] += s
+        real = hook.time.monotonic
+        with mock.patch.object(hook.time, "sleep", side_effect=sleep), \
+                mock.patch.object(hook.time, "monotonic", side_effect=lambda: clock[0]):
+            waited = hook.hold_for_disk(lambda: next(free, False), lambda: False, lambda: evicted.append(1), 600.0)
+        del real
+        self.assertEqual(waited, 3 * hook.LOW_DISK_HOLD_POLL_S)
+        self.assertEqual(evicted, [], "space came back before the first retry interval")
+
+    def test_low_disk_hold_is_bounded_and_retries_eviction(self) -> None:
+        clock = [0.0]
+        evicted: list[int] = []
+
+        def sleep(s: float) -> None:
+            clock[0] += s
+        with mock.patch.object(hook.time, "sleep", side_effect=sleep), \
+                mock.patch.object(hook.time, "monotonic", side_effect=lambda: clock[0]):
+            waited = hook.hold_for_disk(lambda: True, lambda: False, lambda: evicted.append(1), 300.0)
+        self.assertEqual(waited, 300.0, "a disk that never recovers still ends the hold (the job is then warned)")
+        self.assertGreaterEqual(len(evicted), 4)
+
+    def test_low_disk_hold_ends_when_the_worker_is_gone_or_off(self) -> None:
+        self.assertEqual(hook.hold_for_disk(lambda: True, lambda: True, lambda: None, 600.0), 0.0)
+        self.assertEqual(hook.hold_for_disk(lambda: True, lambda: False, lambda: None, 0.0), 0.0)
+        for raw, want in (("0", 0.0), ("5", 5.0), ("-1", hook.LOW_DISK_HOLD_S), ("nan", hook.LOW_DISK_HOLD_S),
+                          ("x", hook.LOW_DISK_HOLD_S), ("999999", hook.LOW_DISK_HOLD_S)):
+            with self.subTest(raw=raw), mock.patch.dict(os.environ, {hook.LOW_DISK_HOLD_ENV: raw}):
+                self.assertEqual(hook.low_disk_hold_s(), want)
 
     def test_prejob_margin_override_is_bounded(self) -> None:
         for value, want in (("5", 5.0), ("0", 0.0), ("-1", 20.0), ("501", 20.0), ("nan", 20.0), ("x", 20.0)):

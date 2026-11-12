@@ -245,6 +245,48 @@ def disk_low_turn(capacity_dir: Path, worker: int, lock_wait_s: float | None = N
 # and a bounded capacity wait after it is shortened by it, so a refusal still comes inside cmux's rescue window
 # (REFUSAL_SECONDS, NIGHTLY_BOUND_WORST_S).
 DISK_LOW_WAIT_S = 300.0
+
+# Under the admission floor after eviction a job is HELD, not admitted at once: admitted at 13 GiB free, a compile
+# that needs more died with "No space left on device" (cmux22, run 43136404454, 2026-11-11), a failure rather than a
+# slowdown. Other jobs finish and free their working sets, and each retry runs the eviction again, so the hold ends
+# the moment free disk is back over the admission floor. It is bounded (a disk that never recovers still admits the
+# job with the warning, never refuses it), and a nightly job (which goes first on disk) is not held.
+LOW_DISK_HOLD_S = 1800.0
+LOW_DISK_HOLD_ENV = "GLAEDA_RUNNER_LOW_DISK_HOLD_S"  # the runner's own environment; 0 turns the hold off
+LOW_DISK_HOLD_POLL_S = 10.0
+LOW_DISK_HOLD_EVICT_EVERY_S = 60.0
+
+
+def low_disk_hold_s() -> float:
+    """LOW_DISK_HOLD_S, or LOW_DISK_HOLD_ENV when it is a finite number from 0 to 6 hours."""
+    raw = os.environ.get(LOW_DISK_HOLD_ENV)
+    if raw is None:
+        return LOW_DISK_HOLD_S
+    try:
+        value = float(raw)
+    except ValueError:
+        return LOW_DISK_HOLD_S
+    return value if math.isfinite(value) and 0 <= value <= 6 * 3600 else LOW_DISK_HOLD_S
+
+
+def hold_for_disk(still_low: Callable[[], bool], gone: Callable[[], bool], evict_again: Callable[[], None],
+                  hold_s: float | None = None) -> float:
+    """Wait, polling every LOW_DISK_HOLD_POLL_S, until still_low() is false, the job's Worker is gone, or hold_s
+    (low_disk_hold_s()) ran out; evict_again() runs at most every LOW_DISK_HOLD_EVICT_EVERY_S meanwhile. Returns the
+    seconds waited. Never raises (an eviction that fails is retried at the next interval)."""
+    budget = low_disk_hold_s() if hold_s is None else hold_s
+    started = time.monotonic()
+    last_evict = started
+    while budget > 0 and still_low() and not gone():
+        left = budget - (time.monotonic() - started)
+        if left <= 0:
+            break
+        time.sleep(min(LOW_DISK_HOLD_POLL_S, left))
+        if time.monotonic() - last_evict >= LOW_DISK_HOLD_EVICT_EVERY_S and still_low():
+            last_evict = time.monotonic()
+            with contextlib.suppress(Exception):
+                evict_again()
+    return time.monotonic() - started
 DISK_LOW_POLL_S = 5.0
 
 
@@ -9957,6 +9999,15 @@ def main(argv: list[str] | None = None) -> int:
             the runner floor it first waits for the disk ledger's turn (wait_disk_low_turn). The one refusal left is
             an unpinned Runner.Worker's, which the capacity admission refuses anyway."""
             low = disk_refusal(disk_path, admit_floor)
+            if low and not nightly_disk and not args.no_disk and low_disk_hold_s() > 0:
+                print(f"{PREFIX}: {low}: holding the job (slower, not failed) until running jobs free disk; "
+                      f"at most {low_disk_hold_s():g} s, evicting again every {LOW_DISK_HOLD_EVICT_EVERY_S:g} s",
+                      flush=True)
+                waited = hold_for_disk(lambda: bool(disk_refusal(disk_path, admit_floor)),
+                                       owner.gone if owner is not None else (lambda: False), floor_evict)
+                low = disk_refusal(disk_path, admit_floor)
+                print(f"{PREFIX}: held {waited:.0f} s for disk: "
+                      + (f"still {low}" if low else "free disk is back over the admission floor"), flush=True)
             if low:
                 print(f"{PREFIX}: warning: {low}: admitted under the admission floor after eviction "
                       "(a disk floor warns, never refuses)", flush=True)
