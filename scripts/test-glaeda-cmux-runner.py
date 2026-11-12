@@ -9579,6 +9579,45 @@ class GateTest(unittest.TestCase):
                 self.assertEqual(stops, [])
                 self.assertIsNone(gate.low_disk())
 
+    def test_a_pool_runner_under_one_jobs_disk_peak_stops_listening(self) -> None:
+        """cmux run 43119216549 (2026-11-11): a pool runner took the fast tier at 19.8 GiB free, job-started admitted it
+        with a warning (20 GiB required), and its link stopped at ld errno=28 thirteen minutes later. Under one job's
+        measured peak the idle listener is held (DISK_SHORT_HOLD), so the job goes to a runner with room; between the
+        peak and the floor it only warns, as before."""
+        write_hook(self.runner, "exec python3 /hook job-started --min-free-gib 30 --capacity-units 14 --fast-runner\n")
+        gate = hook.Gate(self.runner, os.fspath(self.lock), os.fspath(self.tmp / "none.json"), self.state)
+        free = {"gib": 19.8}
+        usage = lambda _path: mock.Mock(free=int(free["gib"] * 1024**3))  # noqa: E731
+        with mock.patch.object(hook.shutil, "disk_usage", side_effect=usage), \
+                mock.patch.object(gate, "evict_in_background") as cleanup, \
+                mock.patch.dict(os.environ, {hook.DISK_JOB_PEAK_ENV: "20"}):
+            why = gate.low_disk()
+            self.assertIn("DISK_SHORT_HOLD", why or "")
+            self.assertIn("19.8 GiB free, 20 GiB required", why or "")
+            cleanup.assert_called_once()  # cleanup is still requested first
+            self.assertIn("DISK_SHORT_HOLD", gate.claimed() or "", "an idle look holds the listener")
+            free["gib"] = 25.0
+            self.assertIsNone(gate.low_disk(), "between one job's peak and the floor it only warns")
+            self.assertIsNone(gate.claimed())
+
+    def test_a_disk_short_runner_never_stops_or_freezes_its_running_job(self) -> None:
+        write_hook(self.runner, "exec python3 /hook job-started --min-free-gib 30 --capacity-units 5\n")
+        with mock.patch.object(hook.shutil, "disk_usage", return_value=mock.Mock(free=10 * 1024**3)), \
+                mock.patch.dict(os.environ, {hook.DISK_JOB_PEAK_ENV: "20"}):
+            gate, stops = self.gate([None] * 3, busy=[True])
+            gate.worker_pids = lambda: [4242]
+            with mock.patch.object(gate, "evict_in_background"):
+                gate.step()
+                self.assertEqual(stops, [], "a runner with a job is never stopped for disk")
+                self.assertFalse(gate.freeze_at_exit, "a disk reading must not arm JOB_END_FREEZE")
+
+    def test_a_runner_with_no_disk_floor_is_never_held_for_disk(self) -> None:
+        write_hook(self.runner, "exec python3 /hook job-started --capacity-units 5\n")
+        gate = hook.Gate(self.runner, os.fspath(self.lock), "", self.state)
+        with mock.patch.object(hook.shutil, "disk_usage", return_value=mock.Mock(free=5 * 1024**3)), \
+                mock.patch.object(gate, "evict_in_background"):
+            self.assertIsNone(gate.low_disk())
+
     def test_a_fleet_waiter_seen_during_a_job_stops_the_listener_as_the_job_ends(self) -> None:
         """cmux11s, 2026-10-06: a fleet build waited 13 minutes while three runners kept taking queued jobs and
         refusing each one. The gate deferred while a job ran and the next job came before two idle polls."""
