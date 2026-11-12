@@ -4794,6 +4794,22 @@ class OverloadTest(Base):
         self.daemon.tick(NOW + 5 * gg.CYCLE)
         self.assertEqual(gg.read_json(gg.BASE / "daemon.json")["oldestData"]["pr"], 5 * gg.CYCLE)
 
+    def test_a_wait_on_an_idle_old_pr_is_not_stale_until_it_has_waited(self) -> None:
+        """The alarm and `restart` read the same staleWaited: a wait that lands on old idle data counts from when it
+        began waiting, so neither says "stale" for data the next tick reads (huge-blue 2026-11-12)."""
+        keys = self.watch(1)
+        self.daemon.tick(NOW)
+        old = NOW + 3 * gg.STALE_DATA_AFTER
+        entry = {"key": keys[0], "cache": gg.read_cache(keys[0]), "waitedAt": old}
+        self.daemon.now = old
+        self.daemon.oldest_data([entry], set())
+        self.assertLess(self.daemon.stale_waited["pr"], 1)  # data is 1800 s old, the wait is new
+        self.daemon.now = old + gg.STALE_DATA_AFTER + 5
+        entry["waitedAt"] = self.daemon.now
+        self.daemon.oldest_data([entry], set())
+        self.assertGreater(self.daemon.stale_waited["pr"], gg.STALE_DATA_AFTER)  # waited past the bound: stale
+        self.assertIsNotNone(self.daemon.stale_alarm())
+
     def test_the_oldest_data_age_is_reported(self) -> None:
         keys = self.watch(3)
         self.daemon.tick(NOW)
