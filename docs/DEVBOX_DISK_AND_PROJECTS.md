@@ -1,5 +1,8 @@
 # Dev-box disk and Projects hygiene
 
+Disk-relief operations that rewrite data follow the [peak-admission pattern](DISK_RELIEF_PEAK_ADMISSION.md):
+their projected temporary working set must fit alongside a free-space floor, after cheap owned cleanup has run.
+
 Glaeda uses one policy surface for fleet minis and developer machines. The role is explicit:
 
 ```text

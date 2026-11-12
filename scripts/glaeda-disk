@@ -4797,6 +4797,13 @@ RUNNER_CHECKOUT_REPACK_FAMILY = "runner-checkout-repack"
 RUNNER_CHECKOUT_REPACK_PACKS = 40  # nightly.yml's own threshold
 RUNNER_CHECKOUT_REPACK_IDLE_HOURS = 10 / 60  # busy runners are rarely idle an hour; its job is checked directly
 
+# Git gc/repack writes a replacement pack before it can remove the old one.  The
+# replacement can therefore need about two copies of the object store at once.
+# Keep a small free-space floor after that peak even on a host without a runner
+# admission floor; a pressure pass gets its cheap, owned deletions first.
+DISK_RELIEF_PEAK_MULTIPLIER = 2
+DISK_RELIEF_MIN_FREE_GIB = 4.0
+
 
 def _git_common_dir(gitdir: Path) -> Path | None:
     """The main clone's git dir of a linked work tree's git dir (<clone>/.git/worktrees/<name>)."""
@@ -5148,6 +5155,35 @@ def compact_wrapper(lock: Path, record: Path | None, argv: list[str]) -> list[st
     return ["/bin/sh", "-c", script, os.fspath(lock), os.fspath(record) if record is not None else "", *argv]
 
 
+def disk_relief_space_veto(path: Path, projected_peak: int) -> tuple[str, dict[str, int | None]]:
+    """Refuse a disk-relief rewrite when its own peak would consume the free space.
+
+    The free-space observation is deliberately taken after process and ownership
+    checks, immediately before the child starts.  A runner admission floor, when
+    present, is retained; other hosts retain the policy's small minimum floor.
+    """
+    try:
+        free, total = free_bytes(path)
+    except OSError as error:
+        return f"free space unreadable ({error.__class__.__name__})", {
+            "free_bytes": None, "total_bytes": None, "floor_bytes": None,
+            "projected_peak_bytes": projected_peak,
+        }
+    try:
+        runner_floor = runner_floor_gib()
+    except (OSError, TypeError, ValueError):
+        runner_floor = 0.0
+    floor_gib = max(float(POLICY.get("low_margin_gib", DISK_RELIEF_MIN_FREE_GIB)), runner_floor)
+    floor = min(total // 2, max(0, int(floor_gib * GIB)))
+    required = projected_peak + floor
+    details = {"free_bytes": free, "total_bytes": total, "floor_bytes": floor,
+               "projected_peak_bytes": projected_peak}
+    if free < required:
+        return (f"free space {gib(free).strip()} is below projected peak {gib(projected_peak).strip()} "
+                f"plus floor {gib(floor).strip()}", details)
+    return "", details
+
+
 def _gc_clones(receipt: Path, clones: list[tuple[int, Path, Path]], family: str, git_args, veto, halt,
                lock=None, record=None) -> int:
     """Run `git <git_args(tree)>` on the first of clones (packs, tree, git dir) that veto clears. With lock, the
@@ -5196,6 +5232,18 @@ def _gc_clones(receipt: Path, clones: list[tuple[int, Path, Path]], family: str,
             rec.update(outcome="changed:in-use", verdict="blocked", reasons=[why], bytes=0)
         else:
             before = git_object_bytes(gitdir)
+            projected_peak = max(GIB, before * DISK_RELIEF_PEAK_MULTIPLIER)
+            space_why, space = disk_relief_space_veto(gitdir, projected_peak)
+            rec.update(space)
+            if space_why:
+                rec.update(outcome="changed:disk-space", verdict="blocked", reasons=[space_why], bytes=0)
+                if held is not None:
+                    with contextlib.suppress(OSError):
+                        held.unlink()
+                why = space_why
+            else:
+                why = ""
+        if not why:
             git = shutil.which("git") or "git"
             nice = shutil.which("nice")
             argv = [*([nice, "-n", "15"] if nice else []), git, "-c", "gc.worktreePruneExpire=never",
@@ -5236,6 +5284,8 @@ def _gc_clones(receipt: Path, clones: list[tuple[int, Path, Path]], family: str,
                 with contextlib.suppress(OSError):
                     HOME_CLONE_GC_FAILED.parent.mkdir(parents=True, exist_ok=True)
                     HOME_CLONE_GC_FAILED.write_text(json.dumps(failed))
+        if why and rec.get("outcome") == "changed:disk-space":
+            rec["reasons"] = [why]
         with contextlib.suppress(OSError), receipt.open("a") as f:  # a lost receipt line must not stop the pass
             f.write(json.dumps(rec) + "\n")
         if not why:

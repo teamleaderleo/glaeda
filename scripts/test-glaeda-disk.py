@@ -7172,6 +7172,24 @@ class GlaedaDiskTest(unittest.TestCase):
         self.assertEqual(self._git("--git-dir", os.fspath(mirror), "rev-list", "--all").split(), heads)
         self._git("--git-dir", os.fspath(mirror), "fsck", "--no-progress")
 
+    def test_disk_relief_repack_waits_for_its_peak_and_free_space_floor(self) -> None:
+        home, mirror, _ = self._shared_mirror(4)
+        receipt = self.receipt()
+        gd.process_evidence = lambda: ([], "")
+        with self._gc_log(), contextlib.redirect_stdout(io.StringIO()), \
+                mock.patch.object(gd, "git_object_bytes", return_value=10 * gd.GIB), \
+                mock.patch.object(gd, "free_bytes", return_value=(15 * gd.GIB, 100 * gd.GIB)), \
+                mock.patch.object(gd, "runner_floor_gib", return_value=0.0), \
+                mock.patch.object(gd.subprocess, "Popen") as popen:
+            self.assertEqual(gd.compact_shared_mirrors(receipt, home), 0)
+        popen.assert_not_called()
+        rec = json.loads(receipt.read_text())
+        self.assertEqual((rec["outcome"], rec["verdict"]), ("changed:disk-space", "blocked"))
+        self.assertEqual((rec["projected_peak_bytes"], rec["free_bytes"], rec["floor_bytes"]),
+                         (20 * gd.GIB, 15 * gd.GIB, 4 * gd.GIB))
+        self.assertIn("projected peak", rec["reasons"][0])
+        self.assertFalse((mirror / "objects/maintenance.lock").exists())
+
     def test_shared_mirror_compact_records_its_packs_for_the_pack_rate(self) -> None:
         # a dev host, 2026-11-09: the fold's output has a .promisor like a blobless fetch's, and repo_mirrors'
         # pack_rate read three 8 GiB folds an hour as a 22.8 GiB fetch storm; it leaves out clone-care-repacked's packs
@@ -7366,7 +7384,7 @@ class GlaedaDiskTest(unittest.TestCase):
                 mock.patch.object(gd, "default_families", return_value=[]), \
                 mock.patch.object(gd, "filesystems", return_value=under), \
                 mock.patch.object(gd, "survey", return_value=[]), \
-                mock.patch.object(gd, "apply", return_value=0), \
+                mock.patch.object(gd, "apply", side_effect=lambda *a, **k: order.append("cheap") or 0), \
                 mock.patch.object(gd, "cleanup_paused_runner_work", return_value=0), \
                 mock.patch.object(gd, "evict_idle_runner_checkouts", return_value=0), \
                 mock.patch.object(gd, "notify_disk"), \
@@ -7382,7 +7400,7 @@ class GlaedaDiskTest(unittest.TestCase):
             gd.main(["--pressure", "--apply", "--no-snapshot", "--top", "0", *receipt])
             gc.assert_called_once()
             repack.assert_called_once()
-        self.assertEqual(order[-2:], ["release", "gc"])  # a long gc never holds the eviction lock
+        self.assertEqual(order[-3:], ["cheap", "release", "gc"])  # cheap relief precedes a long gc
 
     def test_idle_sweep_windows_follow_reuse(self) -> None:
         ci = self.root / "ci"
