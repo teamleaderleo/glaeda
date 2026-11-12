@@ -4062,10 +4062,34 @@ RUNNER_WORK_GLOBS = ("actions-runner-glaeda*/_work", "glaeda-runner/_work",
                      ".local/state/glaeda/promotion/*/runner/_work")  # a promotion lease's runner (PROMOTION_LEASE)
 
 
+# BESIDE_EXCLUSIVE (Leo, 2026-11-12: "BRO HOW COULD ... LIGHT JOBS ... HOLD UP THE ... [nightly] ... THE WHOLE POINT IS
+# \"WHEN IT'S IDLE\""): the nightly's own runners on its signing mini run beside the nightly's own signing job. A
+# runner.dedicated entry with besideExclusive gets --beside-exclusive in its job-started.sh: it never yields
+# (YIELD_TO_EXCLUSIVE is for the mini's other work), and an exclusive job's drain does not count the processes in its
+# _work, so neither waits for the other. Push run 43274514347 (cmux, 2026-11-12) is why: the nightly's
+# resolve-nightly-cmux-tui-client waited 24.5 min in this hook for 0.3 min of work, and build-nightly-remote-daemon
+# 15.4 min for 16 s, both yielding to the same nightly's sign, which then waited for nightly jobs to drain.
+# glaeda_fleet_labels allows the key only on an entry whose admission is glaeda-nightly-only-admit without a trusted
+# ref, so only the NEXT nightly's own jobs (the same ref and workflow as the signing job) run beside the key.
+BESIDE_EXCLUSIVE_RE = re.compile(r"\s--beside-exclusive(?:\s|$)")
+
+
+def beside_exclusive(runner_dir: Path) -> bool:
+    """True when the runner glaeda-cmux-runner installed in runner_dir runs beside an exclusive claim
+    (BESIDE_EXCLUSIVE). A hook script that cannot be read counts, as before, for the drain."""
+    try:
+        text = (runner_dir / RUNNER_HOOK_SCRIPT).read_text()
+    except (OSError, UnicodeDecodeError):
+        return False
+    return BESIDE_EXCLUSIVE_RE.search(text) is not None
+
+
 def stray_job_processes(home: Path, owner_pid: int) -> list[int] | None:
     """This user's processes working in or naming a runner's _work under home that are not this job's (under
-    owner_pid) and not the hook's or this process's ancestors. None when ps or lsof cannot tell."""
-    works = sorted({os.path.realpath(w) for pattern in RUNNER_WORK_GLOBS for w in home.glob(pattern) if w.is_dir()})
+    owner_pid) and not the hook's or this process's ancestors. None when ps or lsof cannot tell. A runner that runs
+    beside the exclusive class (BESIDE_EXCLUSIVE) is not drained: its _work is left out."""
+    works = sorted({os.path.realpath(w) for pattern in RUNNER_WORK_GLOBS for w in home.glob(pattern)
+                    if w.is_dir() and not beside_exclusive(w.parent)})
     if not works:
         return []
     insides = [w.rstrip("/") + "/" for w in works]
@@ -9699,6 +9723,9 @@ def main(argv: list[str] | None = None) -> int:
                    help="job-started, a dedicated runner: start no job while a signing job on this mini waits for "
                         "it to drain or holds it (YIELD_TO_EXCLUSIVE)")
     p.add_argument("--exclusive-yield-wait", type=float, default=None, help=argparse.SUPPRESS)
+    p.add_argument("--beside-exclusive", action="store_true",
+                   help="job-started, a dedicated nightly runner: it runs beside its mini's signing job, which does "
+                        "not drain it, and never yields to it (BESIDE_EXCLUSIVE)")
     p.add_argument("--dev-compile-runner", action="store_true",
                    help="this instance admits only cmux NEXT DEV Release compile jobs (shared host capacity)")
     p.add_argument("--nightly-runner", action="store_true",
@@ -10150,7 +10177,7 @@ def main(argv: list[str] | None = None) -> int:
                     marker.unlink()
         elif args.dedicated_admit:
             held, note = True, ""
-            if args.yield_to_exclusive:
+            if args.yield_to_exclusive and not args.beside_exclusive:  # BESIDE_EXCLUSIVE wins
                 held, note = yield_to_exclusive(args.capacity_dir, owner, args.exclusive_yield_wait)
                 if note == ABANDONED:
                     return abandoned()

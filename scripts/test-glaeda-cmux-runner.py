@@ -3248,6 +3248,28 @@ class HookTest(unittest.TestCase):
             self.finish("n1")
         self.assertTrue(self.lock_free())
 
+    def test_a_signing_drain_leaves_out_a_runner_beside_the_exclusive_class(self) -> None:
+        """BESIDE_EXCLUSIVE: a process in a nightly runner's _work (its job-started.sh has --beside-exclusive) is not
+        a stray for the signing job's drain; one in any other runner's _work still is (push run 43274514347)."""
+        nightly, light = self.dir / "actions-runner-glaeda-nightly-only-1", self.dir / "actions-runner-glaeda-light-1"
+        for runner, flag in ((nightly, " --beside-exclusive"), (light, " --yield-to-exclusive")):
+            (runner / "_work").mkdir(parents=True)
+            (runner / "glaeda-hooks").mkdir()
+            (runner / hook.RUNNER_HOOK_SCRIPT).write_text(f"#!/bin/bash\nexec python3 hook job-started{flag}\n")
+        self.assertTrue(hook.beside_exclusive(nightly))
+        self.assertFalse(hook.beside_exclusive(light))
+        self.assertFalse(hook.beside_exclusive(self.dir / "absent"), "an unreadable hook script is drained")
+        # a fixed process table: one job process in each runner's _work, neither under this process
+        me, work = os.getpid(), {n: os.path.realpath(r / "_work") for n, r in (("n", nightly), ("l", light))}
+        ps = make_executable(self.dir / "ps", f"#!/bin/sh\nprintf '%s\\n' '{me} 1 python3 test' "
+                             f"'5001 1 sleep 30' '5002 1 sleep 30'\n")
+        lsof = make_executable(self.dir / "lsof", f"#!/bin/sh\nprintf '%s\\n' p{me} n/ p5001 n{work['n']} "
+                               f"p5002 n{work['l']}\n")
+        with mock.patch.object(hook, "PS", os.fspath(ps)), mock.patch.object(hook, "LSOF", os.fspath(lsof)):
+            self.assertEqual(hook.stray_job_processes(self.dir, 0), [5002], "only the light runner's job is drained")
+            (light / hook.RUNNER_HOOK_SCRIPT).write_text("#!/bin/bash\nexec python3 hook job-started --beside-exclusive\n")
+            self.assertEqual(hook.stray_job_processes(self.dir, 0), [])
+
     def test_stray_job_processes_refuses_when_ps_or_lsof_cannot_answer_in_full(self) -> None:
         """A failed, partial or empty listing must never read as "nothing in _work" (it refuses the signing job)."""
         (self.dir / "actions-runner-glaeda-7" / "_work").mkdir(parents=True)
@@ -14506,6 +14528,58 @@ class DedicatedRunnerTest(unittest.TestCase):
         hooks = self.home / "actions-runner-glaeda-nightly-next" / cr.HOOK_DIR
         self.assertIn(" --yield-to-exclusive", (hooks / "job-started.sh").read_text())
 
+    def test_a_nightly_runner_never_yields_and_a_light_runner_runs_at_background_qos(self) -> None:
+        """Leo, 2026-11-12: light jobs on the nightly Mac are fine, "THE WHOLE POINT IS \"WHEN IT'S IDLE\"". The
+        nightly's own runner (besideExclusive) never yields to its signing job and is not drained by it; a light runner
+        (background) runs its listener and every job under taskpolicy -b, launchd Background, LowPriorityIO and Nice."""
+        nightly_admit = ["{python}", "~/glaeda-runner/scripts/glaeda-nightly-only-admit", "--hook",
+                         "{runnerDir}/glaeda-hooks/glaeda-cmux-runner-hook"]
+        beside = {**NIGHTLY, "admit": nightly_admit, "besideExclusive": True}
+        light = {**NIGHTLY, "name": "light-1", "labels": ["glaeda-runner-mini-std-light-1"], "background": True,
+                 "yieldToExclusive": True}
+        good, why = fleet_labels.dedicated_runners(dedicated_manifest(beside, light), "mini-std")
+        self.assertIsNone(why)
+        self.assertEqual([(g["besideExclusive"], g["background"]) for g in good], [(True, False), (False, True)])
+        plain, _ = fleet_labels.dedicated_runners(dedicated_manifest(NIGHTLY), "mini-std")
+        self.assertEqual((plain[0]["besideExclusive"], plain[0]["background"]), (False, False))
+        for change, needle in (({"besideExclusive": "yes"}, "besideExclusive must be boolean"),
+                               ({"background": 1}, "background must be boolean"),
+                               ({"yieldToExclusive": True}, "both besideExclusive and yieldToExclusive"),
+                               ({"background": True}, "both background and besideExclusive"),
+                               ({"admit": NIGHTLY["admit"]}, "needs the admission glaeda-nightly-only-admit"),
+                               ({"admit": [*nightly_admit, "--trusted-ref", "refs/heads/main"]},
+                                "needs the admission glaeda-nightly-only-admit"),
+                               ({"trustedRef": "refs/heads/main", "trustedRepo": "manaflow-ai/cmux"},
+                                "needs the admission glaeda-nightly-only-admit")):
+            with self.subTest(change):
+                _, why = fleet_labels.dedicated_runners(dedicated_manifest({**beside, **change}), "mini-std")
+                self.assertIn(needle, why or "")
+        fake_pw = mock.Mock(pw_dir=os.fspath(self.home))
+        with mock.patch.object(cr.pwd, "getpwuid", return_value=fake_pw):
+            for entry in (beside, light):
+                receipt = self.invoke("--apply", "--manifest", self.manifest(entry), "--member", "mini-std",
+                                      "--dedicated", entry["name"])
+                self.assertTrue(receipt["ready"], receipt["blocking"])
+        started = (self.home / "actions-runner-glaeda-nightly-next" / cr.HOOK_DIR / "job-started.sh").read_text()
+        self.assertIn(" --beside-exclusive", started)
+        self.assertNotIn("--yield-to-exclusive", started)
+        self.assertTrue(hook.beside_exclusive(self.home / "actions-runner-glaeda-nightly-next"))
+        self.assertIn(" --yield-to-exclusive",
+                      (self.home / "actions-runner-glaeda-light-1" / cr.HOOK_DIR / "job-started.sh").read_text())
+        self.assertFalse(hook.beside_exclusive(self.home / "actions-runner-glaeda-light-1"))
+        agents = self.home / "Library/LaunchAgents"
+        nightly = plistlib.loads((agents / "com.teamleaderleo.glaeda.cmux-runner.dedicated.nightly-next.plist")
+                                 .read_bytes())
+        self.assertEqual(nightly["ProcessType"], "Interactive")
+        self.assertNotIn(cr.TASKPOLICY, nightly["ProgramArguments"])
+        self.assertNotIn("Nice", nightly)
+        background = plistlib.loads((agents / "com.teamleaderleo.glaeda.cmux-runner.dedicated.light-1.plist")
+                                    .read_bytes())
+        self.assertEqual(background["ProgramArguments"][:2], [cr.TASKPOLICY, "-b"])
+        self.assertTrue(background["ProgramArguments"][2].endswith("listen.sh"))
+        self.assertEqual((background["ProcessType"], background["LowPriorityIO"], background["Nice"]),
+                         ("Background", True, cr.LIGHT_NICE))
+
     def test_an_entry_floor_is_the_runner_floor_and_the_admission_sees_it(self) -> None:
         """A builder that needs more free disk than the member's floor declares minFreeGib: the dedicated runner's
         --min-free-gib is that, so its listener gate holds it off under the builder's floor (the job goes to the
@@ -14921,6 +14995,27 @@ class DedicatedHookTest(unittest.TestCase):
                                "--dedicated-admit", os.fspath(admit), repo="manaflow-ai/cmux")
         self.assertEqual(result.returncode, 1)
         self.assertFalse(marker.exists())
+
+    def test_a_runner_beside_the_exclusive_class_starts_while_a_signing_job_wants_the_mini(self) -> None:
+        """BESIDE_EXCLUSIVE: the nightly's own runner never yields to its signing job, even with a stray
+        --yield-to-exclusive beside the flag."""
+        capacity = self.dir / "capacity"
+        capacity.mkdir()
+        path = event(self.dir, "push", {"repository": CMUX, "ref": "refs/heads/nightly-next"})
+        admit = make_executable(self.dir / "admit.sh", "#!/bin/sh\nexit 0\n")
+        base = ("job-started", "push", path, "--allowed-repo", "manaflow-ai/cmux", "--no-disk",
+                "--dedicated-admit", os.fspath(admit), "--capacity-dir", os.fspath(capacity),
+                "--exclusive-yield-wait", "1")
+        marker = capacity / f"{hook.ADMIT_WANT}{os.getpid()}"
+        hook.write_want(marker, time.time(), ["units"], hook.TIER_NIGHTLY, klass=hook.EXCLUSIVE_CLASS)
+        self.assertIn("waits for this mini", hook.exclusive_claim(capacity))
+        for flags in (("--beside-exclusive",), ("--beside-exclusive", "--yield-to-exclusive")):
+            with self.subTest(flags):
+                result = self.run_hook(*base, *flags, repo="manaflow-ai/cmux")
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertNotIn("starts nothing beside it", result.stdout)
+        result = self.run_hook(*base, "--yield-to-exclusive", repo="manaflow-ai/cmux")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
 
     def test_a_yielding_dedicated_runner_waits_while_a_signing_job_wants_or_holds_the_mini(self) -> None:
         # Leo, 2026-11-04: "reserve cmux15". Its nightly-only builders hold nothing in the capacity ledger, so with

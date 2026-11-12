@@ -737,7 +737,9 @@ def hook_wrappers(ctx: Context) -> dict[str, bytes]:
     dedicated = dedicated_of(ctx)
     if dedicated:  # glaeda's checks, then the builder's own admission (dedicated-admit.sh below)
         scope += f" --dedicated-admit {shlex.quote(os.fspath(ctx.hook_dir / DEDICATED_ADMIT))}"
-        if dedicated.get("yieldToExclusive"):  # the hook's YIELD_TO_EXCLUSIVE
+        if dedicated.get("besideExclusive"):  # the hook's BESIDE_EXCLUSIVE: never yields, never drained
+            scope += " --beside-exclusive"
+        elif dedicated.get("yieldToExclusive"):  # the hook's YIELD_TO_EXCLUSIVE
             scope += " --yield-to-exclusive"
     trusted_entry = dedicated if (dedicated or {}).get("trustedRef") else None
     if trusted_entry:
@@ -920,6 +922,16 @@ def hook_wrappers(ctx: Context) -> dict[str, bytes]:
     return wrappers
 
 
+# LIGHT_QOS (Leo, 2026-11-12: light jobs on the nightly Mac are fine, but "THE WHOLE POINT IS \"WHEN IT'S IDLE\""):
+# a runner.dedicated entry with background runs its LaunchAgent's program under `taskpolicy -b` (darwin background:
+# lowest CPU priority, on Apple silicon the efficiency cores, and throttled disk and network IO), and launchd adds
+# ProcessType Background, LowPriorityIO and Nice. Every job process is a descendant of the listener and inherits it,
+# so a light job runs while the Mac is idle and gives the CPU and disk up the moment a nightly job runs. Its
+# concurrency cap is the number of such entries on the member: each runner runs one job at a time.
+TASKPOLICY = "/usr/sbin/taskpolicy"
+LIGHT_NICE = 10
+
+
 def agent_plist(ctx: Context) -> dict[str, Any]:
     # Exactly cmux's workload PATH (cmux_fleet_bootstrap CMUX_WORKLOAD_TOOL_PATH): a tool under the
     # user's home, such as an old ~/.local/bin/zig, must never shadow the one the class accepted.
@@ -930,6 +942,9 @@ def agent_plist(ctx: Context) -> dict[str, Any]:
         program = [os.fspath(SYSTEM_HELPER), os.fspath(ctx.runner_dir)]
     else:
         program = [os.fspath(ctx.hook_dir / "listen.sh")]
+    background = bool((dedicated_of(ctx) or {}).get("background"))
+    if background:  # LIGHT_QOS: every process of the listener and its jobs inherits darwin background
+        program = [TASKPOLICY, "-b", *program]
     plist = {
         "Label": ctx.label,
         # run.sh under the hook's listener gate (listen.sh): an idle runner stops listening while a fleet
@@ -951,6 +966,8 @@ def agent_plist(ctx: Context) -> dict[str, Any]:
         "StandardOutPath": os.fspath(ctx.log_path),
         "StandardErrorPath": os.fspath(ctx.logs / f"glaeda-cmux-runner{ctx.suffix}.err"),
     }
+    if background:
+        plist.update({"ProcessType": "Background", "LowPriorityIO": True, "Nice": LIGHT_NICE})
     if not console_session_runner(ctx):
         plist["SessionCreate"] = True
     if ctx.headless:

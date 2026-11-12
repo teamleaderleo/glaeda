@@ -570,6 +570,9 @@ def pool_scope(manifest: Any, member: str) -> tuple[dict[str, str | None] | None
     return {"org": org, "group": group}, None
 
 
+NIGHTLY_ONLY_ADMIT = "glaeda-nightly-only-admit"  # scripts/glaeda-nightly-only-admit (BESIDE_EXCLUSIVE)
+
+
 def dedicated_runners(manifest: Any, member: str) -> tuple[list[dict[str, Any]], str | None]:
     """([{name, repo, org, group, labels, admit, watch, env, keep, minFreeGib, lanRelay}], None), or ([], why the
     member's list is unusable). Pure. A member with no runner.dedicated has none. minFreeGib is the entry's own disk
@@ -597,7 +600,7 @@ def dedicated_runners(manifest: Any, member: str) -> tuple[list[dict[str, Any]],
             return [], f"{where} is not an object"
         unknown = sorted(set(entry) - {"name", "repo", "org", "group", "labels", "admit", "watch", "env", "keep",
                                        "minFreeGib", "note", "trustedRef", "trustedRepo", "yieldToExclusive",
-                                       "lanRelay"})
+                                       "lanRelay", "besideExclusive", "background"})
         if unknown:
             return [], f"{where} has unknown keys: {', '.join(unknown)}"
         name, repo, org, group = entry.get("name"), entry.get("repo"), entry.get("org"), entry.get("group")
@@ -673,6 +676,29 @@ def dedicated_runners(manifest: Any, member: str) -> tuple[list[dict[str, Any]],
         yields = entry.get("yieldToExclusive", False)
         if not isinstance(yields, bool):
             return [], f"{where}.yieldToExclusive must be boolean"
+        # BESIDE_EXCLUSIVE (the hook's): the nightly's own runner on its signing mini never yields to the nightly's
+        # own signing job, and that job's drain leaves its _work out. Only the NEXT nightly's own code may run beside
+        # a signing key, so the admission must be glaeda-nightly-only-admit's nightly mode (no trusted ref, which
+        # would also admit main's seed).
+        beside = entry.get("besideExclusive", False)
+        if not isinstance(beside, bool):
+            return [], f"{where}.besideExclusive must be boolean"
+        if beside and yields:
+            return [], f"{where} declares both besideExclusive and yieldToExclusive; a runner either yields or not"
+        if beside and (trusted_ref is not None or not isinstance(entry.get("admit"), list)
+                       or not any(isinstance(w, str) and w.endswith("/" + NIGHTLY_ONLY_ADMIT)
+                                  for w in entry["admit"])
+                       or "--trusted-ref" in entry["admit"]):
+            return [], (f"{where}.besideExclusive needs the admission {NIGHTLY_ONLY_ADMIT} without --trusted-ref and "
+                        "no trustedRef: only the nightly's own jobs run beside its signing job")
+        # LIGHT_QOS: a light (non-nightly) runner on a nightly mini runs its listener, and so every job process, at
+        # background QoS (taskpolicy -b, launchd ProcessType Background, LowPriorityIO, Nice): it gives up CPU and IO
+        # the moment the nightly runs. A nightly runner is never background.
+        background = entry.get("background", False)
+        if not isinstance(background, bool):
+            return [], f"{where}.background must be boolean"
+        if background and beside:
+            return [], f"{where} declares both background and besideExclusive; a nightly runner is never background"
         relay, why = lan_relay(entry.get("lanRelay"), where, trusted_ref is not None,
                                runner.get("dedicatedOnly") is True)
         if why:
@@ -681,7 +707,7 @@ def dedicated_runners(manifest: Any, member: str) -> tuple[list[dict[str, Any]],
                     "admit": commands["admit"], "watch": commands.get("watch"), "env": dict(env),
                     "keep": list(keep), "minFreeGib": None if floor is None else float(floor),
                     "trustedRef": trusted_ref, "trustedRepo": trusted_repo, "yieldToExclusive": yields,
-                    "lanRelay": relay})
+                    "lanRelay": relay, "besideExclusive": beside, "background": background})
     # LAN_RELAY: every runner of a member runs as the one macOS user, so any of them could open a relay's socket. A
     # relay is allowed only when every dedicated entry beside it is trusted too (dedicatedOnly leaves no pool instance).
     relays, untrusted = [d["name"] for d in out if d["lanRelay"]], [d["name"] for d in out if d["trustedRef"] is None]
