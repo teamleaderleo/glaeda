@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""glaeda-idle-warm: while an owned cmux mini is idle, build NEXT's tip (BRANCH, feat-cmux-next) into a root whose kept build is far.
+"""glaeda-idle-warm: while an owned cmux mini is idle, build NEXT's tip (feat-cmux-next) into a root whose kept build is far.
 
     glaeda-idle-warm              plan: would this mini warm now, which root, and why not
     glaeda-idle-warm --apply      warm (the 1-minute LaunchAgent from glaeda-mini-setup)
