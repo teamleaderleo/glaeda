@@ -12387,6 +12387,7 @@ class SpendAlarmTest(Base):
         gg.write_json(gg.cache_dir() / gg.file_name(key), {"key": key, "fetchedAt": NOW - 700, "dataAt": NOW - 700,
                                                            "data": gg.parse_pr(pr_node(5)), "error": None})
         gg.register(key, waited=True)
+        self.daemon.waited_since = {key: NOW - 700}  # the wait has been blocked on this data as long as it is old
         self.gh.prs[("o", "r", 5)] = pr_node(5)
         with mock.patch.object(gg, "parse_pr", side_effect=AttributeError("bug")):
             self.daemon.tick(NOW)
@@ -12456,6 +12457,7 @@ class SpendAlarmTest(Base):
         gg.write_json(gg.cache_dir() / gg.file_name(key), {"key": key, "fetchedAt": NOW - 2509, "dataAt": NOW - 2509,
                                                            "data": gg.parse_pr(pr_node(5)), "error": None})
         gg.register(key, waited=True)
+        self.daemon.waited_since = {key: NOW - 2509}  # the wait has been blocked on this data as long as it is old
         reserve = self.daemon.policy["floors"]["graphql"][1]
         self.daemon.budget["graphql"] = {"limit": 5000, "remaining": reserve - 10, "reset": NOW + 1200}
         self.daemon.budget["rest"] = {"limit": 5000, "remaining": 10, "reset": NOW + 1200}
@@ -14464,6 +14466,7 @@ class StaleDataTest(Base):
         self.gh.prs[("o", "r", 5)] = pr_node(5, rollup="SUCCESS", checks=[check_run("a")])
         self.put(key, gg.parse_pr(pr_node(5)), at=NOW - 700)
         gg.register(key, waited=True)
+        self.daemon.waited_since = {key: NOW - 700}  # the wait has been blocked on this data as long as it is old
         with mock.patch.object(gg, "parse_pr", side_effect=AttributeError("bug")):
             status = self.daemon.tick(NOW)
         self.assertGreaterEqual(status["staleWaited"]["pr"], 700)
