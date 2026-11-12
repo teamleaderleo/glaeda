@@ -6998,7 +6998,7 @@ class Gate:
         observations never arm JOB_END_FREEZE.
 
         One reading does hold an idle pool runner's listener (DISK_SHORT_HOLD): free disk under one job's measured
-        peak (job_disk_gib), after cleanup was requested. A job taken there cannot fit: job-started admits it with a
+        peak (job_disk_gib), whatever the floor, after cleanup was requested. A job taken there cannot fit: job-started admits it with a
         warning (a disk floor never refuses), and it then fails mid-build (cmux run 43119216549, 2026-11-11: admitted
         at 19.8 GiB free, its fast tier's link stopped at ld errno=28 after 13 minutes). Held, the listener takes
         nothing and GitHub hands the job to a runner with room, or the rescue moves it once it waits past its budget:
@@ -7030,17 +7030,23 @@ class Gate:
         path = os.path.dirname(self.host_lock)
         self.reap_eviction(path, floor)
         why = disk_refusal(path, floor)
+        # The peak is read on its own, not only under the floor: a floor under one job's peak (--min-free-gib 30 with
+        # GLAEDA_RUNNER_JOB_DISK_GIB=40, at 35 GiB free) must still hold the listener.
+        short = None
+        if not scope.dedicated and not nightly_own and not scope.gateway and scope.min_free_gib > 0:
+            short = disk_refusal(path, job_disk_gib())
+        if short:
+            target = max(floor, job_disk_gib())
+            self.evict_in_background(path, target)
+            if reserve:
+                self.evict_idle_in_background(path, target + GATE_DISK_RESUME_GIB)
+            return (f"disk: {short} for one job's measured peak, cleanup requested; holding the listener so the "
+                    "job goes to a runner with room (DISK_SHORT_HOLD)")
         if why:
             self.evict_in_background(path, floor)
             if scope.dedicated or reserve:
                 self.evict_idle_in_background(path, floor + GATE_DISK_RESUME_GIB)
             now = time.monotonic()
-            short = None
-            if not scope.dedicated and not nightly_own and not scope.gateway and scope.min_free_gib > 0:
-                short = disk_refusal(path, job_disk_gib())
-            if short:
-                return (f"disk: {short} for one job's measured peak, cleanup requested; holding the listener so the "
-                        "job goes to a runner with room (DISK_SHORT_HOLD)")
             if self.disk_warned_at is None or now - self.disk_warned_at >= GATE_DISK_NOTE_S:
                 gate_log(f"disk warning: {why}{reserve}; keeping the listener online and requesting cleanup")
                 self.disk_warned_at = now

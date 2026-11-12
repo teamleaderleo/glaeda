@@ -9403,19 +9403,33 @@ class GateTest(unittest.TestCase):
         self.assertIsNone(gate.ineligible())
 
     def test_every_runner_warns_while_free_disk_is_under_its_floor(self) -> None:
+        """Under the housekeeping floor a pool runner only warns while one job's measured peak still fits; under the
+        peak (DISK_SHORT_HOLD) it is held. The reading is pinned: the host's own free disk must not decide it."""
         script = self.runner / hook.RUNNER_HOOK_SCRIPT
         script.parent.mkdir(parents=True, exist_ok=True)
         gate = hook.Gate(self.runner, os.fspath(self.lock), os.fspath(self.tmp / "none.json"), self.state)
-        script.write_text("exec python3 /hook job-started --allowed-owner manaflow-ai --capacity-units 4 --instance 0\n")
-        self.assertIsNone(gate.claimed(), "no --min-free-gib: no floor")
-        script.write_text("exec python3 /hook job-started --allowed-owner manaflow-ai --min-free-gib 999999999.5 "
-                          "--trusted-ref refs/heads/main --trusted-repo manaflow-ai/cmux\n")
-        self.assertEqual(hook.runner_scope(self.runner).min_free_gib, 999999999.5)
-        why = gate.claimed()
-        self.assertIsNone(why, "a housekeeping target never holds the listener")
-        self.assertIsNone(gate.confirmed(), "the final stop check is advisory too")
-        script.write_text("exec python3 /hook job-started --allowed-owner manaflow-ai --min-free-gib 1\n")
-        self.assertIsNone(gate.claimed(), "read on every poll: a re-apply that lowers the floor counts at once")
+        free = {"gib": 25.0}
+        usage = lambda _path: mock.Mock(free=int(free["gib"] * 1024**3))  # noqa: E731
+        with mock.patch.object(hook.shutil, "disk_usage", side_effect=usage), \
+                mock.patch.object(gate, "evict_in_background"), \
+                mock.patch.dict(os.environ, {hook.DISK_JOB_PEAK_ENV: "20"}):
+            script.write_text("exec python3 /hook job-started --allowed-owner manaflow-ai --capacity-units 4 "
+                              "--instance 0\n")
+            self.assertIsNone(gate.claimed(), "no --min-free-gib: no floor")
+            free["gib"] = 5.0
+            self.assertIsNone(gate.claimed(), "no floor: never held, even under one job's peak")
+            free["gib"] = 25.0
+            script.write_text("exec python3 /hook job-started --allowed-owner manaflow-ai --min-free-gib 999999999.5 "
+                              "--trusted-ref refs/heads/main --trusted-repo manaflow-ai/cmux\n")
+            self.assertEqual(hook.runner_scope(self.runner).min_free_gib, 999999999.5)
+            why = gate.claimed()
+            self.assertIsNone(why, "over one job's peak, a housekeeping target never holds the listener")
+            self.assertIsNone(gate.confirmed(), "the final stop check is advisory too")
+            free["gib"] = 19.5
+            self.assertIn("DISK_SHORT_HOLD", gate.claimed() or "", "under one job's peak the idle pool runner is held")
+            free["gib"] = 25.0
+            script.write_text("exec python3 /hook job-started --allowed-owner manaflow-ai --min-free-gib 1\n")
+            self.assertIsNone(gate.claimed(), "read on every poll: a re-apply that lowers the floor counts at once")
         self.assertEqual(hook.min_free_gib(" --min-free-gib 100 --min-free-gib 1e+03 "), 1000.0, "the last one wins")
         self.assertEqual(hook.min_free_gib(" --min-free-gib=150\n"), 150.0)
         self.assertEqual(hook.min_free_gib(" --min-free-gib x1 "), 0.0)
@@ -9599,6 +9613,26 @@ class GateTest(unittest.TestCase):
             free["gib"] = 25.0
             self.assertIsNone(gate.low_disk(), "between one job's peak and the floor it only warns")
             self.assertIsNone(gate.claimed())
+
+    def test_a_pool_runner_over_its_floor_but_under_one_jobs_peak_is_held(self) -> None:
+        """The peak is checked on its own, not only under the floor: --min-free-gib 30 with a 40 GiB peak at 35 GiB
+        free holds the idle listener and requests cleanup to the peak."""
+        write_hook(self.runner, "exec python3 /hook job-started --min-free-gib 30 --capacity-units 14 --fast-runner\n")
+        gate = hook.Gate(self.runner, os.fspath(self.lock), os.fspath(self.tmp / "none.json"), self.state)
+        free = {"gib": 35.0}
+        usage = lambda _path: mock.Mock(free=int(free["gib"] * 1024**3))  # noqa: E731
+        with mock.patch.object(hook.shutil, "disk_usage", side_effect=usage), \
+                mock.patch.object(gate, "evict_in_background") as cleanup, \
+                mock.patch.dict(os.environ, {hook.DISK_JOB_PEAK_ENV: "40"}):
+            why = gate.low_disk()
+            self.assertIn("DISK_SHORT_HOLD", why or "")
+            self.assertIn("35.0 GiB free, 40 GiB required", why or "")
+            self.assertEqual(cleanup.call_args.args[1], 40.0, "cleanup aims at the peak, over the floor")
+            self.assertIn("DISK_SHORT_HOLD", gate.claimed() or "")
+            free["gib"] = 41.0
+            cleanup.reset_mock()
+            self.assertIsNone(gate.low_disk(), "over both the peak and the floor: listening, no cleanup")
+            cleanup.assert_not_called()
 
     def test_a_disk_short_runner_never_stops_or_freezes_its_running_job(self) -> None:
         write_hook(self.runner, "exec python3 /hook job-started --min-free-gib 30 --capacity-units 5\n")
