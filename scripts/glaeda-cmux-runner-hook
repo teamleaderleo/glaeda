@@ -5561,6 +5561,7 @@ class RunnerScope(NamedTuple):
     gateway: bool = False
     trusted_signing: bool = False
     yields: bool = False  # --yield-to-exclusive (YIELD_TO_EXCLUSIVE): its gate stops listening for a signing job too
+    trusted_nightly: bool = False  # --trusted-next-nightly: NEXT's build-nightly-app route (NIGHTLY_ALONE exempts it)
 
 
 def reserve_token(scope: RunnerScope | None) -> str | None:
@@ -5769,14 +5770,16 @@ def exclusive_claim(capacity_dir: Path) -> str | None:
 # The nightly's own runners never wait for it: a dedicated runner, the nightly slot and the trusted signing runner,
 # and a nightly-tier job on any runner. A job already running when the builder starts finishes; nothing preempts it.
 NIGHTLY_ALONE_WAIT_S = 900.0
+NIGHTLY_ALONE_READ_S = 10.0  # how long a gate keeps its reading (Gate.nightly_alone): a ps per runner per this
 
 
 def nightly_running(home: Path, skip: Path | None = None, commands: list[str] | None = None) -> str | None:
-    """Why no other job starts on this Mac now (NIGHTLY_ALONE): a dedicated builder under home other than skip has a
-    Runner.Worker, or None. commands is every process's command line (read afresh when None); a failed read raises."""
+    """Why no other job starts on this Mac now (NIGHTLY_ALONE): a dedicated builder (or a --trusted-next-nightly runner,
+    NEXT's app build route) under home other than skip has a Runner.Worker, or None. commands is every process's
+    command line (read afresh when None); a failed read raises."""
     builders = [runner for runner in sorted(home.glob("actions-runner-glaeda*"))
                 if runner.is_dir() and not (skip is not None and os.path.realpath(runner) == os.path.realpath(skip))
-                and runner_scope(runner).dedicated]
+                and (runner_scope(runner).dedicated or runner_scope(runner).trusted_nightly)]
     if not builders:
         return None
     if commands is None:
@@ -5788,14 +5791,14 @@ def nightly_running(home: Path, skip: Path | None = None, commands: list[str] | 
     return None
 
 
-def yield_to_nightly(home: Path, owner: Any, cap: float = NIGHTLY_ALONE_WAIT_S) -> str:
+def yield_to_nightly(home: Path, owner: Any, cap: float = NIGHTLY_ALONE_WAIT_S, skip: Path | None = None) -> str:
     """job-started's NIGHTLY_ALONE backstop: wait while a dedicated builder here has a job, cap seconds at most.
     Returns "" when none ran, ABANDONED when the job is cancelled meanwhile, else a note for the admission log. A
     process table that cannot be read waits for nothing."""
     start, shown = time.monotonic(), ""
     while True:
         try:
-            why = nightly_running(home)
+            why = nightly_running(home, skip)
         except Exception:  # noqa: BLE001
             return ""
         waited = time.monotonic() - start
@@ -5861,7 +5864,8 @@ def runner_scope(runner_dir: Path) -> RunnerScope:
                        gui, runner_floor_gib(min_free_gib(text), gui or session), gui_token,
                        fast, session, fresh, dedicated, nightly, gateway,
                        re.search(r"\s--trusted-next-signing(?:\s|$)", text) is not None,
-                       dedicated and re.search(r"\s--yield-to-exclusive(?:\s|$)", text) is not None)
+                       dedicated and re.search(r"\s--yield-to-exclusive(?:\s|$)", text) is not None,
+                       re.search(r"\s--trusted-next-nightly(?:\s|$)", text) is not None)
 
 
 def eligibility_scope(runner_dir: Path) -> tuple[str, str | None] | None:
@@ -6930,17 +6934,24 @@ class Gate:
         except Exception:  # noqa: BLE001
             return None
 
-    def nightly_alone(self) -> str | None:
+    def nightly_alone(self, fresh: bool = False) -> str | None:
         """NIGHTLY_ALONE at the listener: why this runner takes no job now (a dedicated builder on this Mac has one),
-        or None. The nightly's own runners (a dedicated runner, the nightly slot, the trusted signing runner) are
-        never held. A process table that cannot be read holds nothing: job-started still waits."""
+        or None. The nightly's own runners (a dedicated runner, the nightly slot, the trusted nightly and signing
+        runners) are never held. A process table that cannot be read holds nothing: job-started still waits.
+        A reading is kept NIGHTLY_ALONE_READ_S (one ps per runner per that, not per poll) unless fresh."""
         scope = runner_scope(self.runner_dir)
-        if scope.dedicated or scope.nightly or scope.trusted_signing:
+        if scope.dedicated or scope.nightly or scope.trusted_signing or scope.trusted_nightly:
             return None
+        now = time.monotonic()
+        cached = getattr(self, "_nightly_alone", None)
+        if not fresh and cached is not None and now - cached[0] < NIGHTLY_ALONE_READ_S:
+            return cached[1]
         try:
-            return nightly_running(self.runner_dir.parent, self.runner_dir)
+            why = nightly_running(self.runner_dir.parent, self.runner_dir)
         except Exception:  # noqa: BLE001
-            return None
+            why = None
+        self._nightly_alone = (now, why)
+        return why
 
     def blocking_waiters(self) -> set[int]:
         """The fleet builds waiting for the host that this gate yields to. On the nightly slot, a waiter its jobs may
@@ -7100,6 +7111,8 @@ class Gate:
             return drain
         if runner_scope(self.runner_dir).dedicated:
             return self.claimed()
+        if alone := self.nightly_alone(fresh=True):
+            return alone
         why = host_held(self.host_lock, self.reservation, time.time(), self.state_dir,
                         nightly_slot=runner_scope(self.runner_dir).nightly)
         if why is None and self.waiting:
@@ -7839,7 +7852,7 @@ class Gate:
                 self.watching, self.job_waited, self.freeze_at_exit, self.job_request = (), False, False, None
                 ending = self.job_end() if self.job_ending else None
                 if (why := self.draining() or self.low_disk() or self.still_waiting() or self.still_reserved()
-                        or self.exclusive_yield() or self.nightly_alone() or ending):
+                        or self.exclusive_yield() or self.nightly_alone(fresh=True) or ending):
                     self.unclaim()
                     self.stop(why, finished)
                     return None
@@ -10235,14 +10248,18 @@ def main(argv: list[str] | None = None) -> int:
                          "signs" if drain_bound == SIGNING_DRAIN_WAIT_S else
                          "then is refused so its re-run takes Blacksmith"), flush=True)
             if (tier != TIER_NIGHTLY and claim_class != EXCLUSIVE_CLASS and not args.nightly_runner
-                    and not args.trusted_next_signing):
+                    and not args.trusted_next_signing and not args.trusted_next_nightly and not args.dedicated_admit):
                 # NIGHTLY_ALONE's backstop: the gate held this runner off while the nightly builder ran, but a job
                 # can be handed over in the gap between its look and the builder's start
-                alone = yield_to_nightly(Path.home(), owner)
+                alone_started = time.monotonic()
+                own = Path(os.path.abspath(__file__)).parent.parent  # <runner>/glaeda-hooks/<this hook>
+                alone = yield_to_nightly(own.parent, owner, skip=own)
                 if alone == ABANDONED:
                     return abandoned()
                 if alone:
                     print(f"{PREFIX}: {alone}", flush=True)
+                if cap is not None:  # one setup budget: the nightly's wait counts against it too
+                    cap = max(0.0, cap - (time.monotonic() - alone_started))
             if cap is not None and disk_low_waited[0] > 0:
                 cap = max(0.0, cap - disk_low_waited[0])  # one setup budget: the disk turn's wait counts against it
             if tier == TIER_NIGHTLY:
