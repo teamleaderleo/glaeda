@@ -149,6 +149,19 @@ class GateTest(Base):
         with unittest.mock.patch.object(warm.os, "scandir", side_effect=PermissionError("denied")):
             self.assertIn("cannot read the nightly disk waiters (PermissionError)", warm.nightly_reserve_refusal(quiet))
 
+    def test_no_catch_up_beside_the_nightly_builders_job(self) -> None:
+        # NIGHTLY_ALONE: nothing else runs on a Mac while its nightly builder has a job, the catch-up included
+        why = "the nightly builder actions-runner-glaeda-nightly-only-xl-2 runs a job on this Mac"
+        self.assertEqual(warm.nightly_alone_refusal(types.SimpleNamespace(nightly_running=lambda home: why)), why)
+        self.assertEqual(warm.nightly_alone_refusal(types.SimpleNamespace(nightly_running=lambda home: None)), "")
+        self.assertEqual(warm.nightly_alone_refusal(types.SimpleNamespace()), "", "an older hook: nothing to read")
+
+        def broken(home: Path) -> None:
+            raise subprocess.TimeoutExpired("ps", 30)
+        self.assertIn("cannot read whether the nightly builder runs",
+                      warm.nightly_alone_refusal(types.SimpleNamespace(nightly_running=broken)))
+        self.assertEqual(warm.nightly_alone_refusal(hook), "", "no dedicated builder here")
+
     def test_no_dedicated_builder_or_an_older_hook_keeps_no_reserve(self) -> None:
         warm.free_bytes = lambda path: 1024 ** 3
         self.runner("actions-runner-glaeda", "--min-free-gib 30 --capacity-units 4")

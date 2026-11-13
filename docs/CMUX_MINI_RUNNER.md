@@ -1223,6 +1223,26 @@ busy one as its job ends (`JOB_END_FREEZE`), and starts it again once the claim 
 to a runner that can start it, so a member whose dedicated runners all yield needs a second member with the same
 labels.
 
+### Nothing else beside the nightly (`NIGHTLY_ALONE`)
+
+Leo, 2026-11-12: "Nothing else on it: no light jobs on that machine during a nightly", and "THE WHOLE POINT IS
+'WHEN IT'S IDLE'". A dedicated builder (every runner.dedicated entry: the nightly-only and trusted nightly runners)
+holds nothing in the capacity ledger, so the pool runners beside it never saw it: on ultra2 at 2026-11-13 06:57Z the
+nightly's `build-nightly-app` ran on its nightly-only-xl runner while four pool runners there ran PR jobs and the idle
+catch-up ran too, at load 53. Now, while a dedicated builder (or a `--trusted-next-nightly` runner, NEXT's app build
+route) on a Mac has a `Runner.Worker`:
+
+- every other runner's listener gate there (`Gate.nightly_alone`, read again in `confirmed()` right before a stop)
+  stops an idle listener, and a busy one as its job ends (`JOB_END_FREEZE`), so GitHub hands the job to another Mac;
+  it listens again once the builder's job ends. A gate keeps its reading `NIGHTLY_ALONE_READ_S` (10 s);
+- `job-started` waits `NIGHTLY_ALONE_WAIT_S` (15 min) at most for that job to end, the backstop for a job handed over
+  in the gap, then admits with a note (a busy Mac makes a job slower, never fails it);
+- `glaeda-idle-warm` starts no catch-up or fuzz run, and stops a running catch-up.
+
+The nightly's own runners never wait: a dedicated runner, the nightly slot, the trusted nightly and signing runners,
+and any nightly-tier or signing job. The backstop's wait counts against the job's setup budget, like the disk turn's. A job already running when the builder starts finishes; nothing is preempted. A process
+table the gate cannot read holds nothing there (`job-started` still waits); `glaeda-idle-warm` counts it as busy.
+
 ### A LAN relay for an owner-only runner (`lanRelay`)
 
 macOS Local Network privacy refuses a LAN connection from every process under a runner, Apple's `/usr/bin/ssh` and

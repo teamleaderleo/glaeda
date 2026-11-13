@@ -15254,6 +15254,85 @@ class DedicatedHookTest(unittest.TestCase):
         with mock.patch.object(hook.Gate, "low_disk", return_value="disk: 10 GiB free"):
             self.assertEqual(yielding.claimed(), "disk: 10 GiB free")
 
+    def nightly_mac(self) -> dict[str, Path]:
+        """A Mac with a dedicated nightly builder, two pool runners, a nightly slot and a trusted signing runner."""
+        flags = {"actions-runner-glaeda-nightly-only-xl-2": "--allowed-repo manaflow-ai/cmux --dedicated-admit /x/a.sh",
+                 "actions-runner-glaeda-3": "--allowed-owner manaflow-ai --capacity-units 30 --instance 3",
+                 "actions-runner-glaeda-4": "--allowed-owner manaflow-ai --capacity-units 30 --gateway-runner",
+                 "actions-runner-glaeda-5": "--capacity-units 30 --nightly-runner",
+                 "actions-runner-glaeda": "--capacity-units 30 --trusted-next-signing",
+                 "actions-runner-glaeda-6": "--capacity-units 30 --trusted-next-nightly"}
+        runners = {}
+        for name, flag in flags.items():
+            runner = self.dir / name
+            (runner / cr.HOOK_DIR).mkdir(parents=True)
+            (runner / cr.HOOK_DIR / "job-started.sh").write_text(f"#!/bin/bash\nexec python3 hook job-started {flag}\n")
+            runners[name] = runner
+        return runners
+
+    def test_nothing_else_starts_on_a_mac_while_its_nightly_builder_runs_a_job(self) -> None:
+        # Leo, 2026-11-12: "Nothing else on it: no light jobs on that machine during a nightly." ultra2, 2026-11-13
+        # 06:57Z: build-nightly-app ran on its nightly-only-xl runner beside four pool runners' PR jobs, load 53.
+        runners = self.nightly_mac()
+        builder, pool = runners["actions-runner-glaeda-nightly-only-xl-2"], runners["actions-runner-glaeda-3"]
+        self.assertTrue(hook.runner_scope(builder).dedicated)
+        worker = f"{builder}/bin/Runner.Worker spawnclient 160 163"
+        pool_worker = f"{pool}/bin.2.330.0/Runner.Worker spawnclient 159 162"
+        self.assertIsNone(hook.nightly_running(self.dir, commands=["/bin/zsh", pool_worker]), "a PR job is no nightly")
+        self.assertIn("nightly-only-xl-2 runs a job", hook.nightly_running(self.dir, commands=[worker]))
+        self.assertIsNone(hook.nightly_running(self.dir, skip=builder, commands=[worker]), "the builder itself")
+        self.assertIsNone(hook.nightly_running(self.dir / "elsewhere", commands=[worker]), "no builder: no read")
+
+        def gate(runner: Path) -> Any:
+            return hook.Gate(runner, os.fspath(self.dir / "host.lock"), os.fspath(self.dir / "reservation.json"),
+                             self.dir / "state", waiters=False)
+
+        why = "the nightly builder actions-runner-glaeda-nightly-only-xl-2 runs a job on this Mac"
+        with mock.patch.object(hook, "nightly_running", return_value=why) as running:
+            for name in ("actions-runner-glaeda-3", "actions-runner-glaeda-4"):  # a PR runner and a gateway runner
+                self.assertEqual(gate(runners[name]).nightly_alone(), why, name)
+                self.assertEqual(gate(runners[name]).claimed(), why, name)
+                # the fresh reading right before an idle listener's stop holds too (review of #1980: it did not)
+                self.assertEqual(gate(runners[name]).confirmed(), why, name)
+            self.assertEqual(running.call_args.args, (self.dir, runners["actions-runner-glaeda-4"]))
+            # the nightly's own runners never wait for it
+            for name in ("actions-runner-glaeda-nightly-only-xl-2", "actions-runner-glaeda-5", "actions-runner-glaeda",
+                         "actions-runner-glaeda-6"):
+                self.assertIsNone(gate(runners[name]).nightly_alone(), name)
+        # NEXT's app build on a --trusted-next-nightly runner counts as the nightly too
+        trusted = f"{runners['actions-runner-glaeda-6']}/bin/Runner.Worker spawnclient 1 2"
+        self.assertIn("glaeda-6 runs a job", hook.nightly_running(self.dir, commands=[trusted]))
+        # one ps per NIGHTLY_ALONE_READ_S, not per poll; a fresh reading always looks
+        held = gate(pool)
+        with mock.patch.object(hook, "nightly_running", side_effect=[why, None, None]) as running:
+            self.assertEqual((held.nightly_alone(), held.nightly_alone()), (why, why))
+            self.assertIsNone(held.nightly_alone(fresh=True))
+            self.assertEqual(running.call_count, 2)
+        # a process table that cannot be read holds nothing at the listener (job-started still waits)
+        with mock.patch.object(hook, "nightly_running", side_effect=subprocess.TimeoutExpired("ps", 30)):
+            self.assertIsNone(gate(pool).nightly_alone())
+
+    def test_job_started_waits_for_the_nightly_builders_job_then_starts(self) -> None:
+        why = "the nightly builder actions-runner-glaeda-nightly-only-xl-2 runs a job on this Mac"
+        owner = mock.Mock()
+        owner.gone.return_value = False
+        with mock.patch.object(hook.time, "sleep"):
+            with mock.patch.object(hook, "nightly_running", return_value=None):
+                self.assertEqual(hook.yield_to_nightly(self.dir, owner), "", "nothing to wait for")
+            with mock.patch.object(hook, "nightly_running", side_effect=[why, why, None]):
+                self.assertIn("for the nightly builder's job to end", hook.yield_to_nightly(self.dir, owner))
+            with mock.patch.object(hook, "nightly_running", return_value=why):
+                # bounded: a busy Mac makes a job slower, never fails it
+                self.assertIn("admitted anyway", hook.yield_to_nightly(self.dir, owner, cap=0.0))
+                owner.gone.return_value = True
+                self.assertEqual(hook.yield_to_nightly(self.dir, owner), hook.ABANDONED)
+            with mock.patch.object(hook, "nightly_running", side_effect=OSError("ps")):
+                self.assertEqual(hook.yield_to_nightly(self.dir, owner), "")
+            owner.gone.return_value = False
+            with mock.patch.object(hook, "nightly_running", return_value=None) as running:
+                hook.yield_to_nightly(self.dir, owner, skip=self.dir / "r")
+                self.assertEqual(running.call_args.args, (self.dir, self.dir / "r"), "never waits on its own runner")
+
 
 class ManifestLabelsTest(unittest.TestCase):
     def test_side_labels_widen_to_narrower_classes_only(self) -> None:
