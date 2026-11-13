@@ -5786,6 +5786,19 @@ time.sleep(60)
                               ("cmux-next-base-autofix.yml", "action-exports")):
             self.assertEqual(hook.job_class(job, home, home, workflow), ("isolated", False), (workflow, job))
             self.assertEqual(hook.job_class(job, home, home, "other.yml"), ("compile", True), job)
+        # PORTABLE_JOBS: cmux's portable placement (scripts/ci/portable_job_placement.py) sends these Python and bash
+        # jobs to fleet Linux, an idle mini or Ubuntu, so none can need a Mac root or kept DerivedData. As unknown jobs
+        # they were compiles: cmux run 43462746656's checks waited 8 min for root 1 held by a tooling-tests
+        for workflow, job, klass in (("cmux-next.yml", "checks", "isolated"), ("cmux-next.yml", "path_route", "light"),
+                                     ("cmux-next-guards.yml", "tooling-tests", "isolated"),
+                                     ("cmux-next-guards.yml", "guard-status", "light"),
+                                     ("ci-guards.yml", "guard-status", "light"), ("ci.yml", "changes", "light")):
+            with self.subTest(workflow=workflow, job=job):
+                self.assertEqual(hook.job_class(job, home, home, workflow), (klass, False))
+                self.assertEqual(hook.CLASS_COST[klass][1], (), "no persistent-dd, no root")
+                self.assertEqual(hook.job_class(job, home, home, "other.yml"), ("compile", True))
+        # checks keeps the 5 cores it was costed at as a compile: its pool runs that many at once (CMUX_CI_CPU_BUDGET)
+        self.assertEqual(hook.job_units("isolated", "checks", home, home, "cmux-next.yml"), 5)
         # cmux-next media's tour holds its own tag in the workflow and captures only its app's window: isolated,
         # as many per mini as units allow
         self.assertEqual(hook.job_class("tour", home, home, "cmux-next-media.yml"), ("isolated", False))

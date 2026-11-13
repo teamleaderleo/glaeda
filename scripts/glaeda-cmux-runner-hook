@@ -477,6 +477,20 @@ WORKFLOW_JOB_CLASSES = {("cmux-tui.yml", "lint"): "isolated", ("cmux-tui.yml", "
                         ("cmux-next-pr-autofix.yml", "action-exports"): "isolated",
                         ("cmux-next-base-autofix.yml", "action-exports"): "isolated",
                         ("cmux-next-media.yml", "tour"): "isolated",
+                        # PORTABLE_JOBS: cmux's portable placement (scripts/ci/portable_job_placement.py, each
+                        # workflow's JOBS list) sends these to fleet Linux, an idle mini or Ubuntu, so none touches a
+                        # canonical root, kept DerivedData, keychain or the console: Python and bash in the workspace
+                        # and $RUNNER_TEMP. As unknown jobs they were compiles (5 units, persistent-dd and root 1), so
+                        # on one mini they queued behind each other for a root none uses: on 2026-11-13 cmux run
+                        # 43462746656's checks waited 8 min for root 1 held by a tooling-tests, and runs 43454315926's
+                        # checks waited behind a path_route and a guard-status. checks and tooling-tests run test
+                        # suites (isolated; checks keeps its 5 cores in JOB_CORES), the rest classify paths or
+                        # summarize needs in seconds (light). guard-status is ci-guards.yml's, also as called from
+                        # cmux-next-guards.yml (GITHUB_WORKFLOW_REF names the caller).
+                        ("cmux-next.yml", "checks"): "isolated", ("cmux-next.yml", "path_route"): "light",
+                        ("cmux-next-guards.yml", "tooling-tests"): "isolated",
+                        ("cmux-next-guards.yml", "guard-status"): "light", ("ci-guards.yml", "guard-status"): "light",
+                        ("ci.yml", "changes"): "light",
                         # DEV_DAILY_WORKFLOW's Mac jobs work only in $RUNNER_TEMP: verify unpacks the signed app
                         # with ditto and runs codesign --verify and a Python check; tip-dmg-build runs ditto and
                         # hdiutil. No compile, canonical root, kept DerivedData or console session. As unknown jobs
@@ -640,6 +654,9 @@ JOB_CORES: dict[tuple[str, ...], int] = {
     ("cmux-next-pr-autofix.yml", "action-exports"): 6,  # isolated: 373, 4.74/5.43/5.95
     ("cmux-next-base-autofix.yml", "action-exports"): 6,  # isolated: 254, 3.74/5.14/5.81
     ("cmux-next.yml", "cmux-scheme-compile"): 3,  # isolated: 619, 2.28/2.60/2.93
+    # PORTABLE_JOBS' checks: the 5 it held as an unknown compile, not the class's 4. cmux sizes its check pool to its
+    # share (CMUX_CI_CPU_BUDGET), so these are the cores it runs on; no telemetry yet under its own class.
+    ("cmux-next.yml", "checks"): 5,
     # The Release compiles, from cmuxterm-hq build-fleet/data jobs.csv, successful jobs 2026-10-01 to 10-26 (n,
     # p50/p75/p90 cores): Leo, 2026-10-26: "COMPILES SHOULDNT NEED A PURE EMPTY FUCKING MACHINE JUST MEASURE IT
     # WE'VE ALREADY MEASURED IT". Both had the isolated class's 4.
