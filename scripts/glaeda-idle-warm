@@ -296,6 +296,9 @@ def idle_refusal(hook: Any, now: float, state: Path) -> str:
     why = nightly_reserve_refusal(hook)
     if why:
         return why
+    why = nightly_alone_refusal(hook)
+    if why:
+        return why
     host_lock = os.fspath(FLEET_DIR / "host.lock")
     held = hook.host_held(host_lock, os.fspath(FLEET_DIR / "reservation.json"), now)
     if held:
@@ -339,6 +342,18 @@ def nightly_waiter_refusal(hook: Any) -> str:
     except Exception as error:  # noqa: BLE001
         return f"cannot read the nightly disk waiters ({type(error).__name__})"
     return f"a nightly job waits here for free disk ({waiter})" if waiter else ""
+
+
+def nightly_alone_refusal(hook: Any) -> str:
+    """Why a catch-up must not start or keep running: the nightly builder on this Mac runs a job (the hook's
+    NIGHTLY_ALONE: nothing else runs beside the nightly), or ''. A hook without nightly_running predates it: nothing to
+    read. A process table that cannot be read counts as busy, as running() does."""
+    if not hasattr(hook, "nightly_running"):
+        return ""
+    try:
+        return hook.nightly_running(HOME) or ""
+    except Exception as error:  # noqa: BLE001
+        return f"cannot read whether the nightly builder runs a job here ({type(error).__name__})"
 
 
 def nightly_reserve_refusal(hook: Any) -> str:
@@ -707,7 +722,8 @@ def build(checkout: Path, root: int, state: Path, xcode: str, log: Path, stop_be
           nightly_waiter: Any = None) -> dict[str, Any]:
     """Run cmux's owned_catch_up.sh in our process group, its output appended to LOG; its result line. With
     stop_below, the build is killed once free disk drops under it, and with nightly_waiter (a callable: why, or
-    ''), once a nightly job waits for free disk; both are read every BUILD_DISK_WATCH_S."""
+    ''), once a nightly job waits for free disk or the nightly builder here runs a job (NIGHTLY_ALONE); both are
+    read every BUILD_DISK_WATCH_S."""
     global _child
     env = {key: value for key, value in os.environ.items() if not key.startswith(("GITHUB_", "RUNNER_", "CMUX_"))}
     env.update(PATH=PATH, CMUX_CI_XCODE_APP=xcode, CMUX_CATCH_UP_LOG=os.fspath(log))
@@ -1156,7 +1172,8 @@ def fuzz(apply: bool, state: Path, now: float | None = None) -> dict[str, Any]:
         return {**base, "state": "skip", "reason": setup}
     hook, roots_n, trusted = setup
     capacity = FLEET_DIR / "capacity"
-    why = reservation_refusal(hook, now) or console_refusal(hook) or gui_refusal(hook, capacity)
+    why = (reservation_refusal(hook, now) or console_refusal(hook) or gui_refusal(hook, capacity)
+           or nightly_alone_refusal(hook))
     if why:
         return {**base, "state": "skip", "reason": why}
     replay = pending_replay(now) if trusted else None
@@ -1214,7 +1231,8 @@ def fuzz(apply: bool, state: Path, now: float | None = None) -> dict[str, Any]:
             return {**base, "state": "skip", "reason": "no fuzzer (scripts/fuzz) for this build"}
         ours = os.fspath(fuzz_dir() / "builds") + "/"
         # A job that took the gui token before our holder was written never saw it: look again now.
-        why = reservation_refusal(hook, time.time()) or gui_refusal(hook, capacity, ours)
+        why = (reservation_refusal(hook, time.time()) or gui_refusal(hook, capacity, ours)
+               or nightly_alone_refusal(hook))
         if why:
             return {**base, "state": "skip", "reason": why}
         env = {key: value for key, value in os.environ.items() if not key.startswith(("GITHUB_", "RUNNER_", "CMUX_"))}
@@ -1426,7 +1444,8 @@ def run(apply: bool, state: Path, now: float | None = None) -> dict[str, Any]:
             save_memory(memory_path, memory)
             result = build(work / "cmux", root, state, scope["xcode"], log,
                            stop_below=int(builder * 1024 ** 3) if builder > 0 else None,
-                           nightly_waiter=(lambda: nightly_waiter_refusal(hook)) if builder > 0 else None)
+                           nightly_waiter=lambda: ((nightly_waiter_refusal(hook) if builder > 0 else "")
+                                                   or nightly_alone_refusal(hook)))
             memory.pop("attempt", None)
             trim_logs(logs)
         finally:

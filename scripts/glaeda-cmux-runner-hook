@@ -5754,6 +5754,63 @@ def exclusive_claim(capacity_dir: Path) -> str | None:
     return None
 
 
+# NIGHTLY_ALONE (Leo, 2026-11-12, on light jobs holding up the nightly: "Nothing else on it: no light jobs on that
+# machine during a nightly" and "THE WHOLE POINT IS \"WHEN IT'S IDLE\""): a Mac whose dedicated builder
+# (runner.dedicated: the nightly-only and trusted nightly runners) runs a job runs nothing else meanwhile, and its
+# other runners take work again the moment that job ends. A dedicated builder holds nothing in the capacity ledger
+# (dedicated_admission), so before this the pool runners beside it never saw it: on ultra2, 2026-11-13 06:57Z, the
+# nightly's build-nightly-app ran on its nightly-only-xl runner while four of its pool runners ran PR jobs (a Debug
+# xcodebuild, an optchat-chief cargo build) and the idle catch-up, at load 53.
+#   - the listener gate of every other runner on the Mac (Gate.nightly_alone) stops an idle listener while the
+#     builder has a job, and a busy one as its job ends (JOB_END_FREEZE), so GitHub hands the job to another Mac;
+#   - job-started (the backstop for a job handed over in the gap) waits NIGHTLY_ALONE_WAIT_S at most for the
+#     builder's job to end, then admits with a note: a busy Mac makes a job slower, never fails it;
+#   - glaeda-idle-warm starts no catch-up while it runs and stops a running one (its nightly_waiter watch).
+# The nightly's own runners never wait for it: a dedicated runner, the nightly slot and the trusted signing runner,
+# and a nightly-tier job on any runner. A job already running when the builder starts finishes; nothing preempts it.
+NIGHTLY_ALONE_WAIT_S = 900.0
+
+
+def nightly_running(home: Path, skip: Path | None = None, commands: list[str] | None = None) -> str | None:
+    """Why no other job starts on this Mac now (NIGHTLY_ALONE): a dedicated builder under home other than skip has a
+    Runner.Worker, or None. commands is every process's command line (read afresh when None); a failed read raises."""
+    builders = [runner for runner in sorted(home.glob("actions-runner-glaeda*"))
+                if runner.is_dir() and not (skip is not None and os.path.realpath(runner) == os.path.realpath(skip))
+                and runner_scope(runner).dedicated]
+    if not builders:
+        return None
+    if commands is None:
+        commands = subprocess.run(["/bin/ps", "-axww", "-o", "command="], stdin=subprocess.DEVNULL,
+                                  capture_output=True, text=True, timeout=30, check=True).stdout.splitlines()
+    for runner in builders:
+        if any(runner_worker(runner, command) for command in commands):
+            return f"the nightly builder {runner.name} runs a job on this Mac, so nothing else starts here"
+    return None
+
+
+def yield_to_nightly(home: Path, owner: Any, cap: float = NIGHTLY_ALONE_WAIT_S) -> str:
+    """job-started's NIGHTLY_ALONE backstop: wait while a dedicated builder here has a job, cap seconds at most.
+    Returns "" when none ran, ABANDONED when the job is cancelled meanwhile, else a note for the admission log. A
+    process table that cannot be read waits for nothing."""
+    start, shown = time.monotonic(), ""
+    while True:
+        try:
+            why = nightly_running(home)
+        except Exception:  # noqa: BLE001
+            return ""
+        waited = time.monotonic() - start
+        if why is None:
+            return f"waited {waited:.0f} s for the nightly builder's job to end (NIGHTLY_ALONE)" if shown else ""
+        if owner is not None and owner.gone():
+            return ABANDONED
+        if waited >= cap:
+            return f"{why}; admitted anyway after {waited:.0f} s, its bound (NIGHTLY_ALONE_WAIT_S)"
+        if why != shown:
+            print(f"{PREFIX}: waiting: {why}; this job starts once it ends, {cap:g} s at most", flush=True)
+            shown = why
+        time.sleep(min(ADMIT_POLL_S, max(0.0, cap - waited)))
+
+
 def yield_to_exclusive(capacity_dir: Path, owner: Any, cap: float | None) -> tuple[bool, str]:
     """(True, "") once no signing job wants or holds this mini, (False, why) after cap seconds
     (YIELD_TO_EXCLUSIVE_WAIT_S when None), or (False, ABANDONED) when the job is cancelled meanwhile."""
@@ -6846,6 +6903,8 @@ class Gate:
             # load and heat never hold it off, only what would fail its job here (disk, a missing Rust toolchain)
             # or keep it waiting in job-started (a signing job's claim on a yieldToExclusive runner)
             return self.low_disk() or self.dedicated_toolchain() or self.exclusive_yield()
+        if alone := self.nightly_alone():
+            return alone
         why = host_held(self.host_lock, self.reservation, time.time(), self.state_dir,
                         nightly_slot=runner_scope(self.runner_dir).nightly)
         if why is None and self.waiters and self.waiters_due():
@@ -6868,6 +6927,18 @@ class Gate:
             return None
         try:
             return exclusive_claim(self.capacity_dir)
+        except Exception:  # noqa: BLE001
+            return None
+
+    def nightly_alone(self) -> str | None:
+        """NIGHTLY_ALONE at the listener: why this runner takes no job now (a dedicated builder on this Mac has one),
+        or None. The nightly's own runners (a dedicated runner, the nightly slot, the trusted signing runner) are
+        never held. A process table that cannot be read holds nothing: job-started still waits."""
+        scope = runner_scope(self.runner_dir)
+        if scope.dedicated or scope.nightly or scope.trusted_signing:
+            return None
+        try:
+            return nightly_running(self.runner_dir.parent, self.runner_dir)
         except Exception:  # noqa: BLE001
             return None
 
@@ -7768,7 +7839,7 @@ class Gate:
                 self.watching, self.job_waited, self.freeze_at_exit, self.job_request = (), False, False, None
                 ending = self.job_end() if self.job_ending else None
                 if (why := self.draining() or self.low_disk() or self.still_waiting() or self.still_reserved()
-                        or self.exclusive_yield() or ending):
+                        or self.exclusive_yield() or self.nightly_alone() or ending):
                     self.unclaim()
                     self.stop(why, finished)
                     return None
@@ -7788,7 +7859,7 @@ class Gate:
                     self.waiting, self.waiting_at = self.blocking_waiters(), time.monotonic()
                 # RUNNER_DRAIN stops it at the job's end too, and so does a signing job's claim (exclusive_yield):
                 # a job that ends while the signing job waits for the drain is the one a queued job replaces at once
-                reserved = self.still_reserved() or self.draining() or self.exclusive_yield()
+                reserved = self.still_reserved() or self.draining() or self.exclusive_yield() or self.nightly_alone()
                 self.job_waited = bool(self.waiting) or reserved is not None
                 self.low_disk()  # advisory cleanup only: never watch or freeze a Worker for disk
                 workers = tuple(pid for pid in self.worker_pids() if pid not in self.done) \
@@ -10163,6 +10234,15 @@ def main(argv: list[str] | None = None) -> int:
                       + ("holding every other admission here meanwhile, then is refused so the run's Blacksmith job "
                          "signs" if drain_bound == SIGNING_DRAIN_WAIT_S else
                          "then is refused so its re-run takes Blacksmith"), flush=True)
+            if (tier != TIER_NIGHTLY and claim_class != EXCLUSIVE_CLASS and not args.nightly_runner
+                    and not args.trusted_next_signing):
+                # NIGHTLY_ALONE's backstop: the gate held this runner off while the nightly builder ran, but a job
+                # can be handed over in the gap between its look and the builder's start
+                alone = yield_to_nightly(Path.home(), owner)
+                if alone == ABANDONED:
+                    return abandoned()
+                if alone:
+                    print(f"{PREFIX}: {alone}", flush=True)
             if cap is not None and disk_low_waited[0] > 0:
                 cap = max(0.0, cap - disk_low_waited[0])  # one setup budget: the disk turn's wait counts against it
             if tier == TIER_NIGHTLY:
