@@ -436,6 +436,9 @@ WORKFLOW_JOB_CLASSES = {# the iOS reliability matrix's phone cells: cargo builds
                         # The App Review gate's secret-free walk (cmux#43109; the credentialed reviewer-path stays
                         # on Blacksmith): builds the NEXT app, then walks it in one booted simulator per family.
                         ("ios-review-gate.yml", "walk"): "simulator-step",
+                        # cmux-next-ios kit tests: swift test on the Mac, then xcodebuild test in one booted
+                        # simulator; the picker sends it to the sim-first runner too.
+                        ("cmux-next-ios-kit.yml", "kit-tests"): "simulator-step",
                         ("cmux-tui.yml", "lint"): "isolated", ("cmux-tui.yml", "test"): "isolated",
                         ("cmux-tui.yml", "build"): "isolated", ("cmux-tui.yml", "cdp-browser-smoke"): "isolated",
                         ("cmux-tui.yml", "macos-relay"): "isolated",
