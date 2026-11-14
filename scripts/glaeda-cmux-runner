@@ -458,7 +458,12 @@ def member_labels(manifest: Any, member: str, prior_labels: list[str] | None = N
         return None, f"{LABELS_MODULE} must sit next to this script for --manifest ({type(error).__name__})"
     def ios_sim_ok(apps: list[dict[str, Any]], builds: list[str]) -> bool:
         found = ios_sim_present(apps, builds)
-        return found if found is not None else getattr(rule, "IOS_SIM_LABEL", "glaeda-ios-sim") in (prior_labels or [])
+        # a hiccup keeps what the runner had: glaeda-ios-sim on a pool instance, the sim label on the sim-first runner
+        # (which never carries glaeda-ios-sim), so its member keeps simRunners and its instance
+        sim_prefix = f"glaeda-{getattr(rule, 'SIM_PREFIX', 'sim')}-xcode-"
+        return found if found is not None else any(
+            label == getattr(rule, "IOS_SIM_LABEL", "glaeda-ios-sim") or label.startswith(sim_prefix)
+            for label in prior_labels or [])
     if not hasattr(rule, "macos_label"):  # an older label module beside this script: no OS label, no traceback
         return rule.member_labels(manifest, member, lambda app: xcode_present(app), ios_sim_ok)
     major = macos_major()

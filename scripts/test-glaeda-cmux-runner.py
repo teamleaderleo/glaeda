@@ -3610,6 +3610,35 @@ class HookTest(unittest.TestCase):
 
     # ------------------------------------------------------------ the gateway runners (GATEWAY)
 
+    def test_the_sim_first_runner_admits_only_simulator_jobs(self) -> None:
+        """SIM_FIRST: the sim-first runner listens on a full mini and its job's wait holds the mini's other runners, so
+        only simulator jobs (the simulator and simulator-step classes) are admitted there; a build or compile routed
+        to it is refused at once and rescued. The reliability matrix's phone cells (job `ios`) build the FFI and test
+        in one simulator: a simulator step, never a compile with a canonical root."""
+        self.fleet()
+        test_ios = {"GITHUB_WORKFLOW_REF": "manaflow-ai/cmux/.github/workflows/test-ios.yml@refs/heads/main"}
+        matrix = {"GITHUB_WORKFLOW_REF": "manaflow-ai/cmux/.github/workflows/ios-reliability-matrix.yml@refs/heads/x"}
+        self.assertEqual(hook.job_class("ios", "manaflow-ai/cmux", workflow="ios-reliability-matrix.yml"),
+                         ("simulator-step", False))
+        for job, env in (("ios-simulator-build", test_ios), ("mobile-core-package", test_ios),
+                         ("release-compile", self.FAST_TIER), ("ios", self.FAST_TIER)):
+            with self.subTest(job=job):
+                try:
+                    started = self.job(job, "sr", 14, None, "--sim-runner", env=env)
+                    self.assertEqual(started.returncode, 1, started.stdout + started.stderr)
+                    self.assertIn("refused: the sim-first runner takes only simulator jobs", started.stdout)
+                finally:
+                    self.finish("sr")
+        for job, env, klass in (("ios-simulator", test_ios, "simulator"), ("ios", matrix, "simulator-step")):
+            with self.subTest(job=job):
+                try:
+                    ok = self.job(job, "sr", 14, None, "--sim-runner", env=env)
+                    self.assertEqual(ok.returncode, 0, ok.stdout + ok.stderr)
+                    self.assertIn(f"for {job} ({klass}", ok.stdout)
+                finally:
+                    self.finish("sr")
+        self.assertTrue(hook.probe(self.dir / "capacity" / f"{hook.SIM_TOKEN}.token"), "released with the job")
+
     def test_a_gateway_job_runs_on_a_gateway_token_with_every_unit_taken(self) -> None:
         """2026-10-30 12:43Z: every std mini at 76-100% CPU and units, so no thin cmux-ci client could start. On a
         gateway runner such a client takes one gateway token and no shared unit, so a full mini still admits it;
@@ -10995,7 +11024,7 @@ class GateTest(unittest.TestCase):
             self.assertIn("has waited longer here for units",
                           hook.fair_turn(capacity, {"units"}, time.time(), takes_units=True, new_job=True) or "")
         hook.write_want(marker, time.time() - hook.SIM_FIRST_S - 1, ["units"], "", hook.SIM_LANE)
-        for scope in (side, root):
+        for scope in (side, root, session):  # a lapsed sim waiter holds no session runner either (only session ones do)
             self.assertIsNone(hook.mini_full(capacity, 14, scope, 5), scope)
         with mock.patch("os.getpid", return_value=2 ** 30):
             self.assertIsNone(hook.fair_turn(capacity, {"units"}, time.time(), takes_units=True, new_job=True))
@@ -13761,6 +13790,16 @@ class RunnerTest(unittest.TestCase):
             self.invoke("--apply", "--instance", "6")
         rerun = (self.fast_home / "actions-runner-glaeda-6/glaeda-hooks/job-started.sh").read_text()
         self.assertIn(" --sim-runner ", rerun)
+        # a simctl hiccup keeps the sim-first runner: its own prior label stands in for glaeda-ios-sim, which it lacks
+        manifest = json.loads(json.dumps(MANIFEST))
+        manifest["defaults"]["runner"] = {"classes": {"std": {**base, "simRunners": 1}}}
+        manifest["hosts"]["mini-std"]["roles"].append("ios-simulators")
+        manifest["defaults"]["ios_simulator"] = {"runtimes": ["23F77"]}
+        with mock.patch.object(cr, "ios_sim_present", return_value=None), \
+                mock.patch.object(cr, "xcode_present", return_value=True):
+            kept, _ = cr.member_labels(manifest, "mini-std", ["glaeda-sim-xcode-26.6"])
+            lost, _ = cr.member_labels(manifest, "mini-std", ["glaeda-std-xcode-26.6"])
+        self.assertEqual((kept["simRunners"], lost["simRunners"]), (1, 0))
 
     def test_a_plain_rerun_keeps_the_fast_and_gui_roles(self) -> None:
         """A re-run without --manifest restores the member from the receipt; the fast runner's and the gui

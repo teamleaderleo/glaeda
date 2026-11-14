@@ -429,7 +429,11 @@ SIGNING_JOBS = (("nightly.yml", "promote-nightly-next"), ("nightly.yml", "build-
 # its own (cmux at e46f9264703d).
 TREE_BUILD_CALLERS = ("cmux-tui-artifacts.yml", "cmux-tui-nightly.yml", "cmux-tui-release.yml",
                       "macos-cross-parity.yml")
-WORKFLOW_JOB_CLASSES = {("cmux-tui.yml", "lint"): "isolated", ("cmux-tui.yml", "test"): "isolated",
+WORKFLOW_JOB_CLASSES = {# the iOS reliability matrix's phone cells: cargo builds the FFI xcframework, then xcodebuild tests
+                        # in one booted simulator, so a simulator step's units and the simulator token. As an unknown
+                        # job it was a compile (5 units, persistent-dd and a canonical root, no simulator token).
+                        ("ios-reliability-matrix.yml", "ios"): "simulator-step",
+                        ("cmux-tui.yml", "lint"): "isolated", ("cmux-tui.yml", "test"): "isolated",
                         ("cmux-tui.yml", "build"): "isolated", ("cmux-tui.yml", "cdp-browser-smoke"): "isolated",
                         ("cmux-tui.yml", "macos-relay"): "isolated",
                         # TREE_BUILD: the same reusable `build` (cmux-tui-build-package.yml: cargo into the
@@ -5686,6 +5690,7 @@ SESSION_FIRST_S = float(os.environ.get("GLAEDA_RUNNER_SESSION_FIRST_S") or 20 * 
 SIM_LANE = "sim"
 SIM_FIRST_S = float(os.environ.get("GLAEDA_RUNNER_SIM_FIRST_S") or 20 * 60)
 SIM_TOKEN = "simulator"  # CLASS_COST["simulator"]'s token: one simulator job per mini
+SIM_FIRST_CLASSES = frozenset({"simulator", "simulator-step"})  # the only job classes the sim-first runner admits
 LISTEN_CLAIM_PREFIX = "listen."
 LISTEN_CLAIM_SUFFIX = ".claim"
 LISTEN_CLAIM_HANDOFF_S = 30.0
@@ -5840,16 +5845,15 @@ def runner_scope(runner_dir: Path) -> RunnerScope:
                and not fast and not session and not gui and not fresh and not dedicated)
     gateway = (re.search(r"\s--gateway-runner(?:\s|$)", text) is not None
                and not fast and not session and not gui and not fresh and not dedicated and not nightly)
+    sim = (re.search(r"\s--sim-runner(?:\s|$)", text) is not None
+           and not fast and not session and not gui and not fresh and not dedicated and not nightly and not gateway)
     return RunnerScope(flag("capacity-units", 0), max(1, flag("compile-slots", 1)), roots,
                        instance < roots and not gui and not fast and not session and not dedicated and not nightly
-                       and not gateway,
+                       and not gateway and not sim,
                        gui, runner_floor_gib(min_free_gib(text), gui or session), gui_token,
                        fast, session, fresh, dedicated, nightly, gateway,
                        re.search(r"\s--trusted-next-signing(?:\s|$)", text) is not None,
-                       dedicated and re.search(r"\s--yield-to-exclusive(?:\s|$)", text) is not None,
-                       re.search(r"\s--sim-runner(?:\s|$)", text) is not None
-                       and not fast and not session and not gui and not fresh and not dedicated and not nightly
-                       and not gateway)
+                       dedicated and re.search(r"\s--yield-to-exclusive(?:\s|$)", text) is not None, sim)
 
 
 def eligibility_scope(runner_dir: Path) -> tuple[str, str | None] | None:
@@ -6065,7 +6069,8 @@ def mini_full(capacity_dir: Path | None, total: int, scope: RunnerScope | None =
             {scope.gui_token, "root"} if gui else set())
         now = time.time()
         for waiter in admission_waiters(capacity_dir):
-            if session_first_lapsed(waiter, now) and not (scope is not None and scope.session):
+            if session_first_lapsed(waiter, now) and not (scope is not None and scope.session
+                                                          and waiter["lane"] == SESSION_LANE):
                 continue  # a session job waiting past SESSION_FIRST_S keeps its turn but no longer holds listeners
             shared = compete & set(waiter["wants"])
             if waiter["tier"] == TIER_NIGHTLY:  # no other job takes a unit while a nightly job waits (FEED_FIRST)
@@ -10189,6 +10194,11 @@ def main(argv: list[str] | None = None) -> int:
             # It listens on a full mini (it needs no general units), so any other job would wait here for units
             # with no limit and idle the runner; refused, it is rescued onto its own pool.
             return refused("the fast runner takes only the fast tier")
+        if args.sim_runner and (admit_class or job_class(os.environ.get("GITHUB_JOB", ""), repo, args.home_repo,
+                                                          job_workflow())[0]) not in SIM_FIRST_CLASSES:
+            # SIM_FIRST: it listens on a full mini and its job's wait holds the mini's other runners, so any other job
+            # here would jump the side lanes; refused, it is rescued onto its own pool.
+            return refused("the sim-first runner takes only simulator jobs")
         if owner is None:  # fail closed: with no pinned owner no holder could watch the job
             return refused(f"cannot pin this job's Runner.Worker (pid {args.watch_pid or os.getppid()})")
         admit_start = time.monotonic()
