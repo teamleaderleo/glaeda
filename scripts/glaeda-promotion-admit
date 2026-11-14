@@ -1089,7 +1089,7 @@ class Supervisor:
                    "ready_at": rfc3339(time.time()), "runners": {self.job: request["runner_label"]},
                    "exclusive_claim": self.lease_id, "runner_name": request["runner_name"]}
         if self.policy:
-            receipt.update(workflow=request["workflow"], ref=request["ref"], hook_sha256=self.hook_digest)
+            receipt.update(workflow=request["workflow"], job=self.job, ref=request["ref"], hook_sha256=self.hook_digest)
         write_json(self.lease.receipt_path, receipt)
         self.update(phase="ready", ready_at=receipt["ready_at"])
         self.say("ready: the listener is online and the whole mini is held; receipt written")

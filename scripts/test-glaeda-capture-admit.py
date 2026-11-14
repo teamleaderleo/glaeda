@@ -236,6 +236,10 @@ class CaptureTest(unittest.TestCase):
 
     def test_ready_holds_every_unit_before_listener_then_adopts_exact_job(self):
         receipt = self.ready()
+        self.assertEqual({key: receipt.get(key) for key in
+                          ('lease_id', 'repository', 'run_id', 'run_attempt', 'source_sha', 'workflow', 'job', 'ref')},
+                         {key: self.request()[key] for key in
+                          ('lease_id', 'repository', 'run_id', 'run_attempt', 'source_sha', 'workflow', 'job', 'ref')})
         self.assertEqual(receipt['exclusive_claim'], self.lease_id)
         self.assertEqual(receipt['workflow'], 'pr-capture-cloud.yml')
         self.assertRegex(receipt['hook_sha256'], r'^[a-f0-9]{64}$')
@@ -271,8 +275,9 @@ class CaptureTest(unittest.TestCase):
         self.assertFalse(any(self.units_held()))
 
     def test_ios_job_adopts_only_its_workflow_and_sha(self):
-        self.ready(workflow='ios-screen-sharing-proof.yml', job='proof',
-                   runner_label='cmux-capture-' + self.lease_id + '-proof')
+        receipt = self.ready(workflow='ios-screen-sharing-proof.yml', job='proof',
+                             runner_label='cmux-capture-' + self.lease_id + '-proof')
+        self.assertEqual(receipt['job'], 'proof')
         self.assign(GITHUB_JOB='proof',
                     GITHUB_WORKFLOW_REF='manaflow-ai/cmuxterm-hq/.github/workflows/ios-screen-sharing-proof.yml@refs/heads/main')
         self.assertEqual(self.started()['rc'], 0, self.started())
