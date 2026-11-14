@@ -530,6 +530,9 @@ class UpdateTest(unittest.TestCase):
         self.assertEqual(gu.refresh_runner_scripts(self.state, copy), f"refreshed to {entry['tag']}")
         self.assertEqual((copy / "glaeda-cmux-runner").read_text(), f"glaeda-cmux-runner at {SOURCES[0]}")
         self.assertTrue(os.access(copy / "glaeda-cmux-runner", os.X_OK))
+        for helper in ("glaeda-capture-admit", "glaeda-promotion-admit"):
+            self.assertEqual((copy / helper).read_text(), f"{helper} at {SOURCES[0]}")
+            self.assertTrue(os.access(copy / helper, os.X_OK))
         stamp = json.loads((copy / gu.SOURCE_STAMP).read_text())
         self.assertEqual((stamp["by"], stamp["tag"], stamp["source"], stamp["date"]),
                          ("glaeda-update", entry["tag"], SOURCES[0], "2026-09-25"))
