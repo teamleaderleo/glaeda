@@ -251,7 +251,10 @@ What `--apply` does:
      bounds active execution; it never converts failed cleanup into a free host.
      Detector: `scripts/test-glaeda-capture-admit.py` runs a fake listener against
      real flock tokens, including wrong identities, expiry, holder loss, runtime
-     changes and cleanup quarantine. Deployment requires both the Glaeda OTA and
+     changes and cleanup quarantine. Set `HQ_CAPTURE_ADMISSION` to the companion
+     `build-fleet/pr_capture/capture_admission.py` and run the two
+     `test_real_hq_*_receipt_contract` cases to exercise real producer/consumer
+     readiness and exported-claim checks for both workflows. Deployment requires both the Glaeda OTA and
      HQ fleet-helper receipts before any staging account run.
      The hook's `JOB_CORES` table gives a job its own measured
      cost where it is far from its class's: cmux-next's generated files, both autofix

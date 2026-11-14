@@ -79,6 +79,39 @@ class CaptureTest(unittest.TestCase):
         receipt.update(overrides)
         (self.lease_dir() / 'cleanup.json').write_text(json.dumps(receipt))
 
+    def check_hq_contract(self, workflow, job):
+        consumer = harness.load('hq_capture_contract', Path(os.environ['HQ_CAPTURE_ADMISSION']))
+        request = self.request(workflow=workflow, job=job,
+                               runner_label='cmux-capture-' + self.lease_id + '-' + job)
+        response = self.run_admit(request)
+        self.assertEqual(response.returncode, 0, response.stderr)
+        receipt = json.loads(response.stdout)
+        hook_sha = request['runtime_sha256']['glaeda-cmux-runner-hook']
+        consumer.validate_receipt(request, receipt, hook_sha, now=time.time())
+        env = {'GITHUB_JOB': job, 'GITHUB_REPOSITORY': request['repository'], 'GITHUB_REF': request['ref'],
+               'GITHUB_EVENT_NAME': 'workflow_dispatch', 'GITHUB_RUN_ID': str(request['run_id']),
+               'GITHUB_RUN_ATTEMPT': str(request['run_attempt']), 'GITHUB_SHA': request['source_sha'],
+               'GITHUB_WORKFLOW_SHA': request['source_sha'], 'RUNNER_NAME': request['runner_name'],
+               'GITHUB_WORKFLOW_REF': request['repository'] + '/.github/workflows/' + workflow + '@refs/heads/main'}
+        self.assign(**env)
+        self.assertEqual(self.started()['rc'], 0)
+        for line in (self.dir / 'github-env').read_text().splitlines():
+            key, value = line.split('=', 1)
+            env[key] = value
+        consumer.verify_target(dict(receipt, request=request), env, hook_sha)
+        self.clean_receipt()
+        (self.control / 'finish').touch()
+        (self.control / 'worker-exit').touch()
+        self.wait_for(lambda: self.state().get('phase') == 'released')
+
+    @unittest.skipUnless(os.environ.get('HQ_CAPTURE_ADMISSION'), 'set HQ_CAPTURE_ADMISSION to the HQ consumer')
+    def test_real_hq_mac_receipt_contract(self):
+        self.check_hq_contract('pr-capture-cloud.yml', 'capture')
+
+    @unittest.skipUnless(os.environ.get('HQ_CAPTURE_ADMISSION'), 'set HQ_CAPTURE_ADMISSION to the HQ consumer')
+    def test_real_hq_ios_receipt_contract(self):
+        self.check_hq_contract('ios-screen-sharing-proof.yml', 'proof')
+
     def test_unknown_worker_and_group_keep_quarantine(self):
         module = harness.load('capture_unknown_test', HELPER)
         from unittest import mock
