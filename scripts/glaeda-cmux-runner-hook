@@ -2310,12 +2310,18 @@ def toolchain_refusal(fleet_class: str | None, want: dict[str, Any], xcode_app: 
     env = dict(os.environ)  # the runner's PATH, which is the job's (workload) PATH
     note = ""
 
-    def out_of_time(why: str, empty: bool) -> str:
-        """why, unless the probe behind it gave nothing (empty) after the deadline: that is no answer."""
+    def out_of_time(why: str, empty: bool) -> str | None:
+        """why, unless the probe behind it gave nothing (empty) after the deadline: that is no answer, and no answer
+        is no evidence. A busy machine makes a job slower, never makes it fail (glaeda-13 at load ~200 failed the cmux
+        app compile at Set up runner, cmux run 43683149857), so the job is admitted (None) and the note says what
+        went unanswered; a later look with time to answer judges again. Xcode's probe already admits on no answer."""
+        nonlocal note
         if not empty or time.monotonic() < deadline:
             return why
-        return (f"node not eligible (the toolchain probes timed out after {ELIGIBILITY_BUDGET_S:.0f} s; no answer, "
-                f"not a missing or drifted tool; unanswered: {why.removeprefix('node not eligible ')})")
+        note = "; ".join(x for x in (note, f"admitted on no answer: the toolchain probes timed out after "
+                                           f"{ELIGIBILITY_BUDGET_S:.0f} s (busy, not a missing or drifted tool); "
+                                           f"unanswered: {why.removeprefix('node not eligible ')}") if x)
+        return None
 
     missing = toolchain_missing(env, home)
     if missing:
