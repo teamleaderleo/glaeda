@@ -945,9 +945,12 @@ job's need fit the host's cores, and their RAM plus this job's fits the host's R
 - A job's need: `scripts/glaeda-job-needs.json` (schema `glaeda-job-needs/v1`, generated in cmuxterm-hq
   `build-fleet/data/job-needs.json` from the jobs the hook logs). Cores are `ceil(cores_p90)` of the job's own row,
   else its `JOB_CORES` entry, else its class's row, else `CLASS_COST` (at least 1; the 0-unit token classes, fast and
-  gateway, stay 0; a signing job still takes the whole host). RAM is `mem_peak_mib_p90` of the job's row, else its
-  class's row, else none. Rows under `min_samples` are skipped. A missing, malformed or stale (30 days) file gives
-  today's tables exactly.
+  gateway, stay 0; a signing job still takes the whole host). RAM is `rss_peak_mib_p90` (resident) of the job's
+  row, else its `mem_peak_mib_p90` (the footprint, which counts compressed and swapped pages and can exceed the
+  host's RAM), else its class's row, else none. A row's `by_ncpu` entry for the host's `hw.ncpu` comes before the
+  pooled row, since jobs expand to the cores they find. Rows (and `by_ncpu` entries) under `min_samples` are
+  skipped. A missing, malformed or stale (30 days) file gives today's tables exactly. Rows are keyed by workflow
+  file, and each job record the hook logs carries the same `workflow_file` admission keys by.
 - It ships like the hook's other runner files: `glaeda-cmux-runner-fleet` stages it into `~/glaeda-runner/scripts`
   and `glaeda-update` keeps that copy at the installed release's, and the hook reads it from there. To update it,
   copy hq's file over `scripts/glaeda-job-needs.json`, check it with
@@ -962,8 +965,8 @@ job's need fit the host's cores, and their RAM plus this job's fits the host's R
   flag, so rolling a member that has `reserveCores` back below it needs a re-apply from that older checkout.
   `GLAEDA_RUNNER_RAM_LEDGER=0` in the runner's environment turns RAM accounting off. The memory-pressure gate and
   the disk floor stay.
-- A job whose own measured RAM need is more than the host's RAM capacity is refused at once (`RAM: ...`); one
-  estimated from its class's row runs alone there. A job waiting for RAM waits as for units (its marker wants
+- A job whose RAM need is more than the host's RAM capacity takes all of it, so it runs only when the host is
+  otherwise RAM-idle; it is never refused for RAM. A job waiting for RAM waits as for units (its marker wants
   `units`), so FEED_FIRST, the nightly slot and the signing drain are unchanged.
 - The listener gate holds a runner while the RAM its costliest job needs (that fits the host at all) is taken, as it
   does for cores.

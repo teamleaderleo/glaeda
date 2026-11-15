@@ -9241,6 +9241,8 @@ class GateTest(unittest.TestCase):
             self.assertEqual(hook.job_meta("manaflow-ai/cmux", hook.DEFAULT_HOME_REPO)["class"], "compile-gui")
             os.environ["GITHUB_WORKFLOW_REF"] = "manaflow-ai/cmux/.github/workflows/cmux-tui.yml@refs/heads/main"
             self.assertEqual(hook.job_meta("manaflow-ai/cmux", hook.DEFAULT_HOME_REPO)["class"], "isolated")
+            self.assertEqual(hook.job_meta("manaflow-ai/cmux", hook.DEFAULT_HOME_REPO)["workflow_file"], "cmux-tui.yml",
+                             "the file admission keys the needs row by, so job-needs.json needs no name map")
         payload.write_text(json.dumps({"pull_request": {}}))
         with mock.patch.dict(os.environ, env):
             os.environ.pop("GITHUB_WORKFLOW_REF", None)
@@ -16880,16 +16882,24 @@ class CapacityArithmeticTest(unittest.TestCase):
             self.assertIn("needs 6 GiB", why)
             hook.close_all(self.held)
             self.held.clear()
-            ok, why = self.take("huge")
-            self.assertFalse(ok)
-            self.assertTrue(why.startswith("RAM: huge (isolated) needs 20000 MiB"), why)
-            self.assertFalse(why.startswith("capacity:"), "it can never fit this host, so it does not wait")
-            ok, why = self.take("unmeasured")  # only its class's 30 GiB estimate: it runs here alone
+            ok, why = self.take("test")
             self.assertTrue(ok, why)
-            self.assertIn("12/12 GiB", why)
+            ok, why = self.take("huge")  # more than the host's RAM: it waits for a RAM-idle host, never refused
+            self.assertFalse(ok)
+            self.assertTrue(why.startswith("capacity: 6 of 12 GiB of RAM free"), why)
+            hook.close_all(self.held)
+            self.held.clear()
+            ok, why = self.take("huge")
+            self.assertTrue(ok, why)
+            self.assertIn("12/12 GiB", why, "it runs alone")
             ok, why = self.take("test")
             self.assertFalse(ok)
             self.assertIn("of 12 GiB of RAM free", why)
+            hook.close_all(self.held)
+            self.held.clear()
+            ok, why = self.take("unmeasured")  # only its class's 30 GiB estimate: it runs here alone too
+            self.assertTrue(ok, why)
+            self.assertIn("12/12 GiB", why)
         hook.close_all(self.held)
         self.held.clear()
         with self.host(30, 96, needs):
@@ -16900,6 +16910,27 @@ class CapacityArithmeticTest(unittest.TestCase):
             self.assertEqual(hook.mem_chunks_total(), 0, "the kill switch")
             ok, why = self.take("huge")
             self.assertTrue(ok, why)
+
+    def test_a_row_for_this_hosts_core_count_and_resident_ram_win(self) -> None:
+        """Jobs expand to the cores they find: a by_ncpu row for this host's hw.ncpu comes before the pooled row,
+        and rss_peak_mib_p90 (resident) before mem_peak_mib_p90 (the footprint, which counts swapped pages)."""
+        test = dict(self.row(4.0, 30000), rss_peak_mib_p90=3000,
+                    by_ncpu={"30": dict(self.row(10.2, 60000), rss_peak_mib_p90=9000),
+                             "10": self.row(6.0, 2000, n=3)})  # under min_samples: the pooled row
+        needs = self.needs({f"{self.GUEST}/build-fleet-go.yml/test": test},
+                           {"compile": {"n": 50, "cores_p90": 3.0, "mem_peak_mib_p90": 4000,
+                                    "by_ncpu": {"12": {"n": 50, "cores_p90": 2.0, "mem_peak_mib_p90": 1000}}}})
+        key = ("test", self.GUEST, hook.DEFAULT_HOME_REPO, "build-fleet-go.yml")
+        with self.host(30, 96, needs):
+            self.assertEqual(hook.job_need("compile", *key)[:3], (11, 9000, "job"))
+        with self.host(14, 48, needs):
+            self.assertEqual(hook.job_need("compile", *key)[:3], (4, 3000, "job"), "no 14-core row: pooled, resident")
+            self.assertEqual(hook.class_need("compile")[:2], (3, 4000), "no rss: the footprint")
+        with self.host(10, 16, needs):
+            self.assertEqual(hook.job_need("compile", *key)[:2], (4, 3000),
+                             "a by_ncpu row under min_samples is skipped")
+        with self.host(12, 16, needs):
+            self.assertEqual(hook.class_need("compile")[:2], (2, 1000), "classes have by_ncpu rows too")
 
     def test_a_waiting_nightly_job_still_goes_first(self) -> None:
         """FEED_FIRST is unchanged: RAM waits as units do, so a nightly waiter holds every newcomer, and a nightly

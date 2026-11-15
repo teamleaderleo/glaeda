@@ -753,18 +753,21 @@ DEFAULT_HOME_REPO = "manaflow-ai/cmux"
 # glaeda-cmux-runner-fleet stages it into ~/glaeda-runner/scripts and glaeda-update keeps that copy at the installed
 # release's; job_needs_path finds it there from each runner's glaeda-hooks/). Its rows are keyed
 # "<workflow file>/<job id>" for the home repository and "<owner/repo>/<workflow file>/<job id>" for a guest, and by
-# class. Cores: ceil(cores_p90) of the job's own row, else its JOB_CORES entry, else its class's row, else CLASS_COST;
+# class. A row's "by_ncpu" entry for this host's hw.ncpu is read before the pooled row (jobs expand to the cores
+# they find, so a 30-core host measures them wider than a 10-core one). Cores: ceil(cores_p90) of the job's own row,
+# else its JOB_CORES entry, else its class's row, else CLASS_COST;
 # at least 1, except a class that costs 0 units (fast, gateway: tokens only) stays 0, and the exclusive class takes
-# the whole host. RAM: mem_peak_mib_p90 of the job's row, else its class's row, else none (only the memory-pressure
-# gate, as before). A missing, unreadable, malformed or stale file (older than JOB_NEEDS_MAX_AGE_S) gives every job
-# today's tables exactly; a row with fewer than min_samples runs, or a bad number, is skipped.
+# the whole host. RAM: rss_peak_mib_p90 (else mem_peak_mib_p90, the footprint) of the job's row, else its class's
+# row, else none (only the memory-pressure gate, as before). A missing, unreadable, malformed or stale file (older
+# than JOB_NEEDS_MAX_AGE_S) gives every job today's tables exactly; a row with fewer than min_samples runs, or a bad
+# number, is skipped.
 #
 # A host's capacity is measured on the host: cores are hw.ncpu less --reserve-cores (cores kept back for work outside
 # the ledger), and RAM is hw.memsize less mem_floor_mib(), in MEM_CHUNK_MIB chunks (mem-N flock files in the capacity
 # ledger beside the unit-N ones; a holder that dies frees both). --capacity-units N still turns the ledger on, and N
 # is the count only where the host cannot be measured (not macOS, sysctl failed). The memory-pressure gate and the
-# disk floor stay. A job whose own measured RAM need is more than the host's RAM capacity is refused at once (it can
-# never fit here; cmux's rescue re-runs it); one estimated from its class's row runs alone on such a host instead.
+# disk floor stay. A job whose RAM need is more than the host's RAM capacity takes all of it: it runs only when the
+# host is otherwise RAM-idle, never refused for it.
 JOB_NEEDS_SCHEMA = "glaeda-job-needs/v1"
 JOB_NEEDS_NAME = "glaeda-job-needs.json"
 JOB_NEEDS_ENV = "GLAEDA_JOB_NEEDS"  # another needs file (tests; a host-local trial): a missing path means none
@@ -851,18 +854,37 @@ def parse_job_needs(data: bytes, now: float | None = None) -> tuple[dict[str, An
         if not isinstance(rows, dict):
             return None, f"{table} is not an object"
         kept: dict[str, tuple[float | None, float | None]] = {}
+        by_ncpu: dict[str, dict[str, tuple[float | None, float | None]]] = {}
         for key, row in rows.items():
             if not isinstance(key, str) or not isinstance(row, dict):
                 continue
-            n = row.get("n")
-            if isinstance(n, bool) or not isinstance(n, int) or n < floor:
-                continue
-            cores, mib = (_needs_number(row, "cores_p90", JOB_NEEDS_MAX_CORES),
-                          _needs_number(row, "mem_peak_mib_p90", JOB_NEEDS_MAX_MIB))
-            if cores is not None or mib is not None:
-                kept[key] = (cores, mib)
+            pooled = _needs_row(row, floor)
+            if pooled:
+                kept[key] = pooled
+            hosts = row.get("by_ncpu")
+            if isinstance(hosts, dict):
+                per = {ncpu: got for ncpu, sub in hosts.items()
+                       if isinstance(ncpu, str) and ncpu.isdigit() and isinstance(sub, dict)
+                       and (got := _needs_row(sub, floor))}
+                if per:
+                    by_ncpu[key] = per
         out[table] = kept
+        out[f"{table}_by_ncpu"] = by_ncpu
     return out, ""
+
+
+def _needs_row(row: dict[str, Any], floor: int) -> tuple[float | None, float | None] | None:
+    """(cores_p90, RAM MiB) of one row with at least `floor` runs, or None. RAM is rss_peak_mib_p90 (resident: what
+    the host's RAM actually holds), else mem_peak_mib_p90 (the footprint, which counts compressed and swapped pages
+    and can exceed the host's RAM)."""
+    n = row.get("n")
+    if isinstance(n, bool) or not isinstance(n, int) or n < floor:
+        return None
+    cores = _needs_number(row, "cores_p90", JOB_NEEDS_MAX_CORES)
+    mib = _needs_number(row, "rss_peak_mib_p90", JOB_NEEDS_MAX_MIB)
+    if mib is None:
+        mib = _needs_number(row, "mem_peak_mib_p90", JOB_NEEDS_MAX_MIB)
+    return (cores, mib) if cores is not None or mib is not None else None
 
 
 def load_job_needs(path: Path | None = None, now: float | None = None) -> tuple[dict[str, Any] | None, str]:
@@ -908,8 +930,12 @@ def job_need(klass: str, job: str, repo: str | None, home_repo: str = DEFAULT_HO
         needs = load_job_needs()[0]
     if not needs:
         return Need(JOB_CORES.get(key, base_units))
-    row = needs["jobs"].get(needs_key(job, repo, home_repo, workflow)) if job and workflow else None
-    crow = needs["classes"].get(klass)
+    ncpu = str(host_cores() or "")
+    rkey = needs_key(job, repo, home_repo, workflow) if job and workflow else None
+    # a row measured on hosts with this host's core count first (jobs expand to the cores they find), else pooled
+    row = ((needs.get("jobs_by_ncpu", {}).get(rkey, {}).get(ncpu) or needs["jobs"].get(rkey))
+           if rkey else None)
+    crow = needs.get("classes_by_ncpu", {}).get(klass, {}).get(ncpu) or needs["classes"].get(klass)
     own_cores = _need_cores(row[0], base_units) if row else None
     class_cores = _need_cores(crow[0], base_units) if crow else None
     if own_cores is not None:
@@ -1025,8 +1051,8 @@ def needs_main(path: Path | None) -> int:
 
 def fit_mem_chunks(mibs: list[int], total: int) -> int:
     """The RAM a listener keeps free for its costliest job: the largest of `mibs` that fits the host at all (a job
-    that never fits is refused at admission, so holding a listener for it would only starve the label), at least 1
-    chunk while the ledger is on."""
+    that is bigger waits at admission for a RAM-idle host, and holding a listener for that would starve the label),
+    at least 1 chunk while the ledger is on."""
     if total <= 0:
         return 0
     fitting = [mem_chunks(mib) for mib in mibs if mem_chunks(mib) <= total]
@@ -5423,11 +5449,9 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
     # ledger) takes none, so it never waits behind a waiter for units.
     chunks = mem_total if klass == EXCLUSIVE_CLASS else mem_chunks(need.mib) if units > 0 else 0
     if mem_total and chunks > mem_total:
-        if need.own_mib:  # its own measured p90 never fits here: refused now, not a wait that cannot end
-            host = host_mem_mib() or 0
-            return False, (f"RAM: {job or 'this job'} ({klass}) needs {need.mib} MiB (its measured p90), more than "
-                           f"this host admits ({mem_total} GiB: {host} MiB less a {mem_floor_mib(host)} MiB floor)")
-        chunks = mem_total  # a class estimate: it runs here alone
+        # more than the host's RAM less the floor: it takes all of it, so it runs only when the host is otherwise
+        # RAM-idle (such jobs run on 16 GiB hosts today; the memory-pressure gate still guards them)
+        chunks = mem_total
     if not mem_total:
         chunks = 0
     if roots > 1 and klass in ROOT_CONSUMERS:
@@ -9175,7 +9199,8 @@ def job_meta(repo: str | None, home_repo: str) -> dict[str, Any]:
     # the class admission used (the same workflow lookup), so the record agrees with the ledger
     klass, _ = job_class(job, repo, home_repo, job_workflow()) if job else ("unknown", False)
     return {"host": os.uname().nodename.split(".")[0][:64], "runner": env("RUNNER_NAME", 80), "job": job or None,
-            "class": klass, "workflow": env("GITHUB_WORKFLOW"), "repository": repo,
+            "class": klass, "workflow": env("GITHUB_WORKFLOW"), "workflow_file": job_workflow() or None,
+            "repository": repo,
             "run_id": env("GITHUB_RUN_ID", 32), "run_attempt": env("GITHUB_RUN_ATTEMPT", 8),
             "event_name": env("GITHUB_EVENT_NAME", 40), "ref": env("GITHUB_REF", 160),
             "head_ref": env("GITHUB_HEAD_REF", 160), "sha": env("GITHUB_SHA", 40)}
