@@ -738,6 +738,11 @@ JOB_CORES: dict[tuple[str, ...], int] = {
     ("manaflow-ai/cmuxterm-hq", "build-fleet-go.yml", "test"): 1,  # guest isolated: 919, 0.24/0.42/0.52
 }
 
+# Guest repositories (any repo other than --home-repo, admitted by an org-scoped runner's --allowed-owner)
+# never touch cmux's canonical roots or persistent DerivedData, so they are costed by job-id suffix alone:
+# "-sim" or "simulator" uses the one CoreSimulator service, "-light" is small, anything else is isolated.
+DEFAULT_HOME_REPO = "manaflow-ai/cmux"
+
 # CAPACITY_ARITHMETIC (Leo, 2026-11-15: "And I don't mean, you know, some weird blanket like let's put this on this
 # type of machine, that on that type of machine. I mean so in the sense of like this has this many CPUs."). Admission
 # is arithmetic on measured numbers: a host admits a job while the cores and the RAM its admitted jobs need, plus this
@@ -793,8 +798,11 @@ def job_needs_path() -> Path:
     env = os.environ.get(JOB_NEEDS_ENV)
     if env:
         return Path(env)
-    beside = Path(__file__).resolve().parent / JOB_NEEDS_NAME
-    return beside if beside.is_file() else Path.home() / "glaeda-runner/scripts" / JOB_NEEDS_NAME
+    here = globals().get("__file__") or ""  # the plan runs this hook from stdin: no file beside it then
+    beside = Path(here).resolve().parent / JOB_NEEDS_NAME if here and not here.startswith("<") else None
+    if beside is not None and beside.is_file():
+        return beside
+    return Path.home() / "glaeda-runner/scripts" / JOB_NEEDS_NAME
 
 
 def _needs_number(row: dict[str, Any], key: str, limit: float) -> float | None:
@@ -1018,10 +1026,6 @@ def fit_mem_chunks(mibs: list[int], total: int) -> int:
     fitting = [mem_chunks(mib) for mib in mibs if mem_chunks(mib) <= total]
     return max([1, *fitting])
 
-# Guest repositories (any repo other than --home-repo, admitted by an org-scoped runner's --allowed-owner)
-# never touch cmux's canonical roots or persistent DerivedData, so they are costed by job-id suffix alone:
-# "-sim" or "simulator" uses the one CoreSimulator service, "-light" is small, anything else is isolated.
-DEFAULT_HOME_REPO = "manaflow-ai/cmux"
 
 
 GUEST_WAIT_S = 600.0  # guests have no rescue workflow: a full mini holds their job this long before refusing
