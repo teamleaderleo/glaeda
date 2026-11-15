@@ -8188,7 +8188,9 @@ def cmux_active(path: Path, levels: int = 3, budget: int = 5000, wide_is_busy: b
     unless wide_is_busy is False (a tree that is not a job unit, judged by its process evidence instead)."""
     level = [path]
     for depth in range(levels + 1):
-        nxt: list[Path] = []
+        # Every directory of a level is checked for a marker before any of them is listed, so the budget a wide
+        # sibling's children spend never hides a marker at this depth (glaeda#1992: a live slot marker one level
+        # down went unread once earlier siblings' listings ran the budget out).
         for d in level:
             if d.parent.name == "work" and (d / ".lock").exists():  # hq's slot lock, not any tool's .lock
                 return True
@@ -8199,8 +8201,10 @@ def cmux_active(path: Path, levels: int = 3, budget: int = 5000, wide_is_busy: b
                         return True
                 except (OSError, ValueError, IndexError):
                     return True
-            if depth == levels:
-                continue
+        if depth == levels:
+            break
+        nxt: list[Path] = []
+        for d in level:
             for c in _children(d):
                 budget -= 1
                 if budget < 0:

@@ -1619,19 +1619,25 @@ class GlaedaDiskTest(unittest.TestCase):
         # cmux16, 2026-11-15: a home-scratch folder of several cmux checkouts read "a cmux reload job holds its
         # unit" for three weeks: the bounded marker search ran out of budget and called that busy.
         wide = self.root / "hotswap-review"
-        for i in range(12):
-            (wide / f"pr-{i}").mkdir(parents=True)
+        for i in range(12):  # 12 entries fit a budget of 20; their 60 children do not
+            for j in range(5):
+                (wide / f"pr-{i}" / f"d{j}").mkdir(parents=True)
         fam = gd.Family(gd.HOME_SCRATCH_FAMILY, self.root, True, "x")
-        self.assertTrue(gd.cmux_active(wide, budget=5))  # the default still fails closed
-        self.assertFalse(gd.cmux_active(wide, budget=5, wide_is_busy=False))
+        self.assertTrue(gd.cmux_active(wide, budget=20))  # the default still fails closed
+        self.assertFalse(gd.cmux_active(wide, budget=20, wide_is_busy=False))
         real = gd.cmux_active
-        with mock.patch.object(gd, "cmux_active", lambda p, **k: real(p, budget=5, **k)):
+        with mock.patch.object(gd, "cmux_active", lambda p, **k: real(p, budget=20, **k)):
             self.assertFalse(gd.job_busy(fam, wide))  # no marker: its process evidence decides
-            (wide / "pr-3/.cmux-active").mkdir()
-            (wide / "pr-3/.cmux-active/pid").write_text(f"{os.getpid()}\n")
-            self.assertTrue(gd.cmux_active(wide, wide_is_busy=False))  # a live marker within budget still holds
+            # a live marker on the last sibling, after earlier siblings' listings would have spent the budget,
+            # still holds the tree (glaeda#1992 CI: the old per-directory order never read it)
+            (wide / "pr-11/.cmux-active").mkdir()
+            (wide / "pr-11/.cmux-active/pid").write_text(f"{os.getpid()}\n")
+            self.assertTrue(gd.cmux_active(wide, wide_is_busy=False))
+            self.assertTrue(gd.job_busy(fam, wide))
+            (wide / "pr-11/.cmux-active/pid").write_text("garbage")
+            self.assertTrue(gd.cmux_active(wide, wide_is_busy=False))  # an unreadable marker fails closed
+            (wide / "pr-11/.cmux-active/pid").unlink()
             job = gd.Family("cmux-job-cache", self.root, True, "x", depth=2)
-            (wide / "pr-3/.cmux-active/pid").unlink()
             self.assertTrue(gd.job_busy(job, wide / "pr-0"))  # the job cache's unit still fails closed
 
     def test_cmux_active_marker_holds_a_slot(self) -> None:
