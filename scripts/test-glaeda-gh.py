@@ -12581,7 +12581,7 @@ class SpendAlarmTest(Base):
         self.policy()
         self.daemon.policy = {**self.daemon.policy, "restShare": 0.06}  # a cap of 300
         self.daemon.transport = lambda *a: (200, {}, b"{}")
-        for minute in range(50):  # 7 a minute for 50 minutes and 9 for 30: 620 in the hour, never fast in the last ten minutes
+        for minute in range(50):  # 7 a minute for 50 min, 9 more for 30: 620 in the hour, slow lately
             self.daemon.now = NOW - 3000 + minute * 60
             with self.daemon.calling("pr", "o/r", "session:lane-7"):
                 for n in range(5):
