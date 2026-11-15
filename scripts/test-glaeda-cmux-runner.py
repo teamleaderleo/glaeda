@@ -13641,7 +13641,8 @@ class RunnerTest(unittest.TestCase):
                                                           "glaeda-session"))]
         self.assertEqual([roles(l) for l in labels],
                          [["glaeda-std-xcode-26.6", "glaeda-root-std-xcode-26.6"]] * 2
-                         + [["glaeda-std-xcode-26.6", "glaeda-side-std-xcode-26.6", "glaeda-side-light-xcode-26.6"]] * 2
+                         + [["glaeda-std-xcode-26.6", "glaeda-side-std-xcode-26.6", "glaeda-side-light-xcode-26.6",
+                             "glaeda-side-xcode-26.6"]] * 2
                          + [["glaeda-session-std-xcode-26.6"], ["glaeda-gui-std-xcode-26.6"]],
                          "only the last carries the gui label, so no console job lands where its token is held, and "
                          "with a session runner beside it the console runner leaves session jobs to that one")
@@ -13776,7 +13777,8 @@ class RunnerTest(unittest.TestCase):
                                                           "glaeda-fast"))]
         self.assertEqual([roles(l) for l in today],
                          [["glaeda-std-xcode-26.6", "glaeda-root-std-xcode-26.6"]] * 2
-                         + [["glaeda-std-xcode-26.6", "glaeda-side-std-xcode-26.6", "glaeda-side-light-xcode-26.6"]] * 3)
+                         + [["glaeda-std-xcode-26.6", "glaeda-side-std-xcode-26.6", "glaeda-side-light-xcode-26.6",
+                             "glaeda-side-xcode-26.6"]] * 3)
         zero, zero_hooks = self.fast_labels({**base, "fastRunners": 0}, "zero")
         self.assertEqual((zero, zero_hooks), (today, today_hooks), "fastRunners 0 is today's fleet exactly")
         self.assertFalse([h for h in today_hooks if "--fast-runner" in h])
@@ -16839,8 +16841,9 @@ class CapacityArithmeticTest(unittest.TestCase):
                 self.assertIsNone(needs)
                 self.assertIn(reason, why)
                 with mock.patch.dict(os.environ, {hook.JOB_NEEDS_ENV: os.fspath(path)}):
-                    for (workflow, job), cores in hook.JOB_CORES.items():
-                        if len((workflow, job)) == 2:
+                    for key, cores in hook.JOB_CORES.items():
+                        if len(key) == 2:  # a home job's (workflow, job); a guest's key leads with its repo
+                            workflow, job = key
                             klass = hook.job_class(job, hook.DEFAULT_HOME_REPO, workflow=workflow)[0]
                             self.assertEqual(hook.job_units(klass, job, hook.DEFAULT_HOME_REPO, workflow=workflow),
                                              cores, "today's table exactly")
