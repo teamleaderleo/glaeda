@@ -3720,6 +3720,8 @@ class HookTest(unittest.TestCase):
         self.fleet()
         capacity = self.dir / "capacity"
         other = {"GITHUB_WORKFLOW_REF": "manaflow-ai/cmux/.github/workflows/other.yml@refs/heads/main"}
+        gallery = {"GITHUB_WORKFLOW_REF": "manaflow-ai/cmux/.github/workflows/native-sidebar-gallery.yml@refs/heads/x"}
+        guest_gallery = {"GITHUB_WORKFLOW_REF": "manaflow-ai/cmuxterm-hq/.github/workflows/native-sidebar-gallery.yml@refs/heads/x"}
         cases = (("swift-package-tests", {}, "manaflow-ai/cmux"),
                  ("release-compile", self.FAST_TIER, "manaflow-ai/cmux"),
                  ("generated-files", self.FAST_TIER, "manaflow-ai/cmux"),
@@ -3732,6 +3734,10 @@ class HookTest(unittest.TestCase):
                  ("bench", self.FAST_TIER, "manaflow-ai/cmux"),
                  ("eval", other, "manaflow-ai/cmux"),
                  ("look", self.FAST_TIER, "manaflow-ai/cmux"),
+                 # Only the exact home-repository gallery client is admitted, not its job id or workflow alone.
+                 ("capture", other, "manaflow-ai/cmux"),
+                 ("build", gallery, "manaflow-ai/cmux"),
+                 ("capture", guest_gallery, "manaflow-ai/cmuxterm-hq"),
                  ("app-compile-fleet", self.FAST_TIER, "manaflow-ai/cmuxterm-hq"))
         for index, (job, env, repo) in enumerate(cases):
             with self.subTest(job=job, env=env, repo=repo):
@@ -3752,7 +3758,7 @@ class HookTest(unittest.TestCase):
                               ("cmux-next-tip-test-compile.yml", "compile"), ("cmux-next.yml", "fast-tier-fleet"),
                               ("cmux-next.yml", "daemon-test-fleet"), ("cmux-next-perf-bench.yml", "bench"),
                               ("cu-driver-eval.yml", "eval"), ("screen-stream-eval.yml", "eval"),
-                              ("cmux-next-hot-verify.yml", "look")):
+                              ("cmux-next-hot-verify.yml", "look"), ("native-sidebar-gallery.yml", "capture")):
             with self.subTest(workflow=workflow, job=job):
                 try:
                     ok = self.job(job, "ok", 14, None, "--gateway-runner",

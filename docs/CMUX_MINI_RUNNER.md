@@ -1418,7 +1418,8 @@ in at the producer's root. So one root job per root per mini:
   `cmux-next-tip-test-compile.yml`'s `compile`, and the feat-cmux-next evals on `CI_EVAL_STEP_GATEWAY`:
   `cmux-next-perf-bench.yml`'s `bench`, `cu-driver-eval.yml`'s `eval` and `screen-stream-eval.yml`'s `eval`, whose
   steps run on the bench mini or a measure worker, and `cmux-next-hot-verify.yml`'s `look`, whose step runs on a
-  display worker); job-started refuses any other job at once. Its gate is never held
+  display worker, and `native-sidebar-gallery.yml`'s `capture`, which submits the native sidebar suite to a
+  display worker and leaves its PNG archive in fleet storage); job-started refuses any other job at once. Its gate is never held
   for CPU saturation or the shared units, only for memory pressure, the disk floor, heat, the fleet's host claim,
   a nightly job waiting on the mini, a signing job waiting for the gateway tokens, or both gateway tokens taken.
   Its job is admitted as class `gateway`: one of the mini's two tokens `gateway-0`/`gateway-1` and no shared unit;
@@ -1426,6 +1427,13 @@ in at the producer's root. So one root job per root per mini:
   job (`exclusive`) takes both gateway tokens as well. Route a gateway label's jobs with
   `CI_COMPILE_CHECK_GATEWAY` (and `CI_TEST_COMPILE_GATEWAY`) once its runners are online; roll back by setting the
   label they had before. Adding gateway runners adds instances, so it needs `glaeda-cmux-runner-fleet --apply`.
+  **Detector for a new client missing admission:** a job refused during `Set up runner` names its exact
+  workflow/job pair outside `GATEWAY_JOBS`. Native gallery run `43727447109`, job `132852374607`, at
+  `d5e1b4e6da9e0d6ccbc6d6dd965ee764409a35ef` exposed this on 2026-11-15. Check the client-only workflow and
+  add only its home-repository pair; `HookTest.test_the_gateway_runner_refuses_every_other_job` verifies that
+  pair is admitted while another job, another workflow and a guest repository are refused. After merging,
+  the normal release and `glaeda-update` hook refresh must reach the runner before retrying the job; no
+  controller change or runner restart is needed (see `docs/GLAEDA_OTA.md`).
 - A desktop VM runner is a future, disabled design. It may use the GUI label and a distinct `gui-vm`
   accounting token, but the guest must not receive read-write access to the host capacity ledger. A
   host-side broker, immutable VM ownership receipt, and atomic runner drain are required before any
