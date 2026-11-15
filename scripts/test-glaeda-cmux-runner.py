@@ -3731,6 +3731,7 @@ class HookTest(unittest.TestCase):
                  # an eval's job id from another workflow is not its client
                  ("bench", self.FAST_TIER, "manaflow-ai/cmux"),
                  ("eval", other, "manaflow-ai/cmux"),
+                 ("look", self.FAST_TIER, "manaflow-ai/cmux"),
                  ("app-compile-fleet", self.FAST_TIER, "manaflow-ai/cmuxterm-hq"))
         for index, (job, env, repo) in enumerate(cases):
             with self.subTest(job=job, env=env, repo=repo):
@@ -3750,7 +3751,8 @@ class HookTest(unittest.TestCase):
         for workflow, job in (("fleet-test-compile.yml", "compile"), ("fleet-compile-check.yml", "compile-check"),
                               ("cmux-next-tip-test-compile.yml", "compile"), ("cmux-next.yml", "fast-tier-fleet"),
                               ("cmux-next.yml", "daemon-test-fleet"), ("cmux-next-perf-bench.yml", "bench"),
-                              ("cu-driver-eval.yml", "eval"), ("screen-stream-eval.yml", "eval")):
+                              ("cu-driver-eval.yml", "eval"), ("screen-stream-eval.yml", "eval"),
+                              ("cmux-next-hot-verify.yml", "look")):
             with self.subTest(workflow=workflow, job=job):
                 try:
                     ok = self.job(job, "ok", 14, None, "--gateway-runner",
