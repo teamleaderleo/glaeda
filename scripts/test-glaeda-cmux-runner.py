@@ -7726,6 +7726,34 @@ class XcodeToolchainTest(unittest.TestCase):
                     why, _ = hook.toolchain_refusal("m4pro-48", want, self.XCODE, align=False)
                     self.assertEqual(why, "toolchain: xcrun resolves /x", "the Xcode refusal keeps its own words")
 
+    def test_a_busy_node_whose_probes_run_out_of_time_is_admitted_not_refused(self) -> None:
+        """A busy machine makes a job slower, never makes it fail. cmux8s-mac-mini-glaeda-13 at load ~200 failed the
+        cmux app compile at "Set up runner" (manaflow-ai/cmux run 43683149857) because its probes ran out of time,
+        while gh answered in 0.3 s by hand. A probe with no answer past ELIGIBILITY_BUDGET_S is no evidence of a
+        missing or drifted tool, so the job is admitted and the note names what went unanswered; a real answer that
+        is wrong still refuses."""
+        want = {"rustcVersion": "rustc 1.98.1", "cargoVersion": "cargo 1.98.1", "zigVersion": "0.16.0",
+                "xcodeVersion": "26.6", "xcodeBuild": "17F113", "macosSdkVersion": "26.5"}
+        answers = {"rustc": "rustc 1.98.1", "cargo": "cargo 1.98.1", "zig": "0.16.0", "python3": "3.13",
+                   "gh": "", "xcodebuild": "Xcode 26.6\nBuild version 17F113", "xcrun": "26.5"}
+        with mock.patch.object(hook, "_probe", side_effect=lambda argv, *_: answers.get(argv[0], "")), \
+                mock.patch.object(hook, "toolchain_missing", return_value=None), \
+                mock.patch.object(hook, "ELIGIBILITY_BUDGET_S", 0.0):
+            why, note = hook.toolchain_refusal("m4pro-48", want, None, align=False)
+            self.assertIsNone(why, "no answer from gh past the budget admits")
+            self.assertIn("timed out after 0 s", note)
+            self.assertIn("gh is not on the job PATH", note)
+            answers.update(gh="gh version 2", zig="")
+            why, note = hook.toolchain_refusal("m4pro-48", want, None, align=False)
+            self.assertIsNone(why, "an empty drift past the budget admits too")
+            self.assertIn("zigVersion '' != '0.16.0'", note)
+            answers.update(zig="0.15.0")
+            why, _ = hook.toolchain_refusal("m4pro-48", want, None, align=False)
+            self.assertTrue(why.startswith("node not eligible (toolchain drifted"), "a real answer is a drift")
+            answers.update(zig="0.16.0", python3="3.9")
+            why, _ = hook.toolchain_refusal("m4pro-48", want, None, align=False)
+            self.assertTrue(why.startswith("node not eligible (python3 on the job PATH is 3.9"), why)
+
     def test_the_runner_xcode_is_the_job_started_hooks_toolchain_xcode(self) -> None:
         runner = self.tmp / "actions-runner-glaeda-1"
         (runner / "glaeda-hooks").mkdir(parents=True)
