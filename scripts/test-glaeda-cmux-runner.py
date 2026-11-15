@@ -13589,7 +13589,7 @@ class RunnerTest(unittest.TestCase):
         self.assertEqual([[x for x in l if x.startswith(prefixes)] for l in labels],
                          [["glaeda-std-xcode-26.6", "glaeda-root-std-xcode-26.6"],
                           ["glaeda-std-xcode-26.6", "glaeda-side-std-xcode-26.6",
-                           "glaeda-side-light-xcode-26.6"],
+                           "glaeda-side-light-xcode-26.6", "glaeda-side-xcode-26.6"],
                           ["glaeda-gui-std-xcode-26.6", "glaeda-session-std-xcode-26.6"]],
                          "the gui runner carries neither the pool label nor a root or side one, and the session label")
         self.assertIn("glaeda-ios-sim", labels[0])
@@ -16833,7 +16833,7 @@ class CapacityArithmeticTest(unittest.TestCase):
         broken.write_text("{torn")
         other = self.needs(schema="glaeda-job-needs/v0")
         naive = self.needs(generated_at="2026-11-15T00:00:00")
-        bad_tables = self.needs(jobs=[])
+        bad_tables = self.needs(jobs=["not an object"])
         for path, reason in ((self.dir / "absent.json", "no absent.json"), (broken, "not JSON"),
                              (stale, "stale"), (other, "schema"), (naive, "time zone"), (bad_tables, "jobs")):
             with self.subTest(path=path.name):
