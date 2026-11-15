@@ -230,6 +230,7 @@ import datetime as dt
 import faulthandler
 import fcntl
 import glob
+import gzip
 import hashlib
 from http.client import HTTPException  # the http() helper below shadows the `http` package
 import json
@@ -10692,6 +10693,58 @@ def read_runners(path: str) -> list[dict]:
         raise WatchError(f"gh api {path}: unreadable answer: {error}") from None
 
 
+# CI_RUNNER_STATE (cmuxterm-hq build-fleet/mini-ops/RUNNER-STATE.md): the fleet's runner-heal owner, which holds the
+# org-admin read this host's token lacks, publishes its census of the repo's runners and the approved org groups
+# (glaeda-minis: every glaeda-gui-std / glaeda-side-std pool) as a gzip+base64 repository variable every 120 s.
+# Reading it is one variable GET through this broker, no new grant and no ssh to the minis. Older than
+# RUNNER_STATE_MAX_AGE_S, incomplete, or for another repository, it is not used.
+RUNNER_STATE_VARIABLE = "CI_RUNNER_STATE"
+RUNNER_STATE_SCHEMA = "runner-state/v1"
+RUNNER_STATE_MAX_AGE_S = 600
+
+
+def read_runner_state(repo: str) -> tuple[list[dict] | None, str]:
+    """The org-group runners from `repo`'s published CI_RUNNER_STATE census, as read_runners rows, and its
+    source line; or None and why it could not be used."""
+    path = f"repos/{repo}/actions/variables/{RUNNER_STATE_VARIABLE}"
+    where = f"{RUNNER_STATE_VARIABLE} on {repo}"
+    try:
+        done = run_bounded([sys.executable, str(Path(__file__).resolve()), "gh", "api", path, "--jq", ".value"],
+                           timeout=60)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        return None, f"{where} not read ({describe(error)})"
+    if done.returncode != 0:
+        return None, f"{where} not read ({(done.stderr or '').strip()[:120]})"
+    try:
+        doc = json.loads(gzip.decompress(base64.b64decode(done.stdout.strip(), validate=True)))
+    except (ValueError, OSError, EOFError) as error:
+        return None, f"{where} unreadable ({describe(error)})"
+    if not isinstance(doc, dict) or doc.get("schema") != RUNNER_STATE_SCHEMA:
+        return None, f"{where} has no {RUNNER_STATE_SCHEMA} document"
+    if str(doc.get("repository") or "").lower() != repo.lower():
+        return None, f"{where} is for {doc.get('repository')}"
+    if doc.get("complete") is not True:
+        return None, f"{where} is incomplete"
+    try:
+        at = dt.datetime.fromisoformat(str(doc.get("generated_at")).replace("Z", "+00:00"))
+        age = time.time() - at.timestamp()
+    except (TypeError, ValueError):
+        return None, f"{where} has no readable generated_at"
+    if not -60 <= age <= RUNNER_STATE_MAX_AGE_S:
+        return None, f"{where} is {int(age)} s old"
+    groups = doc.get("runner_groups")
+    if not isinstance(groups, dict) or not all(isinstance(rows, list) for rows in groups.values()):
+        return None, f"{where} has no runner groups"
+    rows = []
+    for row in (r for group in groups.values() for r in group):
+        if not isinstance(row, dict):
+            continue
+        labels = [lab.get("name") if isinstance(lab, dict) else lab for lab in row.get("labels") or []]
+        rows.append({"name": row.get("name"), "status": row.get("status"), "busy": bool(row.get("busy")),
+                     "labels": [lab for lab in labels if isinstance(lab, str)]})
+    return rows, f"{where}, {int(max(age, 0))} s old"
+
+
 def cmd_runners(scope: str, label: str | None, as_json: bool) -> int:
     """Self-hosted runners of an org or repository: online, busy and idle, per label. Read through
     `gh` so the answer cache shares it with every session on the host for its TTL.
@@ -10700,8 +10753,10 @@ def cmd_runners(scope: str, label: str | None, as_json: bool) -> int:
     org's runners, which run most of a repo's jobs, are a different listing. 2026-11-15: `runners OWNER/REPO
     --label glaeda-side-std-xcode-26.6` read 0 online of 39 while the org pool had 8 online, all busy, and a
     lane took the label for down. So OWNER/REPO reads the repo's runners and the owner's org runners, merged by
-    name, and says which it read (`scopes`); an org listing the token may not read is named in `unread`."""
-    unread = None
+    name, and says which it read (`scopes`). The org listing needs an org-admin token; without one the org rows
+    come from the repo's published CI_RUNNER_STATE census, and with neither the counts are unknown (`online`
+    null, `unknown` says why), never 0: a scope this reader cannot see is not an empty pool."""
+    unread = unknown = None
     if re.fullmatch(NAME, scope):
         runners = read_runners(f"orgs/{scope}/actions/runners")
         scopes = {"org": len(runners)}
@@ -10713,6 +10768,14 @@ def cmd_runners(scope: str, label: str | None, as_json: bool) -> int:
             org = read_runners(f"orgs/{owner}/actions/runners")
         except WatchError as error:
             org, unread = [], f"org {owner} not read ({str(error)[:120]})"
+            state, source = read_runner_state(scope)
+            if state is None:
+                unknown = (f"org runners are not visible to this token; read from {RUNNER_STATE_VARIABLE} on "
+                           f"{scope} (cmuxterm-hq build-fleet/mini-ops/RUNNER-STATE.md) or an org-admin "
+                           f"`gh api orgs/{owner}/actions/runners`: {source}")
+            else:
+                org, unread = state, f"org {owner} read from {source}"
+                scopes[RUNNER_STATE_VARIABLE] = len(state)
         else:
             scopes["org"] = len(org)
         have = {r.get("name") for r in runners}
@@ -10731,10 +10794,19 @@ def cmd_runners(scope: str, label: str | None, as_json: bool) -> int:
            "busyRunners": sorted(r["name"] for r in online if r.get("busy"))}
     if unread:
         doc["unread"] = unread
+    if unknown:
+        # the repo rows alone are a lower bound, kept under their own name; the totals are unknown
+        doc.update(online=None, busy=None, unknown=unknown, repoOnly={"online": len(online), "labels": labels})
+        doc["labels"] = {}
     if as_json:
         print(json.dumps(doc, sort_keys=True))
         return EXIT_OK
     read = " + ".join(f"{n} {k}" for k, n in scopes.items())
+    if unknown:
+        print(f"{scope}: unknown" + (f" (label {label})" if label else "") + f": {unknown} [read: {read}]")
+        if online:
+            print(f"  repo runners alone (a lower bound): {len(online)} listening")
+        return EXIT_OK
     print(f"{scope}: {doc['online']} online of {doc['runners']} registered, {doc['busy']} busy"
           + (f" (label {label})" if label else "") + f" [read: {read}]" + (f" [{unread}]" if unread else ""))
     for name, row in sorted(labels.items(), key=lambda kv: (-kv[1]["online"], kv[0])):

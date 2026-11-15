@@ -128,6 +128,7 @@ The fleet and host tools install into `~/.local/bin` with `scripts/glaeda-mini-s
 glaeda-gh wait pr OWNER/REPO#N --sha FULL_SHA   # wait for CI without polling (skills/github-ci-wait)
 glaeda-gh status pr OWNER/REPO#N
 glaeda-gh runners OWNER[/REPO]                   # busy and idle self-hosted runners per label
+                                                 # (org pools this token cannot list come from CI_RUNNER_STATE, else "unknown", never 0)
 glaeda-disk report                               # where the disk went; --apply reclaims
 glaeda-projects tidy                             # report; --apply moves idle checkouts
 glaeda-worktree add --no-build REPO NAME         # a worktree under ~/Projects/worktrees/REPO/
