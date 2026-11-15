@@ -7713,8 +7713,18 @@ class XcodeToolchainTest(unittest.TestCase):
                 why, _ = hook.toolchain_refusal("m4pro-48", want, None, align=False)
                 self.assertIn("timed out after 0 s", why, "an empty drift past the budget is no answer too")
                 self.assertIn("zigVersion '' != '0.16.0'", why)
-                answers.update(zig="0.16.0")
+                answers.update(zig="0.15.0")
+                why, _ = hook.toolchain_refusal("m4pro-48", want, None, align=False)
+                self.assertTrue(why.startswith("node not eligible (toolchain drifted"), "a real answer is a drift")
+                answers.update(zig="0.16.0", python3="3.9")
+                why, _ = hook.toolchain_refusal("m4pro-48", want, None, align=False)
+                self.assertTrue(why.startswith("node not eligible (python3 on the job PATH is 3.9"), why)
+                answers.update(python3="3.13")
                 self.assertEqual(hook.toolchain_refusal("m4pro-48", want, None, align=False), (None, ""))
+                answers.update(zig="")
+                with mock.patch.object(hook, "xcode_refusal", return_value="toolchain: xcrun resolves /x"):
+                    why, _ = hook.toolchain_refusal("m4pro-48", want, self.XCODE, align=False)
+                    self.assertEqual(why, "toolchain: xcrun resolves /x", "the Xcode refusal keeps its own words")
 
     def test_the_runner_xcode_is_the_job_started_hooks_toolchain_xcode(self) -> None:
         runner = self.tmp / "actions-runner-glaeda-1"

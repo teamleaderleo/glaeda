@@ -2310,8 +2310,9 @@ def toolchain_refusal(fleet_class: str | None, want: dict[str, Any], xcode_app: 
     env = dict(os.environ)  # the runner's PATH, which is the job's (workload) PATH
     note = ""
 
-    def out_of_time(why: str) -> str:
-        if time.monotonic() < deadline:
+    def out_of_time(why: str, empty: bool) -> str:
+        """why, unless the probe behind it gave nothing (empty) after the deadline: that is no answer."""
+        if not empty or time.monotonic() < deadline:
             return why
         return (f"node not eligible (the toolchain probes timed out after {ELIGIBILITY_BUDGET_S:.0f} s; no answer, "
                 f"not a missing or drifted tool; unanswered: {why.removeprefix('node not eligible ')})")
@@ -2321,17 +2322,21 @@ def toolchain_refusal(fleet_class: str | None, want: dict[str, Any], xcode_app: 
         return missing, note
     if _probe(["rustc", "--version"], env, home, deadline) != str(want.get("rustcVersion")):
         toolchain = receipt_toolchain_name(want, env, home, deadline)
-        if toolchain is None:
-            return out_of_time(f"node not eligible (cannot name a toolchain for {want.get('rustcVersion')!r})"), note
+        if toolchain is None:  # a malformed receipt rustcVersion is no probe's fault
+            return out_of_time(f"node not eligible (cannot name a toolchain for {want.get('rustcVersion')!r})",
+                               bool(re.fullmatch(r"rustc \d+\.\d+\.\d+(?: .*)?",
+                                                 str(want.get("rustcVersion") or "")))), note
         names = [line.split()[0] for line in _probe(["rustup", "toolchain", "list"], env, home, deadline).splitlines()
                  if line.strip()]
         if toolchain not in names:
-            return out_of_time(f"node not eligible (rust toolchain {toolchain} is not installed)"), note
+            return out_of_time(f"node not eligible (rust toolchain {toolchain} is not installed)", not names), note
         if align:
             current = _probe(["rustup", "default"], env, home, deadline).split()[:1]
             _probe(["rustup", "default", toolchain], env, home, deadline)
-            if _probe(["rustup", "default"], env, home, deadline).split()[:1] != [toolchain]:
-                return out_of_time(f"node not eligible (could not set the rustup default to {toolchain})"), note
+            now = _probe(["rustup", "default"], env, home, deadline).split()[:1]
+            if now != [toolchain]:
+                return out_of_time(f"node not eligible (could not set the rustup default to {toolchain})",
+                                   not now), note
             note = f"set the rustup default to {toolchain} (was {current[0] if current else 'none'})"
         else:
             env["RUSTUP_TOOLCHAIN"] = toolchain  # probe only: what the job would see once aligned
@@ -2339,9 +2344,9 @@ def toolchain_refusal(fleet_class: str | None, want: dict[str, Any], xcode_app: 
     python = _probe(["python3", "-c", "import sys; print('%d.%d' % sys.version_info[:2])"], env, home, deadline)
     if not re.fullmatch(r"\d+\.\d+", python) or tuple(map(int, python.split("."))) < MIN_WORKLOAD_PYTHON:
         return out_of_time(f"node not eligible (python3 on the job PATH is {python or 'missing'}; cmux's profile "
-                           f"runner needs {'.'.join(map(str, MIN_WORKLOAD_PYTHON))}+)"), note
+                           f"runner needs {'.'.join(map(str, MIN_WORKLOAD_PYTHON))}+)", not python), note
     if not _probe(["gh", "--version"], env, home, deadline):
-        return out_of_time("node not eligible (gh is not on the job PATH; cmux's CI scripts call gh api)"), note
+        return out_of_time("node not eligible (gh is not on the job PATH; cmux's CI scripts call gh api)", True), note
     if xcode_app:
         env["DEVELOPER_DIR"] = os.fspath(Path(xcode_app) / "Contents" / "Developer")
     have: dict[str, str] = {}
@@ -2358,7 +2363,8 @@ def toolchain_refusal(fleet_class: str | None, want: dict[str, Any], xcode_app: 
     drift = [f"{field} {have[field]!r} != {str(want[field])!r}" for field in fields
              if have.get(field) != str(want[field])]
     drifted = out_of_time(f"node not eligible (toolchain drifted from the {fleet_class} class receipt: "
-                          f"{'; '.join(drift)})") if drift else None  # timed out before the Xcode probe's own budget
+                          f"{'; '.join(drift)})", any(not have.get(field) for field in fields)) if drift else None
+    # judged before the Xcode probe, which runs on its own budget after the deadline
     if xcode_app:
         # after the receipt probes and on its own budget, so slow Xcode probes never starve them into a '' drift;
         # its refusal is the clearer reason for what drift may also see
