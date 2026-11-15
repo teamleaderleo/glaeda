@@ -471,6 +471,19 @@ IDLE_BACKOFF_MAX = 600  # ... but no less often than this (it expires at IDLE_EX
 # is this old, and a wait hands itself back from the daemon and reads GitHub once itself (direct_read). The heartbeat
 # alone vouched for data that was 50 minutes old on huge-blue (2026-11-11), and `restart` refused.
 STALE_DATA_AFTER = 600
+# After the quota stops explaining old waited data (staleExplainedAt), the daemon has this long to read the backlog
+# before the data counts as starved. huge-blue, 2026-11-11 to 11-15: the shared GraphQL pool sat under the reserve
+# for 10 to 20 minutes before each hourly reset (the alarm rightly "held"), and on the first tick after the reset, at
+# :36 or :37, the stale alarm fired on data the stop had aged ("1044s old"); a session ran `glaeda-gh restart` 4 to 9
+# s later every time, and the restart looked like the fix. The backlog was being read either way.
+STALE_CATCH_UP = STALE_DATA_AFTER
+# The release valve: waited data starved past STALE_DATA_AFTER with nothing explaining it, on this many ticks in a row,
+# restarts the daemon itself (a re-exec, like an update's) instead of waiting for a session to run `glaeda-gh
+# restart`. Not before the daemon has run STALE_DATA_AFTER itself (a new one has not had its chance), and at most
+# once per STALE_VALVE_COOLDOWN (restart.json "valve"): a second starvation that soon is not one a restart fixes.
+STALE_VALVE_TICKS = 2
+STALE_VALVE_COOLDOWN = 1800
+STALE_RESTART_ADVICE = "`glaeda-gh restart` restarts a daemon in this state."
 DIRECT_QUOTA = "GitHub's quota for this read is spent"  # direct_read's refusals no restart can help with
 DIRECT_UPSTREAM = "this host reads GitHub through an upstream (no login here)"
 DIRECT_READ_BUDGET = 60  # seconds a wait's own fallback read (direct_read) may take
@@ -2306,6 +2319,7 @@ def daemon_policy() -> dict:
     alarms = doc.get("alarms") if isinstance(doc.get("alarms"), dict) else {}
     return {"cycle": cycle, "commentCycle": comment, "graphqlPerMinute": per_minute,
             "alarms": {"pool": alarms.get("pool") is True, "share": alarms.get("share") is not False,
+                       "stale": alarms.get("stale") is not False, "staleRestart": alarms.get("staleRestart") is not False,
                        "restLeft": int(_bounded(alarms.get("restLeft"), ALARM_REST_LEFT, 0, 100000)),
                        "paceShare": float(_bounded(alarms.get("paceShare"), ALARM_PACE_SHARE, 0.0, 1.0))},
             "cycles": {"pr": cycle, "run": cycle, "comment": comment, "head": cycle},
@@ -2422,6 +2436,10 @@ class Daemon:
         self.heavy: dict[str, dict] = {}
         self.since: dict[str, float] = {}  # key -> when the daemon first saw it watched, for oldestData
         self.stale_waited: dict[str, float | None] = {}  # oldest_data's, for the watches a wait is blocked on
+        self.explained_at: dict[str, float] = {}  # kind -> the last tick stale_explained(kind) explained its old data
+        self.stale_streak = 0  # ticks in a row the stale alarm found starvation nothing explains (the valve)
+        self.valve_due: dict | None = None  # set by stale_valve: serve() restarts the daemon after this tick
+        self.started_tick: float | None = None  # the first tick's clock, for the valve's own-uptime bound
         self.recent_errors: dict[str, float] = {}  # error -> when last seen (daemon.json recentErrors)
         self.beat = float("-inf")
         self.status: dict[str, Any] = {}  # the last good tick's daemon.json
@@ -2663,6 +2681,8 @@ class Daemon:
             return None
         if self.stale_explained() is not None:
             return "held"
+        if self.catching_up(kind) is not None:
+            return "held"  # the quota explained it until moments ago: the backlog is being read (STALE_CATCH_UP)
         age_s = int(stale[kind])
         level = "fire" if age_s >= 3 * STALE_DATA_AFTER else "warn"
         where = getattr(self, "stale_waited_key", {}).get(kind) or "?"
@@ -2671,8 +2691,67 @@ class Daemon:
         quota = f" Quota: {hold[0]}." if hold else ""
         text = (f"{level.upper()} glaeda-gh on {policy_host()}: {kind} data that waits are blocked on is {age_s}s old "
                 f"(over {STALE_DATA_AFTER}s; oldest {key_name(where) if where != '?' else '?'}) while its heartbeat is "
-                f"fresh.{quota} Recent errors: {errors}. `glaeda-gh restart` restarts a daemon in this state.")
+                f"fresh.{quota} Recent errors: {errors}. {STALE_RESTART_ADVICE}")
         return level, text, {"kind": kind, "age": age_s, "key": where, **({"quota": hold[0]} if hold else {})}
+
+    def note_explained(self) -> None:
+        """Remember, per kind, the last tick whose old waited data stale_explained accounted for (the quota, an
+        upstream), for catching_up. Every tick, after oldest_data."""
+        for kind in CYCLES:
+            if self.stale_explained(kind) is not None:
+                self.explained_at[kind] = self.now
+
+    def catching_up(self, kind: str) -> float | None:
+        """Seconds since the quota (or an upstream) stopped explaining KIND's old waited data, while that is under
+        STALE_CATCH_UP: the daemon is reading the backlog the stop left, oldest waited first, and old data then is
+        not starvation. None otherwise."""
+        at = self.explained_at.get(kind)
+        if not isinstance(at, (int, float)):
+            return None
+        since = self.now - at
+        return since if since < STALE_CATCH_UP else None
+
+    def stale_valve(self, stale: tuple[str, str, dict] | str | None, policy: dict) -> tuple[str, str, dict] | str | None:
+        """The release valve over the stale alarm's verdict: starvation nothing explains on STALE_VALVE_TICKS ticks in a
+        row sets valve_due, and serve() restarts the daemon (restart_self) once the tick has sent the alarm, whose
+        text then says so (sent again for that, ALARM_EVERY notwithstanding: the first tick's WARN went out as before).
+        Past the valve's bounds (policy alarms.staleRestart off, a daemon younger than STALE_DATA_AFTER, a valve
+        restart within STALE_VALVE_COOLDOWN) the alarm stands as it was, saying why the valve did not act."""
+        if not isinstance(stale, tuple):
+            self.stale_streak = 0
+            return stale
+        self.stale_streak += 1
+        if self.stale_streak < STALE_VALVE_TICKS:
+            return stale
+        level, text, data = stale
+        if not policy.get("staleRestart", True):
+            return stale
+        up = self.now - (self.started_tick if self.started_tick is not None else self.now)
+        if up < STALE_DATA_AFTER:
+            return level, text, {**data, "valve": "young", "up": int(up)}
+        record = restart_record() or {}
+        ago = self.clock() - record["at"] if record.get("valve") else None
+        if ago is not None and 0 <= ago < STALE_VALVE_COOLDOWN:
+            said = (f"The daemon already restarted itself for this {int(ago)}s ago (stale valve) and that did not "
+                    "help, so another restart will not either: tell the owner.")
+            return level, text.replace(STALE_RESTART_ADVICE, said), {**data, "valve": "spent", "valveAgo": int(ago)}
+        self.valve_due = {"kind": data.get("kind"), "age": data.get("age"), "key": data.get("key"),
+                          "ticks": self.stale_streak}
+        said = (f"The daemon is restarting itself now (stale valve: {self.stale_streak} ticks in a row); nobody needs "
+                "to run `glaeda-gh restart`.")
+        return level, text.replace(STALE_RESTART_ADVICE, said), {**data, "valve": "restarting"}
+
+    def restart_self(self) -> dict:
+        """The valve's restart, recorded the way `glaeda-gh restart` records one (restart.json, so its cooldown and
+        this valve's see it) and logged. serve() then re-executes the daemon, as it does for an update: a fresh process
+        with none of this one's in-memory state, and the alarm already sent (a service restart would kill its
+        tell-coordinator child with the unit)."""
+        due, self.valve_due = self.valve_due or {}, None
+        record = {"at": self.clock(), "by": os.getpid(), "how": "self: stale valve (re-exec)", "ok": True,
+                  "ran": True, "valve": True, **{k: due.get(k) for k in ("kind", "age", "key")}}
+        write_json(BASE / "restart.json", record)
+        log({"event": "restart", "why": "stale valve", **{k: due.get(k) for k in ("kind", "age", "key", "ticks")}})
+        return record
 
     def check_alarms(self) -> None:
         """The pool alarm (policy alarms.pool): REST left under alarms.restLeft, or the drain over the last minutes
@@ -2721,7 +2800,7 @@ class Daemon:
                     f"({self.rest_spent()} in the last hour). Top routes, last {SPEND_RECENT // 60} min: {routes}.")
             firing["share"] = ("warn", text, {"pace": pace, "cap": cap, "spent": self.rest_spent(), "top": mine})
         if policy.get("stale", True):
-            stale = self.stale_alarm()
+            stale = self.stale_valve(self.stale_alarm(), policy)
             if stale == "held":
                 held.add("stale")
             elif stale is not None:
@@ -2732,7 +2811,7 @@ class Daemon:
             # worse: it became a FIRE, or another REST window (GitHub keeps two core counters) is the one running dry
             worse = level == "fire" and last.get("level") != "fire" or (
                 isinstance(last.get("reset"), (int, float)) and abs(last["reset"] - data.get("reset", last["reset"]))
-                > RESET_JITTER)
+                > RESET_JITTER) or data.get("valve") == "restarting"  # (the valve acting is always news)
             if last.get("at") and self.now - float(last["at"]) < ALARM_EVERY and not worse:
                 if last.get("cleared"):  # back within the hour: still the alarm already sent
                     self.alarms[name] = {k: v for k, v in last.items() if k != "cleared"}
@@ -4124,6 +4203,8 @@ class Daemon:
         self.now = time.time() if now is None else now
         self.clock_real = now is None
         self.tick_deadline = time.monotonic() + TICK_BUDGET
+        if self.started_tick is None:
+            self.started_tick = self.now
         self.errors = []
         self.refunded = {}
         self.spill = []
@@ -4257,6 +4338,7 @@ class Daemon:
         self.rest_tried = {k: t for k, t in self.rest_tried.items() if self.now - t < 2 * IDLE_EXPIRY}
         self.confirm_tried = {k: t for k, t in self.confirm_tried.items() if self.now - t[0] < 2 * IDLE_EXPIRY}
         oldest = self.oldest_data(entries, {e["key"] for e in prs + runs + comments + heads})
+        self.note_explained()  # before check_alarms: the stale alarm and the valve read it (catching_up)
         # errors[] is this tick's only, and a heartbeat tick writes it empty: what failed a minute ago stays visible
         for message in self.errors:
             self.recent_errors[message] = self.now
@@ -4307,6 +4389,7 @@ class Daemon:
                   "batch": dict(self.batch), "oldestData": oldest, "deferred": len(self.deferred),
                   "staleWaited": dict(self.stale_waited), "staleAfter": STALE_DATA_AFTER,
                   "staleWhy": self.stale_why(),
+                  "staleExplainedAt": {k: round(t, 3) for k, t in self.explained_at.items()},
                   "recentErrors": [{"error": m, "at": t} for m, t in self.recent_errors.items()],
                   "outbox": {"queued": len(list(outbox_dir().glob("*.json"))) if outbox_dir().is_dir() else 0,
                              "holdUntil": self.post_hold if self.post_hold > self.now else None}}
@@ -6166,6 +6249,10 @@ def serve(foreground_ok: bool = False) -> int:
         time.sleep(TICK)
         watchdog.beat()
         try:
+            if daemon.valve_due is not None:
+                # the stale valve (Daemon.stale_valve): a fresh daemon, the way an update starts one
+                daemon.restart_self()
+                os.execv(sys.executable, [sys.executable, os.fspath(me), "serve"] + (["--foreground-ok"] if foreground_ok else []))
             if me.stat().st_mtime != stamp:
                 log({"event": "reexec"})
                 os.execv(sys.executable, [sys.executable, os.fspath(me), "serve"] + (["--foreground-ok"] if foreground_ok else []))
@@ -6500,11 +6587,19 @@ def daemon_starved(status: Any = None) -> dict | None:
     upstream = (status.get("upstream") if isinstance(status.get("upstream"), dict) else {}).get("state") == "ok"
     held = (status.get("staleWhy") if isinstance(status.get("staleWhy"), dict) else {}).get(kind)
     held = held if isinstance(held, dict) and isinstance(held.get("why"), str) else None
+    # The quota explained it until moments ago (STALE_CATCH_UP): the daemon is reading the backlog, and a restart
+    # would only start that over (huge-blue 2026-11-15: five restarts, each seconds after an hourly reset).
+    explained = status.get("staleExplainedAt") if isinstance(status.get("staleExplainedAt"), dict) else {}
+    ended = explained.get(kind)
+    ended = time.time() - ended if isinstance(ended, (int, float)) and not isinstance(ended, bool) else None
+    catching = ended is not None and 0 <= ended < STALE_CATCH_UP
     why = ("this host reads GitHub through an upstream, whose daemon reads it" if upstream
            else held["why"] if held else "GitHub's quota is spent (GraphQL stopped, REST at its share)" if quota
+           else (f"the quota held these reads until {int(ended)}s ago and the daemon is reading the backlog it left, "
+                 "waited data first") if catching
            else None)
-    return {"kind": kind, "age": ages[kind], "quota": quota or upstream or bool(held and held.get("quota") is True),
-            "why": why}
+    return {"kind": kind, "age": ages[kind],
+            "quota": quota or upstream or bool(held and held.get("quota") is True) or catching, "why": why}
 
 
 def daemon_failing() -> dict | None:

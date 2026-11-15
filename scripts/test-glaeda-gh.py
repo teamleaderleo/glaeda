@@ -12660,6 +12660,7 @@ class SpendAlarmTest(Base):
         self.policy()
         self.daemon.stale_waited, self.daemon.stale_waited_key = {"pr": 700.0}, {"pr": "pr:o/r#5"}
         self.daemon.check_alarms()
+        self.told_lines()  # each tell-coordinator runs in the background: the two raced to told.txt (3 of 5 failed)
         self.daemon.now, self.daemon.stale_waited = NOW + 1200, {"pr": 1900.0}
         self.daemon.check_alarms()  # worse: a FIRE goes out at once
         self.daemon.now, self.daemon.stale_waited = NOW + 1300, {"pr": 2000.0}
@@ -12752,6 +12753,120 @@ class SpendAlarmTest(Base):
                                      "upstream": {"state": "failing"}, "modes": {"graphql": "normal", "rest": "normal"}})
         self.assertFalse(starved["quota"])
 
+    def test_the_stale_alarm_holds_while_the_backlog_a_quota_stop_left_is_read(self) -> None:
+        """huge-blue 2026-11-15 (13:37, 14:37, 17:38, 18:37): GraphQL stopped under the reserve for 10 to 20 minutes, the
+        alarm rightly held, and on the first tick after the hourly reset it fired on the data the stop had aged ("1044s
+        old"); a session restarted the daemon seconds later every time. The backlog gets STALE_CATCH_UP to be read."""
+        self.policy()
+        self.daemon.stale_waited, self.daemon.stale_waited_key = {"pr": 1000.0}, {"pr": "pr:o/r#5"}
+        self.daemon.backoff = {"rest": NOW + 600, "graphql": NOW + 600}  # the quota stops the reads
+        self.daemon.note_explained()
+        self.daemon.check_alarms()
+        self.assertEqual(self.told_lines(), [])
+        ended = NOW
+        self.daemon.now, self.daemon.backoff = NOW + 2, {"rest": 0.0, "graphql": 0.0}  # the reset: GraphQL is back
+        self.daemon.stale_waited = {"pr": 1044.0}
+        self.daemon.note_explained()
+        self.daemon.check_alarms()
+        self.assertEqual(self.told_lines(), [], "the first tick after a quota stop is catching up, not starved")
+        self.assertFalse((gg.read_json(gg.BASE / gg.ALARMS_FILE) or {}).get("stale", {}).get("cleared"))
+        self.assertEqual(self.daemon.catching_up("pr"), 2)
+        # daemon.json carries it, so `glaeda-gh restart` says a restart would not help instead of restarting
+        starved = gg.daemon_starved({"at": time.time(), "staleWaited": {"pr": 1044.0},
+                                     "staleExplainedAt": {"pr": time.time() - 2},
+                                     "modes": {"graphql": "normal", "rest": "lean"}, "restShare": {"capped": True}})
+        self.assertTrue(starved["quota"], starved)
+        self.assertIn("reading the backlog", starved["why"])
+        later = gg.daemon_starved({"at": time.time(), "staleWaited": {"pr": 1044.0},
+                                   "staleExplainedAt": {"pr": time.time() - gg.STALE_CATCH_UP - 1},
+                                   "modes": {"graphql": "normal", "rest": "lean"}, "restShare": {"capped": True}})
+        self.assertFalse(later["quota"], later)
+        # still starved once the catch-up has had its time: that is this daemon's fault, and it alarms
+        self.daemon.now, self.daemon.stale_waited = ended + gg.STALE_CATCH_UP + 1, {"pr": 1700.0}
+        self.daemon.note_explained()
+        self.daemon.check_alarms()
+        told = self.told_lines()
+        self.assertEqual(len(told), 1, told)
+        self.assertIn("1700s old", told[0])
+
+    def test_the_valve_restarts_a_daemon_starved_two_ticks_in_a_row_and_the_alarm_says_so(self) -> None:
+        self.policy()
+        self.daemon.started_tick = NOW - 2 * gg.STALE_DATA_AFTER
+        self.daemon.stale_waited, self.daemon.stale_waited_key = {"pr": 700.0}, {"pr": "pr:o/r#5"}
+        self.daemon.check_alarms()
+        self.assertIsNone(self.daemon.valve_due, "one tick is not yet a pattern")
+        told = self.told_lines()
+        self.assertEqual(len(told), 1, told)
+        self.assertIn(gg.STALE_RESTART_ADVICE, told[0])
+        self.daemon.now = NOW + gg.TICK
+        self.daemon.check_alarms()
+        self.assertEqual(self.daemon.valve_due, {"kind": "pr", "age": 700, "key": "pr:o/r#5", "ticks": 2})
+        told = self.told_lines()
+        self.assertEqual(len(told), 2, "the valve acting is said at once, within the hour of the first WARN")
+        self.assertIn("restarting itself now (stale valve: 2 ticks in a row)", told[1])
+        self.assertNotIn(gg.STALE_RESTART_ADVICE, told[1])
+        self.assertEqual(self.notice_lines()[-1]["data"]["valve"], "restarting")
+        record = self.daemon.restart_self()
+        self.assertIsNone(self.daemon.valve_due)
+        self.assertEqual(gg.read_json(gg.BASE / "restart.json"), record)
+        self.assertTrue(record["valve"] and record["ok"] and record["ran"])
+        self.assertIsNotNone(gg.recent_restart(now=record["at"] + 5), "`glaeda-gh restart`'s cooldown sees it")
+        # starved again soon after: a restart did not help, so the valve does not loop; the alarm says to tell the owner
+        again = self.daemon.stale_valve(("warn", f"WARN x. {gg.STALE_RESTART_ADVICE}", {"kind": "pr"}),
+                                        self.daemon.policy["alarms"])
+        self.assertIsNone(self.daemon.valve_due)
+        self.assertEqual(again[2]["valve"], "spent")
+        self.assertIn("did not help", again[1])
+        self.daemon.now = NOW + gg.STALE_VALVE_COOLDOWN + 10
+        self.daemon.stale_valve(("warn", "x", {"kind": "pr"}), self.daemon.policy["alarms"])
+        self.assertIsNotNone(self.daemon.valve_due, "past the cooldown the valve acts again")
+
+    def test_the_valve_waits_for_a_daemon_to_have_had_its_chance_and_obeys_policy(self) -> None:
+        self.policy()
+        stale = ("warn", "x", {"kind": "pr"})
+        for setup in ("young", "off", "explained"):
+            with self.subTest(setup=setup):
+                self.daemon.valve_due, self.daemon.stale_streak = None, gg.STALE_VALVE_TICKS
+                self.daemon.started_tick = NOW if setup == "young" else NOW - 2 * gg.STALE_DATA_AFTER
+                policy = {**self.daemon.policy["alarms"], "staleRestart": setup != "off"}
+                verdict = self.daemon.stale_valve("held" if setup == "explained" else stale, policy)
+                self.assertIsNone(self.daemon.valve_due)
+                if setup == "explained":
+                    self.assertEqual((verdict, self.daemon.stale_streak), ("held", 0))
+        self.assertTrue(gg.daemon_policy()["alarms"]["staleRestart"])
+
+    def test_serve_reexecs_the_daemon_when_the_valve_is_due(self) -> None:
+        gg.BASE.mkdir(parents=True, exist_ok=True)
+        calls: list[str] = []
+
+        class NeverExeced(BaseException):
+            pass  # (not an Exception: serve's loop catches those and keeps serving)
+
+        class Valved:
+            valve_due: dict | None = None
+            ticks = 0
+
+            def tick(self) -> dict:
+                self.ticks += 1
+                if self.ticks > 2:
+                    raise NeverExeced  # the valve was due after the first tick: serve must have re-executed by now
+                self.valve_due = {"kind": "pr"}
+                return {"modes": {}, "paths": {}, "errors": []}
+
+            def restart_self(self) -> dict:
+                calls.append("restart_self")
+                return {}
+
+        class Exec(Exception):
+            pass
+
+        with mock.patch.object(gg, "Daemon", Valved), mock.patch.object(gg, "Watchdog"), \
+                mock.patch.object(gg.time, "sleep"), \
+                mock.patch.object(gg.os, "execv", side_effect=Exec) as execv, self.assertRaises(Exec):
+            gg.serve()
+        self.assertEqual(calls, ["restart_self"])
+        self.assertEqual(execv.call_args.args[1][-1], "serve")
+
     def test_the_pace_alarm_is_off_at_a_zero_share(self) -> None:
         for name in ("FLEET_POLICY", "UPDATE_CONFIG", "DAEMON_CONFIG"):
             self.addCleanup(setattr, gg, name, getattr(gg, name))
@@ -12788,10 +12903,16 @@ class SpendAlarmTest(Base):
         for name in ("FLEET_POLICY", "UPDATE_CONFIG", "DAEMON_CONFIG"):
             self.addCleanup(setattr, gg, name, getattr(gg, name))
             setattr(gg, name, Path(self.tmp.name) / f"{name.lower()}.json")
-        self.assertEqual(gg.daemon_policy()["alarms"], {"pool": False, "share": True, "restLeft": 1000, "paceShare": 0.5})
+        on = {"stale": True, "staleRestart": True}
+        self.assertEqual(gg.daemon_policy()["alarms"], {"pool": False, "share": True, "restLeft": 1000, "paceShare": 0.5,
+                                                        **on})
         gg.DAEMON_CONFIG.write_text(json.dumps({"alarms": {"pool": True, "share": False, "restLeft": 2000,
                                                            "paceShare": 0.25}}))
-        self.assertEqual(gg.daemon_policy()["alarms"], {"pool": True, "share": False, "restLeft": 2000, "paceShare": 0.25})
+        self.assertEqual(gg.daemon_policy()["alarms"], {"pool": True, "share": False, "restLeft": 2000, "paceShare": 0.25,
+                                                        **on})
+        # the stale alarm and its valve each turn off (alarms.stale was dropped by the parser, so it never could)
+        gg.DAEMON_CONFIG.write_text(json.dumps({"alarms": {"stale": False, "staleRestart": False}}))
+        self.assertEqual({k: gg.daemon_policy()["alarms"][k] for k in on}, {"stale": False, "staleRestart": False})
         gg.DAEMON_CONFIG.write_text(json.dumps({"alarms": {"paceShare": 2}}))  # out of range: the default
         self.assertEqual(gg.daemon_policy()["alarms"]["paceShare"], 0.5)
         del fleet
