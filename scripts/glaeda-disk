@@ -6541,7 +6541,7 @@ def git_loss(path: Path) -> str:
 
 def _git_dir_run(gitdir: Path, *args: str, timeout: int = 60,
                  network: bool = False, stdin: str | None = None) -> str | None:
-    env = {**os.environ, "GIT_OPTIONAL_LOCKS": "0", "GIT_TERMINAL_PROMPT": "0"}
+    env = {**os.environ, "GIT_OPTIONAL_LOCKS": "0", "GIT_TERMINAL_PROMPT": "0", **NO_LAZY_FETCH}
     if network and "GIT_SSH_COMMAND" not in env:
         env["GIT_SSH_COMMAND"] = "ssh -o BatchMode=yes -o ConnectTimeout=10"
     try:
@@ -6570,6 +6570,16 @@ def _git_subcommand(args: tuple[str, ...]) -> str:
         i += 2 if args[i] == "-c" else 1
     return args[i] if i < len(args) else ""
 
+
+# A disk reclaim never writes objects into the repository it judges. In a partial clone (blob:none, a promisor
+# remote) git fetches any object it cannot find on demand, so `cat-file --batch-check` of the commits a server
+# advertises pulled whole branches' history into the clone, past the timeout, and the reclaim then gave up with
+# "unreadable objects": a CI mini under its floor, 2026-11-15, gained about 0.9 GiB of packs in a home-scratch
+# lane's blobless cmux clone in two minutes, every pass, and the folder was never taken. With lazy fetch off git
+# reports such an object missing, which every reader here already treats as not held locally. An explicit
+# `git fetch` is not a lazy fetch and still runs. GIT_NO_LAZY_FETCH is read by git 2.44 and later.
+NO_LAZY_FETCH = {"GIT_NO_LAZY_FETCH": "1"}
+os.environ.update(NO_LAZY_FETCH)  # every git this process starts, not only _git_dir_run's
 
 ZERO = re.compile(r"0{40}(0{24})?$")
 

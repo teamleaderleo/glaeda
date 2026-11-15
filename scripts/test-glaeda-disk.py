@@ -9134,6 +9134,31 @@ class LinuxLayoutTest(unittest.TestCase):
         self.assertIsNotNone(gd._git_dir_run(clone / ".git", "-c", "protocol.version=2", "for-each-ref"))
         self.assertIsNone(gd._git_dir_run(clone / ".git", "status"))  # a command that reads the work tree still fails
 
+    def test_a_reclaim_never_lazily_fetches_into_a_partial_clone(self) -> None:
+        """A CI mini under its floor, 2026-11-15: judging a blobless (blob:none) lane clone, cat-file of the
+        server's commits fetched about 0.9 GiB of packs into it each pass, then gave up as "unreadable objects"."""
+        env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+               "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
+        env.pop("GIT_NO_LAZY_FETCH", None)  # the setup clone below is a real one; glaeda-disk set it process-wide
+        srv = self.home / "srv-partial"
+        subprocess.run(["git", "init", "-q", "-b", "main", str(srv)], check=True, env=env)
+        (srv / "big.txt").write_text("x" * 4096)
+        subprocess.run(["git", "-C", str(srv), "add", "big.txt"], check=True, env=env)
+        subprocess.run(["git", "-C", str(srv), "commit", "-q", "-m", "c0"], check=True, env=env)
+        subprocess.run(["git", "-C", str(srv), "config", "uploadpack.allowFilter", "true"], check=True, env=env)
+        blob = subprocess.run(["git", "-C", str(srv), "rev-parse", "HEAD:big.txt"], check=True, env=env,
+                              capture_output=True, text=True).stdout.strip()
+        clone = self.home / "partial"
+        subprocess.run(["git", "clone", "-q", "--no-checkout", "--filter=blob:none", f"file://{srv}", str(clone)],
+                       check=True, env=env)
+        packs = sorted(p.name for p in (clone / ".git/objects/pack").iterdir())
+        self.assertEqual(os.environ.get("GIT_NO_LAZY_FETCH"), "1")  # every git glaeda-disk starts
+        self.assertIsNone(gd._git_dir_run(clone / ".git", "cat-file", "-p", blob))  # missing, not fetched
+        out = gd._git_dir_run(clone / ".git", "cat-file", "--batch-check=%(objectname) %(objecttype)",
+                              stdin=f"{blob}\n")
+        self.assertEqual(out.split(), [blob, "missing"])  # the readers here count it as not held locally
+        self.assertEqual(sorted(p.name for p in (clone / ".git/objects/pack").iterdir()), packs)  # nothing written
+
     def test_a_mirror_with_nothing_unpushed_goes_without_a_bundle(self) -> None:
         unit, _, _ = self.mirror_unit()
         rec, _ = self.apply_mirror(unit)
