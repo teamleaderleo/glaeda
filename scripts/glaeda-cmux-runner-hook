@@ -6970,6 +6970,7 @@ class Gate:
         self.reserve_fd: int | None = None  # a gui runner's capacity/<gui token>.reserve flock while it is idle
         self.started_wall = 0.0  # time.time() when start() last started run.sh (registration_deleted's log)
         self.registration = read_registration(state_dir, runner_dir)  # kept across gate restarts: the backoff holds
+        self.registration_held = False  # registration_wait()'s last answer: a deleted registration's backoff holds
         self.free_logged = False  # the restart wait's free line is the last hold line logged (a hold back logs again)
         # the live state last written (gate_state_file): its line, since when (wall), and when written (monotonic)
         self.state_line: str | None = None
@@ -7823,8 +7824,10 @@ class Gate:
         if mtime is not None and mtime != self.registration.get("runner_mtime"):
             gate_log("the runner was re-configured; listening again")
             self.registration["runner_mtime"] = mtime  # one try now; the record stays until a listener stays up
+            self.registration_held = False
             return False
-        return time.time() < float(self.registration.get("retry_after") or 0)
+        self.registration_held = time.time() < float(self.registration.get("retry_after") or 0)
+        return self.registration_held
 
     def registration_ok(self) -> None:
         """A listener up GATE_REGISTRATION_OK_S has its registration: clear the record."""
@@ -7945,9 +7948,10 @@ class Gate:
             if self.stop_deadline is not None:
                 return f"stopping the idle listener: {self.held}"
             return "starting the listener"
-        if self.child is None and self.registration and time.time() < float(self.registration.get("retry_after") or 0):
-            return (f"holding the listener off: {REGISTRATION_DELETED}: GitHub deleted this runner's registration; "
-                    f"trying again after {gate_stamp(float(self.registration['retry_after']))}")
+        if self.child is None and self.registration and self.registration_held:
+            # worded like its log line, with no hold prefix: a runner that needs re-registering reads as down
+            return (f"{REGISTRATION_DELETED}: GitHub deleted this runner's registration; it needs re-registering, "
+                    f"trying again after {gate_stamp(float(self.registration.get('retry_after') or 0))}")
         if self.held is None:
             return None
         if self.free_since is not None and self.stopped_one and self.streak >= GATE_CONFIRM:
