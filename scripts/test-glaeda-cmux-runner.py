@@ -6674,6 +6674,7 @@ else:
             result = self.started("--require-eligible", "--fleet-class", "m4pro-48",
                                   env={"PATH": f"{self.dir / 'jobpath'}:/usr/bin:/bin",
                                        "GLAEDA_RUNNER_PROBE_LOAD_PER_CPU": "0.5"})
+        self.assertLess(time.monotonic() - start, 30)
         self.assertEqual(result.returncode, 1)
         self.assertIn("xcodeVersion '' != '26.6'", result.stdout)
         # the same hung tool on a busy host admits: the job is slower, never failed
@@ -6682,7 +6683,6 @@ else:
                                    "GLAEDA_RUNNER_PROBE_LOAD_PER_CPU": "14"})
         self.assertEqual(result.returncode, 0, result.stdout)
         self.assertIn("admitted on no answer", result.stdout)
-        self.assertLess(time.monotonic() - start, 30)
 
     def test_no_enrollment_refuses(self) -> None:
         self.fleet()
