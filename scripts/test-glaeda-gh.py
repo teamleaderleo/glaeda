@@ -21,6 +21,7 @@ import threading
 import time
 import socket
 import unittest
+import urllib.parse
 from unittest import mock
 from pathlib import Path
 from typing import Any
@@ -217,6 +218,8 @@ class FakeGitHub:
         self.counts = False  # answer the fingerprint's counts (pr_fingerprint): off, no PR is ever probed
         self.probes = 0  # PR_PROBE queries answered
         self.full_reads = 0  # full PR queries answered
+        self.named_calls: list[str] = []  # check-runs?check_name=NAME reads, by NAME
+        self.whole_heads = False  # REST check runs and statuses list self.heads (every page), not a PR's rollup page
 
     def rate(self, resource: str, remaining: int) -> dict:
         return {"x-ratelimit-limit": "5000", "x-ratelimit-remaining": str(remaining),
@@ -417,6 +420,8 @@ class FakeGitHub:
         for node in self.prs.values():
             if node["headRefOid"] == sha:
                 contexts = ((node["commits"]["nodes"][0]["commit"]["statusCheckRollup"] or {}).get("contexts") or {}).get("nodes") or []
+        if self.whole_heads and (owner, repo, sha) in self.heads:  # REST lists the whole commit, not a rollup page
+            contexts = self.heads[(owner, repo, sha)]
         runs = {c["checkSuite"]["workflowRun"]["databaseId"]: c for c in contexts
                 if ((c.get("checkSuite") or {}).get("workflowRun") or {}).get("databaseId")}
         if what == "actions":
@@ -433,6 +438,10 @@ class FakeGitHub:
                 {"context": c["context"], "state": c["state"].lower(), "target_url": c.get("targetUrl"),
                  "created_at": c.get("createdAt")} for c in listed[100 * (page - 1):100 * page]]}
         checks = [c for c in contexts if c["__typename"] == "CheckRun"]
+        if "check_name=" in path:
+            name = urllib.parse.unquote(path.split("check_name=", 1)[1].split("&")[0])
+            self.named_calls.append(name)
+            checks = [c for c in checks if c["name"] == name]
         page = int(path.split("page=")[-1]) if "&page=" in path else 1
         checks_page = checks[100 * (page - 1):100 * page]
         return {"total_count": len(checks), "check_runs": [
@@ -2662,9 +2671,122 @@ class BalanceTest(Base):
         data = gg.read_cache("pr:o/r#11")["data"]
         self.assertEqual(len(data["checks"]), 100)
         self.assertEqual(data["checksPageError"], "graphql: PR check pages over their hourly share")
+        self.assertEqual((data["requiredUnread"], data["requiredMissing"]), (["job-149"], []))  # unread, not missing
         self.assertIsNone(gg.verdict("pr", data))  # a required check past the first page is unread: pending
         self.assertIsNone(gg.verdict("pr", data, until="required"))
         self.assertEqual(len(self.gh.gql_calls()), 1)
+
+    CLIPPY = "clippy (changed cmux-tui packages)"
+
+    def big_pr(self, number: int, required: list[str], extra: list[dict] = (), rollup: str = "FAILURE") -> list[dict]:
+        """manaflow-ai/cmux#43194's shape: 243 contexts, the base requiring names that sit past the first 100."""
+        checks = [workflow_check(f"job-{i}", 5) for i in range(243)]
+        checks[150] = workflow_check(self.CLIPPY, 6)
+        checks += list(extra)
+        first = pr_node(number, rollup=rollup, checks=checks[:100])
+        contexts = first["commits"]["nodes"][0]["commit"]["statusCheckRollup"]["contexts"]
+        contexts["totalCount"] = len(checks)
+        contexts["pageInfo"] = {"hasNextPage": True, "endCursor": "100"}
+        first["baseRef"] = {"branchProtectionRule": {"requiredStatusCheckContexts": required}, "rules": {"nodes": []}}
+        self.gh.prs[("o", "r", number)] = first
+        self.gh.heads[("o", "r", "a" * 40)] = checks
+        self.gh.whole_heads = True
+        self.budgets(rest=(3000, 3000), graphql=(4000, 3000))
+        # the follow-up pages are held, as cmux#43412 read them: only the first 100 contexts come from the rollup
+        self.daemon.gql_log = [(NOW - 60, "pr-pages", gg.PR_PAGES_POINTS_PER_HOUR)]
+        return checks
+
+    def test_required_check_past_page_one_is_read_by_name_while_pages_are_held(self) -> None:
+        """manaflow-ai/cmux#43194 (leo-workspace#5184 ask 3): "clippy (changed cmux-tui packages)" passed, past the
+        first 100 of ~243 contexts, while the check pages were held; status called it "required, not reported yet".
+        It is read by name (one REST read for one required name, no page) and decides `wait --until required`."""
+        self.big_pr(31, [self.CLIPPY])
+        gg.register("pr:o/r#31")
+        self.daemon.tick(NOW)
+        data = gg.read_cache("pr:o/r#31")["data"]
+        self.assertNotIn("checksPageError", data)
+        self.assertEqual(data["requiredMissing"], [])
+        self.assertNotIn("requiredUnread", data)
+        clippy = [c for c in data["checks"] if c["name"] == self.CLIPPY]
+        self.assertEqual([(c["conclusion"], c["required"]) for c in clippy], [("SUCCESS", True)])
+        self.assertEqual(self.gh.named_calls, [self.CLIPPY])  # cost follows the required names, not the contexts
+        self.assertEqual(len(self.gh.gql_calls()), 1, "no follow-up page")
+        self.assertEqual(gg.verdict("pr", data, until="required"), gg.EXIT_OK)  # every required name read, passed
+        text = gg.summary("pr:o/r#31", {"data": data})
+        self.assertNotIn("not reported yet", text)
+        self.assertNotIn("not read yet", text)
+
+    def test_required_check_read_by_name_that_failed_fails_the_required_wait(self) -> None:
+        checks = self.big_pr(32, [self.CLIPPY])
+        checks[150].update(conclusion="FAILURE")
+        checks[150]["checkSuite"]["conclusion"] = "FAILURE"
+        gg.register("pr:o/r#32")
+        self.daemon.tick(NOW)
+        data = gg.read_cache("pr:o/r#32")["data"]
+        self.assertNotIn("checksPageError", data)
+        self.assertEqual(gg.verdict("pr", data, until="required"), gg.EXIT_FAIL)
+        self.assertIn(f"failed: {self.CLIPPY}", gg.summary("pr:o/r#32", {"data": data}))
+
+    def test_required_name_with_no_run_and_no_status_is_missing_read_in_full(self) -> None:
+        """No check run by the name and every status read: truly not reported, so requiredMissing, with no page read.
+        A required status context is found among the commit's statuses."""
+        status = {"__typename": "StatusContext", "context": "ci-status", "state": "SUCCESS", "targetUrl": "https://ci/s"}
+        self.big_pr(33, [self.CLIPPY, "ci-status", "never-ran"], extra=[status], rollup="PENDING")
+        gg.register("pr:o/r#33")
+        self.daemon.tick(NOW)
+        data = gg.read_cache("pr:o/r#33")["data"]
+        self.assertNotIn("checksPageError", data)
+        self.assertEqual(data["requiredMissing"], ["never-ran"])
+        self.assertEqual([c["conclusion"] for c in data["checks"] if c["name"] == "ci-status"], ["SUCCESS"])
+        self.assertEqual(sorted(self.gh.named_calls), sorted([self.CLIPPY, "ci-status", "never-ran"]))
+        self.assertEqual(len([c for c in self.gh.rest_calls() if "/status?" in c[1]]), 1)
+        self.assertEqual(len(self.gh.gql_calls()), 1)
+        self.assertIsNone(gg.verdict("pr", data, until="required"))  # pending until it reports
+        self.assertIn("required, not reported yet: never-ran", gg.summary("pr:o/r#33", {"data": data}))
+
+    def test_held_pages_and_no_rest_room_read_as_unread_never_missing(self) -> None:
+        """leo-workspace#5184 ask 2: with the pages held and no room to read by name, the rollup is partial. Status
+        says so on the checks line, with the error, and names the required check as not read yet, never as not
+        reported yet; --json keeps it in requiredUnread, and requiredMissing is only for a whole read."""
+        self.big_pr(34, [self.CLIPPY])
+        with mock.patch.object(self.daemon, "rest_room", return_value=False):
+            gg.register("pr:o/r#34")
+            self.daemon.tick(NOW)
+        data = gg.read_cache("pr:o/r#34")["data"]
+        self.assertEqual(data["checksPageError"], "graphql: PR check pages over their hourly share")
+        self.assertEqual(data["requiredMissing"], [])
+        self.assertEqual(data["requiredUnread"], [self.CLIPPY])
+        self.assertEqual(self.gh.named_calls, [])
+        self.assertIsNone(gg.verdict("pr", data, until="required"))
+        text = gg.summary("pr:o/r#34", {"data": data})
+        self.assertIn("checks PENDING (partial: 100 of 243 read; check pages held: "
+                      "graphql: PR check pages over their hourly share)", text)
+        self.assertIn(f"required, not read yet (check pages held): {self.CLIPPY}", text)
+        self.assertNotIn("not reported yet", text)
+        doc = json.loads(gg.render("pr:o/r#34", gg.read_cache("pr:o/r#34"), True))
+        self.assertEqual((doc["data"]["requiredUnread"], doc["data"]["requiredMissing"]), ([self.CLIPPY], []))
+
+    def test_a_partial_cache_from_before_required_unread_reads_as_unread(self) -> None:
+        """A cache an older daemon wrote (requiredMissing beside checksPageError) prints the same as a new one."""
+        data = gg.parse_pr(pr_node(35, checks=[workflow_check("job-0", 5)]))
+        data.update(requiredMissing=[self.CLIPPY], checksPageError="graphql: PR check pages wait for the per-minute ceiling",
+                    checksTruncated=True, checksTotal=243)
+        text = gg.summary("pr:o/r#35", {"data": data})
+        self.assertIn("(partial: 1 of 243 read; check pages held: graphql: PR check pages wait for the per-minute "
+                      "ceiling)", text)
+        self.assertIn(f"required, not read yet (check pages held): {self.CLIPPY}", text)
+        self.assertNotIn("not reported yet", text)
+
+    def test_required_by_name_answers_are_conditional(self) -> None:
+        """A second read of an unchanged by-name answer is a 304, which GitHub does not count."""
+        self.big_pr(36, [self.CLIPPY])
+        self.daemon.now = NOW
+        first = self.daemon.required_by_name("o", "r", "a" * 40, [self.CLIPPY], 36)
+        left = self.gh.rest_remaining
+        again = self.daemon.required_by_name("o", "r", "a" * 40, [self.CLIPPY], 36)
+        self.assertEqual(first, again)
+        self.assertIsNone(again[1])
+        self.assertEqual(self.gh.rest_remaining, left, "the unchanged answer was free")
 
     def test_a_stale_graphql_counter_rate_limit_cannot_see_does_not_force_a_read_every_tick(self) -> None:
         """Review of #1834 (F3): a poorer GraphQL counter seen long ago, which /rate_limit does not report, made every

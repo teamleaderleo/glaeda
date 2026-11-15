@@ -2058,6 +2058,7 @@ def parse_pr(node: dict) -> dict:
     reported = {c.get("name") for c in checks}
     return {
         "requiredMissing": sorted(name for name in required if name and name not in reported),
+        "requiredNames": sorted(name for name in required if name),  # what the base requires (check_verdict)
         "number": node.get("number"), "url": node.get("url"), "title": node.get("title"),
         "state": node.get("state"), "isDraft": node.get("isDraft"), "merged": node.get("merged"),
         "mergedAt": node.get("mergedAt"), "mergeable": node.get("mergeable"),
@@ -2070,6 +2071,28 @@ def parse_pr(node: dict) -> dict:
         "checkCounts": check_counts(contexts),
         "checksTruncated": bool((contexts.get("pageInfo") or {}).get("hasNextPage")),
     }
+
+
+def split_unread(data: dict) -> dict:
+    """DATA (parse_pr's answer) with its required names kept apart by how sure the read is: on a partial rollup
+    (checksPageError) a required name not in `checks` may sit past the pages read, so it is `requiredUnread`, and
+    `requiredMissing` (not reported, read in full) is empty. manaflow-ai/cmux#43194, 2026-11-15: a held page left
+    "clippy (changed cmux-tui packages)" past page one, and status sent agents at that passed check as missing."""
+    if not data.get("checksPageError"):
+        return data
+    unread = sorted(set(data.get("requiredUnread") or []) | set(data.get("requiredMissing") or []))
+    data["requiredUnread"], data["requiredMissing"] = unread, []
+    return data
+
+
+def required_names(base: dict) -> set[str]:
+    """The contexts a PR's base requires, from its classic protection and its rulesets (GraphQL baseRef)."""
+    required = set((base.get("branchProtectionRule") or {}).get("requiredStatusCheckContexts") or [])
+    for rule in ((base.get("rules") or {}).get("nodes") or []):
+        for item in ((rule.get("parameters") or {}).get("requiredStatusChecks") or []):
+            if item.get("context"):
+                required.add(item["context"])
+    return {name for name in required if name}
 
 
 def known_steps(pairs: list[tuple[dict, dict]]) -> dict[str, list]:
@@ -2159,6 +2182,19 @@ PR_CONTEXT_MAX_PAGES = 20  # 2,000 contexts per PR; beyond that the cache stays 
 # watched PR every cycle once spent 1678 of one daemon's 1958 points an hour (#1830), and the landers that need the
 # same hour to read their gates must never be starved by a completeness read.
 PR_PAGES_POINTS_PER_HOUR = 300
+NAMED_READS_KEPT = 2000  # required_by_name's conditional answers kept in memory; past it the store starts over
+
+
+def named_check_node(run: dict) -> dict:
+    """A REST check run read by name (required_by_name) as a statusCheckRollup context node. It is required (its
+    name is), and its workflow is unknown: REST names only its suite, and parse_pr keys a check by workflow and name,
+    so it never stands beside the same run read from the rollup (only names the rollup did not show are read)."""
+    return {"__typename": "CheckRun", "id": run.get("node_id"), "name": run.get("name"),
+            "status": upper(run.get("status")), "conclusion": upper(run.get("conclusion")),
+            "detailsUrl": run.get("details_url") or run.get("html_url"), "databaseId": run.get("id"),
+            "startedAt": run.get("started_at"), "completedAt": run.get("completed_at"), "isRequired": True,
+            "checkSuite": {"conclusion": None, "app": {"slug": (run.get("app") or {}).get("slug")},
+                           "workflowRun": None}}
 
 
 def head_query(owner: str, repo: str, sha: str, cursor: str | None = None,
@@ -2348,6 +2384,8 @@ class Daemon:
         self.fed_repos: dict[str, float] = {}  # owner/repo (lowercase) -> the last event the feed delivered for it
         self.gql_reason = "other"  # what the GraphQL query being sent reads, for daemon.json graphqlBy
         self.gql_log: list[tuple[float, str, int]] = []  # (time, reason, points) per GraphQL query, last hour
+        # REST path -> (ETag, answer) of required_by_name's reads, so an unchanged one is a free 304
+        self.named_reads: dict[str, tuple[str | None, Any]] = {}
         self.token_source = token
         self.token: str | None = None
         doc = read_json(BASE / "budget.json")
@@ -4819,6 +4857,7 @@ class Daemon:
                     page_error = page_error or "graphql: " + limits[f"{alias}{i}"]
                 if page_error:
                     parsed[i]["checksPageError"] = page_error
+                    split_unread(parsed[i])  # a required name past the pages read is unread, not missing
                 if kind == "pr":
                     fps[i] = None if page_error else pr_fingerprint(node)
         if kind == "pr":
@@ -4892,11 +4931,13 @@ class Daemon:
         return error
 
     def extend_pr_contexts(self, entry: dict, node: dict) -> str | None:
-        """Follow a PR's cached statusCheckRollup pages so status pr sees required checks beyond 100.
+        """Make a PR's cached statusCheckRollup hold every required check, past the first 100 contexts too.
 
-        The first PR query is deliberately batched. Follow-up pages use the already-known exact head
-        commit and are bounded; a partial page is retained with an explicit error and never treated as
-        a green verdict. This keeps the normal path brokered and avoids REST fallback for large rolls.
+        The first PR query is deliberately batched. A required name it did not show is read by name first
+        (required_by_name: one conditional REST read per such name, so the cost follows the required names, not the
+        contexts); only what that cannot settle falls back to the follow-up pages, which use the already-known exact
+        head commit and are bounded. A partial read is retained with an explicit error and never treated as a green
+        verdict; the names it left unread are kept apart from the ones known missing (split_unread).
         """
         commits = ((node.get("commits") or {}).get("nodes") or [{}])
         commit = (commits[0] or {}).get("commit") or {}
@@ -4908,12 +4949,7 @@ class Daemon:
             return None
         _, owner, repo, number = split_key(entry["key"])
         nodes = list(contexts.get("nodes") or [])
-        base = node.get("baseRef") or {}
-        required = set((base.get("branchProtectionRule") or {}).get("requiredStatusCheckContexts") or [])
-        for rule in ((base.get("rules") or {}).get("nodes") or []):
-            for item in ((rule.get("parameters") or {}).get("requiredStatusChecks") or []):
-                if item.get("context"):
-                    required.add(item["context"])
+        required = required_names(node.get("baseRef") or {})
         reported = {c.get("name") or c.get("context") for c in nodes}
         # Once every required context is in the first page, keep the cache to one cheap query. The
         # rollup's totalCount/pageInfo still tell callers that optional contexts are only a slice, and a
@@ -4924,6 +4960,23 @@ class Daemon:
         # hour out before landings could read their gates.
         if not required or required.issubset(reported):
             return None
+        named, unsettled = self.required_by_name(owner, repo, str(sha), sorted(required - reported), int(number))
+        if unsettled is None:
+            # every required name is read (or proven unreported): the rollup is as whole as a first page that held them
+            contexts["nodes"] = nodes + [c for found in named.values() for c in found]
+            return None
+        error = self.page_pr_contexts(owner, repo, str(sha), int(number), contexts, nodes, required, reported)
+        if error is not None:
+            # the pages stopped short: a required name they did not reach stands on its own read, when it had one
+            left = [c for name, found in named.items() if name not in reported for c in found]
+            contexts["nodes"] = nodes + left
+        return error
+
+    def page_pr_contexts(self, owner: str, repo: str, sha: str, number: int, contexts: dict, nodes: list,
+                         required: set[str], reported: set) -> str | None:
+        """Follow the rollup's pages into CONTEXTS until every REQUIRED name is in REPORTED (NODES and REPORTED grow
+        in place); None, or why the read stopped short (the rollup is partial)."""
+        page = contexts.get("pageInfo") or {}
         cursor = page.get("endCursor")
         for _ in range(PR_CONTEXT_MAX_PAGES - 1):
             if not cursor:
@@ -4936,7 +4989,7 @@ class Daemon:
                 return "graphql: PR check pages wait for the per-minute ceiling"
             reason, self.gql_reason = self.gql_reason, "pr-pages"
             try:
-                more, error = self.graphql("query{" + head_query(owner, repo, str(sha), cursor, int(number)) + "}", {})
+                more, error = self.graphql("query{" + head_query(owner, repo, sha, cursor, number) + "}", {})
             finally:
                 self.gql_reason = reason
             if more is None:
@@ -4962,6 +5015,68 @@ class Daemon:
             if required and required.issubset(reported):
                 return None
         return f"graphql: more than {PR_CONTEXT_MAX_PAGES * 100} PR checks"
+
+    def named_get(self, path: str) -> tuple[Any, str | None]:
+        """(doc, None) or (None, error): a conditional REST read whose ETag and answer the daemon keeps in memory, so
+        an unchanged answer is a free 304."""
+        etag, kept = self.named_reads.get(path, (None, None))
+        try:
+            state, doc, new_etag = self.get(path, etag if kept is not None else None)
+        except OutOfTime:
+            return None, "rest: out of time this tick"
+        if state == "error":
+            return None, doc
+        if state == "same":
+            return kept, None
+        if len(self.named_reads) >= NAMED_READS_KEPT:
+            self.named_reads.clear()  # bounded: an old head's answers are worth nothing
+        self.named_reads[path] = (new_etag, doc)
+        return doc, None
+
+    def required_by_name(self, owner: str, repo: str, sha: str, names: list[str],
+                         number: int) -> tuple[dict[str, list[dict]], str | None]:
+        """Read each required name the first page did not show, by name: one REST
+        `commits/SHA/check-runs?check_name=NAME&filter=latest` per name and, only when a name has no check run, one
+        read of the commit's statuses (a required context may be a status). The cost follows the required names, not
+        the contexts: manaflow-ai/cmux#43194 had 100 to 250 contexts and one required name, and the pages that would
+        reach it were held by PR_PAGES_POINTS_PER_HOUR (leo-workspace#5184, ask 3).
+
+        ({name: its context nodes in statusCheckRollup's shape, [] when proven unreported}, None) when every name is
+        settled, else (the names settled so far, why the rest are not). Held by the daemon's REST share and floor."""
+        settled: dict[str, list[dict]] = {}
+        if not names:
+            return settled, None
+        if not (self.rest_room(len(names) + 1) and self.rest_above_floor()):
+            return settled, "rest: required checks by name wait for the REST share"
+        root = f"/repos/{owner}/{repo}/commits/{sha}"
+        absent: list[str] = []
+        for name in names:
+            doc, error = self.named_get(
+                f"{root}/check-runs?check_name={urllib.parse.quote(name, safe='')}&filter=latest&per_page=100")
+            if error is not None or not isinstance(doc, dict) or not isinstance(doc.get("check_runs"), list):
+                return settled, error or "rest: check runs by name unreadable"
+            runs = [r for r in doc["check_runs"] if isinstance(r, dict) and r.get("name") == name]
+            if runs:
+                settled[name] = [named_check_node(r) for r in runs]
+            else:
+                absent.append(name)
+        if absent:
+            doc, error = self.named_get(f"{root}/status?per_page=100")
+            if error is not None or not isinstance(doc, dict) or not isinstance(doc.get("statuses"), list):
+                return settled, error or "rest: commit statuses unreadable"
+            statuses = {s.get("context"): s for s in doc["statuses"] if isinstance(s, dict)}
+            whole = (doc.get("total_count") or 0) <= len(doc["statuses"])
+            for name in absent:
+                if name in statuses:
+                    s = statuses[name]
+                    settled[name] = [{"__typename": "StatusContext", "context": name, "state": upper(s.get("state")),
+                                      "targetUrl": s.get("target_url"), "createdAt": s.get("created_at"),
+                                      "isRequired": True}]
+                elif whole:
+                    settled[name] = []  # no check run and no status by that name: not reported, read in full
+            if any(name not in settled for name in absent):
+                return settled, "rest: more than 100 commit statuses"
+        return settled, None
 
     def fetch_prs(self, entries: list[dict]) -> str | None:
         """The batch's PRs: the ones a probe may confirm (probe_ok) are probed first, one cheap query (PR_PROBE_FIELDS),
@@ -5441,7 +5556,7 @@ class Daemon:
                 # predates a plan change); a first read with no GraphQL answer has none, and none is enforced.
                 before = prior.get("data") or {}
                 required = {c.get("name") for c in before.get("checks") or [] if c.get("required")}
-                required |= set(before.get("requiredMissing") or [])
+                required |= set(before.get("requiredMissing") or []) | set(before.get("requiredUnread") or [])
         except WatchError as error:
             message = f"rest: {error}"
             self.errors.append(f"{e['key']}: {message}")
@@ -6562,7 +6677,13 @@ def check_verdict(data: dict, until: str = "green", now: float | None = None,
         if until == "done" and (shown["pending"] or shown["held"]):
             return None
         return EXIT_FAIL
-    if data.get("checksTruncated"):
+    # --until required on a truncated rollup that holds every name the base requires (on the first page, or read by
+    # name), each marked required, decides on those checks, as under 100 checks: GitHub's rollup
+    # also counts the optional contexts past the page, which a required wait ignores (leo-workspace#5184, cmux#43194).
+    required_shown = {c.get("name") for c in checks if c.get("required")}
+    every_required = (until == "required" and bool(data.get("requiredNames"))
+                      and set(data["requiredNames"]).issubset(required_shown))
+    if data.get("checksTruncated") and not every_required:
         # More than 100 checks: only the first 100 are here, so GitHub's rollup decides, except that a
         # check shown as held or still running defers its FAILURE (manaflow-ai/cmux#20733: a queued fast
         # tier the rescue cancelled read as a failure while 13 checks still ran).
@@ -6728,10 +6849,15 @@ def summary(key: str, entry: dict | None, until: str = "done", grace: float = RE
         draft = " draft" if data.get("isDraft") else ""
         lines.append(f"{name} {data.get('state')}{draft}  mergeable={data.get('mergeable')} "
                      f"({data.get('mergeStateStatus')})  review={data.get('reviewDecision')}  head {head}")
+        data = split_unread(dict(data))  # (a cache written before requiredUnread existed reads the same)
         checks = data.get("checks") or []
         groups = classify(data, now, grace)
         marked = any(c.get("required") for c in checks)
         more = "+" if data.get("checksTruncated") else ""
+        # A partial rollup (check pages held, a context GitHub could not read) says so on the checks line: its
+        # PENDING is the unread pages', and a required name not shown is unread, not missing (cmux#43194).
+        partial = (f" (partial: {len(checks)} of {data.get('checksTotal') or '?'} read; "
+                   f"check pages held: {data['checksPageError']})") if data.get("checksPageError") else ""
         if checks:
             # the headline is this tool's own reading, the one `wait` decides by; GitHub's rollup also
             # counts superseded attempts and checks that are not required
@@ -6740,18 +6866,20 @@ def summary(key: str, entry: dict | None, until: str = "done", grace: float = RE
             held = f", {len(groups['held'])} held" if groups["held"] else ""
             rollup = data.get("checkState")
             differs = f"; GitHub's rollup says {rollup}" if rollup and rollup != state else ""
-            lines.append(f"checks {state}: {len(groups['passed'])} passed, {len(groups['failed'])} failed, "
+            lines.append(f"checks {state}{partial}: {len(groups['passed'])} passed, {len(groups['failed'])} failed, "
                          f"{len(groups['pending'])} pending{held} (of {len(checks)}{more}, "
                          f"{sum(1 for c in checks if c.get('required'))} required){differs}")
         else:
             left = settling(data, now)
             lines.append("checks: none reported yet for this head commit"
-                         + (f" (not started; settles in {int(left)}s)" if left is not None else ""))
+                         + (f" (not started; settles in {int(left)}s)" if left is not None else "") + partial)
         if data.get("state") == "OPEN" and expected_missing(data):
             lines.append(f"  expected, not posted yet: {', '.join(expected_missing(data))}")
         if data.get("requiredMissing"):
             why = " (merge conflicts: they run after the next push)" if data.get("mergeStateStatus") == "DIRTY" else ""
             lines.append(f"  required, not reported yet: {', '.join(data['requiredMissing'])}{why}")
+        if data.get("requiredUnread"):
+            lines.append(f"  required, not read yet (check pages held): {', '.join(data['requiredUnread'])}")
         # Required checks first, then real failures before cancelled ones: the capped list leads with what to fix.
         bad = sorted(groups["failed"], key=lambda c: (marked and not c.get("required"),
                                                       str(c.get("conclusion") or "").lower() == "cancelled"))
