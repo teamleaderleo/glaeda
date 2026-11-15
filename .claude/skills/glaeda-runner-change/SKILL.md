@@ -22,7 +22,10 @@ mini. Keep changes small, observable and reversible.
 - No em dashes (U+2014) in the runner, hook, fleet, status tooling or their docs (`NoEmDashTest`).
 - Output stays bounded and typed. No secrets, raw logs, environment dumps, process arguments or private paths
   (home paths become `~`). Job telemetry names processes by executable basename and user only.
-- Subprocesses use absolute paths and argument vectors (`/bin/ps`, `/usr/sbin/sysctl`), with timeouts.
+- Subprocesses use absolute paths and argument vectors (`/bin/ps`, `/usr/sbin/sysctl`), with timeouts. In the hook
+  `subprocess.run` is `run_bounded` (`RunIsBoundedTest`): the standard one waits with no limit for the child it
+  killed at the timeout, so an unkillable child (a `/bin/ps` stuck in the kernel on a wedged mini) held
+  `Set up runner` for a whole job timeout. A `Popen` you add bounds its post-kill `communicate()`/`wait()` too.
 - Observation never becomes admission: telemetry and status findings must not refuse, delay or fail a job.
 - Anything forked from the hook detaches twice, points stdio at /dev/null (the runner reads the hook's output
   until EOF), and must not keep lock fds it does not own. A pid file for a new helper must not match the

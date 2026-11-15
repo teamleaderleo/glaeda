@@ -143,6 +143,66 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Mapping, NamedTuple
 
+# How long run_bounded() waits for a child it killed at its timeout before it leaves it behind.
+KILLED_CHILD_REAP_S = 2.0
+_UNBOUNDED_RUN = subprocess.run
+
+
+def _reap_killed(process: subprocess.Popen) -> tuple[Any, Any]:
+    """Kill `process` and collect what it wrote for at most KILLED_CHILD_REAP_S, then let it go: a child the kill
+    cannot end (a /bin/ps stuck in the kernel on a wedged mini) is left to the system, never waited for."""
+    with contextlib.suppress(OSError):
+        process.kill()
+    try:
+        return process.communicate(timeout=KILLED_CHILD_REAP_S)
+    except (subprocess.TimeoutExpired, OSError, ValueError):
+        for pipe in (process.stdin, process.stdout, process.stderr):
+            if pipe is not None:
+                with contextlib.suppress(OSError):
+                    pipe.close()
+        return None, None
+
+
+def run_bounded(*popenargs: Any, input: Any = None, capture_output: bool = False, timeout: float | None = None,
+                check: bool = False, **kwargs: Any) -> subprocess.CompletedProcess:
+    """subprocess.run(), except that a `timeout` bounds the whole call. The standard run() kills the child at its
+    timeout and then waits for it with no limit (`process.wait()`, and again in Popen.__exit__), so a child the kill
+    cannot end holds the caller for good. On 2026-11-15 /bin/ps on cmux8s-mac-mini sat in the kernel (it ignored
+    SIGALRM and SIGKILL for over 10 minutes at load 145 on 14 cores), and cmux run 43708595401's job-started hook
+    held `Set up runner` for 60 minutes, until the job's timeout, with no ledger line. Here the killed child gets
+    KILLED_CHILD_REAP_S, then TimeoutExpired is raised as before and the child is left behind."""
+    if timeout is None:
+        return _UNBOUNDED_RUN(*popenargs, input=input, capture_output=capture_output, check=check, **kwargs)
+    if input is not None:
+        if kwargs.get("stdin") is not None:
+            raise ValueError("stdin and input arguments may not both be used.")
+        kwargs["stdin"] = subprocess.PIPE
+    if capture_output:
+        if kwargs.get("stdout") is not None or kwargs.get("stderr") is not None:
+            raise ValueError("stdout and stderr arguments may not be used with capture_output.")
+        kwargs["stdout"] = subprocess.PIPE
+        kwargs["stderr"] = subprocess.PIPE
+    process = subprocess.Popen(*popenargs, **kwargs)
+    try:
+        stdout, stderr = process.communicate(input, timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        out, err = _reap_killed(process)
+        if out is not None or err is not None:
+            exc.stdout, exc.stderr = out, err
+        raise
+    except BaseException:
+        _reap_killed(process)
+        raise
+    retcode = process.poll()
+    if check and retcode:
+        raise subprocess.CalledProcessError(retcode, process.args, output=stdout, stderr=stderr)
+    return subprocess.CompletedProcess(process.args, retcode, stdout, stderr)
+
+
+# Every subprocess.run(..., timeout=...) in this process, the hook's own and the glaeda scripts it loads, gets the
+# bound (RUN_IS_BOUNDED_TEST). Tests that patch subprocess.run still patch this one name.
+subprocess.run = run_bounded
+
 DISK_TIMEOUT_S = 120  # a synchronous hook pass
 # job-completed's detached pass, which nothing waits on: a whole pass took 192-685 s on cmux14 under the floor, so at
 # DISK_TIMEOUT_S every one (a pass per job) was killed mid-apply while holding evict.lock, and the LaunchAgent's pass,

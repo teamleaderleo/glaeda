@@ -16132,6 +16132,71 @@ class ConsoleTest(unittest.TestCase):
             self.assertIsNone(hook.console_state())
 
 
+class RunIsBoundedTest(unittest.TestCase):
+    """run_bounded(): a subprocess.run(timeout=) whose child the kill cannot end still returns at its bound (cmux run
+    43708595401, 2026-11-15: an unkillable /bin/ps held job-started in `Set up runner` for 60 minutes)."""
+
+    class Unkillable:
+        """A Popen whose child ignores the kill: communicate() and wait() block until their timeout, or forever."""
+
+        def __init__(self, args: Any, **kwargs: Any) -> None:
+            self.args, self.returncode, self.killed, self.closed = args, None, 0, False
+            self.stdin = self.stdout = self.stderr = None
+
+        def communicate(self, input: Any = None, timeout: float | None = None) -> tuple[Any, Any]:
+            if timeout is None:
+                raise AssertionError("an unbounded communicate() on a child the kill cannot end")
+            time.sleep(min(timeout, 0.05))
+            raise subprocess.TimeoutExpired(self.args, timeout)
+
+        def wait(self, timeout: float | None = None) -> int:
+            if timeout is None:
+                raise AssertionError("an unbounded wait() on a child the kill cannot end")
+            raise subprocess.TimeoutExpired(self.args, timeout)
+
+        def kill(self) -> None:
+            self.killed += 1
+
+        def poll(self) -> None:
+            return None
+
+        def __enter__(self) -> "RunIsBoundedTest.Unkillable":
+            return self
+
+        def __exit__(self, *exc: Any) -> None:
+            self.wait()
+
+    def test_every_run_in_the_hook_process_is_bounded(self) -> None:
+        self.assertIs(subprocess.run, hook.run_bounded)
+
+    def test_a_child_the_kill_cannot_end_times_out_at_its_bound(self) -> None:
+        made: list[Any] = []
+
+        def popen(*args: Any, **kwargs: Any) -> Any:
+            made.append(self.Unkillable(*args, **kwargs))
+            return made[-1]
+
+        started = time.monotonic()
+        with mock.patch.object(hook.subprocess, "Popen", popen), mock.patch.object(hook, "KILLED_CHILD_REAP_S", 0.05):
+            with self.assertRaises(subprocess.TimeoutExpired):
+                hook.run_bounded(["/bin/ps", "-axo", "pid="], capture_output=True, text=True, timeout=0.05)
+            # the standard run() waits for the killed child with no limit: the fake says so
+            with self.assertRaisesRegex(AssertionError, "unbounded wait"):
+                hook._UNBOUNDED_RUN(["/bin/ps"], capture_output=True, timeout=0.05)
+        self.assertLess(time.monotonic() - started, 5)
+        self.assertEqual(made[0].killed, 1)
+
+    def test_it_keeps_run_semantics(self) -> None:
+        done = hook.run_bounded([sys.executable, "-c", "import sys; print(sys.stdin.read().upper())"],
+                                input="ps", capture_output=True, text=True, timeout=30)
+        self.assertEqual((done.returncode, done.stdout.strip()), (0, "PS"))
+        with self.assertRaises(subprocess.CalledProcessError):
+            hook.run_bounded([sys.executable, "-c", "raise SystemExit(3)"], timeout=30, check=True)
+        with self.assertRaises(subprocess.TimeoutExpired):
+            hook.run_bounded([sys.executable, "-c", "import time; time.sleep(30)"], capture_output=True, timeout=0.2)
+        self.assertEqual(hook.run_bounded([sys.executable, "-c", "pass"]).returncode, 0)  # no timeout: run() as is
+
+
 class NoEmDashTest(unittest.TestCase):
     def test_no_em_dashes(self) -> None:
         for path in (ROOT / "scripts/glaeda-cmux-runner", HOOK, Path(__file__), ROOT / "docs/CMUX_MINI_RUNNER.md",
