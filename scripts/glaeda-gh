@@ -10675,17 +10675,9 @@ def gh_sweep_refusal(words: list[str], method: str, now: float) -> str | None:
     return None
 
 
-def cmd_runners(scope: str, label: str | None, as_json: bool) -> int:
-    """Self-hosted runners of an org or repository: online, busy and idle, per label. Read through
-    `gh` so the answer cache shares it with every session on the host for its TTL."""
-    if re.fullmatch(NAME, scope):
-        path = f"orgs/{scope}/actions/runners"
-    elif re.fullmatch(rf"{NAME}/{NAME}", scope):
-        path = f"repos/{scope}/actions/runners"
-    else:
-        raise WatchError("runners takes OWNER or OWNER/REPO")
-    # Through this broker, piped, so the answer cache shares the read whether or not the gh shim
-    # is on PATH.
+def read_runners(path: str) -> list[dict]:
+    """One runners listing (org or repo path), through this broker, piped, so the answer cache shares the read
+    whether or not the gh shim is on PATH."""
     try:
         done = run_bounded([sys.executable, str(Path(__file__).resolve()), "gh", "api", "--paginate",
                             f"{path}?per_page=100", "--jq",
@@ -10695,9 +10687,38 @@ def cmd_runners(scope: str, label: str | None, as_json: bool) -> int:
     if done.returncode != 0:
         raise WatchError(f"gh api {path}: {(done.stderr or '').strip()[:300]}")
     try:
-        runners = [json.loads(line) for line in done.stdout.splitlines() if line.strip()]
+        return [json.loads(line) for line in done.stdout.splitlines() if line.strip()]
     except ValueError as error:
         raise WatchError(f"gh api {path}: unreadable answer: {error}") from None
+
+
+def cmd_runners(scope: str, label: str | None, as_json: bool) -> int:
+    """Self-hosted runners of an org or repository: online, busy and idle, per label. Read through
+    `gh` so the answer cache shares it with every session on the host for its TTL.
+
+    GitHub's repo listing holds only runners registered to that repo (the trusted-only and nightly ones); the
+    org's runners, which run most of a repo's jobs, are a different listing. 2026-11-15: `runners OWNER/REPO
+    --label glaeda-side-std-xcode-26.6` read 0 online of 39 while the org pool had 8 online, all busy, and a
+    lane took the label for down. So OWNER/REPO reads the repo's runners and the owner's org runners, merged by
+    name, and says which it read (`scopes`); an org listing the token may not read is named in `unread`."""
+    unread = None
+    if re.fullmatch(NAME, scope):
+        runners = read_runners(f"orgs/{scope}/actions/runners")
+        scopes = {"org": len(runners)}
+    elif re.fullmatch(rf"{NAME}/{NAME}", scope):
+        runners = read_runners(f"repos/{scope}/actions/runners")
+        scopes = {"repo": len(runners)}
+        owner = scope.split("/")[0]
+        try:
+            org = read_runners(f"orgs/{owner}/actions/runners")
+        except WatchError as error:
+            org, unread = [], f"org {owner} not read ({str(error)[:120]})"
+        else:
+            scopes["org"] = len(org)
+        have = {r.get("name") for r in runners}
+        runners += [r for r in org if r.get("name") not in have]
+    else:
+        raise WatchError("runners takes OWNER or OWNER/REPO")
     online = [r for r in runners if r.get("status") == "online" and (not label or label in r.get("labels", []))]
     labels: dict[str, dict[str, int]] = {}
     for r in online:
@@ -10705,14 +10726,17 @@ def cmd_runners(scope: str, label: str | None, as_json: bool) -> int:
             row = labels.setdefault(name, {"online": 0, "busy": 0})
             row["online"] += 1
             row["busy"] += bool(r.get("busy"))
-    doc = {"scope": scope, "label": label, "runners": len(runners), "online": len(online),
+    doc = {"scope": scope, "scopes": scopes, "label": label, "runners": len(runners), "online": len(online),
            "busy": sum(1 for r in online if r.get("busy")), "labels": labels,
            "busyRunners": sorted(r["name"] for r in online if r.get("busy"))}
+    if unread:
+        doc["unread"] = unread
     if as_json:
         print(json.dumps(doc, sort_keys=True))
         return EXIT_OK
+    read = " + ".join(f"{n} {k}" for k, n in scopes.items())
     print(f"{scope}: {doc['online']} online of {doc['runners']} registered, {doc['busy']} busy"
-          + (f" (label {label})" if label else ""))
+          + (f" (label {label})" if label else "") + f" [read: {read}]" + (f" [{unread}]" if unread else ""))
     for name, row in sorted(labels.items(), key=lambda kv: (-kv[1]["online"], kv[0])):
         print(f"  {name:48} {row['busy']:4} busy {row['online'] - row['busy']:4} idle")
     return EXIT_OK

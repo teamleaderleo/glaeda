@@ -14178,11 +14178,39 @@ class RunnersTest(BrokerBase):
         doc = json.loads(out.getvalue())
         self.assertEqual((doc["runners"], doc["online"], doc["busy"], doc["busyRunners"]), (3, 2, 1, ["a"]))
         self.assertEqual(doc["labels"]["mini"], {"online": 2, "busy": 1})
-        with mock.patch.object(gg, "run_bounded", return_value=done) as ran, contextlib.redirect_stdout(io.StringIO()):
-            gg.cmd_runners("o/r", "mini", False)
-        self.assertIn("repos/o/r/actions/runners?per_page=100", ran.call_args[0][0])
         with self.assertRaises(gg.WatchError):
             gg.cmd_runners("not a scope", None, False)
+
+    def test_repo_scope_reads_the_org_pool_too_and_says_so(self) -> None:
+        def answer(argv, timeout=None):
+            path = next(a for a in argv if "actions/runners" in a)
+            rows = ([{"name": "t", "status": "offline", "busy": False, "labels": ["side"]}] if "repos/" in path else
+                    [{"name": "o1", "status": "online", "busy": True, "labels": ["side"]},
+                     {"name": "o2", "status": "online", "busy": False, "labels": ["side"]}])
+            return subprocess.CompletedProcess([], 0, "\n".join(json.dumps(r) for r in rows) + "\n", "")
+        out = io.StringIO()
+        with mock.patch.object(gg, "run_bounded", side_effect=answer), contextlib.redirect_stdout(out):
+            gg.cmd_runners("o/r", "side", True)
+        doc = json.loads(out.getvalue())
+        self.assertEqual(doc["scopes"], {"repo": 1, "org": 2})
+        self.assertEqual((doc["runners"], doc["online"], doc["busy"]), (3, 2, 1))
+        out = io.StringIO()
+        with mock.patch.object(gg, "run_bounded", side_effect=answer), contextlib.redirect_stdout(out):
+            gg.cmd_runners("o/r", "side", False)
+        self.assertIn("[read: 1 repo + 2 org]", out.getvalue())
+
+    def test_repo_scope_names_an_org_listing_it_could_not_read(self) -> None:
+        def answer(argv, timeout=None):
+            if any("orgs/" in a for a in argv):
+                return subprocess.CompletedProcess([], 1, "", "HTTP 403")
+            row = {"name": "t", "status": "online", "busy": False, "labels": ["side"]}
+            return subprocess.CompletedProcess([], 0, json.dumps(row) + "\n", "")
+        out = io.StringIO()
+        with mock.patch.object(gg, "run_bounded", side_effect=answer), contextlib.redirect_stdout(out):
+            gg.cmd_runners("o/r", None, True)
+        doc = json.loads(out.getvalue())
+        self.assertEqual(doc["scopes"], {"repo": 1})
+        self.assertIn("org o not read", doc["unread"])
 
 
 class BrokerGraphqlCacheTest(BrokerBase):
