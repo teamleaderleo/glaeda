@@ -956,7 +956,10 @@ job's need fit the host's cores, and their RAM plus this job's fits the host's R
 - A host's capacity is read on the host: cores from `hw.ncpu` less `--reserve-cores` (the manifest's
   `runner.classes.<class>.reserveCores`, for cores kept for work outside the ledger), RAM from `hw.memsize` less a
   floor of an eighth of it (at least 4 GiB), in 1 GiB `mem-N` flock files beside the `unit-N` ones.
-  `--capacity-units` still turns the ledger on and is the count only where the host cannot be measured.
+  `--capacity-units` still turns the ledger on and is the count only where the host cannot be measured. Every
+  caller of the same ledger passes the same `--reserve-cores` (the build worker's `fits` and `admit` too;
+  `glaeda-promotion-admit` reads it from the runner's `job-started.sh`). A hook older than this change rejects the
+  flag, so rolling a member that has `reserveCores` back below it needs a re-apply from that older checkout.
   `GLAEDA_RUNNER_RAM_LEDGER=0` in the runner's environment turns RAM accounting off. The memory-pressure gate and
   the disk floor stay.
 - A job whose own measured RAM need is more than the host's RAM capacity is refused at once (`RAM: ...`); one

@@ -749,8 +749,9 @@ DEFAULT_HOME_REPO = "manaflow-ai/cmux"
 # job's, fit what the host has.
 #
 # A job's need comes from JOB_NEEDS_NAME beside this hook (schema JOB_NEEDS_SCHEMA, generated in cmuxterm-hq
-# build-fleet/data/job-needs.json from the jobs this hook logs, copied here and shipped with the hook: glaeda-update
-# and glaeda-cmux-runner install it in each runner's glaeda-hooks/ beside glaeda_reservation.py). Its rows are keyed
+# build-fleet/data/job-needs.json from the jobs this hook logs, copied here and shipped with the runner files:
+# glaeda-cmux-runner-fleet stages it into ~/glaeda-runner/scripts and glaeda-update keeps that copy at the installed
+# release's; job_needs_path finds it there from each runner's glaeda-hooks/). Its rows are keyed
 # "<workflow file>/<job id>" for the home repository and "<owner/repo>/<workflow file>/<job id>" for a guest, and by
 # class. Cores: ceil(cores_p90) of the job's own row, else its JOB_CORES entry, else its class's row, else CLASS_COST;
 # at least 1, except a class that costs 0 units (fast, gateway: tokens only) stays 0, and the exclusive class takes
@@ -799,10 +800,15 @@ def job_needs_path() -> Path:
     if env:
         return Path(env)
     here = globals().get("__file__") or ""  # the plan runs this hook from stdin: no file beside it then
-    beside = Path(here).resolve().parent / JOB_NEEDS_NAME if here and not here.startswith("<") else None
-    if beside is not None and beside.is_file():
-        return beside
-    return Path.home() / "glaeda-runner/scripts" / JOB_NEEDS_NAME
+    staged = Path("glaeda-runner/scripts") / JOB_NEEDS_NAME
+    if here and not here.startswith("<"):
+        hook_dir = Path(here).resolve().parent
+        # beside it (a checkout, the staged copy), else the staged copy beside the runner install that holds this
+        # glaeda-hooks/ (~/actions-runner-glaeda-K/glaeda-hooks -> ~/glaeda-runner/scripts), whatever HOME says
+        for candidate in (hook_dir / JOB_NEEDS_NAME, hook_dir.parent.parent / staged):
+            if candidate.is_file():
+                return candidate
+    return Path.home() / staged
 
 
 def _needs_number(row: dict[str, Any], key: str, limit: float) -> float | None:
@@ -820,7 +826,7 @@ def parse_job_needs(data: bytes, now: float | None = None) -> tuple[dict[str, An
         return None, f"larger than {JOB_NEEDS_MAX_BYTES} bytes"
     try:
         doc = json.loads(data)
-    except (ValueError, UnicodeDecodeError):
+    except (ValueError, UnicodeDecodeError, RecursionError):
         return None, "not JSON"
     if not isinstance(doc, dict) or doc.get("schema") != JOB_NEEDS_SCHEMA:
         return None, f"schema is not {JOB_NEEDS_SCHEMA}"
@@ -5413,7 +5419,9 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
     units = min(units, total)
     # CAPACITY_ARITHMETIC: the RAM chunks it takes beside its units; the exclusive class takes all of them
     mem_total = mem_chunks_total()
-    chunks = mem_total if klass == EXCLUSIVE_CLASS else mem_chunks(need.mib)
+    # A 0-unit token class (fast, gateway: thin clients bounded by their tokens, whose gates never look at the shared
+    # ledger) takes none, so it never waits behind a waiter for units.
+    chunks = mem_total if klass == EXCLUSIVE_CLASS else mem_chunks(need.mib) if units > 0 else 0
     if mem_total and chunks > mem_total:
         if need.own_mib:  # its own measured p90 never fits here: refused now, not a wait that cannot end
             host = host_mem_mib() or 0
@@ -5470,7 +5478,8 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
                       and not probe(capacity_dir / f"{own_reserve}{GUI_RESERVE}"))
         # the gateway kind is any one gateway token: a waiter that wants a named one (a signing job) is ahead of it
         needs = {name for token in tokens for name in (GATEWAY_TOKENS if token == GATEWAY_TOKEN_KIND else (token,))}
-        needs |= {"units"} if (units and not in_reserve) or chunks else set()  # RAM waits as units do
+        # RAM waits as units do; a job the gui runner's reserve covers still never queues behind a units waiter
+        needs |= {"units"} if units and not in_reserve else set()
         behind = fair_turn(capacity_dir, needs, time.time() if since is None else since, tier, units > 0, new_job,
                            signs_first and klass == EXCLUSIVE_CLASS)
         if behind:
