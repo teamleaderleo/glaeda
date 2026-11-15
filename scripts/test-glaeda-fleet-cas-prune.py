@@ -34,7 +34,7 @@ class PruneTest(unittest.TestCase):
         self.lock = Path(self.tmp.name) / "host.lock"
         self.lock.write_text("")
         self.saved = (fp.ROOT, fp.HOST_LOCK, fp.running_commands, fp.reserved_above_floor, fp.toolchain_overlap,
-                      fp.free_fraction, fp.build_starts)
+                      fp.free_fraction, getattr(fp, "build_starts", None))
         fp.ROOT, fp.HOST_LOCK = self.root, self.lock
         fp.build_starts = lambda: []  # never the test host's own processes
         fp.free_fraction = lambda path: 0.5  # the test host's own free disk must not decide the gc schedule
