@@ -7692,6 +7692,30 @@ class XcodeToolchainTest(unittest.TestCase):
             why, _ = hook.toolchain_refusal("m4pro-48", want, self.XCODE, align=False)
             self.assertEqual(why, "toolchain: xcrun resolves /x outside Xcode_26.6", "the clearer reason wins")
 
+    def test_a_probe_with_no_answer_in_the_budget_is_a_timeout_not_a_missing_tool(self) -> None:
+        """cmux8s-mac-mini at load ~200 refused jobs as "gh is not on the job PATH" while gh, first on the runner's
+        PATH, answered in 0.3 s by hand: the earlier probes had spent ELIGIBILITY_BUDGET_S. A refusal reached after
+        the budget names the timeout; within the budget the same empty answer is still the missing tool."""
+        want = {"rustcVersion": "rustc 1.98.1", "cargoVersion": "cargo 1.98.1", "zigVersion": "0.16.0",
+                "xcodeVersion": "26.6", "xcodeBuild": "17F113", "macosSdkVersion": "26.5"}
+        answers = {"rustc": "rustc 1.98.1", "cargo": "cargo 1.98.1", "zig": "0.16.0", "python3": "3.13",
+                   "gh": "", "xcodebuild": "Xcode 26.6\nBuild version 17F113", "xcrun": "26.5"}
+        gh_missing = "node not eligible (gh is not on the job PATH; cmux's CI scripts call gh api)"
+        with mock.patch.object(hook, "_probe", side_effect=lambda argv, *_: answers.get(argv[0], "")), \
+                mock.patch.object(hook, "toolchain_missing", return_value=None):
+            why, _ = hook.toolchain_refusal("m4pro-48", want, None, align=False)
+            self.assertEqual(why, gh_missing)
+            with mock.patch.object(hook, "ELIGIBILITY_BUDGET_S", 0.0):
+                why, _ = hook.toolchain_refusal("m4pro-48", want, None, align=False)
+                self.assertIn("timed out after 0 s; no answer, not a missing or drifted tool", why)
+                self.assertIn("gh is not on the job PATH", why)
+                answers.update(gh="gh version 2", zig="")
+                why, _ = hook.toolchain_refusal("m4pro-48", want, None, align=False)
+                self.assertIn("timed out after 0 s", why, "an empty drift past the budget is no answer too")
+                self.assertIn("zigVersion '' != '0.16.0'", why)
+                answers.update(zig="0.16.0")
+                self.assertEqual(hook.toolchain_refusal("m4pro-48", want, None, align=False), (None, ""))
+
     def test_the_runner_xcode_is_the_job_started_hooks_toolchain_xcode(self) -> None:
         runner = self.tmp / "actions-runner-glaeda-1"
         (runner / "glaeda-hooks").mkdir(parents=True)
