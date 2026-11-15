@@ -14212,6 +14212,80 @@ class RunnersTest(BrokerBase):
         self.assertEqual(doc["scopes"], {"repo": 1})
         self.assertIn("org o not read", doc["unread"])
 
+    # 2026-11-15: the repo listing (39 runners) holds none of the org's glaeda-side-std / glaeda-gui-std pools and
+    # the token cannot read the org listing, so `runners OWNER/REPO --label glaeda-side-std-xcode-26.6` said
+    # "0 online of 39" and two lanes took the pool for down. A scope the reader cannot see is unknown, never 0.
+    @staticmethod
+    def state_value(doc: dict) -> str:
+        import base64
+        import gzip
+        return base64.b64encode(gzip.compress(json.dumps(doc).encode())).decode()
+
+    def org_hidden(self, state: str | None):
+        repo_rows = [{"name": f"t{n}", "status": "online", "busy": False, "labels": ["self-hosted", "trusted"]}
+                     for n in range(39)]
+
+        def answer(argv, timeout=None):
+            if any("actions/variables/CI_RUNNER_STATE" in a for a in argv):
+                if state is None:
+                    return subprocess.CompletedProcess([], 1, "", "gh: Not Found (HTTP 404)")
+                return subprocess.CompletedProcess([], 0, state + "\n", "")
+            if any("orgs/" in a for a in argv):
+                return subprocess.CompletedProcess([], 1, "", "gh: You must be an org admin (HTTP 403)")
+            return subprocess.CompletedProcess([], 0, "\n".join(json.dumps(r) for r in repo_rows) + "\n", "")
+        return answer
+
+    def runners_out(self, answer, as_json: bool, label: str = "side") -> str:
+        out = io.StringIO()
+        with mock.patch.object(gg, "run_bounded", side_effect=answer), contextlib.redirect_stdout(out):
+            self.assertEqual(gg.cmd_runners("o/r", label, as_json), 0)
+        return out.getvalue()
+
+    def test_an_org_pool_the_token_cannot_see_is_unknown_not_zero(self) -> None:
+        text = self.runners_out(self.org_hidden(None), False)
+        self.assertNotIn("0 online", text)
+        self.assertIn("unknown: org runners are not visible to this token", text)
+        self.assertIn("CI_RUNNER_STATE", text, "names where the count can be read")
+        doc = json.loads(self.runners_out(self.org_hidden(None), True))
+        self.assertIsNone(doc["online"])
+        self.assertIsNone(doc["busy"])
+        self.assertIn("org runners are not visible to this token", doc["unknown"])
+
+    def test_an_unseen_org_pool_is_read_from_the_published_runner_census(self) -> None:
+        now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        row = lambda name, status, busy: {"id": len(name), "name": name, "os": "macOS", "status": status,  # noqa: E731
+                                          "busy": busy, "labels": [{"name": "self-hosted"}, {"name": "side"}]}
+        state = self.state_value({"schema": "runner-state/v1", "repository": "o/r", "complete": True,
+                                  "generated_at": now, "repository_runners": [],
+                                  "runner_groups": {"glaeda-minis": [row("m1", "online", True),
+                                                                     row("m2", "online", True),
+                                                                     row("m3", "online", False),
+                                                                     row("m4", "offline", False)]}})
+        doc = json.loads(self.runners_out(self.org_hidden(state), True))
+        self.assertEqual((doc["online"], doc["busy"], doc["busyRunners"]), (3, 2, ["m1", "m2"]))
+        self.assertEqual(doc["scopes"], {"repo": 39, "CI_RUNNER_STATE": 4})
+        self.assertNotIn("unknown", doc)
+        text = self.runners_out(self.org_hidden(state), False)
+        self.assertIn("3 online of 43 registered, 2 busy", text)
+        self.assertIn("CI_RUNNER_STATE", text)
+
+    def test_a_stale_or_foreign_runner_census_is_unknown(self) -> None:
+        old = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 3600))
+        base = {"schema": "runner-state/v1", "repository": "o/r", "complete": True, "generated_at": old,
+                "repository_runners": [], "runner_groups": {"glaeda-minis": [
+                    {"id": 1, "name": "m1", "os": "macOS", "status": "online", "busy": True,
+                     "labels": [{"name": "side"}]}]}}
+        for doc, why in ((base, "old"), ({**base, "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                                          "repository": "x/y"}, "x/y"),
+                         ({**base, "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ"), "complete": False},
+                          "incomplete")):
+            with self.subTest(why=why):
+                got = json.loads(self.runners_out(self.org_hidden(self.state_value(doc)), True))
+                self.assertIsNone(got["online"])
+                self.assertIn(why, got["unknown"])
+        got = json.loads(self.runners_out(self.org_hidden("not base64 gzip"), True))
+        self.assertIsNone(got["online"])
+
 
 class BrokerGraphqlCacheTest(BrokerBase):
     """A `gh api graphql` query is kept like a GET, keyed on the query and its variables."""
