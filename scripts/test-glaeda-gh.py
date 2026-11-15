@@ -2788,6 +2788,43 @@ class BalanceTest(Base):
         self.assertIsNone(again[1])
         self.assertEqual(self.gh.rest_remaining, left, "the unchanged answer was free")
 
+    def test_required_by_name_etags_survive_a_restart(self) -> None:
+        """huge-blue 2026-11-15: a restart about every hour (and each re-exec) emptied the in-memory ETag store, so
+        the first read of every required name after it was a counted 200: 90 of the daemon's 148 counted REST in
+        the hour were check-runs?check_name reads, and the share alarm fired ten minutes after each restart. The
+        store is on disk now: a fresh daemon asks with the kept ETag and an unchanged answer is free.
+
+        Replay, one (SHA, required name) per watched PR, K PRs, one restart an hour: before, K counted reads per
+        restart; after, none."""
+        K = 12
+        self.big_pr(37, [self.CLIPPY])
+        checks = self.gh.heads[("o", "r", "a" * 40)]
+        shas = [f"{i:040x}" for i in range(1, K + 1)]
+        for sha in shas:
+            self.gh.heads[("o", "r", sha)] = checks
+        self.daemon.now = NOW
+        first = [self.daemon.required_by_name("o", "r", sha, [self.CLIPPY], 37) for sha in shas]
+        self.daemon.save_named_reads()
+        left = self.gh.rest_remaining
+        again = gg.Daemon(transport=self.gh, token=lambda: TOKEN, controller=None)  # the restart
+        again.now, again.budget = NOW + 60, self.daemon.budget
+        self.assertEqual([again.required_by_name("o", "r", sha, [self.CLIPPY], 37) for sha in shas], first)
+        self.assertEqual(left - self.gh.rest_remaining, 0, "after a restart the unchanged answers were free")
+        self.assertEqual(len(self.gh.named_calls), 2 * K)  # still asked: a changed answer is read
+
+    def test_the_kept_named_reads_are_bounded_oldest_first_and_slim(self) -> None:
+        self.addCleanup(setattr, gg, "NAMED_READS_KEPT", gg.NAMED_READS_KEPT)
+        gg.NAMED_READS_KEPT = 3
+        self.daemon.get = lambda path, etag: ("fresh", {"check_runs": [{"name": path, "output": {"text": "x" * 500},
+                                                                         "status": "completed"}]}, '"e"')
+        for n in range(5):
+            self.daemon.named_get(f"/p{n}")
+        self.daemon.save_named_reads()
+        kept = gg.load_named_reads(gg.read_json(gg.BASE / gg.NAMED_READS_FILE))
+        self.assertEqual(list(kept), ["/p2", "/p3", "/p4"])
+        self.assertNotIn("output", kept["/p4"][1]["check_runs"][0])
+        self.assertEqual(kept["/p4"][1]["check_runs"][0]["status"], "completed")
+
     def test_a_stale_graphql_counter_rate_limit_cannot_see_does_not_force_a_read_every_tick(self) -> None:
         """Review of #1834 (F3): a poorer GraphQL counter seen long ago, which /rate_limit does not report, made every
         tick ask /rate_limit. Like REST's counters, a recent /rate_limit answer makes it fresh enough."""
@@ -12516,21 +12553,54 @@ class SpendAlarmTest(Base):
         again.check_alarms()
         self.assertEqual(len(self.told_lines()), 1)  # within the hour of the first
 
-    def test_the_share_alarm_names_the_routes_that_spent_it(self) -> None:
+    def test_a_fast_ten_minutes_under_the_cap_is_a_log_line_not_an_alarm(self) -> None:
+        """huge-blue 2026-11-15, about hourly: "spending REST at 306/h against its cap of 150 (142 in the last hour)".
+        The cap holds the hour, so a fast ten minutes inside a measured hour under it has nothing to act on: one
+        share-pace log line an hour ("nothing to do, projection only"), no notice, no tell-coordinator."""
         self.policy()
         self.daemon.policy = {**self.daemon.policy, "restShare": 0.06}  # a cap of 300
         self.daemon.transport = lambda *a: (200, {}, b"{}")
         with self.daemon.calling("run", "o/r"):
-            for n in range(80):  # 80 in 10 minutes is 480 an hour: past 300 + 150
+            for n in range(80):  # 80 in 10 minutes is 480 an hour: past 300 + 150, but 80 in the hour
                 self.daemon.request("GET", f"/repos/o/r/actions/runs/{n}/jobs?per_page=100")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.daemon.check_alarms()
+            self.daemon.now += 60
+            self.daemon.check_alarms()  # still fast: not logged again within the hour
+        self.assertEqual(self.told_lines(), [])
+        self.assertEqual(self.notice_lines(), [])
+        lines = [json.loads(x) for x in out.getvalue().splitlines() if '"share-pace"' in x]
+        self.assertEqual(len(lines), 1, out.getvalue())
+        self.assertEqual((lines[0]["pace"], lines[0]["spent"], lines[0]["cap"]), (480, 80, 300))
+        self.assertIn("nothing to do, projection only", lines[0]["note"])
+
+    def test_the_share_alarm_fires_on_the_measured_hour_and_names_the_waiter_to_shed(self) -> None:
+        """Past the cap over the measured trailing hour (what the cap exempts, or a restYield), the alarm names the
+        waiter whose reads spent most, so whoever hears it has one thing to do."""
+        self.policy()
+        self.daemon.policy = {**self.daemon.policy, "restShare": 0.06}  # a cap of 300
+        self.daemon.transport = lambda *a: (200, {}, b"{}")
+        for minute in range(50):  # 7 a minute for 50 minutes: 350 in the hour, never fast in any ten minutes
+            self.daemon.now = NOW - 3000 + minute * 60
+            with self.daemon.calling("pr", "o/r", "session:lane-7"):
+                for n in range(5):
+                    self.daemon.request("GET", f"/repos/o/r/commits/{'a' * 40}/check-runs?check_name=x&per_page=1")
+            with self.daemon.calling("run", "o/r", "session:quiet"):
+                for n in range(2):
+                    self.daemon.request("GET", f"/repos/o/r/actions/runs/{n}/jobs?per_page=100")
         with self.daemon.calling("outbox", "o/r"):
             for n in range(200):  # sessions' writes are not the share's
                 self.daemon.request("POST", f"/repos/o/r/issues/{n}/comments", content=True)
+        self.daemon.now = NOW
         self.daemon.check_alarms()
         told = self.told_lines()
         self.assertEqual(len(told), 1, told)
-        self.assertIn("480/h against its cap of 300", told[0])
-        self.assertIn("GET /repos/{owner}/{repo}/actions/runs/{id}/jobs?per_page 80 (run o/r)", told[0])
+        self.assertIn("spent 350 counted REST in the last hour, past its cap of 300", told[0])
+        self.assertIn("Shed session:lane-7 (250 counted REST)", told[0])
+        self.assertIn("GET /repos/{owner}/{repo}/commits/{sha}/check-runs?check_name&per_page 250 (pr o/r; waiter "
+                      "session:lane-7)", told[0])
+        self.assertEqual(self.notice_lines()[-1]["data"]["shed"], {"waiter": "session:lane-7", "counted": 250})
 
     def spenders(self, rows: list[dict]) -> None:
         cmd = Path(self.tmp.name) / "gh-quota"

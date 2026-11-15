@@ -125,8 +125,9 @@ the daemon is the only process that talks to GitHub, and clients only read its c
   host: the pool is the account's) fires when the poorest REST counter is under alarms.restLeft (1000), its
   drain over the last minutes runs it dry before its reset, or that drain is past alarms.paceShare (0.5) of the
   hourly limit (42 a minute of 5000); it names the host's top REST callers (gh-quota usage) as well as this
-  daemon's routes and their waiters. The share alarm (every host) when this daemon's own
-  REST pace over the last 10 minutes is past its cap by half. Each is a notice line in
+  daemon's routes and their waiters. The share alarm (every host) when this daemon's own counted REST over
+  the measured last hour is past its cap, naming the waiter to shed; a fast 10 minutes inside a measured hour
+  under the cap is only a share-pace log line ("nothing to do, projection only"), as the cap holds the hour. Each is a notice line in
   ~/.local/state/notices/glaeda-gh.jsonl and a `tell-coordinator --from glaeda-gh` (WARN, or FIRE under the
   reserve or within 10 minutes of dry), naming the top routes; at most once an hour unless it gets worse.
 - The token comes from `gh auth token` and stays in memory; it is never written or logged.
@@ -2197,7 +2198,37 @@ PR_CONTEXT_MAX_PAGES = 20  # 2,000 contexts per PR; beyond that the cache stays 
 # watched PR every cycle once spent 1678 of one daemon's 1958 points an hour (#1830), and the landers that need the
 # same hour to read their gates must never be starved by a completeness read.
 PR_PAGES_POINTS_PER_HOUR = 300
-NAMED_READS_KEPT = 2000  # required_by_name's conditional answers kept in memory; past it the store starts over
+NAMED_READS_KEPT = 2000  # required_by_name's conditional answers kept; past it the oldest go first
+# required_by_name's ETags and answers, kept across restarts and re-execs: an in-memory store lost them on every one,
+# so the first read of each required name after it was a counted 200 instead of a free 304. On huge-blue
+# (2026-11-15, a restart about every hour at :37) that burst was most of its REST share: 90 of its 148 counted
+# REST an hour were these reads, and its share alarm fired about ten minutes after each restart.
+NAMED_READS_FILE = "named-reads.json"
+
+
+def slim_named(doc: Any) -> Any:
+    """A by-name answer cut to what required_by_name reads (named_check_node's fields, a status's), so the kept store
+    stays small on disk; anything else is kept as it came."""
+    if isinstance(doc, dict) and isinstance(doc.get("check_runs"), list):
+        keep = ("node_id", "name", "status", "conclusion", "details_url", "html_url", "id", "started_at", "completed_at")
+        return {"check_runs": [{**{k: r.get(k) for k in keep}, "app": {"slug": (r.get("app") or {}).get("slug")}}
+                               for r in doc["check_runs"] if isinstance(r, dict)]}
+    if isinstance(doc, dict) and isinstance(doc.get("statuses"), list):
+        keep = ("context", "state", "target_url", "created_at")
+        return {"total_count": doc.get("total_count"),
+                "statuses": [{k: s.get(k) for k in keep} for s in doc["statuses"] if isinstance(s, dict)]}
+    return doc
+
+
+def load_named_reads(doc: Any) -> dict[str, tuple[str | None, Any]]:
+    """NAMED_READS_FILE's well-formed entries (path -> [ETag, answer]), oldest first."""
+    reads = doc.get("reads") if isinstance(doc, dict) else None
+    out: dict[str, tuple[str | None, Any]] = {}
+    for path, pair in (reads if isinstance(reads, dict) else {}).items():
+        if (isinstance(path, str) and isinstance(pair, list) and len(pair) == 2 and isinstance(pair[0], str)
+                and isinstance(pair[1], dict)):
+            out[path] = (pair[0], pair[1])
+    return dict(list(out.items())[-NAMED_READS_KEPT:])
 
 
 def named_check_node(run: dict) -> dict:
@@ -2400,8 +2431,11 @@ class Daemon:
         self.fed_repos: dict[str, float] = {}  # owner/repo (lowercase) -> the last event the feed delivered for it
         self.gql_reason = "other"  # what the GraphQL query being sent reads, for daemon.json graphqlBy
         self.gql_log: list[tuple[float, str, int]] = []  # (time, reason, points) per GraphQL query, last hour
-        # REST path -> (ETag, answer) of required_by_name's reads, so an unchanged one is a free 304
-        self.named_reads: dict[str, tuple[str | None, Any]] = {}
+        # REST path -> (ETag, answer) of required_by_name's reads, so an unchanged one is a free 304, kept on disk
+        # (NAMED_READS_FILE) so a restart or re-exec still asks with the ETag
+        self.named_reads: dict[str, tuple[str | None, Any]] = load_named_reads(read_json(BASE / NAMED_READS_FILE))
+        self.named_dirty = False
+        self.share_pace_at = float("-inf")  # the last share-pace log line (share_alarm)
         self.token_source = token
         self.token: str | None = None
         doc = read_json(BASE / "budget.json")
@@ -2755,8 +2789,8 @@ class Daemon:
 
     def check_alarms(self) -> None:
         """The pool alarm (policy alarms.pool): REST left under alarms.restLeft, or the drain over the last minutes
-        running it dry before its reset. The share alarm (alarms.share): this daemon's own counted REST over the last
-        SPEND_RECENT seconds, at that pace for an hour, past its cap by half (or by 150 for a small cap). Each names
+        running it dry before its reset. The share alarm (alarms.share, share_alarm): this daemon's own counted REST
+        over the measured last hour past its cap, naming the waiter to shed. Each names
         the routes that spent most lately, so whoever hears it knows what to fix."""
         self.alarm_procs = [p for p in self.alarm_procs if p.poll() is None]  # reap what finished
         policy = self.policy.get("alarms") or {}
@@ -2788,17 +2822,10 @@ class Daemon:
                         f"{dry}, resets {clock(reset)}. This daemon's top REST routes, last "
                         f"{SPEND_RECENT // 60} min: {top}.")
                 firing["pool"] = ("fire" if fire else "warn", text, {**pool, "top": recent["restByRoute"]})
-        cap = self.rest_cap()
-        # the share's own measure: the outbox (sessions' writes) is never held to it (request)
-        polling = [r for r in rows if r["bucket"] == "rest" and r["kind"] != "outbox"]
-        pace = sum(r["counted"] for r in polling) * 3600 // SPEND_RECENT
-        if policy.get("share", True) and pace > max(cap * 3 // 2, cap + 150):
-            mine = spend_summary(polling, SPEND_RECENT, top=3)["restByRoute"]
-            routes = "; ".join(f"{r['route']} {r['counted']} ({r['topCaller'] or '?'}{route_waiter(r)})"
-                               for r in mine if r["counted"])
-            text = (f"WARN glaeda-gh on {policy_host()} is spending REST at {pace}/h against its cap of {cap} "
-                    f"({self.rest_spent()} in the last hour). Top routes, last {SPEND_RECENT // 60} min: {routes}.")
-            firing["share"] = ("warn", text, {"pace": pace, "cap": cap, "spent": self.rest_spent(), "top": mine})
+        if policy.get("share", True):
+            share = self.share_alarm(self.rest_cap(), rows)
+            if share is not None:
+                firing["share"] = share
         if policy.get("stale", True):
             stale = self.stale_valve(self.stale_alarm(), policy)
             if stale == "held":
@@ -2837,6 +2864,40 @@ class Daemon:
             changed = True
         if changed:
             write_json(BASE / ALARMS_FILE, self.alarms)
+
+    def share_alarm(self, cap: int, recent_rows: list[dict]) -> tuple[str, str, dict] | None:
+        """The share alarm: this daemon's counted REST over the measured trailing hour past its cap, naming the waiter
+        to shed. The share is a hard cap (rest_room), so that hour passes it only by what the cap exempts (a failed
+        attempt's job list) or an operator's restYield. A fast ten minutes inside the hour is the cap at work (the
+        daemon reads up to it, and a restart's re-reads come in a burst), not news: one log line an hour
+        (share-pace, "nothing to do, projection only"), never an alarm. The old alarm projected the last
+        SPEND_RECENT seconds over an hour and warned about hourly on huge-blue and cosmic-gray with nothing for
+        anyone to do (2026-11-15: "306/h against its cap of 150 (142 in the last hour)")."""
+        spent = self.rest_spent()
+        # the share's own measure: the outbox (sessions' writes) is never held to it (request)
+        recent = [r for r in recent_rows if r["bucket"] == "rest" and r["kind"] != "outbox"]
+        pace = sum(r["counted"] for r in recent) * 3600 // SPEND_RECENT
+        if spent <= cap:
+            if pace > max(cap * 3 // 2, cap + 150) and self.now - self.share_pace_at >= ALARM_EVERY:
+                self.share_pace_at = self.now
+                log({"event": "share-pace", "pace": pace, "spent": spent, "cap": cap,
+                     "note": "nothing to do, projection only: the measured hour is within the cap, which holds it"})
+            return None
+        polling = [r for r in self.spend_rows(3600) if r["bucket"] == "rest" and r["kind"] != "outbox"]
+        mine = spend_summary(polling, 3600, top=3)["restByRoute"]
+        waiters: dict[str, int] = {}
+        for r in polling:
+            if r.get("waiter") and r["counted"]:
+                waiters[r["waiter"]] = waiters.get(r["waiter"], 0) + r["counted"]
+        shed = max(waiters.items(), key=lambda kv: (kv[1], kv[0]), default=None)
+        routes = "; ".join(f"{r['route']} {r['counted']} ({r['topCaller'] or '?'}{route_waiter(r)})"
+                           for r in mine if r["counted"])
+        action = (f"Shed {shed[0]} ({shed[1]} counted REST): end or slow its waits." if shed else
+                  "No waiter to shed: the spend is the daemon's own; check restYield in its policy.")
+        text = (f"WARN glaeda-gh on {policy_host()} spent {spent} counted REST in the last hour, past its cap of {cap}. "
+                f"{action} Top routes, last hour: {routes or 'none logged'}.")
+        return ("warn", text, {"pace": pace, "cap": cap, "spent": spent, "top": mine,
+                               "shed": {"waiter": shed[0], "counted": shed[1]} if shed else None})
 
     def write_notice(self, kind: str, level: str, text: str, data: dict) -> None:
         """One notice line (cmuxterm-hq tools/fleet-reconcilers/notices.py's schema) in NOTICES_DIR/glaeda-gh.jsonl."""
@@ -4355,6 +4416,7 @@ class Daemon:
             write_json(BASE / "budget.json", self.budget)
             self.saved_budget = json.loads(json.dumps(self.budget))
         self.save_spend()
+        self.save_named_reads()
         try:
             self.check_alarms()
         except Exception as error:  # noqa: BLE001  an alarm that cannot be sent must never stop the reads
@@ -5113,10 +5175,21 @@ class Daemon:
             return None, doc
         if state == "same":
             return kept, None
-        if len(self.named_reads) >= NAMED_READS_KEPT:
-            self.named_reads.clear()  # bounded: an old head's answers are worth nothing
-        self.named_reads[path] = (new_etag, doc)
+        doc = slim_named(doc)
+        self.named_reads.pop(path, None)  # (re-inserted last: the oldest answers go first)
+        while len(self.named_reads) >= NAMED_READS_KEPT:
+            del self.named_reads[next(iter(self.named_reads))]  # bounded: an old head's answers are worth nothing
+        if new_etag:
+            self.named_reads[path] = (new_etag, doc)
+            self.named_dirty = True
         return doc, None
+
+    def save_named_reads(self) -> None:
+        """NAMED_READS_FILE, when a read changed it this tick."""
+        if self.named_dirty:
+            write_json(BASE / NAMED_READS_FILE, {"schema": "glaeda-gh-named-reads/v1",
+                                                 "reads": {p: list(v) for p, v in self.named_reads.items()}})
+            self.named_dirty = False
 
     def required_by_name(self, owner: str, repo: str, sha: str, names: list[str],
                          number: int) -> tuple[dict[str, list[dict]], str | None]:
