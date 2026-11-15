@@ -11420,6 +11420,56 @@ class GateTest(unittest.TestCase):
             popen.assert_called_once()
         self.assertGreaterEqual(hook.GATE_RESTART_FREE_S, hook.BROKER_POLL_S)
 
+    def test_a_hold_back_inside_the_restart_wait_is_the_gate_state_and_its_log_line(self) -> None:
+        # 2026-11-15 20:32Z, cmux22: a fleet build took the host lock again inside a stopped gate's 60 s restart wait,
+        # for the same reason as before. The gate logged only a changed reason, so its last line stayed "the host is
+        # free; listening again after 60 s free" while the build held host.lock, and ci-dash, which read only that
+        # line, counted the runner as "other" with the wrong words. The gate writes its live state every pass
+        # (gate_state_file), and a hold after the free line is logged again.
+        gate, stops = self.gate(["held", "held", "held", None, None, "held", "held"])
+        state = hook.gate_state_file(self.state, self.runner)
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            gate.step(); gate.step()
+            self.assertEqual(stops, ["held"])
+            self.assertEqual(json.loads(state.read_text())["line"], "stopping the idle listener: held")
+            gate.child.poll.return_value = 0  # the listener exited because the gate asked
+            with mock.patch.object(hook.subprocess, "Popen") as popen:
+                gate.step()  # the listener is gone
+                gate.step()  # still held
+                self.assertEqual(json.loads(state.read_text())["line"], "holding the listener off: held")
+                gate.step(); gate.step()  # free twice: the restart wait
+                doc = json.loads(state.read_text())
+                self.assertTrue(doc["line"].startswith("the host is free; listening again after"), doc)
+                gate.step()  # held again, for the same reason
+                popen.assert_not_called()
+        doc = json.loads(state.read_text())
+        self.assertEqual(doc["line"], "holding the listener off: held")
+        self.assertEqual((doc["schema"], doc["pid"]), (hook.GATE_STATE_SCHEMA, os.getpid()))
+        for key in ("since", "at"):
+            self.assertRegex(doc[key], r"^\d{4}-\d\d-\d\d \d\d:\d\d:\d\dZ$")
+        lines = [line.split(f"{hook.GATE}: ", 1)[1] for line in out.getvalue().splitlines() if f"{hook.GATE}: " in line]
+        free = max(i for i, line in enumerate(lines) if line.startswith("the host is free; listening again"))
+        self.assertIn("holding the listener off: held", lines[free + 1:], lines)
+        with contextlib.redirect_stdout(io.StringIO()) as again:
+            gate.step()  # still held: the same reason is not logged again
+        self.assertEqual(again.getvalue(), "")
+
+    def test_the_gate_state_is_rewritten_while_it_holds_and_keeps_its_since(self) -> None:
+        gate, _ = self.gate(["held"] * 3)
+        gate.child = None
+        state = hook.gate_state_file(self.state, self.runner)
+        with contextlib.redirect_stdout(io.StringIO()):
+            gate.step()
+            first = json.loads(state.read_text())
+            gate.step()
+            self.assertEqual(json.loads(state.read_text()), first, "unchanged inside GATE_STATE_EVERY_S: no write")
+            gate.state_written -= hook.GATE_STATE_EVERY_S
+            with mock.patch.object(hook.time, "time", return_value=time.time() + 120):
+                gate.step()
+        later = json.loads(state.read_text())
+        self.assertEqual((later["line"], later["since"]), (first["line"], first["since"]))
+        self.assertGreater(later["at"], first["at"])
+
     def test_a_gate_held_from_its_start_starts_after_two_free_polls(self) -> None:
         # The free-hold is for a listener the gate stopped; a gate that starts held (boot, a full mini) has stopped
         # nothing, so two free polls still start it.
