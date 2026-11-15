@@ -2074,6 +2074,23 @@ MIN_WORKLOAD_PYTHON = (3, 13)  # cmux_fleet_bootstrap profile_runner_interpreter
 ELIGIBILITY_BUDGET_S = 20.0  # one deadline for every probe: a hung xcodebuild refuses, it does not stall
 
 
+PROBE_BUSY_LOAD_PER_CPU = 1.5  # past this 1-minute load per core a probe timeout is the host's load, not a hung tool
+
+
+def probe_load_busy() -> str | None:
+    """'load L on N cores' when this host's 1-minute load is past PROBE_BUSY_LOAD_PER_CPU per core, else None (an
+    unreadable load is not busy). GLAEDA_RUNNER_PROBE_LOAD_PER_CPU sets the per-core load, for tests."""
+    cores = os.cpu_count() or 0
+    forced = os.environ.get("GLAEDA_RUNNER_PROBE_LOAD_PER_CPU")
+    try:
+        per_cpu = float(forced) if forced else ((load_1min() or 0.0) / cores if cores > 0 else 0.0)
+    except ValueError:
+        return None
+    if per_cpu < PROBE_BUSY_LOAD_PER_CPU:
+        return None
+    return f"load {per_cpu * max(cores, 1):.0f} on {cores} cores"
+
+
 def _json_file(path: Path) -> Any:
     try:
         return json.loads(path.read_text(encoding="utf-8"))
@@ -2311,17 +2328,23 @@ def toolchain_refusal(fleet_class: str | None, want: dict[str, Any], xcode_app: 
     note = ""
 
     def out_of_time(why: str, empty: bool) -> str | None:
-        """why, unless the probe behind it gave nothing (empty) after the deadline: that is no answer, and no answer
-        is no evidence. A busy machine makes a job slower, never makes it fail (glaeda-13 at load ~200 failed the cmux
-        app compile at Set up runner, cmux run 43683149857), so the job is admitted (None) and the note says what
-        went unanswered; a later look with time to answer judges again. Xcode's probe already admits on no answer."""
+        """why, unless the probe behind it gave nothing (empty) after the deadline: that is no answer. On a host past
+        its cores (probe_load_busy) no answer is no evidence: a busy machine makes a job slower, never makes it fail
+        (glaeda-13 at load ~200 on 14 cores failed the cmux app compile at Set up runner, cmux run 43683149857), so
+        the job is admitted (None) and the note says what went unanswered. On a host with headroom the same timeout
+        is a hung tool, which refuses (it does not stall the job), naming the timeout."""
         nonlocal note
         if not empty or time.monotonic() < deadline:
             return why
-        note = "; ".join(x for x in (note, f"admitted on no answer: the toolchain probes timed out after "
-                                           f"{ELIGIBILITY_BUDGET_S:.0f} s (busy, not a missing or drifted tool); "
-                                           f"unanswered: {why.removeprefix('node not eligible ')}") if x)
-        return None
+        unanswered = why.removeprefix("node not eligible ")
+        busy = probe_load_busy()
+        if busy:
+            note = "; ".join(x for x in (note, f"admitted on no answer: the toolchain probes timed out after "
+                                               f"{ELIGIBILITY_BUDGET_S:.0f} s on a busy host ({busy}), not a missing "
+                                               f"or drifted tool; unanswered: {unanswered}") if x)
+            return None
+        return (f"node not eligible (the toolchain probes timed out after {ELIGIBILITY_BUDGET_S:.0f} s; no answer, "
+                f"not a missing or drifted tool; unanswered: {unanswered})")
 
     missing = toolchain_missing(env, home)
     if missing:

@@ -6670,10 +6670,18 @@ else:
         self.node(hang="xcodebuild")
         with mock.patch.dict(os.environ, {}):
             start = time.monotonic()
+            # a host with headroom, whatever the test runner's own load: there a timeout is a hung tool
             result = self.started("--require-eligible", "--fleet-class", "m4pro-48",
-                                  env={"PATH": f"{self.dir / 'jobpath'}:/usr/bin:/bin"})
+                                  env={"PATH": f"{self.dir / 'jobpath'}:/usr/bin:/bin",
+                                       "GLAEDA_RUNNER_PROBE_LOAD_PER_CPU": "0.5"})
         self.assertEqual(result.returncode, 1)
         self.assertIn("xcodeVersion '' != '26.6'", result.stdout)
+        # the same hung tool on a busy host admits: the job is slower, never failed
+        result = self.started("--require-eligible", "--fleet-class", "m4pro-48",
+                              env={"PATH": f"{self.dir / 'jobpath'}:/usr/bin:/bin",
+                                   "GLAEDA_RUNNER_PROBE_LOAD_PER_CPU": "14"})
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertIn("admitted on no answer", result.stdout)
         self.assertLess(time.monotonic() - start, 30)
 
     def test_no_enrollment_refuses(self) -> None:
@@ -7705,12 +7713,17 @@ class XcodeToolchainTest(unittest.TestCase):
                 mock.patch.object(hook, "toolchain_missing", return_value=None):
             why, _ = hook.toolchain_refusal("m4pro-48", want, None, align=False)
             self.assertEqual(why, gh_missing)
-            with mock.patch.object(hook, "ELIGIBILITY_BUDGET_S", 0.0):
-                # past the budget the same empty answers admit (test_a_busy_node_whose_probes_run_out_of_time_...)
-                why, note = hook.toolchain_refusal("m4pro-48", want, None, align=False)
-                self.assertIsNone(why)
-                self.assertIn("timed out after 0 s (busy, not a missing or drifted tool)", note)
-                answers.update(gh="gh version 2", zig="0.15.0")
+            # on a host with headroom; a busy one admits (test_a_busy_node_whose_probes_run_out_of_time_...)
+            with mock.patch.object(hook, "ELIGIBILITY_BUDGET_S", 0.0), \
+                    mock.patch.dict(os.environ, {"GLAEDA_RUNNER_PROBE_LOAD_PER_CPU": "0.5"}):
+                why, _ = hook.toolchain_refusal("m4pro-48", want, None, align=False)
+                self.assertIn("timed out after 0 s; no answer, not a missing or drifted tool", why)
+                self.assertIn("gh is not on the job PATH", why)
+                answers.update(gh="gh version 2", zig="")
+                why, _ = hook.toolchain_refusal("m4pro-48", want, None, align=False)
+                self.assertIn("timed out after 0 s", why, "an empty drift past the budget is no answer too")
+                self.assertIn("zigVersion '' != '0.16.0'", why)
+                answers.update(zig="0.15.0")
                 why, _ = hook.toolchain_refusal("m4pro-48", want, None, align=False)
                 self.assertTrue(why.startswith("node not eligible (toolchain drifted"), "a real answer is a drift")
                 answers.update(zig="0.16.0", python3="3.9")
@@ -7736,8 +7749,13 @@ class XcodeToolchainTest(unittest.TestCase):
         with mock.patch.object(hook, "_probe", side_effect=lambda argv, *_: answers.get(argv[0], "")), \
                 mock.patch.object(hook, "toolchain_missing", return_value=None), \
                 mock.patch.object(hook, "ELIGIBILITY_BUDGET_S", 0.0):
+            with mock.patch.dict(os.environ, {"GLAEDA_RUNNER_PROBE_LOAD_PER_CPU": "0.5"}):
+                why, _ = hook.toolchain_refusal("m4pro-48", want, None, align=False)
+                self.assertIn("timed out after 0 s", why, "on a host with headroom a timeout is a hung tool: refused")
+            self.enterContext(mock.patch.dict(os.environ, {"GLAEDA_RUNNER_PROBE_LOAD_PER_CPU": "14"}))
             why, note = hook.toolchain_refusal("m4pro-48", want, None, align=False)
-            self.assertIsNone(why, "no answer from gh past the budget admits")
+            self.assertIsNone(why, "no answer from gh past the budget on a busy host admits")
+            self.assertIn("on a busy host (load ", note)
             self.assertIn("timed out after 0 s", note)
             self.assertIn("gh is not on the job PATH", note)
             answers.update(gh="gh version 2", zig="")
