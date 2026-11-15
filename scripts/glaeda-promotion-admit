@@ -358,11 +358,12 @@ def runner_settings(source: Path) -> dict[str, Any]:
     words = shlex.split(line)[1:]
     if len(words) < 3 or words[2] != "job-started":
         raise Refusal("the installed runner's job-started.sh is not a glaeda hook call")
-    settings: dict[str, Any] = {"python": words[0], "capacity_units": 0, "compile_slots": 1, "canonical_roots": 1,
+    settings: dict[str, Any] = {"python": words[0], "capacity_units": 0, "reserve_cores": 0, "compile_slots": 1,
+                                "canonical_roots": 1,
                                 "gui_token": "gui", "capacity_dir": None}
     flags = {"--capacity-units": ("capacity_units", int), "--compile-slots": ("compile_slots", int),
              "--canonical-roots": ("canonical_roots", int), "--gui-token": ("gui_token", str),
-             "--capacity-dir": ("capacity_dir", str)}
+             "--capacity-dir": ("capacity_dir", str), "--reserve-cores": ("reserve_cores", int)}
     for at, word in enumerate(words):
         if word in flags and at + 1 < len(words):
             name, kind = flags[word]
@@ -819,6 +820,9 @@ class Supervisor:
     def claim(self) -> bool:
         hook = self.hook
         total = int(self.settings["capacity_units"])
+        measured = getattr(hook, "capacity_cores", None)  # the runners' own total (CAPACITY_ARITHMETIC), so the
+        if measured is not None:  # lease takes every unit they scan
+            total = measured(total, int(self.settings.get("reserve_cores") or 0))
         if total <= 0:
             self.update(phase="failed", reason="this mini has no weighted capacity ledger to take whole")
             return False

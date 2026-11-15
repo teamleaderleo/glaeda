@@ -780,7 +780,11 @@ def hook_wrappers(ctx: Context) -> dict[str, bytes]:
             scope += recycle
     if ctx.capacity_units:  # every runner on this mini shares these units (the hook's capacity ledger)
         scope += f" --capacity-units {int(ctx.capacity_units)}"
-        slots = int((ctx.member or {}).get("compileSlots") or 1)
+        # the hook's ledger is the host's measured cores (CAPACITY_ARITHMETIC); a member's reserveCores keeps cores out
+        reserve = int((ctx.member or {}).get("reserveCores") or 0)
+        if reserve > 0:
+            scope += f" --reserve-cores {reserve}"
+        slots =int((ctx.member or {}).get("compileSlots") or 1)
         if slots > 1:
             scope += f" --compile-slots {slots}"
         roots = int((ctx.member or {}).get("canonicalRoots") or 1)
@@ -3082,7 +3086,7 @@ def main(argv: list[str] | None = None) -> int:
                  if ctx.gui_runner
                  else member.get("sessionPools", []) if ctx.session_runner
                  else [*member.get("rootPools", []), *(member.get("sidePools", []) if member.get("rootsTakeSide") else [])]
-                 if is_root else member.get("sidePools", []))
+                 if is_root else [*member.get("sidePools", []), *member.get("sharedSidePools", [])])
         # Dedicated roles leave out ordinary pool and iOS labels, so those jobs cannot take a DEV, GUI or fast
         # instance. The pool's live count includes only the root and side instances it can route to.
         own = ([label for label in member["labels"] if label not in member.get("pools", []) and label != IOS_SIM_JOB_LABEL]

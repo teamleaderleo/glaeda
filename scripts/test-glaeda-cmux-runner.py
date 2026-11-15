@@ -9241,6 +9241,8 @@ class GateTest(unittest.TestCase):
             self.assertEqual(hook.job_meta("manaflow-ai/cmux", hook.DEFAULT_HOME_REPO)["class"], "compile-gui")
             os.environ["GITHUB_WORKFLOW_REF"] = "manaflow-ai/cmux/.github/workflows/cmux-tui.yml@refs/heads/main"
             self.assertEqual(hook.job_meta("manaflow-ai/cmux", hook.DEFAULT_HOME_REPO)["class"], "isolated")
+            self.assertEqual(hook.job_meta("manaflow-ai/cmux", hook.DEFAULT_HOME_REPO)["workflow_file"], "cmux-tui.yml",
+                             "the file admission keys the needs row by, so job-needs.json needs no name map")
         payload.write_text(json.dumps({"pull_request": {}}))
         with mock.patch.dict(os.environ, env):
             os.environ.pop("GITHUB_WORKFLOW_REF", None)
@@ -13637,7 +13639,7 @@ class RunnerTest(unittest.TestCase):
         self.assertEqual([[x for x in l if x.startswith(prefixes)] for l in labels],
                          [["glaeda-std-xcode-26.6", "glaeda-root-std-xcode-26.6"],
                           ["glaeda-std-xcode-26.6", "glaeda-side-std-xcode-26.6",
-                           "glaeda-side-light-xcode-26.6"],
+                           "glaeda-side-light-xcode-26.6", "glaeda-side-xcode-26.6"],
                           ["glaeda-gui-std-xcode-26.6", "glaeda-session-std-xcode-26.6"]],
                          "the gui runner carries neither the pool label nor a root or side one, and the session label")
         self.assertIn("glaeda-ios-sim", labels[0])
@@ -13689,7 +13691,8 @@ class RunnerTest(unittest.TestCase):
                                                           "glaeda-session"))]
         self.assertEqual([roles(l) for l in labels],
                          [["glaeda-std-xcode-26.6", "glaeda-root-std-xcode-26.6"]] * 2
-                         + [["glaeda-std-xcode-26.6", "glaeda-side-std-xcode-26.6", "glaeda-side-light-xcode-26.6"]] * 2
+                         + [["glaeda-std-xcode-26.6", "glaeda-side-std-xcode-26.6", "glaeda-side-light-xcode-26.6",
+                             "glaeda-side-xcode-26.6"]] * 2
                          + [["glaeda-session-std-xcode-26.6"], ["glaeda-gui-std-xcode-26.6"]],
                          "only the last carries the gui label, so no console job lands where its token is held, and "
                          "with a session runner beside it the console runner leaves session jobs to that one")
@@ -13824,7 +13827,8 @@ class RunnerTest(unittest.TestCase):
                                                           "glaeda-fast"))]
         self.assertEqual([roles(l) for l in today],
                          [["glaeda-std-xcode-26.6", "glaeda-root-std-xcode-26.6"]] * 2
-                         + [["glaeda-std-xcode-26.6", "glaeda-side-std-xcode-26.6", "glaeda-side-light-xcode-26.6"]] * 3)
+                         + [["glaeda-std-xcode-26.6", "glaeda-side-std-xcode-26.6", "glaeda-side-light-xcode-26.6",
+                             "glaeda-side-xcode-26.6"]] * 3)
         zero, zero_hooks = self.fast_labels({**base, "fastRunners": 0}, "zero")
         self.assertEqual((zero, zero_hooks), (today, today_hooks), "fastRunners 0 is today's fleet exactly")
         self.assertFalse([h for h in today_hooks if "--fast-runner" in h])
@@ -16790,6 +16794,291 @@ class JobTelemetryTest(unittest.TestCase):
     def test_sampler_file_never_looks_like_a_lock_holder(self) -> None:
         name = self.hook.sampler_file(self.dir).name
         self.assertFalse(name.startswith(self.hook.HOLDER_FILE))
+
+
+class CapacityArithmeticTest(unittest.TestCase):
+    """CAPACITY_ARITHMETIC (Leo, 2026-11-15: "I mean so in the sense of like this has this many CPUs."): a job's need
+    is its measured p90 cores and RAM, a host's capacity is its measured cores and RAM less a floor, and one rule
+    admits on every host."""
+
+    GUEST = "manaflow-ai/cmuxterm-hq"
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+        (self.dir / "fleet").mkdir()
+        (self.dir / "fleet" / "host.lock").touch()
+        self.held: list[int] = []
+        self.addCleanup(lambda: hook.close_all(self.held))
+        hook._NEEDS_CACHE.clear()
+        self.addCleanup(hook._NEEDS_CACHE.clear)
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def needs(self, jobs: dict | None = None, classes: dict | None = None, **top: object) -> Path:
+        doc = {"schema": hook.JOB_NEEDS_SCHEMA, "generated_at": datetime.datetime.now(datetime.timezone.utc)
+               .strftime("%Y-%m-%dT%H:%M:%SZ"), "window": {"from": "2026-11-01", "to": "2026-11-14"},
+               "min_samples": 20, "jobs": jobs or {}, "classes": classes or {}, **top}
+        path = self.dir / f"needs-{len(list(self.dir.glob('needs-*')))}.json"
+        path.write_text(json.dumps(doc))
+        return path
+
+    @staticmethod
+    def row(cores: float, mib: float, n: int = 50) -> dict:
+        return {"n": n, "cores_p50": cores / 2, "cores_p90": cores, "mem_peak_mib_p90": mib, "mem_peak_mib_max": mib,
+                "wall_s_p50": 60, "wall_s_p90": 120}
+
+    def host(self, cores: int, mem_gib: int, needs: Path):
+        return mock.patch.dict(os.environ, {hook.HOST_CORES_ENV: str(cores), hook.HOST_MEM_ENV: str(mem_gib * 1024),
+                                            hook.JOB_NEEDS_ENV: os.fspath(needs)})
+
+    def keep(self, fds: list[int], *args: object, **kwargs: object) -> tuple[bool, str]:
+        self.held.extend(fds)  # the admitted job runs on: its holder keeps every lock
+        return True, "held"
+
+    def take(self, job: str, workflow: str = "build-fleet-go.yml", repo: str = GUEST, tier: str = "",
+             since: float | None = None) -> tuple[bool, str]:
+        total = hook.capacity_cores(14)  # the wrapper's --capacity-units 14 only turns the ledger on
+        with mock.patch.object(hook, "hold", side_effect=self.keep), \
+                mock.patch.object(hook, "lock_waiters", return_value=[]), \
+                mock.patch.object(hook, "bounded_waiters", return_value=[]):
+            return hook.take_capacity(os.fspath(self.dir / "fleet" / "host.lock"), self.dir / "capacity", total,
+                                      job, os.getpid(), self.dir / "state", repo=repo, workflow=workflow,
+                                      tier=tier, since=since)
+
+    def fill(self, job: str) -> tuple[int, str]:
+        """Admit `job` until the host refuses one: (how many ran at once, the refusal)."""
+        for n in range(100):
+            ok, why = self.take(job)
+            if not ok:
+                return n, why
+        self.fail("never full")
+
+    def test_needs_file_parses_and_falls_back_to_todays_tables(self) -> None:
+        good = self.needs({"build-fleet-go.yml/test": self.row(4.0, 100),
+                           f"{self.GUEST}/build-fleet-go.yml/test": self.row(2.3, 3000),
+                           "ci.yml/cli-regressions": self.row(0.2, 300),
+                           "cmux-next.yml/app-compile-fleet": self.row(3.2, 900),
+                           f"{self.GUEST}/build-fleet-go.yml/rare": self.row(9.0, 9000, n=3)},
+                          {"isolated": self.row(5.1, 5000), "gateway": self.row(2.0, 100)})
+        needs, why = hook.load_job_needs(good)
+        self.assertEqual(why, "")
+        need = hook.job_need("isolated", "test", self.GUEST, workflow="build-fleet-go.yml", needs=needs)
+        self.assertEqual(need, hook.Need(3, 3000, "job", True), "ceil(cores_p90) and the p90 RAM of its own row")
+        self.assertEqual(hook.job_need("compile", "cli-regressions", hook.DEFAULT_HOME_REPO, workflow="ci.yml",
+                                       needs=needs).cores, 1, "at least 1 core")
+        rare = hook.job_need("isolated", "rare", self.GUEST, workflow="build-fleet-go.yml", needs=needs)
+        self.assertEqual(rare, hook.Need(6, 5000, "class", False), "under min_samples: its class's row")
+        self.assertEqual(hook.class_need("gateway", needs).cores, 0, "a 0-unit token class stays 0")
+        self.assertEqual(hook.job_need("gateway", "app-compile-fleet", hook.DEFAULT_HOME_REPO,
+                                       workflow="cmux-next.yml", needs=needs).cores, 0)
+        self.assertEqual(hook.job_need(hook.EXCLUSIVE_CLASS, "sign", hook.DEFAULT_HOME_REPO, needs=needs).cores,
+                         hook.EXCLUSIVE_UNITS, "a signing job still takes the whole host")
+        # no measured row: JOB_CORES, then CLASS_COST, as before
+        self.assertEqual(hook.job_need("light", "swift-package-tests", hook.DEFAULT_HOME_REPO, workflow="ci.yml",
+                                       needs=needs).cores, hook.JOB_CORES[("ci.yml", "swift-package-tests")])
+        stale = self.needs(generated_at="2026-01-01T00:00:00Z")
+        broken = self.dir / "broken.json"
+        broken.write_text("{torn")
+        other = self.needs(schema="glaeda-job-needs/v0")
+        naive = self.needs(generated_at="2026-11-15T00:00:00")
+        bad_tables = self.needs(jobs=["not an object"])
+        for path, reason in ((self.dir / "absent.json", "no absent.json"), (broken, "not JSON"),
+                             (stale, "stale"), (other, "schema"), (naive, "time zone"), (bad_tables, "jobs")):
+            with self.subTest(path=path.name):
+                needs, why = hook.load_job_needs(path)
+                self.assertIsNone(needs)
+                self.assertIn(reason, why)
+                with mock.patch.dict(os.environ, {hook.JOB_NEEDS_ENV: os.fspath(path)}):
+                    for key, cores in hook.JOB_CORES.items():
+                        if len(key) == 2:  # a home job's (workflow, job); a guest's key leads with its repo
+                            workflow, job = key
+                            klass = hook.job_class(job, hook.DEFAULT_HOME_REPO, workflow=workflow)[0]
+                            self.assertEqual(hook.job_units(klass, job, hook.DEFAULT_HOME_REPO, workflow=workflow),
+                                             cores, "today's table exactly")
+                    self.assertEqual(hook.class_need("compile"), hook.Need(hook.CLASS_COST["compile"][0]))
+                    self.assertEqual(hook.root_fit_units(), hook.ROOT_FIT_UNITS)
+        # the shipped file is a valid needs file (read as a host it names, when it names any)
+        shipped = ROOT / "scripts" / hook.JOB_NEEDS_NAME
+        listed = json.loads(shipped.read_text()).get("hosts") or [hook.gate_host()]
+        with mock.patch.object(hook, "gate_host", return_value=listed[0]):
+            self.assertEqual(hook.load_job_needs(shipped, now=datetime.datetime(
+                2026, 11, 16, tzinfo=datetime.timezone.utc).timestamp())[1], "")
+
+    def test_one_rule_on_a_12_core_16_gib_host_and_a_30_core_96_gib_host(self) -> None:
+        needs = self.needs({f"{self.GUEST}/build-fleet-go.yml/test": self.row(3.4, 3000)})  # 4 cores, 3 GiB
+        with self.host(12, 16, needs):
+            self.assertEqual((hook.capacity_cores(14), hook.mem_chunks_total()), (12, 12), "16 GiB less a 4 GiB floor")
+            ran, why = self.fill("test")
+        self.assertEqual(ran, 3, "12 cores / 4: cores bind before RAM (12 GiB / 3)")
+        self.assertIn("capacity: 0 of 12 units free", why)
+        hook.close_all(self.held)
+        self.held.clear()
+        with self.host(30, 96, needs):
+            self.assertEqual((hook.capacity_cores(14), hook.mem_chunks_total()), (30, 84), "96 GiB less 12 GiB")
+            ran, why = self.fill("test")
+        self.assertEqual(ran, 7, "30 cores / 4, the same rule with the bigger host's numbers")
+        self.assertIn("of 30 units free", why)
+        with mock.patch.dict(os.environ, {hook.HOST_CORES_ENV: "14"}):
+            self.assertEqual(hook.capacity_cores(14, reserve=4), 10, "--reserve-cores keeps cores out")
+            self.assertEqual(hook.capacity_cores(0), 0, "no ledger stays no ledger")
+        with mock.patch.dict(os.environ, {hook.HOST_CORES_ENV: ""}), mock.patch.object(hook, "host_sysctl_int",
+                                                                                       return_value=None):
+            self.assertEqual(hook.capacity_cores(14), 14, "unmeasurable: the --capacity-units count")
+
+    def test_a_ram_bound_host_refuses_on_ram(self) -> None:
+        needs = self.needs({f"{self.GUEST}/build-fleet-go.yml/test": self.row(1.5, 5500),  # 2 cores, 6 GiB
+                            f"{self.GUEST}/build-fleet-go.yml/huge": self.row(2.0, 20000)},  # 20 GiB, its own
+                           {"isolated": self.row(2.0, 30000)})  # the class estimate: more than 16 GiB too
+        with self.host(12, 16, needs):
+            ran, why = self.fill("test")
+            self.assertEqual(ran, 2, "6 of 12 cores free, but 12 GiB of RAM fits two 6 GiB jobs")
+            self.assertTrue(why.startswith("capacity: 0 of 12 GiB of RAM free"), why)
+            self.assertIn("needs 6 GiB", why)
+            hook.close_all(self.held)
+            self.held.clear()
+            ok, why = self.take("test")
+            self.assertTrue(ok, why)
+            ok, why = self.take("huge")  # more than the host's RAM: it waits for a RAM-idle host, never refused
+            self.assertFalse(ok)
+            self.assertTrue(why.startswith("capacity: 6 of 12 GiB of RAM free"), why)
+            hook.close_all(self.held)
+            self.held.clear()
+            ok, why = self.take("huge")
+            self.assertTrue(ok, why)
+            self.assertIn("12/12 GiB", why, "it runs alone")
+            ok, why = self.take("test")
+            self.assertFalse(ok)
+            self.assertIn("of 12 GiB of RAM free", why)
+            hook.close_all(self.held)
+            self.held.clear()
+            ok, why = self.take("unmeasured")  # only its class's 30 GiB estimate: it runs here alone too
+            self.assertTrue(ok, why)
+            self.assertIn("12/12 GiB", why)
+        hook.close_all(self.held)
+        self.held.clear()
+        with self.host(30, 96, needs):
+            ok, why = self.take("huge")
+            self.assertTrue(ok, why)
+            self.assertIn("20/84 GiB", why)
+        with self.host(12, 16, needs), mock.patch.dict(os.environ, {hook.RAM_LEDGER_ENV: "0"}):
+            self.assertEqual(hook.mem_chunks_total(), 0, "the kill switch")
+            ok, why = self.take("huge")
+            self.assertTrue(ok, why)
+
+    def test_a_row_for_this_hosts_core_count_and_resident_ram_win(self) -> None:
+        """Jobs expand to the cores they find: a by_ncpu row for this host's hw.ncpu comes before the pooled row,
+        and rss_peak_mib_p90 (resident) before mem_peak_mib_p90 (the footprint, which counts swapped pages)."""
+        test = dict(self.row(4.0, 30000), rss_peak_mib_p90=3000,
+                    by_ncpu={"30": dict(self.row(10.2, 60000), rss_peak_mib_p90=9000),
+                             "10": self.row(6.0, 2000, n=3)})  # under min_samples: the pooled row
+        needs = self.needs({f"{self.GUEST}/build-fleet-go.yml/test": test},
+                           {"compile": {"n": 50, "cores_p90": 3.0, "mem_peak_mib_p90": 4000,
+                                    "by_ncpu": {"12": {"n": 50, "cores_p90": 2.0, "mem_peak_mib_p90": 1000}}}})
+        key = ("test", self.GUEST, hook.DEFAULT_HOME_REPO, "build-fleet-go.yml")
+        with self.host(30, 96, needs):
+            self.assertEqual(hook.job_need("compile", *key)[:3], (11, 9000, "job"))
+        with self.host(14, 48, needs):
+            self.assertEqual(hook.job_need("compile", *key)[:3], (4, 3000, "job"), "no 14-core row: pooled, resident")
+            self.assertEqual(hook.class_need("compile")[:2], (3, 4000), "no rss: the footprint")
+        with self.host(10, 16, needs):
+            self.assertEqual(hook.job_need("compile", *key)[:2], (4, 3000),
+                             "a by_ncpu row under min_samples is skipped")
+        with self.host(12, 16, needs):
+            self.assertEqual(hook.class_need("compile")[:2], (2, 1000), "classes have by_ncpu rows too")
+
+    def test_a_waiting_nightly_job_still_goes_first(self) -> None:
+        """FEED_FIRST is unchanged: RAM waits as units do, so a nightly waiter holds every newcomer, and a nightly
+        newcomer goes ahead of an older PR waiter."""
+        needs = self.needs({f"{self.GUEST}/build-fleet-go.yml/test": self.row(1.0, 2000),
+                            "nightly.yml/verify-signed-nightly": self.row(1.0, 2000)})
+        nightly = [{"pid": os.getpid() + 1, "since": time.time() - 30, "wants": ["units"],
+                    "who": "n2 build-nightly-app (run 9)", "tier": hook.TIER_NIGHTLY}]
+        pr = [{"pid": os.getpid() + 1, "since": time.time() - 30, "wants": ["units"],
+               "who": "s3 swift-test (run 8)", "tier": ""}]
+        with self.host(12, 16, needs):
+            with mock.patch.object(hook, "admission_waiters", return_value=nightly):
+                ok, why = self.take("test", since=time.time())
+            self.assertFalse(ok)
+            self.assertIn("is a nightly job and goes first here for units", why)
+            with mock.patch.object(hook, "admission_waiters", return_value=pr):
+                ok, why = self.take("verify-signed-nightly", workflow="nightly.yml", repo=hook.DEFAULT_HOME_REPO,
+                                    tier=hook.TIER_NIGHTLY, since=time.time())
+            self.assertTrue(ok, why)
+            self.assertIn("2/12 GiB", why)
+
+    def test_the_listener_gate_holds_for_ram(self) -> None:
+        needs = self.needs({f"{self.GUEST}/build-fleet-go.yml/test": self.row(1.0, 5500)})
+        with self.host(12, 16, needs):
+            for _ in range(2):
+                self.assertTrue(self.take("test")[0])
+            why = hook.mini_full(self.dir / "capacity", 12, hook.RunnerScope(units=12))
+            self.assertIn("only 0 of 12 GiB of RAM", why)
+            self.assertIn(hook.UNITS_FULL, why, "a RAM hold reads as a units hold (SESSION_FIRST, reserves)")
+            self.assertEqual(hook.fit_mem_chunks([20000, 3000], 12), 3, "a job that never fits holds nothing")
+            self.assertEqual(hook.fit_mem_chunks([], 12), 1)
+            self.assertEqual(hook.fit_mem_chunks([], 0), 0)
+
+    def test_needs_prints_what_admission_reads(self) -> None:
+        needs = self.needs(classes={"compile": self.row(5.2, 9000)})
+        env = {"PATH": "/usr/bin:/bin", "HOME": os.fspath(self.dir), hook.HOST_CORES_ENV: "12",
+               hook.HOST_MEM_ENV: "16384"}
+        out = subprocess.run([sys.executable, os.fspath(HOOK), "needs", "--needs-file", os.fspath(needs)],
+                             capture_output=True, text=True, env=env, timeout=60)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        answer = json.loads(out.stdout)
+        self.assertEqual(answer["host"], {"cores": 12, "mem_mib": 16384, "mem_floor_mib": 4096, "mem_chunks": 12,
+                                          "mem_chunk_mib": 1024})
+        self.assertEqual(answer["classes"]["compile"], {"cores": 6, "mib": 9000})
+        out = subprocess.run([sys.executable, os.fspath(HOOK), "needs", "--needs-file", os.fspath(self.dir / "x")],
+                             capture_output=True, text=True, env=env, timeout=60)
+        self.assertEqual(out.returncode, 1)
+        self.assertEqual(json.loads(out.stdout)["fallback"], "no x")
+
+    def test_needs_hosts_names_the_only_hosts_that_read_it(self) -> None:
+        """A canary: "hosts" names the hosts that read the rows; every other host keeps today's tables exactly."""
+        rows = {"ci.yml/cli-regressions": self.row(0.2, 300)}
+        canary = self.needs(rows, hosts=["mini-a", "Ultra-B"])
+        with mock.patch.object(hook, "gate_host", return_value="ultra-b"):
+            needs, why = hook.load_job_needs(canary)
+        self.assertEqual(why, "")
+        self.assertEqual(hook.job_need("compile", "cli-regressions", hook.DEFAULT_HOME_REPO, workflow="ci.yml",
+                                       needs=needs), hook.Need(1, 300, "job", True))
+        with mock.patch.object(hook, "gate_host", return_value="mini-c"):
+            needs, why = hook.load_job_needs(canary)
+        self.assertIsNone(needs)
+        self.assertEqual(why, "this host (mini-c) is not in the needs file's hosts")
+        for bad in ("mini-a", [1], {"mini-a": True}):
+            with self.subTest(hosts=bad):
+                needs, why = hook.parse_job_needs(json.dumps({
+                    "schema": hook.JOB_NEEDS_SCHEMA, "generated_at": datetime.datetime.now(datetime.timezone.utc)
+                    .strftime("%Y-%m-%dT%H:%M:%SZ"), "jobs": rows, "classes": {}, "hosts": bad}).encode())
+                self.assertIsNone(needs)
+                self.assertEqual(why, "hosts is not a list of host names")
+        with mock.patch.object(hook, "gate_host", return_value="mini-c"):
+            self.assertEqual(hook.load_job_needs(self.needs(rows))[1], "", "no hosts: every host reads it")
+
+    def test_listener_count_and_shared_side_label(self) -> None:
+        self.assertEqual([fleet_labels.listener_count(*shape) for shape in ((14, 48), (12, 16), (10, 16), (30, 96))],
+                         [14, 12, 10, fleet_labels.MAX_RUNNERS])
+        self.assertEqual(fleet_labels.listener_count(12, 16, reserve_cores=4), 8)
+        manifest = copy.deepcopy(MANIFEST)
+        manifest["hardware"] = {"m4pro-48": {"cpus": 14, "memory_gib": 48}}
+        manifest["hosts"]["mini-light"]["availability"] = "dedicated"
+        manifest["hosts"]["mini-std"]["overrides"] = {"runner": {"classes": {"std": {
+            "runners": 6, "capacityUnits": 14, "reserveCores": 2}}}}
+        with mock.patch.object(cr, "xcode_present", return_value=True):
+            std, why = cr.member_labels(manifest, "mini-std")
+            light, _ = cr.member_labels(manifest, "mini-light")
+        self.assertIsNone(why)
+        self.assertEqual((std["reserveCores"], std["listeners"]), (2, 12))
+        self.assertEqual(std["sharedSidePools"], ["glaeda-side-xcode-26.6"])
+        self.assertEqual(light["sharedSidePools"], ["glaeda-side-xcode-26.6"], "every capable host, any class")
+        self.assertEqual(light["sidePools"], ["glaeda-side-light-xcode-26.6"], "the class labels stay")
+        manifest["hosts"]["mini-std"]["overrides"]["runner"]["classes"]["std"]["reserveCores"] = -1
+        with mock.patch.object(cr, "xcode_present", return_value=True):
+            self.assertIn("reserveCores", cr.member_labels(manifest, "mini-std")[1])
 
 
 if __name__ == "__main__":

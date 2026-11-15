@@ -292,6 +292,43 @@ def gateway_label(version: str) -> str:
     return f"glaeda-{GATEWAY_PREFIX}-xcode-{version}"
 
 
+def shared_side_label(version: str) -> str:
+    """The side label every capable host's plain side runners carry, whatever its class: glaeda-side-xcode-<version>
+    (CAPACITY_ARITHMETIC). No class: a job routed to it goes to whichever side runner listens, and a host's listener
+    gate listens only while its measured free cores and RAM fit the label's costliest job, and its hook admits a job
+    only while the job's measured need fits what the host has left. The class side labels stay for the workflows
+    that route to them."""
+    return f"glaeda-side-xcode-{version}"
+
+
+# How many runners (listeners) a member should register so the capacity arithmetic, not the runner count, decides how
+# many jobs run at once: as many as the host could run of the smallest common job (light, gui, gui-step, product and
+# simulator jobs: 1 core and under 1 GiB at p90), by cores and by RAM over the hook's floor, at most MAX_RUNNERS.
+LISTENER_MIN_JOB_CORES = 1
+LISTENER_MIN_JOB_GIB = 1  # the hook's MEM_CHUNK_MIB
+
+
+def listener_count(cpus: int, memory_gib: int | None, reserve_cores: int = 0) -> int:
+    """listener_count(14, 48) == 14 (M4 Pro), (12, 16) == 12 (M6), (10, 16) == 10 (M4), (30, 96) == MAX_RUNNERS."""
+    by_cores = max(1, (cpus - reserve_cores) // LISTENER_MIN_JOB_CORES)
+    if memory_gib:
+        floor = max(4, memory_gib // 8)  # the hook's mem_floor_mib, in GiB
+        by_cores = min(by_cores, max(1, (memory_gib - floor) // LISTENER_MIN_JOB_GIB))
+    return min(MAX_RUNNERS, by_cores)
+
+
+def member_listeners(manifest: dict[str, Any], hardware: str, units: int, reserve: int = 0) -> int:
+    """listener_count() for a member from the manifest's hardware.<class> {cpus, memory_gib} (capacityUnits when
+    the hardware class names no cpus): the runners the member's class should declare. Advisory: the plan prints it
+    beside the declared runners, and the declared count is what --apply registers."""
+    hw = (manifest.get("hardware") or {}).get(hardware) if isinstance(manifest.get("hardware"), dict) else None
+    hw = hw if isinstance(hw, dict) else {}
+    cpus, mem = hw.get("cpus"), hw.get("memory_gib")
+    cpus = cpus if isinstance(cpus, int) and not isinstance(cpus, bool) and cpus > 0 else units
+    mem = mem if isinstance(mem, int) and not isinstance(mem, bool) and mem > 0 else None
+    return listener_count(cpus, mem, reserve)
+
+
 def sim_label(version: str) -> str:
     """The sim-first runners' label for an Xcode version: glaeda-sim-xcode-<version>. No class: a simulator job runs
     the same on any simulator mini, so one label spans every class's sim-first runners."""
@@ -461,8 +498,9 @@ def member_labels(manifest: Any, member: str, xcode_ok: Callable[[dict[str, Any]
         fast = declared.get("fastRunners", 0)
         gateway = declared.get("gatewayRunners", 0)
         sim = declared.get("simRunners", 0)
+        reserve = declared.get("reserveCores", 0)
     else:
-        compile_slots, roots, gui, fast, gateway, sim = 1, 1, 0, 0, 0, 0
+        compile_slots, roots, gui, fast, gateway, sim, reserve = 1, 1, 0, 0, 0, 0, 0
     if dedicated_only:
         gateway = sim = 0  # DEDICATED_ONLY: no pool instance, so no gateway or sim-first runner after them either
     if not (isinstance(runners, int) and not isinstance(runners, bool) and 1 <= runners <= MAX_RUNNERS):
@@ -499,6 +537,10 @@ def member_labels(manifest: Any, member: str, xcode_ok: Callable[[dict[str, Any]
     if sim and (trusted_ref is not None or availability != "dedicated" or normal_pool_prefix):
         return None, (f"{member} runner.classes.{klass}.simRunners needs a dedicated runner without trustedRef "
                       "(a sim-first runner takes pull request jobs) in the default pool namespace (no poolPrefix)")
+    # reserveCores: cores the hook's ledger keeps out of its measured hw.ncpu (CAPACITY_ARITHMETIC), for work it does
+    # not admit; capacityUnits is the count only where the hook cannot measure the host
+    if not (isinstance(reserve, int) and not isinstance(reserve, bool) and 0 <= reserve <= 4 * MAX_RUNNERS):
+        return None, f"runner.classes.{klass}.reserveCores must be 0 to {4 * MAX_RUNNERS} (cores)"
     if compile_slots > roots:
         return None, (f"runner.classes.{klass}.compileSlots {compile_slots} needs canonicalRoots {compile_slots} "
                       "(every compile holds a root)")
@@ -514,7 +556,8 @@ def member_labels(manifest: Any, member: str, xcode_ok: Callable[[dict[str, Any]
             "nightlySlot": nightly_slot, "nightlyInstance": roots + int(dev_compile) if nightly_slot else None,
             "minFreeGib": floor if isinstance(floor, (int, float)) and floor > 0 else None,
             "hardware": hardware, "xcodeApps": [str(a.get("path")) for a in ready], "iosSim": ios_sim,
-            "runners": runners, "capacityUnits": units, "compileSlots": compile_slots,
+            "runners": runners, "capacityUnits": units, "reserveCores": reserve, "compileSlots": compile_slots,
+            "listeners": member_listeners(manifest, hardware, units, reserve),
             "trustedRef": trusted_ref, "trustedRepo": trusted_repo, "trustedNextNightly": next_nightly,
             "trustedNextSigning": next_signing,
             "devCompile": dev_compile, "devCompileInstance": roots if dev_compile else None,
@@ -529,7 +572,11 @@ def member_labels(manifest: Any, member: str, xcode_ok: Callable[[dict[str, Any]
             "gatewayPools": list(dict.fromkeys(gateway_label(v) for v in (versions if pools else []))) if gateway
             else [],
             "simRunners": sim,
-            "simPools": list(dict.fromkeys(sim_label(v) for v in (versions if pools else []))) if sim else []}, None
+            "simPools": list(dict.fromkeys(sim_label(v) for v in (versions if pools else []))) if sim else [],
+            # CAPACITY_ARITHMETIC: the classless side label, on default-namespace PR pools only (never a trusted or
+            # namespaced pool, whose jobs are its own)
+            "sharedSidePools": list(dict.fromkeys(shared_side_label(v) for v in versions))
+            if pools and trusted_ref is None and not normal_pool_prefix else []}, None
 
 
 def declared_pools(manifest: Any, xcode_ok: Callable[[str, dict[str, Any]], bool] | None = None) -> dict[str, list[str]]:
