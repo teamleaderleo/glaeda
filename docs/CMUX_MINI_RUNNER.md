@@ -935,6 +935,44 @@ count is refused. Every instance bakes the same `--capacity-units`, so the mini
 never runs more than its units, however many runners pick up jobs. Uninstall one
 with `--uninstall --apply --instance K`.
 
+### Capacity arithmetic: measured needs against measured hosts
+
+Leo, 2026-11-15: "And I don't mean, you know, some weird blanket like let's put this on this type of machine, that
+on that type of machine. I mean so in the sense of like this has this many CPUs." So admission is one rule on every
+host (the hook's CAPACITY_ARITHMETIC): a job is admitted while the cores of the jobs it already admitted plus this
+job's need fit the host's cores, and their RAM plus this job's fits the host's RAM less a floor.
+
+- A job's need: `scripts/glaeda-job-needs.json` (schema `glaeda-job-needs/v1`, generated in cmuxterm-hq
+  `build-fleet/data/job-needs.json` from the jobs the hook logs). Cores are `ceil(cores_p90)` of the job's own row,
+  else its `JOB_CORES` entry, else its class's row, else `CLASS_COST` (at least 1; the 0-unit token classes, fast and
+  gateway, stay 0; a signing job still takes the whole host). RAM is `mem_peak_mib_p90` of the job's row, else its
+  class's row, else none. Rows under `min_samples` are skipped. A missing, malformed or stale (30 days) file gives
+  today's tables exactly.
+- It ships like the hook's other runner files: `glaeda-cmux-runner-fleet` stages it into `~/glaeda-runner/scripts`
+  and `glaeda-update` keeps that copy at the installed release's, and the hook reads it from there. To update it,
+  copy hq's file over `scripts/glaeda-job-needs.json`, check it with
+  `scripts/glaeda-cmux-runner-hook needs --needs-file scripts/glaeda-job-needs.json` (exit 1 when it would fall
+  back), and merge.
+- A host's capacity is read on the host: cores from `hw.ncpu` less `--reserve-cores` (the manifest's
+  `runner.classes.<class>.reserveCores`, for cores kept for work outside the ledger), RAM from `hw.memsize` less a
+  floor of an eighth of it (at least 4 GiB), in 1 GiB `mem-N` flock files beside the `unit-N` ones.
+  `--capacity-units` still turns the ledger on and is the count only where the host cannot be measured.
+  `GLAEDA_RUNNER_RAM_LEDGER=0` in the runner's environment turns RAM accounting off. The memory-pressure gate and
+  the disk floor stay.
+- A job whose own measured RAM need is more than the host's RAM capacity is refused at once (`RAM: ...`); one
+  estimated from its class's row runs alone there. A job waiting for RAM waits as for units (its marker wants
+  `units`), so FEED_FIRST, the nightly slot and the signing drain are unchanged.
+- The listener gate holds a runner while the RAM its costliest job needs (that fits the host at all) is taken, as it
+  does for cores.
+- `scripts/glaeda-cmux-runner-hook needs` prints what a host's admission reads (cores, RAM, floor, each class's need).
+- Listeners: a member's plan summary carries `listeners`, `glaeda_fleet_labels.listener_count()`: as many runners as
+  the host could run of the smallest common job (1 core, 1 GiB) by cores and by RAM over the floor, at most
+  `MAX_RUNNERS` (14 on an M4 Pro, 12 on an M6, 10 on an M4, 16 on an Ultra). Declare that as the class's `runners`
+  so the arithmetic, not the runner count, decides how many jobs run.
+- Every default-namespace PR pool member's plain side runners also carry the classless
+  `glaeda-side-xcode-<version>` (`shared_side_label`): a workflow that routes there is placed by fit. The class side
+  labels stay for the workflows that route to them.
+
 ### Each admitted job compiles with its share of the cores
 
 Units cap how many jobs a mini runs, not how many threads each starts: before this, every admitted job's
