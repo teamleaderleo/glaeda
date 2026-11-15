@@ -277,15 +277,36 @@ class PruneTest(unittest.TestCase):
     def test_an_idle_local_cas_goes_while_unrelated_builds_run(self) -> None:
         """hq#11385: cmux9s always runs runner jobs, so its local CAS (29 GiB, last used a day and a half before,
         cap 20 GiB) was never pruned and the host sat under its disk floor. A CAS that no process has open and that
-        was last used before the oldest running build started, outside the quiet window, goes while they run."""
+        was last used before the oldest running build started, outside the quiet window, goes while they run. Each
+        runner job holds the host lock shared for its whole run (cmux9s after #1998: "deferred: a build holds the
+        host lock"), so that hold must not keep it."""
         self.env()
         self.plugin_cas(2 * 86400)
         fp.running_commands = lambda: self.RUNNER
         fp.build_starts = lambda: [time.time() - 3 * 3600, time.time() - 60]
-        rec = self.run_main("--apply", "--local-cas-gib", "0")
+        job = os.open(self.lock, os.O_RDONLY)
+        try:
+            fcntl.flock(job, fcntl.LOCK_SH)  # the runner hook's job-long hold
+            rec = self.run_main("--apply", "--local-cas-gib", "0")
+        finally:
+            os.close(job)
         self.assertEqual((rec["local_cas"], rec["result"]), ("removed", "ok"), rec)
         self.assertFalse((self.root / "cas").exists())
         self.assertEqual([p.name for p in self.root.iterdir() if p.name.startswith(".cas")], [])
+
+    def test_a_fleet_build_holding_the_host_lock_keeps_an_idle_local_cas(self) -> None:
+        """A fleet build (with-host-lock) holds the host lock exclusive: the CAS waits for it even when idle."""
+        self.env()
+        self.plugin_cas(2 * 86400)
+        fp.running_commands = lambda: self.RUNNER
+        fp.build_starts = lambda: [time.time() - 60]
+        build = os.open(self.lock, os.O_RDONLY)
+        try:
+            fcntl.flock(build, fcntl.LOCK_EX)
+            self.assert_cas_kept(self.run_main("--apply", "--local-cas-gib", "0"),
+                                 "deferred: a build holds the host lock")
+        finally:
+            os.close(build)
 
     def test_a_local_cas_used_since_the_oldest_build_started_stays(self) -> None:
         """Used 2 h ago, outside the 60 min quiet window, but by a build that may still be running (started 3 h

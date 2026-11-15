@@ -253,7 +253,10 @@ def drop_local_cas(local: Path, building: str, quiet_s: float) -> tuple[str, Pat
         return "deferred: a process has the local CAS open (it holds the CAS lock)", None
     lock = None
     try:
-        lock = take_lock(HOST_LOCK)
+        # While runner jobs run they each hold it shared, so an exclusive hold never comes on a busy mini (cmux9s,
+        # 2026-11-15: "deferred: a build holds the host lock" after #1998). Shared still keeps a fleet build
+        # (with-host-lock, exclusive) from starting until the rename is done, and fails while one runs.
+        lock = take_lock(HOST_LOCK, shared=bool(building))
         if lock is None:
             return "deferred: a build holds the host lock", None
         again = running_commands()
@@ -357,14 +360,15 @@ def sweep(root: Path) -> int:
     return freed
 
 
-def take_lock(path: Path):
-    """The host lock without waiting, or None when a build holds it. No lock file: no lock."""
+def take_lock(path: Path, shared: bool = False):
+    """The host lock without waiting, or None when a build holds it. No lock file: no lock. shared: runner jobs hold
+    it shared for their whole run (docs/CMUX_MINI_RUNNER.md), so only a fleet build's exclusive hold refuses it."""
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)  # flock needs no write access
     except FileNotFoundError:
         return -1
     try:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(fd, (fcntl.LOCK_SH if shared else fcntl.LOCK_EX) | fcntl.LOCK_NB)
     except OSError as e:
         os.close(fd)
         if e.errno in (errno.EWOULDBLOCK, errno.EAGAIN):
