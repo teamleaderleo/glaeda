@@ -12589,7 +12589,7 @@ class SpendAlarmTest(Base):
             with self.daemon.calling("run", "o/r", "session:quiet"):
                 for n in range(2):
                     self.daemon.request("GET", f"/repos/o/r/actions/runs/{n}/jobs?per_page=100")
-        with self.daemon.calling("outbox", "o/r"):
+        with self.daemon.calling("outbox", "o/r"), mock.patch.object(self.daemon, "writing", True):
             for n in range(200):  # sessions' writes are not the share's
                 self.daemon.request("POST", f"/repos/o/r/issues/{n}/comments", content=True)
         self.daemon.now = NOW
