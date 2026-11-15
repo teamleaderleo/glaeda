@@ -6660,6 +6660,22 @@ def rollup_red_is_superseded(data: dict) -> bool:
     return red <= superseded
 
 
+def pending_on_every_page(data: dict) -> int:
+    """How many contexts of a truncated rollup are still unfinished on every page, shown or not, by the rollup's
+    counts, less the superseded attempts shown as pending (those are not counted, as under 100 checks);
+    0 when the read did not ask for the counts or the rollup is whole. manaflow-ai/cmux#43515 at f35486bc,
+    2026-11-15: 247 contexts, an excused guard red on page 1 and every web / react-apps-check shard past it still
+    running; `wait --until done` read 0 pending and exited 1 in 23 s while merge_hold refused [webview] on those shards."""
+    counts = data.get("checkCounts")
+    if not data.get("checksTruncated") or not isinstance(counts, dict):
+        return 0
+    rows = [*(counts.get("runs") or {}).items(), *(counts.get("statuses") or {}).items()]
+    pending = sum(n for state, n in rows if state in COUNT_PENDING)
+    superseded = sum(1 for c in data.get("superseded") or []
+                     if not c.get("conclusion") and not c.get("lastRealAttempt"))
+    return max(0, pending - superseded)
+
+
 def check_verdict(data: dict, until: str = "green", now: float | None = None,
                   grace: float = RESCUE_GRACE, settle: float = SETTLE_GRACE) -> int | None:
     """The checks alone, whatever the PR's state or head: EXIT_OK, EXIT_FAIL, EXIT_NOTHING (nothing reported on the
@@ -6674,7 +6690,7 @@ def check_verdict(data: dict, until: str = "green", now: float | None = None,
            for c in shown["failed"]):
         # A red whose suite's newest attempt ran nothing (startup_failure): GitHub's rollup state omits it, it stands;
         # --until done still waits for every shown check to finish first.
-        if until == "done" and (shown["pending"] or shown["held"]):
+        if until == "done" and (shown["pending"] or shown["held"] or pending_on_every_page(data)):
             return None
         return EXIT_FAIL
     # --until required on a truncated rollup that holds every name the base requires (on the first page, or read by
@@ -6693,8 +6709,8 @@ def check_verdict(data: dict, until: str = "green", now: float | None = None,
         if state not in {"FAILURE", "ERROR"}:
             return None
         groups = classify(data, now, grace)
-        if until == "done" and (groups["pending"] or groups["held"]):
-            return None  # every shown check finishes first, as under 100 checks
+        if until == "done" and (groups["pending"] or groups["held"] or pending_on_every_page(data)):
+            return None  # every check finishes first, shown or past page 1 (counts), as under 100 checks
         if groups["failed"] and until != "required":
             return EXIT_FAIL
         # GitHub's rollup still counts a superseded attempt that failed or was cancelled, so its FAILURE
@@ -6866,6 +6882,9 @@ def summary(key: str, entry: dict | None, until: str = "done", grace: float = RE
             held = f", {len(groups['held'])} held" if groups["held"] else ""
             rollup = data.get("checkState")
             differs = f"; GitHub's rollup says {rollup}" if rollup and rollup != state else ""
+            # what the counts say still runs past the first 100 (cmux#43515: "0 pending" while every webview shard ran)
+            past = max(0, pending_on_every_page(data) - len(groups["pending"]) - len(groups["held"]))
+            held += f", {past} more unfinished past the first 100" if past else ""
             lines.append(f"checks {state}{partial}: {len(groups['passed'])} passed, {len(groups['failed'])} failed, "
                          f"{len(groups['pending'])} pending{held} (of {len(checks)}{more}, "
                          f"{sum(1 for c in checks if c.get('required'))} required){differs}")

@@ -4436,6 +4436,37 @@ class ClientTest(Base):
             checkRunCountsByState=[{"state": "SUCCESS", "count": 1}], statusContextCountsByState=[])
         self.assertEqual(gg.parse_pr(node)["checkCounts"], {"runs": {"SUCCESS": 1}, "statuses": {}})
 
+    def test_until_done_waits_for_checks_still_running_past_the_first_100(self) -> None:
+        """manaflow-ai/cmux#43515 at f35486bc, 2026-11-15: 247 contexts; an excused "cmux-next CI guard group" red at
+        position 95 made GitHub's rollup FAILURE, and every web / react-apps-check shard (positions 168-179) was still
+        running past the first page. `wait pr --until done` read "0 pending" and exited 1 in 23 s, while merge_hold
+        refused [webview] on exactly those shards and printed that wait as its next step. The rollup's counts over
+        every page say they still run: --until done waits for them."""
+        shown = [check_run(f"c{i}") for i in range(99)] + [check_run("cmux-next CI guard group", conclusion="FAILURE")]
+        data = gg.parse_pr(pr_node(43515, rollup="FAILURE", checks=shown))
+        running = {"runs": {"SUCCESS": 230, "FAILURE": 2, "SKIPPED": 3, "IN_PROGRESS": 12}, "statuses": {"SUCCESS": 1}}
+        page = {**data, "checksTruncated": True, "checkState": "FAILURE", "checkCounts": running}
+        self.assertIsNone(gg.verdict("pr", page, "done"))
+        self.assertIn("12 more unfinished past the first 100", gg.summary("pr:o/r#43515", {"data": page}, "done"))
+        # green still fails at once on the shown red, as before
+        self.assertEqual(gg.verdict("pr", page, "green"), 1)
+        # once the shards finish, the red decides
+        finished = {"runs": {"SUCCESS": 242, "FAILURE": 2, "SKIPPED": 3}, "statuses": {"SUCCESS": 1}}
+        self.assertEqual(gg.verdict("pr", {**page, "checkCounts": finished}, "done"), 1)
+        # a pending superseded attempt shown is not counted, as under 100 checks
+        stale = {"name": "risk evidence", "conclusion": None}
+        one = {"runs": {"SUCCESS": 241, "FAILURE": 2, "IN_PROGRESS": 1}, "statuses": {}}
+        self.assertEqual(gg.verdict("pr", {**page, "checkCounts": one, "superseded": [stale]}, "done"), 1)
+        # no counts (an older read): as before
+        self.assertEqual(gg.verdict("pr", {**page, "checkCounts": None}, "done"), 1)
+        # a startup_failure red past its suite (lastRealAttempt) waits for the counted running checks too
+        last = {**check_run("x", conclusion="FAILURE"), "lastRealAttempt": True}
+        lone = {**page, "checks": [*data["checks"][:99], last]}
+        self.assertIsNone(gg.verdict("pr", lone, "done"))
+        self.assertEqual(gg.verdict("pr", {**lone, "checkCounts": finished}, "done"), 1)
+        # merged: done whatever still runs
+        self.assertEqual(gg.verdict("pr", {**page, "state": "MERGED"}, "done"), 1)
+
     def test_a_check_cancelled_before_any_step_is_held_for_the_rescue(self) -> None:
         """manaflow-ai/cmux#20608: the owned-pool rescue cancelled a fast tier still queued for a
         runner (no step ran) and re-ran it; a wait that read the gap exited 1 before the re-run."""
