@@ -16849,9 +16849,12 @@ class CapacityArithmeticTest(unittest.TestCase):
                                              cores, "today's table exactly")
                     self.assertEqual(hook.class_need("compile"), hook.Need(hook.CLASS_COST["compile"][0]))
                     self.assertEqual(hook.root_fit_units(), hook.ROOT_FIT_UNITS)
-        # the shipped file is a valid needs file
-        self.assertEqual(hook.load_job_needs(ROOT / "scripts" / hook.JOB_NEEDS_NAME, now=datetime.datetime(
-            2026, 11, 16, tzinfo=datetime.timezone.utc).timestamp())[1], "")
+        # the shipped file is a valid needs file (read as a host it names, when it names any)
+        shipped = ROOT / "scripts" / hook.JOB_NEEDS_NAME
+        listed = json.loads(shipped.read_text()).get("hosts") or [hook.gate_host()]
+        with mock.patch.object(hook, "gate_host", return_value=listed[0]):
+            self.assertEqual(hook.load_job_needs(shipped, now=datetime.datetime(
+                2026, 11, 16, tzinfo=datetime.timezone.utc).timestamp())[1], "")
 
     def test_one_rule_on_a_12_core_16_gib_host_and_a_30_core_96_gib_host(self) -> None:
         needs = self.needs({f"{self.GUEST}/build-fleet-go.yml/test": self.row(3.4, 3000)})  # 4 cores, 3 GiB
@@ -16982,6 +16985,29 @@ class CapacityArithmeticTest(unittest.TestCase):
                              capture_output=True, text=True, env=env, timeout=60)
         self.assertEqual(out.returncode, 1)
         self.assertEqual(json.loads(out.stdout)["fallback"], "no x")
+
+    def test_needs_hosts_names_the_only_hosts_that_read_it(self) -> None:
+        """A canary: "hosts" names the hosts that read the rows; every other host keeps today's tables exactly."""
+        rows = {"ci.yml/cli-regressions": self.row(0.2, 300)}
+        canary = self.needs(rows, hosts=["mini-a", "Ultra-B"])
+        with mock.patch.object(hook, "gate_host", return_value="ultra-b"):
+            needs, why = hook.load_job_needs(canary)
+        self.assertEqual(why, "")
+        self.assertEqual(hook.job_need("compile", "cli-regressions", hook.DEFAULT_HOME_REPO, workflow="ci.yml",
+                                       needs=needs), hook.Need(1, 300, "job", True))
+        with mock.patch.object(hook, "gate_host", return_value="mini-c"):
+            needs, why = hook.load_job_needs(canary)
+        self.assertIsNone(needs)
+        self.assertEqual(why, "this host (mini-c) is not in the needs file's hosts")
+        for bad in ("mini-a", [1], {"mini-a": True}):
+            with self.subTest(hosts=bad):
+                needs, why = hook.parse_job_needs(json.dumps({
+                    "schema": hook.JOB_NEEDS_SCHEMA, "generated_at": datetime.datetime.now(datetime.timezone.utc)
+                    .strftime("%Y-%m-%dT%H:%M:%SZ"), "jobs": rows, "classes": {}, "hosts": bad}).encode())
+                self.assertIsNone(needs)
+                self.assertEqual(why, "hosts is not a list of host names")
+        with mock.patch.object(hook, "gate_host", return_value="mini-c"):
+            self.assertEqual(hook.load_job_needs(self.needs(rows))[1], "", "no hosts: every host reads it")
 
     def test_listener_count_and_shared_side_label(self) -> None:
         self.assertEqual([fleet_labels.listener_count(*shape) for shape in ((14, 48), (12, 16), (10, 16), (30, 96))],

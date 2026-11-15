@@ -760,7 +760,9 @@ DEFAULT_HOME_REPO = "manaflow-ai/cmux"
 # the whole host. RAM: rss_peak_mib_p90 (else mem_peak_mib_p90, the footprint) of the job's row, else its class's
 # row, else none (only the memory-pressure gate, as before). A missing, unreadable, malformed or stale file (older
 # than JOB_NEEDS_MAX_AGE_S) gives every job today's tables exactly; a row with fewer than min_samples runs, or a bad
-# number, is skipped.
+# number, is skipped. An optional top-level "hosts" (short lowercased hostnames, gate_host()) names the only hosts that
+# read the rows (a canary: Leo's capacity arithmetic ran on one M6 and one Ultra first, 2026-11-15); every other
+# host falls back to today's tables exactly. Absent, every host reads them.
 #
 # A host's capacity is measured on the host: cores are hw.ncpu less --reserve-cores (cores kept back for work outside
 # the ledger), and RAM is hw.memsize less mem_floor_mib(), in MEM_CHUNK_MIB chunks (mem-N flock files in the capacity
@@ -848,6 +850,13 @@ def parse_job_needs(data: bytes, now: float | None = None) -> tuple[dict[str, An
     floor = doc.get("min_samples", 20)
     if isinstance(floor, bool) or not isinstance(floor, int) or floor < 1:
         return None, "min_samples is not a positive integer"
+    hosts = doc.get("hosts")
+    if hosts is not None:
+        if not isinstance(hosts, list) or not all(isinstance(h, str) for h in hosts):
+            return None, "hosts is not a list of host names"
+        me = gate_host()
+        if me not in {h.strip().lower() for h in hosts}:
+            return None, f"this host ({me}) is not in the needs file's hosts"
     out: dict[str, Any] = {"generated_at": at.timestamp(), "min_samples": floor}
     for table in ("jobs", "classes"):
         rows = doc.get(table)
