@@ -6806,6 +6806,24 @@ def registration_file(state_dir: Path, runner_dir: Path) -> Path:
     return state_dir / f"registration-{runner_dir.name}.json"
 
 
+# The gate's live state, rewritten while the gate runs: the line it would log for what it does now (holding the
+# listener off and why, stopping it, waiting out GATE_RESTART_FREE_S, or listening), since when, and when it last
+# wrote. The runner log keeps only changes, so its last gate line can be minutes behind (2026-11-15 20:32Z, cmux22:
+# "the host is free; listening again after 60 s" stayed last while a fleet build held host.lock). ci-dash's probe
+# reads this file first and the log's last line only when the file is stale (`at` over a few GATE_STATE_EVERY_S old)
+# or its gate is gone.
+GATE_STATE_SCHEMA = 1
+GATE_STATE_EVERY_S = float(os.environ.get("GLAEDA_RUNNER_GATE_STATE_EVERY_S") or 30.0)
+
+
+def gate_state_file(state_dir: Path, runner_dir: Path) -> Path:
+    return state_dir / f"gate-{runner_dir.name}.json"
+
+
+def gate_stamp(at: float) -> str:
+    return time.strftime("%Y-%m-%d %H:%M:%SZ", time.gmtime(at))
+
+
 def runner_config(runner_dir: Path) -> tuple[str | None, float | None]:
     """(the registered runner name, .runner's mtime): config.sh rewrites .runner when it re-registers."""
     path = runner_dir / ".runner"
@@ -6952,6 +6970,17 @@ class Gate:
         self.reserve_fd: int | None = None  # a gui runner's capacity/<gui token>.reserve flock while it is idle
         self.started_wall = 0.0  # time.time() when start() last started run.sh (registration_deleted's log)
         self.registration = read_registration(state_dir, runner_dir)  # kept across gate restarts: the backoff holds
+        self.free_logged = False  # the restart wait's free line is the last hold line logged (a hold back logs again)
+        # the live state last written (gate_state_file): its line, since when (wall), and when written (monotonic)
+        self.state_line: str | None = None
+        self.state_since = 0.0
+        self.state_written = -GATE_STATE_EVERY_S
+        with contextlib.suppress(OSError, ValueError, AttributeError, TypeError, KeyError):
+            doc = json.loads(gate_state_file(state_dir, runner_dir).read_text(encoding="utf-8"))
+            if doc.get("pid") == os.getpid():  # a reload's re-exec: the same gate, so its state keeps its since
+                since = datetime.datetime.strptime(doc["since"], "%Y-%m-%d %H:%M:%SZ").replace(
+                    tzinfo=datetime.timezone.utc).timestamp()
+                self.state_line, self.state_since = doc.get("line"), float(since)
 
     def reload(self) -> None:
         """An --apply replaced this hook: re-exec the new one in place, keeping run.sh as our child, so a gate
@@ -7907,6 +7936,45 @@ class Gate:
             return self.poll()
         finally:
             self.thaw()
+            self.publish()
+
+    def live_line(self) -> str | None:
+        """The gate line for what the gate does right now (gate_state_file), or None when it is between states (no
+        listener and no hold: about to exit, or its listener exited on its own)."""
+        if self.child is not None and self.child.poll() is None:
+            if self.stop_deadline is not None:
+                return f"stopping the idle listener: {self.held}"
+            return "starting the listener"
+        if self.child is None and self.registration and time.time() < float(self.registration.get("retry_after") or 0):
+            return (f"holding the listener off: {REGISTRATION_DELETED}: GitHub deleted this runner's registration; "
+                    f"trying again after {gate_stamp(float(self.registration['retry_after']))}")
+        if self.held is None:
+            return None
+        if self.free_since is not None and self.stopped_one and self.streak >= GATE_CONFIRM:
+            return f"the host is free; listening again after {GATE_RESTART_FREE_S:g} s free, since a stop"
+        return f"holding the listener off: {self.held}"
+
+    def publish(self) -> None:
+        """Write the live state (gate_state_file) when its line changed, or GATE_STATE_EVERY_S after the last
+        write so its `at` shows the gate is alive. Atomic; a failed write changes nothing the gate decides."""
+        try:
+            line = self.live_line()
+        except Exception:  # noqa: BLE001  (the next pass writes)
+            return
+        now, wall = time.monotonic(), time.time()
+        if line is None or (line == self.state_line and now - self.state_written < GATE_STATE_EVERY_S):
+            return
+        if line != self.state_line:
+            self.state_line, self.state_since = line, wall
+        doc = {"schema": GATE_STATE_SCHEMA, "pid": os.getpid(), "runner_dir": os.fspath(self.runner_dir),
+               "line": line, "since": gate_stamp(self.state_since), "at": gate_stamp(wall)}
+        path = gate_state_file(self.state_dir, self.runner_dir)
+        with contextlib.suppress(OSError):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_name(path.name + f".{os.getpid()}")
+            tmp.write_text(json.dumps(doc, separators=(",", ":"), sort_keys=True) + "\n", encoding="utf-8")
+            os.replace(tmp, path)
+            self.state_written = now
 
     def poll(self) -> int | None:
         if self.child is not None:
@@ -8031,9 +8099,9 @@ class Gate:
         self.reserve(self.keeps_reserve(why))
         if why:
             self.unclaim()
-            if why != self.held:
+            if why != self.held or self.free_logged:  # a hold back inside the restart wait is logged again
                 gate_log(f"holding the listener off: {why}")
-            self.held, self.streak, self.free_since = why, 0, None
+            self.held, self.streak, self.free_since, self.free_logged = why, 0, None, False
             return None
         if self.held is not None:
             self.streak += 1
@@ -8044,9 +8112,10 @@ class Gate:
             if self.stopped_one and time.monotonic() - self.free_since < GATE_RESTART_FREE_S:
                 if self.streak == GATE_CONFIRM:
                     gate_log(f"the host is free; listening again after {GATE_RESTART_FREE_S:g} s free, since a stop")
+                    self.free_logged = True
                 return None
             gate_log("the host is free again")
-            self.held, self.free_since = None, None
+            self.held, self.free_since, self.free_logged = None, None, False
         if self.terminating:  # SIGTERM during the look above
             return 0
         self.start()

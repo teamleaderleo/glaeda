@@ -582,7 +582,14 @@ What `--apply` does:
      job just handed to the session, and a hold back within seconds made a start and a
      stop 30 s later (cmux7s roots, 2026-10-21, three times in an hour). While
      it waits it logs `glaeda-cmux-runner-gate: holding the listener off: <why>`, and
-     `--apply`'s verify accepts that line with or without gh.
+     `--apply`'s verify accepts that line with or without gh. The log keeps only changes
+     (a hold back inside the restart wait is logged again), so its last line can be
+     minutes old. The gate's live state is
+     `~/.local/state/glaeda/cmux-runner/gate-<runner dir>.json` (`line`, the gate line for
+     what it does now; `since`; `at`; `pid`), written when the line changes and every
+     `GATE_STATE_EVERY_S` (30 s) besides; ci-dash's probe reads it first and falls back
+     to the log's last line when `at` is old or `pid` gone (cmux22, 2026-11-15 20:32Z:
+     the log said "the host is free; listening again" while a fleet build held host.lock).
    - **Failure is safe.**
      - A failed poll (a `ps` timeout under load) is logged and retried. After 5 in a
        row, the gate hands the runner back: it waits for the runner instead of killing
