@@ -2887,7 +2887,8 @@ class Daemon:
         mine = spend_summary(polling, 3600, top=3)["restByRoute"]
         waiters: dict[str, int] = {}
         for r in polling:
-            if r.get("waiter") and r["counted"]:
+            # a read shared by several waiters is logged as "N waiters": no one of them to shed
+            if r.get("waiter") and r["counted"] and not re.fullmatch(r"\d+ waiters", r["waiter"]):
                 waiters[r["waiter"]] = waiters.get(r["waiter"], 0) + r["counted"]
         shed = max(waiters.items(), key=lambda kv: (kv[1], kv[0]), default=None)
         routes = "; ".join(f"{r['route']} {r['counted']} ({r['topCaller'] or '?'}{route_waiter(r)})"

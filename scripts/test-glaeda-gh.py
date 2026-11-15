@@ -12581,7 +12581,7 @@ class SpendAlarmTest(Base):
         self.policy()
         self.daemon.policy = {**self.daemon.policy, "restShare": 0.06}  # a cap of 300
         self.daemon.transport = lambda *a: (200, {}, b"{}")
-        for minute in range(50):  # 7 a minute for 50 minutes: 350 in the hour, never fast in any ten minutes
+        for minute in range(50):  # 7 a minute for 50 minutes and 9 for 30: 620 in the hour, never fast in the last ten minutes
             self.daemon.now = NOW - 3000 + minute * 60
             with self.daemon.calling("pr", "o/r", "session:lane-7"):
                 for n in range(5):
@@ -12589,6 +12589,10 @@ class SpendAlarmTest(Base):
             with self.daemon.calling("run", "o/r", "session:quiet"):
                 for n in range(2):
                     self.daemon.request("GET", f"/repos/o/r/actions/runs/{n}/jobs?per_page=100")
+            if minute < 30:  # shared reads, more of them than lane-7's, are no one waiter to shed
+                with self.daemon.calling("pr", "o/r", "6 waiters"):
+                    for n in range(9):
+                        self.daemon.request("GET", f"/repos/o/r/pulls/{n}")
         with self.daemon.calling("outbox", "o/r"), mock.patch.object(self.daemon, "writing", True):
             for n in range(200):  # sessions' writes are not the share's
                 self.daemon.request("POST", f"/repos/o/r/issues/{n}/comments", content=True)
@@ -12596,7 +12600,7 @@ class SpendAlarmTest(Base):
         self.daemon.check_alarms()
         told = self.told_lines()
         self.assertEqual(len(told), 1, told)
-        self.assertIn("spent 350 counted REST in the last hour, past its cap of 300", told[0])
+        self.assertIn("spent 620 counted REST in the last hour, past its cap of 300", told[0])
         self.assertIn("Shed session:lane-7 (250 counted REST)", told[0])
         self.assertIn("GET /repos/{owner}/{repo}/commits/{sha}/check-runs?check_name&per_page 250 (pr o/r; waiter "
                       "session:lane-7)", told[0])
