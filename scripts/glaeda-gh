@@ -8352,6 +8352,12 @@ BROKER_FLAG_ALIAS = {"-R": "--repo", "-X": "--method"}
 # The only flags a served call may carry. Anything else -- `--jq`, `--template`, `--web`,
 # `--attempt`, `--job`, `--exit-status`, or a flag gh adds next year -- means pass it on.
 BROKER_SAFE_FLAGS = {"--repo", "--json"}
+# Flags that keep a read from being served but not from being counted toward a watch. A `--jq`
+# read prints gh's filtered output, which the broker does not compute, so it always goes to gh; but
+# it asks about the same PR or run with the same `--json` fields, so a watch on that target answers
+# the next plain `--json` read and keeps gh_cache_watch's copy current. Until 2026-11-14 such a
+# read was never counted, and a PR polled only with `--jq` was never watched.
+BROKER_COUNT_ONLY_FLAGS = {"--jq", "-q"}
 # Not github.com: the daemon's cache is github.com's, and an enterprise host has its own PR 7.
 BROKER_GITHUB_HOSTS = {"github.com", "www.github.com", "api.github.com"}
 # gh `pr view --json FIELD` -> (key in a cached PR entry, the Go type gh prints it as). gh renders a
@@ -9573,10 +9579,12 @@ def broker_plan(args: list[str], now: float) -> tuple[str, str | None, str | Non
         if refusal:
             return "refuse", refusal, None
     head = " ".join(words[:2])
-    if head not in ("pr view", "run view") or seen - BROKER_SAFE_FLAGS:
+    count_only = seen - BROKER_SAFE_FLAGS
+    if head not in ("pr view", "run view") or count_only - BROKER_COUNT_ONLY_FLAGS:
         return "pass", None, None
-    if any(flag in seen and flag not in values for flag in BROKER_SAFE_FLAGS):
-        return "pass", None, None  # `--json` or `--repo` with no value: gh errors, so never answer
+    if any(flag in seen and flag not in values for flag in BROKER_SAFE_FLAGS | count_only):
+        # `--json`, `--repo` or `--jq` with no value: gh errors, so never answer or count it
+        return "pass", None, None
     kind = "pr" if head == "pr view" else "run"
     table = BROKER_PR_FIELDS if kind == "pr" else BROKER_RUN_FIELDS
     fields = broker_fields(values, table, args)
@@ -9584,6 +9592,9 @@ def broker_plan(args: list[str], now: float) -> tuple[str, str | None, str | Non
     if fields is None or key is None:
         # Nothing to gain from watching a target the cache could not have answered anyway.
         return "pass", None, None
+    if count_only:
+        # `--jq`: the cache holds every field asked for, but not gh's filter. Counted, never served.
+        return "pass", None, key
     line = broker_serve(key, fields, table, now)
     if line is not None and sys.stdout.isatty():
         # Real gh indents and colours `--json` output when stdout is a tty; this prints the compact
@@ -10688,8 +10699,10 @@ def cmd_gh(args: list[str]) -> int:
                 broker_note({"route": "serve", "key": key, **said})
                 print(payload)
                 return EXIT_OK
-            if key is not None and not sys.stdout.isatty() and broker_bucket_spent(key, now) \
-                    and daemon_running():
+            # Only a call broker_plan could serve is worth waiting on: a `--jq` read carries a key
+            # to be counted, and waiting on the daemon would cost it BROKER_SPENT_WAIT for nothing.
+            if key is not None and not seen - BROKER_SAFE_FLAGS and not sys.stdout.isatty() \
+                    and broker_bucket_spent(key, now) and daemon_running():
                 answered = broker_await(args, key)
                 if answered is not None:
                     broker_note({"route": "serve", "key": key, "spent": True, **said})

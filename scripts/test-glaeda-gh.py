@@ -8533,6 +8533,31 @@ class BrokerRouteTest(BrokerBase):
                 self.assertEqual(out, "")
                 self.assertIsNotNone(passed)
 
+    def test_a_jq_read_is_counted_but_never_served(self) -> None:
+        """broker_plan's decision for `--jq`: the key, so cmd_gh counts it toward a watch, and no
+        answer. Every other extra flag, and a `--jq` gh would reject, still gets no key."""
+        key = self.cache_pr(7, {"state": "OPEN", "title": "a fix"})
+        now = time.time()
+        base = ["pr", "view", "7", "-R", "o/r", "--json", "state,title"]
+        for shape in (["--jq", ".state"], ["--jq=.state"], ["-q", ".state"], ["-q.state"],
+                      ["--jq", ".state", "-q", ".title"]):
+            with self.subTest(shape=shape):
+                self.assertEqual(gg.broker_plan([*base, *shape], now), ("pass", None, key))
+        self.assertEqual(gg.broker_plan(["pr", "view", "https://github.com/o/r/pull/7", "--json", "state",
+                                         "--jq", ".state"], now), ("pass", None, key))
+        self.assertEqual(gg.broker_plan(["run", "view", "12", "-R", "o/r", "--json", "status,conclusion",
+                                         "-q", ".status"], now), ("pass", None, "run:o/r/12"))
+        for args in ([*base, "--template", "{{.state}}"], [*base, "--jq", ".state", "--template", "x"],
+                     [*base, "--jq", ".state", "--web"], [*base, "--jq"], [*base, "-q"],
+                     [*base, "--jq", ".state", "--repo"],
+                     ["pr", "view", "7", "-R", "o/r", "--jq", ".state"],  # gh needs --json for --jq
+                     ["pr", "view", "7", "-R", "o/r", "--json", "state,body", "--jq", ".body"],
+                     ["pr", "view", "feature-branch", "--json", "state", "--jq", ".state"],
+                     ["run", "view", "12", "-R", "o/r", "--json", "status", "--jq", ".status", "--attempt", "2"],
+                     ["pr", "list", "-R", "o/r", "--json", "state", "--jq", ".[].state"]):
+            with self.subTest(args=args):
+                self.assertEqual(gg.broker_plan(args, now), ("pass", None, None))
+
     def test_human_output_is_passed_through(self) -> None:
         self.cache_pr(7, {"state": "OPEN"})
         _code, out, _err, passed = self.run_gh(["pr", "view", "7", "-R", "o/r"])
@@ -8896,6 +8921,24 @@ class BrokerWatchTest(BrokerBase):
             self.run_gh(["pr", "view", "7", "-R", "o/r", "--json", "state,body"])
         self.assertEqual(self.watched(), [])
 
+    def test_reads_that_carry_jq_add_up_to_a_watch(self) -> None:
+        """leo-workspace#5172: "a PR read only with --jq never gets watched by the broker". The
+        filtered output still goes to gh; the read is counted like the plain `--json` one."""
+        for args in (["pr", "view", "7", "-R", "o/r", "--json", "state,headRefOid", "--jq", ".state"],
+                     ["pr", "view", "7", "-R", "o/r", "--json", "state", "-q", ".state"]):
+            _code, out, _err, passed = self.run_gh(args)
+            self.assertEqual((out, passed), ("", args), "never served: the broker does not run jq")
+        self.assertEqual(self.watched(), ["pr:o/r#7"])
+        self.run_gh(["run", "view", "12", "-R", "o/r", "--json", "status", "--jq", ".status"])
+        self.run_gh(["run", "view", "12", "-R", "o/r", "--json", "status"])
+        self.assertEqual(self.watched(), ["pr:o/r#7", "run:o/r/12"], "a --jq read and a plain one add up")
+
+    def test_a_jq_read_of_fields_the_daemon_does_not_hold_is_not_watched(self) -> None:
+        for _ in range(3):
+            self.run_gh(["pr", "view", "7", "-R", "o/r", "--json", "state,body", "--jq", ".body"])
+            self.run_gh(["pr", "view", "8", "-R", "o/r", "--json", "state", "--template", "{{.state}}"])
+        self.assertEqual(self.watched(), [])
+
 
 class BrokerBudgetTest(BrokerBase):
     def test_the_cache_horizon_widens_as_the_shared_quota_drains(self) -> None:
@@ -8975,6 +9018,13 @@ class BrokerSpentBucketTest(BrokerBase):
             _code, _out, _err, passed = self.run_gh(self.ARGS)
         self.assertEqual(passed, self.ARGS)
         self.assertEqual(self.watched(), [])
+
+    def test_a_jq_read_over_a_spent_bucket_does_not_wait_for_an_answer_it_cannot_get(self) -> None:
+        self.budget(graphql=0, rest=4000)
+        args = [*self.ARGS, "--jq", ".title"]
+        with mock.patch.object(gg, "broker_await", side_effect=AssertionError("waited")):
+            _code, _out, _err, passed = self.run_gh(args)
+        self.assertEqual(passed, args)
 
     def test_both_buckets_spent_goes_straight_to_gh(self) -> None:
         self.budget(graphql=0, rest=0)
