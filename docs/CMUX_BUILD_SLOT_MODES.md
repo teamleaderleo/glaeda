@@ -106,7 +106,11 @@ Catch-up DerivedData lifecycle, since one directory serves every slot on the hos
   build on the host empties the directory;
 - the local CAS is kept between builds (the 102 s result depends on a filled one), except on
   the writer, whose builds start from an empty one (Writer, below). It is Xcode's own on-disk CAS, which the node daemon does not manage, so its size budget comes
-  from a separate pruner; the daemon's `node-store` gets its own eviction (both not built yet).
+  from a separate pruner, `glaeda-fleet-cas-prune` (hourly). Over its 20 GiB cap it goes whole,
+  also while unrelated runner jobs run, once no process has it open (its `lock` file is free) and
+  nothing in it was used in the last hour or since the oldest running build started (hq#11385:
+  cmux9s always runs jobs, so an idle-host-only rule never pruned it). The daemon's `node-store`
+  gets its own oldest-first eviction in the same tool.
 
 Contract. The host check (`glaeda-mini-fleet check`) can verify:
 

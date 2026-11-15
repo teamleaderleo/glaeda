@@ -34,8 +34,9 @@ class PruneTest(unittest.TestCase):
         self.lock = Path(self.tmp.name) / "host.lock"
         self.lock.write_text("")
         self.saved = (fp.ROOT, fp.HOST_LOCK, fp.running_commands, fp.reserved_above_floor, fp.toolchain_overlap,
-                      fp.free_fraction)
+                      fp.free_fraction, fp.build_starts)
         fp.ROOT, fp.HOST_LOCK = self.root, self.lock
+        fp.build_starts = lambda: []  # never the test host's own processes
         fp.free_fraction = lambda path: 0.5  # the test host's own free disk must not decide the gc schedule
         fp.running_commands = lambda: ["/usr/libexec/something", "zsh"]
         fp.reserved_above_floor = lambda: ""
@@ -43,7 +44,7 @@ class PruneTest(unittest.TestCase):
 
     def tearDown(self) -> None:
         (fp.ROOT, fp.HOST_LOCK, fp.running_commands, fp.reserved_above_floor, fp.toolchain_overlap,
-         fp.free_fraction) = self.saved
+         fp.free_fraction, fp.build_starts) = self.saved
         self.tmp.cleanup()
 
     def env(self, sign_key: str = "") -> None:
@@ -252,6 +253,92 @@ class PruneTest(unittest.TestCase):
         finally:
             os.close(held)
         self.assertTrue(blob.exists())
+
+    RUNNER = ["/Users/cmux/actions-runner-glaeda-8/bin.2.338.2/Runner.Worker spawnclient 151 154"]
+
+    def plugin_cas(self, age_s: float) -> Path:
+        """An Xcode plugin CAS like cmux9s's (its lock, index, data pool, a standalone leaf), last written and read
+        age_s ago."""
+        plugin = self.root / "cas/plugin"
+        (plugin / "v1.1").mkdir(parents=True)
+        files = [plugin / "lock", plugin / "v1.1/v8.index", plugin / "v1.1/v8.data", plugin / "v1.1/v8.4096.leaf"]
+        for f in files:
+            f.write_bytes(b"\0" * 8192)
+        t = time.time() - age_s
+        for p in [*files, plugin / "v1.1", plugin, self.root / "cas"]:
+            os.utime(p, (t, t))
+        return plugin
+
+    def assert_cas_kept(self, rec: dict, why: str) -> None:
+        self.assertTrue(rec["local_cas"].startswith(why), rec)
+        self.assertEqual(rec["result"], rec["local_cas"])
+        self.assertTrue((self.root / "cas/plugin/v1.1/v8.index").exists())
+
+    def test_an_idle_local_cas_goes_while_unrelated_builds_run(self) -> None:
+        """hq#11385: cmux9s always runs runner jobs, so its local CAS (29 GiB, last used a day and a half before,
+        cap 20 GiB) was never pruned and the host sat under its disk floor. A CAS that no process has open and that
+        was last used before the oldest running build started, outside the quiet window, goes while they run."""
+        self.env()
+        self.plugin_cas(2 * 86400)
+        fp.running_commands = lambda: self.RUNNER
+        fp.build_starts = lambda: [time.time() - 3 * 3600, time.time() - 60]
+        rec = self.run_main("--apply", "--local-cas-gib", "0")
+        self.assertEqual((rec["local_cas"], rec["result"]), ("removed", "ok"), rec)
+        self.assertFalse((self.root / "cas").exists())
+        self.assertEqual([p.name for p in self.root.iterdir() if p.name.startswith(".cas")], [])
+
+    def test_a_local_cas_used_since_the_oldest_build_started_stays(self) -> None:
+        """Used 2 h ago, outside the 60 min quiet window, but by a build that may still be running (started 3 h
+        ago): it stays."""
+        self.env()
+        self.plugin_cas(2 * 3600)
+        fp.running_commands = lambda: self.RUNNER
+        fp.build_starts = lambda: [time.time() - 3 * 3600]
+        self.assert_cas_kept(self.run_main("--apply", "--local-cas-gib", "0"), "deferred: a build is running")
+
+    def test_a_local_cas_used_in_the_quiet_window_stays(self) -> None:
+        """Read 10 min ago, before the only build (1 min old) started: still inside the quiet window, so it stays."""
+        self.env()
+        plugin = self.plugin_cas(2 * 86400)
+        t = time.time() - 600
+        os.utime(plugin / "v1.1/v8.4096.leaf", (t, time.time() - 2 * 86400))  # a read moves only the atime
+        fp.running_commands = lambda: self.RUNNER
+        fp.build_starts = lambda: [time.time() - 60]
+        self.assert_cas_kept(self.run_main("--apply", "--local-cas-gib", "0"), "deferred: a build is running")
+        # a 5 min window: the read is older than both the window and the build, so it goes
+        rec = self.run_main("--apply", "--local-cas-gib", "0", "--local-cas-quiet-min", "5")
+        self.assertEqual(rec["local_cas"], "removed", rec)
+
+    def test_an_open_local_cas_stays_build_or_not(self) -> None:
+        """A process holding the CAS's own lock (LLVM holds it shared while the CAS is open) keeps it, even with no
+        build process seen and nothing touched for days."""
+        self.env()
+        plugin = self.plugin_cas(2 * 86400)
+        held = os.open(plugin / "lock", os.O_RDONLY)
+        try:
+            fcntl.flock(held, fcntl.LOCK_SH)
+            for commands in ([], self.RUNNER):
+                fp.running_commands = lambda commands=commands: commands
+                fp.build_starts = lambda: [time.time() - 60]
+                self.assert_cas_kept(self.run_main("--apply", "--local-cas-gib", "0"),
+                                     "deferred: a process has the local CAS open")
+        finally:
+            os.close(held)
+        self.assertEqual(self.run_main("--apply", "--local-cas-gib", "0")["local_cas"], "removed")
+
+    def test_unreadable_build_starts_keep_the_local_cas(self) -> None:
+        self.env()
+        self.plugin_cas(2 * 86400)
+        fp.running_commands = lambda: self.RUNNER
+        fp.build_starts = lambda: None
+        self.assert_cas_kept(self.run_main("--apply", "--local-cas-gib", "0"), "deferred: a build is running")
+
+    def test_parse_etime(self) -> None:
+        self.assertEqual(fp.parse_etime("04:59"), 299)
+        self.assertEqual(fp.parse_etime("1:02:03"), 3723)
+        self.assertEqual(fp.parse_etime("2-01:00:00"), 2 * 86400 + 3600)
+        self.assertIsNone(fp.parse_etime("soon"))
+        self.assertIsNone(fp.parse_etime("x-01:00"))
 
     def test_node_only_caps_the_node_store_and_leaves_the_rest(self) -> None:
         self.env()

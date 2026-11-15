@@ -14,8 +14,15 @@
 Two stores under /Users/Shared/cmux-build-fleet/xcode (docs/CMUX_BUILD_SLOT_MODES.md):
 
   cas         Xcode's own local CAS. The node does not manage it and its layout is Xcode's, so
-              it only ever goes whole, once it is over --local-cas-gib (20), and only while no
-              build runs and the host lock is free (a build has it open). On a reader it only
+              it only ever goes whole, once it is over --local-cas-gib (20): its standalone
+              files (v8.<offset>.leaf) are named from v8.index, so removing one alone would leave
+              the index naming an object that is gone. It goes while nothing has it open (no
+              process holds its `lock` file, which LLVM's on-disk CAS holds shared while open)
+              and the host lock is free, and either no build runs, or it is idle: nothing in it
+              was written or read in the last --local-cas-quiet-min minutes (60), nor since the
+              oldest running build started, so no running build has used it. (hq#11385: cmux9s
+              always runs unrelated runner jobs, so "no build runs" never held there and its CAS
+              sat at 29 GiB over the 20 GiB cap, under the disk floor.) On a reader it only
               speeds up repeat builds (everything in it comes back from the node); the writer
               empties it at the start of every writer build, so the writer's is left alone.
   node-store  the node daemon's cache of the fleet store: one file per object (cas/) or index
@@ -32,11 +39,13 @@ Two stores under /Users/Shared/cmux-build-fleet/xcode (docs/CMUX_BUILD_SLOT_MODE
               first value for a key, so a writer that lost its own entry and computed another
               would then serve a value the fleet store does not hold (kv_put).
 
-A missing local CAS in the middle of a build breaks the build, so the local CAS goes only while no
-xcodebuild, Xcode build service or GitHub Actions Runner.Worker runs. Sizes and the plan are worked
-out without any lock; the local CAS rename runs under the fleet host lock (host.lock, the same flock
-with-host-lock and the runner hook take), taken without waiting, after checking for a build once
-more. Holding it refuses new jobs and takes idle listeners offline (#1206), so it is held only for
+A missing local CAS in the middle of a build that uses it breaks the build, so the local CAS goes
+only while no build can be using it: none of its lock files is held, and either no xcodebuild, Xcode
+build service or GitHub Actions Runner.Worker runs, or its newest mtime or atime is older than both
+the oldest such process's start and the quiet window. Sizes and the plan are worked out without any
+lock; the local CAS rename runs under the fleet host lock (host.lock, the same flock with-host-lock
+and the runner hook take) and the CAS's own lock files, all taken without waiting, after checking
+once more. Holding the host lock refuses new jobs and takes idle listeners offline (#1206), so it is held only for
 the rename; the renamed local CAS is removed after the lock is released.
 
 The fleet store (xcode/fleet-store, on the store host only) is pruned by `fleet-cas gc`, which
@@ -74,6 +83,9 @@ GIB = 1024**3
 BUSY = re.compile(r"(^|/)(xcodebuild|SWBBuildService|XCBBuildService)(\s|$)"
                   r"|/actions-runner[^/\s]*/bin(?:\.[0-9.]+)?/Runner\.Worker(?:\s|$)")
 PRUNING = ".cas.pruning-"  # a local CAS renamed aside for deletion
+# Standalone objects of the local CAS: written once, named from its index, many (96k on cmux9s), so the re-check
+# under the locks skips them (writing one also changes its directory's mtime, which is checked).
+CAS_STANDALONE = re.compile(r"\.\d+\.(?:leaf|leaf\+0|data)$")
 GC_EVERY = 86400  # seconds between fleet-store gc runs
 GC_EVERY_PRESSED = 6 * 3600  # ... while the store's volume is under GC_PRESSURE free
 GC_PRESSURE = 0.15
@@ -129,6 +141,136 @@ def busy(commands: list[str]) -> str:
         if BUSY.search(c):
             return c.strip()[:160]
     return ""
+
+
+def parse_etime(text: str) -> int | None:
+    """ps's etime, [[dd-]hh:]mm:ss, in seconds; None when it is not that."""
+    days, _, rest = text.strip().rpartition("-")
+    parts = rest.split(":")
+    if not 2 <= len(parts) <= 3 or not all(p.isdigit() for p in parts) or (days and not days.isdigit()):
+        return None
+    secs = 0
+    for p in parts:
+        secs = secs * 60 + int(p)
+    return secs + int(days or 0) * 86400
+
+
+def build_starts(now: float | None = None) -> list[float] | None:
+    """When each running build (a BUSY process) started, or None when ps fails or an age cannot be read."""
+    now = time.time() if now is None else now
+    try:
+        out = subprocess.run(["ps", "-axww", "-o", "etime=,command="], capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if out.returncode != 0:
+        return None
+    starts = []
+    for line in out.stdout.splitlines():
+        etime, _, command = line.strip().partition(" ")
+        if not BUSY.search(command.strip()):
+            continue
+        secs = parse_etime(etime)
+        if secs is None:
+            return None
+        starts.append(now - secs)
+    return starts
+
+
+def last_touch(path: Path, quick: bool = False) -> float:
+    """The newest file mtime or atime, or directory mtime, under path (a directory's atime moves when this very walk
+    lists it, so it is not counted; a new object changes its directory's mtime). quick skips standalone objects."""
+    newest = 0.0
+    for dirpath, _, files in os.walk(path):
+        try:
+            newest = max(newest, os.lstat(dirpath).st_mtime)
+        except OSError:
+            pass
+        for name in files:
+            if quick and CAS_STANDALONE.search(name):
+                continue
+            try:
+                st = os.lstat(os.path.join(dirpath, name))
+            except OSError:
+                continue
+            newest = max(newest, st.st_mtime, st.st_atime)
+    return newest
+
+
+def cas_locks(local: Path) -> list[int] | None:
+    """Every `lock` file of the local CAS (cas/lock, cas/<name>/lock) taken exclusive without waiting, or None, with
+    none kept, when one is held: LLVM's on-disk CAS holds its lock shared while a process has it open."""
+    held: list[int] = []
+    for dirpath, dirs, files in os.walk(local):
+        if dirpath != os.fspath(local):
+            dirs[:] = []  # never down into the object directories
+        if "lock" not in files:
+            continue
+        try:
+            fd = os.open(os.path.join(dirpath, "lock"), os.O_RDONLY | os.O_NOFOLLOW)
+        except OSError:
+            continue
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            os.close(fd)
+            for h in held:
+                os.close(h)
+            return None
+        held.append(fd)
+    return held
+
+
+def idle_cutoff(starts: list[float], quiet_s: float, now: float | None = None) -> float:
+    """The local CAS is idle when nothing in it was touched at or after this: the oldest running build's start or
+    the start of the quiet window, whichever is earlier."""
+    now = time.time() if now is None else now
+    return min([now - quiet_s, *starts])
+
+
+def drop_local_cas(local: Path, building: str, quiet_s: float) -> tuple[str, Path | None]:
+    """Rename the local CAS aside when no build can be using it (the module docstring): (what happened, the renamed
+    path or None). Removing the renamed tree is the caller's, once every lock is released."""
+
+    def not_idle(building: str, quick: bool) -> str:
+        """Why the CAS may be in use by a running build, "" when none runs or none has touched it."""
+        if not building:
+            return ""
+        starts = build_starts()
+        if starts is None:
+            return f"deferred: a build is running ({building}) and its start cannot be read"
+        cutoff = idle_cutoff(starts, quiet_s)
+        touched = last_touch(local, quick=quick)
+        if touched >= cutoff:
+            return (f"deferred: a build is running ({building}) and the local CAS was used "
+                    f"{max(0.0, time.time() - touched) / 60:.0f} min ago, at or after "
+                    f"{time.strftime('%Y-%m-%dT%H:%M:%S%z', time.localtime(cutoff))}")
+        return ""
+
+    if why := not_idle(building, quick=False):  # the full walk, with no lock held: the slow part
+        return why, None
+    cas = cas_locks(local) if local.is_dir() else []
+    if cas is None:
+        return "deferred: a process has the local CAS open (it holds the CAS lock)", None
+    lock = None
+    try:
+        lock = take_lock(HOST_LOCK)
+        if lock is None:
+            return "deferred: a build holds the host lock", None
+        again = running_commands()
+        if again is None:
+            return "deferred: a build started (ps failed)", None
+        if why := not_idle(busy(again), quick=True):
+            return why, None
+        if not local.is_dir():
+            return "removed", None
+        renamed = ROOT / f"{PRUNING}{os.getpid()}"
+        os.rename(local, renamed)
+        return "removed", renamed
+    finally:
+        if lock not in (None, -1):
+            os.close(lock)
+        for fd in cas:
+            os.close(fd)
 
 
 def running_commands() -> list[str] | None:
@@ -284,6 +426,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--node-gib", type=float, default=20, help="node-store budget (default %(default)s)")
     ap.add_argument("--local-cas-gib", type=float, default=20,
                     help="the local Xcode CAS goes whole above this (default %(default)s)")
+    ap.add_argument("--local-cas-quiet-min", type=float, default=60,
+                    help="while builds run, the local CAS goes only if untouched this long (default %(default)s)")
     ap.add_argument("--node-only", action="store_true",
                     help="only the node-store cap: no local CAS, no sweep, no fleet-store gc")
     ap.add_argument("--store-gc-only", action="store_true",
@@ -357,25 +501,10 @@ def main(argv: list[str] | None = None) -> int:
         rec["node_store"] = f"removed {len(doomed)} oldest files, {freed / GIB:.1f} GiB"
     renamed, rec["result"] = None, "ok"
     if drop_local:
-        lock = None if building else take_lock(HOST_LOCK)
-        if building:
-            rec["local_cas"] = f"deferred: a build is running ({building})"
+        rec["local_cas"], renamed = drop_local_cas(local, building, a.local_cas_quiet_min * 60)
+        if rec["local_cas"] != "removed":
             rec["result"] = rec["local_cas"]
-        elif lock is None:
-            rec["local_cas"] = rec["result"] = "deferred: a build holds the host lock"
-        else:
-            try:
-                again = running_commands()
-                if again is None or (why := busy(again)):
-                    rec["local_cas"] = rec["result"] = f"deferred: a build started ({why if again else 'ps failed'})"
-                elif local.is_dir():
-                    renamed = ROOT / f"{PRUNING}{os.getpid()}"
-                    os.rename(local, renamed)
-                    rec["local_cas"] = "removed"
-            finally:
-                if lock != -1:
-                    os.close(lock)
-    if renamed is not None:  # the slow part, with the lock released: nothing reads this path
+    if renamed is not None:  # the slow part, with the locks released: nothing reads this path
         shutil.rmtree(renamed, ignore_errors=True)
     print(json.dumps(rec))
     return 0
