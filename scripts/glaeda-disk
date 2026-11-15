@@ -8181,10 +8181,11 @@ def write_eviction_status(receipt: Path, status: dict[str, Any]) -> None:
         pass
 
 
-def cmux_active(path: Path, levels: int = 3, budget: int = 5000) -> bool:
+def cmux_active(path: Path, levels: int = 3, budget: int = 5000, wide_is_busy: bool = True) -> bool:
     """cmuxterm-hq's reload-cloud marks a slot busy while a job runs: <slot>/.cmux-active/pid with a
     live pid, or work/<slot>/.lock (lib/cloud-slot-runtime.sh). Either, at or up to `levels` below path,
-    means in use. An unreadable pid, or a tree too big to search within `budget`, counts as busy."""
+    means in use. An unreadable pid counts as busy; so does a tree too big to search within `budget`
+    unless wide_is_busy is False (a tree that is not a job unit, judged by its process evidence instead)."""
     level = [path]
     for depth in range(levels + 1):
         nxt: list[Path] = []
@@ -8203,7 +8204,7 @@ def cmux_active(path: Path, levels: int = 3, budget: int = 5000) -> bool:
             for c in _children(d):
                 budget -= 1
                 if budget < 0:
-                    return True
+                    return wide_is_busy
                 if c.name != ".cmux-active" and not c.is_symlink() and c.is_dir():
                     nxt.append(c)
         level = nxt
@@ -8243,7 +8244,13 @@ def job_busy(fam: Family, path: Path) -> bool:
     if fam.id == CMUX_NEXT_CI_FAMILY and (path in cmux_next_ci_state_roots(fam.root)
                                          or cmux_next_ci_host_root(fam, path) or cmux_next_ci_tui_tree(fam, path)):
         return False  # a whole state's inputs are wider than the budget; cmux_next_ci_busy is its signal
-    return fam.reclaimable and not fam.discover and cmux_active(path)
+    # Only the job cache above is a reload unit whose slots a too-wide search must fail closed on. Anywhere else a
+    # search that runs out of budget is no evidence of a job, and treating it as one pinned every wide tree forever
+    # (each family above was such an exception; cmux16, 2026-11-15: a 3.4 GiB home-scratch folder of several cmux
+    # checkouts, untouched three weeks, read "a cmux reload job holds its unit" with no marker and nothing open in
+    # it). A live marker found within the budget still holds it, and process, cwd and open-file evidence applies to
+    # every item.
+    return fam.reclaimable and not fam.discover and cmux_active(path, wide_is_busy=False)
 
 
 def value(item: "Item", fam: Family) -> float:
