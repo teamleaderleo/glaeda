@@ -10984,6 +10984,43 @@ class HomeScratchTest(unittest.TestCase):
         self.apply(fam, item)
         self.assertFalse(tree.exists())
 
+    def test_a_retired_folder_held_by_another_process_names_it_and_stays(self) -> None:
+        # cmux21, 2026-11-15: NotificationCenter held one strings file of an app copy in the retired perf worker's
+        # 18.7 GiB ~/cmux-ci-perf; the verdict said only "open by a process", so nobody could tell what held it.
+        tree = self.tree("cmux-ci-perf", hours=0.5)
+        self.retire("ai.manaflow.cmux-perf-worker", tree)
+        fam = self.family()
+        opened = [str(tree / "evidence.bin")]
+        center = "/System/Library/CoreServices/NotificationCenter.app/Contents/MacOS/NotificationCenter"
+        with mock.patch.object(gd, "path_holders", return_value=[(473, center)]):
+            item = self.survey(fam, opened=opened)["cmux-ci-perf"]
+        self.assertEqual(item.verdict, "in-use")
+        self.assertTrue(any(r.startswith(f"held by {center[:100]} (pid 473), not its retired service "
+                                         "ai.manaflow.cmux-perf-worker: reported, not deleted") for r in item.reasons),
+                        item.reasons)
+        with mock.patch.object(gd, "path_holders", return_value=[(9, f"{tree}/run.sh --serve")]):
+            item = self.survey(fam, opened=opened)["cmux-ci-perf"]
+        self.assertEqual(item.verdict, "in-use")
+        self.assertIn("its retired service ai.manaflow.cmux-perf-worker still runs (pid 9): kept until it exits",
+                      item.reasons)
+        with mock.patch.object(gd, "path_holders", return_value=None):
+            item = self.survey(fam, opened=opened)["cmux-ci-perf"]
+        self.assertIn("its holders are unreadable (lsof or ps failed)", item.reasons)
+        self.assertTrue(tree.exists())
+        # nobody holds it any more: it goes on this pass, as before
+        item = self.survey(fam)["cmux-ci-perf"]
+        self.assertEqual(item.verdict, "reclaimable", item.reasons)
+
+    def test_a_dead_pass_takes_only_retired_folders_from_home_scratch(self) -> None:
+        tree = self.tree("cmux-ci-perf", hours=0.5)
+        self.tree("cnx-old", hours=48)  # idle long enough for the sweep, but nothing says it is dead
+        self.retire("ai.manaflow.cmux-perf-worker", tree)
+        fam = self.family()
+        with mock.patch.object(gd, "DEAD_MODE", True):
+            items = self.survey(fam)
+        self.assertEqual(set(items), {"cmux-ci-perf"})
+        self.assertEqual(items["cmux-ci-perf"].verdict, "reclaimable", items["cmux-ci-perf"].reasons)
+
     def test_only_the_retired_directory_counts_and_only_for_home_folders(self) -> None:
         tree = self.tree("cnx-elsewhere", hours=0.5)
         self.retire("ai.manaflow.cmux-perf-worker", tree, where=".local/state/other")
@@ -11967,6 +12004,196 @@ class FleetCasNodeCapTest(unittest.TestCase):
             prune.write_text("print('not json')\n")
             self.assertEqual(gd.fleet_cas_node_cap(root, prune), 0)
             self.assertEqual(gd.fleet_cas_node_cap(root, Path(tmp) / "missing"), 0)
+
+
+class DeadItemsTest(unittest.TestCase):
+    """What nothing can use any more is reclaimed, by its own evidence and while jobs run (Leo, 2026-11-15: "and go
+    clear disk aggressively!"): an ended build-worker step's checkout, a stopped Tart VM nobody claims, the journey
+    cache's long-unused entries. Each was kept by a verdict before (cmux22, cmux23, cmux21 and cmux22)."""
+
+    STEP = "382d205322458928f0f27846"
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(os.path.realpath(self.tmp.name))
+        self.home = self.root / "home"
+        self.home.mkdir()
+        self.saved = (gd.HOME, gd.FLEET_ROOT)
+        gd.HOME, gd.FLEET_ROOT = self.home, self.root / "shared-fleet"
+        gd._DISCOVERED.clear()
+        gd._ENDED_STEPS.clear()
+
+    def tearDown(self) -> None:
+        gd.HOME, gd.FLEET_ROOT = self.saved
+        gd._DISCOVERED.clear()
+        self.tmp.cleanup()
+
+    def age(self, tree: Path, hours: float) -> None:
+        t = time.time() - hours * 3600
+        for dirpath, dirnames, filenames in os.walk(tree):
+            for name in filenames + dirnames:
+                os.utime(os.path.join(dirpath, name), (t, t), follow_symlinks=False)
+        os.utime(tree, (t, t))
+
+    def step_checkout(self, name: str, step: str = STEP, hours: float = 2.0, live_step: bool = False) -> Path:
+        """`git worktree add $(mktemp -d)/src` from a step's warm checkout, with a ghostty submodule: the step's
+        directory (the worktree's gitdir) is gone once the step ended, unless live_step."""
+        work = self.root / "cmux-build-worker/work"
+        gitdir = work / "steps" / step / "src/.git/worktrees/src"
+        if live_step:
+            gitdir.mkdir(parents=True)
+        item = self.root / "T" / name
+        src = item / "src"
+        (src / "ghostty").mkdir(parents=True)
+        (src / ".git").write_text(f"gitdir: {gitdir}\n")
+        (src / ".gitmodules").write_text('[submodule "ghostty"]\n\tpath = ghostty\n\turl = ../ghostty\n')
+        (src / "ghostty/.git").write_text(f"gitdir: {gitdir}/modules/ghostty\n")
+        (src / "build.bin").write_bytes(b"\0" * 4096)
+        self.age(item, hours)
+        return item
+
+    def test_an_ended_steps_checkout_is_reclaimable_and_goes(self) -> None:
+        ended = self.step_checkout("tmp.VuQw7Es3HF")
+        live = self.step_checkout("tmp.live", step="a" * 24, live_step=True)
+        young = self.step_checkout("tmp.young", step="b" * 24, hours=0.25)
+        fam = gd.Family("user-tmp", self.root / "T", True, "scratch", git_disposable=True)
+        with mock.patch.object(gd, "process_evidence", return_value=([], "")):
+            items = {Path(i.path).name: i for i in gd.survey([fam], 12, 0)}
+        self.assertEqual(items["tmp.VuQw7Es3HF"].verdict, "reclaimable", items["tmp.VuQw7Es3HF"].reasons)
+        self.assertIn(f"a checkout of build-worker step {self.STEP}, which ended (its step directory is gone)",
+                      items["tmp.VuQw7Es3HF"].reasons)
+        self.assertNotEqual(items["tmp.live"].verdict, "reclaimable")  # its step still runs: git rules judge it
+        self.assertEqual(items["tmp.young"].verdict, "recent")  # an hour's grace
+        receipt = self.root / "receipt.jsonl"
+        with contextlib.redirect_stdout(io.StringIO()), mock.patch.object(gd, "process_evidence",
+                                                                          return_value=([], "")):
+            gd.apply(list(items.values()), {fam.id: fam}, receipt, None, 12)
+        self.assertFalse(ended.exists(), receipt.read_text())
+        self.assertTrue(live.exists())
+        self.assertTrue(young.exists())
+
+    def test_a_step_checkout_with_anything_else_is_no_dead_checkout(self) -> None:
+        item = self.step_checkout("tmp.mixed")
+        self.assertTrue(gd.ended_step_checkout(item))
+        gd._ENDED_STEPS.clear()
+        (item / "src/ghostty/.git").unlink()
+        (item / "src/ghostty/.git").mkdir()  # a real repository inside: something git could lose
+        self.assertEqual(gd.ended_step_checkout(item), "")
+        gd._ENDED_STEPS.clear()
+        shutil.rmtree(item / "src/ghostty/.git")
+        (item / "src/ghostty/.git").write_text(f"gitdir: {self.root}/elsewhere/.git/modules/ghostty\n")
+        self.assertEqual(gd.ended_step_checkout(item), "", "a gitdir outside any step is not the step's")
+        gd._ENDED_STEPS.clear()
+        (item / "src/ghostty/.git").unlink()
+        self.assertTrue(gd.ended_step_checkout(item), "a submodule not checked out holds nothing")
+        gd._ENDED_STEPS.clear()
+        plain = self.root / "T/plain"
+        plain.mkdir()
+        self.assertEqual(gd.ended_step_checkout(plain), "", "no checkout at all: not a step's")
+        self.assertEqual(gd.ended_step_of(f"{self.root}/steps/{'c' * 24}/src"), "c" * 24)
+        self.assertEqual(gd.ended_step_of(f"{self.root}/steps/short/src"), "")
+
+    def tart_vm(self, name: str, days: float) -> Path:
+        vm = self.home / ".tart/vms" / name
+        vm.mkdir(parents=True)
+        (vm / "config.json").write_text('{"os": "darwin"}')
+        (vm / "disk.img").write_bytes(b"\0" * 4096)
+        (vm / "nvram.bin").write_bytes(b"\0" * 64)
+        self.age(vm, days * 24)
+        return vm
+
+    def tart_family(self) -> gd.Family:
+        return next(f for f in gd.default_families() if f.id == gd.TART_VMS)
+
+    def test_a_stopped_unclaimed_tart_vm_two_weeks_untouched_goes(self) -> None:
+        old = self.tart_vm("vm0", 26)  # cmux23: ubase and vm0-vm5, stopped since 2026-10-19
+        recent = self.tart_vm("vm1", 5)
+        claimed = self.tart_vm("vm2", 26)
+        (claimed / gd.ROLE_KEEP_MARKER).write_text("{}")
+        named = self.tart_vm("vm3", 26)
+        locked = self.tart_vm("vm4", 26)
+        holder = subprocess.Popen([sys.executable, "-I", "-c",
+                                   "import fcntl, os, sys, time\n"
+                                   "fd = os.open(sys.argv[1], os.O_RDWR)\n"
+                                   "fcntl.lockf(fd, fcntl.LOCK_EX)\n"
+                                   "print('locked', flush=True)\n"
+                                   "time.sleep(60)\n", os.fspath(locked / "config.json")],
+                                  stdout=subprocess.PIPE, text=True)
+        self.addCleanup(holder.wait)
+        self.addCleanup(holder.kill)
+        self.assertEqual(holder.stdout.readline().strip(), "locked")
+        fam = self.tart_family()
+        with mock.patch.object(gd, "process_evidence", return_value=([], "/opt/homebrew/bin/tart run vm3 --no-graphics\n")):
+            items = {Path(i.path).name: i for i in gd.survey([fam], 12, 0)}
+        self.assertEqual(items["vm0"].verdict, "reclaimable", items["vm0"].reasons)
+        self.assertEqual(items["vm1"].verdict, "recent")
+        self.assertEqual(items["vm2"].verdict, "kept")
+        self.assertEqual(items["vm3"].verdict, "in-use")
+        self.assertEqual(items["vm4"].verdict, "in-use")
+        self.assertIn("tart runs it (its config.json lock is held)", items["vm4"].reasons)
+        receipt = self.root / "receipt.jsonl"
+        with contextlib.redirect_stdout(io.StringIO()), mock.patch.object(gd, "process_evidence",
+                                                                          return_value=([], "")):
+            gd.apply([items["vm0"], items["vm4"]], {fam.id: fam}, receipt, None, 12)
+        self.assertFalse(old.exists())
+        self.assertTrue(locked.exists(), "the run lock is read again right before the delete")
+        for vm in (recent, claimed, named):
+            self.assertTrue(vm.exists())
+
+    def test_journey_cache_entries_unused_for_days_go(self) -> None:
+        cache = self.home / gd.JOURNEY_CACHE
+        old = cache / "builds/23ee510cbc3ac7c7a8eb22ad"
+        deep = old / "build/cmux.app"
+        for _ in range(8):  # an app bundle deeper than the generic git search reaches
+            deep = deep / "Contents"
+        deep.mkdir(parents=True)
+        (deep / "bin").write_bytes(b"\0" * 4096)
+        (old / "ok").write_text("")
+        self.age(old, 4 * 24)
+        fresh = cache / "builds/ad78c0f2819637807768af58"
+        fresh.mkdir(parents=True)
+        (fresh / "ok").write_text("")
+        stale_fetch = cache / "fetch/20261105T024056Z-1c65ed50"
+        stale_fetch.mkdir(parents=True)
+        (stale_fetch / "part").write_bytes(b"\0" * 4096)
+        self.age(stale_fetch, 10 * 24)
+        fams = [f for f in gd.default_families() if f.id in ("journey-builds", "journey-fetch", "user-cache")]
+        self.assertEqual({f.id for f in fams} - {"user-cache"}, {"journey-builds", "journey-fetch"})
+        with mock.patch.object(gd, "process_evidence", return_value=([], "")):
+            items = {Path(i.path).name: i for i in gd.survey(fams, 12, 0)}
+        self.assertNotIn("cmux-journeys", items, "no longer one unchecked ~/.cache item")
+        self.assertEqual(items[old.name].verdict, "reclaimable", items[old.name].reasons)
+        self.assertEqual(items[fresh.name].verdict, "recent")
+        self.assertEqual(items[stale_fetch.name].verdict, "reclaimable")
+
+    def test_dead_pass_runs_while_a_job_runs_and_takes_only_dead_items(self) -> None:
+        tmp = self.root / "T"
+        ended = self.step_checkout("tmp.VuQw7Es3HF")
+        scratch = make(tmp / "agent-scratch", age_hours=48)  # old, but nothing says it is dead
+        vm = self.tart_vm("vm0", 26)
+        receipt = self.root / "receipt.jsonl"
+
+        def fams(role: str = "fleet-mini") -> list[gd.Family]:
+            return [gd.Family("user-tmp", tmp, True, "scratch", git_disposable=True),
+                    gd.Family(gd.TART_VMS, self.home / ".tart/vms", True, "vm", min_idle_hours=gd.TART_VM_IDLE_HOURS),
+                    gd.Family("xcode-derived-data", self.root / "dd", True, "rebuild")]
+        (self.root / "dd").mkdir()
+        old_dd = make(self.root / "dd/old", age_hours=48)
+        busy = "/Users/cmux/actions-runner-glaeda-3/bin/Runner.Worker spawnclient 107 110\n"
+        with mock.patch.object(gd, "default_families", side_effect=fams), \
+                mock.patch.object(gd, "process_evidence", return_value=([], busy)), \
+                mock.patch.object(gd, "host_busy", return_value="a CI job is running"), \
+                mock.patch.object(gd, "DEAD_MODE", False), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            status = gd.main(["--dead", "--apply", "--no-snapshot", "--top", "0", "--min-mib", "0",
+                              "--receipt", str(receipt)])
+        self.assertEqual(status, 0, out.getvalue())
+        self.assertFalse(ended.exists(), out.getvalue())
+        self.assertFalse(vm.exists(), out.getvalue())
+        self.assertTrue(scratch.exists(), "scratch by age is the pressure and idle passes', never --dead's")
+        self.assertTrue(old_dd.exists(), "not a dead family")
+        with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
+            gd.main(["--dead", "--pressure", "--no-snapshot"])
 
 
 if __name__ == "__main__":

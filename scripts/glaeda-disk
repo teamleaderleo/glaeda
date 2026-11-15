@@ -7,6 +7,8 @@
     glaeda-disk --apply             delete every reclaimable item, largest first
     glaeda-disk --pressure --apply  act only under disk pressure, stop at the free target
     glaeda-disk --idle --apply      while no job runs, delete what sat idle past its family's age
+    glaeda-disk --dead --apply      now, job or no job: delete only what nothing can use (ended steps' checkouts,
+                                    stopped unclaimed Tart VMs, retired services' folders, unused journey caches)
     glaeda-disk --pressure --idle --apply  pressure first; with no pressure, an hourly idle sweep
     glaeda-disk --low 15% --target 25%  thresholds as GiB free or as a share of each filesystem
     glaeda-disk --pressure --apply waits while a GitHub Actions job runs, unless below --emergency
@@ -1484,6 +1486,8 @@ def item_window(fam: Family, path: Path, idle_hours: float, archived: frozenset[
         with contextlib.suppress(OSError):
             if fam.root.stat().st_dev in FLOOR_HOLD:
                 return 0.0
+    if fam.id in STEP_CHECKOUT_FAMILIES and fam.git_disposable and ended_step_checkout(path):
+        return min(idle_window(fam, idle_hours), STEP_CHECKOUT_IDLE_HOURS)  # its step ended: nothing comes back
     return idle_window(fam, idle_hours)
 
 
@@ -4041,7 +4045,7 @@ def default_families(role: str = "fleet-mini") -> list[Family]:
         Family("user-cache", HOME / ".cache", True, "the tool re-downloads or rebuilds it",
                # glaeda* holds glaeda-gh daemon state, the minis' native cache root, fleet-cas deployments
                # and benchmark receipts; huggingface keeps its token; codex-runtimes is an install
-               skip=("cmux-job", "huggingface", "codex-runtimes"), skip_prefixes=("glaeda",),
+               skip=("cmux-job", "huggingface", "codex-runtimes", JOURNEY_CACHE.parts[-1]), skip_prefixes=("glaeda",),
                owner="tools (XDG cache)", rebuild_minutes=5, pressure_only=role == "devbox", platform=host_cache_platform()),
         Family("library-caches", HOME / "Library/Caches", True, "the app re-downloads or rebuilds it",
                mirror_idle_hours=CMUX_JOB_MIRROR_HOURS if mirror_host else None, mirror_include=("cmux",),
@@ -4089,6 +4093,17 @@ def default_families(role: str = "fleet-mini") -> list[Family]:
         Family(TART_IPSWS, HOME / ".tart/cache/IPSWs", True, "the next tart create downloads it again",
                files=True, owner="Tart (tart create --from-ipsw)", rebuild_minutes=20,
                min_idle_hours=tart_idle_hours(), platform="macos"),
+        Family(TART_VMS, HOME / ".tart/vms", True, "a stopped VM nobody claims: the next tart clone makes it again",
+               owner="Tart (tart clone, tart create)", rebuild_minutes=30, min_idle_hours=TART_VM_IDLE_HOURS,
+               reference_root=FLEET_ROOT, platform="macos"),
+        # cmux's journey harness keeps a build per job and its fetch scratch here (scripts/journeys/build_cache.py,
+        # ~/.cache/cmux-journeys/{builds,fetch}/<entry>). As one ~/.cache item it read "unchecked" (an app bundle is too
+        # deep for the git search) and stayed forever: 7 GiB on cmux21, 4.6 GiB on cmux22 (2026-11-15). An entry is
+        # build output (no checkout), and goes once unused JOURNEY_IDLE_HOURS; a round running its app keeps it.
+        *(Family(f"journey-{sub}", HOME / JOURNEY_CACHE / sub, True, "the next journey round downloads the build again",
+                 build_output=True, min_idle_hours=JOURNEY_IDLE_HOURS, owner="cmux scripts/journeys (build_cache.py)",
+                 rebuild_minutes=3, pressure_only=role == "devbox", platform=host_cache_platform())
+          for sub in JOURNEY_SUBDIRS),
         # Sealed caches (cache_layout) anywhere else in the home directory: ~/.npm/_cacache,
         # ~/.bun/install/cache, ~/.cargo/registry, ~/go/pkg/mod, rustup toolchains. Found by content,
         # so a tool this list never heard of is covered once its cache has a recognized layout.
@@ -4692,6 +4707,208 @@ def newest_mtime(path: Path, levels: int = 2, budget: int = 3000, access: bool =
 RETIRED_OWNER_DIR = ".local/state/fleet-retired-workers"  # under HOME
 
 
+def retired_service(plist_name: str) -> tuple[str, str]:
+    """(label, program) of a retired worker plist under RETIRED_OWNER_DIR, ("", "") when unreadable."""
+    try:
+        doc = plistlib.loads((HOME / RETIRED_OWNER_DIR / plist_name).read_bytes())
+    except (OSError, ValueError, plistlib.InvalidFileException):
+        return "", ""
+    if not isinstance(doc, dict):
+        return "", ""
+    args = doc.get("ProgramArguments")
+    program = doc.get("Program") or (args[0] if isinstance(args, list) and args else "")
+    return str(doc.get("Label") or ""), str(program or "")
+
+
+def path_holders(path: Path) -> list[tuple[int, str]] | None:
+    """(pid, command) of every process with its cwd or an open file inside path, None when lsof or ps fails. One full
+    lsof (process_evidence keeps no pids), so only a verdict that must name the holder pays for it."""
+    lsof = shutil.which("lsof") or "/usr/sbin/lsof"
+    try:
+        code, out = _owned_query([lsof, "-n", "-P", "-Fpn"], 120)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if code not in (0, 1) or not out:
+        return None
+    inside = tuple(s.rstrip("/") + "/" for s in spellings(os.fspath(path)))
+    exact = set(spellings(os.fspath(path)))
+    pids: list[int] = []
+    pid = 0
+    for line in out.splitlines():
+        if line.startswith("p") and line[1:].isdigit():
+            pid = int(line[1:])
+        elif line.startswith("n/") and pid and pid not in pids and (line[1:] in exact or line[1:].startswith(inside)):
+            pids.append(pid)
+    holders = []
+    for pid in pids:
+        try:
+            ps = subprocess.run(["ps", "-ww", "-o", "command=", "-p", str(pid)], capture_output=True, text=True,
+                                timeout=30)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        holders.append((pid, ps.stdout.strip()))
+    return holders
+
+
+def retired_holder_reason(path: Path, plist_name: str) -> str:
+    """Why a home folder whose owner retired (retired_owner) is still held, naming the holder: its retired service
+    itself, still running, waits for that service to exit; any other process is reported and the folder is not deleted
+    (cmux21, 2026-11-15: NotificationCenter held one strings file of an app copy in the retired perf worker's 18.7 GiB
+    ~/cmux-ci-perf, and the verdict said only "open by a process")."""
+    label, program = retired_service(plist_name)
+    holders = path_holders(path)
+    if holders is None:
+        return "its holders are unreadable (lsof or ps failed)"
+    if not holders:
+        return ""
+    own = [(pid, cmd) for pid, cmd in holders if program and (cmd == program or cmd.startswith(program + " "))]
+    if own:
+        return f"its retired service {label or plist_name} still runs (pid {own[0][0]}): kept until it exits"
+    pid, cmd = holders[0]
+    more = f" and {len(holders) - 1} more" if len(holders) > 1 else ""
+    return (f"held by {cmd[:100] or '?'} (pid {pid}){more}, not its retired service {label or plist_name}: "
+            "reported, not deleted")
+
+
+# A build-worker step's checkout left outside its step directory. The cmuxterm-hq worker runs each step in
+# <work root>/steps/<24-hex id>/ and removes that directory when the step ends, done or cancelled (ci_step.go runStep,
+# reapSteps). A step script that adds a linked worktree elsewhere (`git worktree add "$(mktemp -d)/src"`) leaves it
+# behind with a .git file naming the removed directory: cmux22 (2026-11-14) kept 15.4 GiB under the cmux user's
+# $TMPDIR from step 382d2053, cancelled at 15:02Z, as "git-checkout (checkout below the top level)" for 13 h. Such a
+# checkout has no repository left, so git holds nothing it could lose. It goes once idle STEP_CHECKOUT_IDLE_HOURS.
+STEP_CHECKOUT_GITDIR = re.compile(r"^(?P<root>/.+?)/steps/(?P<id>[0-9a-f]{24})(?:/|$)")
+STEP_CHECKOUT_FAMILIES = frozenset({"tmp", "user-tmp"})
+STEP_CHECKOUT_IDLE_HOURS = 1.0
+STEP_CHECKOUT_DEPTH = 3  # tmp.X/src is one level down; a checkout deeper than this is not judged a step's
+STEP_CHECKOUT_BUDGET = 5000  # directory entries read looking for the checkouts; more is doubt
+_ENDED_STEPS: dict[str, str] = {}  # path -> ended step ids ("" when it is no such checkout), one pass's answers
+
+
+def gitfile_target(dotgit: Path) -> str:
+    """The gitdir a `.git` file names (absolute, normalized), or "" when dotgit is no small regular gitdir file."""
+    try:
+        st = dotgit.lstat()
+        if not stat.S_ISREG(st.st_mode) or st.st_size > 4096:
+            return ""
+        text = dotgit.read_text(errors="replace").strip()
+    except OSError:
+        return ""
+    if not text.startswith("gitdir:") or "\n" in text:
+        return ""
+    target = text[len("gitdir:"):].strip()
+    if not target:
+        return ""
+    return os.path.normpath(target if os.path.isabs(target) else os.path.join(os.fspath(dotgit.parent), target))
+
+
+def ended_step_of(gitdir: str) -> str:
+    """The build-worker step a gitdir lies in, when that step's directory is gone; "" otherwise. Only a definite
+    ENOENT counts: a directory this user cannot search is no evidence the step ended."""
+    m = STEP_CHECKOUT_GITDIR.match(gitdir)
+    if not m:
+        return ""
+    try:
+        os.lstat(os.path.join(m["root"], "steps", m["id"]))
+    except FileNotFoundError:
+        return m["id"]
+    except OSError:
+        return ""
+    return ""
+
+
+def _submodule_paths(checkout: Path) -> list[str]:
+    try:
+        text = (checkout / ".gitmodules").read_text(errors="replace")
+    except FileNotFoundError:
+        return []
+    except OSError:
+        return ["\0unreadable"]
+    return [m.strip() for m in re.findall(r"^\s*path\s*=\s*(.+?)\s*$", text, re.M)]
+
+
+def ended_step_checkout(path: Path) -> str:
+    """The ended steps (comma-joined ids) when path holds checkouts and every one of them, to STEP_CHECKOUT_DEPTH
+    levels, and every submodule its .gitmodules lists, is a linked worktree whose gitdir lies in a build-worker step
+    directory that is gone (ended_step_of); "" otherwise. A real .git directory, another VCS, a gitdir anywhere else, a
+    search past its budget or an unreadable directory each answer "": the usual git checks judge the item then."""
+    key = os.fspath(path)
+    if key in _ENDED_STEPS:
+        return _ENDED_STEPS[key]
+    _ENDED_STEPS[key] = answer = _ended_step_checkout(path)
+    return answer
+
+
+def _ended_step_checkout(path: Path) -> str:
+    if path.is_symlink() or not path.is_dir():
+        return ""
+    roots: list[Path] = []
+    level, seen = [path], 0
+    for _ in range(STEP_CHECKOUT_DEPTH + 1):
+        nxt: list[Path] = []
+        for d in level:
+            try:
+                with os.scandir(d) as it:
+                    entries = list(it)
+            except OSError:
+                return ""
+            seen += len(entries)
+            if seen > STEP_CHECKOUT_BUDGET:
+                return ""
+            if any(e.name in VCS_MARKERS for e in entries):
+                roots.append(d)
+                continue
+            nxt.extend(Path(e.path) for e in entries
+                       if e.is_dir(follow_symlinks=False) and e.name not in REPRODUCIBLE_DIRS)
+        level = nxt
+    steps: set[str] = set()
+    for root in roots:
+        if any(os.path.lexists(root / m) for m in VCS_MARKERS if m != ".git"):
+            return ""
+        step = ended_step_of(gitfile_target(root / ".git"))
+        if not step:
+            return ""
+        steps.add(step)
+        for sub in _submodule_paths(root):
+            dotgit = root / sub / ".git"
+            if sub.startswith("\0") or os.path.isabs(sub) or ".." in Path(sub).parts:
+                return ""
+            if not os.path.lexists(dotgit):
+                continue  # not checked out: nothing there
+            if not (inner := ended_step_of(gitfile_target(dotgit))):
+                return ""
+            steps.add(inner)
+    return ",".join(sorted(steps))
+
+
+# cmux's journey cache (scripts/journeys/build_cache.py): its builds and fetch scratch, an entry per job.
+JOURNEY_CACHE = Path(".cache/cmux-journeys")  # under HOME
+JOURNEY_SUBDIRS = ("builds", "fetch")
+JOURNEY_IDLE_HOURS = 3 * 24.0
+
+# --dead: reclaim only what nothing can still use, whatever the free space and whether a job runs. These families'
+# items are dead by their own evidence, never by age alone or a quiet host: ended steps' checkouts (only those, in
+# tmp and user-tmp), stopped Tart VMs and images nobody claims, home folders whose owner service retired (only those,
+# in home-scratch), the journey cache's long-unused entries, and the aside trees of an interrupted deletion. Every
+# per-item check still holds (an open file, a running command, a socket, a lease). Anything a live job might touch
+# (its workspace, $TMPDIR scratch by age, the warm build stores) stays with the pressure and idle passes.
+DEAD_MODE = False
+
+
+def dead_family_ids() -> frozenset[str]:
+    return frozenset({*STEP_CHECKOUT_FAMILIES, HOME_SCRATCH_FAMILY, TART_IMAGES, TART_IPSWS, TART_VMS,
+                      *(f"journey-{sub}" for sub in JOURNEY_SUBDIRS), INTERRUPTED})
+
+
+def dead_item(fam: Family, path: Path) -> bool:
+    """Whether a --dead run judges this item at all: an ended step's checkout in tmp and user-tmp, a folder whose
+    owner retired in home-scratch, any item of the other dead families."""
+    if fam.id in STEP_CHECKOUT_FAMILIES:
+        return bool(ended_step_checkout(path))
+    if fam.id == HOME_SCRATCH_FAMILY:
+        return bool(retired_owner(path))
+    return fam.id in dead_family_ids()
+
+
 def retired_owner(path: Path) -> str:
     """The retired plist that names this home folder ("" when none does or the folder is not directly in HOME)."""
     try:
@@ -4723,7 +4940,8 @@ def item_mtime(fam: Family, path: Path) -> float:
     # git-loss check before deletion.
     skip_names = frozenset(VCS_MARKERS) if (fam.id == "tmp" or RUNNER_CACHE_PROFILE) else frozenset()
     # Tart's access date first, and a walk that never lists a digest directory, which would move that date
-    tart = tart_last_use(path) if fam.id in TART_FAMILIES else 0.0
+    tart = (tart_vm_last_use(path) if fam.id == TART_VMS else tart_last_use(path) if fam.id in TART_FAMILIES
+            else 0.0)
     newest = newest_mtime(path, 1 if fam.id in TART_FAMILIES else 2 if fam.reclaimable else 1,
                           3000 if fam.reclaimable else 300, access=fam.discover, skip_names=skip_names)
     if fam.id == SPM_SCRATCH:
@@ -5494,8 +5712,10 @@ def mirror_due(fam: Family, path: Path, idle_hours: float) -> bool:
 
 
 def git_exempt(fam: Family, path: Path, idle_hours: float) -> bool:
-    """No git check applies: build output (derived_data), or a mirror (mirror_due), whose apply bundles first."""
-    return derived_data(fam, path) or mirror_due(fam, path, idle_hours)
+    """No git check applies: build output (derived_data), a mirror (mirror_due), whose apply bundles first, or an
+    ended build-worker step's checkout (ended_step_checkout), whose repository is gone."""
+    return (derived_data(fam, path) or mirror_due(fam, path, idle_hours)
+            or (fam.id in STEP_CHECKOUT_FAMILIES and fam.git_disposable and bool(ended_step_checkout(path))))
 
 
 # A deletion interrupted after remove()'s rename (the process killed, the host rebooted) leaves the tree under
@@ -5515,6 +5735,8 @@ OUT_OF_BAND_FAMILY_IDS = frozenset({
     "user-cache",          # ~/.cache
     "cua-cache",
     "cmux-ghosttykit-cache",
+    "tart-vms",            # TART_VMS: a stopped VM: Tart's run lock and a tart command naming it still keep one in use
+    *(f"journey-{sub}" for sub in JOURNEY_SUBDIRS),  # journey rounds are no CI job; a running app still keeps its build
     INTERRUPTED,           # aside trees a killed deletion left; its own owner check still applies
 })
 
@@ -5961,6 +6183,8 @@ def keep_verdict(fam: "Family", path: Path) -> str:
         return rustup_verdict(path)
     if fam.checkout_builds and path.parent.name == "cache" and path.parent.parent.name == "apple-build":
         return apple_build_verdict(path)
+    if fam.id == TART_VMS and os.path.lexists(path / ROLE_KEEP_MARKER):
+        return f"claimed ({ROLE_KEEP_MARKER} in it)"
     return ""
 
 
@@ -8086,7 +8310,13 @@ _DISCOVERED: dict[str, list[Path]] = {}
 
 
 TART_IMAGES, TART_IPSWS = "tart-images", "tart-ipsws"
-TART_FAMILIES = frozenset({TART_IMAGES, TART_IPSWS})
+# Local VMs (`tart clone` / `tart create`: ~/.tart/vms/<name>, each a full macOS disk). cmux23 (2026-11-15) held
+# 32 GiB of them, ubase and vm0-vm5, stopped since 2026-10-19 and claimed by nobody (hq#11127), and no family listed
+# them. A stopped VM nothing touched for TART_VM_IDLE_HOURS goes: Tart's run lock, a tart command naming it, a fleet
+# lease naming its path or a .glaeda-keep.json claim in it keeps it.
+TART_VMS = "tart-vms"
+TART_VM_IDLE_HOURS = 14 * 24.0
+TART_FAMILIES = frozenset({TART_IMAGES, TART_IPSWS, TART_VMS})
 TART_IDLE_HOURS = 7 * 24.0  # a week past Tart's last access; APFS updates atime lazily
 TART_DIGEST_PREFIX = "sha256:"
 TART_SEARCH_DEPTH = 8  # registry/namespace.../image below OCIs; a deeper tree is not Tart's
@@ -8205,6 +8435,48 @@ def tart_idle_hours() -> float:
     """The idle window of Tart's cache: TART_IDLE_HOURS where Tart is installed (a weekly clone keeps its image even
     when APFS moved the access date late), DEFAULT_AGE_HOURS where it is not, since nothing on the host reads it."""
     return TART_IDLE_HOURS if tart_installed() else DEFAULT_AGE_HOURS
+
+
+def tart_vm_last_use(path: Path) -> float:
+    """A local Tart VM's last use: the VM directory's mtime and the newest mtime or atime of its files (config.json,
+    disk.img, nvram.bin), read with lstat only. `tart run` writes the disk and nvram, `tart clone` from it reads the
+    disk. The directory's own atime is left out: the survey's du lists the directory and moves it."""
+    try:
+        newest = path.lstat().st_mtime
+    except OSError:
+        return 0.0
+    for e in _entries(path):
+        with contextlib.suppress(OSError):
+            st = e.stat(follow_symlinks=False)
+            if stat.S_ISREG(st.st_mode):
+                newest = max(newest, st.st_mtime, st.st_atime)
+    return newest
+
+
+TART_VM_RUN = re.compile(r"(?:^|/)tart\s")
+
+
+def tart_vm_held(path: Path, cmds: str) -> str:
+    """Why a local Tart VM is in use, or "": Tart holds the VM's config.json lock while it runs it (Tart's PIDLock, a
+    POSIX record lock), or a running tart command names the VM. An unreadable lock counts as held."""
+    config = path / "config.json"
+    try:
+        fd = os.open(config, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        fd = None
+    except OSError:
+        return "its config.json lock is unreadable"
+    if fd is not None:
+        try:
+            fcntl.lockf(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except OSError:
+            return "tart runs it (its config.json lock is held)"
+        finally:
+            os.close(fd)  # closing drops the probe's own lock
+    for line in cmds.splitlines():
+        if TART_VM_RUN.search(line) and re.search(r"(?:^|\s)" + re.escape(path.name) + r"(?:\s|$)", line):
+            return f"a running tart command names it ({line.strip()[:120]})"
+    return ""
 
 
 def candidates(fam: Family) -> list[Path]:
@@ -8574,6 +8846,7 @@ def _survey(families, idle_hours, min_bytes, known, evidence, defer_bulk=False,
     global _MEASURE_BUDGET_REACHED
     _MEASURE_BUDGET_REACHED = False
     _NESTED_WALKS.clear()
+    _ENDED_STEPS.clear()
     now = time.time()
     items: list[Item] = []
     known = known if known is not None else {}
@@ -8636,6 +8909,8 @@ def _survey(families, idle_hours, min_bytes, known, evidence, defer_bulk=False,
             break
         if size < floor:
             continue
+        if DEAD_MODE and not dead_item(fam, path):
+            continue
         if idle is None:
             idle = (now - item_mtime(fam, path)) / 3600
         sp = str(path)
@@ -8663,6 +8938,8 @@ def _survey(families, idle_hours, min_bytes, known, evidence, defer_bulk=False,
                 reasons.append("live lease or running job")
         if fam.id == SPM_SCRATCH and spm_scratch_held(path):
             reasons.append("a job holds its lock (owned_spm_scratch.py)")
+        if fam.id == TART_VMS and not blind and (why := tart_vm_held(path, cmds)):
+            reasons.append(why)
         if media_tour_dd(fam, path) and media_tour_tag_held(path):
             reasons.append("a media tour holds its slot's tag lock (media_tag_lock.py)")
         if fam.id == CANONICAL_ADMISSION and canonical_root_held(path):
@@ -8748,6 +9025,10 @@ def _survey(families, idle_hours, min_bytes, known, evidence, defer_bulk=False,
             reasons.append(reasons_jobs)
         if fam.id in HOME_SCRATCH_FAMILIES and (gone := retired_owner(path)):
             reasons.append(f"its owner retired (~/{RETIRED_OWNER_DIR}/{gone}): no idle clock")
+            if verdict == "in-use" and "open by a process" in reasons and (held := retired_holder_reason(path, gone)):
+                reasons.append(held)
+        if verdict == "reclaimable" and fam.id in STEP_CHECKOUT_FAMILIES and (steps := ended_step_checkout(path)):
+            reasons.append(f"a checkout of build-worker step {steps}, which ended (its step directory is gone)")
         if policy_note:
             reasons.append(policy_note)
         items.append(Item(fam.id, sp, size, round(idle, 1), verdict, reasons, jobs,
@@ -10470,6 +10751,7 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
     receipt.parent.mkdir(parents=True, exist_ok=True)
     released = 0
     _NESTED_WALKS.clear()  # re-observe every checkout right before deleting
+    _ENDED_STEPS.clear()
     every = list(families.values()) if all_families is None else all_families
 
     def family_of(item: Item) -> Family:
@@ -10633,6 +10915,7 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
                 or (fam.id == RUNNER_BUILD_FAMILY and runner_job_live(fam.root.parent, cmds))
                 or (fam.id == NIGHTLY_NEXT_FAMILY and nightly_next_runner_busy(p, cmds))
                 or (fam.app_clones and app_clone_running(p, cmds))
+                or (fam.id == TART_VMS and tart_vm_held(p, cmds))
                 or in_cwd(i.path, cwds) or named_by(i.path, cmds) or holds_socket(p) or job_busy(fam, p)
                 or (fam.reference_root is not None
                     and artifact_referenced(p, fresh_artifact_references(fam.reference_root)))
@@ -12345,6 +12628,10 @@ def _main_impl(argv: list[str] | None = None) -> int:
     ap.add_argument("--devbox", dest="role_devbox", action="store_true", help=argparse.SUPPRESS)
     ap.add_argument("--pressure", action="store_true",
                     help="only act when free space is below --low; stop at --target")
+    ap.add_argument("--dead", action="store_true",
+                    help="reclaim only what nothing can still use (dead_family_ids: ended steps' checkouts, stopped "
+                         "Tart VMs and images nobody claims, retired services' folders, long-unused journey caches, "
+                         "interrupted deletions), whatever the free space and while a job runs; with --apply")
     ap.add_argument("--idle", action="store_true",
                     help="idle sweep: only while no job runs, delete what sat idle past its family's reuse "
                          "window whatever the free space; with --pressure, only when there is no pressure, "
@@ -12421,8 +12708,15 @@ def _main_impl(argv: list[str] | None = None) -> int:
         # Keepup is intentionally report-first; callers must opt into mutation with --apply.
         a.pressure = bool(a.apply)
         a.idle = bool(a.apply)
+    if a.dead:
+        if a.pressure or a.idle or a.command == "keepup" or a.dedupe or a.dedupe_builds or a.cmux_next_drain:
+            ap.error("--dead is its own pass: no --pressure, --idle, keepup, --dedupe or --cmux-next-drain")
+        global DEAD_MODE
+        DEAD_MODE = True
+        dead = dead_family_ids()
+        a.family = sorted(dead & set(a.family) if a.family else dead)
     RUN.update(apply=a.apply, mode="keepup" if a.command == "keepup" else "pressure" if a.pressure
-               else "idle" if a.idle else "apply")
+               else "idle" if a.idle else "dead" if a.dead else "apply")
     if (a.apply or a.dedupe or a.dedupe_builds) and (why := disk_off()):
         print(f"glaeda-disk is off ({why}): nothing deleted")
         RUN.update(off=True, skipped="off")
@@ -12805,9 +13099,10 @@ def _main_impl(argv: list[str] | None = None) -> int:
     receipt_accounting_before = (accounting if len(shown) == len(fss)
                                  else filesystem_accounting(list(fss.values()), items, known))
     before_fs_receipt = filesystem_receipt_state(fss)
-    operation = "idle" if sweep else "pressure" if a.pressure else "apply"
+    operation = "idle" if sweep else "pressure" if a.pressure else "dead" if DEAD_MODE else "apply"
     RUN["mode"] = operation
-    write_health_summary(shown, items, accounting, a.receipt)
+    if not DEAD_MODE:  # a --dead pass judges a few families only: its totals are no host's accounting
+        write_health_summary(shown, items, accounting, a.receipt)
     # After accounting.json holds this run's fixed-root walk, so the census skips those roots; never from an
     # apply, whose deletions it would race (another process's apply only leaves rows the next census drops).
     if not a.no_snapshot and not a.refresh and not a.pressure and not a.apply:
@@ -12852,7 +13147,7 @@ def _main_impl(argv: list[str] | None = None) -> int:
         logical_released = stale_marker_released + apply_pass([i for i in items if id(i) not in last])
         # A drained runner is explicitly held by cmux_mini_fix; once its listener and worker
         # are absent, its disposable checkout can be cleared under this same eviction lock.
-        if not RUNNER_CACHE_PROFILE and not reserved and not out_of_band:  # a held runner's _work is job-owned
+        if not RUNNER_CACHE_PROFILE and not reserved and not out_of_band and not DEAD_MODE:  # job-owned _work
             logical_released += cleanup_paused_runner_work(a.receipt)
         # test scratch left in $TMPDIR, two days untouched: too small per entry for any family's size floor
         if not RUNNER_CACHE_PROFILE and not a.cmux_next_drain and not reserved \
