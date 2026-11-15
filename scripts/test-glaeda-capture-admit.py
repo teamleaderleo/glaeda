@@ -171,7 +171,8 @@ class CaptureTest(unittest.TestCase):
         marker = self.fleet / 'reservation.json'
         self.assertEqual(json.loads(marker.read_text())['owner'], 'glaeda-capture-admit')
         probe = subprocess.run([sys.executable, '-c',
-            "import importlib.machinery as m; h=m.SourceFileLoader('h', __import__('sys').argv[1]).load_module(); "
+            "import importlib.machinery as m, importlib.util as u; l=m.SourceFileLoader('h', __import__('sys').argv[1]); "
+            "h=u.module_from_spec(u.spec_from_loader('h', l)); l.exec_module(h); "
             "print(h.reservation_refusal(h.RESERVATION, h.time.time()))",
             str(ROOT / 'scripts/glaeda-cmux-runner-hook')], env=self.env,
             capture_output=True, text=True, timeout=10)

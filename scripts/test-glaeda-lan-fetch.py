@@ -868,9 +868,10 @@ class LanFetchTest(unittest.TestCase):
         data = os.urandom(1000)
         sha, _ = put_product(self.peers["172.20.21.197"], data)
         script = f"""
-import importlib.machinery, sys
+import importlib.machinery, importlib.util, sys
 from pathlib import Path
-m = importlib.machinery.SourceFileLoader('lf', {os.fspath(ROOT / 'scripts/glaeda-lan-fetch')!r}).load_module()
+l = importlib.machinery.SourceFileLoader('lf', {os.fspath(ROOT / 'scripts/glaeda-lan-fetch')!r})
+m = importlib.util.module_from_spec(importlib.util.spec_from_loader('lf', l)); l.exec_module(m)
 m.SSH = {lf.SSH!r}; m.LAN_CONFIG = Path({os.fspath(self.conf)!r}); m.SOCKET = Path('/nonexistent/sock')
 sys.exit(m.main(sys.argv[1:]))
 """

@@ -295,8 +295,9 @@ class SeedPrefetchTest(PrefetchBase):
             f"open({os.fspath(pidfile)!r}, 'w').write(str(d.pid))\n"
             "time.sleep(300)\n")
         runner = subprocess.Popen([sys.executable, "-c",
-                                   "import importlib.machinery, sys; from pathlib import Path; "
-                                   f"m = importlib.machinery.SourceFileLoader('p', {os.fspath(ROOT / 'scripts/glaeda-seed-prefetch')!r}).load_module(); "
+                                   "import importlib.machinery, importlib.util, sys; from pathlib import Path; "
+                                   f"l = importlib.machinery.SourceFileLoader('p', {os.fspath(ROOT / 'scripts/glaeda-seed-prefetch')!r}); "
+                                   "m = importlib.util.module_from_spec(importlib.util.spec_from_loader('p', l)); l.exec_module(m); "
                                    f"m.prefetch(Path({os.fspath(scripts)!r}), Path({os.fspath(base)!r}), 'x', Path({os.fspath(base / 'm')!r}))"])
         deadline = time.time() + 20
         while not (pidfile.exists() and pidfile.read_text()) and time.time() < deadline:

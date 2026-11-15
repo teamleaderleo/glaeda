@@ -74,5 +74,26 @@ class IdleRepairTest(unittest.TestCase):
         load.assert_not_called()
 
 
+class LoadDiskModuleTest(unittest.TestCase):
+    # The tests above mock load_disk_module, so none of them saw it fail on Python 3.15 (SourceFileLoader.load_module
+    # was removed): from 10-18 every run failed there, 70,782 tracebacks on one host and nothing alarmed.
+    def test_it_loads_an_extensionless_script(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            disk = Path(tmp) / "glaeda-disk"
+            disk.write_text("def host_busy():\n    return None\n")
+            with mock.patch.dict("os.environ", {"GLAEDA_DISK": str(disk)}):
+                module = idle.load_disk_module()
+        self.assertIsNone(module.host_busy())
+
+    def test_no_tracked_file_calls_the_removed_load_module(self) -> None:
+        import subprocess
+        removed = ".load" + "_module("
+        hits = subprocess.run(["git", "-C", str(ROOT), "grep", "-n", "-F", removed, "--", "scripts", ".github"],
+                              capture_output=True, text=True).stdout.strip()
+        self.assertEqual(hits, "", "SourceFileLoader's load_module is gone in Python 3.15; use "
+                         "importlib.util.module_from_spec(spec_from_loader(name, loader)) and loader.exec_module:\n"
+                         + hits)
+
+
 if __name__ == "__main__":
     unittest.main()
