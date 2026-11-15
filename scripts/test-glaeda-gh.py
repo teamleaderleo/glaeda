@@ -14283,8 +14283,33 @@ class RunnersTest(BrokerBase):
                 got = json.loads(self.runners_out(self.org_hidden(self.state_value(doc)), True))
                 self.assertIsNone(got["online"])
                 self.assertIn(why, got["unknown"])
-        got = json.loads(self.runners_out(self.org_hidden("not base64 gzip"), True))
-        self.assertIsNone(got["online"])
+        import base64
+        import gzip
+        corrupt = base64.b64encode(gzip.compress(b"{}")[:12] + b"\xff" * 16).decode()
+        naive = {**base, "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S")}
+        for value in ("not base64 gzip", corrupt, self.state_value(naive),
+                      self.state_value({**base, "schema": "runner-state/v0"})):
+            with self.subTest(value=value[:20]):
+                got = json.loads(self.runners_out(self.org_hidden(value), True))
+                self.assertIsNone(got["online"])
+                self.assertIsNone(got["runners"], "the repo rows alone are not the pool")
+
+    def test_a_census_runner_the_repo_listing_holds_is_counted_once(self) -> None:
+        now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        state = self.state_value({"schema": "runner-state/v1", "repository": "o/r", "complete": True,
+                                  "generated_at": now,
+                                  "repository_runners": [{"id": 9, "name": "ignored", "os": "macOS",
+                                                          "status": "online", "busy": True,
+                                                          "labels": [{"name": "side"}]}],
+                                  "runner_groups": {"glaeda-minis": [
+                                      {"id": 1, "name": "t0", "os": "macOS", "status": "online", "busy": True,
+                                       "labels": [{"name": "side"}]},
+                                      {"id": 2, "name": None, "status": "online", "busy": True,
+                                       "labels": [{"name": "side"}]}]}})
+        doc = json.loads(self.runners_out(self.org_hidden(state), True, label="trusted"))
+        self.assertEqual((doc["runners"], doc["online"]), (39, 39), "t0 is the repo row, counted once")
+        doc = json.loads(self.runners_out(self.org_hidden(state), True))
+        self.assertEqual(doc["online"], 0, "a census read that holds no such runner is a real 0")
 
 
 class BrokerGraphqlCacheTest(BrokerBase):
