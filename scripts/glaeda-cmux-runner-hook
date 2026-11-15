@@ -185,10 +185,8 @@ def run_bounded(*popenargs: Any, input: Any = None, capture_output: bool = False
     process = subprocess.Popen(*popenargs, **kwargs)
     try:
         stdout, stderr = process.communicate(input, timeout=timeout)
-    except subprocess.TimeoutExpired as exc:
-        out, err = _reap_killed(process)
-        if out is not None or err is not None:
-            exc.stdout, exc.stderr = out, err
+    except subprocess.TimeoutExpired:
+        _reap_killed(process)  # TimeoutExpired keeps what communicate() had read, as in run()
         raise
     except BaseException:
         _reap_killed(process)
@@ -199,8 +197,9 @@ def run_bounded(*popenargs: Any, input: Any = None, capture_output: bool = False
     return subprocess.CompletedProcess(process.args, retcode, stdout, stderr)
 
 
-# Every subprocess.run(..., timeout=...) in this process, the hook's own and the glaeda scripts it loads, gets the
-# bound (RUN_IS_BOUNDED_TEST). Tests that patch subprocess.run still patch this one name.
+# Every subprocess.run(..., timeout=...) in a process that loads the hook gets the bound (RunIsBoundedTest): the hook's
+# own, the glaeda scripts it loads, and the tools that load it as a library (glaeda-mini-health, glaeda-capture-admit).
+# Tests that patch subprocess.run still patch this one name.
 subprocess.run = run_bounded
 
 DISK_TIMEOUT_S = 120  # a synchronous hook pass
