@@ -15186,11 +15186,10 @@ class TempFileTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             target = Path(tmp) / "budget.json"
 
-            def full_disk(self: Path, text: str, *args: Any, **kwargs: Any) -> int:
-                self.touch()  # opened, then the disk filled
-                raise OSError(28, "No space left on device")
+            def full_disk(*args: Any, **kwargs: Any) -> str:
+                raise OSError(28, "No space left on device")  # the temporary file is open: the disk filled
 
-            with mock.patch.object(Path, "write_text", full_disk), self.assertRaises(OSError):
+            with mock.patch.object(gg.json, "dumps", full_disk), self.assertRaises(OSError):
                 gg.write_json(target, {"a": 1})
             self.assertEqual(os.listdir(tmp), [])
 
