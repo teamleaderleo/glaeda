@@ -2584,6 +2584,7 @@ class Daemon:
         self.on_event_pending: bool | None = None  # whether on-event.json holds runs to resolve (None: not read yet)
         self.on_event_seen: tuple | None = None  # on-event.json's stat when on_event_pending was learned
         self.on_event_kept: list[dict] = []  # matching runs a busy state lock held back: the cursor is past them
+        self.on_event_next: str | None = None  # the pending key a tick's deadline cut off: the next tick starts there
         self.on_event_problems: set[str] = set()  # config problems already logged
         self.gql_reason = "other"  # what the GraphQL query being sent reads, for daemon.json graphqlBy
         self.gql_log: list[tuple[float, str, int]] = []  # (time, reason, points) per GraphQL query, last hour
@@ -6213,9 +6214,15 @@ class Daemon:
                         continue
                     state["pending"][key] = {"hook": hook["name"], "since": self.now, "run": {
                         k: run.get(k) for k in ("id", "repo", "attempt", "head_sha", "head_branch", "conclusion", "url")}}
-            for key in sorted(state["pending"]):
+            keys = sorted(state["pending"])
+            if self.on_event_next is not None:  # start where the last tick stopped, so slow runs starve none (#2022 F1)
+                at = next((i for i, k in enumerate(keys) if k >= self.on_event_next), 0)
+                keys = keys[at:] + keys[:at]
+            self.on_event_next = None
+            for key in keys:
                 if given is None and time.monotonic() >= self.tick_deadline:
-                    break  # a slow controller used up the tick: the rest stay pending, written below (#2020 F3)
+                    self.on_event_next = key  # a slow controller used up the tick: the rest stay pending (#2020 F3)
+                    break
                 hook = by_name.get(state["pending"][key].get("hook"))
                 if hook is None:
                     self.on_event_finish(state, key, "unresolved", why="the hook is no longer configured")
