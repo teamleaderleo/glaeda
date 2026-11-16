@@ -3782,7 +3782,10 @@ class HookTest(unittest.TestCase):
 
         refused = (("fast-tier", self.FAST_TIER), ("generated-files", self.FAST_TIER),
                    ("size", ref("cmux-next.yml")),  # a small job's name in another workflow is not that job
-                   ("compile", ref("pr-checks.yml")))
+                   ("compile", ref("pr-checks.yml")),
+                   # a reusable workflow's job is keyed by its caller: the called file never matches
+                   ("comment", ref("pr-red-checks-comment.yml")), ("guard-status", ref("ci-guards.yml")),
+                   ("comment", ref("gallery-advisory.yml")))
         for job, env in refused:
             with self.subTest(job=job, env=env):
                 try:
@@ -3791,8 +3794,9 @@ class HookTest(unittest.TestCase):
                     self.assertIn("refused: the small runner takes only the small jobs", started.stdout)
                 finally:
                     self.finish("sm")
-        for job, env in (("size", ref("pr-checks.yml")), ("guard-status", ref("ci-guards.yml")),
-                         ("web-validation", ref("web-validation.yml")), ("comment", ref("pr-red-checks-comment.yml"))):
+        for job, env in (("size", ref("pr-checks.yml")), ("guard-status", ref("cmux-next-guards.yml")),
+                         ("web-validation", ref("web-validation.yml")), ("comment", ref("cmux-next.yml")),
+                         ("comment", ref("ci.yml"))):
             with self.subTest(job=job):
                 try:
                     ok = self.job(job, "sm", 14, None, "--small-runner", env=env)
@@ -3804,8 +3808,9 @@ class HookTest(unittest.TestCase):
         """SMALL_JOBS is exactly the jobs measured at 5 GiB or less run alone (2026-11-16); adding one needs a new
         measurement, so this list changes only with SMALL_JOB_PEAK_GIB's comment."""
         self.assertEqual(hook.SMALL_JOBS, {
-            "pr-checks.yml/size", "pr-red-checks-comment.yml/comment", "ci-guards.yml/guard-status",
-            "web-validation.yml/web-validation", "cmux-next-dev-daily.yml/verify",
+            "pr-checks.yml/size", "web-validation.yml/web-validation", "ci.yml/comment", "cmux-next.yml/comment",
+            "cmux-next-guards.yml/comment", "ci.yml/guard-status", "cmux-next-guards.yml/guard-status",
+            "cmux-next-dev-daily.yml/verify",
             "manaflow-ai/cmuxterm-hq/synthetic-probes.yml/routes"})
         self.assertEqual(hook.SMALL_JOB_DISK_GIB, 8.0)
         self.assertTrue(hook.small_job("routes", "manaflow-ai/cmuxterm-hq", "manaflow-ai/cmux", "synthetic-probes.yml"))

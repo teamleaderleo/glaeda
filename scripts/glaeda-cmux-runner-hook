@@ -1166,8 +1166,11 @@ def disk_shape_main(floor_gib: float) -> int:
 # Measured with `label-disk-samples` over 24 minis, 2026-11-02..16, jobs that ran with no other runner job (the disk
 # reading is the volume's): largest growth per job comment 5.0 GiB (n 447), routes 2.4 (278), size 2.3 (598),
 # web-validation 0.6 (403), guard-status 0.4 (312), verify 3.3 (5).
-SMALL_JOBS = frozenset({"pr-checks.yml/size", "pr-red-checks-comment.yml/comment", "ci-guards.yml/guard-status",
-                        "web-validation.yml/web-validation", "cmux-next-dev-daily.yml/verify",
+# comment (pr-red-checks-comment.yml) and guard-status (ci-guards.yml) run only as reusable workflows, so their keys
+# name the callers (GITHUB_WORKFLOW_REF is the caller's file), as GUARD_JOBS and the other tables key them.
+SMALL_JOBS = frozenset({"pr-checks.yml/size", "web-validation.yml/web-validation",
+                        "ci.yml/comment", "cmux-next.yml/comment", "cmux-next-guards.yml/comment",
+                        "ci.yml/guard-status", "cmux-next-guards.yml/guard-status", "cmux-next-dev-daily.yml/verify",
                         "manaflow-ai/cmuxterm-hq/synthetic-probes.yml/routes"})  # needs_key form
 SMALL_JOB_PEAK_GIB = 5.0  # the largest measured growth of a SMALL_JOBS job (comment)
 SMALL_DISK_MARGIN_GIB = 3.0
@@ -11398,6 +11401,9 @@ def main(argv: list[str] | None = None) -> int:
             return refused(f"the gateway runner takes only thin cmux-ci client jobs ({gateway_jobs_note()}); "
                            f"{job_workflow() or 'an unknown workflow'} {os.environ.get('GITHUB_JOB') or 'job'} "
                            "is not one")
+        if args.small_runner and not small_job(os.environ.get("GITHUB_JOB", ""), repo, args.home_repo, job_workflow()):
+            # SMALL_ONLY: refused at once, before any disk or capacity work, as the gateway runner refuses
+            return refused(small_refusal(os.environ.get("GITHUB_JOB", ""), repo, args.home_repo, job_workflow()))
         # every class, the general pool included: a job cmux routes to a hosted runner is never taken here
         if why := hosted_route_refusal(os.environ.get("GITHUB_WORKFLOW_REF"), os.environ.get("GITHUB_JOB")):
             return refused(why)
@@ -11536,8 +11542,6 @@ def main(argv: list[str] | None = None) -> int:
             # SIM_FIRST: it listens on a full mini and its job's wait holds the mini's other runners, so any other job
             # here would jump the side lanes; refused, it is rescued onto its own pool.
             return refused("the sim-first runner takes only simulator jobs")
-        if args.small_runner and not small_job(os.environ.get("GITHUB_JOB", ""), repo, args.home_repo, job_workflow()):
-            return refused(small_refusal(os.environ.get("GITHUB_JOB", ""), repo, args.home_repo, job_workflow()))
         if owner is None:  # fail closed: with no pinned owner no holder could watch the job
             return refused(f"cannot pin this job's Runner.Worker (pid {args.watch_pid or os.getppid()})")
         admit_start = time.monotonic()
