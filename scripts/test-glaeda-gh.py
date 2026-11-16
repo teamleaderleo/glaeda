@@ -15459,6 +15459,72 @@ class OnEventTest(Base):
         self.assertEqual(gg.on_event_state()["runs"]["cloud-probe-promote manaflow-ai/cmux/93/1"]["outcome"],
                          "started")
 
+    def test_runs_seen_while_a_replay_holds_the_lock_are_kept(self) -> None:
+        # #2020 F1: the feed cursor has moved past these runs, so a busy lock must not drop them
+        self.baseline()
+        self.ctl.held_jobs[(96, 1)] = [held_job("promote-production")]
+        self.ctl.runs[96] = backend_run(96)
+        with gg.bounded_lock(gg.BASE / ".on-event.lock") as held:
+            self.assertTrue(held)
+            self.daemon.tick(NOW + gg.TICK)
+        self.assertEqual(self.fired(), [])
+        self.daemon.tick(NOW + 2 * gg.TICK)  # an empty feed page: the kept run is resolved now
+        self.settle()
+        self.assertEqual(len(self.fired()), 1)
+
+    def test_the_github_fallback_waits_for_rest_room(self) -> None:
+        # #2020 F2: past the daemon's REST share the mode is lean, not stop; the fallback must wait for room
+        self.baseline()
+        self.ctl.runs[97] = backend_run(97)
+        self.daemon.tick(NOW + gg.TICK)
+        self.gh.jobs[97] = [{**job("promote-production", "success"), "run_attempt": 1}]
+        with mock.patch.object(self.daemon, "rest_room", return_value=False):
+            self.daemon.tick(NOW + gg.ON_EVENT_REST_AFTER + gg.TICK)
+        self.assertEqual(self.gh.job_calls(), [])
+        pending = gg.on_event_state()["pending"]["cloud-probe-promote manaflow-ai/cmux/97/1"]
+        self.assertNotIn("restTried", pending)  # deferred, not spent: it is asked once there is room
+        self.daemon.tick(NOW + gg.ON_EVENT_REST_AFTER + 2 * gg.TICK)
+        self.settle()
+        self.assertEqual(len(self.gh.job_calls()), 1)
+        self.assertEqual(len(self.fired()), 1)
+
+    def test_controller_lookups_stop_at_the_tick_deadline_and_the_rest_wait(self) -> None:
+        # #2020 F3: a slow controller must not hold the tick; what is left stays pending on disk
+        self.baseline()
+        for rid in (98, 99):
+            self.ctl.held_jobs[(rid, 1)] = [held_job("promote-production")]
+            self.ctl.runs[rid] = backend_run(rid)
+        read = self.ctl.run_jobs
+
+        def slow(repo: str, run_id: int, attempt: int) -> dict:
+            self.daemon.tick_deadline = 0.0  # this lookup used up the tick
+            return read(repo, run_id, attempt)
+
+        with mock.patch.object(self.ctl, "run_jobs", side_effect=slow):
+            self.daemon.tick(NOW + gg.TICK)
+        self.assertEqual(len(self.ctl.job_reads), 1)
+        state = gg.on_event_state()
+        self.assertEqual(len(state["runs"]) + len(state["pending"]), 2)  # both on disk
+        self.assertEqual(len(state["pending"]), 1)
+        self.daemon.tick(NOW + 2 * gg.TICK)
+        self.settle()
+        self.assertEqual(len(self.fired()), 2)
+
+    def test_a_run_a_replay_left_pending_is_retried_by_the_daemon(self) -> None:
+        # #2020 F4: the daemon cached "nothing pending"; a replay then wrote a pending run into the state file
+        self.baseline()
+        self.daemon.tick(NOW + gg.TICK)
+        self.daemon.tick(NOW + 2 * gg.TICK)
+        self.assertIs(self.daemon.on_event_pending, False)
+        other = self.new_daemon()
+        other.now = NOW + 2 * gg.TICK
+        other.on_event_tick([{"runs": [backend_run(100)]}])  # the controller holds no jobs for it yet
+        self.assertIn("cloud-probe-promote manaflow-ai/cmux/100/1", gg.on_event_state()["pending"])
+        self.ctl.held_jobs[(100, 1)] = [held_job("promote-production")]
+        self.daemon.tick(NOW + 3 * gg.TICK)  # an empty feed page
+        self.settle()
+        self.assertEqual(len(self.fired()), 1)
+
     def test_replay_feeds_one_run_through_the_same_path_once(self) -> None:
         run_file = Path(self.tmp.name) / "run.json"
         jobs_file = Path(self.tmp.name) / "jobs.json"
@@ -15487,6 +15553,42 @@ class OnEventTest(Base):
             self.assertEqual(gg.main(["on-event"]), 0)  # the text form, as a person reads it
         self.assertRegex(out.getvalue(),
                          r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ cloud-probe-promote manaflow-ai/cmux/94/1 ran exit 0 3{40}")
+
+
+class WriteJsonModeTest(unittest.TestCase):
+    """write_json writes a temporary file and replaces the target with it. The temporary file is created 0600 and
+    takes the target's own mode, so a replace never widens a 0600 file to the umask's 0644 (leo-workspace#5398's
+    BLOCK, the same class)."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        old = os.umask(0o022)
+        self.addCleanup(os.umask, old)
+
+    def mode(self, path: Path) -> int:
+        return stat.S_IMODE(path.stat().st_mode)
+
+    def test_a_0600_file_stays_0600(self) -> None:
+        path = Path(self.tmp.name) / "on-event.json"
+        path.write_text("{}\n")
+        path.chmod(0o600)
+        gg.write_json(path, {"runs": {}})
+        self.assertEqual(self.mode(path), 0o600)
+        self.assertEqual(json.loads(path.read_text()), {"runs": {}})
+
+    def test_a_new_file_is_0600(self) -> None:
+        path = Path(self.tmp.name) / "new.json"
+        gg.write_json(path, {"a": 1})
+        self.assertEqual(self.mode(path), 0o600)
+
+    def test_a_wider_mode_set_on_purpose_is_kept(self) -> None:
+        path = Path(self.tmp.name) / "shared.json"
+        path.write_text("{}\n")
+        path.chmod(0o640)
+        gg.write_json(path, {"a": 1})
+        self.assertEqual(self.mode(path), 0o640)
+        self.assertEqual([p.name for p in Path(self.tmp.name).iterdir()], ["shared.json"])  # no temporary left
 
 
 if __name__ == "__main__":
