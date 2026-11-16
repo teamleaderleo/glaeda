@@ -16659,6 +16659,147 @@ class LandTest(Base):
         self.tick()
         self.assert_merged_at(LB)
 
+    def test_status_says_how_long_ago_the_last_step_ended_once(self):
+        e = {"key": self.KEY, "state": "waiting", "lastAction": {"kind": "merge", "endedAt": time.time() - 300}}
+        line = gg.land_line(e, time.time())
+        self.assertIn("last merge 5m ago", line)
+        self.assertNotIn("ago ago", line)
+        self.assertIn("last merge running", gg.land_line({**e, "lastAction": {"kind": "merge"}}, time.time()))
+
+    def test_requester_defaults_to_the_queuing_session(self):
+        keys = {k: "" for k in gg.LAND_REQUESTER_KEYS}
+        with mock.patch.dict(os.environ, {**keys, "CMUX_AGENT_SESSION": "lane-y"}), \
+                mock.patch.object(gg, "policy_host", return_value="hostx"):
+            self.assertEqual(gg.land_requester_from(None), ("hostx/lane-y", "$CMUX_AGENT_SESSION"))
+            self.assertEqual(gg.land_requester_from("other/s"), ("other/s", "--notify"))
+        with mock.patch.dict(os.environ, {**keys, "CMUX_AGENT_SESSION": "glaeda-land"}):
+            self.assertEqual(gg.land_requester_from(None), ("", ""))  # the queue's own tag is never a requester
+        with mock.patch.dict(os.environ, {**keys, "ACPMUX_SESSION_ID": "sid-1"}), \
+                mock.patch.object(gg, "daemon_running", return_value=True), \
+                mock.patch.object(gg, "policy_host", return_value="hostx"), \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(gg.main(["land", "o/r#1", "--json"]), 0)
+        self.pr(LA)
+        self.w.answers.append(refusal("block", LA, {"kind": "stop", "stop": "block"}))
+        e = self.tick()
+        self.assertEqual((e["requester"], e["requesterFrom"], e["state"]), ("hostx/sid-1", "$ACPMUX_SESSION_ID", "stopped"))
+        self.assertEqual(self.w.sent()[-1][3], "hostx/sid-1")
+        self.assertEqual(e["history"][0]["via"], "$ACPMUX_SESSION_ID")
+
+    def test_nobody_to_tell_is_a_notice_not_silence(self):
+        self.pr(LA)
+        self.land(requester="")
+        self.w.answers.append(refusal("block", LA, {"kind": "stop", "stop": "block"}))
+        e = self.tick()
+        self.assertEqual((e["state"], self.w.sent()), ("stopped", []))
+        self.assertEqual(self.w.notices[-1][0], "land-unnotified")
+        self.assertIn("https://github.com/o/r/pull/1 stopped", self.w.notices[-1][2])
+
+    def test_a_check_with_no_runner_escalates_once_per_head(self):
+        self.pr(LA)
+        self.land()
+        esc = {"to": "hq/fleet-coord", "message": "macos-15 job queued 20 min, no runner"}
+        for _ in range(2):
+            self.w.answers.append(refusal("checks_queued_no_runner", LA,
+                                          {"kind": "wait_pr", "sha": LA, "timeout_s": 600, "escalate": esc}))
+        self.tick()
+        self.tick(601)  # the same answer after its wait: no second message
+        to_fleet = [c for c in self.w.sent() if c[3] == "hq/fleet-coord"]
+        self.assertEqual(len(to_fleet), 1)
+        self.assertIn("https://github.com/o/r/pull/1", to_fleet[0][-1])
+        self.assertIn("no runner", to_fleet[0][-1])
+        self.pr(LB)  # a new head: told again
+        self.w.answers.append(refusal("checks_queued_no_runner", LB,
+                                      {"kind": "wait_pr", "sha": LB, "timeout_s": 600, "escalate": esc}))
+        self.tick()
+        self.assertEqual(len([c for c in self.w.sent() if c[3] == "hq/fleet-coord"]), 2)
+
+    def test_a_requeue_during_explain_discards_the_old_answer(self):
+        """Codex review of #2041: cancel and land again with a new --after while explain runs; the old ok answer
+        must not merge before the new dependency."""
+        self.pr(LA)
+        self.pr(LC, key="pr:o/r#2")
+        self.land()
+        real = self.w.run
+
+        def requeue_mid_explain(argv, timeout, env):
+            if argv[1:3] == ["/fake/merge_hold.py", "explain"] and len(self.w.explains()) == 0:
+                gg.land_request(gg.LAND_WITHDRAW, "o/r#1", [], "host/lane")
+                gg.land_request("land", "o/r#1", ["o/r#2"], "host/lane")
+                self.q.ingest()
+            return real(argv, timeout, env)
+        self.q.run = requeue_mid_explain
+        self.w.answers.append(ok_answer(LA))
+        self.tick()
+        self.assertEqual(self.w.gh_calls("pr", "merge"), [])
+        e = self.tick()
+        self.assertEqual((e["state"], e["after"]), ("waiting_after", ["pr:o/r#2"]))
+
+    def test_a_merge_needs_an_ok_answer_at_the_judged_head(self):
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(refusal("other", LA, {"kind": "merge", "sha": LB}))
+        e = self.tick()
+        self.assertEqual((e["state"], e["stop"]["code"], self.w.gh_calls("pr", "merge")), ("stopped", "policy", []))
+
+    def test_update_branch_needs_a_full_pin_at_the_judged_head(self):
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(refusal("tip_merge", LA, {"kind": "update_branch", "expected_head_sha": LB}))
+        e = self.tick()
+        self.assertEqual((e["state"], self.w.gh_calls("api")), ("stopped", []))
+
+    def test_a_request_applied_before_a_crash_is_not_applied_twice(self):
+        self.pr(LA)
+        self.land()
+        req = sorted(gg.LandQueue.requests_dir().glob("*.json"))[0]
+        saved = req.read_text()
+        self.w.answers.append(ok_answer(LA))
+        self.tick()
+        self.assertEqual(self.q.entries[self.KEY]["state"], "merged")
+        req.write_text(saved)  # the crash: the entry was saved, the request not yet deleted
+        self.q = self.queue()
+        e = self.tick()
+        self.assertEqual((e["state"], len(self.w.sent())), ("merged", 1))
+        self.assertFalse(req.exists())
+
+    def test_a_review_is_recorded_before_it_starts_and_runs_through_the_shim(self):
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(refusal("no_ship", LA, {"kind": "review"}))
+        seen = {}
+
+        def popen(argv, **kw):
+            seen["env"] = kw["env"]
+            seen["reviewed"] = gg.read_json(gg.LandQueue.entries_dir() / gg.file_name(self.KEY))["reviewed"]
+            return mock.Mock()
+        with mock.patch.object(gg.subprocess, "Popen", side_effect=popen):
+            e = self.tick()
+        self.assertEqual(seen["reviewed"], [LA])  # on disk before the launch: a restart never posts it again
+        self.assertEqual(seen["env"]["PATH"].split(":")[0], os.fspath(self.w.gh.parent))
+        self.assertEqual(e["wait"]["kind"], "comment")
+
+    def test_no_shim_no_review(self):
+        self.w.gh.unlink()
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(refusal("no_ship", LA, {"kind": "review"}))
+        with mock.patch.object(gg.subprocess, "Popen", side_effect=AssertionError("ran router-review")):
+            e = self.tick()
+        self.assertEqual(e["stop"]["code"], "no_shim")
+
+    def test_reexec_waits_for_a_running_land_step(self):
+        gg.land_dir().mkdir(parents=True)
+        self.daemon.land_tick()
+        self.assertFalse(self.daemon.land_busy())
+        fut = mock.Mock()
+        fut.done.return_value = False
+        self.daemon.land_queue.jobs["pr:o/r#1"] = fut
+        self.assertTrue(self.daemon.land_busy())
+        fut.done.return_value = True
+        fut.exception.return_value = None
+        self.assertFalse(self.daemon.land_busy())
+
     def test_daemon_tick_runs_the_land_pass_only_once_land_exists(self):
         self.daemon.land_tick()
         self.assertIsNone(self.daemon.land_queue)
