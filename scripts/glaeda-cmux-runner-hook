@@ -9293,7 +9293,7 @@ def pcore_stall(busy: list[float], ecores: int | None, load1: float | None, ncpu
     p_busy = sum(busy[ecores:]) / (len(busy) - ecores)
     if e_busy < PCORE_STALL_E_BUSY or p_busy > PCORE_STALL_P_BUSY or load1 < ncpu:
         return None
-    return (f"performance cores {p_busy:.0f}% busy while the efficiency cores are {e_busy:.0f}% busy "
+    return (f"performance cores {p_busy:.0f}% busy, efficiency cores {e_busy:.0f}% busy, "
             f"at load {load1:.0f} on {ncpu} cores")
 
 
