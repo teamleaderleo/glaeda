@@ -15509,6 +15509,45 @@ class OnEventTest(Base):
         self.settle()
         self.assertEqual(len(self.fired()), 2)
 
+    def test_runs_the_deadline_cut_off_go_first_next_tick(self) -> None:
+        # #2022 F1: unresolved runs that use up every tick must not starve a later run whose job is ready
+        self.baseline()
+        for rid in range(200, 205):  # nothing held for these: each lookup comes back empty
+            self.ctl.runs[rid] = backend_run(rid)
+        self.ctl.held_jobs[(205, 1)] = [held_job("promote-production")]
+        self.ctl.runs[205] = backend_run(205)
+        read = self.ctl.run_jobs
+
+        def slow(repo: str, run_id: int, attempt: int) -> dict:
+            if len(self.ctl.job_reads) % 2 == 1:
+                self.daemon.tick_deadline = 0.0  # every second lookup uses up the tick
+            return read(repo, run_id, attempt)
+
+        with mock.patch.object(self.ctl, "run_jobs", side_effect=slow):
+            for i in range(1, 4):
+                self.daemon.tick(NOW + i * gg.TICK)
+        self.settle()
+        self.assertEqual(len(self.fired()), 1)  # three ticks of two lookups reach the sixth run
+        self.assertEqual(sorted(r for _, r, _ in self.ctl.job_reads), list(range(200, 206)))  # each one once
+
+    def test_a_pending_run_costs_one_github_read_and_none_once_unresolved(self) -> None:
+        # The fallback reads runs/{id}/attempts/{n}/jobs once per run, after ON_EVENT_REST_AFTER, never again; an
+        # unresolved run is out of pending and costs no controller read either.
+        self.baseline()
+        self.ctl.runs[210] = backend_run(210)
+        self.daemon.tick(NOW + gg.TICK)
+        step = 60
+        for t in range(2 * gg.TICK, int(gg.ON_EVENT_PENDING_MAX) + 4 * step, step):
+            self.daemon.tick(NOW + t)
+        self.assertEqual(len(self.gh.job_calls()), 1)
+        record = gg.on_event_state()["runs"]["cloud-probe-promote manaflow-ai/cmux/210/1"]
+        self.assertEqual(record["outcome"], "unresolved")
+        reads = len(self.ctl.job_reads)
+        for t in range(1, 6):
+            self.daemon.tick(NOW + gg.ON_EVENT_PENDING_MAX + 4 * step + t * step)
+        self.assertEqual(len(self.ctl.job_reads), reads)
+        self.assertEqual(len(self.gh.job_calls()), 1)
+
     def test_a_run_a_replay_left_pending_is_retried_by_the_daemon(self) -> None:
         # #2020 F4: the daemon cached "nothing pending"; a replay then wrote a pending run into the state file
         self.baseline()
