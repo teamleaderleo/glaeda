@@ -1867,6 +1867,27 @@ GATE_THERMAL_RELEASE = 1
 GATE_THERMAL_EVERY_S = 30.0
 NOTIFYUTIL = "/usr/bin/notifyutil"
 THERMAL_PRESSURE_KEY = "com.apple.system.thermalpressurelevel"
+# A mini whose performance cores stop running anything (cmux8s-mac-mini, 2026-11-14 to 11-16: cpu4-13 at 0% while
+# cpu0-3, the efficiency cores, sat at 100% at load 80 to 123; a fresh process stayed runnable with no CPU time) runs
+# every job on 4 of 14 cores: the daemon tests took 51 to 64 min instead of 14 to 22, and every job's host
+# cpu_busy_pct read a flat 28.9 (4/14). Nothing reports it: thermal pressure, pmset, hw.activecpu and
+# kern.sched_recommended_cores all read healthy, and it lasts until a reboot. When the efficiency cores are at least
+# PCORE_STALL_E_BUSY busy, the performance cores at most PCORE_STALL_P_BUSY and the 1-minute load at least the core
+# count (more runnable threads than cores, so the scheduler would use the P-cores if it could; a background-QoS-only
+# load saturates the E-cores at a low load), on PCORE_STALL_LOOKS looks in a row GATE_PCORE_EVERY_S apart, the gate
+# holds every listener on the mini until it reboots (PCORE_STALL_FILE in the shared state dir, stamped with the boot
+# time) and its hold line names the drained reboot. A held mini whose P-cores are seen PCORE_WORKING_P_BUSY busy
+# listens again, and a hold older than PCORE_STALL_MAX_HOLD_S is looked at afresh. GLAEDA_RUNNER_PCORE_HOLD=0 turns
+# this off. cmuxterm-hq docs/handbook/performance-cores-stop.md.
+GATE_PCORE_HOLD = os.environ.get("GLAEDA_RUNNER_PCORE_HOLD", "").strip() != "0"
+GATE_PCORE_EVERY_S = 60.0
+PCORE_STALL_E_BUSY = 90.0
+PCORE_STALL_P_BUSY = 5.0
+PCORE_WORKING_P_BUSY = 20.0
+PCORE_STALL_LOOKS = 3
+PCORE_STALL_MAX_HOLD_S = 12 * 3600
+PCORE_STALL_FILE = "pcore-stall.json"
+PCORE_REBOOT = "leo-workspace tools/mini_reboot.py --apply --min-held-gib 0"
 # GUI tests (app-host shards, tests-build-and-lag, test-e2e) run in the console user's session. A mini whose
 # auto-login session is screen-locked (displaysleep, then the lock) or sits at the login window fails every one of
 # them (cmuxterm-hq#757). ioreg's IOConsoleUsers names the console session (kCGSSessionOnConsoleKey) and whether its
@@ -7438,6 +7459,12 @@ class Gate:
         self.source = source_identity()
         self.thermal: int | None = None  # the level while the gate holds for heat, else None
         self.thermal_at = -GATE_THERMAL_EVERY_S
+        self.pcore_at = -GATE_PCORE_EVERY_S
+        self.pcore_ticks: list[tuple[int, ...]] | None = None
+        self.pcore_streak = 0
+        self.pcore_ecores: int | None = None
+        self.pcore_why: str | None = None
+        self.pcore_boot: int | None = None
         self.load_since: float | None = None  # when the current CPU/memory hold began (legacy field name)
         self.load_waived = False  # a pressure hold ran past GATE_LOAD_MAX_HOLD_S; ignored until pressure falls
         self.cpu_busy: float | None = None
@@ -7583,8 +7610,8 @@ class Gate:
         if why:
             self.load_since = None  # the fleet's claim, not load, is holding this gate
             self.yield_to_fleet()
-        return (why or self.shed(self.saturated()) or self.full() or self.shed(self.hot()) or self.locked()
-                or self.low_disk() or self.ineligible() or self.off_tailnet())
+        return (why or self.shed(self.saturated()) or self.full() or self.shed(self.hot()) or self.stalled()
+                or self.locked() or self.low_disk() or self.ineligible() or self.off_tailnet())
 
     def exclusive_yield(self) -> str | None:
         """YIELD_TO_EXCLUSIVE at the listener: why a yieldToExclusive dedicated runner takes no job now (a signing
@@ -7750,6 +7777,63 @@ class Gate:
             return None
         return f"the mini is throttled (thermal pressure level {self.thermal})"
 
+    def stalled(self, fresh: bool = False) -> str | None:
+        """Why this mini takes no job because its performance cores run nothing (GATE_PCORE_HOLD), read at most
+        every GATE_PCORE_EVERY_S. Every runner slot shares the hold through PCORE_STALL_FILE, kept until the boot
+        changes, the P-cores are seen working, or PCORE_STALL_MAX_HOLD_S passes. Unreadable counters hold nothing."""
+        if not GATE_PCORE_HOLD:
+            return None
+        now = time.monotonic()
+        if not fresh and now - self.pcore_at < GATE_PCORE_EVERY_S:
+            return self.pcore_why
+        self.pcore_at = now
+        path = Path(self.state_dir) / PCORE_STALL_FILE
+        if self.pcore_boot is None:
+            self.pcore_boot = boot_epoch()  # a reboot restarts the gate, so one read per gate
+        boot = self.pcore_boot
+        held: dict[str, Any] | None = None
+        try:
+            doc = json.loads(path.read_text(encoding="utf-8"))
+            if (isinstance(doc, dict) and doc.get("boot") == boot and boot is not None
+                    and time.time() - float(doc.get("since") or 0) < PCORE_STALL_MAX_HOLD_S):
+                held = doc
+        except (OSError, ValueError, TypeError):
+            held = None
+        held = self.pcore_look(path, boot, held)
+        self.pcore_why = str(held.get("why")) if held is not None else None
+        return self.pcore_why
+
+    def pcore_look(self, path: Path, boot: int | None, held: dict[str, Any] | None) -> dict[str, Any] | None:
+        """One per-CPU reading against the last: clear a hold whose P-cores work again, or start one after
+        PCORE_STALL_LOOKS stalled readings in a row. Returns the hold now in force, or None."""
+        ticks = core_ticks()
+        if self.pcore_ecores is None:
+            self.pcore_ecores = efficiency_cores()
+        busy = core_busy(self.pcore_ticks, ticks) if ticks is not None and self.pcore_ticks is not None else None
+        self.pcore_ticks = ticks
+        ecores = self.pcore_ecores
+        if busy is None or not ecores or len(busy) <= ecores:
+            return held
+        p_busy = sum(busy[ecores:]) / (len(busy) - ecores)
+        if held is not None and p_busy >= PCORE_WORKING_P_BUSY:
+            gate_log(f"the performance cores work again ({p_busy:.0f}% busy): listening again")
+            with contextlib.suppress(OSError):
+                path.unlink()
+            held, self.pcore_streak = None, 0
+        why = pcore_stall(busy, ecores, load_1min(), os.cpu_count())
+        self.pcore_streak = self.pcore_streak + 1 if why else 0
+        if held is not None or not why or self.pcore_streak < PCORE_STALL_LOOKS or boot is None:
+            return held
+        reason = f"the mini's performance cores run nothing ({why}): it needs a drained reboot ({PCORE_REBOOT} {gate_host()})"
+        held = {"boot": boot, "since": time.time(), "why": reason}
+        with contextlib.suppress(OSError):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_name(f".{path.name}.{os.getpid()}")
+            tmp.write_text(json.dumps(held), encoding="utf-8")
+            os.replace(tmp, path)
+        gate_log(reason)
+        return held
+
     def confirmed(self) -> str | None:
         """A fresh reading right before a stop: the holder still holds, or a waiter seen at least one poll ago
         is still waiting (a job-started in flight, which lsof also lists, is gone by then)."""
@@ -7768,7 +7852,7 @@ class Gate:
             self.load_since = None
             self.yield_to_fleet()
         return (why or self.shed(self.saturated()) or self.full(fresh=True) or self.shed(self.hot(fresh=True))
-                or self.locked(fresh=True) or self.low_disk() or self.ineligible() or self.off_tailnet())
+                or self.stalled() or self.locked(fresh=True) or self.low_disk() or self.ineligible() or self.off_tailnet())
 
     def still_waiting(self) -> str | None:
         """A fleet build seen waiting during the job that just ended, still waiting in a fresh reading."""
@@ -9118,6 +9202,99 @@ def host_cpu_ticks() -> tuple[int, ...] | None:
     except (OSError, ctypes.ArgumentError):
         return None
     return tuple(int(t) for t in ticks)
+
+
+# host_processor_info(mach_host_self(), PROCESSOR_CPU_LOAD_INFO, ...): processor_cpu_load_info per CPU, the same
+# four tick counters as host_cpu_ticks but one row per CPU, in a buffer the kernel allocates and the caller frees.
+PROCESSOR_CPU_LOAD_INFO = 2
+_MACH_CORES: list[Any] = []
+
+
+def core_ticks() -> list[tuple[int, ...]] | None:
+    """Each CPU's cumulative ticks (user, system, idle, nice), lowest-numbered CPU first, or None off Darwin or when
+    unreadable. One mach call and one vm_deallocate: no process."""
+    if not _MACH_CORES:
+        call = None
+        if sys.platform == "darwin":
+            try:
+                import ctypes
+                lib = ctypes.CDLL("/usr/lib/libSystem.B.dylib")
+                lib.mach_host_self.restype = ctypes.c_uint32
+                lib.mach_task_self.restype = ctypes.c_uint32
+                fn = lib.host_processor_info
+                fn.argtypes = (ctypes.c_uint32, ctypes.c_int, ctypes.POINTER(ctypes.c_uint32),
+                               ctypes.POINTER(ctypes.POINTER(ctypes.c_int32)), ctypes.POINTER(ctypes.c_uint32))
+                fn.restype = ctypes.c_int
+                free = lib.vm_deallocate
+                free.argtypes = (ctypes.c_uint32, ctypes.c_size_t, ctypes.c_size_t)
+                free.restype = ctypes.c_int
+                call = (fn, free, lib.mach_host_self(), lib.mach_task_self())
+            except (OSError, AttributeError, ImportError):
+                call = None
+        _MACH_CORES.append(call)
+    if _MACH_CORES[0] is None:
+        return None
+    import ctypes
+    fn, free, host, task = _MACH_CORES[0]
+    count, words = ctypes.c_uint32(), ctypes.c_uint32()
+    info = ctypes.POINTER(ctypes.c_int32)()
+    try:
+        if fn(host, PROCESSOR_CPU_LOAD_INFO, ctypes.byref(count), ctypes.byref(info), ctypes.byref(words)) != 0:
+            return None
+    except (OSError, ctypes.ArgumentError):
+        return None
+    try:
+        return [tuple(info[cpu * CPU_STATE_MAX + state] & 0xFFFFFFFF for state in range(CPU_STATE_MAX))
+                for cpu in range(count.value)]
+    finally:
+        free(task, ctypes.cast(info, ctypes.c_void_p).value or 0, words.value * ctypes.sizeof(ctypes.c_int32))
+
+
+def core_busy(before: list[tuple[int, ...]], after: list[tuple[int, ...]]) -> list[float] | None:
+    """Each CPU's busy % between two core_ticks reads (differences modulo 2**32), or None when the CPU counts differ."""
+    if len(before) != len(after) or not after:
+        return None
+    busy = []
+    for old, new in zip(before, after):
+        delta = [(n - o) % 2**32 for n, o in zip(new, old)]
+        total = sum(delta)
+        busy.append(0.0 if total <= 0 else 100.0 * (total - delta[CPU_STATE_IDLE]) / total)
+    return busy
+
+
+def efficiency_cores() -> int | None:
+    """How many efficiency cores the mini has (hw.perflevel1.logicalcpu; on Apple silicon they are the
+    lowest-numbered CPUs), or None on a host with one performance level (Intel, a VM) or when unreadable."""
+    try:
+        out = subprocess.run(["/usr/sbin/sysctl", "-n", "hw.nperflevels", "hw.perflevel1.logicalcpu"],
+                             stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=5).stdout.split()
+        levels, ecores = int(out[0]), int(out[1])
+    except (OSError, subprocess.SubprocessError, ValueError, IndexError):
+        return None
+    return ecores if levels >= 2 and ecores > 0 else None
+
+
+def boot_epoch() -> int | None:
+    """The host's boot time (kern.boottime's seconds), or None when unreadable."""
+    try:
+        out = subprocess.run(["/usr/sbin/sysctl", "-n", "kern.boottime"], stdin=subprocess.DEVNULL,
+                             capture_output=True, text=True, timeout=5).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    found = re.search(r"sec = (\d+)", out)
+    return int(found.group(1)) if found else None
+
+
+def pcore_stall(busy: list[float], ecores: int | None, load1: float | None, ncpu: int | None) -> str | None:
+    """Why the mini's performance cores look stalled in one per-CPU reading (see GATE_PCORE_HOLD), or None."""
+    if not ecores or load1 is None or not ncpu or len(busy) <= ecores:
+        return None
+    e_busy = sum(busy[:ecores]) / ecores
+    p_busy = sum(busy[ecores:]) / (len(busy) - ecores)
+    if e_busy < PCORE_STALL_E_BUSY or p_busy > PCORE_STALL_P_BUSY or load1 < ncpu:
+        return None
+    return (f"performance cores {p_busy:.0f}% busy while the efficiency cores are {e_busy:.0f}% busy "
+            f"at load {load1:.0f} on {ncpu} cores")
 
 
 class CpuWindow:
