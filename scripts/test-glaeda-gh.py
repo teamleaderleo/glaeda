@@ -15215,5 +15215,260 @@ class TempFileTest(unittest.TestCase):
             self.assertTrue(dead_new.exists() and alive_old.exists() and other.exists())
 
 
+# ---------------------------------------------------------------- on-event exec (a command per finished run or job)
+
+PROMOTE_SHA = "3" * 40
+
+
+def backend_run(run_id: int, status: str = "completed", conclusion: str = "success", attempt: int = 1,
+                branch: str = "feat-cmux-next", path: str = ".github/workflows/backend.yml", sha: str = PROMOTE_SHA,
+                updated: str = "2026-11-16T07:00:00Z", repo: str = "manaflow-ai/cmux") -> dict:
+    """A controller feed record of one backend.yml run (the shape /v1/github/events serves)."""
+    return {"id": run_id, "repo": repo, "name": "backend", "event": "push", "head_sha": sha, "head_branch": branch,
+            "attempt": attempt, "status": status, "conclusion": conclusion, "path": path,
+            "url": f"https://github.com/{repo}/actions/runs/{run_id}", "updated_at": updated}
+
+
+class HookController(FakeController):
+    """FakeController plus /v1/github/run-jobs: held_jobs[(run_id, attempt)] is what the controller holds."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.held_jobs: dict[tuple[int, int], list[dict]] = {}
+        self.job_reads: list[tuple[str, int, int]] = []
+
+    def run_jobs(self, repo: str, run_id: int, attempt: int) -> dict:
+        self.job_reads.append((repo, run_id, attempt))
+        self.fail()
+        jobs = self.held_jobs.get((run_id, attempt))
+        return {"repo": repo, "run": run_id, "attempt": attempt, "known": jobs is not None, "jobs": jobs or []}
+
+
+def held_job(name: str, conclusion: str = "success", status: str = "completed", job_id: int = 9001) -> dict:
+    return {"id": job_id, "name": name, "attempt": 1, "status": status, "conclusion": conclusion,
+            "url": f"https://github.com/manaflow-ai/cmux/actions/runs/1/job/{job_id}"}
+
+
+class OnEventTest(Base):
+    """glaeda-gh runs a configured command once per finished run (or one job of it) the controller's feed shows.
+    Leo, on an hourly Cloud probe: "but what's the point of checking every hour?" The probe runs once per cmux-api
+    production promote instead (backend.yml job promote-production on feat-cmux-next)."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.ctl = HookController()
+        feed_every, gg.CONTROLLER_FEED_EVERY = gg.CONTROLLER_FEED_EVERY, 0
+        self.addCleanup(setattr, gg, "CONTROLLER_FEED_EVERY", feed_every)
+        self.out = Path(self.tmp.name) / "fired.jsonl"
+        self.config = Path(self.tmp.name) / "on-event.json"
+        saved = gg.ON_EVENT_CONFIG
+        gg.ON_EVENT_CONFIG = self.config
+        self.addCleanup(setattr, gg, "ON_EVENT_CONFIG", saved)
+        self.write_config()
+        self.daemon = self.new_daemon()
+
+    def new_daemon(self) -> Any:
+        return gg.Daemon(transport=self.gh, token=lambda: TOKEN, controller=self.ctl)
+
+    def hook(self, **over: Any) -> dict:
+        # the command records its argv and environment, one JSON line per run
+        script = ("import json, os, sys; open(sys.argv[1], 'a').write(json.dumps("
+                  "{'argv': sys.argv[2:], 'env': dict(os.environ)}) + '\\n')")
+        h = {"name": "cloud-probe-promote", "repo": "manaflow-ai/cmux", "workflow": "backend.yml",
+             "branch": "feat-cmux-next", "job": "promote-production", "conclusion": "success",
+             "command": [sys.executable, "-c", script, os.fspath(self.out), "run", "--trigger", "deploy",
+                         "--sha", "{head_sha}", "--run", "{run_id}/{attempt}"]}
+        h.update(over)
+        return {k: v for k, v in h.items() if v is not None}
+
+    def write_config(self, *hooks: dict) -> None:
+        self.config.write_text(json.dumps({"hooks": list(hooks) or [self.hook()]}))
+
+    def settle(self, daemon: Any = None) -> None:
+        """Wait for every command the daemon started, then reap them as a tick would."""
+        daemon = daemon or self.daemon
+        for proc in list(daemon.on_event_procs.values()):
+            proc.wait(timeout=30)
+        daemon.on_event_reap()
+
+    def fired(self) -> list[dict]:
+        if not self.out.exists():
+            return []
+        return [json.loads(line) for line in self.out.read_text().splitlines()]
+
+    def baseline(self, daemon: Any = None) -> None:
+        (daemon or self.daemon).tick(NOW)  # the first feed read only learns the cursor
+
+    def test_a_promote_runs_the_command_once_with_the_full_sha(self) -> None:
+        self.baseline()
+        self.ctl.runs[81] = backend_run(81, "in_progress", "")
+        self.daemon.tick(NOW + gg.TICK)
+        self.assertEqual(self.ctl.job_reads, [])  # a run still going costs nothing
+        self.ctl.held_jobs[(81, 1)] = [held_job("deploy-staging"), held_job("promote-production")]
+        self.ctl.runs[81] = backend_run(81)
+        self.daemon.tick(NOW + 2 * gg.TICK)
+        self.settle()
+        fired = self.fired()
+        self.assertEqual(len(fired), 1)
+        self.assertEqual(fired[0]["argv"], ["run", "--trigger", "deploy", "--sha", PROMOTE_SHA, "--run", "81/1"])
+        # the same run delivered again (a late webhook, an updated_at bump) does not run it again
+        self.ctl.runs[81] = backend_run(81, updated="2026-11-16T07:09:00Z")
+        for i in range(3, 6):
+            self.daemon.tick(NOW + i * gg.TICK)
+        self.settle()
+        self.assertEqual(len(self.fired()), 1)
+        self.assertEqual(self.ctl.job_reads, [("manaflow-ai/cmux", 81, 1)])  # one read, at the finish
+        self.assertEqual(self.gh.rest_calls(), [])  # nothing from GitHub
+        record = gg.on_event_state()["runs"]["cloud-probe-promote manaflow-ai/cmux/81/1"]
+        self.assertEqual((record["outcome"], record["sha"], record["exit"]), ("ran", PROMOTE_SHA, 0))
+
+    def test_the_dedupe_survives_a_restart(self) -> None:
+        self.baseline()
+        self.ctl.held_jobs[(82, 1)] = [held_job("promote-production")]
+        self.ctl.runs[82] = backend_run(82)
+        self.daemon.tick(NOW + gg.TICK)
+        self.settle()
+        self.assertEqual(len(self.fired()), 1)
+        again = self.new_daemon()  # a restarted daemon, whose feed shows the run once more
+        self.baseline(again)
+        self.ctl.runs[82] = backend_run(82, updated="2026-11-16T07:30:00Z")
+        again.tick(NOW + gg.TICK)
+        self.settle(again)
+        self.assertEqual(len(self.fired()), 1)
+
+    def test_a_rerun_attempt_runs_it_again(self) -> None:
+        self.baseline()
+        self.ctl.held_jobs[(83, 1)] = [held_job("promote-production", "failure")]
+        self.ctl.runs[83] = backend_run(83, conclusion="failure")
+        self.daemon.tick(NOW + gg.TICK)
+        self.settle()
+        self.assertEqual(self.fired(), [])  # the promote failed: nothing deployed
+        self.assertEqual(gg.on_event_state()["runs"]["cloud-probe-promote manaflow-ai/cmux/83/1"]["outcome"],
+                         "no-match")
+        self.ctl.held_jobs[(83, 2)] = [held_job("promote-production")]
+        self.ctl.runs[83] = backend_run(83, attempt=2)
+        self.daemon.tick(NOW + 2 * gg.TICK)
+        self.settle()
+        self.assertEqual([f["argv"][-1] for f in self.fired()], ["83/2"])
+
+    def test_a_skipped_promote_runs_nothing(self) -> None:
+        self.baseline()
+        self.ctl.held_jobs[(84, 1)] = [held_job("promote-production", "skipped")]
+        self.ctl.runs[84] = backend_run(84)
+        self.daemon.tick(NOW + gg.TICK)
+        self.settle()
+        self.assertEqual(self.fired(), [])
+
+    def test_other_branches_workflows_and_repositories_are_not_read(self) -> None:
+        self.baseline()
+        self.ctl.runs[85] = backend_run(85, branch="lane/x")
+        self.ctl.runs[86] = backend_run(86, path=".github/workflows/ci.yml")
+        self.ctl.runs[87] = backend_run(87, repo="manaflow-ai/cmux-platform")
+        self.daemon.tick(NOW + gg.TICK)
+        self.assertEqual(self.ctl.job_reads, [])
+        self.assertEqual(self.fired(), [])
+
+    def test_a_job_the_controller_dropped_is_read_once_from_github(self) -> None:
+        # the hub keeps at most 30000 jobs: on a busy hour a run's jobs can be gone before the run's finish is read
+        self.baseline()
+        self.ctl.runs[88] = backend_run(88)
+        self.daemon.tick(NOW + gg.TICK)
+        self.assertEqual(self.gh.rest_calls(), [])  # not at once: the job's own delivery may still arrive
+        self.gh.jobs[88] = [{**job("promote-production", "success"), "run_attempt": 1}]
+        self.daemon.tick(NOW + gg.ON_EVENT_REST_AFTER + gg.TICK)
+        self.daemon.tick(NOW + gg.ON_EVENT_REST_AFTER + 2 * gg.TICK)
+        self.settle()
+        self.assertEqual(len(self.fired()), 1)
+        self.assertEqual(len(self.gh.job_calls()), 1)
+        self.assertIn("/actions/runs/88/attempts/1/jobs", self.gh.job_calls()[0][1])
+
+    def test_an_unresolved_run_is_given_up_after_a_bound(self) -> None:
+        self.baseline()
+        self.ctl.runs[89] = backend_run(89)
+        self.daemon.tick(NOW + gg.TICK)
+        self.daemon.tick(NOW + gg.ON_EVENT_REST_AFTER + gg.TICK)  # GitHub has no such job either
+        self.daemon.tick(NOW + gg.ON_EVENT_PENDING_MAX + 2 * gg.TICK)
+        self.assertEqual(len(self.gh.job_calls()), 1)
+        state = gg.on_event_state()
+        self.assertEqual(state["pending"], {})
+        self.assertEqual(state["runs"]["cloud-probe-promote manaflow-ai/cmux/89/1"]["outcome"], "unresolved")
+
+    def test_the_command_gets_no_token_and_a_minimal_environment(self) -> None:
+        self.baseline()
+        self.ctl.held_jobs[(90, 1)] = [held_job("promote-production")]
+        self.ctl.runs[90] = backend_run(90)
+        with mock.patch.dict(os.environ, {"GH_TOKEN": TOKEN, "GITHUB_TOKEN": TOKEN, "SECRET_THING": "x"}):
+            self.daemon.tick(NOW + gg.TICK)
+        self.settle()
+        env = self.fired()[0]["env"]
+        self.assertFalse({"GH_TOKEN", "GITHUB_TOKEN", "SECRET_THING"} & set(env))
+        self.assertEqual(env["GLAEDA_EVENT_HEAD_SHA"], PROMOTE_SHA)
+        self.assertEqual(env["GLAEDA_EVENT_RUN_URL"], "https://github.com/manaflow-ai/cmux/actions/runs/90")
+
+    def test_a_short_sha_runs_nothing(self) -> None:
+        self.baseline()
+        self.ctl.held_jobs[(91, 1)] = [held_job("promote-production")]
+        self.ctl.runs[91] = backend_run(91, sha="abc1234")
+        self.daemon.tick(NOW + gg.TICK)
+        self.settle()
+        self.assertEqual(self.fired(), [])
+
+    def test_a_bad_hook_is_refused_and_named(self) -> None:
+        self.write_config(self.hook(command=["python3", "x.py"]), self.hook(name="ok"))
+        hooks, problems = gg.on_event_hooks()
+        self.assertEqual([h["name"] for h in hooks], ["ok"])
+        self.assertTrue(any("absolute" in p for p in problems))
+        self.write_config(self.hook(command=["/bin/echo", "{token}"]))
+        self.assertEqual(gg.on_event_hooks()[0], [])
+
+    def test_a_run_level_hook_needs_no_job_read(self) -> None:
+        self.write_config(self.hook(job=None))
+        self.baseline()
+        self.ctl.runs[92] = backend_run(92)
+        self.daemon.tick(NOW + gg.TICK)
+        self.settle()
+        self.assertEqual(len(self.fired()), 1)
+        self.assertEqual(self.ctl.job_reads, [])
+
+    def test_a_crashed_daemon_never_runs_it_twice(self) -> None:
+        # the claim is on disk before the command starts: a daemon that dies between the two does not run it again
+        self.ctl.held_jobs[(93, 1)] = [held_job("promote-production")]
+        with mock.patch.object(gg.subprocess, "Popen", side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                self.daemon.on_event_tick([{"runs": [backend_run(93)]}])
+        again = self.new_daemon()
+        self.baseline(again)
+        self.ctl.runs[93] = backend_run(93, updated="2026-11-16T08:00:00Z")
+        again.tick(NOW + gg.TICK)
+        self.settle(again)
+        self.assertEqual(self.fired(), [])
+        self.assertEqual(gg.on_event_state()["runs"]["cloud-probe-promote manaflow-ai/cmux/93/1"]["outcome"],
+                         "started")
+
+    def test_replay_feeds_one_run_through_the_same_path_once(self) -> None:
+        run_file = Path(self.tmp.name) / "run.json"
+        jobs_file = Path(self.tmp.name) / "jobs.json"
+        run_file.write_text(json.dumps(backend_run(94)))
+        jobs_file.write_text(json.dumps({"jobs": [held_job("promote-production")]}))
+        argv = ["on-event", "replay", "--run-file", os.fspath(run_file), "--jobs-file", os.fspath(jobs_file),
+                "--wait", "30", "--json"]
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), mock.patch.object(gg.Controller, "from_env", return_value=None):
+            self.assertEqual(gg.main(argv), 0)
+        first = json.loads(out.getvalue())
+        self.assertEqual((first["outcome"], first["exit"], first["sha"]), ("ran", 0, PROMOTE_SHA))
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), mock.patch.object(gg.Controller, "from_env", return_value=None):
+            self.assertEqual(gg.main(argv), 0)
+        self.assertEqual(json.loads(out.getvalue())["outcome"], "ran")  # the first one's record; not run again
+        self.assertEqual(len(self.fired()), 1)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(gg.main(["on-event", "--json"]), 0)
+        status = json.loads(out.getvalue())
+        self.assertEqual([h["name"] for h in status["hooks"]], ["cloud-probe-promote"])
+        self.assertIn("cloud-probe-promote manaflow-ai/cmux/94/1", status["runs"])
+
+
 if __name__ == "__main__":
     unittest.main()
