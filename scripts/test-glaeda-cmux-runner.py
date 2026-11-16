@@ -3407,6 +3407,89 @@ class HookTest(unittest.TestCase):
                 self.assertEqual(hook.export_job_share({"units": units, "units_total": 14}, cores=14), "")
         self.assertFalse(github_env.exists())
 
+    def share_shims(self) -> tuple[Path, dict[str, str]]:
+        """The JOB_SHARE_TOOLS shims installed under a scratch hook dir, ahead of fake swift and xcodebuild that print
+        their arguments, and the PATH that finds them in that order."""
+        hook_dir, real = self.dir / "glaeda-hooks", self.dir / "real-bin"
+        real.mkdir()
+        for name in ("swift", "xcodebuild"):
+            fake = real / name
+            fake.write_text(f'#!/bin/sh\necho "{name} $*"\n')
+            fake.chmod(0o755)
+        shims = hook.install_share_shims(hook_dir)
+        self.assertEqual(shims, hook_dir / hook.JOB_SHARE_TOOLS_DIR)
+        return shims, {"PATH": f"{shims}:{real}:/usr/bin:/bin"}
+
+    def run_shim(self, env: dict[str, str], *argv: str) -> str:
+        done = subprocess.run(list(argv), env=env, capture_output=True, text=True, timeout=30, check=False)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        return done.stdout.strip()
+
+    def test_share_shims_give_swift_build_and_xcodebuild_the_jobs_share(self) -> None:
+        """JOB_SHARE_TOOLS: ultra2 ran at 4-7x its cores because SwiftPM and xcodebuild ignore CMUX_CI_CPU_BUDGET and
+        start a task per core; the shims add --jobs / -jobs from the budget the step sees."""
+        shims, env = self.share_shims()
+        budget = {**env, "CMUX_CI_CPU_BUDGET": "5"}
+        cases = [  # (argv, output)
+            (("swift", "build", "--build-tests"), "swift build --jobs 5 --build-tests"),
+            (("swift", "test", "--filter", "X"), "swift test --jobs 5 --filter X"),
+            (("swift", "run", "tool"), "swift run --jobs 5 tool"),
+            (("swift", "build", "-j", "8"), "swift build -j 8"),  # the command's own width wins
+            (("swift", "build", "-j3"), "swift build -j3"),
+            (("swift", "build", "--jobs=2"), "swift build --jobs=2"),
+            (("swift", "test", "--", "-j"), "swift test --jobs 5 -- -j"),  # past --, not SwiftPM's
+            (("swift", "package", "resolve"), "swift package resolve"),
+            (("swift", "--version"), "swift --version"),
+            (("xcodebuild", "-scheme", "cmux", "build"), "xcodebuild -jobs 5 -scheme cmux build"),
+            (("xcodebuild", "-scheme", "cmux", "build-for-testing"),
+             "xcodebuild -jobs 5 -scheme cmux build-for-testing"),
+            (("xcodebuild", "-jobs", "12", "build"), "xcodebuild -jobs 12 build"),
+            (("xcodebuild", "-version"), "xcodebuild -version"),
+            (("xcodebuild", "-showBuildSettings", "build"), "xcodebuild -showBuildSettings build"),
+            (("xcodebuild", "-resolvePackageDependencies"), "xcodebuild -resolvePackageDependencies"),
+        ]
+        for argv, out in cases:
+            with self.subTest(argv=argv):
+                self.assertEqual(self.run_shim(budget, *argv), out)
+        for value in ("", "0", "five", "-3"):  # a step that empties or garbles its budget runs unchanged
+            with self.subTest(budget=value):
+                self.assertEqual(self.run_shim({**env, "CMUX_CI_CPU_BUDGET": value}, "swift", "build"), "swift build")
+        self.assertEqual(self.run_shim(env, "xcodebuild", "build"), "xcodebuild build", "no budget: no cap")
+        twice = {**budget, "PATH": f"{shims}:{env['PATH']}"}
+        self.assertEqual(self.run_shim(twice, "swift", "build"), "swift build --jobs 5",
+                         "a share-bin listed twice still reaches the real tool")
+        missing = subprocess.run(["swift", "build"], env={"PATH": f"{shims}:/nonexistent", "CMUX_CI_CPU_BUDGET": "5"},
+                                 capture_output=True, text=True, timeout=30, check=False)
+        self.assertEqual(missing.returncode, 127)
+        self.assertIn("not found on PATH", missing.stderr)
+
+    def test_share_shims_are_rewritten_only_when_they_change(self) -> None:
+        shims, _ = self.share_shims()
+        swift = shims / "swift"
+        before = swift.stat().st_mtime_ns
+        self.assertEqual(hook.install_share_shims(shims.parent), shims)
+        self.assertEqual(swift.stat().st_mtime_ns, before, "an unchanged shim is not rewritten")
+        swift.write_text("#!/bin/sh\nexit 3\n")
+        self.assertEqual(hook.install_share_shims(shims.parent), shims)
+        self.assertEqual(swift.read_text(), hook.JOB_SHARE_SHIMS["swift"])
+        self.assertTrue(os.access(swift, os.X_OK))
+        self.assertEqual(sorted(p.name for p in shims.iterdir()), ["swift", "xcodebuild"], "no temp file left")
+        blocked = self.dir / "blocked"
+        blocked.write_text("a file where the hook dir should be")
+        self.assertIsNone(hook.install_share_shims(blocked))
+
+    def test_share_tools_go_on_the_jobs_path(self) -> None:
+        github_path, hook_dir = self.dir / "github_path", self.dir / "glaeda-hooks"
+        with mock.patch.dict(os.environ, {"GITHUB_PATH": os.fspath(github_path)}, clear=True):
+            self.assertEqual(hook.export_share_tools(hook_dir),
+                             "swift build and xcodebuild take --jobs $CMUX_CI_CPU_BUDGET")
+        self.assertEqual(github_path.read_text(), f"{hook_dir / hook.JOB_SHARE_TOOLS_DIR}\n")
+        github_path.unlink()
+        for env in ({"GITHUB_PATH": os.fspath(github_path), "GLAEDA_JOB_SHARE_TOOLS": "0"}, {}):
+            with self.subTest(env=env), mock.patch.dict(os.environ, env, clear=True):
+                self.assertEqual(hook.export_share_tools(hook_dir), "")
+        self.assertFalse(github_path.exists())
+
     def test_an_admitted_job_gets_its_cpu_share(self) -> None:
         """job-started writes the share (JOB_SHARE) to $GITHUB_ENV and logs it."""
         self.fleet()

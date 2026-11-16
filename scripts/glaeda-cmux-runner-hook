@@ -3093,6 +3093,95 @@ def export_job_share(taken: dict[str, Any], cores: int | None = None) -> str:
     return ""
 
 
+# JOB_SHARE_TOOLS: CMUX_CI_CPU_BUDGET reaches only the scripts that read it, and SwiftPM and xcodebuild do not:
+# `swift build` and `xcodebuild` start one task per core (30 on an ultra), and SwiftPM hands each swiftc its own -j of
+# the same width, so one daemon-test's `swift build --build-tests` held 175 runnable threads on ultra2 on 2026-11-16
+# (01:46Z, load 234 on 30 cores) while it had booked 5 units. Over 11-14 15Z to 11-15 21Z ultra2 ran at a 1-minute load
+# of 4-7x its cores (median per hour 51 to 237) with CPU 92-99% busy and only ~24 cores measured in jobs and outside:
+# the extra load is threads waiting for a core, which slows every job beside them. So an admitted job with a share
+# also gets two shims ahead of its PATH ($GITHUB_PATH): `swift build|test|run` gains `--jobs N` and an xcodebuild
+# build action gains `-jobs N`, N being CMUX_CI_CPU_BUDGET as the step sees it (a step that sets its own value, or
+# empties it, wins; a command that names its own -j/--jobs/-jobs is left as it is). Every other use passes through
+# unchanged to the next swift or xcodebuild on PATH. Off without a redeploy: GLAEDA_JOB_SHARE_TOOLS=0 in the runner
+# LaunchAgent environment (GLAEDA_JOB_SHARE=0 turns the whole share off).
+JOB_SHARE_TOOLS_DIR = "share-bin"
+JOB_SHARE_SHIM_HEAD = """#!/bin/sh
+# glaeda JOB_SHARE_TOOLS shim (scripts/glaeda-cmux-runner-hook writes this file; edits are overwritten)
+name=${0##*/}
+real=
+saved_ifs=$IFS
+IFS=:
+for dir in $PATH; do
+  [ -n "$dir" ] || continue
+  [ "$dir/$name" = "$0" ] && continue
+  case "$dir" in */glaeda-hooks/share-bin|*/glaeda-hooks/share-bin/) continue ;; esac
+  if [ -f "$dir/$name" ] && [ -x "$dir/$name" ]; then real="$dir/$name"; break; fi
+done
+IFS=$saved_ifs
+[ -n "$real" ] || { echo "$name: not found on PATH (glaeda share shim)" >&2; exit 127; }
+budget=${CMUX_CI_CPU_BUDGET:-}
+case "$budget" in ''|*[!0-9]*|0*) exec "$real" "$@" ;; esac
+"""
+JOB_SHARE_SHIMS = {
+    "swift": JOB_SHARE_SHIM_HEAD + """case "${1:-}" in build|test|run) ;; *) exec "$real" "$@" ;; esac
+for arg in "$@"; do
+  [ "$arg" = -- ] && break
+  case "$arg" in -j|-j[0-9]*|--jobs|--jobs=*) exec "$real" "$@" ;; esac
+done
+sub=$1
+shift
+exec "$real" "$sub" --jobs "$budget" "$@"
+""",
+    "xcodebuild": JOB_SHARE_SHIM_HEAD + """build=
+for arg in "$@"; do
+  case "$arg" in
+    -jobs|-version|-list|-showsdks|-showBuildSettings|-showdestinations|-showTestPlans) exec "$real" "$@" ;;
+    -exportArchive|-create-xcframework|-usage|-help) exec "$real" "$@" ;;
+    build|build-for-testing|test|test-without-building|archive|analyze|install|docbuild) build=1 ;;
+  esac
+done
+[ -n "$build" ] || exec "$real" "$@"
+exec "$real" -jobs "$budget" "$@"
+""",
+}
+
+
+def install_share_shims(hook_dir: Path) -> Path | None:
+    """Write the JOB_SHARE_TOOLS shims under hook_dir (rewritten only when their text changed, each by an atomic
+    rename) and return their directory, or None when they cannot be written."""
+    target = hook_dir / JOB_SHARE_TOOLS_DIR
+    try:
+        target.mkdir(parents=True, exist_ok=True)
+        for name, text in JOB_SHARE_SHIMS.items():
+            path = target / name
+            with contextlib.suppress(OSError):
+                if path.read_text(encoding="utf-8") == text and os.access(path, os.X_OK):
+                    continue
+            tmp = target / f".{name}.{os.getpid()}.tmp"
+            tmp.write_text(text, encoding="utf-8")
+            tmp.chmod(0o755)
+            os.replace(tmp, path)
+    except OSError:
+        return None
+    return target
+
+
+def export_share_tools(hook_dir: Path | None = None) -> str:
+    """Put the JOB_SHARE_TOOLS shims ahead of the job's PATH ($GITHUB_PATH). Returns a note, or '' (off, no
+    $GITHUB_PATH, or the shims cannot be written)."""
+    target = os.environ.get("GITHUB_PATH")
+    if os.environ.get("GLAEDA_JOB_SHARE_TOOLS", "1") == "0" or not target:
+        return ""
+    shims = install_share_shims(Path(__file__).resolve().parent if hook_dir is None else hook_dir)
+    if shims is None:
+        return ""
+    with contextlib.suppress(OSError):
+        with open(target, "a", encoding="utf-8") as path_file:
+            path_file.write(f"{shims}\n")
+        return f"swift build and xcodebuild take --jobs ${JOB_SHARE_ENV}"
+    return ""
+
+
 def export_job_claim(capacity_units: int, taken: dict[str, Any], note: str) -> str:
     """Tell an admitted job, through $GITHUB_ENV, that it holds the whole mini (JOB_CLAIM_ENV=exclusive) and which
     hook admitted it (HOOK_SHA_ENV, this file's sha256): an exclusive class job that holds every capacity unit, or any
@@ -10977,6 +11066,8 @@ def main(argv: list[str] | None = None) -> int:
             note += f"; {claim}"
         if args.capacity_units > 0 and (share := export_job_share(taken)):
             note += f"; {share}"
+            if tools := export_share_tools():
+                note += f"; {tools}"
         for root in held_roots(args.state_dir):
             settled = settle_root(int(root.rsplit("-", 1)[1]))
             if settled:
