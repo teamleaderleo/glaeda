@@ -9122,6 +9122,223 @@ def working_runner_jobs(rows: list[tuple[int, int, float, str]], is_gateway: Cal
             working += 1
     return working
 
+# DRAIN_BACKFILL: a drain waiter (DRAIN_WAITER_MARKER, ONCE_DRAIN_MARKER) waits for the mini to go idle: the jobs that
+# run when it arrives must end before it gets the host. Holding every idle listener off meanwhile keeps the host's
+# free units empty for that whole tail and buys the drain nothing while a job that started before it runs on. A
+# listener's next job that is expected to end before the running ones do does not delay the drain either (EASY
+# backfilling), so the gate passes such a drain while that holds: the window is the latest expected end of the
+# runner jobs that were already running when the drain began (drain_since: its marker's registration time; a job
+# admitted later, a backfilled one too, never widens the window, so backfill cannot keep a drain from emptying the
+# mini), each one's admission time plus the p90 run time of the same workflow/job measured on this
+# mini when it ran there DRAIN_BACKFILL_MIN_SAMPLES times, else the fleet's wall_s_p90 for it in the job-needs file
+# (JOB_NEEDS_NAME: its row for this host's hw.ncpu, its pooled row, then its class's; read whatever the file's hosts
+# canary says, which gates only the capacity arithmetic), and this runner's own next job is bounded by the p90 run
+# time of the jobs it ran here. A running job no row estimates, a runner without enough history, or a log that cannot
+# be read gives no window: the drain holds as before. 2026-11-16 11:05Z: a measurement spill drain held 11 of
+# cmux9s-mac-mini's 14 runners from 10:34Z while one Tour the app job (p90 68 min) ran, with 12 of 14 units free and
+# 47 jobs waiting for a mini; cmuxs-mac-mini-5 the same with 12 of 15. Leo, 2026-11-15: "I mean so in the sense of
+# like this has this many CPUs": each job carries its measured need and a host admits while it fits. Units, RAM and
+# every other hold still apply to a backfilled job; the drain's own spans (bounded_waiters) are unchanged.
+DRAIN_BACKFILL_MIN_SAMPLES = 5
+DRAIN_BACKFILL_RUNNER_SAMPLES = 10
+DRAIN_BACKFILL_TAIL_BYTES = 4 << 20  # of JOB_LOG: a few days of a 14-runner mini's started and completed lines
+_BACKFILL_CACHE: dict[str, Any] = {}
+
+
+def _p90(values: list[float]) -> float:
+    ordered = sorted(values)
+    return ordered[min(len(ordered) - 1, math.ceil(0.9 * len(ordered)) - 1)]
+
+
+def job_log_tail(log: Path | None = None, limit: int = DRAIN_BACKFILL_TAIL_BYTES) -> list[dict[str, Any]]:
+    """The started and completed records in the last `limit` bytes of the job log, oldest first; [] when it cannot be
+    read. Cached by the log's size and mtime."""
+    try:
+        log = JOB_LOG if log is None else log
+        st = log.stat()
+    except OSError:
+        return []
+    key = (os.fspath(log), st.st_size, st.st_mtime_ns, limit)
+    cached = _BACKFILL_CACHE.get("tail")
+    if cached is not None and cached[0] == key:
+        return cached[1]
+    records: list[dict[str, Any]] = []
+    try:
+        with open(log, "rb") as handle:
+            if st.st_size > limit:
+                handle.seek(st.st_size - limit)
+                handle.readline()  # a partial first line
+            data = handle.read(limit)
+    except OSError:
+        return []
+    for line in data.splitlines():
+        if b'"started"' not in line and b'"completed"' not in line:
+            continue
+        try:
+            record = json.loads(line)
+        except (ValueError, UnicodeDecodeError, RecursionError):
+            continue
+        if isinstance(record, dict) and record.get("event") in ("started", "completed"):
+            records.append(record)
+    _BACKFILL_CACHE["tail"] = (key, records)
+    return records
+
+
+def _job_key(record: dict[str, Any]) -> str | None:
+    workflow, job = record.get("workflow_file"), record.get("job")
+    if not isinstance(workflow, str) or not isinstance(job, str) or not job:
+        return None
+    return f"{str(record.get('repository') or '').lower()}/{workflow}/{job}"
+
+
+def fleet_walls(path: Path | None = None) -> dict[str, Any]:
+    """{"jobs": {key: row}, "classes": {class: row}, "min_samples": n} from the job-needs file (JOB_NEEDS_NAME), or {}
+    when it is missing, malformed or stale (JOB_NEEDS_MAX_AGE_S). Cached by its size and mtime."""
+    path = path or job_needs_path()
+    try:
+        st = path.stat()
+    except OSError:
+        return {}
+    key = (os.fspath(path), st.st_size, st.st_mtime_ns)
+    cached = _BACKFILL_CACHE.get("walls")
+    if cached is not None and cached[0] == key:
+        return cached[1]
+    walls: dict[str, Any] = {}
+    try:
+        with open(path, "rb") as handle:
+            doc = json.loads(handle.read(JOB_NEEDS_MAX_BYTES + 1))
+        at = datetime.datetime.fromisoformat(str(doc.get("generated_at")).replace("Z", "+00:00")).timestamp()
+        floor = doc.get("min_samples", 20)
+        if (doc.get("schema") == JOB_NEEDS_SCHEMA and 0 <= time.time() - at <= JOB_NEEDS_MAX_AGE_S
+                and isinstance(floor, int) and not isinstance(floor, bool) and floor >= 1
+                and isinstance(doc.get("jobs"), dict) and isinstance(doc.get("classes"), dict)):
+            walls = {"jobs": doc["jobs"], "classes": doc["classes"], "min_samples": floor}
+    except (OSError, ValueError, TypeError, AttributeError, UnicodeDecodeError, RecursionError):
+        walls = {}
+    _BACKFILL_CACHE["walls"] = (key, walls)
+    return walls
+
+
+def fleet_wall_p90(record: dict[str, Any], walls: dict[str, Any], ncpu: int | None) -> float | None:
+    """The fleet's measured p90 run time of a started record's job: its job-needs row for this host's cores, its
+    pooled row, then its class's, each with at least the file's min_samples runs; None when no row has one."""
+    if not walls:
+        return None
+    workflow, job = record.get("workflow_file"), record.get("job")
+    rows: list[Any] = []
+    if isinstance(workflow, str) and isinstance(job, str):
+        repo = record.get("repository")
+        rows.append(walls["jobs"].get(needs_key(job, repo if isinstance(repo, str) else None, DEFAULT_HOME_REPO,
+                                                workflow)))
+    klass = record.get("class")
+    if isinstance(klass, str):
+        rows.append(walls["classes"].get(klass))
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        per = row.get("by_ncpu")
+        for sub in ((per.get(str(ncpu)) if isinstance(per, dict) and ncpu else None), row):
+            if not isinstance(sub, dict):
+                continue
+            n, wall = sub.get("n"), sub.get("wall_s_p90")
+            if (isinstance(n, int) and not isinstance(n, bool) and n >= walls["min_samples"]
+                    and isinstance(wall, (int, float)) and not isinstance(wall, bool) and math.isfinite(wall)
+                    and 0 <= wall <= HOLDER_MAX_S):
+                return float(wall)
+    return None
+
+
+def drain_since(host_lock: str, pids: set[int]) -> float | None:
+    """When the earliest of these drain waiters registered (epoch seconds), read from its marker's name in
+    host.lock.waiters: a DRAIN_WAITER_MARKER ends in its registration's nanoseconds, a ONCE_DRAIN_MARKER carries its
+    epoch second. None when no marker of theirs names one."""
+    found: float | None = None
+    try:
+        names = os.listdir(host_lock + ".waiters")
+    except OSError:
+        return None
+    for name in names[:1024]:
+        if match := DRAIN_WAITER_MARKER.fullmatch(name):
+            at = int(name.rsplit("-", 1)[1]) / 1e9
+        elif match := ONCE_DRAIN_MARKER.fullmatch(name):
+            at = float(name.split("-", 2)[1])
+        else:
+            continue
+        if int(match.group(1)) in pids and math.isfinite(at) and at > 0:
+            found = at if found is None else min(found, at)
+    return found
+
+
+def backfill_window(state_dir: Path, records: list[dict[str, Any]], now: float, since: float,
+                    walls: dict[str, Any] | None = None) -> tuple[float, str] | None:
+    """(seconds until the runner jobs running here are expected to end, a note naming the last one), or None when one
+    of them cannot be estimated. A runner runs a job while its holder (holder_file) lives; the job is that runner's
+    latest started record, and its expected end is the record's time plus the p90 of that job's completed runs here,
+    else the fleet's (fleet_wall_p90)."""
+    runs: dict[str, list[float]] = {}
+    latest: dict[str, dict[str, Any]] = {}
+    for record in records:
+        runner = record.get("runner")
+        if not isinstance(runner, str) or not runner:
+            continue
+        if record["event"] == "started":
+            latest[runner] = record
+        elif (key := _job_key(record)) and isinstance(seconds := record.get("seconds"), (int, float)) \
+                and not isinstance(seconds, bool) and math.isfinite(seconds) and seconds >= 0:
+            runs.setdefault(key, []).append(float(seconds))
+    end, note = now, "the jobs that ran when the drain began are past their p90"
+    for runner, record in latest.items():
+        if not holder_alive(holder_file(state_dir, runner)):
+            continue
+        key, at = _job_key(record), record.get("at")
+        if not isinstance(at, (int, float)) or isinstance(at, bool):
+            return None
+        if at > since:  # admitted after the drain began (a nightly pass, a handed job, a backfilled one)
+            continue
+        if key is None:
+            return None
+        samples = runs.get(key, [])
+        if len(samples) >= DRAIN_BACKFILL_MIN_SAMPLES:
+            p90, source = _p90(samples), f"{len(samples)} runs here"
+        else:
+            if walls is None:
+                walls = fleet_walls()
+            fleet = fleet_wall_p90(record, walls, host_cores())
+            if fleet is None:
+                return None
+            p90, source = fleet, "the fleet's"
+        expected = float(at) + p90
+        if expected > end:
+            end, note = expected, f"{record.get('job')} on {runner}, p90 {p90 / 60:.0f} min ({source})"
+    return end - now, note
+
+
+def runner_job_bound(runner: str, records: list[dict[str, Any]]) -> float | None:
+    """The p90 run time of the jobs this runner completed here (its labels' jobs, measured), or None with fewer than
+    DRAIN_BACKFILL_RUNNER_SAMPLES of them."""
+    seconds = [float(r["seconds"]) for r in records
+               if r["event"] == "completed" and r.get("runner") == runner and isinstance(r.get("seconds"), (int, float))
+               and not isinstance(r.get("seconds"), bool) and math.isfinite(r["seconds"]) and r["seconds"] >= 0]
+    return _p90(seconds) if len(seconds) >= DRAIN_BACKFILL_RUNNER_SAMPLES else None
+
+
+def drain_backfill(state_dir: Path, runner: str | None, since: float | None, now: float | None = None,
+                   log: Path | None = None) -> str | None:
+    """Why this runner may take a job beside a drain waiter that began at `since` (DRAIN_BACKFILL), or None when the
+    drain holds it."""
+    if not runner or since is None:
+        return None
+    now = time.time() if now is None else now
+    records = job_log_tail(log)
+    bound = runner_job_bound(runner, records)
+    if bound is None:
+        return None
+    window = backfill_window(state_dir, records, now, since)
+    if window is None or window[0] < bound:
+        return None
+    return (f"its next job (p90 {bound / 60:.0f} min here) should end before the jobs running here do "
+            f"(about {window[0] / 60:.0f} min left: {window[1]})")
+
 
 def bounded_waiters(state_dir: Path, waiting: list[int] | set[int], now: float | None = None,
                     log: Callable[[str], None] | None = None,
@@ -9581,6 +9798,7 @@ class Gate:
         self.stopped_one = False  # the gate stopped a listener and has not started one since (GATE_RESTART_FREE_S)
         self.terminating = False
         self.waiting: set[int] = set()
+        self.backfill_noted: set[int] = set()  # the drain waiters DRAIN_BACKFILL last passed (logged once)
         self.job_waited = False  # a fleet build was waiting, or the host was reserved, at the last poll of a job
         self.waiting_at = -GATE_WAITER_EVERY_S
         self.waiter_seen = waiter_seen_stamp(state_dir)  # the last job-started waiter refusal this gate acted on
@@ -9820,6 +10038,17 @@ class Gate:
         waiting = host_waiters(self.host_lock, self.state_dir)
         if self.nightly_slot:
             waiting = {pid for pid in waiting if not nightly_pass_left(self.state_dir, pid)}
+        drains = waiting & drain_lock_waiters(self.host_lock) if waiting else set()
+        if drains:
+            why = drain_backfill(self.state_dir, runner_config(self.runner_dir)[0],
+                                 drain_since(self.host_lock, drains))
+            if why:
+                if self.backfill_noted != drains:
+                    gate_log(f"a drain waits for the host (pid {min(drains)}); listening beside it: {why}")
+                self.backfill_noted = drains
+                waiting -= drains
+            else:
+                self.backfill_noted = set()
         return waiting
 
     def waiters_due(self) -> bool:
