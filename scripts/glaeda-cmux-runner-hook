@@ -2393,7 +2393,8 @@ def nightly_slot_refusal(tier: str) -> str | None:
     if tier == TIER_NIGHTLY:
         return None
     return ("the nightly slot admits only nightly jobs (nightly.yml on nightly-next or main, main's DEV daily publish, "
-            "main's nightly-next canary and launch smoke, and the Release compile that gates nightly-next's promotion)")
+            "main's nightly-next canary and launch smoke, the Release compile that gates nightly-next's promotion, "
+            f"and the release and pin builds: {release_pin_note()})")
 
 
 def hosted_route_refusal(workflow_ref: str | None, job: str | None) -> str | None:
@@ -2444,6 +2445,44 @@ def feed_tree_build(event_name: str | None, ref: str | None, repository: str | N
             and event.get("ref") == ref and workflow_ref == f"{FEED_TREE_WORKFLOW}@{FEED_TREE_REF}")
 
 
+# RELEASE_FIRST: a release or pin build ranks with the nightly jobs (TIER_NIGHTLY), so the nightly slot admits it and
+# it waits first in line on its mini, as a nightly job does (FEED_FIRST, NIGHTLY_SLOT). claude-sr2-coord, 2026-11-16:
+# "release and pin jobs (workflow_dispatch of release workflows such as app-ffi-release) and nightlies (nightly,
+# nightly-next, promote) go ahead of PR jobs." That day app-ffi-release's `build xcframework` (cmux run 43869638705, a
+# dispatch on feat-cmux-next) queued 1 to 4 hours on glaeda-side-std-xcode-26.6 behind PR jobs, all of that label's
+# listening runners busy, while the FFI pin it publishes (cmux#44074, cmux#44495) waited. GitHub hands a queued job to
+# the next idle runner of its label in arrival order, and a hook refusal fails the job (the rescue re-runs it at the
+# back of a queue), so the only place to put such a build first is a label no PR job asks for: cmux routes these builds
+# to glaeda's nightly slot label. Nothing is refused for it: a PR job already admitted runs on, and a PR job waiting on
+# the mini only waits longer (busy, never failed). Only the merged workflow on its release branch qualifies, from that
+# branch's own push or a dispatch of it: never a pull request's copy, another branch's, or a payload that carries a
+# pull request. (workflow file, job id) -> the one ref whose push or dispatch builds the release.
+RELEASE_PIN_BUILDS = {("app-ffi-release.yml", "build"): "refs/heads/feat-cmux-next"}
+RELEASE_PIN_EVENTS = ("push", "workflow_dispatch")
+
+
+def release_pin_note() -> str:
+    """RELEASE_PIN_BUILDS for a refusal: "workflow job on branch", sorted."""
+    return ", ".join(f"{workflow} {job} on {ref.removeprefix('refs/heads/')}"
+                     for (workflow, job), ref in sorted(RELEASE_PIN_BUILDS.items()))
+
+
+def release_pin_build(event_name: str | None, ref: str | None, repository: str | None, event: Any,
+                      workflow_ref: str | None, job: str | None) -> bool:
+    """Whether this job is a release or pin build (RELEASE_FIRST). Pure. Only manaflow-ai/cmux's merged workflow on
+    the build's own release ref, from a push of that ref (its own payload) or a dispatch of it."""
+    if not isinstance(event, dict) or any(key in event for key in UNTRUSTED_PAYLOAD_KEYS):
+        return False
+    repos = {(repository or "").lower(), (_repo_name(event.get("repository")) or "").lower()}
+    if repos != {"manaflow-ai/cmux"} or event_name not in RELEASE_PIN_EVENTS or not job:
+        return False
+    workflow = workflow_file(workflow_ref)
+    want = RELEASE_PIN_BUILDS.get((workflow, job))
+    if want is None or ref != want or workflow_ref != f"manaflow-ai/cmux/.github/workflows/{workflow}@{want}":
+        return False
+    return event_name != "push" or event.get("ref") == ref
+
+
 def job_tier(event_name: str | None, ref: str | None, repository: str | None, event: Any,
              workflow_ref: str | None, job: str | None) -> str:
     """This job's admission tier (FEED_FIRST): TIER_NIGHTLY, TIER_DEV or "". Pure. Only merged workflow code on a
@@ -2467,6 +2506,8 @@ def job_tier(event_name: str | None, ref: str | None, repository: str | None, ev
         return TIER_NIGHTLY if job == PROMOTE_COMPILE and event_name == "push" else TIER_DEV
     if feed_tree_build(event_name, ref, repository, event, workflow_ref, job):
         return TIER_DEV
+    if release_pin_build(event_name, ref, repository, event, workflow_ref, job):
+        return TIER_NIGHTLY  # RELEASE_FIRST
     repos = {(repository or "").lower(), (_repo_name(event.get("repository")) or "").lower()}
     if repos != {"manaflow-ai/cmux"} or not job or event_name not in NIGHTLY_EVENTS:
         return ""

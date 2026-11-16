@@ -5456,6 +5456,65 @@ time.sleep(60)
                     rb = hook.admission_rank(b, now - age_b, 11, now)
                     self.assertNotEqual(ra < rb, rb < ra, (a, age_a, b, age_b))
 
+    def test_release_pin_builds_rank_with_nightly_jobs(self) -> None:
+        """RELEASE_FIRST: app-ffi-release's build from feat-cmux-next, pushed or dispatched, ranks as a nightly job, so
+        the nightly slot admits it and it waits there with no bound. A pull request's copy, another branch's, another
+        job or workflow, another repository, a schedule and a payload that carries a pull request keep the ordinary
+        tier, and the nightly slot refuses them."""
+        ref = "refs/heads/feat-cmux-next"
+        build = {"event_name": "workflow_dispatch", "ref": ref, "repository": "manaflow-ai/cmux",
+                 "event": {"repository": CMUX, "inputs": {}},
+                 "workflow_ref": f"manaflow-ai/cmux/.github/workflows/app-ffi-release.yml@{ref}", "job": "build"}
+        push = {**build, "event_name": "push", "event": {"ref": ref, "repository": CMUX}}
+        for args in (build, push):
+            with self.subTest(event=args["event_name"]):
+                self.assertTrue(hook.release_pin_build(**args))
+                self.assertEqual(hook.job_tier(**args), hook.TIER_NIGHTLY)
+                self.assertIsNone(hook.nightly_slot_refusal(hook.job_tier(**args)))
+                self.assertIsNone(hook.nightly_capacity_wait(hook.TIER_NIGHTLY, args["event_name"], ref, "build",
+                                                             "app-ffi-release.yml", "1"),
+                                  "it waits for units, never refused for waiting")
+        other = "refs/heads/feat-cmux-next-other"
+        for overrides in (
+                {"event_name": "pull_request"}, {"event_name": "schedule"}, {"job": "publish"}, {"job": ""},
+                {"repository": "other/cmux"}, {"ref": "refs/pull/1/merge"},
+                {"ref": other, "workflow_ref": build["workflow_ref"].replace(ref, other)},
+                {"workflow_ref": "manaflow-ai/cmux/.github/workflows/app-ffi-release.yml@refs/pull/1/merge"},
+                {"workflow_ref": build["workflow_ref"].replace("app-ffi-release.yml", "ci.yml")},
+                {"event": {"repository": CMUX, "pull_request": {"number": 1}}}):
+            with self.subTest(overrides=overrides):
+                self.assertFalse(hook.release_pin_build(**{**build, **overrides}))
+                self.assertEqual(hook.job_tier(**{**build, **overrides}), "")
+                self.assertIn("app-ffi-release.yml build on feat-cmux-next",
+                              hook.nightly_slot_refusal(hook.job_tier(**{**build, **overrides})))
+        with self.subTest("a push whose payload names another ref"):
+            self.assertEqual(hook.job_tier(**{**push, "event": {"ref": other, "repository": CMUX}}), "")
+
+    def test_a_waiting_release_build_goes_ahead_of_pr_jobs_which_wait_and_are_never_refused(self) -> None:
+        """RELEASE_FIRST on a mini: a release build waiting for units is admitted ahead of an older PR job, and the
+        PR job is told to wait (a reason, which job-started waits on), with no bound that would refuse it."""
+        capacity = self.dir / "capacity"
+        capacity.mkdir()
+        now = time.time()
+        ref = "refs/heads/feat-cmux-next"
+        tier = hook.job_tier("workflow_dispatch", ref, "manaflow-ai/cmux", {"repository": CMUX},
+                             f"manaflow-ai/cmux/.github/workflows/app-ffi-release.yml@{ref}", "build")
+        (capacity / f"{hook.ADMIT_WANT}{os.getppid()}").write_text(
+            json.dumps({"since": now - 5, "wants": ["units"], "tier": tier}))
+        # a PR job that has waited longer than the build and past FEED_JUMP_S still waits behind it
+        why = hook.fair_turn(capacity, {"units"}, now - hook.FEED_JUMP_S - 600, "", True, True)
+        self.assertIsNotNone(why)
+        self.assertIn("goes first here", why)
+        self.assertNotIn("refused", why)
+        pr = {"pull_request": {"number": 1, "head": {"repo": CMUX}, "base": {"repo": CMUX}}, "repository": CMUX}
+        pr_tier = hook.job_tier("pull_request", "refs/pull/1/merge", "manaflow-ai/cmux", pr,
+                                "manaflow-ai/cmux/.github/workflows/app-ffi-release.yml@refs/pull/1/merge", "build")
+        self.assertEqual(pr_tier, "")
+        self.assertIsNone(hook.nightly_capacity_wait(pr_tier, "pull_request", "refs/pull/1/merge", "build",
+                                                     "app-ffi-release.yml", "1"), "no wait bound for the PR job")
+        # an earlier release or nightly job is not held by the later one
+        self.assertIsNone(hook.fair_turn(capacity, {"units"}, now - 10, tier, True, True), "arrival among them")
+
     def test_stack_blocker_tier_ranks_right_after_nightly(self) -> None:
         capacity = self.dir / "capacity"
         capacity.mkdir()
