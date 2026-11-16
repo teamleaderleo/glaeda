@@ -3885,6 +3885,7 @@
  },
  "hosts": [
   "cmux13s-mac-mini",
+  "cmux14",
   "cmux18",
   "ultra2"
  ]
