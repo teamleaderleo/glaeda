@@ -8561,6 +8561,23 @@ class GateTest(unittest.TestCase):
             self.assertEqual(hook.bounded_waiters(self.state, [70504], now=t0 + t, identity=lambda pid: "w",
                                                   drains={70504}), [70504])
 
+    def test_a_measure_drain_and_a_drained_reboot_are_drain_waiters_too(self) -> None:
+        # Two more waiters wait for this mini to go idle and were let go after GATE_WAITER_MAX_HOLD_S like any build:
+        # the worker's in-step measure drain (cmuxterm-hq cmd/worker/ci_step.go, "measure-drain", re-registered every
+        # 12 min) and a drained reboot's root shell (leo-workspace tools/sandboxd_heal.py, `$$-$(date +%s)-root-drain`,
+        # written once and never refreshed). cmux8s-mac-mini, 2026-11-16: pid 61199's reboot drain from 05:40Z waited
+        # its whole 70 min while the runners refilled the mini, so the reboot its stalled performance cores needed
+        # never ran. A once-written marker counts while its pid lives (root's pid: kill(0) says EPERM, alive).
+        waiters = Path(str(self.lock) + ".waiters")
+        waiters.mkdir()
+        for name in ("81475-refresh-measure_drain-1794805076019383000", "61199-1794807627-root-drain",
+                     "61200-1794807627-root-drain", "81477-1794807627-cmux"):
+            (waiters / name).touch()
+        old = time.time() - 3600
+        os.utime(waiters / "61199-1794807627-root-drain", (old, old))
+        with mock.patch.object(hook, "pid_alive", side_effect=lambda pid: pid != 61200):
+            self.assertEqual(hook.drain_lock_waiters(os.fspath(self.lock)), {81475, 61199})
+
     def test_drain_waiter_markers_are_the_workers_lend_drain_ones(self) -> None:
         waiters = Path(str(self.lock) + ".waiters")
         waiters.mkdir()
