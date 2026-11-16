@@ -8531,13 +8531,15 @@ class GateTest(unittest.TestCase):
     def test_lend_drain_waiters_are_read_from_their_markers(self) -> None:
         waiters = Path(str(self.lock) + ".waiters")
         waiters.mkdir()
+        # The worker's lend drain and its in-step measure drain (ci_step.go, re-registered every 12 min) both wait for
+        # this mini to go idle; an ordinary build waiter and a stale marker are not drains.
         for name in ("81472-refresh-lend_drain-1794805076019383000", "81473-refresh-build-1",
-                     "81474-refresh-lend_drain-1"):
+                     "81474-refresh-lend_drain-1", "81475-refresh-measure_drain-1794805076019383000"):
             (waiters / name).touch()
         old = time.time() - 60
         os.utime(waiters / "81474-refresh-lend_drain-1", (old, old))  # stale: its worker stopped refreshing
         with mock.patch.object(hook, "pid_alive", return_value=True):
-            self.assertEqual(hook.lend_drain_waiters(os.fspath(self.lock)), {81472})
+            self.assertEqual(hook.lend_drain_waiters(os.fspath(self.lock)), {81472, 81475})
 
     def test_replay_a_worker_waiting_for_over_an_hour_is_bounded(self) -> None:
         # 2026-10-26, a std mini: the fleet worker (one pid) waited for host.lock from 22:19Z, taking it now and then
