@@ -3884,6 +3884,7 @@
   "to": "2026-11-14"
  },
  "hosts": [
+  "cmux13s-mac-mini",
   "cmux18",
   "ultra2"
  ]
