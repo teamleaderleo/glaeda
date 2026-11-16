@@ -1228,7 +1228,10 @@ instance's receipt, with a remove token for the receipt's own scope, deregistere
 directory removed. Before this, a count drop (an xl Studio from 10 to 6 runners, 2026-11-03, #1821) left the
 instances past it listening and taking side jobs, and their listen claims kept the root runners off. A surplus instance
 with a job is never stopped: it is left installed, reported `retire when idle`, does not fail the apply, and the next
-apply retires it. The plan (no `--apply`) names the instances an apply would retire.
+apply retires it. Surplus instances are retired only after every declared instance applied: when one fails, each
+surplus instance is kept and reported `kept: instances 0-N did not all apply`, because a surplus instance may be the
+member's only live listener (a light mini, 2026-11-16: instances 12 and 13 of 0-13). The plan (no `--apply`) names the
+instances an apply would retire.
 
 ### Dedicated-only members (`runner.dedicatedOnly`)
 

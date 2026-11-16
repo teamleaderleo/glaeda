@@ -357,6 +357,28 @@ class FleetTest(unittest.TestCase):
         self.assertEqual(again.returncode, 0, again.stdout + again.stderr)
         self.assertEqual(json.loads((self.dir / "calls.jsonl.receipts.mini-a").read_text()), [0, 1, 2, 3, 4, 5])
 
+    def test_a_failed_declared_apply_keeps_the_surplus_listeners(self) -> None:
+        """SURPLUS_AFTER_DECLARED: a surplus instance is retired only once every declared instance applied. On a light mini
+        (2026-11-16) instances 12 and 13 were the only live listeners and the plan named them for retirement; an apply
+        whose declared instances failed would have retired them and left the mini listening on none."""
+        manifest = json.loads(json.dumps(MANIFEST))
+        manifest["defaults"]["runner"] = {"classes": {"std": {"runners": 4, "capacityUnits": 14,
+                                                              "gatewayRunners": 2}}}
+        self.manifest.write_text(json.dumps(manifest))
+        seeds = {"FAKE_RECEIPTS": "mini-a=" + ":".join(str(k) for k in range(10)), "FAKE_REGISTER_FAILS": "mini-a"}
+        plan = self.fleet("--hosts", "mini-a", **seeds)
+        row = json.loads(plan.stdout)["members"][0]
+        self.assertIn("when idle, once instances 0-5 apply", row["action"])
+        result = self.fleet("--apply", "--hosts", "mini-a", **seeds)
+        row = json.loads(result.stdout)["members"][0]
+        self.assertEqual(row["action"], "failed")
+        self.assertFalse(any("--uninstall --apply" in c.get("remote", "") for c in self.calls()),
+                         "no surplus instance is retired while a declared one failed")
+        kept = [i for i in row["instances"] if i.get("surplus")]
+        self.assertTrue(kept and all(i["deferred"] for i in kept), kept)
+        self.assertIn("kept: instances 0-5 did not all apply", kept[0]["state"])
+        self.assertEqual(json.loads((self.dir / "calls.jsonl.receipts.mini-a").read_text()), list(range(10)))
+
     def test_an_unregistered_surplus_instance_retires_with_no_token(self) -> None:
         """A surplus instance with no registration (an interrupted install) is removed without a remove token."""
         result = self.fleet("--apply", "--hosts", "mini-a", FAKE_RECEIPTS="mini-a=0:1:2:3:4",

@@ -791,6 +791,22 @@ def surplus_instances(installed: list[int], count: int) -> list[int]:
     return [k for k in installed if k >= count]
 
 
+def _instance_span(count: int) -> str:
+    return "0" if count <= 1 else f"0-{count - 1}"
+
+
+def keep_surplus(member: str, count: int) -> list[dict[str, Any]]:
+    """SURPLUS_AFTER_DECLARED: the surplus instances, each left installed and reported (deferred), when a declared
+    instance did not apply: the next apply retires them once the declared ones are up."""
+    installed, why = installed_pool_instances(member)
+    if installed is None:
+        return [{"instance": None, "exit": None, "surplus": True, "deferred": True,
+                 "state": f"surplus not checked: {why}"}]
+    return [{"instance": k, "exit": None, "surplus": True, "deferred": True, "name": None,
+             "state": f"kept: instances {_instance_span(count)} did not all apply; retire when they do"}
+            for k in surplus_instances(installed, count)]
+
+
 def retire_surplus(member: str, count: int) -> list[dict[str, Any]]:
     """Retire every idle pool instance at or past `count` on `member` (SURPLUS). Each result carries "surplus": True;
     a busy one ("deferred": True) is reported "retire when idle" and left installed. A listing that cannot be read
@@ -944,7 +960,9 @@ def one_member(member: str, summary: dict[str, Any], args: argparse.Namespace, m
             surplus = surplus_instances(installed or [], row["runners"] + row["gatewayRunners"] + row["simRunners"])
             if surplus:
                 row["retire"] = surplus
-                row["action"] += f"; retire surplus instances {surplus} when idle"
+                count = row["runners"] + row["gatewayRunners"] + row["simRunners"]
+                row["action"] += (f"; retire surplus instances {surplus} when idle, once instances "
+                                  f"{_instance_span(count)} apply")
         return row
     if not (eligible or args.include_ineligible):
         row["action"] = "skipped (not eligible)"
@@ -979,7 +997,12 @@ def one_member(member: str, summary: dict[str, Any], args: argparse.Namespace, m
         with concurrent.futures.ThreadPoolExecutor(max_workers=instances) as pool:
             results = list(pool.map(lambda k: apply_instance(member, k, repo, extra, org, group,
                                                              args.migrate_from_repo), range(instances)))
-        results += retire_surplus(member, instances)
+        if all(r["exit"] == 0 for r in results):
+            results += retire_surplus(member, instances)
+        else:
+            # SURPLUS_AFTER_DECLARED: a surplus instance may be the member's only live listener (a light mini, 2026-11-16:
+            # 12 and 13 of 0-13); retiring it while a declared instance failed leaves fewer listeners than either
+            results += keep_surplus(member, instances)
     held = None
     if summary.get("dedicatedOnly") and not all(r["exit"] == 0 for r in results):
         held = "held: pool instances are not all retired; drain the mini and re-run"
