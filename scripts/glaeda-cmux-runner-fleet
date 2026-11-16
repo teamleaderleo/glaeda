@@ -255,6 +255,7 @@ def disk_listener_row(row: dict[str, Any], member: str, summary: dict[str, Any],
         row["diskError"] = why or "disk-shape answered no usable numbers"
         return
     row["disk"] = doc
+    row["diskFloorGib"] = shape.floor_gib  # the floor the count used: the member's minFreeGib wins over the host's
     row["listeners"] = labels.member_listeners(manifest, summary.get("hardware") or "", summary.get("capacityUnits")
                                                or 0, summary.get("reserveCores") or 0, shape)
     row["listenersNoDisk"] = labels.member_listeners(manifest, summary.get("hardware") or "",
@@ -1014,7 +1015,7 @@ def render(rows: list[dict[str, Any]], skipped: dict[str, str], applied: bool, g
             over = " (declared runners exceed it)" if row["listeners"] < row["runners"] else ""
             lines.append(f"      listeners {row['listeners']}{over}: cores/RAM {row['listenersNoDisk']}, disk "
                          f"({disk['free_gib']:g} free + {disk['runners_gib']:g} in runners' _work - "
-                         f"{disk['floor_gib']:g} floor) / {disk['per_runner_gib']:g} GiB per runner "
+                         f"{row['diskFloorGib']:g} floor) / {disk['per_runner_gib']:g} GiB per runner "
                          f"({disk['per_runner_source']})")
         elif row.get("diskError"):
             lines.append(f"      listeners: no disk term ({row['diskError']})")
