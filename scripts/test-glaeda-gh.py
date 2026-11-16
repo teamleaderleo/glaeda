@@ -15137,7 +15137,7 @@ class StaleDataTest(Base):
         reader = os.open(gg.waits_dir() / f"{rid}.fifo", os.O_RDONLY | os.O_NONBLOCK)
         self.addCleanup(os.close, reader)
         # the upstream answers "ok", with its 50-minute-old read of the superseded head (pr_node's a*40)
-        self.put("pr:o/r#9", gg.parse_pr(pr_node(9)), at=time.time() - 3000, source="upstream")
+        self.put("pr:o/r#9", gg.parse_pr(pr_node(9)), at=time.time() - 3000)
         self.daemon.upstream_status = {"state": "ok", "at": time.time()}
         self.assertEqual(self.daemon.stale_explained("pr"), "upstream")
         self.daemon.serve_waits()
