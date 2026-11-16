@@ -8519,11 +8519,14 @@ class GateTest(unittest.TestCase):
                                               long=long_, log=notes.append), [],
                          "past its own bound a lend drain is let go like any waiter")
         self.assertTrue(notes and "pid 81472" in notes[0], notes)
-        # any other waiter keeps the 10 min bound
-        other = hook.bounded_waiters(self.state, [44], now=t0, identity=lambda pid: "b", long=long_)
-        self.assertEqual(other, [44])
-        self.assertEqual(hook.bounded_waiters(self.state, [44], now=t0 + hold + 1, identity=lambda pid: "b",
-                                              long=long_), [])
+        # any other waiter keeps the 10 min bound (read every 60 s, as a polling gate does: a reading after more
+        # than GATE_WAITER_GAP_S starts a new span)
+        t1 = t0 + 2 * hook.GATE_WAITER_GAP_S + lend
+        seen = []
+        for t in range(0, int(hold) + 60, 60):
+            seen.append(hook.bounded_waiters(self.state, [44], now=t1 + t, identity=lambda pid: "b", long=long_))
+        self.assertEqual(seen[0], [44])
+        self.assertEqual(seen[-1], [], "an ordinary waiter is let go past GATE_WAITER_MAX_HOLD_S")
 
     def test_lend_drain_waiters_are_read_from_their_markers(self) -> None:
         waiters = Path(str(self.lock) + ".waiters")
