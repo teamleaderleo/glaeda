@@ -9906,7 +9906,7 @@ class GateTest(unittest.TestCase):
                          "class": "gui", "seconds": 3000, "at": now - 3600 - i})
         return done
 
-    def hold(self, runner: str) -> None:
+    def hold_runner(self, runner: str) -> None:
         self.state.mkdir(exist_ok=True)
         hook.holder_file(self.state, runner).write_text(str(os.getpid()))
 
@@ -9921,7 +9921,7 @@ class GateTest(unittest.TestCase):
         lines.append({"event": "started", "runner": "r1", "workflow_file": "cmux-next-media.yml", "job": "tour",
                       "class": "gui-step", "at": now - 1200})
         log = self.backfill_log(lines)
-        self.hold("r1")
+        self.hold_runner("r1")
         window = hook.backfill_window(self.state, hook.job_log_tail(log), now, drain)
         self.assertIsNotNone(window)
         self.assertAlmostEqual(window[0], 2400, delta=1)
@@ -9949,8 +9949,8 @@ class GateTest(unittest.TestCase):
         lines.append({"event": "started", "runner": "r1", "workflow_file": "cmux-next-media.yml", "job": "tour",
                       "class": "gui-step", "at": now - 60})
         log = self.backfill_log(lines)
-        self.hold("r1")
-        self.hold("r2")
+        self.hold_runner("r1")
+        self.hold_runner("r2")
         window = hook.backfill_window(self.state, hook.job_log_tail(log), now, drain)
         self.assertAlmostEqual(window[0], 0, delta=1, msg="daemon-test (15 min in, p90 10) is the only earlier job")
         self.assertIsNone(hook.drain_backfill(self.state, "r2", drain, now=now, log=log))
@@ -9961,7 +9961,7 @@ class GateTest(unittest.TestCase):
         lines = [{"event": "started", "runner": "r1", "workflow_file": "cmux-next-media.yml", "job": "tour",
                   "class": "gui-step", "at": now - 600}]
         log = self.backfill_log(lines)
-        self.hold("r1")
+        self.hold_runner("r1")
         needs = self.tmp / "needs.json"
         stamp = datetime.datetime.fromtimestamp(now - 3600, datetime.timezone.utc).isoformat()
         doc = {"schema": hook.JOB_NEEDS_SCHEMA, "generated_at": stamp, "min_samples": 20, "hosts": ["elsewhere"],

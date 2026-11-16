@@ -10046,7 +10046,7 @@ class Gate:
                 if self.backfill_noted != drains:
                     gate_log(f"a drain waits for the host (pid {min(drains)}); listening beside it: {why}")
                 self.backfill_noted = drains
-                waiting -= drains
+                waiting = waiting - drains
             else:
                 self.backfill_noted = set()
         return waiting
