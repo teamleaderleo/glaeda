@@ -247,6 +247,7 @@ import shlex
 import shutil
 import signal
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
@@ -1202,7 +1203,12 @@ def write_json(path: Path, doc: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     tmp = path.with_name(f".{path.name}.{os.getpid()}.{time.monotonic_ns()}.tmp")
     try:
-        tmp.write_text(json.dumps(doc, sort_keys=True) + "\n")
+        # Created 0600, then given the target's own mode: a replace with the umask's mode turned a 0600 file into
+        # 0644 (leo-workspace#5398's BLOCK). A new file stays 0600.
+        with os.fdopen(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w") as handle:
+            with contextlib.suppress(FileNotFoundError):
+                os.fchmod(handle.fileno(), stat.S_IMODE(os.stat(path).st_mode))
+            handle.write(json.dumps(doc, sort_keys=True) + "\n")
         os.replace(tmp, path)
     except BaseException:
         # A write cut off (a full disk, or a deadline's exception raised into it) left its empty temporary file behind
@@ -1817,6 +1823,15 @@ def on_event_state() -> dict:
     doc = doc if isinstance(doc, dict) else {}
     runs, pending = doc.get("runs"), doc.get("pending")
     return {"runs": runs if isinstance(runs, dict) else {}, "pending": pending if isinstance(pending, dict) else {}}
+
+
+def on_event_stat() -> tuple | None:
+    """on-event.json's identity and change stamp; None when it does not exist."""
+    try:
+        st = (BASE / ON_EVENT_STATE).stat()
+    except OSError:
+        return None
+    return (st.st_ino, st.st_size, st.st_mtime_ns)
 
 
 def on_event_key(hook: str, repo: str, run_id: Any, attempt: Any) -> str:
@@ -2567,6 +2582,8 @@ class Daemon:
         self.fed_repos: dict[str, float] = {}  # owner/repo (lowercase) -> the last event the feed delivered for it
         self.on_event_procs: dict[str, subprocess.Popen] = {}  # on-event commands started and not reaped yet, by key
         self.on_event_pending: bool | None = None  # whether on-event.json holds runs to resolve (None: not read yet)
+        self.on_event_seen: tuple | None = None  # on-event.json's stat when on_event_pending was learned
+        self.on_event_kept: list[dict] = []  # matching runs a busy state lock held back: the cursor is past them
         self.on_event_problems: set[str] = set()  # config problems already logged
         self.gql_reason = "other"  # what the GraphQL query being sent reads, for daemon.json graphqlBy
         self.gql_log: list[tuple[float, str, int]] = []  # (time, reason, points) per GraphQL query, last hour
@@ -6164,20 +6181,26 @@ class Daemon:
         `given` (replay) holds job lists by on_event_key, in place of the controller's; `rest_now` asks GitHub at
         once when neither holds the job."""
         self.on_event_reap()
-        runs = [r for p in pages for r in (p.get("runs") or []) if isinstance(r, dict) and r.get("status") == "completed"]
-        if not runs and self.on_event_pending is False:
+        runs = self.on_event_kept + [
+            r for p in pages for r in (p.get("runs") or []) if isinstance(r, dict) and r.get("status") == "completed"]
+        if not runs and self.on_event_idle():
             return
         hooks, problems = on_event_hooks()
         for problem in problems:
             if problem not in self.on_event_problems:
                 self.on_event_problems.add(problem)
                 log({"event": "on-event", "refused": problem})
-        if not hooks and self.on_event_pending is False:
+        if not hooks and self.on_event_idle():
             return  # nothing configured, nothing left over: a stat of the config per feed read is all it costs
+        runs = [r for r in runs if any(on_event_matches(h, r) for h in hooks)]
         BASE.mkdir(parents=True, exist_ok=True, mode=0o700)
         with bounded_lock(BASE / ".on-event.lock") as held:
             if not held:
-                return  # a replay holds it: the pending runs are retried at the next feed read
+                # a replay holds it, and the feed cursor is already past these runs: keep them for the next tick
+                # (#2020 F1); the pending runs on disk are retried then too
+                self.on_event_kept = runs[-ON_EVENT_RUNS_MAX:]
+                return
+            self.on_event_kept = []
             state = on_event_state()
             before = json.dumps(state, sort_keys=True)
             by_name = {h["name"]: h for h in hooks}
@@ -6191,6 +6214,8 @@ class Daemon:
                     state["pending"][key] = {"hook": hook["name"], "since": self.now, "run": {
                         k: run.get(k) for k in ("id", "repo", "attempt", "head_sha", "head_branch", "conclusion", "url")}}
             for key in sorted(state["pending"]):
+                if given is None and time.monotonic() >= self.tick_deadline:
+                    break  # a slow controller used up the tick: the rest stay pending, written below (#2020 F3)
                 hook = by_name.get(state["pending"][key].get("hook"))
                 if hook is None:
                     self.on_event_finish(state, key, "unresolved", why="the hook is no longer configured")
@@ -6200,6 +6225,11 @@ class Daemon:
                 on_event_prune(state, self.now)
                 write_json(BASE / ON_EVENT_STATE, state)
             self.on_event_pending = bool(state["pending"])
+            self.on_event_seen = on_event_stat()
+
+    def on_event_idle(self) -> bool:
+        """Nothing pending, as of a state file nobody has changed since (a replay writes it too: #2020 F4)."""
+        return self.on_event_pending is False and not self.on_event_kept and self.on_event_seen == on_event_stat()
 
     def on_event_finish(self, state: dict, key: str, outcome: str, **fields: Any) -> dict:
         p = state["pending"].pop(key, {})
@@ -6250,8 +6280,10 @@ class Daemon:
             if job is not None:
                 return job
         waited = self.now - float(p.get("since") or self.now)
-        if p.get("restTried") or not (rest_now or waited >= ON_EVENT_REST_AFTER) or self.mode("rest") == "stop":
+        if p.get("restTried") or not (rest_now or waited >= ON_EVENT_REST_AFTER):
             return None
+        if self.mode("rest") == "stop" or not self.rest_room(1):
+            return None  # past the daemon's share the mode is only lean: wait for room, restTried unset (#2020 F2)
         p["restTried"] = self.now
         with self.calling("on-event", repo):
             got, doc, _ = self.get(f"/repos/{repo}/actions/runs/{run_id}/attempts/{attempt}/jobs?per_page=100", None)
