@@ -8499,6 +8499,43 @@ class GateTest(unittest.TestCase):
         # another pid on the same host has its own span
         self.assertEqual(self.waited(t0, 2 * hold + waive + 2, 2 * hold + waive + 2, (77, 88)), [88])
 
+    def test_a_lend_drain_waiter_is_held_long_enough_for_the_running_jobs_to_end(self) -> None:
+        # 2026-11-16, cmuxs-mac-mini-6: the controller drained the mini for a waiting gui-session measurement. The
+        # worker's lend-drain waiter (pid 81472, marker 81472-refresh-lend_drain-..., refreshed every 5 s) stood
+        # without a break from 04:57:56Z, but every gate let it go after GATE_WAITER_MAX_HOLD_S (10 min): the
+        # runners took new PR jobs (daemon tests run 18-24 min) before the host went idle, so the drain never
+        # reached idle and 15+ measurements queued from 02:37Z never started. A lend drain holds its own bound,
+        # GATE_LEND_DRAIN_MAX_HOLD_S, long enough for the jobs running at its start to end.
+        lend, hold = hook.GATE_LEND_DRAIN_MAX_HOLD_S, hook.GATE_WAITER_MAX_HOLD_S
+        self.assertGreaterEqual(lend, 45 * 60, "a lend drain outlasts a whole daemon test that was running at its start")
+        t0 = 3_000_000.0
+        long_ = {81472}
+        out = []
+        for t in range(0, int(lend) - 60, 30):
+            out = hook.bounded_waiters(self.state, [81472], now=t0 + t, identity=lambda pid: "w", long=long_)
+            self.assertEqual(out, [81472], f"still honoured {t / 60:.0f} min into the drain")
+        notes: list[str] = []
+        self.assertEqual(hook.bounded_waiters(self.state, [81472], now=t0 + lend + 1, identity=lambda pid: "w",
+                                              long=long_, log=notes.append), [],
+                         "past its own bound a lend drain is let go like any waiter")
+        self.assertTrue(notes and "pid 81472" in notes[0], notes)
+        # any other waiter keeps the 10 min bound
+        other = hook.bounded_waiters(self.state, [44], now=t0, identity=lambda pid: "b", long=long_)
+        self.assertEqual(other, [44])
+        self.assertEqual(hook.bounded_waiters(self.state, [44], now=t0 + hold + 1, identity=lambda pid: "b",
+                                              long=long_), [])
+
+    def test_lend_drain_waiters_are_read_from_their_markers(self) -> None:
+        waiters = Path(str(self.lock) + ".waiters")
+        waiters.mkdir()
+        for name in ("81472-refresh-lend_drain-1794805076019383000", "81473-refresh-build-1",
+                     "81474-refresh-lend_drain-1"):
+            (waiters / name).touch()
+        old = time.time() - 60
+        os.utime(waiters / "81474-refresh-lend_drain-1", (old, old))  # stale: its worker stopped refreshing
+        with mock.patch.object(hook, "pid_alive", return_value=True):
+            self.assertEqual(hook.lend_drain_waiters(os.fspath(self.lock)), {81472})
+
     def test_replay_a_worker_waiting_for_over_an_hour_is_bounded(self) -> None:
         # 2026-10-26, a std mini: the fleet worker (one pid) waited for host.lock from 22:19Z, taking it now and then
         # only to hand its build back for disk (2 to 12 min a try) and wait again. Every gate held its listener off
