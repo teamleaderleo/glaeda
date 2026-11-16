@@ -15161,6 +15161,8 @@ class StaleDataTest(Base):
         self.assertIn("direct read answered", said.getvalue())
         self.assertNotIn("glaeda-gh restart", said.getvalue())
         self.assertIn("pulls/9", served)
+        # GET branches/B through the broker is git's tip with no protection (and hung on 2026-11-16): never asked
+        self.assertEqual([p for p in served if p.startswith("branches/")], [], served)
         self.assertEqual([c for c in self.gh.calls if c[1].endswith("/graphql")], [], "a GraphQL read the broker refuses")
         self.assertEqual(gg.read_cache("pr:o/r#9")["data"]["headRefOid"], new)
 

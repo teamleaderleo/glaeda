@@ -1574,6 +1574,13 @@ def direct_command() -> list[str] | None:
     return None
 
 
+def prior_required(entry: dict) -> set:
+    """The checks a cached PR entry's data calls required: flagged on a check, or named as missing or unread."""
+    before = entry.get("data") or {}
+    required = {c.get("name") for c in before.get("checks") or [] if c.get("required")}
+    return required | set(before.get("requiredMissing") or []) | set(before.get("requiredUnread") or [])
+
+
 def broker_transport(command: list[str], deadline: Callable[[], float]) -> Callable:
     """A Daemon transport for an upstream host's direct read: each GET of /repos/OWNER/REPO/PATH goes to COMMAND
     (direct_command) as `OWNER/REPO -` with {"path", "query"} on stdin, within what is left of DEADLINE (a
@@ -2622,6 +2629,9 @@ class Daemon:
     def __init__(self, transport: Callable = http, token: Callable[[], str] = gh_token,
                  controller: Any = "env", upstream: Any = "config") -> None:
         self.transport = transport
+        # False for an upstream host's direct read: the lane-gh broker answers GET branches/B from git (the tip, no
+        # protection, and on 2026-11-16 no answer within 60 s), so fetch_pr_rest takes GraphQL's last word instead.
+        self.reads_protection = True
         # "config" re-reads UPSTREAM_CONFIG every tick, so writing or removing it switches the mode
         # without a restart; a test passes a callable (request -> answer) or None.
         self.upstream_source = upstream
@@ -5937,14 +5947,17 @@ class Daemon:
             # a deleted base (a stacked PR's, after its merge) has no requirements left to read
             rules, protection = f"{root}/rules/branches/{base}?per_page=100", f"{root}/branches/{base}"
             required = set(self.repo_part(old, parts, rules, slim_rules, []))
-            required |= set(self.repo_part(old, parts, protection, slim_branch, []))
-            if parts[rules].get("unavailable") and parts[protection].get("unavailable"):
+            if not self.reads_protection:
+                # The base's classic protection is not read here (reads_protection): the checks GraphQL last
+                # called required stay required, beside the rulesets' read now.
+                required |= prior_required(prior)
+            else:
+                required |= set(self.repo_part(old, parts, protection, slim_branch, []))
+            if self.reads_protection and parts[rules].get("unavailable") and parts[protection].get("unavailable"):
                 # A private repository on a plan without either feature: GitHub enforces no required check there,
                 # so none is the true answer. GraphQL's last word is kept all the same (it can name a rule that
                 # predates a plan change); a first read with no GraphQL answer has none, and none is enforced.
-                before = prior.get("data") or {}
-                required = {c.get("name") for c in before.get("checks") or [] if c.get("required")}
-                required |= set(before.get("requiredMissing") or []) | set(before.get("requiredUnread") or [])
+                required = prior_required(prior)
         except WatchError as error:
             message = f"rest: {error}"
             self.errors.append(f"{e['key']}: {message}")
@@ -8169,6 +8182,7 @@ def direct_read(req: dict) -> str | None:
         if broker is not None:
             daemon = Daemon(transport=broker_transport(broker, lambda: daemon.tick_deadline), token=lambda: "",
                             controller=None, upstream=None)
+            daemon.reads_protection = False
         else:
             daemon = Daemon(controller=None, upstream=None)
     except Exception as failure:  # noqa: BLE001  a fallback read never stops the wait
