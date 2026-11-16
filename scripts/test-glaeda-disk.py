@@ -6543,7 +6543,11 @@ class GlaedaDiskTest(unittest.TestCase):
         make(work / "other/other")
         (work / "other/other/.git").write_text("gitdir: /elsewhere\n")
         make(work / "_temp/_temp")  # the runner's own folders are never a workspace
-        self.assertEqual(gd.runner_gitless_workspaces(work), [])
+        # a checkout one or two levels down (actions/checkout `path:`) keeps the tree for git to judge
+        (work / "cmux/cmux/trusted/.git").mkdir(parents=True)
+        (work / "hq/hq/a/tools/.git").mkdir(parents=True)
+        make(work / "gone/gone/Build")
+        self.assertEqual(gd.runner_gitless_workspaces(work), [work / "gone/gone"])
 
     def test_idle_runner_checkouts_of_busy_runners_go_between_jobs(self) -> None:
         """cmuxs-mac-mini-6, 2026-10-21: light jobs kept every runner busy at least hourly, so under the floor

@@ -2768,18 +2768,39 @@ def runner_checkout_builds(work: Path) -> list[Path]:
 # runner_checkouts never listed it, so no family and no idle-checkout pass ever took it. cmux18, 2026-11-16: two such
 # trees of 13-14 GiB (runners glaeda-2 and glaeda-10, idle 6-15 h) at 17 GiB free under the 30 GiB runner floor,
 # while the gate held both listeners for want of that space. Git holds nothing there, and actions/checkout deletes a
-# non-repository directory's contents before it clones, so it goes as an idle runner checkout does.
+# non-repository directory's contents before it clones, so it goes as an idle runner checkout does. A tree holding a
+# checkout one or two levels down (actions/checkout's `path:`, e.g. trusted/ or .rerun-tools/) is not one: that
+# checkout's git state is never judged here, so the tree stays.
 def runner_gitless_workspaces(work: Path) -> list[Path]:
-    """Each _work/<repo>/<repo> directory with no .git entry at all (not a file, link or directory)."""
+    """Each _work/<repo>/<repo> directory with no .git entry at all (not a file, link or directory), in it or in
+    any directory one or two levels below it."""
     out = []
     for repo in _children(work):
         if repo.name.startswith("_") or repo.is_symlink() or not repo.is_dir():
             continue
         tree = repo / repo.name
         if (not tree.is_symlink() and tree.is_dir() and not os.path.lexists(tree / ".git")
-                and contained_directory(tree, work)):
+                and contained_directory(tree, work) and not nested_git_entry(tree)):
             out.append(tree)
     return sorted(out)
+
+
+def nested_git_entry(tree: Path) -> bool:
+    """Whether a directory one or two levels below TREE (not following links) has a .git entry, or a level of it
+    cannot be listed."""
+    level = [tree]
+    for _ in range(2):
+        below = []
+        for d in level:
+            try:
+                with os.scandir(d) as it:
+                    below += [Path(e.path) for e in it if e.is_dir(follow_symlinks=False)]
+            except OSError:
+                return True
+        if any(os.path.lexists(d / ".git") for d in below):
+            return True
+        level = below
+    return False
 
 
 def runner_git_garbage(work: Path) -> list[Path]:
