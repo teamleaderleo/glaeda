@@ -10,7 +10,12 @@ glaeda-projects tidy --apply
 ```
 
 `scripts/glaeda-mini-setup --apply` installs these into `~/.local/bin` (`--hygiene-only` on a
-developer machine, which defaults to the `devbox` role).
+developer machine, which defaults to the `devbox` role). A hygiene or `--gh-only` install with no
+glaeda runner that was never a build host is `devbox` even where an earlier release recorded
+`fleet-mini` for it (those releases migrated every role-less hygiene receipt to `fleet-mini` and kept
+it); the next OTA setup run moves it. Only an explicit `--role fleet-mini`, kept in update.json's
+setupArgs, keeps such a host on `fleet-mini`. A host moved this way gets the devbox disk policy but not
+the daily Projects tidy agent, which moves checkouts; `--role devbox` opts it in.
 
 `fleet-mini` retains the existing cmux hot-tier policy. `devbox` adds safe cleanup for stale
 developer worktrees, `/tmp`, Xcode DerivedData, SwiftPM `.build`, Ghostty `.zig-cache`, and

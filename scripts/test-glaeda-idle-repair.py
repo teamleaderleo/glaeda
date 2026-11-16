@@ -60,18 +60,100 @@ class IdleRepairTest(unittest.TestCase):
     def test_successful_repair_waits_until_next_attempt(self) -> None:
         disk = mock.Mock()
         disk.host_busy.return_value = ""
-        with mock.patch.object(idle, "load_disk_module", return_value=disk), \
+        with mock.patch.object(idle, "load_disk_module", return_value=disk) as load, \
              mock.patch.object(idle, "run", side_effect=[(0, "disk ok", ""), (0, "health ok", "")]) as run, \
              mock.patch.object(idle.time, "time", side_effect=[1000, 1001]):
             self.assertEqual(idle.main(["--apply"]), 0)
             self.assertEqual(idle.main(["--apply"]), 0)
         self.assertEqual(run.call_count, 2)
+        self.assertEqual(load.call_count, 1, "the not-due tick never loads glaeda-disk")
+
+    def test_tick_before_next_attempt_loads_nothing_and_keeps_the_schedule(self) -> None:
+        """14 of 15 ticks are not due: they must not import glaeda-disk (~730 KB) or run its host gate, and a
+        busy host must not turn the 15-minute schedule into "queued, due in 60 s"."""
+        idle.write_state({"state": "idle", "lastAttemptAt": 1000, "nextAttemptAt": 1900})
+        before = idle.STATE.read_bytes()
+        with mock.patch.object(idle, "load_disk_module") as load, \
+             mock.patch.object(idle, "run") as run, \
+             mock.patch.object(idle.time, "time", return_value=1500):
+            self.assertEqual(idle.main(["--apply"]), 0)
+        load.assert_not_called()
+        run.assert_not_called()
+        self.assertEqual(idle.STATE.read_bytes(), before)
+        self.assertFalse(idle.RECEIPT.exists())
+
+    def test_queued_repair_is_due_on_the_next_tick_despite_launchd_jitter(self) -> None:
+        disk = mock.Mock()
+        disk.host_busy.side_effect = ["a build is running", ""]
+        with mock.patch.object(idle, "load_disk_module", return_value=disk), \
+             mock.patch.object(idle, "run", side_effect=[(0, "disk ok", ""), (0, "health ok", "")]) as run, \
+             mock.patch.object(idle.time, "time", side_effect=[1000, 1059]):
+            self.assertEqual(idle.main(["--apply"]), idle.QUEUED_EXIT)
+            self.assertEqual(idle.main(["--apply"]), 0)
+        self.assertEqual(disk.host_busy.call_count, 2)
+        self.assertEqual(run.call_count, 2)
+        self.assertEqual(json.loads(idle.STATE.read_text())["nextAttemptAt"], 1059 + 900)
+
+    def test_timed_out_repair_waits_a_full_interval_after_it_was_stopped(self) -> None:
+        disk = mock.Mock()
+        disk.host_busy.return_value = ""
+        with mock.patch.object(idle, "load_disk_module", return_value=disk), \
+             mock.patch.object(idle, "run", return_value=(idle.TIMED_OUT, "", "timed out")), \
+             mock.patch.object(idle.time, "time", return_value=1000):
+            self.assertEqual(idle.main(["--apply"]), 1)
+        state = json.loads(idle.STATE.read_text())
+        self.assertEqual((state["state"], state["nextAttemptAt"]), ("retry", 1000 + 660 + idle.REPAIR_EVERY_S))
+
+    def test_other_failure_retries_on_the_next_tick(self) -> None:
+        disk = mock.Mock()
+        disk.host_busy.return_value = ""
+        with mock.patch.object(idle, "load_disk_module", return_value=disk), \
+             mock.patch.object(idle, "run", return_value=(1, "", "boom")), \
+             mock.patch.object(idle.time, "time", return_value=1000):
+            self.assertEqual(idle.main(["--apply"]), 1)
+        self.assertEqual(json.loads(idle.STATE.read_text())["nextAttemptAt"], 1000 + idle.RETRY_AFTER_S)
 
     def test_status_is_read_only(self) -> None:
         idle.write_state({"state": "queued", "reason": "reservation"})
         with mock.patch.object(idle, "load_disk_module") as load:
             self.assertEqual(idle.main(["--status"]), 0)
         load.assert_not_called()
+
+
+class RunTest(unittest.TestCase):
+    def test_timeout_stops_the_whole_process_group(self) -> None:
+        """A timed-out repair's children (glaeda-disk's git and du) stop with it; only the group run() made."""
+        import os
+        import sys
+        import time
+        with tempfile.TemporaryDirectory() as tmp:
+            pid_file = Path(tmp) / "child.pid"
+            script = ("import subprocess, sys, time\n"
+                      "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])\n"
+                      f"open({str(pid_file)!r}, 'w').write(str(child.pid))\n"
+                      "time.sleep(60)\n")
+            started = time.monotonic()
+            code, _, err = idle.run([sys.executable, "-c", script], timeout=2)
+            self.assertEqual((code, err), (idle.TIMED_OUT, "timed out"))
+            self.assertLess(time.monotonic() - started, 20)
+            child = int(pid_file.read_text())
+            import subprocess
+            for _ in range(50):
+                try:
+                    os.kill(child, 0)
+                except ProcessLookupError:
+                    break
+                stat = subprocess.run(["ps", "-o", "stat=", "-p", str(child)], capture_output=True, text=True).stdout
+                if not stat.strip() or stat.strip().startswith("Z"):  # a zombie a container's pid 1 never reaps
+                    break
+                time.sleep(0.1)
+            else:
+                self.fail(f"grandchild {child} outlived the timed-out repair")
+
+    def test_output_and_exit_are_returned(self) -> None:
+        import sys
+        code, out, err = idle.run([sys.executable, "-c", "import sys; print('ok'); sys.stderr.write('e'); sys.exit(3)"], 30)
+        self.assertEqual((code, out, err), (3, "ok\n", "e"))
 
 
 class LoadDiskModuleTest(unittest.TestCase):

@@ -275,7 +275,7 @@ class Context:
                  platform_name: str | None = None, ota_ring: str | None = None,
                  ota_source: str | None = None, role: str = "devbox",
                  role_explicit: bool = False, headless: bool = False, gh_only: bool = False,
-                 profile_flag: str | None = None) -> None:
+                 profile_flag: str | None = None, projects_tidy: bool = True) -> None:
         self.home = home
         self.platform = platform_name or HOST_PLATFORM
         self.gh_only = gh_only
@@ -314,6 +314,8 @@ class Context:
         self.ota_source = ota_source
         self.role = role
         self.role_explicit = role_explicit
+        # the devbox daily Projects tidy (it moves checkouts); see resolve_role for who gets it
+        self.projects_tidy = projects_tidy
         self.update_config = home / ".config/glaeda/update.json"
 
     def show(self, path: Path | str) -> str:
@@ -1116,7 +1118,7 @@ def agent_plists(ctx: Context) -> dict[str, dict[str, Any]]:
             "StandardErrorPath": os.fspath(ctx.logs / "glaeda-gh.err"),
         },
     }
-    if ctx.role == "devbox":
+    if ctx.role == "devbox" and ctx.projects_tidy:
         agents[LABEL_PREFIX + "projects-tidy"] = {
             "Label": LABEL_PREFIX + "projects-tidy",
             "ProgramArguments": [python, os.fspath(ctx.bin / "glaeda-projects"), "tidy", "--apply"],
@@ -1147,9 +1149,13 @@ RUNNER_ONLY_AGENTS = frozenset(LABEL_PREFIX + name for name in (
 
 def has_glaeda_runner(ctx: Context) -> bool:
     """A glaeda runner directory here, registered (.runner) or hooked (glaeda-hooks), as glaeda-cmux-runner makes."""
+    return glaeda_runner_present(ctx.home)
+
+
+def glaeda_runner_present(home: Path) -> bool:
     try:
         return any((runner / ".runner").is_file() or (runner / "glaeda-hooks").is_dir()
-                   for runner in ctx.home.glob("actions-runner-glaeda*"))
+                   for runner in home.glob("actions-runner-glaeda*"))
     except OSError:
         return True  # unreadable: keep the agents, which gate themselves
 
@@ -1164,7 +1170,8 @@ def agent_names(ctx: Context) -> list[str]:
                 and (runner_only_ok or label not in RUNNER_ONLY_AGENTS)]
     if ctx.gh_only:
         return [name for name in LINUX_UNITS if name in GH_ONLY_LINUX_UNITS]
-    return [name for name in LINUX_UNITS if ctx.role == "devbox" or name not in DEVBOX_LINUX_UNITS]
+    return [name for name in LINUX_UNITS
+            if (ctx.role == "devbox" and ctx.projects_tidy) or name not in DEVBOX_LINUX_UNITS]
 
 
 def stale_agent_actions(ctx: Context, desired: set[str], owned: dict[str, str | None]) -> list[dict[str, Any]]:
@@ -1726,11 +1733,12 @@ def plan_uninstall(ctx: Context) -> list[dict[str, Any]]:
     if recorded_role in {"devbox", "fleet-mini"}:
         roles.add(recorded_role)
     labels: set[str] = set()
-    original_role = ctx.role
+    original_role, original_tidy = ctx.role, ctx.projects_tidy
+    ctx.projects_tidy = True  # an earlier install may have had the tidy agent
     for role in roles:
         ctx.role = role
         labels.update(agent_names(ctx))
-    ctx.role = original_role
+    ctx.role, ctx.projects_tidy = original_role, original_tidy
     # and every agent the receipt owns, so one agent_names() no longer lists (a runner-only agent on a host
     # whose glaeda runner is gone) is still removed with its tool
     labels.update(a["label"] for a in (receipt or {}).get("actions", [])
@@ -2291,6 +2299,40 @@ def run_runner_mode(argv: list[str]) -> int:
     return module.main(argv)
 
 
+def resolve_role(explicit: str | None, hygiene: bool, prior: dict[str, Any] | None,
+                 runner: bool) -> tuple[str, bool]:
+    """(role, install the devbox Projects tidy agent) for this run.
+
+    An explicit --role always wins (OTA reruns carry it in update.json setupArgs). A hygiene or --gh-only
+    install that was never a build host and has no glaeda runner is a personal machine, so it is devbox, even
+    where an earlier release recorded fleet-mini for it: that release migrated every role-less hygiene receipt
+    to fleet-mini and then kept it forever, so Leo's desktop ran the fleet disk policy (git ls-files over every
+    ~/Projects checkout, fleet-only families) every 15 minutes. A build host, and a hygiene host with a glaeda
+    runner (a headless runner Mac), keep the recorded role as before.
+
+    The tidy agent moves checkouts within ~/Projects, so a host that ran fleet-mini until now does not get it
+    by this migration; `--role devbox` (or a host that was devbox from the start) does.
+    """
+    prior = prior or {}
+    recorded = prior.get("role") if prior.get("role") in {"devbox", "fleet-mini"} else None
+    if recorded is None and prior.get("profile") in {"build-host", "hygiene"}:
+        # Before roles were recorded, both profiles used the fleet-style disk policy.
+        recorded = "fleet-mini"
+    if explicit:
+        role = explicit
+    elif hygiene and prior.get("profile") in {None, "hygiene", "gh"} and not runner:
+        role = "devbox"
+    else:
+        role = recorded or ("devbox" if hygiene else "fleet-mini")
+    if role != "devbox":
+        return role, False
+    if explicit == "devbox":
+        return role, True
+    if isinstance(prior.get("projectsTidy"), bool):
+        return role, prior["projectsTidy"]
+    return role, recorded != "fleet-mini"
+
+
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     if "--runner" in argv:
@@ -2302,19 +2344,12 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     min_free_gib = args.min_free_gib if args.min_free_gib is not None else fleet.default_min_free_gib(HOST_PLATFORM)
     home = Path(os.environ.get("HOME") or pwd.getpwuid(os.getuid()).pw_dir)
-    recorded_role = None
     try:
         prior = json.loads((home / ".local/state/glaeda/mini-setup/receipt.json").read_text())
-        if isinstance(prior, dict):
-            recorded_role = prior.get("role") if prior.get("role") in {"devbox", "fleet-mini"} else None
-            if recorded_role is None and prior.get("profile") in {"build-host", "hygiene"}:
-                # Before roles were recorded, both profiles used the fleet-style disk policy.
-                # Keep that policy on upgrade; opting into devbox requires --role devbox.
-                recorded_role = "fleet-mini"
     except (OSError, ValueError, TypeError):
-        pass
-    role = args.role or recorded_role or (
-        "devbox" if args.hygiene_only or args.gh_only or HOST_PLATFORM == "linux" else "fleet-mini")
+        prior = None
+    role, projects_tidy = resolve_role(args.role, args.hygiene_only or args.gh_only or HOST_PLATFORM == "linux",
+                                       prior if isinstance(prior, dict) else None, glaeda_runner_present(home))
     ctx = Context(home, args.apply, args.python,
                   args.skip_launchctl, args.reclaim_binary,
                   args.cmux_root.expanduser().resolve() if args.cmux_root else None,
@@ -2323,7 +2358,8 @@ def main(argv: list[str] | None = None) -> int:
                   ota_source=args.ota_source, role=role,
                   role_explicit=args.role is not None,
                   headless=args.headless, gh_only=args.gh_only,
-                  profile_flag="--gh-only" if args.gh_only else "--hygiene-only" if args.hygiene_only else None)
+                  profile_flag="--gh-only" if args.gh_only else "--hygiene-only" if args.hygiene_only else None,
+                  projects_tidy=projects_tidy)
     pre = preflight(ctx)
     if ctx.hygiene_only:  # build-host checks are reported, not enforced
         blocking_checks = HYGIENE_BLOCKING | ({"headlessSudo"} if args.headless else set())
@@ -2348,6 +2384,7 @@ def main(argv: list[str] | None = None) -> int:
         "mode": "uninstall" if args.uninstall else "install",
         "profile": "gh" if ctx.gh_only else "hygiene" if ctx.hygiene_only else "build-host",
         "role": ctx.role,
+        "projectsTidy": ctx.role == "devbox" and ctx.projects_tidy,
         "platform": ctx.platform,
         "applied": args.apply,
         "at": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),

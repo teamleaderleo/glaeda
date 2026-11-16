@@ -779,13 +779,84 @@ class MiniSetupTest(unittest.TestCase):
         self.assertEqual(receipt["role"], "fleet-mini")
         self.assertFalse((self.home / "Library/LaunchAgents/com.teamleaderleo.glaeda.projects-tidy.plist").exists())
 
-    def test_legacy_hygiene_receipt_preserves_fleet_role(self) -> None:
+    def test_legacy_hygiene_receipt_becomes_devbox_without_projects_tidy(self) -> None:
         receipt_path = self.home / ".local/state/glaeda/mini-setup/receipt.json"
         receipt_path.parent.mkdir(parents=True, exist_ok=True)
         receipt_path.write_text(json.dumps({"profile": "hygiene"}))
         receipt = self.invoke("--hygiene-only", "--apply")
-        self.assertEqual(receipt["role"], "fleet-mini")
+        self.assertEqual((receipt["role"], receipt["projectsTidy"]), ("devbox", False))
         self.assertFalse((self.home / "Library/LaunchAgents/com.teamleaderleo.glaeda.projects-tidy.plist").exists())
+
+    def test_hygiene_host_recorded_as_fleet_mini_converges_to_devbox(self) -> None:
+        """A personal Mac an earlier release recorded as fleet-mini (cosmic-gray, 2026-11-16: idle-repair ran
+        `glaeda-disk --role fleet-mini` every 15 minutes) moves to devbox on the next OTA setup run, with
+        update.json's setupArgs ["--hygiene-only"], keeps every agent it had, and a rerun rewrites nothing."""
+        agents = self.home / "Library/LaunchAgents"
+        with mock.patch.object(ms, "resolve_role", lambda *a: ("fleet-mini", False)):
+            self.invoke("--hygiene-only", "--apply")  # what the earlier release installed
+        before_labels = {p.name for p in agents.glob("*.plist")}
+        repair = plistlib.loads((agents / "com.teamleaderleo.glaeda.idle-repair.plist").read_bytes())
+        self.assertEqual(repair["EnvironmentVariables"]["GLAEDA_ROLE"], "fleet-mini")
+        receipt_path = self.home / ".local/state/glaeda/mini-setup/receipt.json"
+        old = json.loads(receipt_path.read_text())
+        self.assertEqual(old.pop("role"), "fleet-mini")
+        old.pop("projectsTidy")  # the earlier release did not record it
+        receipt_path.write_text(json.dumps({**old, "role": "fleet-mini"}))
+
+        receipt = self.invoke("--hygiene-only", "--apply")
+        self.assertEqual((receipt["role"], receipt["projectsTidy"]), ("devbox", False))
+        self.assertEqual({p.name for p in agents.glob("*.plist")}, before_labels, "no agent gained or lost")
+        for label in ("idle-repair", "disk-pressure"):
+            doc = plistlib.loads((agents / f"com.teamleaderleo.glaeda.{label}.plist").read_bytes())
+            self.assertEqual(doc["EnvironmentVariables"]["GLAEDA_ROLE"], "devbox", label)
+        for label in ("local-guard", "worktree-reclaim", "disk-dedupe", "gh-watch", "update"):
+            self.assertTrue((agents / f"com.teamleaderleo.glaeda.{label}.plist").is_file(), label)
+        changed = {a["label"]: a["state"] for a in receipt["actions"] if a["kind"] == "agent" and a["state"] != "unchanged"}
+        self.assertEqual(changed, {"com.teamleaderleo.glaeda.idle-repair": "update",
+                                   "com.teamleaderleo.glaeda.disk-pressure": "update"})
+
+        before = self.tree()
+        again = self.invoke("--hygiene-only", "--apply")
+        self.assertEqual(again["role"], "devbox")
+        self.assertEqual({a["state"] for a in again["actions"] if a["kind"] == "agent"}, {"unchanged"})
+        after = self.tree()
+        for tree in (before, after):
+            tree.pop(".local/state/glaeda/mini-setup/receipt.json")
+        self.assertEqual(before, after)
+
+    def test_hygiene_runner_host_and_explicit_fleet_mini_keep_fleet_mini(self) -> None:
+        receipt_path = self.home / ".local/state/glaeda/mini-setup/receipt.json"
+        receipt_path.parent.mkdir(parents=True, exist_ok=True)
+        receipt_path.write_text(json.dumps({"profile": "hygiene", "role": "fleet-mini"}))
+        (self.home / "actions-runner-glaeda/glaeda-hooks").mkdir(parents=True)
+        self.assertEqual(self.invoke("--hygiene-only", "--apply")["role"], "fleet-mini")
+        (self.home / "actions-runner-glaeda/glaeda-hooks").rmdir()
+        receipt = self.invoke("--hygiene-only", "--role=fleet-mini", "--apply")
+        self.assertEqual(receipt["role"], "fleet-mini")
+        update = json.loads((self.home / ".config/glaeda/update.json").read_text())
+        self.assertIn("--role=fleet-mini", update["setupArgs"])
+        self.assertEqual(self.invoke("--hygiene-only", "--role=fleet-mini", "--apply")["role"], "fleet-mini")
+
+    def test_resolve_role(self) -> None:
+        hygiene, fleet = {"profile": "hygiene"}, {"profile": "hygiene", "role": "fleet-mini"}
+        cases = [
+            # (explicit, hygiene, prior, runner) -> (role, projects tidy)
+            ((None, True, None, False), ("devbox", True)),                    # a fresh personal install
+            ((None, True, hygiene, False), ("devbox", False)),                # role-less legacy receipt
+            ((None, True, fleet, False), ("devbox", False)),                  # recorded by the old migration
+            ((None, True, {"profile": "hygiene", "role": "devbox"}, False), ("devbox", True)),
+            ((None, True, {"profile": "hygiene", "role": "devbox", "projectsTidy": False}, False), ("devbox", False)),
+            ((None, True, fleet, True), ("fleet-mini", False)),               # a hygiene runner Mac keeps its role
+            (("fleet-mini", True, None, False), ("fleet-mini", False)),
+            (("devbox", True, fleet, False), ("devbox", True)),
+            ((None, False, None, False), ("fleet-mini", False)),              # build hosts as before
+            ((None, False, {"profile": "build-host"}, False), ("fleet-mini", False)),
+            ((None, True, {"profile": "build-host"}, False), ("fleet-mini", False)),
+            ((None, False, {"profile": "build-host", "role": "devbox"}, False), ("devbox", True)),
+            ((None, True, {"profile": "gh", "role": "fleet-mini"}, False), ("devbox", False)),
+        ]
+        for args, want in cases:
+            self.assertEqual(ms.resolve_role(*args), want, args)
 
     def test_explicit_devbox_overrides_legacy_fleet_receipt(self) -> None:
         receipt_path = self.home / ".local/state/glaeda/mini-setup/receipt.json"
