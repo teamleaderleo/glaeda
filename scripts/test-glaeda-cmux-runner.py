@@ -16515,10 +16515,12 @@ class FleetLabelsModuleTest(unittest.TestCase):
             self.assertIn("smallRunners must be 0 to 2",
                           fleet_labels.member_labels(manifest, "mini-std", lambda a: True)[1])
         std["smallRunners"] = 1
+        # the class default reaches a trusted member (the nightly signer): it gets none, never a hold out of heal
         manifest["hosts"]["mini-std"]["overrides"] = {"runner": {"trustedRef": "refs/heads/main",
                                                                  "trustedRepo": "manaflow-ai/cmux"}}
-        self.assertIn("smallRunners needs a dedicated runner without trustedRef",
-                      fleet_labels.member_labels(manifest, "mini-std", lambda a: True)[1])
+        trusted, why = fleet_labels.member_labels(manifest, "mini-std", lambda a: True)
+        self.assertIsNotNone(trusted, why)
+        self.assertEqual((trusted["smallRunners"], trusted["smallPools"]), (0, []))
         manifest["hosts"]["mini-std"]["overrides"] = {"runner": {"poolPrefix": "small-"}}
         self.assertIn("poolPrefix", fleet_labels.member_labels(manifest, "mini-std", lambda a: True)[1])
 

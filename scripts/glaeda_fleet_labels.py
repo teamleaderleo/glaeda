@@ -601,9 +601,11 @@ def member_labels(manifest: Any, member: str, xcode_ok: Callable[[dict[str, Any]
                       "(a sim-first runner takes pull request jobs) in the default pool namespace (no poolPrefix)")
     if not (isinstance(small, int) and not isinstance(small, bool) and 0 <= small <= MAX_SMALL_RUNNERS):
         return None, f"runner.classes.{klass}.smallRunners must be 0 to {MAX_SMALL_RUNNERS}"
-    if small and (trusted_ref is not None or availability != "dedicated" or normal_pool_prefix):
-        return None, (f"{member} runner.classes.{klass}.smallRunners needs a dedicated runner without trustedRef "
-                      "(a small runner takes pull request jobs) in the default pool namespace (no poolPrefix)")
+    # A small runner takes pull request jobs, so only a dedicated member without trustedRef, in the default pool
+    # namespace, gets one. smallRunners is a class default every member of the class reads, so another member gets
+    # none rather than a refusal (a refusal held cmux15 out of runner heal for simRunners, #1984).
+    if trusted_ref is not None or availability != "dedicated" or normal_pool_prefix:
+        small = 0
     # reserveCores: cores the hook's ledger keeps out of its measured hw.ncpu (CAPACITY_ARITHMETIC), for work it does
     # not admit; capacityUnits is the count only where the hook cannot measure the host
     if not (isinstance(reserve, int) and not isinstance(reserve, bool) and 0 <= reserve <= 4 * MAX_RUNNERS):
