@@ -2306,7 +2306,7 @@ def resolve_role(explicit: str | None, hygiene: bool, prior: dict[str, Any] | No
     An explicit --role always wins (OTA reruns carry it in update.json setupArgs). A hygiene or --gh-only
     install that was never a build host and has no glaeda runner is a personal machine, so it is devbox, even
     where an earlier release recorded fleet-mini for it: that release migrated every role-less hygiene receipt
-    to fleet-mini and then kept it forever, so Leo's desktop ran the fleet disk policy (git ls-files over every
+    to fleet-mini and then kept it forever, so Leo's own Mac ran the fleet disk policy (git ls-files over every
     ~/Projects checkout, fleet-only families) every 15 minutes. A build host, and a hygiene host with a glaeda
     runner (a headless runner Mac), keep the recorded role as before.
 
