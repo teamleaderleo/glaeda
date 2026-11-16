@@ -15421,6 +15421,14 @@ class OnEventTest(Base):
         self.write_config(self.hook(command=["/bin/echo", "{token}"]))
         self.assertEqual(gg.on_event_hooks()[0], [])
 
+    def test_a_host_without_hooks_writes_nothing(self) -> None:
+        self.config.unlink()
+        self.baseline()
+        self.ctl.runs[95] = backend_run(95)
+        self.daemon.tick(NOW + gg.TICK)
+        self.assertFalse((gg.BASE / gg.ON_EVENT_STATE).exists())
+        self.assertEqual(self.ctl.job_reads, [])
+
     def test_a_run_level_hook_needs_no_job_read(self) -> None:
         self.write_config(self.hook(job=None))
         self.baseline()

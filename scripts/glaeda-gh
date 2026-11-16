@@ -33,6 +33,10 @@
     glaeda-gh audit [--log PATH] [--last N] [--json]    this host's gh traffic, and what a cache would answer
     glaeda-gh runners OWNER[/REPO] [--label L] [--json] busy and idle self-hosted runners, from one shared read
                                                         (instead of a jobs read per run: see GH_SWEEP_MAX)
+    glaeda-gh on-event [--json]                         the commands the daemon runs once per finished run or job
+                                                        (~/.config/glaeda/on-event.json), and what each one did
+    glaeda-gh on-event replay --run-file F [--jobs-file F] [--wait S] [--json]
+                                                        one run record through the same path, deduped the same way
 
 Many sessions share one GitHub account and so one REST quota (5000 requests an hour). Each
 session polling its own PRs and runs used it up while the separate GraphQL quota sat idle. Here
@@ -459,6 +463,20 @@ CLIENT_RUN_LONG_POLL = STALE_RUN_REREAD
 WAIT_INTEREST = CLIENT_RUN_LONG_POLL + 2 * TOUCH_EVERY
 CONTROLLER_ABSENT = 900  # a controller without the run-events receiver (404, 503) is asked again this rarely
 FEED_PAGES = 5  # feed pages read per tick at most; a longer backlog continues on the next tick
+# on-event: a command run once per finished run (or one job of it) the controller's feed shows (`on-event`).
+# Leo, on an hourly Cloud probe: "but what's the point of checking every hour?"
+ON_EVENT_CONFIG = Path(os.environ.get("GLAEDA_GH_ON_EVENT_CONFIG") or Path.home() / ".config/glaeda/on-event.json")
+ON_EVENT_STATE = "on-event.json"  # under BASE: what ran, per (hook, run, attempt), kept across restarts
+# A matched run whose job the controller does not hold yet (its workflow_job delivery is late, or the hub's 30000-job
+# cap dropped it on a busy hour) is asked of the controller at each feed read; past ON_EVENT_REST_AFTER, GitHub is
+# asked once (one REST request); past ON_EVENT_PENDING_MAX it is given up as unresolved.
+ON_EVENT_REST_AFTER = 300
+ON_EVENT_PENDING_MAX = 3600
+ON_EVENT_KEEP = 30 * 86400  # records older than this are dropped, newest ON_EVENT_RUNS_MAX kept at most
+ON_EVENT_RUNS_MAX = 1000
+ON_EVENT_FIELDS = ("head_sha", "run_id", "attempt", "repo", "run_url", "job_url", "hook")  # {name} in a command
+ON_EVENT_PLACEHOLDER = r"\{([a-z_]+)\}"
+ON_EVENT_ENV = ("HOME", "PATH", "USER", "LOGNAME", "LANG", "LC_ALL", "TMPDIR", "SHELL")  # all a command inherits
 NUDGE_MIN = 20  # a PR a check event nudged is re-read at most this often (GraphQL points)
 # GraphQL diet (2026-11-01: the daemons on huge-blue and cosmic-gray spent 938 and 833 GraphQL queries an hour, the
 # account's biggest spenders, while their clients read about two dozen PRs). A watch nobody has read lately is
@@ -1711,6 +1729,11 @@ class Controller:
             raise WatchError("controller: feed without a cursor")
         return doc
 
+    def run_jobs(self, repo: str, run_id: int, attempt: int) -> dict:
+        """The jobs of one run attempt the controller holds (workflow_job deliveries): known false when none."""
+        return self.get(f"/v1/github/run-jobs?repo={urllib.parse.quote(repo, safe='/')}"
+                        f"&run={int(run_id)}&attempt={int(attempt)}")
+
 
 def controller_run(run: dict) -> dict:
     """The controller's run record in slim_run's shape."""
@@ -1718,6 +1741,102 @@ def controller_run(run: dict) -> dict:
             "conclusion": run.get("conclusion") or None, "html_url": run.get("url"), "head_sha": run.get("head_sha"),
             "head_branch": run.get("head_branch") or "", "event": run.get("event"), "run_attempt": run.get("attempt"),
             "created_at": None, "updated_at": run.get("updated_at")}
+
+
+# ---------------------------------------------------------------- on-event: a command per finished run or job
+#
+# ~/.config/glaeda/on-event.json (GLAEDA_GH_ON_EVENT_CONFIG):
+#   {"hooks": [{"name": "cloud-probe-promote", "repo": "manaflow-ai/cmux", "workflow": "backend.yml",
+#               "branch": "feat-cmux-next", "job": "promote-production", "conclusion": "success",
+#               "command": ["/usr/bin/python3", "/abs/probe.py", "run", "--sha", "{head_sha}"], "cwd": "/abs"}]}
+# The daemon matches each finished run its controller feed delivers (no GitHub read): repo, branch, and workflow by
+# file name or display name. With `job`, that job of the run's attempt must have `conclusion` (read from the
+# controller's run-jobs); without it, the run's own conclusion. Each (hook, repo, run, attempt) runs at most once:
+# the claim is written to BASE/on-event.json before the command starts, so neither a restart nor a crash runs it
+# twice. The command starts detached, with an absolute executable, an environment of ON_EVENT_ENV plus
+# GLAEDA_EVENT_* (never a token), its output in BASE/on-event/; the daemon records its exit code. Events that happen
+# while the daemon is down, or reads through an upstream (a lane VM), are not seen.
+
+
+def on_event_problem(h: Any) -> str | None:
+    """Why a configured hook cannot run, or None."""
+    if not isinstance(h, dict):
+        return "a hook is not an object"
+    name = h.get("name")
+    if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", name):
+        return "a hook needs a name of letters, digits, dot, dash or underscore"
+    if not isinstance(h.get("repo"), str) or not re.fullmatch(rf"{NAME}/{NAME}", h["repo"]):
+        return f"{name}: repo must be OWNER/REPO"
+    for field in ("workflow", "branch"):
+        if not isinstance(h.get(field), str) or not h[field]:
+            return f"{name}: {field} is required"
+    for field in ("job", "conclusion", "cwd"):
+        if field in h and (not isinstance(h[field], str) or not h[field]):
+            return f"{name}: {field} must be a non-empty string"
+    if "cwd" in h and not os.path.isabs(h["cwd"]):
+        return f"{name}: cwd must be an absolute path"
+    command = h.get("command")
+    if not isinstance(command, list) or not command or not all(isinstance(a, str) for a in command):
+        return f"{name}: command must be a list of strings"
+    if not os.path.isabs(command[0]):
+        return f"{name}: command[0] must be an absolute path"
+    # {word} is a placeholder (other braces are literal text, like a dict in a `python3 -c` script)
+    unknown = {f for a in command for f in re.findall(ON_EVENT_PLACEHOLDER, a)} - set(ON_EVENT_FIELDS)
+    if unknown:
+        return f"{name}: unknown placeholder {{{sorted(unknown)[0]}}} (known: {', '.join(ON_EVENT_FIELDS)})"
+    return None
+
+
+def on_event_hooks() -> tuple[list[dict], list[str]]:
+    """The configured hooks that can run, and why each other one cannot."""
+    if not ON_EVENT_CONFIG.exists():
+        return [], []
+    doc = read_json(ON_EVENT_CONFIG)
+    if not isinstance(doc, dict) or not isinstance(doc.get("hooks"), list):
+        return [], [f"{ON_EVENT_CONFIG}: not a JSON object with a hooks list"]
+    hooks, problems, names = [], [], set()
+    for h in doc["hooks"]:
+        problem = on_event_problem(h)
+        if problem is None and h["name"] in names:
+            problem = f"{h['name']}: a second hook of that name"
+        if problem:
+            problems.append(problem)
+            continue
+        names.add(h["name"])
+        hooks.append({**h, "conclusion": h.get("conclusion", "success")})
+    return hooks, problems
+
+
+def on_event_state() -> dict:
+    doc = read_json(BASE / ON_EVENT_STATE)
+    doc = doc if isinstance(doc, dict) else {}
+    runs, pending = doc.get("runs"), doc.get("pending")
+    return {"runs": runs if isinstance(runs, dict) else {}, "pending": pending if isinstance(pending, dict) else {}}
+
+
+def on_event_key(hook: str, repo: str, run_id: Any, attempt: Any) -> str:
+    return f"{hook} {repo.lower()}/{run_id}/{attempt}"
+
+
+def on_event_matches(hook: dict, run: dict) -> bool:
+    """Whether a finished feed run is the hook's repo, branch and workflow (file name or display name)."""
+    if run.get("status") != "completed" or str(run.get("repo") or "").lower() != hook["repo"].lower():
+        return False
+    if run.get("head_branch") != hook["branch"]:
+        return False
+    return hook["workflow"] in {run.get("name"), os.path.basename(str(run.get("path") or ""))}
+
+
+def on_event_job(jobs: Any, name: str) -> dict | None:
+    """The finished job of that name (the last one, when a name repeats), or None."""
+    found = [j for j in jobs or [] if isinstance(j, dict) and j.get("name") == name and j.get("status") == "completed"]
+    return max(found, key=lambda j: j.get("id") or 0) if found else None
+
+
+def on_event_prune(state: dict, now: float) -> None:
+    runs = {k: v for k, v in state["runs"].items() if now - float(v.get("at") or 0) < ON_EVENT_KEEP}
+    keep = sorted(runs, key=lambda k: float(runs[k].get("at") or 0))[-ON_EVENT_RUNS_MAX:]
+    state["runs"] = {k: runs[k] for k in keep}
 
 
 # ---------------------------------------------------------------- GraphQL for PRs
@@ -2441,6 +2560,9 @@ class Daemon:
         self.nudged: set[str] = set()  # PRs (and heads) a check event touched since their last fetch
         self.controller_ok_at = float("-inf")  # the last time the change feed answered
         self.fed_repos: dict[str, float] = {}  # owner/repo (lowercase) -> the last event the feed delivered for it
+        self.on_event_procs: dict[str, subprocess.Popen] = {}  # on-event commands started and not reaped yet, by key
+        self.on_event_pending: bool | None = None  # whether on-event.json holds runs to resolve (None: not read yet)
+        self.on_event_problems: set[str] = set()  # config problems already logged
         self.gql_reason = "other"  # what the GraphQL query being sent reads, for daemon.json graphqlBy
         self.gql_log: list[tuple[float, str, int]] = []  # (time, reason, points) per GraphQL query, last hour
         # REST path -> (ETag, answer) of required_by_name's reads, so an unchanged one is a free 304, kept on disk
@@ -5997,6 +6119,12 @@ class Daemon:
                     repo = str(item.get("repo") or "").lower()
                     if "/" in repo:
                         self.fed_repos[repo] = self.now
+        if pages or self.on_event_procs:
+            # here, before the baseline reads below can return early: the cursor has moved past these pages
+            try:
+                self.on_event_tick(pages)
+            except Exception as error:  # noqa: BLE001  a hook must never stop the reads
+                self.errors.append(f"on-event: {describe(error)} at {error_site(error)}")
         runs = {e["key"]: e for e in entries if e["key"].startswith("run:") and not e["jobs"]}
         self.controller_seen = {k: v for k, v in self.controller_seen.items() if k in runs}
         for key, e in runs.items():
@@ -6025,6 +6153,152 @@ class Daemon:
         if pages:
             self.controller_status = {"state": "ok", "lastDelivery": pages[-1].get("receiver_last_delivery"),
                                       "token": bool(self.controller.token)}
+
+    def on_event_tick(self, pages: list[dict], given: dict[str, list] | None = None, rest_now: bool = False) -> None:
+        """Run on-event hooks for the finished runs in these feed pages, and retry the runs still pending.
+        `given` (replay) holds job lists by on_event_key, in place of the controller's; `rest_now` asks GitHub at
+        once when neither holds the job."""
+        self.on_event_reap()
+        runs = [r for p in pages for r in (p.get("runs") or []) if isinstance(r, dict) and r.get("status") == "completed"]
+        if not runs and self.on_event_pending is False:
+            return
+        hooks, problems = on_event_hooks()
+        for problem in problems:
+            if problem not in self.on_event_problems:
+                self.on_event_problems.add(problem)
+                log({"event": "on-event", "refused": problem})
+        if not hooks and self.on_event_pending is False:
+            return  # nothing configured, nothing left over: a stat of the config per feed read is all it costs
+        BASE.mkdir(parents=True, exist_ok=True, mode=0o700)
+        with bounded_lock(BASE / ".on-event.lock") as held:
+            if not held:
+                return  # a replay holds it: the pending runs are retried at the next feed read
+            state = on_event_state()
+            before = json.dumps(state, sort_keys=True)
+            by_name = {h["name"]: h for h in hooks}
+            for run in runs:
+                for hook in hooks:
+                    if not on_event_matches(hook, run):
+                        continue
+                    key = on_event_key(hook["name"], hook["repo"], run.get("id"), run.get("attempt") or 1)
+                    if key in state["runs"] or key in state["pending"]:
+                        continue
+                    state["pending"][key] = {"hook": hook["name"], "since": self.now, "run": {
+                        k: run.get(k) for k in ("id", "repo", "attempt", "head_sha", "head_branch", "conclusion", "url")}}
+            for key in sorted(state["pending"]):
+                hook = by_name.get(state["pending"][key].get("hook"))
+                if hook is None:
+                    self.on_event_finish(state, key, "unresolved", why="the hook is no longer configured")
+                else:
+                    self.on_event_resolve(state, key, hook, (given or {}).get(key), rest_now)
+            if json.dumps(state, sort_keys=True) != before:  # a pending run asked again unchanged writes nothing
+                on_event_prune(state, self.now)
+                write_json(BASE / ON_EVENT_STATE, state)
+            self.on_event_pending = bool(state["pending"])
+
+    def on_event_finish(self, state: dict, key: str, outcome: str, **fields: Any) -> dict:
+        p = state["pending"].pop(key, {})
+        run = p.get("run") or {}
+        record = {"outcome": outcome, "at": self.now, "hook": p.get("hook"), "sha": run.get("head_sha"),
+                  "run_url": run.get("url"), **fields}
+        state["runs"][key] = record
+        if outcome != "started":
+            log({"event": "on-event", "key": key, "outcome": outcome, **fields})
+        return record
+
+    def on_event_resolve(self, state: dict, key: str, hook: dict, given: list | None, rest_now: bool) -> None:
+        p = state["pending"][key]
+        run = p["run"]
+        if not re.fullmatch(r"[0-9a-f]{40}", str(run.get("head_sha") or "")):
+            self.on_event_finish(state, key, "no-match", why="the run's head_sha is not a full 40-hex commit")
+            return
+        job_url = ""
+        if hook.get("job"):
+            job = self.on_event_find_job(p, hook["job"], given, rest_now)
+            if job is None:
+                if self.now - float(p.get("since") or self.now) >= ON_EVENT_PENDING_MAX:
+                    self.on_event_finish(state, key, "unresolved", why=f"job {hook['job']} never seen finished")
+                return
+            if job.get("conclusion") != hook["conclusion"]:
+                self.on_event_finish(state, key, "no-match", conclusion=job.get("conclusion"))
+                return
+            job_url = str(job.get("url") or job.get("html_url") or "")
+        elif run.get("conclusion") != hook["conclusion"]:
+            self.on_event_finish(state, key, "no-match", conclusion=run.get("conclusion"))
+            return
+        self.on_event_start(state, key, hook, job_url)
+
+    def on_event_find_job(self, p: dict, name: str, given: list | None, rest_now: bool) -> dict | None:
+        """The finished job: from `given`, else the controller (free), else once from GitHub past
+        ON_EVENT_REST_AFTER."""
+        run = p["run"]
+        repo, run_id, attempt = str(run.get("repo") or "").lower(), int(run.get("id")), int(run.get("attempt") or 1)
+        if given is not None:
+            return on_event_job(given, name)
+        if self.controller is not None and hasattr(self.controller, "run_jobs"):
+            try:
+                doc = self.controller.run_jobs(repo, run_id, attempt)
+            except WatchError as error:
+                doc = {}
+                self.errors.append(f"on-event run-jobs: {describe(error)}")
+            job = on_event_job(doc.get("jobs") if doc.get("known") else None, name)
+            if job is not None:
+                return job
+        waited = self.now - float(p.get("since") or self.now)
+        if p.get("restTried") or not (rest_now or waited >= ON_EVENT_REST_AFTER) or self.mode("rest") == "stop":
+            return None
+        p["restTried"] = self.now
+        with self.calling("on-event", repo):
+            got, doc, _ = self.get(f"/repos/{repo}/actions/runs/{run_id}/attempts/{attempt}/jobs?per_page=100", None)
+        if got != "fresh":
+            self.errors.append(f"on-event jobs of {repo}/{run_id}/{attempt}: {doc}")
+            return None
+        return on_event_job((doc or {}).get("jobs"), name)
+
+    def on_event_start(self, state: dict, key: str, hook: dict, job_url: str) -> None:
+        """Claim the run on disk, then start the command detached. A crash between the two leaves the claim:
+        at most once."""
+        run = state["pending"][key]["run"]
+        values = {"head_sha": run["head_sha"], "run_id": str(run.get("id")), "attempt": str(run.get("attempt") or 1),
+                  "repo": str(run.get("repo") or ""), "run_url": str(run.get("url") or ""), "job_url": job_url,
+                  "hook": hook["name"]}
+        argv = [re.sub(ON_EVENT_PLACEHOLDER, lambda m: values[m.group(1)], a) for a in hook["command"]]
+        logs = BASE / "on-event"
+        logs.mkdir(parents=True, exist_ok=True, mode=0o700)
+        out = logs / f"{hook['name']}-{values['run_id']}-{values['attempt']}.log"
+        record = self.on_event_finish(state, key, "started", log=os.fspath(out), job_url=job_url or None)
+        write_json(BASE / ON_EVENT_STATE, state)
+        env = {k: os.environ[k] for k in ON_EVENT_ENV if k in os.environ}
+        env.setdefault("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+        env.update({f"GLAEDA_EVENT_{k.upper()}": v for k, v in values.items()})
+        try:
+            with open(out, "ab") as sink:
+                proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=sink, stderr=subprocess.STDOUT,
+                                        cwd=hook.get("cwd") or os.environ.get("HOME") or "/", env=env,
+                                        start_new_session=True, close_fds=True)
+        except OSError as error:
+            record.update(outcome="failed", error=describe(error))
+            log({"event": "on-event", "key": key, "outcome": "failed", "error": describe(error)})
+            return
+        record["pid"] = proc.pid
+        self.on_event_procs[key] = proc
+        log({"event": "on-event", "key": key, "outcome": "started", "pid": proc.pid, "sha": run["head_sha"]})
+
+    def on_event_reap(self) -> None:
+        """Collect the commands that ended, and record each one's exit code."""
+        ended = {k: p.returncode for k, p in self.on_event_procs.items() if p.poll() is not None}
+        if not ended:
+            return
+        with bounded_lock(BASE / ".on-event.lock") as held:
+            if not held:
+                return  # the next tick
+            state = on_event_state()
+            for key, code in ended.items():
+                del self.on_event_procs[key]
+                if key in state["runs"]:
+                    state["runs"][key].update(outcome="ran", exit=code, ended=time.time())
+                log({"event": "on-event", "key": key, "outcome": "ran", "exit": code})
+            write_json(BASE / ON_EVENT_STATE, state)
 
     def apply_run(self, e: dict, run: dict) -> None:
         prior = e["cache"] or {}
@@ -12031,6 +12305,85 @@ def usage_next(argv: list[str], prog: str = "glaeda-gh") -> str:
     return f"{prog} --help"
 
 
+ON_EVENT_SHOW = 50  # records `on-event` prints, newest first
+
+
+def cmd_on_event_status(as_json: bool) -> int:
+    hooks, problems = on_event_hooks()
+    state = on_event_state()
+    newest = sorted(state["runs"], key=lambda k: float(state["runs"][k].get("at") or 0), reverse=True)[:ON_EVENT_SHOW]
+    doc = {"config": os.fspath(ON_EVENT_CONFIG), "hooks": hooks, "problems": problems,
+           "runs": {k: state["runs"][k] for k in newest}, "pending": state["pending"]}
+    if as_json:
+        print(json.dumps(doc, sort_keys=True))
+        return EXIT_OK
+    print(f"config {doc['config']}: {len(hooks)} hook(s)" + (f", {len(problems)} refused" if problems else ""))
+    for h in hooks:
+        what = f"job {h['job']}" if h.get("job") else "the run"
+        print(f"  {h['name']}: {h['repo']} {h['workflow']} on {h['branch']}, {what} {h['conclusion']}")
+    for p in problems:
+        print(f"  refused: {p}")
+    for k, p in sorted(state["pending"].items()):
+        print(f"pending {k} since {fmt_time(float(p.get('since') or 0))}")
+    for k in newest:
+        r = state["runs"][k]
+        end = f" exit {r['exit']}" if "exit" in r else ""
+        print(f"{fmt_time(float(r.get('at') or 0))} {k} {r.get('outcome')}{end} {r.get('sha') or ''}".rstrip())
+    return EXIT_OK
+
+
+def on_event_run_record(doc: dict) -> dict:
+    """A run as the controller's feed shows it, from that shape or GitHub's REST one."""
+    repo = doc.get("repo") or (doc.get("repository") or {}).get("full_name")
+    url = doc.get("html_url") or doc.get("url")
+    return {"id": doc.get("id"), "repo": repo, "name": doc.get("name"), "path": doc.get("path"),
+            "head_sha": doc.get("head_sha"), "head_branch": doc.get("head_branch"),
+            "attempt": doc.get("attempt") or doc.get("run_attempt") or 1, "status": doc.get("status"),
+            "conclusion": doc.get("conclusion"), "url": url}
+
+
+def cmd_on_event_replay(run_file: Path, jobs_file: Path | None, wait: float, as_json: bool) -> int:
+    """Feed one finished run through the daemon's on-event path: matched, deduped and run as a feed delivery would
+    be. A run already recorded prints its record and runs nothing."""
+    doc = read_json(run_file)
+    if not isinstance(doc, dict) or not isinstance(doc.get("id"), int):
+        raise WatchError(f"{run_file}: not a run (a JSON object with an id)")
+    run = on_event_run_record(doc)
+    if run["status"] != "completed":
+        raise WatchError(f"run {run['id']} is {run['status']}, not completed")
+    hooks, problems = on_event_hooks()
+    matched = [h for h in hooks if on_event_matches(h, run)]
+    if not matched:
+        raise WatchError("no on-event hook matches that run" + (f" ({'; '.join(problems)})" if problems else ""))
+    keys = [on_event_key(h["name"], h["repo"], run["id"], run["attempt"]) for h in matched]
+    given = None
+    if jobs_file is not None:
+        jd = read_json(jobs_file)
+        jobs = jd.get("jobs") if isinstance(jd, dict) else jd
+        if not isinstance(jobs, list):
+            raise WatchError(f"{jobs_file}: not a job list")
+        given = {k: jobs for k in keys}
+    with contextlib.redirect_stdout(sys.stderr):  # the daemon's log lines; stdout is the answer
+        daemon = Daemon()
+        daemon.now = time.time()
+        daemon.on_event_tick([{"runs": [run]}], given=given, rest_now=True)
+        deadline = time.monotonic() + wait
+        for proc in list(daemon.on_event_procs.values()):
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                proc.wait(timeout=max(0.0, deadline - time.monotonic()))
+        daemon.on_event_reap()
+    state = on_event_state()
+    out = [{"key": k, **(state["runs"].get(k) or ({"outcome": "pending"} if k in state["pending"] else {}))}
+           for k in keys]
+    if as_json:
+        print(json.dumps(out[0] if len(out) == 1 else out, sort_keys=True))
+    else:
+        for o in out:
+            end = f" exit {o['exit']}" if "exit" in o else ""
+            print(f"{o['key']}: {o.get('outcome')}{end}" + (f" (log {o['log']})" if o.get("log") else ""))
+    return EXIT_OK
+
+
 def parser() -> argparse.ArgumentParser:
     p = Parser(prog="glaeda-gh", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="command", required=True, parser_class=Parser)
@@ -12118,6 +12471,16 @@ def parser() -> argparse.ArgumentParser:
     rn.add_argument("scope", metavar="OWNER[/REPO]")
     rn.add_argument("--label", default=None, help="only runners carrying this label")
     rn.add_argument("--json", action="store_true")
+    oe = sub.add_parser("on-event", help="the commands the daemon runs once per finished run or job (on-event.json): "
+                                         "status, or replay one run record through the same path")
+    oe.add_argument("action", nargs="?", choices=("status", "replay"), default="status")
+    oe.add_argument("--run-file", type=Path, metavar="PATH",
+                    help="replay: one finished run, as the controller's feed (/v1/github/events) or GitHub serves it")
+    oe.add_argument("--jobs-file", type=Path, metavar="PATH",
+                    help="replay: its attempt's jobs ({\"jobs\": [...]}, run-jobs' or GitHub's), instead of reading them")
+    oe.add_argument("--wait", type=float, default=0, metavar="S",
+                    help="replay: wait up to S seconds for the command to end, to print its exit code")
+    oe.add_argument("--json", action="store_true")
     r = sub.add_parser("restart", help="restart a down or hung daemon once, however many sessions ask at the same time")
     r.add_argument("--force", action="store_true", help="restart even if it looks healthy or was just restarted")
     return p
@@ -12168,6 +12531,12 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_runners(args.scope, args.label, args.json)
         if args.command == "restart":
             return cmd_restart(args.force)
+        if args.command == "on-event":
+            if args.action == "replay":
+                if args.run_file is None or args.wait < 0:
+                    raise WatchError("on-event replay needs --run-file PATH (and --wait 0 or more seconds)")
+                return cmd_on_event_replay(args.run_file, args.jobs_file, args.wait, args.json)
+            return cmd_on_event_status(args.json)
         if args.command == "post":
             if args.wait < 0:
                 raise WatchError("--wait must be 0 or more seconds")

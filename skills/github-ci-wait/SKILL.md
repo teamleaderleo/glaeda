@@ -191,6 +191,31 @@ Add `--wait S` when you need the URL right away (a PR number to claim, a comment
 `wait comment --since`). Do not retry a `gh` write that failed with "submitted too quickly":
 queue it with `post`.
 
+## Running a command when a run or job finishes: on-event
+
+To act once per event (a deploy, a promote) instead of on a timer, configure the daemon, not a
+poller. `~/.config/glaeda/on-event.json` lists hooks; each matches a finished run the build
+controller's feed delivers (no GitHub read) by repo, branch and workflow (file or display name).
+With `job`, that job must have finished with `conclusion` (default success):
+
+```json
+{"hooks": [{"name": "cloud-probe-promote", "repo": "manaflow-ai/cmux", "workflow": "backend.yml",
+            "branch": "feat-cmux-next", "job": "promote-production", "conclusion": "success",
+            "command": ["/usr/bin/python3", "/abs/path/probe.py", "run", "--sha", "{head_sha}"]}]}
+```
+
+- Runs once per (hook, run, attempt), across restarts and crashes: the claim is on disk before
+  the command starts. A rerun attempt is a new event.
+- `command[0]` is absolute. Placeholders: `{head_sha}` (always a full 40-hex), `{run_id}`,
+  `{attempt}`, `{repo}`, `{run_url}`, `{job_url}`, `{hook}`; the same as `GLAEDA_EVENT_*`
+  variables. The environment is only HOME, PATH, USER, LOGNAME, LANG, LC_ALL, TMPDIR and SHELL:
+  no token. Output goes to `~/.cache/glaeda/gh/on-event/`.
+- Only the repositories the controller's webhooks cover (not manaflow-ai/cmux-platform), and only
+  while the daemon runs and reads the controller itself (not through an upstream, as lane VMs do).
+- `glaeda-gh on-event` shows the hooks, refused config and the last outcomes (`ran` with its exit
+  code, `no-match`, `unresolved`). `glaeda-gh on-event replay --run-file F --jobs-file F --wait 60`
+  feeds one run record through the same path to prove a hook.
+
 ## When the daemon is down or hung
 
 `glaeda-gh` exits 3 when the daemon is down or hung. Run `glaeda-gh restart` once, then wait
