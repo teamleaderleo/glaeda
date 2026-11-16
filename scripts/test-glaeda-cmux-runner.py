@@ -11648,6 +11648,7 @@ class GateTest(unittest.TestCase):
         # so a P-core reading does not clear it; a new boot does (or glaeda-update itself, once its tools run).
         gate = self.pcore_gate(self.CMUXS_6)
         why = "glaeda-update: glaeda-disk --help took over 120 s: it needs a drained reboot"
+        Path(self.state).mkdir(parents=True, exist_ok=True)
         (Path(self.state) / hook.PCORE_STALL_FILE).write_text(json.dumps(
             {"boot": 1794342904, "since": time.time(), "why": why, "source": "glaeda-update"}), encoding="utf-8")
         for _ in range(hook.PCORE_STALL_LOOKS + 1):
