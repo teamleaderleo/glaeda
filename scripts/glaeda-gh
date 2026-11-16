@@ -285,6 +285,18 @@ FLOORS = {"rest": (1500, 300), "graphql": (500, 100)}  # (floor, reserve) per qu
 # reset (or a re-exec, or a stop below the reserve) every watched PR is due in the same tick, and a burst of them is
 # what the shared login cannot spend for lands. Past it the reads wait for the next tick, first in line (deferred).
 GRAPHQL_PER_MINUTE = 40
+# A key a wait is blocked on (here, or a lane VM's through the broker) while the reserve alone stops GraphQL
+# (Daemon.read_waited). huge-blue, 2026-11-16: GraphQL under the fleet's 1000-point reserve 5.5 of 14 hours, REST at
+# the daemon's share or under its own reserve for most of them, and every read stopped with it: 151 PR reads in the
+# hour for 79 waited PRs, and lane waits served PR data 1000-6000 s old. Waited keys are read once their data is
+# WAITED_FRESH old, unchanged PRs by the probe (about 3 requests a PR, so WAITED_PROBE_BATCH of them is one point),
+# at most WAITED_PER_MINUTE points a minute (more waiters: each is read less often, never refused), and only while
+# the shared quota holds WAITED_RESERVE_SHARE of the reserve: the rest stays for lands. GitHub's own back-off (a
+# secondary limit, a Retry-After) stops them like any read.
+WAITED_FRESH = 45
+WAITED_PER_MINUTE = 15
+WAITED_PROBE_BATCH = 30
+WAITED_RESERVE_SHARE = 0.5
 # The daemon's own counted REST requests in the last hour stay under this share of the hourly limit.
 # Measured 2026-10-27: the daemon spent 2549 REST requests of one hour's 5000 (756 more were free
 # 304s) on PR reads the balancer had sent to REST, and the account ran out under a nightly re-run.
@@ -491,6 +503,11 @@ IDLE_BACKOFF_MAX = 600  # ... but no less often than this (it expires at IDLE_EX
 # is this old, and a wait hands itself back from the daemon and reads GitHub once itself (direct_read). The heartbeat
 # alone vouched for data that was 50 minutes old on huge-blue (2026-11-11), and `restart` refused.
 STALE_DATA_AFTER = 600
+# On an upstream host that reads one target itself through the broker (direct_command), a wait's data this old means
+# the broker host is behind: the wait reads its target itself (wait_starved). The broker host reads a waited key
+# within WAITED_FRESH even under its GraphQL reserve, and this host asks it every UPSTREAM_EVERY, so its copy is at
+# most about 70 s old while the broker keeps up; 600 s left lane waits on data the broker had not refreshed.
+UPSTREAM_DIRECT_AFTER = 120
 # After the quota stops explaining old waited data (staleExplainedAt), the daemon has this long to read the backlog
 # before the data counts as starved. huge-blue, 2026-11-11 to 11-15: the shared GraphQL pool sat under the reserve
 # for 10 to 20 minutes before each hourly reset (the alarm rightly "held"), and on the first tick after the reset, at
