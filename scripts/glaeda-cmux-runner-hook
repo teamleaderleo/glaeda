@@ -1824,14 +1824,15 @@ GATE_WAITER_EVERY_S = 30.0
 GATE_WAITER_MAX_HOLD_S = float(os.environ.get("GLAEDA_RUNNER_GATE_WAITER_MAX_HOLD_S") or 10 * 60)
 GATE_WAITER_WAIVE_S = float(os.environ.get("GLAEDA_RUNNER_GATE_WAITER_WAIVE_S") or 20 * 60)
 # A lend drain (the fleet worker's `<pid>-refresh-lend_drain-*` marker: the controller drains this mini for an exclusive
-# measurement, which can start only once the host is idle) is held GATE_LEND_DRAIN_MAX_HOLD_S instead. The 10 min bound
+# measurement, which can start only once the host is idle; its in-step `measure_drain` likewise waits for idle and
+# re-registers every 12 min) is held GATE_LEND_DRAIN_MAX_HOLD_S instead. The 10 min bound
 # above let it go before the jobs running at its start ended (a cmux-next daemon test takes 18 to 24 min): on
 # 2026-11-16 cmuxs-mac-mini-6's drain stood without a break from 04:57:56Z, every gate gave the runners back at 10 min,
 # new PR jobs refilled the mini, it never went idle, and 15+ measurements queued from 02:37Z never started. An hour
 # covers a whole long job that had just begun; past it the drain is waived like any other waiter, so a measurement
 # that still cannot start does not keep the mini off.
 GATE_LEND_DRAIN_MAX_HOLD_S = float(os.environ.get("GLAEDA_RUNNER_GATE_LEND_DRAIN_MAX_HOLD_S") or 60 * 60)
-LEND_DRAIN_MARKER = "-refresh-lend_drain-"
+LEND_DRAIN_MARKERS = ("-refresh-lend_drain-", "-refresh-measure_drain-")
 # A waiter not seen this long starts a new wait. A worker that took the lock and handed the job back re-queues within
 # seconds to minutes (its eviction runs under the lock, and the gate takes no reading while the lock is held); a build
 # that ran holds it far longer.
@@ -5376,7 +5377,7 @@ def registered_lock_waiters(path: str, ours: set[int]) -> set[int]:
 
 
 def lend_drain_waiters(path: str) -> set[int]:
-    """The pids of live lend-drain waiters (LEND_DRAIN_MARKER) in the host lock's waiters directory: a fresh marker
+    """The pids of live drain waiters (LEND_DRAIN_MARKERS) in the host lock's waiters directory: a fresh marker
     (refreshed within 30 s) whose pid is alive. Read only, bounded like registered_lock_waiters."""
     directory = Path(path + ".waiters")
     found: set[int] = set()
@@ -5389,7 +5390,7 @@ def lend_drain_waiters(path: str) -> set[int]:
                 if i >= 1024:
                     break
                 match = re.fullmatch(r"([1-9][0-9]*)-[A-Za-z0-9._-]+", entry.name)
-                if not match or LEND_DRAIN_MARKER not in entry.name:
+                if not match or not any(marker in entry.name for marker in LEND_DRAIN_MARKERS):
                     continue
                 try:
                     info = entry.stat(follow_symlinks=False)
