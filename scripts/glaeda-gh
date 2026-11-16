@@ -12314,6 +12314,10 @@ def usage_next(argv: list[str], prog: str = "glaeda-gh") -> str:
 ON_EVENT_SHOW = 50  # records `on-event` prints, newest first
 
 
+def on_event_when(epoch: float) -> str:
+    return dt.datetime.fromtimestamp(epoch, dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 def cmd_on_event_status(as_json: bool) -> int:
     hooks, problems = on_event_hooks()
     state = on_event_state()
@@ -12330,11 +12334,11 @@ def cmd_on_event_status(as_json: bool) -> int:
     for p in problems:
         print(f"  refused: {p}")
     for k, p in sorted(state["pending"].items()):
-        print(f"pending {k} since {fmt_time(float(p.get('since') or 0))}")
+        print(f"pending {k} since {on_event_when(float(p.get('since') or 0))}")
     for k in newest:
         r = state["runs"][k]
         end = f" exit {r['exit']}" if "exit" in r else ""
-        print(f"{fmt_time(float(r.get('at') or 0))} {k} {r.get('outcome')}{end} {r.get('sha') or ''}".rstrip())
+        print(f"{on_event_when(float(r.get('at') or 0))} {k} {r.get('outcome')}{end} {r.get('sha') or ''}".rstrip())
     return EXIT_OK
 
 
