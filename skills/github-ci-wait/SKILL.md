@@ -236,7 +236,7 @@ If it was never installed: `glaeda-mini-setup --hygiene-only --apply` from the g
 
 On a lane VM (a host whose `~/.config/glaeda/upstream.json` names an upstream), the daemon reads through the
 broker host's cache, which can lag a new head by many minutes. A wait whose data is older than 600 s reads its
-one target itself through `lane-gh call get` (or the file's `"direct"` program) and says `direct read answered`.
+one target itself through `lane-gh call get` (or the file's `"direct"` program) and says `direct read answered`, without a `glaeda-gh restart` hint.
 A restart there never helps: the data is the upstream's (glaeda#2029).
 
 Never run `glaeda-gh serve` yourself, not even under `timeout`: it refuses while the service is
