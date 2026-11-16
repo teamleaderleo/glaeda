@@ -17134,6 +17134,27 @@ class CapacityArithmeticTest(unittest.TestCase):
                 return n, why
         self.fail("never full")
 
+    def test_a_side_listener_on_a_needs_host_listens_with_room_for_its_class_median(self) -> None:
+        # SIDE_LISTEN_MEDIAN: fast-tier's own p90 is 8 cores, its class (isolated) median 3. A 14-core needs host with
+        # 6 units free: the side listener listens; the fast-tier job's admission still wants its own 8.
+        needs = self.needs({"cmux-next.yml/fast-tier": self.row(8.0, 500)}, {"isolated": self.row(6.0, 500)})
+        side = hook.RunnerScope(14, 2, 2)
+        with self.host(14, 48, needs):
+            fit = hook.side_fit_units(side)
+            self.assertEqual(fit, 3, "the isolated class's ceil(cores_p50), not fast-tier's ceil(cores_p90)")
+            self.assertEqual(hook.job_units("isolated", "fast-tier", hook.DEFAULT_HOME_REPO, workflow="cmux-next.yml"),
+                             8, "the job's admission keeps its own measured need")
+            capacity = self.dir / "capacity"
+            capacity.mkdir(exist_ok=True)
+            (capacity / "admission.lock").touch()  # a ledger an admission has used
+            for i in range(8):  # 8 of 14 units held: 6 free
+                fd = hook.lock_file(capacity / f"unit-{i}", fcntl.LOCK_EX)
+                self.assertIsNotNone(fd)
+                self.held.append(fd)
+            self.assertIsNone(hook.mini_full(capacity, 14, side, fit), "6 free fit a side job of 3: it listens")
+            self.assertIsNotNone(hook.mini_full(capacity, 14, side, 8), "the old p90 fit (8) held it off")
+        self.assertEqual(hook.side_fit_units(side), 5, "no needs file: the side label's costliest JOB_CORES job")
+
     def test_needs_file_parses_and_falls_back_to_todays_tables(self) -> None:
         good = self.needs({"build-fleet-go.yml/test": self.row(4.0, 100),
                            f"{self.GUEST}/build-fleet-go.yml/test": self.row(2.3, 3000),
