@@ -16137,5 +16137,452 @@ class LogJobTest(Base):
         self.assertEqual(self.rest_reads(), 10)  # the controller's 20 reads added none
 
 
+# ---------------------------------------------------------------- land: the queue that takes merge_hold's next steps
+
+LA, LB, LC = "a" * 40, "b" * 40, "c" * 40
+
+
+def land_pr(head: str, state: str = "OPEN", checks: list | None = None) -> dict:
+    """A PR cache entry's data, as parse_pr stores it."""
+    if checks is None:
+        checks = [("ci", "COMPLETED", "SUCCESS")]
+    return {"state": state, "headRefOid": head, "mergeable": "MERGEABLE", "mergeStateStatus": "CLEAN",
+            "checks": [{"name": n, "workflow": "w", "status": s, "conclusion": c} for n, s, c in checks]}
+
+
+def refusal(code: str, head: str, action: dict | None, nxt: str = "", reason: str = "") -> tuple[int, dict]:
+    doc = {"ok": False, "code": code, "reason": reason or f"merge-hold: refused: {code}", "next": nxt, "head": head,
+           "repo": "o/r", "number": "1"}
+    if action is not None:
+        doc["action"] = {"v": 1, "repo": "o/r", "number": 1, "head": head, **action}
+    return (3 if code in ("quota", "unreadable") else 1), doc
+
+
+def ok_answer(head: str, action: bool = True) -> tuple[int, dict]:
+    doc = {"ok": True, "code": "ok", "reason": "", "head": head, "next": f"gh pr merge 1 -R o/r --squash "
+           f"--match-head-commit {head}"}
+    if action:
+        doc["action"] = {"v": 1, "kind": "merge", "repo": "o/r", "number": 1, "head": head, "sha": head}
+    return 0, doc
+
+
+class LandWorld:
+    """The fakes a LandQueue runs against: the daemon's cache, merge_hold explain, the gh shim, acpmux."""
+
+    def __init__(self, tmp: str) -> None:
+        self.cache: dict[str, dict] = {}
+        self.answers: list[tuple[int, dict]] = []
+        self.calls: list[list[str]] = []
+        self.envs: list[dict] = []
+        self.gh_rc: dict[str, int] = {}
+        self.merged_on_merge = True
+        self.raise_on: str | None = None
+        self.nudged: list[str] = []
+        self.watched: list[str] = []
+        self.notices: list[tuple] = []
+        self.gh = Path(tmp) / "bin" / "gh"
+        self.gh.parent.mkdir(parents=True, exist_ok=True)
+        self.gh.write_text("#!/bin/sh\nexit 99\n")
+        self.gh.chmod(0o755)
+        self.config = {"gh": os.fspath(self.gh), "mergeHold": "/fake/merge_hold.py", "acpmux": "/fake/acpmux",
+                       "python": "/fake/python3", "routerReview": "/fake/router-review"}
+
+    def set_pr(self, key: str, data: dict, fetched: float) -> None:
+        self.cache[key] = {"key": key, "data": data, "fetchedAt": fetched, "dataAt": fetched}
+
+    def run(self, argv: list[str], timeout: float, env: dict) -> subprocess.CompletedProcess:
+        self.calls.append(list(argv))
+        self.envs.append(dict(env))
+        if self.raise_on and self.raise_on in " ".join(argv):
+            raise LandCrash(argv)
+        if argv[1:3] == ["/fake/merge_hold.py", "explain"]:
+            rc, doc = self.answers.pop(0)
+            return subprocess.CompletedProcess(argv, rc, json.dumps(doc) + "\n", "")
+        if argv[0] == "/fake/acpmux":
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        if argv[0] == os.fspath(self.gh):
+            words = argv[1:]
+            if words[:2] == ["pr", "view"]:
+                merged = any(c[1:3] == ["pr", "merge"] and self.gh_rc.get("merge", 0) == 0 for c in self.calls)
+                state = "MERGED" if merged and self.merged_on_merge else "OPEN"
+                return subprocess.CompletedProcess(argv, 0, json.dumps(
+                    {"state": state, "mergeCommit": {"oid": "f" * 40} if state == "MERGED" else None}), "")
+            kind = "merge" if words[:2] == ["pr", "merge"] else "update" if "update-branch" in " ".join(words) \
+                else "rerun" if words[:2] == ["run", "rerun"] else "edit" if words[:2] == ["pr", "edit"] else "other"
+            rc = self.gh_rc.get(kind, 0)
+            return subprocess.CompletedProcess(argv, rc, "", "" if rc == 0 else f"{kind} refused")
+        return subprocess.CompletedProcess(argv, 127, "", "unknown program")
+
+    def explains(self) -> list[list[str]]:
+        return [c for c in self.calls if c[1:3] == ["/fake/merge_hold.py", "explain"]]
+
+    def gh_calls(self, *prefix: str) -> list[list[str]]:
+        return [c[1:] for c in self.calls if c[0] == os.fspath(self.gh) and c[1:1 + len(prefix)] == list(prefix)]
+
+    def sent(self) -> list[list[str]]:
+        return [c for c in self.calls if c[0] == "/fake/acpmux"]
+
+
+class LandCrash(BaseException):
+    """A daemon killed partway through a step (a re-exec, a crash): nothing after the call runs."""
+
+
+class LandTest(Base):
+    """glaeda-gh land: a lane says it once, the daemon takes every machine step merge_hold names (Leo, 2026-11-16:
+    "glaeda clearly needs improvement given the amount of manual work we've had to do these past days")."""
+
+    KEY = "pr:o/r#1"
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.w = LandWorld(self.tmp.name)
+        self.t = NOW
+        self.q = self.queue()
+
+    def queue(self) -> Any:
+        return gg.LandQueue(run=self.w.run, cache_of=self.w.cache.get, watch=self.w.watched.append,
+                            nudge=self.w.nudged.append, notice=lambda *a: self.w.notices.append(a), inline=True,
+                            config=self.w.config)
+
+    def land(self, target: str = "o/r#1", after: list[str] | None = None, requester: str = "host/lane") -> None:
+        gg.land_request("land", target, after or [], requester)
+
+    def tick(self, seconds: float = 2.0) -> dict:
+        self.t += seconds
+        self.q.tick(self.t)
+        return self.q.entries.get(self.KEY) or {}
+
+    def pr(self, head: str, key: str = KEY, **kw: Any) -> None:
+        self.w.set_pr(key, land_pr(head, **kw), self.t)
+
+    def assert_merged_at(self, head: str) -> None:
+        merges = self.w.gh_calls("pr", "merge")
+        self.assertEqual(merges, [["pr", "merge", "1", "-R", "o/r", "--squash", "--match-head-commit", head]])
+        e = self.q.entries[self.KEY]
+        self.assertEqual((e["state"], e["mergeSha"]), ("merged", "f" * 40))
+        self.assertIn("merged at " + "f" * 40, self.w.sent()[-1][-1])
+        self.assertEqual(self.w.sent()[-1][2:4], ["--no-wait", "host/lane"])
+
+    def test_tip_merge_update_branch_head_race_then_merge(self):
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(refusal("tip_merge", LA, {"kind": "update_branch", "expected_head_sha": LA},
+                                      nxt=f"gh api -X PUT repos/o/r/pulls/1/update-branch -f expected_head_sha={LA}"))
+        e = self.tick()
+        self.assertEqual(self.w.gh_calls("api"), [["api", "-X", "PUT", "repos/o/r/pulls/1/update-branch", "-f",
+                                                   f"expected_head_sha={LA}"]])
+        self.assertEqual((e["state"], e["wait"]["kind"], e["wait"]["before"]), ("waiting", "head_change", LA))
+        self.assertIn("--sha", self.w.explains()[0])
+        self.assertEqual(self.w.explains()[0][-2:], [LA, "--json"])
+        # The head race: the cache still shows the old head. Nothing is judged, updated or merged at it.
+        for _ in range(5):
+            e = self.tick(10)
+        self.assertEqual((len(self.w.explains()), len(self.w.gh_calls("api")), self.w.gh_calls("pr", "merge")),
+                         (1, 1, []))
+        self.assertIn(self.KEY, self.w.nudged)
+        # The new head shows, its checks running: still no explain while they run.
+        self.pr(LB, checks=[("ci", "IN_PROGRESS", None)])
+        e = self.tick()
+        self.assertEqual((e["state"], e["wait"]["kind"], len(self.w.explains())), ("waiting", "pr", 1))
+        self.tick()
+        self.assertEqual(len(self.w.explains()), 1)
+        # A wait_pr at the new head, then green: merged pinned at the new head.
+        self.pr(LB, checks=[("ci", "COMPLETED", "SUCCESS"), ("ws-check", "IN_PROGRESS", None)])
+        self.tick()
+        self.assertEqual(len(self.w.explains()), 1)
+        self.pr(LB, checks=[("ci", "COMPLETED", "SUCCESS"), ("ws-check", "COMPLETED", "SUCCESS")])
+        self.w.answers.append(ok_answer(LB))
+        self.tick()
+        self.assertEqual(self.w.explains()[1][-2:], [LB, "--json"])
+        self.assert_merged_at(LB)
+        counts = gg.land_counts()[gg.land_day(self.t)]
+        self.assertEqual((counts["update_branch"], counts["merge"], counts["explain"]), (1, 1, 2))
+
+    def test_wait_pr_then_merge(self):
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(refusal("ws_check_missing", LA, {"kind": "wait_pr", "sha": LA, "until": "done",
+                                                              "timeout_s": 900}))
+        e = self.tick()
+        self.assertEqual((e["state"], e["wait"]["kind"]), ("waiting", "pr"))
+        self.tick()
+        self.assertEqual(len(self.w.explains()), 1)  # nothing changed: not asked again
+        self.pr(LA, checks=[("ci", "COMPLETED", "SUCCESS"), ("ws-check", "COMPLETED", "SUCCESS")])
+        self.w.answers.append(ok_answer(LA))
+        self.tick()
+        self.assert_merged_at(LA)
+
+    def test_stale_green_from_an_old_merge_hold_uses_the_fallback_table(self):
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(refusal("stale_green", LA, None, nxt="gh pr update-branch 1 --needs-newer-base"))
+        e = self.tick()
+        self.assertTrue(e["explain"]["fallback"])
+        self.assertEqual(len(self.w.gh_calls("api")), 1)
+        self.pr(LB)
+        self.w.answers.append(ok_answer(LB, action=False))  # an old ok answer: no action either
+        self.tick()
+        self.assert_merged_at(LB)
+
+    def test_broken_prose_next_step_is_ignored_for_the_action(self):
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(refusal("stale_green", LA, {"kind": "update_branch", "expected_head_sha": LA},
+                                      nxt="gh pr update-branch 1 -R o/r --needs-newer-base"))
+        self.tick()
+        self.assertEqual(self.w.gh_calls("pr", "update-branch"), [])
+        self.assertEqual(self.w.gh_calls("api")[0][3], "repos/o/r/pulls/1/update-branch")
+
+    def test_head_moved_during_review_repins_and_merges_at_the_new_head(self):
+        self.pr(LA)
+        self.land()
+        self.w.answers += [refusal("pin", LA, {"kind": "repin", "sha": LB}), ok_answer(LB)]
+        self.tick()
+        e = self.tick()
+        self.assertEqual(self.w.explains()[1][-2:], [LB, "--json"])
+        self.assert_merged_at(LB)
+
+    def test_pin_with_no_sha_waits_for_the_cache_to_show_another_head(self):
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(refusal("pin", LA, {"kind": "repin", "sha": ""}))
+        e = self.tick()
+        self.assertEqual(e["wait"]["kind"], "head_change")
+        self.tick(5)
+        self.assertEqual(len(self.w.explains()), 1)
+        self.pr(LB)
+        self.w.answers.append(ok_answer(LB))
+        self.tick()
+        self.assert_merged_at(LB)
+
+    def test_base_red_unrelated_waits_on_the_base_run_then_merges(self):
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(refusal("red_not_excused", LA, {"kind": "wait_run", "run": 77, "timeout_s": 3600}))
+        e = self.tick()
+        self.assertEqual((e["wait"]["kind"], e["wait"]["key"]), ("run", "run:o/r/77"))
+        self.assertIn("run:o/r/77", self.w.watched)
+        self.w.cache["run:o/r/77"] = {"data": {"status": "in_progress"}}
+        self.tick(30)
+        self.assertEqual(len(self.w.explains()), 1)
+        self.w.cache["run:o/r/77"] = {"data": {"status": "completed", "conclusion": "success"}}
+        self.w.answers.append(ok_answer(LA))
+        self.tick()
+        self.assert_merged_at(LA)
+
+    def test_cancelled_jobs_are_rerun_then_merged(self):
+        self.pr(LA, checks=[("ci", "COMPLETED", "CANCELLED")])
+        self.land()
+        self.w.answers.append(refusal("cancelled", LA, {"kind": "rerun_failed", "runs": [5, 6]}))
+        e = self.tick()
+        self.assertEqual(self.w.gh_calls("run", "rerun"), [["run", "rerun", "5", "--failed", "-R", "o/r"],
+                                                          ["run", "rerun", "6", "--failed", "-R", "o/r"]])
+        self.assertEqual(e["wait"]["kind"], "pr")
+        self.pr(LA, checks=[("ci", "IN_PROGRESS", None)])
+        self.tick()
+        self.assertEqual(len(self.w.explains()), 1)
+        self.pr(LA)
+        self.w.answers.append(ok_answer(LA))
+        self.tick()
+        self.assert_merged_at(LA)
+
+    def test_dependency_chain_lands_after_the_first_merges(self):
+        self.pr(LA)
+        self.pr(LC, key="pr:o/r#2")
+        self.land(after=["o/r#2"])
+        e = self.tick()
+        self.assertEqual((e["state"], self.w.explains()), ("waiting_after", []))
+        self.assertIn("pr:o/r#2", self.w.watched)
+        self.pr(LC, key="pr:o/r#2", state="MERGED")
+        self.w.answers.append(refusal("tip_merge", LA, {"kind": "update_branch", "expected_head_sha": LA}))
+        self.tick()
+        self.assertEqual(len(self.w.gh_calls("api")), 1)
+        self.pr(LB)
+        self.w.answers.append(ok_answer(LB))
+        self.tick()
+        self.assert_merged_at(LB)
+
+    def test_dependency_closed_unmerged_stops_and_notifies(self):
+        self.pr(LA)
+        self.pr(LC, key="pr:o/r#2")
+        self.land(after=["o/r#2"])
+        self.tick()
+        self.pr(LC, key="pr:o/r#2", state="CLOSED")
+        e = self.tick()
+        self.assertEqual((e["state"], e["stop"]["code"], self.w.explains()), ("stopped", "after_closed", []))
+        self.assertIn("https://github.com/o/r/pull/1 stopped: after_closed", self.w.sent()[-1][-1])
+
+    def test_block_stops_and_notifies(self):
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(refusal("block", LA, {"kind": "stop", "stop": "block", "why": "BLOCK at the head"},
+                                      nxt="fix the finding and push"))
+        e = self.tick()
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "block"))
+        msg = self.w.sent()[-1][-1]
+        for part in ("https://github.com/o/r/pull/1", "block", "BLOCK at the head", "next: fix the finding"):
+            self.assertIn(part, msg)
+        self.assertEqual(self.w.gh_calls("pr", "merge"), [])
+        self.tick(600)
+        self.assertEqual(len(self.w.explains()), 1)  # stopped stays stopped
+
+    def test_leo_hold_stops(self):
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(refusal("held", LA, {"kind": "stop", "stop": "leo_hold", "why": "HOLD: Leo"}))
+        e = self.tick()
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "leo_hold"))
+        self.assertEqual(len(self.w.sent()), 1)
+
+    def test_a_command_step_stops_with_its_text(self):
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(refusal("other", LA, {"kind": "command", "text": "ask Aziz"}))
+        e = self.tick()
+        self.assertEqual((e["state"], e["stop"]["next"]), ("stopped", "ask Aziz"))
+
+    def test_three_identical_refusals_stop_and_notify(self):
+        self.pr(LA)
+        self.land()
+        for _ in range(3):
+            self.w.answers.append(refusal("ws_check_missing", LA, {"kind": "wait_pr", "sha": LA, "timeout_s": 600}))
+        e = self.tick()
+        self.assertEqual(e["streak"]["count"], 1)
+        e = self.tick(601)
+        self.assertEqual((e["state"], e["streak"]["count"]), ("waiting", 2))
+        e = self.tick(601)
+        self.assertEqual((e["state"], len(self.w.explains())), ("stopped", 3))
+        self.assertIn("3 identical refusals", self.w.sent()[-1][-1])
+
+    def test_a_change_alone_does_not_count_toward_the_stop(self):
+        self.pr(LA)
+        self.land()
+        for i in range(4):
+            self.w.answers.append(refusal("ws_check_missing", LA, {"kind": "wait_pr", "sha": LA, "timeout_s": 600}))
+        self.tick()
+        for i in range(3):  # another check finished each time: judged again, the same answer
+            self.pr(LA, checks=[("ci", "COMPLETED", "SUCCESS")] + [(f"x{j}", "COMPLETED", "SUCCESS") for j in range(i + 1)])
+            e = self.tick()
+        self.assertEqual((e["state"], e["streak"]["count"], len(self.w.explains())), ("waiting", 1, 4))
+
+    def test_checks_running_never_calls_explain(self):
+        self.pr(LA, checks=[("ci", "IN_PROGRESS", None)])
+        self.land()
+        for _ in range(5):
+            e = self.tick(120)
+        self.assertEqual((e["state"], self.w.explains()), ("waiting", []))
+
+    def test_restart_mid_action_rejudges_and_never_double_runs(self):
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(ok_answer(LA))
+        self.w.raise_on = "--match-head-commit"
+        with self.assertRaises(LandCrash):
+            self.tick()
+        self.assertEqual(len(self.w.gh_calls("pr", "merge")), 1)
+        on_disk = gg.read_json(gg.LandQueue.entries_dir() / gg.file_name(self.KEY))
+        self.assertEqual((on_disk["state"], on_disk["action"]["kind"]), ("acting", "merge"))
+        self.w.raise_on = None
+        calls = len(self.w.calls)
+        self.q = self.queue()  # the daemon again
+        e = self.q.entries[self.KEY]
+        self.assertEqual((e["state"], e["interrupted"]["kind"], len(self.w.calls)), ("queued", "merge", calls))
+        self.w.answers.append(ok_answer(LA))
+        self.tick()
+        self.assertEqual(len(self.w.explains()), 2)  # judged again first
+        self.assertEqual(len(self.w.gh_calls("pr", "merge")), 2)
+        self.assertEqual(self.q.entries[self.KEY]["state"], "merged")
+
+    def test_missing_shim_refuses_to_merge(self):
+        self.w.gh.unlink()
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(ok_answer(LA))
+        e = self.tick()
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "no_shim"))
+        self.assertFalse([c for c in self.w.calls if "merge" in c])
+        self.assertIn("no_shim", self.w.sent()[-1][-1])
+
+    def test_merge_refused_is_judged_again(self):
+        self.pr(LA)
+        self.land()
+        self.w.gh_rc["merge"] = 1
+        self.w.answers += [ok_answer(LA), refusal("block", LA, {"kind": "stop", "stop": "block"})]
+        e = self.tick()
+        self.assertEqual((e["state"], e["streak"]["count"]), ("waiting", 1))
+        e = self.tick(6)
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "block"))
+
+    def test_calls_carry_the_land_tags_and_no_session_keys(self):
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(ok_answer(LA))
+        with mock.patch.dict(os.environ, {"ACPMUX_SESSION_NAME": "a-person", "CLAUDE_SESSION_ID": "x",
+                                          "CODEX_THREAD_ID": "y", "ACPMUX_SESSION_ID": "z"}):
+            self.tick()
+        for env in self.w.envs:
+            self.assertEqual((env["CMUX_AGENT_SESSION"], env["MAY_MERGE_PATH"], env["GLAEDA_GH_AGENT"]),
+                             ("glaeda-land", "glaeda-land", "glaeda-land"))
+            for k in ("ACPMUX_SESSION_NAME", "CLAUDE_SESSION_ID", "CODEX_THREAD_ID", "ACPMUX_SESSION_ID"):
+                self.assertNotIn(k, env)
+
+    def test_land_again_updates_after_and_notify_and_cancel_stops(self):
+        self.pr(LA, checks=[("ci", "IN_PROGRESS", None)])
+        self.land()
+        self.tick()
+        self.land(after=["o/r#9"], requester="host/other")
+        e = self.tick()
+        self.assertEqual((e["after"], e["requester"], e["state"]), (["pr:o/r#9"], "host/other", "waiting_after"))
+        gg.land_request("cancel", "o/r#1", [], "host/other")
+        e = self.tick()
+        self.assertEqual(e["state"], "cancelled")
+        self.land()
+        self.assertEqual(self.tick()["state"], "waiting")  # landing a finished entry again starts it over
+
+    def test_notify_failure_writes_a_notice_and_never_blocks(self):
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(refusal("block", LA, {"kind": "stop", "stop": "block"}))
+        real = self.w.run
+
+        def failing(argv, timeout, env):
+            if argv[0] == "/fake/acpmux":
+                return subprocess.CompletedProcess(argv, 1, "", "no such session")
+            return real(argv, timeout, env)
+        self.q.run = failing
+        e = self.tick()
+        self.assertEqual(e["state"], "stopped")
+        self.assertEqual(self.w.notices[-1][0], "land-notify-failed")
+
+    def test_cli_land_status_and_cancel(self):
+        with mock.patch.object(gg, "daemon_running", return_value=True), \
+                mock.patch.dict(os.environ, {"ACPMUX_SESSION_NAME": "lane-x"}), \
+                mock.patch.object(gg, "policy_host", return_value="hostx"), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(gg.main(["land", "o/r#1", "--after", "o/r#2", "--json"]), 0)
+        self.assertEqual(json.loads(out.getvalue())["requester"], "hostx/lane-x")
+        self.pr(LA, checks=[("ci", "IN_PROGRESS", None)])
+        e = self.tick()
+        self.assertEqual((e["after"], e["requester"]), (["pr:o/r#2"], "hostx/lane-x"))
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(gg.main(["land", "status", "o/r#1", "--json"]), 0)
+        doc = json.loads(out.getvalue())
+        self.assertEqual(doc["entries"][0]["state"], "waiting_after")
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(gg.main(["land", "status"]), 0)
+        self.assertIn("o/r#1  waiting_after", out.getvalue())
+        self.assertIn("steps taken today", out.getvalue())
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(gg.main(["land", "cancel", "o/r#1"]), 0)
+        self.assertEqual(self.tick()["state"], "cancelled")
+
+    def test_daemon_tick_runs_the_land_pass_only_once_land_exists(self):
+        self.daemon.land_tick()
+        self.assertIsNone(self.daemon.land_queue)
+        gg.land_dir().mkdir(parents=True)
+        self.daemon.land_tick()
+        self.assertIsNotNone(self.daemon.land_queue)
+
+
 if __name__ == "__main__":
     unittest.main()
