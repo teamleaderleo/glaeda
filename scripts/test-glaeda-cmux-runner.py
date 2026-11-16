@@ -2370,6 +2370,36 @@ class HookTest(unittest.TestCase):
     def shared_lock_blocks_exclusive(self) -> bool:
         return not self.lock_free()
 
+    def test_a_job_start_sweeps_dead_holders_pid_files(self) -> None:
+        """A ci-step holder killed outright leaves host-lock-holder-ci-step-<key>.pid behind for good (one CI mini
+        held three, from 2026-11-09 and 2026-11-15, on 2026-11-16): the next job start removes a dead holder's file
+        older than the grace, and leaves a live holder's and a just-written one."""
+        state = self.dir / "state"
+        state.mkdir(parents=True, exist_ok=True)
+        old = time.time() - 3600
+        dead = state / "host-lock-holder-ci-step-58ac1df4427887405ccee472.pid"
+        dead.write_text("999999\n")
+        (state / (dead.name + ".release")).write_text("{}")
+        releasing = state / "host-lock-holder-x9.pid.releasing"
+        releasing.write_text("999998\n")
+        live = state / "host-lock-holder-ci-step-0123456789abcdef01234567.pid"
+        live.write_text(f"{os.getpid()}\n")
+        for path in (dead, releasing, live, state / (dead.name + ".release")):
+            os.utime(path, (old, old))
+        fresh = state / "host-lock-holder-ci-step-fedcba9876543210fedcba98.pid"
+        fresh.write_text("")  # a holder still starting: its pid is not written yet
+        try:
+            started = self.job("swift-package-tests", "s0", 1)
+            self.assertEqual(started.returncode, 0, started.stdout + started.stderr)
+            self.assertIn("removed 2 dead lock holder file(s)", started.stdout)
+            self.assertFalse(dead.exists(), "a dead holder's file goes")
+            self.assertFalse((state / (dead.name + ".release")).exists(), "with its release request")
+            self.assertFalse(releasing.exists(), "a dead released holder's copy goes")
+            self.assertTrue(live.exists(), "a live holder's file stays")
+            self.assertTrue(fresh.exists(), "a file younger than the grace stays")
+        finally:
+            self.finish("s0")
+
     def test_fleet_gateway_clients_wait_as_light_and_leave_compile_tokens_free(self) -> None:
         """release-compile-fast and the other compile-check gateway clients only wait on the Linux pool: they take
         light units and no persistent-dd or root, so a compile on the same mini is admitted beside them."""
