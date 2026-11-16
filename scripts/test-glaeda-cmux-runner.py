@@ -8499,6 +8499,84 @@ class GateTest(unittest.TestCase):
         # another pid on the same host has its own span
         self.assertEqual(self.waited(t0, 2 * hold + waive + 2, 2 * hold + waive + 2, (77, 88)), [88])
 
+    def test_replay_a_measurement_drain_outlasts_the_pr_jobs_it_waits_behind(self) -> None:
+        # 2026-11-15/16, cmux8s-Mac-mini: the build worker (pid 70504) kept a lend drain's waiter for measurement
+        # 29897e0750 pinned to the mini, behind PR jobs running 20-60 min at load 100-150. Counted on wall time, the
+        # hold ended at 10 min with jobs still running and the 20 min waive let new ones in, so the mini never
+        # drained ("has waited for the host for 10 min without getting it" at 04:24Z and 05:04Z). Replayed at the
+        # gate's 30 s cadence with the jobs ending at 55 min: the drain is owed every reading while they run, and
+        # once the host is free it still gets only GATE_WAITER_MAX_HOLD_S to take it.
+        t0 = 7_000_000.0
+        hold = int(hook.GATE_WAITER_MAX_HOLD_S)
+        notes: list[str] = []
+        busy_until = 55 * 60
+        for t in range(0, busy_until, 30):
+            owed = hook.bounded_waiters(self.state, [70504], now=t0 + t, log=notes.append, identity=lambda pid: "w",
+                                        drains={70504}, host_busy=lambda: True)
+            self.assertEqual(owed, [70504], f"the drain was waived at {t / 60:.1f} min behind running PR jobs")
+        self.assertEqual(notes, [])
+        released = None
+        for t in range(busy_until, busy_until + hold + 120, 30):
+            owed = hook.bounded_waiters(self.state, [70504], now=t0 + t, log=notes.append, identity=lambda pid: "w",
+                                        drains={70504}, host_busy=lambda: False)
+            if not owed and released is None:
+                released = t
+        self.assertIsNotNone(released, "a drain that never takes a free host is not bounded")
+        self.assertLessEqual(released - busy_until, hold + 30)
+        self.assertTrue(notes and "pid 70504" in notes[0] and "free of runner jobs" in notes[0], notes)
+        # Any other waiter on the mini keeps the wall-clock bound.
+        self.assertEqual(self.waited(t0, 0, hold + 1, pids=(44,)), [])
+
+    def test_a_drain_behind_jobs_that_never_end_is_bounded_on_the_wall_clock(self) -> None:
+        t0 = 8_000_000.0
+        cap, waive = hook.GATE_DRAIN_WAITER_MAX_HOLD_S, hook.GATE_WAITER_WAIVE_S
+        notes: list[str] = []
+
+        def read(t: float) -> list[int]:
+            return hook.bounded_waiters(self.state, [70504], now=t0 + t, log=notes.append, identity=lambda pid: "w",
+                                        drains={70504}, host_busy=lambda: True)
+
+        t = 0.0
+        while t < cap - 30:
+            self.assertEqual(read(t), [70504])
+            t += 30
+        self.assertEqual(read(cap), [], "past GATE_DRAIN_WAITER_MAX_HOLD_S the gate listens anyway")
+        self.assertEqual(len(notes), 1)
+        self.assertIn("behind running jobs", notes[0])
+        t = cap
+        while t < cap + waive - 30:  # the gates keep reading it every 30 s while they listen
+            t += 30
+            self.assertEqual(read(t), [], f"honoured again {t - cap:.0f} s into the waive")
+        self.assertEqual(len(notes), 1, "one note per waived stretch")
+        self.assertEqual(read(cap + waive), [70504], "then a new hold")
+        t = cap + waive
+        while t < cap + waive + 2 * hook.GATE_WAITER_MAX_HOLD_S:
+            t += 30
+            self.assertEqual(read(t), [70504], "the new hold also counts only idle readings")
+
+    def test_job_started_never_ages_a_drain_on_idle_time(self) -> None:
+        # job-started passes no host_busy: it is itself a runner job, so its readings count as busy.
+        t0 = 9_000_000.0
+        for t in range(0, int(hook.GATE_WAITER_MAX_HOLD_S) + 300, 30):
+            self.assertEqual(hook.bounded_waiters(self.state, [70504], now=t0 + t, identity=lambda pid: "w",
+                                                  drains={70504}), [70504])
+
+    def test_drain_waiter_markers_are_the_workers_lend_drain_ones(self) -> None:
+        waiters = Path(str(self.lock) + ".waiters")
+        waiters.mkdir()
+        for name in ("70504-refresh-lend_drain-1794805255861634000", "70505-refresh-29897e0750ebadb3f378fc5d-1",
+                     "70506-refresh-lend_drain-1", "70507-blocked"):
+            (waiters / name).touch()
+        old = time.time() - 60
+        os.utime(waiters / "70506-refresh-lend_drain-1", (old, old))
+        self.assertEqual(hook.drain_lock_waiters(os.fspath(self.lock)), {70504})
+        with mock.patch.object(hook.subprocess, "run", return_value=subprocess.CompletedProcess([], 1)):
+            self.assertFalse(hook.runner_job_running())
+        with mock.patch.object(hook.subprocess, "run", return_value=subprocess.CompletedProcess([], 0)):
+            self.assertTrue(hook.runner_job_running())
+        with mock.patch.object(hook.subprocess, "run", side_effect=subprocess.TimeoutExpired("pgrep", 5)):
+            self.assertTrue(hook.runner_job_running(), "a reading that cannot tell counts as busy")
+
     def test_replay_a_worker_waiting_for_over_an_hour_is_bounded(self) -> None:
         # 2026-10-26, a std mini: the fleet worker (one pid) waited for host.lock from 22:19Z, taking it now and then
         # only to hand its build back for disk (2 to 12 min a try) and wait again. Every gate held its listener off
