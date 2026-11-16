@@ -15028,6 +15028,8 @@ class WaitedUnderReserveTest(Base):
         """One tick at T, every watch read by its waiter then (a lane wait renews its interest)."""
         for n in range(1, 13):
             path = gg.watch_dir() / gg.file_name(f"pr:o/r#{n}")
+            if n in self.WAITED:
+                gg.write_json(path, {**gg.read_json(path), "waitedAt": t})
             os.utime(path, (t, t))
         return self.daemon.tick(t)
 

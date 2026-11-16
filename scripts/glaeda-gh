@@ -2769,6 +2769,8 @@ class Daemon:
         self.writing = False  # inside the outbox: its requests are sessions' writes, not the daemon's polling
         self.jobs_only: list[dict] = []  # failed runs whose job list is read though runs cannot be (due)
         self.steps_failed: dict[Any, float] = {}  # job id -> when GitHub refused its steps for good (STEPS_RETRY)
+        self.waived = False  # inside read_waited: the reserve's stop yields down to WAITED_RESERVE_SHARE of it
+        self.waited_log: list[tuple[float, int]] = []  # (time, GraphQL points) read_waited spent, last minute
 
     # -- budget
 
@@ -2788,7 +2790,9 @@ class Daemon:
         floor, reserve = self.policy["floors"][bucket]
         remaining = seen.get("remaining", floor)
         forced = bucket in self.policy.get("forceLow", ())
-        return "stop" if remaining < reserve else "lean" if remaining < floor or capped or forced else "normal"
+        if remaining < reserve and not (self.waived and bucket == "graphql" and remaining >= reserve * WAITED_RESERVE_SHARE):
+            return "stop"
+        return "lean" if remaining < floor or capped or forced or remaining < reserve else "normal"
 
     def charge_rest(self, minute: int, n: int) -> None:
         """Count n REST requests in that minute, on disk at once, so a daemon that dies mid-tick
@@ -4606,10 +4610,82 @@ class Daemon:
                     self.read_jobs(e, {}, False)  # read_jobs reads the list a failed attempt is missing
             except Exception as error:  # noqa: BLE001
                 self.errors.append(f"{e['key']} jobs: {describe(error)}")
+        try:
+            self.read_waited(entries, {e["key"] for e in prs + runs})
+        except Exception as error:  # noqa: BLE001  a fault there must not stop the tick
+            self.errors.append(f"waited: {describe(error)} at {error_site(error)}")
         # After the reads, so a busy daemon never pays for it: its own responses' x-ratelimit
         # headers have already brought the view up to date, and only an idle one goes stale.
         self.refresh_budget()
         return self.finish_tick(entries, prs, runs, comments, heads)
+
+    def read_waited(self, entries: list[dict], read: set[str]) -> None:
+        """The PRs and runs a wait is blocked on (here, or a lane VM's through the broker: its upstream read carries
+        "wait"), read over GraphQL once their data is WAITED_FRESH old while the GraphQL reserve alone stops the
+        daemon's polling (huge-blue 2026-11-16: under it 5.5 of 14 hours, waited PR data 1000-6000 s old). Oldest data
+        first; unchanged PRs by the probe, WAITED_PROBE_BATCH a point; at most WAITED_PER_MINUTE points a minute, so
+        more waiters make each read less often, never refused; never below WAITED_RESERVE_SHARE of the reserve, nor
+        through GitHub's own back-off or a secondary hold. READ: the keys this tick already read."""
+        self.waited_log = [(t, p) for t, p in self.waited_log if self.now - t < 60]
+        if (self.mode("graphql") != "stop" or self.backoff["graphql"] > self.now or self.secondary_until > self.now
+                or self.waited_points() >= WAITED_PER_MINUTE):
+            return
+        self.waived = True
+        try:
+            if self.mode("graphql") == "stop":
+                return  # under the part of the reserve kept for lands
+            # (a key never read has no dataAt: first in line, and a lane VM's wait on a new PR is filled at once)
+            data_at = lambda e: float((e["cache"] or {}).get("dataAt") or 0)  # noqa: E731
+            stale = [e for e in entries if split_key(e["key"])[0] in ("pr", "run") and self.waited(e)
+                     and e["key"] not in read and not (e["cache"] or {}).get("missing")
+                     and self.now - data_at(e) >= WAITED_FRESH]
+            stale.sort(key=lambda e: (data_at(e), e["key"]))
+            prs = [e for e in stale if e["key"].startswith("pr:")]
+            runs = [e for e in stale if e["key"].startswith("run:")]
+            probe = [e for e in prs if self.probe_ok(e)]
+            full = [e for e in prs if not self.probe_ok(e)]
+            for i in range(0, len(probe), WAITED_PROBE_BATCH):
+                if not self.waited_room():
+                    return
+                chunk = probe[i:i + WAITED_PROBE_BATCH]
+                repos = sorted({caller_of(e["key"])[1] for e in chunk})
+                with self.waited_spend(), self.calling("pr", repos[0] if len(repos) == 1 else f"{len(repos)} repos",
+                                                       waiters_of(chunk)):
+                    changed, error = self.probe_prs(chunk)
+                if error is not None:
+                    self.errors.append(f"waited: {error}")
+                    return
+                full += changed
+            for kind, todo, fetch in (("pr", full, lambda chunk: self.fetch_aliased(chunk, "pr")),
+                                      ("run", runs, self.graphql_fetch["run"])):
+                size = max(1, self.batch[kind])
+                for i in range(0, len(todo), size):
+                    if not self.waited_room():
+                        return
+                    with self.waited_spend():
+                        left = self.batched(kind, todo[i:i + size], fetch)
+                    if left:
+                        return  # GraphQL stopped partway: the rest wait for the next pass
+        finally:
+            self.waived = False
+
+    def waited_points(self) -> int:
+        return sum(p for t, p in self.waited_log if self.now - t < 60)
+
+    def waited_room(self) -> bool:
+        return self.waited_points() < WAITED_PER_MINUTE and self.mode("graphql") != "stop" \
+            and self.secondary_until <= self.now
+
+    @contextlib.contextmanager
+    def waited_spend(self):
+        """The GraphQL points the reads inside spend count against WAITED_PER_MINUTE."""
+        before = len(self.gql_log)
+        try:
+            yield
+        finally:
+            spent = sum(p for _, _, p in self.gql_log[before:])
+            if spent:
+                self.waited_log.append((self.now, spent))
 
     def to_graphql(self, left: list[dict], spilled: list[dict]) -> None:
         """REST is throttled or its share spent with these still to read: GraphQL reads them this tick when it
@@ -8174,13 +8250,17 @@ def wait_starved(req: dict, entry: dict | None, now: float) -> float | None:
     read for its target in that long (since the wait began, for a target never read), and no direct read was tried
     in that long. None otherwise. Only for an undecided wait: wait_step rules first."""
     began = float(req["began"])
-    if now - began < STALE_DATA_AFTER:
+    # An upstream host that reads one target itself through the broker: UPSTREAM_DIRECT_AFTER (the broker host keeps
+    # waited keys fresher than that), else STALE_DATA_AFTER.
+    bound = UPSTREAM_DIRECT_AFTER if upstream_command() is not None and direct_command() is not None \
+        else STALE_DATA_AFTER
+    if now - began < bound:
         return None
-    if now - float(req.get("directAt") or float("-inf")) < STALE_DATA_AFTER:
+    if now - float(req.get("directAt") or float("-inf")) < bound:
         return None
     seen = (entry or {}).get("dataAt")
     age_s = now - (seen if isinstance(seen, (int, float)) and not isinstance(seen, bool) else began)
-    return age_s if age_s > STALE_DATA_AFTER else None
+    return age_s if age_s > bound else None
 
 
 def direct_read(req: dict) -> str | None:
