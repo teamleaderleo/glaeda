@@ -17060,6 +17060,7 @@ class CapacityArithmeticTest(unittest.TestCase):
                              8, "the job's admission keeps its own measured need")
             capacity = self.dir / "capacity"
             capacity.mkdir(exist_ok=True)
+            (capacity / "admission.lock").touch()  # a ledger an admission has used
             for i in range(8):  # 8 of 14 units held: 6 free
                 fd = hook.lock_file(capacity / f"unit-{i}", fcntl.LOCK_EX)
                 self.assertIsNotNone(fd)
