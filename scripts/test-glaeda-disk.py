@@ -2544,6 +2544,60 @@ class GlaedaDiskTest(unittest.TestCase):
         self.assertTrue(one.exists())
         self.assertEqual(sorted(p.name for p in tmp.iterdir()), ["cmux-ci"], "nothing renamed aside is left behind")
 
+    def test_a_per_runner_root_gives_its_admission_build_up_while_its_runner_has_no_job(self) -> None:
+        """cmux18, 2026-11-16: /private/tmp/cmux-ci-cmux18-glaeda (a per-runner root canonical-build-root.sh names
+        after RUNNER_NAME) held 9.3G of derived-data-compile-admission beside a 1.2G src/ checkout, idle 10.3 h.
+        The tmp family judged the root whole ("checkout below the top level") and reclaimed 0 at 17G free under the
+        30 GiB runner floor."""
+        tmp, home = self.root / "tmp", self.root / "home"
+        for name, agent in (("actions-runner-glaeda", "cmux18-glaeda"), ("actions-runner-glaeda-1", "cmux18-glaeda-1")):
+            (home / name / "glaeda-hooks").mkdir(parents=True)
+            (home / name / ".runner").write_text(json.dumps({"agentName": agent}))
+        idle, busy = tmp / "cmux-ci-cmux18-glaeda", tmp / "cmux-ci-cmux18-glaeda-1"
+        orphan = tmp / "cmux-ci-retired-runner"  # no enrolled runner has its name
+        for root in (idle, busy, orphan):
+            make(root / "derived-data-compile-admission", age_hours=10.3)
+            make(root / "compile-admission-cas", age_hours=10.3)
+            src = root / "src"  # the root's checkout, with an untracked build input
+            src.mkdir(parents=True)
+            subprocess.run(["git", "init", "-q", str(src)], check=True)
+            (src / "generated.swift").write_text("// untracked")
+            self._age(root, hours=10.3)
+        make(tmp / "cmux-ci-2" / "derived-data-compile-admission", age_hours=50)  # the token family's, not this one's
+        worker = f"{home}/actions-runner-glaeda-1/bin/Runner.Worker spawnclient 1 2\n"
+        gd.process_evidence = lambda: ([], worker)
+        tmp_fam = replace(next(f for f in gd.default_families() if f.id == "tmp"), root=tmp, skip=(), min_bytes=None)
+        dev = tmp.stat().st_dev
+        with mock.patch.object(gd, "HOME", home), mock.patch.object(gd, "ACTIVITY_MODE", "pressure"):
+            fams = gd.runner_root_admission_families(tmp)
+            self.assertEqual([f.root for f in fams], [idle, busy, orphan])
+            with mock.patch.object(gd, "FLOOR_HOLD", {}):  # above the floor the 12 h window stands
+                above = {os.path.relpath(i.path, tmp): i.verdict for i in gd.survey(fams, 6, 0)}
+            self.assertEqual(above["cmux-ci-cmux18-glaeda/derived-data-compile-admission"], "recent")
+            with mock.patch.object(gd, "FLOOR_HOLD", {dev: 50 * gd.GIB}):
+                items = gd.survey([*fams, tmp_fam], 6, 0)
+                v = {os.path.relpath(i.path, tmp): (i.verdict, i.reasons) for i in items}
+                self.assertEqual(v["cmux-ci-cmux18-glaeda/derived-data-compile-admission"][0], "reclaimable")
+                self.assertEqual(v["cmux-ci-cmux18-glaeda/compile-admission-cas"][0], "reclaimable")
+                self.assertEqual(v["cmux-ci-cmux18-glaeda-1/derived-data-compile-admission"],
+                                 ("in-use", ["actions-runner-glaeda-1 is running a job (Runner.Worker)"]))
+                self.assertEqual(v["cmux-ci-retired-runner/derived-data-compile-admission"][0], "in-use",
+                                 "a root no enrolled runner names waits while any runner has a job")
+                self.assertNotEqual(v["cmux-ci-cmux18-glaeda"][0], "reclaimable", "src/ is still git's to judge")
+                self.assertNotIn("cmux-ci-cmux18-glaeda/src", v)
+                self.assertNotIn("cmux-ci-2/derived-data-compile-admission", v)
+                patches, _ = self._floor_disk(17.0, freed_gib=1.0)
+                with patches[0], patches[1], mock.patch.object(gd, "command_lines", return_value=worker), \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    gd.apply(items, {f.id: f for f in [*fams, tmp_fam]}, self.receipt(), None, 6,
+                             all_families=[*fams, tmp_fam])
+        self.assertEqual(sorted(p.name for p in idle.iterdir()), ["src"], "the build goes, the checkout stays")
+        self.assertTrue((busy / "derived-data-compile-admission").exists(), "a runner with a job keeps its build")
+        self.assertTrue((orphan / "derived-data-compile-admission").exists())
+        self.assertEqual(gd.runner_root_key("mac mini/ü"), "mac_mini___")  # tr -c on each byte: ü is two
+        self.assertIsNone(gd.runner_root_of(tmp / "cmux-ci-2"))
+        self.assertIsNone(gd.runner_root_of(tmp / "cmux-ci"))
+
     def test_the_emergency_floor_names_its_filesystems(self) -> None:
         total = 460 * gd.GIB  # emergency 10%:30-60 is 46 GiB; a 30 GiB runner floor lifts it to 50 on HOME's volume
         home = gd.HOME.stat().st_dev

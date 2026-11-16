@@ -165,6 +165,7 @@ Under the runner gate's disk floor (FLOOR_HOLD) the windows that only keep thing
 recently used first and only down to the floor plus target_margin_gib: an idle runner's checkout build
 output, its cmux-next scheme state's generated output (cmux-scheme/<runner name>, only while that runner
 has no Runner.Worker), a canonical build root's admission DerivedData while no job holds the root's token,
+a per-runner root's (/private/tmp/cmux-ci-<runner name>) while its runner has no Runner.Worker,
 and code-sign clones other than each bundle's newest copy and any running app's.
 cmux7s sat at 21 GiB under a 30 GiB floor with 40 GiB of media CI's cmux DEV clones and 20 GiB of
 per-runner cmux-next Build "recent" (2026-10-21). cmux14 sat at the floor with 17.9 GiB of admission
@@ -1196,6 +1197,67 @@ def remove_canonical_admission(path: Path, whole_root: bool = False) -> bool:
     return True
 
 
+# A per-runner cmux CI root: a Mac without the glaeda-canonical-root helper has cmux's canonical-build-root.sh
+# derive /private/tmp/cmux-ci-<RUNNER_NAME, tr -c 'A-Za-z0-9_.-' _> for each runner, and every compile job
+# (ci-macos.yml, main-compile-probe.yml, nightly.yml, seed-derived-data.yml) runs scripts/ci/clear-dirs.sh on the
+# root's derived-data-compile-admission and compile-admission-cas before it builds, so they are build output only
+# that runner's next job reads, and it clears them first. No token guards such a root, and the tmp family judged
+# it whole: src/ (the root's checkout) made it "git-checkout (checkout below the top level)" and kept all of it
+# (cmux18, 2026-11-16: /private/tmp/cmux-ci-cmux18-glaeda 10.5G idle 10.3 h, 9.3G of it the admission
+# DerivedData, reclaimed 0 at 17G free under the 30 GiB runner floor while the pressure pass reran every ~15 s).
+# Its admission children are items of their own, kept while the runner named after the root has a Runner.Worker
+# (with no enrolled runner of that name, while any runner on the Mac has one) and by the process, cwd and open-file
+# checks every item gets; src/ stays the tmp family's and git's to judge.
+RUNNER_ROOT_ADMISSION = "cmux-ci-runner-admission"
+RUNNER_ROOT_RE = re.compile(r"cmux-ci-([A-Za-z0-9_.-]+)")
+ANY_RUNNER_WORKER_RE = re.compile(r"/bin(?:\.[0-9.]+)?/Runner\.Worker(?:\s|$)", re.M)
+
+
+def runner_root_key(name: str) -> str:
+    """canonical-build-root.sh's key for RUNNER_NAME: every byte outside A-Za-z0-9_.- becomes _."""
+    return "".join(chr(b) if chr(b).isascii() and (chr(b).isalnum() or chr(b) in "_.-") else "_"
+                   for b in name.encode())
+
+
+def runner_root_of(root: Path) -> str | None:
+    """The runner key of a per-runner root (/private/tmp/cmux-ci-<key>), None for a numbered canonical root
+    (the runner hook's, under its token) or any other name."""
+    m = RUNNER_ROOT_RE.fullmatch(root.name)
+    return m.group(1) if m and canonical_root_number(root) is None and root.name != CANONICAL_ADMISSION else None
+
+
+def runner_root_admission_families(tmp: Path | None = None) -> list[Family]:
+    tmp = (Path("/private/tmp") if DARWIN else Path("/tmp")) if tmp is None else tmp
+    out = []
+    for root in sorted(tmp.glob("cmux-ci-*")):
+        try:  # /private/tmp is world-writable: only a root this user made is this user's build output
+            mine = not root.is_symlink() and root.is_dir() and root.stat().st_uid == os.getuid()
+        except OSError:
+            mine = False
+        if mine and runner_root_of(root) is not None:
+            out.append(Family(RUNNER_ROOT_ADMISSION, root, True,
+                              "the runner's next compile clears it (clear-dirs.sh) and rebuilds or restores it",
+                              include=CANONICAL_ADMISSION_NAMES, build_output=True,
+                              min_idle_hours=CANONICAL_ADMISSION_IDLE_HOURS,
+                              owner="cmux compile admission (per-runner canonical root)", rebuild_minutes=10,
+                              platform="macos"))
+    return out
+
+
+def runner_root_job_live(path: Path, cmds: str) -> str:
+    """Why a per-runner root's admission item is in use, or "": the runner named after its root has a job."""
+    key = runner_root_of(path.parent)
+    if key is None:
+        return "not in a per-runner cmux CI root"
+    owners = [r for r in enrolled_runners() if runner_root_key(runner_agent_name(r) or "") == key]
+    for runner in owners:
+        if why := runner_job_live(runner, cmds):
+            return why
+    if not owners and ANY_RUNNER_WORKER_RE.search(cmds):
+        return f"no enrolled runner is named {key}, and a runner on this Mac has a job (Runner.Worker)"
+    return ""
+
+
 # cmux CI's SwiftPM scratch (cmux scripts/ci/owned_spm_scratch.py): swift-package-tests links each package's .build
 # to STORE/spm-scratch/<fingerprint>/<package> so a job rebuilds only what its change touched. A job holds
 # <fingerprint>.lock shared (a holder process) until the runner ends it; `link` touches the lock, so its time is the
@@ -1515,7 +1577,8 @@ def floor_hold_family(fam: Family, path: Path) -> bool:
     process evidence and taken exclusive to delete; the next compile on the root clears it anyway, and a rerun
     restores it from the artifact; a root without a token file keeps its 12 h window), and code-sign clones
     (keep_live_app_clones and app_clone_running keep the live ones)."""
-    if fam.id == RUNNER_BUILD_FAMILY or fam.app_clones or media_tour_warm_slot(fam, path):
+    if (fam.id in (RUNNER_BUILD_FAMILY, RUNNER_ROOT_ADMISSION) or fam.app_clones
+            or media_tour_warm_slot(fam, path)):
         return True
     if fam.id == CANONICAL_ADMISSION:  # only where the runner hook's token protocol is in force on this root
         token = canonical_root_token(path)
@@ -4208,6 +4271,7 @@ def default_families(role: str = "fleet-mini") -> list[Family]:
                                platform="macos"))
         fams += fleet_families()
         fams += canonical_admission_families()
+        fams += runner_root_admission_families()
         fams += runner_checkout_families()
         for runner in HOME.glob("actions-runner*"):
             temp = runner / "_work/_temp"
@@ -8276,6 +8340,8 @@ def job_busy(fam: Family, path: Path) -> bool:
         return False
     if fam.id == CANONICAL_ADMISSION:  # a DerivedData; the root's token is its in-use signal
         return False
+    if fam.id == RUNNER_ROOT_ADMISSION:  # a DerivedData; its runner's Runner.Worker is its in-use signal
+        return False
     if fam.id == INTERRUPTED:  # renamed away from every job's path; its deleter's pid is its in-use signal
         return False
     if media_tour_dd(fam, path):
@@ -8973,6 +9039,8 @@ def _survey(families, idle_hours, min_bytes, known, evidence, defer_bulk=False,
             if busy_reason := cmux_next_ci_busy(fam, path, opened, cmds):
                 reasons.append(busy_reason)
         if fam.id == RUNNER_BUILD_FAMILY and not blind and (why := runner_job_live(fam.root.parent, cmds)):
+            reasons.append(why)
+        if fam.id == RUNNER_ROOT_ADMISSION and not blind and (why := runner_root_job_live(path, cmds)):
             reasons.append(why)
         if fam.id == NIGHTLY_NEXT_FAMILY and not blind and (why := nightly_next_runner_busy(path, cmds)):
             reasons.append(why)
@@ -10908,7 +10976,7 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
             print(f"stopped: {why}")
             break
         if fam.id in FLEET_FAMILY_IDS or fam.id in (CMUX_NEXT_CI_FAMILY, HQ_CACHE_FAMILY, CANONICAL_ADMISSION,
-                                                     NIGHTLY_NEXT_FAMILY) \
+                                                     RUNNER_ROOT_ADMISSION, NIGHTLY_NEXT_FAMILY) \
                 or media_tour_dd(fam, p) or (
                 fam.id == INTERRUPTED and fam.root in cmux_next_ci_aside_parents(HOME / "Library/Caches" / CMUX_NEXT_CI_ROOT)):
             # Pressure eligibility is intentionally broad, so take fresh cwd/open-file evidence immediately
@@ -10965,6 +11033,7 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
         elif (cmux_next_ci_busy(fam, p, cwds, cmds)
                 or (fam.id == INTERRUPTED and cmux_next_ci_aside_busy(p, cwds, cmds))
                 or (fam.id == RUNNER_BUILD_FAMILY and runner_job_live(fam.root.parent, cmds))
+                or (fam.id == RUNNER_ROOT_ADMISSION and runner_root_job_live(p, cmds))
                 or (fam.id == NIGHTLY_NEXT_FAMILY and nightly_next_runner_busy(p, cmds))
                 or (fam.app_clones and app_clone_running(p, cmds))
                 or (fam.id == TART_VMS and tart_vm_held(p, cmds))
