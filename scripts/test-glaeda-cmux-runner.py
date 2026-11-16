@@ -8533,13 +8533,18 @@ class GateTest(unittest.TestCase):
         waiters.mkdir()
         # The worker's lend drain and its in-step measure drain (ci_step.go, re-registered every 12 min) both wait for
         # this mini to go idle; an ordinary build waiter and a stale marker are not drains.
+        # A drained reboot's root shell (leo-workspace tools/sandboxd_heal.py, `$$-$(date +%s)-root-drain`) waits for
+        # host.lock exclusively and never refreshes its marker: cmux8s-mac-mini on 2026-11-16, pid 61199 from 05:40Z,
+        # let go by every gate at 10 min while its wait ran 70 min. A with-host-lock build marker is not a drain.
         for name in ("81472-refresh-lend_drain-1794805076019383000", "81473-refresh-build-1",
-                     "81474-refresh-lend_drain-1", "81475-refresh-measure_drain-1794805076019383000"):
+                     "81474-refresh-lend_drain-1", "81475-refresh-measure_drain-1794805076019383000",
+                     "61199-1794807627-root-drain", "81477-1794807627-cmux"):
             (waiters / name).touch()
         old = time.time() - 60
         os.utime(waiters / "81474-refresh-lend_drain-1", (old, old))  # stale: its worker stopped refreshing
+        os.utime(waiters / "61199-1794807627-root-drain", (old, old))  # written once; alive while its shell is
         with mock.patch.object(hook, "pid_alive", return_value=True):
-            self.assertEqual(hook.lend_drain_waiters(os.fspath(self.lock)), {81472, 81475})
+            self.assertEqual(hook.lend_drain_waiters(os.fspath(self.lock)), {81472, 81475, 61199})
 
     def test_replay_a_worker_waiting_for_over_an_hour_is_bounded(self) -> None:
         # 2026-10-26, a std mini: the fleet worker (one pid) waited for host.lock from 22:19Z, taking it now and then
