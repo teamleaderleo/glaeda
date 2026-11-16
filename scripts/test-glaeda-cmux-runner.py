@@ -3771,6 +3771,47 @@ class HookTest(unittest.TestCase):
                     self.finish("sr")
         self.assertTrue(hook.probe(self.dir / "capacity" / f"{hook.SIM_TOKEN}.token"), "released with the job")
 
+    def test_the_small_runner_admits_only_the_small_jobs(self) -> None:
+        """SMALL_ONLY: a small runner's listener holds only for the small jobs' disk peak (8 GiB), so a fast tier or any
+        other job routed to its label could run out of disk there. job-started refuses it at once, before it writes,
+        and the rescue re-places it; a small job is admitted."""
+        self.fleet()
+
+        def ref(workflow: str, repo: str = "manaflow-ai/cmux") -> dict[str, str]:
+            return {"GITHUB_WORKFLOW_REF": f"{repo}/.github/workflows/{workflow}@refs/heads/feat-cmux-next"}
+
+        refused = (("fast-tier", self.FAST_TIER), ("generated-files", self.FAST_TIER),
+                   ("size", ref("cmux-next.yml")),  # a small job's name in another workflow is not that job
+                   ("compile", ref("pr-checks.yml")))
+        for job, env in refused:
+            with self.subTest(job=job, env=env):
+                try:
+                    started = self.job(job, "sm", 14, None, "--small-runner", env=env)
+                    self.assertEqual(started.returncode, 1, started.stdout + started.stderr)
+                    self.assertIn("refused: the small runner takes only the small jobs", started.stdout)
+                finally:
+                    self.finish("sm")
+        for job, env in (("size", ref("pr-checks.yml")), ("guard-status", ref("ci-guards.yml")),
+                         ("web-validation", ref("web-validation.yml")), ("comment", ref("pr-red-checks-comment.yml"))):
+            with self.subTest(job=job):
+                try:
+                    ok = self.job(job, "sm", 14, None, "--small-runner", env=env)
+                    self.assertEqual(ok.returncode, 0, ok.stdout + ok.stderr)
+                finally:
+                    self.finish("sm")
+
+    def test_the_small_jobs_are_the_coordinators_list(self) -> None:
+        """SMALL_JOBS is exactly the jobs measured at 5 GiB or less run alone (2026-11-16); adding one needs a new
+        measurement, so this list changes only with SMALL_JOB_PEAK_GIB's comment."""
+        self.assertEqual(hook.SMALL_JOBS, {
+            "pr-checks.yml/size", "pr-red-checks-comment.yml/comment", "ci-guards.yml/guard-status",
+            "web-validation.yml/web-validation", "cmux-next-dev-daily.yml/verify",
+            "manaflow-ai/cmuxterm-hq/synthetic-probes.yml/routes"})
+        self.assertEqual(hook.SMALL_JOB_DISK_GIB, 8.0)
+        self.assertTrue(hook.small_job("routes", "manaflow-ai/cmuxterm-hq", "manaflow-ai/cmux", "synthetic-probes.yml"))
+        self.assertFalse(hook.small_job("routes", "manaflow-ai/cmux", "manaflow-ai/cmux", "synthetic-probes.yml"))
+        self.assertFalse(hook.small_job("fast-tier", "manaflow-ai/cmux", "manaflow-ai/cmux", "cmux-next.yml"))
+
     def test_a_gateway_job_runs_on_a_gateway_token_with_every_unit_taken(self) -> None:
         """2026-10-30 12:43Z: every std mini at 76-100% CPU and units, so no thin cmux-ci client could start. On a
         gateway runner such a client takes one gateway token and no shared unit, so a full mini still admits it;
@@ -10053,6 +10094,38 @@ class GateTest(unittest.TestCase):
             self.assertIsNone(gate.low_disk(), "between one job's peak and the floor it only warns")
             self.assertIsNone(gate.claimed())
 
+    def test_a_small_runner_listens_under_the_heavy_peak_and_a_side_runner_waits(self) -> None:
+        """SMALL_ONLY: at 12 GiB free (under the 20 GiB heavy peak, over the small jobs' 8 GiB) a small runner keeps
+        listening while a plain side runner on the same mini is held (DISK_SHORT_HOLD): its label also brings the fast
+        tier. Under 8 GiB the small runner is held too. Nothing is refused for disk: a held listener only waits."""
+        side = self.runner
+        small = self.runner.parent / "actions-runner-glaeda-9"
+        write_hook(side, "exec python3 /hook job-started --min-free-gib 30 --capacity-units 14\n")
+        write_hook(small, "exec python3 /hook job-started --min-free-gib 30 --capacity-units 14 --small-runner\n")
+        self.assertTrue(hook.runner_scope(small).small)
+        self.assertFalse(hook.runner_scope(small).root, "a small runner is never a root runner")
+        self.assertFalse(hook.runner_scope(side).small)
+        free = {"gib": 12.0}
+        usage = lambda _path: mock.Mock(free=int(free["gib"] * 1024**3))  # noqa: E731
+        with mock.patch.object(hook.shutil, "disk_usage", side_effect=usage), \
+                mock.patch.dict(os.environ, {hook.DISK_JOB_PEAK_ENV: "20"}):
+            side_gate = hook.Gate(side, os.fspath(self.lock), os.fspath(self.tmp / "none.json"), self.state)
+            small_gate = hook.Gate(small, os.fspath(self.lock), os.fspath(self.tmp / "none.json"), self.state)
+            with mock.patch.object(side_gate, "evict_in_background"), \
+                    mock.patch.object(small_gate, "evict_in_background") as cleanup:
+                why = side_gate.low_disk()
+                self.assertIn("DISK_SHORT_HOLD", why or "", "the heavy label still waits at 12 GiB")
+                self.assertIn("12.0 GiB free, 20 GiB required", why or "")
+                self.assertIsNone(small_gate.low_disk(), "the small label admits at 12 GiB")
+                free["gib"] = 7.5
+                why = small_gate.low_disk()
+                self.assertIn("DISK_SHORT_HOLD", why or "")
+                self.assertIn("7.5 GiB free, 8 GiB required", why or "")
+                self.assertIn("small jobs' measured peak", why or "")
+                self.assertEqual(cleanup.call_args.args[1], 30.0, "cleanup still aims at the floor")
+        self.assertEqual(hook.side_fit_units(hook.runner_scope(small)), 1,
+                         "a small runner never waits for room for the fast tier's units")
+
     def test_a_pool_runner_over_its_floor_but_under_one_jobs_peak_is_held(self) -> None:
         """The peak is checked on its own, not only under the floor: --min-free-gib 30 with a 40 GiB peak at 35 GiB
         free holds the idle listener and requests cleanup to the peak."""
@@ -14215,6 +14288,33 @@ class RunnerTest(unittest.TestCase):
         self.assertIn(" --gateway-runner ", rerun)
         self.assertIn(" --instance 6\n", rerun)
 
+    def test_the_small_runners_come_after_the_sim_first_runner(self) -> None:
+        """SMALL_ONLY: smallRunners adds instances after the pool, gateway and sim-first runners. Each carries only the
+        small label (no pool, side, class role or simulator label, so no heavy job reaches it) and passes
+        --small-runner, and no other instance's labels or hook change."""
+        base = {"runners": 5, "capacityUnits": 14, "compileSlots": 2, "canonicalRoots": 2, "guiRunners": 1,
+                "fastRunners": 1, "gatewayRunners": 1, "simRunners": 1}
+        with mock.patch.object(cr, "ios_sim_present", return_value=True):
+            today, today_hooks = self.fast_labels(base, "small-today", ios_sim=True)
+            small, small_hooks = self.fast_labels({**base, "smallRunners": 2}, "small", ios_sim=True)
+        self.assertEqual(len(small), 9)
+        self.assertEqual((small[:7], small_hooks[:7]), (today, today_hooks), "every other instance keeps its labels")
+        for k in (7, 8):
+            self.assertEqual([l for l in small[k] if l not in cr.BASE_LABELS],
+                             ["glaeda-mini", "glaeda-class-std", "glaeda-dedicated", "xcode-26.6",
+                              "glaeda-small-xcode-26.6"])
+            self.assertIn(" --small-runner --test-keychain", small_hooks[k])
+            self.assertNotIn("--sim-runner", small_hooks[k])
+            self.assertNotIn("--gateway-runner", small_hooks[k])
+            scope = hook.runner_scope(self.fast_home / f"actions-runner-glaeda-{k}")
+            self.assertTrue(scope.small)
+            self.assertFalse(scope.root or scope.gateway or scope.sim or scope.session or scope.gui or scope.fast)
+        self.assertEqual([l.count("glaeda-small-xcode-26.6") for l in small], [0] * 7 + [1, 1])
+        member = {"runners": 5, "gatewayRunners": 1, "simRunners": 1, "smallRunners": 2}
+        self.assertEqual([cr.small_instance(member, k) for k in range(10)], [False] * 7 + [True, True, False])
+        self.assertFalse(cr.small_instance({"runners": 5, "smallRunners": 3}, 7), "never more than two")
+        self.assertEqual(cr.member_instances(member), 9)
+
     def test_the_sim_first_runner_comes_after_the_gateway_runners_on_a_simulator_mini(self) -> None:
         """SIM_FIRST: simRunners 1 adds one instance after the pool and gateway runners. It carries only the sim label
         (no pool, side, class role or glaeda-ios-sim label, so no compile reaches it), passes --sim-runner with the
@@ -16394,6 +16494,32 @@ class FleetLabelsModuleTest(unittest.TestCase):
         self.assertIn("simRunners needs a dedicated runner without trustedRef",
                       fleet_labels.member_labels(manifest, "mini-std", lambda a: True)[1])
         manifest["hosts"]["mini-std"]["overrides"] = {"runner": {"poolPrefix": "sim-"}}
+        self.assertIn("poolPrefix", fleet_labels.member_labels(manifest, "mini-std", lambda a: True)[1])
+
+    def test_small_runners_field(self) -> None:
+        manifest = json.loads(json.dumps(MANIFEST))
+        std = {"runners": 5, "capacityUnits": 5, "canonicalRoots": 2, "smallRunners": 0}
+        manifest["defaults"]["runner"] = {"classes": {"std": std}}
+        today = fleet_labels.member_labels(manifest, "mini-std", lambda app: True)[0]
+        self.assertEqual((today["smallRunners"], today["smallPools"]), (0, []))
+        std["smallRunners"] = 2
+        small = fleet_labels.member_labels(manifest, "mini-std", lambda app: True)[0]
+        self.assertEqual((small["smallRunners"], small["smallPools"]), (2, ["glaeda-small-xcode-26.6"]))
+        self.assertEqual((small["runners"], small["pools"], small["labels"], small["sidePools"]),
+                         (today["runners"], today["pools"], today["labels"], today["sidePools"]),
+                         "the pool instances, the picker's pool count, the side labels and the member labels are unchanged")
+        self.assertEqual(fleet_labels.small_label("26.6"), "glaeda-small-xcode-26.6")
+        self.assertNotIn("glaeda-small-xcode-26.6", fleet_labels.declared_pools(manifest))
+        for bad in (3, -1, True, "1"):
+            std["smallRunners"] = bad
+            self.assertIn("smallRunners must be 0 to 2",
+                          fleet_labels.member_labels(manifest, "mini-std", lambda a: True)[1])
+        std["smallRunners"] = 1
+        manifest["hosts"]["mini-std"]["overrides"] = {"runner": {"trustedRef": "refs/heads/main",
+                                                                 "trustedRepo": "manaflow-ai/cmux"}}
+        self.assertIn("smallRunners needs a dedicated runner without trustedRef",
+                      fleet_labels.member_labels(manifest, "mini-std", lambda a: True)[1])
+        manifest["hosts"]["mini-std"]["overrides"] = {"runner": {"poolPrefix": "small-"}}
         self.assertIn("poolPrefix", fleet_labels.member_labels(manifest, "mini-std", lambda a: True)[1])
 
     def test_gateway_runners_field(self) -> None:

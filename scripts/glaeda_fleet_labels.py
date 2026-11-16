@@ -78,6 +78,14 @@ GATEWAY_PREFIX = "gateway"
 # macOS, where it queued 40 minutes.
 MAX_SIM_RUNNERS = 1
 SIM_PREFIX = "sim"
+# smallRunners (0 to MAX_SMALL_RUNNERS, default 0) adds that many small runners after the sim-first runner (instances
+# runners + gatewayRunners + simRunners on; never counted in runners, so no role moves). A small runner carries only
+# the small label (small_label: glaeda-small-xcode-<version>, no class, no pool label) and takes only the small jobs
+# (glaeda-cmux-runner-hook SMALL_JOBS: size, comment, guard-status, web-validation, the DEV verify, routes), each of
+# which grows the disk by 5 GiB at most; so its gate holds its listener under their peak plus a margin (8 GiB), not
+# one heavy job's 20 GiB (SMALL_ONLY). On 2026-11-16 that 20 GiB held 12 of cmux18's 14 runners at 17.2 GiB free.
+MAX_SMALL_RUNNERS = 2
+SMALL_PREFIX = "small"
 COMPILE_CORES = 5  # the hook's CLASS_COST["compile"] units (a test keeps them equal)
 MAX_RUNNERS = 16
 # A host's overrides.runner {trustedRef: refs/heads/main, trustedRepo: owner/name} makes its runners trusted-only:
@@ -88,7 +96,7 @@ TRUSTED_REF_RE = r"refs/heads/[A-Za-z0-9._/-]+"
 REPO_RE = r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+"
 POOL_PREFIX_RE = r"[a-z0-9]+-"
 RESERVED_POOL_PREFIXES = {"root-", "side-", "gui-", "fast-", "trusted-", "std-", "light-", "xl-", "dev-", "nightly-",
-                          "gateway-", "sim-"}
+                          "gateway-", "sim-", "small-"}
 DEV_COMPILE_POOL_PREFIX = "dev-"
 # The classes that may hold the DEV freshness slot (runner.devCompile). An xl slot (an M5 Ultra Studio) also carries
 # the std DEV label (dev_classes), so the feed's Release compile queued on
@@ -382,6 +390,12 @@ def sim_label(version: str) -> str:
     return f"glaeda-{SIM_PREFIX}-xcode-{version}"
 
 
+def small_label(version: str) -> str:
+    """The small runners' label for an Xcode version: glaeda-small-xcode-<version>. No class: a small job runs the same
+    on any mini, so one label spans every class's small runners."""
+    return f"glaeda-{SMALL_PREFIX}-xcode-{version}"
+
+
 def _role_label(pool: str, role: str) -> str:
     """Insert a runner role after an optional pool namespace and before class metadata."""
     parts = pool.split("-")
@@ -545,11 +559,12 @@ def member_labels(manifest: Any, member: str, xcode_ok: Callable[[dict[str, Any]
         fast = declared.get("fastRunners", 0)
         gateway = declared.get("gatewayRunners", 0)
         sim = declared.get("simRunners", 0)
+        small = declared.get("smallRunners", 0)
         reserve = declared.get("reserveCores", 0)
     else:
-        compile_slots, roots, gui, fast, gateway, sim, reserve = 1, 1, 0, 0, 0, 0, 0
+        compile_slots, roots, gui, fast, gateway, sim, small, reserve = 1, 1, 0, 0, 0, 0, 0, 0
     if dedicated_only:
-        gateway = sim = 0  # DEDICATED_ONLY: no pool instance, so no gateway or sim-first runner after them either
+        gateway = sim = small = 0  # DEDICATED_ONLY: no pool instance, so no gateway, sim-first or small runner either
     if not (isinstance(runners, int) and not isinstance(runners, bool) and 1 <= runners <= MAX_RUNNERS):
         return None, f"runner.classes.{klass}.runners must be 1 to {MAX_RUNNERS}"
     # every mini holds at least one compile slot, so it needs a compile's cores; glaeda-route checks the same
@@ -584,6 +599,11 @@ def member_labels(manifest: Any, member: str, xcode_ok: Callable[[dict[str, Any]
     if sim and (trusted_ref is not None or availability != "dedicated" or normal_pool_prefix):
         return None, (f"{member} runner.classes.{klass}.simRunners needs a dedicated runner without trustedRef "
                       "(a sim-first runner takes pull request jobs) in the default pool namespace (no poolPrefix)")
+    if not (isinstance(small, int) and not isinstance(small, bool) and 0 <= small <= MAX_SMALL_RUNNERS):
+        return None, f"runner.classes.{klass}.smallRunners must be 0 to {MAX_SMALL_RUNNERS}"
+    if small and (trusted_ref is not None or availability != "dedicated" or normal_pool_prefix):
+        return None, (f"{member} runner.classes.{klass}.smallRunners needs a dedicated runner without trustedRef "
+                      "(a small runner takes pull request jobs) in the default pool namespace (no poolPrefix)")
     # reserveCores: cores the hook's ledger keeps out of its measured hw.ncpu (CAPACITY_ARITHMETIC), for work it does
     # not admit; capacityUnits is the count only where the hook cannot measure the host
     if not (isinstance(reserve, int) and not isinstance(reserve, bool) and 0 <= reserve <= 4 * MAX_RUNNERS):
@@ -620,6 +640,8 @@ def member_labels(manifest: Any, member: str, xcode_ok: Callable[[dict[str, Any]
             else [],
             "simRunners": sim,
             "simPools": list(dict.fromkeys(sim_label(v) for v in (versions if pools else []))) if sim else [],
+            "smallRunners": small,
+            "smallPools": list(dict.fromkeys(small_label(v) for v in (versions if pools else []))) if small else [],
             # CAPACITY_ARITHMETIC: the classless side label, on default-namespace PR pools only (never a trusted or
             # namespaced pool, whose jobs are its own)
             "sharedSidePools": list(dict.fromkeys(shared_side_label(v) for v in versions))

@@ -333,6 +333,7 @@ class Context:
         self.session_runner = False  # a gui-role instance other than the console one (guiRunners above 1)
         self.gateway_runner = False  # a gateway runner (gatewayRunners: the instances after runners, the gateway label)
         self.sim_runner = False  # the sim-first runner (simRunners: the instance after the gateway runners, the sim label)
+        self.small_runner = False  # a small runner (smallRunners: the instances after the sim-first one, the small label)
         # Instance 0 keeps the original paths; instance K adds -K (dirs, logs, name) or .K (launchd label).
         self.suffix = f"-{self.instance}" if self.instance else ""
         self.label = f"{LABEL}.{self.instance}" if self.instance else LABEL
@@ -774,6 +775,8 @@ def hook_wrappers(ctx: Context) -> dict[str, bytes]:
                 scope += " --nightly-runner"
             elif getattr(ctx, "sim_runner", False) is True:  # SIM_FIRST: listens on a full mini, its job goes first
                 scope += " --sim-runner"
+            elif getattr(ctx, "small_runner", False) is True:  # SMALL_ONLY: the small jobs only, their disk hold
+                scope += " --small-runner"
             scope += " --test-keychain"
             # and a fresh testmanagerd for each job that takes the gui token (a wedged one hangs every XCTest run)
             recycle = " --recycle-testmanagerd"
@@ -3060,14 +3063,17 @@ def main(argv: list[str] | None = None) -> int:
             print(f"glaeda-cmux-runner: {args.member} is class {member['class']} with {member.get('runners')} "
                   f"runner(s), {int(member.get('gatewayRunners') or 0)} gateway runner(s) and "
                   f"{int(member.get('simRunners') or 0)} sim-first runner(s); instance {ctx.instance} "
-                  "is beyond that", file=sys.stderr)
+                  f"is beyond that ({int(member.get('smallRunners') or 0)} small runner(s) after them)",
+                  file=sys.stderr)
             return 2
         if not args.capacity_units:
             ctx.capacity_units = int(member.get("capacityUnits") or 0)
         ctx.fast_runner, ctx.gui_runner, ctx.session_runner = member_roles(member, ctx.instance)
         ctx.gateway_runner = gateway_instance(member, ctx.instance)
         ctx.sim_runner = sim_instance(member, ctx.instance)
-        gateway = ctx.gateway_runner or ctx.sim_runner  # an instance past the pool ones: its own label only
+        ctx.small_runner = small_instance(member, ctx.instance)
+        # an instance past the pool ones: its own label only
+        gateway = ctx.gateway_runner or ctx.sim_runner or ctx.small_runner
         dev = dev_compile_instance(member, ctx.instance)
         nightly = nightly_slot_instance(member, ctx.instance)
         is_root = (ctx.instance < int(member.get("canonicalRoots") or 1) and not ctx.gui_runner and not ctx.fast_runner
@@ -3077,7 +3083,8 @@ def main(argv: list[str] | None = None) -> int:
         # session job (generated files, action exports) taken there with less room would wait and, through its
         # admit.want marker, hold every runner on the mini. The session runners listen with room for one.
         console_session = int(member.get("guiRunners") or 0) <= 1
-        roots = (member.get("simPools", []) if ctx.sim_runner
+        roots = (member.get("smallPools", []) if ctx.small_runner
+                 else member.get("simPools", []) if ctx.sim_runner
                  else member.get("gatewayPools", []) if gateway
                  else member.get("devPools", []) if dev
                  else member.get("nightlyPools", []) if nightly
@@ -3473,10 +3480,23 @@ def sim_instance(member: dict[str, Any], instance: int) -> bool:
     return at <= instance < at + sim_n
 
 
+def small_instance(member: dict[str, Any], instance: int) -> bool:
+    """A small runner (smallRunners): one of the instances after the member's pool, gateway and sim-first runners. It
+    carries only the small label (glaeda_fleet_labels.small_label) and takes only the small jobs, whose disk peak its
+    gate holds for (glaeda-cmux-runner-hook --small-runner, SMALL_ONLY)."""
+    rule = fleet_labels()
+    at = (int(member.get("runners") or 1) + min(int(member.get("gatewayRunners") or 0),
+                                                int(getattr(rule, "MAX_GATEWAY_RUNNERS", 0)))
+          + min(int(member.get("simRunners") or 0), int(getattr(rule, "MAX_SIM_RUNNERS", 0))))
+    small_n = min(int(member.get("smallRunners") or 0), int(getattr(rule, "MAX_SMALL_RUNNERS", 0)))
+    return at <= instance < at + small_n
+
+
 def member_instances(member: dict[str, Any]) -> int:
-    """How many instances a member runs: its pool runners, then its gateway runners, then its sim-first runner."""
+    """How many instances a member runs: its pool runners, then its gateway runners, then its sim-first runner, then
+    its small runners."""
     return (int(member.get("runners") or 1) + int(member.get("gatewayRunners") or 0)
-            + int(member.get("simRunners") or 0))
+            + int(member.get("simRunners") or 0) + int(member.get("smallRunners") or 0))
 
 
 def member_roles(member: dict[str, Any], instance: int) -> tuple[bool, bool, bool]:
@@ -3538,6 +3558,7 @@ def install_or_uninstall(ctx: Context, args: argparse.Namespace, raw_argv: list[
             ctx.fast_runner, ctx.session_runner = fast, session
             ctx.gateway_runner = gateway_instance(kept, ctx.instance)
             ctx.sim_runner = sim_instance(kept, ctx.instance)
+            ctx.small_runner = small_instance(kept, ctx.instance)
             ctx.gui_runner = not fast and not session and (ctx.gui_runner or gui)
         # a re-run that names nothing keeps what this install registered, not the hostname default
         if not ctx.labels_requested and isinstance(registered.get("labels"), list) and registered["labels"]:
