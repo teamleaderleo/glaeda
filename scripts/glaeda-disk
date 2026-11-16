@@ -2763,6 +2763,25 @@ def runner_checkout_builds(work: Path) -> list[Path]:
     return sorted({p for p in found if contained_directory(p, work)})
 
 
+# A runner workspace with no .git at all (_work/<repo>/<repo>: a job's sources and build output after its git store was
+# removed, remove_checkout_store with no submodule stores, or a job that died before actions/checkout cloned again):
+# runner_checkouts never listed it, so no family and no idle-checkout pass ever took it. cmux18, 2026-11-16: two such
+# trees of 13-14 GiB (runners glaeda-2 and glaeda-10, idle 6-15 h) at 17 GiB free under the 30 GiB runner floor,
+# while the gate held both listeners for want of that space. Git holds nothing there, and actions/checkout deletes a
+# non-repository directory's contents before it clones, so it goes as an idle runner checkout does.
+def runner_gitless_workspaces(work: Path) -> list[Path]:
+    """Each _work/<repo>/<repo> directory with no .git entry at all (not a file, link or directory)."""
+    out = []
+    for repo in _children(work):
+        if repo.name.startswith("_") or repo.is_symlink() or not repo.is_dir():
+            continue
+        tree = repo / repo.name
+        if (not tree.is_symlink() and tree.is_dir() and not os.path.lexists(tree / ".git")
+                and contained_directory(tree, work)):
+            out.append(tree)
+    return sorted(out)
+
+
 def runner_git_garbage(work: Path) -> list[Path]:
     """Temp files git leaves in a checkout's object store when a fetch or repack dies: objects/pack/tmp_pack_*
     and friends, and tmp_obj_* loose-object temp files in objects/ or one fan-out directory down."""
@@ -3137,13 +3156,17 @@ def evict_idle_runner_checkouts(receipt: Path, floor_gib: float, home: Path | No
     target = min(int((floor_gib + POLICY["target_margin_gib"]) * GIB), total // 2)  # as filesystems() sets it
     now = time.time()
     every = []
+    gitless: set[str] = set()  # no .git at all: nothing git can lose, so no git veto
     for runner in enrolled_runners(home):
         work = runner / "_work"
         if work.is_symlink() or not work.is_dir():
             continue
         # only actions/checkout's default _work/<repo>/<repo>; a dedicated runner's checkout kept by role (role_keep)
         every += [(runner, c) for c in runner_checkouts(work) if c.name == c.parent.name and not toolchain_held(c)]
-    bloated = bloated_runner_checkouts([c for _, c in every])
+        trees = [c for c in runner_gitless_workspaces(work) if not toolchain_held(c)]
+        gitless.update(map(os.fspath, trees))
+        every += [(runner, c) for c in trees]
+    bloated = bloated_runner_checkouts([c for _, c in every if os.fspath(c) not in gitless])
     found = []
     for runner, checkout in every:
         used = runner_checkout_last_use(runner, checkout)
@@ -3168,7 +3191,7 @@ def evict_idle_runner_checkouts(receipt: Path, floor_gib: float, home: Path | No
         why = idle_runner_checkout_veto(runner, checkout, open_index(opened), cmds)
         # Only the floor's last resort (under the floor, short of the target) takes a checkout git could lose
         # something of; a stale or bloated one anywhere else goes only when git loses nothing.
-        if not why and not (under and free_now < target):
+        if not why and not (under and free_now < target) and os.fspath(checkout) not in gitless:
             why = runner_checkout_git_veto(checkout)
         if not why:  # the git veto can take a minute (it may ask origin for its tags): judge the runner again now
             try:

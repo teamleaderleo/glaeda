@@ -6516,6 +6516,35 @@ class GlaedaDiskTest(unittest.TestCase):
         self.assertTrue((work / "cmux/.glaeda-state/SourcePackages").is_dir())
         self.assertTrue((work / "_temp/cmux-derived-data-tests-1").is_dir())
 
+    def test_an_idle_runners_workspace_with_no_git_goes_as_its_checkout_would(self) -> None:
+        """cmux18, 2026-11-16: runners glaeda-2 and glaeda-10 each held a 13-14 GiB _work/cmux/cmux with no .git (its
+        store removed, the sources and build output left), idle 6-15 h, at 17 GiB free under the 30 GiB floor. No
+        family listed a tree without .git, so the gate held both listeners for space nothing would free."""
+        home, cos = self._idle_checkouts({"actions-runner-glaeda": 5, "actions-runner-glaeda-2": 9,
+                                          "actions-runner-glaeda-3": 9})
+        for name in ("actions-runner-glaeda-2", "actions-runner-glaeda-3"):
+            shutil.rmtree(cos[name] / ".git")
+            make(cos[name] / "Build", age_hours=9)
+            self._age(home / name, hours=9)
+        busy = home / "actions-runner-glaeda-3"
+        gd.process_evidence = lambda: ([], f"{busy}/bin/Runner.Worker spawnclient 1 2\n")
+        patches, removed = self._floor_disk(17.0, freed_gib=14.0)  # floor 30 + target_margin_gib 20 = 50
+        receipt = self.receipt()
+        with patches[0], patches[1], contextlib.redirect_stdout(io.StringIO()):
+            self.assertGreater(gd.evict_idle_runner_checkouts(receipt, 30.0, home), 0)
+        self.assertFalse(cos["actions-runner-glaeda-2"].exists(), "no .git, no job: it goes, oldest first")
+        self.assertTrue(cos["actions-runner-glaeda-3"].is_dir(), "its runner has a job")
+        self.assertEqual(removed[0], str(cos["actions-runner-glaeda-2"]))
+        recs = {Path(r["path"]).parts[-4]: r for r in map(json.loads, receipt.read_text().splitlines())}
+        self.assertEqual(recs["actions-runner-glaeda-2"]["outcome"], "reclaimed")
+        self.assertIn("running a job", recs["actions-runner-glaeda-3"]["reasons"][0])
+        # a .git that is a file or a link is a checkout of something else's store: never this path's to take
+        work = home / "actions-runner-glaeda-2/_work"
+        make(work / "other/other")
+        (work / "other/other/.git").write_text("gitdir: /elsewhere\n")
+        make(work / "_temp/_temp")  # the runner's own folders are never a workspace
+        self.assertEqual(gd.runner_gitless_workspaces(work), [])
+
     def test_idle_runner_checkouts_of_busy_runners_go_between_jobs(self) -> None:
         """cmuxs-mac-mini-6, 2026-10-21: light jobs kept every runner busy at least hourly, so under the floor
         no checkout was ever an hour quiet; runners with no job, last used 23-32 minutes before, held 20 GiB."""
