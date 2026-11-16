@@ -15015,6 +15015,7 @@ class WaitedUnderReserveTest(Base):
                 "b", status="IN_PROGRESS", conclusion=None)])
             gg.register(gg.parse_key("pr", f"o/r#{n}"), waited=n in self.WAITED)
         self.daemon.tick(NOW)  # read in full while the quota is rich
+        self.full0 = self.gh.full_reads  # (two queries: 12 PRs at the batch of 10)
         self.reserve = gg.daemon_policy()["floors"]["graphql"][1]
         self.under(self.reserve - 10)
 
@@ -15042,7 +15043,7 @@ class WaitedUnderReserveTest(Base):
         self.assertEqual(status["modes"]["graphql"], "stop", "the reserve still stops the daemon's own polling")
         self.assertEqual(self.ages(later, self.WAITED), [0.0] * len(self.WAITED), "waited PRs left stale")
         self.assertEqual(gg.read_cache("pr:o/r#3")["via"], "graphql-probe")
-        self.assertEqual((self.gh.full_reads, self.gh.probes), (1, 1), "ten unchanged PRs cost one probe")
+        self.assertEqual((self.gh.full_reads - self.full0, self.gh.probes), (0, 1), "ten unchanged PRs cost one probe")
         self.assertEqual(self.ages(later, (11, 12)), [gg.CYCLE] * 2, "an unwaited PR is read under the reserve")
 
     def test_a_changed_waited_pr_is_read_in_full_under_the_reserve(self) -> None:
@@ -15051,7 +15052,7 @@ class WaitedUnderReserveTest(Base):
             status="COMPLETED", conclusion="FAILURE")
         node["commits"]["nodes"][0]["commit"]["statusCheckRollup"]["state"] = "FAILURE"
         self.at(NOW + gg.CYCLE)
-        self.assertEqual((self.gh.full_reads, self.gh.probes), (2, 1))
+        self.assertEqual((self.gh.full_reads - self.full0, self.gh.probes), (1, 1))
         cached = gg.read_cache("pr:o/r#4")
         self.assertEqual((cached["via"], cached["data"]["checkState"]), ("graphql", "FAILURE"))
 
