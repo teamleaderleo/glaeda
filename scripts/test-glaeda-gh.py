@@ -15082,6 +15082,18 @@ class WaitedUnderReserveTest(Base):
                              "the next minute reads the next oldest")
             self.assertFalse(set(fresh) & {n for n in self.WAITED if self.ages(then, [n])[0] == 0})
 
+    def test_a_failing_waited_read_is_tried_once_per_waited_fresh(self) -> None:
+        """Review: a read that keeps failing keeps its old dataAt, and was first in line every 2 s tick."""
+        self.gh.throttle["graphql"] = (502, self.gh.rate("graphql", self.reserve - 10), b"bad gateway")
+        later = NOW + gg.CYCLE
+        self.at(later)
+        sent = len([c for c in self.gh.calls if c[1].endswith("/graphql")])
+        self.assertGreater(sent, 0)
+        for k in range(1, int(gg.WAITED_FRESH // gg.TICK)):
+            self.at(later + gg.TICK * k)
+        self.assertEqual(len([c for c in self.gh.calls if c[1].endswith("/graphql")]), sent,
+                         "a failing waited read was retried within WAITED_FRESH")
+
     def test_waited_data_age_over_ten_minutes_under_the_reserve(self) -> None:
         """The harness for the PR's before and after numbers: ten waited PRs, GraphQL under the reserve and REST under
         its own for ten minutes of 2 s ticks; the oldest waited data the broker could serve at any tick, and the

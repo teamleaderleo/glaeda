@@ -2771,6 +2771,7 @@ class Daemon:
         self.steps_failed: dict[Any, float] = {}  # job id -> when GitHub refused its steps for good (STEPS_RETRY)
         self.waived = False  # inside read_waited: the reserve's stop yields down to WAITED_RESERVE_SHARE of it
         self.waited_log: list[tuple[float, int]] = []  # (time, GraphQL points) read_waited spent, last minute
+        self.waited_tried: dict[str, float] = {}  # key -> when read_waited last sent it, within WAITED_FRESH
 
     # -- budget
 
@@ -4627,6 +4628,7 @@ class Daemon:
         more waiters make each read less often, never refused; never below WAITED_RESERVE_SHARE of the reserve, nor
         through GitHub's own back-off or a secondary hold. READ: the keys this tick already read."""
         self.waited_log = [(t, p) for t, p in self.waited_log if self.now - t < 60]
+        self.waited_tried = {k: t for k, t in self.waited_tried.items() if self.now - t < WAITED_FRESH}
         if (self.mode("graphql") != "stop" or self.backoff["graphql"] > self.now or self.secondary_until > self.now
                 or self.waited_points() >= WAITED_PER_MINUTE):
             return
@@ -4636,9 +4638,14 @@ class Daemon:
                 return  # under the part of the reserve kept for lands
             # (a key never read has no dataAt: first in line, and a lane VM's wait on a new PR is filled at once)
             data_at = lambda e: float((e["cache"] or {}).get("dataAt") or 0)  # noqa: E731
+            # Not a kind REST reads on its full cycle (route() sent it there and REST is normal): that is fresh already.
+            # A key tried within WAITED_FRESH waits (a read that keeps failing never takes every pass).
+            served = {k for k in ("pr", "run") if self.paths.get(k) == "rest" and self.mode("rest") == "normal"}
             stale = [e for e in entries if split_key(e["key"])[0] in ("pr", "run") and self.waited(e)
+                     and split_key(e["key"])[0] not in served
                      and e["key"] not in read and not (e["cache"] or {}).get("missing")
-                     and self.now - data_at(e) >= WAITED_FRESH]
+                     and self.now - data_at(e) >= WAITED_FRESH
+                     and self.now - self.waited_tried.get(e["key"], float("-inf")) >= WAITED_FRESH]
             stale.sort(key=lambda e: (data_at(e), e["key"]))
             prs = [e for e in stale if e["key"].startswith("pr:")]
             runs = [e for e in stale if e["key"].startswith("run:")]
@@ -4648,6 +4655,7 @@ class Daemon:
                 if not self.waited_room():
                     return
                 chunk = probe[i:i + WAITED_PROBE_BATCH]
+                self.waited_tried.update((e["key"], self.now) for e in chunk)
                 repos = sorted({caller_of(e["key"])[1] for e in chunk})
                 with self.waited_spend(), self.calling("pr", repos[0] if len(repos) == 1 else f"{len(repos)} repos",
                                                        waiters_of(chunk)):
@@ -4662,10 +4670,13 @@ class Daemon:
                 for i in range(0, len(todo), size):
                     if not self.waited_room():
                         return
+                    self.waited_tried.update((e["key"], self.now) for e in todo[i:i + size])
                     with self.waited_spend():
                         left = self.batched(kind, todo[i:i + size], fetch)
                     if left:
                         return  # GraphQL stopped partway: the rest wait for the next pass
+        except OutOfTime:
+            return  # the tick's budget is spent: the next tick goes on
         finally:
             self.waived = False
 
