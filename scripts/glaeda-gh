@@ -631,6 +631,17 @@ NO_FEATURE = re.compile(r"Upgrade to GitHub Pro|make this repository public to e
 RICH_WINDOW_MIN = 60  # seconds: a bucket about to reset is rich, but not infinitely so
 FULL_WINDOW = 3600  # a bucket not seen yet, or past its reset, counts as a full hour's quota
 SWITCH_MARGIN = 1.25  # a kind moves to the other bucket only when that one is this much richer
+# Richness is reads per second, not requests: a PR read over REST is its pull, check runs, statuses and workflow runs
+# (each conditional), over GraphQL a share of one aliased query for up to 10 PRs plus its probes. cosmic-gray,
+# 2026-11-16 14:45 to 15:45Z: 268 counted REST over 105 REST PR reads (2.55 each) against 200 GraphQL points over 198
+# GraphQL PR reads (1.0). Comparing what is left as if a request and a point bought the same read moved PRs to REST
+# whenever it had 25% more left (10:49, 11:16, 11:43, 12:44, 13:39, 13:41 and 14:39Z that day), at 2.5 times the
+# cost. The daemon's own spend log measures the cost (read_cost); these stand until it has READ_COST_MIN_READS reads
+# over a bucket. Runs keep the plain comparison: over REST an unchanged run is a free 304.
+COST_WEIGHTED = ("pr",)
+READ_COST_DEFAULT = {("pr", "rest"): 2.5, ("pr", "graphql"): 1.0}
+READ_COST_MIN_READS = 20
+READ_COST_FLOOR = 0.05  # a measured cost of nothing (every read a 304) still costs something to route on
 REST_CHECK_PAGES = 5  # check-run pages (100 each) one PR read over REST takes at most
 REST_STATUS_PAGES = 2  # commit-status pages (100 each) likewise
 REST_RUN_PAGES = 2  # a commit's workflow-run pages (100 each) likewise: without its run a check has no workflow
@@ -663,7 +674,18 @@ REST_REPO_PART_KEEP = 3600  # an answer past its TTL still lends its ETag to the
 # still reads its head anew. REST_SHARED_MAX bounds the store; the oldest answers go first.
 REST_HEAD_PART_TTL = 15
 REST_SHARED_MAX = 600
-REST_READ_MAX = {"pr": REST_CHECK_PAGES + REST_STATUS_PAGES + REST_RUN_PAGES + 4, "run": 2, "comment": 3,
+# A pull's ETag moves without the pull changing: GET pulls/N embeds its base and head repositories whole (pushed_at,
+# open_issues_count, ...), so on a busy repository every read is a counted 200. cosmic-gray, 2026-11-16 15:25 to
+# 15:38Z, GraphQL under its reserve and every PR on REST: 89 of 103 pull reads were counted, the largest single route
+# (248 counted in all). GET issues/N is the same record without the repositories: its ETag holds until the PR
+# itself changes (a push, a comment, a review, a label, a close or merge all move its updated_at), and an unchanged
+# one answers 304, which is free (live, manaflow-ai/cmux#44595: two reads 90 s apart, pulls 200 and 200, issues 200
+# then 304). So a REST PR read asks the issue first and reuses the pull it holds when the issue is unchanged
+# (rest_pull). What the issue does not show is mergeability, which moves when the base moves: the kept pull is reused
+# at most PULL_REUSE_MAX, never once GitHub had not computed mergeability (mergeable null), and never on a head whose
+# checks have all finished and changed since (then the merge state the waits rule on is final, and is read anew).
+PULL_REUSE_MAX = 300
+REST_READ_MAX = {"pr": REST_CHECK_PAGES + REST_STATUS_PAGES + REST_RUN_PAGES + 5, "run": 2, "comment": 3,
                  "head": REST_CHECK_PAGES + REST_STATUS_PAGES + REST_RUN_PAGES + 1}
 
 # NUM is the alias's PR-number variable: isRequired needs it
@@ -2014,6 +2036,23 @@ def slim_statuses(doc: dict) -> list[dict]:
             for c in doc.get("statuses") or [] if isinstance(c, dict)]
 
 
+def slim_issue_gate(doc: dict) -> dict:
+    """GET issues/N as rest_pull's change detector: only what says the PR changed."""
+    return {k: doc.get(k) for k in ("number", "state", "updated_at")}
+
+
+def head_pending(checks: dict, statuses: list[dict]) -> bool:
+    """A head with a check run not completed, or a status pending, by its REST reads (rest_head)."""
+    return (any(str(c.get("status") or "").lower() != "completed" for c in checks.get("check_runs") or [])
+            or any(str(s.get("state") or "").lower() in {"pending", "expected"} for s in statuses))
+
+
+def head_moved(old: dict, parts: dict, prefix: str) -> bool:
+    """Whether a head read (the parts under PREFIX, a commit's) answered anything but its kept answer."""
+    return any(path.startswith(prefix) and (part.get("etag") != (old.get(path) or {}).get("etag") or path not in old)
+               for path, part in parts.items())
+
+
 def slim_status_page(doc: dict) -> dict:
     """One page of a commit's combined status, with the total it says there is."""
     return {"total": doc.get("total_count"), "statuses": slim_statuses(doc)}
@@ -3265,6 +3304,19 @@ class Daemon:
             return max(0, limit - reserve) / FULL_WINDOW
         return max(0, seen.get("remaining", limit) - reserve) / max(seen["reset"] - self.now, RICH_WINDOW_MIN)
 
+    def read_cost(self, kind: str, bucket: str) -> float:
+        """What one KIND entry read over BUCKET cost the shared pool lately: counted REST requests (a 304 is free) or
+        GraphQL points, per entry read, from the spend log and this process's reads over the same window (since it
+        began, an hour at most). READ_COST_DEFAULT until READ_COST_MIN_READS reads were made over that bucket."""
+        began = self.started_tick if self.started_tick is not None else self.now
+        window = min(3600.0, self.now - began)
+        reads = sum(1 for t, k, b in self.reads if k == kind and b == bucket and self.now - t <= window)
+        if reads < READ_COST_MIN_READS:
+            return READ_COST_DEFAULT[(kind, bucket)]
+        spent = sum(r["counted"] if bucket == "rest" else r["points"] for r in self.spend_rows(window + 60)
+                    if r["bucket"] == bucket and r["kind"] == kind)
+        return max(READ_COST_FLOOR, spent / reads)
+
     def route(self, kind: str) -> str:
         """The bucket this kind reads over this tick: the richer one. A kind leaves its current bucket
         only when the other is SWITCH_MARGIN richer (or the current one stopped), so the reads move in
@@ -3281,13 +3333,20 @@ class Daemon:
                 self.paths[kind] = current = want
         if kind in BALANCED:
             here, there = self.richness(current), self.richness(OTHER[current])
+            # Reads per second each bucket affords, not requests: a PR over REST is several requests, over GraphQL
+            # about one point (read_cost). A stopped bucket (-1) stays stopped.
+            cost = {b: self.read_cost(kind, b) for b in (current, OTHER[current])} if kind in COST_WEIGHTED else None
+            if cost:
+                here = here if here < 0 else here / cost[current]
+                there = there if there < 0 else there / cost[OTHER[current]]
             # Below its floor while the other bucket is not: move, whatever the margin says. The reverse never
             # moves by the margin (a low bucket about to reset can look richer), so the two cannot flap.
             low = self.mode(current) != "normal" and self.mode(OTHER[current]) == "normal"
             into_low = self.mode(OTHER[current]) != "normal" and self.mode(current) == "normal"
             if there >= 0 and (here < 0 or low or (not into_low and there > here * SWITCH_MARGIN)):
                 log({"event": "route", "kind": kind, "from": current, "to": OTHER[current],
-                     "perMinute": {current: round(here * 60, 1), OTHER[current]: round(there * 60, 1)}})
+                     "perMinute": {current: round(here * 60, 1), OTHER[current]: round(there * 60, 1)},
+                     **({"readCost": {b: round(c, 2) for b, c in cost.items()}} if cost else {})})
                 self.paths[kind] = current = OTHER[current]
         return current
 
@@ -6043,10 +6102,16 @@ class Daemon:
         root = f"/repos/{owner}/{repo}"
         old, parts = prior.get("restParts") or {}, {}
         try:
-            pull = self.head_part(old, parts, f"{root}/pulls/{number}", slim_pull)
+            pull, reused = self.rest_pull(old, parts, root, number)
             sha = (pull.get("head") or {}).get("sha") or ""
-            base = urllib.parse.quote(str((pull.get("base") or {}).get("ref") or ""), safe="/")
             checks, statuses, runs, workflows = self.rest_head(old, parts, root, sha)
+            if reused and not head_pending(checks, statuses) and head_moved(old, parts, f"{root}/commits/{sha}/"):
+                # every check finished, and something changed since the kept pull: the merge state is final now
+                pull, _ = self.rest_pull(old, parts, root, number, reuse=False)
+                if ((pull.get("head") or {}).get("sha") or "") != sha:  # (a push the issue had not shown yet)
+                    sha = (pull.get("head") or {}).get("sha") or ""
+                    checks, statuses, runs, workflows = self.rest_head(old, parts, root, sha)
+            base = urllib.parse.quote(str((pull.get("base") or {}).get("ref") or ""), safe="/")
             listed = checks["check_runs"]
             # a deleted base (a stacked PR's, after its merge) has no requirements left to read
             rules, protection = f"{root}/rules/branches/{base}?per_page=100", f"{root}/branches/{base}"
@@ -6072,6 +6137,42 @@ class Daemon:
         data = parse_pr(rest_pr_node(pull, checks, statuses, runs, required, review, workflows))
         self.fill_steps_rest(e, data, root, {c.get("node_id"): c.get("id") for c in listed})
         self.store(e["key"], e["cache"], dataAt=self.now, data=data, restParts=parts, via="rest")
+
+    def rest_pull(self, old: dict, parts: dict, root: str, number: Any, reuse: bool = True) -> tuple[dict, bool]:
+        """(the pull, whether it is the kept one) for a REST PR read. The kept pull stands, with no pulls/N request,
+        when GET issues/N answers 304 (the PR has not changed since) and the kept pull is under PULL_REUSE_MAX old with
+        its mergeability computed; otherwise pulls/N is read (head_part), and its time kept for that bound. The issue
+        answer is kept beside a pull only when both name the same updated_at (a pull and its issue share it; live,
+        manaflow-ai/cmux#44595), so a 304 on it means unchanged since that pull. A failed issue read falls back to
+        reading the pull. Raises WatchError (the pull's), OutOfTime."""
+        path, gate = f"{root}/pulls/{number}", f"{root}/issues/{number}"
+        kept = old.get(path) or {}
+        at = kept.get("at")
+        doc = kept.get("doc") if isinstance(kept.get("doc"), dict) else None
+        held = old.get(gate) or {}
+        can_reuse = (reuse and doc is not None and doc.get("mergeable") is not None and isinstance(at, (int, float))
+                     and self.now - at < PULL_REUSE_MAX and bool(held.get("etag")))
+        if can_reuse and gate not in parts:
+            try:
+                self.head_part(old, parts, gate, slim_issue_gate)
+            except WatchError:
+                parts.pop(gate, None)
+            else:
+                if parts[gate].get("etag") == held.get("etag"):  # 304 (or shared now): unchanged since the kept pull
+                    parts[path] = kept
+                    return doc, True
+        pull = self.head_part(old, parts, path, slim_pull)
+        parts[path] = {**parts[path], "at": self.now}
+        if gate not in parts and held.get("etag") and (held.get("doc") or {}).get("updated_at") == pull.get("updated_at"):
+            parts[gate] = held  # the issue answer kept still describes this pull
+        elif gate not in parts and self.mode("rest") != "stop":
+            try:  # the issue as of now, for the next read's question (shared: a kept ETag makes it a 304)
+                self.head_part(old, parts, gate, slim_issue_gate)
+            except WatchError:
+                parts.pop(gate, None)
+        if (parts.get(gate) or {}).get("doc", {}).get("updated_at") != pull.get("updated_at"):
+            parts.pop(gate, None)  # the PR changed between the two reads (or the issue lags): no 304 can vouch yet
+        return pull, False
 
     def rest_head(self, old: dict, parts: dict, root: str, sha: str) -> tuple[dict, list, list, dict]:
         """A commit's check runs (every attempt, up to REST_CHECK_PAGES pages), statuses, workflow runs and the

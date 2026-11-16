@@ -220,6 +220,7 @@ class FakeGitHub:
         self.full_reads = 0  # full PR queries answered
         self.named_calls: list[str] = []  # check-runs?check_name=NAME reads, by NAME
         self.whole_heads = False  # REST check runs and statuses list self.heads (every page), not a PR's rollup page
+        self.repo_pushes = 0  # pushes to the base repository: GET pulls/N embeds it, so each moves the pull's ETag
 
     def rate(self, resource: str, remaining: int) -> dict:
         return {"x-ratelimit-limit": "5000", "x-ratelimit-remaining": str(remaining),
@@ -377,9 +378,21 @@ class FakeGitHub:
             {"id": suite["id"], "latest": suite["latest"] if suite["latest"] is None else {"totalCount": suite["latest"]}}
             for suite in suites]}}
 
+    @staticmethod
+    def pr_updated(node: dict) -> str:
+        """A PR's updated_at, the pull's and its issue's alike: it moves with what moves GitHub's (a push, a title, a
+        draft flip, a close or merge, updatedAt itself), not with mergeability, which a base move changes on its own."""
+        return json.dumps([node.get(k) for k in ("state", "headRefOid", "title", "isDraft", "merged", "mergedAt",
+                                                 "updatedAt")])
+
     def rest_issue(self, parts: list[str], path: str) -> Any:
         """The REST view of the GraphQL issue nodes in self.issues: the issue, or a page of its comments."""
         node = self.issues.get((parts[2], parts[3], int(parts[5])))
+        pr = self.prs.get((parts[2], parts[3], int(parts[5])))
+        if node is None and pr is not None and len(parts) == 6:
+            # Every PR is an issue too, with the pull's updated_at.
+            return {"number": pr["number"], "html_url": pr["url"], "state": "open" if pr["state"] == "OPEN" else "closed",
+                    "updated_at": self.pr_updated(pr), "pull_request": {"merged_at": pr.get("mergedAt")}}
         if node is None:
             return None
         comments = node["comments"]["nodes"]
@@ -405,8 +418,10 @@ class FakeGitHub:
             return {"number": node["number"], "html_url": node["url"], "title": node["title"], "state": state,
                     "draft": node["isDraft"], "merged": node["merged"], "merged_at": node["mergedAt"],
                     "mergeable": {"MERGEABLE": True, "CONFLICTING": False}.get(node["mergeable"]),
-                    "mergeable_state": node["mergeStateStatus"].lower(), "updated_at": node["updatedAt"],
-                    "head": {"sha": node["headRefOid"], "ref": node.get("headRefName")}, "base": {"ref": "main"}}
+                    "mergeable_state": node["mergeStateStatus"].lower(), "updated_at": self.pr_updated(node),
+                    "head": {"sha": node["headRefOid"], "ref": node.get("headRefName")},
+                    # GitHub embeds the base repository whole, so any push to it moves the pull's ETag
+                    "base": {"ref": "main", "repo": {"pushed_at": self.repo_pushes}}}
         if what in {"rules", "branches"} and self.base_gone:
             return None
         if what == "rules":
@@ -2433,12 +2448,14 @@ class BalanceTest(Base):
         self.assertEqual(self.daemon.route("run"), "graphql")
 
     def test_a_kind_moves_only_when_the_other_bucket_is_clearly_richer(self) -> None:
+        # runs: a PR's route also weighs what a read costs on each bucket (ConcurrentWaitsRestTest)
+        self.daemon.paths["run"] = "graphql"
         self.budgets(rest=(2200, 1800), graphql=(2000, 1800))  # rest 10% richer: below the margin
-        self.assertEqual(self.daemon.route("pr"), "graphql")
+        self.assertEqual(self.daemon.route("run"), "graphql")
         self.budgets(rest=(3000, 1800), graphql=(2000, 1800))
-        self.assertEqual(self.daemon.route("pr"), "rest")
+        self.assertEqual(self.daemon.route("run"), "rest")
         self.budgets(rest=(2200, 1800), graphql=(2000, 1800))  # and it stays there until GraphQL leads
-        self.assertEqual(self.daemon.route("pr"), "rest")
+        self.assertEqual(self.daemon.route("run"), "rest")
 
     def test_the_cheaper_path_flips_as_buckets_drain(self) -> None:
         """Both buckets drain about evenly: reads follow whichever has more to spend per second."""
@@ -2496,7 +2513,7 @@ class BalanceTest(Base):
         self.daemon.budget["graphql"] = {"limit": 5000, "remaining": 400, "reset": NOW + 3000}
         self.daemon.tick(NOW + gg.CYCLE)
         paths = [c[1].split("/o/r/", 1)[1] for c in self.gh.rest_calls()]
-        self.assertEqual(paths, ["pulls/1", f"commits/{'a' * 40}/check-runs?filter=all&per_page=100",
+        self.assertEqual(paths, ["pulls/1", "issues/1", f"commits/{'a' * 40}/check-runs?filter=all&per_page=100",
                                  f"commits/{'a' * 40}/status?per_page=100&page=1", f"actions/runs?head_sha={'a' * 40}&per_page=100&page=1",
                                  "actions/workflows?per_page=100", "rules/branches/main?per_page=100", "branches/main"])
         over_rest = gg.read_cache(key)["data"]
@@ -2510,8 +2527,9 @@ class BalanceTest(Base):
         # nothing changed: every conditional read answers 304, which costs no quota
         before = self.gh.rest_remaining
         self.daemon.tick(NOW + 2 * gg.CYCLE)
-        # the 4 PR-level reads, all 304; the 3 repo/base-level answers are shared within REST_REPO_PART_TTL
-        self.assertEqual(len(self.gh.rest_calls()), 11)
+        # the issue (304, so the pull kept stands: rest_pull) and the head's 3 reads, all 304; the 3 repo/base-level
+        # answers are shared within REST_REPO_PART_TTL
+        self.assertEqual(len(self.gh.rest_calls()), 12)
         self.assertEqual(self.gh.rest_remaining, before)
         self.assertEqual(gg.read_cache(key)["data"]["checks"], over_rest["checks"])
 
@@ -3142,7 +3160,7 @@ class BalanceTest(Base):
         self.assertEqual(sorted(p for p in asked() if p.startswith("pulls/")), [f"pulls/{n}" for n in range(1, 6)])
         for path in shared:
             self.assertEqual(asked().count(path), 1, path)
-        self.assertEqual(len(asked()), 5 * 4 + 3)
+        self.assertEqual(len(asked()), 5 * 5 + 3)  # each PR: pull, issue (rest_pull) and its head's 3
         for n in range(1, 6):
             entry = gg.read_cache(f"pr:o/r#{n}")
             self.assertEqual(entry["data"]["requiredMissing"], ["ci-status"], n)
@@ -3150,7 +3168,7 @@ class BalanceTest(Base):
         self.daemon.tick(NOW + gg.CYCLE)  # within the TTL: only the PR-level reads (all 304)
         for path in shared:
             self.assertEqual(asked().count(path), 1, path)
-        self.assertEqual(len(asked()), 2 * 5 * 4 + 3)
+        self.assertEqual(len(asked()), 5 * 5 + 3 + 5 * 4)  # the issue (304) stands for the pull now
         # past the TTL, one conditional read refreshes each for every PR: a base move is one counted 200
         self.gh.protected = ["ci-status", "lint"]
         before = self.gh.rest_remaining
@@ -15110,6 +15128,107 @@ class WaitedUnderReserveTest(Base):
               file=sys.stderr)
         self.assertLessEqual(worst, 60, "a waited PR's data went past a minute old")
         self.assertLessEqual(spent, 10 * gg.WAITED_PER_MINUTE)
+
+
+class ConcurrentWaitsRestTest(Base):
+    """claude-sr2-coord, 2026-11-16 15:3xZ: one session on cosmic-gray made 76 GET pulls/{id}, 14 check-runs pages and
+    12 actions/runs?head_sha reads in 10 min, with only about 7 plain `glaeda-gh wait pr|run` running. The waits share
+    the daemon's one read per target already; what cost was each REST PR read: GET pulls/N embeds the base repository
+    (pushed_at), so on a busy repository its ETag moves every minute and every read was a counted 200, and the route
+    sent PRs to REST whenever REST had 25% more requests left although a REST PR read costs about 2.5 requests and a
+    GraphQL one about a point. The harness: 7 waited PRs on two repositories, the base pushed every minute, two PRs'
+    checks finishing partway, ten minutes of ticks. The number is counted REST requests (a 304 is free)."""
+
+    WAITS = [("o", "r", n) for n in range(1, 6)] + [("o", "lw", n) for n in (1, 2)]
+
+    def setUp(self) -> None:
+        super().setUp()
+        for owner, repo, n in self.WAITS:
+            node = pr_node(n, rollup="PENDING", checks=[check_run("lint"), check_run("test", "IN_PROGRESS", None)])
+            node.update(url=f"https://github.com/{owner}/{repo}/pull/{n}", headRefOid=f"{n:x}{repo}".ljust(40, "a")[:40],
+                        mergeStateStatus="BLOCKED")
+            self.gh.prs[(owner, repo, n)] = node
+            gg.register(f"pr:{owner}/{repo}#{n}", waited=True, began=NOW)
+
+    def ten_minutes_over_rest(self) -> int:
+        """Counted REST requests over ten one-minute ticks with GraphQL forced low (every PR on REST), after the first
+        read: the steady state the waits sat in."""
+        gg.write_json(gg.DAEMON_CONFIG, {"forceLow": ["graphql"], "restShare": 1.0})
+        self.addCleanup(lambda: gg.DAEMON_CONFIG.unlink(missing_ok=True))
+        self.daemon.paths = {kind: "rest" for kind in gg.CYCLES}
+        self.daemon.tick(NOW)
+        start, self.after_setup = self.gh.rest_remaining, len(self.gh.calls)
+        for minute in range(1, 11):
+            self.gh.repo_pushes += 1  # someone merged to the base: every pull's ETag moves
+            if minute == 4:  # two PRs' last check finishes; GitHub settles their merge state
+                for key in (("o", "r", 2), ("o", "lw", 1)):
+                    node = self.gh.prs[key]
+                    node["commits"]["nodes"][0]["commit"]["statusCheckRollup"]["contexts"]["nodes"][1].update(
+                        status="COMPLETED", conclusion="SUCCESS")
+                    node["mergeStateStatus"] = "CLEAN"
+            t = NOW + minute * gg.CYCLE
+            for owner, repo, n in self.WAITS:
+                path = gg.watch_dir() / gg.file_name(f"pr:{owner}/{repo}#{n}")
+                gg.write_json(path, {**gg.read_json(path), "waitedAt": t})
+                os.utime(path, (t, t))
+            self.daemon.tick(t)
+        return start - self.gh.rest_remaining
+
+    def test_seven_waits_over_rest_reuse_the_pull_while_the_issue_is_unchanged(self) -> None:
+        counted = self.ten_minutes_over_rest()
+        pulls = [c for c in self.gh.calls[self.after_setup:] if re.search(r"/pulls/\d+$", c[1].split("?")[0])]
+        print(f"\nHARNESS 7 waits, 10 min over REST: {counted} counted REST, {len(pulls)} pull reads", file=sys.stderr)
+        # Before: every PR's pull every minute, 7 x 10 = 70 counted pulls alone (the 76 of the evidence). After: a
+        # pull at most every PULL_REUSE_MAX while its issue answers 304, and once more when its checks settle.
+        reuse = getattr(gg, "PULL_REUSE_MAX", gg.CYCLE)
+        self.assertLessEqual(len(pulls), 7 * (10 * gg.CYCLE // reuse) + 2, len(pulls))
+        self.assertLessEqual(counted, 30, f"{counted} counted REST requests in 10 min for 7 waits")
+        for key in (("o", "r", 2), ("o", "lw", 1)):
+            data = gg.read_cache(f"pr:{key[0]}/{key[1]}#{key[2]}")["data"]
+            self.assertEqual((data["mergeStateStatus"], data["checkState"]), ("CLEAN", "SUCCESS"),
+                             "a settled head's merge state was not read anew")
+        for owner, repo, n in self.WAITS:
+            settled = (owner, repo, n) in {("o", "r", 2), ("o", "lw", 1)}
+            data = gg.read_cache(f"pr:{owner}/{repo}#{n}")["data"]
+            self.assertEqual(data["checkState"], "SUCCESS" if settled else "PENDING", (owner, repo, n))
+
+    def test_a_push_the_issue_shows_reads_the_pull_at_once(self) -> None:
+        self.ten_minutes_over_rest()
+        node = self.gh.prs[("o", "r", 3)]
+        node["headRefOid"] = "f" * 40
+        node["updatedAt"] = "pushed"
+        t = NOW + 11 * gg.CYCLE
+        path = gg.watch_dir() / gg.file_name("pr:o/r#3")
+        gg.write_json(path, {**gg.read_json(path), "waitedAt": t})
+        os.utime(path, (t, t))
+        self.daemon.tick(t)
+        self.assertEqual(gg.read_cache("pr:o/r#3")["data"]["headRefOid"], "f" * 40)
+
+    def test_a_pr_read_costs_more_over_rest_so_rest_must_be_that_much_richer(self) -> None:
+        self.daemon.now = NOW
+        self.daemon.started_tick = NOW
+        # REST 30% richer by requests left: the old route moved PRs there, at 2.5 requests a read
+        self.daemon.budget = {"rest": {"limit": 5000, "remaining": 2600, "reset": NOW + 1800},
+                              "graphql": {"limit": 5000, "remaining": 2000, "reset": NOW + 1800}}
+        self.daemon.paths["pr"] = "graphql"
+        self.assertEqual(self.daemon.route("pr"), "graphql")
+        self.assertEqual(self.daemon.route("run"), "rest", "a run over REST is a free 304 when unchanged: not weighted")
+        # REST far richer: PRs still move
+        self.daemon.budget["rest"]["remaining"] = 4900
+        self.daemon.budget["graphql"]["remaining"] = 1100
+        self.assertEqual(self.daemon.route("pr"), "rest")
+
+    def test_read_cost_is_measured_from_the_spend_log(self) -> None:
+        self.daemon.now = NOW
+        self.daemon.started_tick = NOW - 1800
+        self.daemon.reads = [(NOW - 60, "pr", "rest")] * 40 + [(NOW - 60, "pr", "graphql")] * 40
+        minute = int(NOW // 60) - 1
+        self.daemon.spend = {minute: {"rest\tGET /repos/{owner}/{repo}/pulls/{id}\tpr\to/r": [40, 40, 0],
+                                      "graphql\tpr\tpr\to/r": [8, 8, 8]}}
+        self.assertAlmostEqual(self.daemon.read_cost("pr", "rest"), 1.0)
+        self.assertAlmostEqual(self.daemon.read_cost("pr", "graphql"), 0.2)
+        self.daemon.reads = self.daemon.reads[:5]  # too few reads to measure: the default stands
+        self.assertEqual(self.daemon.read_cost("pr", "rest"), gg.READ_COST_DEFAULT[("pr", "rest")])
 
 
 class UpstreamDirectAfterTest(unittest.TestCase):
