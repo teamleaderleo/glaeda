@@ -7935,7 +7935,8 @@ class Gate:
         if busy is None or not ecores or len(busy) <= ecores:
             return held
         p_busy = sum(busy[ecores:]) / (len(busy) - ecores)
-        if held is not None and p_busy >= PCORE_WORKING_P_BUSY:
+        # glaeda-update's hold (a 120 s --help timeout) is not a P-core reading, so no P-core reading clears it.
+        if held is not None and p_busy >= PCORE_WORKING_P_BUSY and held.get("source") != "glaeda-update":
             gate_log(f"the performance cores work again ({p_busy:.0f}% busy): listening again")
             with contextlib.suppress(OSError):
                 path.unlink()

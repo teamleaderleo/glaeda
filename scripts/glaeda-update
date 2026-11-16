@@ -484,6 +484,76 @@ def gh_only(config: dict) -> bool:
     return "--gh-only" in config["setupArgs"]
 
 
+# The runner gate (glaeda-cmux-runner-hook, glaeda#2018) holds a mini whose performance cores run nothing until a
+# drained reboot, through PCORE_STALL_FILE in its state dir (FLEET_DIR/ci), kept for one boot. A host that cannot
+# start Python's --help in 120 s is the same stall seen from here, and the gate it runs may be too old to see it:
+# cmux8s-mac-mini, 2026-11-15 22:25Z on, refused every update on `glaeda-disk --help` at load 180-250 (CPU 71% idle,
+# the P-cores running nothing), so the hold that would have drained it never installed; nothing said so for 6 h.
+# Only on a runner mini (FLEET_DIR exists). The gate keeps this hold until the boot changes or 12 h pass; this
+# updater drops it once its own checks run in time again.
+FLEET_DIR = Path(os.environ.get("GLAEDA_FLEET_DIR") or "/Users/Shared/cmux-build-fleet")
+PCORE_STALL_FILE = "pcore-stall.json"
+PCORE_STALL_MAX_HOLD_S = 12 * 3600  # as the gate's
+STALL_SOURCE = "glaeda-update"
+
+
+def boot_epoch() -> int | None:
+    """The host's boot time (kern.boottime's seconds), or None when unreadable."""
+    try:
+        out = subprocess.run(["/usr/sbin/sysctl", "-n", "kern.boottime"], stdin=subprocess.DEVNULL,
+                             capture_output=True, text=True, timeout=5).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    found = re.search(r"sec = (\d+)", out)
+    return int(found.group(1)) if found else None
+
+
+def stall_hold() -> Path:
+    return FLEET_DIR / "ci" / PCORE_STALL_FILE
+
+
+def note_stall(what: str) -> bool:
+    """Write the runner gate's stall hold for a check (what) that took over 120 s; True when written. A hold already
+    in force for this boot (the gate's or an earlier run's) is kept, with its start. Never raises."""
+    if not FLEET_DIR.is_dir():
+        return False
+    boot = boot_epoch()
+    if boot is None:
+        return False
+    path = stall_hold()
+    try:
+        doc = json.loads(path.read_text(encoding="utf-8"))
+        if (isinstance(doc, dict) and doc.get("boot") == boot
+                and time.time() - float(doc.get("since") or 0) < PCORE_STALL_MAX_HOLD_S):
+            return False
+    except (OSError, ValueError, TypeError):
+        pass
+    host = platform.node().split(".")[0]
+    held = {"boot": boot, "since": time.time(), "source": STALL_SOURCE,
+            "why": f"glaeda-update: {what} took over 120 s, so this mini cannot start Python in time (stalled like idle "
+                   f"performance cores): it needs a drained reboot (leo-workspace tools/mini_reboot.py --apply "
+                   f"--min-held-gib 0 {host})"}
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(f".{path.name}.{os.getpid()}")
+        tmp.write_text(json.dumps(held), encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError:
+        return False
+    return True
+
+
+def clear_stall() -> None:
+    """Drop the hold this updater wrote (its checks ran in time again); the gate's own hold is the gate's."""
+    path = stall_hold()
+    try:
+        doc = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(doc, dict) and doc.get("source") == STALL_SOURCE:
+            path.unlink()
+    except (OSError, ValueError):
+        pass
+
+
 def health(bin_dir: Path, channel_dir: Path, gh_only: bool = False) -> tuple[bool | None, str]:
     """The installed tools run, and the installed glaeda-update plans from the channel files this
     run already fetched, so a network blip cannot fail (and quarantine) a good release. A --gh-only
@@ -505,6 +575,7 @@ def health(bin_dir: Path, channel_dir: Path, gh_only: bool = False) -> tuple[boo
         try:
             result = subprocess.run(argv, capture_output=True, text=True, timeout=120, stdin=subprocess.DEVNULL)
         except subprocess.TimeoutExpired as e:
+            note_stall(f"{name} --help" if "--help" in argv else name)
             return None, f"{name}: {e}"
         except OSError as e:
             return False, f"{name}: {e}"
@@ -517,6 +588,7 @@ def health(bin_dir: Path, channel_dir: Path, gh_only: bool = False) -> tuple[boo
                 return False, "glaeda-update printed no plan"
             if planned not in ("plan", "current", "idle", "quarantined"):
                 return False, f"glaeda-update planned {planned}"
+    clear_stall()
     return True, "tools run"
 
 
@@ -782,6 +854,8 @@ def setup_args_supported(gen: Path, args: list[str]) -> tuple[bool, str]:
         result = subprocess.run([sys.executable, str(script), "--help"], capture_output=True, text=True,
                                 timeout=120, stdin=subprocess.DEVNULL)
     except (OSError, subprocess.TimeoutExpired) as e:
+        if isinstance(e, subprocess.TimeoutExpired):
+            note_stall("glaeda-mini-setup --help")
         return False, f"setup compatibility probe failed: {e}"
     if result.returncode != 0:
         return False, f"setup compatibility probe exited {result.returncode}"
