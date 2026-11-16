@@ -445,9 +445,8 @@ pub fn plan_linked_worktree_reclaim(
 /// Where running processes of this user are working, from one bounded observation.
 ///
 /// Linux reads every readable process's working directory and open files from `/proc`. macOS asks
-/// `lsof` for working directories only: every open file of every process exceeds the 1 MiB capture
-/// limit on a busy Mac, and a process working in a checkout normally has its cwd there. Paths are
-/// kept private and only ever compared.
+/// `lsof` for every named path so a process holding a file from a checkout while its cwd is elsewhere
+/// still vetoes removal. Paths are kept private and only ever compared.
 #[derive(Clone, PartialEq, Eq)]
 pub struct ProcessUseEvidence {
     paths: Vec<PathBuf>,
@@ -464,6 +463,34 @@ impl fmt::Debug for ProcessUseEvidence {
 
 const LSOF_PROGRAM: &str = "/usr/sbin/lsof";
 const LSOF_TIMEOUT: Duration = Duration::from_secs(60);
+
+fn tree_owned_by_current_user(path: &Path) -> bool {
+    let uid = rustix::process::geteuid().as_raw();
+    let mut stack = vec![path.to_path_buf()];
+    while let Some(current) = stack.pop() {
+        let entries = match std::fs::read_dir(&current) {
+            Ok(entries) => entries,
+            Err(_) => return false,
+        };
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(_) => return false,
+            };
+            let metadata = match entry.metadata() {
+                Ok(metadata) => metadata,
+                Err(_) => return false,
+            };
+            if metadata.uid() != uid {
+                return false;
+            }
+            if metadata.is_dir() {
+                stack.push(entry.path());
+            }
+        }
+    }
+    true
+}
 
 impl ProcessUseEvidence {
     /// Evidence from explicit paths, for callers that observed processes themselves and for tests.
@@ -493,9 +520,7 @@ impl ProcessUseEvidence {
                 .argument("-P")
                 .argument("-w")
                 .argument("-Fn")
-                .argument("-a")
-                .argument("-d")
-                .argument("cwd");
+                .argument("-a");
             let record = executor
                 .execute_with_timeout(&spec, LSOF_TIMEOUT)
                 .map_err(|_| process_evidence_unavailable())?;
@@ -985,7 +1010,8 @@ fn observe_detailed(
         owned_by_current_user: std::fs::symlink_metadata(&checkout)
             .map_err(|_| unavailable())?
             .uid()
-            == rustix::process::geteuid().as_raw(),
+            == rustix::process::geteuid().as_raw()
+            && tree_owned_by_current_user(&checkout),
         head_reachability,
         in_use: evidence.uses(&checkout),
         work_state,

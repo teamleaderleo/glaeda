@@ -300,7 +300,7 @@ fn work_state_picks_the_window_and_a_working_process_vetoes() {
     let _ = sleeper.wait();
     let document = document(&output);
     assert_eq!(document["finished_idle_seconds"], 3_600);
-    assert_eq!(document["minimum_idle_seconds"], 3 * 24 * 60 * 60);
+    assert_eq!(document["minimum_idle_seconds"], 48 * 60 * 60);
     let report = document["repositories"][0].clone();
     let order = fixture.linked_order();
     let by_name = |name: &str| {

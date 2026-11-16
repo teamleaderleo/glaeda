@@ -7,6 +7,7 @@ Type=oneshot
 ExecStart=%h/.local/bin/glaeda-idle-repair --apply
 Environment=PYTHONUNBUFFERED=1
 Environment=GLAEDA_ROLE=@GLAEDA_ROLE@
+Environment=GLAEDA_WORKTREE_RECLAIM_ALL=%h/.local/bin/glaeda-worktree-reclaim-all
 Nice=10
 IOSchedulingClass=idle
 TimeoutStartSec=15min
