@@ -6249,10 +6249,20 @@ SIDE_FIT_JOBS = (("cmux-next.yml", "fast-tier"), ("cmux-next.yml", "swift-canary
 
 def side_fit_units(scope: RunnerScope) -> int:
     """The units a plain side runner (no root, gui, session, fast, freshness, nightly or dedicated role) listens
-    with room for: the costliest of SIDE_FIT_JOBS. Every other role keeps its own fit (mini_full)."""
+    with room for: the costliest of SIDE_FIT_JOBS. On a host that reads measured needs (CAPACITY_ARITHMETIC) it is
+    their classes' need instead (class_need: the class median, at most half the host), so the listener listens
+    whenever a typical side job fits; the job's own admission still waits for its own measured need. Every other
+    role keeps its own fit (mini_full)."""
     if scope.units <= 0 or scope.root or scope.gui or scope.session or scope.fast or scope.fresh \
             or scope.nightly or scope.dedicated or scope.gateway or scope.sim:
         return 1
+    classes = {job_class(job, DEFAULT_HOME_REPO, workflow=workflow)[0] for workflow, job in SIDE_FIT_JOBS}
+    needs = load_job_needs()[0]
+    if needs:
+        # SIDE_LISTEN_MEDIAN: fast-tier's ceil(cores_p90) is 8 of 14 cores (11 of 30), so on the needs hosts the
+        # side listeners waited for 8 free units while 3-6 sat free, and glaeda-side-std was 1 of 27 online
+        # (2026-11-16 04:55Z, cmux14 at 2 of 14 free: "its next job needs 8")
+        return max(1, max(class_need(k, needs).cores for k in classes))
     return max(job_units(job_class(job, DEFAULT_HOME_REPO, workflow=workflow)[0], job, DEFAULT_HOME_REPO, workflow=workflow)
                for workflow, job in SIDE_FIT_JOBS)
 
@@ -6556,6 +6566,9 @@ def listen_mem_chunks(scope: RunnerScope | None, mem_total: int) -> int:
         return 0
     if scope is not None and scope.root:
         mibs = [class_need(k).mib for k in ROOT_CLASSES]
+    elif scope is not None and side_fit_units(scope) > 1 and load_job_needs()[0]:
+        mibs = [class_need(k).mib for k in {job_class(job, DEFAULT_HOME_REPO, workflow=workflow)[0]
+                                            for workflow, job in SIDE_FIT_JOBS}]  # SIDE_LISTEN_MEDIAN
     elif scope is not None and side_fit_units(scope) > 1:
         mibs = [job_need(job_class(job, DEFAULT_HOME_REPO, workflow=workflow)[0], job, DEFAULT_HOME_REPO,
                          workflow=workflow).mib for workflow, job in SIDE_FIT_JOBS]
