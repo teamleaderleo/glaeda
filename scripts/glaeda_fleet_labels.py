@@ -10,8 +10,9 @@ the runner checks the machine it runs on and glaeda-mini-fleet checks what it ob
 
 from __future__ import annotations
 
+import json
 import re
-from typing import Any, Callable
+from typing import Any, Callable, NamedTuple
 
 MINI_LABEL = "glaeda-mini"
 # A host with the ios-simulators role, verified on the mini: every runtime build the manifest's ios_simulator.runtimes
@@ -303,30 +304,76 @@ def shared_side_label(version: str) -> str:
 
 # How many runners (listeners) a member should register so the capacity arithmetic, not the runner count, decides how
 # many jobs run at once: as many as the host could run of the smallest common job (light, gui, gui-step, product and
-# simulator jobs: 1 core and under 1 GiB at p90), by cores and by RAM over the hook's floor, at most MAX_RUNNERS.
+# simulator jobs: 1 core and under 1 GiB at p90), by cores and by RAM over the hook's floor, and by disk (below), at
+# most MAX_RUNNERS.
 LISTENER_MIN_JOB_CORES = 1
 LISTENER_MIN_JOB_GIB = 1  # the hook's MEM_CHUNK_MIB
+# LISTENER_DISK: every runner instance keeps its own _work (a cmux checkout is 13.2 GiB: du of cmux18's instances 2 and
+# 10, 2026-11-16), and a side runner that takes its first cmux job clones one. Cores alone sized an M6 (228 GiB disk)
+# at 12 runners: on cmux21 (2026-11-16) free disk fell 41 -> 25 GiB in 40 minutes as the new instances cloned, under
+# the 30 GiB runner floor, and every listener was held (glaeda#2025); cmux18, at 12 runners, sat at 17-19 GiB with its
+# listeners held. So the disk term is the room runner checkouts may use (free disk, plus what existing runners' _work
+# already holds, less the runner floor) over one runner's measured share: the p90 of a job's own disk growth
+# (glaeda-cmux-job/v1 disk_free_start_gib - disk_free_min_gib), 15.0 GiB on cmux18 (3051 jobs) and 14.7 on cmux21
+# (3535), rounded up. The hook's `disk-shape` measures all three on the host (glaeda-cmux-runner-fleet's plan reads it).
+LISTENER_RUNNER_DISK_GIB = 15.0
 
 
-def listener_count(cpus: int, memory_gib: int | None, reserve_cores: int = 0) -> int:
-    """listener_count(14, 48) == 14 (M4 Pro), (12, 16) == 12 (M6), (10, 16) == 10 (M4), (30, 96) == MAX_RUNNERS."""
+class DiskShape(NamedTuple):
+    """A host's disk as the listener count reads it (glaeda-cmux-runner-hook disk-shape), in GiB."""
+    free_gib: float
+    runners_gib: float  # what the runner instances' _work trees hold now
+    floor_gib: float  # the runner floor (disk.min_free_gib)
+    per_runner_gib: float = LISTENER_RUNNER_DISK_GIB
+
+
+def disk_listeners(disk: DiskShape) -> int:
+    """(free + runners - floor) // per_runner, at least 1: DiskShape(17, 32.2, 30) == 1 (cmux18, 2026-11-16),
+    DiskShape(120, 10, 30) == 6."""
+    per = disk.per_runner_gib if disk.per_runner_gib > 0 else LISTENER_RUNNER_DISK_GIB
+    return max(1, int((disk.free_gib + disk.runners_gib - disk.floor_gib) // per))
+
+
+def listener_count(cpus: int, memory_gib: int | None, reserve_cores: int = 0, disk: DiskShape | None = None) -> int:
+    """listener_count(14, 48) == 14 (M4 Pro), (12, 16) == 12 (M6), (10, 16) == 10 (M4), (30, 96) == MAX_RUNNERS;
+    with a disk shape, also at most disk_listeners(disk)."""
     by_cores = max(1, (cpus - reserve_cores) // LISTENER_MIN_JOB_CORES)
     if memory_gib:
         floor = max(4, memory_gib // 8)  # the hook's mem_floor_mib, in GiB
         by_cores = min(by_cores, max(1, (memory_gib - floor) // LISTENER_MIN_JOB_GIB))
+    if disk is not None:
+        by_cores = min(by_cores, disk_listeners(disk))
     return min(MAX_RUNNERS, by_cores)
 
 
-def member_listeners(manifest: dict[str, Any], hardware: str, units: int, reserve: int = 0) -> int:
+def member_listeners(manifest: dict[str, Any], hardware: str, units: int, reserve: int = 0,
+                     disk: DiskShape | None = None) -> int:
     """listener_count() for a member from the manifest's hardware.<class> {cpus, memory_gib} (capacityUnits when
-    the hardware class names no cpus): the runners the member's class should declare. Advisory: the plan prints it
-    beside the declared runners, and the declared count is what --apply registers."""
+    the hardware class names no cpus), and its measured disk when given: the runners the member's class should
+    declare. Advisory: the plan prints it beside the declared runners, and the declared count is what --apply
+    registers."""
     hw = (manifest.get("hardware") or {}).get(hardware) if isinstance(manifest.get("hardware"), dict) else None
     hw = hw if isinstance(hw, dict) else {}
     cpus, mem = hw.get("cpus"), hw.get("memory_gib")
     cpus = cpus if isinstance(cpus, int) and not isinstance(cpus, bool) and cpus > 0 else units
     mem = mem if isinstance(mem, int) and not isinstance(mem, bool) and mem > 0 else None
-    return listener_count(cpus, mem, reserve)
+    return listener_count(cpus, mem, reserve, disk)
+
+
+def parse_disk_shape(line: str, floor_gib: float | None) -> DiskShape | None:
+    """The DiskShape in a `disk-shape` JSON line (glaeda-disk-shape/v1), the floor given here (the member's
+    minFreeGib) winning over the line's; None when the line is not one or a number is missing or out of range."""
+    try:
+        doc = json.loads(line)
+    except ValueError:
+        return None
+    if not isinstance(doc, dict) or doc.get("schema") != "glaeda-disk-shape/v1":
+        return None
+    values = [doc.get("free_gib"), doc.get("runners_gib"), doc.get("floor_gib") if floor_gib is None else floor_gib,
+              doc.get("per_runner_gib")]
+    if not all(isinstance(v, (int, float)) and not isinstance(v, bool) and 0 <= v < 1 << 20 for v in values):
+        return None
+    return DiskShape(*(float(v) for v in values))
 
 
 def sim_label(version: str) -> str:

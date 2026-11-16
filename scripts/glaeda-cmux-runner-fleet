@@ -228,6 +228,39 @@ def check(member: str, summary: dict[str, Any]) -> tuple[bool | None, str]:
     return code == 0, line.removeprefix("glaeda-cmux-runner-hook: ")
 
 
+def disk_shape(member: str, summary: dict[str, Any]) -> tuple[dict[str, Any] | None, str]:
+    """LISTENER_DISK: the member's `glaeda-cmux-runner-hook disk-shape`, read-only over SSH like check(): (the JSON
+    answer, "") or (None, why)."""
+    floor = summary.get("minFreeGib") or 0
+    remote = f"PATH={WORKLOAD_PATH} /usr/bin/python3 - disk-shape --min-free-gib {_quote(f'{floor:g}')}"
+    code, out, err = run(["ssh", *SSH_OPTIONS, member, remote], CHECK_TIMEOUT_S,
+                         stdin=(SCRIPT_DIR / "glaeda-cmux-runner-hook").read_text())
+    line = (out.strip().splitlines() or [""])[-1]
+    try:
+        doc = json.loads(line) if code == 0 else None
+    except ValueError:
+        doc = None
+    if not isinstance(doc, dict):
+        return None, f"disk-shape exit {code}: {(err.strip() or line)[-200:]}"
+    return doc, ""
+
+
+def disk_listener_row(row: dict[str, Any], member: str, summary: dict[str, Any], manifest: dict[str, Any]) -> None:
+    """The plan's advisory listener count with its disk term (glaeda_fleet_labels.listener_count): row["listeners"],
+    and row["disk"] (what the host measured) or row["diskError"]."""
+    labels = load_labels()
+    doc, why = disk_shape(member, summary)
+    shape = labels.parse_disk_shape(json.dumps(doc), summary.get("minFreeGib") or 0.0) if doc else None
+    if shape is None:
+        row["diskError"] = why or "disk-shape answered no usable numbers"
+        return
+    row["disk"] = doc
+    row["listeners"] = labels.member_listeners(manifest, summary.get("hardware") or "", summary.get("capacityUnits")
+                                               or 0, summary.get("reserveCores") or 0, shape)
+    row["listenersNoDisk"] = labels.member_listeners(manifest, summary.get("hardware") or "",
+                                                     summary.get("capacityUnits") or 0, summary.get("reserveCores") or 0)
+
+
 def _quote(text: str) -> str:
     return text if re.fullmatch(r"[A-Za-z0-9_./:=,+-]+", text) else "'" + text.replace("'", "'\\''") + "'"
 
@@ -899,6 +932,8 @@ def one_member(member: str, summary: dict[str, Any], args: argparse.Namespace, m
         row["retire"] = installed if installed is not None else why
     if not args.apply:
         row["action"] = "would apply" if eligible or args.include_ineligible else "skip (not eligible)"
+        if not summary.get("dedicatedOnly"):
+            disk_listener_row(row, member, summary, manifest)
         if summary.get("dedicatedOnly"):
             row["action"] += (f"; dedicated only, retire pool instances {row['retire'] or 'none'}"
                               if isinstance(row["retire"], list) else f"; dedicated only, {row['retire']}")
@@ -974,6 +1009,15 @@ def render(rows: list[dict[str, Any]], skipped: dict[str, str], applied: bool, g
             f"+{row['gatewayRunners']}gw" if row.get("gatewayRunners") else "") + (
             f"+{row['simRunners']}sim" if row.get("simRunners") else "")
         lines.append(f"  {row['member']:<22} {row['class']:<5} {units:<20} {row['action']:<24} {row['gate']}")
+        if row.get("disk"):
+            disk = row["disk"]
+            over = " (declared runners exceed it)" if row["listeners"] < row["runners"] else ""
+            lines.append(f"      listeners {row['listeners']}{over}: cores/RAM {row['listenersNoDisk']}, disk "
+                         f"({disk['free_gib']:g} free + {disk['runners_gib']:g} in runners' _work - "
+                         f"{disk['floor_gib']:g} floor) / {disk['per_runner_gib']:g} GiB per runner "
+                         f"({disk['per_runner_source']})")
+        elif row.get("diskError"):
+            lines.append(f"      listeners: no disk term ({row['diskError']})")
         if any(str(i.get("state", "")).startswith("NO RUNNER") for i in row.get("instances", [])):
             lines.append(f"      {row['member']} has instances with no runner: re-run for this member")
         if row.get("dedicated") and not row.get("instances"):
