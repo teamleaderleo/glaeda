@@ -16533,7 +16533,7 @@ class LandTest(Base):
         self.land(after=["o/r#9"], requester="host/other")
         e = self.tick()
         self.assertEqual((e["after"], e["requester"], e["state"]), (["pr:o/r#9"], "host/other", "waiting_after"))
-        gg.land_request("cancel", "o/r#1", [], "host/other")
+        gg.land_request(gg.LAND_WITHDRAW, "o/r#1", [], "host/other")
         e = self.tick()
         self.assertEqual(e["state"], "cancelled")
         self.land()
@@ -16575,6 +16575,89 @@ class LandTest(Base):
         with contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(gg.main(["land", "cancel", "o/r#1"]), 0)
         self.assertEqual(self.tick()["state"], "cancelled")
+
+    def test_cancel_during_a_step_wins(self):
+        self.pr(LA)
+        self.land()
+        self.w.gh_rc["merge"] = 1
+        self.w.answers.append(ok_answer(LA))
+        real = self.w.run
+
+        def cancel_mid_merge(argv, timeout, env):
+            if "--match-head-commit" in argv:
+                self.q.entries[self.KEY]["state"] = "cancelled"  # ingest on the tick thread, meanwhile
+            return real(argv, timeout, env)
+        self.q.run = cancel_mid_merge
+        e = self.tick()
+        self.assertEqual((e["state"], e["action"]), ("cancelled", None))
+        self.tick(600)
+        self.assertEqual(len(self.w.explains()), 1)
+
+    def test_a_check_that_never_finishes_is_judged_after_its_wait(self):
+        self.pr(LA, checks=[("ws-check", "PENDING", None)])
+        self.land()
+        self.tick()
+        self.assertEqual(self.w.explains(), [])
+        self.w.answers.append(refusal("block", LA, {"kind": "stop", "stop": "block"}))
+        e = self.tick(gg.LAND_WAIT_DEFAULT + 1)
+        self.assertEqual((len(self.w.explains()), e["state"]), (1, "stopped"))
+
+    def test_merge_hold_head_ahead_of_a_stale_cache_does_not_rejudge_every_tick(self):
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(refusal("quota", LB, {"kind": "retry", "after_s": 120}))
+        self.tick()
+        for _ in range(5):
+            self.tick()
+        self.assertEqual(len(self.w.explains()), 1)
+
+    def test_a_bad_request_or_entry_never_stalls_the_queue(self):
+        gg.LandQueue.requests_dir().mkdir(parents=True, exist_ok=True)
+        (gg.LandQueue.requests_dir() / "0-bad.json").write_text('{"key": "pr:o/r#1", "target": 5, "after": 7}')
+        gg.LandQueue.entries_dir().mkdir(parents=True, exist_ok=True)
+        (gg.LandQueue.entries_dir() / "junk.json").write_text('{"key": "pr:o/r#3"}')
+        self.q = self.queue()
+        self.assertNotIn("pr:o/r#3", self.q.entries)
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(ok_answer(LA))
+        self.tick()
+        self.assert_merged_at(LA)
+
+    def test_a_failed_update_branch_does_not_hold_the_next_merge(self):
+        self.pr(LA)
+        self.land()
+        self.w.gh_rc["update"] = 1
+        self.w.answers += [refusal("tip_merge", LA, {"kind": "update_branch", "expected_head_sha": LA}), ok_answer(LA)]
+        self.tick()
+        self.tick(gg.LAND_RETRY_DEFAULT)
+        self.assert_merged_at(LA)
+
+    def test_a_review_that_cannot_start_stops_and_is_not_marked_run(self):
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(refusal("no_ship", LA, {"kind": "review"}))
+        with mock.patch.object(gg.subprocess, "Popen", side_effect=OSError("no router-review")):
+            e = self.tick()
+        self.assertEqual((e["state"], e["stop"]["code"], e["reviewed"]), ("stopped", "review_failed", []))
+
+    def test_restart_after_an_interrupted_update_branch_waits_for_the_new_head(self):
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(refusal("tip_merge", LA, {"kind": "update_branch", "expected_head_sha": LA}))
+        self.w.raise_on = "update-branch"
+        with self.assertRaises(LandCrash):
+            self.tick()
+        self.w.raise_on = None
+        self.q = self.queue()
+        e = self.q.entries[self.KEY]
+        self.assertEqual((e["state"], e["wait"]["kind"], e["wait"]["before"]), ("waiting", "head_change", LA))
+        self.tick(10)
+        self.assertEqual(len(self.w.explains()), 1)  # the old head is never judged again
+        self.pr(LB)
+        self.w.answers.append(ok_answer(LB))
+        self.tick()
+        self.assert_merged_at(LB)
 
     def test_daemon_tick_runs_the_land_pass_only_once_land_exists(self):
         self.daemon.land_tick()

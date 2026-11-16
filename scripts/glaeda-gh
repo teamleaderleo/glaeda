@@ -6780,6 +6780,11 @@ LAND_GH = Path.home() / ".local/lib/gh-quota/bin/gh"  # the gh-quota shim: merge
 LAND_MERGE_HOLD = Path.home() / ".local/share/ws-sync/deploy/tools/merge_hold.py"
 LAND_STATES = ("queued", "waiting_after", "judging", "acting", "waiting", "merged", "stopped", "cancelled")
 LAND_DONE = frozenset({"merged", "stopped", "cancelled"})
+LAND_WITHDRAW = "withdraw"  # the request op `land cancel` writes
+
+
+class LandCancelled(Exception):
+    """`land cancel` arrived while a job ran: the job leaves the entry cancelled."""
 LAND_TAG = "glaeda-land"  # who the gh-quota call log and may_merge's landing record charge these calls to
 # Environment a land subprocess inherits (the on-event pattern: nothing else), then the tags. The session keys gh_quota
 # reads its caller from (ACPMUX_SESSION_NAME, ACPMUX_SESSION_ID, CLAUDE_SESSION_ID, CODEX_THREAD_ID) are never passed:
@@ -6967,7 +6972,8 @@ class LandQueue:
         d = self.entries_dir()
         for p in sorted(d.glob("*.json")) if d.is_dir() else []:
             e = read_json(p)
-            if not isinstance(e, dict) or not isinstance(e.get("key"), str):
+            if not isinstance(e, dict) or not isinstance(e.get("key"), str) or e.get("state") not in LAND_STATES \
+                    or not isinstance(e.get("repo"), str) or not str(e.get("number", "")).isdigit():
                 continue
             if e.get("state") in ("judging", "acting"):
                 claimed = e.get("action")
@@ -6979,6 +6985,13 @@ class LandQueue:
                 e["state"] = "queued"
                 e["wakeAt"] = None
                 e["wait"] = None
+                before = str((claimed or {}).get("before") or "") if isinstance(claimed, dict) else ""
+                if isinstance(claimed, dict) and claimed.get("kind") in ("update_branch", "retarget") and before:
+                    # It may have pushed: never judge (or pin) the head from before it.
+                    e["preStepHead"] = before
+                    e["state"] = "waiting"
+                    e["wait"] = {"kind": "head_change", "before": before, "since": self.now}
+                    e["wakeAt"] = self.now + LAND_HEAD_TIMEOUT
                 self.save(e)
             self.entries[e["key"]] = e
 
@@ -7009,41 +7022,50 @@ class LandQueue:
         if not d.is_dir():
             return
         for p in sorted(d.glob("*.json")):
-            req = read_json(p)
-            p.unlink(missing_ok=True)
-            if not isinstance(req, dict) or not isinstance(req.get("key"), str):
-                continue
             try:
-                key, repo, number = land_key(str(req.get("target") or ""))
-            except WatchError:
-                continue
-            with self.lock:
-                e = self.entries.get(key)
-                if req.get("op") == "cancel":
-                    if e and e["state"] not in LAND_DONE:
-                        e["state"] = "cancelled"
-                        e["wait"] = None
-                        self.history(e, "cancelled", by=req.get("requester"))
-                        self.save(e)
-                    continue
-                after = []
-                for a in req.get("after") or []:
-                    with contextlib.suppress(WatchError):
-                        after.append(land_key(str(a))[0])
-                fresh = e is None or e["state"] in LAND_DONE
-                if e is None:
-                    e = {"key": key, "repo": repo, "number": number, "created": self.now, "history": [],
-                         "mergeSha": "", "reviewed": []}
-                e.update(after=[a for a in after if a != key], requester=str(req.get("requester") or ""),
-                         requestId=req.get("id"))
-                if fresh:
-                    e.update(state="queued", head="", explain=None, action=None, streak=None, wakeAt=None,
-                             wait=None, seen=None, mergeSha="", stop=None)
-                    self.history(e, "queued", by=e["requester"], after=",".join(e["after"]))
-                else:
-                    self.history(e, "updated", by=e["requester"], after=",".join(e["after"]))
-                self.entries[key] = e
-                self.save(e)
+                self.ingest_one(p)
+            except Exception as error:  # noqa: BLE001  one bad request must not stall the queue
+                log({"event": "land-error", "request": p.name, "error": describe(error), "site": error_site(error)})
+                with contextlib.suppress(OSError):
+                    p.rename(p.with_suffix(".bad"))
+
+    def ingest_one(self, p: Path) -> None:
+        req = read_json(p)
+        p.unlink(missing_ok=True)
+        if not isinstance(req, dict) or not isinstance(req.get("key"), str):
+            return
+        try:
+            key, repo, number = land_key(str(req.get("target") or ""))
+        except WatchError:
+            return
+        with self.lock:
+            e = self.entries.get(key)
+            if req.get("op") == LAND_WITHDRAW:
+                if e and e["state"] not in LAND_DONE:
+                    e["state"] = "cancelled"
+                    e["wait"] = None
+                    self.history(e, "cancelled", by=req.get("requester"))
+                    self.save(e)
+                return
+            after = []
+            for a in req.get("after") or []:
+                with contextlib.suppress(WatchError):
+                    after.append(land_key(str(a))[0])
+            fresh = e is None or e["state"] in LAND_DONE
+            if e is None:
+                e = {"key": key, "repo": repo, "number": number, "created": self.now, "history": [],
+                     "mergeSha": "", "reviewed": []}
+            e.update(after=[a for a in after if a != key], requester=str(req.get("requester") or ""),
+                     requestId=req.get("id"))
+            if fresh:
+                e.update(state="queued", head="", explain=None, action=None, streak=None, wakeAt=None,
+                         wait=None, seen=None, seenHead="", mergeSha="", stop=None, preStepHead="",
+                         lastAction=None, reviewed=[])
+                self.history(e, "queued", by=e["requester"], after=",".join(e["after"]))
+            else:
+                self.history(e, "updated", by=e["requester"], after=",".join(e["after"]))
+            self.entries[key] = e
+            self.save(e)
 
     # -- the tick
 
@@ -7052,17 +7074,18 @@ class LandQueue:
         self.ingest()
         self.reap()
         for key in list(self.entries):
-            e = self.entries[key]
-            if e["state"] in LAND_DONE:
-                if self.now - float(e.get("updated") or 0) > LAND_KEEP:
-                    (self.entries_dir() / file_name(key)).unlink(missing_ok=True)
-                    del self.entries[key]
-                continue
-            if key in self.jobs:
-                continue
             try:
-                self.keep_watching(e)
-                self.consider(e)
+                e = self.entries[key]
+                if e["state"] in LAND_DONE:
+                    if self.now - float(e.get("updated") or 0) > LAND_KEEP:
+                        (self.entries_dir() / file_name(key)).unlink(missing_ok=True)
+                        del self.entries[key]
+                    continue
+                if key in self.jobs:
+                    continue
+                with self.lock:
+                    self.keep_watching(e)
+                    self.consider(e)
             except Exception as error:  # noqa: BLE001  one bad entry must not stop the others
                 log({"event": "land-error", "key": key, "error": describe(error), "site": error_site(error)})
 
@@ -7179,22 +7202,25 @@ class LandQueue:
         if kind == "repin":
             self.judge(e, str(w.get("sha") or "") or head, fp)
             return
-        moved = bool(head and e.get("head") and head != e.get("head"))
+        # Against the head the cache showed when it was last judged: merge_hold's own head can differ from a stale cache.
+        moved = bool(head and e.get("seenHead") and head != e.get("seenHead"))
         if kind == "run":
             rd = (self.cache_of(w.get("key", "")) or {}).get("data") or {}
-            if (rd.get("status") == "completed" or woke or moved) and not running:
+            if ((rd.get("status") == "completed" or moved) and not running) or woke:
                 self.judge(e, head, fp)
             return
         if kind == "comment":
-            if (self.comment_seen(w) or woke or moved) and not running:
+            if ((self.comment_seen(w) or moved) and not running) or woke:
                 self.judge(e, head, fp)
             return
         if kind == "retry":
-            if (woke or moved) and not running:
+            if (moved and not running) or woke:
                 self.judge(e, head, fp)
             return
         if running:
-            if kind != "pr" or w.get("sha") != head:
+            if woke:  # a check that never finishes (a status never posted, no runner): merge_hold says what now
+                self.judge(e, head, fp)
+            elif kind != "pr" or w.get("sha") != head:
                 self.wait_running(e, head, fp)
             return
         if woke or fp != e.get("seen"):
@@ -7218,12 +7244,13 @@ class LandQueue:
     def wait_running(self, e: dict, head: str, fp: str) -> None:
         """Checks still run at the head: merge_hold is not asked until they finish (the cache says when)."""
         e.update(state="waiting", wait={"kind": "pr", "sha": head, "why": "checks running"}, seen=fp, head=head,
-                 wakeAt=None)
+                 wakeAt=self.now + LAND_WAIT_DEFAULT)
         self.history(e, "checks_running", head=head[:12])
         self.save(e)
 
     def judge(self, e: dict, sha: str, fp: str, counts: bool = True) -> None:
-        e.update(state="judging", seen=fp, judging={"sha": sha, "at": self.now, "counts": counts})
+        head = str((((self.cache_of(e["key"]) or {}).get("data")) or {}).get("headRefOid") or "").lower()
+        e.update(state="judging", seen=fp, seenHead=head, judging={"sha": sha, "at": self.now, "counts": counts})
         self.save(e)
         self.submit(e["key"], self.job, e["key"], sha)
 
@@ -7291,6 +7318,17 @@ class LandQueue:
         return answer
 
     def job(self, key: str, sha: str) -> None:
+        """One judgment and the step it names. A `land cancel` that arrives meanwhile wins (LandCancelled)."""
+        try:
+            self.judge_and_take(key, sha)
+        except LandCancelled:
+            with self.lock:
+                e = self.entries[key]
+                if e.get("action"):
+                    self.finish(e, None, note="cancelled")
+                self.save(e)
+
+    def judge_and_take(self, key: str, sha: str) -> None:
         with self.lock:
             e = self.entries[key]
             if e["state"] == "cancelled":
@@ -7331,6 +7369,8 @@ class LandQueue:
 
     def claim(self, e: dict, kind: str, **args: Any) -> None:
         """Written before the step starts: a restart sees it and judges again instead of running it on its own."""
+        if e["state"] == "cancelled":
+            raise LandCancelled(e["key"])
         e["action"] = {"kind": kind, "claimedAt": self.now, "head": e.get("head"), **args}
         e["state"] = "acting"
         self.save(e)
@@ -7346,6 +7386,8 @@ class LandQueue:
         self.history(e, "step", kind=a.get("kind"), exit=None if got is None else got.returncode)
 
     def wait(self, e: dict, w: dict, seconds: float | None) -> None:
+        if e["state"] == "cancelled":
+            raise LandCancelled(e["key"])
         e["state"] = "waiting"
         e["wait"] = w
         e["wakeAt"] = None if seconds is None else self.now + seconds
@@ -7454,7 +7496,7 @@ class LandQueue:
         got = self.call([gh, *args], LAND_GH_DEADLINE)
         with self.lock:
             self.finish(e, got)
-            e["preStepHead"] = head
+            e["preStepHead"] = head if got.returncode == 0 else ""
             if got.returncode == 0 and kind == "update_branch":
                 self.nudge(e["key"])
                 self.wait(e, {"kind": "head_change", "before": head, "since": self.now}, LAND_HEAD_TIMEOUT)
@@ -7526,7 +7568,6 @@ class LandQueue:
                 self.history(e, "review_already_run", head=head[:12])
             else:
                 rr = self.path("routerReview", Path.home() / ".local/bin/router-review")
-                e["reviewed"] = (e["reviewed"] + [head])[-10:]
                 self.claim(e, "review", head=head)
                 logs = land_dir() / "logs"
                 logs.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -7535,9 +7576,13 @@ class LandQueue:
                         subprocess.Popen([os.fspath(rr), repo, number, "--post"], stdin=subprocess.DEVNULL,
                                          stdout=sink, stderr=subprocess.STDOUT, env=self.env(), start_new_session=True,
                                          close_fds=True, cwd=os.environ.get("HOME") or "/")
+                    e["reviewed"] = (e["reviewed"] + [head])[-10:]
                     self.finish(e, None, started=True)
                 except OSError as error:
                     self.finish(e, None, error=describe(error))
+                    self.stop(e, "review_failed", f"router-review could not start: {describe(error)}",
+                              f"router-review {repo} {number} --post")
+                    return
             key = parse_key("comment", f"{repo}#{number}")
             self.wait(e, {"kind": "comment", "key": key, "match": "SHIP|BLOCK", "since": self.now}, LAND_REVIEW_WAIT)
             self.watch_now(key)
@@ -7556,6 +7601,8 @@ class LandQueue:
                     f"glaeda land: {self.url(e)} merged" + (f" at {merge_sha}" if merge_sha else ""))
 
     def stop(self, e: dict, code: str, reason: str, nxt: str) -> None:
+        if e["state"] == "cancelled":
+            raise LandCancelled(e["key"])
         e.update(state="stopped", wait=None, wakeAt=None, action=None,
                  stop={"code": code, "reason": land_trim(reason), "next": land_trim(nxt), "at": self.now})
         self.history(e, "stopped", code=code, reason=land_trim(reason, 160))
@@ -7713,7 +7760,7 @@ def cmd_land(target: str, after: list[str], notify: str | None, wait: float, as_
 
 def cmd_land_cancel(target: str, as_json: bool) -> int:
     key = land_key(target)[0]
-    land_request("cancel", target, [], land_requester(None))
+    land_request(LAND_WITHDRAW, target, [], land_requester(None))
     if as_json:
         print(json.dumps({"ok": True, "key": key, "state": "cancel requested"}))
     else:
