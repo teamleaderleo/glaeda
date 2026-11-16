@@ -8381,6 +8381,26 @@ class VolumeCensusTest(unittest.TestCase):
         self.assertNotIn("/gone/x", got["rows"])
         self.assertIn(str(self.root / "a"), got["rows"])
 
+    def test_linux_census_walks_the_volume_holding_home(self) -> None:
+        # huge-blue, 2026-11-16: census_roots() was [] off macOS, so 169 GiB stayed "unwalked (no volume census yet)"
+        saved = (gd.HOME, gd.RUNNER_CACHE_PROFILE)
+        self.addCleanup(lambda: (setattr(gd, "HOME", saved[0]), setattr(gd, "RUNNER_CACHE_PROFILE", saved[1])))
+        gd.HOME, gd.RUNNER_CACHE_PROFILE = self.root, False
+        self.assertEqual(gd.census_roots(), [gd.mount_point(self.root)])
+        gd.RUNNER_CACHE_PROFILE = True
+        self.assertEqual(gd.census_roots(), [])
+
+    def test_a_complete_linux_census_names_open_deleted_not_apfs(self) -> None:
+        self.write("a/blob", 64 * 1024)
+        census = gd.census_pass([self.root], set(), None, now=50.0, path=self.state)
+        self.assertTrue(census["complete"])
+        with mock.patch.object(gd, "fixed_measurement_roots", return_value=[]), \
+                mock.patch.object(gd, "accounting_coverage", return_value=[]), \
+                mock.patch.object(gd, "apfs_container_capacity", return_value=None), \
+                mock.patch.object(gd, "census_for", return_value=census):
+            got = gd.filesystem_accounting([self.fs(10 * gd.GIB)], [])[0]
+        self.assertTrue(got["residual"]["category"].startswith(gd.OPEN_DELETED))
+
     def test_census_du_never_enters_file_provider_trees(self) -> None:
         argv = gd._census_du_argv(self.root)
         for name in gd.MEASURE_SKIP_COMPONENTS:
