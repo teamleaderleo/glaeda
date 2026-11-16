@@ -6367,12 +6367,27 @@ def nested_checkouts(path: Path) -> list[Path] | None:
     return _NESTED_WALKS[key]
 
 
+OLD_TREE_BUDGET = 400_000  # entries git_state may read in a tree untouched for OLD_TREE_IDLE_S
+OLD_TREE_IDLE_S = 7 * 86400
+
+
 def family_git_state(fam: "Family", path: Path) -> str:
     """git_state, or for a nested_git family the full-depth checkout search."""
     if not fam.nested_git:
         # a family whose items are caches by where they sit may skip their sealed parts; one that deletes
         # disposable checkouts (tmp, scratch) searches everything
-        return git_state(path, sealed=not fam.git_disposable)
+        state = git_state(path, sealed=not fam.git_disposable)
+        if state == "unchecked":
+            # A tree past the default entry budget stayed "unchecked" forever (cmux17's 6 GiB cmux-focus-bench,
+            # 28010 files, untouched 414 h, 2026-11-15). One untouched for OLD_TREE_IDLE_S gets one full search on a
+            # larger budget; anything still ambiguous (budget, mount, read error) stays "unchecked": fail closed.
+            try:
+                idle = time.time() - item_mtime(fam, path) >= OLD_TREE_IDLE_S
+            except OSError:
+                idle = False
+            if idle:
+                state = git_state(path, budget=OLD_TREE_BUDGET, sealed=not fam.git_disposable)
+        return state
     roots = nested_checkouts(path)
     return "unchecked" if roots is None else "git" if roots else "none"
 

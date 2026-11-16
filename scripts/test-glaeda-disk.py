@@ -654,6 +654,27 @@ class GlaedaDiskTest(unittest.TestCase):
         (self.root / "repo/sub/.git").mkdir(parents=True)
         self.assertEqual(gd.git_state(self.root / "repo"), "git")
 
+    def test_old_tree_past_default_budget_is_searched_on_a_larger_budget(self) -> None:
+        big = self.root / "big"
+        for i in range(30):
+            d = big / f"d{i}"
+            d.mkdir(parents=True)
+            for j in range(10):
+                (d / f"f{j}").write_text("x")
+        real = gd.git_state
+
+        def small(path, depth=5, budget=20000, sealed=False):
+            return real(path, depth, 50 if budget == 20000 else budget, sealed)
+
+        with mock.patch.object(gd, "git_state", small):
+            self.age(big, *big.iterdir(), hours=24 * 8)
+            self.assertEqual(gd.family_git_state(self.fam, big), "none")  # old: second pass, larger budget
+            self.age(big, *big.iterdir(), hours=1)
+            self.assertEqual(gd.family_git_state(self.fam, big), "unchecked")  # recent: stays fail-closed
+            (big / "d3" / ".git").mkdir()
+            self.age(big, *big.iterdir(), hours=24 * 8)
+            self.assertEqual(gd.family_git_state(self.fam, big), "git")  # old with a clone inside: protected
+
     @staticmethod
     def age(*tops: Path, hours: float = 48) -> None:
         old = time.time() - hours * 3600
