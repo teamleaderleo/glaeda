@@ -8507,7 +8507,7 @@ class GateTest(unittest.TestCase):
         # gate's 30 s cadence with the jobs ending at 55 min: the drain is owed every reading while they run, and
         # once the host is free it still gets only GATE_WAITER_MAX_HOLD_S to take it.
         t0 = 7_000_000.0
-        hold = hook.GATE_WAITER_MAX_HOLD_S
+        hold = int(hook.GATE_WAITER_MAX_HOLD_S)
         notes: list[str] = []
         busy_until = 55 * 60
         for t in range(0, busy_until, 30):
@@ -8543,7 +8543,10 @@ class GateTest(unittest.TestCase):
         self.assertEqual(read(cap), [], "past GATE_DRAIN_WAITER_MAX_HOLD_S the gate listens anyway")
         self.assertEqual(len(notes), 1)
         self.assertIn("behind running jobs", notes[0])
-        self.assertEqual(read(cap + waive - 30), [])
+        t = cap
+        while t < cap + waive - 30:  # the gates keep reading it every 30 s while they listen
+            t += 30
+            self.assertEqual(read(t), [], f"honoured again {t - cap:.0f} s into the waive")
         self.assertEqual(len(notes), 1, "one note per waived stretch")
         self.assertEqual(read(cap + waive), [70504], "then a new hold")
         t = cap + waive
