@@ -16667,5 +16667,31 @@ class LandTest(Base):
         self.assertIsNotNone(self.daemon.land_queue)
 
 
+class WaitFromBytecodeTest(unittest.TestCase):
+    """A wait re-runs itself once from cached bytecode: the compile heap was 54 MB of each waiter's 57 MB."""
+
+    def test_only_a_wait_not_yet_from_bytecode_with_a_home_reruns(self) -> None:
+        env = {"HOME": "/home/u"}
+        got = gg.bytecode_argv(["wait", "pid", "1"], env, "/usr/bin/python3", "glaeda-gh")
+        self.assertEqual(got[:5], ["/usr/bin/python3", "-I", "-X", "pycache_prefix=/home/u/.cache/gh-quota/pycache",
+                                   "-c"])
+        self.assertEqual(got[6:], [os.path.abspath("glaeda-gh"), "wait", "pid", "1"])
+        self.assertIsNotNone(gg.bytecode_argv(["wait-resume", "x"], env, "/usr/bin/python3", "g"))
+        for argv, e in ((["status", "pr", "o/r#1"], env), (["serve"], env), ([], env),
+                        (["wait", "pid", "1"], {**env, gg.PYC_ENV: "1"}), (["wait", "pid", "1"], {})):
+            with self.subTest(argv=argv, env=e):
+                self.assertIsNone(gg.bytecode_argv(argv, e, "/usr/bin/python3", "g"))
+
+    def test_the_rerun_waits_in_the_same_pid_and_keeps_the_exit_code(self) -> None:
+        with tempfile.TemporaryDirectory() as home:
+            env = {**os.environ, "HOME": home, "GLAEDA_GH_DIR": home}
+            env.pop(gg.PYC_ENV, None)
+            done = subprocess.run([sys.executable, os.fspath(ROOT / "scripts" / "glaeda-gh"), "wait", "pid",
+                                   str(2 ** 22 + 7), "--timeout", "5"], env=env, capture_output=True, text=True,
+                                  timeout=60)
+            self.assertEqual(done.returncode, 0, done.stderr)
+            self.assertTrue(list(Path(home, ".cache", "gh-quota", "pycache").rglob("*.pyc")))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -14195,5 +14195,38 @@ def main(argv: list[str] | None = None) -> int:
         return 130
 
 
+# A wait holds its process for minutes to an hour. Run as a script, this file is compiled from source on every call
+# (Python never caches a __main__ script's bytecode), and the compile's heap stays with the process for as long as it
+# lives: 54 MB private for each waiting glaeda-gh on a GCP lane VM, against 13 MB for the same file loaded from cached
+# bytecode (leo-workspace lane-density, 2026-11-16: waiters were a sixth of every lane's memory there). So a wait
+# re-runs this same file once, in the same pid, from bytecode cached under ~/.cache, with the loader the gh wrapper
+# already uses (leo-workspace tools/lane-vm-bootstrap). -I keeps the cwd off sys.path; the -X flag still applies.
+LONG_LIVED = ("wait", "wait-resume")
+PYC_ENV = "GLAEDA_GH_FROM_PYC"
+PYC_LOADER = ('import sys, types, importlib.machinery as m; p = sys.argv[1]; sys.argv = sys.argv[1:]; '
+              'g = types.ModuleType("__main__"); g.__file__ = p; sys.modules["__main__"] = g; '
+              'exec(m.SourceFileLoader("__main__", p).get_code("__main__"), g.__dict__)')
+
+
+def bytecode_argv(argv: list[str], env, executable: str, script: str) -> list[str] | None:
+    """The argv that re-runs SCRIPT ARGV from cached bytecode, or None to run on here: not a wait, already from
+    bytecode (PYC_ENV), or no HOME to cache under (never /tmp)."""
+    home = env.get("HOME")
+    if not argv or argv[0] not in LONG_LIVED or env.get(PYC_ENV) or not home or not executable:
+        return None
+    return [executable, "-I", "-X", f"pycache_prefix={home}/.cache/gh-quota/pycache", "-c", PYC_LOADER,
+            os.path.abspath(script), *argv]
+
+
+def exec_from_bytecode() -> None:
+    again = bytecode_argv(sys.argv[1:], os.environ, sys.executable, __file__)
+    if again:
+        try:
+            os.execve(again[0], again, {**os.environ, PYC_ENV: "1"})
+        except OSError:
+            pass  # runs on from source, as before
+
+
 if __name__ == "__main__":
+    exec_from_bytecode()
     raise SystemExit(main())
