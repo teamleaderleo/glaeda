@@ -16832,6 +16832,7 @@ class CapacityArithmeticTest(unittest.TestCase):
 
     def host(self, cores: int, mem_gib: int, needs: Path):
         return mock.patch.dict(os.environ, {hook.HOST_CORES_ENV: str(cores), hook.HOST_MEM_ENV: str(mem_gib * 1024),
+                                            hook.RAM_LEDGER_ENV: "1",
                                             hook.JOB_NEEDS_ENV: os.fspath(needs)})
 
     def keep(self, fds: list[int], *args: object, **kwargs: object) -> tuple[bool, str]:
@@ -16870,7 +16871,7 @@ class CapacityArithmeticTest(unittest.TestCase):
         self.assertEqual(hook.job_need("compile", "cli-regressions", hook.DEFAULT_HOME_REPO, workflow="ci.yml",
                                        needs=needs).cores, 1, "at least 1 core")
         rare = hook.job_need("isolated", "rare", self.GUEST, workflow="build-fleet-go.yml", needs=needs)
-        self.assertEqual(rare, hook.Need(6, 5000, "class", False), "under min_samples: its class's row")
+        self.assertEqual(rare, hook.Need(3, 5000, "class", False), "under min_samples: its class's median (ceil 2.55)")
         self.assertEqual(hook.class_need("gateway", needs).cores, 0, "a 0-unit token class stays 0")
         self.assertEqual(hook.job_need("gateway", "app-compile-fleet", hook.DEFAULT_HOME_REPO,
                                        workflow="cmux-next.yml", needs=needs).cores, 0)
@@ -16965,6 +16966,8 @@ class CapacityArithmeticTest(unittest.TestCase):
             self.assertIn("20/84 GiB", why)
         with self.host(12, 16, needs), mock.patch.dict(os.environ, {hook.RAM_LEDGER_ENV: "0"}):
             self.assertEqual(hook.mem_chunks_total(), 0, "the kill switch")
+        with self.host(12, 16, needs), mock.patch.dict(os.environ, {hook.RAM_LEDGER_ENV: ""}):
+            self.assertEqual(hook.mem_chunks_total(), 0, "off by default")
             ok, why = self.take("huge")
             self.assertTrue(ok, why)
 
@@ -17024,14 +17027,14 @@ class CapacityArithmeticTest(unittest.TestCase):
     def test_needs_prints_what_admission_reads(self) -> None:
         needs = self.needs(classes={"compile": self.row(5.2, 9000)})
         env = {"PATH": "/usr/bin:/bin", "HOME": os.fspath(self.dir), hook.HOST_CORES_ENV: "12",
-               hook.HOST_MEM_ENV: "16384"}
+               hook.HOST_MEM_ENV: "16384", hook.RAM_LEDGER_ENV: "1"}
         out = subprocess.run([sys.executable, os.fspath(HOOK), "needs", "--needs-file", os.fspath(needs)],
                              capture_output=True, text=True, env=env, timeout=60)
         self.assertEqual(out.returncode, 0, out.stderr)
         answer = json.loads(out.stdout)
         self.assertEqual(answer["host"], {"cores": 12, "mem_mib": 16384, "mem_floor_mib": 4096, "mem_chunks": 12,
                                           "mem_chunk_mib": 1024})
-        self.assertEqual(answer["classes"]["compile"], {"cores": 6, "mib": 9000})
+        self.assertEqual(answer["classes"]["compile"], {"cores": 3, "mib": 9000})
         out = subprocess.run([sys.executable, os.fspath(HOOK), "needs", "--needs-file", os.fspath(self.dir / "x")],
                              capture_output=True, text=True, env=env, timeout=60)
         self.assertEqual(out.returncode, 1)

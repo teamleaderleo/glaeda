@@ -783,7 +783,10 @@ JOB_NEEDS_MAX_CORES = 256.0
 JOB_NEEDS_MAX_MIB = 4 << 20  # 4 TiB: anything above is a broken row
 HOST_CORES_ENV = "GLAEDA_HOST_CORES"  # tests: the host's cores instead of hw.ncpu
 HOST_MEM_ENV = "GLAEDA_HOST_MEM_MIB"  # tests: the host's RAM instead of hw.memsize
-RAM_LEDGER_ENV = "GLAEDA_RUNNER_RAM_LEDGER"  # "0" in the runner's environment: no RAM accounting (kill switch)
+# "1" in the runner's environment turns RAM accounting on; off by default (only the memory-pressure gate and the
+# floor). A job's rss_peak_mib_p90 is not additive: summed over the jobs running at once it reached 288 GiB on a
+# 96 GiB host with no OOM (2026-11-08..14), and on the canary the ledger held big jobs 10-17 min with 93% of RAM free.
+RAM_LEDGER_ENV = "GLAEDA_RUNNER_RAM_LEDGER"
 MEM_CHUNK_MIB = 1024
 MEM_FLOOR_MIN_MIB = 4096
 MEM_FLOOR_FRACTION = 8  # the floor is an eighth of the RAM, at least MEM_FLOOR_MIN_MIB: 4 GiB of 16, 6 of 48, 12 of 96
@@ -886,8 +889,8 @@ def parse_job_needs(data: bytes, now: float | None = None) -> tuple[dict[str, An
     return out, ""
 
 
-def _needs_row(row: dict[str, Any], floor: int) -> tuple[float | None, float | None] | None:
-    """(cores_p90, RAM MiB) of one row with at least `floor` runs, or None. RAM is rss_peak_mib_p90 (resident: what
+def _needs_row(row: dict[str, Any], floor: int) -> tuple[float | None, float | None, float | None] | None:
+    """(cores_p90, RAM MiB, cores_p50) of one row with at least `floor` runs, or None. RAM is rss_peak_mib_p90 (resident: what
     the host's RAM actually holds), else mem_peak_mib_p90 (the footprint, which counts compressed and swapped pages
     and can exceed the host's RAM)."""
     n = row.get("n")
@@ -897,7 +900,8 @@ def _needs_row(row: dict[str, Any], floor: int) -> tuple[float | None, float | N
     mib = _needs_number(row, "rss_peak_mib_p90", JOB_NEEDS_MAX_MIB)
     if mib is None:
         mib = _needs_number(row, "mem_peak_mib_p90", JOB_NEEDS_MAX_MIB)
-    return (cores, mib) if cores is not None or mib is not None else None
+    median = _needs_number(row, "cores_p50", JOB_NEEDS_MAX_CORES)
+    return (cores, mib, median) if cores is not None or mib is not None else None
 
 
 def load_job_needs(path: Path | None = None, now: float | None = None) -> tuple[dict[str, Any] | None, str]:
@@ -950,7 +954,11 @@ def job_need(klass: str, job: str, repo: str | None, home_repo: str = DEFAULT_HO
            if rkey else None)
     crow = needs.get("classes_by_ncpu", {}).get(klass, {}).get(ncpu) or needs["classes"].get(klass)
     own_cores = _need_cores(row[0], base_units) if row else None
-    class_cores = _need_cores(crow[0], base_units) if crow else None
+    # a class row pools every job of the class, the heavy ones too, so a job with no row of its own takes the
+    # class's median, at most half the host: a 15 s probe never takes a whole 12-core mini (cmux18, 2026-11-15)
+    class_cores = _need_cores(crow[2] if crow[2] is not None else crow[0], base_units) if crow else None
+    if class_cores:
+        class_cores = min(class_cores, max(1, (host_cores() or 2 * class_cores) // 2))
     if own_cores is not None:
         cores, source = own_cores, "job"
     elif key in JOB_CORES:
@@ -1020,8 +1028,8 @@ def mem_floor_mib(total_mib: int) -> int:
 
 def mem_chunks_total() -> int:
     """The RAM chunks (MEM_CHUNK_MIB) this host's ledger shares: its RAM less the floor, or 0 (no RAM accounting)
-    when the RAM cannot be measured or RAM_LEDGER_ENV is 0."""
-    if (os.environ.get(RAM_LEDGER_ENV) or "").strip() == "0":
+    when the RAM cannot be measured or RAM_LEDGER_ENV is not 1 (the default)."""
+    if (os.environ.get(RAM_LEDGER_ENV) or "").strip() != "1":
         return 0
     mib = host_mem_mib()
     return max(0, (mib - mem_floor_mib(mib)) // MEM_CHUNK_MIB) if mib else 0
