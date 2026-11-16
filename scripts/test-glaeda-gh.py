@@ -207,6 +207,7 @@ class FakeGitHub:
         self.rules: list[dict] = []  # GET .../rules/branches/B
         self.protected: list[str] = []  # the classic protection's required contexts
         self.job_steps: dict[int, list] = {}  # job (check run) database id -> steps, for GET .../actions/jobs/ID
+        self.job_logs: dict[int, bytes] = {}  # job id -> its log, for GET .../actions/jobs/ID/logs (a redirect)
         self.base_gone = False  # the base branch was deleted: its rules and protection answer 404
         self.heads: dict[tuple[str, str, str], list] = {}  # (owner, repo, sha) -> that commit's check contexts
         # sha -> that commit's check suites [{"id", "latest": runs in its newest attempt, "runs": every attempt's}]
@@ -321,6 +322,13 @@ class FakeGitHub:
             self.rest_remaining -= 1
             return 403, self.rate("core", self.rest_remaining), json.dumps({"message": (
                 "Upgrade to GitHub Pro or make this repository public to enable this feature.")}).encode()
+        elif parts[4] == "actions" and parts[5] == "jobs" and parts[-1] == "logs":
+            # GitHub answers a log with a redirect to signed blob storage, which no quota counts (blob())
+            self.rest_remaining -= 1
+            if int(parts[6]) not in self.job_logs:
+                return 404, self.rate("core", self.rest_remaining), b'{"message": "Not Found"}'
+            return 302, {**self.rate("core", self.rest_remaining),
+                         "location": f"https://blob.example/{int(parts[6])}"}, b""
         elif parts[4] == "actions" and parts[5] == "jobs":
             steps = self.job_steps.get(int(parts[6]))
             payload = None if steps is None else {"id": int(parts[6]), "steps": steps}
@@ -15854,6 +15862,160 @@ class WriteJsonModeTest(unittest.TestCase):
         gg.write_json(path, {"a": 1})
         self.assertEqual(self.mode(path), 0o640)
         self.assertEqual([p.name for p in Path(self.tmp.name).iterdir()], ["shared.json"])  # no temporary left
+
+
+class LogJobTest(Base):
+    """`log job OWNER/REPO ID` (cmux scripts/ci/glaeda_log.py asks it before REST): a finished job's log is read once
+    per host, from the cache, else the build controller (no user REST), else one REST read."""
+
+    DONE = b"2026-11-16T10:00:00Z ##[error]Process completed with exit code 1.\n" \
+           b"2026-11-16T10:00:01Z Cleaning up orphan processes\n"
+    RUNNING = b"2026-11-16T10:00:00Z ##[group]Run swift test\n"
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.blobs = 0
+        self.controller_logs: dict[int, tuple[int, bytes]] = {}  # job -> (status, body) the controller answers
+        self.controller_asked: list[str] = []
+
+    def rest(self, repo: str, job: int) -> tuple[bool, bytes, str]:
+        """What `gh api repos/R/actions/jobs/ID/logs` does: the API hop (counted by FakeGitHub), then the blob."""
+        status, h, _ = self.gh("GET", f"{gg.API}/repos/{repo}/actions/jobs/{job}/logs",
+                               {"Authorization": f"Bearer {TOKEN}"}, None)
+        if status != 302:
+            return False, b"", f"HTTP {status}"
+        self.blobs += 1
+        return True, self.gh.job_logs[int(h["location"].rsplit("/", 1)[1])], ""
+
+    def rest_reads(self) -> int:
+        return sum(1 for c in self.gh.calls if c[1].endswith("/logs"))
+
+    def controller(self) -> Any:
+        import http.server
+        logs, asked = self.controller_logs, self.controller_asked
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *args: Any) -> None:
+                pass
+
+            def do_GET(self) -> None:
+                asked.append(self.path)
+                q = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+                code, body = (logs.get(int(q["id"][0]), (404, b"unknown job"))
+                              if self.path.startswith("/v1/github/job-log?") and q.get("repo") == ["o/r"]
+                              else (404, b"404 page not found"))
+                self.send_response(code)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        return gg.Controller(f"http://127.0.0.1:{server.server_address[1]}", "tok")
+
+    def log(self, job: int, controller: Any = None) -> tuple[int, bytes, str]:
+        out, err = io.BytesIO(), io.StringIO()
+        stdout = io.TextIOWrapper(out)
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(err):
+            code = gg.cmd_log_job("O/r", job, controller=controller, rest=self.rest)
+        stdout.flush()
+        return code, out.getvalue(), err.getvalue()
+
+    def test_a_finished_job_is_read_over_rest_once(self) -> None:
+        self.gh.job_logs[11] = self.DONE
+        self.assertEqual(self.log(11), (0, self.DONE, ""))
+        self.assertEqual(self.rest_reads(), 1)
+        self.assertEqual(self.log(11), (0, self.DONE, ""))
+        self.assertEqual(self.rest_reads(), 1)  # the second read sent nothing
+        kept = gg.job_log_path("o/r", 11)
+        self.assertTrue(kept.exists())
+        self.assertLess(kept.stat().st_size, len(self.DONE) + 64)  # gzip
+
+    def test_a_running_job_is_not_kept(self) -> None:
+        self.gh.job_logs[12] = self.RUNNING
+        self.assertEqual(self.log(12)[:2], (0, self.RUNNING))
+        self.assertFalse(gg.job_log_path("o/r", 12).exists())
+        self.gh.job_logs[12] = self.RUNNING + self.DONE  # it finished: the next read keeps it
+        self.assertEqual(self.log(12)[:2], (0, self.RUNNING + self.DONE))
+        self.log(12)
+        self.assertEqual(self.rest_reads(), 2)
+
+    def test_the_controller_serves_with_no_rest(self) -> None:
+        ctl = self.controller()
+        self.controller_logs[13] = (200, self.DONE)
+        self.assertEqual(self.log(13, ctl), (0, self.DONE, ""))
+        self.assertEqual(self.log(13, ctl), (0, self.DONE, ""))
+        self.assertEqual(self.rest_reads(), 0)
+        self.assertEqual(len(self.controller_asked), 1)  # the second read came from the cache
+        self.assertIn("repo=o/r&id=13", self.controller_asked[0])
+
+    def test_rest_only_where_the_controller_cannot_serve(self) -> None:
+        ctl = self.controller()
+        self.controller_logs[14] = (429, b"log reads spent")
+        self.gh.job_logs[14] = self.DONE
+        self.assertEqual(self.log(14, ctl)[:2], (0, self.DONE))
+        self.assertEqual(self.rest_reads(), 1)
+        self.controller_logs[15] = (410, b"gone")  # GitHub expired it: REST would 410 too
+        code, out, err = self.log(15, ctl)
+        self.assertEqual((code, out), (gg.EXIT_FAIL, b""))
+        self.assertIn("expired", err)
+        self.assertEqual(self.rest_reads(), 1)
+
+    def test_no_answer_prints_nothing_and_fails(self) -> None:
+        code, out, err = self.log(16)  # GitHub 404: the caller reads GitHub itself
+        self.assertEqual((code, out), (gg.EXIT_FAIL, b""))
+        self.assertIn("HTTP 404", err)
+        self.assertEqual(self.log(16)[0], gg.EXIT_FAIL)
+        self.assertEqual(self.rest_reads(), 2)  # a miss is never kept
+
+    def test_the_cli_takes_owner_repo_and_an_id(self) -> None:
+        with mock.patch.object(gg, "find_gh", return_value=None), \
+                mock.patch.object(gg.Controller, "from_env", return_value=None), \
+                contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(gg.main(["log", "job", "o/r", "17"]), gg.EXIT_FAIL)
+            self.assertEqual(gg.main(["log", "job", "o", "17"]), 64)
+        gg.job_log_put("o/r", 17, self.DONE)
+        out = io.BytesIO()
+        stdout = io.TextIOWrapper(out)  # held: a collected wrapper closes the buffer
+        with mock.patch.object(gg.sys, "stdout", stdout):
+            self.assertEqual(gg.main(["log", "job", "O/R", "17"]), gg.EXIT_OK)
+        self.assertEqual(out.getvalue(), self.DONE)
+
+    def test_eviction_drops_the_least_recently_read_first(self) -> None:
+        for job in (1, 2, 3):
+            gg.job_log_put("o/r", job, os.urandom(4096))  # random: gzip cannot shrink it
+            os.utime(gg.job_log_path("o/r", job), (NOW - 100 + job, NOW - 100 + job))
+        gg.job_log_get("o/r", 1)  # read: now the newest
+        each = gg.job_log_path("o/r", 2).stat().st_size
+        tmp = gg.job_log_path("o/r", 1).with_name(".1.log.gz.9.9.tmp")
+        tmp.write_bytes(b"x")
+        os.utime(tmp, (NOW - 2 * gg.JOB_LOG_TMP_KEEP,) * 2)
+        self.assertEqual(gg.job_logs_evict(max_bytes=2 * each)["removed"], 1)
+        self.assertFalse(gg.job_log_path("o/r", 2).exists())
+        self.assertTrue(gg.job_log_path("o/r", 1).exists() and gg.job_log_path("o/r", 3).exists())
+        self.assertFalse(tmp.exists())
+
+    def test_classifier_reads_spend_one_rest_read_per_job(self) -> None:
+        """The before/after harness: 20 classifier reads of 10 distinct failed jobs, each `log job` first and REST
+        only on a non-zero exit (glaeda_log.py). Without `log` every read fell to REST: 20."""
+        for job in range(100, 110):
+            self.gh.job_logs[job] = self.DONE
+        fallback = 0
+        for job in [*range(100, 110)] * 2:
+            code, out, _ = self.log(job)
+            if code != 0:
+                fallback += 1
+            else:
+                self.assertEqual(out, self.DONE)
+        self.assertEqual((self.rest_reads(), fallback), (10, 0))
+        ctl = self.controller()
+        for job in range(200, 210):
+            self.controller_logs[job] = (200, self.DONE)
+        for job in [*range(200, 210)] * 2:
+            self.assertEqual(self.log(job, ctl)[0], 0)
+        self.assertEqual(self.rest_reads(), 10)  # the controller's 20 reads added none
 
 
 if __name__ == "__main__":

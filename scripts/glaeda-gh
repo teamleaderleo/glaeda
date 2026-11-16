@@ -15,6 +15,8 @@
     glaeda-gh wait pid PID [--timeout S]                a process to exit, instead of a `kill -0` loop
     glaeda-gh checks OWNER/REPO SHA... --consumer NAME [--max-age S] [--wait S] [--json]
                                                         every check of those commits, read once for all sessions
+    glaeda-gh log job OWNER/REPO JOB_ID                a finished job's log: kept here, else the build controller,
+                                                        else one REST read; kept compressed for the next reader
     glaeda-gh post comment OWNER/REPO#N --body-file F|- [--wait S]    queue a comment; the daemon posts it, paced
     glaeda-gh post pr OWNER/REPO --head B --base B --title T --body-file F [--reviewer LOGIN] [--wait S]
     glaeda-gh post review OWNER/REPO#N [--event comment|approve|request-changes] --body-file F [--wait S]
@@ -212,7 +214,7 @@ elsewhere by the repository's own rescue. `wait` holds such a failure as pending
 --rescue-grace seconds (default 360) and follows the next attempt; a failure with any other
 cause decides at once.
 
-State lives in ~/.cache/glaeda/gh (GLAEDA_GH_DIR overrides): watch/, cache/, budget.json,
+State lives in ~/.cache/glaeda/gh (GLAEDA_GH_DIR overrides): watch/, cache/, logs/, budget.json,
 daemon.json (a heartbeat and the last hour's request counts), spend.json, alarms.json and daemon.lock, which the daemon
 holds for its lifetime and names itself in. Every GitHub request has a hard deadline (HTTP_DEADLINE),
 every subprocess one too, and a tick starts no request after TICK_BUDGET (what it did not reach goes
@@ -12509,6 +12511,176 @@ def cmd_post_status(post_id: str | None, wait: float, as_json: bool, queued: boo
     return 0 if state["state"] == "posted" else 1 if state["state"] == "failed" else 2 if wait > 0 else 0
 
 
+# ---------------------------------------------------------------- log job: a finished job's log, read once per host
+#
+# cmux's CI classifiers (scripts/ci/glaeda_log.py, cmux#41273) ask `glaeda-gh log job OWNER/REPO ID` for a failed
+# job's log first and read GET .../actions/jobs/ID/logs over REST only when it exits non-zero. The REST quota is one
+# shared 5000/h, out most of every hour, and the same failed job's log is read again by every classifier, replay and
+# property check that looks at it. A finished job's log never changes, so it is read once: from this cache (gzip,
+# under BASE/logs, least recently read out first past JOB_LOG_MAX_BYTES, no other expiry), else from the build
+# controller, which reads it with its own App token (cmuxterm-hq#7930, /v1/github/job-log: no user quota), else with
+# one REST read. Only a finished job's log is kept: the controller serves only those, and a REST answer is kept only
+# when it ends with the runner's last line (JOB_LOG_DONE). Anything this cannot answer exits non-zero with nothing on
+# stdout, so the caller reads GitHub itself. Each step is bounded so the whole stays inside the caller's 30 s
+# (LOG_CONTROLLER_TIMEOUT + LOG_REST_TIMEOUT).
+
+JOB_LOG_DIR = "logs"
+# 512 MiB of compressed logs: a failed cmux job's log is 0.1-5 MB of text and gzip keeps about a tenth of it, so this
+# holds a few thousand failed jobs, more than a busy week of them.
+JOB_LOG_MAX_BYTES = 512 * 1024 * 1024
+JOB_LOG_RAW_MAX = 64 * 1024 * 1024  # a larger log is printed, not kept
+JOB_LOG_TMP_KEEP = 3600.0  # a writer's temporary file this old was left by a crash: eviction removes it
+# The runner's "Complete job" step ends every finished job's log with this line; a job still running has not written
+# it, and neither has one whose runner died. Without it a REST answer is printed but not kept.
+JOB_LOG_DONE = b"Cleaning up orphan processes"
+LOG_CONTROLLER_TIMEOUT = 8  # the controller's job-log read (it may read GitHub itself first)
+LOG_REST_TIMEOUT = 18  # one `gh api .../logs` read (a redirect to blob storage, which gh follows)
+
+
+def job_log_path(repo: str, job: int) -> Path:
+    owner, name = repo.lower().split("/", 1)
+    return BASE / JOB_LOG_DIR / owner / name / f"{int(job)}.log.gz"
+
+
+def job_log_get(repo: str, job: int) -> bytes | None:
+    """JOB's kept log, or None. A hit is marked used (its mtime) so eviction drops the least recently read first."""
+    path = job_log_path(repo, job)
+    try:
+        with open(path, "rb") as f:
+            text = gzip.decompress(f.read())
+    except (OSError, EOFError, ValueError, zlib.error):
+        return None  # missing, or damaged: a miss, and the next read replaces it
+    with contextlib.suppress(OSError):
+        os.utime(path)
+    return text
+
+
+def job_log_put(repo: str, job: int, text: bytes) -> None:
+    """Keep JOB's log, replaced whole (a reader sees the old file, none, or all of it), then evict past the cap."""
+    if len(text) > JOB_LOG_RAW_MAX:
+        return
+    path = job_log_path(repo, job)
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.{time.monotonic_ns()}.tmp")
+    try:
+        with open(tmp, "wb") as f:
+            f.write(gzip.compress(text, compresslevel=6, mtime=0))
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            tmp.unlink()
+        raise
+    job_logs_evict()
+
+
+def job_logs_evict(max_bytes: int | None = None, now: float | None = None) -> dict:
+    """Remove the least recently read logs until the rest fit in max_bytes, and temporary files a crash left.
+    {"removed", "bytes"}. A reader that has a log open keeps reading it."""
+    max_bytes = JOB_LOG_MAX_BYTES if max_bytes is None else max_bytes
+    now = time.time() if now is None else now
+    kept: list[tuple[float, int, Path]] = []
+    removed = 0
+    with contextlib.suppress(OSError):
+        for owner in (BASE / JOB_LOG_DIR).iterdir():
+            for repo in (owner.iterdir() if owner.is_dir() else ()):
+                for p in (repo.iterdir() if repo.is_dir() else ()):
+                    try:
+                        st = p.stat()
+                    except OSError:
+                        continue
+                    if p.name.endswith(".log.gz") and not p.name.startswith("."):
+                        kept.append((st.st_mtime, st.st_size, p))
+                    elif p.name.endswith(".tmp") and now - st.st_mtime > JOB_LOG_TMP_KEEP:
+                        with contextlib.suppress(OSError):
+                            p.unlink()
+    total = sum(size for _, size, _ in kept)
+    for _, size, p in sorted(kept, key=lambda k: k[0]):
+        if total <= max_bytes:
+            break
+        with contextlib.suppress(OSError):
+            p.unlink()
+            total -= size
+            removed += 1
+    return {"removed": removed, "bytes": total}
+
+
+def controller_job_log(ctl: "Controller", repo: str, job: int) -> tuple[int, bytes]:
+    """(HTTP status, body) of the controller's GET /v1/github/job-log: 200 is a finished job's log; 0 when it did not
+    answer. 404 (unknown job, or an older controller), 409 (still running), 410 (GitHub expired it) and 429 (its log
+    reads are spent) carry no log."""
+    headers = {"Authorization": f"Bearer {ctl.token}"} if ctl.token else {}
+    url = f"{ctl.base}/v1/github/job-log?repo={urllib.parse.quote(repo, safe='/')}&id={int(job)}"
+    try:
+        with hard_deadline(LOG_CONTROLLER_TIMEOUT + 1), \
+                OPENER.open(urllib.request.Request(url, headers=headers), timeout=LOG_CONTROLLER_TIMEOUT) as response:
+            return response.status, response.read(JOB_LOG_RAW_MAX + 1)
+    except urllib.error.HTTPError as error:
+        return error.code, b""
+    except (OSError, HTTPException, ValueError):  # DeadlineTimeout is an OSError
+        return 0, b""
+
+
+def rest_job_log(repo: str, job: int) -> tuple[bool, bytes, str]:
+    """One `gh api repos/REPO/actions/jobs/JOB/logs` through the PATH gh (so the quota guard and a lane's broker see
+    it; gh follows the redirect to blob storage, which no quota counts): (ok, log bytes, why not)."""
+    gh = find_gh()
+    if gh is None:
+        return False, b"", "gh not found"
+    route = f"repos/{repo}/actions/jobs/{int(job)}/logs"
+    for flags in (["--allow-escape-sequences"], []):  # newer gh strips a log's colour codes without it; older lacks it
+        try:
+            done = subprocess.run([gh, "api", *flags, route], stdin=subprocess.DEVNULL, capture_output=True,
+                                  timeout=LOG_REST_TIMEOUT, check=False)
+        except (OSError, subprocess.TimeoutExpired) as error:
+            return False, b"", f"gh api: {type(error).__name__}"
+        if done.returncode == 0:
+            return True, done.stdout, ""
+        err = done.stderr.decode(errors="replace").strip()
+        if not (flags and "unknown flag" in err):
+            break
+    return False, b"", (err or f"gh api exited {done.returncode}")[-300:]
+
+
+def job_log_finished(text: bytes) -> bool:
+    return JOB_LOG_DONE in text[-4096:]
+
+
+def cmd_log_job(repo: str, job: int, controller: Any = "env", rest: Callable = rest_job_log) -> int:
+    """Print JOB's log: kept here, else from the build controller, else one REST read. Exit 0 only with the log on
+    stdout; anything else prints nothing there, so a caller reads GitHub itself."""
+    if not re.fullmatch(rf"{NAME}/{NAME}", repo) or job <= 0:
+        raise WatchError("log job takes OWNER/REPO and a job id (the number after /job/ in the job's URL)")
+    repo = repo.lower()
+    text, source = job_log_get(repo, job), "cache"
+    if text is None:
+        ctl = Controller.from_env() if controller == "env" else controller
+        status = 0
+        if ctl is not None:
+            status, body = controller_job_log(ctl, repo, job)
+            if status == 200 and len(body) <= JOB_LOG_RAW_MAX:
+                text, source = body, "controller"
+                with contextlib.suppress(OSError):
+                    job_log_put(repo, job, text)  # the controller serves only a finished job's log
+        if text is None and status == 410:
+            print(f"glaeda-gh: GitHub has no log for {repo} job {job} any more (expired)", file=sys.stderr)
+            return EXIT_FAIL
+        if text is None:
+            ok, body, why = rest(repo, job)
+            if not ok:
+                print(f"glaeda-gh: no log for {repo} job {job}: {why}", file=sys.stderr)
+                return EXIT_FAIL
+            text, source = body, "rest"
+            if job_log_finished(text):
+                with contextlib.suppress(OSError):
+                    job_log_put(repo, job, text)
+    out = sys.stdout.buffer
+    out.write(text)
+    out.flush()
+    if source != "cache" and full_output():
+        print(f"glaeda-gh: {repo} job {job} read from the {source}", file=sys.stderr)
+    return EXIT_OK
+
+
 class Parser(argparse.ArgumentParser):
     """`argparse`'s parser, with a bad argument exiting 64 instead of 2.
 
@@ -12548,7 +12720,7 @@ def usage_next(argv: list[str], prog: str = "glaeda-gh") -> str:
             fixed += ["--timeout", "1800"]
         return " ".join(["glaeda-gh"] + fixed)
     if prog == "glaeda-gh" and words[:1] and words[0] in ("status", "wait", "checks", "post", "budget", "audit",
-                                                          "runners", "restart", "serve"):
+                                                          "runners", "restart", "serve", "log"):
         return f"glaeda-gh {words[0]} --help"
     return f"{prog} --help"
 
@@ -12710,6 +12882,11 @@ def parser() -> argparse.ArgumentParser:
                     help="comment: this is your status KEY on the thread; your next comment with the same KEY edits "
                          "this one in place while it is still the thread's last comment and nobody waits on it")
     po.add_argument("--json", action="store_true")
+    lg = sub.add_parser("log", help="a finished job's log, read once per host (cache, build controller, then REST)")
+    lgs = lg.add_subparsers(dest="kind", required=True, parser_class=Parser)
+    lj = lgs.add_parser("job", help="print one job's log (exit 0 only with the log on stdout)")
+    lj.add_argument("repo", metavar="OWNER/REPO")
+    lj.add_argument("job", type=int, metavar="JOB_ID")
     sub.add_parser("read", help="an upstream's end: register the keys of one JSON request on stdin and print "
                                 "the cached entries (see upstream.json)")
     b = sub.add_parser("budget", help="REST and GraphQL quota as the daemon last saw it")
@@ -12779,6 +12956,8 @@ def main(argv: list[str] | None = None) -> int:
             if args.last < 0:
                 raise WatchError("--last must be 0 (all of it) or more lines")
             return cmd_audit(args.log or guard_log(), args.last, args.json)
+        if args.command == "log":
+            return cmd_log_job(args.repo, args.job)
         if args.command == "runners":
             return cmd_runners(args.scope, args.label, args.json)
         if args.command == "restart":
