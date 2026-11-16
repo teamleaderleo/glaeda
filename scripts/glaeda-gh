@@ -880,7 +880,14 @@ def host_spenders(run: Callable[..., Any] = subprocess.run) -> tuple[list[dict],
     """This host's top REST spenders on the shared login over the last hour (SPENDERS_CMD usage --json), with the REST
     all its callers spent: ([], None) when it cannot say. Each row is {caller, rest, graphql, source}."""
     try:
-        done = run([SPENDERS_CMD, "usage", "--json"], capture_output=True, text=True, timeout=SPENDERS_TIMEOUT)
+        # Every host signed in to the login first (gh-quota `usage --fleet --cache-only` answers from its
+        # last sweep or starts one and exits nonzero), so the pool alarm's "unlogged" is what no host logged; on
+        # 2026-11-16 another host's logs held 2892 REST an hour this alarm called unlogged. An older gh-quota, or no
+        # fresh sweep yet: this host's own usage, as before.
+        done = run([SPENDERS_CMD, "usage", "--json", "--fleet", "--cache-only"], capture_output=True, text=True,
+                   timeout=SPENDERS_TIMEOUT)
+        if done.returncode != 0 or not (done.stdout or "").strip():
+            done = run([SPENDERS_CMD, "usage", "--json"], capture_output=True, text=True, timeout=SPENDERS_TIMEOUT)
         if done.returncode != 0 or not (done.stdout or "").strip():
             return [], None  # it could not say: an empty answer is not "spent nothing" (#1936 review)
         rows = json.loads(done.stdout)
@@ -891,7 +898,7 @@ def host_spenders(run: Callable[..., Any] = subprocess.run) -> tuple[list[dict],
     rows = [r for r in rows if isinstance(r, dict) and isinstance(r.get("rest"), int) and not isinstance(r["rest"], bool)
             and r["rest"] > 0]
     rows.sort(key=lambda r: (-r["rest"], str(r.get("caller"))))
-    return ([{k: r.get(k) for k in ("caller", "rest", "graphql", "source")} for r in rows[:SPENDERS_TOP]],
+    return ([{k: r.get(k) for k in ("caller", "rest", "graphql", "source", "host") if k in r} for r in rows[:SPENDERS_TOP]],
             sum(r["rest"] for r in rows))
 
 
@@ -904,7 +911,7 @@ UNLOGGED_EARLY = 600  # a window younger than this is too early to measure (#193
 
 
 def unlogged_text(limit: int | None, remaining: int | None, reset: float | None, now: float,
-                  host_rest: int | None) -> tuple[str, int | None]:
+                  host_rest: int | None, fleet: bool = False) -> tuple[str, int | None]:
     """(" At least G of the U REST ... ", G) for the REST no log on this host holds, else ("", None). Both sides
     cover the same requests, so a burst is not taken for a rate (#1936 review): U is what GitHub says the pool spent
     since its window opened (LIMIT - REMAINING, at most an hour back from RESET), and HOST_REST is every logged call
@@ -922,6 +929,10 @@ def unlogged_text(limit: int | None, remaining: int | None, reset: float | None,
     gap = used - host_rest
     if gap < UNLOGGED_MIN or gap < UNLOGGED_SHARE * used:
         return "", None
+    if fleet:  # HOST_REST summed every login host's logs (`gh-quota usage --fleet`)
+        return (f" At least {gap} of the {used} REST the pool spent in the last {since / 60:.0f} min ({gap / used:.0%}) "
+                f"is in no host's log (`{Path(SPENDERS_CMD).name} usage --fleet`): this login's token used outside gh.",
+                gap)
     return (f" At least {gap} of the {used} REST the pool spent in the last {since / 60:.0f} min ({gap / used:.0%}) is "
             f"in no log on {policy_host()}: other hosts signed in to this login (their `{Path(SPENDERS_CMD).name} "
             f"usage`), or its token used outside gh.", gap)
@@ -931,7 +942,8 @@ def spenders_text(rows: list[dict]) -> str:
     if not rows:
         return f"Top REST callers on {policy_host()}: unknown ({Path(SPENDERS_CMD).name} usage gave none); glaeda-gh budget."
     said = "; ".join(f"{r['caller']} {r['rest']}" + (f" ({r['source']})" if r.get("source") else "") for r in rows)
-    return f"Top REST callers on {policy_host()}, last hour: {said}."
+    where = "on every login host" if any(r.get("host") for r in rows) else f"on {policy_host()}"
+    return f"Top REST callers {where}, last hour: {said}."
 
 
 def waiter_of(e: dict) -> str:
@@ -2847,7 +2859,8 @@ class Daemon:
             if name == "pool":  # read only when it is sent: at most a few times an hour
                 spenders, host_rest = host_spenders()
                 gap_text, gap = unlogged_text((self.budget.get("rest") or {}).get("limit") or 5000,
-                                              data.get("remaining"), data.get("reset"), self.clock(), host_rest)
+                                              data.get("remaining"), data.get("reset"), self.clock(), host_rest,
+                                              fleet=any(r.get("host") for r in spenders))
                 data = {**data, "spenders": spenders, "hostRest": host_rest, "unlogged": gap}
                 text += " " + spenders_text(spenders) + gap_text
             self.send_alarm(name, level, text, data)

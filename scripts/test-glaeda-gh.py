@@ -12658,6 +12658,29 @@ class SpendAlarmTest(Base):
         self.assertIn("At least 3100 of the 4000 REST the pool spent in the last 50 min (78%) is in no log on", told[0])
         self.assertEqual(self.notice_lines()[-1]["data"]["unlogged"], 3100)
 
+    def test_the_pool_alarm_subtracts_every_login_hosts_logs(self) -> None:
+        """2026-11-16: another host's logs held 2892 REST an hour that this host's alarm called unlogged. With
+        `gh-quota usage --fleet` rows (each with its host), only what no host logged is named, as the token's."""
+        self.policy(pool=True)
+        self.spenders([{"caller": "host-b/broker:vm-2", "rest": 2500, "graphql": 0,
+                        "source": "lane-gh-broker", "host": "host-b"},
+                       {"caller": "host-a/tool:x", "rest": 900, "graphql": 0, "source": "gh shim",
+                        "host": "host-a"}])
+        reset = NOW + 1200
+        self.seen(2000, NOW, reset)
+        self.daemon.check_alarms()
+        self.seen(1000, NOW + 600, reset)
+        self.daemon.check_alarms()
+        told = self.told_lines()
+        self.assertEqual(len(told), 1, told)
+        self.assertIn("Top REST callers on every login host, last hour: host-b/broker:vm-2 2500", told[0])
+        self.assertNotIn("in no log", told[0])  # 4000 spent, 3400 logged on the two hosts: 15%, under the share
+        self.assertNotIn("in no host's log", told[0])
+        self.assertEqual(self.notice_lines()[-1]["data"]["hostRest"], 3400)
+        self.assertEqual(gg.unlogged_text(5000, 1000, NOW + 600, NOW, 1000, fleet=True)[0].split(":")[0],
+                         " At least 3000 of the 4000 REST the pool spent in the last 50 min (75%) is in no host's log "
+                         "(`gh-quota usage --fleet`)")
+
     def test_a_logged_burst_after_an_idle_hour_is_not_called_unlogged(self) -> None:
         """#1936 review F1: 50 idle minutes, then 600 logged requests in 10 minutes. The pace reads 3600 an hour, but
         the pool spent 600 and this host logged all 600: nothing is unlogged."""
