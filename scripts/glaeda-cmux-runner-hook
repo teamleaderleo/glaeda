@@ -4688,6 +4688,34 @@ def holder_alive(pid_file: Path) -> bool:
         return False
 
 
+# A holder killed outright (SIGKILL, a crash) never runs its own cleanup, and a ci-step's holder file is named for its
+# one-off job key, so no later job ever rewrites it: one CI mini carried three such files from 2026-11-09 and
+# 2026-11-15 on 2026-11-16. Each job start sweeps them: a holder pid file (or its .releasing copy) whose holder is gone
+# and that is older than HOLDER_SWEEP_GRACE_S (a holder being started writes its file within seconds), with its
+# .release request. A pid file whose pid was reused stays until that process ends; it holds nothing either way.
+HOLDER_SWEEP_GRACE_S = 120.0
+
+
+def sweep_dead_holders(state_dir: Path, now: float | None = None) -> list[str]:
+    """Remove dead holders' pid files under STATE_DIR; the names removed."""
+    now = time.time() if now is None else now
+    removed: list[str] = []
+    if not state_dir.is_dir():
+        return removed
+    for pid_file in sorted(state_dir.glob(f"{HOLDER_FILE}*.pid")) + sorted(state_dir.glob(f"{HOLDER_FILE}*.pid{RELEASING}")):
+        try:
+            if now - pid_file.stat().st_mtime < HOLDER_SWEEP_GRACE_S or holder_alive(pid_file):
+                continue
+            pid_file.unlink()
+        except OSError:
+            continue
+        removed.append(pid_file.name)
+        if pid_file.name.endswith(".pid"):
+            with contextlib.suppress(OSError):
+                pid_file.with_name(pid_file.name + ".release").unlink(missing_ok=True)
+    return removed
+
+
 def gui_holder_wants(capacity_dir: Path, roots: list[str], gui_token: str = "gui") -> str | None:
     """A root in `roots` that a job holding the gui token is waiting for in take-root, from its marker."""
     for name in roots:
@@ -10532,6 +10560,10 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.phase in ("job-started", "job-completed"):
         leave_job_workspace(args)
+    if args.phase in ("job-started", "admit"):
+        with contextlib.suppress(Exception):  # housekeeping that cannot look never fails the job
+            if swept := sweep_dead_holders(args.state_dir):
+                print(f"{PREFIX}: removed {len(swept)} dead lock holder file(s): {', '.join(swept)}", flush=True)
     if args.phase == "job-started" and not args.dedicated_admit:
         note = None
         with contextlib.suppress(Exception):  # housekeeping that cannot look never fails the job
