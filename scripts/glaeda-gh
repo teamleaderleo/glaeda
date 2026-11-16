@@ -264,6 +264,7 @@ from typing import Any, Callable
 BASE = Path(os.environ.get("GLAEDA_GH_DIR") or Path.home() / ".cache/glaeda/gh")
 API = "https://api.github.com"
 CYCLE = 60  # seconds between polls of a live PR or run
+JOBS_ACTIVE_REFRESH = 5 * CYCLE  # active --jobs watches refresh their job list at a bounded pace
 COMMENT_CYCLE = 15  # comment watches: someone is waiting for a reply, and one batched query costs ~1 point
 TICK = 2  # how often the daemon looks for new interest; a new entry is filled within one tick
 IDLE_EXPIRY = 15 * 60  # drop an entry nobody has read for this long
@@ -1649,7 +1650,7 @@ def cmd_read(text: str) -> int:
         cached = read_cache(key)
         budgets = (entries.get(key) or {}).get("budgets") or {}  # an earlier line's consumers, for this same key
         entries[key] = None if cached is None else {
-            k: cached.get(k) for k in ("data", "dataAt", "error", "fetchedAt", "jobs", "jobsAt", "missing", "restRun", "restRunAt")
+            k: cached.get(k) for k in ("data", "dataAt", "error", "fetchedAt", "jobs", "jobsAt", "jobsReadAt", "jobsAttempt", "missing", "restRun", "restRunAt")
             if k in cached}
         if cached is not None and cached.get("source"):  # where the data came from, so a downstream wait can
             entries[key]["origin"] = cached.get("origin") if cached.get("source") == "upstream" else cached["source"]
@@ -4752,6 +4753,10 @@ class Daemon:
                 jobs_at = entry.get("jobsAt")
                 if isinstance(jobs_at, (int, float)) and not isinstance(jobs_at, bool):
                     fields["jobsAt"] = min(self.now, float(jobs_at))
+            for field in ("jobsReadAt", "jobsAttempt"):
+                value = entry.get(field)
+                if isinstance(value, (int, float)) and not isinstance(value, bool):
+                    fields[field] = min(self.now, float(value)) if field == "jobsReadAt" else int(value)
             self.store(e["key"], e["cache"], **fields)
 
     def upstream_denials(self, got: dict) -> None:
@@ -5074,7 +5079,7 @@ class Daemon:
             base = current if isinstance(current, dict) else prior
             entry = {"key": key, "fetchedAt": self.now, "dataAt": None, "data": None, "error": None}
             if base:
-                entry.update({k: base[k] for k in ("dataAt", "data", "etag", "jobs", "jobsEtag", "jobsAt", "jobsTried", "restAt", "source", "restParts", "restRun", "restRunAt", "origin", "via", "rerunAt", "fp", "fullAt", "wholeAt")
+                entry.update({k: base[k] for k in ("dataAt", "data", "etag", "jobs", "jobsEtag", "jobsAt", "jobsReadAt", "jobsAttempt", "jobsTried", "restAt", "source", "restParts", "restRun", "restRunAt", "origin", "via", "rerunAt", "fp", "fullAt", "wholeAt")
                               if k in base})
             entry.update(fields)
             if key.startswith("pr:") and isinstance(entry.get("data"), dict) and "data" in fields:
@@ -5762,17 +5767,38 @@ class Daemon:
         attempt = run.get("run_attempt") or 1
         failed_attempt = (run.get("status") == "completed" and run.get("conclusion") not in RUN_OK
                           and self.mode("rest") != "stop"
-                          and (fresh or jobs_attempt(prior.get("jobs")) < attempt)
+                          and (fresh or (jobs_attempt(prior.get("jobs")) < attempt
+                                         and prior.get("jobsAttempt") != attempt))
                           # past the REST share, once per attempt, answered or not: an error or an empty
                           # list would otherwise be asked for again every cycle, past the share
                           and (self.rest_room(1) or prior.get("jobsTried") != attempt))
-        if (e["jobs"] and self.mode("rest") == "normal") or failed_attempt:
+        jobs_attempt_mark = prior.get("jobsAttempt")
+        attempt_changed = not isinstance(jobs_attempt_mark, int) or jobs_attempt_mark != attempt
+        jobs_read_at = prior.get("jobsReadAt")
+        if not isinstance(jobs_read_at, (int, float)) or isinstance(jobs_read_at, bool):
+            jobs_read_at = prior.get("jobsAt")
+        active_jobs = run.get("status") != "completed"
+        requested_jobs = False
+        if failed_attempt:
+            requested_jobs = True
+        elif e["jobs"] and self.mode("rest") == "normal":
+            if active_jobs:
+                requested_jobs = (attempt_changed or not isinstance(jobs_read_at, (int, float))
+                                  or self.now - jobs_read_at >= JOBS_ACTIVE_REFRESH)
+            else:
+                # A terminal run's list is immutable for an attempt. Keep the attempt marker separately from
+                # jobsAt: an empty list has no job attempt for jobs_attempt() to report.
+                requested_jobs = attempt_changed or not isinstance(prior.get("jobsAt"), (int, float))
+        if requested_jobs:
             try:
                 with self.calling(*caller_of(e["key"]), waiter_of(e)):  # its own waiter, inside a batch's call too
                     jstate, jdoc, jetag = self.get(base + "/jobs?per_page=100",
                                                    prior.get("jobsEtag") if "jobs" in prior else None)
             except OutOfTime:  # the run itself is read: store it, and its jobs wait for a later read
                 jstate, jdoc, jetag = "late", None, None
+            if jstate != "late":
+                fields["jobsAttempt"] = attempt
+                fields["jobsReadAt"] = self.now
             if failed_attempt and jstate != "late":  # sent: a tick out of time sent nothing, so it is not tried
                 fields["jobsTried"] = attempt  # in the cache entry, so a restart or a new watch remembers it
             if jstate == "fresh":
@@ -8342,7 +8368,7 @@ def controller_wait_run(key: str, timeout: float) -> dict | None:
                 rest_at = prior["restAt"]
         entry = {"key": key, "fetchedAt": now, "dataAt": data_at, "restAt": rest_at,
                  "data": candidate, "error": None, "source": "controller"}
-        for field in ("etag", "jobs", "jobsEtag", "jobsAt", "jobsTried", "restParts", "restRun", "restRunAt", "rerunAt"):
+        for field in ("etag", "jobs", "jobsEtag", "jobsAt", "jobsReadAt", "jobsAttempt", "jobsTried", "restParts", "restRun", "restRunAt", "rerunAt"):
             if field in prior:
                 entry[field] = prior[field]
         write_json(cache, entry)
