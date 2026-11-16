@@ -11567,6 +11567,92 @@ class GateTest(unittest.TestCase):
         gate.step(); gate.step()
         self.assertEqual(stops, ["the mini is throttled (thermal pressure level 3)"])
 
+    # cmux8s-mac-mini (M4 Pro: cpu0-3 efficiency, cpu4-13 performance), 2026-11-16 05:35Z: from 11-14 its
+    # performance cores ran nothing while its efficiency cores were saturated at load 123, and the daemon tests
+    # took 51-64 min instead of 14-22 (host cpu_busy_pct flat at 28.9 = 4/14 on every job). The other 23 runner
+    # Macs, read the same minute, put load on their performance cores.
+    CMUX8S = [100.0] * 4 + [0.0] * 10
+    CMUXS_6 = [61.0, 54.0, 48.0, 42.0] + [91.0] * 10  # the same chip, healthy, load 21
+    CMUX10S_IDLE = [33.0, 30.0, 27.0, 27.0, 0.0, 0.0, 0.0, 0.0, 0.0, 7.0, 3.0, 2.0, 2.0, 2.0]  # load 1.4
+
+    def test_a_host_whose_performance_cores_run_nothing_under_load_is_stalled(self) -> None:
+        why = hook.pcore_stall(self.CMUX8S, 4, 123.47, 14)
+        self.assertIsNotNone(why)
+        self.assertIn("performance cores 0% busy", why)
+        self.assertIn("efficiency cores 100% busy", why)
+        self.assertIsNone(hook.pcore_stall(self.CMUXS_6, 4, 21.08, 14))
+        self.assertIsNone(hook.pcore_stall(self.CMUX10S_IDLE, 4, 1.44, 14))  # idle: macOS prefers E-cores
+        # background-QoS work alone saturates the E-cores at a low load; that is placement, not a stall
+        self.assertIsNone(hook.pcore_stall(self.CMUX8S, 4, 6.0, 14))
+        self.assertIsNone(hook.pcore_stall(self.CMUX8S, None, 123.0, 14))  # one perf level (Intel, VM)
+        self.assertIsNone(hook.pcore_stall(self.CMUX8S, 4, None, 14))
+
+    def test_core_busy_reads_tick_differences_per_cpu(self) -> None:
+        before = [(100, 0, 900, 0), (0, 0, 1000, 0)]
+        after = [(200, 0, 900, 0), (0, 0, 1100, 0)]
+        self.assertEqual(hook.core_busy(before, after), [100.0, 0.0])
+        self.assertIsNone(hook.core_busy(before, after[:1]))
+
+    def pcore_gate(self, busy: list[float], boot: int = 1794342904):
+        totals: list[list[int]] = []
+
+        def read() -> list[tuple[int, int, int, int]]:
+            """Cumulative ticks: each read adds 100 ticks per CPU, split by the busy share the test sets now."""
+            if not totals:
+                totals.extend([0, 0] for _ in self.pcore_busy)
+            for total, b in zip(totals, self.pcore_busy):
+                total[0] += int(b)
+                total[1] += int(100 - b)
+            return [(used, 0, idle, 0) for used, idle in totals]
+        self.pcore_busy = busy
+        patches = [mock.patch.object(hook, "core_ticks", side_effect=read),
+                   mock.patch.object(hook, "efficiency_cores", return_value=4),
+                   mock.patch.object(hook, "load_1min", return_value=123.47),
+                   mock.patch.object(hook.os, "cpu_count", return_value=14),
+                   mock.patch.object(hook, "boot_epoch", return_value=boot)]
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+        return hook.Gate(self.runner, os.fspath(self.lock), os.fspath(self.tmp / "none.json"), self.state)
+
+    def test_a_stalled_mini_holds_every_listener_until_a_reboot_and_names_the_drained_reboot(self) -> None:
+        gate = self.pcore_gate(self.CMUX8S)
+        looks = [gate.stalled(fresh=True) for _ in range(hook.PCORE_STALL_LOOKS)]  # the first look only reads
+        self.assertEqual(looks[:-1], [None] * (hook.PCORE_STALL_LOOKS - 1))
+        gate.stalled(fresh=True)
+        why = gate.stalled(fresh=True)
+        self.assertIsNotNone(why)
+        self.assertIn("drained reboot", why)
+        self.assertIn("mini_reboot.py --apply --min-held-gib 0", why)
+        # every runner slot on the mini reads the same hold at once, without looking again
+        other = hook.Gate(self.runner, os.fspath(self.lock), os.fspath(self.tmp / "none.json"), self.state)
+        self.assertEqual(other.stalled(), why)
+        # the hold outlives an idle host (no load: nothing to measure), until the boot changes
+        self.pcore_busy = [0.0] * 14
+        self.assertEqual(gate.stalled(fresh=True), why)
+        with mock.patch.object(hook, "boot_epoch", return_value=1794900000):
+            rebooted = hook.Gate(self.runner, os.fspath(self.lock), os.fspath(self.tmp / "none.json"), self.state)
+            self.assertIsNone(rebooted.stalled(fresh=True))
+
+    def test_a_held_mini_whose_performance_cores_work_again_listens_again(self) -> None:
+        gate = self.pcore_gate(self.CMUX8S)
+        for _ in range(hook.PCORE_STALL_LOOKS + 1):
+            gate.stalled(fresh=True)
+        self.assertIsNotNone(gate.stalled())
+        self.pcore_busy = self.CMUXS_6
+        gate.stalled(fresh=True)
+        self.assertIsNone(gate.stalled(fresh=True))
+
+    def test_a_healthy_loaded_mini_is_never_held_and_the_stall_hold_is_in_the_gate_chain(self) -> None:
+        gate = self.pcore_gate(self.CMUXS_6)
+        for _ in range(hook.PCORE_STALL_LOOKS + 2):
+            self.assertIsNone(gate.stalled(fresh=True))
+        stalled = self.pcore_gate(self.CMUX8S)
+        for _ in range(hook.PCORE_STALL_LOOKS + 1):
+            stalled.stalled(fresh=True)
+        stalled.saturated = lambda: None  # type: ignore[method-assign]
+        self.assertIn("drained reboot", stalled.confirmed() or "")
+
     def test_the_level_parser_reads_notifyutil(self) -> None:
         run = mock.Mock(return_value=mock.Mock(stdout="com.apple.system.thermalpressurelevel 4\n"))
         with mock.patch.object(hook.subprocess, "run", run):
