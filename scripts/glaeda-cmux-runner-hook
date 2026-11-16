@@ -1838,7 +1838,13 @@ GATE_WAITER_GAP_S = 10 * 60.0
 # hold on wall time, past the longest PR job that night, so a drain behind a job that never ends gives the runners
 # back too; then the same GATE_WAITER_WAIVE_S, and a new hold. Busy is slower, never stuck.
 GATE_DRAIN_WAITER_MAX_HOLD_S = float(os.environ.get("GLAEDA_RUNNER_GATE_DRAIN_WAITER_MAX_HOLD_S") or 150 * 60)
-DRAIN_WAITER_MARKER = re.compile(r"([1-9][0-9]*)-refresh-lend_drain-[0-9]+")
+DRAIN_WAITER_MARKER = re.compile(r"([1-9][0-9]*)-refresh-(?:lend|measure)_drain-[0-9]+")
+# The same hold for the worker's in-step measure drain (cmuxterm-hq cmd/worker/ci_step.go "measure-drain", which also
+# waits for an idle mini) and for a drained reboot's root shell (leo-workspace tools/sandboxd_heal.py writes
+# `$$-$(date +%s)-root-drain` once and never refreshes it; it counts while its pid lives). cmux8s-mac-mini,
+# 2026-11-16: the reboot drain pid 61199 waited 70 min from 05:40Z, let go at 10 min each cycle, and never got the
+# mini its stalled performance cores needed rebooted.
+ONCE_DRAIN_MARKER = re.compile(r"([1-9][0-9]*)-[0-9]+-[a-z_][a-z0-9_-]*-drain")
 WAITER_SPANS_FILE = "fleet-waiter-spans.json"  # in the state dir, shared by every runner's gate and job-started
 # Nightly jobs come first on the fleet (Leo, 2026-10-27): a nightly-tier job is admitted ahead of a waiting fleet build
 # (take_capacity), and each such admission counts against NIGHTLY_WAITER_PASSES per waiter, which the nightly slot's
@@ -7099,8 +7105,8 @@ def nightly_pass(state_dir: Path, pid: int, delta: int = 1) -> bool:
 
 
 def drain_lock_waiters(path: str) -> set[int]:
-    """The pids whose live host.lock.waiters marker is a controller drain's (DRAIN_WAITER_MARKER), read only. A
-    marker not refreshed within 30 s is not live, as registered_lock_waiters reads it."""
+    """The pids whose live host.lock.waiters marker is a drain's, read only: a DRAIN_WAITER_MARKER refreshed within
+    30 s (as registered_lock_waiters reads it), or a once-written ONCE_DRAIN_MARKER whose pid lives."""
     found: set[int] = set()
     directory = Path(path + ".waiters")
     try:
@@ -7112,14 +7118,19 @@ def drain_lock_waiters(path: str) -> set[int]:
                 if i >= 1024:
                     break
                 match = DRAIN_WAITER_MARKER.fullmatch(entry.name)
-                if not match:
+                once = None if match else ONCE_DRAIN_MARKER.fullmatch(entry.name)
+                if not (match or once):
                     continue
                 try:
                     info = entry.stat(follow_symlinks=False)
                 except OSError:
                     continue
-                if stat.S_ISREG(info.st_mode) and 0 <= now - info.st_mtime < 30:
+                if not stat.S_ISREG(info.st_mode):
+                    continue
+                if match and 0 <= now - info.st_mtime < 30:
                     found.add(int(match.group(1)))
+                elif once and pid_alive(int(once.group(1))):
+                    found.add(int(once.group(1)))
     except OSError:
         pass
     return found
