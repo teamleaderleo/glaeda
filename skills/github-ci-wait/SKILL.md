@@ -234,6 +234,12 @@ exits 3, and a restarted daemon writes its heartbeat as soon as it holds its loc
 
 If it was never installed: `glaeda-mini-setup --hygiene-only --apply` from the glaeda checkout.
 
+On a lane VM (a host whose `~/.config/glaeda/upstream.json` names an upstream), the daemon reads through the
+broker host's cache. The broker host reads a key a wait is blocked on within about a minute, even while the
+shared GraphQL quota sits under the fleet's reserve (down to half of it). A wait whose data is older than 120 s reads its
+one target itself through `lane-gh call get` (or the file's `"direct"` program) and says `direct read answered`, without a `glaeda-gh restart` hint.
+A restart there never helps: the data is the upstream's (glaeda#2029).
+
 Never run `glaeda-gh serve` yourself, not even under `timeout`: it refuses while the service is
 loaded, and a hand-started serve that took the lock froze every session's waits on 10-20.
 

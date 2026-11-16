@@ -14996,6 +14996,146 @@ class PrProbeTest(Base):
         self.assertLess(new, old / 3)
 
 
+class WaitedUnderReserveTest(Base):
+    """huge-blue 2026-11-16: GraphQL sat under the fleet's 1000-point reserve for lands (mode stop) for 5.5 of the
+    day's 14 hours, and REST at the daemon's share or its own reserve for most of them. due() returns nothing in a
+    stopped bucket, the PRs and runs lane VMs wait on included: the daemon read 151 PRs in the hour for 79 waited ones,
+    and the broker served lane waits PR data 1000-6000 s old. A key a wait is blocked on is now read within
+    WAITED_FRESH while the reserve alone stops GraphQL: unchanged PRs by the probe (a point per WAITED_PROBE_BATCH),
+    changed ones in full, at most WAITED_PER_MINUTE points a minute and never under WAITED_RESERVE_SHARE of the
+    reserve. Busy or low makes it slower; GitHub's own back-off stops it."""
+
+    WAITED = range(1, 11)
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.gh.counts = True
+        for n in range(1, 13):  # #11 and #12: watched, nobody waits on them
+            self.gh.prs[("o", "r", n)] = pr_node(n, rollup="PENDING", checks=[check_run("a"), check_run(
+                "b", status="IN_PROGRESS", conclusion=None)])
+            gg.register(gg.parse_key("pr", f"o/r#{n}"), waited=n in self.WAITED)
+        self.daemon.tick(NOW)  # read in full while the quota is rich
+        self.full0 = self.gh.full_reads  # (two queries: 12 PRs at the batch of 10)
+        self.reserve = gg.daemon_policy()["floors"]["graphql"][1]
+        self.under(self.reserve - 10)
+
+    def under(self, graphql_left: int) -> None:
+        """GraphQL under its reserve, REST under its own: both buckets stopped (huge-blue's 21% of the day)."""
+        self.gh.graphql_remaining, self.gh.rest_remaining = graphql_left, 10
+        self.daemon.budget["graphql"] = {"limit": 5000, "remaining": graphql_left, "reset": NOW + 1800, "seenAt": NOW}
+        self.daemon.budget["rest"] = {"limit": 5000, "remaining": 10, "reset": NOW + 1800, "seenAt": NOW}
+
+    def at(self, t: float) -> dict:
+        """One tick at T, every watch read by its waiter then (a lane wait renews its interest)."""
+        for n in range(1, 13):
+            path = gg.watch_dir() / gg.file_name(f"pr:o/r#{n}")
+            if n in self.WAITED:
+                gg.write_json(path, {**gg.read_json(path), "waitedAt": t})
+            os.utime(path, (t, t))
+        return self.daemon.tick(t)
+
+    def ages(self, t: float, which: Any) -> list[float]:
+        return [t - gg.read_cache(f"pr:o/r#{n}")["dataAt"] for n in which]
+
+    def test_waited_prs_are_read_within_a_minute_while_the_reserve_stops_graphql(self) -> None:
+        later = NOW + gg.CYCLE
+        status = self.at(later)
+        self.assertEqual(status["modes"]["graphql"], "stop", "the reserve still stops the daemon's own polling")
+        self.assertEqual(self.ages(later, self.WAITED), [0.0] * len(self.WAITED), "waited PRs left stale")
+        self.assertEqual(gg.read_cache("pr:o/r#3")["via"], "graphql-probe")
+        self.assertEqual((self.gh.full_reads - self.full0, self.gh.probes), (0, 1), "ten unchanged PRs cost one probe")
+        self.assertEqual(self.ages(later, (11, 12)), [gg.CYCLE] * 2, "an unwaited PR is read under the reserve")
+
+    def test_a_changed_waited_pr_is_read_in_full_under_the_reserve(self) -> None:
+        node = self.gh.prs[("o", "r", 4)]
+        node["commits"]["nodes"][0]["commit"]["statusCheckRollup"]["contexts"]["nodes"][1].update(
+            status="COMPLETED", conclusion="FAILURE")
+        node["commits"]["nodes"][0]["commit"]["statusCheckRollup"]["state"] = "FAILURE"
+        self.at(NOW + gg.CYCLE)
+        self.assertEqual((self.gh.full_reads - self.full0, self.gh.probes), (1, 1))
+        cached = gg.read_cache("pr:o/r#4")
+        self.assertEqual((cached["via"], cached["data"]["checkState"]), ("graphql", "FAILURE"))
+
+    def test_waited_reads_stop_at_the_reserves_floor_and_on_githubs_back_off(self) -> None:
+        self.daemon.backoff["graphql"] = NOW + 3 * gg.CYCLE  # GitHub said back off: nothing of ours overrides it
+        self.at(NOW + 2 * gg.CYCLE)
+        self.assertEqual(self.gh.probes, 0, "read through GitHub's back-off")
+        self.daemon.backoff["graphql"] = 0.0
+        self.at(NOW + 4 * gg.CYCLE)
+        self.assertEqual(self.gh.probes, 1)
+        self.under(int(self.reserve * gg.WAITED_RESERVE_SHARE) - 1)
+        self.at(NOW + 6 * gg.CYCLE)
+        self.assertEqual(self.gh.probes, 1, "read past the part of the reserve kept for lands")
+
+    def test_many_waited_prs_are_paced_slower_never_refused(self) -> None:
+        with mock.patch.object(gg, "WAITED_PER_MINUTE", 1), mock.patch.object(gg, "WAITED_PROBE_BATCH", 4):
+            later = NOW + gg.CYCLE
+            self.at(later)
+            self.assertEqual(self.gh.probes, 1, "past the pace in one minute")
+            fresh = [n for n in self.WAITED if self.ages(later, [n])[0] == 0]
+            self.assertEqual(len(fresh), 4)
+            self.at(later + gg.TICK)
+            self.assertEqual(self.gh.probes, 1, "the pace holds within its minute")
+            then = later + 61
+            self.at(then)
+            self.assertEqual(self.gh.probes, 2)
+            self.assertEqual(len([n for n in self.WAITED if self.ages(then, [n])[0] == 0]), 4,
+                             "the next minute reads the next oldest")
+            self.assertFalse(set(fresh) & {n for n in self.WAITED if self.ages(then, [n])[0] == 0})
+
+    def test_a_failing_waited_read_is_tried_once_per_waited_fresh(self) -> None:
+        """Review: a read that keeps failing keeps its old dataAt, and was first in line every 2 s tick."""
+        self.gh.throttle["graphql"] = (502, self.gh.rate("graphql", self.reserve - 10), b"bad gateway")
+        later = NOW + gg.CYCLE
+        self.at(later)
+        sent = len([c for c in self.gh.calls if c[1].endswith("/graphql")])
+        self.assertGreater(sent, 0)
+        for k in range(1, int(gg.WAITED_FRESH // gg.TICK)):
+            self.at(later + gg.TICK * k)
+        self.assertEqual(len([c for c in self.gh.calls if c[1].endswith("/graphql")]), sent,
+                         "a failing waited read was retried within WAITED_FRESH")
+
+    def test_waited_data_age_over_ten_minutes_under_the_reserve(self) -> None:
+        """The harness for the PR's before and after numbers: ten waited PRs, GraphQL under the reserve and REST under
+        its own for ten minutes of 2 s ticks; the oldest waited data the broker could serve at any tick, and the
+        GraphQL points spent."""
+        before = self.gh.graphql_remaining
+        worst = 0.0
+        for k in range(1, 301):
+            t = NOW + gg.TICK * k
+            self.at(t)
+            worst = max(worst, *self.ages(t, self.WAITED))
+        spent = before - self.gh.graphql_remaining
+        print(f"\nwaited PR data under the GraphQL reserve, 10 min: oldest {worst:.0f}s, {spent} GraphQL points",
+              file=sys.stderr)
+        self.assertLessEqual(worst, 60, "a waited PR's data went past a minute old")
+        self.assertLessEqual(spent, 10 * gg.WAITED_PER_MINUTE)
+
+
+class UpstreamDirectAfterTest(unittest.TestCase):
+    """The lane VM's own read through the broker (glaeda#2029) began after STALE_DATA_AFTER (600 s). With the broker
+    host's waited reads fresh within a minute, the upstream copy is at most a cycle plus UPSTREAM_EVERY old; past
+    UPSTREAM_DIRECT_AFTER the broker is behind and the VM reads its one target itself."""
+
+    def test_an_upstream_host_with_a_broker_get_starves_after_upstream_direct_after(self) -> None:
+        now = time.time()
+        self.assertLess(gg.UPSTREAM_DIRECT_AFTER, gg.STALE_DATA_AFTER)
+        self.assertGreater(gg.UPSTREAM_DIRECT_AFTER, gg.CYCLE + gg.UPSTREAM_EVERY + gg.TICK,
+                           "a broker on its cycle would send every lane wait to its own read")
+        req = {"began": now - gg.UPSTREAM_DIRECT_AFTER - 30}
+        old = {"dataAt": now - gg.UPSTREAM_DIRECT_AFTER - 10}
+        with tempfile.TemporaryDirectory() as tmp:
+            config = Path(tmp) / "upstream.json"
+            with mock.patch.object(gg, "UPSTREAM_CONFIG", config):
+                self.assertIsNone(gg.wait_starved(req, old, now), "a host with a login keeps STALE_DATA_AFTER")
+                gg.write_json(config, {"command": ["/home/cmux/.local/bin/lane-gh", "glaeda-read"]})
+                self.assertIsNotNone(gg.wait_starved(req, old, now))
+                self.assertIsNone(gg.wait_starved(req, {"dataAt": now - 60}, now), "fresh enough")
+                self.assertIsNone(gg.wait_starved({**req, "directAt": now - 30}, old, now), "one own read per bound")
+                gg.write_json(config, {"command": ["/usr/local/bin/other-upstream"]})
+                self.assertIsNone(gg.wait_starved(req, old, now), "no own read there: the old bound")
+
+
 class StaleDataTest(Base):
     """huge-blue, 2026-11-11: a merged PR read OPEN for 50 minutes while `restart` called the daemon healthy. One
     null check context in GitHub's answer raised AttributeError in parse_pr; batched() dropped the whole batch with

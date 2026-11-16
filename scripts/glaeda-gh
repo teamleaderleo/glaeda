@@ -285,6 +285,18 @@ FLOORS = {"rest": (1500, 300), "graphql": (500, 100)}  # (floor, reserve) per qu
 # reset (or a re-exec, or a stop below the reserve) every watched PR is due in the same tick, and a burst of them is
 # what the shared login cannot spend for lands. Past it the reads wait for the next tick, first in line (deferred).
 GRAPHQL_PER_MINUTE = 40
+# A key a wait is blocked on (here, or a lane VM's through the broker) while the reserve alone stops GraphQL
+# (Daemon.read_waited). huge-blue, 2026-11-16: GraphQL under the fleet's 1000-point reserve 5.5 of 14 hours, REST at
+# the daemon's share or under its own reserve for most of them, and every read stopped with it: 151 PR reads in the
+# hour for 79 waited PRs, and lane waits served PR data 1000-6000 s old. Waited keys are read once their data is
+# WAITED_FRESH old, unchanged PRs by the probe (about 3 requests a PR, so WAITED_PROBE_BATCH of them is one point),
+# at most WAITED_PER_MINUTE points a minute (more waiters: each is read less often, never refused), and only while
+# the shared quota holds WAITED_RESERVE_SHARE of the reserve: the rest stays for lands. GitHub's own back-off (a
+# secondary limit, a Retry-After) stops them like any read.
+WAITED_FRESH = 45
+WAITED_PER_MINUTE = 15
+WAITED_PROBE_BATCH = 30
+WAITED_RESERVE_SHARE = 0.5
 # The daemon's own counted REST requests in the last hour stay under this share of the hourly limit.
 # Measured 2026-10-27: the daemon spent 2549 REST requests of one hour's 5000 (756 more were free
 # 304s) on PR reads the balancer had sent to REST, and the account ran out under a nightly re-run.
@@ -491,6 +503,11 @@ IDLE_BACKOFF_MAX = 600  # ... but no less often than this (it expires at IDLE_EX
 # is this old, and a wait hands itself back from the daemon and reads GitHub once itself (direct_read). The heartbeat
 # alone vouched for data that was 50 minutes old on huge-blue (2026-11-11), and `restart` refused.
 STALE_DATA_AFTER = 600
+# On an upstream host that reads one target itself through the broker (direct_command), a wait's data this old means
+# the broker host is behind: the wait reads its target itself (wait_starved). The broker host reads a waited key
+# within WAITED_FRESH even under its GraphQL reserve, and this host asks it every UPSTREAM_EVERY, so its copy is at
+# most about 70 s old while the broker keeps up; 600 s left lane waits on data the broker had not refreshed.
+UPSTREAM_DIRECT_AFTER = 120
 # After the quota stops explaining old waited data (staleExplainedAt), the daemon has this long to read the backlog
 # before the data counts as starved. huge-blue, 2026-11-11 to 11-15: the shared GraphQL pool sat under the reserve
 # for 10 to 20 minutes before each hourly reset (the alarm rightly "held"), and on the first tick after the reset, at
@@ -2752,6 +2769,9 @@ class Daemon:
         self.writing = False  # inside the outbox: its requests are sessions' writes, not the daemon's polling
         self.jobs_only: list[dict] = []  # failed runs whose job list is read though runs cannot be (due)
         self.steps_failed: dict[Any, float] = {}  # job id -> when GitHub refused its steps for good (STEPS_RETRY)
+        self.waived = False  # inside read_waited: the reserve's stop yields down to WAITED_RESERVE_SHARE of it
+        self.waited_log: list[tuple[float, int]] = []  # (time, GraphQL points) read_waited spent, last minute
+        self.waited_tried: dict[str, float] = {}  # key -> when read_waited last sent it, within WAITED_FRESH
 
     # -- budget
 
@@ -2771,7 +2791,9 @@ class Daemon:
         floor, reserve = self.policy["floors"][bucket]
         remaining = seen.get("remaining", floor)
         forced = bucket in self.policy.get("forceLow", ())
-        return "stop" if remaining < reserve else "lean" if remaining < floor or capped or forced else "normal"
+        if remaining < reserve and not (self.waived and bucket == "graphql" and remaining >= reserve * WAITED_RESERVE_SHARE):
+            return "stop"
+        return "lean" if remaining < floor or capped or forced or remaining < reserve else "normal"
 
     def charge_rest(self, minute: int, n: int) -> None:
         """Count n REST requests in that minute, on disk at once, so a daemon that dies mid-tick
@@ -4589,10 +4611,92 @@ class Daemon:
                     self.read_jobs(e, {}, False)  # read_jobs reads the list a failed attempt is missing
             except Exception as error:  # noqa: BLE001
                 self.errors.append(f"{e['key']} jobs: {describe(error)}")
+        try:
+            self.read_waited(entries, {e["key"] for e in prs + runs})
+        except Exception as error:  # noqa: BLE001  a fault there must not stop the tick
+            self.errors.append(f"waited: {describe(error)} at {error_site(error)}")
         # After the reads, so a busy daemon never pays for it: its own responses' x-ratelimit
         # headers have already brought the view up to date, and only an idle one goes stale.
         self.refresh_budget()
         return self.finish_tick(entries, prs, runs, comments, heads)
+
+    def read_waited(self, entries: list[dict], read: set[str]) -> None:
+        """The PRs and runs a wait is blocked on (here, or a lane VM's through the broker: its upstream read carries
+        "wait"), read over GraphQL once their data is WAITED_FRESH old while the GraphQL reserve alone stops the
+        daemon's polling (huge-blue 2026-11-16: under it 5.5 of 14 hours, waited PR data 1000-6000 s old). Oldest data
+        first; unchanged PRs by the probe, WAITED_PROBE_BATCH a point; at most WAITED_PER_MINUTE points a minute, so
+        more waiters make each read less often, never refused; never below WAITED_RESERVE_SHARE of the reserve, nor
+        through GitHub's own back-off or a secondary hold. READ: the keys this tick already read."""
+        self.waited_log = [(t, p) for t, p in self.waited_log if self.now - t < 60]
+        self.waited_tried = {k: t for k, t in self.waited_tried.items() if self.now - t < WAITED_FRESH}
+        if (self.mode("graphql") != "stop" or self.backoff["graphql"] > self.now or self.secondary_until > self.now
+                or self.waited_points() >= WAITED_PER_MINUTE):
+            return
+        self.waived = True
+        try:
+            if self.mode("graphql") == "stop":
+                return  # under the part of the reserve kept for lands
+            # (a key never read has no dataAt: first in line, and a lane VM's wait on a new PR is filled at once)
+            data_at = lambda e: float((e["cache"] or {}).get("dataAt") or 0)  # noqa: E731
+            # Not a kind REST reads on its full cycle (route() sent it there and REST is normal): that is fresh already.
+            # A key tried within WAITED_FRESH waits (a read that keeps failing never takes every pass).
+            served = {k for k in ("pr", "run") if self.paths.get(k) == "rest" and self.mode("rest") == "normal"}
+            stale = [e for e in entries if split_key(e["key"])[0] in ("pr", "run") and self.waited(e)
+                     and split_key(e["key"])[0] not in served
+                     and e["key"] not in read and not (e["cache"] or {}).get("missing")
+                     and self.now - data_at(e) >= WAITED_FRESH
+                     and self.now - self.waited_tried.get(e["key"], float("-inf")) >= WAITED_FRESH]
+            stale.sort(key=lambda e: (data_at(e), e["key"]))
+            prs = [e for e in stale if e["key"].startswith("pr:")]
+            runs = [e for e in stale if e["key"].startswith("run:")]
+            probe = [e for e in prs if self.probe_ok(e)]
+            full = [e for e in prs if not self.probe_ok(e)]
+            for i in range(0, len(probe), WAITED_PROBE_BATCH):
+                if not self.waited_room():
+                    return
+                chunk = probe[i:i + WAITED_PROBE_BATCH]
+                self.waited_tried.update((e["key"], self.now) for e in chunk)
+                repos = sorted({caller_of(e["key"])[1] for e in chunk})
+                with self.waited_spend(), self.calling("pr", repos[0] if len(repos) == 1 else f"{len(repos)} repos",
+                                                       waiters_of(chunk)):
+                    changed, error = self.probe_prs(chunk)
+                if error is not None:
+                    self.errors.append(f"waited: {error}")
+                    return
+                full += changed
+            for kind, todo, fetch in (("pr", full, lambda chunk: self.fetch_aliased(chunk, "pr")),
+                                      ("run", runs, self.graphql_fetch["run"])):
+                size = max(1, self.batch[kind])
+                for i in range(0, len(todo), size):
+                    if not self.waited_room():
+                        return
+                    self.waited_tried.update((e["key"], self.now) for e in todo[i:i + size])
+                    with self.waited_spend():
+                        left = self.batched(kind, todo[i:i + size], fetch)
+                    if left:
+                        return  # GraphQL stopped partway: the rest wait for the next pass
+        except OutOfTime:
+            return  # the tick's budget is spent: the next tick goes on
+        finally:
+            self.waived = False
+
+    def waited_points(self) -> int:
+        return sum(p for t, p in self.waited_log if self.now - t < 60)
+
+    def waited_room(self) -> bool:
+        return self.waited_points() < WAITED_PER_MINUTE and self.mode("graphql") != "stop" \
+            and self.secondary_until <= self.now
+
+    @contextlib.contextmanager
+    def waited_spend(self):
+        """The GraphQL points the reads inside spend count against WAITED_PER_MINUTE."""
+        before = len(self.gql_log)
+        try:
+            yield
+        finally:
+            spent = sum(p for _, _, p in self.gql_log[before:])
+            if spent:
+                self.waited_log.append((self.now, spent))
 
     def to_graphql(self, left: list[dict], spilled: list[dict]) -> None:
         """REST is throttled or its share spent with these still to read: GraphQL reads them this tick when it
@@ -8157,13 +8261,17 @@ def wait_starved(req: dict, entry: dict | None, now: float) -> float | None:
     read for its target in that long (since the wait began, for a target never read), and no direct read was tried
     in that long. None otherwise. Only for an undecided wait: wait_step rules first."""
     began = float(req["began"])
-    if now - began < STALE_DATA_AFTER:
+    # An upstream host that reads one target itself through the broker: UPSTREAM_DIRECT_AFTER (the broker host keeps
+    # waited keys fresher than that), else STALE_DATA_AFTER.
+    bound = UPSTREAM_DIRECT_AFTER if upstream_command() is not None and direct_command() is not None \
+        else STALE_DATA_AFTER
+    if now - began < bound:
         return None
-    if now - float(req.get("directAt") or float("-inf")) < STALE_DATA_AFTER:
+    if now - float(req.get("directAt") or float("-inf")) < bound:
         return None
     seen = (entry or {}).get("dataAt")
     age_s = now - (seen if isinstance(seen, (int, float)) and not isinstance(seen, bool) else began)
-    return age_s if age_s > STALE_DATA_AFTER else None
+    return age_s if age_s > bound else None
 
 
 def direct_read(req: dict) -> str | None:
