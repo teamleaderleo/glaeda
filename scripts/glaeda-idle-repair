@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """Queue safe Glaeda repairs and run them on the first idle host tick.
 
-The LaunchAgent invokes this once per minute.  A busy host records a durable
-queued receipt and exits without touching its locks, workers, or console.  The
-next tick revalidates the host and runs the normal disk and mini-health tools
-only after the authoritative host gate is idle.
+The LaunchAgent invokes this once per minute.  A tick before nextAttemptAt
+reads only queue.json and exits: it never loads glaeda-disk or asks the host
+gate, so a repair that ran waits its full interval however busy the host is.
+A due tick on a busy host records a durable queued receipt and exits without
+touching its locks, workers, or console.  The next tick revalidates the host
+and runs the normal disk and mini-health tools only after the authoritative
+host gate is idle.
 """
 
 from __future__ import annotations
@@ -16,6 +19,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import signal
 import subprocess
 import sys
 import time
@@ -29,6 +33,11 @@ RECEIPT = STATE_DIR / "receipts.jsonl"
 LOCK = STATE_DIR / "run.lock"
 SCHEMA = "glaeda-idle-repair/v1"
 QUEUED_EXIT = 75
+# launchd's 60 s ticks drift by a second or so: a queued or failed repair that is due "in 60 s" is due on the next tick.
+DUE_SLACK_S = 5
+TIMED_OUT = 124
+REPAIR_EVERY_S = 900
+RETRY_AFTER_S = 60
 
 
 def load_disk_module() -> Any:
@@ -62,14 +71,28 @@ def append_receipt(value: dict[str, Any]) -> None:
 
 
 def run(argv: list[str], timeout: int) -> tuple[int, str, str]:
+    """Run one repair in its own process group; on timeout the whole group stops, not just its leader
+    (subprocess.run's kill left glaeda-disk's git and du children running on after a timed-out pass)."""
     try:
-        proc = subprocess.run(argv, capture_output=True, text=True, timeout=timeout,
-                              stdin=subprocess.DEVNULL, check=False)
-    except subprocess.TimeoutExpired:
-        return 124, "", "timed out"
+        proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                stdin=subprocess.DEVNULL, start_new_session=True)
     except OSError as error:
         return 127, "", str(error)
-    return proc.returncode, proc.stdout[-4000:], proc.stderr[-1000:]
+    try:
+        out, err = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        for sig, wait in ((signal.SIGTERM, 5), (signal.SIGKILL, 5)):
+            try:
+                os.killpg(proc.pid, sig)  # the group this call created: proc.pid leads it
+            except (ProcessLookupError, PermissionError):
+                break
+            try:
+                proc.communicate(timeout=wait)
+                break
+            except subprocess.TimeoutExpired:
+                continue
+        return TIMED_OUT, "", "timed out"
+    return proc.returncode, out[-4000:], err[-1000:]
 
 
 def status() -> int:
@@ -95,20 +118,23 @@ def main(argv: list[str] | None = None) -> int:
 
         now = int(time.time())
         previous = read_state()
+        # The cheap check first. Loading glaeda-disk (~730 KB) and its host gate (a full ps) on every tick cost
+        # 14 of 15 ticks for nothing, and a busy not-due tick rewrote the queue to "queued, due in 60 s", so a
+        # loaded host repaired at its first idle minute instead of every 15 minutes.
+        next_attempt = previous.get("nextAttemptAt")
+        if isinstance(next_attempt, (int, float)) and next_attempt > now + DUE_SLACK_S:
+            print(json.dumps({"schema": SCHEMA, **previous}, separators=(",", ":")))
+            return 0
+
         disk = load_disk_module()
         busy = disk.host_busy()
         if busy:
             value = {"state": "queued", "reason": busy, "queuedAt": previous.get("queuedAt", now),
-                     "lastAttemptAt": now, "nextAttemptAt": now + 60}
+                     "lastAttemptAt": now, "nextAttemptAt": now + RETRY_AFTER_S}
             write_state(value)
             append_receipt({"at": now, "outcome": "queued", "reason": busy})
             print(json.dumps({"schema": SCHEMA, **value}, separators=(",", ":")))
             return QUEUED_EXIT
-
-        next_attempt = previous.get("nextAttemptAt")
-        if isinstance(next_attempt, (int, float)) and next_attempt > now:
-            print(json.dumps({"schema": SCHEMA, **previous}, separators=(",", ":")))
-            return 0
 
         python = os.environ.get("GLAEDA_PYTHON", sys.executable)
         disk_path = os.environ.get("GLAEDA_DISK", str(HOME / ".local/bin/glaeda-disk"))
@@ -123,15 +149,20 @@ def main(argv: list[str] | None = None) -> int:
             ([python, health_path, "--apply"], 180),
         ]
         failed = False
+        wait = REPAIR_EVERY_S
         for command, timeout in commands:
             code, out, err = run(command, timeout)
             action = {"argv": command, "exit": code, "stdoutTail": out, "stderrTail": err}
             actions.append(action)
             if code != 0:
                 failed = True
+                # A pass that used its whole budget is retried a full interval after it was stopped, never a
+                # minute later: on a loaded desktop the fleet disk pass hit 660 s and then ran again at once,
+                # back to back for hours. Any other failure retries on the next tick.
+                wait = timeout + REPAIR_EVERY_S if code == TIMED_OUT else RETRY_AFTER_S
                 break
         value = {"state": "retry" if failed else "idle", "lastAttemptAt": now,
-                 "nextAttemptAt": now + (60 if failed else 900), "actions": actions}
+                 "nextAttemptAt": now + wait, "actions": actions}
         write_state(value)
         append_receipt({"at": now, "outcome": "retry" if failed else "repaired", "actions": actions})
         print(json.dumps({"schema": SCHEMA, **value}, separators=(",", ":")))

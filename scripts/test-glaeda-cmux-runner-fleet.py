@@ -50,6 +50,11 @@ if host in os.environ.get("FAKE_DOWN", "").split(","):
 if remote.startswith("head -c") and ".glaeda-source.json" in remote:
     stamps = json.loads(os.environ.get("FAKE_STAMPS", "{{}}"))
     print(stamps[host] if host in stamps else "@no-stamp"); sys.exit(0)
+if " disk-shape " in remote:
+    shapes = json.loads(os.environ.get("FAKE_DISK_SHAPE", "{{}}"))
+    if host in shapes:
+        print(json.dumps(shapes[host])); sys.exit(0)
+    sys.stderr.write("disk-shape: no such phase\\n"); sys.exit(2)
 if " check " in remote:
     if host in os.environ.get("FAKE_ELIGIBLE", "").split(","):
         print("glaeda-cmux-runner-hook: eligible"); sys.exit(0)
@@ -227,6 +232,29 @@ class FleetTest(unittest.TestCase):
         checks = [c for c in self.calls() if " check " in c["remote"]]
         self.assertTrue(all(c["stdin"].startswith("#!/usr/bin/env python3") for c in checks), "hook sent on stdin")
         self.assertTrue(all("--fleet-class m4pro-48" in c["remote"] or "m4-16" in c["remote"] for c in checks))
+
+    def test_plan_prints_the_listener_count_with_its_disk_term(self) -> None:
+        """LISTENER_DISK: the plan reads each member's disk-shape and sizes the listeners by it too."""
+        shape = {"schema": "glaeda-disk-shape/v1", "free_gib": 160, "runners_gib": 20, "floor_gib": 0,
+                 "per_runner_gib": 15, "per_runner_source": "job log p90 of 3051 jobs", "runner_dirs": {},
+                 "listeners_by_disk": 12}
+        shapes = json.dumps({"mini-a": shape, "mini-b": {**shape, "free_gib": 110}})
+        result = self.fleet(FAKE_DISK_SHAPE=shapes)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        rows = {r["member"]: r for r in json.loads(result.stdout)["members"]}
+        # the member's floor (the manifest's disk.min_free_gib, 100) wins: (160 + 20 - 100) // 15 and (110 + 20 - 100)
+        self.assertEqual((rows["mini-a"]["listeners"], rows["mini-b"]["listeners"]), (5, 2))
+        self.assertGreater(rows["mini-a"]["listenersNoDisk"], 5)
+        self.assertIn("disk-shape exit 2", rows["mini-light"]["diskError"], "an old hook: no disk term, no failure")
+        shapes_sent = [c for c in self.calls() if " disk-shape " in c["remote"]]
+        self.assertTrue(shapes_sent and all("--min-free-gib 100" in c["remote"] for c in shapes_sent))
+        self.assertTrue(all(c["stdin"].startswith("#!/usr/bin/env python3") for c in shapes_sent), "hook on stdin")
+        text = subprocess.run([sys.executable, os.fspath(self.tool), "--manifest", os.fspath(self.manifest)],
+                              capture_output=True, text=True, timeout=120, check=False,
+                              env={**self.env, "FAKE_DISK_SHAPE": shapes})
+        self.assertEqual(text.returncode, 0, text.stderr)
+        self.assertIn("listeners 2 (declared runners exceed it)", text.stdout)
+        self.assertIn("(110 free + 20 in runners' _work - 100 floor) / 15 GiB per runner", text.stdout)
 
     def test_apply_every_instance_in_parallel_with_piped_tokens(self) -> None:
         start = time.monotonic()

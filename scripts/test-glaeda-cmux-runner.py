@@ -3431,13 +3431,22 @@ class HookTest(unittest.TestCase):
         shims, env = self.share_shims()
         budget = {**env, "CMUX_CI_CPU_BUDGET": "5"}
         cases = [  # (argv, output)
-            (("swift", "build", "--build-tests"), "swift build --jobs 5 --build-tests"),
-            (("swift", "test", "--filter", "X"), "swift test --jobs 5 --filter X"),
-            (("swift", "run", "tool"), "swift run --jobs 5 tool"),
+            (("swift", "build", "--build-tests"), "swift build --jobs 2 -Xswiftc -j2 --build-tests"),  # 2 x 2 <= 5
+            (("swift", "test", "--filter", "X"), "swift test --jobs 2 -Xswiftc -j2 --filter X"),
+            (("swift", "run", "tool"), "swift run --jobs 2 -Xswiftc -j2 tool"),
             (("swift", "build", "-j", "8"), "swift build -j 8"),  # the command's own width wins
             (("swift", "build", "-j3"), "swift build -j3"),
             (("swift", "build", "--jobs=2"), "swift build --jobs=2"),
-            (("swift", "test", "--", "-j"), "swift test --jobs 5 -- -j"),  # past --, not SwiftPM's
+            (("swift", "test", "--", "-j"), "swift test --jobs 2 -Xswiftc -j2 -- -j"),  # past --, not SwiftPM's
+            (("swift", "build", "-Xswiftc", "-j4"), "swift build -Xswiftc -j4"),  # its own driver width wins
+            (("swift", "build", "-Xswiftc", "-num-threads", "-Xswiftc", "2"),
+             "swift build -Xswiftc -num-threads -Xswiftc 2"),
+            (("swift", "build", "-c", "release"),  # whole-module: -num-threads too
+             "swift build --jobs 2 -Xswiftc -j2 -Xswiftc -num-threads -Xswiftc 2 -c release"),
+            (("swift", "build", "--configuration=release"),
+             "swift build --jobs 2 -Xswiftc -j2 -Xswiftc -num-threads -Xswiftc 2 --configuration=release"),
+            (("swift", "build", "-c", "debug"), "swift build --jobs 2 -Xswiftc -j2 -c debug"),
+            (("swift", "test", "--", "-c", "release"), "swift test --jobs 2 -Xswiftc -j2 -- -c release"),
             (("swift", "package", "resolve"), "swift package resolve"),
             (("swift", "--version"), "swift --version"),
             (("xcodebuild", "-scheme", "cmux", "build"), "xcodebuild -jobs 5 -scheme cmux build"),
@@ -3455,8 +3464,14 @@ class HookTest(unittest.TestCase):
             with self.subTest(budget=value):
                 self.assertEqual(self.run_shim({**env, "CMUX_CI_CPU_BUDGET": value}, "swift", "build"), "swift build")
         self.assertEqual(self.run_shim(env, "xcodebuild", "build"), "xcodebuild build", "no budget: no cap")
+        # DRIVER_WIDTH: tasks x driver width stays within the budget (cmux14, 2026-11-16: --jobs 9 ran 46 frontends)
+        for value, tasks, width in (("1", 1, 1), ("3", 3, 1), ("4", 2, 2), ("9", 3, 3), ("14", 4, 3), ("30", 6, 5)):
+            with self.subTest(budget=value):
+                self.assertEqual(self.run_shim({**env, "CMUX_CI_CPU_BUDGET": value}, "swift", "build"),
+                                 f"swift build --jobs {tasks} -Xswiftc -j{width}")
+                self.assertLessEqual(tasks * width, int(value))
         twice = {**budget, "PATH": f"{shims}:{env['PATH']}"}
-        self.assertEqual(self.run_shim(twice, "swift", "build"), "swift build --jobs 5",
+        self.assertEqual(self.run_shim(twice, "swift", "build"), "swift build --jobs 2 -Xswiftc -j2",
                          "a share-bin listed twice still reaches the real tool")
         missing = subprocess.run(["swift", "build"], env={"PATH": f"{shims}:/nonexistent", "CMUX_CI_CPU_BUDGET": "5"},
                                  capture_output=True, text=True, timeout=30, check=False)
@@ -17412,6 +17427,67 @@ class CapacityArithmeticTest(unittest.TestCase):
         manifest["hosts"]["mini-std"]["overrides"]["runner"]["classes"]["std"]["reserveCores"] = -1
         with mock.patch.object(cr, "xcode_present", return_value=True):
             self.assertIn("reserveCores", cr.member_labels(manifest, "mini-std")[1])
+
+    def test_listener_count_disk_term(self) -> None:
+        """LISTENER_DISK: cores alone gave an M6 12 runners; their checkouts took cmux21 from 41 to 25 GiB free in 40
+        minutes (glaeda#2025). The disk term is (free + runners' _work - floor) // one runner's measured share."""
+        disk = fleet_labels.DiskShape
+        self.assertEqual(fleet_labels.disk_listeners(disk(17, 32.2, 30)), 1, "cmux18, 2026-11-16: under the floor")
+        self.assertEqual(fleet_labels.disk_listeners(disk(120, 10, 30)), 6)
+        self.assertEqual(fleet_labels.disk_listeners(disk(120, 10, 30, 0)), 6, "a zero share reads the default")
+        self.assertEqual(fleet_labels.disk_listeners(disk(5, 0, 30)), 1, "at least one")
+        self.assertEqual(fleet_labels.listener_count(12, 16, disk=disk(120, 10, 30)), 6, "disk binds before cores")
+        self.assertEqual(fleet_labels.listener_count(12, 16, disk=disk(900, 0, 30)), 12, "cores bind")
+        self.assertEqual(fleet_labels.listener_count(30, 96, disk=disk(900, 0, 30, 1)), fleet_labels.MAX_RUNNERS)
+        self.assertEqual(fleet_labels.listener_count(12, 16), 12, "no shape: no disk term")
+        line = json.dumps({"schema": hook.DISK_SHAPE_SCHEMA, "free_gib": 50, "runners_gib": 25.5, "floor_gib": 0,
+                           "per_runner_gib": 15})
+        self.assertEqual(fleet_labels.parse_disk_shape(line, 30), disk(50, 25.5, 30, 15), "the member's floor wins")
+        self.assertEqual(fleet_labels.parse_disk_shape(line, None), disk(50, 25.5, 0, 15))
+        for bad in ("", "nope", json.dumps({"schema": "other"}), line.replace('"free_gib": 50', '"free_gib": -1'),
+                    line.replace('"free_gib": 50', '"free_gib": true')):
+            with self.subTest(line=bad):
+                self.assertIsNone(fleet_labels.parse_disk_shape(bad, 30))
+        manifest = {"hardware": {"m6-16": {"cpus": 12, "memory_gib": 16}}}
+        self.assertEqual(fleet_labels.member_listeners(manifest, "m6-16", 12, 0, disk(60, 15, 30)), 3)
+        self.assertEqual(hook.DISK_SHAPE_RUNNER_GIB, fleet_labels.LISTENER_RUNNER_DISK_GIB)
+
+    def test_disk_shape_measures_runners_work_and_the_job_logs_growth(self) -> None:
+        home = self.dir / "home"
+        for name in ("actions-runner-glaeda", "actions-runner-glaeda-3", "actions-runner-glaeda-nightly"):
+            (home / name / "_work").mkdir(parents=True)
+        (home / "actions-runner-glaeda-7").mkdir()  # no _work yet
+        log = self.dir / "jobs.jsonl"
+        rows = [{"event": "completed", "disk_free_start_gib": 100.0, "disk_free_min_gib": 100.0 - g}
+                for g in range(1, 61)]
+        rows += [{"event": "started", "disk_free_start_gib": 100.0, "disk_free_min_gib": 0.0},
+                 {"event": "completed", "disk_free_start_gib": None, "disk_free_min_gib": 3.0},
+                 {"event": "completed", "disk_free_start_gib": 10.0, "disk_free_min_gib": 12.0}]
+        log.write_text("\n".join(json.dumps(r) for r in rows) + "\nnot json\n")
+        sizes = {"actions-runner-glaeda": 13.2, "actions-runner-glaeda-3": 0.5}
+        with mock.patch.object(hook, "work_gib", side_effect=lambda work, timeout: sizes[work.parent.name]), \
+                mock.patch.object(hook, "free_gib", return_value=40.0):
+            shape = hook.disk_shape(home, 30.0, log)
+        self.assertEqual(shape["runner_dirs"], sizes, "pool instances only, never a dedicated builder")
+        self.assertEqual(shape["runners_gib"], 13.7)
+        self.assertEqual(shape["per_runner_gib"], 54.0, "p90 of 61 growths: 1..60 and one 0")
+        self.assertIn("61 jobs", shape["per_runner_source"])
+        self.assertEqual(shape["listeners_by_disk"], 1)
+        line = fleet_labels.parse_disk_shape(json.dumps(shape), 30.0)
+        self.assertEqual(fleet_labels.disk_listeners(line), shape["listeners_by_disk"], "one formula on both sides")
+        log.write_text("\n".join(json.dumps(r) for r in rows[:10]) + "\n")
+        with mock.patch.object(hook, "work_gib", return_value=None), mock.patch.object(hook, "free_gib",
+                                                                                     return_value=100.0):
+            shape = hook.disk_shape(home, 30.0, log)
+        self.assertEqual((shape["per_runner_gib"], shape["runners_gib"]), (hook.DISK_SHAPE_RUNNER_GIB, 0))
+        self.assertIn("default", shape["per_runner_source"])
+        self.assertEqual(shape["listeners_by_disk"], 4)
+        work = home / "actions-runner-glaeda" / "_work"
+        (work / "blob").write_bytes(b"x" * (1 << 20))
+        measured = hook.work_gib(work)
+        self.assertIsNotNone(measured)
+        self.assertGreaterEqual(measured, 0.0)
+        self.assertIsNone(hook.work_gib(home / "missing"))
 
 
 if __name__ == "__main__":

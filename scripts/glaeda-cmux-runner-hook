@@ -1070,6 +1070,90 @@ def needs_main(path: Path | None) -> int:
     return 0 if needs else 1
 
 
+# LISTENER_DISK (glaeda_fleet_labels.listener_count's disk term): `disk-shape` measures, on the host, what that term
+# reads: free disk, what each pool runner's _work holds now (du, each bounded by DISK_SHAPE_DU_TIMEOUT_S and all by
+# DISK_SHAPE_TOTAL_S; one that does not answer counts as 0, the side that sizes fewer runners), and one runner's share: the p90 of the job log's own disk
+# growth (disk_free_start_gib - disk_free_min_gib of its completed lines; the host's free disk, so a job beside others
+# reads their growth too: the safe side), or DISK_SHAPE_RUNNER_GIB with fewer than DISK_SHAPE_MIN_JOBS lines.
+DISK_SHAPE_SCHEMA = "glaeda-disk-shape/v1"
+DISK_SHAPE_RUNNER_GIB = 15.0  # glaeda_fleet_labels.LISTENER_RUNNER_DISK_GIB (a test keeps them equal)
+DISK_SHAPE_MIN_JOBS = 50
+DISK_SHAPE_DU_TIMEOUT_S = 20.0  # one runner's du (a warm cmux _work took 3.1 s on cmux18)
+DISK_SHAPE_TOTAL_S = 60.0  # every du together: within glaeda-cmux-runner-fleet's CHECK_TIMEOUT_S (90 s) over SSH
+POOL_RUNNER_DIR = re.compile(r"actions-runner-glaeda(?:-\d+)?")  # pool instances; a dedicated builder keeps its own
+
+
+def work_gib(work: Path, timeout: float = DISK_SHAPE_DU_TIMEOUT_S) -> float | None:
+    """What a runner's _work holds, in GiB (du -sk, so an APFS clone counts whole), or None when du fails or runs
+    past timeout."""
+    try:
+        done = subprocess.run(["/usr/bin/du", "-sk", os.fspath(work)], capture_output=True, text=True,
+                              timeout=timeout, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    first = (done.stdout.split() or [""])[0]
+    return round(int(first) / (1 << 20), 2) if first.isdigit() else None
+
+
+def job_disk_growth(log: Path | None = None) -> list[float]:
+    """Each completed job's disk growth in GiB (disk_free_start_gib - disk_free_min_gib, at least 0) from the job log."""
+    out: list[float] = []
+    try:
+        lines = (log or JOB_LOG).read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return out
+    for line in lines:
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(row, dict) or row.get("event") != "completed":
+            continue
+        start, low = row.get("disk_free_start_gib"), row.get("disk_free_min_gib")
+        if all(isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) for v in (start, low)):
+            out.append(max(0.0, float(start) - float(low)))
+    return out
+
+
+def disk_p90(values: list[float]) -> float:
+    """The nearest-rank 90th percentile of a non-empty list."""
+    ordered = sorted(values)
+    return ordered[max(0, math.ceil(0.9 * len(ordered)) - 1)]
+
+
+def disk_shape(home: Path, floor_gib: float, log: Path | None = None) -> dict[str, Any]:
+    """`disk-shape`'s answer (DISK_SHAPE_SCHEMA): free disk, each pool runner's _work, one runner's measured share and
+    the listener count they allow, (free + runners - floor) // share, at least 1."""
+    dirs = sorted(d for d in home.glob("actions-runner-glaeda*") if POOL_RUNNER_DIR.fullmatch(d.name)
+                  and (d / "_work").is_dir())
+    deadline = time.monotonic() + DISK_SHAPE_TOTAL_S
+    sizes: dict[str, float | None] = {}
+    for d in dirs:
+        left = deadline - time.monotonic()
+        sizes[d.name] = work_gib(d / "_work", min(DISK_SHAPE_DU_TIMEOUT_S, left)) if left > 0 else None
+    runners = round(sum(v for v in sizes.values() if v is not None), 2)
+    growth = job_disk_growth(log)
+    measured = len(growth) >= DISK_SHAPE_MIN_JOBS and disk_p90(growth) > 0
+    per = round(disk_p90(growth), 1) if measured else DISK_SHAPE_RUNNER_GIB
+    free = round(free_gib(os.fspath(home)), 1)
+    return {"schema": DISK_SHAPE_SCHEMA, "free_gib": free, "runners_gib": runners, "runner_dirs": sizes,
+            "floor_gib": floor_gib, "per_runner_gib": per,
+            "per_runner_source": f"job log p90 of {len(growth)} jobs" if measured else
+            f"default ({len(growth)} jobs with disk readings, {DISK_SHAPE_MIN_JOBS} needed)",
+            "listeners_by_disk": max(1, int((free + runners - floor_gib) // per))}
+
+
+def disk_shape_main(floor_gib: float) -> int:
+    """`disk-shape [--min-free-gib F]`: one JSON line (disk_shape), read-only."""
+    try:
+        answer = disk_shape(Path.home(), floor_gib)
+    except OSError as error:
+        print(f"{PREFIX}: disk-shape: {error}", file=sys.stderr)
+        return 1
+    print(json.dumps(answer, sort_keys=True), flush=True)
+    return 0
+
+
 def fit_mem_chunks(mibs: list[int], total: int) -> int:
     """The RAM a listener keeps free for its costliest job: the largest of `mibs` that fits the host at all (a job
     that is bigger waits at admission for a RAM-idle host, and holding a listener for that would starve the label),
@@ -3138,9 +3222,19 @@ def export_job_share(taken: dict[str, Any], cores: int | None = None) -> str:
 # (01:46Z, load 234 on 30 cores) while it had booked 5 units. Over 11-14 15Z to 11-15 21Z ultra2 ran at a 1-minute load
 # of 4-7x its cores (median per hour 51 to 237) with CPU 92-99% busy and only ~24 cores measured in jobs and outside:
 # the extra load is threads waiting for a core, which slows every job beside them. So an admitted job with a share
-# also gets two shims ahead of its PATH ($GITHUB_PATH): `swift build|test|run` gains `--jobs N` and an xcodebuild
-# build action gains `-jobs N`, N being CMUX_CI_CPU_BUDGET as the step sees it (a step that sets its own value, or
-# empties it, wins; a command that names its own -j/--jobs/-jobs is left as it is). Every other use passes through
+# also gets two shims ahead of its PATH ($GITHUB_PATH): `swift build|test|run` gains `--jobs T -Xswiftc -jW` and an
+# xcodebuild build action gains `-jobs N`, N being CMUX_CI_CPU_BUDGET as the step sees it (a step that sets its own
+# value, or empties it, wins; a command that names its own -j/--jobs/-jobs/-num-threads is left as it is).
+# DRIVER_WIDTH: SwiftPM's --jobs bounds its concurrent tasks, but it also hands every swiftc it starts `-j<jobs>`
+# (SwiftModuleBuildDescription.compileArguments), so T drivers each fan out to T frontends, about N^2 in all: on
+# cmux14 on 2026-11-16 a generated-files job admitted at 9 units, given `--jobs 9`, ran 10 swift-drivers at -j9 (46
+# swift-frontends, load 55-69 on 14 cores). So the shim splits N into T tasks of width W, W = floor(sqrt(N)) and
+# T = N // W (N 9: 3 x 3, 14: 4 x 3, 30: 6 x 5), so T x W <= N frontends at once. -Xswiftc flags follow SwiftPM's own
+# ("user arguments should follow generated arguments to allow user overrides") and the driver reads the last -j. A
+# release build (-c release: whole-module, where SwiftPM passes -num-threads <every core>) also gets -num-threads W;
+# a debug build does not, since -num-threads > 0 turns the driver's batch mode off. xcodebuild needs no width: its
+# build system schedules each Swift frontend job as one of its own tasks (the driver is integrated since Xcode 14), so
+# -jobs N bounds the frontends too. Every other use passes through
 # unchanged to the next swift or xcodebuild on PATH. Off without a redeploy: GLAEDA_JOB_SHARE_TOOLS=0 in the runner
 # LaunchAgent environment (GLAEDA_JOB_SHARE=0 turns the whole share off).
 JOB_SHARE_TOOLS_DIR = "share-bin"
@@ -3163,13 +3257,23 @@ case "$budget" in ''|*[!0-9]*|0*) exec "$real" "$@" ;; esac
 """
 JOB_SHARE_SHIMS = {
     "swift": JOB_SHARE_SHIM_HEAD + """case "${1:-}" in build|test|run) ;; *) exec "$real" "$@" ;; esac
+release=
+prev=
 for arg in "$@"; do
   [ "$arg" = -- ] && break
-  case "$arg" in -j|-j[0-9]*|--jobs|--jobs=*) exec "$real" "$@" ;; esac
+  case "$arg" in -j|-j[0-9]*|--jobs|--jobs=*|-num-threads|-num-threads=*) exec "$real" "$@" ;; esac
+  case "$prev:$arg" in -c:release|--configuration:release|*:-crelease|*:--configuration=release) release=1 ;; esac
+  prev=$arg
 done
+width=1
+while [ $(( (width + 1) * (width + 1) )) -le "$budget" ]; do width=$((width + 1)); done
+tasks=$((budget / width))
 sub=$1
 shift
-exec "$real" "$sub" --jobs "$budget" "$@"
+if [ -n "$release" ]; then
+  exec "$real" "$sub" --jobs "$tasks" -Xswiftc "-j$width" -Xswiftc -num-threads -Xswiftc "$width" "$@"
+fi
+exec "$real" "$sub" --jobs "$tasks" -Xswiftc "-j$width" "$@"
 """,
     "xcodebuild": JOB_SHARE_SHIM_HEAD + """build=
 for arg in "$@"; do
@@ -10805,13 +10909,15 @@ def leave_job_workspace(args: argparse.Namespace) -> None:
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog=PREFIX)
     p.add_argument("phase", choices=("job-started", "job-completed", "check", "listen", "take-root", "take-gui",
-                                     "admit", "release", "fits", "busy", "needs"),
+                                     "admit", "release", "fits", "busy", "needs", "disk-shape"),
                    help="check: the eligibility gate only, read-only (no lock, no rustup change); "
                         "needs [--needs-file F]: this host's measured capacity and the needs file as admission reads "
                         "them (one JSON line; exit 1 when the file falls back to the tables); "
                         "listen: run the runner's run.sh under the listener gate (the LaunchAgent's program); "
                         "admit, release, fits: the build worker's ci-step admission (one JSON line each); "
-                        "busy --runner-dir D: exit 3 when that runner is idle, 0 when it has a job or it cannot tell")
+                        "busy --runner-dir D: exit 3 when that runner is idle, 0 when it has a job or it cannot tell; "
+                        "disk-shape [--min-free-gib F]: free disk, the pool runners' _work and one runner's measured "
+                        "share, as the listener count's disk term reads them (one JSON line, read-only)")
     p.add_argument("--class", dest="step_class", choices=STEP_CLASSES, help="admit: the ci-step's class")
     p.add_argument("--job-key", help="admit, release: the ci-step's key (runner name, run id and attempt)")
     p.add_argument("--runner-dir", type=Path, help="listen: the runner directory whose run.sh the gate runs")
@@ -10935,6 +11041,8 @@ def main(argv: list[str] | None = None) -> int:
         return needs_main(args.needs_file)
     if args.phase == "busy":
         return runner_busy_main([os.fspath(args.runner_dir)] if args.runner_dir else [])
+    if args.phase == "disk-shape":
+        return disk_shape_main(max(0.0, args.min_free_gib))
     args.min_free_gib = runner_floor_gib(args.min_free_gib, args.gui_runner or args.session_runner)
     # the floor a job is warned under, after eviction (DISK_JOB_PEAK_GIB); a tour runner's floor is cmux's measure
     admit_floor = admit_floor_gib(args.min_free_gib, args.gui_runner or args.session_runner)

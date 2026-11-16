@@ -1551,8 +1551,77 @@ def upstream_command() -> list[str] | None:
     return None
 
 
+def program_path(name: str) -> str:
+    """An upstream.json program as run: a path as given, else found on PATH or in ~/.local/bin."""
+    return name if "/" in name else shutil.which(name) or os.fspath(Path.home() / ".local/bin" / name)
+
+
+def direct_command() -> list[str] | None:
+    """An upstream host's way to read one target fresh (direct_read), or None: UPSTREAM_CONFIG's "direct", a program
+    that answers `ARGV OWNER/REPO -` with one GET of a repository path, given {"path", "query"} on stdin, as one
+    `lane-gh call get` answer ({"ok", "status", "data"}). Without "direct", the `call get` of the lane-gh whose
+    `glaeda-read` is the upstream: the lane-gh broker's GET reads GitHub with a token minted for the call, so the VM
+    still holds none. Not for any other upstream: its program reads no single target."""
+    doc = read_json(UPSTREAM_CONFIG)
+    if not isinstance(doc, dict):
+        return None
+    direct = doc.get("direct")
+    if isinstance(direct, list) and direct and all(isinstance(a, str) and a for a in direct):
+        return direct
+    command = upstream_command()
+    if command is not None and len(command) == 2 and Path(command[0]).name == "lane-gh" and command[1] == "glaeda-read":
+        return [command[0], "call", "get"]
+    return None
+
+
+def prior_required(entry: dict) -> set:
+    """The checks a cached PR entry's data calls required: flagged on a check, or named as missing or unread."""
+    before = entry.get("data") or {}
+    required = {c.get("name") for c in before.get("checks") or [] if c.get("required")}
+    return required | set(before.get("requiredMissing") or []) | set(before.get("requiredUnread") or [])
+
+
+def broker_transport(command: list[str], deadline: Callable[[], float]) -> Callable:
+    """A Daemon transport for an upstream host's direct read: each GET of /repos/OWNER/REPO/PATH goes to COMMAND
+    (direct_command) as `OWNER/REPO -` with {"path", "query"} on stdin, within what is left of DEADLINE (a
+    time.monotonic() bound) and at most UPSTREAM_DEADLINE. Answers GitHub's status and JSON as http() does; a
+    refusal with no GitHub status is a 502 whose message is the refusal. GraphQL and writes are never sent."""
+    exe = program_path(command[0])
+
+    def send(method: str, url: str, headers: dict, body: bytes | None) -> tuple[int, dict, bytes]:
+        parts = urllib.parse.urlsplit(url)
+        m = re.match(r"^/repos/([^/]+/[^/]+)/(.+)$", parts.path)
+        if method != "GET" or m is None:
+            return 405, {}, json.dumps({"message": f"an upstream host's direct read sends only a repository GET, "
+                                                   f"not {method} {parts.path}"}).encode()
+        args = {"path": urllib.parse.unquote(m.group(2)),
+                "query": dict(urllib.parse.parse_qsl(parts.query, keep_blank_values=True))}
+        left = min(UPSTREAM_DEADLINE, deadline() - time.monotonic())
+        if left <= 0:
+            raise OutOfTime
+        try:
+            result = run_bounded([exe, *command[1:], m.group(1), "-"], left, input_text=json.dumps(args))
+        except subprocess.TimeoutExpired:
+            raise OutOfTime from None
+        except OSError as error:
+            raise WatchError(f"direct: {type(error).__name__} running {command[0]}") from None
+        try:
+            answer = json.loads(result.stdout) if result.stdout.strip() else None
+        except ValueError:
+            answer = None
+        if not isinstance(answer, dict):
+            tail = (result.stderr or "").strip().splitlines()[-1:] or [f"exit {result.returncode}"]
+            raise WatchError(f"direct: {command[0]}: {tail[0]}"[:UPSTREAM_ERROR_MAX])
+        status = answer.get("status")
+        if not isinstance(status, int) or isinstance(status, bool):
+            why = answer.get("error") if isinstance(answer.get("error"), str) else "no GitHub status"
+            return 502, {}, json.dumps({"message": f"direct: {why}"[:UPSTREAM_ERROR_MAX]}).encode()
+        return status, {}, json.dumps(answer.get("data")).encode()
+    return send
+
+
 def run_upstream(command: list[str], request: dict) -> dict:
-    exe = command[0] if "/" in command[0] else shutil.which(command[0]) or os.fspath(Path.home() / ".local/bin" / command[0])
+    exe = program_path(command[0])
     try:
         result = run_bounded([exe, *command[1:]], UPSTREAM_DEADLINE, input_text=json.dumps(request) + "\n")
     except subprocess.TimeoutExpired:
@@ -2560,6 +2629,9 @@ class Daemon:
     def __init__(self, transport: Callable = http, token: Callable[[], str] = gh_token,
                  controller: Any = "env", upstream: Any = "config") -> None:
         self.transport = transport
+        # False for an upstream host's direct read: the lane-gh broker answers GET branches/B from git (the tip, no
+        # protection, and on 2026-11-16 no answer within 60 s), so fetch_pr_rest takes GraphQL's last word instead.
+        self.reads_protection = True
         # "config" re-reads UPSTREAM_CONFIG every tick, so writing or removing it switches the mode
         # without a restart; a test passes a callable (request -> answer) or None.
         self.upstream_source = upstream
@@ -4734,6 +4806,9 @@ class Daemon:
             if data is None and error is None:
                 continue  # registered there, not read yet
             at, fetched = entry.get("dataAt"), entry.get("fetchedAt")
+            mine = (e["cache"] or {}).get("dataAt")
+            if data is not None and isinstance(at, (int, float)) and isinstance(mine, (int, float)) and at < mine:
+                continue  # a wait's own read here (direct_read) is newer: the upstream's older one never replaces it
             fields: dict[str, Any] = {"error": error[:UPSTREAM_ERROR_MAX] if error else None, "source": "upstream",
                                       "missing": entry.get("missing") is True,
                                       # provenance: a controller-only finish stays unconfirmed downstream too
@@ -4856,7 +4931,13 @@ class Daemon:
                 # Not while GitHub's quota explains the old data: the wait's own read could not get through either,
                 # and every live wait would turn into a Python poll for the rest of its timeout (the memory the
                 # blocker saves; review of glaeda#1942).
-                starved = None if self.stale_explained(req.get("kind")) else wait_starved(req, read_cache(req["key"]), now)
+                # Nor while the upstream's own alarm covers it, unless this host can read the one target itself
+                # (direct_command): the upstream may not read a new head for many minutes, and a wait on it then
+                # times out on the superseded one (gcp-agent-lane-3, cmux#44462, 2026-11-16).
+                explained = self.stale_explained(req.get("kind"))
+                if explained == "upstream" and direct_command() is not None:
+                    explained = None
+                starved = None if explained else wait_starved(req, read_cache(req["key"]), now)
                 if starved is not None:
                     # This daemon is not refreshing what the wait is blocked on: hand the wait back (its blocker sees
                     # the FIFO gone and execs wait-resume), where poll_wait says so and reads GitHub once itself.
@@ -5866,14 +5947,17 @@ class Daemon:
             # a deleted base (a stacked PR's, after its merge) has no requirements left to read
             rules, protection = f"{root}/rules/branches/{base}?per_page=100", f"{root}/branches/{base}"
             required = set(self.repo_part(old, parts, rules, slim_rules, []))
-            required |= set(self.repo_part(old, parts, protection, slim_branch, []))
-            if parts[rules].get("unavailable") and parts[protection].get("unavailable"):
+            if not self.reads_protection:
+                # The base's classic protection is not read here (reads_protection): the checks GraphQL last
+                # called required stay required, beside the rulesets' read now.
+                required |= prior_required(prior)
+            else:
+                required |= set(self.repo_part(old, parts, protection, slim_branch, []))
+            if self.reads_protection and parts[rules].get("unavailable") and parts[protection].get("unavailable"):
                 # A private repository on a plan without either feature: GitHub enforces no required check there,
                 # so none is the true answer. GraphQL's last word is kept all the same (it can name a rule that
                 # predates a plan change); a first read with no GraphQL answer has none, and none is enforced.
-                before = prior.get("data") or {}
-                required = {c.get("name") for c in before.get("checks") or [] if c.get("required")}
-                required |= set(before.get("requiredMissing") or []) | set(before.get("requiredUnread") or [])
+                required = prior_required(prior)
         except WatchError as error:
             message = f"rest: {error}"
             self.errors.append(f"{e['key']}: {message}")
@@ -8089,11 +8173,18 @@ def direct_read(req: dict) -> str | None:
     key, kind = req["key"], req["kind"]
     if kind not in ("pr", "run"):
         return f"no direct read for a {kind}"
-    bucket = "graphql" if kind == "pr" else "rest"
+    # An upstream host (no login) reads its one target through direct_command, over REST: the broker's GET.
+    broker = direct_command() if upstream_command() is not None else None
+    bucket = "graphql" if kind == "pr" and broker is None else "rest"
     try:
-        if upstream_command() is not None:
+        if upstream_command() is not None and broker is None:
             return DIRECT_UPSTREAM
-        daemon = Daemon(controller=None, upstream=None)
+        if broker is not None:
+            daemon = Daemon(transport=broker_transport(broker, lambda: daemon.tick_deadline), token=lambda: "",
+                            controller=None, upstream=None)
+            daemon.reads_protection = False
+        else:
+            daemon = Daemon(controller=None, upstream=None)
     except Exception as failure:  # noqa: BLE001  a fallback read never stops the wait
         return f"{describe(failure)} at {error_site(failure)}"
     # The daemon's own view as well as budget.json's: a secondary hold or a backoff lives only in its memory, and
@@ -8111,7 +8202,10 @@ def direct_read(req: dict) -> str | None:
              "waitedAt": daemon.now, "waitBegan": float(req["began"]), "readers": [], "reader": "", "consumers": {}}
     try:
         with daemon.calling(*caller_of(key), "tool:glaeda-gh wait (direct read)"):
-            if kind == "pr":
+            if kind == "pr" and broker is not None:
+                daemon.fetch_pr_rest(entry)
+                error = None
+            elif kind == "pr":
                 daemon.gql_reason = "pr-direct"
                 error = daemon.fetch_prs([entry])
             else:
@@ -8170,7 +8264,8 @@ def poll_wait(req: dict) -> int:
                             f"{int(starved)}s (its heartbeat is fresh, its data is not); reading GitHub directly once.")
                 error = direct_read(req)
                 say_waiting("glaeda-gh: direct read " + (f"failed: {error}" if error else "answered") + "."
-                            + ("" if error in (DIRECT_QUOTA, DIRECT_UPSTREAM) else "\nnext: glaeda-gh restart"))
+                            + ("" if error in (DIRECT_QUOTA, DIRECT_UPSTREAM) or upstream_command() is not None
+                               else "\nnext: glaeda-gh restart"))
                 done = wait_step(req, time.time())
         if done is not None:
             sys.stdout.write(done[1])

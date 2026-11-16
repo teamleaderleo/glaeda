@@ -15100,6 +15100,93 @@ class StaleDataTest(Base):
         self.assertIn("MERGED", out.getvalue())
         self.assertEqual(len(self.gh.gql_calls()), 1, "one direct read, not a loop")
 
+    def broker_get(self, served: list[str]) -> Callable[..., subprocess.CompletedProcess]:
+        """run_bounded as `lane-gh call get REPO -` answers on a lane VM: the broker's GET of one repo path, from
+        self.gh's REST view. Records each path in SERVED; any other program is a test failure."""
+        def run(argv: list[str], timeout: float | None = None, input_text: str | None = None) -> Any:
+            self.assertEqual(argv[1:3], ["call", "get"], argv)
+            self.assertLessEqual(timeout or 0, gg.DIRECT_READ_BUDGET)
+            repo, args = argv[3], json.loads(input_text or "{}")
+            query = urllib.parse.urlencode(args.get("query") or {})
+            served.append(args["path"])
+            status, _, raw = self.gh("GET", f"{gg.API}/repos/{repo}/{args['path']}" + (f"?{query}" if query else ""),
+                                     {"Authorization": f"Bearer {TOKEN}"}, None)
+            doc = json.loads(raw) if raw else None
+            out = {"ok": status < 400, "status": status, "data": doc}
+            return subprocess.CompletedProcess(argv, 0 if status < 400 else 1, json.dumps(out, indent=1) + "\n", "")
+        return run
+
+    def test_an_upstream_hosts_wait_on_a_head_its_upstream_has_not_seen_reads_it_through_the_broker(self) -> None:
+        """gcp-agent-lane-3, 2026-11-16: `wait pr manaflow-ai/cmux#44462 --sha 4273c7ca` said "GitHub still shows head
+        <the old one>" until its timeout. The VM reads through the broker host's cache (upstream ok), which had not
+        read the new head: the "upstream" explanation kept the wait off its fallback, and the fallback refused on a
+        host with no login. A starved wait there is handed back and reads its target through the broker's GET."""
+        config = Path(self.tmp.name) / "upstream.json"
+        gg.write_json(config, {"command": ["/home/cmux/.local/bin/lane-gh", "glaeda-read"]})
+        patcher = mock.patch.object(gg, "UPSTREAM_CONFIG", config)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        gg.BASE.mkdir(parents=True, exist_ok=True)
+        lock = open(gg.BASE / "daemon.lock", "a+")
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        self.addCleanup(lock.close)
+        gg.write_json(gg.BASE / "daemon.json", {"at": time.time(), "heartbeat": 30, "waits": gg.WAITS_CONTRACT})
+        new = "b" * 40
+        rid = gg.write_wait_request("pr", "o/r#9", "green", 3600, False, False, new, True, gg.RESCUE_GRACE,
+                                    os.getpid(), began=time.time() - gg.STALE_DATA_AFTER - 60)
+        reader = os.open(gg.waits_dir() / f"{rid}.fifo", os.O_RDONLY | os.O_NONBLOCK)
+        self.addCleanup(os.close, reader)
+        # the upstream answers "ok", with its 50-minute-old read of the superseded head (pr_node's a*40)
+        self.put("pr:o/r#9", gg.parse_pr(pr_node(9)), at=time.time() - 3000)
+        self.daemon.upstream_status = {"state": "ok", "at": time.time()}
+        self.assertEqual(self.daemon.stale_explained("pr"), "upstream")
+        self.daemon.serve_waits()
+        req = gg.read_json(gg.waits_dir() / f"{rid}.json")
+        self.assertFalse((gg.waits_dir() / f"{rid}.fifo").exists(),
+                         "a wait on a head the upstream has not seen stayed on the blocker")
+        self.assertGreater(req["stale"], gg.STALE_DATA_AFTER)
+
+        # GitHub has the new head, green; the VM has no login, so the read goes through the broker, never a token
+        node = pr_node(9, rollup="SUCCESS", checks=[check_run("a")])
+        node["headRefOid"] = new
+        self.gh.prs[("o", "r", 9)] = node
+        served: list[str] = []
+        said, out = io.StringIO(), io.StringIO()
+        with mock.patch.object(gg, "run_bounded", side_effect=self.broker_get(served)), \
+                mock.patch.object(gg, "gh_token", side_effect=AssertionError("read a login on an upstream host")), \
+                mock.patch.object(gg, "block") as block, self.diagnostics_in(said), contextlib.redirect_stdout(out):
+            code = gg.resume_wait(rid)
+        block.assert_not_called()
+        self.assertEqual(code, gg.EXIT_OK, said.getvalue() + out.getvalue())
+        self.assertIn("direct read answered", said.getvalue())
+        self.assertNotIn("glaeda-gh restart", said.getvalue())
+        self.assertIn("pulls/9", served)
+        # GET branches/B through the broker is git's tip with no protection (and hung on 2026-11-16): never asked
+        self.assertEqual([p for p in served if p.startswith("branches/")], [], served)
+        self.assertEqual([c for c in self.gh.calls if c[1].endswith("/graphql")], [], "a GraphQL read the broker refuses")
+        self.assertEqual(gg.read_cache("pr:o/r#9")["data"]["headRefOid"], new)
+
+    def test_an_upstream_with_no_broker_get_still_says_why_it_cannot_read(self) -> None:
+        """An upstream that is not lane-gh, with no "direct" command: the fallback refuses as before, and the
+        "upstream" explanation keeps such a wait on its blocker (its own read could not help)."""
+        config = Path(self.tmp.name) / "upstream.json"
+        gg.write_json(config, {"command": ["/usr/local/bin/other-upstream"]})
+        with mock.patch.object(gg, "UPSTREAM_CONFIG", config), \
+                mock.patch.object(gg, "run_bounded", side_effect=AssertionError("ran a program")):
+            self.assertIsNone(gg.direct_command())
+            self.assertEqual(gg.direct_read({"key": "pr:o/r#9", "kind": "pr", "began": time.time() - 700}),
+                             gg.DIRECT_UPSTREAM)
+            rid, _ = self.starved_request()
+            self.daemon.upstream_status = {"state": "ok", "at": time.time()}
+            self.daemon.serve_waits()
+            self.assertTrue((gg.waits_dir() / f"{rid}.fifo").exists(), "handed back to a read that cannot happen")
+        gg.write_json(config, {"command": ["/usr/local/bin/other-upstream"], "direct": ["/opt/broker-get"]})
+        with mock.patch.object(gg, "UPSTREAM_CONFIG", config):
+            self.assertEqual(gg.direct_command(), ["/opt/broker-get"])
+        gg.write_json(config, {"command": ["/home/cmux/.local/bin/lane-gh", "glaeda-read"]})
+        with mock.patch.object(gg, "UPSTREAM_CONFIG", config):
+            self.assertEqual(gg.direct_command(), ["/home/cmux/.local/bin/lane-gh", "call", "get"])
+
     def starved_request(self) -> tuple[str, int]:
         gg.BASE.mkdir(parents=True, exist_ok=True)
         lock = open(gg.BASE / "daemon.lock", "a+")
