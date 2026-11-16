@@ -1753,7 +1753,7 @@ def controller_run(run: dict) -> dict:
 # file name or display name. With `job`, that job of the run's attempt must have `conclusion` (read from the
 # controller's run-jobs); without it, the run's own conclusion. Each (hook, repo, run, attempt) runs at most once:
 # the claim is written to BASE/on-event.json before the command starts, so neither a restart nor a crash runs it
-# twice. The command starts detached, with an absolute executable, an environment of ON_EVENT_ENV plus
+# twice. The command starts detached, with an absolute executable, an environment of ON_EVENT_ENV, the hook's `env` and
 # GLAEDA_EVENT_* (never a token), its output in BASE/on-event/; the daemon records its exit code. Events that happen
 # while the daemon is down, or reads through an upstream (a lane VM), are not seen.
 
@@ -1775,6 +1775,11 @@ def on_event_problem(h: Any) -> str | None:
             return f"{name}: {field} must be a non-empty string"
     if "cwd" in h and not os.path.isabs(h["cwd"]):
         return f"{name}: cwd must be an absolute path"
+    env = h.get("env", {})
+    if not isinstance(env, dict) or not all(
+            isinstance(k, str) and re.fullmatch(r"[A-Z_][A-Z0-9_]*", k) and not k.startswith("GLAEDA_EVENT_")
+            and isinstance(v, str) for k, v in env.items()):
+        return f"{name}: env must map NAME to a string value (GLAEDA_EVENT_* are the daemon's)"
     command = h.get("command")
     if not isinstance(command, list) or not command or not all(isinstance(a, str) for a in command):
         return f"{name}: command must be a list of strings"
@@ -6270,6 +6275,7 @@ class Daemon:
         write_json(BASE / ON_EVENT_STATE, state)
         env = {k: os.environ[k] for k in ON_EVENT_ENV if k in os.environ}
         env.setdefault("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+        env.update(hook.get("env") or {})  # the hook's own literal values (a writer name, a PATH)
         env.update({f"GLAEDA_EVENT_{k.upper()}": v for k, v in values.items()})
         try:
             with open(out, "ab") as sink:

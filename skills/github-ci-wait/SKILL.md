@@ -208,8 +208,8 @@ With `job`, that job must have finished with `conclusion` (default success):
   the command starts. A rerun attempt is a new event.
 - `command[0]` is absolute. Placeholders: `{head_sha}` (always a full 40-hex), `{run_id}`,
   `{attempt}`, `{repo}`, `{run_url}`, `{job_url}`, `{hook}`; the same as `GLAEDA_EVENT_*`
-  variables. The environment is only HOME, PATH, USER, LOGNAME, LANG, LC_ALL, TMPDIR and SHELL:
-  no token. Output goes to `~/.cache/glaeda/gh/on-event/`.
+  variables. The environment is only HOME, PATH, USER, LOGNAME, LANG, LC_ALL, TMPDIR and SHELL,
+  plus the hook's own literal `env` map: no token. Output goes to `~/.cache/glaeda/gh/on-event/`.
 - Only the repositories the controller's webhooks cover (not manaflow-ai/cmux-platform), and only
   while the daemon runs and reads the controller itself (not through an upstream, as lane VMs do).
 - `glaeda-gh on-event` shows the hooks, refused config and the last outcomes (`ran` with its exit

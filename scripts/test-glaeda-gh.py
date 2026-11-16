@@ -15397,11 +15397,14 @@ class OnEventTest(Base):
         self.baseline()
         self.ctl.held_jobs[(90, 1)] = [held_job("promote-production")]
         self.ctl.runs[90] = backend_run(90)
+        self.write_config(self.hook(env={"PROBE_WRITER": "air-blue/x", "PATH": "/opt/homebrew/bin:/usr/bin:/bin"}))
         with mock.patch.dict(os.environ, {"GH_TOKEN": TOKEN, "GITHUB_TOKEN": TOKEN, "SECRET_THING": "x"}):
             self.daemon.tick(NOW + gg.TICK)
         self.settle()
         env = self.fired()[0]["env"]
         self.assertFalse({"GH_TOKEN", "GITHUB_TOKEN", "SECRET_THING"} & set(env))
+        # the hook's own literal values, as a LaunchAgent's EnvironmentVariables would give them
+        self.assertEqual((env["PROBE_WRITER"], env["PATH"]), ("air-blue/x", "/opt/homebrew/bin:/usr/bin:/bin"))
         self.assertEqual(env["GLAEDA_EVENT_HEAD_SHA"], PROMOTE_SHA)
         self.assertEqual(env["GLAEDA_EVENT_RUN_URL"], "https://github.com/manaflow-ai/cmux/actions/runs/90")
 
@@ -15420,6 +15423,9 @@ class OnEventTest(Base):
         self.assertTrue(any("absolute" in p for p in problems))
         self.write_config(self.hook(command=["/bin/echo", "{token}"]))
         self.assertEqual(gg.on_event_hooks()[0], [])
+        for env in ({"bad name": "x"}, {"OK": 1}, {"GLAEDA_EVENT_HEAD_SHA": "x"}, ["A=b"]):
+            self.write_config(self.hook(env=env))
+            self.assertEqual(gg.on_event_hooks()[0], [], env)
 
     def test_a_host_without_hooks_writes_nothing(self) -> None:
         self.config.unlink()
