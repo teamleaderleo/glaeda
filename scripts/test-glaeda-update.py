@@ -873,6 +873,63 @@ class UpdateTest(unittest.TestCase):
                          self.server.rings["canary"]["tag"])
         self.assertFalse((self.state / "pre-ota").exists())  # snapshot dropped after the first success
 
+    # cmux8s-mac-mini, 2026-11-15 22:25Z to 11-16: every update was refused on `glaeda-disk --help` taking over 120 s
+    # (load 180-250, CPU 71% idle, the P-cores running nothing). The runner gate (glaeda#2018) holds such a mini
+    # until a drained reboot, but cmux8s ran an older gate that never saw it: nothing said so for 6 h.
+    def stall_host(self) -> Path:
+        fleet = self.root / "fleet"
+        (fleet / "ci").mkdir(parents=True)
+        for p in (mock.patch.object(gu, "FLEET_DIR", fleet), mock.patch.object(gu, "boot_epoch", return_value=1794342904)):
+            p.start()
+            self.addCleanup(p.stop)
+        return fleet / "ci" / gu.PCORE_STALL_FILE
+
+    def test_a_health_check_that_times_out_holds_the_runner_gate_until_its_tools_run(self) -> None:
+        hold = self.stall_host()
+
+        def slow(argv, **kw):
+            raise subprocess.TimeoutExpired(argv, kw.get("timeout"))
+
+        with mock.patch.object(gu.subprocess, "run", slow):
+            self.assertIsNone(gu.health(self.bin, self.root)[0])
+        doc = json.loads(hold.read_text(encoding="utf-8"))
+        self.assertEqual((doc["boot"], doc["source"]), (1794342904, "glaeda-update"))
+        self.assertIn("glaeda-disk --help", doc["why"])
+        self.assertIn("drained reboot", doc["why"])
+        since = doc["since"]
+        with mock.patch.object(gu.subprocess, "run", slow), mock.patch.object(gu.time, "time", return_value=since + 600):
+            gu.health(self.bin, self.root)
+        self.assertEqual(json.loads(hold.read_text(encoding="utf-8"))["since"], since, "one hold per stall, its start kept")
+
+        def ok(argv, **kw):
+            return subprocess.CompletedProcess(argv, 0, '{"result": "current"}\n', "")
+
+        with mock.patch.object(gu.subprocess, "run", ok):
+            self.assertEqual(gu.health(self.bin, self.root), (True, "tools run"))
+        self.assertFalse(hold.exists(), "its tools ran in time again: the hold it wrote goes")
+
+    def test_a_setup_probe_that_times_out_holds_too_and_a_gate_hold_is_left_alone(self) -> None:
+        hold = self.stall_host()
+        gate = {"boot": 1794342904, "since": 1.0, "why": "the mini's performance cores run nothing"}
+        hold.write_text(json.dumps(gate), encoding="utf-8")
+
+        def ok(argv, **kw):
+            return subprocess.CompletedProcess(argv, 0, '{"result": "current"}\n', "")
+
+        with mock.patch.object(gu.subprocess, "run", ok):
+            gu.health(self.bin, self.root)
+        self.assertEqual(json.loads(hold.read_text(encoding="utf-8")), gate, "the gate's own hold is the gate's to clear")
+        hold.unlink()
+        with mock.patch.object(gu.subprocess, "run", side_effect=subprocess.TimeoutExpired("x", 120)):
+            self.assertFalse(gu.setup_args_supported(self.root, [])[0])
+        self.assertIn("glaeda-mini-setup --help", json.loads(hold.read_text(encoding="utf-8"))["why"])
+
+    def test_a_host_without_runners_writes_no_hold(self) -> None:
+        with mock.patch.object(gu, "FLEET_DIR", self.root / "no-fleet"), \
+                mock.patch.object(gu.subprocess, "run", side_effect=subprocess.TimeoutExpired("x", 120)):
+            self.assertIsNone(gu.health(self.bin, self.root)[0])
+        self.assertFalse((self.root / "no-fleet").exists())
+
     def test_a_gh_only_host_checks_only_the_tools_it_installs(self) -> None:
         ran = []
 

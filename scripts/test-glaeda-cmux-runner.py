@@ -11643,6 +11643,19 @@ class GateTest(unittest.TestCase):
         gate.stalled(fresh=True)
         self.assertIsNone(gate.stalled(fresh=True))
 
+    def test_a_stall_glaeda_update_saw_holds_even_while_the_performance_cores_work(self) -> None:
+        # glaeda-update could not start Python in 120 s (cmux8s, 2026-11-15 22:25Z on): not a P-core reading,
+        # so a P-core reading does not clear it; a new boot does (or glaeda-update itself, once its tools run).
+        gate = self.pcore_gate(self.CMUXS_6)
+        why = "glaeda-update: glaeda-disk --help took over 120 s: it needs a drained reboot"
+        (Path(self.state) / hook.PCORE_STALL_FILE).write_text(json.dumps(
+            {"boot": 1794342904, "since": time.time(), "why": why, "source": "glaeda-update"}), encoding="utf-8")
+        for _ in range(hook.PCORE_STALL_LOOKS + 1):
+            self.assertEqual(gate.stalled(fresh=True), why)
+        with mock.patch.object(hook, "boot_epoch", return_value=1794900000):
+            rebooted = hook.Gate(self.runner, os.fspath(self.lock), os.fspath(self.tmp / "none.json"), self.state)
+            self.assertIsNone(rebooted.stalled(fresh=True))
+
     def test_a_healthy_loaded_mini_is_never_held_and_the_stall_hold_is_in_the_gate_chain(self) -> None:
         gate = self.pcore_gate(self.CMUXS_6)
         for _ in range(hook.PCORE_STALL_LOOKS + 2):
