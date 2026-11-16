@@ -2550,12 +2550,19 @@ class GlaedaDiskTest(unittest.TestCase):
         The tmp family judged the root whole ("checkout below the top level") and reclaimed 0 at 17G free under the
         30 GiB runner floor."""
         tmp, home = self.root / "tmp", self.root / "home"
-        for name, agent in (("actions-runner-glaeda", "cmux18-glaeda"), ("actions-runner-glaeda-1", "cmux18-glaeda-1")):
+        for name, agent in (("actions-runner-glaeda", "cmux18-glaeda"), ("actions-runner-glaeda-1", "cmux18-glaeda-1"),
+                            ("actions-runner-glaeda-3", "cmux18-glaeda-3")):
             (home / name / "glaeda-hooks").mkdir(parents=True)
             (home / name / ".runner").write_text(json.dumps({"agentName": agent}))
         idle, busy = tmp / "cmux-ci-cmux18-glaeda", tmp / "cmux-ci-cmux18-glaeda-1"
         orphan = tmp / "cmux-ci-retired-runner"  # no enrolled runner has its name
-        for root in (idle, busy, orphan):
+        # an idle runner's root that glaeda-1's running rerun job builds in (app-host-test-rerun.yml takes the
+        # producer's root and exports it to GITHUB_ENV); its unpacked products keep the producer's old mtimes
+        borrowed = tmp / "cmux-ci-cmux18-glaeda-3"
+        commands = home / "actions-runner-glaeda-1/_work/_temp/_runner_file_commands"
+        commands.mkdir(parents=True)
+        (commands / "set_env_0b1c").write_text(f"CMUX_CI_CANONICAL_ROOT={borrowed}\nCANONICAL_ROOT={borrowed}\n")
+        for root in (idle, busy, orphan, borrowed):
             make(root / "derived-data-compile-admission", age_hours=10.3)
             make(root / "compile-admission-cas", age_hours=10.3)
             src = root / "src"  # the root's checkout, with an untracked build input
@@ -2570,7 +2577,7 @@ class GlaedaDiskTest(unittest.TestCase):
         dev = tmp.stat().st_dev
         with mock.patch.object(gd, "HOME", home), mock.patch.object(gd, "ACTIVITY_MODE", "pressure"):
             fams = gd.runner_root_admission_families(tmp)
-            self.assertEqual([f.root for f in fams], [idle, busy, orphan])
+            self.assertEqual([f.root for f in fams], [idle, busy, borrowed, orphan])
             with mock.patch.object(gd, "FLOOR_HOLD", {}):  # above the floor the 12 h window stands
                 above = {os.path.relpath(i.path, tmp): i.verdict for i in gd.survey(fams, 6, 0)}
             self.assertEqual(above["cmux-ci-cmux18-glaeda/derived-data-compile-admission"], "recent")
@@ -2583,6 +2590,9 @@ class GlaedaDiskTest(unittest.TestCase):
                                  ("in-use", ["actions-runner-glaeda-1 is running a job (Runner.Worker)"]))
                 self.assertEqual(v["cmux-ci-retired-runner/derived-data-compile-admission"][0], "in-use",
                                  "a root no enrolled runner names waits while any runner has a job")
+                self.assertEqual(v["cmux-ci-cmux18-glaeda-3/derived-data-compile-admission"],
+                                 ("in-use", ["actions-runner-glaeda-1 is running a job that builds in this root "
+                                             "(GITHUB_ENV)"]))
                 self.assertNotEqual(v["cmux-ci-cmux18-glaeda"][0], "reclaimable", "src/ is still git's to judge")
                 self.assertNotIn("cmux-ci-cmux18-glaeda/src", v)
                 self.assertNotIn("cmux-ci-2/derived-data-compile-admission", v)
@@ -2594,7 +2604,15 @@ class GlaedaDiskTest(unittest.TestCase):
         self.assertEqual(sorted(p.name for p in idle.iterdir()), ["src"], "the build goes, the checkout stays")
         self.assertTrue((busy / "derived-data-compile-admission").exists(), "a runner with a job keeps its build")
         self.assertTrue((orphan / "derived-data-compile-admission").exists())
-        self.assertEqual(gd.runner_root_key("mac mini/ü"), "mac_mini___")  # tr -c on each byte: ü is two
+        self.assertTrue((borrowed / "derived-data-compile-admission").exists(), "a borrowed root keeps its products")
+        # the idle sweep, no job anywhere: past the 12 h window the build goes, src/ still stays
+        make(idle / "derived-data-compile-admission", age_hours=13)
+        gd.process_evidence = lambda: ([], "")
+        with mock.patch.object(gd, "HOME", home), mock.patch.object(gd, "ACTIVITY_MODE", "sweep"), \
+                mock.patch.object(gd, "FLOOR_HOLD", {}):
+            v = {os.path.relpath(i.path, tmp): i.verdict for i in gd.survey(fams, 6, 0)}
+        self.assertEqual(v["cmux-ci-cmux18-glaeda/derived-data-compile-admission"], "reclaimable")
+        self.assertEqual(gd.runner_root_key("mac mini/x"), "mac_mini_x")  # tr -c, C locale
         self.assertIsNone(gd.runner_root_of(tmp / "cmux-ci-2"))
         self.assertIsNone(gd.runner_root_of(tmp / "cmux-ci"))
 

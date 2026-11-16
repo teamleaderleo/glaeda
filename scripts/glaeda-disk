@@ -1206,15 +1206,19 @@ def remove_canonical_admission(path: Path, whole_root: bool = False) -> bool:
 # (cmux18, 2026-11-16: /private/tmp/cmux-ci-cmux18-glaeda 10.5G idle 10.3 h, 9.3G of it the admission
 # DerivedData, reclaimed 0 at 17G free under the 30 GiB runner floor while the pressure pass reran every ~15 s).
 # Its admission children are items of their own, kept while the runner named after the root has a Runner.Worker
-# (with no enrolled runner of that name, while any runner on the Mac has one) and by the process, cwd and open-file
-# checks every item gets; src/ stays the tmp family's and git's to judge.
+# (with no enrolled runner of that name, while any runner on the Mac has one), while another runner's running job
+# names the root in its GITHUB_ENV (app-host-test-rerun.yml builds in the producer's root, which may be another
+# runner's, and exports CMUX_CI_CANONICAL_ROOT; its unpacked products keep the producer's old mtimes), and by the
+# process, cwd and open-file checks every item gets; src/ stays the tmp family's and git's to judge.
 RUNNER_ROOT_ADMISSION = "cmux-ci-runner-admission"
 RUNNER_ROOT_RE = re.compile(r"cmux-ci-([A-Za-z0-9_.-]+)")
 ANY_RUNNER_WORKER_RE = re.compile(r"/bin(?:\.[0-9.]+)?/Runner\.Worker(?:\s|$)", re.M)
 
 
 def runner_root_key(name: str) -> str:
-    """canonical-build-root.sh's key for RUNNER_NAME: every byte outside A-Za-z0-9_.- becomes _."""
+    """canonical-build-root.sh's key for RUNNER_NAME: every byte outside A-Za-z0-9_.- becomes _ (tr -c in the C
+    locale; a multibyte locale's tr makes one _ of a non-ASCII character, so such a name matches no runner here and
+    its root falls back to "any runner has a job")."""
     return "".join(chr(b) if chr(b).isascii() and (chr(b).isalnum() or chr(b) in "_.-") else "_"
                    for b in name.encode())
 
@@ -1223,7 +1227,7 @@ def runner_root_of(root: Path) -> str | None:
     """The runner key of a per-runner root (/private/tmp/cmux-ci-<key>), None for a numbered canonical root
     (the runner hook's, under its token) or any other name."""
     m = RUNNER_ROOT_RE.fullmatch(root.name)
-    return m.group(1) if m and canonical_root_number(root) is None and root.name != CANONICAL_ADMISSION else None
+    return m.group(1) if m and canonical_root_number(root) is None else None
 
 
 def runner_root_admission_families(tmp: Path | None = None) -> list[Family]:
@@ -1255,6 +1259,20 @@ def runner_root_job_live(path: Path, cmds: str) -> str:
             return why
     if not owners and ANY_RUNNER_WORKER_RE.search(cmds):
         return f"no enrolled runner is named {key}, and a runner on this Mac has a job (Runner.Worker)"
+    for runner in enrolled_runners():
+        if runner_job_live(runner, cmds) and (why := runner_env_names(runner, path.parent)):
+            return why
+    return ""
+
+
+def runner_env_names(runner: Path, root: Path) -> str:
+    """Why RUNNER's running job uses ROOT, or "": a GITHUB_ENV (or GITHUB_OUTPUT) file of its job names it."""
+    commands = runner_work_folder(runner) / "_temp/_runner_file_commands"
+    spellings = _reference_spellings(root)
+    for e in _entries(commands)[:256] if commands.is_dir() and not commands.is_symlink() else []:
+        text = _head(e.path, 1 << 20).decode(errors="replace")
+        if _mentions_any(text, spellings):
+            return f"{runner.name} is running a job that builds in this root (GITHUB_ENV)"
     return ""
 
 
