@@ -15482,6 +15482,11 @@ class OnEventTest(Base):
         status = json.loads(out.getvalue())
         self.assertEqual([h["name"] for h in status["hooks"]], ["cloud-probe-promote"])
         self.assertIn("cloud-probe-promote manaflow-ai/cmux/94/1", status["runs"])
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(gg.main(["on-event"]), 0)  # the text form, as a person reads it
+        self.assertRegex(out.getvalue(),
+                         r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ cloud-probe-promote manaflow-ai/cmux/94/1 ran exit 0 3{40}")
 
 
 if __name__ == "__main__":
