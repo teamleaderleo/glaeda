@@ -1488,7 +1488,7 @@ class ReleaseTest(unittest.TestCase):
             signed = {**fresh, "policy": {**gr.policy_for_paths(["scripts/glaeda-update"]), "soakHours": hours}}
             self.assertTrue(gr.promotion(signed, None, ok, self.NOW)[0], hours)
         # a canary failure still blocks at once
-        failed = ok + [self.status("big-red", "failure", "2026-09-25T12:00:00Z")]
+        failed = ok + [self.status("cosmic-gray", "failure", "2026-09-25T12:00:00Z")]
         self.assertFalse(gr.promotion(fresh, None, failed, self.NOW)[0])
         self.assertEqual(gr.promotion(fresh, None, [], self.NOW), (False, "no canary host reported success"))
         # an operator's explicit soak is still honoured
