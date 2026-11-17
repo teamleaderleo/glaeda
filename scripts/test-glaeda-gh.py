@@ -15832,6 +15832,29 @@ class CmuxWaitsRestCostTest(Base):
         self.assertTrue([c for c in self.gh.calls[after:] if "/3cmux" in c[1] and "/check-runs" in c[1]])
 
 
+class ReexecDrainTest(Base):
+    """cosmic-gray, 2026-11-17: an installed update waited on land steps from 12:39Z until a forced restart, because a
+    busy land queue always had one running. A waiting re-exec starts no new step and waits at most REEXEC_DRAIN_MAX."""
+
+    def test_the_decision(self) -> None:
+        self.assertIsNone(gg.reexec_due(False, True, False, 100.0))
+        self.assertEqual(gg.reexec_due(True, False, False, 100.0), "reexec")
+        self.assertEqual(gg.reexec_due(True, True, False, 100.0), "defer")
+        self.assertEqual(gg.reexec_due(True, True, 100.0, 100.0 + gg.REEXEC_DRAIN_MAX - 1), "defer")
+        late = gg.reexec_due(True, True, 100.0, 100.0 + gg.REEXEC_DRAIN_MAX)
+        self.assertNotIn(late, (None, "defer", "reexec"))
+        self.assertEqual(gg.reexec_due(True, False, 100.0, 101.0), "reexec", "the steps ended: re-exec at once")
+
+    def test_a_waiting_reexec_starts_no_land_step(self) -> None:
+        queue = mock.Mock()
+        self.daemon.land_queue = queue
+        self.daemon.land_tick()
+        self.assertEqual(queue.tick.call_count, 1)
+        self.daemon.reexec_waiting = 50.0
+        self.daemon.land_tick()
+        self.assertEqual(queue.tick.call_count, 1, "a land pass ran while an update waited to re-execute")
+
+
 class UpstreamDirectAfterTest(unittest.TestCase):
     """The lane VM's own read through the broker (glaeda#2029) began after STALE_DATA_AFTER (600 s). With the broker
     host's waited reads fresh within a minute, the upstream copy is at most a cycle plus UPSTREAM_EVERY old; past
