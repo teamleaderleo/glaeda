@@ -10573,6 +10573,11 @@ def view_lines(view: dict) -> list[str]:
     if apps:
         out.append("App installation pools (their own quota, not the login's): " + "; ".join(
             f"{a.get('name')} {a.get('remaining', '?')}/{a.get('limit', '?')}" for a in apps))
+    silent = [h for h in view.get("silent_hosts") or [] if isinstance(h, dict)]
+    if silent:
+        out.append("hosts on the login whose spend is not here (their calls are in the unaccounted remainder):")
+        for h in silent:
+            out.append(f"  {h.get('host')}: {h.get('why')}; reports: {h.get('report')}")
     for gap in (view.get("gaps") or [])[:10]:
         out.append(f"not seen: {gap}")
     return out

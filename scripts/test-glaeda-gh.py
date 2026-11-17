@@ -5243,7 +5243,9 @@ class FleetBudgetTest(Base):
                               "graphql": 0, "search": 0}], "sessions_total": 40,
                 "lane_vm_sessions": [{"host": "gcp-agent-lane-5", "caller": "session:glaeda-land", "rest": 583,
                                       "graphql": 360, "search": 0}], "lane_vm_sessions_total": 7,
-                "app_pools": [], "app_role_calls": [], "gaps": ["other-host: census has no gh_spend"]}
+                "app_pools": [], "app_role_calls": [], "gaps": ["other-host: census has no gh_spend"],
+                "silent_hosts": [{"host": "quiet-host", "why": "no census reached the view",
+                                  "report": "its NOW census carries gh_spend"}]}
         answer = json.dumps({"ok": True, "status": 200, "data": {**data, "markdown": "## big"}})
         gg.LANE_GH_CMD = self.script("lane-gh", f"printf '%s\\n' \"$@\" > \"$0.args\"; cat <<'J'\n{answer}\nJ\n")
         fetch = mock.Mock(side_effect=AssertionError("a host read while spend_view answered"))
@@ -5260,6 +5262,7 @@ class FleetBudgetTest(Base):
         self.assertRegex(text, r"broker:gcp-agent-lane-4/ws-check +REST +778")
         self.assertRegex(text, r"session:glaeda-land +REST +583")
         self.assertIn("not seen: other-host: census has no gh_spend", text)
+        self.assertIn("  quiet-host: no census reached the view; reports: its NOW census carries gh_spend", text)
         self.assertIn("hard reserve: 500 REST, 500 GraphQL", text)
         # a refusal (this host is no broker client) is the host sweep, with the reason said
         gg.LANE_GH_CMD = self.script("lane-gh", "echo 'lane-gh: spend_view: x is not a client of this broker' >&2; "
