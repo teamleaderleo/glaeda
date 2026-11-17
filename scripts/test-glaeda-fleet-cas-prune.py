@@ -185,6 +185,23 @@ class PruneTest(unittest.TestCase):
         self.assertEqual(rec["local_cas"], "within budget")
         self.assertTrue((self.root / "cas/plugin/v1.1/v8.index").exists())
 
+    def test_malformed_crash_report_is_unreadable_not_fatal(self) -> None:
+        self.corrupt_cas()
+        reports = self.crash_report("SWBBuildService-good.ips", time.time() - 3600)  # before the CAS: not counted
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S.00 %z", time.localtime(time.time() + 5))
+        (reports / "SWBBuildService-partial.ips").write_text(
+            json.dumps({"timestamp": stamp}) + "\n" + json.dumps({"threads": ["x"], "usedImages": ["y"]}))
+        self.assertEqual(fp.corrupt_local_cas(self.root / "cas", reports), "")
+
+    def test_lookback_reads_the_report_time_not_its_mtime(self) -> None:
+        """macOS rewrites old reports when it submits them, so a fresh mtime says nothing about when Xcode crashed."""
+        self.corrupt_cas()
+        reports = self.crash_report("SWBBuildService-resubmitted.ips", time.time() + 5)
+        later = time.time() + 30 * 86400
+        os.utime(reports / "SWBBuildService-resubmitted.ips", (later, later))
+        self.assertEqual(fp.corrupt_local_cas(self.root / "cas", reports, now=later), "")
+        self.assertTrue(fp.corrupt_local_cas(self.root / "cas", reports).startswith("corrupt: "))
+
     def test_leftover_renamed_cas_is_swept(self) -> None:
         self.env()
         left = self.root / ".cas.pruning-4242/v1"

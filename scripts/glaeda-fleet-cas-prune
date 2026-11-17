@@ -245,7 +245,7 @@ def crash_time(report: Path) -> tuple[float, bool] | None:
         images = data["usedImages"]
         in_plugin = any((images[f["imageIndex"]].get("name") or "") == CAS_PLUGIN
                         for f in thread.get("frames", []) if 0 <= f.get("imageIndex", -1) < len(images))
-    except (OSError, ValueError, KeyError, IndexError, TypeError):
+    except (OSError, ValueError, KeyError, IndexError, TypeError, AttributeError):  # a partly written report
         return None
     return when, in_plugin
 
@@ -273,7 +273,9 @@ def corrupt_local_cas(local: Path, reports: Path | None = None, now: float | Non
             except OSError:
                 continue
             seen = crash_time(report)
-            if seen and seen[1] and seen[0] > born and (newest is None or seen[0] > newest[0]):
+            # the report's own time, not its mtime, decides both the lookback and "after the CAS was made"
+            fresh = seen is not None and seen[1] and seen[0] > max(born, now - CRASH_LOOKBACK)
+            if fresh and (newest is None or seen[0] > newest[0]):
                 newest = (seen[0], report.name)
     if newest is None:
         return ""
