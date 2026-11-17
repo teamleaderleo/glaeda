@@ -498,6 +498,26 @@ What `--apply` does:
        `memoryCap` in `config/runner-gate.json` (`true`, `false`, or a dict of `needGiB`,
        `resumeGiB` and `maxWaitMin`) sets it by default or per host; `GLAEDA_RUNNER_MEMORY_CAP=off`
        in the runner LaunchAgent's environment turns it off.
+     - **Starved-job reserve** (`STARVED_RESERVE`, cmux#45614). A large job can starve behind
+       smaller ones that share its units: on 2026-11-17 cmux NEXT DEV's DMG build
+       (`glaeda-std-xcode-26.6`, a compile, 5 units) queued 23 min with no std runner listening,
+       because every std mini had 3-4 of 14 units free and side, session and fleet-step jobs took
+       each unit back as it freed. Nothing was down. Now a root runner's gate, held off by units
+       while a job it could take has waited `afterMin` (10) in the controller's feed (the load
+       cap's), holds `capacity/starved.hold` on its mini's turn: `spreadMin` (20) times a stable
+       hash of the host and the job, so one mini goes first and the job is usually gone before the
+       next turn. While it is held, every other listener on the mini except the root runners and
+       the freshness slot, and the fleet step fit (`step_fits`), leave `root_fit_units()` free
+       beside their own need. Admissions never count it, so no job already taken is refused or
+       made to wait; running jobs finish, the units drain to the compile's need, and the root
+       runner takes the job. The hold ends when its runner takes a job, no takeable job has
+       waited long enough, the root runner is held for something other than units, the feed
+       cannot be read (fail open), or after `maxHoldMin` (30), after which that job never gets
+       this mini's hold again. `starvedReserve` in `config/runner-gate.json` (`true`, `false`, or
+       a dict of `afterMin`, `spreadMin` and `maxHoldMin`, each at most 120) sets it by default or
+       per host; `GLAEDA_RUNNER_STARVED_RESERVE=off` turns it off. The gate logs each hold and
+       release, and a held-off listener's line says "N are kept for a starved job of a root
+       runner's label".
      - The gui runner is never held for CPU saturation (85% busy), only for memory
        pressure: its jobs come one per mini and are admitted by units like any other,
        and the CPU mark held it whenever the other lanes kept the mini busy. Nothing

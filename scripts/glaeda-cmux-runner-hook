@@ -7159,7 +7159,8 @@ def step_fits(capacity_dir: Path, total: int, compile_slots: int, roots: int, ho
             return name in yielding or probe(capacity_dir / name)
 
         units = sum(1 for slot in range(total) if free(f"unit-{slot}"))
-        reserved = gui_reserved(capacity_dir)  # a step is never the gui runner's job: it leaves the reserve free
+        # a step is never the gui runner's job: it leaves the reserve free, and a starved root job's (STARVED_RESERVE)
+        reserved = gui_reserved(capacity_dir) + starved_reserved(capacity_dir)
         waited = set()
         for waiter in admission_waiters(capacity_dir):
             waited |= set(waiter["wants"]) | ({"units"} if waiter["tier"] == TIER_NIGHTLY else set())  # FEED_FIRST
@@ -7775,18 +7776,22 @@ def mini_full(capacity_dir: Path | None, total: int, scope: RunnerScope | None =
         # every runner leaves the idle reserving runners' reserves free (GUI_RESERVE, FRESH_RESERVE_TOKEN); a
         # reserving runner's own reserve is its next job's
         kept = reserve_for(gui_reserved(capacity_dir, reserve_token(scope)), need, total)
+        # and the units a root runner's gate holds for a starved job of its label (STARVED_RESERVE); the root runners
+        # take that job, and the freshness slot keeps its own reserve
+        starved = 0 if root or fresh else reserve_for(starved_reserved(capacity_dir), need + kept, total)
         free = 0
         for slot in range(total if not session else 0):  # the SESSION_FIRST listener does not count units
             if not open_to_jobs(f"unit-{slot}", capacity_dir / f"unit-{slot}"):
                 continue
             free += 1
-            if free >= need + kept + others:
+            if free >= need + kept + starved + others:
                 break
         if free == 0 and not session:
             return f"all {total} {UNITS_FULL} are taken"
-        if free < need + kept + others and not session:
+        if free < need + kept + starved + others and not session:
             return (f"only {free} of {total} {UNITS_FULL} are free; "
-                    f"{'a compile' if root else 'its next job'} needs {need}{kept_note(kept)}{claims_note(others)}")
+                    f"{'a compile' if root else 'its next job'} needs {need}{kept_note(kept)}{starved_note(starved)}"
+                    f"{claims_note(others)}")
         # CAPACITY_ARITHMETIC: and the RAM its next job needs (a RAM hold reads as a units hold: same ledger)
         mem_total = 0 if session else mem_chunks_total()
         mem_need = listen_mem_chunks(scope, mem_total)
@@ -8343,6 +8348,142 @@ def oldest_queued_s(summary: dict[str, Any] | None, labels: frozenset[str] | Non
             and isinstance(job.get("created"), (int, float))
             and (max_age is None or now - job["created"] <= max_age)]
     return max(ages) if ages else None
+
+
+# STARVED_RESERVE (cmux#45614; Leo, 2026-11-05: "i meant can you do all of htem"): a large job starves behind
+# smaller ones that share the same units. On 2026-11-17 from 16:07Z cmux NEXT DEV's "Build the unsigned cmux NEXT DEV
+# tip DMG" (glaeda-std-xcode-26.6, a compile: 5 units) queued 23 min with no std runner listening anywhere: every std
+# mini had 3 or 4 of 14 units free, and the side runners beside its root runners (side-std jobs, 3 to 6 units, 211 of
+# them queued) took each unit back the moment a job gave it up, so no mini ever reached 5 free. Nothing was down;
+# the root runners were held off by size. So a root runner's gate, while a job it could take has waited
+# afterMin in the controller's feed (the HOST_LOAD_CAP summary), holds capacity/STARVED_RESERVE_FILE: every other
+# listener on the mini but the root runners and the freshness slot then leaves root_fit_units() units free beside its
+# own need (mini_full), and so does a fleet step's fit (step_fits). Running jobs finish (nothing is refused,
+# cancelled or failed; an admission does not look at it), the units drain to the root runner's need, and its
+# listener takes the job. Only one mini does it at a time: each mini's turn comes spreadMin x a stable hash of its
+# host and the job, so the first one to reach its turn holds it and the job is gone from the queue (the hold ends)
+# long before the next one's turn, unless that mini could not free the units. A hold ends when its runner takes a
+# job, the job leaves the queue, the root runner is held for something other than units, the feed cannot be read
+# (fail open), or after maxHoldMin; after that the same job never gets this mini's hold again. config/
+# runner-gate.json's starvedReserve (false, true, or a dict of afterMin, spreadMin and maxHoldMin) sets it by default
+# or per host; GLAEDA_RUNNER_STARVED_RESERVE=off in the runner's environment turns it off.
+STARVED_RESERVE_FILE = "starved.hold"  # not *.reserve: an admission never counts it (gui_reserved), only listeners
+STARVED_RESERVE_ENV = "GLAEDA_RUNNER_STARVED_RESERVE"
+STARVED_AFTER_MIN = 10.0
+STARVED_SPREAD_MIN = 20.0
+STARVED_MAX_HOLD_MIN = 30.0
+STARVED_LIMIT_MIN = 120.0  # no setting may make a hold or a wait longer than this
+STARVED_SPENT_MAX = 64  # jobs a gate remembers having held for (a hold past maxHoldMin is not taken again)
+STARVED_QUEUED = ("queued", "waiting", "pending")
+STARVED_NOTE = "kept for a starved job of a root runner's label"
+
+
+class StarvedReserve(NamedTuple):
+    after_s: float
+    spread_s: float
+    max_hold_s: float
+
+
+def _starved_reserve(value: Any) -> StarvedReserve | None | bool:
+    """One starvedReserve value read: false is off (None), true the code marks, a dict sets afterMin (> 0),
+    spreadMin (>= 0) and maxHoldMin (> 0), each at most STARVED_LIMIT_MIN and defaulting to the code mark. Anything
+    else is not a setting (False)."""
+    code = (STARVED_AFTER_MIN, STARVED_SPREAD_MIN, STARVED_MAX_HOLD_MIN)
+    if value is False:
+        return None
+    if value is True:
+        after, spread, hold = code
+    elif isinstance(value, dict):
+        try:
+            after = float(value.get("afterMin", code[0]))
+            spread = float(value.get("spreadMin", code[1]))
+            hold = float(value.get("maxHoldMin", code[2]))
+        except (TypeError, ValueError):
+            return False
+        if not (0 < after <= STARVED_LIMIT_MIN and 0 <= spread <= STARVED_LIMIT_MIN and 0 < hold <= STARVED_LIMIT_MIN):
+            return False
+    else:
+        return False
+    return StarvedReserve(after * 60.0, spread * 60.0, hold * 60.0)
+
+
+def gate_starved_reserve(doc: dict[str, Any] | None, host: str, now: float,
+                         raw: str | None = None) -> StarvedReserve | None:
+    """STARVED_RESERVE for this mini, or None when it is off: GLAEDA_RUNNER_STARVED_RESERVE "off" (or 0, false, no)
+    wins; else the host's live starvedReserve entry in runner-gate.json, else defaults.starvedReserve, else the code
+    marks. A value that is not a bool or a valid dict is ignored."""
+    env = os.environ.get(STARVED_RESERVE_ENV) if raw is None else raw
+    if env is not None and env.strip().lower() in ("off", "0", "false", "no", "disabled"):
+        return None
+    got: StarvedReserve | None | bool = _starved_reserve(True)
+    policy = got if isinstance(got, StarvedReserve) else None
+    defaults = doc.get("defaults") if isinstance(doc, dict) else None
+    if isinstance(defaults, dict) and "starvedReserve" in defaults \
+            and (got := _starved_reserve(defaults["starvedReserve"])) is not False:
+        policy = got  # type: ignore[assignment]
+    hosts = doc.get("hosts") if isinstance(doc, dict) else None
+    entry = hosts.get(host) if isinstance(hosts, dict) else None
+    if isinstance(entry, dict) and "starvedReserve" in entry and _live_entry(entry, now) \
+            and (got := _starved_reserve(entry["starvedReserve"])) is not False:
+        policy = got  # type: ignore[assignment]
+    return policy
+
+
+def starved_turn(host: str, key: str) -> float:
+    """This mini's place in [0, 1) for the job `key` (STARVED_RESERVE): a stable hash of both, so every mini agrees
+    without asking another, and a different job puts a different mini first."""
+    digest = hashlib.sha256(f"{host}\n{key}".encode("utf-8", "replace")).digest()
+    return int.from_bytes(digest[:8], "big") / float(1 << 64)
+
+
+def starved_job(summary: dict[str, Any] | None, labels: frozenset[str] | None, host: str, now: float,
+                policy: StarvedReserve | None) -> tuple[str, float] | None:
+    """STARVED_RESERVE: (key, waited s) of the longest-waiting queued job this runner could take (its labels all this
+    runner's) once it has waited policy.after_s plus this mini's turn (starved_turn x policy.spread_s), in a fresh
+    feed; None when none has, the policy is off, or the feed cannot say. A job older than
+    HOST_LOAD_CAP_JOB_MAX_AGE_S is a lost delivery and does not count."""
+    if policy is None or not isinstance(summary, dict) or not labels:
+        return None
+    delivery, at = summary.get("delivery"), summary.get("at")
+    if not isinstance(delivery, (int, float)) or now - delivery > HOST_LOAD_CAP_FEED_STALE_S:
+        return None
+    if not isinstance(at, (int, float)) or not 0 <= now - at <= HOST_LOAD_CAP_FEED_STALE_S:
+        return None
+    oldest: tuple[float, str] | None = None
+    for job in summary.get("jobs") if isinstance(summary.get("jobs"), list) else []:
+        if not isinstance(job, dict) or job.get("status") not in STARVED_QUEUED:
+            continue
+        wants, created = job.get("labels"), job.get("created")
+        if not isinstance(wants, list) or not wants or not set(wants) <= labels \
+                or not isinstance(created, (int, float)):
+            continue
+        waited = now - created
+        if waited > HOST_LOAD_CAP_JOB_MAX_AGE_S or waited < 0:
+            continue
+        if oldest is None or waited > oldest[0]:
+            oldest = (waited, f"{' '.join(sorted(wants))}@{created:.0f}")
+    if oldest is None:
+        return None
+    waited, key = oldest
+    if waited < policy.after_s + starved_turn(host, key) * policy.spread_s:
+        return None
+    return key, waited
+
+
+def starved_reserved(capacity_dir: Path) -> int:
+    """The units this mini keeps for a starved root-runner job (STARVED_RESERVE): root_fit_units() while a root
+    runner's gate holds capacity/STARVED_RESERVE_FILE, else 0. Never raises: an unreadable ledger keeps nothing."""
+    path = capacity_dir / STARVED_RESERVE_FILE
+    try:
+        if not path.exists():
+            return 0
+    except OSError:
+        return 0
+    return 0 if probe(path) else root_fit_units()
+
+
+def starved_note(kept: int) -> str:
+    return f" and {kept} {'is' if kept == 1 else 'are'} {STARVED_NOTE}" if kept else ""
 
 
 # MEMORY_CAP (cmuxterm-hq#12838; Leo, 2026-11-05: "i meant can you do all of htem"): the 16 GiB minis (cmux17, 18,
@@ -9118,6 +9259,13 @@ class Gate:
         self.cap_feed_at = -HOST_LOAD_CAP_FEED_EVERY_S
         self.cap_thread: threading.Thread | None = None
         self.ios_sim_own = False  # IOS_SIM_OWN_FIT: the last full() listened at its own fit for a queued ios-sim job
+        # STARVED_RESERVE: the policy in force (refreshed with the other settings), the capacity/STARVED_RESERVE_FILE
+        # flock while held, since when (monotonic), the job it is held for, and the jobs whose hold ran out
+        self.starved: StarvedReserve | None = gate_starved_reserve(None, "", 0.0)
+        self.starved_fd: int | None = None
+        self.starved_since: float | None = None
+        self.starved_key: str | None = None
+        self.starved_spent: list[str] = []
         # MEMORY_CAP: the cap in force (gate_memory_cap, refreshed with the other settings), its last reading, why it
         # holds and since when (monotonic)
         self.mem_cap: MemoryCap | None = gate_memory_cap(None, "", 0.0)
@@ -9497,6 +9645,58 @@ class Gate:
         self.ios_sim_own = wanted
         return wanted
 
+    def starved_step(self, why: str | None, stop: str | None = None) -> None:
+        """STARVED_RESERVE: hold or let go of capacity/STARVED_RESERVE_FILE for a starved job this root runner could
+        take, given claimed()'s answer. Never raises: a look that fails lets the hold go (fail open)."""
+        try:
+            want, note = (False, stop) if stop else self.starved_wants(why)
+        except Exception as error:  # noqa: BLE001 - a broken look must never stop the gate
+            want, note = False, f"the starved-job reserve look failed ({type(error).__name__})"
+        if want and self.starved_fd is None and self.capacity_dir is not None:
+            with contextlib.suppress(OSError):
+                fd = lock_file(self.capacity_dir / STARVED_RESERVE_FILE, fcntl.LOCK_EX)
+                if fd is not None:
+                    os.set_inheritable(fd, False)
+                    self.starved_fd, self.starved_since = fd, time.monotonic()
+                    gate_log(note)
+        elif not want and self.starved_fd is not None:
+            with contextlib.suppress(OSError):
+                os.close(self.starved_fd)
+            self.starved_fd, self.starved_since, self.starved_key = None, None, None
+            gate_log(note)
+
+    def starved_wants(self, why: str | None) -> tuple[bool, str]:
+        """Whether this gate should hold the starved-job reserve now, and the line to log when that changes. It starts
+        only on a root runner held off by units alone (UNITS_FULL), keeps it while that or nothing holds it (its
+        listener is up and the job is on its way) or a job here waits for units (that job goes first), and lets it go
+        once its runner has a job, the job is no longer queued, maxHoldMin is up, or the feed cannot say."""
+        scope = runner_scope(self.runner_dir)
+        if not scope.root or scope.dedicated or scope.nightly or self.capacity_dir is None:
+            return False, "not a root runner: no starved-job reserve"
+        units_bound = why is not None and UNITS_FULL in why
+        if self.starved_fd is None and not units_bound:
+            return False, ""
+        self.cpu_holds()  # refreshes self.starved with the other settings, at most every GATE_SETTINGS_EVERY_S
+        if self.starved is None:
+            return False, "the starved-job reserve is off: let go"
+        if self.starved_fd is not None and why is not None and not units_bound and "waits here for units" not in why:
+            return False, f"held off for something else ({why}): the starved-job reserve is let go"
+        self.cap_look()
+        found = starved_job(self.cap_summary, self.cap_labels, gate_host(), time.time(), self.starved)
+        if found is None:
+            return False, "no job of this runner's labels is starved now (or the feed cannot say): reserve let go"
+        key, waited = found
+        if key in self.starved_spent:
+            return False, f"the starved-job reserve for {key} already ran {self.starved.max_hold_s / 60:g} min here"
+        # a hold keeps its first job's key and clock while another starved job takes over: maxHoldMin bounds the hold
+        if self.starved_since is not None and time.monotonic() - self.starved_since >= self.starved.max_hold_s:
+            self.starved_spent = (self.starved_spent + [self.starved_key or key])[-STARVED_SPENT_MAX:]
+            return False, (f"the starved-job reserve held {self.starved.max_hold_s / 60:g} min and the units never "
+                           "freed: let go, and not taken again for this job")
+        self.starved_key = self.starved_key or key
+        return True, (f"a job of this runner's labels ({key.split('@', 1)[0]}) has waited {waited / 60:.0f} min with "
+                      f"no runner taking it: holding {root_fit_units()} units on this mini for it (STARVED_RESERVE)")
+
     def cpu_holds(self) -> bool:
         """Whether the CPU marks hold this mini's listeners (config/runner-gate.json's cpuHold; gate_cpu_hold), read
         at most every GATE_SETTINGS_EVERY_S. A change is logged once, so the gate log says when a mini's hold went
@@ -9525,6 +9725,13 @@ class Gate:
                                              f"{mem_cap.resume_mib / 1024:g}, wait at most "
                                              f"{mem_cap.max_wait_s / 60:g} min)" if mem_cap else "off") + " on this mini")
         self.mem_cap = mem_cap
+        starved = gate_starved_reserve(doc, gate_host(), time.time())
+        if starved != self.starved:
+            gate_log("the starved-job reserve is " + (f"on after {starved.after_s / 60:g} min (turns spread over "
+                                                      f"{starved.spread_s / 60:g} min, held at most "
+                                                      f"{starved.max_hold_s / 60:g} min)" if starved else "off")
+                     + " on this mini")
+        self.starved = starved
         return hold
 
     def saturated(self) -> str | None:
@@ -10587,6 +10794,7 @@ class Gate:
                     # one let go at an idle look a job then beat, or a reload's: a job of its own always gets it
                     # back, read from nothing but the job itself, so no state is lost across a reload
                     self.reserve(True)
+                self.starved_step(None, "its runner took a job: the starved-job reserve is let go")
                 return None
             if self.busy_since is not None:
                 self.job_done_at = time.monotonic()  # a job ended: the next poll is a first one (claim_stamp)
@@ -10609,16 +10817,19 @@ class Gate:
             # let go only after the last look (confirmed() included), and never with a job of its own arrived
             # (keeps_reserve); a job that beats even this busy() check gets it back on its first busy poll
             self.reserve(self.keeps_reserve(why))
+            self.starved_step(why)
             return None
         if self.terminating:
             return 0
         self.reload()
         if self.registration_wait():
             self.reserve(False)  # a runner GitHub no longer knows takes no job: it keeps no units from the others
+            self.starved_step(None, "its registration is gone: the starved-job reserve is let go")
             self.unclaim()
             return None
         why = self.claimed()
         self.reserve(self.keeps_reserve(why))
+        self.starved_step(why)
         if why:
             self.unclaim()
             if why != self.held or self.free_logged:  # a hold back inside the restart wait is logged again

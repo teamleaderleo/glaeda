@@ -8829,6 +8829,217 @@ class HostLoadCapTest(unittest.TestCase):
                          "it still needs room for its own job")
 
 
+class StarvedReserveTest(unittest.TestCase):
+    """cmux#45614 (STARVED_RESERVE): on 2026-11-17 cmux NEXT DEV's DMG build (glaeda-std-xcode-26.6, a compile: 5
+    units) queued 23 min with no std runner listening anywhere. Every std mini had 3 or 4 of 14 units free and the side
+    runners took each unit back as it freed, so no root runner ever saw room. One mini's root runner now holds units
+    for such a job; the other listeners there leave them free until the root runner takes it."""
+
+    LABEL = "glaeda-std-xcode-26.6"
+    HOST = "cmux12s-mac-mini"
+
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.tmp = Path(tmp.name)
+        self.state = self.tmp / "state"
+        self.state.mkdir()
+        self.root = self.runner(0)
+        (self.state / "receipt.json").write_text(json.dumps({"registration": {
+            "name": f"{self.HOST}-glaeda", "labels": ["glaeda-mini", self.LABEL]}}))
+        self.jobs: list[dict] = []
+        self.doc: dict | None = {"defaults": {"starvedReserve": {"afterMin": 10, "spreadMin": 0, "maxHoldMin": 30}}}
+        self.logged: list[str] = []
+        for name, value in (("GATE_SETTINGS_EVERY_S", 0.0), ("HOST_LOAD_CAP_FEED_EVERY_S", 0.0)):
+            patcher = mock.patch.object(hook, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        for name, fake in (("gate_host", lambda: self.HOST), ("load_cap_fetch", self.fetch),
+                           ("gate_settings_doc", lambda *a: (self.doc, "")), ("gate_log", self.logged.append)):
+            patcher = mock.patch.object(hook, name, side_effect=fake)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        patcher = mock.patch.dict(os.environ, {hook.STARVED_RESERVE_ENV: ""})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.need = hook.root_fit_units()
+
+    def runner(self, instance: int) -> Path:
+        runner = self.tmp / ("actions-runner-glaeda" + (f"-{instance}" if instance else ""))
+        (runner / hook.RUNNER_HOOK_SCRIPT).parent.mkdir(parents=True, exist_ok=True)
+        (runner / hook.RUNNER_HOOK_SCRIPT).write_text(
+            "#!/bin/bash\nexec /usr/bin/python3 /hook job-started --allowed-owner manaflow-ai --capacity-units 14 "
+            f"--compile-slots 2 --canonical-roots 2 --instance {instance}\n")
+        (runner / ".runner").write_text(json.dumps({"agentName": f"{self.HOST}-glaeda" + (f"-{instance}" if instance
+                                                                                        else "")}))
+        return runner
+
+    def fetch(self, now: float) -> dict:
+        return {"at": now, "delivery": now, "jobs": self.jobs}
+
+    def job(self, status: str = "queued", ago: float = 11 * 60, labels: list[str] | None = None) -> dict:
+        return {"labels": labels or [self.LABEL], "status": status, "created": time.time() - ago, "host": None,
+                "urgent": False}
+
+    def ledger(self, held: int) -> Path:
+        capacity = Path(tempfile.mkdtemp(dir=self.tmp))
+        (capacity / "admission.lock").touch()
+        for slot in range(held):
+            fd = hook.lock_file(capacity / f"unit-{slot}", fcntl.LOCK_EX)
+            self.assertIsNotNone(fd)
+            self.addCleanup(os.close, fd)
+        return capacity
+
+    def gate(self, runner: Path, capacity: Path) -> hook.Gate:
+        gate = hook.Gate(runner, os.fspath(self.tmp / "host.lock"), os.fspath(self.tmp / "none.json"), self.state,
+                         capacity_dir=capacity)
+        self.addCleanup(lambda: gate.starved_step(None, "test over"))
+        return gate
+
+    def look(self, gate: hook.Gate, why: str | None) -> None:
+        """The first look starts the feed read (waited for), the next decides with it."""
+        for _ in range(2):
+            if gate.cap_thread is not None:
+                gate.cap_thread.join(10)
+            gate.starved_step(why)
+        if gate.cap_thread is not None:
+            gate.cap_thread.join(10)
+
+    def test_side_listeners_leave_a_held_starved_reserve_free_and_root_runners_take_it(self) -> None:
+        capacity = self.ledger(14 - (5 + self.need - 1))  # room for a side job, not for one beside the reserve
+        side = hook.RunnerScope(14, 2, 2)
+        self.assertIsNone(hook.mini_full(capacity, 14, side, 5), "no hold: a side job fits")
+        self.assertEqual(hook.starved_reserved(capacity), 0)
+        fd = hook.lock_file(capacity / hook.STARVED_RESERVE_FILE, fcntl.LOCK_EX)
+        self.addCleanup(os.close, fd)
+        self.assertEqual(hook.starved_reserved(capacity), self.need)
+        free = 5 + self.need - 1
+        self.assertEqual(hook.mini_full(capacity, 14, side, 5),
+                         f"only {free} of 14 capacity units on this mini are free; its next job needs 5 and "
+                         f"{self.need} are {hook.STARVED_NOTE}")
+        self.assertIn(hook.STARVED_NOTE, hook.mini_full(capacity, 14, hook.RunnerScope(14, 2, 2, gui=True), 5) or "")
+        self.assertIsNone(hook.mini_full(capacity, 14, hook.RunnerScope(14, 2, 2, root=True)),
+                          "a root runner takes the starved job: the hold is its room")
+        self.assertIsNone(hook.mini_full(capacity, 14, hook.RunnerScope(14, 2, 2, fresh=True)),
+                          "the freshness slot keeps its own reserve")
+
+    def test_a_fleet_step_leaves_a_held_starved_reserve_free(self) -> None:
+        capacity = self.ledger(14 - self.need)
+        args = (capacity, 14, 2, 2, os.fspath(self.tmp / "host.lock"), os.fspath(self.tmp / "none.json"), self.state)
+        before = hook.step_fits(*args, time.time())
+        self.assertTrue(before, "the free units fit a step")
+        fd = hook.lock_file(capacity / hook.STARVED_RESERVE_FILE, fcntl.LOCK_EX)
+        self.addCleanup(os.close, fd)
+        self.assertEqual(hook.step_fits(*args, time.time()), [], "the free units are the starved job's")
+
+    def test_an_admission_does_not_count_the_starved_reserve(self) -> None:
+        capacity = self.ledger(0)
+        fd = hook.lock_file(capacity / hook.STARVED_RESERVE_FILE, fcntl.LOCK_EX)
+        self.addCleanup(os.close, fd)
+        self.assertEqual(hook.gui_reserved(capacity), 0, "a job already taken is never refused or kept waiting for it")
+
+    def test_starved_job_waits_after_min_plus_this_minis_turn(self) -> None:
+        labels = frozenset(["glaeda-mini", self.LABEL])
+        policy = hook.StarvedReserve(600.0, 0.0, 1800.0)
+        now = time.time()
+        summary = {"at": now, "delivery": now, "jobs": [self.job(ago=9 * 60)]}
+        self.assertIsNone(hook.starved_job(summary, labels, self.HOST, now, policy), "9 min is not starved")
+        summary["jobs"].append(self.job(ago=11 * 60))
+        key, waited = hook.starved_job(summary, labels, self.HOST, now, policy)
+        self.assertGreaterEqual(waited, 11 * 60 - 1)
+        self.assertTrue(key.startswith(self.LABEL + "@"))
+        self.assertIsNone(hook.starved_job(summary, labels, self.HOST, now, None), "off")
+        self.assertIsNone(hook.starved_job(summary, frozenset(["glaeda-mini"]), self.HOST, now, policy),
+                          "a job this runner could not take")
+        stale = dict(summary, delivery=now - hook.HOST_LOAD_CAP_FEED_STALE_S - 1)
+        self.assertIsNone(hook.starved_job(stale, labels, self.HOST, now, policy), "a stale feed says nothing")
+        lost = {"at": now, "delivery": now, "jobs": [self.job(ago=hook.HOST_LOAD_CAP_JOB_MAX_AGE_S + 60)]}
+        self.assertIsNone(hook.starved_job(lost, labels, self.HOST, now, policy), "a lost delivery")
+        running = {"at": now, "delivery": now, "jobs": [self.job("in_progress", ago=3600)]}
+        self.assertIsNone(hook.starved_job(running, labels, self.HOST, now, policy))
+        # one mini first: the turns are stable and differ between minis, so the spread puts them in an order
+        hosts = [f"cmux{n}s-mac-mini" for n in range(7, 15)] + [f"cmuxs-mac-mini-{n}" for n in range(3, 7)]
+        turns = [hook.starved_turn(host, key) for host in hosts]
+        self.assertEqual(turns, [hook.starved_turn(host, key) for host in hosts], "deterministic")
+        self.assertEqual(len(set(turns)), len(hosts))
+        self.assertTrue(all(0 <= turn < 1 for turn in turns))
+        spread = hook.StarvedReserve(600.0, 1200.0, 1800.0)
+        first = hosts[turns.index(min(turns))]
+        at = summary["jobs"][1]["created"] + 600 + min(turns) * 1200 + 1
+        summary = dict(summary, at=at, delivery=at)
+        due = [host for host in hosts if hook.starved_job(summary, labels, host, at, spread)]
+        self.assertEqual(due, [first], "only the first mini's turn has come")
+
+    def test_settings(self) -> None:
+        self.assertEqual(hook.gate_starved_reserve(None, "x", 0.0),
+                         hook.StarvedReserve(hook.STARVED_AFTER_MIN * 60, hook.STARVED_SPREAD_MIN * 60,
+                                             hook.STARVED_MAX_HOLD_MIN * 60))
+        self.assertIsNone(hook.gate_starved_reserve(None, "x", 0.0, raw="off"))
+        self.assertIsNone(hook.gate_starved_reserve({"defaults": {"starvedReserve": False}}, "x", 0.0))
+        doc = {"defaults": {"starvedReserve": {"afterMin": 5}}, "hosts": {"x": {"starvedReserve": False}}}
+        self.assertIsNone(hook.gate_starved_reserve(doc, "x", 0.0))
+        self.assertEqual(hook.gate_starved_reserve(doc, "y", 0.0).after_s, 300.0)
+        self.assertEqual(hook.gate_starved_reserve({"defaults": {"starvedReserve": {"afterMin": -1}}}, "x", 0.0),
+                         hook.gate_starved_reserve(None, "x", 0.0), "an invalid value is ignored")
+        doc = json.loads((Path(__file__).resolve().parent.parent / "config" / "runner-gate.json").read_text())
+        self.assertIsNotNone(hook.gate_starved_reserve(doc, "cmux12s-mac-mini", time.time()), "on in the fleet")
+
+    def test_a_root_gate_held_by_units_holds_the_reserve_until_its_runner_takes_the_job(self) -> None:
+        capacity = self.ledger(14 - (self.need - 1))
+        units = f"only {self.need - 1} of 14 capacity units on this mini are free; a compile needs {self.need}"
+        gate = self.gate(self.root, capacity)
+        self.jobs = [self.job(ago=9 * 60)]
+        self.look(gate, units)
+        self.assertEqual(hook.starved_reserved(capacity), 0, "not starved yet")
+        self.jobs = [self.job(ago=11 * 60)]
+        self.look(gate, units)
+        self.assertEqual(hook.starved_reserved(capacity), self.need, "starved: this mini holds room for it")
+        self.assertTrue(any("STARVED_RESERVE" in line for line in self.logged))
+        other = self.gate(self.runner(1), capacity)
+        self.look(other, units)
+        self.assertIsNone(other.starved_fd, "one hold a mini: the other root runner's gate finds it taken")
+        self.look(gate, None)
+        self.assertIsNotNone(gate.starved_fd, "listening with room: kept until the job arrives")
+        gate.starved_step(None, "its runner took a job: the starved-job reserve is let go")
+        self.assertEqual(hook.starved_reserved(capacity), 0, "its runner took a job: let go")
+        self.look(gate, units)
+        self.assertIsNotNone(gate.starved_fd, "still another starved job")
+        self.jobs = []
+        self.look(gate, units)
+        self.assertEqual(hook.starved_reserved(capacity), 0, "no job starved any more")
+
+    def test_the_hold_fails_open_and_ends(self) -> None:
+        capacity = self.ledger(14 - (self.need - 1))
+        units = f"only {self.need - 1} of 14 capacity units on this mini are free; a compile needs {self.need}"
+        gate = self.gate(self.root, capacity)
+        self.jobs = [self.job()]
+        self.look(gate, "a fleet build is waiting for the host (pid 1)")
+        self.assertIsNone(gate.starved_fd, "held for something else: reserving would only idle units")
+        self.look(gate, units)
+        self.assertIsNotNone(gate.starved_fd)
+        with mock.patch.object(hook, "load_cap_fetch", return_value=None):
+            gate.cap_summary = None
+            gate.starved_step(units)
+        self.assertIsNone(gate.starved_fd, "a feed that cannot be read holds nothing")
+        self.look(gate, units)
+        self.assertIsNotNone(gate.starved_fd)
+        gate.starved_since -= 31 * 60
+        self.look(gate, units)
+        self.assertIsNone(gate.starved_fd, "maxHoldMin is up")
+        self.look(gate, units)
+        self.assertIsNone(gate.starved_fd, "and not taken again for the same job")
+        self.jobs = [self.job(ago=12 * 60)]
+        self.look(gate, units)
+        self.assertIsNotNone(gate.starved_fd, "a different starved job gets a new hold")
+        self.doc = {"defaults": {"starvedReserve": False}}
+        self.look(gate, units)
+        self.assertIsNone(gate.starved_fd, "turned off")
+        side = self.gate(self.runner(3), capacity)
+        self.doc = None
+        self.look(side, units)
+        self.assertIsNone(side.starved_fd, "a side runner never holds it")
+
+
 class MemoryCapTest(unittest.TestCase):
     """cmuxterm-hq#12838's memory cap at the listener (MEMORY_CAP). The 16 GiB minis showed macOS's out-of-application-
     memory panel running 4-6 jobs (cmux17's 2026-11-16 22:34Z JetsamEvent: low-swap kills while eight swift-frontend
