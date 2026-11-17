@@ -18579,6 +18579,48 @@ class RefreshStallTest(AlarmBase):
             self.assertLessEqual(self.oldest_age(keys, NOW + i), 2 * gg.CYCLE)
         self.assertFalse(self.daemon.gql_down(), "GraphQL is not held out once GitHub answers")
 
+    def test_the_502_storm_is_written_down_in_bounded_lines_naming_502_and_the_fallback(self) -> None:
+        """huge-blue 2026-11-17: the 502s were in daemon.json alone, not one journal line. The same 30-minute storm
+        (40 PRs, controller down) writes each failure kind in full once, then one counted line a minute: bounded, never
+        a line per PR per tick. `budget` prints the last few."""
+        self.daemon.controller = FakeController()
+        self.daemon.controller.down = True
+        keys = self.watch(40, waited=5)
+        self.answer_502(lambda prs: True)
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            for i in range(0, 1800, gg.TICK):
+                self.keep_alive(keys, NOW + i, waited=5)
+                self.daemon.tick(NOW + i)
+        lines = (gg.BASE / gg.REFRESH_LOG).read_text().splitlines()
+        self.assertEqual(err.getvalue().splitlines(), lines, "stderr (the journal) and the file carry the same lines")
+        self.assertLessEqual(len(lines), 120, f"{len(lines)} lines for a 30-minute storm")
+        text = "\n".join(lines)
+        self.assertIn("graphql: HTTP 502 on pr batch of", text)
+        self.assertNotIn("graphql: graphql:", text)
+        self.assertRegex(text, r"next: (REST reads it this tick|every GraphQL read goes to REST until \d\d:\d\d:\d\dZ)")
+        self.assertIn("controller: URLError", text)
+        self.assertRegex(lines[0], r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ glaeda-gh refresh: ")
+        self.assertRegex(text, r"\d+ more in the last \d+s", "repeats are counted, not repeated")
+        print(f"\n502 storm harness: {len(lines)} refresh-errors.log lines over 30 min", file=sys.__stderr__)
+        with mock.patch.object(gg, "daemon_running", return_value=True), \
+                mock.patch.object(gg, "daemon_stale", return_value=None), \
+                mock.patch.object(gg, "daemon_failing", return_value=None), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            gg.cmd_budget(False)
+        self.assertIn("last refresh failures", out.getvalue())
+        self.assertIn(lines[-1], out.getvalue())
+
+    def test_the_refresh_log_stays_under_its_cap(self) -> None:
+        with mock.patch.object(gg, "REFRESH_LOG_MAX", 4096), contextlib.redirect_stderr(io.StringIO()):
+            for n in range(2000):
+                gg.refresh_log_write(f"2026-11-17T14:52:03Z glaeda-gh refresh: graphql: HTTP 502 on line {n}")
+            size = (gg.BASE / gg.REFRESH_LOG).stat().st_size
+            lines = (gg.BASE / gg.REFRESH_LOG).read_text().splitlines()
+        self.assertLessEqual(size, 4096 + 100)
+        self.assertTrue(lines[-1].endswith("line 1999"), "the newest lines are kept")
+        self.assertTrue(all(line.startswith("2026-") for line in lines), "cut on a line boundary")
+        self.assertEqual(gg.refresh_log_tail(2), lines[-2:])
+
     def test_one_pr_graphql_fails_alone_is_read_over_rest_and_graphql_stays_in(self) -> None:
         """A PR GitHub answers 502 for every time (its query too heavy for GraphQL) costs its batch a split, is read
         over REST, and never takes GraphQL out for the others: the halves without it answer every tick."""

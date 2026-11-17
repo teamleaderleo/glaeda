@@ -458,6 +458,16 @@ HEAVY_AFTER = 3  # lone timeouts in a row after which a heavy entry is read only
 # for everyone: the split halves without it answer, every tick.
 GQL_DOWN_AFTER = 3
 GQL_DOWN_SPAN = 60
+# Every refresh failure is written down where it can be read after the fact (huge-blue 2026-11-17: the 502s were only
+# in daemon.json's health record, not one journal line, so nobody could read the stall afterwards): one line on stderr
+# (the journal, or launchd's log) and in BASE/refresh-errors.log, with the UTC time, the source, the error, what it hit
+# and what happens next. The first failure of a (source, error) prints in full, then one line per REFRESH_NOTE_EVERY
+# with the count, so a 30-minute 502 storm is a few dozen lines, not one per PR per tick. The file is cut to its
+# newest half past REFRESH_LOG_MAX; `glaeda-gh budget` prints its last REFRESH_LOG_SHOWN lines.
+REFRESH_NOTE_EVERY = 60
+REFRESH_LOG = "refresh-errors.log"
+REFRESH_LOG_MAX = 1024 * 1024
+REFRESH_LOG_SHOWN = 5
 GQL_DOWN_BACKOFF = 60
 GQL_DOWN_MAX = 600
 # GitHub failed the query (a 5xx, or no answer): split and retry, then REST. A 504 or a timeout is SLOW instead.
@@ -2940,6 +2950,7 @@ class Daemon:
         self.gql_down_since = 0.0  # when the first of them came
         self.gql_down_strikes = 0  # times GraphQL was taken out since its last clean answer: each doubles the next
         self.gql_down_until = 0.0  # GraphQL reads go to REST until then (gql_down)
+        self.refresh_notes: dict[tuple[str, str], dict] = {}  # (source, error) -> rate-limit state (refresh_note)
         self.newest_data: dict[str, float | None] = {}  # oldest_data's: per kind, the freshest live watch's data age
         self.since: dict[str, float] = {}  # key -> when the daemon first saw it watched, for oldestData
         self.stale_waited: dict[str, float | None] = {}  # oldest_data's, for the watches a wait is blocked on
@@ -3294,6 +3305,8 @@ class Daemon:
                   "ran": True, "valve": True, **{k: due.get(k) for k in ("kind", "age", "key")}}
         write_json(BASE / "restart.json", record)
         why = "stale valve: no PR refreshed (stall_alarm)" if due.get("key") == "newest" else "stale valve"
+        refresh_log_write(f"{utc_stamp(self.clock())} glaeda-gh refresh: {due.get('kind')} data {due.get('age')}s old "
+                          f"({why}, {due.get('ticks')} ticks); next: the daemon re-executes itself now")
         log({"event": "restart", "why": why, **{k: due.get(k) for k in ("kind", "age", "key", "ticks")}})
         return record
 
@@ -4894,6 +4907,11 @@ class Daemon:
                 break  # (cut off before its first request, it was not read: it keeps its place, first next tick)
             except Exception as error:  # noqa: BLE001
                 self.errors.append(f"{e['key']}: {describe(error)}")
+                self.refresh_note("rest", describe(error), key_name(e["key"]), "retry next cycle")
+            else:
+                stored = read_cache(e["key"]) or {}
+                if stored.get("error") and stored.get("fetchedAt") == self.now:
+                    self.refresh_note("rest", stored["error"], key_name(e["key"]), "retry next cycle")
             if self.mode("rest") == "stop" and (read_cache(e["key"]) or {}).get("error"):
                 # this read is the one that ran REST out: GraphQL reads it, and the rest, this tick
                 self.to_graphql(over_rest[i:], spilled)
@@ -5035,6 +5053,7 @@ class Daemon:
         self.confirm_tried = {k: t for k, t in self.confirm_tried.items() if self.now - t[0] < 2 * IDLE_EXPIRY}
         oldest = self.oldest_data(entries, {e["key"] for e in prs + runs + comments + heads})
         self.note_explained()  # before check_alarms: the stale alarm and the valve read it (catching_up)
+        self.flush_refresh_notes()
         # errors[] is this tick's only, and a heartbeat tick writes it empty: what failed a minute ago stays visible
         for message in self.errors:
             self.recent_errors[message] = self.now
@@ -5487,6 +5506,13 @@ class Daemon:
                 queue = redo + [left[i:i + size] for i in range(0, len(left), size)]
                 continue
             down = bool(error and GQL_DOWN.search(error))  # a 5xx or no answer: not the entries' doing
+            if error and (down or SLOW.search(error)):
+                what = (f"{kind} {key_name(chunk[0]['key'])}" if len(chunk) == 1
+                        else f"{kind} batch of {len(chunk)} ({', '.join(repos)})")
+                then = ("REST reads it this tick" if down and (len(chunk) < 2 or splits + 2 > GQL_SPLITS)
+                        else "split into halves and retried" if len(chunk) >= 2 and splits + 2 <= GQL_SPLITS
+                        else "read alone, next cycle")
+                self.refresh_note("graphql", error, what, then)
             if len(chunk) == 1 and chunk[0]["key"] in self.heavy or (len(chunk) == 1 and error and SLOW.search(error)):
                 if down:
                     to_rest += chunk
@@ -5615,6 +5641,38 @@ class Daemon:
         for e in entries:
             self.store(e["key"], e["cache"], error=message)
 
+    def refresh_note(self, source: str, error: str, target: str, then: str) -> None:
+        """Write down one refresh failure (REFRESH_NOTE_EVERY): in full the first time a (source, error) is seen in a
+        window, else counted into the window's summary line (flush_refresh_notes)."""
+        now = self.clock()
+        error = " ".join(str(error).split())
+        error = (error[len(source) + 2:] if error.startswith(source + ": ") else error)[:160]
+        key = (source, error)
+        state = self.refresh_notes.get(key)
+        if state is not None and now - state["at"] < REFRESH_NOTE_EVERY:
+            state.update(count=state["count"] + 1, target=target, then=then)
+            return
+        if state is not None and state["count"]:
+            self.refresh_summary(key, state, now)
+        self.refresh_notes[key] = {"at": now, "count": 0, "target": target, "then": then}
+        refresh_log_write(f"{utc_stamp(now)} glaeda-gh refresh: {source}: {error} on {target}; next: {then}")
+
+    def refresh_summary(self, key: tuple[str, str], state: dict, now: float) -> None:
+        refresh_log_write(f"{utc_stamp(now)} glaeda-gh refresh: {key[0]}: {key[1]}: {state['count']} more in the last "
+                          f"{int(now - state['at'])}s (last on {state['target']}; next: {state['then']})")
+
+    def flush_refresh_notes(self) -> None:
+        """Each tick: a window past REFRESH_NOTE_EVERY with failures counted in it says how many, in one line."""
+        now = self.clock()
+        for key, state in list(self.refresh_notes.items()):
+            if now - state["at"] < REFRESH_NOTE_EVERY:
+                continue
+            if state["count"]:
+                self.refresh_summary(key, state, now)
+                self.refresh_notes[key] = {**state, "at": now, "count": 0}
+            elif now - state["at"] >= 10 * REFRESH_NOTE_EVERY:
+                del self.refresh_notes[key]  # quiet for a while: the next one prints in full again
+
     def note_gql_health(self, error: str | None) -> None:
         """Count one GraphQL answer toward GQL_DOWN_AFTER: ERROR None is a clean one (anything under 500), which ends
         an outage; a 5xx or no answer at all (GQL_DOWN) adds to the streak, and at GQL_DOWN_AFTER over GQL_DOWN_SPAN
@@ -5623,6 +5681,8 @@ class Daemon:
         if error is None:
             if self.gql_down_until > self.clock():
                 log({"event": "graphql-up", "after": self.gql_down_strikes})
+                refresh_log_write(f"{utc_stamp(self.clock())} glaeda-gh refresh: graphql: answering again after "
+                                  f"{self.gql_down_strikes} hold(s); next: reads go back to GraphQL")
             self.gql_down_streak = self.gql_down_strikes = 0
             self.gql_down_until = 0.0
             return
@@ -5639,6 +5699,10 @@ class Daemon:
         hold = min(GQL_DOWN_MAX, GQL_DOWN_BACKOFF * 2 ** (self.gql_down_strikes - 1))
         self.gql_down_until = self.clock() + hold
         log({"event": "graphql-down", "after": error, "hold": hold, "strikes": self.gql_down_strikes})
+        refresh_log_write(f"{utc_stamp(self.clock())} glaeda-gh refresh: graphql: taken out after "
+                          f"{error.removeprefix('graphql: ')} "
+                          f"(strike {self.gql_down_strikes}); next: every GraphQL read goes to REST until "
+                          f"{utc_clock(self.gql_down_until)}")
 
     def gql_down(self) -> bool:
         """Whether GraphQL is out (note_gql_health): its reads go to REST this tick."""
@@ -6806,6 +6870,9 @@ class Daemon:
             wait, state = min(CONTROLLER_ABSENT, CONTROLLER_RETRY * 2 ** (self.controller_failures - 1)), "down"
             self.errors.append(what)
         self.controller_down_until = self.now + wait
+        if not isinstance(error, NoReceiver):
+            self.refresh_note("controller", what, getattr(self.controller, "base", None) or "controller",
+                              f"REST serves runs; the controller is asked again at {utc_clock(self.now + wait)}")
         self.controller_status = {"state": state, "error": what, "retryAt": self.now + wait,
                                   "token": bool(getattr(self.controller, "token", None))}
 
@@ -9303,6 +9370,47 @@ def cmd_land_serve(text: str) -> int:
         out.update(code="daemon_down", reason="the executor's daemon is down; the request stays queued there")
     print(json.dumps(out, sort_keys=True))
     return EXIT_OK
+
+
+def utc_stamp(at: float) -> str:
+    """An ISO UTC timestamp to the second (`2026-11-17T14:52:03Z`), or "unknown"."""
+    try:
+        return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(at))
+    except (ValueError, OSError, OverflowError):
+        return "unknown"
+
+
+def refresh_log_write(line: str) -> None:
+    """One refresh-failure line on stderr and in BASE/REFRESH_LOG, cut to its newest half past REFRESH_LOG_MAX.
+    Never raises: writing down a failure must not become one."""
+    with contextlib.suppress(Exception):
+        print(line, file=sys.stderr, flush=True)
+    path = BASE / REFRESH_LOG
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        with path.open("a") as stream:
+            stream.write(line + "\n")
+        if path.stat().st_size > REFRESH_LOG_MAX:
+            data = path.read_bytes()
+            keep = data[len(data) - REFRESH_LOG_MAX // 2:]
+            keep = keep[keep.find(b"\n") + 1:] if b"\n" in keep else b""
+            tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+            tmp.write_bytes(keep)
+            tmp.replace(path)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def refresh_log_tail(n: int = REFRESH_LOG_SHOWN) -> list[str]:
+    """The last N lines of BASE/REFRESH_LOG ([] when there is none)."""
+    try:
+        with (BASE / REFRESH_LOG).open("rb") as stream:
+            stream.seek(0, os.SEEK_END)
+            stream.seek(max(0, stream.tell() - 64 * 1024))
+            lines = stream.read().decode("utf-8", "replace").splitlines()
+    except OSError:
+        return []
+    return lines[-n:] if n > 0 else []
 
 
 def log(event: dict) -> None:
@@ -12229,6 +12337,11 @@ def cmd_budget(as_json: bool, fleet: bool = False) -> int:
                 print(f"alarm {name} ({alarm.get('level')}, sent {age(alarm.get('at'))}): {alarm.get('text')}")
         if status.get("errors"):
             print("last errors: " + "; ".join(status["errors"][:3]))
+        tail = refresh_log_tail()
+        if tail:
+            print(f"last refresh failures ({BASE / REFRESH_LOG}):")
+            for line in tail:
+                print("  " + line)
     if not running:
         say_waiting(down_message())
         return EXIT_DOWN
