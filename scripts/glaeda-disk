@@ -377,9 +377,55 @@ PRIVACY_SKIP_NAMES = (
 )
 
 
-def du_skip_args() -> list[str]:
-    """du's flags that keep a walk out of FileProvider/iCloud trees and, on macOS, privacy-guarded folders."""
+# The folders of a home's ~/Library that macOS guards (Photos, other apps' data, Full Disk Access). cmux19,
+# 2026-11-17 09:52, with the names above already skipped: the worker's lent eviction ran glaeda-disk, whose
+# accounting `du -xk -d 1 /System/Volumes/Data/Users` (-d only limits what du prints) went through 113 checks
+# on other apps' data in ~/Library/Containers and Group Containers and then into ~/Library/Photos, and macOS
+# asked "Allow worker-<sha> to access your photo library?". These names are skipped only by a walk whose root
+# reaches a home's Library (walk_reaches_a_home_library): elsewhere a build folder named Photos or Messages is
+# a real folder and is sized. Those below Application Support (AddressBook, CallHistoryDB, ...) and Metadata
+# (CoreSpotlight) are skipped by name at any depth inside such a walk.
+LIBRARY_PRIVACY_SKIP_NAMES = (
+    "Photos", "Containers", "Group Containers", "Daemon Containers",
+    "Mail", "Messages", "Safari", "Calendars", "Reminders", "HomeKit", "Cookies", "IdentityServices",
+    "Suggestions", "PersonalizationPortrait", "Biome", "DuetExpertCenter", "Accounts", "CoreSpotlight",
+    "AddressBook", "CallHistoryDB", "CallHistoryTransactions", "MobileSync", "Knowledge", "FaceTime",
+    "com.apple.TCC",
+)
+
+
+def walk_reaches_a_home_library(root: Path) -> bool:
+    """A du walk of ROOT can enter some home's ~/Library: ROOT is /, the Data volume, /Users, a home, or a
+    home's Library (or below it); likewise this process's own HOME, its ancestors and its Library."""
+    parts = Path(os.path.abspath(root)).parts
+    if parts[:4] == ("/", "System", "Volumes", "Data"):
+        parts = ("/", *parts[4:])
+    if len(parts) == 1 or parts[:2] == ("/", "Users"):
+        return len(parts) <= 3 or parts[3] == "Library"
+    home = Path(os.path.abspath(HOME)).parts
+    return parts == home[:len(parts)] or parts[:len(home) + 1] == (*home, "Library")
+
+
+def privacy_guarded(parent: Path, name: str) -> bool:
+    """The directory NAME in PARENT is one macOS guards with a privacy prompt (on macOS only): a PRIVACY_SKIP_NAMES
+    folder at any depth, as du -I skips it, or a LIBRARY_PRIVACY_SKIP_NAMES folder directly in a Library or in its
+    Application Support or Metadata (a simulator's own data/Containers deeper down is still walked)."""
+    if not DARWIN:
+        return False
+    if any(fnmatch.fnmatchcase(name, pattern) for pattern in PRIVACY_SKIP_NAMES):
+        return True
+    parent = Path(parent)
+    in_library = parent.name == "Library" or (parent.parent.name == "Library"
+                                              and parent.name in ("Application Support", "Metadata"))
+    return in_library and name in LIBRARY_PRIVACY_SKIP_NAMES
+
+
+def du_skip_args(root: Path | None = None) -> list[str]:
+    """du's flags that keep a walk of ROOT out of FileProvider/iCloud trees and, on macOS, privacy-guarded
+    folders (and a home's guarded Library folders, when the walk reaches one)."""
     names = [*sorted(MEASURE_SKIP_COMPONENTS), *(PRIVACY_SKIP_NAMES if DARWIN else ())]
+    if DARWIN and root is not None and walk_reaches_a_home_library(root):
+        names += LIBRARY_PRIVACY_SKIP_NAMES
     # The spelling follows the du that runs (BSD's -I, GNU's --exclude), not DARWIN, which a suite may set
     # on a Linux host.
     if sys.platform == "darwin":
@@ -4842,7 +4888,7 @@ def du_bytes(path: Path, *, record_timeout: bool = True) -> int | None:
         return None
     if _measurement_on_timeout_cooldown(path):
         return None
-    out = _du_output(["du", "-xsk", *du_skip_args(), str(path)], record_timeout=record_timeout)
+    out = _du_output(["du", "-xsk", *du_skip_args(path), str(path)], record_timeout=record_timeout)
     if out is None:
         return None
     try:
@@ -4858,7 +4904,7 @@ def du_children(root: Path, *, record_timeout: bool = True) -> dict[str, int] | 
     """Sizes of every directory directly below root from a single walk, keyed like candidates."""
     if not _measurement_path_allowed(root):
         return None
-    out = _du_output(["du", "-xk", "-d", "1", *du_skip_args(), str(root)], record_timeout=record_timeout)
+    out = _du_output(["du", "-xk", "-d", "1", *du_skip_args(root), str(root)], record_timeout=record_timeout)
     if out is None:
         return None
     sizes: dict[str, int] = {}
@@ -4878,7 +4924,7 @@ def du_children_with_status(root: Path, *, record_timeout: bool = True) -> tuple
     """
     if not _measurement_path_allowed(root):
         return None
-    out = _du_output(["du", "-xk", "-d", "1", *du_skip_args(), str(root)], allow_nonzero=True,
+    out = _du_output(["du", "-xk", "-d", "1", *du_skip_args(root), str(root)], allow_nonzero=True,
                      record_timeout=record_timeout)
     if out is None:
         return None
@@ -10163,7 +10209,7 @@ def census_covered() -> set[str]:
 def _census_du_argv(path: Path) -> list[str]:
     # never enter a FileProvider/cloud tree below an unowned directory (du can block in the kernel there),
     # nor a privacy-guarded folder (du would put a TCC prompt on an unattended screen)
-    argv = ["du", "-xsk", *du_skip_args(), str(path)]
+    argv = ["du", "-xsk", *du_skip_args(path), str(path)]
     if os.path.exists("/usr/sbin/taskpolicy"):
         return ["/usr/sbin/taskpolicy", "-b", *argv]  # background QoS: CPU and I/O throttled
     if ionice := shutil.which("ionice"):
@@ -10254,6 +10300,8 @@ def census_pass(roots: list[Path], covered: set[str], state: dict[str, Any] | No
                     continue  # another volume mounted here
                 if name in MEASURE_SKIP_COMPONENTS:
                     rows[child] = [0, "skipped", False]  # FileProvider: du can block in the kernel there
+                elif privacy_guarded(current, name):
+                    rows[child] = [0, "skipped", False]  # listing it puts a privacy prompt on the screen
                 else:
                     children.append(child)
             elif child not in covered:  # a sized file is counted by its own size, not again here
