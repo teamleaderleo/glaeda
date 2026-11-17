@@ -438,15 +438,20 @@ def validate_ios_simulator(path: Path, where: str, ios: Any) -> None:
     """ios_simulator: {"runtimes": ["23F77"], "exclusive": true, "devices": ["iPhone 17 Pro Max"]}.
 
     runtimes are iOS simulator runtime builds every such host must have; exclusive means no others;
-    devices are device types that must exist, available, on each declared runtime.
+    allowed are builds a host may carry beside them under exclusive, never required and never drift (an
+    opt-in iOS 27 runtime beside the 26.5 pin, 2026-11-17); devices are device types that must exist,
+    available, on each declared runtime.
     """
     if ios is None:
         return
-    if not isinstance(ios, dict) or set(ios) - {"runtimes", "exclusive", "devices"}:
-        raise Failure(f"{path}: {where} ios_simulator takes runtimes, exclusive and devices")
+    if not isinstance(ios, dict) or set(ios) - {"runtimes", "allowed", "exclusive", "devices"}:
+        raise Failure(f"{path}: {where} ios_simulator takes runtimes, allowed, exclusive and devices")
     runtimes, devices = ios.get("runtimes", []), ios.get("devices", [])
     if not isinstance(runtimes, list) or not all(isinstance(b, str) and IOS_BUILD_RE.fullmatch(b) for b in runtimes):
         raise Failure(f"{path}: {where} ios_simulator.runtimes must be runtime builds such as 23F77")
+    allowed = ios.get("allowed", [])
+    if not isinstance(allowed, list) or not all(isinstance(b, str) and IOS_BUILD_RE.fullmatch(b) for b in allowed):
+        raise Failure(f"{path}: {where} ios_simulator.allowed must be runtime builds such as 23F77")
     if not isinstance(devices, list) or not all(isinstance(d, str) and IOS_DEVICE_RE.fullmatch(d) for d in devices):
         raise Failure(f"{path}: {where} ios_simulator.devices must be device type names such as iPhone 17 Pro Max")
     if not isinstance(ios.get("exclusive", False), bool):
@@ -509,7 +514,7 @@ def ios_simulator_drift(ios: dict[str, Any], obs: dict[str, Any]) -> list[tuple[
     if ios.get("exclusive"):
         # An unavailable runtime is still extra: deleting it is the fix.
         for build, r in sorted((r["build"], r) for r in runtimes):
-            if build not in ios.get("runtimes", []):
+            if build not in ios.get("runtimes", []) and build not in ios.get("allowed", []):
                 out.append((f"extra iOS simulator runtime {r['full']} ({build})",
                             f"xcrun simctl runtime delete {build}"))
     names = {(d["runtime"], d["name"]) for d in obs.get("ios_devices", [])}

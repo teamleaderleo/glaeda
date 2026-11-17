@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import base64
 import contextlib
 import copy
 import fcntl
@@ -14334,6 +14335,145 @@ class BrokerAnswerCacheTest(CountingGhBase):
                 self.assertFalse(write(args))
 
 
+class BrokerSupersetTest(CountingGhBase):
+    """A `pr view N` or `run view ID` asking for some fields of a target is printed from a kept read of
+    more of them (gh_cache_superset_get), in the style the kept answer was printed in."""
+
+    PR = {"title": "a <b> & c", "headRefOid": "a" * 40, "baseRefName": "main", "additions": 3,
+          "isCrossRepository": False, "mergedAt": None, "body": "caf\u00e9"}
+
+    def setUp(self) -> None:
+        super().setUp()
+        gh = self.home / "bin" / "gh"
+        gh.write_text(f"#!{sys.executable}\n"
+                      "import json, os, sys\n"
+                      f"count = {str(self.count)!r}\n"
+                      "n = int(open(count).read()) + 1 if os.path.exists(count) else 1\n"
+                      "open(count, 'w').write(str(n))\n"
+                      "a = sys.argv[1:]\n"
+                      f"pr = {json.dumps(self.PR)!r}\n"
+                      "pr = json.loads(pr)\n"
+                      "if '--json' not in a:\n    sys.exit(0)\n"
+                      "want = [f for f in a[a.index('--json') + 1].split(',') if f]\n"
+                      "doc = {f: pr[f] for f in want}\n"
+                      "if '--jq' in a:\n"
+                      "    v = doc[a[a.index('--jq') + 1][1:]]\n"
+                      "    print(v if isinstance(v, str) else json.dumps(v))\n"
+                      "elif os.environ.get('FAKE_GH_STYLE') == 'lane':\n"
+                      "    print(json.dumps(doc, indent=2))\n"
+                      "else:\n"
+                      "    print(json.dumps(doc, sort_keys=True, separators=(',', ':'), ensure_ascii=False))\n")
+        gh.chmod(0o755)
+        self.addCleanup(os.environ.pop, "FAKE_GH_STYLE", None)
+
+    def view(self, fields: str, *extra: str) -> tuple[int, str]:
+        code, out, _err, _ = self.run_gh(["pr", "view", "7", "-R", "o/r", "--json", fields, *extra])
+        return code, out
+
+    def test_a_subset_read_is_printed_from_the_whole_read_as_gh_prints_it(self) -> None:
+        self.view("title,headRefOid,baseRefName,additions,isCrossRepository,mergedAt,body")
+        code, out = self.view("headRefOid,title")
+        self.assertEqual(self.runs(), 1)
+        self.assertEqual((code, out), (0, json.dumps({"headRefOid": "a" * 40, "title": "a <b> & c"},
+                                                     sort_keys=True, separators=(",", ":")) + "\n"))
+        routes = [json.loads(line) for line in gg.broker_log().read_text().splitlines()]
+        self.assertTrue(any(r.get("route") == "cache" and r.get("subset") for r in routes))
+
+    def test_a_jq_path_to_one_value_is_answered_too(self) -> None:
+        self.view("title,headRefOid,additions,mergedAt,isCrossRepository")
+        self.assertEqual(self.view("headRefOid", "--jq", ".headRefOid"), (0, "a" * 40 + "\n"))
+        self.assertEqual(self.view("additions", "--jq", ".additions"), (0, "3\n"))
+        self.assertEqual(self.view("mergedAt", "--jq", ".mergedAt"), (0, "null\n"))
+        self.assertEqual(self.view("isCrossRepository", "-q", ".isCrossRepository"), (0, "false\n"))
+        self.assertEqual(self.runs(), 1)
+
+    def test_a_lane_vm_answer_is_printed_in_its_own_style_and_order(self) -> None:
+        os.environ["FAKE_GH_STYLE"] = "lane"
+        self.view("title,headRefOid,baseRefName,body")
+        code, out = self.view("headRefOid,title")
+        self.assertEqual(self.runs(), 1)
+        self.assertEqual(out, json.dumps({"headRefOid": "a" * 40, "title": "a <b> & c"}, indent=2) + "\n")
+
+    def test_a_field_the_kept_read_lacks_asks_github(self) -> None:
+        self.view("title,headRefOid")
+        _code, out = self.view("headRefOid,baseRefName")
+        self.assertEqual(self.runs(), 2)
+        self.assertIn("main", out)
+
+    def test_a_jq_that_is_not_a_plain_path_asks_github(self) -> None:
+        self.view("title,headRefOid")
+        self.view("title", "--jq", ".title | length")
+        self.assertEqual(self.runs(), 2)
+
+    def test_the_kept_read_obeys_the_callers_ttl_and_writes(self) -> None:
+        self.view("title,headRefOid")
+        os.environ["GLAEDA_GH_CACHE_TTL"] = "0"
+        _code, out, _err, execed = self.run_gh(["pr", "view", "7", "-R", "o/r", "--json", "headRefOid"])
+        self.assertEqual((out, execed), ("", ["pr", "view", "7", "-R", "o/r", "--json", "headRefOid"]),
+                         "TTL 0 is a read now, superset or not: gh runs")
+        os.environ["GLAEDA_GH_CACHE_TTL"] = "60"
+        self.run_gh(["pr", "comment", "7", "-R", "o/r", "--body", "hi"])
+        before = self.runs()
+        self.view("title")
+        self.assertEqual(self.runs(), before + 1, "a write to the PR drops the kept read for its subsets too")
+
+    def test_another_pr_is_another_target(self) -> None:
+        self.view("title,headRefOid")
+        self.run_gh(["pr", "view", "8", "-R", "o/r", "--json", "title"])
+        self.assertEqual(self.runs(), 2)
+
+    def test_an_answer_printed_differently_is_never_reshaped(self) -> None:
+        self.view("title,headRefOid")
+        for path in gg.gh_cache_dir().glob("*.json"):
+            doc = json.loads(path.read_text())
+            if "out" in doc:
+                doc["out"] = base64.b64encode(b'{"headRefOid": "x", "title": "y"}\n').decode()
+                path.write_text(json.dumps(doc))
+        self.view("title")
+        self.assertEqual(self.runs(), 2)
+
+
+class BrokerWriteScopeTest(CountingGhBase):
+    """What a write stamps (gh_cache_write_scope)."""
+
+    def test_update_branch_moves_one_pr_not_every_pr(self) -> None:
+        for args in (["pr", "update-branch", "7", "-R", "o/r"], ["api", "-X", "PUT", "repos/o/r/pulls/7/update-branch"]):
+            words, method, _seen, values = gg.broker_words(args)
+            with self.subTest(args=args):
+                repo, scopes = gg.gh_cache_write_scope(args, words, method, values)
+                self.assertEqual((repo, set(scopes)), ("o/r", {"pr 7", "runlists", "other"}))
+
+    def test_merge_still_moves_every_pr(self) -> None:
+        args = ["pr", "merge", "7", "-R", "o/r", "--squash"]
+        words, method, _seen, values = gg.broker_words(args)
+        self.assertIn("prs", gg.gh_cache_write_scope(args, words, method, values)[1])
+
+    def test_another_prs_answer_survives_an_update_branch(self) -> None:
+        read = ["pr", "view", "8", "-R", "o/r", "--json", "mergeable"]
+        self.run_gh(read)
+        self.run_gh(["pr", "update-branch", "7", "-R", "o/r"])
+        self.run_gh(read)
+        self.assertEqual(self.runs(), 2, "the read once, the write once")
+
+    def test_a_write_in_a_checkout_of_several_remotes_stamps_those_repositories(self) -> None:
+        where = self.git_checkout(self.home / "roots" / "fork",
+                                  '[remote "origin"]\n\turl = git@github.com:me/r.git\n'
+                                  '[remote "upstream"]\n\turl = git@github.com:o/r.git\n')
+        args = ["pr", "edit", "7", "--add-label", "x"]
+        words, method, _seen, values = gg.broker_words(args)
+        with mock.patch.object(gg.Path, "cwd", staticmethod(lambda: where)):
+            repo, scopes = gg.gh_cache_write_scope(args, words, method, values)
+        self.assertEqual((repo, scopes), (["me/r", "o/r"], []))
+        gg.gh_cache_note_write(repo, time.time(), scopes)
+        self.assertEqual(set(gg.gh_cache_writes()), {"me/r", "o/r"})
+
+    def test_a_write_outside_any_checkout_still_stamps_everything(self) -> None:
+        args = ["pr", "edit", "7", "--add-label", "x"]
+        words, method, _seen, values = gg.broker_words(args)
+        with mock.patch.object(gg.Path, "cwd", staticmethod(lambda: self.home)):
+            self.assertEqual(gg.gh_cache_write_scope(args, words, method, values), (None, []))
+
+
 class BrokerAnswerHitRateTest(CountingGhBase):
     """What raised the answer cache's hit rate (2026-10-31): one key per question however it is spelled,
     write stamps no wider than what the write changes, a 90 s window, the daemon's own copy of a PR or
@@ -16421,6 +16561,7 @@ class LandWorld:
         self.calls: list[list[str]] = []
         self.envs: list[dict] = []
         self.gh_rc: dict[str, int] = {}
+        self.gh_err: dict[str, str] = {}  # a refused step's stderr, by kind (default "<kind> refused")
         self.merged_on_merge = True
         self.raise_on: str | None = None
         self.nudged: list[str] = []
@@ -16461,7 +16602,7 @@ class LandWorld:
             kind = "merge" if words[:2] == ["pr", "merge"] else "update" if "update-branch" in " ".join(words) \
                 else "rerun" if words[:2] == ["run", "rerun"] else "edit" if words[:2] == ["pr", "edit"] else "other"
             rc = self.gh_rc.get(kind, 0)
-            return subprocess.CompletedProcess(argv, rc, "", "" if rc == 0 else f"{kind} refused")
+            return subprocess.CompletedProcess(argv, rc, "", "" if rc == 0 else self.gh_err.get(kind, f"{kind} refused"))
         return subprocess.CompletedProcess(argv, 127, "", "unknown program")
 
     def explains(self) -> list[list[str]]:
@@ -16783,9 +16924,129 @@ class LandTest(Base):
         self.w.gh_rc["merge"] = 1
         self.w.answers += [ok_answer(LA), refusal("block", LA, {"kind": "stop", "stop": "block"})]
         e = self.tick()
-        self.assertEqual((e["state"], e["streak"]["count"]), ("waiting", 1))
+        self.assertEqual((e["state"], e["stepFail"]["count"], e["wakeAt"] - self.t), ("waiting", 1, 60.0))
         e = self.tick(6)
+        self.assertEqual(len(self.w.explains()), 1)  # never re-judged on a short timer
+        e = self.tick(60)
         self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "block"))
+
+    def run_hour(self, answer, seconds: float = 3600.0, step: float = 10.0) -> dict:
+        """Tick for SECONDS, every merge_hold explain answered by ANSWER(): what the loop did."""
+        end = self.t + seconds
+        e: dict = {}
+        while self.t < end:
+            while len(self.w.answers) < 2:
+                self.w.answers.append(answer())
+            e = self.tick(step)
+            if e.get("state") in gg.LAND_DONE:
+                break
+        return e
+
+    def test_ok_then_merge_refused_at_the_same_head_backs_off_and_stops(self):
+        # cmux#45102, 2026-11-17: explain "ok, merge" and the pinned merge refused after it, 27 times in 59 min.
+        self.pr(LA)
+        self.land()
+        self.w.gh_rc["merge"] = 1
+        self.w.gh_err["merge"] = "merge-hold (warn): ... it lands anyway\nGraphQL: Pull request is not mergeable"
+        e = self.run_hour(lambda: ok_answer(LA))
+        merges = len(self.w.gh_calls("pr", "merge"))
+        self.assertEqual((e["state"], e["stop"]["code"], merges, len(self.w.explains())),
+                         ("stopped", "merge_refused", gg.LAND_STEP_STOP, gg.LAND_STEP_STOP))
+        waits = [round(b["at"] - a["at"]) for a, b in zip(
+            [h for h in e["history"] if h["event"] == "step_refused"],
+            [h for h in e["history"] if h["event"] == "judged"][1:])]
+        self.assertEqual(waits, [60, 120, 240, 480, 960])
+        self.assertIn("refused 6 times in a row", self.w.sent()[-1][-1])
+
+    def test_a_new_head_starts_the_count_again(self):
+        self.pr(LA)
+        self.land()
+        self.w.gh_rc["merge"] = 1
+        self.w.answers.append(ok_answer(LA))
+        e = self.tick()
+        self.assertEqual(e["stepFail"]["count"], 1)
+        self.pr(LB)
+        self.w.answers.append(ok_answer(LB))
+        e = self.tick()  # a moved head is judged at once, not after the backoff
+        self.assertEqual((len(self.w.explains()), e["stepFail"]["count"], e["stepFail"]["head"]), (2, 1, LB))
+
+    def test_a_merge_refusal_naming_update_branch_takes_it(self):
+        self.pr(LA)
+        self.land()
+        self.w.gh_rc["merge"] = 1
+        self.w.gh_err["merge"] = ("merge-hold: refused [tip_merge]: the base's checks have not run on this PR merged "
+                                  f"with the tip; next: gh api -X PUT repos/o/r/pulls/1/update-branch -f "
+                                  f"expected_head_sha={LA} (why: guard-why)")
+        self.w.answers.append(ok_answer(LA))
+        e = self.tick()
+        self.assertEqual(self.w.gh_calls("api"), [["api", "-X", "PUT", "repos/o/r/pulls/1/update-branch", "-f",
+                                                   f"expected_head_sha={LA}"]])
+        self.assertEqual((e["wait"]["kind"], len(self.w.explains())), ("head_change", 1))
+
+    def test_a_merge_refusal_naming_a_wait_waits_on_the_cache(self):
+        self.pr(LA)
+        self.land()
+        self.w.gh_rc["merge"] = 1
+        self.w.gh_err["merge"] = ("merge-hold: refused [checks_running]: checks still running; next: glaeda-gh wait "
+                                  f"pr o/r#1 --until done --sha {LA} --timeout 900 (why: guard-why)")
+        self.w.answers.append(ok_answer(LA))
+        e = self.tick()
+        self.assertEqual((e["wait"]["kind"], e["wakeAt"] - self.t), ("pr", 900.0))
+        for _ in range(30):
+            self.tick(20)
+        self.assertEqual(len(self.w.explains()), 1)  # an event wait: nothing re-judges until the cache moves
+        self.pr(LA, checks=[("ci", "COMPLETED", "SUCCESS"), ("other", "COMPLETED", "SUCCESS")])
+        self.w.answers.append(refusal("block", LA, {"kind": "stop", "stop": "block"}))
+        self.tick()
+        self.assertEqual(len(self.w.explains()), 2)
+
+    def test_update_branch_refused_at_the_same_head_backs_off_and_stops(self):
+        # cmux#44496, 2026-11-17: 30 update-branch steps in 40 min, each refused on the lane VM before GitHub.
+        self.pr(LA)
+        self.land()
+        self.w.gh_rc["update"] = 1
+        self.w.gh_err["update"] = "gh: gh api -X PUT: only a media upload goes through the broker."
+        e = self.run_hour(lambda: refusal("stale_green", LA, {"kind": "update_branch", "expected_head_sha": LA}))
+        # The judge's own streak (stale_green, this head, update_branch) is no longer reset by the step's refusal, so
+        # the third identical judgment stops it: two update-branch steps, 60 s apart, not 30.
+        self.assertEqual((e["state"], e["stop"]["code"], len(self.w.gh_calls("api"))), ("stopped", "stale_green", 2))
+        steps = [h["at"] for h in e["history"] if h["event"] == "step"]
+        self.assertEqual(round(steps[1] - steps[0]), 60)
+
+    def test_no_update_branch_while_the_heads_checks_run(self):
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(refusal("tip_merge", LA, {"kind": "update_branch", "expected_head_sha": LA}))
+        self.tick()
+        self.pr(LB, checks=[("ci", "COMPLETED", "SUCCESS")])
+        self.w.answers.append(refusal("tip_merge", LB, {"kind": "update_branch", "expected_head_sha": LB}))
+        e = self.tick()
+        self.assertEqual(len(self.w.gh_calls("api")), 2)
+        self.assertEqual(e["updatedHead"], LB)
+        self.assertIn("update_again", [h["event"] for h in e["history"]])
+        # a woken retry judges while checks run at the head: the update waits for them instead
+        self.pr(LC, checks=[("ci", "IN_PROGRESS", None)])
+        e = self.q.entries[self.KEY]
+        self.w.answers.append(refusal("tip_merge", LC, {"kind": "update_branch", "expected_head_sha": LC}))
+        self.q.judge(e, LC, gg.land_fingerprint(self.w.cache[self.KEY]))
+        self.assertEqual((len(self.w.gh_calls("api")), e["wait"]["kind"]), (2, "pr"))
+        self.assertIn("update_deferred", [h["event"] for h in e["history"]])
+
+    def test_steps_write_as_the_requesters_lane_on_this_host(self):
+        # gcp-agent-lane-3, 2026-11-17: lane-gh refused every merge and update-branch "land: lease acquisition requires
+        # a lane session" (this queue strips the session keys), so none reached the broker.
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(ok_answer(LA))
+        with mock.patch.object(gg, "policy_host", lambda: "host"):
+            self.tick()
+        by = {tuple(c[1:3]): env for c, env in zip(self.w.calls, self.w.envs)}
+        self.assertEqual(by[("pr", "merge")].get("LANE_GH_LANE"), "lane")
+        self.assertEqual(by[("pr", "merge")]["CMUX_AGENT_SESSION"], "glaeda-land")  # still charged to the queue
+        self.assertNotIn("LANE_GH_LANE", by[(self.w.mh, "explain")])  # a read needs no lane
+        # a requester on another host names no lane
+        self.assertEqual(gg.land_lane({"requester": "other/lane"}), "")
+        self.assertEqual(gg.land_lane({"requester": ""}), "")
 
     def test_calls_carry_the_land_tags_and_no_session_keys(self):
         self.pr(LA)
