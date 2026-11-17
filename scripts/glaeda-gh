@@ -5171,7 +5171,7 @@ class Daemon:
                 # blocker saves; review of glaeda#1942).
                 # Nor while the upstream's own alarm covers it, unless this host can read the one target itself
                 # (direct_command): the upstream may not read a new head for many minutes, and a wait on it then
-                # times out on the superseded one (gcp-agent-lane-3, cmux#44462, 2026-11-16).
+                # times out on the superseded one (one lane VM, cmux#44462, 2026-11-16).
                 explained = self.stale_explained(req.get("kind"))
                 if explained == "upstream" and direct_command() is not None:
                     explained = None
@@ -6820,7 +6820,7 @@ LAND_MERGE_HOLD = Path.home() / ".local/share/ws-sync/deploy/tools/merge_hold.py
 # Where merge_hold.py is, in order, after land.json's mergeHold: the ws-sync deploy (Leo's own hosts), then the
 # leo-workspace checkout (a lane VM has no ws-sync deploy). The first that exists is run. When none does, a land stops
 # at once with merge_hold_missing naming every path tried. Before, python exited 2 ("can't open file"), every job judged
-# explain_failed and retried, and `land status` read like quota trouble (gcp-agent-lane-3, 2026-11-17).
+# explain_failed and retried, and `land status` read like quota trouble (one lane VM, 2026-11-17).
 LAND_MERGE_HOLD_PATHS = (LAND_MERGE_HOLD, Path.home() / "Projects/leo-workspace/tools/merge_hold.py")
 # The land worker's startup check: with no merge_hold.py at any of those paths it refuses to start (no entry is judged
 # or stepped; the daemon itself runs on), writes why to land/refused.json, and `glaeda-gh land` refuses to queue. It is
@@ -12429,7 +12429,7 @@ GH_CACHE_RUN_WRITES = {"rerun", "cancel"}
 GH_CACHE_BASE_WRITES = {"merge"}
 # Verbs that move one PR's head and nothing else: `update-branch` merges the base into the PR's own
 # branch, so the base -- and every other PR's mergeability -- is what it was. Until 2026-11-17 it was
-# stamped as a base write, and on gcp-agent-lane-3 the land loop's 471 update-branch calls a day dropped
+# stamped as a base write, and on one lane VM the land loop's 471 update-branch calls a day dropped
 # every PR answer of manaflow-ai/cmux each time. A stacked PR whose base is this PR's branch can see its
 # mergeability move; that is bounded by the TTL and the daemon's watch, as a push from another host is.
 GH_CACHE_HEAD_WRITES = {"update-branch"}
@@ -12709,7 +12709,7 @@ def gh_cache_target(words: list[str], values: dict[str, str], repo: str | None) 
 #
 # The answer cache above keys a call on its whole line, so `pr view 7 --json title,headRefOid,...` and,
 # a second later, `pr view 7 --json headRefOid --jq .headRefOid` were two questions and two requests.
-# Measured on gcp-agent-lane-3 (2026-11-17, 24 h of the call log): half of all `pr view` calls (2,028 of
+# Measured on one lane VM (2026-11-17, 24 h of the call log): half of all `pr view` calls (2,028 of
 # 4,037) re-read a PR read within 15 s, yet the broker answered 75 of 3,241 it could key, because the
 # callers ask for different field sets: merge_hold's hold read takes 15 fields, its head read one.
 #
