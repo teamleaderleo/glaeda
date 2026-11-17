@@ -253,7 +253,8 @@ effect without a restart.
   steps taken per day, which `land status` prints); ~/.config/glaeda/land.json may set gh, mergeHold, acpmux,
   routerReview, python, workers and env. merge_hold.py is mergeHold, else the ws-sync deploy's, else
   ~/Projects/leo-workspace/tools/merge_hold.py; with none of them the land worker refuses to start (land/refused.json,
-  which `land status` prints) and `land` refuses to queue (merge_hold_missing). On a lane VM (an upstream host) the
+  which `land status` prints) and `land` refuses to queue (merge_hold_missing). router-review is routerReview, else
+  the first of ~/.local/bin, the ws-sync deploy's tools/ and the leo-workspace checkout's tools/, else PATH. On a lane VM (an upstream host) the
   worker reads a landing PR itself through the broker when the upstream's copy is over LAND_REFRESH_AFTER old.
   A quota refusal (merge_hold's, or the shim's on the merge) parks the PR until the reset it names plus a 0-120 s
   per-caller jitter, with no read, judge, watch or nudge before it (`land status`: "parked until HH:MMZ (quota)");
@@ -7115,6 +7116,27 @@ def land_merge_hold_missing(tried: list[Path]) -> tuple[str, str]:
     return why, nxt
 
 
+# Where router-review is, in order, after land.json's routerReview: ~/.local/bin (a host that links it there), the
+# ws-sync deploy's tools/, the leo-workspace checkout's tools/, then the daemon's PATH. The first that exists is run.
+# Before, only ~/.local/bin/router-review was tried, and on a host with no such link every review step stopped
+# review_failed with FileNotFoundError (cmux#45626, 2026-11-17).
+LAND_ROUTER_REVIEW_PATHS = (Path.home() / ".local/bin/router-review", LAND_MERGE_HOLD.parent / "router-review",
+                            Path.home() / "Projects/leo-workspace/tools/router-review")
+
+
+def land_router_review(config: dict) -> tuple[Path | None, list[Path]]:
+    """(the router-review to run, or None; every path tried): CONFIG's routerReview as given (a path set by hand is
+    run, and its own failure stops review_failed), else the first of LAND_ROUTER_REVIEW_PATHS that is executable,
+    else router-review on PATH."""
+    given = config.get("routerReview")
+    if isinstance(given, str) and given:
+        return Path(os.path.expanduser(given)), [Path(os.path.expanduser(given))]
+    tried = list(LAND_ROUTER_REVIEW_PATHS)
+    found = next((p for p in tried if p.is_file() and os.access(p, os.X_OK)), None)
+    on_path = None if found else shutil.which("router-review")
+    return (Path(on_path) if on_path else found), tried + ([] if found else [Path("$PATH/router-review")])
+
+
 # The startup check's second half: merge_hold.py found is in a git checkout (on a lane VM, ~/Projects/leo-workspace)
 # that may sit far behind main when nothing deploys it. gcp-codex-lane-12, 2026-11-17: its checkout sat at
 # leo-workspace#5512 while main moved on, and its old merge_hold could not read main's TWINS (after #5580), so every
@@ -8880,7 +8902,12 @@ class LandQueue:
                           "run around it", f"router-review {repo} {number} --post")
                 return
             else:
-                rr = self.path("routerReview", Path.home() / ".local/bin/router-review")
+                rr, tried = land_router_review(self.config())
+                if rr is None:
+                    self.stop(e, "review_failed", "router-review is not at any of " + ", ".join(map(os.fspath, tried)),
+                              f'set "routerReview" in {LAND_CONFIG} to router-review\'s path, then '
+                              f"router-review {repo} {number} --post")
+                    return
                 e["reviewed"] = (e["reviewed"] + [key])[-10:]  # saved by the claim: a restart never posts it twice
                 self.claim(e, "review", head=head)
                 logs = land_dir() / "logs"

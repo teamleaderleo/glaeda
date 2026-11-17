@@ -18036,6 +18036,41 @@ class LandTest(Base):
             e = self.tick()
         self.assertEqual((e["state"], e["stop"]["code"], e["reviewed"]), ("stopped", "review_failed", []))
 
+    def test_router_review_unset_is_found_in_the_workspace_tools_not_only_local_bin(self):
+        # cmux#45626: a host with no ~/.local/bin/router-review link stopped every review with FileNotFoundError.
+        with tempfile.TemporaryDirectory() as d:
+            home = Path(d)
+            tools = home / "Projects/leo-workspace/tools"
+            tools.mkdir(parents=True)
+            rr = tools / "router-review"
+            rr.write_text("#!/bin/sh\n")
+            rr.chmod(0o755)
+            paths = (home / ".local/bin/router-review", home / "deploy/tools/router-review", rr)
+            with mock.patch.object(gg, "LAND_ROUTER_REVIEW_PATHS", paths), \
+                    mock.patch.object(gg.shutil, "which", return_value=None):
+                self.assertEqual(gg.land_router_review({}), (rr, list(paths[:3])))
+                self.assertEqual(gg.land_router_review({"routerReview": "/given/rr"})[0], Path("/given/rr"))
+                rr.unlink()
+                found, tried = gg.land_router_review({})
+                self.assertIsNone(found)
+                self.assertEqual(tried[-1], Path("$PATH/router-review"))
+            with mock.patch.object(gg, "LAND_ROUTER_REVIEW_PATHS", paths), \
+                    mock.patch.object(gg.shutil, "which", return_value="/usr/bin/router-review"):
+                self.assertEqual(gg.land_router_review({})[0], Path("/usr/bin/router-review"))
+
+    def test_no_router_review_anywhere_stops_naming_every_path_and_is_not_marked_run(self):
+        self.pr(LA)
+        self.land()
+        self.q.config_given = {k: v for k, v in self.q.config().items() if k != "routerReview"}
+        self.w.answers.append(refusal("no_ship", LA, {"kind": "review"}))
+        with mock.patch.object(gg, "LAND_ROUTER_REVIEW_PATHS", (Path("/nowhere/router-review"),)), \
+                mock.patch.object(gg.shutil, "which", return_value=None), \
+                mock.patch.object(gg.subprocess, "Popen", side_effect=AssertionError("ran router-review")):
+            e = self.tick()
+        self.assertEqual((e["state"], e["stop"]["code"], e["reviewed"]), ("stopped", "review_failed", []))
+        self.assertIn("/nowhere/router-review", e["stop"]["reason"])
+        self.assertIn("routerReview", e["stop"]["next"])
+
     def test_restart_after_an_interrupted_update_branch_waits_for_the_new_head(self):
         self.pr(LA)
         self.land()
