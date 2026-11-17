@@ -246,6 +246,64 @@ class RunnerHygieneTest(unittest.TestCase):
                 self.assertRaises(SystemExit):
             rh.main(["--user", self.account.name, "--check", "--apply"])
 
+    def ledger(self) -> "rh.Install":
+        (self.base / rh.CDU_SOURCE_NAME).write_text("int main(void) { return 0; }\n")
+        return rh.build_ledger_install(self.source, Path("/usr/bin/python3"), self.base / "root-ledger",
+                                       self.daemons, self.launchctl) if os.getuid() == 0 else rh.Install(
+            rh.ROOT_ACCOUNT, Path("/usr/bin/python3"), self.source, self.base / "root-ledger",
+            self.base / "root-ledger/bin", self.base / "root-ledger/bin" / rh.DISK_NAME,
+            self.base / "root-ledger/bin" / rh.MANIFEST_NAME, self.daemons / f"{rh.LEDGER_LABEL}.plist",
+            rh.LEDGER_LABEL, self.launchctl, ledger=True)
+
+    def test_root_ledger_daemon_runs_as_root_hourly_and_only_reports(self) -> None:
+        install = self.ledger()
+        plist = rh.plist_for(install)
+        self.assertNotIn("UserName", plist, "root: only root reads every directory and every open-deleted file")
+        self.assertEqual(plist["ProgramArguments"], ["/usr/bin/python3", "-I", str(install.snapshot), "--root-ledger"])
+        self.assertEqual(plist["StartInterval"], 3600)
+        self.assertEqual((plist["Nice"], plist["LowPriorityIO"], plist["ProcessType"]), (10, True, "Background"))
+        self.assertNotIn("--apply", plist["ProgramArguments"])
+        before = sorted(self.base.rglob("*"))
+        self.assertEqual(rh.plan(install)["operation"], "install")
+        self.assertEqual(before, sorted(self.base.rglob("*")), "planning has no side effects")
+        # a runner account's plist under the ledger's label is not the ledger's, and the other way round
+        install.plist.write_bytes(rh.plist_bytes(self.install))
+        with self.assertRaisesRegex(rh.HygieneError, "not a glaeda-runner-hygiene"):
+            rh.plan(install)
+
+    def test_root_ledger_install_may_hold_only_its_walker_beside_the_snapshot(self) -> None:
+        install = self.ledger()
+        for d in (install.install_dir, self.install.install_dir):
+            d.mkdir(parents=True)
+            d.chmod(0o755)
+            os.chown(d, -1, os.getgid())
+            (d / rh.CDU_NAME).write_bytes(b"\x7fELF")
+            (d / rh.MANIFEST_NAME).write_text("{}")
+        with self.owned():
+            # past the name check, a walker that is not root-protected is refused
+            self.assertEqual(rh._managed_install(install)[1], "glaeda-cdu is not a root-owned, protected file")
+            (install.install_dir / rh.CDU_NAME).chmod(0o555)
+            os.chown(install.install_dir / rh.CDU_NAME, -1, os.getgid())
+            self.assertNotIn(rh._managed_install(install)[1], {"install directory contains unrelated files",
+                                                              "glaeda-cdu is not a root-owned, protected file"})
+            # a runner account's install never holds a walker
+            self.assertEqual(rh._managed_install(self.install), (False, "install directory contains unrelated files"))
+
+    def test_root_ledger_without_a_compiler_installs_with_the_du_fallback(self) -> None:
+        install = self.ledger()
+        built, why = rh.build_cdu(install, cc=self.base / "no-cc")
+        self.assertIsNone(built)
+        self.assertIn("no compiler", why)
+        (self.base / rh.CDU_SOURCE_NAME).unlink()
+        self.assertIn("no glaeda-cdu.c", rh.build_cdu(install)[1])
+
+    def test_root_ledger_and_user_are_one_or_the_other(self) -> None:
+        with mock.patch.object(rh.platform, "system", return_value="Darwin"), \
+                mock.patch("sys.stderr"):
+            for argv in ([], ["--root-ledger", "--user", self.account.name]):
+                with self.assertRaises(SystemExit):
+                    rh.main(argv)
+
 
 if __name__ == "__main__":
     unittest.main()

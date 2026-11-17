@@ -58,6 +58,8 @@ gd.reap_tmpdir_test_residue = (lambda receipt, tmp=None, halt=None, runner_host=
 # Nor start a background volume census, or read the real host's census, from a test.
 gd.CENSUS_AUTOLAUNCH = False
 gd.CENSUS_STATE = Path(_NO_RESERVATIONS.name + ".census-none.json")
+# Nor read the real host's root ledger into a test's health summary.
+gd.ROOT_LEDGER_LATEST = Path(_NO_RESERVATIONS.name + ".root-ledger-none.json")
 # Nor git gc the clones in the real home of the host running the suite: only a test's own home is gc'd.
 _gc_home_clones = gd.gc_home_clones
 gd.gc_home_clones = lambda receipt, home=None, halt=None: 0 if home is None else _gc_home_clones(receipt, home, halt)
@@ -12529,6 +12531,152 @@ class DeadItemsTest(unittest.TestCase):
         self.assertTrue(old_dd.exists(), "not a dead family")
         with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
             gd.main(["--dead", "--pressure", "--no-snapshot"])
+
+
+class RootLedgerTest(unittest.TestCase):
+    """glaeda-disk --root-ledger: root, clone-aware accounting with deltas; report only."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.base = Path(self.tmp.name).resolve()
+        self.state = self.base / "state"
+        self.vol = self.base / "vol"
+        (self.vol / "a/b").mkdir(parents=True)
+        (self.vol / "a/b/f").write_bytes(b"x" * 300_000)
+        (self.vol / "c").mkdir()
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def test_root_ledger_parses_cdu_records(self) -> None:
+        walk = gd.parse_cdu("V\t1000\t400\t300\t900\t50\nE\t1\t/v/locked\nD\t4096\t1\t/v/a\tb\n"
+                            "D\t8192\t3\t/v\nT\t8192\t3\t2\t1\t0\t2\t65536\t0\n")
+        self.assertEqual(walk["paths"], {"/v/a\tb": 4096, "/v": 8192})
+        self.assertEqual((walk["total"], walk["files"], walk["errors"], walk["partial"], walk["shared_saved"]),
+                         (8192, 3, 1, False, 65536))
+        self.assertEqual(walk["error_paths"], ["/v/locked"])
+        self.assertEqual(walk["volume"]["important_avail"], 900)
+        self.assertTrue(gd.parse_cdu("D\t1\t1\t/v\n")["partial"], "no T record: the walk did not finish")
+
+    def test_root_ledger_open_deleted_counts_each_inode_once_by_process(self) -> None:
+        lsof = ("p10\ncchronod\nf5\nD0x10\ni7\ns1000\nk0\nf6\nD0x10\ni8\ns500\nk0\n"
+                "p11\ncchronod\nf3\nD0x10\ni7\ns1000\nk0\n"  # the same file, another holder: once
+                "p12\ncdiskimages-help\nf9\nD0x10\ni9\ns4000\nk0\n"
+                "p13\ncother\nf1\nD0x20\ni9\ns99999\nk0\n"  # another volume: not this volume's bytes
+                "p14\ncnamed\nf1\nD0x10\ni10\ns77777\nk1\n")  # still linked: not open-deleted
+        doc = gd.parse_lsof_deleted(lsof, 0x10)
+        self.assertEqual(doc["bytes"], 5500)
+        self.assertEqual(doc["all_volumes_bytes"], 5500 + 99999)
+        self.assertEqual([(r["command"], r["bytes"], r["pids"]) for r in doc["by_process"]],
+                         [("diskimages-help", 4000, [12]), ("chronod", 1500, [10, 11])])
+
+    def test_root_ledger_alarm_names_the_largest_unexplained_cause(self) -> None:
+        gib = gd.GIB
+        walk = {"total": 80 * gib, "partial": False, "errors": 0}
+        vol = {"used": 100 * gib, "purgeable": 12 * gib, "inodes_used": 1_000_000}
+        with mock.patch.object(gd, "DARWIN", True):
+            acct = gd.ledger_account(vol, walk, {"bytes": 3 * gib})
+        self.assertTrue(acct["alarm"])
+        self.assertEqual(acct["coverage"], 0.83)
+        self.assertTrue(acct["largest_unexplained"]["cause"].startswith("purgeable"))
+        self.assertEqual(sum(c["bytes"] for c in acct["causes"]), acct["gap"], "every byte of the gap gets a name")
+        with mock.patch.object(gd, "DARWIN", True):
+            acct = gd.ledger_account(vol, {**walk, "total": 96 * gib, "errors": 4}, {"bytes": 2 * gib})
+        self.assertFalse(acct["alarm"])
+        with mock.patch.object(gd, "DARWIN", False):
+            acct = gd.ledger_account({**vol, "purgeable": None}, {**walk, "errors": 4}, {"bytes": 0})
+        self.assertTrue(acct["largest_unexplained"]["cause"].startswith("unreadable: 4"))
+
+    def run_ledger(self, now: float, cdu: Path | None = None) -> dict:
+        with mock.patch.object(gd, "ledger_open_deleted",
+                               return_value={"bytes": 0, "files": 0, "by_process": []}), \
+                mock.patch.object(gd, "ROOT_LEDGER_PATH_FLOOR", 0):
+            return gd.root_ledger_run(self.state, self.vol, cdu, 2, 60, 14, now)
+
+    def test_root_ledger_snapshots_deltas_and_bounded_retention_with_the_du_fallback(self) -> None:
+        old = self.state / "snapshots/ledger-1000000000.json"
+        old.parent.mkdir(parents=True)
+        old.write_text("{}")
+        keep = self.state / "snapshots/operator-note.json"
+        keep.write_text("{}")
+        now = time.time()
+        first = self.run_ledger(now - 86400, cdu=self.base / "missing-cdu")
+        self.assertEqual((first["walk"]["tool"], first["walk"]["clone_aware"]), ("du", False))
+        self.assertGreater(first["account"]["walk_bytes"], 300_000)
+        self.assertFalse(old.exists(), "a snapshot past 14 days is pruned")
+        self.assertTrue(keep.exists(), "only the ledger's own snapshots are ever removed")
+        (self.vol / "c/new").write_bytes(b"y" * 2_000_000)
+        second = self.run_ledger(now)
+        grown = {r["path"]: r for r in second["deltas"]["paths"]}
+        self.assertGreater(grown[os.fspath(self.vol / "c")]["delta"], 1_900_000)
+        self.assertEqual(second["deltas"]["since"], int(now - 86400))
+        self.assertIn("walk_bytes", second["deltas"]["totals"])
+        self.assertTrue((self.vol / "a/b/f").exists() and (self.vol / "c/new").exists(), "report only")
+        latest = json.loads((self.state / "latest.json").read_text())
+        self.assertEqual(latest["schema"], gd.ROOT_LEDGER_SCHEMA)
+        self.assertNotIn("paths", latest, "latest.json stays bounded; the full path map is in the snapshot")
+        self.assertEqual(stat.S_IMODE((self.state / "latest.json").stat().st_mode), 0o644)
+        self.assertEqual(len(gd.ledger_snapshots(self.state)), 2)
+
+    def test_root_ledger_walks_with_glaeda_cdu_under_its_time_bound(self) -> None:
+        cdu = self.base / "glaeda-cdu"
+        argv_log = self.base / "argv"
+        cdu.write_text(f"#!/bin/sh\necho \"$@\" > {argv_log}\n"
+                       "printf 'V\\t100\\t10\\t10\\t30\\t5\\nD\\t70\\t2\\t%s\\nT\\t70\\t2\\t1\\t0\\t1\\t1\\t50\\t0\\n' \"$7\"\n")
+        cdu.chmod(0o755)
+        latest = self.run_ledger(time.time(), cdu=cdu)
+        self.assertEqual(argv_log.read_text().split()[:6], ["-v", "-d", "2", "-t", "60", os.fspath(self.vol)])
+        self.assertEqual((latest["walk"]["tool"], latest["walk"]["partial"]), ("glaeda-cdu", True))
+        self.assertTrue(latest["account"]["largest_unexplained"]["cause"].startswith("walk-incomplete"))
+
+    def test_root_ledger_waits_while_a_job_holds_the_host_and_runs_daily(self) -> None:
+        argv = ["--root-ledger", "--state-dir", os.fspath(self.state), "--root", os.fspath(self.vol),
+                "--cdu", os.fspath(self.base / "none")]
+        quiet = {"return_value": {"bytes": 0, "files": 0, "by_process": []}}
+        with mock.patch.object(gd, "host_busy", return_value="a CI job is running (Runner.Worker)"), \
+                mock.patch.object(gd, "ledger_open_deleted", **quiet), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(gd.main(argv), 0)
+        self.assertIn("a CI job is running", out.getvalue())
+        self.assertEqual(gd.ledger_snapshots(self.state), [])
+        with mock.patch.object(gd, "host_busy", return_value=""), \
+                mock.patch.object(gd, "ledger_open_deleted", **quiet), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(gd.main(argv), 0)
+            self.assertEqual(json.loads(out.getvalue().splitlines()[-1])["state"], "done")
+            self.assertEqual(gd.main(argv), 0)
+        self.assertIn("not due", out.getvalue())
+        self.assertEqual(len(gd.ledger_snapshots(self.state)), 1)
+        with mock.patch.object(gd, "host_busy", return_value="a build is running (xcodebuild)"), \
+                mock.patch.object(gd, "ledger_open_deleted", **quiet), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(gd.main([*argv, "--force"]), 0)
+        self.assertEqual(json.loads(out.getvalue())["state"], "done", "--force runs on a busy host and when not due")
+
+    def test_root_ledger_alarm_reaches_the_health_summary(self) -> None:
+        gib = gd.GIB
+        latest = self.state / "latest.json"
+        now = time.time()
+        doc = {"schema": gd.ROOT_LEDGER_SCHEMA, "at": int(now), "walk": {"tool": "glaeda-cdu", "partial": False},
+               "volume": {"purgeable": 9 * gib},
+               "open_deleted": {"by_process": [{"command": "chronod", "bytes": 5 * gib, "files": 1, "pids": [9]}]},
+               "account": {"df_used": 100 * gib, "walk_bytes": 80 * gib, "open_deleted_bytes": 5 * gib,
+                           "explained": 85 * gib, "gap": 15 * gib, "coverage": 0.85, "alarm": True,
+                           "largest_unexplained": {"cause": "purgeable: local snapshots", "bytes": 9 * gib}}}
+        gd._ledger_write(latest, doc)
+        summary = self.base / "summary.json"
+        with mock.patch.object(gd, "ROOT_LEDGER_LATEST", latest), mock.patch.object(gd, "HEALTH_SUMMARY", summary):
+            gd.write_health_summary([], [], [])
+        payload = json.loads(summary.read_text())
+        self.assertEqual(payload["schema"], "glaeda-disk/v1")
+        self.assertEqual(payload["root_ledger"]["coverage"], 0.85)
+        self.assertEqual(payload["root_ledger"]["open_deleted_top"][0]["command"], "chronod")
+        found = {f["id"]: f for f in payload["findings"]}
+        self.assertIn("85.0% of df used", found["disk_ledger_gap"]["evidence"])
+        self.assertIn("purgeable", found["disk_ledger_gap"]["evidence"])
+        _block, findings = gd.root_ledger_health(latest, now + 4 * 86400)
+        self.assertIn("disk_ledger_stale", {f["id"] for f in findings})
+        self.assertEqual(gd.root_ledger_health(self.base / "absent.json"), (None, []), "no ledger, no row")
 
 
 if __name__ == "__main__":
