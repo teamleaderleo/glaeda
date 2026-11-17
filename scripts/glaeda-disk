@@ -13597,7 +13597,12 @@ def _main_impl(argv: list[str] | None = None) -> int:
         # the fleet compilation-cache node store's hard cap, on every pressure pass: the runner hook's pass before each
         # job and its floor eviction run this one (glaeda-fleet-cas-prune keeps its own working-set rule)
         if a.pressure and ROLE == "fleet-mini" and not RUNNER_CACHE_PROFILE and not a.cmux_next_drain and not a.family:
-            logical_released += fleet_cas_node_cap()
+            cas_cap = None
+            with contextlib.suppress(OSError):
+                cas_dev = FLEET_CAS_ROOT.stat().st_dev
+                if cache_budget_over(cas_dev) > 0 and cas_dev in fss:
+                    cas_cap = max(2.0, round(fss[cas_dev].total * FLEET_CAS_BUDGET_SHARE / GIB, 1))
+            logical_released += fleet_cas_node_cap(cap_gib=cas_cap)
         # idle simulator devices, on every idle sweep and on a pressure pass while free space is still short of the
         # target: each device is judged on its own, so a busy mini (never idle) still gets them back
         if ((sweep or a.pressure) and DARWIN and ROLE == "fleet-mini" and not RUNNER_CACHE_PROFILE
@@ -13697,25 +13702,39 @@ FLEET_CAS_ROOT = FLEET_ROOT / "xcode"
 FLEET_CAS_PRUNE_TIMEOUT_S = 300.0
 
 
-def fleet_cas_node_cap(root: Path | None = None, prune: Path | None = None) -> int:
+# Over the cache budget, both fleet-cas stores are capped at this share of the volume (at least 2 GiB each) instead of
+# glaeda-fleet-cas-prune's fixed 20 GiB: 40 GiB was 18% of a 228 GB mini. Every object comes back from the fleet store
+# (cmux-lawrence's SSD) on the next lookup, so a smaller cap costs a fetch, never a rebuild.
+FLEET_CAS_BUDGET_SHARE = 0.025
+
+
+def fleet_cas_node_cap(root: Path | None = None, prune: Path | None = None, cap_gib: float | None = None) -> int:
     """Run `glaeda-fleet-cas-prune --apply --node-only` (installed beside this script) on a host with fleet-cas, bounded
-    by FLEET_CAS_PRUNE_TIMEOUT_S; the bytes it reports freed, 0 when it is absent, fails or freed nothing. Never raises."""
+    by FLEET_CAS_PRUNE_TIMEOUT_S; the bytes it reports freed, 0 when it is absent, fails or freed nothing. Never raises.
+    With CAP_GIB (the volume is over the cache budget) it runs `--apply --node-gib CAP --local-cas-gib CAP` instead: the
+    node store under CAP, and a reader's local CAS whole once over it, under the prune's own in-use rules."""
     root = FLEET_CAS_ROOT if root is None else root
     prune = Path(os.path.abspath(__file__)).with_name("glaeda-fleet-cas-prune") if prune is None else prune
     if not (root / "fleet-cas.env").is_file() or not prune.is_file():
         return 0
+    args = ["--apply", "--node-only"] if cap_gib is None else ["--apply", "--node-gib", f"{cap_gib:g}",
+                                                               "--local-cas-gib", f"{cap_gib:g}"]
     try:
-        out = subprocess.run([sys.executable, os.fspath(prune), "--apply", "--node-only"], capture_output=True,
+        out = subprocess.run([sys.executable, os.fspath(prune), *args], capture_output=True,
                              text=True, timeout=FLEET_CAS_PRUNE_TIMEOUT_S, check=False,
                              env={**os.environ, "GLAEDA_FLEET_CAS_ROOT": os.fspath(root)})
         rec = json.loads(out.stdout.strip().splitlines()[-1]) if out.stdout.strip() else {}
     except (OSError, subprocess.SubprocessError, ValueError):
         return 0
+    freed = 0
+    if rec.get("local_cas") == "removed" and isinstance(rec.get("local_cas_bytes"), int):
+        print(f"  fleet-cas local CAS: removed, {rec['local_cas_bytes'] / GIB:.1f} GiB")
+        freed += rec["local_cas_bytes"]
     m = re.match(r"removed (\d+) oldest files, ([0-9.]+) GiB", str(rec.get("node_store") or ""))
-    if not m:
-        return 0
-    print(f"  fleet-cas node store: {rec['node_store']}")
-    return int(float(m.group(2)) * GIB)
+    if m:
+        print(f"  fleet-cas node store: {rec['node_store']}")
+        freed += int(float(m.group(2)) * GIB)
+    return freed
 
 
 def write_run_line(started: float, free_before: int | None) -> None:

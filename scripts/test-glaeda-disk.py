@@ -12250,6 +12250,15 @@ class FleetCasNodeCapTest(unittest.TestCase):
                 self.assertEqual(gd.fleet_cas_node_cap(root, prune), int(3.5 * gd.GIB))
             self.assertEqual(calls.read_text(), f"--apply --node-only {root}\n")
             self.assertIn("fleet-cas node store: removed 12 oldest files", out.getvalue())
+            # over the cache budget: both stores capped at the given size, and a removed local CAS counts too
+            prune.write_text("import json, os, sys\n"
+                             f"open({os.fspath(calls)!r}, 'a').write(' '.join(sys.argv[1:]) + '\\n')\n"
+                             "print(json.dumps({'node_store': 'removed 2 oldest files, 1.0 GiB', 'local_cas': 'removed',"
+                             f" 'local_cas_bytes': {6 * gd.GIB}, 'result': 'ok'}}))\n")
+            calls.unlink()
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(gd.fleet_cas_node_cap(root, prune, cap_gib=5.7), 7 * gd.GIB)
+            self.assertEqual(calls.read_text(), "--apply --node-gib 5.7 --local-cas-gib 5.7\n")
             prune.write_text("print('not json')\n")
             self.assertEqual(gd.fleet_cas_node_cap(root, prune), 0)
             self.assertEqual(gd.fleet_cas_node_cap(root, Path(tmp) / "missing"), 0)
