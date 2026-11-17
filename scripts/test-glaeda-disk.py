@@ -10711,6 +10711,39 @@ class HygieneMirrorTest(unittest.TestCase):
                                check=True).stdout
         self.assertIn("refs/heads/", heads)
 
+    def test_the_cmux_cache_roots_keep_the_rule_per_entry_after_leaving_library_caches(self) -> None:
+        """Review of #2065, finding 3: ~/Library/Caches/cmux and cmux-perf-bench left library-caches for their own
+        git_cache families; on a CI mini each entry still takes the 12 h rule (bundle, then remove)."""
+        caches = gd.HOME / "Library/Caches"
+        tree = caches / "cmux/cu-driver-eval"
+        self.checkout(tree)
+        self.checkout(caches / "cmux-perf-bench/build-src")
+        (caches / "cmux-perf-bench/apps").mkdir()
+        self.checkout(caches / "org.swift.swiftpm/repositories/x")
+        with mock.patch.object(gd, "enrolled_runners", return_value=[self.home / "actions-runner"]):
+            fams = {f.id: f for f in gd.default_families()}
+        for fid in ("cmux-tool-cache", "cmux-perf-bench", "cmux-perf-bench-apps"):
+            self.assertEqual(fams[fid].mirror_idle_hours, gd.CMUX_JOB_MIRROR_HOURS, fid)
+            self.assertEqual(gd.idle_window(fams[fid], 24), gd.CMUX_JOB_MIRROR_HOURS, fid)
+        self.assertIsNone(fams[gd.SWIFTPM_CACHE_FAMILY].mirror_idle_hours, "never under library-caches' cmux rule")
+        self.assertIsNone(self.families(runners=False)["library-caches"].mirror_idle_hours)
+        with mock.patch.object(gd, "enrolled_runners", return_value=[]):
+            plain = {f.id: f for f in gd.default_families()}
+        self.assertIsNone(plain["cmux-tool-cache"].mirror_idle_hours, "off where no CI runner is enrolled")
+        fam = fams["cmux-tool-cache"]
+        item = self.survey(fam)["cu-driver-eval"]
+        self.assertEqual(item.verdict, "reclaimable", item.reasons)
+        self.assertTrue(any("mirrors" in r for r in item.reasons))
+        self.assertEqual(self.survey(fams["cmux-perf-bench"])["build-src"].verdict, "reclaimable")
+        self.assertEqual(self.survey(fams[gd.SWIFTPM_CACHE_FAMILY])["x"].verdict, "git-checkout")
+        receipt = self.home / "receipt.jsonl"
+        with contextlib.redirect_stdout(io.StringIO()), \
+                mock.patch.object(gd, "process_evidence", return_value=([], "")):
+            gd.apply([item], {fam.id: fam}, receipt, None, 24)
+        self.assertFalse(tree.exists(), receipt.read_text())
+        bundles = sorted((self.home / "archive/glaeda-disk").glob("*.bundle"))
+        self.assertEqual(len(bundles), 1)
+
     def test_a_tree_with_a_process_in_it_is_kept(self) -> None:
         tree = gd.HOME / "Library/Caches/cmux/cmux-cua/build-src-abc"
         repo = self.checkout(tree)
@@ -12354,11 +12387,18 @@ class GitCacheFamiliesTest(unittest.TestCase):
     def test_swiftpm_mirrors_idle_a_day_go_and_a_push_target_stays(self) -> None:
         spm = self.caches / "org.swift.swiftpm"
         old = self.mirror(spm / "repositories/swift-collections-a1b2c3d4", 30)
-        server = self.mirror(spm / "repositories/swift-atomics-0f0f0f0f", 30, "https://github.com/apple/swift-atomics")
+        stale = self.mirror(spm / "repositories/swift-nio-11223344", 30)
+        # a server that cannot be asked confirms nothing: kept (fail closed)
+        server = self.mirror(spm / "repositories/swift-atomics-0f0f0f0f", 30, "https://example.invalid/swift-atomics")
         fresh = self.mirror(spm / "repositories/swift-syntax-deadbeef", 2)
+        # the server moved on since stale was fetched: its old tips are still the server's (acknowledged, not advertised)
+        (self.upstream / "later.swift").write_text("let y = 2\n")
+        self.git("-C", str(self.upstream), "add", "later.swift")
+        self.git("-C", str(self.upstream), "commit", "-qm", "later")
         lone = spm / "repositories/no-remote-cafecafe"  # no remote: its commits may be nowhere else
         self.git("init", "-q", "--bare", str(lone))
         self.git("--git-dir", str(lone), "fetch", "-q", str(self.upstream), "main:main")
+        self.git("--git-dir", str(lone), "symbolic-ref", "HEAD", "refs/heads/main")
         self.age(lone, 30)
         artifact = spm / "artifacts/https___example_com_x"
         artifact.mkdir(parents=True)
@@ -12372,18 +12412,63 @@ class GitCacheFamiliesTest(unittest.TestCase):
         items = self.survey(gd.SWIFTPM_CACHE_FAMILY)
         rel = lambda p: os.path.relpath(p, self.caches)  # noqa: E731
         self.assertEqual(items[rel(old)].verdict, "reclaimable", items[rel(old)].reasons)
-        self.assertEqual(items[rel(server)].verdict, "reclaimable", items[rel(server)].reasons)
+        self.assertEqual(items[rel(stale)].verdict, "reclaimable", items[rel(stale)].reasons)
+        self.assertEqual(items[rel(server)].verdict, "git-checkout", items[rel(server)].reasons)
+        self.assertIn("did not answer", " ".join(items[rel(server)].reasons))
         self.assertEqual(items[rel(artifact)].verdict, "reclaimable")
         self.assertEqual(items[rel(fresh)].verdict, "recent")
         self.assertEqual(items[rel(lone)].verdict, "git-checkout", "a bare repository with no remote is no mirror")
+        self.assertIn("no server remote", " ".join(items[rel(lone)].reasons))
         receipt = self.root / "receipt.jsonl"
         fams = {f.id: f for f in self.fams(gd.SWIFTPM_CACHE_FAMILY)}
         with contextlib.redirect_stdout(io.StringIO()), \
                 mock.patch.object(gd, "process_evidence", return_value=([], "")):
-            gd.apply([items[rel(old)], items[rel(server)]], fams, receipt, None, 12)
-        self.assertFalse(old.exists(), receipt.read_text())
-        self.assertFalse(server.exists())
-        self.assertTrue(fresh.exists() and lone.exists())
+            gd.apply([items[rel(old)], items[rel(stale)], items[rel(server)]], fams, receipt, None, 12)
+        self.assertFalse(old.exists() or stale.exists(), receipt.read_text())
+        self.assertTrue(server.exists() and fresh.exists() and lone.exists())
+
+    def test_a_bare_repo_someone_pushed_into_is_kept(self) -> None:
+        """Review of #2065, finding 1: a bare repo with a configured server remote and a commit pushed into it that the
+        server never saw is no refetchable mirror; nor once the push lands after the survey (apply asks again)."""
+        spm = self.caches / "org.swift.swiftpm"
+        target = self.mirror(spm / "repositories/pushed-0badc0de", 30)
+        later = self.mirror(spm / "repositories/pushed-later-0badf00d", 30)
+        work = self.clone(self.root / "elsewhere/work", 0)
+
+        def push(into: Path) -> None:
+            (work / f"{into.name}.swift").write_text("let only = 1\n")
+            self.git("-C", str(work), "add", ".")
+            self.git("-C", str(work), "commit", "-qm", "only in the bare repo")
+            self.git("-C", str(work), "push", "-q", str(into), "HEAD:refs/heads/topic")
+            self.age(into, 30)
+        push(target)
+        self.assertEqual(gd.mirror_loss(target), "commits no server confirms")
+        items = self.survey(gd.SWIFTPM_CACHE_FAMILY)
+        rel = lambda p: os.path.relpath(p, self.caches)  # noqa: E731
+        self.assertEqual(items[rel(target)].verdict, "git-checkout")
+        self.assertIn("commits no server confirms", " ".join(items[rel(target)].reasons))
+        self.assertEqual(items[rel(later)].verdict, "reclaimable", items[rel(later)].reasons)
+        push(later)  # between the survey and the apply
+        receipt = self.root / "receipt.jsonl"
+        with contextlib.redirect_stdout(io.StringIO()), \
+                mock.patch.object(gd, "process_evidence", return_value=([], "")):
+            gd.apply([items[rel(later)]], {f.id: f for f in self.fams(gd.SWIFTPM_CACHE_FAMILY)}, receipt, None, 12)
+        self.assertTrue(target.exists() and later.exists(), receipt.read_text())
+        self.assertIn("changed:git", receipt.read_text())
+
+    def test_a_separate_git_dir_is_no_mirror(self) -> None:
+        """Review of #2065, finding 2: `git clone --separate-git-dir` leaves a git dir with no .git entry and no
+        core.worktree, but core.bare=false: it is a work tree's repository, never a mirror."""
+        tool = self.caches / "cmux/coderouter"
+        tool.mkdir(parents=True)
+        sep = tool / "sep.git"
+        self.git("clone", "-q", "--separate-git-dir", str(sep), str(self.upstream), str(self.root / "elsewhere/wt"))
+        self.age(tool, 30)
+        self.assertTrue(gd.looks_like_repository(os.fspath(sep)))
+        self.assertIn("core.bare", gd.mirror_loss(sep))
+        items = self.survey("cmux-tool-cache")
+        self.assertEqual(items["cmux/coderouter"].verdict, "git-checkout", items["cmux/coderouter"].reasons)
+        self.assertIn("core.bare", " ".join(items["cmux/coderouter"].reasons))
 
     def test_cmux_tool_cache_keeps_a_checkout_with_work_and_leaves_cua_alone(self) -> None:
         cmux = self.caches / "cmux"

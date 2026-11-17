@@ -447,9 +447,9 @@ class Family:
     min_bytes: int | None = None  # size floor for this family instead of --min-mib
     git_disposable: bool = False  # a checkout that loses nothing when deleted is reclaimable
     nested_git: bool = False  # judge every checkout inside an item, not only one rooted at it
-    # a tool cache whose bare/mirror repositories are refetchable (refetchable_mirror: SwiftPM's repositories/<name>,
-    # a script's clone cache), never a checkout; a non-bare checkout inside still has to lose nothing. Set with
-    # git_disposable and nested_git (git_cache_families).
+    # a tool cache that keeps bare mirrors (SwiftPM's repositories/<name>, a script's clone cache): a mirror a server
+    # fully holds loses nothing (mirror_loss); a non-bare checkout inside still has to lose nothing (git_loss). Set
+    # with git_disposable and nested_git (git_cache_families).
     git_cache: bool = False
     owner: str = ""  # who writes it, so a cache nobody owns any more is visible
     # launchd services of that owner (e.g. system/ai.x.worker), one or several; retired = none of them loaded
@@ -4179,34 +4179,41 @@ def hq_cache_family(root: Path | None = None) -> Family:
 # and stayed forever: a fleet sweep's --pressure --apply reclaimed 0 GB on all 20 minis while a hand sweep of their
 # entries idle 24 h freed 1-8 GB on each (2026-11-17). SwiftPM's repositories/<name> are bare mirror clones, and
 # cmux's scripts clone and download into ~/Library/Caches/cmux/<tool> (cef, pinned-shells, coderouter, cu-driver-eval)
-# and cmux-perf-bench (benchhelper-<digest>, apps/<app>/<version>). A git_cache family's refetchable mirrors
-# (refetchable_mirror) never make an entry a checkout; a non-bare checkout in one must still lose nothing (no dirty
-# tree, no unpushed commit), and a process, an open file or a running command naming it keeps it. Each entry goes once
-# idle CACHE_GIT_MIRROR_IDLE_HOURS, whatever the idle window. cmux/cmux-cua is cua-cache's; cmux-next-ci,
-# cmux-nightly-next and ~/.cache/cmux-journeys have families of their own (build output, no git check).
+# and cmux-perf-bench (benchhelper-<digest>, apps/<app>/<version>). In a git_cache family a bare mirror loses nothing
+# only when a server holds every commit it points at (mirror_loss: core.bare, a server remote, every tip advertised or
+# acknowledged, else kept); a non-bare checkout must lose nothing (no dirty tree, no unpushed commit), and a process,
+# an open file or a running command naming it keeps it. Each entry goes once idle CACHE_GIT_MIRROR_IDLE_HOURS,
+# whatever the idle window. On a hygiene mirror host the cmux* roots keep the 12 h mirror rule library-caches gave them
+# (mirror_idle_hours, CMUX_JOB_MIRROR_HOURS): archive_mirror bundles local-only refs and unpushed commits into ~/archive
+# and the entry goes. cmux/cmux-cua is cua-cache's; cmux-next-ci, cmux-nightly-next and ~/.cache/cmux-journeys have
+# families of their own (build output, no git check).
 CACHE_GIT_MIRROR_IDLE_HOURS = 24.0
 SWIFTPM_CACHE_FAMILY = "swiftpm-cache"
 GIT_CACHE_FAMILY_IDS = (SWIFTPM_CACHE_FAMILY, "cmux-tool-cache", "cmux-perf-bench", "cmux-perf-bench-apps")
 GIT_CACHE_ROOTS = ("org.swift.swiftpm", "cmux", "cmux-perf-bench")  # under ~/Library/Caches
 
 
-def git_cache_families(pressure_only: bool = False) -> list[Family]:
+def git_cache_families(pressure_only: bool = False, mirror_host: bool = False) -> list[Family]:
     caches = HOME / "Library/Caches"
     idle = CACHE_GIT_MIRROR_IDLE_HOURS
     common: dict[str, Any] = dict(git_cache=True, git_disposable=True, nested_git=True, min_idle_hours=idle,
                                   max_idle_hours=idle, pressure_only=pressure_only, platform="macos")
+    # the cmux* roots on a mirror host: library-caches' mirror rule (mirror_include=("cmux",)) at its 12 h
+    hygiene = (dict(common, min_idle_hours=CMUX_JOB_MIRROR_HOURS, max_idle_hours=CMUX_JOB_MIRROR_HOURS,
+                    mirror_idle_hours=CMUX_JOB_MIRROR_HOURS, mirror_exclude=HYGIENE_MIRROR_KEEP)
+               if mirror_host else common)
     return [
         # repositories/<name> (bare mirrors), artifacts/<name>, registry/downloads, prebuilts: one entry each
         Family(SWIFTPM_CACHE_FAMILY, caches / "org.swift.swiftpm", True, "the next SwiftPM resolve fetches it again",
                depth=2, owner="SwiftPM (shared package cache)", rebuild_minutes=3, **common),
         Family("cmux-tool-cache", caches / "cmux", True, "the cmux script that made it downloads or builds it again",
                skip=("cmux-cua",), owner="cmux scripts (cef, pinned shells, tool clients)", rebuild_minutes=5,
-               **common),
+               **hygiene),
         Family("cmux-perf-bench", caches / "cmux-perf-bench", True, "the next perf bench run makes it again",
-               skip=("apps",), owner="cmux scripts/perf-bench (xbench.py)", rebuild_minutes=2, **common),
+               skip=("apps",), owner="cmux scripts/perf-bench (xbench.py)", rebuild_minutes=2, **hygiene),
         Family("cmux-perf-bench-apps", caches / "cmux-perf-bench/apps", True,
                "the next perf bench run downloads the app again (fetch_browsers.py)", depth=2,
-               owner="cmux scripts/perf-bench (fetch_browsers.py)", rebuild_minutes=3, **common),
+               owner="cmux scripts/perf-bench (fetch_browsers.py)", rebuild_minutes=3, **hygiene),
     ]
 
 
@@ -4284,7 +4291,7 @@ def default_families(role: str = "fleet-mini") -> list[Family]:
                "the CUA client rebuilds its frame cache", depth=1, files=True,
                min_idle_hours=DEFAULT_AGE_HOURS, mirror_idle_hours=CMUX_JOB_MIRROR_HOURS if mirror_host else None,
                owner="cmux CUA", rebuild_minutes=1, platform="macos"),
-        *git_cache_families(pressure_only=role == "devbox"),
+        *git_cache_families(pressure_only=role == "devbox", mirror_host=mirror_host),
         # Tart's pulled VM images (`tart pull` / `tart clone` of an OCI ref: ~/.tart/cache/OCIs/<registry>/<org>/
         # <image>, each a full macOS disk). home-caches never finds them: a dot directory with no sealed-cache layout.
         # On a dedicated nightly mini (2026-11-03) four cirruslabs vanilla images pulled on 2026-10-19 held 53.5 GiB,
@@ -6589,43 +6596,66 @@ def family_git_state(fam: "Family", path: Path) -> str:
             if idle:
                 state = git_state(path, budget=OLD_TREE_BUDGET, sealed=not fam.git_disposable)
         return state
+    # a git_cache item with any repository is "git": family_git_loss decides, mirrors by mirror_loss
     roots = nested_checkouts(path)
-    if roots is not None and fam.git_cache:
-        roots = [root for root in roots if not refetchable_mirror(root, path)]
     return "unchecked" if roots is None else "git" if roots else "none"
 
 
-def refetchable_mirror(repo: Path, item: Path) -> bool:
-    """A git_cache family's bare or mirror repository, which its tool fetches again: no work tree (no .git entry, no
-    core.worktree), no worktrees or stash of its own, and a remote to fetch from that is a server or a local
-    repository outside the item. Anything else inside a git_cache item is judged as a checkout."""
+# mirror_loss answers by (git dir, its local tips): a survey and the apply right after it ask the servers once, and a
+# push or fetch in between (new tips) asks again
+_MIRROR_CHECKS: dict[tuple[str, tuple[str, ...]], str] = {}
+
+
+def mirror_loss(repo: Path) -> str:
+    """"" when a git_cache family's repository is a refetchable mirror whose deletion loses nothing, else why not.
+
+    It must be bare (core.bare=true, no .git entry, no core.worktree: a --separate-git-dir git dir is a work tree's
+    repository), hold no worktrees, stash or submodule store, and have a server remote (network_remotes) that holds
+    every commit it points at: each local tip is advertised by `git ls-remote` or acknowledged by the server
+    (_server_known), and nothing else is reachable from the tips. A bare repository someone pushed a commit into, or
+    whose server cannot be asked, fails closed."""
     if os.path.lexists(repo / ".git") or not looks_like_repository(os.fspath(repo)):
-        return False
+        return "not a bare repository"
+    bare = _git_dir_run(repo, "config", "--bool", "core.bare")
+    if bare is None or bare.strip() != "true":
+        return "not a bare repository (core.bare is not true)"
+    if _git_dir_run(repo, "config", "--get", "core.worktree") is not None:
+        return "has a work tree (core.worktree)"
     try:
         if (repo / "worktrees").is_dir() and any((repo / "worktrees").iterdir()):
-            return False
+            return "has worktrees of its own"
+        if (repo / "modules").is_dir():
+            return "holds a submodule store"
     except OSError:
-        return False
+        return "unreadable git dir"
     stash = _git_dir_run(repo, "for-each-ref", "--count=1", "refs/stash")
     if stash is None or stash.strip():
-        return False
-    config = _git_dir_run(repo, "config", "--get-regexp", r"^(remote\..*\.url|core\.worktree)$")
-    if config is None:
-        return False  # no remote at all (git config exits 1) or an unreadable config
-    inside = os.path.realpath(item) + "/"
-    fetchable = False
-    for line in config.splitlines():
-        key, _, url = line.partition(" ")
-        if key == "core.worktree":
-            return False
-        if NETWORK_URL.match(url) and not url.startswith("file:"):
-            fetchable = True
-            continue
-        local = url[len("file://"):] if url.startswith("file://") else url
-        local = os.path.realpath(os.path.join(repo, local))
-        if os.path.isdir(local) and not (local + "/").startswith(inside):
-            fetchable = True
-    return fetchable
+        return "stash entries"
+    tips = local_tips(repo)
+    if tips is None:
+        return "unreadable refs"
+    key = (os.path.realpath(repo), tuple(tips))
+    if key not in _MIRROR_CHECKS:
+        _MIRROR_CHECKS[key] = _mirror_unconfirmed(repo, tips)
+    return _MIRROR_CHECKS[key]
+
+
+def _mirror_unconfirmed(repo: Path, tips: list[str]) -> str:
+    if not tips:
+        return ""
+    remotes = network_remotes(repo)
+    if remotes is None:
+        return "unreadable remotes"
+    if not remotes:
+        return "no server remote to fetch it again from"
+    why, _, known = _server_known(repo, remotes, set(tips))
+    if why:
+        return why
+    left = _git_dir_run(repo, "rev-list", "--max-count=1", "--stdin",
+                        stdin="\n".join([*tips, "--not", *known]) + "\n", timeout=120)
+    if left is None:
+        return "unreadable history"
+    return "commits no server confirms" if left.strip() else ""
 
 
 def bare_loss(gitdir: Path) -> str:
@@ -6710,15 +6740,17 @@ def ignored_checkout_loss(root: Path) -> str:
 
 
 def _nested_loss(path: Path, mirrors: bool = False) -> str:
-    """What deleting every checkout inside path loses; with mirrors (a git_cache family), its refetchable bare
-    mirrors lose nothing."""
+    """What deleting every checkout inside path loses; with mirrors (a git_cache family), a repository with no .git
+    entry is judged by mirror_loss: only a bare mirror a server fully holds loses nothing."""
     roots = nested_checkouts(path)
     if roots is None:
         return "too deep or large to find every checkout"
     inside = os.path.realpath(path) + "/"
     for root in roots:
         where = root.relative_to(path)
-        if mirrors and refetchable_mirror(root, path):
+        if mirrors and not os.path.lexists(root / ".git"):
+            if (loss := mirror_loss(root)):
+                return f"{where}: {loss}"
             continue
         if not os.path.lexists(root / ".git"):
             if (loss := bare_loss(root)):
@@ -9303,6 +9335,8 @@ def _survey(families, idle_hours, min_bytes, known, evidence, defer_bulk=False,
             reasons.append(keep)
         elif reasons:
             verdict = "in-use"
+        elif fam.git_cache and not due:
+            verdict = "recent"  # its mirrors' server check (mirror_loss) is asked only of an entry old enough to go
         elif (not git_exempt(fam, path, idle) and (g := family_git_state(fam, path)) != "none"
               and not (g == "git" and fam.git_disposable and due
                        and not (loss := family_git_loss(fam, path)))):
