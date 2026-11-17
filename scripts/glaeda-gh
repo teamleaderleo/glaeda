@@ -2676,6 +2676,7 @@ def daemon_policy() -> dict:
     cycle = int(_bounded(doc.get("cycle"), CYCLE, 15, 900))
     comment = int(_bounded(doc.get("commentCycle"), COMMENT_CYCLE, 5, 300))
     floors = dict(FLOORS)
+    write_floors = dict(FLOORS)  # the configured (floor, reserve), before the hard reserve: the outbox's writes
     hard = hard_reserve_floor()
     given = doc.get("floors") if isinstance(doc.get("floors"), dict) else {}
     for bucket, (floor, reserve) in FLOORS.items():
@@ -2683,6 +2684,7 @@ def daemon_policy() -> dict:
         f = int(_bounded(one.get("floor"), floor, 0, 100000))
         r = int(_bounded(one.get("reserve"), reserve, 0, 100000))
         f, r = (f, r) if r <= f else (floor, reserve)
+        write_floors[bucket] = (f, r)
         # Never under the hard reserve (hard_reserve_floor): a config's lower reserve is raised to it. A floor the
         # raised reserve reaches is raised above it by the band it had, so "lean" still comes before "stop" (GraphQL's
         # module default 500/100 becomes 900/500, not 500/500 with no lean band at all).
@@ -2696,7 +2698,7 @@ def daemon_policy() -> dict:
                        "restLeft": int(_bounded(alarms.get("restLeft"), ALARM_REST_LEFT, 0, 100000)),
                        "paceShare": float(_bounded(alarms.get("paceShare"), ALARM_PACE_SHARE, 0.0, 1.0))},
             "cycles": {"pr": cycle, "run": cycle, "comment": comment, "head": cycle},
-            "floors": floors, "hardReserve": hard, "restShare": float(_bounded(doc.get("restShare"), REST_SHARE, 0.0, 1.0)),
+            "floors": floors, "writeFloors": write_floors, "hardReserve": hard, "restShare": float(_bounded(doc.get("restShare"), REST_SHARE, 0.0, 1.0)),
             # restYield out of range (or not a number) is left out, so the default (no yield) holds
             **({"restYield": int(doc["restYield"])} if isinstance(doc.get("restYield"), (int, float))
                and not isinstance(doc.get("restYield"), bool) and 0 <= doc["restYield"] <= 100000 else {}),
@@ -4033,12 +4035,14 @@ class Daemon:
         return False
 
     def outbox_richness(self, bucket: str) -> float:
-        """richness() for the outbox: the daemon's own REST share does not hold sessions' writes."""
+        """richness() for the outbox: the daemon's own REST share does not hold sessions' writes, nor does the hard
+        reserve, which holds the daemon's own reads (a queued write is a session's, sent once, and its routing between
+        the buckets is not a read): it weighs the configured reserve (writeFloors)."""
         if self.backoff[bucket] > self.now:
             return -1.0
         seen = self.budget.get(bucket) or {}
         limit = seen.get("limit") or 5000
-        reserve = self.policy["floors"][bucket][1]
+        reserve = (self.policy.get("writeFloors") or self.policy["floors"])[bucket][1]
         if not seen or (seen.get("reset") or 0) <= self.now:
             return max(0, limit - reserve) / FULL_WINDOW
         return max(0, seen.get("remaining", limit) - reserve) / max(seen["reset"] - self.now, RICH_WINDOW_MIN)

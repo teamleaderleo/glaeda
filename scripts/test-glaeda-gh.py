@@ -12154,7 +12154,7 @@ class PostJoinTest(unittest.TestCase):
         spent = (403, {"x-ratelimit-remaining": "0", "x-ratelimit-reset": str(int(NOW + 900))},
                  {"message": "API rate limit exceeded for user"})
         d, t = self.daemon(spent, self.subject(), self.made("IC_9", "u"))
-        d.budget = {"graphql": {"limit": 5000, "remaining": 1000, "reset": NOW + 3000},
+        d.budget = {"graphql": {"limit": 5000, "remaining": 300, "reset": NOW + 3000},
                     "rest": {"limit": 5000, "remaining": 4900, "reset": NOW + 3000}}  # REST reads richer
         gg.write_json(gg.BASE / gg.POST_SUBJECTS, {})
         self.step(d, NOW)
@@ -12211,7 +12211,7 @@ class PostJoinTest(unittest.TestCase):
 
     def test_a_status_is_edited_in_place_even_while_rest_is_richer(self) -> None:
         d, t, first, second = self.status_pair("IC_1")
-        d.budget = {"graphql": {"limit": 5000, "remaining": 1000, "reset": NOW + 3000},
+        d.budget = {"graphql": {"limit": 5000, "remaining": 400, "reset": NOW + 3000},
                     "rest": {"limit": 5000, "remaining": 4900, "reset": NOW + 3000}}
         self.step(d, NOW + gg.POST_SPACING)
         self.assertIn("updateIssueComment", t.calls[3][2]["query"])
@@ -13442,6 +13442,8 @@ class DaemonPolicyTest(Base):
         # the module's reserves (300, 100) are raised to the 500-call hard reserve; GraphQL's floor keeps its band
         self.assertEqual(policy["floors"], {"rest": (1500, 500), "graphql": (900, 500)})
         self.assertEqual(policy["hardReserve"], {"rest": 500, "graphql": 500})
+        # the outbox's writes weigh the configured reserves, not the hard reserve (PostJoinTest)
+        self.assertEqual(policy["writeFloors"], {"rest": (1500, 300), "graphql": (500, 100)})
         self.assertEqual(policy["restShare"], 0.4)
 
     def test_values_are_read_and_bad_ones_keep_their_default(self) -> None:
