@@ -1005,6 +1005,7 @@ CMUX_NEXT_DRAIN_HOOK_SHA256 = frozenset({
     "1f4d528d5e8fd2687d4ba6972acad4b3a913c614ec37c1031a36ef0c51530426",
     "9d48941838658210beb6c3368ba830d514996b044e7d9215b8e6236f79a9e6b0",
     "a44fdb3563a9b0b6338bfbec0428cf36b06b92c5a659b2e3756f39c9c9a8783f",
+    "22e0b6e8aaeca9e083b92bbf012d53ffd663926dfc8f040446d630d38a83ba52",
 })
 CMUX_NEXT_CI_PRESERVED_NAMES = frozenset({
     "SourcePackages", "ModuleCache.noindex", "SDKStatCaches.noindex",
@@ -1116,7 +1117,9 @@ def ci_ios_family(root: Path | None = None) -> Family:
 # it: 8-9 GiB per idle root on cmux7s, cmux12s and cmux13s while the controller paused their claims for disk
 # (2026-10-21). Only these names one level below the root, so src/ stays the tmp family's and git's to judge.
 CANONICAL_ADMISSION = "cmux-ci-admission"
-CANONICAL_ADMISSION_NAMES = ("derived-data-", "compile-admission-cas")
+# .product-pack.: a killed compile's product staging (job_end_scratch takes it at once; this is the catch-up for what
+# that hook did not see: a job of an older hook, or a root a job held while another process used the staging dir)
+CANONICAL_ADMISSION_NAMES = ("derived-data-", "compile-admission-cas", ".product-pack.")
 CANONICAL_ADMISSION_IDLE_HOURS = DEFAULT_AGE_HOURS
 CANONICAL_CAPACITY = FLEET_ROOT / "capacity"
 
@@ -1185,12 +1188,20 @@ def remove_canonical_admission(path: Path, whole_root: bool = False) -> bool:
     """Rename an admission item (with whole_root: the root itself) aside under its root's token, held exclusive
     as a job holds it, and delete it outside the lock. False, touching nothing, while a job holds the root."""
     token = canonical_root_token(path, whole_root)
-    if token is None:
-        return False
+    return False if token is None else remove_under_token(path, token)
+
+
+def remove_under_token(path: Path, token: Path, deferred: list[Path] | None = None) -> bool:
+    """remove_canonical_admission's protocol with the root token named: PATH goes aside under TOKEN held exclusive,
+    as a job holds it, and is deleted outside the lock (with deferred, the aside tree is appended there instead).
+    False, touching nothing, while a job holds the root."""
     if not token.parent.is_dir():  # no capacity dir: not a fleet mini, so no job can take the root
-        remove(path)
+        remove(path, deferred=deferred)
         return True
-    # created if missing, as the runner hook's lock_file creates it, so a job arriving now waits on this lock
+    # remove()'s refusals first, so the lock covers only the rename: the runner hook's take of a root token does not
+    # wait (LOCK_NB), and a job admitted on another runner while this holds it passes over the root
+    remove_refusal(path)
+    # created if missing, as the runner hook's lock_file creates it
     fd = os.open(token, os.O_RDONLY | os.O_CREAT | os.O_NOFOLLOW, 0o644)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -1204,7 +1215,7 @@ def remove_canonical_admission(path: Path, whole_root: bool = False) -> bool:
             os.close(held.pop())
 
     try:
-        remove(path, after_rename=release)
+        remove(path, after_rename=release, deferred=deferred, checked=True)
     finally:
         release()
     return True
@@ -3552,6 +3563,217 @@ def own_runner_checkout_main(args: list[str]) -> int:
             print(note)
         else:
             RUN["skipped"] = "not a bloated checkout of a starting job"
+        return 0
+    finally:
+        write_run_line(started, before)
+
+
+# What the ending job alone left, which no later job reads, goes at job-completed (the runner hook's job_end_scratch)
+# instead of waiting for an idle window. Leo, 2026-11-17: "you need to improve glaeda. there are dozens if not hundreds
+# of gb of build stuff that just keep getting accumulated. it's too much". Only three kinds, each named by its owner and
+# bound to the job by the root token it held or the runner it ran on:
+#   * <root>/.product-pack.XXXXXX: ci-macos.yml's and seed-derived-data.yml's mktemp -d staging of the compiled
+#     products as hard links (pax -rwlL), removed by an EXIT trap a cancelled or killed job never runs. Once the next
+#     compile clears the admission DerivedData the links alone keep ~1.9 GB of products, and neither admission family
+#     (CANONICAL_ADMISSION_NAMES) nor the tmp family (src/ keeps the whole root) took it.
+#   * <store>/.derived-data.discard-<pid>: owned_build_state.py's old kept build set aside (12 to 40 GB), deleted after
+#     its lock; a killed `keep` leaves it until the root's next check or keep. Only while <pid> is not running.
+#   * tmp_pack_* and friends in this runner's own checkouts (RUNNER_GIT_GARBAGE_FAMILY): a cancelled fetch's or the
+#     hook's timed-out repack's temp pack (up to 5 GiB), which git never reads again.
+# Everything else a job leaves is warm state a later job reuses (the checkout, its .build and target, spm-scratch/
+# <fingerprint>, the kept build, parked builds, seeds) or its run's consumers read (the admission DerivedData), and
+# stays with its family; the runner empties $RUNNER_TEMP itself after this hook.
+# A root's items go only under its token, taken exclusive without waiting (remove_under_token): the next job on that
+# root, or an idle catch-up, keeps them. Every item also stays while a process has it open or as its working
+# directory, or a command line names it; a checkout's temp packs stay while anything uses or names the checkout.
+# No process evidence, the kill switch or a host reservation keeps everything.
+JOB_END_FAMILY = "job-end-scratch"
+PRODUCT_PACK_PREFIX = ".product-pack."
+KEPT_DISCARD_RE = re.compile(r"\.derived-data\.discard-([0-9]+)")
+
+
+def root_store(k: int, ci: Path | None = None) -> Path:
+    """Root k's kept build store (ci-macos.yml's CMUX_OWNED_STATE_ROOT; cmux-ci-<k> below it past root 1)."""
+    ci = FLEET_CI if ci is None else ci
+    return ci if k == 1 else ci / f"cmux-ci-{k}"
+
+
+def pid_running(pid: int) -> bool:
+    if pid <= 0:
+        return True  # not a pid a process could have: never read it as gone
+    try:
+        os.kill(pid, 0)
+    except PermissionError:
+        return True
+    except (OSError, OverflowError):
+        return False
+    return True
+
+
+def job_end_candidates(roots: list[int], runner: Path | None, tmp: Path | None = None,
+                       ci: Path | None = None) -> list[tuple[str, Path, Path | None]]:
+    """(kind, path, root token or None) for the ending job's own scratch: product-pack staging in the roots it held,
+    discarded kept builds in those roots' stores, and git temp packs in its runner's checkouts."""
+    tmp = (Path("/private/tmp") if DARWIN else Path("/tmp")) if tmp is None else tmp
+    out: list[tuple[str, Path, Path | None]] = []
+    for k in roots:
+        token = CANONICAL_CAPACITY / f"root-{k}.token"
+        root = tmp / ("cmux-ci" if k == 1 else f"cmux-ci-{k}")
+        if not root.is_symlink() and root.is_dir():
+            out += [("product-pack", Path(e.path), token) for e in _entries(root)
+                    if e.name.startswith(PRODUCT_PACK_PREFIX) and e.is_dir(follow_symlinks=False)]
+        store = root_store(k, ci)
+        if not store.is_symlink() and store.is_dir():
+            out += [("kept-build-discard", Path(e.path), token) for e in _entries(store)
+                    if KEPT_DISCARD_RE.fullmatch(e.name) and e.is_dir(follow_symlinks=False)]
+    if runner is not None and not (runner / "_work").is_symlink() and (runner / "_work").is_dir():
+        out += [("git-temp-pack", p, None) for p in runner_git_garbage(runner / "_work")]
+    return out
+
+
+def job_end_veto(kind: str, path: Path, opened: frozenset[str], cmds: str, work: Path | None) -> str:
+    """Why one job-end item stays, or ""."""
+    if kind == "kept-build-discard":
+        m = KEPT_DISCARD_RE.fullmatch(path.name)
+        if m is None or pid_running(int(m.group(1))):
+            return "the keep that set it aside is still running"
+    if kind == "git-temp-pack":  # the checkout (_work/<repo>/<repo>): anything using or naming it may write its packs
+        checkout = next((p for p in path.parents if work is not None and p.parent.parent == work), None)
+        if checkout is None:
+            return "not in this runner's checkout"
+        path = checkout
+    for spelling in dict.fromkeys((os.fspath(path), os.path.realpath(path))):
+        if in_cwd(spelling, opened):
+            return "open or a working directory of a process"
+        if named_by(spelling, cmds):
+            return "named by a running command"
+    return ""
+
+
+def job_end_scratch(roots: list[int], runner: Path | None, receipt: Path, tmp: Path | None = None,
+                    ci: Path | None = None) -> str:
+    """Remove the ending job's own scratch (job_end_candidates) that no veto keeps: a one-line note, "" when there is
+    none. Never raises OSError."""
+    items = job_end_candidates(roots, runner, tmp, ci)
+    if not items:
+        return ""
+    if (why := host_reservation()):
+        return f"kept {len(items)} job-end scratch item(s): {why}"
+    try:
+        opened, cmds = process_evidence()
+    except NoEvidence as e:
+        return f"kept {len(items)} job-end scratch item(s): no process evidence ({e})"
+    index, work = open_index(opened), (None if runner is None else runner / "_work")
+    done: collections.Counter[str] = collections.Counter()
+    kept: list[str] = []
+    freed = 0
+    aside: list[Path] = []  # renamed out of the way here; a detached child deletes them (delete_detached)
+    for kind, path, token in items:
+        why = job_end_veto(kind, path, index, cmds, work)
+        outcome, size = ("changed:in-use" if why else "reclaimed"), None
+        if not why:
+            try:
+                if token is None:  # a temp pack: one file, its bytes are what the unlink frees
+                    size = path.lstat().st_blocks * 512
+                    remove(path)
+                elif not remove_under_token(path, token, deferred=aside):
+                    why, outcome = "a job holds its root", "changed:in-use"
+            except FileNotFoundError:
+                why, outcome, size = "already gone (another pass took it)", "gone", None
+            except OSError as e:
+                why, outcome = f"incomplete: {e.__class__.__name__}", f"incomplete:{e.__class__.__name__}"
+        rec = {"at": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "host": platform.node(), "outcome": outcome,
+               "family": JOB_END_FAMILY, "kind": kind, "path": os.fspath(path), "bytes": None if why else size,
+               "verdict": "blocked" if why else "reclaimable", "reasons": [why or "the job that made it ended"]}
+        with contextlib.suppress(OSError):
+            receipt.parent.mkdir(parents=True, exist_ok=True)
+            with receipt.open("a") as f:
+                f.write(json.dumps(rec) + "\n")
+        if why:
+            if outcome != "gone":
+                kept.append(f"{kind} ({why})")
+        else:
+            done[kind] += 1
+            freed += size or 0
+    RUN["released"] = RUN.get("released", 0) + freed
+    notes = []
+    if aside:
+        notes.append(delete_detached(aside))
+    if done:
+        notes.insert(0, f"removed the job's own scratch: {', '.join(f'{n} {k}' for k, n in sorted(done.items()))}")
+    if kept:
+        notes.append(f"kept {len(kept)}: {'; '.join(kept[:3])}")
+    return "; ".join(notes)
+
+
+def delete_detached(trees: list[Path]) -> str:
+    """Delete aside trees (remove()'s DELETING_PREFIX names) in a detached grandchild in its own session, so the runner
+    hook's bound and its group kill never cut a 12-40 GB delete short and its runner takes the next job at once. The
+    child renames each tree to its own pid first (deletion_owner_live keeps it from the interrupted-deletions family
+    while it works); what a killed child leaves that family finishes. Returns a note."""
+    try:
+        pid = os.fork()
+    except OSError as e:
+        for tree in trees:  # no child: delete here, as remove() would have
+            with contextlib.suppress(OSError):
+                shutil.rmtree(tree, onerror=_chmod_retry)
+        return f"deleted {len(trees)} aside tree(s) in place ({e.__class__.__name__} on fork)"
+    if pid:
+        with contextlib.suppress(ChildProcessError):
+            os.waitpid(pid, 0)  # the first child exits at once
+        return f"deleting {len(trees)} aside tree(s) in the background"
+    try:  # the first child: a new session, then the grandchild that does the work
+        os.setsid()
+        if os.fork():
+            os._exit(0)
+        null = os.open(os.devnull, os.O_RDWR)
+        for fd in (0, 1, 2):
+            os.dup2(null, fd)
+        for tree in trees:
+            with contextlib.suppress(OSError):
+                mine = tree.with_name(f"{tree.name.rsplit('-', 1)[0]}-{os.getpid()}")
+                os.rename(tree, mine)
+                tree = mine
+            with contextlib.suppress(OSError):
+                shutil.rmtree(tree, onerror=_chmod_retry)
+    finally:
+        os._exit(0)
+
+
+def job_end_runner(home: Path | None = None) -> Path | None:
+    """The enrolled runner whose job is ending: its .runner agentName is $RUNNER_NAME and $RUNNER_TEMP is its
+    _work/_temp. None otherwise."""
+    name, temp = os.environ.get("RUNNER_NAME"), os.environ.get("RUNNER_TEMP", "").rstrip("/")
+    if not name or not temp:
+        return None
+    for runner in enrolled_runners(home):
+        if runner_agent_name(runner) == name and os.path.abspath(temp) == os.fspath(runner / "_work" / "_temp"):
+            return runner
+    return None
+
+
+def job_end_scratch_main(args: list[str]) -> int:
+    """glaeda-disk --job-end-scratch [--roots K,K] [--receipt PATH]: job_end_scratch for the canonical roots the
+    ending job held (the runner hook passes their numbers) and the runner the job's environment names, from the
+    runner hook at job-completed. Exits 0."""
+    ap = argparse.ArgumentParser(prog="glaeda-disk --job-end-scratch")
+    ap.add_argument("--job-end-scratch", action="store_true")
+    ap.add_argument("--roots", default="")
+    ap.add_argument("--receipt", type=Path, default=HOME / "Projects/recovery/disk-reclaim/receipts.jsonl")
+    a = ap.parse_args(args)
+    roots = sorted({int(k) for k in a.roots.split(",") if re.fullmatch(r"[1-9][0-9]?", k)})
+    RUN.clear()
+    RUN.update(caller=run_caller(), mode="job-end-scratch", apply=True)
+    started, before = time.time(), _home_free()
+    try:
+        if (off := disk_off()):
+            RUN.update(off=True, skipped=f"kill switch: {off}")
+            return 0
+        note = job_end_scratch(roots, job_end_runner(), a.receipt) if DARWIN else ""
+        if note:
+            print(note)
+        else:
+            RUN["skipped"] = "no job-end scratch"
         return 0
     finally:
         write_run_line(started, before)
@@ -10950,14 +11172,23 @@ def write_eviction_summary(receipt: Path, operation: str, logical_released: int,
     return record
 
 
-def remove(path: Path, after_rename=None) -> None:
-    """Delete path. `after_rename` runs once the tree is out of the way, before the long delete."""
+def remove_refusal(path: Path) -> None:
+    """remove()'s refusals: raises OSError for a kept toolchain or role path, a symlink or a mount point."""
     if toolchain_held(path, fresh=True):
         raise OSError("refusing the job toolchain (toolchain_keep)")
     if path.is_symlink():
         raise OSError("refusing symlink")
     if os.path.ismount(path) or path.lstat().st_dev != path.parent.stat().st_dev:
         raise OSError("refusing a mount point")
+
+
+def remove(path: Path, after_rename=None, deferred: list[Path] | None = None, checked: bool = False) -> None:
+    """Delete path. `after_rename` runs once the tree is out of the way, before the long delete; with `deferred` a
+    directory's aside tree is appended there and left for the caller to delete. `checked`: remove_refusal ran."""
+    if not checked:
+        remove_refusal(path)
+    elif path.is_symlink():  # the rename below must still never move a link a race put in its place
+        raise OSError("refusing symlink")
     if not path.is_dir():
         path.unlink()
         return
@@ -10968,6 +11199,9 @@ def remove(path: Path, after_rename=None) -> None:
     os.rename(path, doomed)
     if after_rename is not None:
         after_rename()
+    if deferred is not None:
+        deferred.append(doomed)
+        return
     shutil.rmtree(doomed, ignore_errors=False, onerror=_chmod_retry)
 
 
@@ -13656,6 +13890,8 @@ def main(argv: list[str] | None = None) -> int:
         return census_main(args)
     if "--own-runner-checkout" in args:
         return own_runner_checkout_main(args)
+    if "--job-end-scratch" in args:
+        return job_end_scratch_main(args)
     background = "--refresh" in args and "--refresh-lock-fd" in args and "--apply" not in args
     if not background:
         return _logged_main(args)
