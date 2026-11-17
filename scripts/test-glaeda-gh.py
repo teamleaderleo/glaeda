@@ -16843,7 +16843,14 @@ class LandWorld:
         Path(self.mh).parent.mkdir(parents=True, exist_ok=True)
         Path(self.mh).write_text("raise SystemExit('not run in tests')\n")
         self.config = {"gh": os.fspath(self.gh), "mergeHold": self.mh, "acpmux": "/fake/acpmux",
-                       "python": "/fake/python3", "routerReview": "/fake/router-review"}
+                       "python": "/fake/python3", "routerReview": "/fake/router-review", "git": "/fake/git",
+                       "laneGh": "/fake/lane-gh"}
+        # A fetch step's mirror: a real (empty) directory, its origin what the fake git config answers.
+        self.mirror = os.fspath(Path(tmp) / "mirrors" / "r.git")
+        Path(self.mirror).mkdir(parents=True, exist_ok=True)
+        self.origin = "https://github.com/o/r.git"
+        self.fetch_rc = 0
+        self.fetch_err = "fatal: unable to access 'https://github.com/o/r.git/': Could not resolve host"
 
     def set_pr(self, key: str, data: dict, fetched: float) -> None:
         self.cache[key] = {"key": key, "data": data, "fetchedAt": fetched, "dataAt": fetched}
@@ -16858,6 +16865,10 @@ class LandWorld:
             return subprocess.CompletedProcess(argv, rc, json.dumps(doc) + "\n", "")
         if argv[0] == "/fake/acpmux":
             return subprocess.CompletedProcess(argv, 0, "", "")
+        if argv[0] == "/fake/git" and argv[3:] == ["config", "--get", "remote.origin.url"]:
+            return subprocess.CompletedProcess(argv, 0 if self.origin else 1, self.origin + "\n", "")
+        if argv[0] in ("/fake/git", "/fake/lane-gh"):
+            return subprocess.CompletedProcess(argv, self.fetch_rc, "", "" if self.fetch_rc == 0 else self.fetch_err)
         if argv[0] == os.fspath(self.gh):
             words = argv[1:]
             if words[:2] == ["pr", "view"]:
@@ -17065,6 +17076,103 @@ class LandTest(Base):
         self.assertFalse(gg.land_needs(["x"] * (gg.LAND_NEEDS_MAX + 1)))
         self.assertIsNone(gg.land_needs(["a\nb"]))
         self.assertEqual(gg.land_needs(None), [])
+
+    def fetch_calls(self) -> list[list[str]]:
+        return [c for c in self.w.calls if c[0] in ("/fake/git", "/fake/lane-gh") and "config" not in c]
+
+    def git_fetch(self, *refspecs: str) -> list[str]:
+        return ["git", "--git-dir", self.w.mirror, "fetch", "--quiet", "--no-tags", "origin",
+                *(refspecs or ("+refs/heads/main:refs/remotes/origin/main",))]
+
+    def test_fetch_fills_the_mirror_then_judges_again(self):
+        # huge-blue, 2026-11-17 ~14:01Z: leo-workspace#5653 and #5614 stopped "unreadable" on a mirror fetch named as a
+        # command; a coordinator ran it by hand. A fetch step is run by the queue, then the PR is judged again.
+        self.pr(LA)
+        self.land()
+        argv = self.git_fetch("+refs/heads/main:refs/remotes/origin/main", LA, "main")
+        self.w.answers.append(refusal("unreadable", LA, {"kind": "fetch", "argv": argv}))
+        e = self.tick()
+        self.assertEqual(self.fetch_calls(), [["/fake/git", *argv[1:]]])
+        self.assertIn(["/fake/git", "--git-dir", self.w.mirror, "config", "--get", "remote.origin.url"], self.w.calls)
+        self.assertEqual(self.w.envs[self.w.calls.index(["/fake/git", *argv[1:]])].get(gg.LAND_LANE_ENV), None)
+        self.assertEqual((e["state"], e["wait"]["kind"], e["lastAction"]["kind"], e["lastAction"]["exit"]),
+                         ("waiting", "retry", "fetch", 0))
+        self.assertEqual(e["wakeAt"] - self.t, gg.NUDGE_MIN * 3)
+        self.assertIn(self.KEY, self.w.nudged)
+        self.w.answers.append(ok_answer(LA))
+        self.tick(gg.NUDGE_MIN * 3 + 1)
+        self.assertEqual(len(self.w.explains()), 2)
+        self.assert_merged_at(LA)
+
+    def test_fetch_takes_the_lane_gh_form_and_an_ssh_origin(self):
+        self.pr(LA)
+        self.land()
+        argv = ["lane-gh", "fetch", "o/r", "--dir", self.w.mirror, "--branch", "main", "--branch", "feat/x"]
+        self.w.answers.append(refusal("unreadable", LA, {"kind": "fetch", "argv": argv}))
+        e = self.tick()
+        self.assertEqual(self.fetch_calls(), [["/fake/lane-gh", *argv[1:]]])
+        self.assertEqual((e["state"], e["lastAction"]["form"]), ("waiting", "lane-gh"))
+        for url in ("git@github.com:o/r.git", "ssh://git@github.com/o/r", "https://github.com/O/R"):
+            self.assertEqual(gg.land_fetch_origin(url).lower(), "o/r", url)
+        for url in ("https://gitlab.com/o/r.git", "https://github.com/o/r/x", "file:///m/o/r.git"):
+            self.assertEqual(gg.land_fetch_origin(url), "", url)
+
+    def test_a_fetch_argv_glaeda_does_not_run_stops_as_policy(self):
+        bad = {
+            "upload-pack": self.git_fetch()[:4] + ["--upload-pack=/tmp/x", "origin", "main"],
+            "upload-pack word": self.git_fetch()[:4] + ["--upload-pack", "/tmp/x", "origin", "main"],
+            "semicolon": self.git_fetch("main;touch /tmp/x"),
+            "range": self.git_fetch("main..evil"),
+            "not .git": ["git", "--git-dir", os.path.dirname(self.w.mirror), "fetch", "origin", "main"],
+            "relative": ["git", "--git-dir", "r.git", "fetch", "origin", "main"],
+            "other remote": ["git", "--git-dir", self.w.mirror, "fetch", "evil", "main"],
+            "no such mirror": ["git", "--git-dir", self.w.mirror + "x.git", "fetch", "origin", "main"],
+            "wrong repo": ["lane-gh", "fetch", "o/other", "--dir", self.w.mirror, "--branch", "main"],
+            "lane-gh option": ["lane-gh", "fetch", "o/r", "--dir", self.w.mirror, "--force", "main"],
+            "lane-gh not .git": ["lane-gh", "fetch", "o/r", "--dir", "/tmp", "--branch", "main"],
+            "other program": ["sh", "-c", f"git --git-dir {self.w.mirror} fetch origin"],
+            "string": " ".join(self.git_fetch()),
+        }
+        for n, (name, argv) in enumerate(bad.items()):
+            with self.subTest(name):
+                key = f"pr:o/r#{n + 10}"
+                self.pr(LA, key=key)
+                self.land(f"o/r#{n + 10}")
+                answer = refusal("unreadable", LA, {"kind": "fetch", "argv": argv})
+                answer[1]["number"] = answer[1]["action"]["number"] = n + 10
+                self.w.answers.append(answer)
+                self.tick()
+                e = self.q.entries[key]
+                self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "policy"))
+                self.assertEqual(self.fetch_calls(), [])
+        # a mirror whose origin is another repository is not fetched either
+        self.w.origin = "https://github.com/o/other.git"
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(refusal("unreadable", LA, {"kind": "fetch", "argv": self.git_fetch()}))
+        e = self.tick()
+        self.assertEqual((e["state"], e["stop"]["code"], self.fetch_calls()), ("stopped", "policy", []))
+        self.assertIn("not github.com/o/r", e["stop"]["reason"])
+
+    def test_a_failing_fetch_is_a_refused_step(self):
+        self.pr(LA)
+        self.land()
+        self.w.fetch_rc = 128
+        self.w.answers.append(refusal("unreadable", LA, {"kind": "fetch", "argv": self.git_fetch()}))
+        e = self.tick()
+        self.assertEqual(len(self.fetch_calls()), 1)
+        self.assertEqual((e["state"], e["stepFail"]["kind"], e["stepFail"]["count"], e["wakeAt"] - self.t),
+                         ("waiting", "fetch", 1, gg.LAND_STEP_BACKOFF))
+        self.assertIn("step_refused", [h["event"] for h in e["history"]])
+        # the same failure again at the same head counts on; at LAND_STEP_STOP it stops and tells the requester
+        for n in range(2, gg.LAND_STEP_STOP + 1):
+            e["streak"] = None  # the judge's own streak aside: this counts the step's refusals
+            self.w.answers.append(refusal("unreadable", LA, {"kind": "fetch", "argv": self.git_fetch()}))
+            e = self.tick(gg.LAND_STEP_BACKOFF_MAX + 1)
+            if n < gg.LAND_STEP_STOP:
+                self.assertEqual(e["stepFail"]["count"], n)
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "fetch_refused"))
+        self.assertIn("stopped: fetch_refused", self.w.sent()[-1][-1])
 
     def test_a_refusal_naming_the_broker_update_branch_takes_it(self):
         self.assertTrue(gg.LAND_STEP_NEXT_UPDATE.search(
