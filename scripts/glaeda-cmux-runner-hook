@@ -10529,6 +10529,9 @@ class Gate:
         try:
             fcntl.flock(lock, fcntl.LOCK_EX)  # held for one look; every holder only probes and opens files
             own = claim_path(self.capacity_dir, self.runner_dir, need)
+            if self.claim_at is not None and self.claim_at != own:
+                # its fit changed (HEAD_FIT, IOS_SIM_OWN_FIT): its own claim for the old need is not another gate's
+                self.unclaim(keep_first=True)
             why = mini_full(self.capacity_dir, scope.units, scope, fit, listen_claims(self.capacity_dir, own))
             if why is None and self.child is None and not self.start_due():
                 self.unclaim()  # not listening, and this look does not start it: no job can reach it to claim for
