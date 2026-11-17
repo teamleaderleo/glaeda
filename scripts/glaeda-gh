@@ -6225,8 +6225,9 @@ class Daemon:
             pull, reused = self.rest_pull(old, parts, root, number)
             sha = (pull.get("head") or {}).get("sha") or ""
             was = prior.get("data") if isinstance(prior.get("data"), dict) else {}
-            # settled: the same head with every check completed (a FAILURE head still running is not; review F1)
-            settled_head = (was.get("headRefOid") == sha and was.get("checkState") not in (None, "PENDING", "EXPECTED")
+            # settled: the same head with every check completed, which the gate never takes (a FAILURE head still
+            # running is not settled; review F1)
+            settled_head = (was.get("headRefOid") == sha and bool(was.get("checks"))
                             and all(str(c.get("status") or "").upper() == "COMPLETED" for c in was.get("checks") or []))
             if sha and not settled_head:
                 # the gate's baseline, read before the check runs so a suite finishing meanwhile reads as a change

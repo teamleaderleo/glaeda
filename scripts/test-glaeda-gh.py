@@ -2542,7 +2542,8 @@ class BalanceTest(Base):
         self.daemon.budget["graphql"] = {"limit": 5000, "remaining": 400, "reset": NOW + 3000}
         self.daemon.tick(NOW + gg.CYCLE)
         paths = [c[1].split("/o/r/", 1)[1] for c in self.gh.rest_calls()]
-        self.assertEqual(paths, ["pulls/1", "issues/1", f"commits/{'a' * 40}/check-runs?filter=all&per_page=100",
+        self.assertEqual(paths, ["pulls/1", "issues/1", f"commits/{'a' * 40}/check-suites?per_page=100",
+                                 f"commits/{'a' * 40}/check-runs?filter=all&per_page=100",
                                  f"commits/{'a' * 40}/status?per_page=100&page=1", f"actions/runs?head_sha={'a' * 40}&per_page=100&page=1",
                                  "actions/workflows?per_page=100", "rules/branches/main?per_page=100", "branches/main"])
         over_rest = gg.read_cache(key)["data"]
@@ -3189,7 +3190,7 @@ class BalanceTest(Base):
         self.assertEqual(sorted(p for p in asked() if p.startswith("pulls/")), [f"pulls/{n}" for n in range(1, 6)])
         for path in shared:
             self.assertEqual(asked().count(path), 1, path)
-        self.assertEqual(len(asked()), 5 * 5 + 3)  # each PR: pull, issue (rest_pull) and its head's 3
+        self.assertEqual(len(asked()), 5 * 6 + 3)  # each PR: pull, issue (rest_pull), the gate's suites and its head's 3
         for n in range(1, 6):
             entry = gg.read_cache(f"pr:o/r#{n}")
             self.assertEqual(entry["data"]["requiredMissing"], ["ci-status"], n)
@@ -3197,7 +3198,7 @@ class BalanceTest(Base):
         self.daemon.tick(NOW + gg.CYCLE)  # within the TTL: only the PR-level reads (all 304)
         for path in shared:
             self.assertEqual(asked().count(path), 1, path)
-        self.assertEqual(len(asked()), 5 * 5 + 3 + 5 * 4)  # the issue (304) stands for the pull now
+        self.assertEqual(len(asked()), 5 * 6 + 3 + 5 * 4)  # the issue (304) stands for the pull now
         # past the TTL, one conditional read refreshes each for every PR: a base move is one counted 200
         self.gh.protected = ["ci-status", "lint"]
         before = self.gh.rest_remaining
