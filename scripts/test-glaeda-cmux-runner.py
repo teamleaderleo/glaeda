@@ -79,6 +79,9 @@ os.environ["GLAEDA_RUNNER_TOOLCHAIN_GATE"] = "0"
 # The off-the-tailnet hold reads this host's real Tailscale: off in this process; GateOffTheTailnet turns it on with
 # tailnet_look patched.
 os.environ["GLAEDA_RUNNER_GATE_TAILNET"] = "off"
+# The host load cap reads this host's real load and the build controller's feed: off in this process; HostLoadCapTest
+# turns it on with the load and the feed patched.
+os.environ["CMUX_CI_HOST_LOAD_CAP"] = "off"
 hook = load("glaeda_cmux_runner_hook", HOOK)
 REAL_FIND_DISK = hook.find_disk
 REAL_LEAVE_JOB_WORKSPACE = hook.leave_job_workspace
@@ -8389,6 +8392,170 @@ class IdleLeftoverSweepTest(unittest.TestCase):
              mock.patch.object(hook, "gate_log") as log:
             gate.sweep()  # never raises
         self.assertIn("leftover sweep failed", log.call_args[0][0])
+
+
+class HostLoadCapTest(unittest.TestCase):
+    """cmuxterm-hq#12331's host load cap at the listener (HOST_LOAD_CAP). 2026-11-16 23:5xZ: cmux21 ran at 6.4x its
+    cores and cmux22 at 5.5x while other Macs idled, because GitHub jobs reach a mini through this gate, which had no
+    such cap. A side or root listener on a host whose mean load1 per core over 2 min is above 1.5 takes no new job
+    while another host's listener keeps up with its label (the controller's workflow_job feed); it only defers."""
+
+    LABEL = "glaeda-side-std-xcode-26.6"
+    NOW = 1_800_000_000.0
+
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.tmp = Path(tmp.name)
+        self.runner = self.tmp / "actions-runner-glaeda-2"
+        self.runner.mkdir()
+        (self.runner / ".runner").write_text(json.dumps({"agentName": "cmux21-glaeda-2"}))
+        self.state = self.tmp / "state"
+        (self.state / "instance-2").mkdir(parents=True)
+        (self.state / "instance-2" / "receipt.json").write_text(json.dumps({"registration": {
+            "name": "cmux21-glaeda-2", "labels": ["glaeda-mini", self.LABEL]}}))
+        self.load = [14 * 3.0]
+        self.jobs: list[dict] = []
+        self.fetches = 0
+        for name, value in (("GATE_CPU_EVERY_S", 0.0), ("GATE_SETTINGS_EVERY_S", 0.0),
+                            ("HOST_LOAD_CAP_MIN_SPAN_S", 0.0), ("HOST_LOAD_CAP_FEED_EVERY_S", 0.0)):
+            patcher = mock.patch.object(hook, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        for name, fake in (("load_1min", lambda: self.load[0]), ("gate_host", lambda: "cmux21"),
+                           ("load_cap_fetch", self.fetch), ("gate_log", lambda line: None)):
+            patcher = mock.patch.object(hook, name, side_effect=fake)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        for patcher in (mock.patch.object(hook.os, "cpu_count", return_value=14),
+                        mock.patch.dict(os.environ, {"CMUX_CI_HOST_LOAD_CAP": ""})):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.gate = hook.Gate(self.runner, os.fspath(self.tmp / "host.lock"), os.fspath(self.tmp / "none.json"),
+                              self.state)
+        self.addCleanup(self.join)  # before the temporary directory goes
+
+    def stamp(self, ago: float) -> str:
+        return datetime.datetime.fromtimestamp(time.time() - ago, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    def fetch(self, now: float) -> dict | None:
+        self.fetches += 1
+        return hook.load_cap_summary({"receiver_last_delivery": self.stamp(5), "jobs": self.jobs}, now)
+
+    def job(self, status: str, runner: str | None = None, ago: float = 10.0, labels: list[str] | None = None,
+            workflow: str = "cmux-next", branch: str = "lane/x") -> dict:
+        return {"status": status, "labels": labels or [self.LABEL], "runner": runner, "created_at": self.stamp(ago),
+                "workflow": workflow, "head_branch": branch, "name": "cmux app scheme compile (Release)"}
+
+    def poll(self) -> str | None:
+        """Three looks: two reads make a mean, the first over the cap starts the feed read (waited for), the last
+        decides with it."""
+        for _ in range(2):
+            self.gate.load_capped()
+            self.join()
+        return self.gate.load_capped()
+
+    def join(self) -> None:
+        if self.gate.cap_thread is not None:
+            self.gate.cap_thread.join(5)
+
+    def test_the_cap_and_its_off_switch(self) -> None:
+        now = self.NOW
+        self.assertEqual(hook.host_load_cap(None, "x", now, raw=""), 1.5, "the controller's default")
+        for raw, cap in (("off", 0.0), ("0", 0.0), ("2.5", 2.5), ("junk", 1.5), ("-1", 1.5), ("nan", 1.5)):
+            self.assertEqual(hook.host_load_cap(None, "x", now, raw=raw), cap, raw)
+        later = datetime.datetime.fromtimestamp(now + 60, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        doc = {"defaults": {"hostLoadCap": 2}, "hosts": {"off": {"hostLoadCap": False, "until": later},
+                                                          "bad": {"hostLoadCap": "x"}}}
+        self.assertEqual(hook.host_load_cap(doc, "x", now, raw=""), 2.0, "runner-gate.json's default")
+        self.assertEqual(hook.host_load_cap(doc, "off", now, raw=""), 0.0, "a live host entry")
+        self.assertEqual(hook.host_load_cap(doc, "off", now + 120, raw=""), 2.0, "a lapsed entry is ignored")
+        self.assertEqual(hook.host_load_cap(doc, "bad", now, raw=""), 2.0)
+        self.assertEqual(hook.host_load_cap(doc, "off", now, raw="1.5"), 1.5, "the environment wins")
+        declared = json.loads((ROOT / "config" / "runner-gate.json").read_text())
+        self.assertEqual(hook.host_load_cap(declared, "cmux21", now, raw=""), 1.5, "the declared cap")
+
+    def test_the_mean_needs_two_minutes_of_reads(self) -> None:
+        with mock.patch.object(hook, "HOST_LOAD_CAP_MIN_SPAN_S", 30.0):
+            self.assertIsNone(hook.mean_load_per_core([(100.0, 42.0)], 14, 100.0), "one read is not a mean")
+            self.assertIsNone(hook.mean_load_per_core([(90.0, 42.0), (100.0, 42.0)], 14, 100.0), "10 s is not either")
+            self.assertEqual(hook.mean_load_per_core([(0.0, 28.0), (60.0, 14.0), (100.0, 42.0)], 14, 100.0), 2.0)
+            self.assertEqual(hook.mean_load_per_core([(-50.0, 999.0), (60.0, 14.0), (100.0, 42.0)], 14, 100.0), 2.0,
+                             "reads older than the window drop out")
+            self.assertIsNone(hook.mean_load_per_core([(60.0, 14.0), (100.0, 42.0)], None, 100.0))
+
+    def test_the_verdict(self) -> None:
+        labels, now = frozenset({"glaeda-mini", self.LABEL}), time.time()
+
+        def verdict(*jobs: dict, delivery: float = 5.0) -> str | None:
+            doc = {"receiver_last_delivery": self.stamp(delivery), "jobs": list(jobs)}
+            return hook.load_cap_verdict(hook.load_cap_summary(doc, now), labels, "cmux21", now)
+
+        elsewhere = self.job("in_progress", "cmux20-glaeda-1")
+        self.assertIn(self.LABEL, verdict(elsewhere) or "", "cmux20 serves the label and nothing waits: hold")
+        self.assertIsNotNone(verdict(self.job("completed", "cmux20-glaeda-1")), "a job done there lately counts")
+        self.assertIsNotNone(verdict(elsewhere, self.job("queued", ago=30)), "a job queued 30 s is being taken")
+        self.assertIsNone(verdict(elsewhere, self.job("queued", ago=hook.HOST_LOAD_CAP_GRACE_S)),
+                          "a job that waited the grace found no idle listener: listen")
+        self.assertIsNotNone(verdict(elsewhere, self.job("queued", ago=hook.HOST_LOAD_CAP_JOB_MAX_AGE_S + 1)),
+                             "a job queued for hours is a lost delivery")
+        self.assertIsNone(verdict(elsewhere, self.job("queued", ago=1, workflow="nightly-next")), "urgent: listen")
+        self.assertIsNone(verdict(elsewhere, self.job("queued", ago=1, branch="promote/next")), "urgent: listen")
+        self.assertIsNotNone(verdict(elsewhere, self.job("queued", ago=1)),
+                             "a job named (Release) is a PR job, not urgent")
+        pinned = [self.LABEL, "glaeda-host-cmux21"]
+        self.assertIsNone(hook.load_cap_verdict(hook.load_cap_summary(
+            {"receiver_last_delivery": self.stamp(5), "jobs": [elsewhere, self.job("queued", ago=1, labels=pinned)]},
+            now), labels | {"glaeda-host-cmux21"}, "cmux21", now), "a job pinned to this host: listen")
+        self.assertIsNotNone(hook.load_cap_verdict(hook.load_cap_summary(
+            {"receiver_last_delivery": self.stamp(5), "jobs": [elsewhere, self.job("queued", ago=1, labels=pinned)]},
+            now), labels | {"glaeda-host-cmux21"}, "cmux2", now), "cmux2 is not named by glaeda-host-cmux21")
+        self.assertIsNotNone(verdict(elsewhere, self.job("queued", ago=999, labels=["glaeda-gateway-xcode-26.6"])),
+                             "a job this runner cannot take is not its queue")
+        self.assertIsNone(verdict(self.job("in_progress", "cmux21-glaeda-3")), "only this host serves it: listen")
+        self.assertIsNone(verdict(self.job("in_progress", "blacksmith-6vcpu-macos-26-x")), "no glaeda host elsewhere")
+        self.assertIsNone(verdict(elsewhere, delivery=hook.HOST_LOAD_CAP_FEED_STALE_S + 60), "a stale feed: listen")
+        self.assertIsNone(hook.load_cap_verdict(None, labels, "cmux21", now), "no feed: listen")
+        self.assertIsNone(hook.load_cap_verdict(hook.load_cap_summary({"receiver_last_delivery": self.stamp(5),
+                                                                       "jobs": [elsewhere]}, now), None, "cmux21", now),
+                          "unknown labels: listen")
+        self.assertIsNone(hook.load_cap_summary({"jobs": "no"}, now))
+        self.assertEqual(hook.runner_host("cmux10s-mac-mini-glaeda-3"), "cmux10s-mac-mini")
+        self.assertEqual(hook.runner_host("cmux7s-mac-mini-glaeda"), "cmux7s-mac-mini")
+        self.assertIsNone(hook.runner_host("GitHub Actions 1001030217"))
+
+    def test_an_over_cap_side_listener_defers_while_another_host_keeps_up(self) -> None:
+        self.jobs = [self.job("in_progress", "cmux20-glaeda-1")]
+        why = self.poll()
+        self.assertTrue(why and why.startswith(hook.LOAD_CAPPED) and "1.5 per core" in why, why)
+        self.assertEqual(self.gate.claimed(), why, "claimed() holds the listener off for it")
+        self.assertEqual(self.gate.confirmed(), why, "and the last look before a stop agrees")
+        self.assertTrue((self.state / hook.HOST_LOAD_CAP_FEED_FILE).exists(), "one read serves every gate here")
+
+        self.jobs.append(self.job("queued", ago=hook.HOST_LOAD_CAP_GRACE_S + 5))
+        self.assertIsNone(self.poll(), "a job waits with no idle listener anywhere: it runs here, slower")
+        self.jobs.pop()
+        self.assertIsNotNone(self.poll())
+
+        self.load[0] = 14 * 1.0
+        self.gate.cap_samples.clear()
+        self.assertIsNone(self.poll(), "under the cap it listens")
+        self.load[0] = 14 * 3.0
+
+        self.gate.cap_samples.clear()
+        with mock.patch.object(hook, "load_cap_fetch", return_value=None):
+            self.assertIsNone(self.poll(), "an unreachable controller holds nothing")
+
+    def test_exempt_runners_and_the_off_switch(self) -> None:
+        self.jobs = [self.job("in_progress", "cmux20-glaeda-1")]
+        self.assertIsNotNone(self.poll())
+        for scope in (hook.RunnerScope(gateway=True), hook.RunnerScope(nightly=True), hook.RunnerScope(gui=True),
+                      hook.RunnerScope(session=True), hook.RunnerScope(fresh=True)):
+            with mock.patch.object(hook, "runner_scope", return_value=scope):
+                self.assertIsNone(self.gate.load_capped(), scope)
+        with mock.patch.dict(os.environ, {"CMUX_CI_HOST_LOAD_CAP": "off"}):
+            self.assertIsNone(self.poll(), "CMUX_CI_HOST_LOAD_CAP=off turns it off")
+        self.assertIsNotNone(self.poll(), "and back on")
 
 
 class GateOffTheTailnet(unittest.TestCase):

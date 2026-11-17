@@ -462,6 +462,26 @@ What `--apply` does:
        gateway runners are exempt, as they are from the CPU hold, because their labels have few
        other runners. A hold longer than `GATE_LOAD_MAX_HOLD_S` (30 min) listens anyway until the
        load falls, so no label is stranded. `false` turns the hold off, by default or per host.
+     - **Host load cap** (`HOST_LOAD_CAP`; cmuxterm-hq#12331's `CMUX_CI_HOST_LOAD_CAP` at the
+       listener). The controller's cap keeps ci-steps off a host whose mean 1-minute load per core
+       over 2 minutes is above 1.5 while a capable host is under it, but GitHub jobs reach a mini
+       through this gate: on 2026-11-16 at 23:5xZ cmux21 ran at 6.4x its cores and cmux22 at 5.5x
+       while other Macs idled. A side or root listener on a mini over the cap (the mean of the gate's
+       own `getloadavg` reads over 2 min, at least 30 s of them) takes no new job while another
+       host's listener keeps up with its label. The evidence is the build controller's
+       workflow_job feed (`/v1/github/actions?repo=manaflow-ai/cmux&recent=600` over the tailnet:
+       no GitHub quota, no token), read at most once a minute per mini in a thread and shared by
+       its gates through `load-cap-feed.json` in the state dir: another host's runner has run a job
+       whose labels this runner carries (running, or done in the last 10 min), and no job it could
+       take has waited `HOST_LOAD_CAP_GRACE_S` (120 s) for a runner. The moment one has, or a
+       nightly or promotion job (urgent) or one whose labels name this host (pinned) queues, it
+       listens, so when every capable host is over the cap the job still runs where it fits. A feed
+       that cannot be read, has had no delivery for 10 min, or shows no other host serving the
+       label holds nothing. It only defers: nothing is refused or failed. The gui, session,
+       freshness, nightly and gateway runners (which carry the measurement clients) are exempt.
+       `hostLoadCap` in `config/runner-gate.json` sets the cap (a number, `false` for off) by
+       default or per host; `CMUX_CI_HOST_LOAD_CAP` in the runner LaunchAgent's environment wins,
+       and `off` or 0 turns it off.
      - The gui runner is never held for CPU saturation (85% busy), only for memory
        pressure: its jobs come one per mini and are admitted by units like any other,
        and the CPU mark held it whenever the other lanes kept the mini busy. Nothing
