@@ -379,9 +379,12 @@ PRIVACY_SKIP_NAMES = (
 
 def du_skip_args() -> list[str]:
     """du's flags that keep a walk out of FileProvider/iCloud trees and, on macOS, privacy-guarded folders."""
-    if DARWIN:
-        return [arg for name in (*sorted(MEASURE_SKIP_COMPONENTS), *PRIVACY_SKIP_NAMES) for arg in ("-I", name)]
-    return [f"--exclude={name}" for name in sorted(MEASURE_SKIP_COMPONENTS)]
+    names = [*sorted(MEASURE_SKIP_COMPONENTS), *(PRIVACY_SKIP_NAMES if DARWIN else ())]
+    # The spelling follows the du that runs (BSD's -I, GNU's --exclude), not DARWIN, which a suite may set
+    # on a Linux host.
+    if sys.platform == "darwin":
+        return [arg for name in names for arg in ("-I", name)]
+    return [f"--exclude={name}" for name in names]
 
 # These roots are for accounting only. They are deliberately separate from the eviction
 # catalogue: their sizes may overlap, and an incomplete walk is a lower bound rather than
