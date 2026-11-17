@@ -253,7 +253,8 @@ effect without a restart.
   steps taken per day, which `land status` prints); ~/.config/glaeda/land.json may set gh, mergeHold, acpmux,
   routerReview, python, workers and env. merge_hold.py is mergeHold, else the ws-sync deploy's, else
   ~/Projects/leo-workspace/tools/merge_hold.py; with none of them the land worker refuses to start (land/refused.json,
-  which `land status` prints) and `land` refuses to queue (merge_hold_missing). On a lane VM (an upstream host) the
+  which `land status` prints) and `land` refuses to queue (merge_hold_missing). router-review is routerReview, else
+  the first of ~/.local/bin, the ws-sync deploy's tools/ and the leo-workspace checkout's tools/, else PATH. On a lane VM (an upstream host) the
   worker reads a landing PR itself through the broker when the upstream's copy is over LAND_REFRESH_AFTER old.
   A quota refusal (merge_hold's, or the shim's on the merge) parks the PR until the reset it names plus a 0-120 s
   per-caller jitter, with no read, judge, watch or nudge before it (`land status`: "parked until HH:MMZ (quota)");
@@ -808,7 +809,11 @@ PR_FIELDS = PR_FIELDS.replace("SUITE_ATTEMPTS", SUITE_ATTEMPTS)
 PR_COUNTS = ("checkRunCount checkRunCountsByState { state count } statusContextCount "
              "statusContextCountsByState { state count }")
 PR_FIELDS = PR_FIELDS.replace("PR_COUNTS", PR_COUNTS)
-PR_PROBE_FIELDS = (f"number state isDraft merged mergeable mergeStateStatus headRefOid reviewDecision commits(last: 1) "
+# `updatedAt` rides along without being part of the fingerprint: a comment, a label or a body edit moves it and nothing
+# a verdict reads, so a probe that matched would otherwise keep the full read's updatedAt for up to PR_FULL_EVERY, and
+# the broker's vouched `pr view` answers (gh_cache_vouch) go by it. A scalar, so it costs the probe nothing.
+PR_PROBE_FIELDS = (f"number state isDraft merged mergeable mergeStateStatus headRefOid reviewDecision updatedAt "
+                   f"commits(last: 1) "
                    f"{{ nodes {{ commit {{ checkSuites(first: 1) {{ totalCount }} statusCheckRollup {{ state "
                    f"contexts(first: 1) {{ totalCount {PR_COUNTS} }} }} }} }} }}")
 PR_FULL_EVERY = 600  # a probed PR is still read in full this often (a renamed check, a base's required contexts)
@@ -2340,6 +2345,20 @@ def outranks(new: dict, new_order: tuple, old: dict, old_order: tuple) -> bool:
     if live[0] and cancelled[1]:
         return True
     return new_order >= old_order
+
+
+def confirmed_updated(cache: dict | None, node: dict | None, now: float) -> dict:
+    """Store fields for a PR whose cached answer a probe (or a full read's first page) just confirmed: the node's
+    updatedAt, which the fingerprint leaves out, and updatedAtAt, the time head and updatedAt were read together. {}
+    when the node carries no updatedAt or another head (then the read is not a confirmation of this data)."""
+    data = (cache or {}).get("data")
+    upd = node.get("updatedAt") if isinstance(node, dict) else None
+    if not isinstance(data, dict) or not isinstance(upd, str) or node.get("headRefOid") != data.get("headRefOid"):
+        return {}
+    fields: dict[str, Any] = {"updatedAtAt": now}
+    if data.get("updatedAt") != upd:
+        fields["data"] = {**data, "updatedAt": upd}
+    return fields
 
 
 def pr_fingerprint(node: dict | None) -> str | None:
@@ -5179,6 +5198,9 @@ class Daemon:
                                    if isinstance(shown, (int, float)) and not isinstance(shown, bool) else None)
             if data is not None:
                 fields.update(data=data, dataAt=float(at) if isinstance(at, (int, float)) else self.now)
+                vouched = entry.get("updatedAtAt")  # the upstream's own claim for this data (confirmed_updated)
+                if isinstance(vouched, (int, float)) and not isinstance(vouched, bool):
+                    fields["updatedAtAt"] = min(self.now, float(vouched))
             if isinstance(entry.get("jobs"), list):
                 fields["jobs"] = entry["jobs"]
                 # when the upstream read that job list, so a downstream `--jobs` look is answered (once_answered)
@@ -5528,9 +5550,14 @@ class Daemon:
             base = current if isinstance(current, dict) else prior
             entry = {"key": key, "fetchedAt": self.now, "dataAt": None, "data": None, "error": None}
             if base:
-                entry.update({k: base[k] for k in ("dataAt", "data", "etag", "jobs", "jobsEtag", "jobsAt", "jobsTried", "restAt", "source", "restParts", "restRun", "restRunAt", "origin", "via", "rerunAt", "fp", "fullAt", "wholeAt", "restFullAt")
+                entry.update({k: base[k] for k in ("dataAt", "data", "etag", "jobs", "jobsEtag", "jobsAt", "jobsTried", "restAt", "source", "restParts", "restRun", "restRunAt", "origin", "via", "rerunAt", "fp", "fullAt", "wholeAt", "restFullAt", "updatedAtAt")
                               if k in base})
             entry.update(fields)
+            if "data" in fields and "updatedAtAt" not in fields:
+                # updatedAtAt says when `data`'s head and updatedAt were last read from GitHub together (a whole
+                # GraphQL read, a probe or a confirming first page: confirmed_updated). Data from any other writer
+                # (REST, which may keep a pull up to PULL_REUSE_MAX; a wait's direct read) does not carry that claim.
+                entry.pop("updatedAtAt", None)
             if key.startswith("pr:") and isinstance(entry.get("data"), dict) and "data" in fields:
                 old = (base or {}).get("data") if isinstance((base or {}).get("data"), dict) else {}
                 head = entry["data"].get("headRefOid")
@@ -5631,11 +5658,13 @@ class Daemon:
         self.limited = [e for i, e in enumerate(entries) if f"{alias}{i}" in limits]
         for i, e in enumerate(entries):
             if i in kept:
-                self.store(e["key"], e["cache"], dataAt=self.now, via="graphql-probe", fullAt=self.now)
+                self.store(e["key"], e["cache"], dataAt=self.now, via="graphql-probe", fullAt=self.now,
+                           **confirmed_updated(e["cache"], (data.get(f"{alias}{i}") or {}).get(field), self.now))
                 continue
             if i in parsed:
                 # a REST read's kept answers are dead weight in a file clients re-read every 3 s
-                more = {"fp": fps.get(i), "fullAt": self.now, "wholeAt": self.now} if kind == "pr" else {}
+                more = {"fp": fps.get(i), "fullAt": self.now, "wholeAt": self.now,
+                        "updatedAtAt": self.now} if kind == "pr" else {}
                 self.store(e["key"], e["cache"], dataAt=self.now, data=parsed[i], restParts=None, via="graphql", **more)
                 continue
             err = problems.get(f"{alias}{i}") or {}
@@ -5972,7 +6001,8 @@ class Daemon:
                 changed.append(e)
                 continue
             self.reads.append((self.now, "pr", "graphql"))
-            self.store(e["key"], e["cache"], dataAt=self.now, via="graphql-probe")
+            self.store(e["key"], e["cache"], dataAt=self.now, via="graphql-probe",
+                       **confirmed_updated(e.get("cache"), node, self.now))
         return changed, None
 
     def fetch_comments(self, entries: list[dict]) -> str | None:
@@ -7119,6 +7149,27 @@ def land_merge_hold_missing(tried: list[Path]) -> tuple[str, str]:
     return why, nxt
 
 
+# Where router-review is, in order, after land.json's routerReview: ~/.local/bin (a host that links it there), the
+# ws-sync deploy's tools/, the leo-workspace checkout's tools/, then the daemon's PATH. The first that exists is run.
+# Before, only ~/.local/bin/router-review was tried, and on a host with no such link every review step stopped
+# review_failed with FileNotFoundError (cmux#45626, 2026-11-17).
+LAND_ROUTER_REVIEW_PATHS = (Path.home() / ".local/bin/router-review", LAND_MERGE_HOLD.parent / "router-review",
+                            Path.home() / "Projects/leo-workspace/tools/router-review")
+
+
+def land_router_review(config: dict) -> tuple[Path | None, list[Path]]:
+    """(the router-review to run, or None; every path tried): CONFIG's routerReview as given (a path set by hand is
+    run, and its own failure stops review_failed), else the first of LAND_ROUTER_REVIEW_PATHS that is executable,
+    else router-review on PATH."""
+    given = config.get("routerReview")
+    if isinstance(given, str) and given:
+        return Path(os.path.expanduser(given)), [Path(os.path.expanduser(given))]
+    tried = list(LAND_ROUTER_REVIEW_PATHS)
+    found = next((p for p in tried if p.is_file() and os.access(p, os.X_OK)), None)
+    on_path = None if found else shutil.which("router-review")
+    return (Path(on_path) if on_path else found), tried + ([] if found else [Path("$PATH/router-review")])
+
+
 # The startup check's second half: merge_hold.py found is in a git checkout (on a lane VM, ~/Projects/leo-workspace)
 # that may sit far behind main when nothing deploys it. gcp-codex-lane-12, 2026-11-17: its checkout sat at
 # leo-workspace#5512 while main moved on, and its old merge_hold could not read main's TWINS (after #5580), so every
@@ -7547,6 +7598,19 @@ def land_fetch_shape(argv: Any, repo: str) -> tuple[str, str, str]:
             return "", "", f"lane-gh fetch with an option this queue does not run: {land_trim(pairs, 160)}"
         return "lane-gh", argv[4], ""
     return "", "", f"the fetch step is neither git --git-dir M fetch nor lane-gh fetch: {land_trim(argv[:5], 160)}"
+
+
+# A chat or iOS hold the PR body can claim a release from (leo-workspace hold_fences CHAT_CLAIM and IOS_CLAIM: a line
+# of its own, "Chat-hold: ..." or "iOS-hold: ..."); a review SHIP at the head must confirm the claim it makes.
+LAND_HOLD_CLAIM_STOPS = frozenset({"chat_hold", "ios_hold"})
+LAND_HOLD_CLAIM = re.compile(r"^[ \t>*_-]*(?:Chat|iOS)-hold:[^\n]*$", re.M | re.I)
+LAND_HOLD_BODY_DEADLINE = 30.0
+
+
+def land_hold_claims(body: str) -> str:
+    """BODY's hold claim lines, normalized and in order, joined by newlines: "" when it has none."""
+    found = LAND_HOLD_CLAIM.findall(str(body or "").replace("\r\n", "\n"))
+    return "\n".join(" ".join(re.sub(r"[*_]", "", line).strip(" \t>-").split()).lower() for line in found)
 
 
 def land_fetch_origin(url: str) -> str:
@@ -8562,9 +8626,11 @@ class LandQueue:
         if kind in ("stop", "command"):
             why = act.get("why") or answer.get("reason")
             nxt = " ".join(map(str, act["argv"])) if isinstance(act.get("argv"), list) else act.get("text")
+            cls = str(act.get("stop") or answer.get("code") or kind)
+            if cls in LAND_HOLD_CLAIM_STOPS and self.review_hold_claim(e, head, answer):
+                return
             with self.lock:
-                self.stop(e, str(act.get("stop") or answer.get("code") or kind), land_trim(why),
-                          land_trim(nxt or answer.get("next")))
+                self.stop(e, cls, land_trim(why), land_trim(nxt or answer.get("next")))
             return
         if kind == "merge":
             sha = str(act.get("sha") or head).lower()
@@ -8730,11 +8796,23 @@ class LandQueue:
         checks finished, is the base moving during CI: counted in history as update_again."""
         repo, number = e["repo"], str(e["number"])
         data = (self.cache_of(e["key"]) or {}).get("data") or {}
-        if land_checks_running(data, head):
+        held = e.get("updateDeferred") or {}
+        stuck = held.get("head") == head and self.now - float(held.get("at") or 0) >= LAND_WAIT_DEFAULT
+        if land_checks_running(data, head) and not stuck:
+            # Deferred once per head. A check still running after the whole wait never finishes (stuck, no runner):
+            # deferring again only re-judges it into the identical-refusal stop with the named update never sent
+            # (cmux#44800 stale_green, cmux#45380 tip_merge, 2026-11-17: both stopped, a person updated them).
             with self.lock:
+                if held.get("head") != head:
+                    e["updateDeferred"] = {"head": head, "at": self.now}
                 self.history(e, "update_deferred", head=head[:12], why="checks still running at the head")
                 self.wait_running(e, head, land_fingerprint(self.cache_of(e["key"])))
             return
+        if stuck:
+            with self.lock:
+                self.history(e, "update_past_stuck", head=head[:12],
+                             why=f"checks still running {LAND_WAIT_DEFAULT:.0f} s after the update was deferred")
+        e.pop("updateDeferred", None)
         if head and head == e.get("updatedHead"):
             with self.lock:
                 self.history(e, "update_again", head=head[:12], why="the base moved during this update's CI")
@@ -8823,20 +8901,47 @@ class LandQueue:
         if named == "update_branch":
             self.update_branch(e, sha)
 
-    def do_review(self, e: dict, head: str, answer: dict) -> None:
-        """router-review R N --post, at most once per head (claimed before it starts), detached; then wait for its
-        receipt comment."""
-        repo, number = e["repo"], str(e["number"])
+    def review_hold_claim(self, e: dict, head: str, answer: dict) -> bool:
+        """A chat or iOS hold whose PR body claims a release (a Chat-hold: or iOS-hold: line) passes only with a SHIP
+        at the head confirming that claim, and the queue reviews once per head: a claim written or changed after the
+        head's review was never confirmed, and the entry stopped (cmux#45558, 2026-11-17). Reviews again once per
+        (head, claim lines); True when it did, False to let the stop stand (no claim, the body unread, or reviewed)."""
+        gh = self.gh()
+        if gh is None or not SHA40.fullmatch(head or ""):
+            return False
+        got = self.call([gh, "pr", "view", str(e["number"]), "-R", e["repo"], "--json", "body", "--jq", ".body"],
+                        LAND_HOLD_BODY_DEADLINE, e)
+        claims = land_hold_claims(got.stdout or "") if got.returncode == 0 else ""
+        if not claims:
+            return False
+        key = f"{head}|{hashlib.sha256(claims.encode()).hexdigest()[:12]}"
+        if key in e.get("reviewed", []):
+            return False
         with self.lock:
-            if head in e.setdefault("reviewed", []):
+            self.history(e, "hold_claim_review", head=head[:12], claims=land_trim(claims, 160))
+        self.do_review(e, head, answer, key=key)
+        return True
+
+    def do_review(self, e: dict, head: str, answer: dict, key: str = "") -> None:
+        """router-review R N --post, at most once per head (claimed before it starts), detached; then wait for its
+        receipt comment. KEY (default the head) is what counts as reviewed: review_hold_claim's adds the claim."""
+        repo, number = e["repo"], str(e["number"])
+        key = key or head
+        with self.lock:
+            if key in e.setdefault("reviewed", []):
                 self.history(e, "review_already_run", head=head[:12])
             elif self.gh() is None:
                 self.stop(e, "no_shim", f"no gh-quota shim at {self.path('gh', LAND_GH)}; router-review --post is not "
                           "run around it", f"router-review {repo} {number} --post")
                 return
             else:
-                rr = self.path("routerReview", Path.home() / ".local/bin/router-review")
-                e["reviewed"] = (e["reviewed"] + [head])[-10:]  # saved by the claim: a restart never posts it twice
+                rr, tried = land_router_review(self.config())
+                if rr is None:
+                    self.stop(e, "review_failed", "router-review is not at any of " + ", ".join(map(os.fspath, tried)),
+                              f'set "routerReview" in {LAND_CONFIG} to router-review\'s path, then '
+                              f"router-review {repo} {number} --post")
+                    return
+                e["reviewed"] = (e["reviewed"] + [key])[-10:]  # saved by the claim: a restart never posts it twice
                 self.claim(e, "review", head=head)
                 logs = land_dir() / "logs"
                 logs.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -8847,7 +8952,7 @@ class LandQueue:
                                          close_fds=True, cwd=os.environ.get("HOME") or "/")
                     self.finish(e, None, started=True)
                 except OSError as error:
-                    e["reviewed"] = [h for h in e["reviewed"] if h != head]
+                    e["reviewed"] = [h for h in e["reviewed"] if h != key]
                     self.finish(e, None, error=describe(error))
                     self.stop(e, "review_failed", f"router-review could not start: {describe(error)}",
                               f"router-review {repo} {number} --post")
@@ -14145,6 +14250,180 @@ GH_CACHE_WRITE_BOOL_FLAGS = {
     "--fill-verbose", "--no-maintainer-edit", "--dry-run", "--editor", "--web", "-w"}
 
 
+# -- vouched `pr view` answers: kept while the PR's head and updatedAt stay what they were
+#
+# Agent sessions type `gh pr view` by hand -- with a number, a branch, or no target at all (the checked-out branch's
+# PR), with and without `--json` -- and keep typing it while they wait: on 2026-11-17 15:30-17:30Z the gh-quota logs on
+# four agent hosts held 140 such charged reads (70 an hour), many minutes apart, past
+# GH_CACHE_TTL. Each reads the same answer as the one before whenever the PR has not changed, and GitHub moves a PR's
+# updatedAt on every push, comment, review, label, title or body edit, state change and review request: everything
+# plain `pr view` prints except its `projects:` line and, unproven, its `auto-merge:` line. Replaying those 140 calls
+# against each PR's real change times: 110 still reach GitHub (the 90 s cache alone: 120; a perfect oracle: 95), since
+# 20 are a merge's own preflight, 35 read a branch with no PR (gh exits 1: nothing is kept), and most of the rest
+# follow the session's own push or comment.
+#
+# So a `pr view` answer whose output depends only on what moves updatedAt or the head (GH_CACHE_VOUCH_UNSAFE names the
+# `--json` fields that move without them: checks, mergeability against the base, review decision, auto-merge,
+# projects) remembers the head and updatedAt it was read at ("vouch"), and is answered again for GH_CACHE_VOUCH_KEEP as
+# long as glaeda's daemon holds that PR at the same head and updatedAt, read from GitHub in the last
+# GH_CACHE_VOUCH_FRESH seconds (updatedAtAt: a whole GraphQL read, a probe, or a confirming first page), and no write
+# from this host touched it since. Anything else reads afresh, as before. The vouch comes from the answer itself when
+# it prints both (`--json headRefOid,updatedAt,...`), else from what the daemon held just before gh ran: a vouch older
+# than the answer can only drop it early, never keep it past a change.
+#
+# Never for a gate: a caller that set GLAEDA_GH_CACHE_TTL (merge_hold, land_ready, merge recovery) or a landing read
+# (GH_QUOTA_LANDING_READ) asked for GitHub within its own bound, and gets the TTL rules alone. A write or a merge never
+# reads the answer cache at all (gh_cache_write).
+GH_CACHE_VOUCH_KEEP = 3600.0
+GH_CACHE_VOUCH_FRESH = BROKER_MAX_AGE
+# `pr view --json` fields whose value can change while the head and updatedAt stay: a check finishing, the base moving
+# (mergeable, mergeStateStatus, baseRefOid, potentialMergeCommit), branch protection (reviewDecision), the merge queue,
+# auto-merge, project boards, reactions, and issues that link the PR from their own side.
+GH_CACHE_VOUCH_UNSAFE = {"statusCheckRollup", "mergeable", "mergeStateStatus", "reviewDecision", "autoMergeRequest",
+                         "projectCards", "projectItems", "potentialMergeCommit", "baseRefOid", "isInMergeQueue",
+                         "isMergeQueueEnabled", "reactionGroups", "closingIssuesReferences"}
+# The flags a vouched `pr view` may carry. `--web` never reaches here (GH_CACHE_NEVER); anything else is passed on.
+GH_CACHE_VOUCH_FLAGS = {"--repo", "--json", "--jq", "--template", "--comments"}
+GH_CACHE_VOUCH_URL_RE = re.compile(rf"^url:\thttps://github\.com/({NAME})/({NAME})/pull/(\d+)$", re.M)
+
+
+def gh_cache_vouch_gate() -> bool:
+    """Whether this caller may be answered by a vouch: not a gate that bounds its own staleness."""
+    return "GLAEDA_GH_CACHE_TTL" not in os.environ and not os.environ.get("GH_QUOTA_LANDING_READ")
+
+
+def gh_cache_vouch_shape(words: list[str], values: dict[str, str], seen: set[str]) -> bool:
+    """A `pr view` whose output the PR's head and updatedAt decide: plain, or `--json` fields none of which moves
+    without them, with no flag but GH_CACHE_VOUCH_FLAGS."""
+    if tuple(words[:2]) != ("pr", "view") or len(words) > 3:
+        return False
+    if {BROKER_FLAG_ALIAS.get(f, f) for f in seen} - GH_CACHE_VOUCH_FLAGS - {"-q", "-t"}:
+        return False
+    fields = {f for f in (values.get("--json") or "").split(",") if f}
+    if "--json" in seen and not fields:
+        return False
+    return not fields & GH_CACHE_VOUCH_UNSAFE
+
+
+def gh_cache_vouch_held(daemon_key: str, now: float | None = None) -> tuple[str, str] | None:
+    """(headRefOid, updatedAt) glaeda's daemon holds for one PR, when it read them from GitHub together
+    (updatedAtAt) and, with `now`, no longer ago than GH_CACHE_VOUCH_FRESH; None otherwise. Never raises."""
+    try:
+        entry = read_cache(daemon_key)
+    except Exception:  # noqa: BLE001  a lookup in front of a gh call
+        return None
+    if not isinstance(entry, dict) or entry.get("error") or not isinstance(entry.get("data"), dict):
+        return None
+    seen_at, data = entry.get("updatedAtAt"), entry["data"]
+    if not isinstance(seen_at, (int, float)) or isinstance(seen_at, bool):
+        return None
+    if now is not None and not 0 <= now - seen_at <= GH_CACHE_VOUCH_FRESH:
+        return None
+    head, upd = data.get("headRefOid"), data.get("updatedAt")
+    return (head, upd) if isinstance(head, str) and head and isinstance(upd, str) and upd else None
+
+
+def gh_cache_answer_pr(out: bytes, repo: str | None) -> tuple[str | None, tuple[str, str] | None]:
+    """(the daemon key of the PR an answer is about, (head, updatedAt) when it prints both), read off what gh printed:
+    a `--json` object's url (or number, in `repo`), or plain `pr view`'s url line. (None, None) when it says neither."""
+    text = out.decode("utf-8", "replace")
+    try:
+        doc = json.loads(text)
+    except ValueError:
+        doc = None
+    if isinstance(doc, dict):
+        key = None
+        match = GH_CACHE_PR_URL_RE.match(str(doc.get("url") or ""))
+        if match and "/pull/" in str(doc.get("url")):
+            key = f"pr:{match.group(1).lower()}/{match.group(2).lower()}#{int(match.group(3))}"
+        elif isinstance(doc.get("number"), int) and not isinstance(doc.get("number"), bool) and repo:
+            key = f"pr:{repo.lower()}#{doc['number']}"
+        head, upd = doc.get("headRefOid"), doc.get("updatedAt")
+        own = (head, upd) if isinstance(head, str) and head and isinstance(upd, str) and upd else None
+        return key, own
+    match = GH_CACHE_VOUCH_URL_RE.search(text)
+    if match:
+        return f"pr:{match.group(1).lower()}/{match.group(2).lower()}#{int(match.group(3))}", None
+    return None, None
+
+
+def gh_cache_branch_state() -> list[str] | None:
+    """What gh reads from the working directory to find the checked-out branch's PR: the branch, and the branch,
+    remote and push configuration (its upstream, push remote, gh-merge-base). None on a detached head or when git
+    cannot say, so a `pr view` with no target is then not kept."""
+    try:
+        head = subprocess.run(["git", "symbolic-ref", "-q", "--short", "HEAD"], capture_output=True, text=True,
+                              timeout=5, stdin=subprocess.DEVNULL)
+        if head.returncode != 0 or not head.stdout.strip():
+            return None
+        config = subprocess.run(["git", "config", "--get-regexp", r"^(branch|remote|push)\."], capture_output=True,
+                                text=True, timeout=5, stdin=subprocess.DEVNULL)
+        if config.returncode not in (0, 1):
+            return None
+        top = subprocess.run(["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True, timeout=5,
+                             stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return [head.stdout.strip(), config.stdout, top.stdout.strip()]
+
+
+def gh_cache_vouch_note(meta: dict, words: list[str], values: dict[str, str], seen: set[str], repo: str | None,
+                        key: str) -> None:
+    """Before gh runs: the PR this answer is likely about (the line's own target, or the PR the last answer for this
+    key named) and what the daemon holds for it now, kept in `meta` for gh_cache_vouch_after. No-op for a shape that
+    cannot be vouched."""
+    if not gh_cache_vouch_shape(words, values, seen):
+        return
+    meta["vouchable"] = True
+    target = gh_cache_target(words, values, repo)
+    pr = f"pr:{target[1]}#{int(target[2])}" if target and target[0] == "pr" else None
+    if pr is None:
+        prior = read_json(gh_cache_dir() / f"{key}.json")
+        pr = prior.get("pr") if isinstance(prior, dict) and isinstance(prior.get("pr"), str) else None
+    held = gh_cache_vouch_held(pr) if pr else None
+    if pr:
+        meta["prBefore"] = pr
+    if held:
+        meta["heldBefore"] = list(held)
+
+
+def gh_cache_vouch_after(meta: dict, out: bytes, repo: str | None, explicit: bool) -> str | None:
+    """After gh answered: settle the vouch in `meta` (the answer's own head and updatedAt, else what the daemon held
+    before the read for the same PR) and return the PR's daemon key, or None when the answer names no PR it can be
+    tied to. `explicit`: the line named the PR, so an answer that prints no url is still about it."""
+    before = meta.pop("prBefore", None)
+    held = meta.pop("heldBefore", None)
+    if not meta.pop("vouchable", False):
+        return None
+    pr, own = gh_cache_answer_pr(out, repo)
+    if pr is None and explicit:
+        pr = before
+    if pr is None:
+        return None
+    meta["pr"] = pr
+    if isinstance(meta.get("stamps"), list):
+        # A write from this host to that PR makes the answer old however the line named it (a branch, no target).
+        _kind, owner, name, number = split_key(pr)
+        meta["stamps"] = list(dict.fromkeys(meta["stamps"] + (gh_cache_stamps(["pr", f"{owner}/{name}", str(number)],
+                                                                             f"{owner}/{name}") or [])))
+    if own is not None:
+        meta["vouch"] = [pr, *own]
+    elif held and pr == before:
+        meta["vouch"] = [pr, *held]
+    return pr
+
+
+def gh_cache_vouched(doc: dict, now: float) -> bool:
+    """Whether a kept answer's vouch still holds: the daemon holds its PR, freshly read, at the same head and
+    updatedAt, and the answer is younger than GH_CACHE_VOUCH_KEEP. The caller checks the write stamps."""
+    vouch = doc.get("vouch")
+    if not (isinstance(vouch, list) and len(vouch) == 3 and all(isinstance(x, str) for x in vouch)):
+        return False
+    if not gh_cache_vouch_gate() or not 0 <= now - float(doc["at"]) < GH_CACHE_VOUCH_KEEP:
+        return False
+    return gh_cache_vouch_held(vouch[0], now) == (vouch[1], vouch[2])
+
+
 def gh_cache_dir() -> Path:
     return BASE / "answers"
 
@@ -14239,6 +14518,7 @@ def gh_cache_key(args: list[str], words: list[str], values: dict[str, str], seen
             or any(os.environ.get(name) for name in GH_CACHE_DEBUG_ENV):
         return None
     head = tuple(words[:2])
+    branch: list[str] | None = None
     graphql = head[:1] == ("api",) and len(words) > 1 and bool(AUDIT_GRAPHQL_RE.match(words[1]))
     if graphql:
         # A GraphQL read is a POST, so the method says nothing: the query does. gh_cache_is_write
@@ -14253,8 +14533,16 @@ def gh_cache_key(args: list[str], words: list[str], values: dict[str, str], seen
             return None  # see GH_CACHE_TARGETED
     elif head in GH_CACHE_LISTS or gh_cache_anywhere(words):
         pass
+    elif head == ("pr", "view") and len(words) == 2:
+        # No target: gh reads the checked-out branch's PR. Kept only in the shape a vouch can hold (gh_cache_vouch),
+        # keyed on what gh reads to find that PR (gh_cache_branch_state), so another branch or worktree is another key.
+        if not gh_cache_vouch_shape(words, values, seen):
+            return None
+        branch = gh_cache_branch_state()
+        if branch is None:
+            return None
     elif head not in GH_CACHE_READS or len(words) < 3:
-        return None  # `pr view` with no target reads the checked-out branch, which is not on the line
+        return None
     if seen & GH_CACHE_NEVER:
         return None
     # The repository gh resolves from the working directory when the line names none, and the
@@ -14279,6 +14567,8 @@ def gh_cache_key(args: list[str], words: list[str], values: dict[str, str], seen
     data = head[:1] == ("api",) or bool(seen & GH_CACHE_DATA_FLAGS)
     ident = [question, resolved, os.environ.get("GH_REPO") or "", os.environ.get("GH_HOST") or "",
              gh_cache_identity(real, data)]
+    if branch is not None:
+        ident.append(branch)
     return hashlib.sha256(json.dumps(ident).encode()).hexdigest()[:40]
 
 
@@ -14477,7 +14767,7 @@ def gh_cache_superset_note(spec: tuple | None, key: str, at: float, real: str | 
     doc = read_json(path)
     entries = doc.get("entries") if isinstance(doc, dict) and isinstance(doc.get("entries"), dict) else {}
     entries = {k: v for k, v in entries.items()
-               if isinstance(v, dict) and isinstance(v.get("at"), (int, float)) and at - v["at"] < GH_CACHE_KEEP}
+               if isinstance(v, dict) and isinstance(v.get("at"), (int, float)) and at - v["at"] < GH_CACHE_VOUCH_KEEP}
     entries[key] = {"at": at, "fields": sorted(set(fields))}
     write_json(path, {"entries": entries})
 
@@ -14763,6 +15053,11 @@ def gh_cache_get(key: str, repo: str | None, now: float) -> dict | None:
     if not isinstance(doc, dict) or doc.get("key") != key or not isinstance(doc.get("at"), (int, float)):
         return None
     at = float(doc["at"])
+    if gh_cache_vouched(doc, now):
+        # The PR is where it was when this was read (gh_cache_vouch): the daemon's change mark and the TTL do not
+        # apply -- a check finishing moves the mark and nothing this prints -- but this host's writes still do.
+        answer = gh_cache_unstamped(doc, repo, at)
+        return None if answer is None else {**answer, "vouched": doc["vouch"][0]}
     ttl = gh_cache_ttl()
     long = ttl > 0 and doc.get("long") is True
     if long:
@@ -14794,6 +15089,11 @@ def gh_cache_get(key: str, repo: str | None, now: float) -> dict | None:
         ttl = max(ttl, GH_CACHE_DONE_TTL)
     if not 0 <= now - at < ttl:
         return None
+    return gh_cache_unstamped(doc, repo, at)
+
+
+def gh_cache_unstamped(doc: dict, repo: str | None, at: float) -> dict | None:
+    """A kept answer as {rc, out, err}, unless a write that could have changed it was stamped at or after `at`."""
     writes = gh_cache_writes()
     stamps = doc.get("stamps")
     if isinstance(stamps, list) and all(isinstance(x, str) for x in stamps):
@@ -14819,7 +15119,7 @@ def gh_cache_put(key: str, at: float, rc: int, out: bytes, err: bytes, long: boo
         return
     doc = {"key": key, "at": at, "rc": rc, "long": long,
            "out": base64.b64encode(out).decode(), "err": base64.b64encode(err).decode()}
-    doc.update({k: v for k, v in (meta or {}).items() if k in ("stamps", "watch", "doneWhenRead", "done")})
+    doc.update({k: v for k, v in (meta or {}).items() if k in ("stamps", "watch", "doneWhenRead", "done", "vouch", "pr")})
     write_json(gh_cache_dir() / f"{key}.json", doc)
     gh_cache_prune(at)
 
@@ -14855,8 +15155,14 @@ def gh_cache_prune(now: float) -> None:
     with contextlib.suppress(OSError):
         stamp.touch()
         for path in gh_cache_dir().glob("*.json"):
-            if path.name != "writes.json" and now - path.stat().st_mtime > GH_CACHE_KEEP:
-                path.unlink(missing_ok=True)
+            age = now - path.stat().st_mtime
+            if path.name == "writes.json" or age <= GH_CACHE_KEEP:
+                continue
+            if age <= GH_CACHE_VOUCH_KEEP:
+                doc = read_json(path)
+                if isinstance(doc, dict) and (doc.get("vouch") or doc.get("pr") or "entries" in doc):
+                    continue  # a vouched answer, the PR a no-target read named, or a superset index (its own entries)
+            path.unlink(missing_ok=True)
         for path in gh_cache_dir().glob(".*.lock"):
             if now - path.stat().st_mtime <= GH_CACHE_LOCK_KEEP:
                 continue
@@ -14982,6 +15288,8 @@ def gh_cache_fill(real: str, args: list[str], key: str, repo: str | None, ran: l
         meta: dict = {}
         with contextlib.suppress(Exception):
             meta = gh_cache_meta(words, values, repo)
+        with contextlib.suppress(Exception):
+            gh_cache_vouch_note(meta, words, values, seen, repo, key)
         broker_note({**{k: v for k, v in note.items() if k != "written"}, "filled": True})
         note["written"] = True  # the caller's record: it must not write the decision a second time
         at = time.time()
@@ -14990,7 +15298,13 @@ def gh_cache_fill(real: str, args: list[str], key: str, repo: str | None, ran: l
         with contextlib.suppress(Exception):
             long = words[:1] == ["api"] and len(words) > 1 and bool(GH_CACHE_LONG_RE.match(words[1]))
             meta["done"] = rc == 0 and gh_cache_done(words, seen, out)
+            pr = gh_cache_vouch_after(meta, out, repo or broker_repo(values),
+                                      gh_cache_target(words, values, repo) is not None) if rc == 0 else None
             gh_cache_put(key, at, rc, out, err, long, meta)
+            if pr and note.get("key") is None and daemon_running() and broker_seen_count(pr, time.time()) >= 2:
+                # A read broker_plan could not count (plain `pr view`, a branch, no target): counted here by the PR
+                # it named, so a PR read by hand again is watched and its next answer is vouched for.
+                register(pr)
             if rc == 0 and not err and len(out) <= GH_CACHE_MAX_BYTES:
                 gh_cache_superset_note(gh_cache_superset_spec(args, words, values, repo), key, at, real)
     return gh_cache_emit({"rc": rc, "out": out, "err": err})
@@ -15368,9 +15682,11 @@ def cmd_gh(args: list[str]) -> int:
                                                        cache_repo, real, now)
                         subset = answer is not None
                     if answer is not None:
-                        if key is not None:
-                            touch_interest(key)  # a read all the same: the daemon's watch stays wanted
-                        broker_note({"route": "cache", **({"subset": True} if subset else {}), **said})
+                        if key is not None or answer.get("vouched"):
+                            # a read all the same: the daemon's watch stays wanted (a vouch needs it read)
+                            touch_interest(key or answer["vouched"])
+                        broker_note({"route": "cache", **({"subset": True} if subset else {}),
+                                     **({"vouched": True} if answer.get("vouched") else {}), **said})
                         return gh_cache_emit(answer)
                 refusal = gh_sweep_refusal(words, method, now)
                 if refusal:

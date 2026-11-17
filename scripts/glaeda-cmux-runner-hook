@@ -8200,8 +8200,10 @@ def load_cap_summary(doc: Any, now: float) -> dict[str, Any] | None:
         if status not in ("queued", "in_progress", "waiting", "pending", "completed"):
             continue
         urgent = any(HOST_LOAD_CAP_URGENT.search(str(job.get(key) or "")) for key in ("workflow", "head_branch"))
+        job_id = job.get("id")
         jobs.append({"labels": sorted(labels), "status": status, "created": _feed_time(job.get("created_at")),
-                     "host": runner_host(job.get("runner")), "urgent": urgent})
+                     "host": runner_host(job.get("runner")), "urgent": urgent,
+                     "id": job_id if isinstance(job_id, int) and not isinstance(job_id, bool) else None})
     return {"at": now, "delivery": _feed_time(doc.get("receiver_last_delivery")), "jobs": jobs}
 
 
@@ -8376,6 +8378,16 @@ STARVED_LIMIT_MIN = 120.0  # no setting may make a hold or a wait longer than th
 STARVED_SPENT_MAX = 64  # jobs a gate remembers having held for (a hold past maxHoldMin is not taken again)
 STARVED_QUEUED = ("queued",)  # "waiting" (an approval) and "pending" (a concurrency group) no runner can take
 STARVED_NOTE = "kept for a starved job of a root runner's label"
+# Before a hold starts, GitHub confirms the job still queues (starved_confirm): the controller's feed can keep a job
+# cancelled before it started as queued for hours (cmux run 44062023658's ios-simulator-build, attempt 1, cancelled at
+# 10:10Z on 2026-11-17 and still queued in the feed at 18:15Z after its run had finished on attempt 2), and a hold
+# for it would only keep units idle. One unauthenticated read of the public job per job and gate (cmux is public,
+# 60 an hour per address); an answer that says it is not queued is final, a read that fails holds nothing.
+STARVED_CONFIRM_URL = "https://api.github.com/repos/{repo}/actions/jobs/{id}"
+STARVED_CONFIRM_TIMEOUT_S = 10.0  # the read runs on its own thread (Gate.starved_confirmed): it never blocks a step
+STARVED_CONFIRM_RETRY_S = 60.0  # after a read that could not say, that job is not asked about again sooner
+STARVED_CONFIRM_LIMITED_S = 600.0  # after a 403 or 429 with no usable X-RateLimit-Reset, no job is asked about sooner
+STARVED_CONFIRM_LIMITED_MAX_S = 3600.0  # a reset further out than this is not believed
 
 
 class StarvedReserve(NamedTuple):
@@ -8436,12 +8448,50 @@ def starved_turn(host: str, key: str) -> float:
     return int.from_bytes(digest[:8], "big") / float(1 << 64)
 
 
+def starved_confirm(job_id: Any, now: float | None = None) -> tuple[bool | None, float | None]:
+    """(answer, quiet until) for job `job_id` of HOST_LOAD_CAP_REPO. The answer is True when GitHub says it still
+    queues, False when it is in progress, completed or gone (404), and None when the read fails or the state is
+    anything else (no id, a waiting or pending job, a rate limit, no network). On a 403 or 429, `quiet until` is the
+    epoch GitHub's X-RateLimit-Reset names (else now + STARVED_CONFIRM_LIMITED_S): no gate asks anything before it."""
+    import urllib.error
+    import urllib.request
+    now = time.time() if now is None else now
+    if not isinstance(job_id, int) or isinstance(job_id, bool) or job_id <= 0:
+        return None, None
+    url = STARVED_CONFIRM_URL.format(repo=HOST_LOAD_CAP_REPO, id=job_id)
+    request = urllib.request.Request(url, headers={"Accept": "application/vnd.github+json",
+                                                   "User-Agent": "glaeda-runner-gate"})
+    try:
+        with urllib.request.urlopen(request, timeout=STARVED_CONFIRM_TIMEOUT_S) as response:
+            doc = json.loads(response.read(1 << 20))
+    except urllib.error.HTTPError as error:
+        if error.code == 404:
+            return False, None
+        if error.code in (403, 429):
+            reset = None
+            with contextlib.suppress(TypeError, ValueError, AttributeError):
+                reset = float(error.headers.get("X-RateLimit-Reset"))
+            until = reset if reset is not None and now < reset <= now + STARVED_CONFIRM_LIMITED_MAX_S \
+                else now + STARVED_CONFIRM_LIMITED_S
+            return None, until
+        return None, None
+    except Exception:  # noqa: BLE001 - a read that fails holds nothing
+        return None, None
+    status = doc.get("status") if isinstance(doc, dict) else None
+    if status == "queued":
+        return True, None
+    return (False, None) if status in ("in_progress", "completed") else (None, None)
+
+
 def starved_job(summary: dict[str, Any] | None, labels: frozenset[str] | None, host: str, now: float,
-                policy: StarvedReserve | None, spent: tuple[str, ...] | list[str] = ()) -> tuple[str, float] | None:
+                policy: StarvedReserve | None, spent: tuple[str, ...] | list[str] = (),
+                confirm: Callable[[str, Any], bool | None] | None = None) -> tuple[str, float] | None:
     """STARVED_RESERVE: (key, waited s) of the longest-waiting queued job this runner could take (its labels all this
     runner's) once it has waited policy.after_s plus this mini's turn (starved_turn x policy.spread_s), in a fresh
     feed; None when none has, the policy is off, or the feed cannot say. A job older than
-    HOST_LOAD_CAP_JOB_MAX_AGE_S is a lost delivery and does not count."""
+    HOST_LOAD_CAP_JOB_MAX_AGE_S is a lost delivery and does not count. With `confirm` (key, job id -> whether GitHub
+    says it still queues), a due job it says left the queue is passed over for the next one, and one it cannot say
+    about holds nothing."""
     if policy is None or not isinstance(summary, dict) or not labels:
         return None
     delivery, at = summary.get("delivery"), summary.get("at")
@@ -8449,7 +8499,7 @@ def starved_job(summary: dict[str, Any] | None, labels: frozenset[str] | None, h
         return None
     if not isinstance(at, (int, float)) or not 0 <= now - at <= HOST_LOAD_CAP_FEED_STALE_S:
         return None
-    oldest: tuple[float, str] | None = None
+    found: list[tuple[float, str, Any]] = []
     for job in summary.get("jobs") if isinstance(summary.get("jobs"), list) else []:
         if not isinstance(job, dict) or job.get("status") not in STARVED_QUEUED:
             continue
@@ -8462,15 +8512,19 @@ def starved_job(summary: dict[str, Any] | None, labels: frozenset[str] | None, h
             continue
         key = f"{' '.join(sorted(wants))}@{created:.0f}"
         if key in spent:
-            continue  # its hold here ran out: a newer starved job is not masked behind it
-        if oldest is None or waited > oldest[0]:
-            oldest = (waited, key)
-    if oldest is None:
-        return None
-    waited, key = oldest
-    if waited < policy.after_s + starved_turn(host, key) * policy.spread_s:
-        return None
-    return key, waited
+            continue  # its hold here ran out, or it left the queue: a newer starved job is not masked behind it
+        found.append((waited, key, job.get("id")))
+    for waited, key, job_id in sorted(found, key=lambda item: (-item[0], item[1])):
+        if waited < policy.after_s + starved_turn(host, key) * policy.spread_s:
+            return None  # the oldest one still queued is not due here yet
+        if confirm is None:
+            return key, waited
+        still = confirm(key, job_id)
+        if still is None:
+            return None  # GitHub cannot say: hold nothing
+        if still:
+            return key, waited
+    return None
 
 
 def starved_reserved(capacity_dir: Path) -> int:
@@ -9297,6 +9351,12 @@ class Gate:
         self.starved_since: float | None = None
         self.starved_key: str | None = None
         self.starved_spent: list[str] = []
+        # STARVED_CONFIRM: job key -> GitHub said it still queues (True), read once per key (a False goes to spent)
+        self.starved_seen: dict[str, bool] = {}
+        self.starved_retry: dict[str, float] = {}  # key -> monotonic time before which it is not asked again
+        self.starved_quiet_until = 0.0  # epoch: after a 403 or 429, no job is asked about before it
+        self.starved_thread: threading.Thread | None = None
+        self.starved_answer: tuple[str, bool | None, float | None, Any] | None = None  # (key, answer, quiet until, id)
         # MEMORY_CAP: the cap in force (gate_memory_cap, refreshed with the other settings), its last reading, why it
         # holds and since when (monotonic)
         self.mem_cap: MemoryCap | None = gate_memory_cap(None, "", 0.0)
@@ -9703,6 +9763,46 @@ class Gate:
             self.starved_fd, self.starved_since, self.starved_key = None, None, None
             gate_log(note)
 
+    def starved_confirmed(self, key: str, job_id: Any) -> bool | None:
+        """starved_job's confirm: GitHub's word that the job behind `key` still queues (starved_confirm), read once
+        per key on its own thread, so neither the network nor DNS ever holds up a gate step (None, "cannot say yet",
+        until the answer is in); a job it says left the queue is spent, so the feed's stale copy never gets a hold
+        here. A read that could not say is not repeated for that job within STARVED_CONFIRM_RETRY_S, and after a 403
+        or 429 no job is asked about until GitHub's reset: the gates of a mini share one 60-an-hour address."""
+        done = self.starved_answer
+        if done is not None and (self.starved_thread is None or not self.starved_thread.is_alive()):
+            self.starved_answer = None  # the last read's answer, whichever job it was for
+            asked, still, until, asked_id = done
+            if until is not None:
+                self.starved_quiet_until = max(self.starved_quiet_until, until)
+            if still is None:
+                self.starved_retry[asked] = time.monotonic() + STARVED_CONFIRM_RETRY_S
+            elif still:
+                self.starved_seen = dict(list(self.starved_seen.items())[-(STARVED_SPENT_MAX - 1):]
+                                         + [(asked, True)])
+            else:
+                self.starved_spent = (self.starved_spent + [asked])[-STARVED_SPENT_MAX:]
+                gate_log(f"the feed shows {asked} queued, but GitHub says job {asked_id} is not: no starved-job "
+                         "reserve for it")
+                if asked == key:
+                    return False
+        if key in self.starved_seen:
+            return self.starved_seen[key]
+        if self.starved_thread is not None and self.starved_thread.is_alive():
+            return None
+        if time.time() < self.starved_quiet_until or time.monotonic() < self.starved_retry.get(key, 0.0):
+            return None
+        self.starved_retry = {k: v for k, v in self.starved_retry.items() if v > time.monotonic()}
+
+        def read() -> None:
+            still, until = starved_confirm(job_id)
+            self.starved_answer = (key, still, until, job_id)
+
+        self.starved_answer = None
+        self.starved_thread = threading.Thread(target=read, name="starved-confirm", daemon=True)
+        self.starved_thread.start()
+        return None
+
     def starved_wants(self, why: str | None) -> tuple[bool, str]:
         """Whether this gate should hold the starved-job reserve now, and the line to log when that changes. It starts
         only on a root runner held off by units alone (UNITS_FULL), keeps it while that or nothing holds it (its
@@ -9722,7 +9822,7 @@ class Gate:
             return False, f"held off for something else ({why}): the starved-job reserve is let go"
         self.cap_look()
         found = starved_job(self.cap_summary, self.cap_labels, gate_host(), time.time(), self.starved,
-                            self.starved_spent)
+                            self.starved_spent, self.starved_confirmed)
         if found is None:
             return False, "no job of this runner's labels is starved now (or the feed cannot say): reserve let go"
         key, waited = found

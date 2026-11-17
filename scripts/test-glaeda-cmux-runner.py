@@ -34,6 +34,7 @@ import tempfile
 import threading
 import time
 import unittest
+import urllib.error
 import urllib.parse
 from pathlib import Path
 from unittest import mock
@@ -8837,6 +8838,7 @@ class StarvedReserveTest(unittest.TestCase):
 
     LABEL = "glaeda-std-xcode-26.6"
     HOST = "cmux12s-mac-mini"
+    REAL_CONFIRM = staticmethod(hook.starved_confirm)  # setUp fakes GitHub for the gate tests
 
     def setUp(self) -> None:
         tmp = tempfile.TemporaryDirectory()
@@ -8850,12 +8852,15 @@ class StarvedReserveTest(unittest.TestCase):
         self.jobs: list[dict] = []
         self.doc: dict | None = {"defaults": {"starvedReserve": {"afterMin": 10, "spreadMin": 0, "maxHoldMin": 30}}}
         self.logged: list[str] = []
+        self.github: dict = {}  # job id -> what GitHub says (True queued, False not, None cannot say)
+        self.confirmed: list = []
         for name, value in (("GATE_SETTINGS_EVERY_S", 0.0), ("HOST_LOAD_CAP_FEED_EVERY_S", 0.0)):
             patcher = mock.patch.object(hook, name, value)
             patcher.start()
             self.addCleanup(patcher.stop)
         for name, fake in (("gate_host", lambda: self.HOST), ("load_cap_fetch", self.fetch),
-                           ("gate_settings_doc", lambda *a: (self.doc, "")), ("gate_log", self.logged.append)):
+                           ("gate_settings_doc", lambda *a: (self.doc, "")), ("gate_log", self.logged.append),
+                           ("starved_confirm", self.confirm)):
             patcher = mock.patch.object(hook, name, side_effect=fake)
             patcher.start()
             self.addCleanup(patcher.stop)
@@ -8877,9 +8882,17 @@ class StarvedReserveTest(unittest.TestCase):
     def fetch(self, now: float) -> dict:
         return {"at": now, "delivery": now, "jobs": self.jobs}
 
-    def job(self, status: str = "queued", ago: float = 11 * 60, labels: list[str] | None = None) -> dict:
+    def confirm(self, job_id, now=None) -> tuple:
+        """GitHub's answer for a job (STARVED_CONFIRM): still queued unless a test says otherwise; a test may give
+        (answer, quiet until) to fake a rate limit."""
+        self.confirmed.append(job_id)
+        answer = self.github.get(job_id, True)
+        return answer if isinstance(answer, tuple) else (answer, None)
+
+    def job(self, status: str = "queued", ago: float = 11 * 60, labels: list[str] | None = None,
+            job_id: int | None = None) -> dict:
         return {"labels": labels or [self.LABEL], "status": status, "created": time.time() - ago, "host": None,
-                "urgent": False}
+                "urgent": False, "id": job_id}
 
     def ledger(self, held: int) -> Path:
         capacity = Path(tempfile.mkdtemp(dir=self.tmp))
@@ -8897,13 +8910,16 @@ class StarvedReserveTest(unittest.TestCase):
         return gate
 
     def look(self, gate: hook.Gate, why: str | None) -> None:
-        """The first look starts the feed read (waited for), the next decides with it."""
-        for _ in range(2):
-            if gate.cap_thread is not None:
-                gate.cap_thread.join(10)
+        """The first look starts the feed read, the next decides with it and starts GitHub's read (STARVED_CONFIRM),
+        the third acts on that answer; each thread is waited for before the next step."""
+        for _ in range(3):
+            for thread in (gate.cap_thread, gate.starved_thread):
+                if thread is not None:
+                    thread.join(10)
             gate.starved_step(why)
-        if gate.cap_thread is not None:
-            gate.cap_thread.join(10)
+        for thread in (gate.cap_thread, gate.starved_thread):
+            if thread is not None:
+                thread.join(10)
 
     def test_side_listeners_leave_a_held_starved_reserve_free_and_root_runners_take_it(self) -> None:
         capacity = self.ledger(14 - (5 + self.need - 1))  # room for a side job, not for one beside the reserve
@@ -8977,6 +8993,124 @@ class StarvedReserveTest(unittest.TestCase):
         summary = dict(summary, at=at, delivery=at)
         due = [host for host in hosts if hook.starved_job(summary, labels, host, at, spread)]
         self.assertEqual(due, [first], "only the first mini's turn has come")
+
+    def test_a_job_the_feed_still_shows_queued_but_github_does_not_gets_no_hold(self) -> None:
+        # cmux run 44062023658: ios-simulator-build (attempt 1) was cancelled at 10:10Z on 2026-11-17 before it
+        # started, and the controller's feed still showed it queued at 18:15Z.
+        capacity = self.ledger(14 - (self.need - 1))
+        units = f"only {self.need - 1} of 14 capacity units on this mini are free; a compile needs {self.need}"
+        gate = self.gate(self.root, capacity)
+        self.github = {133966873848: False}
+        self.jobs = [self.job(ago=40 * 60, job_id=133966873848)]
+        self.look(gate, units)
+        self.assertEqual(hook.starved_reserved(capacity), 0, "the feed's stale copy holds nothing")
+        self.assertTrue(any("GitHub says job 133966873848 is not" in line for line in self.logged), self.logged)
+        self.look(gate, units)
+        self.assertEqual(self.confirmed, [133966873848], "a job GitHub says left the queue is asked about once")
+        self.jobs.append(self.job(ago=20 * 60, job_id=7))
+        self.look(gate, units)
+        self.assertEqual(hook.starved_reserved(capacity), self.need, "the next job that really waits gets the hold")
+        self.look(gate, units)
+        self.assertEqual(self.confirmed, [133966873848, 7], "a job GitHub says still queues is asked about once")
+
+    def test_a_github_read_that_cannot_say_holds_nothing_and_waits_before_asking_again(self) -> None:
+        capacity = self.ledger(14 - (self.need - 1))
+        units = f"only {self.need - 1} of 14 capacity units on this mini are free; a compile needs {self.need}"
+        gate = self.gate(self.root, capacity)
+        self.github = {9: None}
+        self.jobs = [self.job(job_id=9)]
+        self.look(gate, units)
+        self.assertEqual(hook.starved_reserved(capacity), 0, "fail open: no hold without GitHub's word")
+        self.github = {}
+        self.look(gate, units)
+        self.assertEqual(self.confirmed, [9], f"not asked again within {hook.STARVED_CONFIRM_RETRY_S:g} s")
+        self.assertEqual(hook.starved_reserved(capacity), 0)
+        gate.starved_retry = {key: time.monotonic() - 1 for key in gate.starved_retry}  # the minute has passed
+        self.look(gate, units)
+        self.assertEqual(self.confirmed, [9, 9], "asked again once the minute is up")
+        self.assertEqual(hook.starved_reserved(capacity), self.need, "and it still queues")
+
+    def test_a_rate_limited_read_asks_about_no_job_until_githubs_reset(self) -> None:
+        capacity = self.ledger(14 - (self.need - 1))
+        units = f"only {self.need - 1} of 14 capacity units on this mini are free; a compile needs {self.need}"
+        gate = self.gate(self.root, capacity)
+        self.github = {9: (None, time.time() + 600)}
+        self.jobs = [self.job(ago=30 * 60, job_id=9)]
+        self.look(gate, units)
+        self.jobs.append(self.job(ago=20 * 60, job_id=10))
+        gate.starved_retry = {}
+        self.look(gate, units)
+        self.assertEqual(self.confirmed, [9], "no job is asked about before the reset, not even another one")
+        self.assertEqual(hook.starved_reserved(capacity), 0)
+        gate.starved_quiet_until = time.time() - 1  # the reset has passed
+        self.github = {}
+        self.look(gate, units)
+        self.assertEqual(self.confirmed[1:], [9])
+        self.assertEqual(hook.starved_reserved(capacity), self.need)
+
+    def test_a_slow_github_read_never_holds_up_a_gate_step(self) -> None:
+        # DNS or a stalled connection can outlast the read's own timeout: the read runs on its own thread.
+        capacity = self.ledger(14 - (self.need - 1))
+        units = f"only {self.need - 1} of 14 capacity units on this mini are free; a compile needs {self.need}"
+        gate = self.gate(self.root, capacity)
+        release = threading.Event()
+        self.addCleanup(release.set)
+
+        def slow(job_id, now=None):
+            release.wait(30)
+            return True, None
+
+        self.jobs = [self.job(job_id=9)]
+        with mock.patch.object(hook, "starved_confirm", side_effect=slow):
+            for _ in range(3):
+                if gate.cap_thread is not None:
+                    gate.cap_thread.join(10)
+                started = time.monotonic()
+                gate.starved_step(units)
+                self.assertLess(time.monotonic() - started, 5.0, "a step never waits for GitHub")
+            self.assertEqual(hook.starved_reserved(capacity), 0, "no answer yet: nothing held")
+            self.assertTrue(gate.starved_thread.is_alive())
+            release.set()
+            gate.starved_thread.join(10)
+            gate.starved_step(units)
+        self.assertEqual(hook.starved_reserved(capacity), self.need, "the answer came: held")
+
+    def test_starved_confirm_reads_the_public_job(self) -> None:
+        def answer(body: dict | None = None, code: int | None = None, headers: dict | None = None):
+            def opened(request, timeout):
+                self.assertEqual(request.full_url, "https://api.github.com/repos/manaflow-ai/cmux/actions/jobs/5")
+                if code is not None:
+                    raise urllib.error.HTTPError(request.full_url, code, "x", headers or {}, None)
+                return contextlib.closing(io.BytesIO(json.dumps(body).encode()))
+            return mock.patch("urllib.request.urlopen", side_effect=opened)
+        now = 1_800_000_000.0
+        with answer({"status": "queued"}):
+            self.assertEqual(self.REAL_CONFIRM(5, now), (True, None))
+        for status in ("in_progress", "completed"):
+            with answer({"status": status}):
+                self.assertEqual(self.REAL_CONFIRM(5, now), (False, None), status)
+        for status in ("waiting", "pending", "requested", None):
+            with answer({"status": status}):
+                self.assertEqual(self.REAL_CONFIRM(5, now), (None, None), f"{status}: cannot say")
+        with answer(code=404):
+            self.assertEqual(self.REAL_CONFIRM(5, now), (False, None), "gone")
+        with answer(code=500):
+            self.assertEqual(self.REAL_CONFIRM(5, now), (None, None), "cannot say")
+        for code in (403, 429):
+            with answer(code=code, headers={"X-RateLimit-Reset": str(int(now + 120))}):
+                self.assertEqual(self.REAL_CONFIRM(5, now), (None, now + 120), f"HTTP {code}: quiet until the reset")
+            with answer(code=code):
+                self.assertEqual(self.REAL_CONFIRM(5, now), (None, now + hook.STARVED_CONFIRM_LIMITED_S),
+                                 f"HTTP {code} with no reset: the default quiet")
+            with answer(code=code, headers={"X-RateLimit-Reset": str(int(now + 86400))}):
+                self.assertEqual(self.REAL_CONFIRM(5, now), (None, now + hook.STARVED_CONFIRM_LIMITED_S),
+                                 "a reset a day out is not believed")
+        self.assertEqual(self.REAL_CONFIRM(None, now), (None, None), "no job id in the feed: cannot say")
+
+    def test_the_feed_summary_keeps_each_jobs_id(self) -> None:
+        doc = {"jobs": [{"id": 12, "labels": [self.LABEL], "status": "queued", "created_at": "2026-11-17T10:10:00Z"},
+                        {"id": "x", "labels": [self.LABEL], "status": "queued"}]}
+        self.assertEqual([job["id"] for job in hook.load_cap_summary(doc, 0.0)["jobs"]], [12, None])
 
     def test_settings(self) -> None:
         self.assertEqual(hook.gate_starved_reserve(None, "x", 0.0),
