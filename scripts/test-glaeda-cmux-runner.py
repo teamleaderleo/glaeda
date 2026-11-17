@@ -9140,7 +9140,12 @@ class MemoryCapTest(unittest.TestCase):
             self.assertFalse(self.gate.cap_thread.is_alive(), "the load-cap feed look did not finish in 120 s")
 
     def poll(self) -> str | None:
-        """Two looks: the first starts the feed read (waited for), the second decides with it."""
+        """Two looks: the first starts the feed read (waited for), the second decides with it. With
+        HOST_LOAD_CAP_FEED_EVERY_S at 0 the second look starts another read; one still running when the next poll
+        begins made that poll's first look skip its own read, and the decision then read the jobs as they were
+        before the test changed them (runner-tests (3), glaeda#2119: 1 in 8 runs on main). Each poll waits it out
+        first, so its decision always reads the jobs it set up."""
+        self.join()
         (self.state / hook.HOST_LOAD_CAP_FEED_FILE).unlink(missing_ok=True)
         self.gate.cap_feed_at = -hook.HOST_LOAD_CAP_FEED_EVERY_S - 1
         self.gate.memory_capped()
