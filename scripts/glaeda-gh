@@ -99,7 +99,8 @@ the daemon is the only process that talks to GitHub, and clients only read its c
 - The X-RateLimit headers and the GraphQL rateLimit field drive a budget guard: below the floor
   (REST 1500 left, GraphQL 500; the fleet config raises GraphQL to 1500) the daemon polls four times less
   often and skips job lists; below the reserve (REST 300, GraphQL 100; the fleet config: 1000; never under
-  gh-quota's hard_reserve_calls, 500 each, waited reads included) it stops that
+  gh-quota's hard_reserve_calls, 500 each, waited reads included; a floor that reserve reaches is raised to keep its
+  lean band, so GraphQL's default is floor 900, reserve 500) it stops that
   API until the quota resets. The quota is shared, so this also protects every other tool on the account:
   the fleet's GraphQL 1000 is kept for lands (merges and
   the gate reads lane VMs land through). The daemon's own GraphQL spend is also held to graphqlPerMinute
@@ -2682,10 +2683,11 @@ def daemon_policy() -> dict:
         f = int(_bounded(one.get("floor"), floor, 0, 100000))
         r = int(_bounded(one.get("reserve"), reserve, 0, 100000))
         f, r = (f, r) if r <= f else (floor, reserve)
-        # Never under the hard reserve (hard_reserve_floor): a config's lower reserve is raised to it, and its floor
-        # with it, so "stop" still comes after "lean".
-        r = max(r, hard[bucket])
-        floors[bucket] = (max(f, r), r)
+        # Never under the hard reserve (hard_reserve_floor): a config's lower reserve is raised to it. A floor the
+        # raised reserve reaches is raised above it by the band it had, so "lean" still comes before "stop" (GraphQL's
+        # module default 500/100 becomes 900/500, not 500/500 with no lean band at all).
+        raised = max(r, hard[bucket])
+        floors[bucket] = (f if f > raised else raised + (f - r), raised)
     per_minute = int(_bounded(doc.get("graphqlPerMinute"), GRAPHQL_PER_MINUTE, 1, 5000))
     alarms = doc.get("alarms") if isinstance(doc.get("alarms"), dict) else {}
     return {"cycle": cycle, "commentCycle": comment, "graphqlPerMinute": per_minute,
