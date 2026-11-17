@@ -12868,6 +12868,21 @@ class SpendAlarmTest(Base):
         self.assertEqual((lines[0]["pace"], lines[0]["spent"], lines[0]["cap"]), (480, 80, 300))
         self.assertIn("nothing to do, projection only", lines[0]["note"])
 
+    def test_the_share_alarm_ignores_a_few_reads_under_a_cap_of_zero(self) -> None:
+        """A restShare of 0 reads over GraphQL only; its exempt reads (1 and 5 an hour) are not spend to page on, but
+        spend past the floor is."""
+        self.policy()
+        self.daemon.policy = {**self.daemon.policy, "restShare": 0.0}
+        self.assertEqual(self.daemon.rest_cap(), 0)
+        minute = int(self.daemon.clock() // 60)
+        for n in (1, 5, 50):
+            self.daemon.rest_minutes = {minute: n}
+            self.assertIsNone(self.daemon.share_alarm(0, []), n)
+        self.daemon.rest_minutes = {minute: 51}
+        alarm = self.daemon.share_alarm(0, [])
+        self.assertIsNotNone(alarm)
+        self.assertIn("past its cap of 0", alarm[1])
+
     def test_the_share_alarm_fires_on_the_measured_hour_and_names_the_waiter_to_shed(self) -> None:
         """Past the cap over the measured trailing hour (what the cap exempts, or a restYield), the alarm names the
         waiter whose reads spent most, so whoever hears it has one thing to do."""

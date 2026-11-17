@@ -374,6 +374,7 @@ ALARM_CMD = Path(os.environ.get("GLAEDA_GH_ALARM_CMD") or Path.home() / ".local/
 NOTICES_DIR = Path(os.environ.get("NOTICES_DIR") or Path.home() / ".local/state/notices")
 ALARMS_FILE = "alarms.json"  # when each alarm was last sent, so a restart does not send it again
 ALARM_EVERY = 3600.0
+SHARE_ALARM_FLOOR = 50  # counted REST an hour under which the share alarm stays quiet, whatever the cap (a cap of 0: its exempt reads)
 ALARM_REST_LEFT = 1000  # the pool alarm fires below this much REST left on the poorest core counter
 ALARM_TREND_MIN = 300.0  # seconds of readings in one window a drain projection needs
 ALARM_TREND_KEEP = 900.0  # seconds of readings the projection is drawn over
@@ -3302,13 +3303,16 @@ class Daemon:
         daemon reads up to it, and a restart's re-reads come in a burst), not news: one log line an hour
         (share-pace, "nothing to do, projection only"), never an alarm. The old alarm projected the last
         SPEND_RECENT seconds over an hour and warned about hourly on huge-blue and cosmic-gray with nothing for
-        anyone to do (2026-11-15: "306/h against its cap of 150 (142 in the last hour)")."""
+        anyone to do (2026-11-15: "306/h against its cap of 150 (142 in the last hour)").
+        A restShare of 0 (every host the config does not name: PR and run reads over GraphQL only) is a cap of 0, and
+        its few exempt reads (a failed attempt's job list) warned on every one: the alarm needs spend past
+        max(cap, SHARE_ALARM_FLOOR), though the cap itself still holds reads to 0."""
         spent = self.rest_spent()
         # the share's own measure: the outbox (sessions' writes) is never held to it (request)
         recent = [r for r in recent_rows if r["bucket"] == "rest" and r["kind"] != "outbox"]
         pace = sum(r["counted"] for r in recent) * 3600 // SPEND_RECENT
-        if spent <= cap:
-            if pace > max(cap * 3 // 2, cap + 150) and self.now - self.share_pace_at >= ALARM_EVERY:
+        if spent <= max(cap, SHARE_ALARM_FLOOR):
+            if spent <= cap and pace > max(cap * 3 // 2, cap + 150) and self.now - self.share_pace_at >= ALARM_EVERY:
                 self.share_pace_at = self.now
                 log({"event": "share-pace", "pace": pace, "spent": spent, "cap": cap,
                      "note": "nothing to do, projection only: the measured hour is within the cap, which holds it"})
