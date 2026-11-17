@@ -1156,6 +1156,200 @@ def disk_shape_main(floor_gib: float) -> int:
     return 0
 
 
+# SMALL_ONLY: the small runners (--small-runner, glaeda_fleet_labels smallRunners, the label glaeda-small-xcode-<v>
+# only) take only SMALL_JOBS, and their listener's disk hold (DISK_SHORT_HOLD) is those jobs' measured peak plus a
+# margin (SMALL_JOB_DISK_GIB), not one heavy job's (job_disk_gib, 20 GiB). One 20 GiB peak for every listener held the
+# light minis' side runners at 17.2 GiB free (cmux18, 2026-11-16: 2 of 14 slots listening) while these jobs grow the
+# disk by 5 GiB at most. A per-label peak could not do it: every side label also brings fast-tier, generated-files,
+# daemon-test and cmux-scheme-compile (11 to 23 GiB alone), and a listener cannot know which job GitHub hands it, so
+# only a label that brings nothing else may hold lower. A small runner's job-started refuses any other job before it
+# writes anything (as the sim-first runner does), so a job routed there by mistake is re-placed by cmux's rescue
+# instead of running out of disk; cmux's portable placement routes only these jobs to the label.
+# Measured with `label-disk-samples` over 24 minis, 2026-11-02..16, jobs that ran with no other runner job (the disk
+# reading is the volume's): largest growth per job comment 5.0 GiB (n 447), routes 2.4 (278), size 2.3 (598),
+# web-validation 0.6 (403), guard-status 0.4 (312), verify 3.3 (5).
+# comment (pr-red-checks-comment.yml) and guard-status (ci-guards.yml) run only as reusable workflows, so their keys
+# name the callers (GITHUB_WORKFLOW_REF is the caller's file), as GUARD_JOBS and the other tables key them.
+SMALL_JOBS = frozenset({"pr-checks.yml/size", "web-validation.yml/web-validation",
+                        "ci.yml/comment", "cmux-next.yml/comment", "cmux-next-guards.yml/comment",
+                        "ci.yml/guard-status", "cmux-next-guards.yml/guard-status", "cmux-next-dev-daily.yml/verify",
+                        "manaflow-ai/cmuxterm-hq/synthetic-probes.yml/routes"})  # needs_key form
+SMALL_JOB_PEAK_GIB = 5.0  # the largest measured growth of a SMALL_JOBS job (comment)
+SMALL_DISK_MARGIN_GIB = 3.0
+SMALL_JOB_DISK_GIB = SMALL_JOB_PEAK_GIB + SMALL_DISK_MARGIN_GIB
+
+
+def small_job(job: str, repo: str | None, home_repo: str, workflow: str) -> bool:
+    """Whether a job is one of SMALL_JOBS, the only jobs a small runner takes (SMALL_ONLY)."""
+    return needs_key(job, repo, home_repo, workflow) in SMALL_JOBS
+
+
+def small_refusal(job: str, repo: str | None, home_repo: str, workflow: str) -> str:
+    """Why a small runner refuses a job that is not one of SMALL_JOBS: its listener held only for their disk peak, so
+    any other job could run out of disk here. Refused at once, before it writes, the job is re-placed by the rescue."""
+    return (f"the small runner takes only the small jobs ({needs_key(job, repo, home_repo, workflow)} is not one; "
+            f"its listener holds for {SMALL_JOB_DISK_GIB:g} GiB of disk, not one job's {job_disk_gib():g}): "
+            "route it to another label (SMALL_ONLY)")
+
+
+def listener_disk_peak(scope: "RunnerScope") -> tuple[float, str]:
+    """The free disk under which this runner's idle listener is held (DISK_SHORT_HOLD), and what it is: a small
+    runner's is SMALL_JOB_DISK_GIB (at most job_disk_gib()), every other runner's is job_disk_gib()."""
+    if scope.small:
+        return min(SMALL_JOB_DISK_GIB, job_disk_gib()), "the small jobs' measured peak plus margin (SMALL_ONLY)"
+    return job_disk_gib(), "one job's measured peak"
+
+
+# LABEL_DISK: `label-disk-samples` reads each label's measured job disk growth on a mini, `label-disk-table` pools the
+# minis' answers into one table (p90 and max per label), so a label's peak is measured, not guessed. Read-only.
+LABEL_DISK_SCHEMA = "glaeda-label-disk/v1"
+LABEL_DISK_SAMPLES_SCHEMA = "glaeda-label-disk-samples/v1"
+LABEL_DISK_MIN_SAMPLES = 50
+LABEL_DISK_WINDOW_S = 14 * 86400.0  # label-disk-samples reads the job log's completed lines this recent
+# A label's role words (glaeda_fleet_labels). A label without one (glaeda-mini, glaeda-class-std, xcode-26.6,
+# glaeda-macos-27, glaeda-runner-<name>) brings no job of its own.
+LABEL_DISK_ROLES = ("root", "side", "gui", "session", "fast", "nightly", "gateway", "sim", "small")
+LABEL_DISK_CLASSES = ("xl", "std", "light")  # glaeda_fleet_labels.RUNNER_CLASSES (a test keeps them equal)
+
+
+def label_disk_keys(labels: list[str]) -> list[str]:
+    """The keys of a runner's role labels in the label table: glaeda- and the -xcode-<version> suffix taken off
+    (glaeda-side-std-xcode-26.6 -> side-std, glaeda-side-xcode-26.6 -> side). A side label of a narrower class that a
+    wider runner carries too (glaeda_fleet_labels.side_classes: a std runner's glaeda-side-light-...) is left out, so
+    each class label's peak is measured on that class's own runners."""
+    own = next((lab[len("glaeda-class-"):] for lab in labels if lab.startswith("glaeda-class-")), None)
+    keys: list[str] = []
+    for label in labels:
+        if not label.startswith("glaeda-") or label.startswith("glaeda-runner-"):  # glaeda-runner-<name>: one runner
+            continue
+        key = re.sub(r"-xcode-[0-9][0-9.]*$", "", label[len("glaeda-"):])
+        words = key.split("-")
+        if not any(role in words for role in LABEL_DISK_ROLES):
+            continue
+        klass = next((w for w in words if w in LABEL_DISK_CLASSES), None)
+        if klass is not None and own is not None and klass != own:
+            continue
+        if key not in keys:
+            keys.append(key)
+    return keys
+
+
+def receipt_labels(state_dir: Path) -> dict[str, list[str]]:
+    """Each installed runner's registered labels from its install receipt (state_dir/receipt.json and
+    instance-N/receipt.json), keyed by both its registration name and its runner directory."""
+    out: dict[str, list[str]] = {}
+    for receipt in sorted([state_dir / "receipt.json", *state_dir.glob("instance-*/receipt.json")]):
+        try:
+            doc = json.loads(receipt.read_text())
+        except (OSError, ValueError, UnicodeDecodeError):
+            continue
+        registration = doc.get("registration") if isinstance(doc, dict) else None
+        labels = registration.get("labels") if isinstance(registration, dict) else None
+        if not isinstance(labels, list) or not all(isinstance(lab, str) for lab in labels):
+            continue
+        for name in (registration.get("name"), doc.get("runnerDir")):
+            if isinstance(name, str) and name:
+                out[name] = labels
+    return out
+
+
+def label_disk_samples(state_dir: Path, log: Path | None = None, now: float | None = None,
+                       window_s: float = LABEL_DISK_WINDOW_S) -> dict[str, Any]:
+    """`label-disk-samples`' answer (LABEL_DISK_SAMPLES_SCHEMA): for each label key (label_disk_keys) of this host's
+    runners, the disk growth (disk_free_start_gib - disk_free_min_gib, at least 0, GiB) of each completed job in the
+    job log within window_s that ran on a runner carrying it. The reading is the volume's, so another runner's job
+    writing at the same time counts too: "labels" holds the jobs that ran alone (other_runner_jobs empty), the job's
+    own growth, and "shared" the others, kept for comparison only (on a 14-runner std mini, side-std's p90 over every
+    job read 20.5 GiB, the heavy compile beside it). A runner no receipt names (a retired instance) counts for no
+    label. The labels are today's receipts', not the ones the runner had when the job ran."""
+    now = time.time() if now is None else now
+    labels = receipt_labels(state_dir)
+    samples: dict[str, list[float]] = {}
+    shared: dict[str, list[float]] = {}
+    unlabelled = 0
+    try:
+        lines = (log or JOB_LOG).read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        lines = []
+    for line in lines:
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(row, dict) or row.get("event") != "completed":
+            continue
+        start, low = row.get("disk_free_start_gib"), row.get("disk_free_min_gib")
+        at = row.get("ended_at", row.get("at"))
+        if not all(isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+                   for v in (start, low, at)):
+            continue
+        if now - float(at) > window_s:
+            continue
+        runner = row.get("runner")
+        keys = label_disk_keys(labels.get(runner, [])) if isinstance(runner, str) else []
+        if not keys:
+            unlabelled += 1
+            continue
+        growth = round(max(0.0, float(start) - float(low)), 2)
+        alone = row.get("other_runner_jobs") == []
+        for key in keys:
+            (samples if alone else shared).setdefault(key, []).append(growth)
+    return {"schema": LABEL_DISK_SAMPLES_SCHEMA, "host": gate_host(), "at": int(now), "window_s": int(window_s),
+            "unlabelled": unlabelled, "labels": samples, "shared": shared}
+
+
+def label_disk_table(answers: list[Any], now: float | None = None,
+                     min_samples: int = LABEL_DISK_MIN_SAMPLES) -> dict[str, Any]:
+    """`label-disk-table`'s answer (LABEL_DISK_SCHEMA) from the minis' label_disk_samples answers: each label's
+    nearest-rank p90 disk growth over the jobs that ran alone, rounded up to 0.1 GiB, their count and its hosts, with
+    the p90 and count over every job beside them (shared_*, information only). Every label is written with its n; a
+    reader skips the ones under min_samples."""
+    pooled: dict[str, list[float]] = {}
+    every: dict[str, list[float]] = {}
+    hosts: dict[str, set[str]] = {}
+    for answer in answers:
+        if not isinstance(answer, dict) or answer.get("schema") != LABEL_DISK_SAMPLES_SCHEMA:
+            continue
+        for field in ("labels", "shared"):
+            rows = answer.get(field)
+            for key, values in (rows.items() if isinstance(rows, dict) else ()):
+                good = [float(v) for v in values if isinstance(v, (int, float)) and not isinstance(v, bool)
+                        and math.isfinite(v) and v >= 0] if isinstance(values, list) else []
+                if not isinstance(key, str) or not good:
+                    continue
+                every.setdefault(key, []).extend(good)
+                if field == "labels":
+                    pooled.setdefault(key, []).extend(good)
+                    hosts.setdefault(key, set()).add(str(answer.get("host") or "?"))
+
+    def up(values: list[float]) -> float:
+        return math.ceil(round(disk_p90(values) * 10, 6)) / 10
+
+    stamp = datetime.datetime.fromtimestamp(time.time() if now is None else now, datetime.timezone.utc)
+    rows_out = {key: {"disk_growth_gib_p90": up(values), "disk_growth_gib_max": max(values), "n": len(values),
+                      "hosts": sorted(hosts[key]),
+                      "all_jobs_gib_p90": up(every[key]), "all_jobs_n": len(every[key])}
+                for key, values in sorted(pooled.items())}
+    return {"schema": LABEL_DISK_SCHEMA, "generated_at": stamp.isoformat(timespec="seconds").replace("+00:00", "Z"),
+            "min_samples": min_samples, "fallback_gib": DISK_JOB_PEAK_GIB, "labels": rows_out}
+
+
+def label_disk_samples_main(state_dir: Path) -> int:
+    """`label-disk-samples [--state-dir D]`: one JSON line (label_disk_samples), read-only."""
+    print(json.dumps(label_disk_samples(state_dir), sort_keys=True), flush=True)
+    return 0
+
+
+def label_disk_table_main(min_samples: int) -> int:
+    """`label-disk-table`: label_disk_samples answers (JSON lines) on stdin, the pooled table on stdout."""
+    answers: list[Any] = []
+    for line in sys.stdin:
+        with contextlib.suppress(ValueError):
+            answers.append(json.loads(line))
+    print(json.dumps(label_disk_table(answers, min_samples=min_samples), indent=1, sort_keys=True), flush=True)
+    return 0
+
+
 def fit_mem_chunks(mibs: list[int], total: int) -> int:
     """The RAM a listener keeps free for its costliest job: the largest of `mibs` that fits the host at all (a job
     that is bigger waits at admission for a RAM-idle host, and holding a listener for that would starve the label),
@@ -6488,6 +6682,7 @@ class RunnerScope(NamedTuple):
     trusted_signing: bool = False
     yields: bool = False  # --yield-to-exclusive (YIELD_TO_EXCLUSIVE): its gate stops listening for a signing job too
     sim: bool = False  # --sim-runner (SIM_FIRST): the sim-first runner listens on a full mini
+    small: bool = False  # --small-runner (SMALL_ONLY): SMALL_JOBS only, its disk hold is theirs (SMALL_JOB_DISK_GIB)
     sim_slots: int = 1  # --sim-slots (SIM_SLOTS): the simulator token's copies on this mini
 
 
@@ -6530,7 +6725,7 @@ def side_fit_units(scope: RunnerScope) -> int:
     whenever a typical side job fits; the job's own admission still waits for its own measured need. Every other
     role keeps its own fit (mini_full)."""
     if scope.units <= 0 or scope.root or scope.gui or scope.session or scope.fast or scope.fresh \
-            or scope.nightly or scope.dedicated or scope.gateway or scope.sim:
+            or scope.nightly or scope.dedicated or scope.gateway or scope.sim or scope.small:
         return 1
     classes = {job_class(job, DEFAULT_HOME_REPO, workflow=workflow)[0] for workflow, job in SIDE_FIT_JOBS}
     needs = load_job_needs()[0]
@@ -6753,14 +6948,17 @@ def runner_scope(runner_dir: Path) -> RunnerScope:
                and not fast and not session and not gui and not fresh and not dedicated and not nightly)
     sim = (re.search(r"\s--sim-runner(?:\s|$)", text) is not None
            and not fast and not session and not gui and not fresh and not dedicated and not nightly and not gateway)
+    small = (re.search(r"\s--small-runner(?:\s|$)", text) is not None
+             and not fast and not session and not gui and not fresh and not dedicated and not nightly and not gateway
+             and not sim)
     return RunnerScope(capacity_cores(flag("capacity-units", 0), flag("reserve-cores", 0)),
                        max(1, flag("compile-slots", 1)), roots,
                        instance < roots and not gui and not fast and not session and not dedicated and not nightly
-                       and not gateway and not sim,
+                       and not gateway and not sim and not small,
                        gui, runner_floor_gib(min_free_gib(text), gui or session), gui_token,
                        fast, session, fresh, dedicated, nightly, gateway,
                        re.search(r"\s--trusted-next-signing(?:\s|$)", text) is not None,
-                       dedicated and re.search(r"\s--yield-to-exclusive(?:\s|$)", text) is not None, sim,
+                       dedicated and re.search(r"\s--yield-to-exclusive(?:\s|$)", text) is not None, sim, small,
                        sim_slots_of(flag("sim-slots", 1)))
 
 
@@ -8607,14 +8805,15 @@ class Gate:
         # The peak is read on its own, not only under the floor: a floor under one job's peak (--min-free-gib 30 with
         # GLAEDA_RUNNER_JOB_DISK_GIB=40, at 35 GiB free) must still hold the listener.
         short = None
+        peak, whose = listener_disk_peak(scope)
         if not scope.dedicated and not nightly_own and not scope.gateway and scope.min_free_gib > 0:
-            short = disk_refusal(path, job_disk_gib())
+            short = disk_refusal(path, peak)
         if short:
-            target = max(floor, job_disk_gib())
+            target = max(floor, peak)
             self.evict_in_background(path, target)
             if reserve:
                 self.evict_idle_in_background(path, target + GATE_DISK_RESUME_GIB)
-            return (f"disk: {short} for one job's measured peak, cleanup requested; holding the listener so the "
+            return (f"disk: {short} for {whose}, cleanup requested; holding the listener so the "
                     "job goes to a runner with room (DISK_SHORT_HOLD)")
         if why:
             self.evict_in_background(path, floor)
@@ -11403,7 +11602,8 @@ def leave_job_workspace(args: argparse.Namespace) -> None:
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog=PREFIX)
     p.add_argument("phase", choices=("job-started", "job-completed", "check", "listen", "take-root", "take-gui",
-                                     "admit", "release", "fits", "busy", "needs", "disk-shape"),
+                                     "admit", "release", "fits", "busy", "needs", "disk-shape",
+                                     "label-disk-samples", "label-disk-table"),
                    help="check: the eligibility gate only, read-only (no lock, no rustup change); "
                         "needs [--needs-file F]: this host's measured capacity and the needs file as admission reads "
                         "them (one JSON line; exit 1 when the file falls back to the tables); "
@@ -11411,7 +11611,9 @@ def main(argv: list[str] | None = None) -> int:
                         "admit, release, fits: the build worker's ci-step admission (one JSON line each); "
                         "busy --runner-dir D: exit 3 when that runner is idle, 0 when it has a job or it cannot tell; "
                         "disk-shape [--min-free-gib F]: free disk, the pool runners' _work and one runner's measured "
-                        "share, as the listener count's disk term reads them (one JSON line, read-only)")
+                        "share, as the listener count's disk term reads them (one JSON line, read-only); "
+                        "label-disk-samples: each of this host's runner labels' measured job disk growth (one JSON line, "
+                        "read-only, LABEL_DISK); label-disk-table: those lines on stdin, the label table on stdout")
     p.add_argument("--class", dest="step_class", choices=STEP_CLASSES, help="admit: the ci-step's class")
     p.add_argument("--job-key", help="admit, release: the ci-step's key (runner name, run id and attempt)")
     p.add_argument("--runner-dir", type=Path, help="listen: the runner directory whose run.sh the gate runs")
@@ -11510,6 +11712,9 @@ def main(argv: list[str] | None = None) -> int:
                    help="this is one of the mini's gateway runners (the gateway label): it admits only GATEWAY_JOBS, "
                         "thin cmux-ci clients, on a gateway token and no shared unit, and its gate listens through CPU "
                         "saturation and a full mini (GATEWAY)")
+    p.add_argument("--small-runner", action="store_true",
+                   help="this is one of the mini's small runners (the small label): it takes only SMALL_JOBS, and its "
+                        "gate holds its listener under their measured disk peak, not one heavy job's (SMALL_ONLY)")
     p.add_argument("--sim-runner", action="store_true",
                    help="this is the mini's sim-first runner (the sim label): its gate listens on a full mini while "
                         "the simulator token is free, and a job it takes waits here for units ahead of the side "
@@ -11540,6 +11745,10 @@ def main(argv: list[str] | None = None) -> int:
         return runner_busy_main([os.fspath(args.runner_dir)] if args.runner_dir else [])
     if args.phase == "disk-shape":
         return disk_shape_main(max(0.0, args.min_free_gib))
+    if args.phase == "label-disk-samples":
+        return label_disk_samples_main(args.state_dir)
+    if args.phase == "label-disk-table":
+        return label_disk_table_main(LABEL_DISK_MIN_SAMPLES)
     args.min_free_gib = runner_floor_gib(args.min_free_gib, args.gui_runner or args.session_runner)
     # the floor a job is warned under, after eviction (DISK_JOB_PEAK_GIB); a tour runner's floor is cmux's measure
     admit_floor = admit_floor_gib(args.min_free_gib, args.gui_runner or args.session_runner)
@@ -11689,6 +11898,9 @@ def main(argv: list[str] | None = None) -> int:
             return refused(f"the gateway runner takes only thin cmux-ci client jobs ({gateway_jobs_note()}); "
                            f"{job_workflow() or 'an unknown workflow'} {os.environ.get('GITHUB_JOB') or 'job'} "
                            "is not one")
+        if args.small_runner and not small_job(os.environ.get("GITHUB_JOB", ""), repo, args.home_repo, job_workflow()):
+            # SMALL_ONLY: refused at once, before any disk or capacity work, as the gateway runner refuses
+            return refused(small_refusal(os.environ.get("GITHUB_JOB", ""), repo, args.home_repo, job_workflow()))
         # every class, the general pool included: a job cmux routes to a hosted runner is never taken here
         if why := hosted_route_refusal(os.environ.get("GITHUB_WORKFLOW_REF"), os.environ.get("GITHUB_JOB")):
             return refused(why)

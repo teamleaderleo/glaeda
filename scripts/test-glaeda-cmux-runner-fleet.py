@@ -321,6 +321,26 @@ class FleetTest(unittest.TestCase):
         applies = [c["remote"] for c in self.calls() if c["tool"] == "ssh" and "--apply" in c["remote"]]
         self.assertEqual(sorted(int(r.split("--instance ")[1].split()[0]) for r in applies), [0, 1, 2, 3, 4, 5])
 
+    def test_the_small_runners_are_declared_instances_never_surplus(self) -> None:
+        """SMALL_ONLY: smallRunners adds instances after the gateway runners; the plan and the apply count them as
+        declared (member_instance_count), so they are installed and never retired as surplus."""
+        manifest = json.loads(json.dumps(MANIFEST))
+        manifest["defaults"]["runner"] = {"classes": {"std": {"runners": 4, "capacityUnits": 14,
+                                                              "gatewayRunners": 2, "smallRunners": 2}}}
+        self.manifest.write_text(json.dumps(manifest))
+        seeds = {"FAKE_RECEIPTS": "mini-a=" + ":".join(str(k) for k in range(9))}
+        plan = self.fleet("--hosts", "mini-a", "--output", "human", **seeds)
+        self.assertEqual(plan.returncode, 0, plan.stdout + plan.stderr)
+        self.assertIn("4 runners/14 units+2gw+2small", plan.stdout)
+        row = json.loads(self.fleet("--hosts", "mini-a", **seeds).stdout)["members"][0]
+        self.assertEqual(row["smallRunners"], 2)
+        self.assertEqual(row.get("retire"), [8], "only the instance past 0-7 is surplus")
+        result = self.fleet("--apply", "--hosts", "mini-a", **seeds)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        row = json.loads(result.stdout)["members"][0]
+        self.assertEqual([i["instance"] for i in row["instances"] if not i.get("surplus")], list(range(8)))
+        self.assertEqual([i["instance"] for i in row["instances"] if i.get("surplus")], [8])
+
     def test_a_lowered_count_retires_the_idle_instances_past_it(self) -> None:
         """#1821: after runners drops (an xl Studio from 10 to 6), the apply re-applies 0..count-1 and retires each
         pool instance installed at or past the count, deregistering it; a busy one is left and reported, and does
