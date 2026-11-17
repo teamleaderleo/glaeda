@@ -147,7 +147,8 @@ pressure pass's defer-while-CI-runs come back with "defer_during_ci": true in ~/
 Its windows follow reuse (IDLE_SWEEP_HOURS and friends). cmux CI's hot tier ages in host CI jobs since its
 last use, not hours (item_due: pressure_jobs, min_jobs, sweep_jobs, soft_idle_hours in disk-policy.json). It also
 reports Xcode copies no pin names and simulator runtimes, and deletes a runtime only when no device
-uses it, it is not its platform's newest, it went unused for RUNTIME_IDLE_DAYS and no simulator is
+uses it, no installed Xcode's simulator SDK has its platform and version (an unreadable SDK keeps
+its whole platform), it is not its platform's newest, it went unused for RUNTIME_IDLE_DAYS and no simulator is
 booted (simctl runtime delete restarts CoreSimulatorService). Xcode copies are never deleted. A shutdown
 simulator device last booted SIM_DEVICE_IDLE_HOURS ago is erased (`simctl erase`: its name, type and runtime stay,
 its data goes), never deleted, unless a process names its UDID or has a file open in it.
@@ -2230,10 +2231,106 @@ def _iso_age_hours(text: object, now: float) -> float | None:
     return (now - at) / 3600
 
 
-def runtime_items(runtimes: dict, devices: dict, now: float | None = None) -> list[Item]:
-    """Judge simulator runtimes (`simctl runtime list -j`) against devices (`simctl list devices -j`).
-    Reclaimable only when deletable, used by no device, not its platform's newest, unused for
-    RUNTIME_IDLE_DAYS, and no simulator is booted. Unknown fields keep it."""
+# An installed Xcode's simulator SDK needs the runtime of the same platform and version (Xcode 26.6's iOS 26.5 SDK
+# runs on runtime 23F77): with iOS 27 installed beside it, 26.5 is no longer its platform's newest, yet every sim job
+# on that Xcode still needs it. Platform directory -> the last part of simctl's platformIdentifier.
+SIM_SDK_PLATFORMS = {"iPhoneSimulator": "iphonesimulator", "WatchSimulator": "watchsimulator",
+                     "AppleTVSimulator": "appletvsimulator", "XRSimulator": "xrsimulator"}
+SIM_RUNTIME_OS = {"ios": "iphonesimulator", "watchos": "watchsimulator", "tvos": "appletvsimulator",
+                  "xros": "xrsimulator", "visionos": "xrsimulator"}
+ANY_PLATFORM = "*"
+SimSdk = tuple[str, str, "str | None", "str | None"]  # (xcode, platform, version, build)
+
+
+def _major_minor(v: str) -> tuple[int, int] | None:
+    k = _version_key(v)
+    return (k + (0,))[:2] if k else None
+
+
+def _sdk_version(sdk: Path) -> tuple[str | None, str | None]:
+    """(version, build) of one simulator SDK: SDKSettings.json (or .plist) and its SystemVersion.plist."""
+    import plistlib
+    try:
+        version = json.loads((sdk / "SDKSettings.json").read_text()).get("Version")
+    except Exception:  # noqa: BLE001  (unreadable: try the plist, then fail closed)
+        try:
+            version = plistlib.loads((sdk / "SDKSettings.plist").read_bytes()).get("Version")
+        except Exception:  # noqa: BLE001
+            version = None
+    try:
+        build = plistlib.loads((sdk / "System/Library/CoreServices/SystemVersion.plist").read_bytes()
+                               ).get("ProductBuildVersion")
+    except Exception:  # noqa: BLE001  (the build is an extra match; the version decides)
+        build = None
+    return (version if isinstance(version, str) and _major_minor(version) else None,
+            build if isinstance(build, str) and build else None)
+
+
+def xcode_sim_sdks(apps: Path = Path("/Applications"), extra: object = ()) -> list[SimSdk]:
+    """(xcode, platform, version, build) for each simulator SDK of every Xcode*.app under apps and each extra
+    app path (pins). Fail closed: a platform whose SDK cannot be read gives version None (keep every runtime
+    of that platform); an Xcode whose Platforms cannot be listed gives ANY_PLATFORM (keep every runtime)."""
+    out: set[SimSdk] = set()
+    seen: set[str] = set()
+    for app in [*sorted(apps.glob("Xcode*.app")), *(Path(x) for x in extra)]:
+        real = os.path.realpath(app)
+        if real in seen or not os.path.isdir(real):
+            continue
+        seen.add(real)
+        name = Path(real).name  # a symlinked Xcode.app is named by the install it points at
+        plats = Path(real) / "Contents/Developer/Platforms"
+        try:
+            names = set(os.listdir(plats))
+        except OSError:
+            out.add((name, ANY_PLATFORM, None, None))
+            continue
+        for dirname, plat in SIM_SDK_PLATFORMS.items():
+            if f"{dirname}.platform" not in names:
+                continue  # this Xcode ships no SDK for it, so needs no runtime of it
+            read = [_sdk_version(sdk) for sdk in sorted((plats / f"{dirname}.platform/Developer/SDKs").glob("*.sdk"))]
+            read = [(v, b) for v, b in read if v is not None]
+            out.update((name, plat, v, b) for v, b in read)
+            if not read:
+                out.add((name, plat, None, None))
+    return sorted(out, key=lambda t: tuple(str(x) for x in t))
+
+
+def _runtime_platform(r: dict) -> str | None:
+    plat = str(r.get("platformIdentifier") or "").rsplit(".", 1)[-1].lower()
+    if plat in SIM_SDK_PLATFORMS.values():
+        return plat
+    m = re.search(r"SimRuntime\.([A-Za-z]+)-", str(r.get("runtimeIdentifier") or ""))
+    return SIM_RUNTIME_OS.get(m.group(1).lower()) if m else None
+
+
+def _sdk_needs(r: dict, sdks: list[SimSdk]) -> list[str]:
+    """Why an installed Xcode's simulator SDK needs this runtime (empty: none does). Matches the platform and
+    the version's major.minor (how Xcode picks a runtime for an SDK), or the exact build."""
+    plat, mm = _runtime_platform(r), _major_minor(str(r.get("version") or ""))
+    build = str(r.get("build") or "")
+    why = set()
+    for xcode, splat, version, sbuild in sdks:
+        if splat == ANY_PLATFORM:
+            why.add(f"{xcode}'s simulator SDKs cannot be read")
+        elif plat is None:
+            why.add(f"its platform is unknown and {xcode} has a {splat} SDK")
+        elif splat != plat:
+            continue
+        elif version is None:
+            why.add(f"{xcode}'s {splat} SDK version cannot be read")
+        elif mm is None:
+            why.add(f"its version is unknown and {xcode} has a {splat} SDK")
+        elif mm == _major_minor(version) or (build and build == sbuild):
+            why.add(f"{xcode}'s {splat} {version} SDK needs it")
+    return sorted(why)
+
+
+def runtime_items(runtimes: dict, devices: dict, now: float | None = None,
+                  sdks: list[SimSdk] | None = None) -> list[Item]:
+    """Judge simulator runtimes (`simctl runtime list -j`) against devices (`simctl list devices -j`) and the
+    simulator SDKs of installed Xcodes (`xcode_sim_sdks`). Reclaimable only when deletable, used by no device,
+    needed by no Xcode's SDK, not its platform's newest, unused for RUNTIME_IDLE_DAYS, and no simulator is
+    booted. Unknown fields keep it."""
     now = time.time() if now is None else now
     by_runtime = devices.get("devices") if isinstance(devices, dict) else None
     if not isinstance(runtimes, dict) or not isinstance(by_runtime, dict):
@@ -2257,6 +2354,7 @@ def runtime_items(runtimes: dict, devices: dict, now: float | None = None) -> li
             keep.append(f"{len(devs) if isinstance(devs, list) else '?'} simulator devices use it")
         if newest.get(str(r.get("platformIdentifier", ""))) == str(r.get("version", "")):
             keep.append("its platform's newest")
+        keep += _sdk_needs(r, sdks or [])
         if r.get("deletable") is not True:
             keep.append("simctl cannot delete it")
         idle = _iso_age_hours(r.get("lastUsedAt"), now)
@@ -2284,7 +2382,9 @@ def simulator_runtimes() -> list[Item]:
     if not DARWIN or not shutil.which("xcrun"):
         return []
     runtimes, devices = simctl_json("runtime", "list"), simctl_json("list", "devices")
-    return runtime_items(runtimes, devices) if runtimes is not None and devices is not None else []
+    if runtimes is None or devices is None:
+        return []
+    return runtime_items(runtimes, devices, sdks=xcode_sim_sdks(extra=xcode_pins()))
 
 
 # Simulator devices (macOS, pressure passes and idle sweeps). CI jobs create a device per run and delete it in a
