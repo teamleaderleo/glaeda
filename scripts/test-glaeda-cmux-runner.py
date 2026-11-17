@@ -10906,6 +10906,35 @@ class GateTest(unittest.TestCase):
         self.assertFalse(hook.job_written_file(self.state, runner.name).exists(), "unmeasured: the file goes")
         self.assertIsNone(hook.JobWritten(runner / "_work", workspace, du).written(50.0), "no baseline: unmeasured")
 
+    def test_an_earlier_jobs_written_record_is_never_the_next_jobs(self) -> None:
+        """RUNNER_JOB_WRITTEN is keyed by a per-job nonce, not by the Runner.Worker pid and freshness alone: an earlier
+        job's record (its sampler late, or its cleanup missed) whose pid the next job's Worker reuses is never charged
+        to that job, and the earlier job's late write or cleanup never overwrites or deletes the next job's record."""
+        runner = "actions-runner-glaeda-2"
+        now = time.time()
+        first = hook.begin_job_written(self.state, runner, 100)
+        self.assertTrue(first)
+        self.assertTrue(hook.write_job_written(self.state, runner, 100, first, 5.0, now))
+        self.assertEqual(hook.job_written_gib(self.state, runner, 100, now), 5.0)
+        # the next job on the same runner, its Runner.Worker given the same pid, while the first record is still fresh
+        second = hook.begin_job_written(self.state, runner, 100)
+        self.assertTrue(second)
+        self.assertNotEqual(first, second)
+        self.assertIsNone(hook.job_written_gib(self.state, runner, 100, now),
+                          "the earlier job's record is not the next job's: it is charged the full p95")
+        self.assertFalse(hook.write_job_written(self.state, runner, 100, first, 9.0, now),
+                         "the earlier job's late sampler writes nothing once the next job began")
+        self.assertIsNone(hook.job_written_gib(self.state, runner, 100, now))
+        self.assertTrue(hook.write_job_written(self.state, runner, 100, second, 2.0, now))
+        self.assertEqual(hook.job_written_gib(self.state, runner, 100, now), 2.0)
+        hook.clear_job_written(self.state, runner, first)
+        self.assertEqual(hook.job_written_gib(self.state, runner, 100, now), 2.0,
+                         "the earlier job's cleanup leaves the next job's record")
+        self.assertTrue(hook.job_written_file(self.state, runner).exists())
+        hook.clear_job_written(self.state, runner, second)
+        self.assertFalse(hook.job_written_file(self.state, runner).exists(), "its own job's cleanup removes it")
+        self.assertIsNone(hook.job_written_gib(self.state, runner, 100, now))
+
     def test_an_installed_hook_reads_the_staged_runner_job_disk(self) -> None:
         """The hook runs from ~/actions-runner-glaeda-K/glaeda-hooks/; the json is the staged runner copy in
         ~/glaeda-runner/scripts."""
