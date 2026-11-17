@@ -8084,7 +8084,7 @@ class Gate:
         # force (host_load_cap, refreshed with the other settings), the feed summary and this runner's labels
         self.cap_samples: list[tuple[float, float]] = []
         self.cap_sample_at = -GATE_CPU_EVERY_S
-        self.cap = HOST_LOAD_CAP_DEFAULT
+        self.cap = host_load_cap(None, "", 0.0)  # the environment or the code default until the settings are read
         self.cap_why: str | None = None
         self.cap_summary: dict[str, Any] | None = None
         self.cap_labels: frozenset[str] | None = None
@@ -8287,7 +8287,7 @@ class Gate:
     def cap_sample(self, now: float) -> None:
         """One load1 read for HOST_LOAD_CAP every GATE_CPU_EVERY_S, during a job too (cpu_feed), so the look right
         after a job averages the last two minutes. getloadavg only: no process."""
-        if now - self.cap_sample_at < GATE_CPU_EVERY_S:
+        if self.cap <= 0 or now - self.cap_sample_at < GATE_CPU_EVERY_S:
             return
         self.cap_sample_at = now
         if (load := load_1min()) is not None:
