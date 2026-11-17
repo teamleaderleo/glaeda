@@ -6500,6 +6500,38 @@ time.sleep(60)
             waiter.stdout.close()
             self.ci_step("release", "--job-key", "wait-1-1")
 
+    def test_ci_step_takes_no_host_lock_while_every_runner_drains(self) -> None:
+        """HOST_DRAIN: a hand drain marks every runner on a mini (RUNNER_DRAIN) so it empties for a repair. On a mini
+        with a wedged sandboxd (2026-11-17) every listener stopped, but the lent build worker kept leasing ci-steps,
+        and each admission took host.lock, so the repair's wait for a free host.lock refused again and again. A mini
+        whose every runner drains fits and admits no step; one runner draining (a relabel) leaves steps alone."""
+        self.fleet()
+        worker = self.ci_worker()
+        watch = ("--watch-pid", str(worker.pid))
+        runners = [self.dir / "actions-runner-glaeda", self.dir / "actions-runner-glaeda-1"]
+
+        def mark(runner: Path, until: float) -> None:
+            (runner / hook.RUNNER_DRAIN_FILE).write_text(json.dumps({"reason": "a sandboxd restore", "until": until}))
+
+        for runner in runners:
+            runner.mkdir()
+        mark(runners[0], time.time() + 600)
+        self.assertEqual(self.fits(), ["light", "isolated"], "one runner draining is a relabel, not a host drain")
+        mark(runners[1], time.time() + 600)
+        status, result = self.ci_step("fits")
+        self.assertEqual((status, result["fits"]), (0, []), "the worker advertises nothing, so nothing is leased")
+        status, refused = self.ci_step("admit", "--class", "light", "--job-key", "drain-1-1", *watch)
+        self.assertEqual(status, 1, refused)
+        self.assertIn("host draining: all 2 runners are draining for a sandboxd restore", refused["reason"])
+        self.assertTrue(self.lock_free(), "a refused step holds no host.lock")
+        mark(runners[1], time.time() - 1)
+        self.assertEqual(self.fits(), ["light", "isolated"], "an expired marker ends the host drain")
+        try:
+            status, admitted = self.ci_step("admit", "--class", "light", "--job-key", "drain-2-1", *watch)
+            self.assertEqual(status, 0, admitted)
+        finally:
+            self.ci_step("release", "--job-key", "drain-2-1")
+
     def test_ci_step_fits_is_unknown_while_an_admission_runs(self) -> None:
         self.fleet()
         capacity = self.dir / "capacity"
@@ -11101,6 +11133,21 @@ class GateTest(unittest.TestCase):
             marker.unlink()
             gate.step()
         self.assertEqual(stops, [])
+
+    def test_a_drain_holds_every_runner_role(self) -> None:
+        """A drain that empties a mini needs every listener held, whatever its role: a gui, session, nightly, fast or
+        dedicated runner each skip some host-level holds (reservations, fleet waiters), never RUNNER_DRAIN."""
+        hooks = self.runner / "glaeda-hooks"
+        hooks.mkdir()
+        self.drain(reason="a sandboxd restore")
+        for flags in ("--gui-runner --gui-token gui", "--session-runner", "--nightly-runner", "--fast-runner",
+                      "--dedicated-admit x --yield-to-exclusive", ""):
+            with self.subTest(flags=flags):
+                (hooks / "job-started.sh").write_text(f"#!/bin/bash\nexec /hook job-started {flags} --instance 3\n")
+                gate = hook.Gate(self.runner, os.fspath(self.lock), "", self.state)
+                with mock.patch.object(hook, "host_held", return_value=None):
+                    self.assertEqual(gate.claimed(), "draining for a sandboxd restore")
+                    self.assertEqual(gate.confirmed(), "draining for a sandboxd restore")
 
     def test_a_drain_holds_an_idle_listener_off_until_its_marker_goes_or_expires(self) -> None:
         gate = hook.Gate(self.runner, os.fspath(self.lock), "", self.state)

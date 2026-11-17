@@ -666,6 +666,12 @@ What `--apply` does:
      idle (glaeda#1825). Before a drain, a non-dedicated runner's planned hook writes
      land, so an older gate reloads one that reads the marker.
    - job-started still refuses a job handed over in the moment before a stop.
+   - **A drained host.** Every listener role honours `.glaeda-drain` (gui, session,
+     nightly, fast and dedicated runners included). When every runner on a mini has a live
+     marker, as a hand drain for a repair writes, the mini is drained as a whole
+     (`HOST_DRAIN`): the build worker's `fits` advertises no ci-step and `admit`
+     refuses, so nothing new takes `host.lock` and the drain ends once running jobs
+     end. One runner draining (a relabel) leaves ci-steps alone.
 5. Confirms through the GitHub API that the runner is listed with every label and
    waits up to 90 s for it to report online.
 

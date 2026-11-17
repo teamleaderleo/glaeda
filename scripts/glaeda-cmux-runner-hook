@@ -3236,6 +3236,28 @@ def runner_drain(runner_dir: Path, now: float) -> str | None:
     return f"draining for {str(doc.get('reason') or 'glaeda-cmux-runner --apply')[:200]}"
 
 
+# HOST_DRAIN: a hand drain that empties a mini for a repair marks every runner on it (RUNNER_DRAIN), and every listener
+# then stops whatever its role. The lent build worker's ci-steps are no listener: it kept leasing them, and each
+# admission takes host.lock, so a repair waiting for a free host.lock never got it (a mini with a wedged sandboxd,
+# 2026-11-17: six heal drains refused after 1200 s each, one naming a ci-step's admission as the holder). A mini whose
+# every runner drains is a drained host: `fits` advertises nothing and `admit` refuses, so no new step takes the lock
+# and the drain ends once the running work does. One runner draining (a relabel) is not a host drain.
+def host_drain(home: Path, now: float) -> str | None:
+    """Why this mini is drained (HOST_DRAIN), or None: some runner under home has no live RUNNER_DRAIN, or there is
+    none. A directory that cannot be listed drains nothing."""
+    try:
+        runners = sorted(p for p in home.glob("actions-runner-glaeda*") if p.is_dir() and not p.is_symlink())
+    except OSError:
+        return None
+    first = None
+    for runner in runners:
+        why = runner_drain(runner, now)
+        if why is None:
+            return None
+        first = first or why
+    return f"host draining: all {len(runners)} runners are {first}" if first else None
+
+
 # glaeda-mini-health's drain for a Tailscale restart (glaeda#1627): it wants the host idle, not jobs refused. The gate
 # stops idle listeners while the marker stands, so no new job comes; a job a listener already took before the gate
 # saw the marker is admitted and finishes (mini-health waits for it). Refusing it only failed that job: one
@@ -6959,7 +6981,8 @@ def step_fits(capacity_dir: Path, total: int, compile_slots: int, roots: int, ho
     free copy of each token are free (an idle catch-up's locks count as free: it yields them to the next job), and
     no job admitted here waits for units or one of those tokens (CAPACITY_WAIT: it goes first). The units an idle gui
     runner reserves (GUI_RESERVE) are not free to a step."""
-    if total <= 0 or host_held(host_lock, reservation, now, state_dir) or host_waiters(host_lock, state_dir):
+    if total <= 0 or host_drain(Path.home(), now) or host_held(host_lock, reservation, now, state_dir) \
+            or host_waiters(host_lock, state_dir):
         return []
     try:
         admission: int | None = os.open(capacity_dir / "admission.lock", os.O_RDONLY | os.O_NOFOLLOW)
@@ -7028,7 +7051,7 @@ def step_admit(klass: str, key: str, watch_pid: int, host_lock: str, reservation
         return refused("admit needs --capacity-units: this mini has no capacity ledger")
     if watch_pid <= 1 or not pid_alive(watch_pid):
         return refused(f"the watched pid {watch_pid} is not running")
-    why = reservation_refusal(reservation, time.time()) or step_refusal()
+    why = reservation_refusal(reservation, time.time()) or host_drain(Path.home(), time.time()) or step_refusal()
     if why:
         return refused(why)
     if klass == SIMULATOR_STEP_CLASS and not simulator_host(state_dir):
