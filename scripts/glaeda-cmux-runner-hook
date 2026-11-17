@@ -8870,6 +8870,14 @@ class Gate:
             return
         if self.eligible_look is not None and self.eligible_look.is_alive():
             return  # the next poll: the look thread does not block SIGTERM, and its probes would be orphaned
+        if self.watching or self.freeze_at_exit or self.job_waited or self.job_ending or self.frozen:
+            # JOB_END_FREEZE is armed (job_waited too: a request taken whose Worker is not seen yet): this gate will
+            # freeze and stop the listener at its Worker's exit, and none of
+            # that crosses the exec. Re-executed then, the new gate is still starting when the job ends, and the
+            # listener takes the next job (2026-11-17, a lent mini: reloaded during a lend
+            # drain and a RUNNER_DRAIN, its job ended 3 s later and it ran another 2 s later). The reload waits for
+            # the stop; an idle or held gate reloads at its next poll.
+            return
         self.source = now
         argv = [a for a in sys.argv if not a.startswith("--adopt=")]
         if self.child is not None:
