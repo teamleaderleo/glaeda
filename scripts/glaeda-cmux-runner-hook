@@ -371,8 +371,8 @@ JOB_CLASSES = {"macos-compile-admission": "compile", "app-host-unit-tests": "gui
                # iOS (test-ios, ios-screenshots; runs-on glaeda-ios-sim): builds into their own DerivedData or
                # SwiftPM .build, never /private/tmp/cmux-ci, so no canonical root. Simulator jobs reuse, erase and
                # boot named devices in the user's one CoreSimulator service, so each holds a simulator token copy
-               # (SIM_SLOTS: one per mini by default). ios-simulator-build stays isolated here; on a mini with more
-               # than one sim slot it is a simulator job (SIM_SLOT_JOBS). ios-streamed-validate's `validate` is not
+               # (SIM_DYNAMIC: copies by measured headroom). ios-simulator-build stays isolated here; on a mini whose
+               # simulator ceiling is above one it is a simulator job (SIM_SLOT_JOBS). ios-streamed-validate's `validate` is not
                # listed: fixed ports, GUI session changes and secrets in $HOME keep it on Blacksmith
                # (docs/CMUX_MINI_RUNNER.md 2g).
                "mobile-core-package": "isolated", "ios-simulator-build": "isolated",
@@ -866,7 +866,7 @@ def parse_job_needs(data: bytes, now: float | None = None) -> tuple[dict[str, An
         me = gate_host()
         if me not in {h.strip().lower() for h in hosts}:
             return None, f"this host ({me}) is not in the needs file's hosts"
-    out: dict[str, Any] = {"generated_at": at.timestamp(), "min_samples": floor}
+    out: dict[str, Any] = {"generated_at": at.timestamp(), "min_samples": floor, "rss_p95": {}}
     for table in ("jobs", "classes"):
         rows = doc.get(table)
         if not isinstance(rows, dict):
@@ -879,6 +879,9 @@ def parse_job_needs(data: bytes, now: float | None = None) -> tuple[dict[str, An
             pooled = _needs_row(row, floor)
             if pooled:
                 kept[key] = pooled
+                # SIM_DYNAMIC: one simulator's p95 RSS sizes the simulator ceiling (sim_rss_mib)
+                if (p95 := _needs_number(row, "rss_peak_mib_p95", JOB_NEEDS_MAX_MIB)):
+                    out["rss_p95"][f"{table}/{key}"] = p95
             hosts = row.get("by_ncpu")
             if isinstance(hosts, dict):
                 per = {ncpu: got for ncpu, sub in hosts.items()
@@ -1063,6 +1066,9 @@ def needs_main(path: Path | None) -> int:
             os.fspath(Path.home()), "~", 1), "fallback": why or None,
         "host": {"cores": host_cores(), "mem_mib": mib, "mem_floor_mib": mem_floor_mib(mib) if mib else None,
                  "mem_chunks": mem_chunks_total(), "mem_chunk_mib": MEM_CHUNK_MIB}}
+    ceiling, how = sim_ceiling(needs)  # SIM_DYNAMIC: what this host's simulator copies are bounded by
+    answer["simulator"] = {"ceiling": ceiling, "ceiling_from": how, "rss_mib": sim_rss_mib(needs)[0],
+                           "off": sim_off()}
     if needs:
         answer.update(generated_at=datetime.datetime.fromtimestamp(needs["generated_at"], datetime.timezone.utc)
                       .strftime("%Y-%m-%dT%H:%M:%SZ"), jobs=len(needs["jobs"]), classes={
@@ -1592,8 +1598,8 @@ def slot_capacity_wait(cap: float | None, dev_compile_runner: bool) -> float | N
     return DEV_COMPILE_CAPACITY_WAIT_S if cap is None else min(cap, DEV_COMPILE_CAPACITY_WAIT_S)
 
 
-# SIM_SLOT_JOBS: home jobs that boot the mini's simulator but are isolated on a one-slot mini, and simulator jobs (a
-# token copy, GLAEDA_SIM_SLOT, the sim-first runner's priority) where --sim-slots is above 1. ios-simulator-build
+# SIM_SLOT_JOBS: home jobs that boot the mini's simulator but are isolated on a one-copy mini, and simulator jobs (a
+# token copy, GLAEDA_SIM_SLOT, the sim-first runner's priority) where the simulator ceiling is above 1 (SIM_DYNAMIC). ios-simulator-build
 # builds, then runs its tests in the simulator: as isolated, up to 3 ran at once on a mini sharing one device, and
 # its 399 runs on the 3 sim minis (hq build-fleet jobs.csv, 2026-11-13..15) ran 2.7 min p50 but queued 16 / 24.5 min
 # p50 / p90, against 1.6 min for mobile-core-package beside it. One slot keeps it isolated: the one token would run
@@ -1602,9 +1608,9 @@ SIM_SLOT_JOBS = frozenset({"ios-simulator-build"})
 
 
 def job_class(job: str, repo: str | None, home_repo: str = DEFAULT_HOME_REPO,
-              workflow: str = "", sim_slots: int = 1) -> tuple[str, bool]:
-    """The job's class and whether it is pinned to /private/tmp/cmux-ci (an unknown job of the home repo). sim_slots:
-    this mini's --sim-slots, which makes a SIM_SLOT_JOBS job a simulator job above 1."""
+              workflow: str = "") -> tuple[str, bool]:
+    """The job's class and whether it is pinned to /private/tmp/cmux-ci (an unknown job of the home repo). A
+    SIM_SLOT_JOBS job is a simulator job where this mini's simulator ceiling is above 1 (SIM_DYNAMIC)."""
     if is_guest(repo, home_repo):
         name = job.lower()
         if name.endswith("-sim") or name.endswith("simulator"):
@@ -1612,7 +1618,7 @@ def job_class(job: str, repo: str | None, home_repo: str = DEFAULT_HOME_REPO,
         return ("light" if name.endswith("-light") else "isolated"), False
     if (workflow, job) in WORKFLOW_JOB_CLASSES:
         return WORKFLOW_JOB_CLASSES[(workflow, job)], False
-    if job in SIM_SLOT_JOBS and sim_slots > 1:
+    if job in SIM_SLOT_JOBS and sim_copies() > 1:
         return "simulator", False
     return JOB_CLASSES.get(job, "compile"), job not in JOB_CLASSES
 
@@ -2009,59 +2015,157 @@ def export_root(name: str) -> str:
     return export_job_env(CANONICAL_ROOT_ENV, canonical_root(int(name.rsplit("-", 1)[1])), "glaeda-canonical-root")
 
 
-# SIM_SLOTS (Leo, 2026-11-17: "aziz also wanted to look into packing more ios simulators at once and right-sizing
-# them in ci"): a mini's simulator token comes in --sim-slots copies (glaeda_fleet_labels simSlots, default 1), named
-# as persistent-dd's are: simulator (copy 0, the file glaeda-disk's eraser and every older hook take), then
+# SIM_SLOTS, now SIM_DYNAMIC (Leo, 2026-11-17: "aziz also wanted to look into packing more ios simulators at once and
+# right-sizing them in ci", then "hm why 3 tho shouldn't this be more dynamic? i think it's finally time to start
+# getting these things done"). No simulator count is set by hand anywhere. A mini's simulator token comes in copies
+# named as persistent-dd's are: simulator (copy 0, the file glaeda-disk's eraser and every older hook take), then
 # simulator-1, simulator-2. A simulator job takes the first free copy and is told which (GLAEDA_SIM_SLOT, as
-# CMUX_CI_CANONICAL_ROOT names its root), so its workflow can boot devices of its own slot instead of the one shared
-# set. A copy past the first is admitted by headroom, never by a fixed count: the job's units and, with the RAM ledger
-# on, its measured RAM chunks must be free, and sim_copy_room applies the fleet's one headroom rule for work past a
-# host's base count (leo-workspace#5539, tools/lane_admission.py headroom_short: the two stay one rule), each refusal
-# naming the term that failed: load1 under SIM_SLOT_LOAD_SHARE of the cores; RAM for one more job of the class's
-# measured size (job_need's rss p90) over the reserve (mem_floor_mib), with the ledger off; swap under
-# SIM_SLOT_SWAP_SHARE used (vm.swapusage, swap_usage); and the memory-pressure gate's level under
-# GATE_MEMORY_PRESSURE_HOLD, which stands in for #5539's available-memory term (Darwin raises it as free pages run
-# out). 1 keeps today's one simulator job per mini exactly.
-SIM_SLOT_LOAD_SHARE = 0.75  # lane_admission LOAD_SHARE
-SIM_SLOT_SWAP_SHARE = 0.10  # lane_admission SWAP_SHARE
+# CMUX_CI_CANONICAL_ROOT names its root), so its workflow boots devices of its own slot.
+#
+# Copy 0 is always admissible (one simulator job per mini, as before). Copy k > 0 is admissible while, measured now,
+# the host stays under Leo's 80% line with one more simulator on it (sim_copy_room, each refusal naming its term):
+#   - free RAM (kern.memorystatus_level, the free percentage memory_pressure prints) less one simulator's RSS stays
+#     at least SIM_FREE_SHARE of the RAM;
+#   - load1 under SIM_LOAD_SHARE of the cores;
+#   - memory pressure green (the level under GATE_MEMORY_PRESSURE_HOLD);
+#   - swap not growing: used swap rose less than SIM_SWAP_GROWTH_MIB over SIM_SWAP_WINDOW_S (samples kept in the
+#     capacity ledger, SIM_SWAP_SAMPLES).
+# A reading that cannot be taken holds nothing, as the gate fails open (host_saturated). The only number left is a
+# hard ceiling computed here at runtime (sim_ceiling): floor((RAM - reserve) / one simulator's p95 RSS), the reserve
+# being SIM_FREE_SHARE of the RAM (at least mem_floor_mib), so even simulators that have not yet grown to their size
+# cannot together take the host past the line. One simulator's RSS is measured: the needs file's simulator class row,
+# else test-ios.yml's ios-simulator-build row (rss_peak_mib_p95, else rss_peak_mib_p90 until cmuxterm-hq's
+# build-fleet/data/job-needs.json carries p95), else SIM_RSS_FALLBACK_MIB. The old --sim-slots flag and the manifest's
+# runner.classes.<class>.simSlots are ignored (a deprecation line says so). Kill switch: SIM_OFF_ENV=1 in the
+# runner's environment, or a SIM_OFF_FILE in the capacity ledger (touch it on the mini, live), takes no simulator
+# copy at all and the sim-first runner stops listening.
+#
+# glaeda-disk's eraser holds every copy that exists and SIM_GATE exclusive through its erase; a copy past the first is
+# taken only under SIM_GATE shared, so no new copy file can appear between the eraser's listing and its erase.
+SIM_FREE_SHARE = 0.20  # free RAM after one more simulator stays at least 20% of the RAM (Leo's 80% line)
+SIM_LOAD_SHARE = 0.80  # load1 under 0.8 x cores (Leo's 80% line)
+SIM_SWAP_GROWTH_MIB = 256  # swap used grew by more than this within SIM_SWAP_WINDOW_S: growing
+SIM_SWAP_WINDOW_S = 300.0
+SIM_SWAP_SAMPLES = "simulator-swap.json"  # capacity ledger: [[epoch, used bytes], ...] within SIM_SWAP_WINDOW_S
+SIM_RSS_FALLBACK_MIB = 4608  # 4.5 GiB: one simulator job's RSS when no needs row measures it
+SIM_RSS_JOB_ROW = "test-ios.yml/ios-simulator-build"  # the needs file's job row read after the simulator class row
+SIM_OFF_ENV = "GLAEDA_SIMULATORS_OFF"  # "1": the kill switch
+SIM_OFF_FILE = "simulators.off"  # in the capacity ledger: the kill switch, live
+SIM_GATE = "simulator-copies.gate"  # held shared by a copy past the first, exclusive by glaeda-disk's eraser
 SIM_SLOT_ENV = "GLAEDA_SIM_SLOT"
 SIM_SLOT_FILE = "glaeda-sim-slot"  # $RUNNER_TEMP/glaeda-sim-slot: the copy index alone
-MAX_SIM_SLOTS = 4  # glaeda_fleet_labels.MAX_SIM_SLOTS and glaeda-disk's SIM_TOKEN_COPIES (a test keeps them equal)
+MEMORY_FREE_KEY = "kern.memorystatus_level"  # Darwin: the percentage of RAM free (memory_pressure's last line)
+HOST_MEM_FREE_ENV = "GLAEDA_HOST_MEM_FREE_PCT"  # tests: the free percentage instead of kern.memorystatus_level
 
 
-def sim_slots_of(value: int | None) -> int:
-    return min(MAX_SIM_SLOTS, max(1, int(value or 1)))
+def sim_off(capacity_dir: Path | None = None) -> str | None:
+    """Why simulators are off on this mini (the kill switch), or None."""
+    if (os.environ.get(SIM_OFF_ENV) or "").strip() == "1":
+        return f"simulators are off on this mini ({SIM_OFF_ENV}=1)"
+    if capacity_dir is not None and (capacity_dir / SIM_OFF_FILE).exists():
+        return f"simulators are off on this mini ({capacity_dir / SIM_OFF_FILE} exists)"
+    return None
 
 
-def sim_token_names(slots: int) -> list[str]:
-    """The simulator token's copies on a mini with `slots` sim slots: simulator, simulator-1, ..."""
-    return ["simulator"] + [f"simulator-{c}" for c in range(1, sim_slots_of(slots))]
+def sim_rss_mib(needs: Any = _LOAD) -> tuple[int, str]:
+    """(MiB, where it came from): one simulator job's measured p95 RSS (SIM_DYNAMIC)."""
+    if needs is _LOAD:
+        needs = load_job_needs()[0]
+    if needs:
+        p95 = needs.get("rss_p95", {})
+        for table, key in (("classes", SIM_TOKEN), ("jobs", SIM_RSS_JOB_ROW)):
+            if (mib := p95.get(f"{table}/{key}")):
+                return math.ceil(mib), f"{key} rss p95"
+            row = needs.get(table, {}).get(key)
+            if row and row[1]:
+                return math.ceil(row[1]), f"{key} rss p90"
+    return SIM_RSS_FALLBACK_MIB, "stock fallback"
 
 
-def sim_copy_room(copy: int, mib: int, mem_total: int) -> str | None:
-    """The headroom term simulator copy `copy` fails now (SIM_SLOTS, leo-workspace#5539), or None to admit it. Copy 0
-    always may (today's one per mini). A later copy runs beside the earlier ones: load1 must be under
-    SIM_SLOT_LOAD_SHARE of the host's cores, the memory-pressure level under GATE_MEMORY_PRESSURE_HOLD, swap under
-    SIM_SLOT_SWAP_SHARE used (no swap file yet holds nothing), and, with the
-    RAM ledger off (mem_total 0; on, its chunks decide at take_capacity's RAM step), copy + 1 jobs of the class's
-    measured RAM (mib) plus the reserve (mem_floor_mib) must fit the host's RAM. A reading that cannot be taken holds
-    nothing, as the gate fails open (host_saturated)."""
+def sim_ceiling(needs: Any = _LOAD) -> tuple[int, str]:
+    """(copies, why): the hard ceiling on this mini's simulator copies, floor((RAM - reserve) / one simulator's
+    RSS), at least 1; 1 where the RAM cannot be measured (one per mini, as before)."""
+    host = host_mem_mib()
+    if not host:
+        return 1, "RAM unmeasured"
+    rss, source = sim_rss_mib(needs)
+    reserve = max(mem_floor_mib(host), math.ceil(SIM_FREE_SHARE * host))
+    ceiling = max(1, (host - reserve) // max(1, rss))
+    return ceiling, (f"({host / 1024:.0f} GiB - {reserve / 1024:.1f} reserve) / {rss / 1024:.1f} GiB "
+                     f"({source}) = {ceiling}")
+
+
+def sim_copies(capacity_dir: Path | None = None) -> int:
+    """How many simulator copies this mini may hand out now at most: the ceiling, or 0 with the kill switch on."""
+    return 0 if sim_off(capacity_dir) else sim_ceiling()[0]
+
+
+def sim_token_names(capacity_dir: Path | None = None) -> list[str]:
+    """The simulator token's copies this mini may hand out: simulator, simulator-1, ... up to the ceiling."""
+    return [SIM_TOKEN if c == 0 else f"{SIM_TOKEN}-{c}" for c in range(sim_copies(capacity_dir))]
+
+
+def host_mem_free_mib() -> int | None:
+    """This host's free RAM in MiB (kern.memorystatus_level percent of hw.memsize; HOST_MEM_FREE_ENV in tests), or
+    None when it cannot be read."""
+    host = host_mem_mib()
+    raw = (os.environ.get(HOST_MEM_FREE_ENV) or "").strip()
+    if not raw and sys.platform == "darwin":
+        with contextlib.suppress(OSError, subprocess.TimeoutExpired):
+            raw = subprocess.run([SYSCTL, "-n", MEMORY_FREE_KEY], stdin=subprocess.DEVNULL, capture_output=True,
+                                 text=True, timeout=5, check=False).stdout.strip()
+    try:
+        pct = float(raw)
+    except ValueError:
+        return None
+    return int(host * pct / 100) if host and 0 <= pct <= 100 else None
+
+
+def swap_growth(capacity_dir: Path | None, used: int, now: float | None = None) -> int | None:
+    """Bytes the used swap grew since the oldest sample within SIM_SWAP_WINDOW_S, recording this one (best effort:
+    a ledger that cannot be written keeps no history, and no history is no growth)."""
+    if capacity_dir is None:
+        return None
+    now = time.time() if now is None else now
+    path = capacity_dir / SIM_SWAP_SAMPLES
+    samples: list[list[float]] = []
+    with contextlib.suppress(OSError, ValueError, TypeError):
+        samples = [[float(t), float(u)] for t, u in json.loads(path.read_text())
+                   if now - SIM_SWAP_WINDOW_S <= float(t) <= now]
+    grew = int(used - min(u for _, u in samples)) if samples else None
+    if not samples or now - samples[-1][0] >= 10:  # one sample per 10 s is plenty
+        samples.append([now, float(used)])
+        with contextlib.suppress(OSError):
+            tmp = path.with_name(f".{path.name}.{os.getpid()}")
+            tmp.write_text(json.dumps(samples))
+            os.replace(tmp, path)
+    return grew
+
+
+def sim_copy_room(copy: int, mib: int, capacity_dir: Path | None = None) -> str | None:
+    """The term simulator copy `copy` fails now (SIM_DYNAMIC), or None to admit it. Copy 0 always may. mib: the
+    admitted job's own measured RAM; one more simulator counts as the larger of it and sim_rss_mib()."""
     if copy <= 0:
         return None
+    ceiling, how = sim_ceiling()
+    if copy >= ceiling:
+        return f"the ceiling is {ceiling} simulators: {how}"
     load, cores = load_1min(), host_cores() or os.cpu_count()
-    if load is not None and cores and load >= SIM_SLOT_LOAD_SHARE * cores:
-        return f"load1 {load:.1f} >= {SIM_SLOT_LOAD_SHARE:g} x {cores} cores"
+    if load is not None and cores and load >= SIM_LOAD_SHARE * cores:
+        return f"load1 {load:.1f} >= {SIM_LOAD_SHARE:g} x {cores} cores"
     level = memory_pressure_level()
     if level is not None and level >= GATE_MEMORY_PRESSURE_HOLD:
-        return f"memory pressure level {level} >= {GATE_MEMORY_PRESSURE_HOLD}"
+        return f"memory pressure level {level} is not green (>= {GATE_MEMORY_PRESSURE_HOLD})"
     swap = swap_usage()
-    if swap is not None and swap[1] > 0 and swap[0] >= SIM_SLOT_SWAP_SHARE * swap[1]:
-        return (f"swap {100 * swap[0] / swap[1]:.0f}% used ({swap[0] / (1 << 30):.1f} of {swap[1] / (1 << 30):.1f} "
-                f"GiB) >= {SIM_SLOT_SWAP_SHARE:.0%}")
-    host = host_mem_mib()
-    if not mem_total and host and mib > 0 and (copy + 1) * mib + mem_floor_mib(host) > host:
-        return (f"mem {host / 1024:.1f} GiB < {copy + 1} x {mib / 1024:.1f} measured + "
-                f"{mem_floor_mib(host) / 1024:.1f} reserve")
+    if swap is not None and (grew := swap_growth(capacity_dir, swap[0])) is not None \
+            and grew > SIM_SWAP_GROWTH_MIB << 20:
+        return f"swap grew {grew / (1 << 20):.0f} MiB in the last {SIM_SWAP_WINDOW_S / 60:.0f} min"
+    host, free = host_mem_mib(), host_mem_free_mib()
+    if host and free is not None:
+        one = max(mib, sim_rss_mib()[0])
+        if free - one < SIM_FREE_SHARE * host:
+            return (f"free RAM {free / 1024:.1f} GiB less one simulator {one / 1024:.1f} GiB < "
+                    f"{SIM_FREE_SHARE:.0%} of {host / 1024:.0f} GiB")
     return None
 
 
@@ -5962,7 +6066,7 @@ def write_want(marker: Path, since: float, wants: list[str], tier: str = "", lan
 TOKEN_ENV = re.compile(r"(?:^|\s)(RUNNER_NAME|GITHUB_JOB|GITHUB_RUN_ID)=(\S+)")
 
 
-def token_holders(capacity_dir: Path, wants: list[str], compile_slots: int, roots: int, sim_slots: int = 1) -> str:
+def token_holders(capacity_dir: Path, wants: list[str], compile_slots: int, roots: int) -> str:
     """Who holds the tokens of these kinds, for a waiting job's log line: "root-1: RUNNER JOB (run N)" per taken
     token, from lsof and the holder's environment (ps -E, this user's own processes); "" when nothing is known."""
     names: list[str] = []
@@ -5971,8 +6075,8 @@ def token_holders(capacity_dir: Path, wants: list[str], compile_slots: int, root
             names += [f"root-{k}" for k in range(1, max(1, roots) + 1)]
         elif kind == "persistent-dd":
             names += ["persistent-dd"] + [f"persistent-dd-{c}" for c in range(1, max(1, compile_slots))]
-        elif kind == "simulator":  # SIM_SLOTS: every copy
-            names += sim_token_names(sim_slots)
+        elif kind == "simulator":  # SIM_DYNAMIC: every copy up to the ceiling
+            names += sim_token_names()
         elif kind == "gui" or kind in FAST_TOKENS or kind in GATEWAY_TOKENS:
             names.append(kind)
         elif kind == GATEWAY_TOKEN_KIND:
@@ -6013,8 +6117,7 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
                   one_holder: bool = False, since: float | None = None, gui_token: str = "gui",
                   gui_runner: bool = False, fresh_runner: bool = False, tier: str = "",
                   new_job: bool = False, nightly_runner: bool = False,
-                  keep_while: Path | None = None, signs_first: bool = False,
-                  sim_slots: int = 1) -> tuple[bool, str]:
+                  keep_while: Path | None = None, signs_first: bool = False) -> tuple[bool, str]:
     """Weighted admission for one of several runners on this mini, without ever waiting on a job.
     When held, taken_out (if given) receives the units and tokens taken, for the job log; on a capacity refusal it
     receives "wants", the kinds a waiter marker names (CAPACITY_WAIT): the token kind or "units" it lacks, else
@@ -6035,7 +6138,7 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
     if klass:  # a class given outright (a ci-step, the fast tier, a console skipper admitted as light) costs its own
         pinned, need = False, class_need(klass)
     else:
-        klass, pinned = job_class(job, repo, home_repo, workflow, sim_slots_of(sim_slots))
+        klass, pinned = job_class(job, repo, home_repo, workflow)
         need = job_need(klass, job, repo, home_repo, workflow)
     units, tokens = need.cores, CLASS_COST[klass][1]
     uses_gui = "gui" in tokens
@@ -6169,10 +6272,16 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
             # persistent-dd comes in compile_slots copies once compile admission keeps its state per
             # runner; copy 0 keeps the original file name. A mini whose runners disagree on the count runs
             # as many compiles as the highest one allows, so re-apply every instance on a mini together.
-            # SIM_SLOTS: the simulator token likewise comes in sim_slots copies; a copy past the first needs
-            # headroom (sim_copy_room), so a busy mini still runs one simulator job
+            # SIM_DYNAMIC: the simulator token likewise comes in copies up to the runtime ceiling; a copy past the
+            # first needs headroom (sim_copy_room) and SIM_GATE shared, so a busy mini still runs one simulator job
             copies = {"persistent-dd": max(1, compile_slots), "root": 1 if pinned else max(1, roots),
-                      GATEWAY_TOKEN_KIND: len(GATEWAY_TOKENS), SIM_TOKEN: sim_slots_of(sim_slots)}.get(token, 1)
+                      GATEWAY_TOKEN_KIND: len(GATEWAY_TOKENS)}.get(token, 1)
+            if token == SIM_TOKEN:
+                if (off := sim_off(capacity_dir)):
+                    if taken_out is not None:
+                        taken_out["wants"] = [token]
+                    return refused(f"capacity: {off} ({job or 'unknown job'} is {klass})")
+                copies = sim_copies(capacity_dir)
             order = list(range(copies))
             no_room = ""
             if token == "root" and copies > 1 and klass != "compile-gui":
@@ -6194,10 +6303,20 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
                 name = (f"root-{copy + 1}" if token == "root" else GATEWAY_TOKENS[copy] if token == GATEWAY_TOKEN_KIND
                         else token if copy == 0 else f"{token}-{copy}")
                 if token == SIM_TOKEN and copy > 0 and (no_room or probe(capacity_dir / f"{name}.token") and (
-                        why := sim_copy_room(copy, need.mib, mem_total))):
+                        why := sim_copy_room(copy, need.mib, capacity_dir))):
                     no_room = no_room or f"; {name} needs headroom: {why}"
                     continue  # and a later copy needs more room still
+                gate = None
+                if token == SIM_TOKEN and copy > 0:  # glaeda-disk's eraser holds it exclusive through an erase
+                    if (gate := lock_file(capacity_dir / SIM_GATE, fcntl.LOCK_SH)) is None:
+                        no_room = no_room or f"; {name}: the simulator eraser holds {SIM_GATE}"
+                        continue  # every later copy needs the gate too: the for-else refuses
                 fd = lock_file(capacity_dir / f"{name}.token", fcntl.LOCK_EX)
+                if gate is not None:
+                    if fd is None:
+                        os.close(gate)
+                    else:
+                        fds.append(gate)
                 if fd is not None:
                     fds.append(fd)
                     taken.append(name)
@@ -6315,7 +6434,7 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
         sim = next((name for name in taken if name == SIM_TOKEN or name.startswith(f"{SIM_TOKEN}-")), None)
         if held and sim and taken_out is not None:
             taken_out["sim_slot"] = 0 if sim == SIM_TOKEN else int(sim.rsplit("-", 1)[1])
-        if held and sim and not one_holder:  # SIM_SLOTS: a ci-step is told by its admit answer (step_admit)
+        if held and sim and not one_holder:  # SIM_DYNAMIC: a ci-step is told by its admit answer (step_admit)
             note += f"; {export_sim_slot(sim)}"
         if held and root:
             note += f"; {export_root(root)}"
@@ -6539,7 +6658,7 @@ def simulator_host(state_dir: Path) -> bool:
 
 
 def step_fits(capacity_dir: Path, total: int, compile_slots: int, roots: int, host_lock: str, reservation: str,
-              state_dir: Path, now: float, sim_slots: int = 1) -> list[str] | Unknown:
+              state_dir: Path, now: float) -> list[str] | Unknown:
     """The STEP_CLASSES this mini could admit right now, or UNKNOWN when an admission held admission.lock
     throughout. The listener gate's probe (mini_full): the host is not the fleet's (host_held) and no fleet
     build waits for it (host_waiters, which admission refuses for too, so a worker never leases a step it
@@ -6589,10 +6708,11 @@ def step_fits(capacity_dir: Path, total: int, compile_slots: int, roots: int, ho
                 continue
             if mem_left < min(mem_chunks(step_need.mib), mem_total):  # CAPACITY_ARITHMETIC: its RAM too
                 continue
-            # SIM_SLOTS: a simulator copy past the first fits only with headroom for it, as take_capacity admits it
-            copies = {"persistent-dd": max(1, compile_slots), "root": max(1, roots), SIM_TOKEN: sim_slots_of(sim_slots)}
+            # SIM_DYNAMIC: a simulator copy past the first fits only with headroom for it, as take_capacity admits it
+            copies = {"persistent-dd": max(1, compile_slots), "root": max(1, roots),
+                      SIM_TOKEN: sim_copies(capacity_dir)}
             if all(any(free((f"root-{c + 1}" if token == "root" else token if c == 0 else f"{token}-{c}") + ".token")
-                       and not (token == SIM_TOKEN and sim_copy_room(c, step_need.mib, mem_total))
+                       and not (token == SIM_TOKEN and sim_copy_room(c, step_need.mib, capacity_dir))
                        for c in range(copies.get(token, 1))) for token in tokens):
                 fits.append(klass)
         return fits
@@ -6602,11 +6722,10 @@ def step_fits(capacity_dir: Path, total: int, compile_slots: int, roots: int, ho
 
 
 def step_admit(klass: str, key: str, watch_pid: int, host_lock: str, reservation: str, capacity_dir: Path,
-               total: int, state_dir: Path, compile_slots: int = 1, roots: int = 1,
-               sim_slots: int = 1) -> tuple[int, dict[str, Any]]:
+               total: int, state_dir: Path, compile_slots: int = 1, roots: int = 1) -> tuple[int, dict[str, Any]]:
     """Admit one ci-step now or refuse it, never waiting for room. (exit status, typed result): 0 and the units and
     tokens its holder keeps, or 1 and the reason. RUNNER_NAME must already be step_runner_name(key). A simulator
-    step's answer names its simulator copy (sim_slot, SIM_SLOTS), for the worker to hand the step as GLAEDA_SIM_SLOT."""
+    step's answer names its simulator copy (sim_slot, SIM_DYNAMIC), for the worker to hand the step as GLAEDA_SIM_SLOT."""
     result: dict[str, Any] = {"schema": STEP_ADMISSION, "class": klass, "key": key, "admitted": False}
 
     def refused(why: str) -> tuple[int, dict[str, Any]]:
@@ -6625,7 +6744,7 @@ def step_admit(klass: str, key: str, watch_pid: int, host_lock: str, reservation
     taken: dict[str, Any] = {}
     held, note = take_capacity(host_lock, capacity_dir, total, f"ci-step {key}", watch_pid, state_dir,
                                compile_slots, roots, klass=STEP_COST_CLASS.get(klass, klass), taken_out=taken,
-                               one_holder=True, sim_slots=sim_slots)
+                               one_holder=True)
     if not held:
         return refused(note)
     holder = holder_file(state_dir)
@@ -6683,7 +6802,6 @@ class RunnerScope(NamedTuple):
     yields: bool = False  # --yield-to-exclusive (YIELD_TO_EXCLUSIVE): its gate stops listening for a signing job too
     sim: bool = False  # --sim-runner (SIM_FIRST): the sim-first runner listens on a full mini
     small: bool = False  # --small-runner (SMALL_ONLY): SMALL_JOBS only, its disk hold is theirs (SMALL_JOB_DISK_GIB)
-    sim_slots: int = 1  # --sim-slots (SIM_SLOTS): the simulator token's copies on this mini
 
 
 def reserve_token(scope: RunnerScope | None) -> str | None:
@@ -6790,7 +6908,7 @@ SESSION_FIRST_S = float(os.environ.get("GLAEDA_RUNNER_SESSION_FIRST_S") or 20 * 
 # does. No idle reserve: units are taken only by the job GitHub hands it.
 SIM_LANE = "sim"
 SIM_FIRST_S = float(os.environ.get("GLAEDA_RUNNER_SIM_FIRST_S") or 20 * 60)
-SIM_TOKEN = "simulator"  # CLASS_COST["simulator"]'s token: --sim-slots copies of it (SIM_SLOTS), one by default
+SIM_TOKEN = "simulator"  # CLASS_COST["simulator"]'s token: copies of it by measured headroom (SIM_DYNAMIC)
 SIM_FIRST_CLASSES = frozenset({"simulator", "simulator-step"})  # the only job classes the sim-first runner admits
 LISTEN_CLAIM_PREFIX = "listen."
 LISTEN_CLAIM_SUFFIX = ".claim"
@@ -6958,8 +7076,7 @@ def runner_scope(runner_dir: Path) -> RunnerScope:
                        gui, runner_floor_gib(min_free_gib(text), gui or session), gui_token,
                        fast, session, fresh, dedicated, nightly, gateway,
                        re.search(r"\s--trusted-next-signing(?:\s|$)", text) is not None,
-                       dedicated and re.search(r"\s--yield-to-exclusive(?:\s|$)", text) is not None, sim, small,
-                       sim_slots_of(flag("sim-slots", 1)))
+                       dedicated and re.search(r"\s--yield-to-exclusive(?:\s|$)", text) is not None, sim, small)
 
 
 def eligibility_scope(runner_dir: Path) -> tuple[str, str | None] | None:
@@ -7165,14 +7282,16 @@ def mini_full(capacity_dir: Path | None, total: int, scope: RunnerScope | None =
                     return f"{waiter['who'] or 'a job'} waits here for the whole mini"
                 if waiter["lane"] == SIM_LANE or SIM_TOKEN in waiter["wants"]:
                     return f"{waiter['who'] or 'a job'} waits here for the {SIM_TOKEN} token"
-            # SIM_SLOTS: it listens while any copy is free; a copy past the first only with headroom for it (the job
-            # would wait here for that headroom anyway, holding the mini's other listeners)
-            names = sim_token_names(scope.sim_slots)
+            # SIM_DYNAMIC: it listens while any copy is free; a copy past the first only with headroom for it (the
+            # job would wait here for that headroom anyway, holding the mini's other listeners)
+            if (off := sim_off(capacity_dir)):
+                return off
+            names = sim_token_names(capacity_dir)
             free = [c for c, name in enumerate(names) if probe(capacity_dir / f"{name}.token")]
             if not free:
                 return (f"the {SIM_TOKEN} token is taken" if len(names) == 1
                         else f"all {len(names)} {SIM_TOKEN} tokens on this mini are taken")
-            if free[0] > 0 and (why := sim_copy_room(free[0], class_need(SIM_TOKEN).mib, mem_chunks_total())):
+            if free[0] > 0 and (why := sim_copy_room(free[0], class_need(SIM_TOKEN).mib, capacity_dir)):
                 return f"{names[free[0]]} needs headroom: {why}"
             return None
         root = scope is not None and scope.root
@@ -11688,9 +11807,9 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--needs-file", type=Path, help="needs: the needs file to read (default: the one beside the hook)")
     p.add_argument("--compile-slots", type=int, default=1,
                    help="compiles at once on this mini (persistent-dd tokens; >1 needs per-runner compile state)")
-    p.add_argument("--sim-slots", type=int, default=1,
-                   help=f"simulator token copies on this mini (SIM_SLOTS, 1 to {MAX_SIM_SLOTS}): a copy past the "
-                        "first is taken only with headroom for it; the job reads its copy as GLAEDA_SIM_SLOT")
+    p.add_argument("--sim-slots", type=int, default=None,
+                   help="deprecated, ignored (SIM_DYNAMIC): simulator copies follow measured headroom up to a "
+                        "ceiling computed from RAM and one simulator's measured RSS")
     p.add_argument("--canonical-roots", type=int, default=1,
                    help="canonical roots on this mini (root-N tokens; one compile or app-host consumer per root)")
     p.add_argument("--instance", type=int, default=0,
@@ -11792,7 +11911,7 @@ def main(argv: list[str] | None = None) -> int:
             p.error("admit needs --class")
         status, result = step_admit(args.step_class, args.job_key, args.watch_pid, args.host_lock, args.reservation,
                                     args.capacity_dir, args.capacity_units, args.state_dir, args.compile_slots,
-                                    args.canonical_roots, args.sim_slots)
+                                    args.canonical_roots)
         print(json.dumps(result, sort_keys=True), flush=True)
         return status
     if args.phase == "release":
@@ -11803,7 +11922,7 @@ def main(argv: list[str] | None = None) -> int:
         why = step_refusal()
         fits = [] if why else step_fits(args.capacity_dir, args.capacity_units, args.compile_slots,
                                         args.canonical_roots, args.host_lock, args.reservation, args.state_dir,
-                                        time.time(), args.sim_slots)
+                                        time.time())
         unknown = isinstance(fits, Unknown)
         answer: dict[str, Any] = {"schema": STEP_FITS, "fits": [] if unknown else fits, "unknown": unknown,
                                   # whether simulator steps belong here at all, apart from room now: the build worker
@@ -11835,6 +11954,9 @@ def main(argv: list[str] | None = None) -> int:
         print(f"{PREFIX}: {'refused: ' + why if why else 'eligible' + (f' ({note})' if note else '')}", flush=True)
         return 1 if why else 0
     if args.phase == "job-started":
+        if args.sim_slots is not None:  # SIM_DYNAMIC: an older runner apply still passes it
+            print(f"{PREFIX}: --sim-slots {args.sim_slots} is deprecated and ignored: simulator copies follow "
+                  f"measured headroom, at most {sim_ceiling()[1]}", flush=True)
         event = load_event(os.environ.get("GITHUB_EVENT_PATH"))
         # the repository decide() admits: the runner's variable, else the event payload's
         repo = os.environ.get("GITHUB_REPOSITORY") or _repo_name((event or {}).get("repository")
@@ -12035,7 +12157,7 @@ def main(argv: list[str] | None = None) -> int:
             # with no limit and idle the runner; refused, it is rescued onto its own pool.
             return refused("the fast runner takes only the fast tier")
         if args.sim_runner and (admit_class or job_class(os.environ.get("GITHUB_JOB", ""), repo, args.home_repo,
-                                                          job_workflow(), args.sim_slots)[0]) not in SIM_FIRST_CLASSES:
+                                                          job_workflow())[0]) not in SIM_FIRST_CLASSES:
             # SIM_FIRST: it listens on a full mini and its job's wait holds the mini's other runners, so any other job
             # here would jump the side lanes; refused, it is rescued onto its own pool.
             return refused("the sim-first runner takes only simulator jobs")
@@ -12066,7 +12188,7 @@ def main(argv: list[str] | None = None) -> int:
             if admit_class == GATEWAY_CLASS:
                 cap = bounded_wait(cap, GATEWAY_CAPACITY_WAIT_S)
             claim_class = admit_class or job_class(os.environ.get("GITHUB_JOB", ""), repo, args.home_repo,
-                                                   job_workflow(), args.sim_slots)[0]
+                                                   job_workflow())[0]
             if claim_class == EXCLUSIVE_CLASS and not is_guest(repo, args.home_repo):
                 hook = hook_sha256()
                 if signing_hook_listed(repo, os.environ.get("GITHUB_SHA"), hook) is False:
@@ -12118,7 +12240,7 @@ def main(argv: list[str] | None = None) -> int:
                                                gui_runner=args.gui_runner,
                                                fresh_runner=args.dev_compile_runner, tier=tier, new_job=True,
                                                nightly_runner=args.nightly_runner,
-                                               signs_first=args.trusted_next_signing, sim_slots=args.sim_slots)
+                                               signs_first=args.trusted_next_signing)
                     if held and claim_class == EXCLUSIVE_CLASS:
                         stray = stray_job_processes(Path.home(), owner.pid if owner else 0)
                         if stray is None or stray:
@@ -12143,7 +12265,7 @@ def main(argv: list[str] | None = None) -> int:
                         holders = ""
                         with contextlib.suppress(Exception):  # naming holders must never fail the wait
                             holders = token_holders(args.capacity_dir, wants, args.compile_slots,
-                                                    args.canonical_roots, args.sim_slots)
+                                                    args.canonical_roots)
                         print(f"{PREFIX}: waiting ({waited:.0f} s so far): {note.removeprefix('capacity: ')}"
                               + (f"; held by {holders}" if holders else ""), flush=True)
                         shown, shown_at = note, time.monotonic()

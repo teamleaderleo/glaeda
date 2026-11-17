@@ -8154,14 +8154,24 @@ class SimDeviceTest(unittest.TestCase):
                 self.assertEqual(gd.erase_idle_sim_devices(self.receipt, halt, simctl=lambda: SIM_REPLAY,
                                                            below_target=short), 0)
 
-    def test_the_eraser_holds_every_simulator_token_copy(self) -> None:
-        """SIM_SLOTS: a job may hold simulator-1 (or -2, -3) while simulator is free. The eraser holds every copy the
-        hook can hand out, and none while any one is held, so no simulator job starts between its reading and the erase."""
+    def test_the_eraser_holds_the_gate_and_every_simulator_token_copy(self) -> None:
+        """SIM_DYNAMIC: a job may hold simulator-N while simulator is free, as many copies as headroom admits. The
+        eraser holds SIM_GATE (which the hook takes shared for every copy past the first, so no new copy can appear)
+        and every copy that exists, and none while any one is held, so no simulator job starts between its reading
+        and the erase."""
+        for c in (1, 2, 11):
+            gd.SIM_TOKEN.with_name(f"simulator-{c}.token").touch()
         fds = gd.sim_tokens()
         self.assertIsNotNone(fds)
         try:
-            self.assertEqual(len(fds), gd.SIM_TOKEN_COPIES)
-            self.assertIsNone(gd.sim_token(gd.SIM_TOKEN.with_name("simulator-3.token")), "every copy is held")
+            self.assertEqual(len(fds), 5, "the gate, copy 0 and the three copies that exist")
+            self.assertIsNone(gd.sim_token(gd.SIM_TOKEN.with_name("simulator-11.token")), "every copy is held")
+            gate = os.open(gd.SIM_TOKEN.with_name(gd.SIM_GATE), os.O_RDONLY)
+            try:
+                with self.assertRaises(OSError, msg="a copy past the first waits for the eraser"):
+                    fcntl.flock(gate, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            finally:
+                os.close(gate)
         finally:
             for fd in fds:
                 os.close(fd)
@@ -8174,6 +8184,12 @@ class SimDeviceTest(unittest.TestCase):
             os.close(mine)
         finally:
             os.close(job)
+        later = os.open(gd.SIM_TOKEN.with_name(gd.SIM_GATE), os.O_RDONLY)
+        fcntl.flock(later, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        try:
+            self.assertIsNone(gd.sim_tokens(), "a later copy's shared gate stops it")
+        finally:
+            os.close(later)
 
     def test_a_simulator_job_holding_the_token_stops_the_erase(self) -> None:
         """A simulator-class job holds capacity/simulator.token for its whole run; while it does, nothing is erased,
