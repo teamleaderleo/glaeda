@@ -1604,10 +1604,9 @@ Hook classes:
   listens while any copy is admissible. glaeda-disk's device eraser holds `simulator-copies.gate` and every copy;
   a copy past the first is taken only under that gate shared. Kill switch: `GLAEDA_SIMULATORS_OFF=1` in the runner
   environment, or `touch` `simulators.off` in the capacity ledger (live), and no simulator copy is taken.
-  `runner.classes.<class>.simSlots` and the hook's `--sim-slots` are ignored (a deprecation line says so). The
-  mini's `glaeda-ios-sim` runners and its sim-first runner carry `glaeda-sim-dynamic`, which carries no count: it
-  tells cmux's iOS picker (cmux#44908) that the mini admits by headroom and classes `ios-simulator-build` as a
-  simulator job. It replaces `glaeda-sim-slots-<N>`.
+  `runner.classes.<class>.simSlots` and the hook's `--sim-slots` are ignored (a deprecation line says so). No label
+  carries a simulator count: a simulator mini has `glaeda-ios-sim` alone (`glaeda-sim-slots-<N>` is no longer
+  written), and its sim-first runner is online exactly while one more simulator is admissible.
 - A build worker's `simulator` ci-step (cmuxterm-hq's `scripts/ci/cmux-next-ios-sim.sh` steps) is admitted only on
   a mini where a runner registered with `glaeda-ios-sim` (its install receipt says so). It takes the same
   `simulator` token, plus an isolated build's 4 units because it also builds the app, and holds them until

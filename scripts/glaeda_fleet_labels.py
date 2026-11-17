@@ -402,12 +402,9 @@ def small_label(version: str) -> str:
     return f"glaeda-{SMALL_PREFIX}-xcode-{version}"
 
 
-# SIM_DYNAMIC_LABEL, on every simulator mini's glaeda-ios-sim runners and its sim-first runner, carries no count: the
-# mini admits simulator jobs by measured headroom (glaeda-cmux-runner-hook SIM_DYNAMIC), so how many it takes is
-# known only on the mini, at the moment a job asks; its sim-first runner listens exactly while one more is admissible.
-# It also says that the hook classes ios-simulator-build as a simulator job there (SIM_SLOT_JOBS), so cmux's picker
-# (scripts/ci/ios_runner_pool.py, cmux#44908) may route it to the sim-first runner. It replaces glaeda-sim-slots-<N>.
-SIM_DYNAMIC_LABEL = "glaeda-sim-dynamic"
+# No simulator count label: a simulator mini carries IOS_SIM_LABEL alone (cmuxterm-hq lane/sim-dynamic-admission's
+# contract), and its hook admits simulator jobs by measured headroom (glaeda-cmux-runner-hook SIM_DYNAMIC); its
+# sim-first runner listens exactly while one more is admissible. glaeda-sim-slots-<N> is no longer written.
 SIM_SLOTS_IGNORED: set[str] = set()  # the classes whose simSlots was logged as ignored, once each
 
 
@@ -615,8 +612,6 @@ def member_labels(manifest: Any, member: str, xcode_ok: Callable[[dict[str, Any]
     # simulator (a trustedRef nightly host) is not misconfigured by it. On 2026-11-14 the check ran first and held
     # cmux15, the nightly host, out of every runner-heal pass ("simRunners needs a dedicated runner").
     sim = sim if ios_sim else 0
-    if ios_sim:  # SIM_DYNAMIC: a countless label; cmux#44908's picker reads it
-        labels.append(SIM_DYNAMIC_LABEL)
     if sim and (trusted_ref is not None or availability != "dedicated" or normal_pool_prefix):
         return None, (f"{member} runner.classes.{klass}.simRunners needs a dedicated runner without trustedRef "
                       "(a sim-first runner takes pull request jobs) in the default pool namespace (no poolPrefix)")

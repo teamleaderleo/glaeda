@@ -14607,21 +14607,19 @@ class RunnerTest(unittest.TestCase):
 
     def test_no_sim_count_reaches_a_runner_hook_and_the_label_has_none(self) -> None:
         """SIM_DYNAMIC: simSlots is ignored, no hook is given --sim-slots, and a simulator mini's glaeda-ios-sim
-        runners and sim-first runner carry the countless glaeda-sim-dynamic label (cmux#44908's picker reads it)."""
+        runners carry glaeda-ios-sim alone: no label carries a simulator count."""
         base = {"runners": 3, "capacityUnits": 14, "simRunners": 1, "guiRunners": 1}
         with mock.patch.object(cr, "ios_sim_present", return_value=True):
             labels, hooks = self.fast_labels({**base, "simSlots": 2}, "slots-2", ios_sim=True)
         self.assertTrue(all("--sim-slots" not in text for text in hooks), hooks)
         self.assertEqual(len(hooks), 4)
-        # instance 2 is the gui runner: no simulator jobs go there, so no simulator label either
-        self.assertEqual([fleet_labels.SIM_DYNAMIC_LABEL in row for row in labels], [True, True, False, True])
         self.assertEqual(["glaeda-ios-sim" in row for row in labels], [True, True, False, False])
         self.assertFalse(any(label.startswith("glaeda-sim-slots-") for row in labels for label in row))
         manifest = json.loads(json.dumps(MANIFEST))
         manifest["defaults"]["runner"] = {"classes": {"std": {**base, "simSlots": 2}}}
         with mock.patch.object(cr, "xcode_present", return_value=True):
             plain, _ = cr.member_labels(manifest, "mini-std")
-        self.assertNotIn(fleet_labels.SIM_DYNAMIC_LABEL, plain["labels"], "no simulator role: no label")
+        self.assertNotIn("glaeda-ios-sim", plain["labels"], "no simulator role: no label")
         manifest["hosts"]["mini-std"]["roles"].append("ios-simulators")
         manifest["defaults"]["ios_simulator"] = {"runtimes": ["23F77"]}
         for ignored in (0, 5, True, "2"):  # no longer validated: never read
@@ -18080,7 +18078,7 @@ class SimDynamicTest(unittest.TestCase):
             summary, why = cr.member_labels(manifest, "mini-std")
         self.assertIsNotNone(summary, why)
         self.assertNotIn("simSlots", summary)
-        self.assertIn(fleet_labels.SIM_DYNAMIC_LABEL, summary["labels"])
+        self.assertIn("glaeda-ios-sim", summary["labels"])
         self.assertFalse(any(label.startswith("glaeda-sim-slots-") for label in summary["labels"]))
         self.assertEqual(err.getvalue().count("runner.classes.std.simSlots is ignored"), 1,
                          "logged once per member read (an apply reads the rule once), never per runner")

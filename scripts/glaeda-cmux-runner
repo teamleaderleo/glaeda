@@ -3097,11 +3097,9 @@ def main(argv: list[str] | None = None) -> int:
                  if is_root else [*member.get("sidePools", []), *member.get("sharedSidePools", [])])
         # Dedicated roles leave out ordinary pool and iOS labels, so those jobs cannot take a DEV, GUI or fast
         # instance. The pool's live count includes only the root and side instances it can route to.
-        # The countless simulator label (glaeda_fleet_labels.SIM_DYNAMIC_LABEL, cmux#44908) goes only where simulator
-        # jobs go: the glaeda-ios-sim runners and the sim-first runner.
-        sim_dynamic = getattr(fleet_labels(), "SIM_DYNAMIC_LABEL", "glaeda-sim-dynamic")
+        # An older rule's glaeda-sim-slots-<N> (no longer written, SIM_DYNAMIC) never reaches a dedicated runner.
         own = ([label for label in member["labels"] if label not in member.get("pools", []) and label != IOS_SIM_JOB_LABEL
-                and (ctx.sim_runner or (label != sim_dynamic and not label.startswith("glaeda-sim-slots-")))]
+                and (ctx.sim_runner or not label.startswith("glaeda-sim-slots-"))]
                if dev or nightly or gateway or ctx.gui_runner or ctx.session_runner or ctx.fast_runner
                else member["labels"])
         ctx.labels = list(dict.fromkeys([*BASE_LABELS, *own, *roots]))
