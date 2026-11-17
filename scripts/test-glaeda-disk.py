@@ -1178,14 +1178,14 @@ class GlaedaDiskTest(unittest.TestCase):
 
     def test_a_full_disk_keeps_the_old_snapshot_and_no_temp_file(self) -> None:
         snap = self.root / "full.json"
-        gd.save_snapshot({"/a": 1}, snap, at=1000.0)
+        self.assertTrue(gd.save_snapshot({"/a": 1}, snap, at=1000.0))
         real = Path.write_text
 
         def full(path: Path, data: str, *a, **k) -> int:
             real(path, data[:10], *a, **k)  # a partial write, then the disk is full
             raise OSError(errno.ENOSPC, "No space left on device")
         with mock.patch.object(Path, "write_text", full), contextlib.redirect_stderr(io.StringIO()) as err:
-            gd.save_snapshot({"/a": 1, "/b": 2}, snap)  # no raise: the pass goes on to delete
+            self.assertFalse(gd.save_snapshot({"/a": 1, "/b": 2}, snap))  # no raise: the pass goes on
         self.assertIn("size snapshot not saved", err.getvalue())
         self.assertEqual(gd.load_snapshot(snap), (1000.0, {"/a": 1}))
         self.assertEqual([p.name for p in self.root.glob("full.*.tmp")], [])

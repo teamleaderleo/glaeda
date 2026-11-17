@@ -8920,12 +8920,13 @@ def snapshot_stamp(at: float, sizes: dict[str, int], measured_at: dict[str, floa
 
 
 def save_snapshot(sizes: dict[str, int], path: Path | None = None, at: float | None = None,
-                  measured_at: dict[str, float] | None = None) -> None:
+                  measured_at: dict[str, float] | None = None) -> bool:
     """`at` is when the oldest size was measured; per-item times prevent stale reports starving refresh.
 
     The snapshot is a cache of sizes, written before a pressure pass deletes anything. On a full disk the write
     fails (ENOSPC), and it used to end the pass there with nothing freed: a 256 GB mini at 3 GB free, 2026-11-17. So a
-    failed write keeps the old snapshot, drops its partial temp file, and lets the pass go on to delete."""
+    failed write keeps the old snapshot, drops its partial temp file, and lets the pass go on to delete. Returns
+    whether it was saved, so a caller judges freshness by the snapshot on disk."""
     path = SNAPSHOT if path is None else path
     tmp = path.with_suffix(f".{os.getpid()}.tmp")
     payload = {"at": time.time() if at is None else at, "sizes": sizes}
@@ -8939,6 +8940,8 @@ def save_snapshot(sizes: dict[str, int], path: Path | None = None, at: float | N
         with contextlib.suppress(OSError):
             tmp.unlink(missing_ok=True)
         print(f"glaeda-disk: size snapshot not saved ({e}); the pass goes on", file=sys.stderr)
+        return False
+    return True
 
 
 def refresh_lock_path() -> Path:
@@ -13385,8 +13388,8 @@ def _main_impl(argv: list[str] | None = None) -> int:
             updated_times = {k: v for k, v in measured_at.items() if k in known}
             updated_times.update({k: time.time() for k in fresh_paths})
             stamp = snapshot_stamp(at, known, updated_times)
-            save_snapshot(known, at=stamp, measured_at=updated_times)
-            if at:  # the age this run reports and refreshes on is the snapshot it just wrote (None: now)
+            saved = save_snapshot(known, at=stamp, measured_at=updated_times)
+            if at and saved:  # the age this run reports and refreshes on is the snapshot it just wrote (None: now)
                 at = stamp or time.time()
                 age_min = (time.time() - at) / 60
         if at and age_min > a.max_age and not a.apply:
