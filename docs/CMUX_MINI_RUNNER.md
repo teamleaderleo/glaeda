@@ -653,6 +653,19 @@ What `--apply` does:
        session at 03:46:41, stopped at 03:46:44). The job can come any time in that poll:
        on cmux7s's roots (2026-10-21) one queued 25 s in was lost to a stop at 30 s. A job
        that arrives on a full host is refused at job-started in seconds and rescued instead.
+     - **POST_JOB_POLL.** A listener's poll after its own job is a first poll too: when the
+       Worker exits, the listener goes `JobState: Online` and opens a new message poll at
+       once, and GitHub hands a queued job to it within a second. For `GATE_FIRST_POLL_S`
+       after a job's end a hold waits the same way. Only a JOB_END_FREEZE stop goes at once,
+       and only when the frozen listener's diag shows it never went Online after the job.
+       If the freeze came too late, or never came (the job-end marker seen after the Worker
+       exited, a cancelled job whose Worker was killed before job-completed ran), the hold
+       waits that poll out. A reload also waits while the job-end marker stands: job-completed
+       installs a staged hook as the job ends, and a gate re-executed then met the job's end
+       with no freeze armed. On 2026-11-17 these stops cut the Online polls of session runners
+       on std minis while daemon tests and generated files queued for over an hour on
+       `glaeda-session-std-xcode-26.6`, and GitHub cancelled those jobs as not acquired
+       (cmuxterm-hq#12960).
      - A listener that hasn't exited after 60 s is killed, unless a job slipped in.
    - **Restarting and logs.** The gate starts `run.sh` again after two free polls and,
      once it has stopped a listener, a whole free `GATE_RESTART_FREE_S` (60 s,

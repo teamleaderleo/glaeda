@@ -9057,6 +9057,34 @@ def listener_request_at(runner_dir: Path) -> tuple[str | None, float | None]:
     return request, at
 
 
+# POST_JOB_POLL: a listener's job status events (BrokerMessageListener). Busy while its job runs; Online once the job
+# ends, which is when it opens a new message poll with status=Online, and GitHub hands a queued job to that poll
+# within a second. A stop that cancels the poll loses the job: GitHub fails it minutes later "not acquired by Runner
+# of type self-hosted even after multiple attempts" (hq#12960).
+LISTENER_STATE = re.compile(r"Received job status event\. JobState: (\w+)")
+
+
+def listener_went_online(runner_dir: Path) -> bool:
+    """The listener's last job status event in the tail of its newest _diag/Runner_*.log is Online: it has opened,
+    or is opening, a message poll that may carry the next job. No diag, or no event, is False (nothing says it
+    polls); an unreadable one is True, the side that keeps the poll."""
+    diag = runner_dir / "_diag"
+    try:
+        names = sorted(n for n in os.listdir(diag) if n.startswith("Runner_") and n.endswith(".log"))
+        if not names:
+            return False
+        with open(diag / names[-1], "rb") as file:
+            size = os.fstat(file.fileno()).st_size
+            file.seek(max(0, size - RUNNER_DIAG_TAIL))
+            text = file.read().decode("utf-8", "replace")
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    states = LISTENER_STATE.findall(text)
+    return bool(states) and states[-1] == "Online"
+
+
 def note_listener_restart(state_dir: Path, runner_dir: Path, doc: dict[str, Any]) -> None:
     """Append one gate restart of a stuck listener to GATE_RESTARTS_FILE (the last GATE_RESTARTS_KEEP kept), which
     glaeda-mini-health reports under healed for ci-dash. A failed write changes nothing the gate does. Every runner's
@@ -9299,6 +9327,7 @@ class Gate:
         self.done: tuple[int, ...] = ()  # the Workers whose exit woke nap(), unreaped while their listener is frozen
         self.listening_since: float | None = None  # when start() last started run.sh (GATE_FIRST_POLL_S)
         self.first_poll_noted = False
+        self.post_job_noted: float | None = None  # the job_done_at whose POST_JOB_POLL hold was logged
         self.swept_at = time.monotonic() - GATE_SWEEP_S + GATE_POLL_S  # first sweep on the second poll
         self.reserve_fd: int | None = None  # a gui runner's capacity/<gui token>.reserve flock while it is idle
         self.started_wall = 0.0  # time.time() when start() last started run.sh (registration_deleted's log)
@@ -9324,7 +9353,13 @@ class Gate:
             return
         if self.eligible_look is not None and self.eligible_look.is_alive():
             return  # the next poll: the look thread does not block SIGTERM, and its probes would be orphaned
-        if self.watching or self.freeze_at_exit or self.job_waited or self.job_ending or self.frozen:
+        if self.watching or self.freeze_at_exit or self.job_waited or self.job_ending or self.frozen or \
+                (self.child is not None and self.fresh_job_end_marker()):
+            # (the marker: job-completed ran and installs a staged hook in the same breath, so the hook changes
+            # before the busy poll that would set job_ending sees the marker; hq#12960, 2026-11-17: gates on std
+            # minis re-executed 2 to 8 s before their job's Worker exited, and the new gate met the job's end
+            # with the listener already polling Online. Only a fresh one: a marker that cannot be removed never
+            # holds a reload for good)
             # JOB_END_FREEZE is armed (job_waited too: a request taken whose Worker is not seen yet): this gate will
             # freeze and stop the listener at its Worker's exit, and none of
             # that crosses the exec. Re-executed then, the new gate is still starting when the job ends, and the
@@ -10310,6 +10345,13 @@ class Gate:
     def job_end_marker(self) -> Path:
         return self.runner_dir / "glaeda-hooks" / JOB_ENDING
 
+    def fresh_job_end_marker(self) -> bool:
+        """The job-end marker exists and was written less than GATE_FIRST_POLL_S ago (reload()). Never raises."""
+        try:
+            return time.time() - self.job_end_marker().stat().st_mtime < GATE_FIRST_POLL_S
+        except OSError:
+            return False
+
     def job_end(self) -> str | None:
         """The runner's job just ended (JOB_ENDING): a fresh look at the mini, which job-completed already gave the
         job's units back to. Why the listener should not take the next job, or None. Never raises."""
@@ -10568,13 +10610,22 @@ class Gate:
         gate_log("the runner's registration is back; cleared the registration_deleted record")
 
     def first_poll(self, why: str) -> bool:
-        """The listener started less than GATE_FIRST_POLL_S ago: its first poll may already carry a job, so a hold
-        waits (keeping its streak) instead of stopping it."""
-        if self.listening_since is None or time.monotonic() - self.listening_since >= GATE_FIRST_POLL_S:
+        """The listener started, or its last job ended, less than GATE_FIRST_POLL_S ago: its first poll (or its
+        first poll after the job, POST_JOB_POLL) may already carry a job, so a hold waits (keeping its streak)
+        instead of stopping it. The poll after a job counts only once the listener's diag shows it went Online
+        (listener_went_online): before that it has no poll open, and stop() freezes it for the last look."""
+        now = time.monotonic()
+        started = self.listening_since is not None and now - self.listening_since < GATE_FIRST_POLL_S
+        after_job = (not started and self.job_done_at is not None and now - self.job_done_at < GATE_FIRST_POLL_S
+                     and listener_went_online(self.runner_dir))
+        if not (started or after_job):
             return False
-        if not self.first_poll_noted:
+        if started and not self.first_poll_noted:
             gate_log(f"keeping the new listener through its first poll ({GATE_FIRST_POLL_S:g} s): {why}")
             self.first_poll_noted = True
+        elif not started and self.post_job_noted != self.job_done_at:
+            gate_log(f"keeping the listener through its first poll after its job ({GATE_FIRST_POLL_S:g} s): {why}")
+            self.post_job_noted = self.job_done_at
         return True
 
     def listener_list(self) -> tuple[int, ...]:
@@ -10749,9 +10800,14 @@ class Gate:
                 ending = self.job_end() if self.job_ending else None
                 if (why := self.draining() or self.low_disk() or self.still_waiting() or self.still_reserved()
                         or self.exclusive_yield() or ending):
-                    self.unclaim()
-                    self.stop(why, finished)
-                    return None
+                    if not listener_went_online(self.runner_dir):
+                        self.unclaim()
+                        self.stop(why, finished)
+                        return None
+                    # POST_JOB_POLL: the listener went Online before the freeze (or none came), so its message poll
+                    # may already carry the next job: the hold waits that poll out (first_poll) and stops it then,
+                    # as it does a new listener's
+                    self.job_done_at = time.monotonic()
             self.reload()
             if self.stuck_acquire():
                 return None
@@ -10805,8 +10861,11 @@ class Gate:
                 self.job_done_at = time.monotonic()  # a job ended: the next poll is a first one (claim_stamp)
             self.busy_since = None
             if self.job_ending or self.job_end_marker().exists():
-                # a job that ended between two polls, before the gate saw its marker: the same look (job_end)
-                if ending := self.job_end():
+                # a job that ended between two polls, before the gate saw its marker: the same look (job_end). A
+                # listener not frozen at its Worker's exit has usually opened its Online message poll by now, which
+                # may already carry the next job (POST_JOB_POLL, hq#12960): then the hold below waits that poll out
+                # (first_poll, from job_end's job_done_at) instead of cancelling it now
+                if (ending := self.job_end()) and not listener_went_online(self.runner_dir):
                     self.unclaim()
                     self.stop(ending)
                     return None

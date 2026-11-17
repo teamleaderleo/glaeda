@@ -9767,6 +9767,95 @@ class GateTest(unittest.TestCase):
         self.assertEqual(stops, ["held"])
         self.assertGreater(hook.GATE_FIRST_POLL_S, hook.BROKER_POLL_S)
 
+    def post_job_diag(self, state: str) -> None:
+        """The listener's newest Runner_*.log at a job's end: its last job status event names `state`."""
+        diag = self.runner / "_diag"
+        diag.mkdir(exist_ok=True)
+        (diag / "Runner_20261117-125206-utc.log").write_text(
+            "[2026-11-17 12:52:08Z INFO BrokerMessageListener] Received job status event. JobState: Busy\n"
+            "[2026-11-17 13:36:55Z INFO JobDispatcher] finish job request for job db123afb with result: Canceled\n"
+            + (f"[2026-11-17 13:36:55Z INFO BrokerMessageListener] Received job status event. JobState: {state}\n"
+               if state != "Busy" else ""))
+
+    def test_a_job_end_seen_between_polls_keeps_the_listeners_next_poll(self) -> None:
+        # hq#12960, 2026-11-17 13:36:55Z, a std mini: a session runner's job was cancelled and its Worker killed, so
+        # job-completed wrote no marker and nothing armed JOB_END_FREEZE. The listener opened its Online message poll
+        # at once; two idle polls later (13:36:59) the gate stopped it for units, cancelling that poll. A session job
+        # queued since 12:25 had been handed to it, and GitHub failed that job at 13:38:25 "not acquired by Runner
+        # of type self-hosted even after multiple attempts". A listener's poll after its job is a first poll too.
+        full = "only 1 of 14 capacity units on this mini are free; its next job needs 6"
+        for state, expected in (("Online", []), ("Busy", ["held"])):
+            with self.subTest(state=state):
+                self.post_job_diag(state)
+                gate, stops = self.gate([full] * 8, busy=[True, True])
+                gate.worker_pids = lambda: ()
+                gate.listening_since = time.monotonic() - 3600.0  # started long ago: its own first poll is over
+                gate.step()
+                gate.step()  # the job runs
+                for _ in range(3):
+                    gate.step()  # the job has ended; the hold is confirmed
+                self.assertEqual(stops, expected, "an Online listener's poll after its job may carry the next job")
+                gate.job_done_at -= hook.GATE_FIRST_POLL_S
+                gate.step()
+                self.assertEqual(stops[:1], ["held"], "once that poll has had time to deliver, the hold stops it")
+
+    def test_a_job_end_marker_seen_after_the_worker_exited_keeps_the_listeners_poll(self) -> None:
+        # hq#12960: job-completed installs a staged hook, so the gate re-executes 2 to 8 s before its job's Worker
+        # exits (13:27:36 on a std mini; the job ended 13:27:38). The new gate first saw the job-end marker with the
+        # listener already polling Online and stopped it at once (13:27:39), cancelling that poll.
+        full = "only 3 of 14 capacity units on this mini are free; its next job needs 6"
+        self.post_job_diag("Online")
+        gate, stops = self.gate([full] * 8)
+        gate.listening_since = time.monotonic() - 3600.0
+        gate.full = lambda fresh=False: full
+        gate.job_end_marker().parent.mkdir(parents=True, exist_ok=True)
+        gate.job_end_marker().touch()
+        for _ in range(3):
+            gate.step()
+        self.assertEqual(stops, [], "the listener's Online poll after its job may carry the next job")
+        self.assertFalse(gate.job_end_marker().exists(), "the job's end was read")
+        gate.job_done_at -= hook.GATE_FIRST_POLL_S
+        gate.step()
+        self.assertEqual(stops, ["held"], "once that poll has had time to deliver, the hold stops it")
+
+    def test_a_frozen_listener_that_already_went_online_is_kept_through_that_poll(self) -> None:
+        # JOB_END_FREEZE can lose the race to the listener: it may log "JobState: Online" and open its message poll
+        # in the same second its Worker exits (2026-11-17: the freeze armed for a reservation or a fleet waiter,
+        # and the stop still cancelled an Online poll). Then the stop waits out that poll like any first poll;
+        # frozen before it went Online, the listener is stopped at once as before.
+        for state, expected in (("Online", []), ("Busy", ["a fleet build is waiting for the host (pid 6755)"])):
+            with self.subTest(state=state):
+                self.post_job_diag(state)
+                gate, _ = self.gate([None] * 3)
+                busy = iter([True, False])
+                gate.busy = lambda finished=None, busy=busy: next(busy, False) if finished is None else False
+                gate.worker_pids = lambda: [4242]
+                gate.taking = lambda: "db123afb"
+                gate.listener_list = lambda: (4343,)
+                stops: list[str] = []
+                gate.stop = lambda why, finished=None, stops=stops: stops.append(why)
+                gate.freeze = lambda gate=gate: setattr(gate, "frozen", (4343,))
+                gate.thaw = lambda gate=gate: setattr(gate, "frozen", ())
+                with mock.patch.object(hook, "host_waiters", return_value={6755}):
+                    gate.step()
+                    gate.freeze()  # nap(): the Worker exited
+                    gate.step()
+                self.assertEqual(stops, expected)
+                if state == "Online":  # the hold stops it once that poll has had time to deliver
+                    gate.claimed = lambda: "a fleet build is waiting for the host (pid 6755)"
+                    gate.confirmed = lambda: "a fleet build is waiting for the host (pid 6755)"
+                    gate.job_done_at -= hook.GATE_FIRST_POLL_S
+                    for _ in range(hook.GATE_CONFIRM):
+                        gate.step()
+                    self.assertEqual(stops, ["a fleet build is waiting for the host (pid 6755)"])
+
+    def test_listener_went_online_reads_the_last_job_status_event(self) -> None:
+        self.assertFalse(hook.listener_went_online(self.runner), "no diag: nothing says it polls")
+        self.post_job_diag("Busy")
+        self.assertFalse(hook.listener_went_online(self.runner))
+        self.post_job_diag("Online")
+        self.assertTrue(hook.listener_went_online(self.runner))
+
     def units(self, held: int) -> Path:
         """A capacity ledger an admission has used, with its first `held` units taken."""
         capacity = Path(tempfile.mkdtemp(dir=self.tmp))
@@ -9893,7 +9982,10 @@ class GateTest(unittest.TestCase):
         busy = [True, True, False]
         stops: list[str] = []
         with mock.patch.object(gate, "busy", side_effect=lambda *_: busy[0] if len(busy) == 1 else busy.pop(0)), \
-                mock.patch.object(gate, "worker_pids", return_value=()), \
+                mock.patch.object(gate, "worker_pids", return_value=(4242,)), \
+                mock.patch.object(gate, "listener_list", return_value=(4343,)), \
+                mock.patch.object(gate, "freeze", side_effect=lambda: setattr(gate, "frozen", (4343,))), \
+                mock.patch.object(gate, "thaw", side_effect=lambda: setattr(gate, "frozen", ())), \
                 mock.patch.object(gate, "reload"), mock.patch.object(gate, "locked", return_value=None), \
                 mock.patch.object(gate, "low_disk", return_value=None), \
                 mock.patch.object(gate, "still_waiting", return_value=None), \
@@ -9906,6 +9998,7 @@ class GateTest(unittest.TestCase):
             self.assertTrue(gate.job_ending, "the gate watches the Worker until it exits")
             held = [hook.lock_file(capacity / f"unit-{slot}", fcntl.LOCK_EX) for slot in range(10)]
             self.addCleanup(lambda: [os.close(fd) for fd in held if fd is not None])
+            gate.freeze()  # nap(): the Worker exited, the listener frozen before it went Online
             self.assertIsNone(gate.step(), "the Worker exited: one look, with no confirming streak")
         self.assertEqual(stops, ["only 4 of 14 capacity units on this mini are free; its next job needs 5"])
         self.assertFalse(gate.job_end_marker().exists(), "the look consumes the marker")
@@ -9920,6 +10013,8 @@ class GateTest(unittest.TestCase):
                         "the job's units are released before the gate is told to look")
 
     def test_a_job_that_ended_between_polls_still_gets_its_look(self) -> None:
+        # (with the listener's diag showing it went Online after the job, the stop waits that poll out instead:
+        # test_a_job_end_marker_seen_after_the_worker_exited_keeps_the_listeners_poll)
         capacity = self.units(10)
         gate = hook.Gate(self.side_runner(3), os.fspath(self.lock), os.fspath(self.tmp / "none.json"), self.state,
                          waiters=False, capacity_dir=capacity)
@@ -11770,7 +11865,9 @@ class GateTest(unittest.TestCase):
             gate.step()  # within GATE_WAITER_EVERY_S, but the job's end reads the waiters now
             self.assertEqual(lsof.call_count, 2)
             self.assertEqual((gate.watching, gate.freeze_at_exit), ((4242,), True))
-            gate.step()  # the Worker exited
+            gate.frozen = (4343,)  # nap(): the Worker exited and the listener is frozen
+            gate.thaw = lambda: setattr(gate, "frozen", ())
+            gate.step()
         self.assertEqual(stops, ["a fleet build is waiting for the host (pid 6755)"])
 
     def test_the_gate_evicts_in_the_background_while_it_keeps_listening(self) -> None:
@@ -13207,20 +13304,29 @@ class GateTest(unittest.TestCase):
         gate.child = mock.Mock(pid=4321)
         mask = signal.pthread_sigmask(signal.SIG_BLOCK, [])
         self.addCleanup(signal.pthread_sigmask, signal.SIG_SETMASK, mask)
+        marker = gate.job_end_marker()
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        # hq#12960: job-completed installs a staged hook, so the hook changes as the job ends, before the gate's
+        # busy poll sees the job-end marker: the reload waits for that job's end too
         for armed in ({"watching": (999,), "freeze_at_exit": True}, {"job_waited": True}, {"job_ending": True},
-                      {"frozen": (998,)}):
+                      {"frozen": (998,)}, {"marker": True}):
             with self.subTest(armed=sorted(armed)):
                 gate.source = (0, 0, 0)
                 gate.watching, gate.freeze_at_exit, gate.job_ending, gate.frozen = (), False, False, ()
                 gate.job_waited = False
+                marker.unlink(missing_ok=True)
                 for name, value in armed.items():
-                    setattr(gate, name, value)
+                    if name == "marker":
+                        marker.touch()
+                    else:
+                        setattr(gate, name, value)
                 with mock.patch.object(hook.os, "execv") as execv, mock.patch.object(hook, "gate_log"), \
                         mock.patch.object(hook.sys, "argv", [os.fspath(HOOK), "listen"]):
                     gate.reload()
                 execv.assert_not_called()  # the stop at the job's end stays with this gate
                 self.assertEqual(gate.source, (0, 0, 0), "the change is still seen at the next poll")
         gate.watching, gate.freeze_at_exit, gate.job_ending, gate.frozen, gate.job_waited = (), False, False, (), False
+        marker.unlink(missing_ok=True)
         with mock.patch.object(hook.os, "execv") as execv, mock.patch.object(hook, "gate_log"), \
                 mock.patch.object(hook.sys, "argv", [os.fspath(HOOK), "listen"]):
             gate.reload()
