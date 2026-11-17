@@ -9680,6 +9680,61 @@ class GateTest(unittest.TestCase):
         with mock.patch.object(hook.subprocess, "run", side_effect=subprocess.TimeoutExpired("pgrep", 5)):
             self.assertTrue(hook.runner_job_running(), "a reading that cannot tell counts as busy")
 
+    def test_a_capture_lease_drain_is_a_drain_waiter_and_says_so(self) -> None:
+        # cmuxterm-hq's worker publishes an exclusive (capture) lease's waiter as "capture_lease_drain", not
+        # "lend_drain": on 2026-11-17 cmux18's gate logged "a fleet build is waiting for the host (pid 15419)" for
+        # 5.5 h of capture-host acquire --exclusive leases, and no fleet build ever waited. Both kinds are drains,
+        # so a worker of either age holds the same way whichever of the two deploys lands first.
+        waiters = Path(str(self.lock) + ".waiters")
+        waiters.mkdir()
+        for name in ("15419-refresh-capture_lease_drain-1794950000000000000",
+                     "15420-refresh-lend_drain-1794950000000000000", "15421-refresh-capture-1794950000"):
+            (waiters / name).touch()
+        self.assertEqual(hook.drain_lock_waiters(os.fspath(self.lock)), {15419, 15420})
+        self.assertEqual(hook.waiter_why(os.fspath(self.lock), 15419),
+                         "a capture lease is waiting for the host (pid 15419)")
+        self.assertEqual(hook.waiter_why(os.fspath(self.lock), 15420), f"{hook.WAITER_REFUSAL} (pid 15420)")
+        self.assertEqual(hook.waiter_why(os.fspath(self.lock), 15421), f"{hook.WAITER_REFUSAL} (pid 15421)")
+        self.assertTrue(hook.waiter_why(os.fspath(self.lock), 15419).startswith(hook.WAITER_REFUSALS))
+
+    def test_replay_cmux18_a_capture_holding_host_lock_is_no_free_host(self) -> None:
+        # 2026-11-17 16:37-16:48Z on cmux18: captures held host.lock 55-99 s each under their own pid (capture-host's
+        # holder, which writes capture-lease-activity-<pid> while it holds the lock), between their leases'
+        # reservations, and no runner job ran. The gate read the host as free and logged "a controller drain (pid
+        # 15419) has had the host free of runner jobs for 11 min without taking it" at 16:48:06Z (and 19:01:54Z),
+        # though the host was taken all along. A host.lock a live capture lease holds counts as taken.
+        waiters = Path(str(self.lock) + ".waiters")
+        waiters.mkdir()
+        drain = waiters / "15419-refresh-capture_lease_drain-1794950000000000000"
+        activity = self.tmp / f"capture-lease-activity-{os.getpid()}"  # a live holder: this test process
+        notes: list[str] = []
+        clock = [10_000_000.0]
+        with mock.patch.object(hook, "lock_waiters", return_value=[15419]), \
+                mock.patch.object(hook, "holder_pids", return_value=set()), \
+                mock.patch.object(hook, "yielding_family", return_value=set()), \
+                mock.patch.object(hook, "runner_job_running", return_value=False), \
+                mock.patch.object(hook, "process_identity", return_value="w"), \
+                mock.patch.object(hook, "gate_log", side_effect=notes.append), \
+                mock.patch.object(hook.time, "monotonic", side_effect=lambda: clock[0]):
+            for t in range(0, int(hook.GATE_WAITER_MAX_HOLD_S) + 120, 30):
+                clock[0] = 10_000_000.0 + t
+                drain.touch()
+                activity.write_text('{"pool":"capture-55c93483ba81","phase":"journey"}\n')
+                self.assertEqual(hook.host_waiters(os.fspath(self.lock), self.state), {15419},
+                                 f"waived at {t / 60:.1f} min while a capture held host.lock")
+            self.assertEqual(notes, [])
+            # The capture's holder is gone (its activity file stale): the free host ages the drain again.
+            old = time.time() - 600
+            os.utime(activity, (old, old))
+            released = None
+            for t in range(int(hook.GATE_WAITER_MAX_HOLD_S) + 120, 3 * int(hook.GATE_WAITER_MAX_HOLD_S), 30):
+                clock[0] = 10_000_000.0 + t
+                drain.touch()
+                if not hook.host_waiters(os.fspath(self.lock), self.state) and released is None:
+                    released = t
+        self.assertIsNotNone(released)
+        self.assertTrue(notes and "without taking it" in notes[0], notes)
+
     def test_replay_a_worker_waiting_for_over_an_hour_is_bounded(self) -> None:
         # 2026-10-26, a std mini: the fleet worker (one pid) waited for host.lock from 22:19Z, taking it now and then
         # only to hand its build back for disk (2 to 12 min a try) and wait again. Every gate held its listener off
