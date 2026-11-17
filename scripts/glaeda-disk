@@ -289,9 +289,17 @@ CI_DEFER_MARK = "deferred: a CI job is running"  # the hook's bound reads this (
 # A run the floor needs waits this long for evict.lock before it leaves the space to the holder's pass. The holder
 # picks its own families, so it need not free what this floor needs: measured on a mini at 47.8 GiB free against a
 # 50 GiB floor, where every out-of-band run skipped as eviction_busy while the holder evicted other families
-# (glaeda#1897 F2). Manual and LaunchAgent runs above the floor still skip at once.
+# (glaeda#1897 F2). Other runs above the floor skip at once only
+# behind a holder whose pass serves them (EVICT_WAIT_UNSERVED_S).
 EVICT_WAIT_FLOOR_S = 120.0
 EVICT_WAIT_POLL_S = 2.0
+# Any other pressure --apply run waits up to this long for evict.lock when the holder's pass does not do its work
+# (holder_serves: an idle sweep, a floor-only or out-of-band pass, other families, a lower target): skipping as
+# eviction_busy there dropped the run with nothing done, and a fleet sweep (2026-11-17) found --pressure --apply
+# reclaiming 0 GB on every mini, most of them skipped this way. A holder whose pass serves it is still left the work.
+# Below idle-repair's 660 s bound, so its run still has time to evict after the wait.
+EVICT_WAIT_UNSERVED_S = 300.0
+EVICT_SCOPE: dict[str, Any] = {}  # this run's evict_scope, in its evict.owner record once it holds evict.lock
 # When a caller that bounds the run says this run's wait for another eviction runs out (the hook's floor_disk_env,
 # half its own timeout, as a wall-clock time because its timeout started at launch and this run reaches its wait
 # later). The run deadline would do it, but that one bounds every walk and verdict too and would stop a short pass
@@ -8348,7 +8356,7 @@ def eviction_owner_status() -> dict[str, Any]:
         command = _owner_command(pid)
     return {"state": "live" if _pid_alive(pid) else "dead", "pid": pid, "owner": name,
             "started_at": started, "age_s": max(0.0, time.time() - started) if started else None,
-            "command": command[:300]}
+            "command": command[:300], **({"scope": owner["scope"]} if isinstance(owner.get("scope"), dict) else {})}
 
 
 def eviction_owner_text(status: dict[str, Any]) -> str:
@@ -9440,9 +9448,10 @@ def runner_floor_gib(home: Path = HOME) -> float:
 # (~/.local/share/glaeda/fleet-reservations.json, schema glaeda-fleet-reservations/v1:
 # {"expires", "reservations": [{"id", "owner", "hosts": [...], "from", "until"}], "aliases": {host: [...]}}; the
 # writer stamps expires 13 h after each write and refreshes it every 6 h). The host-local reservation
-# (FLEET_ROOT/reservation.json, glaeda-reservation/v1, the one the runner hook reads) counts too. Fails closed: a
-# missing, unreadable, malformed or expired list, or one with no expires, reads as reserved, whatever the
-# host-local file says.
+# (FLEET_ROOT/reservation.json, glaeda-reservation/v1, the one the runner hook reads) counts too. A missing list
+# names no reservation (the host-local file still counts): failing closed on one held a fleet mini as reserved for
+# good, so its pressure runs kept everything (fleet sweep, 2026-11-17). A list that is there but unreadable,
+# malformed or expired, or has no expires, still fails closed and reads as reserved, whatever the host-local file says.
 FLEET_RESERVATIONS: Path | None = None  # None: fleet_reservations_path(); tests point it at a fixture
 FLEET_RESERVATIONS_NAME = ".local/share/glaeda/fleet-reservations.json"
 UPDATE_CONFIG = HOME / ".config/glaeda/update.json"
@@ -9457,15 +9466,6 @@ def fleet_reservations_path() -> Path:
     with contextlib.suppress(OSError, KeyError):
         return Path(pwd.getpwuid(FLEET_ROOT.stat().st_uid).pw_dir) / FLEET_RESERVATIONS_NAME
     return HOME / FLEET_RESERVATIONS_NAME
-
-
-def hygiene_only_mac(path: Path | None = None) -> bool:
-    """A personal Mac set up with glaeda-mini-setup --hygiene-only (as glaeda-local-guard reads update.json): not a
-    fleet host, so it never receives the fleet's reservation list."""
-    with contextlib.suppress(OSError, ValueError, AttributeError, TypeError):
-        return "--hygiene-only" in (json.loads((UPDATE_CONFIG if path is None else path).read_text())
-                                    .get("setupArgs") or [])
-    return False
 
 
 def reservation_time(value: Any) -> float:
@@ -9497,10 +9497,10 @@ def _str_list(value: Any, what: str) -> list[str]:
 
 
 def host_reservation(now: float | None = None, path: Path | None = None, names: set[str] | None = None,
-                     local: Path | None = None, update: Path | None = None) -> str:
+                     local: Path | None = None) -> str:
     """Why this host is reserved now ("" when it is not): an active fleet reservation naming it (or an alias), an
-    active host-local reservation, or a reservation list that is unreadable or malformed anywhere, or missing on a
-    host that is not a hygiene-only Mac."""
+    active host-local reservation, or a reservation list that is there but unreadable, malformed anywhere or expired.
+    A missing list names no reservation."""
     now = time.time() if now is None else now
     names = host_names() if names is None else {n.lower() for n in names}
     try:
@@ -9527,8 +9527,7 @@ def host_reservation(now: float | None = None, path: Path | None = None, names: 
         if hit:
             return hit
     except FileNotFoundError:
-        if not hygiene_only_mac(update):  # a personal Mac never gets the fleet's list; a fleet mini without it fails closed
-            return "fleet reservations unreadable (FileNotFoundError); kept as reserved"
+        pass  # no list, no fleet reservation (fail open for this read only); the host-local marker below still holds
     except (OSError, ValueError, KeyError, TypeError) as error:
         return f"fleet reservations unreadable ({type(error).__name__}); kept as reserved"
     marker = HOST_RESERVATION_LOCAL if local is None else local
@@ -10694,7 +10693,8 @@ def _write_evict_owner() -> None:
     except (KeyError, OSError):
         owner = str(os.getuid())
     payload = {"schema": "glaeda-disk/evict-owner/v1", "pid": os.getpid(),
-               "started_at": time.time(), "owner": owner, "command": " ".join(sys.argv)}
+               "started_at": time.time(), "owner": owner, "command": " ".join(sys.argv),
+               **({"scope": EVICT_SCOPE} if EVICT_SCOPE else {})}
     tmp = EVICT_OWNER.with_suffix(f".{os.getpid()}.tmp")
     tmp.write_text(json.dumps(payload, separators=(",", ":")))
     os.replace(tmp, EVICT_OWNER)
@@ -10725,6 +10725,70 @@ def floor_evict_wait_until(apply_: bool) -> float:
         if bound is not None:
             budget = min(budget, bound)
     return time.monotonic() + budget if budget > 0 else 0.0
+
+
+def evict_scope(mode: str, fams: list[Family], fss: Any) -> dict[str, Any]:
+    """What a pass works on, as its evict.owner record names it (EVICT_SCOPE) and a waiter compares it: its mode
+    (pressure, sweep or apply), the profile, the families it judges (aside-tree families aside: every run derives
+    those from its own roots), and for a pressure pass the target of every filesystem it finds under pressure."""
+    return {"mode": mode, "profile": "runner-caches" if RUNNER_CACHE_PROFILE else "default",
+            "families": sorted({f.id for f in fams} - {INTERRUPTED}),
+            "targets": {fs.mount: fs.target for fs in fss if fs.under} if mode == "pressure" else {}}
+
+
+def holder_serves(owner: dict[str, Any], scope: dict[str, Any]) -> str:
+    """Why the evict.lock holder's pass does not do this pressure run's work, or "" when it does: a live pressure pass
+    of the same profile over every family this run would judge, to at least this run's target on every filesystem
+    this run finds under pressure. A holder whose record names no scope (unreadable, or an older glaeda-disk) is not
+    known to serve it."""
+    held = owner.get("scope")
+    if not isinstance(held, dict):
+        return "its pass names no scope"
+    if held.get("mode") != "pressure":
+        return f"its pass is {'an idle sweep' if held.get('mode') == 'sweep' else 'not a pressure pass'}"
+    if held.get("profile") != scope["profile"]:
+        return f"its pass is the {held.get('profile')} profile's"
+    families = held.get("families")
+    missing = sorted(set(scope["families"]) - set(families if isinstance(families, list) else []))
+    if missing:
+        return f"its pass leaves out {', '.join(missing[:4])}{' and more' if len(missing) > 4 else ''}"
+    targets = held.get("targets") if isinstance(held.get("targets"), dict) else {}
+    for mount, target in scope["targets"].items():
+        theirs = targets.get(mount)
+        if not isinstance(theirs, (int, float)) or theirs < target:
+            return (f"its pass works {mount} only to {gib(int(theirs)).strip()}, not {gib(target).strip()}"
+                    if isinstance(theirs, (int, float)) else f"its pass does not work {mount}")
+    return ""
+
+
+def unserved_evict_wait_until(mode: str, fams: list[Family], fss: Any) -> float:
+    """The monotonic time a pressure run may wait for evict.lock until because the holder's pass does not serve it
+    (holder_serves), or 0.0: skip as before. The runner hook's own runs (HOOK_PASS_ENV) are left to its own waits,
+    which their callers bound. Never past the caller's deadline or wait (run_deadline_left, FLOOR_WAIT_ENV)."""
+    if mode != "pressure" or os.environ.get(HOOK_PASS_ENV) == "1":
+        return 0.0
+    why = holder_serves(eviction_owner_status(), evict_scope(mode, fams, fss))
+    RUN["evict_holder_serves"] = not why
+    if not why:
+        return 0.0
+    RUN["evict_holder_short"] = why
+    budget = EVICT_WAIT_UNSERVED_S
+    for bound in (run_deadline_left(), caller_floor_wait_s()):
+        if bound is not None:
+            budget = min(budget, bound)
+    return time.monotonic() + budget if budget > 0 else 0.0
+
+
+def evict_wait_note() -> str:
+    """The tail of an eviction_busy skip: why the holder's pass is left this run's work, or why it is not and the
+    wait for it ran out."""
+    if RUN.get("evict_floor_wait") == "expired" and not RUN.get("evict_holder_short"):
+        return (f"; the floor's {EVICT_WAIT_FLOOR_S:.0f}s wait ended with it still evicting, so its pass serves "
+                "this floor")
+    if "expired" in (RUN.get("evict_floor_wait"), RUN.get("evict_unserved_wait")):
+        return (f"; {RUN.get('evict_holder_short', 'its pass does not serve this run')}, and it still held the lock "
+                "when this run's wait ran out; the next run comes back for it")
+    return "; its pass serves this run" if RUN.get("evict_holder_serves") else ""
 
 
 def wait_for_evict_lock(until: float) -> bool:
@@ -13142,22 +13206,24 @@ def _main_impl(argv: list[str] | None = None) -> int:
                 return 0
         if a.apply and not a.cmux_next_drain and not RUNNER_CACHE_PROFILE:
             held = eviction_lock_is_held()
-            if held and floor_evict_until and wait_for_evict_lock(floor_evict_until):
+            # a holder whose pass does not do this run's work is waited for (bounded), not left the work
+            unserved_until = unserved_evict_wait_until("pressure", fams, fss.values()) if held else 0.0
+            evict_until = max(floor_evict_until, unserved_until)
+            started_wait = time.monotonic()
+            if held and evict_until and wait_for_evict_lock(evict_until):
                 held = False
-                RUN["evict_floor_wait"] = "took its turn"
-                print(f"floor eviction: the running eviction finished within the floor's "
-                      f"{EVICT_WAIT_FLOOR_S:.0f}s wait; this run takes its turn")
-            elif held and floor_evict_until:
-                RUN["evict_floor_wait"] = "expired"
+                RUN["evict_floor_wait" if floor_evict_until else "evict_unserved_wait"] = "took its turn"
+                print(f"{'floor eviction' if floor_evict_until else 'pressure'}: the running eviction finished "
+                      f"after {time.monotonic() - started_wait:.0f}s; this run takes its turn")
+            elif held and evict_until:
+                RUN["evict_floor_wait" if floor_evict_until else "evict_unserved_wait"] = "expired"
             if held:
                 owner = eviction_owner_status()
                 RUN["evict_owner"] = owner
                 write_eviction_status(a.receipt, owner)
                 write_eviction_contention_health(a.receipt)
                 return deferred("eviction_busy", f"another eviction running; skipped before measuring "
-                                                 f"({eviction_owner_text(owner)})"
-                                + (f"; the floor's {EVICT_WAIT_FLOOR_S:.0f}s wait ended with it still evicting, so "
-                                   "its pass serves this floor" if RUN.get("evict_floor_wait") == "expired" else ""),
+                                                 f"({eviction_owner_text(owner)})" + evict_wait_note(),
                                 owner=owner)
     # only a pressure run measures the cap (one du) and acts on it (cmux_next_ci_over); a text report shows the last
     # measurement, and --json (glaeda-fleet-status asks every mini on every call) neither measures nor shows it
@@ -13197,11 +13263,16 @@ def _main_impl(argv: list[str] | None = None) -> int:
         # A second eviction would only race the first for the same items; its caller re-reads free
         # space instead.  The owner record lets a later run recover from a daemon that died while
         # its lock descriptor remained open.
+        EVICT_SCOPE.clear()
+        EVICT_SCOPE.update(evict_scope("pressure" if a.pressure else "sweep" if sweep else "apply", fams, fss.values()))
         handle = acquire_evict_lock()
-        if handle is None and floor_evict_until and wait_for_evict_lock(floor_evict_until):
-            handle = acquire_evict_lock()  # one more turn: the holder released within the floor's wait
+        evict_until = floor_evict_until
+        if handle is None and pressure and not RUNNER_CACHE_PROFILE and "evict_unserved_wait" not in RUN:  # one wait
+            evict_until = max(evict_until, unserved_evict_wait_until("pressure", fams, fss.values()))
+        if handle is None and evict_until and wait_for_evict_lock(evict_until):
+            handle = acquire_evict_lock()  # one more turn: the holder released within this run's wait
             if handle is not None:
-                RUN["evict_floor_wait"] = "took its turn"
+                RUN["evict_floor_wait" if floor_evict_until else "evict_unserved_wait"] = "took its turn"
                 if cap is not None and pressure:
                     # the holder was evicting while this run waited, so the cap measured before it is spent: a
                     # waiter that kept its old budget would take young build output the holder had already freed
@@ -13214,14 +13285,14 @@ def _main_impl(argv: list[str] | None = None) -> int:
         if handle is None:
             if floor_evict_until:
                 RUN["evict_floor_wait"] = "expired"
+            elif evict_until:
+                RUN["evict_unserved_wait"] = "expired"
             owner = eviction_owner_status()
             RUN["evict_owner"] = owner
             write_eviction_status(a.receipt, owner)
             write_eviction_contention_health(a.receipt)
             result = deferred("eviction_busy", f"another eviction running; skipped ({eviction_owner_text(owner)})"
-                              + (f"; the floor's {EVICT_WAIT_FLOOR_S:.0f}s wait ended with it still evicting, so its "
-                                 "pass serves this floor" if RUN.get("evict_floor_wait") == "expired" else ""),
-                              owner=owner)
+                              + evict_wait_note(), owner=owner)
             if maintenance_handle is not None:
                 fcntl.flock(maintenance_handle, fcntl.LOCK_UN)
                 maintenance_handle.close()
@@ -13559,6 +13630,9 @@ def write_run_line(started: float, free_before: int | None) -> None:
            "bundle_failed": RUN.get("bundle_failed", []),
            "bundle_failed_remembered": RUN.get("bundle_failed_remembered", []),
            "out_of_band": RUN.get("out_of_band"), "evict_floor_wait": RUN.get("evict_floor_wait"),
+           "evict_unserved_wait": RUN.get("evict_unserved_wait"),
+           "evict_holder_serves": RUN.get("evict_holder_serves"),
+           "evict_holder_short": RUN.get("evict_holder_short"),
            "measure_budget_reached": bool(RUN.get("measure_budget_reached")),
            "run_deadline_reached": bool(RUN.get("run_deadline_reached"))}
     with contextlib.suppress(OSError):
