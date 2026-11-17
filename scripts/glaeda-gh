@@ -12126,7 +12126,14 @@ def broker_caller() -> str:
 
     Shape-checked, because this is an environment variable going into a line-oriented log that
     AUDIT_LINE reads as three whitespace-separated fields. The subcommand slot is checked the same
-    way; leaving this one open would just move the hole."""
+    way; leaving this one open would just move the hole.
+
+    GH_QUOTA_CALLER first: the gh-quota shim in front of this exports the caller it charged the call to (`session:NAME`
+    or `tool:NAME`, leo-workspace tools/gh_quota.py caller_of), so a timer with no session id is named by its tool,
+    not a parent pid nothing maps back (huge-blue's 95.6k calls a day could not be split by caller, 2026-11-17)."""
+    quota = os.environ.get("GH_QUOTA_CALLER") or ""
+    if re.fullmatch(r"(?:session|tool):[A-Za-z0-9_.@-]{1,64}", quota):
+        return quota
     named = os.environ.get("CLAUDE_SESSION_ID") or os.environ.get("CODEX_THREAD_ID") or ""
     if re.fullmatch(r"[A-Za-z0-9_.:-]{1,64}", named):
         return named
@@ -13279,6 +13286,9 @@ def gh_cache_fill(real: str, args: list[str], key: str, repo: str | None, ran: l
             meta = gh_cache_meta(words, values, repo)
         broker_note({**{k: v for k, v in note.items() if k != "written"}, "filled": True})
         note["written"] = True  # the caller's record: it must not write the decision a second time
+        watched_final = None
+        with contextlib.suppress(Exception):
+            watched_final = gh_run_jobs_watched(words)
         at = time.time()
         rc, out, err = gh_cache_child(real, args, True, GH_CACHE_FILL_DEADLINE)
         ran.append(rc)
@@ -13286,6 +13296,15 @@ def gh_cache_fill(real: str, args: list[str], key: str, repo: str | None, ran: l
             long = words[:1] == ["api"] and len(words) > 1 and bool(GH_CACHE_LONG_RE.match(words[1]))
             meta["done"] = rc == 0 and gh_cache_done(words, seen, out)
             gh_cache_put(key, at, rc, out, err, long, meta)
+        with contextlib.suppress(Exception):
+            final_run = gh_run_jobs_final(words, seen, out) if rc == 0 else None
+            if rc == 0 and final_run is None and watched_final is not None \
+                    and seen & {"--jq", "-q", "--template", "-t"} and not seen & {"--paginate", "--include"}:
+                final_run = watched_final  # a filtered answer its text cannot vouch for: the daemon's copy does
+            if rc == 0 and (final_run or meta.get("done")):
+                gh_cache_final_put(key, at, out, err, final_run)
+            if final_run and daemon_running():
+                register(parse_key("run", f"{final_run[0]}/{final_run[1]}"))  # its copy is what keeps the answer
     return gh_cache_emit({"rc": rc, "out": out, "err": err})
 
 
@@ -13303,6 +13322,226 @@ def gh_cache_write(real: str, args: list[str], repo: str | None, ran: list[int],
             with contextlib.suppress(Exception):
                 note_run_rerun(repo, scopes, words or [], time.time())
     return rc
+
+
+# -- a finished job's log through the shim: read once per host, never per caller
+#
+# huge-blue, 2026-11-17 (24 h of its calls.log): 8,399 `gh api .../actions/jobs/N/logs` reads (cmux 5,822, cmuxterm-hq
+# 2,577) and 9,610 `.../actions/runs/N/jobs` reads, most from the lane-gh broker's ci_log (ci_wait and ws_check_post read
+# every job's log of a finished cmux-ci run, again on each retry and again per post) and merge_hold's job-log reads. A
+# finished job's log never changes (a rerun is a new job id), so a plain read of one is answered from the log store
+# `glaeda-gh log job` keeps (job_log_get), else from the build controller (its own App token: no user REST), and only
+# then by gh, whose answer is kept when it ends with the runner's closing line. Anything not that plain shape (a --jq,
+# an --include, a header) goes the ordinary way. LOG_CONTROLLER_DOWN_S keeps an unreachable controller from costing
+# every read its LOG_CONTROLLER_TIMEOUT.
+GH_JOB_LOG_RE = re.compile(rf"^(?:https?://api\.github\.com/)?/?repos/({NAME})/({NAME})/actions/jobs/(\d+)/logs/?$")
+GH_JOB_LOG_FLAGS = {"--allow-escape-sequences"}
+LOG_CONTROLLER_DOWN_S = 300.0
+
+
+def gh_job_log_read(words: list[str], method: str, seen: set[str]) -> tuple[str, int] | None:
+    """(repo, job id) when this call is a plain read of one job's log: `gh api [--allow-escape-sequences]
+    repos/O/R/actions/jobs/N/logs`, a GET, stdout not a terminal. None for anything else."""
+    if words[:1] != ["api"] or len(words) != 2 or method != "GET" or seen - GH_JOB_LOG_FLAGS:
+        return None
+    match = GH_JOB_LOG_RE.match(words[1])
+    if not match or sys.stdout.isatty():
+        return None
+    return f"{match.group(1)}/{match.group(2)}".lower(), int(match.group(3))
+
+
+def log_controller_down(now: float) -> bool:
+    with contextlib.suppress(OSError):
+        return now - (BASE / ".log-controller-down").stat().st_mtime < LOG_CONTROLLER_DOWN_S
+    return False
+
+
+def gh_job_log_kept(repo: str, job: int, controller: Any = "env") -> tuple[bytes | None, str]:
+    """(JOB's finished log, where it came from) from this host's log store, else the controller; (None, why) when
+    neither has it. The controller's answer is kept (it serves only finished jobs). Never raises."""
+    try:
+        text = job_log_get(repo, job)
+        if text is not None:
+            return text, "cache"
+        now = time.time()
+        if log_controller_down(now):
+            return None, "controller down"
+        ctl = Controller.from_env() if controller == "env" else controller
+        if ctl is None:
+            return None, "no controller"
+        status, body = controller_job_log(ctl, repo, job)
+        if status == 0:
+            with contextlib.suppress(OSError):
+                BASE.mkdir(parents=True, exist_ok=True, mode=0o700)
+                (BASE / ".log-controller-down").touch()
+        if status == 200 and body and len(body) <= JOB_LOG_RAW_MAX:
+            with contextlib.suppress(OSError):
+                job_log_put(repo, job, body)
+            return body, "controller"
+        return None, f"controller HTTP {status}"
+    except Exception as error:  # noqa: BLE001  a lookup in front of a gh call
+        return None, describe(error)
+
+
+def gh_job_log_answer(real: str, args: list[str], repo: str, job: int, said: dict,
+                      controller: Any = "env") -> int:
+    """Answer one plain job-log read: kept, else the controller, else gh once (identical reads wait on its lock), whose
+    answer is kept when the job had finished. The decision log says which (`joblog`)."""
+    text, source = gh_job_log_kept(repo, job, controller)
+    if text is None:
+        gh_cache_dir().mkdir(parents=True, exist_ok=True, mode=0o700)
+        lock = gh_cache_dir() / f".joblog-{hashlib.sha256(f'{repo}/{job}'.encode()).hexdigest()[:24]}.lock"
+        with gh_cache_fill_lock(lock, GH_CACHE_FILL_WAIT):
+            text = job_log_get(repo, job)  # a sibling may have filled it while this waited
+            if text is None:
+                broker_note({"route": "pass", "joblog": "gh", **said})
+                rc, out, err = gh_cache_child(real, args, True, GH_CACHE_FILL_DEADLINE)
+                if rc == 0 and job_log_finished(out):
+                    with contextlib.suppress(OSError):
+                        job_log_put(repo, job, out)
+                return gh_cache_emit({"rc": rc, "out": out, "err": err})
+            source = "cache"
+    broker_note({"route": "cache" if source == "cache" else "serve", "joblog": source, **said})
+    return gh_cache_emit({"rc": 0, "out": text, "err": b""})
+
+
+# -- a finished run's job list: kept while glaeda's daemon still sees that run completed at that attempt
+#
+# `runs/N/jobs` (the latest attempt's list) changes only with a rerun, which makes a new attempt: an answer listing every
+# job completed (and every job: total_count) is final for its attempt. It is kept (GH_CACHE_FINAL_DIR, no TTL, least
+# recently read out first past GH_CACHE_FINAL_MAX_BYTES) and answered while the daemon's copy of the run, still being
+# read, is completed at that same attempt with no rerun since; the fill registers the run with the daemon so it
+# has that copy (a rerun reaches it from the controller's webhook within a tick, or its TERMINAL_REFRESH re-read). An
+# answer that can never change (a completed `jobs/N`, a completed attempt's `runs/N/attempts/A/jobs`) needs no copy.
+GH_CACHE_FINAL_DIR = "answers-final"
+GH_CACHE_FINAL_MAX_BYTES = 128 * 1024 * 1024
+GH_RUN_JOBS_RE = re.compile(rf"^(?:https?://api\.github\.com/)?/?repos/({NAME})/({NAME})/actions/runs/(\d+)/jobs/?"
+                            r"(?:\?(.*))?$")
+GH_RUN_JOBS_QUERY = {"per_page", "filter", "page"}
+
+
+def gh_run_jobs_final(words: list[str], seen: set[str], out: bytes) -> tuple[str, int, int] | None:
+    """(repo, run id, attempt) when OUT, a raw `gh api repos/O/R/actions/runs/N/jobs` answer of the latest attempt,
+    lists every job of the run and every one completed: final while that attempt is the run's newest. Else None."""
+    if words[:1] != ["api"] or len(words) != 2 or seen & {"--jq", "-q", "--template", "-t", "--paginate", "--include"}:
+        return None
+    match = GH_RUN_JOBS_RE.match(words[1])
+    if not match:
+        return None
+    query = dict(urllib.parse.parse_qsl(match.group(4) or "", keep_blank_values=True))
+    if set(query) - GH_RUN_JOBS_QUERY or query.get("filter", "latest") != "latest" or query.get("page", "1") != "1":
+        return None
+    try:
+        doc = json.loads(out)
+    except ValueError:
+        return None
+    jobs = doc.get("jobs") if isinstance(doc, dict) else None
+    if not isinstance(jobs, list) or not jobs or doc.get("total_count") != len(jobs) \
+            or not all(isinstance(j, dict) and j.get("status") == "completed" for j in jobs):
+        return None
+    attempts = {j.get("run_attempt") for j in jobs}
+    if len(attempts) != 1 or not isinstance(next(iter(attempts)), int):
+        return None
+    return f"{match.group(1)}/{match.group(2)}".lower(), int(match.group(3)), int(next(iter(attempts)))
+
+
+def gh_run_jobs_watched(words: list[str]) -> tuple[str, int, int] | None:
+    """(repo, run id, attempt) when this is a read of a run's latest job list (any --jq) and glaeda's daemon holds that
+    run completed now, read in the last TERMINAL_REFRESH + 2 cycles: the answer about to be read is that attempt's
+    final list (a --jq answer cannot be checked by its own text). A rerun that started in between is caught the same
+    way gh_cache_final_get catches one later: the daemon's next read shows a new attempt."""
+    if words[:1] != ["api"] or len(words) != 2:
+        return None
+    match = GH_RUN_JOBS_RE.match(words[1])
+    if not match:
+        return None
+    query = dict(urllib.parse.parse_qsl(match.group(4) or "", keep_blank_values=True))
+    if set(query) - GH_RUN_JOBS_QUERY or query.get("filter", "latest") != "latest":
+        return None
+    repo, run_id = f"{match.group(1)}/{match.group(2)}".lower(), int(match.group(3))
+    entry = read_cache(parse_key("run", f"{repo}/{run_id}")) or {}
+    data, fetched = entry.get("data"), entry.get("fetchedAt")
+    if not isinstance(data, dict) or not terminal("run", data) or not isinstance(fetched, (int, float)) \
+            or not 0 <= time.time() - fetched < TERMINAL_REFRESH + 2 * CYCLE or entry.get("rerunAt"):
+        return None
+    attempt = data.get("run_attempt") or 1
+    return (repo, run_id, attempt) if isinstance(attempt, int) and not isinstance(attempt, bool) else None
+
+
+def gh_cache_final_path(key: str) -> Path:
+    return BASE / GH_CACHE_FINAL_DIR / f"{key}.json.gz"
+
+
+def gh_cache_final_put(key: str, at: float, out: bytes, err: bytes, run: tuple[str, int, int] | None) -> None:
+    """Keep a final answer (rc 0): RUN is (repo, run id, attempt) for a latest-attempt job list, None for an answer
+    that never changes. Never raises."""
+    if len(out) + len(err) > GH_CACHE_MAX_BYTES * 4:
+        return
+    path = gh_cache_final_path(key)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.{time.monotonic_ns()}.tmp")
+    doc = {"key": key, "at": at, "out": base64.b64encode(out).decode(), "err": base64.b64encode(err).decode(),
+           **({"run": list(run)} if run else {})}
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        with open(tmp, "wb") as f:
+            f.write(gzip.compress(json.dumps(doc).encode(), mtime=0))
+        os.replace(tmp, path)
+    except OSError:
+        with contextlib.suppress(OSError):
+            tmp.unlink()
+        return
+    with contextlib.suppress(Exception):
+        gh_cache_final_evict()
+
+
+def gh_cache_final_evict(max_bytes: int | None = None) -> None:
+    """Least recently read final answers out first past GH_CACHE_FINAL_MAX_BYTES; a crash's temp files after an hour."""
+    max_bytes = GH_CACHE_FINAL_MAX_BYTES if max_bytes is None else max_bytes
+    root = BASE / GH_CACHE_FINAL_DIR
+    kept, now = [], time.time()
+    for p in root.glob("*"):
+        with contextlib.suppress(OSError):
+            st = p.stat()
+            if p.name.endswith(".tmp"):
+                if now - st.st_mtime > JOB_LOG_TMP_KEEP:
+                    p.unlink()
+                continue
+            kept.append((st.st_mtime, st.st_size, p))
+    total = sum(size for _, size, _ in kept)
+    for _, size, p in sorted(kept):
+        if total <= max_bytes:
+            break
+        with contextlib.suppress(OSError):
+            p.unlink()
+            total -= size
+
+
+def gh_cache_final_get(key: str, now: float) -> dict | None:
+    """The final answer kept for KEY, or None. A latest-attempt job list only while the daemon's copy of its run was
+    completed at that same attempt, with no rerun this host started since the answer, and is still being read
+    (TERMINAL_REFRESH + 2 cycles): a rerun from anywhere reaches that copy within those bounds. A hit is marked used (mtime). Never raises."""
+    path = gh_cache_final_path(key)
+    try:
+        doc = json.loads(gzip.decompress(path.read_bytes()))
+        if not isinstance(doc, dict) or doc.get("key") != key:
+            return None
+        run = doc.get("run")
+        if run is not None:
+            repo, run_id, attempt = run
+            entry = read_cache(parse_key("run", f"{repo}/{run_id}"))
+            data = (entry or {}).get("data")
+            fetched = (entry or {}).get("fetchedAt")
+            if (not isinstance(data, dict) or not terminal("run", data) or (data.get("run_attempt") or 1) != attempt
+                    or not isinstance(fetched, (int, float))
+                    or not 0 <= now - fetched < TERMINAL_REFRESH + 2 * CYCLE
+                    or float((entry or {}).get("rerunAt") or 0) >= doc["at"]):
+                return None
+        answer = {"rc": 0, "out": base64.b64decode(doc["out"]), "err": base64.b64decode(doc["err"])}
+    except Exception:  # noqa: BLE001  missing, damaged or not this key: a miss
+        return None
+    with contextlib.suppress(OSError):
+        os.utime(path)
+    return answer
 
 
 # -- occupancy sweeps: one runners read instead of a jobs read per run
@@ -13643,6 +13882,9 @@ def cmd_gh(args: list[str]) -> int:
                     broker_note({"route": "serve", "key": key, "spent": True, **said})
                     print(answered)
                     return EXIT_OK
+            job_log = gh_job_log_read(words, method, seen)
+            if job_log is not None and not gh_cache_is_write(args, words, method):
+                return gh_job_log_answer(real, args, job_log[0], job_log[1], said)
             if gh_cache_is_write(args, words, method):
                 write_repo, write_scopes = gh_cache_write_scope(args, words, method, values)
                 gh_cache_note_write(write_repo, now, write_scopes)
@@ -13655,6 +13897,8 @@ def cmd_gh(args: list[str]) -> int:
                     cache_repo = None if gh_cache_anywhere(words) else gh_cache_repo(words, values) or (
                         None if words[:1] == ["api"] and not any("{" in a for a in args) else broker_repo(values))
                     answer = gh_cache_get(cache_key, cache_repo, now)
+                    if answer is None:
+                        answer = gh_cache_final_get(cache_key, now)
                     if answer is not None:
                         if key is not None:
                             touch_interest(key)  # a read all the same: the daemon's watch stays wanted
@@ -13802,6 +14046,77 @@ def audit_category(words: list[str]) -> tuple[str, bool]:
     if (first, second) in AUDIT_READS:
         return f"{first} {second}", True
     return f"{first} {second}".strip() or "(none)", False
+
+
+AUDIT_CALLER_UUID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+
+
+def audit_caller(caller: str) -> str:
+    """One calls.log caller field as a group: `session:X` and `tool:X` as written (the gh-quota shim's GH_QUOTA_CALLER);
+    an acpmux `NAME.ID` as `session:NAME`; a bare session or thread id as `session-id`; a parent pid, which nothing
+    maps back to a tool, as `unnamed (ppid)`."""
+    if caller.startswith(("session:", "tool:")):
+        return caller
+    if caller.startswith("ppid-") or caller in ("", "unknown"):
+        return "unnamed (ppid)"
+    name, dot, rest = caller.partition(".")
+    if dot and rest and not AUDIT_CALLER_UUID.match(name):
+        return f"session:{name}"
+    return "session-id" if re.fullmatch(r"[0-9a-f-]{20,}", caller) else f"session:{caller}"
+
+
+def audit_by_caller(lines: list[str], top: int = 3) -> list[dict]:
+    """Calls per caller group (audit_caller), most first, each with its TOP categories (audit_category)."""
+    groups: dict[str, dict[str, int]] = {}
+    for line in lines:
+        match = AUDIT_LINE.match(line)
+        if not match:
+            continue
+        _stamp, caller, text = match.groups()
+        category, _ = audit_category(text.split())
+        bucket = groups.setdefault(audit_caller(caller), {})
+        bucket[category] = bucket.get(category, 0) + 1
+    rows = [{"caller": who, "calls": sum(cats.values()),
+             "top": [{"category": c, "calls": n} for c, n in sorted(cats.items(), key=lambda kv: (-kv[1], kv[0]))[:top]]}
+            for who, cats in groups.items()]
+    rows.sort(key=lambda r: (-r["calls"], r["caller"]))
+    return rows
+
+
+def cmd_audit_by_caller(lines: list[str], as_json: bool, top: int = 20) -> int:
+    """`audit --by caller`: who on this host makes its gh calls, and what each mostly reads."""
+    rows = audit_by_caller(lines)
+    total = sum(r["calls"] for r in rows)
+    if not total:
+        raise WatchError("no gh calls logged")
+    if as_json:
+        print(json.dumps({"calls": total, "byCaller": rows}, sort_keys=True))
+        return EXIT_OK
+    print(f"gh calls by caller: {total}")
+    for r in rows[:top]:
+        cats = "; ".join(f"{c['category']} {c['calls']}" for c in r["top"])
+        print(f"  {r['calls']:>7}  {100 * r['calls'] / total:5.1f}%  {r['caller']}  ({cats})")
+    if len(rows) > top:
+        print(f"  ... {len(rows) - top} more callers: {sum(r['calls'] for r in rows[top:])} calls")
+    unnamed = next((r["calls"] for r in rows if r["caller"] == "unnamed (ppid)"), 0)
+    if unnamed:
+        print(f"{unnamed} calls name only a parent pid: logged before the gh-quota shim exported GH_QUOTA_CALLER, or "
+              "by a gh that skipped the shim")
+    return EXIT_OK
+
+
+def audit_lines(path: Path, last: int) -> list[str]:
+    """The call log's lines, its rotated predecessor first (as cmd_audit reads them), the last LAST (0: all)."""
+    try:
+        text = path.read_text(errors="replace")
+    except OSError as error:
+        raise WatchError(f"cannot read {path}: {describe(error)}") from error
+    with contextlib.suppress(OSError):
+        older = (path.with_name(path.name + ".1")).read_text(errors="replace")
+        if older:
+            text = older.rstrip("\n") + "\n" + text
+    lines = text.splitlines()
+    return lines[-last:] if last else lines
 
 
 def cmd_audit(path: Path, last: int, as_json: bool) -> int:
@@ -14880,6 +15195,8 @@ def parser() -> argparse.ArgumentParser:
     a.add_argument("--last", type=int, default=200000, metavar="N",
                    help="only the last N lines (default 200000; 0 reads all of it)")
     a.add_argument("--json", action="store_true")
+    a.add_argument("--by", choices=("caller",), default=None,
+                   help="group the calls by caller (session:NAME or tool:NAME, as the gh-quota shim names them)")
     rn = sub.add_parser("runners", help="busy and idle self-hosted runners per label, from one shared read")
     rn.add_argument("scope", metavar="OWNER[/REPO]")
     rn.add_argument("--label", default=None, help="only runners carrying this label")
@@ -14950,6 +15267,8 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "audit":
             if args.last < 0:
                 raise WatchError("--last must be 0 (all of it) or more lines")
+            if args.by == "caller":
+                return cmd_audit_by_caller(audit_lines(args.log or guard_log(), args.last), args.json)
             return cmd_audit(args.log or guard_log(), args.last, args.json)
         if args.command == "log":
             return cmd_log_job(args.repo, args.job)

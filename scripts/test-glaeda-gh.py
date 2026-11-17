@@ -14141,7 +14141,9 @@ class BrokerAnswerCacheTest(CountingGhBase):
             with mock.patch.dict(os.environ, {"COLUMNS": "80"}):
                 self.assertNotEqual(gg.gh_cache_key(rendered, words, values, seen, method, "/gh"), table)
 
-    def test_a_job_log_is_kept_past_the_ttl(self) -> None:
+    def test_a_running_jobs_log_is_never_kept_and_a_jobs_list_keeps_its_ttl(self) -> None:
+        """A plain log read goes to the job-log store (BrokerJobLogTest): kept only once the runner's closing line is
+        in it, so a running job's log ("answer N", no closing line) is read again; a jobs list keeps the TTL."""
         logs = ["api", "repos/o/r/actions/jobs/77/logs"]
         jobs = ["api", "repos/o/r/actions/runs/5/jobs"]
         self.run_gh(logs)
@@ -14154,10 +14156,8 @@ class BrokerAnswerCacheTest(CountingGhBase):
                     doc["at"] -= seconds
                     path.write_text(json.dumps(doc))
         age(120)
-        self.assertEqual(self.run_gh(logs)[1], "answer 1\n")
-        self.assertEqual(self.run_gh(jobs)[1], "answer 3\n", "a jobs list is not a log")
-        age(gg.GH_CACHE_LONG_TTL)
-        self.assertEqual(self.run_gh(logs)[1], "answer 4\n")
+        self.assertEqual(self.run_gh(logs)[1], "answer 3\n")
+        self.assertEqual(self.run_gh(jobs)[1], "answer 4\n", "a jobs list is not a log")
 
     def test_the_resolved_repository_is_part_of_a_question_that_names_none(self) -> None:
         one, two = self.checkout("o/one"), self.checkout("o/two")
@@ -17353,6 +17353,162 @@ class WaitFromBytecodeTest(unittest.TestCase):
                                   timeout=60)
             self.assertEqual(done.returncode, 0, done.stderr)
             self.assertTrue(list(Path(home, ".cache", "gh-quota", "pycache").rglob("*.pyc")))
+
+
+class BrokerJobLogTest(BrokerBase):
+    """A plain `gh api repos/O/R/actions/jobs/N/logs` read: a finished job's log is read from GitHub once per host
+    (the log store `log job` keeps), the build controller first; a running job's log is never kept."""
+
+    DONE = "2026-11-17T08:00:00Z ##[error]exit 1\n2026-11-17T08:00:01Z Cleaning up orphan processes\n"
+    RUNNING = "2026-11-17T08:00:00Z ##[group]Run swift test\n"
+
+    def setUp(self) -> None:
+        super().setUp()
+        os.environ["CMUX_CI_CONTROLLER"] = "none"  # no controller unless a test gives one
+        self.body = self.home / "body.txt"
+        self.count = self.home / "count"
+        gh = self.home / "bin" / "gh"
+        gh.write_text("#!/bin/sh\n"
+                      f"n=$(($(cat {self.count} 2>/dev/null || echo 0) + 1)); echo $n > {self.count}\n"
+                      f"cat {self.body}\n")
+        gh.chmod(0o755)
+
+    def runs(self) -> int:
+        return int(self.count.read_text()) if self.count.exists() else 0
+
+    def test_a_finished_log_is_read_once_with_or_without_the_escape_flag(self) -> None:
+        self.body.write_text(self.DONE)
+        path = "repos/O/R/actions/jobs/77/logs"
+        first = self.run_gh(["api", "--allow-escape-sequences", path])
+        second = self.run_gh(["api", path])
+        third = self.run_gh(["api", f"/{path}"])
+        self.assertEqual([r[:2] for r in (first, second, third)], [(0, self.DONE)] * 3)
+        self.assertEqual(self.runs(), 1)
+        self.assertTrue(gg.job_log_path("o/r", 77).exists())
+        routes = [json.loads(line) for line in gg.broker_log().read_text().splitlines()]
+        self.assertEqual([r.get("joblog") for r in routes if "joblog" in r], ["gh", "cache", "cache"])
+
+    def test_a_running_jobs_log_is_not_kept(self) -> None:
+        self.body.write_text(self.RUNNING)
+        path = "repos/o/r/actions/jobs/78/logs"
+        self.run_gh(["api", path])
+        self.run_gh(["api", path])
+        self.assertEqual(self.runs(), 2)
+        self.assertFalse(gg.job_log_path("o/r", 78).exists())
+
+    def test_another_shape_goes_the_ordinary_way(self) -> None:
+        self.body.write_text(self.DONE)
+        for args in (["api", "repos/o/r/actions/jobs/79/logs", "--include"],
+                     ["api", "-X", "DELETE", "repos/o/r/actions/runs/79/logs"]):
+            with self.subTest(args=args):
+                self.assertIsNone(gg.gh_job_log_read(*gg.broker_words(args)[:3]))
+
+    def test_the_controller_answers_with_no_gh_and_a_down_one_is_skipped(self) -> None:
+        asked: list[int] = []
+
+        def controller_job_log(ctl: Any, repo: str, job: int) -> tuple[int, bytes]:
+            asked.append(job)
+            return (200, self.DONE.encode()) if job == 80 else (0, b"")
+        with mock.patch.object(gg, "controller_job_log", controller_job_log):
+            ctl = gg.Controller("http://127.0.0.1:9", "tok")
+            self.assertEqual(gg.gh_job_log_kept("o/r", 80, ctl), (self.DONE.encode(), "controller"))
+            self.assertEqual(gg.gh_job_log_kept("o/r", 80, ctl)[1], "cache")
+            self.assertEqual(gg.gh_job_log_kept("o/r", 81, ctl), (None, "controller HTTP 0"))
+            self.assertEqual(gg.gh_job_log_kept("o/r", 82, ctl), (None, "controller down"))
+        self.assertEqual(asked, [80, 81])
+
+
+class BrokerFinalJobsTest(CountingGhBase):
+    """A finished run's job list (every job completed, the latest attempt) is kept with no TTL while glaeda's daemon
+    still reads that run completed at that attempt; a rerun (a new attempt) is read again."""
+
+    def jobs(self, attempt: int = 1, status: str = "completed") -> str:
+        return json.dumps({"total_count": 2, "jobs": [{"id": 1, "status": "completed", "run_attempt": attempt},
+                                                      {"id": 2, "status": status, "run_attempt": attempt}]})
+
+    def daemon_run(self, attempt: int, status: str = "completed", age: float = 0.0) -> None:
+        key = gg.parse_key("run", "o/r/5")
+        gg.write_json(gg.cache_dir() / gg.file_name(key),
+                      {"key": key, "fetchedAt": time.time() - age, "dataAt": time.time() - age, "error": None,
+                       "data": {"id": 5, "status": status, "conclusion": "success", "run_attempt": attempt}})
+
+    def test_final_needs_every_job_completed_and_listed(self) -> None:
+        words, _m, seen, _v = gg.broker_words(["api", "repos/o/r/actions/runs/5/jobs?per_page=100"])
+        self.assertEqual(gg.gh_run_jobs_final(words, seen, self.jobs().encode()), ("o/r", 5, 1))
+        self.assertIsNone(gg.gh_run_jobs_final(words, seen, self.jobs(status="in_progress").encode()))
+        partial = json.dumps({"total_count": 3, "jobs": json.loads(self.jobs())["jobs"]}).encode()
+        self.assertIsNone(gg.gh_run_jobs_final(words, seen, partial))
+        jq = gg.broker_words(["api", "repos/o/r/actions/runs/5/jobs", "--jq", ".jobs"])
+        self.assertIsNone(gg.gh_run_jobs_final(jq[0], jq[2], self.jobs().encode()))
+
+    def test_kept_past_the_ttl_while_the_daemon_sees_the_same_attempt(self) -> None:
+        key = "k" * 40
+        gg.gh_cache_final_put(key, time.time() - 3600, self.jobs().encode(), b"", ("o/r", 5, 1))
+        self.assertIsNone(gg.gh_cache_final_get(key, time.time()))  # no daemon copy: not answered
+        self.daemon_run(1)
+        self.assertEqual(gg.gh_cache_final_get(key, time.time())["out"], self.jobs().encode())
+        self.daemon_run(2)  # rerun: a new attempt
+        self.assertIsNone(gg.gh_cache_final_get(key, time.time()))
+        self.daemon_run(1, age=gg.TERMINAL_REFRESH + 3 * gg.CYCLE)  # the daemon stopped reading it
+        self.assertIsNone(gg.gh_cache_final_get(key, time.time()))
+
+    def test_an_answer_that_never_changes_needs_no_daemon_copy(self) -> None:
+        gg.gh_cache_final_put("j" * 40, time.time() - 86400, b"{}", b"", None)
+        self.assertEqual(gg.gh_cache_final_get("j" * 40, time.time())["out"], b"{}")
+
+    def test_through_the_broker_a_kept_list_outlives_the_answer_cache(self) -> None:
+        gh = self.home / "bin" / "gh"
+        gh.write_text("#!/bin/sh\n"
+                      f"n=$(($(cat {self.count} 2>/dev/null || echo 0) + 1)); echo $n > {self.count}\n"
+                      f"printf '%s\\n' '{self.jobs()}'\n")
+        args = ["api", "repos/o/r/actions/runs/5/jobs?per_page=100"]
+        self.run_gh(args)
+        for path in gg.gh_cache_dir().glob("*.json"):
+            path.unlink()  # the answer cache's copy is gone (its TTL, its prune)
+        self.daemon_run(1)
+        _code, out, _err, _ = self.run_gh(args)
+        self.assertEqual((out.strip(), self.runs()), (self.jobs(), 1))
+
+
+class BrokerFinalJobsJqTest(BrokerFinalJobsTest):
+    def test_a_filtered_list_is_kept_when_the_daemon_held_the_run_completed(self) -> None:
+        self.daemon_run(1)
+        args = ["api", "repos/o/r/actions/runs/5/jobs?per_page=100", "--jq", ".jobs[].id"]
+        self.run_gh(args)
+        for path in gg.gh_cache_dir().glob("*.json"):
+            path.unlink()
+        self.assertEqual(self.run_gh(args)[1], "answer 1\n")
+        self.daemon_run(2)  # rerun: read again
+        self.assertEqual(self.run_gh(args)[1], "answer 2\n")
+
+    def test_a_raw_list_still_running_is_never_kept_on_the_daemons_word(self) -> None:
+        self.daemon_run(1)
+        args = ["api", "repos/o/r/actions/runs/5/jobs"]
+        self.run_gh(args)  # "answer 1" is no completed list
+        for path in gg.gh_cache_dir().glob("*.json"):
+            path.unlink()
+        self.assertEqual(self.run_gh(args)[1], "answer 2\n")
+
+
+class AuditByCallerTest(Base):
+    def test_callers_are_grouped_and_ppids_are_one_unnamed_group(self) -> None:
+        lines = ["2026-11-17T08:00:00Z tool:merge_hold.py api repos/o/r/actions/jobs/1/logs",
+                 "2026-11-17T08:00:01Z tool:merge_hold.py api repos/o/r/actions/runs/2/jobs",
+                 "2026-11-17T08:00:02Z ppid-11 pr view 7 o/r",
+                 "2026-11-17T08:00:03Z ppid-12 pr view 8 o/r",
+                 "2026-11-17T08:00:04Z ws-check.0d9b2f6a-1111-2222-3333-444455556666 pr view 9 o/r",
+                 "2026-11-17T08:00:05Z session:claude-1 api graphql"]
+        rows = gg.audit_by_caller(lines)
+        self.assertEqual([(r["caller"], r["calls"]) for r in rows],
+                         [("tool:merge_hold.py", 2), ("unnamed (ppid)", 2), ("session:claude-1", 1),
+                          ("session:ws-check", 1)])
+        self.assertEqual(rows[0]["top"][0]["calls"], 1)
+
+    def test_the_broker_logs_the_gh_quota_caller(self) -> None:
+        with mock.patch.dict(os.environ, {"GH_QUOTA_CALLER": "tool:base_red_watch.py", "CLAUDE_SESSION_ID": "x"}):
+            self.assertEqual(gg.broker_caller(), "tool:base_red_watch.py")
+        with mock.patch.dict(os.environ, {"GH_QUOTA_CALLER": "tool:a b\nforged", "CLAUDE_SESSION_ID": "abc"}):
+            self.assertEqual(gg.broker_caller(), "abc")
 
 
 if __name__ == "__main__":
