@@ -6802,6 +6802,7 @@ LAND_MERGE_HOLD_PATHS = (LAND_MERGE_HOLD, Path.home() / "Projects/leo-workspace/
 # a configured path that did not exist was run anyway and every land judged explain_failed (gcp-agent-lane-6,
 # 2026-11-17: cmux#44604 stopped after 8 of them).
 LAND_REFUSED_FILE = "refused.json"
+LAND_STALE_CHECKOUT_FILE = "stale-checkout.json"  # LandQueue.check_behind's warning, while it holds
 # On an upstream host (a lane VM: no login, its PR data is the controller's copy), the land worker's nudge reaches
 # nothing: upstream_tick asks the upstream every UPSTREAM_EVERY and takes whatever copy it has. When that copy of a
 # landing PR is older than LAND_REFRESH_AFTER, the worker reads the PR itself through the broker (direct_read, as a
@@ -6826,6 +6827,53 @@ def land_merge_hold_missing(tried: list[Path]) -> tuple[str, str]:
     nxt = (f'set "mergeHold" in {LAND_CONFIG} to merge_hold.py\'s path (on a lane VM: '
            "~/Projects/leo-workspace/tools/merge_hold.py, from `reach enroll HOST --apply`)")
     return why, nxt
+
+
+# The startup check's second half: merge_hold.py found is in a git checkout (on a lane VM, ~/Projects/leo-workspace)
+# that may sit far behind main when nothing deploys it. gcp-codex-lane-12, 2026-11-17: its checkout sat at
+# leo-workspace#5512 while main moved on, and its old merge_hold could not read main's TWINS (after #5580), so every
+# pinned merge from that VM was refused "unreadable: not judged, retry" until `tools/ws-deploy --local` ran. The check
+# warns (it never refuses: an old merge_hold still judges) when the checkout is more than LAND_MH_BEHIND_COMMITS
+# commits behind its origin/main, its origin/main tip is more than LAND_MH_BEHIND_HOURS newer than its HEAD, or it
+# was last fetched more than LAND_MH_BEHIND_HOURS ago. land.json's mergeHoldBehindCommits and mergeHoldBehindHours
+# override them. Read at most every LAND_MH_BEHIND_EVERY seconds.
+LAND_MH_BEHIND_COMMITS = 20
+LAND_MH_BEHIND_HOURS = 6.0
+LAND_MH_BEHIND_EVERY = 600.0
+LAND_MH_BEHIND_DEADLINE = 10.0
+
+
+def land_checkout_behind(script: Path, max_commits: int, max_hours: float, now: float,
+                         git: Callable[[list[str]], str | None] | None = None) -> str | None:
+    """Why the git checkout holding SCRIPT is too far behind its origin/main to trust its merge_hold, or None (current,
+    or not a checkout, or git could not tell). GIT runs `git -C DIR ARGS` and answers its stdout, or None."""
+    def real(args: list[str]) -> str | None:
+        try:
+            got = run_bounded(["git", "-C", os.fspath(script.parent), *args], LAND_MH_BEHIND_DEADLINE)
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        return got.stdout.strip() if got.returncode == 0 else None
+    git = git or real
+    root = git(["rev-parse", "--show-toplevel"])
+    if not root:
+        return None
+    behind = git(["rev-list", "--count", "HEAD..origin/main"])
+    times = (git(["log", "-1", "--format=%ct", "HEAD"]), git(["log", "-1", "--format=%ct", "origin/main"]))
+    fetch = git(["rev-parse", "--path-format=absolute", "--git-path", "FETCH_HEAD"])
+    why = []
+    if behind and behind.isdigit() and int(behind) > max_commits:
+        why.append(f"{behind} commits behind origin/main (over {max_commits})")
+    if all(x and x.isdigit() for x in times) and (int(times[1]) - int(times[0])) / 3600 > max_hours:
+        why.append(f"origin/main is {(int(times[1]) - int(times[0])) / 3600:.1f} h newer than HEAD (over {max_hours:g})")
+    with contextlib.suppress(OSError, TypeError):
+        age = (now - Path(fetch).stat().st_mtime) / 3600 if fetch else None
+        if age is not None and age > max_hours:
+            why.append(f"last fetched {age:.1f} h ago (over {max_hours:g})")
+    if not why:
+        return None
+    return (f"merge_hold.py's checkout {root} is stale: " + "; ".join(why) + f". next: {root}/tools/ws-deploy --local "
+            "(an old merge_hold can refuse every merge as unreadable; knobs: land.json mergeHoldBehindCommits, "
+            "mergeHoldBehindHours)")
 
 
 def land_reads_upstream() -> bool:
@@ -7006,7 +7054,8 @@ class LandQueue:
                  watch: Callable[[str], None] | None = None, nudge: Callable[[str], None] | None = None,
                  notice: Callable[[str, str, str, dict], None] | None = None, inline: bool = False,
                  config: dict | None = None, reads_upstream: Callable[[], bool] = land_reads_upstream,
-                 refresh: Callable[[str], str | None] = land_direct_read) -> None:
+                 refresh: Callable[[str], str | None] = land_direct_read,
+                 behind: Callable[[Path, int, float, float], str | None] = land_checkout_behind) -> None:
         self.run = run or (lambda argv, timeout, env: self._run_real(argv, timeout, env))
         self.cache_of = cache_of
         self.watch = watch or (lambda key: register(key, waited=True, reader=f"tool:{LAND_TAG}"))
@@ -7016,6 +7065,9 @@ class LandQueue:
         self.config_given = config
         self.reads_upstream = reads_upstream
         self.refresh = refresh
+        self.behind = behind
+        self.behind_at = float("-inf")
+        self.stale_checkout: str | None = None
         refused = read_json(land_dir() / LAND_REFUSED_FILE)
         self.refused: dict | None = refused if isinstance(refused, dict) else None
         self.lock = threading.RLock()
@@ -7196,6 +7248,7 @@ class LandQueue:
                             {"mergeHold": os.fspath(mh)})
                 path.unlink(missing_ok=True)
                 self.refused = None
+            self.check_behind(mh)
             return False
         why, nxt = land_merge_hold_missing(tried)
         nxt += "; the land worker starts on its next tick"
@@ -7206,6 +7259,32 @@ class LandQueue:
             log({"event": "land-refused", **self.refused})
             self.notice("land-refused", "warn", f"glaeda land refused to start: {why}. next: {nxt}", self.refused)
         return True
+
+    def check_behind(self, mh: Path) -> None:
+        """Warn once (log, notice, land/stale-checkout.json, which `land status` prints) when merge_hold.py's checkout
+        is behind (LAND_MH_BEHIND_COMMITS), and once when it is current again."""
+        if self.now - self.behind_at < LAND_MH_BEHIND_EVERY:
+            return
+        self.behind_at = self.now
+        cfg = self.config()
+        commits = int(land_seconds(cfg.get("mergeHoldBehindCommits"), LAND_MH_BEHIND_COMMITS, 0, 1e6))
+        hours = land_seconds(cfg.get("mergeHoldBehindHours"), LAND_MH_BEHIND_HOURS, 0.1, 1e4)
+        try:
+            why = self.behind(mh, commits, hours, self.now)
+        except Exception as error:  # noqa: BLE001  a warning's own failure never stops the queue
+            log({"event": "land-error", "site": "check_behind", "error": describe(error)})
+            return
+        path = land_dir() / LAND_STALE_CHECKOUT_FILE
+        if why == self.stale_checkout:
+            return
+        self.stale_checkout = why
+        if why is None:
+            path.unlink(missing_ok=True)
+            log({"event": "land-checkout-current", "mergeHold": os.fspath(mh)})
+            return
+        write_json(path, {"reason": why, "at": self.now, "mergeHold": os.fspath(mh)})
+        log({"event": "land-checkout-stale", "reason": why})
+        self.notice("land-checkout-stale", "warn", f"glaeda land: {why}", {"mergeHold": os.fspath(mh)})
 
     def reap(self) -> None:
         for key, fut in list(self.jobs.items()):
@@ -7893,6 +7972,9 @@ def cmd_land_status(target: str | None, as_json: bool) -> int:
         print(json.dumps({"ok": True, "entries": entries, "steps": counts, "refused": refused}, sort_keys=True))
         return EXIT_OK if entries or not target else EXIT_FAIL
     now = time.time()
+    stale = read_json(land_dir() / LAND_STALE_CHECKOUT_FILE)
+    if isinstance(stale, dict) and stale.get("reason"):
+        print(f"glaeda land: WARNING: {stale['reason']}")
     if refused:
         print(f"glaeda land: REFUSED to start since {utc_clock(float(refused.get('at') or 0))}: "
               f"{refused.get('reason')}\nnext: {refused.get('next')}")

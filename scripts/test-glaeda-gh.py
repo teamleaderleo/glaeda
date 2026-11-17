@@ -16247,7 +16247,10 @@ class LandTest(Base):
     def queue(self) -> Any:
         return gg.LandQueue(run=self.w.run, cache_of=self.w.cache.get, watch=self.w.watched.append,
                             nudge=self.w.nudged.append, notice=lambda *a: self.w.notices.append(a), inline=True,
-                            config=self.w.config, reads_upstream=lambda: self.upstream, refresh=self.refresh)
+                            config=self.w.config, reads_upstream=lambda: self.upstream, refresh=self.refresh,
+                            behind=lambda *a: self.stale_why)
+
+    stale_why: str | None = None  # what the checkout-staleness check answers
 
     upstream = False  # this host reads PRs through an upstream (a lane VM)
     fresh_head: str | None = None  # what a direct read (refresh) stores, or None for a read that fails
@@ -16808,6 +16811,43 @@ class LandTest(Base):
         self.w.cache[self.KEY]["dataAt"] = self.t - 5
         e["refresh"] = {}
         self.assertFalse(self.q.refresh_due(e, self.w.cache[self.KEY]))  # a fresh copy: no read
+
+    def test_a_stale_merge_hold_checkout_warns_once_and_clears(self):
+        """gcp-codex-lane-12, 2026-11-17: a lane VM's leo-workspace sat at #5512 and its merge_hold refused every merge
+        as unreadable. The startup check warns (never refuses) once, prints in `land status`, and clears once."""
+        self.stale_why = "merge_hold.py's checkout /ws is stale: 30 commits behind origin/main (over 20)"
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(ok_answer(LA))
+        self.tick()
+        self.assert_merged_at(LA)  # a warning, not a refusal
+        self.assertEqual([n[0] for n in self.w.notices if n[0].startswith("land-checkout")], ["land-checkout-stale"])
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            gg.cmd_land_status(None, False)
+        self.assertIn("WARNING: merge_hold.py's checkout /ws is stale", out.getvalue())
+        self.tick(gg.LAND_MH_BEHIND_EVERY + 1)
+        self.assertEqual(len([n for n in self.w.notices if n[0] == "land-checkout-stale"]), 1)  # said once
+        self.stale_why = None
+        self.tick(gg.LAND_MH_BEHIND_EVERY + 1)
+        self.assertFalse((gg.land_dir() / gg.LAND_STALE_CHECKOUT_FILE).exists())
+
+    def test_checkout_behind_reads_commits_hours_and_fetch_age(self):
+        fetch = Path(self.tmp.name) / "FETCH_HEAD"
+        fetch.write_text("")
+        now = fetch.stat().st_mtime
+        answers = {"rev-parse --show-toplevel": "/ws", "rev-list --count HEAD..origin/main": "28",
+                   "log -1 --format=%ct HEAD": str(int(now - 9 * 3600)), "log -1 --format=%ct origin/main": str(int(now)),
+                   "rev-parse --path-format=absolute --git-path FETCH_HEAD": os.fspath(fetch)}
+        git = lambda args: answers.get(" ".join(args))  # noqa: E731
+        why = gg.land_checkout_behind(Path("/ws/tools/merge_hold.py"), 20, 6.0, now, git)
+        self.assertIn("28 commits behind origin/main (over 20)", why)
+        self.assertIn("9.0 h newer than HEAD", why)
+        self.assertIn("/ws/tools/ws-deploy --local", why)
+        self.assertNotIn("last fetched", why)
+        self.assertIn("last fetched 7.0 h ago", gg.land_checkout_behind(Path("/ws/x"), 100, 6.0, now + 7 * 3600, git))
+        self.assertIsNone(gg.land_checkout_behind(Path("/ws/x"), 100, 24.0, now, git))
+        self.assertIsNone(gg.land_checkout_behind(Path("/nogit/x"), 0, 0.1, now, lambda args: None))
 
     def test_status_names_why_explain_failed(self):
         e = {"key": self.KEY, "state": "waiting", "explain": {"code": "explain_failed",
