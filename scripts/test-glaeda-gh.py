@@ -62,6 +62,20 @@ gg.ALARM_CMD = Path(tempfile.gettempdir()) / f"glaeda-gh-test-no-alarm-{os.getpi
 gg.SPENDERS_CMD = os.fspath(Path(tempfile.gettempdir()) / f"glaeda-gh-test-no-spenders-{os.getpid()}" / "gh-quota")
 _NOTICES = tempfile.TemporaryDirectory(prefix="glaeda-gh-test-notices-")  # removed when the run ends
 gg.NOTICES_DIR = Path(_NOTICES.name)
+# Nor may the host's own rate-limit latch (gh-quota's rest-exhausted.json, held while the account is spent) hold the
+# tests' fake GitHub, nor a test's 403 mark the host's or the next test's: every test gets its own directory.
+for _name in ("GH_TOKEN", "GITHUB_TOKEN"):  # a caller's token would make every test daemon another identity
+    os.environ.pop(_name, None)
+_test_run = unittest.TestCase.run
+
+
+def _own_quota_state(self: unittest.TestCase, result: Any = None) -> Any:
+    with tempfile.TemporaryDirectory(prefix="glaeda-gh-test-quota-") as state, \
+            mock.patch.dict(os.environ, {"GH_QUOTA_STATE": state}):
+        return _test_run(self, result)
+
+
+unittest.TestCase.run = _own_quota_state  # type: ignore[method-assign]
 
 TOKEN = "ghp_faketoken_must_never_touch_disk"
 NOW = float(int(time.time()))  # watch files carry real mtimes
@@ -17353,6 +17367,143 @@ class WaitFromBytecodeTest(unittest.TestCase):
                                   timeout=60)
             self.assertEqual(done.returncode, 0, done.stderr)
             self.assertTrue(list(Path(home, ".cache", "gh-quota", "pycache").rglob("*.pyc")))
+
+
+def hhmm(epoch: float) -> str:
+    return time.strftime("%H:%MZ", time.gmtime(epoch))
+
+
+class NoSpiralTest(Base):
+    """hq#12421, the GitHub quota-spiral class: "no spiral: on a 403 or rate-limit, every caller (broker, gh shim,
+    cmux-ci, glaeda-land, ws-check, merge_hold) stops until the reset header and fails fast naming the reset time".
+    One 403 from GitHub's primary limit is the last request any caller here sends to that pool before its reset: the
+    host's latch (GH_QUOTA_STATE) says so to the next caller in well under a second, and names the reset."""
+
+    KEY = LandTest.KEY
+    queue, land, tick, pr, refresh = LandTest.queue, LandTest.land, LandTest.tick, LandTest.pr, LandTest.refresh
+    stale_why, upstream, fresh_head = None, False, None
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.w = LandWorld(self.tmp.name)
+        paths = mock.patch.object(gg, "LAND_MERGE_HOLD_PATHS", (Path(self.w.mh),))
+        paths.start()
+        self.addCleanup(paths.stop)
+        self.t = NOW
+        self.q = self.queue()
+
+    def spent(self, reset: float) -> tuple[int, dict, bytes]:
+        return (403, {"x-ratelimit-limit": "5000", "x-ratelimit-remaining": "0", "x-ratelimit-reset": str(int(reset)),
+                      "x-ratelimit-resource": "core"},
+                json.dumps({"message": "API rate limit exceeded for user ID 1."}).encode())
+
+    def test_no_spiral(self) -> None:
+        r = int(NOW) + 1500
+        d = self.daemon
+        d.clock_real, d.now = False, NOW
+        self.gh.throttle["rest"] = self.spent(r)
+        status, _, _ = d.request("GET", "/repos/o/r/pulls/1")
+        self.assertEqual((status, len(self.gh.calls)), (403, 1))
+        # Every later call to that pool, until R: refused fast, naming R, sending nothing.
+        for at in (NOW + 1, NOW + 600, r - 1):
+            d.now = at
+            started = time.monotonic()
+            with self.assertRaises(gg.WatchError) as refused:
+                d.request("GET", "/repos/o/r/pulls/2")
+            self.assertLess(time.monotonic() - started, 1.0)
+            self.assertEqual(str(refused.exception), f"GitHub's REST rate limit is spent for login until {hhmm(r)} "
+                             f"(reset); not sent, retry after {hhmm(r)}")
+        self.assertEqual(len(self.gh.calls), 1)
+        mark = json.loads(gg.latch_path("rest", "login").read_text())
+        self.assertEqual((mark["until"], mark["reset"], mark["source"], mark["by"], mark["identity"], mark["counter"]),
+                         (r, r, "x-ratelimit-reset", "glaeda-gh", "login", "core"))
+        self.assertEqual(gg.latch_path("rest", "login").name, "rest-exhausted.json")  # gh-quota's own file
+        # A new daemon (a restart) reads the mark too, as does the next tick's routing: REST is stopped till R.
+        again = gg.Daemon(transport=self.gh, token=lambda: TOKEN, controller=None)
+        again.clock_real, again.now = False, NOW + 2
+        again.adopt_latch()
+        self.assertEqual((again.backoff["rest"], again.mode("rest")), (r, "stop"))
+        with self.assertRaises(gg.WatchError):
+            again.request("GET", "/repos/o/r/pulls/3")
+        self.assertEqual(len(self.gh.calls), 1)
+        # GraphQL (the other pool) is not latched: the fallback stays.
+        self.assertIsNone(gg.latch_held("graphql", "login", NOW + 2))
+        # Another token (a GH_TOKEN the caller brought, an App installation's) is not held by the login's mark.
+        other = "ghs_other_token_never_on_disk"
+        sent: list[str] = []
+        with mock.patch.dict(os.environ, {"GH_TOKEN": other}):
+            ident = gg.quota_identity()
+            self.assertRegex(ident, r"^tok-[0-9a-f]{12}$")
+            them = gg.Daemon(transport=lambda m, u, h, b: (sent.append(u), (200, {}, b"{}"))[1],
+                             token=lambda: other, controller=None)
+            them.clock_real, them.now = False, NOW + 2
+            self.assertEqual(them.request("GET", "/repos/o/r/pulls/4")[0], 200)
+            self.assertEqual(self.q.identity(), "login")  # the land queue's env never inherits the caller's token
+        self.assertEqual(len(sent), 1)
+        self.assertIsNone(gg.latch_held("rest", "app-cmux-bot", NOW + 2))
+        gg.latch_write("rest", "app-cmux-bot", NOW + 2, r + 600, "x-ratelimit-reset", r + 600)
+        self.assertEqual(gg.latch_held("rest", "login", NOW + 2)["until"], r)  # an App mark leaves the login's alone
+        self.assertTrue((gg.quota_state() / "rest-exhausted@app-cmux-bot.json").is_file())
+        # The lane-gh broker's land reserve is never a mark (gh_latch broker_reserve), nor its words a refusal.
+        gg.write_json(gg.latch_path("graphql", "app-cmux-bot"), {"until": r, "at": NOW, "reserve": True})
+        self.assertIsNone(gg.latch_held("graphql", "app-cmux-bot", NOW + 2))
+        self.assertTrue(gg.LATCH_RESERVE.search("refused: the broker's reserve kept for lands, not GitHub's refusal"))
+        # A later refusal that knows no reset never shortens the mark.
+        self.assertEqual(gg.latch_write("rest", "login", NOW + 3, NOW + 303, "default"), r)
+        # After R, the pool is asked again.
+        self.gh.throttle.clear()
+        d.now = r + 1
+        self.assertNotEqual(d.request("GET", "/repos/o/r/pulls/1")[0], 403)  # sent: the fake knows no such pull
+        self.assertEqual(len(self.gh.calls), 2)
+
+    def test_no_spiral_land(self) -> None:
+        """glaeda-gh land: a merge refused for GraphQL's primary limit is sent once, not judged and sent again every
+        5 s; the entry waits until the reset (named), `glaeda-gh land` refuses at once, and after the reset it lands."""
+        r = int(self.t) + 1500
+        gg.write_json(gg.BASE / "budget.json", {"graphql": {"limit": 5000, "remaining": 0, "reset": r, "seenAt": self.t}})
+        real = self.w.run
+
+        def run(argv: list[str], timeout: float, env: dict) -> subprocess.CompletedProcess:
+            if argv[1:3] == ["pr", "merge"] and self.t < r:
+                self.w.calls.append(list(argv))
+                return subprocess.CompletedProcess(argv, 1, "", "GraphQL: API rate limit already exceeded for user "
+                                                                "ID 1.\n")
+            return real(argv, timeout, env)
+
+        self.q.run = run
+        self.pr(LA, checks=[("ci", "COMPLETED", "SUCCESS")])
+        self.land()
+        self.w.answers.append(ok_answer(LA))
+        e = self.tick()
+        self.assertEqual(len(self.w.gh_calls("pr", "merge")), 1)
+        self.assertEqual(self.w.gh_calls("pr", "view"), [])  # nothing merged: not read back either
+        self.assertEqual((e["state"], e["wait"]["kind"], e["wait"]["said"]), ("waiting", "quota", True))
+        self.assertTrue(r <= e["wakeAt"] <= r + 60 + gg.LAND_QUOTA_JITTER)  # #2066's park: R's minute, plus jitter
+        self.assertIn(f"parked until {hhmm(e['wakeAt'])} (quota)", gg.land_line(e, self.t))
+        self.assertIsNone(e.get("streak"))  # not a refusal of the merge: it does not count toward a stop
+        mark = json.loads(gg.latch_path("graphql", "login").read_text())
+        self.assertEqual((mark["until"], mark["source"]), (r, "budget"))
+        for _ in range(20):
+            e = self.tick(60)
+        self.assertEqual((len(self.w.explains()), len(self.w.gh_calls("pr", "merge"))), (1, 1))
+        # A lane asking again before R is refused at once, naming R; nothing is queued.
+        out = io.StringIO()
+        with mock.patch.object(gg, "LAND_CONFIG", Path(self.tmp.name) / "no-land.json"), \
+                contextlib.redirect_stdout(out):
+            started = time.monotonic()
+            rc = gg.cmd_land("o/r#1", [], None, 30.0, True)
+        self.assertLess(time.monotonic() - started, 1.0)
+        doc = json.loads(out.getvalue())
+        self.assertEqual((rc, doc["code"], doc["until"]), (gg.EXIT_QUOTA, "quota", r))
+        self.assertIn(f"rate limit is spent for login until {hhmm(r)} (reset)", doc["reason"])
+        # After R: judged afresh and merged pinned.
+        self.w.answers.append(ok_answer(LA))
+        self.t = e["wakeAt"]
+        self.tick(1)
+        self.assertEqual(len(self.w.explains()), 2)
+        merges = self.w.gh_calls("pr", "merge")
+        self.assertEqual(len(merges), 2)
+        self.assertEqual(self.q.entries[self.KEY]["state"], "merged")
 
 
 if __name__ == "__main__":

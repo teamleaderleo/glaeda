@@ -83,7 +83,9 @@ the daemon is the only process that talks to GitHub, and clients only read its c
   GraphQL query could not make because the quota ran out go over REST, and reads REST could not make
   (its quota, or the share) go over GraphQL. A secondary-limit 403 holds both buckets instead: the
   limit is one for both, so moving the reads would be the burst it refuses. The hold is Retry-After or
-  60 s doubling to 15 min, whichever is longer, and no read is sent during it.
+  60 s doubling to 15 min, whichever is longer, and no read is sent during it. A PRIMARY-limit answer marks
+  the host's latch (GH_QUOTA_STATE's rest-exhausted.json / graphql-exhausted.json, per identity) with GitHub's
+  reset, and a held mark refuses every read and land step to that pool, naming the reset (LATCH_*).
 - Comment watches (an issue's or PR's latest 50 comments) are one batched GraphQL query every 15 s
   (over REST: the issue and the page or two holding them), and last only while someone waits on them.
 - A merged or closed PR's failed steps are not read (its cached ones are kept), and a job whose steps read GitHub
@@ -681,6 +683,118 @@ PACE_FILE = "pace.json"
 PACE_CLI = Path.home() / ".local/lib/gh-quota/bin/gh"  # a link into the pacer's checkout, next to gh_quota.py
 PACE_DEADLINE = 5
 PACE_HOLD_MAX = 3600
+# The host's shared latch for GitHub's PRIMARY rate limit (hq#12421: "no spiral: on a 403 or rate-limit, every caller
+# ... stops until the reset header and fails fast naming the reset time"). Every caller on the host (gh-quota's shim,
+# the lane-gh broker, merge_hold, this daemon, its land queue) reads the mark for its own identity and pool before it
+# sends, and the first to meet the limit writes it with GitHub's own reset. The host's gh login keeps gh-quota's file
+# names (rest-exhausted.json, graphql-exhausted.json); any other identity has its own (rest-exhausted@tok-....json), so
+# a login mark never holds an App token's call, nor the other way round. Before it, the daemon's backoff lived in its
+# memory alone and a land's merge refused for the limit was judged and sent again 5 s later, three times.
+LATCH_DEFAULT = 300.0  # a refusal that names no reset, and no reading says when the pool refills
+LATCH_MAX = 3700.0  # a reset never lies more than GitHub's hour ahead: a corrupt far future holds that long at most
+LATCH_SPENT = re.compile(r"API rate limit (?:already )?exceeded|\bRATE_LIMITED\b|"
+                         r"GitHub's (?:REST|GraphQL) rate limit is spent for", re.I)
+# The lane-gh broker's land reserve is not GitHub's refusal and never a mark (leo-workspace tools/gh_latch.py broker_reserve)
+LATCH_RESERVE = re.compile(r"the broker's reserve kept for lands, not GitHub's refusal|"
+                           r"REST reserve: the broker host's login has",
+                           re.I)
+EXIT_QUOTA = 75  # EX_TEMPFAIL, as lane-gh's quota refusal: merge_hold's refusal_kind reads it as a spent quota
+
+
+def quota_state() -> Path:
+    return Path(os.environ.get("GH_QUOTA_STATE") or Path.home() / ".local/state/gh-quota")
+
+
+def quota_identity(env: dict | os._Environ | None = None, token: str | None = None) -> str:
+    """Whose pool a call spends: "login" (the host's gh login), or tok-<12 hex of sha256> for a token the caller
+    brought (GH_TOKEN, else GITHUB_TOKEN, as gh reads them). TOKEN: the token actually sent, when known; one that is
+    not the environment's is the login's (gh auth token printed it)."""
+    env = os.environ if env is None else env
+    brought = env.get("GH_TOKEN") or env.get("GITHUB_TOKEN") or ""
+    if not brought or (token is not None and token != brought):
+        return "login"
+    return "tok-" + hashlib.sha256(brought.encode()).hexdigest()[:12]
+
+
+def latch_path(bucket: str, identity: str) -> Path:
+    stem = "rest-exhausted" if bucket == "rest" else "graphql-exhausted"
+    return quota_state() / (f"{stem}.json" if identity == "login" else f"{stem}@{identity}.json")
+
+
+def latch_held(bucket: str, identity: str, now: float, counter: str | None = None) -> dict | None:
+    """The mark that holds BUCKET for IDENTITY at NOW, or None. A mark holds iff now < until. A REST mark naming a
+    core counter holds only calls that may spend it (COUNTER None: unknown, so any). A lane-share mark ("share") is the
+    lane-gh broker's refusal of a lane VM's share, not GitHub's pool: this daemon does not read through that
+    broker. Nor is the broker's land reserve ("reserve": true)."""
+    doc = read_json(latch_path(bucket, identity))
+    until = doc.get("until") if isinstance(doc, dict) else None
+    if not isinstance(until, (int, float)) or isinstance(until, bool) or now >= until or doc.get("share") is True \
+            or doc.get("reserve") is True:
+        return None
+    marked = doc.get("counter") if bucket == "rest" else None
+    if marked and counter and marked != counter:
+        return None
+    return {**doc, "until": min(float(until), now + LATCH_MAX)}
+
+
+def latch_write(bucket: str, identity: str, now: float, until: float, source: str, reset: float | None = None,
+                counter: str | None = None) -> float:
+    """Mark BUCKET spent for IDENTITY until UNTIL (atomic, never shortening a mark that still holds); the mark's until.
+    A held lane-share mark is left as it is."""
+    path = latch_path(bucket, identity)
+    old = read_json(path)
+    old = old if isinstance(old, dict) else {}
+    held = isinstance(old.get("until"), (int, float)) and now < float(old["until"])
+    if held and old.get("share") is True:
+        return float(old["until"])
+    until = min(max(until, now + 1.0), now + LATCH_MAX)
+    doc: dict[str, Any] = {"until": until, "at": now, "reset": reset, "source": source, "by": "glaeda-gh",
+                           "identity": identity}
+    if held and float(old["until"]) >= until:
+        doc.update(until=float(old["until"]), source=old.get("source") or source, reset=old.get("reset", reset))
+    if bucket == "rest" and counter and (not held or old.get("counter") == counter):
+        doc["counter"] = counter  # a held mark for the other counter (or every one) now holds both: no counter
+    with contextlib.suppress(OSError):
+        write_json(path, doc)
+    return float(doc["until"])
+
+
+def latch_sentence(bucket: str, identity: str, until: float) -> str:
+    at = dt.datetime.fromtimestamp(until, dt.timezone.utc).strftime("%H:%MZ")
+    return (f"GitHub's {'REST' if bucket == 'rest' else 'GraphQL'} rate limit is spent for {identity} until {at} "
+            f"(reset); not sent, retry after {at}")
+
+
+def latch_reset(h: dict, now: float) -> tuple[float | None, str]:
+    """GitHub's own reset in a primary-limit answer's headers: (epoch, source), or (None, "") when it names none."""
+    try:
+        if h.get("x-ratelimit-remaining") == "0" and h.get("x-ratelimit-reset"):
+            return float(h["x-ratelimit-reset"]), "x-ratelimit-reset"
+        if h.get("retry-after"):
+            return now + float(h["retry-after"]), "retry-after"
+    except ValueError:
+        pass
+    return None, ""
+
+
+def latch_from_budget(budget: Any, bucket: str, now: float, counter: str | None = None) -> float | None:
+    """The reset glaeda's own budget.json reading gives BUCKET (COUNTER's, for REST: "actions" the tagged counter,
+    "core" an untagged one, None any) when it says that counter is spent, else None."""
+    if not isinstance(budget, dict):
+        return None
+    key = "restCounters" if bucket == "rest" else "graphqlCounters"
+    items = [c for c in (budget.get(key) or []) if isinstance(c, dict)] + [budget.get(bucket)]
+    resets = []
+    for c in items:
+        if not isinstance(c, dict) or not isinstance(c.get("reset"), (int, float)) \
+                or not isinstance(c.get("remaining"), (int, float)):
+            continue
+        tagged = "actions" in (c.get("counters") or [])
+        if bucket == "rest" and counter and c is not budget.get(bucket) and tagged != (counter == "actions"):
+            continue
+        if c["remaining"] <= 0 and now < c["reset"] <= now + LATCH_MAX:
+            resets.append(float(c["reset"]))
+    return max(resets) if resets else None
 # A private repository on a plan without branch protection or rulesets answers 403 with this: there are
 # no requirements to read, as for a deleted base branch.
 NO_FEATURE = re.compile(r"Upgrade to GitHub Pro|make this repository public to enable this feature", re.I)
@@ -3557,6 +3671,14 @@ class Daemon:
             raise WatchError("this host reads GitHub through its upstream (upstream.json) and has no login")
         if self.token is None:
             self.token = self.token_source()
+        counter = None if bucket != "rest" else "actions" if ACTIONS_COUNTER_PATH.fullmatch(path) else "core"
+        if not free:
+            # The host's latch (another caller, or this daemon before a restart, met the primary limit): nothing is
+            # sent to the spent pool before GitHub's reset; the reads move to the other bucket (adopt_latch, mode).
+            mark = latch_held(bucket, self.quota_identity(), self.clock(), counter)
+            if mark is not None:
+                self.backoff[bucket] = max(self.backoff[bucket], mark["until"])
+                raise WatchError(latch_sentence(bucket, self.quota_identity(), mark["until"]))
         headers = {"Authorization": f"Bearer {self.token}", "Accept": "application/vnd.github+json",
                    "User-Agent": "glaeda-gh", "X-GitHub-Api-Version": "2022-11-28"}
         if etag:
@@ -3620,9 +3742,38 @@ class Daemon:
             except ValueError:
                 wait = CYCLE
             self.backoff[bucket] = self.now + max(CYCLE, wait)
+            self.latch_hit(bucket, h, counter)
         elif status < 400 and not free:
             self.secondary_strikes = 0  # a clean answer: the next secondary hold starts short again
         return status, h, doc
+
+    def quota_identity(self) -> str:
+        """The latch identity of the token this daemon sends: the host's login, unless it is a GH_TOKEN it was given."""
+        return quota_identity(token=self.token)
+
+    def latch_hit(self, bucket: str, h: dict, counter: str | None) -> None:
+        """A primary-limit answer: mark the host's latch with GitHub's reset (x-ratelimit-reset, or Retry-After), else
+        this daemon's own reading when it says the bucket is spent, else LATCH_DEFAULT, so every caller stops till then."""
+        now = self.clock()
+        reset, source = latch_reset(h, now)
+        until = reset
+        if until is None:
+            until = latch_from_budget(self.budget, bucket, now, counter)
+            source = "budget" if until is not None else "default"
+        until = latch_write(bucket, self.quota_identity(), now, until if until is not None else now + LATCH_DEFAULT,
+                            source, reset, counter)
+        self.backoff[bucket] = max(self.backoff[bucket], until)
+        log({"event": "latch", "bucket": bucket, "until": round(until), "source": source})
+
+    def adopt_latch(self) -> None:
+        """Take on the host's latch for each bucket (another caller met the primary limit): its reads stop until then."""
+        if self.upstream() is not None:
+            return
+        for b in self.backoff:
+            mark = latch_held(b, self.quota_identity(), self.clock())
+            if mark is not None and mark["until"] > self.backoff[b]:
+                self.backoff[b] = mark["until"]
+                log({"event": "latch", "source": "host", "bucket": b, "until": round(mark["until"])})
 
     def secondary_admit(self, bucket: str, n: int) -> bool:
         """Whether n more read requests may go to GitHub now: not while this daemon's own secondary hold
@@ -3675,6 +3826,7 @@ class Daemon:
         """Send at most one queued write per tick, POST_SPACING after the last one and never while GitHub's
         secondary limit holds the outbox. Oldest first; a write waiting out its own retry is skipped."""
         self.adopt_pace_hold()
+        self.adopt_latch()
         if self.clock() < self.secondary_until:
             return  # a read met the secondary limit: writes wait it out too, as one account's
         if self.now < max(self.post_hold, self.post_at + POST_SPACING):
@@ -4656,6 +4808,7 @@ class Daemon:
             self.errors.append(f"outbox: {describe(error)} at {error_site(error)}")
         entries = self.watches()
         self.adopt_pace_hold()
+        self.adopt_latch()
         try:
             self.from_controller(entries)
         except Exception as error:  # noqa: BLE001  the controller is an optional, free source: a fault
@@ -6994,6 +7147,12 @@ def land_config() -> dict:
     return doc if isinstance(doc, dict) else {}
 
 
+def land_identity() -> str:
+    """Whose pool the land queue's steps spend: land.json's env may bring a GH_TOKEN (LandQueue.env); else the login."""
+    extra = land_config().get("env")
+    return quota_identity({str(k): str(v) for k, v in extra.items()} if isinstance(extra, dict) else {})
+
+
 def land_key(target: str) -> tuple[str, str, int]:
     """(key, OWNER/REPO as typed, N) for OWNER/REPO#N or a PR URL."""
     m = PR_RE.fullmatch(target.strip())
@@ -7803,6 +7962,49 @@ class LandQueue:
         e["wakeAt"] = None if seconds is None else self.now + seconds
         self.save(e)
 
+    # -- the host's latch (LATCH_*): a step is never sent to a pool GitHub refused for its primary limit before the reset
+
+    def identity(self) -> str:
+        """Whose pool the steps' gh spends (land_identity, read from the env the steps get)."""
+        return quota_identity(self.env())
+
+    def quota_held(self, e: dict, bucket: str, counter: str | None = None) -> bool:
+        """BUCKET is latched for this queue's identity: nothing is sent, and E waits until the reset, naming it."""
+        ident = self.identity()
+        mark = latch_held(bucket, ident, self.now, counter)
+        if mark is None:
+            return False
+        with self.lock:
+            self.quota_wait(e, bucket, ident, float(mark["until"]))
+        return True
+
+    def quota_refused(self, e: dict, got: subprocess.CompletedProcess, bucket: str, counter: str | None = None) -> bool:
+        """GOT was refused for GitHub's primary limit (gh's words, or another caller's latch sentence): latch it with the
+        reset a caller already wrote, else glaeda's own reading when that counter is spent (the login's alone), else
+        LATCH_DEFAULT; E waits until then and no refusal is counted. A secondary limit is not this: it holds the pacer."""
+        text = f"{got.stderr or ''} {got.stdout or ''}"
+        if got.returncode == 0 or not LATCH_SPENT.search(text) or SECONDARY.search(text) or LATCH_RESERVE.search(text):
+            return False
+        ident = self.identity()
+        mark = latch_held(bucket, ident, self.now, counter)
+        until, source, reset = (float(mark["until"]), str(mark.get("source") or "default"), mark.get("reset")) \
+            if mark is not None else (None, "", None)
+        if until is None and ident == "login":
+            until = latch_from_budget(read_json(BASE / "budget.json"), bucket, self.now, counter)
+            source, reset = "budget", until
+        if until is None:
+            until, source = self.now + LATCH_DEFAULT, "default"
+        until = latch_write(bucket, ident, self.now, until, source, reset, counter)
+        with self.lock:
+            self.finish(e, got, quota=bucket)
+            self.quota_wait(e, bucket, ident, until)
+        return True
+
+    def quota_wait(self, e: dict, bucket: str, ident: str, until: float) -> None:
+        """Parked as a quota refusal is (park_quota): until the sentence's reset plus this caller's jitter."""
+        self.history(e, "quota", bucket=bucket, identity=ident, until=round(until))
+        self.park_quota(e, latch_sentence(bucket, ident, until))
+
     def take(self, e: dict, act: dict, answer: dict) -> None:
         kind = act.get("kind")
         repo, number, head = e["repo"], str(e["number"]), e.get("head") or ""
@@ -7856,9 +8058,15 @@ class LandQueue:
                               "no gh-quota shim to rerun through" if runs else "rerun_failed named no run",
                               land_trim(answer.get("next")))
                 return
+            if self.quota_held(e, "rest", "actions"):
+                return
             with self.lock:
                 self.claim(e, "rerun_failed", runs=runs)
-            results = [self.call([gh, "run", "rerun", str(r), "--failed", "-R", repo], LAND_GH_DEADLINE) for r in runs]
+            results = []
+            for r in runs:  # one refused for the limit stops the rest: they spend the same pool
+                results.append(self.call([gh, "run", "rerun", str(r), "--failed", "-R", repo], LAND_GH_DEADLINE))
+                if self.quota_refused(e, results[-1], "rest", "actions"):
+                    return
             with self.lock:
                 self.finish(e, results[-1], exits=[g.returncode for g in results])
                 self.nudge(e["key"])
@@ -7912,9 +8120,15 @@ class LandQueue:
                 self.stop(e, "no_shim", f"no gh-quota shim at {self.path('gh', LAND_GH)}; {kind} is not sent around it",
                           "install the gh-quota shim (tools/host-baseline) or set gh in ~/.config/glaeda/land.json")
             return
+        bucket = "rest" if args[:1] == ["api"] else "graphql"  # update-branch is REST; pr edit is GraphQL
+        counter = "core" if bucket == "rest" else None
+        if self.quota_held(e, bucket, counter):
+            return
         with self.lock:
             self.claim(e, kind, before=head, **extra)
         got = self.call([gh, *args], LAND_GH_DEADLINE)
+        if self.quota_refused(e, got, bucket, counter):
+            return
         with self.lock:
             self.finish(e, got)
             e["preStepHead"] = head if got.returncode == 0 else ""
@@ -7954,6 +8168,8 @@ class LandQueue:
                           "~/.config/glaeda/land.json")
             return
         repo, number = e["repo"], str(e["number"])
+        if self.quota_held(e, "graphql"):  # gh pr merge, and the pr view after it, are GraphQL
+            return
         with self.lock:
             self.claim(e, "merge", sha=sha)
         got = self.call([gh, "pr", "merge", number, "-R", repo, "--squash", "--match-head-commit", sha],
@@ -7964,6 +8180,8 @@ class LandQueue:
                 self.finish(e, got)
                 self.park_quota(e, said)
             return
+        if self.quota_refused(e, got, "graphql"):
+            return  # GitHub's own rate limit on the merge: latched with its reset, parked, and no `pr view` either
         view = self.call([gh, "pr", "view", number, "-R", repo, "--json", "state,mergeCommit,headRefOid"],
                          LAND_GH_DEADLINE)
         state, merge_sha = "", ""
@@ -8189,6 +8407,20 @@ def cmd_land(target: str, after: list[str], notify: str | None, wait: float, as_
         else:
             say_waiting(f"glaeda land: refused: {why}\nnext: {nxt}, then glaeda-gh land {repo}#{number}")
         return EXIT_FAIL
+    # The merge is GraphQL (gh pr merge): latched for the queue's identity, nothing is queued or sent; refused at once,
+    # naming GitHub's reset, so a lane neither waits out --wait nor queues a judgment the reset makes stale.
+    ident = land_identity()
+    mark = latch_held("graphql", ident, time.time())
+    if mark is not None:
+        why = latch_sentence("graphql", ident, float(mark["until"]))
+        nxt = f"glaeda-gh land {repo}#{number} after {utc_clock(float(mark['until']))}"
+        if as_json:
+            print(json.dumps({"ok": False, "key": key, "state": "refused", "code": "quota", "reason": why,
+                              "next": nxt, "until": mark["until"]}, sort_keys=True))
+        else:
+            print(f"glaeda-gh land: {why}", file=sys.stderr)
+            print(f"next: {nxt}", file=sys.stderr)
+        return EXIT_QUOTA
     rid = land_request("land", f"{repo}#{number}", [land_key(a)[1] + f"#{land_key(a)[2]}" for a in after], requester,
                        source)
     running = daemon_running()
