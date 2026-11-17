@@ -565,7 +565,8 @@ What `--apply` does:
      Over all of these sits one host **cache budget** (`cache_budget`, default `35%` of the volume): every
      build-cache family together (seeds, kept and parked builds, spm-scratch, admission roots, runner build
      output, Xcode DerivedData, cmux-next-ci, hq's fleet cache, and the fleet Xcode CAS's node store and local
-     CAS, sized from `glaeda-fleet-cas-prune`'s report of its last run). Only a `--pressure` run applies it;
+     CAS, sized from `glaeda-fleet-cas-prune`'s report of its last run, measured again by a plan-only run
+     whenever that report is over 2 h old). Only a `--pressure` run applies it;
      a report, `--json` or a plain `--apply` never does. Before its survey the run sizes the families from
      the snapshot (paths deleted since are dropped): over the budget, the volume is under pressure whatever
      its free space, and its warm families (admission roots, runner build output, Xcode DerivedData, journey

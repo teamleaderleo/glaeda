@@ -5072,6 +5072,37 @@ class GlaedaDiskTest(unittest.TestCase):
                 self.assertNotIn("cache budget:", self.said, argv)
                 self.assertFalse(any("cache_budget" in r for r in rows[before:]), argv)
 
+    def test_a_stale_fleet_cas_record_is_measured_again_on_a_pass_with_no_pressure(self) -> None:
+        dev = gd.HOME.stat().st_dev
+        if self.root.stat().st_dev != dev:
+            self.skipTest("the fake volume is HOME's; this temp dir is on another")
+        for name in ("CACHE_BUDGET", "BUDGET_WARM_DEVS"):
+            self.addCleanup(setattr, gd, name, getattr(gd, name))
+        root = self.root / "xcode"
+        (root / "node-store/cas/00").mkdir(parents=True)
+        (root / "node-store/cas/00/obj").write_bytes(b"\0" * 8192)
+        (root / "cas/v1").mkdir(parents=True)
+        (root / "cas/v1/blob").write_bytes(b"\0" * 4096)
+        (root / "fleet-cas.env").write_text("FLEET_CAS_STORE=x\n")
+        record = self.root / "fleet-cas-bytes.json"
+        record.write_text(json.dumps({"at": time.time() - gd.FLEET_CAS_RECORD_MAX_AGE_S - 60, "dev": dev,
+                                      "bytes": gd.GIB}))  # the last capped pass, long ago
+        self.assertFalse(gd.fleet_cas_record_fresh(gd.read_fleet_cas_record(record)))
+        with mock.patch.object(gd, "FLEET_CAS_RECORD", record), mock.patch.object(gd, "FLEET_CAS_ROOT", root), \
+                mock.patch.object(gd, "CACHE_BUDGET_RECORD", self.root / "cache-budget.json"), \
+                mock.patch.object(gd, "load_snapshot", return_value=(0.0, {})):
+            _, rows, _, _ = self._main_run(["--pressure", "--apply"], free_gib=400.0)  # plenty free: no pressure
+            self.assertEqual(rows[-1]["skipped"], "no pressure")
+            doc = gd.read_fleet_cas_record(record)
+            self.assertTrue(gd.fleet_cas_record_fresh(doc))  # the plan-only prune measured both stores again
+            self.assertEqual((doc["dev"], doc["bytes"]), (dev, 8192 + 4096))
+            self.assertTrue((root / "node-store/cas/00/obj").exists() and (root / "cas/v1/blob").exists())
+            fs = gd.Fs(dev, "/", 400 * gd.GIB, 460 * gd.GIB, 120 * gd.GIB, 170 * gd.GIB)
+            fam = gd.Family("cmux-seeds", self.root / "seeds", True, "")
+            fam.root.mkdir()
+            row = gd.cache_budget_state([fam], {dev: fs}, {})[dev]
+            self.assertEqual(row["families"], {"fleet-cas": 8192 + 4096})  # the CAS is counted again
+
     def test_a_pressure_apply_bounds_its_survey(self) -> None:
         """Every pressure --apply measures for at most pressure_measure_budget_s and judges until twice that, so it
         reaches its deletes inside the runner hook's bound; a report and a 0 budget keep the unbounded survey."""
@@ -12681,10 +12712,12 @@ class CacheBudgetTest(unittest.TestCase):
         doc = gd.read_fleet_cas_record(record)
         self.assertEqual((doc["dev"], doc["bytes"]), (root.stat().st_dev, 11 * gd.GIB))  # 10 - 2 + 3
         self.assertLess(time.time() - doc["at"], 60)
-        # over the budget: --cap-only (no sweep, no gc) at 2.5% of the volume, and what it freed comes off "over"
+        # over the budget: --cap-only (no sweep, no gc) at 2.5% of the volume; with no new record, what it freed
+        # comes off "over"
         gd.ACTIVITY_MODE = "pressure"
         gd.CACHE_BUDGET = {self.dev: {"used": 1, "budget": 1, "over": 5 * gd.GIB, "families": {}}}
-        with mock.patch.object(gd, "fleet_cas_node_cap", return_value=2 * gd.GIB) as cap:
+        with mock.patch.object(gd, "fleet_cas_node_cap", return_value=2 * gd.GIB) as cap, \
+                mock.patch.object(gd, "FLEET_CAS_RECORD", record):
             self.assertEqual(gd.fleet_cas_budget_cap({self.dev: self.fs}, root), 2 * gd.GIB)
         self.assertEqual(cap.call_args.kwargs["cap_gib"], 2.5)
         self.assertEqual(gd.CACHE_BUDGET[self.dev]["over"], 3 * gd.GIB)
@@ -12696,6 +12729,38 @@ class CacheBudgetTest(unittest.TestCase):
         with mock.patch.object(gd, "fleet_cas_node_cap") as cap:
             self.assertEqual(gd.fleet_cas_budget_cap({self.dev: self.fs}, root), 0)
         cap.assert_not_called()
+
+    def test_the_cas_cap_credits_what_the_stores_shrank_by_since_the_counted_record(self) -> None:
+        root, record = self.root / "xcode", self.root / "fleet-cas-bytes.json"
+        root.mkdir()
+        record.write_text(json.dumps({"at": time.time() - 600, "dev": self.dev, "bytes": 20 * gd.GIB}))
+        gd.ACTIVITY_MODE = "pressure"
+        gd.CACHE_BUDGET = {self.dev: {"used": 1, "budget": 1, "over": 30 * gd.GIB,
+                                      "families": {"fleet-cas": 20 * gd.GIB}}}
+
+        def cap(*args, **kw):  # freed 2 GiB, but a writer build had emptied its local CAS since: 5 GiB are left
+            record.write_text(json.dumps({"at": time.time(), "dev": self.dev, "bytes": 5 * gd.GIB}))
+            return 2 * gd.GIB
+        with mock.patch.object(gd, "fleet_cas_node_cap", side_effect=cap), \
+                mock.patch.object(gd, "FLEET_CAS_RECORD", record):
+            self.assertEqual(gd.fleet_cas_budget_cap({self.dev: self.fs}, root), 2 * gd.GIB)
+        self.assertEqual(gd.CACHE_BUDGET[self.dev]["over"], 15 * gd.GIB)  # 30 - (20 - 5)
+
+    def test_records_holding_infinity_or_nan_read_as_absent(self) -> None:
+        path = self.root / "record.json"
+        for body in ('{"at": 1e300, "dev": 1, "bytes": Infinity}', '{"at": NaN, "dev": 1, "bytes": 1}',
+                     '{"at": 1, "dev": Infinity, "bytes": 1}', '{"at": true, "dev": 1, "bytes": 1}', "[]", "x"):
+            path.write_text(body)
+            self.assertEqual(gd.read_fleet_cas_record(path), {}, body)
+        now = time.time()
+        for body in (f'{{"at": {now}, "left": {{"1": Infinity}}}}', '{"at": Infinity, "left": {}}',
+                     f'{{"at": {now}, "left": {{"1": NaN}}}}', '{"at": NaN, "left": {"1": 5}}'):
+            path.write_text(body)
+            self.assertEqual(gd.read_budget_left(path, now=now), {}, body)
+        # cache_budget_state never sees one: an infinite record is no record
+        path.write_text('{"at": 1, "dev": 1, "bytes": Infinity}')
+        fam = gd.Family("cmux-seeds", self.root, True, "")
+        self.assertEqual(gd.cache_budget_state([fam], {self.dev: self.fs}, {}, gd.read_fleet_cas_record(path)), {})
 
 
 if __name__ == "__main__":

@@ -1691,13 +1691,20 @@ def _outermost(paths: list[str]) -> list[str]:
 
 
 def read_fleet_cas_record(path: Path | None = None) -> dict[str, Any]:
-    """FLEET_CAS_RECORD ({"at", "dev", "bytes"}), {} when absent or malformed."""
+    """FLEET_CAS_RECORD ({"at", "dev", "bytes"}), {} when absent or malformed (json reads Infinity and NaN too)."""
     try:
         doc = json.loads((FLEET_CAS_RECORD if path is None else path).read_text())
-    except (OSError, ValueError):
+        ok = isinstance(doc, dict) and all(
+            isinstance(doc.get(k), (int, float)) and not isinstance(doc.get(k), bool) and math.isfinite(doc[k])
+            for k in ("at", "dev", "bytes"))
+        return {"at": float(doc["at"]), "dev": int(doc["dev"]), "bytes": int(doc["bytes"])} if ok else {}
+    except (OSError, ValueError, OverflowError):
         return {}
-    ok = isinstance(doc, dict) and all(isinstance(doc.get(k), (int, float)) for k in ("at", "dev", "bytes"))
-    return doc if ok else {}
+
+
+def fleet_cas_record_fresh(rec: dict[str, Any], now: float | None = None) -> bool:
+    now = time.time() if now is None else now
+    return bool(rec) and 0 <= now - rec["at"] <= FLEET_CAS_RECORD_MAX_AGE_S
 
 
 def read_budget_left(path: Path | None = None, now: float | None = None) -> dict[int, int]:
@@ -1705,10 +1712,11 @@ def read_budget_left(path: Path | None = None, now: float | None = None) -> dict
     now = time.time() if now is None else now
     try:
         doc = json.loads((CACHE_BUDGET_RECORD if path is None else path).read_text())
-        if not 0 <= now - float(doc["at"]) <= CACHE_BUDGET_RECORD_MAX_AGE_S:
+        at = float(doc["at"])
+        if not math.isfinite(at) or not 0 <= now - at <= CACHE_BUDGET_RECORD_MAX_AGE_S:
             return {}
-        return {int(k): int(v) for k, v in doc["left"].items() if int(v) > 0}
-    except (OSError, ValueError, TypeError, KeyError, AttributeError):
+        return {int(k): int(v) for k, v in doc["left"].items() if int(v) > 0}  # int(inf) raises OverflowError
+    except (OSError, ValueError, TypeError, KeyError, AttributeError, OverflowError):
         return {}
 
 
@@ -1778,7 +1786,7 @@ def cache_budget_state(fams: list[Family], fss: "dict[int, Fs]", sizes: dict[str
     for dev, by in _budget_dev_bytes(fams, sizes).items():
         out[dev] = {"used": sum(by.values()), "families": dict(by)}
     rec = read_fleet_cas_record() if fleet_cas is None else fleet_cas
-    if rec and rec.get("bytes", 0) > 0 and 0 <= now - float(rec["at"]) <= FLEET_CAS_RECORD_MAX_AGE_S:
+    if rec and rec.get("bytes", 0) > 0 and fleet_cas_record_fresh(rec, now):
         r = out.setdefault(int(rec["dev"]), {"used": 0, "families": {}})
         r["used"] += int(rec["bytes"])
         r["families"]["fleet-cas"] = r["families"].get("fleet-cas", 0) + int(rec["bytes"])
@@ -13300,6 +13308,10 @@ def _main_impl(argv: list[str] | None = None) -> int:
     budget_base: dict[int, tuple[int, int]] = {}  # dev -> the volume's (low, target) before the budget raised them
     if (a.pressure and ROLE == "fleet-mini" and not RUNNER_CACHE_PROFILE and not reserved and not a.family
             and a.need is None and not a.cmux_next_drain and not a.root_override):
+        # an expired fleet-cas record is measured again here (a plan-only prune), on every budgeted path: the hourly
+        # sweep and a pass that finds no pressure never reach the capped prune that rewrites it
+        if not fleet_cas_record_fresh(read_fleet_cas_record()):
+            fleet_cas_measure()
         seen = {k: v for k, v in load_snapshot()[1].items() if os.path.lexists(k)}  # a deleted path holds nothing
         for dev, row in cache_budget_state(every, fss, seen, unclosable=read_budget_left()).items():
             if row["over"] > 0 and dev in fss:
@@ -13796,6 +13808,43 @@ FLEET_CAS_PRUNE_TIMEOUT_S = 300.0
 FLEET_CAS_BUDGET_SHARE = 0.025
 
 
+def _fleet_cas_prune(root: Path, prune: Path, args: list[str]) -> dict[str, Any] | None:
+    """One glaeda-fleet-cas-prune run (ARGS) bounded by FLEET_CAS_PRUNE_TIMEOUT_S: its JSON line, None when the prune or
+    fleet-cas is absent, or the run failed."""
+    if not (root / "fleet-cas.env").is_file() or not prune.is_file():
+        return None
+    try:
+        out = subprocess.run([sys.executable, os.fspath(prune), *args], capture_output=True,
+                             text=True, timeout=FLEET_CAS_PRUNE_TIMEOUT_S, check=False,
+                             env={**os.environ, "GLAEDA_FLEET_CAS_ROOT": os.fspath(root)})
+        rec = json.loads(out.stdout.strip().splitlines()[-1]) if out.stdout.strip() else {}
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+    return rec if isinstance(rec, dict) else None
+
+
+def _write_fleet_cas_record(root: Path, held: int, record: Path | None) -> None:
+    with contextlib.suppress(OSError):
+        path = FLEET_CAS_RECORD if record is None else record
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(f".{os.getpid()}.tmp")
+        tmp.write_text(json.dumps({"at": time.time(), "dev": root.stat().st_dev, "bytes": held}))
+        os.replace(tmp, path)
+
+
+def fleet_cas_measure(root: Path | None = None, prune: Path | None = None, record: Path | None = None) -> int | None:
+    """Both fleet-cas stores' bytes from a plan-only `glaeda-fleet-cas-prune --node-only` (it deletes nothing and
+    takes no lock), written to RECORD (FLEET_CAS_RECORD); None when it is absent or fails. Never raises."""
+    root = FLEET_CAS_ROOT if root is None else root
+    prune = Path(os.path.abspath(__file__)).with_name("glaeda-fleet-cas-prune") if prune is None else prune
+    rec = _fleet_cas_prune(root, prune, ["--node-only"])
+    if rec is None or not isinstance(rec.get("node_store_bytes"), int):
+        return None
+    held = rec["node_store_bytes"] + (rec["local_cas_bytes"] if isinstance(rec.get("local_cas_bytes"), int) else 0)
+    _write_fleet_cas_record(root, held, record)
+    return held
+
+
 def fleet_cas_node_cap(root: Path | None = None, prune: Path | None = None, cap_gib: float | None = None,
                        record: Path | None = None) -> int:
     """Run `glaeda-fleet-cas-prune --apply --node-only` (installed beside this script) on a host with fleet-cas, bounded
@@ -13806,18 +13855,10 @@ def fleet_cas_node_cap(root: Path | None = None, prune: Path | None = None, cap_
     stores hold after the run go to RECORD (FLEET_CAS_RECORD), which the cache budget counts."""
     root = FLEET_CAS_ROOT if root is None else root
     prune = Path(os.path.abspath(__file__)).with_name("glaeda-fleet-cas-prune") if prune is None else prune
-    if not (root / "fleet-cas.env").is_file() or not prune.is_file():
-        return 0
     args = ["--apply", "--node-only"] if cap_gib is None else ["--apply", "--cap-only", "--node-gib", f"{cap_gib:g}",
                                                                "--local-cas-gib", f"{cap_gib:g}"]
-    try:
-        out = subprocess.run([sys.executable, os.fspath(prune), *args], capture_output=True,
-                             text=True, timeout=FLEET_CAS_PRUNE_TIMEOUT_S, check=False,
-                             env={**os.environ, "GLAEDA_FLEET_CAS_ROOT": os.fspath(root)})
-        rec = json.loads(out.stdout.strip().splitlines()[-1]) if out.stdout.strip() else {}
-    except (OSError, subprocess.SubprocessError, ValueError):
-        return 0
-    if not isinstance(rec, dict):
+    rec = _fleet_cas_prune(root, prune, args)
+    if rec is None:
         return 0
     local_gone = rec.get("local_cas") == "removed" and isinstance(rec.get("local_cas_bytes"), int)
     freed = 0
@@ -13834,18 +13875,16 @@ def fleet_cas_node_cap(root: Path | None = None, prune: Path | None = None, cap_
         held = max(0, rec["node_store_bytes"] - (node_freed if isinstance(node_freed, int) else 0))
         if isinstance(rec.get("local_cas_bytes"), int) and not local_gone:
             held += rec["local_cas_bytes"]
-        with contextlib.suppress(OSError):
-            path = FLEET_CAS_RECORD if record is None else record
-            path.parent.mkdir(parents=True, exist_ok=True)
-            tmp = path.with_suffix(f".{os.getpid()}.tmp")
-            tmp.write_text(json.dumps({"at": time.time(), "dev": root.stat().st_dev, "bytes": held}))
-            os.replace(tmp, path)
+        _write_fleet_cas_record(root, held, record)
     return freed
 
 
 def fleet_cas_budget_cap(fss: "dict[int, Fs]", root: Path | None = None) -> int:
     """Over the cache budget, cap both fleet-cas stores at FLEET_CAS_BUDGET_SHARE of their volume before the
-    eviction passes, and take what that freed off the volume's "over", so warm build state pays only the rest."""
+    eviction passes, and take what the stores shrank by off the volume's "over": the bytes the budget counted for
+    them (the last record) less what the capped run just recorded, so warm build state pays only the rest. Bytes that
+    left since the last record (a writer build emptying its local CAS) come off too; when no record is written,
+    what the run freed."""
     root = FLEET_CAS_ROOT if root is None else root
     try:
         dev = root.stat().st_dev
@@ -13854,8 +13893,15 @@ def fleet_cas_budget_cap(fss: "dict[int, Fs]", root: Path | None = None) -> int:
     if cache_budget_over(dev) <= 0 or dev not in fss:
         return 0
     RUN["fleet_cas_budget_cap"] = True
+    counted = CACHE_BUDGET[dev].get("families", {}).get("fleet-cas", 0)
+    before = read_fleet_cas_record()
     freed = fleet_cas_node_cap(root, cap_gib=max(2.0, round(fss[dev].total * FLEET_CAS_BUDGET_SHARE / GIB, 1)))
-    CACHE_BUDGET[dev]["over"] = max(0, CACHE_BUDGET[dev]["over"] - freed)
+    after = read_fleet_cas_record()
+    if after and after.get("dev") == dev and after["at"] > (before.get("at", 0.0) if before else 0.0):
+        shrank = max(0, counted - after["bytes"])
+    else:
+        shrank = freed
+    CACHE_BUDGET[dev]["over"] = max(0, CACHE_BUDGET[dev]["over"] - shrank)
     return freed
 
 
