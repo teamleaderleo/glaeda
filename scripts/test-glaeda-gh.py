@@ -18649,7 +18649,7 @@ class WaitFromBytecodeTest(unittest.TestCase):
 
 class BrokerVouchTest(CountingGhBase):
     """teamleaderleo/glaeda: agent sessions type `gh pr view` by hand, with a number, a branch or no target, and keep
-    typing it: 140 charged reads in two hours on four hosts (2026-11-17), one big-red session reading one PR 24 times,
+    typing it: 140 charged reads in two hours on four hosts (2026-11-17), one session reading one branch 24 times,
     minutes apart. An answer is kept while glaeda's daemon holds the PR at the head and updatedAt it was read at."""
 
     HEAD = "a" * 40
