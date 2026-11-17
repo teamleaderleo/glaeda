@@ -3,9 +3,15 @@ name: Promote
 # Moves stable to the newest release that has soaked, that canary hosts reported healthy on
 # (commit statuses glaeda-ota/<host>) and that descends from stable. stable.json has this one
 # writer. Canary hosts also dispatch this after each run, since GitHub's cron can lag for hours.
+# Each published release starts it too (workflow_run), and a run looks again every minute while a
+# release may still become promotable (`promote --watch`: its canary quorum or the end of its soak),
+# so stable moves within a minute of that, not at the next canary run or cron (Leo, 2026-11-17).
 # docs/GLAEDA_OTA.md
 
 on:
+  workflow_run:
+    workflows: [Release]
+    types: [completed]
   schedule:
     - cron: "17 * * * *"
   workflow_dispatch:
@@ -25,7 +31,8 @@ permissions:
 # nothing the run that replaced it does not do (scripts/test-delivery-concurrency.py declares it). A
 # release asset upload has no compare-and-swap, so stable.json keeps this one group rather than racing
 # writers. The one input, an operator's soak_hours, can be replaced by a later cron while it waits; GitHub
-# then shows the dispatch as cancelled and the operator dispatches it again.
+# then shows the dispatch as cancelled and the operator dispatches it again. A run that watches holds the group
+# for up to WATCH_S; it re-reads every release and status each minute, so a run waiting behind it sees nothing new.
 concurrency:
   group: ota-stable
   cancel-in-progress: false
@@ -34,7 +41,8 @@ jobs:
   promote:
     if: github.repository == 'teamleaderleo/glaeda' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    # WATCH_S of minute-by-minute checks plus one evaluation
+    timeout-minutes: 40
     env:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
@@ -47,54 +55,77 @@ jobs:
       - name: Promote the newest healthy soaked release
         env:
           SOAK_HOURS: ${{ inputs.soak_hours }}
+          # how long one run keeps looking, a minute apart, while a release may become promotable
+          # (glaeda_release.py WATCH_GRACE_S past a 15-minute soak); then the canaries' nudges and the cron
+          WATCH_S: "1800"
         run: |
-          mkdir -p channels
-          stable=()
-          stable_tag=""
-          stable_source=""
-          if gh release download ota-channels --pattern stable.json --dir channels 2>channels/err; then
-            stable=(--stable channels/stable.json)
-            stable_tag=$(python3 -c 'import json;print(json.load(open("channels/stable.json"))["tag"])')
-            stable_source=$(python3 -c 'import json;print(json.load(open("channels/stable.json"))["source"])')
-          elif ! grep -q -e "no assets match" -e "release not found" channels/err; then
-            cat channels/err; exit 1
-          fi
-          # releases newest first, down to stable; soaking ones count too, since their canary failures
-          # block promoting anything older
-          gh release list --limit 40 --json tagName,publishedAt \
-            --jq '.[] | select(.tagName | test("^r-[0-9]{8}-[0-9a-f]{12}$")) | "\(.tagName) \(.publishedAt)"' \
-            > channels/releases.txt
-          : > channels/candidates.jsonl
-          considered=0
-          while read -r tag created; do
-            gh release download "$tag" --pattern release.json --output channels/release.json --clobber
-            source=$(python3 -c 'import json;print(json.load(open("channels/release.json"))["source"])')
-            # newest first; one page holds every canary host's latest status
-            gh api "repos/$GH_REPO/commits/$source/statuses?per_page=100" > channels/statuses.json
-            descends=true
-            if [ -n "$stable_source" ]; then
-              set +e
-              git merge-base --is-ancestor "$stable_source" "$source"
-              code=$?
-              set -e
-              case "$code" in 0) ;; 1) descends=false ;; *) echo "stable $stable_source is not in main's history" >&2; exit 1 ;; esac
+          # One evaluation: 0 promoted (or nothing to do), 4 look again in a minute, anything else a failure.
+          evaluate() {
+            rm -rf channels
+            mkdir -p channels
+            # releases published since the checkout name commits it does not have yet
+            git fetch --quiet origin main
+            stable=()
+            stable_tag=""
+            stable_source=""
+            if gh release download ota-channels --pattern stable.json --dir channels 2>channels/err; then
+              stable=(--stable channels/stable.json)
+              stable_tag=$(python3 -c 'import json;print(json.load(open("channels/stable.json"))["tag"])')
+              stable_source=$(python3 -c 'import json;print(json.load(open("channels/stable.json"))["source"])')
+            elif ! grep -q -e "no assets match" -e "release not found" channels/err; then
+              cat channels/err; return 1
             fi
-            python3 scripts/glaeda_release.py candidate --release channels/release.json --published "$created" \
-              --statuses channels/statuses.json --descends "$descends" >> channels/candidates.jsonl
-            considered=$((considered + 1))
-            if [ "$tag" = "$stable_tag" ] || [ "$considered" -ge 20 ]; then break; fi
-          done < channels/releases.txt
-          set +e
-          promote_args=(--candidates channels/candidates.jsonl "${stable[@]}")
-          if [ -n "$SOAK_HOURS" ]; then
-            promote_args+=(--soak-hours "$SOAK_HOURS")
-          fi
-          python3 scripts/glaeda_release.py promote "${promote_args[@]}" > channels/next.json 2> channels/why.txt
-          code=$?
-          set -e
-          cat channels/why.txt >> "$GITHUB_STEP_SUMMARY"
-          if [ "$code" = 3 ]; then exit 0; fi
-          [ "$code" = 0 ] || exit "$code"
-          mv channels/next.json channels/stable.json
-          gh release upload ota-channels channels/stable.json --clobber
-          cat channels/stable.json >> "$GITHUB_STEP_SUMMARY"
+            # releases newest first, down to stable; soaking ones count too, since their canary failures
+            # block promoting anything older
+            gh release list --limit 40 --json tagName,publishedAt \
+              --jq '.[] | select(.tagName | test("^r-[0-9]{8}-[0-9a-f]{12}$")) | "\(.tagName) \(.publishedAt)"' \
+              > channels/releases.txt
+            : > channels/candidates.jsonl
+            considered=0
+            while read -r tag created; do
+              # a release whose manifest is not uploaded yet is passed over; the next look finds it
+              gh release download "$tag" --pattern release.json --output channels/release.json --clobber || continue
+              source=$(python3 -c 'import json;print(json.load(open("channels/release.json"))["source"])')
+              # newest first; one page holds every canary host's latest status
+              gh api "repos/$GH_REPO/commits/$source/statuses?per_page=100" > channels/statuses.json
+              descends=true
+              if [ -n "$stable_source" ]; then
+                set +e
+                git merge-base --is-ancestor "$stable_source" "$source"
+                code=$?
+                set -e
+                case "$code" in 0) ;; 1) descends=false ;; *) echo "stable $stable_source is not in main's history" >&2; return 1 ;; esac
+              fi
+              python3 scripts/glaeda_release.py candidate --release channels/release.json --published "$created" \
+                --statuses channels/statuses.json --descends "$descends" >> channels/candidates.jsonl
+              considered=$((considered + 1))
+              if [ "$tag" = "$stable_tag" ] || [ "$considered" -ge 20 ]; then break; fi
+            done < channels/releases.txt
+            set +e
+            promote_args=(--candidates channels/candidates.jsonl --watch "${stable[@]}")
+            if [ -n "$SOAK_HOURS" ]; then
+              promote_args+=(--soak-hours "$SOAK_HOURS")
+            fi
+            python3 scripts/glaeda_release.py promote "${promote_args[@]}" > channels/next.json 2> channels/why.txt
+            code=$?
+            set -e
+            echo "$(date -u +%H:%M:%SZ): $(cat channels/why.txt)" >> "$GITHUB_STEP_SUMMARY"
+            if [ "$code" = 3 ]; then return 0; fi
+            [ "$code" = 0 ] || return "$code"
+            mv channels/next.json channels/stable.json
+            gh release upload ota-channels channels/stable.json --clobber
+            cat channels/stable.json >> "$GITHUB_STEP_SUMMARY"
+          }
+          deadline=$(( $(date +%s) + WATCH_S ))
+          while :; do
+            set +e
+            (set -e; evaluate)  # a subshell, so errexit holds inside it and a failure returns its code here
+            code=$?
+            set -e
+            [ "$code" = 4 ] || exit "$code"
+            if [ "$(date +%s)" -ge "$deadline" ]; then
+              echo "stopped watching after ${WATCH_S}s; the canaries' nudges and the hourly cron take over" >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            sleep 60
+          done

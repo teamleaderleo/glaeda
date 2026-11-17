@@ -172,11 +172,12 @@ SYSTEMD_UNITS_DIR = REPO / "ops/systemd"
 
 
 def update_every_s() -> int:
-    """glaeda-update's APPLY_EVERY_S, its one definition: the agent runs it that often and its backoff starts
-    there. Read from the source beside this script, so a release's setup schedules that release's updater."""
-    match = re.search(r"^APPLY_EVERY_S = (\d+)\b", (SCRIPT_DIR / "glaeda-update").read_text(), re.M)
+    """glaeda-update's PROBE_EVERY_S, its one definition: the agent runs it that often (a run between its ten-minute
+    full runs only probes the channel). Read from the source beside this script, so a release's setup schedules that
+    release's updater."""
+    match = re.search(r"^PROBE_EVERY_S = (\d+)\b", (SCRIPT_DIR / "glaeda-update").read_text(), re.M)
     if not match:
-        raise RuntimeError("scripts/glaeda-update defines no APPLY_EVERY_S")
+        raise RuntimeError("scripts/glaeda-update defines no PROBE_EVERY_S")
     return int(match.group(1))
 LINUX_UNITS = (
     "glaeda-disk-pressure.service",
@@ -973,8 +974,9 @@ def agent_plists(ctx: Context) -> dict[str, dict[str, Any]]:
             "StandardOutPath": os.fspath(ctx.logs / "glaeda-worktree-reclaim.jsonl"),
             "StandardErrorPath": os.fspath(ctx.logs / "glaeda-worktree-reclaim.err"),
         },
-        # Over-the-air updates (scripts/glaeda-update): every APPLY_EVERY_S, converges this host on its
-        # release ring (backing off while it cannot) and rolls back when the new tools do not run.
+        # Over-the-air updates (scripts/glaeda-update): every PROBE_EVERY_S it probes the channel, and every
+        # APPLY_EVERY_S or on a change converges this host on its release ring (backing off while it cannot) and
+        # rolls back when the new tools do not run.
         LABEL_PREFIX + "update": {
             "Label": LABEL_PREFIX + "update",
             "ProgramArguments": [python, os.fspath(ctx.bin / "glaeda-update"), "--apply"],
