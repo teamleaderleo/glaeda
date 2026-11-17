@@ -2474,6 +2474,74 @@ def jobs_attempt(jobs: list[dict] | None) -> int:
     return max((j.get("run_attempt") or 0 for j in jobs or []), default=0)
 
 
+# A completed run attempt's job list, kept on disk with no expiry (2026-11-17, Leo: "so claude desktop shows rate limit
+# on hover of the github links sometimes"; the shared REST pool at 0/5000, its top route GET .../actions/runs/{id}/jobs
+# at 56 an hour, read by this daemon for a lane VM's `--jobs` watches relayed by the broker). A watched `--jobs` run was
+# read again each cycle a reader touched it, and its job list with it, long after the attempt had finished: a completed
+# attempt's jobs never change (a re-run is a new attempt, with a new run_attempt), so once a list is read with the run
+# completed at that attempt and every job listed completed, read_jobs answers it from here with no request. A run still
+# moving reads its list as before, with If-None-Match. Keyed by (repo, run id, attempt) like the lane-gh broker's kept
+# actions/runs/N/attempts/A/jobs (cmuxterm-hq tools/lane-gh-broker/parts/36-immutable-cache.py), under BASE beside the
+# job-log cache (BASE/logs) and evicted the same way: least recently read first past ATTEMPT_JOBS_MAX_BYTES. It holds
+# the default (filter=latest) list read_jobs reads, slimmed (slim_jobs), so it outlives the run's cache entry
+# (CACHE_KEEP) and a watch dropped and registered again later.
+ATTEMPT_JOBS_DIR = "run-jobs"
+ATTEMPT_JOBS_MAX_BYTES = 64 * 1024 * 1024  # a slimmed 50-job list is ~8 KB gzip'd: several thousand attempts
+
+
+def attempt_jobs_done(run: dict | None, jobs: Any) -> int | None:
+    """The attempt a job list is final for, else None: the run (as read with or before the list) completed at that
+    attempt, the list is not empty, every job in it completed, and its newest job is of that attempt. A job a
+    `needs:` held back is listed by then: the run completes only after every job it will run has."""
+    if not isinstance(run, dict) or run.get("status") != "completed" or not isinstance(jobs, list) or not jobs:
+        return None
+    attempt = run.get("run_attempt") or 1
+    if not isinstance(attempt, int) or isinstance(attempt, bool):
+        return None
+    if not all(isinstance(j, dict) and j.get("status") == "completed" for j in jobs) or jobs_attempt(jobs) != attempt:
+        return None
+    return attempt
+
+
+def attempt_jobs_path(repo: str, run_id: int, attempt: int) -> Path:
+    owner, name = repo.lower().split("/", 1)
+    return BASE / ATTEMPT_JOBS_DIR / owner / name / f"{int(run_id)}.{int(attempt)}.json.gz"
+
+
+def attempt_jobs_get(repo: str, run_id: int, attempt: int) -> list[dict] | None:
+    """The kept job list of that completed attempt, or None. A hit is marked used (its mtime) for eviction."""
+    path = attempt_jobs_path(repo, run_id, attempt)
+    try:
+        with open(path, "rb") as f:
+            doc = json.loads(gzip.decompress(f.read()))
+    except (OSError, EOFError, ValueError, zlib.error):
+        return None  # missing or damaged: a miss, and the next read replaces it
+    jobs = doc.get("jobs") if isinstance(doc, dict) else None
+    if not isinstance(jobs, list) or not jobs or not all(isinstance(j, dict) for j in jobs):
+        return None
+    with contextlib.suppress(OSError):
+        os.utime(path)
+    return jobs
+
+
+def attempt_jobs_put(repo: str, run_id: int, attempt: int, jobs: list[dict]) -> None:
+    """Keep that completed attempt's job list, replaced whole, then evict past the cap. Never raises: a full disk
+    only means the next read asks GitHub."""
+    path = attempt_jobs_path(repo, run_id, attempt)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.{time.monotonic_ns()}.tmp")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        with open(tmp, "wb") as f:
+            f.write(gzip.compress(json.dumps({"repo": repo.lower(), "run": int(run_id), "attempt": int(attempt),
+                                              "jobs": jobs}, separators=(",", ":")).encode(), mtime=0))
+        os.replace(tmp, path)
+    except OSError:
+        with contextlib.suppress(OSError):
+            tmp.unlink()
+        return
+    kept_evict(BASE / ATTEMPT_JOBS_DIR, ".json.gz", ATTEMPT_JOBS_MAX_BYTES)
+
+
 # ---------------------------------------------------------------- daemon
 
 
@@ -4848,7 +4916,7 @@ class Daemon:
         self.write_consumers()
         self.sent = [(t, what) for t, what in self.sent if self.now - t < 3600]
         hour = {what: sum(1 for _, w in self.sent if w == what)
-                for what in ("rest", "rest304", "graphql", "free", "write")}
+                for what in ("rest", "rest304", "graphql", "free", "write", "kept")}
         self.reads = [r for r in self.reads if self.now - r[0] < 3600]
         self.gql_log = [g for g in self.gql_log if self.now - g[0] < 3600]
         graphql_by: dict[str, dict[str, int]] = {}
@@ -5365,7 +5433,7 @@ class Daemon:
             base = current if isinstance(current, dict) else prior
             entry = {"key": key, "fetchedAt": self.now, "dataAt": None, "data": None, "error": None}
             if base:
-                entry.update({k: base[k] for k in ("dataAt", "data", "etag", "jobs", "jobsEtag", "jobsAt", "jobsTried", "restAt", "source", "restParts", "restRun", "restRunAt", "origin", "via", "rerunAt", "fp", "fullAt", "wholeAt")
+                entry.update({k: base[k] for k in ("dataAt", "data", "etag", "jobs", "jobsEtag", "jobsAt", "jobsTried", "jobsDone", "restAt", "source", "restParts", "restRun", "restRunAt", "origin", "via", "rerunAt", "fp", "fullAt", "wholeAt")
                               if k in base})
             entry.update(fields)
             if key.startswith("pr:") and isinstance(entry.get("data"), dict) and "data" in fields:
@@ -6057,6 +6125,18 @@ class Daemon:
                           # past the REST share, once per attempt, answered or not: an error or an empty
                           # list would otherwise be asked for again every cycle, past the share
                           and (self.rest_room(1) or prior.get("jobsTried") != attempt))
+        # A completed attempt's list, read once already (here, or kept on disk by any watch of the run before): no
+        # request, in any mode. A re-run is a new attempt, which this run read shows, so it misses and is read.
+        if (e["jobs"] or failed_attempt) and run.get("status") == "completed":
+            kept = prior.get("jobs") if prior.get("jobsDone") == attempt and isinstance(prior.get("jobs"), list) \
+                else attempt_jobs_get(f"{owner}/{repo}", int(run_id), attempt)
+            if kept is not None and attempt_jobs_done(run, kept) == attempt:
+                fields.update(jobs=kept, jobsAt=self.now, jobsDone=attempt)
+                if failed_attempt:
+                    fields["jobsTried"] = attempt
+                self.sent.append((self.now, "kept"))  # a job list answered with no request (budget: hour.kept)
+                self.store(e["key"], e["cache"], **fields)
+                return
         if (e["jobs"] and self.mode("rest") == "normal") or failed_attempt:
             try:
                 with self.calling(*caller_of(e["key"]), waiter_of(e)):  # its own waiter, inside a batch's call too
@@ -6074,6 +6154,13 @@ class Daemon:
                 self.deferred.add(e["key"])
             else:
                 self.errors.append(f"{e['key']} jobs: {jdoc}")
+            if jstate in ("fresh", "same"):
+                done = attempt_jobs_done(run, fields["jobs"] if jstate == "fresh" else prior.get("jobs"))
+                if done is not None:  # final: the next read of this attempt sends nothing (above)
+                    fields["jobsDone"] = done
+                    if prior.get("jobsDone") != done:
+                        attempt_jobs_put(f"{owner}/{repo}", int(run_id), done,
+                                         fields["jobs"] if jstate == "fresh" else prior["jobs"])
         self.store(e["key"], e["cache"], **fields)
 
     def rest_part(self, old: dict, new: dict, path: str, slim: Callable[[Any], Any], absent: Any = None) -> Any:
@@ -9798,7 +9885,7 @@ def controller_wait_run(key: str, timeout: float) -> dict | None:
                 rest_at = prior["restAt"]
         entry = {"key": key, "fetchedAt": now, "dataAt": data_at, "restAt": rest_at,
                  "data": candidate, "error": None, "source": "controller"}
-        for field in ("etag", "jobs", "jobsEtag", "jobsAt", "jobsTried", "restParts", "restRun", "restRunAt", "rerunAt"):
+        for field in ("etag", "jobs", "jobsEtag", "jobsAt", "jobsTried", "jobsDone", "restParts", "restRun", "restRunAt", "rerunAt"):
             if field in prior:
                 entry[field] = prior[field]
         write_json(cache, entry)
@@ -10322,7 +10409,8 @@ def cmd_budget(as_json: bool) -> int:
         if isinstance(hour, dict):
             print(f"daemon requests in the last hour: {hour.get('rest', 0)} REST, {hour.get('rest304', 0)} more "
                   f"REST answered 304 (free), {hour.get('graphql', 0)} GraphQL, "
-                  f"{hour.get('free', 0)} rate_limit reads (free), {hour.get('write', 0)} REST for queued writes")
+                  f"{hour.get('free', 0)} rate_limit reads (free), {hour.get('write', 0)} REST for queued writes, "
+                  f"{hour.get('kept', 0)} completed-attempt job lists answered from disk (no request)")
         share = status.get("restShare")
         if isinstance(share, dict):
             print(f"daemon REST spend {share.get('spent', '?')}/{share.get('cap', '?')} this hour "
@@ -13827,19 +13915,25 @@ def job_log_put(repo: str, job: int, text: bytes) -> None:
 def job_logs_evict(max_bytes: int | None = None, now: float | None = None) -> dict:
     """Remove the least recently read logs until the rest fit in max_bytes, and temporary files a crash left.
     {"removed", "bytes"}. A reader that has a log open keeps reading it."""
-    max_bytes = JOB_LOG_MAX_BYTES if max_bytes is None else max_bytes
+    return kept_evict(BASE / JOB_LOG_DIR, ".log.gz", JOB_LOG_MAX_BYTES if max_bytes is None else max_bytes, now)
+
+
+def kept_evict(root: Path, suffix: str, max_bytes: int, now: float | None = None) -> dict:
+    """Under ROOT/OWNER/REPO: remove the least recently read SUFFIX files until the rest fit in max_bytes, and
+    temporary files a crash left (older than JOB_LOG_TMP_KEEP). {"removed", "bytes"}. The job-log cache and the kept
+    completed-attempt job lists (attempt_jobs_put) share it."""
     now = time.time() if now is None else now
     kept: list[tuple[float, int, Path]] = []
     removed = 0
     with contextlib.suppress(OSError):
-        for owner in (BASE / JOB_LOG_DIR).iterdir():
+        for owner in root.iterdir():
             for repo in (owner.iterdir() if owner.is_dir() else ()):
                 for p in (repo.iterdir() if repo.is_dir() else ()):
                     try:
                         st = p.stat()
                     except OSError:
                         continue
-                    if p.name.endswith(".log.gz") and not p.name.startswith("."):
+                    if p.name.endswith(suffix) and not p.name.startswith("."):
                         kept.append((st.st_mtime, st.st_size, p))
                     elif p.name.endswith(".tmp") and now - st.st_mtime > JOB_LOG_TMP_KEEP:
                         with contextlib.suppress(OSError):

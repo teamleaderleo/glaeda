@@ -2291,6 +2291,108 @@ class DaemonTest(Base):
         self.assertEqual(len(self.gh.job_calls()), 2)
         self.assertEqual(gg.jobs_attempt(gg.read_cache(key)["jobs"]), 2)
 
+    def replay_one_runs_life(self, waiters: int, done_cycles: int) -> dict:
+        """One run's life as the pool host's daemon sees it through the broker relay (2026-11-17: GET
+        .../actions/runs/{id}/jobs, 56 an hour, waiter VM/tool:lane-gh-broker): WAITERS lane sessions
+        each `wait run --jobs` it and their VM's glaeda forwards the watch every cycle (an upstream `read`: the jobs
+        flag, a wait, the session's own touch time). Queued 1 cycle, in progress 4 (its job list moves each cycle),
+        completed for DONE_CYCLES, re-run (attempt 2) in progress 2, completed for DONE_CYCLES. The job list
+        requests by phase."""
+        key, clock = "run:o/r/9", [NOW]
+        counts: dict[str, int] = {}
+
+        def cycle(phase: str, run: dict, jobs: list) -> None:
+            self.gh.runs[9], self.gh.jobs[9] = run, jobs
+            t = clock[0]
+            for i in range(waiters):
+                gg.register(key, jobs=True, waited=True, reader=f"vm-1/session:w{i}",
+                            at={"touched": t - 1, "waitedAt": t - 1})
+            before = len(self.gh.job_calls())
+            self.daemon.tick(t)
+            counts[phase] = counts.get(phase, 0) + len(self.gh.job_calls()) - before
+            clock[0] += gg.CYCLE
+
+        def running(n: int, attempt: int) -> list:
+            return [{**job("build", "success", run_attempt=attempt, end=NOW), "status": "in_progress",
+                     "conclusion": None, "steps": [{"name": f"step {s}", "conclusion": "success"} for s in range(n)]},
+                    {**job("lint", "success", run_attempt=attempt, end=NOW), "status": "queued", "conclusion": None}]
+
+        def finished(attempt: int) -> list:
+            return [job("build", "success", run_attempt=attempt, end=NOW), job("lint", "success", run_attempt=attempt, end=NOW)]
+
+        base = {"id": 9, "name": "CI", "html_url": "u", "conclusion": None}
+        with mock.patch.object(gg.time, "time", lambda: clock[0]):
+            cycle("queued", {**base, "status": "queued", "run_attempt": 1, "updated_at": iso(NOW)}, [])
+            for n in range(4):
+                cycle("running", {**base, "status": "in_progress", "run_attempt": 1, "updated_at": iso(NOW + n)},
+                      running(n + 1, 1))
+            done = {**base, "status": "completed", "conclusion": "success", "run_attempt": 1, "updated_at": iso(NOW + 9)}
+            for _ in range(done_cycles):
+                cycle("completed", done, finished(1))
+            for n in range(2):
+                cycle("rerun running", {**done, "status": "in_progress", "conclusion": None, "run_attempt": 2,
+                                        "updated_at": iso(NOW + 20 + n)}, running(n + 1, 2))
+            for _ in range(done_cycles):
+                cycle("rerun completed", {**done, "run_attempt": 2, "updated_at": iso(NOW + 30)}, finished(2))
+        return counts
+
+    def check_one_runs_life(self, waiters: int) -> None:
+        """A completed attempt's jobs never change, so its list is read once (when the run is first seen completed)
+        and then answered from disk; a re-run is a new attempt and reads again. Before, every cycle a waiter
+        touched it read the list again (60 an hour per run for as long as a VM kept the watch)."""
+        sent = self.replay_one_runs_life(waiters, done_cycles=60)
+        if os.environ.get("GLAEDA_REPLAY_PRINT"):
+            print(f"waiters={waiters} job list requests by phase: {sent}", file=sys.stderr)
+        # in progress: each cycle (the list moves), conditional after the first; each finish: one read, then none
+        self.assertEqual(sent, {"queued": 1, "running": 4, "completed": 1, "rerun running": 2, "rerun completed": 1})
+        entry = gg.read_cache("run:o/r/9")
+        self.assertEqual((entry["jobsDone"], gg.jobs_attempt(entry["jobs"])), (2, 2))
+        self.assertTrue(all(c[2].get("If-None-Match") for c in self.gh.job_calls()[1:]))
+        self.assertGreaterEqual(self.daemon.status["lastHour"]["kept"], 59)  # the last hour: the re-run's finish
+
+    def test_a_completed_attempts_job_list_is_read_once_for_one_waiter(self) -> None:
+        self.check_one_runs_life(1)
+
+    def test_a_completed_attempts_job_list_is_read_once_for_five_waiters(self) -> None:
+        self.check_one_runs_life(5)
+
+    def test_a_kept_attempt_outlives_its_cache_entry_and_a_rerun_misses_it(self) -> None:
+        key = "run:o/r/4"
+        self.gh.runs[4] = {"id": 4, "status": "completed", "conclusion": "failure", "run_attempt": 1,
+                           "updated_at": iso(NOW)}
+        self.gh.jobs[4] = [job("build", end=NOW), job("lint", "success", end=NOW)]
+        gg.register(key, jobs=True)
+        self.daemon.tick(NOW)
+        self.assertEqual(len(self.gh.job_calls()), 1)
+        self.assertTrue(gg.attempt_jobs_path("o/r", 4, 1).exists())
+        # the run's cache entry and watch are gone (CACHE_KEEP); a new watch an hour later reads the run, not its jobs
+        (gg.cache_dir() / gg.file_name(key)).unlink()
+        gg.register(key, jobs=True)
+        self.daemon.tick(NOW + 2 * gg.CYCLE)
+        self.assertEqual(len(self.gh.job_calls()), 1)
+        entry = gg.read_cache(key)
+        self.assertEqual([j["failedSteps"] for j in entry["jobs"]], [["Run selected tests"], []])
+        self.assertEqual(entry["jobsTried"], 1)
+        # a re-run: the run read shows attempt 2 in progress, and its list is read
+        self.gh.runs[4] = {**self.gh.runs[4], "status": "in_progress", "conclusion": None, "run_attempt": 2}
+        self.gh.jobs[4] = [{**job("build", run_attempt=2, end=NOW), "status": "in_progress", "conclusion": None}]
+        os.utime(gg.watch_dir() / gg.file_name(key), (NOW + 4 * gg.CYCLE - 1,) * 2)
+        self.daemon.tick(NOW + 4 * gg.CYCLE)
+        self.assertEqual(len(self.gh.job_calls()), 2)
+        self.assertEqual(gg.read_cache(key)["jobsDone"], 1)  # (the kept attempt stays named; attempt 2 is not done)
+        self.assertEqual(gg.attempt_jobs_done(gg.read_cache(key)["data"], gg.read_cache(key)["jobs"]), None)
+
+    def test_a_list_read_before_its_run_completed_is_never_kept(self) -> None:
+        """Every listed job completed while the run is not: a job a `needs:` holds back may not be listed yet."""
+        run = {"status": "in_progress", "run_attempt": 1}
+        self.assertIsNone(gg.attempt_jobs_done(run, [job("build", "success")]))
+        self.assertIsNone(gg.attempt_jobs_done({**run, "status": "completed"}, []))
+        self.assertIsNone(gg.attempt_jobs_done({**run, "status": "completed"},
+                                               [job("a", "success"), {**job("b"), "status": "in_progress"}]))
+        self.assertIsNone(gg.attempt_jobs_done({**run, "status": "completed", "run_attempt": 2}, [job("a", "success")]))
+        self.assertEqual(gg.attempt_jobs_done({**run, "status": "completed", "run_attempt": 2},
+                                              [job("a", "success"), job("b", "success", run_attempt=2)]), 2)
+
     def test_failed_check_steps_are_read_once(self) -> None:
         failed = {**check_run("build", conclusion="FAILURE"), "id": "CR_1"}
         self.gh.prs[("o", "r", 1)] = pr_node(1, rollup="FAILURE", checks=[failed, {**check_run("lint"), "id": "CR_2"}])
@@ -8458,7 +8560,7 @@ class BudgetRefreshTest(Base):
     def test_the_free_read_is_not_counted_as_a_request_the_daemon_spent(self) -> None:
         status = self.daemon.tick(NOW)
         self.assertEqual(self.gh.rate_limit_calls, 1)
-        self.assertEqual(status["lastHour"], {"rest": 0, "rest304": 0, "graphql": 0, "free": 1, "write": 0},
+        self.assertEqual(status["lastHour"], {"rest": 0, "rest304": 0, "graphql": 0, "free": 1, "write": 0, "kept": 0},
                          "the refresh is counted, and not as a request that spent anything")
 
     def test_a_refusal_is_reported_and_leaves_the_last_view_alone(self) -> None:
