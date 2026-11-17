@@ -566,12 +566,17 @@ What `--apply` does:
      side-std jobs queued under 60% CPU). So a running job is charged `max(0, p95 - written)` (`RUNNER_JOB_WRITTEN`):
      its own sampler measures the growth of its runner's `_work` and of the `spm-scratch` its packages link, every
      3 minutes with a bounded `du`, capped by its own free-disk drop, and writes it to
-     `~/.local/state/glaeda/cmux-runner/job-written-<runner>.json`; a gate trusts it only for that live
+     `~/.local/state/glaeda/cmux-runner/job-written/written-<runner>.json`; a gate trusts it only for that live
      `Runner.Worker` and for 9 minutes, else charges the full p95. A pid and a freshness window do not name a job
      (a late sampler, or a next job whose Worker reuses the pid, read the earlier job's record as its own), so
-     job-started draws a per-job nonce into `job-nonce-<runner>.json`: the sampler writes it into every record,
-     writes only while it is still the runner's current nonce, removes a record (and, the job over, the nonce) only
-     when it carries its own, and a gate trusts a record only with the current nonce for that Worker. The detector is the gate's hold line: a
+     job-started draws a per-job nonce into `job-written/nonce-<runner>.json`: the sampler writes it into every
+     record, writes only while it is still the runner's current nonce, removes a record (and, the job over, the
+     nonce) only when it carries its own, and a gate trusts a record only with the current nonce for that Worker.
+     A record discounts disk the gate admits work against, so only the hook's own counts: `job-written/` is made
+     0700, both files are written 0600 without following a symlink, and a gate reads (and cleanup removes) only a
+     regular file of its own uid with no group or other access in a directory that is the same; a record in the
+     state directory itself is never read. Jobs run as the hook's user, so this keeps out records that are stale,
+     foreign, loose or linked, not a job that sets out to forge one. The detector is the gate's hold line: a
      `RUNNER_JOBS_DISK` hold whose free disk is well above the floor with no `less ... already wrote` is a
      reservation that is not shrinking.
      `glaeda-disk --pressure` reads the highest floor among the user's runner hooks and starts freeing at floor
