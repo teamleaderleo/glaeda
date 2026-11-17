@@ -117,7 +117,8 @@ class DoH(http.server.ThreadingHTTPServer):
         class Handler(http.server.BaseHTTPRequestHandler):
             def do_GET(self):  # noqa: N802
                 outer.asked += 1
-                body = json.dumps({"Status": 0, "Answer": [{"name": "api.github.com.", "type": 1, "data": outer.answer}]})
+                answer = [{"name": "api.github.com.", "type": 1, "data": outer.answer}] if outer.answer else []
+                body = json.dumps({"Status": 0, "Answer": answer})
                 self.send_response(200)
                 self.send_header("Content-Type", "application/dns-json")
                 self.end_headers()
@@ -190,6 +191,19 @@ class EdgeRetry(unittest.TestCase):
         t = time.monotonic()  # remembered: the next request goes straight to edge B
         self.assertEqual(self.zen()[1]["edge"], GOOD_IP)
         self.assertLess(time.monotonic() - t, 1.5)
+
+    def test_a_lone_edge_marked_bad_is_still_dialled_when_no_other_is_known(self):
+        # One blip marked the only resolved edge bad and the second resolver knows no other: reads still go to it,
+        # rather than every read failing for EDGE_BAD_TTL.
+        self.bad = Edge(BAD_IP, self.good.port, "ok", self.cert, self.key)
+        self.doh.answer = None
+        gg.EDGE.mark_bad(BAD_IP)
+        self.assertEqual(self.zen(), (200, {"edge": BAD_IP, "path": "/zen"}))
+
+    def test_a_bare_403_with_no_other_edge_is_returned_as_before(self):
+        self.bad = Edge(BAD_IP, self.good.port, "403", self.cert, self.key)
+        self.doh.answer = None
+        self.assertEqual(self.zen()[0], 403)
 
     def test_bare_403_retries_on_another_edge(self):
         self.bad = Edge(BAD_IP, self.good.port, "403", self.cert, self.key)

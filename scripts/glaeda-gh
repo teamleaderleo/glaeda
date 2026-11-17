@@ -1668,43 +1668,59 @@ class Edges:
         except TimeoutError:
             raw.close()
             raise EdgeFailed("tls-timeout") from None
+        except ssl.SSLCertVerificationError:
+            raw.close()
+            raise  # this host's trust store, not the edge: no verdict, the request fails as it did before
         except OSError:
             raw.close()
             raise EdgeFailed("tls-failed") from None
         tls.settimeout(timeout)
         return tls
 
+    def candidates(self, host: str, tried: set[str]) -> list[str]:
+        """Edges to retry on: the system resolver's other addresses, then the second resolver's, none marked bad."""
+        out: list[str] = []
+        for ip in self.resolve(host) + self.doh(host):
+            if ip not in tried and ip not in out and not self.is_bad(ip):
+                out.append(ip)
+        return out
+
     def connect(self, host: str, context: ssl.SSLContext, timeout: float):
         """A TLS connection to an edge for HOST: the first try, then at most one retry on another edge."""
         port = int(os.environ.get("GLAEDA_EDGE_TEST_PORT") or 443)
         primary = self.resolve(host)
         first = next((ip for ip in primary if not self.is_bad(ip)), None)
-        why = "all-marked-bad"
-        if first is not None:
-            try:
-                sock = self.attempt(first, port, host, context, timeout)
-                self.local.ip = first
-                return sock
-            except EdgeFailed as error:
-                why = error.why
-                self.mark_bad(first)
-        tried = set(primary)
-        alts = [ip for ip in self.doh(host) if ip not in tried and not self.is_bad(ip)]
-        frm = first
-        if not alts:
-            log({"event": "edge-retry", "host": host, "from": frm, "to": None, "why": why, "ok": False})
-            raise EdgeFailed(f"no other {host} edge ({why})")
-        second = alts[0]
+        if first is None:
+            alts = self.candidates(host, set(primary))
+            if alts:  # every resolved edge failed lately: another one, the retry spent on it
+                return self.second(host, port, context, timeout, None, "all-marked-bad", alts[0])
+            # None known: the resolver's own first answer once more (a blip must not lock reads out for EDGE_BAD_TTL).
+            first = primary[0] if primary else None
+            if first is None:
+                raise EdgeFailed(f"{host} resolves to nothing")
         try:
-            sock = self.attempt(second, port, host, context, timeout)
+            sock = self.attempt(first, port, host, context, timeout)
+            self.local.ip = first
+            return sock
         except EdgeFailed as error:
-            self.mark_bad(second)
-            log({"event": "edge-retry", "host": host, "from": frm, "to": second, "why": why, "ok": False,
-                 "why2": error.why})
+            self.mark_bad(first)
+            alts = self.candidates(host, {first})
+            if not alts:
+                log({"event": "edge-retry", "host": host, "from": first, "to": None, "why": error.why, "ok": False})
+                raise
+            return self.second(host, port, context, timeout, first, error.why, alts[0])
+
+    def second(self, host: str, port: int, context: ssl.SSLContext, timeout: float, frm: str | None, why: str,
+               to: str):
+        try:
+            sock = self.attempt(to, port, host, context, timeout)
+        except EdgeFailed as error:
+            self.mark_bad(to)
+            log({"event": "edge-retry", "host": host, "from": frm, "to": to, "why": why, "ok": False, "why2": error.why})
             raise
         if frm is not None:  # a known-bad first edge skipped is no retry
-            log({"event": "edge-retry", "host": host, "from": frm, "to": second, "why": why, "ok": True})
-        self.local.ip = second
+            log({"event": "edge-retry", "host": host, "from": frm, "to": to, "why": why, "ok": True})
+        self.local.ip = to
         return sock
 
 
@@ -1801,13 +1817,15 @@ def http(method: str, url: str, headers: dict[str, str], body: bytes | None = No
             edge = EDGE.last_ip()
             if edge is not None and edge_refused(answer[0], answer[1]):
                 # The edge's own 403 (no rate-limit headers): GitHub never saw the request. Once more, elsewhere.
+                # With no other edge known, the edge's 403 is the answer, as before.
                 EDGE.mark_bad(edge)
-                EDGE.local.ip = None
-                try:
-                    answer = once()
-                finally:
-                    log({"event": "edge-retry", "host": urllib.parse.urlsplit(url).hostname, "from": edge,
-                         "to": EDGE.last_ip(), "why": "edge-403", "ok": EDGE.last_ip() is not None})
+                if EDGE.candidates(urllib.parse.urlsplit(url).hostname or "", {edge}):
+                    EDGE.local.ip = None
+                    try:
+                        answer = once()
+                    finally:
+                        log({"event": "edge-retry", "host": urllib.parse.urlsplit(url).hostname, "from": edge,
+                             "to": EDGE.last_ip(), "why": "edge-403", "ok": EDGE.last_ip() is not None})
             return answer
     except (OSError, HTTPException, ValueError) as error:  # DeadlineTimeout is a TimeoutError, an OSError
         raise WatchError(f"request failed: {type(error).__name__}") from None
