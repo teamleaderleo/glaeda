@@ -17539,7 +17539,7 @@ class LandTest(Base):
         self.assertEqual((e["state"], self.w.gh_calls("run", "rerun"), self.w.gh_calls("api")), ("stopped", [], []))
         self.assertIn("has no inert-path rule", json.dumps(e["history"]))
 
-    def test_the_cmux_rust_workspaces_rule(self):
+    def test_the_rust_workspaces_rule(self):
         rule = gg.land_unrelated_rule("Manaflow-AI/cmux", "rust workspaces")
         inert = {"webviews/src/x.tsx": True, "docs/a/b.md": True, "scripts/ci/react-doctor-baseline.json": True,
                  "scripts/measure/first-load-after-restart.sh": True, "scripts/ci/init-submodule.sh": False,
