@@ -8932,7 +8932,7 @@ class StarvedReserveTest(unittest.TestCase):
         free = 5 + self.need - 1
         self.assertEqual(hook.mini_full(capacity, 14, side, 5),
                          f"only {free} of 14 capacity units on this mini are free; its next job needs 5 and "
-                         f"{self.need} are {hook.STARVED_NOTE}")
+                         f"{self.need} {'is' if self.need == 1 else 'are'} {hook.STARVED_NOTE}")
         self.assertIn(hook.STARVED_NOTE, hook.mini_full(capacity, 14, hook.RunnerScope(14, 2, 2, gui=True), 5) or "")
         self.assertIsNone(hook.mini_full(capacity, 14, hook.RunnerScope(14, 2, 2, root=True)),
                           "a root runner takes the starved job: the hold is its room")
