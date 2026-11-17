@@ -10419,7 +10419,9 @@ class GateTest(unittest.TestCase):
     def workers(self, *runners: str) -> dict[int, tuple[int, str]]:
         """A process table with a Runner.Worker of each named runner install beside self.runner, plus noise that is no
         job of this host's runners: a listener, and a Worker of a runner install outside this home."""
-        table = {100 + i: (1, f"{self.tmp}/{name}/bin/Runner.Worker spawnclient 1 2") for i, name in enumerate(runners)}
+        # a runner that updated itself runs its Worker from bin.<version>/
+        table = {100 + i: (1, f"{self.tmp}/{name}/bin{'.2.329.0' if i % 2 else ''}/Runner.Worker spawnclient 1 2")
+                 for i, name in enumerate(runners)}
         table[90] = (1, f"{self.tmp}/actions-runner-glaeda-2/bin/Runner.Listener run --startuptype service")
         table[91] = (1, "/home/runner/actions-runner/cached/bin/Runner.Worker spawnclient 3 4")
         return table
@@ -10444,7 +10446,7 @@ class GateTest(unittest.TestCase):
             why = gate.low_disk()
             self.assertIn("RUNNER_JOBS_DISK", why or "", "two jobs in flight (its own Worker and others' are not)")
             self.assertIn("25.0 GiB free, 25.9 GiB required: 10 GiB + 5.3 GiB for each of 2 runner jobs in flight "
-                          "and this one", why or "")
+                          "(or listening first) and this one", why or "")
             self.assertIn("the p95 of 11438 jobs, 2026-11-02..2026-11-15", why or "")
             self.assertEqual(cleanup.call_args.args[1], 30.0, "cleanup aims at the floor, over the need")
             self.assertIn("RUNNER_JOBS_DISK", gate.claimed() or "", "an idle look holds the listener")
@@ -10470,6 +10472,39 @@ class GateTest(unittest.TestCase):
             disk = self.runner_job_disk_file(5.3)
             ps.side_effect = subprocess.TimeoutExpired("ps", 30)
             self.assertIsNone(gate.low_disk(), "no process table: the one-job hold alone")
+
+    def test_a_burst_at_several_idle_listeners_is_admitted_only_while_it_fits(self) -> None:
+        """Every idle listener counts the idle listeners that sort before it, so three idle runners at 26 GiB with
+        nothing running take at most two jobs together (10 + 5.3 x 2 = 20.6 fits, 10 + 5.3 x 3 = 25.9 does not)."""
+        names = ["actions-runner-glaeda-1", "actions-runner-glaeda-2", "actions-runner-glaeda-3"]
+        for name in names:
+            write_hook(self.tmp / name, "exec python3 /hook job-started --min-free-gib 30 --capacity-units 14\n")
+        disk = self.runner_job_disk_file(5.3)
+        table = {200 + i: (1, f"{self.tmp}/{name}/bin/Runner.Listener run --startuptype service")
+                 for i, name in enumerate(names)}
+        answers = {}
+        with mock.patch.object(hook.shutil, "disk_usage", return_value=mock.Mock(free=int(25.0 * 1024**3))), \
+                mock.patch.object(hook, "processes", return_value=table), \
+                mock.patch.dict(os.environ, {hook.DISK_JOB_PEAK_ENV: "20", hook.RUNNER_JOB_DISK_ENV: os.fspath(disk)}):
+            for name in names:
+                gate = hook.Gate(self.tmp / name, os.fspath(self.lock), os.fspath(self.tmp / "none.json"), self.state)
+                with mock.patch.object(gate, "evict_in_background"):
+                    answers[name] = gate.low_disk()
+        self.assertIsNone(answers[names[0]], "the first counts nobody before it: 15.3 GiB")
+        self.assertIsNone(answers[names[1]], "the second counts the first: 20.6 GiB")
+        self.assertIn("25.9 GiB required", answers[names[2]] or "", "the third would not fit beside them")
+
+    def test_an_installed_hook_reads_the_staged_runner_job_disk(self) -> None:
+        """The hook runs from ~/actions-runner-glaeda-K/glaeda-hooks/; the json is the staged runner copy in
+        ~/glaeda-runner/scripts."""
+        hooks = self.tmp / "actions-runner-glaeda-2/glaeda-hooks"
+        hooks.mkdir(parents=True)
+        staged = self.tmp / "glaeda-runner/scripts" / hook.RUNNER_JOB_DISK_NAME
+        staged.parent.mkdir(parents=True)
+        staged.write_text("{}")
+        with mock.patch.dict(hook.__dict__, {"__file__": os.fspath(hooks / "glaeda-cmux-runner-hook")}), \
+                mock.patch.dict(os.environ, {hook.RUNNER_JOB_DISK_ENV: ""}):
+            self.assertEqual(hook.staged_data_path(hook.RUNNER_JOB_DISK_NAME, hook.RUNNER_JOB_DISK_ENV), staged)
 
     def test_the_jobs_in_flight_hold_never_stops_a_running_job(self) -> None:
         """Busy, never failed: a runner with a job keeps it whatever the jobs beside it leave free."""

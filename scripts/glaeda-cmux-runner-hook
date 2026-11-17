@@ -1222,6 +1222,8 @@ def listener_disk_peak(scope: "RunnerScope") -> tuple[float, str]:
 # cmux17, cmux21 and cmux22). An idle pool runner's listener is held while free disk is under RUNNER_JOBS_FLOOR_GIB
 # plus one runner job's measured p95 disk for each job in flight on the host and for the one it would take: held, it
 # takes nothing and the job waits or goes to a runner with room. Slower, never failed: job-started admits as before.
+# An idle listener that sorts before this one counts as a job too (runner_jobs_in_flight), so a burst of jobs arriving
+# at several idle listeners together is admitted only while all of them fit.
 # The per-job value is RUNNER_JOB_DISK_NAME's disk_gib_p95, a byte copy of cmuxterm-hq build-fleet/runner-job-disk.json
 # (data/job_needs.py writes it from job-needs.json's all.disk_gib_p95; the controller's runner_disk.go reserves the same
 # value per PR job on a lent host, the twin of this rule). Copy hq's file over it to refresh it; a missing, unreadable
@@ -1270,18 +1272,26 @@ def runner_job_disk(path: Path | None = None) -> tuple[float | None, str]:
 def runner_dirs(home: Path) -> list[Path]:
     """Every runner install in home (~/actions-runner*, pool and dedicated): the most jobs it can run at once."""
     try:
-        return [d for d in home.glob("actions-runner*") if d.is_dir() and not d.is_symlink()]
+        return [d for d in home.glob("actions-runner*") if d.is_dir()]
     except OSError:
         return []
 
 
 def runner_jobs_in_flight(home: Path, own: Path, table: dict[int, tuple[int, str]]) -> int:
-    """The runner jobs running on this host: a Runner.Worker of any runner install in home other than own (the idle
-    runner asking), from a process table (processes())."""
-    pattern = re.compile(r"(?:^|\s)" + re.escape(os.fspath(home)) +
-                         r"/(actions-runner[^/\s]*)/bin(?:\.[^/\s]+)?/Runner\.Worker(?:\s|$)")
-    return sum(1 for _ppid, command in table.values()
-               if (match := pattern.search(command)) and match.group(1) != own.name)
+    """The runner jobs this idle runner must leave room for, from a process table (processes()): a Runner.Worker of
+    any runner install in home other than own (a job running), and each other install there that listens with no
+    Worker and sorts before own (an idle listener that may take a job in the same burst: every idle listener counts
+    the ones before it, so a burst of N jobs is admitted only while N jobs' disk is free, not N times one job's)."""
+    prefix = r"(?:^|\s)" + re.escape(os.fspath(home)) + r"/(actions-runner[^/\s]*)/bin(?:\.[^/\s]+)?/Runner\."
+    workers, listeners = set(), set()
+    count = 0
+    for _ppid, command in table.values():
+        if (match := re.search(prefix + r"Worker(?:\s|$)", command)) and match.group(1) != own.name:
+            workers.add(match.group(1))
+            count += 1
+        elif (match := re.search(prefix + r"Listener(?:\s|$)", command)) and match.group(1) != own.name:
+            listeners.add(match.group(1))
+    return count + sum(1 for name in listeners - workers if name < own.name)
 
 
 def runner_jobs_need_gib(in_flight: int, per_job_gib: float) -> float:
@@ -1295,7 +1305,7 @@ def runner_jobs_refusal(free: float, in_flight: int, per_job_gib: float, source:
     if free >= need:
         return None
     return (f"{free:.1f} GiB free, {need:g} GiB required: {RUNNER_JOBS_FLOOR_GIB:g} GiB + {per_job_gib:g} GiB "
-            f"for each of {in_flight} runner job{'s' if in_flight != 1 else ''} in flight and this one "
+            f"for each of {in_flight} runner job{'s' if in_flight != 1 else ''} in flight (or listening first) and this one "
             f"({RUNNER_JOB_DISK_NAME}: {source})")
 
 

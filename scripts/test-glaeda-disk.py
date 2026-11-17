@@ -12059,7 +12059,7 @@ class HostReservationTest(unittest.TestCase):
             self.assertTrue(gd.controller_worker_host(), "the lent worker is loaded")
         with mock.patch.object(gd, "DARWIN", True), mock.patch.object(gd.Path, "exists", return_value=False), \
                 mock.patch.object(gd.subprocess, "run", return_value=mock.Mock(returncode=5)):
-            self.assertTrue(gd.controller_worker_host(), "launchctl failed otherwise: not proven absent")
+            self.assertFalse(gd.controller_worker_host(), "launchctl refused this user and no plist is installed")
         with mock.patch.object(gd, "DARWIN", True), mock.patch.object(gd.Path, "exists", return_value=False), \
                 mock.patch.object(gd.subprocess, "run", side_effect=subprocess.TimeoutExpired("launchctl", 10)):
             self.assertTrue(gd.controller_worker_host(), "launchctl hung: not proven absent")

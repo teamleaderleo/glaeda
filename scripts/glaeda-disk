@@ -1001,7 +1001,7 @@ CMUX_NEXT_DRAIN_HOOK_SHA256 = frozenset({
     "1f4d528d5e8fd2687d4ba6972acad4b3a913c614ec37c1031a36ef0c51530426",
     "9d48941838658210beb6c3368ba830d514996b044e7d9215b8e6236f79a9e6b0",
     "a44fdb3563a9b0b6338bfbec0428cf36b06b92c5a659b2e3756f39c9c9a8783f",
-    "be1ed2a3f8540a5958b3b842c4e52fa1ae5496632beacddaa563bfa8d9028470",
+    "0cc3fe0fdf60a2a0fbc3b6c29596d1a23c03a5eec33b0b58a212781944d7cb10",
 })
 CMUX_NEXT_CI_PRESERVED_NAMES = frozenset({
     "SourcePackages", "ModuleCache.noindex", "SDKStatCaches.noindex",
@@ -9503,8 +9503,9 @@ def _str_list(value: Any, what: str) -> list[str]:
 
 def controller_worker_host() -> bool:
     """Whether a cmuxterm-hq controller worker (HQ_BUILD_WORKERS) runs, or may run, on this host: its LaunchDaemon
-    plist is there, or launchctl knows the service. False only on macOS when every one is proven absent (no plist and
-    launchctl's 113, "could not find service"); off macOS, or when launchctl fails or hangs, True (fail-safe)."""
+    plist is there, or launchctl prints the service. False only on macOS when no plist is there and launchctl does not
+    print one (113, "could not find service", or a refusal to a user who may not read the system domain: the
+    installed plist is then the evidence); off macOS, or when launchctl cannot run or hangs, True (fail-safe)."""
     if not DARWIN:
         return True
     for job in HQ_BUILD_WORKERS:
@@ -9512,7 +9513,7 @@ def controller_worker_host() -> bool:
         try:
             if Path("/Library/LaunchDaemons", f"{label}.plist").exists():
                 return True
-            if subprocess.run(["launchctl", "print", job], capture_output=True, timeout=10).returncode != 113:
+            if subprocess.run(["launchctl", "print", job], capture_output=True, timeout=10).returncode == 0:
                 return True
         except (OSError, subprocess.SubprocessError):
             return True
