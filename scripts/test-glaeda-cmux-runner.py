@@ -3752,7 +3752,7 @@ class HookTest(unittest.TestCase):
                          ("simulator-step", False))
         self.assertEqual(hook.job_class("walk", "manaflow-ai/cmux", workflow="ios-review-gate.yml"),
                          ("simulator-step", False))
-        for job, env in (("mobile-core-package", test_ios),
+        for job, env in (("ios-simulator-build", test_ios), ("mobile-core-package", test_ios),
                          ("release-compile", self.FAST_TIER), ("ios", self.FAST_TIER)):
             with self.subTest(job=job):
                 try:
@@ -3761,12 +3761,13 @@ class HookTest(unittest.TestCase):
                     self.assertIn("refused: the sim-first runner takes only simulator jobs", started.stdout)
                 finally:
                     self.finish("sr")
-        # ios-simulator-build boots the simulator to run its tests (SIM_SLOTS): a simulator job the runner takes
-        for job, env, klass in (("ios-simulator", test_ios, "simulator"), ("ios-simulator-build", test_ios, "simulator"),
-                                ("ios", matrix, "simulator-step")):
+        # SIM_SLOT_JOBS: above one sim slot ios-simulator-build is a simulator job the runner takes
+        for job, env, klass, slots in (("ios-simulator", test_ios, "simulator", "1"),
+                                       ("ios-simulator-build", test_ios, "simulator", "2"),
+                                       ("ios", matrix, "simulator-step", "1")):
             with self.subTest(job=job):
                 try:
-                    ok = self.job(job, "sr", 14, None, "--sim-runner", env=env)
+                    ok = self.job(job, "sr", 14, None, "--sim-runner", "--sim-slots", slots, env=env)
                     self.assertEqual(ok.returncode, 0, ok.stdout + ok.stderr)
                     self.assertIn(f"for {job} ({klass}", ok.stdout)
                 finally:
@@ -4793,15 +4794,10 @@ class HookTest(unittest.TestCase):
         ios = {"GITHUB_WORKFLOW_REF": "manaflow-ai/cmux/.github/workflows/test-ios.yml@refs/heads/main"}
         try:
             self.assertIn("persistent-dd+root-1", self.job("macos-compile-admission", "i0", 12).stdout)
-            result = self.job("mobile-core-package", "i1", 12, None, env=ios)
-            self.assertEqual(result.returncode, 0, result.stdout)
-            self.assertIn("holding 3/12 units for mobile-core-package (isolated", result.stdout)
-            # SIM_SLOTS: ios-simulator-build boots the simulator for its tests, so it holds the token like one
-            build = self.job("ios-simulator-build", "i2", 12, None, env=ios)
-            self.assertEqual(build.returncode, 0, build.stdout)
-            self.assertIn("holding 3/12 units+simulator for ios-simulator-build (simulator", build.stdout)
-            self.assertIn("GLAEDA_SIM_SLOT=0", build.stdout)
-            self.finish("i2")
+            for n, job in enumerate(("ios-simulator-build", "mobile-core-package")):
+                result = self.job(job, f"i{n + 1}", 12, None, env=ios)
+                self.assertEqual(result.returncode, 0, result.stdout)
+                self.assertIn(f"holding 3/12 units for {job} (isolated", result.stdout)
             sim = self.job("ios-simulator", "i3", 12)
             self.assertIn("1/12 units+simulator for ios-simulator (simulator", sim.stdout)
             waited = time.monotonic()
@@ -14337,11 +14333,17 @@ class RunnerTest(unittest.TestCase):
     def test_sim_slots_reach_every_runner_hook_on_a_simulator_mini(self) -> None:
         """SIM_SLOTS: runner.classes.<class>.simSlots becomes --sim-slots on every instance's hook (the ledger is the
         mini's, so they agree), only on a member with the simulator role; 1, the default, passes nothing."""
-        base = {"runners": 3, "capacityUnits": 14, "simRunners": 1}
+        base = {"runners": 3, "capacityUnits": 14, "simRunners": 1, "guiRunners": 1}
         with mock.patch.object(cr, "ios_sim_present", return_value=True):
-            _, today = self.fast_labels(base, "slots-today", ios_sim=True)
-            _, hooks = self.fast_labels({**base, "simSlots": 2}, "slots-2", ios_sim=True)
+            today_labels, today = self.fast_labels(base, "slots-today", ios_sim=True)
+            labels, hooks = self.fast_labels({**base, "simSlots": 2}, "slots-2", ios_sim=True)
         self.assertTrue(all("--sim-slots" not in text for text in today), "the default passes nothing")
+        # cmux#44908: the picker learns the slot count from glaeda-sim-slots-<N>, on the glaeda-ios-sim runners and
+        # the sim-first runner only (instance 2 is the gui runner); none at 1
+        self.assertFalse(any(label.startswith("glaeda-sim-slots-") for row in today_labels for label in row))
+        self.assertEqual(["glaeda-sim-slots-2" in row for row in labels], [True, True, False, True])
+        self.assertEqual(["glaeda-ios-sim" in row for row in labels], [True, True, False, False])
+        self.assertEqual(fleet_labels.sim_slots_label(3), "glaeda-sim-slots-3")
         self.assertEqual(len(hooks), 4)
         self.assertTrue(all(" --sim-slots 2 " in text for text in hooks), hooks)
         self.assertEqual(hook.runner_scope(self.fast_home / "actions-runner-glaeda-3").sim_slots, 2)
@@ -17600,8 +17602,9 @@ class SimSlotsTest(unittest.TestCase):
         hook._NEEDS_CACHE.clear()
         self.addCleanup(hook._NEEDS_CACHE.clear)
         # a quiet 10-core, 32 GiB host with no needs file and the RAM ledger off (the default)
-        self.load, self.pressure = 1.0, 1
-        for name, value in (("load_1min", lambda: self.load), ("memory_pressure_level", lambda: self.pressure)):
+        self.load, self.pressure, self.swap = 1.0, 1, (0, 1 << 30)
+        for name, value in (("load_1min", lambda: self.load), ("memory_pressure_level", lambda: self.pressure),
+                            ("swap_usage", lambda: self.swap)):
             patcher = mock.patch.object(hook, name, side_effect=value)
             patcher.start()
             self.addCleanup(patcher.stop)
@@ -17671,7 +17674,11 @@ class SimSlotsTest(unittest.TestCase):
         self.assertIn("simulator-1 needs headroom: memory pressure level 2 >= 2", why)
         self.pressure = 4
         self.assertIn("memory pressure level 4", self.take(slots=2)[1])
-        self.pressure = None  # unreadable: holds nothing, as the gate fails open
+        self.pressure, self.swap = 1, ((2 << 30) // 5, 2 << 30)
+        self.assertIn("simulator-1 needs headroom: swap 20% used (0.4 of 2.0 GiB) >= 10%", self.take(slots=2)[1])
+        self.swap = (5 << 20, 0)  # no swap file yet: no term
+        self.assertIsNone(hook.sim_copy_room(1, 0, 0))
+        self.pressure, self.swap = None, None  # unreadable: holds nothing, as the gate fails open
         ok, why = self.take(slots=2)
         self.assertTrue(ok, why)
         self.assertIn("units+simulator-1 for", why)
@@ -17752,14 +17759,38 @@ class SimSlotsTest(unittest.TestCase):
             script.write_text(f"exec python3 /hook job-started {text}")
             self.assertEqual(hook.runner_scope(runner).sim_slots, slots, text)
 
-    def test_ios_simulator_build_is_a_simulator_job_at_its_own_cost(self) -> None:
+    def test_parse_swap_usage_reads_what_the_worker_reads(self) -> None:
+        self.assertEqual(hook.parse_swap_usage("total = 2048.00M  used = 1003.25M  free = 1044.75M  (encrypted)"),
+                         (int(1003.25 * (1 << 20)), 2048 << 20))
+        self.assertEqual(hook.parse_swap_usage("total = 3.00G  used = 512.00K  free = 2.99G"),
+                         (512 << 10, 3 << 30))
+        self.assertEqual(hook.parse_swap_usage("total = 0.00M  used = 0.00M  free = 0.00M"), (0, 0))
+        for text in ("", "sysctl: unknown oid 'vm.swapusage'", "total = 2048.00M"):
+            self.assertIsNone(hook.parse_swap_usage(text), text)
+
+    def test_ios_simulator_build_is_a_simulator_job_only_above_one_slot(self) -> None:
+        """One slot keeps ios-simulator-build isolated (up to 3 at once per mini, as today, so its queue does not
+        grow); above one it takes a token copy and its slot, at its own cost."""
         self.assertEqual(hook.job_class("ios-simulator-build", hook.DEFAULT_HOME_REPO, workflow="test-ios.yml"),
-                         ("simulator", False))
-        self.assertIn("simulator", hook.SIM_FIRST_CLASSES, "so the sim-first runner takes it")
-        self.assertEqual(hook.job_units("simulator", "ios-simulator-build", hook.DEFAULT_HOME_REPO,
-                                        workflow="test-ios.yml"), 3, "JOB_CORES, not the class's 1")
-        self.assertEqual(hook.job_class("mobile-core-package", hook.DEFAULT_HOME_REPO, workflow="test-ios.yml"),
-                         ("isolated", False), "no simulator there")
+                         ("isolated", False))
+        self.assertEqual(hook.job_class("ios-simulator-build", hook.DEFAULT_HOME_REPO, workflow="test-ios.yml",
+                                        sim_slots=2), ("simulator", False))
+        self.assertEqual(hook.job_class("mobile-core-package", hook.DEFAULT_HOME_REPO, workflow="test-ios.yml",
+                                        sim_slots=2), ("isolated", False), "no simulator there")
+        for n in range(3):  # one slot: three at once, no token
+            ok, why = self.take("ios-simulator-build")
+            self.assertTrue(ok, why)
+            self.assertIn("holding 3/10 units for ios-simulator-build (isolated", why)
+        self.assertEqual(self.slot_env(), [], "an isolated job is told no slot")
+        self.assertTrue(hook.probe(self.capacity / "simulator.token"))
+        hook.close_all(self.held)
+        self.held.clear()
+        ok, why = self.take("ios-simulator-build", slots=2)
+        self.assertTrue(ok, why)
+        self.assertIn("holding 3/10 units+simulator for ios-simulator-build (simulator", why)
+        self.assertEqual(self.slot_env(), ["GLAEDA_SIM_SLOT=0"])
+        ok, why = self.take("ios-simulator-build", slots=2)
+        self.assertIn("units+simulator-1 for ios-simulator-build", why)
 
     def test_the_bound_is_one_number_across_the_tools(self) -> None:
         self.assertEqual(hook.MAX_SIM_SLOTS, fleet_labels.MAX_SIM_SLOTS)

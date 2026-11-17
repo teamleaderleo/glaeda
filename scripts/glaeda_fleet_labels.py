@@ -388,6 +388,16 @@ def sim_label(version: str) -> str:
     return f"glaeda-{SIM_PREFIX}-xcode-{version}"
 
 
+SIM_SLOTS_LABEL_PREFIX = "glaeda-sim-slots-"
+
+
+def sim_slots_label(slots: int) -> str:
+    """glaeda-sim-slots-<N>: a simulator mini's slot count (simSlots above 1), on its glaeda-ios-sim runners and its
+    sim-first runner. cmux's picker (scripts/ci/ios_runner_pool.py, cmux#44908) reads it to learn how many simulator
+    jobs the mini runs at once, and routes test-ios to the sim-first runner only where it is. None at 1."""
+    return f"{SIM_SLOTS_LABEL_PREFIX}{slots}"
+
+
 def _role_label(pool: str, role: str) -> str:
     """Insert a runner role after an optional pool namespace and before class metadata."""
     parts = pool.split("-")
@@ -592,6 +602,8 @@ def member_labels(manifest: Any, member: str, xcode_ok: Callable[[dict[str, Any]
     if not (isinstance(sim_slots, int) and not isinstance(sim_slots, bool) and 1 <= sim_slots <= MAX_SIM_SLOTS):
         return None, f"runner.classes.{klass}.simSlots must be 1 to {MAX_SIM_SLOTS}"
     sim_slots = sim_slots if ios_sim else 1  # a class default, read the same way as simRunners
+    if sim_slots > 1:  # cmux#44908: the picker learns the slot count from this label
+        labels.append(sim_slots_label(sim_slots))
     if sim and (trusted_ref is not None or availability != "dedicated" or normal_pool_prefix):
         return None, (f"{member} runner.classes.{klass}.simRunners needs a dedicated runner without trustedRef "
                       "(a sim-first runner takes pull request jobs) in the default pool namespace (no poolPrefix)")

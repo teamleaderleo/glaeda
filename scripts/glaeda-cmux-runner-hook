@@ -371,14 +371,11 @@ JOB_CLASSES = {"macos-compile-admission": "compile", "app-host-unit-tests": "gui
                # iOS (test-ios, ios-screenshots; runs-on glaeda-ios-sim): builds into their own DerivedData or
                # SwiftPM .build, never /private/tmp/cmux-ci, so no canonical root. Simulator jobs reuse, erase and
                # boot named devices in the user's one CoreSimulator service, so each holds a simulator token copy
-               # (SIM_SLOTS: one per mini by default). ios-simulator-build is one of them: it builds, then boots the
-               # mini's simulator and runs its tests there. As isolated it took no token, so up to 3 ran at once on
-               # one mini sharing one device, and the sim-first runner refused it; its 399 runs on the 3 sim minis
-               # (hq build-fleet jobs.csv, 2026-11-13..15) ran 2.7 min p50 and queued 16 / 24.5 min p50 / p90,
-               # against 1.6 min for mobile-core-package beside it. Its cost stays its own measured need (JOB_CORES,
-               # job_need). ios-streamed-validate's `validate` is not listed: fixed ports, GUI session changes and
-               # secrets in $HOME keep it on Blacksmith (docs/CMUX_MINI_RUNNER.md 2g).
-               "mobile-core-package": "isolated", "ios-simulator-build": "simulator",
+               # (SIM_SLOTS: one per mini by default). ios-simulator-build stays isolated here; on a mini with more
+               # than one sim slot it is a simulator job (SIM_SLOT_JOBS). ios-streamed-validate's `validate` is not
+               # listed: fixed ports, GUI session changes and secrets in $HOME keep it on Blacksmith
+               # (docs/CMUX_MINI_RUNNER.md 2g).
+               "mobile-core-package": "isolated", "ios-simulator-build": "isolated",
                "ios-simulator": "simulator", "screenshots": "simulator",
                # ci-macos.yml release-build: an unsigned universal Release into its own workspace DerivedData,
                # never /private/tmp/cmux-ci*; no GUI, product or secrets (audit in cmux#14417). It runs
@@ -734,7 +731,7 @@ JOB_CORES: dict[tuple[str, ...], int] = {
     ("cmux-tui.yml", "build"): 2,  # isolated: 475, 1.36/1.46/1.53
     ("cmux-tui.yml", "macos-relay"): 3,  # isolated: 125, 1.75/2.07/2.60
     ("cmux-tui.yml", "lint"): 3,  # isolated: 56, 1.90/2.31/2.66
-    ("test-ios.yml", "ios-simulator-build"): 3,  # simulator since SIM_SLOTS (measured as isolated): 447, 1.67/2.19/2.58
+    ("test-ios.yml", "ios-simulator-build"): 3,  # isolated (simulator above 1 sim slot): 447, 1.67/2.19/2.58
     ("test-ios.yml", "mobile-core-package"): 3,  # isolated: 371, 1.90/2.28/2.65
     ("ci.yml", "cli-regressions"): 1,  # compile (an unknown job): 526, 0.11/0.16/0.27
     ("ci.yml", "swift-package-tests"): 4,  # light: 204, 2.14/3.20/3.99
@@ -1401,9 +1398,19 @@ def slot_capacity_wait(cap: float | None, dev_compile_runner: bool) -> float | N
     return DEV_COMPILE_CAPACITY_WAIT_S if cap is None else min(cap, DEV_COMPILE_CAPACITY_WAIT_S)
 
 
+# SIM_SLOT_JOBS: home jobs that boot the mini's simulator but are isolated on a one-slot mini, and simulator jobs (a
+# token copy, GLAEDA_SIM_SLOT, the sim-first runner's priority) where --sim-slots is above 1. ios-simulator-build
+# builds, then runs its tests in the simulator: as isolated, up to 3 ran at once on a mini sharing one device, and
+# its 399 runs on the 3 sim minis (hq build-fleet jobs.csv, 2026-11-13..15) ran 2.7 min p50 but queued 16 / 24.5 min
+# p50 / p90, against 1.6 min for mobile-core-package beside it. One slot keeps it isolated: the one token would run
+# them one at a time and lengthen that queue. Its cost stays its own measured need (JOB_CORES, job_need).
+SIM_SLOT_JOBS = frozenset({"ios-simulator-build"})
+
+
 def job_class(job: str, repo: str | None, home_repo: str = DEFAULT_HOME_REPO,
-              workflow: str = "") -> tuple[str, bool]:
-    """The job's class and whether it is pinned to /private/tmp/cmux-ci (an unknown job of the home repo)."""
+              workflow: str = "", sim_slots: int = 1) -> tuple[str, bool]:
+    """The job's class and whether it is pinned to /private/tmp/cmux-ci (an unknown job of the home repo). sim_slots:
+    this mini's --sim-slots, which makes a SIM_SLOT_JOBS job a simulator job above 1."""
     if is_guest(repo, home_repo):
         name = job.lower()
         if name.endswith("-sim") or name.endswith("simulator"):
@@ -1411,6 +1418,8 @@ def job_class(job: str, repo: str | None, home_repo: str = DEFAULT_HOME_REPO,
         return ("light" if name.endswith("-light") else "isolated"), False
     if (workflow, job) in WORKFLOW_JOB_CLASSES:
         return WORKFLOW_JOB_CLASSES[(workflow, job)], False
+    if job in SIM_SLOT_JOBS and sim_slots > 1:
+        return "simulator", False
     return JOB_CLASSES.get(job, "compile"), job not in JOB_CLASSES
 
 
@@ -1815,11 +1824,12 @@ def export_root(name: str) -> str:
 # on, its measured RAM chunks must be free, and sim_copy_room applies the fleet's one headroom rule for work past a
 # host's base count (leo-workspace#5539, tools/lane_admission.py headroom_short: the two stay one rule), each refusal
 # naming the term that failed: load1 under SIM_SLOT_LOAD_SHARE of the cores; RAM for one more job of the class's
-# measured size (job_need's rss p90) over the reserve (mem_floor_mib), with the ledger off; and the memory-pressure
-# gate's level under GATE_MEMORY_PRESSURE_HOLD, which stands in for #5539's available-memory and swap terms: this
-# hook reads neither (only hw.memsize and kern.memorystatus_vm_pressure_level, which Darwin raises as free pages run
-# out and compression and swap grow). 1 keeps today's one simulator job per mini exactly.
+# measured size (job_need's rss p90) over the reserve (mem_floor_mib), with the ledger off; swap under
+# SIM_SLOT_SWAP_SHARE used (vm.swapusage, swap_usage); and the memory-pressure gate's level under
+# GATE_MEMORY_PRESSURE_HOLD, which stands in for #5539's available-memory term (Darwin raises it as free pages run
+# out). 1 keeps today's one simulator job per mini exactly.
 SIM_SLOT_LOAD_SHARE = 0.75  # lane_admission LOAD_SHARE
+SIM_SLOT_SWAP_SHARE = 0.10  # lane_admission SWAP_SHARE
 SIM_SLOT_ENV = "GLAEDA_SIM_SLOT"
 SIM_SLOT_FILE = "glaeda-sim-slot"  # $RUNNER_TEMP/glaeda-sim-slot: the copy index alone
 MAX_SIM_SLOTS = 4  # glaeda_fleet_labels.MAX_SIM_SLOTS and glaeda-disk's SIM_TOKEN_COPIES (a test keeps them equal)
@@ -1837,7 +1847,8 @@ def sim_token_names(slots: int) -> list[str]:
 def sim_copy_room(copy: int, mib: int, mem_total: int) -> str | None:
     """The headroom term simulator copy `copy` fails now (SIM_SLOTS, leo-workspace#5539), or None to admit it. Copy 0
     always may (today's one per mini). A later copy runs beside the earlier ones: load1 must be under
-    SIM_SLOT_LOAD_SHARE of the host's cores, the memory-pressure level under GATE_MEMORY_PRESSURE_HOLD, and, with the
+    SIM_SLOT_LOAD_SHARE of the host's cores, the memory-pressure level under GATE_MEMORY_PRESSURE_HOLD, swap under
+    SIM_SLOT_SWAP_SHARE used (no swap file yet holds nothing), and, with the
     RAM ledger off (mem_total 0; on, its chunks decide at take_capacity's RAM step), copy + 1 jobs of the class's
     measured RAM (mib) plus the reserve (mem_floor_mib) must fit the host's RAM. A reading that cannot be taken holds
     nothing, as the gate fails open (host_saturated)."""
@@ -1849,6 +1860,10 @@ def sim_copy_room(copy: int, mib: int, mem_total: int) -> str | None:
     level = memory_pressure_level()
     if level is not None and level >= GATE_MEMORY_PRESSURE_HOLD:
         return f"memory pressure level {level} >= {GATE_MEMORY_PRESSURE_HOLD}"
+    swap = swap_usage()
+    if swap is not None and swap[1] > 0 and swap[0] >= SIM_SLOT_SWAP_SHARE * swap[1]:
+        return (f"swap {100 * swap[0] / swap[1]:.0f}% used ({swap[0] / (1 << 30):.1f} of {swap[1] / (1 << 30):.1f} "
+                f"GiB) >= {SIM_SLOT_SWAP_SHARE:.0%}")
     host = host_mem_mib()
     if not mem_total and host and mib > 0 and (copy + 1) * mib + mem_floor_mib(host) > host:
         return (f"mem {host / 1024:.1f} GiB < {copy + 1} x {mib / 1024:.1f} measured + "
@@ -5826,7 +5841,7 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
     if klass:  # a class given outright (a ci-step, the fast tier, a console skipper admitted as light) costs its own
         pinned, need = False, class_need(klass)
     else:
-        klass, pinned = job_class(job, repo, home_repo, workflow)
+        klass, pinned = job_class(job, repo, home_repo, workflow, sim_slots_of(sim_slots))
         need = job_need(klass, job, repo, home_repo, workflow)
     units, tokens = need.cores, CLASS_COST[klass][1]
     uses_gui = "gui" in tokens
@@ -9732,6 +9747,39 @@ def memory_pressure_level() -> int | None:
         return None
 
 
+SWAP_USAGE_KEY = "vm.swapusage"
+# "total = 2048.00M  used = 1003.25M  free = 1044.75M  (encrypted)": the pattern and units cmuxterm-hq's worker reads
+# (build-fleet/cmd/worker/mem_pressure.go parseSwapUsed), so the two read one number
+SWAP_FIELD = re.compile(r"\b(total|used) = ([0-9.]+)([KMG])")
+SWAP_UNIT = {"K": 1 << 10, "M": 1 << 20, "G": 1 << 30}
+
+
+def parse_swap_usage(text: str) -> tuple[int, int] | None:
+    """(used, total) bytes from `sysctl -n vm.swapusage`, or None when either field is missing or not a number."""
+    fields: dict[str, int] = {}
+    for name, value, unit in SWAP_FIELD.findall(text):
+        try:
+            number = float(value)
+        except ValueError:
+            return None
+        if number < 0:
+            return None
+        fields.setdefault(name, int(number * SWAP_UNIT[unit]))
+    if "used" not in fields or "total" not in fields:
+        return None
+    return fields["used"], fields["total"]
+
+
+def swap_usage() -> tuple[int, int] | None:
+    """Darwin swap (used, total) bytes from vm.swapusage; None off Darwin or when it cannot be read."""
+    try:
+        out = subprocess.run([SYSCTL, "-n", SWAP_USAGE_KEY], stdin=subprocess.DEVNULL, capture_output=True,
+                             text=True, timeout=5, check=False).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return parse_swap_usage(out)
+
+
 def dynamic_release_decision(elapsed: float, low_since: float | None, units: int, total: int,
                              job_cores: float | None, host_busy: float | None, blocked: int,
                              memory: int | None, thermal: bool | None,
@@ -11467,7 +11515,7 @@ def main(argv: list[str] | None = None) -> int:
             # with no limit and idle the runner; refused, it is rescued onto its own pool.
             return refused("the fast runner takes only the fast tier")
         if args.sim_runner and (admit_class or job_class(os.environ.get("GITHUB_JOB", ""), repo, args.home_repo,
-                                                          job_workflow())[0]) not in SIM_FIRST_CLASSES:
+                                                          job_workflow(), args.sim_slots)[0]) not in SIM_FIRST_CLASSES:
             # SIM_FIRST: it listens on a full mini and its job's wait holds the mini's other runners, so any other job
             # here would jump the side lanes; refused, it is rescued onto its own pool.
             return refused("the sim-first runner takes only simulator jobs")
@@ -11498,7 +11546,7 @@ def main(argv: list[str] | None = None) -> int:
             if admit_class == GATEWAY_CLASS:
                 cap = bounded_wait(cap, GATEWAY_CAPACITY_WAIT_S)
             claim_class = admit_class or job_class(os.environ.get("GITHUB_JOB", ""), repo, args.home_repo,
-                                                   job_workflow())[0]
+                                                   job_workflow(), args.sim_slots)[0]
             if claim_class == EXCLUSIVE_CLASS and not is_guest(repo, args.home_repo):
                 hook = hook_sha256()
                 if signing_hook_listed(repo, os.environ.get("GITHUB_SHA"), hook) is False:
