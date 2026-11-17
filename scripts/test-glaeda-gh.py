@@ -5332,6 +5332,24 @@ class FleetBudgetTest(Base):
         gg.REACH_CMD = os.fspath(self.home / "bin" / "absent")
         self.assertIn("unreachable", gg.fetch_host("far", False)["error"])
 
+    def test_the_host_script_finds_gh_quota_where_host_baseline_links_it(self) -> None:
+        """2026-11-17: two hosts had gh-quota only under ~/.local/lib/gh-quota/bin, so `budget` read them as
+        "gh-quota usage gave nothing" and 0 REST while they spent."""
+        link = self.home / ".local/lib/gh-quota/bin/gh-quota"
+        link.parent.mkdir(parents=True)
+        link.write_text('#!/bin/sh\necho \'[{"caller": "session:x", "rest": 762, "graphql": 0}]\'\n',
+                        encoding="utf-8")
+        link.chmod(0o755)
+        env = {k: v for k, v in os.environ.items() if k != "GLAEDA_GH_DIR"}
+        done = subprocess.run(["sh", "-c", gg.FLEET_HOST_SCRIPT], capture_output=True, text=True, timeout=30,
+                              env={**env, "HOME": os.fspath(self.home)})
+        self.assertEqual(gg.parse_host_report(done.stdout)["usage"][0]["rest"], 762)
+        link.unlink()  # neither path: no usage, never an error from the host
+        done = subprocess.run(["sh", "-c", gg.FLEET_HOST_SCRIPT], capture_output=True, text=True, timeout=30,
+                              env={**env, "HOME": os.fspath(self.home)})
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIsNone(gg.parse_host_report(done.stdout)["usage"])
+
     def test_budget_prints_the_fleet_first_and_json_carries_it(self) -> None:
         now = time.time()
         reports = self.reports(now)
@@ -16965,6 +16983,7 @@ class LandWorld:
         self.gh_rc: dict[str, int] = {}
         self.gh_err: dict[str, str] = {}  # a refused step's stderr, by kind (default "<kind> refused")
         self.merged_on_merge = True
+        self.body = ""  # the PR body a `pr view --json body --jq .body` read answers
         self.raise_on: str | None = None
         self.nudged: list[str] = []
         self.refreshed: list[str] = []
@@ -17007,6 +17026,8 @@ class LandWorld:
             return subprocess.CompletedProcess(argv, self.fetch_rc, "", "" if self.fetch_rc == 0 else self.fetch_err)
         if argv[0] == os.fspath(self.gh):
             words = argv[1:]
+            if words[:2] == ["pr", "view"] and words[-4:-2] == ["--json", "body"]:
+                return subprocess.CompletedProcess(argv, 0, self.body + "\n", "")
             if words[:2] == ["pr", "view"]:
                 merged = any(c[1:3] == ["pr", "merge"] and self.gh_rc.get("merge", 0) == 0 for c in self.calls)
                 state = "MERGED" if merged and self.merged_on_merge else "OPEN"
@@ -17703,6 +17724,30 @@ class LandTest(Base):
         self.assertEqual((len(self.w.gh_calls("api")), e["wait"]["kind"]), (2, "pr"))
         self.assertIn("update_deferred", [h["event"] for h in e["history"]])
 
+    def test_a_check_that_never_finishes_never_holds_the_named_update_past_one_wait(self):
+        # cmux#44800 (stale_green) and cmux#45380 (tip_merge), 2026-11-17: each refusal named update-branch, a check
+        # at the head never finished, and every timed-out wait judged again and deferred again: "3 identical refusals
+        # in a row", the update never sent, a person ran it. Now the update waits for running checks once per head.
+        for code in ("stale_green", "tip_merge"):
+            with self.subTest(code=code):
+                shutil.rmtree(gg.land_dir(), ignore_errors=True)
+                self.w = LandWorld(self.tmp.name)
+                self.q = self.queue()
+                self.pr(LA, checks=[("ci", "COMPLETED", "SUCCESS"), ("stuck", "IN_PROGRESS", None)])
+                self.land()
+                e = self.run_hour(lambda: refusal(code, LA, {"kind": "update_branch", "expected_head_sha": LA}),
+                                  seconds=2 * gg.LAND_WAIT_DEFAULT + 120, step=60.0)
+                updates = [c for c in self.w.gh_calls("api") if "update-branch" in " ".join(c)]
+                self.assertEqual((e.get("state"), len(updates)), ("waiting", 1), "the named update is sent once")
+                events = [h["event"] for h in e["history"]]
+                self.assertEqual((events.count("update_deferred"), events.count("judged")), (1, 2))
+                self.assertIn("update_past_stuck", events)
+                # the update's new head is judged afresh (a new streak) and lands
+                self.pr(LB, checks=[("ci", "COMPLETED", "SUCCESS")])
+                self.w.answers[:] = [ok_answer(LB)]
+                self.tick()
+                self.assert_merged_at(LB)
+
     def test_steps_write_as_the_requesters_lane_on_this_host(self):
         # gcp-agent-lane-3, 2026-11-17: lane-gh refused every merge and update-branch "land: lease acquisition requires
         # a lane session" (this queue strips the session keys), so none reached the broker. Every step that writes
@@ -17969,6 +18014,38 @@ class LandTest(Base):
         self.tick(gg.LAND_RETRY_DEFAULT)
         self.assert_merged_at(LA)
 
+    def test_a_changed_hold_claim_line_is_reviewed_again_then_stops_unchanged(self):
+        # cmux#45558, 2026-11-17: its body's Chat-hold line changed after the head's review (the shared-TMPDIR swap
+        # undone), the queue reviews once per head, and the land stopped at chat_hold with the claim never confirmed.
+        chat = lambda: refusal("chat_hold", LA, {"kind": "stop", "stop": "chat_hold"})  # noqa: E731
+        with mock.patch.object(gg.subprocess, "Popen", return_value=mock.Mock()) as popen:
+            self.pr(LA)
+            self.land()
+            self.w.answers.append(chat())
+            e = self.tick()
+            self.assertEqual((e["state"], e["stop"]["code"], popen.call_count), ("stopped", "chat_hold", 0),
+                             "no claim line: the stop stands, no review")
+            # the claim line written after that stop: a land again reviews the head for it
+            self.w.body = "Fixes the pane.\n\nChat-hold: speed\n"
+            self.land()
+            self.w.answers.append(chat())
+            e = self.tick()
+            self.assertEqual((e["state"], e["wait"]["kind"], e["lastAction"]["kind"], popen.call_count),
+                             ("waiting", "comment", "review", 1))
+            self.assertIn("hold_claim_review", [h["event"] for h in e["history"]])
+            # the review's wait ends with the same claim still held: no second review of it, the stop stands
+            self.w.answers.append(chat())
+            e = self.tick(gg.LAND_REVIEW_WAIT + 1)
+            self.assertEqual((e["state"], e["stop"]["code"], popen.call_count), ("stopped", "chat_hold", 1))
+            # the claim line changes again (here to an iOS-hold claim): one more review, for the new line
+            self.w.body = "Fixes the pane.\n\n**iOS-hold:** strict fix\n"
+            self.land()
+            self.w.answers.append(chat())
+            e = self.tick()
+            self.assertEqual((e["state"], e["lastAction"]["kind"], popen.call_count), ("waiting", "review", 2))
+        self.assertEqual(gg.land_hold_claims("x\n> **Chat-hold:**  Speed \r\nCHAT-HOLD: strict fix"),
+                         "chat-hold: speed\nchat-hold: strict fix")
+
     def test_a_review_that_cannot_start_stops_and_is_not_marked_run(self):
         self.pr(LA)
         self.land()
@@ -17976,6 +18053,41 @@ class LandTest(Base):
         with mock.patch.object(gg.subprocess, "Popen", side_effect=OSError("no router-review")):
             e = self.tick()
         self.assertEqual((e["state"], e["stop"]["code"], e["reviewed"]), ("stopped", "review_failed", []))
+
+    def test_router_review_unset_is_found_in_the_workspace_tools_not_only_local_bin(self):
+        # cmux#45626: a host with no ~/.local/bin/router-review link stopped every review with FileNotFoundError.
+        with tempfile.TemporaryDirectory() as d:
+            home = Path(d)
+            tools = home / "Projects/leo-workspace/tools"
+            tools.mkdir(parents=True)
+            rr = tools / "router-review"
+            rr.write_text("#!/bin/sh\n")
+            rr.chmod(0o755)
+            paths = (home / ".local/bin/router-review", home / "deploy/tools/router-review", rr)
+            with mock.patch.object(gg, "LAND_ROUTER_REVIEW_PATHS", paths), \
+                    mock.patch.object(gg.shutil, "which", return_value=None):
+                self.assertEqual(gg.land_router_review({}), (rr, list(paths[:3])))
+                self.assertEqual(gg.land_router_review({"routerReview": "/given/rr"})[0], Path("/given/rr"))
+                rr.unlink()
+                found, tried = gg.land_router_review({})
+                self.assertIsNone(found)
+                self.assertEqual(tried[-1], Path("$PATH/router-review"))
+            with mock.patch.object(gg, "LAND_ROUTER_REVIEW_PATHS", paths), \
+                    mock.patch.object(gg.shutil, "which", return_value="/usr/bin/router-review"):
+                self.assertEqual(gg.land_router_review({})[0], Path("/usr/bin/router-review"))
+
+    def test_no_router_review_anywhere_stops_naming_every_path_and_is_not_marked_run(self):
+        self.pr(LA)
+        self.land()
+        self.q.config_given = {k: v for k, v in self.q.config().items() if k != "routerReview"}
+        self.w.answers.append(refusal("no_ship", LA, {"kind": "review"}))
+        with mock.patch.object(gg, "LAND_ROUTER_REVIEW_PATHS", (Path("/nowhere/router-review"),)), \
+                mock.patch.object(gg.shutil, "which", return_value=None), \
+                mock.patch.object(gg.subprocess, "Popen", side_effect=AssertionError("ran router-review")):
+            e = self.tick()
+        self.assertEqual((e["state"], e["stop"]["code"], e["reviewed"]), ("stopped", "review_failed", []))
+        self.assertIn("/nowhere/router-review", e["stop"]["reason"])
+        self.assertIn("routerReview", e["stop"]["next"])
 
     def test_restart_after_an_interrupted_update_branch_waits_for_the_new_head(self):
         self.pr(LA)

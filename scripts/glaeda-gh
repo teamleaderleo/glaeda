@@ -253,7 +253,8 @@ effect without a restart.
   steps taken per day, which `land status` prints); ~/.config/glaeda/land.json may set gh, mergeHold, acpmux,
   routerReview, python, workers and env. merge_hold.py is mergeHold, else the ws-sync deploy's, else
   ~/Projects/leo-workspace/tools/merge_hold.py; with none of them the land worker refuses to start (land/refused.json,
-  which `land status` prints) and `land` refuses to queue (merge_hold_missing). On a lane VM (an upstream host) the
+  which `land status` prints) and `land` refuses to queue (merge_hold_missing). router-review is routerReview, else
+  the first of ~/.local/bin, the ws-sync deploy's tools/ and the leo-workspace checkout's tools/, else PATH. On a lane VM (an upstream host) the
   worker reads a landing PR itself through the broker when the upstream's copy is over LAND_REFRESH_AFTER old.
   A quota refusal (merge_hold's, or the shim's on the merge) parks the PR until the reset it names plus a 0-120 s
   per-caller jitter, with no read, judge, watch or nudge before it (`land status`: "parked until HH:MMZ (quota)");
@@ -7144,6 +7145,27 @@ def land_merge_hold_missing(tried: list[Path]) -> tuple[str, str]:
     return why, nxt
 
 
+# Where router-review is, in order, after land.json's routerReview: ~/.local/bin (a host that links it there), the
+# ws-sync deploy's tools/, the leo-workspace checkout's tools/, then the daemon's PATH. The first that exists is run.
+# Before, only ~/.local/bin/router-review was tried, and on a host with no such link every review step stopped
+# review_failed with FileNotFoundError (cmux#45626, 2026-11-17).
+LAND_ROUTER_REVIEW_PATHS = (Path.home() / ".local/bin/router-review", LAND_MERGE_HOLD.parent / "router-review",
+                            Path.home() / "Projects/leo-workspace/tools/router-review")
+
+
+def land_router_review(config: dict) -> tuple[Path | None, list[Path]]:
+    """(the router-review to run, or None; every path tried): CONFIG's routerReview as given (a path set by hand is
+    run, and its own failure stops review_failed), else the first of LAND_ROUTER_REVIEW_PATHS that is executable,
+    else router-review on PATH."""
+    given = config.get("routerReview")
+    if isinstance(given, str) and given:
+        return Path(os.path.expanduser(given)), [Path(os.path.expanduser(given))]
+    tried = list(LAND_ROUTER_REVIEW_PATHS)
+    found = next((p for p in tried if p.is_file() and os.access(p, os.X_OK)), None)
+    on_path = None if found else shutil.which("router-review")
+    return (Path(on_path) if on_path else found), tried + ([] if found else [Path("$PATH/router-review")])
+
+
 # The startup check's second half: merge_hold.py found is in a git checkout (on a lane VM, ~/Projects/leo-workspace)
 # that may sit far behind main when nothing deploys it. gcp-codex-lane-12, 2026-11-17: its checkout sat at
 # leo-workspace#5512 while main moved on, and its old merge_hold could not read main's TWINS (after #5580), so every
@@ -7572,6 +7594,19 @@ def land_fetch_shape(argv: Any, repo: str) -> tuple[str, str, str]:
             return "", "", f"lane-gh fetch with an option this queue does not run: {land_trim(pairs, 160)}"
         return "lane-gh", argv[4], ""
     return "", "", f"the fetch step is neither git --git-dir M fetch nor lane-gh fetch: {land_trim(argv[:5], 160)}"
+
+
+# A chat or iOS hold the PR body can claim a release from (leo-workspace hold_fences CHAT_CLAIM and IOS_CLAIM: a line
+# of its own, "Chat-hold: ..." or "iOS-hold: ..."); a review SHIP at the head must confirm the claim it makes.
+LAND_HOLD_CLAIM_STOPS = frozenset({"chat_hold", "ios_hold"})
+LAND_HOLD_CLAIM = re.compile(r"^[ \t>*_-]*(?:Chat|iOS)-hold:[^\n]*$", re.M | re.I)
+LAND_HOLD_BODY_DEADLINE = 30.0
+
+
+def land_hold_claims(body: str) -> str:
+    """BODY's hold claim lines, normalized and in order, joined by newlines: "" when it has none."""
+    found = LAND_HOLD_CLAIM.findall(str(body or "").replace("\r\n", "\n"))
+    return "\n".join(" ".join(re.sub(r"[*_]", "", line).strip(" \t>-").split()).lower() for line in found)
 
 
 def land_fetch_origin(url: str) -> str:
@@ -8587,9 +8622,11 @@ class LandQueue:
         if kind in ("stop", "command"):
             why = act.get("why") or answer.get("reason")
             nxt = " ".join(map(str, act["argv"])) if isinstance(act.get("argv"), list) else act.get("text")
+            cls = str(act.get("stop") or answer.get("code") or kind)
+            if cls in LAND_HOLD_CLAIM_STOPS and self.review_hold_claim(e, head, answer):
+                return
             with self.lock:
-                self.stop(e, str(act.get("stop") or answer.get("code") or kind), land_trim(why),
-                          land_trim(nxt or answer.get("next")))
+                self.stop(e, cls, land_trim(why), land_trim(nxt or answer.get("next")))
             return
         if kind == "merge":
             sha = str(act.get("sha") or head).lower()
@@ -8755,11 +8792,23 @@ class LandQueue:
         checks finished, is the base moving during CI: counted in history as update_again."""
         repo, number = e["repo"], str(e["number"])
         data = (self.cache_of(e["key"]) or {}).get("data") or {}
-        if land_checks_running(data, head):
+        held = e.get("updateDeferred") or {}
+        stuck = held.get("head") == head and self.now - float(held.get("at") or 0) >= LAND_WAIT_DEFAULT
+        if land_checks_running(data, head) and not stuck:
+            # Deferred once per head. A check still running after the whole wait never finishes (stuck, no runner):
+            # deferring again only re-judges it into the identical-refusal stop with the named update never sent
+            # (cmux#44800 stale_green, cmux#45380 tip_merge, 2026-11-17: both stopped, a person updated them).
             with self.lock:
+                if held.get("head") != head:
+                    e["updateDeferred"] = {"head": head, "at": self.now}
                 self.history(e, "update_deferred", head=head[:12], why="checks still running at the head")
                 self.wait_running(e, head, land_fingerprint(self.cache_of(e["key"])))
             return
+        if stuck:
+            with self.lock:
+                self.history(e, "update_past_stuck", head=head[:12],
+                             why=f"checks still running {LAND_WAIT_DEFAULT:.0f} s after the update was deferred")
+        e.pop("updateDeferred", None)
         if head and head == e.get("updatedHead"):
             with self.lock:
                 self.history(e, "update_again", head=head[:12], why="the base moved during this update's CI")
@@ -8848,20 +8897,47 @@ class LandQueue:
         if named == "update_branch":
             self.update_branch(e, sha)
 
-    def do_review(self, e: dict, head: str, answer: dict) -> None:
-        """router-review R N --post, at most once per head (claimed before it starts), detached; then wait for its
-        receipt comment."""
-        repo, number = e["repo"], str(e["number"])
+    def review_hold_claim(self, e: dict, head: str, answer: dict) -> bool:
+        """A chat or iOS hold whose PR body claims a release (a Chat-hold: or iOS-hold: line) passes only with a SHIP
+        at the head confirming that claim, and the queue reviews once per head: a claim written or changed after the
+        head's review was never confirmed, and the entry stopped (cmux#45558, 2026-11-17). Reviews again once per
+        (head, claim lines); True when it did, False to let the stop stand (no claim, the body unread, or reviewed)."""
+        gh = self.gh()
+        if gh is None or not SHA40.fullmatch(head or ""):
+            return False
+        got = self.call([gh, "pr", "view", str(e["number"]), "-R", e["repo"], "--json", "body", "--jq", ".body"],
+                        LAND_HOLD_BODY_DEADLINE, e)
+        claims = land_hold_claims(got.stdout or "") if got.returncode == 0 else ""
+        if not claims:
+            return False
+        key = f"{head}|{hashlib.sha256(claims.encode()).hexdigest()[:12]}"
+        if key in e.get("reviewed", []):
+            return False
         with self.lock:
-            if head in e.setdefault("reviewed", []):
+            self.history(e, "hold_claim_review", head=head[:12], claims=land_trim(claims, 160))
+        self.do_review(e, head, answer, key=key)
+        return True
+
+    def do_review(self, e: dict, head: str, answer: dict, key: str = "") -> None:
+        """router-review R N --post, at most once per head (claimed before it starts), detached; then wait for its
+        receipt comment. KEY (default the head) is what counts as reviewed: review_hold_claim's adds the claim."""
+        repo, number = e["repo"], str(e["number"])
+        key = key or head
+        with self.lock:
+            if key in e.setdefault("reviewed", []):
                 self.history(e, "review_already_run", head=head[:12])
             elif self.gh() is None:
                 self.stop(e, "no_shim", f"no gh-quota shim at {self.path('gh', LAND_GH)}; router-review --post is not "
                           "run around it", f"router-review {repo} {number} --post")
                 return
             else:
-                rr = self.path("routerReview", Path.home() / ".local/bin/router-review")
-                e["reviewed"] = (e["reviewed"] + [head])[-10:]  # saved by the claim: a restart never posts it twice
+                rr, tried = land_router_review(self.config())
+                if rr is None:
+                    self.stop(e, "review_failed", "router-review is not at any of " + ", ".join(map(os.fspath, tried)),
+                              f'set "routerReview" in {LAND_CONFIG} to router-review\'s path, then '
+                              f"router-review {repo} {number} --post")
+                    return
+                e["reviewed"] = (e["reviewed"] + [key])[-10:]  # saved by the claim: a restart never posts it twice
                 self.claim(e, "review", head=head)
                 logs = land_dir() / "logs"
                 logs.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -8872,7 +8948,7 @@ class LandQueue:
                                          close_fds=True, cwd=os.environ.get("HOME") or "/")
                     self.finish(e, None, started=True)
                 except OSError as error:
-                    e["reviewed"] = [h for h in e["reviewed"] if h != head]
+                    e["reviewed"] = [h for h in e["reviewed"] if h != key]
                     self.finish(e, None, error=describe(error))
                     self.stop(e, "review_failed", f"router-review could not start: {describe(error)}",
                               f"router-review {repo} {number} --post")
@@ -11815,11 +11891,18 @@ def spend_lines(spend: Any) -> list[str]:
 # What each host prints for fleet_budget: the files it already keeps and its gh-quota usage, between marker lines.
 # POSIX sh (a Mac's login shell may be zsh; `sh -c` keeps it one dialect). The daemon's state dir is the default one:
 # GLAEDA_GH_DIR is a test's or an operator's override and an ssh session does not carry it.
+# gh-quota is the first of FLEET_GH_QUOTA_PATHS present: a full setup links ~/.local/bin/gh-quota, and a lighter one
+# links ~/.local/lib/gh-quota/bin/gh-quota beside the gh shim. 2026-11-17: two hosts with only the second answered
+# "gh-quota usage gave nothing" and read as 0 REST while one of them alone spent about 760 an hour, so most of the
+# login's hour looked like calls from nowhere.
+FLEET_GH_QUOTA_PATHS = ("$HOME/.local/bin/gh-quota", "$HOME/.local/lib/gh-quota/bin/gh-quota")
 FLEET_HOST_SCRIPT = (
     'd="${GLAEDA_GH_DIR:-$HOME/.cache/glaeda/gh}"; '
     'echo "@@budget"; cat "$d/budget.json" 2>/dev/null; echo; '
     'echo "@@daemon"; cat "$d/daemon.json" 2>/dev/null; echo; '
-    'echo "@@usage"; "$HOME/.local/bin/gh-quota" usage --json 2>/dev/null; echo; '
+    'q=; for c in ' + " ".join(f'"{p}"' for p in FLEET_GH_QUOTA_PATHS) + '; do [ -x "$c" ] && { q="$c"; break; }; '
+    'done; '
+    'echo "@@usage"; [ -n "$q" ] && "$q" usage --json 2>/dev/null; echo; '
     'echo "@@end"')
 
 
