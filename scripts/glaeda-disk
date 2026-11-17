@@ -820,7 +820,11 @@ def artifact_referenced(path: Path, references: frozenset[str]) -> bool:
 # LRU under pressure, keeping what the next job most likely starts from.
 FLEET_CI = Path("/Users/Shared/cmux-build-fleet/ci")
 SEED_SOURCE = "seed-source.json"
-SEED_KEEP = 2  # seed_derived_data.LOCAL_KEEP_LOW_DISK: newest seeds of the current prefix each root keeps
+# The newest seeds of the current prefix each root keeps whatever their age: one (Leo, 2026-11-17: "keep only the
+# current seed, not two"; it was 2, cmux seed_derived_data.py's LOCAL_KEEP_LOW_DISK). An older seed still stays
+# while a job touched it within the idle window (adopt touches the seed it clones), so only one no job started from
+# for IDLE_SEED_HOURS goes, and it comes back from the LAN archive or the bucket.
+SEED_KEEP = 1
 # One age for everything disposable (Leo, 2026-10-26): "When have we ever had something useful greater than 12 hours?
 # I mean, if something stalls, like sure, but why would it stall? If it stalls, it's gonna have to get a rebase
 # anyway." DerivedData, CoreSimulator, package caches, runner work dirs and build dirs go once idle this long. Only
@@ -2624,9 +2628,8 @@ def seed_verdict(path: Path) -> str:
                 current.append((c.stat(follow_symlinks=False).st_mtime, c.name))
             except OSError:
                 continue
-    keep = 1 if ACTIVITY_MODE == "pressure" else SEED_KEEP
-    newest = {name for _, name in sorted(current, reverse=True)[:keep]}
-    return f"one of its root's newest {keep} current seeds" if path.name in newest else ""
+    newest = {name for _, name in sorted(current, reverse=True)[:SEED_KEEP]}
+    return "its root's newest current seed" if path.name in newest else ""
 
 
 WORKTREE_DIRS = ("worktrees", "cmux-worktrees", "glaeda-worktrees")
@@ -12569,6 +12572,21 @@ def dedupe_roots(derived_data: Path) -> list[Path]:
     return [r for r in roots if r.is_dir() and not r.is_symlink()]
 
 
+def cmux_next_ci_input_roots(root: Path) -> list[Path]:
+    """The package and module caches (DEDUPE_SUBDIRS) of every cmux-next state root that dedupe_roots of the
+    <kind> directories does not reach: a dev-daily-release or release-compile state sits at
+    <kind>/<key>/Release/<xcode hash>, three levels down, and each keeps its own SourcePackages like a runner's
+    cmux-scheme/<runner> does. The per-host build root (cmux_next_ci_host_roots) too. One ordinary --dedupe pass
+    over them and the runners' copies stores each identical package file once, whichever tree holds it."""
+    found: list[Path] = []
+    for state in cmux_next_ci_state_roots(root):
+        if state.parent.name != "cmux-scheme":  # cmux-scheme/<runner> is dedupe_roots(cmux-scheme)'s already
+            found += [state / sub for sub in DEDUPE_SUBDIRS]
+    for host in cmux_next_ci_host_roots(root):
+        found += dedupe_roots(host)
+    return [r for r in found if r.is_dir() and not r.is_symlink()]
+
+
 def _file_key(st: os.stat_result) -> list[int]:
     return [st.st_size, st.st_mtime_ns, st.st_ino]
 
@@ -12800,6 +12818,8 @@ def dedupe_xcode(a: argparse.Namespace, bases: list[Path], ci_root: Path) -> Non
     """The Xcode pass: DerivedData's and cmux-next's package and module caches (and, with --dedupe-builds,
     sealed cmux-next Products), files of 1 MiB and up, retried while files are still settling."""
     input_roots = [r for b in bases for r in dedupe_roots(b)]
+    if ci_root in {b.parent for b in bases}:  # the cmux-next cache is a base (never under the runner-cache profile)
+        input_roots += [r for r in cmux_next_ci_input_roots(ci_root) if r not in input_roots]
     passes = [(input_roots, DEDUPE_STATE, a.settle_minutes * 60, None)]
     if a.dedupe_builds:
         # Sealed Products output is opt-in because the normal LaunchAgent can run
