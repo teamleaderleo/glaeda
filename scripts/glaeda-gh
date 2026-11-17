@@ -6962,6 +6962,23 @@ LAND_QUOTA_REFUSAL = re.compile(r"quota: not judged|\[quota: not judged")
 # "until" (the latch SENTENCE). HH:MMZ with no seconds is the end of that minute, as gh_latch reads it.
 LAND_QUOTA_SAID = (re.compile(r"\bno attempt before\s+(\d{2}):(\d{2})(?::(\d{2}))?Z"),
                    re.compile(r"(?:\bretry after|\buntil)\s+(\d{2}):(\d{2})(?::(\d{2}))?Z"))
+# A step merge_hold named that then fails at the same head is never sent again on a short timer. gcp-agent-lane-3,
+# 2026-11-17: explain answered "ok, merge" for cmux#45102 at 43cac146 and the pinned merge failed after it, 27 times
+# in 59 min; cmux#44496's update-branch was refused the same way 30 times in 40 min, and that day's land took explain
+# 1218, update_branch 524 and merge 454 steps for about 12 PRs (session:glaeda-land: REST 963 + GraphQL 1148 an hour).
+# Each "ok" answer cleared the refusal streak, so the merge's own refusal never counted toward a stop, and a refused
+# step was judged again 5 s (merge) or 60 s (update-branch) later. Now a step refused at the same head (step_refused):
+# - takes the step the refusal itself names, when it names one this queue runs: an update-branch (LAND_STEP_NEXT_UPDATE)
+#   or a wait on the PR's checks (LAND_STEP_NEXT_WAIT: an event wait on the daemon's cache, no explain until it moves);
+# - else waits LAND_STEP_BACKOFF, doubling with each identical refusal at that head, at most LAND_STEP_BACKOFF_MAX;
+# - and stops the entry, telling the requester, at the LAND_STEP_STOP-th identical refusal at that head. A new head
+#   starts the count again. An "ok" judgment never clears it: only the step's own success or a new head does.
+LAND_STEP_BACKOFF = 60.0
+LAND_STEP_BACKOFF_MAX = 1800.0
+LAND_STEP_STOP = 6  # 60+120+240+480+960 s of backoff (~31 min) before the 6th identical refusal stops it
+LAND_STEP_NEXT_UPDATE = re.compile(r"\bnext: (?:gh pr update-branch \d+|gh api -X PUT \S*/pulls/\d+/update-branch)")
+LAND_STEP_NEXT_WAIT = re.compile(r"\bnext: glaeda-gh wait pr \S+[^\n;]*?(?:--timeout (\d+))?(?=\s*(?:\(|$|\n|;))")
+LAND_STEP_CODE = re.compile(r"\brefused \[([a-z_]+)")
 LAND_HISTORY = 60
 LAND_KEEP = 7 * 86400  # finished entries are kept this long for `land status`
 LAND_COUNT_DAYS = 30
@@ -7034,11 +7051,38 @@ def land_trim(text: Any, limit: int = LAND_TEXT) -> str:
     return text if len(text) <= limit else text[:limit - 1] + "…"
 
 
+def land_tail(text: Any, limit: int = LAND_TEXT) -> str:
+    """TEXT on one line, its end kept when it is longer than LIMIT (where a refusal's reason and next step are)."""
+    text = " ".join(str(text or "").split())
+    return text if len(text) <= limit else "…" + text[-(limit - 1):]
+
+
 def land_checks_running(data: dict, head: str) -> bool:
     """Whether the cache shows checks still running at HEAD (a pending status counts)."""
     if not data or data.get("state") != "OPEN" or not head or data.get("headRefOid") != head:
         return False
     return any(str(c.get("status") or "").upper() not in ("COMPLETED", "") for c in data.get("checks") or [])
+
+
+def land_step_class(out: str) -> str:
+    """What a refused step's output says, as one identity: merge_hold's refusal code (`refused [code`) when it names
+    one, else the output's last line with numbers and shas folded (a count of commits behind moves with the base)."""
+    found = LAND_STEP_CODE.findall(out or "")
+    if found:
+        return found[-1]
+    lines = [ln.strip() for ln in str(out or "").splitlines() if ln.strip()]
+    return re.sub(r"[0-9a-f]{7,40}|\d+", "#", lines[-1] if lines else "no output")[:120]
+
+
+def land_step_named(out: str) -> dict | None:
+    """The step a refusal's own `next:` names, when it is one the queue runs (update_branch, wait_pr), else None."""
+    text = str(out or "")
+    if LAND_STEP_NEXT_UPDATE.search(text):
+        return {"kind": "update_branch"}
+    wait = LAND_STEP_NEXT_WAIT.search(text)
+    if wait:
+        return {"kind": "wait_pr", "timeout_s": float(wait.group(1)) if wait.group(1) else LAND_WAIT_DEFAULT}
+    return None
 
 
 def land_fingerprint(cache: dict | None) -> str:
@@ -7545,6 +7589,8 @@ class LandQueue:
         if kind == "head_change":
             # After a push-making step: never judge (or pin) a head read before it.
             if head and head != w.get("before"):
+                if (e.get("lastAction") or {}).get("kind") == "update_branch":
+                    e["updatedHead"] = head  # this queue's own base merge made it (update_again)
                 self.wait_running(e, head, fp) if running else self.judge(e, head, fp)
             elif woke:
                 self.history(e, "head_timeout", before=w.get("before"))
@@ -7791,7 +7837,9 @@ class LandQueue:
         a = e.get("action") or {}
         last = {**a, "endedAt": self.now, **fields}
         if got is not None:
-            last.update(exit=got.returncode, out=land_trim((got.stderr or "") + " " + (got.stdout or ""), 300))
+            # the tail: a refusal and its `next:` come last, after merge_hold's notes (cmux#45102's 300-char head
+            # held only notes, so nobody could see why its merge failed 27 times)
+            last.update(exit=got.returncode, out=land_tail((got.stderr or "") + " " + (got.stdout or ""), 600))
         e["lastAction"] = last
         e["action"] = None
         self.history(e, "step", kind=a.get("kind"), exit=None if got is None else got.returncode)
@@ -7835,9 +7883,7 @@ class LandQueue:
                     self.stop(e, "policy", f"update_branch pinned to {sha[:12] or 'nothing'}, not the judged head "
                               f"{head[:12] or '?'}", land_trim(answer.get("next")))
                 return
-            self.push_step(e, "update_branch", sha,
-                           ["api", "-X", "PUT", f"repos/{repo}/pulls/{number}/update-branch", "-f",
-                            f"expected_head_sha={sha}"])
+            self.update_branch(e, sha)
             return
         if kind == "retarget":
             base = str(act.get("base") or "")
@@ -7915,9 +7961,12 @@ class LandQueue:
         with self.lock:
             self.claim(e, kind, before=head, **extra)
         got = self.call([gh, *args], LAND_GH_DEADLINE)
+        named = None
         with self.lock:
             self.finish(e, got)
             e["preStepHead"] = head if got.returncode == 0 else ""
+            if got.returncode == 0:
+                e.pop("stepFail", None)
             if got.returncode == 0 and kind == "update_branch":
                 self.nudge(e["key"])
                 self.wait(e, {"kind": "head_change", "before": head, "since": self.now}, LAND_HEAD_TIMEOUT)
@@ -7925,13 +7974,59 @@ class LandQueue:
                 self.nudge(e["key"])
                 self.wait(e, {"kind": "retry"}, NUDGE_MIN * 3)  # a base change: judged again once the cache reads it
             else:
-                # Refused (the head moved, nothing to update): the next judgment says what now.
-                if self.streak(e, f"{kind}_refused|{head}|{kind}"):
-                    self.stop(e, f"{kind}_refused", f"{kind} refused {LAND_STREAK_STOP} times: "
-                              f"{land_trim(got.stderr or got.stdout)}", "")
-                    return
+                # Refused at this head (moved, nothing to update, or a broker that cannot run this form): the refusal's
+                # own next step, else a backoff that doubles, and a stop at LAND_STEP_STOP (step_refused).
                 self.nudge(e["key"])
-                self.wait(e, {"kind": "retry"}, LAND_RETRY_DEFAULT / 2)
+                named = self.step_refused(e, kind, head, got)
+        if named == "update_branch" and kind != "update_branch":
+            self.update_branch(e, head)
+
+    def update_branch(self, e: dict, head: str) -> None:
+        """The pinned base merge merge_hold (or a refused step) named, unless the head's checks still run: an update
+        while the last one's CI runs only restarts that CI (2026-11-17: 524 update-branch steps in a day). Waits on the
+        cache (an event wait, no explain) instead. An update at a head that an update of this queue made, after its
+        checks finished, is the base moving during CI: counted in history as update_again."""
+        repo, number = e["repo"], str(e["number"])
+        data = (self.cache_of(e["key"]) or {}).get("data") or {}
+        if land_checks_running(data, head):
+            with self.lock:
+                self.history(e, "update_deferred", head=head[:12], why="checks still running at the head")
+                self.wait_running(e, head, land_fingerprint(self.cache_of(e["key"])))
+            return
+        if head and head == e.get("updatedHead"):
+            with self.lock:
+                self.history(e, "update_again", head=head[:12], why="the base moved during this update's CI")
+        self.push_step(e, "update_branch", head,
+                       ["api", "-X", "PUT", f"repos/{repo}/pulls/{number}/update-branch", "-f",
+                        f"expected_head_sha={head}"])
+
+    def step_refused(self, e: dict, kind: str, head: str, got: subprocess.CompletedProcess) -> str | None:
+        """KIND, the step merge_hold named, failed at HEAD (LAND_STEP_BACKOFF's comment). Under the lock. Waits or
+        stops the entry; answers "update_branch" when the refusal names that step and the caller should take it now."""
+        out = f"{got.stderr or ''}\n{got.stdout or ''}"
+        cls = land_step_class(out)
+        sig = f"{kind}|{head}|{cls}"
+        last = e.get("stepFail") or {}
+        n = int(last.get("count") or 0) + 1 if last.get("sig") == sig else 1
+        e["stepFail"] = {"sig": sig, "kind": kind, "head": head, "class": cls, "count": n, "at": self.now}
+        self.history(e, "step_refused", kind=kind, head=head[:12], why=cls, n=n)
+        named = land_step_named(out)
+        if n >= LAND_STEP_STOP:
+            self.stop(e, f"{kind}_refused", f"the {kind} merge_hold named was refused {n} times in a row at "
+                      f"{head[:12]} ({cls}): {land_trim(land_tail(out), 300)}",
+                      land_trim(land_tail(out), 200) if named else "")
+            return None
+        if named and named["kind"] == "update_branch" and kind != "update_branch":
+            self.history(e, "refusal_named", step="update_branch")
+            return "update_branch"
+        if named and named["kind"] == "wait_pr":
+            self.history(e, "refusal_named", step="wait_pr")
+            self.wait(e, {"kind": "pr", "sha": head, "until": "done", "why": f"{kind} refused: its next is a wait"},
+                      land_seconds(named.get("timeout_s"), LAND_WAIT_DEFAULT))
+            return None
+        after = min(LAND_STEP_BACKOFF_MAX, LAND_STEP_BACKOFF * (2 ** (n - 1)))
+        self.wait(e, {"kind": "retry", "why": f"{kind} refused at the same head ({cls}): backoff {after:.0f} s"}, after)
+        return None
 
     def do_merge(self, e: dict, sha: str, answer: dict) -> None:
         if not SHA40.fullmatch(sha):
@@ -7980,11 +8075,9 @@ class LandQueue:
             if got.returncode == 0 and not state:
                 self.wait(e, {"kind": "retry", "why": "merged? the cache will say"}, LAND_RETRY_DEFAULT)
                 return
-            if self.streak(e, f"merge_refused|{sha}|merge"):
-                self.stop(e, "merge_refused", f"the pinned merge was refused {LAND_STREAK_STOP} times: "
-                          f"{land_trim(got.stderr or got.stdout)}", land_trim(answer.get("next")))
-                return
-            self.wait(e, {"kind": "retry", "why": "merge refused"}, 5.0)  # judged again: merge_hold names the step
+            named = self.step_refused(e, "merge", sha, got)
+        if named == "update_branch":
+            self.update_branch(e, sha)
 
     def do_review(self, e: dict, head: str, answer: dict) -> None:
         """router-review R N --post, at most once per head (claimed before it starts), detached; then wait for its

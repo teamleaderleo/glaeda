@@ -16393,6 +16393,7 @@ class LandWorld:
         self.calls: list[list[str]] = []
         self.envs: list[dict] = []
         self.gh_rc: dict[str, int] = {}
+        self.gh_err: dict[str, str] = {}  # a refused step's stderr, by kind (default "<kind> refused")
         self.merged_on_merge = True
         self.raise_on: str | None = None
         self.nudged: list[str] = []
@@ -16433,7 +16434,7 @@ class LandWorld:
             kind = "merge" if words[:2] == ["pr", "merge"] else "update" if "update-branch" in " ".join(words) \
                 else "rerun" if words[:2] == ["run", "rerun"] else "edit" if words[:2] == ["pr", "edit"] else "other"
             rc = self.gh_rc.get(kind, 0)
-            return subprocess.CompletedProcess(argv, rc, "", "" if rc == 0 else f"{kind} refused")
+            return subprocess.CompletedProcess(argv, rc, "", "" if rc == 0 else self.gh_err.get(kind, f"{kind} refused"))
         return subprocess.CompletedProcess(argv, 127, "", "unknown program")
 
     def explains(self) -> list[list[str]]:
@@ -16755,9 +16756,113 @@ class LandTest(Base):
         self.w.gh_rc["merge"] = 1
         self.w.answers += [ok_answer(LA), refusal("block", LA, {"kind": "stop", "stop": "block"})]
         e = self.tick()
-        self.assertEqual((e["state"], e["streak"]["count"]), ("waiting", 1))
+        self.assertEqual((e["state"], e["stepFail"]["count"], e["wakeAt"] - self.t), ("waiting", 1, 60.0))
         e = self.tick(6)
+        self.assertEqual(len(self.w.explains()), 1)  # never re-judged on a short timer
+        e = self.tick(60)
         self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "block"))
+
+    def run_hour(self, answer, seconds: float = 3600.0, step: float = 10.0) -> dict:
+        """Tick for SECONDS, every merge_hold explain answered by ANSWER(): what the loop did."""
+        end = self.t + seconds
+        e: dict = {}
+        while self.t < end:
+            while len(self.w.answers) < 2:
+                self.w.answers.append(answer())
+            e = self.tick(step)
+            if e.get("state") in gg.LAND_DONE:
+                break
+        return e
+
+    def test_ok_then_merge_refused_at_the_same_head_backs_off_and_stops(self):
+        # cmux#45102, 2026-11-17: explain "ok, merge" and the pinned merge refused after it, 27 times in 59 min.
+        self.pr(LA)
+        self.land()
+        self.w.gh_rc["merge"] = 1
+        self.w.gh_err["merge"] = "merge-hold (warn): ... it lands anyway\nGraphQL: Pull request is not mergeable"
+        e = self.run_hour(lambda: ok_answer(LA))
+        merges = len(self.w.gh_calls("pr", "merge"))
+        self.assertEqual((e["state"], e["stop"]["code"], merges, len(self.w.explains())),
+                         ("stopped", "merge_refused", gg.LAND_STEP_STOP, gg.LAND_STEP_STOP))
+        waits = [round(b["at"] - a["at"]) for a, b in zip(
+            [h for h in e["history"] if h["event"] == "step_refused"],
+            [h for h in e["history"] if h["event"] == "judged"][1:])]
+        self.assertEqual(waits, [60, 120, 240, 480, 960])
+        self.assertIn("refused 6 times in a row", self.w.sent()[-1][-1])
+
+    def test_a_new_head_starts_the_count_again(self):
+        self.pr(LA)
+        self.land()
+        self.w.gh_rc["merge"] = 1
+        self.w.answers.append(ok_answer(LA))
+        e = self.tick()
+        self.assertEqual(e["stepFail"]["count"], 1)
+        self.pr(LB)
+        self.w.answers.append(ok_answer(LB))
+        e = self.tick()  # a moved head is judged at once, not after the backoff
+        self.assertEqual((len(self.w.explains()), e["stepFail"]["count"], e["stepFail"]["head"]), (2, 1, LB))
+
+    def test_a_merge_refusal_naming_update_branch_takes_it(self):
+        self.pr(LA)
+        self.land()
+        self.w.gh_rc["merge"] = 1
+        self.w.gh_err["merge"] = ("merge-hold: refused [tip_merge]: the base's checks have not run on this PR merged "
+                                  f"with the tip; next: gh api -X PUT repos/o/r/pulls/1/update-branch -f "
+                                  f"expected_head_sha={LA} (why: guard-why)")
+        self.w.answers.append(ok_answer(LA))
+        e = self.tick()
+        self.assertEqual(self.w.gh_calls("api"), [["api", "-X", "PUT", "repos/o/r/pulls/1/update-branch", "-f",
+                                                   f"expected_head_sha={LA}"]])
+        self.assertEqual((e["wait"]["kind"], len(self.w.explains())), ("head_change", 1))
+
+    def test_a_merge_refusal_naming_a_wait_waits_on_the_cache(self):
+        self.pr(LA)
+        self.land()
+        self.w.gh_rc["merge"] = 1
+        self.w.gh_err["merge"] = ("merge-hold: refused [checks_running]: checks still running; next: glaeda-gh wait "
+                                  f"pr o/r#1 --until done --sha {LA} --timeout 900 (why: guard-why)")
+        self.w.answers.append(ok_answer(LA))
+        e = self.tick()
+        self.assertEqual((e["wait"]["kind"], e["wakeAt"] - self.t), ("pr", 900.0))
+        for _ in range(30):
+            self.tick(20)
+        self.assertEqual(len(self.w.explains()), 1)  # an event wait: nothing re-judges until the cache moves
+        self.pr(LA, checks=[("ci", "COMPLETED", "SUCCESS"), ("other", "COMPLETED", "SUCCESS")])
+        self.w.answers.append(refusal("block", LA, {"kind": "stop", "stop": "block"}))
+        self.tick()
+        self.assertEqual(len(self.w.explains()), 2)
+
+    def test_update_branch_refused_at_the_same_head_backs_off_and_stops(self):
+        # cmux#44496, 2026-11-17: 30 update-branch steps in 40 min, each refused on the lane VM before GitHub.
+        self.pr(LA)
+        self.land()
+        self.w.gh_rc["update"] = 1
+        self.w.gh_err["update"] = "gh: gh api -X PUT: only a media upload goes through the broker."
+        e = self.run_hour(lambda: refusal("stale_green", LA, {"kind": "update_branch", "expected_head_sha": LA}))
+        # The judge's own streak (stale_green, this head, update_branch) is no longer reset by the step's refusal, so
+        # the third identical judgment stops it: two update-branch steps, 60 s apart, not 30.
+        self.assertEqual((e["state"], e["stop"]["code"], len(self.w.gh_calls("api"))), ("stopped", "stale_green", 2))
+        steps = [h["at"] for h in e["history"] if h["event"] == "step"]
+        self.assertEqual(round(steps[1] - steps[0]), 60)
+
+    def test_no_update_branch_while_the_heads_checks_run(self):
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(refusal("tip_merge", LA, {"kind": "update_branch", "expected_head_sha": LA}))
+        self.tick()
+        self.pr(LB, checks=[("ci", "COMPLETED", "SUCCESS")])
+        self.w.answers.append(refusal("tip_merge", LB, {"kind": "update_branch", "expected_head_sha": LB}))
+        e = self.tick()
+        self.assertEqual(len(self.w.gh_calls("api")), 2)
+        self.assertEqual(e["updatedHead"], LB)
+        self.assertIn("update_again", [h["event"] for h in e["history"]])
+        # a woken retry judges while checks run at the head: the update waits for them instead
+        self.pr(LC, checks=[("ci", "IN_PROGRESS", None)])
+        e = self.q.entries[self.KEY]
+        self.w.answers.append(refusal("tip_merge", LC, {"kind": "update_branch", "expected_head_sha": LC}))
+        self.q.judge(e, LC, gg.land_fingerprint(self.w.cache[self.KEY]))
+        self.assertEqual((len(self.w.gh_calls("api")), e["wait"]["kind"]), (2, "pr"))
+        self.assertIn("update_deferred", [h["event"] for h in e["history"]])
 
     def test_calls_carry_the_land_tags_and_no_session_keys(self):
         self.pr(LA)
