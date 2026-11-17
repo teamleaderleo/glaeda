@@ -8559,7 +8559,7 @@ TART_IMAGES, TART_IPSWS = "tart-images", "tart-ipsws"
 # lease naming its path or a .glaeda-keep.json claim in it keeps it.
 # Two days, not two weeks (Leo, 2026-11-17: "man all these disks should be able to just be a lot more cleared up than
 # they are"): nine minis measured that day held 236 GiB of Tart VMs, 140 GiB of them stopped and judged "recent"
-# (aside-golden and aside-1 on cmux11s, 86 GiB, idle 78 h), and 53 GiB of pulled images, while glaeda-disk found
+# (two VMs on one mini, 86 GiB, idle 78 h), and 53 GiB of pulled images, while glaeda-disk found
 # 16.5 GiB reclaimable in 2.9 TiB used. A VM someone means to keep carries a .glaeda-keep.json claim.
 TART_VMS = "tart-vms"
 TART_VM_IDLE_HOURS = 2 * 24.0

@@ -12442,7 +12442,7 @@ class DeadItemsTest(unittest.TestCase):
 
     def test_a_stopped_unclaimed_tart_vm_two_days_untouched_goes(self) -> None:
         old = self.tart_vm("vm0", 26)  # cmux23: ubase and vm0-vm5, stopped since 2026-10-19
-        aside = self.tart_vm("aside-1", 78 / 24)  # cmux11s, 2026-11-17: idle 78 h and judged "recent" at 14 days
+        aside = self.tart_vm("aside-1", 78 / 24)  # one mini, 2026-11-17: idle 78 h and judged "recent" at 14 days
         recent = self.tart_vm("vm1", 1)
         claimed = self.tart_vm("vm2", 26)
         (claimed / gd.ROLE_KEEP_MARKER).write_text("{}")
