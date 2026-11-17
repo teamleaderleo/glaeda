@@ -14,6 +14,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import signal
 import stat
 import subprocess
@@ -17021,16 +17022,41 @@ class LandTest(Base):
 
     def test_steps_write_as_the_requesters_lane_on_this_host(self):
         # gcp-agent-lane-3, 2026-11-17: lane-gh refused every merge and update-branch "land: lease acquisition requires
-        # a lane session" (this queue strips the session keys), so none reached the broker.
-        self.pr(LA)
-        self.land()
-        self.w.answers.append(ok_answer(LA))
-        with mock.patch.object(gg, "policy_host", lambda: "host"):
-            self.tick()
-        by = {tuple(c[1:3]): env for c, env in zip(self.w.calls, self.w.envs)}
-        self.assertEqual(by[("pr", "merge")].get("LANE_GH_LANE"), "lane")
-        self.assertEqual(by[("pr", "merge")]["CMUX_AGENT_SESSION"], "glaeda-land")  # still charged to the queue
-        self.assertNotIn("LANE_GH_LANE", by[(self.w.mh, "explain")])  # a read needs no lane
+        # a lane session" (this queue strips the session keys), so none reached the broker. Every step that writes
+        # carries the lane, review too (router-review --post comments through the same client; review finding F1).
+        steps = {
+            "merge": (ok_answer(LA), lambda c: c[1:3] == ["pr", "merge"]),
+            "update_branch": (refusal("tip_merge", LA, {"kind": "update_branch", "expected_head_sha": LA}),
+                              lambda c: "update-branch" in " ".join(c)),
+            "rerun_failed": (refusal("cancelled", LA, {"kind": "rerun_failed", "runs": [5]}),
+                             lambda c: c[1:3] == ["run", "rerun"]),
+            "review": (refusal("no_ship", LA, {"kind": "review"}), lambda c: c[0] == "/fake/router-review"),
+        }
+        for kind, (answer, is_step) in steps.items():
+            with self.subTest(kind=kind):
+                shutil.rmtree(gg.land_dir(), ignore_errors=True)
+                self.w = LandWorld(self.tmp.name)
+                self.q = self.queue()
+                self.pr(LA)
+                self.land()
+                self.w.answers.append(answer)
+                spawned: list[tuple[list[str], dict]] = []
+
+                def popen(argv, **kw):
+                    spawned.append((list(argv), dict(kw["env"])))
+                    return mock.Mock()
+                with mock.patch.object(gg, "policy_host", lambda: "host"), \
+                        mock.patch.object(gg.subprocess, "Popen", side_effect=popen):
+                    self.tick()
+                runs = list(zip(self.w.calls, self.w.envs)) + spawned
+                envs = [env for c, env in runs if is_step(c)]
+                self.assertTrue(envs, f"no {kind} step ran")
+                for env in envs:
+                    self.assertEqual(env.get("LANE_GH_LANE"), "lane")
+                    self.assertEqual(env["CMUX_AGENT_SESSION"], "glaeda-land")  # still charged to the queue
+                explain = [env for c, env in runs if c[1:3] == [self.w.mh, "explain"]]
+                self.assertTrue(explain)
+                self.assertNotIn("LANE_GH_LANE", explain[0])  # a read needs no lane
         # a requester on another host names no lane
         self.assertEqual(gg.land_lane({"requester": "other/lane"}), "")
         self.assertEqual(gg.land_lane({"requester": ""}), "")

@@ -7023,6 +7023,9 @@ BRANCH_SAFE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,250}")
 # reached the broker (`lane-gh calls --tool land` holds no land of cmux#45102 or #45090 after 27 and 30 merges).
 # The step is the requester's: its session on this host names the lane; the calls stay charged to glaeda-land
 # (gh_quota reads CMUX_AGENT_SESSION, never LANE_GH_LANE). A requester on another host names none.
+# Every step that writes passes E (self.env(e)): merge, update_branch, rerun_failed and review (router-review
+# --post writes its comment through the same client). Reads (merge_hold explain, the post-merge `pr view`) and
+# acpmux notices need no lane and run with the bare env.
 LAND_LANE_ENV = "LANE_GH_LANE"
 LAND_LANE_NAME = re.compile(r"[A-Za-z0-9._-]{1,100}")
 
@@ -8141,7 +8144,7 @@ class LandQueue:
                 try:
                     with open(logs / f"review-{repo.replace('/', '_')}-{number}-{head[:12]}.log", "ab") as sink:
                         subprocess.Popen([os.fspath(rr), repo, number, "--post"], stdin=subprocess.DEVNULL,
-                                         stdout=sink, stderr=subprocess.STDOUT, env=self.env(), start_new_session=True,
+                                         stdout=sink, stderr=subprocess.STDOUT, env=self.env(e), start_new_session=True,
                                          close_fds=True, cwd=os.environ.get("HOME") or "/")
                     self.finish(e, None, started=True)
                 except OSError as error:
