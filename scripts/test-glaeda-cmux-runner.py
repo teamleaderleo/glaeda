@@ -6510,16 +6510,22 @@ time.sleep(60)
         watch = ("--watch-pid", str(worker.pid))
         runners = [self.dir / "actions-runner-glaeda", self.dir / "actions-runner-glaeda-1"]
 
-        def mark(runner: Path, until: float) -> None:
-            (runner / hook.RUNNER_DRAIN_FILE).write_text(json.dumps({"reason": "a sandboxd restore", "until": until}))
+        def mark(runner: Path, until: float, **extra: str) -> None:
+            (runner / hook.RUNNER_DRAIN_FILE).write_text(
+                json.dumps({"reason": "a sandboxd restore", "until": until, **extra}))
 
         for runner in runners:
             runner.mkdir()
+        (self.dir / "actions-runner-glaeda-3.old").mkdir()  # a stray copy is no runner: it never blocks a host drain
+        for runner in runners:  # the apply's relabel of every busy runner is no host drain
+            mark(runner, time.time() + 600, by=hook.APPLY_DRAIN_BY)
+        self.assertEqual(self.fits(), ["light", "isolated"], "apply markers on every runner are relabels")
         mark(runners[0], time.time() + 600)
-        self.assertEqual(self.fits(), ["light", "isolated"], "one runner draining is a relabel, not a host drain")
+        self.assertEqual(self.fits(), ["light", "isolated"], "one runner hand-drained is not a host drain")
         mark(runners[1], time.time() + 600)
         status, result = self.ci_step("fits")
         self.assertEqual((status, result["fits"]), (0, []), "the worker advertises nothing, so nothing is leased")
+        self.assertEqual(result["refusal"], "host draining: all 2 runners are draining for a sandboxd restore")
         status, refused = self.ci_step("admit", "--class", "light", "--job-key", "drain-1-1", *watch)
         self.assertEqual(status, 1, refused)
         self.assertIn("host draining: all 2 runners are draining for a sandboxd restore", refused["reason"])

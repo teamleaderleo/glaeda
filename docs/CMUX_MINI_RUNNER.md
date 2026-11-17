@@ -669,9 +669,12 @@ What `--apply` does:
    - **A drained host.** Every listener role honours `.glaeda-drain` (gui, session,
      nightly, fast and dedicated runners included). When every runner on a mini has a live
      marker, as a hand drain for a repair writes, the mini is drained as a whole
-     (`HOST_DRAIN`): the build worker's `fits` advertises no ci-step and `admit`
-     refuses, so nothing new takes `host.lock` and the drain ends once running jobs
-     end. One runner draining (a relabel) leaves ci-steps alone.
+     (`HOST_DRAIN`): the build worker's `fits` advertises no ci-step (its `refusal`
+     says why) and `admit` refuses, so no new ci-step takes `host.lock`. Markers the
+     apply writes for a relabel or a retirement (`"by": "glaeda-cmux-runner --apply"`)
+     never make a host drain, even on every runner. Fleet builds outside ci-steps
+     (`with-host-lock`) do not read the marker; hold the mini's build worker with a
+     controller reservation (`cmux-ci reserve --workers W --pool P`) for those.
 5. Confirms through the GitHub API that the runner is listed with every label and
    waits up to 90 s for it to report online.
 

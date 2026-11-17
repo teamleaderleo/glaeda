@@ -3210,6 +3210,12 @@ DRAIN_MAX_BYTES = 4096
 
 def runner_drain(runner_dir: Path, now: float) -> str | None:
     """Why this runner is draining (RUNNER_DRAIN), or None: no marker, an expired one, or one that cannot be read."""
+    doc = runner_drain_doc(runner_dir, now)
+    return None if doc is None else f"draining for {str(doc.get('reason') or 'glaeda-cmux-runner --apply')[:200]}"
+
+
+def runner_drain_doc(runner_dir: Path, now: float) -> dict[str, Any] | None:
+    """The live RUNNER_DRAIN marker of this runner, or None: no marker, an expired one, or one that cannot be read."""
     # a job runs as this user in this tree, so the read is bounded: no symlink, no FIFO or device, at most
     # DRAIN_MAX_BYTES, and nothing in it can raise past here; a marker that is not a small regular file holds nothing
     try:
@@ -3233,29 +3239,36 @@ def runner_drain(runner_dir: Path, now: float) -> str | None:
         return None
     if not math.isfinite(until) or until <= now or until > now + DRAIN_TTL_S + 60:
         return None
-    return f"draining for {str(doc.get('reason') or 'glaeda-cmux-runner --apply')[:200]}"
+    return doc
 
 
 # HOST_DRAIN: a hand drain that empties a mini for a repair marks every runner on it (RUNNER_DRAIN), and every listener
 # then stops whatever its role. The lent build worker's ci-steps are no listener: it kept leasing them, and each
 # admission takes host.lock, so a repair waiting for a free host.lock never got it (a mini with a wedged sandboxd,
 # 2026-11-17: six heal drains refused after 1200 s each, one naming a ci-step's admission as the holder). A mini whose
-# every runner drains is a drained host: `fits` advertises nothing and `admit` refuses, so no new step takes the lock
-# and the drain ends once the running work does. One runner draining (a relabel) is not a host drain.
+# every runner carries a hand drain is a drained host: `fits` advertises nothing and `admit` refuses, so no new ci-step
+# takes the lock and the drain ends once the running work does. The apply's own markers (a relabel or a retirement of
+# a busy runner, APPLY_DRAIN_BY) never make one, even when they cover every runner (a one-runner mini, a label change
+# while every runner works). Runner dirs are the installer's names (HOST_DRAIN_RUNNER_DIR); a stray copy is no runner.
+APPLY_DRAIN_BY = "glaeda-cmux-runner --apply"
+HOST_DRAIN_RUNNER_DIR = re.compile(r"actions-runner-glaeda(?:-(\d+|[a-z][a-z0-9-]*))?")
+
+
 def host_drain(home: Path, now: float) -> str | None:
-    """Why this mini is drained (HOST_DRAIN), or None: some runner under home has no live RUNNER_DRAIN, or there is
-    none. A directory that cannot be listed drains nothing."""
+    """Why this mini is drained (HOST_DRAIN), or None: some runner under home has no live hand-written RUNNER_DRAIN,
+    or there is no runner. A directory that cannot be listed drains nothing."""
     try:
-        runners = sorted(p for p in home.glob("actions-runner-glaeda*") if p.is_dir() and not p.is_symlink())
+        runners = sorted(p for p in home.glob("actions-runner-glaeda*")
+                         if HOST_DRAIN_RUNNER_DIR.fullmatch(p.name) and p.is_dir() and not p.is_symlink())
     except OSError:
         return None
     first = None
     for runner in runners:
-        why = runner_drain(runner, now)
-        if why is None:
+        doc = runner_drain_doc(runner, now)
+        if doc is None or doc.get("by") == APPLY_DRAIN_BY:
             return None
-        first = first or why
-    return f"host draining: all {len(runners)} runners are {first}" if first else None
+        first = first or str(doc.get("reason") or "a hand drain")[:200]
+    return f"host draining: all {len(runners)} runners are draining for {first}" if first else None
 
 
 # glaeda-mini-health's drain for a Tailscale restart (glaeda#1627): it wants the host idle, not jobs refused. The gate
@@ -12723,7 +12736,7 @@ def main(argv: list[str] | None = None) -> int:
                           "released": release_host_lock(args.state_dir)}, sort_keys=True), flush=True)
         return 0
     if args.phase == "fits":
-        why = step_refusal()
+        why = step_refusal() or host_drain(Path.home(), time.time())
         fits = [] if why else step_fits(args.capacity_dir, args.capacity_units, args.compile_slots,
                                         args.canonical_roots, args.host_lock, args.reservation, args.state_dir,
                                         time.time())
