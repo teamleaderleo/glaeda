@@ -247,7 +247,9 @@ effect without a restart.
   call log and the landing record tell them from a person's. State in land/ (entries/, requests/, counts.json: the
   steps taken per day, which `land status` prints); ~/.config/glaeda/land.json may set gh, mergeHold, acpmux,
   routerReview, python, workers and env. merge_hold.py is mergeHold, else the ws-sync deploy's, else
-  ~/Projects/leo-workspace/tools/merge_hold.py; with none of them a land stops at once (merge_hold_missing).
+  ~/Projects/leo-workspace/tools/merge_hold.py; with none of them the land worker refuses to start (land/refused.json,
+  which `land status` prints) and `land` refuses to queue (merge_hold_missing). On a lane VM (an upstream host) the
+  worker reads a landing PR itself through the broker when the upstream's copy is over LAND_REFRESH_AFTER old.
 """
 
 from __future__ import annotations
@@ -6794,6 +6796,46 @@ LAND_MERGE_HOLD = Path.home() / ".local/share/ws-sync/deploy/tools/merge_hold.py
 # at once with merge_hold_missing naming every path tried. Before, python exited 2 ("can't open file"), every job judged
 # explain_failed and retried, and `land status` read like quota trouble (gcp-agent-lane-3, 2026-11-17).
 LAND_MERGE_HOLD_PATHS = (LAND_MERGE_HOLD, Path.home() / "Projects/leo-workspace/tools/merge_hold.py")
+# The land worker's startup check: with no merge_hold.py at any of those paths it refuses to start (no entry is judged
+# or stepped; the daemon itself runs on), writes why to land/refused.json, and `glaeda-gh land` refuses to queue. It is
+# checked every tick, so installing merge_hold.py or setting land.json's mergeHold starts it without a restart. Before,
+# a configured path that did not exist was run anyway and every land judged explain_failed (gcp-agent-lane-6,
+# 2026-11-17: cmux#44604 stopped after 8 of them).
+LAND_REFUSED_FILE = "refused.json"
+# On an upstream host (a lane VM: no login, its PR data is the controller's copy), the land worker's nudge reaches
+# nothing: upstream_tick asks the upstream every UPSTREAM_EVERY and takes whatever copy it has. When that copy of a
+# landing PR is older than LAND_REFRESH_AFTER, the worker reads the PR itself through the broker (direct_read, as a
+# starved wait does): at most every LAND_REFRESH_AFTER while it waits for a pushed head or is queued, else every
+# LAND_REFRESH_EVERY. gcp-agent-lane-6, 2026-11-17: cmux#44537's copy was 8923 s old two minutes after the worker's
+# own update-branch, so it sat out LAND_HEAD_TIMEOUT and judged unpinned; cmux#44209's held 02:24Z data for hours.
+LAND_REFRESH_AFTER = float(UPSTREAM_DIRECT_AFTER)
+LAND_REFRESH_EVERY = float(STALE_DATA_AFTER)
+
+
+def land_merge_hold(config: dict) -> tuple[Path | None, list[Path]]:
+    """(the merge_hold.py to run, or None; every path tried): CONFIG's mergeHold, then LAND_MERGE_HOLD_PATHS."""
+    given = config.get("mergeHold")
+    tried = [Path(os.path.expanduser(given))] if isinstance(given, str) and given else []
+    tried += [p for p in LAND_MERGE_HOLD_PATHS if p not in tried]
+    return next((p for p in tried if p.is_file()), None), tried
+
+
+def land_merge_hold_missing(tried: list[Path]) -> tuple[str, str]:
+    """(why, the step that fixes it) when no merge_hold.py is at any path TRIED."""
+    why = "merge_hold.py is not at any of " + ", ".join(map(os.fspath, tried))
+    nxt = (f'set "mergeHold" in {LAND_CONFIG} to merge_hold.py\'s path (on a lane VM: '
+           "~/Projects/leo-workspace/tools/merge_hold.py, from `reach enroll HOST --apply`)")
+    return why, nxt
+
+
+def land_reads_upstream() -> bool:
+    """This host reads PRs through an upstream and can read one itself through the broker (direct_read)."""
+    return upstream_command() is not None and direct_command() is not None
+
+
+def land_direct_read(key: str) -> str | None:
+    """One read of KEY's PR from GitHub through the broker, stored in the cache; None, or why it could not."""
+    return direct_read({"key": key, "kind": "pr", "jobs": False, "began": time.time()})
 LAND_STATES = ("queued", "waiting_after", "judging", "acting", "waiting", "merged", "stopped", "cancelled")
 LAND_DONE = frozenset({"merged", "stopped", "cancelled"})
 LAND_WITHDRAW = "withdraw"  # the request op `land cancel` writes
@@ -6955,13 +6997,16 @@ def land_seconds(value: Any, default: float, low: float = 1.0, high: float = 864
 class LandQueue:
     """The daemon's land queue (see the section comment). RUN runs one argv with a deadline and an environment and
     returns a CompletedProcess; CACHE_OF reads a cache entry by key; WATCH registers interest in a key as waited;
-    NUDGE asks for a fresh read of a PR; NOTICE writes a notice line. INLINE runs jobs in the tick (tests)."""
+    NUDGE asks for a fresh read of a PR; NOTICE writes a notice line. INLINE runs jobs in the tick (tests).
+    READS_UPSTREAM says whether this host's PR data is an upstream's copy, which REFRESH reads fresh by key
+    (LAND_REFRESH_AFTER)."""
 
     def __init__(self, run: Callable[..., subprocess.CompletedProcess] | None = None,
                  cache_of: Callable[[str], dict | None] = read_cache,
                  watch: Callable[[str], None] | None = None, nudge: Callable[[str], None] | None = None,
                  notice: Callable[[str, str, str, dict], None] | None = None, inline: bool = False,
-                 config: dict | None = None) -> None:
+                 config: dict | None = None, reads_upstream: Callable[[], bool] = land_reads_upstream,
+                 refresh: Callable[[str], str | None] = land_direct_read) -> None:
         self.run = run or (lambda argv, timeout, env: self._run_real(argv, timeout, env))
         self.cache_of = cache_of
         self.watch = watch or (lambda key: register(key, waited=True, reader=f"tool:{LAND_TAG}"))
@@ -6969,6 +7014,10 @@ class LandQueue:
         self.notice = notice or (lambda kind, level, text, data: None)
         self.inline = inline
         self.config_given = config
+        self.reads_upstream = reads_upstream
+        self.refresh = refresh
+        refused = read_json(land_dir() / LAND_REFUSED_FILE)
+        self.refused: dict | None = refused if isinstance(refused, dict) else None
         self.lock = threading.RLock()
         self.local = threading.local()  # .gen: the request generation the worker's job started under
         self.entries: dict[str, dict] = {}
@@ -7117,6 +7166,8 @@ class LandQueue:
         self.now = time.time() if now is None else now
         self.ingest()
         self.reap()
+        if self.refuse():
+            return
         for key in list(self.entries):
             try:
                 e = self.entries[key]
@@ -7132,6 +7183,29 @@ class LandQueue:
                     self.consider(e)
             except Exception as error:  # noqa: BLE001  one bad entry must not stop the others
                 log({"event": "land-error", "key": key, "error": describe(error), "site": error_site(error)})
+
+    def refuse(self) -> bool:
+        """The startup check, every tick: True (no entry is judged or stepped) while no merge_hold.py resolves.
+        The refusal is said once (log, notice, land/refused.json), and once more when it clears."""
+        mh, tried = self.merge_hold()
+        path = land_dir() / LAND_REFUSED_FILE
+        if mh is not None:
+            if self.refused is not None:
+                log({"event": "land-started", "mergeHold": os.fspath(mh), "refusedAt": self.refused.get("at")})
+                self.notice("land-started", "info", f"glaeda land started: merge_hold.py is {mh}",
+                            {"mergeHold": os.fspath(mh)})
+                path.unlink(missing_ok=True)
+                self.refused = None
+            return False
+        why, nxt = land_merge_hold_missing(tried)
+        nxt += "; the land worker starts on its next tick"
+        if self.refused is None or self.refused.get("reason") != why:
+            self.refused = {"code": "merge_hold_missing", "reason": why, "next": nxt, "at": self.now,
+                            "tried": [os.fspath(p) for p in tried]}
+            write_json(path, self.refused)
+            log({"event": "land-refused", **self.refused})
+            self.notice("land-refused", "warn", f"glaeda land refused to start: {why}. next: {nxt}", self.refused)
+        return True
 
     def reap(self) -> None:
         for key, fut in list(self.jobs.items()):
@@ -7179,6 +7253,8 @@ class LandQueue:
     def consider(self, e: dict) -> None:
         """Whether this entry is judged now: only when something could have changed merge_hold's answer."""
         c = self.cache_of(e["key"])
+        if self.refresh_due(e, c):
+            return  # judged on the fresh copy, next tick
         data = (c or {}).get("data") or {}
         if data.get("state") == "MERGED":
             self.merged(e, e.get("mergeSha") or "", "the cache shows it merged")
@@ -7272,6 +7348,33 @@ class LandQueue:
             # refusal after it does not count toward the stop; after its timeout it does.
             self.judge(e, head, fp, counts=woke)
 
+    def refresh_due(self, e: dict, c: dict | None) -> bool:
+        """On an upstream host, a read of the entry's PR through the broker when the upstream's copy is older than
+        LAND_REFRESH_AFTER (see there), started on a worker: True when one was started."""
+        at = (c or {}).get("dataAt")
+        if not isinstance(at, (int, float)) or isinstance(at, bool) or self.now - at < LAND_REFRESH_AFTER:
+            return False  # fresh, or never read (the no-data path judges it unpinned)
+        urgent = e["state"] == "queued" or (e.get("wait") or {}).get("kind") == "head_change"
+        last = (e.get("refresh") or {}).get("at")
+        if isinstance(last, (int, float)) and self.now - last < (LAND_REFRESH_AFTER if urgent else LAND_REFRESH_EVERY):
+            return False
+        if not self.reads_upstream():
+            return False  # a host with its own login: the nudge (and the stale valve) refresh it
+        e["refresh"] = {"at": self.now, "age": round(self.now - at)}
+        self.save(e)
+        self.submit(e["key"], self.refresh_job, e["key"])
+        return True
+
+    def refresh_job(self, key: str) -> None:
+        error = self.refresh(key)
+        with self.lock:
+            e = self.entries.get(key)
+            if e is None:
+                return
+            e["refresh"] = {**(e.get("refresh") or {}), "error": land_trim(error, 160) if error else None}
+            log({"event": "land-refresh", "key": key, "age": e["refresh"].get("age"), "error": error})
+            self.save(e)
+
     def comment_seen(self, w: dict) -> bool:
         cd = (self.cache_of(w.get("key", "")) or {}).get("data") or {}
         try:
@@ -7347,18 +7450,14 @@ class LandQueue:
 
     def merge_hold(self) -> tuple[Path | None, list[Path]]:
         """(the merge_hold.py to run, or None; every path tried): land.json's mergeHold, then LAND_MERGE_HOLD_PATHS."""
-        given = self.config().get("mergeHold")
-        tried = [Path(os.path.expanduser(given))] if isinstance(given, str) and given else []
-        tried += [p for p in LAND_MERGE_HOLD_PATHS if p not in tried]
-        return next((p for p in tried if p.is_file()), None), tried
+        return land_merge_hold(self.config())
 
     def explain(self, e: dict, sha: str) -> dict:
         mh, tried = self.merge_hold()
         if mh is None:
-            # Permanent until a person installs it: a stop that names the file, never a retry.
-            why = "merge_hold.py is not at any of " + ", ".join(map(os.fspath, tried))
-            nxt = (f'set "mergeHold" in {LAND_CONFIG} to merge_hold.py\'s path, then '
-                   f'glaeda-gh land {e["repo"]}#{e["number"]}')
+            # Gone between the tick's startup check and this job: a stop that names the file, never a retry.
+            why, nxt = land_merge_hold_missing(tried)
+            nxt += f', then glaeda-gh land {e["repo"]}#{e["number"]}'
             return {"ok": False, "code": "merge_hold_missing", "reason": why, "next": nxt, "head": sha,
                     "action": {"v": 1, "kind": "stop", "stop": "merge_hold_missing", "why": why}}
         argv = [self.path("python", Path(sys.executable)).as_posix(), os.fspath(mh),
@@ -7788,10 +7887,15 @@ def cmd_land_status(target: str | None, as_json: bool) -> int:
         key = land_key(target)[0]
         entries = [e for e in entries if e.get("key") == key]
     counts = land_counts()
+    refused = read_json(land_dir() / LAND_REFUSED_FILE)
+    refused = refused if isinstance(refused, dict) else None
     if as_json:
-        print(json.dumps({"ok": True, "entries": entries, "steps": counts}, sort_keys=True))
+        print(json.dumps({"ok": True, "entries": entries, "steps": counts, "refused": refused}, sort_keys=True))
         return EXIT_OK if entries or not target else EXIT_FAIL
     now = time.time()
+    if refused:
+        print(f"glaeda land: REFUSED to start since {utc_clock(float(refused.get('at') or 0))}: "
+              f"{refused.get('reason')}\nnext: {refused.get('next')}")
     for e in entries:
         print(land_line(e, now))
         if target:
@@ -7821,6 +7925,16 @@ def cmd_land(target: str, after: list[str], notify: str | None, wait: float, as_
     for a in after:
         land_key(a)
     requester, source = land_requester_from(notify)
+    mh, tried = land_merge_hold(land_config())
+    if mh is None:
+        # The startup check's twin: nothing on this host could judge the merge, so it is not queued.
+        why, nxt = land_merge_hold_missing(tried)
+        if as_json:
+            print(json.dumps({"ok": False, "key": key, "code": "merge_hold_missing", "reason": why, "next": nxt},
+                             sort_keys=True))
+        else:
+            say_waiting(f"glaeda land: refused: {why}\nnext: {nxt}, then glaeda-gh land {repo}#{number}")
+        return EXIT_FAIL
     rid = land_request("land", f"{repo}#{number}", [land_key(a)[1] + f"#{land_key(a)[2]}" for a in after], requester,
                        source)
     running = daemon_running()
