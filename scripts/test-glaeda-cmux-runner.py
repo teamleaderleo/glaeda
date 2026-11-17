@@ -10943,6 +10943,45 @@ class GateTest(unittest.TestCase):
         self.assertFalse(hook.job_nonce_file(self.state, runner).exists(), "and, the job over, its nonce")
         self.assertIsNone(hook.job_written_gib(self.state, runner, 100, now))
 
+    def test_a_forged_job_written_record_is_never_honoured(self) -> None:
+        """RUNNER_JOB_WRITTEN: a record discounts disk the gate then admits work against, so only the hook's own record
+        counts: one in the hook's private job-written directory (its uid's, no group or other access), a regular
+        file of the gate's uid with no group or other access, never a symlink, carrying the job's nonce. A record a
+        job forged with the matching pid and nonce in the state directory it can write is not honoured."""
+        runner, pid = "actions-runner-glaeda-2", 100
+        now = time.time()
+        nonce = hook.begin_job_written(self.state, runner, pid)
+        self.assertTrue(nonce)
+        forged = {"schema": hook.JOB_WRITTEN_SCHEMA, "worker_pid": pid, "nonce": nonce, "written_gib": 5.0,
+                  "at": round(now, 1)}
+        (self.state / f"job-written-{runner}.json").write_text(json.dumps(forged))
+        self.assertIsNone(hook.job_written_gib(self.state, runner, pid, now),
+                          "a record in the job-writable state directory is not the hook's")
+        path = hook.job_written_file(self.state, runner)
+        self.assertNotEqual(path.parent, self.state)
+        self.assertTrue(hook.write_job_written(self.state, runner, pid, nonce, 5.0, now))
+        self.assertEqual(hook.job_written_gib(self.state, runner, pid, now), 5.0, "the hook's own record counts")
+        self.assertEqual(stat.S_IMODE(path.parent.stat().st_mode) & 0o077, 0)
+        self.assertEqual(stat.S_IMODE(path.stat().st_mode) & 0o077, 0)
+        path.chmod(0o644)
+        self.assertIsNone(hook.job_written_gib(self.state, runner, pid, now), "group or other access: not honoured")
+        path.chmod(0o600)
+        path.parent.chmod(0o755)
+        self.assertIsNone(hook.job_written_gib(self.state, runner, pid, now), "a loose directory: not honoured")
+        path.parent.chmod(0o700)
+        with mock.patch.object(hook.os, "getuid", return_value=os.getuid() + 1):
+            self.assertIsNone(hook.job_written_gib(self.state, runner, pid, now), "another uid's: not honoured")
+            hook.clear_job_written(self.state, runner, nonce, job_ended=True)
+        self.assertTrue(path.exists(), "cleanup never removes a record that is not its uid's")
+        real = path.with_name("elsewhere.json")
+        os.replace(path, real)
+        path.symlink_to(real)
+        self.assertIsNone(hook.job_written_gib(self.state, runner, pid, now), "a symlink: not honoured")
+        path.unlink()
+        self.assertTrue(hook.write_job_written(self.state, runner, pid, nonce, 3.0, now))
+        hook.clear_job_written(self.state, runner, nonce, job_ended=True)
+        self.assertFalse(path.exists(), "its own job's cleanup removes its own record")
+
     def test_an_installed_hook_reads_the_staged_runner_job_disk(self) -> None:
         """The hook runs from ~/actions-runner-glaeda-K/glaeda-hooks/; the json is the staged runner copy in
         ~/glaeda-runner/scripts."""
@@ -13156,6 +13195,27 @@ class GateTest(unittest.TestCase):
                 hook.note_listener_restart(self.state, self.runner, {"t": n})
         lines = (self.state / hook.GATE_RESTARTS_FILE).read_text().splitlines()
         self.assertEqual([json.loads(x)["t"] for x in lines], [2, 3, 4])
+
+    def test_concurrent_gates_lose_no_listener_restart(self) -> None:
+        """Every runner's gate notes its restarts in the one listener-restarts.jsonl: a read, modify and replace
+        that two gates run at once kept only one of their lines. Each note is one locked step."""
+        children = []
+        for g in range(6):
+            pid = os.fork()
+            if pid == 0:
+                code = 0
+                try:
+                    for n in range(25):
+                        hook.note_listener_restart(self.state, self.runner, {"g": g, "t": n})
+                except BaseException:  # noqa: BLE001
+                    code = 1
+                os._exit(code)
+            children.append(pid)
+        for pid in children:
+            self.assertEqual(os.waitpid(pid, 0)[1], 0)
+        lines = (self.state / hook.GATE_RESTARTS_FILE).read_text().splitlines()
+        self.assertEqual(sorted((json.loads(x)["g"], json.loads(x)["t"]) for x in lines),
+                         [(g, n) for g in range(6) for n in range(25)], "150 notes, 150 lines")
 
     def test_listen_stops_and_restarts_a_real_listener(self) -> None:
         proc, log = self.run_listen()
