@@ -2463,7 +2463,7 @@ def sim_token(path: Path | None = None) -> int | None:
 # SIM_SLOTS (glaeda-cmux-runner-hook): a mini may run several simulator jobs, each holding one copy of the token
 # (simulator, simulator-1, ...). The eraser holds every copy the hook can hand out (its MAX_SIM_SLOTS), whatever this
 # mini's --sim-slots: copy 0 alone would let a job start on copy 1 between the last reading and the erase.
-SIM_TOKEN_COPIES = 4  # the hook's MAX_SIM_SLOTS (a test keeps them equal)
+SIM_TOKEN_COPIES = 8  # the hook's MAX_SIM_SLOTS (a test keeps them equal)
 
 
 def sim_tokens() -> list[int] | None:

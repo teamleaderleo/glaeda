@@ -8103,13 +8103,13 @@ class SimDeviceTest(unittest.TestCase):
                                                            below_target=short), 0)
 
     def test_the_eraser_holds_every_simulator_token_copy(self) -> None:
-        """SIM_SLOTS: a job may hold simulator-1 (or -2, -3) while simulator is free. The eraser holds every copy the
+        """SIM_SLOTS: a job may hold simulator-1 (or -2 ... -7) while simulator is free. The eraser holds every copy the
         hook can hand out, and none while any one is held, so no simulator job starts between its reading and the erase."""
         fds = gd.sim_tokens()
         self.assertIsNotNone(fds)
         try:
             self.assertEqual(len(fds), gd.SIM_TOKEN_COPIES)
-            self.assertIsNone(gd.sim_token(gd.SIM_TOKEN.with_name("simulator-3.token")), "every copy is held")
+            self.assertIsNone(gd.sim_token(gd.SIM_TOKEN.with_name("simulator-7.token")), "every copy is held")
         finally:
             for fd in fds:
                 os.close(fd)

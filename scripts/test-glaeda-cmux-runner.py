@@ -14626,7 +14626,7 @@ class RunnerTest(unittest.TestCase):
         self.assertEqual(plain["simSlots"], 1, "no simulator role: one copy")
         manifest["hosts"]["mini-std"]["roles"].append("ios-simulators")
         manifest["defaults"]["ios_simulator"] = {"runtimes": ["23F77"]}
-        for bad in (0, 5, True, "2"):
+        for bad in (0, 9, True, "2"):
             manifest["defaults"]["runner"]["classes"]["std"]["simSlots"] = bad
             with mock.patch.object(cr, "ios_sim_present", return_value=True), \
                     mock.patch.object(cr, "xcode_present", return_value=True):
@@ -17957,7 +17957,7 @@ class SimSlotsTest(unittest.TestCase):
         ok, why = self.take(slots=3)
         self.assertFalse(ok)
         self.assertEqual(why, "capacity: all 3 simulator tokens are taken (ios-simulator is simulator)")
-        self.assertEqual(hook.sim_token_names(9), ["simulator", "simulator-1", "simulator-2", "simulator-3"],
+        self.assertEqual(hook.sim_token_names(9), ["simulator"] + [f"simulator-{c}" for c in range(1, 8)],
                          "at most MAX_SIM_SLOTS")
         self.assertEqual(hook.sim_token_names(0), ["simulator"])
 

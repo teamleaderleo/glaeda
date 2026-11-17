@@ -91,7 +91,7 @@ SMALL_PREFIX = "small"
 # (GLAEDA_SIM_SLOT) to boot its own devices, and every copy past the first only with headroom for it (load, memory
 # pressure, the class's measured RAM). Leo, 2026-11-17: "aziz also wanted to look into packing more ios simulators
 # at once and right-sizing them in ci". A member without the simulator role keeps 1.
-MAX_SIM_SLOTS = 4  # the hook's MAX_SIM_SLOTS (a test keeps them equal)
+MAX_SIM_SLOTS = 8  # the hook's MAX_SIM_SLOTS (a test keeps them equal)
 COMPILE_CORES = 5  # the hook's CLASS_COST["compile"] units (a test keeps them equal)
 MAX_RUNNERS = 16
 # A host's overrides.runner {trustedRef: refs/heads/main, trustedRepo: owner/name} makes its runners trusted-only:

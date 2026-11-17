@@ -2026,7 +2026,7 @@ SIM_SLOT_LOAD_SHARE = 0.75  # lane_admission LOAD_SHARE
 SIM_SLOT_SWAP_SHARE = 0.10  # lane_admission SWAP_SHARE
 SIM_SLOT_ENV = "GLAEDA_SIM_SLOT"
 SIM_SLOT_FILE = "glaeda-sim-slot"  # $RUNNER_TEMP/glaeda-sim-slot: the copy index alone
-MAX_SIM_SLOTS = 4  # glaeda_fleet_labels.MAX_SIM_SLOTS and glaeda-disk's SIM_TOKEN_COPIES (a test keeps them equal)
+MAX_SIM_SLOTS = 8  # glaeda_fleet_labels.MAX_SIM_SLOTS and glaeda-disk's SIM_TOKEN_COPIES (a test keeps them equal)
 
 
 def sim_slots_of(value: int | None) -> int:

@@ -1585,7 +1585,7 @@ Hook classes:
 - `ios-simulator` and `screenshots` are `simulator` (1 unit, p75 0.28 cores per job), plus a copy of the
   `simulator` token: they reuse, erase and boot named devices in the user's one CoreSimulator service. A job
   refused only for that token waits for it at job start, as any capacity wait does.
-- `runner.classes.<class>.simSlots` (1 to 4, default 1; a member without the simulator role keeps 1) gives the
+- `runner.classes.<class>.simSlots` (1 to 8, default 1; a member without the simulator role keeps 1) gives the
   hook `--sim-slots N`: the token comes in N copies (`simulator`, `simulator-1`, ...), and the job is told its copy
   as `GLAEDA_SIM_SLOT` in `$GITHUB_ENV` and `$RUNNER_TEMP/glaeda-sim-slot` (a ci-step: `sim_slot` in its admit
   answer), so a workflow can boot devices of its own slot. A copy past the first is admitted only with headroom,
