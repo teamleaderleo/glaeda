@@ -6788,6 +6788,16 @@ class Daemon:
 LAND_CONFIG = Path(os.environ.get("GLAEDA_GH_LAND_CONFIG") or Path.home() / ".config/glaeda/land.json")
 LAND_GH = Path.home() / ".local/lib/gh-quota/bin/gh"  # the gh-quota shim: merge_hold judges every merge it sends
 LAND_MERGE_HOLD = Path.home() / ".local/share/ws-sync/deploy/tools/merge_hold.py"
+# A host without a ws-sync deploy (an agent VM) keeps merge_hold in its managed leo-workspace checkout.
+LAND_MERGE_HOLD_FALLBACKS = (Path.home() / "Projects/leo-workspace/tools/merge_hold.py",)
+
+
+def land_merge_hold(default: Path = LAND_MERGE_HOLD) -> Path:
+    """merge_hold.py: the deploy tree's, else the managed checkout's; the first that exists (else the first)."""
+    for p in (default, *LAND_MERGE_HOLD_FALLBACKS):
+        if p.is_file():
+            return p
+    return default
 LAND_STATES = ("queued", "waiting_after", "judging", "acting", "waiting", "merged", "stopped", "cancelled")
 LAND_DONE = frozenset({"merged", "stopped", "cancelled"})
 LAND_WITHDRAW = "withdraw"  # the request op `land cancel` writes
@@ -7340,7 +7350,7 @@ class LandQueue:
         return os.fspath(p) if p.exists() and os.access(p, os.X_OK) else None
 
     def explain(self, e: dict, sha: str) -> dict:
-        argv = [self.path("python", Path(sys.executable)).as_posix(), os.fspath(self.path("mergeHold", LAND_MERGE_HOLD)),
+        argv = [self.path("python", Path(sys.executable)).as_posix(), os.fspath(land_merge_hold(self.path("mergeHold", LAND_MERGE_HOLD))),
                 "explain", e["repo"], str(e["number"])] + (["--sha", sha] if sha else []) + ["--json"]
         got = self.call(argv, LAND_EXPLAIN_DEADLINE)
         answer = None
@@ -7797,6 +7807,12 @@ def cmd_land(target: str, after: list[str], notify: str | None, wait: float, as_
     for a in after:
         land_key(a)
     requester, source = land_requester_from(notify)
+    hold = land_merge_hold()
+    if not hold.is_file():
+        print(f"glaeda land: refused: merge_hold.py is missing at {hold} (and in the managed leo-workspace checkout); "
+              "nothing could judge a merge. next: ws-deploy or `reach enroll HOST --apply`, then land again",
+              file=sys.stderr)
+        return 1
     rid = land_request("land", f"{repo}#{number}", [land_key(a)[1] + f"#{land_key(a)[2]}" for a in after], requester,
                        source)
     running = daemon_running()
