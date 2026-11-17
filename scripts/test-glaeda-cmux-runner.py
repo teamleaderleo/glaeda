@@ -3815,15 +3815,18 @@ class HookTest(unittest.TestCase):
                     self.assertIn("refused: the sim-first runner takes only simulator jobs", started.stdout)
                 finally:
                     self.finish("sr")
-        # SIM_SLOT_JOBS: above one sim slot ios-simulator-build is a simulator job the runner takes
-        for job, env, klass, slots in (("ios-simulator", test_ios, "simulator", "1"),
-                                       ("ios-simulator-build", test_ios, "simulator", "2"),
-                                       ("ios", matrix, "simulator-step", "1")):
+        # SIM_SLOT_JOBS: where the simulator ceiling is above one (a measured 32 GiB host) ios-simulator-build is a
+        # simulator job the runner takes; an older apply's --sim-slots is ignored, with a deprecation line
+        roomy = {hook.HOST_MEM_ENV: str(32 * 1024), hook.HOST_MEM_FREE_ENV: "90"}
+        for job, env, klass, extra in (("ios-simulator", test_ios, "simulator", ()),
+                                       ("ios-simulator-build", {**test_ios, **roomy}, "simulator", ("--sim-slots", "2")),
+                                       ("ios", matrix, "simulator-step", ())):
             with self.subTest(job=job):
                 try:
-                    ok = self.job(job, "sr", 14, None, "--sim-runner", "--sim-slots", slots, env=env)
+                    ok = self.job(job, "sr", 14, None, "--sim-runner", *extra, env=env)
                     self.assertEqual(ok.returncode, 0, ok.stdout + ok.stderr)
                     self.assertIn(f"for {job} ({klass}", ok.stdout)
+                    self.assertEqual("--sim-slots 2 is deprecated and ignored" in ok.stdout, bool(extra))
                 finally:
                     self.finish("sr")
         self.assertTrue(hook.probe(self.dir / "capacity" / f"{hook.SIM_TOKEN}.token"), "released with the job")
@@ -15311,37 +15314,31 @@ class RunnerTest(unittest.TestCase):
             lost, _ = cr.member_labels(manifest, "mini-std", ["glaeda-std-xcode-26.6"])
         self.assertEqual((kept["simRunners"], lost["simRunners"]), (1, 0))
 
-    def test_sim_slots_reach_every_runner_hook_on_a_simulator_mini(self) -> None:
-        """SIM_SLOTS: runner.classes.<class>.simSlots becomes --sim-slots on every instance's hook (the ledger is the
-        mini's, so they agree), only on a member with the simulator role; 1, the default, passes nothing."""
+    def test_no_sim_count_reaches_a_runner_hook_and_the_label_has_none(self) -> None:
+        """SIM_DYNAMIC: simSlots is ignored, no hook is given --sim-slots, and a simulator mini's glaeda-ios-sim
+        runners carry glaeda-ios-sim alone: no label carries a simulator count."""
         base = {"runners": 3, "capacityUnits": 14, "simRunners": 1, "guiRunners": 1}
         with mock.patch.object(cr, "ios_sim_present", return_value=True):
-            today_labels, today = self.fast_labels(base, "slots-today", ios_sim=True)
             labels, hooks = self.fast_labels({**base, "simSlots": 2}, "slots-2", ios_sim=True)
-        self.assertTrue(all("--sim-slots" not in text for text in today), "the default passes nothing")
-        # cmux#44908: the picker learns the slot count from glaeda-sim-slots-<N>, on the glaeda-ios-sim runners and
-        # the sim-first runner only (instance 2 is the gui runner); none at 1
-        self.assertFalse(any(label.startswith("glaeda-sim-slots-") for row in today_labels for label in row))
-        self.assertEqual(["glaeda-sim-slots-2" in row for row in labels], [True, True, False, True])
-        self.assertEqual(["glaeda-ios-sim" in row for row in labels], [True, True, False, False])
-        self.assertEqual(fleet_labels.sim_slots_label(3), "glaeda-sim-slots-3")
+        self.assertTrue(all("--sim-slots" not in text for text in hooks), hooks)
         self.assertEqual(len(hooks), 4)
-        self.assertTrue(all(" --sim-slots 2 " in text for text in hooks), hooks)
-        self.assertEqual(hook.runner_scope(self.fast_home / "actions-runner-glaeda-3").sim_slots, 2)
+        self.assertEqual(["glaeda-ios-sim" in row for row in labels], [True, True, False, False])
+        self.assertFalse(any(label.startswith("glaeda-sim-slots-") for row in labels for label in row))
         manifest = json.loads(json.dumps(MANIFEST))
         manifest["defaults"]["runner"] = {"classes": {"std": {**base, "simSlots": 2}}}
         with mock.patch.object(cr, "xcode_present", return_value=True):
             plain, _ = cr.member_labels(manifest, "mini-std")
-        self.assertEqual(plain["simSlots"], 1, "no simulator role: one copy")
+        self.assertNotIn("glaeda-ios-sim", plain["labels"], "no simulator role: no label")
         manifest["hosts"]["mini-std"]["roles"].append("ios-simulators")
         manifest["defaults"]["ios_simulator"] = {"runtimes": ["23F77"]}
-        for bad in (0, 5, True, "2"):
-            manifest["defaults"]["runner"]["classes"]["std"]["simSlots"] = bad
+        for ignored in (0, 5, True, "2"):  # no longer validated: never read
+            manifest["defaults"]["runner"]["classes"]["std"]["simSlots"] = ignored
             with mock.patch.object(cr, "ios_sim_present", return_value=True), \
-                    mock.patch.object(cr, "xcode_present", return_value=True):
+                    mock.patch.object(cr, "xcode_present", return_value=True), \
+                    contextlib.redirect_stderr(io.StringIO()):
                 summary, why = cr.member_labels(manifest, "mini-std")
-            self.assertIsNone(summary, bad)
-            self.assertIn(f"simSlots must be 1 to {fleet_labels.MAX_SIM_SLOTS}", why)
+            self.assertIsNotNone(summary, why)
+            self.assertNotIn("simSlots", summary)
 
     def test_a_plain_rerun_keeps_the_fast_and_gui_roles(self) -> None:
         """A re-run without --manifest restores the member from the receipt; the fast runner's and the gui
@@ -18652,10 +18649,12 @@ class CapacityArithmeticTest(unittest.TestCase):
         self.assertIsNone(hook.work_gib(home / "missing"))
 
 
-class SimSlotsTest(unittest.TestCase):
-    """SIM_SLOTS (Leo, 2026-11-17: "aziz also wanted to look into packing more ios simulators at once and right-sizing
-    them in ci"): the simulator token comes in --sim-slots copies, the job is told its copy (GLAEDA_SIM_SLOT), and a
-    copy past the first is admitted only with headroom (leo-workspace#5539's terms). 1 copy is today exactly."""
+class SimDynamicTest(unittest.TestCase):
+    """SIM_DYNAMIC (Leo, 2026-11-17: "hm why 3 tho shouldn't this be more dynamic? i think it's finally time to start
+    getting these things done"): no simulator count is set by hand. The simulator token comes in copies, the job is
+    told its copy (GLAEDA_SIM_SLOT), copy 0 is always admissible, and a later copy only while one more simulator keeps
+    the host under the 80% line (free RAM, load, pressure, swap growth), up to a ceiling computed from the RAM and one
+    simulator's measured RSS."""
 
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
@@ -18669,7 +18668,8 @@ class SimSlotsTest(unittest.TestCase):
         self.addCleanup(lambda: hook.close_all(self.held))
         hook._NEEDS_CACHE.clear()
         self.addCleanup(hook._NEEDS_CACHE.clear)
-        # a quiet 10-core, 32 GiB host with no needs file and the RAM ledger off (the default)
+        # a quiet 10-core, 32 GiB host, 90% free, no needs file (the 4.5 GiB stock RSS) and the RAM ledger off: the
+        # ceiling is (32 - 6.4 reserve) / 4.5 = 5
         self.load, self.pressure, self.swap = 1.0, 1, (0, 1 << 30)
         for name, value in (("load_1min", lambda: self.load), ("memory_pressure_level", lambda: self.pressure),
                             ("swap_usage", lambda: self.swap)):
@@ -18677,88 +18677,179 @@ class SimSlotsTest(unittest.TestCase):
             patcher.start()
             self.addCleanup(patcher.stop)
         patcher = mock.patch.dict(os.environ, {hook.HOST_CORES_ENV: "10", hook.HOST_MEM_ENV: str(32 * 1024),
-                                               hook.RAM_LEDGER_ENV: "0",
+                                               hook.HOST_MEM_FREE_ENV: "90", hook.RAM_LEDGER_ENV: "0",
                                                hook.JOB_NEEDS_ENV: os.fspath(self.dir / "no-needs.json"),
                                                "GITHUB_ENV": os.fspath(self.dir / "github-env"),
                                                "RUNNER_TEMP": os.fspath(self.dir / "temp")})
         patcher.start()
         self.addCleanup(patcher.stop)
+        os.environ.pop(hook.SIM_OFF_ENV, None)
 
     def keep(self, fds: list[int], *args: object, **kwargs: object) -> tuple[bool, str]:
         self.held.extend(fds)  # the admitted job runs on: its holder keeps every lock
         return True, "held"
 
-    def take(self, job: str = "ios-simulator", slots: int = 1, taken: dict | None = None) -> tuple[bool, str]:
+    def take(self, job: str = "ios-simulator", taken: dict | None = None) -> tuple[bool, str]:
         with mock.patch.object(hook, "hold", side_effect=self.keep), \
                 mock.patch.object(hook, "lock_waiters", return_value=[]), \
                 mock.patch.object(hook, "bounded_waiters", return_value=[]):
             return hook.take_capacity(os.fspath(self.dir / "fleet" / "host.lock"), self.capacity, 10, job,
-                                      os.getpid(), self.dir / "state", workflow="test-ios.yml", sim_slots=slots,
-                                      taken_out=taken)
+                                      os.getpid(), self.dir / "state", workflow="test-ios.yml", taken_out=taken)
 
     def slot_env(self) -> list[str]:
         path = self.dir / "github-env"
         return [line for line in path.read_text().splitlines() if line.startswith("GLAEDA_SIM_SLOT=")] \
             if path.exists() else []
 
-    def test_one_copy_by_default_is_today_and_tells_the_job_slot_0(self) -> None:
-        ok, why = self.take()
-        self.assertTrue(ok, why)
-        self.assertIn("1/10 units+simulator for ios-simulator (simulator", why)
-        self.assertIn("GLAEDA_SIM_SLOT=0 via GITHUB_ENV+RUNNER_TEMP", why)
-        self.assertEqual(self.slot_env(), ["GLAEDA_SIM_SLOT=0"])
-        self.assertEqual((self.dir / "temp" / hook.SIM_SLOT_FILE).read_text(), "0\n")
-        ok, why = self.take("screenshots")
-        self.assertFalse(ok)
-        self.assertEqual(why, "capacity: the simulator token is taken (screenshots is simulator)", "no copy past one")
-        self.assertFalse((self.capacity / "simulator-1.token").exists(), "no second copy is ever made")
-        self.assertEqual(hook.sim_token_names(1), ["simulator"])
+    def needs(self, classes: dict | None = None, jobs: dict | None = None) -> None:
+        path = self.dir / f"needs-{len(list(self.dir.glob('needs-*')))}.json"
+        path.write_text(json.dumps({
+            "schema": hook.JOB_NEEDS_SCHEMA, "min_samples": 20, "jobs": jobs or {}, "classes": classes or {},
+            "generated_at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}))
+        os.environ[hook.JOB_NEEDS_ENV] = os.fspath(path)
+        hook._NEEDS_CACHE.clear()
 
-    def test_copies_are_taken_in_order_then_refused(self) -> None:
-        for n, name in enumerate(("simulator", "simulator-1", "simulator-2")):
+    def test_copies_grow_while_headroom_holds_and_tell_each_job_its_slot(self) -> None:
+        for n in range(5):
             taken: dict = {}
-            ok, why = self.take(slots=3, taken=taken)
+            ok, why = self.take(taken=taken)
             self.assertTrue(ok, why)
+            name = "simulator" if n == 0 else f"simulator-{n}"
             self.assertIn(f"units+{name} for ios-simulator", why)
             self.assertEqual(taken["sim_slot"], n)
             self.assertEqual(self.slot_env()[-1], f"GLAEDA_SIM_SLOT={n}")
-        ok, why = self.take(slots=3)
-        self.assertFalse(ok)
-        self.assertEqual(why, "capacity: all 3 simulator tokens are taken (ios-simulator is simulator)")
-        self.assertEqual(hook.sim_token_names(9), ["simulator", "simulator-1", "simulator-2", "simulator-3"],
-                         "at most MAX_SIM_SLOTS")
-        self.assertEqual(hook.sim_token_names(0), ["simulator"])
+        self.assertEqual((self.dir / "temp" / hook.SIM_SLOT_FILE).read_text(), "4\n")
+        self.assertFalse(hook.probe(self.capacity / hook.SIM_GATE), "a copy past the first holds the gate shared")
 
-    def test_a_later_copy_needs_headroom_and_names_the_term(self) -> None:
-        ok, why = self.take(slots=2)
-        self.assertTrue(ok, why)
-        self.load = 7.5  # 0.75 x 10 cores
-        ok, why = self.take(slots=2)
+    def test_the_ceiling_is_never_exceeded(self) -> None:
+        self.assertEqual(hook.sim_ceiling(), (5, "(32 GiB - 6.4 reserve) / 4.5 GiB (stock fallback) = 5"))
+        for _ in range(5):
+            self.assertTrue(self.take()[0])
+        ok, why = self.take()
+        self.assertFalse(ok)
+        self.assertEqual(why, "capacity: all 5 simulator tokens are taken (ios-simulator is simulator)")
+        self.assertFalse((self.capacity / "simulator-5.token").exists(), "no copy past the ceiling is ever made")
+        self.assertEqual(hook.sim_copy_room(5, 0, self.capacity),
+                         "the ceiling is 5 simulators: (32 GiB - 6.4 reserve) / 4.5 GiB (stock fallback) = 5")
+        self.assertEqual(len(hook.sim_token_names()), 5)
+        with mock.patch.dict(os.environ, {hook.HOST_MEM_ENV: str(16 * 1024)}):
+            self.assertEqual(hook.sim_ceiling()[0], 2, "16 GiB: (16 - 4) / 4.5")
+        with mock.patch.dict(os.environ, {hook.HOST_MEM_ENV: str(96 * 1024)}):
+            self.assertEqual(hook.sim_ceiling()[0], 17, "96 GiB: (96 - 19.2) / 4.5")
+        with mock.patch.dict(os.environ, {hook.HOST_MEM_ENV: ""}), mock.patch.object(hook.sys, "platform", "linux"):
+            self.assertEqual(hook.sim_ceiling(), (1, "RAM unmeasured"), "unmeasured: one per mini, as before")
+
+    def test_the_ceiling_reads_the_measured_p95_rss(self) -> None:
+        row = {"n": 50, "cores_p90": 1.3, "rss_peak_mib_p90": 3846}
+        self.needs(jobs={hook.SIM_RSS_JOB_ROW: row})
+        self.assertEqual(hook.sim_rss_mib(), (3846, "test-ios.yml/ios-simulator-build rss p90"))
+        self.needs(jobs={hook.SIM_RSS_JOB_ROW: {**row, "rss_peak_mib_p95": 5120}})
+        self.assertEqual(hook.sim_rss_mib(), (5120, "test-ios.yml/ios-simulator-build rss p95"))
+        self.assertEqual(hook.sim_ceiling()[0], 5, "(32 - 6.4) / 5")
+        self.needs(classes={"simulator": {"n": 40, "cores_p90": 0.2, "rss_peak_mib_p95": 8192}},
+                   jobs={hook.SIM_RSS_JOB_ROW: {**row, "rss_peak_mib_p95": 5120}})
+        self.assertEqual(hook.sim_rss_mib(), (8192, "simulator rss p95"), "the class row first")
+        self.assertEqual(hook.sim_ceiling()[0], 3)
+        self.needs(classes={"simulator": {"n": 4, "cores_p90": 0.2, "rss_peak_mib_p95": 8192}})
+        self.assertEqual(hook.sim_rss_mib(), (hook.SIM_RSS_FALLBACK_MIB, "stock fallback"), "too few runs")
+
+    def test_copies_stop_at_80_percent_ram(self) -> None:
+        self.assertTrue(self.take()[0])
+        os.environ[hook.HOST_MEM_FREE_ENV] = "33"  # 10.6 GiB free less 4.5 is 6.1 < 6.4
+        ok, why = self.take()
         self.assertFalse(ok)
         self.assertTrue(why.startswith("capacity:"), "a headroom refusal waits like any capacity wait")
-        self.assertIn("; simulator-1 needs headroom: load1 7.5 >= 0.75 x 10 cores", why)
-        self.load, self.pressure = 1.0, 2
-        ok, why = self.take(slots=2)
-        self.assertIn("simulator-1 needs headroom: memory pressure level 2 >= 2", why)
-        self.pressure = 4
-        self.assertIn("memory pressure level 4", self.take(slots=2)[1])
-        self.pressure, self.swap = 1, ((2 << 30) // 5, 2 << 30)
-        self.assertIn("simulator-1 needs headroom: swap 20% used (0.4 of 2.0 GiB) >= 10%", self.take(slots=2)[1])
-        self.swap = (5 << 20, 0)  # no swap file yet: no term
-        self.assertIsNone(hook.sim_copy_room(1, 0, 0))
-        self.pressure, self.swap = None, None  # unreadable: holds nothing, as the gate fails open
-        ok, why = self.take(slots=2)
-        self.assertTrue(ok, why)
-        self.assertIn("units+simulator-1 for", why)
+        self.assertIn("; simulator-1 needs headroom: free RAM 10.6 GiB less one simulator 4.5 GiB < 20% of 32 GiB",
+                      why)
+        os.environ[hook.HOST_MEM_FREE_ENV] = "35"  # 11.2 - 4.5 = 6.7 >= 6.4
+        self.assertTrue(self.take()[0])
+        os.environ[hook.HOST_MEM_FREE_ENV] = "60"
+        self.assertIn("free RAM 19.2 GiB less one simulator 16.0 GiB", hook.sim_copy_room(2, 16 * 1024, None),
+                      "a job measured bigger than one simulator counts as itself")
+        os.environ[hook.HOST_MEM_FREE_ENV] = "junk"
+        self.assertIsNone(hook.sim_copy_room(2, 0, None), "unreadable: holds nothing")
 
-    def test_the_ram_term_uses_the_measured_need_unless_the_ledger_is_on(self) -> None:
-        # a 16 GiB host keeps a 4 GiB floor: two 7 GiB jobs and the floor fit 18 > 16
-        with mock.patch.dict(os.environ, {hook.HOST_MEM_ENV: str(16 * 1024)}):
-            self.assertIsNone(hook.sim_copy_room(0, 7 * 1024, 0), "copy 0 is never held")
-            self.assertEqual(hook.sim_copy_room(1, 7 * 1024, 0), "mem 16.0 GiB < 2 x 7.0 measured + 4.0 reserve")
-            self.assertIsNone(hook.sim_copy_room(1, 7 * 1024, 12), "the ledger's chunks decide RAM when it is on")
-            self.assertIsNone(hook.sim_copy_room(1, 5 * 1024, 0), "two 5 GiB jobs and the floor fit")
-            self.assertIsNone(hook.sim_copy_room(1, 0, 0), "no measured RAM: no RAM term")
+    def test_copies_stop_at_load_80_percent_of_the_cores(self) -> None:
+        self.assertTrue(self.take()[0])
+        self.load = 7.9
+        self.assertTrue(self.take()[0])
+        self.load = 8.0
+        ok, why = self.take()
+        self.assertFalse(ok)
+        self.assertIn("; simulator-2 needs headroom: load1 8.0 >= 0.8 x 10 cores", why)
+
+    def test_copies_stop_on_pressure_and_on_growing_swap(self) -> None:
+        self.assertTrue(self.take()[0])
+        self.pressure = 2
+        self.assertIn("simulator-1 needs headroom: memory pressure level 2 is not green (>= 2)", self.take()[1])
+        self.pressure = 4
+        self.assertIn("memory pressure level 4", self.take()[1])
+        self.pressure = 1
+        self.capacity.mkdir(exist_ok=True)
+        (self.capacity / hook.SIM_SWAP_SAMPLES).write_text(json.dumps([[time.time() - 60, 0]]))
+        self.swap = (512 << 20, 2 << 30)  # 512 MiB more in a minute: growing
+        ok, why = self.take()
+        self.assertFalse(ok)
+        self.assertIn("simulator-1 needs headroom: swap grew 512 MiB in the last 5 min", why)
+        (self.capacity / hook.SIM_SWAP_SAMPLES).write_text(json.dumps([[time.time() - 600, 0]]))
+        self.assertTrue(self.take()[0], "an old sample is out of the window: a high but steady swap holds nothing")
+        self.pressure, self.swap = None, None  # unreadable: holds nothing, as the gate fails open
+        self.assertTrue(self.take()[0])
+
+    def test_the_kill_switch_takes_no_copy(self) -> None:
+        self.capacity.mkdir()
+        (self.capacity / hook.SIM_OFF_FILE).touch()
+        ok, why = self.take()
+        self.assertFalse(ok)
+        self.assertIn("simulators are off on this mini", why)
+        self.assertTrue(hook.probe(self.capacity / "simulator.token"))
+        sim = hook.RunnerScope(10, 1, 1, sim=True)
+        (self.capacity / "admission.lock").touch()
+        self.assertIn("simulators are off", hook.mini_full(self.capacity, 10, sim), "the sim-first runner stops")
+        (self.capacity / hook.SIM_OFF_FILE).unlink()
+        with mock.patch.dict(os.environ, {hook.SIM_OFF_ENV: "1"}):
+            self.assertIn(f"{hook.SIM_OFF_ENV}=1", self.take()[1])
+            self.assertEqual(hook.job_class("ios-simulator-build", hook.DEFAULT_HOME_REPO, workflow="test-ios.yml"),
+                             ("isolated", False))
+        self.assertTrue(self.take()[0])
+
+    def test_the_eraser_gate_holds_later_copies(self) -> None:
+        self.assertTrue(self.take()[0])
+        self.capacity.mkdir(exist_ok=True)
+        eraser = hook.lock_file(self.capacity / hook.SIM_GATE, fcntl.LOCK_EX)
+        self.assertIsNotNone(eraser)
+        self.held.append(eraser)
+        ok, why = self.take()
+        self.assertFalse(ok)
+        self.assertIn("simulator-1: the simulator eraser holds simulator-copies.gate", why)
+        self.assertTrue(hook.probe(self.capacity / "simulator-1.token"), "nothing taken")
+
+    def test_no_manifest_count_is_read(self) -> None:
+        """simSlots and --sim-slots are ignored: the same headroom decides with or without them."""
+        runner = self.dir / "actions-runner-glaeda-6"
+        (runner / "glaeda-hooks").mkdir(parents=True)
+        script = runner / hook.RUNNER_HOOK_SCRIPT
+        script.parent.mkdir(parents=True, exist_ok=True)
+        script.write_text("exec python3 /hook job-started --capacity-units 10 --sim-slots 2 --instance 6 --sim-runner\n")
+        self.assertFalse(hasattr(hook.runner_scope(runner), "sim_slots"))
+        self.assertFalse(hasattr(hook, "MAX_SIM_SLOTS"))
+        self.assertFalse(hasattr(fleet_labels, "MAX_SIM_SLOTS"))
+        for _ in range(5):  # a hook file saying 2 still takes 5 here
+            self.assertTrue(self.take()[0])
+        manifest = json.loads(json.dumps(MANIFEST))
+        manifest["defaults"]["runner"] = {"classes": {"std": {"runners": 3, "capacityUnits": 14, "simSlots": 99}}}
+        manifest["hosts"]["mini-std"]["roles"].append("ios-simulators")
+        manifest["defaults"]["ios_simulator"] = {"runtimes": ["23F77"]}
+        err = io.StringIO()
+        with mock.patch.object(cr, "ios_sim_present", return_value=True), \
+                mock.patch.object(cr, "xcode_present", return_value=True), contextlib.redirect_stderr(err):
+            summary, why = cr.member_labels(manifest, "mini-std")
+        self.assertIsNotNone(summary, why)
+        self.assertNotIn("simSlots", summary)
+        self.assertIn("glaeda-ios-sim", summary["labels"])
+        self.assertFalse(any(label.startswith("glaeda-sim-slots-") for label in summary["labels"]))
+        self.assertEqual(err.getvalue().count("runner.classes.std.simSlots is ignored"), 1,
+                         "logged once per member read (an apply reads the rule once), never per runner")
 
     def test_fits_counts_a_free_copy_with_headroom(self) -> None:
         state = self.dir / "state" / "instance-3"
@@ -18767,20 +18858,19 @@ class SimSlotsTest(unittest.TestCase):
         self.capacity.mkdir()
         (self.capacity / "admission.lock").touch()
 
-        def fits(slots: int) -> list[str]:
+        def fits() -> list[str]:
             return hook.step_fits(self.capacity, 10, 1, 1, os.fspath(self.dir / "no-fleet" / "host.lock"),
-                                  os.fspath(self.dir / "no-reservation"), self.dir / "state", time.time(), slots)
+                                  os.fspath(self.dir / "no-reservation"), self.dir / "state", time.time())
 
-        self.assertIn("simulator", fits(1))
-        token = hook.lock_file(self.capacity / "simulator.token", fcntl.LOCK_EX)
-        self.held.append(token)
-        self.assertNotIn("simulator", fits(1), "one copy, taken")
-        self.assertIn("simulator", fits(2), "copy 1 is free")
+        self.assertIn("simulator", fits())
+        self.held.append(hook.lock_file(self.capacity / "simulator.token", fcntl.LOCK_EX))
+        self.assertIn("simulator", fits(), "copy 1 is free")
         self.load = 9.0
-        self.assertNotIn("simulator", fits(2), "copy 1 without headroom")
+        self.assertNotIn("simulator", fits(), "copy 1 without headroom")
         self.load = 1.0
-        self.held.append(hook.lock_file(self.capacity / "simulator-1.token", fcntl.LOCK_EX))
-        self.assertNotIn("simulator", fits(2), "both copies taken")
+        for c in range(1, 5):
+            self.held.append(hook.lock_file(self.capacity / f"simulator-{c}.token", fcntl.LOCK_EX))
+        self.assertNotIn("simulator", fits(), "every copy to the ceiling taken")
 
     def test_ci_step_admit_answers_its_sim_slot(self) -> None:
         self.capacity.mkdir()
@@ -18793,39 +18883,27 @@ class SimSlotsTest(unittest.TestCase):
             status, result = hook.step_admit("simulator", "sim-1-1", os.getpid(),
                                              os.fspath(self.dir / "fleet" / "host.lock"),
                                              os.fspath(self.dir / "no-reservation"), self.capacity, 10,
-                                             self.dir / "state", sim_slots=2)
+                                             self.dir / "state")
         self.assertEqual(status, 0, result)
         self.assertEqual((result["tokens"], result["sim_slot"]), (["simulator-1"], 1))
         self.assertEqual(self.slot_env(), [], "a step is told by its answer, never the runner's GITHUB_ENV")
 
-    def test_the_sim_first_runner_listens_while_any_copy_is_free(self) -> None:
-        sim = hook.RunnerScope(10, 1, 1, sim=True, sim_slots=2)
+    def test_the_sim_first_runner_listens_while_a_copy_is_admissible(self) -> None:
+        sim = hook.RunnerScope(10, 1, 1, sim=True)
         self.capacity.mkdir()
         (self.capacity / "admission.lock").touch()
         for slot in range(10):  # every unit taken: the sim-first runner still listens (SIM_FIRST)
             self.held.append(hook.lock_file(self.capacity / f"unit-{slot}", fcntl.LOCK_EX))
         self.assertIsNone(hook.mini_full(self.capacity, 10, sim))
         self.held.append(hook.lock_file(self.capacity / "simulator.token", fcntl.LOCK_EX))
-        self.assertEqual(hook.mini_full(self.capacity, 10, hook.RunnerScope(10, 1, 1, sim=True)),
-                         "the simulator token is taken", "one copy: today")
         self.assertIsNone(hook.mini_full(self.capacity, 10, sim), "copy 1 is free")
         self.pressure = 2
         self.assertEqual(hook.mini_full(self.capacity, 10, sim),
-                         "simulator-1 needs headroom: memory pressure level 2 >= 2")
+                         "simulator-1 needs headroom: memory pressure level 2 is not green (>= 2)")
         self.pressure = 1
-        self.held.append(hook.lock_file(self.capacity / "simulator-1.token", fcntl.LOCK_EX))
-        self.assertEqual(hook.mini_full(self.capacity, 10, sim), "all 2 simulator tokens on this mini are taken")
-
-    def test_runner_scope_reads_sim_slots(self) -> None:
-        runner = self.dir / "actions-runner-glaeda-6"
-        (runner / "glaeda-hooks").mkdir(parents=True)
-        script = runner / hook.RUNNER_HOOK_SCRIPT
-        script.parent.mkdir(parents=True, exist_ok=True)
-        for text, slots in (("--capacity-units 10 --instance 6 --sim-runner\n", 1),
-                            ("--capacity-units 10 --sim-slots 3 --instance 6 --sim-runner\n", 3),
-                            ("--capacity-units 10 --sim-slots 40 --instance 6\n", hook.MAX_SIM_SLOTS)):
-            script.write_text(f"exec python3 /hook job-started {text}")
-            self.assertEqual(hook.runner_scope(runner).sim_slots, slots, text)
+        for c in range(1, 5):
+            self.held.append(hook.lock_file(self.capacity / f"simulator-{c}.token", fcntl.LOCK_EX))
+        self.assertEqual(hook.mini_full(self.capacity, 10, sim), "all 5 simulator tokens on this mini are taken")
 
     def test_parse_swap_usage_reads_what_the_worker_reads(self) -> None:
         self.assertEqual(hook.parse_swap_usage("total = 2048.00M  used = 1003.25M  free = 1044.75M  (encrypted)"),
@@ -18836,34 +18914,28 @@ class SimSlotsTest(unittest.TestCase):
         for text in ("", "sysctl: unknown oid 'vm.swapusage'", "total = 2048.00M"):
             self.assertIsNone(hook.parse_swap_usage(text), text)
 
-    def test_ios_simulator_build_is_a_simulator_job_only_above_one_slot(self) -> None:
-        """One slot keeps ios-simulator-build isolated (up to 3 at once per mini, as today, so its queue does not
-        grow); above one it takes a token copy and its slot, at its own cost."""
+    def test_ios_simulator_build_is_a_simulator_job_above_a_ceiling_of_one(self) -> None:
+        """A ceiling of 1 keeps ios-simulator-build isolated (up to 3 at once per mini, so its queue does not grow);
+        above one it takes a token copy and its slot, at its own cost."""
         self.assertEqual(hook.job_class("ios-simulator-build", hook.DEFAULT_HOME_REPO, workflow="test-ios.yml"),
-                         ("isolated", False))
-        self.assertEqual(hook.job_class("ios-simulator-build", hook.DEFAULT_HOME_REPO, workflow="test-ios.yml",
-                                        sim_slots=2), ("simulator", False))
-        self.assertEqual(hook.job_class("mobile-core-package", hook.DEFAULT_HOME_REPO, workflow="test-ios.yml",
-                                        sim_slots=2), ("isolated", False), "no simulator there")
-        for n in range(3):  # one slot: three at once, no token
-            ok, why = self.take("ios-simulator-build")
-            self.assertTrue(ok, why)
-            self.assertIn("holding 3/10 units for ios-simulator-build (isolated", why)
-        self.assertEqual(self.slot_env(), [], "an isolated job is told no slot")
-        self.assertTrue(hook.probe(self.capacity / "simulator.token"))
-        hook.close_all(self.held)
-        self.held.clear()
-        ok, why = self.take("ios-simulator-build", slots=2)
+                         ("simulator", False))
+        self.assertEqual(hook.job_class("mobile-core-package", hook.DEFAULT_HOME_REPO, workflow="test-ios.yml"),
+                         ("isolated", False), "no simulator there")
+        ok, why = self.take("ios-simulator-build")
         self.assertTrue(ok, why)
         self.assertIn("holding 3/10 units+simulator for ios-simulator-build (simulator", why)
         self.assertEqual(self.slot_env(), ["GLAEDA_SIM_SLOT=0"])
-        ok, why = self.take("ios-simulator-build", slots=2)
-        self.assertIn("units+simulator-1 for ios-simulator-build", why)
+        self.assertIn("units+simulator-1 for ios-simulator-build", self.take("ios-simulator-build")[1])
+        hook.close_all(self.held)
+        self.held.clear()
+        with mock.patch.dict(os.environ, {hook.HOST_MEM_ENV: str(8 * 1024)}):  # (8 - 4) / 4.5: a ceiling of 1
+            self.assertEqual(hook.job_class("ios-simulator-build", hook.DEFAULT_HOME_REPO, workflow="test-ios.yml"),
+                             ("isolated", False))
 
-    def test_the_bound_is_one_number_across_the_tools(self) -> None:
-        self.assertEqual(hook.MAX_SIM_SLOTS, fleet_labels.MAX_SIM_SLOTS)
+    def test_the_eraser_and_the_hook_name_one_gate(self) -> None:
         disk = (ROOT / "scripts" / "glaeda-disk").read_text()
-        self.assertIn(f"\nSIM_TOKEN_COPIES = {hook.MAX_SIM_SLOTS}  #", disk, "glaeda-disk's eraser holds every copy")
+        self.assertIn(f'\nSIM_GATE = "{hook.SIM_GATE}"  #', disk)
+        self.assertNotIn("SIM_TOKEN_COPIES", disk)
 
 
 if __name__ == "__main__":

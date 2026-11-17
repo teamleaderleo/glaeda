@@ -7287,6 +7287,9 @@ LAND_RETRY_MAX = 1800.0
 LAND_REVIEW_WAIT = 3600.0
 LAND_STREAK_STOP = 3  # identical refusals in a row (code, head, step) that stop an entry
 LAND_RETRY_STREAK_STOP = 8  # ... for could-not-judge answers (quota, unreadable), which back off between tries
+# The steps of a could-not-judge answer: a retry, and the mirror fill an unreadable answer names (fetch), whose
+# failures step_refused counts on their own
+LAND_RETRY_KINDS = frozenset({"retry", "fetch"})
 # A quota refusal parks the entry: no judge, read, watch or nudge for it until the reset the refusal names (Leo,
 # 2026-11-17, on Claude desktop's "GitHub rate limit" hover: "this is... interesting. so claude desktop shows rate limit
 # on hover of the github links sometimes..."). Before, every quota-refused entry was judged again about every 5 min
@@ -7361,9 +7364,28 @@ LAND_FALLBACK = {"tip_merge": "update_branch", "stale_green": "update_branch", "
                  "review_running": "wait_comment", "no_ship": "review", "same_model": "review",
                  "regen_refused": "review"}
 LAND_KINDS = frozenset({"merge", "update_branch", "wait_pr", "wait_run", "wait_comment", "rerun_failed", "repin",
-                        "retry", "review", "retarget", "stop", "command"})
+                        "retry", "review", "retarget", "stop", "command", "fetch"})
 SHA40 = re.compile(r"[0-9a-f]{40}")
 BRANCH_SAFE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,250}")
+# A "fetch" step fills this host's mirror of the PR's repository. huge-blue, 2026-11-17 ~14:01Z: merge_hold could not
+# read its mirror (ls-remote failed) and refused leo-workspace#5653 and #5614 "unreadable", naming a fetch of that
+# mirror as a "command" step; the queue stops on a command, no lane can run one on huge-blue, and a coordinator ran
+# the fetch by hand. merge_hold (mirror_fetch_argv) now names it {"kind": "fetch", "argv": [...]}, one of two shapes,
+# which this queue checks again on its own (land_fetch_shape, then the mirror itself) before it runs it, bounded:
+# - git --git-dir MIRROR.git fetch [LAND_FETCH_OPTIONS] origin REFSPEC..., MIRROR's origin being the PR's repository
+#   on github.com (LAND_FETCH_ORIGIN), run with the bare env (this host's own git login);
+# - lane-gh fetch OWNER/REPO --dir MIRROR.git [--branch B]..., OWNER/REPO the PR's (a broker read: land_lane).
+# Any other argv stops the entry as policy and runs nothing. A fetch that fails is a refused step (step_refused): it
+# backs off, and the LAND_STEP_STOP-th identical failure stops the entry and tells the requester.
+LAND_FETCH_DEADLINE = 300.0
+LAND_FETCH_CONFIG_DEADLINE = 10.0  # git config --get remote.origin.url
+LAND_FETCH_OPTIONS = frozenset({"--quiet", "--no-tags", "--no-write-fetch-head"})
+LAND_FETCH_REFSPEC = re.compile(r"\+?refs/(?:heads|pull)/[\w./-]+:refs/remotes/origin/[\w./-]+|[0-9a-f]{40}|\w[\w./-]*")
+LAND_FETCH_BRANCH = re.compile(r"\w[\w./-]*")
+LAND_FETCH_REPO = re.compile(r"[\w.-]+/[\w.-]+")
+LAND_FETCH_ORIGIN = re.compile(
+    r"(?:https://github\.com/|ssh://git@github\.com/|git@github\.com:)([\w.-]+/[\w.-]+?)(?:\.git)?/?")
+LAND_FETCH_UNSAFE = frozenset("\0\n\r\t ;|&$`<>\\'\"*?")
 
 
 # The lane a land step writes as. lane-gh (a lane VM's broker client) fences every write (land, update_branch, rerun)
@@ -7481,6 +7503,48 @@ def land_fingerprint(cache: dict | None) -> str:
                      str(c.get("conclusion") or "")) for c in data.get("checks") or [])
     doc = [data.get("headRefOid"), data.get("state"), data.get("mergeable"), checks]
     return hashlib.sha256(json.dumps(doc, sort_keys=True).encode()).hexdigest()[:16]
+
+
+def land_fetch_mirror_ok(mirror: str) -> bool:
+    return os.path.isabs(mirror) and mirror.endswith(".git") and ".." not in mirror.split("/")
+
+
+def land_fetch_shape(argv: Any, repo: str) -> tuple[str, str, str]:
+    """(form "git" or "lane-gh", the mirror, "") when ARGV is one of a fetch step's two shapes (LAND_FETCH_DEADLINE's
+    comment) for REPO, else ("", "", why not). Reads nothing: the mirror itself is do_fetch's to check."""
+    if not isinstance(argv, list) or not argv or not all(isinstance(a, str) for a in argv):
+        return "", "", "the fetch step's argv is not a list of strings"
+    if any(not a or LAND_FETCH_UNSAFE.intersection(a) for a in argv):
+        return "", "", f"the fetch step's argv holds an empty word or a shell character: {land_trim(argv, 160)}"
+    if argv[:2] == ["git", "--git-dir"] and len(argv) >= 6 and argv[3] == "fetch":
+        if not land_fetch_mirror_ok(argv[2]):
+            return "", "", f"git fetch's --git-dir {argv[2]!r} is not an absolute path ending .git"
+        rest = argv[4:]
+        while rest and rest[0] in LAND_FETCH_OPTIONS:
+            rest = rest[1:]
+        if len(rest) < 2 or rest[0] != "origin":
+            return "", "", f"git fetch names {rest[0] if rest else 'nothing'!r} where origin and a refspec go"
+        bad = [r for r in rest[1:] if not LAND_FETCH_REFSPEC.fullmatch(r) or ".." in r]
+        if bad:
+            return "", "", f"git fetch with a refspec or option this queue does not run: {bad[0]!r}"
+        return "git", argv[2], ""
+    if argv[:2] == ["lane-gh", "fetch"] and len(argv) >= 5 and argv[3] == "--dir":
+        if not land_fetch_mirror_ok(argv[4]):
+            return "", "", f"lane-gh fetch's --dir {argv[4]!r} is not an absolute path ending .git"
+        if not LAND_FETCH_REPO.fullmatch(argv[2]) or argv[2].lower() != repo.lower():
+            return "", "", f"lane-gh fetch names {argv[2]!r}, not this PR's {repo}"
+        pairs = argv[5:]
+        if len(pairs) % 2 or not all(pairs[i] == "--branch" and LAND_FETCH_BRANCH.fullmatch(pairs[i + 1])
+                                     and ".." not in pairs[i + 1] for i in range(0, len(pairs), 2)):
+            return "", "", f"lane-gh fetch with an option this queue does not run: {land_trim(pairs, 160)}"
+        return "lane-gh", argv[4], ""
+    return "", "", f"the fetch step is neither git --git-dir M fetch nor lane-gh fetch: {land_trim(argv[:5], 160)}"
+
+
+def land_fetch_origin(url: str) -> str:
+    """OWNER/REPO a github.com remote URL names (https, ssh:// or scp form), else ""."""
+    m = LAND_FETCH_ORIGIN.fullmatch(url.strip())
+    return m.group(1) if m else ""
 
 
 def land_fallback(answer: dict, head: str) -> dict:
@@ -8434,9 +8498,10 @@ class LandQueue:
             e.pop("quotaRefusals", None)
             if answer.get("ok"):
                 e["streak"] = None
-            elif self.streak(e, f"{answer.get('code')}|{head}|{act.get('kind')}", act.get("kind") == "retry", counts):
+            elif self.streak(e, f"{answer.get('code')}|{head}|{act.get('kind')}", act.get("kind") in LAND_RETRY_KINDS,
+                             counts):
                 self.stop(e, str(answer.get("code") or "refused"),
-                          f"{LAND_STREAK_STOP if act.get('kind') != 'retry' else LAND_RETRY_STREAK_STOP} identical "
+                          f"{LAND_RETRY_STREAK_STOP if act.get('kind') in LAND_RETRY_KINDS else LAND_STREAK_STOP} identical "
                           f"refusals in a row: {land_trim(answer.get('reason'))}", land_trim(answer.get("next")))
                 return
             self.save(e)
@@ -8519,6 +8584,9 @@ class LandQueue:
                     self.stop(e, "policy", f"retarget to an unsafe base name {base!r}", land_trim(answer.get("next")))
                 return
             self.push_step(e, "retarget", head, ["pr", "edit", number, "-R", repo, "--base", base], base=base)
+            return
+        if kind == "fetch":
+            self.do_fetch(e, act, answer, head)
             return
         if kind == "rerun_failed":
             runs = [int(r) for r in act.get("runs") or [] if str(r).isdigit()]
@@ -8607,6 +8675,44 @@ class LandQueue:
                 self.nudge(e["key"])
                 named = self.step_refused(e, kind, head, got)
         if named == "update_branch" and kind != "update_branch":
+            self.update_branch(e, head)
+
+    def do_fetch(self, e: dict, act: dict, answer: dict, head: str) -> None:
+        """Fill this host's mirror as merge_hold named (LAND_FETCH_DEADLINE's comment), then judge again soon. An argv
+        that is not one of the two shapes, for this PR's repository and an existing mirror, stops as policy."""
+        repo, argv = e["repo"], act.get("argv")
+        form, mirror, why = land_fetch_shape(argv, repo)
+        if not why and not os.path.isdir(mirror):
+            why = f"the fetch step's mirror {mirror} is not a directory on this host"
+        git = self.path("git", Path(shutil.which("git") or "/usr/bin/git")).as_posix()
+        if not why and form == "git":
+            got = self.call([git, "--git-dir", mirror, "config", "--get", "remote.origin.url"],
+                            LAND_FETCH_CONFIG_DEADLINE)
+            origin = land_fetch_origin(got.stdout or "") if got.returncode == 0 else ""
+            if origin.lower() != repo.lower():
+                why = (f"the mirror {mirror}'s origin is {land_trim(got.stdout, 120) or 'unreadable'}, "
+                       f"not github.com/{repo}")
+        if why:
+            with self.lock:
+                self.stop(e, "policy", land_trim(why), land_trim(answer.get("next")))
+            return
+        if form == "git":  # this host's own git login reads github.com: the bare env
+            run, step_env = [git, *argv[1:]], None
+        else:  # a broker read: the requester's lane only names it in the broker's audit log (land_lane)
+            run, step_env = [self.path("laneGh", Path(LANE_GH_CMD)).as_posix(), *argv[1:]], e
+        with self.lock:
+            self.claim(e, "fetch", argv=list(argv), form=form)
+        got = self.call(run, LAND_FETCH_DEADLINE, step_env)
+        named = None
+        with self.lock:
+            self.finish(e, got)
+            self.nudge(e["key"])
+            if got.returncode == 0:
+                e.pop("stepFail", None)
+                self.wait(e, {"kind": "retry", "why": "filled the mirror merge_hold could not read"}, NUDGE_MIN * 3)
+            else:
+                named = self.step_refused(e, "fetch", head, got)
+        if named == "update_branch":
             self.update_branch(e, head)
 
     def update_branch(self, e: dict, head: str, needs: list[str] | None = None) -> None:
