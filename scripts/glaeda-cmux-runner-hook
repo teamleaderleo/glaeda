@@ -7280,6 +7280,218 @@ def load_1min() -> float | None:
         return None
 
 
+# HOST_LOAD_CAP: cmuxterm-hq#12331's host load cap (CMUX_CI_HOST_LOAD_CAP) at the listener. That cap keeps the build
+# controller from placing a ci-step on a host whose mean load1 per core over the last 2 minutes is above 1.5 while
+# another capable host is under it, but GitHub runner jobs reach a mini through this gate, which had no such cap: on
+# 2026-11-16 at 23:5xZ cmux21 ran at 6.4x its cores and cmux22 at 5.5x while other Macs idled. The overload hold
+# above waits for twice the cores and lets go after GATE_LOAD_MAX_HOLD_S whatever the fleet does, so a backlog
+# outlasted it. So a side or root listener on a host over the cap (the mean of the gate's own getloadavg reads over
+# HOST_LOAD_CAP_WINDOW_S, per core) stops taking new jobs while another host's listener for the same label is keeping
+# up, and listens as soon as it is not. The evidence is the build controller's GitHub workflow_job feed
+# (/v1/github/actions over the tailnet: no GitHub API quota, no token): an idle listener elsewhere takes a job of its
+# label within seconds, so the label is kept up with while some other host's runner has taken a job of that label
+# set (running, or done in the last HOST_LOAD_CAP_RECENT_S) and no job this runner could take has waited
+# HOST_LOAD_CAP_GRACE_S for a runner. When every capable host is over the cap their listeners are all held, a job waits past the grace, and every one of them listens again: the
+# job runs where it fits (busy is slower, never a failure), so the cap never strands work. It only defers; nothing
+# is refused or failed. Exempt, as in the controller: the nightly slot and a queued nightly or promotion job
+# (urgent), a job whose labels name this host (pinned), and the gateway runners that carry measurements (cmux-ci
+# run --measurement) and other thin clients; the gui, session and freshness runners are exempt as from the CPU and
+# overload holds. A feed that cannot be read, has had no delivery for HOST_LOAD_CAP_FEED_STALE_S, or shows no other
+# host serving the label holds nothing. CMUX_CI_HOST_LOAD_CAP (in the runner LaunchAgent's environment) sets the cap
+# in load per core; "off" or 0 turns it off; runner-gate.json's hostLoadCap (a number, or false) sets it by default
+# or per host, and the environment wins.
+HOST_LOAD_CAP_ENV = "CMUX_CI_HOST_LOAD_CAP"
+HOST_LOAD_CAP_DEFAULT = 1.5
+HOST_LOAD_CAP_WINDOW_S = 120.0  # the controller's stepLoadWindow
+HOST_LOAD_CAP_MIN_SPAN_S = float(os.environ.get("GLAEDA_RUNNER_GATE_LOAD_CAP_MIN_SPAN_S") or 30.0)
+HOST_LOAD_CAP_GRACE_S = float(os.environ.get("GLAEDA_RUNNER_GATE_LOAD_CAP_GRACE_S") or 120.0)
+HOST_LOAD_CAP_FEED_EVERY_S = float(os.environ.get("GLAEDA_RUNNER_GATE_LOAD_CAP_FEED_EVERY_S") or 60.0)
+HOST_LOAD_CAP_FEED_STALE_S = 600.0
+HOST_LOAD_CAP_RECENT_S = 600.0  # jobs completed this recently show which hosts serve a label (about 1.6 MB a read)
+HOST_LOAD_CAP_JOB_MAX_AGE_S = 3 * 3600.0  # a queued job older than this is a lost delivery, not a waiting job
+HOST_LOAD_CAP_FEED_TIMEOUT_S = 20.0
+HOST_LOAD_CAP_FEED_MAX_BYTES = 32 * 1024 * 1024
+HOST_LOAD_CAP_FEED_FILE = "load-cap-feed.json"  # in the state dir: one fetch a minute serves every gate on the mini
+HOST_LOAD_CAP_REPO = "manaflow-ai/cmux"
+HOST_LOAD_CAP_CONTROLLER_DEFAULT = "http://100.89.225.106:18765"
+HOST_LOAD_CAP_CONTROLLER_CONFIG = ".local/share/cmux-fleet-client/client.json"  # under HOME, as glaeda-gh reads it
+HOST_LOAD_CAP_URGENT = re.compile(r"(?i)nightly|promot")  # in a workflow or branch name: the urgent class
+LOAD_CAPPED = "the host is over its load cap"
+
+
+def host_load_cap(doc: dict[str, Any] | None, host: str, now: float, raw: str | None = None) -> float:
+    """The cap in load1 per core, 0 for off: CMUX_CI_HOST_LOAD_CAP when set ("off" or 0 is off; an invalid value
+    keeps the default, as the controller's hostLoadCap does), else the host's live hostLoadCap entry in
+    runner-gate.json, else defaults.hostLoadCap, else HOST_LOAD_CAP_DEFAULT. false in the file is off."""
+    def parse(value: Any) -> float | None:
+        if value is False:
+            return 0.0
+        if isinstance(value, str):
+            text = value.strip().lower()
+            if text in ("off", "false", "no", "disabled"):
+                return 0.0
+            try:
+                value = float(text)
+            except ValueError:
+                return None
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        value = float(value)
+        return value if math.isfinite(value) and value >= 0 else None
+
+    env = os.environ.get(HOST_LOAD_CAP_ENV) if raw is None else raw
+    if env is not None and env.strip():
+        got = parse(env)
+        return HOST_LOAD_CAP_DEFAULT if got is None else got
+    cap = HOST_LOAD_CAP_DEFAULT
+    defaults = doc.get("defaults") if isinstance(doc, dict) else None
+    if isinstance(defaults, dict) and "hostLoadCap" in defaults and (got := parse(defaults["hostLoadCap"])) is not None:
+        cap = got
+    hosts = doc.get("hosts") if isinstance(doc, dict) else None
+    entry = hosts.get(host) if isinstance(hosts, dict) else None
+    if isinstance(entry, dict) and "hostLoadCap" in entry and _live_entry(entry, now) \
+            and (got := parse(entry["hostLoadCap"])) is not None:
+        cap = got
+    return cap
+
+
+def runner_host(name: Any) -> str | None:
+    """The host part of a glaeda runner name (cmux21-glaeda-3 -> cmux21, cmux10s-mac-mini-glaeda -> cmux10s-mac-mini),
+    lowercased, or None for any other runner (GitHub-hosted, Blacksmith)."""
+    if not isinstance(name, str) or "-glaeda" not in name:
+        return None
+    return name.split("-glaeda", 1)[0].lower() or None
+
+
+def runner_labels(state_dir: Path, name: str | None) -> frozenset[str] | None:
+    """This runner's registered labels: the install receipt (state_dir/receipt.json or instance-N/receipt.json) whose
+    registration names it. None when no receipt does."""
+    if not name:
+        return None
+    for receipt in sorted([state_dir / "receipt.json", *state_dir.glob("instance-*/receipt.json")]):
+        try:
+            doc = json.loads(receipt.read_text())
+        except (OSError, ValueError):
+            continue
+        reg = doc.get("registration") if isinstance(doc, dict) else None
+        labels = reg.get("labels") if isinstance(reg, dict) else None
+        if isinstance(reg, dict) and reg.get("name") == name and isinstance(labels, list) \
+                and all(isinstance(label, str) for label in labels) and labels:
+            return frozenset(labels)
+    return None
+
+
+def _feed_time(value: Any) -> float | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        at = datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return at.timestamp() if at.tzinfo is not None else None
+
+
+def load_cap_summary(doc: Any, now: float) -> dict[str, Any] | None:
+    """The controller's /v1/github/actions answer reduced to what the load cap reads: its last delivery and, for every
+    open job on a glaeda label, its labels, status, creation time, the host of its runner and whether it is urgent.
+    None when the answer is not one."""
+    if not isinstance(doc, dict) or not isinstance(doc.get("jobs"), list):
+        return None
+    jobs = []
+    for job in doc["jobs"]:
+        if not isinstance(job, dict):
+            continue
+        labels = job.get("labels")
+        if not isinstance(labels, list) or not labels or not all(isinstance(label, str) for label in labels) \
+                or not any(label.startswith("glaeda-") for label in labels):
+            continue
+        status = job.get("status")
+        if status not in ("queued", "in_progress", "waiting", "pending", "completed"):
+            continue
+        urgent = any(HOST_LOAD_CAP_URGENT.search(str(job.get(key) or "")) for key in ("workflow", "head_branch"))
+        jobs.append({"labels": sorted(labels), "status": status, "created": _feed_time(job.get("created_at")),
+                     "host": runner_host(job.get("runner")), "urgent": urgent})
+    return {"at": now, "delivery": _feed_time(doc.get("receiver_last_delivery")), "jobs": jobs}
+
+
+def load_cap_controller(home: Path | None = None) -> str | None:
+    """The build controller's base URL: $CMUX_CI_CONTROLLER, else the cmux-ci client config, else the default."""
+    base = os.environ.get("CMUX_CI_CONTROLLER", "").strip()
+    if not base:
+        try:
+            doc = json.loads(((home or Path.home()) / HOST_LOAD_CAP_CONTROLLER_CONFIG).read_text())
+            base = doc.get("controller") if isinstance(doc, dict) else None
+        except (OSError, ValueError):
+            base = None
+        base = base or HOST_LOAD_CAP_CONTROLLER_DEFAULT
+    return base.rstrip("/") if isinstance(base, str) and base.startswith(("http://", "https://")) else None
+
+
+def load_cap_fetch(now: float) -> dict[str, Any] | None:
+    """One read of the controller's open GitHub jobs for HOST_LOAD_CAP_REPO, summarized; None on any failure."""
+    import urllib.parse
+    import urllib.request
+    base = load_cap_controller()
+    if base is None:
+        return None
+    url = (f"{base}/v1/github/actions?repo={urllib.parse.quote(HOST_LOAD_CAP_REPO, safe='/')}"
+           f"&recent={HOST_LOAD_CAP_RECENT_S:g}")
+    try:
+        with urllib.request.urlopen(url, timeout=HOST_LOAD_CAP_FEED_TIMEOUT_S) as response:
+            body = response.read(HOST_LOAD_CAP_FEED_MAX_BYTES + 1)
+    except Exception:  # noqa: BLE001 - an unreachable controller holds nothing
+        return None
+    if len(body) > HOST_LOAD_CAP_FEED_MAX_BYTES:
+        return None
+    try:
+        return load_cap_summary(json.loads(body), now)
+    except (ValueError, RecursionError):
+        return None
+
+
+def load_cap_verdict(summary: dict[str, Any] | None, labels: frozenset[str] | None, host: str,
+                     now: float) -> str | None:
+    """Why another host's listener keeps up with this runner's label (so an over-cap mini may hold its listener off),
+    or None, which listens: no feed, a stale one, no other host serving a job this runner could take, or such a job
+    queued that is urgent, pinned to this host, or has waited HOST_LOAD_CAP_GRACE_S (no idle listener took it)."""
+    if not isinstance(summary, dict) or not labels:
+        return None
+    delivery = summary.get("delivery")
+    if not isinstance(delivery, (int, float)) or now - delivery > HOST_LOAD_CAP_FEED_STALE_S:
+        return None
+    jobs = summary.get("jobs") if isinstance(summary.get("jobs"), list) else []
+    takeable = [job for job in jobs if isinstance(job, dict) and isinstance(job.get("labels"), list)
+                and job["labels"] and set(job["labels"]) <= labels]
+    served = sorted({" ".join(job["labels"]) for job in takeable
+                     if job.get("host") and job.get("host") != host and job.get("status") in ("in_progress", "completed")})
+    if not served:
+        return None
+    pinned = re.compile(rf"(?:^|[^a-z0-9]){re.escape(host.lower())}(?:$|[^a-z0-9])") if host else None
+    for job in takeable:
+        if job.get("status") in ("in_progress", "completed"):
+            continue
+        created = job.get("created")
+        age = now - created if isinstance(created, (int, float)) else None
+        if age is not None and age > HOST_LOAD_CAP_JOB_MAX_AGE_S:
+            continue  # a lost delivery
+        if job.get("urgent") or (pinned is not None and any(pinned.search(label.lower()) for label in job["labels"])):
+            return None
+        if age is None or age >= HOST_LOAD_CAP_GRACE_S:
+            return None
+    return f"another host's listener takes {served[0]} jobs"
+
+
+def mean_load_per_core(samples: list[tuple[float, float]], cores: int | None, now: float) -> float | None:
+    """The mean of the load1 reads of the last HOST_LOAD_CAP_WINDOW_S per core, or None while they span less than
+    HOST_LOAD_CAP_MIN_SPAN_S (one read after a reload is not two minutes) or the cores are unknown."""
+    if not cores or cores <= 0:
+        return None
+    recent = [(at, load) for at, load in samples if now - at <= HOST_LOAD_CAP_WINDOW_S]
+    if len(recent) < 2 or recent[-1][0] - recent[0][0] < HOST_LOAD_CAP_MIN_SPAN_S:
+        return None
+    return sum(load for _, load in recent) / len(recent) / cores
+
+
 def host_saturated(paused: bool, cpu_busy: float | None = None, memory_pressure: int | None = None) -> str | None:
     """Why the listener should pause from measured host pressure, or None when it has headroom.
 
@@ -7868,6 +8080,16 @@ class Gate:
         self.tailnet_seen = 0  # looks in a row that found this mini off the tailnet
         self.tailnet_at = -GATE_TAILNET_EVERY_S
         self.tailnet_thread: threading.Thread | None = None
+        # HOST_LOAD_CAP: the gate's own load1 reads (monotonic, load) of the last HOST_LOAD_CAP_WINDOW_S, the cap in
+        # force (host_load_cap, refreshed with the other settings), the feed summary and this runner's labels
+        self.cap_samples: list[tuple[float, float]] = []
+        self.cap_sample_at = -GATE_CPU_EVERY_S
+        self.cap = HOST_LOAD_CAP_DEFAULT
+        self.cap_why: str | None = None
+        self.cap_summary: dict[str, Any] | None = None
+        self.cap_labels: frozenset[str] | None = None
+        self.cap_feed_at = -HOST_LOAD_CAP_FEED_EVERY_S
+        self.cap_thread: threading.Thread | None = None
         self.stale_env: str | None = None  # why an adopted listener's env is not listener_env's (listen())
         self.disk_warned_at: float | None = None  # when the last low-disk warning was logged
         self.disk_evicted_at = -GATE_DISK_EVICT_EVERY_S  # when the last eviction under the floor started
@@ -7978,6 +8200,7 @@ class Gate:
             # load and heat never hold it off, only what would fail its job here (disk, a missing Rust toolchain)
             # or keep it waiting in job-started (a signing job's claim on a yieldToExclusive runner)
             return self.low_disk() or self.dedicated_toolchain() or self.exclusive_yield()
+        self.cap_sample(time.monotonic())  # HOST_LOAD_CAP reads load whatever holds the gate now
         why = host_held(self.host_lock, self.reservation, time.time(), self.state_dir,
                         nightly_slot=runner_scope(self.runner_dir).nightly)
         if why is None and self.waiters and self.waiters_due():
@@ -7987,7 +8210,7 @@ class Gate:
         if why:
             self.load_since = None  # the fleet's claim, not load, is holding this gate
             self.yield_to_fleet()
-        return (why or self.shed(self.saturated()) or self.full() or self.shed(self.hot()) or self.stalled()
+        return (why or self.shed(self.saturated()) or self.load_capped() or self.full() or self.shed(self.hot()) or self.stalled()
                 or self.locked() or self.low_disk() or self.ineligible() or self.off_tailnet())
 
     def exclusive_yield(self) -> str | None:
@@ -8059,6 +8282,86 @@ class Gate:
         ticks = host_cpu_ticks()
         if ticks is not None and (busy := self.cpu_window.add(now, ticks)) is not None:
             self.cpu_busy, self.cpu_at = busy, now
+        self.cap_sample(now)
+
+    def cap_sample(self, now: float) -> None:
+        """One load1 read for HOST_LOAD_CAP every GATE_CPU_EVERY_S, during a job too (cpu_feed), so the look right
+        after a job averages the last two minutes. getloadavg only: no process."""
+        if now - self.cap_sample_at < GATE_CPU_EVERY_S:
+            return
+        self.cap_sample_at = now
+        if (load := load_1min()) is not None:
+            self.cap_samples.append((now, load))
+        self.cap_samples = [(at, value) for at, value in self.cap_samples if now - at <= HOST_LOAD_CAP_WINDOW_S]
+
+    def cap_look(self) -> None:
+        """Refresh the feed summary and this runner's labels in a thread, at most every HOST_LOAD_CAP_FEED_EVERY_S.
+        Every gate on the mini shares one read through HOST_LOAD_CAP_FEED_FILE."""
+        running = self.cap_thread is not None and self.cap_thread.is_alive()
+        if running or time.monotonic() - self.cap_feed_at < HOST_LOAD_CAP_FEED_EVERY_S:
+            return
+        self.cap_feed_at = time.monotonic()
+
+        def look() -> None:
+            try:
+                self.cap_labels = runner_labels(self.state_dir, runner_config(self.runner_dir)[0])
+                path, now = self.state_dir / HOST_LOAD_CAP_FEED_FILE, time.time()
+                summary = None
+                with contextlib.suppress(OSError, ValueError, RecursionError):
+                    raw = read_bounded(path)
+                    shared = json.loads(raw.decode("utf-8")) if raw is not None else None
+                    at = shared.get("at") if isinstance(shared, dict) else None
+                    if isinstance(at, (int, float)) and 0 <= now - at < HOST_LOAD_CAP_FEED_EVERY_S:
+                        summary = shared
+                if summary is None:
+                    summary = load_cap_fetch(now)
+                    if summary is not None:
+                        with contextlib.suppress(OSError):
+                            tmp = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}")
+                            tmp.write_text(json.dumps(summary, separators=(",", ":")))
+                            os.replace(tmp, path)
+                self.cap_summary = summary
+            except Exception as error:  # noqa: BLE001 - a broken look must never stop the gate
+                self.cap_summary = None
+                gate_log(f"the host load cap's feed look failed ({type(error).__name__}); not holding for it")
+
+        self.cap_thread = threading.Thread(target=look, name="load-cap", daemon=True)
+        self.cap_thread.start()
+
+    def load_capped(self) -> str | None:
+        """HOST_LOAD_CAP: why this side or root listener takes no new job because the host is over its load cap while
+        another host's listener keeps up with its label, or None. Only defers: the moment no other listener keeps
+        up (a job waits HOST_LOAD_CAP_GRACE_S, an urgent or pinned job queues, or the feed cannot say) it listens."""
+        scope = runner_scope(self.runner_dir)
+        exempt = scope.gui or scope.session or scope.fresh or scope.nightly or scope.gateway or scope.dedicated
+        if exempt:
+            return self.cap_release(None)
+        self.cpu_holds()  # refreshes self.cap with the other settings, at most every GATE_SETTINGS_EVERY_S
+        if self.cap <= 0:
+            return self.cap_release(None)
+        now = time.monotonic()
+        self.cap_sample(now)
+        per = mean_load_per_core(self.cap_samples, os.cpu_count(), now)
+        if per is None or per <= self.cap:
+            return self.cap_release(None)
+        self.cap_look()
+        host = runner_host(runner_config(self.runner_dir)[0]) or gate_host()
+        verdict = load_cap_verdict(self.cap_summary, self.cap_labels, host, time.time())
+        if verdict is None:
+            return self.cap_release(f"mean load {per:.1f} per core is over the cap of {self.cap:g}, but no other "
+                                    "listener keeps up with this runner's label: listening")
+        why = f"{LOAD_CAPPED} (mean 1-minute load over {self.cap:g} per core for 2 min) while {verdict}"
+        if why != self.cap_why:
+            gate_log(f"{why}; measured {per:.1f} per core on {os.cpu_count()} cores")
+        self.cap_why = why
+        return why
+
+    def cap_release(self, note: str | None) -> None:
+        """End a HOST_LOAD_CAP hold, logging why once."""
+        if self.cap_why is not None:
+            gate_log(note or "the host is under its load cap again")
+        self.cap_why = None
+        return None
 
     def cpu_holds(self) -> bool:
         """Whether the CPU marks hold this mini's listeners (config/runner-gate.json's cpuHold; gate_cpu_hold), read
@@ -8078,6 +8381,10 @@ class Gate:
             gate_log("the overload hold is " + (f"at {overload[0]:g} per core (resume {overload[1]:g}, CPU at least "
                                                 f"{overload[2]:g}%)" if overload else "off") + " on this mini")
         self.overload = overload
+        cap = host_load_cap(doc, gate_host(), time.time())
+        if cap != self.cap:
+            gate_log(f"the host load cap is {f'{cap:g} per core' if cap > 0 else 'off'} on this mini")
+        self.cap = cap
         return hold
 
     def saturated(self) -> str | None:
@@ -8219,6 +8526,7 @@ class Gate:
             return drain
         if runner_scope(self.runner_dir).dedicated:
             return self.claimed()
+        self.cap_sample(time.monotonic())  # HOST_LOAD_CAP reads load whatever holds the gate now
         why = host_held(self.host_lock, self.reservation, time.time(), self.state_dir,
                         nightly_slot=runner_scope(self.runner_dir).nightly)
         if why is None and self.waiting:
@@ -8229,7 +8537,7 @@ class Gate:
         if why:
             self.load_since = None
             self.yield_to_fleet()
-        return (why or self.shed(self.saturated()) or self.full(fresh=True) or self.shed(self.hot(fresh=True))
+        return (why or self.shed(self.saturated()) or self.load_capped() or self.full(fresh=True) or self.shed(self.hot(fresh=True))
                 or self.stalled() or self.locked(fresh=True) or self.low_disk() or self.ineligible() or self.off_tailnet())
 
     def still_waiting(self) -> str | None:
