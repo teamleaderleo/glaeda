@@ -7067,6 +7067,16 @@ LAND_STEP_STOP = 6  # 60+120+240+480+960 s of backoff (~31 min) before the 6th i
 LAND_STEP_NEXT_UPDATE = re.compile(r"\bnext: (?:gh pr update-branch \d+|gh api -X PUT \S*/pulls/\d+/update-branch)")
 LAND_STEP_NEXT_WAIT = re.compile(r"\bnext: glaeda-gh wait pr \S+[^\n;]*?(?:--timeout (\d+))?(?=\s*(?:\(|$|\n|;))")
 LAND_STEP_CODE = re.compile(r"\brefused \[([a-z_]+)")
+# A "command" step that is a wait this queue runs itself. cosmic-gray, 2026-11-17: merge_hold refused cmux#45404 (the
+# base clippy fix) `checks_running` with the step {"kind": "command", "text": "glaeda-gh wait run
+# manaflow-ai/cmux/44061804279 --timeout 3600"}, and land stopped on it twice, each stop also stopping every land queued
+# `--after` it (#45302, #45281, #45350). A refusal that names a next step is a step, not a stop: a command that is
+# exactly `glaeda-gh wait run OWNER/REPO/ID` or `glaeda-gh wait pr OWNER/REPO#N` (with --timeout, --until) on this PR's
+# repository is taken as that wait, then judged again; LAND_STREAK_STOP identical refusals in a row still stop it.
+LAND_COMMAND_WAIT_RUN = re.compile(r"\s*glaeda-gh wait run ([\w.-]+/[\w.-]+)/(\d+)((?:\s+--[a-z-]+(?:[ =]\S+)?)*)\s*")
+LAND_COMMAND_WAIT_PR = re.compile(r"\s*glaeda-gh wait pr ([\w.-]+/[\w.-]+)#(\d+)((?:\s+--[a-z-]+(?:[ =]\S+)?)*)\s*")
+LAND_COMMAND_TIMEOUT = re.compile(r"--timeout[ =](\d+)")
+LAND_COMMAND_UNTIL = re.compile(r"--until[ =](green|done|required|merged)\b")
 LAND_HISTORY = 60
 LAND_KEEP = 7 * 86400  # finished entries are kept this long for `land status`
 LAND_COUNT_DAYS = 30
@@ -7230,9 +7240,31 @@ def land_fallback(answer: dict, head: str) -> dict:
 def land_action(answer: dict, head: str) -> dict:
     """The answer's "action" when it is one this queue knows, else the fallback table's."""
     act = answer.get("action")
-    if isinstance(act, dict) and act.get("kind") in LAND_KINDS:
-        return act
-    return land_fallback(answer, head)
+    if not (isinstance(act, dict) and act.get("kind") in LAND_KINDS):
+        act = land_fallback(answer, head)
+    return land_command_wait(act, answer, head) if act.get("kind") == "command" else act
+
+
+def land_command_wait(act: dict, answer: dict, head: str) -> dict:
+    """A "command" step that is a glaeda-gh wait (LAND_COMMAND_WAIT_RUN, _PR) as that wait step, else ACT. The run or
+    PR's repository is the step's, so take() stops one on another repository; a PR wait on another PR number is left
+    a command (take() would stop it anyway)."""
+    text = " ".join(map(str, act["argv"])) if isinstance(act.get("argv"), list) else str(act.get("text") or "")
+    if not text.strip():
+        text = str(answer.get("next") or "")
+    timeout = LAND_COMMAND_TIMEOUT.search(text)
+    timeout_s = float(timeout.group(1)) if timeout else LAND_WAIT_DEFAULT
+    base = {"v": 1, **{k: act[k] for k in ("number", "head") if k in act}}
+    run = LAND_COMMAND_WAIT_RUN.fullmatch(text)
+    if run:
+        return {**base, "kind": "wait_run", "repo": run.group(1), "run": run.group(2), "timeout_s": timeout_s,
+                "from": "command"}
+    pr = LAND_COMMAND_WAIT_PR.fullmatch(text)
+    if pr and (act.get("number") in (None, "") or str(act.get("number")) == pr.group(2)):
+        until = LAND_COMMAND_UNTIL.search(text)
+        return {**base, "kind": "wait_pr", "repo": pr.group(1), "number": pr.group(2), "sha": head,
+                "until": until.group(1) if until else "done", "timeout_s": timeout_s, "from": "command"}
+    return act
 
 
 def land_quota_said(text: str, now: float) -> float | None:

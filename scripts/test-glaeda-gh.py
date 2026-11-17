@@ -16871,6 +16871,41 @@ class LandTest(Base):
         e = self.tick()
         self.assertEqual((e["state"], e["stop"]["next"]), ("stopped", "ask Aziz"))
 
+    def test_a_command_naming_a_run_wait_is_waited_then_judged_again(self):
+        """cmux#45404, 2026-11-17: merge_hold's checks_running step was {"kind": "command", "text": "glaeda-gh wait run
+        manaflow-ai/cmux/44061804279 --timeout 3600"}, and land stopped on it (and every land queued after it). It is a
+        step: land waits on that run, judges again, and stops only at the third identical refusal in a row."""
+        self.pr(LA)
+        self.land()
+        step = {"kind": "command", "text": "glaeda-gh wait run o/r/44061804279 --timeout 600"}
+        for _ in range(3):
+            self.w.answers.append(refusal("checks_running", LA, step, nxt=step["text"]))
+        e = self.tick()
+        self.assertEqual(e["state"], "waiting", e.get("stop"))
+        self.assertEqual((e["wait"]["kind"], e["wait"]["run"]), ("run", 44061804279))
+        self.assertEqual(e["explain"]["action"]["kind"], "wait_run")
+        e = self.tick(601)  # the wait's timeout: judged again, the same refusal
+        self.assertEqual((e["state"], e["streak"]["count"], len(self.w.explains())), ("waiting", 2, 2))
+        e = self.tick(601)
+        self.assertEqual((e["state"], len(self.w.explains())), ("stopped", 3))
+        self.assertIn("3 identical refusals", self.w.sent()[-1][-1])
+
+    def test_a_command_naming_a_wait_on_another_repository_still_stops(self):
+        self.pr(LA)
+        self.land()
+        step = {"kind": "command", "text": "glaeda-gh wait run other/repo/5 --timeout 600"}
+        self.w.answers.append(refusal("checks_running", LA, step))
+        e = self.tick()
+        self.assertEqual(e["state"], "stopped")
+
+    def test_a_command_naming_a_pr_wait_is_waited(self):
+        self.pr(LA)
+        self.land()
+        step = {"kind": "command", "text": "glaeda-gh wait pr o/r#1 --until done --timeout 900"}
+        self.w.answers.append(refusal("checks_running", LA, step))
+        e = self.tick()
+        self.assertEqual((e["state"], e["wait"]["kind"], e["wait"]["until"]), ("waiting", "pr", "done"))
+
     def test_three_identical_refusals_stop_and_notify(self):
         self.pr(LA)
         self.land()
