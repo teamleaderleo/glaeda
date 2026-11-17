@@ -520,7 +520,9 @@ What `--apply` does:
        runner's label". Before a hold starts, one unauthenticated read of the public job on GitHub
        confirms it still queues: the feed can keep a job cancelled before it started as queued for
        hours, and a job GitHub says left the queue never gets a hold here. A read that fails holds
-       nothing and is asked again.
+       nothing; that job is asked again a minute later at the earliest, and after a 403 or 429 no
+       job is asked about until GitHub's rate-limit reset (the gates of a mini share one 60-an-hour
+       address). The read runs on its own thread, so it never holds up a gate step.
      - The gui runner is never held for CPU saturation (85% busy), only for memory
        pressure: its jobs come one per mini and are admitted by units like any other,
        and the CPU mark held it whenever the other lanes kept the mini busy. Nothing
