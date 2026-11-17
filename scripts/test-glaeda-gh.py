@@ -2259,7 +2259,9 @@ class DaemonTest(Base):
         self.daemon.transport = lambda *a: (attempts.append(a[1]), broken(*a))[1]
         for i in range(20):  # 40 s of ticks
             self.daemon.tick(NOW + i * gg.TICK)
-        self.assertEqual(len(attempts), 2)
+        # the PR over GraphQL, then once over REST in the same tick (GraphQL gave no answer: GQL_DOWN), and the run
+        self.assertEqual(len(attempts), 3, attempts)
+        self.assertEqual(sum(a.endswith("/graphql") for a in attempts), 1)
         self.assertIn("RemoteDisconnected", gg.read_cache("run:o/r/2")["error"])
 
         def explodes(method, url, headers, body):
@@ -2268,7 +2270,7 @@ class DaemonTest(Base):
         self.daemon.transport = lambda *a: (attempts.append(a[1]), explodes(*a))[1]
         for i in range(20):
             self.daemon.tick(NOW + gg.CYCLE + i * gg.TICK)
-        self.assertEqual(len(attempts), 4)
+        self.assertEqual(len(attempts), 5)
 
     def test_redirects_and_foreign_hosts_are_refused(self) -> None:
         with self.assertRaises(gg.WatchError):
@@ -12736,8 +12738,8 @@ class SpendByPathTest(Base):
         self.assertIn("pr  by pr o/r", lines[2])
 
 
-class SpendAlarmTest(Base):
-    """The pool and share alarms: a notice line and tell-coordinator, before the pool runs dry."""
+class AlarmBase(Base):
+    """A daemon on a pinned clock whose alarms go to a notice file and a fake tell-coordinator."""
 
     def setUp(self) -> None:
         super().setUp()
@@ -12771,6 +12773,10 @@ class SpendAlarmTest(Base):
     def notice_lines(self) -> list[dict]:
         path = self.notices / "glaeda-gh.jsonl"
         return [json.loads(x) for x in path.read_text().splitlines()] if path.exists() else []
+
+
+class SpendAlarmTest(AlarmBase):
+    """The pool and share alarms: a notice line and tell-coordinator, before the pool runs dry."""
 
     def seen(self, remaining: int, at: float, reset: float) -> None:
         self.daemon.now = at
@@ -16047,8 +16053,10 @@ class StaleDataTest(Base):
         starved = gg.daemon_starved(status)
         self.assertEqual(starved["kind"], "pr")
         self.assertFalse(starved["quota"])
-        # an unwaited (idle) PR's old data is its backoff, not starvation
+        # an unwaited (idle) PR's old data is its backoff, not starvation (nor a stalled loop: nobody read it lately)
         gg.write_json(gg.watch_dir() / gg.file_name(key), {"key": key})
+        idle = NOW + gg.CYCLE - gg.IDLE_BACKOFF_AFTER - 1
+        os.utime(gg.watch_dir() / gg.file_name(key), (idle, idle))
         with mock.patch.object(gg, "parse_pr", side_effect=AttributeError("bug")):
             status = self.daemon.tick(NOW + gg.CYCLE)
         self.assertIsNone(status["staleWaited"]["pr"])
@@ -18492,6 +18500,220 @@ class WaitFromBytecodeTest(unittest.TestCase):
                                   timeout=60)
             self.assertEqual(done.returncode, 0, done.stderr)
             self.assertTrue(list(Path(home, ".cache", "gh-quota", "pycache").rglob("*.pyc")))
+
+
+class RefreshStallTest(AlarmBase):
+    """huge-blue, 2026-11-17: the daemon's PR data reached 3585 s old (about 13:2xZ) and then 1392 s (about 14:5xZ) with
+    its heartbeat fresh, errors "graphql: HTTP 502" and "controller: URLError", at the 40 points/min GraphQL pace; a
+    session restarted it by hand both times. A GraphQL 502 only split the batch and left it for the next cycle: while
+    GitHub kept answering 502 nothing routed to GraphQL was read at all, though REST answered, and nothing in the
+    daemon said its refresh loop had stopped. The detector of this class ("daemon heartbeat fresh, data stale")."""
+
+    def watch(self, count: int, waited: int = 0) -> list[str]:
+        keys = []
+        for n in range(1, count + 1):
+            self.gh.prs[("o", "r", n)] = pr_node(n)
+            keys.append(f"pr:o/r#{n}")
+            gg.register(keys[-1], waited=n <= waited)
+        return keys
+
+    def keep_alive(self, keys: list[str], at: float, waited: int = 0) -> None:
+        """A reader's touch at AT (the fake clock): register() stamps the wall clock, never a future one."""
+        for n, key in enumerate(keys, 1):
+            path = gg.watch_dir() / gg.file_name(key)
+            if n <= waited:
+                gg.write_json(path, {**gg.read_json(path), "waitedAt": at})
+            os.utime(path, (at, at))
+
+    def answer_502(self, when: Any) -> list[int]:
+        """GraphQL PR queries answer 502 while when(prs) is true; every other request goes to the fake."""
+        sizes: list[int] = []
+
+        def transport(method, url, headers, body):
+            if url.endswith("/graphql"):
+                doc = json.loads(body)
+                prs = [v for k, v in doc["variables"].items() if re.fullmatch(r"n\d+", k)]
+                if "pullRequest(number:" in doc["query"] and when(prs):
+                    sizes.append(len(prs))
+                    return 502, {}, b'{"message": "Server Error"}'
+            return self.gh(method, url, headers, body)
+        self.daemon.transport = transport
+        return sizes
+
+    def newest_age(self, keys: list[str], now: float) -> float:
+        return min(now - ((gg.read_cache(k) or {}).get("dataAt") or float("-inf")) for k in keys)
+
+    def oldest_age(self, keys: list[str], now: float) -> float:
+        return max(now - ((gg.read_cache(k) or {}).get("dataAt") or float("-inf")) for k in keys)
+
+    def test_a_graphql_502_storm_reads_prs_over_rest_and_never_lets_their_data_age(self) -> None:
+        """The harness: 40 watched PRs (5 waited), the controller down (URLError), GitHub's GraphQL answering 502 to
+        every PR query for 30 minutes, one tick every TICK. Before: every PR's data aged the whole 30 minutes (1800 s,
+        the shape of huge-blue's 3585 s and 1392 s). Now: GraphQL is out within GQL_DOWN_SPAN, REST reads the PRs
+        every cycle, and no PR's data passes two cycles old; once GitHub answers again GraphQL is back."""
+        self.daemon.controller = FakeController()
+        self.daemon.controller.down = True
+        keys = self.watch(40, waited=5)
+        storm = {"on": True}
+        sizes = self.answer_502(lambda prs: storm["on"])
+        worst, out, unhealthy = 0.0, 0, 0
+        for i in range(0, 1800, gg.TICK):
+            now = NOW + i
+            self.keep_alive(keys, now, waited=5)
+            status = self.daemon.tick(now)
+            out += status["graphqlDown"] is not None
+            unhealthy += not status["healthy"]
+            if i >= gg.CYCLE:
+                worst = max(worst, self.oldest_age(keys, now))
+        self.assertLessEqual(worst, 2 * gg.CYCLE, "a PR's data aged past two cycles during the 502 storm")
+        self.assertIn("controller: URLError", " ".join(self.daemon.recent_errors))
+        self.assertGreater(out, 0, "GraphQL was taken out while it kept answering 502")
+        self.assertEqual(unhealthy, 0)
+        self.assertIsNone(self.daemon.valve_due, "nothing to restart: the PRs were read")
+        # bounded: GraphQL is tried again only after each hold, not a cascade of 502s every tick
+        self.assertLess(len(sizes), 60, len(sizes))
+        storm["on"] = False
+        for i in range(1800, 1800 + gg.GQL_DOWN_MAX + 3 * gg.CYCLE, gg.TICK):
+            self.keep_alive(keys, NOW + i, waited=5)
+            self.daemon.tick(NOW + i)
+            self.assertLessEqual(self.oldest_age(keys, NOW + i), 2 * gg.CYCLE)
+        self.assertFalse(self.daemon.gql_down(), "GraphQL is not held out once GitHub answers")
+
+    def test_one_pr_graphql_fails_alone_is_read_over_rest_and_graphql_stays_in(self) -> None:
+        """A PR GitHub answers 502 for every time (its query too heavy for GraphQL) costs its batch a split, is read
+        over REST, and never takes GraphQL out for the others: the halves without it answer every tick."""
+        keys = self.watch(12)
+        self.answer_502(lambda prs: 7 in prs)
+        for i in range(0, 20 * gg.CYCLE, gg.TICK):
+            self.keep_alive(keys, NOW + i)
+            self.daemon.tick(NOW + i)
+            self.assertFalse(self.daemon.gql_down(), i)
+        now = NOW + 20 * gg.CYCLE - gg.TICK
+        self.assertLessEqual(self.oldest_age(keys, now), 2 * gg.CYCLE, "PR 7 (or one batched with it) went stale")
+        self.assertEqual(gg.read_cache("pr:o/r#7")["data"]["number"], 7)
+        self.assertGreater(self.gh.full_reads, 0, "the other PRs still read over GraphQL")
+
+    def test_graphql_out_backs_off_doubling_and_one_clean_answer_ends_it(self) -> None:
+        d = self.daemon
+        for n in range(gg.GQL_DOWN_AFTER):
+            d.now = NOW + n * gg.GQL_DOWN_SPAN / (gg.GQL_DOWN_AFTER - 1)
+            d.note_gql_health("graphql: HTTP 502")
+        self.assertTrue(d.gql_down())
+        self.assertEqual(d.gql_down_until, d.now + gg.GQL_DOWN_BACKOFF)
+        d.now = d.gql_down_until + 1
+        self.assertFalse(d.gql_down(), "the hold ends: the next read tries GraphQL again")
+        d.note_gql_health("graphql: request failed: URLError")  # still down: out again at once, for twice as long
+        self.assertEqual(d.gql_down_until, d.now + 2 * gg.GQL_DOWN_BACKOFF)
+        for _ in range(10):
+            d.now = d.gql_down_until + 1
+            d.note_gql_health("graphql: HTTP 503")
+        self.assertEqual(d.gql_down_until - d.now, gg.GQL_DOWN_MAX, "the back-off is bounded")
+        d.note_gql_health("graphql: HTTP 504")  # too heavy, not down: says nothing either way
+        d.note_gql_health("graphql: request failed: TimeoutError")
+        self.assertTrue(d.gql_down())
+        d.note_gql_health(None)
+        self.assertFalse(d.gql_down())
+        self.assertEqual((d.gql_down_streak, d.gql_down_strikes), (0, 0))
+        # a burst inside GQL_DOWN_SPAN (one heavy PR's split cascade) does not take it out
+        for _ in range(gg.GQL_DOWN_AFTER + 2):
+            d.note_gql_health("graphql: HTTP 502")
+        self.assertFalse(d.gql_down())
+
+    def test_every_network_call_in_the_refresh_loop_is_bounded(self) -> None:
+        """GitHub: SOCKET_TIMEOUT per read and HTTP_DEADLINE per request (hard_deadline); the controller:
+        CONTROLLER_TIMEOUT and CONTROLLER_DEADLINE, and a down one is left alone with a bounded back-off."""
+        self.assertLessEqual(gg.HTTP_DEADLINE, gg.TICK_BUDGET)
+        self.assertLessEqual(gg.CONTROLLER_DEADLINE, gg.TICK * 5)
+        self.assertLess(gg.TICK_BUDGET + gg.HTTP_DEADLINE, gg.WATCHDOG_AFTER)
+        d = gg.Daemon(transport=self.gh, token=lambda: TOKEN, controller=FakeController())
+        d.controller.down = True
+        waits = []
+        for i in range(12):
+            d.now = NOW + i * gg.CONTROLLER_ABSENT
+            d.controller_down(gg.WatchError("controller: URLError"))
+            waits.append(d.controller_down_until - d.now)
+        self.assertEqual(max(waits), gg.CONTROLLER_ABSENT, waits)
+
+    def stalled(self, age: float) -> None:
+        self.daemon.started_tick = NOW - 2 * gg.STALE_DATA_AFTER
+        self.daemon.stale_waited = {"pr": None}
+        self.daemon.newest_data = {"pr": age}
+
+    def test_the_daemon_restarts_itself_when_no_pr_has_been_refreshed_for_600s(self) -> None:
+        """No wait blocked (so staleWaited says nothing), but the freshest live PR watch's data is past
+        STALE_DATA_AFTER: the refresh loop has stopped. Two ticks in a row and the valve re-executes the daemon."""
+        self.policy()
+        self.stalled(gg.STALE_DATA_AFTER - 1)
+        self.daemon.check_alarms()
+        self.assertEqual(self.told_lines(), [], "under the bound: nothing")
+        self.stalled(gg.STALE_DATA_AFTER + 100)
+        self.daemon.check_alarms()
+        self.assertIsNone(self.daemon.valve_due, "one tick is not yet a pattern")
+        self.assertIn("no PR has been refreshed for 700s", self.told_lines()[0])
+        self.daemon.now = NOW + gg.TICK
+        self.daemon.check_alarms()
+        self.assertEqual(self.daemon.valve_due, {"kind": "pr", "age": 700, "key": "newest", "ticks": 2})
+        self.assertIn("restarting itself now", self.told_lines()[-1])
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            self.daemon.restart_self()
+        self.assertIn("no PR refreshed (stall_alarm)", out.getvalue())
+
+    def test_a_quota_stop_holds_the_stall_alarm_and_the_valve(self) -> None:
+        self.policy()
+        self.stalled(gg.STALE_DATA_AFTER * 3)
+        self.daemon.backoff = {"rest": NOW + 600, "graphql": NOW + 600}  # GitHub's own limits stop every read
+        for i in range(3):
+            self.daemon.now = NOW + i * gg.TICK
+            self.daemon.check_alarms()
+        self.assertIsNone(self.daemon.valve_due)
+        self.assertEqual(self.told_lines(), [])
+        self.assertEqual(self.daemon.stall_alarm(), "held")
+
+    def test_only_live_pr_watches_count_toward_the_pulse(self) -> None:
+        """An idle PR nobody waits on or has read lately is polled every IDLE_BACKOFF_MAX by design: its age is not
+        the loop's. A waited one, or one read lately, is due every cycle."""
+        self.gh.prs[("o", "r", 1)] = pr_node(1)
+        gg.register("pr:o/r#1")
+        self.daemon.clock_real = True
+        self.daemon.tick(NOW)
+        idle = NOW + gg.IDLE_BACKOFF_AFTER + 10
+        self.daemon.now = idle
+        entries = self.daemon.watches()
+        self.daemon.oldest_data(entries, set())
+        self.assertIsNone(self.daemon.newest_data["pr"])
+        self.keep_alive(["pr:o/r#1"], idle, waited=1)
+        self.daemon.oldest_data(self.daemon.watches(), set())
+        self.assertEqual(self.daemon.newest_data["pr"], idle - NOW)
+
+    def test_the_heartbeat_says_unhealthy_and_status_and_restart_report_it(self) -> None:
+        """A tick past the bound writes daemon.json healthy false and stalled; `budget` prints it, and daemon_starved
+        (what `restart` reads) counts newestData even with no wait blocked."""
+        keys = self.watch(3)
+        self.daemon.tick(NOW)
+        self.answer_502(lambda prs: True)
+        self.daemon.transport = lambda *a: (_ for _ in ()).throw(gg.WatchError("request failed: URLError"))
+        late = NOW + gg.STALE_DATA_AFTER + 60
+        self.keep_alive(keys, late)
+        self.daemon.started_tick = NOW - 2 * gg.STALE_DATA_AFTER
+        status = self.daemon.tick(late)  # REST and GraphQL both unreachable: nothing reads
+        self.assertFalse(status["healthy"])
+        self.assertEqual(status["stalled"]["kind"], "pr")
+        self.assertGreater(status["stalled"]["age"], gg.STALE_DATA_AFTER)
+        written = gg.read_json(gg.BASE / "daemon.json")
+        self.assertFalse(written["healthy"])
+        starved = gg.daemon_starved({**written, "at": time.time()})
+        self.assertIsNotNone(starved)
+        self.assertEqual(starved["kind"], "pr")
+        self.assertFalse(starved["quota"], starved)
+        with mock.patch.object(gg, "daemon_running", return_value=True), \
+                mock.patch.object(gg, "daemon_stale", return_value=None), \
+                mock.patch.object(gg, "daemon_failing", return_value=None), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            gg.cmd_budget(False)
+        self.assertIn("NOT HEALTHY: no PR refreshed for", out.getvalue())
+        # a new process starts healthy: the previous one's stall is not its own
+        gg.first_heartbeat()
+        self.assertNotIn("stalled", gg.read_json(gg.BASE / "daemon.json"))
 
 
 if __name__ == "__main__":

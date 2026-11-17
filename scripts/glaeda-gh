@@ -235,8 +235,12 @@ a new one. A daemon waiting for the lock stops a holder silent for STALE_HEARTBE
 serve, checked first) and takes over. `serve` refuses to start from a shell while the LaunchAgent or
 systemd unit is loaded, unless given --foreground-ok: sessions never run their own. A cycle that raises still writes the heartbeat, with the error's type and
 code site under "failing"; once cycles have failed for FAILING_AFTER seconds, clients exit 3 and
-name the error instead of waiting on a daemon that refreshes nothing. The daemon re-executes itself when this file changes, so an update takes
-effect without a restart.
+name the error instead of waiting on a daemon that refreshes nothing. A heartbeat over a loop that reads nothing is
+not health: when even the freshest live PR watch's data passes STALE_DATA_AFTER and the quota does not explain it,
+daemon.json says "healthy": false and "stalled", `budget` prints NOT HEALTHY, and two such ticks re-execute the daemon
+(the stale valve). GraphQL answering 5xx (or not at all) sends its reads to REST: at once for an entry that cannot be
+split further, and for every entry while GraphQL is out (GQL_DOWN_AFTER, "graphqlDown"). The daemon re-executes itself
+when this file changes, so an update takes effect without a restart.
 
 - `land` is the land queue. A lane says `glaeda-gh land OWNER/REPO#N` once (idempotent per PR: again updates
   --after and --notify) and the daemon lands it: it asks `merge_hold.py explain R N --sha HEAD --json` at the head the
@@ -442,8 +446,22 @@ SLOW = re.compile(r"HTTP 504|[Tt]imeout|timed out|[Rr]esource limits")  # the qu
 # next cycle. batched() halves the batch (down to 1, not GQL_BATCH_MIN: a PR this heavy is the point of reading it
 # alone) and re-reads only the partial entries at the smaller size; GQL_GROW_AFTER clean queries grow it back by one.
 RESOURCE_LIMITS = "RESOURCE_LIMITS_EXCEEDED"
-FLAKY = re.compile(r"HTTP 50[23]")  # GitHub hiccuped: split and retry, but the size was not the cause
 HEAVY_AFTER = 3  # lone timeouts in a row after which a heavy entry is read only every LEAN_FACTOR cycles
+# GraphQL down, REST up. huge-blue 2026-11-17: GitHub's GraphQL answered 502 for long stretches (and the controller
+# URLError) and waited PR data reached 3585 s, then 1392 s old, with the heartbeat fresh, both times until a session
+# restarted the daemon. A 502 only split the batch and left it for the next cycle, so a kind routed to GraphQL was
+# never read at all while it lasted, though REST answered. Now an entry GraphQL fails with a 5xx (or no answer at all)
+# that cannot be split further is read over REST this tick, and GQL_DOWN_AFTER such failures in a row over at least
+# GQL_DOWN_SPAN with no clean GraphQL answer between take GraphQL out for GQL_DOWN_BACKOFF (doubling to GQL_DOWN_MAX
+# while the first query after each hold fails again): its reads go to REST at once instead of each spending ~10 s of
+# the tick on another 502. One clean answer ends it. The span keeps one PR GitHub fails alone from taking GraphQL out
+# for everyone: the split halves without it answer, every tick.
+GQL_DOWN_AFTER = 3
+GQL_DOWN_SPAN = 60
+GQL_DOWN_BACKOFF = 60
+GQL_DOWN_MAX = 600
+# GitHub failed the query (a 5xx, or no answer): split and retry, then REST. A 504 or a timeout is SLOW instead.
+GQL_DOWN = re.compile(r"HTTP 5(?!04)\d\d|request failed: (?!TimeoutError)")
 MAX_BODY = 8 * 1024 * 1024
 WAIT_POLL = 3  # clients re-read the cache this often
 TOUCH_EVERY = 30  # clients refresh their interest this often
@@ -2918,6 +2936,11 @@ class Daemon:
         self.clean: dict[str, int] = {kind: 0 for kind in CYCLES}  # clean GraphQL queries in a row
         # key -> {"at": last lone read, "fails": lone timeouts in a row, "oks": lone answers in a row}
         self.heavy: dict[str, dict] = {}
+        self.gql_down_streak = 0  # GraphQL answers in a row that were a 5xx or no answer (GQL_DOWN)
+        self.gql_down_since = 0.0  # when the first of them came
+        self.gql_down_strikes = 0  # times GraphQL was taken out since its last clean answer: each doubles the next
+        self.gql_down_until = 0.0  # GraphQL reads go to REST until then (gql_down)
+        self.newest_data: dict[str, float | None] = {}  # oldest_data's: per kind, the freshest live watch's data age
         self.since: dict[str, float] = {}  # key -> when the daemon first saw it watched, for oldestData
         self.stale_waited: dict[str, float | None] = {}  # oldest_data's, for the watches a wait is blocked on
         self.explained_at: dict[str, float] = {}  # kind -> the last tick stale_explained(kind) explained its old data
@@ -3154,8 +3177,12 @@ class Daemon:
         back (quota_hold), {"why": the reason, "quota": True when it stops the reads}. daemon_starved, the stale
         alarm and `restart` say it instead of calling old data a fault."""
         out = {}
-        for kind, age_s in (getattr(self, "stale_waited", None) or {}).items():
-            if isinstance(age_s, (int, float)) and age_s > STALE_DATA_AFTER:
+        ages = {k: v for k, v in (getattr(self, "stale_waited", None) or {}).items() if isinstance(v, (int, float))}
+        for kind, age_s in (getattr(self, "newest_data", None) or {}).items():  # a stalled loop too (stall_alarm)
+            if isinstance(age_s, (int, float)):
+                ages[kind] = max(ages.get(kind, 0.0), age_s)
+        for kind, age_s in ages.items():
+            if age_s > STALE_DATA_AFTER:
                 hold = self.quota_hold(kind)
                 if hold is not None:
                     out[kind] = {"why": hold[0], "quota": hold[1]}
@@ -3185,6 +3212,30 @@ class Daemon:
                 f"(over {STALE_DATA_AFTER}s; oldest {key_name(where) if where != '?' else '?'}) while its heartbeat is "
                 f"fresh.{quota} Recent errors: {errors}. {STALE_RESTART_ADVICE}")
         return level, text, {"kind": kind, "age": age_s, "key": where, **({"quota": hold[0]} if hold else {})}
+
+    def stall_alarm(self) -> tuple[str, str, dict] | str | None:
+        """The refresh loop's own pulse, beside stale_alarm (which needs a wait blocked on old data): when even the
+        freshest PR data of a live watch (newest_data: one a wait is on or someone read lately, each due every cycle)
+        is older than STALE_DATA_AFTER, no PR has been refreshed in that long, whatever the heartbeat says. The same
+        verdicts as stale_alarm ("held" while the quota or an upstream explains it), so the valve restarts the daemon
+        on it. huge-blue 2026-11-17: PR data 3585 s and 1392 s old, heartbeat fresh, restarted by hand both times."""
+        age_s = (getattr(self, "newest_data", None) or {}).get("pr")
+        if not isinstance(age_s, (int, float)) or age_s <= STALE_DATA_AFTER:
+            return None
+        if self.stale_explained("pr") is not None or self.catching_up("pr") is not None:
+            return "held"
+        age_s = int(age_s)
+        level = "fire" if age_s >= 3 * STALE_DATA_AFTER else "warn"
+        errors = "; ".join(list(getattr(self, "recent_errors", {}))[:3]) or "none recorded"
+        hold = self.quota_hold("pr")
+        quota = f" Quota: {hold[0]}." if hold else ""
+        down = (f" GraphQL is out until {dt.datetime.fromtimestamp(self.gql_down_until, dt.timezone.utc):%H:%MZ} "
+                "(5xx answers), so PRs read over REST." if self.gql_down() else "")
+        text = (f"{level.upper()} glaeda-gh on {policy_host()}: no PR has been refreshed for {age_s}s (over "
+                f"{STALE_DATA_AFTER}s; the freshest live PR watch's data is that old) while its heartbeat is fresh."
+                f"{quota}{down} Recent errors: {errors}. {STALE_RESTART_ADVICE}")
+        return level, text, {"kind": "pr", "age": age_s, "key": "newest", "stall": True,
+                             **({"quota": hold[0]} if hold else {})}
 
     def note_explained(self) -> None:
         """Remember, per kind, the last tick whose old waited data stale_explained accounted for (the quota, an
@@ -3242,7 +3293,8 @@ class Daemon:
         record = {"at": self.clock(), "by": os.getpid(), "how": "self: stale valve (re-exec)", "ok": True,
                   "ran": True, "valve": True, **{k: due.get(k) for k in ("kind", "age", "key")}}
         write_json(BASE / "restart.json", record)
-        log({"event": "restart", "why": "stale valve", **{k: due.get(k) for k in ("kind", "age", "key", "ticks")}})
+        why = "stale valve: no PR refreshed (stall_alarm)" if due.get("key") == "newest" else "stale valve"
+        log({"event": "restart", "why": why, **{k: due.get(k) for k in ("kind", "age", "key", "ticks")}})
         return record
 
     def check_alarms(self) -> None:
@@ -3290,7 +3342,11 @@ class Daemon:
             if share is not None:
                 firing["share"] = share
         if policy.get("stale", True):
-            stale = self.stale_valve(self.stale_alarm(), policy)
+            verdict = self.stale_alarm()
+            if not isinstance(verdict, tuple):  # no wait starved: the refresh loop itself may still be (stall_alarm)
+                stall = self.stall_alarm()
+                verdict = stall if stall is not None else verdict
+            stale = self.stale_valve(verdict, policy)
             if stale == "held":
                 held.add("stale")
             elif stale is not None:
@@ -5028,6 +5084,9 @@ class Daemon:
                   "spendBy": self.spend_by(), "alarms": self.alarms,
                   "perMinute": {b: round(self.richness(b) * 60, 1) for b in ("rest", "graphql")},
                   "batch": dict(self.batch), "oldestData": oldest, "deferred": len(self.deferred),
+                  "newestData": dict(self.newest_data),
+                  "graphqlDown": {"until": round(self.gql_down_until, 3), "strikes": self.gql_down_strikes}
+                  if self.gql_down() else None,
                   "staleWaited": dict(self.stale_waited), "staleAfter": STALE_DATA_AFTER,
                   "staleWhy": self.stale_why(),
                   "staleExplainedAt": {k: round(t, 3) for k, t in self.explained_at.items()},
@@ -5036,6 +5095,12 @@ class Daemon:
                              "holdUntil": self.post_hold if self.post_hold > self.now else None}}
         if self.upstream_status is not None:
             status["upstream"] = self.upstream_status
+        # A fresh heartbeat over a refresh loop that reads nothing is not health: say so in the heartbeat itself, so
+        # `budget`, `restart` and a wait's daemon_starved see it (stall_alarm; "held" when the quota explains it).
+        stall = self.stall_alarm()
+        status["healthy"] = stall is None
+        if stall is not None:
+            status["stalled"] = {"kind": "pr", "age": int(self.newest_data["pr"] or 0), "explained": stall == "held"}
         # the heartbeat lets clients tell a hung daemon (lock held, nothing written) from an idle one
         recovered, self.failing = self.failing is not None, None
         if recovered or prs or runs or comments or heads or self.errors or self.now - self.beat >= HEARTBEAT_EVERY:
@@ -5339,7 +5404,8 @@ class Daemon:
         the batch grows back. A 502 or 503 is split and retried without shrinking. GQL_SPLITS bounds
         the extra queries a tick spends on splitting; what is left waits for the next cycle. Returns the
         entries left unread because GraphQL stopped (its quota, or a throttle) partway, the one that hit it
-        included, for the caller to read over REST."""
+        included, for the caller to read over REST, and the entries GraphQL failed with a 5xx or no answer that could
+        not be split further, or every entry while GraphQL is out (gql_down): REST reads them this tick (GQL_DOWN)."""
         self.heavy = {k: h for k, h in self.heavy.items() if self.now - h["at"] < IDLE_EXPIRY}
         size = self.batch[kind]
         alone, rest = [], []
@@ -5351,17 +5417,18 @@ class Daemon:
                 alone.append([e])
         queue = alone + [rest[i:i + size] for i in range(0, len(rest), size)]
         splits, shrunk = 0, False
+        to_rest: list[dict] = []
         while queue:
             chunk = queue.pop(0)
-            if self.mode("graphql") == "stop":
-                return chunk + [e for c in queue for e in c]
+            if self.mode("graphql") == "stop" or self.gql_down():
+                return to_rest + chunk + [e for c in queue for e in c]
             if not self.gql_room():
                 # Over the per-minute ceiling: the rest wait, first next tick. Not REST's to read: GraphQL is not
                 # spent, only paced, and a REST spill of a whole post-reset refresh would be the same burst there.
                 self.defer(chunk + [e for c in queue for e in c])
                 if getattr(self, "gql_paced", None) is None:
                     self.gql_paced = kind
-                return []
+                return to_rest
             self.gql_limited = False
             self.gql_reason = kind
             repos = sorted({caller_of(e["key"])[1] for e in chunk})
@@ -5373,7 +5440,7 @@ class Daemon:
                 limited, self.limited = self.limited, []
             except OutOfTime:
                 self.defer(chunk + [e for c in queue for e in c])
-                return []
+                return to_rest
             except Exception as failure:  # noqa: BLE001  one bad batch must not stop the rest
                 # A bug on one entry's answer (an AttributeError on a null node, huge-blue 2026-11-11) used to drop the
                 # whole chunk here with nothing stored: every PR in it kept its old data, errors[] was empty again by the
@@ -5395,9 +5462,9 @@ class Daemon:
             if (error or self.gql_limited) and self.mode("graphql") == "stop":
                 # this query hit the limit (a RATE_LIMITED answer can still carry data.rateLimit and null aliases):
                 # whatever it stored for them, REST reads them this tick and replaces it
-                return chunk + [e for c in queue for e in c]
+                return to_rest + chunk + [e for c in queue for e in c]
             if spilled:
-                return spilled + [e for c in queue for e in c]
+                return to_rest + spilled + [e for c in queue for e in c]
             if limited:
                 # Partial: not a clean query, and the batch was too big for these entries. Halve it, then re-read only
                 # the partial ones at a size below this chunk's (so a re-read ends at one entry alone), within
@@ -5419,7 +5486,10 @@ class Daemon:
                 size = self.batch[kind]
                 queue = redo + [left[i:i + size] for i in range(0, len(left), size)]
                 continue
+            down = bool(error and GQL_DOWN.search(error))  # a 5xx or no answer: not the entries' doing
             if len(chunk) == 1 and chunk[0]["key"] in self.heavy or (len(chunk) == 1 and error and SLOW.search(error)):
+                if down:
+                    to_rest += chunk
                 # a lone read says nothing about the batch size; it only judges this entry
                 h = self.heavy.setdefault(chunk[0]["key"], {"at": self.now, "fails": 0, "oks": 0})
                 h["at"] = self.now
@@ -5437,7 +5507,10 @@ class Daemon:
                     self.clean[kind] = 0
                 continue
             slow = bool(SLOW.search(error))
-            if not slow and not FLAKY.search(error) or len(chunk) < 2:
+            if down and (len(chunk) < 2 or splits + 2 > GQL_SPLITS):
+                to_rest += chunk  # GitHub failed it and splitting cannot help any more: REST reads it this tick
+                continue
+            if not slow and not down or len(chunk) < 2:
                 continue
             self.clean[kind] = 0
             if slow and not shrunk and self.batch[kind] > GQL_BATCH_MIN:
@@ -5450,7 +5523,7 @@ class Daemon:
                 left = [e for c in queue for e in c]
                 size = self.batch[kind]
                 queue = [chunk[:half], chunk[half:]] + [left[i:i + size] for i in range(0, len(left), size)]
-        return []
+        return to_rest
 
     def oldest_data(self, entries: list[dict], fetched: set[str]) -> dict[str, float | None]:
         """Per kind, how old the oldest data of an open (not finished) watch is. A finished one is
@@ -5458,6 +5531,9 @@ class Daemon:
         for the watches a wait is blocked on only: those are read every cycle, so an old one there is starved
         (STALE_DATA_AFTER), where an idle PR's old data is only its backoff."""
         oldest: dict[str, float | None] = {kind: None for kind in CYCLES}
+        # And per kind the freshest data of a live watch, one a wait is on or someone read lately (polled every cycle,
+        # not on an idle back-off): the refresh loop's own pulse, which stall_alarm reads.
+        self.newest_data = {kind: None for kind in CYCLES}
         self.stale_waited = {kind: None for kind in CYCLES}
         self.stale_waited_key: dict[str, str] = {}
         # A waited key this daemon has not seen yet is watched since its wait began (waitBegan) at the latest: after a
@@ -5482,6 +5558,9 @@ class Daemon:
             seen = (cached or {}).get("dataAt") or self.since[e["key"]]
             age_s = max(0.0, self.now - seen)
             oldest[kind] = max(oldest[kind] or 0.0, age_s)
+            if self.waited(e) or self.now - e["touched"] < IDLE_BACKOFF_AFTER:
+                newest = self.newest_data[kind]
+                self.newest_data[kind] = age_s if newest is None else min(newest, age_s)
             blocked = min(age_s, self.now - self.waited_since[e["key"]]) if self.waited(e) else 0.0
             if self.waited(e) and blocked >= (self.stale_waited[kind] or 0.0):
                 self.stale_waited[kind] = blocked
@@ -5536,13 +5615,45 @@ class Daemon:
         for e in entries:
             self.store(e["key"], e["cache"], error=message)
 
+    def note_gql_health(self, error: str | None) -> None:
+        """Count one GraphQL answer toward GQL_DOWN_AFTER: ERROR None is a clean one (anything under 500), which ends
+        an outage; a 5xx or no answer at all (GQL_DOWN) adds to the streak, and at GQL_DOWN_AFTER over GQL_DOWN_SPAN
+        takes GraphQL out (gql_down) for the doubling back-off; once out, the first failure after a hold takes it out
+        again. A timeout or a hold says nothing either way."""
+        if error is None:
+            if self.gql_down_until > self.clock():
+                log({"event": "graphql-up", "after": self.gql_down_strikes})
+            self.gql_down_streak = self.gql_down_strikes = 0
+            self.gql_down_until = 0.0
+            return
+        if not GQL_DOWN.search(error):
+            return
+        if self.gql_down_streak == 0:
+            self.gql_down_since = self.clock()
+        self.gql_down_streak += 1
+        if self.gql_down_strikes == 0 and (self.gql_down_streak < GQL_DOWN_AFTER
+                                           or self.clock() - self.gql_down_since < GQL_DOWN_SPAN):
+            return
+        self.gql_down_streak = 0
+        self.gql_down_strikes += 1
+        hold = min(GQL_DOWN_MAX, GQL_DOWN_BACKOFF * 2 ** (self.gql_down_strikes - 1))
+        self.gql_down_until = self.clock() + hold
+        log({"event": "graphql-down", "after": error, "hold": hold, "strikes": self.gql_down_strikes})
+
+    def gql_down(self) -> bool:
+        """Whether GraphQL is out (note_gql_health): its reads go to REST this tick."""
+        return self.gql_down_until > self.clock()
+
     def graphql(self, query: str, variables: dict) -> tuple[dict | None, str | None]:
         """(doc, None) or (None, error message). Notes the rateLimit field when the query asks for it."""
         try:
             status, _, doc = self.request("POST", "/graphql", {"query": query, "variables": variables})
         except (WatchError, OSError) as error:  # (a held or timed-out query is not counted: it may not have run)
-            return None, f"graphql: {describe(error)}"
-        rate = ((doc.get("data") or {}).get("rateLimit") or {}) if isinstance(doc, dict) else {}
+            message = f"graphql: {describe(error)}"
+            self.note_gql_health(message)
+            return None, message
+        self.note_gql_health(f"graphql: HTTP {status}" if status >= 500 else None)
+        rate =((doc.get("data") or {}).get("rateLimit") or {}) if isinstance(doc, dict) else {}
         cost = rate.get("cost") if isinstance(rate, dict) else None
         points = cost if isinstance(cost, int) and not isinstance(cost, bool) and cost > 0 else 1
         self.gql_log.append((self.now, self.gql_reason, points))
@@ -9237,6 +9348,8 @@ def first_heartbeat(now: float | None = None) -> None:
     status = status if isinstance(status, dict) else {}
     status.pop("failing", None)
     status.pop("staleWaited", None)  # the previous process's starvation is not this one's (daemon_starved)
+    for stale in ("newestData", "stalled", "healthy"):  # nor its stalled refresh loop (stall_alarm)
+        status.pop(stale, None)
     write_json(BASE / "daemon.json", {**status, "pid": os.getpid(), "at": now, "startedAt": now,
                                       "heartbeat": HEARTBEAT_EVERY})
 
@@ -9748,6 +9861,12 @@ def daemon_starved(status: Any = None) -> dict | None:
     stale = status.get("staleWaited")
     if not isinstance(stale, dict):
         return None
+    # The freshest live PR watch's data counts too (daemon.json newestData, stall_alarm): a refresh loop that reads
+    # nothing starves every wait, including one that has not been blocked long enough for staleWaited to show it.
+    newest = status.get("newestData") if isinstance(status.get("newestData"), dict) else {}
+    stale = {k: max(v for v in (stale.get(k), newest.get(k)) if isinstance(v, (int, float)) and not isinstance(v, bool))
+             for k in set(stale) | set(newest)
+             if any(isinstance(v, (int, float)) and not isinstance(v, bool) for v in (stale.get(k), newest.get(k)))}
     bound = status.get("staleAfter") if isinstance(status.get("staleAfter"), (int, float)) else STALE_DATA_AFTER
     at = status.get("at") if isinstance(status.get("at"), (int, float)) else time.time()
     ages = {k: v + max(0.0, time.time() - at) for k, v in stale.items()
@@ -12026,7 +12145,8 @@ def cmd_budget(as_json: bool, fleet: bool = False) -> int:
     spread = fleet_budget() if fleet else None
     if as_json:
         doc = {"daemon": running, "stale": lag is not None, "failing": broken is not None,
-               "budget": budget, "watching": watching, "last": status}
+               "budget": budget, "watching": watching, "last": status,
+               "healthy": running and lag is None and broken is None and not isinstance(status.get("stalled"), dict)}
         if spread is not None:
             doc["fleet"] = spread
         print(json.dumps(doc, sort_keys=True))
@@ -12037,6 +12157,17 @@ def cmd_budget(as_json: bool, fleet: bool = False) -> int:
             print(f"this host's daemon ({policy_host()}):")
         print(f"daemon: {'running' if running else 'NOT RUNNING'}, watching {watching}, "
               f"last heartbeat {age(status.get('at'))}")
+        stalled = status.get("stalled")
+        if running and isinstance(stalled, dict):
+            why = ("the quota explains it" if stalled.get("explained")
+                   else "nothing explains it: the daemon restarts itself (stale valve)")
+            print(f"NOT HEALTHY: no PR refreshed for {stalled.get('age', '?')}s (over {STALE_DATA_AFTER}s) though the "
+                  f"heartbeat is fresh; {why}")
+        down = status.get("graphqlDown")
+        if running and isinstance(down, dict) and isinstance(down.get("until"), (int, float)):
+            until = dt.datetime.fromtimestamp(down["until"], dt.timezone.utc)
+            print(f"GraphQL is out (5xx answers) until {until:%H:%M:%SZ}: its reads go to REST meanwhile "
+                  f"(strike {down.get('strikes', '?')})")
         for bucket in ("rest", "graphql"):
             b = budget.get(bucket)
             if not b:
