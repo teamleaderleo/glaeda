@@ -1369,8 +1369,8 @@ class HookTest(unittest.TestCase):
         self.assertIn(hook.STACK_BLOCKER_LABEL, hook.nightly_slot_refusal(""))
         fleet = self.fleet()
 
-        def pull(labels: list, head: str = "manaflow-ai/cmux") -> Path:
-            return event(self.dir, "stack-pr", {
+        def pull(labels: list, head: str = "manaflow-ai/cmux", name: str = "stack-pr") -> Path:
+            return event(self.dir, name, {
                 "repository": CMUX,
                 "pull_request": {"number": 45498, "labels": labels, "head": {"repo": {"full_name": head}},
                                  "base": {"repo": CMUX}}})
@@ -1385,13 +1385,16 @@ class HookTest(unittest.TestCase):
                                      env=env)
             self.assertEqual(admitted.returncode, 0, admitted.stdout + admitted.stderr)
             self.finish("")
-            for name, payload in (("no label", pull([{"name": "full-ci"}])),
-                                  ("a fork", pull(label, "someone/cmux"))):
+            # a fork's job is refused before the slot looks (cross-repository), and stack_blocker_tier gives it no
+            # tier either (test_stack_blocker_tier_reads_the_pull_request_label)
+            for name, payload, why in (
+                    ("no label", pull([{"name": "full-ci"}], name="plain-pr"), "the nightly slot admits only nightly jobs"),
+                    ("a fork", pull(label, "someone/cmux", "fork-pr"), "refused")):
                 with self.subTest(name):
                     refused = self.run_hook("job-started", "pull_request", payload, *args, repo="manaflow-ai/cmux",
                                             env=env)
                     self.assertEqual(refused.returncode, 1, refused.stdout + refused.stderr)
-                    self.assertIn("the nightly slot admits only nightly jobs", refused.stdout)
+                    self.assertIn(why, refused.stdout)
             now = int(time.time())
             (fleet / "reservation.json").write_text(json.dumps({
                 "schema": "glaeda-reservation/v1", "owner": "cmux-nightly", "since": now - 5, "until": now + 600,
