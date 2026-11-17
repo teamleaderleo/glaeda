@@ -14353,6 +14353,7 @@ class BrokerSupersetTest(CountingGhBase):
                       "a = sys.argv[1:]\n"
                       f"pr = {json.dumps(self.PR)!r}\n"
                       "pr = json.loads(pr)\n"
+                      "if '--json' not in a:\n    sys.exit(0)\n"
                       "want = [f for f in a[a.index('--json') + 1].split(',') if f]\n"
                       "doc = {f: pr[f] for f in want}\n"
                       "if '--jq' in a:\n"
