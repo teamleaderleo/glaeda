@@ -8029,6 +8029,9 @@ class LandQueue:
         """KIND, the step merge_hold named, failed at HEAD (LAND_STEP_BACKOFF's comment). Under the lock. Waits or
         stops the entry; answers "update_branch" when the refusal names that step and the caller should take it now."""
         out = f"{got.stderr or ''}\n{got.stdout or ''}"
+        if LAND_QUOTA_REFUSAL.search(out):
+            self.park_quota(e, out)  # the login's state, not the PR's: parked, never counted toward a stop
+            return None
         cls = land_step_class(out)
         sig = f"{kind}|{head}|{cls}"
         last = e.get("stepFail") or {}
