@@ -1560,8 +1560,8 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
 OPENER = urllib.request.build_opener(NoRedirect)
 
 
-# api.github.com edges. On 2026-11-17 from 22:40Z cosmic-gray resolved api.github.com only to one edge (from 8.8.8.8
-# and Tailscale's resolver alike); from there it dropped most SYNs and answered the rest with a 403 that carried no
+# api.github.com edges. On 2026-11-17 from 22:40Z one host resolved api.github.com only to one edge (from 8.8.8.8
+# and the host's VPN resolver alike); from there it dropped most SYNs and answered the rest with a 403 that carried no
 # rate-limit headers, while GitHub's other edges answered every call. With SOCKET_TIMEOUT's 20 s per connect every read
 # failed (URLError) and a tick's reads queued behind each other. Now each connect and TLS handshake to api.github.com
 # gets EDGE_CONNECT_TIMEOUT, and a dead edge (a timeout, a failed connect, or the bare 403 edge_refused names) gets one

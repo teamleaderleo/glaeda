@@ -2,7 +2,7 @@
 """glaeda-gh's own GitHub client (the daemon's http(), which no gh shim fronts): a dead api.github.com edge costs one
 3 s connect timeout, then the request goes to another edge.
 
-On 2026-11-17 from 22:40Z cosmic-gray resolved api.github.com only to one edge, which dropped most SYNs from there and
+On 2026-11-17 from 22:40Z one host resolved api.github.com only to one edge, which dropped most SYNs from there and
 answered the rest with a 403 that carried no rate-limit headers; the daemon's reads failed with URLError every tick.
 Edge A here is what the system resolver gives: it drops every SYN (a listener whose one-slot accept queue is full,
 so Linux drops further SYNs) or answers a bare 403. Edge B is what a second resolver (a fake DNS-over-HTTPS server)
@@ -108,7 +108,7 @@ class Edge:
 
 
 class DoH(http.server.ThreadingHTTPServer):
-    """A second resolver: DNS-over-HTTPS JSON (dns.google's /resolve shape) that names edge B."""
+    """A second resolver: DNS-over-HTTPS JSON (the JSON /resolve shape) that names edge B."""
 
     def __init__(self, answer: str):
         self.answer, self.asked = answer, 0
