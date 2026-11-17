@@ -514,6 +514,10 @@ WORKFLOW_JOB_CLASSES = {# the iOS reliability matrix's phone cells: cargo builds
                         ("test-e2e.yml", "build"): "compile-gui", ("test-e2e.yml", "test"): "gui-step",
                         ("seed-derived-data.yml", "seed"): "seed",
                         ("nightly.yml", "build-nightly-app"): "isolated",
+                        # cmux's app FFI release build: cargo tests and scripts/cmux-next/build-app-ffi.sh, which
+                        # writes only under its workspace (cmux-tui/target/cmux-app-ffi) and a mktemp dir. As an
+                        # unknown job it was a compile and waited for canonical root 1 (cmux run 43952668846).
+                        ("app-ffi-release.yml", "build"): "isolated",
                         # Nightly control and artifact jobs do not run an Xcode app compile or take a canonical root.
                         # They can land on an owned Mac through the build runner picker, so keep them in the measured
                         # light class instead of the unknown-job compile default (which held persistent-dd and a root).
