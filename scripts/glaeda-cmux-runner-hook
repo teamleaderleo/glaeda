@@ -7655,6 +7655,42 @@ def load_cap_fetch(now: float) -> dict[str, Any] | None:
         return None
 
 
+# IOS_SIM_OWN_FIT: a side runner that carries IOS_SIM_RUNNER_LABEL (listen.sh --fit-units 3, the costliest job that
+# label brings) listens at its own fit, not the side label's costliest job (side_fit_units, 5), while the controller's
+# feed (the HOST_LOAD_CAP summary of /v1/github/actions, which keeps every open glaeda job's labels, status and
+# creation time) shows a queued job needing glaeda-ios-sim that this runner could take. On 2026-11-17 cmux's
+# ios-simulator-build jobs (glaeda-std-xcode-26.6 + glaeda-ios-sim, 3 units) queued for hours (16 queued, oldest
+# 4h23m, cmux#45115) while cmuxs-mac-mini-6 had 4 and mini-3 had 3 of 14 units free: their ios-sim runners held for
+# "its next job needs 5", the side need, so no busy simulator mini ever listened. Should such a listener receive a
+# bigger std job instead, that job waits on the mini for its units through normal admission (CAPACITY_WAIT), as any
+# job does. A feed that cannot be read, is stale, or shows no such job keeps the side need (today's rule): no reserve.
+IOS_SIM_QUEUED_MAX_AGE_S = 12 * 3600.0  # a queued ios-sim job older than this is a lost record, not a waiting job
+IOS_SIM_QUEUED = ("queued", "waiting", "pending")
+
+
+def ios_sim_queued(summary: dict[str, Any] | None, labels: frozenset[str] | None, now: float) -> bool:
+    """IOS_SIM_OWN_FIT: whether the feed summary (load_cap_summary) is fresh and shows a queued job whose labels
+    include IOS_SIM_RUNNER_LABEL and are all this runner's. False on any doubt."""
+    if not isinstance(summary, dict) or not labels or IOS_SIM_RUNNER_LABEL not in labels:
+        return False
+    at, delivery = summary.get("at"), summary.get("delivery")
+    if not isinstance(at, (int, float)) or not 0 <= now - at <= HOST_LOAD_CAP_FEED_STALE_S:
+        return False
+    if not isinstance(delivery, (int, float)) or now - delivery > HOST_LOAD_CAP_FEED_STALE_S:
+        return False
+    for job in summary.get("jobs") if isinstance(summary.get("jobs"), list) else []:
+        if not isinstance(job, dict) or job.get("status") not in IOS_SIM_QUEUED:
+            continue
+        wants = job.get("labels")
+        if not isinstance(wants, list) or IOS_SIM_RUNNER_LABEL not in wants or not set(wants) <= labels:
+            continue
+        created = job.get("created")
+        if isinstance(created, (int, float)) and now - created > IOS_SIM_QUEUED_MAX_AGE_S:
+            continue
+        return True
+    return False
+
+
 def load_cap_verdict(summary: dict[str, Any] | None, labels: frozenset[str] | None, host: str,
                      now: float) -> str | None:
     """Why another host's listener keeps up with this runner's label (so an over-cap mini may hold its listener off),
@@ -8296,6 +8332,7 @@ class Gate:
         self.cap_labels: frozenset[str] | None = None
         self.cap_feed_at = -HOST_LOAD_CAP_FEED_EVERY_S
         self.cap_thread: threading.Thread | None = None
+        self.ios_sim_own = False  # IOS_SIM_OWN_FIT: the last full() listened at its own fit for a queued ios-sim job
         self.stale_env: str | None = None  # why an adopted listener's env is not listener_env's (listen())
         self.disk_warned_at: float | None = None  # when the last low-disk warning was logged
         self.disk_evicted_at = -GATE_DISK_EVICT_EVERY_S  # when the last eviction under the floor started
@@ -8568,6 +8605,21 @@ class Gate:
             gate_log(note or "the host is under its load cap again")
         self.cap_why = None
         return None
+
+    def ios_sim_wanted(self) -> bool:
+        """IOS_SIM_OWN_FIT: whether this runner carries IOS_SIM_RUNNER_LABEL and the controller's feed shows a queued
+        job needing it that this runner could take. Only on a simulator mini (simulator_host) does it start the
+        shared feed look (cap_look); until that look lands, or when it fails, the answer is False (today's rule)."""
+        wanted = False
+        if simulator_host(self.state_dir):
+            self.cap_look()
+            wanted = ios_sim_queued(self.cap_summary, self.cap_labels, time.time())
+        if wanted != self.ios_sim_own:
+            gate_log(f"a queued job needs {IOS_SIM_RUNNER_LABEL}: listening at this runner's own fit, not the side "
+                     "label's costliest job" if wanted else
+                     f"no queued job needs {IOS_SIM_RUNNER_LABEL}: listening with room for the side label's costliest job")
+        self.ios_sim_own = wanted
+        return wanted
 
     def cpu_holds(self) -> bool:
         """Whether the CPU marks hold this mini's listeners (config/runner-gate.json's cpuHold; gate_cpu_hold), read
@@ -9013,7 +9065,10 @@ class Gate:
         if scope.nightly:  # NIGHTLY_SLOT: its one job shape goes first here, so it listens on a full mini
             self.full_why = None
             return None
-        fit = max(self.fit_units, listen_fit_units(self.runner_dir), side_fit_units(scope))
+        own = max(self.fit_units, listen_fit_units(self.runner_dir))
+        fit = max(own, side_fit_units(scope))
+        if fit > own and self.ios_sim_wanted():
+            fit = own  # IOS_SIM_OWN_FIT: a bigger std job it receives waits here for units (CAPACITY_WAIT)
         if self.capacity_dir is None or not claims_room(scope):
             why = mini_full(self.capacity_dir, scope.units, scope, fit)
         elif scope.session:

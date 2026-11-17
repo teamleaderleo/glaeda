@@ -8629,6 +8629,68 @@ class HostLoadCapTest(unittest.TestCase):
             self.assertIsNone(self.poll(), "CMUX_CI_HOST_LOAD_CAP=off turns it off")
         self.assertIsNotNone(self.poll(), "and back on")
 
+    IOS_SIM_JOB = ["glaeda-std-xcode-26.6", hook.IOS_SIM_RUNNER_LABEL]
+
+    def side_gate(self, held: int, labels: list[str]) -> hook.Gate:
+        """A plain side runner (listen.sh --fit-units 3) on a 14-unit simulator mini with `held` units taken, its
+        receipt registering `labels`; another runner on the mini carries glaeda-ios-sim, so the mini is a simulator
+        host either way."""
+        (self.state / "instance-2" / "receipt.json").write_text(json.dumps({"registration": {
+            "name": "cmux21-glaeda-2", "labels": labels}}))
+        (self.state / "instance-4").mkdir(exist_ok=True)
+        (self.state / "instance-4" / "receipt.json").write_text(json.dumps({"registration": {
+            "name": "cmux21-glaeda-4", "labels": ["glaeda-mini", "glaeda-std-xcode-26.6", hook.IOS_SIM_RUNNER_LABEL]}}))
+        (self.runner / hook.RUNNER_HOOK_SCRIPT).parent.mkdir(exist_ok=True)
+        (self.runner / hook.RUNNER_HOOK_SCRIPT).write_text(
+            "exec python3 /hook job-started --capacity-units 14 --canonical-roots 2 --instance 3\n")
+        (self.runner / hook.LISTEN_SCRIPT).write_text(f"listen --runner-dir {self.runner} --fit-units 3 &\n")
+        capacity = Path(tempfile.mkdtemp(dir=self.tmp))
+        (capacity / "admission.lock").touch()
+        for slot in range(held):
+            fd = os.open(capacity / f"unit-{slot}", os.O_RDONLY | os.O_CREAT, 0o644)
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.addCleanup(os.close, fd)
+        self.join()
+        self.gate = hook.Gate(self.runner, os.fspath(self.tmp / "host.lock"), os.fspath(self.tmp / "none.json"),
+                              self.state, capacity_dir=capacity)
+        return self.gate
+
+    def full(self, gate: hook.Gate) -> str | None:
+        """The first look starts the feed read (waited for), the next decides with it."""
+        gate.full(fresh=True)
+        self.join()
+        why = gate.full(fresh=True)
+        gate.unclaim()
+        return why
+
+    def test_a_busy_simulator_mini_listens_on_its_ios_sim_runner_while_an_ios_sim_job_queues(self) -> None:
+        # 2026-11-17: cmux's ios-simulator-build jobs (3 units) queued for hours while cmuxs-mac-mini-6 had 4 and
+        # mini-3 had 3 of 14 units free: "its next job needs 5", the side label's costliest job (IOS_SIM_OWN_FIT)
+        side = ["glaeda-mini", "glaeda-side-std-xcode-26.6", "glaeda-std-xcode-26.6"]
+        ios_sim = [*side, hook.IOS_SIM_RUNNER_LABEL]
+        self.jobs = [self.job("in_progress", "cmux20-glaeda-1")]
+        for held in (10, 11):
+            free = 14 - held
+            needs5 = f"only {free} of 14 capacity units on this mini are free; its next job needs 5"
+            self.assertEqual(self.full(self.side_gate(held, ios_sim)), needs5, "no ios-sim job queued: it holds")
+            self.jobs.append(self.job("queued", labels=self.IOS_SIM_JOB, ago=4 * 3600))
+            self.assertIsNone(self.full(self.side_gate(held, ios_sim)),
+                              f"{free} free and an ios-sim job queued: its ios-sim runner listens at its own 3")
+            self.assertEqual(self.full(self.side_gate(held, side)), needs5,
+                             "a side runner without glaeda-ios-sim still holds for the side need")
+            with mock.patch.object(hook, "load_cap_fetch", return_value=None):
+                self.assertEqual(self.full(self.side_gate(held, ios_sim)), needs5,
+                                 "an unreadable feed keeps today's rule")
+            self.jobs[-1] = self.job("queued", labels=["glaeda-std-xcode-26.6", "glaeda-ios-sim", "glaeda-other"])
+            self.assertEqual(self.full(self.side_gate(held, ios_sim)), needs5, "a job it could not take holds")
+            self.jobs[-1] = self.job("in_progress", "cmux20-glaeda-1", labels=self.IOS_SIM_JOB)
+            self.assertEqual(self.full(self.side_gate(held, ios_sim)), needs5, "a running ios-sim job is not queued")
+            self.jobs.pop()
+        self.jobs.append(self.job("queued", labels=self.IOS_SIM_JOB))
+        self.assertEqual(self.full(self.side_gate(12, ios_sim)),
+                         "only 2 of 14 capacity units on this mini are free; its next job needs 3",
+                         "it still needs room for its own job")
+
 
 class GateOffTheTailnet(unittest.TestCase):
     """2026-11-11: a CI mini was off the tailnet for 4+ h and its runners kept taking build-fleet compile
