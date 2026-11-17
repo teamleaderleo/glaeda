@@ -4286,15 +4286,17 @@ def default_families(role: str = "fleet-mini") -> list[Family]:
         # mini (2026-10-28) 391 tags held 35.8 GiB under cmux-next, 354 untouched for over a day, and the builder's
         # runner sat offline under its 40 GiB floor while glaeda-disk found 0.0G reclaimable. Only debug tags: the
         # release and NEXT apps' own data (com.cmuxterm.app, com.cmuxterm.app.next) is never a candidate. Not on a
-        # devbox, where a tag may be a developer's live test session.
+        # devbox, where a tag may be a developer's live test session. The classic app's tags sit at the top of
+        # Application Support itself (cmux18, 2026-11-17: 67 tags, 13.2 GiB, none touched in two days, which no
+        # family listed while the mini sat at 8 GB free): "" is that top level.
         *([] if role == "devbox" else [
-            Family(f"cmux-debug-app-data-{app}", HOME / "Library/Application Support" / app, True,
+            Family(f"cmux-debug-app-data{'-' + app if app else ''}", HOME / "Library/Application Support" / app, True,
                    # an installed app copy is too deep for the git search to finish and holds no checkout, so it
                    # is build output (as code-sign-clones); the process and open-file checks still keep a live tag
                    "the next tagged DEV build recreates it", include=(CMUX_DEBUG_APP_PREFIX,), build_output=True,
                    min_idle_hours=DEFAULT_AGE_HOURS, owner="cmux tagged DEV builds (reload.sh --tag, CI capture)",
                    rebuild_minutes=2, platform="macos")
-            for app in ("cmux-next", "cmux")]),
+            for app in ("cmux-next", "cmux", "")]),
         Family("simulators", HOME / "Library/Developer/CoreSimulator", False,
                "use `xcrun simctl delete unavailable` (report only)", platform="macos"),
         # Kept, with an owner, so the accounting names it rather than leaving it in the gap (cmux16, 2026-11-08).

@@ -2041,14 +2041,14 @@ class GlaedaDiskTest(unittest.TestCase):
         gd.FLEET_ROOT = self.root / "shared-fleet"
         gd.DARWIN = True
         try:
-            for app in ("cmux-next", "cmux"):
+            for app in ("cmux-next", "cmux", ""):
                 base = gd.HOME / "Library/Application Support" / app
                 for name in ("com.cmuxterm.app.debug.pcrim3.capslot1", "com.cmuxterm.app.next", "com.cmuxterm.app",
                              "session-com.cmuxterm.app.debug.x.json.d"):
                     (base / name).mkdir(parents=True)
             fams = {f.id: f for f in gd.default_families()}
-            for app in ("cmux-next", "cmux"):
-                fam = fams[f"cmux-debug-app-data-{app}"]
+            for fid in ("cmux-debug-app-data-cmux-next", "cmux-debug-app-data-cmux", "cmux-debug-app-data"):
+                fam = fams[fid]
                 self.assertTrue(fam.reclaimable)
                 self.assertEqual(fam.min_idle_hours, gd.DEFAULT_AGE_HOURS)
                 self.assertEqual([p.name for p in gd.candidates(fam)], ["com.cmuxterm.app.debug.pcrim3.capslot1"])
