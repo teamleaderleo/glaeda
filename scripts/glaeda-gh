@@ -7002,6 +7002,25 @@ SHA40 = re.compile(r"[0-9a-f]{40}")
 BRANCH_SAFE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,250}")
 
 
+# The lane a land step writes as. lane-gh (a lane VM's broker client) fences every write (land, update_branch, rerun)
+# with a lease taken in the calling lane's name, from LANE_GH_LANE or the acpmux session, and refuses with no lane:
+# "land: lease acquisition requires a lane session", exit 1, before the broker. This queue strips the session keys
+# (LAND_ENV), so on gcp-agent-lane-3 on 2026-11-17 every merge and update-branch it sent failed that way: none
+# reached the broker (`lane-gh calls --tool land` holds no land of cmux#45102 or #45090 after 27 and 30 merges).
+# The step is the requester's: its session on this host names the lane; the calls stay charged to glaeda-land
+# (gh_quota reads CMUX_AGENT_SESSION, never LANE_GH_LANE). A requester on another host names none.
+LAND_LANE_ENV = "LANE_GH_LANE"
+LAND_LANE_NAME = re.compile(r"[A-Za-z0-9._-]{1,100}")
+
+
+def land_lane(e: dict) -> str:
+    """E's requester's session name when the requester is a session on this host, else ""."""
+    host, _, name = str(e.get("requester") or "").rpartition("/")
+    if not host or host != policy_host() or not LAND_LANE_NAME.fullmatch(name) or name == LAND_TAG:
+        return ""
+    return name
+
+
 def land_dir() -> Path:
     return BASE / "land"
 
@@ -7684,7 +7703,9 @@ class LandQueue:
 
     # -- a job: one judgment and the step it names (a worker thread)
 
-    def env(self) -> dict[str, str]:
+    def env(self, e: dict | None = None) -> dict[str, str]:
+        """The environment a land subprocess runs with; with E, a step's, which also names E's requester as the lane
+        (land_lane): on a lane VM the broker client refuses a write with no lane before it reaches the broker."""
         env = {k: os.environ[k] for k in LAND_ENV if k in os.environ}
         parts = [p for p in env.get("PATH", "").split(":") if p]
         shim = self.gh()
@@ -7699,6 +7720,9 @@ class LandQueue:
         if isinstance(extra_env, dict):
             env.update({str(k): str(v) for k, v in extra_env.items() if k not in LAND_ENV_TAGS})
         env.update(LAND_ENV_TAGS)
+        lane = land_lane(e) if e is not None else ""
+        if lane:
+            env[LAND_LANE_ENV] = lane
         return env
 
     @staticmethod
@@ -7716,9 +7740,9 @@ class LandQueue:
                 raise subprocess.TimeoutExpired(argv, timeout) from None
         return subprocess.CompletedProcess(argv, proc.returncode, out, err)
 
-    def call(self, argv: list[str], timeout: float) -> subprocess.CompletedProcess:
+    def call(self, argv: list[str], timeout: float, e: dict | None = None) -> subprocess.CompletedProcess:
         try:
-            return self.run(argv, timeout, self.env())
+            return self.run(argv, timeout, self.env(e))
         except subprocess.TimeoutExpired:
             return subprocess.CompletedProcess(argv, 124, "", f"timed out after {timeout:.0f}s")
         except OSError as error:
@@ -7904,7 +7928,8 @@ class LandQueue:
                 return
             with self.lock:
                 self.claim(e, "rerun_failed", runs=runs)
-            results = [self.call([gh, "run", "rerun", str(r), "--failed", "-R", repo], LAND_GH_DEADLINE) for r in runs]
+            results = [self.call([gh, "run", "rerun", str(r), "--failed", "-R", repo], LAND_GH_DEADLINE, e)
+                       for r in runs]
             with self.lock:
                 self.finish(e, results[-1], exits=[g.returncode for g in results])
                 self.nudge(e["key"])
@@ -7960,7 +7985,7 @@ class LandQueue:
             return
         with self.lock:
             self.claim(e, kind, before=head, **extra)
-        got = self.call([gh, *args], LAND_GH_DEADLINE)
+        got = self.call([gh, *args], LAND_GH_DEADLINE, e)
         named = None
         with self.lock:
             self.finish(e, got)
@@ -8052,7 +8077,7 @@ class LandQueue:
         with self.lock:
             self.claim(e, "merge", sha=sha)
         got = self.call([gh, "pr", "merge", number, "-R", repo, "--squash", "--match-head-commit", sha],
-                        LAND_MERGE_DEADLINE)
+                        LAND_MERGE_DEADLINE, e)
         said = f"{got.stderr or ''} {got.stdout or ''}"
         if got.returncode != 0 and LAND_QUOTA_REFUSAL.search(said):
             with self.lock:  # the shim's merge_hold judged it on a spent quota: parked, and no `pr view` after it

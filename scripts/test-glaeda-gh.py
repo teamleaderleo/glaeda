@@ -16864,6 +16864,22 @@ class LandTest(Base):
         self.assertEqual((len(self.w.gh_calls("api")), e["wait"]["kind"]), (2, "pr"))
         self.assertIn("update_deferred", [h["event"] for h in e["history"]])
 
+    def test_steps_write_as_the_requesters_lane_on_this_host(self):
+        # gcp-agent-lane-3, 2026-11-17: lane-gh refused every merge and update-branch "land: lease acquisition requires
+        # a lane session" (this queue strips the session keys), so none reached the broker.
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(ok_answer(LA))
+        with mock.patch.object(gg, "policy_host", lambda: "host"):
+            self.tick()
+        by = {tuple(c[1:3]): env for c, env in zip(self.w.calls, self.w.envs)}
+        self.assertEqual(by[("pr", "merge")].get("LANE_GH_LANE"), "lane")
+        self.assertEqual(by[("pr", "merge")]["CMUX_AGENT_SESSION"], "glaeda-land")  # still charged to the queue
+        self.assertNotIn("LANE_GH_LANE", by[(self.w.mh, "explain")])  # a read needs no lane
+        # a requester on another host names no lane
+        self.assertEqual(gg.land_lane({"requester": "other/lane"}), "")
+        self.assertEqual(gg.land_lane({"requester": ""}), "")
+
     def test_calls_carry_the_land_tags_and_no_session_keys(self):
         self.pr(LA)
         self.land()
