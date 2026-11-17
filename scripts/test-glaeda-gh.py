@@ -8626,6 +8626,31 @@ class FileAndPidWaitTest(unittest.TestCase):
         code, doc = self.wait_file("never*.txt", 2)
         self.assertEqual((code, doc["path"]), (0, str(self.dir / "never7.txt")))
 
+    def test_without_proc_a_pid_wait_forks_ps_at_most_once_per_zombie_check(self) -> None:
+        """macOS has no /proc: kill -0 answers every poll, the zombie `ps` runs once per ZOMBIE_CHECK_S, and the reader
+        walk's command line and parent come from one ps (cosmic-gray, 2026-11-17: 223 spawns/s)."""
+        clock = [100.0]
+        ps = mock.Mock(return_value=subprocess.CompletedProcess([], 0, "S\n", ""))
+        gg._zombie_checked.clear()
+        with mock.patch.object(gg.Path, "read_text", side_effect=OSError), \
+                mock.patch.object(gg.Path, "read_bytes", side_effect=OSError), \
+                mock.patch.object(gg.subprocess, "run", ps), \
+                mock.patch.object(gg.time, "monotonic", lambda: clock[0]):
+            for _ in range(10):  # ten polls a second apart
+                self.assertTrue(gg.pid_alive(os.getpid()))
+                clock[0] += 1.0
+            self.assertEqual(ps.call_count, 1)
+            clock[0] += gg.ZOMBIE_CHECK_S
+            ps.return_value = subprocess.CompletedProcess([], 0, "Z\n", "")
+            self.assertFalse(gg.pid_alive(os.getpid()))
+            self.assertEqual(ps.call_count, 2)
+            ps.reset_mock()
+            ps.return_value = subprocess.CompletedProcess([], 0, " 4242 /usr/bin/python3 /x/pr_owner.py who\n", "")
+            self.assertEqual(gg.parent_command(31337), ["/usr/bin/python3", "/x/pr_owner.py", "who"])
+            self.assertEqual(gg.parent_pid(31337), 4242)
+            self.assertEqual(ps.call_count, 1)
+        gg._zombie_checked.clear()
+
     def test_waits_for_a_process_to_exit(self) -> None:
         proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(0.3)"])
         self.addCleanup(proc.wait)

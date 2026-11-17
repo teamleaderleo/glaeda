@@ -613,7 +613,7 @@ CONSUMER_WINDOW = 3600
 CONSUMER_DEFAULTS = {"reserved": {"autoland": 1500}, "limit": 240, "pool": 600}  # head reads an hour
 CONSUMERS_CONFIG = Path.home() / ".config/glaeda/gh-consumers.json"  # same keys as CONSUMER_DEFAULTS
 CONSUMERS_FILE = "consumers.json"  # the daemon's spend, denials and limits, for clients and `budget`
-WAIT_FILE_POLL = 1.0  # `wait file` and `wait pid` look this often (local stat calls only, no GitHub)
+WAIT_FILE_POLL = 1.0  # `wait file` and `wait pid` look this often (stat and kill -0, no GitHub; ZOMBIE_CHECK_S)
 EXIT_PARTIAL = 5  # `checks`: some heads were served stale or not at all
 POST_SPACING = 3  # seconds between two content writes from this machine (GitHub: at least 1 s between writes)
 POST_BACKOFF = 60  # a throttled write without Retry-After holds the outbox this long, doubling to POST_BACKOFF_MAX
@@ -1185,11 +1185,17 @@ def parent_command(pid: int) -> list[str]:
         return [w for w in raw.decode(errors="replace").split("\0") if w]
     except OSError:
         pass
-    try:
-        done = subprocess.run(["ps", "-o", "args=", "-p", str(pid)], capture_output=True, text=True, timeout=2)
-        return done.stdout.split()
+    try:  # one ps answers both this and parent_pid's question, so the reader walk forks one ps a level, not two
+        done = subprocess.run(["ps", "-o", "ppid=,args=", "-p", str(pid)], capture_output=True, text=True, timeout=2)
+        ppid, _, args = done.stdout.strip().partition(" ")
+        if ppid.isdigit():
+            _ppid_of[pid] = int(ppid)
+        return args.split()
     except (OSError, subprocess.SubprocessError):
         return []
+
+
+_ppid_of: dict[int, int] = {}
 
 
 def parent_pid(pid: int) -> int:
@@ -1199,6 +1205,8 @@ def parent_pid(pid: int) -> int:
                 return int(line.split()[1])
     except (OSError, ValueError, IndexError):
         pass
+    if pid in _ppid_of:
+        return _ppid_of[pid]
     try:
         done = subprocess.run(["ps", "-o", "ppid=", "-p", str(pid)], capture_output=True, text=True, timeout=2)
         return int(done.stdout.strip() or 0)
@@ -11111,6 +11119,13 @@ def cmd_wait_file(target: str, timeout: float, as_json: bool, mode: str = "nonem
         time.sleep(min(WAIT_FILE_POLL, max(0.05, timeout - (time.monotonic() - start))))
 
 
+# Without /proc (macOS) the zombie check forks `ps`, so a pid wait runs it at most this often per pid; kill -0 still
+# answers every WAIT_FILE_POLL. A `ps` a second per waiter, each one scanned by XProtect, was part of cosmic-gray's
+# 223 spawns/s on 2026-11-17 (load 30 on 15 cores, 18 glaeda-gh processes at 81% CPU).
+ZOMBIE_CHECK_S = 15.0
+_zombie_checked: dict[int, float] = {}
+
+
 def pid_alive(pid: int) -> bool:
     try:
         os.kill(pid, 0)
@@ -11118,7 +11133,16 @@ def pid_alive(pid: int) -> bool:
         return False
     except PermissionError:
         return True
-    try:  # a zombie has exited; its parent just has not reaped it
+    # a zombie has exited; its parent just has not reaped it
+    try:
+        return Path(f"/proc/{pid}/stat").read_text().rpartition(")")[2].split()[0] != "Z"
+    except (OSError, IndexError):
+        pass
+    now = time.monotonic()
+    if now - _zombie_checked.get(pid, -ZOMBIE_CHECK_S) < ZOMBIE_CHECK_S:
+        return True
+    _zombie_checked[pid] = now
+    try:
         state = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True, timeout=5).stdout
         return not state.strip().startswith("Z") and bool(state.strip())
     except (OSError, subprocess.SubprocessError):
