@@ -505,8 +505,8 @@ What `--apply` does:
        each unit back as it freed. Nothing was down. Now a root runner's gate, held off by units
        while a job it could take has waited `afterMin` (10) in the controller's feed (the load
        cap's), holds `capacity/starved.hold` on its mini's turn: `spreadMin` (20) times a stable
-       hash of the host and the job, so one mini goes first and the job is usually gone before the
-       next turn. While it is held, every other listener on the mini except the root runners and
+       hash of the host and the job, so one mini goes first and others join only while the job still
+       waits (about one more every spreadMin divided by the std minis). While it is held, every other listener on the mini except the root runners and
        the freshness slot, and the fleet step fit (`step_fits`), leave `root_fit_units()` free
        beside their own need. Admissions never count it, so no job already taken is refused or
        made to wait; running jobs finish, the units drain to the compile's need, and the root

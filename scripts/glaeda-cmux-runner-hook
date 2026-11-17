@@ -8360,9 +8360,9 @@ def oldest_queued_s(summary: dict[str, Any] | None, labels: frozenset[str] | Non
 # listener on the mini but the root runners and the freshness slot then leaves root_fit_units() units free beside its
 # own need (mini_full), and so does a fleet step's fit (step_fits). Running jobs finish (nothing is refused,
 # cancelled or failed; an admission does not look at it), the units drain to the root runner's need, and its
-# listener takes the job. Only one mini does it at a time: each mini's turn comes spreadMin x a stable hash of its
-# host and the job, so the first one to reach its turn holds it and the job is gone from the queue (the hold ends)
-# long before the next one's turn, unless that mini could not free the units. A hold ends when its runner takes a
+# listener takes the job. The minis take turns: each mini's turn comes spreadMin x a stable hash of its host and the
+# job, so one mini holds first and others join only while the job still waits (with N std minis, about one more
+# every spreadMin / N); every hold for it ends at the first feed read after some mini takes it. A hold ends when its runner takes a
 # job, the job leaves the queue, the root runner is held for something other than units, the feed cannot be read
 # (fail open), or after maxHoldMin; after that the same job never gets this mini's hold again. config/
 # runner-gate.json's starvedReserve (false, true, or a dict of afterMin, spreadMin and maxHoldMin) sets it by default
@@ -8374,7 +8374,7 @@ STARVED_SPREAD_MIN = 20.0
 STARVED_MAX_HOLD_MIN = 30.0
 STARVED_LIMIT_MIN = 120.0  # no setting may make a hold or a wait longer than this
 STARVED_SPENT_MAX = 64  # jobs a gate remembers having held for (a hold past maxHoldMin is not taken again)
-STARVED_QUEUED = ("queued", "waiting", "pending")
+STARVED_QUEUED = ("queued",)  # "waiting" (an approval) and "pending" (a concurrency group) no runner can take
 STARVED_NOTE = "kept for a starved job of a root runner's label"
 
 
@@ -8437,7 +8437,7 @@ def starved_turn(host: str, key: str) -> float:
 
 
 def starved_job(summary: dict[str, Any] | None, labels: frozenset[str] | None, host: str, now: float,
-                policy: StarvedReserve | None) -> tuple[str, float] | None:
+                policy: StarvedReserve | None, spent: tuple[str, ...] | list[str] = ()) -> tuple[str, float] | None:
     """STARVED_RESERVE: (key, waited s) of the longest-waiting queued job this runner could take (its labels all this
     runner's) once it has waited policy.after_s plus this mini's turn (starved_turn x policy.spread_s), in a fresh
     feed; None when none has, the policy is off, or the feed cannot say. A job older than
@@ -8460,8 +8460,11 @@ def starved_job(summary: dict[str, Any] | None, labels: frozenset[str] | None, h
         waited = now - created
         if waited > HOST_LOAD_CAP_JOB_MAX_AGE_S or waited < 0:
             continue
+        key = f"{' '.join(sorted(wants))}@{created:.0f}"
+        if key in spent:
+            continue  # its hold here ran out: a newer starved job is not masked behind it
         if oldest is None or waited > oldest[0]:
-            oldest = (waited, f"{' '.join(sorted(wants))}@{created:.0f}")
+            oldest = (waited, key)
     if oldest is None:
         return None
     waited, key = oldest
@@ -9673,7 +9676,8 @@ class Gate:
         scope = runner_scope(self.runner_dir)
         if not scope.root or scope.dedicated or scope.nightly or self.capacity_dir is None:
             return False, "not a root runner: no starved-job reserve"
-        units_bound = why is not None and UNITS_FULL in why
+        # units, not RAM: a reserve keeps units free, and a RAM-bound root runner would gain nothing from it
+        units_bound = why is not None and UNITS_FULL in why and "GiB of RAM" not in why
         if self.starved_fd is None and not units_bound:
             return False, ""
         self.cpu_holds()  # refreshes self.starved with the other settings, at most every GATE_SETTINGS_EVERY_S
@@ -9682,7 +9686,8 @@ class Gate:
         if self.starved_fd is not None and why is not None and not units_bound and "waits here for units" not in why:
             return False, f"held off for something else ({why}): the starved-job reserve is let go"
         self.cap_look()
-        found = starved_job(self.cap_summary, self.cap_labels, gate_host(), time.time(), self.starved)
+        found = starved_job(self.cap_summary, self.cap_labels, gate_host(), time.time(), self.starved,
+                            self.starved_spent)
         if found is None:
             return False, "no job of this runner's labels is starved now (or the feed cannot say): reserve let go"
         key, waited = found

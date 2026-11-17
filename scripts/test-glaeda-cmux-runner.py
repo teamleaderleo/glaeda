@@ -8957,6 +8957,14 @@ class StarvedReserveTest(unittest.TestCase):
         self.assertIsNone(hook.starved_job(lost, labels, self.HOST, now, policy), "a lost delivery")
         running = {"at": now, "delivery": now, "jobs": [self.job("in_progress", ago=3600)]}
         self.assertIsNone(hook.starved_job(running, labels, self.HOST, now, policy))
+        for status in ("waiting", "pending"):  # an approval or a concurrency group: no runner can take it
+            gated = {"at": now, "delivery": now, "jobs": [self.job(status, ago=3600)]}
+            self.assertIsNone(hook.starved_job(gated, labels, self.HOST, now, policy), status)
+        # a job whose hold here ran out does not mask a newer starved one
+        two = {"at": now, "delivery": now, "jobs": [self.job(ago=40 * 60), self.job(ago=12 * 60)]}
+        spent, _ = hook.starved_job(two, labels, self.HOST, now, policy)
+        newer, _ = hook.starved_job(two, labels, self.HOST, now, policy, [spent])
+        self.assertNotEqual(newer, spent)
         # one mini first: the turns are stable and differ between minis, so the spread puts them in an order
         hosts = [f"cmux{n}s-mac-mini" for n in range(7, 15)] + [f"cmuxs-mac-mini-{n}" for n in range(3, 7)]
         turns = [hook.starved_turn(host, key) for host in hosts]
@@ -9015,6 +9023,8 @@ class StarvedReserveTest(unittest.TestCase):
         self.jobs = [self.job()]
         self.look(gate, "a fleet build is waiting for the host (pid 1)")
         self.assertIsNone(gate.starved_fd, "held for something else: reserving would only idle units")
+        self.look(gate, "only 3 of 24 GiB of RAM (capacity units on this mini) are free; a compile needs 6 GiB")
+        self.assertIsNone(gate.starved_fd, "held for RAM: a units reserve cannot help it")
         self.look(gate, units)
         self.assertIsNotNone(gate.starved_fd)
         with mock.patch.object(hook, "load_cap_fetch", return_value=None):
