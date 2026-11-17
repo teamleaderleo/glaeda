@@ -1116,7 +1116,9 @@ def ci_ios_family(root: Path | None = None) -> Family:
 # it: 8-9 GiB per idle root on cmux7s, cmux12s and cmux13s while the controller paused their claims for disk
 # (2026-10-21). Only these names one level below the root, so src/ stays the tmp family's and git's to judge.
 CANONICAL_ADMISSION = "cmux-ci-admission"
-CANONICAL_ADMISSION_NAMES = ("derived-data-", "compile-admission-cas")
+# .product-pack.: a killed compile's product staging (job_end_scratch takes it at once; this is the catch-up for what
+# that hook did not see: a job of an older hook, or a root a job held while another process used the staging dir)
+CANONICAL_ADMISSION_NAMES = ("derived-data-", "compile-admission-cas", ".product-pack.")
 CANONICAL_ADMISSION_IDLE_HOURS = DEFAULT_AGE_HOURS
 CANONICAL_CAPACITY = FLEET_ROOT / "capacity"
 
@@ -1185,8 +1187,12 @@ def remove_canonical_admission(path: Path, whole_root: bool = False) -> bool:
     """Rename an admission item (with whole_root: the root itself) aside under its root's token, held exclusive
     as a job holds it, and delete it outside the lock. False, touching nothing, while a job holds the root."""
     token = canonical_root_token(path, whole_root)
-    if token is None:
-        return False
+    return False if token is None else remove_under_token(path, token)
+
+
+def remove_under_token(path: Path, token: Path) -> bool:
+    """remove_canonical_admission's protocol with the root token named: PATH goes aside under TOKEN held exclusive,
+    as a job holds it, and is deleted outside the lock. False, touching nothing, while a job holds the root."""
     if not token.parent.is_dir():  # no capacity dir: not a fleet mini, so no job can take the root
         remove(path)
         return True
@@ -3552,6 +3558,181 @@ def own_runner_checkout_main(args: list[str]) -> int:
             print(note)
         else:
             RUN["skipped"] = "not a bloated checkout of a starting job"
+        return 0
+    finally:
+        write_run_line(started, before)
+
+
+# What the ending job alone left, which no later job reads, goes at job-completed (the runner hook's job_end_scratch)
+# instead of waiting for an idle window. Leo, 2026-11-17: "you need to improve glaeda. there are dozens if not hundreds
+# of gb of build stuff that just keep getting accumulated. it's too much". Only three kinds, each named by its owner and
+# bound to the job by the root token it held or the runner it ran on:
+#   * <root>/.product-pack.XXXXXX: ci-macos.yml's and seed-derived-data.yml's mktemp -d staging of the compiled
+#     products as hard links (pax -rwlL), removed by an EXIT trap a cancelled or killed job never runs. Once the next
+#     compile clears the admission DerivedData the links alone keep ~1.9 GB of products, and neither admission family
+#     (CANONICAL_ADMISSION_NAMES) nor the tmp family (src/ keeps the whole root) took it.
+#   * <store>/.derived-data.discard-<pid>: owned_build_state.py's old kept build set aside (12 to 40 GB), deleted after
+#     its lock; a killed `keep` leaves it until the root's next check or keep. Only while <pid> is not running.
+#   * tmp_pack_* and friends in this runner's own checkouts (RUNNER_GIT_GARBAGE_FAMILY): a cancelled fetch's or the
+#     hook's timed-out repack's temp pack (up to 5 GiB), which git never reads again.
+# Everything else a job leaves is warm state a later job reuses (the checkout, its .build and target, spm-scratch/
+# <fingerprint>, the kept build, parked builds, seeds) or its run's consumers read (the admission DerivedData), and
+# stays with its family; the runner empties $RUNNER_TEMP itself after this hook.
+# A root's items go only under its token, taken exclusive without waiting (remove_under_token): the next job on that
+# root, or an idle catch-up, keeps them. Every item also stays while a process has it open or as its working
+# directory, or a command line names it; a checkout's temp packs stay while anything uses or names the checkout.
+# No process evidence, the kill switch or a host reservation keeps everything.
+JOB_END_FAMILY = "job-end-scratch"
+PRODUCT_PACK_PREFIX = ".product-pack."
+KEPT_DISCARD_RE = re.compile(r"\.derived-data\.discard-([0-9]+)")
+
+
+def root_store(k: int, ci: Path | None = None) -> Path:
+    """Root k's kept build store (ci-macos.yml's CMUX_OWNED_STATE_ROOT; cmux-ci-<k> below it past root 1)."""
+    ci = FLEET_CI if ci is None else ci
+    return ci if k == 1 else ci / f"cmux-ci-{k}"
+
+
+def pid_running(pid: int) -> bool:
+    if pid <= 0:
+        return True  # not a pid a process could have: never read it as gone
+    try:
+        os.kill(pid, 0)
+    except PermissionError:
+        return True
+    except (OSError, OverflowError):
+        return False
+    return True
+
+
+def job_end_candidates(roots: list[int], runner: Path | None, tmp: Path | None = None,
+                       ci: Path | None = None) -> list[tuple[str, Path, Path | None]]:
+    """(kind, path, root token or None) for the ending job's own scratch: product-pack staging in the roots it held,
+    discarded kept builds in those roots' stores, and git temp packs in its runner's checkouts."""
+    tmp = (Path("/private/tmp") if DARWIN else Path("/tmp")) if tmp is None else tmp
+    out: list[tuple[str, Path, Path | None]] = []
+    for k in roots:
+        token = CANONICAL_CAPACITY / f"root-{k}.token"
+        root = tmp / ("cmux-ci" if k == 1 else f"cmux-ci-{k}")
+        if not root.is_symlink() and root.is_dir():
+            out += [("product-pack", Path(e.path), token) for e in _entries(root)
+                    if e.name.startswith(PRODUCT_PACK_PREFIX) and e.is_dir(follow_symlinks=False)]
+        store = root_store(k, ci)
+        if not store.is_symlink() and store.is_dir():
+            out += [("kept-build-discard", Path(e.path), token) for e in _entries(store)
+                    if KEPT_DISCARD_RE.fullmatch(e.name) and e.is_dir(follow_symlinks=False)]
+    if runner is not None and not (runner / "_work").is_symlink() and (runner / "_work").is_dir():
+        out += [("git-temp-pack", p, None) for p in runner_git_garbage(runner / "_work")]
+    return out
+
+
+def job_end_veto(kind: str, path: Path, opened: frozenset[str], cmds: str, work: Path | None) -> str:
+    """Why one job-end item stays, or ""."""
+    if kind == "kept-build-discard":
+        m = KEPT_DISCARD_RE.fullmatch(path.name)
+        if m is None or pid_running(int(m.group(1))):
+            return "the keep that set it aside is still running"
+    if kind == "git-temp-pack":  # the checkout (_work/<repo>/<repo>): anything using or naming it may write its packs
+        checkout = next((p for p in path.parents if work is not None and p.parent.parent == work), None)
+        if checkout is None:
+            return "not in this runner's checkout"
+        path = checkout
+    for spelling in dict.fromkeys((os.fspath(path), os.path.realpath(path))):
+        if in_cwd(spelling, opened):
+            return "open or a working directory of a process"
+        if named_by(spelling, cmds):
+            return "named by a running command"
+    return ""
+
+
+def job_end_scratch(roots: list[int], runner: Path | None, receipt: Path, tmp: Path | None = None,
+                    ci: Path | None = None) -> str:
+    """Remove the ending job's own scratch (job_end_candidates) that no veto keeps: a one-line note, "" when there is
+    none. Never raises OSError."""
+    items = job_end_candidates(roots, runner, tmp, ci)
+    if not items:
+        return ""
+    if (why := host_reservation()):
+        return f"kept {len(items)} job-end scratch item(s): {why}"
+    try:
+        opened, cmds = process_evidence()
+    except NoEvidence as e:
+        return f"kept {len(items)} job-end scratch item(s): no process evidence ({e})"
+    index, work = open_index(opened), (None if runner is None else runner / "_work")
+    done: collections.Counter[str] = collections.Counter()
+    kept: list[str] = []
+    freed = 0
+    for kind, path, token in items:
+        seen = tree_newest(path, budget=1_000_000)
+        size = seen[1] if seen else 0
+        why = job_end_veto(kind, path, index, cmds, work)
+        outcome = "changed:in-use" if why else "reclaimed"
+        if not why:
+            try:
+                if token is None:
+                    remove(path)
+                elif not remove_under_token(path, token):
+                    why, outcome = "a job holds its root", "changed:in-use"
+            except FileNotFoundError:
+                size = 0  # another pass took it first
+            except OSError as e:
+                why, outcome = f"incomplete: {e.__class__.__name__}", f"incomplete:{e.__class__.__name__}"
+        rec = {"at": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "host": platform.node(), "outcome": outcome,
+               "family": JOB_END_FAMILY, "kind": kind, "path": os.fspath(path), "bytes": 0 if why else size,
+               "verdict": "blocked" if why else "reclaimable", "reasons": [why or "the job that made it ended"]}
+        with contextlib.suppress(OSError):
+            receipt.parent.mkdir(parents=True, exist_ok=True)
+            with receipt.open("a") as f:
+                f.write(json.dumps(rec) + "\n")
+        if why:
+            kept.append(f"{kind} ({why})")
+        else:
+            done[kind] += 1
+            freed += size
+    RUN["released"] = RUN.get("released", 0) + freed
+    notes = []
+    if done:
+        notes.append(f"removed the job's own scratch: {', '.join(f'{n} {k}' for k, n in sorted(done.items()))} "
+                     f"({gib(freed).strip()})")
+    if kept:
+        notes.append(f"kept {len(kept)}: {'; '.join(kept[:3])}")
+    return "; ".join(notes)
+
+
+def job_end_runner(home: Path | None = None) -> Path | None:
+    """The enrolled runner whose job is ending: its .runner agentName is $RUNNER_NAME and $RUNNER_TEMP is its
+    _work/_temp. None otherwise."""
+    name, temp = os.environ.get("RUNNER_NAME"), os.environ.get("RUNNER_TEMP", "").rstrip("/")
+    if not name or not temp:
+        return None
+    for runner in enrolled_runners(home):
+        if runner_agent_name(runner) == name and os.path.abspath(temp) == os.fspath(runner / "_work" / "_temp"):
+            return runner
+    return None
+
+
+def job_end_scratch_main(args: list[str]) -> int:
+    """glaeda-disk --job-end-scratch [--roots K,K] [--receipt PATH]: job_end_scratch for the canonical roots the
+    ending job held (the runner hook passes their numbers) and the runner the job's environment names, from the
+    runner hook at job-completed. Exits 0."""
+    ap = argparse.ArgumentParser(prog="glaeda-disk --job-end-scratch")
+    ap.add_argument("--job-end-scratch", action="store_true")
+    ap.add_argument("--roots", default="")
+    ap.add_argument("--receipt", type=Path, default=HOME / "Projects/recovery/disk-reclaim/receipts.jsonl")
+    a = ap.parse_args(args)
+    roots = sorted({int(k) for k in a.roots.split(",") if re.fullmatch(r"[1-9][0-9]?", k)})
+    RUN.clear()
+    RUN.update(caller=run_caller(), mode="job-end-scratch", apply=True)
+    started, before = time.time(), _home_free()
+    try:
+        if (off := disk_off()):
+            RUN.update(off=True, skipped=f"kill switch: {off}")
+            return 0
+        note = job_end_scratch(roots, job_end_runner(), a.receipt) if DARWIN else ""
+        if note:
+            print(note)
+        else:
+            RUN["skipped"] = "no job-end scratch"
         return 0
     finally:
         write_run_line(started, before)
@@ -13656,6 +13837,8 @@ def main(argv: list[str] | None = None) -> int:
         return census_main(args)
     if "--own-runner-checkout" in args:
         return own_runner_checkout_main(args)
+    if "--job-end-scratch" in args:
+        return job_end_scratch_main(args)
     background = "--refresh" in args and "--refresh-lock-fd" in args and "--apply" not in args
     if not background:
         return _logged_main(args)

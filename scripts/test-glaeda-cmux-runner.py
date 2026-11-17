@@ -447,6 +447,65 @@ class HookTest(unittest.TestCase):
         with mock.patch.object(hook.subprocess, "Popen", side_effect=OSError("gone")):
             self.assertEqual(hook.evict_own_checkout(os.fspath(ws), os.fspath(disk)), "")
 
+    def test_job_completed_asks_glaeda_disk_about_the_jobs_own_scratch_only_when_a_listing_finds_some(self) -> None:
+        """job-completed runs glaeda-disk --job-end-scratch (from /, in its own session, the roots the job held by
+        number) only when a killed compile's .product-pack.*, a killed keep's .derived-data.discard-<pid> in a held
+        root, or a git temp pack in this runner's checkout is there. Another root's leftovers never start it. A
+        timeout kills its whole process group; nothing ever fails the job."""
+        roots, fleet = self.dir / "tmp", self.dir / "fleet"
+        work = self.dir / "actions-runner-glaeda-4" / "_work"
+        pack = work / "cmux" / "cmux" / ".git" / "objects" / "pack"
+        for d in (roots / "cmux-ci-2", roots / "cmux-ci-3", fleet / "ci" / "cmux-ci-2", pack, work / "_temp"):
+            d.mkdir(parents=True)
+        (pack / "pack-1.pack").write_text("")
+        runs = []
+
+        class Proc:
+            pid = 4343
+
+            def __init__(self, argv, **kw):
+                runs.append((argv, kw.get("cwd"), kw.get("start_new_session")))
+
+            def communicate(self, timeout=None):
+                return "removed the job's own scratch: 1 product-pack (1.9G)\n", ""
+        disk = self.dir / "glaeda-disk"
+        disk.write_text("")
+        env = {"RUNNER_TEMP": os.fspath(work / "_temp")}
+        with mock.patch.object(hook.subprocess, "Popen", Proc), mock.patch.object(hook.os, "killpg"), \
+                mock.patch.object(hook, "ROOT_PARENT", os.fspath(roots)), \
+                mock.patch.object(hook, "FLEET_DIR", os.fspath(fleet)), mock.patch.dict(os.environ, env):
+            self.assertEqual(hook.job_end_scratch(["root-2"], os.fspath(disk)), "")
+            (roots / "cmux-ci-3" / ".product-pack.AbC123").mkdir()  # a root this job did not hold
+            (fleet / "ci" / "cmux-ci-2" / ".derived-data.discard-").mkdir()  # no pid: not owned_build_state's name
+            self.assertEqual(hook.job_end_scratch(["root-2", "gui"], os.fspath(disk)), "")
+            self.assertEqual(runs, [])
+            for made, roots_held in ((roots / "cmux-ci-2" / ".product-pack.XyZ789", ["root-2"]),
+                                     (fleet / "ci" / "cmux-ci-2" / ".derived-data.discard-812", ["root-2"]),
+                                     (pack / "tmp_pack_q1w2e3", [])):
+                made.mkdir() if made.name.startswith(".") else made.write_text("")
+                self.assertIn("product-pack", hook.job_end_scratch(roots_held, os.fspath(disk)))
+                if made.is_dir():
+                    made.rmdir()
+                else:
+                    made.unlink()
+        self.assertEqual(runs, [([sys.executable, os.fspath(disk), "--job-end-scratch", "--roots", "2"], "/", True),
+                                ([sys.executable, os.fspath(disk), "--job-end-scratch", "--roots", "2"], "/", True),
+                                ([sys.executable, os.fspath(disk), "--job-end-scratch", "--roots", ""], "/", True)])
+
+        class Slow(Proc):
+            def communicate(self, timeout=None):
+                if timeout != 5:
+                    raise subprocess.TimeoutExpired("glaeda-disk", timeout)
+                return "", ""
+        killed = []
+        (pack / "tmp_pack_q1w2e3").write_text("")
+        with mock.patch.object(hook.subprocess, "Popen", Slow), mock.patch.dict(os.environ, env), \
+                mock.patch.object(hook.os, "killpg", side_effect=lambda pid, sig: killed.append((pid, sig))):
+            self.assertIn("timed out", hook.job_end_scratch([], os.fspath(disk), timeout=1))
+        self.assertEqual(killed, [(4343, hook.signal.SIGKILL)])
+        with mock.patch.object(hook.subprocess, "Popen", side_effect=OSError("gone")), mock.patch.dict(os.environ, env):
+            self.assertEqual(hook.job_end_scratch([], os.fspath(disk)), "")
+
     def test_a_workspace_a_failed_checkout_left_is_reset_before_the_next(self) -> None:
         """glaeda-2 kept failing cmux-tui checkouts after the sparse job had gone (op-restore-sqlite: three
         runs on 2026-10-12, missing scripts/install-zig-ci.sh, "not uptodate"): a failed checkout leaves

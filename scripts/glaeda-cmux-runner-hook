@@ -4667,6 +4667,69 @@ def evict_own_checkout(workspace: str | None, explicit: str | None, timeout: flo
         return ""
 
 
+# glaeda-disk --job-end-scratch removes what the ending job alone left that no later job reads (glaeda-disk's
+# JOB_END_FAMILY): a killed compile's <root>/.product-pack.* staging and a killed keep's <store>/.derived-data.discard-*
+# in the canonical roots it held, and git temp packs (a cancelled fetch's, or borrow_mirror's timed-out repack's) in
+# this runner's checkouts. At job end, not an idle window later: Leo, 2026-11-17, "there are dozens if not hundreds of
+# gb of build stuff that just keep getting accumulated". Started only when a listing of those few directories finds
+# one, so an ordinary job pays a handful of scandirs; the runner waits for it before its next job, bounded.
+JOB_END_SCRATCH_TIMEOUT_S = 90.0
+JOB_END_GIT_TEMP = re.compile(r"tmp_[a-z]+_[A-Za-z0-9]{6,}|\.tmp-[0-9]+-pack-.+")  # glaeda-disk GIT_GARBAGE_NAME
+JOB_END_DISCARD = re.compile(r"\.derived-data\.discard-[0-9]+")  # glaeda-disk KEPT_DISCARD_RE
+
+
+def job_end_scratch_found(roots: list[int], work: str | None) -> bool:
+    """Whether any job-end scratch candidate is there: one listing per root, store and checkout object dir."""
+    def names(path: str) -> list[str]:
+        try:
+            with os.scandir(path) as it:
+                return [e.name for e in it]
+        except OSError:
+            return []
+    for k in roots:
+        root = os.path.join(ROOT_PARENT, "cmux-ci" if k == 1 else f"cmux-ci-{k}")
+        store = os.path.join(FLEET_DIR, "ci") if k == 1 else os.path.join(FLEET_DIR, "ci", f"cmux-ci-{k}")
+        if any(n.startswith(".product-pack.") for n in names(root)) \
+                or any(JOB_END_DISCARD.fullmatch(n) for n in names(store)):
+            return True
+    if work:
+        for repo in names(work):
+            if repo.startswith(("_", ".")):
+                continue
+            objects = os.path.join(work, repo, repo, ".git", "objects")
+            if any(JOB_END_GIT_TEMP.fullmatch(n) for d in (objects, os.path.join(objects, "pack")) for n in names(d)):
+                return True
+    return False
+
+
+def job_end_scratch(roots: list[str], explicit: str | None, timeout: float = JOB_END_SCRATCH_TIMEOUT_S) -> str:
+    """job-completed: glaeda-disk's note on the ending job's own scratch, or "". Never raises."""
+    try:
+        numbers = sorted({int(r[len("root-"):]) for r in roots if re.fullmatch(r"root-[1-9][0-9]?", r)})
+        if not job_end_scratch_found(numbers, job_work_dir()):
+            return ""
+        disk = find_disk(explicit)
+        if disk is None:
+            return ""
+        proc = subprocess.Popen([sys.executable, disk, "--job-end-scratch", "--roots", ",".join(map(str, numbers))],
+                                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+                                cwd="/", start_new_session=True)
+        try:
+            out, _ = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            with contextlib.suppress(OSError):
+                os.killpg(proc.pid, signal.SIGKILL)  # glaeda-disk and every lsof and ps it started
+            with contextlib.suppress(Exception):
+                proc.communicate(timeout=5)
+            return f"job-end scratch timed out after {timeout:g} s (the disk passes take what is left)"
+        with contextlib.suppress(OSError):
+            os.killpg(proc.pid, signal.SIGKILL)
+        lines = (out or "").strip().splitlines()
+        return lines[-1] if lines else ""
+    except Exception:  # noqa: BLE001  (never fail the job on housekeeping)
+        return ""
+
+
 # One copy of cmux's objects per mini instead of one per runner. Each runner's checkout kept its own packs: 0.5-1.6 GiB
 # for a depth-1 checkout, 9-12 GiB for a full-history one, 15-33 GiB of runner .git per mini (2026-10-27). glaeda-git-
 # mirror keeps one full mirror per mini and never removes an object from it, so at job-completed a cmux checkout
@@ -12237,6 +12300,7 @@ def main(argv: list[str] | None = None) -> int:
                                  disk_path=None if args.no_disk else disk_path)
             print(f"{PREFIX}: {note}", flush=True)
     else:
+        ending_roots = held_roots(args.state_dir)  # read before release_host_lock removes the .roots file
         if telemetry:
             print(f"{PREFIX}: {finish_sampler(args.state_dir)}", flush=True)
         if args.promotion_lease is not None or args.capture_lease is not None:
@@ -12260,6 +12324,9 @@ def main(argv: list[str] | None = None) -> int:
             print(f"{PREFIX}: {note}", flush=True)
         if not args.no_disk and (borrowed := borrow_mirror(os.environ.get("GITHUB_WORKSPACE"))):
             print(f"{PREFIX}: {borrowed}", flush=True)
+        if not args.no_disk and args.promotion_lease is None and args.capture_lease is None \
+                and (scratch := job_end_scratch(ending_roots, args.disk)):
+            print(f"{PREFIX}: {scratch}", flush=True)
         worker = args.watch_pid or current_worker
         if worker:
             with contextlib.suppress(OSError):

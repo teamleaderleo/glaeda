@@ -2480,6 +2480,94 @@ class GlaedaDiskTest(unittest.TestCase):
         self.assertTrue(gd.canonical_root_held(tmp / "cmux-ci-next" / "derived-data-x"))
         self.assertFalse(gd.remove_canonical_admission(tmp / "cmux-ci-next" / "derived-data-x"))
 
+    def test_job_end_scratch_takes_only_the_ending_jobs_own_leftovers(self) -> None:
+        """Leo, 2026-11-17: "dozens if not hundreds of gb of build stuff that just keep getting accumulated". At
+        job-completed the ending job's own leftovers go: a killed compile's .product-pack.* in a root it held, a
+        killed keep's .derived-data.discard-<pid> in that root's store, git temp packs in its runner's checkout.
+        Warm state stays (the admission DerivedData, the kept build, spm-scratch, the checkout's packs), as does
+        another root's, a root a new job holds, a discard whose keep still runs, and anything open or named."""
+        tmp, ci, capacity, home = self.root / "tmp", self.root / "ci", self.root / "capacity", self.root / "home"
+        capacity.mkdir()
+        for k in (1, 2, 3):
+            (capacity / f"root-{k}.token").touch()
+        runner = home / "actions-runner-glaeda-4"
+        (runner / "glaeda-hooks").mkdir(parents=True)
+        (runner / ".runner").write_text('﻿{"agentName": "mini-glaeda-4"}')
+        checkout = runner / "_work" / "cmux" / "cmux"
+        pack = checkout / ".git" / "objects" / "pack"
+        pack.mkdir(parents=True)
+        (pack / "pack-1.pack").write_text("kept")
+        (pack / "tmp_pack_q1w2e3").write_text("x" * 4096)
+        (runner / "_work" / "_temp").mkdir()
+        dead = 2**22 + 7  # past any pid_max this suite runs under
+        stage = make(tmp / "cmux-ci-2" / ".product-pack.XyZ789", age_hours=0)
+        make(tmp / "cmux-ci-2" / "derived-data-compile-admission", age_hours=0)  # its run's consumers read it
+        make(tmp / "cmux-ci-3" / ".product-pack.Other1", age_hours=0)  # a root this job did not hold
+        make(tmp / "cmux-ci" / ".product-pack.Root1x", age_hours=0)  # root 1: a new job holds it now
+        discard = make(ci / "cmux-ci-2" / f".derived-data.discard-{dead}", age_hours=0)
+        live = make(ci / "cmux-ci-2" / f".derived-data.discard-{os.getpid()}", age_hours=0)  # its keep still runs
+        make(ci / "cmux-ci-2" / "derived-data", age_hours=0)  # the kept build
+        make(ci / "spm-scratch" / "abc123", age_hours=0)
+        job = open(capacity / "root-1.token")
+        self.addCleanup(job.close)
+        fcntl.flock(job, fcntl.LOCK_EX)
+        receipt = self.receipt()
+        env = {"RUNNER_NAME": "mini-glaeda-4", "RUNNER_TEMP": os.fspath(runner / "_work" / "_temp")}
+        with mock.patch.object(gd, "CANONICAL_CAPACITY", capacity), mock.patch.object(gd, "HOME", home), \
+                mock.patch.object(gd, "host_reservation", return_value=""), mock.patch.dict(os.environ, env):
+            found = gd.job_end_runner(home)
+            self.assertEqual(found, runner)
+            # a command naming the checkout (a fetch still running) keeps its temp packs
+            gd.process_evidence = lambda: ([], f"git -C {checkout} fetch origin")
+            note = gd.job_end_scratch([1, 2], found, receipt, tmp, ci)
+            self.assertIn("1 kept-build-discard", note)
+            self.assertIn("1 product-pack", note)
+            self.assertIn("a job holds its root", note)
+            self.assertTrue((pack / "tmp_pack_q1w2e3").is_file())
+            gd.process_evidence = lambda: ([], "")
+            self.assertIn("1 git-temp-pack", gd.job_end_scratch([1, 2], found, receipt, tmp, ci))
+            with mock.patch.dict(os.environ, {"RUNNER_NAME": "mini-glaeda-5"}):
+                self.assertIsNone(gd.job_end_runner(home), "another runner's name: not this runner's job")
+        self.assertFalse(stage.exists() or discard.exists() or (pack / "tmp_pack_q1w2e3").exists())
+        for stays in (live, tmp / "cmux-ci-2" / "derived-data-compile-admission", tmp / "cmux-ci-3" / ".product-pack.Other1",
+                      tmp / "cmux-ci" / ".product-pack.Root1x", ci / "cmux-ci-2" / "derived-data",
+                      ci / "spm-scratch" / "abc123", pack / "pack-1.pack"):
+            self.assertTrue(stays.exists(), stays)
+        self.assertEqual([p.name for p in (tmp / "cmux-ci-2").iterdir()], ["derived-data-compile-admission"],
+                         "nothing renamed aside is left behind")
+        recs = [json.loads(line) for line in receipt.read_text().splitlines()]
+        self.assertEqual({r["family"] for r in recs}, {gd.JOB_END_FAMILY})
+        self.assertEqual(sorted((r["kind"], r["outcome"]) for r in recs if r["outcome"] == "reclaimed"),
+                         [("git-temp-pack", "reclaimed"), ("kept-build-discard", "reclaimed"),
+                          ("product-pack", "reclaimed")])
+        # no process evidence, or a reserved host, keeps everything
+        make(tmp / "cmux-ci-2" / ".product-pack.Again1", age_hours=0)
+        with mock.patch.object(gd, "CANONICAL_CAPACITY", capacity), \
+                mock.patch.object(gd, "host_reservation", return_value=""):
+            gd.process_evidence = mock.Mock(side_effect=gd.NoEvidence("lsof failed"))
+            self.assertIn("no process evidence", gd.job_end_scratch([2], None, receipt, tmp, ci))
+            gd.process_evidence = lambda: ([os.fspath(tmp / "cmux-ci-2" / ".product-pack.Again1" / "f")], "")
+            self.assertIn("open or a working directory", gd.job_end_scratch([2], None, receipt, tmp, ci))
+            with mock.patch.object(gd, "host_reservation", return_value="reserved for a capture"):
+                self.assertIn("reserved", gd.job_end_scratch([2], None, receipt, tmp, ci))
+        self.assertTrue((tmp / "cmux-ci-2" / ".product-pack.Again1").is_dir())
+        self.assertEqual(gd.job_end_scratch([], None, receipt, tmp, ci), "")
+        # the idle catch-up: a .product-pack.* staging dir is an admission item of its root
+        fams = gd.canonical_admission_families(tmp)
+        self.assertIn(".product-pack.", next(f for f in fams if f.root == tmp / "cmux-ci-2").include)
+
+    def test_job_end_scratch_main_reads_the_runner_from_the_environment(self) -> None:
+        called = []
+        with mock.patch.object(gd, "job_end_scratch", side_effect=lambda *a: called.append(a) or ""), \
+                mock.patch.object(gd, "DARWIN", True), mock.patch.object(gd, "job_end_runner", return_value=None), \
+                mock.patch.object(gd, "RUN_LOG", self.root / "runs.jsonl"), \
+                mock.patch.object(gd, "disk_off", return_value=""):
+            self.assertEqual(gd.main(["--job-end-scratch", "--roots", "2,1,x,100,02", "--receipt",
+                                      os.fspath(self.receipt())]), 0)
+        self.assertEqual([a[:2] for a in called], [([1, 2], None)])
+        (line,) = map(json.loads, (self.root / "runs.jsonl").read_text().splitlines())
+        self.assertEqual((line["mode"], line["skipped"]), ("job-end-scratch", "no job-end scratch"))
+
     def test_canonical_admission_gives_way_under_the_runner_floor_only_while_no_job_holds_its_root(self) -> None:
         """cmux14, 2026-10-25: at the 30 GiB floor with 9.1 and 8.7 GiB of admission DerivedData idle 9 and 21 h
         ("recent" under the 24 h window) on two roots no job held, and 0.0G reclaimable."""
