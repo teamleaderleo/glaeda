@@ -15240,6 +15240,48 @@ class PrProbeTest(Base):
         self.assertLess(new, old / 3)
 
 
+class HardReserveFloorTest(Base):
+    """2026-11-17: the shared login's REST read 0 of 5000 at 04:15Z and 05:05Z, and Leo's own Claude app showed "GitHub
+    rate limit" on a PR link's hover (Leo: "this is... interesting. so claude desktop shows rate limit on hover of the
+    github links sometimes..."). The daemon's reserve for its own reads was 300 REST and 100 GraphQL; it is now never
+    under hard_reserve_calls (500 each by default, leo-workspace machines/gh-quota.json)."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.policy = Path(self.tmp.name) / "gh-quota.json"
+        env = mock.patch.dict(os.environ, {"GLAEDA_GH_QUOTA_POLICY": os.fspath(self.policy)})
+        env.start()
+        self.addCleanup(env.stop)
+        self.addCleanup(lambda: gg.DAEMON_CONFIG.unlink(missing_ok=True))
+
+    def test_the_reserve_is_at_least_the_hard_reserve(self) -> None:
+        gg.write_json(gg.DAEMON_CONFIG, {"floors": {"rest": {"floor": 400, "reserve": 300},
+                                                    "graphql": {"floor": 200, "reserve": 100}}})
+        floors = gg.daemon_policy()["floors"]
+        self.assertEqual(floors, {"rest": (500, 500), "graphql": (500, 500)})
+        self.policy.write_text(json.dumps({"hard_reserve_calls": {"rest": 800, "graphql": 0}}))
+        floors = gg.daemon_policy()["floors"]
+        self.assertEqual((floors["rest"], floors["graphql"]), ((800, 800), (500, 500)), "0 never empties it")
+        gg.write_json(gg.DAEMON_CONFIG, {"floors": {"graphql": {"floor": 1500, "reserve": 1000}}})
+        self.assertEqual(gg.daemon_policy()["floors"]["graphql"], (1500, 1000), "a higher reserve stays")
+
+    def test_a_read_under_the_hard_reserve_stops_above_it_goes_on(self) -> None:
+        self.daemon.policy = gg.daemon_policy()
+        self.daemon.now = NOW
+        for left, stops in ((499, True), (500, False), (2000, False)):
+            self.daemon.budget["rest"] = {"limit": 5000, "remaining": left, "reset": NOW + 1800, "seenAt": NOW}
+            self.daemon.budget["graphql"] = {"limit": 5000, "remaining": left, "reset": NOW + 1800, "seenAt": NOW}
+            self.assertEqual(self.daemon.mode("rest") == "stop", stops, left)
+            self.daemon.waived = True  # a waited read: no exception into the hard reserve
+            self.assertEqual(self.daemon.mode("graphql") == "stop", stops, left)
+            self.daemon.waived = False
+        self.daemon.budget["rest"]["remaining"] = 499
+        hold = self.daemon.quota_hold("pr") if self.daemon.paths.get("pr") == "rest" else None
+        if hold is not None:
+            self.assertTrue(hold[1])
+            self.assertIn("resets", hold[0])
+
+
 class WaitedUnderReserveTest(Base):
     """huge-blue 2026-11-16: GraphQL sat under the fleet's 1000-point reserve for lands (mode stop) for 5.5 of the
     day's 14 hours, and REST at the daemon's share or its own reserve for most of them. due() returns nothing in a
@@ -15253,6 +15295,9 @@ class WaitedUnderReserveTest(Base):
 
     def setUp(self) -> None:
         super().setUp()
+        # The fleet's reserve for lands (config/gh-daemon.json): waited reads yield it, never the hard reserve under it.
+        gg.write_json(gg.DAEMON_CONFIG, {"floors": {"graphql": {"floor": 1500, "reserve": 1000}}})
+        self.addCleanup(lambda: gg.DAEMON_CONFIG.unlink(missing_ok=True))
         self.gh.counts = True
         for n in range(1, 13):  # #11 and #12: watched, nobody waits on them
             self.gh.prs[("o", "r", n)] = pr_node(n, rollup="PENDING", checks=[check_run("a"), check_run(
@@ -15310,6 +15355,22 @@ class WaitedUnderReserveTest(Base):
         self.under(int(self.reserve * gg.WAITED_RESERVE_SHARE) - 1)
         self.at(NOW + 6 * gg.CYCLE)
         self.assertEqual(self.gh.probes, 1, "read past the part of the reserve kept for lands")
+
+    def test_waited_reads_never_go_into_the_hard_reserve(self) -> None:
+        # 2026-11-17: the login's REST read 0 of 5000 and Leo's own Claude app showed "GitHub rate limit". Waited
+        # reads yield the fleet's reserve down to WAITED_RESERVE_SHARE of it, never into hard_reserve_calls.
+        hard = gg.daemon_policy()["hardReserve"]["graphql"]
+        self.assertGreaterEqual(hard, 500)
+        sent = lambda: len([c for c in self.gh.calls if c[1].endswith("/graphql")])  # noqa: E731
+        with mock.patch.object(gg, "WAITED_RESERVE_SHARE", 0.1):
+            self.under(hard + 5)
+            before = sent()
+            self.at(NOW + gg.CYCLE)
+            self.assertGreater(sent(), before, "above the hard reserve a waited read is still made")
+            self.under(hard - 1)
+            before = sent()
+            self.at(NOW + 3 * gg.CYCLE)
+            self.assertEqual(sent(), before, "a waited read spent the hard reserve")
 
     def test_many_waited_prs_are_paced_slower_never_refused(self) -> None:
         with mock.patch.object(gg, "WAITED_PER_MINUTE", 1), mock.patch.object(gg, "WAITED_PROBE_BATCH", 4):

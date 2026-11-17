@@ -98,7 +98,8 @@ the daemon is the only process that talks to GitHub, and clients only read its c
   queries read (pr, run, comment, head, steps, head-pages) and the points GitHub charged for them.
 - The X-RateLimit headers and the GraphQL rateLimit field drive a budget guard: below the floor
   (REST 1500 left, GraphQL 500; the fleet config raises GraphQL to 1500) the daemon polls four times less
-  often and skips job lists; below the reserve (REST 300, GraphQL 100; the fleet config: 1000) it stops that
+  often and skips job lists; below the reserve (REST 300, GraphQL 100; the fleet config: 1000; never under
+  gh-quota's hard_reserve_calls, 500 each, waited reads included) it stops that
   API until the quota resets. The quota is shared, so this also protects every other tool on the account:
   the fleet's GraphQL 1000 is kept for lands (merges and
   the gate reads lane VMs land through). The daemon's own GraphQL spend is also held to graphqlPerMinute
@@ -309,6 +310,8 @@ ONCE_SPAN = CYCLE
 ONCE_SLACK = 2.0  # a wait's touch writes waitedAt and the file's mtime a moment apart
 LEAN_FACTOR = 4  # below the floor, poll this many times less often
 FLOORS = {"rest": (1500, 300), "graphql": (500, 100)}  # (floor, reserve) per quota: the module defaults
+# Every reserve is raised to the hard reserve (hard_reserve_floor, 500 REST and 500 GraphQL by default), which the
+# daemon's own reads never spend, waited reads included: it is kept for Leo's own Claude app and gh on the login.
 # The fleet's config/gh-daemon.json raises GraphQL's to floor 1500, reserve 1000: the share of the shared login's hour
 # kept for lands. Below it the daemon sends no GraphQL read (its PR reads go over REST, or wait for the reset), so the
 # merges and gate reads lane VMs land through on the broker host never meet an hour the daemon's polling emptied. On
@@ -2672,12 +2675,17 @@ def daemon_policy() -> dict:
     cycle = int(_bounded(doc.get("cycle"), CYCLE, 15, 900))
     comment = int(_bounded(doc.get("commentCycle"), COMMENT_CYCLE, 5, 300))
     floors = dict(FLOORS)
+    hard = hard_reserve_floor()
     given = doc.get("floors") if isinstance(doc.get("floors"), dict) else {}
     for bucket, (floor, reserve) in FLOORS.items():
         one = given.get(bucket) if isinstance(given.get(bucket), dict) else {}
         f = int(_bounded(one.get("floor"), floor, 0, 100000))
         r = int(_bounded(one.get("reserve"), reserve, 0, 100000))
-        floors[bucket] = (f, r) if r <= f else (floor, reserve)
+        f, r = (f, r) if r <= f else (floor, reserve)
+        # Never under the hard reserve (hard_reserve_floor): a config's lower reserve is raised to it, and its floor
+        # with it, so "stop" still comes after "lean".
+        r = max(r, hard[bucket])
+        floors[bucket] = (max(f, r), r)
     per_minute = int(_bounded(doc.get("graphqlPerMinute"), GRAPHQL_PER_MINUTE, 1, 5000))
     alarms = doc.get("alarms") if isinstance(doc.get("alarms"), dict) else {}
     return {"cycle": cycle, "commentCycle": comment, "graphqlPerMinute": per_minute,
@@ -2686,7 +2694,7 @@ def daemon_policy() -> dict:
                        "restLeft": int(_bounded(alarms.get("restLeft"), ALARM_REST_LEFT, 0, 100000)),
                        "paceShare": float(_bounded(alarms.get("paceShare"), ALARM_PACE_SHARE, 0.0, 1.0))},
             "cycles": {"pr": cycle, "run": cycle, "comment": comment, "head": cycle},
-            "floors": floors, "restShare": float(_bounded(doc.get("restShare"), REST_SHARE, 0.0, 1.0)),
+            "floors": floors, "hardReserve": hard, "restShare": float(_bounded(doc.get("restShare"), REST_SHARE, 0.0, 1.0)),
             # restYield out of range (or not a number) is left out, so the default (no yield) holds
             **({"restYield": int(doc["restYield"])} if isinstance(doc.get("restYield"), (int, float))
                and not isinstance(doc.get("restYield"), bool) and 0 <= doc["restYield"] <= 100000 else {}),
@@ -2888,7 +2896,10 @@ class Daemon:
         floor, reserve = self.policy["floors"][bucket]
         remaining = seen.get("remaining", floor)
         forced = bucket in self.policy.get("forceLow", ())
-        if remaining < reserve and not (self.waived and bucket == "graphql" and remaining >= reserve * WAITED_RESERVE_SHARE):
+        # Waited reads may go into the fleet's reserve down to WAITED_RESERVE_SHARE of it, never into the hard reserve.
+        hard = (self.policy.get("hardReserve") or HARD_RESERVE_DEFAULT).get(bucket, HARD_RESERVE_DEFAULT[bucket])
+        if remaining < reserve and not (self.waived and bucket == "graphql"
+                                        and remaining >= max(reserve * WAITED_RESERVE_SHARE, hard)):
             return "stop"
         return "lean" if remaining < floor or capped or forced or remaining < reserve else "normal"
 
@@ -10691,6 +10702,18 @@ def fleet_hosts() -> list[str]:
         hosts = hosts or list(FLEET_BUDGET_HOSTS)
     me = policy_host()
     return [me] + [h for h in hosts if h != me]
+
+
+def hard_reserve_floor() -> dict:
+    """{"rest": N, "graphql": N}: the calls the daemon's own reads on the login never spend, waited reads included:
+    hard_reserve() (leo-workspace machines/gh-quota.json hard_reserve_calls, kept in step with leo-workspace#5618's
+    tools/gh_reserve.py), never under HARD_RESERVE_DEFAULT (a policy may raise a pool's reserve, never lower or empty
+    it). The login is Leo's own: his Claude app and gh read the same hour (2026-11-17, REST at 0 of 5000 at 04:15Z
+    and 05:05Z; Leo: "this is... interesting. so claude desktop shows rate limit on hover of the github links
+    sometimes...")."""
+    named = hard_reserve()
+    return {pool: max(default, named.get(pool, default) if isinstance(named.get(pool), int) else default)
+            for pool, default in HARD_RESERVE_DEFAULT.items()}
 
 
 def hard_reserve() -> dict:
