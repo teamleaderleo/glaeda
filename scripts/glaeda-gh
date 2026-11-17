@@ -2744,6 +2744,9 @@ class Daemon:
         # False for an upstream host's direct read: the lane-gh broker answers GET branches/B from git (the tip, no
         # protection, and on 2026-11-16 no answer within 60 s), so fetch_pr_rest takes GraphQL's last word instead.
         self.reads_protection = True
+        # False for that read too: the broker answers no ETag (broker_transport), so an issues/N read can never vouch
+        # for a kept pull (rest_pull's 304 probe) and is not sent (DIRECT_PARTS says what that read cost).
+        self.etags = True
         # "config" re-reads UPSTREAM_CONFIG every tick, so writing or removing it switches the mode
         # without a restart; a test passes a callable (request -> answer) or None.
         self.upstream_source = upstream
@@ -6229,8 +6232,8 @@ class Daemon:
         at = kept.get("at")
         doc = kept.get("doc") if isinstance(kept.get("doc"), dict) else None
         held = old.get(gate) or {}
-        can_reuse = (reuse and doc is not None and doc.get("mergeable") is not None and isinstance(at, (int, float))
-                     and self.now - at < PULL_REUSE_MAX and bool(held.get("etag")))
+        can_reuse = (reuse and self.etags and doc is not None and doc.get("mergeable") is not None
+                     and isinstance(at, (int, float)) and self.now - at < PULL_REUSE_MAX and bool(held.get("etag")))
         if can_reuse and gate not in parts:
             try:
                 self.head_part(old, parts, gate, slim_issue_gate)
@@ -6244,7 +6247,7 @@ class Daemon:
         parts[path] = {**parts[path], "at": self.now}
         if gate not in parts and held.get("etag") and (held.get("doc") or {}).get("updated_at") == pull.get("updated_at"):
             parts[gate] = held  # the issue answer kept still describes this pull
-        elif gate not in parts and self.mode("rest") != "stop":
+        elif gate not in parts and self.etags and self.mode("rest") != "stop":
             try:  # the issue as of now, for the next read's question (shared: a kept ETag makes it a 304)
                 self.head_part(old, parts, gate, slim_issue_gate)
             except WatchError:
@@ -9912,6 +9915,7 @@ def direct_read(req: dict) -> str | None:
             daemon = Daemon(transport=broker_transport(broker, lambda: daemon.tick_deadline), token=lambda: "",
                             controller=None, upstream=None)
             daemon.reads_protection = False
+            daemon.etags = False
         else:
             daemon = Daemon(controller=None, upstream=None)
     except Exception as failure:  # noqa: BLE001  a fallback read never stops the wait
@@ -9929,6 +9933,8 @@ def direct_read(req: dict) -> str | None:
     daemon.tick_deadline = time.monotonic() + DIRECT_READ_BUDGET
     entry = {"key": key, "jobs": bool(req.get("jobs")), "cache": read_cache(key), "touched": daemon.now,
              "waitedAt": daemon.now, "waitBegan": float(req["began"]), "readers": [], "reader": "", "consumers": {}}
+    if broker is not None:
+        daemon.repo_parts.update(direct_parts_load(daemon.now))
     try:
         with daemon.calling(*caller_of(key), "tool:glaeda-gh wait (direct read)"):
             if kind == "pr" and broker is not None:
@@ -9944,10 +9950,52 @@ def direct_read(req: dict) -> str | None:
         return f"no answer within {DIRECT_READ_BUDGET}s"
     except Exception as failure:  # noqa: BLE001  a fallback read never stops the wait
         return f"{describe(failure)} at {error_site(failure)}"
+    finally:
+        if broker is not None:
+            direct_parts_save(daemon.repo_parts, daemon.now)
     if error:
         return error
     cached = read_cache(key) or {}
     return None if (cached.get("dataAt") or 0) >= daemon.now else (cached.get("error") or "no data stored")
+
+
+# A lane VM's direct reads (direct_read through the broker: a starved wait, the land worker's refresh) are one process
+# each, so the Daemon's repo_parts, which shares a repository's or base's answer between watches for
+# REST_REPO_PART_TTL, began empty every time, and every read asked for the base's rulesets and the repository's
+# workflow list again. And the broker answers no ETag, so rest_pull's issues/N probe could never vouch for anything.
+# gcp-codex-lane-12, 2026-11-17 07:00-07:55Z (lane-gh calls): 166 direct reads made 1,571 of the VM's 1,857 broker
+# GETs, every one an App or login request: rules/branches 166, actions/workflows 166, issues/N 228 among them. The
+# rulesets and workflow list are kept here for REST_REPO_PART_TTL, shared by every direct read on the host (the same
+# window the daemon gives them), and the probe is not sent (Daemon.etags): 7 GETs a read become 4, 9 become 6.
+DIRECT_PARTS = "direct-parts.json"  # under BASE (read when used: tests move BASE)
+DIRECT_PARTS_RE = re.compile(r"^/repos/[^/]+/[^/]+/(?:rules/branches/[^?]+|actions/workflows)\?")
+DIRECT_PARTS_MAX = 200
+
+
+def direct_parts_load(now: float) -> dict[str, dict]:
+    """The repository-level answers an earlier direct read on this host kept, still within REST_REPO_PART_TTL."""
+    doc = read_json(BASE / DIRECT_PARTS)
+    parts = doc.get("parts") if isinstance(doc, dict) else None
+    if not isinstance(parts, dict):
+        return {}
+    return {path: v for path, v in parts.items()
+            if DIRECT_PARTS_RE.match(path) and isinstance(v, dict) and isinstance(v.get("part"), dict)
+            and isinstance(v.get("at"), (int, float)) and not isinstance(v.get("at"), bool)
+            and 0 <= now - v["at"] < REST_REPO_PART_TTL}
+
+
+def direct_parts_save(repo_parts: dict[str, dict], now: float) -> None:
+    """Keep REPO_PARTS' repository-level answers for the next direct read (best effort: a lost write costs a read)."""
+    try:
+        kept = direct_parts_load(now)
+        for path, v in repo_parts.items():
+            if DIRECT_PARTS_RE.match(path) and isinstance(v, dict) and isinstance(v.get("at"), (int, float)) \
+                    and "doc" in (v.get("part") or {}) and v["at"] >= (kept.get(path) or {}).get("at", float("-inf")):
+                kept[path] = v
+        newest = sorted(kept, key=lambda p: kept[p]["at"], reverse=True)[:DIRECT_PARTS_MAX]
+        write_json(BASE / DIRECT_PARTS, {"parts": {p: kept[p] for p in newest}})
+    except (OSError, ValueError, TypeError):
+        pass
 
 
 def poll_wait(req: dict) -> int:

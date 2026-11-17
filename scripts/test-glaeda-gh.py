@@ -15651,6 +15651,34 @@ class StaleDataTest(Base):
         self.assertEqual([c for c in self.gh.calls if c[1].endswith("/graphql")], [], "a GraphQL read the broker refuses")
         self.assertEqual(gg.read_cache("pr:o/r#9")["data"]["headRefOid"], new)
 
+    def test_direct_reads_through_the_broker_share_the_repo_parts_and_send_no_issue_probe(self) -> None:
+        """gcp-codex-lane-12, 2026-11-17 07:00-07:55Z: 166 direct reads made 1,571 of the VM's 1,857 broker GETs,
+        each asking the base's rulesets and the workflow list again (one process each, so repo_parts began empty) and
+        an issues/N probe whose answer, with no ETag through the broker, could never vouch for a kept pull. Two direct
+        reads of one PR, as two waits' processes make them: the second reads only what moves (the pull and the head)."""
+        config = Path(self.tmp.name) / "upstream.json"
+        gg.write_json(config, {"command": ["/home/cmux/.local/bin/lane-gh", "glaeda-read"]})
+        patcher = mock.patch.object(gg, "UPSTREAM_CONFIG", config)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        gg.BASE.mkdir(parents=True, exist_ok=True)
+        self.gh.prs[("o", "r", 9)] = pr_node(9, rollup="SUCCESS", checks=[check_run("a")])
+        served: list[str] = []
+        with mock.patch.object(gg, "run_bounded", side_effect=self.broker_get(served)), \
+                mock.patch.object(gg, "gh_token", side_effect=AssertionError("read a login on an upstream host")):
+            for _ in range(2):
+                self.assertIsNone(gg.direct_read({"key": "pr:o/r#9", "kind": "pr", "jobs": False,
+                                                  "began": time.time() - 700}))
+        self.assertEqual([p for p in served if p.startswith("issues/")], [], served)
+        self.assertEqual(len([p for p in served if p.startswith("rules/branches/")]), 1, served)
+        self.assertEqual(len([p for p in served if p.startswith("actions/workflows")]), 1, served)
+        self.assertEqual(len([p for p in served if p == "pulls/9"]), 2, served)
+        print(f"\ntwo direct reads of one PR through the broker: {len(served)} GETs ({served})")
+        # past the TTL the next read asks them again
+        later = time.time() + gg.REST_REPO_PART_TTL + 1
+        self.assertEqual(gg.direct_parts_load(later), {})
+        self.assertEqual(len(gg.direct_parts_load(time.time())), 2)
+
     def test_an_upstream_with_no_broker_get_still_says_why_it_cannot_read(self) -> None:
         """An upstream that is not lane-gh, with no "direct" command: the fallback refuses as before, and the
         "upstream" explanation keeps such a wait on its blocker (its own read could not help)."""
