@@ -12681,6 +12681,110 @@ class GateTest(unittest.TestCase):
                   "Runner_20260928-140000-utc.log")  # a later listener's file is the one it reads
         self.assertEqual(hook.listener_request(self.runner), "next")
 
+    def stuck_diag(self, acked: float) -> Path:
+        """cmux13s glaeda-12, 2026-11-17: the acknowledge, then GetJobMessageAsync hung with no further line."""
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(acked))
+        return self.diag(f"[{stamp}Z INFO BrokerMessageListener] Acknowledging runner request "
+                         "'f233fe94-dba2-5527-8e6e-65b8ce6fa6bf'.\n"
+                         f"[{stamp}Z INFO GitHubActionsService] AAD Correlation ID for this token request: Unknown\n")
+
+    def free_gate(self) -> hook.Gate:
+        """A real gate over the fake listener with nothing holding it off, its listener up for an hour."""
+        gate = self.started_gate()
+        gate.claimed = lambda: None  # type: ignore[method-assign]
+        gate.confirmed = gate.claimed  # type: ignore[method-assign]
+        gate.listening_since = time.monotonic() - 3600
+        return gate
+
+    def test_a_listener_stuck_acquiring_a_job_is_restarted_past_the_bound(self) -> None:
+        self.stuck_diag(time.time() - hook.GATE_ACQUIRE_STUCK_S - 60)
+        gate = self.free_gate()
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertIsNone(gate.step())
+        self.assertIsNotNone(gate.stop_deadline, "the stuck listener is stopped through the gate's own path")
+        self.assertIn(f"{hook.LISTENER_STUCK}: the listener acknowledged job request f233fe94", out.getvalue())
+        self.assertIn("started no Runner.Worker", out.getvalue())
+        self.assertIsNotNone(gate.child.wait(timeout=10))
+        lines = (self.state / hook.GATE_RESTARTS_FILE).read_text().splitlines()
+        self.assertEqual(len(lines), 1)
+        doc = json.loads(lines[0])
+        self.assertEqual((doc["cause"], doc["runner"], doc["request"]),
+                         (hook.LISTENER_STUCK, "actions-runner-glaeda", "f233fe94-dba2-5527-8e6e-65b8ce6fa6bf"))
+        self.assertGreaterEqual(doc["held_s"], hook.GATE_ACQUIRE_STUCK_S)
+        # the listener is gone: the gate holds it off, then starts a new one once the host is free
+        with contextlib.redirect_stdout(io.StringIO()), mock.patch.object(hook, "GATE_RESTART_FREE_S", 0.0):
+            gate.step()
+            self.assertIsNotNone(gate.held)
+            for _ in range(hook.GATE_CONFIRM + 1):
+                gate.step()
+        self.assertIsNotNone(gate.child)
+        self.assertIsNone(gate.lost_request, "a new listener starts with nothing given up")
+
+    def test_a_listener_acquiring_under_the_bound_is_kept(self) -> None:
+        self.stuck_diag(time.time() - 600)  # the longest acknowledge that ended on its own took 678 s
+        gate = self.free_gate()
+        with contextlib.redirect_stdout(io.StringIO()):
+            for _ in range(3):
+                self.assertIsNone(gate.step())
+        self.assertIsNone(gate.stop_deadline)
+        self.assert_listening()
+        self.assertFalse((self.state / hook.GATE_RESTARTS_FILE).exists())
+
+    def test_an_acknowledge_older_than_its_listener_counts_from_the_listener(self) -> None:
+        self.stuck_diag(time.time() - 10 * hook.GATE_ACQUIRE_STUCK_S)
+        gate = self.free_gate()
+        gate.listening_since = time.monotonic() - 60  # a clock that jumped, or a diag older than the listener
+        with contextlib.redirect_stdout(io.StringIO()):
+            gate.step()
+        self.assertIsNone(gate.stop_deadline)
+        # the gate's own sighting counts too: past the bound since it first saw the request, it is stuck
+        gate.first_taken = ("f233fe94-dba2-5527-8e6e-65b8ce6fa6bf", time.monotonic() - hook.GATE_ACQUIRE_STUCK_S - 1)
+        gate.acquire_at = -hook.GATE_ACQUIRE_EVERY_S
+        with contextlib.redirect_stdout(io.StringIO()):
+            gate.step()
+        self.assertIsNotNone(gate.stop_deadline)
+
+    def test_a_stuck_look_never_stops_a_runner_with_a_worker(self) -> None:
+        self.stuck_diag(time.time() - hook.GATE_ACQUIRE_STUCK_S - 60)
+        gate = self.free_gate()
+        with mock.patch.object(hook.Gate, "worker", return_value=True), \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertFalse(gate.stuck_acquire())
+            gate.acquire_at = -hook.GATE_ACQUIRE_EVERY_S
+            gate.step()
+        self.assertIsNone(gate.stop_deadline)
+        self.assertIsNone(gate.lost_request)
+        self.assert_listening()
+        # a Worker that comes up at stop()'s frozen last look keeps the listener, and nothing is given up
+        gate.acquire_at = -hook.GATE_ACQUIRE_EVERY_S
+        with mock.patch.object(hook.Gate, "worker", side_effect=[False, True, True, True]), \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertFalse(gate.stuck_acquire())
+        self.assertIsNone(gate.stop_deadline)
+        self.assertIsNone(gate.lost_request)
+        self.assertFalse((self.state / hook.GATE_RESTARTS_FILE).exists())
+
+    def test_the_listener_request_at_reads_the_acknowledge_stamp(self) -> None:
+        self.diag(MID_ACQUIRE_DIAG)
+        self.assertEqual(hook.listener_request_at(self.runner),
+                         ("eeb83692-303d-516a-b3bf-e6e6f93c1d90", 1790603581.0))  # 2026-09-28 13:53:01Z
+        self.diag(MID_ACQUIRE_DIAG + "[2026-09-28 13:53:09Z INFO JobDispatcher] Job request 0 for plan p job "
+                  "eeb83692 received.\n")
+        self.assertEqual(hook.listener_request_at(self.runner), ("eeb83692", 1790603581.0),
+                         "the dispatch keeps the acknowledge's stamp")
+        self.diag("[x INFO BrokerMessageListener] Acknowledging runner request 'next'.\n")
+        self.assertEqual(hook.listener_request_at(self.runner), ("next", None))
+        self.diag(MID_ACQUIRE_DIAG + ACQUIRE_FAILED)
+        self.assertEqual(hook.listener_request_at(self.runner), (None, None))
+
+    def test_listener_restarts_keep_the_last_ones(self) -> None:
+        with mock.patch.object(hook, "GATE_RESTARTS_KEEP", 3):
+            for n in range(5):
+                hook.note_listener_restart(self.state, self.runner, {"t": n})
+        lines = (self.state / hook.GATE_RESTARTS_FILE).read_text().splitlines()
+        self.assertEqual([json.loads(x)["t"] for x in lines], [2, 3, 4])
+
     def test_listen_stops_and_restarts_a_real_listener(self) -> None:
         proc, log = self.run_listen()
         self.wait_for(log, "Listening for Jobs")

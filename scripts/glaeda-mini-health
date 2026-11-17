@@ -197,7 +197,8 @@ A heal (other than tailscale_no_route's, above) is tried at most every HEAL_EVER
 but did not last (a runner that exits again), so nothing loops. Each finding reads
 {id, code, severity, since, evidence, auto_fix, note}: auto_fix is "pending" while a heal will be tried,
 "impossible" when this user cannot fix it or the tries ran out. A fixed finding leaves the report and its heal is
-kept under "healed" for a day (auto_fix "done"). The report is REPORT (ci-dash's probe reads it; cmuxterm-hq
+kept under "healed" for a day (auto_fix "done"), as is each restart the runner gate made of a listener stuck
+acquiring a job (listener_acquire_stuck, from the gate's listener-restarts.jsonl). The report is REPORT (ci-dash's probe reads it; cmuxterm-hq
 build-fleet/ci-dash turns each code into the operator command that fixes it); the state beside it keeps each
 finding's first sighting and the heal tries. On a host with no glaeda runner it checks only claude_route, runner_unmanaged and unmanaged_service (and the daemon healer). With KILL_SWITCH
 present it still reports but never heals. Prints one JSON line when it healed something or the findings changed.
@@ -2829,6 +2830,36 @@ HEALS: dict[str, tuple[Callable[[Mini, dict[str, Any]], tuple[bool, str]], int]]
 # ---------------------------------------------------------------- run
 
 
+GATE_RESTARTS = "listener-restarts.jsonl"  # glaeda-cmux-runner-hook GATE_RESTARTS_FILE, in the gate's state dir
+
+
+def gate_restarts_healed(home: Any, now: float) -> list[dict[str, Any]]:
+    """The listener gate's restarts of a stuck listener in the last HEALED_KEEP_S (glaeda-cmux-runner-hook
+    stuck_acquire: a listener that acknowledged a job request and started no Worker), as healed entries for
+    ci-dash: one per restart, code listener_acquire_stuck. Unreadable or missing: none."""
+    if not isinstance(home, Path):
+        return []
+    try:
+        lines = (home / ".local/state/glaeda/cmux-runner" / GATE_RESTARTS).read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeDecodeError):
+        return []
+    out = []
+    for line in lines:
+        try:
+            doc = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(doc, dict) or not isinstance(doc.get("t"), (int, float)) or now - doc["t"] >= HEALED_KEEP_S:
+            continue
+        code, runner = str(doc.get("cause") or "listener_acquire_stuck"), str(doc.get("runner") or "")
+        out.append({"id": f"{code}:{runner}:{doc.get('request')}", "code": code, "t": doc["t"], "at": doc.get("at"),
+                    "since": doc.get("acknowledged"),
+                    "evidence": f"{runner} acknowledged job request {doc.get('request')} and started no Worker in "
+                                f"{doc.get('held_s')} s (bound {doc.get('bound_s')} s)",
+                    "action": "the runner gate restarted the listener", "auto_fix": "done"})
+    return out
+
+
 def load_json(path: Path) -> dict[str, Any]:
     try:
         doc = json.loads(path.read_text())
@@ -2980,7 +3011,9 @@ def run(mini: Mini, apply: bool, now: float | None = None, state_path: Path = ST
     seen = {k: v for k, v in seen.items() if k in ids | {f["id"] for f in found} | unlooked}
     tries = {k: v for k, v in tries.items() if k in ids}
     report = {"schema": SCHEMA, "at": iso(now), "findings": findings,
-              "healed": sorted(healed + getattr(mini, "daemon_healed", []), key=lambda h: h.get("t") or 0)[-HEALED_MAX:],
+              "healed": sorted(healed + getattr(mini, "daemon_healed", []) +
+                               (gate_restarts_healed(getattr(mini, "home", None), now) if runner else []),
+                               key=lambda h: h.get("t") or 0)[-HEALED_MAX:],
               "ota": ota_summary(mini.ota_converge())}
     if apply:
         write_json(state_path, {"seen": seen, "tries": tries, "healed": healed[-HEALED_MAX:]})

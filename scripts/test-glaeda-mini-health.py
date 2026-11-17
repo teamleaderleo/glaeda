@@ -860,6 +860,22 @@ class DiskAndLeaks(Base):
                                                                        {"unmeasured": None}]}
         self.assertEqual(self.run_once()["findings"], [])
 
+    def test_gate_restarts_of_a_stuck_listener_are_healed_for_a_day(self) -> None:
+        # glaeda-cmux-runner-hook stuck_acquire writes one line per restart; ci-dash shows them under healed
+        self.mini.home = self.dir
+        path = self.dir / ".local/state/glaeda/cmux-runner" / health.GATE_RESTARTS
+        path.parent.mkdir(parents=True)
+        line = {"cause": "listener_acquire_stuck", "runner": "actions-runner-glaeda-12", "request": "f233fe94",
+                "acknowledged": "2026-11-17 08:02:33Z", "held_s": 901, "bound_s": 900.0}
+        path.write_text(json.dumps({**line, "t": NOW - 2 * health.HEALED_KEEP_S}) + "\nnot json\n" +
+                        json.dumps({**line, "t": NOW - 60, "at": "then"}) + "\n")
+        healed = self.run_once()["healed"]
+        self.assertEqual([(h["id"], h["code"], h["auto_fix"]) for h in healed],
+                         [("listener_acquire_stuck:actions-runner-glaeda-12:f233fe94", "listener_acquire_stuck",
+                           "done")])
+        self.assertIn("started no Worker in 901 s", healed[0]["evidence"])
+        self.assertEqual(health.gate_restarts_healed(Path("/nonexistent"), NOW), [])
+
     def test_orphaned_apps_are_healed_by_the_backstop(self) -> None:
         self.mini.leaks = [(99, "/tmp/cmux DEV.app")]
         report = self.run_once()
