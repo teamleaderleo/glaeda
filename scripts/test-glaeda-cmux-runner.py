@@ -8621,8 +8621,11 @@ class HostLoadCapTest(unittest.TestCase):
         return self.gate.load_capped()
 
     def join(self) -> None:
+        # A loaded CI runner can take past 5 s here (glaeda#2108 and #2110, 3 of 4 runs): the next look then judged
+        # the previous feed. Wait for the read itself, bounded, and say so when it never ends.
         if self.gate.cap_thread is not None:
-            self.gate.cap_thread.join(5)
+            self.gate.cap_thread.join(120)
+            self.assertFalse(self.gate.cap_thread.is_alive(), "the load-cap feed look did not finish in 120 s")
 
     def test_the_cap_and_its_off_switch(self) -> None:
         now = self.NOW
@@ -8839,8 +8842,11 @@ class MemoryCapTest(unittest.TestCase):
                 "workflow": workflow, "head_branch": "lane/x", "name": "compile"}
 
     def join(self) -> None:
+        # A loaded CI runner can take past 5 s here (glaeda#2108 and #2110, 3 of 4 runs): the next look then judged
+        # the previous feed. Wait for the read itself, bounded, and say so when it never ends.
         if self.gate.cap_thread is not None:
-            self.gate.cap_thread.join(5)
+            self.gate.cap_thread.join(120)
+            self.assertFalse(self.gate.cap_thread.is_alive(), "the load-cap feed look did not finish in 120 s")
 
     def poll(self) -> str | None:
         """Two looks: the first starts the feed read (waited for), the second decides with it."""
@@ -8988,7 +8994,7 @@ class GateOffTheTailnet(unittest.TestCase):
         self.gate.tailnet_at -= hook.GATE_TAILNET_EVERY_S
         with mock.patch.object(hook, "tailnet_look", return_value=(state, via)):
             self.gate.off_tailnet()
-            self.gate.tailnet_thread.join(5)
+            self.gate.tailnet_thread.join(120)
         return self.gate.off_tailnet()
 
     def test_the_two_signals(self) -> None:
@@ -9018,7 +9024,7 @@ class GateOffTheTailnet(unittest.TestCase):
         self.gate.tailnet_at -= hook.GATE_TAILNET_EVERY_S
         with mock.patch.object(hook, "tailnet_look", side_effect=RuntimeError("boom")):
             self.gate.off_tailnet()
-            self.gate.tailnet_thread.join(5)
+            self.gate.tailnet_thread.join(120)
         self.assertIsNone(self.gate.off_tailnet())
 
     def test_the_kill_switch(self) -> None:
@@ -10270,7 +10276,7 @@ class GateTest(unittest.TestCase):
 
         def settle() -> None:
             if gate.eligible_look is not None:
-                gate.eligible_look.join(5)
+                gate.eligible_look.join(120)
 
         with mock.patch.object(hook, "eligibility_refusal", return_value=why) as look:
             self.assertIsNone(gate.claimed(), "the first poll starts the look")
@@ -10292,11 +10298,11 @@ class GateTest(unittest.TestCase):
         with mock.patch.object(hook, "eligibility_refusal", return_value="node not eligible (state x)"):
             fresh = hook.Gate(self.runner, os.fspath(self.lock), os.fspath(self.tmp / "none.json"), self.state)
             fresh.ineligible()
-            fresh.eligible_look.join(5)
+            fresh.eligible_look.join(120)
             fresh.eligible_at -= hook.GATE_ELIGIBLE_RECHECK_S
             with mock.patch.object(hook, "eligibility_refusal", return_value=None):
                 fresh.ineligible()
-                fresh.eligible_look.join(5)
+                fresh.eligible_look.join(120)
             self.assertIsNone(fresh.ineligible(), "a refusal the recheck does not repeat never holds")
         script.write_text("exec /usr/bin/python3 /hook job-started --require-eligible --fleet-class m6-16 "
                           "--toolchain-xcode '/Applications/Xcode 26.app'\n")
@@ -10426,7 +10432,7 @@ class GateTest(unittest.TestCase):
             self.assertIsNone(gate.claimed(), "listening again on the first poll after it is back")
             self.assertTrue(gate.eligible_look.is_alive())
             release.set()
-            gate.eligible_look.join(5)
+            gate.eligible_look.join(120)
             self.assertIsNone(gate.eligible_why, "the look's late answer is never stored, so it cannot hold 300 s")
             self.assertIsNone(gate.eligible_new, "no recheck queued for it either")
             self.assertIsNone(gate.claimed())
@@ -10435,7 +10441,7 @@ class GateTest(unittest.TestCase):
         gate.eligible_at -= hook.GATE_ELIGIBLE_EVERY_S
         with mock.patch.object(hook, "eligibility_refusal", return_value=why):
             gate.claimed()
-            gate.eligible_look.join(5)
+            gate.eligible_look.join(120)
         self.assertEqual(gate.eligible_why, held, "a look that meets a missing toolchain keeps the held refusal")
         self.assertEqual(gate.claimed(), f"ineligible: {held}")
 
