@@ -17388,19 +17388,46 @@ class JobTelemetryTest(unittest.TestCase):
         self.assertEqual(rows[1], (101, 100, 700.0, "cmux", "swift-frontend"))
         self.assertEqual(calls.count("pid=,ppid=,pcpu=,user=,rss=,comm="), 2, "one ps pass per call, no extra")
 
-    def test_dynamic_release_needs_sustained_quiet_headroom(self) -> None:
+    def test_live_units_follow_the_measured_peak_after_the_grace(self) -> None:
+        """LIVE_UNITS: a daemon-test admitted at its p90 of 6 units on a 14-core mini that runs at about 1 core gives
+        back every unit above ceil(peak * margin) once its warmup is over and a minute of samples covers it."""
         decide = self.hook.dynamic_release_decision
-        self.assertIsNone(decide(100, 20, 2, 5, 0.8, 55, 0, 1, False))
-        self.assertEqual(decide(200, 120, 2, 5, 0.8, 55, 0, 1, False)[0], 1)
-        self.assertIsNone(decide(200, 120, 2, 5, 0.8, 85, 0, 1, False))
-        self.assertIsNone(decide(200, 120, 2, 5, 0.8, 55, 1, 1, False))
-        self.assertIsNone(decide(200, 120, 2, 5, 0.8, 55, 0, 2, False))
-        # units are cores: a 6-core job quiet after warmup gives back one core at a time, down to half its admission
-        self.assertEqual(decide(200, 120, 6, 14, 1.0, 55, 0, 1, False, admitted=6), (5, "sustained low job CPU with host headroom"))
-        self.assertEqual(decide(200, 120, 4, 14, 1.0, 55, 0, 1, False, admitted=6)[0], 3)
-        self.assertIsNone(decide(200, 120, 3, 14, 1.0, 55, 0, 1, False, admitted=6), "3 is half of 6: it keeps them")
-        self.assertIsNone(decide(200, 120, 3, 14, 1.0, 55, 0, 1, False, admitted=5), "ceil(5 / 2) is 3")
-        self.assertEqual(decide(200, 120, 2, 14, 0.8, 55, 0, 1, False, admitted=2)[0], 1, "a 2-core job still may go to 1")
+        warm = self.hook.DYNAMIC_WARMUP_S
+        cover = self.hook.DYNAMIC_LOW_S
+        keep = decide(warm + 60, 1.0, cover + 30, 6, 14, 45.0, 2, 1, False, ncpu=14)
+        self.assertEqual(keep[0], 2, keep)  # ceil(1.0 * 1.25)
+        self.assertIn("1.00 cores peak", keep[1])
+        self.assertEqual(decide(warm + 60, 0.2, cover, 6, 14, 45.0, 0, 1, False, ncpu=14)[0], 1, "at least 1")
+        # 1 to 3 processes in uninterruptible wait are an idle Mac's noise: they no longer stop a release
+        self.assertIsNotNone(decide(warm + 60, 1.0, cover, 6, 14, 45.0, 3, 1, False, ncpu=14))
+        self.assertIsNone(decide(warm + 60, 1.0, cover, 6, 14, 45.0, 5, 1, False, ncpu=14), "contended waits")
+        # the grace: the full p90 at start
+        self.assertIsNone(decide(warm - 1, 1.0, cover, 6, 14, 45.0, 0, 1, False, ncpu=14))
+        self.assertIsNone(decide(warm + 200, 1.0, cover, 6, 14, 45.0, 0, 1, False, ncpu=14, warmup=warm + 300),
+                          "compile-gui's longer warmup")
+        # a job busy near its estimate keeps it, and units never grow back
+        self.assertIsNone(decide(warm + 60, 4.9, cover, 6, 14, 45.0, 0, 1, False, ncpu=14))
+        self.assertIsNone(decide(warm + 60, 9.0, cover, 2, 14, 45.0, 0, 1, False, ncpu=14))
+        self.assertEqual(decide(warm + 60, 2.1, cover, 6, 14, 45.0, 0, 1, False, ncpu=14)[0], 3)
+        # the host's safety brakes keep what it holds
+        self.assertIsNone(decide(warm + 60, 1.0, cover, 6, 14, 85.0, 0, 1, False, ncpu=14), "host at 80%+")
+        self.assertIsNone(decide(warm + 60, 1.0, cover, 6, 14, 45.0, 0, 2, False, ncpu=14), "memory pressure")
+        self.assertIsNone(decide(warm + 60, 1.0, cover, 6, 14, 45.0, 0, 1, True, ncpu=14), "thermal")
+        self.assertIsNone(decide(warm + 60, 1.0, cover, 1, 14, 45.0, 0, 1, False, ncpu=14), "one unit stays")
+
+    def test_a_job_without_measurements_keeps_its_p90(self) -> None:
+        decide = self.hook.dynamic_release_decision
+        warm = self.hook.DYNAMIC_WARMUP_S
+        self.assertIsNone(decide(warm + 600, None, 0.0, 6, 14, 30.0, 0, 1, False, ncpu=14), "no sample at all")
+        self.assertIsNone(decide(warm + 600, 1.0, self.hook.DYNAMIC_LOW_S - 1, 6, 14, 30.0, 0, 1, False, ncpu=14),
+                          "samples covering under DYNAMIC_LOW_S")
+        self.assertIsNone(decide(warm + 600, float("nan"), 600, 6, 14, 30.0, 0, 1, False, ncpu=14))
+        # the window keeps only the last DYNAMIC_WINDOW_S: a burst ages out, a gap in samples leaves nothing
+        window = [(0.0, 6.0), (100.0, 1.0), (200.0, 1.0)]
+        peak, covered = self.hook.live_peak(window, 200.0)
+        self.assertEqual((peak, covered), (1.0, 100.0))
+        self.assertEqual(self.hook.live_peak([(0.0, 1.0)], 1000.0), (None, 0.0))
+        self.assertEqual(self.hook.live_peak([], 5.0), (None, 0.0))
 
     def test_reparented_test_app_cpu_belongs_to_exact_live_job(self) -> None:
         first = "/Users/cmux/actions-runner-glaeda"
@@ -17981,6 +18008,38 @@ class CapacityArithmeticTest(unittest.TestCase):
             self.assertEqual(hook.mem_chunks_total(), 0, "off by default")
             ok, why = self.take("huge")
             self.assertTrue(ok, why)
+
+    def test_live_units_give_back_cores_never_ram(self) -> None:
+        """LIVE_UNITS: a job's holder lets its unit files above the measured need go, so the next admission takes them;
+        its RAM chunks stay held, so a job whose RAM does not fit what is really free is still refused."""
+        needs = self.needs({f"{self.GUEST}/build-fleet-go.yml/test": self.row(5.5, 7000),  # 6 cores, 7 GiB
+                            f"{self.GUEST}/build-fleet-go.yml/small": self.row(1.0, 4000)})  # 1 core, 4 GiB
+        capacity = self.dir / "capacity"
+        state = self.dir / "state"
+        with self.host(14, 16, needs), mock.patch.object(hook, "lock_waiters", return_value=[]), \
+                mock.patch.object(hook, "bounded_waiters", return_value=[]):
+            total = hook.capacity_cores(14)
+            ok, why = hook.take_capacity(os.fspath(self.dir / "fleet" / "host.lock"), capacity, total, "test",
+                                         os.getpid(), state, repo=self.GUEST, workflow="build-fleet-go.yml")
+            self.assertTrue(ok, why)
+            self.addCleanup(hook.release_holder, hook.holder_file(state))
+            self.assertIn("6/14 units+7/12 GiB", why)
+            taken = lambda prefix, n: sum(not hook.probe(capacity / f"{prefix}-{i}") for i in range(n))  # noqa: E731
+            self.assertEqual((taken("unit", 14), taken(hook.MEM_UNIT, 12)), (6, 7))
+            hook.request_dynamic_release(state, 2, {"reason": "test"})
+            deadline = time.monotonic() + 5
+            while taken("unit", 14) > 2 and time.monotonic() < deadline:
+                time.sleep(hook.HOLDER_POLL_S)
+            self.assertEqual((taken("unit", 14), taken(hook.MEM_UNIT, 12)), (2, 7), "cores go back, RAM stays")
+            # 12 cores are free now but only 5 GiB of RAM: a 7 GiB job is refused for RAM, a 4 GiB one fits
+            with mock.patch.object(hook, "hold", side_effect=self.keep):
+                ok, why = hook.take_capacity(os.fspath(self.dir / "fleet" / "host.lock"), capacity, total, "test",
+                                             os.getpid(), state, repo=self.GUEST, workflow="build-fleet-go.yml")
+                self.assertFalse(ok)
+                self.assertTrue(why.startswith("capacity: 5 of 12 GiB of RAM free"), why)
+                ok, why = hook.take_capacity(os.fspath(self.dir / "fleet" / "host.lock"), capacity, total, "small",
+                                             os.getpid(), state, repo=self.GUEST, workflow="build-fleet-go.yml")
+                self.assertTrue(ok, why)
 
     def test_a_row_for_this_hosts_core_count_and_resident_ram_win(self) -> None:
         """Jobs expand to the cores they find: a by_ncpu row for this host's hw.ncpu comes before the pooled row,

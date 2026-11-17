@@ -996,6 +996,16 @@ job's need fit the host's cores, and their RAM plus this job's fits the host's R
   flag, so rolling a member that has `reserveCores` back below it needs a re-apply from that older checkout.
   `GLAEDA_RUNNER_RAM_LEDGER=0` in the runner's environment turns RAM accounting off. The memory-pressure gate and
   the disk floor stay.
+- Held units follow live use (the hook's LIVE_UNITS; Leo, 2026-11-17: "maximizing the amount of time that we're
+  using our stuff"). A job is admitted at its estimate and keeps it for its first 2 min (`DYNAMIC_WARMUP_S`, 7 for
+  compile-gui). Then its sampler takes the peak of its tree's cores over the last 2 min (`DYNAMIC_WINDOW_S`, at
+  least 1 min of samples, else it keeps what it holds), and its holder lets every unit above
+  `ceil(peak * 1.25)` (at least 1) go at once, so the next admission and every idle listener's gate see them free.
+  A daemon-test admitted at 6 units that runs at 1 core keeps 2. Units only shrink: a job that bursts back above
+  them shares the cores (slower, never failed), and the gate's CPU mark holds new work while the host is busy. No
+  release while host CPU is at 80% or more, under memory pressure, thermally limited, or with many processes in
+  uninterruptible wait (the job record's contended threshold). Signing jobs and a reserving runner's own job keep
+  their admission. RAM chunks are never released early: the floor and the memory-pressure gate stay.
 - A job whose RAM need is more than the host's RAM capacity takes all of it, so it runs only when the host is
   otherwise RAM-idle; it is never refused for RAM. A job waiting for RAM waits as for units (its marker wants
   `units`), so FEED_FIRST, the nightly slot and the signing drain are unchanged.
