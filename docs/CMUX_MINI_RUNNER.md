@@ -633,6 +633,17 @@ What `--apply` does:
        session at 03:46:41, stopped at 03:46:44). The job can come any time in that poll:
        on cmux7s's roots (2026-10-21) one queued 25 s in was lost to a stop at 30 s. A job
        that arrives on a full host is refused at job-started in seconds and rescued instead.
+     - Nor is a listener whose job just ended, for `GATE_JOB_END_SETTLE_S` (10 s,
+       `GLAEDA_RUNNER_GATE_JOB_END_SETTLE_S`): a stop decided as the job ends (a fleet build
+       waiting, a full mini, a drain, a signing claim) waits that long with the listener
+       running, and is dropped if it takes the next job. GitHub hands the next queued job the
+       moment a job completes, on the poll the listener kept open through it, so the freeze at
+       the Worker's exit can hold that message unread: the look saw no acknowledge, the SIGINT
+       went out, and the listener exited without reading it or with its acknowledge cancelled.
+       GitHub kept offering the job to sessions that never took it and cancelled it an hour or
+       two later, "not acquired by Runner ... after multiple attempts" (cmuxterm-hq#12960: on
+       2026-11-17 all 22 session-runner stops from 10:46 to 13:38Z came 0 to 6 s after the
+       listener's job completed).
      - A listener that hasn't exited after 60 s is killed, unless a job slipped in.
    - **Restarting and logs.** The gate starts `run.sh` again after two free polls and,
      once it has stopped a listener, a whole free `GATE_RESTART_FREE_S` (60 s,

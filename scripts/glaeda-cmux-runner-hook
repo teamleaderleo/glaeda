@@ -2690,6 +2690,19 @@ GATE_FIRST_POLL_S = float(os.environ.get("GLAEDA_RUNNER_GATE_FIRST_POLL_S") or B
 # a job GitHub just handed the session, and a hold that comes back within seconds turned two free polls into a
 # start and a stop 30 s later (cmux7s roots, 2026-10-21: at 14:10, 14:50 and 14:59).
 GATE_RESTART_FREE_S = float(os.environ.get("GLAEDA_RUNNER_GATE_RESTART_FREE_S") or BROKER_POLL_S + 10.0)
+# A stop the gate decides as a job ends (JOB_END_FREEZE: a fleet build waiting, the mini full, a drain, a signing
+# claim) waits this long with the listener running before its SIGINT. GitHub hands the next queued job to the runner
+# the moment its job completes, on the poll the listener kept open through the job, so the freeze at the Worker's
+# exit can catch that job's message unread in the listener's socket: the look sees no acknowledge, the SIGINT goes
+# out, and the thawed listener exits without reading it, or acknowledges and is cancelled in the same second
+# ("Best-effort acknowledge failed", "Caught exception from acquiring job message", "Deleting Runner Session").
+# GitHub keeps offering the job to sessions that never take it and cancels it an hour or two later, "not acquired by
+# Runner of type self-hosted even after multiple attempts" (manaflow-ai/cmuxterm-hq#12960: on 2026-11-17 10:46-13:38Z
+# all 22 session-runner stops came 0-6 s after the listener's job completed, and two session-std jobs were
+# cancelled so). Running, the listener acknowledges a handed job within a second or two, and busy() then keeps it: a
+# job on a full host is refused at job-started in seconds and rescued, which a lost one never is. Past the settle,
+# with no job taken, the stop goes on.
+GATE_JOB_END_SETTLE_S = float(os.environ.get("GLAEDA_RUNNER_GATE_JOB_END_SETTLE_S") or 10.0)
 # reload() hands the listener's start (time.monotonic, system-wide) to the re-executed gate here, not in argv, so a
 # rollback to a hook without it still accepts the exec.
 GATE_LISTENING_SINCE_ENV = "GLAEDA_RUNNER_GATE_LISTENING_SINCE"
@@ -9066,6 +9079,9 @@ class Gate:
         self.waiter_seen = waiter_seen_stamp(state_dir)  # the last job-started waiter refusal this gate acted on
         self.worker_noted = False
         self.defer_noted = False  # stop() said once that it kept a listener taking a job
+        # a stop decided as a job ended, deferred through GATE_JOB_END_SETTLE_S: (why, the finished request, due at
+        # time.monotonic); end_stop() makes it, or drops it when the listener takes the next job meanwhile
+        self.ending_stop: tuple[str, str | None, float] | None = None
         # stuck_acquire(): a request the listener acknowledged and never ran (GATE_ACQUIRE_STUCK_S) is given up, so
         # busy() and stop() no longer keep the listener for it; first_taken is when this gate first saw the request
         # without a Worker (time.monotonic), the bound when its _diag line has no stamp
@@ -10330,6 +10346,7 @@ class Gate:
         self.streak, self.stopped_one = 0, False
         self.listening_since, self.first_poll_noted = time.monotonic(), False
         self.lost_request, self.first_taken = None, None
+        self.ending_stop = None
         self.started_wall = time.time()
 
     def registration_wait(self) -> bool:
@@ -10439,6 +10456,33 @@ class Gate:
                 with contextlib.suppress(OSError):
                     os.kill(pid, signal.SIGCONT)
 
+    def end_stop(self, why: str | None = None, finished: str | None = None) -> None:
+        """A stop decided as a job ended (why), made only once GATE_JOB_END_SETTLE_S has passed with the listener
+        running and taking no job: the next queued job reaches it in that span, and a SIGINT then loses it unread
+        (GATE_JOB_END_SETTLE_S). Called with why to defer one, then on each poll with none to make it or drop it: a
+        listener that took a job meanwhile is kept, and its job's own admission decides. The caller has already let
+        go of the job's claim."""
+        now = time.monotonic()
+        if why is not None:
+            if GATE_JOB_END_SETTLE_S <= 0:
+                self.stop(why, finished)
+                return
+            self.ending_stop = (why, finished, now + GATE_JOB_END_SETTLE_S)
+            gate_log(f"the job ended; stopping the listener after {GATE_JOB_END_SETTLE_S:g} s unless GitHub hands it "
+                     f"the next job meanwhile: {why}")
+            return
+        if self.ending_stop is None:
+            return
+        why, finished, due = self.ending_stop
+        if self.busy(finished):
+            self.ending_stop = None
+            gate_log(f"not stopping the listener ({why}): it took the next job as the last one ended")
+            return
+        if now < due:
+            return
+        self.ending_stop = None
+        self.stop(why, finished)
+
     def kill(self) -> None:
         try:
             pids, _ = self.tree()
@@ -10538,8 +10582,11 @@ class Gate:
                 if (why := self.draining() or self.low_disk() or self.still_waiting() or self.still_reserved()
                         or self.exclusive_yield() or ending):
                     self.unclaim()
-                    self.stop(why, finished)
+                    self.end_stop(why, finished)
                     return None
+            if self.ending_stop is not None:
+                self.end_stop()
+                return None
             self.reload()
             if self.stuck_acquire():
                 return None
@@ -10595,7 +10642,7 @@ class Gate:
                 # a job that ended between two polls, before the gate saw its marker: the same look (job_end)
                 if ending := self.job_end():
                     self.unclaim()
-                    self.stop(ending)
+                    self.end_stop(ending)
                     return None
             why = self.claimed()
             if self.reserves(why):

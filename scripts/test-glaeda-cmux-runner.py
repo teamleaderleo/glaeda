@@ -9465,6 +9465,17 @@ class GateTest(unittest.TestCase):
         self.assertEqual(hook.host_waiters(os.fspath(self.lock), self.state), set())
         self.assertIsNone(ours.poll())
 
+    def settle(self, gate: hook.Gate, ending: bool = True) -> None:
+        """GATE_JOB_END_SETTLE_S: a stop decided as a job ends waits with the listener running; past the settle, with
+        no job taken, the next poll makes it."""
+        if not ending:
+            self.assertIsNone(gate.ending_stop)
+            return
+        self.assertIsNotNone(gate.ending_stop, "a job-end stop waits out the settle first")
+        why, finished, _ = gate.ending_stop
+        gate.ending_stop = (why, finished, time.monotonic() - 1)
+        gate.step()
+
     def gate(self, claims: list, busy: list | None = None):
         gate = hook.Gate(self.runner, os.fspath(self.lock), "", self.state)
         gate.child = mock.Mock(pid=1)
@@ -9657,6 +9668,7 @@ class GateTest(unittest.TestCase):
             held = [hook.lock_file(capacity / f"unit-{slot}", fcntl.LOCK_EX) for slot in range(10)]
             self.addCleanup(lambda: [os.close(fd) for fd in held if fd is not None])
             self.assertIsNone(gate.step(), "the Worker exited: one look, with no confirming streak")
+            self.settle(gate)
         self.assertEqual(stops, ["only 4 of 14 capacity units on this mini are free; its next job needs 5"])
         self.assertFalse(gate.job_end_marker().exists(), "the look consumes the marker")
         self.assertFalse(gate.job_ending)
@@ -9679,6 +9691,7 @@ class GateTest(unittest.TestCase):
         with mock.patch.object(gate, "busy", return_value=False), mock.patch.object(gate, "reload"), \
                 mock.patch.object(gate, "stop", side_effect=lambda why, *_: stops.append(why) or True):
             self.assertIsNone(gate.step())
+            self.settle(gate)
         self.assertEqual(stops, ["only 4 of 14 capacity units on this mini are free; its next job needs 5"])
         self.assertFalse(gate.job_end_marker().exists())
 
@@ -11139,6 +11152,7 @@ class GateTest(unittest.TestCase):
             self.assertEqual(stops, [], "a runner with a job is never stopped")
             self.assertEqual(gate.watching, (4242,), "a refused job's worker is watched")
             gate.step()  # the worker exited
+            self.settle(gate)
         self.assertEqual(stops, ["a fleet build is waiting for the host (pid 77)"], "at once, not two idle polls")
 
         # Any other job is watched the same way (JOB_END_FREEZE), and its runner stops on the first idle poll.
@@ -11148,6 +11162,7 @@ class GateTest(unittest.TestCase):
             gate.step(); gate.step()
             self.assertEqual((stops, gate.watching, gate.freeze_at_exit), ([], (4343,), True))
             gate.step()  # the job ended
+            self.settle(gate)
         self.assertEqual(stops, ["a fleet build is waiting for the host (pid 77)"])
         self.assertEqual((gate.watching, gate.freeze_at_exit), ((), False))
 
@@ -11175,6 +11190,7 @@ class GateTest(unittest.TestCase):
             self.assertEqual(stops, [], "a runner with a job is never stopped")
             self.assertEqual(gate.watching, (4242,), "a refused job's worker is watched")
             gate.step()  # the worker exited
+            self.settle(gate)
         self.assertEqual(stops, [reserved], "at once, not two idle polls")
 
         # A job the reservation did not refuse (it started first) ends the same way.
@@ -11185,6 +11201,7 @@ class GateTest(unittest.TestCase):
             gate.step(); gate.step()
             self.assertEqual((stops, gate.watching), ([], (4343,)), "its Worker's exit freezes the listener too")
             gate.step()  # the job ended
+            self.settle(gate)
         self.assertEqual(stops, [reserved])
 
     def drain(self, until: float | None = None, reason: str = "a relabel to a,b") -> Path:
@@ -11203,6 +11220,7 @@ class GateTest(unittest.TestCase):
             gate.step()
             self.assertEqual((stops, gate.watching), ([], (4343,)), "never stopped under its job; its Worker is watched")
             gate.step()  # the job ended
+            self.settle(gate)
         self.assertEqual(stops, ["draining for a relabel to a,b"])
 
     def test_a_signing_claim_seen_during_a_job_stops_a_yielding_listener_as_the_job_ends(self) -> None:
@@ -11224,6 +11242,7 @@ class GateTest(unittest.TestCase):
                 gate.step()
                 self.assertEqual((stops, gate.watching), ([], (4343,) if stopped else ()), "never under its job")
                 gate.step()  # the job ended
+                self.settle(gate, stopped)
             self.assertEqual(len(stops), 1 if stopped else 0, stops)
             if stopped:
                 self.assertIn("a signing job waits for this mini to drain", stops[0])
@@ -11349,6 +11368,7 @@ class GateTest(unittest.TestCase):
             self.assertEqual(lsof.call_count, 2)
             self.assertEqual(gate.watching, (4242,), "the refused job's worker is watched")
             gate.step()  # the worker exited: still_waiting reads again and stops
+            self.settle(gate)
         self.assertEqual(stops, ["a fleet build is waiting for the host (pid 77)"])
 
     def test_the_waiter_note_counts_once_and_only_for_waiter_refusals(self) -> None:
@@ -11506,6 +11526,7 @@ class GateTest(unittest.TestCase):
                              ((4242,), True, "b43ca05a", (4343,)))
             gate.freeze()  # nap(): the Worker exited
             gate.step()
+            self.settle(gate)
         self.assertEqual(stops, [("a fleet build is waiting for the host (pid 6755)", "b43ca05a")])
         self.assertEqual(gate.frozen, (), "thawed once the stop is sent")
 
@@ -11521,6 +11542,7 @@ class GateTest(unittest.TestCase):
             self.assertEqual(lsof.call_count, 2)
             self.assertEqual((gate.watching, gate.freeze_at_exit), ((4242,), True))
             gate.step()  # the Worker exited
+            self.settle(gate)
         self.assertEqual(stops, ["a fleet build is waiting for the host (pid 6755)"])
 
     def test_the_gate_evicts_in_the_background_while_it_keeps_listening(self) -> None:
@@ -13127,6 +13149,84 @@ class GateTest(unittest.TestCase):
         gate.step(); gate.step()
         self.assertIsNotNone(gate.stop_deadline)
         self.assertIsNotNone(gate.child.wait(timeout=10))
+
+    # The listener's _diag through the end of job 930d9f84 (MID_ACQUIRE_DIAG's first lines): the job is done, so the
+    # trace names no request the listener is taking.
+    JOB_DONE_DIAG = "".join(MID_ACQUIRE_DIAG.splitlines(keepends=True)[:6])
+    # A listener that, like Runner.Listener, reads a job message GitHub handed its open poll only while it runs: once
+    # `handed` exists it writes its acknowledge to the newest _diag log; a SIGINT before then exits it with the message
+    # unread.
+    HANDED_LISTENER = """#!/usr/bin/env python3
+import os, signal, sys, time
+signal.signal(signal.SIGINT, lambda *_: sys.exit(0))
+runner = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+print("Listening for Jobs", flush=True)
+acked = False
+while True:
+    if not acked and os.path.exists(os.path.join(runner, "handed")):
+        diag = os.path.join(runner, "_diag")
+        log = os.path.join(diag, sorted(n for n in os.listdir(diag) if n.startswith("Runner_"))[-1])
+        with open(log, "a") as f:
+            f.write("[2026-11-17 09:06:33Z INFO BrokerMessageListener] Acknowledging runner request "
+                    "'5ac0eee9-b0bd-53b7-94b6-751532b70aec'.\\n")
+        acked = True
+    time.sleep(0.02)
+"""
+
+    def job_ending_gate(self) -> hook.Gate:
+        """A real gate over HANDED_LISTENER whose job (930d9f84) just ended while a fleet build waits for the host: the
+        listener frozen at the Worker's exit (JOB_END_FREEZE), as nap() leaves it."""
+        listener = self.runner / "bin/Runner.Listener"
+        listener.write_text(self.HANDED_LISTENER)
+        self.diag(self.JOB_DONE_DIAG)
+        gate = self.started_gate()
+        gate.draining = gate.low_disk = gate.still_reserved = gate.exclusive_yield = lambda: None  # type: ignore
+        gate.still_waiting = lambda: "a fleet build is waiting for the host (pid 6755)"  # type: ignore
+        gate.job_waited, gate.job_request = True, "930d9f84-513b-5f03-96b5-0138d88db265"
+        gate.listener_pids = tuple(self.listeners())
+        gate.freeze()
+        self.assertEqual(gate.frozen, gate.listener_pids)
+        return gate
+
+    def test_a_job_handed_to_the_listener_as_its_last_job_ends_is_taken_not_lost(self) -> None:
+        """manaflow-ai/cmuxterm-hq#12960, 2026-11-17: at a job's end GitHub handed the next session-std job to the
+        listener's open poll, the gate's frozen look saw no acknowledge and sent the SIGINT, and the listener exited
+        with the job unread or its acknowledge cancelled (cmux10s instance 8 at 09:06:33Z: "stopping the idle
+        listener: only 5 of 14 capacity units", the acknowledge and "Deleting Runner Session" in the same second).
+        GitHub cancelled such jobs an hour or two later, "not acquired by Runner ... after multiple attempts". The stop
+        now waits GATE_JOB_END_SETTLE_S with the listener running, and a listener that takes the job is kept."""
+        gate = self.job_ending_gate()
+        (self.runner / "handed").touch()  # the job message is in the frozen listener's socket, unread
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertIsNone(gate.step())
+            self.assertIsNone(gate.stop_deadline, "no SIGINT while the next job may be on its way")
+            self.assertEqual(gate.frozen, (), "the listener runs through the settle")
+            deadline = time.monotonic() + 10
+            while "5ac0eee9" not in (self.runner / "_diag/Runner_20260928-135151-utc.log").read_text():
+                self.assertLess(time.monotonic(), deadline, "the running listener read the handed job")
+                time.sleep(0.05)
+            self.assertIsNone(gate.step())
+        self.assertIsNone(gate.stop_deadline)
+        self.assertIsNone(gate.ending_stop)
+        self.assert_listening()
+        self.assertIn("it took the next job as the last one ended", out.getvalue())
+
+    def test_a_job_end_stop_goes_on_after_the_settle_when_no_job_came(self) -> None:
+        gate = self.job_ending_gate()
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), mock.patch.object(hook, "GATE_JOB_END_SETTLE_S", 0.3):
+            self.assertIsNone(gate.step())
+            self.assertIsNone(gate.stop_deadline)
+            self.assertIsNotNone(gate.ending_stop)
+            self.assertIsNone(gate.step(), "inside the settle: still listening")
+            self.assertIsNone(gate.stop_deadline)
+            time.sleep(0.35)
+            self.assertIsNone(gate.step())
+        self.assertIsNotNone(gate.stop_deadline, "past the settle with no job taken, the stop goes on")
+        self.assertEqual(gate.held, "a fleet build is waiting for the host (pid 6755)")
+        self.assertIsNotNone(gate.child.wait(timeout=10))
+        self.assertIn("stopping the listener after 0.3 s unless GitHub hands it the next job", out.getvalue())
 
     def test_the_frozen_last_look_keeps_a_listener_that_acknowledged_after_the_poll(self) -> None:
         gate = self.started_gate()
