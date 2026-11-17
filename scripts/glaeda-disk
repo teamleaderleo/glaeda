@@ -1029,6 +1029,9 @@ CMUX_NEXT_DRAIN_HOOK_SHA256 = frozenset({
     "a44fdb3563a9b0b6338bfbec0428cf36b06b92c5a659b2e3756f39c9c9a8783f",
     "e8b42e4572d6a481e884f36f8165c7c3c936662d9aedaf83991843376b668785",
     "1095242d677e69184c3ed8b0f4d61ae425d7748828261ba944f1e5e24ac69d50",
+    "60a45395bbef188d96883903193c37829d4c37f9ed0abab01bb1b6ebac15c67d",
+    "23ae0141055ce1938749f14369a6365b75ae552ee8f3adc11c5d48ce5cb7dc61",
+    "c9cede71a5b59436eb082df629b6350321c80fc4ab562d3973928ac990fc7817",
 })
 CMUX_NEXT_CI_PRESERVED_NAMES = frozenset({
     "SourcePackages", "ModuleCache.noindex", "SDKStatCaches.noindex",
@@ -5223,6 +5226,37 @@ def _owned_query(argv: list[str], timeout: float) -> tuple[int, str]:
         _ACTIVE_QUERY_PROCS.pop(proc.pid, None)
 
 
+# PASSIVE_HOLDERS: macOS agents that map a built app's executable once it posts a notification, and keep the mapping
+# until they exit. Such a mapping never makes a build output in use: deleting the folder only unlinks the names (the
+# agent keeps its inode), and nothing builds from or reads the tree through it. Counted as a holder, it pinned a
+# superseded admission DerivedData seed as "in-use (open by a process)" for as long as the host stayed up (cmux19,
+# 2026-11-17: a 9.5 GiB seed held by NotificationCenter's mapping of Build/Products/Debug/cmux, while the runner gate
+# held listeners for disk, RUNNER_JOBS_DISK; cmux18's seed and cmux21's ~/cmux-ci-perf on 11-15 the same way).
+# lsof's c field cuts the command name (9 to 15 characters on macOS), so a holder matches by a prefix of its name.
+PASSIVE_HOLDERS = ("NotificationCenter", "usernoted")
+PASSIVE_HOLDER_MIN_CHARS = 9
+
+
+def passive_holder(command: str) -> bool:
+    """True when command (lsof's c field) names a PASSIVE_HOLDERS agent."""
+    return len(command) >= PASSIVE_HOLDER_MIN_CHARS and any(name.startswith(command) for name in PASSIVE_HOLDERS) \
+        or command in PASSIVE_HOLDERS
+
+
+def lsof_open_paths(out: str) -> list[str]:
+    """The paths in `lsof -Fcn` output, leaving out the files a PASSIVE_HOLDERS agent has open."""
+    opened: list[str] = []
+    skip = False
+    for line in out.splitlines():
+        if line.startswith("p"):
+            skip = False
+        elif line.startswith("c"):
+            skip = passive_holder(line[1:])
+        elif line.startswith("n/") and not skip:
+            opened.append(line[1:])
+    return opened
+
+
 def process_evidence() -> tuple[list[str], str]:
     """Every path a process has open (cwd and files) plus all command lines.
 
@@ -5248,14 +5282,14 @@ def process_evidence() -> tuple[list[str], str]:
     else:
         lsof = shutil.which("lsof") or "/usr/sbin/lsof"
         try:
-            code, out = _owned_query([lsof, "-n", "-P", "-Fn"], 120)
+            code, out = _owned_query([lsof, "-n", "-P", "-Fcn"], 120)
         except (OSError, subprocess.TimeoutExpired) as e:
             raise NoEvidence(f"lsof: {e}") from e
         if code != 0:
             raise NoEvidence(f"lsof failed (exit {code})")
-        opened = [line[1:] for line in out.splitlines() if line.startswith("n/")]
-        if not opened:
+        if not any(line.startswith("n/") for line in out.splitlines()):
             raise NoEvidence(f"lsof returned nothing (exit {code})")
+        opened = lsof_open_paths(out)
     try:
         ps_code, ps_out = _owned_query(["ps", "-axww", "-o", "command="], 60)
     except (OSError, subprocess.TimeoutExpired) as e:

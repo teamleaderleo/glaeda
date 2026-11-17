@@ -8627,6 +8627,31 @@ class FileAndPidWaitTest(unittest.TestCase):
         code, doc = self.wait_file("never*.txt", 2)
         self.assertEqual((code, doc["path"]), (0, str(self.dir / "never7.txt")))
 
+    def test_without_proc_a_pid_wait_forks_ps_at_most_once_per_zombie_check(self) -> None:
+        """macOS has no /proc: kill -0 answers every poll, the zombie `ps` runs once per ZOMBIE_CHECK_S, and the reader
+        walk's command line and parent come from one ps (cosmic-gray, 2026-11-17: 223 spawns/s)."""
+        clock = [100.0]
+        ps = mock.Mock(return_value=subprocess.CompletedProcess([], 0, "S\n", ""))
+        gg._zombie_checked.clear()
+        with mock.patch.object(gg.Path, "read_text", side_effect=OSError), \
+                mock.patch.object(gg.Path, "read_bytes", side_effect=OSError), \
+                mock.patch.object(gg.subprocess, "run", ps), \
+                mock.patch.object(gg.time, "monotonic", lambda: clock[0]):
+            for _ in range(10):  # ten polls a second apart
+                self.assertTrue(gg.pid_alive(os.getpid()))
+                clock[0] += 1.0
+            self.assertEqual(ps.call_count, 1)
+            clock[0] += gg.ZOMBIE_CHECK_S
+            ps.return_value = subprocess.CompletedProcess([], 0, "Z\n", "")
+            self.assertFalse(gg.pid_alive(os.getpid()))
+            self.assertEqual(ps.call_count, 2)
+            ps.reset_mock()
+            ps.return_value = subprocess.CompletedProcess([], 0, " 4242 /usr/bin/python3 /x/pr_owner.py who\n", "")
+            self.assertEqual(gg.parent_command(31337), ["/usr/bin/python3", "/x/pr_owner.py", "who"])
+            self.assertEqual(gg.parent_pid(31337), 4242)
+            self.assertEqual(ps.call_count, 1)
+        gg._zombie_checked.clear()
+
     def test_waits_for_a_process_to_exit(self) -> None:
         proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(0.3)"])
         self.addCleanup(proc.wait)
@@ -12843,6 +12868,21 @@ class SpendAlarmTest(Base):
         self.assertEqual(len(lines), 1, out.getvalue())
         self.assertEqual((lines[0]["pace"], lines[0]["spent"], lines[0]["cap"]), (480, 80, 300))
         self.assertIn("nothing to do, projection only", lines[0]["note"])
+
+    def test_the_share_alarm_ignores_a_few_reads_under_a_cap_of_zero(self) -> None:
+        """A restShare of 0 reads over GraphQL only; its exempt reads (1 and 5 an hour) are not spend to page on, but
+        spend past the floor is."""
+        self.policy()
+        self.daemon.policy = {**self.daemon.policy, "restShare": 0.0}
+        self.assertEqual(self.daemon.rest_cap(), 0)
+        minute = int(self.daemon.clock() // 60)
+        for n in (1, 5, 50):
+            self.daemon.rest_minutes = {minute: n}
+            self.assertIsNone(self.daemon.share_alarm(0, []), n)
+        self.daemon.rest_minutes = {minute: 51}
+        alarm = self.daemon.share_alarm(0, [])
+        self.assertIsNotNone(alarm)
+        self.assertIn("past its cap of 0", alarm[1])
 
     def test_the_share_alarm_fires_on_the_measured_hour_and_names_the_waiter_to_shed(self) -> None:
         """Past the cap over the measured trailing hour (what the cap exempts, or a restYield), the alarm names the
@@ -17298,6 +17338,41 @@ class LandTest(Base):
         self.w.answers.append(refusal("other", LA, {"kind": "command", "text": "ask Aziz"}))
         e = self.tick()
         self.assertEqual((e["state"], e["stop"]["next"]), ("stopped", "ask Aziz"))
+
+    def test_a_command_naming_a_run_wait_is_waited_then_judged_again(self):
+        """cmux#45404, 2026-11-17: merge_hold's checks_running step was {"kind": "command", "text": "glaeda-gh wait run
+        manaflow-ai/cmux/44061804279 --timeout 3600"}, and land stopped on it (and every land queued after it). It is a
+        step: land waits on that run, judges again, and stops only at the third identical refusal in a row."""
+        self.pr(LA)
+        self.land()
+        step = {"kind": "command", "text": "glaeda-gh wait run o/r/44061804279 --timeout 600"}
+        for _ in range(3):
+            self.w.answers.append(refusal("checks_running", LA, step, nxt=step["text"]))
+        e = self.tick()
+        self.assertEqual(e["state"], "waiting", e.get("stop"))
+        self.assertEqual((e["wait"]["kind"], e["wait"]["run"]), ("run", 44061804279))
+        self.assertEqual(e["explain"]["action"]["kind"], "wait_run")
+        e = self.tick(601)  # the wait's timeout: judged again, the same refusal
+        self.assertEqual((e["state"], e["streak"]["count"], len(self.w.explains())), ("waiting", 2, 2))
+        e = self.tick(601)
+        self.assertEqual((e["state"], len(self.w.explains())), ("stopped", 3))
+        self.assertIn("3 identical refusals", self.w.sent()[-1][-1])
+
+    def test_a_command_naming_a_wait_on_another_repository_still_stops(self):
+        self.pr(LA)
+        self.land()
+        step = {"kind": "command", "text": "glaeda-gh wait run other/repo/5 --timeout 600"}
+        self.w.answers.append(refusal("checks_running", LA, step))
+        e = self.tick()
+        self.assertEqual(e["state"], "stopped")
+
+    def test_a_command_naming_a_pr_wait_is_waited(self):
+        self.pr(LA)
+        self.land()
+        step = {"kind": "command", "text": "glaeda-gh wait pr o/r#1 --until done --timeout 900"}
+        self.w.answers.append(refusal("checks_running", LA, step))
+        e = self.tick()
+        self.assertEqual((e["state"], e["wait"]["kind"], e["wait"]["until"]), ("waiting", "pr", "done"))
 
     def test_three_identical_refusals_stop_and_notify(self):
         self.pr(LA)

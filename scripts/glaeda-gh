@@ -374,6 +374,7 @@ ALARM_CMD = Path(os.environ.get("GLAEDA_GH_ALARM_CMD") or Path.home() / ".local/
 NOTICES_DIR = Path(os.environ.get("NOTICES_DIR") or Path.home() / ".local/state/notices")
 ALARMS_FILE = "alarms.json"  # when each alarm was last sent, so a restart does not send it again
 ALARM_EVERY = 3600.0
+SHARE_ALARM_FLOOR = 50  # counted REST an hour under which the share alarm stays quiet, whatever the cap (a cap of 0: its exempt reads)
 ALARM_REST_LEFT = 1000  # the pool alarm fires below this much REST left on the poorest core counter
 ALARM_TREND_MIN = 300.0  # seconds of readings in one window a drain projection needs
 ALARM_TREND_KEEP = 900.0  # seconds of readings the projection is drawn over
@@ -613,7 +614,7 @@ CONSUMER_WINDOW = 3600
 CONSUMER_DEFAULTS = {"reserved": {"autoland": 1500}, "limit": 240, "pool": 600}  # head reads an hour
 CONSUMERS_CONFIG = Path.home() / ".config/glaeda/gh-consumers.json"  # same keys as CONSUMER_DEFAULTS
 CONSUMERS_FILE = "consumers.json"  # the daemon's spend, denials and limits, for clients and `budget`
-WAIT_FILE_POLL = 1.0  # `wait file` and `wait pid` look this often (local stat calls only, no GitHub)
+WAIT_FILE_POLL = 1.0  # `wait file` and `wait pid` look this often (stat and kill -0, no GitHub; ZOMBIE_CHECK_S)
 EXIT_PARTIAL = 5  # `checks`: some heads were served stale or not at all
 POST_SPACING = 3  # seconds between two content writes from this machine (GitHub: at least 1 s between writes)
 POST_BACKOFF = 60  # a throttled write without Retry-After holds the outbox this long, doubling to POST_BACKOFF_MAX
@@ -1186,11 +1187,17 @@ def parent_command(pid: int) -> list[str]:
         return [w for w in raw.decode(errors="replace").split("\0") if w]
     except OSError:
         pass
-    try:
-        done = subprocess.run(["ps", "-o", "args=", "-p", str(pid)], capture_output=True, text=True, timeout=2)
-        return done.stdout.split()
+    try:  # one ps answers both this and parent_pid's question, so the reader walk forks one ps a level, not two
+        done = subprocess.run(["ps", "-o", "ppid=,args=", "-p", str(pid)], capture_output=True, text=True, timeout=2)
+        ppid, _, args = done.stdout.strip().partition(" ")
+        if ppid.isdigit():
+            _ppid_of[pid] = int(ppid)
+        return args.split()
     except (OSError, subprocess.SubprocessError):
         return []
+
+
+_ppid_of: dict[int, int] = {}
 
 
 def parent_pid(pid: int) -> int:
@@ -1200,6 +1207,8 @@ def parent_pid(pid: int) -> int:
                 return int(line.split()[1])
     except (OSError, ValueError, IndexError):
         pass
+    if pid in _ppid_of:
+        return _ppid_of[pid]
     try:
         done = subprocess.run(["ps", "-o", "ppid=", "-p", str(pid)], capture_output=True, text=True, timeout=2)
         return int(done.stdout.strip() or 0)
@@ -3327,13 +3336,16 @@ class Daemon:
         daemon reads up to it, and a restart's re-reads come in a burst), not news: one log line an hour
         (share-pace, "nothing to do, projection only"), never an alarm. The old alarm projected the last
         SPEND_RECENT seconds over an hour and warned about hourly on huge-blue and cosmic-gray with nothing for
-        anyone to do (2026-11-15: "306/h against its cap of 150 (142 in the last hour)")."""
+        anyone to do (2026-11-15: "306/h against its cap of 150 (142 in the last hour)").
+        A restShare of 0 (every host the config does not name: PR and run reads over GraphQL only) is a cap of 0, and
+        its few exempt reads (a failed attempt's job list) warned on every one: the alarm needs spend past
+        max(cap, SHARE_ALARM_FLOOR), though the cap itself still holds reads to 0."""
         spent = self.rest_spent()
         # the share's own measure: the outbox (sessions' writes) is never held to it (request)
         recent = [r for r in recent_rows if r["bucket"] == "rest" and r["kind"] != "outbox"]
         pace = sum(r["counted"] for r in recent) * 3600 // SPEND_RECENT
-        if spent <= cap:
-            if pace > max(cap * 3 // 2, cap + 150) and self.now - self.share_pace_at >= ALARM_EVERY:
+        if spent <= max(cap, SHARE_ALARM_FLOOR):
+            if spent <= cap and pace > max(cap * 3 // 2, cap + 150) and self.now - self.share_pace_at >= ALARM_EVERY:
                 self.share_pace_at = self.now
                 log({"event": "share-pace", "pace": pace, "spent": spent, "cap": cap,
                      "note": "nothing to do, projection only: the measured hour is within the cap, which holds it"})
@@ -7321,6 +7333,16 @@ LAND_SNAPSHOT_SCHEMA = "merge-hold-rollup-snapshot/v1"
 LAND_SNAPSHOT_DIR = "snapshots"
 LAND_SNAPSHOT_MAX_AGE = 300.0
 LAND_SNAPSHOT_WAIT = 120.0
+# A "command" step that is a wait this queue runs itself. cosmic-gray, 2026-11-17: merge_hold refused cmux#45404 (the
+# base clippy fix) `checks_running` with the step {"kind": "command", "text": "glaeda-gh wait run
+# manaflow-ai/cmux/44061804279 --timeout 3600"}, and land stopped on it twice, each stop also stopping every land queued
+# `--after` it (#45302, #45281, #45350). A refusal that names a next step is a step, not a stop: a command that is
+# exactly `glaeda-gh wait run OWNER/REPO/ID` or `glaeda-gh wait pr OWNER/REPO#N` (with --timeout, --until) on this PR's
+# repository is taken as that wait, then judged again; LAND_STREAK_STOP identical refusals in a row still stop it.
+LAND_COMMAND_WAIT_RUN = re.compile(r"\s*glaeda-gh wait run ([\w.-]+/[\w.-]+)/(\d+)((?:\s+--[a-z-]+(?:[ =]\S+)?)*)\s*")
+LAND_COMMAND_WAIT_PR = re.compile(r"\s*glaeda-gh wait pr ([\w.-]+/[\w.-]+)#(\d+)((?:\s+--[a-z-]+(?:[ =]\S+)?)*)\s*")
+LAND_COMMAND_TIMEOUT = re.compile(r"--timeout[ =](\d+)")
+LAND_COMMAND_UNTIL = re.compile(r"--until[ =](green|done|required|merged)\b")
 LAND_HISTORY = 60
 LAND_KEEP = 7 * 86400  # finished entries are kept this long for `land status`
 LAND_COUNT_DAYS = 30
@@ -7484,9 +7506,31 @@ def land_fallback(answer: dict, head: str) -> dict:
 def land_action(answer: dict, head: str) -> dict:
     """The answer's "action" when it is one this queue knows, else the fallback table's."""
     act = answer.get("action")
-    if isinstance(act, dict) and act.get("kind") in LAND_KINDS:
-        return act
-    return land_fallback(answer, head)
+    if not (isinstance(act, dict) and act.get("kind") in LAND_KINDS):
+        act = land_fallback(answer, head)
+    return land_command_wait(act, answer, head) if act.get("kind") == "command" else act
+
+
+def land_command_wait(act: dict, answer: dict, head: str) -> dict:
+    """A "command" step that is a glaeda-gh wait (LAND_COMMAND_WAIT_RUN, _PR) as that wait step, else ACT. The run or
+    PR's repository is the step's, so take() stops one on another repository; a PR wait on another PR number is left
+    a command (take() would stop it anyway)."""
+    text = " ".join(map(str, act["argv"])) if isinstance(act.get("argv"), list) else str(act.get("text") or "")
+    if not text.strip():
+        text = str(answer.get("next") or "")
+    timeout = LAND_COMMAND_TIMEOUT.search(text)
+    timeout_s = float(timeout.group(1)) if timeout else LAND_WAIT_DEFAULT
+    base = {"v": 1, **{k: act[k] for k in ("number", "head") if k in act}}
+    run = LAND_COMMAND_WAIT_RUN.fullmatch(text)
+    if run:
+        return {**base, "kind": "wait_run", "repo": run.group(1), "run": run.group(2), "timeout_s": timeout_s,
+                "from": "command"}
+    pr = LAND_COMMAND_WAIT_PR.fullmatch(text)
+    if pr and (act.get("number") in (None, "") or str(act.get("number")) == pr.group(2)):
+        until = LAND_COMMAND_UNTIL.search(text)
+        return {**base, "kind": "wait_pr", "repo": pr.group(1), "number": pr.group(2), "sha": head,
+                "until": until.group(1) if until else "done", "timeout_s": timeout_s, "from": "command"}
+    return act
 
 
 def land_quota_said(text: str, now: float) -> float | None:
@@ -11316,6 +11360,13 @@ def cmd_wait_file(target: str, timeout: float, as_json: bool, mode: str = "nonem
         time.sleep(min(WAIT_FILE_POLL, max(0.05, timeout - (time.monotonic() - start))))
 
 
+# Without /proc (macOS) the zombie check forks `ps`, so a pid wait runs it at most this often per pid; kill -0 still
+# answers every WAIT_FILE_POLL. A `ps` a second per waiter, each one scanned by XProtect, was part of cosmic-gray's
+# 223 spawns/s on 2026-11-17 (load 30 on 15 cores, 18 glaeda-gh processes at 81% CPU).
+ZOMBIE_CHECK_S = 15.0
+_zombie_checked: dict[int, float] = {}
+
+
 def pid_alive(pid: int) -> bool:
     try:
         os.kill(pid, 0)
@@ -11323,7 +11374,16 @@ def pid_alive(pid: int) -> bool:
         return False
     except PermissionError:
         return True
-    try:  # a zombie has exited; its parent just has not reaped it
+    # a zombie has exited; its parent just has not reaped it
+    try:
+        return Path(f"/proc/{pid}/stat").read_text().rpartition(")")[2].split()[0] != "Z"
+    except (OSError, IndexError):
+        pass
+    now = time.monotonic()
+    if now - _zombie_checked.get(pid, -ZOMBIE_CHECK_S) < ZOMBIE_CHECK_S:
+        return True
+    _zombie_checked[pid] = now
+    try:
         state = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True, timeout=5).stdout
         return not state.strip().startswith("Z") and bool(state.strip())
     except (OSError, subprocess.SubprocessError):

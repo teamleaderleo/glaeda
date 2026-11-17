@@ -1120,6 +1120,31 @@ class GlaedaDiskTest(unittest.TestCase):
         self.assertIn("/bin/sh -c x", commands)
         self.assertEqual(len(calls), 2)
 
+    def test_process_evidence_leaves_out_what_only_notification_center_maps(self) -> None:
+        # cmux19, 2026-11-17: NotificationCenter's mapping of Build/Products/Debug/cmux kept a superseded 9.5 GiB
+        # admission seed "in-use (open by a process)" while the runner gate held listeners for disk.
+        seed = "/Users/Shared/cmux-build-fleet/ci/seeds/admission-derived-data-v1-old"
+        listing = (f"p515\ncNotificationCen\nftxt\nn{seed}/Build/Products/Debug/cmux\n"
+                   f"p516\ncusernoted\nftxt\nn{seed}/Build/Products/Debug/cmux.app/Contents/Info.plist\n"
+                   f"p900\ncxcodebuild\nfcwd\nn/Users/Shared/cmux-build-fleet/ci/seeds/live\n"
+                   f"p901\ncNotify\nf3\nn/tmp/notify-tool\n")
+
+        def query(argv, timeout):
+            if argv[0].endswith("lsof"):
+                self.assertIn("-Fcn", argv)
+                return (0, listing)
+            return (0, "/bin/sh -c x\n")
+        with mock.patch.object(gd, "DARWIN", True), mock.patch.object(gd, "_owned_query", side_effect=query):
+            opened, _ = self.gd_evidence()
+        self.assertEqual(opened, ["/Users/Shared/cmux-build-fleet/ci/seeds/live", "/tmp/notify-tool"])
+        self.assertFalse(gd.in_cwd(seed, opened))
+        self.assertTrue(gd.in_cwd("/Users/Shared/cmux-build-fleet/ci/seeds/live", opened))
+        # only a passive holder open: still evidence (lsof worked), and the tree is free
+        with mock.patch.object(gd, "DARWIN", True), mock.patch.object(
+                gd, "_owned_query", side_effect=lambda argv, t: (0, f"p515\ncNotificat\nn{seed}/x\n")
+                if argv[0].endswith("lsof") else (0, "/bin/sh\n")):
+            self.assertEqual(self.gd_evidence()[0], [])
+
     def test_process_evidence_failures_raise_no_evidence_never_a_crash(self) -> None:
         cases = [
             lambda argv, timeout: (1, ""),  # lsof exits nonzero
