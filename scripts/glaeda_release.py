@@ -30,8 +30,8 @@ and stable would starve.
 
 Promotion does not wait out the soak once CANARY_QUORUM canary hosts report the release installed and healthy
 and none reports failure or pending (2026-11-17: Leo, "we should be able to propagate and have ci related changes
-reflect much faster"). promote.yml starts when a release is published and re-checks every minute while a release
-may still become promotable (`promote --watch`), so stable moves within a minute of the quorum's second report.
+reflect much faster"). promote.yml runs on each canary's `glaeda-ota/<host>` commit status (the `status` event), so
+stable moves as soon as the quorum's second report lands, with no polling.
 
 Promotion never waits on the shared GitHub quota (2026-10-20). Canary hosts post their statuses with the
 fleet's one REST quota; when it is spent for hours, no host can say "healthy". Every release also carries
@@ -79,12 +79,9 @@ MAX_ASSET = 200 * 1024 * 1024
 # it. Longer than glaeda-update's FAILURE_WAIT_MAX plus BACKOFF_MAX_S (test-glaeda-update.py checks), so a
 # failing canary has posted its failure by then even through a spent quota.
 CANARY_SILENT_HOURS = 2.5
-# Canary hosts whose success (with no canary failure or pending) ends the soak early. Three canaries exist (air-blue,
-# big-red, cosmic-gray; docs/GLAEDA_OTA.md Rings): two healthy installs are the evidence the soak window waits for.
+# Canary hosts whose success (with no canary failure or pending) ends the soak early. Three canaries exist
+# (docs/GLAEDA_OTA.md Rings): two healthy installs are the evidence the soak window waits for.
 CANARY_QUORUM = 2
-# How long past its soak promote.yml keeps watching a release that no canary has reported success on yet. Past it
-# the canaries' own nudges and the hourly cron take over (a canary's run dispatches promote.yml).
-WATCH_GRACE_S = 600
 SMOKE_SCHEMA = "glaeda-release-smoke/v1"
 TAG_RE = re.compile(r"r-\d{8}-[0-9a-f]{12}")
 SHA_RE = re.compile(r"[0-9a-f]{40}")
@@ -415,28 +412,6 @@ def choose(candidates: list[dict], stable: dict | None, now: dt.datetime,
     return None, "; ".join(reasons) or "no releases"
 
 
-def watching(candidates: list[dict], stable: dict | None, now: dt.datetime,
-             soak_hours: float | None = None) -> str | None:
-    """Why promote.yml should look again in a minute, or None. Some release newer than stable, on stable's line, that
-    no canary failed, is soaking or is within WATCH_GRACE_S past its soak: its quorum or the end of its soak can
-    make it promotable any minute. Anything else changes only on a new event (a release, a canary's nudge, the cron)."""
-    for candidate in sorted(candidates, key=lambda c: c["entry"]["published"], reverse=True):
-        entry = candidate["entry"]
-        if stable is not None and entry["tag"] == stable["tag"]:
-            return None
-        if canary_verdict(candidate["statuses"])[1]:
-            return None  # a failure blocks it and everything older until a newer release is healthy
-        if stable is not None and not candidate.get("descendsFromStable"):
-            continue
-        policy = parse_policy(candidate.get("policy"), legacy=candidate.get("policy") is None)
-        soak = policy["soakHours"] if soak_hours is None else soak_hours
-        published = dt.datetime.fromisoformat(entry["published"].replace("Z", "+00:00"))
-        age_s = (now - published).total_seconds()
-        if age_s < soak * 3600 + WATCH_GRACE_S:
-            return f"{entry['tag']}: {age_s / 60:.0f} min old, waiting on canary reports"
-    return None
-
-
 def now_utc() -> dt.datetime:
     return dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
 
@@ -475,8 +450,6 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--candidates", type=Path, required=True, help="JSON lines from `candidate`")
     p.add_argument("--stable", type=Path, help="current stable.json; absent means none yet")
     p.add_argument("--soak-hours", type=float, help="explicit operator override; otherwise use release policy")
-    p.add_argument("--watch", action="store_true",
-                   help="exit 4, not 3, when a release may become promotable within minutes (promote.yml looks again)")
     k = sub.add_parser("control", help="print control.json")
     k.add_argument("--paused", choices=("true", "false"), required=True)
     a = ap.parse_args(argv)
@@ -523,14 +496,9 @@ def main(argv: list[str] | None = None) -> int:
             candidates = [json.loads(line) for line in a.candidates.read_text().splitlines() if line.strip()]
             for candidate in candidates:
                 parse_channel(canonical(candidate["entry"]), "canary")
-            now = now_utc()
-            chosen, why = choose(candidates, stable, now, a.soak_hours)
+            chosen, why = choose(candidates, stable, now_utc(), a.soak_hours)
             print(why, file=sys.stderr)
             if chosen is None:
-                watch = watching(candidates, stable, now, a.soak_hours) if a.watch else None
-                if watch:
-                    print(f"watching: {watch}", file=sys.stderr)
-                    return 4
                 return 3
             sys.stdout.buffer.write(canonical({**chosen, "ring": "stable", "promoted": iso(now_utc())}))
         elif a.command == "control":

@@ -1662,7 +1662,7 @@ class ReleaseTest(unittest.TestCase):
         # Leo, 2026-11-17: "we should be able to propagate and have ci related changes reflect much faster"
         candidate = {**self.canary("2026-09-25T11:57:00Z"), "policy": gr.policy_for_paths(["scripts/glaeda-cmux-runner-hook"])}
         at = "2026-09-25T11:59:00Z"
-        one = [self.status("big-red", "success", at)]
+        one = [self.status("air-blue", "success", at)]
         two = one + [self.status("cosmic-gray", "success", at)]
         self.assertEqual(gr.CANARY_QUORUM, 2)
         ok, why = gr.promotion(candidate, None, one, self.NOW)
@@ -1672,38 +1672,15 @@ class ReleaseTest(unittest.TestCase):
         self.assertTrue(ok, why)
         self.assertIn("quorum of 2 ends the soak", why)
         # halt on red: one failure, from any canary, blocks it however many succeeded
-        self.assertFalse(gr.promotion(candidate, None, two + [self.status("air-blue", "failure", at)], self.NOW)[0])
+        self.assertFalse(gr.promotion(candidate, None, two + [self.status("canary-3", "failure", at)], self.NOW)[0])
         # a canary still retrying (pending) holds it until the soak ends, as before
-        self.assertFalse(gr.promotion(candidate, None, two + [self.status("air-blue", "pending", at)], self.NOW)[0])
+        self.assertFalse(gr.promotion(candidate, None, two + [self.status("canary-3", "pending", at)], self.NOW)[0])
         # choose() takes it from the quorum, and a newer release's failure still blocks it
         held = {"entry": candidate, "statuses": two, "descendsFromStable": True, "policy": candidate["policy"]}
         self.assertEqual(gr.choose([held], None, self.NOW)[0]["tag"], candidate["tag"])
-        newer = {"entry": self.entry("c", "2026-09-25T11:58:00Z"), "statuses": [self.status("big-red", "failure", at)],
+        newer = {"entry": self.entry("c", "2026-09-25T11:58:00Z"), "statuses": [self.status("cosmic-gray", "failure", at)],
                  "descendsFromStable": True}
         self.assertIsNone(gr.choose([newer, held], None, self.NOW)[0])
-
-    def test_promote_watches_a_release_that_can_become_promotable_within_minutes(self) -> None:
-        fresh = {"entry": {**self.canary("2026-09-25T11:55:00Z"), "policy": gr.policy_for_paths(["scripts/x.py"])},
-                 "statuses": [], "descendsFromStable": True, "policy": gr.policy_for_paths(["scripts/x.py"])}
-        stable = {**self.entry("a", "2026-09-25T01:00:00Z"), "ring": "stable"}
-        fresh["entry"]["tag"] = "r-20260925-" + "b" * 12
-        self.assertIn("waiting on canary reports", gr.watching([fresh], stable, self.NOW))
-        # still watched a while past the soak for its first success, then left to the nudges and the cron
-        late = self.NOW + dt.timedelta(minutes=15 + 10 - 5 - 1)
-        self.assertTrue(gr.watching([fresh], stable, late))
-        self.assertIsNone(gr.watching([fresh], stable, self.NOW + dt.timedelta(minutes=15 + 10 - 5)))
-        # a red, stable itself, or a release off stable's line is nothing to watch
-        red = {**fresh, "statuses": [self.status("big-red", "failure", "2026-09-25T11:58:00Z")]}
-        self.assertIsNone(gr.watching([red], stable, self.NOW))
-        self.assertIsNone(gr.watching([{**fresh, "entry": {**fresh["entry"], "tag": stable["tag"]}}], stable, self.NOW))
-        self.assertIsNone(gr.watching([{**fresh, "descendsFromStable": False}], stable, self.NOW))
-        with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / "candidates.jsonl"
-            path.write_text(json.dumps({**fresh, "entry": {**fresh["entry"], "published": gr.iso(gr.now_utc())},
-                                        "policy": fresh["entry"]["policy"]}) + "\n")
-            with open(os.devnull, "w") as null, contextlib.redirect_stderr(null):
-                self.assertEqual(gr.main(["promote", "--candidates", str(path)]), 3)
-                self.assertEqual(gr.main(["promote", "--candidates", str(path), "--watch"]), 4)
 
     def test_the_manifest_records_when_its_commit_landed(self) -> None:
         head = subprocess.run(["git", "-C", str(ROOT), "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()

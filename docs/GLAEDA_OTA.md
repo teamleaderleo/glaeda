@@ -106,12 +106,11 @@ but still installs through `glaeda-mini-fleet upgrade` (below).
    canary's success can promote, and a success or failure that still is not delivered is kept in the host's
    state.json and posted again by the next run (commit statuses have no GraphQL mutation to fall
    back to). "Signed in" is the local `gh auth token`, not `gh auth status`, which spends quota.
-5. **Stable.** `.github/workflows/promote.yml` starts when a release is published (`workflow_run` on
-   Release), runs hourly, and each canary run also dispatches it, since GitHub's cron can lag for
-   hours. While some release newer than stable may become promotable within minutes (soaking, or
-   up to 10 minutes past its soak with no canary success yet, and no canary failure), the run looks
-   again every minute (`promote --watch`, at most 30 minutes). It moves `stable` to the newest
-   release for which all of these hold:
+5. **Stable.** `.github/workflows/promote.yml` runs on every canary's `glaeda-ota/<host>` commit
+   status (the `status` event; a run for any other context is skipped and takes no concurrency
+   slot), when a Release run finishes, hourly, and when a canary run dispatches it after its soak,
+   since GitHub's cron can lag for hours. Nothing polls: each run evaluates once. It moves `stable`
+   to the newest release for which all of these hold:
    - the release's signed `policy` is valid and its publication timestamp is older than that policy's
      soak floor: new releases use a 15-minute window. Historical signed 2/6/12-hour policies remain
      readable during the transition; manifests without a policy retain the original 6-hour fallback.
@@ -144,10 +143,12 @@ but still installs through `glaeda-mini-fleet upgrade` (below).
    Stable hosts pick it up within about a minute (the probe in step 3), the mirror's included.
 
 End to end, by design: the release is published about 5 minutes after the merge (the build), canary
-hosts see it within a minute and report after their install and health check, stable moves within a
-minute of the second canary's success, and every host (an idle runner's hook too) installs it within
-another minute plus its install: about 10 minutes from merge to a runner's hook. A busy runner takes
-the hook at its next gap between jobs. With one canary awake, stable waits out the 15-minute soak.
+hosts see it within a minute and report after their install and health check, the second canary's
+success starts a promote run that moves stable (about a minute for the run), and every host (an idle
+runner's hook too) installs it within another minute plus its install: about 10 minutes from merge to
+a runner's hook. A busy runner takes the hook at its next gap between jobs. With one canary awake,
+stable waits out the 15-minute soak and that canary's next full run (up to 10 minutes) dispatches the
+promote run.
 Before 2026-11-17 the same path took 23 to 50 minutes (a 15-minute soak, then a 10-13 minute poll and
 up to 15 more for the mirror).
 
