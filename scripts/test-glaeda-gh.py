@@ -15588,7 +15588,8 @@ class StaleDataTest(Base):
     def broker_get(self, served: list[str]) -> Callable[..., subprocess.CompletedProcess]:
         """run_bounded as `lane-gh call get REPO -` answers on a lane VM: the broker's GET of one repo path, from
         self.gh's REST view. Records each path in SERVED; any other program is a test failure."""
-        def run(argv: list[str], timeout: float | None = None, input_text: str | None = None) -> Any:
+        def run(argv: list[str], timeout: float | None = None, input_text: str | None = None,
+                env: dict | None = None) -> Any:
             self.assertEqual(argv[1:3], ["call", "get"], argv)
             self.assertLessEqual(timeout or 0, gg.DIRECT_READ_BUDGET)
             repo, args = argv[3], json.loads(input_text or "{}")
