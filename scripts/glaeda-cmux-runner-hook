@@ -8307,16 +8307,44 @@ def ios_sim_queued(summary: dict[str, Any] | None, labels: frozenset[str] | None
 # when that job's need (job_need, the number its admission will wait for) is larger than the side fit, listens only
 # with room for it: the job stays queued in GitHub, where its timeout does not run, until a mini has its units. The
 # need only ever rises (IOS_SIM_OWN_FIT lowers a sim runner's fit on its own evidence). A job name the hook does not
-# know (HEAD_FIT_JOBS: the feed carries GitHub's display name, not GITHUB_JOB), a feed that cannot be read or is
-# stale, or no queued job keeps the side fit (today's rule).
-HEAD_FIT_JOBS = {
-    "cmux-next generated files": ("cmux-next.yml", "generated-files"),
-    "cmux-next daemon tests": ("cmux-next.yml", "daemon-test"),
-    "cmux-next fast tier": ("cmux-next.yml", "fast-tier"),
-    "cmux-next Swift canary": ("cmux-next.yml", "swift-canary"),
-    "cmux-next Release compile (Xcode 26)": ("cmux-next.yml", "release-compile"),
-    "cmux app scheme compile (Debug)": ("cmux-next.yml", "cmux-scheme-compile"),
+# know (the feed carries GitHub's display name, not GITHUB_JOB: head_job_key), a feed that cannot be read or is
+# stale, or no queued job keeps the side fit (today's rule). It is not a list of six names: every job the hook's
+# own tables know (JOB_CORES, WORKFLOW_JOB_CLASSES) of a cmux-next workflow is read from its display name, so a
+# renamed or newly measured job ("macOS fast tier", cmux#44472, run 44024082059, cancelled by its timeout while
+# waiting for units) is covered without a name edit.
+HEAD_FIT_ALIASES = {  # display names that do not slug to their job id
+    "cmux app scheme compile (debug)": ("cmux-next.yml", "cmux-scheme-compile"),
+    "cmux next dev release compile": ("cmux-next.yml", "cmux-scheme-compile"),
 }
+HEAD_FIT_WORKFLOW = re.compile(r"^cmux-next[a-z-]*\.yml$")
+
+
+def _head_slug(name: str) -> str:
+    """A job display name as a job-id-shaped slug: lowercase, parentheses dropped, the cmux-next / cmux / macos
+    prefixes dropped, words joined by hyphens."""
+    text = re.sub(r"\([^)]*\)", " ", name.lower())
+    words = [w for w in re.split(r"[^a-z0-9]+", text) if w]
+    while words and words[0] in ("cmux", "next", "macos"):
+        words.pop(0)
+    return "-".join(words)
+
+
+def head_job_key(name: str) -> tuple[str, str] | None:
+    """(workflow file, job id) of a cmux-next job from its feed display name, or None when no table names it."""
+    lowered = name.strip().lower()
+    if lowered in HEAD_FIT_ALIASES:
+        return HEAD_FIT_ALIASES[lowered]
+    slug = _head_slug(name)
+    if not slug:
+        return None
+    keys = [key for key in (*JOB_CORES, *WORKFLOW_JOB_CLASSES)
+            if len(key) == 2 and HEAD_FIT_WORKFLOW.match(key[0])]
+    for want in (slug, slug.removesuffix("s")):
+        found = sorted({key for key in keys if key[1] == want},
+                       key=lambda key: (key[0] != "cmux-next.yml", key[0]))
+        if found:
+            return found[0]
+    return None
 
 
 def queue_head(summary: dict[str, Any] | None, labels: frozenset[str] | None, now: float,
@@ -8339,7 +8367,7 @@ def head_fit_units(summary: dict[str, Any] | None, labels: frozenset[str] | None
                    need: Callable[[str, str], int] | None = None) -> tuple[int, str] | None:
     """HEAD_FIT: (units, job name) the head of this runner's queue needs, or None when it cannot say."""
     head = queue_head(summary, labels, now)
-    known = HEAD_FIT_JOBS.get(str((head or {}).get("name") or ""))
+    known = head_job_key(str((head or {}).get("name") or ""))
     if known is None:
         return None
     workflow, job = known
