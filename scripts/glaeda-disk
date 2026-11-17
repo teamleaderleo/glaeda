@@ -8921,15 +8921,24 @@ def snapshot_stamp(at: float, sizes: dict[str, int], measured_at: dict[str, floa
 
 def save_snapshot(sizes: dict[str, int], path: Path | None = None, at: float | None = None,
                   measured_at: dict[str, float] | None = None) -> None:
-    """`at` is when the oldest size was measured; per-item times prevent stale reports starving refresh."""
+    """`at` is when the oldest size was measured; per-item times prevent stale reports starving refresh.
+
+    The snapshot is a cache of sizes, written before a pressure pass deletes anything. On a full disk the write
+    fails (ENOSPC), and it used to end the pass there with nothing freed: a 256 GB mini at 3 GB free, 2026-11-17. So a
+    failed write keeps the old snapshot, drops its partial temp file, and lets the pass go on to delete."""
     path = SNAPSHOT if path is None else path
-    path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(f".{os.getpid()}.tmp")
     payload = {"at": time.time() if at is None else at, "sizes": sizes}
     if measured_at is not None:
         payload["measured_at"] = {k: v for k, v in measured_at.items() if k in sizes}
-    tmp.write_text(json.dumps(payload))
-    os.replace(tmp, path)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp.write_text(json.dumps(payload))
+        os.replace(tmp, path)
+    except OSError as e:
+        with contextlib.suppress(OSError):
+            tmp.unlink(missing_ok=True)
+        print(f"glaeda-disk: size snapshot not saved ({e}); the pass goes on", file=sys.stderr)
 
 
 def refresh_lock_path() -> Path:
