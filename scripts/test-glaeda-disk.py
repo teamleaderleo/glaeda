@@ -7678,7 +7678,8 @@ class GlaedaDiskTest(unittest.TestCase):
         make(ci / "derived-data", age_hours=30)
         fams = gd.idle_families(gd.fleet_families(ci))
         got = {str(Path(i.path).relative_to(ci)): i.verdict for i in gd.survey(fams, gd.IDLE_SWEEP_HOURS, 0)}
-        self.assertEqual(got, {"seeds/p-a": "kept", "seeds/p-b": "kept", "seeds/p-c": "reclaimable",
+        # SEED_KEEP 1: only the newest stays whatever its age; p-b, used 2 h ago, waits out the 12 h window
+        self.assertEqual(got, {"seeds/p-a": "kept", "seeds/p-b": "recent", "seeds/p-c": "reclaimable",
                                "seeds/p-d": "reclaimable", "pr-builds/pr-1": "recent",
                                "pr-builds/pr-2": "recent", "derived-data": "reclaimable"})
         # DerivedData and caches use the 12 h idle window for disposable output.
