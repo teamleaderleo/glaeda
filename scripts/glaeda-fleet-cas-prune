@@ -62,6 +62,7 @@ Prints one JSON line per run.
 from __future__ import annotations
 
 import argparse
+import datetime
 import errno
 import importlib.machinery
 import importlib.util
@@ -91,6 +92,12 @@ GC_EVERY_PRESSED = 6 * 3600  # ... while the store's volume is under GC_PRESSURE
 GC_PRESSURE = 0.15
 GC_MIN_KEEP_DAYS = 3
 GC_REPORT = re.compile(r"kept entries naming no stored object: (\d+)")
+# Crash reports of the processes that load Xcode's CAS plugin (libToolchainCASPlugin.dylib).
+CRASH_REPORTS = Path(os.environ.get("GLAEDA_FLEET_CAS_CRASH_REPORTS",
+                                    os.path.expanduser("~/Library/Logs/DiagnosticReports")))
+CAS_CLIENTS = ("SWBBuildService", "XCBBuildService", "swift-frontend", "clang")
+CAS_PLUGIN = "libToolchainCASPlugin.dylib"
+CRASH_LOOKBACK = 7 * 86400  # crash reports older than this are not read
 
 
 def load_glaeda_disk(path: Path | None = None):
@@ -227,9 +234,57 @@ def idle_cutoff(starts: list[float], quiet_s: float, now: float | None = None) -
     return min([now - quiet_s, *starts])
 
 
-def drop_local_cas(local: Path, building: str, quiet_s: float) -> tuple[str, Path | None]:
+def crash_time(report: Path) -> tuple[float, bool] | None:
+    """(when it crashed, whether the crashing thread was in Xcode's CAS plugin) for one .ips report, or None when it
+    cannot be read. The report's own timestamp, not its mtime: macOS rewrites old reports when it submits them."""
+    try:
+        header, _, body = report.read_text(errors="replace").partition("\n")
+        head, data = json.loads(header), json.loads(body)
+        when = datetime.datetime.strptime(head["timestamp"], "%Y-%m-%d %H:%M:%S.%f %z").timestamp()
+        thread = data["threads"][data.get("faultingThread", 0)]
+        images = data["usedImages"]
+        in_plugin = any((images[f["imageIndex"]].get("name") or "") == CAS_PLUGIN
+                        for f in thread.get("frames", []) if 0 <= f.get("imageIndex", -1) < len(images))
+    except (OSError, ValueError, KeyError, IndexError, TypeError):
+        return None
+    return when, in_plugin
+
+
+def corrupt_local_cas(local: Path, reports: Path | None = None, now: float | None = None) -> str:
+    """Why the local CAS is corrupt, "" when nothing says so: an Xcode process crashed inside the CAS plugin after
+    the CAS was created. LLVM's on-disk CAS keeps its index in a memory-mapped file, so an unclean shutdown can leave
+    the index naming bytes that were never written; from then on every build that inserts there crashes with
+    "The Xcode build system has crashed" (cmux7s, 2026-11-10 to 11-17: 29 SWBBuildService crashes in
+    OnDiskHashMappedTrie::insertLazy, every trusted seed red), and the size budget never drops it because a build
+    that crashes never grows it."""
+    reports = CRASH_REPORTS if reports is None else reports
+    now = time.time() if now is None else now
+    try:
+        st = local.stat()
+    except OSError:
+        return ""
+    born = getattr(st, "st_birthtime", st.st_ctime)
+    newest = None
+    for client in CAS_CLIENTS:
+        for report in reports.glob(f"{client}*.ips"):
+            try:
+                if report.stat().st_mtime < max(born, now - CRASH_LOOKBACK):
+                    continue
+            except OSError:
+                continue
+            seen = crash_time(report)
+            if seen and seen[1] and seen[0] > born and (newest is None or seen[0] > newest[0]):
+                newest = (seen[0], report.name)
+    if newest is None:
+        return ""
+    return f"corrupt: {newest[1]} crashed in {CAS_PLUGIN} after the local CAS was created"
+
+
+def drop_local_cas(local: Path, building: str, quiet_s: float, corrupt: bool = False) -> tuple[str, Path | None]:
     """Rename the local CAS aside when no build can be using it (the module docstring): (what happened, the renamed
-    path or None). Removing the renamed tree is the caller's, once every lock is released."""
+    path or None). Removing the renamed tree is the caller's, once every lock is released. A corrupt one goes
+    without the idle check: any build that touches it crashes, so a running build gains nothing from it, and its
+    lock still keeps a process that has it open from losing it mid-use."""
 
     def not_idle(building: str, quick: bool) -> str:
         """Why the CAS may be in use by a running build, "" when none runs or none has touched it."""
@@ -246,7 +301,7 @@ def drop_local_cas(local: Path, building: str, quiet_s: float) -> tuple[str, Pat
                     f"{time.strftime('%Y-%m-%dT%H:%M:%S%z', time.localtime(cutoff))}")
         return ""
 
-    if why := not_idle(building, quick=False):  # the full walk, with no lock held: the slow part
+    if not corrupt and (why := not_idle(building, quick=False)):  # the full walk, with no lock held: the slow part
         return why, None
     cas = cas_locks(local) if local.is_dir() else []
     if cas is None:
@@ -262,7 +317,7 @@ def drop_local_cas(local: Path, building: str, quiet_s: float) -> tuple[str, Pat
         again = running_commands()
         if again is None:
             return "deferred: a build started (ps failed)", None
-        if why := not_idle(busy(again), quick=True):
+        if not corrupt and (why := not_idle(busy(again), quick=True)):
             return why, None
         if not local.is_dir():
             return "removed", None
@@ -479,7 +534,8 @@ def main(argv: list[str] | None = None) -> int:
     local = ROOT / "cas"
     local_bytes = tree_bytes(local) if local.is_dir() and not a.node_only else 0
     rec["local_cas_bytes"] = local_bytes
-    drop_local = not writer and not a.node_only and local_bytes > a.local_cas_gib * GIB
+    corrupt = corrupt_local_cas(local) if not writer and not a.node_only else ""
+    drop_local = not writer and not a.node_only and (local_bytes > a.local_cas_gib * GIB or bool(corrupt))
     store = ROOT / "node-store"
     files = node_files(store) if store.is_dir() else []
     rec["node_store_bytes"] = sum(b for _, b, _ in files)
@@ -488,7 +544,8 @@ def main(argv: list[str] | None = None) -> int:
     doomed = plan_node(prunable, int(a.node_gib * GIB), total=rec["node_store_bytes"])
     rec["local_cas"] = ("not judged (--node-only)" if a.node_only
                         else "kept: the writer empties it before every writer build" if writer
-                        else ("would remove" if drop_local else "within budget"))
+                        else (f"would remove ({corrupt})" if corrupt
+                              else "would remove" if drop_local else "within budget"))
     rec["node_store"] = f"would remove {len(doomed)} oldest files, {sum(b for _, b, _ in doomed) / GIB:.1f} GiB"
     if not a.apply:
         rec["result"] = "ok"
@@ -505,9 +562,11 @@ def main(argv: list[str] | None = None) -> int:
         rec["node_store"] = f"removed {len(doomed)} oldest files, {freed / GIB:.1f} GiB"
     renamed, rec["result"] = None, "ok"
     if drop_local:
-        rec["local_cas"], renamed = drop_local_cas(local, building, a.local_cas_quiet_min * 60)
+        rec["local_cas"], renamed = drop_local_cas(local, building, a.local_cas_quiet_min * 60, corrupt=bool(corrupt))
         if rec["local_cas"] != "removed":
             rec["result"] = rec["local_cas"]
+        elif corrupt:
+            rec["local_cas"] = f"removed ({corrupt})"
     if renamed is not None:  # the slow part, with the locks released: nothing reads this path
         shutil.rmtree(renamed, ignore_errors=True)
     print(json.dumps(rec))
