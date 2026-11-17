@@ -18646,5 +18646,263 @@ class WaitFromBytecodeTest(unittest.TestCase):
             self.assertTrue(list(Path(home, ".cache", "gh-quota", "pycache").rglob("*.pyc")))
 
 
+
+class BrokerVouchTest(CountingGhBase):
+    """teamleaderleo/glaeda: agent sessions type `gh pr view` by hand, with a number, a branch or no target, and keep
+    typing it: 140 charged reads in two hours on four hosts (2026-11-17), one big-red session reading one PR 24 times,
+    minutes apart. An answer is kept while glaeda's daemon holds the PR at the head and updatedAt it was read at."""
+
+    HEAD = "a" * 40
+    UPDATED = "2026-11-17T17:53:19Z"
+
+    def setUp(self) -> None:
+        super().setUp()
+        os.environ.pop("GLAEDA_GH_CACHE_TTL", None)  # the default TTL: a caller that sets one is a gate
+        os.environ.pop("GH_QUOTA_LANDING_READ", None)
+        gh = self.home / "bin" / "gh"
+        # gh's plain `pr view` to a pipe prints `url:\t...`; `--json` prints the fields asked for.
+        gh.write_text("#!/bin/sh\n"
+                      f"n=$(($(cat {self.count} 2>/dev/null || echo 0) + 1)); echo $n > {self.count}\n"
+                      f"printf '%s\\n' \"$@\" >> {self.passed}\n"
+                      "case \"$*\" in\n"
+                      "  *--json*) echo \"{\\\"n\\\":$n,\\\"url\\\":\\\"https://github.com/o/r/pull/7\\\"}\" ;;\n"
+                      "  *) printf 'title:\\tt\\nnumber:\\t7\\nurl:\\thttps://github.com/o/r/pull/7\\nread:\\t%s\\n' $n ;;\n"
+                      "esac\nexit ${FAKE_GH_RC:-0}\n")
+        gh.chmod(0o755)
+
+    def hold(self, head: str | None = None, updated: str | None = None, seen_ago: float = 5.0,
+             number: int = 7) -> None:
+        """What glaeda's daemon holds for o/r#NUMBER, its head and updatedAt read SEEN_AGO seconds ago."""
+        key = f"pr:o/r#{number}"
+        gg.write_json(gg.cache_dir() / gg.file_name(key),
+                      {"key": key, "fetchedAt": time.time(), "dataAt": time.time(), "error": None,
+                       "updatedAtAt": time.time() - seen_ago, "via": "graphql",
+                       "data": {"number": number, "state": "OPEN", "headRefOid": head or self.HEAD,
+                                "updatedAt": updated or self.UPDATED, "checkState": "PENDING"}})
+
+    def age_answers(self, seconds: float) -> None:
+        for path in gg.gh_cache_dir().glob("*.json"):
+            doc = json.loads(path.read_text())
+            if "at" in doc:
+                doc["at"] -= seconds
+                path.write_text(json.dumps(doc))
+
+    def vouched_routes(self) -> int:
+        return sum(1 for line in gg.broker_log().read_text().splitlines() if json.loads(line).get("vouched"))
+
+    def test_an_unchanged_pr_is_answered_past_the_ttl_byte_for_byte(self) -> None:
+        self.hold()
+        for args in (["pr", "view", "7", "-R", "o/r"], ["pr", "view", "7", "-R", "o/r", "--json", "title,body"],
+                     ["pr", "view", "https://github.com/o/r/pull/7", "--json", "title", "--jq", ".title"],
+                     ["pr", "view", "7", "-R", "o/r", "--comments"]):
+            with self.subTest(args=args):
+                before = self.runs()
+                first = self.run_gh(args)
+                self.age_answers(gg.GH_CACHE_TTL * 10)  # 15 minutes: far past the TTL
+                second = self.run_gh(args)
+                self.assertEqual(self.runs(), before + 1, "the second read is answered, not run")
+                self.assertEqual(second[:3], first[:3], "the same bytes and exit code gh printed")
+        self.assertEqual(self.vouched_routes(), 4)
+
+    def test_a_moved_updated_at_or_head_reads_afresh(self) -> None:
+        args = ["pr", "view", "7", "-R", "o/r"]
+        for change in ({"updated": "2026-11-17T18:00:00Z"}, {"head": "b" * 40}):
+            with self.subTest(change=change):
+                self.hold()
+                self.run_gh(args)
+                self.age_answers(gg.GH_CACHE_TTL * 2)
+                before = self.runs()
+                self.hold(**change)
+                _code, out, _err, _ = self.run_gh(args)
+                self.assertEqual(self.runs(), before + 1)
+                self.assertIn(f"read:\t{before + 1}", out)
+
+    def test_a_change_inside_the_ttl_still_reads_afresh(self) -> None:
+        """A comment moves updatedAt and nothing the daemon's change mark covers; the vouch is what drops it."""
+        args = ["pr", "view", "7", "-R", "o/r"]
+        self.hold()
+        self.run_gh(args)
+        self.hold(updated="2026-11-17T18:00:00Z")
+        self.run_gh(args)
+        self.assertEqual(self.runs(), 2)
+
+    def test_a_check_finishing_does_not_drop_a_plain_view(self) -> None:
+        """Checks move the daemon's change mark and nothing plain `pr view` prints."""
+        args = ["pr", "view", "7", "-R", "o/r"]
+        self.hold()
+        self.run_gh(args)
+        entry = gg.read_cache("pr:o/r#7")
+        entry["data"]["checkState"] = "SUCCESS"
+        gg.write_json(gg.cache_dir() / gg.file_name("pr:o/r#7"), entry)
+        self.run_gh(args)
+        self.assertEqual(self.runs(), 1)
+
+    def test_a_daemon_that_has_not_read_the_pr_lately_vouches_for_nothing(self) -> None:
+        args = ["pr", "view", "7", "-R", "o/r"]
+        self.hold()
+        self.run_gh(args)
+        self.age_answers(gg.GH_CACHE_TTL * 2)
+        self.hold(seen_ago=gg.GH_CACHE_VOUCH_FRESH + 30)
+        self.run_gh(args)
+        self.assertEqual(self.runs(), 2)
+        os.remove(gg.cache_dir() / gg.file_name("pr:o/r#7"))  # no entry at all
+        self.age_answers(gg.GH_CACHE_TTL * 2)
+        self.run_gh(args)
+        self.assertEqual(self.runs(), 3)
+
+    def test_data_read_without_its_updated_at_vouches_for_nothing(self) -> None:
+        """A REST read may keep a pull up to PULL_REUSE_MAX: data written without updatedAtAt claims nothing."""
+        args = ["pr", "view", "7", "-R", "o/r"]
+        self.hold()
+        self.run_gh(args)
+        entry = gg.read_cache("pr:o/r#7")
+        self.daemon.now = time.time()
+        self.daemon.store("pr:o/r#7", entry, data=dict(entry["data"]), dataAt=time.time(), via="rest")
+        self.assertNotIn("updatedAtAt", gg.read_cache("pr:o/r#7"))
+        self.age_answers(gg.GH_CACHE_TTL * 2)
+        self.run_gh(args)
+        self.assertEqual(self.runs(), 2)
+
+    def test_fields_that_move_without_updated_at_are_never_vouched(self) -> None:
+        self.hold()
+        for fields in ("statusCheckRollup", "title,mergeStateStatus", "mergeable", "reviewDecision", "autoMergeRequest"):
+            with self.subTest(fields=fields):
+                args = ["pr", "view", "7", "-R", "o/r", "--json", fields]
+                before = self.runs()
+                self.run_gh(args)
+                self.age_answers(gg.GH_CACHE_TTL * 2)
+                self.run_gh(args)
+                self.assertEqual(self.runs(), before + 2)
+        self.assertEqual(self.vouched_routes(), 0)
+
+    def test_a_gate_or_a_landing_read_gets_the_ttl_alone(self) -> None:
+        args = ["pr", "view", "7", "-R", "o/r"]
+        for name, value in (("GLAEDA_GH_CACHE_TTL", "90"), ("GH_QUOTA_LANDING_READ", "merge-hold")):
+            with self.subTest(env=name):
+                self.hold()
+                self.run_gh(args)
+                self.age_answers(gg.GH_CACHE_TTL * 2)
+                before = self.runs()
+                with mock.patch.dict(os.environ, {name: value}):
+                    self.run_gh(args)
+                self.assertEqual(self.runs(), before + 1)
+
+    def test_a_write_or_a_merge_from_this_host_is_never_answered_from_before_it(self) -> None:
+        args = ["pr", "view", "7", "-R", "o/r"]
+        for write in (["pr", "comment", "7", "-R", "o/r", "--body", "hi"],
+                      ["pr", "merge", "7", "-R", "o/r", "--squash", "--match-head-commit", self.HEAD]):
+            with self.subTest(write=write[:2]):
+                self.hold()
+                self.run_gh(args)
+                before = self.runs()
+                code, _out, _err, _ = self.run_gh(write)
+                self.assertEqual((code, self.runs()), (0, before + 1), "the write runs, never answered")
+                self.run_gh(args)
+                self.assertEqual(self.runs(), before + 2, "the read after it goes to GitHub")
+
+    def test_the_answers_own_head_and_updated_at_vouch_for_it(self) -> None:
+        """`--json headRefOid,updatedAt` says what it was read at: no snapshot is needed, and a daemon at another
+        head or updatedAt never vouches."""
+        gh = self.home / "bin" / "gh"
+        gh.write_text("#!/bin/sh\n"
+                      f"n=$(($(cat {self.count} 2>/dev/null || echo 0) + 1)); echo $n > {self.count}\n"
+                      f"echo '{{\"body\":\"b\",\"headRefOid\":\"{self.HEAD}\",\"updatedAt\":\"{self.UPDATED}\"}}'\n")
+        # `body` too: the daemon does not keep it, so broker_plan cannot answer this from its cache first
+        args = ["pr", "view", "7", "-R", "o/r", "--json", "body,headRefOid,updatedAt"]
+        self.run_gh(args)  # the daemon holds nothing yet
+        self.hold()
+        self.age_answers(gg.GH_CACHE_TTL * 2)
+        self.run_gh(args)
+        self.assertEqual(self.runs(), 1)
+        self.hold(updated="2026-11-17T19:00:00Z")
+        self.run_gh(args)
+        self.assertEqual(self.runs(), 2)
+
+    def test_no_answer_outlives_the_vouch_keep(self) -> None:
+        args = ["pr", "view", "7", "-R", "o/r"]
+        self.hold()
+        self.run_gh(args)
+        self.age_answers(gg.GH_CACHE_VOUCH_KEEP + 1)
+        self.run_gh(args)
+        self.assertEqual(self.runs(), 2)
+
+    def test_a_pr_view_with_no_target_is_kept_per_branch(self) -> None:
+        where = self.git_checkout(self.home / "roots" / "r", '[remote "origin"]\n\turl = git@github.com:o/r.git\n')
+        subprocess.run(["git", "-C", str(where), "checkout", "-q", "-b", "feature"], check=True)
+        subprocess.run(["git", "-C", str(where), "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q",
+                        "--allow-empty", "-m", "init"], check=True)
+        self.hold()
+        args = ["pr", "view"]
+        here = os.getcwd()
+        os.chdir(where)  # gh_cache_branch_state asks git in the working directory, as gh does
+        self.addCleanup(os.chdir, here)
+        with mock.patch.object(gg.Path, "cwd", staticmethod(lambda: where)):
+            first = self.run_gh(args)
+            self.age_answers(gg.GH_CACHE_TTL * 2)
+            # the first answer named the PR, but there was no snapshot of it from before gh ran: read again
+            self.run_gh(args)
+            self.age_answers(gg.GH_CACHE_TTL * 2)
+            third = self.run_gh(args)
+            self.assertEqual((self.runs(), third[1]), (2, "title:\tt\nnumber:\t7\nurl:\thttps://github.com/o/r/pull/7\n"
+                                                           "read:\t2\n"))
+            self.assertIn("url:", first[1])
+            subprocess.run(["git", "-C", str(where), "checkout", "-q", "-b", "other"], check=True)
+            self.run_gh(args)
+            self.assertEqual(self.runs(), 3, "another branch is another question")
+            subprocess.run(["git", "-C", str(where), "checkout", "-q", "feature"], check=True)
+            self.run_gh(args)
+            self.assertEqual(self.runs(), 3, "back on the branch: still vouched")
+            self.run_gh(["pr", "comment", "7", "-R", "o/r", "--body", "hi"])
+            self.run_gh(args)
+            self.assertEqual(self.runs(), 5, "a comment from this host drops the branch's answer at once")
+            subprocess.run(["git", "-C", str(where), "checkout", "-q", "--detach"], check=True)
+            for _ in range(2):
+                self.assertIsNotNone(self.run_gh(args)[3], "a detached head is never kept: gh is handed the call")
+
+    def test_a_branch_target_is_tied_to_the_pr_its_answer_names(self) -> None:
+        self.hold()
+        args = ["pr", "view", "leo/feature", "-R", "o/r"]
+        self.run_gh(args)
+        self.run_gh(args)  # inside the TTL
+        self.assertEqual(self.runs(), 1)
+        self.age_answers(gg.GH_CACHE_TTL * 2)
+        self.run_gh(args)  # first fill had no PR to snapshot: read once more, now tied to o/r#7
+        self.age_answers(gg.GH_CACHE_TTL * 2)
+        self.run_gh(args)
+        self.assertEqual(self.runs(), 2)
+        self.hold(updated="2026-11-17T18:00:00Z")
+        self.run_gh(args)
+        self.assertEqual(self.runs(), 3)
+
+
+class ConfirmedUpdatedAtTest(Base):
+    """The daemon's probe confirms a PR without a full read; it carries updatedAt, which the fingerprint leaves out,
+    so a comment or a body edit is seen within a cycle and not only at the next full read (PR_FULL_EVERY)."""
+
+    def test_a_probe_brings_updated_at_without_a_full_read(self) -> None:
+        self.gh.counts = True
+        self.gh.prs[("o", "r", 1)] = pr_node(1, checks=[check_run("a")])
+        gg.register("pr:o/r#1", waited=True)
+        self.daemon.tick(NOW)
+        first = gg.read_cache("pr:o/r#1")
+        self.assertEqual((first["data"]["updatedAt"], first["updatedAtAt"]), ("x", NOW))
+        self.gh.prs[("o", "r", 1)]["updatedAt"] = "y"  # a comment: nothing the fingerprint counts
+        later = NOW + gg.CYCLE
+        os.utime(gg.watch_dir() / gg.file_name("pr:o/r#1"), (later, later))
+        self.daemon.tick(later)
+        self.assertEqual((self.gh.full_reads, self.gh.probes), (1, 1))
+        after = gg.read_cache("pr:o/r#1")
+        self.assertEqual((after["via"], after["data"]["updatedAt"], after["updatedAtAt"]), ("graphql-probe", "y", later))
+
+    def test_confirmed_updated(self) -> None:
+        data = {"headRefOid": "a", "updatedAt": "x"}
+        self.assertEqual(gg.confirmed_updated({"data": data}, {"headRefOid": "a", "updatedAt": "x"}, 5.0),
+                         {"updatedAtAt": 5.0})
+        self.assertEqual(gg.confirmed_updated({"data": data}, {"headRefOid": "a", "updatedAt": "y"}, 5.0),
+                         {"updatedAtAt": 5.0, "data": {"headRefOid": "a", "updatedAt": "y"}})
+        for node in ({"headRefOid": "b", "updatedAt": "y"}, {"headRefOid": "a"}, None):
+            self.assertEqual(gg.confirmed_updated({"data": data}, node, 5.0), {})
+
+
 if __name__ == "__main__":
     unittest.main()
