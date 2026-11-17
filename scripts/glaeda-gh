@@ -21,7 +21,10 @@
     glaeda-gh post pr OWNER/REPO --head B --base B --title T --body-file F [--reviewer LOGIN] [--wait S]
     glaeda-gh post review OWNER/REPO#N [--event comment|approve|request-changes] --body-file F [--wait S]
     glaeda-gh post status [ID] [--wait S] [--json]      one write's URL or error, or the queue and recent writes
-    glaeda-gh budget [--json]                           REST and GraphQL quota as last seen
+    glaeda-gh budget [--json] [--local]                 who spent the login's quota this hour, per host
+                                                        and session (lane-gh spend_view, kept 60 s), the
+                                                        account's reading and the hard reserve; then this
+                                                        host's daemon: REST and GraphQL quota as last seen
     glaeda-gh read < REQUEST                            cached entries for an upstream client (upstream.json)
     glaeda-gh restart [--force]                         restart a down or hung daemon, once for every session
     glaeda-gh gh ARG...                                 one `gh` call, brokered: served from the cache when it
@@ -370,6 +373,29 @@ ALARM_PACE_SHARE = 0.5
 SPENDERS_CMD = os.environ.get("GLAEDA_GH_SPENDERS_CMD") or os.fspath(Path.home() / ".local/bin/gh-quota")
 SPENDERS_TIMEOUT = 10.0
 SPENDERS_TOP = 3
+# `budget` across hosts (fleet_budget): who spent the login's quota this hour, every host signed in to it at once.
+# Leo, 2026-11-17, on the Claude desktop app showing "GitHub rate limit" on hovering a PR link: the coordinator had to
+# count by hand (huge-blue 6,458 gh calls 03:20Z-04:15Z, cosmic-gray 1,442, the daemon 200). The account-wide view is
+# the lane-gh broker's spend_view (cmuxterm-hq hq#12421): every host's gh-quota spend, carried by its NOW census over
+# git, summed per host and session against GitHub's own used count, at no GitHub call. glaeda only shows it: one
+# `lane-gh call spend_view` (leo-workspace's lane-gh, the same checkout gh-quota, SPENDERS_CMD, already comes from).
+# Where lane-gh does not answer (a host that is no broker client), each host is one `reach HOST sh -c ...` printing
+# the files it already keeps (budget.json, daemon.json) and its `gh-quota usage --json`; an ssh that fails or times
+# out is that host "unreachable", never the command failing. Either answer is kept FLEET_BUDGET_TTL, so any number of
+# sessions asking cost one read a minute.
+FLEET_BUDGET_FILE = "fleet-budget.json"
+FLEET_BUDGET_TTL = 60.0
+FLEET_HOST_TIMEOUT = 25.0  # one host's ssh and its gh-quota usage; past it the host is "unreachable (timed out)"
+FLEET_BUDGET_HOSTS = ("huge-blue", "cosmic-gray", "big-red", "air-blue")  # the registry's origins, if it is not found
+FLEET_CALLERS_TOP = 8  # callers per host in the text; --json keeps every one
+FLEET_READING_MAX_AGE = 900.0  # an account reading older than this is not shown as the account's
+REACH_CMD = os.environ.get("GLAEDA_GH_REACH_CMD") or os.fspath(Path.home() / ".local/bin/reach")
+LANE_GH_CMD = os.environ.get("GLAEDA_GH_LANE_GH_CMD") or os.fspath(Path.home() / ".local/bin/lane-gh")
+SPEND_VIEW_REPO = "manaflow-ai/cmuxterm-hq"
+SPEND_VIEW_TOP = 15
+# The calls gh-quota keeps back from every caller but lands (leo-workspace machines/gh-quota.json hard_reserve_calls,
+# {"rest": N, "graphql": N}); this default until the policy names it.
+HARD_RESERVE_DEFAULT = {"rest": 500, "graphql": 500}
 # How stale this host's view of the shared quota may get before GET /rate_limit refreshes it. That
 # endpoint reports every family at once and costs no primary quota, so the only cost of a short
 # interval is the secondary limit, which one call every two minutes is nowhere near. 0 turns it off.
@@ -10260,7 +10286,357 @@ def spend_lines(spend: Any) -> list[str]:
     return out
 
 
-def cmd_budget(as_json: bool) -> int:
+# ---------------------------------------------------------------- budget across hosts
+
+# What each host prints for fleet_budget: the files it already keeps and its gh-quota usage, between marker lines.
+# POSIX sh (a Mac's login shell may be zsh; `sh -c` keeps it one dialect). The daemon's state dir is the default one:
+# GLAEDA_GH_DIR is a test's or an operator's override and an ssh session does not carry it.
+FLEET_HOST_SCRIPT = (
+    'd="${GLAEDA_GH_DIR:-$HOME/.cache/glaeda/gh}"; '
+    'echo "@@budget"; cat "$d/budget.json" 2>/dev/null; echo; '
+    'echo "@@daemon"; cat "$d/daemon.json" 2>/dev/null; echo; '
+    'echo "@@usage"; "$HOME/.local/bin/gh-quota" usage --json 2>/dev/null; echo; '
+    'echo "@@end"')
+
+
+def parse_host_report(text: str) -> dict:
+    """FLEET_HOST_SCRIPT's output as {"budget", "daemon", "usage"}, each None when the host had nothing parseable."""
+    parts: dict[str, list[str]] = {}
+    current = None
+    for line in (text or "").splitlines():
+        if line.startswith("@@"):
+            current = line[2:].strip()
+            parts.setdefault(current, [])
+        elif current is not None:
+            parts[current].append(line)
+    out: dict[str, Any] = {}
+    for name in ("budget", "daemon", "usage"):
+        try:
+            out[name] = json.loads("\n".join(parts.get(name) or []))
+        except ValueError:
+            out[name] = None
+    if "end" not in parts:
+        out["truncated"] = True
+    return out
+
+
+def local_host_report() -> dict:
+    """This host's own FLEET_HOST_SCRIPT answer, read in place (BASE, SPENDERS_CMD) instead of through a shell."""
+    usage = None
+    try:
+        done = run_bounded([SPENDERS_CMD, "usage", "--json"], timeout=FLEET_HOST_TIMEOUT)
+        usage = json.loads(done.stdout) if done.returncode == 0 and (done.stdout or "").strip() else None
+    except (OSError, subprocess.SubprocessError, ValueError):
+        usage = None
+    return {"budget": read_json(BASE / "budget.json"), "daemon": read_json(BASE / "daemon.json"), "usage": usage}
+
+
+def fleet_hosts() -> list[str]:
+    """The hosts signed in to the shared login: GLAEDA_GH_BUDGET_HOSTS (comma-separated), else the fleet registry's
+    origins (leo-workspace machines/fleet-registry.json, beside gh-quota's checkout, or reach's installed copy), else
+    FLEET_BUDGET_HOSTS. This host comes first whether it is one or not (a lane VM's own sessions spend through the
+    broker, and its gh-quota log names them)."""
+    env = os.environ.get("GLAEDA_GH_BUDGET_HOSTS")
+    hosts: list[str] = [h.strip() for h in env.split(",") if h.strip()] if env else []
+    if not env:
+        for path in (Path(SPENDERS_CMD).resolve().parent.parent / "machines/fleet-registry.json",
+                     Path.home() / ".ssh/config.d/fleet-registry.json"):
+            doc = read_json(path)
+            origins = doc.get("origins") if isinstance(doc, dict) else None
+            if isinstance(origins, dict) and origins:
+                hosts = [str(h) for h in origins]
+                break
+        hosts = hosts or list(FLEET_BUDGET_HOSTS)
+    me = policy_host()
+    return [me] + [h for h in hosts if h != me]
+
+
+def hard_reserve() -> dict:
+    """gh-quota's hard reserve per pool: leo-workspace machines/gh-quota.json hard_reserve_calls (GLAEDA_GH_QUOTA_POLICY
+    names another file), an int for both pools or {"rest": N, "graphql": N}; HARD_RESERVE_DEFAULT where it says
+    nothing."""
+    path = Path(os.environ.get("GLAEDA_GH_QUOTA_POLICY")
+                or Path(SPENDERS_CMD).resolve().parent.parent / "machines/gh-quota.json")
+    doc = read_json(path)
+    value = doc.get("hard_reserve_calls") if isinstance(doc, dict) else None
+    out = dict(HARD_RESERVE_DEFAULT)
+    found = False
+    for pool in out:
+        v = value if isinstance(value, int) else value.get(pool) if isinstance(value, dict) else None
+        if isinstance(v, int) and not isinstance(v, bool) and v >= 0:
+            out[pool], found = v, True
+    return {**out, "source": f"{path.name} hard_reserve_calls" if found
+            else f"default: {path.name} has no hard_reserve_calls yet"}
+
+
+def summarize_host(report: dict, now: float) -> dict:
+    """One reachable host's row: its callers (gh-quota usage, which already counts the daemon and the broker's VMs),
+    the REST and GraphQL they spent, what was free (304s the daemon got, reads served from a cache or mirror), and
+    the account reading its daemon last took."""
+    rows = report.get("usage") if isinstance(report.get("usage"), list) else []
+
+    def n(v: Any) -> int:
+        return v if isinstance(v, int) and not isinstance(v, bool) and v > 0 else 0
+
+    callers = []
+    for r in rows:
+        if not isinstance(r, dict) or not isinstance(r.get("caller"), str):
+            continue
+        rest, gql = n(r.get("rest")), n(r.get("graphql")) + n(r.get("search"))
+        served = n(r.get("cache")) + n(r.get("mirror")) + n(r.get("glaeda"))
+        if rest or gql or served:
+            callers.append({"caller": r["caller"], "rest": rest, "graphql": gql, "served": served,
+                            "source": r.get("source")})
+    callers.sort(key=lambda c: (-c["rest"], -c["graphql"], c["caller"]))
+    daemon = report.get("daemon") if isinstance(report.get("daemon"), dict) else {}
+    hour = daemon.get("lastHour") if isinstance(daemon.get("lastHour"), dict) \
+        and isinstance(daemon.get("at"), (int, float)) and now - daemon["at"] < 3600 else {}
+    out = {"ok": True, "rest": sum(c["rest"] for c in callers), "graphql": sum(c["graphql"] for c in callers),
+           "notModified": n(hour.get("rest304")), "served": sum(c["served"] for c in callers), "callers": callers,
+           "usage": report.get("usage") is not None}
+    budget = report.get("budget") if isinstance(report.get("budget"), dict) else {}
+    out["readings"] = {b: {k: budget[b].get(k) for k in ("remaining", "limit", "reset", "seenAt")}
+                       for b in ("rest", "graphql") if isinstance(budget.get(b), dict)}
+    return out
+
+
+def account_reading(hosts: dict, now: float) -> dict:
+    """The login's REST and GraphQL as the freshest live reading any host's daemon took (each host's "rest" is already
+    the poorest core counter it sees), with the host that read it."""
+    out: dict[str, dict] = {}
+    for bucket in ("rest", "graphql"):
+        best = None
+        for name, h in hosts.items():
+            r = (h.get("readings") or {}).get(bucket) if h.get("ok") else None
+            try:
+                seen, reset = float(r["seenAt"]), float(r["reset"])
+                int(r["remaining"]), int(r["limit"])
+            except (TypeError, KeyError, ValueError):
+                continue
+            if reset <= now or now - seen > FLEET_READING_MAX_AGE:
+                continue
+            if best is None or seen > best["seenAt"]:
+                best = {**r, "host": name}
+        if best is not None:
+            out[bucket] = best
+    return out
+
+
+def exhausted_marks(now: float) -> dict:
+    """gh-quota's own marks on this host that a pool is spent until a time (rest-exhausted.json, graphql-exhausted.json
+    under ~/.local/state/gh-quota): the only account reading a lane VM, which has no daemon budget of its own, holds."""
+    state = Path(os.environ.get("GH_QUOTA_STATE") or Path.home() / ".local/state/gh-quota")
+    out = {}
+    for bucket in ("rest", "graphql"):
+        doc = read_json(state / f"{bucket}-exhausted.json")
+        until = doc.get("until") if isinstance(doc, dict) else None
+        if isinstance(until, (int, float)) and until > now:
+            out[bucket] = {"until": until, "at": doc.get("at")}
+    return out
+
+
+def spend_view() -> dict:
+    """The lane-gh broker's spend_view (cmuxterm-hq hq#12421): the login's spend on every host per host and session,
+    from each host's NOW census, against GitHub's own used count for the window; no GitHub call. {"ok": True, "data"}
+    or {"ok": False, "error"} where lane-gh is absent, refuses (a host that is no broker client) or does not answer."""
+    if not os.access(LANE_GH_CMD, os.X_OK):
+        return {"ok": False, "error": "no lane-gh here"}
+    try:
+        done = run_bounded([LANE_GH_CMD, "call", "spend_view", SPEND_VIEW_REPO, json.dumps({"top": SPEND_VIEW_TOP})],
+                           timeout=FLEET_HOST_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "error": f"lane-gh spend_view gave no answer in {FLEET_HOST_TIMEOUT:g}s"}
+    except (OSError, subprocess.SubprocessError):
+        return {"ok": False, "error": "lane-gh spend_view did not run"}
+    try:
+        answer = json.loads(done.stdout)
+    except ValueError:
+        lines = [x.strip() for x in (done.stderr or "").splitlines() if x.strip()]
+        return {"ok": False, "error": "lane-gh spend_view: " + (lines[-1][:200] if lines else "no answer")}
+    data = answer.get("data") if isinstance(answer, dict) else None
+    if not isinstance(data, dict) or not answer.get("ok") or not isinstance(data.get("pools"), list):
+        why = (answer or {}).get("error") if isinstance(answer, dict) else None
+        why = why or (data.get("error") if isinstance(data, dict) else None) or "no spend_view in its answer"
+        return {"ok": False, "error": f"lane-gh spend_view: {str(why)[:200]}"}
+    return {"ok": True, "data": {k: v for k, v in data.items() if k != "markdown"}}
+
+
+def fetch_host(host: str, local: bool) -> dict:
+    """One host's report: this host's in place, another's through one `reach HOST sh -c FLEET_HOST_SCRIPT`."""
+    if local:
+        return local_host_report()
+    try:
+        done = run_bounded([REACH_CMD, host, "sh", "-c", shlex.quote(FLEET_HOST_SCRIPT)], timeout=FLEET_HOST_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        return {"error": f"unreachable (no answer in {FLEET_HOST_TIMEOUT:g}s)"}
+    except OSError as error:
+        return {"error": f"unreachable ({Path(REACH_CMD).name}: {error.strerror or error})"}
+    report = parse_host_report(done.stdout)
+    if done.returncode != 0 and all(report.get(k) is None for k in ("budget", "daemon", "usage")):
+        lines = [x.strip() for x in (done.stderr or "").splitlines() if x.strip()]
+        return {"error": f"unreachable (exit {done.returncode}: {(lines[-1] if lines else 'no output')[:160]})"}
+    return report
+
+
+def host_sweep(clock: float, fetch: Callable[[str, bool], dict]) -> dict:
+    """spend_view's stand-in: every host at once, one fetch each, joined within FLEET_HOST_TIMEOUT."""
+    hosts = fleet_hosts()
+    me = hosts[0]
+    reports: dict[str, dict] = {}
+
+    def one(host: str) -> None:
+        try:
+            reports[host] = fetch(host, host == me)
+        except Exception as error:  # a host's read is never the command failing
+            reports[host] = {"error": f"unreachable ({type(error).__name__})"}
+
+    threads = [threading.Thread(target=one, args=(h,), daemon=True) for h in hosts]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(FLEET_HOST_TIMEOUT + 5)
+    rows: dict[str, dict] = {}
+    for host in hosts:
+        report = dict(reports.get(host) or {"error": "unreachable (no answer)"})
+        rows[host] = {"ok": False, "error": report["error"]} if report.get("error") else summarize_host(report, clock)
+    if rows[me].get("ok") and UPSTREAM_CONFIG.exists():  # no login here: every call went through a broker
+        rows[me]["brokerClient"] = True
+    return {"hosts": rows, "account": account_reading(rows, clock), "exhausted": exhausted_marks(clock)}
+
+
+def fleet_budget(now: float | None = None, fetch: Callable[[str, bool], dict] | None = None,
+                 view: Callable[[], dict] | None = None) -> dict:
+    """Who spent the login's quota this hour, per host and session, with the account's reading and the hard reserve:
+    the FLEET_BUDGET_FILE answer when it is under FLEET_BUDGET_TTL old, else spend_view, else one read per host (all
+    at once). One reader at a time under a lock, so sessions asking together share one read."""
+    fetch, view = fetch or fetch_host, view or spend_view
+    path = BASE / FLEET_BUDGET_FILE
+    BASE.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with open(BASE / "fleet-budget.lock", "a+") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        clock = time.time() if now is None else now
+        cached = read_json(path)
+        if isinstance(cached, dict) and isinstance(cached.get("at"), (int, float)) \
+                and 0 <= clock - cached["at"] < FLEET_BUDGET_TTL:
+            return cached
+        doc: dict[str, Any] = {"at": clock, "thisHost": policy_host(), "hardReserve": hard_reserve()}
+        try:
+            seen = view()
+        except Exception as error:  # the view is never the command failing
+            seen = {"ok": False, "error": f"lane-gh spend_view: {type(error).__name__}"}
+        if seen.get("ok"):
+            doc.update(source="spend_view", view=seen["data"])
+        else:
+            doc.update(source="hosts", spendView=seen.get("error"), **host_sweep(clock, fetch))
+        write_json(path, doc)
+        return doc
+
+
+def hhmm(epoch: Any) -> str:
+    return dt.datetime.fromtimestamp(float(epoch), dt.timezone.utc).strftime("%H:%MZ") \
+        if isinstance(epoch, (int, float)) else "?"
+
+
+POOL_NAMES = {"rest": "REST", "graphql": "GraphQL"}
+
+
+def view_lines(view: dict) -> list[str]:
+    """spend_view's answer as `budget` lines: each pool against GitHub's count, then hosts, sessions, lane VMs."""
+    out = [f"account (the shared login, every host; lane-gh spend_view at {view.get('at', '?')}):"]
+    for p in view.get("pools") or []:
+        if not isinstance(p, dict):
+            continue
+        counters = [c for c in p.get("counters") or [] if isinstance(c, dict)]
+        left = "; ".join(f"{c.get('remaining')}/{c.get('limit')} left in {c.get('window')} "
+                         f"(read {c.get('reading_age_s', '?')} s ago{', ' + ','.join(c['tags']) if c.get('tags') else ''})"
+                         for c in counters) or "no reading of GitHub's count"
+        used = p.get("used")
+        acct = (f"GitHub counted {used}, the hosts' logs hold {p.get('attributed')} ({p.get('accounted_pct')}%), "
+                f"{p.get('unaccounted')} in no host's log") if used is not None \
+            else f"the hosts' logs hold {p.get('attributed')} in {p.get('since')} .. {p.get('until')}"
+        out.append(f"  {POOL_NAMES.get(p.get('pool'), p.get('pool'))}: {left}; {acct}")
+    out.append("by host (the window; a broker client's calls are in its broker host's broker:VM rows):")
+    for h in view.get("hosts") or []:
+        if isinstance(h, dict):
+            out.append(f"  {str(h.get('host')):<22} REST {h.get('rest', 0):>5}  GraphQL {h.get('graphql', 0):>5}  "
+                       f"search {h.get('search', 0):>3}  {h.get('source', '')}, {int(h.get('age_s') or 0) // 60} min old"
+                       + (f"; {h['note']}" if h.get("note") else ""))
+    for key, total, label in (("sessions", "sessions_total", "top sessions and callers"),
+                              ("lane_vm_sessions", "lane_vm_sessions_total",
+                               "lane VM sessions (through a broker; already in its broker:VM rows, not added again)")):
+        rows = [r for r in view.get(key) or [] if isinstance(r, dict)]
+        out.append(f"{label} ({len(rows)} of {view.get(total, len(rows))}):")
+        for r in rows:
+            out.append(f"  {str(r.get('host')):<18} {str(r.get('caller')):<44} REST {r.get('rest', 0):>5}  "
+                       f"GraphQL {r.get('graphql', 0):>5}")
+    apps = [a for a in view.get("app_pools") or [] if isinstance(a, dict)]
+    if apps:
+        out.append("App installation pools (their own quota, not the login's): " + "; ".join(
+            f"{a.get('name')} {a.get('remaining', '?')}/{a.get('limit', '?')}" for a in apps))
+    for gap in (view.get("gaps") or [])[:10]:
+        out.append(f"not seen: {gap}")
+    return out
+
+
+def sweep_lines(doc: dict) -> list[str]:
+    """The host sweep's answer (spend_view unavailable) as `budget` lines."""
+    account, marks = doc.get("account") or {}, doc.get("exhausted") or {}
+    parts = []
+    for bucket in ("rest", "graphql"):
+        r = account.get(bucket)
+        if r:
+            parts.append(f"{POOL_NAMES[bucket]} {r.get('remaining')}/{r.get('limit')} left, resets "
+                         f"{hhmm(r.get('reset'))} (read by {r.get('host')} {age(r.get('seenAt'))})")
+        elif marks.get(bucket):
+            parts.append(f"{POOL_NAMES[bucket]} spent until {hhmm(marks[bucket].get('until'))} (gh-quota's mark here)")
+        else:
+            parts.append(f"{POOL_NAMES[bucket]} unknown (no reachable host's daemon has a fresh reading)")
+    out = ["account (the shared login, every host): " + "; ".join(parts),
+           f"{doc.get('spendView') or 'lane-gh spend_view unavailable'}; read each host instead",
+           "who spent it, last hour, per host and caller (REST counted; 304s and cache, mirror or glaeda answers are "
+           "free and not counted):"]
+    total_rest = total_gql = reached = 0
+    for host, h in (doc.get("hosts") or {}).items():
+        mine = " (this host)" if host == doc.get("thisHost") else ""
+        if not h.get("ok"):
+            out.append(f"  {host}{mine}: {h.get('error') or 'unreachable'}")
+            continue
+        reached += 1
+        if h.get("brokerClient"):
+            mine += " (a broker client: its broker host counts these in its broker:VM rows, so not added below)"
+        else:
+            total_rest += h.get("rest", 0)
+            total_gql += h.get("graphql", 0)
+        free = f"free: {h.get('notModified', 0)} daemon 304s, {h.get('served', 0)} served from a cache"
+        no_usage = "" if h.get("usage", True) else "; gh-quota usage gave nothing"
+        out.append(f"  {host}{mine}: REST {h.get('rest', 0)}, GraphQL {h.get('graphql', 0)} ({free}{no_usage})")
+        callers = h.get("callers") or []
+        for c in callers[:FLEET_CALLERS_TOP]:
+            out.append(f"    {c['caller']:<40} REST {c['rest']:>5}  GraphQL {c['graphql']:>5}"
+                       + (f"  ({c['served']} free)" if c.get("served") else ""))
+        rest_of = callers[FLEET_CALLERS_TOP:]
+        if rest_of:
+            out.append(f"    ... {len(rest_of)} more callers: REST {sum(c['rest'] for c in rest_of)}, "
+                       f"GraphQL {sum(c['graphql'] for c in rest_of)}")
+    out.append(f"  reachable hosts together: REST {total_rest}, GraphQL {total_gql} "
+               f"({reached} of {len(doc.get('hosts') or {})} hosts)")
+    return out
+
+
+def fleet_lines(doc: dict) -> list[str]:
+    """`budget`'s cross-host section, from fleet_budget's answer."""
+    reserve = doc.get("hardReserve") or {}
+    out = view_lines(doc["view"]) if doc.get("source") == "spend_view" and isinstance(doc.get("view"), dict) \
+        else sweep_lines(doc)
+    out.insert(1 if doc.get("source") != "spend_view" else len(out),
+               f"hard reserve: {reserve.get('rest', '?')} REST, {reserve.get('graphql', '?')} GraphQL kept for lands "
+               f"({reserve.get('source', '?')})")
+    out.append(f"(read {age(doc.get('at'))}; kept {FLEET_BUDGET_TTL:g} s for every session; --local for this host's "
+               f"daemon only)")
+    return out
+
+
+def cmd_budget(as_json: bool, fleet: bool = False) -> int:
     running = daemon_running(grace=DOWN_GRACE)
     budget = read_json(BASE / "budget.json") or {}
     status = read_json(BASE / "daemon.json") or {}
@@ -10268,10 +10644,18 @@ def cmd_budget(as_json: bool) -> int:
     broken = daemon_failing() if running else None
     watching = sum(1 for p in watch_dir().glob("*.json") if not (read_json(p) or {}).get("dormant")) \
         if watch_dir().is_dir() else 0
+    spread = fleet_budget() if fleet else None
     if as_json:
-        print(json.dumps({"daemon": running, "stale": lag is not None, "failing": broken is not None,
-                          "budget": budget, "watching": watching, "last": status}, sort_keys=True))
+        doc = {"daemon": running, "stale": lag is not None, "failing": broken is not None,
+               "budget": budget, "watching": watching, "last": status}
+        if spread is not None:
+            doc["fleet"] = spread
+        print(json.dumps(doc, sort_keys=True))
     else:
+        for line in fleet_lines(spread) if spread is not None else []:
+            print(line)
+        if spread is not None:
+            print(f"this host's daemon ({policy_host()}):")
         print(f"daemon: {'running' if running else 'NOT RUNNING'}, watching {watching}, "
               f"last heartbeat {age(status.get('at'))}")
         for bucket in ("rest", "graphql"):
@@ -14140,8 +14524,10 @@ def parser() -> argparse.ArgumentParser:
     lj.add_argument("job", type=int, metavar="JOB_ID")
     sub.add_parser("read", help="an upstream's end: register the keys of one JSON request on stdin and print "
                                 "the cached entries (see upstream.json)")
-    b = sub.add_parser("budget", help="REST and GraphQL quota as the daemon last saw it")
+    b = sub.add_parser("budget", help="who spent the shared login's quota this hour, per host and caller, and "
+                                      "REST and GraphQL quota as this host's daemon last saw it")
     b.add_argument("--json", action="store_true")
+    b.add_argument("--local", action="store_true", help="this host's daemon only: no read of the other hosts")
     a = sub.add_parser("audit", help="what this host's gh traffic is, and how much of it a cache would answer")
     a.add_argument("--log", type=Path, default=None, help="the call log to read (default the PATH guard's)")
     a.add_argument("--last", type=int, default=200000, metavar="N",
@@ -14211,7 +14597,7 @@ def main(argv: list[str] | None = None) -> int:
                 raise WatchError(serve_refusal())
             return serve(args.foreground_ok)
         if args.command == "budget":
-            return cmd_budget(args.json)
+            return cmd_budget(args.json, fleet=not args.local)
         if args.command == "read":
             return cmd_read(sys.stdin.readline())
         if args.command == "audit":

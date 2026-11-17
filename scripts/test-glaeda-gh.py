@@ -12,6 +12,7 @@ import io
 import json
 import os
 import re
+import shlex
 import signal
 import stat
 import subprocess
@@ -5114,6 +5115,220 @@ class BudgetOutputTest(Base):
             last = json.loads(out.getvalue())["last"]
             self.assertEqual(last["paths"]["run"], "graphql")
             self.assertIn("perMinute", last)
+        finally:
+            lock.close()
+
+
+class FleetBudgetTest(Base):
+    """`budget` across hosts: who spent the shared login's quota this hour, per host and caller (fleet_budget)."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.saved_fleet = (gg.FLEET_BUDGET_TTL, gg.FLEET_HOST_TIMEOUT, gg.REACH_CMD, gg.LANE_GH_CMD)
+        self.home = Path(self.tmp.name) / "home"
+        (self.home / "bin").mkdir(parents=True)
+        self.policy = self.home / "gh-quota.json"
+        env = mock.patch.dict(os.environ, {"GLAEDA_GH_BUDGET_HOSTS": "here,far,down",
+                                           "GLAEDA_GH_QUOTA_POLICY": os.fspath(self.policy),
+                                           "GH_QUOTA_STATE": os.fspath(self.home / "state")})
+        env.start()
+        self.addCleanup(env.stop)
+        host = mock.patch.object(gg, "policy_host", return_value="here")
+        host.start()
+        self.addCleanup(host.stop)
+
+    def tearDown(self) -> None:
+        gg.FLEET_BUDGET_TTL, gg.FLEET_HOST_TIMEOUT, gg.REACH_CMD, gg.LANE_GH_CMD = self.saved_fleet
+        super().tearDown()
+
+    def script(self, name: str, body: str) -> str:
+        path = self.home / "bin" / name
+        path.write_text("#!/bin/sh\n" + body)
+        path.chmod(0o755)
+        return os.fspath(path)
+
+    def reports(self, now: float) -> dict:
+        usage = [{"caller": "session:alpha", "rest": 900, "graphql": 10, "search": 0, "cache": 40, "mirror": 2,
+                  "glaeda": 0},
+                 {"caller": "broker:gcp-agent-lane-5", "rest": 1200, "graphql": 30, "source": "lane-gh-broker"},
+                 {"caller": "daemon:glaeda-gh", "rest": 150, "graphql": 400},
+                 {"caller": "tool:idle", "rest": 0, "graphql": 0}]
+        return {
+            "here": {"budget": {"rest": {"remaining": 4000, "limit": 5000, "reset": now + 1000, "seenAt": now - 600}},
+                     "daemon": None, "usage": [{"caller": "session:mine", "rest": 7, "graphql": 3}]},
+            "far": {"budget": {"rest": {"remaining": 12, "limit": 5000, "reset": now + 900, "seenAt": now - 30},
+                               "graphql": {"remaining": 2500, "limit": 5000, "reset": now + 300, "seenAt": now - 5}},
+                    "daemon": {"at": now - 20, "lastHour": {"rest304": 77}}, "usage": usage},
+        }
+
+    def test_each_host_its_callers_the_account_and_the_reserve(self) -> None:
+        now = time.time()
+        reports, calls = self.reports(now), []
+        self.policy.write_text(json.dumps({"hard_reserve_calls": {"rest": 500, "graphql": 700}}))
+
+        def fetch(host: str, local: bool) -> dict:
+            calls.append((host, local))
+            if host == "down":
+                raise OSError("boom")
+            return reports[host]
+
+        def view() -> dict:
+            return {"ok": False, "error": "lane-gh spend_view: here is not a client of this broker"}
+
+        doc = gg.fleet_budget(now, fetch=fetch, view=view)
+        self.assertEqual(doc["source"], "hosts")
+        self.assertEqual(sorted(calls), [("down", False), ("far", False), ("here", True)])
+        far = doc["hosts"]["far"]
+        self.assertEqual((far["rest"], far["graphql"], far["notModified"], far["served"]), (2250, 440, 77, 42))
+        self.assertEqual([c["caller"] for c in far["callers"]],
+                         ["broker:gcp-agent-lane-5", "session:alpha", "daemon:glaeda-gh"])  # an idle row is dropped
+        self.assertFalse(doc["hosts"]["down"]["ok"])
+        self.assertIn("unreachable", doc["hosts"]["down"]["error"])
+        # the freshest reading of the login, with who read it
+        self.assertEqual((doc["account"]["rest"]["remaining"], doc["account"]["rest"]["host"]), (12, "far"))
+        self.assertEqual(doc["account"]["graphql"]["remaining"], 2500)
+        self.assertEqual((doc["hardReserve"]["rest"], doc["hardReserve"]["graphql"]), (500, 700))
+        # kept for FLEET_BUDGET_TTL: a second ask reads no host
+        self.assertEqual(gg.fleet_budget(now + 30, fetch=fetch, view=view)["at"], now)
+        self.assertEqual(len(calls), 3)
+        gg.fleet_budget(now + gg.FLEET_BUDGET_TTL + 1, fetch=fetch, view=view)
+        self.assertEqual(len(calls), 6)
+        text = "\n".join(gg.fleet_lines(doc))
+        self.assertIn("REST 12/5000 left", text)
+        self.assertIn("read by far", text)
+        self.assertIn("hard reserve: 500 REST, 700 GraphQL", text)
+        self.assertRegex(text, r"far: REST 2250, GraphQL 440 \(free: 77 daemon 304s, 42 served from a cache\)")
+        self.assertRegex(text, r"broker:gcp-agent-lane-5 +REST +1200")
+        self.assertIn("here (this host): REST 7", text)
+        self.assertIn("down: unreachable", text)
+        self.assertIn("here is not a client of this broker; read each host instead", text)
+        # a host with no login of its own (upstream.json) spent through a broker: named, not added twice
+        with mock.patch.object(gg, "UPSTREAM_CONFIG", self.policy):  # any file that exists
+            doc = gg.fleet_budget(now + 3 * gg.FLEET_BUDGET_TTL, fetch=fetch, view=view)
+        self.assertTrue(doc["hosts"]["here"]["brokerClient"])
+        text = "\n".join(gg.fleet_lines(doc))
+        self.assertIn("here (this host) (a broker client", text)
+        self.assertIn("reachable hosts together: REST 2250,", text)
+
+    def test_reserve_default_and_marks_when_no_daemon_reads_the_account(self) -> None:
+        now = time.time()
+        (self.home / "state").mkdir()
+        (self.home / "state" / "rest-exhausted.json").write_text(json.dumps({"until": now + 600, "at": now - 10}))
+        doc = gg.fleet_budget(now, fetch=lambda h, local: {"error": "unreachable (exit 4: no fleet key)"},
+                              view=lambda: {"ok": False, "error": "no lane-gh here"})
+        self.assertEqual((doc["hardReserve"]["rest"], doc["hardReserve"]["graphql"]), (500, 500))
+        self.assertIn("default", doc["hardReserve"]["source"])
+        self.assertEqual(doc["account"], {})
+        text = "\n".join(gg.fleet_lines(doc))
+        self.assertIn("REST spent until", text)
+        self.assertIn("GraphQL unknown", text)
+        self.assertIn("no lane-gh here; read each host instead", text)
+        self.assertIn("(0 of 3 hosts)", text)
+
+    def test_spend_view_is_the_answer_where_lane_gh_serves_it(self) -> None:
+        """The broker's spend_view (every host's census against GitHub's count) is shown as it is, and no host is read."""
+        now = time.time()
+        data = {"at": "2026-11-17T05:05:00Z",
+                "pools": [{"pool": "rest", "since": "a", "until": "b", "attributed": 4100, "used": 5000,
+                           "unaccounted": 900, "accounted_pct": 82,
+                           "counters": [{"used": 5000, "limit": 5000, "remaining": 0, "reading_age_s": 40,
+                                         "window": "2026-11-17T04:37:00Z .. 2026-11-17T05:37:00Z", "tags": []}]},
+                          {"pool": "graphql", "since": "a", "until": "b", "attributed": 1200, "used": None,
+                           "unaccounted": None, "accounted_pct": None, "counters": []}],
+                "hosts": [{"host": "huge-blue", "rest": 3200, "graphql": 900, "search": 3, "counted": True,
+                           "age_s": 120, "source": "live", "note": ""},
+                          {"host": "gcp-agent-lane-5", "rest": 165, "graphql": 30, "search": 0, "counted": False,
+                           "age_s": 600, "source": "census", "note": "broker client"}],
+                "sessions": [{"host": "huge-blue", "caller": "broker:gcp-agent-lane-4/ws-check", "rest": 778,
+                              "graphql": 0, "search": 0}], "sessions_total": 40,
+                "lane_vm_sessions": [{"host": "gcp-agent-lane-5", "caller": "session:glaeda-land", "rest": 583,
+                                      "graphql": 360, "search": 0}], "lane_vm_sessions_total": 7,
+                "app_pools": [], "app_role_calls": [], "gaps": ["big-red: census has no gh_spend"]}
+        answer = json.dumps({"ok": True, "status": 200, "data": {**data, "markdown": "## big"}})
+        gg.LANE_GH_CMD = self.script("lane-gh", f"printf '%s\\n' \"$@\" > \"$0.args\"; cat <<'J'\n{answer}\nJ\n")
+        fetch = mock.Mock(side_effect=AssertionError("a host read while spend_view answered"))
+        doc = gg.fleet_budget(now, fetch=fetch)
+        self.assertEqual(doc["source"], "spend_view")
+        self.assertNotIn("markdown", doc["view"])
+        self.assertEqual(Path(gg.LANE_GH_CMD + ".args").read_text().splitlines()[:3],
+                         ["call", "spend_view", gg.SPEND_VIEW_REPO])
+        text = "\n".join(gg.fleet_lines(doc))
+        self.assertIn("REST: 0/5000 left in 2026-11-17T04:37:00Z .. 2026-11-17T05:37:00Z", text)
+        self.assertIn("GitHub counted 5000, the hosts' logs hold 4100 (82%), 900 in no host's log", text)
+        self.assertRegex(text, r"huge-blue +REST +3200 +GraphQL +900")
+        self.assertRegex(text, r"top sessions and callers \(1 of 40\)")
+        self.assertRegex(text, r"broker:gcp-agent-lane-4/ws-check +REST +778")
+        self.assertRegex(text, r"session:glaeda-land +REST +583")
+        self.assertIn("not seen: big-red: census has no gh_spend", text)
+        self.assertIn("hard reserve: 500 REST, 500 GraphQL", text)
+        # a refusal (this host is no broker client) is the host sweep, with the reason said
+        gg.LANE_GH_CMD = self.script("lane-gh", "echo 'lane-gh: spend_view: x is not a client of this broker' >&2; "
+                                                "exit 1\n")
+        self.assertEqual(gg.spend_view(), {"ok": False,
+                                           "error": "lane-gh spend_view: lane-gh: spend_view: x is not a client of "
+                                                    "this broker"})
+        gg.LANE_GH_CMD = os.fspath(self.home / "bin" / "absent")
+        self.assertEqual(gg.spend_view()["error"], "no lane-gh here")
+
+    def test_the_host_script_through_a_shell_and_reach_failing(self) -> None:
+        """FLEET_HOST_SCRIPT as a host's shell runs it, parsed back; a reach that refuses or hangs is that host
+        unreachable, never the command failing."""
+        state = self.home / ".cache/glaeda/gh"
+        state.mkdir(parents=True)
+        (state / "budget.json").write_text(json.dumps({"rest": {"remaining": 1}}))
+        (self.home / ".local/bin").mkdir(parents=True)
+        quota = self.home / ".local/bin/gh-quota"
+        quota.write_text('#!/bin/sh\necho \'[{"caller": "session:x", "rest": 5, "graphql": 1}]\'\n')
+        quota.chmod(0o755)
+        env = {k: v for k, v in os.environ.items() if k != "GLAEDA_GH_DIR"}
+        done = subprocess.run(["sh", "-c", gg.FLEET_HOST_SCRIPT], capture_output=True, text=True, timeout=30,
+                              env={**env, "HOME": os.fspath(self.home)})
+        report = gg.parse_host_report(done.stdout)
+        self.assertEqual(report["budget"], {"rest": {"remaining": 1}})
+        self.assertIsNone(report["daemon"])  # no daemon.json there
+        self.assertEqual(report["usage"][0]["caller"], "session:x")
+        self.assertNotIn("truncated", report)
+        # reach is handed the script as one quoted word, the way ssh joins its words
+        gg.REACH_CMD = self.script("reach", 'printf "%s\\n" "$@" > "$0.args"; echo "@@budget"; echo "{}"; '
+                                            'echo "@@end"\n')
+        self.assertEqual(gg.fetch_host("far", False)["budget"], {})
+        args = Path(gg.REACH_CMD + ".args").read_text().splitlines()
+        self.assertEqual(args[:3], ["far", "sh", "-c"])
+        self.assertEqual(shlex.split("\n".join(args[3:])), [gg.FLEET_HOST_SCRIPT])
+        gg.REACH_CMD = self.script("reach", 'echo "reach: no route to far" >&2; exit 4\n')
+        self.assertEqual(gg.fetch_host("far", False)["error"], "unreachable (exit 4: reach: no route to far)")
+        gg.REACH_CMD = self.script("reach", "sleep 30\n")
+        gg.FLEET_HOST_TIMEOUT = 0.5
+        started = time.monotonic()
+        self.assertIn("no answer in 0.5s", gg.fetch_host("far", False)["error"])
+        self.assertLess(time.monotonic() - started, 10)
+        gg.REACH_CMD = os.fspath(self.home / "bin" / "absent")
+        self.assertIn("unreachable", gg.fetch_host("far", False)["error"])
+
+    def test_budget_prints_the_fleet_first_and_json_carries_it(self) -> None:
+        now = time.time()
+        reports = self.reports(now)
+        gg.write_json(gg.BASE / "daemon.json", {"at": now, "heartbeat": 30})
+        lock = open(gg.BASE / "daemon.lock", "a+")
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            with mock.patch.object(gg, "fetch_host", lambda host, local: reports.get(host) or {"error": "unreachable"}), \
+                    mock.patch.object(gg, "spend_view", lambda: {"ok": False, "error": "no lane-gh here"}), \
+                    mock.patch.object(gg, "daemon_stale", return_value=None):
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+                    gg.cmd_budget(False, fleet=True)
+                text = out.getvalue()
+                self.assertTrue(text.startswith("account (the shared login, every host)"), text)
+                self.assertLess(text.index("who spent it"), text.index("daemon: running"))
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+                    gg.cmd_budget(True, fleet=True)
+                self.assertEqual(json.loads(out.getvalue())["fleet"]["hosts"]["far"]["rest"], 2250)
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+                    gg.cmd_budget(True)  # --local: no host is read
+                self.assertNotIn("fleet", json.loads(out.getvalue()))
         finally:
             lock.close()
 
