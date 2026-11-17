@@ -7160,6 +7160,9 @@ LAND_RETRY_MAX = 1800.0
 LAND_REVIEW_WAIT = 3600.0
 LAND_STREAK_STOP = 3  # identical refusals in a row (code, head, step) that stop an entry
 LAND_RETRY_STREAK_STOP = 8  # ... for could-not-judge answers (quota, unreadable), which back off between tries
+# The steps of a could-not-judge answer: a retry, and the mirror fill an unreadable answer names (fetch), whose
+# failures step_refused counts on their own
+LAND_RETRY_KINDS = frozenset({"retry", "fetch"})
 # A quota refusal parks the entry: no judge, read, watch or nudge for it until the reset the refusal names (Leo,
 # 2026-11-17, on Claude desktop's "GitHub rate limit" hover: "this is... interesting. so claude desktop shows rate limit
 # on hover of the github links sometimes..."). Before, every quota-refused entry was judged again about every 5 min
@@ -8316,9 +8319,10 @@ class LandQueue:
             e.pop("quotaRefusals", None)
             if answer.get("ok"):
                 e["streak"] = None
-            elif self.streak(e, f"{answer.get('code')}|{head}|{act.get('kind')}", act.get("kind") == "retry", counts):
+            elif self.streak(e, f"{answer.get('code')}|{head}|{act.get('kind')}", act.get("kind") in LAND_RETRY_KINDS,
+                             counts):
                 self.stop(e, str(answer.get("code") or "refused"),
-                          f"{LAND_STREAK_STOP if act.get('kind') != 'retry' else LAND_RETRY_STREAK_STOP} identical "
+                          f"{LAND_RETRY_STREAK_STOP if act.get('kind') in LAND_RETRY_KINDS else LAND_STREAK_STOP} identical "
                           f"refusals in a row: {land_trim(answer.get('reason'))}", land_trim(answer.get("next")))
                 return
             self.save(e)
