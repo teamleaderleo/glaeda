@@ -8685,7 +8685,7 @@ class LandQueue:
         if not why and not os.path.isdir(mirror):
             why = f"the fetch step's mirror {mirror} is not a directory on this host"
         git = self.path("git", Path(shutil.which("git") or "/usr/bin/git")).as_posix()
-        if not why and form == "git":
+        if not why:  # both forms write into the mirror: its origin must be this PR's repository
             got = self.call([git, "--git-dir", mirror, "config", "--get", "remote.origin.url"],
                             LAND_FETCH_CONFIG_DEADLINE)
             origin = land_fetch_origin(got.stdout or "") if got.returncode == 0 else ""

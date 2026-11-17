@@ -17325,6 +17325,17 @@ class LandTest(Base):
         self.assertEqual((e["state"], e["stop"]["code"], self.fetch_calls()), ("stopped", "policy", []))
         self.assertIn("not github.com/o/r", e["stop"]["reason"])
 
+    def test_the_lane_gh_form_checks_the_mirrors_origin_too(self):
+        # review of glaeda#2108 at 1e968938, F1: lane-gh fetch --dir wrote into a mirror whose origin went unread
+        self.w.origin = "https://github.com/o/other.git"
+        self.pr(LA)
+        self.land()
+        argv = ["lane-gh", "fetch", "o/r", "--dir", self.w.mirror, "--branch", "main"]
+        self.w.answers.append(refusal("unreadable", LA, {"kind": "fetch", "argv": argv}))
+        e = self.tick()
+        self.assertEqual((e["state"], e["stop"]["code"], self.fetch_calls()), ("stopped", "policy", []))
+        self.assertIn("not github.com/o/r", e["stop"]["reason"])
+
     def test_a_failing_fetch_is_a_refused_step(self):
         self.pr(LA)
         self.land()
