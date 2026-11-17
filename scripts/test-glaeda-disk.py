@@ -12444,6 +12444,8 @@ class DeadItemsTest(unittest.TestCase):
         old = self.tart_vm("vm0", 26)  # cmux23: ubase and vm0-vm5, stopped since 2026-10-19
         aside = self.tart_vm("aside-1", 78 / 24)  # one mini, 2026-11-17: idle 78 h and judged "recent" at 14 days
         recent = self.tart_vm("vm1", 1)
+        golden = self.tart_vm("golden", 26)  # only ever cloned: Tart moves the directory's access date, nothing else
+        os.utime(golden, (time.time(), golden.stat().st_mtime))
         claimed = self.tart_vm("vm2", 26)
         (claimed / gd.ROLE_KEEP_MARKER).write_text("{}")
         named = self.tart_vm("vm3", 26)
@@ -12464,6 +12466,7 @@ class DeadItemsTest(unittest.TestCase):
         self.assertEqual(items["vm0"].verdict, "reclaimable", items["vm0"].reasons)
         self.assertEqual(items["aside-1"].verdict, "reclaimable", items["aside-1"].reasons)
         self.assertEqual(items["vm1"].verdict, "recent")
+        self.assertEqual(items["golden"].verdict, "recent", items["golden"].reasons)
         self.assertEqual(items["vm2"].verdict, "kept")
         self.assertEqual(items["vm3"].verdict, "in-use")
         self.assertEqual(items["vm4"].verdict, "in-use")
@@ -12475,7 +12478,7 @@ class DeadItemsTest(unittest.TestCase):
         self.assertFalse(old.exists())
         self.assertFalse(aside.exists())
         self.assertTrue(locked.exists(), "the run lock is read again right before the delete")
-        for vm in (recent, claimed, named):
+        for vm in (recent, golden, claimed, named):
             self.assertTrue(vm.exists())
 
     def test_journey_cache_entries_unused_for_days_go(self) -> None:

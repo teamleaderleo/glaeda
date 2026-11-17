@@ -8668,10 +8668,13 @@ def tart_restore_access() -> None:
 
 
 def tart_seen(fam: Family, items: list[Path]) -> None:
-    """Read each image's access dates before anything of this run walks it (TART_ACCESS)."""
+    """Read each image's and VM's access dates before anything of this run walks it (TART_ACCESS)."""
     if fam.id == TART_IMAGES:
         for item in items:
             tart_last_use(item)
+    elif fam.id == TART_VMS:
+        for item in items:
+            tart_vm_last_use(item)
 
 
 def tart_installed() -> bool:
@@ -8688,11 +8691,13 @@ def tart_idle_hours() -> float:
 def tart_vm_last_use(path: Path) -> float:
     """A local Tart VM's last use: the VM directory's mtime and the newest mtime or atime of its files (config.json,
     disk.img, nvram.bin), read with lstat only. `tart run` writes the disk and nvram, `tart clone` from it reads the
-    disk. The directory's own atime is left out: the survey's du lists the directory and moves it."""
+    disk. The directory's own atime counts as this run first saw it (TART_ACCESS, handed back at the run's end): the
+    survey's du lists the directory and moves it, and a golden VM that is only ever cloned may move nothing else."""
     try:
-        newest = path.lstat().st_mtime
+        st = path.lstat()
     except OSError:
         return 0.0
+    newest = max(st.st_mtime, tart_access(path, st))
     for e in _entries(path):
         with contextlib.suppress(OSError):
             st = e.stat(follow_symlinks=False)
@@ -8768,6 +8773,7 @@ def candidates(fam: Family) -> list[Path]:
             level = [p for p in level if nightly_next_fallback(p)]
         if fam.app_clones:
             level = keep_live_app_clones(level)
+        tart_seen(fam, level)
     # an aside tree (remove()'s rename) is the interrupted-deletions family's alone, whatever family's root holds it
     if fam.id == INTERRUPTED:
         level = [p for p in level if DELETING_RE.fullmatch(p.name)]
