@@ -517,7 +517,10 @@ What `--apply` does:
        a dict of `afterMin`, `spreadMin` and `maxHoldMin`, each at most 120) sets it by default or
        per host; `GLAEDA_RUNNER_STARVED_RESERVE=off` turns it off. The gate logs each hold and
        release, and a held-off listener's line says "N are kept for a starved job of a root
-       runner's label".
+       runner's label". Before a hold starts, one unauthenticated read of the public job on GitHub
+       confirms it still queues: the feed can keep a job cancelled before it started as queued for
+       hours, and a job GitHub says left the queue never gets a hold here. A read that fails holds
+       nothing and is asked again.
      - The gui runner is never held for CPU saturation (85% busy), only for memory
        pressure: its jobs come one per mini and are admitted by units like any other,
        and the CPU mark held it whenever the other lanes kept the mini busy. Nothing
