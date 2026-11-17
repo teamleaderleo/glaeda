@@ -869,6 +869,55 @@ class LanSeedTest(PrefetchBase):
         self.assertIn("Local Network Privacy", lan["reason"])
         self.assert_clean()
 
+    def archive_config(self, seeder: str, addresses: list[str] | None = None) -> None:
+        (self.conf / "config.json").write_text(json.dumps({"schema": 1, "seeder": seeder, "user": "cmux",
+                                                           "addresses": addresses or ["172.20.21.158"]}))
+
+    def test_archive_list_is_recorded_for_glaeda_disk_when_the_seeder_is_the_archive(self):
+        self.record(self.state)
+        old, head = self.commit(), self.commit()
+        self.seeder_keeps(old)
+        self.seeder_keeps(head)
+        self.archive_config("cmux-lawrence", ["172.20.21.157", "172.20.21.158"])
+        os.environ["FAKE_UNREACHABLE"] = "172.20.21.157"  # the next address answers
+        record = sp.run(True, self.state)
+        self.assertEqual(record["archive_list"], {"state": "listed", "count": 2, "address": "172.20.21.158"})
+        listed = json.loads((self.state / ".prefetch" / sp.ARCHIVE_LIST).read_text())
+        self.assertEqual((listed["schema"], listed["seeder"]), (1, "cmux-lawrence"))
+        self.assertEqual(sorted(listed["keys"]), sorted([self.key(old), self.key(head)]))
+        self.assertLessEqual(abs(listed["time"] - time.time()), 60)
+        self.assertEqual(list((self.state / ".prefetch").glob(f".{sp.ARCHIVE_LIST}.*")), [])
+        # a plan never asks
+        self.ssh_log.unlink()
+        sp.run(False, self.state)
+        self.assertFalse(self.ssh_log.exists())
+
+    def test_a_failed_archive_list_keeps_the_last_one_and_bounds_the_wait(self):
+        self.record(self.state)
+        self.commit()
+        self.archive_config("cmux-lawrence")
+        os.environ["FAKE_SSH_MODE"] = "silent"
+        started = time.monotonic()
+        got = sp.record_archive_list(self.state, sp.lan_config(), timeout=1.0)
+        self.assertLess(time.monotonic() - started, 10)
+        self.assertEqual(got, {"state": "error", "reason": "seed-list-v1 timed out"})
+        self.assertFalse((self.state / sp.ARCHIVE_LIST).exists())
+        os.environ["FAKE_SSH_MODE"] = "busy"
+        self.assertEqual(sp.record_archive_list(self.state, sp.lan_config())["reason"], "seeder: busy")
+
+    def test_a_mini_reading_the_trusted_seeder_never_lists_it(self):
+        # the seeder's glaeda-disk reads a client that lists as the archive's filler (archived_seeds)
+        self.record(self.state)
+        self.seeder_keeps(self.commit())
+        for config in ({"schema": 1, "seeder": "cmux15", "user": "cmux", "addresses": ["172.20.21.202"]},
+                       {"schema": 1, "user": "cmux", "addresses": ["172.20.21.202"]}):
+            (self.conf / "config.json").write_text(json.dumps(config))
+            record = sp.run(True, self.state)
+            self.assertEqual(record["archive_list"]["state"], "off")
+            asked = [json.loads(line)[-1] for line in self.ssh_log.read_text().splitlines()]
+            self.assertNotIn("seed-list-v1", asked)
+            self.assertFalse((self.state / ".prefetch" / sp.ARCHIVE_LIST).exists())
+
     def test_every_bad_stream_leaves_the_cache_as_it_was(self):
         self.record(self.state)
         head = self.commit()

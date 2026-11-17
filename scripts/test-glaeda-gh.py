@@ -16603,6 +16603,11 @@ class LandTest(Base):
         paths = mock.patch.object(gg, "LAND_MERGE_HOLD_PATHS", (Path(self.w.mh),))
         paths.start()
         self.addCleanup(paths.stop)
+        # The login's latch marks: a test dir, never the host's (a dry login on the test host would park every test).
+        self.latch_dir = Path(self.tmp.name) / "gh-quota"
+        state = mock.patch.dict(os.environ, {"GH_QUOTA_STATE": os.fspath(self.latch_dir)})
+        state.start()
+        self.addCleanup(state.stop)
         self.t = NOW
         self.q = self.queue()
 
@@ -16990,6 +16995,111 @@ class LandTest(Base):
         for _ in range(5):
             self.tick()
         self.assertEqual(len(self.w.explains()), 1)
+
+    def latch(self, pool: str, until: float, **more: Any) -> None:
+        self.latch_dir.mkdir(parents=True, exist_ok=True)
+        (self.latch_dir / f"{pool}-exhausted.json").write_text(json.dumps(
+            {"until": until, "at": self.t, "reset": until, "source": "x-ratelimit-reset", "by": "test",
+             "identity": "login", **more}))
+
+    def reads(self) -> tuple[int, int, int, int]:
+        """Everything the queue sent or asked for: explains, gh calls, nudges, watches."""
+        return (len(self.w.explains()), len([c for c in self.w.calls if c[0] == os.fspath(self.w.gh)]),
+                len(self.w.nudged), len(self.w.watched))
+
+    def test_quota_refusal_parks_with_zero_reads_until_the_named_reset(self):
+        """gh-quota-spiral (2026-11-17): a quota refusal was judged again every ~5 min while the login was dry, each
+        judge spending merge_hold's reads (glaeda-land 549 REST / 360 GraphQL an hour on gcp-agent-lane-5)."""
+        self.pr(LA)
+        self.land()
+        reset = self.t + 1800
+        at = time.strftime("%H:%M", time.gmtime(reset))
+        self.w.answers.append(refusal("quota", LA, {"kind": "retry", "after_s": 300},
+                                      reason=f"quota: not judged, retry after {at}Z (reset); no attempt before {at}Z"))
+        e = self.tick()
+        said = gg.land_quota_said(f"no attempt before {at}Z", self.t)
+        jitter = gg.land_jitter(self.KEY)
+        self.assertEqual((e["state"], e["wait"]["kind"], e["wakeAt"]), ("waiting", "quota", said + jitter))
+        self.assertTrue(0 <= said + jitter - reset <= 59 + gg.LAND_QUOTA_JITTER)
+        self.assertIsNone(e.get("streak"))
+        self.assertIn(f"parked until {time.strftime('%H:%MZ', time.gmtime(said + jitter))} (quota)",
+                      gg.land_line(e, self.t))
+        before = self.reads()
+        self.pr(LB)  # even a new head is not read or judged while parked
+        while self.t + 60 < said + jitter:
+            self.tick(60)
+        self.assertEqual(self.reads(), before)
+        self.w.answers.append(ok_answer(LB))
+        self.tick(61)
+        self.assertEqual(len(self.w.explains()), 2)
+        self.assert_merged_at(LB)
+
+    def test_a_merge_the_shim_refuses_for_quota_parks_without_a_pr_view(self):
+        self.pr(LA)
+        self.land()
+        reset = self.t + 900
+        at = time.strftime("%H:%M", time.gmtime(reset))
+        real = self.w.run
+
+        def quota_merge(argv, timeout, env):
+            if argv[1:3] == ["pr", "merge"]:
+                self.w.calls.append(list(argv))
+                return subprocess.CompletedProcess(argv, 1, "", "merge-hold: refused [quota: not judged, retry]: "
+                                                   f"quota: not judged, retry after {at}Z (reset); no attempt before {at}Z")
+            return real(argv, timeout, env)
+        self.q.run = quota_merge
+        self.w.answers.append(ok_answer(LA))
+        e = self.tick()
+        self.assertEqual((e["state"], e["wait"]["kind"]), ("waiting", "quota"))
+        self.assertEqual(self.w.gh_calls("pr", "view"), [])
+        self.assertGreaterEqual(e["wakeAt"], reset)
+
+    def test_a_held_latch_skips_every_judge(self):
+        self.pr(LA)
+        self.land()
+        self.latch("graphql", self.t + 600)
+        for _ in range(10):
+            e = self.tick(30)
+        self.assertEqual(self.reads(), (0, 0, 0, 0))
+        self.assertEqual(e["state"], "queued")
+        self.assertEqual(gg.read_json(gg.land_dir() / gg.LAND_LATCH_FILE)["pool"], "graphql")
+        # A lane-share mark is the broker's refusal of a VM's share, which a land passes: it holds nothing here.
+        self.latch("graphql", self.t, share=True)
+        self.latch("rest", self.t + 600, share=True)
+        self.w.answers.append(ok_answer(LA))
+        self.tick(1)
+        self.assert_merged_at(LA)
+        self.assertFalse((gg.land_dir() / gg.LAND_LATCH_FILE).exists())
+
+    def test_jitter_is_within_the_spread_and_fixed_per_caller(self):
+        keys = [f"pr:o/r#{n}" for n in range(200)]
+        offsets = [gg.land_jitter(k) for k in keys]
+        self.assertTrue(all(0 <= j <= gg.LAND_QUOTA_JITTER for j in offsets))
+        self.assertGreater(len(set(offsets)), 50)  # spread over the window, not one second
+        self.assertEqual(offsets, [gg.land_jitter(k) for k in keys])
+
+    def test_a_quota_refusal_with_no_time_backs_off_exponentially(self):
+        self.pr(LA)
+        self.land()
+        gaps = []
+        for _ in range(6):
+            self.w.answers.append(refusal("quota", LA, {"kind": "retry", "after_s": 300},
+                                          reason="merge-hold: refused: REST reserve"))
+            judged = len(self.w.explains())
+            e = self.tick(1) if judged == 0 else self.tick(e["wakeAt"] - self.t)
+            self.assertEqual(len(self.w.explains()), judged + 1)
+            gaps.append(e["wakeAt"] - self.t)
+            self.tick(min(60, gaps[-1] - 1))
+            self.assertEqual(len(self.w.explains()), judged + 1)
+        self.assertEqual(gaps, [300, 600, 1200, 2400, 3600, 3600])
+        self.assertEqual(e["state"], "waiting")  # a dry login never stops the entry
+
+    def test_quota_said_reads_the_named_time(self):
+        now = float(gg.dt.datetime(2026, 11, 17, 7, 0, 5, tzinfo=gg.dt.timezone.utc).timestamp())
+        said = gg.land_quota_said("quota: not judged, retry after 07:37Z (reset); no attempt before 07:37Z", now)
+        self.assertEqual(said - now, 37 * 60 + 59 - 5)
+        self.assertIsNone(gg.land_quota_said("merge-hold: refused: REST reserve", now))
+        self.assertIsNone(gg.land_quota_said("no attempt before 09:30Z", now))  # past GitHub's hour
 
     def test_a_bad_request_or_entry_never_stalls_the_queue(self):
         gg.LandQueue.requests_dir().mkdir(parents=True, exist_ok=True)
