@@ -482,6 +482,22 @@ What `--apply` does:
        `hostLoadCap` in `config/runner-gate.json` sets the cap (a number, `false` for off) by
        default or per host; `CMUX_CI_HOST_LOAD_CAP` in the runner LaunchAgent's environment wins,
        and `off` or 0 turns it off.
+     - **Memory cap** (`MEMORY_CAP`, cmuxterm-hq#12838). The 16 GiB minis (cmux17, 18, 21, 22)
+       showed macOS's "out of application memory" panel running 4-6 jobs: on 2026-11-16 at 22:34Z
+       cmux17's JetsamEvent killed a dozen daemons for low swap while eight `swift-frontend`
+       processes held 2.8-6.5 GiB each. The memory-pressure hold reacts only once Darwin is already
+       compressing and swapping. So an idle listener also reads what a new job could get without
+       compression or swap: free, purgeable and file-backed pages (one `sysctl`).
+       Under `needGiB` (4), or at memory pressure level 2 or more, it takes no new job, and listens
+       again at `resumeGiB` (5) and normal pressure. It never strands or fails a job; it only
+       defers. While another host's listener keeps up with the label (the load cap's feed) it
+       holds. An urgent or pinned job queued, a job of its label waiting `maxWaitMin` (10), or a
+       hold that long with no other listener known to keep up, and it listens until memory
+       recovers: the job runs here, slower. When memory recovers, one held listener on a mini resumes at a time, 90 s apart (`mem-cap-start` in the state dir), as a new job's compile peaks minutes after it starts; `maxWaitMin` above 60 is not a setting. The nightly, freshness, gateway and dedicated runners
+       are exempt; the gui and session runners are not, as they are held for memory pressure too.
+       `memoryCap` in `config/runner-gate.json` (`true`, `false`, or a dict of `needGiB`,
+       `resumeGiB` and `maxWaitMin`) sets it by default or per host; `GLAEDA_RUNNER_MEMORY_CAP=off`
+       in the runner LaunchAgent's environment turns it off.
      - The gui runner is never held for CPU saturation (85% busy), only for memory
        pressure: its jobs come one per mini and are admitted by units like any other,
        and the CPU mark held it whenever the other lanes kept the mini busy. Nothing
@@ -1583,22 +1599,34 @@ on the label, or a job could wait for a label no online runner has.
 Hook classes:
 
 - `mobile-core-package` is `isolated` (3 units, `JOB_CORES`; own SwiftPM `.build`, no canonical root).
-- `ios-simulator-build` (3 units, `JOB_CORES`) builds and then boots the simulator to run its tests. On a mini with
-  one sim slot it stays `isolated`, as before (no token, up to 3 at once); above one (`SIM_SLOT_JOBS`) it is a
-  `simulator` job at its own cost: a token copy, `GLAEDA_SIM_SLOT`, and the sim-first runner takes it.
+- `ios-simulator-build` (3 units, `JOB_CORES`) builds and then boots the simulator to run its tests. On a mini
+  whose simulator ceiling is 1 it stays `isolated`, as before (no token, up to 3 at once); above one
+  (`SIM_SLOT_JOBS`) it is a `simulator` job at its own cost: a token copy, `GLAEDA_SIM_SLOT`, and the sim-first
+  runner takes it.
 - `ios-simulator` and `screenshots` are `simulator` (1 unit, p75 0.28 cores per job), plus a copy of the
   `simulator` token: they reuse, erase and boot named devices in the user's one CoreSimulator service. A job
   refused only for that token waits for it at job start, as any capacity wait does.
-- `runner.classes.<class>.simSlots` (1 to 4, default 1; a member without the simulator role keeps 1) gives the
-  hook `--sim-slots N`: the token comes in N copies (`simulator`, `simulator-1`, ...), and the job is told its copy
-  as `GLAEDA_SIM_SLOT` in `$GITHUB_ENV` and `$RUNNER_TEMP/glaeda-sim-slot` (a ci-step: `sim_slot` in its admit
-  answer), so a workflow can boot devices of its own slot. A copy past the first is admitted only with headroom,
-  the rule leo-workspace#5539 uses for lanes, and the refusal names the term that failed: load1 under 0.75 of the
-  cores, memory pressure under level 2, swap under 10% used (`vm.swapusage`, parsed as cmuxterm-hq's worker
-  does), and, with the RAM ledger off, one more job of the class's measured RAM plus the floor within the host's
-  RAM. The sim-first runner listens while any copy is free (a later one only with that headroom). glaeda-disk's
-  device eraser holds every copy. Above 1, the mini's `glaeda-ios-sim` runners and its sim-first runner also carry
-  `glaeda-sim-slots-<N>`, from which cmux's iOS picker (cmux#44908) learns the slot count.
+- Simulator copies are dynamic (`SIM_DYNAMIC`; Leo, 2026-11-17: "hm why 3 tho shouldn't this be more dynamic? i
+  think it's finally time to start getting these things done"). No count is set by hand: the token comes in copies
+  (`simulator`, `simulator-1`, ...), and the job is told its copy as `GLAEDA_SIM_SLOT` in `$GITHUB_ENV` and
+  `$RUNNER_TEMP/glaeda-sim-slot` (a ci-step: `sim_slot` in its admit answer), so a workflow can boot devices of its
+  own slot. Copy 0 is always admissible; a later copy only while, measured now, one more simulator keeps the host
+  under the 80% line, and the refusal names the term that failed:
+  - free RAM (`kern.memorystatus_level`) less one simulator's RSS stays at least 20% of the RAM;
+  - load1 under 0.8 of the cores;
+  - memory pressure green (level 1);
+  - swap not growing (used swap rose under 256 MiB in 5 minutes; `vm.swapusage`, parsed as cmuxterm-hq's worker
+    does).
+  The only number is a hard ceiling computed on the host: floor((RAM - reserve) / one simulator's p95 RSS), the
+  reserve being 20% of the RAM (at least the RAM floor). One simulator's RSS comes from the needs file (the
+  `simulator` class row, else `test-ios.yml/ios-simulator-build`; `rss_peak_mib_p95`, else `rss_peak_mib_p90`),
+  else 4.5 GiB. `glaeda-cmux-runner-hook needs` prints the ceiling and where it came from. The sim-first runner
+  listens while any copy is admissible. glaeda-disk's device eraser holds `simulator-copies.gate` and every copy;
+  a copy past the first is taken only under that gate shared. Kill switch: `GLAEDA_SIMULATORS_OFF=1` in the runner
+  environment, or `touch` `simulators.off` in the capacity ledger (live), and no simulator copy is taken.
+  `runner.classes.<class>.simSlots` and the hook's `--sim-slots` are ignored (a deprecation line says so). No label
+  carries a simulator count: a simulator mini has `glaeda-ios-sim` alone (`glaeda-sim-slots-<N>` is no longer
+  written), and its sim-first runner is online exactly while one more simulator is admissible.
 - A build worker's `simulator` ci-step (cmuxterm-hq's `scripts/ci/cmux-next-ios-sim.sh` steps) is admitted only on
   a mini where a runner registered with `glaeda-ios-sim` (its install receipt says so). It takes the same
   `simulator` token, plus an isolated build's 4 units because it also builds the app, and holds them until

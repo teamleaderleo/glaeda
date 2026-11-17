@@ -14,6 +14,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import signal
 import stat
 import subprocess
@@ -21,6 +22,7 @@ import sys
 import tempfile
 import threading
 import time
+import types
 import socket
 import unittest
 import urllib.parse
@@ -12868,6 +12870,21 @@ class SpendAlarmTest(Base):
         self.assertEqual((lines[0]["pace"], lines[0]["spent"], lines[0]["cap"]), (480, 80, 300))
         self.assertIn("nothing to do, projection only", lines[0]["note"])
 
+    def test_the_share_alarm_ignores_a_few_reads_under_a_cap_of_zero(self) -> None:
+        """A restShare of 0 reads over GraphQL only; its exempt reads (1 and 5 an hour) are not spend to page on, but
+        spend past the floor is."""
+        self.policy()
+        self.daemon.policy = {**self.daemon.policy, "restShare": 0.0}
+        self.assertEqual(self.daemon.rest_cap(), 0)
+        minute = int(self.daemon.clock() // 60)
+        for n in (1, 5, 50):
+            self.daemon.rest_minutes = {minute: n}
+            self.assertIsNone(self.daemon.share_alarm(0, []), n)
+        self.daemon.rest_minutes = {minute: 51}
+        alarm = self.daemon.share_alarm(0, [])
+        self.assertIsNotNone(alarm)
+        self.assertIn("past its cap of 0", alarm[1])
+
     def test_the_share_alarm_fires_on_the_measured_hour_and_names_the_waiter_to_shed(self) -> None:
         """Past the cap over the measured trailing hour (what the cap exempts, or a restYield), the alarm names the
         waiter whose reads spent most, so whoever hears it has one thing to do."""
@@ -15317,6 +15334,118 @@ class ScarceWaitedFirstTest(Base):
         self.assertEqual(due[1:], [f"pr:o/r#{n}" for n in (8, 6, 5, 4, 3, 2, 1)], "the rest: oldest deferral first")
 
 
+class LandSnapshotTest(Base):
+    """glaeda-gh land reads check state from the daemon's PR read, not a read per queued PR (cosmic-gray, 2026-11-17:
+    session glaeda-land was the shared login's top caller, 606 REST in an hour, mostly `commits/SHA/check-runs` reads
+    merge_hold explain made for each queued PR at each judgment). For each PR the land queue holds, a full read keeps
+    the head's raw rollup (ROLLUP_DIR); a probe that confirms it keeps it; only a new head or fingerprint reads again."""
+
+    N = 10
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.gh.counts = True
+        for n in range(1, self.N + 1):
+            self.gh.prs[("o", "r", n)] = pr_node(n, rollup="PENDING", checks=[
+                dict(check_run("a"), databaseId=10 * n, checkSuite={"databaseId": n, "app": {"slug": "github-actions"},
+                                                                     "workflowRun": {"databaseId": 900 + n,
+                                                                                     "event": "pull_request",
+                                                                                     "workflow": {"name": "CI",
+                                                                                                  "databaseId": 77}}}),
+                {"__typename": "StatusContext", "context": "ws-check", "state": "PENDING", "description": "queued"}])
+            gg.register(gg.parse_key("pr", f"o/r#{n}"), waited=True)
+        self.land = types.SimpleNamespace(lock=threading.RLock(), jobs={}, tick=lambda now=None: None,
+                                          reap=lambda: None,
+                                          entries={f"pr:o/r#{n}": {"state": "queued"} for n in range(1, self.N + 1)})
+        self.daemon.land_queue = self.land
+
+    def cycle(self, k: int) -> dict:
+        at = NOW + gg.CYCLE * k
+        for n in range(1, self.N + 1):
+            path = gg.watch_dir() / gg.file_name(f"pr:o/r#{n}")
+            os.utime(path, (at, at))
+        return self.daemon.tick(at)
+
+    def pr_reads(self, since: int = 0) -> list[int]:
+        """The PR numbers each PR query (full or probe) since call SINCE asked for, in order."""
+        out = []
+        for _, url, _, body in self.gh.calls[since:]:
+            if url.endswith("/graphql") and b"pullRequest(number:" in body:
+                v = json.loads(body)["variables"]
+                out += [v[f"n{i}"] for i in range(100) if f"n{i}" in v]
+        return out
+
+    def test_ten_queued_prs_over_five_ticks_cost_one_read_per_head_per_tick_and_no_check_runs(self) -> None:
+        per_tick = []
+        for k in range(5):
+            mark = len(self.gh.calls)
+            status = self.cycle(k)
+            self.assertEqual(status["errors"], [])
+            reads = self.pr_reads(mark)
+            self.assertEqual(sorted(reads), sorted(set(reads)), "at most one read of each PR in a tick")
+            per_tick.append(len(reads))
+        self.assertEqual(per_tick, [self.N] * 5)
+        self.assertEqual((self.gh.full_reads, self.gh.probes), (1, 4), "one full read, then one probe a tick")
+        rest = [url for _, url, _, _ in self.gh.calls if "check-runs" in url or "/status" in url]
+        self.assertEqual((rest, self.gh.named_calls), ([], []), "no check-runs read, by name or otherwise")
+        for n in range(1, self.N + 1):
+            key = f"pr:o/r#{n}"
+            snap, cache = gg.read_rollup(key), gg.read_cache(key)
+            self.assertEqual((snap["head"], snap["fp"], snap["complete"]), ("a" * 40, cache["fp"], True))
+            check, status_node = snap["rollup"]["nodes"]
+            # the fields merge_hold's HEAD_REDS_QUERY reads, as GitHub gave them
+            self.assertEqual((check["databaseId"], check["checkSuite"]["databaseId"],
+                              check["checkSuite"]["workflowRun"]["event"]), (10 * n, n, "pull_request"))
+            self.assertEqual(status_node["description"], "queued")
+        query = [json.loads(b)["query"] for _, u, _, b in self.gh.calls if u.endswith("/graphql")
+                 and b"pullRequest(number:" in b and b"checkSuites(first: 1) { totalCount }" not in b][0]
+        for field in ("databaseId conclusion app { slug }", "workflowRun { databaseId event workflow",
+                      "context state description"):
+            self.assertIn(field, query)
+
+    def test_a_new_head_is_read_in_full_once_and_its_snapshot_follows(self) -> None:
+        self.cycle(0)
+        self.gh.prs[("o", "r", 3)]["headRefOid"] = "b" * 40
+        mark, full = len(self.gh.calls), self.gh.full_reads
+        self.cycle(1)
+        # the batch's probe shows the change, and the one full read it needs (the daemon's way, land or not)
+        self.assertEqual((self.pr_reads(mark).count(3), self.gh.full_reads - full), (2, 1))
+        self.assertEqual(gg.read_rollup("pr:o/r#3")["head"], "b" * 40)
+        self.assertEqual(gg.read_rollup("pr:o/r#3")["fp"], gg.read_cache("pr:o/r#3")["fp"])
+
+    def test_a_land_pr_with_no_snapshot_is_read_in_full_not_probed(self) -> None:
+        self.land.entries = {}
+        self.cycle(0)
+        self.assertIsNone(gg.read_rollup("pr:o/r#2"), "no land PR, no snapshot")
+        self.land.entries = {"pr:o/r#2": {"state": "queued"}}
+        full = self.gh.full_reads
+        self.cycle(1)
+        self.assertEqual(self.gh.full_reads, full + 1, "the queued PR's next read is a full one, once")
+        self.assertEqual(gg.read_rollup("pr:o/r#2")["head"], "a" * 40)
+        self.assertIsNone(gg.read_rollup("pr:o/r#5"))
+        self.cycle(2)
+        self.assertEqual(self.gh.full_reads, full + 1)
+
+    def test_every_page_of_a_long_rollup_is_kept_and_nothing_folded_in(self) -> None:
+        nodes = [dict(check_run(f"c{i}"), databaseId=5000 + i) for i in range(150)]
+        node = self.gh.prs[("o", "r", 1)]
+        contexts = node["commits"]["nodes"][0]["commit"]["statusCheckRollup"]["contexts"]
+        contexts.update(nodes=nodes[:100], totalCount=150, pageInfo={"hasNextPage": True, "endCursor": "100"})
+        self.gh.heads[("o", "r", "a" * 40)] = nodes
+        self.cycle(0)
+        snap = gg.read_rollup("pr:o/r#1")
+        self.assertTrue(snap["complete"])
+        self.assertEqual([c["databaseId"] for c in snap["rollup"]["nodes"]], [5000 + i for i in range(150)])
+
+    def test_finished_land_prs_lose_their_snapshots(self) -> None:
+        self.cycle(0)
+        self.land.entries = {"pr:o/r#1": {"state": "queued"}, "pr:o/r#2": {"state": "merged"}}
+        self.daemon.rollup_swept = float("-inf")
+        self.cycle(1)
+        self.assertIsNotNone(gg.read_rollup("pr:o/r#1"))
+        self.assertIsNone(gg.read_rollup("pr:o/r#2"))
+
+
 class PrProbeTest(Base):
     """2026-11-11: the shared GraphQL quota ran out four times in a day and every session's PR data went stale with it.
     PR reads were 1,550 of the two daemons' ~2,000 points an hour, each one the full PR (about 1.4 points a PR) again
@@ -16827,7 +16956,14 @@ class LandWorld:
         Path(self.mh).parent.mkdir(parents=True, exist_ok=True)
         Path(self.mh).write_text("raise SystemExit('not run in tests')\n")
         self.config = {"gh": os.fspath(self.gh), "mergeHold": self.mh, "acpmux": "/fake/acpmux",
-                       "python": "/fake/python3", "routerReview": "/fake/router-review"}
+                       "python": "/fake/python3", "routerReview": "/fake/router-review", "git": "/fake/git",
+                       "laneGh": "/fake/lane-gh"}
+        # A fetch step's mirror: a real (empty) directory, its origin what the fake git config answers.
+        self.mirror = os.fspath(Path(tmp) / "mirrors" / "r.git")
+        Path(self.mirror).mkdir(parents=True, exist_ok=True)
+        self.origin = "https://github.com/o/r.git"
+        self.fetch_rc = 0
+        self.fetch_err = "fatal: unable to access 'https://github.com/o/r.git/': Could not resolve host"
 
     def set_pr(self, key: str, data: dict, fetched: float) -> None:
         self.cache[key] = {"key": key, "data": data, "fetchedAt": fetched, "dataAt": fetched}
@@ -16842,6 +16978,10 @@ class LandWorld:
             return subprocess.CompletedProcess(argv, rc, json.dumps(doc) + "\n", "")
         if argv[0] == "/fake/acpmux":
             return subprocess.CompletedProcess(argv, 0, "", "")
+        if argv[0] == "/fake/git" and argv[3:] == ["config", "--get", "remote.origin.url"]:
+            return subprocess.CompletedProcess(argv, 0 if self.origin else 1, self.origin + "\n", "")
+        if argv[0] in ("/fake/git", "/fake/lane-gh"):
+            return subprocess.CompletedProcess(argv, self.fetch_rc, "", "" if self.fetch_rc == 0 else self.fetch_err)
         if argv[0] == os.fspath(self.gh):
             words = argv[1:]
             if words[:2] == ["pr", "view"]:
@@ -16877,12 +17017,18 @@ class LandTest(Base):
 
     def setUp(self) -> None:
         super().setUp()
+        self.snaps: dict[str, dict] = {}  # key -> the daemon's rollup snapshot (ROLLUP_DIR), as read_rollup gives it
         self.w = LandWorld(self.tmp.name)
         # The CLI (`glaeda-gh land`) resolves merge_hold.py from the host's land.json and defaults: pin the defaults to
         # the fake one, so the tests never depend on the host having a leo-workspace checkout (a CI runner has none).
         paths = mock.patch.object(gg, "LAND_MERGE_HOLD_PATHS", (Path(self.w.mh),))
         paths.start()
         self.addCleanup(paths.stop)
+        # Not a lane VM unless a test says so: the host's own lane-gh wrapper never decides the update-branch form.
+        self.lane_client = Path(self.tmp.name) / "lane-gh" / "gh"
+        lane = mock.patch.object(gg, "LAND_LANE_GH_CLIENT", self.lane_client)
+        lane.start()
+        self.addCleanup(lane.stop)
         # The login's latch marks: a test dir, never the host's (a dry login on the test host would park every test).
         self.latch_dir = Path(self.tmp.name) / "gh-quota"
         state = mock.patch.dict(os.environ, {"GH_QUOTA_STATE": os.fspath(self.latch_dir)})
@@ -16895,9 +17041,11 @@ class LandTest(Base):
         return gg.LandQueue(run=self.w.run, cache_of=self.w.cache.get, watch=self.w.watched.append,
                             nudge=self.w.nudged.append, notice=lambda *a: self.w.notices.append(a), inline=True,
                             config=self.w.config, reads_upstream=lambda: self.upstream, refresh=self.refresh,
-                            behind=lambda *a: self.stale_why)
+                            behind=lambda *a: self.stale_why, broker_client=lambda: self.broker,
+                            snapshot_of=self.snaps.get)
 
     stale_why: str | None = None  # what the checkout-staleness check answers
+    broker = False  # this host's gh is lane-gh's broker client (a lane VM)
 
     upstream = False  # this host reads PRs through an upstream (a lane VM)
     fresh_head: str | None = None  # what a direct read (refresh) stores, or None for a read that fails
@@ -16963,6 +17111,108 @@ class LandTest(Base):
         counts = gg.land_counts()[gg.land_day(self.t)]
         self.assertEqual((counts["update_branch"], counts["merge"], counts["explain"]), (1, 1, 2))
 
+    def test_a_lane_vm_update_branch_takes_the_broker_form_pinned(self):
+        # hq#12553, hq#12590, cmux#45254 (2026-11-17): on a lane VM the broker refuses `gh api -X PUT` (only a media
+        # upload goes through), so every update-branch exited 1 and three identical refusals stopped the entry. The
+        # broker takes `gh pr update-branch N -R O/R --match-head-commit SHA [--needs-newer-base CHECK]...`.
+        self.broker = True
+        self.q = self.queue()
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(refusal("stale_green", LA, {"kind": "update_branch", "expected_head_sha": LA,
+                                                          "needs_newer_base": ["ws-check", "build (macos, arm64)"]},
+                                      nxt=f"gh api -X PUT repos/o/r/pulls/1/update-branch -f expected_head_sha={LA}"))
+        e = self.tick()
+        self.assertEqual(self.w.gh_calls("api"), [])
+        self.assertEqual(self.w.gh_calls("pr", "update-branch"),
+                         [["pr", "update-branch", "1", "-R", "o/r", "--needs-newer-base", "ws-check",
+                           "--needs-newer-base", "build (macos, arm64)", "--match-head-commit", LA]])
+        self.assertEqual((e["state"], e["wait"]["kind"], e["wait"]["before"]), ("waiting", "head_change", LA))
+
+    def test_a_host_with_its_own_login_keeps_the_pinned_rest_update_branch(self):
+        # gh's own `pr update-branch` takes no head: off a lane VM the pinned REST PUT stays.
+        self.assertFalse(gg.land_broker_client(Path(self.tmp.name) / "no-such-client"))
+        client = Path(self.tmp.name) / "lane-gh-gh"
+        client.write_text("#!/bin/sh\nexec lane-gh-credential gh \"$@\"\n")
+        self.assertTrue(gg.land_broker_client(client))
+        self.assertEqual(gg.land_update_branch_args("o/r", "1", LA, ["ws-check"], False),
+                         ["api", "-X", "PUT", "repos/o/r/pulls/1/update-branch", "-f", f"expected_head_sha={LA}"])
+        self.assertEqual(gg.land_update_branch_args("o/r", "1", LA, [], True),
+                         ["pr", "update-branch", "1", "-R", "o/r", "--match-head-commit", LA])
+
+    NODES = [{"__typename": "CheckRun", "name": "ci", "status": "COMPLETED", "conclusion": "SUCCESS",
+              "databaseId": 7, "isRequired": True, "checkSuite": {"databaseId": 3, "app": {"slug": "github-actions"},
+                                                                  "workflowRun": None}}]
+
+    def snap_pr(self, head: str, fp: str = "F1", snap_head: str | None = None, complete: bool = True) -> None:
+        """The cache at HEAD with fingerprint FP, and the daemon's snapshot at SNAP_HEAD (None: no snapshot)."""
+        self.pr(head)
+        self.w.cache[self.KEY]["fp"] = fp
+        if snap_head is not None:
+            self.snaps[self.KEY] = {"schema": gg.ROLLUP_SCHEMA, "key": self.KEY, "head": snap_head, "fp": fp,
+                                    "complete": complete, "readAt": self.t, "rollup": {"nodes": self.NODES}}
+
+    def explain_env(self, n: int = -1) -> dict:
+        return [env for argv, env in zip(self.w.calls, self.w.envs) if argv[1:3] == [self.w.mh, "explain"]][n]
+
+    def test_explain_judges_the_daemons_snapshot_and_the_merge_reads_live(self):
+        self.snap_pr(LA, snap_head=LA)
+        self.land()
+        self.w.answers.append(ok_answer(LA))
+        self.tick()
+        env = self.explain_env()
+        doc = json.loads(Path(env[gg.LAND_SNAPSHOT_ENV]).read_text())
+        self.assertEqual((doc["schema"], doc["repo"], doc["number"], doc["head"], doc["rollup"]["nodes"]),
+                         (gg.LAND_SNAPSHOT_SCHEMA, "o/r", 1, LA, self.NODES))
+        self.assertEqual(doc["dataAt"], self.w.cache[self.KEY]["dataAt"])
+        self.assert_merged_at(LA)
+        merge_env = [env for argv, env in zip(self.w.calls, self.w.envs) if argv[1:3] == ["pr", "merge"]][0]
+        self.assertNotIn(gg.LAND_SNAPSHOT_ENV, merge_env)  # the shim's merge_hold reads the merge's evidence live
+        self.assertEqual(gg.land_counts()[gg.land_day(self.t)]["snapshot"], 1)
+
+    def test_a_head_the_snapshot_lacks_waits_for_the_daemons_read_never_merge_holds(self):
+        self.snap_pr(LB, snap_head=LA)  # the daemon's snapshot is of the old head
+        self.land()
+        for _ in range(3):
+            e = self.tick(10)
+        self.assertEqual(self.w.explains(), [])
+        self.assertIn(self.KEY, self.w.nudged)
+        self.assertEqual(e["snapshotWait"]["sha"], LB)
+        self.snap_pr(LB, snap_head=LB)  # the daemon's next full read
+        self.w.answers.append(ok_answer(LB))
+        self.tick()
+        self.assertEqual(json.loads(Path(self.explain_env()[gg.LAND_SNAPSHOT_ENV]).read_text())["head"], LB)
+        self.assert_merged_at(LB)
+
+    def test_a_snapshot_that_never_comes_is_judged_live_after_the_wait(self):
+        self.snap_pr(LA, snap_head=None)
+        self.land()
+        self.tick()
+        self.assertEqual(self.w.explains(), [])
+        self.w.answers.append(ok_answer(LA))
+        self.tick(gg.LAND_SNAPSHOT_WAIT + 1)
+        self.assertNotIn(gg.LAND_SNAPSHOT_ENV, self.explain_env())
+        self.assert_merged_at(LA)
+        self.assertIn("snapshot_missing", [h.get("event") for h in self.q.entries[self.KEY]["history"]])
+
+    def test_no_wait_for_a_partial_snapshot_an_upstream_host_or_a_rest_read(self):
+        for setup in ("partial", "upstream", "rest"):
+            with self.subTest(setup):
+                self.w.calls.clear()
+                self.w.envs.clear()
+                self.upstream = setup == "upstream"
+                self.snap_pr(LA, snap_head=LA, complete=setup != "partial")
+                if setup == "rest":
+                    self.w.cache[self.KEY].pop("fp")
+                self.q = self.queue()
+                self.land()
+                self.w.answers.append(ok_answer(LA))
+                self.tick()
+                self.assertNotIn(gg.LAND_SNAPSHOT_ENV, self.explain_env())
+                self.q.entries.clear()
+                gg.land_request("withdraw", "o/r#1", [], "host/lane")
+        self.upstream = False
+
     def test_wait_pr_then_merge(self):
         self.pr(LA)
         self.land()
@@ -16997,6 +17247,108 @@ class LandTest(Base):
         self.tick()
         self.assertEqual(self.w.gh_calls("pr", "update-branch"), [])
         self.assertEqual(self.w.gh_calls("api")[0][3], "repos/o/r/pulls/1/update-branch")
+
+    def fetch_calls(self) -> list[list[str]]:
+        return [c for c in self.w.calls if c[0] in ("/fake/git", "/fake/lane-gh") and "config" not in c]
+
+    def git_fetch(self, *refspecs: str) -> list[str]:
+        return ["git", "--git-dir", self.w.mirror, "fetch", "--quiet", "--no-tags", "origin",
+                *(refspecs or ("+refs/heads/main:refs/remotes/origin/main",))]
+
+    def test_fetch_fills_the_mirror_then_judges_again(self):
+        # huge-blue, 2026-11-17 ~14:01Z: leo-workspace#5653 and #5614 stopped "unreadable" on a mirror fetch named as a
+        # command; a coordinator ran it by hand. A fetch step is run by the queue, then the PR is judged again.
+        self.pr(LA)
+        self.land()
+        argv = self.git_fetch("+refs/heads/main:refs/remotes/origin/main", LA, "main")
+        self.w.answers.append(refusal("unreadable", LA, {"kind": "fetch", "argv": argv}))
+        e = self.tick()
+        self.assertEqual(self.fetch_calls(), [["/fake/git", *argv[1:]]])
+        self.assertIn(["/fake/git", "--git-dir", self.w.mirror, "config", "--get", "remote.origin.url"], self.w.calls)
+        self.assertEqual(self.w.envs[self.w.calls.index(["/fake/git", *argv[1:]])].get(gg.LAND_LANE_ENV), None)
+        self.assertEqual((e["state"], e["wait"]["kind"], e["lastAction"]["kind"], e["lastAction"]["exit"]),
+                         ("waiting", "retry", "fetch", 0))
+        self.assertEqual(e["wakeAt"] - self.t, gg.NUDGE_MIN * 3)
+        self.assertIn(self.KEY, self.w.nudged)
+        self.w.answers.append(ok_answer(LA))
+        self.tick(gg.NUDGE_MIN * 3 + 1)
+        self.assertEqual(len(self.w.explains()), 2)
+        self.assert_merged_at(LA)
+
+    def test_fetch_takes_the_lane_gh_form_and_an_ssh_origin(self):
+        self.pr(LA)
+        self.land()
+        argv = ["lane-gh", "fetch", "o/r", "--dir", self.w.mirror, "--branch", "main", "--branch", "feat/x"]
+        self.w.answers.append(refusal("unreadable", LA, {"kind": "fetch", "argv": argv}))
+        e = self.tick()
+        self.assertEqual(self.fetch_calls(), [["/fake/lane-gh", *argv[1:]]])
+        self.assertEqual((e["state"], e["lastAction"]["form"]), ("waiting", "lane-gh"))
+        for url in ("git@github.com:o/r.git", "ssh://git@github.com/o/r", "https://github.com/O/R"):
+            self.assertEqual(gg.land_fetch_origin(url).lower(), "o/r", url)
+        for url in ("https://gitlab.com/o/r.git", "https://github.com/o/r/x", "file:///m/o/r.git"):
+            self.assertEqual(gg.land_fetch_origin(url), "", url)
+
+    def test_a_fetch_argv_glaeda_does_not_run_stops_as_policy(self):
+        bad = {
+            "upload-pack": self.git_fetch()[:4] + ["--upload-pack=/tmp/x", "origin", "main"],
+            "upload-pack word": self.git_fetch()[:4] + ["--upload-pack", "/tmp/x", "origin", "main"],
+            "semicolon": self.git_fetch("main;touch /tmp/x"),
+            "range": self.git_fetch("main..evil"),
+            "not .git": ["git", "--git-dir", os.path.dirname(self.w.mirror), "fetch", "origin", "main"],
+            "relative": ["git", "--git-dir", "r.git", "fetch", "origin", "main"],
+            "other remote": ["git", "--git-dir", self.w.mirror, "fetch", "evil", "main"],
+            "no such mirror": ["git", "--git-dir", self.w.mirror + "x.git", "fetch", "origin", "main"],
+            "wrong repo": ["lane-gh", "fetch", "o/other", "--dir", self.w.mirror, "--branch", "main"],
+            "lane-gh option": ["lane-gh", "fetch", "o/r", "--dir", self.w.mirror, "--force", "main"],
+            "lane-gh not .git": ["lane-gh", "fetch", "o/r", "--dir", "/tmp", "--branch", "main"],
+            "other program": ["sh", "-c", f"git --git-dir {self.w.mirror} fetch origin"],
+            "string": " ".join(self.git_fetch()),
+        }
+        for n, (name, argv) in enumerate(bad.items()):
+            with self.subTest(name):
+                key = f"pr:o/r#{n + 10}"
+                self.pr(LA, key=key)
+                self.land(f"o/r#{n + 10}")
+                answer = refusal("unreadable", LA, {"kind": "fetch", "argv": argv})
+                answer[1]["number"] = answer[1]["action"]["number"] = n + 10
+                self.w.answers.append(answer)
+                self.tick()
+                e = self.q.entries[key]
+                self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "policy"))
+                self.assertEqual(self.fetch_calls(), [])
+        # a mirror whose origin is another repository is not fetched either
+        self.w.origin = "https://github.com/o/other.git"
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(refusal("unreadable", LA, {"kind": "fetch", "argv": self.git_fetch()}))
+        e = self.tick()
+        self.assertEqual((e["state"], e["stop"]["code"], self.fetch_calls()), ("stopped", "policy", []))
+        self.assertIn("not github.com/o/r", e["stop"]["reason"])
+
+    def test_a_failing_fetch_is_a_refused_step(self):
+        self.pr(LA)
+        self.land()
+        self.w.fetch_rc = 128
+        self.w.answers.append(refusal("unreadable", LA, {"kind": "fetch", "argv": self.git_fetch()}))
+        e = self.tick()
+        self.assertEqual(len(self.fetch_calls()), 1)
+        self.assertEqual((e["state"], e["stepFail"]["kind"], e["stepFail"]["count"], e["wakeAt"] - self.t),
+                         ("waiting", "fetch", 1, gg.LAND_STEP_BACKOFF))
+        self.assertIn("step_refused", [h["event"] for h in e["history"]])
+        # the same failure again at the same head counts on; at LAND_STEP_STOP it stops and tells the requester
+        for n in range(2, gg.LAND_STEP_STOP + 1):
+            e["streak"] = None  # the judge's own streak aside: this counts the step's refusals
+            self.w.answers.append(refusal("unreadable", LA, {"kind": "fetch", "argv": self.git_fetch()}))
+            e = self.tick(gg.LAND_STEP_BACKOFF_MAX + 1)
+            if n < gg.LAND_STEP_STOP:
+                self.assertEqual(e["stepFail"]["count"], n)
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "fetch_refused"))
+        self.assertIn("stopped: fetch_refused", self.w.sent()[-1][-1])
+
+    def test_a_refusal_naming_the_broker_update_branch_takes_it(self):
+        self.assertTrue(gg.LAND_STEP_NEXT_UPDATE.search(
+            f"merge-hold: refused [tip_merge]; next: gh pr update-branch 1 -R o/r --match-head-commit {LA} "
+            "--needs-newer-base ws-check"))
 
     def test_head_moved_during_review_repins_and_merges_at_the_new_head(self):
         self.pr(LA)
@@ -17319,16 +17671,41 @@ class LandTest(Base):
 
     def test_steps_write_as_the_requesters_lane_on_this_host(self):
         # gcp-agent-lane-3, 2026-11-17: lane-gh refused every merge and update-branch "land: lease acquisition requires
-        # a lane session" (this queue strips the session keys), so none reached the broker.
-        self.pr(LA)
-        self.land()
-        self.w.answers.append(ok_answer(LA))
-        with mock.patch.object(gg, "policy_host", lambda: "host"):
-            self.tick()
-        by = {tuple(c[1:3]): env for c, env in zip(self.w.calls, self.w.envs)}
-        self.assertEqual(by[("pr", "merge")].get("LANE_GH_LANE"), "lane")
-        self.assertEqual(by[("pr", "merge")]["CMUX_AGENT_SESSION"], "glaeda-land")  # still charged to the queue
-        self.assertNotIn("LANE_GH_LANE", by[(self.w.mh, "explain")])  # a read needs no lane
+        # a lane session" (this queue strips the session keys), so none reached the broker. Every step that writes
+        # carries the lane, review too (router-review --post comments through the same client; review finding F1).
+        steps = {
+            "merge": (ok_answer(LA), lambda c: c[1:3] == ["pr", "merge"]),
+            "update_branch": (refusal("tip_merge", LA, {"kind": "update_branch", "expected_head_sha": LA}),
+                              lambda c: "update-branch" in " ".join(c)),
+            "rerun_failed": (refusal("cancelled", LA, {"kind": "rerun_failed", "runs": [5]}),
+                             lambda c: c[1:3] == ["run", "rerun"]),
+            "review": (refusal("no_ship", LA, {"kind": "review"}), lambda c: c[0] == "/fake/router-review"),
+        }
+        for kind, (answer, is_step) in steps.items():
+            with self.subTest(kind=kind):
+                shutil.rmtree(gg.land_dir(), ignore_errors=True)
+                self.w = LandWorld(self.tmp.name)
+                self.q = self.queue()
+                self.pr(LA)
+                self.land()
+                self.w.answers.append(answer)
+                spawned: list[tuple[list[str], dict]] = []
+
+                def popen(argv, **kw):
+                    spawned.append((list(argv), dict(kw["env"])))
+                    return mock.Mock()
+                with mock.patch.object(gg, "policy_host", lambda: "host"), \
+                        mock.patch.object(gg.subprocess, "Popen", side_effect=popen):
+                    self.tick()
+                runs = list(zip(self.w.calls, self.w.envs)) + spawned
+                envs = [env for c, env in runs if is_step(c)]
+                self.assertTrue(envs, f"no {kind} step ran")
+                for env in envs:
+                    self.assertEqual(env.get("LANE_GH_LANE"), "lane")
+                    self.assertEqual(env["CMUX_AGENT_SESSION"], "glaeda-land")  # still charged to the queue
+                explain = [env for c, env in runs if c[1:3] == [self.w.mh, "explain"]]
+                self.assertTrue(explain)
+                self.assertNotIn("LANE_GH_LANE", explain[0])  # a read needs no lane
         # a requester on another host names no lane
         self.assertEqual(gg.land_lane({"requester": "other/lane"}), "")
         self.assertEqual(gg.land_lane({"requester": ""}), "")
@@ -17922,6 +18299,7 @@ class LandForwardTest(Base):
 
     def setUp(self) -> None:
         super().setUp()
+        self.snaps: dict[str, dict] = {}  # key -> the daemon's rollup snapshot (ROLLUP_DIR), as read_rollup gives it
         self.w = LandWorld(self.tmp.name)
         for patch in (mock.patch.object(gg, "LAND_MERGE_HOLD_PATHS", (Path(self.w.mh),)),
                       mock.patch.dict(os.environ, {"GH_QUOTA_STATE": os.fspath(Path(self.tmp.name) / "gh-quota")})):

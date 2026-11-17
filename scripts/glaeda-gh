@@ -374,6 +374,7 @@ ALARM_CMD = Path(os.environ.get("GLAEDA_GH_ALARM_CMD") or Path.home() / ".local/
 NOTICES_DIR = Path(os.environ.get("NOTICES_DIR") or Path.home() / ".local/state/notices")
 ALARMS_FILE = "alarms.json"  # when each alarm was last sent, so a restart does not send it again
 ALARM_EVERY = 3600.0
+SHARE_ALARM_FLOOR = 50  # counted REST an hour under which the share alarm stays quiet, whatever the cap (a cap of 0: its exempt reads)
 ALARM_REST_LEFT = 1000  # the pool alarm fires below this much REST left on the poorest core counter
 ALARM_TREND_MIN = 300.0  # seconds of readings in one window a drain projection needs
 ALARM_TREND_KEEP = 900.0  # seconds of readings the projection is drawn over
@@ -778,8 +779,9 @@ rules(first: 50) { nodes { type parameters { ... on RequiredStatusChecksParamete
   requiredStatusChecks { context } } } } } } commits(last: 1) { nodes { commit { SUITE_ATTEMPTS statusCheckRollup { state
 contexts(first: 100) { totalCount PR_COUNTS pageInfo { hasNextPage endCursor } nodes { __typename
 ... on CheckRun { id name status conclusion detailsUrl databaseId startedAt completedAt
-  isRequired(pullRequestNumber: NUM) checkSuite { conclusion workflowRun { databaseId workflow { name databaseId } } } }
-... on StatusContext { context state targetUrl createdAt isRequired(pullRequestNumber: NUM) } } } } } } }"""
+  isRequired(pullRequestNumber: NUM) checkSuite { databaseId conclusion app { slug }
+  workflowRun { databaseId event workflow { name databaseId } } } }
+... on StatusContext { context state description targetUrl createdAt isRequired(pullRequestNumber: NUM) } } } } } } }"""
 # A check reads as its last real attempt left it (2026-11-05). statusCheckRollup, like every latest-attempt view, lists
 # only each check suite's newest attempt, and one that ended in startup_failure ran no jobs: after two such reruns of
 # run 41931705470, cmux#35906's "publish tree-addressed cmux-tui" red was gone from it, and the PR merged as 633d5e38
@@ -2583,8 +2585,9 @@ def newest_verdict(found: list[tuple[int, str, str]]) -> tuple[str, str]:
 
 
 HEAD_CONTEXTS = """statusCheckRollup{contexts(first:100%s){pageInfo{hasNextPage endCursor} nodes{__typename
-... on CheckRun{databaseId name status conclusion checkSuite{app{slug} workflowRun{workflow{name}}}}
-... on StatusContext{context state}}}}"""
+... on CheckRun{databaseId name status conclusion startedAt checkSuite{databaseId app{slug}
+workflowRun{databaseId event workflow{name databaseId}}}}
+... on StatusContext{context state description}}}}"""
 
 PR_CONTEXT_MAX_PAGES = 20  # 2,000 contexts per PR; beyond that the cache stays explicitly partial
 # The follow-up pages' own share of the shared login's GraphQL hour, in points over the last hour. Past it a PR that
@@ -2644,8 +2647,8 @@ def head_query(owner: str, repo: str, sha: str, cursor: str | None = None,
     contexts = (HEAD_CONTEXTS % after).replace("databaseId name status conclusion",
                                                 f"databaseId name status conclusion{required}")
     if required:
-        contexts = contexts.replace("... on StatusContext{context state}",
-                                    f"... on StatusContext{{context state{required}}}")
+        contexts = contexts.replace("... on StatusContext{context state description}",
+                                    f"... on StatusContext{{context state description{required}}}")
     suites = "" if cursor else " " + SUITE_ATTEMPTS
     return (f'repository(owner:"{owner}",name:"{repo}"){{object(oid:"{sha}"){{... on Commit{{'
             + contexts + suites + "}}}")
@@ -2807,6 +2810,34 @@ def rest_counters(budget: dict, key: str = "restCounters") -> list[dict]:
     return out
 
 
+# -- the land queue's check snapshot (glaeda-gh land -> merge_hold explain)
+#
+# cosmic-gray, 2026-11-17: the shared login ran dry before every reset, and the land queue (session glaeda-land) was
+# its top caller, 606 REST in an hour, mostly `GET commits/SHA/check-runs` reads merge_hold made for each queued PR at
+# each judgment: every `merge_hold.py explain` read the head's whole status rollup (and its path-routing check runs by
+# name) again, though this daemon had just read the same head for every `glaeda-gh status pr` / `wait pr` caller.
+# Now, for each PR the land queue holds, a full read here also keeps the head's raw rollup context nodes (the fields
+# merge_hold's HEAD_REDS_QUERY asks, every page) in ROLLUP_DIR, and the queue hands merge_hold a copy at the judged
+# head (LAND_SNAPSHOT_ENV, explain only). merge_hold judges those nodes with the parser its own GraphQL read uses, so
+# its verdict is the same; the final pinned merge (the shim's own judgment) and its evidence are still read live. A
+# head the snapshot does not hold yet is read by the daemon on its next tick (rollup_stale makes that tick a full
+# read), never by each waiter. Nodes the daemon folds in from other sources are left out: a REST read by name
+# (required_by_name) and a suite's last real attempt (add_last_real_contexts) are not in merge_hold's own read.
+ROLLUP_DIR = "rollups"
+ROLLUP_SCHEMA = "glaeda-gh-rollup/v1"
+ROLLUP_SWEEP_EVERY = 3600.0  # snapshots of PRs the land queue no longer holds are removed this often
+ROLLUP_ALL = "\0every page"  # page_pr_contexts' REQUIRED for a read of every page: no context has this name
+
+
+def rollup_path(key: str) -> Path:
+    return BASE / ROLLUP_DIR / file_name(key)
+
+
+def read_rollup(key: str) -> dict | None:
+    doc = read_json(rollup_path(key))
+    return doc if isinstance(doc, dict) and doc.get("schema") == ROLLUP_SCHEMA and doc.get("key") == key else None
+
+
 class Daemon:
     def __init__(self, transport: Callable = http, token: Callable[[], str] = gh_token,
                  controller: Any = "env", upstream: Any = "config") -> None:
@@ -2839,6 +2870,9 @@ class Daemon:
         self.fed_repos: dict[str, float] = {}  # owner/repo (lowercase) -> the last event the feed delivered for it
         self.reexec_waiting = False  # an update arrived while a land step ran (serve)
         self.land_queue: LandQueue | None = None  # `glaeda-gh land` (made when BASE/land first exists)
+        self.rollups: dict[str, tuple[Any, Any]] = {}  # key -> (head, fp) of its ROLLUP_DIR snapshot, as last written
+        self.rollup_keys: tuple[float, frozenset[str]] = (float("nan"), frozenset())  # (self.now, rollup_wanted)
+        self.rollup_swept = float("-inf")
         self.on_event_procs: dict[str, subprocess.Popen] = {}  # on-event commands started and not reaped yet, by key
         self.on_event_pending: bool | None = None  # whether on-event.json holds runs to resolve (None: not read yet)
         self.on_event_seen: tuple | None = None  # on-event.json's stat when on_event_pending was learned
@@ -3302,13 +3336,16 @@ class Daemon:
         daemon reads up to it, and a restart's re-reads come in a burst), not news: one log line an hour
         (share-pace, "nothing to do, projection only"), never an alarm. The old alarm projected the last
         SPEND_RECENT seconds over an hour and warned about hourly on huge-blue and cosmic-gray with nothing for
-        anyone to do (2026-11-15: "306/h against its cap of 150 (142 in the last hour)")."""
+        anyone to do (2026-11-15: "306/h against its cap of 150 (142 in the last hour)").
+        A restShare of 0 (every host the config does not name: PR and run reads over GraphQL only) is a cap of 0, and
+        its few exempt reads (a failed attempt's job list) warned on every one: the alarm needs spend past
+        max(cap, SHARE_ALARM_FLOOR), though the cap itself still holds reads to 0."""
         spent = self.rest_spent()
         # the share's own measure: the outbox (sessions' writes) is never held to it (request)
         recent = [r for r in recent_rows if r["bucket"] == "rest" and r["kind"] != "outbox"]
         pace = sum(r["counted"] for r in recent) * 3600 // SPEND_RECENT
-        if spent <= cap:
-            if pace > max(cap * 3 // 2, cap + 150) and self.now - self.share_pace_at >= ALARM_EVERY:
+        if spent <= max(cap, SHARE_ALARM_FLOOR):
+            if spent <= cap and pace > max(cap * 3 // 2, cap + 150) and self.now - self.share_pace_at >= ALARM_EVERY:
                 self.share_pace_at = self.now
                 log({"event": "share-pace", "pace": pace, "spent": spent, "cap": cap,
                      "note": "nothing to do, projection only: the measured hour is within the cap, which holds it"})
@@ -5555,12 +5592,16 @@ class Daemon:
         # one read for the whole batch's suites, not one per PR: most cmux heads have a few such suites
         suite_runs, suites_error = self.suite_runs(
             [s for found in attempts.values() if isinstance(found, list) for s in found], paced=False)
+        wanted = self.rollup_wanted() if kind == "pr" else frozenset()
+        captured: dict[int, dict] = {}  # PR alias -> its rollup snapshot (capture_rollup), for a land PR
         for i, e in enumerate(entries):
             node = (data.get(f"{alias}{i}") or {}).get(field)
             if i in kept:
                 continue
             if node:
                 page_error = None
+                if kind == "pr" and e["key"] in wanted:
+                    captured[i] = self.capture_rollup(e["key"], node, nulls.get(i, 0) + (f"{alias}{i}" in limits))
                 if kind == "pr":
                     page_error = self.extend_pr_contexts(e, node)
                     page_error = self.add_last_real_contexts(node, attempts[i], suite_runs, suites_error) or page_error
@@ -5575,6 +5616,8 @@ class Daemon:
                     split_unread(parsed[i])  # a required name past the pages read is unread, not missing
                 if kind == "pr":
                     fps[i] = None if page_error else pr_fingerprint(node)
+                if i in captured:
+                    self.save_rollup(e["key"], node, captured[i], fps[i])
         if kind == "pr":
             self.fill_steps([(entries[i], d) for i, d in parsed.items()])
         self.limited = [e for i, e in enumerate(entries) if f"{alias}{i}" in limits]
@@ -5828,7 +5871,75 @@ class Daemon:
                 and c.get("source") != "upstream"
                 and isinstance(data, dict) and not data.get("checksPageError") and data.get("state") == "OPEN"
                 and isinstance(c.get("fullAt"), (int, float)) and self.now - c["fullAt"] < PR_FULL_EVERY
-                and not any(wants_steps(ch) and "failedSteps" not in ch for ch in data.get("checks") or []))
+                and not any(wants_steps(ch) and "failedSteps" not in ch for ch in data.get("checks") or [])
+                and not self.rollup_stale(e["key"], c))
+
+    def rollup_wanted(self) -> frozenset[str]:
+        """The PRs the land queue holds (not done): a full read of one keeps its rollup snapshot. Once per tick."""
+        at, keys = self.rollup_keys
+        if at == self.now:
+            return keys
+        q = self.land_queue
+        if q is None:
+            keys = frozenset()
+        else:
+            with q.lock:
+                keys = frozenset(k for k, e in q.entries.items() if e.get("state") not in LAND_DONE)
+        self.rollup_keys = (self.now, keys)
+        if self.now - self.rollup_swept >= ROLLUP_SWEEP_EVERY:
+            self.rollup_swept = self.now
+            self.sweep_rollups(keys)
+        return keys
+
+    def sweep_rollups(self, keep: frozenset[str]) -> None:
+        """Remove the snapshots (and the land queue's per-judgment copies) of PRs it no longer holds."""
+        names = {file_name(k) for k in keep}
+        for d in (BASE / ROLLUP_DIR, land_dir() / LAND_SNAPSHOT_DIR):
+            with contextlib.suppress(OSError):
+                for f in d.iterdir():
+                    if f.name not in names and f.suffix == ".json":
+                        with contextlib.suppress(OSError):
+                            f.unlink()
+        self.rollups = {k: v for k, v in self.rollups.items() if k in keep}
+
+    def rollup_stale(self, key: str, cache: dict) -> bool:
+        """KEY is a land PR whose rollup snapshot is missing, or is not at the head and fingerprint CACHE holds: its
+        next read is a full one, which writes the snapshot (one read for the head, shared by every judgment)."""
+        if key not in self.rollup_wanted():
+            return False
+        if key not in self.rollups:
+            doc = read_rollup(key) or {}
+            self.rollups[key] = (doc.get("head"), doc.get("fp"))
+        head = ((cache or {}).get("data") or {}).get("headRefOid")
+        return self.rollups[key] != (head, (cache or {}).get("fp"))
+
+    def capture_rollup(self, key: str, node: dict, nulls: int) -> dict:
+        """A PR NODE's rollup as merge_hold's HEAD_REDS_QUERY reads it, before anything is folded in: the first page's
+        context nodes, and every later page read here (page_pr_contexts under its own hourly share). complete is
+        False when a page stopped short or GitHub answered a context null: merge_hold then reads the head itself."""
+        commit = (((node.get("commits") or {}).get("nodes") or [{}])[0] or {}).get("commit") or {}
+        rollup = commit.get("statusCheckRollup")
+        if rollup is None:
+            return {"rollup": None, "complete": "statusCheckRollup" in commit and not nulls}
+        contexts = rollup.get("contexts") or {}
+        nodes = [dict(c) for c in contexts.get("nodes") or [] if isinstance(c, dict)]
+        page = dict(contexts.get("pageInfo") or {})
+        complete = not nulls and isinstance(page.get("hasNextPage"), bool)
+        sha = str(node.get("headRefOid") or "")
+        if complete and page["hasNextPage"]:
+            _, owner, repo, number = split_key(key)
+            more = {"nodes": nodes, "pageInfo": page}
+            complete = (re.fullmatch(r"[0-9a-fA-F]{40}", sha) is not None and self.page_pr_contexts(
+                owner, repo, sha, int(number), more, nodes, {ROLLUP_ALL}, set()) is None)
+        return {"rollup": {"nodes": nodes}, "complete": complete}
+
+    def save_rollup(self, key: str, node: dict, captured: dict, fp: str | None) -> None:
+        """Write KEY's rollup snapshot (ROLLUP_DIR) at NODE's head, with the fingerprint its cache entry now holds."""
+        _, owner, repo, number = split_key(key)
+        head = node.get("headRefOid")
+        write_json(rollup_path(key), {"schema": ROLLUP_SCHEMA, "key": key, "repo": f"{owner}/{repo}",
+                                      "number": int(number), "head": head, "fp": fp, "readAt": self.now, **captured})
+        self.rollups[key] = (head, fp)
 
     def probe_prs(self, entries: list[dict]) -> tuple[list[dict], str | None]:
         """One PR_PROBE query for ENTRIES: those whose fingerprint matches their cache are confirmed (dataAt and
@@ -7052,6 +7163,33 @@ def land_reads_upstream() -> bool:
     return upstream_command() is not None and direct_command() is not None
 
 
+# How a land update-branch is sent. A lane VM's gh is lane-gh's broker client, which refuses every `gh api -X PUT`
+# but a media upload ("gh api -X PUT: only a media upload goes through the broker"), so the REST form merge_hold names
+# (`gh api -X PUT repos/O/R/pulls/N/update-branch -f expected_head_sha=SHA`) exited 1 at every try there and stopped
+# the entry after three identical refusals (hq#12553, hq#12590, cmux#45254, 2026-11-17). The broker takes
+# `gh pr update-branch N -R O/R --match-head-commit SHA [--needs-newer-base CHECK]...` (its update_branch tool, pinned
+# to SHA); gh's own `pr update-branch` takes no head, so a host with its own login keeps the pinned REST call.
+# gh_quota.lane_gh_client reads the same file: the bootstrap's wrapper that runs lane-gh-credential.
+LAND_LANE_GH_CLIENT = Path.home() / ".local/lib/lane-gh/bin/gh"
+
+
+def land_broker_client(client: Path | None = None) -> bool:
+    """This host's gh goes through the lane-gh broker (LAND_LANE_GH_CLIENT runs lane-gh-credential)."""
+    try:
+        return "lane-gh-credential" in (client or LAND_LANE_GH_CLIENT).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+
+
+def land_update_branch_args(repo: str, number: str, head: str, needs: list[str], broker: bool) -> list[str]:
+    """The gh argv of an update-branch pinned to HEAD: the broker's `pr update-branch` form (BROKER, a lane VM), one
+    --needs-newer-base per check NEEDS names, else GitHub's REST PUT with expected_head_sha."""
+    if broker:
+        return (["pr", "update-branch", number, "-R", repo]
+                + [arg for name in needs for arg in ("--needs-newer-base", name)] + ["--match-head-commit", head])
+    return ["api", "-X", "PUT", f"repos/{repo}/pulls/{number}/update-branch", "-f", f"expected_head_sha={head}"]
+
+
 def land_direct_read(key: str) -> str | None:
     """One read of KEY's PR from GitHub through the broker, stored in the cache; None, or why it could not."""
     return direct_read({"key": key, "kind": "pr", "jobs": False, "began": time.time()})
@@ -7149,6 +7287,9 @@ LAND_RETRY_MAX = 1800.0
 LAND_REVIEW_WAIT = 3600.0
 LAND_STREAK_STOP = 3  # identical refusals in a row (code, head, step) that stop an entry
 LAND_RETRY_STREAK_STOP = 8  # ... for could-not-judge answers (quota, unreadable), which back off between tries
+# The steps of a could-not-judge answer: a retry, and the mirror fill an unreadable answer names (fetch), whose
+# failures step_refused counts on their own
+LAND_RETRY_KINDS = frozenset({"retry", "fetch"})
 # A quota refusal parks the entry: no judge, read, watch or nudge for it until the reset the refusal names (Leo,
 # 2026-11-17, on Claude desktop's "GitHub rate limit" hover: "this is... interesting. so claude desktop shows rate limit
 # on hover of the github links sometimes..."). Before, every quota-refused entry was judged again about every 5 min
@@ -7185,6 +7326,16 @@ LAND_STEP_STOP = 6  # 60+120+240+480+960 s of backoff (~31 min) before the 6th i
 LAND_STEP_NEXT_UPDATE = re.compile(r"\bnext: (?:gh pr update-branch \d+|gh api -X PUT \S*/pulls/\d+/update-branch)")
 LAND_STEP_NEXT_WAIT = re.compile(r"\bnext: glaeda-gh wait pr \S+[^\n;]*?(?:--timeout (\d+))?(?=\s*(?:\(|$|\n|;))")
 LAND_STEP_CODE = re.compile(r"\brefused \[([a-z_]+)")
+# The check snapshot merge_hold explain judges from (ROLLUP_DIR's comment): the per-judgment copy's file under
+# land/LAND_SNAPSHOT_DIR, named to merge_hold by LAND_SNAPSHOT_ENV. It is handed over only when the daemon's cache
+# entry shows the same head and fingerprint it was read at, within LAND_SNAPSHOT_MAX_AGE (merge_hold keeps its own
+# bound too). A head the snapshot does not hold yet waits up to LAND_SNAPSHOT_WAIT for the daemon's next full read
+# (nudged), then merge_hold reads it itself, as before; an upstream host (a lane VM) keeps no snapshot and never waits.
+LAND_SNAPSHOT_ENV = "MERGE_HOLD_ROLLUP_SNAPSHOT"
+LAND_SNAPSHOT_SCHEMA = "merge-hold-rollup-snapshot/v1"
+LAND_SNAPSHOT_DIR = "snapshots"
+LAND_SNAPSHOT_MAX_AGE = 300.0
+LAND_SNAPSHOT_WAIT = 120.0
 # A "command" step that is a wait this queue runs itself. cosmic-gray, 2026-11-17: merge_hold refused cmux#45404 (the
 # base clippy fix) `checks_running` with the step {"kind": "command", "text": "glaeda-gh wait run
 # manaflow-ai/cmux/44061804279 --timeout 3600"}, and land stopped on it twice, each stop also stopping every land queued
@@ -7213,9 +7364,28 @@ LAND_FALLBACK = {"tip_merge": "update_branch", "stale_green": "update_branch", "
                  "review_running": "wait_comment", "no_ship": "review", "same_model": "review",
                  "regen_refused": "review"}
 LAND_KINDS = frozenset({"merge", "update_branch", "wait_pr", "wait_run", "wait_comment", "rerun_failed", "repin",
-                        "retry", "review", "retarget", "stop", "command"})
+                        "retry", "review", "retarget", "stop", "command", "fetch"})
 SHA40 = re.compile(r"[0-9a-f]{40}")
 BRANCH_SAFE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,250}")
+# A "fetch" step fills this host's mirror of the PR's repository. huge-blue, 2026-11-17 ~14:01Z: merge_hold could not
+# read its mirror (ls-remote failed) and refused leo-workspace#5653 and #5614 "unreadable", naming a fetch of that
+# mirror as a "command" step; the queue stops on a command, no lane can run one on huge-blue, and a coordinator ran
+# the fetch by hand. merge_hold (mirror_fetch_argv) now names it {"kind": "fetch", "argv": [...]}, one of two shapes,
+# which this queue checks again on its own (land_fetch_shape, then the mirror itself) before it runs it, bounded:
+# - git --git-dir MIRROR.git fetch [LAND_FETCH_OPTIONS] origin REFSPEC..., MIRROR's origin being the PR's repository
+#   on github.com (LAND_FETCH_ORIGIN), run with the bare env (this host's own git login);
+# - lane-gh fetch OWNER/REPO --dir MIRROR.git [--branch B]..., OWNER/REPO the PR's (a broker read: land_lane).
+# Any other argv stops the entry as policy and runs nothing. A fetch that fails is a refused step (step_refused): it
+# backs off, and the LAND_STEP_STOP-th identical failure stops the entry and tells the requester.
+LAND_FETCH_DEADLINE = 300.0
+LAND_FETCH_CONFIG_DEADLINE = 10.0  # git config --get remote.origin.url
+LAND_FETCH_OPTIONS = frozenset({"--quiet", "--no-tags", "--no-write-fetch-head"})
+LAND_FETCH_REFSPEC = re.compile(r"\+?refs/(?:heads|pull)/[\w./-]+:refs/remotes/origin/[\w./-]+|[0-9a-f]{40}|\w[\w./-]*")
+LAND_FETCH_BRANCH = re.compile(r"\w[\w./-]*")
+LAND_FETCH_REPO = re.compile(r"[\w.-]+/[\w.-]+")
+LAND_FETCH_ORIGIN = re.compile(
+    r"(?:https://github\.com/|ssh://git@github\.com/|git@github\.com:)([\w.-]+/[\w.-]+?)(?:\.git)?/?")
+LAND_FETCH_UNSAFE = frozenset("\0\n\r\t ;|&$`<>\\'\"*?")
 
 
 # The lane a land step writes as. lane-gh (a lane VM's broker client) fences every write (land, update_branch, rerun)
@@ -7225,6 +7395,9 @@ BRANCH_SAFE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,250}")
 # reached the broker (`lane-gh calls --tool land` holds no land of cmux#45102 or #45090 after 27 and 30 merges).
 # The step is the requester's: its session on this host names the lane; the calls stay charged to glaeda-land
 # (gh_quota reads CMUX_AGENT_SESSION, never LANE_GH_LANE). A requester on another host names none.
+# Every step that writes passes E (self.env(e)): merge, update_branch, rerun_failed and review (router-review
+# --post writes its comment through the same client). Reads (merge_hold explain, the post-merge `pr view`) and
+# acpmux notices need no lane and run with the bare env.
 LAND_LANE_ENV = "LANE_GH_LANE"
 LAND_LANE_NAME = re.compile(r"[A-Za-z0-9._-]{1,100}")
 
@@ -7330,6 +7503,48 @@ def land_fingerprint(cache: dict | None) -> str:
                      str(c.get("conclusion") or "")) for c in data.get("checks") or [])
     doc = [data.get("headRefOid"), data.get("state"), data.get("mergeable"), checks]
     return hashlib.sha256(json.dumps(doc, sort_keys=True).encode()).hexdigest()[:16]
+
+
+def land_fetch_mirror_ok(mirror: str) -> bool:
+    return os.path.isabs(mirror) and mirror.endswith(".git") and ".." not in mirror.split("/")
+
+
+def land_fetch_shape(argv: Any, repo: str) -> tuple[str, str, str]:
+    """(form "git" or "lane-gh", the mirror, "") when ARGV is one of a fetch step's two shapes (LAND_FETCH_DEADLINE's
+    comment) for REPO, else ("", "", why not). Reads nothing: the mirror itself is do_fetch's to check."""
+    if not isinstance(argv, list) or not argv or not all(isinstance(a, str) for a in argv):
+        return "", "", "the fetch step's argv is not a list of strings"
+    if any(not a or LAND_FETCH_UNSAFE.intersection(a) for a in argv):
+        return "", "", f"the fetch step's argv holds an empty word or a shell character: {land_trim(argv, 160)}"
+    if argv[:2] == ["git", "--git-dir"] and len(argv) >= 6 and argv[3] == "fetch":
+        if not land_fetch_mirror_ok(argv[2]):
+            return "", "", f"git fetch's --git-dir {argv[2]!r} is not an absolute path ending .git"
+        rest = argv[4:]
+        while rest and rest[0] in LAND_FETCH_OPTIONS:
+            rest = rest[1:]
+        if len(rest) < 2 or rest[0] != "origin":
+            return "", "", f"git fetch names {rest[0] if rest else 'nothing'!r} where origin and a refspec go"
+        bad = [r for r in rest[1:] if not LAND_FETCH_REFSPEC.fullmatch(r) or ".." in r]
+        if bad:
+            return "", "", f"git fetch with a refspec or option this queue does not run: {bad[0]!r}"
+        return "git", argv[2], ""
+    if argv[:2] == ["lane-gh", "fetch"] and len(argv) >= 5 and argv[3] == "--dir":
+        if not land_fetch_mirror_ok(argv[4]):
+            return "", "", f"lane-gh fetch's --dir {argv[4]!r} is not an absolute path ending .git"
+        if not LAND_FETCH_REPO.fullmatch(argv[2]) or argv[2].lower() != repo.lower():
+            return "", "", f"lane-gh fetch names {argv[2]!r}, not this PR's {repo}"
+        pairs = argv[5:]
+        if len(pairs) % 2 or not all(pairs[i] == "--branch" and LAND_FETCH_BRANCH.fullmatch(pairs[i + 1])
+                                     and ".." not in pairs[i + 1] for i in range(0, len(pairs), 2)):
+            return "", "", f"lane-gh fetch with an option this queue does not run: {land_trim(pairs, 160)}"
+        return "lane-gh", argv[4], ""
+    return "", "", f"the fetch step is neither git --git-dir M fetch nor lane-gh fetch: {land_trim(argv[:5], 160)}"
+
+
+def land_fetch_origin(url: str) -> str:
+    """OWNER/REPO a github.com remote URL names (https, ssh:// or scp form), else ""."""
+    m = LAND_FETCH_ORIGIN.fullmatch(url.strip())
+    return m.group(1) if m else ""
 
 
 def land_fallback(answer: dict, head: str) -> dict:
@@ -7460,7 +7675,11 @@ class LandQueue:
                  config: dict | None = None, reads_upstream: Callable[[], bool] = land_reads_upstream,
                  refresh: Callable[[str], str | None] = land_direct_read,
                  behind: Callable[[Path, int, float, float], str | None] = land_checkout_behind,
-                 forward: Callable[[list[str], dict, float], dict] = land_forward) -> None:
+                 forward: Callable[[list[str], dict, float], dict] = land_forward,
+                 broker_client: Callable[[], bool] = land_broker_client,
+                 snapshot_of: Callable[[str], dict | None] = read_rollup) -> None:
+        self.broker_client = broker_client
+        self.snapshot_of = snapshot_of
         self.run = run or (lambda argv, timeout, env: self._run_real(argv, timeout, env))
         self.forward = forward
         self.sending: set[str] = set()  # keys whose handoff is in flight to the executor (forward_tick)
@@ -8085,7 +8304,50 @@ class LandQueue:
         self.history(e, "checks_running", head=head[:12])
         self.save(e)
 
+    def snapshot(self, key: str, sha: str) -> tuple[dict | None, str]:
+        """(KEY's rollup snapshot at SHA, ready to hand merge_hold, or None; why not: "" when it is ready, "wait" when
+        the daemon's next full read will write it, else the reason no snapshot will come for this judgment)."""
+        if not SHA40.fullmatch(sha or ""):
+            return None, "unpinned"
+        if self.reads_upstream():
+            return None, "upstream"
+        c = self.cache_of(key) or {}
+        if not isinstance(c.get("fp"), str):
+            return None, "no fingerprint"  # not a whole GraphQL read (REST, partial): no snapshot is kept for it
+        data = c.get("data") or {}
+        snap = self.snapshot_of(key)
+        if not isinstance(snap, dict) or str(data.get("headRefOid") or "").lower() != sha \
+                or str(snap.get("head") or "").lower() != sha or snap.get("fp") != c.get("fp") \
+                or not isinstance(c.get("fp"), str):
+            return None, "wait"
+        at = c.get("dataAt")
+        if not isinstance(at, (int, float)) or isinstance(at, bool) or self.now - at > LAND_SNAPSHOT_MAX_AGE:
+            return None, "wait"
+        if not snap.get("complete"):
+            return None, "partial"
+        return {**snap, "dataAt": at}, ""
+
+    def snapshot_wait(self, e: dict, sha: str) -> bool:
+        """True while E waits for the daemon to read SHA's rollup snapshot (at most LAND_SNAPSHOT_WAIT, nudged)."""
+        _, why = self.snapshot(e["key"], sha)
+        w = e.get("snapshotWait") or {}
+        if why != "wait":
+            e.pop("snapshotWait", None)
+            return False
+        if w.get("sha") != sha:
+            w = e["snapshotWait"] = {"sha": sha, "since": self.now}
+            self.history(e, "snapshot_wait", head=sha[:12])
+            self.nudge(e["key"])
+            self.save(e)
+        if self.now - float(w.get("since") or 0) < LAND_SNAPSHOT_WAIT:
+            return True
+        e.pop("snapshotWait", None)
+        self.history(e, "snapshot_missing", head=sha[:12])
+        return False
+
     def judge(self, e: dict, sha: str, fp: str, counts: bool = True) -> None:
+        if self.snapshot_wait(e, sha):
+            return  # judged on the daemon's next read of this head (one read, shared), not on merge_hold's own
         head = str((((self.cache_of(e["key"]) or {}).get("data")) or {}).get("headRefOid") or "").lower()
         e.update(state="judging", seen=fp, seenHead=head, judging={"sha": sha, "at": self.now, "counts": counts})
         self.save(e)
@@ -8130,9 +8392,10 @@ class LandQueue:
                 raise subprocess.TimeoutExpired(argv, timeout) from None
         return subprocess.CompletedProcess(argv, proc.returncode, out, err)
 
-    def call(self, argv: list[str], timeout: float, e: dict | None = None) -> subprocess.CompletedProcess:
+    def call(self, argv: list[str], timeout: float, e: dict | None = None,
+             extra: dict[str, str] | None = None) -> subprocess.CompletedProcess:
         try:
-            return self.run(argv, timeout, self.env(e))
+            return self.run(argv, timeout, {**self.env(e), **(extra or {})})
         except subprocess.TimeoutExpired:
             return subprocess.CompletedProcess(argv, 124, "", f"timed out after {timeout:.0f}s")
         except OSError as error:
@@ -8157,7 +8420,20 @@ class LandQueue:
                     "action": {"v": 1, "kind": "stop", "stop": "merge_hold_missing", "why": why}}
         argv = [self.path("python", Path(sys.executable)).as_posix(), os.fspath(mh),
                 "explain", e["repo"], str(e["number"])] + (["--sha", sha] if sha else []) + ["--json"]
-        got = self.call(argv, LAND_EXPLAIN_DEADLINE)
+        snap, _ = self.snapshot(e["key"], sha)
+        extra = {}
+        if snap is not None:
+            # explain only: the merge (the shim's merge_hold) reads its evidence live
+            path = land_dir() / LAND_SNAPSHOT_DIR / file_name(e["key"])
+            with contextlib.suppress(OSError):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                write_json(path, {"schema": LAND_SNAPSHOT_SCHEMA, "repo": e["repo"], "number": int(e["number"]),
+                                  "head": sha, "dataAt": snap["dataAt"], "readAt": snap.get("readAt"),
+                                  "rollup": snap.get("rollup")})
+                extra[LAND_SNAPSHOT_ENV] = os.fspath(path)
+        with self.lock:
+            self.count("snapshot" if extra else "live")
+        got = self.call(argv, LAND_EXPLAIN_DEADLINE, extra=extra)
         answer = None
         for line in reversed((got.stdout or "").strip().splitlines()):
             with contextlib.suppress(ValueError):
@@ -8222,9 +8498,10 @@ class LandQueue:
             e.pop("quotaRefusals", None)
             if answer.get("ok"):
                 e["streak"] = None
-            elif self.streak(e, f"{answer.get('code')}|{head}|{act.get('kind')}", act.get("kind") == "retry", counts):
+            elif self.streak(e, f"{answer.get('code')}|{head}|{act.get('kind')}", act.get("kind") in LAND_RETRY_KINDS,
+                             counts):
                 self.stop(e, str(answer.get("code") or "refused"),
-                          f"{LAND_STREAK_STOP if act.get('kind') != 'retry' else LAND_RETRY_STREAK_STOP} identical "
+                          f"{LAND_RETRY_STREAK_STOP if act.get('kind') in LAND_RETRY_KINDS else LAND_STREAK_STOP} identical "
                           f"refusals in a row: {land_trim(answer.get('reason'))}", land_trim(answer.get("next")))
                 return
             self.save(e)
@@ -8297,7 +8574,8 @@ class LandQueue:
                     self.stop(e, "policy", f"update_branch pinned to {sha[:12] or 'nothing'}, not the judged head "
                               f"{head[:12] or '?'}", land_trim(answer.get("next")))
                 return
-            self.update_branch(e, sha)
+            needs = act.get("needs_newer_base")
+            self.update_branch(e, sha, [str(n) for n in needs if str(n)] if isinstance(needs, list) else [])
             return
         if kind == "retarget":
             base = str(act.get("base") or "")
@@ -8306,6 +8584,9 @@ class LandQueue:
                     self.stop(e, "policy", f"retarget to an unsafe base name {base!r}", land_trim(answer.get("next")))
                 return
             self.push_step(e, "retarget", head, ["pr", "edit", number, "-R", repo, "--base", base], base=base)
+            return
+        if kind == "fetch":
+            self.do_fetch(e, act, answer, head)
             return
         if kind == "rerun_failed":
             runs = [int(r) for r in act.get("runs") or [] if str(r).isdigit()]
@@ -8396,7 +8677,45 @@ class LandQueue:
         if named == "update_branch" and kind != "update_branch":
             self.update_branch(e, head)
 
-    def update_branch(self, e: dict, head: str) -> None:
+    def do_fetch(self, e: dict, act: dict, answer: dict, head: str) -> None:
+        """Fill this host's mirror as merge_hold named (LAND_FETCH_DEADLINE's comment), then judge again soon. An argv
+        that is not one of the two shapes, for this PR's repository and an existing mirror, stops as policy."""
+        repo, argv = e["repo"], act.get("argv")
+        form, mirror, why = land_fetch_shape(argv, repo)
+        if not why and not os.path.isdir(mirror):
+            why = f"the fetch step's mirror {mirror} is not a directory on this host"
+        git = self.path("git", Path(shutil.which("git") or "/usr/bin/git")).as_posix()
+        if not why and form == "git":
+            got = self.call([git, "--git-dir", mirror, "config", "--get", "remote.origin.url"],
+                            LAND_FETCH_CONFIG_DEADLINE)
+            origin = land_fetch_origin(got.stdout or "") if got.returncode == 0 else ""
+            if origin.lower() != repo.lower():
+                why = (f"the mirror {mirror}'s origin is {land_trim(got.stdout, 120) or 'unreadable'}, "
+                       f"not github.com/{repo}")
+        if why:
+            with self.lock:
+                self.stop(e, "policy", land_trim(why), land_trim(answer.get("next")))
+            return
+        if form == "git":  # this host's own git login reads github.com: the bare env
+            run, step_env = [git, *argv[1:]], None
+        else:  # a broker read: the requester's lane only names it in the broker's audit log (land_lane)
+            run, step_env = [self.path("laneGh", Path(LANE_GH_CMD)).as_posix(), *argv[1:]], e
+        with self.lock:
+            self.claim(e, "fetch", argv=list(argv), form=form)
+        got = self.call(run, LAND_FETCH_DEADLINE, step_env)
+        named = None
+        with self.lock:
+            self.finish(e, got)
+            self.nudge(e["key"])
+            if got.returncode == 0:
+                e.pop("stepFail", None)
+                self.wait(e, {"kind": "retry", "why": "filled the mirror merge_hold could not read"}, NUDGE_MIN * 3)
+            else:
+                named = self.step_refused(e, "fetch", head, got)
+        if named == "update_branch":
+            self.update_branch(e, head)
+
+    def update_branch(self, e: dict, head: str, needs: list[str] | None = None) -> None:
         """The pinned base merge merge_hold (or a refused step) named, unless the head's checks still run: an update
         while the last one's CI runs only restarts that CI (2026-11-17: 524 update-branch steps in a day). Waits on the
         cache (an event wait, no explain) instead. An update at a head that an update of this queue made, after its
@@ -8412,8 +8731,7 @@ class LandQueue:
             with self.lock:
                 self.history(e, "update_again", head=head[:12], why="the base moved during this update's CI")
         self.push_step(e, "update_branch", head,
-                       ["api", "-X", "PUT", f"repos/{repo}/pulls/{number}/update-branch", "-f",
-                        f"expected_head_sha={head}"])
+                       land_update_branch_args(repo, number, head, list(needs or []), self.broker_client()))
 
     def step_refused(self, e: dict, kind: str, head: str, got: subprocess.CompletedProcess) -> str | None:
         """KIND, the step merge_hold named, failed at HEAD (LAND_STEP_BACKOFF's comment). Under the lock. Waits or
@@ -8517,7 +8835,7 @@ class LandQueue:
                 try:
                     with open(logs / f"review-{repo.replace('/', '_')}-{number}-{head[:12]}.log", "ab") as sink:
                         subprocess.Popen([os.fspath(rr), repo, number, "--post"], stdin=subprocess.DEVNULL,
-                                         stdout=sink, stderr=subprocess.STDOUT, env=self.env(), start_new_session=True,
+                                         stdout=sink, stderr=subprocess.STDOUT, env=self.env(e), start_new_session=True,
                                          close_fds=True, cwd=os.environ.get("HOME") or "/")
                     self.finish(e, None, started=True)
                 except OSError as error:

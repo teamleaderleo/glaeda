@@ -1030,7 +1030,11 @@ CMUX_NEXT_DRAIN_HOOK_SHA256 = frozenset({
     "e8b42e4572d6a481e884f36f8165c7c3c936662d9aedaf83991843376b668785",
     "1095242d677e69184c3ed8b0f4d61ae425d7748828261ba944f1e5e24ac69d50",
     "60a45395bbef188d96883903193c37829d4c37f9ed0abab01bb1b6ebac15c67d",
-    "d9a8d210c90e89619e56a0b1f988d0ff427641c6d4642e4302aa711bda279368",
+    "23ae0141055ce1938749f14369a6365b75ae552ee8f3adc11c5d48ce5cb7dc61",
+    "c9cede71a5b59436eb082df629b6350321c80fc4ab562d3973928ac990fc7817",
+    "f9d7999b378ef24c0b35ec6d68a34ace4a6e38c8bbc7a057cf60ce85fcef7938",
+    "604b4875444a2f2a9d8949936c2dcc7750d8ec90cd9bcfe6de3c9063e1e464f6",
+    "1d5b4d3f4f86cb81fb8d6c3bb0426959dec390114bf683bf165646c05812d342",
 })
 CMUX_NEXT_CI_PRESERVED_NAMES = frozenset({
     "SourcePackages", "ModuleCache.noindex", "SDKStatCaches.noindex",
@@ -2456,7 +2460,7 @@ def erase_idle_sim_devices(receipt: Path, halt=None, budget_s: float = SIM_DEVIC
         except (OSError, subprocess.SubprocessError):
             print("refusing to erase simulator devices: ps failed", file=sys.stderr)
             break
-        tokens = sim_tokens()  # every copy (SIM_SLOTS)
+        tokens = sim_tokens()  # every copy (SIM_DYNAMIC)
         if tokens is None:
             print("not erasing simulator devices: a simulator job holds the simulator token", file=sys.stderr)
             break
@@ -2522,17 +2526,20 @@ def sim_token(path: Path | None = None) -> int | None:
     return fd
 
 
-# SIM_SLOTS (glaeda-cmux-runner-hook): a mini may run several simulator jobs, each holding one copy of the token
-# (simulator, simulator-1, ...). The eraser holds every copy the hook can hand out (its MAX_SIM_SLOTS), whatever this
-# mini's --sim-slots: copy 0 alone would let a job start on copy 1 between the last reading and the erase.
-SIM_TOKEN_COPIES = 4  # the hook's MAX_SIM_SLOTS (a test keeps them equal)
+# SIM_DYNAMIC (glaeda-cmux-runner-hook): a mini may run several simulator jobs, each holding one copy of the token
+# (simulator, simulator-1, ...), as many as measured headroom admits up to a ceiling computed on the host. The eraser
+# holds SIM_GATE exclusive, then copy 0 and every copy file that exists: the hook takes a copy past the first only
+# under SIM_GATE shared, so no copy file can appear between this listing and the erase, and none while one is held.
+SIM_GATE = "simulator-copies.gate"  # the hook's SIM_GATE (a test keeps them equal)
 
 
 def sim_tokens() -> list[int] | None:
-    """fds holding every simulator token copy exclusive, or None (holding none) while any is held or cannot be opened."""
+    """fds holding SIM_GATE and every simulator token copy exclusive, or None (holding none) while any is held or
+    cannot be opened."""
     fds: list[int] = []
-    for copy in range(SIM_TOKEN_COPIES):
-        fd = sim_token(SIM_TOKEN if copy == 0 else SIM_TOKEN.with_name(f"simulator-{copy}.token"))
+    copies = sorted(SIM_TOKEN.parent.glob("simulator-*.token"), key=lambda p: (len(p.name), p.name))
+    for path in (SIM_TOKEN.with_name(SIM_GATE), SIM_TOKEN, *copies):
+        fd = sim_token(path)
         if fd is None:
             for held in fds:
                 os.close(held)
