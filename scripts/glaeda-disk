@@ -1005,6 +1005,7 @@ CMUX_NEXT_DRAIN_HOOK_SHA256 = frozenset({
     "1f4d528d5e8fd2687d4ba6972acad4b3a913c614ec37c1031a36ef0c51530426",
     "9d48941838658210beb6c3368ba830d514996b044e7d9215b8e6236f79a9e6b0",
     "a44fdb3563a9b0b6338bfbec0428cf36b06b92c5a659b2e3756f39c9c9a8783f",
+    "22e0b6e8aaeca9e083b92bbf012d53ffd663926dfc8f040446d630d38a83ba52",
 })
 CMUX_NEXT_CI_PRESERVED_NAMES = frozenset({
     "SourcePackages", "ModuleCache.noindex", "SDKStatCaches.noindex",
@@ -1190,13 +1191,17 @@ def remove_canonical_admission(path: Path, whole_root: bool = False) -> bool:
     return False if token is None else remove_under_token(path, token)
 
 
-def remove_under_token(path: Path, token: Path) -> bool:
+def remove_under_token(path: Path, token: Path, deferred: list[Path] | None = None) -> bool:
     """remove_canonical_admission's protocol with the root token named: PATH goes aside under TOKEN held exclusive,
-    as a job holds it, and is deleted outside the lock. False, touching nothing, while a job holds the root."""
+    as a job holds it, and is deleted outside the lock (with deferred, the aside tree is appended there instead).
+    False, touching nothing, while a job holds the root."""
     if not token.parent.is_dir():  # no capacity dir: not a fleet mini, so no job can take the root
-        remove(path)
+        remove(path, deferred=deferred)
         return True
-    # created if missing, as the runner hook's lock_file creates it, so a job arriving now waits on this lock
+    # remove()'s refusals first, so the lock covers only the rename: the runner hook's take of a root token does not
+    # wait (LOCK_NB), and a job admitted on another runner while this holds it passes over the root
+    remove_refusal(path)
+    # created if missing, as the runner hook's lock_file creates it
     fd = os.open(token, os.O_RDONLY | os.O_CREAT | os.O_NOFOLLOW, 0o644)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -1210,7 +1215,7 @@ def remove_under_token(path: Path, token: Path) -> bool:
             os.close(held.pop())
 
     try:
-        remove(path, after_rename=release)
+        remove(path, after_rename=release, deferred=deferred, checked=True)
     finally:
         release()
     return True
@@ -3662,41 +3667,77 @@ def job_end_scratch(roots: list[int], runner: Path | None, receipt: Path, tmp: P
     done: collections.Counter[str] = collections.Counter()
     kept: list[str] = []
     freed = 0
+    aside: list[Path] = []  # renamed out of the way here; a detached child deletes them (delete_detached)
     for kind, path, token in items:
-        seen = tree_newest(path, budget=1_000_000)
-        size = seen[1] if seen else 0
         why = job_end_veto(kind, path, index, cmds, work)
-        outcome = "changed:in-use" if why else "reclaimed"
+        outcome, size = ("changed:in-use" if why else "reclaimed"), None
         if not why:
             try:
-                if token is None:
+                if token is None:  # a temp pack: one file, its bytes are what the unlink frees
+                    size = path.lstat().st_blocks * 512
                     remove(path)
-                elif not remove_under_token(path, token):
+                elif not remove_under_token(path, token, deferred=aside):
                     why, outcome = "a job holds its root", "changed:in-use"
             except FileNotFoundError:
-                size = 0  # another pass took it first
+                why, outcome, size = "already gone (another pass took it)", "gone", None
             except OSError as e:
                 why, outcome = f"incomplete: {e.__class__.__name__}", f"incomplete:{e.__class__.__name__}"
         rec = {"at": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "host": platform.node(), "outcome": outcome,
-               "family": JOB_END_FAMILY, "kind": kind, "path": os.fspath(path), "bytes": 0 if why else size,
+               "family": JOB_END_FAMILY, "kind": kind, "path": os.fspath(path), "bytes": None if why else size,
                "verdict": "blocked" if why else "reclaimable", "reasons": [why or "the job that made it ended"]}
         with contextlib.suppress(OSError):
             receipt.parent.mkdir(parents=True, exist_ok=True)
             with receipt.open("a") as f:
                 f.write(json.dumps(rec) + "\n")
         if why:
-            kept.append(f"{kind} ({why})")
+            if outcome != "gone":
+                kept.append(f"{kind} ({why})")
         else:
             done[kind] += 1
-            freed += size
+            freed += size or 0
     RUN["released"] = RUN.get("released", 0) + freed
     notes = []
+    if aside:
+        notes.append(delete_detached(aside))
     if done:
-        notes.append(f"removed the job's own scratch: {', '.join(f'{n} {k}' for k, n in sorted(done.items()))} "
-                     f"({gib(freed).strip()})")
+        notes.insert(0, f"removed the job's own scratch: {', '.join(f'{n} {k}' for k, n in sorted(done.items()))}")
     if kept:
         notes.append(f"kept {len(kept)}: {'; '.join(kept[:3])}")
     return "; ".join(notes)
+
+
+def delete_detached(trees: list[Path]) -> str:
+    """Delete aside trees (remove()'s DELETING_PREFIX names) in a detached grandchild in its own session, so the runner
+    hook's bound and its group kill never cut a 12-40 GB delete short and its runner takes the next job at once. The
+    child renames each tree to its own pid first (deletion_owner_live keeps it from the interrupted-deletions family
+    while it works); what a killed child leaves that family finishes. Returns a note."""
+    try:
+        pid = os.fork()
+    except OSError as e:
+        for tree in trees:  # no child: delete here, as remove() would have
+            with contextlib.suppress(OSError):
+                shutil.rmtree(tree, onerror=_chmod_retry)
+        return f"deleted {len(trees)} aside tree(s) in place ({e.__class__.__name__} on fork)"
+    if pid:
+        with contextlib.suppress(ChildProcessError):
+            os.waitpid(pid, 0)  # the first child exits at once
+        return f"deleting {len(trees)} aside tree(s) in the background"
+    try:  # the first child: a new session, then the grandchild that does the work
+        os.setsid()
+        if os.fork():
+            os._exit(0)
+        null = os.open(os.devnull, os.O_RDWR)
+        for fd in (0, 1, 2):
+            os.dup2(null, fd)
+        for tree in trees:
+            with contextlib.suppress(OSError):
+                mine = tree.with_name(f"{tree.name.rsplit('-', 1)[0]}-{os.getpid()}")
+                os.rename(tree, mine)
+                tree = mine
+            with contextlib.suppress(OSError):
+                shutil.rmtree(tree, onerror=_chmod_retry)
+    finally:
+        os._exit(0)
 
 
 def job_end_runner(home: Path | None = None) -> Path | None:
@@ -11131,14 +11172,23 @@ def write_eviction_summary(receipt: Path, operation: str, logical_released: int,
     return record
 
 
-def remove(path: Path, after_rename=None) -> None:
-    """Delete path. `after_rename` runs once the tree is out of the way, before the long delete."""
+def remove_refusal(path: Path) -> None:
+    """remove()'s refusals: raises OSError for a kept toolchain or role path, a symlink or a mount point."""
     if toolchain_held(path, fresh=True):
         raise OSError("refusing the job toolchain (toolchain_keep)")
     if path.is_symlink():
         raise OSError("refusing symlink")
     if os.path.ismount(path) or path.lstat().st_dev != path.parent.stat().st_dev:
         raise OSError("refusing a mount point")
+
+
+def remove(path: Path, after_rename=None, deferred: list[Path] | None = None, checked: bool = False) -> None:
+    """Delete path. `after_rename` runs once the tree is out of the way, before the long delete; with `deferred` a
+    directory's aside tree is appended there and left for the caller to delete. `checked`: remove_refusal ran."""
+    if not checked:
+        remove_refusal(path)
+    elif path.is_symlink():  # the rename below must still never move a link a race put in its place
+        raise OSError("refusing symlink")
     if not path.is_dir():
         path.unlink()
         return
@@ -11149,6 +11199,9 @@ def remove(path: Path, after_rename=None) -> None:
     os.rename(path, doomed)
     if after_rename is not None:
         after_rename()
+    if deferred is not None:
+        deferred.append(doomed)
+        return
     shutil.rmtree(doomed, ignore_errors=False, onerror=_chmod_retry)
 
 

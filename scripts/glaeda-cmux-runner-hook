@@ -4672,8 +4672,9 @@ def evict_own_checkout(workspace: str | None, explicit: str | None, timeout: flo
 # in the canonical roots it held, and git temp packs (a cancelled fetch's, or borrow_mirror's timed-out repack's) in
 # this runner's checkouts. At job end, not an idle window later: Leo, 2026-11-17, "there are dozens if not hundreds of
 # gb of build stuff that just keep getting accumulated". Started only when a listing of those few directories finds
-# one, so an ordinary job pays a handful of scandirs; the runner waits for it before its next job, bounded.
-JOB_END_SCRATCH_TIMEOUT_S = 90.0
+# one, so an ordinary job pays a handful of scandirs. The runner waits only for the look (glaeda-disk's lsof, at most
+# 120 s, and the renames under each root token); the deletes run detached (glaeda-disk delete_detached).
+JOB_END_SCRATCH_TIMEOUT_S = 150.0
 JOB_END_GIT_TEMP = re.compile(r"tmp_[a-z]+_[A-Za-z0-9]{6,}|\.tmp-[0-9]+-pack-.+")  # glaeda-disk GIT_GARBAGE_NAME
 JOB_END_DISCARD = re.compile(r"\.derived-data\.discard-[0-9]+")  # glaeda-disk KEPT_DISCARD_RE
 
@@ -4692,13 +4693,17 @@ def job_end_scratch_found(roots: list[int], work: str | None) -> bool:
         if any(n.startswith(".product-pack.") for n in names(root)) \
                 or any(JOB_END_DISCARD.fullmatch(n) for n in names(store)):
             return True
-    if work:
-        for repo in names(work):
-            if repo.startswith(("_", ".")):
+    if work:  # every checkout glaeda-disk's runner_checkouts lists (_work/<repo>/<checkout>); the fan-out dirs' tmp_obj_*
+        for repo in names(work):  # are a few KiB and wait for the idle pass, not worth 256 listings per job
+            if repo.startswith("_"):
                 continue
-            objects = os.path.join(work, repo, repo, ".git", "objects")
-            if any(JOB_END_GIT_TEMP.fullmatch(n) for d in (objects, os.path.join(objects, "pack")) for n in names(d)):
-                return True
+            for checkout in names(os.path.join(work, repo)):
+                if checkout.startswith("_"):
+                    continue
+                objects = os.path.join(work, repo, checkout, ".git", "objects")
+                if any(JOB_END_GIT_TEMP.fullmatch(n) for d in (objects, os.path.join(objects, "pack"))
+                       for n in names(d)):
+                    return True
     return False
 
 

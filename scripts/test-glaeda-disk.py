@@ -2513,8 +2513,17 @@ class GlaedaDiskTest(unittest.TestCase):
         fcntl.flock(job, fcntl.LOCK_EX)
         receipt = self.receipt()
         env = {"RUNNER_NAME": "mini-glaeda-4", "RUNNER_TEMP": os.fspath(runner / "_work" / "_temp")}
+        detached: list[Path] = []
+
+        def delete_now(trees):  # delete_detached forks; its own test below
+            for tree in trees:
+                self.assertTrue(tree.name.startswith(gd.DELETING_PREFIX), tree)
+                shutil.rmtree(tree)
+            detached.extend(trees)
+            return f"deleting {len(trees)} aside tree(s) in the background"
         with mock.patch.object(gd, "CANONICAL_CAPACITY", capacity), mock.patch.object(gd, "HOME", home), \
-                mock.patch.object(gd, "host_reservation", return_value=""), mock.patch.dict(os.environ, env):
+                mock.patch.object(gd, "host_reservation", return_value=""), mock.patch.dict(os.environ, env), \
+                mock.patch.object(gd, "delete_detached", side_effect=delete_now):
             found = gd.job_end_runner(home)
             self.assertEqual(found, runner)
             # a command naming the checkout (a fetch still running) keeps its temp packs
@@ -2529,6 +2538,7 @@ class GlaedaDiskTest(unittest.TestCase):
             with mock.patch.dict(os.environ, {"RUNNER_NAME": "mini-glaeda-5"}):
                 self.assertIsNone(gd.job_end_runner(home), "another runner's name: not this runner's job")
         self.assertFalse(stage.exists() or discard.exists() or (pack / "tmp_pack_q1w2e3").exists())
+        self.assertEqual(len(detached), 2, "the two root items go aside and are deleted detached; a temp pack in place")
         for stays in (live, tmp / "cmux-ci-2" / "derived-data-compile-admission", tmp / "cmux-ci-3" / ".product-pack.Other1",
                       tmp / "cmux-ci" / ".product-pack.Root1x", ci / "cmux-ci-2" / "derived-data",
                       ci / "spm-scratch" / "abc123", pack / "pack-1.pack"):
@@ -2555,6 +2565,19 @@ class GlaedaDiskTest(unittest.TestCase):
         # the idle catch-up: a .product-pack.* staging dir is an admission item of its root
         fams = gd.canonical_admission_families(tmp)
         self.assertIn(".product-pack.", next(f for f in fams if f.root == tmp / "cmux-ci-2").include)
+
+    def test_job_end_deletes_run_detached_and_survive_the_callers_group_kill(self) -> None:
+        """The hook kills glaeda-disk's process group at its bound; a 12-40 GB discard's delete must outlive that, so
+        it runs in a grandchild in its own session, under its own pid's aside name."""
+        trees = []
+        for name in ("a", "b"):
+            tree = make(self.root / f"{gd.DELETING_PREFIX}{name}-{os.getpid()}", age_hours=0)
+            trees.append(tree)
+        self.assertIn("in the background", gd.delete_detached(trees))
+        deadline = time.monotonic() + 20
+        while list(self.root.glob(f"{gd.DELETING_PREFIX}*")) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        self.assertEqual(list(self.root.glob(f"{gd.DELETING_PREFIX}*")), [])
 
     def test_job_end_scratch_main_reads_the_runner_from_the_environment(self) -> None:
         called = []
@@ -5873,8 +5896,8 @@ class GlaedaDiskTest(unittest.TestCase):
         removed: list[str] = []
         real_remove = gd.remove
 
-        def remove(path, after_rename=None):
-            real_remove(path, after_rename)
+        def remove(path, after_rename=None, **kw):
+            real_remove(path, after_rename, **kw)
             removed.append(str(path))
             state["free"] += int(freed_gib * gd.GIB)
         return (mock.patch.object(gd, "free_bytes", side_effect=lambda _p: (state["free"], 460 * gd.GIB)),
