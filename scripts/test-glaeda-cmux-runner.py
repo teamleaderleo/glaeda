@@ -1361,6 +1361,48 @@ class HookTest(unittest.TestCase):
         finally:
             self.finish("")
 
+    def test_the_nightly_slot_admits_a_stack_blocker_pull_request_job(self) -> None:
+        """STACK_SLOT: cmux routes a labelled same-repository pull request's Mac jobs to the nightly slot's label, so
+        the base-red repair skips the side label's queue. The slot admits it; an unlabelled or fork pull request
+        is still refused; and a NIGHTLY_SIGNING reservation, which admits the slot's nightly jobs, refuses it."""
+        self.assertIsNone(hook.nightly_slot_refusal(hook.TIER_STACK))
+        self.assertIn(hook.STACK_BLOCKER_LABEL, hook.nightly_slot_refusal(""))
+        fleet = self.fleet()
+
+        def pull(labels: list, head: str = "manaflow-ai/cmux") -> Path:
+            return event(self.dir, "stack-pr", {
+                "repository": CMUX,
+                "pull_request": {"number": 45498, "labels": labels, "head": {"repo": {"full_name": head}},
+                                 "base": {"repo": CMUX}}})
+
+        env = {"GITHUB_REF": "refs/pull/45498/merge", "GITHUB_JOB": "daemon-test",
+               "GITHUB_WORKFLOW_REF": "manaflow-ai/cmux/.github/workflows/cmux-next.yml@refs/pull/45498/merge"}
+        args = ("--allowed-repo", "manaflow-ai/cmux", "--no-disk", "--watch-pid", str(os.getpid()),
+                "--state-dir", os.fspath(self.dir / "state"), "--gui-wait", "0", "--nightly-runner")
+        label = [{"name": hook.STACK_BLOCKER_LABEL}]
+        try:
+            admitted = self.run_hook("job-started", "pull_request", pull(label), *args, repo="manaflow-ai/cmux",
+                                     env=env)
+            self.assertEqual(admitted.returncode, 0, admitted.stdout + admitted.stderr)
+            self.finish("")
+            for name, payload in (("no label", pull([{"name": "full-ci"}])),
+                                  ("a fork", pull(label, "someone/cmux"))):
+                with self.subTest(name):
+                    refused = self.run_hook("job-started", "pull_request", payload, *args, repo="manaflow-ai/cmux",
+                                            env=env)
+                    self.assertEqual(refused.returncode, 1, refused.stdout + refused.stderr)
+                    self.assertIn("the nightly slot admits only nightly jobs", refused.stdout)
+            now = int(time.time())
+            (fleet / "reservation.json").write_text(json.dumps({
+                "schema": "glaeda-reservation/v1", "owner": "cmux-nightly", "since": now - 5, "until": now + 600,
+                "purpose": hook.NIGHTLY_SIGNING_PURPOSE + "a mini"}))
+            held = self.run_hook("job-started", "pull_request", pull(label), *args, repo="manaflow-ai/cmux", env=env)
+            self.assertEqual(held.returncode, 1, held.stdout + held.stderr)
+            self.assertIn("host reserved by cmux-nightly", held.stdout)
+        finally:
+            (fleet / "reservation.json").unlink(missing_ok=True)
+            self.finish("")
+
     def test_disk_pressure_never_fails_and_is_bounded(self) -> None:
         marker = self.dir / "disk-ran"
         slow = make_executable(self.dir / "glaeda-disk-slow", "import time, pathlib, sys\n"

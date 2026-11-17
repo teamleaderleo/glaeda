@@ -2795,13 +2795,27 @@ def gateway_jobs_note() -> str:
     return ", ".join(f"{workflow} {job}" for workflow, job in sorted(GATEWAY_JOBS))
 
 
+# STACK_SLOT: the nightly slot also admits a stack-blocker PR job (TIER_STACK, stack_blocker_tier). FEED_FIRST ranks
+# one only among the jobs a mini's runners already took, and GitHub hands a queued job to the next idle runner of its
+# label in arrival order, so on a busy side label the job that repairs a base red waited behind every PR job queued
+# before it. claude-sr2-coord, 2026-11-17, for cmux#45498 (it repairs "cloud.team.sessions is not in the action
+# catalog", which failed cmux-next daemon tests on every feat-cmux-next head) while glaeda-side-std-xcode-26.6 held
+# about 70 queued jobs: "A base-red repair jumping the Mac queue is a route we need every day ... build it as the
+# standing mechanism (the stack-blocker path), with a test." cmux routes a labelled same-repository pull request's Mac
+# jobs to this slot's label; here it waits for units right after nightly jobs (admission_rank), as on any runner. It
+# takes none of a nightly job's passes: no NIGHTLY_SIGNING reservation admits it (job-started), it yields to a waiting
+# fleet build (NIGHTLY_WAITER) and it holds no other runner's gate. Only a person with triage or write access can
+# label a pull request, and the slot is an ordinary side instance (no trustedRef), so it trusts nothing a side runner
+# does not.
 def nightly_slot_refusal(tier: str) -> str | None:
-    """Why the nightly slot refuses a job of this job_tier(), or None: it takes only nightly jobs (NIGHTLY_SLOT)."""
-    if tier == TIER_NIGHTLY:
+    """Why the nightly slot refuses a job of this tier, or None: it takes nightly jobs (NIGHTLY_SLOT) and stack-blocker
+    PR jobs (STACK_SLOT). `tier` is job_tier()'s answer, else stack_blocker_tier()'s."""
+    if tier in (TIER_NIGHTLY, TIER_STACK):
         return None
     return ("the nightly slot admits only nightly jobs (nightly.yml on nightly-next or main, main's DEV daily publish, "
             "main's nightly-next canary and launch smoke, the Release compile that gates nightly-next's promotion, "
-            f"and the release and pin builds: {release_pin_note()})")
+            f"and the release and pin builds: {release_pin_note()}) and a same-repository pull request labelled "
+            f"{STACK_BLOCKER_LABEL}")
 
 
 def hosted_route_refusal(workflow_ref: str | None, job: str | None) -> str | None:
@@ -12368,10 +12382,13 @@ def main(argv: list[str] | None = None) -> int:
         # every class, the general pool included: a job cmux routes to a hosted runner is never taken here
         if why := hosted_route_refusal(os.environ.get("GITHUB_WORKFLOW_REF"), os.environ.get("GITHUB_JOB")):
             return refused(why)
+        slot_tier = ""  # the nightly slot's job: its tier (NIGHTLY_SLOT, STACK_SLOT)
         if args.nightly_runner:
-            why = nightly_slot_refusal(job_tier(os.environ.get("GITHUB_EVENT_NAME"), os.environ.get("GITHUB_REF"),
-                                                os.environ.get("GITHUB_REPOSITORY"), event,
-                                                os.environ.get("GITHUB_WORKFLOW_REF"), os.environ.get("GITHUB_JOB")))
+            slot_tier = job_tier(os.environ.get("GITHUB_EVENT_NAME"), os.environ.get("GITHUB_REF"),
+                                 os.environ.get("GITHUB_REPOSITORY"), event, os.environ.get("GITHUB_WORKFLOW_REF"),
+                                 os.environ.get("GITHUB_JOB")) or stack_blocker_tier(
+                os.environ.get("GITHUB_EVENT_NAME"), os.environ.get("GITHUB_REPOSITORY"), event)
+            why = nightly_slot_refusal(slot_tier)
             if why:
                 return refused(why)
         if args.dev_compile_runner:
@@ -12400,8 +12417,9 @@ def main(argv: list[str] | None = None) -> int:
             if why:
                 return refused(why)
         # a dedicated builder is not a pool runner: a reservation of the mini's pool never refuses its one job shape
+        # STACK_SLOT: a NIGHTLY_SIGNING reservation admits only the nightly slot's nightly jobs, never a PR job there
         why = None if args.dedicated_admit else reservation_refusal(args.reservation, time.time(), taken_job=True,
-                                                                    nightly_slot=bool(args.nightly_runner))
+                                                                    nightly_slot=slot_tier == TIER_NIGHTLY)
         disk_path = os.path.dirname(args.host_lock)
         disk_deadline = time.monotonic() + EVICT_TIMEOUT_S  # one budget for every eviction of this job-started
         # a nightly job short of disk goes first here (NIGHTLY_DISK_RESERVE): no new job starts on this mini while it
