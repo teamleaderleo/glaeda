@@ -153,6 +153,17 @@ LAN_ATTEMPTS = 4
 LAN_BUSY_BACKOFF = (10.0, 30.0)
 LAN_RETRY_BACKOFF = (2.0, 8.0)
 LAN_BUSY_BUDGET = 120.0  # seconds a busy seeder is waited for, from the first attempt
+# What the seed archive holds (glaeda-disk evicts on it). A mini whose LAN seeder is the seed archive on
+# cmux-lawrence (glaeda-seed-lan install --role archive) asks it `seed-list-v1` once per applied run and writes
+# the answer to ARCHIVE_LIST in its work folder (STATE/.prefetch). glaeda-disk runs under Homebrew python3,
+# which Local Network Privacy keeps off the LAN, so it reads this file instead of asking: a local seed the
+# archive lists may go before its idle window, since a later miss comes back from the archive over the LAN
+# (63 to 184 s) instead of from R2 or a rebuild. Only the archive is asked: on the trusted seeder, glaeda-disk's
+# archived_seeds reads a client that lists as the archive's filler, so a PR mini must never list there.
+# A PR mini never uploads a seed: seeds are trusted bytes, and the archive takes them only from the seeder.
+ARCHIVE_SEEDERS = ("cmux-lawrence",)
+ARCHIVE_LIST = "archive-seeds.json"
+ARCHIVE_LIST_TIMEOUT = 30  # the whole ask, every address; a run never waits longer for it
 
 
 def running_commands() -> list[str] | None:
@@ -304,7 +315,9 @@ def lan_config(path: Path | None = None) -> dict | None:
     identity, known_hosts = path.parent / "id_ed25519", path.parent / "known_hosts"
     if not identity.is_file() or not known_hosts.is_file():
         return None
-    return {"user": user, "addresses": addresses, "identity": identity, "known_hosts": known_hosts}
+    seeder = raw.get("seeder") if isinstance(raw.get("seeder"), str) else ""
+    return {"user": user, "addresses": addresses, "identity": identity, "known_hosts": known_hosts,
+            "seeder": seeder}
 
 
 def zstd_tool() -> str | None:
@@ -345,6 +358,57 @@ def lan_candidates(mirror: Path, store: Path, head: str) -> tuple[list[str], str
             break
         keys.append(key)
     return keys, "" if keys else "the nearest seed is kept here"
+
+
+def seed_list(config: dict, address: str, timeout: float) -> tuple[list[tuple[str, int]], str]:
+    """The seeder's kept seeds (key, mtime) as `seed-list-v1` answers, newest first, or [] and why."""
+    proc = subprocess.Popen(ssh_command(config, address, "seed-list-v1"), stdin=subprocess.DEVNULL,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    try:
+        out, err = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.communicate()
+        return [], "seed-list-v1 timed out"
+    head, _, body = out.partition(b"\n")
+    while head and not head.startswith(SERVE_HEADER) and body:  # a noisy login shell printed first
+        head, _, body = body.partition(b"\n")
+    words = head[len(SERVE_HEADER):].decode(errors="replace").split()
+    if not head.startswith(SERVE_HEADER) or len(words) != 2 or words[0] != "list" or not words[1].isdigit():
+        detail = " ".join(words)[:120] or err.decode(errors="replace").strip()[-160:] or f"exit {proc.returncode}"
+        return [], f"seeder: {detail}"
+    kept = []
+    for line in body.decode(errors="replace").splitlines()[:int(words[1])]:
+        parts = line.split()
+        if len(parts) == 2 and KEY_RE.fullmatch(parts[0]) and parts[1].isdigit():
+            kept.append((parts[0], int(parts[1])))
+    return kept, ""
+
+
+def record_archive_list(work: Path, config: dict | None, timeout: float = ARCHIVE_LIST_TIMEOUT) -> dict:
+    """Ask the seed archive what it holds and write it to WORK/ARCHIVE_LIST for glaeda-disk; the outcome.
+
+    Only when this mini's LAN seeder is the archive. Each address in turn, within TIMEOUT in all. A failed
+    ask writes nothing: glaeda-disk ignores a list older than its bound, and the seeds keep their window.
+    """
+    if not config or config.get("seeder") not in ARCHIVE_SEEDERS:
+        return {"state": "off", "reason": "the LAN seeder is not the seed archive"}
+    deadline = time.monotonic() + timeout
+    why = "no address"
+    for address in config["addresses"]:
+        left = deadline - time.monotonic()
+        if left <= 0:
+            why = "seed-list-v1 timed out"
+            break
+        kept, why = seed_list(config, address, left)
+        if not why:
+            record = {"schema": 1, "time": int(time.time()), "seeder": config["seeder"], "address": address,
+                      "keys": [key for key, _ in kept]}
+            incoming = work / f".{ARCHIVE_LIST}.{os.getpid()}"
+            incoming.write_text(json.dumps(record) + "\n")
+            incoming.rename(work / ARCHIVE_LIST)
+            return {"state": "listed", "count": len(kept), "address": address}
+    return {"state": "error", "reason": why}
 
 
 def ssh_command(config: dict, address: str, request: str) -> list[str]:
@@ -1109,6 +1173,8 @@ def run(apply: bool, state: Path = STATE) -> dict:
             record["thawed"] = thawed
         if not roots:
             return {**record, "state": "skip", "reason": "no owned job has recorded a seed prefix on this mini"}
+        if apply:  # first: glaeda-disk needs the list even when no seed is due, and when git fetch fails
+            record["archive_list"] = record_archive_list(work, lan_config())
         try:
             mirror, head = main_head(work)
         except (OSError, subprocess.SubprocessError) as error:

@@ -1805,6 +1805,14 @@ cmux-lawrence runs no jobs and has TBs of SSD. It keeps every seed cmux15 keeps,
   free. Serving a seed touches it.
 - **Serving.** `glaeda-seed-serve --role archive` refuses everything on a host that has a glaeda runner
   receipt.
+- **Evicting against it.** On a PR mini whose seeder is the archive, each applied `glaeda-seed-prefetch` run
+  first asks the archive for `seed-list-v1` (30 s at most) and writes the answer to
+  `/Users/Shared/cmux-build-fleet/ci/.prefetch/archive-seeds.json`. glaeda-disk runs off the LAN, so it reads
+  that file, ignoring it after 30 minutes. A local seed the archive lists goes without waiting out its idle
+  window, and a later miss streams it back from the archive. The newest two seeds of each root stay. An unlisted
+  seed keeps its window. A PR mini never uploads a seed: the archive takes bytes only from the trusted seeder.
+  On cmux15, glaeda-disk reads the same thing from its serve log (the filler's lists). That is why a PR mini asks
+  only a seeder named in `ARCHIVE_SEEDERS`.
 
 ```sh
 # the archive as a client of the trusted seeder

@@ -1076,7 +1076,7 @@ def fleet_families(ci: Path | None = None) -> list[Family]:
                            platform="macos"))
         # Seeds: the root's newest SEED_KEEP of its current prefix stay (seed_verdict); older and other
         # fingerprints' seeds go LRU. A seed comes back from the LAN seeder or the bucket in 25 to 280 s.
-        # On the trusted seeder, one the seed archive already holds goes without waiting (archived_seeds).
+        # One the seed archive already holds goes without waiting, on every mini (archived_seeds).
         fams.append(Family("cmux-seeds", store / "seeds", True,
                            "glaeda-seed-prefetch or the next job fetches it again", build_output=True,
                            owner="cmux seed_derived_data.py (CMUX_SEED_LOCAL_CACHE)", rebuild_minutes=4,
@@ -1392,10 +1392,39 @@ def emergency_devs(fss: "dict[int, Fs]", emergency: str, floor_gib: float = 0.0)
 # The trusted seeder's serve log (glaeda-seed-serve): the seed archive on cmux-lawrence's SSD fills itself from
 # it every 5 minutes (glaeda-seed-archive), asking seed-list-v1 and then one seed-v1 per seed it lacks.
 SEED_SERVE_LOG = HOME / ".local/state/glaeda/seed-serve/serve.jsonl"
+# Every other mini whose LAN seeder is the archive: the archive's own `seed-list-v1` answer, which
+# glaeda-seed-prefetch (the LAN-capable agent; this one runs under Homebrew python3, off the LAN) writes to
+# FLEET_CI/.prefetch/archive-seeds.json each run. Older than this, it proves nothing: the archive prunes.
+ARCHIVE_LIST = Path(".prefetch") / "archive-seeds.json"  # under FLEET_CI (glaeda-seed-prefetch ARCHIVE_LIST)
+SEED_KEY_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,199}")  # a seed directory name (no dot, no slash)
+ARCHIVE_LIST_MAX_AGE = 1800  # six prefetch runs; the archive prunes oldest first, so a listed seed is rarely next
 
 
-def archived_seeds(log: Path | None = None) -> frozenset[str]:
-    """Seed keys the seed archive holds, as far as this seeder's serve log (and the rotated one) can show.
+def archive_listed_seeds(path: Path | None = None, now: float | None = None) -> frozenset[str]:
+    """Seed keys the seed archive listed within ARCHIVE_LIST_MAX_AGE, as glaeda-seed-prefetch recorded them.
+
+    A PR job can write this file, as it can the seeds: a forged list only makes a seed go early, and the next
+    job fetches it again (from the archive, R2, or by building). A missing, malformed or stale list is empty,
+    and the seeds keep their usual window: a PR mini never uploads a seed, since the archive takes trusted
+    bytes from the trusted seeder only, so an unlisted seed waits out its window as before.
+    """
+    path = FLEET_CI / ARCHIVE_LIST if path is None else path
+    now = time.time() if now is None else now
+    try:
+        record = json.loads(path.read_text(errors="replace")[:1 << 20])
+    except (OSError, ValueError, RecursionError):
+        return frozenset()
+    if not isinstance(record, dict) or record.get("schema") != 1 or not isinstance(record.get("keys"), list):
+        return frozenset()
+    stamp = record.get("time")
+    if not isinstance(stamp, int) or isinstance(stamp, bool) or not 0 <= now - stamp <= ARCHIVE_LIST_MAX_AGE:
+        return frozenset()
+    return frozenset(k for k in record["keys"] if isinstance(k, str) and SEED_KEY_RE.fullmatch(k))
+
+
+def archived_seeds(log: Path | None = None, listing: Path | None = None) -> frozenset[str]:
+    """Seed keys the seed archive holds: what it listed to this mini (archive_listed_seeds), and on the trusted
+    seeder what its serve log (and the rotated one) can show.
 
     Only the archive's filler asks seed-list-v1, so a client address that lists is the archive. A clean
     `served` alone is not enough: the filler still checks and renames the file afterwards and drops it on
@@ -1429,7 +1458,7 @@ def archived_seeds(log: Path | None = None) -> frozenset[str]:
             decided.add(key)  # only a key's newest request counts
             if outcome == "served" and r.get("status") == 0 and lists.get(client, 0) >= 2:
                 held.add(key)
-    return frozenset(held)
+    return frozenset(held) | archive_listed_seeds(listing)
 
 
 # cmux's media tour (cmux-next-media.yml) builds two apps per tour slot into

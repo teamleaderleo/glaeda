@@ -2672,6 +2672,45 @@ class GlaedaDiskTest(unittest.TestCase):
         for name in ("p-a", "p-b", "p-d", "p-e"):
             self.assertTrue((ci / "seeds" / name).exists(), name)
 
+    def test_a_seed_the_archive_listed_goes_without_waiting_on_any_mini(self) -> None:
+        ci = self.root / "ci"
+        (ci / "seeds").mkdir(parents=True)
+        (ci / "seed-source.json").write_text(json.dumps({"prefix": "p-"}))
+        for name, age in (("p-a", 0.2), ("p-b", 0.3), ("p-c", 1), ("p-d", 2)):
+            make(ci / "seeds" / name, age_hours=age)
+        listing = ci / gd.ARCHIVE_LIST
+        listing.parent.mkdir()
+
+        def listed(keys: list, age: float = 60, **kw) -> None:
+            listing.write_text(json.dumps({"schema": 1, "time": int(time.time() - age), "keys": keys, **kw}))
+
+        listed(["p-a", "p-c", "../p-d", ".p-d", 7, "p-x"])
+        self.assertEqual(gd.archive_listed_seeds(listing), {"p-a", "p-c", "p-x"})
+        for bad in (lambda: listed(["p-c"], age=gd.ARCHIVE_LIST_MAX_AGE + 60),  # stale: the archive may have pruned
+                    lambda: listed(["p-c"], age=-3600),  # from the future
+                    lambda: listed(["p-c"], schema=2),
+                    lambda: listing.write_text("[" * 5000),
+                    lambda: listing.write_text(json.dumps({"schema": 1, "time": True, "keys": ["p-c"]}))):
+            bad()
+            self.assertEqual(gd.archive_listed_seeds(listing), frozenset())
+        self.assertEqual(gd.archive_listed_seeds(self.root / "missing.json"), frozenset())
+        listed(["p-a", "p-c"])
+        missing_log = self.root / "no-serve-log.jsonl"  # a PR mini: no seed serve log at all
+        self.assertEqual(gd.archived_seeds(missing_log, listing), {"p-a", "p-c"})
+        with mock.patch.object(gd, "SEED_SERVE_LOG", missing_log), mock.patch.object(gd, "FLEET_CI", ci), \
+                mock.patch.object(gd, "cmux_active", lambda *a, **k: True):
+            items = gd.survey(gd.fleet_families(ci), 24, 0)
+            got = {Path(i.path).name: (i.verdict, i.reasons) for i in items}
+            self.assertEqual(got["p-a"][0], "kept")  # the newest two stay, listed or not
+            self.assertEqual(got["p-b"][0], "kept")
+            self.assertEqual(got["p-c"], ("reclaimable", ["the seed archive holds it"]))
+            self.assertEqual(got["p-d"][0], "recent")  # not listed: its usual window
+            fams = {f.id: f for f in gd.fleet_families(ci)}
+            gd.apply([i for i in items if i.verdict == "reclaimable"], fams, self.root / "r.jsonl", None, 24)
+        self.assertFalse((ci / "seeds/p-c").exists())
+        for name in ("p-a", "p-b", "p-d"):
+            self.assertTrue((ci / "seeds" / name).exists(), name)
+
     def test_pressure_targets_are_per_filesystem(self) -> None:
         make(self.root / "old")
         items = gd.survey([self.fam], 24, 0)
