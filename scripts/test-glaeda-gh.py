@@ -17519,6 +17519,17 @@ class LandTest(Base):
                 self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "own_red"))
                 self.assertIn(f"it changes {files[-1]}, which 'rust workspaces' can read", json.dumps(e["history"]))
 
+    def test_a_refused_rerun_stops_own_red_and_is_never_sent_again(self):
+        self.unrelated_world(["webviews/src/a.ts"])
+        self.w.gh_rc["rerun"] = 1
+        self.land()
+        self.w.answers.append(self.own_red())
+        e = self.tick()
+        self.assertEqual(len(self.w.gh_calls("run", "rerun")), 1)
+        self.assertEqual((e["state"], e["stop"]["code"], e["unrelatedReruns"]),
+                         ("stopped", "own_red", [f"{LA}|{self.RUN}"]))
+        self.assertIn("the rerun of run 44118660533 failed: rerun refused", json.dumps(e["history"]))
+
     def test_a_workflow_with_no_rule_stops_without_reading_the_files(self):
         self.unrelated_world(["webviews/src/a.ts"])
         del self.w.config["unrelatedReds"]  # o/r has no rule: a change can affect every workflow

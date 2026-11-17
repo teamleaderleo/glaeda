@@ -8797,6 +8797,10 @@ class LandQueue:
         got = self.call([gh, "run", "rerun", str(run), "--failed", "-R", repo], LAND_GH_DEADLINE, e)
         with self.lock:
             self.finish(e, got)
+            if got.returncode != 0:  # refused: the stop goes ahead, naming the red as before
+                self.history(e, "no_unrelated_rerun", why=land_trim(f"the rerun of run {run} failed: "
+                                                                   f"{got.stderr or got.stdout}", 200))
+                return False
             self.nudge(e["key"])
             self.wait(e, {"kind": "pr", "sha": head, "rerun": True,
                           "why": f"reran run {run}, a red the change cannot affect"}, LAND_WAIT_DEFAULT)
