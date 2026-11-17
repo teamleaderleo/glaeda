@@ -382,9 +382,9 @@ PRIVACY_SKIP_NAMES = (
 # accounting `du -xk -d 1 /System/Volumes/Data/Users` (-d only limits what du prints) went through 113 checks
 # on other apps' data in ~/Library/Containers and Group Containers and then into ~/Library/Photos, and macOS
 # asked "Allow worker-<sha> to access your photo library?". These names are skipped only by a walk whose root
-# reaches a home's Library (walk_reaches_a_home_library): elsewhere a build folder named Photos or Messages is
-# a real folder and is sized. Those below Application Support (AddressBook, CallHistoryDB, ...) and Metadata
-# (CoreSpotlight) are skipped by name at any depth inside such a walk.
+# reaches a home's guarded Library folders (walk_reaches_a_home_library): elsewhere a build folder named Photos
+# or Messages is a real folder and is sized. Those below Application Support (AddressBook, CallHistoryDB, ...)
+# and Metadata (CoreSpotlight) are skipped by name at any depth inside such a walk.
 LIBRARY_PRIVACY_SKIP_NAMES = (
     "Photos", "Containers", "Group Containers", "Daemon Containers",
     "Mail", "Messages", "Safari", "Calendars", "Reminders", "HomeKit", "Cookies", "IdentityServices",
@@ -394,16 +394,32 @@ LIBRARY_PRIVACY_SKIP_NAMES = (
 )
 
 
+# Below a home's Library, only these walks can reach a guarded folder by name. Any other root there (Caches,
+# Developer/CoreSimulator, a cmux-next CI cache) keeps every name: a simulator's data/Containers or a build tree's
+# Mail fixture is real data glaeda sizes, and BSD du's -I matches a name at any depth.
+LIBRARY_GUARDED_PARENTS = ((), ("Application Support",), ("Metadata",))
+
+
 def walk_reaches_a_home_library(root: Path) -> bool:
-    """A du walk of ROOT can enter some home's ~/Library: ROOT is /, the Data volume, /Users, a home, or a
-    home's Library (or below it); likewise this process's own HOME, its ancestors and its Library."""
+    """A du walk of ROOT can enter the guarded folders of some home's ~/Library: ROOT is /, the Data volume,
+    /Users, a home (not /Users/Shared), its Library, or that Library's Application Support or Metadata; likewise
+    this process's own HOME and its ancestors."""
     parts = Path(os.path.abspath(root)).parts
     if parts[:4] == ("/", "System", "Volumes", "Data"):
         parts = ("/", *parts[4:])
-    if len(parts) == 1 or parts[:2] == ("/", "Users"):
-        return len(parts) <= 3 or parts[3] == "Library"
-    home = Path(os.path.abspath(HOME)).parts
-    return parts == home[:len(parts)] or parts[:len(home) + 1] == (*home, "Library")
+
+    def at_or_above_library(parts: tuple, home: tuple) -> bool:
+        if parts == home[:len(parts)]:
+            return True
+        if parts[:len(home) + 1] != (*home, "Library"):
+            return False
+        return tuple(parts[len(home) + 1:]) in LIBRARY_GUARDED_PARENTS
+
+    if len(parts) == 1 or parts == ("/", "Users"):
+        return True
+    if parts[:2] == ("/", "Users") and parts[2] != "Shared":
+        return at_or_above_library(parts, parts[:3])
+    return at_or_above_library(parts, Path(os.path.abspath(HOME)).parts)
 
 
 def privacy_guarded(parent: Path, name: str) -> bool:

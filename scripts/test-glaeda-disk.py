@@ -8741,7 +8741,7 @@ class VolumeCensusTest(unittest.TestCase):
                 mock.patch.object(gd, "_du_output", side_effect=fake):
             for root in (Path("/"), Path("/System/Volumes/Data"), Path("/System/Volumes/Data/Users"),
                          Path("/Users"), Path("/Users/cmux"), Path("/Users/cmux/Library"),
-                         Path("/Users/cmux/Library/Group Containers"), home, home / "Library"):
+                         Path("/Users/cmux/Library/Application Support"), home, home / "Library"):
                 seen.clear()
                 gd.du_bytes(root, record_timeout=False)
                 gd.du_children(root, record_timeout=False)
@@ -8752,8 +8752,11 @@ class VolumeCensusTest(unittest.TestCase):
                     for name in guarded:
                         self.assertIn(name, ignored(argv), (root, argv))
                     self.assertEqual(argv[-1], str(root))
-            for root in (Path("/Users/Shared/cmux-build-fleet/cache"), Path("/Users/cmux/Projects/cmux"),
-                         home / "Projects"):
+            # below a Library only its own guarded parents: a simulator's data/Containers stays sized
+            for root in (Path("/Users/Shared/cmux-build-fleet/cache"), Path("/Users/Shared"),
+                         Path("/System/Volumes/Data/Users/Shared"), Path("/Users/cmux/Projects/cmux"),
+                         Path("/Users/cmux/Library/Caches"), Path("/Users/cmux/Library/Developer/CoreSimulator"),
+                         home / "Projects", home / "Library" / "Caches"):
                 self.assertNotIn("Photos", ignored(gd._census_du_argv(root)), root)
                 self.assertNotIn("Messages", ignored(["du", *gd.du_skip_args(root), str(root)]), root)
         with mock.patch.object(gd, "DARWIN", False):
@@ -8762,12 +8765,14 @@ class VolumeCensusTest(unittest.TestCase):
     def test_the_census_never_opens_a_privacy_guarded_folder(self) -> None:
         # The census lists the Data volume a directory at a time; opening ~/Pictures or ~/Library/Photos asks a
         # person (cmux19, 2026-11-17). Those are named as skipped, never listed; a build folder that happens to be
-        # called Photos outside a Library is still walked.
+        # called Photos outside a Library, or a simulator's data/Containers, is still walked. _census_du answers
+        # None (as for a timed-out du), so the census opens every directory it does not skip.
         home = self.root / "Users" / "cmux"
+        sim = "Users/cmux/Library/Developer/CoreSimulator/Devices/u/data/Containers"
         for rel in ("Users/cmux/Pictures/Photos Library.photoslibrary/db", "Users/cmux/Library/Photos/x",
                     "Users/cmux/Library/Containers/c/y", "Users/cmux/Library/Group Containers/g/y",
                     "Users/cmux/Library/Application Support/AddressBook/z", "Users/cmux/Library/Caches/z",
-                    "Users/cmux/Projects/app/Photos/p", "Users/cmux/Projects/app/Desktop/d"):
+                    "Users/cmux/Projects/app/Photos/p", "Users/cmux/Projects/app/Desktop/d", f"{sim}/app/s"):
             self.write(rel)
         opened: list[str] = []
         listdir = os.listdir
@@ -8777,7 +8782,8 @@ class VolumeCensusTest(unittest.TestCase):
             return listdir(path)
 
         with mock.patch.object(gd, "DARWIN", True), mock.patch.object(gd, "HOME", home), \
-                mock.patch.object(gd.os, "listdir", side_effect=spy):
+                mock.patch.object(gd.os, "listdir", side_effect=spy), \
+                mock.patch.object(gd, "_census_du", return_value=None):
             state = gd.census_pass([self.root], set(), budget_s=1000, path=self.state)
         self.assertTrue(state["complete"])
         for rel in ("Users/cmux/Pictures", "Users/cmux/Library/Photos", "Users/cmux/Library/Containers",
@@ -8786,7 +8792,7 @@ class VolumeCensusTest(unittest.TestCase):
             self.assertFalse([p for p in opened if p == str(self.root / rel) or p.startswith(f"{self.root / rel}/")],
                              rel)
             self.assertEqual(state["rows"][str(self.root / rel)][1], "skipped", rel)
-        for rel in ("Users/cmux/Library/Caches", "Users/cmux/Projects/app/Photos"):
+        for rel in ("Users/cmux/Library/Caches", "Users/cmux/Projects/app/Photos", sim):
             self.assertIn(str(self.root / rel), opened, rel)
         with mock.patch.object(gd, "DARWIN", False), mock.patch.object(gd, "HOME", home):
             self.assertFalse(gd.privacy_guarded(home, "Pictures"))  # Linux has no TCC
