@@ -2456,7 +2456,7 @@ class DaemonTest(Base):
         self.daemon.tick(NOW + 100)
         self.daemon.tick(NOW + 100 + gg.CYCLE)
         hour = gg.read_json(gg.BASE / "daemon.json")["lastHour"]
-        self.assertEqual(hour, {"rest": 1, "rest304": 1, "graphql": 0, "free": 0, "write": 0})
+        self.assertEqual(hour, {"rest": 1, "rest304": 1, "graphql": 0, "free": 0, "write": 0, "kept": 0})
         self.gh.runs[7] = {"id": 7, "status": "queued"}
         self.daemon.tick(NOW + 100 + 3700)
         self.assertEqual(gg.read_json(gg.BASE / "daemon.json")["lastHour"]["rest304"], 0)  # an hour later
