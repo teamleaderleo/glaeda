@@ -1001,6 +1001,7 @@ CMUX_NEXT_DRAIN_HOOK_SHA256 = frozenset({
     "1f4d528d5e8fd2687d4ba6972acad4b3a913c614ec37c1031a36ef0c51530426",
     "9d48941838658210beb6c3368ba830d514996b044e7d9215b8e6236f79a9e6b0",
     "a44fdb3563a9b0b6338bfbec0428cf36b06b92c5a659b2e3756f39c9c9a8783f",
+    "be1ed2a3f8540a5958b3b842c4e52fa1ae5496632beacddaa563bfa8d9028470",
 })
 CMUX_NEXT_CI_PRESERVED_NAMES = frozenset({
     "SourcePackages", "ModuleCache.noindex", "SDKStatCaches.noindex",
@@ -9443,7 +9444,10 @@ def runner_floor_gib(home: Path = HOME) -> float:
 # writer stamps expires 13 h after each write and refreshes it every 6 h). The host-local reservation
 # (FLEET_ROOT/reservation.json, glaeda-reservation/v1, the one the runner hook reads) counts too. Fails closed: a
 # missing, unreadable, malformed or expired list, or one with no expires, reads as reserved, whatever the
-# host-local file says.
+# host-local file says, except a missing list on a host that runs no controller worker (controller_worker_host): there
+# a missing list means no reservations, and cleanup proceeds (2026-11-17: passes on such hosts logged "fleet
+# reservations unreadable (FileNotFoundError); kept as reserved" and deleted nothing). A list that is there but
+# unreadable, malformed or expired, or one missing where a controller worker runs or may run, still fails closed.
 FLEET_RESERVATIONS: Path | None = None  # None: fleet_reservations_path(); tests point it at a fixture
 FLEET_RESERVATIONS_NAME = ".local/share/glaeda/fleet-reservations.json"
 UPDATE_CONFIG = HOME / ".config/glaeda/update.json"
@@ -9497,11 +9501,29 @@ def _str_list(value: Any, what: str) -> list[str]:
     return value
 
 
+def controller_worker_host() -> bool:
+    """Whether a cmuxterm-hq controller worker (HQ_BUILD_WORKERS) runs, or may run, on this host: its LaunchDaemon
+    plist is there, or launchctl knows the service. False only on macOS when every one is proven absent (no plist and
+    launchctl's 113, "could not find service"); off macOS, or when launchctl fails or hangs, True (fail-safe)."""
+    if not DARWIN:
+        return True
+    for job in HQ_BUILD_WORKERS:
+        label = job.rsplit("/", 1)[-1]
+        try:
+            if Path("/Library/LaunchDaemons", f"{label}.plist").exists():
+                return True
+            if subprocess.run(["launchctl", "print", job], capture_output=True, timeout=10).returncode != 113:
+                return True
+        except (OSError, subprocess.SubprocessError):
+            return True
+    return False
+
+
 def host_reservation(now: float | None = None, path: Path | None = None, names: set[str] | None = None,
                      local: Path | None = None, update: Path | None = None) -> str:
     """Why this host is reserved now ("" when it is not): an active fleet reservation naming it (or an alias), an
     active host-local reservation, or a reservation list that is unreadable or malformed anywhere, or missing on a
-    host that is not a hygiene-only Mac."""
+    host that runs a controller worker (controller_worker_host) and is not a hygiene-only Mac."""
     now = time.time() if now is None else now
     names = host_names() if names is None else {n.lower() for n in names}
     try:
@@ -9528,8 +9550,10 @@ def host_reservation(now: float | None = None, path: Path | None = None, names: 
         if hit:
             return hit
     except FileNotFoundError:
-        if not hygiene_only_mac(update):  # a personal Mac never gets the fleet's list; a fleet mini without it fails closed
-            return "fleet reservations unreadable (FileNotFoundError); kept as reserved"
+        # a personal Mac never gets the fleet's list, nor does a host with no controller worker (the writer's hosts);
+        # a controller-worker host without it fails closed
+        if not hygiene_only_mac(update) and controller_worker_host():
+            return "fleet reservations unreadable (FileNotFoundError) on a controller-worker host; kept as reserved"
     except (OSError, ValueError, KeyError, TypeError) as error:
         return f"fleet reservations unreadable ({type(error).__name__}); kept as reserved"
     marker = HOST_RESERVATION_LOCAL if local is None else local

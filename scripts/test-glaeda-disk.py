@@ -11973,6 +11973,10 @@ class HostReservationTest(unittest.TestCase):
         update = mock.patch.object(gd, "UPDATE_CONFIG", self.update)
         update.start()
         self.addCleanup(update.stop)
+        # a controller-worker host unless a test says otherwise: the fail-closed side
+        self.worker = mock.patch.object(gd, "controller_worker_host", return_value=True)
+        self.worker.start()
+        self.addCleanup(self.worker.stop)
         self.list.write_text(json.dumps({"schema": "glaeda-fleet-reservations/v1", "expires": "2026-10-27T13:00:00Z",
                                          "aliases": {"cmux30": ["cmux-thirty"]},
                                          "reservations": [{"id": "r1", "owner": "someone", "hosts": ["cmux30"],
@@ -12014,6 +12018,54 @@ class HostReservationTest(unittest.TestCase):
         self.local.unlink()
         self.list.write_text("{nope")
         self.assertIn("unreadable", self.reserved({"air-blue"}), "a list that is there but broken fails closed")
+
+    def test_a_missing_list_without_a_controller_worker_reserves_nothing(self) -> None:
+        """Coordinator, 2026-11-17: "A missing reservations file on a host with no controller worker means no
+        reservations. An unreadable existing file, or a controller-worker host, stays fail-safe."""
+        self.list.unlink()
+        with mock.patch.object(gd, "controller_worker_host", return_value=False):
+            self.assertEqual(self.reserved({"cmux31"}), "", "missing, no controller worker: no reservations")
+            now = int(self.during)
+            self.local.write_text(json.dumps({"schema": "glaeda-reservation/v1", "owner": "fleet",
+                                              "since": now - 60, "until": now + 60}))
+            self.assertIn("host reservation by fleet", self.reserved({"cmux31"}), "a host-local marker still holds")
+            self.local.unlink()
+            for broken in ("{nope", json.dumps({"reservations": []}), json.dumps(
+                    {"reservations": [], "expires": "2026-10-26T00:00:00Z"})):
+                with self.subTest(broken=broken):
+                    self.list.write_text(broken)  # there but unreadable, malformed or expired: fails closed
+                    self.assertIn("kept as reserved", self.reserved({"cmux31"}))
+            self.list.write_bytes(b"\xff\xfe")
+            self.assertIn("kept as reserved", self.reserved({"cmux31"}), "undecodable bytes")
+            self.list.unlink()
+            self.list.mkdir()  # there but not a file (IsADirectoryError): fails closed
+            self.assertIn("kept as reserved", self.reserved({"cmux31"}))
+            self.list.rmdir()
+        self.assertIn("on a controller-worker host; kept as reserved", self.reserved({"cmux31"}),
+                      "missing on a controller-worker host: fails closed")
+
+    def test_a_controller_worker_host_is_read_from_launchd(self) -> None:
+        self.worker.stop()
+        self.addCleanup(self.worker.start)
+        with mock.patch.object(gd, "DARWIN", False):
+            self.assertTrue(gd.controller_worker_host(), "off macOS: unknown, fail-safe")
+        absent = mock.Mock(returncode=113)
+        with mock.patch.object(gd, "DARWIN", True), mock.patch.object(gd.Path, "exists", return_value=False), \
+                mock.patch.object(gd.subprocess, "run", return_value=absent) as run:
+            self.assertFalse(gd.controller_worker_host(), "no plist, launchctl: could not find service")
+            self.assertEqual([c.args[0][-1] for c in run.call_args_list], list(gd.HQ_BUILD_WORKERS))
+        with mock.patch.object(gd, "DARWIN", True), mock.patch.object(gd.Path, "exists", return_value=False), \
+                mock.patch.object(gd.subprocess, "run", side_effect=[absent, mock.Mock(returncode=0)]):
+            self.assertTrue(gd.controller_worker_host(), "the lent worker is loaded")
+        with mock.patch.object(gd, "DARWIN", True), mock.patch.object(gd.Path, "exists", return_value=False), \
+                mock.patch.object(gd.subprocess, "run", return_value=mock.Mock(returncode=5)):
+            self.assertTrue(gd.controller_worker_host(), "launchctl failed otherwise: not proven absent")
+        with mock.patch.object(gd, "DARWIN", True), mock.patch.object(gd.Path, "exists", return_value=False), \
+                mock.patch.object(gd.subprocess, "run", side_effect=subprocess.TimeoutExpired("launchctl", 10)):
+            self.assertTrue(gd.controller_worker_host(), "launchctl hung: not proven absent")
+        with mock.patch.object(gd, "DARWIN", True), mock.patch.object(gd.Path, "exists", return_value=True), \
+                mock.patch.object(gd.subprocess, "run", return_value=absent):
+            self.assertTrue(gd.controller_worker_host(), "its LaunchDaemon plist is installed")
 
     def test_the_host_local_reservation_counts(self) -> None:
         now = int(self.during)

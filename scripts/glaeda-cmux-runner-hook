@@ -109,7 +109,8 @@ shared unit; its gate is never held for CPU saturation or the units (GATEWAY).
 Every runner warns while free disk is under its job-started hook's --min-free-gib and starts the same bounded
 eviction in the background while it keeps listening (Gate.low_disk), except that an idle pool runner stops
 listening while free disk is under one job's measured peak (job_disk_gib, DISK_SHORT_HOLD), where a job it took could
-not fit. Full means every
+not fit, or under 10 GiB plus one runner job's measured p95 disk for each job in flight on the host and the next
+(RUNNER_JOBS_DISK). Full means every
 unit this runner's own --capacity-units scans, read from its job-started hook, is taken or kept for an idle gui
 runner's reserve; for a root runner it also means the mini cannot admit a compile or an app-host shard (mini_full).
 """
@@ -818,16 +819,22 @@ _LOAD = object()
 def job_needs_path() -> Path:
     """JOB_NEEDS_ENV, else the file beside this hook (a checkout's scripts/), else the runner copy's
     (~/glaeda-runner/scripts, which glaeda-cmux-runner-fleet stages and glaeda-update keeps at the release's)."""
-    env = os.environ.get(JOB_NEEDS_ENV)
+    return staged_data_path(JOB_NEEDS_NAME, JOB_NEEDS_ENV)
+
+
+def staged_data_path(name: str, env_name: str) -> Path:
+    """A data file shipped with the runner files: env_name's path, else the file beside this hook, else the runner
+    copy's (~/glaeda-runner/scripts)."""
+    env = os.environ.get(env_name)
     if env:
         return Path(env)
     here = globals().get("__file__") or ""  # the plan runs this hook from stdin: no file beside it then
-    staged = Path("glaeda-runner/scripts") / JOB_NEEDS_NAME
+    staged = Path("glaeda-runner/scripts") / name
     if here and not here.startswith("<"):
         hook_dir = Path(here).resolve().parent
         # beside it (a checkout, the staged copy), else the staged copy beside the runner install that holds this
         # glaeda-hooks/ (~/actions-runner-glaeda-K/glaeda-hooks -> ~/glaeda-runner/scripts), whatever HOME says
-        for candidate in (hook_dir / JOB_NEEDS_NAME, hook_dir.parent.parent / staged):
+        for candidate in (hook_dir / name, hook_dir.parent.parent / staged):
             if candidate.is_file():
                 return candidate
     return Path.home() / staged
@@ -1206,6 +1213,90 @@ def listener_disk_peak(scope: "RunnerScope") -> tuple[float, str]:
     if scope.small:
         return min(SMALL_JOB_DISK_GIB, job_disk_gib()), "the small jobs' measured peak plus margin (SMALL_ONLY)"
     return job_disk_gib(), "one job's measured peak"
+
+
+# RUNNER_JOBS_DISK (coordinator, 2026-11-17: "Admit a runner job only if 10 GiB + 5.3 GiB per job in flight (from hq
+# build-fleet/runner-job-disk.json) stays free. That's how cmux17 hit 26 GiB"). The listener hold above counts one job;
+# the jobs already running beside it were not counted, so several jobs admitted together each saw room and then wrote
+# the disk down together (2026-11-02..15: 8.9% of M6 runner jobs saw under 15 GiB free, the lowest 0.1 GiB, on
+# cmux17, cmux21 and cmux22). An idle pool runner's listener is held while free disk is under RUNNER_JOBS_FLOOR_GIB
+# plus one runner job's measured p95 disk for each job in flight on the host and for the one it would take: held, it
+# takes nothing and the job waits or goes to a runner with room. Slower, never failed: job-started admits as before.
+# The per-job value is RUNNER_JOB_DISK_NAME's disk_gib_p95, a byte copy of cmuxterm-hq build-fleet/runner-job-disk.json
+# (data/job_needs.py writes it from job-needs.json's all.disk_gib_p95; the controller's runner_disk.go reserves the same
+# value per PR job on a lent host, the twin of this rule). Copy hq's file over it to refresh it; a missing, unreadable
+# or malformed file turns this hold off (the one-job hold stays) rather than guessing a number.
+RUNNER_JOB_DISK_SCHEMA = "glaeda-runner-job-disk/v1"
+RUNNER_JOB_DISK_NAME = "glaeda-runner-job-disk.json"
+RUNNER_JOB_DISK_ENV = "GLAEDA_RUNNER_JOB_DISK_FILE"  # another file (tests; a host-local trial)
+RUNNER_JOB_DISK_MAX_GIB = 1000.0
+RUNNER_JOBS_FLOOR_GIB = 10.0  # the controller's hard disk floor, which hq's runnerJobsLeaveRoom adds the jobs to
+_RUNNER_JOB_DISK_CACHE: dict[str, Any] = {}
+
+
+def runner_job_disk(path: Path | None = None) -> tuple[float | None, str]:
+    """(one runner job's measured p95 disk in GiB, where it came from), or (None, why there is none), from
+    RUNNER_JOB_DISK_NAME; cached by the file's size and mtime, as the gate reads it every poll."""
+    path = path or staged_data_path(RUNNER_JOB_DISK_NAME, RUNNER_JOB_DISK_ENV)
+    try:
+        st = path.stat()
+        key = (os.fspath(path), st.st_size, st.st_mtime_ns)
+        cached = _RUNNER_JOB_DISK_CACHE.get("file")
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        with open(path, "rb") as handle:
+            data = handle.read(1 << 16)
+    except OSError as error:
+        return None, f"{path.name} is unreadable ({type(error).__name__})"
+    try:
+        doc = json.loads(data)
+    except (ValueError, UnicodeDecodeError, RecursionError):
+        answer: tuple[float | None, str] = (None, f"{path.name} is not JSON")
+    else:
+        value = doc.get("disk_gib_p95") if isinstance(doc, dict) else None
+        if not isinstance(doc, dict) or doc.get("schema") != RUNNER_JOB_DISK_SCHEMA:
+            answer = (None, f"{path.name}'s schema is not {RUNNER_JOB_DISK_SCHEMA}")
+        elif isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) \
+                or not 0 < value <= RUNNER_JOB_DISK_MAX_GIB:
+            answer = (None, f"{path.name} has no disk_gib_p95 in (0, {RUNNER_JOB_DISK_MAX_GIB:g}]")
+        else:
+            window = doc.get("window") if isinstance(doc.get("window"), dict) else {}
+            answer = (float(value), f"the p95 of {doc.get('disk_n', '?')} jobs, "
+                                    f"{window.get('from', '?')}..{window.get('to', '?')}")
+    _RUNNER_JOB_DISK_CACHE["file"] = (key, answer)
+    return answer
+
+
+def runner_dirs(home: Path) -> list[Path]:
+    """Every runner install in home (~/actions-runner*, pool and dedicated): the most jobs it can run at once."""
+    try:
+        return [d for d in home.glob("actions-runner*") if d.is_dir() and not d.is_symlink()]
+    except OSError:
+        return []
+
+
+def runner_jobs_in_flight(home: Path, own: Path, table: dict[int, tuple[int, str]]) -> int:
+    """The runner jobs running on this host: a Runner.Worker of any runner install in home other than own (the idle
+    runner asking), from a process table (processes())."""
+    pattern = re.compile(r"(?:^|\s)" + re.escape(os.fspath(home)) +
+                         r"/(actions-runner[^/\s]*)/bin(?:\.[^/\s]+)?/Runner\.Worker(?:\s|$)")
+    return sum(1 for _ppid, command in table.values()
+               if (match := pattern.search(command)) and match.group(1) != own.name)
+
+
+def runner_jobs_need_gib(in_flight: int, per_job_gib: float) -> float:
+    """The free disk one more job needs: RUNNER_JOBS_FLOOR_GIB + per_job_gib for each job in flight and for it."""
+    return round(RUNNER_JOBS_FLOOR_GIB + per_job_gib * (in_flight + 1), 1)
+
+
+def runner_jobs_refusal(free: float, in_flight: int, per_job_gib: float, source: str) -> str | None:
+    """Why an idle listener takes no job for disk with in_flight jobs running beside it (RUNNER_JOBS_DISK), or None."""
+    need = runner_jobs_need_gib(in_flight, per_job_gib)
+    if free >= need:
+        return None
+    return (f"{free:.1f} GiB free, {need:g} GiB required: {RUNNER_JOBS_FLOOR_GIB:g} GiB + {per_job_gib:g} GiB "
+            f"for each of {in_flight} runner job{'s' if in_flight != 1 else ''} in flight and this one "
+            f"({RUNNER_JOB_DISK_NAME}: {source})")
 
 
 # LABEL_DISK: `label-disk-samples` reads each label's measured job disk growth on a mini, `label-disk-table` pools the
@@ -8823,6 +8914,16 @@ class Gate:
                 self.evict_idle_in_background(path, target + GATE_DISK_RESUME_GIB)
             return (f"disk: {short} for {whose}, cleanup requested; holding the listener so the "
                     "job goes to a runner with room (DISK_SHORT_HOLD)")
+        if not scope.dedicated and not nightly_own and not scope.gateway and scope.min_free_gib > 0:
+            crowded = self.runner_jobs_short(path)
+            if crowded:
+                why_jobs, need = crowded
+                target = max(floor, need)
+                self.evict_in_background(path, target)
+                if reserve:
+                    self.evict_idle_in_background(path, target + GATE_DISK_RESUME_GIB)
+                return (f"disk: {why_jobs}, cleanup requested; holding the listener so the job goes to a runner "
+                        "with room (RUNNER_JOBS_DISK)")
         if why:
             self.evict_in_background(path, floor)
             if scope.dedicated or reserve:
@@ -8832,6 +8933,25 @@ class Gate:
                 gate_log(f"disk warning: {why}{reserve}; keeping the listener online and requesting cleanup")
                 self.disk_warned_at = now
         return None
+
+    def runner_jobs_short(self, path: str) -> tuple[str, float] | None:
+        """RUNNER_JOBS_DISK: (why, the free disk wanted) when free disk is under the floor plus one measured job's
+        disk for each runner job in flight here and the next, else None. The process table is read only when the
+        free disk could be short with every runner install busy; no per-job value, no free-disk reading or no
+        process table: None (the one-job hold still stands)."""
+        per, source = runner_job_disk()
+        free = free_or_none(path)
+        if per is None or free is None:
+            return None
+        home = self.runner_dir.parent
+        if free >= runner_jobs_need_gib(max(0, len(runner_dirs(home)) - 1), per):
+            return None
+        try:
+            in_flight = runner_jobs_in_flight(home, self.runner_dir, processes())
+        except Exception:  # noqa: BLE001
+            return None
+        why = runner_jobs_refusal(free, in_flight, per, source)
+        return (why, runner_jobs_need_gib(in_flight, per)) if why else None
 
     def evict_idle_in_background(self, path: str, target: float) -> None:
         """Below a builder's floor or reserve, reclaim idle PR runners' _work in a bounded thread

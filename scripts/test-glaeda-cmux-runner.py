@@ -10365,18 +10365,22 @@ class GateTest(unittest.TestCase):
         self.assertTrue(hook.runner_scope(small).small)
         self.assertFalse(hook.runner_scope(small).root, "a small runner is never a root runner")
         self.assertFalse(hook.runner_scope(side).small)
-        free = {"gib": 12.0}
+        free = {"gib": 16.0}
         usage = lambda _path: mock.Mock(free=int(free["gib"] * 1024**3))  # noqa: E731
         with mock.patch.object(hook.shutil, "disk_usage", side_effect=usage), \
+                mock.patch.object(hook, "processes", return_value={}), \
                 mock.patch.dict(os.environ, {hook.DISK_JOB_PEAK_ENV: "20"}):
             side_gate = hook.Gate(side, os.fspath(self.lock), os.fspath(self.tmp / "none.json"), self.state)
             small_gate = hook.Gate(small, os.fspath(self.lock), os.fspath(self.tmp / "none.json"), self.state)
             with mock.patch.object(side_gate, "evict_in_background"), \
                     mock.patch.object(small_gate, "evict_in_background") as cleanup:
                 why = side_gate.low_disk()
-                self.assertIn("DISK_SHORT_HOLD", why or "", "the heavy label still waits at 12 GiB")
-                self.assertIn("12.0 GiB free, 20 GiB required", why or "")
-                self.assertIsNone(small_gate.low_disk(), "the small label admits at 12 GiB")
+                self.assertIn("DISK_SHORT_HOLD", why or "", "the heavy label still waits at 16 GiB")
+                self.assertIn("16.0 GiB free, 20 GiB required", why or "")
+                self.assertIsNone(small_gate.low_disk(), "the small label admits at 16 GiB with nothing in flight")
+                free["gib"] = 12.0
+                why = small_gate.low_disk()
+                self.assertIn("RUNNER_JOBS_DISK", why or "", "10 GiB + 5.3 GiB for its own job is not free at 12")
                 free["gib"] = 7.5
                 why = small_gate.low_disk()
                 self.assertIn("DISK_SHORT_HOLD", why or "")
@@ -10405,6 +10409,110 @@ class GateTest(unittest.TestCase):
             cleanup.reset_mock()
             self.assertIsNone(gate.low_disk(), "over both the peak and the floor: listening, no cleanup")
             cleanup.assert_not_called()
+
+    def runner_job_disk_file(self, p95: float) -> Path:
+        path = self.tmp / "runner-job-disk.json"
+        path.write_text(json.dumps({"schema": hook.RUNNER_JOB_DISK_SCHEMA, "disk_gib_p95": p95, "disk_n": 11438,
+                                    "window": {"from": "2026-11-02", "to": "2026-11-15"}}))
+        return path
+
+    def workers(self, *runners: str) -> dict[int, tuple[int, str]]:
+        """A process table with a Runner.Worker of each named runner install beside self.runner, plus noise that is no
+        job of this host's runners: a listener, and a Worker of a runner install outside this home."""
+        table = {100 + i: (1, f"{self.tmp}/{name}/bin/Runner.Worker spawnclient 1 2") for i, name in enumerate(runners)}
+        table[90] = (1, f"{self.tmp}/actions-runner-glaeda-2/bin/Runner.Listener run --startuptype service")
+        table[91] = (1, "/home/runner/actions-runner/cached/bin/Runner.Worker spawnclient 3 4")
+        return table
+
+    def test_an_idle_runner_counts_the_jobs_in_flight_before_it_takes_one(self) -> None:
+        """RUNNER_JOBS_DISK (coordinator, 2026-11-17: "Admit a runner job only if 10 GiB + 5.3 GiB per job in flight
+        (from hq build-fleet/runner-job-disk.json) stays free"). Over one job's peak (DISK_SHORT_HOLD lets it listen),
+        an idle pool runner beside two running jobs is held until 10 + 5.3 x 3 = 25.9 GiB is free; the value per job
+        is the file's, and a held listener only waits: job-started is not involved."""
+        write_hook(self.runner, "exec python3 /hook job-started --min-free-gib 30 --capacity-units 14\n")
+        for name in ("actions-runner-glaeda-2", "actions-runner-glaeda-3", "actions-runner-glaeda-4"):
+            (self.tmp / name).mkdir()
+        disk = self.runner_job_disk_file(5.3)
+        gate = hook.Gate(self.runner, os.fspath(self.lock), os.fspath(self.tmp / "none.json"), self.state)
+        free = {"gib": 25.0}
+        table = {"now": self.workers("actions-runner-glaeda-2", "actions-runner-glaeda-3", self.runner.name)}
+        usage = lambda _path: mock.Mock(free=int(free["gib"] * 1024**3))  # noqa: E731
+        with mock.patch.object(hook.shutil, "disk_usage", side_effect=usage), \
+                mock.patch.object(hook, "processes", side_effect=lambda: table["now"]) as ps, \
+                mock.patch.object(gate, "evict_in_background") as cleanup, \
+                mock.patch.dict(os.environ, {hook.DISK_JOB_PEAK_ENV: "20", hook.RUNNER_JOB_DISK_ENV: os.fspath(disk)}):
+            why = gate.low_disk()
+            self.assertIn("RUNNER_JOBS_DISK", why or "", "two jobs in flight (its own Worker and others' are not)")
+            self.assertIn("25.0 GiB free, 25.9 GiB required: 10 GiB + 5.3 GiB for each of 2 runner jobs in flight "
+                          "and this one", why or "")
+            self.assertIn("the p95 of 11438 jobs, 2026-11-02..2026-11-15", why or "")
+            self.assertEqual(cleanup.call_args.args[1], 30.0, "cleanup aims at the floor, over the need")
+            self.assertIn("RUNNER_JOBS_DISK", gate.claimed() or "", "an idle look holds the listener")
+            free["gib"] = 26.0
+            self.assertIsNone(gate.low_disk(), "room for both jobs in flight and the next one: listening")
+            free["gib"] = 21.0
+            table["now"] = self.workers("actions-runner-glaeda-2")
+            self.assertIsNone(gate.low_disk(), "one job in flight: 20.6 GiB is enough")
+            table["now"] = self.workers("actions-runner-glaeda-2", "actions-runner-glaeda-3")
+            self.assertIn("21.0 GiB free, 25.9 GiB required", gate.low_disk() or "", "a second one starts")
+            disk.write_text(disk.read_text().replace("5.3", "4.0"))
+            free["gib"] = 22.5
+            self.assertIsNone(gate.low_disk(), "the value is the file's: 10 + 4 x 3 = 22, not 25.9")
+            free["gib"] = 21.5
+            self.assertIn("21.5 GiB free, 22 GiB required", gate.low_disk() or "")
+            ps.reset_mock()
+            free["gib"] = 100.0
+            self.assertIsNone(gate.low_disk())
+            ps.assert_not_called()  # every runner install busy would still fit: no process table read
+            free["gib"] = 21.5
+            disk.unlink()
+            self.assertIsNone(gate.low_disk(), "no measured value: no guess, the one-job hold alone")
+            disk = self.runner_job_disk_file(5.3)
+            ps.side_effect = subprocess.TimeoutExpired("ps", 30)
+            self.assertIsNone(gate.low_disk(), "no process table: the one-job hold alone")
+
+    def test_the_jobs_in_flight_hold_never_stops_a_running_job(self) -> None:
+        """Busy, never failed: a runner with a job keeps it whatever the jobs beside it leave free."""
+        write_hook(self.runner, "exec python3 /hook job-started --min-free-gib 30 --capacity-units 5\n")
+        (self.tmp / "actions-runner-glaeda-2").mkdir()
+        disk = self.runner_job_disk_file(5.3)
+        with mock.patch.object(hook.shutil, "disk_usage", return_value=mock.Mock(free=21 * 1024**3)), \
+                mock.patch.object(hook, "processes", return_value=self.workers("actions-runner-glaeda-2")), \
+                mock.patch.dict(os.environ, {hook.DISK_JOB_PEAK_ENV: "20", hook.RUNNER_JOB_DISK_ENV: os.fspath(disk)}):
+            gate, stops = self.gate([None] * 3, busy=[True])
+            gate.worker_pids = lambda: [4242]
+            with mock.patch.object(gate, "evict_in_background"):
+                gate.step()
+                self.assertEqual(stops, [], "a runner with a job is never stopped for disk")
+                self.assertFalse(gate.freeze_at_exit, "a disk reading must not arm JOB_END_FREEZE")
+
+    def test_the_shipped_runner_job_disk_is_hqs_measurement(self) -> None:
+        """The per-job value is read from the shipped copy of cmuxterm-hq build-fleet/runner-job-disk.json, staged with
+        the runner files. With GLAEDA_HQ_CHECKOUT set to an HQ checkout, the copy must equal HQ's bytes."""
+        shipped = ROOT / "scripts" / hook.RUNNER_JOB_DISK_NAME
+        doc = json.loads(shipped.read_text())
+        self.assertEqual(doc["schema"], hook.RUNNER_JOB_DISK_SCHEMA)
+        value, source = hook.runner_job_disk(shipped)
+        self.assertEqual(value, doc["disk_gib_p95"])
+        self.assertIn(f"the p95 of {doc['disk_n']} jobs", source)
+        with mock.patch.dict(os.environ, {hook.RUNNER_JOB_DISK_ENV: ""}):
+            self.assertEqual(hook.staged_data_path(hook.RUNNER_JOB_DISK_NAME, hook.RUNNER_JOB_DISK_ENV).resolve(),
+                             shipped.resolve(), "the copy beside the hook")
+        for tool, table in (("glaeda-cmux-runner-fleet", "STAGED"), ("glaeda-update", "RUNNER_FILES")):
+            listed = re.search(rf'^{table} = \((.*?)"\)', (ROOT / "scripts" / tool).read_text(), re.M | re.S)
+            self.assertIn(f'"{hook.RUNNER_JOB_DISK_NAME}', listed[1] if listed else "", f"{tool} ships it ({table})")
+        for bad in (b"{nope", json.dumps({"schema": "x", "disk_gib_p95": 5.3}).encode(),
+                    json.dumps({"schema": hook.RUNNER_JOB_DISK_SCHEMA, "disk_gib_p95": 0}).encode(),
+                    json.dumps({"schema": hook.RUNNER_JOB_DISK_SCHEMA, "disk_gib_p95": True}).encode(),
+                    json.dumps({"schema": hook.RUNNER_JOB_DISK_SCHEMA}).encode()):
+            with self.subTest(bad=bad):
+                path = self.tmp / f"bad-{len(bad)}.json"
+                path.write_bytes(bad)
+                self.assertIsNone(hook.runner_job_disk(path)[0])
+        hq = os.environ.get("GLAEDA_HQ_CHECKOUT")
+        if hq:
+            self.assertEqual(shipped.read_bytes(), (Path(hq) / "build-fleet/runner-job-disk.json").read_bytes(),
+                             "copy HQ's build-fleet/runner-job-disk.json over scripts/" + hook.RUNNER_JOB_DISK_NAME)
 
     def test_a_disk_short_runner_never_stops_or_freezes_its_running_job(self) -> None:
         write_hook(self.runner, "exec python3 /hook job-started --min-free-gib 30 --capacity-units 5\n")
