@@ -187,7 +187,7 @@ BLOCKING_HOOK_STATES = ("blocked", "kept", "skipped")
 GH_BACKOFF = (20, 60, 180)  # seconds slept before each retry of a rate-limited or transient gh call
 RATE_WAIT_MAX = 5 * 60  # a spent quota that resets this soon is waited for; a later reset gives up
 # A failure is waited out to the reset (at most an hour): unposted, another canary's success would
-# promote the release after the 15-minute soak, before the next run could post it.
+# promote the release (no time soak holds it), before the next run could post it.
 FAILURE_WAIT_MAX = 60 * 60
 # Our own gh is the broker chain (the gh-quota shim, the local-build guard, glaeda's broker), and the shim refuses a
 # call in its own words when a shared pool is under its low-water floor. That refusal is a spent quota, not a verdict:

@@ -21,20 +21,21 @@ files, each with exactly one writer so concurrent workflow runs never overwrite 
 
 Hosts read them anonymously (the repository is public) and trust nothing by name: release.json
 must match `releaseSha256`, and every asset must match release.json. Canary only moves forward
-(release.yml checks ancestry). Stable moves to the newest release that has soaked (`SOAK_HOURS`),
-that canary hosts reported success on and none failure (commit statuses `glaeda-ota/<host>`), and
-that descends from the current stable. One canary's success is enough and no host is required, so
-a canary that never reports cannot hold stable, while any canary's failure blocks it (2026-10-19).
-Not only the current canary: with several merges a day the newest release never finishes soaking,
-and stable would starve.
+(release.yml checks ancestry). Stable moves to the newest release that canary hosts reported success
+on and none failure (commit statuses `glaeda-ota/<host>`), and that descends from the current stable.
+No time soak gates it (`SOAK_HOURS` is 0, 2026-11-17; Leo: "I f***ing hate soaks"): the soak held a
+merged quota fix off every host while the fault it fixed went on. An operator may still pass
+`--soak-hours`. One canary's success is enough and no host is required, so a canary that never
+reports cannot hold stable, while any canary's failure blocks it (2026-10-19). Not only the current
+canary: the newest release may have no report yet, and an older healthy one must not starve behind it.
 
 Promotion never waits on the shared GitHub quota (2026-10-20). Canary hosts post their statuses with the
 fleet's one REST quota; when it is spent for hours, no host can say "healthy". Every release also carries
 smoke-<target>.json for each target: release.yml's build extracted that target's hygiene archive on a
 fresh runner and ran the same health checks glaeda-update runs after an install (smoke). A release
 whose every target smoked, that no canary reported failure on, and that no canary reported at all for
-CANARY_SILENT_HOURS past its soak, is promoted on that evidence alone. A canary's failure still blocks
-it: glaeda-update waits up to an hour to post one, well inside that window.
+CANARY_SILENT_HOURS after publication (plus any operator soak), is promoted on that evidence alone. A
+canary's failure still blocks it: glaeda-update waits up to an hour to post one, well inside that window.
 """
 from __future__ import annotations
 
@@ -60,9 +61,12 @@ RELEASE_SCHEMA = "glaeda-release/v1"
 POLICY_SCHEMA = "glaeda-release-policy/v1"
 TARGETS = ("aarch64-apple-darwin", "x86_64-unknown-linux-gnu")
 STATUS_PREFIX = "glaeda-ota/"
-SOAK_HOURS = 6
-# A short window catches immediate install/health regressions. Risk still controls
-# canary coverage, while legacy manifests retain the original six-hour behavior.
+# Promotion waits on canary evidence, never on time (2026-11-17): the default soak is 0, whatever a release's
+# signed policy says. `--soak-hours` (promote.yml's soak_hours input) still lets an operator ask for one.
+SOAK_HOURS = 0
+# The soak each release's policy is signed with. Promotion no longer reads it, but hosts parse release.json
+# with their installed parse_policy, which accepts only these values: signing a new value would make every
+# host that has not updated yet refuse the release.
 RISK_SOAK_HOURS = {"low": 0.25, "normal": 0.25, "high": 0.25}
 HISTORICAL_RISK_SOAK_HOURS = {"low": 2, "normal": 6, "high": 12}
 # No canary host is required: promotion takes one success and no failure. Policies signed before
@@ -340,7 +344,7 @@ def promotion(canary: dict | None, stable: dict | None, statuses: list[dict], no
     if stable is not None and stable["tag"] == canary["tag"]:
         return False, "stable is already the canary"
     policy = parse_policy(canary.get("policy"), legacy=canary.get("policy") is None)
-    soak_hours = policy["soakHours"] if soak_hours is None else soak_hours
+    soak_hours = SOAK_HOURS if soak_hours is None else soak_hours  # the signed policy's soak no longer gates
     published = dt.datetime.fromisoformat(canary["published"].replace("Z", "+00:00"))
     age = (now - published).total_seconds() / 3600
     if age < soak_hours:
@@ -363,7 +367,7 @@ def choose(candidates: list[dict], stable: dict | None, now: dt.datetime,
     """The newest candidate that may become stable, and why (or why none).
 
     Each candidate is {"entry": <canary-shaped entry>, "statuses": [...], "descendsFromStable": bool}.
-    Candidates include releases still soaking: their failures block older releases.
+    Candidates include every release down to stable, healthy or not: a newer one's failure blocks older ones.
     """
     reasons = []
     for candidate in sorted(candidates, key=lambda c: c["entry"]["published"], reverse=True):
@@ -371,7 +375,7 @@ def choose(candidates: list[dict], stable: dict | None, now: dt.datetime,
         if stable is not None and entry["tag"] == stable["tag"]:
             reasons.append(f"{entry['tag']}: already stable")
             break  # everything older is older than stable too
-        policy = parse_policy(candidate.get("policy"), legacy=candidate.get("policy") is None)
+        parse_policy(candidate.get("policy"), legacy=candidate.get("policy") is None)  # malformed raises
         if canary_verdict(candidate["statuses"])[1]:
             # A release's own updater installs its successor, so a canary failure on a newer release can
             # be an older release's fault: nothing older is promoted until a newer one is healthy.
@@ -380,8 +384,7 @@ def choose(candidates: list[dict], stable: dict | None, now: dt.datetime,
         if stable is not None and not candidate.get("descendsFromStable"):
             reasons.append(f"{entry['tag']}: does not descend from stable")
             continue
-        ok, why = promotion(entry, stable, candidate["statuses"], now,
-                            soak_hours if soak_hours is not None else policy["soakHours"],
+        ok, why = promotion(entry, stable, candidate["statuses"], now, soak_hours,
                             smoke_passed=candidate.get("smoked") is True)
         if ok:
             return entry, f"{entry['tag']}: {why}"
@@ -426,7 +429,7 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("promote", help="print stable.json for the best candidate (exit 3 if none)")
     p.add_argument("--candidates", type=Path, required=True, help="JSON lines from `candidate`")
     p.add_argument("--stable", type=Path, help="current stable.json; absent means none yet")
-    p.add_argument("--soak-hours", type=float, help="explicit operator override; otherwise use release policy")
+    p.add_argument("--soak-hours", type=float, help="an operator's explicit soak; default 0 (no time soak)")
     k = sub.add_parser("control", help="print control.json")
     k.add_argument("--paused", choices=("true", "false"), required=True)
     a = ap.parse_args(argv)

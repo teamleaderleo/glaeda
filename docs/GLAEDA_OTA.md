@@ -67,7 +67,7 @@ but still installs through `glaeda-mini-fleet upgrade` (below).
    archive carries `ancestry.txt` (the source's ancestors: a copy an operator staged from one is
    refreshed, a newer one kept) and `hook-history.json` (the SHA-256 of every version of those two
    files, so a newer hook is never downgraded). The canary hosts run no runners, so a hook change is
-   gated by CI, the signed policy soak and these checks, not by a canary status.
+   gated by CI and these checks, not by a canary status.
    The same run brings `~/.local/bin/glaeda-promotion-admit` (HQ's nightly promotion lease runs it
    over ssh; `glaeda-cmux-runner-fleet --apply` installs it on every member it stages) to the
    release's bytes on those runner minis: installed when missing, replaced when `hook-history.json`
@@ -96,16 +96,18 @@ but still installs through `glaeda-mini-fleet upgrade` (below).
 5. **Stable.** `.github/workflows/promote.yml` runs hourly, and each canary run also dispatches it,
    since GitHub's cron can lag for hours. It moves `stable` to the newest release for which all of
    these hold:
-   - the release's signed `policy` is valid and its publication timestamp is older than that policy's
-     soak floor: new releases use a 15-minute window. Historical signed 2/6/12-hour policies remain
-     readable during the transition; manifests without a policy retain the original 6-hour fallback;
+   - the release's signed `policy` is valid. No time soak gates promotion (2026-11-17; Leo: "I
+     f***ing hate soaks"): a six-hour soak held a merged quota fix off every host for hours while
+     the fault it fixed went on. `SOAK_HOURS` is 0 whatever the signed policy's `soakHours` says
+     (still signed at 0.25, and historical 2/6/12, so hosts that have not updated keep accepting
+     new releases); an operator may still dispatch `promote` with a `soak_hours` input;
    - at least one canary host's newest status is success, and no canary host's newest status is a
      failure. No host is required, whatever the risk: a canary that is silent or pending holds
-     nothing once the soak is over. Policies above low risk signed before 2026-10-19 list Air Blue and
+     nothing. Policies above low risk signed before 2026-10-19 list Air Blue and
      Big Red in `requiredHosts`; they still parse, and the list is not enforced. (On 2026-10-19 a spent quota
      kept Air Blue from reporting, and requiring it held stable on one build for 15 hours.);
    - or, when no canary host reported anything (success or failure) for `CANARY_SILENT_HOURS`
-     (2.5 h) past the soak, every target's `smoke-<target>.json` is an asset of the release: the
+     (2.5 h) after publication, every target's `smoke-<target>.json` is an asset of the release: the
      build extracted that target's hygiene archive on a fresh runner and ran the checks
      `glaeda-update` runs after an install. That bounds what a spent shared quota can do to stable;
      a canary's failure, which is waited out for up to an hour, still blocks it;
@@ -242,7 +244,7 @@ tail ~/Library/Logs/glaeda-update.jsonl    # macOS; ~/.local/state/glaeda-update
 ```
 
 A broken release on stable is fixed forward: revert on `main`, and the revert becomes the next
-canary. Dispatching `promote` only runs the same check early; it never skips the soak.
+canary. Dispatching `promote` only runs the same check early; it never skips a canary check.
 
 ## Trust
 

@@ -1230,15 +1230,14 @@ class UpdateTest(unittest.TestCase):
     def test_the_canary_that_installed_a_release_still_nudges_after_its_soak(self) -> None:
         entry = self.server.publish(SOURCES[0])
         published = gu.parse_utc(entry["published"])
-        soak = float(entry["policy"]["soakHours"]) * 3600
-        self.assertGreater(soak, 120)
+        self.assertEqual(float(entry["policy"]["soakHours"]), gr.SOAK_HOURS)  # unsigned policy: no time soak
         with mock.patch.object(gu, "nudge_promotion", return_value="dispatched") as nudge:
             self.assertEqual(self.apply(published + 60)["promotion"], "dispatched")  # the install's nudge
             self.assertNotIn("nudged", self.converge())
-            self.assertNotIn("promotion", self.apply(published + 120))  # current, still soaking
-            self.assertEqual(self.apply(published + soak + 3600)["promotion"], "dispatched")  # after the soak
+            # no soak: the next current run sends the one post-install nudge (statuses may have landed since)
+            self.assertEqual(self.apply(published + 120)["promotion"], "dispatched")
             self.assertEqual(self.converge()["nudged"], entry["tag"])
-            self.assertNotIn("promotion", self.apply(published + soak + 7200))  # once per release
+            self.assertNotIn("promotion", self.apply(published + 7200))  # once per release
         self.assertEqual(nudge.call_count, 2)
 
     def test_a_first_run_that_never_read_the_channel_is_not_converged(self) -> None:
@@ -1441,13 +1440,17 @@ class ReleaseTest(unittest.TestCase):
 
     def test_a_smoked_release_no_canary_could_report_on_is_promoted_after_the_silent_window(self) -> None:
         # 2026-10-19: the fleet's REST quota was spent for hours, no canary could post, stable sat 15 h.
-        canary = self.canary("2026-09-25T00:00:00Z")  # legacy policy: 6 h soak
-        late = dt.datetime(2026, 9, 25, 8, 30, tzinfo=dt.timezone.utc)
+        canary = self.canary("2026-09-25T00:00:00Z")  # no time soak: the silent window runs from publication
+        late = dt.datetime(2026, 9, 25, 2, 30, tzinfo=dt.timezone.utc)
         self.assertTrue(gr.promotion(canary, None, [], late, smoke_passed=True)[0])
-        early = dt.datetime(2026, 9, 25, 8, 29, tzinfo=dt.timezone.utc)
+        early = dt.datetime(2026, 9, 25, 2, 29, tzinfo=dt.timezone.utc)
         ok, why = gr.promotion(canary, None, [], early, smoke_passed=True)
         self.assertFalse(ok)
-        self.assertIn("CI smoke promotes it at 8.5 h", why)
+        self.assertIn("CI smoke promotes it at 2.5 h", why)
+        # an operator's explicit soak still adds to the window
+        self.assertFalse(gr.promotion(canary, None, [], late, soak_hours=6, smoke_passed=True)[0])
+        self.assertTrue(gr.promotion(canary, None, [], late.replace(hour=8, minute=30), soak_hours=6,
+                                     smoke_passed=True)[0])
         self.assertFalse(gr.promotion(canary, None, [], late)[0])  # unsmoked (older) releases need a host
         failed = [self.status("big-red", "failure", "2026-09-25T07:00:00Z")]
         self.assertFalse(gr.promotion(canary, None, failed, late, smoke_passed=True)[0])
@@ -1474,9 +1477,35 @@ class ReleaseTest(unittest.TestCase):
         self.assertTrue(gr.smoked({"assets": assets}))
         self.assertFalse(gr.smoked({"assets": {gr.smoke_asset(TARGET): {}}}))
 
-    def test_promotion_needs_soak_success_and_no_failure(self) -> None:
+    def test_no_time_soak_gates_promotion(self) -> None:
+        # Leo, 2026-11-17: "I f***ing hate soaks". A six-hour soak held a merged quota fix off every host.
+        self.assertEqual(gr.SOAK_HOURS, 0)
+        ok = [self.status("air-blue", "success", "2026-09-25T12:00:00Z")]
+        fresh = self.canary("2026-09-25T12:00:00Z")  # published this instant
+        self.assertTrue(gr.promotion(fresh, None, ok, self.NOW)[0])
+        # whatever soak a release's policy was signed with, current (0.25 h) or historical (12 h)
+        for hours in (0.25, 12):
+            signed = {**fresh, "policy": {**gr.policy_for_paths(["scripts/glaeda-update"]), "soakHours": hours}}
+            self.assertTrue(gr.promotion(signed, None, ok, self.NOW)[0], hours)
+        # a canary failure still blocks at once
+        failed = ok + [self.status("big-red", "failure", "2026-09-25T12:00:00Z")]
+        self.assertFalse(gr.promotion(fresh, None, failed, self.NOW)[0])
+        self.assertEqual(gr.promotion(fresh, None, [], self.NOW), (False, "no canary host reported success"))
+        # an operator's explicit soak is still honoured
+        self.assertEqual(gr.promotion(fresh, None, ok, self.NOW, soak_hours=6),
+                         (False, "canary soaking: 0.0 h of 6 h"))
+        # through choose: promoted at once, ancestry still enforced, a failure still blocks
+        stable = {**self.entry("b", "2026-09-25T01:00:00Z"), "ring": "stable"}
+        candidate = {"entry": fresh, "statuses": ok, "descendsFromStable": True}
+        self.assertEqual(gr.choose([candidate], stable, self.NOW)[0]["tag"], fresh["tag"])
+        chosen, why = gr.choose([{**candidate, "descendsFromStable": False}], stable, self.NOW)
+        self.assertIsNone(chosen)
+        self.assertIn("does not descend from stable", why)
+        self.assertIsNone(gr.choose([{**candidate, "statuses": failed}], stable, self.NOW)[0])
+        self.assertIsNone(gr.choose([candidate], stable, self.NOW, soak_hours=6)[0])
+
+    def test_promotion_needs_success_and_no_failure(self) -> None:
         ok = [self.status("air-blue", "success", "2026-09-25T01:00:00Z")]
-        self.assertFalse(gr.promotion(self.canary("2026-09-25T10:00:00Z"), None, ok, self.NOW)[0])
         self.assertEqual(gr.promotion(self.canary(), None, [], self.NOW),
                          (False, "no canary host reported success"))
         failed = ok + [self.status("big-red", "failure", "2026-09-25T02:00:00Z")]
@@ -1548,18 +1577,20 @@ class ReleaseTest(unittest.TestCase):
     def entry(self, letter: str, published: str) -> dict:
         return {**self.canary(published), "tag": "r-20260925-" + letter * 12, "source": letter * 40}
 
-    def test_choose_takes_the_newest_soaked_healthy_release_not_only_the_canary(self) -> None:
+    def test_choose_takes_the_newest_healthy_release_not_only_the_canary(self) -> None:
         ok = [self.status("air-blue", "success", "2026-09-25T01:00:00Z")]
         bad = [self.status("big-red", "failure", "2026-09-25T01:00:00Z")]
         old = {"entry": self.entry("a", "2026-09-25T01:00:00Z"), "statuses": ok, "descendsFromStable": True}
         mid = {"entry": self.entry("b", "2026-09-25T04:00:00Z"), "statuses": bad, "descendsFromStable": True}
-        new = {"entry": self.entry("c", "2026-09-25T10:00:00Z"), "statuses": ok, "descendsFromStable": True}
-        # c is still soaking: a, the newest soaked healthy release, is promoted
+        new = {"entry": self.entry("c", "2026-09-25T10:00:00Z"), "statuses": [], "descendsFromStable": True}
+        # no canary has reported on c yet: a, the newest healthy release, is promoted
         chosen, why = gr.choose([new, old], None, self.NOW)
         self.assertEqual(chosen["tag"], old["entry"]["tag"], why)
+        # once one reports success on c, c goes at once
+        self.assertEqual(gr.choose([{**new, "statuses": ok}, old], None, self.NOW)[0]["tag"], new["entry"]["tag"])
         # a canary failure on b, newer than a, may be a's updater failing to install b: nothing older goes
         self.assertIsNone(gr.choose([new, mid, old], None, self.NOW)[0])
-        # a failure on a newer release that is still soaking blocks too
+        # a failure on a newer release nobody else reported on blocks too
         soaking_bad = {**new, "statuses": bad}
         self.assertIsNone(gr.choose([soaking_bad, old], None, self.NOW)[0])
         # nothing older than stable is considered, and never a release off stable's line

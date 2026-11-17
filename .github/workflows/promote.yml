@@ -1,7 +1,7 @@
 name: Promote
 
-# Moves stable to the newest release that has soaked, that canary hosts reported healthy on
-# (commit statuses glaeda-ota/<host>) and that descends from stable. stable.json has this one
+# Moves stable to the newest release that canary hosts reported healthy on (commit statuses
+# glaeda-ota/<host>) and that descends from stable, with no time soak. stable.json has this one
 # writer. Canary hosts also dispatch this after each run, since GitHub's cron can lag for hours.
 # docs/GLAEDA_OTA.md
 
@@ -11,10 +11,11 @@ on:
   workflow_dispatch:
     inputs:
       soak_hours:
-        # An operator's early promotion of a narrow fix for live fleet breakage, after canary hosts
-        # reported success (glaeda#1461/#1462, 2026-10-13). Every other check still applies.
-        description: "Optional explicit soak override; empty uses each release's signed policy"
+        # No time soak by default (2026-11-17): promotion waits on canary evidence, not time. An
+        # operator may still ask for one; every other check applies either way.
+        description: "Soak in hours before promotion; 0 means none (promotion waits on canary evidence, not time)"
         required: false
+        default: "0"
 
 permissions:
   contents: write
@@ -44,7 +45,7 @@ jobs:
           persist-credentials: false
           show-progress: false
           fetch-depth: 0  # stable only moves forward: the ancestry check needs history
-      - name: Promote the newest healthy soaked release
+      - name: Promote the newest healthy release
         env:
           SOAK_HOURS: ${{ inputs.soak_hours }}
         run: |
@@ -59,7 +60,7 @@ jobs:
           elif ! grep -q -e "no assets match" -e "release not found" channels/err; then
             cat channels/err; exit 1
           fi
-          # releases newest first, down to stable; soaking ones count too, since their canary failures
+          # releases newest first, down to stable; unhealthy ones count too, since their canary failures
           # block promoting anything older
           gh release list --limit 40 --json tagName,publishedAt \
             --jq '.[] | select(.tagName | test("^r-[0-9]{8}-[0-9a-f]{12}$")) | "\(.tagName) \(.publishedAt)"' \

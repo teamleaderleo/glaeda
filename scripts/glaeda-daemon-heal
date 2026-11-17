@@ -131,7 +131,7 @@ POLICY_KEYS = {"every_s": int, "hot_cores": (int, float), "hot_hours": (int, flo
 # The release channel (glaeda-update and glaeda_release.py write and read the same files).
 REPOSITORY = "teamleaderleo/glaeda"
 RELEASE_SOURCES = (REPOSITORY, "manaflow-ai/glaeda")  # glaeda-update SOURCES: the repository and its mirror
-RING = "stable"  # only releases a canary verified (with attestation) and that soaked
+RING = "stable"  # only releases a canary verified (with attestation)
 CONTROL_SCHEMA = "glaeda-ota-control/v1"
 CHANNEL_SCHEMA = "glaeda-ota-channel/v1"
 RELEASE_SCHEMA = "glaeda-release/v1"
