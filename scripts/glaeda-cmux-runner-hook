@@ -1291,7 +1291,15 @@ def runner_jobs_in_flight(home: Path, own: Path, table: dict[int, tuple[int, str
             count += 1
         elif (match := re.search(prefix + r"Listener(?:\s|$)", command)) and match.group(1) != own.name:
             listeners.add(match.group(1))
-    return count + sum(1 for name in listeners - workers if name < own.name)
+    return count + sum(1 for name in listeners - workers if name < own.name and pool_listener(home / name))
+
+
+def pool_listener(runner_dir: Path) -> bool:
+    """A runner whose idle listener takes PR-pool jobs, as low_disk holds them: not a dedicated builder, the nightly's
+    own listeners, a gateway runner or one with no disk floor (their jobs never come from the same burst)."""
+    scope = runner_scope(runner_dir)
+    nightly_own = (scope.nightly or scope.trusted_signing) and not scope.dedicated
+    return not scope.dedicated and not nightly_own and not scope.gateway and scope.min_free_gib > 0
 
 
 def runner_jobs_need_gib(in_flight: int, per_job_gib: float) -> float:
