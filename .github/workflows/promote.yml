@@ -3,9 +3,17 @@ name: Promote
 # Moves stable to the newest release that has soaked, that canary hosts reported healthy on
 # (commit statuses glaeda-ota/<host>) and that descends from stable. stable.json has this one
 # writer. Canary hosts also dispatch this after each run, since GitHub's cron can lag for hours.
+# Events start it too, so stable moves as soon as the evidence lands and nothing polls (Leo, 2026-11-17: "we
+# should be able to propagate and have ci related changes reflect much faster"): every canary's
+# glaeda-ota/<host> commit status (the `status` event; the second healthy canary ends the soak,
+# glaeda_release.py CANARY_QUORUM), and every finished Release run.
 # docs/GLAEDA_OTA.md
 
 on:
+  status:
+  workflow_run:
+    workflows: [Release]
+    types: [completed]
   schedule:
     - cron: "17 * * * *"
   workflow_dispatch:
@@ -25,14 +33,19 @@ permissions:
 # nothing the run that replaced it does not do (scripts/test-delivery-concurrency.py declares it). A
 # release asset upload has no compare-and-swap, so stable.json keeps this one group rather than racing
 # writers. The one input, an operator's soak_hours, can be replaced by a later cron while it waits; GitHub
-# then shows the dispatch as cancelled and the operator dispatches it again.
-concurrency:
-  group: ota-stable
-  cancel-in-progress: false
+# then shows the dispatch as cancelled and the operator dispatches it again. The group is the job's, not the
+# workflow's: a run started by some other context's status is skipped by the job's `if` and so never takes the
+# group, where it could replace a waiting run that has work.
 
 jobs:
   promote:
-    if: github.repository == 'teamleaderleo/glaeda' && github.ref == 'refs/heads/main'
+    # a status event counts only for a canary's own report, not every CI context's
+    if: >-
+      github.repository == 'teamleaderleo/glaeda' && github.ref == 'refs/heads/main'
+      && (github.event_name != 'status' || startsWith(github.event.context, 'glaeda-ota/'))
+    concurrency:
+      group: ota-stable
+      cancel-in-progress: false
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     env:

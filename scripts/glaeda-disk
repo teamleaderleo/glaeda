@@ -364,6 +364,28 @@ MEASURE_SKIP_COMPONENTS = frozenset({
     "com.apple.FileProvider", "com.apple.CloudDocs",
 })
 
+# Folders macOS guards with a privacy (TCC) prompt. du opening one asks a person, in the name of the
+# program that started glaeda-disk: "worker-<sha>" wants your photo library or media library (the CI
+# worker's lent-host eviction runs glaeda-disk), "python3.13" wants files managed by iCloud Drive (the
+# LaunchAgent). A fleet Mac has nobody to answer, so the prompt sits on its screen over every capture
+# (cmuxterm-hq docs/handbook/prompt-on-an-unattended-screen.md; its detector is dialog-alarm). On macOS
+# every du walk skips them by name at any depth: they hold no runner work or rebuildable state, and
+# accounting is a lower bound already. HOME_NEVER keeps discovery out of the same folders.
+PRIVACY_SKIP_NAMES = (
+    "Desktop", "Documents", "Downloads", "Movies", "Music", "Pictures",
+    "*.photoslibrary", "*.musiclibrary", "*.tvlibrary",
+)
+
+
+def du_skip_args() -> list[str]:
+    """du's flags that keep a walk out of FileProvider/iCloud trees and, on macOS, privacy-guarded folders."""
+    names = [*sorted(MEASURE_SKIP_COMPONENTS), *(PRIVACY_SKIP_NAMES if DARWIN else ())]
+    # The spelling follows the du that runs (BSD's -I, GNU's --exclude), not DARWIN, which a suite may set
+    # on a Linux host.
+    if sys.platform == "darwin":
+        return [arg for name in names for arg in ("-I", name)]
+    return [f"--exclude={name}" for name in names]
+
 # These roots are for accounting only. They are deliberately separate from the eviction
 # catalogue: their sizes may overlap, and an incomplete walk is a lower bound rather than
 # permission to delete anything. Keeping the Data volume at one bounded level makes the
@@ -820,7 +842,11 @@ def artifact_referenced(path: Path, references: frozenset[str]) -> bool:
 # LRU under pressure, keeping what the next job most likely starts from.
 FLEET_CI = Path("/Users/Shared/cmux-build-fleet/ci")
 SEED_SOURCE = "seed-source.json"
-SEED_KEEP = 2  # seed_derived_data.LOCAL_KEEP_LOW_DISK: newest seeds of the current prefix each root keeps
+# The newest seeds of the current prefix each root keeps whatever their age: one (Leo, 2026-11-17: "keep only the
+# current seed, not two"; it was 2, cmux seed_derived_data.py's LOCAL_KEEP_LOW_DISK). An older seed still stays
+# while a job touched it within the idle window (adopt touches the seed it clones), so only one no job started from
+# for IDLE_SEED_HOURS goes, and it comes back from the LAN archive or the bucket.
+SEED_KEEP = 1
 # One age for everything disposable (Leo, 2026-10-26): "When have we ever had something useful greater than 12 hours?
 # I mean, if something stalls, like sure, but why would it stall? If it stalls, it's gonna have to get a rebase
 # anyway." DerivedData, CoreSimulator, package caches, runner work dirs and build dirs go once idle this long. Only
@@ -1000,7 +1026,14 @@ CMUX_NEXT_DRAIN_HOOK_SHA256 = frozenset({
     "070c1e6533560dd96cac6536eb915768076ddb00aed5a8983b990109c46a55dd",
     "1f4d528d5e8fd2687d4ba6972acad4b3a913c614ec37c1031a36ef0c51530426",
     "9d48941838658210beb6c3368ba830d514996b044e7d9215b8e6236f79a9e6b0",
-    "615a20ae0c800d96591ba5701fa8b16e4c04313aecc371ccdcabdb47dbee5d78",
+    "a44fdb3563a9b0b6338bfbec0428cf36b06b92c5a659b2e3756f39c9c9a8783f",
+    "e8b42e4572d6a481e884f36f8165c7c3c936662d9aedaf83991843376b668785",
+    "1095242d677e69184c3ed8b0f4d61ae425d7748828261ba944f1e5e24ac69d50",
+    "60a45395bbef188d96883903193c37829d4c37f9ed0abab01bb1b6ebac15c67d",
+    "23ae0141055ce1938749f14369a6365b75ae552ee8f3adc11c5d48ce5cb7dc61",
+    "c9cede71a5b59436eb082df629b6350321c80fc4ab562d3973928ac990fc7817",
+    "f9d7999b378ef24c0b35ec6d68a34ace4a6e38c8bbc7a057cf60ce85fcef7938",
+    "604b4875444a2f2a9d8949936c2dcc7750d8ec90cd9bcfe6de3c9063e1e464f6",
 })
 CMUX_NEXT_CI_PRESERVED_NAMES = frozenset({
     "SourcePackages", "ModuleCache.noindex", "SDKStatCaches.noindex",
@@ -1077,7 +1110,7 @@ def fleet_families(ci: Path | None = None) -> list[Family]:
                            platform="macos"))
         # Seeds: the root's newest SEED_KEEP of its current prefix stay (seed_verdict); older and other
         # fingerprints' seeds go LRU. A seed comes back from the LAN seeder or the bucket in 25 to 280 s.
-        # On the trusted seeder, one the seed archive already holds goes without waiting (archived_seeds).
+        # One the seed archive already holds goes without waiting, on every mini (archived_seeds).
         fams.append(Family("cmux-seeds", store / "seeds", True,
                            "glaeda-seed-prefetch or the next job fetches it again", build_output=True,
                            owner="cmux seed_derived_data.py (CMUX_SEED_LOCAL_CACHE)", rebuild_minutes=4,
@@ -1393,10 +1426,39 @@ def emergency_devs(fss: "dict[int, Fs]", emergency: str, floor_gib: float = 0.0)
 # The trusted seeder's serve log (glaeda-seed-serve): the seed archive on cmux-lawrence's SSD fills itself from
 # it every 5 minutes (glaeda-seed-archive), asking seed-list-v1 and then one seed-v1 per seed it lacks.
 SEED_SERVE_LOG = HOME / ".local/state/glaeda/seed-serve/serve.jsonl"
+# Every other mini whose LAN seeder is the archive: the archive's own `seed-list-v1` answer, which
+# glaeda-seed-prefetch (the LAN-capable agent; this one runs under Homebrew python3, off the LAN) writes to
+# FLEET_CI/.prefetch/archive-seeds.json each run. Older than this, it proves nothing: the archive prunes.
+ARCHIVE_LIST = Path(".prefetch") / "archive-seeds.json"  # under FLEET_CI (glaeda-seed-prefetch ARCHIVE_LIST)
+SEED_KEY_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,199}")  # a seed directory name (no dot, no slash)
+ARCHIVE_LIST_MAX_AGE = 1800  # six prefetch runs; the archive prunes oldest first, so a listed seed is rarely next
 
 
-def archived_seeds(log: Path | None = None) -> frozenset[str]:
-    """Seed keys the seed archive holds, as far as this seeder's serve log (and the rotated one) can show.
+def archive_listed_seeds(path: Path | None = None, now: float | None = None) -> frozenset[str]:
+    """Seed keys the seed archive listed within ARCHIVE_LIST_MAX_AGE, as glaeda-seed-prefetch recorded them.
+
+    A PR job can write this file, as it can the seeds: a forged list only makes a seed go early, and the next
+    job fetches it again (from the archive, R2, or by building). A missing, malformed or stale list is empty,
+    and the seeds keep their usual window: a PR mini never uploads a seed, since the archive takes trusted
+    bytes from the trusted seeder only, so an unlisted seed waits out its window as before.
+    """
+    path = FLEET_CI / ARCHIVE_LIST if path is None else path
+    now = time.time() if now is None else now
+    try:
+        record = json.loads(path.read_text(errors="replace")[:1 << 20])
+    except (OSError, ValueError, RecursionError):
+        return frozenset()
+    if not isinstance(record, dict) or record.get("schema") != 1 or not isinstance(record.get("keys"), list):
+        return frozenset()
+    stamp = record.get("time")
+    if not isinstance(stamp, int) or isinstance(stamp, bool) or not 0 <= now - stamp <= ARCHIVE_LIST_MAX_AGE:
+        return frozenset()
+    return frozenset(k for k in record["keys"] if isinstance(k, str) and SEED_KEY_RE.fullmatch(k))
+
+
+def archived_seeds(log: Path | None = None, listing: Path | None = None) -> frozenset[str]:
+    """Seed keys the seed archive holds: what it listed to this mini (archive_listed_seeds), and on the trusted
+    seeder what its serve log (and the rotated one) can show.
 
     Only the archive's filler asks seed-list-v1, so a client address that lists is the archive. A clean
     `served` alone is not enough: the filler still checks and renames the file afterwards and drops it on
@@ -1430,7 +1492,7 @@ def archived_seeds(log: Path | None = None) -> frozenset[str]:
             decided.add(key)  # only a key's newest request counts
             if outcome == "served" and r.get("status") == 0 and lists.get(client, 0) >= 2:
                 held.add(key)
-    return frozenset(held)
+    return frozenset(held) | archive_listed_seeds(listing)
 
 
 # cmux's media tour (cmux-next-media.yml) builds two apps per tour slot into
@@ -2628,9 +2690,8 @@ def seed_verdict(path: Path) -> str:
                 current.append((c.stat(follow_symlinks=False).st_mtime, c.name))
             except OSError:
                 continue
-    keep = 1 if ACTIVITY_MODE == "pressure" else SEED_KEEP
-    newest = {name for _, name in sorted(current, reverse=True)[:keep]}
-    return f"one of its root's newest {keep} current seeds" if path.name in newest else ""
+    newest = {name for _, name in sorted(current, reverse=True)[:SEED_KEEP]}
+    return "its root's newest current seed" if path.name in newest else ""
 
 
 WORKTREE_DIRS = ("worktrees", "cmux-worktrees", "glaeda-worktrees")
@@ -4259,7 +4320,7 @@ def default_families(role: str = "fleet-mini") -> list[Family]:
         # and the tag links to them, at any depth, so a nested ghcr path is never cut above or below its image), and
         # its last use is Tart's own access date on its digest directories (tart_last_use): `tart clone` leaves every
         # mtime alone, so an image cloned daily would read as idle by mtime and be pulled again, tens of GiB each time.
-        # Where Tart is installed the window is TART_IDLE_HOURS (a week; APFS moves atime lazily), where it is not
+        # Where Tart is installed the window is TART_IDLE_HOURS (two days; APFS moves atime lazily), where it is not
         # DEFAULT_AGE_HOURS (tart_idle_hours). A root that is a symlink or resolves outside HOME is never walked.
         Family(TART_IMAGES, HOME / ".tart/cache/OCIs", True, "the next tart clone or pull downloads it again",
                owner="Tart (tart pull)", rebuild_minutes=20, min_idle_hours=tart_idle_hours(), platform="macos"),
@@ -4290,15 +4351,17 @@ def default_families(role: str = "fleet-mini") -> list[Family]:
         # mini (2026-10-28) 391 tags held 35.8 GiB under cmux-next, 354 untouched for over a day, and the builder's
         # runner sat offline under its 40 GiB floor while glaeda-disk found 0.0G reclaimable. Only debug tags: the
         # release and NEXT apps' own data (com.cmuxterm.app, com.cmuxterm.app.next) is never a candidate. Not on a
-        # devbox, where a tag may be a developer's live test session.
+        # devbox, where a tag may be a developer's live test session. The classic app's tags sit at the top of
+        # Application Support itself (cmux18, 2026-11-17: 67 tags, 13.2 GiB, none touched in two days, which no
+        # family listed while the mini sat at 8 GB free): "" is that top level.
         *([] if role == "devbox" else [
-            Family(f"cmux-debug-app-data-{app}", HOME / "Library/Application Support" / app, True,
+            Family(f"cmux-debug-app-data{'-' + app if app else ''}", HOME / "Library/Application Support" / app, True,
                    # an installed app copy is too deep for the git search to finish and holds no checkout, so it
                    # is build output (as code-sign-clones); the process and open-file checks still keep a live tag
                    "the next tagged DEV build recreates it", include=(CMUX_DEBUG_APP_PREFIX,), build_output=True,
                    min_idle_hours=DEFAULT_AGE_HOURS, owner="cmux tagged DEV builds (reload.sh --tag, CI capture)",
                    rebuild_minutes=2, platform="macos")
-            for app in ("cmux-next", "cmux")]),
+            for app in ("cmux-next", "cmux", "")]),
         Family("simulators", HOME / "Library/Developer/CoreSimulator", False,
                "use `xcrun simctl delete unavailable` (report only)", platform="macos"),
         # Kept, with an owner, so the accounting names it rather than leaving it in the gap (cmux16, 2026-11-08).
@@ -4775,7 +4838,7 @@ def du_bytes(path: Path, *, record_timeout: bool = True) -> int | None:
         return None
     if _measurement_on_timeout_cooldown(path):
         return None
-    out = _du_output(["du", "-xsk", str(path)], record_timeout=record_timeout)
+    out = _du_output(["du", "-xsk", *du_skip_args(), str(path)], record_timeout=record_timeout)
     if out is None:
         return None
     try:
@@ -4791,7 +4854,7 @@ def du_children(root: Path, *, record_timeout: bool = True) -> dict[str, int] | 
     """Sizes of every directory directly below root from a single walk, keyed like candidates."""
     if not _measurement_path_allowed(root):
         return None
-    out = _du_output(["du", "-xk", "-d", "1", str(root)], record_timeout=record_timeout)
+    out = _du_output(["du", "-xk", "-d", "1", *du_skip_args(), str(root)], record_timeout=record_timeout)
     if out is None:
         return None
     sizes: dict[str, int] = {}
@@ -4811,7 +4874,7 @@ def du_children_with_status(root: Path, *, record_timeout: bool = True) -> tuple
     """
     if not _measurement_path_allowed(root):
         return None
-    out = _du_output(["du", "-xk", "-d", "1", str(root)], allow_nonzero=True,
+    out = _du_output(["du", "-xk", "-d", "1", *du_skip_args(), str(root)], allow_nonzero=True,
                      record_timeout=record_timeout)
     if out is None:
         return None
@@ -5168,6 +5231,37 @@ def _owned_query(argv: list[str], timeout: float) -> tuple[int, str]:
         _ACTIVE_QUERY_PROCS.pop(proc.pid, None)
 
 
+# PASSIVE_HOLDERS: macOS agents that map a built app's executable once it posts a notification, and keep the mapping
+# until they exit. Such a mapping never makes a build output in use: deleting the folder only unlinks the names (the
+# agent keeps its inode), and nothing builds from or reads the tree through it. Counted as a holder, it pinned a
+# superseded admission DerivedData seed as "in-use (open by a process)" for as long as the host stayed up (cmux19,
+# 2026-11-17: a 9.5 GiB seed held by NotificationCenter's mapping of Build/Products/Debug/cmux, while the runner gate
+# held listeners for disk, RUNNER_JOBS_DISK; cmux18's seed and cmux21's ~/cmux-ci-perf on 11-15 the same way).
+# lsof's c field cuts the command name (9 to 15 characters on macOS), so a holder matches by a prefix of its name.
+PASSIVE_HOLDERS = ("NotificationCenter", "usernoted")
+PASSIVE_HOLDER_MIN_CHARS = 9
+
+
+def passive_holder(command: str) -> bool:
+    """True when command (lsof's c field) names a PASSIVE_HOLDERS agent."""
+    return len(command) >= PASSIVE_HOLDER_MIN_CHARS and any(name.startswith(command) for name in PASSIVE_HOLDERS) \
+        or command in PASSIVE_HOLDERS
+
+
+def lsof_open_paths(out: str) -> list[str]:
+    """The paths in `lsof -Fcn` output, leaving out the files a PASSIVE_HOLDERS agent has open."""
+    opened: list[str] = []
+    skip = False
+    for line in out.splitlines():
+        if line.startswith("p"):
+            skip = False
+        elif line.startswith("c"):
+            skip = passive_holder(line[1:])
+        elif line.startswith("n/") and not skip:
+            opened.append(line[1:])
+    return opened
+
+
 def process_evidence() -> tuple[list[str], str]:
     """Every path a process has open (cwd and files) plus all command lines.
 
@@ -5193,14 +5287,14 @@ def process_evidence() -> tuple[list[str], str]:
     else:
         lsof = shutil.which("lsof") or "/usr/sbin/lsof"
         try:
-            code, out = _owned_query([lsof, "-n", "-P", "-Fn"], 120)
+            code, out = _owned_query([lsof, "-n", "-P", "-Fcn"], 120)
         except (OSError, subprocess.TimeoutExpired) as e:
             raise NoEvidence(f"lsof: {e}") from e
         if code != 0:
             raise NoEvidence(f"lsof failed (exit {code})")
-        opened = [line[1:] for line in out.splitlines() if line.startswith("n/")]
-        if not opened:
+        if not any(line.startswith("n/") for line in out.splitlines()):
             raise NoEvidence(f"lsof returned nothing (exit {code})")
+        opened = lsof_open_paths(out)
     try:
         ps_code, ps_out = _owned_query(["ps", "-axww", "-o", "command="], 60)
     except (OSError, subprocess.TimeoutExpired) as e:
@@ -8526,10 +8620,15 @@ TART_IMAGES, TART_IPSWS = "tart-images", "tart-ipsws"
 # 32 GiB of them, ubase and vm0-vm5, stopped since 2026-10-19 and claimed by nobody (hq#11127), and no family listed
 # them. A stopped VM nothing touched for TART_VM_IDLE_HOURS goes: Tart's run lock, a tart command naming it, a fleet
 # lease naming its path or a .glaeda-keep.json claim in it keeps it.
+# Two days, not two weeks (Leo, 2026-11-17: "man all these disks should be able to just be a lot more cleared up than
+# they are"): nine minis measured that day held 236 GiB of Tart VMs, 140 GiB of them stopped and judged "recent"
+# (two VMs on one mini, 86 GiB, idle 78 h), and 53 GiB of pulled images, while glaeda-disk found
+# 16.5 GiB reclaimable in 2.9 TiB used. A VM someone means to keep carries a .glaeda-keep.json claim.
 TART_VMS = "tart-vms"
-TART_VM_IDLE_HOURS = 14 * 24.0
+TART_VM_IDLE_HOURS = 2 * 24.0
 TART_FAMILIES = frozenset({TART_IMAGES, TART_IPSWS, TART_VMS})
-TART_IDLE_HOURS = 7 * 24.0  # a week past Tart's last access; APFS updates atime lazily
+# Two days past Tart's last access: APFS moves atime at most once a day, so an image cloned daily still reads in use.
+TART_IDLE_HOURS = 2 * 24.0
 TART_DIGEST_PREFIX = "sha256:"
 TART_SEARCH_DEPTH = 8  # registry/namespace.../image below OCIs; a deeper tree is not Tart's
 TART_BINARIES = ("/opt/homebrew/bin/tart", "/usr/local/bin/tart")
@@ -8632,10 +8731,13 @@ def tart_restore_access() -> None:
 
 
 def tart_seen(fam: Family, items: list[Path]) -> None:
-    """Read each image's access dates before anything of this run walks it (TART_ACCESS)."""
+    """Read each image's and VM's access dates before anything of this run walks it (TART_ACCESS)."""
     if fam.id == TART_IMAGES:
         for item in items:
             tart_last_use(item)
+    elif fam.id == TART_VMS:
+        for item in items:
+            tart_vm_last_use(item)
 
 
 def tart_installed() -> bool:
@@ -8644,7 +8746,7 @@ def tart_installed() -> bool:
 
 
 def tart_idle_hours() -> float:
-    """The idle window of Tart's cache: TART_IDLE_HOURS where Tart is installed (a weekly clone keeps its image even
+    """The idle window of Tart's cache: TART_IDLE_HOURS where Tart is installed (a daily clone keeps its image even
     when APFS moved the access date late), DEFAULT_AGE_HOURS where it is not, since nothing on the host reads it."""
     return TART_IDLE_HOURS if tart_installed() else DEFAULT_AGE_HOURS
 
@@ -8652,11 +8754,13 @@ def tart_idle_hours() -> float:
 def tart_vm_last_use(path: Path) -> float:
     """A local Tart VM's last use: the VM directory's mtime and the newest mtime or atime of its files (config.json,
     disk.img, nvram.bin), read with lstat only. `tart run` writes the disk and nvram, `tart clone` from it reads the
-    disk. The directory's own atime is left out: the survey's du lists the directory and moves it."""
+    disk. The directory's own atime counts as this run first saw it (TART_ACCESS, handed back at the run's end): the
+    survey's du lists the directory and moves it, and a golden VM that is only ever cloned may move nothing else."""
     try:
-        newest = path.lstat().st_mtime
+        st = path.lstat()
     except OSError:
         return 0.0
+    newest = max(st.st_mtime, tart_access(path, st))
     for e in _entries(path):
         with contextlib.suppress(OSError):
             st = e.stat(follow_symlinks=False)
@@ -8732,6 +8836,7 @@ def candidates(fam: Family) -> list[Path]:
             level = [p for p in level if nightly_next_fallback(p)]
         if fam.app_clones:
             level = keep_live_app_clones(level)
+        tart_seen(fam, level)
     # an aside tree (remove()'s rename) is the interrupted-deletions family's alone, whatever family's root holds it
     if fam.id == INTERRUPTED:
         level = [p for p in level if DELETING_RE.fullmatch(p.name)]
@@ -8889,16 +8994,28 @@ def snapshot_stamp(at: float, sizes: dict[str, int], measured_at: dict[str, floa
 
 
 def save_snapshot(sizes: dict[str, int], path: Path | None = None, at: float | None = None,
-                  measured_at: dict[str, float] | None = None) -> None:
-    """`at` is when the oldest size was measured; per-item times prevent stale reports starving refresh."""
+                  measured_at: dict[str, float] | None = None) -> bool:
+    """`at` is when the oldest size was measured; per-item times prevent stale reports starving refresh.
+
+    The snapshot is a cache of sizes, written before a pressure pass deletes anything. On a full disk the write
+    fails (ENOSPC), and it used to end the pass there with nothing freed: a 256 GB mini at 3 GB free, 2026-11-17. So a
+    failed write keeps the old snapshot, drops its partial temp file, and lets the pass go on to delete. Returns
+    whether it was saved, so a caller judges freshness by the snapshot on disk."""
     path = SNAPSHOT if path is None else path
-    path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(f".{os.getpid()}.tmp")
     payload = {"at": time.time() if at is None else at, "sizes": sizes}
     if measured_at is not None:
         payload["measured_at"] = {k: v for k, v in measured_at.items() if k in sizes}
-    tmp.write_text(json.dumps(payload))
-    os.replace(tmp, path)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp.write_text(json.dumps(payload))
+        os.replace(tmp, path)
+    except OSError as e:
+        with contextlib.suppress(OSError):
+            tmp.unlink(missing_ok=True)
+        print(f"glaeda-disk: size snapshot not saved ({e}); the pass goes on", file=sys.stderr)
+        return False
+    return True
 
 
 def refresh_lock_path() -> Path:
@@ -9446,7 +9563,10 @@ def runner_floor_gib(home: Path = HOME) -> float:
 # writer stamps expires 13 h after each write and refreshes it every 6 h). The host-local reservation
 # (FLEET_ROOT/reservation.json, glaeda-reservation/v1, the one the runner hook reads) counts too. Fails closed: a
 # missing, unreadable, malformed or expired list, or one with no expires, reads as reserved, whatever the
-# host-local file says.
+# host-local file says, except a missing list on a host that runs no controller worker (controller_worker_host): there
+# a missing list means no reservations, and cleanup proceeds (2026-11-17: passes on such hosts logged "fleet
+# reservations unreadable (FileNotFoundError); kept as reserved" and deleted nothing). A list that is there but
+# unreadable, malformed or expired, or one missing where a controller worker runs or may run, still fails closed.
 FLEET_RESERVATIONS: Path | None = None  # None: fleet_reservations_path(); tests point it at a fixture
 FLEET_RESERVATIONS_NAME = ".local/share/glaeda/fleet-reservations.json"
 UPDATE_CONFIG = HOME / ".config/glaeda/update.json"
@@ -9500,11 +9620,30 @@ def _str_list(value: Any, what: str) -> list[str]:
     return value
 
 
+def controller_worker_host() -> bool:
+    """Whether a cmuxterm-hq controller worker (HQ_BUILD_WORKERS) runs, or may run, on this host: its LaunchDaemon
+    plist is there, or launchctl prints the service. False only on macOS when no plist is there and launchctl does not
+    print one (113, "could not find service", or a refusal to a user who may not read the system domain: the
+    installed plist is then the evidence); off macOS, or when launchctl cannot run or hangs, True (fail-safe)."""
+    if not DARWIN:
+        return True
+    for job in HQ_BUILD_WORKERS:
+        label = job.rsplit("/", 1)[-1]
+        try:
+            if Path("/Library/LaunchDaemons", f"{label}.plist").exists():
+                return True
+            if subprocess.run(["launchctl", "print", job], capture_output=True, timeout=10).returncode == 0:
+                return True
+        except (OSError, subprocess.SubprocessError):
+            return True
+    return False
+
+
 def host_reservation(now: float | None = None, path: Path | None = None, names: set[str] | None = None,
                      local: Path | None = None, update: Path | None = None) -> str:
     """Why this host is reserved now ("" when it is not): an active fleet reservation naming it (or an alias), an
     active host-local reservation, or a reservation list that is unreadable or malformed anywhere, or missing on a
-    host that is not a hygiene-only Mac."""
+    host that runs a controller worker (controller_worker_host) and is not a hygiene-only Mac."""
     now = time.time() if now is None else now
     names = host_names() if names is None else {n.lower() for n in names}
     try:
@@ -9531,8 +9670,10 @@ def host_reservation(now: float | None = None, path: Path | None = None, names: 
         if hit:
             return hit
     except FileNotFoundError:
-        if not hygiene_only_mac(update):  # a personal Mac never gets the fleet's list; a fleet mini without it fails closed
-            return "fleet reservations unreadable (FileNotFoundError); kept as reserved"
+        # a personal Mac never gets the fleet's list, nor does a host with no controller worker (the writer's hosts);
+        # a controller-worker host without it fails closed
+        if not hygiene_only_mac(update) and controller_worker_host():
+            return "fleet reservations unreadable (FileNotFoundError) on a controller-worker host; kept as reserved"
     except (OSError, ValueError, KeyError, TypeError) as error:
         return f"fleet reservations unreadable ({type(error).__name__}); kept as reserved"
     marker = HOST_RESERVATION_LOCAL if local is None else local
@@ -10016,10 +10157,9 @@ def census_covered() -> set[str]:
 
 
 def _census_du_argv(path: Path) -> list[str]:
-    # never enter a FileProvider/cloud tree below an unowned directory: du can block in the kernel there
-    skips = [arg for name in sorted(MEASURE_SKIP_COMPONENTS)
-             for arg in (("-I", name) if DARWIN else (f"--exclude={name}",))]
-    argv = ["du", "-xsk", *skips, str(path)]
+    # never enter a FileProvider/cloud tree below an unowned directory (du can block in the kernel there),
+    # nor a privacy-guarded folder (du would put a TCC prompt on an unattended screen)
+    argv = ["du", "-xsk", *du_skip_args(), str(path)]
     if os.path.exists("/usr/sbin/taskpolicy"):
         return ["/usr/sbin/taskpolicy", "-b", *argv]  # background QoS: CPU and I/O throttled
     if ionice := shutil.which("ionice"):
@@ -12573,6 +12713,21 @@ def dedupe_roots(derived_data: Path) -> list[Path]:
     return [r for r in roots if r.is_dir() and not r.is_symlink()]
 
 
+def cmux_next_ci_input_roots(root: Path) -> list[Path]:
+    """The package and module caches (DEDUPE_SUBDIRS) of every cmux-next state root that dedupe_roots of the
+    <kind> directories does not reach: a dev-daily-release or release-compile state sits at
+    <kind>/<key>/Release/<xcode hash>, three levels down, and each keeps its own SourcePackages like a runner's
+    cmux-scheme/<runner> does. The per-host build root (cmux_next_ci_host_roots) too. One ordinary --dedupe pass
+    over them and the runners' copies stores each identical package file once, whichever tree holds it."""
+    found: list[Path] = []
+    for state in cmux_next_ci_state_roots(root):
+        if state.parent.name != "cmux-scheme":  # cmux-scheme/<runner> is dedupe_roots(cmux-scheme)'s already
+            found += [state / sub for sub in DEDUPE_SUBDIRS]
+    for host in cmux_next_ci_host_roots(root):
+        found += dedupe_roots(host)
+    return [r for r in found if r.is_dir() and not r.is_symlink()]
+
+
 def _file_key(st: os.stat_result) -> list[int]:
     return [st.st_size, st.st_mtime_ns, st.st_ino]
 
@@ -12804,6 +12959,8 @@ def dedupe_xcode(a: argparse.Namespace, bases: list[Path], ci_root: Path) -> Non
     """The Xcode pass: DerivedData's and cmux-next's package and module caches (and, with --dedupe-builds,
     sealed cmux-next Products), files of 1 MiB and up, retried while files are still settling."""
     input_roots = [r for b in bases for r in dedupe_roots(b)]
+    if ci_root in {b.parent for b in bases}:  # the cmux-next cache is a base (never under the runner-cache profile)
+        input_roots += [r for r in cmux_next_ci_input_roots(ci_root) if r not in input_roots]
     passes = [(input_roots, DEDUPE_STATE, a.settle_minutes * 60, None)]
     if a.dedupe_builds:
         # Sealed Products output is opt-in because the normal LaunchAgent can run
@@ -13328,8 +13485,8 @@ def _main_impl(argv: list[str] | None = None) -> int:
             updated_times = {k: v for k, v in measured_at.items() if k in known}
             updated_times.update({k: time.time() for k in fresh_paths})
             stamp = snapshot_stamp(at, known, updated_times)
-            save_snapshot(known, at=stamp, measured_at=updated_times)
-            if at:  # the age this run reports and refreshes on is the snapshot it just wrote (None: now)
+            saved = save_snapshot(known, at=stamp, measured_at=updated_times)
+            if at and saved:  # the age this run reports and refreshes on is the snapshot it just wrote (None: now)
                 at = stamp or time.time()
                 age_min = (time.time() - at) / 60
         if at and age_min > a.max_age and not a.apply:

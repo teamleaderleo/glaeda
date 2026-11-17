@@ -109,7 +109,8 @@ shared unit; its gate is never held for CPU saturation or the units (GATEWAY).
 Every runner warns while free disk is under its job-started hook's --min-free-gib and starts the same bounded
 eviction in the background while it keeps listening (Gate.low_disk), except that an idle pool runner stops
 listening while free disk is under one job's measured peak (job_disk_gib, DISK_SHORT_HOLD), where a job it took could
-not fit. Full means every
+not fit, or under 10 GiB plus one runner job's measured p95 disk for each job in flight on the host and the next
+(RUNNER_JOBS_DISK). Full means every
 unit this runner's own --capacity-units scans, read from its job-started hook, is taken or kept for an idle gui
 runner's reserve; for a root runner it also means the mini cannot admit a compile or an app-host shard (mini_full).
 """
@@ -567,6 +568,23 @@ WORKFLOW_JOB_CLASSES = {# the iOS reliability matrix's phone cells: cargo builds
                         # kept DerivedData. As unknown jobs they were compiles (5 units, persistent-dd and a root).
                         ("nightly-next-canary.yml", "canary"): "isolated",
                         ("nightly-next-launch-smoke.yml", "smoke"): "isolated",
+                        # The launch smoke's other jobs share the smoke's nightly slot and build nothing: pick checks
+                        # out scripts/ci and reads the feed and this workflow's runs with the job token, record writes
+                        # a marker file and saves it to the cache, crashed dispatches the rollback and files an issue.
+                        # As unknown jobs they were compiles (5 units, persistent-dd and a root): cmux run
+                        # 44021676892's pick was refused with 4 of 14 units free.
+                        ("nightly-next-launch-smoke.yml", "pick"): "light",
+                        ("nightly-next-launch-smoke.yml", "record"): "light",
+                        ("nightly-next-launch-smoke.yml", "crashed"): "light",
+                        # The canary's other jobs, the same way: pick reads the feed and the verdict cache, verdict
+                        # writes the verdict and dispatches nightly-next-verdict.yml, failed dispatches the rollback
+                        # and files an issue. As unknown jobs they were compiles: from about 09:37Z on 2026-11-17
+                        # scheduled canaries ended cancelled, cmux run 44067455848's pick refused after 300 s with
+                        # "4 of 14 units free, pick (compile) needs 5". job_class makes any job of these workflows
+                        # that no row names light too (NIGHTLY_VERIFY_WORKFLOWS build nothing).
+                        ("nightly-next-canary.yml", "pick"): "light",
+                        ("nightly-next-canary.yml", "verdict"): "light",
+                        ("nightly-next-canary.yml", "failed"): "light",
                         ("nightly.yml", "verify-signed-nightly"): "light",
                         # the release-surface ack gate only waits for an environment approval: no key, no build
                         ("nightly.yml", "await-release-surface-ack"): "light",
@@ -810,16 +828,22 @@ _LOAD = object()
 def job_needs_path() -> Path:
     """JOB_NEEDS_ENV, else the file beside this hook (a checkout's scripts/), else the runner copy's
     (~/glaeda-runner/scripts, which glaeda-cmux-runner-fleet stages and glaeda-update keeps at the release's)."""
-    env = os.environ.get(JOB_NEEDS_ENV)
+    return staged_data_path(JOB_NEEDS_NAME, JOB_NEEDS_ENV)
+
+
+def staged_data_path(name: str, env_name: str) -> Path:
+    """A data file shipped with the runner files: env_name's path, else the file beside this hook, else the runner
+    copy's (~/glaeda-runner/scripts)."""
+    env = os.environ.get(env_name)
     if env:
         return Path(env)
     here = globals().get("__file__") or ""  # the plan runs this hook from stdin: no file beside it then
-    staged = Path("glaeda-runner/scripts") / JOB_NEEDS_NAME
+    staged = Path("glaeda-runner/scripts") / name
     if here and not here.startswith("<"):
         hook_dir = Path(here).resolve().parent
         # beside it (a checkout, the staged copy), else the staged copy beside the runner install that holds this
         # glaeda-hooks/ (~/actions-runner-glaeda-K/glaeda-hooks -> ~/glaeda-runner/scripts), whatever HOME says
-        for candidate in (hook_dir / JOB_NEEDS_NAME, hook_dir.parent.parent / staged):
+        for candidate in (hook_dir / name, hook_dir.parent.parent / staged):
             if candidate.is_file():
                 return candidate
     return Path.home() / staged
@@ -1206,6 +1230,108 @@ def listener_disk_peak(scope: "RunnerScope") -> tuple[float, str]:
     return job_disk_gib(), "one job's measured peak"
 
 
+# RUNNER_JOBS_DISK (coordinator, 2026-11-17: "Admit a runner job only if 10 GiB + 5.3 GiB per job in flight (from hq
+# build-fleet/runner-job-disk.json) stays free. That's how cmux17 hit 26 GiB"). The listener hold above counts one job;
+# the jobs already running beside it were not counted, so several jobs admitted together each saw room and then wrote
+# the disk down together (2026-11-02..15: 8.9% of M6 runner jobs saw under 15 GiB free, the lowest 0.1 GiB, on
+# cmux17, cmux21 and cmux22). An idle pool runner's listener is held while free disk is under RUNNER_JOBS_FLOOR_GIB
+# plus one runner job's measured p95 disk for each job in flight on the host and for the one it would take: held, it
+# takes nothing and the job waits or goes to a runner with room. Slower, never failed: job-started admits as before.
+# An idle listener that sorts before this one counts as a job too (runner_jobs_in_flight), so a burst of jobs arriving
+# at several idle listeners together is admitted only while all of them fit.
+# The per-job value is RUNNER_JOB_DISK_NAME's disk_gib_p95, a byte copy of cmuxterm-hq build-fleet/runner-job-disk.json
+# (data/job_needs.py writes it from job-needs.json's all.disk_gib_p95; the controller's runner_disk.go reserves the same
+# value per PR job on a lent host, the twin of this rule). Copy hq's file over it to refresh it; a missing, unreadable
+# or malformed file turns this hold off (the one-job hold stays) rather than guessing a number.
+RUNNER_JOB_DISK_SCHEMA = "glaeda-runner-job-disk/v1"
+RUNNER_JOB_DISK_NAME = "glaeda-runner-job-disk.json"
+RUNNER_JOB_DISK_ENV = "GLAEDA_RUNNER_JOB_DISK_FILE"  # another file (tests; a host-local trial)
+RUNNER_JOB_DISK_MAX_GIB = 1000.0
+RUNNER_JOBS_FLOOR_GIB = 10.0  # the controller's hard disk floor, which hq's runnerJobsLeaveRoom adds the jobs to
+_RUNNER_JOB_DISK_CACHE: dict[str, Any] = {}
+
+
+def runner_job_disk(path: Path | None = None) -> tuple[float | None, str]:
+    """(one runner job's measured p95 disk in GiB, where it came from), or (None, why there is none), from
+    RUNNER_JOB_DISK_NAME; cached by the file's size and mtime, as the gate reads it every poll."""
+    path = path or staged_data_path(RUNNER_JOB_DISK_NAME, RUNNER_JOB_DISK_ENV)
+    try:
+        st = path.stat()
+        key = (os.fspath(path), st.st_size, st.st_mtime_ns)
+        cached = _RUNNER_JOB_DISK_CACHE.get("file")
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        with open(path, "rb") as handle:
+            data = handle.read(1 << 16)
+    except OSError as error:
+        return None, f"{path.name} is unreadable ({type(error).__name__})"
+    try:
+        doc = json.loads(data)
+    except (ValueError, UnicodeDecodeError, RecursionError):
+        answer: tuple[float | None, str] = (None, f"{path.name} is not JSON")
+    else:
+        value = doc.get("disk_gib_p95") if isinstance(doc, dict) else None
+        if not isinstance(doc, dict) or doc.get("schema") != RUNNER_JOB_DISK_SCHEMA:
+            answer = (None, f"{path.name}'s schema is not {RUNNER_JOB_DISK_SCHEMA}")
+        elif isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) \
+                or not 0 < value <= RUNNER_JOB_DISK_MAX_GIB:
+            answer = (None, f"{path.name} has no disk_gib_p95 in (0, {RUNNER_JOB_DISK_MAX_GIB:g}]")
+        else:
+            window = doc.get("window") if isinstance(doc.get("window"), dict) else {}
+            answer = (float(value), f"the p95 of {doc.get('disk_n', '?')} jobs, "
+                                    f"{window.get('from', '?')}..{window.get('to', '?')}")
+    _RUNNER_JOB_DISK_CACHE["file"] = (key, answer)
+    return answer
+
+
+def runner_dirs(home: Path) -> list[Path]:
+    """Every runner install in home (~/actions-runner*, pool and dedicated): the most jobs it can run at once."""
+    try:
+        return [d for d in home.glob("actions-runner*") if d.is_dir()]
+    except OSError:
+        return []
+
+
+def runner_jobs_in_flight(home: Path, own: Path, table: dict[int, tuple[int, str]]) -> int:
+    """The runner jobs this idle runner must leave room for, from a process table (processes()): a Runner.Worker of
+    any runner install in home other than own (a job running), and each other install there that listens with no
+    Worker and sorts before own (an idle listener that may take a job in the same burst: every idle listener counts
+    the ones before it, so a burst of N jobs is admitted only while N jobs' disk is free, not N times one job's)."""
+    prefix = r"(?:^|\s)" + re.escape(os.fspath(home)) + r"/(actions-runner[^/\s]*)/bin(?:\.[^/\s]+)?/Runner\."
+    workers, listeners = set(), set()
+    count = 0
+    for _ppid, command in table.values():
+        if (match := re.search(prefix + r"Worker(?:\s|$)", command)) and match.group(1) != own.name:
+            workers.add(match.group(1))
+            count += 1
+        elif (match := re.search(prefix + r"Listener(?:\s|$)", command)) and match.group(1) != own.name:
+            listeners.add(match.group(1))
+    return count + sum(1 for name in listeners - workers if name < own.name and pool_listener(home / name))
+
+
+def pool_listener(runner_dir: Path) -> bool:
+    """A runner whose idle listener takes PR-pool jobs, as low_disk holds them: not a dedicated builder, the nightly's
+    own listeners, a gateway runner or one with no disk floor (their jobs never come from the same burst)."""
+    scope = runner_scope(runner_dir)
+    nightly_own = (scope.nightly or scope.trusted_signing) and not scope.dedicated
+    return not scope.dedicated and not nightly_own and not scope.gateway and scope.min_free_gib > 0
+
+
+def runner_jobs_need_gib(in_flight: int, per_job_gib: float) -> float:
+    """The free disk one more job needs: RUNNER_JOBS_FLOOR_GIB + per_job_gib for each job in flight and for it."""
+    return round(RUNNER_JOBS_FLOOR_GIB + per_job_gib * (in_flight + 1), 1)
+
+
+def runner_jobs_refusal(free: float, in_flight: int, per_job_gib: float, source: str) -> str | None:
+    """Why an idle listener takes no job for disk with in_flight jobs running beside it (RUNNER_JOBS_DISK), or None."""
+    need = runner_jobs_need_gib(in_flight, per_job_gib)
+    if free >= need:
+        return None
+    return (f"{free:.1f} GiB free, {need:g} GiB required: {RUNNER_JOBS_FLOOR_GIB:g} GiB + {per_job_gib:g} GiB "
+            f"for each of {in_flight} runner job{'s' if in_flight != 1 else ''} in flight (or listening first) and this one "
+            f"({RUNNER_JOB_DISK_NAME}: {source})")
+
+
 # LABEL_DISK: `label-disk-samples` reads each label's measured job disk growth on a mini, `label-disk-table` pools the
 # minis' answers into one table (p90 and max per label), so a label's peak is measured, not guessed. Read-only.
 LABEL_DISK_SCHEMA = "glaeda-label-disk/v1"
@@ -1588,6 +1714,19 @@ def bounded_wait(cap: float | None, bound: float | None) -> float | None:
     return bound if cap is None else min(cap, bound)
 
 
+# STACK_SLOT_WAIT: the nightly slot's gate listens however full the mini is, which suits a nightly job (no other
+# admission takes a unit while it waits) but not a PR job: a stack-blocker job it took would wait there for units with
+# no limit, and every minute it holds the slot a nightly build or sign pinned to that mini's slot waits behind a PR
+# job, the very wait the slot exists to remove (review of glaeda#2098). So on the slot it waits this long at most and
+# is then refused; cmux's owned-pool rescue re-runs it, placed as an ordinary PR job.
+STACK_SLOT_CAPACITY_WAIT_S = 300.0
+
+
+def stack_slot_capacity_wait(cap: float | None, tier: str, nightly_runner: bool) -> float | None:
+    """`cap`, bounded to STACK_SLOT_CAPACITY_WAIT_S for a stack-blocker job on the nightly slot (STACK_SLOT_WAIT)."""
+    return bounded_wait(cap, STACK_SLOT_CAPACITY_WAIT_S) if nightly_runner and tier == TIER_STACK else cap
+
+
 def slot_capacity_wait(cap: float | None, dev_compile_runner: bool) -> float | None:
     """`cap`, bounded on the freshness slot (an explicit longer --gui-wait is clamped too): every job it admits (a push's release-compile too, which
     dev_compile_capacity_wait does not name) waits at most DEV_COMPILE_CAPACITY_WAIT_S. GitHub never moves a job
@@ -1620,6 +1759,11 @@ def job_class(job: str, repo: str | None, home_repo: str = DEFAULT_HOME_REPO,
         return WORKFLOW_JOB_CLASSES[(workflow, job)], False
     if job in SIM_SLOT_JOBS and sim_copies() > 1:
         return "simulator", False
+    if workflow in NIGHTLY_VERIFY_WORKFLOWS and job not in JOB_CLASSES:
+        # main's canary and launch smoke check a published DMG and build nothing; as nightly jobs they wait 300 s at
+        # most, so a job they add costed as a compile (5 units and a root) is refused on a busy mini and cancels
+        # every scheduled run (the canary's pick, 2026-11-17). Unlisted, such a job is light.
+        return "light", False
     return JOB_CLASSES.get(job, "compile"), job not in JOB_CLASSES
 
 
@@ -2768,13 +2912,27 @@ def gateway_jobs_note() -> str:
     return ", ".join(f"{workflow} {job}" for workflow, job in sorted(GATEWAY_JOBS))
 
 
+# STACK_SLOT: the nightly slot also admits a stack-blocker PR job (TIER_STACK, stack_blocker_tier). FEED_FIRST ranks
+# one only among the jobs a mini's runners already took, and GitHub hands a queued job to the next idle runner of its
+# label in arrival order, so on a busy side label the job that repairs a base red waited behind every PR job queued
+# before it. claude-sr2-coord, 2026-11-17, for cmux#45498 (it repairs "cloud.team.sessions is not in the action
+# catalog", which failed cmux-next daemon tests on every feat-cmux-next head) while glaeda-side-std-xcode-26.6 held
+# about 70 queued jobs: "A base-red repair jumping the Mac queue is a route we need every day ... build it as the
+# standing mechanism (the stack-blocker path), with a test." cmux routes a labelled same-repository pull request's Mac
+# jobs to this slot's label; here it waits for units right after nightly jobs (admission_rank), as on any runner. It
+# takes none of a nightly job's passes: no NIGHTLY_SIGNING reservation admits it (job-started), it yields to a waiting
+# fleet build (NIGHTLY_WAITER) and it holds no other runner's gate. Only a person with triage or write access can
+# label a pull request, and the slot is an ordinary side instance (no trustedRef), so it trusts nothing a side runner
+# does not.
 def nightly_slot_refusal(tier: str) -> str | None:
-    """Why the nightly slot refuses a job of this job_tier(), or None: it takes only nightly jobs (NIGHTLY_SLOT)."""
-    if tier == TIER_NIGHTLY:
+    """Why the nightly slot refuses a job of this tier, or None: it takes nightly jobs (NIGHTLY_SLOT) and stack-blocker
+    PR jobs (STACK_SLOT). `tier` is job_tier()'s answer, else stack_blocker_tier()'s."""
+    if tier in (TIER_NIGHTLY, TIER_STACK):
         return None
     return ("the nightly slot admits only nightly jobs (nightly.yml on nightly-next or main, main's DEV daily publish, "
             "main's nightly-next canary and launch smoke, the Release compile that gates nightly-next's promotion, "
-            f"and the release and pin builds: {release_pin_note()})")
+            f"and the release and pin builds: {release_pin_note()}) and a same-repository pull request labelled "
+            f"{STACK_BLOCKER_LABEL}")
 
 
 def hosted_route_refusal(workflow_ref: str | None, job: str | None) -> str | None:
@@ -7766,11 +7924,49 @@ def load_cap_fetch(now: float) -> dict[str, Any] | None:
         return None
 
 
+# IOS_SIM_OWN_FIT: a side runner that carries IOS_SIM_RUNNER_LABEL (listen.sh --fit-units 3, the costliest job that
+# label brings) listens at its own fit, not the side label's costliest job (side_fit_units, 5), while the controller's
+# feed (the HOST_LOAD_CAP summary of /v1/github/actions, which keeps every open glaeda job's labels, status and
+# creation time) shows a queued job needing glaeda-ios-sim that this runner could take. On 2026-11-17 cmux's
+# ios-simulator-build jobs (glaeda-std-xcode-26.6 + glaeda-ios-sim, 3 units) queued for hours (16 queued, oldest
+# 4h23m, cmux#45115) while cmuxs-mac-mini-6 had 4 and mini-3 had 3 of 14 units free: their ios-sim runners held for
+# "its next job needs 5", the side need, so no busy simulator mini ever listened. Should such a listener receive a
+# bigger std job instead, that job waits on the mini for its units through normal admission (CAPACITY_WAIT), as any
+# job does. A feed that cannot be read, is stale, or shows no such job keeps the side need (today's rule): no reserve.
+IOS_SIM_QUEUED_MAX_AGE_S = 12 * 3600.0  # a queued ios-sim job older than this is a lost record, not a waiting job
+IOS_SIM_QUEUED = ("queued", "waiting", "pending")
+
+
+def ios_sim_queued(summary: dict[str, Any] | None, labels: frozenset[str] | None, now: float) -> bool:
+    """IOS_SIM_OWN_FIT: whether the feed summary (load_cap_summary) is fresh and shows a queued job whose labels
+    include IOS_SIM_RUNNER_LABEL and are all this runner's. False on any doubt."""
+    if not isinstance(summary, dict) or not labels or IOS_SIM_RUNNER_LABEL not in labels:
+        return False
+    at, delivery = summary.get("at"), summary.get("delivery")
+    if not isinstance(at, (int, float)) or not 0 <= now - at <= HOST_LOAD_CAP_FEED_STALE_S:
+        return False
+    if not isinstance(delivery, (int, float)) or now - delivery > HOST_LOAD_CAP_FEED_STALE_S:
+        return False
+    for job in summary.get("jobs") if isinstance(summary.get("jobs"), list) else []:
+        if not isinstance(job, dict) or job.get("status") not in IOS_SIM_QUEUED:
+            continue
+        wants = job.get("labels")
+        if not isinstance(wants, list) or IOS_SIM_RUNNER_LABEL not in wants or not set(wants) <= labels:
+            continue
+        created = job.get("created")
+        if isinstance(created, (int, float)) and now - created > IOS_SIM_QUEUED_MAX_AGE_S:
+            continue
+        return True
+    return False
+
+
 def load_cap_verdict(summary: dict[str, Any] | None, labels: frozenset[str] | None, host: str,
-                     now: float) -> str | None:
+                     now: float, grace: float | None = None) -> str | None:
     """Why another host's listener keeps up with this runner's label (so an over-cap mini may hold its listener off),
     or None, which listens: no feed, a stale one, no other host serving a job this runner could take, or such a job
-    queued that is urgent, pinned to this host, or has waited HOST_LOAD_CAP_GRACE_S (no idle listener took it)."""
+    queued that is urgent, pinned to this host, or has waited `grace` (HOST_LOAD_CAP_GRACE_S by default: no idle
+    listener took it)."""
+    grace = HOST_LOAD_CAP_GRACE_S if grace is None else grace
     if not isinstance(summary, dict) or not labels:
         return None
     delivery = summary.get("delivery")
@@ -7793,9 +7989,167 @@ def load_cap_verdict(summary: dict[str, Any] | None, labels: frozenset[str] | No
             continue  # a lost delivery
         if job.get("urgent") or (pinned is not None and any(pinned.search(label.lower()) for label in job["labels"])):
             return None
-        if age is None or age >= HOST_LOAD_CAP_GRACE_S:
+        if age is None or age >= grace:
             return None
     return f"another host's listener takes {served[0]} jobs"
+
+
+def urgent_queued(summary: dict[str, Any] | None, labels: frozenset[str] | None, host: str, now: float) -> bool:
+    """Whether a job this runner could take is queued and urgent (a nightly or promotion) or pinned to this host,
+    in a fresh feed: load_cap_verdict's exemptions, read alone."""
+    if not isinstance(summary, dict) or not labels:
+        return False
+    delivery = summary.get("delivery")
+    if not isinstance(delivery, (int, float)) or now - delivery > HOST_LOAD_CAP_FEED_STALE_S:
+        return False
+    pinned = re.compile(rf"(?:^|[^a-z0-9]){re.escape(host.lower())}(?:$|[^a-z0-9])") if host else None
+    for job in summary.get("jobs") if isinstance(summary.get("jobs"), list) else []:
+        if not isinstance(job, dict) or not isinstance(job.get("labels"), list) or not job["labels"] \
+                or not set(job["labels"]) <= labels or job.get("status") in ("in_progress", "completed"):
+            continue
+        created = job.get("created")
+        if isinstance(created, (int, float)) and now - created > HOST_LOAD_CAP_JOB_MAX_AGE_S:
+            continue  # a lost delivery
+        if job.get("urgent") or (pinned is not None and any(pinned.search(label.lower()) for label in job["labels"])):
+            return True
+    return False
+
+
+def oldest_queued_s(summary: dict[str, Any] | None, labels: frozenset[str] | None, now: float,
+                    max_age: float | None = HOST_LOAD_CAP_JOB_MAX_AGE_S) -> float | None:
+    """How long the longest-waiting queued job this runner could take has waited, in a fresh feed, or None when none
+    waits or the feed cannot say. A job older than max_age (a lost delivery, for the load cap) does not count; None
+    counts every one, as the memory cap does: listening for a lost delivery costs nothing, and a gui or session
+    label's real job can queue for hours (2026-10-21: 1.5 to 3 h)."""
+    if not isinstance(summary, dict) or not labels:
+        return None
+    delivery = summary.get("delivery")
+    if not isinstance(delivery, (int, float)) or now - delivery > HOST_LOAD_CAP_FEED_STALE_S:
+        return None
+    ages = [now - job["created"] for job in (summary.get("jobs") if isinstance(summary.get("jobs"), list) else [])
+            if isinstance(job, dict) and isinstance(job.get("labels"), list) and job["labels"]
+            and set(job["labels"]) <= labels and job.get("status") not in ("in_progress", "completed")
+            and isinstance(job.get("created"), (int, float))
+            and (max_age is None or now - job["created"] <= max_age)]
+    return max(ages) if ages else None
+
+
+# MEMORY_CAP (cmuxterm-hq#12838; Leo, 2026-11-05: "i meant can you do all of htem"): the 16 GiB minis (cmux17, 18,
+# 21, 22) showed macOS's "out of application memory" panel running 4-6 jobs: on 2026-11-16 at 22:34Z cmux17's
+# JetsamEvent killed homed, tccd and a dozen other daemons for low-swap while eight swift-frontend processes held
+# 2.8-6.5 GiB each, and at 12:07Z the next day it sat at pressure level 2 with 3.0 of 4 GiB of swap used and 2 GiB
+# reclaimable. The memory-pressure hold (GATE_MEMORY_PRESSURE_HOLD) only reacts once Darwin is already compressing
+# and swapping, and the RAM ledger is off because measured peaks do not add (RAM_LEDGER_ENV). So an idle listener
+# also looks at what a new job could get without compression or swap: free, purgeable and file-backed
+# pages (reclaimable_mib, one sysctl). Under needGiB, or at memory pressure level 2 or more, a new job will not fit:
+# the listener takes none, and listens again once resumeGiB is reclaimable at normal pressure. It never strands a
+# job and never fails one: it only defers, as HOST_LOAD_CAP does. While another host's listener keeps up with the
+# label (the controller's feed, shared with the load cap) it holds; a job of its label that has waited maxWaitMin,
+# an urgent (nightly, promotion) or pinned job, or a hold past maxWaitMin with no feed to say, and it listens: the
+# job then runs here, slower, rather than not at all. Exempt like the load cap: the nightly, freshness, gateway and
+# dedicated runners. config/runner-gate.json's memoryCap (true, false or a dict of needGiB, resumeGiB and
+# maxWaitMin) sets it by default or per host; GLAEDA_RUNNER_MEMORY_CAP=off in the runner's environment turns it off.
+MEMORY_CAP_ENV = "GLAEDA_RUNNER_MEMORY_CAP"
+MEMORY_CAP_NEED_GIB = 4.0  # a swift-frontend at its peak (2.8-6.5 GiB in the 11-16 Jetsam reports)
+MEMORY_CAP_RESUME_GIB = 5.0
+MEMORY_CAP_MAX_WAIT_MIN = 10.0
+MEMORY_CAP_MAX_WAIT_LIMIT_MIN = 60.0  # a longer maxWaitMin is not a setting: no hold may outlast an hour
+# One idle listener on a mini resumes at a time: every gate there reads the same memory, and a swift-frontend reaches
+# its peak minutes after admission, so when memory recovers the others wait this long after one has started
+# (MEMORY_CAP_START_FILE's mtime in the state dir) before they look again.
+MEMORY_CAP_STAGGER_S = float(os.environ.get("GLAEDA_RUNNER_MEMORY_CAP_STAGGER_S") or 90.0)
+MEMORY_CAP_START_FILE = "mem-cap-start"
+MEMORY_CAPPED = "a new job will not fit in this mini's memory"
+# Speculative pages are file-backed pages already in vm.page_pageable_external_count, so they are not added again.
+# The file-backed count also holds running compiles' mapped executables, so this is an upper bound: it leans toward
+# admitting, and the memory-pressure level backs it.
+RECLAIMABLE_KEYS = ("hw.pagesize", "vm.page_free_count", "vm.page_purgeable_count", "vm.page_pageable_external_count")
+
+
+class MemoryCap(NamedTuple):
+    need_mib: int
+    resume_mib: int
+    max_wait_s: float
+
+
+def _memory_cap(value: Any) -> MemoryCap | None | bool:
+    """One memoryCap value read: false is off (None), true the code marks, a dict sets needGiB <= resumeGiB and
+    maxWaitMin (> 0 each), each defaulting to the code mark. Anything else is not a setting (False)."""
+    code = (MEMORY_CAP_NEED_GIB, MEMORY_CAP_RESUME_GIB, MEMORY_CAP_MAX_WAIT_MIN)
+    if value is False:
+        return None
+    if value is True:
+        need, resume, wait = code
+    elif isinstance(value, dict):
+        try:
+            need = float(value.get("needGiB", code[0]))
+            resume = float(value.get("resumeGiB", max(code[1], need)))
+            wait = float(value.get("maxWaitMin", code[2]))
+        except (TypeError, ValueError):
+            return False
+        if not (0 < need <= resume and 0 < wait <= MEMORY_CAP_MAX_WAIT_LIMIT_MIN and math.isfinite(resume)):
+            return False
+    else:
+        return False
+    return MemoryCap(int(need * 1024), int(resume * 1024), wait * 60.0)
+
+
+def gate_memory_cap(doc: dict[str, Any] | None, host: str, now: float, raw: str | None = None) -> MemoryCap | None:
+    """The memory cap for this mini, or None when it is off: GLAEDA_RUNNER_MEMORY_CAP "off" (or 0, false, no) wins;
+    else the host's live memoryCap entry in runner-gate.json, else defaults.memoryCap, else the code marks. A value
+    that is not a bool or a valid dict is ignored."""
+    env = os.environ.get(MEMORY_CAP_ENV) if raw is None else raw
+    if env is not None and env.strip().lower() in ("off", "0", "false", "no", "disabled"):
+        return None
+    cap: MemoryCap | None = _memory_cap(True)  # type: ignore[assignment]
+    defaults = doc.get("defaults") if isinstance(doc, dict) else None
+    if isinstance(defaults, dict) and "memoryCap" in defaults and (got := _memory_cap(defaults["memoryCap"])) is not False:
+        cap = got  # type: ignore[assignment]
+    hosts = doc.get("hosts") if isinstance(doc, dict) else None
+    entry = hosts.get(host) if isinstance(hosts, dict) else None
+    if isinstance(entry, dict) and "memoryCap" in entry and _live_entry(entry, now) \
+            and (got := _memory_cap(entry["memoryCap"])) is not False:
+        cap = got  # type: ignore[assignment]
+    return cap
+
+
+def parse_reclaimable(text: str) -> int | None:
+    """MiB reclaimable without compression or swap from `sysctl -n` of RECLAIMABLE_KEYS (one number a line, in
+    order): (free + purgeable + file-backed pages) x the page size. None unless every key read."""
+    try:
+        values = [int(line.strip()) for line in text.strip().splitlines()]
+    except ValueError:
+        return None
+    if len(values) != len(RECLAIMABLE_KEYS) or values[0] <= 0 or any(value < 0 for value in values):
+        return None
+    return sum(values[1:]) * values[0] // (1 << 20)
+
+
+def reclaimable_mib() -> int | None:
+    """This Mac's reclaimable memory (parse_reclaimable) in one sysctl, or None off Darwin or when it cannot be read."""
+    if sys.platform != "darwin":
+        return None
+    try:
+        out = subprocess.run([SYSCTL, "-n", *RECLAIMABLE_KEYS], stdin=subprocess.DEVNULL, capture_output=True,
+                             text=True, timeout=5, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return parse_reclaimable(out.stdout) if out.returncode == 0 else None
+
+
+def memory_short(cap: MemoryCap | None, held: bool, reclaimable: int | None, pressure: int | None) -> str | None:
+    """Why a new job will not fit in memory now, or None: memory pressure at GATE_MEMORY_PRESSURE_HOLD or more, or
+    reclaimable memory under the cap's need (its resume mark once `held`, so it does not flap). Unreadable
+    readings hold nothing."""
+    if cap is None:
+        return None
+    if pressure is not None and pressure >= GATE_MEMORY_PRESSURE_HOLD:
+        return f"memory pressure level {pressure}" + (f", {reclaimable / 1024:.1f} GiB reclaimable"
+                                                      if reclaimable is not None else "")
+    mark = cap.resume_mib if held else cap.need_mib
+    if reclaimable is not None and reclaimable < mark:
+        return f"{reclaimable / 1024:.1f} GiB reclaimable, under {mark / 1024:g} GiB"
+    return None
 
 
 def mean_load_per_core(samples: list[tuple[float, float]], cores: int | None, now: float) -> float | None:
@@ -8407,6 +8761,17 @@ class Gate:
         self.cap_labels: frozenset[str] | None = None
         self.cap_feed_at = -HOST_LOAD_CAP_FEED_EVERY_S
         self.cap_thread: threading.Thread | None = None
+        self.ios_sim_own = False  # IOS_SIM_OWN_FIT: the last full() listened at its own fit for a queued ios-sim job
+        # MEMORY_CAP: the cap in force (gate_memory_cap, refreshed with the other settings), its last reading, why it
+        # holds and since when (monotonic)
+        self.mem_cap: MemoryCap | None = gate_memory_cap(None, "", 0.0)
+        self.mem_at = -GATE_CPU_EVERY_S
+        self.mem_reading: tuple[int | None, int | None] = (None, None)
+        self.mem_why: str | None = None
+        self.mem_since: float | None = None
+        self.mem_waived = False  # a hold ran past maxWaitMin; ignored until a new job fits again
+        self.mem_held = False  # memory was short at the last look: the resume mark applies (hysteresis)
+        self.mem_unread_noted = False
         self.stale_env: str | None = None  # why an adopted listener's env is not listener_env's (listen())
         self.disk_warned_at: float | None = None  # when the last low-disk warning was logged
         self.disk_evicted_at = -GATE_DISK_EVICT_EVERY_S  # when the last eviction under the floor started
@@ -8452,6 +8817,14 @@ class Gate:
             return
         if self.eligible_look is not None and self.eligible_look.is_alive():
             return  # the next poll: the look thread does not block SIGTERM, and its probes would be orphaned
+        if self.watching or self.freeze_at_exit or self.job_waited or self.job_ending or self.frozen:
+            # JOB_END_FREEZE is armed (job_waited too: a request taken whose Worker is not seen yet): this gate will
+            # freeze and stop the listener at its Worker's exit, and none of
+            # that crosses the exec. Re-executed then, the new gate is still starting when the job ends, and the
+            # listener takes the next job (2026-11-17, a lent mini: reloaded during a lend
+            # drain and a RUNNER_DRAIN, its job ended 3 s later and it ran another 2 s later). The reload waits for
+            # the stop; an idle or held gate reloads at its next poll.
+            return
         self.source = now
         argv = [a for a in sys.argv if not a.startswith("--adopt=")]
         if self.child is not None:
@@ -8527,7 +8900,7 @@ class Gate:
         if why:
             self.load_since = None  # the fleet's claim, not load, is holding this gate
             self.yield_to_fleet()
-        return (why or self.shed(self.saturated()) or self.load_capped() or self.full() or self.shed(self.hot()) or self.stalled()
+        return (why or self.shed(self.saturated()) or self.load_capped() or self.memory_capped() or self.full() or self.shed(self.hot()) or self.stalled()
                 or self.locked() or self.low_disk() or self.ineligible() or self.off_tailnet())
 
     def exclusive_yield(self) -> str | None:
@@ -8673,12 +9046,100 @@ class Gate:
         self.cap_why = why
         return why
 
+    def memory_capped(self) -> str | None:
+        """MEMORY_CAP: why this listener takes no new job because one will not fit in the mini's memory, or None. Only
+        defers: an urgent or pinned job of its label queued, a job of its label waiting the cap's maxWaitMin, or a hold
+        that long with no other host's listener known to keep up, and it listens; the job runs here, slower."""
+        scope = runner_scope(self.runner_dir)
+        if scope.nightly or scope.fresh or scope.gateway or scope.dedicated:
+            return self.mem_release(None)
+        self.cpu_holds()  # refreshes self.mem_cap with the other settings, at most every GATE_SETTINGS_EVERY_S
+        if self.mem_cap is None:
+            self.mem_waived = False
+            return self.mem_release(None)
+        now = time.monotonic()
+        if now - self.mem_at >= GATE_CPU_EVERY_S:
+            fresh = now - self.memory_at < GATE_CPU_EVERY_S  # saturated() just read the level
+            level = self.memory_pressure if fresh else memory_pressure_level()
+            self.mem_reading, self.mem_at = (reclaimable_mib(), level), now
+            if self.mem_reading[0] is None and sys.platform == "darwin" and not self.mem_unread_noted:
+                gate_log("the memory cap cannot read reclaimable memory (sysctl); only memory pressure applies")
+                self.mem_unread_noted = True
+        short = memory_short(self.mem_cap, self.mem_held, *self.mem_reading)
+        if short is None:
+            if self.mem_held and (wait := self.mem_stagger()):
+                return wait
+            self.mem_waived = self.mem_held = False
+            return self.mem_release(None)
+        self.mem_held = True
+        if self.mem_waived:
+            return None
+        self.cap_look()  # the load cap's feed: one read a minute serves both caps
+        host = runner_host(runner_config(self.runner_dir)[0]) or gate_host()
+        wall = time.time()
+        if urgent_queued(self.cap_summary, self.cap_labels, host, wall):
+            return self.mem_release(f"{short}, but an urgent or pinned job of this runner's label is queued: listening")
+        waited = oldest_queued_s(self.cap_summary, self.cap_labels, wall, max_age=None)
+        if waited is not None and waited >= self.mem_cap.max_wait_s:
+            return self.mem_release(f"{short}, but a job of this runner's label has waited {waited / 60:.0f} min: "
+                                    "listening (the job runs here, slower)")
+        since = self.mem_since if self.mem_since is not None else now
+        verdict = load_cap_verdict(self.cap_summary, self.cap_labels, host, wall, grace=self.mem_cap.max_wait_s)
+        if verdict is None and now - since >= self.mem_cap.max_wait_s:
+            self.mem_waived = True
+            return self.mem_release(f"{short} for {self.mem_cap.max_wait_s / 60:g} min with no other listener known "
+                                    "to keep up with this runner's label: listening (the job runs here, slower)")
+        why = (f"{MEMORY_CAPPED} ({short}) while " + (verdict or "a job of its label may wait "
+                                                      f"{self.mem_cap.max_wait_s / 60:g} min for room"))
+        if why != self.mem_why:
+            gate_log(why)
+        self.mem_why, self.mem_since = why, since
+        return why
+
+    def mem_stagger(self) -> str | None:
+        """When memory recovers, one held listener on the mini resumes at a time (MEMORY_CAP_STAGGER_S): None and the
+        shared stamp touched for this one, or why it waits because another started within the stagger."""
+        path = self.state_dir / MEMORY_CAP_START_FILE
+        with contextlib.suppress(OSError):
+            ago = time.time() - path.stat().st_mtime
+            if 0 <= ago < MEMORY_CAP_STAGGER_S:
+                why = (f"{MEMORY_CAPPED} (another listener on this mini started {ago:.0f} s ago; the next one waits "
+                       f"{MEMORY_CAP_STAGGER_S:g} s for its job's memory to show)")
+                self.mem_why = self.mem_why or why
+                return why
+        with contextlib.suppress(OSError):
+            path.touch()
+            os.utime(path)
+        return None
+
+    def mem_release(self, note: str | None) -> None:
+        """End a MEMORY_CAP hold, logging why once."""
+        if self.mem_why is not None:
+            gate_log(note or "a new job fits in this mini's memory again")
+        self.mem_why, self.mem_since = None, None
+        return None
+
     def cap_release(self, note: str | None) -> None:
         """End a HOST_LOAD_CAP hold, logging why once."""
         if self.cap_why is not None:
             gate_log(note or "the host is under its load cap again")
         self.cap_why = None
         return None
+
+    def ios_sim_wanted(self) -> bool:
+        """IOS_SIM_OWN_FIT: whether this runner carries IOS_SIM_RUNNER_LABEL and the controller's feed shows a queued
+        job needing it that this runner could take. Only on a simulator mini (simulator_host) does it start the
+        shared feed look (cap_look); until that look lands, or when it fails, the answer is False (today's rule)."""
+        wanted = False
+        if simulator_host(self.state_dir):
+            self.cap_look()
+            wanted = ios_sim_queued(self.cap_summary, self.cap_labels, time.time())
+        if wanted != self.ios_sim_own:
+            gate_log(f"a queued job needs {IOS_SIM_RUNNER_LABEL}: listening at this runner's own fit, not the side "
+                     "label's costliest job" if wanted else
+                     f"no queued job needs {IOS_SIM_RUNNER_LABEL}: listening with room for the side label's costliest job")
+        self.ios_sim_own = wanted
+        return wanted
 
     def cpu_holds(self) -> bool:
         """Whether the CPU marks hold this mini's listeners (config/runner-gate.json's cpuHold; gate_cpu_hold), read
@@ -8702,6 +9163,12 @@ class Gate:
         if cap != self.cap:
             gate_log(f"the host load cap is {f'{cap:g} per core' if cap > 0 else 'off'} on this mini")
         self.cap = cap
+        mem_cap = gate_memory_cap(doc, gate_host(), time.time())
+        if mem_cap != self.mem_cap:
+            gate_log("the memory cap is " + (f"{mem_cap.need_mib / 1024:g} GiB reclaimable (resume "
+                                             f"{mem_cap.resume_mib / 1024:g}, wait at most "
+                                             f"{mem_cap.max_wait_s / 60:g} min)" if mem_cap else "off") + " on this mini")
+        self.mem_cap = mem_cap
         return hold
 
     def saturated(self) -> str | None:
@@ -8854,7 +9321,7 @@ class Gate:
         if why:
             self.load_since = None
             self.yield_to_fleet()
-        return (why or self.shed(self.saturated()) or self.load_capped() or self.full(fresh=True) or self.shed(self.hot(fresh=True))
+        return (why or self.shed(self.saturated()) or self.load_capped() or self.memory_capped() or self.full(fresh=True) or self.shed(self.hot(fresh=True))
                 or self.stalled() or self.locked(fresh=True) or self.low_disk() or self.ineligible() or self.off_tailnet())
 
     def still_waiting(self) -> str | None:
@@ -8934,6 +9401,16 @@ class Gate:
                 self.evict_idle_in_background(path, target + GATE_DISK_RESUME_GIB)
             return (f"disk: {short} for {whose}, cleanup requested; holding the listener so the "
                     "job goes to a runner with room (DISK_SHORT_HOLD)")
+        if not scope.dedicated and not nightly_own and not scope.gateway and scope.min_free_gib > 0:
+            crowded = self.runner_jobs_short(path)
+            if crowded:
+                why_jobs, need = crowded
+                target = max(floor, need)
+                self.evict_in_background(path, target)
+                if reserve:
+                    self.evict_idle_in_background(path, target + GATE_DISK_RESUME_GIB)
+                return (f"disk: {why_jobs}, cleanup requested; holding the listener so the job goes to a runner "
+                        "with room (RUNNER_JOBS_DISK)")
         if why:
             self.evict_in_background(path, floor)
             if scope.dedicated or reserve:
@@ -8943,6 +9420,25 @@ class Gate:
                 gate_log(f"disk warning: {why}{reserve}; keeping the listener online and requesting cleanup")
                 self.disk_warned_at = now
         return None
+
+    def runner_jobs_short(self, path: str) -> tuple[str, float] | None:
+        """RUNNER_JOBS_DISK: (why, the free disk wanted) when free disk is under the floor plus one measured job's
+        disk for each runner job in flight here and the next, else None. The process table is read only when the
+        free disk could be short with every runner install busy; no per-job value, no free-disk reading or no
+        process table: None (the one-job hold still stands)."""
+        per, source = runner_job_disk()
+        free = free_or_none(path)
+        if per is None or free is None:
+            return None
+        home = self.runner_dir.parent
+        if free >= runner_jobs_need_gib(max(0, len(runner_dirs(home)) - 1), per):
+            return None
+        try:
+            in_flight = runner_jobs_in_flight(home, self.runner_dir, processes())
+        except Exception:  # noqa: BLE001
+            return None
+        why = runner_jobs_refusal(free, in_flight, per, source)
+        return (why, runner_jobs_need_gib(in_flight, per)) if why else None
 
     def evict_idle_in_background(self, path: str, target: float) -> None:
         """Below a builder's floor or reserve, reclaim idle PR runners' _work in a bounded thread
@@ -9124,7 +9620,10 @@ class Gate:
         if scope.nightly:  # NIGHTLY_SLOT: its one job shape goes first here, so it listens on a full mini
             self.full_why = None
             return None
-        fit = max(self.fit_units, listen_fit_units(self.runner_dir), side_fit_units(scope))
+        own = max(self.fit_units, listen_fit_units(self.runner_dir))
+        fit = max(own, side_fit_units(scope))
+        if fit > own and self.ios_sim_wanted():
+            fit = own  # IOS_SIM_OWN_FIT: a bigger std job it receives waits here for units (CAPACITY_WAIT)
         if self.capacity_dir is None or not claims_room(scope):
             why = mini_full(self.capacity_dir, scope.units, scope, fit)
         elif scope.session:
@@ -12026,10 +12525,13 @@ def main(argv: list[str] | None = None) -> int:
         # every class, the general pool included: a job cmux routes to a hosted runner is never taken here
         if why := hosted_route_refusal(os.environ.get("GITHUB_WORKFLOW_REF"), os.environ.get("GITHUB_JOB")):
             return refused(why)
+        slot_tier = ""  # the nightly slot's job: its tier (NIGHTLY_SLOT, STACK_SLOT)
         if args.nightly_runner:
-            why = nightly_slot_refusal(job_tier(os.environ.get("GITHUB_EVENT_NAME"), os.environ.get("GITHUB_REF"),
-                                                os.environ.get("GITHUB_REPOSITORY"), event,
-                                                os.environ.get("GITHUB_WORKFLOW_REF"), os.environ.get("GITHUB_JOB")))
+            slot_tier = job_tier(os.environ.get("GITHUB_EVENT_NAME"), os.environ.get("GITHUB_REF"),
+                                 os.environ.get("GITHUB_REPOSITORY"), event, os.environ.get("GITHUB_WORKFLOW_REF"),
+                                 os.environ.get("GITHUB_JOB")) or stack_blocker_tier(
+                os.environ.get("GITHUB_EVENT_NAME"), os.environ.get("GITHUB_REPOSITORY"), event)
+            why = nightly_slot_refusal(slot_tier)
             if why:
                 return refused(why)
         if args.dev_compile_runner:
@@ -12058,8 +12560,9 @@ def main(argv: list[str] | None = None) -> int:
             if why:
                 return refused(why)
         # a dedicated builder is not a pool runner: a reservation of the mini's pool never refuses its one job shape
+        # STACK_SLOT: a NIGHTLY_SIGNING reservation admits only the nightly slot's nightly jobs, never a PR job there
         why = None if args.dedicated_admit else reservation_refusal(args.reservation, time.time(), taken_job=True,
-                                                                    nightly_slot=bool(args.nightly_runner))
+                                                                    nightly_slot=slot_tier == TIER_NIGHTLY)
         disk_path = os.path.dirname(args.host_lock)
         disk_deadline = time.monotonic() + EVICT_TIMEOUT_S  # one budget for every eviction of this job-started
         # a nightly job short of disk goes first here (NIGHTLY_DISK_RESERVE): no new job starts on this mini while it
@@ -12185,6 +12688,7 @@ def main(argv: list[str] | None = None) -> int:
                                                   os.environ.get("GITHUB_REF"), os.environ.get("GITHUB_JOB"),
                                                   job_workflow(), os.environ.get("GITHUB_RUN_ATTEMPT"))
             cap = bounded_wait(cap, nightly_bound)
+            cap = stack_slot_capacity_wait(cap, tier, bool(args.nightly_runner))
             if admit_class == GATEWAY_CLASS:
                 cap = bounded_wait(cap, GATEWAY_CAPACITY_WAIT_S)
             claim_class = admit_class or job_class(os.environ.get("GITHUB_JOB", ""), repo, args.home_repo,
