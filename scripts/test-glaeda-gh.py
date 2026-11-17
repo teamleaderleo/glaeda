@@ -2031,6 +2031,39 @@ class DaemonTest(Base):
         self.daemon.tick(NOW + gg.CYCLE)
         self.assertEqual(gg.read_cache(key)["jobs"][0]["name"], "build")
 
+    def test_active_jobs_are_not_refetched_on_every_run_poll(self) -> None:
+        self.gh.runs[8] = {"id": 8, "status": "in_progress", "run_attempt": 1}
+        self.gh.jobs[8] = [job("build", run_attempt=1)]
+        key = gg.parse_key("run", "o/r/8")
+        gg.register(key, jobs=True)
+        self.daemon.tick(NOW)
+        self.daemon.tick(NOW + gg.CYCLE)
+        self.daemon.tick(NOW + 2 * gg.CYCLE)
+        self.assertEqual(len(self.gh.job_calls()), 1)
+        self.daemon.tick(NOW + 5 * gg.CYCLE)
+        self.assertEqual(len(self.gh.job_calls()), 2)  # active progress still refreshes at a bounded pace
+        self.gh.runs[8] = {**self.gh.runs[8], "run_attempt": 2}
+        self.gh.jobs[8] = [job("build-2", run_attempt=2)]
+        self.daemon.tick(NOW + 6 * gg.CYCLE)
+        self.assertEqual(len(self.gh.job_calls()), 3)  # a rerun gets its list immediately
+
+    def test_terminal_jobs_are_hydrated_once_per_attempt(self) -> None:
+        self.gh.runs[9] = {"id": 9, "status": "completed", "conclusion": "success", "run_attempt": 1}
+        self.gh.jobs[9] = [job("build", conclusion="success", run_attempt=1)]
+        key = gg.parse_key("run", "o/r/9")
+        gg.register(key, jobs=True)
+        self.daemon.tick(NOW)
+        gg.register(key)
+        os.utime(gg.watch_dir() / gg.file_name(key), (NOW + gg.TERMINAL_REFRESH + gg.CYCLE,) * 2)
+        self.daemon.tick(NOW + gg.TERMINAL_REFRESH + gg.CYCLE)
+        self.assertEqual(len(self.gh.job_calls()), 1)
+        self.gh.runs[9] = {**self.gh.runs[9], "run_attempt": 2}
+        self.gh.jobs[9] = [job("build-2", conclusion="success", run_attempt=2)]
+        gg.register(key)
+        os.utime(gg.watch_dir() / gg.file_name(key), (NOW + 2 * gg.TERMINAL_REFRESH + gg.CYCLE,) * 2)
+        self.daemon.tick(NOW + 2 * gg.TERMINAL_REFRESH + gg.CYCLE)
+        self.assertEqual(len(self.gh.job_calls()), 2)
+
     def test_batched_graphql_query_and_parse(self) -> None:
         keys = [gg.parse_key("pr", "o/r#1"), gg.parse_key("pr", "https://github.com/O/R/pull/2"), gg.parse_key("pr", "o/r#3")]
         query, variables = gg.pr_query(keys)
