@@ -4509,6 +4509,48 @@ class HookTest(unittest.TestCase):
                 self.finish(runner)
         self.assertTrue(self.lock_free())
 
+    def test_canarys_light_jobs_run_beside_a_compile(self) -> None:
+        """nightly-next-canary.yml's pick (reads the feed and the verdict cache with the job token), verdict (writes
+        the verdict and dispatches nightly-next-verdict.yml) and failed (a rollback dispatch and an issue) build
+        nothing on the nightly slot. As unknown jobs they were compiles: every scheduled canary from about 09:37Z on
+        2026-11-17 ended cancelled, cmux run 44067455848's pick refused after 300 s with "4 of 14 units free, pick
+        (compile) needs 5"."""
+        self.fleet()
+        name = "nightly-next-canary.yml"
+        ref = {"GITHUB_WORKFLOW_REF": f"manaflow-ai/cmux/.github/workflows/{name}@refs/heads/main"}
+        runners = ["r0"]
+        try:
+            compile_ = self.job("macos-compile-admission", "r0", 14, None, env={
+                "GITHUB_WORKFLOW_REF": "manaflow-ai/cmux/.github/workflows/ci.yml@refs/heads/main"})
+            self.assertIn("holding 5/14 units+persistent-dd+root-1 for macos-compile-admission (", compile_.stdout)
+            for index, job in enumerate(("pick", "verdict", "failed")):
+                with self.subTest(job=job):
+                    self.assertEqual(hook.job_class(job, "manaflow-ai/cmux", workflow=name), ("light", False))
+                    runners.append(f"s{index}")
+                    done = self.job(job, runners[-1], 14, None, env=ref)
+                    self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+                    self.assertIn(f"for {job} (light", done.stdout)
+                    self.assertNotIn("is in no job table", done.stdout)
+        finally:
+            for runner in runners:
+                self.finish(runner)
+        self.assertTrue(self.lock_free())
+
+    def test_a_nightly_verify_workflows_unlisted_job_is_light(self) -> None:
+        """NIGHTLY_VERIFY_WORKFLOWS check a published DMG and build nothing, and their jobs rank as nightly jobs that
+        wait 300 s at most. A job one of them adds that no table lists is light, not a compile (5 units, persistent-dd
+        and a root): the canary's pick, then its verdict and failed, were each refused that way after the launch
+        smoke's pick (#2062). A listed job keeps its row (the canary itself is isolated)."""
+        for name in hook.NIGHTLY_VERIFY_WORKFLOWS:
+            with self.subTest(workflow=name):
+                self.assertEqual(hook.job_class("a-job-added-later", "manaflow-ai/cmux", workflow=name),
+                                 ("light", False))
+        self.assertEqual(hook.job_class("canary", "manaflow-ai/cmux", workflow="nightly-next-canary.yml"),
+                         ("isolated", False))
+        # any other workflow's unlisted job stays the compile it was
+        self.assertEqual(hook.job_class("a-job-added-later", "manaflow-ai/cmux", workflow="ci.yml"),
+                         ("compile", True))
+
     def test_capacity_a_job_cost_override_keeps_its_class_tokens(self) -> None:
         """cli-regressions is an unknown job (a compile, pinned to root 1) that measures 0.16 cores: it costs 1 core
         but still holds persistent-dd and the root, so a compile still waits for those, not for cores."""
