@@ -7359,6 +7359,108 @@ LAND_STOP_CLASSES = {"block": "block", "held": "hold", "chat_hold": "chat_hold",
                      "language_boundary": "language_boundary", "react_port": "react_port", "teammate": "teammate",
                      "admin": "admin", "not_found": "not_found", "main": "main_web", "pin_skew": "pin_skew",
                      "conflicts_base": "conflict"}
+# A red in a job the PR's changed paths cannot affect gets one `gh run rerun RUN --failed` before it counts as own_red
+# (claude-sr2-coord, 2026-11-17: "A red in a job the PR's changed paths cannot affect gets one --failed rerun by the
+# queue before it counts as own_red"). manaflow-ai/cmux#45558 changed only webviews/ and scripts/ files, and land
+# stopped it own_red on run 44118660533, whose rust workspaces job Native/OptChat/optchat-chief failed one test with
+# "connection refused" on a local port; a hand rerun was the step. merge_hold's own_red answer is a stop that names no
+# job, run or path verdict as data (its red_runs fact holds every red run at the head, excused base reds too), so:
+# - the job: the classifier's first unexcused red, as base_red_excuse.py words it ("not excused: 'NAME'"), found among
+#   the cache's red checks at the judged head: one workflow and one run, else no rerun;
+# - "cannot affect": LAND_UNRELATED_REDS below (land.json "unrelatedReds" adds to it), per repository and workflow, a
+#   list of path globs that workflow's jobs never read. Every file the PR changes (one read of its file list) must be
+#   one of them. A workflow with no entry, a path outside them, a list that cannot be read whole: it can affect, no
+#   rerun. The globs are an allow list of the inert, so a new directory is never inert by default; a glob that goes
+#   stale costs one rerun, since the second red still stops;
+# - once per (head, run), kept on the entry (unrelatedReruns) before the rerun is sent, so a restart never sends it
+#   twice; then a wait on the PR's checks at that head and a judge. The same red again at that head stops own_red.
+# The cmux rust workspaces entry: its plan job (.github/scripts/rust-workspaces.py plan) runs a workspace for a file
+# under it or a path dependency, a file its Rust sources read by literal path, or a change to the workflow itself; its
+# jobs also run scripts/ci/api_call_log/env.sh (BASH_ENV), scripts/ci/init-submodule.sh and scripts/install-zig-ci.sh.
+# Rust sources read webviews/src/agent-session/acpmux/rows/parity/ (acpmux-core's parity tests) and
+# scripts/measure/screen-stream-eval/ by literal path at feat-cmux-next 695daf1d7a0 (2026-11-17); nothing else under
+# webviews/, scripts/ci/ or scripts/measure/'s own files.
+LAND_UNRELATED_REDS: dict[str, dict[str, dict[str, list[str]]]] = {
+    "manaflow-ai/cmux": {
+        "rust workspaces": {
+            "inert": ["webviews/**", "docs/**", "scripts/ci/*", "scripts/measure/*"],
+            "except": ["webviews/src/agent-session/acpmux/rows/parity/**", "scripts/ci/init-submodule.sh",
+                       "**/*.rs", "**/Cargo.toml", "**/Cargo.lock", "**/rust-toolchain", "**/rust-toolchain.toml"],
+        },
+    },
+}
+LAND_OWN_RED_JOB = re.compile(r"\bnot excused: '([^'\n]{1,200})'")
+LAND_RED_CONCLUSIONS = frozenset({"FAILURE", "TIMED_OUT", "CANCELLED"})  # what `gh run rerun --failed` reruns
+LAND_FILES_MAX = 3000  # GitHub lists at most this many files of a PR: a list that long may not be whole
+LAND_UNRELATED_KEEP = 20  # (head, run) reruns an entry remembers
+
+
+def land_glob(pattern: str) -> re.Pattern:
+    """A path glob as a regex over a whole repository path: `**/` any directories (or none), `**` anything, `*` and `?`
+    within one path segment."""
+    out, i = [], 0
+    while i < len(pattern):
+        if pattern.startswith("**/", i):
+            out.append("(?:.*/)?")
+            i += 3
+        elif pattern.startswith("**", i):
+            out.append(".*")
+            i += 2
+        elif pattern[i] == "*":
+            out.append("[^/]*")
+            i += 1
+        elif pattern[i] == "?":
+            out.append("[^/]")
+            i += 1
+        else:
+            out.append(re.escape(pattern[i]))
+            i += 1
+    return re.compile("".join(out))
+
+
+def land_unrelated_rule(repo: str, workflow: str, config: dict | None = None) -> dict | None:
+    """The inert-path rule for WORKFLOW's jobs in REPO (LAND_UNRELATED_REDS, then land.json's "unrelatedReds"), or
+    None: no rule, so a change can affect it."""
+    def find(table: Any) -> Any:
+        if not isinstance(table, dict):
+            return None
+        rules = next((v for k, v in table.items() if str(k).lower() == repo.lower()), None)
+        return rules.get(workflow) if isinstance(rules, dict) else None
+    rule = find((config or {}).get("unrelatedReds")) or find(LAND_UNRELATED_REDS)
+    if not isinstance(rule, dict) or not isinstance(rule.get("inert"), list) or not rule["inert"]:
+        return None
+    return rule
+
+
+def land_path_inert(path: str, rule: dict) -> bool:
+    """PATH is one RULE names as never read by its workflow's jobs."""
+    def hit(key: str) -> bool:
+        return any(isinstance(g, str) and land_glob(g).fullmatch(path) for g in rule.get(key) or [])
+    return hit("inert") and not hit("except")
+
+
+def land_own_red(answer: dict, act: dict, checks: list, head_ok: bool) -> tuple[str, int | None, str]:
+    """(workflow, run, why-not) of the red merge_hold's own_red answer names: the classifier's first unexcused job
+    ("not excused: 'NAME'"), matched by name (or "WORKFLOW / NAME") among CHECKS' reds at the judged head (HEAD_OK).
+    One workflow and one run, else (.., None, why not)."""
+    said = LAND_OWN_RED_JOB.search(f"{answer.get('reason') or ''}\n{act.get('why') or ''}")
+    if not said:
+        return "", None, "the refusal names no unexcused job"
+    if not head_ok:
+        return "", None, "the cache's checks are not at the judged head"
+    name = said.group(1)
+    reds = [c for c in checks if isinstance(c, dict) and str(c.get("conclusion") or "").upper() in LAND_RED_CONCLUSIONS
+            and name in (c.get("name"), f"{c.get('workflow')} / {c.get('name')}")]
+    runs = {c.get("runId") for c in reds}
+    flows = {c.get("workflow") for c in reds}
+    if not reds or len(runs) != 1 or len(flows) != 1:
+        return "", None, f"'{name}' is not one red check in one run at the head"
+    run, flow = next(iter(runs)), next(iter(flows))
+    if not isinstance(run, int) or isinstance(run, bool) or run <= 0 or not flow:
+        return "", None, f"'{name}' has no workflow run"
+    return str(flow), run, ""
+
+
 # merge_hold before the "action" field: its refusal code mapped to a step (action-schema.md, "Notes"). The prose
 # `next:` line is never parsed: a step it names that the table does not know is a command, which stops.
 LAND_FALLBACK = {"tip_merge": "update_branch", "stale_green": "update_branch", "ws_check_stale_base": "update_branch",
@@ -8255,8 +8357,13 @@ class LandQueue:
                 self.judge(e, head, fp)
             elif kind != "pr" or w.get("sha") != head:
                 self.wait_running(e, head, fp)
+            elif w.get("rerun") and not w.get("sawRunning"):
+                w["sawRunning"] = True
+                self.save(e)
             return
-        if woke or fp != e.get("seen"):
+        # A rerun's wait: the rerun ran (the checks were seen running) and finished. Red again shows the fingerprint it
+        # was judged at, which alone would wait out the whole timeout before the same red is judged.
+        if woke or fp != e.get("seen") or (kind == "pr" and w.get("rerun") and w.get("sawRunning")):
             # A change alone (checks finished, mergeability computed) is not the step running its course: the same
             # refusal after it does not count toward the stop; after its timeout it does.
             self.judge(e, head, fp, counts=woke)
@@ -8555,6 +8662,8 @@ class LandQueue:
                 self.stop(e, "policy", f"merge_hold's step names {act.get('repo')}#{act.get('number')}, not this PR",
                           land_trim(answer.get("next")))
             return
+        if kind == "stop" and act.get("stop") == "own_red" and self.rerun_unrelated(e, act, answer, head):
+            return
         if kind in ("stop", "command"):
             why = act.get("why") or answer.get("reason")
             nxt = " ".join(map(str, act["argv"])) if isinstance(act.get("argv"), list) else act.get("text")
@@ -8608,7 +8717,8 @@ class LandQueue:
             with self.lock:
                 self.finish(e, results[-1], exits=[g.returncode for g in results])
                 self.nudge(e["key"])
-                self.wait(e, {"kind": "pr", "sha": head, "why": "reran failed jobs"}, LAND_WAIT_DEFAULT)
+                self.wait(e, {"kind": "pr", "sha": head, "why": "reran failed jobs", "rerun": True},
+                          LAND_WAIT_DEFAULT)
             return
         if kind == "review":
             self.do_review(e, head, answer)
@@ -8648,6 +8758,49 @@ class LandQueue:
                 after = land_seconds(act.get("after_s"), LAND_RETRY_DEFAULT) * (2 ** max(0, n - 1))
                 self.wait(e, {"kind": "retry"}, min(LAND_RETRY_MAX, after))
             self.count(kind)
+
+    def rerun_unrelated(self, e: dict, act: dict, answer: dict, head: str) -> bool:
+        """An own_red stop whose red is in a job the PR's changed paths cannot affect (LAND_UNRELATED_REDS): one
+        `gh run rerun RUN --failed` per (head, run), kept on the entry before it is sent, then a wait on the PR's
+        checks at HEAD. True when it took that step; False: the stop goes ahead, as before."""
+        repo, number = e["repo"], str(e["number"])
+        data = (self.cache_of(e["key"]) or {}).get("data") or {}
+        checks = data.get("checks") if isinstance(data.get("checks"), list) else []
+        head_ok = bool(SHA40.fullmatch(head)) and str(data.get("headRefOid") or "").lower() == head
+        flow, run, why = land_own_red(answer, act, checks, head_ok)
+        rule = land_unrelated_rule(repo, flow, self.config()) if run else None
+        if run and rule is None:
+            why = f"workflow '{flow}' has no inert-path rule, so the change can affect it"
+        done = f"{head}|{run}"
+        if rule is not None and done in (e.get("unrelatedReruns") or []):
+            rule, why = None, f"run {run} was already rerun once at {head[:12]}"
+        gh = self.gh() if rule is not None else None
+        if rule is not None and gh is None:
+            rule, why = None, "no gh-quota shim to read the PR's files through"
+        if rule is not None:
+            got = self.call([gh, "api", f"repos/{repo}/pulls/{number}/files?per_page=100", "--paginate",
+                             "--jq", ".[].filename"], LAND_GH_DEADLINE)
+            files = [line.strip() for line in (got.stdout or "").splitlines() if line.strip()]
+            if got.returncode != 0 or not files or len(files) >= LAND_FILES_MAX:
+                rule, why = None, (f"the PR's file list could not be read whole (exit {got.returncode}, "
+                                   f"{len(files)} files)")
+            elif touched := [f for f in files if not land_path_inert(f, rule)]:
+                rule, why = None, f"it changes {land_trim(touched[0], 160)}, which '{flow}' can read"
+        with self.lock:
+            self.check(e)
+            if rule is None:
+                self.history(e, "no_unrelated_rerun", why=land_trim(why, 200))
+                return False
+            e["unrelatedReruns"] = [*(e.get("unrelatedReruns") or []), done][-LAND_UNRELATED_KEEP:]
+            self.history(e, "unrelated_red", run=run, workflow=flow, files=len(files))
+            self.claim(e, "rerun_failed", runs=[run], unrelated=True)
+        got = self.call([gh, "run", "rerun", str(run), "--failed", "-R", repo], LAND_GH_DEADLINE, e)
+        with self.lock:
+            self.finish(e, got)
+            self.nudge(e["key"])
+            self.wait(e, {"kind": "pr", "sha": head, "rerun": True,
+                          "why": f"reran run {run}, a red the change cannot affect"}, LAND_WAIT_DEFAULT)
+        return True
 
     def push_step(self, e: dict, kind: str, head: str, args: list[str], **extra: Any) -> None:
         """A step that makes GitHub change the PR (update-branch, a base change): run it, then wait for the cache to

@@ -16987,6 +16987,7 @@ class LandWorld:
         self.origin = "https://github.com/o/r.git"
         self.fetch_rc = 0
         self.fetch_err = "fatal: unable to access 'https://github.com/o/r.git/': Could not resolve host"
+        self.files: list[str] = []  # the PR's changed files, as `gh api repos/o/r/pulls/1/files` lists them
 
     def set_pr(self, key: str, data: dict, fetched: float) -> None:
         self.cache[key] = {"key": key, "data": data, "fetchedAt": fetched, "dataAt": fetched}
@@ -17007,6 +17008,8 @@ class LandWorld:
             return subprocess.CompletedProcess(argv, self.fetch_rc, "", "" if self.fetch_rc == 0 else self.fetch_err)
         if argv[0] == os.fspath(self.gh):
             words = argv[1:]
+            if words[:1] == ["api"] and "/files?" in words[1]:
+                return subprocess.CompletedProcess(argv, 0, "".join(f + "\n" for f in self.files), "")
             if words[:2] == ["pr", "view"]:
                 merged = any(c[1:3] == ["pr", "merge"] and self.gh_rc.get("merge", 0) == 0 for c in self.calls)
                 state = "MERGED" if merged and self.merged_on_merge else "OPEN"
@@ -17436,6 +17439,104 @@ class LandTest(Base):
         self.w.answers.append(ok_answer(LA))
         self.tick()
         self.assert_merged_at(LA)
+
+    # cmux#45558 (2026-11-17): webviews/ and scripts/ only, stopped own_red on run 44118660533, whose rust workspaces
+    # job failed a test on a local port; a hand rerun was the step.
+    RUN = 44118660533
+    OWN_RED = ("merge_hold: refused: base_red_excuse.py exit 1 at {head}: not excused: 'Native/OptChat/optchat-chief': "
+               "its log names failed test streamable_http_server_with_get_stream_events, which passed on base")
+
+    def unrelated_world(self, files: list[str], red: bool = True) -> None:
+        self.w.config["unrelatedReds"] = {"o/r": gg.LAND_UNRELATED_REDS["manaflow-ai/cmux"]}
+        self.w.files = files
+        self.pr_red(red)
+
+    def pr_red(self, red: bool, running: bool = False) -> None:
+        state = ("IN_PROGRESS", None) if running else ("COMPLETED", "FAILURE" if red else "SUCCESS")
+        checks = [{"name": "Native/OptChat/optchat-chief", "workflow": "rust workspaces", "status": state[0],
+                   "conclusion": state[1], "runId": self.RUN},
+                  {"name": "rust workspaces", "workflow": "rust workspaces", "status": state[0],
+                   "conclusion": state[1], "runId": self.RUN},
+                  # a base red merge_hold excused: another workflow, never rerun for this
+                  {"name": "cmux-next CI guard group", "workflow": "cmux-next guards", "status": "COMPLETED",
+                   "conclusion": "FAILURE", "runId": 44118660549}]
+        self.w.set_pr(self.KEY, {**land_pr(LA), "checks": checks}, self.t)
+
+    def own_red(self) -> tuple[int, dict]:
+        why = self.OWN_RED.format(head=LA)
+        return refusal("red_not_excused", LA, {"kind": "stop", "stop": "own_red",
+                                               "why": f"{why}; read: gh run view 44118660549 -R o/r --log-failed"},
+                       reason=why)
+
+    def test_a_red_the_change_cannot_affect_is_rerun_once_then_merged(self):
+        self.unrelated_world(["scripts/ci/react-doctor-baseline.json", "scripts/measure/first-load-after-restart.sh",
+                              "webviews/src/agent-session/acpmux/VirtualTranscript.tsx",
+                              "webviews/test/first-load-frames.test.ts"])
+        self.land()
+        self.w.answers.append(self.own_red())
+        e = self.tick()
+        self.assertEqual(self.w.gh_calls("run", "rerun"), [["run", "rerun", str(self.RUN), "--failed", "-R", "o/r"]])
+        self.assertEqual((e["state"], e["wait"]["kind"], e["unrelatedReruns"]), ("waiting", "pr", [f"{LA}|{self.RUN}"]))
+        self.assertIsNone(e.get("stop"))
+        self.pr_red(False, running=True)
+        self.tick()
+        self.assertEqual(len(self.w.explains()), 1)
+        self.pr_red(False)
+        self.w.answers.append(ok_answer(LA))
+        self.tick()
+        self.assert_merged_at(LA)
+
+    def test_the_same_red_after_its_one_rerun_stops_own_red_even_after_a_restart(self):
+        self.unrelated_world(["webviews/src/a.ts"])
+        self.land()
+        self.w.answers.append(self.own_red())
+        self.tick()
+        self.assertEqual(len(self.w.gh_calls("run", "rerun")), 1)
+        self.q = self.queue()  # a restart: the rerun is kept on the entry, on disk
+        self.pr_red(True, running=True)
+        self.tick()
+        self.pr_red(True)
+        self.w.answers.append(self.own_red())
+        e = self.tick()
+        self.assertEqual(len(self.w.gh_calls("run", "rerun")), 1)
+        self.assertEqual((e["state"], (e.get("stop") or {}).get("code")), ("stopped", "own_red"), e.get("history"))
+        self.assertIn("already rerun once", json.dumps(e["history"]))
+
+    def test_a_red_the_change_can_affect_stops_at_once_with_no_rerun(self):
+        for files in (["webviews/src/a.ts", "Native/OptChat/optchat-chief/src/hub.rs"],
+                      ["webviews/src/agent-session/acpmux/rows/parity/parity.changes.jsonl"],
+                      ["scripts/ci/init-submodule.sh"], ["scripts/ci/api_call_log/env.sh"],
+                      ["scripts/measure/screen-stream-eval/wifi-away-holds.json"], ["README.md"]):
+            with self.subTest(files=files):
+                gg.BASE = Path(self.tmp.name) / f"gh-{len(files)}-{abs(hash(files[-1]))}"  # a fresh queue each
+                self.w.calls.clear()
+                self.q = self.queue()
+                self.unrelated_world(files)
+                self.land()
+                self.w.answers.append(self.own_red())
+                e = self.tick()
+                self.assertEqual(self.w.gh_calls("run", "rerun"), [])
+                self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "own_red"))
+                self.assertIn(f"it changes {files[-1]}, which 'rust workspaces' can read", json.dumps(e["history"]))
+
+    def test_a_workflow_with_no_rule_stops_without_reading_the_files(self):
+        self.unrelated_world(["webviews/src/a.ts"])
+        del self.w.config["unrelatedReds"]  # o/r has no rule: a change can affect every workflow
+        self.land()
+        self.w.answers.append(self.own_red())
+        e = self.tick()
+        self.assertEqual((e["state"], self.w.gh_calls("run", "rerun"), self.w.gh_calls("api")), ("stopped", [], []))
+        self.assertIn("has no inert-path rule", json.dumps(e["history"]))
+
+    def test_the_cmux_rust_workspaces_rule(self):
+        rule = gg.land_unrelated_rule("Manaflow-AI/cmux", "rust workspaces")
+        inert = {"webviews/src/x.tsx": True, "docs/a/b.md": True, "scripts/ci/react-doctor-baseline.json": True,
+                 "scripts/measure/first-load-after-restart.sh": True, "scripts/ci/init-submodule.sh": False,
+                 "scripts/ci/api_call_log/env.sh": False, "scripts/measure/workspace-factory/src/main.rs": False,
+                 "webviews/src/agent-session/acpmux/rows/parity/a.jsonl": False, "webviews/build.rs": False,
+                 "Native/OptChat/optchat-chief/tests/mcp_hub.rs": False, ".github/workflows/rust-workspaces.yml": False}
+        self.assertEqual({p: gg.land_path_inert(p, rule) for p in inert}, inert)
+        self.assertIsNone(gg.land_unrelated_rule("manaflow-ai/cmux", "cmux-next guards"))
 
     def test_dependency_chain_lands_after_the_first_merges(self):
         self.pr(LA)
