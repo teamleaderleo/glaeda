@@ -13680,6 +13680,17 @@ ROOT_LEDGER_DEPTH = 3
 ROOT_LEDGER_PATH_FLOOR = 16 * 1024**2  # a snapshot keeps only paths this big; a smaller one's delta is lost in the floor
 ROOT_LEDGER_TOP = 25
 ROOT_LEDGER_COVERAGE = 0.97  # walk + open-deleted under this share of df used: the gap alarm
+# A TCC-protected folder can block a root read in the kernel (one host hung in a user's Library/News). glaeda-cdu
+# skips the known ones (its TCC_SKIP) and bounds every directory read to this; a walk it had to abandon is run again
+# without the stalled path, at most ROOT_LEDGER_WALK_RETRIES times, and the path is remembered for later walks.
+ROOT_LEDGER_DIR_TIMEOUT_S = 60
+ROOT_LEDGER_WALK_RETRIES = 3
+ROOT_LEDGER_LEARNED_DAYS = 30
+CDU_STALLED_EXIT = 3
+# du (the fallback) can skip only by name: the TCC-guarded folder names no build or cache uses.
+DU_TCC_NAMES = ("News", "Mail", "Messages", "Safari", "Cookies", "Calendars", "Reminders", "HomeKit", "Suggestions",
+                "IdentityServices", "AddressBook", "CallHistoryDB", "CallHistoryTransactions", "com.apple.TCC",
+                "Knowledge", "Biome", "PersonalizationPortrait")
 APFS_META_PER_INODE = 2048  # measured on the fleet: APFS metadata grows ~2 KiB per inode
 LEDGER_SNAPSHOT_NAME = re.compile(r"^ledger-(\d{10,})\.json$")
 
@@ -13699,32 +13710,50 @@ def _ledger_low_priority() -> None:
             libc.setiopolicy_np(0, 0, 3)  # IOPOL_TYPE_DISK, IOPOL_SCOPE_PROCESS, IOPOL_THROTTLE
 
 
-def _bounded_lines(argv: list[str], timeout: float) -> tuple[str, str, bool]:
-    """stdout, stderr and whether the time bound stopped it. A stopped walk keeps what it printed."""
+def _bounded_lines(argv: list[str], timeout: float) -> tuple[str, str, bool, int | None]:
+    """stdout, stderr, whether the time bound stopped it and its exit code. A stopped walk keeps what it printed."""
     proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                             stdin=subprocess.DEVNULL, start_new_session=True)
     try:
         out, err = proc.communicate(timeout=timeout)
-        return out, err, False
+        return out, err, False, proc.returncode
     except subprocess.TimeoutExpired:
         with contextlib.suppress(OSError):
             os.killpg(proc.pid, signal.SIGKILL)  # this run's own child and its group, nothing else
         out, err = proc.communicate()
-        return out or "", err or "", True
+        return out or "", err or "", True, proc.returncode
+
+
+def _empty_walk(tool: str) -> dict[str, Any]:
+    return {"tool": tool, "clone_aware": tool == "glaeda-cdu" and DARWIN, "paths": {}, "total": 0, "files": None,
+            "errors": 0, "error_paths": [], "partial": True, "shared_saved": 0, "volume": None,
+            "skipped": [], "skipped_count": {"tcc": 0, "excluded": 0, "stalled": 0}, "unreadable": {"sip": 0, "tcc": 0}}
+
+
+def _note_skip(walk: dict[str, Any], kind: str, path: str) -> None:
+    counts = walk["skipped_count"]
+    counts[kind] = counts.get(kind, 0) + 1
+    if len(walk["skipped"]) < 200 and {"kind": kind, "path": path} not in walk["skipped"]:
+        walk["skipped"].append({"kind": kind, "path": path})
 
 
 def parse_cdu(text: str) -> dict[str, Any]:
     """glaeda-cdu's records (see scripts/glaeda-cdu.c) as the ledger's walk."""
-    walk: dict[str, Any] = {"tool": "glaeda-cdu", "clone_aware": DARWIN, "paths": {}, "total": 0, "files": None,
-                            "errors": 0, "error_paths": [], "partial": True, "shared_saved": 0, "volume": None}
+    walk = _empty_walk("glaeda-cdu")
     for line in text.splitlines():
         f = line.split("\t")
         with contextlib.suppress(ValueError, IndexError):
             if f[0] == "D" and len(f) >= 4:
                 walk["paths"]["\t".join(f[3:])] = int(f[1])
             elif f[0] == "E" and len(f) >= 3:
+                path = "\t".join(f[2:])
+                # root reading a folder SIP guards gets EPERM; a TCC folder too (by path: it is under a Library)
+                if int(f[1]) in (errno.EPERM, errno.EACCES):
+                    walk["unreadable"]["tcc" if "/Library/" in path else "sip"] += 1
                 if len(walk["error_paths"]) < 20:
-                    walk["error_paths"].append("\t".join(f[2:]))
+                    walk["error_paths"].append({"errno": int(f[1]), "path": path})
+            elif f[0] == "S" and len(f) >= 3:
+                _note_skip(walk, f[1], "\t".join(f[2:]))
             elif f[0] == "T" and len(f) >= 9:
                 walk.update(total=int(f[1]), files=int(f[2]), errors=int(f[4]), partial=f[5] != "0",
                             shared_files=int(f[6]), shared_saved=int(f[7]), unmapped_files=int(f[8]))
@@ -13736,33 +13765,74 @@ def parse_cdu(text: str) -> dict[str, Any]:
 
 def parse_du_depth(text: str, err: str, root: Path, stopped: bool) -> dict[str, Any]:
     """`du -xk -d N ROOT` as the ledger's walk: not clone aware, so an APFS clone counts in full."""
-    paths: dict[str, int] = {}
+    walk = _empty_walk("du")
+    paths: dict[str, int] = walk["paths"]
     for line in text.splitlines():
         kib, _, path = line.partition("\t")
         with contextlib.suppress(ValueError):
             paths[path] = int(kib) * 1024
     errors = [line for line in err.splitlines() if line.startswith("du:")]
+    for line in errors:
+        if "Operation not permitted" in line or "Permission denied" in line:
+            walk["unreadable"]["tcc" if "/Library/" in line else "sip"] += 1
     total = paths.get(os.fspath(root))
     if total is None:  # stopped before the root's line: the top-level children it finished are a lower bound
         depth = len(root.parts)
         total = sum(b for p, b in paths.items() if len(Path(p).parts) == depth + 1)
-    return {"tool": "du", "clone_aware": False, "paths": paths, "total": total, "files": None,
-            "errors": len(errors), "error_paths": [e[:300] for e in errors[:20]],
-            "partial": stopped or os.fspath(root) not in paths, "shared_saved": 0, "volume": None}
+    walk.update(total=total, errors=len(errors), error_paths=[{"errno": None, "path": e[:300]} for e in errors[:20]],
+                partial=stopped or os.fspath(root) not in paths)
+    if DARWIN:
+        walk["skip_names"] = list(DU_TCC_NAMES)
+    return walk
 
 
-def ledger_walk(root: Path, cdu: Path | None, depth: int, budget_s: float) -> dict[str, Any]:
-    """The clone-aware walk with glaeda-cdu, or du when the binary is missing; bounded by budget_s either way."""
+def ledger_learned_skips(state: Path, now: float) -> dict[str, float]:
+    """Paths an earlier walk stalled in, by when: later walks skip them for ROOT_LEDGER_LEARNED_DAYS."""
+    try:
+        doc = json.loads((state / "learned-skips.json").read_text())
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(doc, dict):
+        return {}
+    return {p: float(at) for p, at in doc.items() if isinstance(p, str) and isinstance(at, (int, float))
+            and now - float(at) < ROOT_LEDGER_LEARNED_DAYS * 86400}
+
+
+def ledger_walk(root: Path, cdu: Path | None, depth: int, budget_s: float, state: Path | None = None,
+                now: float | None = None) -> dict[str, Any]:
+    """The clone-aware walk with glaeda-cdu, or du when the binary is missing; bounded by budget_s either way.
+    glaeda-cdu bounds each directory read too; a walk it abandons in a stalled path runs again without it."""
+    now = time.time() if now is None else now
     if cdu is not None and os.access(cdu, os.X_OK):
-        out, _err, stopped = _bounded_lines(
-            _background_argv([os.fspath(cdu), "-v", "-d", str(depth), "-t", str(int(budget_s)), os.fspath(root)]),
-            budget_s + 120)
-        walk = parse_cdu(out)
-        walk["partial"] = walk["partial"] or stopped
+        learned = ledger_learned_skips(state, now) if state is not None else {}
+        deadline = time.monotonic() + budget_s
+        stalled: list[str] = []
+        for _attempt in range(ROOT_LEDGER_WALK_RETRIES + 1):
+            left = max(1.0, deadline - time.monotonic())
+            excludes = [arg for path in sorted(set(learned) | set(stalled))[:200] for arg in ("-x", path)]
+            out, _err, stopped, code = _bounded_lines(
+                _background_argv([os.fspath(cdu), "-v", "-d", str(depth), "-t", str(round(left)),
+                                  "-s", str(ROOT_LEDGER_DIR_TIMEOUT_S), *excludes, os.fspath(root)]),
+                left + 3 * ROOT_LEDGER_DIR_TIMEOUT_S)
+            walk = parse_cdu(out)
+            walk["partial"] = walk["partial"] or stopped
+            if code != CDU_STALLED_EXIT or stopped:
+                break
+            new = [s["path"] for s in walk["skipped"] if s["kind"] == "stalled" and s["path"] not in stalled]
+            if not new or time.monotonic() >= deadline:
+                break
+            stalled += new
+        for path in stalled:  # the abandoned attempts' stalls are this walk's too
+            _note_skip(walk, "stalled", path)
+        found = [s["path"] for s in walk["skipped"] if s["kind"] == "stalled"]
+        if state is not None and found:
+            learned.update({path: now for path in found})
+            with contextlib.suppress(OSError):
+                _ledger_write(state / "learned-skips.json", dict(sorted(learned.items(), key=lambda kv: -kv[1])[:200]))
         return walk
-    skips = [arg for name in sorted(MEASURE_SKIP_COMPONENTS)
+    skips = [arg for name in sorted(MEASURE_SKIP_COMPONENTS | (set(DU_TCC_NAMES) if DARWIN else set()))
              for arg in (("-I", name) if DARWIN else (f"--exclude={name}",))]
-    out, err, stopped = _bounded_lines(
+    out, err, stopped, _code = _bounded_lines(
         _background_argv(["du", "-xk", "-d", str(depth), *skips, os.fspath(root)]), budget_s)
     return parse_du_depth(out, err, root, stopped)
 
@@ -13828,7 +13898,7 @@ def ledger_open_deleted(device: int | None, timeout: float = ROOT_LEDGER_LSOF_TI
     lsof = "/usr/sbin/lsof" if os.path.exists("/usr/sbin/lsof") else shutil.which("lsof")
     if not lsof:
         return {"bytes": 0, "files": 0, "by_process": [], "error": "no lsof"}
-    out, err, stopped = _bounded_lines(_background_argv([lsof, "-nPw", "+L1", "-F", "pcDisk"]), timeout)
+    out, err, stopped, _code = _bounded_lines(_background_argv([lsof, "-nPw", "+L1", "-F", "pcDisk"]), timeout)
     doc = parse_lsof_deleted(out, device)
     if stopped:
         doc["error"] = f"lsof stopped at its {timeout:.0f}s bound; a lower bound"
@@ -13851,29 +13921,62 @@ def ledger_volume(root: Path, walk: dict[str, Any]) -> dict[str, Any]:
     return vol
 
 
-def ledger_account(vol: dict[str, Any], walk: dict[str, Any], deleted: dict[str, Any]) -> dict[str, Any]:
-    """Coverage of df used by walk + open-deleted, and the named causes of what is left, largest first."""
+def ledger_account(vol: dict[str, Any], walk: dict[str, Any], deleted: dict[str, Any],
+                   churn: int = 0) -> dict[str, Any]:
+    """Coverage of df used by walk + open-deleted, and every byte outside the walk by category, largest first:
+    open-deleted (per process), purgeable, APFS metadata, churn (df used moving during the walk), then what is left,
+    named by why the walk could not see it: SIP dirs, TCC-skipped, a walk stopped at its bound, or churn."""
     used = max(1, int(vol["used"]))
     explained = int(walk["total"]) + int(deleted["bytes"])
     gap = max(0, used - explained)
-    purgeable = int(vol["purgeable"] or 0)
-    metadata = int(vol["inodes_used"]) * APFS_META_PER_INODE if DARWIN else 0
-    residual = max(0, gap - purgeable - metadata)
+    left = max(0, used - int(walk["total"]))  # outside the walk; open-deleted files are the first of it
+    categories: list[dict[str, Any]] = []
+
+    def take(cid: str, nbytes: int, detail: str) -> None:
+        nonlocal left
+        n = max(0, min(int(nbytes), left))
+        left -= n
+        if n > 0:
+            categories.append({"id": cid, "bytes": n, "detail": detail})
+
+    rows = deleted.get("by_process") or []
+    for row in rows:
+        take(f"open-deleted:{row.get('command') or '?'}", int(row.get("bytes") or 0),
+             f"{row.get('files', 0)} open-deleted file(s), pids {row.get('pids', [])}")
+    take("open-deleted:other", int(deleted["bytes"]) - sum(int(r.get("bytes") or 0) for r in rows),
+         "open-deleted files of smaller holders")
+    take("purgeable", int(vol["purgeable"] or 0), "local snapshots and caches macOS may free")
+    take("apfs-metadata", int(vol["inodes_used"]) * APFS_META_PER_INODE if DARWIN else 0, "~2 KiB per inode")
+    take("churn", churn, "df used moved this much while the walk ran")
+    counts = walk.get("skipped_count") or {}
+    unreadable = walk.get("unreadable") or {}
+    tcc = int(counts.get("tcc", 0)) + int(counts.get("stalled", 0)) + int(unreadable.get("tcc", 0))
+    sip = int(unreadable.get("sip", 0))
     if walk.get("partial"):
-        rest = "walk-incomplete: the walk stopped at its time bound or could not finish"
-    elif walk.get("errors"):
-        rest = f"unreadable: {walk['errors']} entries the walk could not read (SIP or TCC-protected)"
+        take("walk-incomplete", left, "the walk stopped at its time bound or a stall")
+    elif tcc and sip:
+        take("sip+tcc", left, f"{sip} SIP dir(s) and {tcc} TCC-protected dir(s) the walk could not read or skipped")
+    elif tcc:
+        take("tcc-skipped", left, f"{tcc} TCC-protected dir(s) skipped or stalled: "
+             + ", ".join(s["path"] for s in (walk.get("skipped") or [])[:3]))
+    elif sip:
+        take("sip", left, f"{sip} SIP-protected dir(s) root cannot read")
     else:
-        rest = "unexplained: churn between df and the walk, or space no directory shows"
-    causes = [{"cause": "purgeable: local snapshots and caches macOS may free", "bytes": min(purgeable, gap)},
-              {"cause": "apfs-metadata: ~2 KiB per inode", "bytes": min(metadata, gap)},
-              {"cause": rest, "bytes": residual}]
-    causes = sorted((c for c in causes if c["bytes"] > 0), key=lambda c: -c["bytes"])
+        take("churn", left, "no directory shows it: files written and removed between df and the walk")
+    merged: dict[str, dict[str, Any]] = {}
+    for c in categories:  # the measured and the residual churn are one row
+        if c["id"] in merged:
+            merged[c["id"]]["bytes"] += c["bytes"]
+        else:
+            merged[c["id"]] = dict(c)
+    categories = sorted(merged.values(), key=lambda c: -c["bytes"])
+    unexplained = [c for c in categories if not c["id"].startswith("open-deleted")]
     coverage = explained / used
     return {"df_used": used, "walk_bytes": int(walk["total"]), "open_deleted_bytes": int(deleted["bytes"]),
             "explained": explained, "gap": gap, "coverage": round(coverage, 4),
-            "alarm": coverage < ROOT_LEDGER_COVERAGE, "causes": causes,
-            "largest_unexplained": causes[0] if causes else None}
+            "alarm": coverage < ROOT_LEDGER_COVERAGE, "categories": categories,
+            "largest": categories[0] if categories else None,
+            "largest_unexplained": unexplained[0] if unexplained else None}
 
 
 def ledger_snapshots(state: Path) -> list[tuple[int, Path]]:
@@ -13935,10 +14038,12 @@ def root_ledger_run(state: Path, root: Path, cdu: Path | None, depth: int, budge
     """One ledger pass: walk, open-deleted, volume, accounting, deltas, snapshot. Returns latest.json's document."""
     now = time.time() if now is None else now
     started = time.monotonic()
-    walk = ledger_walk(root, cdu, depth, budget_s)
+    st = os.statvfs(root)
+    used_before = (st.f_blocks - st.f_bfree) * (st.f_frsize or st.f_bsize)
+    walk = ledger_walk(root, cdu, depth, budget_s, state, now)
     vol = ledger_volume(root, walk)
     deleted = ledger_open_deleted(vol["device"])
-    account = ledger_account(vol, walk, deleted)
+    account = ledger_account(vol, walk, deleted, abs(vol["used"] - used_before))
     paths = {p: b for p, b in walk["paths"].items() if b >= ROOT_LEDGER_PATH_FLOOR}
     snaps = ledger_snapshots(state)
     prev = None
@@ -14005,7 +14110,8 @@ def root_ledger_main(args: list[str]) -> int:
         latest = root_ledger_run(state, root, cdu, a.depth, a.walk_budget_s, a.keep_days, now)
     print(json.dumps({"state": "done", "tool": latest["walk"]["tool"], "partial": latest["walk"]["partial"],
                       **{k: latest["account"][k] for k in ("df_used", "explained", "coverage", "alarm")},
-                      "largest_unexplained": latest["account"]["largest_unexplained"]}))
+                      "largest_unexplained": latest["account"]["largest_unexplained"],
+                      "skipped": latest["walk"].get("skipped_count")}))
     return 0
 
 
@@ -14025,7 +14131,9 @@ def root_ledger_health(path: Path | None = None, now: float | None = None) -> tu
     block = {"at": at, "age_s": int(now - at), "tool": (doc.get("walk") or {}).get("tool"),
              "partial": (doc.get("walk") or {}).get("partial"),
              **{k: acct.get(k) for k in ("df_used", "walk_bytes", "open_deleted_bytes", "explained", "gap",
-                                         "coverage", "alarm", "largest_unexplained")},
+                                         "coverage", "alarm", "largest", "largest_unexplained")},
+             "categories": (acct.get("categories") or [])[:6],
+             "skipped": (doc.get("walk") or {}).get("skipped_count"),
              "purgeable_bytes": (doc.get("volume") or {}).get("purgeable"),
              "open_deleted_top": ((doc.get("open_deleted") or {}).get("by_process") or [])[:3],
              "deltas_top": ((doc.get("deltas") or {}).get("paths") or [])[:5]}
@@ -14033,11 +14141,14 @@ def root_ledger_health(path: Path | None = None, now: float | None = None) -> tu
         block["last_skip"] = doc["last_skip"]
     findings = []
     if acct.get("alarm") is True:
+        cats = [c for c in acct.get("categories") or [] if isinstance(c, dict)]
+        top = ", ".join(f"{c.get('id', '?')} {int(c.get('bytes') or 0) / GIB:.1f} GiB" for c in cats[:3])
         largest = acct.get("largest_unexplained") or {}
         findings.append({"id": "disk_ledger_gap", "severity": "warn", "auto_fix": "impossible",
                          "evidence": f"walk + open-deleted cover {float(acct.get('coverage') or 0):.1%} of df used; "
                                      f"{int(acct.get('gap') or 0) / GIB:.1f} GiB unexplained, largest: "
-                                     f"{largest.get('cause', '?')} {int(largest.get('bytes') or 0) / GIB:.1f} GiB"})
+                                     f"{largest.get('id', '?')} {int(largest.get('bytes') or 0) / GIB:.1f} GiB; "
+                                     f"outside the walk: {top or 'nothing'}"})
     if now - at > ROOT_LEDGER_STALE_S:
         why = (doc.get("last_skip") or {}).get("why") if isinstance(doc.get("last_skip"), dict) else None
         findings.append({"id": "disk_ledger_stale", "severity": "warn", "auto_fix": "pending",

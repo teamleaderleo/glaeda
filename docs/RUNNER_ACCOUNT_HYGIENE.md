@@ -109,7 +109,16 @@ host lock; otherwise it waits for the next wake and records why in
 - walks `/System/Volumes/Data` on one volume with `glaeda-cdu`, bounded to an
   hour: a file that may share blocks (`EF_MAY_SHARE_BLOCKS`) has its physical
   extents (`F_LOG2PHYS_EXT`) marked in a block bitmap, so every block counts
-  once, to the first path that reaches it; hard links count once;
+  once, to the first path that reaches it; hard links count once. It does
+  not enter the folders macOS guards with TCC under any `Library` (News, Mail,
+  Messages, Safari, Cookies, `Containers/com.apple.*`, Apple's Group
+  Containers, `Application Support/AddressBook`, `CallHistoryDB`,
+  `com.apple.TCC` and the rest of `TCC_SKIP` in `glaeda-cdu.c`): as root a read
+  there can block in the kernel. A watchdog bounds every directory read to 60 s;
+  a read it cannot interrupt ends the walk with exit 3, and the ledger walks
+  again without that path (up to 3 times) and remembers it for 30 days
+  (`state/learned-skips.json`). Every skipped or stalled path is in the
+  snapshot's `walk.skipped`;
 - lists open-deleted files with `lsof +L1`, each device and inode once, by
   process;
 - reads purgeable space (important-usage capacity over free) and the inode
@@ -122,7 +131,9 @@ host lock; otherwise it waits for the next wake and records why in
 The runner account's own `glaeda-disk` pass folds `latest.json` into
 `~/.local/state/glaeda/disk/summary.json` as `root_ledger`. When the walk plus
 open-deleted bytes cover less than 97% of `df` used, it adds the finding
-`disk_ledger_gap` naming the largest unexplained cause (purgeable space, APFS
-metadata, unreadable directories, a walk stopped at its bound, or the
-remainder). A ledger with no snapshot for 3 days adds `disk_ledger_stale`.
+`disk_ledger_gap`. Every byte outside the walk gets one category:
+`open-deleted:<process>`, `purgeable`, `apfs-metadata`, `churn` (df used moving
+during the walk, and any remainder no directory shows), then what the walk could
+not see: `sip`, `tcc-skipped`, `sip+tcc` or `walk-incomplete`. The finding names
+the largest category that is not open-deleted and lists the top three. A ledger with no snapshot for 3 days adds `disk_ledger_stale`.
 `glaeda-mini-health` reports both like any other glaeda-disk finding.

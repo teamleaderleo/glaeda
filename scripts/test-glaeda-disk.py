@@ -12550,11 +12550,16 @@ class RootLedgerTest(unittest.TestCase):
 
     def test_root_ledger_parses_cdu_records(self) -> None:
         walk = gd.parse_cdu("V\t1000\t400\t300\t900\t50\nE\t1\t/v/locked\nD\t4096\t1\t/v/a\tb\n"
-                            "D\t8192\t3\t/v\nT\t8192\t3\t2\t1\t0\t2\t65536\t0\n")
+                            "E\t1\t/v/Users/u/Library/Application Support/Foo\n"
+                            "S\ttcc\t/v/Users/u/Library/News\nS\tstalled\t/v/Users/u/Library/Odd\n"
+                            "D\t8192\t3\t/v\nT\t8192\t3\t2\t2\t0\t2\t65536\t0\t2\n")
         self.assertEqual(walk["paths"], {"/v/a\tb": 4096, "/v": 8192})
         self.assertEqual((walk["total"], walk["files"], walk["errors"], walk["partial"], walk["shared_saved"]),
-                         (8192, 3, 1, False, 65536))
-        self.assertEqual(walk["error_paths"], ["/v/locked"])
+                         (8192, 3, 2, False, 65536))
+        self.assertEqual(walk["error_paths"][0], {"errno": 1, "path": "/v/locked"})
+        self.assertEqual(walk["unreadable"], {"sip": 1, "tcc": 1})
+        self.assertEqual(walk["skipped_count"], {"tcc": 1, "excluded": 0, "stalled": 1})
+        self.assertEqual(walk["skipped"][0], {"kind": "tcc", "path": "/v/Users/u/Library/News"})
         self.assertEqual(walk["volume"]["important_avail"], 900)
         self.assertTrue(gd.parse_cdu("D\t1\t1\t/v\n")["partial"], "no T record: the walk did not finish")
 
@@ -12574,18 +12579,36 @@ class RootLedgerTest(unittest.TestCase):
         gib = gd.GIB
         walk = {"total": 80 * gib, "partial": False, "errors": 0}
         vol = {"used": 100 * gib, "purgeable": 12 * gib, "inodes_used": 1_000_000}
+        deleted = {"bytes": 3 * gib, "by_process": [{"command": "chronod", "bytes": 2 * gib, "files": 1, "pids": [7]}]}
         with mock.patch.object(gd, "DARWIN", True):
-            acct = gd.ledger_account(vol, walk, {"bytes": 3 * gib})
+            acct = gd.ledger_account(vol, walk, deleted, churn=gib)
         self.assertTrue(acct["alarm"])
         self.assertEqual(acct["coverage"], 0.83)
-        self.assertTrue(acct["largest_unexplained"]["cause"].startswith("purgeable"))
-        self.assertEqual(sum(c["bytes"] for c in acct["causes"]), acct["gap"], "every byte of the gap gets a name")
+        ids = [c["id"] for c in acct["categories"]]
+        self.assertEqual(ids[0], "purgeable")
+        self.assertIn("open-deleted:chronod", ids)
+        self.assertIn("open-deleted:other", ids)
+        self.assertEqual(acct["largest_unexplained"]["id"], "purgeable")
+        self.assertEqual(sum(c["bytes"] for c in acct["categories"]), 20 * gib,
+                         "every byte outside the walk gets a category")
+        self.assertEqual(sum(c["bytes"] for c in acct["categories"] if c["id"] == "churn"), 20 * gib - 3 * gib
+                         - 12 * gib - 1_000_000 * 2048, "measured and residual churn are one row")
         with mock.patch.object(gd, "DARWIN", True):
-            acct = gd.ledger_account(vol, {**walk, "total": 96 * gib, "errors": 4}, {"bytes": 2 * gib})
+            acct = gd.ledger_account(vol, {**walk, "total": 96 * gib}, {"bytes": 2 * gib})
         self.assertFalse(acct["alarm"])
+        none = {"bytes": 0}
         with mock.patch.object(gd, "DARWIN", False):
-            acct = gd.ledger_account({**vol, "purgeable": None}, {**walk, "errors": 4}, {"bytes": 0})
-        self.assertTrue(acct["largest_unexplained"]["cause"].startswith("unreadable: 4"))
+            sip = gd.ledger_account({**vol, "purgeable": None}, {**walk, "unreadable": {"sip": 4, "tcc": 0}}, none)
+            tcc = gd.ledger_account({**vol, "purgeable": None},
+                                    {**walk, "skipped_count": {"tcc": 2, "stalled": 1},
+                                     "skipped": [{"kind": "stalled", "path": "/Users/a/Library/News"}]}, none)
+            both = gd.ledger_account({**vol, "purgeable": None}, {**walk, "unreadable": {"sip": 1, "tcc": 1}}, none)
+            stopped = gd.ledger_account({**vol, "purgeable": None}, {**walk, "partial": True}, none)
+        self.assertEqual(sip["largest"]["id"], "sip")
+        self.assertEqual(tcc["largest"]["id"], "tcc-skipped")
+        self.assertIn("Library/News", tcc["largest"]["detail"])
+        self.assertEqual(both["largest"]["id"], "sip+tcc")
+        self.assertEqual(stopped["largest"]["id"], "walk-incomplete")
 
     def run_ledger(self, now: float, cdu: Path | None = None) -> dict:
         with mock.patch.object(gd, "ledger_open_deleted",
@@ -12622,12 +12645,32 @@ class RootLedgerTest(unittest.TestCase):
         cdu = self.base / "glaeda-cdu"
         argv_log = self.base / "argv"
         cdu.write_text(f"#!/bin/sh\necho \"$@\" > {argv_log}\n"
-                       "printf 'V\\t100\\t10\\t10\\t30\\t5\\nD\\t70\\t2\\t%s\\nT\\t70\\t2\\t1\\t0\\t1\\t1\\t50\\t0\\n' \"$7\"\n")
+                       "printf 'V\\t100\\t10\\t10\\t30\\t5\\nD\\t70\\t2\\t%s\\nT\\t70\\t2\\t1\\t0\\t1\\t1\\t50\\t0\\n' \"$9\"\n")
         cdu.chmod(0o755)
         latest = self.run_ledger(time.time(), cdu=cdu)
-        self.assertEqual(argv_log.read_text().split()[:6], ["-v", "-d", "2", "-t", "60", os.fspath(self.vol)])
+        self.assertEqual(argv_log.read_text().split(), ["-v", "-d", "2", "-t", "60", "-s", "60", os.fspath(self.vol)])
         self.assertEqual((latest["walk"]["tool"], latest["walk"]["partial"]), ("glaeda-cdu", True))
-        self.assertTrue(latest["account"]["largest_unexplained"]["cause"].startswith("walk-incomplete"))
+        self.assertEqual(latest["account"]["largest_unexplained"]["id"], "walk-incomplete")
+
+    def test_root_ledger_walks_again_without_a_path_a_tcc_stall_hung(self) -> None:
+        cdu = self.base / "glaeda-cdu"
+        calls = self.base / "calls"
+        stuck = os.fspath(self.vol / "Users/admin/Library/Odd")
+        # the first walk stalls in a folder past its per-directory bound and exits 3; the next is given -x for it
+        cdu.write_text(f"#!/bin/sh\necho \"$@\" >> {calls}\n"
+                       f"case \"$*\" in *'-x {stuck}'*) "
+                       "printf 'D\\t70\\t2\\t/v\\nT\\t70\\t2\\t1\\t0\\t0\\t0\\t0\\t0\\t1\\n'; exit 0;; esac\n"
+                       f"printf 'S\\tstalled\\t{stuck}\\nT\\t10\\t1\\t1\\t0\\t1\\t0\\t0\\t0\\t1\\n'; exit 3\n")
+        cdu.chmod(0o755)
+        now = time.time()
+        latest = self.run_ledger(now, cdu=cdu)
+        self.assertEqual(len(calls.read_text().splitlines()), 2)
+        self.assertEqual((latest["walk"]["total"], latest["walk"]["partial"]), (70, False))
+        self.assertIn({"kind": "stalled", "path": stuck}, latest["walk"]["skipped"], "coverage names the stall")
+        self.assertIn(stuck, json.loads((self.state / "learned-skips.json").read_text()))
+        calls.unlink()
+        self.run_ledger(now + 86400, cdu=cdu)
+        self.assertEqual(len(calls.read_text().splitlines()), 1, "a later walk skips the learned path at once")
 
     def test_root_ledger_waits_while_a_job_holds_the_host_and_runs_daily(self) -> None:
         argv = ["--root-ledger", "--state-dir", os.fspath(self.state), "--root", os.fspath(self.vol),
@@ -12662,7 +12705,10 @@ class RootLedgerTest(unittest.TestCase):
                "open_deleted": {"by_process": [{"command": "chronod", "bytes": 5 * gib, "files": 1, "pids": [9]}]},
                "account": {"df_used": 100 * gib, "walk_bytes": 80 * gib, "open_deleted_bytes": 5 * gib,
                            "explained": 85 * gib, "gap": 15 * gib, "coverage": 0.85, "alarm": True,
-                           "largest_unexplained": {"cause": "purgeable: local snapshots", "bytes": 9 * gib}}}
+                           "categories": [{"id": "purgeable", "bytes": 9 * gib},
+                                          {"id": "open-deleted:chronod", "bytes": 5 * gib},
+                                          {"id": "tcc-skipped", "bytes": 6 * gib}],
+                           "largest_unexplained": {"id": "purgeable", "bytes": 9 * gib}}}
         gd._ledger_write(latest, doc)
         summary = self.base / "summary.json"
         with mock.patch.object(gd, "ROOT_LEDGER_LATEST", latest), mock.patch.object(gd, "HEALTH_SUMMARY", summary):
@@ -12673,7 +12719,8 @@ class RootLedgerTest(unittest.TestCase):
         self.assertEqual(payload["root_ledger"]["open_deleted_top"][0]["command"], "chronod")
         found = {f["id"]: f for f in payload["findings"]}
         self.assertIn("85.0% of df used", found["disk_ledger_gap"]["evidence"])
-        self.assertIn("purgeable", found["disk_ledger_gap"]["evidence"])
+        self.assertIn("largest: purgeable 9.0 GiB", found["disk_ledger_gap"]["evidence"])
+        self.assertIn("open-deleted:chronod 5.0 GiB", found["disk_ledger_gap"]["evidence"])
         _block, findings = gd.root_ledger_health(latest, now + 4 * 86400)
         self.assertIn("disk_ledger_stale", {f["id"] for f in findings})
         self.assertEqual(gd.root_ledger_health(self.base / "absent.json"), (None, []), "no ledger, no row")
