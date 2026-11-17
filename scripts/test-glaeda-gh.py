@@ -15571,6 +15571,24 @@ class CmuxWaitsRestCostTest(Base):
         paged = [c[1] for c in self.gh.calls[after:] if "/check-runs" in c[1]]
         self.assertTrue(paged and all("/2cmux" in u for u in paged), paged)
 
+    def test_a_failing_head_still_running_records_the_gate_after_a_graphql_read(self) -> None:
+        """Review F1: a head GraphQL last read as FAILURE with checks still running is not settled: the first REST read
+        records its suites, so the next is gated."""
+        self.contexts(4)[0].update(status="COMPLETED", conclusion="FAILURE")
+        self.gh.prs[("o", "cmux", 4)]["commits"]["nodes"][0]["commit"]["statusCheckRollup"]["state"] = "FAILURE"
+        gg.register("pr:o/cmux#4", waited=True, began=NOW)
+        self.daemon.tick(NOW)  # GraphQL
+        self.assertEqual(gg.read_cache("pr:o/cmux#4")["data"]["checkState"], "FAILURE")
+        self.run_over_rest(minutes=1)
+        t = NOW + 2 * gg.CYCLE
+        for n in range(1, self.N + 1):
+            path = gg.watch_dir() / gg.file_name(f"pr:o/cmux#{n}")
+            gg.write_json(path, {**gg.read_json(path), "waitedAt": t})
+            os.utime(path, (t, t))
+        after = len(self.gh.calls)
+        self.daemon.tick(t)
+        self.assertFalse([c for c in self.gh.calls[after:] if "/4cmux" in c[1] and "/check-runs" in c[1]])
+
     def test_a_jobs_watch_is_never_gated(self) -> None:
         self.run_over_rest(minutes=1)
         gg.register("pr:o/cmux#3", jobs=True, waited=True, began=NOW)
