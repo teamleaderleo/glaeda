@@ -2721,7 +2721,22 @@ GATE_WAITER_GAP_S = 10 * 60.0
 # hold on wall time, past the longest PR job that night, so a drain behind a job that never ends gives the runners
 # back too; then the same GATE_WAITER_WAIVE_S, and a new hold. Busy is slower, never stuck.
 GATE_DRAIN_WAITER_MAX_HOLD_S = float(os.environ.get("GLAEDA_RUNNER_GATE_DRAIN_WAITER_MAX_HOLD_S") or 150 * 60)
-DRAIN_WAITER_MARKER = re.compile(r"([1-9][0-9]*)-refresh-(?:lend|measure)_drain-[0-9]+")
+#
+# An exclusive (capture) lease's waiter has its own kind, "<pid>-refresh-capture_lease_drain-<ns>" (cmuxterm-hq worker
+# lend_drain.go, since 2026-11-17): the same drain, logged as CAPTURE_LEASE_REFUSAL instead of WAITER_REFUSAL. On
+# 2026-11-17 cmux18's gate said "a fleet build is waiting for the host (pid 15419)" for 5.5 h of capture-host acquire
+# --exclusive leases while no fleet build waited. A worker from before that still publishes lend_drain for a lease,
+# and this gate holds for either, so the worker and glaeda deploy in either order.
+#
+# Such a drain's idle readings count only while the host is really free: a host.lock a capture lease holds (capture-
+# host's holder writes capture-lease-activity-<pid> beside host.lock at every renewal while it holds the lock) is
+# taken, as a runner job is (host_taken). On 2026-11-17 16:37-16:48Z cmux18's captures held host.lock 55-99 s each
+# under their own pids, and the gate logged "free of runner jobs for 11 min without taking it" at 16:48:06Z.
+DRAIN_WAITER_MARKER = re.compile(r"([1-9][0-9]*)-refresh-(?:lend|measure|capture_lease)_drain-[0-9]+")
+CAPTURE_LEASE_MARKER = re.compile(r"([1-9][0-9]*)-refresh-capture_lease_drain-[0-9]+")
+CAPTURE_LEASE_ACTIVITY = re.compile(r"capture-lease-activity-([1-9][0-9]*)")
+# capture-host renews a lease every CAPTURE_HOST_HEARTBEAT_SECONDS (30 s), rewriting its activity file each time.
+CAPTURE_LEASE_ACTIVITY_FRESH_S = 120.0
 # The same hold for the worker's in-step measure drain (cmuxterm-hq cmd/worker/ci_step.go "measure-drain", which also
 # waits for an idle mini) and for a drained reboot's root shell (leo-workspace tools/sandboxd_heal.py writes
 # `$$-$(date +%s)-root-drain` once and never refreshes it; it counts while its pid lives). cmux8s-mac-mini,
@@ -2753,6 +2768,8 @@ NIGHTLY_PASS_NOTED: set[int] = set()  # the waiters this process has logged a ni
 # wait, and the same runner took and refused a nightly verify at 17:49:29; its gate stopped only at 17:49:50).
 WAITER_SEEN_FILE = "fleet-waiter-seen"
 WAITER_REFUSAL = "a fleet build is waiting for the host"
+CAPTURE_LEASE_REFUSAL = "a capture lease is waiting for the host"  # a capture_lease_drain waiter (DRAIN_WAITER_MARKER)
+WAITER_REFUSALS = (WAITER_REFUSAL, CAPTURE_LEASE_REFUSAL)
 WAITER_SPANS_LOCK_S = 2.0  # waiting for another reader's update; past it every waiter is honoured
 GATE_MAX_FAILURES = 5  # consecutive failed polls before the gate hands the runner back
 GATE_FALLBACK = 70  # listen.sh runs run.sh itself: the gate broke before any runner started
@@ -6644,7 +6661,7 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
         nightly_pass(state_dir, passed, -1)
         if new_job:  # a handed job waits for its capacity like any other (HANDED_JOBS_NEVER_FAIL_FOR_A_WAITER)
             return False, note
-        return False, f"{WAITER_REFUSAL} (pid {passed})"
+        return False, waiter_why(host_lock, passed)
 
     # pinned: home-repo workflows the hook does not know use /private/tmp/cmux-ci itself
     try:
@@ -6720,13 +6737,13 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
                 # often one waiter is passed.
                 if waiting[0] not in NIGHTLY_PASS_NOTED:  # once per waiter: a handed job's capacity wait retries
                     NIGHTLY_PASS_NOTED.add(waiting[0])
-                    print(f"{PREFIX}: a fleet build is waiting for the host (pid {waiting[0]}); a nightly job goes "
+                    print(f"{PREFIX}: {waiter_why(host_lock, waiting[0])}; a nightly job goes "
                           "first, the build gets the host when it ends", flush=True)
                 passed = waiting[0]
             elif waiting and not new_job:  # flock has no writer preference: stop admitting so the build worker gets in
                 # A ci-step: not a retryable capacity refusal (a draining fleet worker waits for our parent
                 # Runner.Worker to exit before claiming); the build worker leases the step elsewhere.
-                return False, f"{WAITER_REFUSAL} (pid {waiting[0]})"
+                return False, waiter_why(host_lock, waiting[0])
             elif waiting:
                 # HANDED_JOBS_NEVER_FAIL_FOR_A_WAITER: a job GitHub already handed this runner is not refused for the
                 # waiter (a refusal fails it red); it takes its units like any job, and the build gets the host when
@@ -8729,7 +8746,8 @@ def host_waiters(host_lock: str, state_dir: Path) -> set[int]:
     if not os.path.exists(host_lock):
         return set()
     return set(bounded_waiters(state_dir, lock_waiters(host_lock, holder_pids(state_dir) | yielding_family(host_lock)),
-                               log=gate_log, drains=drain_lock_waiters(host_lock), host_busy=runner_job_running))
+                               log=gate_log, drains=drain_lock_waiters(host_lock),
+                               host_busy=lambda: host_taken(host_lock)))
 
 
 def nightly_passes(state_dir: Path) -> dict[str, int] | None:
@@ -8817,6 +8835,67 @@ def drain_lock_waiters(path: str) -> set[int]:
     except OSError:
         pass
     return found
+
+
+def capture_lease_waiters(path: str) -> set[int]:
+    """The pids whose capture_lease_drain marker (CAPTURE_LEASE_MARKER) on path's host.lock.waiters was refreshed
+    within 30 s, read only."""
+    found: set[int] = set()
+    directory = Path(path + ".waiters")
+    try:
+        if directory.is_symlink():
+            return found
+        now = time.time()
+        with os.scandir(directory) as entries:
+            for i, entry in enumerate(entries):
+                if i >= 1024:
+                    break
+                match = CAPTURE_LEASE_MARKER.fullmatch(entry.name)
+                if not match:
+                    continue
+                with contextlib.suppress(OSError):
+                    info = entry.stat(follow_symlinks=False)
+                    if stat.S_ISREG(info.st_mode) and 0 <= now - info.st_mtime < 30:
+                        found.add(int(match.group(1)))
+    except OSError:
+        pass
+    return found
+
+
+def waiter_why(host_lock: str, pid: int) -> str:
+    """The reason a gate or job-started gives for waiter pid: CAPTURE_LEASE_REFUSAL for a capture lease's drain,
+    else WAITER_REFUSAL."""
+    kind = CAPTURE_LEASE_REFUSAL if pid in capture_lease_waiters(host_lock) else WAITER_REFUSAL
+    return f"{kind} (pid {pid})"
+
+
+def capture_lease_holding(host_lock: str) -> bool:
+    """Whether a capture lease holds host_lock now: a capture-lease-activity-<pid> file beside it, written within
+    CAPTURE_LEASE_ACTIVITY_FRESH_S, whose pid lives (capture-host writes it only once its holder has the lock, and
+    removes it when the lease ends)."""
+    now = time.time()
+    try:
+        with os.scandir(os.path.dirname(host_lock) or ".") as entries:
+            for entry in entries:
+                match = CAPTURE_LEASE_ACTIVITY.fullmatch(entry.name)
+                if not match:
+                    continue
+                try:
+                    info = entry.stat(follow_symlinks=False)
+                except OSError:
+                    continue
+                if (stat.S_ISREG(info.st_mode) and 0 <= now - info.st_mtime < CAPTURE_LEASE_ACTIVITY_FRESH_S
+                        and pid_alive(int(match.group(1)))):
+                    return True
+    except OSError:
+        pass
+    return False
+
+
+def host_taken(host_lock: str) -> bool:
+    """A drain's busy reading (bounded_waiters host_busy): a runner job runs here, or a capture lease holds
+    host.lock. Either way the drain is not the one leaving a free host untaken."""
+    return runner_job_running() or capture_lease_holding(host_lock)
 
 
 def runner_job_running() -> bool:
@@ -9498,7 +9577,7 @@ class Gate:
         if why is None and self.waiters and self.waiters_due():
             self.waiting, self.waiting_at = self.blocking_waiters(), time.monotonic()
         if why is None and self.waiting:
-            why = f"a fleet build is waiting for the host (pid {min(self.waiting)})"
+            why = waiter_why(self.host_lock, min(self.waiting))
         if why:
             self.load_since = None  # the fleet's claim, not load, is holding this gate
             self.yield_to_fleet()
@@ -10020,7 +10099,7 @@ class Gate:
             again = self.waiting & self.blocking_waiters()
             self.waiting, self.waiting_at = again, time.monotonic()
             if again:
-                why = f"a fleet build is waiting for the host (pid {min(again)})"
+                why = waiter_why(self.host_lock, min(again))
         if why:
             self.load_since = None
             self.yield_to_fleet()
@@ -10037,7 +10116,7 @@ class Gate:
             return None
         self.load_since = None
         self.yield_to_fleet()
-        return f"a fleet build is waiting for the host (pid {min(again)})"
+        return waiter_why(self.host_lock, min(again))
 
     def draining(self) -> str | None:
         """RUNNER_DRAIN: an apply waits to re-register or retire this runner. One small file, read every poll; a
@@ -11128,7 +11207,7 @@ def waiter_seen_stamp(state_dir: Path) -> int | None:
 def note_waiter_refusal(state_dir: Path, why: str) -> None:
     """After job-started refused for a fleet waiter: touch WAITER_SEEN_FILE so every gate here reads the waiters at
     its next poll (Gate.waiters_due). Never raises; a note it cannot write leaves the gates on their cadence."""
-    if not why.startswith(WAITER_REFUSAL):
+    if not why.startswith(WAITER_REFUSALS):
         return
     with contextlib.suppress(OSError):
         state_dir.mkdir(parents=True, exist_ok=True)
