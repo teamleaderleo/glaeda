@@ -1367,6 +1367,12 @@ class HookTest(unittest.TestCase):
         is still refused; and a NIGHTLY_SIGNING reservation, which admits the slot's nightly jobs, refuses it."""
         self.assertIsNone(hook.nightly_slot_refusal(hook.TIER_STACK))
         self.assertIn(hook.STACK_BLOCKER_LABEL, hook.nightly_slot_refusal(""))
+        # STACK_SLOT_WAIT: on the slot a stack job waits for units a bounded time, then the rescue places it again
+        wait = hook.STACK_SLOT_CAPACITY_WAIT_S
+        self.assertEqual(hook.stack_slot_capacity_wait(None, hook.TIER_STACK, True), wait)
+        self.assertEqual(hook.stack_slot_capacity_wait(60.0, hook.TIER_STACK, True), 60.0)
+        self.assertIsNone(hook.stack_slot_capacity_wait(None, hook.TIER_STACK, False), "a side runner: no new bound")
+        self.assertIsNone(hook.stack_slot_capacity_wait(None, hook.TIER_NIGHTLY, True), "a nightly job: unchanged")
         fleet = self.fleet()
 
         def pull(labels: list, head: str = "manaflow-ai/cmux", name: str = "stack-pr") -> Path:

@@ -1708,6 +1708,19 @@ def bounded_wait(cap: float | None, bound: float | None) -> float | None:
     return bound if cap is None else min(cap, bound)
 
 
+# STACK_SLOT_WAIT: the nightly slot's gate listens however full the mini is, which suits a nightly job (no other
+# admission takes a unit while it waits) but not a PR job: a stack-blocker job it took would wait there for units with
+# no limit, and every minute it holds the slot a nightly build or sign pinned to that mini's slot waits behind a PR
+# job, the very wait the slot exists to remove (review of glaeda#2098). So on the slot it waits this long at most and
+# is then refused; cmux's owned-pool rescue re-runs it, placed as an ordinary PR job.
+STACK_SLOT_CAPACITY_WAIT_S = 300.0
+
+
+def stack_slot_capacity_wait(cap: float | None, tier: str, nightly_runner: bool) -> float | None:
+    """`cap`, bounded to STACK_SLOT_CAPACITY_WAIT_S for a stack-blocker job on the nightly slot (STACK_SLOT_WAIT)."""
+    return bounded_wait(cap, STACK_SLOT_CAPACITY_WAIT_S) if nightly_runner and tier == TIER_STACK else cap
+
+
 def slot_capacity_wait(cap: float | None, dev_compile_runner: bool) -> float | None:
     """`cap`, bounded on the freshness slot (an explicit longer --gui-wait is clamped too): every job it admits (a push's release-compile too, which
     dev_compile_capacity_wait does not name) waits at most DEV_COMPILE_CAPACITY_WAIT_S. GitHub never moves a job
@@ -12545,6 +12558,7 @@ def main(argv: list[str] | None = None) -> int:
                                                   os.environ.get("GITHUB_REF"), os.environ.get("GITHUB_JOB"),
                                                   job_workflow(), os.environ.get("GITHUB_RUN_ATTEMPT"))
             cap = bounded_wait(cap, nightly_bound)
+            cap = stack_slot_capacity_wait(cap, tier, bool(args.nightly_runner))
             if admit_class == GATEWAY_CLASS:
                 cap = bounded_wait(cap, GATEWAY_CAPACITY_WAIT_S)
             claim_class = admit_class or job_class(os.environ.get("GITHUB_JOB", ""), repo, args.home_repo,
