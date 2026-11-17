@@ -562,6 +562,14 @@ What `--apply` does:
      pressure run takes its least recently used generated output, and whole states no enrolled runner
      owns, whatever their age, back down to the cap, keeping every in-use veto ([CMUX_NEXT_CI_RETENTION.md](CMUX_NEXT_CI_RETENTION.md); cmux11s,
      2026-10-21: jobs refused at 21 GiB free with 78 GiB there and nothing reclaimable).
+     Over all of these sits one host **cache budget** (`cache_budget`, default `35%` of the volume): every
+     build-cache family together (seeds, kept and parked builds, spm-scratch, admission roots, runner build
+     output, Xcode DerivedData, cmux-next-ci, hq's fleet cache, the fleet Xcode CAS), summed from the last
+     measured sizes. Over it the volume is under pressure whatever its free space; warm build state past 1 h
+     idle goes by value (space per rebuild minute, idle longest first) after everything already due, keeping
+     every in-use veto, until the caches are back under 90% of the budget. The run line's `cache_budget`
+     and the health summary's `cache_budget` rows show used against budget per volume and family (cmux13s,
+     2026-11-17: 58 of 460 GB free with every family inside its own window).
    - **Stopping.** After two idle polls in a row, and one fresh look right before the
      signal, the gate sends `SIGINT` to the runner's `Runner.Listener`. Under the disk
      floor the first idle poll is enough, ahead of any other hold, and while a job runs

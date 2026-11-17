@@ -11948,7 +11948,7 @@ class ActivityClockTest(unittest.TestCase):
 
 MAIN_GLOBALS = ("ROLE", "RUNNER_CACHE_PROFILE", "CMUX_NEXT_CI_DRAIN", "ACTIVITY_MODE", "EMERGENCY_DEVS", "FLOOR_HOLD",
                 "CMUX_NEXT_HOST_FLOOR", "CMUX_NEXT_CI_OVER", "_JOB_STARTS", "_JOB_STARTS_READ", "_RUNNING_JOB_HOURS",
-                "_MEASURE_BUDGET_REACHED", "_EVICT_HANDLE", "_HOOK_PASS_FD", "OUT_OF_BAND_RUN")
+                "_MEASURE_BUDGET_REACHED", "_EVICT_HANDLE", "_HOOK_PASS_FD", "OUT_OF_BAND_RUN", "CACHE_BUDGET")
 
 
 def keep_main_globals(stack: contextlib.ExitStack) -> None:
@@ -12443,6 +12443,90 @@ class DeadItemsTest(unittest.TestCase):
         self.assertTrue(old_dd.exists(), "not a dead family")
         with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
             gd.main(["--dead", "--pressure", "--no-snapshot"])
+
+
+class CacheBudgetTest(unittest.TestCase):
+    """The host cache budget: every build cache on a volume together under POLICY cache_budget."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(os.path.realpath(self.tmp.name))
+        self.dev = self.root.stat().st_dev
+        self.fs = gd.Fs(self.dev, "/", 50 * gd.GIB, 100 * gd.GIB, 35 * gd.GIB, 45 * gd.GIB)
+        stack = contextlib.ExitStack()
+        self.addCleanup(stack.close)
+        keep_main_globals(stack)
+        stack.enter_context(mock.patch.object(gd, "process_evidence", return_value=([], "")))
+        gd._DISCOVERED.clear()
+        self.addCleanup(self.tmp.cleanup)
+
+    def test_family_ids_named_before_their_constants_match_them(self) -> None:
+        for fid in (gd.RUNNER_BUILD_FAMILY, gd.HQ_CACHE_FAMILY, *(f"journey-{s}" for s in gd.JOURNEY_SUBDIRS)):
+            self.assertIn(fid, gd.BUDGET_FAMILY_IDS)
+        self.assertLessEqual(gd.BUDGET_WARM_FAMILY_IDS, gd.BUDGET_FAMILY_IDS)
+
+    def test_state_counts_outermost_sizes_of_budget_families_and_the_fleet_cas(self) -> None:
+        seeds = gd.Family("cmux-seeds", self.root / "ci/seeds", True, "")
+        kept = gd.Family("cmux-kept-build", self.root / "ci", True, "")
+        other = gd.Family("projects", self.root / "projects", False, "")
+        for f in (seeds, kept, other):
+            f.root.mkdir(parents=True, exist_ok=True)
+        r = os.fspath(self.root)
+        sizes = {f"{r}/ci/seeds/a": 10 * gd.GIB, f"{r}/ci/seeds/a/inner": 9 * gd.GIB,  # inside a: counted once
+                 f"{r}/ci/derived-data": 12 * gd.GIB, f"{r}/projects/x": 50 * gd.GIB}
+        accounting = {str(self.dev): {"coverage_at": 1000.0, "coverage": [
+            {"scope": "shared-fleet/xcode", "children": [{"category": "xcode", "bytes": 18 * gd.GIB}]},
+            {"scope": "shared-fleet/tools", "children": [{"category": "tools", "bytes": 5 * gd.GIB}]}]}}
+        state = gd.cache_budget_state([seeds, kept, other], {self.dev: self.fs}, sizes, accounting, now=1000.0)
+        row = state[self.dev]
+        self.assertEqual(row["used"], 40 * gd.GIB)
+        self.assertEqual(row["families"], {"cmux-seeds": 10 * gd.GIB, "cmux-kept-build": 12 * gd.GIB,
+                                           "fleet-cas": 18 * gd.GIB})
+        self.assertEqual(row["budget"], 35 * gd.GIB)
+        self.assertEqual(row["over"], 40 * gd.GIB - int(35 * gd.GIB * gd.BUDGET_STOP_SHARE))
+        # under the budget: nothing to give back; stale accounting is not counted
+        state = gd.cache_budget_state([seeds, kept], {self.dev: self.fs}, sizes, accounting,
+                                      now=1000.0 + gd.ACCOUNTING_MAX_AGE_S + 1)
+        self.assertEqual((state[self.dev]["used"], state[self.dev]["over"]), (22 * gd.GIB, 0))
+
+    def test_a_zero_budget_turns_it_off(self) -> None:
+        fam = gd.Family("cmux-seeds", self.root, True, "")
+        gd.POLICY["cache_budget"] = "0"
+        self.assertEqual(gd.cache_budget_state([fam], {self.dev: self.fs}, {f"{self.root}/a": 99 * gd.GIB}, {}), {})
+
+    def test_over_the_budget_warm_windows_drop_to_an_hour_and_other_families_keep_theirs(self) -> None:
+        dd = gd.Family("xcode-derived-data", self.root, True, "", min_idle_hours=12)
+        lib = gd.Family("library-caches", self.root, True, "", min_idle_hours=12)
+        gd.ACTIVITY_MODE = "pressure"
+        self.assertEqual(gd.item_window(dd, self.root / "a", 6), 12)
+        gd.CACHE_BUDGET = {self.dev: {"used": 1, "budget": 1, "over": gd.GIB, "families": {}}}
+        self.assertEqual(gd.item_window(dd, self.root / "a", 6), gd.BUDGET_IDLE_HOURS)
+        self.assertEqual(gd.item_window(lib, self.root / "a", 6), 12)
+        gd.ACTIVITY_MODE = None  # a report or a sweep never spends the budget
+        self.assertEqual(gd.item_window(dd, self.root / "a", 6), 12)
+
+    def test_apply_takes_warm_state_by_value_and_stops_once_under_the_budget(self) -> None:
+        dd = gd.Family("xcode-derived-data", self.root, True, "", min_idle_hours=12, build_output=True)
+        for name, age in (("young", 2), ("older", 3), ("oldest", 4), ("fresh", 0.2)):
+            make(self.root / name, mib=2, age_hours=age)
+        gd.ACTIVITY_MODE = "pressure"
+        gd.CACHE_BUDGET = {self.dev: {"used": 1, "budget": 1, "over": 3 * 1024 * 1024, "families": {}}}
+        receipt = self.root.parent / f"{self.root.name}-receipt.jsonl"
+        self.addCleanup(receipt.unlink, missing_ok=True)
+        with contextlib.redirect_stdout(io.StringIO()):
+            items = gd.survey([dd], 6, 0)
+            verdicts = {Path(i.path).name: i.verdict for i in items}
+            self.assertEqual(verdicts, {"young": "reclaimable", "older": "reclaimable", "oldest": "reclaimable",
+                                        "fresh": "recent"})
+            gd.apply(items, {dd.id: dd}, receipt, None, 6)
+        left = sorted(p.name for p in self.root.iterdir())
+        self.assertEqual(left, ["fresh", "young"])  # the two idle longest went; then the volume was under
+
+    def test_rows_name_the_mount_and_families_in_gib(self) -> None:
+        gd.CACHE_BUDGET = {self.dev: {"used": 40 * gd.GIB, "budget": 35 * gd.GIB, "over": 8 * gd.GIB,
+                                      "mount": "/", "families": {"a": 1 * gd.GIB, "b": 39 * gd.GIB}}}
+        self.assertEqual(gd.cache_budget_rows(), [{"mount": "/", "used_gib": 40.0, "budget_gib": 35.0,
+                                                   "over_gib": 8.0, "families_gib": {"b": 39.0, "a": 1.0}}])
 
 
 if __name__ == "__main__":

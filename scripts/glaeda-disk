@@ -1592,6 +1592,8 @@ def item_window(fam: Family, path: Path, idle_hours: float, archived: frozenset[
                 return 0.0
     if fam.id in STEP_CHECKOUT_FAMILIES and fam.git_disposable and ended_step_checkout(path):
         return min(idle_window(fam, idle_hours), STEP_CHECKOUT_IDLE_HOURS)  # its step ended: nothing comes back
+    if budget_warm(fam):  # the volume's caches are over their budget: warmth older than an hour is spent
+        return min(idle_window(fam, idle_hours), BUDGET_IDLE_HOURS)
     return idle_window(fam, idle_hours)
 
 
@@ -1634,6 +1636,131 @@ def cmux_next_cap_only(fam: Family, path: Path, idle: float, idle_hours: float) 
             and not cmux_next_ci_host_root(fam, path)
             and ((cmux_next_ci_state_for(path, fam.root) is None and not cmux_next_ci_tui_tree(fam, path))
                  or idle < idle_window(fam, idle_hours)))
+
+
+# The host cache budget (POLICY cache_budget, Leo 2026-11-17: "there are dozens if not hundreds of gb of build stuff
+# that just keep getting accumulated. it's too much"): every build cache on a volume together stays under a share of
+# it, whatever each family's own window says. Per-family windows let each family keep a day of warm state, and
+# fourteen runners' worth of that filled 460 GB minis to 58 GB free (cmux13s, 2026-11-17: fleet CAS 47.5 GB,
+# spm-scratch 25, Xcode DerivedData 25.6 all "recent", hq's cache 24, two seeds per root 17.5).
+# BUDGET_FAMILY_IDS count toward it (report-only ones too: their bytes are on the disk whoever evicts them).
+# BUDGET_WARM_FAMILY_IDS are the ones whose window is only warmth, never a safety proof: over the budget their window
+# drops to BUDGET_IDLE_HOURS, apply takes them by value (space per rebuild minute, idle longest first) after
+# everything already due, and stops once the volume is back under BUDGET_STOP_SHARE of the budget. Every in-use,
+# lock, socket, keep and git check still applies to them.
+BUDGET_FAMILY_IDS = frozenset({
+    *FLEET_FAMILY_IDS, SPM_SCRATCH, CANONICAL_ADMISSION, RUNNER_ROOT_ADMISSION, CMUX_NEXT_CI_FAMILY,
+    NIGHTLY_NEXT_FAMILY, "runner-checkout-build", "xcode-derived-data", "cmux-job-cache", "fleet-artifacts",
+    "hq-build-fleet-cache", "cmux-node-products", "cmux-git-mirror", "browser-artifacts", "journey-builds",
+    "journey-fetch",
+})  # RUNNER_BUILD_FAMILY, HQ_CACHE_FAMILY and the JOURNEY_SUBDIRS families, defined below (a test keeps them equal)
+BUDGET_WARM_FAMILY_IDS = frozenset({  # not FLEET_FAMILY_IDS: pressure already spends them past pressure_idle_hours
+    CANONICAL_ADMISSION, RUNNER_ROOT_ADMISSION, "runner-checkout-build", "xcode-derived-data",
+    "cmux-job-cache", "journey-builds", "journey-fetch",
+})
+# glaeda-disk's accounting coverage rows (cached up to ACCOUNTING_MAX_AGE_S) for build stores no family lists: the
+# fleet Xcode compilation cache, which glaeda-fleet-cas-prune bounds by its own node cap
+BUDGET_COVERAGE_SCOPES = {"shared-fleet/xcode": "fleet-cas"}
+BUDGET_IDLE_HOURS = 1.0  # unused for an hour on a busy runner host: the next job that wants it rebuilds or re-seeds
+BUDGET_STOP_SHARE = 0.9  # over the budget, evict down to this share of it, so one pass is not followed by another
+CACHE_BUDGET: dict[int, dict[str, Any]] = {}  # dev -> {"used", "budget", "over", "families"}, set by main
+
+
+def _outermost(paths: list[str]) -> list[str]:
+    """PATHS without any path inside another listed one."""
+    out: list[str] = []
+    for p in sorted(paths):
+        if out and (p == out[-1] or p.startswith(out[-1].rstrip("/") + "/")):
+            continue
+        out.append(p)
+    return out
+
+
+def cache_budget_state(fams: list[Family], fss: "dict[int, Fs]", sizes: dict[str, int],
+                       accounting: dict[str, Any] | None = None, now: float | None = None) -> dict[int, dict[str, Any]]:
+    """Each volume's build-cache bytes against POLICY cache_budget: the last measured size of every candidate of a
+    BUDGET_FAMILY_IDS family (the snapshot, outermost paths only) plus BUDGET_COVERAGE_SCOPES from the cached
+    accounting. Reads only: no walk. {} when the budget is off ("0") or nothing is known."""
+    spec = str(POLICY["cache_budget"]).strip()
+    if spec in ("", "0", "0%"):
+        return {}
+    now = time.time() if now is None else now
+    roots: list[tuple[str, Family, int]] = []
+    for f in fams:
+        if f.id not in BUDGET_FAMILY_IDS:
+            continue
+        try:
+            roots.append((os.fspath(f.root).rstrip("/"), f, f.root.stat().st_dev))
+        except OSError:
+            continue
+    roots.sort(key=lambda r: len(r[0]), reverse=True)  # the deepest root a path is under owns it
+    owned: dict[str, tuple[str, int]] = {}
+    for path, size in sizes.items():
+        if size <= 0:
+            continue
+        for root, f, dev in roots:
+            if path.startswith(root + "/"):
+                owned[path] = (f.id, dev)
+                break
+    out: dict[int, dict[str, Any]] = {}
+    for path in _outermost(list(owned)):
+        fid, dev = owned[path]
+        row = out.setdefault(dev, {"used": 0, "families": {}})
+        row["used"] += sizes[path]
+        row["families"][fid] = row["families"].get(fid, 0) + sizes[path]
+    doc = _accounting_cache() if accounting is None else accounting
+    for dev in fss:
+        hit = doc.get(str(dev)) if isinstance(doc.get(str(dev)), dict) else None
+        if not hit or now - float(hit.get("coverage_at", 0) or 0) > ACCOUNTING_MAX_AGE_S:
+            continue
+        for row in _safe_cached_coverage(hit.get("coverage")) or []:
+            label = BUDGET_COVERAGE_SCOPES.get(row["scope"])
+            size = sum(int(c.get("bytes", 0)) for c in row.get("children", []) if isinstance(c.get("bytes"), int))
+            if label and size > 0:
+                r = out.setdefault(dev, {"used": 0, "families": {}})
+                r["used"] += size
+                r["families"][label] = r["families"].get(label, 0) + size
+    for dev, row in list(out.items()):
+        fs = fss.get(dev)
+        if fs is None or fs.tmpfs:
+            del out[dev]
+            continue
+        try:
+            budget = space(spec, fs.total)
+        except ValueError:
+            return {}
+        row["budget"], row["mount"] = budget, fs.mount
+        row["over"] = max(0, row["used"] - int(budget * BUDGET_STOP_SHARE)) if row["used"] > budget else 0
+    return out
+
+
+def cache_budget_over(dev: int) -> int:
+    """Bytes the volume's build caches are over their budget's stop line, counted only in a pressure run."""
+    return CACHE_BUDGET.get(dev, {}).get("over", 0) if ACTIVITY_MODE == "pressure" else 0
+
+
+def budget_warm(fam: Family) -> bool:
+    """Whether FAM's window is only warmth that the cache budget may spend (its volume is over the budget)."""
+    if fam.id not in BUDGET_WARM_FAMILY_IDS:
+        return False
+    try:
+        return cache_budget_over(fam.root.stat().st_dev) > 0
+    except OSError:
+        return False
+
+
+def budget_only(fam: Family, item: "Item", idle_hours: float) -> bool:
+    """Reclaimable only because the volume is over the cache budget: younger than its family's own window.
+    apply stops these once the volume's caches are back under the budget's stop line."""
+    return budget_warm(fam) and item.idle_hours < idle_window(fam, idle_hours)
+
+
+def cache_budget_rows() -> list[dict[str, Any]]:
+    """CACHE_BUDGET for the run line and the health summary (ci-dash's cache-vs-budget row): GiB, no paths."""
+    return [{"mount": r.get("mount", ""), "used_gib": round(r["used"] / GIB, 1), "budget_gib": round(r["budget"] / GIB, 1),
+             "over_gib": round(r["over"] / GIB, 1),
+             "families_gib": {k: round(v / GIB, 1) for k, v in sorted(r["families"].items(), key=lambda kv: -kv[1])}}
+            for r in CACHE_BUDGET.values()]
 
 
 # The idle sweep (--idle): windows from how often each family is read again, not from free space.
@@ -1778,6 +1905,10 @@ POLICY_DEFAULTS: dict[str, Any] = {
     "low_margin_gib": 4.0,
     "target_margin_gib": 20.0,
     "pressure_idle_hours": 0.5,
+    # Every build cache on a volume together (BUDGET_FAMILY_IDS and BUDGET_COVERAGE_SCOPES) stays under this share of
+    # it (space()'s syntax; "0" turns it off). Over it, a pressure pass spends warm build state past BUDGET_IDLE_HOURS
+    # by value until the caches are back under BUDGET_STOP_SHARE of it.
+    "cache_budget": "35%",
     # PRESSURE_MEASURE_BUDGET_S: seconds a pressure --apply spends starting size walks (0: no bound)
     "pressure_measure_budget_s": float(PRESSURE_MEASURE_BUDGET_S),
     "pressure_jobs": 80,
@@ -10630,6 +10761,8 @@ def write_health_summary(fss: list[Fs], items: list[Item], accounting: list[dict
                    "accounting": [dict(x) for x in accounting],
                    "filesystems": [{"mount": x.mount, "free": x.free, "total": x.total,
                                     "under": x.under} for x in fss]}
+        if CACHE_BUDGET:
+            payload["cache_budget"] = cache_budget_rows()  # ci-dash's cache GB vs budget row
         if receipt is not None:
             contention = read_eviction_contention(receipt)
             if contention is not None:
@@ -11017,6 +11150,7 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
     archived = archived_seeds() if any(i.family == "cmux-seeds" for i in items) else frozenset()
     # Among pressure hot-tier items, evict greatest reuse distance, then oldest use.
     cap_left = cmux_next_ci_over()  # what the cmux-next-ci cache is still over its cap
+    budget_left = {dev: cache_budget_over(dev) for dev in CACHE_BUDGET}  # what each volume's caches are still over
     # bytes this pass took from inside each cmux-next state root and host root; TAKEN shares it across main's passes
     taken_in: dict[Path, int] = {} if taken is None else taken
 
@@ -11038,6 +11172,9 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
         if warm:
             # reclaimable only by FLOOR_HOLD or the cmux-next cap: warm builds go last, least recently used first
             return (-1, 0, i.idle_hours, i.bytes)
+        if budget_only(family_of(i), i, idle_hours):
+            # warm, and reclaimable only over the cache budget: after everything due, by value across families
+            return (-0.5, value(i, families[i.family]), 0, 0)
         if i.family == RUNNER_GIT_GARBAGE_FAMILY:  # garbage nothing reads goes before anything that costs a rebuild
             return (2, 0, i.idle_hours, i.bytes)
         if cmux_next_ci_fallback_item(family_of(i), Path(i.path)):  # due by its own window: first of its band
@@ -11081,6 +11218,11 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
                 warm.append(False)
         if cmux_next_cap_only(fam, p, i.idle_hours, idle_hours):
             warm.append(cap_left > 0)
+        budget_dev = None
+        if budget_only(fam, i, idle_hours):
+            with contextlib.suppress(OSError):
+                budget_dev = fam.root.stat().st_dev
+            warm.append(budget_left.get(budget_dev, 0) > 0)
         if warm and not any(warm):
             continue
         if cmux_next_ci_host_floor_only(fam, p, i.idle_hours) and not cmux_next_ci_host_floor_unmet(p):
@@ -11262,6 +11404,11 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
                         cap_left -= took  # an aside slot was part of the cache the cap measured
                         taken_in[p.parent] = taken_in.get(p.parent, 0) + took  # a host root's measure held it too
                     released += took if gone else 0
+                    if gone and fam.id in BUDGET_FAMILY_IDS:
+                        with contextlib.suppress(OSError):
+                            bdev = fam.root.stat().st_dev
+                            if bdev in budget_left:
+                                budget_left[bdev] -= took  # anything a budget family gives back counts toward it
                 if common:  # drop the deleted worktree's record from its repository
                     subprocess.run(["git", "--git-dir", common, "worktree", "prune"],
                                    capture_output=True, timeout=60)
@@ -13059,6 +13206,27 @@ def _main_impl(argv: list[str] | None = None) -> int:
     except ValueError:
         ap.error(f"--low/--target/--tmpfs-*/--emergency take GiB or N%: {a.low!r}, {a.target!r}, "
                  f"{a.tmpfs_low!r}, {a.tmpfs_target!r}, {a.emergency!r}")
+    # The host cache budget, from the last measured sizes (no walk): a volume whose build caches are over it is under
+    # pressure whatever its free space, and its free target rises by what the caches must give back. A run limited to
+    # some families, a reserved host's floor pass, a --need, the drain and the runner-account profile leave it alone.
+    global CACHE_BUDGET
+    CACHE_BUDGET = {}
+    if (ROLE == "fleet-mini" and not RUNNER_CACHE_PROFILE and not reserved and not a.family and a.need is None
+            and not a.cmux_next_drain and not a.root_override):
+        CACHE_BUDGET = cache_budget_state(every, fss, load_snapshot()[1])
+        for dev, row in CACHE_BUDGET.items():
+            if row["over"] > 0 and dev in fss:
+                fs = fss[dev]
+                fss[dev] = replace(fs, low=max(fs.low, fs.free + 1), target=max(fs.target, fs.free + row["over"]))
+        if CACHE_BUDGET:
+            RUN["cache_budget"] = cache_budget_rows()
+            if not a.json:
+                for row in RUN["cache_budget"]:
+                    top = ", ".join(f"{k} {v:g}" for k, v in list(row["families_gib"].items())[:6])
+                    print(f"cache budget: {row['used_gib']:g} GiB of build caches, budget {row['budget_gib']:g} GiB"
+                          + (f" ({row['over_gib']:g} GiB to give back: warm build state past "
+                             f"{BUDGET_IDLE_HOURS:g}h idle goes by value)" if row["over_gib"] else "")
+                          + (f"; {top}" if top else ""))
     # a tmpfs is under pressure at a quarter full, so it shortens the idle window only for
     # pressure runs, which then touch nothing but that filesystem's families
     under = any(fs.under for fs in fss.values() if a.pressure or not fs.tmpfs)
