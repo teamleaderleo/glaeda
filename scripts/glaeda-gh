@@ -279,6 +279,8 @@ import glob
 import gzip
 import hashlib
 from http.client import HTTPException  # the http() helper below shadows the `http` package
+import http.client as http_client
+import ipaddress
 import json
 import math
 import os
@@ -1558,6 +1560,174 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
 OPENER = urllib.request.build_opener(NoRedirect)
 
 
+# api.github.com edges. On 2026-11-17 from 22:40Z cosmic-gray resolved api.github.com only to one edge (from 8.8.8.8
+# and Tailscale's resolver alike); from there it dropped most SYNs and answered the rest with a 403 that carried no
+# rate-limit headers, while GitHub's other edges answered every call. With SOCKET_TIMEOUT's 20 s per connect every read
+# failed (URLError) and a tick's reads queued behind each other. Now each connect and TLS handshake to api.github.com
+# gets EDGE_CONNECT_TIMEOUT, and a dead edge (a timeout, a failed connect, or the bare 403 edge_refused names) gets one
+# retry on another edge address, from a second resolver (DNS over HTTPS) since the system one named only the dead edge.
+# No address is written here, and TLS still checks api.github.com's certificate, so a wrong address can only fail. The
+# gh-quota shim gives every gh call the same (leo-workspace tools/gh_edge.py); this daemon talks to GitHub itself.
+EDGE_HOSTS = {"api.github.com"}
+EDGE_CONNECT_TIMEOUT = 3.0
+EDGE_BAD_TTL = 600.0
+EDGE_DOH_TTL = 300.0
+EDGE_DOH_DEFAULT = "https://dns.google/resolve,https://cloudflare-dns.com/dns-query"
+
+
+def edge_refused(status: int, headers: dict) -> bool:
+    """A 403 the edge made, not GitHub's API: no X-RateLimit-* header and no Retry-After. GitHub's own 403s (a rate
+    limit, a permission) carry the rate-limit headers and reach the caller as before."""
+    if status != 403:
+        return False
+    return not any(k.lower().startswith("x-ratelimit-") or k.lower() == "retry-after" for k in headers)
+
+
+class EdgeFailed(OSError):
+    def __init__(self, why: str):
+        super().__init__(why)
+        self.why = why
+
+
+class Edges:
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.reset()
+
+    def reset(self) -> None:
+        self.bad: dict[str, float] = {}
+        self.doh_cache: tuple[float, list[str]] = (float("-inf"), [])
+        self.local = threading.local()
+
+    def is_bad(self, ip: str) -> bool:
+        return self.bad.get(ip, 0) > time.time()
+
+    def mark_bad(self, ip: str) -> None:
+        with self.lock:
+            now = time.time()
+            self.bad = {k: v for k, v in self.bad.items() if v > now}
+            self.bad[ip] = now + EDGE_BAD_TTL
+
+    def last_ip(self) -> str | None:
+        return getattr(self.local, "ip", None)
+
+    @staticmethod
+    def resolve(host: str) -> list[str]:
+        override = os.environ.get("GLAEDA_EDGE_TEST_RESOLVE", "")
+        if override.startswith(host + "="):
+            return [ip for ip in override.split("=", 1)[1].split(",") if ip]
+        try:
+            infos = socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)
+        except OSError:
+            return []
+        return list(dict.fromkeys(info[4][0] for info in infos))
+
+    def doh(self, host: str) -> list[str]:
+        """A second resolver's addresses for HOST: DNS over HTTPS (JSON), each provider in GLAEDA_EDGE_DOH in turn."""
+        at, ips = self.doh_cache
+        if at + EDGE_DOH_TTL > time.time():
+            return ips
+        plain = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        out: list[str] = []
+        for url in (os.environ.get("GLAEDA_EDGE_DOH") or EDGE_DOH_DEFAULT).split(","):
+            url = url.strip()
+            for rtype in ("A", "AAAA"):
+                if not url:
+                    break
+                query = url + ("&" if "?" in url else "?") + urllib.parse.urlencode({"name": host, "type": rtype})
+                try:
+                    with plain.open(urllib.request.Request(query, headers={"Accept": "application/dns-json"}),
+                                    timeout=2) as answer:
+                        records = json.loads(answer.read(65536)).get("Answer") or []
+                except (OSError, HTTPException, ValueError, AttributeError):
+                    continue
+                for record in records:
+                    data = record.get("data") if isinstance(record, dict) else None
+                    if isinstance(record, dict) and record.get("type") in (1, 28) and isinstance(data, str):
+                        try:
+                            ipaddress.ip_address(data)
+                        except ValueError:
+                            continue
+                        if data not in out:
+                            out.append(data)
+            if out:
+                break
+        self.doh_cache = (time.time(), out)
+        return out
+
+    @staticmethod
+    def attempt(ip: str, port: int, host: str, context: ssl.SSLContext, timeout: float):
+        try:
+            raw = socket.create_connection((ip, port), timeout=EDGE_CONNECT_TIMEOUT)
+        except TimeoutError:
+            raise EdgeFailed("connect-timeout") from None
+        except OSError:
+            raise EdgeFailed("connect-failed") from None
+        try:
+            tls = context.wrap_socket(raw, server_hostname=host)
+        except TimeoutError:
+            raw.close()
+            raise EdgeFailed("tls-timeout") from None
+        except OSError:
+            raw.close()
+            raise EdgeFailed("tls-failed") from None
+        tls.settimeout(timeout)
+        return tls
+
+    def connect(self, host: str, context: ssl.SSLContext, timeout: float):
+        """A TLS connection to an edge for HOST: the first try, then at most one retry on another edge."""
+        port = int(os.environ.get("GLAEDA_EDGE_TEST_PORT") or 443)
+        primary = self.resolve(host)
+        first = next((ip for ip in primary if not self.is_bad(ip)), None)
+        why = "all-marked-bad"
+        if first is not None:
+            try:
+                sock = self.attempt(first, port, host, context, timeout)
+                self.local.ip = first
+                return sock
+            except EdgeFailed as error:
+                why = error.why
+                self.mark_bad(first)
+        tried = set(primary)
+        alts = [ip for ip in self.doh(host) if ip not in tried and not self.is_bad(ip)]
+        frm = first
+        if not alts:
+            log({"event": "edge-retry", "host": host, "from": frm, "to": None, "why": why, "ok": False})
+            raise EdgeFailed(f"no other {host} edge ({why})")
+        second = alts[0]
+        try:
+            sock = self.attempt(second, port, host, context, timeout)
+        except EdgeFailed as error:
+            self.mark_bad(second)
+            log({"event": "edge-retry", "host": host, "from": frm, "to": second, "why": why, "ok": False,
+                 "why2": error.why})
+            raise
+        if frm is not None:  # a known-bad first edge skipped is no retry
+            log({"event": "edge-retry", "host": host, "from": frm, "to": second, "why": why, "ok": True})
+        self.local.ip = second
+        return sock
+
+
+EDGE = Edges()
+
+
+class EdgeHTTPSConnection(http_client.HTTPSConnection):
+
+    def connect(self) -> None:
+        if self._tunnel_host or self.host not in EDGE_HOSTS:  # through a proxy, or another host: as before
+            super().connect()
+            return
+        self.sock = EDGE.connect(self.host, self._context, self.timeout)
+
+
+class EdgeHTTPSHandler(urllib.request.HTTPSHandler):
+    def https_open(self, req):  # noqa: ANN001
+        return self.do_open(EdgeHTTPSConnection, req)
+
+
+GITHUB_OPENER = urllib.request.build_opener(NoRedirect, EdgeHTTPSHandler)
+
+
 def error_site(error: BaseException) -> str:
     """Where `error` was raised: file, line and function only, never values, so a recurring error
     can be found without reproducing it."""
@@ -1616,13 +1786,29 @@ def http(method: str, url: str, headers: dict[str, str], body: bytes | None = No
     if not url.startswith(API + "/"):
         raise WatchError("refusing a request outside api.github.com")
     request = urllib.request.Request(url, data=body, method=method, headers=headers)
+
+    def once() -> tuple[int, dict, bytes]:
+        try:
+            with GITHUB_OPENER.open(request, timeout=SOCKET_TIMEOUT) as response:
+                return response.status, {k.lower(): v for k, v in response.headers.items()}, response.read(MAX_BODY)
+        except urllib.error.HTTPError as error:  # 304, refused redirects and every 4xx/5xx land here
+            return error.code, {k.lower(): v for k, v in (error.headers or {}).items()}, error.read(MAX_BODY)
+
     try:
         with hard_deadline(HTTP_DEADLINE):
-            try:
-                with OPENER.open(request, timeout=SOCKET_TIMEOUT) as response:
-                    return response.status, {k.lower(): v for k, v in response.headers.items()}, response.read(MAX_BODY)
-            except urllib.error.HTTPError as error:  # 304, refused redirects and every 4xx/5xx land here
-                return error.code, {k.lower(): v for k, v in (error.headers or {}).items()}, error.read(MAX_BODY)
+            EDGE.local.ip = None
+            answer = once()
+            edge = EDGE.last_ip()
+            if edge is not None and edge_refused(answer[0], answer[1]):
+                # The edge's own 403 (no rate-limit headers): GitHub never saw the request. Once more, elsewhere.
+                EDGE.mark_bad(edge)
+                EDGE.local.ip = None
+                try:
+                    answer = once()
+                finally:
+                    log({"event": "edge-retry", "host": urllib.parse.urlsplit(url).hostname, "from": edge,
+                         "to": EDGE.last_ip(), "why": "edge-403", "ok": EDGE.last_ip() is not None})
+            return answer
     except (OSError, HTTPException, ValueError) as error:  # DeadlineTimeout is a TimeoutError, an OSError
         raise WatchError(f"request failed: {type(error).__name__}") from None
 
