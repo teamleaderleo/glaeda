@@ -57,6 +57,18 @@ gg.DAEMON_CONFIG = Path(tempfile.gettempdir()) / f"glaeda-gh-test-no-daemon-conf
 gg.FLEET_POLICY = Path(tempfile.gettempdir()) / f"glaeda-gh-test-no-fleet-policy-{os.getpid()}.json"
 # Nor may a host's own pacer hear about the tests' secondary 403s.
 gg.PACE_CLI = Path(tempfile.gettempdir()) / f"glaeda-gh-test-no-pacer-{os.getpid()}" / "gh"
+# Nor may a test's secondary 403 write the host's own login latch marks (latch_write_secondary), or a host's marks or
+# another test's hold it: every test runs with a fresh GH_QUOTA_STATE of its own (a test may still patch its own).
+_testcase_run = unittest.TestCase.run
+
+
+def _run_with_own_latch_dir(self, result=None):
+    with tempfile.TemporaryDirectory(prefix="glaeda-gh-test-gh-quota-") as latch, \
+            mock.patch.dict(os.environ, {"GH_QUOTA_STATE": latch}):
+        return _testcase_run(self, result)
+
+
+unittest.TestCase.run = _run_with_own_latch_dir
 # Nor may a host's own expected-contexts.json add contexts the tests do not post.
 gg.EXPECTED_CONFIG = Path(tempfile.gettempdir()) / f"glaeda-gh-test-no-expected-{os.getpid()}.json"
 # Nor may a test's alarm reach the host's coordinator, or its notices.
@@ -12573,6 +12585,8 @@ class RiskReceiptPostTest(unittest.TestCase):
         for answer in ((403, {"retry-after": "120"}, {"message": "secondary rate limit"}),
                        (502, {}, {}), gg.WatchError("request failed: TimeoutError")):
             with self.subTest(answer=answer):
+                for pool in ("rest", "graphql"):  # each answer alone: the secondary one holds the host (latch marks)
+                    (gg.latch_state_dir() / f"{pool}-exhausted.json").unlink(missing_ok=True)
                 item = self.queue("comment", "manaflow-ai/cmux#7", "--body", self.receipt()["body"])
                 d, t = self.daemon((201, {}, self.receipt()), (200, {}, self.pull()), answer)
                 self.step(d, NOW)
@@ -12624,6 +12638,8 @@ class RiskReceiptPostTest(unittest.TestCase):
         for answer in ((404, {}, {}), (429, {"retry-after": "120"}, {}),
                        gg.WatchError("request failed: TimeoutError")):
             with self.subTest(answer=answer):
+                for pool in ("rest", "graphql"):  # each answer alone: a 429 with Retry-After holds the host (latch marks)
+                    (gg.latch_state_dir() / f"{pool}-exhausted.json").unlink(missing_ok=True)
                 item = self.queue("comment", "manaflow-ai/cmux#7", "--body", self.receipt()["body"])
                 d, t = self.daemon((201, {}, self.receipt()), answer)
                 self.step(d, NOW)
@@ -17853,7 +17869,7 @@ class LandTest(Base):
                                       reason=f"quota: not judged, retry after {at}Z (reset); no attempt before {at}Z"))
         e = self.tick()
         said = gg.land_quota_said(f"no attempt before {at}Z", self.t)
-        jitter = gg.land_jitter(self.KEY)
+        jitter = gg.land_jitter(self.KEY, said)
         self.assertEqual((e["state"], e["wait"]["kind"], e["wakeAt"]), ("waiting", "quota", said + jitter))
         self.assertTrue(0 <= said + jitter - reset <= 59 + gg.LAND_QUOTA_JITTER)
         self.assertIsNone(e.get("streak"))
@@ -18633,6 +18649,100 @@ class WaitFromBytecodeTest(unittest.TestCase):
                                   timeout=60)
             self.assertEqual(done.returncode, 0, done.stderr)
             self.assertTrue(list(Path(home, ".cache", "gh-quota", "pycache").rglob("*.pyc")))
+
+
+class ResetPaceTest(unittest.TestCase):
+    """gh-quota-spiral, 2026-11-17: the login's REST hour reset at 15:48:36Z and ~5000 calls spent it before 15:49:30Z;
+    at 15:46:32Z GitHub answered with its scraping page (the secondary limit). The same keys as leo-workspace
+    tools/gh_pace.py: reset_spread_s, minute_cap_calls, secondary_hold_s (gh-quota.json)."""
+
+    R = 1_763_394_516.0
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.policy = Path(self.tmp.name) / "gh-quota.json"
+        self.state = Path(self.tmp.name) / "gh-quota"
+        env = mock.patch.dict(os.environ, {"GLAEDA_GH_QUOTA_POLICY": os.fspath(self.policy),
+                                           "GH_QUOTA_STATE": os.fspath(self.state)})
+        env.start()
+        self.addCleanup(env.stop)
+
+    def test_settings_read_gh_quota_json_and_default_when_absent(self) -> None:
+        self.assertEqual(gg.pace_settings(), gg.PACE_DEFAULTS)
+        self.policy.write_text(json.dumps({"reset_spread_s": 30, "minute_cap_calls": 0, "secondary_hold_s": True}))
+        self.assertEqual(gg.pace_settings(), {**gg.PACE_DEFAULTS, "reset_spread_s": 30.0})
+
+    def test_spread_is_the_shims_hash(self) -> None:
+        import hashlib
+        digest = hashlib.sha256(f"c\0{int(self.R)}".encode()).digest()
+        self.assertAlmostEqual(gg.pace_spread("c", self.R), int.from_bytes(digest[:4], "big") / 0xFFFFFFFF * 120)
+
+    def test_fifty_lands_held_until_r_spread_and_no_minute_takes_more_than_the_cap(self) -> None:
+        """50 PRs whose lands were held by the latch until R. Before, every one was judged at R's first second;
+        now each resumes at R + land_jitter, so they spread over reset_spread_s."""
+        (self.state).mkdir(parents=True)
+        (self.state / "rest-exhausted.json").write_text(json.dumps(
+            {"until": self.R, "at": self.R - 600, "reset": self.R, "source": "x-ratelimit-reset", "identity": "login"}))
+        keys = [f"pr:o/r#{n}" for n in range(50)]
+        resumed: dict[str, float] = {}
+        t = self.R - 5
+        while len(resumed) < len(keys) and t < self.R + 600:
+            held = gg.land_latch(t)
+            ended = gg.land_latch_spread(t) if held is None else None
+            for k in keys:
+                if k in resumed or held is not None:
+                    continue
+                if ended is not None and t < ended + gg.land_jitter(k, ended):
+                    continue
+                resumed[k] = t
+            t += 1
+        times = sorted(resumed.values())
+        before_first_second = len(keys)  # the old rule: the latch clears at R, every entry judged that pass
+        after_first_second = sum(1 for x in times if x < self.R + 1)
+        cap = 60 * len(keys) / 120 * 2  # twice the even pace over the spread
+        worst = max(sum(1 for y in times if x <= y < x + 60) for x in times)
+        print(f"\nland harness, 50 held until R: before {before_first_second} at R's first second; after "
+              f"{after_first_second}, max {worst} in any 60 s, last R+{times[-1] - self.R:.0f}s", file=sys.stderr)
+        self.assertEqual(len(times), len(keys))
+        self.assertLessEqual(after_first_second, 3)
+        self.assertLessEqual(worst, cap)
+        self.assertLessEqual(times[-1], self.R + 121)
+
+    def test_the_daemons_minute_cap_holds_reads_and_names_when(self) -> None:
+        self.policy.write_text(json.dumps({"minute_cap_calls": 5}))
+        d = gg.Daemon(transport=lambda *a: (200, {}, b"{}"), token=lambda: "t", controller=None)
+        d.clock_real, d.now = False, self.R
+        for _ in range(5):
+            d.minute_admit("rest")
+        with self.assertRaises(gg.WatchError) as caught:
+            d.minute_admit("rest")
+        self.assertIn("minute_cap_calls=5", str(caught.exception))
+        self.assertEqual(d.backoff["rest"], self.R + 60)  # stopped until the window has room: no loop
+        self.assertEqual(d.mode("rest"), "stop")
+        d.minute_admit("graphql")  # its own bucket
+        d.now = self.R + 60
+        d.minute_admit("rest")
+
+    def test_a_secondary_answer_holds_every_caller_on_the_host(self) -> None:
+        d = gg.Daemon(transport=lambda *a: (200, {}, b"{}"), token=lambda: "t", controller=None)
+        d.clock_real, d.now = False, self.R
+        d.secondary_hit("graphql", None)
+        for pool in ("rest", "graphql"):
+            mark = json.loads((self.state / f"{pool}-exhausted.json").read_text())
+            self.assertEqual((mark["source"], mark["until"]), ("secondary", self.R + gg.SECONDARY_BACKOFF))
+        # a land queue and another daemon on the host see it
+        self.assertIsNotNone(gg.land_latch(self.R + 5))
+        other = gg.Daemon(transport=lambda *a: (200, {}, b"{}"), token=lambda: "t", controller=None)
+        other.clock_real, other.now = False, self.R + 5
+        self.assertFalse(other.secondary_admit("rest", 1))
+        self.assertGreaterEqual(other.secondary_until, self.R + gg.SECONDARY_BACKOFF)
+        self.assertLessEqual(other.secondary_until, self.R + gg.SECONDARY_BACKOFF + 120)
+
+    def test_the_scraping_page_is_a_secondary_limit(self) -> None:
+        page = ("<p>Access to this site has been restricted.</p><p>For more on scraping GitHub and how it may affect "
+                "your rights, please review our Terms of Service.</p>")
+        self.assertTrue(gg.SECONDARY.search(page))
 
 
 if __name__ == "__main__":

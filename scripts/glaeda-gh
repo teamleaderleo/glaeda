@@ -412,6 +412,18 @@ SPEND_VIEW_TOP = 15
 # The calls gh-quota keeps back from every caller but lands (leo-workspace machines/gh-quota.json hard_reserve_calls,
 # {"rest": N, "graphql": N}); this default until the policy names it.
 HARD_RESERVE_DEFAULT = {"rest": 500, "graphql": 500}
+# How fast one host spends the shared login: leo-workspace machines/gh-quota.json, read by tools/gh_pace.py for the gh
+# shim and here for the daemon and the land queue (the lane-gh broker reads the same keys). 2026-11-17: the login's REST
+# hour reset at 15:48:36Z and ~5000 calls spent it before 15:49:30Z (everything held until the reset fired at its first
+# second); at 15:46:32Z GitHub answered NOW's reads with its "For more on scraping GitHub ... Terms of Service" page.
+#   reset_spread_s    a caller held until a reset R resumes at R + its own 0..reset_spread_s (pace_spread), not at R
+#   minute_cap_calls  the daemon's own login requests per bucket in any 60 s; a read past it waits (writes never)
+#   login_concurrency login requests in flight per host (the shim's slots; the daemon sends one at a time)
+#   secondary_hold_s  GitHub's secondary limit with no Retry-After holds every caller on the host this long
+PACE_DEFAULTS = {"reset_spread_s": 120.0, "minute_cap_calls": 170.0, "login_concurrency": 2.0, "secondary_hold_s": 60.0}
+PACE_WINDOW = 60.0
+# GitHub's own word for a mark's end (leo-workspace tools/gh_latch.py GITHUB_SOURCES): a reading never voids it early.
+LATCH_GITHUB_SOURCES = ("x-ratelimit-reset", "retry-after", "said", "secondary")
 # How stale this host's view of the shared quota may get before GET /rate_limit refreshes it. That
 # endpoint reports every family at once and costs no primary quota, so the only cost of a short
 # interval is the secondary limit, which one call every two minutes is nowhere near. 0 turns it off.
@@ -682,7 +694,8 @@ FALLBACK = ("comment", "head")
 # or SECONDARY_BACKOFF doubling with each hit in a row up to SECONDARY_BACKOFF_MAX, whichever is longer.
 SECONDARY_BACKOFF = 60
 SECONDARY_BACKOFF_MAX = 900
-SECONDARY = re.compile(r"secondary rate limit|abuse detection", re.I)
+SECONDARY = re.compile(r"secondary rate limit|abuse detection|For more on scraping GitHub and how it may affect your rights",
+                       re.I)  # the last: GitHub's restriction page for a login it reads as scraping (2026-11-17)
 CONTENT_ONLY = re.compile(r"content creation", re.I)  # "...temporarily blocked from content creation"
 # The host-wide pacer for the secondary limit (gh-quota's pace.json, in this directory), when one is installed:
 # its hold stops this daemon's reads too, and a secondary 403 the daemon meets is reported to it. Read only;
@@ -2894,6 +2907,7 @@ class Daemon:
         self.backoff: dict[str, float] = {"rest": 0.0, "graphql": 0.0}
         self.secondary_until = 0.0  # a secondary 403 holds both buckets until then
         self.secondary_strikes = 0  # secondary 403s since the last clean answer: each doubles the hold
+        self.minute_sent: dict[str, list[float]] = {"rest": [], "graphql": []}  # send times, the per-minute cap
         self.budget_retry = 0.0  # /rate_limit is left alone until this time after a refusal
         self.rate_limit_at = float("-inf")  # when /rate_limit last answered (refresh_budget)
         self.last_cycle: dict[str, float] = {kind: 0.0 for kind in CYCLES}
@@ -3687,6 +3701,8 @@ class Daemon:
         # caps the daemon's polling, so the outbox is neither counted against it nor held by it:
         # holding a lander's write until the hour turns would be an outage, not a saving.
         write = self.writing
+        if not free and not write and not content:
+            self.minute_admit(bucket)
         charged = bucket == "rest" and not free and not write
         if charged:
             # Charged before it is sent, and refunded only when GitHub says it was free (a 304): a
@@ -3737,10 +3753,27 @@ class Daemon:
                 wait = float(h["retry-after"]) if h.get("retry-after") else float(h.get("x-ratelimit-reset", 0)) - self.now
             except ValueError:
                 wait = CYCLE
-            self.backoff[bucket] = self.now + max(CYCLE, wait)
+            # resumed at the reset plus this daemon's own place in the spread, not at the reset's first second
+            until = self.now + max(CYCLE, wait)
+            self.backoff[bucket] = until + pace_spread(f"{policy_host()}|glaeda-gh|{bucket}", until)
         elif status < 400 and not free:
             self.secondary_strikes = 0  # a clean answer: the next secondary hold starts short again
         return status, h, doc
+
+    def minute_admit(self, bucket: str) -> None:
+        """The per-minute cap (minute_cap_calls) on this daemon's own read requests per bucket: past it the request
+        is not sent and the bucket stops until the window has room (backoff), so no read retries in a loop."""
+        at = self.clock()
+        sent = [t for t in self.minute_sent[bucket] if at - t < PACE_WINDOW]
+        cap = int(pace_settings()["minute_cap_calls"])
+        if len(sent) >= cap:
+            free_at = sent[len(sent) - cap] + PACE_WINDOW
+            self.minute_sent[bucket] = sent
+            self.backoff[bucket] = max(self.backoff[bucket], free_at)
+            raise WatchError(f"held: {len(sent)} {bucket} requests in the last 60 s, the per-minute cap "
+                             f"minute_cap_calls={cap} (gh-quota.json); next at {utc_clock(free_at)}")
+        sent.append(at)
+        self.minute_sent[bucket] = sent
 
     def secondary_admit(self, bucket: str, n: int) -> bool:
         """Whether n more read requests may go to GitHub now: not while this daemon's own secondary hold
@@ -3749,10 +3782,17 @@ class Daemon:
         return self.clock() >= self.secondary_until
 
     def adopt_pace_hold(self) -> None:
-        """Take on the pacer's hold (another caller met the secondary limit), so both buckets stop for it."""
+        """Take on the pacer's hold (another caller met the secondary limit), so both buckets stop for it; and a
+        login latch mark another caller wrote for the secondary limit (source "secondary"), resumed past its end at
+        this daemon's own place in the reset spread."""
         doc = read_json(BASE / PACE_FILE)
         hold = doc.get("hold") if isinstance(doc, dict) else None
         until = hold.get("until") if isinstance(hold, dict) else None
+        marked = latch_secondary_until(self.clock())
+        if marked is not None and marked > self.secondary_until:
+            marked += pace_spread(f"{policy_host()}|glaeda-gh", marked)
+            if not isinstance(until, (int, float)) or isinstance(until, bool) or marked > until:
+                until = marked
         if isinstance(until, (int, float)) and not isinstance(until, bool) and until > max(self.clock(), self.secondary_until):
             until = min(until, self.clock() + PACE_HOLD_MAX)  # a corrupt far future holds an hour at most
             if until > self.secondary_until:
@@ -3785,6 +3825,7 @@ class Daemon:
         for b in self.backoff:
             self.backoff[b] = max(self.backoff[b], self.secondary_until)
         log({"event": "secondary", "bucket": bucket, "hold": round(hold), "strikes": self.secondary_strikes})
+        latch_write_secondary(self.clock(), self.secondary_until)  # every caller on the host holds too
         self.report_secondary(self.secondary_until - self.clock())
 
     # -- the outbox: content writes (comments, PRs, reviews) queued by `glaeda-gh post`
@@ -7624,11 +7665,26 @@ def land_quota_said(text: str, now: float) -> float | None:
     return None
 
 
-def land_jitter(key: str) -> float:
-    """This caller's offset past a reset for KEY, 0..LAND_QUOTA_JITTER s: fixed per host and PR, so a re-park lands on
-    the same second and the queues of every host spread over the window."""
-    digest = hashlib.sha256(f"{policy_host()}|{LAND_TAG}|{key}".encode()).digest()
-    return float(int.from_bytes(digest[:4], "big") % (LAND_QUOTA_JITTER + 1))
+def land_jitter(key: str, reset: float = 0.0) -> float:
+    """This caller's offset past the reset RESET for KEY, 0..reset_spread_s (gh-quota.json; LAND_QUOTA_JITTER its
+    default): fixed per host, PR and reset, so a re-park lands on the same second and the queues of every host spread
+    over the window (pace_spread, the shim's own hash)."""
+    return pace_spread(f"{policy_host()}|{LAND_TAG}|{key}", reset)
+
+
+def land_latch_spread(now: float) -> float | None:
+    """The until of the login's latch mark GitHub named (LATCH_GITHUB_SOURCES) that ended less than reset_spread_s
+    before NOW, or None: entries resume past it each at its own land_jitter, not all at its first second."""
+    width = pace_settings()["reset_spread_s"]
+    best = None
+    for pool in ("rest", "graphql"):
+        doc = read_json(latch_state_dir() / f"{pool}-exhausted.json")
+        if not isinstance(doc, dict) or doc.get("share") is True or doc.get("source") not in LATCH_GITHUB_SOURCES:
+            continue
+        until = doc.get("until")
+        if isinstance(until, (int, float)) and not isinstance(until, bool) and until <= now < until + width:
+            best = max(best or 0.0, float(until))
+    return best
 
 
 def land_latch(now: float) -> tuple[str, float] | None:
@@ -7859,6 +7915,7 @@ class LandQueue:
         if self.refuse():
             return
         latch = self.latch_held()
+        ended = land_latch_spread(self.now) if latch is None else None
         for key in list(self.entries):
             try:
                 e = self.entries[key]
@@ -7869,6 +7926,8 @@ class LandQueue:
                     continue
                 if key in self.jobs or latch is not None:
                     continue  # a held latch: no judge, read, watch or nudge for any entry this pass
+                if ended is not None and self.now < ended + land_jitter(key, ended):
+                    continue  # the latch just ended: this entry's place in the reset spread is still ahead
                 with self.lock:
                     if self.parked(e):
                         continue
@@ -8055,7 +8114,7 @@ class LandQueue:
         e["quotaRefusals"] = n
         said = land_quota_said(text, self.now)
         if said is not None:
-            jitter = land_jitter(e["key"])
+            jitter = land_jitter(e["key"], said)
             wake = max(said, self.now) + jitter
             w = {"kind": "quota", "until": said, "said": True, "jitter": jitter}
         else:
@@ -11858,12 +11917,67 @@ def hard_reserve_floor() -> dict:
             for pool, default in HARD_RESERVE_DEFAULT.items()}
 
 
+def quota_policy_path() -> Path:
+    return Path(os.environ.get("GLAEDA_GH_QUOTA_POLICY")
+                or Path(SPENDERS_CMD).resolve().parent.parent / "machines/gh-quota.json")
+
+
+def pace_settings() -> dict:
+    """PACE_DEFAULTS overlaid with gh-quota.json's positive values for the same keys."""
+    doc = read_json(quota_policy_path())
+    out = dict(PACE_DEFAULTS)
+    if isinstance(doc, dict):
+        for key in out:
+            v = doc.get(key)
+            if isinstance(v, (int, float)) and not isinstance(v, bool) and v > 0:
+                out[key] = float(v)
+    return out
+
+
+def pace_spread(caller: str, reset: float, spread: float | None = None) -> float:
+    """CALLER's own offset in [0, reset_spread_s] past RESET: leo-workspace gh_pace.spread_s's hash, so one caller is
+    told one time per reset and N callers spread evenly over the window."""
+    width = pace_settings()["reset_spread_s"] if spread is None else spread
+    digest = hashlib.sha256(f"{caller}\0{int(reset)}".encode()).digest()
+    return int.from_bytes(digest[:4], "big") / 0xFFFFFFFF * width
+
+
+def latch_state_dir() -> Path:
+    return Path(os.environ.get("GH_QUOTA_STATE") or Path.home() / ".local/state/gh-quota")
+
+
+def latch_write_secondary(now: float, until: float, by: str = "glaeda-gh") -> None:
+    """Both pools' login marks (leo-workspace tools/gh_latch.py's files and fields) after GitHub's secondary limit, so
+    every caller on the host stops, not just the one that met it. Never shortens a mark that holds."""
+    for pool in ("rest", "graphql"):
+        path = latch_state_dir() / f"{pool}-exhausted.json"
+        old = read_json(path)
+        old_until = old.get("until") if isinstance(old, dict) else None
+        if isinstance(old_until, (int, float)) and not isinstance(old_until, bool) and old_until >= until > now:
+            continue
+        with contextlib.suppress(OSError):
+            write_json(path, {"until": until, "at": now, "reset": None, "source": "secondary", "by": by[:60],
+                              "identity": "login"})
+
+
+def latch_secondary_until(now: float) -> float | None:
+    """The latest until of a login mark another caller wrote for GitHub's secondary limit that holds at NOW."""
+    best = None
+    for pool in ("rest", "graphql"):
+        doc = read_json(latch_state_dir() / f"{pool}-exhausted.json")
+        if not isinstance(doc, dict) or doc.get("source") != "secondary":
+            continue
+        until = doc.get("until")
+        if isinstance(until, (int, float)) and not isinstance(until, bool) and now < until:
+            best = max(best or 0.0, min(float(until), now + PACE_HOLD_MAX))
+    return best
+
+
 def hard_reserve() -> dict:
     """gh-quota's hard reserve per pool: leo-workspace machines/gh-quota.json hard_reserve_calls (GLAEDA_GH_QUOTA_POLICY
     names another file), an int for both pools or {"rest": N, "graphql": N}; HARD_RESERVE_DEFAULT where it says
     nothing."""
-    path = Path(os.environ.get("GLAEDA_GH_QUOTA_POLICY")
-                or Path(SPENDERS_CMD).resolve().parent.parent / "machines/gh-quota.json")
+    path = quota_policy_path()
     doc = read_json(path)
     value = doc.get("hard_reserve_calls") if isinstance(doc, dict) else None
     out = dict(HARD_RESERVE_DEFAULT)
