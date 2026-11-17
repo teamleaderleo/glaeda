@@ -1275,11 +1275,14 @@ class DeclaredRunnerTests(unittest.TestCase):
                               "mini-b": {**host, "overrides": {"runner": {"classes": {"std": {"runners": 6}}}}},
                               "mini-c": {**host, "overrides": {"runner": {"classes": {"std": {
                                   "runners": 6, "gatewayRunners": 2}}}}},
+                              "mini-e": {**host, "overrides": {"runner": {"classes": {"std": {
+                                  "runners": 6, "smallRunners": 2}}}}},
                               "mini-d": {**host, "roles": ["dev-builds"]}}}
         hosts = fs.manifest_source(manifest)["data"]["hosts"]
         self.assertEqual(hosts["mini-a"]["runners_declared"], 4)  # the std class default
         self.assertEqual(hosts["mini-b"]["runners_declared"], 6)
         self.assertEqual(hosts["mini-c"]["runners_declared"], 8, "the gateway runners come after the pool instances")
+        self.assertEqual(hosts["mini-e"]["runners_declared"], 8, "a missing small runner is a missing instance")
         self.assertNotIn("runners_declared", hosts["mini-d"])
 
     def test_an_unknown_declared_count_keeps_the_zero_runner_check(self):

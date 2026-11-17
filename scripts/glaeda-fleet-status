@@ -334,8 +334,9 @@ def declared_runners(manifest: dict[str, Any], name: str) -> int | None:
     runners = (summary or {}).get("runners")
     if not (isinstance(runners, int) and not isinstance(runners, bool) and runners > 0):
         return None
-    # the gateway runners come after the pool instances, then the sim-first runner
-    extra = [(summary or {}).get("gatewayRunners"), (summary or {}).get("simRunners")]
+    # the gateway runners come after the pool instances, then the sim-first runner, then the small runners
+    extra = [(summary or {}).get("gatewayRunners"), (summary or {}).get("simRunners"),
+             (summary or {}).get("smallRunners")]
     return runners + sum(n for n in extra if isinstance(n, int) and not isinstance(n, bool) and n > 0)
 
 

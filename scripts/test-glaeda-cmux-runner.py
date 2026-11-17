@@ -79,6 +79,9 @@ os.environ["GLAEDA_RUNNER_TOOLCHAIN_GATE"] = "0"
 # The off-the-tailnet hold reads this host's real Tailscale: off in this process; GateOffTheTailnet turns it on with
 # tailnet_look patched.
 os.environ["GLAEDA_RUNNER_GATE_TAILNET"] = "off"
+# The host load cap reads this host's real load and the build controller's feed: off in this process; HostLoadCapTest
+# turns it on with the load and the feed patched.
+os.environ["CMUX_CI_HOST_LOAD_CAP"] = "off"
 hook = load("glaeda_cmux_runner_hook", HOOK)
 REAL_FIND_DISK = hook.find_disk
 REAL_LEAVE_JOB_WORKSPACE = hook.leave_job_workspace
@@ -3774,6 +3777,52 @@ class HookTest(unittest.TestCase):
                     self.finish("sr")
         self.assertTrue(hook.probe(self.dir / "capacity" / f"{hook.SIM_TOKEN}.token"), "released with the job")
 
+    def test_the_small_runner_admits_only_the_small_jobs(self) -> None:
+        """SMALL_ONLY: a small runner's listener holds only for the small jobs' disk peak (8 GiB), so a fast tier or any
+        other job routed to its label could run out of disk there. job-started refuses it at once, before it writes,
+        and the rescue re-places it; a small job is admitted."""
+        self.fleet()
+
+        def ref(workflow: str, repo: str = "manaflow-ai/cmux") -> dict[str, str]:
+            return {"GITHUB_WORKFLOW_REF": f"{repo}/.github/workflows/{workflow}@refs/heads/feat-cmux-next"}
+
+        refused = (("fast-tier", self.FAST_TIER), ("generated-files", self.FAST_TIER),
+                   ("size", ref("cmux-next.yml")),  # a small job's name in another workflow is not that job
+                   ("compile", ref("pr-checks.yml")),
+                   # a reusable workflow's job is keyed by its caller: the called file never matches
+                   ("comment", ref("pr-red-checks-comment.yml")), ("guard-status", ref("ci-guards.yml")),
+                   ("comment", ref("gallery-advisory.yml")))
+        for job, env in refused:
+            with self.subTest(job=job, env=env):
+                try:
+                    started = self.job(job, "sm", 14, None, "--small-runner", env=env)
+                    self.assertEqual(started.returncode, 1, started.stdout + started.stderr)
+                    self.assertIn("refused: the small runner takes only the small jobs", started.stdout)
+                finally:
+                    self.finish("sm")
+        for job, env in (("size", ref("pr-checks.yml")), ("guard-status", ref("cmux-next-guards.yml")),
+                         ("web-validation", ref("web-validation.yml")), ("comment", ref("cmux-next.yml")),
+                         ("comment", ref("ci.yml"))):
+            with self.subTest(job=job):
+                try:
+                    ok = self.job(job, "sm", 14, None, "--small-runner", env=env)
+                    self.assertEqual(ok.returncode, 0, ok.stdout + ok.stderr)
+                finally:
+                    self.finish("sm")
+
+    def test_the_small_jobs_are_the_coordinators_list(self) -> None:
+        """SMALL_JOBS is exactly the jobs measured at 5 GiB or less run alone (2026-11-16); adding one needs a new
+        measurement, so this list changes only with SMALL_JOB_PEAK_GIB's comment."""
+        self.assertEqual(hook.SMALL_JOBS, {
+            "pr-checks.yml/size", "web-validation.yml/web-validation", "ci.yml/comment", "cmux-next.yml/comment",
+            "cmux-next-guards.yml/comment", "ci.yml/guard-status", "cmux-next-guards.yml/guard-status",
+            "cmux-next-dev-daily.yml/verify",
+            "manaflow-ai/cmuxterm-hq/synthetic-probes.yml/routes"})
+        self.assertEqual(hook.SMALL_JOB_DISK_GIB, 8.0)
+        self.assertTrue(hook.small_job("routes", "manaflow-ai/cmuxterm-hq", "manaflow-ai/cmux", "synthetic-probes.yml"))
+        self.assertFalse(hook.small_job("routes", "manaflow-ai/cmux", "manaflow-ai/cmux", "synthetic-probes.yml"))
+        self.assertFalse(hook.small_job("fast-tier", "manaflow-ai/cmux", "manaflow-ai/cmux", "cmux-next.yml"))
+
     def test_a_gateway_job_runs_on_a_gateway_token_with_every_unit_taken(self) -> None:
         """2026-10-30 12:43Z: every std mini at 76-100% CPU and units, so no thin cmux-ci client could start. On a
         gateway runner such a client takes one gateway token and no shared unit, so a full mini still admits it;
@@ -4433,6 +4482,74 @@ class HookTest(unittest.TestCase):
             for runner in ("r0", "s0", "s1", "s2"):
                 self.finish(runner)
         self.assertTrue(self.lock_free())
+
+    def test_launch_smokes_light_jobs_run_beside_a_compile(self) -> None:
+        """nightly-next-launch-smoke.yml's pick (reads the feed and the workflow's runs with the job token), record
+        (writes a marker and saves it to the cache) and crashed (a rollback dispatch and an issue) build nothing on
+        the nightly slot. As unknown jobs they were compiles: cmux run 44021676892's pick was refused with "is in no
+        job table of this hook, so it is costed as a compile: 5 units" and 4 of 14 units free."""
+        self.fleet()
+        name = "nightly-next-launch-smoke.yml"
+        ref = {"GITHUB_WORKFLOW_REF": f"manaflow-ai/cmux/.github/workflows/{name}@refs/heads/main"}
+        runners = ["r0"]
+        try:
+            compile_ = self.job("macos-compile-admission", "r0", 14, None, env={
+                "GITHUB_WORKFLOW_REF": "manaflow-ai/cmux/.github/workflows/ci.yml@refs/heads/main"})
+            self.assertIn("holding 5/14 units+persistent-dd+root-1 for macos-compile-admission (", compile_.stdout)
+            for index, job in enumerate(("pick", "record", "crashed")):
+                with self.subTest(job=job):
+                    self.assertEqual(hook.job_class(job, "manaflow-ai/cmux", workflow=name), ("light", False))
+                    runners.append(f"s{index}")
+                    done = self.job(job, runners[-1], 14, None, env=ref)
+                    self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+                    self.assertIn(f"for {job} (light", done.stdout)
+                    self.assertNotIn("is in no job table", done.stdout)
+        finally:
+            for runner in runners:
+                self.finish(runner)
+        self.assertTrue(self.lock_free())
+
+    def test_canarys_light_jobs_run_beside_a_compile(self) -> None:
+        """nightly-next-canary.yml's pick (reads the feed and the verdict cache with the job token), verdict (writes
+        the verdict and dispatches nightly-next-verdict.yml) and failed (a rollback dispatch and an issue) build
+        nothing on the nightly slot. As unknown jobs they were compiles: every scheduled canary from about 09:37Z on
+        2026-11-17 ended cancelled, cmux run 44067455848's pick refused after 300 s with "4 of 14 units free, pick
+        (compile) needs 5"."""
+        self.fleet()
+        name = "nightly-next-canary.yml"
+        ref = {"GITHUB_WORKFLOW_REF": f"manaflow-ai/cmux/.github/workflows/{name}@refs/heads/main"}
+        runners = ["r0"]
+        try:
+            compile_ = self.job("macos-compile-admission", "r0", 14, None, env={
+                "GITHUB_WORKFLOW_REF": "manaflow-ai/cmux/.github/workflows/ci.yml@refs/heads/main"})
+            self.assertIn("holding 5/14 units+persistent-dd+root-1 for macos-compile-admission (", compile_.stdout)
+            for index, job in enumerate(("pick", "verdict", "failed")):
+                with self.subTest(job=job):
+                    self.assertEqual(hook.job_class(job, "manaflow-ai/cmux", workflow=name), ("light", False))
+                    runners.append(f"s{index}")
+                    done = self.job(job, runners[-1], 14, None, env=ref)
+                    self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+                    self.assertIn(f"for {job} (light", done.stdout)
+                    self.assertNotIn("is in no job table", done.stdout)
+        finally:
+            for runner in runners:
+                self.finish(runner)
+        self.assertTrue(self.lock_free())
+
+    def test_a_nightly_verify_workflows_unlisted_job_is_light(self) -> None:
+        """NIGHTLY_VERIFY_WORKFLOWS check a published DMG and build nothing, and their jobs rank as nightly jobs that
+        wait 300 s at most. A job one of them adds that no table lists is light, not a compile (5 units, persistent-dd
+        and a root): the canary's pick, then its verdict and failed, were each refused that way after the launch
+        smoke's pick (#2062). A listed job keeps its row (the canary itself is isolated)."""
+        for name in hook.NIGHTLY_VERIFY_WORKFLOWS:
+            with self.subTest(workflow=name):
+                self.assertEqual(hook.job_class("a-job-added-later", "manaflow-ai/cmux", workflow=name),
+                                 ("light", False))
+        self.assertEqual(hook.job_class("canary", "manaflow-ai/cmux", workflow="nightly-next-canary.yml"),
+                         ("isolated", False))
+        # any other workflow's unlisted job stays the compile it was
+        self.assertEqual(hook.job_class("a-job-added-later", "manaflow-ai/cmux", workflow="ci.yml"),
+                         ("compile", True))
 
     def test_capacity_a_job_cost_override_keeps_its_class_tokens(self) -> None:
         """cli-regressions is an unknown job (a compile, pinned to root 1) that measures 0.16 cores: it costs 1 core
@@ -8394,6 +8511,232 @@ class IdleLeftoverSweepTest(unittest.TestCase):
         self.assertIn("leftover sweep failed", log.call_args[0][0])
 
 
+class HostLoadCapTest(unittest.TestCase):
+    """cmuxterm-hq#12331's host load cap at the listener (HOST_LOAD_CAP). 2026-11-16 23:5xZ: cmux21 ran at 6.4x its
+    cores and cmux22 at 5.5x while other Macs idled, because GitHub jobs reach a mini through this gate, which had no
+    such cap. A side or root listener on a host whose mean load1 per core over 2 min is above 1.5 takes no new job
+    while another host's listener keeps up with its label (the controller's workflow_job feed); it only defers."""
+
+    LABEL = "glaeda-side-std-xcode-26.6"
+    NOW = 1_800_000_000.0
+
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.tmp = Path(tmp.name)
+        self.runner = self.tmp / "actions-runner-glaeda-2"
+        self.runner.mkdir()
+        (self.runner / ".runner").write_text(json.dumps({"agentName": "cmux21-glaeda-2"}))
+        self.state = self.tmp / "state"
+        (self.state / "instance-2").mkdir(parents=True)
+        (self.state / "instance-2" / "receipt.json").write_text(json.dumps({"registration": {
+            "name": "cmux21-glaeda-2", "labels": ["glaeda-mini", self.LABEL]}}))
+        self.load = [14 * 3.0]
+        self.jobs: list[dict] = []
+        self.fetches = 0
+        for name, value in (("GATE_CPU_EVERY_S", 0.0), ("GATE_SETTINGS_EVERY_S", 0.0),
+                            ("HOST_LOAD_CAP_MIN_SPAN_S", 0.0), ("HOST_LOAD_CAP_FEED_EVERY_S", 0.0)):
+            patcher = mock.patch.object(hook, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        for name, fake in (("load_1min", lambda: self.load[0]), ("gate_host", lambda: "cmux21"),
+                           ("load_cap_fetch", self.fetch), ("gate_log", lambda line: None)):
+            patcher = mock.patch.object(hook, name, side_effect=fake)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        for patcher in (mock.patch.object(hook.os, "cpu_count", return_value=14),
+                        mock.patch.dict(os.environ, {"CMUX_CI_HOST_LOAD_CAP": ""})):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.gate = hook.Gate(self.runner, os.fspath(self.tmp / "host.lock"), os.fspath(self.tmp / "none.json"),
+                              self.state)
+        self.addCleanup(self.join)  # before the temporary directory goes
+
+    def stamp(self, ago: float) -> str:
+        return datetime.datetime.fromtimestamp(time.time() - ago, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    def fetch(self, now: float) -> dict | None:
+        self.fetches += 1
+        return hook.load_cap_summary({"receiver_last_delivery": self.stamp(5), "jobs": self.jobs}, now)
+
+    def job(self, status: str, runner: str | None = None, ago: float = 10.0, labels: list[str] | None = None,
+            workflow: str = "cmux-next", branch: str = "lane/x") -> dict:
+        return {"status": status, "labels": labels or [self.LABEL], "runner": runner, "created_at": self.stamp(ago),
+                "workflow": workflow, "head_branch": branch, "name": "cmux app scheme compile (Release)"}
+
+    def poll(self) -> str | None:
+        """Three looks: two reads make a mean, the first over the cap starts the feed read (waited for), the last
+        decides with it."""
+        for _ in range(2):
+            self.gate.load_capped()
+            self.join()
+        return self.gate.load_capped()
+
+    def join(self) -> None:
+        if self.gate.cap_thread is not None:
+            self.gate.cap_thread.join(5)
+
+    def test_the_cap_and_its_off_switch(self) -> None:
+        now = self.NOW
+        self.assertEqual(hook.host_load_cap(None, "x", now, raw=""), 1.5, "the controller's default")
+        for raw, cap in (("off", 0.0), ("0", 0.0), ("2.5", 2.5), ("junk", 1.5), ("-1", 1.5), ("nan", 1.5)):
+            self.assertEqual(hook.host_load_cap(None, "x", now, raw=raw), cap, raw)
+        later = datetime.datetime.fromtimestamp(now + 60, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        doc = {"defaults": {"hostLoadCap": 2}, "hosts": {"off": {"hostLoadCap": False, "until": later},
+                                                          "bad": {"hostLoadCap": "x"}}}
+        self.assertEqual(hook.host_load_cap(doc, "x", now, raw=""), 2.0, "runner-gate.json's default")
+        self.assertEqual(hook.host_load_cap(doc, "off", now, raw=""), 0.0, "a live host entry")
+        self.assertEqual(hook.host_load_cap(doc, "off", now + 120, raw=""), 2.0, "a lapsed entry is ignored")
+        self.assertEqual(hook.host_load_cap(doc, "bad", now, raw=""), 2.0)
+        self.assertEqual(hook.host_load_cap(doc, "off", now, raw="1.5"), 1.5, "the environment wins")
+        declared = json.loads((ROOT / "config" / "runner-gate.json").read_text())
+        self.assertEqual(hook.host_load_cap(declared, "cmux21", now, raw=""), 1.5, "the declared cap")
+
+    def test_the_mean_needs_two_minutes_of_reads(self) -> None:
+        with mock.patch.object(hook, "HOST_LOAD_CAP_MIN_SPAN_S", 30.0):
+            self.assertIsNone(hook.mean_load_per_core([(100.0, 42.0)], 14, 100.0), "one read is not a mean")
+            self.assertIsNone(hook.mean_load_per_core([(90.0, 42.0), (100.0, 42.0)], 14, 100.0), "10 s is not either")
+            self.assertEqual(hook.mean_load_per_core([(0.0, 28.0), (60.0, 14.0), (100.0, 42.0)], 14, 100.0), 2.0)
+            self.assertEqual(hook.mean_load_per_core([(-50.0, 999.0), (60.0, 14.0), (100.0, 42.0)], 14, 100.0), 2.0,
+                             "reads older than the window drop out")
+            self.assertIsNone(hook.mean_load_per_core([(60.0, 14.0), (100.0, 42.0)], None, 100.0))
+
+    def test_the_verdict(self) -> None:
+        labels, now = frozenset({"glaeda-mini", self.LABEL}), time.time()
+
+        def verdict(*jobs: dict, delivery: float = 5.0) -> str | None:
+            doc = {"receiver_last_delivery": self.stamp(delivery), "jobs": list(jobs)}
+            return hook.load_cap_verdict(hook.load_cap_summary(doc, now), labels, "cmux21", now)
+
+        elsewhere = self.job("in_progress", "cmux20-glaeda-1")
+        self.assertIn(self.LABEL, verdict(elsewhere) or "", "cmux20 serves the label and nothing waits: hold")
+        self.assertIsNotNone(verdict(self.job("completed", "cmux20-glaeda-1")), "a job done there lately counts")
+        self.assertIsNotNone(verdict(elsewhere, self.job("queued", ago=30)), "a job queued 30 s is being taken")
+        self.assertIsNone(verdict(elsewhere, self.job("queued", ago=hook.HOST_LOAD_CAP_GRACE_S)),
+                          "a job that waited the grace found no idle listener: listen")
+        self.assertIsNotNone(verdict(elsewhere, self.job("queued", ago=hook.HOST_LOAD_CAP_JOB_MAX_AGE_S + 1)),
+                             "a job queued for hours is a lost delivery")
+        self.assertIsNone(verdict(elsewhere, self.job("queued", ago=1, workflow="nightly-next")), "urgent: listen")
+        self.assertIsNone(verdict(elsewhere, self.job("queued", ago=1, branch="promote/next")), "urgent: listen")
+        self.assertIsNotNone(verdict(elsewhere, self.job("queued", ago=1)),
+                             "a job named (Release) is a PR job, not urgent")
+        pinned = [self.LABEL, "glaeda-host-cmux21"]
+        self.assertIsNone(hook.load_cap_verdict(hook.load_cap_summary(
+            {"receiver_last_delivery": self.stamp(5), "jobs": [elsewhere, self.job("queued", ago=1, labels=pinned)]},
+            now), labels | {"glaeda-host-cmux21"}, "cmux21", now), "a job pinned to this host: listen")
+        self.assertIsNotNone(hook.load_cap_verdict(hook.load_cap_summary(
+            {"receiver_last_delivery": self.stamp(5), "jobs": [elsewhere, self.job("queued", ago=1, labels=pinned)]},
+            now), labels | {"glaeda-host-cmux21"}, "cmux2", now), "cmux2 is not named by glaeda-host-cmux21")
+        self.assertIsNotNone(verdict(elsewhere, self.job("queued", ago=999, labels=["glaeda-gateway-xcode-26.6"])),
+                             "a job this runner cannot take is not its queue")
+        self.assertIsNone(verdict(self.job("in_progress", "cmux21-glaeda-3")), "only this host serves it: listen")
+        self.assertIsNone(verdict(self.job("in_progress", "blacksmith-6vcpu-macos-26-x")), "no glaeda host elsewhere")
+        self.assertIsNone(verdict(elsewhere, delivery=hook.HOST_LOAD_CAP_FEED_STALE_S + 60), "a stale feed: listen")
+        self.assertIsNone(hook.load_cap_verdict(None, labels, "cmux21", now), "no feed: listen")
+        self.assertIsNone(hook.load_cap_verdict(hook.load_cap_summary({"receiver_last_delivery": self.stamp(5),
+                                                                       "jobs": [elsewhere]}, now), None, "cmux21", now),
+                          "unknown labels: listen")
+        self.assertIsNone(hook.load_cap_summary({"jobs": "no"}, now))
+        self.assertEqual(hook.runner_host("cmux10s-mac-mini-glaeda-3"), "cmux10s-mac-mini")
+        self.assertEqual(hook.runner_host("cmux7s-mac-mini-glaeda"), "cmux7s-mac-mini")
+        self.assertIsNone(hook.runner_host("GitHub Actions 1001030217"))
+
+    def test_an_over_cap_side_listener_defers_while_another_host_keeps_up(self) -> None:
+        self.jobs = [self.job("in_progress", "cmux20-glaeda-1")]
+        why = self.poll()
+        self.assertTrue(why and why.startswith(hook.LOAD_CAPPED) and "1.5 per core" in why, why)
+        self.assertEqual(self.gate.claimed(), why, "claimed() holds the listener off for it")
+        self.assertEqual(self.gate.confirmed(), why, "and the last look before a stop agrees")
+        self.assertTrue((self.state / hook.HOST_LOAD_CAP_FEED_FILE).exists(), "one read serves every gate here")
+
+        self.jobs.append(self.job("queued", ago=hook.HOST_LOAD_CAP_GRACE_S + 5))
+        self.assertIsNone(self.poll(), "a job waits with no idle listener anywhere: it runs here, slower")
+        self.jobs.pop()
+        self.assertIsNotNone(self.poll())
+
+        self.load[0] = 14 * 1.0
+        self.gate.cap_samples.clear()
+        self.assertIsNone(self.poll(), "under the cap it listens")
+        self.load[0] = 14 * 3.0
+
+        self.gate.cap_samples.clear()
+        with mock.patch.object(hook, "load_cap_fetch", return_value=None):
+            self.assertIsNone(self.poll(), "an unreachable controller holds nothing")
+
+    def test_exempt_runners_and_the_off_switch(self) -> None:
+        self.jobs = [self.job("in_progress", "cmux20-glaeda-1")]
+        self.assertIsNotNone(self.poll())
+        for scope in (hook.RunnerScope(gateway=True), hook.RunnerScope(nightly=True), hook.RunnerScope(gui=True),
+                      hook.RunnerScope(session=True), hook.RunnerScope(fresh=True)):
+            with mock.patch.object(hook, "runner_scope", return_value=scope):
+                self.assertIsNone(self.gate.load_capped(), scope)
+        with mock.patch.dict(os.environ, {"CMUX_CI_HOST_LOAD_CAP": "off"}):
+            self.assertIsNone(self.poll(), "CMUX_CI_HOST_LOAD_CAP=off turns it off")
+        self.assertIsNotNone(self.poll(), "and back on")
+
+    IOS_SIM_JOB = ["glaeda-std-xcode-26.6", hook.IOS_SIM_RUNNER_LABEL]
+
+    def side_gate(self, held: int, labels: list[str]) -> hook.Gate:
+        """A plain side runner (listen.sh --fit-units 3) on a 14-unit simulator mini with `held` units taken, its
+        receipt registering `labels`; another runner on the mini carries glaeda-ios-sim, so the mini is a simulator
+        host either way."""
+        (self.state / "instance-2" / "receipt.json").write_text(json.dumps({"registration": {
+            "name": "cmux21-glaeda-2", "labels": labels}}))
+        (self.state / "instance-4").mkdir(exist_ok=True)
+        (self.state / "instance-4" / "receipt.json").write_text(json.dumps({"registration": {
+            "name": "cmux21-glaeda-4", "labels": ["glaeda-mini", "glaeda-std-xcode-26.6", hook.IOS_SIM_RUNNER_LABEL]}}))
+        (self.runner / hook.RUNNER_HOOK_SCRIPT).parent.mkdir(exist_ok=True)
+        (self.runner / hook.RUNNER_HOOK_SCRIPT).write_text(
+            "exec python3 /hook job-started --capacity-units 14 --canonical-roots 2 --instance 3\n")
+        (self.runner / hook.LISTEN_SCRIPT).write_text(f"listen --runner-dir {self.runner} --fit-units 3 &\n")
+        capacity = Path(tempfile.mkdtemp(dir=self.tmp))
+        (capacity / "admission.lock").touch()
+        for slot in range(held):
+            fd = os.open(capacity / f"unit-{slot}", os.O_RDONLY | os.O_CREAT, 0o644)
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.addCleanup(os.close, fd)
+        self.join()
+        self.gate = hook.Gate(self.runner, os.fspath(self.tmp / "host.lock"), os.fspath(self.tmp / "none.json"),
+                              self.state, capacity_dir=capacity)
+        return self.gate
+
+    def full(self, gate: hook.Gate) -> str | None:
+        """The first look starts the feed read (waited for), the next decides with it."""
+        gate.full(fresh=True)
+        self.join()
+        why = gate.full(fresh=True)
+        gate.unclaim()
+        return why
+
+    def test_a_busy_simulator_mini_listens_on_its_ios_sim_runner_while_an_ios_sim_job_queues(self) -> None:
+        # 2026-11-17: cmux's ios-simulator-build jobs (3 units) queued for hours while cmuxs-mac-mini-6 had 4 and
+        # mini-3 had 3 of 14 units free: "its next job needs 5", the side label's costliest job (IOS_SIM_OWN_FIT)
+        side = ["glaeda-mini", "glaeda-side-std-xcode-26.6", "glaeda-std-xcode-26.6"]
+        ios_sim = [*side, hook.IOS_SIM_RUNNER_LABEL]
+        self.jobs = [self.job("in_progress", "cmux20-glaeda-1")]
+        for held in (10, 11):
+            free = 14 - held
+            needs5 = f"only {free} of 14 capacity units on this mini are free; its next job needs 5"
+            self.assertEqual(self.full(self.side_gate(held, ios_sim)), needs5, "no ios-sim job queued: it holds")
+            self.jobs.append(self.job("queued", labels=self.IOS_SIM_JOB, ago=4 * 3600))
+            self.assertIsNone(self.full(self.side_gate(held, ios_sim)),
+                              f"{free} free and an ios-sim job queued: its ios-sim runner listens at its own 3")
+            self.assertEqual(self.full(self.side_gate(held, side)), needs5,
+                             "a side runner without glaeda-ios-sim still holds for the side need")
+            with mock.patch.object(hook, "load_cap_fetch", return_value=None):
+                self.assertEqual(self.full(self.side_gate(held, ios_sim)), needs5,
+                                 "an unreadable feed keeps today's rule")
+            self.jobs[-1] = self.job("queued", labels=["glaeda-std-xcode-26.6", "glaeda-ios-sim", "glaeda-other"])
+            self.assertEqual(self.full(self.side_gate(held, ios_sim)), needs5, "a job it could not take holds")
+            self.jobs[-1] = self.job("in_progress", "cmux20-glaeda-1", labels=self.IOS_SIM_JOB)
+            self.assertEqual(self.full(self.side_gate(held, ios_sim)), needs5, "a running ios-sim job is not queued")
+            self.jobs.pop()
+        self.jobs.append(self.job("queued", labels=self.IOS_SIM_JOB))
+        self.assertEqual(self.full(self.side_gate(12, ios_sim)),
+                         "only 2 of 14 capacity units on this mini are free; its next job needs 3",
+                         "it still needs room for its own job")
+
+
 class GateOffTheTailnet(unittest.TestCase):
     """2026-11-11: a CI mini was off the tailnet for 4+ h and its runners kept taking build-fleet compile
     jobs, each failing after 300 s with "controller unreachable" (three PRs in an hour). The gate holds the
@@ -10118,6 +10461,42 @@ class GateTest(unittest.TestCase):
             self.assertIsNone(gate.low_disk(), "between one job's peak and the floor it only warns")
             self.assertIsNone(gate.claimed())
 
+    def test_a_small_runner_listens_under_the_heavy_peak_and_a_side_runner_waits(self) -> None:
+        """SMALL_ONLY: at 12 GiB free (under the 20 GiB heavy peak, over the small jobs' 8 GiB) a small runner keeps
+        listening while a plain side runner on the same mini is held (DISK_SHORT_HOLD): its label also brings the fast
+        tier. Under 8 GiB the small runner is held too. Nothing is refused for disk: a held listener only waits."""
+        side = self.runner
+        small = self.runner.parent / "actions-runner-glaeda-9"
+        write_hook(side, "exec python3 /hook job-started --min-free-gib 30 --capacity-units 14\n")
+        write_hook(small, "exec python3 /hook job-started --min-free-gib 30 --capacity-units 14 --small-runner\n")
+        self.assertTrue(hook.runner_scope(small).small)
+        self.assertFalse(hook.runner_scope(small).root, "a small runner is never a root runner")
+        self.assertFalse(hook.runner_scope(side).small)
+        free = {"gib": 16.0}
+        usage = lambda _path: mock.Mock(free=int(free["gib"] * 1024**3))  # noqa: E731
+        with mock.patch.object(hook.shutil, "disk_usage", side_effect=usage), \
+                mock.patch.object(hook, "processes", return_value={}), \
+                mock.patch.dict(os.environ, {hook.DISK_JOB_PEAK_ENV: "20"}):
+            side_gate = hook.Gate(side, os.fspath(self.lock), os.fspath(self.tmp / "none.json"), self.state)
+            small_gate = hook.Gate(small, os.fspath(self.lock), os.fspath(self.tmp / "none.json"), self.state)
+            with mock.patch.object(side_gate, "evict_in_background"), \
+                    mock.patch.object(small_gate, "evict_in_background") as cleanup:
+                why = side_gate.low_disk()
+                self.assertIn("DISK_SHORT_HOLD", why or "", "the heavy label still waits at 16 GiB")
+                self.assertIn("16.0 GiB free, 20 GiB required", why or "")
+                self.assertIsNone(small_gate.low_disk(), "the small label admits at 16 GiB with nothing in flight")
+                free["gib"] = 12.0
+                why = small_gate.low_disk()
+                self.assertIn("RUNNER_JOBS_DISK", why or "", "10 GiB + 5.3 GiB for its own job is not free at 12")
+                free["gib"] = 7.5
+                why = small_gate.low_disk()
+                self.assertIn("DISK_SHORT_HOLD", why or "")
+                self.assertIn("7.5 GiB free, 8 GiB required", why or "")
+                self.assertIn("small jobs' measured peak", why or "")
+                self.assertEqual(cleanup.call_args.args[1], 30.0, "cleanup still aims at the floor")
+        self.assertEqual(hook.side_fit_units(hook.runner_scope(small)), 1,
+                         "a small runner never waits for room for the fast tier's units")
+
     def test_a_pool_runner_over_its_floor_but_under_one_jobs_peak_is_held(self) -> None:
         """The peak is checked on its own, not only under the floor: --min-free-gib 30 with a 40 GiB peak at 35 GiB
         free holds the idle listener and requests cleanup to the peak."""
@@ -10137,6 +10516,145 @@ class GateTest(unittest.TestCase):
             cleanup.reset_mock()
             self.assertIsNone(gate.low_disk(), "over both the peak and the floor: listening, no cleanup")
             cleanup.assert_not_called()
+
+    def runner_job_disk_file(self, p95: float) -> Path:
+        path = self.tmp / "runner-job-disk.json"
+        path.write_text(json.dumps({"schema": hook.RUNNER_JOB_DISK_SCHEMA, "disk_gib_p95": p95, "disk_n": 11438,
+                                    "window": {"from": "2026-11-02", "to": "2026-11-15"}}))
+        return path
+
+    def workers(self, *runners: str) -> dict[int, tuple[int, str]]:
+        """A process table with a Runner.Worker of each named runner install beside self.runner, plus noise that is no
+        job of this host's runners: a listener, and a Worker of a runner install outside this home."""
+        # a runner that updated itself runs its Worker from bin.<version>/
+        table = {100 + i: (1, f"{self.tmp}/{name}/bin{'.2.329.0' if i % 2 else ''}/Runner.Worker spawnclient 1 2")
+                 for i, name in enumerate(runners)}
+        table[90] = (1, f"{self.tmp}/actions-runner-glaeda-2/bin/Runner.Listener run --startuptype service")
+        table[91] = (1, "/home/runner/actions-runner/cached/bin/Runner.Worker spawnclient 3 4")
+        return table
+
+    def test_an_idle_runner_counts_the_jobs_in_flight_before_it_takes_one(self) -> None:
+        """RUNNER_JOBS_DISK (coordinator, 2026-11-17: "Admit a runner job only if 10 GiB + 5.3 GiB per job in flight
+        (from hq build-fleet/runner-job-disk.json) stays free"). Over one job's peak (DISK_SHORT_HOLD lets it listen),
+        an idle pool runner beside two running jobs is held until 10 + 5.3 x 3 = 25.9 GiB is free; the value per job
+        is the file's, and a held listener only waits: job-started is not involved."""
+        write_hook(self.runner, "exec python3 /hook job-started --min-free-gib 30 --capacity-units 14\n")
+        for name in ("actions-runner-glaeda-2", "actions-runner-glaeda-3", "actions-runner-glaeda-4"):
+            (self.tmp / name).mkdir()
+        disk = self.runner_job_disk_file(5.3)
+        gate = hook.Gate(self.runner, os.fspath(self.lock), os.fspath(self.tmp / "none.json"), self.state)
+        free = {"gib": 25.0}
+        table = {"now": self.workers("actions-runner-glaeda-2", "actions-runner-glaeda-3", self.runner.name)}
+        usage = lambda _path: mock.Mock(free=int(free["gib"] * 1024**3))  # noqa: E731
+        with mock.patch.object(hook.shutil, "disk_usage", side_effect=usage), \
+                mock.patch.object(hook, "processes", side_effect=lambda: table["now"]) as ps, \
+                mock.patch.object(gate, "evict_in_background") as cleanup, \
+                mock.patch.dict(os.environ, {hook.DISK_JOB_PEAK_ENV: "20", hook.RUNNER_JOB_DISK_ENV: os.fspath(disk)}):
+            why = gate.low_disk()
+            self.assertIn("RUNNER_JOBS_DISK", why or "", "two jobs in flight (its own Worker and others' are not)")
+            self.assertIn("25.0 GiB free, 25.9 GiB required: 10 GiB + 5.3 GiB for each of 2 runner jobs in flight "
+                          "(or listening first) and this one", why or "")
+            self.assertIn("the p95 of 11438 jobs, 2026-11-02..2026-11-15", why or "")
+            self.assertEqual(cleanup.call_args.args[1], 30.0, "cleanup aims at the floor, over the need")
+            self.assertIn("RUNNER_JOBS_DISK", gate.claimed() or "", "an idle look holds the listener")
+            free["gib"] = 26.0
+            self.assertIsNone(gate.low_disk(), "room for both jobs in flight and the next one: listening")
+            free["gib"] = 21.0
+            table["now"] = self.workers("actions-runner-glaeda-2")
+            self.assertIsNone(gate.low_disk(), "one job in flight: 20.6 GiB is enough")
+            table["now"] = self.workers("actions-runner-glaeda-2", "actions-runner-glaeda-3")
+            self.assertIn("21.0 GiB free, 25.9 GiB required", gate.low_disk() or "", "a second one starts")
+            disk.write_text(disk.read_text().replace("5.3", "4.0"))
+            free["gib"] = 22.5
+            self.assertIsNone(gate.low_disk(), "the value is the file's: 10 + 4 x 3 = 22, not 25.9")
+            free["gib"] = 21.5
+            self.assertIn("21.5 GiB free, 22 GiB required", gate.low_disk() or "")
+            ps.reset_mock()
+            free["gib"] = 100.0
+            self.assertIsNone(gate.low_disk())
+            ps.assert_not_called()  # every runner install busy would still fit: no process table read
+            free["gib"] = 21.5
+            disk.unlink()
+            self.assertIsNone(gate.low_disk(), "no measured value: no guess, the one-job hold alone")
+            disk = self.runner_job_disk_file(5.3)
+            ps.side_effect = subprocess.TimeoutExpired("ps", 30)
+            self.assertIsNone(gate.low_disk(), "no process table: the one-job hold alone")
+
+    def test_a_burst_at_several_idle_listeners_is_admitted_only_while_it_fits(self) -> None:
+        """Every idle listener counts the idle listeners that sort before it, so three idle runners at 26 GiB with
+        nothing running take at most two jobs together (10 + 5.3 x 2 = 20.6 fits, 10 + 5.3 x 3 = 25.9 does not)."""
+        names = ["actions-runner-glaeda-1", "actions-runner-glaeda-2", "actions-runner-glaeda-3"]
+        for name in names:
+            write_hook(self.tmp / name, "exec python3 /hook job-started --min-free-gib 30 --capacity-units 14\n")
+        disk = self.runner_job_disk_file(5.3)
+        table = {200 + i: (1, f"{self.tmp}/{name}/bin/Runner.Listener run --startuptype service")
+                 for i, name in enumerate(names)}
+        answers = {}
+        with mock.patch.object(hook.shutil, "disk_usage", return_value=mock.Mock(free=int(25.0 * 1024**3))), \
+                mock.patch.object(hook, "processes", return_value=table), \
+                mock.patch.dict(os.environ, {hook.DISK_JOB_PEAK_ENV: "20", hook.RUNNER_JOB_DISK_ENV: os.fspath(disk)}):
+            for name in names:
+                gate = hook.Gate(self.tmp / name, os.fspath(self.lock), os.fspath(self.tmp / "none.json"), self.state)
+                with mock.patch.object(gate, "evict_in_background"):
+                    answers[name] = gate.low_disk()
+        self.assertIsNone(answers[names[0]], "the first counts nobody before it: 15.3 GiB")
+        self.assertIsNone(answers[names[1]], "the second counts the first: 20.6 GiB")
+        self.assertIn("25.9 GiB required", answers[names[2]] or "", "the third would not fit beside them")
+
+    def test_an_installed_hook_reads_the_staged_runner_job_disk(self) -> None:
+        """The hook runs from ~/actions-runner-glaeda-K/glaeda-hooks/; the json is the staged runner copy in
+        ~/glaeda-runner/scripts."""
+        hooks = self.tmp / "actions-runner-glaeda-2/glaeda-hooks"
+        hooks.mkdir(parents=True)
+        staged = self.tmp / "glaeda-runner/scripts" / hook.RUNNER_JOB_DISK_NAME
+        staged.parent.mkdir(parents=True)
+        staged.write_text("{}")
+        with mock.patch.dict(hook.__dict__, {"__file__": os.fspath(hooks / "glaeda-cmux-runner-hook")}), \
+                mock.patch.dict(os.environ, {hook.RUNNER_JOB_DISK_ENV: ""}):
+            self.assertEqual(hook.staged_data_path(hook.RUNNER_JOB_DISK_NAME, hook.RUNNER_JOB_DISK_ENV), staged)
+
+    def test_the_jobs_in_flight_hold_never_stops_a_running_job(self) -> None:
+        """Busy, never failed: a runner with a job keeps it whatever the jobs beside it leave free."""
+        write_hook(self.runner, "exec python3 /hook job-started --min-free-gib 30 --capacity-units 5\n")
+        (self.tmp / "actions-runner-glaeda-2").mkdir()
+        disk = self.runner_job_disk_file(5.3)
+        with mock.patch.object(hook.shutil, "disk_usage", return_value=mock.Mock(free=21 * 1024**3)), \
+                mock.patch.object(hook, "processes", return_value=self.workers("actions-runner-glaeda-2")), \
+                mock.patch.dict(os.environ, {hook.DISK_JOB_PEAK_ENV: "20", hook.RUNNER_JOB_DISK_ENV: os.fspath(disk)}):
+            gate, stops = self.gate([None] * 3, busy=[True])
+            gate.worker_pids = lambda: [4242]
+            with mock.patch.object(gate, "evict_in_background"):
+                gate.step()
+                self.assertEqual(stops, [], "a runner with a job is never stopped for disk")
+                self.assertFalse(gate.freeze_at_exit, "a disk reading must not arm JOB_END_FREEZE")
+
+    def test_the_shipped_runner_job_disk_is_hqs_measurement(self) -> None:
+        """The per-job value is read from the shipped copy of cmuxterm-hq build-fleet/runner-job-disk.json, staged with
+        the runner files. With GLAEDA_HQ_CHECKOUT set to an HQ checkout, the copy must equal HQ's bytes."""
+        shipped = ROOT / "scripts" / hook.RUNNER_JOB_DISK_NAME
+        doc = json.loads(shipped.read_text())
+        self.assertEqual(doc["schema"], hook.RUNNER_JOB_DISK_SCHEMA)
+        value, source = hook.runner_job_disk(shipped)
+        self.assertEqual(value, doc["disk_gib_p95"])
+        self.assertIn(f"the p95 of {doc['disk_n']} jobs", source)
+        with mock.patch.dict(os.environ, {hook.RUNNER_JOB_DISK_ENV: ""}):
+            self.assertEqual(hook.staged_data_path(hook.RUNNER_JOB_DISK_NAME, hook.RUNNER_JOB_DISK_ENV).resolve(),
+                             shipped.resolve(), "the copy beside the hook")
+        for tool, table in (("glaeda-cmux-runner-fleet", "STAGED"), ("glaeda-update", "RUNNER_FILES")):
+            listed = re.search(rf'^{table} = \((.*?)"\)', (ROOT / "scripts" / tool).read_text(), re.M | re.S)
+            self.assertIn(f'"{hook.RUNNER_JOB_DISK_NAME}', listed[1] if listed else "", f"{tool} ships it ({table})")
+        for bad in (b"{nope", json.dumps({"schema": "x", "disk_gib_p95": 5.3}).encode(),
+                    json.dumps({"schema": hook.RUNNER_JOB_DISK_SCHEMA, "disk_gib_p95": 0}).encode(),
+                    json.dumps({"schema": hook.RUNNER_JOB_DISK_SCHEMA, "disk_gib_p95": True}).encode(),
+                    json.dumps({"schema": hook.RUNNER_JOB_DISK_SCHEMA}).encode()):
+            with self.subTest(bad=bad):
+                path = self.tmp / f"bad-{len(bad)}.json"
+                path.write_bytes(bad)
+                self.assertIsNone(hook.runner_job_disk(path)[0])
+        hq = os.environ.get("GLAEDA_HQ_CHECKOUT")
+        if hq:
+            self.assertEqual(shipped.read_bytes(), (Path(hq) / "build-fleet/runner-job-disk.json").read_bytes(),
+                             "copy HQ's build-fleet/runner-job-disk.json over scripts/" + hook.RUNNER_JOB_DISK_NAME)
 
     def test_a_disk_short_runner_never_stops_or_freezes_its_running_job(self) -> None:
         write_hook(self.runner, "exec python3 /hook job-started --min-free-gib 30 --capacity-units 5\n")
@@ -14280,6 +14798,33 @@ class RunnerTest(unittest.TestCase):
         self.assertIn(" --gateway-runner ", rerun)
         self.assertIn(" --instance 6\n", rerun)
 
+    def test_the_small_runners_come_after_the_sim_first_runner(self) -> None:
+        """SMALL_ONLY: smallRunners adds instances after the pool, gateway and sim-first runners. Each carries only the
+        small label (no pool, side, class role or simulator label, so no heavy job reaches it) and passes
+        --small-runner, and no other instance's labels or hook change."""
+        base = {"runners": 5, "capacityUnits": 14, "compileSlots": 2, "canonicalRoots": 2, "guiRunners": 1,
+                "fastRunners": 1, "gatewayRunners": 1, "simRunners": 1}
+        with mock.patch.object(cr, "ios_sim_present", return_value=True):
+            today, today_hooks = self.fast_labels(base, "small-today", ios_sim=True)
+            small, small_hooks = self.fast_labels({**base, "smallRunners": 2}, "small", ios_sim=True)
+        self.assertEqual(len(small), 9)
+        self.assertEqual((small[:7], small_hooks[:7]), (today, today_hooks), "every other instance keeps its labels")
+        for k in (7, 8):
+            self.assertEqual([l for l in small[k] if l not in cr.BASE_LABELS],
+                             ["glaeda-mini", "glaeda-class-std", "glaeda-dedicated", "xcode-26.6",
+                              "glaeda-small-xcode-26.6"])
+            self.assertIn(" --small-runner --test-keychain", small_hooks[k])
+            self.assertNotIn("--sim-runner", small_hooks[k])
+            self.assertNotIn("--gateway-runner", small_hooks[k])
+            scope = hook.runner_scope(self.fast_home / f"actions-runner-glaeda-{k}")
+            self.assertTrue(scope.small)
+            self.assertFalse(scope.root or scope.gateway or scope.sim or scope.session or scope.gui or scope.fast)
+        self.assertEqual([l.count("glaeda-small-xcode-26.6") for l in small], [0] * 7 + [1, 1])
+        member = {"runners": 5, "gatewayRunners": 1, "simRunners": 1, "smallRunners": 2}
+        self.assertEqual([cr.small_instance(member, k) for k in range(10)], [False] * 7 + [True, True, False])
+        self.assertFalse(cr.small_instance({"runners": 5, "smallRunners": 3}, 7), "never more than two")
+        self.assertEqual(cr.member_instances(member), 9)
+
     def test_the_sim_first_runner_comes_after_the_gateway_runners_on_a_simulator_mini(self) -> None:
         """SIM_FIRST: simRunners 1 adds one instance after the pool and gateway runners. It carries only the sim label
         (no pool, side, class role or glaeda-ios-sim label, so no compile reaches it), passes --sim-runner with the
@@ -16491,6 +17036,34 @@ class FleetLabelsModuleTest(unittest.TestCase):
         self.assertIn("simRunners needs a dedicated runner without trustedRef",
                       fleet_labels.member_labels(manifest, "mini-std", lambda a: True)[1])
         manifest["hosts"]["mini-std"]["overrides"] = {"runner": {"poolPrefix": "sim-"}}
+        self.assertIn("poolPrefix", fleet_labels.member_labels(manifest, "mini-std", lambda a: True)[1])
+
+    def test_small_runners_field(self) -> None:
+        manifest = json.loads(json.dumps(MANIFEST))
+        std = {"runners": 5, "capacityUnits": 5, "canonicalRoots": 2, "smallRunners": 0}
+        manifest["defaults"]["runner"] = {"classes": {"std": std}}
+        today = fleet_labels.member_labels(manifest, "mini-std", lambda app: True)[0]
+        self.assertEqual((today["smallRunners"], today["smallPools"]), (0, []))
+        std["smallRunners"] = 2
+        small = fleet_labels.member_labels(manifest, "mini-std", lambda app: True)[0]
+        self.assertEqual((small["smallRunners"], small["smallPools"]), (2, ["glaeda-small-xcode-26.6"]))
+        self.assertEqual((small["runners"], small["pools"], small["labels"], small["sidePools"]),
+                         (today["runners"], today["pools"], today["labels"], today["sidePools"]),
+                         "the pool instances, the picker's pool count, the side labels and the member labels are unchanged")
+        self.assertEqual(fleet_labels.small_label("26.6"), "glaeda-small-xcode-26.6")
+        self.assertNotIn("glaeda-small-xcode-26.6", fleet_labels.declared_pools(manifest))
+        for bad in (3, -1, True, "1"):
+            std["smallRunners"] = bad
+            self.assertIn("smallRunners must be 0 to 2",
+                          fleet_labels.member_labels(manifest, "mini-std", lambda a: True)[1])
+        std["smallRunners"] = 1
+        # the class default reaches a trusted member (the nightly signer): it gets none, never a hold out of heal
+        manifest["hosts"]["mini-std"]["overrides"] = {"runner": {"trustedRef": "refs/heads/main",
+                                                                 "trustedRepo": "manaflow-ai/cmux"}}
+        trusted, why = fleet_labels.member_labels(manifest, "mini-std", lambda a: True)
+        self.assertIsNotNone(trusted, why)
+        self.assertEqual((trusted["smallRunners"], trusted["smallPools"]), (0, []))
+        manifest["hosts"]["mini-std"]["overrides"] = {"runner": {"poolPrefix": "small-"}}
         self.assertIn("poolPrefix", fleet_labels.member_labels(manifest, "mini-std", lambda a: True)[1])
 
     def test_gateway_runners_field(self) -> None:

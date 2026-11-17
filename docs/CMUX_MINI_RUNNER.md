@@ -462,6 +462,26 @@ What `--apply` does:
        gateway runners are exempt, as they are from the CPU hold, because their labels have few
        other runners. A hold longer than `GATE_LOAD_MAX_HOLD_S` (30 min) listens anyway until the
        load falls, so no label is stranded. `false` turns the hold off, by default or per host.
+     - **Host load cap** (`HOST_LOAD_CAP`; cmuxterm-hq#12331's `CMUX_CI_HOST_LOAD_CAP` at the
+       listener). The controller's cap keeps ci-steps off a host whose mean 1-minute load per core
+       over 2 minutes is above 1.5 while a capable host is under it, but GitHub jobs reach a mini
+       through this gate: on 2026-11-16 at 23:5xZ cmux21 ran at 6.4x its cores and cmux22 at 5.5x
+       while other Macs idled. A side or root listener on a mini over the cap (the mean of the gate's
+       own `getloadavg` reads over 2 min, at least 30 s of them) takes no new job while another
+       host's listener keeps up with its label. The evidence is the build controller's
+       workflow_job feed (`/v1/github/actions?repo=manaflow-ai/cmux&recent=600` over the tailnet:
+       no GitHub quota, no token), read at most once a minute per mini in a thread and shared by
+       its gates through `load-cap-feed.json` in the state dir: another host's runner has run a job
+       whose labels this runner carries (running, or done in the last 10 min), and no job it could
+       take has waited `HOST_LOAD_CAP_GRACE_S` (120 s) for a runner. The moment one has, or a
+       nightly or promotion job (urgent) or one whose labels name this host (pinned) queues, it
+       listens, so when every capable host is over the cap the job still runs where it fits. A feed
+       that cannot be read, has had no delivery for 10 min, or shows no other host serving the
+       label holds nothing. It only defers: nothing is refused or failed. The gui, session,
+       freshness, nightly and gateway runners (which carry the measurement clients) are exempt.
+       `hostLoadCap` in `config/runner-gate.json` sets the cap (a number, `false` for off) by
+       default or per host; `CMUX_CI_HOST_LOAD_CAP` in the runner LaunchAgent's environment wins,
+       and `off` or 0 turns it off.
      - The gui runner is never held for CPU saturation (85% busy), only for memory
        pressure: its jobs come one per mini and are admitted by units like any other,
        and the CPU mark held it whenever the other lanes kept the mini busy. Nothing
@@ -737,7 +757,11 @@ a dispatch of them keeps the ordinary tier), and the Release compile that gates
 nightly-next's promotion). The canary and the smoke are `isolated` jobs (4 units, no
 token) and wait at most `NIGHTLY_CAPACITY_WAIT_S` on any attempt, since a nightly
 waiter holds every other gate on its mini; a refused one is re-run by cmux's
-owned-pool rescue, and the re-run takes Blacksmith.
+owned-pool rescue, and the re-run takes Blacksmith. The launch smoke's `pick`,
+`record` and `crashed` jobs share its slot and build nothing, so they are `light`.
+So are the canary's `pick`, `verdict` and `failed`, and any job of either
+workflow that no table names: costed as a compile, the canary's `pick` was
+refused on busy nightly minis from 2026-11-17 09:37Z and cancelled its runs.
 The DEV daily's Mac jobs (`verify`, `tip-dmg-build`) are `light` (they work only
 in `$RUNNER_TEMP`) and wait up to `NIGHTLY_CAPACITY_WAIT_S` on main's dispatch. GitHub
 hands a queued job to the next idle runner in arrival order, so a nightly job
@@ -818,7 +842,7 @@ each signal. It runs as the build user and handles at most 16 processes per
 completed job; a busy host defers cleanup to a later completion.
 
 **Hook fixes roll out without `--apply`.** Every `glaeda-update` run that installs or finds its
-release current (every 10 minutes, its `APPLY_EVERY_S`) also runs the installed release's `glaeda-cmux-runner --refresh-hooks --apply`. In each runner directory
+release current (every 10 minutes, its `APPLY_EVERY_S`, and within about a minute of a new release on its ring) also runs the installed release's `glaeda-cmux-runner --refresh-hooks --apply`. In each runner directory
 a receipt owns, it writes `glaeda-hooks/glaeda-cmux-runner-hook` and
 `glaeda_reservation.py` atomically and synced (0755 and 0644, the module first) and nothing
 else, so no registration token or org-admin access is needed. It replaces only a file whose
@@ -1785,6 +1809,14 @@ cmux-lawrence runs no jobs and has TBs of SSD. It keeps every seed cmux15 keeps,
   free. Serving a seed touches it.
 - **Serving.** `glaeda-seed-serve --role archive` refuses everything on a host that has a glaeda runner
   receipt.
+- **Evicting against it.** On a PR mini whose seeder is the archive, each applied `glaeda-seed-prefetch` run
+  first asks the archive for `seed-list-v1` (30 s at most) and writes the answer to
+  `/Users/Shared/cmux-build-fleet/ci/.prefetch/archive-seeds.json`. glaeda-disk runs off the LAN, so it reads
+  that file, ignoring it after 30 minutes. A local seed the archive lists goes without waiting out its idle
+  window, and a later miss streams it back from the archive. The newest two seeds of each root stay. An unlisted
+  seed keeps its window. A PR mini never uploads a seed: the archive takes bytes only from the trusted seeder.
+  On cmux15, glaeda-disk reads the same thing from its serve log (the filler's lists). That is why a PR mini asks
+  only a seeder named in `ARCHIVE_SEEDERS`.
 
 ```sh
 # the archive as a client of the trusted seeder
@@ -1965,7 +1997,7 @@ runners) looks for what stopped runner minis on 2026-09-25 and 26 without anythi
 | `console_locked`, `console_no_user` | none: root and a reboot (the hook already refuses GUI jobs there, #1286) |
 | `autologin_locks` (loginwindow `autoLoginUserScreenLocked`), `display_sleep` | none: root |
 | `testmanagerd_wedged`: the newest session line of this user's testmanagerd is `XCIDESession is responsible for cleaning up its socket`, 90 s old, nothing after it | the hook's `recycle_testmanagerd` (#1281) while no test runs; a hook without it gets the finding only |
-| `tailscale_down`: a BackendState other than `Running`, two runs in a row | `tailscale up` when Stopped, else `scutil --nc stop/start` of the Tailscale VPN service; a standalone tailscaled or a logged-out node is reported only |
+| `tailscale_down`: a BackendState other than `Running`, two runs in a row | `tailscale up` when Stopped, else `scutil --nc stop/start` of the Tailscale VPN service; a standalone tailscaled or a logged-out node is reported only. A capture-only mini (no glaeda runner) is checked too and gets only the `tailscale up` when Stopped (cmux-mac-mini, 2026-11-17, stayed Stopped after a power loss until a person ran it); a stuck Starting and a `tailscale_no_route` there are reported only |
 | `tailscale_no_route`: BackendState `Running`, but `route -n get 100.100.100.100` leaves by a non-utun interface (the tailnet route is gone), two runs in a row | a restart of Tailscale (never a config, auth or flag change), only on an idle CI runner mini the fleet registry opted in, at most once every 6 h per mini (below); elsewhere reported only |
 | `tailscale_cli_missing`: a host with runner LaunchAgents has neither `/usr/local/bin/tailscale` (standalone) nor the Tailscale app's CLI | reported only (warn): the tunnel is not checked, so it is not counted healthy |
 | `sandboxd_wedged`: the root daemon-heal's sandbox probe hangs again on a mini it already rebooted for that within 7 days | none: a person (an error that ci-dash keeps as an HQ fleet-alert issue). The first time, the root daemon-heal reboots the idle mini itself (below) |
