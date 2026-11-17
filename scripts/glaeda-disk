@@ -1730,7 +1730,15 @@ def cache_budget_state(fams: list[Family], fss: "dict[int, Fs]", sizes: dict[str
         except ValueError:
             return {}
         row["budget"], row["mount"] = budget, fs.mount
-        row["over"] = max(0, row["used"] - int(budget * BUDGET_STOP_SHARE)) if row["used"] > budget else 0
+        over_share = max(0, row["used"] - int(budget * BUDGET_STOP_SHARE)) if row["used"] > budget else 0
+        # a small disk's own system and tools leave less room than the share does: the caches also give back what
+        # keeps the volume at cache_budget_free (a 228 GB mini holds ~120 GB that is no cache)
+        try:
+            free_need = space(str(POLICY["cache_budget_free"]), fs.total) if POLICY["cache_budget_free"] else 0
+        except ValueError:
+            free_need = 0
+        row["free_short"] = max(0, free_need - fs.free)
+        row["over"] = min(row["used"], max(over_share, row["free_short"]))
     return out
 
 
@@ -1758,7 +1766,7 @@ def budget_only(fam: Family, item: "Item", idle_hours: float) -> bool:
 def cache_budget_rows() -> list[dict[str, Any]]:
     """CACHE_BUDGET for the run line and the health summary (ci-dash's cache-vs-budget row): GiB, no paths."""
     return [{"mount": r.get("mount", ""), "used_gib": round(r["used"] / GIB, 1), "budget_gib": round(r["budget"] / GIB, 1),
-             "over_gib": round(r["over"] / GIB, 1),
+             "over_gib": round(r["over"] / GIB, 1), "free_short_gib": round(r.get("free_short", 0) / GIB, 1),
              "families_gib": {k: round(v / GIB, 1) for k, v in sorted(r["families"].items(), key=lambda kv: -kv[1])}}
             for r in CACHE_BUDGET.values()]
 
@@ -1909,6 +1917,9 @@ POLICY_DEFAULTS: dict[str, Any] = {
     # it (space()'s syntax; "0" turns it off). Over it, a pressure pass spends warm build state past BUDGET_IDLE_HOURS
     # by value until the caches are back under BUDGET_STOP_SHARE of it.
     "cache_budget": "35%",
+    # ... and the caches give back what keeps this much of the volume free, whichever asks more ("" or "0": only the
+    # share). The fleet's stop condition: every mini holds 30% free through a peak day.
+    "cache_budget_free": "30%",
     # PRESSURE_MEASURE_BUDGET_S: seconds a pressure --apply spends starting size walks (0: no bound)
     "pressure_measure_budget_s": float(PRESSURE_MEASURE_BUDGET_S),
     "pressure_jobs": 80,

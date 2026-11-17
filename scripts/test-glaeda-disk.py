@@ -12526,7 +12526,19 @@ class CacheBudgetTest(unittest.TestCase):
         gd.CACHE_BUDGET = {self.dev: {"used": 40 * gd.GIB, "budget": 35 * gd.GIB, "over": 8 * gd.GIB,
                                       "mount": "/", "families": {"a": 1 * gd.GIB, "b": 39 * gd.GIB}}}
         self.assertEqual(gd.cache_budget_rows(), [{"mount": "/", "used_gib": 40.0, "budget_gib": 35.0,
-                                                   "over_gib": 8.0, "families_gib": {"b": 39.0, "a": 1.0}}])
+                                                   "over_gib": 8.0, "free_short_gib": 0.0,
+                                                   "families_gib": {"b": 39.0, "a": 1.0}}])
+
+    def test_a_small_disk_under_its_free_share_gives_back_more_than_the_share_asks(self) -> None:
+        # a 228 GB mini: 30 GiB of caches is under the 35% share, but 8 GiB free is 60 GiB short of 30% free
+        fs = gd.Fs(self.dev, "/", 8 * gd.GIB, 228 * gd.GIB, 100 * gd.GIB, 150 * gd.GIB)
+        fam = gd.Family("cmux-seeds", self.root, True, "")
+        sizes = {f"{self.root}/a": 30 * gd.GIB}
+        row = gd.cache_budget_state([fam], {self.dev: fs}, sizes, {})[self.dev]
+        self.assertEqual(row["free_short"], int(228 * gd.GIB * 0.30) - 8 * gd.GIB)
+        self.assertEqual(row["over"], 30 * gd.GIB)  # never more than the caches hold
+        gd.POLICY["cache_budget_free"] = "0"  # the share alone: under it, nothing to give back
+        self.assertEqual(gd.cache_budget_state([fam], {self.dev: fs}, sizes, {})[self.dev]["over"], 0)
 
 
 if __name__ == "__main__":
