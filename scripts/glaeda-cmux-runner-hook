@@ -9973,14 +9973,16 @@ class Gate:
         if self.stop_deadline is not None or self.terminating or mono - self.acquire_at < GATE_ACQUIRE_EVERY_S:
             return False
         self.acquire_at = mono
-        if self.worker() or not self.listening():  # a failed look reads as a Worker: never stuck
-            self.first_taken = None
-            return False
+        # the diag first: an idle listener (no request) costs no process-table read, and the gate's own reads of
+        # the table (busy(), the reserve lend) see the same sequence they did before this check existed
         try:
             request, acked = listener_request_at(self.runner_dir)
         except (OSError, ValueError):
             return False
         if request is None or request == self.lost_request:
+            self.first_taken = None
+            return False
+        if self.worker() or not self.listening():  # a failed look reads as a Worker: never stuck
             self.first_taken = None
             return False
         if self.first_taken is None or self.first_taken[0] != request:
