@@ -444,6 +444,7 @@ def fleet_labels() -> Any:
     loader = importlib.machinery.SourceFileLoader("glaeda_fleet_labels", os.fspath(path))
     spec = importlib.util.spec_from_loader("glaeda_fleet_labels", loader)
     module = importlib.util.module_from_spec(spec)
+    sys.modules[loader.name] = module  # dataclasses look their module up in sys.modules while it loads
     loader.exec_module(module)
     return module
 
@@ -1573,6 +1574,7 @@ def hook_module() -> Any:
     loader = importlib.machinery.SourceFileLoader("glaeda_cmux_runner_hook", os.fspath(HOOK_SOURCE))
     spec = importlib.util.spec_from_loader("glaeda_cmux_runner_hook", loader)
     module = importlib.util.module_from_spec(spec)
+    sys.modules[loader.name] = module  # dataclasses look their module up in sys.modules while it loads
     loader.exec_module(module)
     return module
 

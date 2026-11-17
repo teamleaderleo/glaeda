@@ -3474,6 +3474,7 @@ def reservation_refusal(path: str, now: float, taken_job: bool = False, nightly_
         loader = importlib.machinery.SourceFileLoader("glaeda_reservation", os.fspath(module))
         spec = importlib.util.spec_from_loader("glaeda_reservation", loader)
         reservation = importlib.util.module_from_spec(spec)
+        sys.modules[loader.name] = reservation  # dataclasses look their module up in sys.modules while it loads
         loader.exec_module(reservation)
     except Exception as error:  # noqa: BLE001  (a marker we cannot read refuses)
         return f"reservation {path} exists but glaeda_reservation.py is missing ({type(error).__name__})"
