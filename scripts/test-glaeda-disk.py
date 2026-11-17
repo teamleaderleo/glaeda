@@ -1176,6 +1176,20 @@ class GlaedaDiskTest(unittest.TestCase):
         gd.save_snapshot({"/a": 1}, snap)
         self.assertGreater(gd.load_snapshot(snap)[0], 1000.0)  # a full measurement is now
 
+    def test_a_full_disk_keeps_the_old_snapshot_and_no_temp_file(self) -> None:
+        snap = self.root / "full.json"
+        self.assertTrue(gd.save_snapshot({"/a": 1}, snap, at=1000.0))
+        real = Path.write_text
+
+        def full(path: Path, data: str, *a, **k) -> int:
+            real(path, data[:10], *a, **k)  # a partial write, then the disk is full
+            raise OSError(errno.ENOSPC, "No space left on device")
+        with mock.patch.object(Path, "write_text", full), contextlib.redirect_stderr(io.StringIO()) as err:
+            self.assertFalse(gd.save_snapshot({"/a": 1, "/b": 2}, snap))  # no raise: the pass goes on
+        self.assertIn("size snapshot not saved", err.getvalue())
+        self.assertEqual(gd.load_snapshot(snap), (1000.0, {"/a": 1}))
+        self.assertEqual([p.name for p in self.root.glob("full.*.tmp")], [])
+
     def test_snapshot_round_trip_and_corrupt_snapshot_is_empty(self) -> None:
         snap = self.root / "sizes.json"
         gd.save_snapshot({"/a": 1}, snap)
@@ -1932,8 +1946,8 @@ class GlaedaDiskTest(unittest.TestCase):
             self.assertTrue(images.reclaimable and ipsws.reclaimable)
             with mock.patch.object(gd, "tart_installed", return_value=True):
                 fams_tart = {f.id: f for f in gd.default_families()}
-            self.assertEqual(fams_tart["tart-images"].min_idle_hours, 7 * 24.0)
-            self.assertEqual(fams_tart["tart-ipsws"].min_idle_hours, 7 * 24.0)
+            self.assertEqual(fams_tart["tart-images"].min_idle_hours, 2 * 24.0)
+            self.assertEqual(fams_tart["tart-ipsws"].min_idle_hours, 2 * 24.0)
             self.assertEqual(sorted(p.name for p in gd.candidates(images)),
                              ["macos-sequoia-vanilla", "macos-sonoma-vanilla"], "one image at a time, never ~/.tart/vms")
             self.assertEqual([p.name for p in gd.candidates(ipsws)], ["UniversalMac.ipsw"])
@@ -2727,8 +2741,8 @@ class GlaedaDiskTest(unittest.TestCase):
                 mock.patch.object(gd, "cmux_active", lambda *a, **k: True):
             items = gd.survey(gd.fleet_families(ci), 24, 0)
             got = {Path(i.path).name: (i.verdict, i.reasons) for i in items}
-            self.assertEqual(got["p-a"][0], "kept")  # the newest two stay, listed or not
-            self.assertEqual(got["p-b"][0], "kept")
+            self.assertEqual(got["p-a"][0], "kept")  # the newest stays, listed or not (SEED_KEEP = 1 since #2059)
+            self.assertEqual(got["p-b"][0], "recent")  # second newest: not listed, its usual window
             self.assertEqual(got["p-c"], ("reclaimable", ["the seed archive holds it"]))
             self.assertEqual(got["p-d"][0], "recent")  # not listed: its usual window
             fams = {f.id: f for f in gd.fleet_families(ci)}
@@ -8631,6 +8645,35 @@ class VolumeCensusTest(unittest.TestCase):
             self.assertTrue(name in argv or f"--exclude={name}" in argv, name)
         self.assertEqual(argv[-1], str(self.root))
 
+    def test_no_du_walk_on_macos_enters_a_privacy_guarded_folder(self) -> None:
+        # du opening ~/Pictures or ~/Music put "worker-<sha> wants your photo library / media library" on
+        # unattended fleet Macs (dialog-alarm, 2026-11-17): every walk names them in -I, at any depth.
+        seen: list[list[str]] = []
+
+        def fake(argv, *args, **kwargs):
+            seen.append(list(argv))
+            return f"4 {self.root}\n"
+
+        with mock.patch.object(gd, "DARWIN", True), mock.patch.object(gd, "_du_output", side_effect=fake):
+            gd.du_bytes(self.root, record_timeout=False)
+            gd.du_children(self.root, record_timeout=False)
+            gd.du_children_with_status(self.root, record_timeout=False)
+            seen.append(gd._census_du_argv(self.root))
+        self.assertEqual(len(seen), 4)
+        for argv in seen:
+            # BSD du's -I on a Mac, GNU du's --exclude when the suite runs on Linux
+            ignored = ({argv[i + 1] for i, a in enumerate(argv[:-1]) if a == "-I"}
+                       | {a.removeprefix("--exclude=") for a in argv if a.startswith("--exclude=")})
+            for name in ("Pictures", "Music", "Movies", "Desktop", "Documents", "Downloads",
+                         "*.photoslibrary", "*.musiclibrary", "Mobile Documents"):
+                self.assertIn(name, ignored, argv)
+            self.assertEqual(argv[-1], str(self.root))
+        with mock.patch.object(gd, "DARWIN", False):
+            self.assertFalse({"Pictures", "--exclude=Pictures"} & set(gd.du_skip_args()))
+        with mock.patch.object(gd, "DARWIN", True), mock.patch.object(gd.sys, "platform", "linux"):
+            self.assertIn("--exclude=Pictures", gd.du_skip_args())  # GNU du never gets BSD's -I
+            self.assertNotIn("-I", gd.du_skip_args())
+
     def test_a_sized_dir_whose_size_goes_is_walked_before_completion(self) -> None:
         a, b = self.write("a/blob").parent, self.write("b/blob").parent
         state = {"schema": "glaeda-disk-census/v1", "started_at": 1.0, "dev": self.root.stat().st_dev,
@@ -12059,6 +12102,10 @@ class HostReservationTest(unittest.TestCase):
         update = mock.patch.object(gd, "UPDATE_CONFIG", self.update)
         update.start()
         self.addCleanup(update.stop)
+        # a controller-worker host unless a test says otherwise: the fail-closed side
+        self.worker = mock.patch.object(gd, "controller_worker_host", return_value=True)
+        self.worker.start()
+        self.addCleanup(self.worker.stop)
         self.list.write_text(json.dumps({"schema": "glaeda-fleet-reservations/v1", "expires": "2026-10-27T13:00:00Z",
                                          "aliases": {"cmux30": ["cmux-thirty"]},
                                          "reservations": [{"id": "r1", "owner": "someone", "hosts": ["cmux30"],
@@ -12100,6 +12147,54 @@ class HostReservationTest(unittest.TestCase):
         self.local.unlink()
         self.list.write_text("{nope")
         self.assertIn("unreadable", self.reserved({"air-blue"}), "a list that is there but broken fails closed")
+
+    def test_a_missing_list_without_a_controller_worker_reserves_nothing(self) -> None:
+        """Coordinator, 2026-11-17: "A missing reservations file on a host with no controller worker means no
+        reservations. An unreadable existing file, or a controller-worker host, stays fail-safe."""
+        self.list.unlink()
+        with mock.patch.object(gd, "controller_worker_host", return_value=False):
+            self.assertEqual(self.reserved({"cmux31"}), "", "missing, no controller worker: no reservations")
+            now = int(self.during)
+            self.local.write_text(json.dumps({"schema": "glaeda-reservation/v1", "owner": "fleet",
+                                              "since": now - 60, "until": now + 60}))
+            self.assertIn("host reservation by fleet", self.reserved({"cmux31"}), "a host-local marker still holds")
+            self.local.unlink()
+            for broken in ("{nope", json.dumps({"reservations": []}), json.dumps(
+                    {"reservations": [], "expires": "2026-10-26T00:00:00Z"})):
+                with self.subTest(broken=broken):
+                    self.list.write_text(broken)  # there but unreadable, malformed or expired: fails closed
+                    self.assertIn("kept as reserved", self.reserved({"cmux31"}))
+            self.list.write_bytes(b"\xff\xfe")
+            self.assertIn("kept as reserved", self.reserved({"cmux31"}), "undecodable bytes")
+            self.list.unlink()
+            self.list.mkdir()  # there but not a file (IsADirectoryError): fails closed
+            self.assertIn("kept as reserved", self.reserved({"cmux31"}))
+            self.list.rmdir()
+        self.assertIn("on a controller-worker host; kept as reserved", self.reserved({"cmux31"}),
+                      "missing on a controller-worker host: fails closed")
+
+    def test_a_controller_worker_host_is_read_from_launchd(self) -> None:
+        self.worker.stop()
+        self.addCleanup(self.worker.start)
+        with mock.patch.object(gd, "DARWIN", False):
+            self.assertTrue(gd.controller_worker_host(), "off macOS: unknown, fail-safe")
+        absent = mock.Mock(returncode=113)
+        with mock.patch.object(gd, "DARWIN", True), mock.patch.object(gd.Path, "exists", return_value=False), \
+                mock.patch.object(gd.subprocess, "run", return_value=absent) as run:
+            self.assertFalse(gd.controller_worker_host(), "no plist, launchctl: could not find service")
+            self.assertEqual([c.args[0][-1] for c in run.call_args_list], list(gd.HQ_BUILD_WORKERS))
+        with mock.patch.object(gd, "DARWIN", True), mock.patch.object(gd.Path, "exists", return_value=False), \
+                mock.patch.object(gd.subprocess, "run", side_effect=[absent, mock.Mock(returncode=0)]):
+            self.assertTrue(gd.controller_worker_host(), "the lent worker is loaded")
+        with mock.patch.object(gd, "DARWIN", True), mock.patch.object(gd.Path, "exists", return_value=False), \
+                mock.patch.object(gd.subprocess, "run", return_value=mock.Mock(returncode=5)):
+            self.assertFalse(gd.controller_worker_host(), "launchctl refused this user and no plist is installed")
+        with mock.patch.object(gd, "DARWIN", True), mock.patch.object(gd.Path, "exists", return_value=False), \
+                mock.patch.object(gd.subprocess, "run", side_effect=subprocess.TimeoutExpired("launchctl", 10)):
+            self.assertTrue(gd.controller_worker_host(), "launchctl hung: not proven absent")
+        with mock.patch.object(gd, "DARWIN", True), mock.patch.object(gd.Path, "exists", return_value=True), \
+                mock.patch.object(gd.subprocess, "run", return_value=absent):
+            self.assertTrue(gd.controller_worker_host(), "its LaunchDaemon plist is installed")
 
     def test_the_host_local_reservation_counts(self) -> None:
         now = int(self.during)
@@ -12440,9 +12535,12 @@ class DeadItemsTest(unittest.TestCase):
     def tart_family(self) -> gd.Family:
         return next(f for f in gd.default_families() if f.id == gd.TART_VMS)
 
-    def test_a_stopped_unclaimed_tart_vm_two_weeks_untouched_goes(self) -> None:
+    def test_a_stopped_unclaimed_tart_vm_two_days_untouched_goes(self) -> None:
         old = self.tart_vm("vm0", 26)  # cmux23: ubase and vm0-vm5, stopped since 2026-10-19
-        recent = self.tart_vm("vm1", 5)
+        aside = self.tart_vm("aside-1", 78 / 24)  # one mini, 2026-11-17: idle 78 h and judged "recent" at 14 days
+        recent = self.tart_vm("vm1", 1)
+        golden = self.tart_vm("golden", 26)  # only ever cloned: Tart moves the directory's access date, nothing else
+        os.utime(golden, (time.time(), golden.stat().st_mtime))
         claimed = self.tart_vm("vm2", 26)
         (claimed / gd.ROLE_KEEP_MARKER).write_text("{}")
         named = self.tart_vm("vm3", 26)
@@ -12461,7 +12559,9 @@ class DeadItemsTest(unittest.TestCase):
         with mock.patch.object(gd, "process_evidence", return_value=([], "/opt/homebrew/bin/tart run vm3 --no-graphics\n")):
             items = {Path(i.path).name: i for i in gd.survey([fam], 12, 0)}
         self.assertEqual(items["vm0"].verdict, "reclaimable", items["vm0"].reasons)
+        self.assertEqual(items["aside-1"].verdict, "reclaimable", items["aside-1"].reasons)
         self.assertEqual(items["vm1"].verdict, "recent")
+        self.assertEqual(items["golden"].verdict, "recent", items["golden"].reasons)
         self.assertEqual(items["vm2"].verdict, "kept")
         self.assertEqual(items["vm3"].verdict, "in-use")
         self.assertEqual(items["vm4"].verdict, "in-use")
@@ -12469,10 +12569,11 @@ class DeadItemsTest(unittest.TestCase):
         receipt = self.root / "receipt.jsonl"
         with contextlib.redirect_stdout(io.StringIO()), mock.patch.object(gd, "process_evidence",
                                                                           return_value=([], "")):
-            gd.apply([items["vm0"], items["vm4"]], {fam.id: fam}, receipt, None, 12)
+            gd.apply([items["vm0"], items["aside-1"], items["vm4"]], {fam.id: fam}, receipt, None, 12)
         self.assertFalse(old.exists())
+        self.assertFalse(aside.exists())
         self.assertTrue(locked.exists(), "the run lock is read again right before the delete")
-        for vm in (recent, claimed, named):
+        for vm in (recent, golden, claimed, named):
             self.assertTrue(vm.exists())
 
     def test_journey_cache_entries_unused_for_days_go(self) -> None:

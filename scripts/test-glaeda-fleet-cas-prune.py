@@ -132,6 +132,76 @@ class PruneTest(unittest.TestCase):
         self.assertFalse((self.root / "cas").exists())
         self.assertEqual([p.name for p in self.root.iterdir() if p.name.startswith(".cas")], [])
 
+    def crash_report(self, name: str, when: float, in_plugin: bool = True) -> Path:
+        reports = Path(self.tmp.name) / "DiagnosticReports"
+        reports.mkdir(exist_ok=True)
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S.00 %z", time.localtime(when))
+        images = [{"name": "libsystem_platform.dylib"}, {"name": fp.CAS_PLUGIN if in_plugin else "libswift.dylib"}]
+        body = {"faultingThread": 1, "usedImages": images,
+                "threads": [{"frames": [{"imageIndex": 0}]}, {"frames": [{"imageIndex": 0}, {"imageIndex": 1}]}]}
+        path = reports / name
+        path.write_text(json.dumps({"app_name": name.split("-")[0], "timestamp": stamp}) + "\n" + json.dumps(body))
+        return reports
+
+    def corrupt_cas(self) -> None:
+        """A small, just-used local CAS, with a build running since before it was last touched: under budget and
+        not idle, so before this change it was kept, and every build crashed on it (cmux7s, 2026-11-10 to 11-17)."""
+        self.env()
+        (self.root / "cas/plugin/v1.1").mkdir(parents=True)
+        (self.root / "cas/plugin/lock").write_text("")
+        (self.root / "cas/plugin/v1.1/v8.index").write_bytes(b"\0" * 8192)
+        fp.running_commands = lambda: ["/Users/cmux/actions-runner-glaeda/bin/Runner.Worker spawnclient 1 2"]
+        fp.build_starts = lambda: [time.time() - 3 * 3600]
+
+    def test_corrupt_local_cas_goes_under_budget_while_builds_run(self) -> None:
+        self.corrupt_cas()
+        reports = self.crash_report("SWBBuildService-2026-11-17-010834.ips", time.time() + 5)
+        with mock.patch.object(fp, "CRASH_REPORTS", reports):
+            rec = self.run_main("--apply")
+        self.assertTrue(rec["local_cas"].startswith("removed (corrupt: SWBBuildService-2026-11-17"), rec)
+        self.assertEqual(rec["result"], "ok")
+        self.assertFalse((self.root / "cas").exists())
+
+    def test_corrupt_local_cas_waits_for_its_lock(self) -> None:
+        self.corrupt_cas()
+        reports = self.crash_report("SWBBuildService-2026-11-17-010834.ips", time.time() + 5)
+        fd = os.open(self.root / "cas/plugin/lock", os.O_RDONLY)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_SH)
+            with mock.patch.object(fp, "CRASH_REPORTS", reports):
+                rec = self.run_main("--apply")
+        finally:
+            os.close(fd)
+        self.assertIn("holds the CAS lock", rec["result"])
+        self.assertTrue((self.root / "cas/plugin/v1.1/v8.index").exists())
+
+    def test_crash_before_the_cas_or_outside_the_plugin_keeps_it(self) -> None:
+        self.corrupt_cas()
+        reports = self.crash_report("SWBBuildService-old.ips", time.time() - 3600)
+        self.crash_report("swift-frontend-new.ips", time.time() + 5, in_plugin=False)
+        self.crash_report("bsdtar-new.ips", time.time() + 5)  # not a CAS client
+        with mock.patch.object(fp, "CRASH_REPORTS", reports):
+            rec = self.run_main("--apply")
+        self.assertEqual(rec["local_cas"], "within budget")
+        self.assertTrue((self.root / "cas/plugin/v1.1/v8.index").exists())
+
+    def test_malformed_crash_report_is_unreadable_not_fatal(self) -> None:
+        self.corrupt_cas()
+        reports = self.crash_report("SWBBuildService-good.ips", time.time() - 3600)  # before the CAS: not counted
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S.00 %z", time.localtime(time.time() + 5))
+        (reports / "SWBBuildService-partial.ips").write_text(
+            json.dumps({"timestamp": stamp}) + "\n" + json.dumps({"threads": ["x"], "usedImages": ["y"]}))
+        self.assertEqual(fp.corrupt_local_cas(self.root / "cas", reports), "")
+
+    def test_lookback_reads_the_report_time_not_its_mtime(self) -> None:
+        """macOS rewrites old reports when it submits them, so a fresh mtime says nothing about when Xcode crashed."""
+        self.corrupt_cas()
+        reports = self.crash_report("SWBBuildService-resubmitted.ips", time.time() + 5)
+        later = time.time() + 30 * 86400
+        os.utime(reports / "SWBBuildService-resubmitted.ips", (later, later))
+        self.assertEqual(fp.corrupt_local_cas(self.root / "cas", reports, now=later), "")
+        self.assertTrue(fp.corrupt_local_cas(self.root / "cas", reports).startswith("corrupt: "))
+
     def test_leftover_renamed_cas_is_swept(self) -> None:
         self.env()
         left = self.root / ".cas.pruning-4242/v1"

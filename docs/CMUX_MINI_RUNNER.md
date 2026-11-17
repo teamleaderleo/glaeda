@@ -759,6 +759,9 @@ token) and wait at most `NIGHTLY_CAPACITY_WAIT_S` on any attempt, since a nightl
 waiter holds every other gate on its mini; a refused one is re-run by cmux's
 owned-pool rescue, and the re-run takes Blacksmith. The launch smoke's `pick`,
 `record` and `crashed` jobs share its slot and build nothing, so they are `light`.
+So are the canary's `pick`, `verdict` and `failed`, and any job of either
+workflow that no table names: costed as a compile, the canary's `pick` was
+refused on busy nightly minis from 2026-11-17 09:37Z and cancelled its runs.
 The DEV daily's Mac jobs (`verify`, `tip-dmg-build`) are `light` (they work only
 in `$RUNNER_TEMP`) and wait up to `NIGHTLY_CAPACITY_WAIT_S` on main's dispatch. GitHub
 hands a queued job to the next idle runner in arrival order, so a nightly job
@@ -839,7 +842,7 @@ each signal. It runs as the build user and handles at most 16 processes per
 completed job; a busy host defers cleanup to a later completion.
 
 **Hook fixes roll out without `--apply`.** Every `glaeda-update` run that installs or finds its
-release current (every 10 minutes, its `APPLY_EVERY_S`) also runs the installed release's `glaeda-cmux-runner --refresh-hooks --apply`. In each runner directory
+release current (every 10 minutes, its `APPLY_EVERY_S`, and within about a minute of a new release on its ring) also runs the installed release's `glaeda-cmux-runner --refresh-hooks --apply`. In each runner directory
 a receipt owns, it writes `glaeda-hooks/glaeda-cmux-runner-hook` and
 `glaeda_reservation.py` atomically and synced (0755 and 0644, the module first) and nothing
 else, so no registration token or org-admin access is needed. It replaces only a file whose
