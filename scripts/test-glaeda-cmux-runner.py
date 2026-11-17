@@ -9709,6 +9709,9 @@ class GateTest(unittest.TestCase):
         activity = self.tmp / f"capture-lease-activity-{os.getpid()}"  # a live holder: this test process
         notes: list[str] = []
         clock = [10_000_000.0]
+        holder = open(self.lock, "r+")  # the whole-host capture's holder: host.lock exclusively
+        fcntl.flock(holder, fcntl.LOCK_EX)
+        self.addCleanup(holder.close)
         with mock.patch.object(hook, "lock_waiters", return_value=[15419]), \
                 mock.patch.object(hook, "holder_pids", return_value=set()), \
                 mock.patch.object(hook, "yielding_family", return_value=set()), \
@@ -9723,7 +9726,8 @@ class GateTest(unittest.TestCase):
                 self.assertEqual(hook.host_waiters(os.fspath(self.lock), self.state), {15419},
                                  f"waived at {t / 60:.1f} min while a capture held host.lock")
             self.assertEqual(notes, [])
-            # The capture's holder is gone (its activity file stale): the free host ages the drain again.
+            # The capture's holder is gone (lock let go, its activity file stale): the free host ages the drain again.
+            holder.close()
             old = time.time() - 600
             os.utime(activity, (old, old))
             released = None
@@ -9734,6 +9738,19 @@ class GateTest(unittest.TestCase):
                     released = t
         self.assertIsNotNone(released)
         self.assertTrue(notes and "without taking it" in notes[0], notes)
+
+    def test_a_slot_capture_or_an_unreadable_dir_reads_as_it_should(self) -> None:
+        activity = self.tmp / f"capture-lease-activity-{os.getpid()}"
+        activity.write_text("{}\n")
+        self.assertFalse(hook.capture_lease_holding(os.fspath(self.lock)), "no holder: the host is free")
+        with open(self.lock, "r+") as shared:  # a slot capture holds host.lock shared: runner jobs still fit
+            fcntl.flock(shared, fcntl.LOCK_SH)
+            self.assertFalse(hook.capture_lease_holding(os.fspath(self.lock)))
+        with open(self.lock, "r+") as whole:
+            fcntl.flock(whole, fcntl.LOCK_EX)
+            self.assertTrue(hook.capture_lease_holding(os.fspath(self.lock)))
+        with mock.patch.object(hook.os, "scandir", side_effect=PermissionError("denied")):
+            self.assertTrue(hook.capture_lease_holding(os.fspath(self.lock)), "a reading that cannot tell is taken")
 
     def test_replay_a_worker_waiting_for_over_an_hour_is_bounded(self) -> None:
         # 2026-10-26, a std mini: the fleet worker (one pid) waited for host.lock from 22:19Z, taking it now and then
@@ -11914,7 +11931,9 @@ class GateTest(unittest.TestCase):
         self.assertTrue(f"{hook.WAITER_REFUSAL} (pid 1)".startswith("a fleet build is waiting for the host"))
         source = HOOK.read_text()
         self.assertIn("note_waiter_refusal(args.state_dir, why)", source)
-        self.assertIn('return False, f"{WAITER_REFUSAL} (pid {waiting[0]})"', source)
+        self.assertIn("return False, waiter_why(host_lock, waiting[0])", source)
+        for kind in hook.WAITER_REFUSALS:
+            self.assertTrue(f"{kind} (pid 1)".startswith(hook.WAITER_REFUSALS))
 
     @staticmethod
     def stat(pid: int) -> str:
