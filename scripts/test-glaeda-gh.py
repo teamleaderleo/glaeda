@@ -16184,7 +16184,11 @@ class LandWorld:
         self.gh.parent.mkdir(parents=True, exist_ok=True)
         self.gh.write_text("#!/bin/sh\nexit 99\n")
         self.gh.chmod(0o755)
-        self.config = {"gh": os.fspath(self.gh), "mergeHold": "/fake/merge_hold.py", "acpmux": "/fake/acpmux",
+        # merge_hold.py must exist to be run (a missing one stops the land): a real file, never executed.
+        self.mh = os.fspath(Path(tmp) / "tools" / "merge_hold.py")
+        Path(self.mh).parent.mkdir(parents=True, exist_ok=True)
+        Path(self.mh).write_text("raise SystemExit('not run in tests')\n")
+        self.config = {"gh": os.fspath(self.gh), "mergeHold": self.mh, "acpmux": "/fake/acpmux",
                        "python": "/fake/python3", "routerReview": "/fake/router-review"}
 
     def set_pr(self, key: str, data: dict, fetched: float) -> None:
@@ -16195,7 +16199,7 @@ class LandWorld:
         self.envs.append(dict(env))
         if self.raise_on and self.raise_on in " ".join(argv):
             raise LandCrash(argv)
-        if argv[1:3] == ["/fake/merge_hold.py", "explain"]:
+        if argv[1:3] == [self.mh, "explain"]:
             rc, doc = self.answers.pop(0)
             return subprocess.CompletedProcess(argv, rc, json.dumps(doc) + "\n", "")
         if argv[0] == "/fake/acpmux":
@@ -16214,7 +16218,7 @@ class LandWorld:
         return subprocess.CompletedProcess(argv, 127, "", "unknown program")
 
     def explains(self) -> list[list[str]]:
-        return [c for c in self.calls if c[1:3] == ["/fake/merge_hold.py", "explain"]]
+        return [c for c in self.calls if c[1:3] == [self.mh, "explain"]]
 
     def gh_calls(self, *prefix: str) -> list[list[str]]:
         return [c[1:] for c in self.calls if c[0] == os.fspath(self.gh) and c[1:1 + len(prefix)] == list(prefix)]
@@ -16666,6 +16670,52 @@ class LandTest(Base):
         self.assertNotIn("ago ago", line)
         self.assertIn("last merge running", gg.land_line({**e, "lastAction": {"kind": "merge"}}, time.time()))
 
+    def test_merge_hold_is_found_past_a_missing_configured_path(self):
+        """gcp-agent-lane-3, 2026-11-17: a lane VM has no ws-sync deploy, so the default merge_hold.py was missing and
+        every land judged explain_failed and retried. The leo-workspace checkout's copy is found and run."""
+        checkout = Path(self.tmp.name) / "leo-workspace" / "tools" / "merge_hold.py"
+        checkout.parent.mkdir(parents=True)
+        checkout.write_text("")
+        deploy = Path(self.tmp.name) / "no-ws-sync" / "merge_hold.py"
+        self.w.config["mergeHold"] = os.fspath(Path(self.tmp.name) / "gone" / "merge_hold.py")
+        with mock.patch.object(gg, "LAND_MERGE_HOLD_PATHS", (deploy, checkout)):
+            self.assertEqual(self.q.merge_hold()[0], checkout)
+            self.w.mh = os.fspath(checkout)
+            self.pr(LA)
+            self.land()
+            self.w.answers.append(ok_answer(LA))
+            self.tick()
+        self.assert_merged_at(LA)
+        self.assertEqual(self.w.explains()[0][1], os.fspath(checkout))
+        # The configured path wins whenever it exists.
+        self.w.config["mergeHold"] = os.fspath(deploy)
+        deploy.parent.mkdir(parents=True)
+        deploy.write_text("")
+        with mock.patch.object(gg, "LAND_MERGE_HOLD_PATHS", (checkout,)):
+            self.assertEqual(self.q.merge_hold()[0], deploy)
+
+    def test_no_merge_hold_anywhere_stops_at_once_naming_every_path(self):
+        """The detector for a retry that hides a permanent failure: no merge_hold.py is a stop on the first judgment,
+        named merge_hold_missing with each path tried, never explain_failed and a retry."""
+        gone = [Path(self.tmp.name) / d / "merge_hold.py" for d in ("conf", "deploy", "checkout")]
+        self.w.config["mergeHold"] = os.fspath(gone[0])
+        with mock.patch.object(gg, "LAND_MERGE_HOLD_PATHS", tuple(gone[1:])):
+            self.pr(LA)
+            self.land()
+            e = self.tick()
+        self.assertEqual(self.w.explains(), [])  # nothing was run
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "merge_hold_missing"))
+        for p in gone:
+            self.assertIn(os.fspath(p), e["stop"]["reason"])
+        self.assertIn("mergeHold", e["stop"]["next"])
+        self.assertIn("merge_hold_missing", self.w.sent()[-1][-1])
+        self.assertIn("merge_hold_missing: merge_hold.py is not at", gg.land_line(e, time.time()))
+
+    def test_status_names_why_explain_failed(self):
+        e = {"key": self.KEY, "state": "waiting", "explain": {"code": "explain_failed",
+                                                             "reason": "merge_hold explain exit 1: Traceback boom"}}
+        self.assertIn("explain_failed: merge_hold explain exit 1: Traceback boom", gg.land_line(e, time.time()))
+
     def test_requester_defaults_to_the_queuing_session(self):
         keys = {k: "" for k in gg.LAND_REQUESTER_KEYS}
         with mock.patch.dict(os.environ, {**keys, "CMUX_AGENT_SESSION": "lane-y"}), \
@@ -16723,7 +16773,7 @@ class LandTest(Base):
         real = self.w.run
 
         def requeue_mid_explain(argv, timeout, env):
-            if argv[1:3] == ["/fake/merge_hold.py", "explain"] and len(self.w.explains()) == 0:
+            if argv[1:3] == [self.w.mh, "explain"] and len(self.w.explains()) == 0:
                 gg.land_request(gg.LAND_WITHDRAW, "o/r#1", [], "host/lane")
                 gg.land_request("land", "o/r#1", ["o/r#2"], "host/lane")
                 self.q.ingest()

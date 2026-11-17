@@ -246,7 +246,8 @@ effect without a restart.
   refusals in a row. Its calls carry CMUX_AGENT_SESSION=glaeda-land and MAY_MERGE_PATH=glaeda-land, so the gh-quota
   call log and the landing record tell them from a person's. State in land/ (entries/, requests/, counts.json: the
   steps taken per day, which `land status` prints); ~/.config/glaeda/land.json may set gh, mergeHold, acpmux,
-  routerReview, python, workers and env.
+  routerReview, python, workers and env. merge_hold.py is mergeHold, else the ws-sync deploy's, else
+  ~/Projects/leo-workspace/tools/merge_hold.py; with none of them a land stops at once (merge_hold_missing).
 """
 
 from __future__ import annotations
@@ -6788,6 +6789,11 @@ class Daemon:
 LAND_CONFIG = Path(os.environ.get("GLAEDA_GH_LAND_CONFIG") or Path.home() / ".config/glaeda/land.json")
 LAND_GH = Path.home() / ".local/lib/gh-quota/bin/gh"  # the gh-quota shim: merge_hold judges every merge it sends
 LAND_MERGE_HOLD = Path.home() / ".local/share/ws-sync/deploy/tools/merge_hold.py"
+# Where merge_hold.py is, in order, after land.json's mergeHold: the ws-sync deploy (Leo's own hosts), then the
+# leo-workspace checkout (a lane VM has no ws-sync deploy). The first that exists is run. When none does, a land stops
+# at once with merge_hold_missing naming every path tried. Before, python exited 2 ("can't open file"), every job judged
+# explain_failed and retried, and `land status` read like quota trouble (gcp-agent-lane-3, 2026-11-17).
+LAND_MERGE_HOLD_PATHS = (LAND_MERGE_HOLD, Path.home() / "Projects/leo-workspace/tools/merge_hold.py")
 LAND_STATES = ("queued", "waiting_after", "judging", "acting", "waiting", "merged", "stopped", "cancelled")
 LAND_DONE = frozenset({"merged", "stopped", "cancelled"})
 LAND_WITHDRAW = "withdraw"  # the request op `land cancel` writes
@@ -7339,8 +7345,23 @@ class LandQueue:
         p = self.path("gh", LAND_GH)
         return os.fspath(p) if p.exists() and os.access(p, os.X_OK) else None
 
+    def merge_hold(self) -> tuple[Path | None, list[Path]]:
+        """(the merge_hold.py to run, or None; every path tried): land.json's mergeHold, then LAND_MERGE_HOLD_PATHS."""
+        given = self.config().get("mergeHold")
+        tried = [Path(os.path.expanduser(given))] if isinstance(given, str) and given else []
+        tried += [p for p in LAND_MERGE_HOLD_PATHS if p not in tried]
+        return next((p for p in tried if p.is_file()), None), tried
+
     def explain(self, e: dict, sha: str) -> dict:
-        argv = [self.path("python", Path(sys.executable)).as_posix(), os.fspath(self.path("mergeHold", LAND_MERGE_HOLD)),
+        mh, tried = self.merge_hold()
+        if mh is None:
+            # Permanent until a person installs it: a stop that names the file, never a retry.
+            why = "merge_hold.py is not at any of " + ", ".join(map(os.fspath, tried))
+            nxt = (f'set "mergeHold" in {LAND_CONFIG} to merge_hold.py\'s path, then '
+                   f'glaeda-gh land {e["repo"]}#{e["number"]}')
+            return {"ok": False, "code": "merge_hold_missing", "reason": why, "next": nxt, "head": sha,
+                    "action": {"v": 1, "kind": "stop", "stop": "merge_hold_missing", "why": why}}
+        argv = [self.path("python", Path(sys.executable)).as_posix(), os.fspath(mh),
                 "explain", e["repo"], str(e["number"])] + (["--sha", sha] if sha else []) + ["--json"]
         got = self.call(argv, LAND_EXPLAIN_DEADLINE)
         answer = None
@@ -7753,6 +7774,9 @@ def land_line(e: dict, now: float) -> str:
     if e["state"] == "stopped":
         st = e.get("stop") or {}
         bits.append(f"{st.get('code')}: {land_trim(st.get('reason'), 160)}")
+    elif (e.get("explain") or {}).get("code") == "explain_failed":
+        # merge_hold itself failed (a crash, a bad python): its words, or the line reads like a quota wait.
+        bits.append(f"explain_failed: {land_trim(e['explain'].get('reason'), 160)}")
     if e.get("requester"):
         bits.append(f"for {e['requester']}")
     return "  ".join(bits)
