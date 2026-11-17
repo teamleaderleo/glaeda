@@ -17703,6 +17703,30 @@ class LandTest(Base):
         self.assertEqual((len(self.w.gh_calls("api")), e["wait"]["kind"]), (2, "pr"))
         self.assertIn("update_deferred", [h["event"] for h in e["history"]])
 
+    def test_a_check_that_never_finishes_never_holds_the_named_update_past_one_wait(self):
+        # cmux#44800 (stale_green) and cmux#45380 (tip_merge), 2026-11-17: each refusal named update-branch, a check
+        # at the head never finished, and every timed-out wait judged again and deferred again: "3 identical refusals
+        # in a row", the update never sent, a person ran it. Now the update waits for running checks once per head.
+        for code in ("stale_green", "tip_merge"):
+            with self.subTest(code=code):
+                shutil.rmtree(gg.land_dir(), ignore_errors=True)
+                self.w = LandWorld(self.tmp.name)
+                self.q = self.queue()
+                self.pr(LA, checks=[("ci", "COMPLETED", "SUCCESS"), ("stuck", "IN_PROGRESS", None)])
+                self.land()
+                e = self.run_hour(lambda: refusal(code, LA, {"kind": "update_branch", "expected_head_sha": LA}),
+                                  seconds=2 * gg.LAND_WAIT_DEFAULT + 120, step=60.0)
+                updates = [c for c in self.w.gh_calls("api") if "update-branch" in " ".join(c)]
+                self.assertEqual((e.get("state"), len(updates)), ("waiting", 1), "the named update is sent once")
+                events = [h["event"] for h in e["history"]]
+                self.assertEqual((events.count("update_deferred"), events.count("judged")), (1, 2))
+                self.assertIn("update_past_stuck", events)
+                # the update's new head is judged afresh (a new streak) and lands
+                self.pr(LB, checks=[("ci", "COMPLETED", "SUCCESS")])
+                self.w.answers[:] = [ok_answer(LB)]
+                self.tick()
+                self.assert_merged_at(LB)
+
     def test_steps_write_as_the_requesters_lane_on_this_host(self):
         # gcp-agent-lane-3, 2026-11-17: lane-gh refused every merge and update-branch "land: lease acquisition requires
         # a lane session" (this queue strips the session keys), so none reached the broker. Every step that writes

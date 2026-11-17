@@ -8726,11 +8726,23 @@ class LandQueue:
         checks finished, is the base moving during CI: counted in history as update_again."""
         repo, number = e["repo"], str(e["number"])
         data = (self.cache_of(e["key"]) or {}).get("data") or {}
-        if land_checks_running(data, head):
+        held = e.get("updateDeferred") or {}
+        stuck = held.get("head") == head and self.now - float(held.get("at") or 0) >= LAND_WAIT_DEFAULT
+        if land_checks_running(data, head) and not stuck:
+            # Deferred once per head. A check still running after the whole wait never finishes (stuck, no runner):
+            # deferring again only re-judges it into the identical-refusal stop with the named update never sent
+            # (cmux#44800 stale_green, cmux#45380 tip_merge, 2026-11-17: both stopped, a person updated them).
             with self.lock:
+                if held.get("head") != head:
+                    e["updateDeferred"] = {"head": head, "at": self.now}
                 self.history(e, "update_deferred", head=head[:12], why="checks still running at the head")
                 self.wait_running(e, head, land_fingerprint(self.cache_of(e["key"])))
             return
+        if stuck:
+            with self.lock:
+                self.history(e, "update_past_stuck", head=head[:12],
+                             why=f"checks still running {LAND_WAIT_DEFAULT:.0f} s after the update was deferred")
+        e.pop("updateDeferred", None)
         if head and head == e.get("updatedHead"):
             with self.lock:
                 self.history(e, "update_again", head=head[:12], why="the base moved during this update's CI")
