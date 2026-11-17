@@ -16899,6 +16899,11 @@ class LandTest(Base):
         paths = mock.patch.object(gg, "LAND_MERGE_HOLD_PATHS", (Path(self.w.mh),))
         paths.start()
         self.addCleanup(paths.stop)
+        # Not a lane VM unless a test says so: the host's own lane-gh wrapper never decides the update-branch form.
+        self.lane_client = Path(self.tmp.name) / "lane-gh" / "gh"
+        lane = mock.patch.object(gg, "LAND_LANE_GH_CLIENT", self.lane_client)
+        lane.start()
+        self.addCleanup(lane.stop)
         # The login's latch marks: a test dir, never the host's (a dry login on the test host would park every test).
         self.latch_dir = Path(self.tmp.name) / "gh-quota"
         state = mock.patch.dict(os.environ, {"GH_QUOTA_STATE": os.fspath(self.latch_dir)})
@@ -17013,6 +17018,58 @@ class LandTest(Base):
         self.tick()
         self.assertEqual(self.w.gh_calls("pr", "update-branch"), [])
         self.assertEqual(self.w.gh_calls("api")[0][3], "repos/o/r/pulls/1/update-branch")
+
+    def as_lane_vm(self) -> None:
+        self.lane_client.parent.mkdir(parents=True, exist_ok=True)
+        self.lane_client.write_text("#!/bin/sh\nexec lane-gh-credential gh \"$@\"\n")
+
+    def test_update_branch_on_a_lane_vm_sends_the_broker_form_with_needs(self):
+        # cmux#45378/#45468, 2026-11-17: the lane VM's gh refused the REST PUT, and the broker refuses a base merge on
+        # a SHIP'd head unless --needs-newer-base names a check: the broker's form, pinned, one flag per check.
+        self.as_lane_vm()
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(refusal("stale_green", LA, {"kind": "update_branch", "expected_head_sha": LA,
+                                                          "needs_newer_base": ["ws-check", "build (macos, arm64)"]}))
+        e = self.tick()
+        self.assertEqual(self.w.gh_calls("api"), [])
+        self.assertEqual(self.w.gh_calls("pr", "update-branch"), [
+            ["pr", "update-branch", "1", "-R", "o/r", "--match-head-commit", LA,
+             "--needs-newer-base", "ws-check", "--needs-newer-base", "build (macos, arm64)"]])
+        self.assertEqual(e["lastAction"]["needs"], ["ws-check", "build (macos, arm64)"])
+        self.assertEqual((e["state"], e["wait"]["kind"]), ("waiting", "head_change"))
+
+    def test_update_branch_off_a_lane_vm_keeps_the_rest_put_and_records_needs(self):
+        self.lane_client.parent.mkdir(parents=True, exist_ok=True)
+        self.lane_client.write_text("#!/bin/sh\nexec /usr/bin/gh \"$@\"\n")  # a wrapper, but not lane-gh's
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(refusal("stale_green", LA, {"kind": "update_branch", "expected_head_sha": LA,
+                                                          "needs_newer_base": ["ws-check"]}))
+        e = self.tick()
+        self.assertEqual(self.w.gh_calls("pr", "update-branch"), [])
+        self.assertEqual(self.w.gh_calls("api"), [["api", "-X", "PUT", "repos/o/r/pulls/1/update-branch", "-f",
+                                                   f"expected_head_sha={LA}"]])
+        self.assertEqual(e["lastAction"]["needs"], ["ws-check"])
+
+    def test_update_branch_ignores_a_malformed_needs_list(self):
+        self.as_lane_vm()
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(refusal("stale_green", LA, {"kind": "update_branch", "expected_head_sha": LA,
+                                                          "needs_newer_base": ["ws-check", 7]}))
+        e = self.tick()
+        self.assertEqual(self.w.gh_calls("pr", "update-branch"),
+                         [["pr", "update-branch", "1", "-R", "o/r", "--match-head-commit", LA]])
+        self.assertIn("needs_ignored", [h.get("event") for h in e.get("history") or []])
+        self.assertFalse(gg.land_needs(["x"] * (gg.LAND_NEEDS_MAX + 1)))
+        self.assertIsNone(gg.land_needs(["a\nb"]))
+        self.assertEqual(gg.land_needs(None), [])
+
+    def test_a_refusal_naming_the_broker_update_branch_takes_it(self):
+        self.assertTrue(gg.LAND_STEP_NEXT_UPDATE.search(
+            f"merge-hold: refused [tip_merge]; next: gh pr update-branch 1 -R o/r --match-head-commit {LA} "
+            "--needs-newer-base ws-check"))
 
     def test_head_moved_during_review_repins_and_merges_at_the_new_head(self):
         self.pr(LA)

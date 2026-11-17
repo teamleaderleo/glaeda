@@ -6965,6 +6965,13 @@ class Daemon:
 LAND_CONFIG = Path(os.environ.get("GLAEDA_GH_LAND_CONFIG") or Path.home() / ".config/glaeda/land.json")
 LAND_GH = Path.home() / ".local/lib/gh-quota/bin/gh"  # the gh-quota shim: merge_hold judges every merge it sends
 LAND_MERGE_HOLD = Path.home() / ".local/share/ws-sync/deploy/tools/merge_hold.py"
+# A lane VM's gh is a lane-gh broker client: its wrapper runs lane-gh-credential (gh_quota.lane_gh_client reads the
+# same file). That gh refuses a REST PUT outright (only media PUTs pass), and the broker refuses a base merge on a head
+# carrying a SHIP unless --needs-newer-base names a check, so there update_branch sends the broker's form
+# `gh pr update-branch N -R R --match-head-commit H --needs-newer-base C...` with merge_hold's needs_newer_base.
+# 2026-11-17: cmux#45378 and #45468 sat refused on the REST form until a person updated the branch by hand.
+LAND_LANE_GH_CLIENT = Path.home() / ".local/lib/lane-gh/bin/gh"
+LAND_NEEDS_MAX = 8  # needs_newer_base names a few checks; a longer list (or a non-string) is ignored, noted in history
 # Where merge_hold.py is, in order, after land.json's mergeHold: the ws-sync deploy (Leo's own hosts), then the
 # leo-workspace checkout (a lane VM has no ws-sync deploy). The first that exists is run. When none does, a land stops
 # at once with merge_hold_missing naming every path tried. Before, python exited 2 ("can't open file"), every job judged
@@ -7337,6 +7344,25 @@ def land_fingerprint(cache: dict | None) -> str:
                      str(c.get("conclusion") or "")) for c in data.get("checks") or [])
     doc = [data.get("headRefOid"), data.get("state"), data.get("mergeable"), checks]
     return hashlib.sha256(json.dumps(doc, sort_keys=True).encode()).hexdigest()[:16]
+
+
+def land_lane_gh_client() -> bool:
+    """This host's gh goes through the lane-gh broker (LAND_LANE_GH_CLIENT), as gh_quota.lane_gh_client reads it."""
+    try:
+        return "lane-gh-credential" in LAND_LANE_GH_CLIENT.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+
+
+def land_needs(needs: Any) -> list[str] | None:
+    """merge_hold's needs_newer_base as check names: [] for none, None for a value that is not a short list of
+    non-empty one-line strings (ignored by the caller)."""
+    if needs is None:
+        return []
+    if not isinstance(needs, list) or len(needs) > LAND_NEEDS_MAX or not all(
+            isinstance(n, str) and n.strip() and len(n) <= 200 and "\n" not in n for n in needs):
+        return None
+    return list(needs)
 
 
 def land_fallback(answer: dict, head: str) -> dict:
@@ -8304,7 +8330,7 @@ class LandQueue:
                     self.stop(e, "policy", f"update_branch pinned to {sha[:12] or 'nothing'}, not the judged head "
                               f"{head[:12] or '?'}", land_trim(answer.get("next")))
                 return
-            self.update_branch(e, sha)
+            self.update_branch(e, sha, act.get("needs_newer_base"))
             return
         if kind == "retarget":
             base = str(act.get("base") or "")
@@ -8403,11 +8429,12 @@ class LandQueue:
         if named == "update_branch" and kind != "update_branch":
             self.update_branch(e, head)
 
-    def update_branch(self, e: dict, head: str) -> None:
+    def update_branch(self, e: dict, head: str, needs: Any = None) -> None:
         """The pinned base merge merge_hold (or a refused step) named, unless the head's checks still run: an update
         while the last one's CI runs only restarts that CI (2026-11-17: 524 update-branch steps in a day). Waits on the
         cache (an event wait, no explain) instead. An update at a head that an update of this queue made, after its
-        checks finished, is the base moving during CI: counted in history as update_again."""
+        checks finished, is the base moving during CI: counted in history as update_again. NEEDS is merge_hold's
+        needs_newer_base (LAND_LANE_GH_CLIENT): the broker's flags on a lane VM, else only recorded in the claim."""
         repo, number = e["repo"], str(e["number"])
         data = (self.cache_of(e["key"]) or {}).get("data") or {}
         if land_checks_running(data, head):
@@ -8418,9 +8445,17 @@ class LandQueue:
         if head and head == e.get("updatedHead"):
             with self.lock:
                 self.history(e, "update_again", head=head[:12], why="the base moved during this update's CI")
-        self.push_step(e, "update_branch", head,
-                       ["api", "-X", "PUT", f"repos/{repo}/pulls/{number}/update-branch", "-f",
-                        f"expected_head_sha={head}"])
+        checks = land_needs(needs)
+        if checks is None:
+            with self.lock:
+                self.history(e, "needs_ignored", head=head[:12], why=land_trim(repr(needs), 120))
+            checks = []
+        if land_lane_gh_client():
+            args = ["pr", "update-branch", number, "-R", repo, "--match-head-commit", head,
+                    *(w for name in checks for w in ("--needs-newer-base", name))]
+        else:  # GitHub has no SHIP gate: the REST call, pinned
+            args = ["api", "-X", "PUT", f"repos/{repo}/pulls/{number}/update-branch", "-f", f"expected_head_sha={head}"]
+        self.push_step(e, "update_branch", head, args, **({"needs": checks} if checks else {}))
 
     def step_refused(self, e: dict, kind: str, head: str, got: subprocess.CompletedProcess) -> str | None:
         """KIND, the step merge_hold named, failed at HEAD (LAND_STEP_BACKOFF's comment). Under the lock. Waits or
