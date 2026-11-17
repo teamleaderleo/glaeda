@@ -349,8 +349,14 @@ What `--apply` does:
      waits up to `EVICT_WAIT_FLOOR_S` (120 s), never past what its caller allows (`GLAEDA_DISK_FLOOR_WAIT_UNTIL`,
      when half the gate's own timeout runs out) or the run deadline, and takes its turn if the holder
      releases, since the holder picks its own families and need not free what the floor needs. When the wait ends with
-     the holder still evicting, the line says so and the holder's pass serves the floor. Manual and LaunchAgent runs
-     above the floor still skip at once. The run line's `evict_floor_wait` is `took its turn` or `expired`. An exclusive signing job used
+     the holder still evicting, the line says so and the holder's pass serves the floor. Manual, LaunchAgent and
+     idle-repair pressure runs above the floor skip at once only when the holder's pass serves them (`holder_serves`:
+     its `evict.owner.json` scope is a pressure pass of the same profile over every family the run would judge, to at
+     least its target on every filesystem under pressure); behind an idle sweep, a floor-only, out-of-band or narrower
+     pass, or a holder that names no scope, they wait up to `EVICT_WAIT_UNSERVED_S` (300 s, within the same caller
+     bounds) and then evict. The runner hook's own runs (`GLAEDA_DISK_HOOK_PASS`) keep their own waits. The run line's
+     `evict_floor_wait` / `evict_unserved_wait` is `took its turn` or `expired`, `evict_holder_serves` says whether the
+     holder served the run and `evict_holder_short` why not. An exclusive signing job used
      to hold the queue for hours while every run in it freed nothing. The two-minute `glaeda-mini-health` agent repeats
      that ownership check when a post-job hook was skipped, and the listener gate sweeps its
      own idle runner's `_work` for such orphans every ten minutes (never while that runner has

@@ -5111,6 +5111,15 @@ class GlaedaDiskTest(unittest.TestCase):
         policy.write_text("{}")
         self.assertNotEqual(before, gd.config_sha256(policy=policy))
 
+    # what a plain `--pressure --apply` holder of _main_run's volume records: its pass serves any such run
+    SERVING_SCOPE = {"mode": "pressure", "profile": "default", "families": [], "targets": {"/": 170 * gd.GIB}}
+
+    def _holder(self, scope: dict | None = None, command: str = "glaeda-disk --pressure --apply --top 0") -> None:
+        """An evict.owner record for a holder of _main_run's evict.lock (this process, so it reads live)."""
+        (self.root / "evict.owner.json").write_text(json.dumps({
+            "pid": os.getpid(), "owner": "cmux", "started_at": time.time() - 60, "command": command,
+            **({"scope": scope} if scope is not None else {})}))
+
     def _queue(self):
         """This test's runner-hook queue files, in place of the home's."""
         lock, pending = self.root / "hook-pass.lock", self.root / "hook-pass.pending"
@@ -5440,9 +5449,7 @@ class GlaedaDiskTest(unittest.TestCase):
         with p_lock, p_pending, lock.open("a") as held, mock.patch.dict(os.environ, {gd.CALLER_ENV: "test"}), \
                 mock.patch.object(gd, "cmux_next_ci_cap_state", return_value=None) as cap:
             fcntl.flock(held, fcntl.LOCK_EX)
-            (self.root / "evict.owner.json").write_text(json.dumps({
-                "pid": os.getpid(), "owner": "cmux", "started_at": time.time() - 60,
-                "command": "glaeda-disk --pressure --apply --top 0"}))
+            self._holder(self.SERVING_SCOPE)
             status, rows, survey, _ = self._main_run(["--pressure", "--apply"], free_gib=100.0)
         self.assertEqual(status, 0)
         row = rows[-1]
@@ -5554,6 +5561,7 @@ class GlaedaDiskTest(unittest.TestCase):
                 mock.patch.object(gd, "EVICT_WAIT_POLL_S", 0.01), \
                 mock.patch.object(gd, "cmux_next_ci_cap_state", return_value=None):
             fcntl.flock(busy, fcntl.LOCK_EX)
+            self._holder(self.SERVING_SCOPE)
             status, rows, survey, _ = self._main_run(["--pressure", "--apply"], free_gib=28.0)
         self.assertEqual(status, 0)
         row = rows[-1]
@@ -5561,21 +5569,117 @@ class GlaedaDiskTest(unittest.TestCase):
         self.assertIn("its pass serves this floor", self.said)
         survey.assert_not_called()
 
-    def test_a_run_above_the_floor_still_skips_a_held_lock_at_once(self) -> None:
-        """Manual and LaunchAgent runs above the floor keep today's behaviour: no wait, no sleep."""
+    def test_a_run_above_the_floor_skips_at_once_a_holder_whose_pass_serves_it(self) -> None:
+        """Manual and LaunchAgent runs above the floor leave the work to a holder doing the same pass: no wait."""
         _, _, p_lock, p_pending = self._queue()
         lock = self.root / "evict.lock"
         with p_lock, p_pending, lock.open("a") as busy, mock.patch.dict(os.environ, {gd.CALLER_ENV: "test"}), \
                 mock.patch.object(gd.time, "sleep") as slept, \
                 mock.patch.object(gd, "cmux_next_ci_cap_state", return_value=None):
             fcntl.flock(busy, fcntl.LOCK_EX)
+            self._holder(dict(self.SERVING_SCOPE, targets={"/": 200 * gd.GIB}))  # a higher target serves it too
             status, rows, survey, _ = self._main_run(["--pressure", "--apply"], free_gib=100.0)
         self.assertEqual(status, 0)
         row = rows[-1]
-        self.assertEqual((row["skipped"], row["evict_floor_wait"]), ("eviction_busy", None))
+        self.assertEqual((row["skipped"], row["evict_floor_wait"], row["evict_holder_serves"]),
+                         ("eviction_busy", None, True))
+        self.assertIsNone(row["evict_unserved_wait"])
         self.assertNotIn("serves this floor", self.said)
+        self.assertIn("its pass serves this run", self.said)
         slept.assert_not_called()
         survey.assert_not_called()
+
+    def test_a_pressure_run_waits_its_turn_behind_a_holder_whose_pass_does_not_serve_it(self) -> None:
+        """Most fleet --pressure --apply runs skipped as eviction_busy and did nothing (fleet sweep, 2026-11-17),
+        whatever the holder was doing. A holder whose pass does not do this run's work is waited for, then this
+        run evicts."""
+        _, _, p_lock, p_pending = self._queue()
+        for scope in (None, dict(self.SERVING_SCOPE, mode="sweep", targets={}),
+                      dict(self.SERVING_SCOPE, targets={"/": 60 * gd.GIB})):
+            with self.subTest(scope=scope), p_lock, p_pending, mock.patch.dict(os.environ, {gd.CALLER_ENV: "test"}), \
+                    mock.patch.object(gd, "EVICT_WAIT_POLL_S", 0.01), \
+                    mock.patch.object(gd, "eviction_lock_is_held", side_effect=[True, True, False]), \
+                    mock.patch.object(gd, "cmux_next_ci_cap_state", return_value=None):
+                self._holder(scope)
+                status, rows, survey, _ = self._main_run(["--pressure", "--apply"], free_gib=100.0)
+            self.assertEqual(status, 0)
+            row = rows[-1]
+            self.assertEqual((row["skipped"], row["evict_unserved_wait"], row["evict_holder_serves"]),
+                             (None, "took its turn", False))
+            survey.assert_called()
+            (self.root / "runs.jsonl").unlink()
+
+    def test_the_wait_behind_a_holder_that_does_not_serve_the_run_is_bounded(self) -> None:
+        _, _, p_lock, p_pending = self._queue()
+        lock = self.root / "evict.lock"
+        with p_lock, p_pending, lock.open("a") as busy, mock.patch.dict(os.environ, {gd.CALLER_ENV: "test"}), \
+                mock.patch.object(gd, "EVICT_WAIT_UNSERVED_S", 0.05), \
+                mock.patch.object(gd, "EVICT_WAIT_POLL_S", 0.01), \
+                mock.patch.object(gd, "cmux_next_ci_cap_state", return_value=None):
+            fcntl.flock(busy, fcntl.LOCK_EX)
+            self._holder(dict(self.SERVING_SCOPE, mode="sweep", targets={}), "glaeda-disk --pressure --idle --apply")
+            status, rows, survey, _ = self._main_run(["--pressure", "--apply"], free_gib=100.0)
+        self.assertEqual(status, 0)
+        row = rows[-1]
+        self.assertEqual((row["skipped"], row["evict_unserved_wait"], row["evict_holder_short"]),
+                         ("eviction_busy", "expired", "its pass is an idle sweep"))
+        self.assertIn("another eviction running", self.said, "the runner hook's BUSY phrase stays")
+        self.assertIn("its pass is an idle sweep, and it still held the lock", self.said)
+        survey.assert_not_called()
+
+    def test_the_runner_hooks_own_runs_keep_their_own_waits(self) -> None:
+        """The hook's pass and floor evictions run under its timeouts (DISK_BOUND, floor_disk_env): no extra wait."""
+        _, _, p_lock, p_pending = self._queue()
+        lock = self.root / "evict.lock"
+        with p_lock, p_pending, lock.open("a") as busy, \
+                mock.patch.dict(os.environ, {gd.CALLER_ENV: "runner hook pass", gd.HOOK_PASS_ENV: "1"}), \
+                mock.patch.object(gd.time, "sleep") as slept, \
+                mock.patch.object(gd, "cmux_next_ci_cap_state", return_value=None):
+            fcntl.flock(busy, fcntl.LOCK_EX)
+            self._holder(dict(self.SERVING_SCOPE, mode="sweep", targets={}))
+            status, rows, survey, _ = self._main_run(["--pressure", "--apply"], free_gib=100.0)
+        self.assertEqual((status, rows[-1]["skipped"]), (0, "eviction_busy"))
+        self.assertIsNone(rows[-1]["evict_unserved_wait"])
+        slept.assert_not_called()
+
+    def test_holder_serves_compares_mode_profile_families_and_targets(self) -> None:
+        mine = {"mode": "pressure", "profile": "default", "families": ["a", "b"], "targets": {"/": 100}}
+        cases = (
+            ({"mode": "pressure", "profile": "default", "families": ["a", "b", "c"], "targets": {"/": 100}}, ""),
+            ({"mode": "pressure", "profile": "default", "families": ["a", "b"], "targets": {"/": 120}}, ""),
+            (None, "its pass names no scope"),
+            ({"mode": "sweep", "profile": "default", "families": ["a", "b"], "targets": {}},
+             "its pass is an idle sweep"),
+            ({"mode": "apply", "profile": "default", "families": ["a", "b"], "targets": {}},
+             "its pass is not a pressure pass"),
+            ({"mode": "pressure", "profile": "runner-caches", "families": ["a", "b"], "targets": {"/": 100}},
+             "its pass is the runner-caches profile's"),
+            ({"mode": "pressure", "profile": "default", "families": ["a"], "targets": {"/": 100}},
+             "its pass leaves out b"),
+            ({"mode": "pressure", "profile": "default", "families": ["a", "b"], "targets": {"/": 50}},
+             "its pass works / only to"),
+            ({"mode": "pressure", "profile": "default", "families": ["a", "b"], "targets": {"/tmp": 100}},
+             "its pass does not work /"),
+        )
+        for held, why in cases:
+            with self.subTest(held=held):
+                got = gd.holder_serves({} if held is None else {"scope": held}, mine)
+                self.assertTrue(got.startswith(why) if why else got == "", got)
+
+    def test_the_holder_records_its_scope_with_the_lock(self) -> None:
+        """A waiter can only compare what the holder wrote: the owner record carries the scope of its pass."""
+        _, _, p_lock, p_pending = self._queue()
+        seen = {}
+
+        def survey(*args, **kwargs):
+            seen.update(json.loads((self.root / "evict.owner.json").read_text()))
+            return []
+
+        with p_lock, p_pending, mock.patch.dict(os.environ, {gd.CALLER_ENV: "test"}), \
+                mock.patch.object(gd, "cmux_next_ci_cap_state", return_value=None):
+            self._main_run(["--pressure", "--apply"], free_gib=100.0, survey_effect=survey)
+        self.assertEqual(seen.get("scope"), self.SERVING_SCOPE)
+        self.assertTrue(gd.holder_serves(seen, self.SERVING_SCOPE) == "", "a plain pressure pass serves another")
 
     def test_the_run_line_names_its_caller_without_the_variable(self) -> None:
         with mock.patch.dict(os.environ, {}, clear=False):
@@ -11995,25 +12099,27 @@ class HostReservationTest(unittest.TestCase):
     def test_an_unreadable_list_fails_closed(self) -> None:
         self.list.write_text("{nope")
         self.assertIn("unreadable", self.reserved({"cmux31"}))
-        self.list.unlink()
-        self.assertIn("unreadable", self.reserved({"cmux31"}))
+        self.list.chmod(0)
+        self.addCleanup(self.list.chmod, 0o600)
+        if os.geteuid() != 0:  # root reads it anyway
+            self.assertIn("unreadable", self.reserved({"cmux31"}), "there but not readable")
 
-    def test_a_missing_list_holds_no_hygiene_only_mac(self) -> None:
-        """A personal Mac (glaeda-mini-setup --hygiene-only) never receives the fleet's list. Failing closed there
-        held air-blue as reserved for good, so its pressure pass deleted nothing while the disk fell below 40 GiB."""
+    def test_a_missing_list_names_no_reservation(self) -> None:
+        """A missing list is no reservation, on a fleet mini or a personal Mac alike. Failing closed on one held a
+        fleet mini as reserved for good, so its pressure runs kept everything (fleet sweep, 2026-11-17)."""
         self.list.unlink()
-        self.assertIn("unreadable", self.reserved({"air-blue"}), "no update.json: not known to be personal")
-        self.update.write_text(json.dumps({"host": "air-blue", "setupArgs": ["--role=fleet-mini"]}))
-        self.assertIn("unreadable", self.reserved({"air-blue"}), "a fleet mini without its list fails closed")
-        self.update.write_text(json.dumps({"host": "air-blue", "setupArgs": ["--hygiene-only"]}))
-        self.assertEqual(self.reserved({"air-blue"}), "")
+        self.assertEqual(self.reserved({"cmux31"}), "", "no update.json")
+        for args in (["--role=fleet-mini"], ["--hygiene-only"]):
+            with self.subTest(args=args):
+                self.update.write_text(json.dumps({"host": "cmux31", "setupArgs": args}))
+                self.assertEqual(self.reserved({"cmux31"}), "")
         now = int(self.during)
         self.local.write_text(json.dumps({"schema": "glaeda-reservation/v1", "owner": "fleet", "since": now - 60,
                                           "until": now + 60}))
-        self.assertIn("host reservation by fleet", self.reserved({"air-blue"}), "a host-local marker still holds")
+        self.assertIn("host reservation by fleet", self.reserved({"cmux31"}), "a host-local marker still holds")
         self.local.unlink()
         self.list.write_text("{nope")
-        self.assertIn("unreadable", self.reserved({"air-blue"}), "a list that is there but broken fails closed")
+        self.assertIn("unreadable", self.reserved({"cmux31"}), "a list that is there but broken fails closed")
 
     def test_the_host_local_reservation_counts(self) -> None:
         now = int(self.during)
@@ -12079,12 +12185,14 @@ class HostReservationTest(unittest.TestCase):
                 self.list.write_text(json.dumps(doc))
                 self.assertIn("kept as reserved", self.reserved({"cmux31"}))
 
-    def test_a_missing_list_is_reserved_whatever_the_host_local_file_says(self) -> None:
+    def test_a_missing_list_leaves_only_the_host_local_file(self) -> None:
         now = int(self.during)
         self.local.write_text(json.dumps({"schema": "glaeda-reservation/v1", "owner": "fleet", "since": now - 600,
                                           "until": now - 60}))
         self.list.unlink()
-        self.assertIn("kept as reserved", self.reserved({"cmux31"}))
+        self.assertEqual(self.reserved({"cmux31"}), "", "a lapsed marker and no list: not reserved")
+        self.local.write_text("{nope")
+        self.assertIn("marker unreadable", self.reserved({"cmux31"}), "a broken marker still fails closed")
 
     def test_the_list_is_read_from_the_fleet_owners_home(self) -> None:
         owner = types.SimpleNamespace(pw_dir=os.fspath(self.root / "fleet-home"))
@@ -12093,8 +12201,13 @@ class HostReservationTest(unittest.TestCase):
             self.assertEqual(gd.fleet_reservations_path(),
                              self.root / "fleet-home/.local/share/glaeda/fleet-reservations.json")
             getpwuid.assert_called_once_with(self.root.stat().st_uid)
+            self.assertEqual(gd.host_reservation(self.during, None, {"cmux31"}, self.local), "",
+                             "nothing written there yet: no reservation")
+            listed = self.root / "fleet-home" / gd.FLEET_RESERVATIONS_NAME
+            listed.parent.mkdir(parents=True)
+            listed.write_text("{nope")
             self.assertIn("kept as reserved", gd.host_reservation(self.during, None, {"cmux31"}, self.local),
-                          "nothing written there yet")
+                          "the list there is the one read")
         with mock.patch.object(gd, "FLEET_RESERVATIONS", None), \
                 mock.patch.object(gd, "FLEET_ROOT", self.root / "absent"):
             self.assertEqual(gd.fleet_reservations_path(), gd.HOME / gd.FLEET_RESERVATIONS_NAME)
