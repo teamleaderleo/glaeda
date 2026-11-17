@@ -2868,7 +2868,7 @@ class Daemon:
         self.nudged: set[str] = set()  # PRs (and heads) a check event touched since their last fetch
         self.controller_ok_at = float("-inf")  # the last time the change feed answered
         self.fed_repos: dict[str, float] = {}  # owner/repo (lowercase) -> the last event the feed delivered for it
-        self.reexec_waiting = False  # an update arrived while a land step ran (serve)
+        self.reexec_waiting: float | bool = False  # since when an update has waited on a running land step (serve)
         self.land_queue: LandQueue | None = None  # `glaeda-gh land` (made when BASE/land first exists)
         self.rollups: dict[str, tuple[Any, Any]] = {}  # key -> (head, fp) of its ROLLUP_DIR snapshot, as last written
         self.rollup_keys: tuple[float, frozenset[str]] = (float("nan"), frozenset())  # (self.now, rollup_wanted)
@@ -5054,7 +5054,11 @@ class Daemon:
         return bool(q.jobs)
 
     def land_tick(self) -> None:
-        """The land queue's pass: cheap (its entries are in memory; judgments and steps run on its workers)."""
+        """The land queue's pass: cheap (its entries are in memory; judgments and steps run on its workers). None while
+        an update waits to re-execute (reexec_waiting): the steps running end, no new one starts, and the new daemon
+        takes the queue from there."""
+        if self.reexec_waiting:
+            return
         if self.land_queue is None:
             if not land_dir().is_dir():
                 return
@@ -8685,7 +8689,7 @@ class LandQueue:
         if not why and not os.path.isdir(mirror):
             why = f"the fetch step's mirror {mirror} is not a directory on this host"
         git = self.path("git", Path(shutil.which("git") or "/usr/bin/git")).as_posix()
-        if not why and form == "git":
+        if not why:  # both forms write into the mirror: its origin must be this PR's repository
             got = self.call([git, "--git-dir", mirror, "config", "--get", "remote.origin.url"],
                             LAND_FETCH_CONFIG_DEADLINE)
             origin = land_fetch_origin(got.stdout or "") if got.returncode == 0 else ""
@@ -9494,6 +9498,28 @@ def hold_daemon_lock() -> Any:
         lock.close()
 
 
+# An update (the script on disk changed) re-executes the daemon, but not under a running land step, so the new daemon
+# never sends a step beside one the old one runs. cosmic-gray, 2026-11-17: a busy land queue always had a step
+# running (explains back to back), so the re-exec waited 11:41-12:06Z and again from 12:39Z until a forced restart:
+# glaeda#2092 was installed at 12:41Z and the daemon ran the old code. Now a waiting re-exec starts no new land step
+# (land_tick), so it waits only for the steps in flight, and at most REEXEC_DRAIN_MAX: a step's claim is written before
+# it starts, and a restart judges a claimed step again rather than run it twice (LandQueue.claim).
+REEXEC_DRAIN_MAX = 300.0
+
+
+def reexec_due(changed: bool, busy: bool, waiting_since: float | bool, now: float) -> str | None:
+    """What serve does about an update: None (nothing changed), "defer" (a land step runs; no new one starts),
+    "reexec", or a reason string for a re-exec past REEXEC_DRAIN_MAX with a step still running."""
+    if not changed:
+        return None
+    if not busy:
+        return "reexec"
+    since = waiting_since if isinstance(waiting_since, (int, float)) and not isinstance(waiting_since, bool) else None
+    if since is not None and now - since >= REEXEC_DRAIN_MAX:
+        return f"a land step still ran after {int(REEXEC_DRAIN_MAX)} s; its claim is judged again"
+    return "defer"
+
+
 def serve(foreground_ok: bool = False) -> int:
     lock = hold_daemon_lock()
     first_heartbeat()
@@ -9529,12 +9555,13 @@ def serve(foreground_ok: bool = False) -> int:
                 # the stale valve (Daemon.stale_valve): a fresh daemon, the way an update starts one
                 daemon.restart_self()
                 os.execv(sys.executable, [sys.executable, os.fspath(me), "serve"] + (["--foreground-ok"] if foreground_ok else []))
-            if me.stat().st_mtime != stamp and daemon.land_busy():
+            due = reexec_due(me.stat().st_mtime != stamp, daemon.land_busy(), daemon.reexec_waiting, time.monotonic())
+            if due == "defer":
                 if not daemon.reexec_waiting:
-                    log({"event": "reexec-deferred", "why": "a land step is running"})
-                daemon.reexec_waiting = True
-            elif me.stat().st_mtime != stamp:
-                log({"event": "reexec"})
+                    log({"event": "reexec-deferred", "why": "a land step is running; no new one starts until it ends"})
+                    daemon.reexec_waiting = time.monotonic()
+            elif due is not None:
+                log({"event": "reexec", **({"why": due} if due != "reexec" else {})})
                 os.execv(sys.executable, [sys.executable, os.fspath(me), "serve"] + (["--foreground-ok"] if foreground_ok else []))
             if lock_replaced(lock):
                 # A cleanup moved or deleted BASE (huge-blue, 10-24: a hygiene pass trashed ~/.cache/glaeda):

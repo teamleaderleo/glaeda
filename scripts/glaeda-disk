@@ -1035,7 +1035,8 @@ CMUX_NEXT_DRAIN_HOOK_SHA256 = frozenset({
     "f9d7999b378ef24c0b35ec6d68a34ace4a6e38c8bbc7a057cf60ce85fcef7938",
     "604b4875444a2f2a9d8949936c2dcc7750d8ec90cd9bcfe6de3c9063e1e464f6",
     "61288c7d638db3ccef4208cd4a1a268beed2f11cf0eaec2487568d7cb1a8e3ae",
-    "ed19b07558411f9e7e774ee127e4390315dfdb733fc5370e21e2133f2638bff3",
+    "8a8efccf8581126de3169bb83cdbabd66ce78b42763231d82eb6506dc5016ae2",
+    "ea1711a1e87e5fd7e1ec779a2c066e2427dfe52c8630ecd17bcaf483a9de471d",
 })
 CMUX_NEXT_CI_PRESERVED_NAMES = frozenset({
     "SourcePackages", "ModuleCache.noindex", "SDKStatCaches.noindex",
