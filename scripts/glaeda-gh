@@ -7640,13 +7640,15 @@ def land_latch(now: float) -> tuple[str, float] | None:
     reset is never more than MAX_S (3700 s) ahead. Writers are atomic and never shorten a held mark; a mark whose source
     is GitHub's own (x-ratelimit-reset, retry-after, said) is never voided early, so a reader trusts until as written.
     A lane-share mark (share: true, the broker's refusal of a VM's share) does not hold a land: lands pass the share
-    (gh_latch.held(share=False)). The land queue only reads these marks: merge_hold, the broker and the daemon write
-    them."""
+    (gh_latch.held(share=False)). A REST mark with login_only: true (a broker client's refusal that named the shared
+    login) holds no judgement either: merge_hold's REST reads of a repo the broker's read pool covers go on its read
+    Apps, and merge_hold's own stop (quota_held) judges that per repo. The land queue only reads these marks:
+    merge_hold, the broker and the daemon write them."""
     state = Path(os.environ.get("GH_QUOTA_STATE") or Path.home() / ".local/state/gh-quota")
     best: tuple[str, float] | None = None
     for pool in ("rest", "graphql"):
         doc = read_json(state / f"{pool}-exhausted.json")
-        if not isinstance(doc, dict) or doc.get("share") is True:
+        if not isinstance(doc, dict) or doc.get("share") is True or (pool == "rest" and doc.get("login_only") is True):
             continue
         until = doc.get("until")
         if not isinstance(until, (int, float)) or isinstance(until, bool) or not now < until:

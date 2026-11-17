@@ -17917,6 +17917,22 @@ class LandTest(Base):
         self.assert_merged_at(LA)
         self.assertFalse((gg.land_dir() / gg.LAND_LATCH_FILE).exists())
 
+    def test_a_login_only_rest_mark_skips_no_judge(self):
+        """gcp-agent-lane-1, 2026-11-17 18:41Z: one refused update-branch on the shared login latched REST, and the VM's
+        queue judged nothing while merge_hold's REST reads of the PR's repo go on the broker's read pool. A mark from a
+        refusal that named the login (login_only, leo-workspace tools/gh_latch.py) is merge_hold's to judge per repo
+        (quota_held), not a stop for every entry; a REST mark without it still is."""
+        self.pr(LA)
+        self.land()
+        self.latch("rest", self.t + 600)
+        self.tick(30)
+        self.assertEqual(self.reads(), (0, 0, 0, 0))
+        self.latch("rest", self.t + 600, login_only=True)
+        self.w.answers.append(ok_answer(LA))
+        self.tick(1)
+        self.assert_merged_at(LA)
+        self.assertFalse((gg.land_dir() / gg.LAND_LATCH_FILE).exists())
+
     def test_jitter_is_within_the_spread_and_fixed_per_caller(self):
         keys = [f"pr:o/r#{n}" for n in range(200)]
         offsets = [gg.land_jitter(k) for k in keys]
