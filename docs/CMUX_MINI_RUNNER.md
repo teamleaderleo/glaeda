@@ -1096,6 +1096,11 @@ job's need fit the host's cores, and their RAM plus this job's fits the host's R
   `units`), so FEED_FIRST, the nightly slot and the signing drain are unchanged.
 - The listener gate holds a runner while the RAM its costliest job needs (that fits the host at all) is taken, as it
   does for cores.
+- HEAD_FIT: a plain side runner listens with room for the head of its queue (the oldest queued job it could take, in
+  the build controller's workflow_job feed) when that job's own need is larger than the side fit. GitHub hands that
+  job first, and a job that waits for units in "Set up runner" spends its timeout-minutes there (cmux#44505's
+  generated files, 2026-11-17: 19 min waiting for 8 units, then cancelled at 40 min). Only names in `HEAD_FIT_JOBS`
+  count; an unknown name, a stale or unreadable feed, or no queued job keeps the side fit.
 - `scripts/glaeda-cmux-runner-hook needs` prints what a host's admission reads (cores, RAM, floor, each class's need).
 - Listeners: a member's plan summary carries `listeners`, `glaeda_fleet_labels.listener_count()`: as many runners as
   the host could run of the smallest common job (1 core, 1 GiB) by cores and by RAM over the floor, at most

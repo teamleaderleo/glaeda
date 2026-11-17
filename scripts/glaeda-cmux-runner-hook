@@ -8220,7 +8220,8 @@ def load_cap_summary(doc: Any, now: float) -> dict[str, Any] | None:
         job_id = job.get("id")
         jobs.append({"labels": sorted(labels), "status": status, "created": _feed_time(job.get("created_at")),
                      "host": runner_host(job.get("runner")), "urgent": urgent,
-                     "id": job_id if isinstance(job_id, int) and not isinstance(job_id, bool) else None})
+                     "id": job_id if isinstance(job_id, int) and not isinstance(job_id, bool) else None,
+                     "name": job.get("name") if isinstance(job.get("name"), str) else ""})
     return {"at": now, "delivery": _feed_time(doc.get("receiver_last_delivery")), "jobs": jobs}
 
 
@@ -8293,6 +8294,60 @@ def ios_sim_queued(summary: dict[str, Any] | None, labels: frozenset[str] | None
             continue
         return True
     return False
+
+
+# HEAD_FIT: GitHub hands an idle runner its label's oldest queued job (Newest run first, docs/CMUX_MINI_RUNNER.md),
+# so a side listener's next job is the head of its queue, and a listener that listens with room for less than the
+# head's need takes a job it cannot start: the job waits in "Set up runner" for units (CAPACITY_WAIT), and that wait
+# counts against its timeout-minutes, which run from pickup. On 2026-11-17 cmux#44505's `cmux-next generated files`
+# (job 134087426027, queued on glaeda-side-std-xcode-26.6 from 13:53Z) reached cmux18-glaeda-8 at 17:49Z, which had
+# listened at the side fit (the isolated class's median) with 1 of 12 units free; the job needed 8 (its own measured
+# row), waited 19 min for them, started at 18:08Z and was cancelled at 18:29:57Z by its 40-min timeout mid-compile.
+# So a plain side listener reads the head of its queue in the controller's feed (the HOST_LOAD_CAP summary) and,
+# when that job's need (job_need, the number its admission will wait for) is larger than the side fit, listens only
+# with room for it: the job stays queued in GitHub, where its timeout does not run, until a mini has its units. The
+# need only ever rises (IOS_SIM_OWN_FIT lowers a sim runner's fit on its own evidence). A job name the hook does not
+# know (HEAD_FIT_JOBS: the feed carries GitHub's display name, not GITHUB_JOB), a feed that cannot be read or is
+# stale, or no queued job keeps the side fit (today's rule).
+HEAD_FIT_JOBS = {
+    "cmux-next generated files": ("cmux-next.yml", "generated-files"),
+    "cmux-next daemon tests": ("cmux-next.yml", "daemon-test"),
+    "cmux-next fast tier": ("cmux-next.yml", "fast-tier"),
+    "cmux-next Swift canary": ("cmux-next.yml", "swift-canary"),
+    "cmux-next Release compile (Xcode 26)": ("cmux-next.yml", "release-compile"),
+    "cmux app scheme compile (Debug)": ("cmux-next.yml", "cmux-scheme-compile"),
+}
+
+
+def queue_head(summary: dict[str, Any] | None, labels: frozenset[str] | None, now: float,
+               max_age: float | None = HOST_LOAD_CAP_JOB_MAX_AGE_S) -> dict[str, Any] | None:
+    """HEAD_FIT: the oldest queued job in a fresh feed whose labels are all this runner's, or None."""
+    if not isinstance(summary, dict) or not labels:
+        return None
+    delivery = summary.get("delivery")
+    if not isinstance(delivery, (int, float)) or now - delivery > HOST_LOAD_CAP_FEED_STALE_S:
+        return None
+    queued = [job for job in (summary.get("jobs") if isinstance(summary.get("jobs"), list) else [])
+              if isinstance(job, dict) and isinstance(job.get("labels"), list) and job["labels"]
+              and set(job["labels"]) <= labels and job.get("status") in IOS_SIM_QUEUED
+              and isinstance(job.get("created"), (int, float))
+              and (max_age is None or now - job["created"] <= max_age)]
+    return min(queued, key=lambda job: job["created"]) if queued else None
+
+
+def head_fit_units(summary: dict[str, Any] | None, labels: frozenset[str] | None, now: float,
+                   need: Callable[[str, str], int] | None = None) -> tuple[int, str] | None:
+    """HEAD_FIT: (units, job name) the head of this runner's queue needs, or None when it cannot say."""
+    head = queue_head(summary, labels, now)
+    known = HEAD_FIT_JOBS.get(str((head or {}).get("name") or ""))
+    if known is None:
+        return None
+    workflow, job = known
+    if need is None:
+        def need(workflow: str, job: str) -> int:
+            return job_need(job_class(job, DEFAULT_HOME_REPO, workflow=workflow)[0], job, DEFAULT_HOME_REPO,
+                            workflow=workflow).cores
+    return max(1, int(need(workflow, job))), str(head["name"])
 
 
 def load_cap_verdict(summary: dict[str, Any] | None, labels: frozenset[str] | None, host: str,
@@ -9443,6 +9498,7 @@ class Gate:
         self.cap_feed_at = -HOST_LOAD_CAP_FEED_EVERY_S
         self.cap_thread: threading.Thread | None = None
         self.ios_sim_own = False  # IOS_SIM_OWN_FIT: the last full() listened at its own fit for a queued ios-sim job
+        self.head_fit_seen: tuple[int, str] | None = None  # HEAD_FIT: the last head need full() listened for
         # STARVED_RESERVE: the policy in force (refreshed with the other settings), the capacity/STARVED_RESERVE_FILE
         # flock while held, since when (monotonic), the job it is held for, and the jobs whose hold ran out
         self.starved: StarvedReserve | None = gate_starved_reserve(None, "", 0.0)
@@ -9841,6 +9897,21 @@ class Gate:
                      f"no queued job needs {IOS_SIM_RUNNER_LABEL}: listening with room for the side label's costliest job")
         self.ios_sim_own = wanted
         return wanted
+
+    def head_fit(self) -> int:
+        """HEAD_FIT: the units the head of this plain side runner's queue needs, from the shared feed look, or 1
+        (no say) until the look lands, when it fails, or for a job it does not know. Never raises."""
+        try:
+            self.cap_look()
+            found = head_fit_units(self.cap_summary, self.cap_labels, time.time())
+        except Exception as error:  # noqa: BLE001 - a broken look must never stop the gate
+            found = None
+            gate_log(f"the queue-head look failed ({type(error).__name__}); listening at the side fit")
+        if found != self.head_fit_seen and found is not None:
+            gate_log(f"the oldest queued job it could take, {found[1]}, needs {found[0]} units: listening only "
+                     "with room for it, so it never waits here for units against its timeout")
+        self.head_fit_seen = found
+        return found[0] if found else 1
 
     def starved_step(self, why: str | None, stop: str | None = None) -> None:
         """STARVED_RESERVE: hold or let go of capacity/STARVED_RESERVE_FILE for a starved job this root runner could
@@ -10428,9 +10499,12 @@ class Gate:
             self.full_why = None
             return None
         own = max(self.fit_units, listen_fit_units(self.runner_dir))
-        fit = max(own, side_fit_units(scope))
+        side = side_fit_units(scope)
+        fit = max(own, side)
         if fit > own and self.ios_sim_wanted():
             fit = own  # IOS_SIM_OWN_FIT: a bigger std job it receives waits here for units (CAPACITY_WAIT)
+        elif side > 1:
+            fit = max(fit, self.head_fit())  # HEAD_FIT: room for the job GitHub would hand it next
         if self.capacity_dir is None or not claims_room(scope):
             why = mini_full(self.capacity_dir, scope.units, scope, fit)
         elif scope.session:

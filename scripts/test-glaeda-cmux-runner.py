@@ -8829,6 +8829,42 @@ class HostLoadCapTest(unittest.TestCase):
                          "only 2 of 14 capacity units on this mini are free; its next job needs 3",
                          "it still needs room for its own job")
 
+    def test_a_side_listener_never_takes_a_queue_head_it_cannot_start(self) -> None:
+        # HEAD_FIT, 2026-11-17: cmux#44505's generated files (job 134087426027) reached cmux18-glaeda-8, which
+        # listened at the side fit with 1 unit free; the job needed 8, waited 19 min for them in "Set up runner" and
+        # was cancelled by its 40-min timeout mid-compile. GitHub hands the oldest queued job first, so the listener
+        # must hold until the head's need fits.
+        side = ["glaeda-mini", "glaeda-side-std-xcode-26.6"]
+        real_need = hook.job_need
+
+        def need(klass, job, repo, home_repo=hook.DEFAULT_HOME_REPO, workflow="", needs=hook._LOAD):
+            return hook.Need(8) if (workflow, job) == ("cmux-next.yml", "generated-files") else \
+                real_need(klass, job, repo, home_repo, workflow, needs)
+        head = dict(self.job("queued", ago=3 * 3600 - 60, labels=["glaeda-side-std-xcode-26.6"]),
+                    name="cmux-next generated files")
+        newer = dict(self.job("queued", ago=60, labels=["glaeda-side-std-xcode-26.6"]),
+                     name="cmux app scheme compile (Debug)")
+        with mock.patch.object(hook, "job_need", side_effect=need):
+            side_fit = hook.side_fit_units(hook.RunnerScope(units=14))
+            self.assertLess(side_fit, 8, "the replay needs a side fit under generated-files' 8")
+            self.jobs = [self.job("in_progress", "cmux20-glaeda-1"), newer, head]
+            self.assertEqual(self.full(self.side_gate(13, side)),
+                             "only 1 of 14 capacity units on this mini are free; its next job needs 8",
+                             "1 free, the head needs 8: held, so the job stays queued in GitHub")
+            fits_side = 14 - side_fit
+            self.assertEqual(self.full(self.side_gate(fits_side, side)),
+                             f"only {side_fit} of 14 capacity units on this mini are free; its next job needs 8",
+                             "room for the side fit is not room for the head")
+            self.assertIsNone(self.full(self.side_gate(6, side)), "8 free: it listens")
+            self.jobs = [self.job("in_progress", "cmux20-glaeda-1"), newer]
+            self.assertIsNone(self.full(self.side_gate(fits_side, side)), "a smaller head keeps the side fit")
+            self.jobs = [dict(head, name="some job the hook does not know")]
+            self.assertIsNone(self.full(self.side_gate(fits_side, side)), "an unknown head keeps the side fit")
+            self.jobs = [head]
+            with mock.patch.object(hook, "load_cap_fetch", return_value=None):
+                self.assertIsNone(self.full(self.side_gate(fits_side, side)), "an unreadable feed keeps today's rule")
+        self.assertEqual(hook.head_fit_units(None, frozenset(side), time.time()), None)
+
 
 class StarvedReserveTest(unittest.TestCase):
     """cmux#45614 (STARVED_RESERVE): on 2026-11-17 cmux NEXT DEV's DMG build (glaeda-std-xcode-26.6, a compile: 5
