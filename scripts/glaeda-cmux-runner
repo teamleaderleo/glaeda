@@ -787,6 +787,10 @@ def hook_wrappers(ctx: Context) -> dict[str, bytes]:
         slots =int((ctx.member or {}).get("compileSlots") or 1)
         if slots > 1:
             scope += f" --compile-slots {slots}"
+        # SIM_SLOTS: simulator token copies (the member's simSlots); every runner on the mini passes the same count
+        sims = int((ctx.member or {}).get("simSlots") or 1)
+        if sims > 1:
+            scope += f" --sim-slots {sims}"
         roots = int((ctx.member or {}).get("canonicalRoots") or 1)
         if roots > 1:
             # instance i prefers root i+1, so a root runner keeps compiling in the tree its warm labels name

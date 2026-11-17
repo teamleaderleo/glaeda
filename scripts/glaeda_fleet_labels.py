@@ -78,6 +78,12 @@ GATEWAY_PREFIX = "gateway"
 # macOS, where it queued 40 minutes.
 MAX_SIM_RUNNERS = 1
 SIM_PREFIX = "sim"
+# simSlots (1 to MAX_SIM_SLOTS, default 1) is how many copies of the simulator token a simulator mini's hook hands
+# out (glaeda-cmux-runner-hook SIM_SLOTS, --sim-slots): that many simulator jobs may run at once, each told its copy
+# (GLAEDA_SIM_SLOT) to boot its own devices, and every copy past the first only with headroom for it (load, memory
+# pressure, the class's measured RAM). Leo, 2026-11-17: "aziz also wanted to look into packing more ios simulators
+# at once and right-sizing them in ci". A member without the simulator role keeps 1.
+MAX_SIM_SLOTS = 4  # the hook's MAX_SIM_SLOTS (a test keeps them equal)
 COMPILE_CORES = 5  # the hook's CLASS_COST["compile"] units (a test keeps them equal)
 MAX_RUNNERS = 16
 # A host's overrides.runner {trustedRef: refs/heads/main, trustedRepo: owner/name} makes its runners trusted-only:
@@ -545,9 +551,11 @@ def member_labels(manifest: Any, member: str, xcode_ok: Callable[[dict[str, Any]
         fast = declared.get("fastRunners", 0)
         gateway = declared.get("gatewayRunners", 0)
         sim = declared.get("simRunners", 0)
+        sim_slots = declared.get("simSlots", 1)
         reserve = declared.get("reserveCores", 0)
     else:
         compile_slots, roots, gui, fast, gateway, sim, reserve = 1, 1, 0, 0, 0, 0, 0
+        sim_slots = 1
     if dedicated_only:
         gateway = sim = 0  # DEDICATED_ONLY: no pool instance, so no gateway or sim-first runner after them either
     if not (isinstance(runners, int) and not isinstance(runners, bool) and 1 <= runners <= MAX_RUNNERS):
@@ -581,6 +589,9 @@ def member_labels(manifest: Any, member: str, xcode_ok: Callable[[dict[str, Any]
     # simulator (a trustedRef nightly host) is not misconfigured by it. On 2026-11-14 the check ran first and held
     # cmux15, the nightly host, out of every runner-heal pass ("simRunners needs a dedicated runner").
     sim = sim if ios_sim else 0
+    if not (isinstance(sim_slots, int) and not isinstance(sim_slots, bool) and 1 <= sim_slots <= MAX_SIM_SLOTS):
+        return None, f"runner.classes.{klass}.simSlots must be 1 to {MAX_SIM_SLOTS}"
+    sim_slots = sim_slots if ios_sim else 1  # a class default, read the same way as simRunners
     if sim and (trusted_ref is not None or availability != "dedicated" or normal_pool_prefix):
         return None, (f"{member} runner.classes.{klass}.simRunners needs a dedicated runner without trustedRef "
                       "(a sim-first runner takes pull request jobs) in the default pool namespace (no poolPrefix)")
@@ -618,7 +629,7 @@ def member_labels(manifest: Any, member: str, xcode_ok: Callable[[dict[str, Any]
             "gatewayRunners": gateway,
             "gatewayPools": list(dict.fromkeys(gateway_label(v) for v in (versions if pools else []))) if gateway
             else [],
-            "simRunners": sim,
+            "simRunners": sim, "simSlots": sim_slots,
             "simPools": list(dict.fromkeys(sim_label(v) for v in (versions if pools else []))) if sim else [],
             # CAPACITY_ARITHMETIC: the classless side label, on default-namespace PR pools only (never a trusted or
             # namespaced pool, whose jobs are its own)
