@@ -245,15 +245,19 @@ class GlaedaDiskTest(unittest.TestCase):
                 ".cache/cmux/ghosttykit",
                 "Library/Application Support/cua-ssh/recordings",
                 "Library/Caches/cmux/cmux-cua",
+                "Library/Caches/org.swift.swiftpm",
+                "Library/Caches/cmux-perf-bench/apps",
             ):
                 (self.root / relative).mkdir(parents=True)
             families = gd.runner_cache_families()
             self.assertEqual(
                 {family.id for family in families},
                 {"xcode-derived-data", "cmux-job-cache", "cmux-ghosttykit-cache",
-                 "cua-recordings", "cua-cache"},
+                 "cua-recordings", "cua-cache", *gd.GIT_CACHE_FAMILY_IDS},
             )
-            self.assertTrue(all(family.min_idle_hours == gd.DEFAULT_AGE_HOURS for family in families))
+            # git_cache_families keep their own 24 h window (CACHE_GIT_MIRROR_IDLE_HOURS)
+            self.assertTrue(all(family.min_idle_hours == (gd.CACHE_GIT_MIRROR_IDLE_HOURS if family.git_cache
+                                                          else gd.DEFAULT_AGE_HOURS) for family in families))
             self.assertTrue(gd.runner_profile_roots_safe(families))
             measured = gd.fixed_measurement_roots()
             self.assertEqual(set(measured), {family.root for family in families})
@@ -12253,6 +12257,187 @@ class FleetCasNodeCapTest(unittest.TestCase):
             prune.write_text("print('not json')\n")
             self.assertEqual(gd.fleet_cas_node_cap(root, prune), 0)
             self.assertEqual(gd.fleet_cas_node_cap(root, Path(tmp) / "missing"), 0)
+
+
+class GitCacheFamiliesTest(unittest.TestCase):
+    """Tool caches in ~/Library/Caches whose git mirrors are refetchable (git_cache_families): as library-caches items
+    they read "git-checkout" and --pressure --apply reclaimed 0 GB on every mini (2026-11-17). A bare mirror with a
+    remote never keeps an entry; a non-bare checkout with uncommitted or unpushed work still does."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(os.path.realpath(self.tmp.name))
+        self.home = self.root / "home"
+        self.caches = self.home / "Library/Caches"
+        self.caches.mkdir(parents=True)
+        self.saved = (gd.HOME, gd.FLEET_ROOT, gd.NESTED_KEEP, gd.TRUSTED_LOCAL_REMOTES)
+        gd.HOME, gd.FLEET_ROOT = self.home, self.root / "shared-fleet"
+        gd.NESTED_KEEP = self.root / "nested-keep.json"
+        self.upstream = self.root / "upstream"
+        gd.TRUSTED_LOCAL_REMOTES = (str(self.upstream),)  # stands in for a server
+        gd._DISCOVERED.clear()
+        self.git("init", "-q", "-b", "main", str(self.upstream))
+        (self.upstream / "Package.swift").write_text("// swift-tools-version:5.9\n")
+        self.git("-C", str(self.upstream), "add", "Package.swift")
+        self.git("-C", str(self.upstream), "commit", "-qm", "c")
+        self.git("-C", str(self.upstream), "tag", "1.0.0")
+
+    def tearDown(self) -> None:
+        gd.HOME, gd.FLEET_ROOT, gd.NESTED_KEEP, gd.TRUSTED_LOCAL_REMOTES = self.saved
+        gd._DISCOVERED.clear()
+        self.tmp.cleanup()
+
+    def git(self, *args: str) -> str:
+        env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+               "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
+        return subprocess.run(["git", "-c", "maintenance.auto=false", "-c", "gc.auto=0", *args],
+                              check=True, capture_output=True, text=True, env=env).stdout
+
+    def age(self, tree: Path, hours: float) -> None:
+        t = time.time() - hours * 3600
+        for dirpath, dirnames, filenames in os.walk(tree):
+            for name in filenames + dirnames:
+                os.utime(os.path.join(dirpath, name), (t, t), follow_symlinks=False)
+        os.utime(tree, (t, t))
+
+    def mirror(self, where: Path, hours: float, url: str | None = None) -> Path:
+        """SwiftPM's `git clone --mirror` of a package, its origin a server (url) or the upstream repository."""
+        where.parent.mkdir(parents=True, exist_ok=True)
+        self.git("clone", "-q", "--mirror", str(self.upstream), str(where))
+        if url is not None:
+            self.git("--git-dir", str(where), "remote", "set-url", "origin", url)
+        self.age(where, hours)
+        return where
+
+    def clone(self, where: Path, hours: float, work: str = "") -> Path:
+        where.parent.mkdir(parents=True, exist_ok=True)
+        self.git("clone", "-q", str(self.upstream), str(where))
+        if work == "dirty":
+            (where / "Package.swift").write_text("// edited\n")
+        elif work == "unpushed":
+            (where / "new.swift").write_text("let x = 1\n")
+            self.git("-C", str(where), "add", "new.swift")
+            self.git("-C", str(where), "commit", "-qm", "only here")
+        self.age(where, hours)
+        return where
+
+    def fams(self, *ids: str) -> list[gd.Family]:
+        fams = {f.id: f for f in gd.default_families()}
+        return [fams[i] for i in ids]
+
+    def survey(self, *ids: str) -> dict[str, gd.Item]:
+        with mock.patch.object(gd, "process_evidence", return_value=([], "")):
+            return {os.path.relpath(i.path, self.caches): i for i in gd.survey(self.fams(*ids), 12, 0)}
+
+    def test_families_own_their_roots_with_a_24h_window(self) -> None:
+        for name in ("org.swift.swiftpm", "cmux", "cmux-perf-bench/apps"):
+            (self.caches / name).mkdir(parents=True)
+        for sub in gd.JOURNEY_SUBDIRS:
+            (self.home / gd.JOURNEY_CACHE / sub).mkdir(parents=True)
+        fams = {f.id: f for f in gd.default_families()}
+        for fid in gd.GIT_CACHE_FAMILY_IDS:
+            fam = fams[fid]
+            self.assertTrue(fam.git_cache and fam.git_disposable and fam.nested_git, fid)
+            self.assertTrue(fam.reclaimable and fam.owner and fam.rebuild, fid)
+            self.assertEqual(gd.idle_window(fam, 2.0), 24.0)
+            self.assertEqual(gd.idle_window(fam, 72.0), 24.0)
+            self.assertIn(fid, gd.OUT_OF_BAND_FAMILY_IDS)
+        for name in ("org.swift.swiftpm", "cmux", "cmux-perf-bench"):
+            self.assertIn(name, fams["library-caches"].skip, "one family per root")
+        self.assertIn("cmux-cua", fams["cmux-tool-cache"].skip, "cua-cache's")
+        self.assertIn("apps", fams["cmux-perf-bench"].skip, "cmux-perf-bench-apps'")
+        # the other build caches named in the sweep already have families that run no git check
+        self.assertTrue(gd.cmux_next_ci_family(self.caches / "cmux-next-ci").build_output)
+        self.assertTrue(gd.nightly_next_family(self.caches / "cmux-nightly-next").build_output)
+        self.assertTrue(all(fams[f"journey-{sub}"].build_output for sub in gd.JOURNEY_SUBDIRS))
+
+    def test_swiftpm_mirrors_idle_a_day_go_and_a_push_target_stays(self) -> None:
+        spm = self.caches / "org.swift.swiftpm"
+        old = self.mirror(spm / "repositories/swift-collections-a1b2c3d4", 30)
+        server = self.mirror(spm / "repositories/swift-atomics-0f0f0f0f", 30, "https://github.com/apple/swift-atomics")
+        fresh = self.mirror(spm / "repositories/swift-syntax-deadbeef", 2)
+        lone = spm / "repositories/no-remote-cafecafe"  # no remote: its commits may be nowhere else
+        self.git("init", "-q", "--bare", str(lone))
+        self.git("--git-dir", str(lone), "fetch", "-q", str(self.upstream), "main:main")
+        self.age(lone, 30)
+        artifact = spm / "artifacts/https___example_com_x"
+        artifact.mkdir(parents=True)
+        (artifact / "x.zip").write_bytes(b"\0" * 4096)
+        self.age(artifact, 30)
+        before = {f.id: f for f in gd.default_families()}["library-caches"]
+        with mock.patch.object(gd, "process_evidence", return_value=([], "")):
+            whole = gd.survey([replace(before, skip=())], 12, 0)
+        self.assertEqual({i.verdict for i in whole if i.path == str(spm)}, {"git-checkout"},
+                         "the bug: one blocked item")
+        items = self.survey(gd.SWIFTPM_CACHE_FAMILY)
+        rel = lambda p: os.path.relpath(p, self.caches)  # noqa: E731
+        self.assertEqual(items[rel(old)].verdict, "reclaimable", items[rel(old)].reasons)
+        self.assertEqual(items[rel(server)].verdict, "reclaimable", items[rel(server)].reasons)
+        self.assertEqual(items[rel(artifact)].verdict, "reclaimable")
+        self.assertEqual(items[rel(fresh)].verdict, "recent")
+        self.assertEqual(items[rel(lone)].verdict, "git-checkout", "a bare repository with no remote is no mirror")
+        receipt = self.root / "receipt.jsonl"
+        fams = {f.id: f for f in self.fams(gd.SWIFTPM_CACHE_FAMILY)}
+        with contextlib.redirect_stdout(io.StringIO()), \
+                mock.patch.object(gd, "process_evidence", return_value=([], "")):
+            gd.apply([items[rel(old)], items[rel(server)]], fams, receipt, None, 12)
+        self.assertFalse(old.exists(), receipt.read_text())
+        self.assertFalse(server.exists())
+        self.assertTrue(fresh.exists() and lone.exists())
+
+    def test_cmux_tool_cache_keeps_a_checkout_with_work_and_leaves_cua_alone(self) -> None:
+        cmux = self.caches / "cmux"
+        mirrors = self.mirror(cmux / "coderouter/src.git", 30)
+        (cmux / "coderouter/bin").mkdir()
+        (cmux / "coderouter/bin/coderouter").write_bytes(b"\0" * 4096)
+        self.age(cmux / "coderouter", 30)
+        clean = self.clone(cmux / "cu-driver-eval/src", 30)
+        self.age(cmux / "cu-driver-eval", 30)
+        dirty = self.clone(cmux / "pinned-shells/src", 30, work="dirty")
+        self.age(cmux / "pinned-shells", 30)
+        unpushed = self.clone(cmux / "cef/src", 30, work="unpushed")
+        self.age(cmux / "cef", 30)
+        cua = self.mirror(cmux / "cmux-cua/build-src", 30)
+        items = self.survey("cmux-tool-cache")
+        self.assertEqual(items["cmux/coderouter"].verdict, "reclaimable", items["cmux/coderouter"].reasons)
+        self.assertEqual(items["cmux/cu-driver-eval"].verdict, "reclaimable", items["cmux/cu-driver-eval"].reasons)
+        self.assertEqual(items["cmux/pinned-shells"].verdict, "git-checkout")
+        self.assertIn("uncommitted or untracked changes", " ".join(items["cmux/pinned-shells"].reasons))
+        self.assertEqual(items["cmux/cef"].verdict, "git-checkout")
+        self.assertNotIn("cmux/cmux-cua", items)
+        receipt = self.root / "receipt.jsonl"
+        with contextlib.redirect_stdout(io.StringIO()), \
+                mock.patch.object(gd, "process_evidence", return_value=([], "")):
+            gd.apply(list(items.values()), {f.id: f for f in self.fams("cmux-tool-cache")}, receipt, None, 12)
+        self.assertFalse(mirrors.exists() or clean.exists(), receipt.read_text())
+        self.assertTrue(dirty.exists() and unpushed.exists() and cua.exists())
+
+    def test_cmux_perf_bench_entries_and_apps_go_by_entry(self) -> None:
+        bench = self.caches / "cmux-perf-bench"
+        helper = bench / "benchhelper-0123abcd"
+        helper.mkdir(parents=True)
+        (helper / "helper").write_bytes(b"\0" * 4096)
+        self.age(helper, 30)
+        app = bench / "apps/chrome/2026-10-20/Google Chrome.app"
+        deep = app
+        for _ in range(8):  # deeper than the generic git search reaches
+            deep = deep / "Contents"
+        deep.mkdir(parents=True)
+        (deep / "bin").write_bytes(b"\0" * 4096)
+        self.age(bench / "apps/chrome/2026-10-20", 30)
+        current = bench / "apps/cmux-nightly/3946367535401"
+        current.mkdir(parents=True)
+        (current / "app").write_bytes(b"\0" * 4096)
+        src = self.clone(bench / "build-src/cmux", 30, work="unpushed")
+        self.age(bench / "build-src", 30)
+        items = self.survey("cmux-perf-bench", "cmux-perf-bench-apps")
+        self.assertEqual(items["cmux-perf-bench/benchhelper-0123abcd"].verdict, "reclaimable")
+        self.assertEqual(items["cmux-perf-bench/apps/chrome/2026-10-20"].verdict, "reclaimable",
+                         items["cmux-perf-bench/apps/chrome/2026-10-20"].reasons)
+        self.assertEqual(items["cmux-perf-bench/apps/cmux-nightly/3946367535401"].verdict, "recent")
+        self.assertEqual(items["cmux-perf-bench/build-src"].verdict, "git-checkout")
+        self.assertNotIn("cmux-perf-bench/apps", items)
+        self.assertTrue(src.exists())
 
 
 class DeadItemsTest(unittest.TestCase):
