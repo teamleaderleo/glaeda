@@ -292,6 +292,7 @@ jobs:
               Path("scripts/test-glaeda-lan-fetch.py"),
               Path("scripts/glaeda-gh"),
               Path("scripts/test-glaeda-gh.py"),
+              Path("scripts/benchmark-land-forward.py"),
               Path("scripts/glaeda-wallpaper-rotate"),
               Path("scripts/glaeda-sync-main"),
               Path("scripts/glaeda-nightly-only-admit"),

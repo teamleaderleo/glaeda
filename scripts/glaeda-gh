@@ -257,6 +257,11 @@ effect without a restart.
   per-caller jitter, with no read, judge, watch or nudge before it (`land status`: "parked until HH:MMZ (quota)");
   one that names no time backs off 5, 10, 20 ... at most 60 min. While the login's latch mark holds
   (rest-exhausted.json / graphql-exhausted.json under $GH_QUOTA_STATE, lw#5626) no entry is judged at all.
+  A host whose land.json names an "executor" (a program taking one JSON line on stdin, answering one, e.g.
+  ["reach", "huge-blue", ".local/bin/glaeda-gh", "land", "serve"]) runs no queue of its own: `land`, `land cancel`
+  and `land status` go to the executor's `glaeda-gh land serve`, whose queue judges, steps and notifies the
+  requester (HOST/SESSION as named here). A request the executor did not take waits in requests/ and the daemon
+  forwards it, in order; entries still open here are handed off (state "forwarded") once their running step ends.
 """
 
 from __future__ import annotations
@@ -6915,8 +6920,74 @@ def land_reads_upstream() -> bool:
 def land_direct_read(key: str) -> str | None:
     """One read of KEY's PR from GitHub through the broker, stored in the cache; None, or why it could not."""
     return direct_read({"key": key, "kind": "pr", "jobs": False, "began": time.time()})
-LAND_STATES = ("queued", "waiting_after", "judging", "acting", "waiting", "merged", "stopped", "cancelled")
-LAND_DONE = frozenset({"merged", "stopped", "cancelled"})
+
+
+# The land executor: a host that only forwards its lands. cosmic-gray (Leo's Mac), 2026-11-17: load 48 on 15 cores,
+# swap 9.4 of 10.7 GB, and its land queue ran merge_hold for every queued PR on it (base_red_excuse.py x5 and
+# pr_owner.py x2 at one look) and was its top REST caller (500/h). land.json's "executor" names a program, as
+# upstream.json's "command" does (`["reach", "huge-blue", ".local/bin/glaeda-gh", "land", "serve"]`), that takes one
+# JSON request line on stdin and answers one JSON line: the far side is `glaeda-gh land serve` on the executor host.
+# With it, this host judges, steps, watches and runs merge_hold for nothing:
+# - `land`, `land cancel` and `land status` go to the executor (the same answer they print here: a request is
+#   applied there, and the executor's queue notifies the requester, HOST/SESSION as named here, with acpmux send);
+# - a request the executor did not take (it was unreachable) stays in this host's requests/ (an outbox), and the
+#   daemon forwards it, in order, until the executor takes it: nothing is lost in flight;
+# - the cutover: every entry this host's queue still has open is handed to the executor (its requester, --after and
+#   request id kept, so a resend is applied once), then left "forwarded" here. One whose step is running here is
+#   handed off when that step ends; a request for it in the meantime is applied here first, so the handoff carries it.
+LAND_EXECUTOR_KEY = "executor"
+LAND_FORWARD_DEADLINE = 60.0  # one run of the executor command (plus a land's --wait)
+LAND_FORWARD_RETRY = 60.0  # after a failed forward, doubling, at most LAND_FORWARD_RETRY_MAX
+LAND_FORWARD_RETRY_MAX = 600.0
+LAND_FORWARD_BATCH = 50  # requests per forward
+LAND_SERVE_WAIT = 10.0  # `land serve`: how long a land waits for the executor's daemon to pick its request up
+LAND_SERVE_OPS = ("land", "withdraw", "status", "batch")
+LAND_FORWARDED = "forwarded"
+LAND_FORWARD_FILE = "forward.json"  # the last forward's outcome, for `land status`
+LAND_REQUEST_ID = re.compile(r"[A-Za-z0-9._:-]{1,160}")
+
+
+def land_executor(config: dict | None = None) -> list[str] | None:
+    """land.json's "executor" program (a list of words), or None: this host runs its own land queue."""
+    command = (land_config() if config is None else config).get(LAND_EXECUTOR_KEY)
+    if isinstance(command, list) and command and all(isinstance(a, str) and a for a in command):
+        return command
+    return None
+
+
+def land_forward(command: list[str], request: dict, deadline: float = LAND_FORWARD_DEADLINE,
+                 run: Callable[..., subprocess.CompletedProcess] | None = None) -> dict:
+    """REQUEST sent to the executor (land_executor) as one JSON line; its answer, a dict with "ok", or WatchError."""
+    exe = program_path(command[0])
+    try:
+        result = (run or run_bounded)([exe, *command[1:]], deadline, input_text=json.dumps(request) + "\n")
+    except subprocess.TimeoutExpired:
+        raise WatchError(f"land executor: no answer within {deadline:.0f}s") from None
+    except OSError as error:
+        raise WatchError(f"land executor: {type(error).__name__} running {command[0]}") from None
+    lines = (result.stdout or "").strip().splitlines()
+    try:
+        answer = json.loads(lines[-1]) if lines else None
+    except ValueError:
+        answer = None
+    if not isinstance(answer, dict):
+        tail = (result.stderr or "").strip().splitlines()[-1:] or [f"exit {result.returncode}"]
+        raise WatchError(f"land executor: {command[0]}: {tail[0]}"[:UPSTREAM_ERROR_MAX])
+    if not answer.get("ok") and answer.get("code") in ("not_executor", "bad_request"):
+        raise WatchError(f"land executor: {answer.get('code')}: {land_trim(answer.get('reason'), 200)}")
+    return answer
+
+
+def land_forward_name(command: list[str]) -> str:
+    """The executor as said in messages: `reach HOST ...`'s HOST, else the program's words."""
+    if Path(command[0]).name in ("reach", "ssh") and len(command) > 1:
+        return command[1]
+    return " ".join(command)[:120]
+
+
+LAND_STATES = ("queued", "waiting_after", "judging", "acting", "waiting", "merged", "stopped", "cancelled",
+               LAND_FORWARDED)
+LAND_DONE = frozenset({"merged", "stopped", "cancelled", LAND_FORWARDED})
 LAND_WITHDRAW = "withdraw"  # the request op `land cancel` writes
 
 
@@ -7221,8 +7292,14 @@ class LandQueue:
                  notice: Callable[[str, str, str, dict], None] | None = None, inline: bool = False,
                  config: dict | None = None, reads_upstream: Callable[[], bool] = land_reads_upstream,
                  refresh: Callable[[str], str | None] = land_direct_read,
-                 behind: Callable[[Path, int, float, float], str | None] = land_checkout_behind) -> None:
+                 behind: Callable[[Path, int, float, float], str | None] = land_checkout_behind,
+                 forward: Callable[[list[str], dict, float], dict] = land_forward) -> None:
         self.run = run or (lambda argv, timeout, env: self._run_real(argv, timeout, env))
+        self.forward = forward
+        self.sending: set[str] = set()  # keys whose handoff is in flight to the executor (forward_tick)
+        self.forward_thread: threading.Thread | None = None
+        self.forward_after = float("-inf")  # no forward before this (a failed one backs off)
+        self.forward_fails = 0
         self.cache_of = cache_of
         self.watch = watch or (lambda key: register(key, waited=True, reader=f"tool:{LAND_TAG}"))
         self.nudge = nudge or (lambda key: None)
@@ -7383,6 +7460,10 @@ class LandQueue:
 
     def tick(self, now: float | None = None) -> None:
         self.now = time.time() if now is None else now
+        executor = land_executor(self.config())
+        if executor is not None:
+            self.forward_tick(executor)
+            return
         self.ingest()
         self.reap()
         if self.refuse():
@@ -7405,6 +7486,132 @@ class LandQueue:
                     self.consider(e)
             except Exception as error:  # noqa: BLE001  one bad entry must not stop the others
                 log({"event": "land-error", "key": key, "error": describe(error), "site": error_site(error)})
+
+    # -- forwarding to the land executor (land_executor): this host judges nothing
+
+    def forward_tick(self, command: list[str]) -> None:
+        """One pass on a host that forwards its lands: apply here the requests for entries still open here, hand those
+        entries to the executor, and send the rest of requests/ there, in order, off the tick."""
+        self.reap()
+        d = self.requests_dir()
+        with self.lock:
+            for path in sorted(d.glob("*.json")) if d.is_dir() else []:
+                req = read_json(path)
+                try:
+                    key, repo, number = land_key(str((req or {}).get("target") or ""))
+                except (WatchError, AttributeError):
+                    path.unlink(missing_ok=True)
+                    continue
+                e = self.entries.get(key)
+                if key in self.sending or e is None or e["state"] in LAND_DONE:
+                    continue  # forwarded after the handoff in flight, or as it is (forward_batch)
+                try:
+                    self.apply(req, key, repo, number)
+                except Exception as error:  # noqa: BLE001  one bad request must not stall the queue
+                    log({"event": "land-error", "request": path.name, "error": describe(error),
+                         "site": error_site(error)})
+                    with contextlib.suppress(OSError):
+                        path.rename(path.with_suffix(".bad"))
+                    continue
+                path.unlink(missing_ok=True)
+            for key in list(self.entries):
+                e = self.entries[key]
+                if e["state"] in LAND_DONE and self.now - float(e.get("updated") or 0) > LAND_KEEP:
+                    (self.entries_dir() / file_name(key)).unlink(missing_ok=True)
+                    del self.entries[key]
+        if self.forward_thread is not None and self.forward_thread.is_alive():
+            return
+        if self.now < self.forward_after:
+            return
+        batch, files, handed = self.forward_batch()
+        if not batch:
+            return
+        self.sending = {key for key, _ in handed}
+        args = (command, batch, files, handed)
+        if self.inline:
+            self.forward_send(*args)
+        else:
+            self.forward_thread = threading.Thread(target=self.forward_send, args=args, name="land-forward",
+                                                   daemon=True)
+            self.forward_thread.start()
+
+    def forward_batch(self) -> tuple[list[dict], list[tuple[str, Path]], list[tuple[str, int]]]:
+        """(the requests to send, (id, file) of each from requests/, (key, gen) of each entry handed off): the entries
+        open here first (none whose step still runs), then requests/ in order, at most LAND_FORWARD_BATCH."""
+        batch: list[dict] = []
+        handed: list[tuple[str, int]] = []
+        files: list[tuple[str, Path]] = []
+        with self.lock:
+            for key, e in sorted(self.entries.items(), key=lambda kv: float(kv[1].get("created") or 0)):
+                if e["state"] in LAND_DONE or key in self.jobs or len(batch) >= LAND_FORWARD_BATCH:
+                    continue
+                rid = str(e.get("requestId") or "")
+                batch.append({"id": rid if LAND_REQUEST_ID.fullmatch(rid) else f"handoff-{file_name(key)[:16]}-"
+                              f"{int(e.get('gen') or 0)}", "op": "land", "target": key_name(key),
+                              "after": [key_name(a) for a in e.get("after") or []],
+                              "requester": e.get("requester") or "", "requesterFrom": e.get("requesterFrom") or "",
+                              "queuedBy": e.get("queuedBy") or "", "handoff": True})
+                handed.append((key, int(e.get("gen") or 0)))
+            d = self.requests_dir()
+            blocked = {k for k, e in self.entries.items() if e["state"] not in LAND_DONE}
+            for path in sorted(d.glob("*.json")) if d.is_dir() else []:
+                if len(batch) >= LAND_FORWARD_BATCH:
+                    break
+                req = read_json(path)
+                if not isinstance(req, dict) or not isinstance(req.get("target"), str):
+                    continue
+                if req.get("key") in blocked:
+                    break  # this key's entry is handed off first: what follows waits, so the order holds
+                rid = str(req.get("id") or "")
+                if not LAND_REQUEST_ID.fullmatch(rid):
+                    rid = path.stem
+                batch.append({k: req.get(k) for k in ("op", "target", "after", "requester", "requesterFrom",
+                                                      "queuedBy")} | {"id": rid})
+                files.append((rid, path))
+        return batch, files, handed
+
+    def forward_send(self, command: list[str], batch: list[dict], files: list[tuple[str, Path]],
+                     handed: list[tuple[str, int]]) -> None:
+        name = land_forward_name(command)
+        try:
+            answer = self.forward(command, {"op": "batch", "requests": batch, "from": policy_host()},
+                                  LAND_FORWARD_DEADLINE)
+            if not answer.get("ok"):
+                raise WatchError(f"land executor {name}: {land_trim(answer.get('reason') or answer.get('code'), 200)}")
+            accepted = {str(a) for a in answer.get("accepted") or []}
+        except Exception as error:  # noqa: BLE001  an unreachable executor is retried, never fatal
+            why = str(error) if isinstance(error, WatchError) else describe(error)
+            with self.lock:
+                self.sending = set()
+                self.forward_fails += 1
+                wait = min(LAND_FORWARD_RETRY_MAX, LAND_FORWARD_RETRY * 2 ** (self.forward_fails - 1))
+                self.forward_after = self.now + wait
+                write_json(land_dir() / LAND_FORWARD_FILE, {"executor": name, "state": "failing", "error": why,
+                                                            "at": self.now, "pending": len(batch),
+                                                            "retryAt": self.forward_after})
+            log({"event": "land-forward-failed", "executor": name, "error": why, "pending": len(batch)})
+            if self.forward_fails == 1:
+                with contextlib.suppress(Exception):
+                    self.notice("land-forward-failed", "warn", f"glaeda land could not hand {len(batch)} request(s) "
+                                f"to its executor {name}: {why}; they stay queued here and are sent again",
+                                {"executor": name, "error": why})
+            return
+        with self.lock:
+            self.sending = set()
+            self.forward_fails = 0
+            self.forward_after = float("-inf")
+            for rid, path in files:
+                if rid in accepted:
+                    path.unlink(missing_ok=True)
+            for (key, gen), req in zip(handed, batch):
+                e = self.entries.get(key)
+                if req["id"] in accepted and e and e["state"] not in LAND_DONE and int(e.get("gen") or 0) == gen:
+                    e.update(state=LAND_FORWARDED, wait=None, wakeAt=None, action=None, forwardedTo=name)
+                    self.history(e, "handed_off", to=name, request=req["id"])
+                    self.save(e)
+            write_json(land_dir() / LAND_FORWARD_FILE, {"executor": name, "state": "ok", "at": self.now,
+                                                        "sent": len(accepted)})
+        log({"event": "land-forwarded", "executor": name, "sent": len(accepted), "handedOff": len(handed)})
 
     def latch_held(self) -> tuple[str, float] | None:
         """The login's latch (land_latch) before a judge pass; logged once when it starts holding and once when it
@@ -8203,11 +8410,23 @@ def land_counts() -> dict:
     return doc.get("days") if isinstance(doc, dict) and isinstance(doc.get("days"), dict) else {}
 
 
-def land_request(op: str, target: str, after: list[str], requester: str, source: str = "") -> str:
-    rid = f"{time.time_ns()}-{os.getpid()}"
-    write_json(LandQueue.requests_dir() / f"{rid}.json",
+_land_seq = 0
+
+
+def land_request(op: str, target: str, after: list[str], requester: str, source: str = "", rid: str = "",
+                 queued_by: str = "") -> str:
+    """Write one request for the daemon's queue (requests/); its id. RID and QUEUED_BY are kept as given (a forwarded
+    request's, so the executor applies a resend once): else a new id and this process's reader."""
+    # The file is named for its arrival here (ingest applies requests/ in name order); the id inside is the request's.
+    # A sequence number keeps a batch's requests apart and in order where time_ns() ticks in microseconds (macOS).
+    global _land_seq
+    _land_seq += 1
+    name = f"{time.time_ns()}-{os.getpid()}-{_land_seq:06d}"
+    rid = rid if rid and LAND_REQUEST_ID.fullmatch(rid) else name
+    write_json(LandQueue.requests_dir() / f"{name}.json",
                {"id": rid, "op": op, "target": target, "key": land_key(target)[0], "after": after,
-                "requester": requester, "requesterFrom": source, "queuedBy": reader_name(), "at": time.time()})
+                "requester": requester, "requesterFrom": source, "queuedBy": queued_by or reader_name(),
+                "at": time.time()})
     return rid
 
 
@@ -8249,19 +8468,44 @@ def land_line(e: dict, now: float) -> str:
     return "  ".join(bits)
 
 
-def cmd_land_status(target: str | None, as_json: bool) -> int:
+def land_status_doc(target: str | None) -> dict:
+    """What `land status` shows of this host's queue (`land serve`'s status answer too)."""
     entries = land_entries()
     if target:
         key = land_key(target)[0]
         entries = [e for e in entries if e.get("key") == key]
-    counts = land_counts()
     refused = read_json(land_dir() / LAND_REFUSED_FILE)
-    refused = refused if isinstance(refused, dict) else None
+    stale = read_json(land_dir() / LAND_STALE_CHECKOUT_FILE)
+    return {"ok": True, "entries": entries, "steps": land_counts(), "refused": refused if isinstance(refused, dict)
+            else None, "stale": stale if isinstance(stale, dict) else None}
+
+
+def cmd_land_status(target: str | None, as_json: bool) -> int:
+    doc = land_status_doc(target)
+    executor = land_executor()
+    if executor is not None:
+        # This host forwards its lands: the executor's queue, with what is still open or waiting here.
+        name = land_forward_name(executor)
+        mine = [e for e in doc["entries"] if e.get("state") != LAND_FORWARDED]
+        try:
+            remote = land_forward(executor, {"op": "status", "target": target})
+            remote_entries = [e for e in remote.get("entries") or [] if isinstance(e, dict)]
+            doc = {**remote, "entries": mine + remote_entries, "executor": name}
+        except WatchError as error:
+            doc = {**doc, "entries": mine, "executor": name, "executorError": str(error)}
+        d = LandQueue.requests_dir()
+        doc["pendingForward"] = len(list(d.glob("*.json"))) if d.is_dir() else 0
+        doc["forward"] = read_json(land_dir() / LAND_FORWARD_FILE)
+    entries, counts, refused = doc["entries"], doc.get("steps") or {}, doc.get("refused")
     if as_json:
-        print(json.dumps({"ok": True, "entries": entries, "steps": counts, "refused": refused}, sort_keys=True))
+        print(json.dumps(doc, sort_keys=True))
         return EXIT_OK if entries or not target else EXIT_FAIL
     now = time.time()
-    stale = read_json(land_dir() / LAND_STALE_CHECKOUT_FILE)
+    if executor is not None:
+        print(f"glaeda land: this host forwards its lands to {doc['executor']}"
+              + (f"; {doc['pendingForward']} request(s) wait here to be sent" if doc["pendingForward"] else "")
+              + (f"; the executor did not answer: {doc['executorError']}" if doc.get("executorError") else ""))
+    stale = doc.get("stale")
     if isinstance(stale, dict) and stale.get("reason"):
         print(f"glaeda land: WARNING: {stale['reason']}")
     if refused:
@@ -8295,11 +8539,87 @@ def cmd_land_status(target: str | None, as_json: bool) -> int:
     return EXIT_OK
 
 
+def land_outbox_busy(key: str) -> bool:
+    """On a forwarding host: whether a request must wait in requests/ (the daemon forwards it in order) rather than go
+    to the executor now: an older request is still waiting there, or KEY's entry is still open here."""
+    d = LandQueue.requests_dir()
+    if d.is_dir() and any(d.glob("*.json")):
+        return True
+    e = read_json(LandQueue.entries_dir() / file_name(key))
+    return isinstance(e, dict) and e.get("state") not in LAND_DONE
+
+
+def land_print_answer(out: dict, as_json: bool, key: str, where: str) -> None:
+    entry = out.get("entry") if isinstance(out.get("entry"), dict) else None
+    if as_json:
+        print(json.dumps(out, sort_keys=True))
+        return
+    print((land_line(entry, time.time()) if entry else f"{key_name(key)} requested; the daemon takes it next tick")
+          + f"  (on {where})")
+    if not out.get("requester"):
+        say_waiting("glaeda-gh land: no --notify and no session in the environment ($ACPMUX_SESSION_NAME, ...): "
+                    "a stop or a merge is only a notice line (glaeda-gh land status shows it)")
+
+
+def land_forward_exit(out: dict, wait: float) -> int:
+    state = out.get("state")
+    if out.get("code") == "merge_hold_missing":
+        return EXIT_FAIL
+    if state == "merged":
+        return EXIT_OK
+    if state in ("stopped", "cancelled"):
+        return EXIT_FAIL
+    return EXIT_TIMEOUT if wait > 0 and out.get("entry") else EXIT_OK
+
+
+def cmd_land_forwarded(executor: list[str], target: str, after: list[str], requester: str, source: str, wait: float,
+                       as_json: bool) -> int:
+    """`land` on a host that forwards its lands (land_executor): to the executor now, else into requests/, which the
+    daemon forwards when the executor answers. Either way it is never lost."""
+    key, repo, number = land_key(target)
+    name = land_forward_name(executor)
+    targets = [land_key(a)[1] + f"#{land_key(a)[2]}" for a in after]
+    rid = f"{policy_host()}-{time.time_ns()}-{os.getpid()}"
+    req = {"op": "land", "target": f"{repo}#{number}", "after": targets, "requester": requester,
+           "requesterFrom": source, "queuedBy": land_queued_by(), "id": rid, "wait": wait}
+    why = "an earlier request is still waiting to be forwarded" if land_outbox_busy(key) else ""
+    if not why:
+        try:
+            out = land_forward(executor, req, LAND_FORWARD_DEADLINE + wait)
+        except WatchError as error:
+            why = str(error)
+        else:
+            land_print_answer(out, as_json, key, name)
+            if out.get("code") == "merge_hold_missing" and not as_json:
+                say_waiting(f"glaeda land: refused on {name}: {out.get('reason')}\nnext: {out.get('next')}")
+            return land_forward_exit(out, wait)
+    land_request("land", f"{repo}#{number}", targets, requester, source, rid=rid, queued_by=req["queuedBy"])
+    out = {"ok": True, "key": key, "state": "requested", "requester": requester, "request": rid, "entry": None,
+           "forwardTo": name, "pending": why}
+    if as_json:
+        print(json.dumps(out, sort_keys=True))
+    else:
+        print(f"{key_name(key)} requested; this host forwards it to {name} ({why})")
+        if not daemon_running():
+            say_waiting(f"glaeda-gh: {down_message()} The request stays queued for it.")
+            say_waiting("next: glaeda-gh restart")
+    return EXIT_OK
+
+
+def land_queued_by() -> str:
+    """Who queued a request, as the executor keeps it: HOST/READER (a forwarded request's reader is this host's)."""
+    reader = reader_name()
+    return reader if "/" in reader else f"{policy_host()}/{reader}"
+
+
 def cmd_land(target: str, after: list[str], notify: str | None, wait: float, as_json: bool) -> int:
     key, repo, number = land_key(target)
     for a in after:
         land_key(a)
     requester, source = land_requester_from(notify)
+    executor = land_executor()
+    if executor is not None:
+        return cmd_land_forwarded(executor, target, after, requester, source, wait, as_json)
     mh, tried = land_merge_hold(land_config())
     if mh is None:
         # The startup check's twin: nothing on this host could judge the merge, so it is not queued.
@@ -8348,11 +8668,113 @@ def cmd_land(target: str, after: list[str], notify: str | None, wait: float, as_
 
 def cmd_land_cancel(target: str, as_json: bool) -> int:
     key = land_key(target)[0]
-    land_request(LAND_WITHDRAW, target, [], land_requester(None))
+    executor = land_executor()
+    if executor is not None and not land_outbox_busy(key):
+        rid = f"{policy_host()}-{time.time_ns()}-{os.getpid()}"
+        try:
+            land_forward(executor, {"op": LAND_WITHDRAW, "target": target, "after": [],
+                                    "requester": land_requester(None),
+                                    "queuedBy": land_queued_by(), "id": rid})
+        except WatchError as error:
+            say_waiting(f"glaeda land: {error}; the cancel waits here and is forwarded when it answers")
+            land_request(LAND_WITHDRAW, target, [], land_requester(None), rid=rid)
+    else:
+        land_request(LAND_WITHDRAW, target, [], land_requester(None))
     if as_json:
         print(json.dumps({"ok": True, "key": key, "state": "cancel requested"}))
     else:
         print(f"{key_name(key)}: cancel requested")
+    return EXIT_OK
+
+
+def land_serve_one(req: Any) -> tuple[str | None, str]:
+    """Write one forwarded land or withdraw request into this host's queue: (its id, "") or (None, why not)."""
+    if not isinstance(req, dict) or req.get("op") not in ("land", LAND_WITHDRAW):
+        return None, "a request is a land or a withdraw"
+    try:
+        land_key(str(req.get("target") or ""))
+        after = [str(a) for a in req.get("after") or []]
+        for a in after:
+            land_key(a)
+    except (WatchError, TypeError):
+        return None, f"not a pull request: {str(req.get('target'))[:80]!r}"
+    requester = str(req.get("requester") or "")
+    if requester and not re.fullmatch(r"[A-Za-z0-9._-]{1,64}/[A-Za-z0-9._:-]{1,100}", requester):
+        return None, f"not HOST/SESSION: {requester[:80]!r}"
+    queued_by = str(req.get("queuedBy") or "")
+    queued_by = queued_by if re.fullmatch(r"[A-Za-z0-9._:/-]{1,200}", queued_by) else "tool:land-forward"
+    rid = land_request(str(req["op"]), str(req["target"]), after, requester, str(req.get("requesterFrom") or "")[:80],
+                       rid=str(req.get("id") or ""), queued_by=queued_by)
+    return rid, ""
+
+
+def cmd_land_serve(text: str) -> int:
+    """`land serve`: the executor's end of land.json's "executor" on a forwarding host. One JSON request line on stdin
+    ({"op": "land" | "withdraw" | "status" | "batch", ...}), one JSON answer line on stdout. A host that forwards its
+    own lands is no executor: it refuses, so two hosts never hand a PR back and forth."""
+    try:
+        req = json.loads(text)
+    except ValueError:
+        req = None
+    if not isinstance(req, dict) or req.get("op") not in LAND_SERVE_OPS:
+        print(json.dumps({"ok": False, "code": "bad_request", "reason": f"land serve takes one JSON line with an op "
+                                                                        f"of {', '.join(LAND_SERVE_OPS)}"}))
+        return EXIT_FAIL
+    executor = land_executor()
+    if executor is not None:
+        print(json.dumps({"ok": False, "code": "not_executor", "reason": f"{policy_host()} forwards its own lands to "
+                          f"{land_forward_name(executor)} (land.json executor); it serves none"}))
+        return EXIT_FAIL
+    op = req["op"]
+    if op == "status":
+        target = req.get("target")
+        try:
+            print(json.dumps({**land_status_doc(target if isinstance(target, str) and target else None),
+                              "host": policy_host()}, sort_keys=True))
+        except WatchError as error:
+            print(json.dumps({"ok": False, "code": "bad_request", "reason": str(error)}))
+            return EXIT_FAIL
+        return EXIT_OK
+    mh, tried = land_merge_hold(land_config())
+    if mh is None and op in ("land", "batch"):
+        why, nxt = land_merge_hold_missing(tried)
+        print(json.dumps({"ok": False, "code": "merge_hold_missing", "reason": why, "next": nxt,
+                          "host": policy_host()}, sort_keys=True))
+        return EXIT_FAIL
+    if op == "batch":
+        accepted, refused = [], []
+        for item in (req.get("requests") or [])[:LAND_FORWARD_BATCH]:
+            rid, why = land_serve_one(item)
+            if rid is None:
+                refused.append({"id": (item or {}).get("id") if isinstance(item, dict) else None, "why": why})
+            # A request refused for its shape is taken too (as refused): sent again it would be refused again.
+            accepted.append(rid if rid is not None else str((item or {}).get("id") if isinstance(item, dict) else ""))
+        print(json.dumps({"ok": True, "accepted": accepted, "refused": refused, "host": policy_host(),
+                          "running": daemon_running()}, sort_keys=True))
+        return EXIT_OK
+    rid, why = land_serve_one(req)
+    if rid is None:
+        print(json.dumps({"ok": False, "code": "bad_request", "reason": why}))
+        return EXIT_FAIL
+    key = land_key(str(req["target"]))[0]
+    running = daemon_running()
+    entry = None
+    if op == "land":
+        wait = req.get("wait") if isinstance(req.get("wait"), (int, float)) else 0
+        deadline = time.monotonic() + max(LAND_SERVE_WAIT, min(float(wait), 86400.0))
+        while running:
+            entry = read_json(LandQueue.entries_dir() / file_name(key))
+            picked = isinstance(entry, dict) and entry.get("requestId") == rid
+            if (picked and (wait <= 0 or entry.get("state") in LAND_DONE)) or time.monotonic() >= deadline:
+                break
+            time.sleep(0.5 if not picked else 1.0)
+    picked = isinstance(entry, dict) and entry.get("requestId") == rid
+    out = {"ok": True, "key": key, "state": entry.get("state") if picked else "requested", "request": rid,
+           "requester": req.get("requester") or "", "entry": entry if picked else None, "host": policy_host(),
+           "running": running}
+    if not running:
+        out.update(code="daemon_down", reason="the executor's daemon is down; the request stays queued there")
+    print(json.dumps(out, sort_keys=True))
     return EXIT_OK
 
 
@@ -15017,7 +15439,8 @@ def parser() -> argparse.ArgumentParser:
     oe.add_argument("--json", action="store_true")
     ld = sub.add_parser("land", help="land a PR: the daemon takes each step merge_hold names until it merges or stops "
                                      "(land status, land cancel)")
-    ld.add_argument("words", nargs="+", metavar="OWNER/REPO#N | status [OWNER/REPO#N] | cancel OWNER/REPO#N")
+    ld.add_argument("words", nargs="+",
+                    metavar="OWNER/REPO#N | status [OWNER/REPO#N] | cancel OWNER/REPO#N | serve")
     ld.add_argument("--after", action="append", default=[], metavar="OWNER/REPO#M",
                     help="land only after this PR merged (repeatable); it closing unmerged or its own land stopping "
                          "stops this one")
@@ -15080,6 +15503,8 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_restart(args.force)
         if args.command == "land":
             words = args.words
+            if words == ["serve"]:
+                return cmd_land_serve(sys.stdin.readline())
             if words[0] == "status":
                 if len(words) > 2:
                     raise WatchError("land status takes at most one OWNER/REPO#N")
