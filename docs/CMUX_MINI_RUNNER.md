@@ -759,6 +759,9 @@ token) and wait at most `NIGHTLY_CAPACITY_WAIT_S` on any attempt, since a nightl
 waiter holds every other gate on its mini; a refused one is re-run by cmux's
 owned-pool rescue, and the re-run takes Blacksmith. The launch smoke's `pick`,
 `record` and `crashed` jobs share its slot and build nothing, so they are `light`.
+So are the canary's `pick`, `verdict` and `failed`, and any job of either
+workflow that no table names: costed as a compile, the canary's `pick` was
+refused on busy nightly minis from 2026-11-17 09:37Z and cancelled its runs.
 The DEV daily's Mac jobs (`verify`, `tip-dmg-build`) are `light` (they work only
 in `$RUNNER_TEMP`) and wait up to `NIGHTLY_CAPACITY_WAIT_S` on main's dispatch. GitHub
 hands a queued job to the next idle runner in arrival order, so a nightly job

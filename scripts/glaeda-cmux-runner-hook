@@ -576,6 +576,15 @@ WORKFLOW_JOB_CLASSES = {# the iOS reliability matrix's phone cells: cargo builds
                         ("nightly-next-launch-smoke.yml", "pick"): "light",
                         ("nightly-next-launch-smoke.yml", "record"): "light",
                         ("nightly-next-launch-smoke.yml", "crashed"): "light",
+                        # The canary's other jobs, the same way: pick reads the feed and the verdict cache, verdict
+                        # writes the verdict and dispatches nightly-next-verdict.yml, failed dispatches the rollback
+                        # and files an issue. As unknown jobs they were compiles: from about 09:37Z on 2026-11-17
+                        # scheduled canaries ended cancelled, cmux run 44067455848's pick refused after 300 s with
+                        # "4 of 14 units free, pick (compile) needs 5". job_class makes any job of these workflows
+                        # that no row names light too (NIGHTLY_VERIFY_WORKFLOWS build nothing).
+                        ("nightly-next-canary.yml", "pick"): "light",
+                        ("nightly-next-canary.yml", "verdict"): "light",
+                        ("nightly-next-canary.yml", "failed"): "light",
                         ("nightly.yml", "verify-signed-nightly"): "light",
                         # the release-surface ack gate only waits for an environment approval: no key, no build
                         ("nightly.yml", "await-release-surface-ack"): "light",
@@ -1731,6 +1740,11 @@ def job_class(job: str, repo: str | None, home_repo: str = DEFAULT_HOME_REPO,
         return WORKFLOW_JOB_CLASSES[(workflow, job)], False
     if job in SIM_SLOT_JOBS and sim_slots > 1:
         return "simulator", False
+    if workflow in NIGHTLY_VERIFY_WORKFLOWS and job not in JOB_CLASSES:
+        # main's canary and launch smoke check a published DMG and build nothing; as nightly jobs they wait 300 s at
+        # most, so a job they add costed as a compile (5 units and a root) is refused on a busy mini and cancels
+        # every scheduled run (the canary's pick, 2026-11-17). Unlisted, such a job is light.
+        return "light", False
     return JOB_CLASSES.get(job, "compile"), job not in JOB_CLASSES
 
 
