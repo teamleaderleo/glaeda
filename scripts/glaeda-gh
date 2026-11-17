@@ -11786,11 +11786,18 @@ def spend_lines(spend: Any) -> list[str]:
 # What each host prints for fleet_budget: the files it already keeps and its gh-quota usage, between marker lines.
 # POSIX sh (a Mac's login shell may be zsh; `sh -c` keeps it one dialect). The daemon's state dir is the default one:
 # GLAEDA_GH_DIR is a test's or an operator's override and an ssh session does not carry it.
+# gh-quota is the first of FLEET_GH_QUOTA_PATHS present: a full setup links ~/.local/bin/gh-quota, and a lighter one
+# links ~/.local/lib/gh-quota/bin/gh-quota beside the gh shim. 2026-11-17: two hosts with only the second answered
+# "gh-quota usage gave nothing" and read as 0 REST while one of them alone spent about 760 an hour, so most of the
+# login's hour looked like calls from nowhere.
+FLEET_GH_QUOTA_PATHS = ("$HOME/.local/bin/gh-quota", "$HOME/.local/lib/gh-quota/bin/gh-quota")
 FLEET_HOST_SCRIPT = (
     'd="${GLAEDA_GH_DIR:-$HOME/.cache/glaeda/gh}"; '
     'echo "@@budget"; cat "$d/budget.json" 2>/dev/null; echo; '
     'echo "@@daemon"; cat "$d/daemon.json" 2>/dev/null; echo; '
-    'echo "@@usage"; "$HOME/.local/bin/gh-quota" usage --json 2>/dev/null; echo; '
+    'q=; for c in ' + " ".join(f'"{p}"' for p in FLEET_GH_QUOTA_PATHS) + '; do [ -x "$c" ] && { q="$c"; break; }; '
+    'done; '
+    'echo "@@usage"; [ -n "$q" ] && "$q" usage --json 2>/dev/null; echo; '
     'echo "@@end"')
 
 

@@ -5332,6 +5332,24 @@ class FleetBudgetTest(Base):
         gg.REACH_CMD = os.fspath(self.home / "bin" / "absent")
         self.assertIn("unreachable", gg.fetch_host("far", False)["error"])
 
+    def test_the_host_script_finds_gh_quota_where_host_baseline_links_it(self) -> None:
+        """2026-11-17: two hosts had gh-quota only under ~/.local/lib/gh-quota/bin, so `budget` read them as
+        "gh-quota usage gave nothing" and 0 REST while they spent."""
+        link = self.home / ".local/lib/gh-quota/bin/gh-quota"
+        link.parent.mkdir(parents=True)
+        link.write_text('#!/bin/sh\necho \'[{"caller": "session:x", "rest": 762, "graphql": 0}]\'\n',
+                        encoding="utf-8")
+        link.chmod(0o755)
+        env = {k: v for k, v in os.environ.items() if k != "GLAEDA_GH_DIR"}
+        done = subprocess.run(["sh", "-c", gg.FLEET_HOST_SCRIPT], capture_output=True, text=True, timeout=30,
+                              env={**env, "HOME": os.fspath(self.home)})
+        self.assertEqual(gg.parse_host_report(done.stdout)["usage"][0]["rest"], 762)
+        link.unlink()  # neither path: no usage, never an error from the host
+        done = subprocess.run(["sh", "-c", gg.FLEET_HOST_SCRIPT], capture_output=True, text=True, timeout=30,
+                              env={**env, "HOME": os.fspath(self.home)})
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIsNone(gg.parse_host_report(done.stdout)["usage"])
+
     def test_budget_prints_the_fleet_first_and_json_carries_it(self) -> None:
         now = time.time()
         reports = self.reports(now)
