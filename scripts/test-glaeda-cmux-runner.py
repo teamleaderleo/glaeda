@@ -12708,6 +12708,33 @@ class GateTest(unittest.TestCase):
         self.assertEqual(check.call_args[0][0][1:], [os.fspath(HOOK), "listen", "--no-waiters", "--adopt=4321",
                                                      "--parse-only"])
 
+    def test_a_reload_waits_while_the_job_end_freeze_is_armed(self) -> None:
+        # 2026-11-17, a lent mini: the hook changed while a lend drain and a RUNNER_DRAIN held the
+        # mini, the gate re-executed with the stop armed for its job's end, the job ended 3 s later and the
+        # listener took the next one before the new gate's first poll.
+        gate = hook.Gate(self.runner, os.fspath(self.lock), "", self.state)
+        gate.child = mock.Mock(pid=4321)
+        mask = signal.pthread_sigmask(signal.SIG_BLOCK, [])
+        self.addCleanup(signal.pthread_sigmask, signal.SIG_SETMASK, mask)
+        for armed in ({"watching": (999,), "freeze_at_exit": True}, {"job_waited": True}, {"job_ending": True},
+                      {"frozen": (998,)}):
+            with self.subTest(armed=sorted(armed)):
+                gate.source = (0, 0, 0)
+                gate.watching, gate.freeze_at_exit, gate.job_ending, gate.frozen = (), False, False, ()
+                gate.job_waited = False
+                for name, value in armed.items():
+                    setattr(gate, name, value)
+                with mock.patch.object(hook.os, "execv") as execv, mock.patch.object(hook, "gate_log"), \
+                        mock.patch.object(hook.sys, "argv", [os.fspath(HOOK), "listen"]):
+                    gate.reload()
+                execv.assert_not_called()  # the stop at the job's end stays with this gate
+                self.assertEqual(gate.source, (0, 0, 0), "the change is still seen at the next poll")
+        gate.watching, gate.freeze_at_exit, gate.job_ending, gate.frozen, gate.job_waited = (), False, False, (), False
+        with mock.patch.object(hook.os, "execv") as execv, mock.patch.object(hook, "gate_log"), \
+                mock.patch.object(hook.sys, "argv", [os.fspath(HOOK), "listen"]):
+            gate.reload()
+        execv.assert_called_once()  # disarmed, the gate reloads
+
     def test_a_reload_keeps_the_listeners_first_poll(self) -> None:
         # An --apply that lands inside a listener's first poll must not hand the re-executed gate a listener it
         # may stop at once (GATE_FIRST_POLL_S). The start goes in the environment, so argv stays one an older hook
