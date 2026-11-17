@@ -12426,7 +12426,13 @@ GH_CACHE_TARGET_WRITES = {"comment", "edit", "ready", "close", "reopen", "review
 # caller's command line to decide what to invalidate; the broker runs that write as it was typed.
 GH_CACHE_RUN_WRITES = {"rerun", "cancel"}
 # Verbs that change one PR and, through the base branch, every other PR's mergeability.
-GH_CACHE_BASE_WRITES = {"merge", "update-branch"}
+GH_CACHE_BASE_WRITES = {"merge"}
+# Verbs that move one PR's head and nothing else: `update-branch` merges the base into the PR's own
+# branch, so the base -- and every other PR's mergeability -- is what it was. Until 2026-11-17 it was
+# stamped as a base write, and on gcp-agent-lane-3 the land loop's 471 update-branch calls a day dropped
+# every PR answer of manaflow-ai/cmux each time. A stacked PR whose base is this PR's branch can see its
+# mergeability move; that is bounded by the TTL and the daemon's watch, as a push from another host is.
+GH_CACHE_HEAD_WRITES = {"update-branch"}
 # The flags of those writes, by whether they take a value, so their one positional word (the PR) can
 # be found. A write carrying a flag in neither set is stamped as wide as before.
 GH_CACHE_WRITE_VALUE_FLAGS = BROKER_VALUE_FLAGS | {
@@ -12699,6 +12705,126 @@ def gh_cache_target(words: list[str], values: dict[str, str], repo: str | None) 
     return None
 
 
+# -- one PR or run read with fewer fields: answered from a kept read of more of them
+#
+# The answer cache above keys a call on its whole line, so `pr view 7 --json title,headRefOid,...` and,
+# a second later, `pr view 7 --json headRefOid --jq .headRefOid` were two questions and two requests.
+# Measured on gcp-agent-lane-3 (2026-11-17, 24 h of the call log): half of all `pr view` calls (2,028 of
+# 4,037) re-read a PR read within 15 s, yet the broker answered 75 of 3,241 it could key, because the
+# callers ask for different field sets: merge_hold's hold read takes 15 fields, its head read one.
+#
+# So a `pr view N` or `run view ID` that is nothing but `--json F` (and `-R`), stored, is also indexed by
+# its target (gh_cache_superset_key), and a later read of that target asking for a subset of F -- with
+# or without a `--jq` that is a plain path to one value -- is printed from it, under the same TTL, write
+# stamps and daemon watch as the stored answer itself (gh_cache_get, with the caller's own TTL, so a
+# caller asking for at most 15 s old gets at most 15 s old). Printed the way gh prints `--json` to a
+# pipe (Go's encoder: sorted keys, compact, no HTML escaping), and only when the stored answer
+# re-encodes to the exact bytes gh printed, so a value this encoder would print differently is never
+# reshaped: that answer is just not used.
+GH_CACHE_SUPERSET_HEADS = {("pr", "view"): "pr", ("run", "view"): "run"}
+GH_CACHE_SUPERSET_FLAGS = {"--repo", "--json", "--jq"}
+GH_CACHE_JQ_PATH_RE = re.compile(r"^(?:\.[A-Za-z_][A-Za-z0-9_]*)+$")
+
+
+def gh_cache_superset_spec(args: list[str], words: list[str], values: dict[str, str],
+                           repo: str | None) -> tuple[list, list[str], str | None] | None:
+    """(target, the --json fields, the --jq path or None) for a read the superset index can hold or
+    answer; None for anything else (another flag, a template, a field list given twice, a --jq that is
+    not a plain path)."""
+    kind = GH_CACHE_SUPERSET_HEADS.get(tuple(words[:2]))
+    canonical = gh_cache_canonical(args)
+    if kind is None or len(words) != 3 or canonical is None:
+        return None
+    names = [name for name, _value in canonical[2]]
+    if len(names) != len(set(names)) or not set(names) <= GH_CACHE_SUPERSET_FLAGS or "--json" not in names:
+        return None
+    flags = dict((name, value) for name, value in canonical[2])
+    jq = flags.get("--jq")
+    if jq is not None and not GH_CACHE_JQ_PATH_RE.match(jq):
+        return None
+    # In the order asked: lane-gh's gh (a lane VM's) prints the fields in that order, gh sorts them.
+    fields = list(dict.fromkeys(f for f in (values.get("--json") or "").split(",") if f))
+    target = gh_cache_target(words, values, repo)
+    if not fields or target is None or target[0] != kind:
+        return None
+    return target, fields, jq
+
+
+def gh_cache_superset_key(target: list, real: str | None) -> str:
+    """The index's key for one PR or run: the target, and everything besides the line that changes what
+    gh prints for it (gh_cache_key's identity, as for any `--json` read)."""
+    ident = ["superset", target, os.environ.get("GH_REPO") or "", os.environ.get("GH_HOST") or "",
+             gh_cache_identity(real, True)]
+    return "t-" + hashlib.sha256(json.dumps(ident).encode()).hexdigest()[:40]
+
+
+def gh_json_bytes(doc: Any, style: str = "gh") -> bytes:
+    """What prints `--json` to a pipe. "gh": gh's own, Go's encoding/json with HTML escaping off, map keys
+    sorted, one line (Go also escapes U+2028 and U+2029, which Python leaves as they are). "lane": a lane
+    VM's gh, lane-gh's (leo-workspace tools/lane_gh_vm.py pick_json), Python's indent=2 in the order asked."""
+    if style == "lane":
+        return (json.dumps(doc, indent=2) + "\n").encode()
+    text = json.dumps(doc, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return (text.replace("\u2028", "\\u2028").replace("\u2029", "\\u2029") + "\n").encode()
+
+
+def gh_cache_superset_note(spec: tuple | None, key: str, at: float, real: str | None) -> None:
+    """Index a kept plain `--json` answer under its target. Lossy by design: two fills racing may keep
+    only one of their entries, which costs the next subset read a request, never a wrong answer."""
+    if spec is None or spec[2] is not None:
+        return
+    target, fields, _jq = spec
+    path = gh_cache_dir() / f"{gh_cache_superset_key(target, real)}.json"
+    doc = read_json(path)
+    entries = doc.get("entries") if isinstance(doc, dict) and isinstance(doc.get("entries"), dict) else {}
+    entries = {k: v for k, v in entries.items()
+               if isinstance(v, dict) and isinstance(v.get("at"), (int, float)) and at - v["at"] < GH_CACHE_KEEP}
+    entries[key] = {"at": at, "fields": sorted(set(fields))}
+    write_json(path, {"entries": entries})
+
+
+def gh_cache_superset_get(spec: tuple | None, repo: str | None, real: str | None, now: float) -> dict | None:
+    """An answer for a read of some fields of one PR or run, printed from a kept read of more of them;
+    None when no such read is kept and still good (gh_cache_get decides that, as for its own line)."""
+    if spec is None:
+        return None
+    target, fields, jq = spec
+    doc = read_json(gh_cache_dir() / f"{gh_cache_superset_key(target, real)}.json")
+    entries = doc.get("entries") if isinstance(doc, dict) and isinstance(doc.get("entries"), dict) else {}
+    wanted = set(fields)
+    found = sorted(((v.get("at"), k) for k, v in entries.items()
+                    if isinstance(v, dict) and isinstance(v.get("at"), (int, float))
+                    and isinstance(v.get("fields"), list) and wanted <= set(v["fields"])), reverse=True)
+    for _at, key in found:
+        answer = gh_cache_get(key, repo, now)
+        if answer is None or answer["rc"] != 0 or answer["err"]:
+            continue
+        try:
+            whole = json.loads(answer["out"])
+        except ValueError:
+            continue
+        if not isinstance(whole, dict) or not wanted <= set(whole):
+            continue
+        style = next((s for s in ("gh", "lane") if gh_json_bytes(whole, s) == answer["out"]), None)
+        if style is None:
+            continue  # not printed the way this would print it: never reshaped
+        part = {name: whole[name] for name in fields}
+        if jq is None:
+            return {"rc": 0, "out": gh_json_bytes(part, style), "err": b""}
+        value: Any = part
+        for name in jq[1:].split("."):
+            if not isinstance(value, dict) or name not in value:
+                value = None
+                break
+            value = value[name]
+        if isinstance(value, str):
+            return {"rc": 0, "out": (value + "\n").encode() if value else b"\n", "err": b""}
+        if value is None or isinstance(value, (bool, int)):
+            return {"rc": 0, "out": (json.dumps(value) + "\n").encode(), "err": b""}
+        return None  # an object, a list or a float: gh's jq prints those its own way
+    return None
+
+
 def gh_cache_stamps(target: list | None, repo: str | None, words: list[str] | None = None) -> list[str] | None:
     """The writes.json entries that make an answer old: one about `target`, or about `repo` when it
     is about nothing narrower (a list of workflow runs has a scope of its own, "runlists"). None when the
@@ -12730,7 +12856,7 @@ def gh_cache_write_scope(args: list[str], words: list[str], method: str,
     if repo is None:
         repo = broker_repo(values) if words[:1] != ["api"] else None
     if repo is None:
-        return None, []
+        return gh_cache_write_remotes(words, values), []
     first, second = (words + ["", ""])[:2]
     rest = words[2:]
     if first == "api":
@@ -12741,6 +12867,8 @@ def gh_cache_write_scope(args: list[str], words: list[str], method: str,
         if len(tail) >= 2 and tail[0] in ("pulls", "issues") and tail[1].isdigit():
             if tail[0] == "pulls" and tail[2:3] and tail[2] in GH_CACHE_BASE_WRITES:
                 return repo, [f"pr {int(tail[1])}", "prs", "runlists", "other"]
+            if tail[0] == "pulls" and tail[2:3] and tail[2] in GH_CACHE_HEAD_WRITES:
+                return repo, [f"pr {int(tail[1])}", "runlists", "other"]  # a push: pull_request.synchronize
             # An edit, a label, a comment or a review: each can start a workflow (pull_request,
             # issues, issue_comment, pull_request_review), so the run lists go with them.
             return repo, [f"pr {int(tail[1])}", "runlists", "other"]
@@ -12764,6 +12892,8 @@ def gh_cache_write_scope(args: list[str], words: list[str], method: str,
     if first in ("pr", "issue") and number is not None and len(rest) == 1:
         if first == "pr" and second in GH_CACHE_BASE_WRITES:
             return repo, [f"pr {int(number)}", "prs", "runlists", "other"]
+        if first == "pr" and second in GH_CACHE_HEAD_WRITES:
+            return repo, [f"pr {int(number)}", "runlists", "other"]
         if second in GH_CACHE_TARGET_WRITES:
             # A label, a ready-for-review, a reopen, a comment or a review can each start a workflow
             # (pull_request, issue_comment, pull_request_review): the run lists go with them.
@@ -12775,6 +12905,24 @@ def gh_cache_write_scope(args: list[str], words: list[str], method: str,
     if (first, second) == ("workflow", "run"):
         return repo, ["runlists", "prs", "other"]
     return repo, []
+
+
+def gh_cache_write_remotes(words: list[str], values: dict[str, str]) -> list[str] | None:
+    """The repositories a `gh pr|issue|run ...` write with no repository on its line can be about: every
+    GitHub remote of the checkout it runs in, since gh picks one of them (broker_repo declines to say
+    which when there are several). None -- every answer on the host -- when that is not known exactly.
+
+    A checkout of manaflow-ai/cmux has five remotes, so every `gh pr create` or `gh pr edit` there with
+    no -R stamped "*" and dropped every answer the host held, for every repository."""
+    if not words or words[0] == "api" or broker_elsewhere(values) or os.environ.get("GH_REPO") or any(
+            os.environ.get(name) for name in ("GIT_DIR", "GIT_WORK_TREE", "GIT_CEILING_DIRECTORIES",
+                                              "GIT_DISCOVERY_ACROSS_FILESYSTEM")):
+        return None
+    with contextlib.suppress(Exception):
+        found = git_remotes(Path.cwd())
+        if found:
+            return sorted(set(found))
+    return None
 
 
 def gh_cache_write_positionals(args: list[str]) -> list[str] | None:
@@ -12889,15 +13037,19 @@ def note_run_rerun(repo: str | None, scopes: list[str] | None, words: list[str],
             write_json(cache, {**entry, "rerunAt": now})
 
 
-def gh_cache_note_write(repo: str | None, now: float, scopes: list[str] | None = None) -> None:
+def gh_cache_note_write(repo: str | list[str] | None, now: float, scopes: list[str] | None = None) -> None:
     """Stamp a write, so no answer read before it is served after it. A write is stamped when it
     starts and again when it finishes (gh_cache_write), so a read that began while it was in flight
     is older than the second stamp and is not served either. Bounded like every lock here: losing
     a stamp to a wedged sibling costs at most one TTL of staleness, never the gh call.
 
     `scopes` (gh_cache_write_scope) narrows the stamp to what the write can change within `repo`;
-    none stamps the whole repository, and no repository stamps every answer on the host."""
-    names = [f"{repo} {scope}" for scope in scopes] if repo and scopes else [repo or "*"]
+    none stamps the whole repository, and no repository stamps every answer on the host. A list of
+    repositories (gh_cache_write_remotes) stamps each of them whole."""
+    if isinstance(repo, list):
+        names = list(repo) or ["*"]
+    else:
+        names = [f"{repo} {scope}" for scope in scopes] if repo and scopes else [repo or "*"]
     with bounded_lock(gh_cache_dir().parent / ".answers-writes.lock"):
         writes = {k: v for k, v in gh_cache_writes().items() if now - v < GH_CACHE_KEEP}
         for name in names:
@@ -13140,6 +13292,8 @@ def gh_cache_fill(real: str, args: list[str], key: str, repo: str | None, ran: l
             long = words[:1] == ["api"] and len(words) > 1 and bool(GH_CACHE_LONG_RE.match(words[1]))
             meta["done"] = rc == 0 and gh_cache_done(words, seen, out)
             gh_cache_put(key, at, rc, out, err, long, meta)
+            if rc == 0 and not err and len(out) <= GH_CACHE_MAX_BYTES:
+                gh_cache_superset_note(gh_cache_superset_spec(args, words, values, repo), key, at, real)
     return gh_cache_emit({"rc": rc, "out": out, "err": err})
 
 
@@ -13509,10 +13663,15 @@ def cmd_gh(args: list[str]) -> int:
                     cache_repo = None if gh_cache_anywhere(words) else gh_cache_repo(words, values) or (
                         None if words[:1] == ["api"] and not any("{" in a for a in args) else broker_repo(values))
                     answer = gh_cache_get(cache_key, cache_repo, now)
+                    subset = False
+                    if answer is None:
+                        answer = gh_cache_superset_get(gh_cache_superset_spec(args, words, values, cache_repo),
+                                                       cache_repo, real, now)
+                        subset = answer is not None
                     if answer is not None:
                         if key is not None:
                             touch_interest(key)  # a read all the same: the daemon's watch stays wanted
-                        broker_note({"route": "cache", **said})
+                        broker_note({"route": "cache", **({"subset": True} if subset else {}), **said})
                         return gh_cache_emit(answer)
                 refusal = gh_sweep_refusal(words, method, now)
                 if refusal:

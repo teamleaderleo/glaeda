@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import base64
 import contextlib
 import copy
 import fcntl
@@ -14332,6 +14333,144 @@ class BrokerAnswerCacheTest(CountingGhBase):
                      ["api", "graphql", "-f", "query=query{viewer{login}}"], ["search", "prs", "x"], []):
             with self.subTest(args=args):
                 self.assertFalse(write(args))
+
+
+class BrokerSupersetTest(CountingGhBase):
+    """A `pr view N` or `run view ID` asking for some fields of a target is printed from a kept read of
+    more of them (gh_cache_superset_get), in the style the kept answer was printed in."""
+
+    PR = {"title": "a <b> & c", "headRefOid": "a" * 40, "baseRefName": "main", "additions": 3,
+          "isCrossRepository": False, "mergedAt": None, "body": "caf\u00e9"}
+
+    def setUp(self) -> None:
+        super().setUp()
+        gh = self.home / "bin" / "gh"
+        gh.write_text(f"#!{sys.executable}\n"
+                      "import json, os, sys\n"
+                      f"count = {str(self.count)!r}\n"
+                      "n = int(open(count).read()) + 1 if os.path.exists(count) else 1\n"
+                      "open(count, 'w').write(str(n))\n"
+                      "a = sys.argv[1:]\n"
+                      f"pr = {json.dumps(self.PR)!r}\n"
+                      "pr = json.loads(pr)\n"
+                      "want = [f for f in a[a.index('--json') + 1].split(',') if f]\n"
+                      "doc = {f: pr[f] for f in want}\n"
+                      "if '--jq' in a:\n"
+                      "    v = doc[a[a.index('--jq') + 1][1:]]\n"
+                      "    print(v if isinstance(v, str) else json.dumps(v))\n"
+                      "elif os.environ.get('FAKE_GH_STYLE') == 'lane':\n"
+                      "    print(json.dumps(doc, indent=2))\n"
+                      "else:\n"
+                      "    print(json.dumps(doc, sort_keys=True, separators=(',', ':'), ensure_ascii=False))\n")
+        gh.chmod(0o755)
+        self.addCleanup(os.environ.pop, "FAKE_GH_STYLE", None)
+
+    def view(self, fields: str, *extra: str) -> tuple[int, str]:
+        code, out, _err, _ = self.run_gh(["pr", "view", "7", "-R", "o/r", "--json", fields, *extra])
+        return code, out
+
+    def test_a_subset_read_is_printed_from_the_whole_read_as_gh_prints_it(self) -> None:
+        self.view("title,headRefOid,baseRefName,additions,isCrossRepository,mergedAt,body")
+        code, out = self.view("headRefOid,title")
+        self.assertEqual(self.runs(), 1)
+        self.assertEqual((code, out), (0, json.dumps({"headRefOid": "a" * 40, "title": "a <b> & c"},
+                                                     sort_keys=True, separators=(",", ":")) + "\n"))
+        routes = [json.loads(line) for line in gg.broker_log().read_text().splitlines()]
+        self.assertTrue(any(r.get("route") == "cache" and r.get("subset") for r in routes))
+
+    def test_a_jq_path_to_one_value_is_answered_too(self) -> None:
+        self.view("title,headRefOid,additions,mergedAt,isCrossRepository")
+        self.assertEqual(self.view("headRefOid", "--jq", ".headRefOid"), (0, "a" * 40 + "\n"))
+        self.assertEqual(self.view("additions", "--jq", ".additions"), (0, "3\n"))
+        self.assertEqual(self.view("mergedAt", "--jq", ".mergedAt"), (0, "null\n"))
+        self.assertEqual(self.view("isCrossRepository", "-q", ".isCrossRepository"), (0, "false\n"))
+        self.assertEqual(self.runs(), 1)
+
+    def test_a_lane_vm_answer_is_printed_in_its_own_style_and_order(self) -> None:
+        os.environ["FAKE_GH_STYLE"] = "lane"
+        self.view("title,headRefOid,baseRefName,body")
+        code, out = self.view("headRefOid,title")
+        self.assertEqual(self.runs(), 1)
+        self.assertEqual(out, json.dumps({"headRefOid": "a" * 40, "title": "a <b> & c"}, indent=2) + "\n")
+
+    def test_a_field_the_kept_read_lacks_asks_github(self) -> None:
+        self.view("title,headRefOid")
+        _code, out = self.view("headRefOid,baseRefName")
+        self.assertEqual(self.runs(), 2)
+        self.assertIn("main", out)
+
+    def test_a_jq_that_is_not_a_plain_path_asks_github(self) -> None:
+        self.view("title,headRefOid")
+        self.view("title", "--jq", ".title | length")
+        self.assertEqual(self.runs(), 2)
+
+    def test_the_kept_read_obeys_the_callers_ttl_and_writes(self) -> None:
+        self.view("title,headRefOid")
+        os.environ["GLAEDA_GH_CACHE_TTL"] = "0"
+        _code, out, _err, execed = self.run_gh(["pr", "view", "7", "-R", "o/r", "--json", "headRefOid"])
+        self.assertEqual((out, execed), ("", ["pr", "view", "7", "-R", "o/r", "--json", "headRefOid"]),
+                         "TTL 0 is a read now, superset or not: gh runs")
+        os.environ["GLAEDA_GH_CACHE_TTL"] = "60"
+        self.run_gh(["pr", "comment", "7", "-R", "o/r", "--body", "hi"])
+        before = self.runs()
+        self.view("title")
+        self.assertEqual(self.runs(), before + 1, "a write to the PR drops the kept read for its subsets too")
+
+    def test_another_pr_is_another_target(self) -> None:
+        self.view("title,headRefOid")
+        self.run_gh(["pr", "view", "8", "-R", "o/r", "--json", "title"])
+        self.assertEqual(self.runs(), 2)
+
+    def test_an_answer_printed_differently_is_never_reshaped(self) -> None:
+        self.view("title,headRefOid")
+        for path in gg.gh_cache_dir().glob("*.json"):
+            doc = json.loads(path.read_text())
+            if "out" in doc:
+                doc["out"] = base64.b64encode(b'{"headRefOid": "x", "title": "y"}\n').decode()
+                path.write_text(json.dumps(doc))
+        self.view("title")
+        self.assertEqual(self.runs(), 2)
+
+
+class BrokerWriteScopeTest(CountingGhBase):
+    """What a write stamps (gh_cache_write_scope)."""
+
+    def test_update_branch_moves_one_pr_not_every_pr(self) -> None:
+        for args in (["pr", "update-branch", "7", "-R", "o/r"], ["api", "-X", "PUT", "repos/o/r/pulls/7/update-branch"]):
+            words, method, _seen, values = gg.broker_words(args)
+            with self.subTest(args=args):
+                repo, scopes = gg.gh_cache_write_scope(args, words, method, values)
+                self.assertEqual((repo, set(scopes)), ("o/r", {"pr 7", "runlists", "other"}))
+
+    def test_merge_still_moves_every_pr(self) -> None:
+        args = ["pr", "merge", "7", "-R", "o/r", "--squash"]
+        words, method, _seen, values = gg.broker_words(args)
+        self.assertIn("prs", gg.gh_cache_write_scope(args, words, method, values)[1])
+
+    def test_another_prs_answer_survives_an_update_branch(self) -> None:
+        read = ["pr", "view", "8", "-R", "o/r", "--json", "mergeable"]
+        self.run_gh(read)
+        self.run_gh(["pr", "update-branch", "7", "-R", "o/r"])
+        self.run_gh(read)
+        self.assertEqual(self.runs(), 2, "the read once, the write once")
+
+    def test_a_write_in_a_checkout_of_several_remotes_stamps_those_repositories(self) -> None:
+        where = self.git_checkout(self.home / "roots" / "fork",
+                                  '[remote "origin"]\n\turl = git@github.com:me/r.git\n'
+                                  '[remote "upstream"]\n\turl = git@github.com:o/r.git\n')
+        args = ["pr", "edit", "7", "--add-label", "x"]
+        words, method, _seen, values = gg.broker_words(args)
+        with mock.patch.object(gg.Path, "cwd", staticmethod(lambda: where)):
+            repo, scopes = gg.gh_cache_write_scope(args, words, method, values)
+        self.assertEqual((repo, scopes), (["me/r", "o/r"], []))
+        gg.gh_cache_note_write(repo, time.time(), scopes)
+        self.assertEqual(set(gg.gh_cache_writes()), {"me/r", "o/r"})
+
+    def test_a_write_outside_any_checkout_still_stamps_everything(self) -> None:
+        args = ["pr", "edit", "7", "--add-label", "x"]
+        words, method, _seen, values = gg.broker_words(args)
+        with mock.patch.object(gg.Path, "cwd", staticmethod(lambda: self.home)):
+            self.assertEqual(gg.gh_cache_write_scope(args, words, method, values), (None, []))
 
 
 class BrokerAnswerHitRateTest(CountingGhBase):
