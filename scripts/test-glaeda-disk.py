@@ -2041,14 +2041,14 @@ class GlaedaDiskTest(unittest.TestCase):
         gd.FLEET_ROOT = self.root / "shared-fleet"
         gd.DARWIN = True
         try:
-            for app in ("cmux-next", "cmux"):
+            for app in ("cmux-next", "cmux", ""):
                 base = gd.HOME / "Library/Application Support" / app
                 for name in ("com.cmuxterm.app.debug.pcrim3.capslot1", "com.cmuxterm.app.next", "com.cmuxterm.app",
                              "session-com.cmuxterm.app.debug.x.json.d"):
                     (base / name).mkdir(parents=True)
             fams = {f.id: f for f in gd.default_families()}
-            for app in ("cmux-next", "cmux"):
-                fam = fams[f"cmux-debug-app-data-{app}"]
+            for fid in ("cmux-debug-app-data-cmux-next", "cmux-debug-app-data-cmux", "cmux-debug-app-data"):
+                fam = fams[fid]
                 self.assertTrue(fam.reclaimable)
                 self.assertEqual(fam.min_idle_hours, gd.DEFAULT_AGE_HOURS)
                 self.assertEqual([p.name for p in gd.candidates(fam)], ["com.cmuxterm.app.debug.pcrim3.capslot1"])
@@ -2277,6 +2277,30 @@ class GlaedaDiskTest(unittest.TestCase):
         (state / "unknown").mkdir()
         self.assertEqual(sorted(gd.cmux_next_ci_dedupe_roots(root)), sorted([products, nested_products]))
 
+    def test_cmux_next_ci_input_roots_reach_release_states_and_the_host_root(self) -> None:
+        """A dev-daily-release or release-compile state keeps its own SourcePackages three levels below its kind,
+        where dedupe_roots of the kind never looked: each was a full copy beside the runners' deduped ones."""
+        root = self.root / "Library/Caches/cmux-next-ci"
+        (root / "cmux-scheme/runner-a/SourcePackages").mkdir(parents=True)
+        daily = root / "dev-daily-release/0123456789abcdef/Release/xcode-89abcdef"
+        compile_ = root / "release-compile/fedcba9876543210/Release/xcode-01234567"
+        for state in (daily, compile_):
+            (state / "SourcePackages/artifacts").mkdir(parents=True)
+            (state / "Build/Products").mkdir(parents=True)
+        (daily / "ModuleCache.noindex").mkdir()
+        (root / "dev-daily-release/host/SourcePackages").mkdir(parents=True)
+        (root / "dev-daily-release/notakey/Release/xcode-89abcdef/SourcePackages").mkdir(parents=True)
+        (root / "dev-daily-release/0123456789abcdef/Release/xcode-aaaaaaaa").mkdir()
+        os.symlink(daily / "SourcePackages", root / "release-compile/fedcba9876543210/Release/xcode-01234567"
+                   / "ModuleCache.noindex")
+        got = sorted(p.relative_to(root).as_posix() for p in gd.cmux_next_ci_input_roots(root))
+        self.assertEqual(got, ["dev-daily-release/0123456789abcdef/Release/xcode-89abcdef/ModuleCache.noindex",
+                               "dev-daily-release/0123456789abcdef/Release/xcode-89abcdef/SourcePackages",
+                               "dev-daily-release/host/SourcePackages",
+                               "release-compile/fedcba9876543210/Release/xcode-01234567/SourcePackages"])
+        # cmux-scheme/<runner> stays dedupe_roots(cmux-scheme)'s, so no root is walked twice
+        self.assertNotIn("cmux-scheme/runner-a/SourcePackages", got)
+
     def test_fleet_ci_hot_tier(self) -> None:
         ci = self.root / "ci"
         (ci / "seeds").mkdir(parents=True)
@@ -2291,7 +2315,7 @@ class GlaedaDiskTest(unittest.TestCase):
         make(ci / ".derived-data.discard-7", age_hours=60)
         make(ci / "source-packages", age_hours=60)
         make(ci / "cmux-ci-2/derived-data", age_hours=60)
-        # a root with no seed source keeps its newest two of any prefix; dot entries are never seeds
+        # a root with no seed source keeps its newest of any prefix (SEED_KEEP 1); dot entries are never seeds
         for name, age in (("p-y", 48), ("p-z", 49), ("q-z", 50), (".q-w.incoming-3", 50)):
             make(ci / "cmux-ci-2/seeds" / name, age_hours=age)
         make(ci / "cmux-ci-x/derived-data", age_hours=60)  # not a root store
@@ -2304,10 +2328,12 @@ class GlaedaDiskTest(unittest.TestCase):
         items = gd.survey(gd.fleet_families(ci), 6, 0)
         got = {str(Path(i.path).relative_to(ci)): i.verdict for i in items}
         self.assertEqual(got, {
-            "seeds/p-a": "kept", "seeds/p-b": "kept", "seeds/p-c": "reclaimable", "seeds/q-x": "reclaimable",
+            # one seed per root stays whatever its age (Leo: "keep only the current seed, not two"); the second
+            # newest waits out the idle window like any other
+            "seeds/p-a": "kept", "seeds/p-b": "recent", "seeds/p-c": "reclaimable", "seeds/q-x": "reclaimable",
             "pr-builds/pr-1": "recent", "pr-builds/pr-2": "recent",
             "derived-data": "recent", ".derived-data.discard-7": "reclaimable",
-            "cmux-ci-2/derived-data": "reclaimable", "cmux-ci-2/seeds/p-y": "kept", "cmux-ci-2/seeds/p-z": "kept",
+            "cmux-ci-2/derived-data": "reclaimable", "cmux-ci-2/seeds/p-y": "kept", "cmux-ci-2/seeds/p-z": "reclaimable",
             "cmux-ci-2/seeds/q-z": "reclaimable", "cmux-ci-2/seeds/.q-w.incoming-3": "reclaimable"})
         # apply keeps the hot-tier windows, and re-reads command lines per item: a job that starts cloning a
         # parked build during the run keeps it
@@ -2659,9 +2685,9 @@ class GlaedaDiskTest(unittest.TestCase):
         with mock.patch.object(gd, "SEED_SERVE_LOG", log), mock.patch.object(gd, "cmux_active", lambda *a, **k: True):
             items = gd.survey(gd.fleet_families(ci), 24, 0)
             got = {Path(i.path).name: (i.verdict, i.reasons) for i in items}
-            # the newest two stay even when archived; an archived older one goes; the rest wait out the window
+            # the newest stays even when archived; an archived older one goes; the rest wait out the window
             self.assertEqual(got["p-a"][0], "kept")
-            self.assertEqual(got["p-b"][0], "kept")
+            self.assertEqual(got["p-b"][0], "recent")  # not archived: it waits out the window
             self.assertEqual(got["p-c"], ("reclaimable", ["the seed archive holds it"]))
             self.assertEqual(got["p-d"][0], "recent")
             self.assertEqual(got["p-e"][0], "recent")
@@ -2670,6 +2696,45 @@ class GlaedaDiskTest(unittest.TestCase):
                 gd.apply([i for i in items if i.verdict == "reclaimable"], fams, self.root / "r.jsonl", None, 24)
         self.assertFalse((ci / "seeds/p-c").exists())
         for name in ("p-a", "p-b", "p-d", "p-e"):
+            self.assertTrue((ci / "seeds" / name).exists(), name)
+
+    def test_a_seed_the_archive_listed_goes_without_waiting_on_any_mini(self) -> None:
+        ci = self.root / "ci"
+        (ci / "seeds").mkdir(parents=True)
+        (ci / "seed-source.json").write_text(json.dumps({"prefix": "p-"}))
+        for name, age in (("p-a", 0.2), ("p-b", 0.3), ("p-c", 1), ("p-d", 2)):
+            make(ci / "seeds" / name, age_hours=age)
+        listing = ci / gd.ARCHIVE_LIST
+        listing.parent.mkdir()
+
+        def listed(keys: list, age: float = 60, **kw) -> None:
+            listing.write_text(json.dumps({"schema": 1, "time": int(time.time() - age), "keys": keys, **kw}))
+
+        listed(["p-a", "p-c", "../p-d", ".p-d", 7, "p-x"])
+        self.assertEqual(gd.archive_listed_seeds(listing), {"p-a", "p-c", "p-x"})
+        for bad in (lambda: listed(["p-c"], age=gd.ARCHIVE_LIST_MAX_AGE + 60),  # stale: the archive may have pruned
+                    lambda: listed(["p-c"], age=-3600),  # from the future
+                    lambda: listed(["p-c"], schema=2),
+                    lambda: listing.write_text("[" * 5000),
+                    lambda: listing.write_text(json.dumps({"schema": 1, "time": True, "keys": ["p-c"]}))):
+            bad()
+            self.assertEqual(gd.archive_listed_seeds(listing), frozenset())
+        self.assertEqual(gd.archive_listed_seeds(self.root / "missing.json"), frozenset())
+        listed(["p-a", "p-c"])
+        missing_log = self.root / "no-serve-log.jsonl"  # a PR mini: no seed serve log at all
+        self.assertEqual(gd.archived_seeds(missing_log, listing), {"p-a", "p-c"})
+        with mock.patch.object(gd, "SEED_SERVE_LOG", missing_log), mock.patch.object(gd, "FLEET_CI", ci), \
+                mock.patch.object(gd, "cmux_active", lambda *a, **k: True):
+            items = gd.survey(gd.fleet_families(ci), 24, 0)
+            got = {Path(i.path).name: (i.verdict, i.reasons) for i in items}
+            self.assertEqual(got["p-a"][0], "kept")  # the newest two stay, listed or not
+            self.assertEqual(got["p-b"][0], "kept")
+            self.assertEqual(got["p-c"], ("reclaimable", ["the seed archive holds it"]))
+            self.assertEqual(got["p-d"][0], "recent")  # not listed: its usual window
+            fams = {f.id: f for f in gd.fleet_families(ci)}
+            gd.apply([i for i in items if i.verdict == "reclaimable"], fams, self.root / "r.jsonl", None, 24)
+        self.assertFalse((ci / "seeds/p-c").exists())
+        for name in ("p-a", "p-b", "p-d"):
             self.assertTrue((ci / "seeds" / name).exists(), name)
 
     def test_pressure_targets_are_per_filesystem(self) -> None:
@@ -7652,7 +7717,8 @@ class GlaedaDiskTest(unittest.TestCase):
         make(ci / "derived-data", age_hours=30)
         fams = gd.idle_families(gd.fleet_families(ci))
         got = {str(Path(i.path).relative_to(ci)): i.verdict for i in gd.survey(fams, gd.IDLE_SWEEP_HOURS, 0)}
-        self.assertEqual(got, {"seeds/p-a": "kept", "seeds/p-b": "kept", "seeds/p-c": "reclaimable",
+        # SEED_KEEP 1: only the newest stays whatever its age; p-b, used 2 h ago, waits out the 12 h window
+        self.assertEqual(got, {"seeds/p-a": "kept", "seeds/p-b": "recent", "seeds/p-c": "reclaimable",
                                "seeds/p-d": "reclaimable", "pr-builds/pr-1": "recent",
                                "pr-builds/pr-2": "recent", "derived-data": "reclaimable"})
         # DerivedData and caches use the 12 h idle window for disposable output.
@@ -10285,6 +10351,26 @@ class DedupeTest(unittest.TestCase):
         self.assertIn("cloned 0.0G", out.getvalue())  # 2 MiB rounds to 0.0G; the state records the clone
         state = json.loads(self.state.read_text())
         self.assertTrue(all(v["cloned"] for v in state.values()))
+
+    def test_dedupe_main_shares_release_state_packages_with_runner_copies(self) -> None:
+        data = os.urandom(2 * 1024 * 1024)
+        ci = "Library/Caches/cmux-next-ci"
+        runner = self.blob(f"{ci}/cmux-scheme/host-glaeda-2/SourcePackages/artifacts/x.bin", data)
+        daily = self.blob(f"{ci}/dev-daily-release/0123456789abcdef/Release/xcode-89abcdef/SourcePackages/"
+                          "artifacts/x.bin", data)
+        product = self.blob(f"{ci}/dev-daily-release/0123456789abcdef/Release/xcode-89abcdef/Build/Products/x.bin",
+                            data)
+        before = {p: p.stat().st_ino for p in (runner, daily, product)}
+        out = io.StringIO()
+        with mock.patch.object(gd, "HOME", self.root), mock.patch.object(gd, "DEDUPE_STATE", self.state), \
+                mock.patch.object(gd, "default_families", return_value=[]), contextlib.redirect_stdout(out):
+            self.assertEqual(gd.main(["--dedupe"]), 0)
+        self.assertIn("dedupe: 2 files >= 1 MiB", out.getvalue())  # Build/Products is --dedupe-builds' only
+        self.assertEqual(product.stat().st_ino, before[product])
+        self.assertEqual(sum(p.stat().st_ino != before[p] for p in (runner, daily)), 1)
+        self.assertTrue(runner.read_bytes() == daily.read_bytes() == data)
+        if (ids := {gd.file_clone_id(os.fspath(p)) for p in (runner, daily)}) != {None}:
+            self.assertEqual(len(ids), 1)  # one data stream on disk
 
     def test_target_changed_after_hash_is_refused(self) -> None:
         data = os.urandom(2 * 1024 * 1024)

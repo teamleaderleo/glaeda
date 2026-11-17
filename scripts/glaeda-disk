@@ -820,7 +820,11 @@ def artifact_referenced(path: Path, references: frozenset[str]) -> bool:
 # LRU under pressure, keeping what the next job most likely starts from.
 FLEET_CI = Path("/Users/Shared/cmux-build-fleet/ci")
 SEED_SOURCE = "seed-source.json"
-SEED_KEEP = 2  # seed_derived_data.LOCAL_KEEP_LOW_DISK: newest seeds of the current prefix each root keeps
+# The newest seeds of the current prefix each root keeps whatever their age: one (Leo, 2026-11-17: "keep only the
+# current seed, not two"; it was 2, cmux seed_derived_data.py's LOCAL_KEEP_LOW_DISK). An older seed still stays
+# while a job touched it within the idle window (adopt touches the seed it clones), so only one no job started from
+# for IDLE_SEED_HOURS goes, and it comes back from the LAN archive or the bucket.
+SEED_KEEP = 1
 # One age for everything disposable (Leo, 2026-10-26): "When have we ever had something useful greater than 12 hours?
 # I mean, if something stalls, like sure, but why would it stall? If it stalls, it's gonna have to get a rebase
 # anyway." DerivedData, CoreSimulator, package caches, runner work dirs and build dirs go once idle this long. Only
@@ -1078,7 +1082,7 @@ def fleet_families(ci: Path | None = None) -> list[Family]:
                            platform="macos"))
         # Seeds: the root's newest SEED_KEEP of its current prefix stay (seed_verdict); older and other
         # fingerprints' seeds go LRU. A seed comes back from the LAN seeder or the bucket in 25 to 280 s.
-        # On the trusted seeder, one the seed archive already holds goes without waiting (archived_seeds).
+        # One the seed archive already holds goes without waiting, on every mini (archived_seeds).
         fams.append(Family("cmux-seeds", store / "seeds", True,
                            "glaeda-seed-prefetch or the next job fetches it again", build_output=True,
                            owner="cmux seed_derived_data.py (CMUX_SEED_LOCAL_CACHE)", rebuild_minutes=4,
@@ -1394,10 +1398,39 @@ def emergency_devs(fss: "dict[int, Fs]", emergency: str, floor_gib: float = 0.0)
 # The trusted seeder's serve log (glaeda-seed-serve): the seed archive on cmux-lawrence's SSD fills itself from
 # it every 5 minutes (glaeda-seed-archive), asking seed-list-v1 and then one seed-v1 per seed it lacks.
 SEED_SERVE_LOG = HOME / ".local/state/glaeda/seed-serve/serve.jsonl"
+# Every other mini whose LAN seeder is the archive: the archive's own `seed-list-v1` answer, which
+# glaeda-seed-prefetch (the LAN-capable agent; this one runs under Homebrew python3, off the LAN) writes to
+# FLEET_CI/.prefetch/archive-seeds.json each run. Older than this, it proves nothing: the archive prunes.
+ARCHIVE_LIST = Path(".prefetch") / "archive-seeds.json"  # under FLEET_CI (glaeda-seed-prefetch ARCHIVE_LIST)
+SEED_KEY_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,199}")  # a seed directory name (no dot, no slash)
+ARCHIVE_LIST_MAX_AGE = 1800  # six prefetch runs; the archive prunes oldest first, so a listed seed is rarely next
 
 
-def archived_seeds(log: Path | None = None) -> frozenset[str]:
-    """Seed keys the seed archive holds, as far as this seeder's serve log (and the rotated one) can show.
+def archive_listed_seeds(path: Path | None = None, now: float | None = None) -> frozenset[str]:
+    """Seed keys the seed archive listed within ARCHIVE_LIST_MAX_AGE, as glaeda-seed-prefetch recorded them.
+
+    A PR job can write this file, as it can the seeds: a forged list only makes a seed go early, and the next
+    job fetches it again (from the archive, R2, or by building). A missing, malformed or stale list is empty,
+    and the seeds keep their usual window: a PR mini never uploads a seed, since the archive takes trusted
+    bytes from the trusted seeder only, so an unlisted seed waits out its window as before.
+    """
+    path = FLEET_CI / ARCHIVE_LIST if path is None else path
+    now = time.time() if now is None else now
+    try:
+        record = json.loads(path.read_text(errors="replace")[:1 << 20])
+    except (OSError, ValueError, RecursionError):
+        return frozenset()
+    if not isinstance(record, dict) or record.get("schema") != 1 or not isinstance(record.get("keys"), list):
+        return frozenset()
+    stamp = record.get("time")
+    if not isinstance(stamp, int) or isinstance(stamp, bool) or not 0 <= now - stamp <= ARCHIVE_LIST_MAX_AGE:
+        return frozenset()
+    return frozenset(k for k in record["keys"] if isinstance(k, str) and SEED_KEY_RE.fullmatch(k))
+
+
+def archived_seeds(log: Path | None = None, listing: Path | None = None) -> frozenset[str]:
+    """Seed keys the seed archive holds: what it listed to this mini (archive_listed_seeds), and on the trusted
+    seeder what its serve log (and the rotated one) can show.
 
     Only the archive's filler asks seed-list-v1, so a client address that lists is the archive. A clean
     `served` alone is not enough: the filler still checks and renames the file afterwards and drops it on
@@ -1431,7 +1464,7 @@ def archived_seeds(log: Path | None = None) -> frozenset[str]:
             decided.add(key)  # only a key's newest request counts
             if outcome == "served" and r.get("status") == 0 and lists.get(client, 0) >= 2:
                 held.add(key)
-    return frozenset(held)
+    return frozenset(held) | archive_listed_seeds(listing)
 
 
 # cmux's media tour (cmux-next-media.yml) builds two apps per tour slot into
@@ -2626,9 +2659,8 @@ def seed_verdict(path: Path) -> str:
                 current.append((c.stat(follow_symlinks=False).st_mtime, c.name))
             except OSError:
                 continue
-    keep = 1 if ACTIVITY_MODE == "pressure" else SEED_KEEP
-    newest = {name for _, name in sorted(current, reverse=True)[:keep]}
-    return f"one of its root's newest {keep} current seeds" if path.name in newest else ""
+    newest = {name for _, name in sorted(current, reverse=True)[:SEED_KEEP]}
+    return "its root's newest current seed" if path.name in newest else ""
 
 
 WORKTREE_DIRS = ("worktrees", "cmux-worktrees", "glaeda-worktrees")
@@ -4288,15 +4320,17 @@ def default_families(role: str = "fleet-mini") -> list[Family]:
         # mini (2026-10-28) 391 tags held 35.8 GiB under cmux-next, 354 untouched for over a day, and the builder's
         # runner sat offline under its 40 GiB floor while glaeda-disk found 0.0G reclaimable. Only debug tags: the
         # release and NEXT apps' own data (com.cmuxterm.app, com.cmuxterm.app.next) is never a candidate. Not on a
-        # devbox, where a tag may be a developer's live test session.
+        # devbox, where a tag may be a developer's live test session. The classic app's tags sit at the top of
+        # Application Support itself (cmux18, 2026-11-17: 67 tags, 13.2 GiB, none touched in two days, which no
+        # family listed while the mini sat at 8 GB free): "" is that top level.
         *([] if role == "devbox" else [
-            Family(f"cmux-debug-app-data-{app}", HOME / "Library/Application Support" / app, True,
+            Family(f"cmux-debug-app-data{'-' + app if app else ''}", HOME / "Library/Application Support" / app, True,
                    # an installed app copy is too deep for the git search to finish and holds no checkout, so it
                    # is build output (as code-sign-clones); the process and open-file checks still keep a live tag
                    "the next tagged DEV build recreates it", include=(CMUX_DEBUG_APP_PREFIX,), build_output=True,
                    min_idle_hours=DEFAULT_AGE_HOURS, owner="cmux tagged DEV builds (reload.sh --tag, CI capture)",
                    rebuild_minutes=2, platform="macos")
-            for app in ("cmux-next", "cmux")]),
+            for app in ("cmux-next", "cmux", "")]),
         Family("simulators", HOME / "Library/Developer/CoreSimulator", False,
                "use `xcrun simctl delete unavailable` (report only)", platform="macos"),
         # Kept, with an owner, so the accounting names it rather than leaving it in the gap (cmux16, 2026-11-08).
@@ -12595,6 +12629,21 @@ def dedupe_roots(derived_data: Path) -> list[Path]:
     return [r for r in roots if r.is_dir() and not r.is_symlink()]
 
 
+def cmux_next_ci_input_roots(root: Path) -> list[Path]:
+    """The package and module caches (DEDUPE_SUBDIRS) of every cmux-next state root that dedupe_roots of the
+    <kind> directories does not reach: a dev-daily-release or release-compile state sits at
+    <kind>/<key>/Release/<xcode hash>, three levels down, and each keeps its own SourcePackages like a runner's
+    cmux-scheme/<runner> does. The per-host build root (cmux_next_ci_host_roots) too. One ordinary --dedupe pass
+    over them and the runners' copies stores each identical package file once, whichever tree holds it."""
+    found: list[Path] = []
+    for state in cmux_next_ci_state_roots(root):
+        if state.parent.name != "cmux-scheme":  # cmux-scheme/<runner> is dedupe_roots(cmux-scheme)'s already
+            found += [state / sub for sub in DEDUPE_SUBDIRS]
+    for host in cmux_next_ci_host_roots(root):
+        found += dedupe_roots(host)
+    return [r for r in found if r.is_dir() and not r.is_symlink()]
+
+
 def _file_key(st: os.stat_result) -> list[int]:
     return [st.st_size, st.st_mtime_ns, st.st_ino]
 
@@ -12826,6 +12875,8 @@ def dedupe_xcode(a: argparse.Namespace, bases: list[Path], ci_root: Path) -> Non
     """The Xcode pass: DerivedData's and cmux-next's package and module caches (and, with --dedupe-builds,
     sealed cmux-next Products), files of 1 MiB and up, retried while files are still settling."""
     input_roots = [r for b in bases for r in dedupe_roots(b)]
+    if ci_root in {b.parent for b in bases}:  # the cmux-next cache is a base (never under the runner-cache profile)
+        input_roots += [r for r in cmux_next_ci_input_roots(ci_root) if r not in input_roots]
     passes = [(input_roots, DEDUPE_STATE, a.settle_minutes * 60, None)]
     if a.dedupe_builds:
         # Sealed Products output is opt-in because the normal LaunchAgent can run

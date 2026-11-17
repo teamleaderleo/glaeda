@@ -140,7 +140,10 @@ and over the size cap such a state idle `cmux_next_ci_unowned_idle_hours` goes
 whole, inputs included, as any other does (its runner's running job and every
 other veto still keep it).
 
-The ordinary `--dedupe` pass visits only reusable package/module/SDK inputs. Build
+The ordinary `--dedupe` pass visits only reusable package/module/SDK inputs: every
+`cmux-scheme/<runner>`'s, every `dev-daily-release` and `release-compile` state's
+(`cmux_next_ci_input_roots`) and the per-host build root's, in one pass, so an
+identical package file is stored once whichever of them holds it. Build
 output is write-heavy, so it is excluded from the periodic WatchPaths agent. An
 operator may opt into the narrower `--dedupe --dedupe-builds` pass after the roots
 are inactive. It scans each validated top-level `Products` directory, plus the sealed
