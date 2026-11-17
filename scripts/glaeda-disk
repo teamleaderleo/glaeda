@@ -30,7 +30,9 @@ macOS keeps no directory sizes (Spotlight has none for folders), so measuring
 means walking every file, which is disk-latency bound. Sizes are therefore kept
 in a snapshot: a report prints instantly from it, re-judges every verdict live
 (processes, idle time, git), sizes only new items, and re-measures in the
-background once the snapshot is older than --max-age minutes.
+background once the snapshot is older than --max-age minutes. An applying idle sweep, even
+with --refresh, walks only what it may delete: a pressure-only or report-only item keeps a size
+measured within the last 3-6 hours (SWEEP_SIZE_REUSE_S).
 
 Only families whose contents are reproducible build output or scratch space are
 ever deleted. Everything else is reported so the space is at least visible.
@@ -8825,6 +8827,32 @@ def fresh_for_apply(known: dict[str, int], fams: list[Family]) -> dict[str, int]
     return {k: v for k, v in known.items() if not candidate_of_selected(k)}
 
 
+# How long an idle sweep reuses a size it cannot act on. idle-repair's hourly sweep is `--refresh --apply`, which
+# re-walked every candidate, every pressure-only cache and report-only checkout included, though a sweep deletes neither
+# (a devbox Mac, 2026-11-17: load 19 on 15 cores, 6 min in `du` under ~/Library/Caches; Leo: "typing under load is not
+# good enough"). Each path gets its own window in [half, all] of this, so the re-walks spread over the passes
+# instead of all coming due in the same one.
+SWEEP_SIZE_REUSE_S = 6 * 3600
+
+
+def sweep_size_window(key: str) -> float:
+    spread = int.from_bytes(hashlib.sha256(key.encode()).digest()[:2], "big") / 65536
+    return SWEEP_SIZE_REUSE_S * (0.5 + 0.5 * spread)
+
+
+def sweep_reusable_sizes(fams: list[Family], now: float | None = None,
+                         path: Path | None = None) -> dict[str, tuple[int, float]]:
+    """The snapshot sizes an applying idle sweep may reuse, with when each was measured: every size measured within
+    its window (sweep_size_window) except a candidate of a family the sweep may delete (fresh_for_apply's rule for
+    the families that are not pressure-only). A pressure-only family is only "kept" in a sweep and a report-only one
+    is never deleted, so their sizes decide nothing in it; a pressure pass and a report still measure as before."""
+    at, sizes, times = load_snapshot_meta(path)
+    now = time.time() if now is None else now
+    recent = {k: v for k, v in sizes.items() if 0 <= now - times.get(k, at) < sweep_size_window(k)}
+    kept = fresh_for_apply(recent, [f for f in fams if not f.pressure_only])
+    return {k: (v, times.get(k, at)) for k, v in kept.items()}
+
+
 def load_snapshot_meta(path: Path | None = None) -> tuple[float, dict[str, int], dict[str, float]]:
     path = SNAPSHOT if path is None else path
     try:
@@ -13208,6 +13236,13 @@ def _main_impl(argv: list[str] | None = None) -> int:
     if a.apply:
         # sizes decide what gets deleted under pressure, so never trust stale candidate sizes
         known = fresh_for_apply(known, fams)
+    # an idle sweep, --refresh or not, walks only what it may delete: the rest keeps a recent size and its time
+    reused: dict[str, float] = {}
+    if a.apply and sweep and not a.no_snapshot:
+        for k, (size, measured) in sweep_reusable_sizes(fams).items():
+            if k not in known:
+                known[k], reused[k] = size, measured
+        measured_at.update(reused)
     now = time.time()
     stale_s = a.max_age * 60
     if a.pressure:
@@ -13282,7 +13317,8 @@ def _main_impl(argv: list[str] | None = None) -> int:
         if a.refresh:
             old_at, old_sizes, old_times = load_snapshot_meta()
             merged = {**old_sizes, **known}
-            save_snapshot(merged, measured_at={**old_times, **{k: time.time() for k in known}})
+            save_snapshot(merged, measured_at={**old_times, **reused,
+                                               **{k: time.time() for k in known if k not in reused}})
         elif not at or len(known) != before or a.apply or fresh_paths or not known:
             # Keep the global stamp old until every item has been refreshed, while recording exact item times.
             updated_times = {k: v for k, v in measured_at.items() if k in known}

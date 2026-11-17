@@ -7911,6 +7911,58 @@ class GlaedaDiskTest(unittest.TestCase):
             self.assertIn("within", out.getvalue())
             self.assertTrue((self.root / "old").exists())
 
+    def test_an_idle_sweep_reuses_recent_sizes_of_what_it_cannot_delete(self) -> None:
+        """Leo: "typing under load is not good enough". idle-repair's hourly `--role devbox --refresh --pressure --idle
+        --apply` re-walked every candidate with du, ~/Library/Caches' children and the report-only checkouts too, on a
+        loaded desktop (a devbox Mac, 2026-11-17: load 19, 6 min in du). A sweep deletes neither a pressure-only cache nor
+        a report-only item, so it reuses their sizes while they are recent and walks only what it may delete."""
+        caches = gd.Family("library-caches", self.root / "Caches", True, "rebuild", pressure_only=True)
+        report = gd.Family("devbox-checkouts", self.root / "Projects", False, "a person's checkout")
+        scratch = gd.Family("test-scratch", self.root / "scratch", True, "rebuild")
+        for i in range(4):
+            make(caches.root / f"cache{i}", age_hours=100)
+        for i in range(3):
+            make(report.root / f"checkout{i}", age_hours=100)
+        make(scratch.root / "fresh", age_hours=0)
+        side = self.root.parent / f"{self.root.name}-sweep"
+        side.mkdir()
+        self.addCleanup(shutil.rmtree, side, ignore_errors=True)
+        snap, stamp = side / "sizes.json", side / "idle.last"
+        args = ["--role", "devbox", "--refresh", "--pressure", "--idle", "--apply", "--top", "0", "--min-mib", "0",
+                "--receipt", os.fspath(side / "receipt.jsonl")]
+        walked_du = gd.du_bytes
+
+        def walked(argv: list[str]) -> list[str]:
+            stamp.unlink(missing_ok=True)
+            with mock.patch.object(gd, "du_bytes", side_effect=walked_du) as du, \
+                    contextlib.redirect_stdout(io.StringIO()):
+                gd.main(argv)
+            return sorted(Path(c.args[0]).name for c in du.call_args_list if self.root in Path(c.args[0]).parents)
+
+        with mock.patch.object(gd, "default_families", return_value=[caches, report, scratch]), \
+                mock.patch.object(gd, "free_bytes", return_value=(300 * gd.GIB, 400 * gd.GIB)), \
+                mock.patch.object(gd, "SNAPSHOT", snap), mock.patch.object(gd, "IDLE_STAMP", stamp), \
+                mock.patch.object(gd, "EVICT_LOCK", side / "evict.lock"), \
+                mock.patch.object(gd, "MEASURE_LOCK", side / "measure.lock"), \
+                mock.patch.object(gd, "HEALTH_SUMMARY", side / "summary.json"), \
+                mock.patch.object(gd, "RUN_LOG", side / "runs.jsonl"), \
+                mock.patch.object(gd, "host_busy", return_value=""), \
+                mock.patch.object(gd, "simulator_runtimes", return_value=[]):
+            everything = [*(f"cache{i}" for i in range(4)), *(f"checkout{i}" for i in range(3)), "fresh"]
+            self.assertEqual(walked(args), sorted(everything), "a cold snapshot walks every candidate once")
+            self.assertEqual(walked(args), ["fresh"], "the next sweep walks only what it may delete")
+            self.assertTrue(all((caches.root / f"cache{i}").exists() for i in range(4)), "pressure-only: kept")
+            _, sizes, times = gd.load_snapshot_meta(snap)
+            self.assertEqual(set(sizes), {os.fspath(p) for f in (caches, report, scratch) for p in f.root.iterdir()})
+            cache0 = os.fspath(caches.root / "cache0")
+            self.assertLess(time.time() - times[cache0], gd.SWEEP_SIZE_REUSE_S,
+                            "a reused size keeps the time it was measured, so it ages out")
+            # past its reuse window a size is walked again, and only that one
+            gd.save_snapshot(sizes, snap, measured_at={**times, cache0: time.time() - gd.SWEEP_SIZE_REUSE_S})
+            self.assertEqual(walked(args), ["cache0", "fresh"])
+            # a report's --refresh still re-measures every size
+            self.assertEqual(walked(["--refresh", "--top", "0", "--min-mib", "0"]), sorted(everything))
+
     def test_simulator_runtimes_go_only_when_nothing_uses_them(self) -> None:
         now = time.time()
         old = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now - 30 * 86400))
