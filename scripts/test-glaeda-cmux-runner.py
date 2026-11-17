@@ -9016,6 +9016,35 @@ class StarvedReserveTest(unittest.TestCase):
         self.look(gate, units)
         self.assertEqual(hook.starved_reserved(capacity), 0, "no job starved any more")
 
+    def test_dev_std_and_gateway_runners_are_not_starved_by_units(self) -> None:
+        # glaeda-dev-std (the freshness slot) already keeps its own FRESH_RESERVE_UNITS while idle, and ignores a
+        # starved hold; glaeda-gateway takes a gateway token and no shared unit. Neither holds nor is held by one.
+        capacity = self.ledger(14 - (self.need - 1))
+        fd = hook.lock_file(capacity / hook.STARVED_RESERVE_FILE, fcntl.LOCK_EX)
+        try:
+            self.assertIsNone(hook.mini_full(capacity, 14, hook.RunnerScope(14, 2, 2, gateway=True)),
+                              "a gateway listener needs a gateway token, not units")
+            self.assertNotIn(hook.STARVED_NOTE,
+                             hook.mini_full(capacity, 14, hook.RunnerScope(14, 2, 2, fresh=True)) or "")
+        finally:
+            os.close(fd)
+        units = f"only {self.need - 1} of 14 capacity units on this mini are free; its next job needs 3"
+        for label, flag in (("glaeda-dev-std-xcode-26.6", " --dev-compile-runner"), ("glaeda-gateway-xcode-26.6", "")):
+            with self.subTest(label=label):
+                runner = self.runner(2)
+                script = runner / hook.RUNNER_HOOK_SCRIPT
+                script.write_text(script.read_text().rstrip("\n") + flag + "\n")
+                (self.state / "instance-2").mkdir(exist_ok=True)
+                (self.state / "instance-2" / "receipt.json").write_text(json.dumps({"registration": {
+                    "name": f"{self.HOST}-glaeda-2", "labels": ["glaeda-mini", label]}}))
+                self.jobs = [self.job(labels=[label], ago=60 * 60)]
+                scope = hook.RunnerScope(14, 2, 2, gateway=True) if "gateway" in label else None
+                with mock.patch.object(hook, "runner_scope", return_value=scope) if scope else contextlib.nullcontext():
+                    gate = self.gate(runner, capacity)
+                    self.look(gate, units)
+                self.assertIsNone(gate.starved_fd, f"{label}: not a root runner, no hold")
+                self.assertEqual(hook.starved_reserved(capacity), 0)
+
     def test_the_hold_fails_open_and_ends(self) -> None:
         capacity = self.ledger(14 - (self.need - 1))
         units = f"only {self.need - 1} of 14 capacity units on this mini are free; a compile needs {self.need}"
