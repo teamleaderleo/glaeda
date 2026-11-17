@@ -364,6 +364,25 @@ MEASURE_SKIP_COMPONENTS = frozenset({
     "com.apple.FileProvider", "com.apple.CloudDocs",
 })
 
+# Folders macOS guards with a privacy (TCC) prompt. du opening one asks a person, in the name of the
+# program that started glaeda-disk: "worker-<sha>" wants your photo library or media library (the CI
+# worker's lent-host eviction runs glaeda-disk), "python3.13" wants files managed by iCloud Drive (the
+# LaunchAgent). A fleet Mac has nobody to answer, so the prompt sits on its screen over every capture
+# (cmuxterm-hq docs/handbook/prompt-on-an-unattended-screen.md; its detector is dialog-alarm). On macOS
+# every du walk skips them by name at any depth: they hold no runner work or rebuildable state, and
+# accounting is a lower bound already. HOME_NEVER keeps discovery out of the same folders.
+PRIVACY_SKIP_NAMES = (
+    "Desktop", "Documents", "Downloads", "Movies", "Music", "Pictures",
+    "*.photoslibrary", "*.musiclibrary", "*.tvlibrary",
+)
+
+
+def du_skip_args() -> list[str]:
+    """du's flags that keep a walk out of FileProvider/iCloud trees and, on macOS, privacy-guarded folders."""
+    if DARWIN:
+        return [arg for name in (*sorted(MEASURE_SKIP_COMPONENTS), *PRIVACY_SKIP_NAMES) for arg in ("-I", name)]
+    return [f"--exclude={name}" for name in sorted(MEASURE_SKIP_COMPONENTS)]
+
 # These roots are for accounting only. They are deliberately separate from the eviction
 # catalogue: their sizes may overlap, and an incomplete walk is a lower bound rather than
 # permission to delete anything. Keeping the Data volume at one bounded level makes the
@@ -4806,7 +4825,7 @@ def du_bytes(path: Path, *, record_timeout: bool = True) -> int | None:
         return None
     if _measurement_on_timeout_cooldown(path):
         return None
-    out = _du_output(["du", "-xsk", str(path)], record_timeout=record_timeout)
+    out = _du_output(["du", "-xsk", *du_skip_args(), str(path)], record_timeout=record_timeout)
     if out is None:
         return None
     try:
@@ -4822,7 +4841,7 @@ def du_children(root: Path, *, record_timeout: bool = True) -> dict[str, int] | 
     """Sizes of every directory directly below root from a single walk, keyed like candidates."""
     if not _measurement_path_allowed(root):
         return None
-    out = _du_output(["du", "-xk", "-d", "1", str(root)], record_timeout=record_timeout)
+    out = _du_output(["du", "-xk", "-d", "1", *du_skip_args(), str(root)], record_timeout=record_timeout)
     if out is None:
         return None
     sizes: dict[str, int] = {}
@@ -4842,7 +4861,7 @@ def du_children_with_status(root: Path, *, record_timeout: bool = True) -> tuple
     """
     if not _measurement_path_allowed(root):
         return None
-    out = _du_output(["du", "-xk", "-d", "1", str(root)], allow_nonzero=True,
+    out = _du_output(["du", "-xk", "-d", "1", *du_skip_args(), str(root)], allow_nonzero=True,
                      record_timeout=record_timeout)
     if out is None:
         return None
@@ -10047,10 +10066,9 @@ def census_covered() -> set[str]:
 
 
 def _census_du_argv(path: Path) -> list[str]:
-    # never enter a FileProvider/cloud tree below an unowned directory: du can block in the kernel there
-    skips = [arg for name in sorted(MEASURE_SKIP_COMPONENTS)
-             for arg in (("-I", name) if DARWIN else (f"--exclude={name}",))]
-    argv = ["du", "-xsk", *skips, str(path)]
+    # never enter a FileProvider/cloud tree below an unowned directory (du can block in the kernel there),
+    # nor a privacy-guarded folder (du would put a TCC prompt on an unattended screen)
+    argv = ["du", "-xsk", *du_skip_args(), str(path)]
     if os.path.exists("/usr/sbin/taskpolicy"):
         return ["/usr/sbin/taskpolicy", "-b", *argv]  # background QoS: CPU and I/O throttled
     if ionice := shutil.which("ionice"):

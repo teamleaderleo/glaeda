@@ -8631,6 +8631,30 @@ class VolumeCensusTest(unittest.TestCase):
             self.assertTrue(name in argv or f"--exclude={name}" in argv, name)
         self.assertEqual(argv[-1], str(self.root))
 
+    def test_no_du_walk_on_macos_enters_a_privacy_guarded_folder(self) -> None:
+        # du opening ~/Pictures or ~/Music put "worker-<sha> wants your photo library / media library" on
+        # unattended fleet Macs (dialog-alarm, 2026-11-17): every walk names them in -I, at any depth.
+        seen: list[list[str]] = []
+
+        def fake(argv, *args, **kwargs):
+            seen.append(list(argv))
+            return f"4 {self.root}\n"
+
+        with mock.patch.object(gd, "DARWIN", True), mock.patch.object(gd, "_du_output", side_effect=fake):
+            gd.du_bytes(self.root, record_timeout=False)
+            gd.du_children(self.root, record_timeout=False)
+            gd.du_children_with_status(self.root, record_timeout=False)
+            seen.append(gd._census_du_argv(self.root))
+        self.assertEqual(len(seen), 4)
+        for argv in seen:
+            ignored = {argv[i + 1] for i, a in enumerate(argv[:-1]) if a == "-I"}
+            for name in ("Pictures", "Music", "Movies", "Desktop", "Documents", "Downloads",
+                         "*.photoslibrary", "*.musiclibrary", "Mobile Documents"):
+                self.assertIn(name, ignored, argv)
+            self.assertEqual(argv[-1], str(self.root))
+        with mock.patch.object(gd, "DARWIN", False):
+            self.assertNotIn("--exclude=Pictures", gd.du_skip_args())
+
     def test_a_sized_dir_whose_size_goes_is_walked_before_completion(self) -> None:
         a, b = self.write("a/blob").parent, self.write("b/blob").parent
         state = {"schema": "glaeda-disk-census/v1", "started_at": 1.0, "dev": self.root.stat().st_dev,
