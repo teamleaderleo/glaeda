@@ -2727,8 +2727,8 @@ class GlaedaDiskTest(unittest.TestCase):
                 mock.patch.object(gd, "cmux_active", lambda *a, **k: True):
             items = gd.survey(gd.fleet_families(ci), 24, 0)
             got = {Path(i.path).name: (i.verdict, i.reasons) for i in items}
-            self.assertEqual(got["p-a"][0], "kept")  # the newest two stay, listed or not
-            self.assertEqual(got["p-b"][0], "kept")
+            self.assertEqual(got["p-a"][0], "kept")  # the newest stays, listed or not (SEED_KEEP = 1 since #2059)
+            self.assertEqual(got["p-b"][0], "recent")  # second newest: not listed, its usual window
             self.assertEqual(got["p-c"], ("reclaimable", ["the seed archive holds it"]))
             self.assertEqual(got["p-d"][0], "recent")  # not listed: its usual window
             fams = {f.id: f for f in gd.fleet_families(ci)}
