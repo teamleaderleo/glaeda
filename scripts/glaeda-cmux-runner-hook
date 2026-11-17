@@ -2419,6 +2419,19 @@ SATURATED = "the mini is saturated"
 # load again once the load has fallen below the resume mark, so one stuck process cannot keep a mini dark.
 GATE_LOAD_MAX_HOLD_S = float(os.environ.get("GLAEDA_RUNNER_GATE_LOAD_MAX_HOLD_S") or 30 * 60)
 GATE_STOP_WAIT_S = 60.0  # a graceful listener exit, before it is killed
+# A listener that acknowledged a job request and has started no Runner.Worker for this long is stuck, not taking it:
+# the gate restarts it (Gate.stuck_acquire). cmux13s glaeda-12, 2026-11-17: acknowledged f233fe94 at 08:02:33Z, then
+# GetJobMessageAsync hung on one connection with no further _diag line until 12:40:14Z, so the slot ran nothing for
+# 4.6 h while stop() kept it as "taking job request". The bound, from every acknowledge in the _diag logs of
+# cmux13s, cmux10s and cmuxs-mac-mini-5 (29,427, 2026-10-19..11-17): acknowledge to Worker p50 2 s, p99 14 s, max
+# 219 s; an acknowledge that ended without a Worker on its own did so within 678 s. GitHub fails a job its runner has
+# not acquired and renewed for 10 min ("lost communication with the server", LISTENER_TAKES' note), so past 15 min
+# the restart can lose nothing the hang had not already lost. A Runner.Worker is never touched.
+GATE_ACQUIRE_STUCK_S = float(os.environ.get("GLAEDA_RUNNER_GATE_ACQUIRE_STUCK_S") or 15 * 60)
+GATE_ACQUIRE_EVERY_S = 30.0  # how often a busy listener with no Worker is looked at for it
+LISTENER_STUCK = "listener_acquire_stuck"  # the structured reason, in the log line and in GATE_RESTARTS_FILE
+GATE_RESTARTS_FILE = "listener-restarts.jsonl"  # in the state dir; glaeda-mini-health reports it as healed
+GATE_RESTARTS_KEEP = 200
 # A listener's first message poll is kept this long before a hold may stop it. GitHub can hand a queued job to a
 # new session before the listener has seen it, and a stop that cancels that poll loses the job: GitHub retries the
 # gone session and fails the job 3 min later, "not acquired by Runner of type self-hosted even after multiple
@@ -8567,25 +8580,57 @@ def listener_request(runner_dir: Path) -> str | None:
     """The runner request the listener has acknowledged or dispatched and not yet finished, from the tail of the
     newest _diag/Runner_*.log (a listener writes a new one each start; Worker_*.log files are jobs' own), or None.
     From the acknowledge until its Worker finishes the job is this runner's: a stop in that span loses it."""
+    return listener_request_at(runner_dir)[0]
+
+
+DIAG_STAMP = re.compile(r"^\[(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d)Z ")
+
+
+def listener_request_at(runner_dir: Path) -> tuple[str | None, float | None]:
+    """listener_request, with when the listener took it: the epoch of its acknowledge's _diag line (UTC), or None
+    when that line has no stamp."""
     diag = runner_dir / "_diag"
     try:
         names = sorted(n for n in os.listdir(diag) if n.startswith("Runner_") and n.endswith(".log"))
     except FileNotFoundError:
-        return None
+        return None, None
     if not names:
-        return None
+        return None, None
     with open(diag / names[-1], "rb") as file:
         size = os.fstat(file.fileno()).st_size
         file.seek(max(0, size - RUNNER_DIAG_TAIL))
         text = file.read().decode("utf-8", "replace")
-    request = None
+    request, at = None, None
     for line in text.splitlines():
         taken = LISTENER_TAKES.search(line)
         if taken:
+            if request is None or taken.group(1):  # an acknowledge starts the span; its dispatch keeps the stamp
+                stamp = DIAG_STAMP.match(line)
+                at = None
+                if stamp:
+                    with contextlib.suppress(ValueError):
+                        at = datetime.datetime.strptime(stamp.group(1), "%Y-%m-%d %H:%M:%S").replace(
+                            tzinfo=datetime.timezone.utc).timestamp()
             request = taken.group(1) or taken.group(2)
         elif request is not None and any(done in line for done in LISTENER_DONE):
-            request = None
-    return request
+            request, at = None, None
+    return request, at
+
+
+def note_listener_restart(state_dir: Path, runner_dir: Path, doc: dict[str, Any]) -> None:
+    """Append one gate restart of a stuck listener to GATE_RESTARTS_FILE (the last GATE_RESTARTS_KEEP kept), which
+    glaeda-mini-health reports under healed for ci-dash. A failed write changes nothing the gate does."""
+    path = state_dir / GATE_RESTARTS_FILE
+    line = json.dumps({"runner": runner_dir.name, **doc}, separators=(",", ":"), sort_keys=True)
+    with contextlib.suppress(OSError):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            kept = path.read_text(encoding="utf-8").splitlines()[-(GATE_RESTARTS_KEEP - 1):]
+        except FileNotFoundError:
+            kept = []
+        tmp = path.with_name(path.name + f".{os.getpid()}")
+        tmp.write_text("".join(f"{x}\n" for x in [*kept, line] if x.strip()), encoding="utf-8")
+        os.replace(tmp, path)
 
 
 # A runner GitHub removed (an org deletes a runner that has not connected for a while, so a listener the gate held
@@ -8718,6 +8763,12 @@ class Gate:
         self.waiter_seen = waiter_seen_stamp(state_dir)  # the last job-started waiter refusal this gate acted on
         self.worker_noted = False
         self.defer_noted = False  # stop() said once that it kept a listener taking a job
+        # stuck_acquire(): a request the listener acknowledged and never ran (GATE_ACQUIRE_STUCK_S) is given up, so
+        # busy() and stop() no longer keep the listener for it; first_taken is when this gate first saw the request
+        # without a Worker (time.monotonic), the bound when its _diag line has no stamp
+        self.lost_request: str | None = None
+        self.first_taken: tuple[str, float] | None = None
+        self.acquire_at = -GATE_ACQUIRE_EVERY_S
         self.source = source_identity()
         self.thermal: int | None = None  # the level while the gate holds for heat, else None
         self.thermal_at = -GATE_THERMAL_EVERY_S
@@ -9865,7 +9916,7 @@ class Gate:
         if not self.listening():
             return False
         request = self.taking()
-        return request is not None and (finished is None or request != finished)
+        return request is not None and request != self.lost_request and (finished is None or request != finished)
 
     def listening(self) -> bool:
         """A Runner.Listener of this runner under its tree. A failed look counts as listening."""
@@ -9911,6 +9962,53 @@ class Gate:
         except (OSError, ValueError) as error:
             return f"unknown ({type(error).__name__})"
 
+    def stuck_acquire(self, now: float | None = None) -> bool:
+        """A listener that acknowledged a job request GATE_ACQUIRE_STUCK_S ago and has started no Runner.Worker
+        for it is stuck in its acquisition, not taking a job (GATE_ACQUIRE_STUCK_S): give the request up (lost_request,
+        so busy() and stop() no longer keep the listener for it) and restart the listener through stop(): its SIGINT,
+        the kill after GATE_STOP_WAIT_S, then the usual start after GATE_RESTART_FREE_S free. Logged with
+        LISTENER_STUCK and counted in GATE_RESTARTS_FILE. Looked at every GATE_ACQUIRE_EVERY_S; a Worker, or an
+        unreadable diag or process table, is never stuck. Returns whether it stopped the listener."""
+        mono = time.monotonic()
+        if self.stop_deadline is not None or self.terminating or mono - self.acquire_at < GATE_ACQUIRE_EVERY_S:
+            return False
+        self.acquire_at = mono
+        if self.worker() or not self.listening():  # a failed look reads as a Worker: never stuck
+            self.first_taken = None
+            return False
+        try:
+            request, acked = listener_request_at(self.runner_dir)
+        except (OSError, ValueError):
+            return False
+        if request is None or request == self.lost_request:
+            self.first_taken = None
+            return False
+        if self.first_taken is None or self.first_taken[0] != request:
+            self.first_taken = (request, mono)
+        now = time.time() if now is None else now
+        held = mono - self.first_taken[1]
+        if acked is not None:  # an acknowledge never predates its own listener (listening_since, when known)
+            age = now - acked
+            if self.listening_since is not None:
+                age = min(age, mono - self.listening_since)
+            held = max(held, age)
+        if held < GATE_ACQUIRE_STUCK_S:
+            return False
+        why = (f"{LISTENER_STUCK}: the listener acknowledged job request {request} "
+               f"{'at ' + gate_stamp(acked) + ' ' if acked is not None else ''}and started no Runner.Worker in "
+               f"{held:.0f} s (bound {GATE_ACQUIRE_STUCK_S:g} s); restarting it")
+        self.lost_request = request
+        gate_log(why)
+        self.unclaim()
+        if not self.stop(why):  # a Worker came up at the last look: it is a job after all
+            self.lost_request = None
+            return False
+        note_listener_restart(self.state_dir, self.runner_dir, {
+            "schema": 1, "cause": LISTENER_STUCK, "t": round(now), "at": gate_stamp(now), "request": request,
+            "acknowledged": gate_stamp(acked) if acked is not None else None, "held_s": round(held),
+            "bound_s": GATE_ACQUIRE_STUCK_S})
+        return True
+
     def start(self) -> None:
         gate_log("starting the listener")
         self.child = subprocess.Popen([os.fspath(self.runner_dir / "run.sh")], cwd=self.runner_dir,
@@ -9918,6 +10016,7 @@ class Gate:
         self.stale_env = None
         self.streak, self.stopped_one = 0, False
         self.listening_since, self.first_poll_noted = time.monotonic(), False
+        self.lost_request, self.first_taken = None, None
         self.started_wall = time.time()
 
     def registration_wait(self) -> bool:
@@ -10004,7 +10103,7 @@ class Gate:
                     frozen.append(pid)
             if listeners:
                 request, worker = self.taking(), self.worker()
-                if request is not None and request == finished and not worker:
+                if request is not None and request in (finished, self.lost_request) and not worker:
                     request = None
                 if (worker and not self.terminating) or (request is not None and not worker):
                     if not self.defer_noted:
@@ -10129,6 +10228,8 @@ class Gate:
                     self.stop(why, finished)
                     return None
             self.reload()
+            if self.stuck_acquire():
+                return None
             if self.busy():
                 # A fleet build seen waiting, or a reservation made, during a job stops the listener as the job
                 # ends: with a queue behind the label the next job comes before two idle polls, and each is
