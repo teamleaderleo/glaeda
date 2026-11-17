@@ -12480,6 +12480,9 @@ def broker_plan(args: list[str], now: float) -> tuple[str, str | None, str | Non
 # same question, not the same bytes (gh_cache_canonical): `-R O/R --json b,a` and `--json=a,b
 # --repo o/r` share one answer and one fill.
 GH_CACHE_TTL = 90.0  # the window cosmic-gray's repeats fall in (glaeda-gh audit: AUDIT_WINDOW)
+# The head-read budget's consumer for the commits whose checks the broker sees read twice (cmd_gh): one shared
+# daemon read in place of every session's REST pages. Its hourly budget is the consumer budget every head has.
+BROKER_HEAD_CONSUMER = "gh-broker"
 # An answer that cannot change: a completed job, a completed attempt's jobs, or a completed run the
 # daemon still watches and has seen no change in. As long as an answer is kept at all (GH_CACHE_KEEP).
 GH_CACHE_DONE_TTL = float(TERMINAL_REFRESH)
@@ -12538,6 +12541,12 @@ GH_CACHE_MUTATION_RE = re.compile(r"\bmutation\b")
 GH_CACHE_API_PR_RE = re.compile(rf"^(?:https?://api\.github\.com/)?/?repos/({NAME})/({NAME})/(?:pulls|issues)/(\d+)(?:[/?]|$)")
 GH_CACHE_API_RUN_RE = re.compile(rf"^(?:https?://api\.github\.com/)?/?repos/({NAME})/({NAME})/actions/runs/(\d+)(?:[/?]|$)")
 GH_CACHE_API_JOB_RE = re.compile(rf"^(?:https?://api\.github\.com/)?/?repos/({NAME})/({NAME})/actions/jobs/(\d+)(?:[/?]|$)")
+# One commit's checks: its check runs, combined status, statuses or check suites, by full sha. Kept as a "head" answer:
+# made old by a write that can start or rerun a check (the "heads" scope), not by every comment or update-branch on the
+# repository, and checked against glaeda's own read of that head (`glaeda-gh checks`) when the daemon holds it.
+GH_CACHE_API_HEAD_RE = re.compile(
+    rf"^(?:https?://api\.github\.com/)?/?repos/({NAME})/({NAME})/commits/([0-9a-fA-F]{{40}})/"
+    r"(?:check-runs|check-suites|status|statuses)/?(?:\?|$)")
 GH_CACHE_PR_URL_RE = re.compile(rf"^https://github\.com/({NAME})/({NAME})/(?:pull|issues)/(\d+)/?$")
 # Lists of workflow runs: the REST reads repeated most on cosmic-gray (1,092 of 1,400 within 90 s over
 # 8 hours, 2026-10-30), which a comment or a label cannot change.
@@ -12752,6 +12761,111 @@ def gh_cache_graphql_question(args: list[str]) -> list:
     return [fields, other]
 
 
+# What a GraphQL read is about, read off its query and variables (gh_cache_graphql_scope). Root fields that can reach
+# any repository, or none named on the line: a query using one stays unscoped, so every write on the host still makes
+# it old. `node(`/`nodes(` need their parenthesis: a connection's `nodes { ... }` is no lookup.
+GH_CACHE_GRAPHQL_ANYWHERE_RE = re.compile(
+    r"\b(?:node|nodes|user|organization|repositoryOwner|enterprise|resource|topic|codeOfConduct|license|"
+    r"securityAdvisory|securityAdvisories|securityVulnerabilities|sponsorables|marketplaceListing)\s*\(|\bviewer\b")
+GH_CACHE_GRAPHQL_REPO_RE = re.compile(r"\brepository\s*\(([^)]*)\)")
+GH_CACHE_GRAPHQL_SEARCH_RE = re.compile(r"\bsearch\s*\(([^)]*)\)")
+GH_CACHE_GRAPHQL_ONE_RE = re.compile(r"\b(?:pullRequest|issue|issueOrPullRequest)\s*\(([^)]*)\)")
+GH_CACHE_GRAPHQL_MANY_RE = re.compile(r"\b(?:pullRequests|issues|refs|ref|object|commit|defaultBranchRef|"
+                                      r"discussions?|releases?|deployments|milestones?|labels|projects?)\b")
+GH_CACHE_GRAPHQL_SEARCH_REPO_RE = re.compile(rf"(?:^|\s)repo:({NAME}/{NAME})(?=\s|$)")
+
+
+def gh_cache_graphql_scope(args: list[str]) -> tuple[str | None, list | None]:
+    """(repository, target) a GraphQL read is about: the one repository every `repository(...)` and `search(...)` in
+    its query names, by literal or by a variable on the line (`-f owner=o -f name=r`, a search string's `repo:o/r`),
+    and, when the query reads exactly one PR or issue of it and nothing else of the repository, ["pr", repo, N]. (None,
+    None) when it names none, more than one, any it cannot resolve, or a root field that can read anywhere (node,
+    viewer, user, ...): such an answer is made old by every write on the host, as before. A read scoped here is made
+    old only by a write to its repository (or one naming none), as a REST read of that repository is; until
+    2026-11-17 every GraphQL read was dropped by any write anywhere, and a lane VM's land loop writes every 30 s."""
+    fields, _other = gh_cache_graphql_question(args)
+    variables: dict[str, str] = {}
+    query = None
+    for field in fields:
+        name, _eq, value = field[2:].partition("=")
+        if name == "query":
+            if query is not None:
+                return None, None  # gh sends the last one; two are not worth reasoning about
+            query = value
+        else:
+            variables[name] = value
+    if not query or GH_CACHE_MUTATION_RE.search(query) or GH_CACHE_GRAPHQL_ANYWHERE_RE.search(query):
+        return None, None
+
+    def resolve(text: str) -> str | None:
+        text = text.strip()
+        if text.startswith("$"):
+            return variables.get(text[1:])
+        if len(text) >= 2 and text[0] == text[-1] == '"':
+            return text[1:-1]
+        return None
+
+    def arguments(text: str) -> dict[str, str | None]:
+        found: dict[str, str | None] = {}
+        for match in re.finditer(r'(\w+)\s*:\s*("(?:[^"\\]|\\.)*"|\$\w+|[\w.-]+)', text):
+            found[match.group(1)] = resolve(match.group(2)) if match.group(2)[0] in '"$' else match.group(2)
+        return found
+
+    repos: set[str] = set()
+    for match in GH_CACHE_GRAPHQL_REPO_RE.finditer(query):
+        said = arguments(match.group(1))
+        owner, name = said.get("owner"), said.get("name")
+        if not owner or not name or not re.fullmatch(NAME, owner) or not re.fullmatch(NAME, name):
+            return None, None
+        repos.add(f"{owner}/{name}".lower())
+    searches = list(GH_CACHE_GRAPHQL_SEARCH_RE.finditer(query))
+    for match in searches:
+        text = arguments(match.group(1)).get("query")
+        named = GH_CACHE_GRAPHQL_SEARCH_REPO_RE.findall(text or "")
+        if len(named) != 1 or re.search(r"(?:^|\s)(?:org|user|owner|repo):", GH_CACHE_GRAPHQL_SEARCH_REPO_RE.sub(" ", text)):
+            return None, None  # several repositories, or an owner-wide qualifier besides the one repo
+        repos.add(named[0].lower())
+    if len(repos) != 1:
+        return None, None
+    repo = repos.pop()
+    if searches:
+        return repo, None
+    ones = list(GH_CACHE_GRAPHQL_ONE_RE.finditer(query))
+    if len(ones) != 1:
+        return repo, None
+    number = arguments(ones[0].group(1)).get("number")
+    if not number or not re.fullmatch(r"\d+", number):
+        return repo, None
+    # One PR, and nothing else of the repository read beside it (a list, a ref, a commit): the query with that PR's
+    # own selection set taken out must read nothing more of the repository.
+    start = query.find("{", ones[0].end())
+    depth, end = 0, -1
+    for i in range(start, len(query)) if start >= 0 else ():
+        depth += {"{": 1, "}": -1}.get(query[i], 0)
+        if depth == 0:
+            end = i
+            break
+    if end < 0:
+        return repo, None
+    outside = query[:ones[0].start()] + query[end + 1:]
+    if GH_CACHE_GRAPHQL_MANY_RE.search(outside):
+        return repo, None
+    return repo, ["pr", repo, str(int(number))]
+
+
+def gh_cache_answer_repo(args: list[str], words: list[str], values: dict[str, str]) -> str | None:
+    """The repository whose writes make a kept answer old; None is every write on the host. A GraphQL read's is the
+    one its query names (gh_cache_graphql_scope), never the working directory's: until 2026-11-17 its braces read
+    as gh's `{owner}` placeholders, so a query about one repository run in a checkout of another was made old only
+    by the checkout's writes, and one run outside a checkout by every write anywhere."""
+    if words[:1] == ["api"] and len(words) > 1 and AUDIT_GRAPHQL_RE.match(words[1]):
+        return gh_cache_graphql_scope(args)[0]
+    if gh_cache_anywhere(words):
+        return None  # a search spans repositories, so any write on this host makes its answer old
+    return gh_cache_repo(words, values) or (
+        None if words[:1] == ["api"] and not any("{" in a for a in args) else broker_repo(values))
+
+
 def gh_cache_canonical(args: list[str]) -> list | None:
     """The question a non-GraphQL call asks, with the spelling taken out: flags in one order (a flag
     given twice keeps its occurrences in order, since gh keeps the last or appends), each by one
@@ -12829,6 +12943,9 @@ def gh_cache_target(words: list[str], values: dict[str, str], repo: str | None) 
             match = pattern.match(words[1])
             if match:
                 return [kind, f"{match.group(1)}/{match.group(2)}".lower(), match.group(3)]
+        match = GH_CACHE_API_HEAD_RE.match(words[1])
+        if match:
+            return ["head", f"{match.group(1)}/{match.group(2)}".lower(), match.group(3).lower()]
         return None
     if (first, second) in {("pr", "view"), ("pr", "checks"), ("pr", "diff"), ("issue", "view")} and len(words) == 3:
         match = GH_CACHE_PR_URL_RE.match(words[2])
@@ -12856,7 +12973,7 @@ def gh_cache_stamps(target: list | None, repo: str | None, words: list[str] | No
     if target:
         kind, repo, ident = target
         narrow = {"pr": [f"{repo} pr {ident}", f"{repo} prs"], "run": [f"{repo} run {ident}", f"{repo} runs"],
-                  "job": [f"{repo} jobs", f"{repo} runs"]}[kind]
+                  "job": [f"{repo} jobs", f"{repo} runs"], "head": [f"{repo} heads"]}[kind]
         return ["*", repo, *narrow]
     if repo:
         return ["*", repo, f"{repo} other"]
@@ -12867,7 +12984,8 @@ def gh_cache_write_scope(args: list[str], words: list[str], method: str,
                          values: dict[str, str]) -> tuple[str | None, list[str]]:
     """(repository or None, the scopes this write stamps): "pr N", "run ID", "prs" (every PR's
     mergeability or checks), "runs" (every run), "jobs", "runlists" (the lists of workflow runs: a
-    write that can start one) and "other" (the other lists, and everything not one target). [] is
+    write that can start one), "heads" (one commit's checks: a write that can start or rerun one; never
+    merge or update-branch, whose runs are on a new commit) and "other" (the other lists, and everything not one target). [] is
     the whole repository, as every write was before; a write naming no repository stamps every one.
 
     Narrow only where what the write changes is known: anything else, a GraphQL mutation included,
@@ -12889,15 +13007,15 @@ def gh_cache_write_scope(args: list[str], words: list[str], method: str,
                 return repo, [f"pr {int(tail[1])}", "prs", "runlists", "other"]
             # An edit, a label, a comment or a review: each can start a workflow (pull_request,
             # issues, issue_comment, pull_request_review), so the run lists go with them.
-            return repo, [f"pr {int(tail[1])}", "runlists", "other"]
+            return repo, [f"pr {int(tail[1])}", "runlists", "heads", "other"]
         if tail in (["issues"], ["pulls"]):
-            return repo, ["runlists", "other"]  # a new issue or PR: issues.opened, pull_request
+            return repo, ["runlists", "heads", "other"]  # a new issue or PR: issues.opened, pull_request
         if len(tail) >= 3 and tail[:2] == ["actions", "runs"] and tail[2].isdigit():
-            return repo, [f"run {tail[2]}", "runlists", "jobs", "prs", "other"]
+            return repo, [f"run {tail[2]}", "runlists", "heads", "jobs", "prs", "other"]
         if len(tail) >= 3 and tail[:2] == ["actions", "jobs"] and tail[2].isdigit():
-            return repo, ["runs", "runlists", "jobs", "prs", "other"]
+            return repo, ["runs", "runlists", "heads", "jobs", "prs", "other"]
         if len(tail) >= 4 and tail[:2] == ["actions", "workflows"] and tail[3] == "dispatches":
-            return repo, ["runlists", "prs", "other"]  # a new run: its checks reach a PR on that branch
+            return repo, ["runlists", "heads", "prs", "other"]  # a new run: its checks reach a PR on that branch
         return repo, []
     rest = gh_cache_write_positionals(args)
     if rest is None:
@@ -12913,13 +13031,13 @@ def gh_cache_write_scope(args: list[str], words: list[str], method: str,
         if second in GH_CACHE_TARGET_WRITES:
             # A label, a ready-for-review, a reopen, a comment or a review can each start a workflow
             # (pull_request, issue_comment, pull_request_review): the run lists go with them.
-            return repo, [f"pr {int(number)}", "runlists", "other"]
+            return repo, [f"pr {int(number)}", "runlists", "heads", "other"]
     if (first, second) in {("pr", "create"), ("issue", "create")}:
-        return repo, ["runlists", "other"]  # pull_request, issues.opened
+        return repo, ["runlists", "heads", "other"]  # pull_request, issues.opened
     if first == "run" and second in GH_CACHE_RUN_WRITES and rest[:1] and rest[0].isdigit() and len(rest) == 1:
-        return repo, [f"run {rest[0]}", "runlists", "jobs", "prs", "other"]
+        return repo, [f"run {rest[0]}", "runlists", "heads", "jobs", "prs", "other"]
     if (first, second) == ("workflow", "run"):
-        return repo, ["runlists", "prs", "other"]
+        return repo, ["runlists", "heads", "prs", "other"]
     return repo, []
 
 
@@ -12955,13 +13073,13 @@ def gh_cache_post_scopes(item: dict) -> list[str]:
     the lists and the run lists. Anything else stamps the whole repository."""
     number = item.get("number")
     if item.get("kind") in ("comment", "review") and isinstance(number, int) and not isinstance(number, bool):
-        return [f"pr {number}", "runlists", "other"]
+        return [f"pr {number}", "runlists", "heads", "other"]
     if item.get("kind") == "pr":
-        return ["runlists", "other"]
+        return ["runlists", "heads", "other"]
     return []
 
 
-GH_CACHE_WATCH_KIND = {"pr": "pr", "run": "run"}
+GH_CACHE_WATCH_KIND = {"pr": "pr", "run": "run", "head": "head"}
 
 
 def gh_cache_watch(target: list | None) -> tuple[str, dict] | None:
@@ -12971,7 +13089,7 @@ def gh_cache_watch(target: list | None) -> tuple[str, dict] | None:
         return None
     kind, repo, ident = target
     try:
-        key = parse_key(kind, f"{repo}{'#' if kind == 'pr' else '/'}{ident}")
+        key = parse_key(kind, f"{repo}{ {'pr': '#', 'head': '@'}.get(kind, '/') }{ident}")
         entry = read_cache(key)
     except (WatchError, OSError, ValueError):
         return None
@@ -13079,7 +13197,10 @@ def gh_cache_get(key: str, repo: str | None, now: float) -> dict | None:
         # stamps decide, as for an answer the daemon never held.
     if ttl > 0 and not long and (doc.get("done") is True or (
             watched and doc.get("doneWhenRead") is True and isinstance(watched.get("fetchedAt"), (int, float))
-            and now - watched["fetchedAt"] < TERMINAL_REFRESH + 2 * CYCLE)):
+            and now - watched["fetchedAt"] < TERMINAL_REFRESH + 2 * CYCLE
+            # A settled head (every check finished) is kept past the TTL only for a caller that did not ask for a
+            # shorter one: a merge gate reading with GLAEDA_GH_CACHE_TTL=15 still reads it within 15 s.
+            and (watch[2] != "head" or ttl >= GH_CACHE_TTL))):
         # Cannot change (a completed job), or a completed run whose daemon copy is still being read
         # and has not changed since. A rerun reaches that copy through the controller's webhook
         # within a tick, or the daemon's own re-read of a finished run (TERMINAL_REFRESH) when the
@@ -13119,12 +13240,17 @@ def gh_cache_put(key: str, at: float, rc: int, out: bytes, err: bytes, long: boo
     gh_cache_prune(at)
 
 
-def gh_cache_meta(words: list[str], values: dict[str, str], repo: str | None) -> dict:
+def gh_cache_meta(words: list[str], values: dict[str, str], repo: str | None, args: list[str] | None = None) -> dict:
     """What an answer about to be read must be checked against later, taken before gh runs: the write
     stamps for its target (gh_cache_stamps) and, when glaeda's daemon holds the PR or run, a mark of
     what it holds now. A mark taken before the read can only be older than the answer, so a change
-    the daemon sees afterwards always drops it -- never the other way round."""
+    the daemon sees afterwards always drops it -- never the other way round. A GraphQL read's target is
+    read off its query (gh_cache_graphql_scope), when ARGS are given."""
     target = gh_cache_target(words, values, repo)
+    if args is not None and words[:1] == ["api"] and len(words) > 1 and AUDIT_GRAPHQL_RE.match(words[1]):
+        scoped, target = gh_cache_graphql_scope(args)
+        if scoped != repo:
+            target = None  # stamped by what the caller keyed it under, never narrower
     meta: dict[str, Any] = {}
     stamps = gh_cache_stamps(target, repo, words)
     if stamps is not None:
@@ -13134,7 +13260,8 @@ def gh_cache_meta(words: list[str], values: dict[str, str], repo: str | None) ->
         daemon_key, entry = held
         kind = daemon_key.split(":", 1)[0]
         meta["watch"] = [daemon_key, gh_cache_watch_mark(kind, entry), kind]
-        meta["doneWhenRead"] = kind == "run" and terminal("run", entry.get("data"))
+        meta["doneWhenRead"] = (kind == "run" and terminal("run", entry.get("data"))) or (
+            kind == "head" and bool((entry.get("data") or {}).get("settled")))
     return meta
 
 
@@ -13276,7 +13403,7 @@ def gh_cache_fill(real: str, args: list[str], key: str, repo: str | None, ran: l
         words, _method, seen, values = broker_words(args)
         meta: dict = {}
         with contextlib.suppress(Exception):
-            meta = gh_cache_meta(words, values, repo)
+            meta = gh_cache_meta(words, values, repo, args)
         broker_note({**{k: v for k, v in note.items() if k != "written"}, "filled": True})
         note["written"] = True  # the caller's record: it must not write the decision a second time
         at = time.time()
@@ -13651,9 +13778,11 @@ def cmd_gh(args: list[str]) -> int:
             else:
                 cache_key = gh_cache_key(args, words, values, seen, method, real)
                 if cache_key is not None:
-                    # A search spans repositories, so any write on this host makes its answer old.
-                    cache_repo = None if gh_cache_anywhere(words) else gh_cache_repo(words, values) or (
-                        None if words[:1] == ["api"] and not any("{" in a for a in args) else broker_repo(values))
+                    if words[1:2] and AUDIT_GRAPHQL_RE.match(words[1]):
+                        # A GraphQL read's log line is only `api graphql`: its key's prefix lets `audit` count
+                        # the same question asked again, which the line alone cannot show.
+                        said = {**said, "graphql": cache_key[:12]}
+                    cache_repo = gh_cache_answer_repo(args, words, values)
                     answer = gh_cache_get(cache_key, cache_repo, now)
                     if answer is not None:
                         if key is not None:
@@ -13672,6 +13801,15 @@ def cmd_gh(args: list[str]) -> int:
             # hottest read shape on the host (measured: `gh pr view 7 -R o/r --json state` with no
             # daemon, 26x plain gh's startup), per call, exactly when none of the cache's value
             # exists to pay for it.
+            if key is None and cache_key is not None:
+                # A commit's checks read through REST (`commits/SHA/check-runs`, `/status`): read twice in
+                # BROKER_REPEAT, the head becomes the daemon's to read once for every session (`glaeda-gh checks`),
+                # and the answer kept here is checked against that read (gh_cache_watch) instead of every write.
+                target = gh_cache_target(words, values, None)
+                if target and target[0] == "head":
+                    head_key = parse_key("head", f"{target[1]}@{target[2]}")
+                    if daemon_running() and broker_seen_count(head_key, now) >= 2:
+                        register(head_key, consumer=BROKER_HEAD_CONSUMER)
             if key is not None and daemon_running() and broker_seen_count(key, now) >= 2:
                 # read twice in BROKER_REPEAT: worth a watch, so the next read of it is free. A
                 # target read once is never watched, or a sweep over fifty PRs would cost more

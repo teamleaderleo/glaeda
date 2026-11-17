@@ -14237,7 +14237,7 @@ class BrokerAnswerCacheTest(CountingGhBase):
         with mock.patch.object(gg, "daemon_running", return_value=False), \
                 contextlib.redirect_stderr(io.StringIO()):
             gg.cmd_post(args)
-        self.assertEqual(set(gg.gh_cache_writes()), {"o/r pr 7", "o/r runlists", "o/r other"})
+        self.assertEqual(set(gg.gh_cache_writes()), {"o/r pr 7", "o/r runlists", "o/r heads", "o/r other"})
 
     def test_another_token_is_another_question(self) -> None:
         args = ["api", "repos/o/r/pulls/7"]
@@ -14424,7 +14424,7 @@ class BrokerAnswerHitRateTest(CountingGhBase):
         fresh()
         self.run_gh(["pr", "comment", "7", "-R", "o/r", "--body", "hi"])
         self.assertEqual(fresh(), {"pr7": True, "pr8": False, "run5": False, "list": True})
-        self.assertEqual(gg.gh_cache_post_scopes({"kind": "pr", "repo": "o/r"}), ["runlists", "other"],
+        self.assertEqual(gg.gh_cache_post_scopes({"kind": "pr", "repo": "o/r"}), ["runlists", "heads", "other"],
                          "a queued PR stamps what `pr create` does")
         self.run_gh(["pr", "merge", "8", "-R", "o/r", "--squash", "--match-head-commit", "a" * 40])
         self.assertEqual(fresh(), {"pr7": True, "pr8": True, "run5": False, "list": True},
@@ -14836,6 +14836,151 @@ class BrokerGraphqlCacheTest(BrokerBase):
                 self.run_gh(args)
                 self.run_gh(args)
                 self.assertEqual(self.runs(), before + 2)
+
+
+class BrokerGraphqlScopeTest(BrokerGraphqlCacheTest):
+    """A GraphQL read is made old by writes to the repository its query names, not by every write on the host."""
+
+    PRS = ("query=query($owner:String!,$name:String!,$after:String){repository(owner:$owner,name:$name){"
+           "pullRequests(states:OPEN,first:100,after:$after){nodes{number files(first:100){nodes{path}}}}}}")
+    ONE = ("query=query($o:String!,$n:String!,$pr:Int!){repository(owner:$o,name:$n){"
+           "pullRequest(number:$pr){headRefOid commits(last:1){nodes{commit{oid}}}}}}")
+
+    def scope(self, *args: str) -> tuple:
+        return gg.gh_cache_graphql_scope(["api", "graphql", *args])
+
+    def test_the_repository_and_pr_are_read_off_the_query(self) -> None:
+        self.assertEqual(self.scope("-f", self.PRS, "-f", "owner=O", "-f", "name=R"), ("o/r", None))
+        self.assertEqual(self.scope("-f", self.ONE, "-f", "o=o", "-f", "n=r", "-F", "pr=7"), ("o/r", ["pr", "o/r", "7"]))
+        literal = 'query=query{repository(owner:"o",name:"r"){pullRequest(number:12){state}}}'
+        self.assertEqual(self.scope("-f", literal), ("o/r", ["pr", "o/r", "12"]))
+        search = ("query=query($q:String!){search(query:$q,type:ISSUE,first:100){nodes{... on PullRequest{number}}}}")
+        self.assertEqual(self.scope("-f", search, "-f", "q=repo:o/r is:pr is:open base:main"), ("o/r", None))
+
+    def test_a_query_that_can_read_anywhere_stays_unscoped(self) -> None:
+        unscoped = (
+            ("-f", "query=query($id:ID!){node(id:$id){... on PullRequest{state}}}", "-f", "id=PR_1"),
+            ("-f", "query=query{viewer{login}}"),
+            ("-f", self.PRS, "-f", "owner=o"),  # a variable not on the line
+            ("-f", 'query=query{a:repository(owner:"o",name:"r"){id} b:repository(owner:"o",name:"s"){id}}'),
+            ("-f", "query=query($q:String!){search(query:$q,type:ISSUE,first:9){issueCount}}", "-f", "q=org:o is:pr"),
+            ("-f", "query=query($q:String!){search(query:$q,type:ISSUE,first:9){issueCount}}",
+             "-f", "q=repo:o/r repo:o/s"),
+            ("-f", 'query=mutation{addComment(input:{subjectId:"x",body:"y"}){clientMutationId}}'),
+        )
+        for args in unscoped:
+            with self.subTest(args=args[1][:40]):
+                self.assertEqual(self.scope(*args), (None, None))
+
+    def test_a_pr_beside_a_list_is_the_repository_not_the_pr(self) -> None:
+        both = ('query=query{repository(owner:"o",name:"r"){pullRequest(number:3){state} '
+                'refs(refPrefix:"refs/heads/",first:5){nodes{name}}}}')
+        self.assertEqual(self.scope("-f", both), ("o/r", None))
+
+    def test_a_write_to_another_repository_keeps_the_answer(self) -> None:
+        read = ["api", "graphql", "-f", self.PRS, "-f", "owner=o", "-f", "name=r"]
+        self.run_gh(read)
+        self.run_gh(["api", "-X", "POST", "repos/o/elsewhere/issues/4/comments", "-f", "body=x"])
+        self.run_gh(["pr", "merge", "9", "-R", "o/elsewhere", "--squash"])
+        self.run_gh(read)
+        self.assertEqual(self.runs(), 3, "the two writes ran; the read was answered here the second time")
+
+    def test_a_write_to_the_named_repository_or_none_makes_it_old(self) -> None:
+        for i, write in enumerate((["api", "-X", "POST", "repos/o/r/issues/4/comments", "-f", "body=x"],
+                                   ["api", "graphql", "-f", "query=mutation{addComment(input:{}){clientMutationId}}"])):
+            with self.subTest(write=write[:3]):
+                read = ["api", "graphql", "-f", self.PRS, "-f", "owner=o", "-f", "name=r", "-f", f"after=C{i}"]
+                before = self.runs()
+                self.run_gh(read)
+                self.run_gh(write)
+                self.run_gh(read)
+                self.assertEqual(self.runs(), before + 3)
+
+    def test_a_pr_read_is_kept_past_a_write_to_another_pr_of_the_repository(self) -> None:
+        read = ["api", "graphql", "-f", self.ONE, "-f", "o=o", "-f", "n=r", "-F", "pr=7"]
+        self.run_gh(read)
+        self.run_gh(["pr", "comment", "8", "-R", "o/r", "--body", "x"])
+        self.run_gh(read)
+        self.assertEqual(self.runs(), 2)
+        self.run_gh(["pr", "comment", "7", "-R", "o/r", "--body", "x"])
+        self.run_gh(read)
+        self.assertEqual(self.runs(), 4, "a comment on PR 7 itself makes its read old")
+
+    def test_the_working_directory_is_not_the_scope_of_a_query(self) -> None:
+        where = self.checkout("o/s")
+        read = ["api", "graphql", "-f", self.PRS, "-f", "owner=o", "-f", "name=r"]
+        old = os.getcwd()
+        os.chdir(where)
+        self.addCleanup(os.chdir, old)
+        self.run_gh(read)
+        self.run_gh(["api", "-X", "POST", "repos/o/r/issues/4/comments", "-f", "body=x"])
+        self.run_gh(read)
+        self.assertEqual(self.runs(), 3, "a write to o/r makes a query about o/r old, whatever checkout it ran in")
+
+    def test_the_broker_note_carries_the_query_key(self) -> None:
+        read = ["api", "graphql", "-f", self.PRS, "-f", "owner=o", "-f", "name=r"]
+        self.run_gh(read)
+        self.run_gh(read)
+        notes = [json.loads(line) for line in gg.broker_log().read_text().splitlines()]
+        keys = [n.get("graphql") for n in notes if n.get("graphql")]
+        self.assertEqual(len(keys), 2)
+        self.assertEqual(keys[0], keys[1])
+        self.assertEqual([n["route"] for n in notes if n.get("graphql")], ["pass", "cache"])
+
+
+class BrokerHeadChecksCacheTest(BrokerGraphqlCacheTest):
+    """`commits/SHA/check-runs` and `/status`: one commit's checks, made old by a write that can start or rerun a
+    check, and checked against glaeda's own read of that head."""
+
+    SHA = "a" * 40
+
+    def path(self, tail: str = "check-runs?filter=all&per_page=100") -> list[str]:
+        return ["api", f"repos/o/r/commits/{self.SHA}/{tail}"]
+
+    def test_merges_and_update_branch_keep_it(self) -> None:
+        self.run_gh(self.path())
+        self.run_gh(["api", "-X", "PUT", "repos/o/r/pulls/8/update-branch"])
+        self.run_gh(["pr", "merge", "9", "-R", "o/r", "--squash"])
+        self.run_gh(self.path())
+        self.assertEqual(self.runs(), 3, "update-branch and a merge make a new commit; this one's checks stand")
+
+    def test_a_rerun_or_a_label_makes_it_old(self) -> None:
+        for write in (["run", "rerun", "55", "-R", "o/r", "--failed"],
+                      ["api", "-X", "POST", "repos/o/r/actions/jobs/66/rerun"],
+                      ["pr", "edit", "9", "-R", "o/r", "--add-label", "x"],
+                      ["api", "-X", "POST", f"repos/o/r/statuses/{self.SHA}", "-f", "state=success"]):
+            with self.subTest(write=write[:3]):
+                before = self.runs()
+                read = self.path(f"status?per_page={len(write) + before}")
+                self.run_gh(read)
+                self.run_gh(write)
+                self.run_gh(read)
+                self.assertEqual(self.runs(), before + 3)
+
+    def test_a_settled_head_the_daemon_holds_is_kept_until_its_read_changes(self) -> None:
+        os.environ["GLAEDA_GH_CACHE_TTL"] = str(gg.GH_CACHE_TTL)
+        key = f"head:o/r@{self.SHA}"
+        entry = {"key": key, "fetchedAt": time.time(), "dataAt": time.time(),
+                 "data": {"sha": self.SHA, "found": {"CI / a": ["completed", "success"]}, "ids": {},
+                          "settled": True, "statusStates": {}}}
+        gg.write_json(gg.cache_dir() / gg.file_name(key), entry)
+        self.run_gh(self.path())
+        doc = next(json.loads(p.read_text()) for p in gg.gh_cache_dir().glob("*.json") if p.name != "writes.json")
+        self.assertEqual((doc["watch"][0], doc["doneWhenRead"]), (key, True))
+        self.assertEqual(doc["stamps"], ["*", "o/r", "o/r heads"])
+        with mock.patch.object(gg.time, "time", return_value=time.time() + 300):
+            self.run_gh(self.path())
+        self.assertEqual(self.runs(), 1, "past the TTL, a settled head the daemon still holds unchanged is kept")
+        os.environ["GLAEDA_GH_CACHE_TTL"] = "15"
+        with mock.patch.object(gg.time, "time", return_value=time.time() + 300):
+            self.run_gh(self.path())
+        self.assertEqual(self.runs(), 2, "a caller asking for a 15 s answer never gets a 5-minute one")
+        os.environ["GLAEDA_GH_CACHE_TTL"] = str(gg.GH_CACHE_TTL)
+        entry["data"]["found"]["CI / a"] = ["in_progress", ""]
+        entry["data"]["settled"] = False
+        gg.write_json(gg.cache_dir() / gg.file_name(key), entry)
+        self.run_gh(self.path())
+        self.assertEqual(self.runs(), 3, "the daemon saw the head change: the kept answer is dropped")
 
 
 class BrokerAnswerCacheReviewTest(BrokerBase):
