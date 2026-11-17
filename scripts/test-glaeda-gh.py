@@ -16241,6 +16241,11 @@ class LandTest(Base):
     def setUp(self) -> None:
         super().setUp()
         self.w = LandWorld(self.tmp.name)
+        # The CLI (`glaeda-gh land`) resolves merge_hold.py from the host's land.json and defaults: pin the defaults to
+        # the fake one, so the tests never depend on the host having a leo-workspace checkout (a CI runner has none).
+        paths = mock.patch.object(gg, "LAND_MERGE_HOLD_PATHS", (Path(self.w.mh),))
+        paths.start()
+        self.addCleanup(paths.stop)
         self.t = NOW
         self.q = self.queue()
 
