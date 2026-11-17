@@ -12716,10 +12716,12 @@ class GateTest(unittest.TestCase):
         gate.child = mock.Mock(pid=4321)
         mask = signal.pthread_sigmask(signal.SIG_BLOCK, [])
         self.addCleanup(signal.pthread_sigmask, signal.SIG_SETMASK, mask)
-        for armed in ({"watching": (999,), "freeze_at_exit": True}, {"job_ending": True}, {"frozen": (998,)}):
+        for armed in ({"watching": (999,), "freeze_at_exit": True}, {"job_waited": True}, {"job_ending": True},
+                      {"frozen": (998,)}):
             with self.subTest(armed=sorted(armed)):
                 gate.source = (0, 0, 0)
                 gate.watching, gate.freeze_at_exit, gate.job_ending, gate.frozen = (), False, False, ()
+                gate.job_waited = False
                 for name, value in armed.items():
                     setattr(gate, name, value)
                 with mock.patch.object(hook.os, "execv") as execv, mock.patch.object(hook, "gate_log"), \
@@ -12727,7 +12729,7 @@ class GateTest(unittest.TestCase):
                     gate.reload()
                 execv.assert_not_called()  # the stop at the job's end stays with this gate
                 self.assertEqual(gate.source, (0, 0, 0), "the change is still seen at the next poll")
-        gate.watching, gate.freeze_at_exit, gate.job_ending, gate.frozen = (), False, False, ()
+        gate.watching, gate.freeze_at_exit, gate.job_ending, gate.frozen, gate.job_waited = (), False, False, (), False
         with mock.patch.object(hook.os, "execv") as execv, mock.patch.object(hook, "gate_log"), \
                 mock.patch.object(hook.sys, "argv", [os.fspath(HOOK), "listen"]):
             gate.reload()
