@@ -253,6 +253,10 @@ effect without a restart.
   ~/Projects/leo-workspace/tools/merge_hold.py; with none of them the land worker refuses to start (land/refused.json,
   which `land status` prints) and `land` refuses to queue (merge_hold_missing). On a lane VM (an upstream host) the
   worker reads a landing PR itself through the broker when the upstream's copy is over LAND_REFRESH_AFTER old.
+  A quota refusal (merge_hold's, or the shim's on the merge) parks the PR until the reset it names plus a 0-120 s
+  per-caller jitter, with no read, judge, watch or nudge before it (`land status`: "parked until HH:MMZ (quota)");
+  one that names no time backs off 5, 10, 20 ... at most 60 min. While the login's latch mark holds
+  (rest-exhausted.json / graphql-exhausted.json under $GH_QUOTA_STATE, lw#5626) no entry is judged at all.
 """
 
 from __future__ import annotations
@@ -6828,6 +6832,7 @@ LAND_MERGE_HOLD_PATHS = (LAND_MERGE_HOLD, Path.home() / "Projects/leo-workspace/
 # a configured path that did not exist was run anyway and every land judged explain_failed (gcp-agent-lane-6,
 # 2026-11-17: cmux#44604 stopped after 8 of them).
 LAND_REFUSED_FILE = "refused.json"
+LAND_LATCH_FILE = "latch.json"  # the login's latch mark the queue last saw holding (land_latch), for `land status`
 LAND_STALE_CHECKOUT_FILE = "stale-checkout.json"  # LandQueue.check_behind's warning, while it holds
 # On an upstream host (a lane VM: no login, its PR data is the controller's copy), the land worker's nudge reaches
 # nothing: upstream_tick asks the upstream every UPSTREAM_EVERY and takes whatever copy it has. When that copy of a
@@ -6938,6 +6943,25 @@ LAND_RETRY_MAX = 1800.0
 LAND_REVIEW_WAIT = 3600.0
 LAND_STREAK_STOP = 3  # identical refusals in a row (code, head, step) that stop an entry
 LAND_RETRY_STREAK_STOP = 8  # ... for could-not-judge answers (quota, unreadable), which back off between tries
+# A quota refusal parks the entry: no judge, read, watch or nudge for it until the reset the refusal names (Leo,
+# 2026-11-17, on Claude desktop's "GitHub rate limit" hover: "this is... interesting. so claude desktop shows rate limit
+# on hover of the github links sometimes..."). Before, every quota-refused entry was judged again about every 5 min
+# while the login was dry, each judge spending merge_hold's reads on it: session:glaeda-land 549 REST / 360 GraphQL in
+# an hour on gcp-agent-lane-5, 498 REST on cosmic-gray. merge_hold names the reset ("quota: not judged, retry after
+# HH:MMZ (reset); no attempt before HH:MMZ", leo-workspace tools/gh_latch.py not_judged, lw#5626): parked until it
+# plus a per-caller jitter of 0..LAND_QUOTA_JITTER s, the same spread merge_hold's own callers take, so the queues on
+# every host do not all fire at the reset second. A refusal that names no time (an older merge_hold) backs off
+# LAND_QUOTA_BACKOFF, doubled per quota refusal in a row, at most LAND_QUOTA_BACKOFF_MAX. A quota park is the login's
+# state, not the PR's: it never counts toward a stop.
+LAND_QUOTA_JITTER = 120
+LAND_QUOTA_BACKOFF = 300.0
+LAND_QUOTA_BACKOFF_MAX = 3600.0
+LAND_QUOTA_MAX_S = 3700.0  # gh_latch MAX_S: a reset never lies more than GitHub's hour ahead
+LAND_QUOTA_REFUSAL = re.compile(r"quota: not judged|\[quota: not judged")
+# The time a refusal names, in gh_latch.reset_from's order: merge_hold's "no attempt before", then "retry after" /
+# "until" (the latch SENTENCE). HH:MMZ with no seconds is the end of that minute, as gh_latch reads it.
+LAND_QUOTA_SAID = (re.compile(r"\bno attempt before\s+(\d{2}):(\d{2})(?::(\d{2}))?Z"),
+                   re.compile(r"(?:\bretry after|\buntil)\s+(\d{2}):(\d{2})(?::(\d{2}))?Z"))
 LAND_HISTORY = 60
 LAND_KEEP = 7 * 86400  # finished entries are kept this long for `land status`
 LAND_COUNT_DAYS = 30
@@ -7060,6 +7084,59 @@ def land_action(answer: dict, head: str) -> dict:
     return land_fallback(answer, head)
 
 
+def land_quota_said(text: str, now: float) -> float | None:
+    """The reset a quota refusal's TEXT names (HH:MM[:SS]Z, see LAND_QUOTA_SAID), as the next such time at or after
+    NOW (a time up to 120 s past is this window's, just gone, as gh_latch._next_at reads it), or None: no time, or one
+    more than LAND_QUOTA_MAX_S ahead."""
+    for pattern in LAND_QUOTA_SAID:
+        m = pattern.search(text or "")
+        if not m:
+            continue
+        hh, mm, ss = int(m.group(1)), int(m.group(2)), int(m.group(3)) if m.group(3) else 59
+        if hh > 23 or mm > 59 or ss > 59:
+            return None
+        day = time.gmtime(now)
+        at = float(dt.datetime(day.tm_year, day.tm_mon, day.tm_mday, hh, mm, ss,
+                               tzinfo=dt.timezone.utc).timestamp())
+        if at < now - 120:
+            at += 86400
+        return at if at <= now + LAND_QUOTA_MAX_S else None
+    return None
+
+
+def land_jitter(key: str) -> float:
+    """This caller's offset past a reset for KEY, 0..LAND_QUOTA_JITTER s: fixed per host and PR, so a re-park lands on
+    the same second and the queues of every host spread over the window."""
+    digest = hashlib.sha256(f"{policy_host()}|{LAND_TAG}|{key}".encode()).digest()
+    return float(int.from_bytes(digest[:4], "big") % (LAND_QUOTA_JITTER + 1))
+
+
+def land_latch(now: float) -> tuple[str, float] | None:
+    """(pool, until) of the login's latch mark that holds at NOW and ends last, or None.
+
+    The contract (leo-workspace tools/gh_latch.py, lw#5626; glaeda never imports it, it reads the same files): dir
+    $GH_QUOTA_STATE, else ~/.local/state/gh-quota; the host's login has rest-exhausted.json and graphql-exhausted.json,
+    JSON {until, at, reset, source, by, identity} (older marks: until, at, counter); a mark holds iff now < until, and a
+    reset is never more than MAX_S (3700 s) ahead. Writers are atomic and never shorten a held mark; a mark whose source
+    is GitHub's own (x-ratelimit-reset, retry-after, said) is never voided early, so a reader trusts until as written.
+    A lane-share mark (share: true, the broker's refusal of a VM's share) does not hold a land: lands pass the share
+    (gh_latch.held(share=False)). The land queue only reads these marks: merge_hold, the broker and the daemon write
+    them."""
+    state = Path(os.environ.get("GH_QUOTA_STATE") or Path.home() / ".local/state/gh-quota")
+    best: tuple[str, float] | None = None
+    for pool in ("rest", "graphql"):
+        doc = read_json(state / f"{pool}-exhausted.json")
+        if not isinstance(doc, dict) or doc.get("share") is True:
+            continue
+        until = doc.get("until")
+        if not isinstance(until, (int, float)) or isinstance(until, bool) or not now < until:
+            continue
+        until = min(float(until), now + LAND_QUOTA_MAX_S)
+        if best is None or until > best[1]:
+            best = (pool, until)
+    return best
+
+
 def land_seconds(value: Any, default: float, low: float = 1.0, high: float = 86400.0) -> float:
     try:
         f = float(value)
@@ -7094,6 +7171,7 @@ class LandQueue:
         self.behind = behind
         self.behind_at = float("-inf")
         self.stale_checkout: str | None = None
+        self.latched: tuple[str, int] | None = None
         refused = read_json(land_dir() / LAND_REFUSED_FILE)
         self.refused: dict | None = refused if isinstance(refused, dict) else None
         self.lock = threading.RLock()
@@ -7246,6 +7324,7 @@ class LandQueue:
         self.reap()
         if self.refuse():
             return
+        latch = self.latch_held()
         for key in list(self.entries):
             try:
                 e = self.entries[key]
@@ -7254,13 +7333,64 @@ class LandQueue:
                         (self.entries_dir() / file_name(key)).unlink(missing_ok=True)
                         del self.entries[key]
                     continue
-                if key in self.jobs:
-                    continue
+                if key in self.jobs or latch is not None:
+                    continue  # a held latch: no judge, read, watch or nudge for any entry this pass
                 with self.lock:
+                    if self.parked(e):
+                        continue
                     self.keep_watching(e)
                     self.consider(e)
             except Exception as error:  # noqa: BLE001  one bad entry must not stop the others
                 log({"event": "land-error", "key": key, "error": describe(error), "site": error_site(error)})
+
+    def latch_held(self) -> tuple[str, float] | None:
+        """The login's latch (land_latch) before a judge pass; logged once when it starts holding and once when it
+        clears, and kept in land/latch.json for `land status`."""
+        latch = land_latch(self.now)
+        held = None if latch is None else (latch[0], round(latch[1]))
+        if held != self.latched:
+            self.latched = held
+            path = land_dir() / LAND_LATCH_FILE
+            if held is None:
+                path.unlink(missing_ok=True)
+                log({"event": "land-latch-clear"})
+            else:
+                write_json(path, {"pool": held[0], "until": held[1], "at": self.now})
+                log({"event": "land-latch-held", "pool": held[0], "until": held[1]})
+        return latch
+
+    def parked(self, e: dict) -> bool:
+        """True while E is parked on a quota refusal (park_quota): nothing is read for it. Past its wake it is judged
+        afresh, as a queued entry."""
+        if e["state"] != "waiting" or (e.get("wait") or {}).get("kind") != "quota":
+            return False
+        wake = e.get("wakeAt")
+        if isinstance(wake, (int, float)) and self.now < wake:
+            return True
+        e.update(state="queued", wait=None, wakeAt=None)
+        self.history(e, "unparked")
+        self.save(e)
+        return False
+
+    def park_quota(self, e: dict, text: str) -> None:
+        """Park E on a quota refusal whose words are TEXT: until the reset it names plus this caller's jitter, else
+        LAND_QUOTA_BACKOFF doubled per quota refusal in a row (at most LAND_QUOTA_BACKOFF_MAX). No step is taken."""
+        n = int(e.get("quotaRefusals") or 0) + 1
+        e["quotaRefusals"] = n
+        said = land_quota_said(text, self.now)
+        if said is not None:
+            jitter = land_jitter(e["key"])
+            wake = max(said, self.now) + jitter
+            w = {"kind": "quota", "until": said, "said": True, "jitter": jitter}
+        else:
+            wake = self.now + min(LAND_QUOTA_BACKOFF_MAX, LAND_QUOTA_BACKOFF * (2 ** (n - 1)))
+            w = {"kind": "quota", "until": wake, "said": False}
+        self.history(e, "parked", until=utc_clock(wake), said=utc_clock(said) if said is not None else None, n=n)
+        self.check(e)
+        e["state"] = "waiting"
+        e["wait"] = w
+        e["wakeAt"] = wake
+        self.save(e)
 
     def refuse(self) -> bool:
         """The startup check, every tick: True (no entry is judged or stepped) while no merge_hold.py resolves.
@@ -7626,6 +7756,10 @@ class LandQueue:
                             "head": head, "action": act, "fallback": not isinstance(answer.get("action"), dict)}
             self.history(e, "judged", code=answer.get("code") or ("ok" if answer.get("ok") else ""),
                          head=head[:12], step=act.get("kind"))
+            if str(answer.get("code") or "") == "quota" or LAND_QUOTA_REFUSAL.search(str(answer.get("reason") or "")):
+                self.park_quota(e, f"{answer.get('reason') or ''} {answer.get('next') or ''}")
+                return  # the login's state, not the PR's: no step, no streak
+            e.pop("quotaRefusals", None)
             if answer.get("ok"):
                 e["streak"] = None
             elif self.streak(e, f"{answer.get('code')}|{head}|{act.get('kind')}", act.get("kind") == "retry", counts):
@@ -7824,6 +7958,12 @@ class LandQueue:
             self.claim(e, "merge", sha=sha)
         got = self.call([gh, "pr", "merge", number, "-R", repo, "--squash", "--match-head-commit", sha],
                         LAND_MERGE_DEADLINE)
+        said = f"{got.stderr or ''} {got.stdout or ''}"
+        if got.returncode != 0 and LAND_QUOTA_REFUSAL.search(said):
+            with self.lock:  # the shim's merge_hold judged it on a spent quota: parked, and no `pr view` after it
+                self.finish(e, got)
+                self.park_quota(e, said)
+            return
         view = self.call([gh, "pr", "view", number, "-R", repo, "--json", "state,mergeCommit,headRefOid"],
                          LAND_GH_DEADLINE)
         state, merge_sha = "", ""
@@ -7962,7 +8102,9 @@ def land_line(e: dict, now: float) -> str:
         if w.get("before"):
             what += f" from {str(w['before'])[:12]}"
         bits.append(f"on {what}")
-    if isinstance(e.get("wakeAt"), (int, float)) and e["state"] == "waiting":
+    if w.get("kind") == "quota" and e["state"] == "waiting" and isinstance(e.get("wakeAt"), (int, float)):
+        bits.append(f"parked until {time.strftime('%H:%MZ', time.gmtime(e['wakeAt']))} (quota)")
+    elif isinstance(e.get("wakeAt"), (int, float)) and e["state"] == "waiting":
         bits.append(f"wakes {utc_clock(e['wakeAt'])}")
     if e.get("after") and e["state"] == "waiting_after":
         bits.append("after " + ", ".join(key_name(a) for a in e["after"]))
@@ -8004,6 +8146,10 @@ def cmd_land_status(target: str | None, as_json: bool) -> int:
     if refused:
         print(f"glaeda land: REFUSED to start since {utc_clock(float(refused.get('at') or 0))}: "
               f"{refused.get('reason')}\nnext: {refused.get('next')}")
+    latch = land_latch(now)
+    if latch:
+        print(f"glaeda land: parked until {time.strftime('%H:%MZ', time.gmtime(latch[1]))} (quota): the login's "
+              f"{'REST' if latch[0] == 'rest' else 'GraphQL'} latch holds; no entry is judged before it")
     for e in entries:
         print(land_line(e, now))
         if target:
