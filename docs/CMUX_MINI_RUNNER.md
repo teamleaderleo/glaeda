@@ -569,9 +569,11 @@ What `--apply` does:
      `~/.local/state/glaeda/cmux-runner/job-written/written-<runner>.json`; a gate trusts it only for that live
      `Runner.Worker` and for 9 minutes, else charges the full p95. A pid and a freshness window do not name a job
      (a late sampler, or a next job whose Worker reuses the pid, read the earlier job's record as its own), so
-     job-started draws a per-job nonce into `job-written/nonce-<runner>.json`: the sampler writes it into every
+     job-started draws a per-job nonce into `job-written/nonce-<runner>.json` with the Worker's pid and start
+     identity (a pid reused before the next job-started is not that Worker): the sampler writes it into every
      record, writes only while it is still the runner's current nonce, removes a record (and, the job over, the
-     nonce) only when it carries its own, and a gate trusts a record only with the current nonce for that Worker.
+     nonce) only when it carries its own, each under a per-runner flock, and a gate trusts a record only with the
+     current nonce for that Worker.
      A record discounts disk the gate admits work against, so only the hook's own counts: `job-written/` is made
      0700, both files are written 0600 without following a symlink, and a gate reads (and cleanup removes) only a
      regular file of its own uid with no group or other access in a directory that is the same; a record in the

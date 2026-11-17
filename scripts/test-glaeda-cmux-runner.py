@@ -10753,6 +10753,15 @@ class GateTest(unittest.TestCase):
                                     "window": {"from": "2026-11-02", "to": "2026-11-15"}}))
         return path
 
+    def fake_identities(self) -> dict[int, str]:
+        """RUNNER_JOB_WRITTEN: fake Runner.Worker pids get a start identity each (process_identity), changed by
+        setting the returned map."""
+        identities: dict[int, str] = {}
+        patcher = mock.patch.object(hook, "process_identity", side_effect=lambda pid: identities.get(pid, f"t:{pid}"))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return identities
+
     def job_written(self, runner: str, pid: int, gib: float, at: float) -> None:
         """RUNNER_JOB_WRITTEN: a job of runner (Runner.Worker pid) began and its sampler wrote gib at at."""
         self.assertTrue(hook.write_job_written(self.state, runner, pid, hook.begin_job_written(self.state, runner, pid),
@@ -10841,6 +10850,7 @@ class GateTest(unittest.TestCase):
         2026-11-17 12:36Z-12:55Z cmux17/18/19/21 held side-std listeners at 25-35 GiB free while 160 jobs queued: a
         running job's full p95 was reserved although it had already written it. A job that wrote 5 GiB of its 5.3 is
         charged 0.3; an unmeasured one (no file, another Worker's, stale) still the full 5.3; the next job always 5.3."""
+        self.fake_identities()
         write_hook(self.runner, "exec python3 /hook job-started --min-free-gib 30 --capacity-units 14\n")
         for name in ("actions-runner-glaeda-2", "actions-runner-glaeda-3"):
             (self.tmp / name).mkdir()
@@ -10884,6 +10894,7 @@ class GateTest(unittest.TestCase):
         """The sampler's side of RUNNER_JOB_WRITTEN: _work's and the linked spm-scratch root's growth since first seen,
         capped by the job's free-disk drop (an APFS clone du counts whole never reads as written); no _work reading:
         unmeasured, and the file goes so the gates charge the full p95."""
+        self.fake_identities()
         runner = self.tmp / "actions-runner-glaeda-2"
         workspace = runner / "_work/cmux/cmux"
         package = workspace / "Packages/CmuxNext/Core"
@@ -10916,6 +10927,7 @@ class GateTest(unittest.TestCase):
         """RUNNER_JOB_WRITTEN is keyed by a per-job nonce, not by the Runner.Worker pid and freshness alone: an earlier
         job's record (its sampler late, or its cleanup missed) whose pid the next job's Worker reuses is never charged
         to that job, and the earlier job's late write or cleanup never overwrites or deletes the next job's record."""
+        self.fake_identities()
         runner = "actions-runner-glaeda-2"
         now = time.time()
         first = hook.begin_job_written(self.state, runner, 100)
@@ -10943,11 +10955,27 @@ class GateTest(unittest.TestCase):
         self.assertFalse(hook.job_nonce_file(self.state, runner).exists(), "and, the job over, its nonce")
         self.assertIsNone(hook.job_written_gib(self.state, runner, 100, now))
 
+    def test_a_pid_reused_before_the_next_job_started_is_not_the_job(self) -> None:
+        """RUNNER_JOB_WRITTEN: a job whose sampler never cleaned up (killed, a reboot) leaves its nonce and record; a
+        new process given the same pid before any job-started draws a nonce is not that Worker (its start identity
+        differs), so it gets no discount."""
+        identities = self.fake_identities()
+        runner, now = "actions-runner-glaeda-2", time.time()
+        nonce = hook.begin_job_written(self.state, runner, 100)
+        self.assertTrue(hook.write_job_written(self.state, runner, 100, nonce, 5.0, now))
+        self.assertEqual(hook.job_written_gib(self.state, runner, 100, now), 5.0)
+        identities[100] = "t:reused"
+        self.assertIsNone(hook.job_written_gib(self.state, runner, 100, now))
+        identities[100] = None
+        self.assertIsNone(hook.job_written_gib(self.state, runner, 100, now), "an unreadable identity: unmeasured")
+        self.assertIsNone(hook.begin_job_written(self.state, runner, 100), "no identity to name: unmeasured")
+
     def test_a_forged_job_written_record_is_never_honoured(self) -> None:
         """RUNNER_JOB_WRITTEN: a record discounts disk the gate then admits work against, so only the hook's own record
         counts: one in the hook's private job-written directory (its uid's, no group or other access), a regular
         file of the gate's uid with no group or other access, never a symlink, carrying the job's nonce. A record a
         job forged with the matching pid and nonce in the state directory it can write is not honoured."""
+        self.fake_identities()
         runner, pid = "actions-runner-glaeda-2", 100
         now = time.time()
         nonce = hook.begin_job_written(self.state, runner, pid)
