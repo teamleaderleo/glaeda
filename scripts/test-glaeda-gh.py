@@ -2384,7 +2384,7 @@ class DaemonTest(Base):
 
     def test_a_list_read_before_its_run_completed_is_never_kept(self) -> None:
         """Every listed job completed while the run is not: a job a `needs:` holds back may not be listed yet."""
-        run = {"status": "in_progress", "run_attempt": 1}
+        run = {"status": "in_progress", "conclusion": "success", "run_attempt": 1}
         self.assertIsNone(gg.attempt_jobs_done(run, [job("build", "success")]))
         self.assertIsNone(gg.attempt_jobs_done({**run, "status": "completed"}, []))
         self.assertIsNone(gg.attempt_jobs_done({**run, "status": "completed"},
@@ -2392,6 +2392,11 @@ class DaemonTest(Base):
         self.assertIsNone(gg.attempt_jobs_done({**run, "status": "completed", "run_attempt": 2}, [job("a", "success")]))
         self.assertEqual(gg.attempt_jobs_done({**run, "status": "completed", "run_attempt": 2},
                                               [job("a", "success"), job("b", "success", run_attempt=2)]), 2)
+        # a failed run whose list shows no failure (its failed jobs dropped, their re-run not listed yet)
+        self.assertIsNone(gg.attempt_jobs_done({**run, "status": "completed", "conclusion": "failure"},
+                                               [job("a", "success")]))
+        self.assertEqual(gg.attempt_jobs_done({**run, "status": "completed", "conclusion": "failure"},
+                                              [job("a", "success"), job("b")]), 1)
 
     def test_failed_check_steps_are_read_once(self) -> None:
         failed = {**check_run("build", conclusion="FAILURE"), "id": "CR_1"}

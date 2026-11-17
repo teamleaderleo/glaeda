@@ -2500,6 +2500,10 @@ def attempt_jobs_done(run: dict | None, jobs: Any) -> int | None:
         return None
     if not all(isinstance(j, dict) and j.get("status") == "completed" for j in jobs) or jobs_attempt(jobs) != attempt:
         return None
+    # A run that did not pass lists a job that did not either; a list that does not (caught between a "re-run failed
+    # jobs" dropping the failed ones and listing their new attempt, say) is not kept: the next read asks again.
+    if run.get("conclusion") not in RUN_OK and all(j.get("conclusion") in RUN_OK for j in jobs):
+        return None
     return attempt
 
 
@@ -5100,7 +5104,9 @@ class Daemon:
             if data is not None:
                 fields.update(data=data, dataAt=float(at) if isinstance(at, (int, float)) else self.now)
             if isinstance(entry.get("jobs"), list):
-                fields["jobs"] = entry["jobs"]
+                # this host's ETag (and a list it found final) vouch for its own last read, not the upstream's list:
+                # a 304 on that ETag must not confirm this one as a completed attempt's (attempt_jobs_put)
+                fields.update(jobs=entry["jobs"], jobsEtag=None, jobsDone=None)
                 # when the upstream read that job list, so a downstream `--jobs` look is answered (once_answered)
                 jobs_at = entry.get("jobsAt")
                 if isinstance(jobs_at, (int, float)) and not isinstance(jobs_at, bool):
@@ -6132,6 +6138,8 @@ class Daemon:
                 else attempt_jobs_get(f"{owner}/{repo}", int(run_id), attempt)
             if kept is not None and attempt_jobs_done(run, kept) == attempt:
                 fields.update(jobs=kept, jobsAt=self.now, jobsDone=attempt)
+                if kept is not prior.get("jobs"):
+                    fields["jobsEtag"] = None  # the kept ETag was another list's: a 304 on it must not keep this one
                 if failed_attempt:
                     fields["jobsTried"] = attempt
                 self.sent.append((self.now, "kept"))  # a job list answered with no request (budget: hour.kept)
