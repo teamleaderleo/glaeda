@@ -1627,6 +1627,114 @@ def http(method: str, url: str, headers: dict[str, str], body: bytes | None = No
         raise WatchError(f"request failed: {type(error).__name__}") from None
 
 
+# ---------------------------------------------------------------- GraphQL slots (one host, one login)
+#
+# At most graphql_slots() GraphQL requests in flight per login on this host, whoever sends them: the daemon's refreshes
+# and a wait's direct read (Daemon.request) and every `glaeda-gh gh` read that reaches GitHub over GraphQL (the broker,
+# around the real gh). One flock'd file per slot under BASE/graphql-slots, so the bound holds across processes and a
+# holder that dies frees its slot with its last descriptor. hq#13031 (2026-11-17): the login's GraphQL hour drained at
+# ~7800 points/h against 5000; on one host a 7-way parallel fan-out of `glaeda-gh gh api graphql` open-PR reads spent
+# ~45 calls in 3 min, every process its own GitHub request at once.
+GRAPHQL_SLOTS_DEFAULT = 2  # gh-quota.json login_concurrency, else this; GLAEDA_GH_GRAPHQL_SLOTS overrides both
+GRAPHQL_SLOT_WAIT = 120.0  # the longest a `glaeda-gh gh` read waits for a slot; past it, it runs (logged: overflow.log)
+GRAPHQL_SLOT_POLL = 0.02
+GRAPHQL_SLOT_ENV = "GLAEDA_GH_GRAPHQL_SLOT"  # set for gh run under a held slot: a gh call nested in it uses its parent's
+GRAPHQL_SLOT_DIR = "graphql-slots"
+# gh subcommands that read over GraphQL (gh's own client); `api graphql` is the rest. --watch and --web stay out: one
+# holds for as long as the watch lasts, the other sends nothing worth a slot.
+GH_GRAPHQL_READS = {("pr", "view"), ("pr", "list"), ("pr", "status"), ("pr", "checks"), ("issue", "view"),
+                    ("issue", "list"), ("issue", "status"), ("repo", "view"), ("repo", "list")}
+
+
+def graphql_slots() -> int:
+    """How many GraphQL requests one login may have in flight on this host (at least 1)."""
+    raw: Any = os.environ.get("GLAEDA_GH_GRAPHQL_SLOTS")
+    if raw is None:
+        doc = read_json(Path(os.environ.get("GLAEDA_GH_QUOTA_POLICY")
+                             or Path(SPENDERS_CMD).resolve().parent.parent / "machines/gh-quota.json"))
+        raw = doc.get("login_concurrency") if isinstance(doc, dict) else None
+    try:
+        value = int(float(raw)) if raw is not None and not isinstance(raw, bool) else GRAPHQL_SLOTS_DEFAULT
+    except (TypeError, ValueError):
+        value = GRAPHQL_SLOTS_DEFAULT
+    return max(1, min(value, 64)) if value > 0 else GRAPHQL_SLOTS_DEFAULT
+
+
+def graphql_login() -> str:
+    """The github.com login gh's hosts.yml names (the slots are per login), else "default". Never raises."""
+    try:
+        path = gh_hosts_file()
+        text = path.read_text() if path is not None else ""
+    except (OSError, UnicodeDecodeError):
+        text = ""
+    found = re.search(r"^github\.com:[ \t]*\n(?:[ \t]+.*\n|[ \t]*\n)*?[ \t]+user:[ \t]*['\"]?([A-Za-z0-9-]{1,39})",
+                      text, re.M)
+    return found.group(1) if found else "default"
+
+
+def graphql_slot_take(deadline: float | None) -> tuple[Any, int] | None:
+    """A held GraphQL slot (its open file, its index) for this login on this host, waiting until DEADLINE
+    (time.monotonic()); None once it passes with every slot held. None deadline: try once."""
+    d = BASE / GRAPHQL_SLOT_DIR
+    try:
+        d.mkdir(parents=True, exist_ok=True, mode=0o700)
+    except OSError:
+        return None
+    login, k = graphql_login(), graphql_slots()
+    while True:
+        for i in range(k):
+            try:
+                handle = open(d / f"{login}.{i}.lock", "a+")
+            except OSError:
+                continue
+            try:
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                handle.close()
+                continue
+            return handle, i
+        if deadline is None or time.monotonic() >= deadline:
+            return None
+        time.sleep(GRAPHQL_SLOT_POLL)
+
+
+def graphql_slot_overflow(what: str, waited: float) -> None:
+    """A CLI read that ran without a slot after GRAPHQL_SLOT_WAIT: one line in BASE/graphql-slots/overflow.log."""
+    with contextlib.suppress(OSError):
+        with open(BASE / GRAPHQL_SLOT_DIR / "overflow.log", "a") as out:
+            out.write(f"{time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())} pid={os.getpid()} "
+                      f"waited={waited:.0f}s {what[:120]}\n")
+
+
+def gh_graphql_read(args: list[str]) -> bool:
+    """Whether `gh ARGS` is a read gh sends over GraphQL (a slot's worth). Never raises."""
+    try:
+        words, method, seen, _values = broker_words(args)
+        if words[:2] == ["api", "graphql"]:
+            return not gh_cache_is_write(args, words, method)
+        return tuple(words[:2]) in GH_GRAPHQL_READS and not seen & {"--watch", "--web"}
+    except Exception:  # noqa: BLE001  a lookup in front of a gh call
+        return False
+
+
+def gh_graphql_slot_for(args: list[str]) -> Any:
+    """For the broker: a held slot's open file when `gh ARGS` is a GraphQL read that needs one, else None (not a
+    GraphQL read, a gh call nested under a slot its parent holds, or GRAPHQL_SLOT_WAIT passed: logged)."""
+    if not gh_graphql_read(args):
+        return None
+    holder = os.environ.get(GRAPHQL_SLOT_ENV, "")
+    if holder.isdigit() and int(holder) > 1:
+        with contextlib.suppress(OSError):
+            os.kill(int(holder), 0)  # the holder still runs: this call is nested inside its slot
+            return None
+    start = time.monotonic()
+    got = graphql_slot_take(start + GRAPHQL_SLOT_WAIT)
+    if got is None:
+        graphql_slot_overflow(" ".join(args[:3]), time.monotonic() - start)
+        return None
+    return got[0]
+
+
 def run_bounded(argv: list[str], timeout: float | None = None, input_text: str | None = None,
                 env: dict | None = None) -> subprocess.CompletedProcess:
     """subprocess.run(capture_output=True, text=True) with a deadline that holds. On a timeout run()
@@ -3714,12 +3822,23 @@ class Daemon:
             # start, and dating its requests early would let them leave the hour's window early.
             minute = int(self.clock() // 60)
             self.charge_rest(minute, 1)
+        # One of the login's GraphQL slots on this host (graphql_slot_take), shared with every `glaeda-gh gh` read and every
+        # other process's daemon or direct read, waited for within the tick's budget and held only while in flight.
+        slot = graphql_slot_take(min(self.tick_deadline, time.monotonic() + GRAPHQL_SLOT_WAIT)) \
+            if bucket == "graphql" else None
+        if bucket == "graphql" and slot is None:
+            raise WatchError(f"held: all {graphql_slots()} GraphQL slots of this login on this host are in flight "
+                             f"({GRAPHQL_SLOT_DIR}/); not sent")
         try:
             status, h, raw = self.transport(method, API + path, headers, raw_body)
         except BaseException:
             if bucket == "rest":  # never answered, but GitHub may have counted it (as charge_rest above assumes)
                 self.note_spend("rest", route_of(method, path), 0 if free else 1)
             raise
+        finally:
+            if slot is not None:
+                with contextlib.suppress(OSError):
+                    slot[0].close()
         if charged and status == 304:
             self.charge_rest(minute, -1)
         if bucket == "rest":  # GraphQL's points are known from its answer (graphql)
@@ -9628,6 +9747,8 @@ def reexec_due(changed: bool, busy: bool, waiting_since: float | bool, now: floa
 def serve(foreground_ok: bool = False) -> int:
     lock = hold_daemon_lock()
     first_heartbeat()
+    # A daemon started by a gh call holding a GraphQL slot outlives it: its own gh calls (the land pool's) take slots.
+    os.environ.pop(GRAPHQL_SLOT_ENV, None)
     with contextlib.suppress(OSError):
         swept = sweep_temp_files()
         if swept:
@@ -14912,7 +15033,16 @@ def gh_cache_fill(real: str, args: list[str], key: str, repo: str | None, ran: l
         broker_note({**{k: v for k, v in note.items() if k != "written"}, "filled": True})
         note["written"] = True  # the caller's record: it must not write the decision a second time
         at = time.time()
-        rc, out, err = gh_cache_child(real, args, True, GH_CACHE_FILL_DEADLINE)
+        slot = gh_graphql_slot_for(args)  # held while gh runs: a GraphQL read is one of the login's slots on the host
+        try:
+            if slot is not None:
+                os.environ[GRAPHQL_SLOT_ENV] = str(os.getpid())  # gh_cache_child copies it: nested gh uses this slot
+            rc, out, err = gh_cache_child(real, args, True, GH_CACHE_FILL_DEADLINE)
+        finally:
+            if slot is not None:
+                os.environ.pop(GRAPHQL_SLOT_ENV, None)
+                with contextlib.suppress(OSError):
+                    slot.close()
         ran.append(rc)
         with contextlib.suppress(Exception):
             long = words[:1] == ["api"] and len(words) > 1 and bool(GH_CACHE_LONG_RE.match(words[1]))
@@ -15384,6 +15514,13 @@ def cmd_gh(args: list[str]) -> int:
         # deliberately NOT set: it is a person's unconditional switch, and setting it here turned
         # it off for every descendant -- including, once it was inherited, for the person.
         os.environ["GLAEDA_GH_BROKER_PID"] = str(os.getpid())
+        # A GraphQL read takes one of the login's slots on the host before gh runs. The lock lives on the open file,
+        # which gh inherits across the exec, so the slot is held until gh (and anything it left holding the file)
+        # exits; gh calls nested under it use it (GRAPHQL_SLOT_ENV) rather than wait on their own parent.
+        slot = gh_graphql_slot_for(args)
+        if slot is not None:
+            os.set_inheritable(slot.fileno(), True)
+            os.environ[GRAPHQL_SLOT_ENV] = str(os.getpid())
         os.execv(real, [real, *args])
     except OSError as error:
         print(f"glaeda-gh: cannot run {real}: {describe(error)}", file=sys.stderr)
