@@ -1558,12 +1558,23 @@ on the label, or a job could wait for a label no online runner has.
 
 Hook classes:
 
-- `mobile-core-package` and `ios-simulator-build` are `isolated` (3 units each, `JOB_CORES`; own DerivedData or SwiftPM
-  `.build`, no canonical root).
-- `ios-simulator` and `screenshots` are `simulator` (1 unit, p75 0.28 cores per job,
-  plus the per-mini `simulator` token: they
-  reuse, erase and boot named devices in the user's one CoreSimulator service). A job refused only for
-  that token waits for it at job start, as any capacity wait does.
+- `mobile-core-package` is `isolated` (3 units, `JOB_CORES`; own SwiftPM `.build`, no canonical root).
+- `ios-simulator-build` (3 units, `JOB_CORES`) builds and then boots the simulator to run its tests. On a mini with
+  one sim slot it stays `isolated`, as before (no token, up to 3 at once); above one (`SIM_SLOT_JOBS`) it is a
+  `simulator` job at its own cost: a token copy, `GLAEDA_SIM_SLOT`, and the sim-first runner takes it.
+- `ios-simulator` and `screenshots` are `simulator` (1 unit, p75 0.28 cores per job), plus a copy of the
+  `simulator` token: they reuse, erase and boot named devices in the user's one CoreSimulator service. A job
+  refused only for that token waits for it at job start, as any capacity wait does.
+- `runner.classes.<class>.simSlots` (1 to 4, default 1; a member without the simulator role keeps 1) gives the
+  hook `--sim-slots N`: the token comes in N copies (`simulator`, `simulator-1`, ...), and the job is told its copy
+  as `GLAEDA_SIM_SLOT` in `$GITHUB_ENV` and `$RUNNER_TEMP/glaeda-sim-slot` (a ci-step: `sim_slot` in its admit
+  answer), so a workflow can boot devices of its own slot. A copy past the first is admitted only with headroom,
+  the rule leo-workspace#5539 uses for lanes, and the refusal names the term that failed: load1 under 0.75 of the
+  cores, memory pressure under level 2, swap under 10% used (`vm.swapusage`, parsed as cmuxterm-hq's worker
+  does), and, with the RAM ledger off, one more job of the class's measured RAM plus the floor within the host's
+  RAM. The sim-first runner listens while any copy is free (a later one only with that headroom). glaeda-disk's
+  device eraser holds every copy. Above 1, the mini's `glaeda-ios-sim` runners and its sim-first runner also carry
+  `glaeda-sim-slots-<N>`, from which cmux's iOS picker (cmux#44908) learns the slot count.
 - A build worker's `simulator` ci-step (cmuxterm-hq's `scripts/ci/cmux-next-ios-sim.sh` steps) is admitted only on
   a mini where a runner registered with `glaeda-ios-sim` (its install receipt says so). It takes the same
   `simulator` token, plus an isolated build's 4 units because it also builds the app, and holds them until

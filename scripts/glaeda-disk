@@ -995,7 +995,8 @@ CMUX_NEXT_DRAIN_HOOK_SHA256 = frozenset({
     "3df101515a2a4666c3bf8f2f7020c01f359584223b40abbca6ed5c00c04e9ac6",
     "d748c57d7ebfbbaf16edb53c62fd6ce12c6e9f37b45c54b24a642e87dd22f42a",
     "aed770e77a947512d27e0f374c06c0f46aa9a7023e423d68fdb2a740211795ed",
-    "5e4c1a3bd2b21861b4dd4da23dadb4fd6c4cc088176c7db8c5daf1ecea32b1f8",
+    "070c1e6533560dd96cac6536eb915768076ddb00aed5a8983b990109c46a55dd",
+    "1f4d528d5e8fd2687d4ba6972acad4b3a913c614ec37c1031a36ef0c51530426",
 })
 CMUX_NEXT_CI_PRESERVED_NAMES = frozenset({
     "SourcePackages", "ModuleCache.noindex", "SDKStatCaches.noindex",
@@ -2392,8 +2393,8 @@ def erase_idle_sim_devices(receipt: Path, halt=None, budget_s: float = SIM_DEVIC
         except (OSError, subprocess.SubprocessError):
             print("refusing to erase simulator devices: ps failed", file=sys.stderr)
             break
-        token = sim_token()
-        if token is None:
+        tokens = sim_tokens()  # every copy (SIM_SLOTS)
+        if tokens is None:
             print("not erasing simulator devices: a simulator job holds the simulator token", file=sys.stderr)
             break
         try:  # held through the last reading and the erase, so no simulator job is admitted in between
@@ -2416,7 +2417,8 @@ def erase_idle_sim_devices(receipt: Path, halt=None, budget_s: float = SIM_DEVIC
                 except (OSError, subprocess.SubprocessError) as e:
                     outcome = f"incomplete:{e.__class__.__name__}"
         finally:
-            os.close(token)
+            for token in tokens:
+                os.close(token)
         if outcome == "reclaimed":
             after = sim_device_size(simctl(), i.path)
             if after is None:
@@ -2455,6 +2457,25 @@ def sim_token(path: Path | None = None) -> int | None:
         os.close(fd)
         return None
     return fd
+
+
+# SIM_SLOTS (glaeda-cmux-runner-hook): a mini may run several simulator jobs, each holding one copy of the token
+# (simulator, simulator-1, ...). The eraser holds every copy the hook can hand out (its MAX_SIM_SLOTS), whatever this
+# mini's --sim-slots: copy 0 alone would let a job start on copy 1 between the last reading and the erase.
+SIM_TOKEN_COPIES = 4  # the hook's MAX_SIM_SLOTS (a test keeps them equal)
+
+
+def sim_tokens() -> list[int] | None:
+    """fds holding every simulator token copy exclusive, or None (holding none) while any is held or cannot be opened."""
+    fds: list[int] = []
+    for copy in range(SIM_TOKEN_COPIES):
+        fd = sim_token(SIM_TOKEN if copy == 0 else SIM_TOKEN.with_name(f"simulator-{copy}.token"))
+        if fd is None:
+            for held in fds:
+                os.close(held)
+            return None
+        fds.append(fd)
+    return fds
 
 
 def sim_device_size(devices: object, udid: str) -> int | None:

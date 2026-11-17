@@ -216,6 +216,31 @@ With `job`, that job must have finished with `conclusion` (default success):
   code, `no-match`, `unresolved`). `glaeda-gh on-event replay --run-file F --jobs-file F --wait 60`
   feeds one run record through the same path to prove a hook.
 
+## Landing a PR: glaeda-gh land
+
+Say it once; the daemon lands it. No update-branch / wait / read-the-head / merge-again loops by hand.
+
+```bash
+glaeda-gh land OWNER/REPO#N                         # queue it; returns at once
+glaeda-gh land OWNER/REPO#N --after OWNER/REPO#M    # only after #M merged (a chain: one land per PR)
+glaeda-gh land OWNER/REPO#N --notify HOST/SESSION   # who hears of the merge or the stop
+glaeda-gh land OWNER/REPO#N --wait 3600             # also wait: 0 merged, 1 stopped, 2 still going
+glaeda-gh land status [OWNER/REPO#N] [--json]       # state, last step, refusals, history; steps per day
+glaeda-gh land cancel OWNER/REPO#N
+```
+
+- The daemon asks `merge_hold.py explain R N --sha HEAD --json` at the head its cache shows, and takes
+  the step the answer's `action` names: the pinned squash merge, a pinned update-branch, `gh run rerun
+  ID --failed`, a base change, `router-review R N --post` (once per head), or a wait on the PR's checks,
+  a base run or a review comment. It never asks while the head's checks still run, and after an
+  update-branch it judges nothing until the cache shows the new head.
+- Every `gh` goes through the gh-quota shim, so merge_hold judges every merge; without the shim it
+  merges nothing. The calls carry `CMUX_AGENT_SESSION=glaeda-land` and `MAY_MERGE_PATH=glaeda-land`.
+- It stops and tells the requester (`acpmux send --no-wait`, default this host/`$ACPMUX_SESSION_NAME`)
+  only on a real stop: a BLOCK, a hold, a conflict, a step only a person can take, the PR or an
+  `--after` PR closed, or 3 identical refusals in a row. On a stop, do the named step, then `land` again.
+- Landing again updates `--after` and `--notify`; landing a stopped or cancelled PR starts it over.
+
 ## When the daemon is down or hung
 
 `glaeda-gh` exits 3 when the daemon is down or hung. Run `glaeda-gh restart` once, then wait

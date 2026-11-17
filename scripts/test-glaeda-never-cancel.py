@@ -212,6 +212,8 @@ ALLOWED = {
     ("src/main.rs", '"cancel",'): "the local personal-worker queue's `glaeda job cancel` subcommand in a CLI test",
     ("scripts/glaeda-gh", 'GH_CACHE_RUN_WRITES = {"rerun", "cancel"}'):
         "the answer cache reads a caller's `gh run cancel N` to decide what to invalidate; it cancels nothing",
+    ("scripts/glaeda-gh", 'if words[0] == "cancel":'):
+        "`glaeda-gh land cancel OWNER/REPO#N` withdraws a land request; it cancels no run",
 }
 GUARD_LINE = "post(f\"/repos/{repo}/actions/runs/{run_id}/{'force-cancel' if force else 'cancel'}\")"
 
