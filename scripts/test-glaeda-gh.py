@@ -16965,6 +16965,7 @@ class LandWorld:
         self.gh_rc: dict[str, int] = {}
         self.gh_err: dict[str, str] = {}  # a refused step's stderr, by kind (default "<kind> refused")
         self.merged_on_merge = True
+        self.body = ""  # the PR body a `pr view --json body --jq .body` read answers
         self.raise_on: str | None = None
         self.nudged: list[str] = []
         self.refreshed: list[str] = []
@@ -17007,6 +17008,8 @@ class LandWorld:
             return subprocess.CompletedProcess(argv, self.fetch_rc, "", "" if self.fetch_rc == 0 else self.fetch_err)
         if argv[0] == os.fspath(self.gh):
             words = argv[1:]
+            if words[:2] == ["pr", "view"] and words[-4:-2] == ["--json", "body"]:
+                return subprocess.CompletedProcess(argv, 0, self.body + "\n", "")
             if words[:2] == ["pr", "view"]:
                 merged = any(c[1:3] == ["pr", "merge"] and self.gh_rc.get("merge", 0) == 0 for c in self.calls)
                 state = "MERGED" if merged and self.merged_on_merge else "OPEN"
@@ -17992,6 +17995,38 @@ class LandTest(Base):
         self.tick()
         self.tick(gg.LAND_RETRY_DEFAULT)
         self.assert_merged_at(LA)
+
+    def test_a_changed_hold_claim_line_is_reviewed_again_then_stops_unchanged(self):
+        # cmux#45558, 2026-11-17: its body's Chat-hold line changed after the head's review (the shared-TMPDIR swap
+        # undone), the queue reviews once per head, and the land stopped at chat_hold with the claim never confirmed.
+        chat = lambda: refusal("chat_hold", LA, {"kind": "stop", "stop": "chat_hold"})  # noqa: E731
+        with mock.patch.object(gg.subprocess, "Popen", return_value=mock.Mock()) as popen:
+            self.pr(LA)
+            self.land()
+            self.w.answers.append(chat())
+            e = self.tick()
+            self.assertEqual((e["state"], e["stop"]["code"], popen.call_count), ("stopped", "chat_hold", 0),
+                             "no claim line: the stop stands, no review")
+            # the claim line written after that stop: a land again reviews the head for it
+            self.w.body = "Fixes the pane.\n\nChat-hold: speed\n"
+            self.land()
+            self.w.answers.append(chat())
+            e = self.tick()
+            self.assertEqual((e["state"], e["wait"]["kind"], e["lastAction"]["kind"], popen.call_count),
+                             ("waiting", "comment", "review", 1))
+            self.assertIn("hold_claim_review", [h["event"] for h in e["history"]])
+            # the review's wait ends with the same claim still held: no second review of it, the stop stands
+            self.w.answers.append(chat())
+            e = self.tick(gg.LAND_REVIEW_WAIT + 1)
+            self.assertEqual((e["state"], e["stop"]["code"], popen.call_count), ("stopped", "chat_hold", 1))
+            # the claim line changes again (here to an iOS-hold claim): one more review, for the new line
+            self.w.body = "Fixes the pane.\n\n**iOS-hold:** strict fix\n"
+            self.land()
+            self.w.answers.append(chat())
+            e = self.tick()
+            self.assertEqual((e["state"], e["lastAction"]["kind"], popen.call_count), ("waiting", "review", 2))
+        self.assertEqual(gg.land_hold_claims("x\n> **Chat-hold:**  Speed \r\nCHAT-HOLD: strict fix"),
+                         "chat-hold: speed\nchat-hold: strict fix")
 
     def test_a_review_that_cannot_start_stops_and_is_not_marked_run(self):
         self.pr(LA)

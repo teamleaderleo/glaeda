@@ -7545,6 +7545,19 @@ def land_fetch_shape(argv: Any, repo: str) -> tuple[str, str, str]:
     return "", "", f"the fetch step is neither git --git-dir M fetch nor lane-gh fetch: {land_trim(argv[:5], 160)}"
 
 
+# A chat or iOS hold the PR body can claim a release from (leo-workspace hold_fences CHAT_CLAIM and IOS_CLAIM: a line
+# of its own, "Chat-hold: ..." or "iOS-hold: ..."); a review SHIP at the head must confirm the claim it makes.
+LAND_HOLD_CLAIM_STOPS = frozenset({"chat_hold", "ios_hold"})
+LAND_HOLD_CLAIM = re.compile(r"^[ \t>*_-]*(?:Chat|iOS)-hold:[^\n]*$", re.M | re.I)
+LAND_HOLD_BODY_DEADLINE = 30.0
+
+
+def land_hold_claims(body: str) -> str:
+    """BODY's hold claim lines, normalized and in order, joined by newlines: "" when it has none."""
+    found = LAND_HOLD_CLAIM.findall(str(body or "").replace("\r\n", "\n"))
+    return "\n".join(" ".join(re.sub(r"[*_]", "", line).strip(" \t>-").split()).lower() for line in found)
+
+
 def land_fetch_origin(url: str) -> str:
     """OWNER/REPO a github.com remote URL names (https, ssh:// or scp form), else ""."""
     m = LAND_FETCH_ORIGIN.fullmatch(url.strip())
@@ -8558,9 +8571,11 @@ class LandQueue:
         if kind in ("stop", "command"):
             why = act.get("why") or answer.get("reason")
             nxt = " ".join(map(str, act["argv"])) if isinstance(act.get("argv"), list) else act.get("text")
+            cls = str(act.get("stop") or answer.get("code") or kind)
+            if cls in LAND_HOLD_CLAIM_STOPS and self.review_hold_claim(e, head, answer):
+                return
             with self.lock:
-                self.stop(e, str(act.get("stop") or answer.get("code") or kind), land_trim(why),
-                          land_trim(nxt or answer.get("next")))
+                self.stop(e, cls, land_trim(why), land_trim(nxt or answer.get("next")))
             return
         if kind == "merge":
             sha = str(act.get("sha") or head).lower()
@@ -8831,12 +8846,34 @@ class LandQueue:
         if named == "update_branch":
             self.update_branch(e, sha)
 
-    def do_review(self, e: dict, head: str, answer: dict) -> None:
-        """router-review R N --post, at most once per head (claimed before it starts), detached; then wait for its
-        receipt comment."""
-        repo, number = e["repo"], str(e["number"])
+    def review_hold_claim(self, e: dict, head: str, answer: dict) -> bool:
+        """A chat or iOS hold whose PR body claims a release (a Chat-hold: or iOS-hold: line) passes only with a SHIP
+        at the head confirming that claim, and the queue reviews once per head: a claim written or changed after the
+        head's review was never confirmed, and the entry stopped (cmux#45558, 2026-11-17). Reviews again once per
+        (head, claim lines); True when it did, False to let the stop stand (no claim, the body unread, or reviewed)."""
+        gh = self.gh()
+        if gh is None or not SHA40.fullmatch(head or ""):
+            return False
+        got = self.call([gh, "pr", "view", str(e["number"]), "-R", e["repo"], "--json", "body", "--jq", ".body"],
+                        LAND_HOLD_BODY_DEADLINE, e)
+        claims = land_hold_claims(got.stdout or "") if got.returncode == 0 else ""
+        if not claims:
+            return False
+        key = f"{head}|{hashlib.sha256(claims.encode()).hexdigest()[:12]}"
+        if key in e.get("reviewed", []):
+            return False
         with self.lock:
-            if head in e.setdefault("reviewed", []):
+            self.history(e, "hold_claim_review", head=head[:12], claims=land_trim(claims, 160))
+        self.do_review(e, head, answer, key=key)
+        return True
+
+    def do_review(self, e: dict, head: str, answer: dict, key: str = "") -> None:
+        """router-review R N --post, at most once per head (claimed before it starts), detached; then wait for its
+        receipt comment. KEY (default the head) is what counts as reviewed: review_hold_claim's adds the claim."""
+        repo, number = e["repo"], str(e["number"])
+        key = key or head
+        with self.lock:
+            if key in e.setdefault("reviewed", []):
                 self.history(e, "review_already_run", head=head[:12])
             elif self.gh() is None:
                 self.stop(e, "no_shim", f"no gh-quota shim at {self.path('gh', LAND_GH)}; router-review --post is not "
@@ -8844,7 +8881,7 @@ class LandQueue:
                 return
             else:
                 rr = self.path("routerReview", Path.home() / ".local/bin/router-review")
-                e["reviewed"] = (e["reviewed"] + [head])[-10:]  # saved by the claim: a restart never posts it twice
+                e["reviewed"] = (e["reviewed"] + [key])[-10:]  # saved by the claim: a restart never posts it twice
                 self.claim(e, "review", head=head)
                 logs = land_dir() / "logs"
                 logs.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -8855,7 +8892,7 @@ class LandQueue:
                                          close_fds=True, cwd=os.environ.get("HOME") or "/")
                     self.finish(e, None, started=True)
                 except OSError as error:
-                    e["reviewed"] = [h for h in e["reviewed"] if h != head]
+                    e["reviewed"] = [h for h in e["reviewed"] if h != key]
                     self.finish(e, None, error=describe(error))
                     self.stop(e, "review_failed", f"router-review could not start: {describe(error)}",
                               f"router-review {repo} {number} --post")
