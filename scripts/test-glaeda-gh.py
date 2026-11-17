@@ -221,6 +221,7 @@ class FakeGitHub:
         self.probes = 0  # PR_PROBE queries answered
         self.full_reads = 0  # full PR queries answered
         self.named_calls: list[str] = []  # check-runs?check_name=NAME reads, by NAME
+        self.suite_calls = 0  # GET commits/SHA/check-suites reads
         self.whole_heads = False  # REST check runs and statuses list self.heads (every page), not a PR's rollup page
         self.repo_pushes = 0  # pushes to the base repository: GET pulls/N embeds it, so each moves the pull's ETag
 
@@ -455,6 +456,25 @@ class FakeGitHub:
                                        "workflow_id": {"CI": 77, "Lint": 78}.get(c["checkSuite"]["workflowRun"]["workflow"]["name"]),
                                        "check_suite_id": rid, "conclusion": (c["checkSuite"].get("conclusion") or "").lower() or None}
                                       for rid, c in listed]}
+        if parts[-1] == "check-suites":
+            # One suite per workflow run (its check runs' checkSuite), as GET commits/SHA/check-suites lists them: a
+            # suite is completed when every run in it is, and its conclusion is known only then.
+            self.suite_calls += 1
+            grouped: dict = {}
+            for c in contexts:
+                if c.get("__typename") == "CheckRun":
+                    rid = ((c.get("checkSuite") or {}).get("workflowRun") or {}).get("databaseId") or 0
+                    grouped.setdefault(rid, []).append(c)
+            suites = []
+            for rid, runs in grouped.items():
+                done = all(r["status"] == "COMPLETED" for r in runs)
+                failed = any((r.get("conclusion") or "") in {"FAILURE", "TIMED_OUT", "CANCELLED", "STARTUP_FAILURE"}
+                             for r in runs)
+                suites.append({"id": rid, "status": "completed" if done else "in_progress",
+                               "conclusion": ("failure" if failed else "success") if done else None,
+                               "updated_at": json.dumps([[r["status"], r.get("conclusion")] for r in runs]),
+                               "latest_check_runs_count": len(runs), "app": {"slug": "github-actions"}})
+            return {"total_count": len(suites), "check_suites": suites}
         if parts[-1] == "status":
             listed = [c for c in contexts if c["__typename"] == "StatusContext"]
             page = int(path.split("page=")[-1]) if "&page=" in path else 1
@@ -12742,6 +12762,8 @@ class SpendAlarmTest(Base):
         self.assertIn("--severity fire", told[0])
         self.assertIn("1500 left", told[0])
         self.assertIn("dry at", told[0])
+        # the daemon's own part of the drain, before its routes: 2026-11-17 its routes alone read as the cause
+        self.assertRegex(told[0], r"This daemon: \d+\.\d/min counted REST, last \d+ min \(\d+% of the drain\); its top")
         self.assertEqual(self.notice_lines()[-1]["kind"], "pool")
         self.assertEqual(self.notice_lines()[-1]["level"], "warn")
         self.seen(1400, NOW + 620, reset)  # still firing: not sent again within the hour
@@ -15455,6 +15477,110 @@ class ConcurrentWaitsRestTest(Base):
         self.assertAlmostEqual(self.daemon.read_cost("pr", "graphql"), 0.2)
         self.daemon.reads = self.daemon.reads[:5]  # too few reads to measure: the default stands
         self.assertEqual(self.daemon.read_cost("pr", "rest"), gg.READ_COST_DEFAULT[("pr", "rest")])
+
+
+class CmuxWaitsRestCostTest(Base):
+    """claude-sr2-coord, 2026-11-17 09:41Z and 10:36Z: cosmic-gray's REST pool drained at 127-169/min, and the daemon's
+    top routes were commits/SHA/check-runs pages, runs/ID/jobs pages and pulls/N on manaflow-ai/cmux, from `glaeda-gh
+    wait pr` on cmux PRs while GraphQL was stopped (every PR read over REST, at 9.31 counted REST a read). A cmux head
+    has about 170 check runs, so every read of a PR whose CI was moving paged its check runs (two counted 200s), its
+    workflow runs and the job lists of its failed checks. The harness: N=10 waited PRs on one repository, 170 checks
+    each in 17 workflow runs, 3 checks of each finishing every minute, one PR failing at minute 5, twenty one-minute
+    ticks over REST. The number is counted REST requests per minute (a 304 is free)."""
+
+    N, CHECKS, RUNS, MINUTES = 10, 170, 17, 20
+
+    def checks_for(self, n: int) -> list:
+        return [{**check_run(f"job-{i}", "IN_PROGRESS", None), "databaseId": 100000 * n + i, "id": f"CR_{n}_{i}",
+                 "checkSuite": {"workflowRun": {"databaseId": 1000 * n + i % self.RUNS, "workflow": {"name": "CI"}},
+                                "app": {"slug": "github-actions"}}}
+                for i in range(self.CHECKS)]
+
+    def setUp(self) -> None:
+        super().setUp()
+        for n in range(1, self.N + 1):
+            node = pr_node(n, rollup="PENDING", checks=self.checks_for(n))
+            node.update(url=f"https://github.com/o/cmux/pull/{n}", headRefOid=f"{n:x}cmux".ljust(40, "a")[:40])
+            self.gh.prs[("o", "cmux", n)] = node
+            gg.register(f"pr:o/cmux#{n}", waited=True, began=NOW)
+
+    def contexts(self, n: int) -> list:
+        return self.gh.prs[("o", "cmux", n)]["commits"]["nodes"][0]["commit"]["statusCheckRollup"]["contexts"]["nodes"]
+
+    def run_over_rest(self, minutes: int | None = None) -> list[int]:
+        """Counted REST requests per minute over MINUTES one-minute ticks with GraphQL forced low (every PR on REST),
+        after the first read. Three checks finish every minute, spread over both check-run pages and every run (so a
+        run completes only near the end), and a bot comment moves each PR's updated_at every minute, as on cmux."""
+        gg.write_json(gg.DAEMON_CONFIG, {"forceLow": ["graphql"], "restShare": 1.0})
+        self.addCleanup(lambda: gg.DAEMON_CONFIG.unlink(missing_ok=True))
+        self.daemon.paths = {kind: "rest" for kind in gg.CYCLES}
+        self.daemon.tick(NOW)
+        per_minute = []
+        for minute in range(1, (minutes or self.MINUTES) + 1):
+            for n in range(1, self.N + 1):
+                for i in range(3 * (minute - 1), min(3 * minute, self.CHECKS)):
+                    fail = n == 1 and minute == 5 and i % 3 == 0
+                    self.contexts(n)[(i * 37) % self.CHECKS].update(status="COMPLETED",
+                                                                    conclusion="FAILURE" if fail else "SUCCESS")
+                self.gh.prs[("o", "cmux", n)]["updatedAt"] = f"comment {minute}"
+            t = NOW + minute * gg.CYCLE
+            for n in range(1, self.N + 1):
+                path = gg.watch_dir() / gg.file_name(f"pr:o/cmux#{n}")
+                gg.write_json(path, {**gg.read_json(path), "waitedAt": t})
+                os.utime(path, (t, t))
+            before = self.gh.rest_remaining
+            self.daemon.tick(t)
+            per_minute.append(before - self.gh.rest_remaining)
+        return per_minute
+
+    def test_ten_cmux_waits_over_rest_cost_a_small_constant_a_minute(self) -> None:
+        per_minute = self.run_over_rest()
+        total = sum(per_minute)
+        print(f"\nHARNESS N={self.N} cmux waits ({self.CHECKS} checks), {self.MINUTES} min over REST: {total} counted "
+              f"REST, {total / self.MINUTES:.1f}/min, per minute {per_minute}", file=sys.stderr)
+        self.assertLessEqual(total / self.MINUTES, 2.5 * self.N, per_minute)
+        self.assertEqual(gg.read_cache("pr:o/cmux#1")["data"]["checkState"], "FAILURE", "the failure was not seen")
+        for n in range(2, self.N + 1):
+            self.assertEqual(gg.read_cache(f"pr:o/cmux#{n}")["data"]["checkState"], "PENDING", n)
+
+    def test_a_gated_minute_pages_no_check_runs_and_a_finished_suite_reads_in_full(self) -> None:
+        self.run_over_rest(minutes=1)
+        after = len(self.gh.calls)
+        # minute 2: nothing finished in any suite's terms: no check-run page, job list or pull is asked
+        t = NOW + 2 * gg.CYCLE
+        for n in range(1, self.N + 1):
+            path = gg.watch_dir() / gg.file_name(f"pr:o/cmux#{n}")
+            gg.write_json(path, {**gg.read_json(path), "waitedAt": t})
+            os.utime(path, (t, t))
+        self.daemon.tick(t)
+        asked = [c[1] for c in self.gh.calls[after:]]
+        self.assertFalse([u for u in asked if "/check-runs" in u or "/jobs" in u or "/pulls/" in u], asked)
+        self.assertEqual(gg.read_cache("pr:o/cmux#2")["dataAt"], t, "a gated read is a read as of now")
+        # minute 3: PR 2's run 0 finishes with one failure: its suite moved, so PR 2 is read in full at once
+        for i, c in enumerate(self.contexts(2)):
+            if i % self.RUNS == 0:
+                c.update(status="COMPLETED", conclusion="FAILURE" if i == 0 else "SUCCESS")
+        t = NOW + 3 * gg.CYCLE
+        for n in range(1, self.N + 1):
+            path = gg.watch_dir() / gg.file_name(f"pr:o/cmux#{n}")
+            gg.write_json(path, {**gg.read_json(path), "waitedAt": t})
+            os.utime(path, (t, t))
+        after = len(self.gh.calls)
+        self.daemon.tick(t)
+        self.assertEqual(gg.read_cache("pr:o/cmux#2")["data"]["checkState"], "FAILURE")
+        paged = [c[1] for c in self.gh.calls[after:] if "/check-runs" in c[1]]
+        self.assertTrue(paged and all("/2cmux" in u for u in paged), paged)
+
+    def test_a_jobs_watch_is_never_gated(self) -> None:
+        self.run_over_rest(minutes=1)
+        gg.register("pr:o/cmux#3", jobs=True, waited=True, began=NOW)
+        t = NOW + 2 * gg.CYCLE
+        path = gg.watch_dir() / gg.file_name("pr:o/cmux#3")
+        gg.write_json(path, {**gg.read_json(path), "waitedAt": t})
+        os.utime(path, (t, t))
+        after = len(self.gh.calls)
+        self.daemon.tick(t)
+        self.assertTrue([c for c in self.gh.calls[after:] if "/3cmux" in c[1] and "/check-runs" in c[1]])
 
 
 class UpstreamDirectAfterTest(unittest.TestCase):

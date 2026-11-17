@@ -741,6 +741,24 @@ REST_SHARED_MAX = 600
 # at most PULL_REUSE_MAX, never once GitHub had not computed mergeability (mergeable null), and never on a head whose
 # checks have all finished and changed since (then the merge state the waits rule on is final, and is read anew).
 PULL_REUSE_MAX = 300
+# A REST PR read whose head is still running pages nothing while the head's check suites say nothing changed
+# (claude-sr2-coord, 2026-11-17 09:41Z and 10:36Z: with GraphQL stopped, waits on cmux PRs cost 9.31 counted REST a
+# read, check-run pages, job lists and pulls, and the pool drained at 127-169/min). The gate is one conditional
+# GET commits/SHA/check-suites (one page: a suite per workflow run and app) beside the head's first status page and
+# the issue: while every suite's status, conclusion and run count are as the last full read left them, the statuses
+# too, and the issue shows the PR still open, the cached checks stand, read again as of now. A suite finishing (a
+# failure included), a new suite or rerun, a status, a close, `--jobs`, a head with no suites, or a full read older
+# than PR_REST_FULL_EVERY reads the head in full. So a moving cmux head costs about two counted requests a minute
+# instead of nine; the price is that a check's own progress inside a running suite (one job failing early, a
+# required check passing before its workflow ends) shows within PR_REST_FULL_EVERY rather than the next cycle. Only
+# the REST route: GraphQL's rollup is one read already.
+PR_REST_FULL_EVERY = 300
+PR_REST_SUITE_PAGE = 100  # a head with more suites than one page is read in full
+# A wait on a PR read over REST that has run LONG_WAIT_AFTER is read every LONG_WAIT_FACTOR cycles (a check event the
+# controller delivers still reads it at once): a cmux wait runs 30-60 minutes, and its last minutes decide nothing the
+# first ones did not.
+LONG_WAIT_AFTER = 900
+LONG_WAIT_FACTOR = 2
 REST_READ_MAX = {"pr": REST_CHECK_PAGES + REST_STATUS_PAGES + REST_RUN_PAGES + 5, "run": 2, "comment": 3,
                  "head": REST_CHECK_PAGES + REST_STATUS_PAGES + REST_RUN_PAGES + 1}
 
@@ -2097,6 +2115,19 @@ def slim_issue_gate(doc: dict) -> dict:
     return {k: doc.get(k) for k in ("number", "state", "updated_at")}
 
 
+def slim_check_suites(doc: dict) -> dict:
+    """GET commits/SHA/check-suites as the REST PR read's gate (PR_REST_FULL_EVERY): each suite's id, status,
+    conclusion and run count, which move when a suite finishes, fails, is added or rerun, and not while its runs only
+    progress."""
+    suites = [[s.get("id"), s.get("status"), s.get("conclusion"), s.get("latest_check_runs_count")]
+              for s in doc.get("check_suites") or [] if isinstance(s, dict)]
+    return {"total": doc.get("total_count"), "suites": sorted(suites, key=lambda s: str(s[0]))}
+
+
+def suites_path(root: str, sha: str) -> str:
+    return f"{root}/commits/{sha}/check-suites?per_page={PR_REST_SUITE_PAGE}"
+
+
 def head_pending(checks: dict, statuses: list[dict]) -> bool:
     """A head with a check run not completed, or a status pending, by its REST reads (rest_head)."""
     return (any(str(c.get("status") or "").lower() != "completed" for c in checks.get("check_runs") or [])
@@ -3166,9 +3197,14 @@ class Daemon:
                 if fast:
                     pace += f" (past {share:.0%} of its {limit} an hour, {share * limit / 60:.0f}/min)"
                 dry = f", dry at {clock(pool['dryAt'])}" if pool["dryAt"] is not None else ""
+                # The daemon's own part of the drain first: on 2026-11-17 the alarm named only the daemon's routes, and
+                # its readers took the daemon (about 20/min) for the 127/min drain the gh shim's callers and other
+                # hosts made.
+                mine = recent["rest"]["counted"] / max(1.0, SPEND_RECENT / 60)
+                part = (f" ({mine / pool['perMinute']:.0%} of the drain)" if pool["perMinute"] else "")
                 text = (f"{'FIRE' if fire else 'WARN'} shared GitHub REST pool on {policy_host()}: {left} left{pace}"
-                        f"{dry}, resets {clock(reset)}. This daemon's top REST routes, last "
-                        f"{SPEND_RECENT // 60} min: {top}.")
+                        f"{dry}, resets {clock(reset)}. This daemon: {mine:.1f}/min counted REST, last "
+                        f"{SPEND_RECENT // 60} min{part}; its top routes: {top}.")
                 firing["pool"] = ("fire" if fire else "warn", text, {**pool, "top": recent["restByRoute"]})
         if policy.get("share", True):
             share = self.share_alarm(self.rest_cap(), rows)
@@ -4470,6 +4506,9 @@ class Daemon:
                 if kind == "comment" and self.fed(e["key"]) and since < COMMENT_FED_CYCLE - TICK:
                     continue  # the controller's issue_comment webhooks carry its new comments (merge_comments)
                 want = self.idle_interval(e, interval) if kind == "pr" and not terminal(kind, c.get("data")) else interval
+                if (kind == "pr" and path == "rest" and self.waited(e) and not terminal(kind, c.get("data"))
+                        and self.now - self.wait_start(e) >= LONG_WAIT_AFTER):
+                    want = max(want, interval * LONG_WAIT_FACTOR)  # a long wait over REST (a nudge still reads it)
                 if want > interval and since < want - interval / 2:
                     continue  # unread and unwaited: polled about as often as it was last read
                 out.append(e)
@@ -5397,7 +5436,7 @@ class Daemon:
             base = current if isinstance(current, dict) else prior
             entry = {"key": key, "fetchedAt": self.now, "dataAt": None, "data": None, "error": None}
             if base:
-                entry.update({k: base[k] for k in ("dataAt", "data", "etag", "jobs", "jobsEtag", "jobsAt", "jobsTried", "restAt", "source", "restParts", "restRun", "restRunAt", "origin", "via", "rerunAt", "fp", "fullAt", "wholeAt")
+                entry.update({k: base[k] for k in ("dataAt", "data", "etag", "jobs", "jobsEtag", "jobsAt", "jobsTried", "restAt", "source", "restParts", "restRun", "restRunAt", "origin", "via", "rerunAt", "fp", "fullAt", "wholeAt", "restFullAt")
                               if k in base})
             entry.update(fields)
             if key.startswith("pr:") and isinstance(entry.get("data"), dict) and "data" in fields:
@@ -6180,9 +6219,17 @@ class Daemon:
         self.reads.append((self.now, "pr", "rest"))
         root = f"/repos/{owner}/{repo}"
         old, parts = prior.get("restParts") or {}, {}
+        if self.rest_gate_holds(e, prior, old, root, number):
+            return None
         try:
             pull, reused = self.rest_pull(old, parts, root, number)
             sha = (pull.get("head") or {}).get("sha") or ""
+            was = prior.get("data") if isinstance(prior.get("data"), dict) else {}
+            settled_head = was.get("headRefOid") == sha and was.get("checkState") not in (None, "PENDING", "EXPECTED")
+            if sha and not settled_head:
+                # the gate's baseline, read before the check runs so a suite finishing meanwhile reads as a change
+                with contextlib.suppress(WatchError):
+                    self.head_part(old, parts, suites_path(root, sha), slim_check_suites)
             checks, statuses, runs, workflows = self.rest_head(old, parts, root, sha)
             if reused and not head_pending(checks, statuses) and head_moved(old, parts, f"{root}/commits/{sha}/"):
                 # every check finished, and something changed since the kept pull: the merge state is final now
@@ -6215,7 +6262,50 @@ class Daemon:
         review = (prior.get("data") or {}).get("reviewDecision")  # REST has none: keep GraphQL's last
         data = parse_pr(rest_pr_node(pull, checks, statuses, runs, required, review, workflows))
         self.fill_steps_rest(e, data, root, {c.get("node_id"): c.get("id") for c in listed})
-        self.store(e["key"], e["cache"], dataAt=self.now, data=data, restParts=parts, via="rest")
+        self.store(e["key"], e["cache"], dataAt=self.now, data=data, restParts=parts, via="rest", restFullAt=self.now)
+
+    def rest_gate_holds(self, e: dict, prior: dict, old: dict, root: str, number: Any) -> bool:
+        """The REST PR read's gate (PR_REST_FULL_EVERY): True when the issue, the head's check suites and its first
+        status page show nothing changed since the last full read, which then stands, stored as read now. False sends
+        the read on in full: no full read within PR_REST_FULL_EVERY, a settled, closed or GraphQL-read entry, `--jobs`,
+        a head with no suite or more than one page of them, a changed suite or status, a closed issue, or an issue that
+        changed while the kept pull is past PULL_REUSE_MAX. Raises OutOfTime."""
+        data = prior.get("data") if isinstance(prior.get("data"), dict) else None
+        full = prior.get("restFullAt")
+        if (data is None or e.get("jobs") or prior.get("via") != "rest" or prior.get("error")
+                or not isinstance(full, (int, float)) or isinstance(full, bool) or self.now - full >= PR_REST_FULL_EVERY
+                or str(data.get("state") or "").upper() != "OPEN" or data.get("checkState") not in ("PENDING", "FAILURE")
+                or not any(str(c.get("status") or "").upper() != "COMPLETED" for c in data.get("checks") or [])
+                or not data.get("headRefOid") or self.mode("rest") == "stop"):
+            return False
+        sha = str(data["headRefOid"])
+        issue_path, pull_path = f"{root}/issues/{number}", f"{root}/pulls/{number}"
+        gate_paths = (suites_path(root, sha), f"{root}/commits/{sha}/status?per_page=100&page=1")
+        kept = {p: old.get(p) for p in (issue_path, pull_path) + gate_paths}
+        if any(not isinstance(k, dict) or "doc" not in k for k in kept.values()):
+            return False
+        total = (kept[gate_paths[0]]["doc"] or {}).get("total")
+        if not isinstance(total, int) or not 0 < total <= PR_REST_SUITE_PAGE:
+            return False
+        probe: dict = {}
+        try:
+            issue = self.head_part(old, probe, issue_path, slim_issue_gate)
+            if str((issue or {}).get("state") or "").lower() != "open":
+                return False
+            if probe[issue_path].get("etag") != kept[issue_path].get("etag"):
+                pulled = kept[pull_path].get("at")
+                if not isinstance(pulled, (int, float)) or self.now - pulled >= PULL_REUSE_MAX:
+                    return False
+                # The issue moved (a comment, usually): the kept pull stands until PULL_REUSE_MAX, and the issue's
+                # old answer is kept so the next full read still sees the change and reads the pull.
+                probe[issue_path] = kept[issue_path]
+            for path, slim in zip(gate_paths, (slim_check_suites, slim_status_page)):
+                if self.head_part(old, probe, path, slim) != kept[path]["doc"]:
+                    return False
+        except WatchError:
+            return False  # the full read says what failed
+        self.store(e["key"], e["cache"], error=None, dataAt=self.now, restParts={**old, **probe}, via="rest")
+        return True
 
     def rest_pull(self, old: dict, parts: dict, root: str, number: Any, reuse: bool = True) -> tuple[dict, bool]:
         """(the pull, whether it is the kept one) for a REST PR read. The kept pull stands, with no pulls/N request,
