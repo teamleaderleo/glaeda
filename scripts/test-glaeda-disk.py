@@ -5066,6 +5066,122 @@ class GlaedaDiskTest(unittest.TestCase):
         rows = [json.loads(x) for x in log.read_text().splitlines()] if log.exists() else []
         return status, rows, survey, apply
 
+    def _full_disk_run(self, free_gib: float, full: bool = False) -> tuple[int, list[dict], Path, list[str]]:
+        """One real main() --pressure --apply (survey and apply unmocked) on a 256 GiB volume holding SwiftPM scratch:
+        `idle` (no job holds it, used an hour ago, so younger than its window) and `held` (a live job's shared lock).
+        With FULL every state record glaeda-disk writes under STATE raises ENOSPC. Returns (status, run lines, the
+        scratch root, and each failed write's file name with what it found: 'idle there' or 'idle gone')."""
+        store = self.root / "store"
+        scratch = store / "spm-scratch"
+        for name in ("idle", "held"):
+            make(scratch / name, age_hours=1)
+            (scratch / f"{name}.lock").touch()
+        holder = subprocess.Popen([sys.executable, "-c", "import fcntl, sys, time\n"
+                                   "f = open(sys.argv[1], 'a'); fcntl.flock(f, fcntl.LOCK_SH)\n"
+                                   "print('held', flush=True); time.sleep(60)\n", os.fspath(scratch / "held.lock")],
+                                  stdout=subprocess.PIPE, text=True)
+        self.addCleanup(holder.stdout.close)
+        self.addCleanup(holder.wait)
+        self.addCleanup(holder.kill)
+        self.assertEqual(holder.stdout.readline().strip(), "held")
+        state = self.root / "state"
+        state.mkdir()
+        log = self.root / "runs.jsonl"
+        dev = scratch.stat().st_dev
+        total = 256 * gd.GIB
+        free = int(free_gib * gd.GIB)
+        fss = {dev: gd.Fs(dev, "/", free, total, 120 * gd.GIB, 170 * gd.GIB)}
+        for name in ("EMERGENCY_DEVS", "ACTIVITY_MODE", "FLOOR_HOLD", "ROLE", "RUNNER_CACHE_PROFILE",
+                     "_REFRESH_DEADLINE_ACTIVE", "_MEASURE_BUDGET_REACHED", "OUT_OF_BAND_RUN"):
+            self.addCleanup(setattr, gd, name, getattr(gd, name))
+        gd._MEASURE_BUDGET_REACHED = False
+        seen: list[tuple[str, str]] = []
+        real_open, real_path_open = open, Path.open
+
+        def doomed(path, mode) -> bool:
+            if full and any(c in mode for c in "wax") and Path(path).is_relative_to(state):
+                seen.append((Path(path).name, "idle there" if (scratch / "idle").exists() else "idle gone"))
+                return True
+            return False
+
+        def full_open(file, mode="r", *a, **k):
+            if isinstance(file, (str, os.PathLike)) and doomed(file, mode):
+                raise OSError(errno.ENOSPC, "No space left on device")
+            return real_open(file, mode, *a, **k)
+
+        def full_path_open(self_, mode="r", *a, **k):
+            if doomed(self_, mode):
+                raise OSError(errno.ENOSPC, "No space left on device")
+            return real_path_open(self_, mode, *a, **k)
+        err = io.StringIO()
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(mock.patch.object(gd, "RUN_LOG", log))
+            stack.enter_context(mock.patch.object(gd, "DISK_OFF", self.root / "disk-off"))
+            stack.enter_context(mock.patch.object(gd, "SNAPSHOT", state / "sizes.json"))
+            stack.enter_context(mock.patch.object(gd, "ACCOUNTING", state / "accounting.json"))
+            stack.enter_context(mock.patch.object(gd, "TIMEOUT_STATE", state / "timeout-paths.json"))
+            stack.enter_context(mock.patch.object(gd, "HEALTH_SUMMARY", state / "summary.json"))
+            stack.enter_context(mock.patch.object(gd, "EVICT_OWNER", state / "evict.owner.json"))
+            stack.enter_context(mock.patch.object(gd, "MEASURE_LOCK", self.root / "measure.lock"))
+            stack.enter_context(mock.patch.object(gd, "EVICT_LOCK", self.root / "evict.lock"))
+            stack.enter_context(mock.patch.dict(os.environ, {gd.HOOK_PASS_ENV: "1"}))
+            stack.enter_context(mock.patch.object(gd, "default_families", return_value=[gd.spm_scratch_family(store)]))
+            stack.enter_context(mock.patch.object(gd, "runner_floor_gib", return_value=0.0))
+            stack.enter_context(mock.patch.object(gd, "filesystems", return_value=fss))
+            stack.enter_context(mock.patch.object(gd, "free_bytes", return_value=(free, total)))
+            stack.enter_context(mock.patch.object(gd, "ci_jobs", return_value=[]))
+            stack.enter_context(mock.patch.object(gd, "cmux_next_ci_cap_state", return_value=None))
+            stack.enter_context(mock.patch.object(gd, "cleanup_paused_runner_work", return_value=0))
+            stack.enter_context(mock.patch.object(gd, "evict_idle_runner_checkouts", return_value=0))
+            stack.enter_context(mock.patch.object(gd, "clear_stale_build_markers", return_value=0))
+            stack.enter_context(mock.patch.object(gd, "repack_runner_checkouts", return_value=0))
+            stack.enter_context(mock.patch.object(gd, "notify_disk"))
+            stack.enter_context(mock.patch("builtins.open", full_open))
+            stack.enter_context(mock.patch.object(Path, "open", full_path_open))
+            stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
+            stack.enter_context(contextlib.redirect_stderr(err))
+            status = gd.main(["--pressure", "--apply", "--top", "0", "--min-mib", "0",
+                              "--receipt", os.fspath(state / "receipt.jsonl")])
+        self.stderr = err.getvalue()
+        rows = [json.loads(x) for x in log.read_text().splitlines()] if log.exists() else []
+        self.assertEqual(sorted(p.name for p in state.iterdir() if ".tmp" in p.name), [], "no tmp file left")
+        return status, rows, scratch, seen
+
+    def test_a_full_disk_never_stops_eviction_at_a_state_write(self) -> None:
+        """2026-11-17, a 256 GB mini at 3 GB free: the pass died with ENOSPC writing ~/.cache/glaeda-disk/sizes.*.tmp
+        before it deleted anything. Every state record now fails soft, and below the emergency floor the sizes
+        snapshot is written after the deletions."""
+        status, rows, scratch, seen = self._full_disk_run(3.0, full=True)
+        self.assertEqual(status, 0)
+        self.assertFalse((scratch / "idle").exists(), "evicted although every state write failed")
+        self.assertTrue((scratch / "held").exists(), "a live job's scratch stays")
+        self.assertEqual(rows[-1]["skipped"], None)
+        failed = rows[-1]["state_write_failed"]
+        for what in ("receipt", "the health summary", "the eviction summary"):
+            self.assertIn(what, failed)
+        self.assertIn("the run goes on", self.stderr)
+        # the sizes snapshot, the largest record, came only after the delete
+        snapshots = [found for name, found in seen if name.startswith(("sizes", ".sizes"))]
+        self.assertTrue(snapshots)
+        self.assertEqual(set(snapshots), {"idle gone"})
+
+    def test_below_the_emergency_floor_a_pressure_apply_takes_idle_spm_scratch(self) -> None:
+        """Under pressure but above the emergency floor (30 GiB of 256), scratch used an hour ago is recent; at 3 GB
+        free, whatever no job holds goes whatever its age, and the scratch a live job holds stays."""
+        status, rows, scratch, _ = self._full_disk_run(100.0)
+        self.assertEqual(status, 0)
+        self.assertTrue((scratch / "idle").exists(), "above the emergency floor it waits out its window")
+        self.assertIn(gd.SPM_SCRATCH, rows[-1]["blocked"])
+        for p in (scratch / "idle", scratch / "held"):
+            shutil.rmtree(p)
+            (scratch / f"{p.name}.lock").unlink()
+        shutil.rmtree(self.root / "state")
+        status, rows, scratch, _ = self._full_disk_run(3.0)
+        self.assertEqual(status, 0)
+        self.assertFalse((scratch / "idle").exists())
+        self.assertTrue((scratch / "held").exists())
+        self.assertEqual(rows[-1]["state_write_failed"], [])
+
     def test_every_applying_run_writes_one_run_line(self) -> None:
         blocked = gd.Item("code-sign-clones", "/x/c", 12 * gd.GIB, 1.0, "recent", [])
         status, rows, survey, apply = self._main_run(["--pressure", "--apply"], items=[blocked], released=3 * gd.GIB)
