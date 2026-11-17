@@ -1592,7 +1592,7 @@ def item_window(fam: Family, path: Path, idle_hours: float, archived: frozenset[
                 return 0.0
     if fam.id in STEP_CHECKOUT_FAMILIES and fam.git_disposable and ended_step_checkout(path):
         return min(idle_window(fam, idle_hours), STEP_CHECKOUT_IDLE_HOURS)  # its step ended: nothing comes back
-    if budget_warm(fam):  # the volume's caches are over their budget: warmth older than an hour is spent
+    if budget_warm(fam, path):  # the volume's caches are over their budget: warmth older than an hour is spent
         return min(idle_window(fam, idle_hours), BUDGET_IDLE_HOURS)
     return idle_window(fam, idle_hours)
 
@@ -1655,36 +1655,75 @@ BUDGET_FAMILY_IDS = frozenset({
     "journey-fetch",
 })  # RUNNER_BUILD_FAMILY, HQ_CACHE_FAMILY and the JOURNEY_SUBDIRS families, defined below (a test keeps them equal)
 BUDGET_WARM_FAMILY_IDS = frozenset({  # not FLEET_FAMILY_IDS: pressure already spends them past pressure_idle_hours
+    # not cmux-job-cache: its half-day minimum keeps a reload-cloud slot used in the same work period (its Family)
     CANONICAL_ADMISSION, RUNNER_ROOT_ADMISSION, "runner-checkout-build", "xcode-derived-data",
-    "cmux-job-cache", "journey-builds", "journey-fetch",
+    "journey-builds", "journey-fetch",
 })
-# glaeda-disk's accounting coverage rows (cached up to ACCOUNTING_MAX_AGE_S) for build stores no family lists: the
-# fleet Xcode compilation cache, which glaeda-fleet-cas-prune bounds by its own node cap
-BUDGET_COVERAGE_SCOPES = {"shared-fleet/xcode": "fleet-cas"}
+# The fleet Xcode compilation cache (node-store and the local CAS under FLEET_CAS_ROOT) is no family: its bytes come
+# from glaeda-fleet-cas-prune's own report of its last run (fleet_cas_node_cap keeps it here), after what that run
+# removed, never a cached walk of the whole xcode/ tree.
+FLEET_CAS_RECORD = HOME / ".cache/glaeda-disk/fleet-cas-bytes.json"
+FLEET_CAS_RECORD_MAX_AGE_S = 2 * 3600.0  # every pressure pass rewrites it; older than this it is not counted
+# The last budgeted pressure pass's free shortfall that no cache could close, per volume (free_short_left): the next
+# pass counts only the shortfall beyond it before its survey, so a disk whose non-cache use alone is over
+# cache_budget_free is not forced into a pressure pass every time. Past its age one pass measures it again.
+CACHE_BUDGET_RECORD = HOME / ".cache/glaeda-disk/cache-budget.json"
+CACHE_BUDGET_RECORD_MAX_AGE_S = 6 * 3600.0
 BUDGET_IDLE_HOURS = 1.0  # unused for an hour on a busy runner host: the next job that wants it rebuilds or re-seeds
 BUDGET_STOP_SHARE = 0.9  # over the budget, evict down to this share of it, so one pass is not followed by another
 CACHE_BUDGET: dict[int, dict[str, Any]] = {}  # dev -> {"used", "budget", "over", "families"}, set by main
+# the volumes a pressure run found over the budget before its survey: the survey judged their warm families on
+# BUDGET_IDLE_HOURS, so apply keeps treating those items as budget-only (stopping with CACHE_BUDGET's fresh "over")
+BUDGET_WARM_DEVS: frozenset[int] = frozenset()
 
 
 def _outermost(paths: list[str]) -> list[str]:
-    """PATHS without any path inside another listed one."""
+    """PATHS without any path inside another listed one, compared by path components ("/r/a-1" is not in "/r/a")."""
     out: list[str] = []
-    for p in sorted(paths):
-        if out and (p == out[-1] or p.startswith(out[-1].rstrip("/") + "/")):
+    kept: list[tuple[str, ...]] = []
+    for p in sorted(paths, key=lambda x: Path(x).parts):
+        parts = Path(p).parts
+        if kept and parts[:len(kept[-1])] == kept[-1]:
             continue
         out.append(p)
+        kept.append(parts)
     return out
 
 
-def cache_budget_state(fams: list[Family], fss: "dict[int, Fs]", sizes: dict[str, int],
-                       accounting: dict[str, Any] | None = None, now: float | None = None) -> dict[int, dict[str, Any]]:
-    """Each volume's build-cache bytes against POLICY cache_budget: the last measured size of every candidate of a
-    BUDGET_FAMILY_IDS family (the snapshot, outermost paths only) plus BUDGET_COVERAGE_SCOPES from the cached
-    accounting. Reads only: no walk. {} when the budget is off ("0") or nothing is known."""
-    spec = str(POLICY["cache_budget"]).strip()
-    if spec in ("", "0", "0%"):
+def read_fleet_cas_record(path: Path | None = None) -> dict[str, Any]:
+    """FLEET_CAS_RECORD ({"at", "dev", "bytes"}), {} when absent or malformed."""
+    try:
+        doc = json.loads((FLEET_CAS_RECORD if path is None else path).read_text())
+    except (OSError, ValueError):
         return {}
+    ok = isinstance(doc, dict) and all(isinstance(doc.get(k), (int, float)) for k in ("at", "dev", "bytes"))
+    return doc if ok else {}
+
+
+def read_budget_left(path: Path | None = None, now: float | None = None) -> dict[int, int]:
+    """CACHE_BUDGET_RECORD's free_short_left per dev, {} when absent, malformed or older than its bound."""
     now = time.time() if now is None else now
+    try:
+        doc = json.loads((CACHE_BUDGET_RECORD if path is None else path).read_text())
+        if not 0 <= now - float(doc["at"]) <= CACHE_BUDGET_RECORD_MAX_AGE_S:
+            return {}
+        return {int(k): int(v) for k, v in doc["left"].items() if int(v) > 0}
+    except (OSError, ValueError, TypeError, KeyError, AttributeError):
+        return {}
+
+
+def write_budget_left(state: dict[int, dict[str, Any]], path: Path | None = None) -> None:
+    path = CACHE_BUDGET_RECORD if path is None else path
+    with contextlib.suppress(OSError):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(f".{os.getpid()}.tmp")
+        tmp.write_text(json.dumps({"at": time.time(),
+                                   "left": {str(d): r.get("free_short_left", 0) for d, r in state.items()}}))
+        os.replace(tmp, path)
+
+
+def _budget_dev_bytes(fams: list[Family], sizes: dict[str, int]) -> dict[int, dict[str, int]]:
+    """dev -> family -> bytes of the outermost sized paths under a BUDGET_FAMILY_IDS root (the deepest root owns)."""
     roots: list[tuple[str, Family, int]] = []
     for f in fams:
         if f.id not in BUDGET_FAMILY_IDS:
@@ -1693,7 +1732,7 @@ def cache_budget_state(fams: list[Family], fss: "dict[int, Fs]", sizes: dict[str
             roots.append((os.fspath(f.root).rstrip("/"), f, f.root.stat().st_dev))
         except OSError:
             continue
-    roots.sort(key=lambda r: len(r[0]), reverse=True)  # the deepest root a path is under owns it
+    roots.sort(key=lambda r: len(r[0]), reverse=True)
     owned: dict[str, tuple[str, int]] = {}
     for path, size in sizes.items():
         if size <= 0:
@@ -1702,24 +1741,47 @@ def cache_budget_state(fams: list[Family], fss: "dict[int, Fs]", sizes: dict[str
             if path.startswith(root + "/"):
                 owned[path] = (f.id, dev)
                 break
-    out: dict[int, dict[str, Any]] = {}
+    out: dict[int, dict[str, int]] = {}
     for path in _outermost(list(owned)):
         fid, dev = owned[path]
-        row = out.setdefault(dev, {"used": 0, "families": {}})
-        row["used"] += sizes[path]
-        row["families"][fid] = row["families"].get(fid, 0) + sizes[path]
-    doc = _accounting_cache() if accounting is None else accounting
-    for dev in fss:
-        hit = doc.get(str(dev)) if isinstance(doc.get(str(dev)), dict) else None
-        if not hit or now - float(hit.get("coverage_at", 0) or 0) > ACCOUNTING_MAX_AGE_S:
-            continue
-        for row in _safe_cached_coverage(hit.get("coverage")) or []:
-            label = BUDGET_COVERAGE_SCOPES.get(row["scope"])
-            size = sum(int(c.get("bytes", 0)) for c in row.get("children", []) if isinstance(c.get("bytes"), int))
-            if label and size > 0:
-                r = out.setdefault(dev, {"used": 0, "families": {}})
-                r["used"] += size
-                r["families"][label] = r["families"].get(label, 0) + size
+        fam_bytes = out.setdefault(dev, {})
+        fam_bytes[fid] = fam_bytes.get(fid, 0) + sizes[path]
+    return out
+
+
+def cache_budget_reclaimable(items: "list[Item]", fams: list[Family]) -> dict[int, int]:
+    """dev -> bytes this run's survey judged reclaimable in BUDGET_FAMILY_IDS families: what eviction can give back."""
+    sizes = {i.path: i.bytes for i in items if i.verdict == "reclaimable" and i.family in BUDGET_FAMILY_IDS}
+    return {dev: sum(by.values()) for dev, by in _budget_dev_bytes(fams, sizes).items()}
+
+
+def cache_budget_state(fams: list[Family], fss: "dict[int, Fs]", sizes: dict[str, int],
+                       fleet_cas: dict[str, Any] | None = None, now: float | None = None,
+                       reclaimable: dict[int, int] | None = None,
+                       unclosable: dict[int, int] | None = None) -> dict[int, dict[str, Any]]:
+    """Each volume's build-cache bytes against POLICY cache_budget: the size of every candidate of a
+    BUDGET_FAMILY_IDS family in SIZES (outermost paths only; main passes the sizes its survey just took, so a path
+    deleted since is gone) plus the fleet compilation cache from FLEET_CAS (read_fleet_cas_record). Reads only: no
+    walk. {} when the budget is off ("0") or nothing is known.
+
+    The volume is "over" by what takes its caches back under BUDGET_STOP_SHARE of the budget, or by what keeps
+    cache_budget_free of it free, whichever is more. The free shortfall counts only up to RECLAIMABLE[dev] (what this
+    run's survey judged reclaimable in those families): the rest is no cache's to close ("free_short_left"), so it
+    never keeps a small disk over pass after pass. RECLAIMABLE None (before the survey, which only decides whether
+    the survey judges warm families on BUDGET_IDLE_HOURS) counts the shortfall beyond UNCLOSABLE[dev], what the last
+    pass could not close (read_budget_left)."""
+    spec = str(POLICY["cache_budget"]).strip()
+    if spec in ("", "0", "0%"):
+        return {}
+    now = time.time() if now is None else now
+    out: dict[int, dict[str, Any]] = {}
+    for dev, by in _budget_dev_bytes(fams, sizes).items():
+        out[dev] = {"used": sum(by.values()), "families": dict(by)}
+    rec = read_fleet_cas_record() if fleet_cas is None else fleet_cas
+    if rec and rec.get("bytes", 0) > 0 and 0 <= now - float(rec["at"]) <= FLEET_CAS_RECORD_MAX_AGE_S:
+        r = out.setdefault(int(rec["dev"]), {"used": 0, "families": {}})
+        r["used"] += int(rec["bytes"])
+        r["families"]["fleet-cas"] = r["families"].get("fleet-cas", 0) + int(rec["bytes"])
     for dev, row in list(out.items()):
         fs = fss.get(dev)
         if fs is None or fs.tmpfs:
@@ -1738,7 +1800,10 @@ def cache_budget_state(fams: list[Family], fss: "dict[int, Fs]", sizes: dict[str
         except ValueError:
             free_need = 0
         row["free_short"] = max(0, free_need - fs.free)
-        row["over"] = min(row["used"], max(over_share, row["free_short"]))
+        closable = (max(0, row["free_short"] - (unclosable or {}).get(dev, 0)) if reclaimable is None
+                    else min(row["free_short"], reclaimable.get(dev, 0)))
+        row["free_short_left"] = row["free_short"] - closable
+        row["over"] = min(row["used"], max(over_share, closable))
     return out
 
 
@@ -1747,26 +1812,32 @@ def cache_budget_over(dev: int) -> int:
     return CACHE_BUDGET.get(dev, {}).get("over", 0) if ACTIVITY_MODE == "pressure" else 0
 
 
-def budget_warm(fam: Family) -> bool:
-    """Whether FAM's window is only warmth that the cache budget may spend (its volume is over the budget)."""
-    if fam.id not in BUDGET_WARM_FAMILY_IDS:
+def budget_warm(fam: Family, path: Path) -> bool:
+    """Whether PATH's window in FAM is only warmth that the cache budget may spend: a pressure run found its volume
+    over the budget (BUDGET_WARM_DEVS). Never a media host's warm tour slot, nor a canonical root's admission
+    DerivedData without the runner hook's token file (its 12 h window is that root's only protection)."""
+    if fam.id not in BUDGET_WARM_FAMILY_IDS or ACTIVITY_MODE != "pressure" or media_tour_warm_slot(fam, path):
+        return False
+    if fam.id == CANONICAL_ADMISSION and not floor_hold_family(fam, path):
         return False
     try:
-        return cache_budget_over(fam.root.stat().st_dev) > 0
+        return fam.root.stat().st_dev in BUDGET_WARM_DEVS
     except OSError:
         return False
 
 
 def budget_only(fam: Family, item: "Item", idle_hours: float) -> bool:
     """Reclaimable only because the volume is over the cache budget: younger than its family's own window.
-    apply stops these once the volume's caches are back under the budget's stop line."""
-    return budget_warm(fam) and item.idle_hours < idle_window(fam, idle_hours)
+    apply stops these once the volume's caches are back under the budget's stop line, and takes fresh process
+    evidence before each one."""
+    return budget_warm(fam, Path(item.path)) and item.idle_hours < idle_window(fam, idle_hours)
 
 
 def cache_budget_rows() -> list[dict[str, Any]]:
     """CACHE_BUDGET for the run line and the health summary (ci-dash's cache-vs-budget row): GiB, no paths."""
     return [{"mount": r.get("mount", ""), "used_gib": round(r["used"] / GIB, 1), "budget_gib": round(r["budget"] / GIB, 1),
              "over_gib": round(r["over"] / GIB, 1), "free_short_gib": round(r.get("free_short", 0) / GIB, 1),
+             "free_short_left_gib": round(r.get("free_short_left", 0) / GIB, 1),
              "families_gib": {k: round(v / GIB, 1) for k, v in sorted(r["families"].items(), key=lambda kv: -kv[1])}}
             for r in CACHE_BUDGET.values()]
 
@@ -1913,12 +1984,13 @@ POLICY_DEFAULTS: dict[str, Any] = {
     "low_margin_gib": 4.0,
     "target_margin_gib": 20.0,
     "pressure_idle_hours": 0.5,
-    # Every build cache on a volume together (BUDGET_FAMILY_IDS and BUDGET_COVERAGE_SCOPES) stays under this share of
+    # Every build cache on a volume together (BUDGET_FAMILY_IDS and the fleet compilation cache) stays under this share of
     # it (space()'s syntax; "0" turns it off). Over it, a pressure pass spends warm build state past BUDGET_IDLE_HOURS
     # by value until the caches are back under BUDGET_STOP_SHARE of it.
     "cache_budget": "35%",
     # ... and the caches give back what keeps this much of the volume free, whichever asks more ("" or "0": only the
-    # share). The fleet's stop condition: every mini holds 30% free through a peak day.
+    # share), counted only up to what the survey found reclaimable in those families. The fleet's stop condition:
+    # every mini holds 30% free through a peak day.
     "cache_budget_free": "30%",
     # PRESSURE_MEASURE_BUDGET_S: seconds a pressure --apply spends starting size walks (0: no bound)
     "pressure_measure_budget_s": float(PRESSURE_MEASURE_BUDGET_S),
@@ -11246,7 +11318,7 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
             break
         if fam.id in FLEET_FAMILY_IDS or fam.id in (CMUX_NEXT_CI_FAMILY, HQ_CACHE_FAMILY, CANONICAL_ADMISSION,
                                                      RUNNER_ROOT_ADMISSION, NIGHTLY_NEXT_FAMILY) \
-                or media_tour_dd(fam, p) or (
+                or media_tour_dd(fam, p) or budget_only(fam, i, idle_hours) or (
                 fam.id == INTERRUPTED and fam.root in cmux_next_ci_aside_parents(HOME / "Library/Caches" / CMUX_NEXT_CI_ROOT)):
             # Pressure eligibility is intentionally broad, so take fresh cwd/open-file evidence immediately
             # before each rename. A job may start using a candidate after the survey or during a long pass.
@@ -13217,27 +13289,24 @@ def _main_impl(argv: list[str] | None = None) -> int:
     except ValueError:
         ap.error(f"--low/--target/--tmpfs-*/--emergency take GiB or N%: {a.low!r}, {a.target!r}, "
                  f"{a.tmpfs_low!r}, {a.tmpfs_target!r}, {a.emergency!r}")
-    # The host cache budget, from the last measured sizes (no walk): a volume whose build caches are over it is under
-    # pressure whatever its free space, and its free target rises by what the caches must give back. A run limited to
-    # some families, a reserved host's floor pass, a --need, the drain and the runner-account profile leave it alone.
-    global CACHE_BUDGET
-    CACHE_BUDGET = {}
-    if (ROLE == "fleet-mini" and not RUNNER_CACHE_PROFILE and not reserved and not a.family and a.need is None
-            and not a.cmux_next_drain and not a.root_override):
-        CACHE_BUDGET = cache_budget_state(every, fss, load_snapshot()[1])
-        for dev, row in CACHE_BUDGET.items():
+    # The host cache budget, only for a pressure run (a report, --json or a plain --apply never spends it). Before the
+    # survey, from the snapshot's sizes of paths still there (no walk): a volume whose build caches look over it is
+    # under pressure whatever its free space, and the survey judges its warm families on BUDGET_IDLE_HOURS
+    # (BUDGET_WARM_DEVS). After the survey, the sizes it just took decide how much apply gives back (CACHE_BUDGET).
+    # A run limited to some families, a reserved host's floor pass, a --need, the drain and the runner-account
+    # profile leave it alone.
+    global CACHE_BUDGET, BUDGET_WARM_DEVS
+    CACHE_BUDGET, BUDGET_WARM_DEVS = {}, frozenset()
+    budget_base: dict[int, tuple[int, int]] = {}  # dev -> the volume's (low, target) before the budget raised them
+    if (a.pressure and ROLE == "fleet-mini" and not RUNNER_CACHE_PROFILE and not reserved and not a.family
+            and a.need is None and not a.cmux_next_drain and not a.root_override):
+        seen = {k: v for k, v in load_snapshot()[1].items() if os.path.lexists(k)}  # a deleted path holds nothing
+        for dev, row in cache_budget_state(every, fss, seen, unclosable=read_budget_left()).items():
             if row["over"] > 0 and dev in fss:
                 fs = fss[dev]
+                budget_base[dev] = (fs.low, fs.target)
                 fss[dev] = replace(fs, low=max(fs.low, fs.free + 1), target=max(fs.target, fs.free + row["over"]))
-        if CACHE_BUDGET:
-            RUN["cache_budget"] = cache_budget_rows()
-            if not a.json:
-                for row in RUN["cache_budget"]:
-                    top = ", ".join(f"{k} {v:g}" for k, v in list(row["families_gib"].items())[:6])
-                    print(f"cache budget: {row['used_gib']:g} GiB of build caches, budget {row['budget_gib']:g} GiB"
-                          + (f" ({row['over_gib']:g} GiB to give back: warm build state past "
-                             f"{BUDGET_IDLE_HOURS:g}h idle goes by value)" if row["over_gib"] else "")
-                          + (f"; {top}" if top else ""))
+        BUDGET_WARM_DEVS = frozenset(budget_base)
     # a tmpfs is under pressure at a quarter full, so it shortens the idle window only for
     # pressure runs, which then touch nothing but that filesystem's families
     under = any(fs.under for fs in fss.values() if a.pressure or not fs.tmpfs)
@@ -13516,6 +13585,27 @@ def _main_impl(argv: list[str] | None = None) -> int:
     if a.refresh and _MEASURE_BUDGET_REACHED and not a.json:
         print(f"refresh budget reached after {a.refresh_budget_s:g}s; completed measurements were saved; "
               "the next refresh will continue\n")
+    if budget_base:
+        # the sizes this survey just took (paths deleted since the snapshot are gone from KNOWN), and the free
+        # shortfall only up to what it found reclaimable in the budget's families
+        CACHE_BUDGET = cache_budget_state(every, fss, known, reclaimable=cache_budget_reclaimable(items, every))
+        if a.apply:
+            write_budget_left(CACHE_BUDGET)
+        for dev, (low, target) in budget_base.items():
+            over = CACHE_BUDGET.get(dev, {}).get("over", 0)
+            fs = fss[dev]
+            fss[dev] = replace(fs, low=max(low, fs.free + 1) if over else low, target=max(target, fs.free + over))
+        if CACHE_BUDGET:
+            RUN["cache_budget"] = cache_budget_rows()
+            if not a.json:
+                for row in RUN["cache_budget"]:
+                    top = ", ".join(f"{k} {v:g}" for k, v in list(row["families_gib"].items())[:6])
+                    print(f"cache budget: {row['used_gib']:g} GiB of build caches, budget {row['budget_gib']:g} GiB"
+                          + (f" ({row['over_gib']:g} GiB to give back: warm build state past "
+                             f"{BUDGET_IDLE_HOURS:g}h idle goes by value)" if row["over_gib"] else "")
+                          + (f"; {row['free_short_left_gib']:g} GiB of the free shortfall is no cache's to close"
+                             if row["free_short_left_gib"] else "")
+                          + (f"; {top}" if top else ""))
     shown = [fs for fs in fss.values() if not a.pressure or fs.under]
     accounting = filesystem_accounting(shown, items, known)
     # A before/after receipt must compare the same filesystem set even when a pressure
@@ -13564,11 +13654,14 @@ def _main_impl(argv: list[str] | None = None) -> int:
         last = {id(i) for i in items if i.family in by_id and cmux_next_ci_host_root(by_id[i.family], Path(i.path))}
 
         taken: dict[Path, int] = {}  # one tally across both passes: an aside finished first is in the host's size
+        fleet_cas_due = (a.pressure and ROLE == "fleet-mini" and not RUNNER_CACHE_PROFILE and not a.cmux_next_drain
+                         and not a.family)
+        cas_budget_freed = fleet_cas_budget_cap(fss) if fleet_cas_due else 0  # over the budget: the CAS goes first
 
         def apply_pass(chosen: list[Item]) -> int:
             return apply(chosen, by_id, a.receipt, {fs.dev: fs.target for fs in shown} if a.pressure else None,
                          idle, halt, all_families=fams, receipt_sweep=sweep, taken=taken)
-        logical_released = stale_marker_released + apply_pass([i for i in items if id(i) not in last])
+        logical_released = stale_marker_released + cas_budget_freed + apply_pass([i for i in items if id(i) not in last])
         # A drained runner is explicitly held by cmux_mini_fix; once its listener and worker
         # are absent, its disposable checkout can be cleared under this same eviction lock.
         if not RUNNER_CACHE_PROFILE and not reserved and not out_of_band and not DEAD_MODE:  # job-owned _work
@@ -13596,13 +13689,8 @@ def _main_impl(argv: list[str] | None = None) -> int:
                               and not reserved and (not a.family or SHARED_MIRROR_COMPACT_FAMILY in a.family))
         # the fleet compilation-cache node store's hard cap, on every pressure pass: the runner hook's pass before each
         # job and its floor eviction run this one (glaeda-fleet-cas-prune keeps its own working-set rule)
-        if a.pressure and ROLE == "fleet-mini" and not RUNNER_CACHE_PROFILE and not a.cmux_next_drain and not a.family:
-            cas_cap = None
-            with contextlib.suppress(OSError):
-                cas_dev = FLEET_CAS_ROOT.stat().st_dev
-                if cache_budget_over(cas_dev) > 0 and cas_dev in fss:
-                    cas_cap = max(2.0, round(fss[cas_dev].total * FLEET_CAS_BUDGET_SHARE / GIB, 1))
-            logical_released += fleet_cas_node_cap(cap_gib=cas_cap)
+        if fleet_cas_due and not RUN.get("fleet_cas_budget_cap"):  # the budget's cap already ran this pass
+            logical_released += fleet_cas_node_cap()
         # idle simulator devices, on every idle sweep and on a pressure pass while free space is still short of the
         # target: each device is judged on its own, so a busy mini (never idle) still gets them back
         if ((sweep or a.pressure) and DARWIN and ROLE == "fleet-mini" and not RUNNER_CACHE_PROFILE
@@ -13708,16 +13796,19 @@ FLEET_CAS_PRUNE_TIMEOUT_S = 300.0
 FLEET_CAS_BUDGET_SHARE = 0.025
 
 
-def fleet_cas_node_cap(root: Path | None = None, prune: Path | None = None, cap_gib: float | None = None) -> int:
+def fleet_cas_node_cap(root: Path | None = None, prune: Path | None = None, cap_gib: float | None = None,
+                       record: Path | None = None) -> int:
     """Run `glaeda-fleet-cas-prune --apply --node-only` (installed beside this script) on a host with fleet-cas, bounded
     by FLEET_CAS_PRUNE_TIMEOUT_S; the bytes it reports freed, 0 when it is absent, fails or freed nothing. Never raises.
-    With CAP_GIB (the volume is over the cache budget) it runs `--apply --node-gib CAP --local-cas-gib CAP` instead: the
-    node store under CAP, and a reader's local CAS whole once over it, under the prune's own in-use rules."""
+    With CAP_GIB (the volume is over the cache budget) it runs `--apply --cap-only --node-gib CAP --local-cas-gib CAP`
+    instead: the node store under CAP, and a reader's local CAS whole once over it, under the prune's own in-use rules
+    (no sweep, no fleet-store gc; when ps fails the node cap still holds and the local CAS waits). The bytes both
+    stores hold after the run go to RECORD (FLEET_CAS_RECORD), which the cache budget counts."""
     root = FLEET_CAS_ROOT if root is None else root
     prune = Path(os.path.abspath(__file__)).with_name("glaeda-fleet-cas-prune") if prune is None else prune
     if not (root / "fleet-cas.env").is_file() or not prune.is_file():
         return 0
-    args = ["--apply", "--node-only"] if cap_gib is None else ["--apply", "--node-gib", f"{cap_gib:g}",
+    args = ["--apply", "--node-only"] if cap_gib is None else ["--apply", "--cap-only", "--node-gib", f"{cap_gib:g}",
                                                                "--local-cas-gib", f"{cap_gib:g}"]
     try:
         out = subprocess.run([sys.executable, os.fspath(prune), *args], capture_output=True,
@@ -13726,14 +13817,45 @@ def fleet_cas_node_cap(root: Path | None = None, prune: Path | None = None, cap_
         rec = json.loads(out.stdout.strip().splitlines()[-1]) if out.stdout.strip() else {}
     except (OSError, subprocess.SubprocessError, ValueError):
         return 0
+    if not isinstance(rec, dict):
+        return 0
+    local_gone = rec.get("local_cas") == "removed" and isinstance(rec.get("local_cas_bytes"), int)
     freed = 0
-    if rec.get("local_cas") == "removed" and isinstance(rec.get("local_cas_bytes"), int):
+    if local_gone:
         print(f"  fleet-cas local CAS: removed, {rec['local_cas_bytes'] / GIB:.1f} GiB")
         freed += rec["local_cas_bytes"]
+    node_freed = rec.get("node_store_freed_bytes")
     m = re.match(r"removed (\d+) oldest files, ([0-9.]+) GiB", str(rec.get("node_store") or ""))
     if m:
         print(f"  fleet-cas node store: {rec['node_store']}")
-        freed += int(float(m.group(2)) * GIB)
+        node_freed = node_freed if isinstance(node_freed, int) else int(float(m.group(2)) * GIB)
+        freed += node_freed
+    if isinstance(rec.get("node_store_bytes"), int):  # what both stores hold now, for the cache budget
+        held = max(0, rec["node_store_bytes"] - (node_freed if isinstance(node_freed, int) else 0))
+        if isinstance(rec.get("local_cas_bytes"), int) and not local_gone:
+            held += rec["local_cas_bytes"]
+        with contextlib.suppress(OSError):
+            path = FLEET_CAS_RECORD if record is None else record
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(f".{os.getpid()}.tmp")
+            tmp.write_text(json.dumps({"at": time.time(), "dev": root.stat().st_dev, "bytes": held}))
+            os.replace(tmp, path)
+    return freed
+
+
+def fleet_cas_budget_cap(fss: "dict[int, Fs]", root: Path | None = None) -> int:
+    """Over the cache budget, cap both fleet-cas stores at FLEET_CAS_BUDGET_SHARE of their volume before the
+    eviction passes, and take what that freed off the volume's "over", so warm build state pays only the rest."""
+    root = FLEET_CAS_ROOT if root is None else root
+    try:
+        dev = root.stat().st_dev
+    except OSError:
+        return 0
+    if cache_budget_over(dev) <= 0 or dev not in fss:
+        return 0
+    RUN["fleet_cas_budget_cap"] = True
+    freed = fleet_cas_node_cap(root, cap_gib=max(2.0, round(fss[dev].total * FLEET_CAS_BUDGET_SHARE / GIB, 1)))
+    CACHE_BUDGET[dev]["over"] = max(0, CACHE_BUDGET[dev]["over"] - freed)
     return freed
 
 
@@ -13759,6 +13881,8 @@ def write_run_line(started: float, free_before: int | None) -> None:
            "out_of_band": RUN.get("out_of_band"), "evict_floor_wait": RUN.get("evict_floor_wait"),
            "measure_budget_reached": bool(RUN.get("measure_budget_reached")),
            "run_deadline_reached": bool(RUN.get("run_deadline_reached"))}
+    if RUN.get("cache_budget"):  # a budgeted pressure pass: used against budget per volume (cache_budget_rows)
+        row["cache_budget"] = RUN["cache_budget"]
     with contextlib.suppress(OSError):
         RUN_LOG.parent.mkdir(parents=True, exist_ok=True)
         with RUN_LOG.open("a") as f:

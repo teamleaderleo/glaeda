@@ -564,12 +564,25 @@ What `--apply` does:
      2026-10-21: jobs refused at 21 GiB free with 78 GiB there and nothing reclaimable).
      Over all of these sits one host **cache budget** (`cache_budget`, default `35%` of the volume): every
      build-cache family together (seeds, kept and parked builds, spm-scratch, admission roots, runner build
-     output, Xcode DerivedData, cmux-next-ci, hq's fleet cache, the fleet Xcode CAS), summed from the last
-     measured sizes. Over it the volume is under pressure whatever its free space; warm build state past 1 h
-     idle goes by value (space per rebuild minute, idle longest first) after everything already due, keeping
-     every in-use veto, until the caches are back under 90% of the budget. The run line's `cache_budget`
-     and the health summary's `cache_budget` rows show used against budget per volume and family (cmux13s,
-     2026-11-17: 58 of 460 GB free with every family inside its own window).
+     output, Xcode DerivedData, cmux-next-ci, hq's fleet cache, and the fleet Xcode CAS's node store and local
+     CAS, sized from `glaeda-fleet-cas-prune`'s report of its last run). Only a `--pressure` run applies it;
+     a report, `--json` or a plain `--apply` never does. Before its survey the run sizes the families from
+     the snapshot (paths deleted since are dropped): over the budget, the volume is under pressure whatever
+     its free space, and its warm families (admission roots, runner build output, Xcode DerivedData, journey
+     builds) are judged on a 1 h idle window. After the survey, the sizes it just took decide how much goes:
+     the fleet CAS is capped first (`--cap-only`, both stores at 2.5% of the volume; a missing object is
+     fetched again, never rebuilt), then warm build state past 1 h idle goes by value (space per rebuild
+     minute, idle longest first) after everything already due, keeping every in-use veto and fresh process
+     evidence per item, until the caches are back under 90% of the budget. The budget never shortens
+     cmux-job-cache's half-day minimum, a media host's warm tour slots, or the 12 h window of a canonical
+     root's admission DerivedData without its token file.
+     The caches also give back what keeps `cache_budget_free` (default `30%`) of the volume free, whichever
+     asks more, but only up to what the survey found reclaimable in those families: the rest of that
+     shortfall is no cache's to close, so it is reported (`free_short_left_gib`), and the next pass (within
+     6 h) counts only the shortfall beyond it, so a disk whose non-cache use alone is over 70% is not
+     forced into a pressure pass every time. The run line's `cache_budget` and the health summary's `cache_budget` rows show
+     used against budget per volume and family (cmux13s, 2026-11-17: 58 of 460 GB free with every family
+     inside its own window).
    - **Stopping.** After two idle polls in a row, and one fresh look right before the
      signal, the gate sends `SIGINT` to the runner's `Runner.Listener`. Under the disk
      floor the first idle poll is enough, ahead of any other hold, and while a job runs

@@ -10,6 +10,12 @@
     glaeda-fleet-cas-prune --apply --node-only
                                            only the node-store cap (glaeda-disk's pressure passes, which run
                                            before every job and under the runner floor)
+    glaeda-fleet-cas-prune --apply --cap-only --node-gib N --local-cas-gib N
+                                           only the two caps: the node store under N and a reader's local
+                                           CAS whole once over N, under the local CAS's own in-use rules; no
+                                           sweep, no fleet-store gc (glaeda-disk's pressure pass while the
+                                           volume's build caches are over their budget). When ps fails the
+                                           node cap still holds and the local CAS waits for the next pass.
 
 Two stores under /Users/Shared/cmux-build-fleet/xcode (docs/CMUX_BUILD_SLOT_MODES.md):
 
@@ -434,11 +440,16 @@ def main(argv: list[str] | None = None) -> int:
                     help="while builds run, the local CAS goes only if untouched this long (default %(default)s)")
     ap.add_argument("--node-only", action="store_true",
                     help="only the node-store cap: no local CAS, no sweep, no fleet-store gc")
+    ap.add_argument("--cap-only", action="store_true",
+                    help="only the node-store cap and the local CAS cap: no sweep, no fleet-store gc")
     ap.add_argument("--store-gc-only", action="store_true",
                     help="only the fleet-store gc, for a store host with a custom store root under /Volumes")
     ap.add_argument("--gc-keep-days", type=int, default=14,
                     help="on the store host: fleet-cas gc keeps entries used within this many days")
     a = ap.parse_args(argv)
+    if a.cap_only and (a.node_only or a.store_gc_only):
+        ap.error("--cap-only excludes --node-only and --store-gc-only")
+    caps = a.node_only or a.cap_only  # the caps alone: no sweep, no gc, and the node cap needs no build check
     rec: dict = {"at": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "apply": a.apply}
     if a.store_gc_only:
         # A dedicated store volume (glaeda-fleet-cas checks it is its own APFS volume under /Volumes) holds no mini
@@ -459,7 +470,7 @@ def main(argv: list[str] | None = None) -> int:
         rec["result"] = f"deferred: {held}"
         print(json.dumps(rec))
         return 0
-    if a.apply and not a.node_only:
+    if a.apply and not caps:
         rec.update(store_gc(ROOT, a.gc_keep_days))
     if not (ROOT / "fleet-cas.env").exists():
         rec["result"] = "no fleet-cas on this host"
@@ -468,18 +479,20 @@ def main(argv: list[str] | None = None) -> int:
     writer = is_writer(ROOT)
     rec["role"] = "writer" if writer else "reader"
     commands = running_commands()
-    if commands is None and not a.node_only:
+    if commands is None and not caps:
         rec["result"] = "deferred: ps failed, cannot rule out a running build"
         print(json.dumps(rec))
         return 0
-    building = busy(commands) if commands is not None else "ps failed"  # --node-only: the cap needs no build check
-    if a.apply and not a.node_only:
+    building = busy(commands) if commands is not None else "ps failed"  # the caps: the node cap needs no build check
+    if a.apply and not caps:
         rec["swept_bytes"] = sweep(ROOT)
     # Measure and plan with no lock held: these walks are the slow part.
     local = ROOT / "cas"
-    local_bytes = tree_bytes(local) if local.is_dir() and not a.node_only else 0
+    # measured in every mode (--node-only too): glaeda-disk's cache budget counts both stores from this report
+    local_bytes = tree_bytes(local) if local.is_dir() else 0
     rec["local_cas_bytes"] = local_bytes
     drop_local = not writer and not a.node_only and local_bytes > a.local_cas_gib * GIB
+    ps_failed = drop_local and commands is None  # only --cap-only gets here without ps: the local CAS waits
     store = ROOT / "node-store"
     files = node_files(store) if store.is_dir() else []
     rec["node_store_bytes"] = sum(b for _, b, _ in files)
@@ -488,14 +501,15 @@ def main(argv: list[str] | None = None) -> int:
     doomed = plan_node(prunable, int(a.node_gib * GIB), total=rec["node_store_bytes"])
     rec["local_cas"] = ("not judged (--node-only)" if a.node_only
                         else "kept: the writer empties it before every writer build" if writer
+                        else "deferred: ps failed, cannot rule out a running build" if ps_failed
                         else ("would remove" if drop_local else "within budget"))
     rec["node_store"] = f"would remove {len(doomed)} oldest files, {sum(b for _, b, _ in doomed) / GIB:.1f} GiB"
     if not a.apply:
         rec["result"] = "ok"
         print(json.dumps(rec))
         return 0
+    freed = 0
     if doomed:  # the hard cap: no lock and no build check; a file a running build still wants is fetched again
-        freed = 0
         for _, b, p in doomed:
             try:
                 os.unlink(p)
@@ -503,8 +517,11 @@ def main(argv: list[str] | None = None) -> int:
             except FileNotFoundError:
                 pass
         rec["node_store"] = f"removed {len(doomed)} oldest files, {freed / GIB:.1f} GiB"
+    rec["node_store_freed_bytes"] = freed
     renamed, rec["result"] = None, "ok"
-    if drop_local:
+    if ps_failed:
+        rec["result"] = rec["local_cas"]
+    elif drop_local:
         rec["local_cas"], renamed = drop_local_cas(local, building, a.local_cas_quiet_min * 60)
         if rec["local_cas"] != "removed":
             rec["result"] = rec["local_cas"]
