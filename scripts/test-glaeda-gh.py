@@ -17491,7 +17491,6 @@ class LandForwardTest(Base):
             with mock.patch.object(gg, "land_config", return_value={"mergeHold": self.w.mh}), \
                     mock.patch.object(gg, "daemon_running", return_value=True), \
                     mock.patch.object(gg, "policy_host", return_value="big-exec"), \
-                    mock.patch.object(gg, "LAND_SERVE_WAIT", 0.0), \
                     contextlib.redirect_stdout(io.StringIO()) as out:
                 gg.cmd_land_serve(json.dumps(request))
         finally:
@@ -17649,6 +17648,97 @@ class LandForwardTest(Base):
                 self.assertEqual(gg.cmd_land_serve(line), gg.EXIT_FAIL)
             self.assertEqual(json.loads(out.getvalue())["code"], code)
 
+
+    def test_a_remote_wait_that_ends_with_the_land_still_going_is_a_timeout(self):
+        """Review F1: `land --wait N` forwarded, the executor answering "requested" with no entry, exited 0."""
+        answer = {"ok": True, "state": "requested", "entry": None, "requester": "cosmic/coord", "key": self.KEY}
+        with mock.patch.object(gg, "land_forward", return_value=answer), \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(gg.cmd_land_forwarded(list(self.EXEC), "o/r#1", [], "cosmic/coord", "", 5, False),
+                             gg.EXIT_TIMEOUT)
+            self.assertEqual(gg.cmd_land_forwarded(list(self.EXEC), "o/r#1", [], "cosmic/coord", "", 0, False),
+                             gg.EXIT_OK)
+
+    def test_serve_with_no_wait_answers_at_once(self):
+        """Review F1: `land serve` with --wait 0 waited a forced 10 s for the executor's daemon to pick it up."""
+        began = time.monotonic()
+        doc = self.executor_serve({"op": "land", "target": "o/r#1", "requester": "cosmic/coord", "id": "x-1",
+                                   "wait": 0})
+        self.assertLess(time.monotonic() - began, 2.0)
+        self.assertEqual((doc["ok"], doc["state"]), (True, "requested"))
+
+    def test_a_request_the_executor_refuses_is_kept_here_and_said(self):
+        """Review F2: a batch item land_serve_one refused was answered "accepted", so the outbox file was deleted."""
+        self.q = self.forwarding()
+        gg.land_request("land", "o/r#1", [], "cosmic/bad requester")  # a --notify with a space in it
+        gg.land_request("land", "o/r#3", [], "cosmic/coord")
+        self.tick()
+        refused = self.sent_batches[0]["requests"][0]["id"]
+        left = list(gg.LandQueue.requests_dir().iterdir())
+        self.assertEqual([p.suffix for p in left], [".refused"])
+        self.assertEqual(gg.read_json(left[0])["requester"], "cosmic/bad requester")
+        self.assertEqual(self.w.notices[-1][0], "land-forward-refused")
+        self.assertIn(refused, self.w.notices[-1][2])
+        self.tick(60)
+        self.assertEqual(len(self.sent_batches), 1)  # never sent again
+        self.assertEqual(len(list((self.exec_base / "land" / "requests").glob("*.json"))), 1)  # o/r#3 alone
+
+    def test_a_handoff_the_executor_refuses_stops_the_entry_here(self):
+        self.pr(LA, checks=[("ci", "IN_PROGRESS", None)])
+        self.land(requester="cosmic/bad requester")
+        self.tick()
+        self.q = self.forwarding()
+        self.tick()
+        e = self.q.entries[self.KEY]
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "forward_refused"))
+        self.tick(60)
+        self.assertEqual(len(self.sent_batches), 1)
+
+    def test_a_crash_during_the_forward_keeps_the_land_and_the_cancel(self):
+        """Review F3: a direct land or cancel was written to requests/ only after the forward failed, so a crash or a
+        kill during the subprocess call lost it."""
+        self.w.config["executor"] = list(self.EXEC)
+        with mock.patch.object(gg, "land_config", return_value=self.w.config), \
+                mock.patch.object(gg, "land_forward", side_effect=LandCrash("killed mid-forward")), \
+                mock.patch.object(gg, "policy_host", return_value="cosmic"), \
+                contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(LandCrash):
+                gg.main(["land", "o/r#1", "--notify", "cosmic/coord"])
+            got = [gg.read_json(p) for p in sorted(gg.LandQueue.requests_dir().glob("*.json"))]
+            self.assertEqual([(r["op"], r["target"]) for r in got], [("land", "o/r#1")])
+            for p in gg.LandQueue.requests_dir().glob("*.json"):
+                p.unlink()
+            with self.assertRaises(LandCrash):
+                gg.main(["land", "cancel", "o/r#1"])
+            got = [gg.read_json(p) for p in sorted(gg.LandQueue.requests_dir().glob("*.json"))]
+            self.assertEqual([r["op"] for r in got], [gg.LAND_WITHDRAW])
+        # The daemon forwards what was staged: the cancel reaches the executor.
+        self.q = self.forwarding()
+        self.tick()
+        self.assertEqual([r["op"] for r in self.sent_batches[0]["requests"]], [gg.LAND_WITHDRAW])
+        self.assertEqual(list(gg.LandQueue.requests_dir().glob("*.json")), [])
+
+    def test_a_direct_forward_that_succeeds_leaves_nothing_staged(self):
+        self.w.config["executor"] = list(self.EXEC)
+        fwd = lambda cmd, req, deadline=gg.LAND_FORWARD_DEADLINE, run=None: self.executor_serve(req)  # noqa: E731
+        with mock.patch.object(gg, "land_config", return_value=self.w.config), \
+                mock.patch.object(gg, "land_forward", side_effect=fwd), \
+                mock.patch.object(gg, "policy_host", return_value="cosmic"), \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(gg.main(["land", "o/r#1", "--notify", "cosmic/coord"]), 0)
+            self.assertEqual(gg.main(["land", "cancel", "o/r#1"]), 0)
+        self.assertEqual(list(gg.LandQueue.requests_dir().glob("*.json")), [])
+        self.assertEqual(len(list((self.exec_base / "land" / "requests").glob("*.json"))), 2)
+
+    def test_benchmark_json_is_one_document(self):
+        """Review F4: `benchmark-land-forward.py --json` printed the queue's land-forwarded log line before the JSON."""
+        done = subprocess.run([sys.executable, "-I", os.fspath(ROOT / "scripts" / "benchmark-land-forward.py"),
+                               "--prs", "2", "--classifier-cpu", "0", "--json"], capture_output=True, text=True,
+                              timeout=120)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        doc = json.loads(done.stdout)
+        self.assertEqual([(r["mode"], r["requestsLeftHere"]) for r in doc], [("old", 0), ("new", 0)])
+        self.assertEqual((doc[0]["entries"], doc[1]["processes"]), ({"merged": 2}, 1))
     def test_land_forward_reads_the_last_line_and_names_a_refusal(self):
         def run(argv, deadline, input_text=None):
             return subprocess.CompletedProcess(argv, 0, 'noise\n{"ok": true, "accepted": ["1"]}\n', "")

@@ -14,6 +14,7 @@ does from this host's side. Every fake program logs one line when it starts, and
 from __future__ import annotations
 
 import argparse
+import contextlib
 import importlib.machinery
 import importlib.util
 import json
@@ -70,7 +71,7 @@ def load() -> object:
     return gg
 
 
-def run(gg: object, mode: str, prs: int, tmp: Path) -> dict:
+def run(gg: object, mode: str, prs: int, tmp: Path, cpu: float = CLASSIFIER_CPU) -> dict:
     gg.BASE = tmp / mode / "gh"
     log = tmp / mode / "spawned.log"
     bin_dir = tmp / mode / "bin"
@@ -84,7 +85,7 @@ def run(gg: object, mode: str, prs: int, tmp: Path) -> dict:
     exe.write_text(EXECUTOR)
     os.environ["BENCH_LOG"] = os.fspath(log)  # the forward runs with this process's environment
     config = {"gh": os.fspath(gh), "mergeHold": os.fspath(mh), "python": sys.executable, "acpmux": "/bin/true",
-              "env": {"BENCH_LOG": os.fspath(log), "BENCH_CPU": str(CLASSIFIER_CPU)}}
+              "env": {"BENCH_LOG": os.fspath(log), "BENCH_CPU": str(cpu)}}
     if mode == "new":
         config["executor"] = [sys.executable, os.fspath(exe)]
     now = time.time()
@@ -117,12 +118,16 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--prs", type=int, default=7)
     ap.add_argument("--json", action="store_true")
+    ap.add_argument("--classifier-cpu", type=float, default=CLASSIFIER_CPU, metavar="S",
+                    help="CPU seconds each fake classifier burns")
     args = ap.parse_args()
     gg = load()
     with tempfile.TemporaryDirectory(prefix="bench-land-forward-") as tmp:
         os.environ["GH_QUOTA_STATE"] = os.fspath(Path(tmp) / "gh-quota")
         gg.LAND_MERGE_HOLD_PATHS = ()
-        results = [run(gg, mode, args.prs, Path(tmp)) for mode in ("old", "new")]
+        # The queue logs JSON event lines to stdout: kept off it, so --json prints one JSON document alone.
+        with contextlib.redirect_stdout(sys.stderr):
+            results = [run(gg, mode, args.prs, Path(tmp), args.classifier_cpu) for mode in ("old", "new")]
     if args.json:
         print(json.dumps(results, sort_keys=True))
         return 0
