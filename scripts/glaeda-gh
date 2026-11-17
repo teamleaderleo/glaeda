@@ -13790,7 +13790,7 @@ GH_CACHE_WRITE_BOOL_FLAGS = {
 #
 # Agent sessions type `gh pr view` by hand -- with a number, a branch, or no target at all (the checked-out branch's
 # PR), with and without `--json` -- and keep typing it while they wait: on 2026-11-17 15:30-17:30Z the gh-quota logs on
-# cosmic-gray, huge-blue, big-red and air-blue held 140 such charged reads (70 an hour), many minutes apart, past
+# four agent hosts held 140 such charged reads (70 an hour), many minutes apart, past
 # GH_CACHE_TTL. Each reads the same answer as the one before whenever the PR has not changed, and GitHub moves a PR's
 # updatedAt on every push, comment, review, label, title or body edit, state change and review request: everything
 # plain `pr view` prints except its `projects:` line and, unproven, its `auto-merge:` line. Replaying those 140 calls
