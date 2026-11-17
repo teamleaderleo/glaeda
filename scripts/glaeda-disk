@@ -4288,7 +4288,7 @@ def default_families(role: str = "fleet-mini") -> list[Family]:
         # and the tag links to them, at any depth, so a nested ghcr path is never cut above or below its image), and
         # its last use is Tart's own access date on its digest directories (tart_last_use): `tart clone` leaves every
         # mtime alone, so an image cloned daily would read as idle by mtime and be pulled again, tens of GiB each time.
-        # Where Tart is installed the window is TART_IDLE_HOURS (a week; APFS moves atime lazily), where it is not
+        # Where Tart is installed the window is TART_IDLE_HOURS (two days; APFS moves atime lazily), where it is not
         # DEFAULT_AGE_HOURS (tart_idle_hours). A root that is a symlink or resolves outside HOME is never walked.
         Family(TART_IMAGES, HOME / ".tart/cache/OCIs", True, "the next tart clone or pull downloads it again",
                owner="Tart (tart pull)", rebuild_minutes=20, min_idle_hours=tart_idle_hours(), platform="macos"),
@@ -8557,10 +8557,15 @@ TART_IMAGES, TART_IPSWS = "tart-images", "tart-ipsws"
 # 32 GiB of them, ubase and vm0-vm5, stopped since 2026-10-19 and claimed by nobody (hq#11127), and no family listed
 # them. A stopped VM nothing touched for TART_VM_IDLE_HOURS goes: Tart's run lock, a tart command naming it, a fleet
 # lease naming its path or a .glaeda-keep.json claim in it keeps it.
+# Two days, not two weeks (Leo, 2026-11-17: "man all these disks should be able to just be a lot more cleared up than
+# they are"): nine minis measured that day held 236 GiB of Tart VMs, 140 GiB of them stopped and judged "recent"
+# (aside-golden and aside-1 on cmux11s, 86 GiB, idle 78 h), and 53 GiB of pulled images, while glaeda-disk found
+# 16.5 GiB reclaimable in 2.9 TiB used. A VM someone means to keep carries a .glaeda-keep.json claim.
 TART_VMS = "tart-vms"
-TART_VM_IDLE_HOURS = 14 * 24.0
+TART_VM_IDLE_HOURS = 2 * 24.0
 TART_FAMILIES = frozenset({TART_IMAGES, TART_IPSWS, TART_VMS})
-TART_IDLE_HOURS = 7 * 24.0  # a week past Tart's last access; APFS updates atime lazily
+# Two days past Tart's last access: APFS moves atime at most once a day, so an image cloned daily still reads in use.
+TART_IDLE_HOURS = 2 * 24.0
 TART_DIGEST_PREFIX = "sha256:"
 TART_SEARCH_DEPTH = 8  # registry/namespace.../image below OCIs; a deeper tree is not Tart's
 TART_BINARIES = ("/opt/homebrew/bin/tart", "/usr/local/bin/tart")
@@ -8675,7 +8680,7 @@ def tart_installed() -> bool:
 
 
 def tart_idle_hours() -> float:
-    """The idle window of Tart's cache: TART_IDLE_HOURS where Tart is installed (a weekly clone keeps its image even
+    """The idle window of Tart's cache: TART_IDLE_HOURS where Tart is installed (a daily clone keeps its image even
     when APFS moved the access date late), DEFAULT_AGE_HOURS where it is not, since nothing on the host reads it."""
     return TART_IDLE_HOURS if tart_installed() else DEFAULT_AGE_HOURS
 

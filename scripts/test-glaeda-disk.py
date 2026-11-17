@@ -1932,8 +1932,8 @@ class GlaedaDiskTest(unittest.TestCase):
             self.assertTrue(images.reclaimable and ipsws.reclaimable)
             with mock.patch.object(gd, "tart_installed", return_value=True):
                 fams_tart = {f.id: f for f in gd.default_families()}
-            self.assertEqual(fams_tart["tart-images"].min_idle_hours, 7 * 24.0)
-            self.assertEqual(fams_tart["tart-ipsws"].min_idle_hours, 7 * 24.0)
+            self.assertEqual(fams_tart["tart-images"].min_idle_hours, 2 * 24.0)
+            self.assertEqual(fams_tart["tart-ipsws"].min_idle_hours, 2 * 24.0)
             self.assertEqual(sorted(p.name for p in gd.candidates(images)),
                              ["macos-sequoia-vanilla", "macos-sonoma-vanilla"], "one image at a time, never ~/.tart/vms")
             self.assertEqual([p.name for p in gd.candidates(ipsws)], ["UniversalMac.ipsw"])
@@ -12440,9 +12440,10 @@ class DeadItemsTest(unittest.TestCase):
     def tart_family(self) -> gd.Family:
         return next(f for f in gd.default_families() if f.id == gd.TART_VMS)
 
-    def test_a_stopped_unclaimed_tart_vm_two_weeks_untouched_goes(self) -> None:
+    def test_a_stopped_unclaimed_tart_vm_two_days_untouched_goes(self) -> None:
         old = self.tart_vm("vm0", 26)  # cmux23: ubase and vm0-vm5, stopped since 2026-10-19
-        recent = self.tart_vm("vm1", 5)
+        aside = self.tart_vm("aside-1", 78 / 24)  # cmux11s, 2026-11-17: idle 78 h and judged "recent" at 14 days
+        recent = self.tart_vm("vm1", 1)
         claimed = self.tart_vm("vm2", 26)
         (claimed / gd.ROLE_KEEP_MARKER).write_text("{}")
         named = self.tart_vm("vm3", 26)
@@ -12461,6 +12462,7 @@ class DeadItemsTest(unittest.TestCase):
         with mock.patch.object(gd, "process_evidence", return_value=([], "/opt/homebrew/bin/tart run vm3 --no-graphics\n")):
             items = {Path(i.path).name: i for i in gd.survey([fam], 12, 0)}
         self.assertEqual(items["vm0"].verdict, "reclaimable", items["vm0"].reasons)
+        self.assertEqual(items["aside-1"].verdict, "reclaimable", items["aside-1"].reasons)
         self.assertEqual(items["vm1"].verdict, "recent")
         self.assertEqual(items["vm2"].verdict, "kept")
         self.assertEqual(items["vm3"].verdict, "in-use")
@@ -12469,8 +12471,9 @@ class DeadItemsTest(unittest.TestCase):
         receipt = self.root / "receipt.jsonl"
         with contextlib.redirect_stdout(io.StringIO()), mock.patch.object(gd, "process_evidence",
                                                                           return_value=([], "")):
-            gd.apply([items["vm0"], items["vm4"]], {fam.id: fam}, receipt, None, 12)
+            gd.apply([items["vm0"], items["aside-1"], items["vm4"]], {fam.id: fam}, receipt, None, 12)
         self.assertFalse(old.exists())
+        self.assertFalse(aside.exists())
         self.assertTrue(locked.exists(), "the run lock is read again right before the delete")
         for vm in (recent, claimed, named):
             self.assertTrue(vm.exists())
