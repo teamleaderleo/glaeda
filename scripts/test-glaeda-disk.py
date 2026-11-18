@@ -12911,6 +12911,78 @@ class DeadItemsTest(unittest.TestCase):
         for vm in (recent, golden, claimed, named):
             self.assertTrue(vm.exists())
 
+    def lima_vm(self, name: str, days: float) -> Path:
+        vm = self.home / ".lima" / name
+        vm.mkdir(parents=True)
+        (vm / "lima.yaml").write_text("vmType: vz\n")
+        (vm / "diffdisk").write_bytes(b"\0" * 4096)
+        (vm / "basedisk").write_bytes(b"\0" * 4096)
+        self.age(vm, days * 24)
+        return vm
+
+    def lima_family(self) -> gd.Family:
+        return next(f for f in gd.default_families() if f.id == gd.LIMA_VMS)
+
+    def test_a_stopped_unclaimed_lima_vm_two_days_untouched_goes(self) -> None:
+        """ai.manaflow.cmux-linux-vm's slots (<host>-lvm-<k>) and their base under ~/.lima: a claim, a live
+        hostagent or a limactl command naming one keeps it; a stopped unclaimed one idle past the VM window goes."""
+        old = self.lima_vm("cmux-old-lvm-9", 26)
+        recent = self.lima_vm("cmux21-lvm-1", 1)
+        claimed = self.lima_vm("cmux-linux-bake", 26)
+        (claimed / gd.ROLE_KEEP_MARKER).write_text('{"owner": "ai.manaflow.cmux-linux-vm", "why": "base"}')
+        running = self.lima_vm("cmux21-lvm-0", 26)
+        (running / "ha.pid").write_text(f"{os.getpid()}\n")
+        self.age(running, 26 * 24)
+        named = self.lima_vm("cmux21-lvm-2", 26)
+        stale = self.lima_vm("cmux21-lvm-3", 26)  # a hostagent that crashed left its pid file
+        dead = subprocess.Popen([sys.executable, "-I", "-c", ""])
+        dead.wait()
+        (stale / "ha.pid").write_text(f"{dead.pid}\n")
+        self.age(stale, 26 * 24)
+        for internal in ("_config", "_disks", "_networks", ".hidden"):
+            (self.home / ".lima" / internal).mkdir()
+            self.age(self.home / ".lima" / internal, 26 * 24)
+        fam = self.lima_family()
+        self.assertEqual({p.name for p in gd.candidates(fam)},
+                         {"cmux-old-lvm-9", "cmux21-lvm-1", "cmux-linux-bake", "cmux21-lvm-0", "cmux21-lvm-2",
+                          "cmux21-lvm-3"}, "Lima's own _config, _disks, _networks and dot entries are never items")
+        cmds = "/opt/homebrew/bin/limactl start cmux21-lvm-2 --tty=false\n"
+        with mock.patch.object(gd, "process_evidence", return_value=([], cmds)):
+            items = {Path(i.path).name: i for i in gd.survey([fam], 12, 0)}
+        self.assertEqual(items["cmux-old-lvm-9"].verdict, "reclaimable", items["cmux-old-lvm-9"].reasons)
+        self.assertEqual(items["cmux21-lvm-3"].verdict, "reclaimable", items["cmux21-lvm-3"].reasons)
+        self.assertEqual(items["cmux21-lvm-1"].verdict, "recent")
+        self.assertEqual(items["cmux-linux-bake"].verdict, "kept")
+        self.assertEqual(items["cmux21-lvm-0"].verdict, "in-use")
+        self.assertIn(f"Lima runs it (hostagent pid {os.getpid()} in ha.pid is live)", items["cmux21-lvm-0"].reasons)
+        self.assertEqual(items["cmux21-lvm-2"].verdict, "in-use")
+        self.assertIn(gd.LIMA_VMS, gd.dead_family_ids())
+        receipt = self.root / "receipt.jsonl"
+        with contextlib.redirect_stdout(io.StringIO()), mock.patch.object(gd, "process_evidence",
+                                                                          return_value=([], "")):
+            gd.apply([items["cmux-old-lvm-9"], items["cmux21-lvm-3"], items["cmux21-lvm-0"]], {fam.id: fam},
+                     receipt, None, 12)
+        self.assertFalse(old.exists())
+        self.assertFalse(stale.exists())
+        self.assertTrue(running.exists(), "the hostagent's pid is read again right before the delete")
+        for vm in (recent, claimed, named):
+            self.assertTrue(vm.exists())
+
+    def test_a_symlinked_or_out_of_home_lima_root_is_never_walked(self) -> None:
+        store = self.root / "elsewhere"
+        (store / "slot-0").mkdir(parents=True)
+        self.age(store, 26 * 24)
+        (self.home / ".lima").symlink_to(store)
+        fam = self.lima_family()
+        self.assertEqual(gd.candidates(fam), [])
+        (store / f"{gd.DELETING_PREFIX}x-1").mkdir()
+        self.assertEqual(gd.interrupted_families([fam]), [], "no aside tree is finished through a symlinked ~/.lima")
+        (self.home / ".lima").unlink()
+        (self.home / ".lima").mkdir()
+        (self.home / ".lima/slot-1").symlink_to(store / "slot-0")
+        self.assertEqual(gd.candidates(fam), [], "an instance that is a symlink is never followed")
+        self.assertTrue((store / "slot-0").exists())
+
     def test_journey_cache_entries_unused_for_days_go(self) -> None:
         cache = self.home / gd.JOURNEY_CACHE
         old = cache / "builds/23ee510cbc3ac7c7a8eb22ad"

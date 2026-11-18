@@ -4574,6 +4574,10 @@ def default_families(role: str = "fleet-mini") -> list[Family]:
         Family(TART_VMS, HOME / ".tart/vms", True, "a stopped VM nobody claims: the next tart clone makes it again",
                owner="Tart (tart clone, tart create)", rebuild_minutes=30, min_idle_hours=TART_VM_IDLE_HOURS,
                reference_root=FLEET_ROOT, platform="macos"),
+        # Lima instances (LIMA_VMS: ~/.lima/<name>, the Linux worker VMs and their base), judged like Tart VMs.
+        Family(LIMA_VMS, HOME / ".lima", True, "a stopped VM nobody claims: the next limactl clone makes it again",
+               skip=LIMA_SKIP, skip_prefixes=(".",), owner="Lima (limactl create, limactl clone)",
+               rebuild_minutes=30, min_idle_hours=TART_VM_IDLE_HOURS, reference_root=FLEET_ROOT, platform="macos"),
         # cmux's journey harness keeps a build per job and its fetch scratch here (scripts/journeys/build_cache.py,
         # ~/.cache/cmux-journeys/{builds,fetch}/<entry>). As one ~/.cache item it read "unchecked" (an app bundle is too
         # deep for the git search) and stayed forever: 7 GiB on cmux21, 4.6 GiB on cmux22 (2026-11-15). An entry is
@@ -5368,8 +5372,8 @@ JOURNEY_IDLE_HOURS = 3 * 24.0
 
 # --dead: reclaim only what nothing can still use, whatever the free space and whether a job runs. These families'
 # items are dead by their own evidence, never by age alone or a quiet host: ended steps' checkouts (only those, in
-# tmp and user-tmp), stopped Tart VMs and images nobody claims, home folders whose owner service retired (only those,
-# in home-scratch), the journey cache's long-unused entries, and the aside trees of an interrupted deletion. Every
+# tmp and user-tmp), stopped Tart and Lima VMs and Tart images nobody claims, home folders whose owner service
+# retired (only those, in home-scratch), the journey cache's long-unused entries, and the aside trees of an interrupted deletion. Every
 # per-item check still holds (an open file, a running command, a socket, a lease). Anything a live job might touch
 # (its workspace, $TMPDIR scratch by age, the warm build stores) stays with the pressure and idle passes.
 DEAD_MODE = False
@@ -5377,7 +5381,7 @@ DEAD_MODE = False
 
 def dead_family_ids() -> frozenset[str]:
     return frozenset({*STEP_CHECKOUT_FAMILIES, HOME_SCRATCH_FAMILY, TART_IMAGES, TART_IPSWS, TART_VMS,
-                      *(f"journey-{sub}" for sub in JOURNEY_SUBDIRS), INTERRUPTED})
+                      LIMA_VMS, *(f"journey-{sub}" for sub in JOURNEY_SUBDIRS), INTERRUPTED})
 
 
 def dead_item(fam: Family, path: Path) -> bool:
@@ -5421,9 +5425,9 @@ def item_mtime(fam: Family, path: Path) -> float:
     # git-loss check before deletion.
     skip_names = frozenset(VCS_MARKERS) if (fam.id == "tmp" or RUNNER_CACHE_PROFILE) else frozenset()
     # Tart's access date first, and a walk that never lists a digest directory, which would move that date
-    tart = (tart_vm_last_use(path) if fam.id == TART_VMS else tart_last_use(path) if fam.id in TART_FAMILIES
-            else 0.0)
-    newest = newest_mtime(path, 1 if fam.id in TART_FAMILIES else 2 if fam.reclaimable else 1,
+    tart = (tart_vm_last_use(path) if fam.id in (TART_VMS, LIMA_VMS) else tart_last_use(path)
+            if fam.id in TART_FAMILIES else 0.0)
+    newest = newest_mtime(path, 1 if fam.id in ROOT_SAFE_FAMILIES else 2 if fam.reclaimable else 1,
                           3000 if fam.reclaimable else 300, access=fam.discover, skip_names=skip_names)
     if fam.id == SPM_SCRATCH:
         with contextlib.suppress(OSError):
@@ -6248,6 +6252,7 @@ OUT_OF_BAND_FAMILY_IDS = frozenset({
     "cua-cache",
     "cmux-ghosttykit-cache",
     "tart-vms",            # TART_VMS: a stopped VM: Tart's run lock and a tart command naming it still keep one in use
+    "lima-vms",            # LIMA_VMS: a stopped VM: a live hostagent and a limactl command naming it still keep one
     *(f"journey-{sub}" for sub in JOURNEY_SUBDIRS),  # journey rounds are no CI job; a running app still keeps its build
     INTERRUPTED,           # aside trees a killed deletion left; its own owner check still applies
 })
@@ -6305,7 +6310,7 @@ def interrupted_families(fams: list[Family]) -> list[Family]:
     for fam in fams:
         if not fam.reclaimable or fam.id == INTERRUPTED:
             continue
-        if fam.id in TART_FAMILIES and not tart_root_safe(fam.root):
+        if fam.id in ROOT_SAFE_FAMILIES and not tart_root_safe(fam.root):
             continue  # a symlinked or out-of-HOME Tart store is someone else's, its aside trees too (#1813)
         dirs = {fam.root}
         if fam.id == CMUX_NEXT_CI_FAMILY:  # a whole state set aside leaves no candidate where it sat
@@ -6697,7 +6702,7 @@ def keep_verdict(fam: "Family", path: Path) -> str:
         return rustup_verdict(path)
     if fam.checkout_builds and path.parent.name == "cache" and path.parent.parent.name == "apple-build":
         return apple_build_verdict(path)
-    if fam.id == TART_VMS and os.path.lexists(path / ROLE_KEEP_MARKER):
+    if fam.id in (TART_VMS, LIMA_VMS) and os.path.lexists(path / ROLE_KEEP_MARKER):
         return f"claimed ({ROLE_KEEP_MARKER} in it)"
     return ""
 
@@ -9006,7 +9011,7 @@ def tart_seen(fam: Family, items: list[Path]) -> None:
     if fam.id == TART_IMAGES:
         for item in items:
             tart_last_use(item)
-    elif fam.id == TART_VMS:
+    elif fam.id in (TART_VMS, LIMA_VMS):
         for item in items:
             tart_vm_last_use(item)
 
@@ -9066,8 +9071,59 @@ def tart_vm_held(path: Path, cmds: str) -> str:
     return ""
 
 
+# Lima instances (`limactl create|clone`: ~/.lima/<name>, Lima's default LIMA_HOME, each a Linux disk). The Linux
+# worker VMs on fleet Macs (manaflow-ai/cmuxterm-hq build-fleet/mini-ops/linux-vm: ai.manaflow.cmux-linux-vm's slots
+# <host>-lvm-<k>, cloned from the stopped base cmux-linux-bake) live here, and no family listed them (Leo, 2026-11-17:
+# "and you guys haven't even set up linux vms on any of them... glaeda many months ago the whole point was to have
+# that"). Like a Tart VM, a stopped instance nothing touched for TART_VM_IDLE_HOURS goes: a running hostagent (its
+# ha.pid names a live process), a limactl command naming it, an open file, a fleet lease naming its path or a
+# .glaeda-keep.json claim in it (the supervisor writes one into each slot and the base) keeps it. Lima's own _config,
+# _disks and _networks and dot entries are never items, and a ~/.lima that is a symlink or resolves outside HOME is
+# never walked (tart_root_safe).
+LIMA_VMS = "lima-vms"
+LIMA_SKIP = ("_config", "_disks", "_networks")
+LIMA_VM_RUN = re.compile(r"(?:^|/)(?:limactl|lima)\s")
+ROOT_SAFE_FAMILIES = TART_FAMILIES | {LIMA_VMS}  # walked only when tart_root_safe(root)
+
+
+def lima_vm_held(path: Path, cmds: str) -> str:
+    """Why a Lima instance is in use, or "": its hostagent's ha.pid names a live process (Lima removes the file when
+    the instance stops; a stale one whose pid was reused keeps the instance, which only errs toward keeping), or a
+    running limactl or lima command names it. An unreadable or malformed ha.pid counts as held."""
+    try:
+        fd = os.open(path / "ha.pid", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        fd = None
+    except OSError:
+        return "its ha.pid is unreadable"
+    if fd is not None:
+        try:
+            raw = os.read(fd, 64)
+        except OSError:
+            return "its ha.pid is unreadable"
+        finally:
+            os.close(fd)
+        try:
+            pid = int(raw.decode("ascii", "replace").strip())
+        except ValueError:
+            return "its ha.pid is malformed"
+        if pid <= 0:
+            return "its ha.pid is malformed"
+        try:
+            os.kill(pid, 0)
+            return f"Lima runs it (hostagent pid {pid} in ha.pid is live)"
+        except PermissionError:
+            return f"Lima runs it (hostagent pid {pid} in ha.pid is live)"
+        except OSError:
+            pass  # a pid file the hostagent left on a crash: nothing runs it
+    for line in cmds.splitlines():
+        if LIMA_VM_RUN.search(line) and re.search(r"(?:^|\s)" + re.escape(path.name) + r"(?:\s|$)", line):
+            return f"a running limactl command names it ({line.strip()[:120]})"
+    return ""
+
+
 def candidates(fam: Family) -> list[Path]:
-    if fam.id in TART_FAMILIES and not tart_root_safe(fam.root):
+    if fam.id in ROOT_SAFE_FAMILIES and not tart_root_safe(fam.root):
         return []
     if fam.id == TART_IMAGES:
         level = tart_image_dirs(fam.root)
@@ -9569,6 +9625,8 @@ def _survey(families, idle_hours, min_bytes, known, evidence, defer_bulk=False,
         if fam.id == SPM_SCRATCH and spm_scratch_held(path):
             reasons.append("a job holds its lock (owned_spm_scratch.py)")
         if fam.id == TART_VMS and not blind and (why := tart_vm_held(path, cmds)):
+            reasons.append(why)
+        if fam.id == LIMA_VMS and not blind and (why := lima_vm_held(path, cmds)):
             reasons.append(why)
         if media_tour_dd(fam, path) and media_tour_tag_held(path):
             reasons.append("a media tour holds its slot's tag lock (media_tag_lock.py)")
@@ -11572,6 +11630,7 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
                 or (fam.id == NIGHTLY_NEXT_FAMILY and nightly_next_runner_busy(p, cmds))
                 or (fam.app_clones and app_clone_running(p, cmds))
                 or (fam.id == TART_VMS and tart_vm_held(p, cmds))
+                or (fam.id == LIMA_VMS and lima_vm_held(p, cmds))
                 or in_cwd(i.path, cwds) or named_by(i.path, cmds) or holds_socket(p) or job_busy(fam, p)
                 or (fam.reference_root is not None
                     and artifact_referenced(p, fresh_artifact_references(fam.reference_root)))
