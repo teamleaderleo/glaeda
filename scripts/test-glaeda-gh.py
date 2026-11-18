@@ -20481,6 +20481,164 @@ class LandTest(Base):
         self.assertIn("head_unpinned", [h.get("event") for h in e["history"]])
         self.assert_merged_at(LB)
 
+    # -- due rows starved by the login's latch (huge-blue, 2026-11-18 17:18-19:53Z)
+
+    def stuck(self, n: int, wake_ago: float, judged_ago: float | None = None, kind: str = "retry",
+              seen: str | None = None, state: str = "waiting", after: list[str] | None = None) -> str:
+        """An open entry as huge-blue held them: KIND waiting, its wake WAKE_AGO s past (negative: ahead), judged
+        JUDGED_AGO s ago ("judged code=unreadable step=retry" a minute before the wake)."""
+        key = f"pr:o/r#{n}"
+        head = f"{n:x}".rjust(40, "a")
+        self.w.set_pr(key, land_pr(head), self.t - 600)
+        e = {"key": key, "repo": "o/r", "number": n, "created": self.t - 90000, "history": [], "mergeSha": "",
+             "reviewed": [], "state": state, "wait": {"kind": kind, "sha": head} if state == "waiting" else None,
+             "wakeAt": self.t - wake_ago if state == "waiting" else None, "head": head, "seenHead": head,
+             "seen": seen if seen is not None else gg.land_fingerprint(self.w.cache[key]),
+             "explain": {"at": self.t - (judged_ago if judged_ago is not None else wake_ago + 60), "ok": False,
+                         "code": "unreadable", "head": head, "action": {"kind": kind}},
+             "requester": f"host/lane{n}", "requesterFrom": "", "queuedBy": "", "gen": 1, "after": after or []}
+        self.q.entries[key] = e
+        self.q.save(e)
+        return key
+
+    def retries(self, n: int) -> None:
+        for _ in range(n):
+            self.w.answers.append((3, {"ok": False, "code": "unreadable", "reason": "merge-hold: refused: unreadable",
+                                       "next": "", "action": {"v": 1, "kind": "retry", "after_s": 120}}))
+
+    def explained(self) -> list[str]:
+        return [c[4] for c in self.w.explains()]
+
+    def test_due_rows_go_oldest_wake_first_ahead_of_rows_judged_only_for_a_change(self):
+        """No latch at all. Due rows (retry, woke 2-4 h ago) are judged before an entry judged only because its cache
+        changed (a wait on its checks, its wake ahead, last judged 26 h ago), oldest wake first: sorted by the last
+        judgment, the 22 rows judged at 17:17 sat behind 300 others."""
+        self.stuck(11, 4 * 3600)
+        self.stuck(12, 2 * 3600)
+        self.stuck(13, 3 * 3600)
+        self.stuck(21, -3600, judged_ago=26 * 3600, kind="pr", seen="an older fingerprint")
+        self.retries(4)
+        self.tick()
+        self.assertEqual(self.explained(), ["11", "13", "12", "21"])
+
+    def test_due_rows_under_a_cycling_latch_say_so_and_go_first_at_its_clear(self):
+        """The replay: three rows waiting kind=retry, their wake 2-4 h past, and the login's latch holding, clearing for
+        a moment (each row still in the reset spread), holding again, then clearing. Each row's status names the
+        latch; at its second window its requester is told once, naming lw#5944; at the next clear it goes at once,
+        oldest wake first, with no reset spread."""
+        logs: list[dict] = []
+        patches = [mock.patch.object(gg, "land_jitter", lambda key, reset=0.0: 90.0),
+                   mock.patch.object(gg, "log", logs.append)]
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+        keys = [self.stuck(11, 4 * 3600), self.stuck(12, 2 * 3600), self.stuck(13, 3 * 3600)]
+        reset1 = self.t + 600
+        self.latch("graphql", reset1)
+        self.tick(30)
+        self.assertEqual(self.w.explains(), [])
+        for k in keys:
+            e = self.q.entries[k]
+            self.assertEqual(e["latchHeld"]["windows"], 1)
+            self.assertIn(f"held by the login latch until {time.strftime('%H:%MZ', time.gmtime(reset1))}",
+                          gg.land_line(e, self.t))
+            self.assertIn("woke ", gg.land_line(e, self.t))
+        pool = [r for r in logs if r.get("event") == "land-pool"][-1]
+        self.assertEqual((pool["latched"], pool["due"], pool["dueLatchHeld"]), (3, 3, 3))
+        self.assertEqual(pool["oldestDue"]["pr"], "o/r#11")
+        self.assertGreaterEqual(pool["oldestDue"]["waitingS"], 4 * 3600)
+        for _ in range(5):  # the same window: no new history, no message
+            self.tick(60)
+        self.assertEqual([h["event"] for h in self.q.entries[keys[0]]["history"]].count("latch_held"), 1)
+        self.assertEqual(self.w.sent(), [])
+        # It clears; every row's place in the reset spread is still ahead, and the login is spent again before it
+        self.tick(reset1 + 1 - self.t)
+        self.assertEqual(self.w.explains(), [])
+        reset2 = self.t + 1500
+        self.latch("rest", reset2)
+        self.tick(30)
+        self.assertEqual(self.w.explains(), [])
+        self.assertEqual([self.q.entries[k]["latchHeld"]["windows"] for k in keys], [2, 2, 2])
+        sent = self.w.sent()
+        self.assertEqual(sorted(s[3] for s in sent), ["host/lane11", "host/lane12", "host/lane13"])
+        self.assertTrue(all("latch" in s[-1] and "leo-workspace#5944" in s[-1] for s in sent), sent)
+        self.tick(60)
+        self.assertEqual(len(self.w.sent()), 3, "told once")
+        # The next clear: at once, past no spread, oldest wake first
+        self.retries(3)
+        self.tick(reset2 + 1 - self.t)
+        self.assertEqual(self.explained(), ["11", "13", "12"])
+        for k in keys:
+            e = self.q.entries[k]
+            self.assertNotIn("latchHeld", e)
+            self.assertIn("latch_released", [h["event"] for h in e["history"]])
+
+    def test_a_due_row_no_worker_takes_says_why_past_the_bound(self):
+        """No latch, every worker busy: a row past its wake by LAND_DUE_LATE gets one due_late in its history, its
+        status says every worker is busy, and the land-pool line counts it."""
+        logs: list[dict] = []
+        p = mock.patch.object(gg, "log", logs.append)
+        p.start()
+        self.addCleanup(p.stop)
+        self.w.config["workers"] = 1
+
+        class Busy:
+            def done(self) -> bool:
+                return False
+        self.q.jobs["pr:o/r#99"] = Busy()
+        key = self.stuck(11, 3 * 3600)
+        self.tick(30)
+        self.tick(30)
+        e = self.q.entries[key]
+        self.assertEqual([h["event"] for h in e["history"]].count("due_late"), 1)
+        self.assertIn("every worker busy", gg.land_line(e, self.t))
+        pool = [r for r in logs if r.get("event") == "land-pool"][-1]
+        self.assertEqual((pool["gated"], pool["dueLate"], pool["firstGated"]), (1, 1, "o/r#11"))
+        del self.q.jobs["pr:o/r#99"]
+        self.retries(1)
+        e = self.tick(30) and self.q.entries[key]
+        self.assertEqual(self.explained(), ["11"])
+        self.assertNotIn("dueLate", e)
+
+    def test_only_due_entries_hold_a_waited_pr_watch(self):
+        """huge-blue, 2026-11-18 20:00Z: 525 of 725 pr watches were the land queue's, each open entry's waited watch
+        renewed every 30 s, and no pr cache was read in 600 s. With 440 open entries for an hour: an entry waiting on
+        its checks or a wake ahead, or waiting_after, holds no waited watch, only one unwaited one-off read per
+        LAND_PEEK_EVERY; a due one is waited; a latched one asks for nothing."""
+        calls: list[tuple[str, bool, bool]] = []
+
+        def register(key: str, waited: bool = False, once: bool = False, **kw: Any) -> None:
+            calls.append((key, waited, once))
+        p = mock.patch.object(gg, "register", register)
+        p.start()
+        self.addCleanup(p.stop)
+        self.q = gg.LandQueue(run=self.w.run, cache_of=self.w.cache.get, nudge=self.nudge_read, inline=True,
+                              config=self.w.config, reads_upstream=lambda: False, refresh=self.refresh,
+                              behind=lambda *a: None, broker_client=lambda: False, snapshot_of=self.snaps.get)
+        n = 1000
+        for i in range(400):
+            self.stuck(n + i, -3 * 3600, kind="pr")  # waits on its checks, nothing changed
+        for i in range(400, 420):
+            self.stuck(n + i, -3 * 3600)  # a retry whose wake is ahead
+        for i in range(420, 440):
+            self.stuck(n + i, 0, state="waiting_after", after=[f"pr:o/r#{n + i - 420}"])
+        due = self.stuck(5000, 60)  # woke a minute ago: judged, and waited until then
+        self.retries(60)  # judged again at each retry wake
+        start = self.t
+        while self.t - start < 3600:
+            self.tick(30)
+        waited = {k for k, w, _ in calls if w}
+        peeks = [k for k, w, once in calls if not w and once]
+        self.assertEqual(waited, {due})
+        self.assertLessEqual(len(peeks), 440 * (3600 / gg.LAND_PEEK_EVERY + 1))
+        self.assertEqual(len(peeks), len(calls) - len([c for c in calls if c[1]]))
+        # Latched: nothing at all
+        calls.clear()
+        self.latch("graphql", self.t + 1200)
+        for _ in range(10):
+            self.tick(30)
+        self.assertEqual(calls, [])
+
     def test_an_entry_unparked_from_a_quota_park_reads_its_head_again(self):
         """The same for one entry's own quota park (park_quota): nothing is read for it while parked."""
         self.pr(LA)
