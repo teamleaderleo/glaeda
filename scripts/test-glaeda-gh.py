@@ -1688,6 +1688,26 @@ class UpstreamTest(Base):
         self.assertEqual(served["origin"], "controller")
         self.assertEqual(served["restRun"]["conclusion"], "cancelled")
 
+    def test_the_api_an_upstream_read_a_pr_over_travels_downstream(self) -> None:
+        """A downstream reader (leo-workspace's gh_glaeda_reads) serves a PR's reviewDecision only from a GraphQL read:
+        the REST reader keeps GraphQL's last one. So the upstream says which API it read the PR over (`via`), the
+        downstream keeps it as `originVia` (its own `via` names its own reads), and passes it on in turn."""
+        gg.register("pr:o/r#7")
+        node = gg.parse_pr(pr_node(7))
+        self.answers["pr:o/r#7"] = {"data": node, "dataAt": time.time() - 5, "origin": "graphql", "via": "graphql"}
+        self.daemon.tick(now=NOW)
+        entry = gg.read_cache("pr:o/r#7")
+        self.assertEqual((entry["source"], entry["originVia"]), ("upstream", "graphql"))
+        self.assertNotIn("via", entry)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), mock.patch.object(gg, "daemon_running", return_value=True), \
+                mock.patch.object(gg, "daemon_failing", return_value=None):
+            gg.cmd_read(json.dumps({"keys": [{"key": "pr:o/r#7", "jobs": False}]}))
+        self.assertEqual(json.loads(out.getvalue())["entries"]["pr:o/r#7"]["via"], "graphql")
+        self.answers["pr:o/r#7"] = {"data": node, "dataAt": time.time() - 4, "via": "sideways"}  # not an API: dropped
+        self.daemon.tick(now=NOW + gg.UPSTREAM_EVERY + 1)
+        self.assertIsNone(gg.read_cache("pr:o/r#7")["originVia"])
+
     def test_a_downstream_jobs_look_is_answered_by_the_upstream_job_read(self) -> None:
         """Review of #1961 F1: jobsAt travels both ways, so a downstream `status run --jobs` look is answered once the
         upstream has read the job list, and is not polled until IDLE_EXPIRY. On one fake clock: the look at NOW, the
@@ -10469,8 +10489,10 @@ class BrokerFieldTableTest(unittest.TestCase):
         node["mergedAt"] = "2026-10-21T00:00:00Z"
         node["headRefName"] = "a-branch"
         node["reviewDecision"] = "APPROVED"
+        node.update(additions=12, deletions=3, changedFiles=2)
         pull = {"number": 7, "html_url": node["url"], "title": "t", "state": "closed", "merged": True,
-                "merged_at": node["mergedAt"], "draft": False, "mergeable": True,
+                "merged_at": node["mergedAt"], "draft": False, "mergeable": True, "additions": 12, "deletions": 3,
+                "changed_files": 2,
                 "mergeable_state": "clean", "updated_at": node["updatedAt"],
                 "head": {"sha": node["headRefOid"], "ref": node["headRefName"]}}
         return {"graphql": gg.parse_pr(node),

@@ -804,7 +804,8 @@ REST_READ_MAX = {"pr": REST_CHECK_PAGES + REST_STATUS_PAGES + REST_RUN_PAGES + 5
                  "head": REST_CHECK_PAGES + REST_STATUS_PAGES + REST_RUN_PAGES + 1}
 
 # NUM is the alias's PR-number variable: isRequired needs it
-PR_FIELDS = """number url title state isDraft merged mergedAt mergeable mergeStateStatus headRefOid
+PR_FIELDS = """number url title state isDraft merged mergedAt mergeable mergeStateStatus headRefOid additions deletions
+changedFiles
 headRefName reviewDecision updatedAt baseRef { branchProtectionRule { requiredStatusCheckContexts }
 rules(first: 50) { nodes { type parameters { ... on RequiredStatusChecksParameters {
   requiredStatusChecks { context } } } } } } commits(last: 1) { nodes { commit { SUITE_ATTEMPTS statusCheckRollup { state
@@ -2180,6 +2181,12 @@ def cmd_read(text: str) -> int:
             if k in cached}
         if cached is not None and cached.get("source"):  # where the data came from, so a downstream wait can
             entries[key]["origin"] = cached.get("origin") if cached.get("source") == "upstream" else cached["source"]
+        # Which API the data was last read over ("graphql" or "rest"), so a downstream reader can tell a GraphQL-read
+        # reviewDecision from the REST reader's carried-over one (leo-workspace gh_glaeda_reads, `originVia`).
+        via = None if cached is None else (cached.get("originVia") if cached.get("source") == "upstream"
+                                           else cached.get("via"))
+        if via in ("graphql", "rest"):
+            entries[key]["via"] = via
         if consumer:
             if ledger is None:
                 doc = read_json(BASE / CONSUMERS_FILE)
@@ -2436,7 +2443,7 @@ def upper(value: Any) -> str | None:
 
 def slim_pull(doc: dict) -> dict:
     keep = ("number", "html_url", "title", "state", "draft", "merged", "merged_at", "mergeable", "mergeable_state",
-            "updated_at")
+            "updated_at", "additions", "deletions", "changed_files")
     head, base = doc.get("head") or {}, doc.get("base") or {}
     return {**{k: doc.get(k) for k in keep}, "head": {"sha": head.get("sha"), "ref": head.get("ref")},
             "base": {"ref": base.get("ref")}}
@@ -2616,7 +2623,8 @@ def rest_pr_node(pull: dict, checks: dict, statuses: list[dict], runs: list[dict
             "isDraft": bool(pull.get("draft")), "merged": bool(pull.get("merged")), "mergedAt": pull.get("merged_at"),
             "mergeable": mergeable, "mergeStateStatus": upper(pull.get("mergeable_state")) or "UNKNOWN",
             "headRefOid": head.get("sha"), "headRefName": head.get("ref"), "reviewDecision": review,
-            "updatedAt": pull.get("updated_at"),
+            "updatedAt": pull.get("updated_at"), "additions": pull.get("additions"), "deletions": pull.get("deletions"),
+            "changedFiles": pull.get("changed_files"),
             "baseRef": {"branchProtectionRule": {"requiredStatusCheckContexts": sorted(required)}, "rules": {"nodes": []}},
             "commits": {"nodes": [{"commit": {"statusCheckRollup": rollup}}]}}
 
@@ -2805,6 +2813,7 @@ def parse_pr(node: dict) -> dict:
         "mergeStateStatus": node.get("mergeStateStatus"), "headRefOid": node.get("headRefOid"),
         "headRefName": node.get("headRefName"),
         "reviewDecision": node.get("reviewDecision"), "updatedAt": node.get("updatedAt"),
+        "additions": node.get("additions"), "deletions": node.get("deletions"), "changedFiles": node.get("changedFiles"),
         "checkState": rollup.get("state"), "checks": checks, "superseded": superseded,
         "supersededOmitted": superseded_omitted,
         "checksTotal": contexts.get("totalCount", len(checks)),
@@ -5694,6 +5703,9 @@ class Daemon:
                                       "missing": entry.get("missing") is True,
                                       # provenance: a controller-only finish stays unconfirmed downstream too
                                       "origin": entry.get("origin") if isinstance(entry.get("origin"), str) else None,
+                                      # the API the upstream read it over (cmd_read): kept apart from `via`, which
+                                      # names this daemon's own reads (rest_gate_holds)
+                                      "originVia": entry.get("via") if entry.get("via") in ("graphql", "rest") else None,
                                       "restRun": entry.get("restRun") if isinstance(entry.get("restRun"), dict) else None}
             if isinstance(fetched, (int, float)):
                 fields["fetchedAt"] = min(self.now, float(fetched))  # a wait rules only on reads after it began
@@ -13408,6 +13420,9 @@ BROKER_PR_FIELDS = {
     "mergeStateStatus": ("mergeStateStatus", "str"), "headRefOid": ("headRefOid", "str"),
     "headRefName": ("headRefName", "str"),
     "updatedAt": ("updatedAt", "time"), "mergedAt": ("mergedAt", "time"),
+    # Both writers fill these (the GraphQL read and fetch_pr_rest's pull); an entry stored before they were read
+    # lacks the key, and broker_serve passes that call on. Claude Code's PR badge asks additions and deletions.
+    "additions": ("additions", "int"), "deletions": ("deletions", "int"), "changedFiles": ("changedFiles", "int"),
 }
 # gh `run view --json FIELD` -> the same, over slim_run's REST names. Four are missing for the
 # reason above. REST's `name` is the run-name when a workflow sets one and GraphQL's is the
@@ -13426,8 +13441,8 @@ BROKER_RUN_FIELDS = {
 # acting on a stale one means waiting on a superseded head, calling a run green, or reading a
 # merged PR as open. The lean horizon never covers them. `updatedAt` is the mutation clock itself,
 # so anything using it as a change detector would be told "nothing changed" for the whole horizon.
-BROKER_LIVE_FIELDS = {"headRefOid", "conclusion", "status", "state", "attempt",
-                      "mergeStateStatus", "mergeable", "mergedAt", "isDraft", "updatedAt"}
+BROKER_LIVE_FIELDS = {"headRefOid", "conclusion", "status", "state", "attempt", "additions", "deletions",
+                      "changedFiles", "mergeStateStatus", "mergeable", "mergedAt", "isDraft", "updatedAt"}
 # The other half of the same decision, and the reason it is written down rather than implied: a
 # served field that is in neither set is served stale under the lean horizon, and nothing noticed.
 # Adding `merged` to BROKER_PR_FIELDS and leaving it unclassified served `{"merged": false}` from
