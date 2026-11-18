@@ -20094,5 +20094,56 @@ class SimDynamicTest(unittest.TestCase):
         self.assertNotIn("SIM_TOKEN_COPIES", disk)
 
 
+
+class LsofNoMountStatTest(unittest.TestCase):
+    """lsof without -b stat()s every mount point, the removable disk images among them, and macOS asks a person for
+    that in the listener gate's name (cmux13s, 2026-11-18 07:33: tccd AUTHREQ_PROMPTING
+    service=kTCCServiceSystemPolicyRemovableVolumes, Resp = the gate's python3.14). The hook's lsof always passes -b
+    and never a file argument; a holder of one file comes from the full listing by name."""
+
+    def test_lsof_holders_lists_without_a_file_argument_and_matches_either_spelling(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            real = Path(d) / "real"
+            real.mkdir()
+            (Path(d) / "link").symlink_to(real)
+            lock = real / "host.lock"
+            lock.touch()
+            argv_log = Path(d) / "argv"
+            fake = Path(d) / "lsof"
+            fake.write_text("#!/bin/sh\n"
+                            f"printf '%s\\n' \"$@\" > {argv_log}\n"
+                            f"printf 'p11\\nn/dev/null\\np22\\nn{os.path.realpath(lock)}\\nn{os.path.realpath(lock)}\\n"
+                            "p33\\nn/elsewhere/host.lock\\n'\n")
+            fake.chmod(0o755)
+            with mock.patch.object(hook, "LSOF", str(fake)):
+                self.assertEqual(hook.lsof_holders(str(Path(d) / "link" / "host.lock"), 5), [22])
+                args = argv_log.read_text().split()
+                self.assertIn("-b", args)
+                self.assertIn("-w", args)
+                self.assertNotIn("--", args)
+                self.assertNotIn("-t", args)
+                self.assertFalse([a for a in args if a.endswith("host.lock")], args)
+            with mock.patch.object(hook, "LSOF", str(Path(d) / "missing")):
+                self.assertIsNone(hook.lsof_holders(str(lock), 5))
+
+    @unittest.skipUnless(os.path.exists(hook.LSOF), "needs lsof")
+    def test_real_lsof_with_b_still_names_a_holder_and_a_cwd(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            lock = Path(d) / "host.lock"
+            lock.touch()
+            child = subprocess.Popen([sys.executable, "-c",
+                                      f"import os,sys\nfd=os.open({os.fspath(lock)!r},os.O_RDWR)\n"
+                                      "print('open',flush=True)\nsys.stdin.read()\n"],
+                                     cwd=d, stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+            try:
+                self.assertEqual(child.stdout.readline().strip(), "open")
+                self.assertIn(child.pid, hook.lsof_holders(os.fspath(lock), 10) or [])
+                self.assertEqual((hook.process_cwds() or {}).get(child.pid), os.path.realpath(d))
+            finally:
+                child.stdin.close()
+                child.wait(timeout=10)
+                child.stdout.close()
+
+
 if __name__ == "__main__":
     unittest.main()

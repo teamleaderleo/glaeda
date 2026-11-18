@@ -407,6 +407,49 @@ LIBRARY_PRIVACY_SKIP_NAMES = (
 LIBRARY_GUARDED_PARENTS = ((), ("Application Support",), ("Metadata",))
 
 
+# lsof without -b stat()s and readlink()s every mount point in the mount table, the removable volumes and disk images
+# among them (VOLUME_MOUNT_HOLDERS), and macOS asks a person for that access. -b avoids those calls (lsof still names
+# each open file from the kernel); -w drops its warning per skipped mount. No glaeda-disk lsof names a file argument,
+# which -b could not resolve.
+LSOF_NO_MOUNT_STAT = ("-b", "-w")
+
+# Where macOS mounts removable volumes and disk images on the Data volume: /Volumes (a USB disk, a DMG that hdiutil
+# attaches), /Library/Developer/CoreSimulator/Volumes (each iOS simulator runtime image) and cryptexd's mounts.
+# diskutil calls each of them "Removable Media: Removable". A walk that lists one of these folders lstat()s every
+# mount point in it, which is an access to that volume: macOS asks "would like to access files on a removable
+# volume" in the name of whoever started the walk (cmux13s, 2026-11-18 07:33, tccd AUTHREQ_PROMPTING
+# service=kTCCServiceSystemPolicyRemovableVolumes for the runner listener gate's python3.14, whose glaeda-disk pass
+# and lsof were running). du -x only keeps it from descending, after that lstat. So a walk whose root is at or
+# above one of these folders never lists it (du -I, the census): a mount holder holds no bytes of the Data volume.
+VOLUME_MOUNT_HOLDERS = (
+    ("Volumes",),
+    ("Library", "Developer", "CoreSimulator", "Volumes"),
+    ("private", "var", "run", "com.apple.security.cryptexd"),
+)
+
+
+def _data_parts(path: Path | str) -> tuple[str, ...]:
+    """PATH's components below /, the Data volume's own spelling (/System/Volumes/Data/...) read as the firmlinked
+    one."""
+    parts = Path(os.path.abspath(path)).parts[1:]
+    if parts[:3] == ("System", "Volumes", "Data"):
+        parts = parts[3:]
+    return tuple(parts)
+
+
+def volume_mount_holder(path: Path | str) -> bool:
+    """PATH is a folder where macOS mounts removable volumes or disk images (VOLUME_MOUNT_HOLDERS), on macOS only."""
+    return DARWIN and _data_parts(path) in VOLUME_MOUNT_HOLDERS
+
+
+def walk_reaches_volume_mounts(root: Path) -> list[str]:
+    """The names of the VOLUME_MOUNT_HOLDERS a du walk of ROOT would list, for du -I (on macOS only)."""
+    if not DARWIN:
+        return []
+    parts = _data_parts(root)
+    return sorted({h[-1] for h in VOLUME_MOUNT_HOLDERS if len(parts) < len(h) and h[:len(parts)] == parts})
+
+
 # Set by --root-census only: the root LaunchDaemon glaeda-runner-hygiene installs on a CI mini (a host with an
 # enrolled runner account). It runs in launchd's system domain with no login session, so a guarded folder cannot put
 # a prompt on any screen: TCC lets root read it or refuses it silently. There every folder is walked, other accounts'
@@ -454,11 +497,14 @@ def privacy_guarded(parent: Path, name: str) -> bool:
 
 def du_skip_args(root: Path | None = None) -> list[str]:
     """du's flags that keep a walk of ROOT out of FileProvider/iCloud trees and, on macOS, privacy-guarded
-    folders (and a home's guarded Library folders, when the walk reaches one)."""
+    folders (and a home's guarded Library folders, when the walk reaches one), and never into a folder where
+    removable volumes and disk images are mounted (VOLUME_MOUNT_HOLDERS)."""
     guarded = DARWIN and not ROOT_CENSUS_MODE
     names = [*sorted(MEASURE_SKIP_COMPONENTS), *(PRIVACY_SKIP_NAMES if guarded else ())]
     if guarded and root is not None and walk_reaches_a_home_library(root):
         names += LIBRARY_PRIVACY_SKIP_NAMES
+    if root is not None:
+        names += walk_reaches_volume_mounts(root)  # as root too: listing a mount holder touches every volume in it
     # The spelling follows the du that runs (BSD's -I, GNU's --exclude), not DARWIN, which a suite may set
     # on a Linux host.
     if sys.platform == "darwin":
@@ -1167,6 +1213,7 @@ CMUX_NEXT_DRAIN_HOOK_SHA256 = frozenset({
     "3082c5a63cbe5d98a837b3fe648cab09dcddeb1c79cc475716a62b9529d024ba",
     "52e9a71a38132cdf79e49f2b751940cb6b10dceededf16fa43ae28bf2cb05e72",
     "5bb42957d1041edc213fbd24fcb2c6e854c9b743fd55c9a417b4e9dd0b0bc3c5",
+    "a5958215b862d5848961bd9fdf3b9c52ea14d0acbb1deadeddf0a59c67ccebd6",
 })
 CMUX_NEXT_CI_PRESERVED_NAMES = frozenset({
     "SourcePackages", "ModuleCache.noindex", "SDKStatCaches.noindex",
@@ -3695,7 +3742,7 @@ def checkout_users(checkout: Path) -> tuple[str, str]:
         return r.returncode, r.stdout
     try:
         code, out = query(["ps", "-axww", "-o", "pid=,ppid=,command="], 30)
-        lcode, listing = query([shutil.which("lsof") or "/usr/sbin/lsof", "-n", "-P", "-Fpn"], 60)
+        lcode, listing = query([shutil.which("lsof") or "/usr/sbin/lsof", *LSOF_NO_MOUNT_STAT, "-n", "-P", "-Fpn"], 60)
     except (OSError, subprocess.SubprocessError) as e:
         raise NoEvidence(f"lsof or ps: {e}") from e
     if code != 0 or not out.strip() or lcode != 0 or not listing.strip():
@@ -5273,7 +5320,7 @@ def path_holders(path: Path) -> list[tuple[int, str]] | None:
     lsof (process_evidence keeps no pids), so only a verdict that must name the holder pays for it."""
     lsof = shutil.which("lsof") or "/usr/sbin/lsof"
     try:
-        code, out = _owned_query([lsof, "-n", "-P", "-Fpn"], 120)
+        code, out = _owned_query([lsof, *LSOF_NO_MOUNT_STAT, "-n", "-P", "-Fpn"], 120)
     except (OSError, subprocess.TimeoutExpired):
         return None
     if code not in (0, 1) or not out:
@@ -5598,7 +5645,7 @@ def process_evidence() -> tuple[list[str], str]:
     else:
         lsof = shutil.which("lsof") or "/usr/sbin/lsof"
         try:
-            code, out = _owned_query([lsof, "-n", "-P", "-Fcn"], 120)
+            code, out = _owned_query([lsof, *LSOF_NO_MOUNT_STAT, "-n", "-P", "-Fcn"], 120)
         except (OSError, subprocess.TimeoutExpired) as e:
             raise NoEvidence(f"lsof: {e}") from e
         if code != 0:
@@ -10651,7 +10698,9 @@ def census_pass(roots: list[Path], covered: set[str], state: dict[str, Any] | No
             if stat.S_ISDIR(est.st_mode):
                 if dev is not None and est.st_dev != dev:
                     continue  # another volume mounted here
-                if name in MEASURE_SKIP_COMPONENTS:
+                if volume_mount_holder(entry_path):
+                    rows[child] = [0, "skipped", False]  # listing it lstat()s each removable volume mounted in it
+                elif name in MEASURE_SKIP_COMPONENTS:
                     rows[child] = [0, "skipped", False]  # FileProvider: du can block in the kernel there
                 elif privacy_guarded(current, name):
                     rows[child] = [0, "skipped", False]  # listing it puts a privacy prompt on the screen
@@ -13210,7 +13259,7 @@ def open_for_writing() -> frozenset[str]:
     """Every path some process has open for writing now. Raises NoEvidence when lsof cannot tell."""
     lsof = shutil.which("lsof") or "/usr/sbin/lsof"
     try:
-        code, out = _owned_query([lsof, "-n", "-P", "-w", "-F", "an"], 120)
+        code, out = _owned_query([lsof, *LSOF_NO_MOUNT_STAT, "-n", "-P", "-F", "an"], 120)
     except (OSError, subprocess.TimeoutExpired) as e:
         raise NoEvidence(f"lsof: {e}") from e
     # lsof exits 1 when some processes could not be read (other users'); no output at all is no evidence

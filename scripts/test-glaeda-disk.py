@@ -9117,6 +9117,97 @@ class VolumeCensusTest(unittest.TestCase):
         with mock.patch.object(gd, "DARWIN", False), mock.patch.object(gd, "HOME", home):
             self.assertFalse(gd.privacy_guarded(home, "Pictures"))  # Linux has no TCC
 
+    def test_no_walk_lists_a_folder_where_removable_volumes_mount(self) -> None:
+        # cmux13s, 2026-11-18 07:33: tccd AUTHREQ_PROMPTING service=kTCCServiceSystemPolicyRemovableVolumes for the
+        # runner listener gate's python3.14 while its glaeda-disk pass ran. diskutil calls each CoreSimulator
+        # runtime image "Removable Media: Removable"; listing /Library/Developer/CoreSimulator/Volumes (or /Volumes,
+        # where hdiutil attaches a DMG) lstat()s every volume mounted there, and du -x only stops after that. Every
+        # du whose root reaches a mount holder names it in -I, as root too; one below or beside them does not.
+        def ignored(argv: list[str]) -> set[str]:
+            return ({argv[i + 1] for i, a in enumerate(argv[:-1]) if a == "-I"}
+                    | {a.removeprefix("--exclude=") for a in argv if a.startswith("--exclude=")})
+
+        seen: list[list[str]] = []
+
+        def fake(argv, *args, **kwargs):
+            seen.append(list(argv))
+            return f"4 {argv[-1]}\n"
+
+        with mock.patch.object(gd, "DARWIN", True), \
+                mock.patch.object(gd, "_measurement_path_allowed", return_value=True), \
+                mock.patch.object(gd, "_measurement_on_timeout_cooldown", return_value=False), \
+                mock.patch.object(gd, "_du_output", side_effect=fake):
+            for census_mode in (False, True):
+                with mock.patch.object(gd, "ROOT_CENSUS_MODE", census_mode):
+                    for root, names in ((Path("/"), {"Volumes", "com.apple.security.cryptexd"}),
+                                        (Path("/System/Volumes/Data"), {"Volumes", "com.apple.security.cryptexd"}),
+                                        (Path("/Library"), {"Volumes"}),
+                                        (Path("/System/Volumes/Data/Library/Developer"), {"Volumes"}),
+                                        (Path("/Library/Developer/CoreSimulator"), {"Volumes"}),
+                                        (Path("/private/var"), {"com.apple.security.cryptexd"})):
+                        seen.clear()
+                        gd.du_bytes(root, record_timeout=False)
+                        gd.du_children(root, record_timeout=False)
+                        gd.du_children_with_status(root, record_timeout=False)
+                        seen.append(gd._census_du_argv(root))
+                        self.assertEqual(len(seen), 4, root)
+                        for argv in seen:
+                            self.assertLessEqual(names, ignored(argv), (root, census_mode, argv))
+            for root in (Path("/Users/cmux/Projects/cmux"), Path("/Users/Shared/cmux-build-fleet/cache"),
+                         Path("/Library/Developer/CoreSimulator/Devices"), Path("/Users/cmux/Library/Caches")):
+                self.assertNotIn("Volumes", ignored(gd._census_du_argv(root)), root)
+        with mock.patch.object(gd, "DARWIN", False):
+            self.assertEqual(gd.walk_reaches_volume_mounts(Path("/")), [])
+            self.assertFalse(gd.volume_mount_holder("/Volumes"))
+
+    def test_the_census_never_lists_a_folder_where_removable_volumes_mount(self) -> None:
+        # The census opens the Data volume a folder at a time and lstat()s each entry; in a mount holder each entry
+        # is a removable volume's root (cmux13s, 2026-11-18). The holder is named as skipped and never listed.
+        for rel in ("Volumes/iOS_24A434/System/x", "Library/Developer/CoreSimulator/Volumes/iOS_23F77/x",
+                    "Library/Developer/CoreSimulator/Devices/u/x", "Users/cmux/Volumes/kept"):
+            self.write(rel)
+        holders = (gd._data_parts(self.root / "Volumes"),
+                   gd._data_parts(self.root / "Library/Developer/CoreSimulator/Volumes"))
+        opened: list[str] = []
+        listdir = os.listdir
+
+        def spy(path):
+            opened.append(str(path))
+            return listdir(path)
+
+        with mock.patch.object(gd, "DARWIN", True), mock.patch.object(gd, "VOLUME_MOUNT_HOLDERS", holders), \
+                mock.patch.object(gd.os, "listdir", side_effect=spy), \
+                mock.patch.object(gd, "_census_du", return_value=None):
+            state = gd.census_pass([self.root], set(), budget_s=1000, path=self.state)
+        self.assertTrue(state["complete"])
+        for rel in ("Volumes", "Library/Developer/CoreSimulator/Volumes"):
+            self.assertFalse([p for p in opened if p == str(self.root / rel) or p.startswith(f"{self.root / rel}/")],
+                             rel)
+            self.assertEqual(state["rows"][str(self.root / rel)][1], "skipped", rel)
+        for rel in ("Library/Developer/CoreSimulator/Devices", "Users/cmux/Volumes"):
+            self.assertIn(str(self.root / rel), opened, rel)  # only the holders themselves, not every "Volumes"
+
+    def test_every_fleet_lsof_skips_the_mount_point_stats(self) -> None:
+        # lsof without -b stat()s and readlink()s every mount point, the removable disk images among them, and macOS
+        # asks a person for that in the caller's name (cmux13s, 2026-11-18 07:33, the listener gate's python3.14).
+        # Every lsof a glaeda script runs passes -b (with -w for its per-mount warning), and none names a file
+        # argument (lsof -- PATH), which needs that stat: a holder of one file comes from the full listing by name.
+        call = re.compile(r"\[\s*(LSOF|lsof|shutil\.which\(\"lsof\"\)[^,]*)\s*,([^\]]*)\]")
+        found = 0
+        for script in sorted((ROOT / "scripts").glob("glaeda-*")):
+            if not script.is_file() or script.suffix not in ("", ".py"):
+                continue
+            text = script.read_text(errors="replace")
+            for m in call.finditer(text):
+                args = m.group(2)
+                found += 1
+                where = f"{script.name}: {m.group(0)}"
+                self.assertTrue("LSOF_NO_MOUNT_STAT" in args or ('"-b"' in args and '"-w"' in args), where)
+                self.assertNotIn('"--"', args, where)
+                self.assertNotIn('"-t"', args, where)
+        self.assertGreaterEqual(found, 10)
+        self.assertEqual(gd.LSOF_NO_MOUNT_STAT, ("-b", "-w"))
+
     def test_a_sized_dir_whose_size_goes_is_walked_before_completion(self) -> None:
         a, b = self.write("a/blob").parent, self.write("b/blob").parent
         state = {"schema": "glaeda-disk-census/v1", "started_at": 1.0, "dev": self.root.stat().st_dev,

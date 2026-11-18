@@ -360,7 +360,10 @@ class FakeGitHub:
                 return 404, self.rate("core", self.rest_remaining), b'{"message": "Not Found"}'
         elif parts[4] == "actions" and len(parts) > 6:
             run_id = int(parts[6])
-            payload = {"jobs": self.jobs.get(run_id, [])} if parts[-1] == "jobs" else self.runs[run_id]
+            payload = {"jobs": self.jobs.get(run_id, [])} if parts[-1] == "jobs" else self.runs.get(run_id)
+            if payload is None:
+                self.rest_remaining -= 1
+                return 404, self.rate("core", self.rest_remaining), b'{"message": "Not Found"}'
         else:
             payload = self.rest_pr(parts, path)
             if payload is None:
@@ -2539,7 +2542,7 @@ class BalanceTest(Base):
         gg.register("run:o/r/404")
         self.daemon.tick(NOW + gg.TERMINAL_REFRESH + gg.CYCLE)
         missing = gg.read_cache("run:o/r/404")
-        self.assertIn("no workflow run", missing["error"])
+        self.assertIn("404", missing["error"])  # REST decided it, after GraphQL's null
         # never shown by any read: missing (wait's not-found), as REST's 404 for such a run now is
         self.assertTrue(missing.get("missing"))
 
@@ -4012,6 +4015,66 @@ class ClientTest(Base):
         with mock.patch.object(self.daemon, "graphql", return_value=(limited, None)):
             self.daemon.fetch_runs_graphql([{"key": "run:o/r/3", "cache": None}])
         self.assertFalse(gg.read_cache("run:o/r/3").get("missing"))
+
+    def test_a_run_graphql_cannot_see_is_read_over_rest_once_not_retried_every_cycle(self) -> None:
+        """leo-workspace runs 44343207314 and 44348360740 (2026-11-18): resource(url:) answered null for a private
+        repo the GraphQL token cannot see, every cycle, "no workflow run at this URL", forever. REST (the login) sees it."""
+        self.daemon.now = NOW
+        run = {"id": 9, "name": "CI", "display_title": "x", "status": "completed", "conclusion": "success",
+               "html_url": "https://github.com/o/r/actions/runs/9", "head_sha": "b" * 40, "head_branch": "x",
+               "event": "push", "run_attempt": 1, "created_at": iso(NOW - 99), "updated_at": iso(NOW - 9)}
+        self.gh.runs[9] = run
+        entry = {"key": "run:o/r/9", "cache": None, "jobs": False, "touched": NOW}
+        blind = ({"data": {"w0": None}}, None)
+        with mock.patch.object(self.daemon, "graphql", return_value=blind) as gql:
+            self.daemon.fetch_runs_graphql([entry])
+            got = gg.read_cache("run:o/r/9")
+            self.assertEqual(got["data"], gg.slim_run(run))  # REST's answer, not an error
+            self.assertFalse(got.get("missing"))
+            self.assertIsNone(got["error"])
+            self.assertEqual(gql.call_count, 1)
+            self.daemon.now = NOW + 60  # the next cycle asks REST directly: no GraphQL query is spent
+            self.daemon.fetch_runs_graphql([{**entry, "cache": got}])
+            self.assertEqual(gql.call_count, 1)
+        self.assertEqual(len(self.gh.run_calls()), 2)
+        # a run neither source shows: missing once, then not re-read every cycle
+        gone = {"key": "run:o/r/404", "cache": None, "jobs": False, "touched": NOW}
+        with mock.patch.object(self.daemon, "graphql", return_value=({"data": {"w0": None}}, None)):
+            self.daemon.fetch_runs_graphql([gone])
+        cache = gg.read_cache("run:o/r/404")
+        self.assertTrue(cache["missing"])
+        self.assertIsNone(cache.get("data"))
+        self.daemon.now = cache["fetchedAt"] + gg.CYCLE
+        self.daemon.last_cycle["run"] = 0
+        self.assertEqual(self.daemon.due("run", [{**gone, "cache": cache}]), [])
+
+    def test_a_blind_runs_read_window_ends_and_an_unread_one_is_not_stored(self) -> None:
+        self.daemon.now = NOW
+        self.gh.runs[9] = {"id": 9, "name": "CI", "display_title": "x", "status": "completed", "conclusion": "success",
+                           "html_url": "u", "head_sha": "b" * 40, "head_branch": "x", "event": "push",
+                           "run_attempt": 1, "created_at": iso(NOW - 99), "updated_at": iso(NOW - 9)}
+        entry = {"key": "run:o/r/9", "cache": None, "jobs": False, "touched": NOW}
+        with mock.patch.object(self.daemon, "graphql", return_value=({"data": {"w0": None}}, None)):
+            self.daemon.fetch_runs_graphql([entry])
+        stamp = gg.read_cache("run:o/r/9")["gqlBlindAt"]
+        self.daemon.now = NOW + 60
+        with mock.patch.object(self.daemon, "graphql") as gql:
+            self.daemon.fetch_runs_graphql([{**entry, "cache": gg.read_cache("run:o/r/9")}])
+        self.assertEqual(gg.read_cache("run:o/r/9")["gqlBlindAt"], stamp)  # reading inside the window keeps its end
+        gql.assert_not_called()
+        # out of time: nothing stored, the run is deferred
+        fresh = {"key": "run:o/r/10", "cache": None, "jobs": False, "touched": NOW}
+        with mock.patch.object(self.daemon, "graphql", return_value=({"data": {"w0": None}}, None)), \
+                mock.patch.object(self.daemon, "fetch_run", side_effect=gg.OutOfTime()):
+            self.daemon.fetch_runs_graphql([fresh])
+        self.assertIsNone(gg.read_cache("run:o/r/10"))
+        self.assertIn("run:o/r/10", self.daemon.deferred)
+        # a timeout for the alias is not blindness: no fallback
+        with mock.patch.object(self.daemon, "graphql", return_value=({"data": {"w0": None}, "errors": [
+                {"path": ["w0"], "type": "SERVICE_UNAVAILABLE", "message": "timeout"}]}, None)), \
+                mock.patch.object(self.daemon, "fetch_run") as rest:
+            self.daemon.fetch_runs_graphql([{**fresh, "key": "run:o/r/11"}])
+        rest.assert_not_called()
 
     def test_a_never_read_key_a_wait_is_on_goes_ahead_of_deferred_ones(self) -> None:
         self.daemon.now = NOW
@@ -17808,6 +17871,7 @@ class LandWorld:
         self.origin = "https://github.com/o/r.git"
         self.fetch_rc = 0
         self.fetch_err = "fatal: unable to access 'https://github.com/o/r.git/': Could not resolve host"
+        self.files: list[str] = []  # the PR's changed files, as `gh api repos/o/r/pulls/1/files` lists them
 
     def set_pr(self, key: str, data: dict, fetched: float) -> None:
         self.cache[key] = {"key": key, "data": data, "fetchedAt": fetched, "dataAt": fetched}
@@ -17828,6 +17892,8 @@ class LandWorld:
             return subprocess.CompletedProcess(argv, self.fetch_rc, "", "" if self.fetch_rc == 0 else self.fetch_err)
         if argv[0] == os.fspath(self.gh):
             words = argv[1:]
+            if words[:1] == ["api"] and "/files?" in words[1]:
+                return subprocess.CompletedProcess(argv, 0, "".join(f + "\n" for f in self.files), "")
             if words[:2] == ["pr", "view"] and words[-4:-2] == ["--json", "body"]:
                 return subprocess.CompletedProcess(argv, 0, self.body + "\n", "")
             if words[:2] == ["pr", "view"]:
@@ -18602,6 +18668,34 @@ class LandTest(Base):
         self.tick()
         self.assert_merged_at(LB)
 
+    def test_a_repin_to_the_head_the_cache_holds_judges_it_again_pinned(self):
+        # merge_hold's fallback for a refusal with no step of its own is judge_again(): a repin to the head it judged.
+        # Taken as a stale cache, it waited LAND_HEAD_TIMEOUT for a head that never came (nudging reads all along),
+        # then judged unpinned: a live read with no snapshot, the same answer, round again.
+        self.snap_pr(LA, snap_head=LA)
+        self.land()
+        self.w.answers.append(refusal("other_code", LA, {"kind": "repin", "sha": LA}))
+        e = self.tick()
+        self.assertEqual((e["state"], e["wait"]["kind"]), ("waiting", "retry"))
+        nudged = len(self.w.nudged)
+        self.tick(5)
+        self.assertEqual((len(self.w.explains()), len(self.w.nudged)), (1, nudged))
+        self.snap_pr(LA, snap_head=LA)  # the daemon's next full read of the same head
+        self.w.answers.append(ok_answer(LA))
+        self.tick(gg.LAND_RETRY_DEFAULT)
+        self.assertEqual(self.w.explains()[1][-2:], [LA, "--json"])  # pinned at the cached head
+        self.assertIn(gg.LAND_SNAPSHOT_ENV, self.explain_env())  # on the daemon's snapshot, not a live read
+        self.assertTrue(all("--sha" in argv for argv in self.w.explains()))
+        self.assert_merged_at(LA)
+
+    def test_a_repin_to_its_own_head_that_the_cache_does_not_hold_still_waits_for_the_cache(self):
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(refusal("other_code", LA, {"kind": "repin", "sha": LA}))
+        self.w.cache[self.KEY]["data"]["headRefOid"] = LB  # the cache moved on while merge_hold judged LA
+        e = self.tick()
+        self.assertEqual((e["wait"]["kind"], e["wait"]["before"]), ("head_change", LA))
+
     def test_base_red_unrelated_waits_on_the_base_run_then_merges(self):
         self.pr(LA)
         self.land()
@@ -18632,6 +18726,115 @@ class LandTest(Base):
         self.w.answers.append(ok_answer(LA))
         self.tick()
         self.assert_merged_at(LA)
+
+    # cmux#45558 (2026-11-17): webviews/ and scripts/ only, stopped own_red on run 44118660533, whose rust workspaces
+    # job failed a test on a local port; a hand rerun was the step.
+    RUN = 44118660533
+    OWN_RED = ("merge_hold: refused: base_red_excuse.py exit 1 at {head}: not excused: 'Native/OptChat/optchat-chief': "
+               "its log names failed test streamable_http_server_with_get_stream_events, which passed on base")
+
+    def unrelated_world(self, files: list[str], red: bool = True) -> None:
+        self.w.config["unrelatedReds"] = {"o/r": gg.LAND_UNRELATED_REDS["manaflow-ai/cmux"]}
+        self.w.files = files
+        self.pr_red(red)
+
+    def pr_red(self, red: bool, running: bool = False) -> None:
+        state = ("IN_PROGRESS", None) if running else ("COMPLETED", "FAILURE" if red else "SUCCESS")
+        checks = [{"name": "Native/OptChat/optchat-chief", "workflow": "rust workspaces", "status": state[0],
+                   "conclusion": state[1], "runId": self.RUN},
+                  {"name": "rust workspaces", "workflow": "rust workspaces", "status": state[0],
+                   "conclusion": state[1], "runId": self.RUN},
+                  # a base red merge_hold excused: another workflow, never rerun for this
+                  {"name": "cmux-next CI guard group", "workflow": "cmux-next guards", "status": "COMPLETED",
+                   "conclusion": "FAILURE", "runId": 44118660549}]
+        self.w.set_pr(self.KEY, {**land_pr(LA), "checks": checks}, self.t)
+
+    def own_red(self) -> tuple[int, dict]:
+        why = self.OWN_RED.format(head=LA)
+        return refusal("red_not_excused", LA, {"kind": "stop", "stop": "own_red",
+                                               "why": f"{why}; read: gh run view 44118660549 -R o/r --log-failed"},
+                       reason=why)
+
+    def test_a_red_the_change_cannot_affect_is_rerun_once_then_merged(self):
+        self.unrelated_world(["scripts/ci/react-doctor-baseline.json", "scripts/measure/first-load-after-restart.sh",
+                              "webviews/src/agent-session/acpmux/VirtualTranscript.tsx",
+                              "webviews/test/first-load-frames.test.ts"])
+        self.land()
+        self.w.answers.append(self.own_red())
+        e = self.tick()
+        self.assertEqual(self.w.gh_calls("run", "rerun"), [["run", "rerun", str(self.RUN), "--failed", "-R", "o/r"]])
+        self.assertEqual((e["state"], e["wait"]["kind"], e["unrelatedReruns"]), ("waiting", "pr", [f"{LA}|{self.RUN}"]))
+        self.assertIsNone(e.get("stop"))
+        self.pr_red(False, running=True)
+        self.tick()
+        self.assertEqual(len(self.w.explains()), 1)
+        self.pr_red(False)
+        self.w.answers.append(ok_answer(LA))
+        self.tick()
+        self.assert_merged_at(LA)
+
+    def test_the_same_red_after_its_one_rerun_stops_own_red_even_after_a_restart(self):
+        self.unrelated_world(["webviews/src/a.ts"])
+        self.land()
+        self.w.answers.append(self.own_red())
+        self.tick()
+        self.assertEqual(len(self.w.gh_calls("run", "rerun")), 1)
+        self.q = self.queue()  # a restart: the rerun is kept on the entry, on disk
+        self.pr_red(True, running=True)
+        self.tick()
+        self.pr_red(True)
+        self.w.answers.append(self.own_red())
+        e = self.tick()
+        self.assertEqual(len(self.w.gh_calls("run", "rerun")), 1)
+        self.assertEqual((e["state"], (e.get("stop") or {}).get("code")), ("stopped", "own_red"), e.get("history"))
+        self.assertIn("already rerun once", json.dumps(e["history"]))
+
+    def test_a_red_the_change_can_affect_stops_at_once_with_no_rerun(self):
+        for files in (["webviews/src/a.ts", "Native/OptChat/optchat-chief/src/hub.rs"],
+                      ["webviews/src/agent-session/acpmux/rows/parity/parity.changes.jsonl"],
+                      ["scripts/ci/init-submodule.sh"], ["scripts/ci/api_call_log/env.sh"],
+                      ["scripts/measure/screen-stream-eval/wifi-away-holds.json"], ["README.md"]):
+            with self.subTest(files=files):
+                gg.BASE = Path(self.tmp.name) / f"gh-{len(files)}-{abs(hash(files[-1]))}"  # a fresh queue each
+                self.w.calls.clear()
+                self.q = self.queue()
+                self.unrelated_world(files)
+                self.land()
+                self.w.answers.append(self.own_red())
+                e = self.tick()
+                self.assertEqual(self.w.gh_calls("run", "rerun"), [])
+                self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "own_red"))
+                self.assertIn(f"it changes {files[-1]}, which 'rust workspaces' can read", json.dumps(e["history"]))
+
+    def test_a_refused_rerun_stops_own_red_and_is_never_sent_again(self):
+        self.unrelated_world(["webviews/src/a.ts"])
+        self.w.gh_rc["rerun"] = 1
+        self.land()
+        self.w.answers.append(self.own_red())
+        e = self.tick()
+        self.assertEqual(len(self.w.gh_calls("run", "rerun")), 1)
+        self.assertEqual((e["state"], e["stop"]["code"], e["unrelatedReruns"]),
+                         ("stopped", "own_red", [f"{LA}|{self.RUN}"]))
+        self.assertIn("the rerun of run 44118660533 failed: rerun refused", json.dumps(e["history"]))
+
+    def test_a_workflow_with_no_rule_stops_without_reading_the_files(self):
+        self.unrelated_world(["webviews/src/a.ts"])
+        del self.w.config["unrelatedReds"]  # o/r has no rule: a change can affect every workflow
+        self.land()
+        self.w.answers.append(self.own_red())
+        e = self.tick()
+        self.assertEqual((e["state"], self.w.gh_calls("run", "rerun"), self.w.gh_calls("api")), ("stopped", [], []))
+        self.assertIn("has no inert-path rule", json.dumps(e["history"]))
+
+    def test_the_rust_workspaces_rule(self):
+        rule = gg.land_unrelated_rule("Manaflow-AI/cmux", "rust workspaces")
+        inert = {"webviews/src/x.tsx": True, "docs/a/b.md": True, "scripts/ci/react-doctor-baseline.json": True,
+                 "scripts/measure/first-load-after-restart.sh": True, "scripts/ci/init-submodule.sh": False,
+                 "scripts/ci/api_call_log/env.sh": False, "scripts/measure/workspace-factory/src/main.rs": False,
+                 "webviews/src/agent-session/acpmux/rows/parity/a.jsonl": False, "webviews/build.rs": False,
+                 "Native/OptChat/optchat-chief/tests/mcp_hub.rs": False, ".github/workflows/rust-workspaces.yml": False}
+        self.assertEqual({p: gg.land_path_inert(p, rule) for p in inert}, inert)
+        self.assertIsNone(gg.land_unrelated_rule("manaflow-ai/cmux", "cmux-next guards"))
 
     def test_dependency_chain_lands_after_the_first_merges(self):
         self.pr(LA)
@@ -18691,7 +18894,7 @@ class LandTest(Base):
     def test_a_command_naming_a_run_wait_is_waited_then_judged_again(self):
         """cmux#45404, 2026-11-17: merge_hold's checks_running step was {"kind": "command", "text": "glaeda-gh wait run
         manaflow-ai/cmux/44061804279 --timeout 3600"}, and land stopped on it (and every land queued after it). It is a
-        step: land waits on that run, judges again, and stops only at the third identical refusal in a row."""
+        step: land waits on that run and judges again, and a wait never counts toward the identical-refusal stop."""
         self.pr(LA)
         self.land()
         step = {"kind": "command", "text": "glaeda-gh wait run o/r/44061804279 --timeout 600"}
@@ -18702,10 +18905,10 @@ class LandTest(Base):
         self.assertEqual((e["wait"]["kind"], e["wait"]["run"]), ("run", 44061804279))
         self.assertEqual(e["explain"]["action"]["kind"], "wait_run")
         e = self.tick(601)  # the wait's timeout: judged again, the same refusal
-        self.assertEqual((e["state"], e["streak"]["count"], len(self.w.explains())), ("waiting", 2, 2))
+        self.assertEqual((e["state"], e["streak"], len(self.w.explains())), ("waiting", None, 2))
         e = self.tick(601)
-        self.assertEqual((e["state"], len(self.w.explains())), ("stopped", 3))
-        self.assertIn("3 identical refusals", self.w.sent()[-1][-1])
+        self.assertEqual((e["state"], e["waitRefused"]["count"], len(self.w.explains())), ("waiting", 3, 3))
+        self.assertEqual(self.w.sent(), [])
 
     def test_a_command_naming_a_wait_on_another_repository_still_stops(self):
         self.pr(LA)
@@ -18727,7 +18930,7 @@ class LandTest(Base):
         self.pr(LA)
         self.land()
         for _ in range(3):
-            self.w.answers.append(refusal("ws_check_missing", LA, {"kind": "wait_pr", "sha": LA, "timeout_s": 600}))
+            self.w.answers.append(refusal("review_running", LA, {"kind": "wait_comment", "timeout_s": 600}))
         e = self.tick()
         self.assertEqual(e["streak"]["count"], 1)
         e = self.tick(601)
@@ -18745,7 +18948,68 @@ class LandTest(Base):
         for i in range(3):  # another check finished each time: judged again, the same answer
             self.pr(LA, checks=[("ci", "COMPLETED", "SUCCESS")] + [(f"x{j}", "COMPLETED", "SUCCESS") for j in range(i + 1)])
             e = self.tick()
-        self.assertEqual((e["state"], e["streak"]["count"], len(self.w.explains())), ("waiting", 1, 4))
+        self.assertEqual((e["state"], e["streak"], e["waitRefused"]["count"], len(self.w.explains())),
+                         ("waiting", None, 4, 4))
+        self.assertEqual(e["waitRefused"]["movedAt"], self.t)  # each change is the wait making progress
+
+    def queued_wait(self, head: str = LA, timeout: int = 1800) -> tuple[int, dict]:
+        nxt = f"glaeda-gh wait pr o/r#1 --until done --sha {head} --timeout {timeout}"
+        return refusal("checks_running", head, {"kind": "wait_pr", "sha": head, "until": "done", "timeout_s": timeout},
+                       nxt=nxt, reason=f"merge-hold: refused: checks still running at {head[:8]}")
+
+    def test_checks_running_refusals_at_one_head_never_stop(self):
+        # hq#12626 (d5bf1325) and hq#12595 (db2a372b), 2026-11-18 ~15:50Z: hosted Linux runners queued ~50 min, each
+        # 1800 s wait timed out with the checks still queued, and the third judgment stopped both: "checks_running: 3
+        # identical refusals in a row". Checks still running are a wait: taken and judged again, never a stop.
+        self.pr(LA, checks=[("ci", "COMPLETED", "SUCCESS"), ("linux", "QUEUED", None)])
+        self.land()
+        e = self.run_hour(self.queued_wait, seconds=3 * gg.LAND_WAIT_DEFAULT, step=60.0)
+        judged = [h for h in e["history"] if h["event"] == "judged"]
+        self.assertGreaterEqual(len(judged), 3)
+        self.assertEqual({h["code"] for h in judged}, {"checks_running"})
+        self.assertEqual((e["state"], e["wait"]["kind"], e["streak"], e["waitRefused"]["count"]),
+                         ("waiting", "pr", None, len(judged)))
+        self.assertEqual(self.w.sent(), [], "no stop, nobody asked to requeue")
+        # the checks start: progress, the wait goes on past the bound counted from the first refusal
+        self.pr(LA, checks=[("ci", "COMPLETED", "SUCCESS"), ("linux", "IN_PROGRESS", None)])
+        e = self.run_hour(self.queued_wait, seconds=gg.LAND_WAIT_STUCK - 2 * gg.LAND_WAIT_DEFAULT, step=60.0)
+        self.assertEqual((e["state"], self.w.sent()), ("waiting", []))
+        # they finish green: merged at that head
+        self.pr(LA, checks=[("ci", "COMPLETED", "SUCCESS"), ("linux", "COMPLETED", "SUCCESS")])
+        self.w.answers[:] = [ok_answer(LA)]
+        self.tick()
+        self.assert_merged_at(LA)
+
+    def test_checks_that_never_start_stop_at_the_long_bound_naming_them(self):
+        for code in ("checks_running", "checks_queued_no_runner"):
+            with self.subTest(code=code):
+                shutil.rmtree(gg.land_dir(), ignore_errors=True)
+                self.w = LandWorld(self.tmp.name)
+                self.q = self.queue()
+                self.pr(LA, checks=[("ci", "COMPLETED", "SUCCESS"), ("linux", "QUEUED", None)])
+                self.land()
+                start = self.t
+                e = self.run_hour(lambda: refusal(code, LA, {"kind": "wait_pr", "sha": LA, "timeout_s": 1800}),
+                                  seconds=gg.LAND_WAIT_STUCK + 2 * gg.LAND_WAIT_DEFAULT, step=60.0)
+                self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "checks_stuck"))
+                self.assertGreaterEqual(e["stop"]["at"] - start, gg.LAND_WAIT_STUCK)
+                self.assertIn("w/linux (queued)", e["stop"]["reason"])
+                self.assertNotIn("identical refusals", self.w.sent()[-1][-1])
+                self.assertIn("checks_stuck", self.w.sent()[-1][-1])
+
+    def test_a_merge_refused_for_running_checks_never_counts_toward_the_step_stop(self):
+        # The same class through a step: "ok", then the pinned merge refused [checks_running] naming a wait, again and
+        # again at one head. Each is a wait, never one of LAND_STEP_STOP's refusals; the long bound still ends it.
+        self.pr(LA)
+        self.land()
+        self.w.gh_rc["merge"] = 1
+        self.w.gh_err["merge"] = ("merge-hold: refused [checks_running]: checks still running; next: glaeda-gh wait "
+                                  f"pr o/r#1 --until done --sha {LA} --timeout 900 (why: guard-why)")
+        e = self.run_hour(lambda: ok_answer(LA), seconds=3 * gg.LAND_WAIT_DEFAULT, step=60.0)
+        self.assertGreater(len(self.w.gh_calls("pr", "merge")), gg.LAND_STEP_STOP)
+        self.assertEqual((e["state"], e.get("stepFail"), self.w.sent()), ("waiting", None, []))
+        e = self.run_hour(lambda: ok_answer(LA), seconds=2 * gg.LAND_WAIT_DEFAULT, step=60.0)
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "checks_stuck"))
 
     def test_checks_running_never_calls_explain(self):
         self.pr(LA, checks=[("ci", "IN_PROGRESS", None)])
@@ -18958,13 +19222,12 @@ class LandTest(Base):
         self.assertEqual((len(updates), e["state"]), (1, "waiting"))  # the crashed one only
 
     def test_an_update_cancelled_before_it_was_sent_is_sent_after_the_reexec(self):
-        # review F1: a claim refused while the daemon drains for a re-exec sent nothing, so it never counts as sent
+        # review F1, on #2169's drain: while an update waits to re-exec no new land job starts (reexec_due "defer"),
+        # so a due update-branch is not sent by the old daemon; the next one judges it and sends it exactly once
         self.pr(LA)
         self.land()
         answer = lambda: refusal("tip_merge", LA, {"kind": "update_branch", "expected_head_sha": LA})
-        self.w.answers.append(answer())
-        self.q.draining = True
-        self.tick()
+        self.assertEqual(gg.reexec_due(True, True, self.q.now, self.q.now), "defer")
         self.assertEqual(self.w.gh_calls("api"), [])
         self.q = self.queue()
         e = self.run_hour(answer, seconds=60)
