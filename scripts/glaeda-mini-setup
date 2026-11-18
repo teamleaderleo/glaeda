@@ -2296,6 +2296,7 @@ def run_runner_mode(argv: list[str]) -> int:
     loader = importlib.machinery.SourceFileLoader("glaeda_cmux_runner", os.fspath(SCRIPT_DIR / "glaeda-cmux-runner"))
     spec = importlib.util.spec_from_loader("glaeda_cmux_runner", loader)
     module = importlib.util.module_from_spec(spec)
+    sys.modules[loader.name] = module  # before exec_module: a dataclass in the module looks its module up here
     loader.exec_module(module)
     module.DARWIN_REQUIRED = DARWIN_REQUIRED
     return module.main(argv)

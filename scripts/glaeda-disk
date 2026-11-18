@@ -6,12 +6,13 @@
     glaeda-disk                     report: biggest items, verdicts, reclaimable total
     glaeda-disk --apply             delete every reclaimable item, largest first
     glaeda-disk --pressure --apply  act only under disk pressure, stop at the free target
-    glaeda-disk --idle --apply      while no job runs, delete what sat idle past its family's age
+    glaeda-disk --idle --apply      job or no job, delete what sat idle past its family's age
     glaeda-disk --dead --apply      now, job or no job: delete only what nothing can use (ended steps' checkouts,
                                     stopped unclaimed Tart VMs, retired services' folders, unused journey caches)
     glaeda-disk --pressure --idle --apply  pressure first; with no pressure, an hourly idle sweep
     glaeda-disk --low 15% --target 25%  thresholds as GiB free or as a share of each filesystem
-    glaeda-disk --pressure --apply waits while a GitHub Actions job runs, unless below --emergency
+    glaeda-disk --pressure --apply deletes while jobs run; it holds only while the host is CPU-saturated
+                                    (host_saturated), and never below --emergency; deletes run at low IO priority
     glaeda-disk --refresh           re-measure every size now instead of using the snapshot
     glaeda-disk --dedupe            store identical Xcode package/module files once (APFS clones), in
                                     Xcode's DerivedData and the cmux-next workflow's per-runner copies
@@ -63,7 +64,7 @@ The cmux-next workflow keeps per-runner state under
 ~/Library/Caches/cmux-next-ci.  Its SourcePackages and module/SDK caches are
 reusable inputs, so the explicit cmux-next family below only considers the
 generated Build, Index, Logs and Products children beneath a validated runner
-or dev-daily Release root.  Those children require a DEFAULT_AGE_HOURS (12 h) idle
+or dev-daily Release root.  Those children require a DEFAULT_AGE_HOURS (1 h) idle
 window plus a fresh process/lock/lease check; unknown children and all preserved
 inputs remain visible to accounting and are kept.  The cache has an LRU size cap
 (cmux_next_ci_cap_gib in disk-policy.json or --cmux-next-cap-gib, default 40 GiB, 0 off): while a
@@ -137,7 +138,7 @@ install replaced.
 
 The runner-account profile is intentionally narrower than the normal user profile:
 it covers only DerivedData, cmux reload/GhosttyKit caches, and CUA recordings/frame
-caches, with a DEFAULT_AGE_HOURS (12 h) minimum idle age. Git index refreshes are ignored for that
+caches, with a DEFAULT_AGE_HOURS (1 h) minimum idle age. Git index refreshes are ignored for that
 age clock; process/open-file/command/socket/git-loss checks still veto deletion.
 
 The idle sweep (--idle) reclaims whatever the free space. A busy host sweeps too: deletes skip only what a
@@ -158,7 +159,10 @@ root's newest one under pressure (two during idle sweeps), and a root's kept bui
 trusted seeder, a seed its serve log shows streamed whole to the seed archive (cmux-lawrence's SSD) is
 reclaimable at once instead of after the idle window: the PR minis restore it from there over the LAN.
 SwiftPM scratch (spm-scratch/<fingerprint>) that no job holds by its lock ages like any cache, and goes
-whatever its age once free space is below the emergency floor. The Chromium source tree under
+whatever its age once free space is below the emergency floor. The fast tier's seed root
+(/Users/runner/_work/cmux, cmux owned_spm_scratch.py seed_lease) keeps its package builds while a job holds
+its lock, and under pressure they go after the per-slot builds: the next job restores them from the seed.
+The Chromium source tree under
 cmux-browser-fleet/build and protected release-support caches are never deleted. Small top-level
 browser tour artifacts and fleet cache entries older than the 2026-09-17 migration cutoff are
 disposable; newer ones stay when a live reservation or lease names them.
@@ -914,7 +918,14 @@ SEED_KEEP = 1
 # anyway." DerivedData, CoreSimulator, package caches, runner work dirs and build dirs go once idle this long. Only
 # the newest warm compile cache per builder is exempt, by role and not by age (the per-host cmux-next build root,
 # cmux_next_ci_host_idle_hours; each root's newest SEED_KEEP seeds); older warm caches go at this age too.
-DEFAULT_AGE_HOURS = 12.0
+# Leo, 2026-11-18: "6 hours may be too hard of a thing to hit. these days, it should be more like 1." One hour,
+# under pressure or not; every in-use check (open file, command line, lease, live socket, a running job's own root)
+# still holds an item whatever its age.
+DEFAULT_AGE_HOURS = 1.0
+# The nightly builders' warm inputs keep 12 h: the cmux-nightly-next trees and the cmux-cua source clone that the
+# nightly's "Assemble the Computer Use helper" fetches again from GitHub when it is gone. Nightly run 44232805509
+# failed on that fetch timing out (cmux15, 2026-11-18) after glaeda-disk had reclaimed cmux-cua there six times.
+NIGHTLY_WARM_IDLE_HOURS = 12.0
 KEPT_BUILD_IDLE_HOURS = DEFAULT_AGE_HOURS
 PARKED_IDLE_HOURS = float("inf")  # parked builds age by host-job reuse distance, not wall clock
 # A missing job log cannot establish a reuse distance.  An idle sweep can still make
@@ -1105,6 +1116,9 @@ CMUX_NEXT_DRAIN_HOOK_SHA256 = frozenset({
     "4c60ea0484bad079a6a51c6df977a3956178739542e40655248d5dab011ac41f",
     "27aa7f2985b9e8b0a996dfb4859fa6a6ffe4acc70d1ac20ff95f0338b59158fe",
     "d2c2805b1705ed4da1d82a3de3914b4247b1b020c6e4bd070fa52b34481e4b68",
+    "369ead8fc4c1a1816d372dfb03ea9f1611fead7637b21941a83aa316c1366f7f",
+    "7def763ca3c6912cffc14dca5a28be0ee55279c747f22f7d70904b2d11ebd28b",
+    "6c95f41f8ece6366199891978fbdb75f18f385b3266b3105d0571d6bbcbcd2fe",
 })
 CMUX_NEXT_CI_PRESERVED_NAMES = frozenset({
     "SourcePackages", "ModuleCache.noindex", "SDKStatCaches.noindex",
@@ -1194,6 +1208,10 @@ def fleet_families(ci: Path | None = None) -> list[Family]:
                            platform="macos"))
     if fams:  # root 1's store is the mini's, and the only one that holds SwiftPM scratch (cmux mini_store)
         fams.append(spm_scratch_family(fleet_stores(ci)[0]))
+    packages = CMUX_SEED_ROOT / "cmux/Packages"
+    if (packages.is_dir() and not CMUX_SEED_ROOT.is_symlink()  # a fast-tier job used the seed root here
+            and (CMUX_SEED_ROOT / SEED_ROOT_MARKER).is_file()):
+        fams.append(seed_root_family(packages))
     return fams
 
 
@@ -1459,6 +1477,86 @@ def remove_spm_scratch(path: Path) -> bool:
     return True
 
 
+# cmux CI's fast-tier seed root (cmux scripts/ci/owned_spm_scratch.py seed_lease): an owned mini's fast-tier job
+# builds at the workspace path the base seed was built at on Blacksmith (SwiftPM records absolute paths), restores
+# that seed into its packages' .build, and holds <root>/.cmux-seed-root.lock exclusive for the whole job. The next
+# job restores the seed again, so a build left there costs one restore (minutes) and goes after the per-slot cold
+# builds (runner checkouts, SwiftPM scratch), each of which costs a whole compile (cmux#44271, 2026-11-18). Only
+# the builds go, only under that lock; the mirrored source beside them is small.
+CMUX_SEED_ROOT = Path("/Users/runner/_work/cmux")
+SEED_ROOT_FAMILY = "cmux-fast-tier-seed-root"
+SEED_ROOT_LOCK = ".cmux-seed-root.lock"  # owned_spm_scratch.SEED_LOCK
+# owned_spm_scratch.SEED_MARKER: provisioning marks the seed root. The nightly-next builder's runner also works in
+# /Users/runner/_work/cmux/cmux; without the marker those builds are its runner checkout's, not this family's.
+SEED_ROOT_MARKER = ".cmux-seed-root"
+SEED_ROOT_REBUILD_MINUTES = 30.0  # above every per-slot build family: they go first under pressure
+
+
+def seed_root_family(packages: Path) -> Family:
+    """The seed workspace's package builds: PACKAGES is <seed root>/cmux/Packages."""
+    return Family(SEED_ROOT_FAMILY, packages, True, "the next fast-tier job on this mini restores the base seed",
+                  depth=3, match=".build", build_output=True,  # <platform>/<package>/.build
+                  owner="cmux owned_spm_scratch.py (seed_lease)", rebuild_minutes=SEED_ROOT_REBUILD_MINUTES,
+                  platform="macos")
+
+
+def seed_root_lock(fam: Family) -> Path:
+    return fam.root.parent.parent / SEED_ROOT_LOCK
+
+
+def seed_root_held(fam: Family, path: Path) -> bool:
+    """Whether a fast-tier job holds the seed root: its holder keeps <root>/.cmux-seed-root.lock exclusive.
+    Probed exclusive and released at once; seed_lease takes it non-blocking and falls back to the shared roots for
+    that moment. No lock file means no job ever took it. An unreadable lock counts as held."""
+    try:
+        fd = os.open(seed_root_lock(fam), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return True
+    finally:
+        os.close(fd)
+    return False
+
+
+def seed_root_aside(fam: Family, path: Path) -> Path:
+    """Where a package build goes aside to be deleted: beside the lock with remove()'s deleting name, outside the
+    workspace the next job mirrors into (the mirror would delete an untracked tree there itself)."""
+    return seed_root_lock(fam).parent / f"{DELETING_PREFIX}{path.parent.name}{path.name}-{os.getpid()}"
+
+
+def seed_root_emergency(fam: Family) -> bool:
+    with contextlib.suppress(OSError):
+        return fam.root.stat().st_dev in EMERGENCY_DEVS
+    return False
+
+
+def remove_seed_root_build(fam: Family, path: Path) -> bool:
+    """Under an exclusive lock on the seed root's lock file, so no job takes the root meanwhile, rename one package
+    build aside (seed_root_aside), then delete it outside the lock. A delete cut short leaves an aside
+    tree (interrupted_families finishes it), never a half .build the next job builds on. False, touching nothing,
+    while a job holds the root."""
+    if toolchain_held(path, fresh=True):
+        raise OSError("refusing the job toolchain (toolchain_keep)")
+    if path.is_symlink():
+        raise OSError("refusing symlink")
+    if os.path.ismount(path) or path.lstat().st_dev != path.parent.stat().st_dev:
+        raise OSError("refusing a mount point")
+    with open(seed_root_lock(fam), "a") as handle:  # created as seed_lease creates it
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return False
+        doomed = seed_root_aside(fam, path)
+        os.rename(path, doomed)
+    shutil.rmtree(doomed, onerror=_chmod_retry)
+    return True
+
+
 # Filesystems whose free space is below the emergency floor (emergency_bytes) in this pressure run or report. There
 # the SwiftPM scratch no job holds goes whatever its age: it rebuilds in minutes, and the runner floor is near.
 EMERGENCY_DEVS: frozenset[int] = frozenset()
@@ -1693,6 +1791,8 @@ def item_window(fam: Family, path: Path, idle_hours: float, archived: frozenset[
     (cmux_next_ci_over). Everything else waits out its family's window."""
     if fam.id == "cmux-seeds" and path.name in archived:
         return 0.0
+    if fam.id in REMOTE_COPY_FAMILIES and ACTIVITY_MODE == "pressure":  # a pull brings it back: no age under pressure
+        return 0.0
     if media_tour_stray(fam, path):  # no tour can reach this host: nothing will reuse it
         return 0.0
     if media_tour_warm_slot(fam, path):  # warm by role: only under the runner floor (floor_hold_only)
@@ -1714,6 +1814,9 @@ def item_window(fam: Family, path: Path, idle_hours: float, archived: frozenset[
         return max(window, CMUX_TUI_SETTLE_HOURS)
     if fam.id == CMUX_NEXT_CI_FAMILY and (CMUX_NEXT_CI_DRAIN or cmux_next_ci_over()):
         return 0.0
+    if fam.id == SEED_ROOT_FAMILY:  # rewritten by nearly every fast-tier job, so its window rarely passes: below the
+        if seed_root_emergency(fam):  # emergency floor it goes once no job holds it (the floor hold: below)
+            return 0.0
     if fam.id == SPM_SCRATCH:
         if path.name.startswith(SPM_TRASH):
             return 0.0
@@ -1726,7 +1829,14 @@ def item_window(fam: Family, path: Path, idle_hours: float, archived: frozenset[
                 return 0.0
     if fam.id in STEP_CHECKOUT_FAMILIES and fam.git_disposable and ended_step_checkout(path):
         return min(idle_window(fam, idle_hours), STEP_CHECKOUT_IDLE_HOURS)  # its step ended: nothing comes back
+    if cua_source_clone(fam, path):  # the nightly fetches it again from GitHub: warm by role for 12 h
+        return max(idle_window(fam, idle_hours), NIGHTLY_WARM_IDLE_HOURS)
     return idle_window(fam, idle_hours)
+
+
+def cua_source_clone(fam: Family, path: Path) -> bool:
+    """The cmux-cua source clone (~/Library/Caches/cmux/cmux-cua/src-<sha>), not its build tree (build-src-*)."""
+    return fam.id == "cua-cache" and path.name.startswith("src-")
 
 
 def floor_hold_family(fam: Family, path: Path) -> bool:
@@ -1736,8 +1846,9 @@ def floor_hold_family(fam: Family, path: Path) -> bool:
     it while a compile or a product consumer holds the root: canonical_root_held, re-checked at apply with fresh
     process evidence and taken exclusive to delete; the next compile on the root clears it anyway, and a rerun
     restores it from the artifact; a root without a token file keeps its 12 h window), and code-sign clones
-    (keep_live_app_clones and app_clone_running keep the live ones)."""
-    if (fam.id in (RUNNER_BUILD_FAMILY, RUNNER_ROOT_ADMISSION) or fam.app_clones
+    (keep_live_app_clones and app_clone_running keep the live ones), and the fast tier's seed root builds (its
+    lock keeps the ones a job holds)."""
+    if (fam.id in (RUNNER_BUILD_FAMILY, RUNNER_ROOT_ADMISSION, SEED_ROOT_FAMILY) or fam.app_clones
             or media_tour_warm_slot(fam, path)):
         return True
     if fam.id == CANONICAL_ADMISSION:  # only where the runner hook's token protocol is in force on this root
@@ -1753,6 +1864,8 @@ def floor_hold_only(fam: Family, item: "Item", idle_hours: float) -> bool:
     slot has no age window, so the floor hold is the only thing that lets it go."""
     if media_tour_warm_slot(fam, Path(item.path)):
         return True
+    if fam.id == SEED_ROOT_FAMILY and seed_root_emergency(fam):  # goes below the emergency floor too, like spm scratch
+        return False
     return floor_hold_family(fam, Path(item.path)) and item.idle_hours < idle_window(fam, idle_hours)
 
 
@@ -2106,6 +2219,66 @@ def item_due(fam: "Family", idle_hours: float, window: float) -> tuple[bool, int
         return False, jobs
     return (jobs >= POLICY["sweep_jobs"]
             or (idle_hours >= POLICY["soft_idle_hours"] and jobs >= POLICY["pressure_jobs"])), jobs
+
+
+# A running job no longer holds the whole pass (Leo, 2026-11-18: "the whole "we dont delete while a job is running"
+# also sucks for glaeda. i dont see a good reason for doing that most of the time assuming we're not literally already
+# at 100%+ cpu usage, but we're not"). A deletion is held only by its own item's evidence (an open file, a command
+# line naming it, a lease or token file, a live socket, the running job's own root). The pass as a whole holds only
+# while the CPU is saturated: the 1-minute load average at or above SATURATED_LOAD_PER_CORE per core. On cmux11s
+# (14 cores) under three concurrent cmux jobs the runner hook logged 74-82% CPU busy and the 1/5/15-minute load read
+# 9.4/14.1/19.5 (2026-11-18), so one core per runnable thread is where a delete starts to compete with a job; deletes
+# also run at background IO priority (lower_io_priority), so below that line they yield to the job's IO.
+SATURATED_LOAD_PER_CORE = 1.0
+
+
+def host_saturated() -> str:
+    """Why the host is too busy for a delete now (its CPU saturated), or "". Unreadable reads as not saturated:
+    the per-item checks still hold what a job uses."""
+    try:
+        load1 = os.getloadavg()[0]
+    except OSError:
+        return ""
+    cores = os.cpu_count() or 1
+    if load1 >= SATURATED_LOAD_PER_CORE * cores:
+        return f"host CPU saturated: 1-minute load {load1:.1f} on {cores} cores"
+    return ""
+
+
+def saturation_halt(fss: "dict[int, Fs]", emergency: str, floor_gib: float = 0.0):
+    """host_saturated as an apply halt, except while a filesystem is below its emergency floor: then nothing holds."""
+    if emergency_devs(fss, emergency, floor_gib):
+        return None
+    return host_saturated
+
+
+_IO_LOWERED = False
+
+
+def lower_io_priority() -> str:
+    """Run this process's deletes at background priority so they never slow a job: nice 10 and, on macOS, the
+    throttled disk IO policy (setiopolicy_np, what `taskpolicy -b` sets); on Linux the idle IO class (ionice -c3).
+    Children (rm, git) inherit both. Returns what it set, "" when nothing could be."""
+    global _IO_LOWERED
+    if _IO_LOWERED:
+        return "already lowered"
+    done = []
+    with contextlib.suppress(OSError):
+        os.nice(10)
+        done.append("nice 10")
+    if sys.platform == "darwin":
+        with contextlib.suppress(OSError, AttributeError):
+            libc = ctypes.CDLL("/usr/lib/libSystem.B.dylib", use_errno=True)
+            # IOPOL_TYPE_DISK 0, IOPOL_SCOPE_PROCESS 0, IOPOL_THROTTLE 3
+            if libc.setiopolicy_np(0, 0, 3) == 0:
+                done.append("IO throttled")
+    elif shutil.which("ionice"):
+        with contextlib.suppress(OSError, subprocess.SubprocessError):
+            if subprocess.run(["ionice", "-c3", "-p", str(os.getpid())], capture_output=True,
+                              timeout=5).returncode == 0:
+                done.append("IO idle class")
+    _IO_LOWERED = True
+    return ", ".join(done)
 
 
 # host_busy's reasons that are no answer (it could not read), not a busy host: a caller that waits for idle (the
@@ -4368,7 +4541,7 @@ def default_families(role: str = "fleet-mini") -> list[Family]:
         # that within its git-search budget and kept tens of GiB forever. Live-process checks still apply.
         Family("sparkle-appcast", HOME / "Library/Caches/Sparkle_generate_appcast", True,
                "generate_appcast extracts the published application again", depth=1, build_output=True,
-               min_idle_hours=6.0, max_idle_hours=6.0, owner="Sparkle generate_appcast", rebuild_minutes=1,
+               min_idle_hours=DEFAULT_AGE_HOURS, max_idle_hours=DEFAULT_AGE_HOURS, owner="Sparkle generate_appcast", rebuild_minutes=1,
                pressure_only=role == "devbox", platform="macos"),
         # CUA recordings and frame caches are runner tooling residue, not private user data needed
         # by CI. Keep them separate from the generic Application Support/Cache totals so operators
@@ -4605,8 +4778,8 @@ def runner_cache_families() -> list[Family]:
     if (HOME / "Library/Caches" / CMUX_NEXT_CI_ROOT).is_dir():
         roots.append(replace(cmux_next_ci_family(), min_idle_hours=RUNNER_CACHE_IDLE_HOURS))
     if nightly_next_split():
-        roots.append(replace(nightly_next_family(), min_idle_hours=RUNNER_CACHE_IDLE_HOURS,
-                             max_idle_hours=RUNNER_CACHE_IDLE_HOURS))
+        warm = max(RUNNER_CACHE_IDLE_HOURS, NIGHTLY_WARM_IDLE_HOURS)  # the nightly's warm tree keeps its 12 h
+        roots.append(replace(nightly_next_family(), min_idle_hours=warm, max_idle_hours=warm))
     return [f for f in roots if f.root.is_dir()]
 
 
@@ -6137,6 +6310,8 @@ def interrupted_families(fams: list[Family]) -> list[Family]:
         dirs = {fam.root}
         if fam.id == CMUX_NEXT_CI_FAMILY:  # a whole state set aside leaves no candidate where it sat
             dirs.update(cmux_next_ci_aside_parents(fam.root))
+        if fam.id == SEED_ROOT_FAMILY:  # its builds go aside beside the lock (seed_root_aside)
+            dirs.add(seed_root_lock(fam).parent)
         if fam.id == TART_IMAGES:  # an image sits at any depth: every namespace directory above one
             dirs.update(tart_walk(fam.root)[1])
         elif fam.discover or fam.checkout_builds:
@@ -8597,6 +8772,8 @@ def job_busy(fam: Family, path: Path) -> bool:
         return False
     if fam.id == SPM_SCRATCH:  # dozens of package builds within three levels; its lock is its in-use signal
         return False
+    if fam.id == SEED_ROOT_FAMILY:  # a package build; the seed root's lock is its in-use signal
+        return False
     if fam.id == CANONICAL_ADMISSION:  # a DerivedData; the root's token is its in-use signal
         return False
     if fam.id == RUNNER_ROOT_ADMISSION:  # a DerivedData; its runner's Runner.Worker is its in-use signal
@@ -8634,7 +8811,9 @@ def holds_socket(path: Path, levels: int = 2, budget: int = 3000) -> bool:
     """True when a Unix socket sits up to `levels` below path (tmux, ssh-agent, X11, IDE servers).
 
     /proc shows a socket a process holds as socket:[inode], not as a path, so neither the open
-    file nor the command line check sees it. A directory holding one is treated as in use.
+    file nor the command line check sees it. A directory holding one is treated as in use, unless the socket is
+    stale: nothing listens on it (socket_live). A stopped Tart VM leaves its control.sock behind, and that kept a
+    40 GiB VM idle four days "in-use" on cmux11s (2026-11-18).
     """
     frontier = [str(path)]
     for _ in range(levels):
@@ -8650,7 +8829,7 @@ def holds_socket(path: Path, levels: int = 2, budget: int = 3000) -> bool:
                             st = e.stat(follow_symlinks=False)
                         except OSError:
                             continue
-                        if stat.S_ISSOCK(st.st_mode):
+                        if stat.S_ISSOCK(st.st_mode) and socket_live(e.path):
                             return True
                         if stat.S_ISDIR(st.st_mode):
                             nxt.append(e.path)
@@ -8658,6 +8837,23 @@ def holds_socket(path: Path, levels: int = 2, budget: int = 3000) -> bool:
                 pass
         frontier = nxt
     return False
+
+
+def socket_live(path: str, timeout: float = 0.5) -> bool:
+    """Whether a process listens on the Unix socket at path. Only a refused connection (no listener: the owner
+    exited and left the file) reads as stale; any other outcome, a path too long to bind among them, reads live."""
+    import socket
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        s.settimeout(timeout)
+        s.connect(path)
+        return True
+    except ConnectionRefusedError:
+        return False
+    except OSError:
+        return True
+    finally:
+        s.close()
 
 
 SEARCH_SKIP = REPRODUCIBLE_DIRS | {".git"}
@@ -8698,6 +8894,10 @@ TART_IMAGES, TART_IPSWS = "tart-images", "tart-ipsws"
 TART_VMS = "tart-vms"
 TART_VM_IDLE_HOURS = 2 * 24.0
 TART_FAMILIES = frozenset({TART_IMAGES, TART_IPSWS, TART_VMS})
+# Caches whose every item has a remote copy to pull back (a registry image, Apple's IPSW): under pressure they go
+# whatever their age (Leo, 2026-11-18, via the coordinator: a cache the controller SSD or R2 also holds is
+# reclaimable no matter how old). Seeds in the LAN archive already go at once (item_window's `archived`).
+REMOTE_COPY_FAMILIES = frozenset({TART_IMAGES, TART_IPSWS})
 # Two days past Tart's last access: APFS moves atime at most once a day, so an image cloned daily still reads in use.
 TART_IDLE_HOURS = 2 * 24.0
 TART_DIGEST_PREFIX = "sha256:"
@@ -9364,6 +9564,8 @@ def _survey(families, idle_hours, min_bytes, known, evidence, defer_bulk=False,
             references = references_by_root.setdefault(key, live_artifact_references(fam.reference_root))
             if artifact_referenced(path, references):
                 reasons.append("live lease or running job")
+        if fam.id == SEED_ROOT_FAMILY and seed_root_held(fam, path):
+            reasons.append("a fast-tier job holds the seed root's lock (owned_spm_scratch.py seed_lease)")
         if fam.id == SPM_SCRATCH and spm_scratch_held(path):
             reasons.append("a job holds its lock (owned_spm_scratch.py)")
         if fam.id == TART_VMS and not blind and (why := tart_vm_held(path, cmds)):
@@ -11375,6 +11577,7 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
                     and artifact_referenced(p, fresh_artifact_references(fam.reference_root)))
                 or (i.family == "claude-scratchpad" and claude_session_active(p.name, idle_hours * 3600))
                 or (i.family == SPM_SCRATCH and spm_scratch_held(p))
+                or (i.family == SEED_ROOT_FAMILY and seed_root_held(fam, p))
                 or (i.family == CANONICAL_ADMISSION and canonical_root_held(p))
                 or (tmp_canonical_root(fam, p) and canonical_root_held(p, whole_root=True))):
             outcome = "changed:in-use"
@@ -11434,6 +11637,8 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
                     released += max(0, original_bytes - destination.stat().st_size)
                 elif i.family == SPM_SCRATCH:
                     gone = remove_spm_scratch(p)  # only under its lock: a job may link it right now
+                elif i.family == SEED_ROOT_FAMILY:
+                    gone = remove_seed_root_build(fam, p)  # only under its lock: a job may take the root now
                 elif i.family == CANONICAL_ADMISSION:
                     gone = remove_canonical_admission(p)  # only under its root's token: a job may take it now
                 elif tmp_canonical_root(fam, p):
@@ -12211,7 +12416,7 @@ def nightly_next_split() -> bool:
 def nightly_next_family(root: Path | None = None) -> Family:
     """Pool runners' cmux-nightly-next trees, each its own item; the dedicated builder's tree is never one."""
     root = (HOME / "Library/Caches" / NIGHTLY_NEXT_ROOT) if root is None else root
-    window = DEFAULT_AGE_HOURS  # a module global keep_legacy_ages may have raised for this run
+    window = max(DEFAULT_AGE_HOURS, NIGHTLY_WARM_IDLE_HOURS)  # keep_legacy_ages may have raised the default
     return Family(NIGHTLY_NEXT_FAMILY, root, True,
                   "a fallback nightly-next build on this runner starts cold (the dedicated builder keeps its own)",
                   # SourcePackages/checkouts and notices-crates/git hold SwiftPM and cargo clones, which the next
@@ -12428,7 +12633,9 @@ def clear_stale_build_markers(receipt: Path, roots: list[Path] | None = None,
     except NoEvidence:
         return 0
     opened_indexed = open_index(opened)
-    if any(Path(r).resolve() == (FLEET_ROOT / "cache").resolve() for r in roots) and host_busy():
+    # a marker whose owner is gone holds nothing a job uses (the process evidence above judges each one), so a
+    # running job no longer holds the clear; only a saturated CPU does
+    if any(Path(r).resolve() == (FLEET_ROOT / "cache").resolve() for r in roots) and host_saturated():
         return 0
     released = 0
     seen: set[str] = set()
@@ -13104,7 +13311,7 @@ def _main_impl(argv: list[str] | None = None) -> int:
                          "Tart VMs and images nobody claims, retired services' folders, long-unused journey caches, "
                          "interrupted deletions), whatever the free space and while a job runs; with --apply")
     ap.add_argument("--idle", action="store_true",
-                    help="idle sweep: only while no job runs, delete what sat idle past its family's reuse "
+                    help="idle sweep: job or no job (only what a job uses is held), delete what sat idle past its family's reuse "
                          "window whatever the free space; with --pressure, only when there is no pressure, "
                          "at most hourly")
     # Air Blue sat at 3-7% free for a day with the old 15%/25%: act earlier and free more per run
@@ -13136,7 +13343,7 @@ def _main_impl(argv: list[str] | None = None) -> int:
     ap.add_argument("--cmux-next-reservation-owner",
                     help="cmux-next drain: exact owner string in the active Glaeda reservation")
     ap.add_argument("--idle-hours", type=float, default=None,
-                    help="idle window (default 12h, or 6h under pressure)")
+                    help="idle window (default 1h, DEFAULT_AGE_HOURS, under pressure or not)")
     ap.add_argument("--family", action="append", help="limit to these family ids")
     ap.add_argument("--runner-caches", action="store_true",
                     help="use the narrow enrolled-runner account profile (macOS only)")
@@ -13463,7 +13670,7 @@ def _main_impl(argv: list[str] | None = None) -> int:
         if not reserved and not out_of_band:  # a reserved host gets the floor-pressure pass and nothing else, and
             # an out-of-band run leaves the job-owned build markers to the hook's pass
             stale_marker_released = clear_stale_build_markers(a.receipt)
-    idle = a.idle_hours if a.idle_hours is not None else IDLE_SWEEP_HOURS if sweep else (6 if under else DEFAULT_AGE_HOURS)
+    idle = a.idle_hours if a.idle_hours is not None else IDLE_SWEEP_HOURS if sweep else DEFAULT_AGE_HOURS
     at, known, measured_at = (0.0, {}, {}) if a.refresh or a.no_snapshot else load_snapshot_meta()
     original_known = set(known)
     _REFRESH_PROGRESS_KNOWN = dict(known)
@@ -13612,8 +13819,10 @@ def _main_impl(argv: list[str] | None = None) -> int:
             print(f"  {gib(t.bytes)}  {t.verdict:12s} {t.idle_hours:6.1f}h  {t.family} {t.path} ({', '.join(t.reasons)})")
     if a.apply:
         print()
+        RUN["io_priority"] = lower_io_priority()
         halt = with_run_deadline(cmux_next_drain_halt if a.cmux_next_drain
-                                 else host_busy if sweep and POLICY["defer_during_ci"] else None)
+                                 else host_busy if sweep and POLICY["defer_during_ci"]
+                                 else saturation_halt(fss, a.emergency, floor_gib))
         by_id = {f.id: f for f in fams}
         # the per-host cmux-next build root goes after everything else, idle runners' whole checkouts included
         last = {id(i) for i in items if i.family in by_id and cmux_next_ci_host_root(by_id[i.family], Path(i.path))}
