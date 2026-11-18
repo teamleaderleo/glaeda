@@ -1511,9 +1511,21 @@ def seed_root_held(fam: Family, path: Path) -> bool:
     return False
 
 
+def seed_root_aside(fam: Family, path: Path) -> Path:
+    """Where a package build goes aside to be deleted: beside the lock with remove()'s deleting name, outside the
+    workspace the next job mirrors into (the mirror would delete an untracked tree there itself)."""
+    return seed_root_lock(fam).parent / f"{DELETING_PREFIX}{path.parent.name}{path.name}-{os.getpid()}"
+
+
+def seed_root_emergency(fam: Family) -> bool:
+    with contextlib.suppress(OSError):
+        return fam.root.stat().st_dev in EMERGENCY_DEVS
+    return False
+
+
 def remove_seed_root_build(fam: Family, path: Path) -> bool:
     """Under an exclusive lock on the seed root's lock file, so no job takes the root meanwhile, rename one package
-    build aside with remove()'s deleting name, then delete it outside the lock. A delete cut short leaves an aside
+    build aside (seed_root_aside), then delete it outside the lock. A delete cut short leaves an aside
     tree (interrupted_families finishes it), never a half .build the next job builds on. False, touching nothing,
     while a job holds the root."""
     if toolchain_held(path, fresh=True):
@@ -1527,7 +1539,7 @@ def remove_seed_root_build(fam: Family, path: Path) -> bool:
             fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             return False
-        doomed = path.with_name(f"{DELETING_PREFIX}{path.name}-{os.getpid()}")
+        doomed = seed_root_aside(fam, path)
         os.rename(path, doomed)
     shutil.rmtree(doomed, onerror=_chmod_retry)
     return True
@@ -1789,9 +1801,8 @@ def item_window(fam: Family, path: Path, idle_hours: float, archived: frozenset[
     if fam.id == CMUX_NEXT_CI_FAMILY and (CMUX_NEXT_CI_DRAIN or cmux_next_ci_over()):
         return 0.0
     if fam.id == SEED_ROOT_FAMILY:  # rewritten by nearly every fast-tier job, so its window rarely passes: below the
-        with contextlib.suppress(OSError):  # emergency floor it goes once no job holds it (the floor hold: below)
-            if fam.root.stat().st_dev in EMERGENCY_DEVS:
-                return 0.0
+        if seed_root_emergency(fam):  # emergency floor it goes once no job holds it (the floor hold: below)
+            return 0.0
     if fam.id == SPM_SCRATCH:
         if path.name.startswith(SPM_TRASH):
             return 0.0
@@ -1832,6 +1843,8 @@ def floor_hold_only(fam: Family, item: "Item", idle_hours: float) -> bool:
     slot has no age window, so the floor hold is the only thing that lets it go."""
     if media_tour_warm_slot(fam, Path(item.path)):
         return True
+    if fam.id == SEED_ROOT_FAMILY and seed_root_emergency(fam):  # goes below the emergency floor too, like spm scratch
+        return False
     return floor_hold_family(fam, Path(item.path)) and item.idle_hours < idle_window(fam, idle_hours)
 
 
@@ -6216,6 +6229,8 @@ def interrupted_families(fams: list[Family]) -> list[Family]:
         dirs = {fam.root}
         if fam.id == CMUX_NEXT_CI_FAMILY:  # a whole state set aside leaves no candidate where it sat
             dirs.update(cmux_next_ci_aside_parents(fam.root))
+        if fam.id == SEED_ROOT_FAMILY:  # its builds go aside beside the lock (seed_root_aside)
+            dirs.add(seed_root_lock(fam).parent)
         if fam.id == TART_IMAGES:  # an image sits at any depth: every namespace directory above one
             dirs.update(tart_walk(fam.root)[1])
         elif fam.discover or fam.checkout_builds:
