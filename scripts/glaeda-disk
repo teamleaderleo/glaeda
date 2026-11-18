@@ -9098,7 +9098,12 @@ def lima_vm_held(path: Path, cmds: str) -> str:
         return "its ha.pid is unreadable"
     if fd is not None:
         try:
+            st = os.fstat(fd)
             raw = os.read(fd, 64)
+            # the read moves the pid file's atime (Linux relatime): hand Lima's date back, or this probe alone
+            # would make a stopped instance read as used (tart_vm_last_use counts its files' atime)
+            with contextlib.suppress(OSError, NotImplementedError):
+                os.utime(fd, ns=(st.st_atime_ns, st.st_mtime_ns))
         except OSError:
             return "its ha.pid is unreadable"
         finally:
