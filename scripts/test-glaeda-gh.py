@@ -17103,7 +17103,8 @@ class LandTest(Base):
         state.start()
         self.addCleanup(state.stop)
         # The fleet's machine names (land_session_host): pinned, never the test host's registry.
-        machines = mock.patch.object(gg, "fleet_machines", lambda: frozenset({"host", "other"}), create=True)
+        self.real_fleet_machines = getattr(gg, "fleet_machines", None)
+        machines =mock.patch.object(gg, "fleet_machines", lambda: frozenset({"host", "other"}), create=True)
         machines.start()
         self.addCleanup(machines.stop)
         self.t = NOW
@@ -17958,6 +17959,24 @@ class LandTest(Base):
         # on the executor the lane names a lane on its own host only
         with mock.patch.object(gg, "policy_host", lambda: "executor"):
             self.assertEqual(gg.land_lane({"lane": "child", "laneHost": "host"}), "")
+
+    def test_a_fresh_land_from_an_older_sender_drops_the_last_queuers_lane(self):
+        with mock.patch.object(gg, "policy_host", lambda: "host"):
+            gg.land_request("land", "o/r#1", [], "host/first", lane=("first", "host"))
+            self.pr(LA, checks=[("ci", "IN_PROGRESS", None)])
+            self.tick()
+            self.q.entries[self.KEY]["state"] = "merged"
+            gg.land_request("land", "o/r#1", [], "host/second")  # no lane field: a sender from before it
+            e = self.tick()
+            self.assertNotIn("lane", e)
+            self.assertEqual(gg.land_lane(e), "second")
+
+    def test_a_malformed_registry_alias_never_breaks_a_step(self):
+        doc = {"machines": {"a": {"aliases": "abc"}, "b": {"aliases": 5}, "c": {"aliases": ["c2", 7]}},
+               "origins": {"d": {}}}
+        with mock.patch.object(gg, "fleet_registries", lambda: [doc]), \
+                mock.patch.object(gg, "_fleet_machines", None):
+            self.assertEqual(self.real_fleet_machines(), frozenset({"a", "b", "c", "c2", "d"}))
 
     def test_calls_carry_the_land_tags_and_no_session_keys(self):
         self.pr(LA)

@@ -7787,7 +7787,9 @@ def land_requester_from(given: str | None) -> tuple[str, str]:
         return "", ""
     if source != "--notify":
         host, local = land_session_host(name)
-        return f"{host or policy_host()}/{local if host else name}", source
+        if host:
+            return f"{host}/{local}", source
+        # no registry to tell a peer's HOST/NAME from PARENT/CHILD: kept as it is (acpmux send resolves both)
     return (name if "/" in name else f"{policy_host()}/{name}"), source
 
 
@@ -8192,8 +8194,11 @@ class LandQueue:
         e.update(after=[a for a in after if a != key], requester=str(req.get("requester") or ""),
                  requesterFrom=str(req.get("requesterFrom") or ""), queuedBy=str(req.get("queuedBy") or ""),
                  requestId=req.get("id"), gen=int(e.get("gen") or 0) + 1)
-        if "lane" in req:  # a request from before the lane was recorded leaves the entry's (land_lane reads it)
+        if "lane" in req:
             e.update(lane=str(req.get("lane") or ""), laneHost=str(req.get("laneHost") or ""))
+        elif fresh:  # an older sender's request: land_lane reads its requester, never an earlier queuer's lane
+            e.pop("lane", None)
+            e.pop("laneHost", None)
         if fresh:
             e.update(state="queued", head="", explain=None, action=None, streak=None, wakeAt=None,
                      wait=None, seen=None, seenHead="", mergeSha="", stop=None, preStepHead="",
@@ -8299,8 +8304,9 @@ class LandQueue:
                               "after": [key_name(a) for a in e.get("after") or []],
                               "requester": e.get("requester") or "", "requesterFrom": e.get("requesterFrom") or "",
                               "queuedBy": e.get("queuedBy") or "", "handoff": True}
-                             | ({"lane": e.get("lane") or "", "laneHost": e.get("laneHost") or ""} if "lane" in e
-                                else {}))
+                             # an entry from before the lane was recorded names none there: its requester's
+                             # PARENT/CHILD would read as a session on the executor's host
+                             | {"lane": e.get("lane") or "", "laneHost": e.get("laneHost") or ""})
                 handed.append((key, int(e.get("gen") or 0)))
             d = self.requests_dir()
             blocked = {k for k, e in self.entries.items() if e["state"] not in LAND_DONE}
@@ -12705,7 +12711,8 @@ def fleet_machines() -> frozenset[str]:
             for name, spec in table.items() if isinstance(table, dict) else ():
                 names.add(str(name))
                 aliases = spec.get("aliases") if isinstance(spec, dict) else None
-                names.update(a for a in aliases or () if isinstance(a, str))
+                if isinstance(aliases, list):
+                    names.update(a for a in aliases if isinstance(a, str))
     _fleet_machines = (now, frozenset(n for n in names if n))
     return _fleet_machines[1]
 
