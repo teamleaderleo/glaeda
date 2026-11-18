@@ -8802,7 +8802,7 @@ class VolumeCensusTest(unittest.TestCase):
         self.assertEqual(got["measured"], 13 * gd.GIB)
         self.assertEqual(got["reclaimable"], 3 * gd.GIB)
         self.assertEqual(got["accounting_gap"], 0)
-        self.assertEqual(got["residual"]["category"], gd.APFS_INVISIBLE)
+        self.assertEqual(got["residual"]["category"], gd.OPEN_DELETED)  # a Linux volume: no purgeable space
 
     def test_a_complete_walk_leaves_no_gap(self) -> None:
         sized = self.write("sized/a").parent
@@ -8824,7 +8824,7 @@ class VolumeCensusTest(unittest.TestCase):
         got = gd.filesystem_accounting([self.fs(self.du(self.root))], [], sizes)[0]
         self.assertEqual(got["accounting_gap"], 0)
         self.assertEqual(got["measured"], got["used"])
-        self.assertEqual(got["residual"]["category"], gd.APFS_INVISIBLE)
+        self.assertEqual(got["residual"]["category"], gd.OPEN_DELETED)  # a Linux volume: no purgeable space
         row = next(r for r in got["coverage"] if r["scope"] == gd.CENSUS_SCOPE)
         self.assertIn(f"unclassified:{self.root / 'plain'}", [c["category"] for c in row["children"]])
 
@@ -9083,6 +9083,45 @@ class VolumeCensusTest(unittest.TestCase):
         self.assertEqual(got["dev"], self.root.stat().st_dev)
         self.assertNotIn("/gone/x", got["rows"])
         self.assertIn(str(self.root / "a"), got["rows"])
+
+    def test_linux_census_walks_the_volume_holding_home(self) -> None:
+        # a lane VM, 2026-11-18 (huge-blue 2026-11-16, glaeda#2021): census_roots() was [] off macOS, so 340G of a
+        # full root stayed "unwalked (no volume census yet)"
+        saved = (gd.HOME, gd.RUNNER_CACHE_PROFILE, gd.DARWIN)
+        self.addCleanup(lambda: (setattr(gd, "HOME", saved[0]), setattr(gd, "RUNNER_CACHE_PROFILE", saved[1]),
+                                 setattr(gd, "DARWIN", saved[2])))
+        gd.HOME, gd.RUNNER_CACHE_PROFILE, gd.DARWIN = self.root, False, False
+        self.assertEqual(gd.census_roots(), [gd.mount_point(self.root)])
+        for role in ("devbox", "fleet-mini"):  # whatever role the lane VM's timer runs
+            with mock.patch.object(gd, "ROLE", role):
+                self.assertEqual(gd.census_roots(), [gd.mount_point(self.root)])
+        gd.RUNNER_CACHE_PROFILE = True
+        self.assertEqual(gd.census_roots(), [])
+
+    def test_a_linux_census_opens_home_and_names_each_folder_beside_an_unreadable_one(self) -> None:
+        """A lane VM, 2026-11-18: "/home >=150.4G unreadable" named nothing; home's own folders are rows now."""
+        home = self.root / "home/cmux"
+        self.write("home/cmux/Projects/big", 256 * 1024)
+        self.write("home/cmux/.cache/x", 64 * 1024)
+        other = self.root / "home/someone-else"
+        other.mkdir(parents=True)
+        os.chmod(other, 0)
+        self.addCleanup(os.chmod, other, 0o755)
+        with mock.patch.object(gd, "DARWIN", False):
+            opened = gd.census_open_home(home)
+        self.assertIn(str(self.root / "home"), opened)
+        self.assertIn(str(home), opened)
+        self.assertNotIn("/", opened)
+        census = gd.census_pass([self.root], set(), None, now=50.0, path=self.state, open_also=opened)
+        self.assertTrue(census["complete"])
+        rows = census["rows"]
+        self.assertGreaterEqual(rows[str(home / "Projects")][0], 256 * 1024)
+        self.assertIn(str(home / ".cache"), rows)
+        if os.geteuid() != 0:  # root reads everything
+            self.assertEqual(rows[str(other)][1], "unreadable")
+        self.assertNotIn(str(self.root / "home"), rows)  # opened, never one lower bound
+        with mock.patch.object(gd, "DARWIN", True):
+            self.assertEqual(gd.census_open_home(home), frozenset())
 
     def test_census_du_never_enters_file_provider_trees(self) -> None:
         argv = gd._census_du_argv(self.root)
@@ -9884,6 +9923,100 @@ class LinuxLayoutTest(unittest.TestCase):
         self.assertEqual({r: heads.get(r) for r in want}, want)
         self.assertEqual(heads.get(gd.ARCHIVE_REF + detached), detached)  # a commit only HEAD held
         self.assertTrue(any("bundled to" in r for r in rec["reasons"]))
+
+    def _unreachable_clone(self, how: str) -> tuple[Path, Path, dict, str]:
+        """A mirror unit whose clone (full, shallow or blob:none partial) holds an unpushed commit, a staged edit and
+        an untracked file, and whose origin no longer answers (a lane VM's private origin with no credentials)."""
+        unit, clone, env = self.mirror_unit(srv_commits=3)
+        srv = self.home / "srv"
+        for text in ("an old blob the partial clone never fetched\n", "the blob at origin's tip\n"):
+            (srv / "big.txt").write_text(text * 100)
+            subprocess.run(["git", "-C", str(srv), "add", "big.txt"], check=True, env=env)
+            subprocess.run(["git", "-C", str(srv), "commit", "-qm", "blob"], check=True, env=env)
+        subprocess.run(["git", "-C", str(srv), "config", "uploadpack.allowFilter", "true"], check=True, env=env)
+        shutil.rmtree(clone)
+        extra = {"shallow": ["--depth", "1"], "partial": ["--filter=blob:none"], "full": []}[how]
+        r = subprocess.run(["git", "clone", "-q", *extra, f"file://{srv}", str(clone)], capture_output=True, text=True,
+                           env={k: v for k, v in env.items() if k != "GIT_NO_LAZY_FETCH"})
+        self.assertEqual(r.returncode, 0, r.stderr)
+        if how == "partial":  # the old blob is not here: a lazy fetch would have to ask origin for it
+            old = subprocess.run(["git", "-C", str(srv), "rev-parse", "HEAD~1:big.txt"], capture_output=True,
+                                 text=True, check=True).stdout.strip()
+            listed = subprocess.run(["git", "-C", str(clone), "rev-list", "--objects", "--all", "--missing=print"],
+                                    capture_output=True, text=True, check=True).stdout
+            self.assertIn("?" + old, listed.split())
+        (clone / "new.txt").write_text("committed only here\n")
+        subprocess.run(["git", "-C", str(clone), "add", "new.txt"], check=True, env=env)
+        subprocess.run(["git", "-C", str(clone), "commit", "-qm", "unpushed"], check=True, env=env)
+        (clone / "new.txt").write_text("staged edit\n")
+        subprocess.run(["git", "-C", str(clone), "add", "new.txt"], check=True, env=env)
+        (clone / "notes.md").write_text("untracked\n")
+        subprocess.run(["git", "-C", str(clone), "remote", "set-url", "origin", "https://127.0.0.1:9/gone.git"],
+                       check=True, env=env)
+        head = subprocess.run(["git", "-C", str(clone), "rev-parse", "HEAD"], capture_output=True, text=True,
+                              check=True).stdout.strip()
+        return unit, clone, env, head
+
+    def test_an_unreachable_origin_is_judged_by_its_last_fetched_refs(self) -> None:
+        """A lane VM's /tmp/bsz (12.7G) stayed whole as "remote origin of /tmp/bsz/cef-fix/.git did not answer"
+        (2026-11-18). A full, a shallow and a blob:none partial clone each lose nothing: the unpushed commit goes to a
+        verified bundle on top of what origin held at the last fetch, the uncommitted work to a patch and a tar."""
+        for how in ("full", "shallow", "partial"):
+            with self.subTest(how=how):
+                shutil.rmtree(self.home / "archive", ignore_errors=True)
+                shutil.rmtree(self.home / "srv", ignore_errors=True)
+                shutil.rmtree(self.home / ".cache/cmux-job", ignore_errors=True)
+                gd._DISCOVERED.clear()
+                unit, clone, env, head = self._unreachable_clone(how)
+                rec, err = self.apply_mirror(unit)
+                self.assertEqual(rec["outcome"], "reclaimed", (how, rec["reasons"], err))
+                self.assertFalse(unit.exists())
+                self.assertTrue(any("judged by its last-fetched refs" in r for r in rec["reasons"]), rec["reasons"])
+                bundles = sorted((self.home / "archive/glaeda-disk").glob("*.bundle"))
+                self.assertTrue(bundles)
+                heads = {}
+                for b in bundles:
+                    out = subprocess.run(["git", "bundle", "list-heads", str(b)], capture_output=True, text=True,
+                                         check=True).stdout
+                    heads.update({ln.split(" ")[1]: ln.split(" ")[0] for ln in out.splitlines()})
+                self.assertEqual(heads.get("refs/heads/main"), head)
+                # the bundle holds only what origin lacked: it applies onto origin's history
+                subprocess.run(["git", "-C", str(self.home / "srv"), "fetch", "-q", str(bundles[0]),
+                                "refs/heads/main:refs/heads/restored"], check=True, env=env)
+                show = subprocess.run(["git", "-C", str(self.home / "srv"), "show", "restored:new.txt"],
+                                      capture_output=True, text=True, check=True).stdout
+                self.assertEqual(show, "committed only here\n")
+                archived = list((self.home / "archive/glaeda-disk").iterdir())
+                self.assertTrue(any(p.name.endswith(".patch") for p in archived), archived)
+                self.assertTrue(any(p.name.endswith(".tar.gz") for p in archived), archived)
+
+    def test_an_unreachable_origin_without_tracking_refs_bundles_the_whole_history(self) -> None:
+        unit, clone, env, head = self._unreachable_clone("full")
+        subprocess.run(["git", "-C", str(clone), "update-ref", "-d", "refs/remotes/origin/main"], check=True, env=env)
+        subprocess.run(["git", "-C", str(clone), "update-ref", "-d", "refs/remotes/origin/HEAD"], check=False, env=env)
+        rec, err = self.apply_mirror(unit)
+        self.assertEqual(rec["outcome"], "reclaimed", (rec["reasons"], err))
+        self.assertEqual(self.bundle_heads().get("refs/heads/main"), head)
+
+    def test_a_mirror_held_by_live_worktrees_elsewhere_names_them(self) -> None:
+        """A lane VM's /tmp/wt-rd (22.1G) holds a cmux mirror three checkouts under ~/Projects/checkouts still use:
+        kept, and the plan names each one that holds it."""
+        unit, clone, env = self.mirror_unit()
+        live = [self.home / "Projects/checkouts/cmux" / n for n in ("lane--a", "lane--b")]
+        for w in live:
+            self.git(clone, "worktree", "add", "-q", "--detach", str(w), env=env)
+        gone = self.home / "gone-wt"
+        self.git(clone, "worktree", "add", "-q", "--detach", str(gone), env=env)
+        shutil.rmtree(gone)
+        why = gd.mirror_repos(unit)[0]
+        self.assertIn("held by 2 that still exist", why)
+        for w in live:
+            self.assertIn(str(w), why)
+        self.assertIn("1 whose tree is gone", why)
+        self.assertNotIn(str(gone), why)
+        rec, _ = self.apply_mirror(unit)
+        self.assertEqual(rec["outcome"], "blocked:bundle-failed")
+        self.assertTrue(all((w / ".git").is_file() for w in live))
 
     def test_a_mirror_whose_bundle_fails_is_kept_and_alerts(self) -> None:
         unit, clone, env = self.mirror_unit()

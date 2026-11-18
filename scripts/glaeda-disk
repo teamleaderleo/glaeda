@@ -8398,9 +8398,19 @@ def _server_known(gitdir: Path, remotes: list[str], asked: set[str]) -> tuple[st
     """What the servers hold right now: ("" or why not, refname -> objects they advertise there, the local
     commits and tags among those and `asked` they advertise or acknowledge)."""
     held: dict[str, set[str]] = {}
+    answered: list[str] = []
     for r in remotes:
         if (out := _git_dir_run(gitdir, "ls-remote", "--heads", "--tags", r, network=True, timeout=120)) is None:
-            return f"remote {r} of {gitdir} did not answer", {}, []
+            # A remote that does not answer (a lane VM holds no credentials for a private origin; a dead host) is
+            # judged by what it held when last fetched: its refs/remotes/<r>/*. /tmp/bsz on a lane VM stayed whole
+            # as "remote origin of /tmp/bsz/cef-fix/.git did not answer" (2026-11-18), 12.7G kept by a question
+            # nobody could answer. What no tracking ref reaches is bundled; the tracking commits are the bundle's
+            # prerequisites, so its history must still be on that server, as it was at the fetch.
+            if (out := last_fetched_refs(gitdir, r)) is None:
+                return f"remote {r} of {gitdir} did not answer, and its last-fetched refs are unreadable", {}, []
+            LAST_FETCHED_TRUSTED.append(f"remote {r} of {gitdir} did not answer: judged by its last-fetched refs")
+        else:
+            answered.append(r)
         for ln in out.splitlines():
             obj, _, name = ln.partition("\t")
             held.setdefault(name.removesuffix("^{}"), set()).add(obj)
@@ -8412,8 +8422,23 @@ def _server_known(gitdir: Path, remotes: list[str], asked: set[str]) -> tuple[st
     present = {ln.split()[0] for ln in have.splitlines() if ln.endswith(" commit") or ln.endswith(" tag")}
     advertised = {o for s in held.values() for o in s} & present
     ask = sorted((present & asked) - advertised)
-    acked = _server_acks(gitdir, remotes, ask) if len(ask) <= NEGOTIATE_MAX else set()
+    acked = _server_acks(gitdir, answered, ask) if len(ask) <= NEGOTIATE_MAX and answered else set()
     return "", held, sorted(advertised | (acked & present))
+
+
+LAST_FETCHED_TRUSTED: list[str] = []  # this item's remotes judged by their last fetch (archive_mirror clears it)
+
+
+def last_fetched_refs(gitdir: Path, remote: str) -> str | None:
+    """ls-remote's lines ("<object>\t<refname>") for what REMOTE held when this repository last fetched it: each
+    refs/remotes/<remote>/<branch> as refs/heads/<branch>. None when the refs cannot be read."""
+    out = _git_dir_run(gitdir, "for-each-ref", "--format=%(objectname)\t%(refname)", f"refs/remotes/{remote}/")
+    if out is None:
+        return None
+    prefix = f"refs/remotes/{remote}/"
+    return "\n".join(f"{obj}\trefs/heads/{name[len(prefix):]}" for obj, _, name in
+                     (ln.partition("\t") for ln in out.splitlines())
+                     if name.startswith(prefix) and name != prefix + "HEAD")
 
 
 def server_still_holds(gitdir: Path, relied: list[str]) -> str:
@@ -8892,8 +8917,16 @@ def mirror_repos(path: Path, external: dict[str, tuple[Path, list[str]]] | None 
         # absolute paths; after the rename aside, renamed_gitfiles reads them at the new path.
         outside = [w for w in linked if os.path.realpath(moved_git_path(os.fspath(w))) not in found]
         if outside:
-            return (f"{key}: has linked worktrees outside it or missing "
-                    f"({', '.join(map(os.fspath, outside[:3]))}); kept"), {}, []
+            # Name every worktree that still exists: a lane VM's /tmp/wt-rd (22.1G) holds a cmux mirror that three
+            # checkouts under ~/Projects/checkouts still use (2026-11-18). Re-pointing them is not done here.
+            live = [w for w in outside if os.path.lexists(moved_git_path(os.fspath(w)))]
+            gone = len(outside) - len(live)
+            named = ", ".join(map(os.fspath, live[:8])) + (f" and {len(live) - 8} more" if len(live) > 8 else "")
+            return (f"{key}: has linked worktrees outside it or missing ("
+                    + (f"held by {len(live)} that still exist: {named}" if live else "")
+                    + ("; " if live and gone else "")
+                    + (f"{gone} whose tree is gone (git worktree prune drops them)" if gone else "")
+                    + "); kept"), {}, []
     return "", gitdirs, sorted(trees)
 
 
@@ -9048,6 +9081,7 @@ def archive_mirror(path: Path) -> tuple[str, list[Path], tuple]:
     uncommitted work no archive can hold, or whose repositories or work cannot all be found or archived, is kept.
     ("" or why it must stay, the bundles written, what mirror_moved rechecks)."""
     none: tuple = ([], [], [], {}, None, {}, {}, {})
+    LAST_FETCHED_TRUSTED.clear()
     if (why := archive_root_why(path)):
         return why, [], none
     external: dict[str, tuple[Path, list[str]]] = {}
@@ -10984,6 +11018,7 @@ CENSUS_AUTOLAUNCH = True
 CENSUS_AFTER_SKIPS = (None, "no pressure", "no pressure; idle sweep ran within the hour")  # apply runs it follows
 DATA_VOLUME = Path("/System/Volumes/Data")
 APFS_INVISIBLE = "apfs-invisible (open-deleted/purgeable)"
+OPEN_DELETED = "open-deleted (files a process still holds; lsof +L1 names them)"  # Linux has no purgeable space
 
 
 _CENSUS_FIRMLINK_MEM: dict[str, bool] = {}
@@ -11028,9 +11063,18 @@ def _private_link(name: str) -> bool:
 
 
 def census_roots() -> list[Path]:
-    if not DARWIN or RUNNER_CACHE_PROFILE:
+    """The volume the census walks: the Data volume on macOS, and on Linux the filesystem that holds HOME, from its
+    mount point (the walk stays on that device), whatever the role. Off macOS this returned [], so a lane VM never had
+    a census: 340G of a full 495 GB root read "unwalked (no volume census yet)" while its tests failed with ENOSPC
+    (2026-11-18; first found on huge-blue, 2026-11-16, in glaeda#2021, which this carries)."""
+    if RUNNER_CACHE_PROFILE:
         return []
-    return [DATA_VOLUME] if DATA_VOLUME.is_dir() else []
+    if DARWIN:
+        return [DATA_VOLUME] if DATA_VOLUME.is_dir() else []
+    try:
+        return [mount_point(HOME)]
+    except OSError:
+        return []
 
 
 def load_census(path: Path | None = None) -> dict[str, Any]:
@@ -11348,6 +11392,17 @@ def launch_background_census() -> bool:
     return True
 
 
+def census_open_home(home: Path | None = None) -> frozenset[str]:
+    """On Linux, HOME and every folder above it: the census opens them, so each top-level folder of HOME (and of
+    /home beside it) is its own row, never one du of /home. A lane VM's census read "/home >=150.4G unreadable"
+    (2026-11-18): other accounts' homes there are unreadable, and one unreadable entry made the whole /home a single
+    lower bound that named nothing. On macOS the Data volume walk already opens what it needs."""
+    if DARWIN:
+        return frozenset()
+    home = HOME if home is None else home
+    return frozenset(census_canon(str(p)) for p in (home, *home.parents) if str(p) != "/")
+
+
 def census_main(args: list[str]) -> int:
     ap = argparse.ArgumentParser(prog="glaeda-disk --census")
     ap.add_argument("--census", action="store_true")
@@ -11375,7 +11430,8 @@ def census_main(args: list[str]) -> int:
         if not roots or not census_due(state, time.time()):
             print("census not due; skipped")
             return 0
-        state = census_pass(roots, census_covered(), state, budget_s=max(1.0, a.census_budget_s))
+        state = census_pass(roots, census_covered(), state, budget_s=max(1.0, a.census_budget_s),
+                            open_also=census_open_home())
     print(f"census {'complete' if state['complete'] else 'paused'}: {len(state['rows'])} rows, "
           f"{len(state['pending'])} directories left")
     return 0
@@ -11777,8 +11833,10 @@ def filesystem_accounting(fss: list[Fs], items: list[Item],
             # The census already sized the shared tree by path, so the path-less coverage rows add nothing.
             gap = unclassified
             unreadable = sum(1 for row in census["rows"].values() if row[1] in ("unreadable", "skipped"))
-            residual = APFS_INVISIBLE + (f" and {unreadable} unreadable or skipped dirs (lower bounds)"
-                                         if unreadable else "") + census_unreadable_named(census)
+            # an APFS volume (macOS, or its sibling volumes read) hides purgeable space; a Linux one only open-deleted files
+            residual = (APFS_INVISIBLE if DARWIN or volumes else OPEN_DELETED) + (
+                f" and {unreadable} unreadable or skipped dirs (lower bounds)" if unreadable else "") \
+                + census_unreadable_named(census)
         else:
             gap = max(0, unclassified - known_coverage)
             residual = "unwalked (volume census in progress)" if census else "unwalked (no volume census yet)"
@@ -12556,6 +12614,8 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
         else:
             if mirror_due(fam, p, idle_now) and bundled[1]:
                 i.reasons.append("unpushed git work bundled to " + ", ".join(map(os.fspath, bundled[1])))
+            if mirror_due(fam, p, idle_now) and LAST_FETCHED_TRUSTED:
+                i.reasons += sorted(set(LAST_FETCHED_TRUSTED))
             whole_state = fam.id == CMUX_NEXT_CI_FAMILY and p in cmux_next_ci_state_roots(fam.root)
             try:
                 common = git_common_dir(p) if fam.git_disposable else ""
