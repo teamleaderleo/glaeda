@@ -10,6 +10,9 @@
     glaeda-disk --dead --apply      now, job or no job: delete only what nothing can use (ended steps' checkouts,
                                     stopped unclaimed Tart VMs, retired services' folders, unused journey caches)
     glaeda-disk --pressure --idle --apply  pressure first; with no pressure, an hourly idle sweep
+    On a fleet mini build caches have no age window (BUILD_CACHES_UNWINDOWED): every whole --pressure --apply
+    pass sweeps too, every time, and takes each build cache nothing live holds, past the free target; summary.json's
+    outlived_build_caches names what a pass left behind
     glaeda-disk --low 15% --target 25%  thresholds as GiB free or as a share of each filesystem
     glaeda-disk --pressure --apply deletes while jobs run; it holds only while the host is CPU-saturated
                                     (host_saturated), and never below --emergency; deletes run at low IO priority
@@ -933,6 +936,38 @@ PARKED_IDLE_HOURS = float("inf")  # parked builds age by host-job reuse distance
 # sweep's host-busy gate plus the normal process, socket, lease and recheck guards
 # remain in force before any deletion.
 PARKED_NO_LOG_IDLE_HOURS = DEFAULT_AGE_HOURS
+# No age window for a build cache on a fleet mini (Leo, 2026-11-18: "these build caches, if they're not being used,
+# they're not useful. So stop fucking holding on to bullshit."). Local disk holds only what a running or queued build
+# uses now: a build cache (DerivedData, target dirs, per-hash and per-PR caches, seeds, admission and scheme output)
+# goes on the first pass after nothing live holds it, under pressure or not, past the free target, with no job-count
+# reuse distance and no pressure-only rule. What still keeps one: the never-delete list, live evidence (an open file,
+# a command line, a lock, lease or token, a socket, a running job that may hold it, a running VM), and one working
+# cache per kind by role (each root's current seed, SEED_KEEP; the per-host cmux-next build root; a media host's
+# tour slots; the nightly builder's warm inputs for its queued nightly; a cmux-tui tree a job may be linking into).
+# A reserved host keeps its holder's ages (keep_legacy_ages); disk-policy.json "build_caches_unwindowed": false
+# turns it off on one host. build_cache_unwindowed decides it per item; outlived_build_caches reports what a pass
+# left behind (summary.json), which cmuxterm-hq's detector reads.
+BUILD_CACHES_UNWINDOWED = False  # set by main: a fleet-mini pass, not reserved, not the runner-cache profile
+BUILD_CACHE_FAMILY_NAMES = ("cmux-pr-builds", "cmux-seeds", "cmux-kept-build", "ci-derived-data",
+                            "ci-ios-derived-data", "cmux-ci-admission", "cmux-ci-runner-admission",
+                            "cmux-spm-scratch", "cmux-fast-tier-seed-root", "cmux-next-ci-generated",
+                            "runner-checkout-build", "xcode-derived-data")
+
+
+def build_cache_family(fam: "Family") -> bool:
+    """A family whose items are build caches: build output, or one of the build-state families by id."""
+    return fam.build_output or fam.id in BUILD_CACHE_FAMILY_NAMES
+
+
+def build_cache_unwindowed(fam: "Family", path: Path | None = None) -> bool:
+    """Whether this item has no age window: a build cache on a fleet mini this run, other than the one working
+    cache per kind kept by role (see BUILD_CACHES_UNWINDOWED)."""
+    if not BUILD_CACHES_UNWINDOWED or not build_cache_family(fam) or fam.id == NIGHTLY_NEXT_FAMILY:
+        return False
+    if path is None:
+        return True
+    return not (media_tour_warm_slot(fam, path) or cmux_next_ci_host_root(fam, path)
+                or cmux_next_ci_tui_tree(fam, path) or cua_source_clone(fam, path))
 
 
 def fleet_stores(ci: Path | None = None) -> list[Path]:
@@ -1785,7 +1820,15 @@ def media_tour_stray(fam: Family, path: Path) -> bool:
 
 
 def item_window(fam: Family, path: Path, idle_hours: float, archived: frozenset[str] = frozenset()) -> float:
-    """The idle window for one candidate: a seed the archive already holds may go at once (the newest of each
+    """The idle window for one candidate: none for a build cache on a fleet mini (build_cache_unwindowed), else
+    family_item_window's."""
+    if build_cache_unwindowed(fam, path):
+        return 0.0
+    return family_item_window(fam, path, idle_hours, archived)
+
+
+def family_item_window(fam: Family, path: Path, idle_hours: float, archived: frozenset[str] = frozenset()) -> float:
+    """The family's idle window for one candidate: a seed the archive already holds may go at once (the newest of each
     root still stay, by keep_verdict), and SwiftPM scratch left in the trash or under the emergency floor
     (EMERGENCY_DEVS) may go at once (its lock keeps what a job holds), and so may an idle runner's build output
     while the runner gate holds for disk (FLOOR_HOLD), and cmux-next output while that cache is over its cap
@@ -2026,6 +2069,8 @@ POLICY_DEFAULTS: dict[str, Any] = {
     "low_margin_gib": 4.0,
     "target_margin_gib": 20.0,
     "pressure_idle_hours": 0.5,
+    # false: build caches keep their families' age windows on this host (BUILD_CACHES_UNWINDOWED)
+    "build_caches_unwindowed": True,
     # PRESSURE_MEASURE_BUDGET_S: seconds a pressure --apply spends starting size walks (0: no bound)
     "pressure_measure_budget_s": float(PRESSURE_MEASURE_BUDGET_S),
     "pressure_jobs": 80,
@@ -2199,8 +2244,13 @@ def item_due(fam: "Family", idle_hours: float, window: float) -> tuple[bool, int
     A hot-tier item used since the oldest running CI job started is never due: that job may hold it
     (a `cp -cR` clone leaves the source's times alone, and a step between commands names no path),
     which the old defer-while-CI-runs rule covered. Its own run counts toward jobs_since, so without
-    this a job could age the seed it started from past pressure_jobs."""
+    this a job could age the seed it started from past pressure_jobs.
+
+    A build cache with no age window (build_cache_unwindowed) is due at once, sweep or pressure: no job count and
+    no running job's age keep it, only its own live evidence (judged by the caller and again by apply)."""
     jobs = jobs_since_use(fam, idle_hours)
+    if window <= 0 and build_cache_unwindowed(fam):
+        return True, jobs
     if ACTIVITY_MODE == "pressure" and fam.id in FLEET_FAMILY_IDS:
         # Pressure spends disposable hot state until the free target, even on a quiet host.
         # A running job may touch a source between commands; cwd, command-line, socket and job-unit
@@ -9577,7 +9627,7 @@ def _survey(families, idle_hours, min_bytes, known, evidence, defer_bulk=False,
             reasons.append("a job holds its canonical root (root token)")
         if tmp_canonical_root(fam, path) and canonical_root_held(path, whole_root=True):
             reasons.append("a job holds this canonical root (root token)")
-        if fam.pressure_only and ACTIVITY_MODE != "pressure":
+        if fam.pressure_only and ACTIVITY_MODE != "pressure" and not build_cache_unwindowed(fam, path):
             reasons.append(("runner build output" if fam.id == RUNNER_BUILD_FAMILY else "package cache")
                            + ": pressure-only policy")
         if fam.git_disposable and (reference := referenced_main_checkout(path, nested=fam.nested_git)):
@@ -9603,7 +9653,7 @@ def _survey(families, idle_hours, min_bytes, known, evidence, defer_bulk=False,
             reasons.append("holds a socket")
         if deletable_age and job_busy(fam, path):
             reasons.append("a cmux reload job holds its unit (.cmux-active or .lock)")
-        if fam.pressure_only and ACTIVITY_MODE != "pressure":
+        if fam.pressure_only and ACTIVITY_MODE != "pressure" and not build_cache_unwindowed(fam, path):
             verdict = "kept"
         elif not fam.reclaimable:
             verdict = "report-only"
@@ -11025,6 +11075,47 @@ def write_eviction_contention_health(receipt: Path) -> None:
         pass
 
 
+OUTLIVED_TOP = 10
+
+
+def outlived_build_caches(items: list[Item], families: dict[str, Family]) -> dict[str, Any]:
+    """What an --apply pass left of the build caches nothing live holds: unwindowed build-cache items still on disk
+    that the pass judged reclaimable (or recent) and did not take. Kept ones (live evidence, role keep, never-delete)
+    are not in it. cmuxterm-hq's detector reads it from summary.json: nonzero after two passes is the bug."""
+    left = []
+    for i in items:
+        fam = families.get(i.family)
+        if (fam is not None and i.verdict in ("reclaimable", "recent") and build_cache_unwindowed(fam, Path(i.path))
+                and os.path.lexists(i.path)):
+            left.append(i)
+    left.sort(key=lambda i: -i.bytes)
+    return {"bytes": sum(i.bytes for i in left), "count": len(left),
+            "top": [{"family": i.family, "path": i.path, "bytes": i.bytes, "idle_hours": i.idle_hours,
+                     "verdict": i.verdict} for i in left[:OUTLIVED_TOP]]}
+
+
+def write_outlived_health(outlived: dict[str, Any] | None) -> None:
+    """Set (or, off a fleet mini's unwindowed pass, drop) summary.json's outlived_build_caches."""
+    try:
+        try:
+            payload = json.loads(HEALTH_SUMMARY.read_text())
+            if not isinstance(payload, dict):
+                payload = {}
+        except (OSError, ValueError):
+            payload = {}
+        payload.setdefault("schema", "glaeda-disk/v1")
+        if outlived is None:
+            payload.pop("outlived_build_caches", None)
+        else:
+            payload["outlived_build_caches"] = outlived
+        HEALTH_SUMMARY.parent.mkdir(parents=True, exist_ok=True)
+        tmp = HEALTH_SUMMARY.with_suffix(f".{os.getpid()}.tmp")
+        tmp.write_text(json.dumps(payload, separators=(",", ":")))
+        os.replace(tmp, HEALTH_SUMMARY)
+    except OSError:
+        pass
+
+
 def write_health_summary(fss: list[Fs], items: list[Item], accounting: list[dict[str, Any]],
                          receipt: Path | None = None) -> None:
     """Write the bounded local summary consumed by mini-health and ci-dash's Health row."""
@@ -11480,7 +11571,7 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
             with receipt.open("a") as f:
                 f.write(json.dumps(rec) + "\n")
             continue
-        if targets is not None:
+        if targets is not None and not build_cache_unwindowed(fam, p):  # a build cache goes past the target too
             try:
                 dev = p.parent.stat().st_dev
             except OSError:
@@ -13436,8 +13527,10 @@ def _main_impl(argv: list[str] | None = None) -> int:
                 else "")
     if reserved:
         keep_legacy_ages()
-    global RUNNER_CACHE_PROFILE
+    global RUNNER_CACHE_PROFILE, BUILD_CACHES_UNWINDOWED
     RUNNER_CACHE_PROFILE = bool(a.runner_caches)
+    BUILD_CACHES_UNWINDOWED = (role == "fleet-mini" and not reserved and not RUNNER_CACHE_PROFILE
+                               and bool(POLICY["build_caches_unwindowed"]))
     use_profile_state(RUNNER_CACHE_PROFILE)
     fams = runner_cache_families() if RUNNER_CACHE_PROFILE else default_families(role)
     if RUNNER_CACHE_PROFILE and not DARWIN:
@@ -13504,6 +13597,12 @@ def _main_impl(argv: list[str] | None = None) -> int:
     # a tmpfs is under pressure at a quarter full, so it shortens the idle window only for
     # pressure runs, which then touch nothing but that filesystem's families
     under = any(fs.under for fs in fss.values() if a.pressure or not fs.tmpfs)
+    # A build's caches go when it ends, not when the disk runs short: on a fleet mini every whole pressure pass (the
+    # runner hook's after each job, the gate's, the LaunchAgent's) sweeps when there is no pressure, every time.
+    every_pass_sweeps = (BUILD_CACHES_UNWINDOWED and a.pressure and a.apply and not a.family
+                         and not a.cmux_next_drain and not DEAD_MODE)
+    if every_pass_sweeps:
+        a.idle = True
     sweep = a.idle and not (a.pressure and under)
     RUN["floor_gib"] = round(floor_gib, 1)
     # every filesystem's exact target, and whether they are the ones a plain `--pressure --apply` works to: the runner
@@ -13522,7 +13621,7 @@ def _main_impl(argv: list[str] | None = None) -> int:
         if not a.idle:
             RUN["skipped"] = "no pressure"
             return 0
-        if not idle_due():
+        if not every_pass_sweeps and not idle_due():
             print(f"idle sweep: the last one ran within {IDLE_SWEEP_EVERY_S // 60} min")
             RUN["skipped"] = "no pressure; idle sweep ran within the hour"
             return 0
@@ -13908,6 +14007,10 @@ def _main_impl(argv: list[str] | None = None) -> int:
         after_fss, after_fs_receipt = reobserve_filesystems(fss)
         after_accounting = filesystem_accounting(after_fss, items, known)
         write_health_summary(after_fss, items, after_accounting, a.receipt)
+        if not DEAD_MODE and not a.family and not a.cmux_next_drain:
+            outlived = outlived_build_caches(items, by_id) if BUILD_CACHES_UNWINDOWED else None
+            RUN["outlived_build_cache_gib"] = round(outlived["bytes"] / GIB, 1) if outlived else None
+            write_outlived_health(outlived)
         summary = write_eviction_summary(a.receipt, operation, logical_released,
                                          before_fs_receipt, after_fs_receipt,
                                          receipt_accounting_before, after_accounting)

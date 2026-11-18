@@ -65,7 +65,8 @@ def twelve_hour_ages(test):
 
     @functools.wraps(test)
     def run(*args, **kwargs):
-        policy = {**gd.POLICY, "soft_idle_hours": 12.0, "stale_marker_max_hours": 12.0}
+        policy = {**gd.POLICY, "soft_idle_hours": 12.0, "stale_marker_max_hours": 12.0,
+                  "build_caches_unwindowed": False}
         with mock.patch.multiple(gd, **TWELVE_HOUR_AGES), mock.patch.object(gd, "POLICY", policy):
             return test(*args, **kwargs)
     return run
@@ -128,6 +129,7 @@ class GlaedaDiskTest(unittest.TestCase):
     def tearDown(self) -> None:
         gd.process_evidence = self.gd_evidence
         gd.FLOOR_HOLD = {}  # a main() pressure run in a test sets it
+        gd.BUILD_CACHES_UNWINDOWED = False  # and this, on a fleet-mini run
         gd.NESTED_KEEP.unlink(missing_ok=True)
         gd.NESTED_KEEP = self.gd_keep
         self.tmp.cleanup()
@@ -8215,10 +8217,91 @@ class GlaedaDiskTest(unittest.TestCase):
             self.assertFalse((self.root / "day").exists())
             self.assertTrue(stamp.exists())
             make(self.root / "old", age_hours=50)
-            with mock.patch.object(gd, "host_busy", return_value=""), contextlib.redirect_stdout(io.StringIO()) as out:
-                gd.main(args)  # within the hour: no second sweep
+            with mock.patch.object(gd, "host_busy", return_value=""), contextlib.redirect_stdout(io.StringIO()) as out, \
+                    mock.patch.dict(gd.POLICY, build_caches_unwindowed=False):
+                gd.main(args)  # within the hour: no second sweep (where build caches keep their windows)
             self.assertIn("within", out.getvalue())
             self.assertTrue((self.root / "old").exists())
+            with mock.patch.object(gd, "host_busy", return_value=""), contextlib.redirect_stdout(io.StringIO()) as out:
+                gd.main(args)  # a fleet mini sweeps on every pass: a build's caches go when it ends
+            self.assertNotIn("within", out.getvalue())
+            self.assertFalse((self.root / "old").exists())
+
+    def test_a_finished_builds_cache_goes_on_the_next_pass_with_no_pressure(self) -> None:
+        """Leo, 2026-11-18: "these build caches, if they're not being used, they're not useful. So stop fucking holding
+        on to bullshit." A fleet mini's pass after a job (--pressure --apply, plenty free) sweeps, and a build cache
+        minutes old goes: no age window, no hourly sweep stamp. What a process holds stays."""
+        make(self.root / "finished", age_hours=0.05)
+        make(self.root / "live", age_hours=0.05)
+        stamp = self.root.parent / f"{self.root.name}-idle.last"
+        self.addCleanup(stamp.unlink, missing_ok=True)
+        stamp.touch()  # a sweep "ran within the hour"
+        summary = self.root.parent / f"{self.root.name}-summary.json"
+        self.addCleanup(summary.unlink, missing_ok=True)
+        gd.process_evidence = lambda: ([], f"xcodebuild -derivedDataPath {self.root / 'live'} build\n")
+        args = ["--pressure", "--apply", "--no-snapshot", "--top", "0", "--min-mib", "0", "--low", "1",
+                "--target", "2", "--receipt", os.fspath(self.receipt())]
+        with mock.patch.object(gd, "default_families", return_value=[self.fam]), \
+                mock.patch.object(gd, "free_bytes", return_value=(300 * gd.GIB, 400 * gd.GIB)), \
+                mock.patch.object(gd, "IDLE_STAMP", stamp), mock.patch.object(gd, "HEALTH_SUMMARY", summary), \
+                mock.patch.object(gd, "EVICT_LOCK", self.root.parent / f"{self.root.name}.lock"), \
+                mock.patch.object(gd, "command_lines", return_value=f"xcodebuild -derivedDataPath {self.root / 'live'}\n"), \
+                mock.patch.object(gd, "simulator_runtimes", return_value=[]), contextlib.redirect_stdout(io.StringIO()):
+            gd.main(args)
+        self.assertFalse((self.root / "finished").exists())
+        self.assertTrue((self.root / "live").exists(), "a running build's cache stays")
+        self.assertEqual(json.loads(summary.read_text())["outlived_build_caches"]["count"], 0)
+
+    def test_build_caches_keep_their_windows_off_a_fleet_mini_or_when_turned_off(self) -> None:
+        make(self.root / "finished", age_hours=0.05)
+        args = ["--pressure", "--apply", "--no-snapshot", "--top", "0", "--min-mib", "0", "--low", "1",
+                "--target", "2", "--receipt", os.fspath(self.receipt())]
+        for extra, policy in ((["--role", "devbox"], {}), ([], {"build_caches_unwindowed": False})):
+            with mock.patch.object(gd, "default_families", return_value=[self.fam]), \
+                    mock.patch.object(gd, "free_bytes", return_value=(300 * gd.GIB, 400 * gd.GIB)), \
+                    mock.patch.object(gd, "EVICT_LOCK", self.root.parent / f"{self.root.name}.lock"), \
+                    mock.patch.dict(gd.POLICY, policy), contextlib.redirect_stdout(io.StringIO()) as out:
+                gd.main(args + extra)
+            self.assertIn("no pressure", out.getvalue(), extra or policy)
+            self.assertTrue((self.root / "finished").exists(), extra or policy)
+            self.assertFalse(gd.BUILD_CACHES_UNWINDOWED)
+
+    def test_a_build_cache_has_no_age_window_but_one_per_kind_stays_by_role(self) -> None:
+        dd = gd.Family("ci-derived-data", self.root, True, "rebuild", min_idle_hours=1.0)
+        hot = gd.Family("cmux-pr-builds", self.root, True, "rebuild", max_idle_hours=float("inf"))
+        runner = gd.Family(gd.RUNNER_BUILD_FAMILY, self.root, True, "rebuild", build_output=True, pressure_only=True)
+        scratch = gd.Family("tmp", self.root, True, "rebuild", min_idle_hours=1.0)
+        nightly = gd.Family(gd.NIGHTLY_NEXT_FAMILY, self.root, True, "rebuild", build_output=True,
+                            min_idle_hours=12.0, max_idle_hours=12.0)
+        path = self.root / "x"
+        with mock.patch.object(gd, "BUILD_CACHES_UNWINDOWED", True), mock.patch.object(gd, "job_starts",
+                                                                                     return_value=[time.time()]):
+            for mode in ("pressure", "sweep", None):
+                with mock.patch.object(gd, "ACTIVITY_MODE", mode):
+                    for fam in (dd, hot, runner):
+                        self.assertEqual(gd.item_window(fam, path, 1.0), 0.0, (fam.id, mode))
+                        self.assertTrue(gd.item_due(fam, 0.01, 0.0)[0], (fam.id, mode))  # one job since: still due
+            self.assertEqual(gd.item_window(scratch, path, 1.0), 1.0)  # not a build cache: its window stands
+            self.assertEqual(gd.item_window(nightly, path, 1.0), 12.0)  # the queued nightly's warm inputs
+            with mock.patch.object(gd, "cmux_next_ci_host_root", return_value=True):
+                self.assertNotEqual(gd.item_window(dd, path, 1.0), 0.0)  # one working cache per builder, by role
+        with mock.patch.object(gd, "BUILD_CACHES_UNWINDOWED", False):
+            self.assertEqual(gd.item_window(dd, path, 1.0), 1.0)
+
+    def test_outlived_build_caches_counts_only_unheld_build_caches_still_on_disk(self) -> None:
+        dd = gd.Family("ci-derived-data", self.root, True, "rebuild")
+        scratch = gd.Family("tmp", self.root, True, "rebuild")
+        left, gone, held = make(self.root / "left", mib=2), self.root / "gone", make(self.root / "held")
+        loose = make(self.root / "loose")
+        items = [gd.Item("ci-derived-data", os.fspath(left), 2 * 1024**2, 0.1, "reclaimable"),
+                 gd.Item("ci-derived-data", os.fspath(gone), 1024**2, 0.1, "reclaimable"),
+                 gd.Item("ci-derived-data", os.fspath(held), 1024**2, 0.1, "in-use", ["open by a process"]),
+                 gd.Item("tmp", os.fspath(loose), 1024**2, 0.1, "reclaimable")]
+        fams = {"ci-derived-data": dd, "tmp": scratch}
+        with mock.patch.object(gd, "BUILD_CACHES_UNWINDOWED", True):
+            out = gd.outlived_build_caches(items, fams)
+        self.assertEqual((out["count"], out["bytes"]), (1, 2 * 1024**2))
+        self.assertEqual(out["top"][0]["path"], os.fspath(left))
 
     def test_an_idle_sweep_reuses_recent_sizes_of_what_it_cannot_delete(self) -> None:
         """Leo: "typing under load is not good enough". idle-repair's hourly `--role devbox --refresh --pressure --idle
