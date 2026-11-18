@@ -17102,6 +17102,10 @@ class LandTest(Base):
         state = mock.patch.dict(os.environ, {"GH_QUOTA_STATE": os.fspath(self.latch_dir)})
         state.start()
         self.addCleanup(state.stop)
+        # The fleet's machine names (land_session_host): pinned, never the test host's registry.
+        machines = mock.patch.object(gg, "fleet_machines", lambda: frozenset({"host", "other"}), create=True)
+        machines.start()
+        self.addCleanup(machines.stop)
         self.t = NOW
         self.q = self.queue()
 
@@ -17833,6 +17837,127 @@ class LandTest(Base):
         # a requester on another host names no lane
         self.assertEqual(gg.land_lane({"requester": "other/lane"}), "")
         self.assertEqual(gg.land_lane({"requester": ""}), "")
+
+    LANE_STEPS = {
+        "merge": (lambda: ok_answer(LA), lambda c: c[1:3] == ["pr", "merge"]),
+        "update_branch": (lambda: refusal("tip_merge", LA, {"kind": "update_branch", "expected_head_sha": LA}),
+                          lambda c: "update-branch" in " ".join(c)),
+        "rerun_failed": (lambda: refusal("cancelled", LA, {"kind": "rerun_failed", "runs": [5]}),
+                         lambda c: c[1:3] == ["run", "rerun"]),
+        "review": (lambda: refusal("no_ship", LA, {"kind": "review"}), lambda c: c[0] == "/fake/router-review"),
+    }
+
+    def step_lanes(self, queue: Callable[[], None]) -> dict[str, list]:
+        """Each write step (LANE_STEPS) run once from an entry QUEUE makes on "host": its LANE_GH_LANE per call."""
+        lanes: dict[str, list] = {}
+        for kind, (answer, is_step) in self.LANE_STEPS.items():
+            shutil.rmtree(gg.land_dir(), ignore_errors=True)
+            self.w = LandWorld(self.tmp.name)
+            self.q = self.queue()
+            self.pr(LA)
+            with mock.patch.object(gg, "policy_host", lambda: "host"):
+                queue()
+            self.w.answers.append(answer())
+            spawned: list[tuple[list[str], dict]] = []
+
+            def popen(argv, **kw):
+                spawned.append((list(argv), dict(kw["env"])))
+                return mock.Mock()
+            with mock.patch.object(gg, "policy_host", lambda: "host"), \
+                    mock.patch.object(gg.subprocess, "Popen", side_effect=popen):
+                self.tick()
+            lanes[kind] = [env.get("LANE_GH_LANE") for c, env in list(zip(self.w.calls, self.w.envs)) + spawned
+                           if is_step(c)]
+            self.assertTrue(lanes[kind], f"no {kind} step ran")
+        return lanes
+
+    def test_the_lane_is_the_queuing_sessions_not_the_notified_ones(self):
+        # gcp-agent-lane-1, 2026-11-18: a sub-session (acpmux names it PARENT/CHILD) queued its lands; the requester
+        # was recorded as PARENT/CHILD and read as HOST/SESSION, so no step named a lane and every merge failed
+        # "lease acquisition requires a lane session" before the broker. The queuing process's own lane is recorded,
+        # whoever --notify names (here a coordinator on another host).
+        env = {"ACPMUX_SESSION_NAME": "parent/child", "LANE_GH_LANE": ""}
+        with mock.patch.dict(os.environ, env), mock.patch.object(gg, "policy_host", lambda: "host"):
+            self.assertEqual(gg.land_queue_lane(), "child")
+            self.assertEqual(gg.land_requester_from(None), ("host/parent/child", "$ACPMUX_SESSION_NAME"))
+            self.assertEqual(gg.land_requester_from("other/coord"), ("other/coord", "--notify"))
+        with mock.patch.dict(os.environ, {"ACPMUX_SESSION_NAME": "other/peer-made"}), \
+                mock.patch.object(gg, "policy_host", lambda: "host"):
+            # a peer's HOST/NAME stays as it is: its first part is a fleet machine
+            self.assertEqual(gg.land_requester_from(None), ("other/peer-made", "$ACPMUX_SESSION_NAME"))
+        with mock.patch.dict(os.environ, {"LANE_GH_LANE": "named", "ACPMUX_SESSION_NAME": "parent/child"}):
+            self.assertEqual(gg.land_queue_lane(), "named")  # lane-gh's own order
+        lanes = self.step_lanes(lambda: gg.land_request("land", "o/r#1", [], "other/coord", lane=("child", "host")))
+        self.assertEqual(lanes, {k: ["child"] * len(v) for k, v in lanes.items()})
+
+    def test_an_entry_queued_before_the_lane_was_recorded_reads_its_requester(self):
+        # The 14 entries queued "for v2-architect/lane-vm-create-fallback" on gcp-agent-lane-1: a sub-session's
+        # PARENT/CHILD, told from HOST/SESSION by the fleet registry's machine names, never by a guess.
+        with mock.patch.object(gg, "policy_host", lambda: "host"):
+            self.assertEqual(gg.land_lane({"requester": "v2-architect/lane-vm-create-fallback"}),
+                             "lane-vm-create-fallback")
+            self.assertEqual(gg.land_lane({"requester": "host/v2-architect/lane-vm-create-fallback"}),
+                             "lane-vm-create-fallback")
+            self.assertEqual(gg.land_lane({"requester": "host/lane"}), "lane")
+            self.assertEqual(gg.land_lane({"requester": "other/claude-sr2-coord"}), "")
+            self.assertEqual(gg.land_lane({"requester": "other/parent/child"}), "")
+            self.assertEqual(gg.land_lane({"requester": ""}), "")
+            with mock.patch.object(gg, "fleet_machines", lambda: frozenset()):
+                self.assertEqual(gg.land_lane({"requester": "parent/child"}), "")  # no registry: no guess
+            # a recorded lane wins over the requester, and names one only on its own host
+            self.assertEqual(gg.land_lane({"requester": "host/x", "lane": "y", "laneHost": "host"}), "y")
+            self.assertEqual(gg.land_lane({"requester": "host/x", "lane": "y", "laneHost": "other"}), "")
+            self.assertEqual(gg.land_lane({"requester": "host/x", "lane": "", "laneHost": ""}), "")
+        lanes = self.step_lanes(lambda: self.land(requester="parent/child"))
+        self.assertEqual(lanes, {k: ["child"] * len(v) for k, v in lanes.items()})
+
+    def test_with_no_lane_a_broker_host_writes_as_the_queues_own(self):
+        # A requester on another host, or none, names no lane here. On a lane VM every write step goes as the queue's
+        # own lane (the broker checks the PR is the VM's, and fences a lane by its lease); a host with its own login
+        # names none.
+        for requester, lane in (("other/coord", None), ("", None), ("host/x", ("", ""))):
+            with self.subTest(requester=requester, lane=lane):
+                self.broker = True
+                lanes = self.step_lanes(lambda: gg.land_request("land", "o/r#1", [], requester, lane=lane))
+                self.assertEqual(lanes, {k: ["glaeda-land"] * len(v) for k, v in lanes.items()})
+                self.broker = False
+                lanes = self.step_lanes(lambda: gg.land_request("land", "o/r#1", [], requester, lane=lane))
+                self.assertEqual(lanes, {k: [None] * len(v) for k, v in lanes.items()})
+
+    def test_a_refusal_before_the_broker_stops_at_the_first_and_says_the_next_step(self):
+        # cmux#45753, cmux#45936: six merges in a row refused "land: lease acquisition requires a lane session". No
+        # retry changes it: the first stops the entry, and the requester is told what to run.
+        for kind, rc_key in (("merge", "merge"), ("update_branch", "update"), ("rerun_failed", "rerun")):
+            with self.subTest(kind=kind):
+                shutil.rmtree(gg.land_dir(), ignore_errors=True)
+                self.w = LandWorld(self.tmp.name)
+                self.q = self.queue()
+                self.broker = True
+                self.pr(LA)
+                self.land()
+                self.w.gh_rc[rc_key] = 1
+                self.w.gh_err[rc_key] = f"{kind}: lease acquisition requires a lane session"
+                self.w.answers.append(self.LANE_STEPS[kind][0]())
+                e = self.tick()
+                self.assertEqual((e.get("state"), (e.get("stop") or {}).get("code")), ("stopped", "no_lane"))
+                self.assertIn("glaeda-gh land o/r#1", e["stop"]["next"])
+                self.assertEqual(len(self.w.explains()), 1)
+                self.assertTrue(any("no_lane" in " ".join(c) for c in self.w.sent()), "the requester is told")
+                self.broker = False
+
+    def test_a_forwarded_land_keeps_its_lane_and_host(self):
+        req = {"op": "land", "target": "o/r#1", "requester": "host/parent/child", "id": "r1", "lane": "child",
+               "laneHost": "host"}
+        rid, why = gg.land_serve_one(req)
+        self.assertEqual(why, "")
+        doc = next(d for d in map(gg.read_json, gg.LandQueue.requests_dir().glob("*.json")) if d.get("id") == rid)
+        self.assertEqual((doc["lane"], doc["laneHost"]), ("child", "host"))
+        rid, _ = gg.land_serve_one({**req, "id": "r2", "lane": "bad lane"})
+        doc = next(d for d in map(gg.read_json, gg.LandQueue.requests_dir().glob("*.json")) if d.get("id") == rid)
+        self.assertEqual((doc["lane"], doc["laneHost"]), ("", ""))
+        # on the executor the lane names a lane on its own host only
+        with mock.patch.object(gg, "policy_host", lambda: "executor"):
+            self.assertEqual(gg.land_lane({"lane": "child", "laneHost": "host"}), "")
 
     def test_calls_carry_the_land_tags_and_no_session_keys(self):
         self.pr(LA)

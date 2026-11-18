@@ -7687,21 +7687,67 @@ LAND_FETCH_UNSAFE = frozenset("\0\n\r\t ;|&$`<>\\'\"*?")
 # "land: lease acquisition requires a lane session", exit 1, before the broker. This queue strips the session keys
 # (LAND_ENV), so on gcp-agent-lane-3 on 2026-11-17 every merge and update-branch it sent failed that way: none
 # reached the broker (`lane-gh calls --tool land` holds no land of cmux#45102 or #45090 after 27 and 30 merges).
-# The step is the requester's: its session on this host names the lane; the calls stay charged to glaeda-land
-# (gh_quota reads CMUX_AGENT_SESSION, never LANE_GH_LANE). A requester on another host names none.
+# The step is the queuing session's: its lane names the step's; the calls stay charged to glaeda-land
+# (gh_quota reads CMUX_AGENT_SESSION, never LANE_GH_LANE).
 # Every step that writes passes E (self.env(e)): merge, update_branch, rerun_failed and review (router-review
 # --post writes its comment through the same client). Reads (merge_hold explain, the post-merge `pr view`) and
 # acpmux notices need no lane and run with the bare env.
+# The lane is the queuing process's own (land_queue_lane), recorded in the entry with the host it names a lane on
+# ("lane", "laneHost"): --notify only says who is told. gcp-agent-lane-1, 2026-11-18: the lane was read from the
+# requester, so a sub-session (acpmux names it PARENT/CHILD, which was read as HOST/SESSION), a --notify on another
+# host and a queue with no session all named none, and every merge failed that way six times in a row.
 LAND_LANE_ENV = "LANE_GH_LANE"
 LAND_LANE_NAME = re.compile(r"[A-Za-z0-9._-]{1,100}")
+LAND_LANE_KEYS = (LAND_LANE_ENV, "ACPMUX_SESSION_NAME", "ACPMUX_SESSION")  # lane-gh's lane(), in its order
+# Where no lane is named here (a requester on another host, none, a queue with no session), a step on a broker host
+# writes as the queue's own lane. The broker takes it: it checks a PR is this VM's by the VM, and fences a lane only by
+# its lease (cmuxterm-hq tools/lane-gh-broker parts/30-calls-core.py own_pr; parts/27-leases.py lease_resource_for):
+# update_branch, rerun and a review's comment take the lane's own actor lease, and land the PR's branch lease, refused
+# while another lane holds it ("held by ... wait for expiry", a broker refusal step_refused backs off). There is no
+# route to the controller's queue from a lane VM (`reach` reaches only the VM itself), so no handoff.
+LAND_QUEUE_LANE = "glaeda-land"
+# lane-gh's refusal of a write with no lane, raised before the broker: no retry changes it, so the first one stops the
+# entry (step_refused).
+LAND_NO_LANE = re.compile(r"lease acquisition requires a lane session")
+
+
+def land_session_lane(name: str) -> str:
+    """The lane lane-gh names for session NAME (its last path component), or "" when that is no lane name."""
+    lane = str(name or "").strip().rstrip("/").split("/")[-1]
+    return lane if LAND_LANE_NAME.fullmatch(lane) and lane != LAND_TAG else ""
+
+
+def land_queue_lane() -> str:
+    """The lane of the process queuing a land, as lane-gh would name it for its own write: LANE_GH_LANE, else the acpmux
+    session's name; "" when it has none."""
+    return land_session_lane(next((os.environ[k] for k in LAND_LANE_KEYS if os.environ.get(k, "").strip()), ""))
+
+
+def land_session_host(name: str) -> tuple[str, str]:
+    """(HOST, the session's name on HOST) for a session NAME as a requester holds it. HOST/REST when its first part is
+    this host or a fleet machine (fleet_machines); a bare name, or PARENT/CHILD whose PARENT is no machine (an acpmux
+    sub-session), is a session on this host. ("", NAME) when no registry can tell which a slash is."""
+    first, sep, rest = name.partition("/")
+    me = policy_host()
+    if not sep:
+        return me, name
+    if first == me:
+        return me, rest
+    machines = fleet_machines()
+    if first in machines:
+        return first, rest
+    return ("", name) if not machines else (me, name)
 
 
 def land_lane(e: dict) -> str:
-    """E's requester's session name when the requester is a session on this host, else ""."""
-    host, _, name = str(e.get("requester") or "").rpartition("/")
-    if not host or host != policy_host() or not LAND_LANE_NAME.fullmatch(name) or name == LAND_TAG:
-        return ""
-    return name
+    """The lane E's steps write as on this host, or "": the lane recorded when it was queued, on this host; an entry
+    queued before that was recorded reads its requester (land_session_host), a session on this host naming its
+    lane."""
+    if "lane" in e:
+        lane = str(e.get("lane") or "")
+        return lane if e.get("laneHost") == policy_host() and land_session_lane(lane) == lane else ""
+    host, name = land_session_host(str(e.get("requester") or ""))
+    return land_session_lane(name) if host == policy_host() and name else ""
 
 
 def land_dir() -> Path:
@@ -7730,13 +7776,18 @@ LAND_REQUESTER_KEYS = ("ACPMUX_SESSION_NAME", "ACPMUX_SESSION", "LANE_GH_LANE", 
 
 def land_requester_from(given: str | None) -> tuple[str, str]:
     """(HOST/SESSION, where it came from): --notify (a bare name gets this host), else the first of
-    LAND_REQUESTER_KEYS set in the queuing process (never glaeda-land itself); ("", "") when none is."""
+    LAND_REQUESTER_KEYS set in the queuing process (never glaeda-land itself); ("", "") when none is. A name from
+    the environment is a session here: a sub-session's PARENT/CHILD gets this host too (acpmux send takes
+    HOST/PARENT/CHILD), unless its first part is a fleet machine (a peer's session name, HOST/NAME)."""
     name, source = (given.strip(), "--notify") if given and given.strip() else ("", "")
     if not name:
         name, source = next(((os.environ[k].strip(), "$" + k) for k in LAND_REQUESTER_KEYS
                              if os.environ.get(k, "").strip() and os.environ[k].strip() != LAND_TAG), ("", ""))
     if not name:
         return "", ""
+    if source != "--notify":
+        host, local = land_session_host(name)
+        return f"{host or policy_host()}/{local if host else name}", source
     return (name if "/" in name else f"{policy_host()}/{name}"), source
 
 
@@ -8141,6 +8192,8 @@ class LandQueue:
         e.update(after=[a for a in after if a != key], requester=str(req.get("requester") or ""),
                  requesterFrom=str(req.get("requesterFrom") or ""), queuedBy=str(req.get("queuedBy") or ""),
                  requestId=req.get("id"), gen=int(e.get("gen") or 0) + 1)
+        if "lane" in req:  # a request from before the lane was recorded leaves the entry's (land_lane reads it)
+            e.update(lane=str(req.get("lane") or ""), laneHost=str(req.get("laneHost") or ""))
         if fresh:
             e.update(state="queued", head="", explain=None, action=None, streak=None, wakeAt=None,
                      wait=None, seen=None, seenHead="", mergeSha="", stop=None, preStepHead="",
@@ -8245,7 +8298,9 @@ class LandQueue:
                               f"{int(e.get('gen') or 0)}", "op": "land", "target": key_name(key),
                               "after": [key_name(a) for a in e.get("after") or []],
                               "requester": e.get("requester") or "", "requesterFrom": e.get("requesterFrom") or "",
-                              "queuedBy": e.get("queuedBy") or "", "handoff": True})
+                              "queuedBy": e.get("queuedBy") or "", "handoff": True}
+                             | ({"lane": e.get("lane") or "", "laneHost": e.get("laneHost") or ""} if "lane" in e
+                                else {}))
                 handed.append((key, int(e.get("gen") or 0)))
             d = self.requests_dir()
             blocked = {k for k, e in self.entries.items() if e["state"] not in LAND_DONE}
@@ -8261,7 +8316,7 @@ class LandQueue:
                 if not LAND_REQUEST_ID.fullmatch(rid):
                     rid = path.stem
                 batch.append({k: req.get(k) for k in ("op", "target", "after", "requester", "requesterFrom",
-                                                      "queuedBy")} | {"id": rid})
+                                                      "queuedBy", "lane", "laneHost") if k in req} | {"id": rid})
                 files.append((rid, path))
         return batch, files, handed
 
@@ -8690,9 +8745,10 @@ class LandQueue:
         if isinstance(extra_env, dict):
             env.update({str(k): str(v) for k, v in extra_env.items() if k not in LAND_ENV_TAGS})
         env.update(LAND_ENV_TAGS)
-        lane = land_lane(e) if e is not None else ""
-        if lane:
-            env[LAND_LANE_ENV] = lane
+        if e is not None:
+            lane = land_lane(e) or (LAND_QUEUE_LANE if self.broker_client() else "")
+            if lane:
+                env[LAND_LANE_ENV] = lane
         return env
 
     @staticmethod
@@ -8924,9 +8980,13 @@ class LandQueue:
                 self.claim(e, "rerun_failed", runs=runs)
             results = [self.call([gh, "run", "rerun", str(r), "--failed", "-R", repo], LAND_GH_DEADLINE, e)
                        for r in runs]
+            no_lane = [g for g in results if g.returncode != 0 and LAND_NO_LANE.search(f"{g.stderr} {g.stdout}")]
             with self.lock:
                 self.finish(e, results[-1], exits=[g.returncode for g in results])
                 self.nudge(e["key"])
+                if no_lane:
+                    self.step_refused(e, "rerun_failed", head, no_lane[0])
+                    return
                 self.wait(e, {"kind": "pr", "sha": head, "why": "reran failed jobs"}, LAND_WAIT_DEFAULT)
             return
         if kind == "review":
@@ -9072,6 +9132,12 @@ class LandQueue:
         """KIND, the step merge_hold named, failed at HEAD (LAND_STEP_BACKOFF's comment). Under the lock. Waits or
         stops the entry; answers "update_branch" when the refusal names that step and the caller should take it now."""
         out = f"{got.stderr or ''}\n{got.stdout or ''}"
+        if LAND_NO_LANE.search(out):
+            self.history(e, "step_refused", kind=kind, head=head[:12], why="no lane", n=1)
+            self.stop(e, "no_lane", f"the {kind} at {head[:12]} was refused before the broker: "
+                      f"{land_trim(land_tail(out), 200)} (lane named: {land_lane(e) or 'none'})",
+                      f"from the PR's lane session on {policy_host()}: glaeda-gh land {key_name(e['key'])}")
+            return None
         if LAND_STEP_QUOTA.search(out):
             self.park_quota(e, out)  # the login's state, not the PR's: parked, never counted toward a stop
             e["stepQuotaParked"] = True  # so the judgment after the reset does not count toward a stop either
@@ -9287,9 +9353,10 @@ def land_request_path(rid: str) -> Path:
 
 
 def land_request(op: str, target: str, after: list[str], requester: str, source: str = "", rid: str = "",
-                 queued_by: str = "") -> str:
+                 queued_by: str = "", lane: tuple[str, str] | None = None) -> str:
     """Write one request for the daemon's queue (requests/); its id. RID and QUEUED_BY are kept as given (a forwarded
-    request's, so the executor applies a resend once): else a new id and this process's reader."""
+    request's, so the executor applies a resend once): else a new id and this process's reader. LANE is (the lane its
+    steps write as, the host that lane is on), the queuing process's (land_queue_lane) or a forwarded request's."""
     # The file is named for its arrival here (ingest applies requests/ in name order); the id inside is the request's.
     # A sequence number keeps a batch's requests apart and in order where time_ns() ticks in microseconds (macOS).
     global _land_seq
@@ -9300,8 +9367,16 @@ def land_request(op: str, target: str, after: list[str], requester: str, source:
     write_json(LandQueue.requests_dir() / f"{name}.json",
                {"id": rid, "op": op, "target": target, "key": land_key(target)[0], "after": after,
                 "requester": requester, "requesterFrom": source, "queuedBy": queued_by or reader_name(),
-                "at": time.time()})
+                "at": time.time()} | ({"lane": lane[0], "laneHost": lane[1]} if lane is not None else {}))
     return rid
+
+
+def land_request_lane(req: dict) -> tuple[str, str] | None:
+    """A request's (lane, laneHost) as land_request takes it, or None when it records none (an older sender's)."""
+    if "lane" not in req:
+        return None
+    lane, host = str(req.get("lane") or ""), str(req.get("laneHost") or "")
+    return (lane, host) if land_session_lane(lane) == lane and re.fullmatch(r"[A-Za-z0-9._-]{0,100}", host) else ("", "")
 
 
 def land_line(e: dict, now: float) -> str:
@@ -9454,13 +9529,15 @@ def cmd_land_forwarded(executor: list[str], target: str, after: list[str], reque
     name = land_forward_name(executor)
     targets = [land_key(a)[1] + f"#{land_key(a)[2]}" for a in after]
     rid = f"{policy_host()}-{time.time_ns()}-{os.getpid()}"
+    lane = land_queue_lane()
     req = {"op": "land", "target": f"{repo}#{number}", "after": targets, "requester": requester,
-           "requesterFrom": source, "queuedBy": land_queued_by(), "id": rid, "wait": wait}
+           "requesterFrom": source, "queuedBy": land_queued_by(), "id": rid, "wait": wait, "lane": lane,
+           "laneHost": policy_host() if lane else ""}
     why = "an earlier request is still waiting to be forwarded" if land_outbox_busy(key) else ""
     # Staged first: a crash (or a kill) during the forward leaves it in requests/, which the daemon forwards. The
     # executor applies the same id once, so the daemon's send and this one never land it twice.
     staged = land_request_path(land_request("land", f"{repo}#{number}", targets, requester, source, rid=rid,
-                                            queued_by=req["queuedBy"]))
+                                            queued_by=req["queuedBy"], lane=(req["lane"], req["laneHost"])))
     if not why:
         try:
             out = land_forward(executor, req, LAND_FORWARD_DEADLINE + wait)
@@ -9512,8 +9589,12 @@ def cmd_land(target: str, after: list[str], notify: str | None, wait: float, as_
         else:
             say_waiting(f"glaeda land: refused: {why}\nnext: {nxt}, then glaeda-gh land {repo}#{number}")
         return EXIT_FAIL
+    lane = land_queue_lane()
     rid = land_request("land", f"{repo}#{number}", [land_key(a)[1] + f"#{land_key(a)[2]}" for a in after], requester,
-                       source)
+                       source, lane=(lane, policy_host() if lane else ""))
+    if not lane and land_broker_client() and not as_json:
+        say_waiting(f"glaeda-gh land: no lane here (${LAND_LANE_ENV}, $ACPMUX_SESSION_NAME): its steps write as "
+                    f"{LAND_QUEUE_LANE}, which the broker refuses while another lane holds the PR's branch lease")
     running = daemon_running()
     deadline = time.monotonic() + wait
     entry = None
@@ -9592,7 +9673,7 @@ def land_serve_one(req: Any) -> tuple[str | None, str]:
     queued_by = str(req.get("queuedBy") or "")
     queued_by = queued_by if re.fullmatch(r"[A-Za-z0-9._:/-]{1,200}", queued_by) else "tool:land-forward"
     rid = land_request(str(req["op"]), str(req["target"]), after, requester, str(req.get("requesterFrom") or "")[:80],
-                       rid=str(req.get("id") or ""), queued_by=queued_by)
+                       rid=str(req.get("id") or ""), queued_by=queued_by, lane=land_request_lane(req))
     return rid, ""
 
 
@@ -12587,16 +12668,46 @@ def fleet_hosts() -> list[str]:
     env = os.environ.get("GLAEDA_GH_BUDGET_HOSTS")
     hosts: list[str] = [h.strip() for h in env.split(",") if h.strip()] if env else []
     if not env:
-        for path in (Path(SPENDERS_CMD).resolve().parent.parent / "machines/fleet-registry.json",
-                     Path.home() / ".ssh/config.d/fleet-registry.json"):
-            doc = read_json(path)
-            origins = doc.get("origins") if isinstance(doc, dict) else None
+        for doc in fleet_registries():
+            origins = doc.get("origins")
             if isinstance(origins, dict) and origins:
                 hosts = [str(h) for h in origins]
                 break
         hosts = hosts or list(FLEET_BUDGET_HOSTS)
     me = policy_host()
     return [me] + [h for h in hosts if h != me]
+
+
+def fleet_registries() -> list[dict]:
+    """The fleet registries this host can read, in order: leo-workspace machines/fleet-registry.json beside gh-quota's
+    checkout, then reach's installed copy."""
+    docs = [read_json(path) for path in (Path(SPENDERS_CMD).resolve().parent.parent / "machines/fleet-registry.json",
+                                         Path.home() / ".ssh/config.d/fleet-registry.json")]
+    return [doc for doc in docs if isinstance(doc, dict)]
+
+
+FLEET_MACHINES_TTL = 300.0
+_fleet_machines: tuple[float, frozenset[str]] | None = None
+
+
+def fleet_machines() -> frozenset[str]:
+    """Every machine name the fleet registry knows (its "machines" with their aliases, and its "origins"), read at most
+    once per FLEET_MACHINES_TTL; empty when no registry is readable. What tells a peer's HOST/SESSION from a
+    sub-session's PARENT/CHILD (land_session_host)."""
+    global _fleet_machines
+    now = time.monotonic()
+    if _fleet_machines is not None and now - _fleet_machines[0] < FLEET_MACHINES_TTL:
+        return _fleet_machines[1]
+    names: set[str] = set()
+    for doc in fleet_registries():
+        for field in ("machines", "origins"):
+            table = doc.get(field)
+            for name, spec in table.items() if isinstance(table, dict) else ():
+                names.add(str(name))
+                aliases = spec.get("aliases") if isinstance(spec, dict) else None
+                names.update(a for a in aliases or () if isinstance(a, str))
+    _fleet_machines = (now, frozenset(n for n in names if n))
+    return _fleet_machines[1]
 
 
 def hard_reserve_floor() -> dict:
