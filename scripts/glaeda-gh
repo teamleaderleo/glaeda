@@ -7364,6 +7364,13 @@ LAND_QUOTA_BACKOFF = 300.0
 LAND_QUOTA_BACKOFF_MAX = 3600.0
 LAND_QUOTA_MAX_S = 3700.0  # gh_latch MAX_S: a reset never lies more than GitHub's hour ahead
 LAND_QUOTA_REFUSAL = re.compile(r"quota: not judged|\[quota: not judged")
+# A step's own output (update-branch, rerun, merge) that GitHub refused for the login's quota, in the words the broker
+# and the gh-quota shim use, as well as merge_hold's. Read on a step's output only, never on merge_hold's reason (which
+# can quote a red job's log). Before, only merge_hold's words parked a step: cmux#42244's update-branch was refused
+# "GitHub rate limit (HTTP 403) on the broker host's gh login" twice, each judgment after it counted, and the entry
+# stopped "3 identical refusals in a row" at 19:17Z on a quota that reset minutes later.
+LAND_STEP_QUOTA = re.compile(LAND_QUOTA_REFUSAL.pattern + r"|GitHub(?:'s)? (?:REST |GraphQL )?rate limit"
+                             r"|rate limit is spent|secondary rate limit|content-creation cooldown", re.I)
 # The time a refusal names, in gh_latch.reset_from's order: merge_hold's "no attempt before", then "retry after" /
 # "until" (the latch SENTENCE). HH:MMZ with no seconds is the end of that minute, as gh_latch reads it.
 LAND_QUOTA_SAID = (re.compile(r"\bno attempt before\s+(\d{2}):(\d{2})(?::(\d{2}))?Z"),
@@ -8553,6 +8560,9 @@ class LandQueue:
             e = self.entries[key]
             self.check(e)
             counts = (e.pop("judging", None) or {}).get("counts", True)
+            # The step after the last judgment was refused for quota (step_refused, do_merge): this judgment repeats
+            # it and is not a new refusal of the PR's.
+            counts = counts and not e.pop("stepQuotaParked", False)
         answer = self.explain(e, sha)
         answer["pinned"] = bool(sha)  # judged at the cache's head; unpinned, merge_hold read the head itself
         head = str(answer.get("head") or sha or "").lower()
@@ -8825,8 +8835,10 @@ class LandQueue:
         """KIND, the step merge_hold named, failed at HEAD (LAND_STEP_BACKOFF's comment). Under the lock. Waits or
         stops the entry; answers "update_branch" when the refusal names that step and the caller should take it now."""
         out = f"{got.stderr or ''}\n{got.stdout or ''}"
-        if LAND_QUOTA_REFUSAL.search(out):
+        if LAND_STEP_QUOTA.search(out):
             self.park_quota(e, out)  # the login's state, not the PR's: parked, never counted toward a stop
+            e["stepQuotaParked"] = True  # so the judgment after the reset does not count toward a stop either
+            self.save(e)
             return None
         cls = land_step_class(out)
         sig = f"{kind}|{head}|{cls}"
@@ -8878,10 +8890,12 @@ class LandQueue:
         got = self.call([gh, "pr", "merge", number, "-R", repo, "--squash", "--match-head-commit", sha],
                         LAND_MERGE_DEADLINE, e)
         said = f"{got.stderr or ''} {got.stdout or ''}"
-        if got.returncode != 0 and LAND_QUOTA_REFUSAL.search(said):
+        if got.returncode != 0 and LAND_STEP_QUOTA.search(said):
             with self.lock:  # the shim's merge_hold judged it on a spent quota: parked, and no `pr view` after it
                 self.finish(e, got)
                 self.park_quota(e, said)
+                e["stepQuotaParked"] = True
+                self.save(e)
             return
         view = self.call([gh, "pr", "view", number, "-R", repo, "--json", "state,mergeCommit,headRefOid"],
                          LAND_GH_DEADLINE)

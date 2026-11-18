@@ -17946,6 +17946,35 @@ class LandTest(Base):
         self.assertEqual(self.w.gh_calls("pr", "view"), [])
         self.assertGreaterEqual(e["wakeAt"], reset)
 
+    def test_a_step_github_refused_for_quota_parks_and_never_counts_toward_a_stop(self):
+        # cmux#42244 (2026-11-17 19:17Z): the update-branch merge_hold named was refused by the broker for the login's
+        # quota, in the broker's words, not merge_hold's; each judgment after it counted, and it stopped
+        # "3 identical refusals in a row" on a quota that reset minutes later.
+        self.pr(LA)
+        self.land()
+        reset = self.t + 600
+        at = time.strftime("%H:%M", time.gmtime(reset))
+        real, refused = self.w.run, []
+
+        def quota_update(argv, timeout, env):
+            if any("update-branch" in a or "update_branch" in a for a in map(str, argv)):
+                self.w.calls.append(list(argv))
+                refused.append(argv)
+                return subprocess.CompletedProcess(argv, 1, "", "gh: lane-gh call update_branch o/r: GitHub rate limit "
+                                                   "(HTTP 403) on the broker host's gh login; GitHub's REST rate limit "
+                                                   f"is spent for login until {at}Z (reset); retry after {at}Z")
+            return real(argv, timeout, env)
+        self.q.run = quota_update
+        for n in range(1, gg.LAND_STREAK_STOP + 3):
+            self.w.answers.append(refusal("stale_green", LA, {"kind": "update_branch", "expected_head_sha": LA}))
+            e = self.tick(0 if n == 1 else 700)
+            self.assertEqual((e["state"], (e.get("wait") or {}).get("kind")), ("waiting", "quota"), n)
+            self.assertNotIn("stepFail", e)
+        self.assertEqual(len(refused), gg.LAND_STREAK_STOP + 2)
+        self.assertNotIn("stopped", [h["event"] for h in e["history"]])
+        self.assertTrue(gg.LAND_STEP_QUOTA.search("shared content-creation cooldown: every lane's creates wait"))
+        self.assertIsNone(gg.LAND_QUOTA_REFUSAL.search("GitHub rate limit (HTTP 403)"))  # merge_hold's reason: unchanged
+
     def test_a_held_latch_skips_every_judge(self):
         self.pr(LA)
         self.land()
