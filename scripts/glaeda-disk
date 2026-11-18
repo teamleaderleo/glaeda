@@ -1197,7 +1197,8 @@ def fleet_families(ci: Path | None = None) -> list[Family]:
     if fams:  # root 1's store is the mini's, and the only one that holds SwiftPM scratch (cmux mini_store)
         fams.append(spm_scratch_family(fleet_stores(ci)[0]))
     packages = CMUX_SEED_ROOT / "cmux/Packages"
-    if packages.is_dir() and not CMUX_SEED_ROOT.is_symlink():  # a fast-tier job used the seed root here
+    if (packages.is_dir() and not CMUX_SEED_ROOT.is_symlink()  # a fast-tier job used the seed root here
+            and (CMUX_SEED_ROOT / SEED_ROOT_MARKER).is_file()):
         fams.append(seed_root_family(packages))
     return fams
 
@@ -1473,6 +1474,9 @@ def remove_spm_scratch(path: Path) -> bool:
 CMUX_SEED_ROOT = Path("/Users/runner/_work/cmux")
 SEED_ROOT_FAMILY = "cmux-fast-tier-seed-root"
 SEED_ROOT_LOCK = ".cmux-seed-root.lock"  # owned_spm_scratch.SEED_LOCK
+# owned_spm_scratch.SEED_MARKER: provisioning marks the seed root. The nightly-next builder's runner also works in
+# /Users/runner/_work/cmux/cmux; without the marker those builds are its runner checkout's, not this family's.
+SEED_ROOT_MARKER = ".cmux-seed-root"
 SEED_ROOT_REBUILD_MINUTES = 30.0  # above every per-slot build family: they go first under pressure
 
 

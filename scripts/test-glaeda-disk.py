@@ -2468,6 +2468,7 @@ class GlaedaDiskTest(unittest.TestCase):
         next_build = make(ws / "Packages/macOS/CmuxNext/.build", mib=4, age_hours=50)
         home_build = make(ws / "Packages/Shared/CmuxHomeRender/.build", mib=1, age_hours=50)
         (ws / "Packages/macOS/CmuxNext/Package.swift").write_text("// swift-tools-version:6.0\n")
+        (seed / ".cmux-seed-root").touch()  # provisioning marks it (cmux owned_spm_scratch.SEED_MARKER)
         lock = seed / gd.SEED_ROOT_LOCK
         lock.touch()
         ci = self.root / "ci"
@@ -2478,6 +2479,11 @@ class GlaedaDiskTest(unittest.TestCase):
         with mock.patch.object(gd, "CMUX_SEED_ROOT", self.root / "absent"):
             self.assertEqual([f for f in gd.fleet_families(ci) if f.id == gd.SEED_ROOT_FAMILY], [],
                              "a mini without the seed workspace has no such family")
+        (seed / ".cmux-seed-root").unlink()
+        with mock.patch.object(gd, "CMUX_SEED_ROOT", seed):
+            self.assertEqual([f for f in gd.fleet_families(ci) if f.id == gd.SEED_ROOT_FAMILY], [],
+                             "unmarked, it is a runner's workspace (the nightly-next builder's): never this family")
+        (seed / ".cmux-seed-root").touch()
         fam = fams[0]
         self.assertFalse(gd.job_busy(fam, next_build), "its lock, not a slot marker search, decides")
 
