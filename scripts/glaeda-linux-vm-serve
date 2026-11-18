@@ -409,9 +409,16 @@ class Serve:
     def build(self, rustup: str, source: dict[str, Any]) -> dict[str, Any]:
         private_mkdir(self.stage)
         target = self.serve / "target"
+        # The pinned toolchain's own cargo, with its bin first on PATH: cargo runs `rustc` from PATH, and a
+        # Homebrew rustup's `rustup run` does not put the toolchain there.
+        which = self.run([rustup, "which", "--toolchain", RUST_TOOLCHAIN, "cargo"], timeout=60)
+        cargo_bin = pathlib.Path(which.stdout.strip())
+        if which.returncode != 0 or not cargo_bin.is_absolute() or cargo_bin.name != "cargo":
+            raise Failed(f"rustup cannot locate toolchain {RUST_TOOLCHAIN}: {tail(which.stderr)}")
         env = self.base_env()
-        env["CARGO_TARGET_DIR"] = str(target)
-        cargo = self.run([rustup, "run", RUST_TOOLCHAIN, "cargo", "build", "--locked", "--release", "--bin", "glaeda"],
+        env.update({"PATH": f"{cargo_bin.parent}:/usr/bin:/bin", "CARGO_TARGET_DIR": str(target),
+                    "RUSTUP_TOOLCHAIN": RUST_TOOLCHAIN})
+        cargo = self.run([str(cargo_bin), "build", "--locked", "--release", "--bin", "glaeda"],
                          env=env, timeout=BUILD_TIMEOUT, cwd=self.repo)
         if cargo.returncode != 0:
             raise Failed(f"cargo build failed: {tail(cargo.stderr)}")
@@ -434,7 +441,7 @@ class Serve:
             if path.parent == self.stage:
                 path.unlink()
             artifacts[name] = {"sha256": sha256_file(dest), "bytes": dest.stat().st_size}
-        rustc = self.run([rustup, "run", RUST_TOOLCHAIN, "rustc", "--version"], timeout=60).stdout.strip()
+        rustc = self.run([str(cargo_bin.parent / "rustc"), "--version"], env=env, timeout=60).stdout.strip()
         receipt = {"created_by": SCHEMA, "source_commit": source["commit"], "staged_at": now(),
                    "go": GO_VERSION, "rustc": tail(rustc), "artifacts": artifacts}
         write_private(self.stage_receipt, (json.dumps(receipt, indent=2, sort_keys=True) + "\n").encode())

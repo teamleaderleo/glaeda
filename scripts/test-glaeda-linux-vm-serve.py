@@ -77,11 +77,15 @@ class Fake:
             if argv[1:3] == ["toolchain", "install"]:
                 self.toolchains += f"{serve.RUST_TOOLCHAIN}-aarch64-apple-darwin\n"
                 return ok()
-            if "cargo" in argv:
-                target = pathlib.Path(env["CARGO_TARGET_DIR"]) / "release"
-                target.mkdir(parents=True, exist_ok=True)
-                (target / "glaeda").write_bytes(b"glaeda-binary")
-                return ok()
+            if argv[1] == "which":
+                return ok(f"/rustup/toolchains/{argv[3]}-aarch64-apple-darwin/bin/{argv[4]}\n")
+            raise AssertionError(f"unexpected rustup argv {argv}")
+        if argv[0].endswith("/bin/cargo"):
+            target = pathlib.Path(env["CARGO_TARGET_DIR"]) / "release"
+            target.mkdir(parents=True, exist_ok=True)
+            (target / "glaeda").write_bytes(b"glaeda-binary")
+            return ok()
+        if argv[0].endswith("/bin/rustc"):
             return ok("rustc 1.97.1 (x 2026-01-01)\n")
         if argv[0].endswith("/glaeda"):
             verb = argv[4]
@@ -237,8 +241,12 @@ class OperatorStage(Case):
         self.assertEqual(stat.S_IMODE(template.stat().st_mode), 0o600)
         self.assertIn(f"sha256:{report['stage']['scaleset-bridge']}", template.read_text())
         # cargo through the pinned toolchain, go with a local toolchain and no cgo
-        cargo = next(c for c in fake.calls if "cargo" in c)
-        self.assertEqual(cargo[1:6], ["run", serve.RUST_TOOLCHAIN, "cargo", "build", "--locked"])
+        cargo, cargo_env = next((c, e) for c, e in zip(fake.calls, fake.envs) if c[0].endswith("/bin/cargo"))
+        self.assertIn(f"/{serve.RUST_TOOLCHAIN}-", cargo[0])
+        self.assertEqual(cargo[1:3], ["build", "--locked"])
+        # cargo finds the pinned rustc first on PATH
+        self.assertEqual(cargo_env["PATH"].split(":")[0], str(pathlib.Path(cargo[0]).parent))
+        self.assertEqual(cargo_env["RUSTUP_TOOLCHAIN"], serve.RUST_TOOLCHAIN)
         go_env = next(e for c, e in zip(fake.calls, fake.envs) if c[0].endswith("/bin/go") and c[1] == "build")
         self.assertEqual((go_env["GOTOOLCHAIN"], go_env["CGO_ENABLED"], go_env["GOFLAGS"]), ("local", "0", "-mod=readonly"))
         self.assertFalse(report["installed"]["program"].get("contract_ok"))
