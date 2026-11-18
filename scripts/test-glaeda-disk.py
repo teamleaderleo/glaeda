@@ -13690,5 +13690,228 @@ class CacheBudgetTest(unittest.TestCase):
         self.assertEqual(gd.cache_budget_state([fam], {self.dev: self.fs}, {}, gd.read_fleet_cas_record(path)), {})
 
 
+class EvictLockQueueTest(unittest.TestCase):
+    """evict.lock's bounded hold and fair queue. A fleet mini, 2026-11-18 05:31 to 10:22: the runner hook's DISK_BOUND
+    ran pass after pass, each taking evict.lock, while 35 floor evictions and 27 LaunchAgent, launchd and build-worker
+    runs skipped as eviction_busy, about as often as they ran."""
+
+    _main_run = GlaedaDiskTest._main_run
+    _queue = GlaedaDiskTest._queue
+    receipt = GlaedaDiskTest.receipt
+    tearDown = GlaedaDiskTest.tearDown
+
+    def setUp(self) -> None:
+        GlaedaDiskTest.setUp(self)
+        for name in ("EVICT_LOCK", "EVICT_OWNER", "_EVICT_TICKET", "_EVICT_RANK", "_EVICT_HANDLE", "_EVICT_TAKEN_AT",
+                     "_EVICT_HALTS"):
+            self.addCleanup(setattr, gd, name, getattr(gd, name))
+        gd.EVICT_LOCK, gd.EVICT_OWNER = self.root / "evict.lock", self.root / "evict.owner.json"
+        gd._EVICT_TICKET, gd._EVICT_RANK, gd._EVICT_HANDLE = None, 1, None
+        self.waiters = gd.evict_waiters_dir()
+        run = mock.patch.dict(gd.RUN, clear=True)
+        run.start()
+        self.addCleanup(run.stop)
+
+    def sleeper(self) -> subprocess.Popen:
+        """A live process of this test's own, standing in for a waiting run."""
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+        self.addCleanup(lambda: (child.kill(), child.wait()))
+        return child
+
+    def dead_pid(self) -> int:
+        child = subprocess.Popen([sys.executable, "-c", "pass"])
+        child.wait()
+        return child.pid
+
+    def ticket(self, rank: int, pid: int, age_s: float = 0.0) -> str:
+        self.waiters.mkdir(parents=True, exist_ok=True)
+        name = f"{rank}-{int((time.time() - age_s) * 1e9):020d}-{pid}.ticket"
+        (self.waiters / name).write_text("{}")
+        return name
+
+    def test_the_queue_serves_floor_waiters_first_then_first_come_and_skips_dead_tickets(self) -> None:
+        live = self.sleeper().pid
+        early = self.ticket(1, live, age_s=10)
+        floor = self.ticket(0, live, age_s=5)
+        late = self.ticket(1, live, age_s=1)
+        dead = self.ticket(1, self.dead_pid(), age_s=3)
+        stale = self.ticket(1, live, age_s=gd.EVICT_TICKET_STALE_S + 10)
+        self.assertEqual(gd.evict_waiters(), [floor, early, late], "a floor waiter goes ahead; then FIFO")
+        self.assertFalse((self.waiters / dead).exists(), "a dead waiter's ticket is cleared")
+        self.assertTrue((self.waiters / stale).exists(), "a stale one (pid reused) is only ignored")
+        mine = self.waiters / late
+        self.assertEqual(gd.evict_queue_ahead(mine), [floor, early])
+        self.assertEqual(gd.evict_queue_ahead(None), [floor, early, late], "a run with no ticket is behind all")
+
+    def test_a_queued_acquire_never_jumps_a_live_waiter(self) -> None:
+        self.ticket(1, self.sleeper().pid, age_s=1)
+        self.assertIsNone(gd.acquire_evict_lock(queued=True), "the free lock is the waiter's turn")
+        handle = gd.acquire_evict_lock()  # drain and runner-cache-profile runs: the lock alone decides, as before
+        self.assertIsNotNone(handle)
+        gd.release_evict_lock(handle)
+        gd._EVICT_RANK = 0  # a floor run's ticket goes ahead of the waiting LaunchAgent's
+        mine = gd.take_evict_ticket()
+        self.assertEqual(json.loads(mine.read_text())["floor"], True)
+        handle = gd.acquire_evict_lock(queued=True)
+        self.assertIsNotNone(handle, "first in line: its turn")
+        gd.release_evict_lock(handle)
+        gd.drop_evict_ticket()
+        self.assertFalse(mine.exists())
+        self.assertIsNone(gd._EVICT_TICKET)
+
+    def test_the_holder_yields_between_items_only_past_its_slice_with_a_waiter(self) -> None:
+        gd._EVICT_HANDLE, gd._EVICT_HALTS = object(), 0
+        gd._EVICT_TAKEN_AT = time.monotonic() - gd.EVICT_SLICE_S - 1
+        self.assertEqual(gd.evict_yield_halt(), "", "the first deletion's check never yields")
+        self.assertEqual(gd.evict_yield_halt(), "", "past the slice, but nobody waits")
+        self.ticket(1, self.sleeper().pid)
+        why = gd.evict_yield_halt()
+        self.assertTrue(why.startswith(gd.EVICT_YIELD_MARK), why)
+        self.assertEqual(gd.RUN["evict_yielded"], 1)
+        self.assertEqual(gd.evict_yield_halt(), gd.EVICT_YIELD_MARK, "once it yields, every later step stops")
+        self.assertEqual(gd.with_evict_yield(None)(), gd.EVICT_YIELD_MARK)
+        gd.RUN.clear()
+        gd._EVICT_HALTS, gd._EVICT_TAKEN_AT = 1, time.monotonic()
+        self.assertEqual(gd.evict_yield_halt(), "", "within its slice the holder keeps deleting")
+        self.assertEqual(gd.with_evict_yield(lambda: "busy host")(), "busy host", "the caller's halt still stops it")
+        gd._EVICT_RANK, gd._EVICT_TAKEN_AT = 0, time.monotonic() - gd.EVICT_SLICE_S - 1
+        self.assertEqual(gd.evict_yield_halt(), "", "a floor holder does not yield to a run the floor does not need")
+        self.ticket(0, self.sleeper().pid)
+        self.assertTrue(gd.evict_yield_halt().startswith(gd.EVICT_YIELD_MARK), "it yields to another floor run")
+        gd.RUN.clear()
+        gd._EVICT_HANDLE = None
+        self.assertEqual(gd.evict_yield_halt(), "", "after the release (the gc, the repacks) there is nothing to yield")
+
+    def test_only_a_bounded_run_waits_and_with_half_its_bound(self) -> None:
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(gd.RUN_DEADLINE_ENV, None)
+            self.assertEqual(gd.queue_wait_until(True), 0.0, "no bound: it skips at once, as before")
+        with mock.patch.dict(os.environ, {gd.RUN_DEADLINE_ENV: repr(time.time() + 100)}):
+            left = gd.queue_wait_until(True) - time.monotonic()
+            self.assertTrue(15 < left <= 20, f"half of the 40 s left before the margin: {left}")
+            self.assertEqual(gd.queue_wait_until(False), 0.0)
+        with mock.patch.dict(os.environ, {gd.RUN_DEADLINE_ENV: repr(time.time() + 840)}):  # the LaunchAgent's
+            left = gd.queue_wait_until(True) - time.monotonic()
+            self.assertTrue(385 < left <= 390, f"half of its 780 s left: {left}")
+            self.assertGreater(left, gd.EVICT_SLICE_S, "still longer than a holder's slice")
+        with mock.patch.dict(os.environ, {gd.RUN_DEADLINE_ENV: repr(time.time() + 3600)}):
+            left = gd.queue_wait_until(True) - time.monotonic()
+            self.assertTrue(gd.EVICT_WAIT_FLOOR_S - 5 < left <= gd.EVICT_WAIT_FLOOR_S, f"capped: {left}")
+        self.assertGreater(gd.EVICT_WAIT_FLOOR_S, gd.EVICT_SLICE_S, "a waiter outlasts a holder's whole slice")
+
+    def test_a_launchagent_run_waits_its_turn_and_its_run_line_says_how_long(self) -> None:
+        _, _, p_lock, p_pending = self._queue()
+        env = {gd.CALLER_ENV: "disk-pressure LaunchAgent", gd.RUN_DEADLINE_ENV: repr(time.time() + 840)}
+        with p_lock, p_pending, mock.patch.dict(os.environ, env), \
+                mock.patch.object(gd, "EVICT_WAIT_POLL_S", 0.01), \
+                mock.patch.object(gd, "eviction_lock_is_held", side_effect=[True, True, False]), \
+                mock.patch.object(gd, "cmux_next_ci_cap_state", return_value=None):
+            os.environ.pop(gd.HOOK_PASS_ENV, None)
+            status, rows, survey, _ = self._main_run(["--pressure", "--apply"], free_gib=100.0)
+        self.assertEqual(status, 0)
+        row = rows[-1]
+        self.assertEqual(row["skipped"], None, "it waited in the queue and ran instead of skipping")
+        self.assertEqual((row["evict_queue_position"], row["evict_floor_wait"]), (1, None))
+        self.assertIsInstance(row["evict_wait_s"], float)
+        self.assertIn("evict.lock queue: this run's turn came", self.said)
+        self.assertEqual(os.listdir(self.waiters), [], "its ticket is gone once served")
+        survey.assert_called()
+
+    def test_a_queued_run_whose_bound_runs_out_skips_as_busy_and_says_where_it_stood(self) -> None:
+        _, _, p_lock, p_pending = self._queue()
+        lock = self.root / "evict.lock"
+        env = {gd.CALLER_ENV: "disk-pressure LaunchAgent", gd.RUN_DEADLINE_ENV: repr(time.time() + 60.2)}
+        with p_lock, p_pending, lock.open("a") as busy, mock.patch.dict(os.environ, env), \
+                mock.patch.object(gd, "EVICT_WAIT_POLL_S", 0.01), \
+                mock.patch.object(gd, "cmux_next_ci_cap_state", return_value=None):
+            os.environ.pop(gd.HOOK_PASS_ENV, None)
+            fcntl.flock(busy, fcntl.LOCK_EX)
+            status, rows, survey, _ = self._main_run(["--pressure", "--apply"], free_gib=100.0)
+        self.assertEqual(status, 0)
+        row = rows[-1]
+        self.assertEqual((row["skipped"], row["evict_queue_position"]), ("eviction_busy", 1))
+        self.assertIsNotNone(row["evict_wait_s"])
+        self.assertIn("wait in the queue (place 1) ended with it still evicting", self.said)
+        self.assertEqual(os.listdir(self.waiters), [], "a waiter that leaves takes its ticket with it")
+        survey.assert_not_called()
+
+    def test_a_newcomer_with_no_bound_does_not_take_a_free_lock_a_waiter_is_due(self) -> None:
+        _, _, p_lock, p_pending = self._queue()
+        self.ticket(1, self.sleeper().pid)
+        with p_lock, p_pending, mock.patch.dict(os.environ, {gd.CALLER_ENV: "test"}), \
+                mock.patch.object(gd.time, "sleep") as slept, \
+                mock.patch.object(gd, "cmux_next_ci_cap_state", return_value=None):
+            for name in (gd.HOOK_PASS_ENV, gd.RUN_DEADLINE_ENV):
+                os.environ.pop(name, None)
+            status, rows, survey, _ = self._main_run(["--pressure", "--apply"], free_gib=100.0)
+        self.assertEqual((status, rows[-1]["skipped"], rows[-1]["evict_wait_s"]), (0, "eviction_busy", None))
+        slept.assert_not_called()
+        survey.assert_not_called()
+
+    def test_a_bounded_waiter_behind_an_older_one_runs_once_that_one_is_gone(self) -> None:
+        _, _, p_lock, p_pending = self._queue()
+        older = self.sleeper()
+        self.ticket(1, older.pid, age_s=1)
+        import threading
+        leave = threading.Timer(0.3, lambda: (older.kill(), older.wait()))
+        leave.start()
+        self.addCleanup(leave.cancel)
+        env = {gd.CALLER_ENV: "disk-pressure LaunchAgent", gd.RUN_DEADLINE_ENV: repr(time.time() + 840)}
+        with p_lock, p_pending, mock.patch.dict(os.environ, env), \
+                mock.patch.object(gd, "EVICT_WAIT_POLL_S", 0.02), \
+                mock.patch.object(gd, "cmux_next_ci_cap_state", return_value=None):
+            os.environ.pop(gd.HOOK_PASS_ENV, None)
+            status, rows, survey, _ = self._main_run(["--pressure", "--apply"], free_gib=100.0)
+        row = rows[-1]
+        self.assertEqual((status, row["skipped"], row["evict_queue_position"]), (0, None, 2))
+        self.assertGreaterEqual(row["evict_wait_s"], 0.2, "it waited for the older waiter, not just for the lock")
+        survey.assert_called()
+
+    def test_a_pass_yields_through_its_halt_and_says_so_for_the_hooks_bound(self) -> None:
+        _, _, p_lock, p_pending = self._queue()
+        seen = []
+
+        def reap(receipt, halt=None, **kw):  # a step main() hands its halt to after the families' deletions
+            gd._EVICT_TAKEN_AT = time.monotonic() - gd.EVICT_SLICE_S - 1
+            self.ticket(0, self.sleeper().pid)
+            seen.extend([halt(), halt()])
+            return 0
+        with p_lock, p_pending, mock.patch.dict(os.environ, {gd.CALLER_ENV: "test"}), \
+                mock.patch.object(gd, "saturation_halt", return_value=lambda: ""), \
+                mock.patch.object(gd, "reap_tmpdir_test_residue", side_effect=reap), \
+                mock.patch.object(gd, "cmux_next_ci_cap_state", return_value=None):
+            for name in (gd.HOOK_PASS_ENV, gd.RUN_DEADLINE_ENV):
+                os.environ.pop(name, None)
+            status, rows, _, _ = self._main_run(["--pressure", "--apply"], free_gib=100.0)
+        self.assertEqual(status, 0)
+        self.assertEqual(seen[0], "", "the first item always goes")
+        self.assertTrue(seen[1].startswith(gd.EVICT_YIELD_MARK), seen)
+        self.assertEqual(rows[-1]["evict_yielded"], 1)
+        self.assertIn(f"{gd.EVICT_YIELD_MARK}: 1 waiting", self.said)
+
+    def test_a_run_that_yielded_leaves_the_hooks_claimed_triggers_for_the_next_pass(self) -> None:
+        for yielded, kept in ((2, True), (None, False)):
+            with self.subTest(yielded=yielded):
+                claimed = self.root / "hook-pass.pending.claimed"
+                claimed.touch()
+                fd = os.open(self.root / "hook-pass.lock", os.O_RDWR | os.O_CREAT, 0o600)
+
+                def impl(args):
+                    gd.RUN["evict_yielded"] = yielded
+                    return 0
+                with mock.patch.object(gd, "HOOK_PASS_CLAIMED", claimed), mock.patch.object(gd, "_HOOK_PASS_FD", fd), \
+                        mock.patch.object(gd, "_main_impl", side_effect=impl), \
+                        mock.patch.object(gd, "launch_background_census"), \
+                        mock.patch.dict(os.environ, {gd.CALLER_ENV: "test"}):
+                    self.assertEqual(gd._logged_main(["--pressure", "--apply"]), 0)
+                self.assertEqual(claimed.exists(), kept)
+
+    def test_the_hooks_bound_reads_the_same_queue_and_yield_words(self) -> None:
+        text = (ROOT / "scripts/glaeda-cmux-runner-hook").read_text()
+        self.assertIn(f'b"{gd.EVICT_YIELD_MARK}"', text, "DISK_BOUND keeps its trigger on this exact phrase")
+        self.assertIn(f'"{gd.EVICT_WAITERS}"', text, "DISK_BOUND looks for waiters where glaeda-disk puts them")
+        self.assertIn(f"> {gd.EVICT_TICKET_STALE_S:g}:", text, "the same stale age for a ticket")
+
+
 if __name__ == "__main__":
     unittest.main()
