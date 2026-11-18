@@ -2815,7 +2815,7 @@ class BalanceTest(Base):
         self.assertEqual(self.gh.named_calls, [])
         self.assertIsNone(gg.verdict("pr", data, until="required"))
         text = gg.summary("pr:o/r#34", {"data": data})
-        self.assertIn("checks PENDING (partial: 100 of 243 read; check pages held: "
+        self.assertIn("checks INCONCLUSIVE (partial: 100 of 243 read; check pages held: "
                       "graphql: PR check pages over their hourly share)", text)
         self.assertIn(f"required, not read yet (check pages held): {self.CLIPPY}", text)
         self.assertNotIn("not reported yet", text)
@@ -20688,7 +20688,7 @@ class StragglerTest(unittest.TestCase):
             data = gg.straggler_pass("pr:o/r#45147", data, self.now, get)
         self.assertEqual(len(self.calls), 4, self.calls)
         self.assertEqual(sum(1 for c in self.calls if "check-runs" in c), 1)
-        self.assertEqual(gg.verdict("pr", data, "done", now=self.now), gg.EXIT_OK)
+        self.assertEqual(gg.verdict("pr", data, "done", now=self.now), gg.EXIT_INCONCLUSIVE)
         said = gg.summary("pr:o/r#45147", {"data": data}, "done")
         self.assertIn("stragglers, not required, queued with no runner past 30 min", said)
         self.assertIn("publish artifacts (cmux-tui artifacts, overflow-8vcpu-linux, 41 min)", said)
@@ -20697,12 +20697,12 @@ class StragglerTest(unittest.TestCase):
         # green and required waits are unchanged: they never waited on optional checks this way
         self.assertIsNone(gg.verdict("pr", data, "green", now=self.now))
 
-    def test_finished_checks_decide_the_verdict(self) -> None:
+    def test_a_red_among_stragglers_is_still_not_done(self) -> None:
         red = {"runs": {"SUCCESS": 219, "FAILURE": 1, "SKIPPED": 5, "QUEUED": 3}, "statuses": {"SUCCESS": 1}}
         data, get = self.head(counts=red)
         for _ in range(3):
             data = gg.straggler_pass("pr:o/r#45147", data, self.now, get)
-        self.assertEqual(gg.verdict("pr", data, "done", now=self.now), gg.EXIT_FAIL)
+        self.assertEqual(gg.verdict("pr", data, "done", now=self.now), gg.EXIT_INCONCLUSIVE)
 
     def test_no_read_while_anything_else_runs(self) -> None:
         """The cost stays flat: while a check runs, waits, or a status is pending, no straggler read is made."""
@@ -20749,7 +20749,7 @@ class StragglerTest(unittest.TestCase):
             seen = gg.straggler_pass("pr:o/r#45147", data, t, get)
             decided = gg.verdict("pr", seen, "done", now=t)
             t += 3
-        self.assertEqual(decided, gg.EXIT_OK)
+        self.assertEqual(decided, gg.EXIT_INCONCLUSIVE)
         self.assertLess(t - self.now, gg.STRAGGLER_AFTER + 60)
         self.assertLessEqual(len(self.calls), 1 + 3 + gg.STRAGGLER_AFTER // gg.STRAGGLER_REREAD, self.calls)
 
@@ -20773,7 +20773,7 @@ class StragglerTest(unittest.TestCase):
         data, get = self.head()
         for _ in range(3):
             data = gg.straggler_pass("pr:o/r#45147", data, self.now, get)
-        self.assertEqual(gg.verdict("pr", data, "done", now=self.now), gg.EXIT_OK)
+        self.assertEqual(gg.verdict("pr", data, "done", now=self.now), gg.EXIT_INCONCLUSIVE)
         swapped = {**data, "checksTotal": data.get("checksTotal", 0) + 1,
                    "checkCounts": {"runs": {"SUCCESS": 221, "SKIPPED": 5, "QUEUED": 3}, "statuses": {"SUCCESS": 1}}}
         self.assertIsNone(gg.verdict("pr", swapped, "done", now=self.now))
@@ -20785,7 +20785,7 @@ class StragglerTest(unittest.TestCase):
         with mock.patch.object(gg, "straggler_get", side_effect=AssertionError("straggler_get in the daemon")):
             for _ in range(3):
                 data = gg.straggler_pass("pr:o/r#45147", data, self.now, get)
-        self.assertEqual(gg.verdict("pr", data, "done", now=self.now), gg.EXIT_OK)
+        self.assertEqual(gg.verdict("pr", data, "done", now=self.now), gg.EXIT_INCONCLUSIVE)
 
     def test_a_bad_seen_file_is_read_as_empty(self) -> None:
         gg.BASE.mkdir(parents=True, exist_ok=True)
@@ -20800,7 +20800,7 @@ class StragglerTest(unittest.TestCase):
     def test_property_every_mix_of_stragglers(self) -> None:
         """For every mix of required/optional, queued/in progress, young/past the bound and first attempt/rerun over
         one to three unfinished checks (shown, under 100 checks), the wait ends only when each is optional, queued,
-        past the bound and a first attempt; and then on the finished checks' verdict."""
+        past the bound and a first attempt; and then inconclusive, never success."""
         import itertools
         kinds = list(itertools.product((False, True), ("QUEUED", "IN_PROGRESS"), (10 * 60, 31 * 60), (1, 2)))
         for n in (1, 2, 3):
@@ -20814,7 +20814,7 @@ class StragglerTest(unittest.TestCase):
                                            "attempt": attempt, "workflow": "w", "labels": ["l"]}
                 data = {**gg.parse_pr(pr_node(1, checks=checks)), "queuedJobs": jobs}
                 ends = all(not r and s == "QUEUED" and ago > gg.STRAGGLER_AFTER and a == 1 for r, s, ago, a in mix)
-                self.assertEqual(gg.verdict("pr", data, "done", now=self.now), gg.EXIT_OK if ends else None, mix)
+                self.assertEqual(gg.verdict("pr", data, "done", now=self.now), gg.EXIT_INCONCLUSIVE if ends else None, mix)
                 said = gg.summary("pr:o/r#1", {"data": data}, "done")
                 needed = any(r and s == "QUEUED" and ago > gg.STRAGGLER_AFTER and a == 1 for r, s, ago, a in mix)
                 self.assertEqual("required, queued with no runner past 30 min (the wait goes on)" in said,
@@ -20889,14 +20889,16 @@ class QueuedNeverDoneTest(unittest.TestCase):
     def hq13202(self) -> tuple[dict, Any]:
         """0a581929: 13 check runs, 8 queued 30+ min (go vet + go test, go test ... (Linux), Skill test scope,
         lazy-regex-sweep, Agent launch lint, polling-guard, tests, deleted-or-weakened-tests)."""
-        return self.head(13202, ["CodeRabbit", "Socket Security: Pull Request Alerts", "go test (macOS)", "tests (unit)",
+        return self.head(13202, ["CodeRabbit", "Socket Security: Pull Request Alerts", "go test (macOS)",
+                                 "tests (unit)",
                                  "Socket Security: Project Report"],
                          ["go vet + go test", "go test (Linux)", "Skill test scope", "lazy-regex-sweep",
                           "Agent launch lint", "polling-guard", "tests", "deleted-or-weakened-tests"], 34 * 60)
 
     def hq13438(self) -> tuple[dict, Any]:
         """10b0ae08: 13 check runs, 7 queued since 14:56Z, read at 15:30Z (a wait begun at 15:27Z ended after 184 s)."""
-        return self.head(13438, ["Socket Security: Pull Request Alerts", "CodeRabbit", "Socket Security: Project Report",
+        return self.head(13438, ["Socket Security: Pull Request Alerts", "CodeRabbit",
+                                 "Socket Security: Project Report",
                                  "tests (unit)", "size", "Agent launch lint"],
                          ["tests", "lazy-regex-sweep", "polling-guard", "Skill test scope", "deleted-or-weakened-tests",
                           "go vet + go test", "go test (Linux)"], 34 * 60)

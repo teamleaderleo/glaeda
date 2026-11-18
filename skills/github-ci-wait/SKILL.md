@@ -36,11 +36,13 @@ glaeda-gh runners OWNER[/REPO] [--label L] [--json]  # online, busy and idle sel
 
 - `wait` exits 0 on success (or a matching comment), 1 on failure (including a PR closed without
   being merged), 2 on timeout (`--timeout S`, default 3600), 3 when the daemon is down, 4 when the
-  PR conflicts with its base, 6 when no CI ever reported on the head, 64 on bad arguments.
+  PR conflicts with its base, 6 when no CI ever reported on the head, 7 (inconclusive) when `--until done`
+  is left with only checks queued with no runner past 30 min or the deadline passes on a partial read,
+  64 on bad arguments. Done and green never exit 0 while any check is queued, running or pending.
 - Every non-zero exit of `status` and `wait pr|run` ends with a line saying what is wrong and a last line
   `next: <command>` (or `next: none (why)`), and with `--json` its one object carries `ok`, `code`, `reason`
   and `next` (codes: `not-found`, `timeout`, `checks-failed`, `run-failed`, `pr-closed`, `conflict`,
-  `nothing-reported`, `no-data-yet`, `usage`, `refused`, `daemon-down`). A PR or run GitHub does not know is
+  `nothing-reported`, `inconclusive`, `no-data-yet`, `usage`, `refused`, `daemon-down`). A PR or run GitHub does not know is
   `not-found` (exit 1) on the daemon's first read of it, not a wait to the timeout. `status` exits 3 when
   the daemon has not read a target yet. Deadlines are UTC with a Z (`17:55:00Z`).
 - While it blocks, a `wait pr|run` prints `glaeda-gh: still waiting on KEY: 240s of 1800s, deadline

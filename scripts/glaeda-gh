@@ -207,7 +207,10 @@ Clients make no API calls. When the daemon is not running they say so and exit 3
 fall back to polling. `wait` exits 0 on success (or a matching comment), 1 on failure (a failed
 check, a failed run, a PR closed without being merged, an issue that does not exist), 2 on timeout,
 4 when the PR conflicts with its base, 6 when no check or status ever reported on the PR's head
-(--settle seconds after its push, default SETTLE_GRACE: its CI has not started, which is not a pass).
+(--settle seconds after its push, default SETTLE_GRACE: its CI has not started, which is not a pass),
+7 (inconclusive) when --until done is left with only checks queued with no runner past 30 min, or the
+deadline passes on a read that never came back whole. Done and green never exit 0 while any check
+is queued, in progress, waiting, requested or pending, or an expected status is not posted.
 --until green (default) fails as soon as any completed check
 failed, required or not, and succeeds once every check finished with success, neutral or skipped;
 a pending commit status is unfinished like a running check, and so is one of the repo's
@@ -497,6 +500,12 @@ COMMENT_BODY_MAX = 4000
 STEPS_BATCH = 50  # check runs per steps query
 EXIT_OK, EXIT_FAIL, EXIT_TIMEOUT, EXIT_DOWN, EXIT_CONFLICT = 0, 1, 2, 3, 4
 EXIT_NOTHING = 6  # `wait pr`: the head's settle window passed and no check or status ever reported on it
+# `wait pr`: not done and not green, and nothing more will be learned by waiting on: the only unfinished checks are
+# queued with no runner past STRAGGLER_AFTER (they still run if a runner comes), or the deadline passed on a read that
+# never came back whole (checksPageError: pages held, contexts null, no head commit). Never 0. claude-sr2-coord,
+# 2026-11-18: hq#13438 at 10b0ae08 and hq#13202 at 0a581929 ended `wait --until done` with "result: success" while 7
+# and 8 of 13 checks were queued on a busy pool (queued 34 min, then they ran); merge_hold refused both checks_running.
+EXIT_INCONCLUSIVE = 7
 # A green head is green only once nothing more is coming. teamleaderleo/leo-workspace#3538 (2026-11-05): a `wait pr
 # --sha f40f2a3d` returned success on GitGuardian's pass alone, before the fleet-reconciler (cmuxterm-hq
 # fleet-reconciler-ws-check.yml) got round to posting the `ws-check` status its merges wait on: the head was pushed
@@ -2924,6 +2933,10 @@ def parse_pr(node: dict) -> dict:
         "checksTotal": contexts.get("totalCount", len(checks)),
         "checkCounts": check_counts(contexts),
         "checksTruncated": bool((contexts.get("pageInfo") or {}).get("hasNextPage")),
+        # a read whose head commit came back null or absent (a latched or cut-short answer) read no rollup at all:
+        # partial, so no wait calls it "nothing reported" or green (check_verdict, wait_step's deadline)
+        **({"checksPageError": "graphql: no head commit in the read (rollup unread)"}
+           if "commits" in node and not isinstance(((commits or [None])[0] or {}).get("commit"), dict) else {}),
     }
 
 
@@ -8313,10 +8326,12 @@ def land_tail(text: Any, limit: int = LAND_TEXT) -> str:
 
 
 def land_checks_running(data: dict, head: str) -> bool:
-    """Whether the cache shows checks still running at HEAD (a pending status counts)."""
+    """Whether the cache shows checks still running at HEAD (a pending status counts, and so does an unfinished context
+    a truncated rollup counts past its first page: the wait's own answer, pending_on_every_page)."""
     if not data or data.get("state") != "OPEN" or not head or data.get("headRefOid") != head:
         return False
-    return any(str(c.get("status") or "").upper() not in ("COMPLETED", "") for c in data.get("checks") or [])
+    return (any(str(c.get("status") or "").upper() not in ("COMPLETED", "") for c in data.get("checks") or [])
+            or pending_on_every_page(data) > 0)
 
 
 def land_unfinished(data: dict, now: float, limit: int = 6) -> str:
@@ -11551,8 +11566,9 @@ def straggler_lines(data: dict, now: float, bound: float = STRAGGLER_AFTER) -> l
         return "; ".join(f"{s['name']} ({s['workflow'] or '?'}, {s['label']}, {s['minutes']} min)" for s in items)
     ended = [s for s in data.get("stragglers") or [] if not s.get("required")]
     if ended:
-        lines.append(f"  stragglers, not required, queued with no runner past {int(bound // 60)} min (the wait ended "
-                     f"without them; merge_hold still counts them running, checks_queued_no_runner): {said(ended)}. "
+        lines.append(f"  stragglers, not required, queued with no runner past {int(bound // 60)} min (a done wait ends "
+                     f"inconclusive on them, never success; merge_hold counts them running, checks_queued_no_runner): "
+                     f"{said(ended)}. "
                      + STRAGGLER_STEP.format(label="its label"))
     queued = queued_unfinished(data) if data.get("stragglers") is None else None
     required = [s for s in (straggler_of(c, data, now, bound) for c in queued or []) if s and s["required"]]
@@ -11795,13 +11811,13 @@ def queued_any(data: dict) -> list[dict]:
 def check_verdict(data: dict, until: str = "green", now: float | None = None,
                   grace: float = RESCUE_GRACE, settle: float = SETTLE_GRACE) -> int | None:
     """The checks alone, whatever the PR's state or head: EXIT_OK, EXIT_FAIL, EXIT_NOTHING (nothing reported on the
-    head past its settle window), or None while pending. --until done judges a head whose only unfinished checks are
-    stragglers nothing requires (straggler_cut) without them."""
+    head past its settle window), EXIT_INCONCLUSIVE, or None while pending. Never EXIT_OK while any check is unfinished.
+    --until done ends EXIT_INCONCLUSIVE on a head whose only unfinished checks are stragglers nothing requires
+    (straggler_cut): they are still queued, and run if a runner comes, so the head is not done (hq#13438, hq#13202:
+    the cut used to judge the head without them and said success while 7 and 8 of 13 checks were queued)."""
     now = time.time() if now is None else now
-    if until == "done":
-        cut = straggler_cut(data, now)
-        if cut is not None:
-            return check_verdict(cut, until, now, grace, settle)
+    if until == "done" and straggler_cut(data, now) is not None:
+        return EXIT_INCONCLUSIVE
     checks = data.get("checks") or []
     if data.get("checksPageError"):
         return None  # a partial cached rollup is not evidence of a green head
@@ -11871,6 +11887,14 @@ def check_verdict(data: dict, until: str = "green", now: float | None = None,
     if data.get("state") == "OPEN" and expected_missing(data):
         return None  # a status every head of this repo gets has not been posted yet: unfinished, like a required one
     return EXIT_OK
+
+
+def checks_state(data: dict, result: int | None) -> str:
+    """A head's checks in one word for `status`: SUCCESS and FAILURE as check_verdict decides, INCONCLUSIVE when it
+    says so or the read is partial (checksPageError: what was not read may be unfinished or red), else PENDING."""
+    if result == EXIT_INCONCLUSIVE or (result != EXIT_FAIL and data.get("checksPageError")):
+        return "INCONCLUSIVE"
+    return {EXIT_OK: "SUCCESS", EXIT_FAIL: "FAILURE"}.get(result, "PENDING")  # type: ignore[arg-type]
 
 
 def run_hold(data: dict, jobs: list[dict] | None, now: float | None = None,
@@ -11999,7 +12023,7 @@ def summary(key: str, entry: dict | None, until: str = "done", grace: float = RE
             # the headline is this tool's own reading, the one `wait` decides by; GitHub's rollup also
             # counts superseded attempts and checks that are not required
             result = check_verdict(data, "done" if until == "merged" else until, now, grace)
-            state = {EXIT_OK: "SUCCESS", EXIT_FAIL: "FAILURE"}.get(result, "PENDING")
+            state = checks_state(data, result)
             held = f", {len(groups['held'])} held" if groups["held"] else ""
             rollup = data.get("checkState")
             differs = f"; GitHub's rollup says {rollup}" if rollup and rollup != state else ""
@@ -12179,6 +12203,13 @@ def wait_outcome(req: dict, result: int, entry: dict | None, waited: int) -> dic
     if result == EXIT_CONFLICT:
         return fail_fields("conflict", f"{name} conflicts with its base (mergeable CONFLICTING)",
                            "none (merge or rebase onto the base and push; checks run after that push)")
+    if result == EXIT_INCONCLUSIVE:
+        if data.get("checksPageError"):
+            return fail_fields("inconclusive", f"{name}: the last read was partial ({data['checksPageError']})",
+                               wait_command(req))
+        return fail_fields("inconclusive", f"{name}: {inconclusive_note(data, time.time())}",
+                           f"glaeda-gh status pr {name} (the queued checks' runner label; merge_hold counts them "
+                           "running)")
     if result == EXIT_NOTHING:
         head = str(data.get("headRefOid") or "")[:10]
         return fail_fields("nothing-reported", f"no check or status ever reported on {name} head {head}",
@@ -12248,7 +12279,7 @@ def status_view(key: str, entry: dict | None, grace: float = RESCUE_GRACE) -> di
         groups = classify(data, time.time(), grace)
         checks = data.get("checks") or []
         result = check_verdict(data, "done", time.time(), grace) if checks else None
-        view["checks"] = {"state": {EXIT_OK: "SUCCESS", EXIT_FAIL: "FAILURE"}.get(result, "PENDING"),
+        view["checks"] = {"state": checks_state(data, result),
                           **groups, "total": len(checks), "required": [c for c in checks if c.get("required")]}
     elif kind == "run":
         view["head"] = data.get("head_sha")
@@ -12653,12 +12684,14 @@ def wait_step(req: dict, now: float, get: Callable[[str, list[str]], dict] | Non
     result = (verdict(kind, data, until, sha, (entry or {}).get("jobs"), time.time(), grace, f"{owner}/{repo}", settle)
               if usable else None)
     if result is not None:
-        outcome_name = {EXIT_OK: "success", EXIT_CONFLICT: "conflict", EXIT_NOTHING: "nothing-reported"}.get(
-            result, "failure")
+        outcome_name = {EXIT_OK: "success", EXIT_CONFLICT: "conflict", EXIT_NOTHING: "nothing-reported",
+                        EXIT_INCONCLUSIVE: "inconclusive"}.get(result, "failure")
         extra: dict[str, Any] = {"result": outcome_name, "waited_s": waited}
         if kind == "pr" and result == EXIT_NOTHING:
             extra["note"] = (f"no check or status reported on this head within {int(settle)}s of its push: "
                              "its CI has not started (not a pass)")
+        elif kind == "pr" and result == EXIT_INCONCLUSIVE:
+            extra["note"] = inconclusive_note(data, time.time())
         elif kind == "pr" and result == EXIT_CONFLICT:
             extra["note"] = ("PR conflicts with its base (mergeable CONFLICTING): no checks run until you "
                              "merge or rebase onto the base and push")
@@ -12672,6 +12705,12 @@ def wait_step(req: dict, now: float, get: Callable[[str, list[str]], dict] | Non
             extra["note"] = f"a glaeda runner refused this attempt at setup and no rescue attempt followed within {int(grace)}s"
         extra.update(wait_outcome(req, result, entry, waited))
         return result, render(key, entry, as_json, extra, until, grace, bool(req.get("verbose")))
+    if now - began >= req["timeout"] and kind == "pr" and data and data.get("checksPageError"):
+        # the deadline passed on a read that never came back whole: not a pass and not a plain timeout
+        extra = {"result": "inconclusive", "waited_s": waited,
+                 "note": f"the last read of this PR was partial ({data['checksPageError']}): its checks are unknown"}
+        extra.update(wait_outcome(req, EXIT_INCONCLUSIVE, entry, waited))
+        return EXIT_INCONCLUSIVE, render(key, entry, as_json, extra, until, grace, bool(req.get("verbose")))
     if now - began >= req["timeout"]:
         extra = {"result": "timeout", "waited_s": waited}
         if sha and entry and entry.get("data"):
@@ -12681,6 +12720,16 @@ def wait_step(req: dict, now: float, get: Callable[[str, list[str]], dict] | Non
         extra.update(wait_outcome(req, EXIT_TIMEOUT, entry, waited))
         return EXIT_TIMEOUT, render(key, entry, as_json, extra, until, grace, bool(req.get("verbose")))
     return None
+
+
+def inconclusive_note(data: dict, now: float) -> str:
+    """What an inconclusive done wait says: how many checks are still queued with no runner, and any red already in."""
+    cut = straggler_cut(data, now)
+    queued = len((cut or {}).get("stragglers") or [])
+    failed = len(classify(data, now)["failed"])
+    red = f"; {failed} finished check(s) failed" if failed else ""
+    return (f"not done: {queued} queued with no runner past {int(STRAGGLER_AFTER // 60)} min, nothing requires them, "
+            f"and they still run if a runner comes{red} (not a pass)")
 
 
 def cmd_wait(kind: str, target: str, until: str, timeout: float, jobs: bool, as_json: bool,
@@ -12870,7 +12919,7 @@ def poll_wait(req: dict) -> int:
             register(req["key"], jobs, waited=True, began=req["began"])  # (the same start every touch)
             touched = now
         done = wait_step(req, time.time())
-        if done is None or done[0] == EXIT_TIMEOUT:
+        if done is None or done[0] in (EXIT_TIMEOUT, EXIT_INCONCLUSIVE):  # (a partial read at the deadline too)
             starved = wait_starved(req, read_cache(req["key"]), time.time())
             if starved is not None:
                 # The daemon heartbeats but has not refreshed this target: say so, loudly, and read it once here
