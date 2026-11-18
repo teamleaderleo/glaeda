@@ -1974,7 +1974,7 @@ def gh_token() -> str:
 # Leo, 2026-11-18: "you use the apps where they're useful, and it just does it automatically, so no agents necessarily
 # even have to think about it." leo-workspace machines/gh-app-roles.json gives glaeda-gh to the ci-watch role, but that
 # routing lives in the gh-quota shim (tools/gh_app_token.py route), and this daemon talks to GitHub itself with
-# `gh auth token`, so all its reads (about 295 REST an hour on cosmic-gray that day) stayed on the account's login.
+# `gh auth token`, so all its reads (about 295 REST an hour on one host that day) stayed on the account's login.
 # Now a REST GET of a repo the role's Apps are installed on goes out on the ci-watch installation token when this host
 # holds that App (~/.config/gh-app-tokens/ci-watch.json and .pem, written by gh_app_token.py when the App was made):
 # the token is `gh_app_token.py token ci-watch --owner OWNER` (the copy next to the gh-quota shim gh_quota.py, which
