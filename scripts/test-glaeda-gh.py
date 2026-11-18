@@ -8689,6 +8689,36 @@ class FileAndPidWaitTest(unittest.TestCase):
         with self.assertRaises(gg.WatchError):
             gg.cmd_wait_pid("abc", 1, False)
 
+    def test_waits_until_a_time_or_the_quota_reset(self) -> None:
+        """`wait until`: the wait for "go on at T" (a quota reset) that needs no head SHA (2026-11-18)."""
+        now = 1_795_000_000.0  # 2026-11-18T11:06:40Z
+        self.assertEqual(gg.until_epoch("45m", now), now + 2700)
+        self.assertEqual(gg.until_epoch("2026-11-18T14:40:00Z", now), 1_795_012_800.0)
+        self.assertEqual(gg.until_epoch("14:40Z", now), 1_795_012_800.0)
+        self.assertEqual(gg.until_epoch("08:00Z", now), 1_795_075_200.0)  # passed today: tomorrow
+        for bad in ("soon", "2026-11-18T14:40:00", "-5m"):
+            with self.assertRaises(gg.WatchError):
+                gg.until_epoch(bad, now)
+        state = self.dir / "gh-quota"
+        state.mkdir()
+        with mock.patch.dict(os.environ, {"GH_QUOTA_STATE": str(state)}):
+            self.assertIsNone(gg.until_epoch("quota", now))  # nothing spent: go on at once
+            (state / "rest-exhausted.json").write_text(json.dumps({"until": now + 600, "at": now}))
+            (state / "graphql-exhausted.json").write_text(json.dumps({"until": now + 60, "at": now}))
+            self.assertEqual(gg.until_epoch("quota", now), now + 600)
+            self.assertEqual(gg.until_epoch("quota:graphql", now), now + 60)
+            (state / "rest-exhausted.json").write_text(json.dumps({"until": time.time() + 600}))  # live, by the real clock
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(gg.cmd_wait_until("quota", 0.05, True), gg.EXIT_TIMEOUT)
+            (state / "rest-exhausted.json").write_text(json.dumps({"until": time.time() + 0.2}))
+            (state / "graphql-exhausted.json").unlink()
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(gg.cmd_wait_until("quota", 5, True), gg.EXIT_OK)
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(gg.cmd_wait_until("0s", 1, True), gg.EXIT_OK)
+        self.assertEqual(json.loads(out.getvalue().splitlines()[-1])["result"], "success")
+
     def test_cli_parses_the_new_forms(self) -> None:
         target = self.dir / "ready"
         target.write_text("1")

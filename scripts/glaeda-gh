@@ -13,6 +13,7 @@
     glaeda-gh status comment OWNER/REPO#N               the latest comments on an issue or PR
     glaeda-gh wait file PATH [--exists|--gone] [--contains REGEX] [--timeout S]   a file, instead of a sleep loop
     glaeda-gh wait pid PID [--timeout S]                a process to exit, instead of a `kill -0` loop
+    glaeda-gh wait until quota|TIME [--timeout S]       a time (14:40Z, 2026-11-18T14:40:00Z, 45m) or this host's quota reset
     glaeda-gh checks OWNER/REPO SHA... --consumer NAME [--max-age S] [--wait S] [--json]
                                                         every check of those commits, read once for all sessions
     glaeda-gh log job OWNER/REPO JOB_ID                a finished job's log: kept here, else the build controller,
@@ -619,6 +620,7 @@ CONSUMER_DEFAULTS = {"reserved": {"autoland": 1500}, "limit": 240, "pool": 600} 
 CONSUMERS_CONFIG = Path.home() / ".config/glaeda/gh-consumers.json"  # same keys as CONSUMER_DEFAULTS
 CONSUMERS_FILE = "consumers.json"  # the daemon's spend, denials and limits, for clients and `budget`
 WAIT_FILE_POLL = 1.0  # `wait file` and `wait pid` look this often (stat and kill -0, no GitHub; ZOMBIE_CHECK_S)
+WAIT_UNTIL_POLL = 30.0  # `wait until` sleeps at most this long at a time, so a moved quota mark is seen (no GitHub call)
 EXIT_PARTIAL = 5  # `checks`: some heads were served stale or not at all
 POST_SPACING = 3  # seconds between two content writes from this machine (GitHub: at least 1 s between writes)
 POST_BACKOFF = 60  # a throttled write without Retry-After holds the outbox this long, doubling to POST_BACKOFF_MAX
@@ -12769,6 +12771,51 @@ def cmd_wait_pid(target: str, timeout: float, as_json: bool) -> int:
     return EXIT_OK
 
 
+def until_epoch(target: str, now: float) -> float | None:
+    """`wait until`'s time: an ISO time (2026-11-18T14:40:00Z), a UTC clock time today or tomorrow (14:40Z), a
+    duration from now (45m), or `quota`: the latest of this host's gh-quota marks (None when no pool is spent)."""
+    text = target.strip()
+    if text in ("quota", "quota:rest", "quota:graphql"):
+        marks = exhausted_marks(now)
+        pools = [text.split(":")[1]] if ":" in text else list(marks)
+        return max([marks[p]["until"] for p in pools if p in marks] or [0.0]) or None
+    match = re.fullmatch(r"(\d+)([smhd])", text)
+    if match:
+        return now + int(match.group(1)) * {"s": 1, "m": 60, "h": 3600, "d": 86400}[match.group(2)]
+    match = re.fullmatch(r"(\d\d?):(\d\d)Z", text)
+    if match:
+        day = dt.datetime.fromtimestamp(now, dt.timezone.utc)
+        at = day.replace(hour=int(match.group(1)), minute=int(match.group(2)), second=0, microsecond=0).timestamp()
+        return at if at > now else at + 86400
+    at = iso_epoch(text) if re.match(r"\d{4}-\d\d-\d\dT", text) and re.search(r"(Z|[+-]\d\d:\d\d)$", text) else None
+    if at is None:
+        raise WatchError(f"wait until takes quota, quota:rest, quota:graphql, an ISO time with a zone "
+                         f"(2026-11-18T14:40:00Z), a UTC time (14:40Z) or a duration (45m), not {target!r}")
+    return at
+
+
+def cmd_wait_until(target: str, timeout: float, as_json: bool) -> int:
+    """Block until a time, or until GitHub quota this host marked spent resets (`wait until quota`): the one wait for
+    "go on at T" every agent hook accepts, with no head SHA to read while quota is spent. A quota mark is read again
+    on each pass, so a pool spent again on the way is waited out too. Exit 0 at the time, 2 on --timeout."""
+    start = time.monotonic()
+    deadline = until_epoch(target, time.time())
+    say_waiting(waiting_line(f"until {target}", "the time comes", None, True, timeout))
+    while deadline is not None and time.time() < deadline:
+        waited = int(time.monotonic() - start)
+        if time.monotonic() - start >= timeout:
+            print(json.dumps({"result": "timeout", "until": deadline, "waited_s": waited}) if as_json
+                  else f"glaeda-gh: still {int(deadline - time.time())}s before {target} after {waited}s (timeout)")
+            return EXIT_TIMEOUT
+        time.sleep(max(0.05, min(WAIT_UNTIL_POLL, deadline - time.time(), timeout - (time.monotonic() - start))))
+        if target.startswith("quota"):
+            deadline = until_epoch(target, time.time())
+    waited = int(time.monotonic() - start)
+    print(json.dumps({"result": "success", "until": deadline, "waited_s": waited}) if as_json
+          else f"glaeda-gh: {target} reached after {waited}s")
+    return EXIT_OK
+
+
 def head_served(entry: dict | None, now: float, max_age: float) -> tuple[dict | None, bool]:
     """(data, fresh): a head's data, and whether it is recent enough. Settled data is good for
     HEAD_SETTLED_TTL and two of the daemon's head cycles (the configured one, as the daemon paces
@@ -17707,7 +17754,7 @@ def parser() -> argparse.ArgumentParser:
                     help="start even though the LaunchAgent or systemd unit is loaded (debugging only)")
     for name in ("status", "wait"):
         s = sub.add_parser(name)
-        s.add_argument("kind", choices=("pr", "run", "comment") + (("file", "pid") if name == "wait" else ()))
+        s.add_argument("kind", choices=("pr", "run", "comment") + (("file", "pid", "until") if name == "wait" else ()))
         if name == "status":
             s.add_argument("target", nargs="+",
                            help="OWNER/REPO#N, OWNER/REPO/RUN_ID, or a GitHub URL; several are read in one gather, "
@@ -17919,6 +17966,8 @@ def main(argv: list[str] | None = None) -> int:
                 raise WatchError("wait file takes one of --exists and --gone")
             return cmd_wait_file(args.target, args.timeout, args.json,
                                  "gone" if args.gone else "exists" if args.exists else "nonempty", args.contains)
+        if args.kind == "until":
+            return cmd_wait_until(args.target, args.timeout, args.json)
         if args.kind == "pid":
             return cmd_wait_pid(args.target, args.timeout, args.json)
         if args.exists or args.gone or args.contains:

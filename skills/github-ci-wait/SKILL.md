@@ -96,6 +96,7 @@ glaeda-gh runners OWNER[/REPO] [--label L] [--json]  # online, busy and idle sel
 ```bash
 glaeda-gh wait file PATH --timeout 600           # exists and not empty ([ -s PATH ]); PATH may be a glob
 glaeda-gh wait file PATH --exists | --gone | --contains 'REGEX'
+glaeda-gh wait until quota --timeout 4000       # until this host's GitHub quota reset; or 14:40Z, an ISO time, 45m
 glaeda-gh wait pid 12345                         # until the process exits
 ```
 
