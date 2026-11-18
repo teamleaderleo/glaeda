@@ -8106,12 +8106,13 @@ LAND_WAIT_STUCK = 4 * 3600.0
 # (rerun_failed; its checks' wait after it is a wait_pr above). interim-coord, 2026-11-18: "A refusal whose next step
 # is a wait (a check queued, pending or cancelled-and-rerun) should keep waiting up to a deadline, with no strike; only
 # a real red or a hold counts toward the 3" (cmux#46183, #46220: cancelled shards a rerun clears). Keyed on the action's
-# kind, never its words. Each head has one budget over all these waits (e["waitBudget"], wait_spent), so kinds that
+# kind, never its words. These waits in a row at one head share one budget (e["waitBudget"], wait_spent), so kinds that
 # alternate (a review running while reads flap unreadable: wait_comment, retry, wait_comment...) never restart it
 # (review of glaeda#2174, F1): from its first such judgment at the head,
 # sized max(the kind's LAND_WAIT_DEADLINE, twice the action's own timeout_s, so a wait always gets judged again at
 # least once); the judgment that finds it spent stops "<kind>_deadline", naming the wait that ran out. A new head
-# starts a new budget, an "ok" drops it. A fetch is work, not a wait: LAND_RETRY_STREAK_STOP and step_refused
+# starts a new budget; an "ok", a wait on the checks or any other step between drops it. A fetch is work, not a wait:
+# LAND_RETRY_STREAK_STOP and step_refused
 # still bound it. Only a "stop" or "command" (a red not excused, a hold, a BLOCK, a teammate's PR, a conflict) and the
 # remaining steps (repin, review, retarget) count toward or stop at LAND_STREAK_STOP.
 LAND_WAIT_DEADLINE = {"wait_comment": 7200.0, "retry": 7200.0, "rerun_failed": 7200.0}
@@ -9879,9 +9880,12 @@ class LandQueue:
                 self.park_quota(e, f"{answer.get('reason') or ''} {answer.get('next') or ''}")
                 return  # the login's state, not the PR's: no step, no streak
             e.pop("quotaRefusals", None)
+            if act.get("kind") not in LAND_WAIT_DEADLINE or answer.get("ok"):
+                # Only these waits in a row share a budget: a wait on the checks (bounded on its own, checks_stuck) or
+                # any other step between gives the next one its whole deadline (review of glaeda#2180)
+                e.pop("waitBudget", None)
             if answer.get("ok"):
                 e["streak"] = None
-                e.pop("waitBudget", None)
             elif act.get("kind") in LAND_WAIT_DEADLINE:
                 # Another wait: never a strike, a deadline (LAND_WAIT_DEADLINE's comment)
                 if self.wait_spent(e, act, answer, head):
@@ -9922,7 +9926,9 @@ class LandQueue:
         b = e.get("waitBudget") or {}
         if b.get("key") != key:
             b = {"key": key, "since": self.now, "deadline": size, "n": 0}
-        b.update(kind=kind, code=str(answer.get("code") or ""), n=int(b.get("n") or 0) + 1,
+        per = dict(b.get("perKind") or {})
+        per[kind] = int(per.get(kind) or 0) + 1  # a retry's backoff counts its own kind's judgments only
+        b.update(kind=kind, code=str(answer.get("code") or ""), n=int(b.get("n") or 0) + 1, perKind=per,
                  deadline=max(float(b.get("deadline") or 0), size))
         e["waitBudget"] = b
         e["streak"] = None
@@ -10047,6 +10053,7 @@ class LandQueue:
                               land_trim(answer.get("next")))
                 return
             with self.lock:
+                self.check(e)  # a newer land since this judgment: its count is never written onto the new entry
                 sent = {k: v for k, v in (e.get("reruns") or {}).items() if k.startswith(f"{head}|")}
                 capped = [r for r in runs if int(sent.get(f"{head}|{r}") or 0) >= LAND_RERUN_CAP]
                 if capped:
@@ -10064,6 +10071,13 @@ class LandQueue:
             no_lane = [g for g in results if g.returncode != 0 and LAND_NO_LANE.search(f"{g.stderr} {g.stdout}")]
             with self.lock:
                 self.finish(e, results[-1], exits=[g.returncode for g in results])
+                for r, g in zip(runs, results):
+                    if g.returncode not in (0, 124):  # refused: never sent (a timeout may have reached GitHub)
+                        k = f"{head}|{r}"
+                        left = int((e.get("reruns") or {}).get(k) or 0) - 1
+                        e["reruns"] = {**(e.get("reruns") or {}), k: left}
+                        if left <= 0:
+                            e["reruns"].pop(k)
                 self.nudge(e["key"])
                 if no_lane:
                     self.step_refused(e, "rerun_failed", head, no_lane[0])
@@ -10115,7 +10129,7 @@ class LandQueue:
                     self.nudge(e["key"])
                     self.wait(e, {"kind": "head_change", "before": head, "since": self.now}, LAND_HEAD_TIMEOUT)
             elif kind == "retry":
-                n = int((e.get("waitBudget") or {}).get("n") or (e.get("streak") or {}).get("count") or 1)
+                n = int(((e.get("waitBudget") or {}).get("perKind") or {}).get("retry") or 1)
                 after = land_seconds(act.get("after_s"), LAND_RETRY_DEFAULT) * (2 ** max(0, n - 1))
                 self.wait(e, {"kind": "retry"}, min(LAND_RETRY_MAX, after))
             self.count(kind)

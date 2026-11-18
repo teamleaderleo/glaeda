@@ -19251,6 +19251,24 @@ class LandTest(Base):
         self.assertIn(e["stop"]["code"], ("wait_comment_deadline", "retry_deadline"))
         self.assertGreaterEqual(self.t - NOW, 7200)
 
+    def test_a_check_wait_between_two_waits_starts_their_budget_again(self):
+        # review of glaeda#2180 (BLOCK): one unreadable retry, then checks running past 2 h, then a review running: the
+        # review wait got no time at all ("waited 12607 s ... for a review verdict"). Only waits in a row share a budget.
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(refusal("unreadable", LA, {"kind": "retry", "after_s": 60}))
+        running = refusal("checks_running", LA, {"kind": "wait_pr", "sha": LA, "until": "done", "timeout_s": 1800})
+        self.w.answers += [running] * 5
+        review = refusal("review_running", LA, {"kind": "wait_comment", "match": "SHIP|BLOCK", "timeout_s": 600})
+        self.w.answers += [review] * 3
+        self.tick()
+        for _ in range(5):
+            self.tick(gg.LAND_RETRY_MAX + 1)
+        for _ in range(3):
+            e = self.tick(gg.LAND_RETRY_MAX + 1)  # 3 waits: 5403 s, under the 2 h a review wait gets
+        self.assertEqual((e["state"], e["waitBudget"]["kind"], e["waitBudget"]["n"]), ("waiting", "wait_comment", 3),
+                         e.get("stop"))
+
     def test_a_retry_never_strikes_and_stops_at_its_deadline_naming_it(self):
         self.pr(LA)
         self.land()
@@ -19278,12 +19296,54 @@ class LandTest(Base):
         self.assertEqual(len(self.w.gh_calls("run", "rerun")), gg.LAND_RERUN_CAP)
         self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "rerun_failed_cap"))
         self.assertIn(f"run 77 was rerun {gg.LAND_RERUN_CAP} times at {LA[:12]}", e["stop"]["reason"])
-        # a new head starts the count again
-        self.pr(LB)
-        self.w.answers.append(refusal("cancelled", LB, {"kind": "rerun_failed", "runs": [77]}))
+        # landing it again starts the count again
+        self.w.answers.append(refusal("cancelled", LA, {"kind": "rerun_failed", "runs": [77]}))
         self.land()
         self.tick()
         self.assertEqual(len(self.w.gh_calls("run", "rerun")), gg.LAND_RERUN_CAP + 1)
+
+    def test_a_new_head_in_one_land_starts_the_rerun_count_again(self):
+        self.pr(LA)
+        self.land()
+        for i in range(gg.LAND_RERUN_CAP):
+            self.w.answers.append(refusal("cancelled", LA, {"kind": "rerun_failed", "runs": [77]}))
+        e = self.tick()
+        for i in range(gg.LAND_RERUN_CAP - 1):
+            self.pr(LA, checks=[("shard", "COMPLETED", "CANCELLED"), (f"other{i}", "COMPLETED", "SUCCESS")])
+            e = self.tick(60)
+        self.assertEqual((e["state"], len(self.w.gh_calls("run", "rerun"))), ("waiting", gg.LAND_RERUN_CAP))
+        self.pr(LB)  # a push while the land stays open
+        self.w.answers.append(refusal("cancelled", LB, {"kind": "rerun_failed", "runs": [77]}))
+        e = self.tick(60)
+        self.assertEqual((e["state"], len(self.w.gh_calls("run", "rerun"))), ("waiting", gg.LAND_RERUN_CAP + 1))
+        self.assertEqual(e["reruns"], {f"{LB}|77": 1})
+
+    def test_a_rerun_gh_refused_is_not_counted(self):
+        self.pr(LA)
+        self.land()
+        self.w.gh_rc["rerun"] = 1
+        self.w.gh_err["rerun"] = "run 77 cannot be rerun: its workflow file is invalid"
+        self.w.answers.append(refusal("cancelled", LA, {"kind": "rerun_failed", "runs": [77]}))
+        e = self.tick()
+        self.assertEqual((len(self.w.gh_calls("run", "rerun")), e.get("reruns")), (1, {}))
+
+    def test_a_cancelled_judgment_never_leaves_a_rerun_count(self):
+        # review of glaeda#2180 F2: a newer land arriving mid-job; the stale job's count never lands on the new entry
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(refusal("cancelled", LA, {"kind": "rerun_failed", "runs": [77]}))
+        real_gh = self.q.gh
+
+        def newer_land_arrives() -> Any:  # take() reads the shim just before the count; the newer land is applied then
+            e = self.q.entries[self.KEY]
+            if (e.get("explain") or {}).get("action", {}).get("kind") == "rerun_failed" and not e.get("requeued"):
+                e.update(requeued=True, reruns=None, gen=int(e.get("gen") or 0) + 1)
+            return real_gh()
+
+        with mock.patch.object(self.q, "gh", side_effect=newer_land_arrives):
+            self.tick()
+        e = self.q.entries[self.KEY]
+        self.assertEqual((self.w.gh_calls("run", "rerun"), e.get("reruns")), ([], None))
 
     def test_a_follower_whose_stopped_predecessor_was_pruned_stops_naming_it(self):
         self.pr(LA)
