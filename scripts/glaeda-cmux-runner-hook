@@ -518,6 +518,9 @@ WORKFLOW_JOB_CLASSES = {# the iOS reliability matrix's phone cells: cargo builds
                         # cmux-next-ios kit tests: swift test on the Mac, then xcodebuild test in one booted
                         # simulator; the picker sends it to the sim-first runner too.
                         ("cmux-next-ios-kit.yml", "kit-tests"): "simulator-step",
+                        # `cmux-ci test --setup kernel-free` on cmux: a checkout and a Python, git or shell command,
+                        # no build in a canonical root; isolated, as hq's kernel-free fast checks are as a guest.
+                        ("fast-checks.yml", "checks-mac"): "isolated",
                         ("cmux-tui.yml", "lint"): "isolated", ("cmux-tui.yml", "test"): "isolated",
                         ("cmux-tui.yml", "build"): "isolated", ("cmux-tui.yml", "cdp-browser-smoke"): "isolated",
                         ("cmux-tui.yml", "macos-relay"): "isolated",
