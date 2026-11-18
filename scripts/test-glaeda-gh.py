@@ -17877,7 +17877,7 @@ class LandWorld:
         if argv[0] == os.fspath(self.gh):
             words = argv[1:]
             if words[:1] == ["api"] and "/files?" in words[1]:
-                return subprocess.CompletedProcess(argv, 0, "".join(f + "\n" for f in self.files), "")
+                return subprocess.CompletedProcess(argv, 0, "".join(json.dumps(f) + "\n" for f in self.files), "")
             if words[:2] == ["pr", "view"] and words[-4:-2] == ["--json", "body"]:
                 return subprocess.CompletedProcess(argv, 0, self.body + "\n", "")
             if words[:2] == ["pr", "view"]:
@@ -18722,15 +18722,17 @@ class LandTest(Base):
         self.w.files = files
         self.pr_red(red)
 
-    def pr_red(self, red: bool, running: bool = False) -> None:
-        state = ("IN_PROGRESS", None) if running else ("COMPLETED", "FAILURE" if red else "SUCCESS")
+    def pr_red(self, red: bool, running: bool = False, conclusion: str = "FAILURE",
+               done: str = "2026-11-17T10:00:00Z", other: str = "COMPLETED") -> None:
+        state = ("IN_PROGRESS", None) if running else ("COMPLETED", conclusion if red else "SUCCESS")
+        at = None if running else done
         checks = [{"name": "Native/OptChat/optchat-chief", "workflow": "rust workspaces", "status": state[0],
-                   "conclusion": state[1], "runId": self.RUN},
+                   "conclusion": state[1], "runId": self.RUN, "completedAt": at},
                   {"name": "rust workspaces", "workflow": "rust workspaces", "status": state[0],
-                   "conclusion": state[1], "runId": self.RUN},
+                   "conclusion": state[1], "runId": self.RUN, "completedAt": at},
                   # a base red merge_hold excused: another workflow, never rerun for this
-                  {"name": "cmux-next CI guard group", "workflow": "cmux-next guards", "status": "COMPLETED",
-                   "conclusion": "FAILURE", "runId": 44118660549}]
+                  {"name": "cmux-next CI guard group", "workflow": "cmux-next guards", "status": other,
+                   "conclusion": "FAILURE" if other == "COMPLETED" else None, "runId": 44118660549}]
         self.w.set_pr(self.KEY, {**land_pr(LA), "checks": checks}, self.t)
 
     def own_red(self) -> tuple[int, dict]:
@@ -18819,6 +18821,68 @@ class LandTest(Base):
                  "Native/OptChat/optchat-chief/tests/mcp_hub.rs": False, ".github/workflows/rust-workspaces.yml": False}
         self.assertEqual({p: gg.land_path_inert(p, rule) for p in inert}, inert)
         self.assertIsNone(gg.land_unrelated_rule("manaflow-ai/cmux", "cmux-next guards"))
+
+    def test_a_job_that_never_started_is_a_red_the_rerun_takes(self):
+        # #2132 review F1: `gh run rerun --failed` reruns a STARTUP_FAILURE job too
+        self.unrelated_world(["webviews/src/a.ts"])
+        self.pr_red(True, conclusion="STARTUP_FAILURE")
+        self.land()
+        self.w.answers.append(self.own_red())
+        e = self.tick()
+        self.assertEqual(self.w.gh_calls("run", "rerun"), [["run", "rerun", str(self.RUN), "--failed", "-R", "o/r"]])
+        self.assertEqual((e["state"], e["wait"]["kind"]), ("waiting", "pr"))
+
+    def test_a_file_name_is_matched_exactly_never_stripped(self):
+        # #2132 review F1 at 1be9e4c0: " webviews/src/a.ts" is not webviews/src/a.ts, and no inert glob names it
+        self.unrelated_world([" webviews/src/a.ts"])
+        self.land()
+        self.w.answers.append(self.own_red())
+        e = self.tick()
+        self.assertEqual((e["state"], e["stop"]["code"], self.w.gh_calls("run", "rerun")), ("stopped", "own_red", []))
+        rule = gg.LAND_UNRELATED_REDS["manaflow-ai/cmux"]["rust workspaces"]
+        self.assertEqual((gg.land_path_inert(" webviews/src/a.ts", rule), gg.land_path_inert("webviews/src/a.ts", rule)),
+                         (False, True))
+        self.assertEqual(gg.land_file_names('" a.ts "\n"b/c\\u2028d.ts"\n'), [" a.ts ", "b/c d.ts"])
+        self.assertEqual(gg.land_file_names('"a.ts"\nb.ts\n'), [])  # a line that is not a JSON string: unreadable
+
+    def test_another_runs_checks_running_never_count_as_the_rerun_running(self):
+        # #2132 review F2: the guard group's run, not the one rerun, ran and finished; the rerun has not started yet
+        self.unrelated_world(["webviews/src/a.ts"])
+        self.land()
+        self.w.answers.append(self.own_red())
+        e = self.tick()
+        self.assertEqual((e["wait"]["runs"], e["wait"].get("ran")), ({str(self.RUN): "2026-11-17T10:00:00Z"}, None))
+        self.pr_red(True, other="IN_PROGRESS")
+        self.tick(30)
+        self.pr_red(True)
+        e = self.tick(30)
+        self.assertEqual((self.w.explains(), e["state"], e["wait"]["ran"]), ([self.w.explains()[0]], "waiting", []))
+        self.pr_red(True, done="2026-11-17T10:30:00Z")  # finished again between two reads, never seen running
+        self.w.answers.append(ok_answer(LA))
+        e = self.tick(30)
+        self.assert_merged_at(LA)
+
+    def test_a_rerun_of_two_runs_waits_for_both(self):
+        both = lambda a, b: [{"name": "x", "workflow": "w", "runId": 5, **a}, {"name": "y", "workflow": "v", "runId": 6, **b}]
+        red = {"status": "COMPLETED", "conclusion": "CANCELLED", "completedAt": "2026-11-17T10:00:00Z"}
+        busy = {"status": "IN_PROGRESS", "conclusion": None, "completedAt": None}
+        green = {"status": "COMPLETED", "conclusion": "SUCCESS", "completedAt": "2026-11-17T10:20:00Z"}
+        self.pr(LA, checks=[])
+        self.w.set_pr(self.KEY, {**land_pr(LA), "checks": both(red, red)}, self.t)
+        self.land()
+        self.w.answers.append(refusal("cancelled", LA, {"kind": "rerun_failed", "runs": [5, 6]}))
+        e = self.tick()
+        self.assertEqual(e["wait"]["runs"], {"5": "2026-11-17T10:00:00Z", "6": "2026-11-17T10:00:00Z"})
+        self.w.set_pr(self.KEY, {**land_pr(LA), "checks": both(busy, red)}, self.t)
+        self.tick(30)
+        self.w.set_pr(self.KEY, {**land_pr(LA), "checks": both(green, red)}, self.t)
+        e = self.tick(30)
+        self.assertEqual((e["wait"]["ran"], gg.land_rerun_ran(e["wait"], both(green, red))), (["5"], False))
+        self.w.set_pr(self.KEY, {**land_pr(LA), "checks": both(green, green)}, self.t)
+        self.assertTrue(gg.land_rerun_ran(dict(e["wait"]), both(green, green)))
+        self.w.answers.append(ok_answer(LA))
+        self.tick(30)
+        self.assert_merged_at(LA)
 
     def test_dependency_chain_lands_after_the_first_merges(self):
         self.pr(LA)

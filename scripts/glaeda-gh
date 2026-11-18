@@ -8213,7 +8213,9 @@ LAND_UNRELATED_REDS: dict[str, dict[str, dict[str, list[str]]]] = {
     },
 }
 LAND_OWN_RED_JOB = re.compile(r"\bnot excused: '([^'\n]{1,200})'")
-LAND_RED_CONCLUSIONS = frozenset({"FAILURE", "TIMED_OUT", "CANCELLED"})  # what `gh run rerun --failed` reruns
+# What `gh run rerun --failed` reruns: every failed conclusion GitHub's "re-run failed jobs" takes (#2132 review F1: a
+# job that never started, STARTUP_FAILURE, is one)
+LAND_RED_CONCLUSIONS = frozenset({"FAILURE", "TIMED_OUT", "CANCELLED", "STARTUP_FAILURE"})
 LAND_FILES_MAX = 3000  # GitHub lists at most this many files of a PR: a list that long may not be whole
 LAND_UNRELATED_KEEP = 20  # (head, run) reruns an entry remembers
 
@@ -8253,6 +8255,55 @@ def land_unrelated_rule(repo: str, workflow: str, config: dict | None = None) ->
     if not isinstance(rule, dict) or not isinstance(rule.get("inert"), list) or not rule["inert"]:
         return None
     return rule
+
+
+def land_file_names(out: str) -> list[str]:
+    """The PR's file names from `--jq '.[].filename | @json'`, one JSON string a line, kept exactly; a line that is
+    not one makes it [] (the list is unreadable, so a change can affect)."""
+    names = []
+    for line in out.split("\n"):
+        if not line:
+            continue
+        try:
+            name = json.loads(line)
+        except ValueError:
+            return []
+        if not isinstance(name, str) or not name:
+            return []
+        names.append(name)
+    return names
+
+
+def land_rerun_marks(checks: list, runs: list[int]) -> dict[str, str]:
+    """Each of RUNS' latest completedAt among CHECKS ("" for none), taken when its rerun is sent (land_rerun_ran)."""
+    marks = {str(r): "" for r in runs}
+    for c in checks:
+        r = str(c.get("runId") or "") if isinstance(c, dict) else ""
+        if r in marks:
+            marks[r] = max(marks[r], str(c.get("completedAt") or ""))
+    return marks
+
+
+def land_rerun_ran(w: dict, checks: list) -> bool:
+    """#2132 review F2: each requested rerun's own completion, not one bit for every check at the head. W's "runs" holds
+    each rerun run's mark (land_rerun_marks); a run ran once one of its checks shows running or a later completedAt
+    (kept in W's "ran"). True when every run ran and none of its checks still runs. A wait from before this (no "runs")
+    keeps its one aggregate bit, sawRunning."""
+    runs = w.get("runs")
+    if not isinstance(runs, dict):
+        return bool(w.get("sawRunning"))
+    ran, busy = set(w.get("ran") or []), set()
+    for c in checks:
+        r = str(c.get("runId") or "") if isinstance(c, dict) else ""
+        if r not in runs:
+            continue
+        if str(c.get("status") or "").upper() not in ("COMPLETED", ""):
+            ran.add(r)
+            busy.add(r)
+        elif str(c.get("completedAt") or "") > str(runs[r] or ""):
+            ran.add(r)
+    w["ran"] = sorted(ran)
+    return ran >= set(runs) and not busy
 
 
 def land_path_inert(path: str, rule: dict) -> bool:
@@ -9374,13 +9425,21 @@ class LandQueue:
                 self.judge(e, head, fp)
             elif kind != "pr" or w.get("sha") != head:
                 self.wait_running(e, head, fp)
-            elif w.get("rerun") and not w.get("sawRunning"):
+            elif w.get("rerun"):
+                before = (w.get("sawRunning"), w.get("ran"))
                 w["sawRunning"] = True
-                self.save(e)
+                land_rerun_ran(w, data.get("checks") or [])
+                if (w.get("sawRunning"), w.get("ran")) != before:
+                    self.save(e)
             return
-        # A rerun's wait: the rerun ran (the checks were seen running) and finished. Red again shows the fingerprint it
-        # was judged at, which alone would wait out the whole timeout before the same red is judged.
-        reran = kind == "pr" and w.get("rerun") and w.get("sawRunning")
+        # A rerun's wait: each rerun run ran and finished (land_rerun_ran). Red again shows the fingerprint it was judged
+        # at, which alone would wait out the whole timeout before the same red is judged.
+        reran = False
+        if kind == "pr" and w.get("rerun"):
+            before = w.get("ran")
+            reran = land_rerun_ran(w, data.get("checks") or [])
+            if w.get("ran") != before:
+                self.save(e)
         if woke or fp != e.get("seen") or reran:
             if not woke and not reran and self.verdict_holds(e, c, head, fp):
                 return  # merge_hold would answer the same wait (LAND_VERDICT_KEEP)
@@ -9878,7 +9937,9 @@ class LandQueue:
                 return
             with self.lock:
                 self.claim(e, "rerun_failed", runs=runs)
-            results = [self.call([gh, "run", "rerun", str(r), "--failed", "-R", repo], LAND_GH_DEADLINE, e)
+                checks = ((self.cache_of(e["key"]) or {}).get("data") or {}).get("checks") or []
+                marks = land_rerun_marks(checks if isinstance(checks, list) else [], runs)
+            results =[self.call([gh, "run", "rerun", str(r), "--failed", "-R", repo], LAND_GH_DEADLINE, e)
                        for r in runs]
             no_lane = [g for g in results if g.returncode != 0 and LAND_NO_LANE.search(f"{g.stderr} {g.stdout}")]
             with self.lock:
@@ -9887,7 +9948,7 @@ class LandQueue:
                 if no_lane:
                     self.step_refused(e, "rerun_failed", head, no_lane[0])
                     return
-                self.wait(e, {"kind": "pr", "sha": head, "why": "reran failed jobs", "rerun": True},
+                self.wait(e, {"kind": "pr", "sha": head, "why": "reran failed jobs", "rerun": True, "runs": marks},
                           LAND_WAIT_DEFAULT)
             return
         if kind == "review":
@@ -9958,9 +10019,11 @@ class LandQueue:
         if rule is not None and gh is None:
             rule, why = None, "no gh-quota shim to read the PR's files through"
         if rule is not None:
+            # One JSON string per file, so a name keeps its exact characters (#2132 review F1: a stripped
+            # " webviews/a.ts" matched an inert glob its real name does not)
             got = self.call([gh, "api", f"repos/{repo}/pulls/{number}/files?per_page=100", "--paginate",
-                             "--jq", ".[].filename"], LAND_GH_DEADLINE)
-            files = [line.strip() for line in (got.stdout or "").splitlines() if line.strip()]
+                             "--jq", ".[].filename | @json"], LAND_GH_DEADLINE)
+            files = land_file_names(got.stdout or "")
             if got.returncode != 0 or not files or len(files) >= LAND_FILES_MAX:
                 rule, why = None, (f"the PR's file list could not be read whole (exit {got.returncode}, "
                                    f"{len(files)} files)")
@@ -9982,7 +10045,7 @@ class LandQueue:
                                                                    f"{got.stderr or got.stdout}", 200))
                 return False
             self.nudge(e["key"])
-            self.wait(e, {"kind": "pr", "sha": head, "rerun": True,
+            self.wait(e, {"kind": "pr", "sha": head, "rerun": True, "runs": land_rerun_marks(checks, [run]),
                           "why": f"reran run {run}, a red the change cannot affect"}, LAND_WAIT_DEFAULT)
         return True
 
