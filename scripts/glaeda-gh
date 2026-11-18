@@ -9538,8 +9538,18 @@ class LandQueue:
                 self.watch_now(key)
             elif kind == "repin":
                 sha = str(act.get("sha") or "").lower()
+                cached = str(((self.cache_of(e["key"]) or {}).get("data") or {}).get("headRefOid") or "").lower()
                 if SHA40.fullmatch(sha) and sha != head:
                     self.wait(e, {"kind": "repin", "sha": sha}, None)
+                elif SHA40.fullmatch(sha) and sha == head == cached:
+                    # merge_hold's judge_again(), its fallback for a refusal with no step of its own: judge this same
+                    # head again. Nothing is stale (the cache holds it), so no head_change wait: that one nudged reads
+                    # for LAND_HEAD_TIMEOUT for a head that never came, then judged unpinned, a live read with no
+                    # snapshot (hq boneheaded-designs §4.2: 816 live reads, 46 snapshot judgments, 2026-11-18).
+                    # A retry, pinned at the cached head, backing off; LAND_STREAK_STOP identical answers still stop.
+                    n = int((e.get("streak") or {}).get("count") or 1)
+                    self.wait(e, {"kind": "retry", "why": "repin at the cached head"},
+                              min(LAND_RETRY_MAX, LAND_RETRY_DEFAULT * (2 ** max(0, n - 1))))
                 else:  # the cache's head was stale: wait for it to show another, then judge there
                     self.nudge(e["key"])
                     self.wait(e, {"kind": "head_change", "before": head, "since": self.now}, LAND_HEAD_TIMEOUT)

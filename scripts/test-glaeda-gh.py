@@ -18357,6 +18357,34 @@ class LandTest(Base):
         self.tick()
         self.assert_merged_at(LB)
 
+    def test_a_repin_to_the_head_the_cache_holds_judges_it_again_pinned(self):
+        # merge_hold's fallback for a refusal with no step of its own is judge_again(): a repin to the head it judged.
+        # Taken as a stale cache, it waited LAND_HEAD_TIMEOUT for a head that never came (nudging reads all along),
+        # then judged unpinned: a live read with no snapshot, the same answer, round again.
+        self.snap_pr(LA, snap_head=LA)
+        self.land()
+        self.w.answers.append(refusal("other_code", LA, {"kind": "repin", "sha": LA}))
+        e = self.tick()
+        self.assertEqual((e["state"], e["wait"]["kind"]), ("waiting", "retry"))
+        nudged = len(self.w.nudged)
+        self.tick(5)
+        self.assertEqual((len(self.w.explains()), len(self.w.nudged)), (1, nudged))
+        self.snap_pr(LA, snap_head=LA)  # the daemon's next full read of the same head
+        self.w.answers.append(ok_answer(LA))
+        self.tick(gg.LAND_RETRY_DEFAULT)
+        self.assertEqual(self.w.explains()[1][-2:], [LA, "--json"])  # pinned at the cached head
+        self.assertIn(gg.LAND_SNAPSHOT_ENV, self.explain_env())  # on the daemon's snapshot, not a live read
+        self.assertTrue(all("--sha" in argv for argv in self.w.explains()))
+        self.assert_merged_at(LA)
+
+    def test_a_repin_to_its_own_head_that_the_cache_does_not_hold_still_waits_for_the_cache(self):
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(refusal("other_code", LA, {"kind": "repin", "sha": LA}))
+        self.w.cache[self.KEY]["data"]["headRefOid"] = LB  # the cache moved on while merge_hold judged LA
+        e = self.tick()
+        self.assertEqual((e["wait"]["kind"], e["wait"]["before"]), ("head_change", LA))
+
     def test_base_red_unrelated_waits_on_the_base_run_then_merges(self):
         self.pr(LA)
         self.land()
