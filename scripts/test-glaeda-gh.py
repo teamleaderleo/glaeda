@@ -18005,7 +18005,7 @@ class LandTest(Base):
             e = self.tick(30)
         self.assertEqual((e["state"], e["mergeSha"]), ("merged", "f" * 40))
         self.assertEqual((len(self.w.gh_calls("pr", "update-branch")), len(self.w.explains())), (1, 1))
-        self.assertEqual(e["streak"]["count"], 1)  # the one judgment before the step, never more
+        self.assertIsNone(e.get("streak"))  # a refusal naming update-branch never counts toward the 3-refusal stop
         self.assertEqual([m[-1] for m in self.w.sent()], ["glaeda land: https://github.com/o/r/pull/1 merged at "
                                                           + "f" * 40])
 
@@ -18077,8 +18077,9 @@ class LandTest(Base):
         for _ in range(3):
             e = self.tick(30)
         self.assertEqual(e["stateOpen"], LA)
-        self.assertEqual(len(self.w.gh_calls("pr", "update-branch")), 2)
-        self.assertEqual(e["stepFail"]["count"], 1)
+        # no 3-refusal stop on an update: the third judgment sends it again, and the step's own count runs
+        self.assertEqual(len(self.w.gh_calls("pr", "update-branch")), 3)
+        self.assertEqual((e["state"], e["stepFail"]["count"]), ("waiting", 2))  # counted from the OPEN read on
 
     def test_a_host_with_its_own_login_keeps_the_pinned_rest_update_branch(self):
         # gh's own `pr update-branch` takes no head: off a lane VM the pinned REST PUT stays.
@@ -18819,7 +18820,7 @@ class LandTest(Base):
                 self.pr(LA)
                 self.land()
                 self.w.gh_rc["update"] = 1
-                self.w.gh_err["update"] = "gh: update_branch: lease acquisition requires a lane session."
+                self.w.gh_err["update"] = "gh: update_branch: broker refused: the base merge gate is not open yet."
                 answer = lambda: refusal(code, LA, {"kind": "update_branch", "expected_head_sha": LA, **args})
                 e = self.run_hour(answer, seconds=200)  # judged and refused at 0 s and at 60 s, then judged at 180 s
                 updates = [c for c in self.w.gh_calls("api") if "update-branch" in " ".join(c)]
