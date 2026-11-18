@@ -18975,8 +18975,10 @@ class LandTest(Base):
             self.assertEqual(e["state"], "queued")  # held, not stopped: it lands once the worker starts
             refused = gg.read_json(gg.land_dir() / gg.LAND_REFUSED_FILE)
             self.assertEqual(refused["code"], "merge_hold_missing")
-            self.assertEqual(refused["tried"], [os.fspath(p) for p in gone])
+            self.assertEqual(refused["tried"], [os.fspath(gone[0])] + [os.fspath(c) for p in gone[1:]
+                                                                         for c in (p.parent / "land-judge", p)])
             self.assertIn("mergeHold", refused["next"])
+            self.assertIn("landJudge", refused["next"])
             self.assertEqual([n[0] for n in self.w.notices], ["land-refused"])  # said once, not every tick
             out = io.StringIO()
             with contextlib.redirect_stdout(out):
@@ -19005,7 +19007,7 @@ class LandTest(Base):
                 mock.patch.object(gg, "say_waiting", side_effect=said.append):
             rc = gg.cmd_land("o/r#1", [], "host/lane", 0, False)
         self.assertEqual(rc, gg.EXIT_FAIL)
-        self.assertIn(f"refused: merge_hold.py is not at any of {gone}", said[0])
+        self.assertIn(f"refused: land-judge is not at any of {gone}", said[0])
         self.assertIn("then glaeda-gh land o/r#1", said[0])
         self.assertEqual(list(gg.LandQueue.requests_dir().glob("*.json")) if gg.LandQueue.requests_dir().is_dir()
                          else [], [])
@@ -19017,6 +19019,49 @@ class LandTest(Base):
             got = self.q.explain({"repo": "o/r", "number": 1}, LA)
         self.assertEqual((got["code"], got["action"]["kind"]), ("merge_hold_missing", "stop"))
         self.assertIn("then glaeda-gh land o/r#1", got["next"])
+
+    def test_land_judge_is_preferred_beside_merge_hold_and_merge_hold_runs_where_it_is_absent(self):
+        """leo-workspace renames merge_hold to land-judge (Leo, 2026-11-18: "Yeah, land judges could."), keeping
+        merge_hold.py. At each default location the land-judge beside merge_hold.py runs when it is there, run as
+        merge_hold.py was (python PATH explain R N --sha HEAD --json); a deploy or checkout older than land-judge still
+        runs its merge_hold.py, and a land-judge at a later location never beats an earlier merge_hold.py."""
+        deploy = Path(self.tmp.name) / "deploy" / "tools" / "merge_hold.py"
+        checkout = Path(self.tmp.name) / "leo-workspace" / "tools" / "merge_hold.py"
+        for p in (deploy, checkout, checkout.parent / "land-judge"):
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text("")
+        del self.w.config["mergeHold"]
+        with mock.patch.object(gg, "LAND_MERGE_HOLD_PATHS", (deploy, checkout)):
+            self.assertEqual(self.q.merge_hold()[0], deploy)  # an old deploy: its merge_hold.py, first location
+            (deploy.parent / "land-judge").write_text("")
+            judge = deploy.parent / "land-judge"
+            self.assertEqual(self.q.merge_hold()[0], judge)
+            self.w.mh = os.fspath(judge)
+            self.pr(LA)
+            self.land()
+            self.w.answers.append(ok_answer(LA))
+            self.tick()
+        self.assert_merged_at(LA)
+        self.assertEqual(self.w.explains()[0][1:], [os.fspath(judge), "explain", "o/r", "1", "--sha", LA, "--json"])
+
+    def test_land_json_land_judge_key_wins_over_merge_hold(self):
+        judge = Path(self.tmp.name) / "conf" / "land-judge"
+        self.w.config["landJudge"] = os.fspath(judge)
+        with mock.patch.object(gg, "LAND_MERGE_HOLD_PATHS", ()):
+            self.assertEqual(self.q.merge_hold()[0], Path(self.w.mh))  # landJudge missing: mergeHold still runs
+            self.assertEqual(self.q.merge_hold()[1], [judge, Path(self.w.mh)])
+            judge.parent.mkdir(parents=True)
+            judge.write_text("")
+            self.assertEqual(self.q.merge_hold()[0], judge)
+            del self.w.config["mergeHold"]
+            self.assertEqual(self.q.merge_hold(), (judge, [judge]))
+
+    def test_checkout_behind_names_the_land_judge_it_found(self):
+        answers = {"rev-parse --show-toplevel": "/ws", "rev-list --count HEAD..origin/main": "28"}
+        git = lambda args: answers.get(" ".join(args))  # noqa: E731
+        why = gg.land_checkout_behind(Path("/ws/tools/land-judge"), 20, 6.0, time.time(), git)
+        self.assertTrue(why.startswith("land-judge's checkout /ws is stale: 28 commits behind"), why)
+        self.assertIn("/ws/tools/ws-deploy --local", why)
 
     def test_upstream_host_reads_a_stale_landing_pr_itself(self):
         """gcp-agent-lane-6, 2026-11-17: on a lane VM the PR data is the controller's copy and the worker's nudge
