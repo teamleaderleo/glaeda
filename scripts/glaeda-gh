@@ -4826,9 +4826,33 @@ class Daemon:
         if kind == "run":
             self.confirming = {e["key"]: (rest_run((e["cache"] or {}).get("data")), (e["cache"] or {}).get("fetchedAt"))
                                for e in out if self.wait_confirms(e)}
+        if kind == "pr":
+            out = self.snapshot_first(mine, out)
         for e in out:
             self.attempted[e["key"]] = self.now
         return out
+
+    def snapshot_first(self, mine: list[dict], out: list[dict]) -> list[dict]:
+        """OUT with the PRs a land judgment waits on for its rollup snapshot (snapshot_waits) first, due or not, ahead
+        of the deferred backlog: the judgment runs merge_hold live, on its own reads, if the snapshot is not there
+        within LAND_SNAPSHOT_WAIT. One read per waiting head at most every NUDGE_MIN; the rest keep their order."""
+        waiting = self.snapshot_waits()
+        if not waiting:
+            return out
+        front = [e for e in mine if e["key"] in waiting and e.get("cache") is not None
+                 and not terminal("pr", (e["cache"] or {}).get("data"))
+                 and self.now - self.attempted.get(e["key"], float("-inf")) >= NUDGE_MIN]
+        keys = {e["key"] for e in front}
+        return front + [e for e in out if e["key"] not in keys]
+
+    def snapshot_waits(self) -> frozenset[str]:
+        """The PRs whose land judgment waits for the daemon's read of its head's rollup (LandQueue.snapshot_wait)."""
+        q = self.land_queue
+        if q is None:
+            return frozenset()
+        with q.lock:
+            return frozenset(k for k, e in q.entries.items()
+                             if e.get("state") not in LAND_DONE and isinstance(e.get("snapshotWait"), dict))
 
     def wait_confirms(self, e: dict) -> bool:
         """A finished run a wait is blocked on that GitHub has not shown since the wait (run_needs_confirm): the cache
@@ -8590,13 +8614,22 @@ class LandQueue:
         if self.reads_upstream():
             return None, "upstream"
         c = self.cache_of(key) or {}
-        if not isinstance(c.get("fp"), str):
-            return None, "no fingerprint"  # not a whole GraphQL read (REST, partial): no snapshot is kept for it
+        fp = c.get("fp")
+        if not isinstance(fp, str) and c.get("via") != "graphql":
+            return None, "no fingerprint"  # not a GraphQL full read (REST, a probe of one): no snapshot is kept for it
         data = c.get("data") or {}
         snap = self.snapshot_of(key)
+        # A whole read is matched by its fingerprint. One the daemon kept partial (a fold of its own failed: a page
+        # past the per-minute ceiling, a suite's last real attempt) has none, but its rollup capture may still be
+        # whole: it is matched by being that same read (the snapshot's readAt is the cache's fullAt).
+        if not isinstance(snap, dict):
+            same = False
+        elif isinstance(fp, str):
+            same = snap.get("fp") == fp
+        else:
+            same = snap.get("fp") is None and snap.get("readAt") is not None and snap.get("readAt") == c.get("fullAt")
         if not isinstance(snap, dict) or str(data.get("headRefOid") or "").lower() != sha \
-                or str(snap.get("head") or "").lower() != sha or snap.get("fp") != c.get("fp") \
-                or not isinstance(c.get("fp"), str):
+                or str(snap.get("head") or "").lower() != sha or not same:
             return None, "wait"
         at = c.get("dataAt")
         if not isinstance(at, (int, float)) or isinstance(at, bool) or self.now - at > LAND_SNAPSHOT_MAX_AGE:

@@ -15456,6 +15456,29 @@ class LandSnapshotTest(Base):
         self.assertTrue(snap["complete"])
         self.assertEqual([c["databaseId"] for c in snap["rollup"]["nodes"]], [5000 + i for i in range(150)])
 
+    def test_a_pr_whose_judgment_waits_for_its_snapshot_is_read_ahead_of_the_deferred_backlog(self) -> None:
+        # huge-blue, 2026-11-17: 245 land PRs and 434 watches on a lean daemon, PR data 20 to 77 min old; 1159 of the
+        # day's judgments waited the 120 s for a snapshot that the nudge never brought ahead of the backlog, then ran
+        # merge_hold live (land counts: snapshot 17, live 512)
+        self.cycle(0)
+        self.gh.prs[("o", "r", 10)]["headRefOid"] = "b" * 40  # a new head: its snapshot is stale, the read is a full one
+        keys = [f"pr:o/r#{n}" for n in range(1, self.N)]
+        self.daemon.deferred = set(keys)
+        self.daemon.deferred_since = {k: NOW - 100 + i for i, k in enumerate(keys)}
+        self.daemon.batch["pr"] = 2
+        room = iter([True])
+        self.daemon.gql_room = lambda: next(room, False)  # one query's room this tick: the rest stay deferred
+        for waiting in (False, True):
+            with self.subTest(waiting=waiting):
+                self.land.entries["pr:o/r#10"] = {"state": "queued", **(
+                    {"snapshotWait": {"sha": "b" * 40, "since": NOW}} if waiting else {})}
+                self.assertEqual(self.daemon.snapshot_waits(), frozenset({"pr:o/r#10"} if waiting else ()))
+        mark = len(self.gh.calls)
+        self.cycle(1)
+        self.assertIn(10, self.pr_reads(mark), "read on this tick, ahead of the nine deferred PRs")
+        self.assertEqual(gg.read_rollup("pr:o/r#10")["head"], "b" * 40)
+        self.assertEqual(len(set(self.pr_reads(mark))), 2, "one query of two: the backlog keeps its place behind it")
+
     def test_finished_land_prs_lose_their_snapshots(self) -> None:
         self.cycle(0)
         self.land.entries = {"pr:o/r#1": {"state": "queued"}, "pr:o/r#2": {"state": "merged"}}
@@ -17257,6 +17280,27 @@ class LandTest(Base):
                 self.q.entries.clear()
                 gg.land_request("withdraw", "o/r#1", [], "host/lane")
         self.upstream = False
+
+    def test_a_whole_rollup_from_a_read_the_daemon_kept_partial_is_judged_from_the_snapshot(self):
+        # huge-blue, 2026-11-18: a third of the queued cmux PRs had no fingerprint ("last real attempt: malformed
+        # check suite counts"), a fold the daemon adds after it captured the rollup, so explain ran live at once
+        self.snap_pr(LA, snap_head=LA)
+        c = self.w.cache[self.KEY]
+        c.update(via="graphql", fullAt=self.t, fp=None)
+        self.snaps[self.KEY].update(fp=None, readAt=self.t)
+        self.land()
+        self.w.answers.append(ok_answer(LA))
+        self.tick()
+        self.assertEqual(json.loads(Path(self.explain_env()[gg.LAND_SNAPSHOT_ENV]).read_text())["head"], LA)
+        self.assert_merged_at(LA)
+
+    def test_a_partial_reads_snapshot_from_an_older_read_waits_for_the_next_read(self):
+        self.snap_pr(LA, snap_head=LA)
+        self.w.cache[self.KEY].update(via="graphql", fullAt=self.t, fp=None)
+        self.snaps[self.KEY].update(fp=None, readAt=self.t - 60)  # the same head, but not the read the cache holds
+        self.land()
+        e = self.tick()
+        self.assertEqual((self.w.explains(), e["snapshotWait"]["sha"]), ([], LA))
 
     def test_wait_pr_then_merge(self):
         self.pr(LA)
