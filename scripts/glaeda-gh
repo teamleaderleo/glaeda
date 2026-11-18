@@ -705,7 +705,12 @@ PACE_HOLD_MAX = 3600
 CONTENT_PAUSE_ENV = "GLAEDA_CONTENT_PAUSE_CMD"
 CONTENT_PAUSE_NAMES = ("gh-quota",)
 CONTENT_PAUSE_TTL = 15  # seconds an answer is reused
-CONTENT_PAUSE_DEADLINE = 10
+# The ask runs on the daemon's main thread, so its bound is what the reads and waits lose to a hung keeper. A healthy
+# answer read from the host's own file took 0.09-0.10 s (median 0.09 s, ten runs); 2 s is twenty times that, room for
+# a loaded host's interpreter start. A keeper that asks over a socket is bounded by its own longer deadline, and a
+# client of one that answers slower than this waits out CONTENT_PAUSE_RETRY on the last answer instead.
+CONTENT_PAUSE_DEADLINE = 2
+CONTENT_PAUSE_RETRY = 60  # seconds after a failed or timed-out ask before the next; the last answer stands meanwhile
 # A private repository on a plan without branch protection or rulesets answers 403 with this: there are
 # no requirements to read, as for a deleted base branch.
 NO_FEATURE = re.compile(r"Upgrade to GitHub Pro|make this repository public to enable this feature", re.I)
@@ -1868,11 +1873,36 @@ def run_bounded(argv: list[str], timeout: float | None = None, input_text: str |
     return subprocess.CompletedProcess(argv, proc.returncode, out, err)
 
 
+def retry_after_seconds(value: Any) -> float | None:
+    """A Retry-After header as seconds, at most PACE_HOLD_MAX, or None when it says no usable number. float() takes
+    "inf", "nan" and "1e12": an infinite hold overflowed every int() after it (the queued write was dropped as a bad
+    entry), and a huge finite one held the outbox, and was reported to every writer on the login, for years."""
+    try:
+        seconds = float(value) if value else None
+    except (TypeError, ValueError):
+        return None
+    if seconds is None or math.isnan(seconds) or seconds == -math.inf:
+        return None
+    return max(0.0, min(seconds, float(PACE_HOLD_MAX)))
+
+
+_CONTENT_PAUSE_UNREAD: set[str] = set()  # CONTENT_PAUSE_ENV values already logged as unreadable
+
+
 def content_pause_cmd() -> list[str] | None:
-    """The command that reads and extends the login's create pause (CONTENT_PAUSE_ENV), or None: none on this host."""
+    """The command that reads and extends the login's create pause (CONTENT_PAUSE_ENV), or None: none on this host.
+    A setting shlex cannot read (an unclosed quote) is no command, logged once: raising here stopped every outbox
+    pass."""
     named = os.environ.get(CONTENT_PAUSE_ENV)
     if named is not None:
-        return shlex.split(named) or None
+        try:
+            return shlex.split(named) or None
+        except ValueError as error:
+            if named not in _CONTENT_PAUSE_UNREAD:
+                _CONTENT_PAUSE_UNREAD.add(named)
+                log({"event": "content-pause-cmd",
+                     "error": f"{CONTENT_PAUSE_ENV} unreadable ({error}): no pause asked"})
+            return None
     with contextlib.suppress(OSError):
         cli = PACE_CLI.resolve().parent / "gh_quota.py"
         if cli.is_file():
@@ -3189,7 +3219,7 @@ class Daemon:
         self.post_hold = float(held.get("holdUntil") or 0.0)  # GitHub's secondary limit holds the outbox until then
         self.post_backoff = POST_BACKOFF  # the next hold without a Retry-After
         self.pause_until = 0.0  # the login's create pause (content_pause_until), as last read
-        self.pause_read = float("-inf")  # when it was last asked
+        self.pause_next = float("-inf")  # when it may next be asked
         saved = read_json(BASE / CONSUMERS_FILE)
         spends = saved.get("spends") if isinstance(saved, dict) else None
         # consumer -> times of the head reads charged to it in the last hour
@@ -3975,9 +4005,11 @@ class Daemon:
             # the primary limit: this bucket only; its reads move to the other one (route, tick)
             self.gql_limited = self.gql_limited or bucket == "graphql"
             try:
-                wait = float(h["retry-after"]) if h.get("retry-after") else float(h.get("x-ratelimit-reset", 0)) - self.now
+                wait = (retry_after_seconds(h["retry-after"]) if h.get("retry-after")
+                        else float(h.get("x-ratelimit-reset", 0)) - self.now)
             except ValueError:
-                wait = CYCLE
+                wait = None
+            wait = CYCLE if wait is None or math.isnan(wait) else min(wait, PACE_HOLD_MAX)
             self.backoff[bucket] = self.now + max(CYCLE, wait)
         elif status < 400 and not free:
             self.secondary_strikes = 0  # a clean answer: the next secondary hold starts short again
@@ -4007,19 +4039,16 @@ class Daemon:
         try:
             cli = PACE_CLI.resolve().parent / "gh_quota.py"
             if cli.is_file():
-                run_bounded([sys.executable, "-I", os.fspath(cli), "secondary", "--retry-after", str(int(math.ceil(hold))),
-                             "--source", "glaeda-gh"], PACE_DEADLINE)
-        except (OSError, subprocess.SubprocessError) as error:
+                run_bounded([sys.executable, "-I", os.fspath(cli), "secondary", "--retry-after",
+                             str(int(math.ceil(min(hold, PACE_HOLD_MAX)))), "--source", "glaeda-gh"], PACE_DEADLINE)
+        except (OSError, subprocess.SubprocessError, ValueError, OverflowError) as error:
             self.errors.append(f"pace: {describe(error)}")
 
     def secondary_hit(self, bucket: str, retry_after: Any) -> None:
         """A secondary 403 or 429: hold both buckets (the limit is one for REST and GraphQL), for its
         Retry-After or the doubling back-off, whichever is longer. Never a retry within the same hold."""
         self.secondary_strikes += 1
-        try:
-            told = float(retry_after) if retry_after else 0.0
-        except ValueError:
-            told = 0.0
+        told = retry_after_seconds(retry_after) or 0.0
         hold = max(told, min(SECONDARY_BACKOFF_MAX, SECONDARY_BACKOFF * 2 ** (self.secondary_strikes - 1)))
         # from when the refusal arrived: a tick can run TICK_BUDGET past self.now, its start
         self.secondary_until = max(self.secondary_until, self.clock() + hold)
@@ -4077,15 +4106,17 @@ class Daemon:
             self.now = tick_now
 
     def content_pause_until(self) -> float:
-        """When the login's create pause ends (0: none), asked at most every CONTENT_PAUSE_TTL. A failed ask keeps
-        the last answer; the pacer's own hold (adopt_pace_hold) applies either way."""
+        """When the login's create pause ends (0: none), asked at most every CONTENT_PAUSE_TTL. A failed or
+        timed-out ask keeps the last answer and is not repeated for CONTENT_PAUSE_RETRY: the ask holds the daemon's
+        main thread, and a hung keeper asked every TTL took most of its time from the reads and waits. The pacer's own
+        hold (adopt_pace_hold) applies either way."""
         cmd = content_pause_cmd()
         if cmd is None:
             return 0.0
         clock = self.clock()
-        if clock - self.pause_read < CONTENT_PAUSE_TTL:
+        if clock < self.pause_next:
             return self.pause_until
-        self.pause_read = clock
+        self.pause_next = clock + CONTENT_PAUSE_RETRY  # until it answers
         try:
             done = run_bounded([*cmd, "content-pause"], CONTENT_PAUSE_DEADLINE)
             doc = json.loads(done.stdout) if done.returncode == 0 else None
@@ -4099,12 +4130,17 @@ class Daemon:
             if until > max(self.now, self.pause_until):
                 log({"event": "post-paused", "source": "login", "hold": round(until - self.now)})
             self.pause_until = until
+            self.pause_next = clock + CONTENT_PAUSE_TTL
         except (OSError, subprocess.SubprocessError, ValueError) as error:
             self.errors.append(f"content pause: {describe(error)}")
         return self.pause_until
 
     def report_content_pause(self, until: float, kind: str) -> None:
-        """Extend the login's create pause to `until` for this throttled write, so every writer waits it out."""
+        """Extend the login's create pause to `until` for this throttled write, so every writer waits it out. An hour
+        at most (PACE_HOLD_MAX), as the hold it came from."""
+        until = min(until, self.clock() + PACE_HOLD_MAX)
+        if math.isnan(until):
+            return
         self.pause_until = max(self.pause_until, until)
         cmd = content_pause_cmd()
         if cmd is None:
@@ -4114,15 +4150,16 @@ class Daemon:
                                 "--what", f"glaeda outbox {kind}"], CONTENT_PAUSE_DEADLINE)
             if done.returncode != 0:
                 self.errors.append(f"content pause hold: exit {done.returncode}")
-        except (OSError, subprocess.SubprocessError) as error:
+        except (OSError, subprocess.SubprocessError, ValueError, OverflowError) as error:
             self.errors.append(f"content pause hold: {describe(error)}")
 
     def post_hold_for(self, h: dict, path: Path, item: dict) -> None:
         try:
-            wait = float(h["retry-after"]) if h.get("retry-after") else (
+            wait = (retry_after_seconds(h["retry-after"]) or 0.0) if h.get("retry-after") else (
                 float(h.get("x-ratelimit-reset", 0)) - self.now if h.get("x-ratelimit-remaining") == "0" else 0.0)
         except ValueError:
             wait = 0.0
+        wait = 0.0 if math.isnan(wait) else min(wait, PACE_HOLD_MAX)  # an hour at most, as every other hold
         wait = max(wait, self.post_backoff) if wait <= 0 else wait
         self.post_backoff = min(POST_BACKOFF_MAX, self.post_backoff * 2)
         self.post_hold = self.now + max(POST_SPACING, wait)
@@ -15872,7 +15909,32 @@ def cmd_runners(scope: str, label: str | None, as_json: bool) -> int:
 # usual. The guard then reaches this broker again with GH_QUOTA_CHECKED set, and the call passes as before.
 # A host with no guard refuses the merge rather than run it unjudged: nothing on the fleet merges through
 # `glaeda-gh gh` on purpose, and `gh pr merge` is the documented route.
+# A create (a comment, review, PR, issue, status, release: GitHub's secondary content-creation limit) is handed to the
+# guard the same way, because the guard asks the login's create pause before it: a create typed as `glaeda-gh gh`
+# reached gh unasked and could renew the pause for every writer on the login. The lists mirror the guard's own
+# (gh_quota.py CREATE_WORDS, CREATE_API, CREATE_MUTATIONS, plus its landing creates). Unlike a merge, a create on a
+# host with no guard runs as before: creates are routine everywhere, and such a host has no pause to ask.
 MERGE_GUARD_ENV = "GLAEDA_MERGE_GUARD"
+# (command, subcommand) -> None (always a create) or the flags without which it creates nothing (a close's comment)
+BROKER_CREATE_WORDS: dict[tuple[str, str], tuple[str, ...] | None] = {
+    ("pr", "comment"): None, ("pr", "review"): None, ("pr", "create"): None, ("issue", "create"): None,
+    ("issue", "comment"): None, ("release", "create"): None, ("gist", "create"): None,
+    ("pr", "close"): ("--comment", "-c"), ("pr", "reopen"): ("--comment", "-c"),
+    ("issue", "close"): ("--comment", "-c"), ("issue", "reopen"): ("--comment", "-c")}
+BROKER_CREATE_API = re.compile("|".join((
+    r"repos/[^/]+/[^/]+/(?:pulls|issues)(?:/\d+/comments)?",
+    r"repos/[^/]+/[^/]+/pulls/\d+/(?:reviews|comments)(?:/\d+/(?:events|replies))?",
+    r"repos/[^/]+/[^/]+/pulls/comments/\d+/replies",
+    r"repos/[^/]+/[^/]+/statuses/[0-9a-fA-F]{7,40}",
+    r"repos/[^/]+/[^/]+/check-runs",
+    r"repos/[^/]+/[^/]+/commits/[0-9a-fA-F]{7,40}/comments",
+    r"repos/[^/]+/[^/]+/releases",
+    r"gists(?:/[0-9a-fA-F]+/comments)?",
+    r"(?:orgs/[^/]+/teams/[^/]+|teams/\d+)/discussions(?:/\d+/comments)?")))
+BROKER_CREATE_MUTATIONS = re.compile(
+    r"\b(?:addComment|addDiscussionComment|createDiscussion|createIssue|createPullRequest|addPullRequestReview"
+    r"|submitPullRequestReview|addPullRequestReviewComment|addPullRequestReviewThread|addPullRequestReviewThreadReply"
+    r"|createCheckRun|createCommitOnBranch)\s*\(")
 BROKER_MERGE_MUTATIONS = re.compile(r"\b(?:mergePullRequest|enablePullRequestAutoMerge|enqueuePullRequest)\b")
 BROKER_REST_MERGE = re.compile(r"^/?(?:https?://[^/]+/(?:api/v3/)?)?repos/[^/]+/[^/]+/pulls/\d+/merge/?$")
 
@@ -15883,8 +15945,8 @@ def broker_merge_call(args: list[str]) -> bool:
     it could change between this read and gh's (router-review F2 on #1878), so the guard, which snapshots it before it
     judges (merge_hold.snapshot), gets every such call. A `?query` suffix on the endpoint is ignored (F1)."""
     words, method, seen, _values = broker_words(args)
-    if "--help" in seen or "-h" in seen or any(a.lower() in ("--help=true", "--help=1") for a in args):
-        return False  # gh prints help and does nothing else (router-review F3 on #1878)
+    if broker_help(args, seen):
+        return False  # gh prints help and does nothing else
     if words[:2] == ["pr", "merge"]:
         return True
     if words[:1] != ["api"] or len(words) < 2:
@@ -15911,11 +15973,51 @@ def broker_merge_call(args: list[str]) -> bool:
     return bool(BROKER_MERGE_MUTATIONS.search("\n".join(args)))
 
 
+def broker_help(args: list[str], seen: set[str]) -> bool:
+    """Whether gh only prints help for this call (router-review F3 on #1878)."""
+    return "--help" in seen or "-h" in seen or any(a.lower() in ("--help=true", "--help=1") for a in args)
+
+
+def broker_create_call(args: list[str]) -> bool:
+    """Whether this gh call creates content (BROKER_CREATE_WORDS, a POST to a BROKER_CREATE_API path, or a `gh api
+    graphql` mutation naming a BROKER_CREATE_MUTATIONS field inline). A graphql call that reads a file or stdin is
+    broker_merge_call's, and goes to the guard already."""
+    words, method, seen, _values = broker_words(args)
+    if broker_help(args, seen):
+        return False
+    if words[:1] != ["api"]:
+        if tuple(words[:2]) not in BROKER_CREATE_WORDS:
+            return False
+        need = BROKER_CREATE_WORDS[tuple(words[:2])]
+        return need is None or any(a.split("=", 1)[0] in need or (a[:2] in need and len(a) > 2 and a[1] != "-")
+                                   for a in args if a.startswith("-"))
+    if len(words) < 2:
+        return False
+    endpoint = words[1].split("?", 1)[0].split("#", 1)[0]
+    if AUDIT_GRAPHQL_RE.match(endpoint):
+        text = "\n".join(args)
+        return bool(re.search(r"\bmutation\b", text) and BROKER_CREATE_MUTATIONS.search(text))
+    path = re.sub(r"^/?(?:[A-Za-z][A-Za-z0-9+.-]*://[^/]*/(?:api/v3/)?)?", "", endpoint).rstrip("/")
+    return method == "POST" and bool(BROKER_CREATE_API.fullmatch(path))
+
+
 def broker_merge_handoff(args: list[str]) -> int | None:
-    """Hand a merge the gh-quota guard has not judged to the guard (exec, so this returns only on failure), or None
-    when the call is no such merge."""
-    if os.environ.get("GH_QUOTA_CHECKED") or not broker_merge_call(args):
+    """Hand a merge or a create the gh-quota guard has not judged to the guard (exec, so this returns only on
+    failure), or None when the call is neither, or is a create and no guard can be run here."""
+    if os.environ.get("GH_QUOTA_CHECKED"):
         return None
+    if not broker_merge_call(args):
+        if broker_create_call(args):
+            path = os.environ.get("PATH", "")
+            try:
+                guard = Path(os.environ.get(MERGE_GUARD_ENV) or PACE_CLI)
+                if guard.is_file() and os.access(guard, os.X_OK):
+                    os.environ["PATH"] = os.pathsep.join([str(guard.parent), path])
+                    os.execv(str(guard), [str(guard), *args])
+            except Exception as error:  # noqa: BLE001
+                os.environ["PATH"] = path
+                broker_note({"route": "error", "error": describe(error), "site": "broker_create_handoff"})
+        return None  # no guard to ask (or it cannot run): the create runs as before
     # From here the call is a merge: anything that fails refuses it, never runs it unguarded (F2, second review).
     try:
         guard = Path(os.environ.get(MERGE_GUARD_ENV) or PACE_CLI)

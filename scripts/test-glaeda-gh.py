@@ -9666,11 +9666,65 @@ class BrokerMergeGuardTest(BrokerBase):
                      ["api", "repos/o/r/pulls/7/merge"],  # GET: whether it merged
                      ["api", "-X", "PUT", "repos/o/r/pulls/7/update-branch"],
                      ["api", "graphql", "-f", "query=query { viewer { login } }"],
-                     ["api", "graphql", "-f", "query=mutation { addComment(input: {subjectId: \"X\", body: \"mergePull\"}) "
-                      "{ clientMutationId } }"]):
+                     ["api", "graphql", "-f", "query=mutation { updateIssueComment(input: {id: \"X\", "
+                      "body: \"mergePull\"}) { clientMutationId } }"],
+                     # edits, labels and a close with no comment create no content: the guard's create list agrees
+                     ["api", "-X", "PATCH", "repos/o/r/issues/comments/9", "-f", "body=x"],
+                     ["api", "repos/o/r/issues/7/labels", "-f", "labels[]=x"],
+                     ["api", "repos/o/r/issues/7/comments"],  # GET: reading the thread
+                     ["issue", "close", "7", "-R", "o/r"],
+                     ["pr", "edit", "7", "-R", "o/r", "--body", "x"],
+                     ["pr", "comment", "--help"],
+                     ["api", "graphql", "-f", "query=query { addComment }"]):  # no `mutation`: a read
             with self.subTest(args=args):
                 _code, _err, path, _passed = self.route(args)
                 self.assertNotEqual(path, str(self.guard))
+
+    def test_every_create_goes_to_the_guard(self) -> None:
+        # The guard asks the login's create pause before a create; `glaeda-gh gh` stepped over it, so a create typed
+        # here renewed the pause for every writer on the login.
+        sha = "a" * 40
+        for args in (["pr", "comment", "7", "-R", "o/r", "--body", "x"],
+                     ["pr", "review", "7", "-R", "o/r", "--approve", "--body", "x"],
+                     ["pr", "create", "-R", "o/r", "--head", "h", "--base", "main", "--title", "T", "--body", "b"],
+                     ["issue", "create", "-R", "o/r", "--title", "T", "--body", "b"],
+                     ["issue", "comment", "7", "-R", "o/r", "--body", "x"],
+                     ["issue", "close", "7", "-R", "o/r", "--comment", "done"],
+                     ["pr", "close", "7", "-R", "o/r", "-c", "done"],
+                     ["release", "create", "v1", "-R", "o/r"],
+                     ["api", "-X", "POST", "repos/o/r/issues/7/comments", "-f", "body=x"],
+                     ["api", "repos/o/r/issues/7/comments", "-f", "body=x"],  # fields: gh POSTs
+                     ["api", "/repos/o/r/pulls", "--input", "-"],
+                     ["api", "--method=post", "repos/o/r/pulls/7/reviews", "-f", "event=APPROVE"],
+                     ["api", "-XPOST", "https://api.github.com/repos/o/r/pulls/7/comments", "-f", "body=x"],
+                     ["api", "-X", "POST", "HTTPS://API.GITHUB.COM/repos/o/r/statuses/" + sha, "-f", "state=success"],
+                     ["api", "repos/o/r/issues?x=y", "-f", "title=T"],
+                     ["api", "graphql", "-f", "query=mutation { addComment(input: {subjectId: \"X\", body: \"b\"}) "
+                      "{ clientMutationId } }"],
+                     ["api", "graphql", "-f", "query=mutation($i: CreateIssueInput!) { createIssue (input: $i) "
+                      "{ issue { id } } }"]):
+            with self.subTest(args=args):
+                code, _err, path, passed = self.route(args)
+                self.assertIsNone(code)
+                self.assertEqual(path, str(self.guard))
+                self.assertEqual(passed, args)
+                self.assertEqual(os.environ["PATH"].split(os.pathsep)[0], str(self.guard.parent))
+
+    def test_a_create_the_guard_judged_passes_to_the_real_gh(self) -> None:
+        os.environ["GH_QUOTA_CHECKED"] = "1"
+        args = ["pr", "comment", "7", "-R", "o/r", "--body", "x"]
+        _code, _err, path, passed = self.route(args)
+        self.assertEqual(path, os.environ["GLAEDA_GH_REAL"])
+        self.assertEqual(passed, args)
+
+    def test_a_create_on_a_host_with_no_guard_runs_as_before(self) -> None:
+        # A merge is refused there; a create is routine on every host, and a host with no guard has no pause to ask.
+        for guard in (str(self.home / "nowhere" / "gh"), "/" + "x" * 5000):
+            os.environ["GLAEDA_MERGE_GUARD"] = guard
+            with self.subTest(guard=guard[:40]):
+                code, _err, path, _passed = self.route(["pr", "comment", "7", "-R", "o/r", "--body", "x"])
+                self.assertNotEqual(code, gg.BROKER_EXIT_REFUSED)
+                self.assertEqual(path, os.environ["GLAEDA_GH_REAL"])
 
     def test_a_merge_the_guard_judged_passes_to_the_real_gh(self) -> None:
         os.environ["GH_QUOTA_CHECKED"] = "1"
@@ -11812,6 +11866,7 @@ class PostTest(unittest.TestCase):
         (root / "pause.json").write_text(json.dumps({"blocked_until": blocked_until, "level": level}))
         cmd = root / "content-pause-cmd"
         cmd.write_text(f'#!/bin/sh\necho "$*" >> {shlex.quote(os.fspath(root / "calls"))}\n'
+                       f'[ -f {shlex.quote(os.fspath(root / "hang"))} ] && exec sleep 30\n'
                        f'[ "$2" = --hold ] || cat {shlex.quote(os.fspath(root / "pause.json"))}\n')
         cmd.chmod(0o755)
         env = mock.patch.dict(os.environ, {gg.CONTENT_PAUSE_ENV: shlex.quote(os.fspath(cmd))})
@@ -11869,7 +11924,7 @@ class PostTest(unittest.TestCase):
         self.step(d, NOW)
         for said in ('{"blocked_until": NaN, "level": 1}', '{"blocked_until": Infinity, "level": 1}'):
             (calls.parent / "pause.json").write_text(said)
-            d.pause_read = 0.0  # ask again now
+            d.pause_next = float("-inf")  # ask again now
             failed = len(d.errors)
             self.step(d, NOW + 20)
             self.assertEqual(d.pause_until, NOW + 100, said)
@@ -11901,6 +11956,97 @@ class PostTest(unittest.TestCase):
         self.assertEqual(gg.post_state(item["id"])["state"], "posted")
         with mock.patch.dict(os.environ, {gg.CONTENT_PAUSE_ENV: ""}):
             self.assertIsNone(gg.content_pause_cmd())  # an empty setting turns it off
+
+    def test_an_infinite_or_absurd_retry_after_keeps_the_write_and_holds_an_hour_at_most(self) -> None:
+        # float("inf") parses: int(math.ceil(inf)) in the report raised OverflowError, which dropped the write as a
+        # "bad queue entry"; a huge finite one went to the pause's keeper as years.
+        for said in ("inf", "1e12", "nan"):
+            with self.subTest(retry_after=said):
+                for left in gg.outbox_dir().glob("*.json") if gg.outbox_dir().is_dir() else []:
+                    left.unlink()
+                item = self.queue("comment", "o/r#7", "--body", "x")
+                calls = self.pause_cmd(0, level=0)
+                calls.unlink(missing_ok=True)
+                d, t = self.daemon((403, {"retry-after": said}, {"message": (
+                    "You have exceeded a secondary rate limit and have been temporarily blocked from content "
+                    "creation.")}))
+                d.clock_real = False
+                self.step(d, NOW)
+                self.assertEqual(len(t.calls), 1)
+                self.assertEqual(gg.post_state(item["id"])["state"], "queued")
+                self.assertLessEqual(d.post_hold, NOW + gg.PACE_HOLD_MAX)
+                self.assertLessEqual(d.pause_until, NOW + gg.PACE_HOLD_MAX)
+                held = [line.split()[2] for line in calls.read_text().splitlines() if "--hold" in line]
+                self.assertEqual(len(held), 1)
+                self.assertLessEqual(int(held[0]), int(NOW) + gg.PACE_HOLD_MAX)
+
+    def test_an_infinite_retry_after_on_a_read_holds_an_hour_at_most(self) -> None:
+        d, _t = self.daemon()
+        with mock.patch.object(gg, "run_bounded", side_effect=AssertionError("no pacer here")), \
+                mock.patch.object(gg, "PACE_CLI", Path(self.tmp.name) / "no-pacer" / "gh"):
+            d.secondary_hit("rest", "inf")
+        self.assertLessEqual(d.secondary_until, d.clock() + gg.PACE_HOLD_MAX)
+        self.assertEqual(gg.retry_after_seconds("inf"), gg.PACE_HOLD_MAX)
+        self.assertEqual(gg.retry_after_seconds("1e12"), gg.PACE_HOLD_MAX)
+        self.assertEqual(gg.retry_after_seconds("120"), 120.0)
+        for unread in ("nan", "-inf", "soon", "", None):
+            self.assertIsNone(gg.retry_after_seconds(unread), unread)
+
+    def test_a_malformed_pause_command_is_no_command_logged_once(self) -> None:
+        # shlex.split raised ValueError outside post_tick's try: every pass failed and nothing was ever sent.
+        first = self.queue("comment", "o/r#1", "--body", "one")
+        second = self.queue("comment", "o/r#2", "--body", "two")
+        ok = (201, {}, {"html_url": "u"})
+        d, t = self.daemon(ok, ok)
+        d.clock_real = False
+        lines: list[dict] = []
+        with mock.patch.dict(os.environ, {gg.CONTENT_PAUSE_ENV: 'gh-quota "unclosed'}), \
+                mock.patch.object(gg, "log", lines.append):
+            self.assertIsNone(gg.content_pause_cmd())
+            self.step(d, NOW)
+            self.step(d, NOW + gg.POST_SPACING)
+        self.assertEqual([gg.post_state(i["id"])["state"] for i in (first, second)], ["posted", "posted"])
+        self.assertEqual(len([e for e in lines if e.get("event") == "content-pause-cmd"]), 1)
+
+    def test_a_timed_out_ask_is_not_repeated_for_a_minute_and_the_last_answer_stands(self) -> None:
+        # A hung keeper of the pause held the daemon's main thread CONTENT_PAUSE_DEADLINE out of every TTL.
+        self.queue("comment", "o/r#1", "--body", "one")
+        calls = self.pause_cmd(NOW + 100)
+        d, t = self.daemon((201, {}, {"html_url": "u"}))
+        d.clock_real = False
+        clock = [NOW]
+        d.clock = lambda: clock[0]
+        self.step(d, NOW)
+        self.assertEqual(d.pause_until, NOW + 100)
+        (calls.parent / "hang").touch()
+        with mock.patch.object(gg, "CONTENT_PAUSE_DEADLINE", 0.3):
+            clock[0] = NOW + 20
+            self.step(d, NOW + 20)  # this ask times out
+            self.assertTrue(any(e.startswith("content pause:") for e in d.errors))
+            self.assertEqual(d.pause_until, NOW + 100)
+            for at in (NOW + 40, NOW + 60, NOW + 79):
+                clock[0] = at
+                self.step(d, at)
+            self.assertEqual(len(calls.read_text().splitlines()), 2)  # no ask within a minute of the failed one
+            (calls.parent / "hang").unlink()
+            clock[0] = NOW + 80
+            self.step(d, NOW + 80)
+        self.assertEqual(len(calls.read_text().splitlines()), 3)
+        self.assertEqual(t.calls, [])
+        self.assertLessEqual(gg.CONTENT_PAUSE_DEADLINE, 2)  # a healthy local answer takes about 0.1 s
+
+    def test_the_pause_holds_writes_not_reads(self) -> None:
+        self.queue("comment", "o/r#1", "--body", "one")
+        self.pause_cmd(NOW + 100)
+        d, t = self.daemon((200, {}, {"number": 1}))
+        d.clock_real = False
+        self.step(d, NOW)
+        self.assertEqual(t.calls, [])  # the write waits
+        for bucket in ("rest", "graphql"):
+            self.assertTrue(d.secondary_admit(bucket, 1), bucket)
+            self.assertLessEqual(d.backoff[bucket], NOW, bucket)
+        status, _h, _doc = d.request("GET", "/repos/o/r/pulls/1", None)
+        self.assertEqual((status, t.calls[-1][:2]), (200, ("GET", "/repos/o/r/pulls/1")))
 
     def test_secondary_limit_holds_the_outbox_not_the_reads(self) -> None:
         item = self.queue("pr", "o/r", "--head", "lane/x", "--base", "main", "--title", "T", "--body", "b",
@@ -17401,6 +17547,22 @@ class LandTest(Base):
         self.land()
         e = self.tick()
         self.assertEqual((self.w.explains(), e["snapshotWait"]["sha"]), ([], LA))
+
+    def test_a_merge_goes_out_while_the_logins_create_pause_is_on(self):
+        # The pause holds the outbox's creates only: the land queue never asks it, and its merge goes out.
+        root = Path(self.tmp.name) / "pause"
+        root.mkdir()
+        cmd = root / "content-pause-cmd"
+        cmd.write_text(f'#!/bin/sh\necho "$*" >> {shlex.quote(os.fspath(root / "calls"))}\n'
+                       f'echo \'{{"blocked_until": {NOW + 3000}, "level": 3}}\'\n')
+        cmd.chmod(0o755)
+        with mock.patch.dict(os.environ, {gg.CONTENT_PAUSE_ENV: shlex.quote(os.fspath(cmd))}):
+            self.pr(LA)
+            self.land()
+            self.w.answers.append(ok_answer(LA))
+            self.tick()
+            self.assert_merged_at(LA)
+        self.assertFalse((root / "calls").exists())
 
     def test_wait_pr_then_merge(self):
         self.pr(LA)
