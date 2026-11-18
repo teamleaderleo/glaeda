@@ -20,8 +20,11 @@ Each run checks, as the runner user and without sudo:
                                      (Stopped, stuck Starting). Healed after two runs in a row: `tailscale up` when
                                      Stopped, else a stop and start of the Tailscale VPN service (scutil --nc), as
                                      mini-ops tailscale-unstick.sh does by hand. A standalone tailscaled (root daemon)
-                                     or a logged-out node is reported only.
-  tailscale_no_route                 BackendState is Running but the OS sends tailnet traffic elsewhere:
+                                     or a logged-out node is reported only. A capture-only mini (no glaeda runner) is
+                                     checked too and gets only the `tailscale up` when Stopped (cmux-mac-mini,
+                                     2026-11-17: Stopped after a power loss until a person ran it); a stuck Starting
+                                     and a tailscale_no_route there are reported only.
+  tailscale_no_route                BackendState is Running but the OS sends tailnet traffic elsewhere:
                                      `route -n get 100.100.100.100` (Tailscale's own address) leaves by a
                                      non-utun interface (en0 to the LAN gateway), so no tailnet host reaches
                                      ssh here while `tailscale ping --tsmp` still answers (cmuxs-mac-mini-5,
@@ -194,7 +197,8 @@ A heal (other than tailscale_no_route's, above) is tried at most every HEAL_EVER
 but did not last (a runner that exits again), so nothing loops. Each finding reads
 {id, code, severity, since, evidence, auto_fix, note}: auto_fix is "pending" while a heal will be tried,
 "impossible" when this user cannot fix it or the tries ran out. A fixed finding leaves the report and its heal is
-kept under "healed" for a day (auto_fix "done"). The report is REPORT (ci-dash's probe reads it; cmuxterm-hq
+kept under "healed" for a day (auto_fix "done"), as is each restart the runner gate made of a listener stuck
+acquiring a job (listener_acquire_stuck, from the gate's listener-restarts.jsonl). The report is REPORT (ci-dash's probe reads it; cmuxterm-hq
 build-fleet/ci-dash turns each code into the operator command that fixes it); the state beside it keeps each
 finding's first sighting and the heal tries. On a host with no glaeda runner it checks only claude_route, runner_unmanaged and unmanaged_service (and the daemon healer). With KILL_SWITCH
 present it still reports but never heals. Prints one JSON line when it healed something or the findings changed.
@@ -486,6 +490,7 @@ class Mini:
             try:
                 loader = importlib.machinery.SourceFileLoader("glaeda_cmux_runner_hook_for_health", os.fspath(path))
                 module = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
+                sys.modules[loader.name] = module  # before exec_module: a dataclass in the module looks its module up here
                 loader.exec_module(module)
                 self._hook = module
             except Exception:  # noqa: BLE001  (an unreadable hook skips the checks that need it)
@@ -1664,6 +1669,28 @@ def check_git_mirror(mini: Mini, now: float) -> list[dict[str, Any]]:
                     "glaeda-git-mirror (plan) says what the next pass does; ~/Library/Logs/glaeda-git-mirror.jsonl")]
 
 
+PRESSURE_BLOCKED_MIN = 20 * 1024**3  # blocked bytes worth a look
+PRESSURE_BLOCKED_SHARE = 0.05  # reclaimable under this share of blocked, under pressure: the classifier keeps too much
+
+
+def pressure_blocked_findings(summary: dict[str, Any]) -> list[dict[str, Any]]:
+    """disk_pressure_blocked: a filesystem is under pressure while glaeda-disk calls almost nothing reclaimable and
+    holds tens of GiB blocked. A fleet mini sat at 27 GB free of 460 with 372 GB measured build/cache and
+    "Reclaimable 0.0 GB" (2026-11-18): a stale socket, a 12 h mirror window and a 2-day image window kept 108 GiB."""
+    under = [f for f in summary.get("filesystems") or [] if isinstance(f, dict) and f.get("under")]
+    reclaimable, blocked = summary.get("reclaimable"), summary.get("blocked")
+    if not under or not isinstance(reclaimable, (int, float)) or not isinstance(blocked, (int, float)):
+        return []
+    if blocked < PRESSURE_BLOCKED_MIN or reclaimable >= PRESSURE_BLOCKED_SHARE * blocked:
+        return []
+    mounts = ", ".join(str(f.get("mount")) for f in under)
+    return [finding("disk_pressure_blocked", "warn",
+                    f"under pressure on {mounts}: reclaimable {reclaimable / 1024**3:.1f} GiB, blocked "
+                    f"{blocked / 1024**3:.1f} GiB", "pending",
+                    "run `glaeda-disk --pressure --json` and fix the verdict that keeps the biggest build/cache items "
+                    "(handbook: build-caches-classified-keep)")]
+
+
 def check_disk_accounting(mini: Mini) -> list[dict[str, Any]]:
     summary = mini.disk_summary()
     if summary.get("schema") != "glaeda-disk/v1":
@@ -1729,6 +1756,7 @@ def check_disk_accounting(mini: Mini) -> list[dict[str, Any]]:
         findings.append(finding("eviction_contention", "warn",
                                 f"eviction skipped while pid {pid} ({account}, {state}) held the lock",
                                 "impossible", "the next scheduled pass retries; live scans are never killed"))
+    findings.extend(pressure_blocked_findings(summary))
     accounting = summary.get("accounting") or []
     # The enrolled-runner profile deliberately measures only its rebuildable cache allowlist.
     # Its df-used remainder includes unrelated system and account data, so comparing it with the
@@ -2826,6 +2854,36 @@ HEALS: dict[str, tuple[Callable[[Mini, dict[str, Any]], tuple[bool, str]], int]]
 # ---------------------------------------------------------------- run
 
 
+GATE_RESTARTS = "listener-restarts.jsonl"  # glaeda-cmux-runner-hook GATE_RESTARTS_FILE, in the gate's state dir
+
+
+def gate_restarts_healed(home: Any, now: float) -> list[dict[str, Any]]:
+    """The listener gate's restarts of a stuck listener in the last HEALED_KEEP_S (glaeda-cmux-runner-hook
+    stuck_acquire: a listener that acknowledged a job request and started no Worker), as healed entries for
+    ci-dash: one per restart, code listener_acquire_stuck. Unreadable or missing: none."""
+    if not isinstance(home, Path):
+        return []
+    try:
+        lines = (home / ".local/state/glaeda/cmux-runner" / GATE_RESTARTS).read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeDecodeError):
+        return []
+    out = []
+    for line in lines:
+        try:
+            doc = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(doc, dict) or not isinstance(doc.get("t"), (int, float)) or now - doc["t"] >= HEALED_KEEP_S:
+            continue
+        code, runner = str(doc.get("cause") or "listener_acquire_stuck"), str(doc.get("runner") or "")
+        out.append({"id": f"{code}:{runner}:{doc.get('request')}", "code": code, "t": doc["t"], "at": doc.get("at"),
+                    "since": doc.get("acknowledged"),
+                    "evidence": f"{runner} acknowledged job request {doc.get('request')} and started no Worker in "
+                                f"{doc.get('held_s')} s (bound {doc.get('bound_s')} s)",
+                    "action": "the runner gate restarted the listener", "auto_fix": "done"})
+    return out
+
+
 def load_json(path: Path) -> dict[str, Any]:
     try:
         doc = json.loads(path.read_text())
@@ -2845,10 +2903,24 @@ def iso(t: float) -> str:
     return datetime.datetime.fromtimestamp(t, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def capture_only_tailscale(f: dict[str, Any]) -> dict[str, Any]:
+    """A Tailscale finding on a host with no glaeda runner: only a Stopped app Tailscale keeps its heal (`tailscale
+    up`, HEALS' two runs in a row); a stuck Starting is reported, and tailscale_no_route gets no restart."""
+    if f["code"] == "tailscale_down" and f["auto_fix"] == "pending" and "Stopped" not in f["evidence"]:
+        return {**f, "auto_fix": "impossible", "note": "a host with no glaeda runner heals only a Stopped Tailscale "
+                "(tailscale up); its owner stops and starts the Tailscale VPN service"}
+    if f["code"] == "tailscale_no_route":
+        out = {k: v for k, v in f.items() if k != "flavor"}
+        return {**out, "auto_fix": "impossible", "note": f"{f['note']}; not restarted here: no glaeda runner on this "
+                "host (a capture-only mini), the restart is a CI runner mini's; its owner does that"[:300]}
+    return f
+
+
 def run(mini: Mini, apply: bool, now: float | None = None, state_path: Path = STATE,
         report_path: Path = REPORT, heal_ok: bool = True, runner: bool = True) -> dict[str, Any]:
-    """One pass. runner=False is a host with no glaeda runner (a capture-only mini): only its Claude Code (missing,
-    route), runner_unmanaged and unmanaged_service."""
+    """One pass. runner=False is a host with no glaeda runner (a capture-only mini): only its Tailscale (tailscale_down
+    healed only when Stopped, by `tailscale up`; tailscale_no_route reported, never restarted), its Claude Code
+    (missing, route), runner_unmanaged and unmanaged_service."""
     now = time.time() if now is None else now
     state = load_json(state_path) if apply else {}
     seen: dict[str, Any] = state.get("seen") or {}
@@ -2876,10 +2948,15 @@ def run(mini: Mini, apply: bool, now: float | None = None, state_path: Path = ST
         carried = tm is None and "testmanagerd_wedged" in previous  # a test runs, or the log was unreadable: no heal
         found += [previous["testmanagerd_wedged"]] if carried else tm or []
     else:  # no glaeda runner here, yet a hand-made one is still a fault (it may be the only runner on the host)
-        # Its Tailscale findings are not this pass's to report, but a tunnel that is down still holds Claude's
-        # install and reroute here, as on a runner host (a probe through it hangs and spends a try).
-        tunnel_down = any(f["code"] in TUNNEL_DOWN for f in check_tailscale(mini))
-        found = (check_claude_missing(mini) + check_claude_route(mini, now, apply and not tunnel_down, tunnel_down)
+        # Its Tailscale is checked too: cmux-mac-mini (capture-only, 2026-11-17) came back from a power loss with
+        # Tailscale Stopped (WantRunning=false) and stayed off the tailnet until a person ran `tailscale up`. That is
+        # the one Tailscale heal here; tailscale_no_route's restart stays a CI runner mini's (reported, never run).
+        # A tunnel that is down still holds Claude's install and reroute, as on a runner host (a probe through it
+        # hangs and spends a try).
+        tailnet = [capture_only_tailscale(f) for f in check_tailscale(mini)]
+        tunnel_down = any(f["code"] in TUNNEL_DOWN for f in tailnet)
+        found = (tailnet + check_claude_missing(mini)
+                 + check_claude_route(mini, now, apply and not tunnel_down, tunnel_down)
                  + check_foreign_runners(mini) + check_unmanaged_services(mini))
 
     findings, heals = [], []
@@ -2894,6 +2971,9 @@ def run(mini: Mini, apply: bool, now: float | None = None, state_path: Path = ST
         if apply and s["runs"] < REPORT_AFTER.get(f["code"], 1):
             continue  # seen, not yet reported
         f["since"] = iso(s["since"])
+        if f["code"] == "tailscale_no_route" and not runner:  # reported only: no restart off a CI runner mini
+            findings.append(f)
+            continue
         if f["code"] == "tailscale_no_route":  # its own gates and 6 h window, not HEALS' tries
             route_healed = True
             f, done_heal, fixed = heal_tailscale_route(mini, f, now, s["runs"], apply, heal_ok,
@@ -2951,11 +3031,13 @@ def run(mini: Mini, apply: bool, now: float | None = None, state_path: Path = ST
     # starts again (cmuxs-mac-mini-5, 2026-10-26: a 15 s status timeout every other run kept it at 1 for hours)
     # (a probe error whose route lookup named a utun did look: the route is clear, so the count starts again)
     unlooked = ({"tailscale_no_route"} if any(f["code"] == "tailscale_probe_error" for f in found)
-                and not (runner and mini.route_on_tunnel) else set())
+                and not mini.route_on_tunnel else set())
     seen = {k: v for k, v in seen.items() if k in ids | {f["id"] for f in found} | unlooked}
     tries = {k: v for k, v in tries.items() if k in ids}
     report = {"schema": SCHEMA, "at": iso(now), "findings": findings,
-              "healed": sorted(healed + getattr(mini, "daemon_healed", []), key=lambda h: h.get("t") or 0)[-HEALED_MAX:],
+              "healed": sorted(healed + getattr(mini, "daemon_healed", []) +
+                               (gate_restarts_healed(getattr(mini, "home", None), now) if runner else []),
+                               key=lambda h: h.get("t") or 0)[-HEALED_MAX:],
               "ota": ota_summary(mini.ota_converge())}
     if apply:
         write_json(state_path, {"seen": seen, "tries": tries, "healed": healed[-HEALED_MAX:]})
