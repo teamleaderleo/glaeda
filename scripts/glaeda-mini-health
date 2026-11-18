@@ -490,6 +490,7 @@ class Mini:
             try:
                 loader = importlib.machinery.SourceFileLoader("glaeda_cmux_runner_hook_for_health", os.fspath(path))
                 module = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
+                sys.modules[loader.name] = module  # before exec_module: a dataclass in the module looks its module up here
                 loader.exec_module(module)
                 self._hook = module
             except Exception:  # noqa: BLE001  (an unreadable hook skips the checks that need it)

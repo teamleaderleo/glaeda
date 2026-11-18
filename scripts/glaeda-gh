@@ -10792,6 +10792,7 @@ def coord_alert_send(text: str) -> int:
     try:
         spec = importlib.util.spec_from_file_location("coord_alert", COORD_ALERT)
         module = importlib.util.module_from_spec(spec)  # type: ignore[arg-type]
+        sys.modules[spec.name] = module  # before exec_module: a dataclass in the module looks its module up here
         spec.loader.exec_module(module)  # type: ignore[union-attr]
         via = module.send(text, "glaeda-gh", budget=180)
     except Exception as error:  # noqa: BLE001  an alert's failure is logged, never raised
