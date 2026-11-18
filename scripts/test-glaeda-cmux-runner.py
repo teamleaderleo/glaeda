@@ -401,6 +401,66 @@ class HookTest(unittest.TestCase):
         self.assertNotIn("sparse", result.stdout)
         self.assertTrue((full / ".build").is_dir() and (full / "Packages" / "B.swift").is_file())
 
+    def test_a_sparse_setting_masked_by_per_worktree_config_is_reset(self) -> None:
+        """cmux job 135147612854 (gcp-agent-lane-6, 2026-11-18; cmuxterm-hq#13682): .git/config said
+        core.sparseCheckout = true, config.worktree said false, so the effective config read clean. actions/checkout
+        unset extensions.worktreeConfig after its disable, the true came back, and its forced checkout applied the
+        old patterns and lost files. job-started reads each config file on its own and resets a workspace with
+        per-worktree config, so that checkout writes every file."""
+        git_env = {"PATH": "/usr/bin:/bin", "HOME": os.fspath(self.dir), "GIT_AUTHOR_NAME": "t",
+                   "GIT_AUTHOR_EMAIL": "t@example.com", "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.com"}
+
+        def git(ws: Path, *args: str) -> str:
+            return subprocess.run(["git", "-C", os.fspath(ws), *args], env=git_env, capture_output=True,
+                                  text=True, check=True).stdout.strip()
+
+        def workspace(name: str) -> Path:
+            ws = self.dir / name / "_work" / "cmux" / "cmux"
+            (ws / "scripts" / "ci").mkdir(parents=True)
+            (ws / "Packages").mkdir()
+            (ws / "scripts" / "ci" / "a.sh").write_text("a\n")
+            (ws / "Packages" / "B.swift").write_text("b\n")
+            git(ws, "init", "-q", "-b", "main")
+            git(ws, "add", "-A")
+            git(ws, "commit", "-qm", "one")
+            git(ws, "sparse-checkout", "set", "scripts/ci")
+            git(ws, "sparse-checkout", "disable")
+            return ws
+
+        def actions_checkout(ws: Path) -> None:
+            # What actions/checkout runs on a full checkout of a reused workspace.
+            subprocess.run(["git", "-C", os.fspath(ws), "sparse-checkout", "disable"], env=git_env,
+                           capture_output=True, check=False)
+            subprocess.run(["git", "-C", os.fspath(ws), "config", "--local", "--unset-all",
+                            "extensions.worktreeConfig"], env=git_env, capture_output=True, check=False)
+            git(ws, "checkout", "-q", "--force", "-B", "main", "HEAD")
+
+        path = event(self.dir, "push", {"repository": CMUX})
+        masked = workspace("actions-runner-glaeda-2")
+        git(masked, "config", "--file", os.fspath(masked / ".git" / "config"), "core.sparseCheckout", "true")
+        self.assertEqual(git(masked, "config", "--bool", "--default", "false", "core.sparseCheckout"), "false")
+        self.assertEqual(git(masked, "status", "--porcelain"), "")
+        self.assertNotIn("S ", git(masked, "ls-files", "-v"))
+        worktree_only = workspace("actions-runner-glaeda-3")  # config.worktree alone, nothing sparse
+        for ws, why in ((masked, "sparse (in config)"), (worktree_only, "per-worktree config")):
+            with self.subTest(ws.parts[-4]):
+                result = self.run_hook("job-started", "push", path, "--allowed-repo", "manaflow-ai/cmux",
+                                       "--no-disk", repo="manaflow-ai/cmux", env={"GITHUB_WORKSPACE": os.fspath(ws)})
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn(why, result.stdout)
+                self.assertEqual(sorted(p.name for p in ws.iterdir()), [".git"])
+                self.assertFalse((ws / ".git" / "config.worktree").exists())
+                git(ws, "reset", "-q", "--hard", "HEAD")
+                actions_checkout(ws)
+                self.assertEqual((ws / "Packages" / "B.swift").read_text(), "b\n")
+                self.assertEqual(git(ws, "ls-files", "-v", "Packages/B.swift"), "H Packages/B.swift")
+
+        # Without the hook, the same state loses the file: the case the test reproduces.
+        unhooked = workspace("actions-runner-glaeda-4")
+        git(unhooked, "config", "--file", os.fspath(unhooked / ".git" / "config"), "core.sparseCheckout", "true")
+        actions_checkout(unhooked)
+        self.assertFalse((unhooked / "Packages" / "B.swift").exists())
+
     def test_job_started_asks_glaeda_disk_only_about_a_workspace_past_the_bloat_minimum(self) -> None:
         """job-started runs glaeda-disk --own-runner-checkout (from /, in its own session, the workspace in its
         environment) only when the workspace's packs pass the 2 GiB bloat minimum, so an ordinary job pays one

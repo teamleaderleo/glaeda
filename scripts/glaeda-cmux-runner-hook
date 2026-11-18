@@ -5586,6 +5586,20 @@ def workspace_damage(ws: Path) -> str:
 
     if git("config", "--bool", "--default", "false", "core.sparseCheckout").stdout.strip() == "true":
         return "sparse"
+    # A sparse setting the effective config hides: with extensions.worktreeConfig, config.worktree's
+    # `sparseCheckout = false` (what `sparse-checkout disable` wrote) masks a `true` in .git/config.
+    # actions/checkout then unsets extensions.worktreeConfig after its disable, the `true` comes back, and its
+    # `checkout --force` applies the old patterns (cmux job 135147612854 on gcp-agent-lane-6, 2026-11-18: 53541
+    # skip-worktree entries, scripts/ci/cmux-machine-linux-bytes.sh missing; cmuxterm-hq#13682). So every config
+    # file is read on its own, and any per-worktree config resets the workspace.
+    git_dir = ws / ".git"
+    for config in (git_dir / "config", git_dir / "config.worktree"):
+        if config.is_file() and git("config", "--file", os.fspath(config), "--bool", "--default", "false",
+                                    "core.sparseCheckout").stdout.strip() == "true":
+            return f"sparse (in {config.name})"
+    if (git_dir / "config.worktree").is_file() or git(
+            "config", "--file", os.fspath(git_dir / "config"), "--get", "extensions.worktreeConfig").stdout.strip():
+        return "with per-worktree config (it can hide a sparse setting)"
     listed = git("ls-files", "-v")
     if listed.returncode != 0 or any(line.startswith("S ") for line in listed.stdout.splitlines()):
         return "with skip-worktree entries"
