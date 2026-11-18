@@ -8056,6 +8056,7 @@ LAND_SNAPSHOT_WAIT = 120.0
 # first for (Daemon.snapshot_waits) could not come within LAND_SNAPSHOT_WAIT. Ahead of the workers at most this many
 # per worker wait on their snapshot reads.
 LAND_SNAPSHOT_AHEAD = 1
+LAND_POOL_LOG_EVERY = 300.0  # the land-pool log line (LandQueue.log_pool)
 # The head a judgement pins is the cache's only when the cache read the PR after the entry was unparked or the login's
 # latch last cleared (LandQueue.fresh_head). huge-blue, 2026-11-18 09:43Z: parked on the latch, the daemon read
 # nothing for 37 min; on resume glaeda#2140 waited on, then judged, its old head 401ccf880760 though bc1601b6 had been
@@ -8450,6 +8451,8 @@ class LandQueue:
         self.entries: dict[str, dict] = {}
         self.jobs: dict[str, Any] = {}
         self.touched: dict[str, float] = {}
+        self.pass_gated, self.pass_first_gated = 0, None  # this pass's due judgments that waited for a worker
+        self.pool_logged = float("-inf")
         self.draining = False  # an update waits to re-exec: no judgment claims a step (claim; Daemon.land_busy)
         self.snapshot_waiting: set[str] = set()  # keys with a snapshot wait, run out or not (judge's cap)
         self.pool: Any = None
@@ -8605,6 +8608,7 @@ class LandQueue:
         latch = self.latch_held()
         self.snapshot_waiting = {k for k, e in self.entries.items() if e.get("state") not in LAND_DONE
                                  and isinstance(e.get("snapshotWait"), dict)}
+        self.pass_gated, self.pass_first_gated = 0, None
         for key in sorted(self.entries, key=self.judge_order):
             try:
                 e = self.entries[key]
@@ -8622,6 +8626,7 @@ class LandQueue:
                     self.consider(e)
             except Exception as error:  # noqa: BLE001  one bad entry must not stop the others
                 log({"event": "land-error", "key": key, "error": describe(error), "site": error_site(error)})
+        self.log_pool()
 
     # -- forwarding to the land executor (land_executor): this host judges nothing
 
@@ -8883,12 +8888,43 @@ class LandQueue:
     def workers(self) -> int:
         return int(land_seconds(self.config().get("workers"), LAND_WORKERS, 1, 16))
 
-    def judge_order(self, key: str) -> float:
-        """The tick's order: the entry judged longest ago first (never judged: first of all), so a free worker goes to
-        the land that waited longest, and a restart, which keeps each entry's last judgment on disk, does not start
-        over from the same few."""
-        at = (self.entries[key].get("explain") or {}).get("at")
-        return float(at) if isinstance(at, (int, float)) and not isinstance(at, bool) else 0.0
+    def gated(self, e: dict) -> None:
+        """E was due a judgment this pass and waits for a worker (judge): counted for the pass's land-pool line."""
+        self.pass_gated += 1
+        if self.pass_first_gated is None:
+            self.pass_first_gated = e["key"]
+
+    def log_pool(self) -> None:
+        """Once per LAND_POOL_LOG_EVERY, the pool as the last pass left it: workers busy and on what, snapshot waits, and
+        how many due judgments waited for a worker (the first in line named), so a land that is not judged can be told
+        apart from one that is never considered."""
+        if self.now - self.pool_logged < LAND_POOL_LOG_EVERY:
+            return
+        self.pool_logged = self.now
+        with self.lock:
+            running = {k: (self.entries.get(k) or {}).get("state") for k in self.jobs}
+        log({"event": "land-pool", "workers": self.workers(), "busy": len(running),
+             "running": [f"{key_name(k)}:{v}" for k, v in running.items()][:16],
+             "snapshotWaiting": len(self.snapshot_waiting), "gated": self.pass_gated,
+             "firstGated": key_name(self.pass_first_gated) if self.pass_first_gated else None,
+             "open": sum(1 for e in self.entries.values() if e.get("state") not in LAND_DONE)})
+
+    def judge_order(self, key: str) -> tuple[int, float]:
+        """The tick's order, so a free worker goes first to the land most likely to merge, then to the one that waited
+        longest: a PR the cache shows CLEAN with no check running (one merge away) ahead of the rest, then by when it
+        began to wait, its last judgment or else when it was queued (both on disk, so a restart does not start over
+        from the same few). huge-blue, 2026-11-18 after glaeda#2161: "never judged" sorted first, so cmux#45661 (CLEAN,
+        60/60 green, judged hours before) sat behind every PR queued since and got no worker between two restarts."""
+        e = self.entries[key]
+        data = (self.cache_of(key) or {}).get("data") or {}
+        head = str(data.get("headRefOid") or "")
+        ready = data.get("state") == "OPEN" and data.get("mergeStateStatus") == "CLEAN" \
+            and not land_checks_running(data, head)
+        at = (e.get("explain") or {}).get("at")
+        if not isinstance(at, (int, float)) or isinstance(at, bool):
+            at = e.get("created")
+        since = float(at) if isinstance(at, (int, float)) and not isinstance(at, bool) else 0.0
+        return (0 if ready else 1), since
 
     def submit(self, key: str, fn: Callable[..., None], *args: Any) -> None:
         if self.inline:
@@ -9161,15 +9197,20 @@ class LandQueue:
         again next tick (the tick goes least recently judged first), so the pool never queues. Ahead of the workers at
         most LAND_SNAPSHOT_AHEAD per worker start a snapshot wait (each puts its PR's read first); past that, one whose
         snapshot is ready (or that needs none) still takes a free worker, and the rest wait without nudging a read."""
-        pin = self.fresh_head(e, sha, len(self.jobs) < self.workers())
+        workers = self.workers()
+        free = len(self.jobs) < workers
+        room = len(self.jobs) + len(self.snapshot_waiting) < workers * (1 + LAND_SNAPSHOT_AHEAD)
+        if not free and not room and not e.get("snapshotWait"):
+            self.gated(e)
+            return False  # nothing it could start now: no head read nudged, no wait begun, ahead of its turn
+        pin = self.fresh_head(e, sha, free)
         if pin is None:
             return False  # judged once the daemon has read the PR since it was unparked or the latch cleared
         sha = pin
-        workers = self.workers()
-        free = len(self.jobs) < workers
         mine = (e.get("snapshotWait") or {}).get("sha") == sha
-        if not mine and len(self.jobs) + len(self.snapshot_waiting) >= workers * (1 + LAND_SNAPSHOT_AHEAD):
+        if not mine and not room:
             if not free or self.snapshot(e["key"], sha)[1] == "wait":
+                self.gated(e)
                 return False
         elif self.snapshot_wait(e, sha, free):
             return False  # judged on the daemon's next read of this head (one read, shared), not on merge_hold's own

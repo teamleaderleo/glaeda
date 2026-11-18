@@ -18053,6 +18053,62 @@ class LandTest(Base):
         self.assertEqual(len(pool.handed), 3)
         self.assertEqual(len(self.q.jobs), 2)
 
+    def five_snapped(self) -> None:
+        for n in range(1, 6):
+            key = f"pr:o/r#{n}"
+            self.pr(LA, key=key)
+            self.w.cache[key]["fp"] = "F"
+            self.snaps[key] = {"schema": gg.ROLLUP_SCHEMA, "key": key, "head": LA, "fp": "F", "complete": True,
+                               "readAt": self.t, "rollup": {"nodes": self.NODES}}
+
+    def test_a_land_judged_hours_ago_goes_before_lands_queued_since(self):
+        # huge-blue, 2026-11-18 after glaeda#2161: "never judged" sorted first, so cmux#45661 (judged hours before)
+        # sat behind every PR queued since and was not judged between two restarts.
+        self.five_snapped()
+        pool = self.pooled(5)
+        self.land("o/r#5")
+        self.tick()
+        e5 = self.q.entries["pr:o/r#5"]
+        e5["explain"] = {"at": self.t - 7 * 3600, "ok": False}
+        self.q.save(e5)
+        self.t += 3600
+        self.five_snapped()  # read again since
+        for n in range(1, 5):
+            self.land(f"o/r#{n}")  # queued an hour later, never judged
+        pool = self.pooled(1)  # the restart
+        self.tick()
+        self.assertEqual(pool.keys(), ["pr:o/r#5"])
+
+    def test_a_clean_green_pr_takes_the_next_worker_first(self):
+        self.five_snapped()
+        for n in range(1, 6):
+            self.land(f"o/r#{n}")
+        for n in range(1, 5):
+            self.w.cache[f"pr:o/r#{n}"]["data"]["mergeStateStatus"] = "BEHIND"
+        pool = self.pooled(1)
+        self.tick()
+        self.assertEqual(pool.keys(), ["pr:o/r#5"])
+
+    def test_a_land_waiting_for_a_worker_nudges_no_read_and_is_counted(self):
+        self.five_snapped()
+        for n in range(1, 6):
+            self.land(f"o/r#{n}")
+        pool = self.pooled(1)
+        for n in range(2, 6):  # no snapshot: each first waits for the daemon's read
+            self.snaps.pop(f"pr:o/r#{n}")
+        self.tick()
+        self.assertEqual(pool.keys(), ["pr:o/r#1"])
+        self.q.latch_cleared = self.t  # every cached head now wants a fresh read before it is pinned
+        self.w.nudged.clear()
+        self.tick()
+        waiting = {k for k, e in self.q.entries.items() if e.get("snapshotWait")}
+        self.assertEqual(len(waiting), 1)  # one wait ahead of the one worker
+        gated = {f"pr:o/r#{n}" for n in range(2, 6)} - waiting
+        for k in gated:
+            self.assertNotIn("head_stale", [h.get("event") for h in self.q.entries[k]["history"]])
+            self.assertNotIn(k, self.w.nudged)
+        self.assertEqual(self.q.pass_gated, len(gated))
+
     def test_a_restart_judges_the_longest_unjudged_land_first(self):
         pool = self.pooled(5)
         for n in range(1, 6):
