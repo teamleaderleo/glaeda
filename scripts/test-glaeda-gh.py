@@ -20846,6 +20846,151 @@ class StragglerTest(unittest.TestCase):
         self.assertEqual(len(seen["overflow-8vcpu-linux"]), 4)
 
 
+class QueuedNeverDoneTest(unittest.TestCase):
+    """claude-sr2-coord (from cloud-prod-goals-2), 2026-11-18: "`glaeda-gh wait pr --until done` returned 'result:
+    success' while checks were still queued. hq#13438 at 10b0ae08: after 184 s, with 7 pending. hq#13202 at
+    0a581929: after 1789 s, with 8 of 13 pending. merge_hold then refused both as checks_running." Both heads' jobs sat
+    queued 30+ minutes on a busy runner pool (hq#13202: queued 15:01:35Z, still queued at 15:35Z, then ran) and the
+    straggler cut (#2125) judged the head as if they were not there. Done and green never return while any check is
+    queued or pending; a read with no data or partial data is inconclusive, never success."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.saved = (gg.BASE, gg.NOTICES_DIR)
+        gg.BASE = Path(self.tmp.name) / "gh"
+        gg.NOTICES_DIR = Path(self.tmp.name) / "notices"
+        self.now = float(int(time.time()))
+        spawn = mock.patch.object(gg, "coord_alert_spawn")
+        spawn.start()
+        self.addCleanup(spawn.stop)
+
+    def tearDown(self) -> None:
+        gg.BASE, gg.NOTICES_DIR = self.saved
+        self.tmp.cleanup()
+
+    def head(self, number: int, done: list[str], queued: list[str], queued_ago: float) -> tuple[dict, Any]:
+        """An hq head of len(done) + len(queued) check runs, none required, the queued ones queued QUEUED_AGO with
+        no runner (as GitHub shows a job queued on a busy pool), and a fake GitHub answering their job reads."""
+        started = iso(self.now - queued_ago)
+        checks = [check_run(name) for name in done]
+        jobs: dict[int, str] = {}
+        for i, name in enumerate(queued):
+            jobs[134894373000 + i] = name
+            checks.append({**check_run(name, status="QUEUED", conclusion=None), "databaseId": 134894373000 + i,
+                           "startedAt": started})
+        data = gg.parse_pr(pr_node(number, checks=checks))
+
+        def get(repo: str, paths: list[str]) -> dict:
+            return {p: {"id": int(p.rsplit("/", 1)[1]), "status": "queued", "runner_id": 0, "runner_name": "",
+                        "steps": [], "run_attempt": 1, "workflow_name": "ci", "labels": ["self-hosted"]}
+                    for p in paths if p.startswith("actions/jobs/")}
+        return data, get
+
+    def hq13202(self) -> tuple[dict, Any]:
+        """0a581929: 13 check runs, 8 queued 30+ min (go vet + go test, go test ... (Linux), Skill test scope,
+        lazy-regex-sweep, Agent launch lint, polling-guard, tests, deleted-or-weakened-tests)."""
+        return self.head(13202, ["CodeRabbit", "Socket Security: Pull Request Alerts", "go test (macOS)", "tests (unit)",
+                                 "Socket Security: Project Report"],
+                         ["go vet + go test", "go test (Linux)", "Skill test scope", "lazy-regex-sweep",
+                          "Agent launch lint", "polling-guard", "tests", "deleted-or-weakened-tests"], 34 * 60)
+
+    def hq13438(self) -> tuple[dict, Any]:
+        """10b0ae08: 13 check runs, 7 queued since 14:56Z, read at 15:30Z (a wait begun at 15:27Z ended after 184 s)."""
+        return self.head(13438, ["Socket Security: Pull Request Alerts", "CodeRabbit", "Socket Security: Project Report",
+                                 "tests (unit)", "size", "Agent launch lint"],
+                         ["tests", "lazy-regex-sweep", "polling-guard", "Skill test scope", "deleted-or-weakened-tests",
+                          "go vet + go test", "go test (Linux)"], 34 * 60)
+
+    def read(self, key: str, data: dict, get: Any) -> dict:
+        for _ in range(3):
+            data = gg.straggler_pass(key, data, self.now, get)
+        return data
+
+    def test_hq13202_eight_of_thirteen_queued_is_never_done(self) -> None:
+        data, get = self.hq13202()
+        data = self.read("pr:o/r#13202", data, get)
+        self.assertEqual(sum(1 for c in data["checks"] if c["status"] == "QUEUED"), 8)
+        for until in ("done", "green"):
+            self.assertNotEqual(gg.verdict("pr", data, until, now=self.now), gg.EXIT_OK, until)
+        self.assertEqual(gg.verdict("pr", data, "done", now=self.now), gg.EXIT_INCONCLUSIVE)
+        self.assertNotIn(gg.EXIT_INCONCLUSIVE, (gg.EXIT_OK, gg.EXIT_FAIL, gg.EXIT_TIMEOUT, gg.EXIT_DOWN,
+                                                gg.EXIT_CONFLICT, gg.EXIT_NOTHING, gg.EXIT_PARTIAL))
+        self.assertNotIn("SUCCESS", gg.summary("pr:o/r#13202", {"data": data}, "done").splitlines()[1])
+        self.assertNotEqual(gg.status_view("pr:o/r#13202", {"data": data})["checks"]["state"], "SUCCESS")
+
+    def test_hq13438_seven_queued_wait_says_inconclusive_not_success(self) -> None:
+        key = "pr:o/r#13438"
+        data, get = self.hq13438()
+        req = gg.wait_request("pr", "o/r#13438", "done", 3600, False, False, None, True, gg.RESCUE_GRACE)
+        req["began"] = self.now - 184
+        gg.write_json(gg.cache_dir() / gg.file_name(key),
+                      {"key": key, "fetchedAt": self.now, "dataAt": self.now, "data": data, "error": None})
+        decided = None
+        for _ in range(3):
+            decided = gg.wait_step(req, self.now, get) or decided
+        self.assertIsNotNone(decided)
+        code, text = decided
+        self.assertEqual(code, gg.EXIT_INCONCLUSIVE, text)
+        self.assertIn("result: inconclusive", text)
+        self.assertNotIn("result: success", text)
+        self.assertIn("7 queued", text)
+
+    def test_queued_young_checks_hold_every_mode(self) -> None:
+        """Under the straggler bound the wait goes on, in every mode but merged."""
+        data, get = self.head(13438, ["size"], ["tests"], 3 * 60)
+        data = self.read("pr:o/r#13438", data, get)
+        for until in ("done", "green", "required", "merged"):
+            self.assertIsNone(gg.verdict("pr", data, until, now=self.now), until)
+
+    def test_property_no_success_while_anything_is_unfinished(self) -> None:
+        """For every mix of unfinished states (queued, in progress, waiting, requested, pending, a pending or expected
+        status), age and requirement, done and green never answer success."""
+        import itertools
+        states = ("QUEUED", "IN_PROGRESS", "WAITING", "REQUESTED", "PENDING", "status:PENDING", "status:EXPECTED")
+        for state, ago, required in itertools.product(states, (60, 31 * 60, 3 * 3600), (False, True)):
+            if state.startswith("status:"):
+                pending = {**status_context("ci/x", state.split(":")[1]), "isRequired": required}
+            else:
+                pending = {**check_run("x", status=state, conclusion=None), "databaseId": 7,
+                           "startedAt": iso(self.now - ago), "isRequired": required}
+            data = gg.parse_pr(pr_node(1, checks=[check_run("build"), pending]))
+            data["queuedJobs"] = {"7": {"status": "queued", "runner": "", "attempt": 1, "workflow": "w",
+                                        "labels": ["l"]}}
+            for until in ("done", "green"):
+                self.assertNotEqual(gg.verdict("pr", data, until, now=self.now), gg.EXIT_OK, (state, ago, until))
+                self.assertNotEqual(gg.status_view("pr:o/r#1", {"data": data})["checks"]["state"], "SUCCESS")
+
+    def test_a_latched_read_with_an_empty_rollup_is_inconclusive(self) -> None:
+        """A read that came back with no head commit (a latched or cut-short GraphQL answer: commits null) is not
+        "nothing reported" and never success: it waits, and at its deadline the wait says inconclusive."""
+        key = "pr:o/r#13438"
+        node = {**pr_node(13438), "commits": {"nodes": [None]}}
+        data = {**gg.parse_pr(node), "updatedAt": iso(self.now - 3600)}
+        self.assertTrue(data.get("checksPageError"), data)
+        for until in ("done", "green", "required"):
+            self.assertIsNone(gg.verdict("pr", data, until, now=self.now), until)
+        req = gg.wait_request("pr", "o/r#13438", "done", 60, False, False, None, True, gg.RESCUE_GRACE)
+        req["began"] = self.now - 61
+        gg.write_json(gg.cache_dir() / gg.file_name(key),
+                      {"key": key, "fetchedAt": self.now, "dataAt": self.now, "data": data, "error": None})
+        code, text = gg.wait_step(req, self.now, lambda repo, paths: {})
+        self.assertEqual(code, gg.EXIT_INCONCLUSIVE, text)
+        self.assertIn("result: inconclusive", text)
+        # a whole read that times out is still a timeout
+        whole, _ = self.head(13438, ["size"], ["tests"], 60)
+        gg.write_json(gg.cache_dir() / gg.file_name(key),
+                      {"key": key, "fetchedAt": self.now, "dataAt": self.now, "data": whole, "error": None})
+        self.assertEqual(gg.wait_step(req, self.now, lambda repo, paths: {})[0], gg.EXIT_TIMEOUT)
+
+    def test_land_sees_running_checks_past_the_first_page(self) -> None:
+        """land's own predicate gives the same answer: unfinished contexts the rollup counts past page 1 are running."""
+        data = gg.parse_pr(pr_node(13202, checks=[check_run("build")]))
+        data.update(checksTruncated=True, checkState="PENDING",
+                    checkCounts={"runs": {"SUCCESS": 100, "QUEUED": 8}, "statuses": {}})
+        self.assertTrue(gg.land_checks_running(data, data["headRefOid"]))
+        self.assertIsNone(gg.verdict("pr", data, "done", now=self.now))
+
+
 class BrokerVouchTest(CountingGhBase):
     """teamleaderleo/glaeda: agent sessions type `gh pr view` by hand, with a number, a branch or no target, and keep
     typing it: 140 charged reads in two hours on four hosts (2026-11-17), one session reading one branch 24 times,
