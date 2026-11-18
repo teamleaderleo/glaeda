@@ -9646,6 +9646,14 @@ class LandQueue:
         v = e.get("cacheVerdict") or {}
         if v.get("window") == window:
             return
+        if self.gh() is None:
+            # No gh-quota shim: nothing would answer merge_hold's reads from the caches, so none is run (review of #2193)
+            e["cacheVerdict"] = {"window": window, "at": self.now, "head": "", "miss": True,
+                                 "reason": "no gh-quota shim on this host (land.json gh), so nothing answers from the "
+                                           "caches"}
+            self.history(e, "cache_no_shim")
+            self.save(e)
+            return
         c = self.cache_of(e["key"]) or {}
         head = str((c.get("data") or {}).get("headRefOid") or "").lower()
         at = c.get("dataAt")
