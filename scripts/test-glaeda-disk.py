@@ -13690,5 +13690,197 @@ class CacheBudgetTest(unittest.TestCase):
         self.assertEqual(gd.cache_budget_state([fam], {self.dev: self.fs}, {}, gd.read_fleet_cas_record(path)), {})
 
 
+
+class HeldReasonTest(unittest.TestCase):
+    """Every held item in a dry run says what holds it, its last use and whether it is stale (glaeda#2060 follow-up)."""
+
+    def test_a_recent_item_with_no_reason_names_its_window_and_owner(self) -> None:
+        fam = gd.Family(gd.TART_VMS, Path("/x"), True, "vm", owner="Tart", min_idle_hours=48)
+        hold = gd.hold_record(fam, "recent", [], 36.7, 48.0, False)
+        self.assertEqual(hold["by"], "idle 36.7h, inside its 48h window (owner: Tart)")
+        self.assertEqual((hold["last_use_hours"], hold["window_hours"], hold["stale"]), (36.7, 48.0, False))
+        self.assertIsNone(gd.hold_record(fam, "reclaimable", [], 99, 48.0, True))
+
+    def test_a_held_item_past_its_window_is_stale_and_names_its_holder(self) -> None:
+        fam = gd.Family("home-scratch", Path("/x"), True, "")
+        hold = gd.hold_record(fam, "in-use", ["named by /Users/x/.codex/config.toml"], 355.7, 1.0, True)
+        self.assertEqual(hold["by"], "named by /Users/x/.codex/config.toml")
+        self.assertTrue(hold["stale"])
+        report_only = gd.Family("cmux-git-mirror", Path("/x"), False, "", owner="cmux CI")
+        self.assertFalse(gd.hold_record(report_only, "report-only", [], 9, 1.0, True)["stale"],
+                         "a report-only family is never stale: nothing may delete it")
+        self.assertIn("report-only", gd.hold_record(report_only, "report-only", [], 9, 1.0, True)["by"])
+
+    def test_the_summary_counts_nested_items_once_and_splits_stale_bytes(self) -> None:
+        items = [gd.Item("a", "/r/a", 10, 50, "in-use", ["open by a process"],
+                         hold={"by": "open by a process", "stale": True}),
+                 gd.Item("a", "/r/a/b", 4, 50, "in-use", [], hold={"by": "x", "stale": True}),
+                 gd.Item("c", "/r/c", 5, 1, "recent", [], hold={"by": "idle", "stale": False}),
+                 gd.Item("d", "/r/d", 7, 9, "reclaimable", [])]
+        summary = gd.held_summary(items)
+        self.assertEqual((summary["bytes"], summary["stale_bytes"]), (15, 10))
+        self.assertEqual(summary["by"][0], {"why": "a: open by a process", "bytes": 10})
+        gd.fill_holds([extra := gd.Item("xcode-apps", "/A/Xcode.app", 1, 0.0, "report-only", ["no pin"])])
+        self.assertEqual(extra.hold["by"], "no pin")
+
+
+class LeaseHoldsOnlyItsJobTest(unittest.TestCase):
+    """A fleet lease no longer turns the budget off: only what its job used since it began stays (Leo, 2026-11-18)."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(os.path.realpath(self.tmp.name))
+        self.list = self.root / "fleet-reservations.json"
+        self.list.write_text(json.dumps({"schema": "glaeda-fleet-reservations/v1", "expires": "2999-01-01T00:00:00Z",
+                                         "aliases": {}, "reservations": [
+                                             {"id": "lease-1", "owner": "node:lane", "hosts": ["mini-a"],
+                                              "from": "2026-11-18T18:30:00Z", "until": "2026-11-18T20:30:00Z"}]}))
+        self.during = gd.reservation_time("2026-11-18T19:00:00Z")
+        self.addCleanup(gd.LEASE.clear)
+
+    def test_an_active_lease_records_when_it_began_and_a_failed_read_does_not(self) -> None:
+        why = gd.host_reservation(self.during, self.list, {"mini-a"}, self.root / "none.json")
+        self.assertIn("lease-1", why)
+        self.assertEqual(gd.RESERVATION_SINCE, gd.reservation_time("2026-11-18T18:30:00Z"))
+        self.list.write_text("{nope")
+        self.assertIn("unreadable", gd.host_reservation(self.during, self.list, {"mini-a"}, self.root / "none.json"))
+        self.assertIsNone(gd.RESERVATION_SINCE, "fails closed: floor-only, as before")
+
+    def test_only_what_was_used_since_the_lease_began_is_held(self) -> None:
+        fam = gd.Family("xcode-derived-data", self.root, True, "")
+        old, new = make(self.root / "old", age_hours=48), make(self.root / "new", age_hours=0)
+        gd.LEASE.update(why="reserved for node:lane", since=time.time() - 3600)
+        self.assertEqual(gd.lease_holds(fam, old), "")
+        self.assertIn("the leased job's own", gd.lease_holds(fam, new))
+        self.assertEqual(gd.lease_holds(fam, new, used=time.time() - 7200), "", "the survey's own last use counts")
+        gd.LEASE.clear()
+        self.assertEqual(gd.lease_holds(fam, new), "", "no lease: nothing held by one")
+
+
+class BuildStateUnderBudgetTest(unittest.TestCase):
+    """The build state no family held (build-fleet slots and package stores, runner leftovers, home folders, aside
+    trees) is judged by staleness and counted by the host cache budget."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(os.path.realpath(self.tmp.name))
+        self.home = self.root / "home"
+        self.fleet = self.root / "fleet"
+        self.runner = self.home / "actions-runner-glaeda-11"
+        (self.runner / "glaeda-hooks").mkdir(parents=True)
+        (self.runner / ".runner").write_text("{}")
+        for v in ("bin.2.338.0", "bin.2.338.2", "externals.2.338.0", "externals.2.338.2"):
+            (self.runner / v).mkdir()
+        (self.runner / "bin").symlink_to("bin.2.338.2")
+        (self.runner / "externals").symlink_to("externals.2.338.2")
+        for d in ("_work/_tool/Python", "_work/_update", "_diag", "_work/cmux"):
+            (self.runner / d).mkdir(parents=True, exist_ok=True)
+        (self.fleet / "xcode/next-release/DerivedData").mkdir(parents=True)
+        (self.fleet / "ci/source-packages").mkdir(parents=True)
+        (self.fleet / "ci-ios-packages/source-packages").mkdir(parents=True)
+        home = mock.patch.object(gd, "HOME", self.home)
+        home.start()
+        self.addCleanup(home.stop)
+        gd._DISCOVERED.clear()
+
+    def fams(self) -> list:
+        return gd.build_state_families(self.home, self.fleet)
+
+    def test_the_families_find_each_kind_and_count_toward_the_budget(self) -> None:
+        fams = self.fams()
+        found = {(f.id, os.fspath(p.relative_to(self.root))) for f in fams for p in gd.candidates(f)}
+        self.assertLessEqual({
+            (gd.FLEET_RELEASE_DD, "fleet/xcode/next-release/DerivedData"),
+            (gd.FLEET_SOURCE_PACKAGES, "fleet/ci/source-packages"),
+            (gd.FLEET_SOURCE_PACKAGES, "fleet/ci-ios-packages/source-packages"),
+            (gd.RUNNER_LEFTOVERS, "home/actions-runner-glaeda-11/bin.2.338.0"),
+            (gd.RUNNER_LEFTOVERS, "home/actions-runner-glaeda-11/_work/_tool"),
+            (gd.RUNNER_LEFTOVERS, "home/actions-runner-glaeda-11/_work/_update")}, found)
+        self.assertNotIn((gd.RUNNER_LEFTOVERS, "home/actions-runner-glaeda-11/_work/cmux"), found)
+        for f in fams:
+            self.assertIn(f.id, gd.BUDGET_FAMILY_IDS)
+            self.assertEqual(f.min_idle_hours, gd.BUILD_STATE_STALE_HOURS)
+        for fid in ("home-scratch", "retired-runner", gd.INTERRUPTED):
+            self.assertIn(fid, gd.BUDGET_FAMILY_IDS)
+
+    def test_the_current_runner_version_and_a_live_job_keep_theirs(self) -> None:
+        leftovers = next(f for f in self.fams() if f.id == gd.RUNNER_LEFTOVERS and f.root == self.runner)
+        self.assertIn("current version", gd.build_state_held(leftovers, self.runner / "bin.2.338.2", ""))
+        self.assertEqual(gd.build_state_held(leftovers, self.runner / "bin.2.338.0", ""), "")
+        work = next(f for f in self.fams() if f.id == gd.RUNNER_LEFTOVERS and f.root.name == "_work")
+        job = f"{self.runner}/bin.2.338.2/Runner.Worker spawnclient 1 2\n"
+        self.assertIn("a job runs on actions-runner-glaeda-11",
+                      gd.build_state_held(work, self.runner / "_work/_tool", job))
+        self.assertEqual(gd.build_state_held(work, self.runner / "_work/_tool", ""), "")
+
+    def test_a_held_slot_lock_keeps_the_release_build(self) -> None:
+        fam = next(f for f in self.fams() if f.id == gd.FLEET_RELEASE_DD)
+        dd = self.fleet / "xcode/next-release/DerivedData"
+        self.assertEqual(gd.build_state_held(fam, dd, ""), "", "no lock file: no holder")
+        lock = self.fleet / "xcode/next-release/lock"
+        lock.write_text('{"pid": 999999999}')
+        self.assertEqual(gd.build_state_held(fam, dd, ""), "", "a dead pid holds nothing")
+        lock.write_text(json.dumps({"pid": os.getpid()}))
+        self.assertIn("live process", gd.build_state_held(fam, dd, ""))
+        lock.write_text("")
+        with open(lock) as held:
+            fcntl.flock(held, fcntl.LOCK_EX)
+            self.assertIn("holds its slot lock", gd.build_state_held(fam, dd, ""))
+
+    def test_the_budget_gives_a_home_rooted_family_only_its_own_folders(self) -> None:
+        scratch = gd.Family("home-scratch", self.home, True, "", skip=("Library",), skip_prefixes=(".", "actions-runner"))
+        aside = gd.Family(gd.INTERRUPTED, self.home, True, "")
+        sizes = {os.fspath(self.home / "cu-rewrite-build"): 5, os.fspath(self.home / "Library/Caches/x"): 7,
+                 os.fspath(self.home / ".glaeda-disk-deleting-rig-10354"): 3,
+                 os.fspath(self.home / "actions-runner-glaeda-11/_diag"): 11}
+        by = gd._budget_dev_bytes([scratch, aside], sizes)
+        self.assertEqual(by, {self.home.stat().st_dev: {"home-scratch": 5, gd.INTERRUPTED: 3}})
+
+
+class KeptAsideRestoreTest(unittest.TestCase):
+    """An aside tree kept for a git change goes back to its path once stale, for its family to judge again."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(os.path.realpath(self.tmp.name))
+        self.aside = make(self.root / ".glaeda-disk-deleting-simsurface-rig-10354", age_hours=615)
+        self.marker = gd.mirror_keep_marker(self.aside)
+        self.marker.write_text("kept")
+        t = time.time() - 615 * 3600
+        os.utime(self.marker, (t, t))
+        self.fam = gd.Family(gd.INTERRUPTED, self.root, True, "")
+        gd._DISCOVERED.clear()
+
+    def test_its_origin_is_its_name_without_prefix_or_pid(self) -> None:
+        self.assertEqual(gd.aside_origin(self.aside), self.root / "simsurface-rig")
+        self.assertIsNone(gd.aside_origin(self.root / "simsurface-rig"))
+
+    def test_a_stale_one_goes_back_and_a_fresh_or_blocked_one_stays(self) -> None:
+        self.assertIn("stale", gd.kept_aside_stale(self.aside))
+        self.assertIn("stale", gd.keep_verdict(self.fam, self.aside), "the dry run says so")
+        os.utime(self.marker)
+        self.assertEqual(gd.kept_aside_stale(self.aside), "", "a marker touched lately: not stale")
+        t = time.time() - 615 * 3600
+        os.utime(self.marker, (t, t))
+        (self.root / "simsurface-rig").mkdir()
+        self.assertEqual(gd.kept_aside_stale(self.aside), "", "its path is taken: it stays aside")
+        (self.root / "simsurface-rig").rmdir()
+        receipt = self.root / "receipt.jsonl"
+        with mock.patch.object(gd, "process_evidence", return_value=([], "")), \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(gd.restore_stale_kept_asides([self.fam], receipt), 1)
+        self.assertTrue((self.root / "simsurface-rig/blob").is_file())
+        self.assertFalse(self.marker.exists())
+        self.assertEqual(json.loads(receipt.read_text())["operation"], "restore-kept-aside")
+
+    def test_a_process_in_it_keeps_it_aside(self) -> None:
+        with mock.patch.object(gd, "process_evidence", return_value=([], f"vim {self.aside}/x\n")):
+            self.assertEqual(gd.restore_stale_kept_asides([self.fam]), 0)
+        self.assertTrue(self.aside.is_dir())
+
+
 if __name__ == "__main__":
     unittest.main()

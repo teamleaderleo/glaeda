@@ -2003,6 +2003,10 @@ BUDGET_FAMILY_IDS = frozenset({
     NIGHTLY_NEXT_FAMILY, "runner-checkout-build", "xcode-derived-data", "cmux-job-cache", "fleet-artifacts",
     "hq-build-fleet-cache", "cmux-node-products", "cmux-git-mirror", "browser-artifacts", "journey-builds",
     "journey-fetch",
+    # the build state no family held until 2026-11-18 (BUILD_STATE_STALE_HOURS), the folders lanes leave in the home
+    # and aside trees a killed deletion left: their bytes are build leftovers whoever evicts them
+    "fleet-release-derived-data", "fleet-source-packages", "runner-leftovers", "runner-diag", "home-scratch",
+    "retired-runner", "interrupted-deletions",
 })  # RUNNER_BUILD_FAMILY, HQ_CACHE_FAMILY and the JOURNEY_SUBDIRS families, defined below (a test keeps them equal)
 BUDGET_WARM_FAMILY_IDS = frozenset({  # not FLEET_FAMILY_IDS: pressure already spends them past pressure_idle_hours
     # not cmux-job-cache: its half-day minimum keeps a reload-cloud slot used in the same work period (its Family)
@@ -2080,6 +2084,18 @@ def write_budget_left(state: dict[int, dict[str, Any]], path: Path | None = None
         os.replace(tmp, path)
 
 
+def _budget_candidate(f: Family, path: Path) -> bool:
+    """Whether a sized path below F's root can be F's: a family rooted at the home (home-scratch, retired-runner) or
+    one that holds aside trees owns only its own direct children, never the home's other folders or caches."""
+    if f.id == INTERRUPTED:
+        return path.parent == f.root and bool(DELETING_RE.fullmatch(path.name))
+    if f.root == HOME:
+        return (path.parent == HOME and path.name not in f.skip
+                and not (f.skip_prefixes and path.name.startswith(f.skip_prefixes))
+                and (not f.include or path.name.startswith(f.include)))
+    return True
+
+
 def _budget_dev_bytes(fams: list[Family], sizes: dict[str, int]) -> dict[int, dict[str, int]]:
     """dev -> family -> bytes of the outermost sized paths under a BUDGET_FAMILY_IDS root (the deepest root owns)."""
     roots: list[tuple[str, Family, int]] = []
@@ -2096,7 +2112,7 @@ def _budget_dev_bytes(fams: list[Family], sizes: dict[str, int]) -> dict[int, di
         if size <= 0:
             continue
         for root, f, dev in roots:
-            if path.startswith(root + "/"):
+            if path.startswith(root + "/") and _budget_candidate(f, Path(path)):
                 owned[path] = (f.id, dev)
                 break
     out: dict[int, dict[str, int]] = {}
@@ -3522,6 +3538,130 @@ def runner_job_started(runner: Path) -> float | None:
         except ValueError:
             return None
     return min(starts) if starts else None
+
+
+# Build state outside every family, measured on a 460 GB mini after glaeda#2060 (2026-11-18): the cache budget counted
+# 32 GiB of build caches while df said 386 GiB used, and the pass that should have closed a 57 GiB free shortfall found
+# 0 reclaimable. Most of the rest was no family's: under the build-fleet tree the release builder's slot DerivedData
+# (xcode/next-release, 9.2 GiB) and two shared SwiftPM package stores (ci/source-packages 5.3 GiB, untouched two days,
+# and ci-ios-packages/source-packages 5.8 GiB, untouched thirteen), and in fourteen runners 20 GiB of _work/_tool and
+# _work/_update, 6.4 GiB of _diag logs and the runner versions a self-update left behind (bin.<v>, externals.<v>,
+# 0.45 GiB each). Each is rebuilt, fetched or rewritten by its owner, so each goes once it is stale: untouched for
+# BUILD_STATE_STALE_HOURS with no live job (a held slot lock, a running job on that runner, an open file, a command
+# naming it, a lease or job marker), and all of them count toward the host cache budget (BUDGET_FAMILY_IDS).
+BUILD_STATE_STALE_HOURS = 12.0
+FLEET_RELEASE_DD = "fleet-release-derived-data"  # FLEET_ROOT/xcode/<slot>/DerivedData, the slot's lock beside it
+FLEET_SOURCE_PACKAGES = "fleet-source-packages"  # FLEET_ROOT/{ci,ci-ios-packages}/source-packages
+RUNNER_LEFTOVERS = "runner-leftovers"  # <runner>/{bin.<v>,externals.<v>}, <runner>/_work/{_tool,_update}
+RUNNER_DIAG = "runner-diag"  # <runner>/_diag/*.log
+RUNNER_VERSION_DIRS = ("bin.", "externals.")
+RUNNER_WORK_LEFTOVERS = ("_tool", "_update")
+BUILD_STATE_FAMILY_IDS = frozenset({FLEET_RELEASE_DD, FLEET_SOURCE_PACKAGES, RUNNER_LEFTOVERS, RUNNER_DIAG})
+
+
+def runner_of_path(path: Path) -> Path | None:
+    """The enrolled-runner directory PATH sits in (an actions-runner* ancestor), or None."""
+    for parent in (path, *path.parents):
+        if parent.name.startswith("actions-runner") and parent.parent == HOME:
+            return parent
+    return None
+
+
+def runner_current_version(path: Path) -> str:
+    """Why a runner version directory stays ("" when it may go): the runner's bin or externals link points at it."""
+    if not path.name.startswith(RUNNER_VERSION_DIRS):
+        return ""
+    link = path.parent / path.name.split(".", 1)[0]
+    try:
+        if os.path.realpath(link) == os.path.realpath(path):
+            return f"the runner's current version ({link.name} -> {path.name})"
+    except OSError:
+        return "its runner's version link cannot be read"
+    return ""
+
+
+def slot_lock_held(lock: Path) -> str:
+    """Why a build slot's lock file keeps its DerivedData ("" when it does not): a process holds a flock on it, or it
+    names a live pid. Unreadable counts as held."""
+    try:
+        fd = os.open(lock, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        return ""
+    except OSError:
+        return f"its slot lock {lock.name} cannot be read"
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return f"a build holds its slot lock ({lock})"
+        except OSError:
+            return f"its slot lock {lock.name} cannot be probed"
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        try:
+            text = os.read(fd, 4096).decode("utf-8", "replace")
+        except OSError:
+            return ""
+    finally:
+        os.close(fd)
+    for m in re.finditer(r'"?pid"?\s*[:=]\s*([1-9][0-9]{0,8})', text):
+        try:
+            os.kill(int(m.group(1)), 0)
+        except ProcessLookupError:
+            continue
+        except OSError:
+            pass
+        return f"its slot lock names a live process (pid {m.group(1)})"
+    return ""
+
+
+def build_state_held(fam: Family, path: Path, cmds: str) -> str:
+    """The live-job check of the build-state families above, beyond every family's open-file and command checks."""
+    if fam.id == FLEET_RELEASE_DD:
+        return slot_lock_held(path.parent / "lock")
+    if fam.id in (RUNNER_LEFTOVERS, RUNNER_DIAG):
+        if fam.id == RUNNER_LEFTOVERS and (why := runner_current_version(path)):
+            return why
+        runner = runner_of_path(path)
+        if runner is not None and fam.id == RUNNER_LEFTOVERS and runner_job_live(runner, cmds):
+            return f"a job runs on {runner.name}"
+    return ""
+
+
+def build_state_families(home: Path | None = None, fleet: Path | None = None) -> list[Family]:
+    """The build-state families BUILD_STATE_STALE_HOURS describes, for what is on this host."""
+    home = HOME if home is None else home
+    fleet = FLEET_ROOT if fleet is None else fleet
+    fams: list[Family] = []
+    xcode = fleet / "xcode"
+    if xcode.is_dir() and not xcode.is_symlink():
+        fams.append(Family(FLEET_RELEASE_DD, xcode, True, "the release builder's next build compiles it again",
+                           depth=2, match="DerivedData", build_output=True, min_idle_hours=BUILD_STATE_STALE_HOURS,
+                           reference_root=fleet, owner="cmux release builder (build-fleet xcode slots)",
+                           rebuild_minutes=25, platform="macos"))
+    for store in (fleet / "ci", fleet / "ci-ios-packages"):
+        if (store / "source-packages").is_dir() and not store.is_symlink():
+            fams.append(Family(FLEET_SOURCE_PACKAGES, store, True, "SwiftPM fetches the packages again",
+                               include=("source-packages",), build_output=True,
+                               min_idle_hours=BUILD_STATE_STALE_HOURS, reference_root=fleet,
+                               owner="cmux CI (shared SwiftPM package store)", rebuild_minutes=5, platform="macos"))
+    for runner in enrolled_runners(home):
+        fams.append(Family(RUNNER_LEFTOVERS, runner, True, "the runner's next self-update downloads it again",
+                           include=RUNNER_VERSION_DIRS, build_output=True, min_idle_hours=BUILD_STATE_STALE_HOURS,
+                           owner="GitHub Actions runner (self-update)", rebuild_minutes=1, platform="macos"))
+        work = runner / RUNNER_WORK_DIR
+        if work.is_dir() and not work.is_symlink():
+            fams.append(Family(RUNNER_LEFTOVERS, work, True, "a job's setup step downloads the tool again",
+                               include=RUNNER_WORK_LEFTOVERS, build_output=True,
+                               min_idle_hours=BUILD_STATE_STALE_HOURS,
+                               owner="GitHub Actions jobs (tool cache, runner update)", rebuild_minutes=2,
+                               platform="macos"))
+        diag = runner / "_diag"
+        if diag.is_dir() and not diag.is_symlink():
+            fams.append(Family(RUNNER_DIAG, diag, True, "logs: the runner writes new ones", files=True,
+                               min_bytes=1024**2, min_idle_hours=BUILD_STATE_STALE_HOURS,
+                               owner="GitHub Actions runner (diagnostic logs)", rebuild_minutes=0.1,
+                               platform="macos"))
+    return fams
 
 
 def runner_checkout_families(home: Path | None = None) -> list[Family]:
@@ -5010,6 +5150,7 @@ def default_families(role: str = "fleet-mini") -> list[Family]:
         fams += canonical_admission_families()
         fams += runner_root_admission_families()
         fams += runner_checkout_families()
+        fams += build_state_families()
         for runner in HOME.glob("actions-runner*"):
             temp = runner / "_work/_temp"
             if (runner / ".runner").is_file() and (runner / "glaeda-hooks").is_dir() and temp.is_dir():
@@ -5177,6 +5318,67 @@ class Item:
     reasons: list[str] = field(default_factory=list)
     jobs_since: int | None = None  # host CI jobs started since its last use (activity_due), when counted
     platform: str = "unknown"
+    # Every item that stays says why (hold_record): what holds it, its last use, its family's window and whether it is
+    # stale (idle past that window), so a dry run's "blocked" total is a list of reasons, never a bare verdict
+    hold: dict[str, Any] | None = None
+
+
+# What a verdict with no reason of its own means, for hold_record. A mini measured after glaeda#2060 (2026-11-18) held
+# 145 GiB "blocked" in its dry run, 31.5 GiB of it "recent" with no reason at all and 7.5 GiB "report-only", so
+# nobody could tell a stopped VM inside its window from a cache no family may delete.
+HOLD_BY_VERDICT = {
+    "recent": "inside its family's idle window",
+    "report-only": "its family is report-only: glaeda-disk never deletes it",
+    "git-checkout": "a git checkout that may hold unpushed work",
+    "unchecked": "too deep or large to rule out a git checkout",
+    "kept": "kept by its family's rule",
+    "in-use": "in use",
+}
+
+
+def hold_record(fam: Family, verdict: str, reasons: list[str], idle: float, window: float,
+                due: bool) -> dict[str, Any] | None:
+    """Why an item stays, for the dry run and the receipts: {"by", "last_use_hours", "window_hours", "stale"}, None
+    for a reclaimable one. "by" is its first reason, else what its verdict means (HOLD_BY_VERDICT, with the window
+    for a recent one); "stale" is whether it sat idle past its family's window, so a held item that is stale says
+    its holder, not its age, keeps it."""
+    if verdict == "reclaimable":
+        return None
+    finite = math.isfinite(window)
+    by = reasons[0] if reasons else HOLD_BY_VERDICT.get(verdict, verdict)
+    if verdict == "recent" and not reasons:
+        by = (f"idle {idle:.1f}h, inside its {window:g}h window" if finite
+              else "no age window: it goes only by host-job reuse or under the floor")
+    if verdict in ("recent", "report-only") and fam.owner:
+        by += f" (owner: {fam.owner})"
+    return {"by": by, "last_use_hours": round(idle, 1) if math.isfinite(idle) else None,
+            "window_hours": window if finite else None, "stale": bool(due) and fam.reclaimable}
+
+
+def fill_holds(items: "list[Item]") -> None:
+    """A hold for every held item that no survey judged (simulator runtimes, Xcode copies, receipts' own items)."""
+    for i in items:
+        if i.verdict != "reclaimable" and i.hold is None:
+            i.hold = {"by": i.reasons[0] if i.reasons else HOLD_BY_VERDICT.get(i.verdict, i.verdict),
+                      "last_use_hours": i.idle_hours if math.isfinite(i.idle_hours) else None,
+                      "window_hours": None, "stale": False}
+
+
+def held_summary(items: "list[Item]", top: int = 12) -> dict[str, Any]:
+    """The dry run's held bytes by what holds them: stale ones (idle past their window, kept only by their holder)
+    apart from fresh ones, and the biggest held items with their reasons. Nested items count once, at the top."""
+    held = [i for i in items if i.verdict != "reclaimable" and i.hold]
+    tops = set(_outermost([i.path for i in held]))
+    rows = [i for i in held if i.path in tops]
+    by: dict[str, int] = {}
+    for i in rows:
+        key = f"{i.family}: {i.hold['by']}"
+        by[key] = by.get(key, 0) + i.bytes
+    return {"bytes": sum(i.bytes for i in rows),
+            "stale_bytes": sum(i.bytes for i in rows if i.hold.get("stale")),
+            "by": [{"why": k, "bytes": v} for k, v in sorted(by.items(), key=lambda kv: -kv[1])[:top]],
+            "biggest": [{"family": i.family, "path": i.path, "bytes": i.bytes, **i.hold}
+                        for i in sorted(rows, key=lambda i: -i.bytes)[:top]]}
 
 
 def platform_label(fam: Family) -> str:
@@ -7028,7 +7230,8 @@ def keep_verdict(fam: "Family", path: Path) -> str:
         return seed_verdict(path)
     if fam.id == INTERRUPTED:
         if os.path.lexists(mirror_keep_marker(path)):
-            return "glaeda-disk kept it: its git work changed after bundling"
+            stale = kept_aside_stale(path)
+            return "glaeda-disk kept it: its git work changed after bundling" + (f"; {stale}" if stale else "")
         return deletion_owner_live(path)
     if fam.discover and stat_layout(os.fspath(path)) == "rustup-toolchain":
         return rustup_verdict(path)
@@ -8362,6 +8565,78 @@ MIRROR_KEEP = ".glaeda-disk-keep-"  # next to an aside tree: finish_deletion and
 
 def mirror_keep_marker(aside: Path) -> Path:
     return aside.with_name(MIRROR_KEEP + aside.name)
+
+
+# An aside tree kept because its git work changed while it was bundled, and that could not go back to its path then
+# (mirror_rename_recheck), stayed aside for good: nothing judged it again. A mini held one 26 days (2026-11-18:
+# 5.1 GiB, ~/.glaeda-disk-deleting-simsurface-rig-<pid>, its marker and tree untouched since 2026-10-23). Once the
+# marker and the tree sat untouched KEPT_ASIDE_RESTORE_HOURS, with no process in it and its path free, an apply puts
+# it back where it was and drops the marker, so its own family judges it again under every usual rule: a home folder
+# bundles what is unpushed into ~/archive before it goes, and a checkout someone uses stays.
+KEPT_ASIDE_RESTORE_HOURS = 7 * 24.0
+
+
+def aside_origin(aside: Path) -> Path | None:
+    """The path an aside tree was renamed from (DELETING_PREFIX<name>-<pid>), or None."""
+    m = DELETING_RE.fullmatch(aside.name)
+    if m is None:
+        return None
+    name = aside.name[len(DELETING_PREFIX):m.start(1) - 1]
+    return aside.with_name(name) if name and name not in (".", "..") else None
+
+
+def kept_aside_stale(aside: Path, now: float | None = None) -> str:
+    """Why a kept aside tree may go back to its path ("" when it may not): marker and tree untouched long enough and
+    its path free. Process evidence is apply's to take, right before the rename."""
+    now = time.time() if now is None else now
+    marker = mirror_keep_marker(aside)
+    origin = aside_origin(aside)
+    try:
+        marked = marker.lstat().st_mtime
+    except OSError:
+        return ""
+    if origin is None or os.path.lexists(origin):
+        return ""
+    used = max(marked, newest_mtime(aside, 2, 3000))
+    idle_h = (now - used) / 3600
+    if idle_h < KEPT_ASIDE_RESTORE_HOURS:
+        return ""
+    return (f"kept aside {idle_h / 24:.0f} days untouched: stale; an apply puts it back at {origin} for its family "
+            "to judge again")
+
+
+def restore_stale_kept_asides(fams: list[Family], receipt: Path | None = None) -> int:
+    """Put every stale kept aside tree (kept_aside_stale) back at its path, with fresh process evidence first. The
+    number put back."""
+    asides = [c for f in fams if f.id == INTERRUPTED for c in candidates(f)
+              if os.path.lexists(mirror_keep_marker(c)) and kept_aside_stale(c)]
+    if not asides:
+        return 0
+    try:
+        opened, cmds = process_evidence()
+    except NoEvidence:
+        return 0
+    cwds = open_index(opened)
+    restored = 0
+    for aside in asides:
+        origin = aside_origin(aside)
+        if origin is None or in_cwd(os.fspath(aside), cwds) or named_by(os.fspath(aside), cmds) or holds_socket(aside):
+            continue
+        try:
+            rename_noreplace(aside, origin)
+        except OSError:
+            continue
+        with contextlib.suppress(OSError):
+            mirror_keep_marker(aside).unlink()
+        restored += 1
+        print(f"  put back  {origin} (kept aside {KEPT_ASIDE_RESTORE_HOURS / 24:g}+ days untouched; its family "
+              "judges it again)")
+        if receipt is not None:
+            with contextlib.suppress(OSError), receipt.open("a") as f:  # a lost receipt line must not stop the pass
+                f.write(json.dumps({"at": time.time(), "operation": "restore-kept-aside", "family": INTERRUPTED,
+                                     "path": os.fspath(origin), "from": os.fspath(aside), "outcome": "restored",
+                                     "verdict": "kept", "bytes": 0, "reasons": ["stale kept aside tree"]}) + "\n")
+    return restored
 
 
 def repo_unborn(gitdir: Path) -> bool:
@@ -9961,6 +10236,10 @@ def _survey(families, idle_hours, min_bytes, known, evidence, defer_bulk=False,
             references = references_by_root.setdefault(key, live_artifact_references(fam.reference_root))
             if artifact_referenced(path, references):
                 reasons.append("live lease or running job")
+        if LEASE and (why := lease_holds(fam, path, now - idle * 3600)):
+            reasons.append(why)
+        if fam.id in BUILD_STATE_FAMILY_IDS and not blind and (why := build_state_held(fam, path, cmds)):
+            reasons.append(why)
         if fam.id == SEED_ROOT_FAMILY and seed_root_held(fam, path):
             reasons.append("a fast-tier job holds the seed root's lock (owned_spm_scratch.py seed_lease)")
         if fam.id == SPM_SCRATCH and spm_scratch_held(path):
@@ -10061,7 +10340,7 @@ def _survey(families, idle_hours, min_bytes, known, evidence, defer_bulk=False,
         if policy_note:
             reasons.append(policy_note)
         items.append(Item(fam.id, sp, size, round(idle, 1), verdict, reasons, jobs,
-                          platform_label(fam)))
+                          platform_label(fam), hold_record(fam, verdict, reasons, idle, window, due)))
     items.sort(key=lambda i: i.bytes, reverse=True)
     return items
 
@@ -10243,6 +10522,9 @@ FLEET_RESERVATIONS: Path | None = None  # None: fleet_reservations_path(); tests
 FLEET_RESERVATIONS_NAME = ".local/share/glaeda/fleet-reservations.json"
 UPDATE_CONFIG = HOME / ".config/glaeda/update.json"
 HOST_RESERVATION_LOCAL = FLEET_ROOT / "reservation.json"
+# When the lease host_reservation last found began (its "from", or the host-local marker's "since"), None when it
+# found none or failed closed (an unreadable, malformed or expired list, an unreadable marker).
+RESERVATION_SINCE: float | None = None
 
 
 def fleet_reservations_path() -> Path:
@@ -10316,6 +10598,8 @@ def host_reservation(now: float | None = None, path: Path | None = None, names: 
     """Why this host is reserved now ("" when it is not): an active fleet reservation naming it (or an alias), an
     active host-local reservation, or a reservation list that is unreadable or malformed anywhere, or missing on a
     host that runs a controller worker (controller_worker_host) and is not a hygiene-only Mac."""
+    global RESERVATION_SINCE
+    RESERVATION_SINCE = None
     now = time.time() if now is None else now
     names = host_names() if names is None else {n.lower() for n in names}
     try:
@@ -10328,7 +10612,7 @@ def host_reservation(now: float | None = None, path: Path | None = None, names: 
         if reservation_time(doc["expires"]) <= now:  # KeyError without one: the writer stopped refreshing it
             return f"fleet reservations expired at {doc['expires']}; kept as reserved"
         alias = {str(h).lower(): {a.lower() for a in _str_list(v, "aliases")} for h, v in aliases.items()}
-        hit = ""
+        hit, since = "", None
         for e in entries:  # every entry is checked, so one malformed entry anywhere fails closed
             if not isinstance(e, dict):
                 raise ValueError("malformed entry")
@@ -10338,8 +10622,9 @@ def host_reservation(now: float | None = None, path: Path | None = None, names: 
             if start >= end:
                 raise ValueError("from must be before until")
             if not hit and names & hosts and start <= now <= end:
-                hit = f"reserved for {e.get('owner', '?')} until {e['until']} ({e.get('id', '?')})"
+                hit, since = f"reserved for {e.get('owner', '?')} until {e['until']} ({e.get('id', '?')})", start
         if hit:
+            RESERVATION_SINCE = since
             return hit
     except FileNotFoundError:
         # a personal Mac never gets the fleet's list, nor does a host with no controller worker (the writer's hosts);
@@ -10362,7 +10647,34 @@ def host_reservation(now: float | None = None, path: Path | None = None, names: 
     except (OSError, ValueError, TypeError, AttributeError, KeyError) as error:
         return f"host reservation marker unreadable ({type(error).__name__}); kept as reserved"
     if now < until:  # the runner hook's rule: a marker holds from when it is written until until, since or not
+        RESERVATION_SINCE = float(min(since, now))
         return f"host reservation by {held.get('owner', '?')} until {until}"
+    return ""
+
+
+# A lease hands the host to one job, not its whole disk (Leo, 2026-11-18: "A fleet lease's host reservation must not
+# turn the budget off. Only the leased job's own paths are protected"). A lease used to make every pass floor-only
+# with no budget, no idle sweep and 24 h ages: a mini under a two-hour measurement lease kept 145 GiB "blocked" and
+# freed nothing. Now a readable, active lease (RESERVATION_SINCE) leaves every rule as on an unleased host, and holds
+# only what its job owns: an item used since the lease began (its job wrote it, or read it with a tool that moves
+# mtime), a path its lease or job markers name (live_artifact_references, as before) and anything its processes have
+# open or name (every family's own in-use checks). A list that cannot be read still fails closed to floor-only.
+LEASE: dict[str, Any] = {}  # {"why", "since"} when an active lease holds this host; set by main
+
+
+def lease_holds(fam: "Family", path: Path, used: float | None = None) -> str:
+    """Why the lease holding this host keeps PATH ("" when none does or it is no job's): used since it began. USED is
+    its last use when the caller already has it (the survey's), else item_mtime reads it now."""
+    since = LEASE.get("since")
+    if since is None:
+        return ""
+    if used is None:
+        try:
+            used = item_mtime(fam, path)
+        except OSError:
+            return ""
+    if used >= since:
+        return f"used since the host's lease began ({LEASE.get('why', '?')}): the leased job's own"
     return ""
 
 
@@ -11927,7 +12239,8 @@ def report(items: list[Item], fss: list[Fs], limit: int, idle_hours: float,
         print(f"  {gib(n)}  {fam:20s}  {label:7s} reclaimable {gib(r).strip()}{note}")
     print(f"\ntop {limit}")
     for i in items[:limit]:
-        why = f" ({', '.join(i.reasons)})" if i.reasons else ""
+        why = (f" ({', '.join(i.reasons)})" if i.reasons
+               else f" ({i.hold['by']})" if i.verdict != "reclaimable" and i.hold else "")
         path = i.path.replace(str(HOME), "~")
         print(f"  {gib(i.bytes)}  {i.verdict:12s} {i.idle_hours:6.1f}h  "
               f"{i.platform:7s} {path}{why}")
@@ -12253,6 +12566,7 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
                 or (fam.app_clones and app_clone_running(p, cmds))
                 or (fam.id == TART_VMS and tart_vm_held(p, cmds))
                 or (fam.id == LIMA_VMS and lima_vm_held(p, cmds))
+                or (fam.id in BUILD_STATE_FAMILY_IDS and build_state_held(fam, p, cmds))
                 or in_cwd(i.path, cwds) or named_by(i.path, cmds) or holds_socket(p) or job_busy(fam, p)
                 or (fam.reference_root is not None
                     and artifact_referenced(p, fresh_artifact_references(fam.reference_root)))
@@ -12266,6 +12580,8 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
                and referenced_main_checkout(p, nested=families[i.family].nested_git))
               or (i.family in HOME_SCRATCH_FAMILIES and home_scratch_referenced(p))):
             outcome = "changed:referenced"
+        elif LEASE and lease_holds(fam, p):
+            outcome = "changed:leased"
         elif not item_due(fam, (idle_now := (time.time() - item_mtime(fam, p)) / 3600),
                           item_window(fam, p, idle_hours, archived))[0]:
             outcome = "changed:modified"
@@ -14119,6 +14435,12 @@ def _main_impl(argv: list[str] | None = None) -> int:
     # before any family is built: a reserved host's families keep its holder's ages (keep_legacy_ages, once 12 h lands)
     reserved = (host_reservation() if role == "fleet-mini" and DARWIN and (a.apply or a.dedupe or a.dedupe_builds)
                 else "")
+    LEASE.clear()
+    if reserved and RESERVATION_SINCE is not None and not (a.dedupe or a.dedupe_builds):
+        # a readable, active lease: every rule runs as on an unleased host, and lease_holds keeps its job's own paths
+        LEASE.update(why=reserved, since=RESERVATION_SINCE)
+        RUN["lease"] = reserved
+        reserved = ""
     if reserved:
         keep_legacy_ages()
     global RUNNER_CACHE_PROFILE, BUILD_CACHES_UNWINDOWED
@@ -14450,6 +14772,8 @@ def _main_impl(argv: list[str] | None = None) -> int:
         if _REFRESH_PROGRESS_KNOWN is not None:
             known.update(_REFRESH_PROGRESS_KNOWN)
     else:
+        if a.apply and not reserved and not DEAD_MODE and not RUNNER_CACHE_PROFILE and not OUT_OF_BAND_RUN:
+            restore_stale_kept_asides(fams, a.receipt)  # before the survey, so the put-back tree is judged this pass
         items = survey(fams, idle, a.min_mib * 1024**2, known,
                        defer_bulk=bool(at) and not a.apply, deadline=refresh_deadline,
                        judge_deadline=judge_deadline)
@@ -14534,12 +14858,14 @@ def _main_impl(argv: list[str] | None = None) -> int:
     tooling = (simulator_runtimes() + (xcode_items() if a.top or a.json else [])) \
         if sweep and DARWIN and not RUNNER_CACHE_PROFILE else []
     tmp_residue = tmp_test_residue_census() if not RUNNER_CACHE_PROFILE else None
+    fill_holds([*items, *tooling])
     if a.json:
         print(json.dumps({"schema": "glaeda-disk/v2", "role": ROLE, "free": shown[0].free,
                           "total": shown[0].total, "idle_hours": idle, "tmp_test_residue": tmp_residue,
                           "tooling": [asdict(i) for i in tooling],
                           "filesystems": [asdict(fs) for fs in shown],
                           "accounting": accounting,
+                          "held": held_summary(items),
                           "owners": {f.id: {"owner": f.owner, "retired": owner_retired(f)}
                                      for f in fams if f.owner},
                           "items": [asdict(i) for i in items]}, indent=2))

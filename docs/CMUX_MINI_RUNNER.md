@@ -652,6 +652,21 @@ What `--apply` does:
      forced into a pressure pass every time. The run line's `cache_budget` and the health summary's `cache_budget` rows show
      used against budget per volume and family (cmux13s, 2026-11-17: 58 of 460 GB free with every family
      inside its own window).
+     The budget also counts the build state no family held before 2026-11-18, each going once it is stale
+     (untouched 12 h, `BUILD_STATE_STALE_HOURS`, with no live job): the release builder's slot DerivedData
+     under `build-fleet/xcode/<slot>` (its slot `lock` held or naming a live pid keeps it), the shared
+     SwiftPM `source-packages` stores under `build-fleet/ci` and `ci-ios-packages`, each runner's
+     `_work/_tool` and `_work/_update` (a job on that runner keeps them), its `_diag` logs and the
+     `bin.<v>`/`externals.<v>` versions its `bin`/`externals` links no longer name. Home-scratch, retired
+     runners and interrupted deletions count too, by their own folders only. An aside tree kept because
+     its git work changed while it was bundled goes back to its path once it and its marker sat untouched
+     7 days, with no process in it and its path free, and its family judges it again.
+     Every held item in the dry run (`--json`) carries `hold`: what holds it (`by`), its last use, its
+     window and whether it is `stale`; the top-level `held` sums held bytes by reason and stale bytes apart.
+     A fleet lease no longer turns any of this off: with a readable active lease every rule runs as on an
+     unleased host, and only the leased job's own paths stay (used since the lease began, named by its
+     lease or job markers, or open or named by its processes). An unreadable reservation list still
+     fails closed to floor-only eviction.
    - **Stopping.** After two idle polls in a row, and one fresh look right before the
      signal, the gate sends `SIGINT` to the runner's `Runner.Listener`. Disk never stops a
      listener (`DISK_RECLAIM_NOW`). For the holds that remain, while a job runs the gate watches
