@@ -2313,6 +2313,15 @@ def run_upstream(command: list[str], request: dict) -> dict:
     return answer
 
 
+def upstream_read_at(cached: dict | None) -> float | None:
+    """When a key's cache entry was last really read (its fetchedAt), looking through an outage stored on it since
+    (readAt); None for a key never read. Kept on the outage so its end restores it (Daemon.upstream_outage_over)."""
+    if not isinstance(cached, dict):
+        return None
+    at = cached.get("readAt") if cached.get("errorFrom") == UPSTREAM_OUTAGE else cached.get("fetchedAt")
+    return float(at) if isinstance(at, (int, float)) and not isinstance(at, bool) else None
+
+
 def read_request(text: str) -> list[tuple[str, bool, bool, str | None]]:
     """The (key, jobs, wait, consumer) of each key in one upstream request line; WatchError on anything else. `wait`
     (optional) says a wait downstream is blocked on the key, so this host's daemon treats it as waited
@@ -2393,9 +2402,9 @@ def cmd_read(text: str) -> int:
         cached = read_cache(key)
         budgets = (entries.get(key) or {}).get("budgets") or {}  # an earlier line's consumers, for this same key
         entries[key] = None if cached is None else {
-            # errorFrom: an outage of this host's own upstream, which a downstream clears once this host answers again
-            k: cached.get(k) for k in ("data", "dataAt", "error", "errorFrom", "fetchedAt", "jobs", "jobsAt", "missing",
-                                       "restRun", "restRunAt")
+            # errorFrom, readAt: an outage of this host's own upstream, which a downstream clears once this host answers
+            k: cached.get(k) for k in ("data", "dataAt", "error", "errorFrom", "readAt", "fetchedAt", "jobs", "jobsAt",
+                                       "missing", "restRun", "restRunAt")
             if k in cached}
         if cached is not None and cached.get("source"):  # where the data came from, so a downstream wait can
             entries[key]["origin"] = cached.get("origin") if cached.get("source") == "upstream" else cached["source"]
@@ -6074,7 +6083,7 @@ class Daemon:
             self.errors.append(why)
             self.upstream_status = {"state": "failing", "error": why, "at": self.now}
             for e in due:  # the data is kept; a status names the outage instead of showing it as current
-                self.store(e["key"], e["cache"], error=why, errorFrom=UPSTREAM_OUTAGE)
+                self.store(e["key"], e["cache"], error=why, errorFrom=UPSTREAM_OUTAGE, readAt=upstream_read_at(e["cache"]))
             return
         self.upstream_status = {"state": "ok", "at": self.now, "keys": len(due)}
         self.upstream_denials(got)
@@ -6101,7 +6110,10 @@ class Daemon:
                                       "origin": entry.get("origin") if isinstance(entry.get("origin"), str) else None,
                                       "restRun": entry.get("restRun") if isinstance(entry.get("restRun"), dict) else None}
             if error and entry.get("errorFrom") == UPSTREAM_OUTAGE:
-                fields["errorFrom"] = UPSTREAM_OUTAGE  # the upstream's own upstream was down: cleared as this host's is
+                # the upstream's own upstream was down: cleared as this host's is, back to its last real read
+                read_at = entry.get("readAt")
+                fields.update(errorFrom=UPSTREAM_OUTAGE, readAt=min(self.now, float(read_at)) if isinstance(
+                    read_at, (int, float)) and not isinstance(read_at, bool) else None)
             if isinstance(fetched, (int, float)):
                 fields["fetchedAt"] = min(self.now, float(fetched))  # a wait rules only on reads after it began
             shown = entry.get("restRunAt")  # when the upstream's GitHub read last showed restRun (run_unconfirmed)
@@ -6123,12 +6135,26 @@ class Daemon:
     def upstream_outage_over(self, e: dict) -> None:
         """A key the upstream answered with nothing to store no longer names an outage this host stored on it
         (2026-11-18: huge-blue's 9 s restart showed as "not running on the upstream host" on lane VMs for 30 min).
-        An error the upstream gave for the key itself carries no errorFrom and stays."""
-        cached = e["cache"] or {}
-        if cached.get("errorFrom") != UPSTREAM_OUTAGE:
+        An error the upstream gave for the key itself carries no errorFrom and stays. Nothing was read, so the entry goes
+        back to what it was before the outage: fetchedAt the last real read (readAt), or no entry at all for a key never
+        read. The outage's own fetchedAt would tell once_answered a one-off `status` was answered, and drop its watch."""
+        if (e["cache"] or {}).get("errorFrom") != UPSTREAM_OUTAGE:
             return
-        fetched = cached.get("fetchedAt")  # nothing was read: a wait's "read since I began" must not move
-        self.store(e["key"], e["cache"], error=None, **({"fetchedAt": fetched} if isinstance(fetched, (int, float)) else {}))
+        cache = cache_dir() / file_name(e["key"])
+        with bounded_lock(cache_dir() / ".write.lock") as held:
+            if not held:
+                self.errors.append(f"{e['key']}: cache write lock timeout")
+                return
+            current = read_json(cache)
+            if not isinstance(current, dict) or current.get("errorFrom") != UPSTREAM_OUTAGE:
+                return  # written since this tick read it
+            read_at = current.get("readAt")
+            known = isinstance(read_at, (int, float)) and not isinstance(read_at, bool)
+            if not known and current.get("data") is None:
+                cache.unlink(missing_ok=True)  # never read: as before the outage, asked again in UPSTREAM_NEW
+                return
+            current = {k: v for k, v in current.items() if k not in ("errorFrom", "readAt")}
+            write_json(cache, {**current, "error": None, **({"fetchedAt": float(read_at)} if known else {})})
 
     def upstream_denials(self, got: dict) -> None:
         """A head consumer the upstream refused for its budget is denied here too (this host's consumers ledger), so

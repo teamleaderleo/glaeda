@@ -1793,9 +1793,10 @@ class UpstreamTest(Base):
                 "run": "run:o/r/11"}
         for k in keys.values():
             gg.register(k)
-        self.answers[keys["answered"]] = {"data": self.pr_data(), "dataAt": NOW}
-        self.answers[keys["older"]] = {"data": self.pr_data(), "dataAt": NOW}
+        for k in ("answered", "absent", "older"):
+            self.answers[keys[k]] = {"data": self.pr_data(), "dataAt": NOW}
         self.daemon.tick(now=NOW)
+        self.answers[keys["absent"]] = None
         self.broken = gg.WatchError("upstream: HTTP 503: glaeda-gh is not running on the upstream host")
         self.daemon.tick(now=NOW + gg.UPSTREAM_EVERY)
         for k in keys.values():
@@ -1806,10 +1807,42 @@ class UpstreamTest(Base):
         self.answers[keys["run"]] = {"budgets": {}}  # an entry with nothing in it
         status = self.daemon.tick(now=NOW + 2 * gg.UPSTREAM_EVERY)
         self.assertEqual(status["upstream"]["state"], "ok")
-        for k in keys.values():
-            self.assertIsNone(gg.read_cache(k)["error"], k)
+        for k in ("answered", "absent", "older"):
+            self.assertIsNone(gg.read_cache(keys[k])["error"], k)
+            self.assertNotIn("errorFrom", gg.read_cache(keys[k]), k)
+        # nothing was read for these: the last real read's time comes back, not the outage's
+        for k in ("absent", "older"):
+            self.assertEqual(gg.read_cache(keys[k])["fetchedAt"], NOW, k)
+            self.assertNotIn("readAt", gg.read_cache(keys[k]), k)
+        # a key never read is as it was before the outage: no entry, so it is asked for again in UPSTREAM_NEW
+        for k in ("unread", "run"):
+            self.assertIsNone(gg.read_cache(keys[k]), k)
         self.assertEqual(gg.read_cache(keys["older"])["dataAt"], NOW, "this host's newer data is kept")
-        self.assertEqual(gg.read_cache(keys["answered"])["data"]["number"], 7)
+        self.assertEqual(gg.read_cache(keys["absent"])["data"]["number"], 7, "the data is kept")
+
+    def test_a_one_off_status_is_not_answered_by_the_end_of_an_outage(self) -> None:
+        """Review of glaeda#2195: the outage's store stamps fetchedAt, so an entry cleared with that stamp read as
+        "read since the ask" (once_answered) and a one-off `status` lost its watch before anything was read."""
+        key = "pr:o/r#7"
+        with mock.patch.object(gg.time, "time", return_value=NOW):
+            gg.register(key, once=True)
+        path = gg.watch_dir() / gg.file_name(key)
+
+        def tick(t: float) -> None:  # the ask stays at NOW on the daemon's clock (touched is now minus the file's age)
+            os.utime(path, (time.time() - (t - NOW),) * 2)
+            self.daemon.tick(now=t)
+
+        self.broken = gg.WatchError("upstream: HTTP 503: glaeda-gh is not running on the upstream host")
+        tick(NOW + 1)
+        self.broken = None
+        self.answers[key] = {"data": None, "error": None}
+        for t in (NOW + 1 + gg.UPSTREAM_EVERY, NOW + 2 + gg.UPSTREAM_EVERY, NOW + 2 + 2 * gg.UPSTREAM_EVERY):
+            tick(t)
+            self.assertFalse(gg.read_json(path).get("dormant"), "the ask still waits for a read")
+        self.answers[key] = {"data": self.pr_data(), "dataAt": NOW + 50, "fetchedAt": NOW + 50}
+        tick(NOW + 3 + 3 * gg.UPSTREAM_EVERY)
+        self.assertEqual(gg.read_cache(key)["data"]["number"], 7)
+        self.assertIsNone(gg.read_cache(key)["error"])
 
     def test_a_per_key_error_the_upstream_reported_outlives_an_answer_with_no_data(self) -> None:
         """Only the outage this host stored is cleared: an error the upstream gave for the key itself (even one that
@@ -1837,17 +1870,24 @@ class UpstreamTest(Base):
         """A chained host serves its own stored outage on (cmd_read sends errorFrom); the host below clears it once
         the middle one answers with no error, as it would its own."""
         gg.register("pr:o/r#7")
-        self.answers["pr:o/r#7"] = {"data": None, "error": "upstream: no broker socket", "errorFrom": gg.UPSTREAM_OUTAGE}
+        self.answers["pr:o/r#7"] = {"data": self.pr_data(), "dataAt": NOW - 60, "fetchedAt": NOW - 5,
+                                    "error": "upstream: no broker socket", "errorFrom": gg.UPSTREAM_OUTAGE,
+                                    "readAt": NOW - 60}
+        self.answers["pr:o/r#8"] = {"data": None, "error": "upstream: no broker socket", "errorFrom": gg.UPSTREAM_OUTAGE}
+        gg.register("pr:o/r#8")
         self.daemon.tick(now=NOW)
         self.assertEqual(gg.read_cache("pr:o/r#7")["errorFrom"], gg.UPSTREAM_OUTAGE)
         out = io.StringIO()
         with contextlib.redirect_stdout(out), mock.patch.object(gg, "daemon_running", return_value=True), \
                 mock.patch.object(gg, "daemon_failing", return_value=None):
             gg.cmd_read(json.dumps({"keys": [{"key": "pr:o/r#7", "jobs": False}]}))
-        self.assertEqual(json.loads(out.getvalue())["entries"]["pr:o/r#7"]["errorFrom"], gg.UPSTREAM_OUTAGE)
-        self.answers["pr:o/r#7"] = {"data": None, "error": None}
+        served = json.loads(out.getvalue())["entries"]["pr:o/r#7"]
+        self.assertEqual((served["errorFrom"], served["readAt"]), (gg.UPSTREAM_OUTAGE, NOW - 60))
+        self.answers = {"pr:o/r#7": {"data": None, "error": None}, "pr:o/r#8": {"data": None, "error": None}}
         self.daemon.tick(now=NOW + gg.UPSTREAM_EVERY)
-        self.assertIsNone(gg.read_cache("pr:o/r#7")["error"])
+        entry = gg.read_cache("pr:o/r#7")
+        self.assertEqual((entry["error"], entry["fetchedAt"], entry["data"]["number"]), (None, NOW - 60, 7))
+        self.assertIsNone(gg.read_cache("pr:o/r#8"), "never read below either")
 
     def test_a_daemon_restart_shorter_than_the_grace_never_answers_not_running(self) -> None:
         """huge-blue's glaeda-gh took 9 s to restart (2026-11-18) while `read` looked for it for DOWN_GRACE, 5 s, and
