@@ -15,6 +15,7 @@ import json
 import errno
 import os
 import plistlib
+import pwd
 import re
 import shutil
 import signal
@@ -78,6 +79,8 @@ _NO_RESERVATIONS.write('{"schema": "glaeda-fleet-reservations/v1", "expires": "2
                        '"reservations": [], "aliases": {}}')
 _NO_RESERVATIONS.close()
 gd.FLEET_RESERVATIONS = Path(_NO_RESERVATIONS.name)
+# No test reads a real root census (RootCensusTest writes its own).
+gd.ROOT_CENSUS_STATE = Path(_NO_RESERVATIONS.name + ".no-root-census.json")
 gd.HOST_RESERVATION_LOCAL = Path(_NO_RESERVATIONS.name + ".none")
 # An --apply in a test must never reap the real $TMPDIR of the host running the suite: without a tmp of
 # the test's own, the TMPDIR reaper does nothing.
@@ -9055,6 +9058,119 @@ class VolumeCensusTest(unittest.TestCase):
                 contextlib.redirect_stdout(io.StringIO()) as out:
             self.assertEqual(gd.main(["--census"]), 0)
         self.assertIn("not due", out.getvalue())
+
+
+class RootCensusTest(unittest.TestCase):
+    """CI minis: the root census walks every folder of every account and the accounting merges it (Leo,
+    2026-11-17: "why is it always unaccounted? ... these are ci machines")."""
+
+    write, fs, du = VolumeCensusTest.write, VolumeCensusTest.fs, staticmethod(VolumeCensusTest.du)
+
+    def setUp(self) -> None:
+        VolumeCensusTest.setUp(self)
+        self.root_state = Path(self.tmp.name) / "root-census.json"
+        saved = gd.ROOT_CENSUS_STATE
+        gd.ROOT_CENSUS_STATE = self.root_state
+        self.addCleanup(setattr, gd, "ROOT_CENSUS_STATE", saved)
+
+    def tree(self) -> None:
+        for rel in ("Users/runner2/actions-runner/_work/blob", "Users/runner2/Library/Containers/c/data",
+                    "Users/runner2/Library/Photos/p", "Users/runner2/Pictures/x.photoslibrary/db",
+                    "Users/runner2/Library/Developer/CoreSimulator/Devices/u/data/blob",
+                    "Users/Shared/cmux-build-fleet/cache/blob", "private/var/folders/xy/blob",
+                    "Library/Caches/blob"):
+            self.write(rel)
+
+    def test_the_root_census_walks_every_guarded_folder_and_names_its_account(self) -> None:
+        self.tree()
+        home = self.root / "Users" / "runner2"
+        with mock.patch.object(gd, "DARWIN", True), mock.patch.object(gd, "HOME", home), \
+                mock.patch.object(gd, "apfs_local_snapshots", return_value=["com.apple.TimeMachine.x.local"]), \
+                mock.patch.object(gd, "_census_du", return_value=None):  # every directory is opened
+            state = gd.root_census_slice([self.root], self.root_state, budget_s=1000)
+            self.assertFalse(gd.ROOT_CENSUS_MODE, "the root mode ends with its slice")
+            self.assertTrue(gd.privacy_guarded(home, "Pictures"), "the unprivileged walks keep their guards")
+        self.assertTrue(state["complete"])
+        rows = state["rows"]
+        self.assertFalse([k for k, r in rows.items() if r[1] in ("skipped", "unreadable")], rows)
+        for rel in ("Users/runner2/Library/Containers/c", "Users/runner2/Library/Photos",
+                    "Users/runner2/Pictures/x.photoslibrary"):
+            self.assertIn(str(self.root / rel / gd.CENSUS_FILES), rows, rel)
+        me = pwd.getpwuid(os.getuid()).pw_name
+        self.assertTrue(all(r[3] == me for r in rows.values()))
+        self.assertEqual(state["meta"]["by_owner"], {me: sum(r[0] for r in rows.values())})
+        self.assertEqual(state["meta"]["snapshots"], ["com.apple.TimeMachine.x.local"])
+
+    def test_a_ci_mini_gap_is_never_attributed_to_unreadable_folders(self) -> None:
+        # The fleet user's own census can read none of another account's home: its rows say "unreadable" and the
+        # gap kept everything past du's lower bound. With a root census on the host none of that is left.
+        self.tree()
+        other = self.root / "Users" / "runner2"
+        user_census = {"complete": True, "at": 1.0, "rows": {
+            str(other): [0, "unreadable", False],
+            str(other / "Library" / "Containers"): [0, "skipped", False],
+            str(self.root / "Library"): [4096, "unreadable", False]}}
+        with mock.patch.object(gd, "apfs_local_snapshots", return_value=[]):
+            gd.root_census_slice([self.root], self.root_state, budget_s=1000)
+        total = self.du(self.root)
+        for used, snapshots in ((total, []), (total + 3 * gd.GIB, ["com.apple.os.update-1"])):
+            doc = json.loads(self.root_state.read_text())
+            doc["meta"]["snapshots"] = snapshots
+            self.root_state.write_text(json.dumps(doc))
+            gd._ACCOUNTING_MEM.clear()
+            gd._ACCOUNTING_COVERAGE_MEM.clear()
+            real = gd.census_for
+            # the fleet user's census (no state passed) is the unprivileged one; the root census passes its doc
+            with mock.patch.object(gd, "census_for", side_effect=lambda dev, state=None: (
+                    user_census if state is None else real(dev, state))):
+                got = gd.filesystem_accounting([self.fs(used)], [])[0]
+            self.assertEqual(got["accounting_gap"], used - total)
+            self.assertNotIn("unreadable", got["residual"]["category"])
+            self.assertTrue(got["residual"]["category"].startswith(gd.APFS_INVISIBLE))  # mini-health keys on it
+            for row in got["coverage"]:
+                for child in row["children"]:
+                    self.assertNotIn("unreadable", f"{child['category']} {child['classification']}", row["scope"])
+            self.assertNotIn(gd.CENSUS_SCOPE, [r["scope"] for r in got["coverage"]])
+            owners = next(r for r in got["coverage"] if r["scope"] == gd.ROOT_CENSUS_OWNERS_SCOPE)
+            self.assertEqual(sum(c["bytes"] for c in owners["children"]), total)
+        self.assertIn("1 local APFS snapshots", got["residual"]["category"])
+
+    def test_rows_root_could_not_read_are_named_protected_and_another_accounts_tree_still_counts(self) -> None:
+        self.write("System/blob")
+        locked = self.write("Users/runner2/blob").parent  # /Users is opened: each home is its own row
+        real = gd._census_du
+
+        def census_du(path, timeout):
+            return (gd.GIB, False) if path == self.root / "System" else real(path, timeout)
+
+        with mock.patch.object(gd, "_census_du", side_effect=census_du), \
+                mock.patch.object(gd, "apfs_local_snapshots", return_value=[]):
+            state = gd.root_census_slice([self.root], self.root_state, budget_s=1000)
+        self.assertEqual(state["rows"][str(self.root / "System")][1], gd.ROOT_PROTECTED)
+        census = gd.root_census_for(self.root.stat().st_dev, time.time())
+        self.assertIsNotNone(census)
+        real_lstat = os.lstat
+
+        def lstat(path, *a, **k):  # the fleet user cannot stat into another account's home
+            if str(path).startswith(str(locked)):
+                raise PermissionError(errno.EACCES, "Permission denied", str(path))
+            return real_lstat(path, *a, **k)
+
+        with mock.patch.object(gd.os, "lstat", side_effect=lstat):
+            paths = [p for p, _, _ in gd.root_census_catalogue(census)]
+        self.assertIn(Path(gd.census_canon(str(locked / gd.CENSUS_FILES))), paths)  # its home, opened
+        residual = gd.root_census_residual(census)
+        self.assertNotIn("unreadable", residual)
+        self.assertIn(f"{self.root / 'System'} >=1.0G", residual)
+        # stale, or of another volume: not used
+        self.assertIsNone(gd.root_census_for(self.root.stat().st_dev, time.time() + gd.ROOT_CENSUS_MAX_AGE_S + 60))
+        self.assertIsNone(gd.root_census_for(-1, time.time()))
+
+    def test_only_root_runs_the_root_census(self) -> None:
+        with mock.patch.object(gd, "DARWIN", True), mock.patch.object(gd.os, "geteuid", return_value=501), \
+                mock.patch.object(gd, "census_pass", side_effect=AssertionError("walked")), \
+                contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(gd.main(["--root-census"]), 2)
 
 
 class MediaTourDerivedDataTest(unittest.TestCase):
