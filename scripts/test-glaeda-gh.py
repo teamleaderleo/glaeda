@@ -2300,7 +2300,9 @@ class DaemonTest(Base):
         self.daemon.transport = lambda *a: (attempts.append(a[1]), broken(*a))[1]
         for i in range(20):  # 40 s of ticks
             self.daemon.tick(NOW + i * gg.TICK)
-        self.assertEqual(len(attempts), 2)
+        # the PR over GraphQL, then once over REST in the same tick (GraphQL gave no answer: GQL_DOWN), and the run
+        self.assertEqual(len(attempts), 3, attempts)
+        self.assertEqual(sum(a.endswith("/graphql") for a in attempts), 1)
         self.assertIn("RemoteDisconnected", gg.read_cache("run:o/r/2")["error"])
 
         def explodes(method, url, headers, body):
@@ -2309,7 +2311,7 @@ class DaemonTest(Base):
         self.daemon.transport = lambda *a: (attempts.append(a[1]), explodes(*a))[1]
         for i in range(20):
             self.daemon.tick(NOW + gg.CYCLE + i * gg.TICK)
-        self.assertEqual(len(attempts), 4)
+        self.assertEqual(len(attempts), 5)
 
     def test_redirects_and_foreign_hosts_are_refused(self) -> None:
         with self.assertRaises(gg.WatchError):
@@ -13814,8 +13816,8 @@ class SpendByPathTest(Base):
         self.assertIn("pr  by pr o/r", lines[2])
 
 
-class SpendAlarmTest(Base):
-    """The pool and share alarms: a notice line and tell-coordinator, before the pool runs dry."""
+class AlarmBase(Base):
+    """A daemon on a pinned clock whose alarms go to a notice file and a fake tell-coordinator."""
 
     def setUp(self) -> None:
         super().setUp()
@@ -13849,6 +13851,10 @@ class SpendAlarmTest(Base):
     def notice_lines(self) -> list[dict]:
         path = self.notices / "glaeda-gh.jsonl"
         return [json.loads(x) for x in path.read_text().splitlines()] if path.exists() else []
+
+
+class SpendAlarmTest(AlarmBase):
+    """The pool and share alarms: a notice line and tell-coordinator, before the pool runs dry."""
 
     def seen(self, remaining: int, at: float, reset: float) -> None:
         self.daemon.now = at
@@ -17339,8 +17345,10 @@ class StaleDataTest(Base):
         starved = gg.daemon_starved(status)
         self.assertEqual(starved["kind"], "pr")
         self.assertFalse(starved["quota"])
-        # an unwaited (idle) PR's old data is its backoff, not starvation
+        # an unwaited (idle) PR's old data is its backoff, not starvation (nor a stalled loop: nobody read it lately)
         gg.write_json(gg.watch_dir() / gg.file_name(key), {"key": key})
+        idle = NOW + gg.CYCLE - gg.IDLE_BACKOFF_AFTER - 1
+        os.utime(gg.watch_dir() / gg.file_name(key), (idle, idle))
         with mock.patch.object(gg, "parse_pr", side_effect=AttributeError("bug")):
             status = self.daemon.tick(NOW + gg.CYCLE)
         self.assertIsNone(status["staleWaited"]["pr"])
@@ -20704,6 +20712,200 @@ class LandTest(Base):
         self.assertIn("head_unpinned", [h.get("event") for h in e["history"]])
         self.assert_merged_at(LB)
 
+    # -- due rows starved by the login's latch (huge-blue, 2026-11-18 17:18-19:53Z)
+
+    def stuck(self, n: int, wake_ago: float, judged_ago: float | None = None, kind: str = "retry",
+              seen: str | None = None, state: str = "waiting", after: list[str] | None = None) -> str:
+        """An open entry as huge-blue held them: KIND waiting, its wake WAKE_AGO s past (negative: ahead), judged
+        JUDGED_AGO s ago ("judged code=unreadable step=retry" a minute before the wake)."""
+        key = f"pr:o/r#{n}"
+        head = f"{n:x}".rjust(40, "a")
+        self.w.set_pr(key, land_pr(head), self.t - 600)
+        e = {"key": key, "repo": "o/r", "number": n, "created": self.t - 90000, "history": [], "mergeSha": "",
+             "reviewed": [], "state": state, "wait": {"kind": kind, "sha": head} if state == "waiting" else None,
+             "wakeAt": self.t - wake_ago if state == "waiting" else None, "head": head, "seenHead": head,
+             "seen": seen if seen is not None else gg.land_fingerprint(self.w.cache[key]),
+             "explain": {"at": self.t - (judged_ago if judged_ago is not None else wake_ago + 60), "ok": False,
+                         "code": "unreadable", "head": head, "action": {"kind": kind}},
+             "requester": f"host/lane{n}", "requesterFrom": "", "queuedBy": "", "gen": 1, "after": after or []}
+        self.q.entries[key] = e
+        self.q.save(e)
+        return key
+
+    def retries(self, n: int) -> None:
+        for _ in range(n):
+            self.w.answers.append((3, {"ok": False, "code": "unreadable", "reason": "merge-hold: refused: unreadable",
+                                       "next": "", "action": {"v": 1, "kind": "retry", "after_s": 120}}))
+
+    def explained(self) -> list[str]:
+        return [c[4] for c in self.w.explains()]
+
+    def test_due_rows_go_oldest_wake_first_ahead_of_rows_judged_only_for_a_change(self):
+        """No latch at all. Due rows (retry, woke 2-4 h ago) are judged before an entry judged only because its cache
+        changed (a wait on its checks, its wake ahead, last judged 26 h ago), oldest wake first: sorted by the last
+        judgment, the 22 rows judged at 17:17 sat behind 300 others."""
+        self.stuck(11, 4 * 3600)
+        self.stuck(12, 2 * 3600)
+        self.stuck(13, 3 * 3600)
+        self.stuck(21, -3600, judged_ago=26 * 3600, kind="pr", seen="an older fingerprint")
+        self.retries(4)
+        self.tick()
+        self.assertEqual(self.explained(), ["11", "13", "12", "21"])
+
+    def test_due_rows_under_a_cycling_latch_say_so_and_go_first_at_its_clear(self):
+        """The replay: three rows waiting kind=retry, their wake 2-4 h past, and the login's latch holding, clearing for
+        a moment (each row still in the reset spread), holding again, then clearing. Each row's status names the
+        latch; at its second window its requester is told once, naming lw#5944; at the next clear it goes at once,
+        oldest wake first, with no reset spread."""
+        logs: list[dict] = []
+        patches = [mock.patch.object(gg, "land_jitter", lambda key, reset=0.0: 90.0),
+                   mock.patch.object(gg, "log", logs.append)]
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+        keys = [self.stuck(11, 4 * 3600), self.stuck(12, 2 * 3600), self.stuck(13, 3 * 3600)]
+        reset1 = self.t + 600
+        self.latch("graphql", reset1)
+        self.tick(30)
+        self.assertEqual(self.w.explains(), [])
+        for k in keys:
+            e = self.q.entries[k]
+            self.assertEqual(e["latchHeld"]["windows"], 1)
+            self.assertIn(f"held by the login latch until {time.strftime('%H:%MZ', time.gmtime(reset1))}",
+                          gg.land_line(e, self.t))
+            self.assertIn("woke ", gg.land_line(e, self.t))
+        pool = [r for r in logs if r.get("event") == "land-pool"][-1]
+        self.assertEqual((pool["latched"], pool["due"], pool["dueLatchHeld"]), (3, 3, 3))
+        self.assertEqual(pool["oldestDue"]["pr"], "o/r#11")
+        self.assertGreaterEqual(pool["oldestDue"]["waitingS"], 4 * 3600)
+        for _ in range(5):  # the same window: no new history, no message
+            self.tick(60)
+        self.assertEqual([h["event"] for h in self.q.entries[keys[0]]["history"]].count("latch_held"), 1)
+        self.assertEqual(self.w.sent(), [])
+        self.q = self.queue()  # a re-exec inside the same hold: the same window, not a second one
+        self.tick(60)
+        self.assertEqual([self.q.entries[k]["latchHeld"]["windows"] for k in keys], [1, 1, 1])
+        self.assertEqual(self.w.sent(), [])
+        # It clears; every row's place in the reset spread is still ahead, and the login is spent again before it
+        self.tick(reset1 + 1 - self.t)
+        self.assertEqual(self.w.explains(), [])
+        reset2 = self.t + 1500
+        self.latch("rest", reset2)
+        self.tick(30)
+        self.assertEqual(self.w.explains(), [])
+        self.assertEqual([self.q.entries[k]["latchHeld"]["windows"] for k in keys], [2, 2, 2])
+        sent = self.w.sent()
+        self.assertEqual(sorted(s[3] for s in sent), ["host/lane11", "host/lane12", "host/lane13"])
+        self.assertTrue(all("latch" in s[-1] and "leo-workspace#5944" in s[-1] for s in sent), sent)
+        self.tick(60)
+        self.assertEqual(len(self.w.sent()), 3, "told once")
+        # The next clear: at once, past no spread, oldest wake first
+        self.retries(3)
+        self.tick(reset2 + 1 - self.t)
+        self.assertEqual(self.explained(), ["11", "13", "12"])
+        for k in keys:
+            e = self.q.entries[k]
+            self.assertNotIn("latchHeld", e)
+            self.assertIn("latch_released", [h["event"] for h in e["history"]])
+
+    def test_a_due_row_no_worker_takes_says_why_past_the_bound(self):
+        """No latch, every worker busy: a row past its wake by LAND_DUE_LATE gets one due_late in its history, its
+        status says every worker is busy, and the land-pool line counts it."""
+        logs: list[dict] = []
+        p = mock.patch.object(gg, "log", logs.append)
+        p.start()
+        self.addCleanup(p.stop)
+        self.w.config["workers"] = 1
+
+        class Busy:
+            def done(self) -> bool:
+                return False
+        self.q.jobs["pr:o/r#99"] = Busy()
+        key = self.stuck(11, 3 * 3600)
+        self.tick(30)
+        self.tick(30)
+        e = self.q.entries[key]
+        self.assertEqual([h["event"] for h in e["history"]].count("due_late"), 1)
+        self.assertIn("every worker busy", gg.land_line(e, self.t))
+        pool = [r for r in logs if r.get("event") == "land-pool"][-1]
+        self.assertEqual((pool["gated"], pool["dueLate"], pool["firstGated"]), (1, 1, "o/r#11"))
+        del self.q.jobs["pr:o/r#99"]
+        self.retries(1)
+        self.tick(30)
+        e = self.q.entries[key]
+        self.assertEqual(self.explained(), ["11"])
+        self.assertNotIn("dueLate", e)
+
+    def test_a_stopped_predecessor_merged_by_hand_is_still_read_for_its_follower(self):
+        """Review: an --after PR whose own entry stopped is read by nothing else once only due entries hold watches; its
+        follower must still read it (one peek per LAND_PEEK_EVERY), or a hand merge never shows and the follower stops
+        after_stopped a day later."""
+        a = self.stuck(2, 0, state="stopped")
+        self.q.entries[a]["stop"] = {"code": "block", "reason": "blocked", "at": self.t - 60}
+        e_key = self.stuck(11, 0, state="waiting_after", after=[a])
+        self.w.watched.clear()
+        self.tick(30)
+        self.assertIn(a, self.w.watched)
+        self.assertEqual(self.q.entries[e_key]["state"], "waiting_after")
+        self.w.set_pr(a, land_pr("b" * 40, state="MERGED"), self.t)  # what that read stores
+        self.retries(2)
+        self.tick(30)
+        self.assertEqual(self.explained(), ["11"])
+
+    def test_a_due_row_put_on_running_checks_drops_its_latch_mark(self):
+        """Review: a due row the latch held, then found with checks running, waits on a wake an hour ahead: it is not
+        due, so its status no longer says the latch holds it, and its windows do not carry into later latches."""
+        key = self.stuck(11, 0, state="queued")  # queued: due, its checks not read yet
+        self.latch("graphql", self.t + 300)
+        self.tick(30)
+        self.assertIn("latchHeld", self.q.entries[key])
+        self.clear_latch()
+        self.pr("b".rjust(40, "b"), key=key, checks=[("ci", "IN_PROGRESS", None)])
+        self.tick(30)
+        e = self.q.entries[key]
+        self.assertEqual((e["state"], e["wait"]["kind"]), ("waiting", "pr"))
+        self.assertNotIn("latchHeld", e)
+        self.assertNotIn("held by the login latch", gg.land_line(e, self.t))
+
+    def test_only_due_entries_hold_a_waited_pr_watch(self):
+        """huge-blue, 2026-11-18 20:00Z: 525 of 725 pr watches were the land queue's, each open entry's waited watch
+        renewed every 30 s, and no pr cache was read in 600 s. With 440 open entries for an hour: an entry waiting on
+        its checks or a wake ahead, or waiting_after, holds no waited watch, only one unwaited one-off read per
+        LAND_PEEK_EVERY; a due one is waited; a latched one asks for nothing."""
+        calls: list[tuple[str, bool, bool]] = []
+
+        def register(key: str, waited: bool = False, once: bool = False, **kw: Any) -> None:
+            calls.append((key, waited, once))
+        p = mock.patch.object(gg, "register", register)
+        p.start()
+        self.addCleanup(p.stop)
+        self.q = gg.LandQueue(run=self.w.run, cache_of=self.w.cache.get, nudge=self.nudge_read, inline=True,
+                              config=self.w.config, reads_upstream=lambda: False, refresh=self.refresh,
+                              behind=lambda *a: None, broker_client=lambda: False, snapshot_of=self.snaps.get)
+        n = 1000
+        for i in range(400):
+            self.stuck(n + i, -3 * 3600, kind="pr")  # waits on its checks, nothing changed
+        for i in range(400, 420):
+            self.stuck(n + i, -3 * 3600)  # a retry whose wake is ahead
+        for i in range(420, 440):
+            self.stuck(n + i, 0, state="waiting_after", after=[f"pr:o/r#{n + i - 420}"])
+        due = self.stuck(5000, 60)  # woke a minute ago: judged, and waited until then
+        self.retries(60)  # judged again at each retry wake
+        start = self.t
+        while self.t - start < 3600:
+            self.tick(30)
+        waited = {k for k, w, _ in calls if w}
+        peeks = [k for k, w, once in calls if not w and once]
+        self.assertEqual(waited, {due})
+        self.assertLessEqual(len(peeks), 440 * (3600 / gg.LAND_PEEK_EVERY + 1))
+        self.assertEqual(len(peeks), len(calls) - len([c for c in calls if c[1]]))
+        # Latched: nothing at all
+        calls.clear()
+        self.latch("graphql", self.t + 1200)
+        for _ in range(10):
+            self.tick(30)
+        self.assertEqual(calls, [])
+
     def test_an_entry_unparked_from_a_quota_park_reads_its_head_again(self):
         """The same for one entry's own quota park (park_quota): nothing is read for it while parked."""
         self.pr(LA)
@@ -21683,6 +21885,277 @@ class WaitFromBytecodeTest(unittest.TestCase):
                                   timeout=60)
             self.assertEqual(done.returncode, 0, done.stderr)
             self.assertTrue(list(Path(home, ".cache", "gh-quota", "pycache").rglob("*.pyc")))
+
+
+class RefreshStallTest(AlarmBase):
+    """huge-blue, 2026-11-17: the daemon's PR data reached 3585 s old (about 13:2xZ) and then 1392 s (about 14:5xZ) with
+    its heartbeat fresh, errors "graphql: HTTP 502" and "controller: URLError", at the 40 points/min GraphQL pace; a
+    session restarted it by hand both times. A GraphQL 502 only split the batch and left it for the next cycle: while
+    GitHub kept answering 502 nothing routed to GraphQL was read at all, though REST answered, and nothing in the
+    daemon said its refresh loop had stopped. The detector of this class ("daemon heartbeat fresh, data stale")."""
+
+    def watch(self, count: int, waited: int = 0) -> list[str]:
+        keys = []
+        for n in range(1, count + 1):
+            self.gh.prs[("o", "r", n)] = pr_node(n)
+            keys.append(f"pr:o/r#{n}")
+            gg.register(keys[-1], waited=n <= waited)
+        return keys
+
+    def keep_alive(self, keys: list[str], at: float, waited: int = 0) -> None:
+        """A reader's touch at AT (the fake clock): register() stamps the wall clock, never a future one."""
+        for n, key in enumerate(keys, 1):
+            path = gg.watch_dir() / gg.file_name(key)
+            if n <= waited:
+                gg.write_json(path, {**gg.read_json(path), "waitedAt": at})
+            os.utime(path, (at, at))
+
+    def answer_502(self, when: Any) -> list[int]:
+        """GraphQL PR queries answer 502 while when(prs) is true; every other request goes to the fake."""
+        sizes: list[int] = []
+
+        def transport(method, url, headers, body):
+            if url.endswith("/graphql"):
+                doc = json.loads(body)
+                prs = [v for k, v in doc["variables"].items() if re.fullmatch(r"n\d+", k)]
+                if "pullRequest(number:" in doc["query"] and when(prs):
+                    sizes.append(len(prs))
+                    return 502, {}, b'{"message": "Server Error"}'
+            return self.gh(method, url, headers, body)
+        self.daemon.transport = transport
+        return sizes
+
+    def newest_age(self, keys: list[str], now: float) -> float:
+        return min(now - ((gg.read_cache(k) or {}).get("dataAt") or float("-inf")) for k in keys)
+
+    def oldest_age(self, keys: list[str], now: float) -> float:
+        return max(now - ((gg.read_cache(k) or {}).get("dataAt") or float("-inf")) for k in keys)
+
+    def test_a_graphql_502_storm_reads_prs_over_rest_and_never_lets_their_data_age(self) -> None:
+        """The harness: 40 watched PRs (5 waited), the controller down (URLError), GitHub's GraphQL answering 502 to
+        every PR query for 30 minutes, one tick every TICK. Before: every PR's data aged the whole 30 minutes (1800 s,
+        the shape of huge-blue's 3585 s and 1392 s). Now: GraphQL is out within GQL_DOWN_SPAN, REST reads the PRs
+        every cycle, and no PR's data passes two cycles old; once GitHub answers again GraphQL is back."""
+        self.daemon.controller = FakeController()
+        self.daemon.controller.down = True
+        keys = self.watch(40, waited=5)
+        storm = {"on": True}
+        sizes = self.answer_502(lambda prs: storm["on"])
+        worst, out, unhealthy = 0.0, 0, 0
+        for i in range(0, 1800, gg.TICK):
+            now = NOW + i
+            self.keep_alive(keys, now, waited=5)
+            status = self.daemon.tick(now)
+            out += status["graphqlDown"] is not None
+            unhealthy += not status["healthy"]
+            if i >= gg.CYCLE:
+                worst = max(worst, self.oldest_age(keys, now))
+        self.assertLessEqual(worst, 2 * gg.CYCLE, "a PR's data aged past two cycles during the 502 storm")
+        self.assertIn("controller: URLError", " ".join(self.daemon.recent_errors))
+        self.assertGreater(out, 0, "GraphQL was taken out while it kept answering 502")
+        self.assertEqual(unhealthy, 0)
+        self.assertIsNone(self.daemon.valve_due, "nothing to restart: the PRs were read")
+        # bounded: GraphQL is tried again only after each hold, not a cascade of 502s every tick
+        self.assertLess(len(sizes), 60, len(sizes))
+        storm["on"] = False
+        for i in range(1800, 1800 + gg.GQL_DOWN_MAX + 3 * gg.CYCLE, gg.TICK):
+            self.keep_alive(keys, NOW + i, waited=5)
+            self.daemon.tick(NOW + i)
+            self.assertLessEqual(self.oldest_age(keys, NOW + i), 2 * gg.CYCLE)
+        self.assertFalse(self.daemon.gql_down(), "GraphQL is not held out once GitHub answers")
+
+    def test_the_502_storm_is_written_down_in_bounded_lines_naming_502_and_the_fallback(self) -> None:
+        """huge-blue 2026-11-17: the 502s were in daemon.json alone, not one journal line. The same 30-minute storm
+        (40 PRs, controller down) writes each failure kind in full once, then one counted line a minute: bounded, never
+        a line per PR per tick. `budget` prints the last few."""
+        self.daemon.controller = FakeController()
+        self.daemon.controller.down = True
+        keys = self.watch(40, waited=5)
+        self.answer_502(lambda prs: True)
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            for i in range(0, 1800, gg.TICK):
+                self.keep_alive(keys, NOW + i, waited=5)
+                self.daemon.tick(NOW + i)
+        lines = (gg.BASE / gg.REFRESH_LOG).read_text().splitlines()
+        self.assertEqual(err.getvalue().splitlines(), lines, "stderr (the journal) and the file carry the same lines")
+        self.assertLessEqual(len(lines), 120, f"{len(lines)} lines for a 30-minute storm")
+        text = "\n".join(lines)
+        self.assertIn("graphql: HTTP 502 on pr batch of", text)
+        self.assertNotIn("graphql: graphql:", text)
+        self.assertRegex(text, r"next: (REST reads it this tick|every GraphQL read goes to REST until \d\d:\d\d:\d\dZ)")
+        self.assertIn("controller: URLError", text)
+        self.assertRegex(lines[0], r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ glaeda-gh refresh: ")
+        self.assertRegex(text, r"\d+ more in the last \d+s", "repeats are counted, not repeated")
+        print(f"\n502 storm harness: {len(lines)} refresh-errors.log lines over 30 min", file=sys.__stderr__)
+        with mock.patch.object(gg, "daemon_running", return_value=True), \
+                mock.patch.object(gg, "daemon_stale", return_value=None), \
+                mock.patch.object(gg, "daemon_failing", return_value=None), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            gg.cmd_budget(False)
+        self.assertIn("last refresh failures", out.getvalue())
+        self.assertIn(lines[-1], out.getvalue())
+
+    def test_the_refresh_log_stays_under_its_cap(self) -> None:
+        with mock.patch.object(gg, "REFRESH_LOG_MAX", 4096), contextlib.redirect_stderr(io.StringIO()):
+            for n in range(2000):
+                gg.refresh_log_write(f"2026-11-17T14:52:03Z glaeda-gh refresh: graphql: HTTP 502 on line {n}")
+            size = (gg.BASE / gg.REFRESH_LOG).stat().st_size
+            lines = (gg.BASE / gg.REFRESH_LOG).read_text().splitlines()
+        self.assertLessEqual(size, 4096 + 100)
+        self.assertTrue(lines[-1].endswith("line 1999"), "the newest lines are kept")
+        self.assertTrue(all(line.startswith("2026-") for line in lines), "cut on a line boundary")
+        self.assertEqual(gg.refresh_log_tail(2), lines[-2:])
+
+    def test_one_pr_graphql_fails_alone_is_read_over_rest_and_graphql_stays_in(self) -> None:
+        """A PR GitHub answers 502 for every time (its query too heavy for GraphQL) costs its batch a split, is read
+        over REST, and never takes GraphQL out for the others: the halves without it answer every tick."""
+        keys = self.watch(12)
+        self.answer_502(lambda prs: 7 in prs)
+        for i in range(0, 20 * gg.CYCLE, gg.TICK):
+            self.keep_alive(keys, NOW + i)
+            self.daemon.tick(NOW + i)
+            self.assertFalse(self.daemon.gql_down(), i)
+        now = NOW + 20 * gg.CYCLE - gg.TICK
+        self.assertLessEqual(self.oldest_age(keys, now), 2 * gg.CYCLE, "PR 7 (or one batched with it) went stale")
+        self.assertEqual(gg.read_cache("pr:o/r#7")["data"]["number"], 7)
+        self.assertGreater(self.gh.full_reads, 0, "the other PRs still read over GraphQL")
+
+    def test_graphql_out_backs_off_doubling_and_one_clean_answer_ends_it(self) -> None:
+        d = self.daemon
+        for n in range(gg.GQL_DOWN_AFTER):
+            d.now = NOW + n * gg.GQL_DOWN_SPAN / (gg.GQL_DOWN_AFTER - 1)
+            d.note_gql_health("graphql: HTTP 502")
+        self.assertTrue(d.gql_down())
+        self.assertEqual(d.gql_down_until, d.now + gg.GQL_DOWN_BACKOFF)
+        d.now = d.gql_down_until + 1
+        self.assertFalse(d.gql_down(), "the hold ends: the next read tries GraphQL again")
+        d.note_gql_health("graphql: request failed: URLError")  # still down: out again at once, for twice as long
+        self.assertEqual(d.gql_down_until, d.now + 2 * gg.GQL_DOWN_BACKOFF)
+        for _ in range(10):
+            d.now = d.gql_down_until + 1
+            d.note_gql_health("graphql: HTTP 503")
+        self.assertEqual(d.gql_down_until - d.now, gg.GQL_DOWN_MAX, "the back-off is bounded")
+        d.note_gql_health("graphql: HTTP 504")  # too heavy, not down: says nothing either way
+        d.note_gql_health("graphql: request failed: TimeoutError")
+        self.assertTrue(d.gql_down())
+        d.note_gql_health(None)
+        self.assertFalse(d.gql_down())
+        self.assertEqual((d.gql_down_streak, d.gql_down_strikes), (0, 0))
+        # a burst inside GQL_DOWN_SPAN (one heavy PR's split cascade) does not take it out
+        for _ in range(gg.GQL_DOWN_AFTER + 2):
+            d.note_gql_health("graphql: HTTP 502")
+        self.assertFalse(d.gql_down())
+
+    def test_every_network_call_in_the_refresh_loop_is_bounded(self) -> None:
+        """GitHub: SOCKET_TIMEOUT per read and HTTP_DEADLINE per request (hard_deadline); the controller:
+        CONTROLLER_TIMEOUT and CONTROLLER_DEADLINE, and a down one is left alone with a bounded back-off."""
+        self.assertLessEqual(gg.HTTP_DEADLINE, gg.TICK_BUDGET)
+        self.assertLessEqual(gg.CONTROLLER_DEADLINE, gg.TICK * 5)
+        self.assertLess(gg.TICK_BUDGET + gg.HTTP_DEADLINE, gg.WATCHDOG_AFTER)
+        d = gg.Daemon(transport=self.gh, token=lambda: TOKEN, controller=FakeController())
+        d.controller.down = True
+        waits = []
+        for i in range(12):
+            d.now = NOW + i * gg.CONTROLLER_ABSENT
+            d.controller_down(gg.WatchError("controller: URLError"))
+            waits.append(d.controller_down_until - d.now)
+        self.assertEqual(max(waits), gg.CONTROLLER_ABSENT, waits)
+
+    def stalled(self, age: float) -> None:
+        self.daemon.started_tick = NOW - 2 * gg.STALE_DATA_AFTER
+        self.daemon.stale_waited = {"pr": None}
+        self.daemon.newest_data = {"pr": age}
+
+    def test_the_daemon_restarts_itself_when_no_pr_has_been_refreshed_for_600s(self) -> None:
+        """No wait blocked (so staleWaited says nothing), but the freshest live PR watch's data is past
+        STALE_DATA_AFTER: the refresh loop has stopped. Two ticks in a row and the valve re-executes the daemon."""
+        self.policy()
+        self.stalled(gg.STALE_DATA_AFTER - 1)
+        self.daemon.check_alarms()
+        self.assertEqual(self.told_lines(), [], "under the bound: nothing")
+        self.stalled(gg.STALE_DATA_AFTER + 100)
+        self.daemon.check_alarms()
+        self.assertIsNone(self.daemon.valve_due, "one tick is not yet a pattern")
+        self.assertIn("no PR has been refreshed for 700s", self.told_lines()[0])
+        self.daemon.now = NOW + gg.TICK
+        self.daemon.check_alarms()
+        self.assertEqual(self.daemon.valve_due, {"kind": "pr", "age": 700, "key": "newest", "ticks": 2,
+                                                   "cause": "stalled: no pr read stored in the last 600s"})
+        self.assertIn("restarting itself now", self.told_lines()[-1])
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            self.daemon.restart_self()
+        self.assertIn("no PR refreshed (stall_alarm)", out.getvalue())
+
+    def test_a_stall_the_budget_defers_says_so_and_never_restarts(self) -> None:
+        """#2109's stall alarm with this PR's deferral (huge-blue 2026-11-18 19:56Z: 740 pr reads deferred under the
+        REST share): the alarm names the deferral, not "none recorded" and a restart, and the valve does not restart."""
+        self.policy()
+        self.daemon.deferred = {f"pr:o/r#{n}" for n in range(740)}
+        self.daemon.defer_why["pr"] = (NOW, "the REST share (134 of 150)")
+        self.stalled(gg.STALE_DATA_AFTER + 100)
+        self.daemon.check_alarms()
+        self.daemon.now = NOW + gg.TICK
+        self.daemon.check_alarms()
+        self.assertIsNone(self.daemon.valve_due)
+        self.assertIn("740 pr reads deferred", self.told_lines()[-1])
+        self.assertNotIn("Recent errors: none recorded", self.told_lines()[-1])
+
+    def test_a_quota_stop_holds_the_stall_alarm_and_the_valve(self) -> None:
+        self.policy()
+        self.stalled(gg.STALE_DATA_AFTER * 3)
+        self.daemon.backoff = {"rest": NOW + 600, "graphql": NOW + 600}  # GitHub's own limits stop every read
+        for i in range(3):
+            self.daemon.now = NOW + i * gg.TICK
+            self.daemon.check_alarms()
+        self.assertIsNone(self.daemon.valve_due)
+        self.assertEqual(self.told_lines(), [])
+        self.assertEqual(self.daemon.stall_alarm(), "held")
+
+    def test_only_live_pr_watches_count_toward_the_pulse(self) -> None:
+        """An idle PR nobody waits on or has read lately is polled every IDLE_BACKOFF_MAX by design: its age is not
+        the loop's. A waited one, or one read lately, is due every cycle."""
+        self.gh.prs[("o", "r", 1)] = pr_node(1)
+        gg.register("pr:o/r#1")
+        self.daemon.clock_real = True
+        self.daemon.tick(NOW)
+        idle = NOW + gg.IDLE_BACKOFF_AFTER + 10
+        self.daemon.now = idle
+        entries = self.daemon.watches()
+        self.daemon.oldest_data(entries, set())
+        self.assertIsNone(self.daemon.newest_data["pr"])
+        self.keep_alive(["pr:o/r#1"], idle, waited=1)
+        self.daemon.oldest_data(self.daemon.watches(), set())
+        self.assertEqual(self.daemon.newest_data["pr"], idle - NOW)
+
+    def test_the_heartbeat_says_unhealthy_and_status_and_restart_report_it(self) -> None:
+        """A tick past the bound writes daemon.json healthy false and stalled; `budget` prints it, and daemon_starved
+        (what `restart` reads) counts newestData even with no wait blocked."""
+        keys = self.watch(3)
+        self.daemon.tick(NOW)
+        self.answer_502(lambda prs: True)
+        self.daemon.transport = lambda *a: (_ for _ in ()).throw(gg.WatchError("request failed: URLError"))
+        late = NOW + gg.STALE_DATA_AFTER + 60
+        self.keep_alive(keys, late)
+        self.daemon.started_tick = NOW - 2 * gg.STALE_DATA_AFTER
+        status = self.daemon.tick(late)  # REST and GraphQL both unreachable: nothing reads
+        self.assertFalse(status["healthy"])
+        self.assertEqual(status["stalled"]["kind"], "pr")
+        self.assertGreater(status["stalled"]["age"], gg.STALE_DATA_AFTER)
+        written = gg.read_json(gg.BASE / "daemon.json")
+        self.assertFalse(written["healthy"])
+        starved = gg.daemon_starved({**written, "at": time.time()})
+        self.assertIsNotNone(starved)
+        self.assertEqual(starved["kind"], "pr")
+        self.assertFalse(starved["quota"], starved)
+        with mock.patch.object(gg, "daemon_running", return_value=True), \
+                mock.patch.object(gg, "daemon_stale", return_value=None), \
+                mock.patch.object(gg, "daemon_failing", return_value=None), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            gg.cmd_budget(False)
+        self.assertIn("NOT HEALTHY: no PR refreshed for", out.getvalue())
+        # a new process starts healthy: the previous one's stall is not its own
+        gg.first_heartbeat()
+        self.assertNotIn("stalled", gg.read_json(gg.BASE / "daemon.json"))
 
 
 class ResetPaceTest(unittest.TestCase):

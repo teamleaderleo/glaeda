@@ -1217,6 +1217,7 @@ CMUX_NEXT_DRAIN_HOOK_SHA256 = frozenset({
     "52e9a71a38132cdf79e49f2b751940cb6b10dceededf16fa43ae28bf2cb05e72",
     "5bb42957d1041edc213fbd24fcb2c6e854c9b743fd55c9a417b4e9dd0b0bc3c5",
     "a5958215b862d5848961bd9fdf3b9c52ea14d0acbb1deadeddf0a59c67ccebd6",
+    "faa91672c9b5669cfc3e428f5b29c46ea21ee3c4fe6984a67167821a0964af39",
 })
 CMUX_NEXT_CI_PRESERVED_NAMES = frozenset({
     "SourcePackages", "ModuleCache.noindex", "SDKStatCaches.noindex",
@@ -5809,13 +5810,21 @@ class NoEvidence(Exception):
 
 
 def _owned_query(argv: list[str], timeout: float) -> tuple[int, str]:
-    """Run a bounded evidence query whose child can be killed by refresh expiry."""
+    """Run a bounded evidence query whose child can be killed by refresh expiry (stdout and stderr together)."""
+    code, out, _ = _owned_query_split(argv, timeout, apart=False)
+    return code, out
+
+
+def _owned_query_split(argv: list[str], timeout: float, apart: bool = True) -> tuple[int, str, str]:
+    """_owned_query with stderr kept APART from stdout: a parser reads stdout alone, so a warning on stderr (acpmux's
+    "other machines' sessions are not listed" where its relay is not on PATH) never spoils the JSON."""
     proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                            stderr=subprocess.STDOUT, text=True, start_new_session=True)
+                            stderr=subprocess.PIPE if apart else subprocess.STDOUT, text=True,
+                            start_new_session=True)
     _ACTIVE_QUERY_PROCS[proc.pid] = proc
     try:
-        output, _ = proc.communicate(timeout=timeout)
-        return proc.returncode, output
+        output, err = proc.communicate(timeout=timeout)
+        return proc.returncode, output, err or ""
     except BaseException:
         with contextlib.suppress(OSError):
             os.killpg(proc.pid, signal.SIGKILL)
@@ -6568,14 +6577,32 @@ ACPMUX_SESSION_TMP = "acpmux-session-tmp"
 TMP_WORKTREES = "tmp-worktrees"
 TMP_BSZ = "tmp-bsz"
 LANE_TMP_FAMILY_IDS = frozenset({ACPMUX_SESSION_TMP, TMP_WORKTREES, TMP_BSZ})
-SESSION_HOLD_FAMILY_IDS = LANE_TMP_FAMILY_IDS | {"claude-scratchpad"}
+# Trees agents leave directly in a Linux lane VM's home, one item per entry inside. Owners, as found (2026-11-18):
+# ~/out/<tag> and ~/out/<tag>.envargs are swift-linux-builder's linux-app.sh output (it `rm -rf`s and rebuilds a tag's
+# folder each build); its ~/out/.work is worktree_reclaim's (pressure_caches), so it is skipped here. No tool in the
+# fleet's repositories writes ~/lab-tmp, ~/lab-target (a CARGO_TARGET_DIR by its name, outside worktree_reclaim's
+# pressure_cargo_roots) or ~/lab-data: with no owner's rule they go by age, no holder and git safety, as /tmp/bsz.
+# ~/lanes and ~/lane-scratch are worktree_reclaim's (standalone clones, cargo targets, scratch globs): not here.
+# On a lane VM: gcp-agent-lane-2, 2026-11-18, ~/lab-tmp 32.9G, ~/lab-target 27.2G, ~/out 7.4G, ~/lab-data 5.3G.
+LANE_GIT_WORK_IDLE_HOURS = 12.0  # worktree-reclaim.json git_work_min_idle_hours: no lane's git work goes sooner
+LANE_HOME_TREES: tuple[tuple[str, str, str, str, dict[str, Any]], ...] = (
+    ("home-lab-tmp", "lab-tmp", "agent lab scratch (no owning tool)", "the lab run that left it runs again", {}),
+    ("home-lab-target", "lab-target", "an agent's CARGO_TARGET_DIR (no owning tool)", "cargo builds it again", {}),
+    ("home-lab-data", "lab-data", "agent lab data (no owning tool)", "the lab run that left it makes it again", {}),
+    ("home-out", "out", "swift-linux-builder linux-app.sh (~/out/<tag>)", "linux-app.sh builds the tag again",
+     {"skip": (".work",)}),
+)
+LANE_HOME_FAMILY_IDS = frozenset(t[0] for t in LANE_HOME_TREES)
+SESSION_HOLD_FAMILY_IDS = LANE_TMP_FAMILY_IDS | LANE_HOME_FAMILY_IDS | {"claude-scratchpad"}
 ACPMUX_DEAD_STATUSES = frozenset({"closed"})  # acpmux's own: a closed session's folder goes at its purge
 SESSION_ID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 SESSION_ENV_KEYS = ("ACPMUX_SESSION_ID",)
 SESSION_TMP_ENV_KEYS = ("TMPDIR", "ACPMUX_SESSION_TMPDIR")
 DEEP_MTIME_BUDGET = 400_000  # entries; a tree past it reads as used now (kept)
 ACPMUX_LS_TIMEOUT_S = 120
+ACPMUX_ERR_TAIL = 300  # characters of acpmux's stderr (or stdout) a "list unreadable" reason quotes
 _ACPMUX_ROWS: list[dict] | None | bool = False  # False: not read yet this run
+ACPMUX_ROWS_ERROR = ""  # why the last acpmux_rows() read failed; "" when it did not
 _SESSION_ENV: tuple[frozenset[str], frozenset[str]] | None | bool = False
 
 
@@ -6626,28 +6653,63 @@ def acpmux_home() -> Path:
 def acpmux_rows(fresh: bool = False) -> list[dict] | None:
     """This host's acpmux sessions (`acpmux ls --json`, no peer's), read once per run unless FRESH. [] where acpmux is
     not used (no program, no ~/.acpmux); None when it is used but its list cannot be read (every session is kept)."""
-    global _ACPMUX_ROWS
+    global _ACPMUX_ROWS, ACPMUX_ROWS_ERROR
     if not fresh and _ACPMUX_ROWS is not False:
         return _ACPMUX_ROWS  # type: ignore[return-value]
-    exe = shutil.which("acpmux") or (os.fspath(HOME / ".local/bin/acpmux")
-                                     if os.access(HOME / ".local/bin/acpmux", os.X_OK) else None)
-    rows: list[dict] | None
+    exe = acpmux_exe()
+    rows: list[dict] | None = None
+    error = ""
     if exe is None:
-        rows = None if acpmux_home().exists() else []
+        if acpmux_home().exists():
+            error = (f"no acpmux program on PATH ({os.environ.get('PATH', '')}) or in "
+                     + ", ".join(os.fspath(p) for p in acpmux_exe_candidates()))
+        else:
+            rows = []
     else:
+        argv = [exe, "ls", "--json", "--machine", "local", "--fields", "sessionId,agentSessionId,status,peer,cwd,name"]
+        shown = " ".join(argv)
         try:
-            code, out = _owned_query([exe, "ls", "--json", "--fields",
-                                      "sessionId,agentSessionId,status,peer,cwd,name"], ACPMUX_LS_TIMEOUT_S)
-            got = json.loads(out) if code == 0 else None
-            rows = got.get("sessions") if isinstance(got, dict) else None
-            if not isinstance(rows, list) or not all(isinstance(r, dict) for r in rows):
-                rows = None
-        except (OSError, ValueError, subprocess.TimeoutExpired):
-            rows = None
+            code, out, err = _owned_query_split(argv, ACPMUX_LS_TIMEOUT_S)
+            tail = " ".join(err.split())[-ACPMUX_ERR_TAIL:]
+            if code != 0:
+                error = f"`{shown}` exited {code}: {tail or '(no stderr)'}"
+            else:
+                got = json.loads(out)
+                found = got.get("sessions") if isinstance(got, dict) else None
+                if isinstance(found, list) and all(isinstance(r, dict) for r in found):
+                    rows = found
+                else:
+                    error = f"`{shown}` printed no session list: {' '.join(out.split())[:ACPMUX_ERR_TAIL]}"
+        except subprocess.TimeoutExpired:
+            error = f"`{shown}` did not answer in {ACPMUX_LS_TIMEOUT_S}s"
+        except ValueError as e:
+            error = f"`{shown}` printed no JSON ({e}): {' '.join(out.split())[:ACPMUX_ERR_TAIL]}"
+        except OSError as e:
+            error = f"`{shown}` could not run: {e}"
     if rows is not None:
         rows = [r for r in rows if not r.get("peer")]
     _ACPMUX_ROWS = rows
+    ACPMUX_ROWS_ERROR = error
     return rows
+
+
+def acpmux_exe_candidates() -> list[Path]:
+    """Where acpmux lives when PATH does not name it: a non-interactive `ssh host 'cmd'` (reach) or a bare `env -i`
+    shell carries only /usr/bin:/bin. ~/.local/bin is where the installer puts it; the agent shim dir and cargo's are
+    on an interactive PATH only."""
+    return [HOME / ".local/bin/acpmux", HOME / ".local/lib/gh-quota/bin/acpmux", HOME / ".cargo/bin/acpmux",
+            Path("/usr/local/bin/acpmux")]
+
+
+def acpmux_exe() -> str | None:
+    """This user's acpmux program: ACPMUX_BIN, then PATH, then acpmux_exe_candidates()."""
+    named = os.environ.get("ACPMUX_BIN")
+    if named and os.access(named, os.X_OK):
+        return named
+    found = shutil.which("acpmux")
+    if found:
+        return found
+    return next((os.fspath(p) for p in acpmux_exe_candidates() if os.access(p, os.X_OK)), None)
 
 
 def session_env(fresh: bool = False) -> tuple[frozenset[str], frozenset[str]] | None:
@@ -6699,7 +6761,7 @@ def session_hold(fam: Family, path: Path, cmds: str, fresh: bool = False) -> str
     mine = {os.fspath(path), real}
     rows = acpmux_rows(fresh)
     if rows is None:
-        return "acpmux session list unreadable: liveness unknown"
+        return f"acpmux session list unreadable: liveness unknown ({ACPMUX_ROWS_ERROR or 'no reason recorded'})"
     for r in rows:
         if r.get("status") in ACPMUX_DEAD_STATUSES or not isinstance(r.get("cwd"), str) or not r["cwd"]:
             continue
@@ -6730,6 +6792,124 @@ def session_hold(fam: Family, path: Path, cmds: str, fresh: bool = False) -> str
     if SESSION_ID_RE.fullmatch(name) and re.search(r"(?<![0-9a-f-])" + re.escape(name) + r"(?![0-9a-f-])", cmds):
         return "a running command names its session id"
     return ""
+
+
+# A repository in an item that something outside the item still uses keeps the whole item, whatever its family's git
+# rule (a mirror's bundle, build output's plain delete): a linked worktree's record (<repo>/worktrees/*/gitdir) naming
+# a tree that exists outside it, a checkout outside whose .git file points into it, or a repository outside whose
+# objects/info/alternates borrows its objects. gcp-agent-lane-2, 2026-11-18: the dry run marked /tmp/wt-rd (22.1G)
+# "reclaimable: its checkouts are mirrors" while its .wt-mirrors/manaflow-ai/cmux.git still served three checkouts
+# under ~/Projects/checkouts/cmux; the worktree guard ran only inside the bundle step at apply.
+GIT_HOLDER_WALK_BUDGET = 400_000  # entries; an item too large to search stays
+_GIT_OUTSIDE_INDEX: list[tuple[str, str, str]] | None = None  # (user outside, path it points to, how) per run
+
+
+def git_holder_family(fam: Family) -> bool:
+    """Families whose items may hold a repository others use: agent scratch, mirrors, a session's TMPDIR."""
+    return fam.reclaimable and (fam.git_disposable or fam.id in SESSION_HOLD_FAMILY_IDS)
+
+
+def _gitdir_pointer(dotgit: Path) -> str | None:
+    """The git dir a `.git` file points to (a linked worktree's or a submodule's), absolute; None if not one."""
+    try:
+        line = dotgit.read_text(errors="replace").splitlines()[0]
+    except (OSError, IndexError):
+        return None
+    if not line.startswith("gitdir:"):
+        return None
+    target = line.split(":", 1)[1].strip()
+    return os.path.normpath(os.path.join(os.fspath(dotgit.parent), target))
+
+
+def _alternates(gitdir: Path) -> list[str]:
+    try:
+        lines = (gitdir / "objects/info/alternates").read_text(errors="replace").splitlines()
+    except OSError:
+        return []
+    return [os.path.normpath(os.path.join(os.fspath(gitdir / "objects"), ln.strip()))
+            for ln in lines if ln.strip() and not ln.startswith("#")]
+
+
+def git_outside_index(fresh: bool = False) -> list[tuple[str, str, str]]:
+    """Who outside any item points into a repository: every checkout two levels under ~/Projects/checkouts (its .git
+    file's git dir, or its .git dir's alternates) and every wt mirror under ~/Projects/.wt-mirrors (alternates)."""
+    global _GIT_OUTSIDE_INDEX
+    if _GIT_OUTSIDE_INDEX is not None and not fresh:
+        return _GIT_OUTSIDE_INDEX
+    out: list[tuple[str, str, str]] = []
+    for co in glob.glob(os.fspath(HOME / "Projects/checkouts/*/*")):
+        dotgit = Path(co) / ".git"
+        if dotgit.is_file():
+            if (target := _gitdir_pointer(dotgit)):
+                out.append((co, target, "a checkout's .git file points into it"))
+        elif dotgit.is_dir():
+            out += [(co, alt, "a checkout borrows its objects (alternates)") for alt in _alternates(dotgit)]
+    mirrors = HOME / "Projects/.wt-mirrors"
+    for depth in ("*", "*/*", "*/*/*"):
+        for g in glob.glob(os.fspath(mirrors / depth)):
+            if g.endswith(".git") and os.path.isdir(g):
+                out += [(g, alt, "a wt mirror borrows its objects (alternates)") for alt in _alternates(Path(g))]
+    _GIT_OUTSIDE_INDEX = out
+    return out
+
+
+def git_used_from_outside(path: Path, fresh: bool = False, budget: int = GIT_HOLDER_WALK_BUDGET) -> str:
+    """Why an item must stay because a repository in it is used from outside it ("" when none is): see
+    GIT_HOLDER_WALK_BUDGET. Every repository at any depth is read (bare ones, *.git, .wt-mirrors, a checkout's .git);
+    a walk it cannot finish keeps the item."""
+    try:
+        if path.is_symlink() or not path.is_dir():
+            return ""
+    except OSError:
+        return ""
+    inside = os.path.realpath(path)
+    holders: list[str] = []
+
+    def outside_live(p: str) -> bool:
+        return os.path.lexists(p) and not _within(os.path.realpath(p), inside)
+
+    for user, target, how in git_outside_index(fresh):
+        if _within(os.path.realpath(target), inside) and outside_live(user):
+            holders.append(f"{user} ({how})")
+    stack = [inside]
+    while stack and len(holders) < 8:
+        d = stack.pop()
+        try:
+            with os.scandir(d) as it:
+                entries = list(it)
+        except FileNotFoundError:
+            continue
+        except OSError as e:
+            return f"a repository in it may be used from outside: cannot read {d} ({e.strerror or e})"
+        budget -= len(entries)
+        if budget < 0:
+            return "a repository in it may be used from outside: too large to search for linked worktrees"
+        names = {e.name for e in entries}
+        repo = "HEAD" in names and "objects" in names and "refs" in names
+        if repo and "worktrees" in names:
+            try:
+                records = list(os.scandir(os.path.join(d, "worktrees")))
+            except OSError as e:
+                return f"{d}: unreadable linked worktree records ({e.strerror or e}); kept"
+            for rec in records:
+                try:
+                    tree = os.path.dirname(Path(rec.path, "gitdir").read_text().strip())
+                except (OSError, ValueError):
+                    continue  # a record without gitdir names no tree
+                if tree and outside_live(tree):
+                    holders.append(f"{tree} (a linked worktree of {d})")
+        for e in entries:
+            if repo and e.name == "objects":
+                continue  # loose objects and packs: no repository below
+            try:
+                if e.is_dir(follow_symlinks=False):
+                    stack.append(e.path)
+            except OSError:
+                continue
+    if not holders:
+        return ""
+    return (f"a repository in it is used from outside: {', '.join(holders[:8])}"
+            + (" and more" if len(holders) >= 8 else "") + "; kept")
 
 
 def acpmux_daemon_roots(base: Path) -> list[Path]:
@@ -6776,6 +6956,13 @@ def lane_vm_families(tmp: Path, uid: int) -> list[Family]:
                        include=("bsz",), git_disposable=True, nested_git=True, min_idle_hours=window,
                        mirror_idle_hours=window, deep_mtime=True, owner="bundle-size analysis scratch (no owning tool)",
                        rebuild_minutes=2, platform="linux"))
+    for fam_id, name, owner, rebuild, extra in LANE_HOME_TREES:
+        root = HOME / name
+        if root.is_symlink() or not root.is_dir():
+            continue
+        fams.append(Family(fam_id, root, True, rebuild, files=True, git_disposable=True, nested_git=True,
+                           min_idle_hours=window, mirror_idle_hours=LANE_GIT_WORK_IDLE_HOURS, deep_mtime=True,
+                           owner=owner, rebuild_minutes=2, platform="linux", **extra))
     return fams
 
 
@@ -10233,6 +10420,8 @@ def _survey(families, idle_hours, min_bytes, known, evidence, defer_bulk=False,
             reasons.append("claude session active")
         if fam.id in SESSION_HOLD_FAMILY_IDS and not blind and (why := session_hold(fam, path, cmds)):
             reasons.append(why)
+        if git_holder_family(fam) and (why := git_used_from_outside(path)):
+            reasons.append(why)
         references = frozenset()
         if fam.reference_root is not None:
             key = os.fspath(fam.reference_root)
@@ -10847,7 +11036,14 @@ CENSUS_OWNERS: tuple[tuple[str, str], ...] = (
     ("/opt", "Homebrew and system packages (never reclaimed)"),
     ("/private/var/db", "macOS (never reclaimed)"),
     ("/private/var/folders", "per-user temporary and cache dirs (other accounts' are root-only)"),
-    (str(HOME / ".acpmux"), "acpmux sessions (acpmux_store_reclaim)"),
+    (str(HOME / ".acpmux"), "acpmux sessions (acpmux_store_reclaim takes only ~/.acpmux-supervised; see "
+                            "'owned elsewhere')"),
+    (str(HOME / ".acpmux-supervised"), "the app's acpmux sessions (acpmux_store_reclaim)"),
+    (str(HOME / "Projects/checkouts"), "wt checkouts (wt reclaim, worktree_reclaim; see 'owned elsewhere')"),
+    (str(HOME / "lanes"), "lane clones and their cargo targets (worktree_reclaim)"),
+    (str(HOME / "lane-scratch"), "lane scratch checkouts (worktree_reclaim)"),
+    (str(HOME / "Projects/lane-scratch"), "lane scratch checkouts (worktree_reclaim)"),
+    (str(HOME / "out/.work"), "swift-linux-builder component work (worktree_reclaim pressure_caches)"),
     (str(HOME / ".codex"), "Codex CLI state"),
     (str(HOME / ".claude"), "Claude Code state"),
     (str(HOME / "Applications"), "user-installed apps"),
@@ -11326,6 +11522,43 @@ def census_unreadable_named(census: dict[str, Any], shown: int = 3) -> str:
     return "; largest: " + ", ".join(named) if named else ""
 
 
+def unreadable_why(shown: str) -> str:
+    """Why the census could not read a tree, as this account sees it now: who owns it and its mode, or the first
+    folder below it this account cannot list. A lane VM, 2026-11-18: ~/lane-scratch 15.3G read as "unreadable" with no
+    reason, so nobody could tell a root-owned tree from a mode a tool set."""
+    path = shown[:-len(" (files)")] if shown.endswith(" (files)") else shown
+    try:
+        st = os.lstat(path)
+    except OSError as e:
+        return f"cannot stat: {e.strerror or e.__class__.__name__}"
+    owner = pwd_name(st.st_uid)
+    mode = f"mode {stat.S_IMODE(st.st_mode):04o}"
+    if not os.access(path, os.R_OK | os.X_OK):
+        mine = "" if st.st_uid == os.getuid() else f", not this account's ({pwd_name(os.getuid())})"
+        return f"owned by {owner}, {mode}{mine}"
+    budget = 20_000
+    for dirpath, dirnames, _ in os.walk(path, onerror=None):
+        for d in list(dirnames):
+            budget -= 1
+            full = os.path.join(dirpath, d)
+            try:
+                dst = os.lstat(full)
+            except OSError as e:
+                return f"{full}: {e.strerror or e.__class__.__name__}"
+            if stat.S_ISDIR(dst.st_mode) and not os.access(full, os.R_OK | os.X_OK):
+                return f"{full} is owned by {pwd_name(dst.st_uid)}, mode {stat.S_IMODE(dst.st_mode):04o}"
+        if budget < 0:
+            break
+    return f"owned by {owner}, {mode}; readable now (a file below could not be read, or it changed during the walk)"
+
+
+def pwd_name(uid: int) -> str:
+    try:
+        return pwd.getpwuid(uid).pw_name
+    except KeyError:
+        return f"uid {uid}"
+
+
 def census_coverage_row(census: dict[str, Any]) -> dict[str, Any]:
     merged: dict[str, list[Any]] = {}
     for key, row in census["rows"].items():
@@ -11335,7 +11568,9 @@ def census_coverage_row(census: dict[str, Any]) -> dict[str, Any]:
     ranked = sorted(merged.items(), key=lambda kv: -kv[1][0])
     children = [{"category": label, "bytes": size, "private": label.endswith(":private-user-data"),
                  "classification": kind,
-                 **({"owner": owner} if (owner := census_owner(label.split(":", 1)[1])) else {})}
+                 **({"owner": owner} if (owner := census_owner(label.split(":", 1)[1])) else {}),
+                 **({"why": unreadable_why(label.split(":", 1)[1])}
+                    if kind == "unreadable" and not label.endswith(":private-user-data") else {})}
                 for label, (size, kind) in ranked[:CENSUS_ROWS_SHOWN]
                 if size or kind != "unclassified"]  # an unreadable or skipped tree stays named at 0 bytes
     rest = sum(size for _, (size, _) in ranked[CENSUS_ROWS_SHOWN:])
@@ -12214,7 +12449,8 @@ def report(items: list[Item], fss: list[Fs], limit: int, idle_hours: float,
                 category = child.get("category", "unknown")
                 private = " private" if child.get("private") else ""
                 owner = f"  keep, owner: {child['owner']}" if child.get("owner") else ""
-                print(f"    {gib(int(child.get('bytes', 0))).strip()}  {category}{private}{owner}")
+                why = f"  ({child['why']})" if child.get("why") else ""
+                print(f"    {gib(int(child.get('bytes', 0))).strip()}  {category}{private}{owner}{why}")
     by_fam: dict[str, int] = {}
     for i in items:
         by_fam[i.family] = by_fam.get(i.family, 0) + i.bytes
@@ -12238,7 +12474,118 @@ def report(items: list[Item], fss: list[Fs], limit: int, idle_hours: float,
                 if DARWIN else f"not readable by uid {os.getuid()}; its items are skipped")
         print(f"\ncannot read {u}: permission denied ({hint})", file=sys.stderr)
     total_r = sum(i.bytes for i in items if i.verdict == "reclaimable")
+    if not DARWIN:
+        for line in owned_elsewhere_lines():
+            print(line)
     print(f"\nreclaimable now: {gib(total_r).strip()}  ->  glaeda-disk --apply")
+
+
+# What other tools own on a Linux lane VM, and what they would free. glaeda-disk never deletes in them: wt reclaim
+# and worktree_reclaim (run by the hygiene reconciler's timer, with their own owner, process and acpmux checks and the
+# shared cleaner lock) own ~/Projects/checkouts, ~/lanes, ~/lane-scratch and ~/out/.work, and acpmux_store_reclaim
+# owns only the app's supervised store (~/.acpmux-supervised). Starting them from here would only contend for that
+# lock, so the report reads what their last passes wrote and prints their commands. A lane VM, 2026-11-18: the plan
+# named ~/Projects/checkouts 104.6G and ~/.acpmux 56.5G as "keep" with no word on why or who frees them.
+WORKTREE_RECLAIM_STATE_REL = ".cache/worktree-reclaim"  # below HOME, read when called (tests move HOME)
+WORKTREE_RECLAIM_TOOL_REL = "Projects/leo-workspace/tools/worktree_reclaim.py"
+ACPMUX_SUPERVISED_REL = ".acpmux-supervised"
+OWNED_ELSEWHERE_REASONS = 6
+
+
+def _last_json_row(path: Path, kind: str, tail_bytes: int = 1 << 20) -> dict | None:
+    """The last row of KIND in a JSON-lines log, read from its last TAIL_BYTES only (the log grows for weeks)."""
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            fh.seek(max(0, fh.tell() - tail_bytes))
+            lines = fh.read().decode("utf-8", "replace").splitlines()
+    except OSError:
+        return None
+    for line in reversed(lines):
+        if f'"kind": "{kind}"' not in line and f'"kind":"{kind}"' not in line:
+            continue
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(row, dict):
+            return row
+    return None
+
+
+def checkout_keep_lines(now: float) -> list[str]:
+    """wt reclaim's and worktree_reclaim's last keep report (hygiene_reconciler writes it each full pass): what they
+    keep in the checkouts, grouped by the first reason."""
+    try:
+        report = json.loads(((HOME / WORKTREE_RECLAIM_STATE_REL) / "checkout-keep-report.json").read_text())
+        rows = [r for r in report["rows"] if isinstance(r, dict)]
+    except (OSError, ValueError, KeyError, TypeError):
+        return ["  checkouts: no keep report (hygiene_reconciler writes "
+                f"{(HOME / WORKTREE_RECLAIM_STATE_REL) / 'checkout-keep-report.json'} each full pass)"]
+    total = sum(int(r.get("bytes") or 0) for r in rows)
+    by: dict[str, list[int]] = {}
+    for r in rows:
+        why = (r.get("reasons") or ["(no reason)"])[0].split(";")[0].split(": gh")[0].strip()[:100]
+        hit = by.setdefault(why, [0, 0])
+        hit[0] += int(r.get("bytes") or 0)
+        hit[1] += 1
+    at = report.get("at")
+    age = ""
+    with contextlib.suppress(TypeError, ValueError):
+        import datetime as _dt
+        stamp = _dt.datetime.fromisoformat(at.replace("Z", "+00:00")).timestamp() if isinstance(at, str) \
+            else float(at)
+        age = f", {max(0.0, (now - stamp) / 3600):.1f}h old"
+    out = [f"  checkouts and scratch: wt reclaim and worktree_reclaim keep {gib(total).strip()} in {len(rows)} "
+           f"(their keep report{age}), by first reason:"]
+    for why, (size, n) in sorted(by.items(), key=lambda kv: -kv[1][0])[:OWNED_ELSEWHERE_REASONS]:
+        out.append(f"    {gib(size)}  {n:3d}  {why}")
+    return out
+
+
+def acpmux_store_lines() -> list[str]:
+    """This daemon's session store and whether acpmux_store_reclaim judges it (only ~/.acpmux-supervised)."""
+    home = acpmux_home()
+    real = os.path.realpath(home)
+    if _within(real, os.path.realpath(HOME / ACPMUX_SUPERVISED_REL)):
+        return [f"  acpmux store {home}: acpmux_store_reclaim archives and purges its closed sessions"]
+    rows = acpmux_rows()
+    sessions = home / "sessions"
+    if rows is None:
+        return [f"  acpmux store {sessions}: no pass reclaims it (acpmux_store_reclaim takes only {HOME / ACPMUX_SUPERVISED_REL}); "
+                f"its closed sessions are unknown: {ACPMUX_ROWS_ERROR or 'session list unreadable'}"]
+    closed = [sessions / r["sessionId"] for r in rows
+              if r.get("status") in ACPMUX_DEAD_STATUSES and isinstance(r.get("sessionId"), str)
+              and SESSION_ID_RE.fullmatch(r["sessionId"]) and (sessions / r["sessionId"]).is_dir()]
+    size = None
+    if closed:
+        with contextlib.suppress(OSError, subprocess.TimeoutExpired, ValueError):
+            code, out, _ = _owned_query_split(["du", "-sck", "--", *map(os.fspath, closed)], 120)
+            if code == 0 and out.strip():
+                size = int(out.strip().splitlines()[-1].split()[0]) * 1024
+    shown = gib(size).strip() if size is not None else "size unknown"
+    return [f"  acpmux store {sessions}: {len(closed)} closed sessions hold {shown}; no pass reclaims them here "
+            f"(acpmux_store_reclaim takes only {HOME / ACPMUX_SUPERVISED_REL}, the app's daemon; acpmux has no purge command)"]
+
+
+def owned_elsewhere_lines(now: float | None = None) -> list[str]:
+    """The report's 'owned elsewhere' section (see WORKTREE_RECLAIM_STATE_REL)."""
+    now = time.time() if now is None else now
+    out = ["\nowned elsewhere (report only: glaeda-disk never deletes in these, nor starts their tools)"]
+    out += checkout_keep_lines(now)
+    last = _last_json_row((HOME / WORKTREE_RECLAIM_STATE_REL) / "log.jsonl", "summary")
+    if last:
+        out.append(f"  worktree_reclaim's last pass: {last.get('mode', '?')} at {last.get('at', '?')}, freed "
+                   f"{last.get('freed_gb', 0)} GB" + (f" ({last['skipped']})" if last.get("skipped") else ""))
+    if acpmux_home().is_dir() and _within(os.path.realpath(acpmux_home()), os.path.realpath(HOME)):
+        out += acpmux_store_lines()
+    if (HOME / WORKTREE_RECLAIM_TOOL_REL).is_file():
+        tool = os.fspath(HOME / WORKTREE_RECLAIM_TOOL_REL).replace(os.fspath(HOME), "~", 1)
+        out.append(f"  dry run: python3 {tool} plan   (skipped while the hygiene reconciler holds the cleaner lock)")
+        out.append(f"  apply:   python3 {tool} pressure   (its timer: ai.leo-workspace.hygiene-reconciler)")
+    else:
+        out.append(f"  worktree_reclaim is not installed here ({HOME / WORKTREE_RECLAIM_TOOL_REL})")
+    return out
 
 
 def notify_disk(title: str, body: str) -> None:
@@ -12563,6 +12910,7 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
                     and artifact_referenced(p, fresh_artifact_references(fam.reference_root)))
                 or (i.family == "claude-scratchpad" and claude_session_active(p.name, idle_window(fam, idle_hours) * 3600))
                 or (fam.id in SESSION_HOLD_FAMILY_IDS and session_hold(fam, p, cmds, fresh=True))
+                or (git_holder_family(fam) and git_used_from_outside(p, fresh=True))
                 or (i.family == SPM_SCRATCH and spm_scratch_held(p))
                 or (i.family == SEED_ROOT_FAMILY and seed_root_held(fam, p))
                 or (i.family == CANONICAL_ADMISSION and canonical_root_held(p))

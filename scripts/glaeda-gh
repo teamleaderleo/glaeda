@@ -239,8 +239,12 @@ a new one. A daemon waiting for the lock stops a holder silent for STALE_HEARTBE
 serve, checked first) and takes over. `serve` refuses to start from a shell while the LaunchAgent or
 systemd unit is loaded, unless given --foreground-ok: sessions never run their own. A cycle that raises still writes the heartbeat, with the error's type and
 code site under "failing"; once cycles have failed for FAILING_AFTER seconds, clients exit 3 and
-name the error instead of waiting on a daemon that refreshes nothing. The daemon re-executes itself when this file changes, so an update takes
-effect without a restart.
+name the error instead of waiting on a daemon that refreshes nothing. A heartbeat over a loop that reads nothing is
+not health: when even the freshest live PR watch's data passes STALE_DATA_AFTER and the quota does not explain it,
+daemon.json says "healthy": false and "stalled", `budget` prints NOT HEALTHY, and two such ticks re-execute the daemon
+(the stale valve). GraphQL answering 5xx (or not at all) sends its reads to REST: at once for an entry that cannot be
+split further, and for every entry while GraphQL is out (GQL_DOWN_AFTER, "graphqlDown"). The daemon re-executes itself
+when this file changes, so an update takes effect without a restart.
 
 - `land` is the land queue. A lane says `glaeda-gh land OWNER/REPO#N` once (idempotent per PR: again updates
   --after and --notify) and the daemon lands it: it asks `merge_hold.py explain R N --sha HEAD --json` at the head the
@@ -470,8 +474,32 @@ SLOW = re.compile(r"HTTP 504|[Tt]imeout|timed out|[Rr]esource limits")  # the qu
 # next cycle. batched() halves the batch (down to 1, not GQL_BATCH_MIN: a PR this heavy is the point of reading it
 # alone) and re-reads only the partial entries at the smaller size; GQL_GROW_AFTER clean queries grow it back by one.
 RESOURCE_LIMITS = "RESOURCE_LIMITS_EXCEEDED"
-FLAKY = re.compile(r"HTTP 50[23]")  # GitHub hiccuped: split and retry, but the size was not the cause
 HEAVY_AFTER = 3  # lone timeouts in a row after which a heavy entry is read only every LEAN_FACTOR cycles
+# GraphQL down, REST up. huge-blue 2026-11-17: GitHub's GraphQL answered 502 for long stretches (and the controller
+# URLError) and waited PR data reached 3585 s, then 1392 s old, with the heartbeat fresh, both times until a session
+# restarted the daemon. A 502 only split the batch and left it for the next cycle, so a kind routed to GraphQL was
+# never read at all while it lasted, though REST answered. Now an entry GraphQL fails with a 5xx (or no answer at all)
+# that cannot be split further is read over REST this tick, and GQL_DOWN_AFTER such failures in a row over at least
+# GQL_DOWN_SPAN with no clean GraphQL answer between take GraphQL out for GQL_DOWN_BACKOFF (doubling to GQL_DOWN_MAX
+# while the first query after each hold fails again): its reads go to REST at once instead of each spending ~10 s of
+# the tick on another 502. One clean answer ends it. The span keeps one PR GitHub fails alone from taking GraphQL out
+# for everyone: the split halves without it answer, every tick.
+GQL_DOWN_AFTER = 3
+GQL_DOWN_SPAN = 60
+# Every refresh failure is written down where it can be read after the fact (huge-blue 2026-11-17: the 502s were only
+# in daemon.json's health record, not one journal line, so nobody could read the stall afterwards): one line on stderr
+# (the journal, or launchd's log) and in BASE/refresh-errors.log, with the UTC time, the source, the error, what it hit
+# and what happens next. The first failure of a (source, error) prints in full, then one line per REFRESH_NOTE_EVERY
+# with the count, so a 30-minute 502 storm is a few dozen lines, not one per PR per tick. The file is cut to its
+# newest half past REFRESH_LOG_MAX; `glaeda-gh budget` prints its last REFRESH_LOG_SHOWN lines.
+REFRESH_NOTE_EVERY = 60
+REFRESH_LOG = "refresh-errors.log"
+REFRESH_LOG_MAX = 1024 * 1024
+REFRESH_LOG_SHOWN = 5
+GQL_DOWN_BACKOFF = 60
+GQL_DOWN_MAX = 600
+# GitHub failed the query (a 5xx, or no answer): split and retry, then REST. A 504 or a timeout is SLOW instead.
+GQL_DOWN = re.compile(r"HTTP 5(?!04)\d\d|request failed: (?!TimeoutError)")
 MAX_BODY = 8 * 1024 * 1024
 WAIT_POLL = 3  # clients re-read the cache this often
 TOUCH_EVERY = 30  # clients refresh their interest this often
@@ -3506,6 +3534,12 @@ class Daemon:
         self.clean: dict[str, int] = {kind: 0 for kind in CYCLES}  # clean GraphQL queries in a row
         # key -> {"at": last lone read, "fails": lone timeouts in a row, "oks": lone answers in a row}
         self.heavy: dict[str, dict] = {}
+        self.gql_down_streak = 0  # GraphQL answers in a row that were a 5xx or no answer (GQL_DOWN)
+        self.gql_down_since = 0.0  # when the first of them came
+        self.gql_down_strikes = 0  # times GraphQL was taken out since its last clean answer: each doubles the next
+        self.gql_down_until = 0.0  # GraphQL reads go to REST until then (gql_down)
+        self.refresh_notes: dict[tuple[str, str], dict] = {}  # (source, error) -> rate-limit state (refresh_note)
+        self.newest_data: dict[str, float | None] = {}  # oldest_data's: per kind, the freshest live watch's data age
         self.since: dict[str, float] = {}  # key -> when the daemon first saw it watched, for oldestData
         self.stale_waited: dict[str, float | None] = {}  # oldest_data's, for the watches a wait is blocked on
         self.explained_at: dict[str, float] = {}  # kind -> the last tick stale_explained(kind) explained its old data
@@ -3892,13 +3926,17 @@ class Daemon:
         back (quota_hold), {"why": the reason, "quota": True when it stops the reads}. daemon_starved, the stale
         alarm and `restart` say it instead of calling old data a fault."""
         out = {}
-        for kind, age_s in (getattr(self, "stale_waited", None) or {}).items():
-            if isinstance(age_s, (int, float)) and age_s > STALE_DATA_AFTER and self.quota_hold(kind) is None:
+        ages = {k: v for k, v in (getattr(self, "stale_waited", None) or {}).items() if isinstance(v, (int, float))}
+        for kind, age_s in (getattr(self, "newest_data", None) or {}).items():  # a stalled loop too (stall_alarm)
+            if isinstance(age_s, (int, float)):
+                ages[kind] = max(ages.get(kind, 0.0), age_s)
+        for kind, age_s in ages.items():
+            if age_s > STALE_DATA_AFTER and self.quota_hold(kind) is None:
                 held = self.deferral(kind)
                 if held is not None:  # a budget defers the reads: a restart cannot read sooner (daemon_starved)
                     out[kind] = {"why": held["text"], "quota": True, "deferred": held["deferred"]}
                     continue
-            if isinstance(age_s, (int, float)) and age_s > STALE_DATA_AFTER:
+            if age_s > STALE_DATA_AFTER:
                 hold = self.quota_hold(kind)
                 if hold is not None:
                     out[kind] = {"why": hold[0], "quota": hold[1]}
@@ -3932,6 +3970,35 @@ class Daemon:
                 f"(over {STALE_DATA_AFTER}s; oldest {key_name(where) if where != '?' else '?'}) while its heartbeat is "
                 f"fresh.{quota} Reads: {cause['text']}.{said} {advice} {STALE_DUMP_ADVICE}.")
         return level, text, {"kind": kind, "age": age_s, "key": where, "cause": cause["verdict"],
+                             **({"quota": hold[0]} if hold else {})}
+
+    def stall_alarm(self) -> tuple[str, str, dict] | str | None:
+        """The refresh loop's own pulse, beside stale_alarm (which needs a wait blocked on old data): when even the
+        freshest PR data of a live watch (newest_data: one a wait is on or someone read lately, each due every cycle)
+        is older than STALE_DATA_AFTER, no PR has been refreshed in that long, whatever the heartbeat says. The same
+        verdicts as stale_alarm ("held" while the quota or an upstream explains it), so the valve restarts the daemon
+        on it. huge-blue 2026-11-17: PR data 3585 s and 1392 s old, heartbeat fresh, restarted by hand both times."""
+        age_s = (getattr(self, "newest_data", None) or {}).get("pr")
+        if not isinstance(age_s, (int, float)) or age_s <= STALE_DATA_AFTER:
+            return None
+        if self.stale_explained("pr") is not None or self.catching_up("pr") is not None:
+            return "held"
+        age_s = int(age_s)
+        level = "fire" if age_s >= 3 * STALE_DATA_AFTER else "warn"
+        errors = "; ".join(list(getattr(self, "recent_errors", {}))[:3]) or "none recorded"
+        hold = self.quota_hold("pr")
+        quota = f" Quota: {hold[0]}." if hold else ""
+        down = (f" GraphQL is out until {dt.datetime.fromtimestamp(self.gql_down_until, dt.timezone.utc):%H:%MZ} "
+                "(5xx answers), so PRs read over REST." if self.gql_down() else "")
+        # Why the reads did not happen (stall_cause), as stale_alarm says it: a budget that defers them is no fault a
+        # restart fixes, and the valve does not restart for it (stale_valve, "deferred")
+        cause = self.stall_cause("pr")
+        advice = STALE_DEFERRED_ADVICE if cause["verdict"] == "deferred" else STALE_RESTART_ADVICE
+        said = "" if cause["verdict"] == "deferred" and errors == "none recorded" else f" Recent errors: {errors}."
+        text = (f"{level.upper()} glaeda-gh on {policy_host()}: no PR has been refreshed for {age_s}s (over "
+                f"{STALE_DATA_AFTER}s; the freshest live PR watch's data is that old) while its heartbeat is fresh."
+                f"{quota}{down} Reads: {cause['text']}.{said} {advice} {STALE_DUMP_ADVICE}.")
+        return level, text, {"kind": "pr", "age": age_s, "key": "newest", "stall": True, "cause": cause["verdict"],
                              **({"quota": hold[0]} if hold else {})}
 
     def note_explained(self) -> None:
@@ -4009,8 +4076,10 @@ class Daemon:
                   "ran": True, "valve": True, **{k: due.get(k) for k in ("kind", "age", "key")},
                   **({"cause": due["cause"]} if "cause" in due else {})}
         write_json(BASE / "restart.json", record)
-        log({"event": "restart", "why": "stale valve",
-             **{k: due.get(k) for k in ("kind", "age", "key", "ticks")},
+        why = "stale valve: no PR refreshed (stall_alarm)" if due.get("key") == "newest" else "stale valve"
+        refresh_log_write(f"{utc_stamp(self.clock())} glaeda-gh refresh: {due.get('kind')} data {due.get('age')}s old "
+                          f"({why}, {due.get('ticks')} ticks); next: the daemon re-executes itself now")
+        log({"event": "restart", "why": why, **{k: due.get(k) for k in ("kind", "age", "key", "ticks")},
              **({"cause": due["cause"]} if "cause" in due else {})})
         return record
 
@@ -4059,7 +4128,11 @@ class Daemon:
             if share is not None:
                 firing["share"] = share
         if policy.get("stale", True):
-            stale = self.stale_valve(self.stale_alarm(), policy)
+            verdict = self.stale_alarm()
+            if not isinstance(verdict, tuple):  # no wait starved: the refresh loop itself may still be (stall_alarm)
+                stall = self.stall_alarm()
+                verdict = stall if stall is not None else verdict
+            stale = self.stale_valve(verdict, policy)
             if stale == "held":
                 held.add("stale")
             elif stale is not None:
@@ -5873,6 +5946,11 @@ class Daemon:
                 break  # (cut off before its first request, it was not read: it keeps its place, first next tick)
             except Exception as error:  # noqa: BLE001
                 self.errors.append(f"{e['key']}: {describe(error)}")
+                self.refresh_note("rest", describe(error), key_name(e["key"]), "retry next cycle")
+            else:
+                stored = read_cache(e["key"]) or {}
+                if stored.get("error") and stored.get("fetchedAt") == self.now:
+                    self.refresh_note("rest", stored["error"], key_name(e["key"]), "retry next cycle")
             if self.mode("rest") == "stop" and (read_cache(e["key"]) or {}).get("error"):
                 # this read is the one that ran REST out: GraphQL reads it, and the rest, this tick
                 self.to_graphql(over_rest[i:], spilled)
@@ -6017,6 +6095,7 @@ class Daemon:
         self.confirm_tried = {k: t for k, t in self.confirm_tried.items() if self.now - t[0] < 2 * IDLE_EXPIRY}
         oldest = self.oldest_data(entries, {e["key"] for e in prs + runs + comments + heads})
         self.note_explained()  # before check_alarms: the stale alarm and the valve read it (catching_up)
+        self.flush_refresh_notes()
         # errors[] is this tick's only, and a heartbeat tick writes it empty: what failed a minute ago stays visible
         for message in self.errors:
             self.recent_errors[message] = self.now
@@ -6067,6 +6146,9 @@ class Daemon:
                   "spendBy": self.spend_by(), "alarms": self.alarms,
                   "perMinute": {b: round(self.richness(b) * 60, 1) for b in ("rest", "graphql")},
                   "batch": dict(self.batch), "oldestData": oldest, "deferred": len(self.deferred),
+                  "newestData": dict(self.newest_data),
+                  "graphqlDown": {"until": round(self.gql_down_until, 3), "strikes": self.gql_down_strikes}
+                  if self.gql_down() else None,
                   "staleWaited": dict(self.stale_waited), "staleAfter": STALE_DATA_AFTER,
                   "staleWhy": self.stale_why(), "progress": self.progress(), "staleCause": self.stale_causes(),
                   "staleExplainedAt": {k: round(t, 3) for k, t in self.explained_at.items()},
@@ -6076,6 +6158,12 @@ class Daemon:
                              "pause": self.content_pause_status()}}
         if self.upstream_status is not None:
             status["upstream"] = self.upstream_status
+        # A fresh heartbeat over a refresh loop that reads nothing is not health: say so in the heartbeat itself, so
+        # `budget`, `restart` and a wait's daemon_starved see it (stall_alarm; "held" when the quota explains it).
+        stall = self.stall_alarm()
+        status["healthy"] = stall is None
+        if stall is not None:
+            status["stalled"] = {"kind": "pr", "age": int(self.newest_data["pr"] or 0), "explained": stall == "held"}
         # the heartbeat lets clients tell a hung daemon (lock held, nothing written) from an idle one
         recovered, self.failing = self.failing is not None, None
         if recovered or prs or runs or comments or heads or self.errors or self.now - self.beat >= HEARTBEAT_EVERY:
@@ -6402,7 +6490,8 @@ class Daemon:
         the batch grows back. A 502 or 503 is split and retried without shrinking. GQL_SPLITS bounds
         the extra queries a tick spends on splitting; what is left waits for the next cycle. Returns the
         entries left unread because GraphQL stopped (its quota, or a throttle) partway, the one that hit it
-        included, for the caller to read over REST."""
+        included, for the caller to read over REST, and the entries GraphQL failed with a 5xx or no answer that could
+        not be split further, or every entry while GraphQL is out (gql_down): REST reads them this tick (GQL_DOWN)."""
         self.heavy = {k: h for k, h in self.heavy.items() if self.now - h["at"] < IDLE_EXPIRY}
         size = self.batch[kind]
         alone, rest = [], []
@@ -6414,10 +6503,11 @@ class Daemon:
                 alone.append([e])
         queue = alone + [rest[i:i + size] for i in range(0, len(rest), size)]
         splits, shrunk = 0, False
+        to_rest: list[dict] = []
         while queue:
             chunk = queue.pop(0)
-            if self.mode("graphql") == "stop":
-                return chunk + [e for c in queue for e in c]
+            if self.mode("graphql") == "stop" or self.gql_down():
+                return to_rest + chunk + [e for c in queue for e in c]
             if not self.gql_room():
                 # Over the per-minute ceiling: the rest wait, first next tick. Not REST's to read: GraphQL is not
                 # spent, only paced, and a REST spill of a whole post-reset refresh would be the same burst there.
@@ -6426,7 +6516,7 @@ class Daemon:
                            f"{self.policy.get('graphqlPerMinute', GRAPHQL_PER_MINUTE)} points this minute")
                 if getattr(self, "gql_paced", None) is None:
                     self.gql_paced = kind
-                return []
+                return to_rest
             self.gql_limited = False
             self.gql_reason = kind
             repos = sorted({caller_of(e["key"])[1] for e in chunk})
@@ -6438,7 +6528,7 @@ class Daemon:
                 limited, self.limited = self.limited, []
             except OutOfTime:
                 self.defer(chunk + [e for c in queue for e in c], f"the tick's {TICK_BUDGET} s read budget ran out")
-                return []
+                return to_rest
             except Exception as failure:  # noqa: BLE001  one bad batch must not stop the rest
                 # A bug on one entry's answer (an AttributeError on a null node, huge-blue 2026-11-11) used to drop the
                 # whole chunk here with nothing stored: every PR in it kept its old data, errors[] was empty again by the
@@ -6460,9 +6550,9 @@ class Daemon:
             if (error or self.gql_limited) and self.mode("graphql") == "stop":
                 # this query hit the limit (a RATE_LIMITED answer can still carry data.rateLimit and null aliases):
                 # whatever it stored for them, REST reads them this tick and replaces it
-                return chunk + [e for c in queue for e in c]
+                return to_rest + chunk + [e for c in queue for e in c]
             if spilled:
-                return spilled + [e for c in queue for e in c]
+                return to_rest + spilled + [e for c in queue for e in c]
             if limited:
                 # Partial: not a clean query, and the batch was too big for these entries. Halve it, then re-read only
                 # the partial ones at a size below this chunk's (so a re-read ends at one entry alone), within
@@ -6484,7 +6574,17 @@ class Daemon:
                 size = self.batch[kind]
                 queue = redo + [left[i:i + size] for i in range(0, len(left), size)]
                 continue
+            down = bool(error and GQL_DOWN.search(error))  # a 5xx or no answer: not the entries' doing
+            if error and (down or SLOW.search(error)):
+                what = (f"{kind} {key_name(chunk[0]['key'])}" if len(chunk) == 1
+                        else f"{kind} batch of {len(chunk)} ({', '.join(repos)})")
+                then = ("REST reads it this tick" if down and (len(chunk) < 2 or splits + 2 > GQL_SPLITS)
+                        else "split into halves and retried" if len(chunk) >= 2 and splits + 2 <= GQL_SPLITS
+                        else "read alone, next cycle")
+                self.refresh_note("graphql", error, what, then)
             if len(chunk) == 1 and chunk[0]["key"] in self.heavy or (len(chunk) == 1 and error and SLOW.search(error)):
+                if down:
+                    to_rest += chunk
                 # a lone read says nothing about the batch size; it only judges this entry
                 h = self.heavy.setdefault(chunk[0]["key"], {"at": self.now, "fails": 0, "oks": 0})
                 h["at"] = self.now
@@ -6502,7 +6602,10 @@ class Daemon:
                     self.clean[kind] = 0
                 continue
             slow = bool(SLOW.search(error))
-            if not slow and not FLAKY.search(error) or len(chunk) < 2:
+            if down and (len(chunk) < 2 or splits + 2 > GQL_SPLITS):
+                to_rest += chunk  # GitHub failed it and splitting cannot help any more: REST reads it this tick
+                continue
+            if not slow and not down or len(chunk) < 2:
                 continue
             self.clean[kind] = 0
             if slow and not shrunk and self.batch[kind] > GQL_BATCH_MIN:
@@ -6515,7 +6618,7 @@ class Daemon:
                 left = [e for c in queue for e in c]
                 size = self.batch[kind]
                 queue = [chunk[:half], chunk[half:]] + [left[i:i + size] for i in range(0, len(left), size)]
-        return []
+        return to_rest
 
     def oldest_data(self, entries: list[dict], fetched: set[str]) -> dict[str, float | None]:
         """Per kind, how old the oldest data of an open (not finished) watch is. A finished one is
@@ -6523,6 +6626,9 @@ class Daemon:
         for the watches a wait is blocked on only: those are read every cycle, so an old one there is starved
         (STALE_DATA_AFTER), where an idle PR's old data is only its backoff."""
         oldest: dict[str, float | None] = {kind: None for kind in CYCLES}
+        # And per kind the freshest data of a live watch, one a wait is on or someone read lately (polled every cycle,
+        # not on an idle back-off): the refresh loop's own pulse, which stall_alarm reads.
+        self.newest_data = {kind: None for kind in CYCLES}
         self.stale_waited = {kind: None for kind in CYCLES}
         self.fresh_waited: dict[str, float | None] = {kind: None for kind in CYCLES}  # the newest waited data's age
         self.stale_waited_key: dict[str, str] = {}
@@ -6548,6 +6654,9 @@ class Daemon:
             seen = (cached or {}).get("dataAt") or self.since[e["key"]]
             age_s = max(0.0, self.now - seen)
             oldest[kind] = max(oldest[kind] or 0.0, age_s)
+            if self.waited(e) or self.now - e["touched"] < IDLE_BACKOFF_AFTER:
+                newest = self.newest_data[kind]
+                self.newest_data[kind] = age_s if newest is None else min(newest, age_s)
             blocked = min(age_s, self.now - self.waited_since[e["key"]]) if self.waited(e) else 0.0
             if self.waited(e) and (self.fresh_waited[kind] is None or age_s < self.fresh_waited[kind]):
                 self.fresh_waited[kind] = age_s
@@ -6611,13 +6720,83 @@ class Daemon:
         for e in entries:
             self.store(e["key"], e["cache"], error=message)
 
+    def refresh_note(self, source: str, error: str, target: str, then: str) -> None:
+        """Write down one refresh failure (REFRESH_NOTE_EVERY): in full the first time a (source, error) is seen in a
+        window, else counted into the window's summary line (flush_refresh_notes)."""
+        now = self.clock()
+        error = " ".join(str(error).split())
+        error = (error[len(source) + 2:] if error.startswith(source + ": ") else error)[:160]
+        key = (source, error)
+        state = self.refresh_notes.get(key)
+        if state is not None and now - state["at"] < REFRESH_NOTE_EVERY:
+            state.update(count=state["count"] + 1, target=target, then=then)
+            return
+        if state is not None and state["count"]:
+            self.refresh_summary(key, state, now)
+        self.refresh_notes[key] = {"at": now, "count": 0, "target": target, "then": then}
+        refresh_log_write(f"{utc_stamp(now)} glaeda-gh refresh: {source}: {error} on {target}; next: {then}")
+
+    def refresh_summary(self, key: tuple[str, str], state: dict, now: float) -> None:
+        refresh_log_write(f"{utc_stamp(now)} glaeda-gh refresh: {key[0]}: {key[1]}: {state['count']} more in the last "
+                          f"{int(now - state['at'])}s (last on {state['target']}; next: {state['then']})")
+
+    def flush_refresh_notes(self) -> None:
+        """Each tick: a window past REFRESH_NOTE_EVERY with failures counted in it says how many, in one line."""
+        now = self.clock()
+        for key, state in list(self.refresh_notes.items()):
+            if now - state["at"] < REFRESH_NOTE_EVERY:
+                continue
+            if state["count"]:
+                self.refresh_summary(key, state, now)
+                self.refresh_notes[key] = {**state, "at": now, "count": 0}
+            elif now - state["at"] >= 10 * REFRESH_NOTE_EVERY:
+                del self.refresh_notes[key]  # quiet for a while: the next one prints in full again
+
+    def note_gql_health(self, error: str | None) -> None:
+        """Count one GraphQL answer toward GQL_DOWN_AFTER: ERROR None is a clean one (anything under 500), which ends
+        an outage; a 5xx or no answer at all (GQL_DOWN) adds to the streak, and at GQL_DOWN_AFTER over GQL_DOWN_SPAN
+        takes GraphQL out (gql_down) for the doubling back-off; once out, the first failure after a hold takes it out
+        again. A timeout or a hold says nothing either way."""
+        if error is None:
+            if self.gql_down_until > self.clock():
+                log({"event": "graphql-up", "after": self.gql_down_strikes})
+                refresh_log_write(f"{utc_stamp(self.clock())} glaeda-gh refresh: graphql: answering again after "
+                                  f"{self.gql_down_strikes} hold(s); next: reads go back to GraphQL")
+            self.gql_down_streak = self.gql_down_strikes = 0
+            self.gql_down_until = 0.0
+            return
+        if not GQL_DOWN.search(error):
+            return
+        if self.gql_down_streak == 0:
+            self.gql_down_since = self.clock()
+        self.gql_down_streak += 1
+        if self.gql_down_strikes == 0 and (self.gql_down_streak < GQL_DOWN_AFTER
+                                           or self.clock() - self.gql_down_since < GQL_DOWN_SPAN):
+            return
+        self.gql_down_streak = 0
+        self.gql_down_strikes += 1
+        hold = min(GQL_DOWN_MAX, GQL_DOWN_BACKOFF * 2 ** (self.gql_down_strikes - 1))
+        self.gql_down_until = self.clock() + hold
+        log({"event": "graphql-down", "after": error, "hold": hold, "strikes": self.gql_down_strikes})
+        refresh_log_write(f"{utc_stamp(self.clock())} glaeda-gh refresh: graphql: taken out after "
+                          f"{error.removeprefix('graphql: ')} "
+                          f"(strike {self.gql_down_strikes}); next: every GraphQL read goes to REST until "
+                          f"{utc_clock(self.gql_down_until)}")
+
+    def gql_down(self) -> bool:
+        """Whether GraphQL is out (note_gql_health): its reads go to REST this tick."""
+        return self.gql_down_until > self.clock()
+
     def graphql(self, query: str, variables: dict) -> tuple[dict | None, str | None]:
         """(doc, None) or (None, error message). Notes the rateLimit field when the query asks for it."""
         try:
             status, _, doc = self.request("POST", "/graphql", {"query": query, "variables": variables})
         except (WatchError, OSError) as error:  # (a held or timed-out query is not counted: it may not have run)
-            return None, f"graphql: {describe(error)}"
-        rate = ((doc.get("data") or {}).get("rateLimit") or {}) if isinstance(doc, dict) else {}
+            message = f"graphql: {describe(error)}"
+            self.note_gql_health(message)
+            return None, message
+        self.note_gql_health(f"graphql: HTTP {status}" if status >= 500 else None)
+        rate =((doc.get("data") or {}).get("rateLimit") or {}) if isinstance(doc, dict) else {}
         cost = rate.get("cost") if isinstance(rate, dict) else None
         points = cost if isinstance(cost, int) and not isinstance(cost, bool) and cost > 0 else 1
         self.gql_log.append((self.now, self.gql_reason, points))
@@ -7806,6 +7985,9 @@ class Daemon:
             wait, state = min(CONTROLLER_ABSENT, CONTROLLER_RETRY * 2 ** (self.controller_failures - 1)), "down"
             self.errors.append(what)
         self.controller_down_until = self.now + wait
+        if not isinstance(error, NoReceiver):
+            self.refresh_note("controller", what, getattr(self.controller, "base", None) or "controller",
+                              f"REST serves runs; the controller is asked again at {utc_clock(self.now + wait)}")
         self.controller_status = {"state": state, "error": what, "retryAt": self.now + wait,
                                   "token": bool(getattr(self.controller, "token", None))}
 
@@ -8655,6 +8837,22 @@ LAND_HISTORY = 60
 LAND_KEEP = 7 * 86400  # finished entries are kept this long for `land status`
 LAND_COUNT_DAYS = 30
 LAND_TOUCH = TOUCH_EVERY  # the daemon re-registers the PRs, runs and comments it waits on this often
+# Only an entry that is due (queued, past its wake, or waiting on its own push's new head) holds a waited watch on its
+# PR (LandQueue.keep_watching). Every other open entry (a wait on its checks, a retry or a park whose wake is ahead,
+# waiting_after) asks for one unwaited, one-off read (register once=True, like `status`) at most this often, and a
+# latched one asks for nothing. huge-blue, 2026-11-18 20:00Z: 525 of the daemon's 725 pr watches were the land
+# queue's, every open entry's waited watch renewed every LAND_TOUCH, and pr caches fetched in the last 600 s: 0, so
+# even the PRs a due land needed were never read.
+LAND_PEEK_EVERY = 600.0
+# A due entry the login's latch skipped through this many latch windows (each a hold of the latch: LandQueue.hold)
+# tells its requester once, naming the latch and its end; from its second window it goes at the latch's clear without
+# the reset spread (land_latch_spread). huge-blue, 2026-11-18 17:18-19:53Z: 22 lands past their wake for 2-4 h
+# through five latch windows of 2-25 min each, nothing said to anyone. The real unblock is the App read pools
+# (leo-workspace#5944: gh_app_token.py ready --owner, latch_free).
+LAND_LATCH_STARVED_WINDOWS = 2
+# A due entry left unjudged this long past its wake with no latch (every worker busy: gated) is noted once in its
+# history and counted in the land-pool line (dueLate), so a wait past its wake always has a logged reason.
+LAND_DUE_LATE = 1800.0
 LAND_TEXT = 400  # a reason or step kept in an entry or a message, at most
 LAND_STOP_CLASSES = {"block": "block", "held": "hold", "chat_hold": "chat_hold", "classic_frozen": "classic_frozen",
                      "language_boundary": "language_boundary", "react_port": "react_port", "teammate": "teammate",
@@ -9266,7 +9464,8 @@ class LandQueue:
                  behind: Callable[[Path, int, float, float], str | None] = land_checkout_behind,
                  forward: Callable[[list[str], dict, float], dict] = land_forward,
                  broker_client: Callable[[], bool] = land_broker_client,
-                 snapshot_of: Callable[[str], dict | None] = read_rollup) -> None:
+                 snapshot_of: Callable[[str], dict | None] = read_rollup,
+                 peek: Callable[[str], None] | None = None) -> None:
         self.broker_client = broker_client
         self.snapshot_of = snapshot_of
         self.run = run or (lambda argv, timeout, env: self._run_real(argv, timeout, env))
@@ -9277,6 +9476,11 @@ class LandQueue:
         self.forward_fails = 0
         self.cache_of = cache_of
         self.watch = watch or (lambda key: register(key, waited=True, reader=f"tool:{LAND_TAG}"))
+        # one unwaited, one-off read of a key (LAND_PEEK_EVERY); a test's WATCH alone records both
+        self.peek = peek or ((lambda key: register(key, reader=f"tool:{LAND_TAG}", once=True)) if watch is None
+                             else self.watch)
+        self.peeked: dict[str, float] = {}
+        self.latch_started: float | None = None  # when the latch this pass sees began to hold (a window: hold)
         self.nudge = nudge or (lambda key: None)
         self.notice = notice or (lambda kind, level, text, data: None)
         self.inline = inline
@@ -9288,6 +9492,15 @@ class LandQueue:
         self.stale_checkout: tuple[str, str | None] | None = None  # check_behind's last finding, numbers out
         self.mh_fallback: tuple[Path, Path] | None = None  # (merge_hold.py configured, the release run instead)
         self.latched: tuple[str, int] | None = None
+        # The latch a previous daemon saw holding (land/latch.json): a restart or re-exec inside one hold is the same
+        # window (hold), not a new one; its end is still logged and still marks latch_cleared.
+        seen = read_json(land_dir() / LAND_LATCH_FILE)
+        if isinstance(seen, dict) and isinstance(seen.get("pool"), str) \
+                and isinstance(seen.get("until"), (int, float)) and not isinstance(seen.get("until"), bool):
+            self.latched = (seen["pool"], round(seen["until"]))
+            since = seen.get("since", seen.get("at"))
+            if isinstance(since, (int, float)) and not isinstance(since, bool):
+                self.latch_started = float(since)
         self.latch_cleared = float("-inf")  # when the login's latch last cleared: no cached head before it is pinned
         refused =read_json(land_dir() / LAND_REFUSED_FILE)
         self.refused: dict | None = refused if isinstance(refused, dict) else None
@@ -9444,7 +9657,7 @@ class LandQueue:
             e.update(state="queued", head="", explain=None, action=None, streak=None, wakeAt=None,
                      wait=None, seen=None, seenHead="", mergeSha="", stop=None, preStepHead="",
                      lastAction=None, reviewed=[], updateSent=None, updateDeferred=None, waitRefused=None,
-                     waitBudget=None, afterStopped=None, reruns=None)
+                     waitBudget=None, afterStopped=None, reruns=None, latchHeld=None, dueLate=None, dueAt=self.now)
             self.history(e, "queued", by=e["requester"], via=e["requesterFrom"], after=",".join(e["after"]))
         else:
             self.history(e, "updated", by=e["requester"], after=",".join(e["after"]))
@@ -9482,8 +9695,11 @@ class LandQueue:
                     continue
                 if latch is not None and not self.latch_free(e):
                     self.pass_latched += 1
+                    with self.lock:
+                        self.hold(e, latch)
                     continue  # a held latch: no judge, read, watch or nudge for this entry this pass
-                if ended is not None and self.now < ended + land_jitter(key, ended):
+                if ended is not None and self.now < ended + land_jitter(key, ended) \
+                        and int((e.get("latchHeld") or {}).get("windows") or 0) < LAND_LATCH_STARVED_WINDOWS:
                     continue  # the latch just ended: this entry's place in the reset spread is still ahead
                 with self.lock:
                     if self.parked(e):
@@ -9645,16 +9861,72 @@ class LandQueue:
         latch = land_latch(self.now)
         held = None if latch is None else (latch[0], round(latch[1]))
         if held != self.latched:
-            self.latched = held
+            was, self.latched = self.latched, held
             path = land_dir() / LAND_LATCH_FILE
             if held is None:
                 path.unlink(missing_ok=True)
                 self.latch_cleared = self.now  # every cached head is from before or during the park (fresh_head)
+                self.latch_started = None
                 log({"event": "land-latch-clear"})
             else:
-                write_json(path, {"pool": held[0], "until": held[1], "at": self.now})
+                if was is None or self.latch_started is None:
+                    self.latch_started = self.now  # a new hold: a new window (a longer until is the same one)
+                write_json(path, {"pool": held[0], "until": held[1], "at": self.now, "since": self.latch_started})
                 log({"event": "land-latch-held", "pool": held[0], "until": held[1]})
         return latch
+
+    def due(self, e: dict) -> bool:
+        """Whether E is owed a judgment now: queued, or waiting past its wake (any kind, a park's too)."""
+        if e["state"] == "queued":
+            return True
+        wake = e.get("wakeAt")
+        return e["state"] == "waiting" and isinstance(wake, (int, float)) and not isinstance(wake, bool) \
+            and wake <= self.now
+
+    def due_since(self, e: dict) -> float:
+        """When E became due: its wake, else (queued) its last judgment, else when it was queued."""
+        wake = e.get("wakeAt")
+        if e["state"] == "waiting" and isinstance(wake, (int, float)) and not isinstance(wake, bool):
+            return float(wake)
+        at = e.get("dueAt")  # when it was last queued (apply, after_merged, unparked)
+        if not isinstance(at, (int, float)) or isinstance(at, bool):
+            at = (e.get("explain") or {}).get("at")
+        if not isinstance(at, (int, float)) or isinstance(at, bool):
+            at = e.get("created")
+        return float(at) if isinstance(at, (int, float)) and not isinstance(at, bool) else 0.0
+
+    def hold(self, e: dict, latch: tuple[str, float]) -> None:
+        """E, due, was skipped for the login's LATCH this pass: its status says so (latchHeld, land_line), once per
+        latch window in its history; at LAND_LATCH_STARVED_WINDOWS windows its requester is told once. An entry not
+        due is only skipped: it owes no judgment yet."""
+        if not self.due(e):
+            return
+        mark = e.get("latchHeld") or {}
+        window = self.latch_started if self.latch_started is not None else self.now
+        until = round(latch[1])
+        if mark.get("window") == window:
+            if mark.get("until") != until:
+                mark["until"] = until
+                self.save(e)
+            return
+        n = int(mark.get("windows") or 0) + 1
+        e["latchHeld"] = mark = {"pool": latch[0], "until": until, "window": window, "windows": n,
+                                 "since": float(mark.get("since") or self.now), "dueSince": self.due_since(e)}
+        self.history(e, "latch_held", pool=latch[0], until=utc_clock(until), windows=n)
+        if n == LAND_LATCH_STARVED_WINDOWS:
+            self.notify(e, e.get("requester") or "",
+                        f"glaeda land: {self.url(e)} has been due since {utc_clock(mark['dueSince'])} and not judged: "
+                        f"the login's {'REST' if latch[0] == 'rest' else 'GraphQL'} latch has held through {n} "
+                        f"windows (now until {utc_clock(until)}). It is judged first when the latch clears; nothing "
+                        "to do. The unblock is the App read pools (leo-workspace#5944)")
+        self.save(e)
+
+    def unhold(self, e: dict) -> None:
+        """E is judged: the latch no longer holds it (hold)."""
+        mark = e.pop("latchHeld", None)
+        if mark:
+            self.history(e, "latch_released", windows=mark.get("windows"),
+                         waited=round(self.now - float(mark.get("dueSince") or self.now)))
 
     def parked(self, e: dict) -> bool:
         """True while E is parked on a quota refusal (park_quota): nothing is read for it. Past its wake it is judged
@@ -9664,7 +9936,9 @@ class LandQueue:
         wake = e.get("wakeAt")
         if isinstance(wake, (int, float)) and self.now < wake:
             return True
-        e.update(state="queued", wait=None, wakeAt=None, freshAfter=self.now)  # nothing was read for it while parked
+        # nothing was read for it while parked; due since its wake
+        e.update(state="queued", wait=None, wakeAt=None, freshAfter=self.now, dueAt=float(wake)
+                 if isinstance(wake, (int, float)) and not isinstance(wake, bool) else self.now)
         self.history(e, "unparked")
         self.save(e)
         return False
@@ -9824,6 +10098,12 @@ class LandQueue:
         self.pass_gated += 1
         if self.pass_first_gated is None:
             self.pass_first_gated = e["key"]
+        if self.due(e) and self.now - self.due_since(e) >= LAND_DUE_LATE and not e.get("dueLate"):
+            # A wait past its wake always has a reason on record: here, every worker was busy (LAND_DUE_LATE)
+            e["dueLate"] = {"at": self.now, "since": self.due_since(e)}
+            self.history(e, "due_late", waited=round(self.now - self.due_since(e)), why="every worker busy",
+                         workers=self.workers(), busy=len(self.jobs))
+            self.save(e)
 
     def log_pool(self) -> None:
         """Once per LAND_POOL_LOG_EVERY, the pool as the last pass left it: workers busy and on what, snapshot waits,
@@ -9839,6 +10119,7 @@ class LandQueue:
             states: dict[str, int] = {}
             waits: dict[str, int] = {}
             due: list[tuple[float, str]] = []
+            held = late = 0
             for k, e in self.entries.items():
                 state = str(e.get("state") or "?")
                 if state in LAND_DONE:
@@ -9847,10 +10128,11 @@ class LandQueue:
                 if state == "waiting":
                     kind = str((e.get("wait") or {}).get("kind") or "?")
                     waits[kind] = waits.get(kind, 0) + 1
-                wake = e.get("wakeAt")
-                if k not in self.jobs and (state == "queued" or state == "waiting" and isinstance(wake, (int, float))
-                                           and not isinstance(wake, bool) and wake <= self.now):
-                    due.append((self.judge_order(k)[1], k))
+                if k not in self.jobs and self.due(e):
+                    since = self.due_since(e)
+                    due.append((since, k))
+                    held += 1 if e.get("latchHeld") else 0
+                    late += 1 if since and self.now - since >= LAND_DUE_LATE else 0
         oldest = min(due) if due else None
         latch = self.pass_latch
         log({"event": "land-pool", "workers": self.workers(),
@@ -9860,26 +10142,32 @@ class LandQueue:
              "firstGated": key_name(self.pass_first_gated) if self.pass_first_gated else None,
              "open": sum(states.values()), "states": states, "waits": waits,
              "latch": None if latch is None else {"pool": latch[0], "until": utc_clock(latch[1])},
-             "latched": self.pass_latched, "due": len(due),
+             "latched": self.pass_latched, "due": len(due), "dueLatchHeld": held, "dueLate": late,
              "oldestDue": None if oldest is None else {"pr": key_name(oldest[1]),
                                                        "waitingS": int(self.now - oldest[0]) if oldest[0] else None}})
 
-    def judge_order(self, key: str) -> tuple[int, float]:
+    def judge_order(self, key: str) -> tuple[int, int, float]:
         """The tick's order, so a free worker goes first to the land most likely to merge, then to the one that waited
         longest: a PR the cache shows CLEAN with no check running (one merge away) ahead of the rest, then by when it
         began to wait, its last judgment or else when it was queued (both on disk, so a restart does not start over
         from the same few). huge-blue, 2026-11-18 after glaeda#2161: "never judged" sorted first, so cmux#45661 (CLEAN,
-        60/60 green, judged hours before) sat behind every PR queued since and got no worker between two restarts."""
+        60/60 green, judged hours before) sat behind every PR queued since and got no worker between two restarts.
+        Within each, an entry that is due (queued or past its wake: due) goes ahead of one judged only because its
+        cache changed, oldest due first (by its wake, due_since), so a latch window's few workers go to the lands
+        waiting longest past their wake. huge-blue, 2026-11-18 17:18-19:53Z: 22 lands woke at 17:18 and, sorted by
+        their 17:17 judgment, sat behind 300 others through every short window between the login's latches."""
         e = self.entries[key]
         data = (self.cache_of(key) or {}).get("data") or {}
         head = str(data.get("headRefOid") or "")
         ready = data.get("state") == "OPEN" and data.get("mergeStateStatus") == "CLEAN" \
             and not land_checks_running(data, head)
+        if self.due(e):
+            return (0 if ready else 1), 0, self.due_since(e)
         at = (e.get("explain") or {}).get("at")
         if not isinstance(at, (int, float)) or isinstance(at, bool):
             at = e.get("created")
         since = float(at) if isinstance(at, (int, float)) and not isinstance(at, bool) else 0.0
-        return (0 if ready else 1), since
+        return (0 if ready else 1), 1, since
 
     def submit(self, key: str, fn: Callable[..., None], *args: Any) -> None:
         if self.inline:
@@ -9894,16 +10182,28 @@ class LandQueue:
 
     def keep_watching(self, e: dict) -> None:
         """The PR, its --after PRs and whatever it waits on stay watched and waited, so the daemon reads them at
-        full pace."""
-        keys = [e["key"], *e.get("after", [])]
+        full pace: only while E is due (due), or waits on its own push's new head. Otherwise (LAND_PEEK_EVERY) its PR
+        and --after PRs get one unwaited read per LAND_PEEK_EVERY, below every wait's in the daemon's order, and an
+        --after PR with its own entry here none (that entry reads it, and its merge shows in its state). The run or
+        comment a wait is on stays watched and waited: that is what it waits for."""
         w = e.get("wait") or {}
-        if w.get("kind") == "run" and w.get("key"):
-            keys.append(w["key"])
-        if w.get("kind") == "comment" and w.get("key"):
+        waited = self.due(e) or w.get("kind") == "head_change"
+        keys = [e["key"]] if waited else []
+        if w.get("kind") in ("run", "comment") and w.get("key"):
             keys.append(w["key"])
         for k in keys:
             if self.now - self.touched.get(k, float("-inf")) >= LAND_TOUCH:
                 self.watch_now(k)
+        peeks = [] if waited else [e["key"]]
+        # (an --after PR whose entry here ended unmerged, stopped or forwarded, is read no more by its own entry: a
+        # hand merge of it must still show, or this one waits out LAND_AFTER_STOPPED_WAIT and stops)
+        peeks += [a for a in e.get("after", []) if (self.entries.get(a) or {}).get("state", LAND_FORWARDED)
+                  in LAND_DONE - {"merged", "cancelled"}]
+        for k in peeks:
+            if self.now - self.peeked.get(k, float("-inf")) >= LAND_PEEK_EVERY:
+                self.peeked[k] = self.now
+                with contextlib.suppress(OSError, WatchError):
+                    self.peek(k)
 
     def watch_now(self, key: str) -> None:
         self.touched[key] = self.now
@@ -9954,7 +10254,7 @@ class LandQueue:
                 self.save(e)
             return
         if e["state"] == "waiting_after":
-            e["state"], e["wait"], e["wakeAt"] = "queued", None, None
+            e["state"], e["wait"], e["wakeAt"], e["dueAt"] = "queued", None, None, self.now
             self.history(e, "after_merged")  # judged at once: its base may need an update or a retarget
         head = str(data.get("headRefOid") or "").lower()
         fp = land_fingerprint(c)
@@ -10127,6 +10427,8 @@ class LandQueue:
         e.update(state="waiting", wait={"kind": "pr", "sha": head, "why": "checks running"}, seen=fp, head=head,
                  wakeAt=self.now + LAND_WAIT_DEFAULT)
         e.pop("seenChecks", None)  # checks ran since the last verdict: the next is judged, even if they end the same
+        self.unhold(e)  # not due now: its wake is ahead (hold, LAND_DUE_LATE)
+        e.pop("dueLate", None)
         self.history(e, "checks_running", head=head[:12])
         self.save(e)
 
@@ -10244,11 +10546,15 @@ class LandQueue:
         elif self.snapshot_wait(e, sha, free):
             return False  # judged on the daemon's next read of this head (one read, shared), not on merge_hold's own
         if not free:
+            self.gated(e)  # a judgment it could start: ready, waiting for a worker
             return False
         c = self.cache_of(e["key"]) or {}
         head = str((c.get("data") or {}).get("headRefOid") or "").lower()
         e.update(state="judging", seen=fp, seenHead=head, seenChecks=land_check_fingerprint(c), keptFp=None,
                  judging={"sha": sha, "at": self.now, "counts": counts})
+        self.unhold(e)
+        e.pop("dueLate", None)
+        e.pop("dueAt", None)
         self.save(e)
         self.submit(e["key"], self.job, e["key"], sha, int(e.get("gen") or 0))
         return True
@@ -11277,7 +11583,15 @@ def land_line(e: dict, now: float) -> str:
     if w.get("kind") == "quota" and e["state"] == "waiting" and isinstance(e.get("wakeAt"), (int, float)):
         bits.append(f"parked until {time.strftime('%H:%MZ', time.gmtime(e['wakeAt']))} (quota)")
     elif isinstance(e.get("wakeAt"), (int, float)) and e["state"] == "waiting":
-        bits.append(f"wakes {utc_clock(e['wakeAt'])}")
+        bits.append(f"{'woke' if e['wakeAt'] <= now else 'wakes'} {utc_clock(e['wakeAt'])}")
+    held = e.get("latchHeld") or {}
+    if held and e["state"] in ("queued", "waiting"):
+        # A due land the login's latch skips says so, never a silent wait past its wake (LandQueue.hold)
+        bits.append(f"held by the login latch until {time.strftime('%H:%MZ', time.gmtime(float(held.get('until') or 0)))}"
+                    f" ({held.get('windows')} window{'s' if held.get('windows') != 1 else ''}, due since "
+                    f"{utc_clock(float(held.get('dueSince') or 0))})")
+    elif (e.get("dueLate") or {}) and e["state"] in ("queued", "waiting"):
+        bits.append(f"due since {utc_clock(float(e['dueLate'].get('since') or 0))}: every worker busy")
     if e.get("after") and e["state"] == "waiting_after":
         bits.append("after " + ", ".join(key_name(a) for a in e["after"]))
     la = e.get("lastAction") or {}
@@ -11637,6 +11951,47 @@ def cmd_land_serve(text: str) -> int:
     return EXIT_OK
 
 
+def utc_stamp(at: float) -> str:
+    """An ISO UTC timestamp to the second (`2026-11-17T14:52:03Z`), or "unknown"."""
+    try:
+        return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(at))
+    except (ValueError, OSError, OverflowError):
+        return "unknown"
+
+
+def refresh_log_write(line: str) -> None:
+    """One refresh-failure line on stderr and in BASE/REFRESH_LOG, cut to its newest half past REFRESH_LOG_MAX.
+    Never raises: writing down a failure must not become one."""
+    with contextlib.suppress(Exception):
+        print(line, file=sys.stderr, flush=True)
+    path = BASE / REFRESH_LOG
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        with path.open("a") as stream:
+            stream.write(line + "\n")
+        if path.stat().st_size > REFRESH_LOG_MAX:
+            data = path.read_bytes()
+            keep = data[len(data) - REFRESH_LOG_MAX // 2:]
+            keep = keep[keep.find(b"\n") + 1:] if b"\n" in keep else b""
+            tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+            tmp.write_bytes(keep)
+            tmp.replace(path)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def refresh_log_tail(n: int = REFRESH_LOG_SHOWN) -> list[str]:
+    """The last N lines of BASE/REFRESH_LOG ([] when there is none)."""
+    try:
+        with (BASE / REFRESH_LOG).open("rb") as stream:
+            stream.seek(0, os.SEEK_END)
+            stream.seek(max(0, stream.tell() - 64 * 1024))
+            lines = stream.read().decode("utf-8", "replace").splitlines()
+    except OSError:
+        return []
+    return lines[-n:] if n > 0 else []
+
+
 def log(event: dict) -> None:
     print(json.dumps({"at": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"), **event}), flush=True)
 
@@ -11680,6 +12035,8 @@ def first_heartbeat(now: float | None = None) -> None:
     status = status if isinstance(status, dict) else {}
     status.pop("failing", None)
     status.pop("staleWaited", None)  # the previous process's starvation is not this one's (daemon_starved)
+    for stale in ("newestData", "stalled", "healthy"):  # nor its stalled refresh loop (stall_alarm)
+        status.pop(stale, None)
     write_json(BASE / "daemon.json", {**status, "pid": os.getpid(), "at": now, "startedAt": now,
                                       "heartbeat": HEARTBEAT_EVERY})
 
@@ -12248,6 +12605,12 @@ def daemon_starved(status: Any = None) -> dict | None:
     stale = status.get("staleWaited")
     if not isinstance(stale, dict):
         return None
+    # The freshest live PR watch's data counts too (daemon.json newestData, stall_alarm): a refresh loop that reads
+    # nothing starves every wait, including one that has not been blocked long enough for staleWaited to show it.
+    newest = status.get("newestData") if isinstance(status.get("newestData"), dict) else {}
+    stale = {k: max(v for v in (stale.get(k), newest.get(k)) if isinstance(v, (int, float)) and not isinstance(v, bool))
+             for k in set(stale) | set(newest)
+             if any(isinstance(v, (int, float)) and not isinstance(v, bool) for v in (stale.get(k), newest.get(k)))}
     bound = status.get("staleAfter") if isinstance(status.get("staleAfter"), (int, float)) else STALE_DATA_AFTER
     at = status.get("at") if isinstance(status.get("at"), (int, float)) else time.time()
     ages = {k: v + max(0.0, time.time() - at) for k, v in stale.items()
@@ -15184,7 +15547,8 @@ def cmd_budget(as_json: bool, fleet: bool = False) -> int:
     spread = fleet_budget() if fleet else None
     if as_json:
         doc = {"daemon": running, "stale": lag is not None, "failing": broken is not None,
-               "budget": budget, "watching": watching, "last": status}
+               "budget": budget, "watching": watching, "last": status,
+               "healthy": running and lag is None and broken is None and not isinstance(status.get("stalled"), dict)}
         if spread is not None:
             doc["fleet"] = spread
         print(json.dumps(doc, sort_keys=True))
@@ -15195,6 +15559,17 @@ def cmd_budget(as_json: bool, fleet: bool = False) -> int:
             print(f"this host's daemon ({policy_host()}):")
         print(f"daemon: {'running' if running else 'NOT RUNNING'}, watching {watching}, "
               f"last heartbeat {age(status.get('at'))}")
+        stalled = status.get("stalled")
+        if running and isinstance(stalled, dict):
+            why = ("the quota explains it" if stalled.get("explained")
+                   else "nothing explains it: the daemon restarts itself (stale valve)")
+            print(f"NOT HEALTHY: no PR refreshed for {stalled.get('age', '?')}s (over {STALE_DATA_AFTER}s) though the "
+                  f"heartbeat is fresh; {why}")
+        down = status.get("graphqlDown")
+        if running and isinstance(down, dict) and isinstance(down.get("until"), (int, float)):
+            until = dt.datetime.fromtimestamp(down["until"], dt.timezone.utc)
+            print(f"GraphQL is out (5xx answers) until {until:%H:%M:%SZ}: its reads go to REST meanwhile "
+                  f"(strike {down.get('strikes', '?')})")
         for bucket in ("rest", "graphql"):
             b = budget.get(bucket)
             if not b:
@@ -15256,6 +15631,11 @@ def cmd_budget(as_json: bool, fleet: bool = False) -> int:
                 print(f"alarm {name} ({alarm.get('level')}, sent {age(alarm.get('at'))}): {alarm.get('text')}")
         if status.get("errors"):
             print("last errors: " + "; ".join(status["errors"][:3]))
+        tail = refresh_log_tail()
+        if tail:
+            print(f"last refresh failures ({BASE / REFRESH_LOG}):")
+            for line in tail:
+                print("  " + line)
     if not running:
         say_waiting(down_message())
         return EXIT_DOWN

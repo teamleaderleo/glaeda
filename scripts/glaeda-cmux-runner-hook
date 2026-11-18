@@ -10699,7 +10699,8 @@ class Gate:
         running Worker's exit. Job admission keeps its existing measured disk-growth checks and disk-low ledger. Disk
         observations never arm JOB_END_FREEZE.
 
-        No reading holds the listener (DISK_RECLAIM_NOW). An idle pool runner short of one job's measured peak
+        No floor holds the listener (DISK_RECLAIM_NOW); only a full disk does, free under RUNNER_JOBS_FLOOR_GIB where
+        no job fits (DISK_FULL_NO_LISTEN, the one reason this returns). An idle pool runner short of one job's measured peak
         (job_disk_gib, DISK_SHORT_RECLAIM), whatever the floor, or of the jobs in flight's disk (RUNNER_JOBS_DISK)
         starts reclaim at once aimed at what it lacks, and records it (disk_short), so its listener's next start waits
         at most DISK_RECLAIM_WAIT_S for room (disk_room_wait) and then listens whatever that freed. These readings used
@@ -10739,6 +10740,20 @@ class Gate:
         short: tuple[str, float] | None = None
         if not scope.dedicated and not nightly_own and not scope.gateway and scope.min_free_gib > 0:
             peak, whose = listener_disk_peak(scope)
+            # DISK_FULL_NO_LISTEN: under the hard floor no job fits, and one taken fails with ENOSPC, so this is no
+            # floor to warn about but a full disk: reclaim, and hold the listener (its look after a job stops it too)
+            # until reclaim or the running jobs' ends free it. Leo: "A busy machine makes things slower, never makes
+            # them fail." 2026-11-18 19:46-19:55Z: cmux18's listeners took jobs at 8.5 GiB free beside five running,
+            # which wrote it down to 1.8 GiB while the lent fleet worker beside them sat at claim_paused disk.
+            # Full is under the hard floor and under this runner's own job peak (a small runner's 8 GiB: its jobs are
+            # measured to fit under the hard floor). An unreadable reading holds nothing (free_or_none: None).
+            full_gib = min(RUNNER_JOBS_FLOOR_GIB, peak)
+            if (free := free_or_none(path)) is not None and free < full_gib:
+                self.disk_short = None
+                self.evict_in_background(path, max(floor, peak))
+                # the same words every poll: the gate logs a hold again only when its reason changes
+                return (f"disk full: under {full_gib:g} GiB, where no job of this runner fits; "
+                        "reclaiming (DISK_FULL_NO_LISTEN)")
             if under := disk_refusal(path, peak):
                 short = (f"disk: {under} for {whose} (DISK_SHORT_RECLAIM)", max(floor, peak))
             elif crowded := self.runner_jobs_short(path):
@@ -11619,10 +11634,13 @@ class Gate:
                 # RUNNER_DRAIN stops it at the job's end too, and so does a signing job's claim (exclusive_yield):
                 # a job that ends while the signing job waits for the drain is the one a queued job replaces at once
                 reserved = self.still_reserved() or self.draining() or self.exclusive_yield()
-                self.job_waited = bool(self.waiting) or reserved is not None
-                self.low_disk()  # advisory cleanup only: never watch or freeze a Worker for disk
+                # A disk floor is advisory cleanup only: never watch or freeze a Worker for it. A full disk
+                # (DISK_FULL_NO_LISTEN) is not a floor: the next job would fail there, so the listener stops at this
+                # job's end as for a reservation, and starts again once reclaim or the other jobs' ends free room.
+                full = self.low_disk()
+                self.job_waited = bool(self.waiting) or reserved is not None or full is not None
                 workers = tuple(pid for pid in self.worker_pids() if pid not in self.done) \
-                    if self.waiting or reserved or self.job_ending else ()
+                    if self.waiting or reserved or full or self.job_ending else ()
                 if workers:
                     if workers != self.watching:  # once per job: the request its Worker runs, and who runs it
                         self.job_request, self.listener_pids = self.taking(), self.listener_list()
