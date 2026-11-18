@@ -364,6 +364,90 @@ MEASURE_SKIP_COMPONENTS = frozenset({
     "com.apple.FileProvider", "com.apple.CloudDocs",
 })
 
+# Folders macOS guards with a privacy (TCC) prompt. du opening one asks a person, in the name of the
+# program that started glaeda-disk: "worker-<sha>" wants your photo library or media library (the CI
+# worker's lent-host eviction runs glaeda-disk), "python3.13" wants files managed by iCloud Drive (the
+# LaunchAgent). A fleet Mac has nobody to answer, so the prompt sits on its screen over every capture
+# (cmuxterm-hq docs/handbook/prompt-on-an-unattended-screen.md; its detector is dialog-alarm). On macOS
+# every du walk skips them by name at any depth: they hold no runner work or rebuildable state, and
+# accounting is a lower bound already. HOME_NEVER keeps discovery out of the same folders.
+PRIVACY_SKIP_NAMES = (
+    "Desktop", "Documents", "Downloads", "Movies", "Music", "Pictures",
+    "*.photoslibrary", "*.musiclibrary", "*.tvlibrary",
+)
+
+
+# The folders of a home's ~/Library that macOS guards (Photos, other apps' data, Full Disk Access). cmux19,
+# 2026-11-17 09:52, with the names above already skipped: the worker's lent eviction ran glaeda-disk, whose
+# accounting `du -xk -d 1 /System/Volumes/Data/Users` (-d only limits what du prints) went through 113 checks
+# on other apps' data in ~/Library/Containers and Group Containers and then into ~/Library/Photos, and macOS
+# asked "Allow worker-<sha> to access your photo library?". These names are skipped only by a walk whose root
+# reaches a home's guarded Library folders (walk_reaches_a_home_library): elsewhere a build folder named Photos
+# or Messages is a real folder and is sized. Those below Application Support (AddressBook, CallHistoryDB, ...)
+# and Metadata (CoreSpotlight) are skipped by name at any depth inside such a walk.
+LIBRARY_PRIVACY_SKIP_NAMES = (
+    "Photos", "Containers", "Group Containers", "Daemon Containers",
+    "Mail", "Messages", "Safari", "Calendars", "Reminders", "HomeKit", "Cookies", "IdentityServices",
+    "Suggestions", "PersonalizationPortrait", "Biome", "DuetExpertCenter", "Accounts", "CoreSpotlight",
+    "AddressBook", "CallHistoryDB", "CallHistoryTransactions", "MobileSync", "Knowledge", "FaceTime",
+    "com.apple.TCC",
+)
+
+
+# Below a home's Library, only these walks can reach a guarded folder by name. Any other root there (Caches,
+# Developer/CoreSimulator, a cmux-next CI cache) keeps every name: a simulator's data/Containers or a build tree's
+# Mail fixture is real data glaeda sizes, and BSD du's -I matches a name at any depth.
+LIBRARY_GUARDED_PARENTS = ((), ("Application Support",), ("Metadata",))
+
+
+def walk_reaches_a_home_library(root: Path) -> bool:
+    """A du walk of ROOT can enter the guarded folders of some home's ~/Library: ROOT is /, the Data volume,
+    /Users, a home (not /Users/Shared), its Library, or that Library's Application Support or Metadata; likewise
+    this process's own HOME and its ancestors."""
+    parts = Path(os.path.abspath(root)).parts
+    if parts[:4] == ("/", "System", "Volumes", "Data"):
+        parts = ("/", *parts[4:])
+
+    def at_or_above_library(parts: tuple, home: tuple) -> bool:
+        if parts == home[:len(parts)]:
+            return True
+        if parts[:len(home) + 1] != (*home, "Library"):
+            return False
+        return tuple(parts[len(home) + 1:]) in LIBRARY_GUARDED_PARENTS
+
+    if len(parts) == 1 or parts == ("/", "Users"):
+        return True
+    if parts[:2] == ("/", "Users") and parts[2] != "Shared":
+        return at_or_above_library(parts, parts[:3])
+    return at_or_above_library(parts, Path(os.path.abspath(HOME)).parts)
+
+
+def privacy_guarded(parent: Path, name: str) -> bool:
+    """The directory NAME in PARENT is one macOS guards with a privacy prompt (on macOS only): a PRIVACY_SKIP_NAMES
+    folder at any depth, as du -I skips it, or a LIBRARY_PRIVACY_SKIP_NAMES folder directly in a Library or in its
+    Application Support or Metadata (a simulator's own data/Containers deeper down is still walked)."""
+    if not DARWIN:
+        return False
+    if any(fnmatch.fnmatchcase(name, pattern) for pattern in PRIVACY_SKIP_NAMES):
+        return True
+    parent = Path(parent)
+    in_library = parent.name == "Library" or (parent.parent.name == "Library"
+                                              and parent.name in ("Application Support", "Metadata"))
+    return in_library and name in LIBRARY_PRIVACY_SKIP_NAMES
+
+
+def du_skip_args(root: Path | None = None) -> list[str]:
+    """du's flags that keep a walk of ROOT out of FileProvider/iCloud trees and, on macOS, privacy-guarded
+    folders (and a home's guarded Library folders, when the walk reaches one)."""
+    names = [*sorted(MEASURE_SKIP_COMPONENTS), *(PRIVACY_SKIP_NAMES if DARWIN else ())]
+    if DARWIN and root is not None and walk_reaches_a_home_library(root):
+        names += LIBRARY_PRIVACY_SKIP_NAMES
+    # The spelling follows the du that runs (BSD's -I, GNU's --exclude), not DARWIN, which a suite may set
+    # on a Linux host.
+    if sys.platform == "darwin":
+        return [arg for name in names for arg in ("-I", name)]
+    return [f"--exclude={name}" for name in names]
+
 # These roots are for accounting only. They are deliberately separate from the eviction
 # catalogue: their sizes may overlap, and an incomplete walk is a lower bound rather than
 # permission to delete anything. Keeping the Data volume at one bounded level makes the
@@ -1005,6 +1089,21 @@ CMUX_NEXT_DRAIN_HOOK_SHA256 = frozenset({
     "1f4d528d5e8fd2687d4ba6972acad4b3a913c614ec37c1031a36ef0c51530426",
     "9d48941838658210beb6c3368ba830d514996b044e7d9215b8e6236f79a9e6b0",
     "a44fdb3563a9b0b6338bfbec0428cf36b06b92c5a659b2e3756f39c9c9a8783f",
+    "e8b42e4572d6a481e884f36f8165c7c3c936662d9aedaf83991843376b668785",
+    "1095242d677e69184c3ed8b0f4d61ae425d7748828261ba944f1e5e24ac69d50",
+    "60a45395bbef188d96883903193c37829d4c37f9ed0abab01bb1b6ebac15c67d",
+    "23ae0141055ce1938749f14369a6365b75ae552ee8f3adc11c5d48ce5cb7dc61",
+    "c9cede71a5b59436eb082df629b6350321c80fc4ab562d3973928ac990fc7817",
+    "f9d7999b378ef24c0b35ec6d68a34ace4a6e38c8bbc7a057cf60ce85fcef7938",
+    "604b4875444a2f2a9d8949936c2dcc7750d8ec90cd9bcfe6de3c9063e1e464f6",
+    "61288c7d638db3ccef4208cd4a1a268beed2f11cf0eaec2487568d7cb1a8e3ae",
+    "8a8efccf8581126de3169bb83cdbabd66ce78b42763231d82eb6506dc5016ae2",
+    "ea1711a1e87e5fd7e1ec779a2c066e2427dfe52c8630ecd17bcaf483a9de471d",
+    "b5396ef30480df76d30c761e9107feeeff984dc66b0e9d072b717bf7f7d7f8fc",
+    "bd26f6b050e084631d4fc42332d27f379f07d56d0079d6b9c7cca8ba249a7655",
+    "213d9574d44736c8d2c483cf6ca5960ab6fae5a6a07b0239d9671f3d5023478f",
+    "4c60ea0484bad079a6a51c6df977a3956178739542e40655248d5dab011ac41f",
+    "27aa7f2985b9e8b0a996dfb4859fa6a6ffe4acc70d1ac20ff95f0338b59158fe",
 })
 CMUX_NEXT_CI_PRESERVED_NAMES = frozenset({
     "SourcePackages", "ModuleCache.noindex", "SDKStatCaches.noindex",
@@ -2430,7 +2529,7 @@ def erase_idle_sim_devices(receipt: Path, halt=None, budget_s: float = SIM_DEVIC
         except (OSError, subprocess.SubprocessError):
             print("refusing to erase simulator devices: ps failed", file=sys.stderr)
             break
-        tokens = sim_tokens()  # every copy (SIM_SLOTS)
+        tokens = sim_tokens()  # every copy (SIM_DYNAMIC)
         if tokens is None:
             print("not erasing simulator devices: a simulator job holds the simulator token", file=sys.stderr)
             break
@@ -2496,17 +2595,20 @@ def sim_token(path: Path | None = None) -> int | None:
     return fd
 
 
-# SIM_SLOTS (glaeda-cmux-runner-hook): a mini may run several simulator jobs, each holding one copy of the token
-# (simulator, simulator-1, ...). The eraser holds every copy the hook can hand out (its MAX_SIM_SLOTS), whatever this
-# mini's --sim-slots: copy 0 alone would let a job start on copy 1 between the last reading and the erase.
-SIM_TOKEN_COPIES = 4  # the hook's MAX_SIM_SLOTS (a test keeps them equal)
+# SIM_DYNAMIC (glaeda-cmux-runner-hook): a mini may run several simulator jobs, each holding one copy of the token
+# (simulator, simulator-1, ...), as many as measured headroom admits up to a ceiling computed on the host. The eraser
+# holds SIM_GATE exclusive, then copy 0 and every copy file that exists: the hook takes a copy past the first only
+# under SIM_GATE shared, so no copy file can appear between this listing and the erase, and none while one is held.
+SIM_GATE = "simulator-copies.gate"  # the hook's SIM_GATE (a test keeps them equal)
 
 
 def sim_tokens() -> list[int] | None:
-    """fds holding every simulator token copy exclusive, or None (holding none) while any is held or cannot be opened."""
+    """fds holding SIM_GATE and every simulator token copy exclusive, or None (holding none) while any is held or
+    cannot be opened."""
     fds: list[int] = []
-    for copy in range(SIM_TOKEN_COPIES):
-        fd = sim_token(SIM_TOKEN if copy == 0 else SIM_TOKEN.with_name(f"simulator-{copy}.token"))
+    copies = sorted(SIM_TOKEN.parent.glob("simulator-*.token"), key=lambda p: (len(p.name), p.name))
+    for path in (SIM_TOKEN.with_name(SIM_GATE), SIM_TOKEN, *copies):
+        fd = sim_token(path)
         if fd is None:
             for held in fds:
                 os.close(held)
@@ -4288,7 +4390,7 @@ def default_families(role: str = "fleet-mini") -> list[Family]:
         # and the tag links to them, at any depth, so a nested ghcr path is never cut above or below its image), and
         # its last use is Tart's own access date on its digest directories (tart_last_use): `tart clone` leaves every
         # mtime alone, so an image cloned daily would read as idle by mtime and be pulled again, tens of GiB each time.
-        # Where Tart is installed the window is TART_IDLE_HOURS (a week; APFS moves atime lazily), where it is not
+        # Where Tart is installed the window is TART_IDLE_HOURS (two days; APFS moves atime lazily), where it is not
         # DEFAULT_AGE_HOURS (tart_idle_hours). A root that is a symlink or resolves outside HOME is never walked.
         Family(TART_IMAGES, HOME / ".tart/cache/OCIs", True, "the next tart clone or pull downloads it again",
                owner="Tart (tart pull)", rebuild_minutes=20, min_idle_hours=tart_idle_hours(), platform="macos"),
@@ -4806,7 +4908,7 @@ def du_bytes(path: Path, *, record_timeout: bool = True) -> int | None:
         return None
     if _measurement_on_timeout_cooldown(path):
         return None
-    out = _du_output(["du", "-xsk", str(path)], record_timeout=record_timeout)
+    out = _du_output(["du", "-xsk", *du_skip_args(path), str(path)], record_timeout=record_timeout)
     if out is None:
         return None
     try:
@@ -4822,7 +4924,7 @@ def du_children(root: Path, *, record_timeout: bool = True) -> dict[str, int] | 
     """Sizes of every directory directly below root from a single walk, keyed like candidates."""
     if not _measurement_path_allowed(root):
         return None
-    out = _du_output(["du", "-xk", "-d", "1", str(root)], record_timeout=record_timeout)
+    out = _du_output(["du", "-xk", "-d", "1", *du_skip_args(root), str(root)], record_timeout=record_timeout)
     if out is None:
         return None
     sizes: dict[str, int] = {}
@@ -4842,7 +4944,7 @@ def du_children_with_status(root: Path, *, record_timeout: bool = True) -> tuple
     """
     if not _measurement_path_allowed(root):
         return None
-    out = _du_output(["du", "-xk", "-d", "1", str(root)], allow_nonzero=True,
+    out = _du_output(["du", "-xk", "-d", "1", *du_skip_args(root), str(root)], allow_nonzero=True,
                      record_timeout=record_timeout)
     if out is None:
         return None
@@ -5199,6 +5301,37 @@ def _owned_query(argv: list[str], timeout: float) -> tuple[int, str]:
         _ACTIVE_QUERY_PROCS.pop(proc.pid, None)
 
 
+# PASSIVE_HOLDERS: macOS agents that map a built app's executable once it posts a notification, and keep the mapping
+# until they exit. Such a mapping never makes a build output in use: deleting the folder only unlinks the names (the
+# agent keeps its inode), and nothing builds from or reads the tree through it. Counted as a holder, it pinned a
+# superseded admission DerivedData seed as "in-use (open by a process)" for as long as the host stayed up (cmux19,
+# 2026-11-17: a 9.5 GiB seed held by NotificationCenter's mapping of Build/Products/Debug/cmux, while the runner gate
+# held listeners for disk, RUNNER_JOBS_DISK; cmux18's seed and cmux21's ~/cmux-ci-perf on 11-15 the same way).
+# lsof's c field cuts the command name (9 to 15 characters on macOS), so a holder matches by a prefix of its name.
+PASSIVE_HOLDERS = ("NotificationCenter", "usernoted")
+PASSIVE_HOLDER_MIN_CHARS = 9
+
+
+def passive_holder(command: str) -> bool:
+    """True when command (lsof's c field) names a PASSIVE_HOLDERS agent."""
+    return len(command) >= PASSIVE_HOLDER_MIN_CHARS and any(name.startswith(command) for name in PASSIVE_HOLDERS) \
+        or command in PASSIVE_HOLDERS
+
+
+def lsof_open_paths(out: str) -> list[str]:
+    """The paths in `lsof -Fcn` output, leaving out the files a PASSIVE_HOLDERS agent has open."""
+    opened: list[str] = []
+    skip = False
+    for line in out.splitlines():
+        if line.startswith("p"):
+            skip = False
+        elif line.startswith("c"):
+            skip = passive_holder(line[1:])
+        elif line.startswith("n/") and not skip:
+            opened.append(line[1:])
+    return opened
+
+
 def process_evidence() -> tuple[list[str], str]:
     """Every path a process has open (cwd and files) plus all command lines.
 
@@ -5224,14 +5357,14 @@ def process_evidence() -> tuple[list[str], str]:
     else:
         lsof = shutil.which("lsof") or "/usr/sbin/lsof"
         try:
-            code, out = _owned_query([lsof, "-n", "-P", "-Fn"], 120)
+            code, out = _owned_query([lsof, "-n", "-P", "-Fcn"], 120)
         except (OSError, subprocess.TimeoutExpired) as e:
             raise NoEvidence(f"lsof: {e}") from e
         if code != 0:
             raise NoEvidence(f"lsof failed (exit {code})")
-        opened = [line[1:] for line in out.splitlines() if line.startswith("n/")]
-        if not opened:
+        if not any(line.startswith("n/") for line in out.splitlines()):
             raise NoEvidence(f"lsof returned nothing (exit {code})")
+        opened = lsof_open_paths(out)
     try:
         ps_code, ps_out = _owned_query(["ps", "-axww", "-o", "command="], 60)
     except (OSError, subprocess.TimeoutExpired) as e:
@@ -8557,10 +8690,15 @@ TART_IMAGES, TART_IPSWS = "tart-images", "tart-ipsws"
 # 32 GiB of them, ubase and vm0-vm5, stopped since 2026-10-19 and claimed by nobody (hq#11127), and no family listed
 # them. A stopped VM nothing touched for TART_VM_IDLE_HOURS goes: Tart's run lock, a tart command naming it, a fleet
 # lease naming its path or a .glaeda-keep.json claim in it keeps it.
+# Two days, not two weeks (Leo, 2026-11-17: "man all these disks should be able to just be a lot more cleared up than
+# they are"): nine minis measured that day held 236 GiB of Tart VMs, 140 GiB of them stopped and judged "recent"
+# (two VMs on one mini, 86 GiB, idle 78 h), and 53 GiB of pulled images, while glaeda-disk found
+# 16.5 GiB reclaimable in 2.9 TiB used. A VM someone means to keep carries a .glaeda-keep.json claim.
 TART_VMS = "tart-vms"
-TART_VM_IDLE_HOURS = 14 * 24.0
+TART_VM_IDLE_HOURS = 2 * 24.0
 TART_FAMILIES = frozenset({TART_IMAGES, TART_IPSWS, TART_VMS})
-TART_IDLE_HOURS = 7 * 24.0  # a week past Tart's last access; APFS updates atime lazily
+# Two days past Tart's last access: APFS moves atime at most once a day, so an image cloned daily still reads in use.
+TART_IDLE_HOURS = 2 * 24.0
 TART_DIGEST_PREFIX = "sha256:"
 TART_SEARCH_DEPTH = 8  # registry/namespace.../image below OCIs; a deeper tree is not Tart's
 TART_BINARIES = ("/opt/homebrew/bin/tart", "/usr/local/bin/tart")
@@ -8663,10 +8801,13 @@ def tart_restore_access() -> None:
 
 
 def tart_seen(fam: Family, items: list[Path]) -> None:
-    """Read each image's access dates before anything of this run walks it (TART_ACCESS)."""
+    """Read each image's and VM's access dates before anything of this run walks it (TART_ACCESS)."""
     if fam.id == TART_IMAGES:
         for item in items:
             tart_last_use(item)
+    elif fam.id == TART_VMS:
+        for item in items:
+            tart_vm_last_use(item)
 
 
 def tart_installed() -> bool:
@@ -8675,7 +8816,7 @@ def tart_installed() -> bool:
 
 
 def tart_idle_hours() -> float:
-    """The idle window of Tart's cache: TART_IDLE_HOURS where Tart is installed (a weekly clone keeps its image even
+    """The idle window of Tart's cache: TART_IDLE_HOURS where Tart is installed (a daily clone keeps its image even
     when APFS moved the access date late), DEFAULT_AGE_HOURS where it is not, since nothing on the host reads it."""
     return TART_IDLE_HOURS if tart_installed() else DEFAULT_AGE_HOURS
 
@@ -8683,11 +8824,13 @@ def tart_idle_hours() -> float:
 def tart_vm_last_use(path: Path) -> float:
     """A local Tart VM's last use: the VM directory's mtime and the newest mtime or atime of its files (config.json,
     disk.img, nvram.bin), read with lstat only. `tart run` writes the disk and nvram, `tart clone` from it reads the
-    disk. The directory's own atime is left out: the survey's du lists the directory and moves it."""
+    disk. The directory's own atime counts as this run first saw it (TART_ACCESS, handed back at the run's end): the
+    survey's du lists the directory and moves it, and a golden VM that is only ever cloned may move nothing else."""
     try:
-        newest = path.lstat().st_mtime
+        st = path.lstat()
     except OSError:
         return 0.0
+    newest = max(st.st_mtime, tart_access(path, st))
     for e in _entries(path):
         with contextlib.suppress(OSError):
             st = e.stat(follow_symlinks=False)
@@ -8763,6 +8906,7 @@ def candidates(fam: Family) -> list[Path]:
             level = [p for p in level if nightly_next_fallback(p)]
         if fam.app_clones:
             level = keep_live_app_clones(level)
+        tart_seen(fam, level)
     # an aside tree (remove()'s rename) is the interrupted-deletions family's alone, whatever family's root holds it
     if fam.id == INTERRUPTED:
         level = [p for p in level if DELETING_RE.fullmatch(p.name)]
@@ -8920,16 +9064,28 @@ def snapshot_stamp(at: float, sizes: dict[str, int], measured_at: dict[str, floa
 
 
 def save_snapshot(sizes: dict[str, int], path: Path | None = None, at: float | None = None,
-                  measured_at: dict[str, float] | None = None) -> None:
-    """`at` is when the oldest size was measured; per-item times prevent stale reports starving refresh."""
+                  measured_at: dict[str, float] | None = None) -> bool:
+    """`at` is when the oldest size was measured; per-item times prevent stale reports starving refresh.
+
+    The snapshot is a cache of sizes, written before a pressure pass deletes anything. On a full disk the write
+    fails (ENOSPC), and it used to end the pass there with nothing freed: a 256 GB mini at 3 GB free, 2026-11-17. So a
+    failed write keeps the old snapshot, drops its partial temp file, and lets the pass go on to delete. Returns
+    whether it was saved, so a caller judges freshness by the snapshot on disk."""
     path = SNAPSHOT if path is None else path
-    path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(f".{os.getpid()}.tmp")
     payload = {"at": time.time() if at is None else at, "sizes": sizes}
     if measured_at is not None:
         payload["measured_at"] = {k: v for k, v in measured_at.items() if k in sizes}
-    tmp.write_text(json.dumps(payload))
-    os.replace(tmp, path)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp.write_text(json.dumps(payload))
+        os.replace(tmp, path)
+    except OSError as e:
+        with contextlib.suppress(OSError):
+            tmp.unlink(missing_ok=True)
+        print(f"glaeda-disk: size snapshot not saved ({e}); the pass goes on", file=sys.stderr)
+        return False
+    return True
 
 
 def refresh_lock_path() -> Path:
@@ -9477,7 +9633,10 @@ def runner_floor_gib(home: Path = HOME) -> float:
 # writer stamps expires 13 h after each write and refreshes it every 6 h). The host-local reservation
 # (FLEET_ROOT/reservation.json, glaeda-reservation/v1, the one the runner hook reads) counts too. Fails closed: a
 # missing, unreadable, malformed or expired list, or one with no expires, reads as reserved, whatever the
-# host-local file says.
+# host-local file says, except a missing list on a host that runs no controller worker (controller_worker_host): there
+# a missing list means no reservations, and cleanup proceeds (2026-11-17: passes on such hosts logged "fleet
+# reservations unreadable (FileNotFoundError); kept as reserved" and deleted nothing). A list that is there but
+# unreadable, malformed or expired, or one missing where a controller worker runs or may run, still fails closed.
 FLEET_RESERVATIONS: Path | None = None  # None: fleet_reservations_path(); tests point it at a fixture
 FLEET_RESERVATIONS_NAME = ".local/share/glaeda/fleet-reservations.json"
 UPDATE_CONFIG = HOME / ".config/glaeda/update.json"
@@ -9531,11 +9690,30 @@ def _str_list(value: Any, what: str) -> list[str]:
     return value
 
 
+def controller_worker_host() -> bool:
+    """Whether a cmuxterm-hq controller worker (HQ_BUILD_WORKERS) runs, or may run, on this host: its LaunchDaemon
+    plist is there, or launchctl prints the service. False only on macOS when no plist is there and launchctl does not
+    print one (113, "could not find service", or a refusal to a user who may not read the system domain: the
+    installed plist is then the evidence); off macOS, or when launchctl cannot run or hangs, True (fail-safe)."""
+    if not DARWIN:
+        return True
+    for job in HQ_BUILD_WORKERS:
+        label = job.rsplit("/", 1)[-1]
+        try:
+            if Path("/Library/LaunchDaemons", f"{label}.plist").exists():
+                return True
+            if subprocess.run(["launchctl", "print", job], capture_output=True, timeout=10).returncode == 0:
+                return True
+        except (OSError, subprocess.SubprocessError):
+            return True
+    return False
+
+
 def host_reservation(now: float | None = None, path: Path | None = None, names: set[str] | None = None,
                      local: Path | None = None, update: Path | None = None) -> str:
     """Why this host is reserved now ("" when it is not): an active fleet reservation naming it (or an alias), an
     active host-local reservation, or a reservation list that is unreadable or malformed anywhere, or missing on a
-    host that is not a hygiene-only Mac."""
+    host that runs a controller worker (controller_worker_host) and is not a hygiene-only Mac."""
     now = time.time() if now is None else now
     names = host_names() if names is None else {n.lower() for n in names}
     try:
@@ -9562,8 +9740,10 @@ def host_reservation(now: float | None = None, path: Path | None = None, names: 
         if hit:
             return hit
     except FileNotFoundError:
-        if not hygiene_only_mac(update):  # a personal Mac never gets the fleet's list; a fleet mini without it fails closed
-            return "fleet reservations unreadable (FileNotFoundError); kept as reserved"
+        # a personal Mac never gets the fleet's list, nor does a host with no controller worker (the writer's hosts);
+        # a controller-worker host without it fails closed
+        if not hygiene_only_mac(update) and controller_worker_host():
+            return "fleet reservations unreadable (FileNotFoundError) on a controller-worker host; kept as reserved"
     except (OSError, ValueError, KeyError, TypeError) as error:
         return f"fleet reservations unreadable ({type(error).__name__}); kept as reserved"
     marker = HOST_RESERVATION_LOCAL if local is None else local
@@ -10047,10 +10227,9 @@ def census_covered() -> set[str]:
 
 
 def _census_du_argv(path: Path) -> list[str]:
-    # never enter a FileProvider/cloud tree below an unowned directory: du can block in the kernel there
-    skips = [arg for name in sorted(MEASURE_SKIP_COMPONENTS)
-             for arg in (("-I", name) if DARWIN else (f"--exclude={name}",))]
-    argv = ["du", "-xsk", *skips, str(path)]
+    # never enter a FileProvider/cloud tree below an unowned directory (du can block in the kernel there),
+    # nor a privacy-guarded folder (du would put a TCC prompt on an unattended screen)
+    argv = ["du", "-xsk", *du_skip_args(path), str(path)]
     if os.path.exists("/usr/sbin/taskpolicy"):
         return ["/usr/sbin/taskpolicy", "-b", *argv]  # background QoS: CPU and I/O throttled
     if ionice := shutil.which("ionice"):
@@ -10141,6 +10320,8 @@ def census_pass(roots: list[Path], covered: set[str], state: dict[str, Any] | No
                     continue  # another volume mounted here
                 if name in MEASURE_SKIP_COMPONENTS:
                     rows[child] = [0, "skipped", False]  # FileProvider: du can block in the kernel there
+                elif privacy_guarded(current, name):
+                    rows[child] = [0, "skipped", False]  # listing it puts a privacy prompt on the screen
                 else:
                     children.append(child)
             elif child not in covered:  # a sized file is counted by its own size, not again here
@@ -13376,8 +13557,8 @@ def _main_impl(argv: list[str] | None = None) -> int:
             updated_times = {k: v for k, v in measured_at.items() if k in known}
             updated_times.update({k: time.time() for k in fresh_paths})
             stamp = snapshot_stamp(at, known, updated_times)
-            save_snapshot(known, at=stamp, measured_at=updated_times)
-            if at:  # the age this run reports and refreshes on is the snapshot it just wrote (None: now)
+            saved = save_snapshot(known, at=stamp, measured_at=updated_times)
+            if at and saved:  # the age this run reports and refreshes on is the snapshot it just wrote (None: now)
                 at = stamp or time.time()
                 age_min = (time.time() - at) / 60
         if at and age_min > a.max_age and not a.apply:

@@ -28,12 +28,20 @@ but still installs through `glaeda-mini-fleet upgrade` (below).
    - `control.json` (`paused`), written by `control.yml`.
 
    Only runs on `main` publish or write anything.
-3. **Hosts pull.** `glaeda-update` runs every 10 minutes on every host (its `APPLY_EVERY_S`, which
+3. **Hosts pull.** `glaeda-update --apply` runs every minute on every host (its `PROBE_EVERY_S`, which
    setup's LaunchAgent reads and a test holds the Linux timer to): a LaunchAgent
    `com.teamleaderleo.glaeda.update` on macOS, the systemd user timer `glaeda-update.timer` on
-   Linux, with up to 3 minutes of random delay. Channel files and assets come from
-   `github.com/<source>/releases/download`, anonymously, never through the GitHub API, so a spent
-   API quota never stops a host from converging (a canary's attestation check is the one API call). It reads its ring from
+   Linux, with a fixed per-host offset of up to 30 seconds. A run does the full update every 10
+   minutes (`APPLY_EVERY_S`) and, between those, only when the channel changed: it sends one
+   anonymous HEAD for `control.json` and one for its ring's file, and github.com's redirect names the
+   uploaded asset, which every `gh release upload --clobber` replaces. An unchanged probe logs
+   nothing; one that cannot tell (offline) starts nothing, so the backoff below still holds. A host
+   sees a new release or a pause within about a minute. Channel files and assets come from
+   `github.com/<repo>/releases/download`, anonymously, never through the GitHub API, so a spent
+   API quota never stops a host from converging (a canary's attestation check is the one API call).
+   A host whose `source` is the mirror reads the channel files here first (their one writer; the
+   mirror when this repository cannot be read) and downloads a release from the mirror first (here
+   when the mirror has not copied it yet), so a promotion does not wait for the mirror. It reads its ring from
    `~/.config/glaeda/update.json`, then:
    - downloads by hash;
    - checks the build-provenance attestation, which must come from `release.yml` on `main`. A
@@ -81,7 +89,12 @@ but still installs through `glaeda-mini-fleet upgrade` (below).
    setup. While a host stays unconverged on the same wanted release it backs off from 10 minutes to
    an hour; a new release on the ring is tried at once, and an installed release's hooks are retried
    every run, so a runner busy with a job gets them between jobs. `glaeda-update --status` shows the
-   record and a live reading. `glaeda-mini-health` reads it and reports `ota_not_converging`
+   record and a live reading. Its `live` is merge-to-live on this host: `merged` (the release
+   commit's time on `main`, from release.json `committed`), `installedAt`, `hooksLiveAt` (when the
+   last runner's hook files took the release's bytes, from their rename; null until every runner's
+   has) and `mergeToInstallS` / `mergeToHooksLiveS`. Read it with
+   `jq .live ~/.local/state/glaeda/update/converge.json` on the host (or through `reach HOST`).
+   Releases published before `committed` existed show null spans. `glaeda-mini-health` reads it and reports `ota_not_converging`
    ("running X, wants Y, because Z") only past the `alertAfter` time glaeda-update wrote (two
    backed-off hours), as an error when the reason is one retrying cannot clear (a quarantined or
    refused release, a hook `--refresh-hooks` keeps), and `ota_stale` when no run has finished for
@@ -93,12 +106,18 @@ but still installs through `glaeda-mini-fleet upgrade` (below).
    canary's success can promote, and a success or failure that still is not delivered is kept in the host's
    state.json and posted again by the next run (commit statuses have no GraphQL mutation to fall
    back to). "Signed in" is the local `gh auth token`, not `gh auth status`, which spends quota.
-5. **Stable.** `.github/workflows/promote.yml` runs hourly, and each canary run also dispatches it,
-   since GitHub's cron can lag for hours. It moves `stable` to the newest release for which all of
-   these hold:
+5. **Stable.** `.github/workflows/promote.yml` runs on every canary's `glaeda-ota/<host>` commit
+   status (the `status` event; a run for any other context is skipped and takes no concurrency
+   slot), when a Release run finishes, hourly, and when a canary run dispatches it after its soak,
+   since GitHub's cron can lag for hours. Nothing polls: each run evaluates once. It moves `stable`
+   to the newest release for which all of these hold:
    - the release's signed `policy` is valid and its publication timestamp is older than that policy's
      soak floor: new releases use a 15-minute window. Historical signed 2/6/12-hour policies remain
-     readable during the transition; manifests without a policy retain the original 6-hour fallback;
+     readable during the transition; manifests without a policy retain the original 6-hour fallback.
+     The soak ends early once `CANARY_QUORUM` (2) canary hosts report success and none reports
+     failure or pending: two canaries installed it and passed health, which is what the window
+     waits for (Leo, 2026-11-17: "we should be able to propagate and have ci related changes
+     reflect much faster");
    - at least one canary host's newest status is success, and no canary host's newest status is a
      failure. No host is required, whatever the risk: a canary that is silent or pending holds
      nothing once the soak is over. Policies above low risk signed before 2026-10-19 list Air Blue and
@@ -121,10 +140,17 @@ but still installs through `glaeda-mini-fleet upgrade` (below).
    never old enough, and stable would never move. Candidate age uses GitHub's `publishedAt`, the
    same canonical publication time written into the channel receipt.
 
-   Stable hosts pick it up within 10 minutes.
+   Stable hosts pick it up within about a minute (the probe in step 3), the mirror's included.
 
-End to end, a merged change reaches canary hosts in about an hour and stable hosts after the
-15-minute healthy-canary window.
+End to end, by design: the release is published about 5 minutes after the merge (the build), canary
+hosts see it within a minute and report after their install and health check, the second canary's
+success starts a promote run that moves stable (about a minute for the run), and every host (an idle
+runner's hook too) installs it within another minute plus its install: about 10 minutes from merge to
+a runner's hook. A busy runner takes the hook at its next gap between jobs. With one canary awake,
+stable waits out the 15-minute soak and that canary's next full run (up to 10 minutes) dispatches the
+promote run.
+Before 2026-11-17 the same path took 23 to 50 minutes (a 15-minute soak, then a 10-13 minute poll and
+up to 15 more for the mirror).
 
 ## Rings
 
@@ -162,8 +188,8 @@ convention of the workflows, not something the ruleset checks. The ruleset stops
 happen (a merge button, a direct push), not a fork admin or a workflow written to push `main`.
 
 **Anything merged to `main` ships to the fleet.** Every push to this `main` is released as above:
-canary hosts install it within about an hour, and the minis (stable) after the 15-minute canary
-window once both required host statuses are healthy. There is no separate approval step after the merge. To hold a release
+canary hosts install it within minutes of its release, and the minis (stable) once two canaries
+report it healthy (or after the 15-minute soak with one). There is no separate approval step after the merge. To hold a release
 back, pause the rollout (`control.yml`, below).
 
 - **Sync of `main`.** `.github/workflows/sync-main.yml` runs only in this repository, on every
@@ -210,15 +236,16 @@ back, pause the rollout (`control.yml`, below).
   secret `MIRROR_DEPLOY_KEY`), since the job token cannot create a tag on a commit whose workflow
   files differ from `main`'s; releases are then made on those tags with the job token. No personal
   token is stored anywhere.
-- **What hosts check.** A host with `"source": "manaflow-ai/glaeda"` downloads channel files and
-  assets from the fork, and checks them exactly as before: release.json must name
+- **What hosts check.** A host with `"source": "manaflow-ai/glaeda"` downloads assets from the fork (here when the
+  fork has not copied a release yet) and channel files from here first (step 3), and checks them exactly as before: release.json must name
   `teamleaderleo/glaeda`, and the attestation (when `gh` is signed in) must come from this
   repository's `release.yml`. The fork's admins can write what minis download, as they can already
   change the minis themselves, and now merge what this repository releases.
 - **Lag.** Each direction of `main` is up to 15 minutes behind (longer when GitHub's cron lags; a
-  push to this `main` syncs at once). Releases and rings reach the fork after the next mirror run.
-  A pause reaches the minis after the next mirror run; to hurry it, dispatch the mirror too:
-  `gh workflow run mirror.yml --repo manaflow-ai/glaeda`.
+  push to this `main` syncs at once). Releases and rings reach the fork after the next mirror run,
+  but the minis do not wait for it: they read the channel files here first and download a release
+  the fork lacks from here (step 3), so a promotion or a pause reaches them within about a minute.
+  The fork is their fallback when this repository cannot be read.
 - **Checkouts.** New minis clone the fork (`glaeda-mini-fleet`), and `~/glaeda` moves to the fork's
   `main`. Hosts set up earlier are moved by cmuxterm-hq's `build-fleet/mini-ops/glaeda-mirror.sh`,
   which sets their `origin` and `source`, one canary host first.
