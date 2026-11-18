@@ -8030,6 +8030,14 @@ LAND_SNAPSHOT_SCHEMA = "merge-hold-rollup-snapshot/v1"
 LAND_SNAPSHOT_DIR = "snapshots"
 LAND_SNAPSHOT_MAX_AGE = 300.0
 LAND_SNAPSHOT_WAIT = 120.0
+# Judgments run on the land workers and are handed one only when one is free (LandQueue.judge), least recently judged
+# first (LandQueue.judge_order). huge-blue, 2026-11-18: every due judgment went onto the pool's own queue at once (596
+# lands, 4 workers), hours deep; each update's re-exec (glaeda releases land 10-60 min apart) dropped that queue and
+# the next daemon judged from the top again, so cmux#45661 (SHIP, CLEAN, 60/60 green) went 7 h unjudged, its history
+# ending at snapshot_missing every pass: every due land waited on its snapshot at once, so the reads they were put
+# first for (Daemon.snapshot_waits) could not come within LAND_SNAPSHOT_WAIT. Ahead of the workers at most this many
+# per worker wait on their snapshot reads.
+LAND_SNAPSHOT_AHEAD = 1
 # A "command" step that is a wait this queue runs itself. cosmic-gray, 2026-11-17: merge_hold refused cmux#45404 (the
 # base clippy fix) `checks_running` with the step {"kind": "command", "text": "glaeda-gh wait run
 # manaflow-ai/cmux/44061804279 --timeout 3600"}, and land stopped on it twice, each stop also stopping every land queued
@@ -8418,6 +8426,7 @@ class LandQueue:
         self.entries: dict[str, dict] = {}
         self.jobs: dict[str, Any] = {}
         self.touched: dict[str, float] = {}
+        self.snapshot_waiting: set[str] = set()  # keys whose snapshot wait has not run out (judge's cap)
         self.pool: Any = None
         self.now = time.time()
         self.load()
@@ -8568,7 +8577,9 @@ class LandQueue:
         if self.refuse():
             return
         latch = self.latch_held()
-        for key in list(self.entries):
+        self.snapshot_waiting = {k for k, e in self.entries.items() if e.get("state") not in LAND_DONE
+                                 and isinstance(e.get("snapshotWait"), dict) and self.now - float(e["snapshotWait"].get("since") or 0) < LAND_SNAPSHOT_WAIT}
+        for key in sorted(self.entries, key=self.judge_order):
             try:
                 e = self.entries[key]
                 if e["state"] in LAND_DONE:
@@ -8842,14 +8853,23 @@ class LandQueue:
                             self.history(e, "error", error=describe(err))
                             self.save(e)
 
+    def workers(self) -> int:
+        return int(land_seconds(self.config().get("workers"), LAND_WORKERS, 1, 16))
+
+    def judge_order(self, key: str) -> float:
+        """The tick's order: the entry judged longest ago first (never judged: first of all), so a free worker goes to
+        the land that waited longest, and a restart, which keeps each entry's last judgment on disk, does not start
+        over from the same few."""
+        at = (self.entries[key].get("explain") or {}).get("at")
+        return float(at) if isinstance(at, (int, float)) and not isinstance(at, bool) else 0.0
+
     def submit(self, key: str, fn: Callable[..., None], *args: Any) -> None:
         if self.inline:
             fn(*args)
             return
         if self.pool is None:
             import concurrent.futures
-            workers = int(land_seconds(self.config().get("workers"), LAND_WORKERS, 1, 16))
-            self.pool = concurrent.futures.ThreadPoolExecutor(max_workers=workers, thread_name_prefix="land")
+            self.pool = concurrent.futures.ThreadPoolExecutor(max_workers=self.workers(), thread_name_prefix="land")
         self.jobs[key] = self.pool.submit(fn, *args)
 
     def keep_watching(self, e: dict) -> None:
@@ -9049,27 +9069,41 @@ class LandQueue:
             return None, "partial"
         return {**snap, "dataAt": at}, ""
 
-    def snapshot_wait(self, e: dict, sha: str) -> bool:
-        """True while E waits for the daemon to read SHA's rollup snapshot (at most LAND_SNAPSHOT_WAIT, nudged)."""
+    def snapshot_wait(self, e: dict, sha: str, free: bool = True) -> bool:
+        """True while E waits for the daemon to read SHA's rollup snapshot (at most LAND_SNAPSHOT_WAIT, nudged). A wait
+        that ran out with no worker FREE stays (True): it is judged live when one frees, never waits a second time."""
         _, why = self.snapshot(e["key"], sha)
         w = e.get("snapshotWait") or {}
         if why != "wait":
             e.pop("snapshotWait", None)
+            self.snapshot_waiting.discard(e["key"])
             return False
         if w.get("sha") != sha:
             w = e["snapshotWait"] = {"sha": sha, "since": self.now}
+            self.snapshot_waiting.add(e["key"])
             self.history(e, "snapshot_wait", head=sha[:12])
             self.nudge(e["key"])
             self.save(e)
-        if self.now - float(w.get("since") or 0) < LAND_SNAPSHOT_WAIT:
+        if self.now - float(w.get("since") or 0) < LAND_SNAPSHOT_WAIT or not free:
             return True
         e.pop("snapshotWait", None)
+        self.snapshot_waiting.discard(e["key"])
         self.history(e, "snapshot_missing", head=sha[:12])
         return False
 
     def judge(self, e: dict, sha: str, fp: str, counts: bool = True) -> None:
-        if self.snapshot_wait(e, sha):
+        """Judge E at SHA on a free worker. None free: it stays as it is and is considered again next tick (the tick
+        goes least recently judged first), so the pool never queues; ahead of the workers at most LAND_SNAPSHOT_AHEAD
+        per worker start their snapshot wait, the rest wait for room without nudging a read."""
+        workers = self.workers()
+        free = len(self.jobs) < workers
+        mine = (e.get("snapshotWait") or {}).get("sha") == sha
+        if not mine and len(self.jobs) + len(self.snapshot_waiting) >= workers * (1 + LAND_SNAPSHOT_AHEAD):
+            return
+        if self.snapshot_wait(e, sha, free):
             return  # judged on the daemon's next read of this head (one read, shared), not on merge_hold's own
+        if not free:
+            return
         head = str((((self.cache_of(e["key"]) or {}).get("data")) or {}).get("headRefOid") or "").lower()
         e.update(state="judging", seen=fp, seenHead=head, judging={"sha": sha, "at": self.now, "counts": counts})
         self.save(e)

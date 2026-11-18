@@ -17964,6 +17964,102 @@ class LandTest(Base):
         self.assert_merged_at(LA)
         self.assertIn("snapshot_missing", [h.get("event") for h in self.q.entries[self.KEY]["history"]])
 
+    class FakePool:
+        """A worker pool whose jobs run only when a test says so: what was handed to it, in order."""
+
+        class Job:
+            def __init__(self) -> None:
+                self.finished = False
+
+            def done(self) -> bool:
+                return self.finished
+
+            def exception(self) -> None:
+                return None
+
+        def __init__(self) -> None:
+            self.handed: list[tuple[str, Any]] = []
+
+        def submit(self, fn: Any, *args: Any) -> Any:
+            job = self.Job()
+            self.handed.append((args[0], job))
+            return job
+
+        def keys(self) -> list[str]:
+            return [k for k, _ in self.handed]
+
+    def pooled(self, workers: int) -> "LandTest.FakePool":
+        self.w.config["workers"] = workers
+        self.q = self.queue()
+        self.q.inline = False
+        self.q.pool = pool = self.FakePool()
+        return pool
+
+    def test_judgments_wait_for_a_free_worker_instead_of_queueing_on_the_pool(self):
+        # huge-blue, 2026-11-18: 596 queued lands, 4 workers. Every judgment went onto the pool's own queue at once, so
+        # the queue was hours deep; each update's re-exec (10-60 min apart) dropped it and judged from the top again,
+        # and cmux#45661 (SHIP, CLEAN, 60/60 green) sat unjudged for 7 h behind snapshot_missing.
+        pool = self.pooled(2)
+        for n in range(1, 6):
+            key = f"pr:o/r#{n}"
+            self.pr(LA, key=key)
+            self.w.cache[key]["fp"] = "F"
+            self.snaps[key] = {"schema": gg.ROLLUP_SCHEMA, "key": key, "head": LA, "fp": "F", "complete": True,
+                               "readAt": self.t, "rollup": {"nodes": self.NODES}}
+            self.land(f"o/r#{n}")
+        self.tick()
+        self.tick()
+        self.assertEqual(len(pool.handed), 2)  # never more jobs than workers
+        self.assertEqual(len(self.q.jobs), 2)
+        pool.handed[0][1].finished = True
+        self.tick()
+        self.assertEqual(len(pool.handed), 3)
+        self.assertEqual(len(self.q.jobs), 2)
+
+    def test_a_restart_judges_the_longest_unjudged_land_first(self):
+        pool = self.pooled(5)
+        for n in range(1, 6):
+            key = f"pr:o/r#{n}"
+            self.pr(LA, key=key)
+            self.w.cache[key]["fp"] = "F"
+            self.snaps[key] = {"schema": gg.ROLLUP_SCHEMA, "key": key, "head": LA, "fp": "F", "complete": True,
+                               "readAt": self.t, "rollup": {"nodes": self.NODES}}
+            self.land(f"o/r#{n}")
+        self.tick()
+        self.assertEqual(len(pool.handed), 5)
+        for n in range(1, 6):  # judged a minute ago, but #5 not for 7 h; all being judged when the re-exec came
+            e = self.q.entries[f"pr:o/r#{n}"]
+            e["explain"] = {"at": self.t - (7 * 3600 if n == 5 else 60), "ok": False}
+            self.q.save(e)
+        pool = self.pooled(2)  # the re-exec: a fresh queue off the same disk
+        self.tick()
+        self.assertEqual(pool.keys()[0], "pr:o/r#5")
+        self.assertEqual(len(pool.handed), 2)
+
+    def test_snapshot_waits_are_capped_and_an_expired_wait_keeps_its_place_while_workers_are_busy(self):
+        pool = self.pooled(1)
+        for n in range(1, 5):
+            key = f"pr:o/r#{n}"
+            self.pr(LA, key=key)
+            self.w.cache[key]["fp"] = "F"  # no snapshot: each judgment waits for the daemon's read first
+            self.land(f"o/r#{n}")
+        self.tick()
+        waiting = [k for k, e in self.q.entries.items() if e.get("snapshotWait")]
+        self.assertEqual(len(waiting), 2)  # one per worker, one ahead: not all 4 (each nudges a read)
+        self.assertEqual(self.w.nudged.count("pr:o/r#3") + self.w.nudged.count("pr:o/r#4"), 0)
+        self.tick(gg.LAND_SNAPSHOT_WAIT + 1)
+        self.assertEqual(len(pool.handed), 1)  # the first expired wait judged live in the same pass
+        other = [k for k in waiting if k != pool.keys()[0]][0]
+        events = [h.get("event") for h in self.q.entries[other]["history"]]
+        self.assertEqual((events.count("snapshot_wait"), events.count("snapshot_missing")), (1, 0))
+        self.tick()
+        self.assertEqual(len(pool.handed), 1)
+        pool.handed[0][1].finished = True
+        self.tick()
+        self.assertEqual(pool.keys()[1], other)  # the next free worker goes to it, no second two-minute wait
+        events = [h.get("event") for h in self.q.entries[other]["history"]]
+        self.assertEqual((events.count("snapshot_wait"), events.count("snapshot_missing")), (1, 1))
+
     def test_no_wait_for_a_partial_snapshot_an_upstream_host_or_a_rest_read(self):
         for setup in ("partial", "upstream", "rest"):
             with self.subTest(setup):
