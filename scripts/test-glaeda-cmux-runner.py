@@ -9884,6 +9884,140 @@ class GateTest(unittest.TestCase):
         with mock.patch.object(hook.os, "scandir", side_effect=PermissionError("denied")):
             self.assertTrue(hook.capture_lease_holding(os.fspath(self.lock)), "a reading that cannot tell is taken")
 
+    def backfill_log(self, lines: list[dict]) -> Path:
+        log = self.tmp / "jobs.jsonl"
+        with log.open("w", encoding="utf-8") as handle:
+            for line in lines:
+                handle.write(json.dumps({"schema": hook.JOB_SCHEMA, "repository": "manaflow-ai/cmux", **line}) + "\n")
+        hook._BACKFILL_CACHE.clear()
+        return log
+
+    def backfill_history(self, now: float) -> list[dict]:
+        """Completed runs, all ended an hour before now: Tour the app runs 60 min here (5 runs), daemon-test 10 min
+        on runner r2 (10 runs), and r3's own jobs 50 min (10 runs)."""
+        done: list[dict] = []
+        for i in range(5):
+            done.append({"event": "completed", "runner": "r1", "workflow_file": "cmux-next-media.yml", "job": "tour",
+                         "class": "gui-step", "seconds": 3600, "at": now - 7200 - i})
+        for i in range(10):
+            done.append({"event": "completed", "runner": "r2", "workflow_file": "cmux-next.yml", "job": "daemon-test",
+                         "class": "isolated", "seconds": 600, "at": now - 3600 - i})
+            done.append({"event": "completed", "runner": "r3", "workflow_file": "cmux-next.yml", "job": "frames",
+                         "class": "gui", "seconds": 3000, "at": now - 3600 - i})
+        return done
+
+    def hold_runner(self, runner: str) -> None:
+        self.state.mkdir(exist_ok=True)
+        hook.holder_file(self.state, runner).write_text(str(os.getpid()))
+
+    def test_a_drain_lets_an_idle_runner_take_a_job_that_ends_before_the_running_ones(self) -> None:
+        # DRAIN_BACKFILL. 2026-11-16 10:34Z: a measurement spill drain held 11 of cmux9s-mac-mini's 14 runners while
+        # one Tour the app job (p90 67 min) ran, 12 of 14 units free, 47 jobs waiting for a mini. A job that ends
+        # before the tour does costs the drain nothing, so the gate passes the drain for a runner whose own jobs'
+        # p90 fits in what is left of the tour, and holds for one whose jobs would outlast it.
+        now = time.time()
+        drain = now - 600
+        lines = self.backfill_history(now)
+        lines.append({"event": "started", "runner": "r1", "workflow_file": "cmux-next-media.yml", "job": "tour",
+                      "class": "gui-step", "at": now - 1200})
+        log = self.backfill_log(lines)
+        self.hold_runner("r1")
+        window = hook.backfill_window(self.state, hook.job_log_tail(log), now, drain)
+        self.assertIsNotNone(window)
+        self.assertAlmostEqual(window[0], 2400, delta=1)
+        self.assertIn("tour on r1, p90 60 min (5 runs here)", window[1])
+        why = hook.drain_backfill(self.state, "r2", drain, now=now, log=log)
+        self.assertIsNotNone(why)
+        self.assertIn("p90 10 min here", why)
+        self.assertIsNone(hook.drain_backfill(self.state, "r3", drain, now=now, log=log),
+                          "a 50 min job would outlast the tour's 40 min: the drain holds this runner")
+        self.assertIsNone(hook.drain_backfill(self.state, "r9", drain, now=now, log=log),
+                          "a runner with no history here: the drain holds it")
+        self.assertIsNone(hook.drain_backfill(self.state, "r2", None, now=now, log=log), "no drain start: hold")
+        # the tour ends (its holder exits): nothing left that the drain waits behind, so every runner is held
+        hook.holder_file(self.state, "r1").unlink()
+        self.assertIsNone(hook.drain_backfill(self.state, "r2", drain, now=now, log=log))
+
+    def test_a_job_admitted_after_the_drain_began_never_widens_its_window(self) -> None:
+        # Otherwise each backfilled job (or a nightly passed ahead of the drain) would let the next one in, and the
+        # drain would never see the mini empty.
+        now = time.time()
+        drain = now - 600
+        lines = self.backfill_history(now)
+        lines.append({"event": "started", "runner": "r2", "workflow_file": "cmux-next.yml", "job": "daemon-test",
+                      "class": "isolated", "at": now - 900})
+        lines.append({"event": "started", "runner": "r1", "workflow_file": "cmux-next-media.yml", "job": "tour",
+                      "class": "gui-step", "at": now - 60})
+        log = self.backfill_log(lines)
+        self.hold_runner("r1")
+        self.hold_runner("r2")
+        window = hook.backfill_window(self.state, hook.job_log_tail(log), now, drain)
+        self.assertAlmostEqual(window[0], 0, delta=1, msg="daemon-test (15 min in, p90 10) is the only earlier job")
+        self.assertIsNone(hook.drain_backfill(self.state, "r2", drain, now=now, log=log))
+
+    def test_a_running_job_with_few_runs_here_takes_the_fleets_p90_or_holds(self) -> None:
+        now = time.time()
+        drain = now - 60
+        lines = [{"event": "started", "runner": "r1", "workflow_file": "cmux-next-media.yml", "job": "tour",
+                  "class": "gui-step", "at": now - 600}]
+        log = self.backfill_log(lines)
+        self.hold_runner("r1")
+        needs = self.tmp / "needs.json"
+        stamp = datetime.datetime.fromtimestamp(now - 3600, datetime.timezone.utc).isoformat()
+        doc = {"schema": hook.JOB_NEEDS_SCHEMA, "generated_at": stamp, "min_samples": 20, "hosts": ["elsewhere"],
+               "jobs": {"cmux-next-media.yml/tour": {"n": 1385, "wall_s_p90": 3999,
+                                                      "by_ncpu": {"14": {"n": 1385, "wall_s_p90": 4000}}}},
+               "classes": {"gui-step": {"n": 588, "wall_s_p90": 937}}}
+        needs.write_text(json.dumps(doc))
+        walls = hook.fleet_walls(needs)
+        self.assertTrue(walls, "the hosts canary gates the capacity rows, not the run times")
+        with mock.patch.object(hook, "host_cores", return_value=14):
+            window = hook.backfill_window(self.state, hook.job_log_tail(log), now, drain, walls)
+        self.assertAlmostEqual(window[0], 3400, delta=1)
+        self.assertIn("(the fleet's)", window[1])
+        with mock.patch.object(hook, "host_cores", return_value=10):
+            window = hook.backfill_window(self.state, hook.job_log_tail(log), now, drain, walls)
+        self.assertAlmostEqual(window[0], 3399, delta=1, msg="no row for 10 cores: the pooled row")
+        doc["jobs"] = {}
+        needs.write_text(json.dumps(doc) + " ")
+        window = hook.backfill_window(self.state, hook.job_log_tail(log), now, drain, hook.fleet_walls(needs))
+        self.assertAlmostEqual(window[0], 337, delta=1, msg="no job row: its class's")
+        doc["classes"] = {}
+        needs.write_text(json.dumps(doc) + "  ")
+        self.assertIsNone(hook.backfill_window(self.state, hook.job_log_tail(log), now, drain,
+                                               hook.fleet_walls(needs)), "nothing estimates the tour: hold")
+        self.assertEqual(hook.fleet_walls(self.tmp / "missing.json"), {})
+
+    def test_a_drain_begins_when_its_marker_registered(self) -> None:
+        waiters = Path(str(self.lock) + ".waiters")
+        waiters.mkdir()
+        for name in ("70504-refresh-lend_drain-1794825279605328000", "70504-refresh-lend_drain-1794826748580064000",
+                     "61199-1794807627-root-drain", "70507-blocked"):
+            (waiters / name).touch()
+        self.assertAlmostEqual(hook.drain_since(os.fspath(self.lock), {70504}), 1794825279.605328, places=3)
+        self.assertEqual(hook.drain_since(os.fspath(self.lock), {61199, 70504}), 1794807627.0)
+        self.assertIsNone(hook.drain_since(os.fspath(self.lock), {70507}))
+        self.assertIsNone(hook.drain_since(os.fspath(self.tmp / "none.lock"), {70504}))
+
+    def test_the_gate_passes_a_drain_only_while_its_next_job_fits_before_the_mini_empties(self) -> None:
+        (self.runner / ".runner").write_text(json.dumps({"agentName": "r2"}))
+        gate = hook.Gate(self.runner, os.fspath(self.lock), "", self.state)
+        with mock.patch.object(hook, "host_waiters", return_value={77, 78}), \
+                mock.patch.object(hook, "drain_lock_waiters", return_value={77}), \
+                mock.patch.object(hook, "drain_since", return_value=1000.0), \
+                mock.patch.object(hook, "gate_log") as logged:
+            with mock.patch.object(hook, "drain_backfill", return_value="fits") as asked:
+                self.assertEqual(gate.blocking_waiters(), {78}, "a build waiting for the host is not a drain")
+                self.assertEqual(asked.call_args.args[1:], ("r2", 1000.0))
+                self.assertEqual(gate.blocking_waiters(), {78})
+            self.assertEqual(logged.call_count, 1, "logged once per drain")
+            with mock.patch.object(hook, "drain_backfill", return_value=None):
+                self.assertEqual(gate.blocking_waiters(), {77, 78})
+        with mock.patch.object(hook, "host_waiters", return_value=set()), \
+                mock.patch.object(hook, "drain_backfill") as asked:
+            self.assertEqual(gate.blocking_waiters(), set())
+            asked.assert_not_called()
+
     def test_replay_a_worker_waiting_for_over_an_hour_is_bounded(self) -> None:
         # 2026-10-26, a std mini: the fleet worker (one pid) waited for host.lock from 22:19Z, taking it now and then
         # only to hand its build back for disk (2 to 12 min a try) and wait again. Every gate held its listener off

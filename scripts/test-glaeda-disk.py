@@ -2489,6 +2489,124 @@ class GlaedaDiskTest(unittest.TestCase):
         self.assertTrue(gd.remove_spm_scratch(scratch / "raced"))
         self.assertFalse((scratch / "raced").exists())
 
+    def test_the_fast_tier_seed_root_goes_under_its_lock_after_slot_builds(self) -> None:
+        """cmux#44271, 2026-11-18: owned-mini fast-tier jobs restore the base seed at the seed workspace
+        (cmux owned_spm_scratch.py seed_lease). Its package builds go under pressure only while no job holds the
+        root's lock, and after per-slot cold builds of the same size and age: every slot's cold build costs a
+        whole compile, the seed root one restore."""
+        seed = self.root / "runner/_work/cmux"
+        ws = seed / "cmux"
+        next_build = make(ws / "Packages/macOS/CmuxNext/.build", mib=4, age_hours=50)
+        home_build = make(ws / "Packages/Shared/CmuxHomeRender/.build", mib=1, age_hours=50)
+        (ws / "Packages/macOS/CmuxNext/Package.swift").write_text("// swift-tools-version:6.0\n")
+        (seed / ".cmux-seed-root").touch()  # provisioning marks it (cmux owned_spm_scratch.SEED_MARKER)
+        lock = seed / gd.SEED_ROOT_LOCK
+        lock.touch()
+        ci = self.root / "ci"
+        make(ci / "seeds/p-a", age_hours=1)
+        with mock.patch.object(gd, "CMUX_SEED_ROOT", seed):
+            fams = [f for f in gd.fleet_families(ci) if f.id == gd.SEED_ROOT_FAMILY]
+        self.assertEqual([f.root for f in fams], [ws / "Packages"])
+        with mock.patch.object(gd, "CMUX_SEED_ROOT", self.root / "absent"):
+            self.assertEqual([f for f in gd.fleet_families(ci) if f.id == gd.SEED_ROOT_FAMILY], [],
+                             "a mini without the seed workspace has no such family")
+        (seed / ".cmux-seed-root").unlink()
+        with mock.patch.object(gd, "CMUX_SEED_ROOT", seed):
+            self.assertEqual([f for f in gd.fleet_families(ci) if f.id == gd.SEED_ROOT_FAMILY], [],
+                             "unmarked, it is a runner's workspace (the nightly-next builder's): never this family")
+        (seed / ".cmux-seed-root").touch()
+        fam = fams[0]
+        self.assertFalse(gd.job_busy(fam, next_build), "its lock, not a slot marker search, decides")
+
+        def verdicts() -> dict[str, str]:
+            return {os.path.relpath(i.path, ws): i.verdict for i in gd.survey(fams, 6, 0)}
+
+        self.assertEqual(verdicts(), {"Packages/macOS/CmuxNext/.build": "reclaimable",
+                                      "Packages/Shared/CmuxHomeRender/.build": "reclaimable"})
+        # a fast-tier job's holder keeps the lock exclusive for the whole job
+        holder = subprocess.Popen([sys.executable, "-c", "import fcntl, sys, time\n"
+                                   "f = open(sys.argv[1], 'a'); fcntl.flock(f, fcntl.LOCK_EX)\n"
+                                   "print('held', flush=True); time.sleep(60)\n", os.fspath(lock)],
+                                  stdout=subprocess.PIPE, text=True)
+        self.addCleanup(holder.stdout.close)
+        self.addCleanup(holder.wait)
+        self.addCleanup(holder.kill)
+        self.assertEqual(holder.stdout.readline().strip(), "held")
+        self.assertTrue(gd.seed_root_held(fam, next_build))
+        self.assertEqual(set(verdicts().values()), {"in-use"})
+        self.assertFalse(gd.remove_seed_root_build(fam, next_build), "the delete itself takes the lock")
+        self.assertTrue(next_build.exists())
+        holder.kill()
+        holder.wait()
+        self.assertFalse(gd.seed_root_held(fam, next_build))
+
+        # a job takes the root between the survey and the delete: apply re-checks the lock and keeps it
+        items = [i for i in gd.survey(fams, 6, 0) if i.verdict == "reclaimable"]
+        late = open(lock, "a")
+        fcntl.flock(late, fcntl.LOCK_EX)
+        with mock.patch.object(gd, "process_evidence", return_value=([], "")):
+            gd.apply(items, {f.id: f for f in fams}, self.root / "r.jsonl", None, 6)
+        late.close()
+        self.assertTrue(next_build.exists() and home_build.exists())
+        items = [i for i in gd.survey(fams, 6, 0) if i.verdict == "reclaimable"]
+        with mock.patch.object(gd, "process_evidence", return_value=([], "")):
+            gd.apply(items, {f.id: f for f in fams}, self.root / "r2.jsonl", None, 6)
+        self.assertFalse(next_build.exists() or home_build.exists())
+        self.assertTrue((ws / "Packages/macOS/CmuxNext/Package.swift").exists(), "only the builds go")
+        self.assertEqual(sorted(p.name for p in (ws / "Packages/macOS/CmuxNext").iterdir()), ["Package.swift"],
+                         "no aside tree left behind")
+        self.assertTrue(lock.exists())
+
+        # per-slot cold builds (a runner checkout's, a SwiftPM scratch slot's) of the same size and age go first
+        slot = make(self.root / "slot/.build", mib=4, age_hours=50)
+        item = lambda path: gd.Item("x", os.fspath(path), 4 * 1024**2, 50.0, "reclaimable")
+        runner_build = gd.Family(gd.RUNNER_BUILD_FAMILY, slot.parent, True, "rebuild", rebuild_minutes=10)
+        spm = gd.spm_scratch_family(ci)
+        self.assertLess(gd.value(item(next_build), fam), gd.value(item(slot), runner_build))
+        self.assertLess(gd.value(item(next_build), fam), gd.value(item(slot), spm))
+
+    def test_a_fresh_seed_root_build_goes_only_below_a_floor(self) -> None:
+        """Review of glaeda#2137: nearly every fast-tier job rewrites the seed root's builds, so they never age past
+        the idle window. Below the runner floor (the floor hold) or the emergency floor they go once no job holds
+        the root, and a delete cut short leaves a deleting-named tree the interrupted sweep finishes."""
+        seed = self.root / "runner/_work/cmux"
+        ws = seed / "cmux"
+        fresh = make(ws / "Packages/macOS/CmuxNext/.build", mib=4, age_hours=0.1)
+        (seed / ".cmux-seed-root").touch()
+        lock = seed / gd.SEED_ROOT_LOCK
+        lock.touch()
+        with mock.patch.object(gd, "CMUX_SEED_ROOT", seed):
+            fams = [f for f in gd.fleet_families(self.root / "ci") if f.id == gd.SEED_ROOT_FAMILY]
+        dev = fams[0].root.stat().st_dev
+
+        def verdict() -> str:
+            got = {os.path.relpath(i.path, ws): i.verdict for i in gd.survey(fams, 6, 0)}
+            self.assertEqual(list(got), ["Packages/macOS/CmuxNext/.build"])
+            return got["Packages/macOS/CmuxNext/.build"]
+
+        self.assertEqual(verdict(), "recent")
+        with mock.patch.object(gd, "FLOOR_HOLD", {dev: 1 << 60}):
+            self.assertEqual(verdict(), "reclaimable")
+        with mock.patch.object(gd, "EMERGENCY_DEVS", frozenset({dev})):
+            self.assertEqual(verdict(), "reclaimable")
+            late = open(lock, "a")
+            fcntl.flock(late, fcntl.LOCK_EX)
+            self.assertEqual(verdict(), "in-use")
+            late.close()
+            # below the emergency floor but above the runner floor's hold, apply deletes it too
+            items = [i for i in gd.survey(fams, 6, 0) if i.verdict == "reclaimable"]
+            with mock.patch.object(gd, "process_evidence", return_value=([], "")):
+                gd.apply(items, {f.id: f for f in fams}, self.root / "r.jsonl", None, 6)
+        self.assertFalse(fresh.exists())
+        # the aside tree sits beside the lock, outside the workspace the next job mirrors into, and a delete cut
+        # short there is finished by the interrupted sweep
+        self.assertEqual([p.name for p in seed.iterdir() if gd.DELETING_RE.fullmatch(p.name)], [])
+        aside = seed / f"{gd.DELETING_PREFIX}CmuxNext.build-99"
+        make(aside)
+        self.assertIn(seed, [f.root for f in gd.interrupted_families(fams)])
+        doomed = gd.seed_root_aside(fams[0], make(ws / "Packages/macOS/CmuxNext/.build"))
+        self.assertEqual(doomed.parent, seed)
+
     def test_canonical_root_admission_goes_under_its_root_token(self) -> None:
         """cmux7s, cmux12s, cmux13s, 2026-10-21: 8-9 GiB of admission DerivedData per idle canonical root stayed,
         because the tmp family judged the whole root and its src/ checkout holds untracked build inputs."""
