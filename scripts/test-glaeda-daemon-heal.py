@@ -1531,6 +1531,17 @@ class FakeHygiene:
     def __call__(self, argv: list[str], timeout: float) -> tuple[int, str, str]:
         self.argv.append(argv)
         source = Path(argv[argv.index("--source") + 1]).read_bytes()
+        if "--root-census" in argv:  # the host's census alone: its snapshot and plist under the same test tree
+            census = self.root / "root-census" / "glaeda-disk"
+            if "--apply" in argv:
+                if self.fail_apply:
+                    return 2, "", "glaeda-runner-hygiene: launchctl bootstrap of the root census failed"
+                census.parent.mkdir(parents=True, exist_ok=True)
+                census.write_bytes(source)
+                return 0, json.dumps({"state": "applied", "operation": "root-census"}), ""
+            current = census.is_file() and census.read_bytes() == source
+            return 0, json.dumps({"state": "current" if current else "stale",
+                                  "stale": [] if current else ["root census snapshot missing"]}), ""
         uid = "501"  # the one account the tests enroll
         snapshot, manifest = self.root / uid / "glaeda-disk", self.root / uid / "manifest.json"
         if "--apply" in argv:
@@ -1669,11 +1680,84 @@ class RunnerHygiene(unittest.TestCase):
         self.assertIn("Input/output error", report["error"])
         self.assertEqual(self.state["runner_hygiene"], cache, "the cache is kept")
 
-    def test_no_enrolled_account_is_no_work(self) -> None:
+    def unenroll(self) -> None:
         for p in (self.root / "501").iterdir():
             p.unlink()
         (self.root / "501").rmdir()
-        self.assertEqual(self.hygiene_pass(), {"accounts": {}})
+
+    def census_pass(self, why: str = "", live: bool = True, now: float = T0) -> dict:
+        return heal.hygiene_pass(self.dir, self.state, now, live, self.root, self.daemons, self.run,
+                                 sys.executable, lambda uid: {501: "cmux"}[uid], lambda: why)
+
+    def test_no_enrolled_account_off_a_ci_mini_is_no_work(self) -> None:
+        self.unenroll()
+        self.assertEqual(self.census_pass(why="no runner glaeda-cmux-runner enrolled under /Users/x: not a CI mini"),
+                         {"accounts": {}, "rootCensus": {"state": "skipped", "why":
+                                                          "no runner glaeda-cmux-runner enrolled under /Users/x: not a CI mini"}})
+        self.assertEqual(self.run.argv, [])
+
+    def test_an_unenrolled_ci_mini_gets_the_root_census_from_daemon_heal(self) -> None:
+        # Lent CI minis, 2026-11-18: no account was ever enrolled, so no root census anywhere ("nothing is adopted").
+        # Root daemon-heal now keeps the host's read-only census there with the release's own --root-census.
+        self.unenroll()
+        census = self.root / "root-census" / "glaeda-disk"
+        report = self.census_pass()
+        c = report["rootCensus"]
+        self.assertEqual((report["accounts"], c["state"], c["reinstalled"]), ({}, "current", True))
+        self.assertEqual(census.read_bytes(), DISK_BYTES)
+        self.assertEqual(self.run.argv[0], [sys.executable, "-I", os.fspath(self.dir / heal.HYGIENE_NAME),
+                                            "--root-census", "--source", os.fspath(self.dir / heal.DISK_NAME),
+                                            "--python", "/usr/bin/python3", "--check"])
+        self.assertEqual([a[-1] for a in self.run.argv], ["--check", "--apply", "--check"])
+        calls = len(self.run.argv)
+        again = self.census_pass(now=T0 + 120)
+        self.assertEqual((again["rootCensus"]["state"], len(self.run.argv)), ("current", calls), "a second pass runs nothing")
+
+    def test_the_root_census_is_planned_not_installed_off_a_root_pass_and_waits_on_its_release(self) -> None:
+        self.unenroll()
+        c = self.census_pass(live=False)["rootCensus"]
+        self.assertEqual((c["state"], c["action"], self.run.applies()), ("stale", "reinstall", 0))
+        (self.dir / heal.HYGIENE_NAME).write_bytes(b"print('not the release')\n")
+        self.run.argv.clear()
+        c = self.census_pass(now=T0 + 120)["rootCensus"]
+        self.assertEqual((c["state"], self.run.argv), ("unchecked", []))
+        self.assertIn("release pass brings them", c["why"])
+
+    def test_a_failed_root_census_install_is_an_error_retried_after_hygiene_retry_s(self) -> None:
+        self.unenroll()
+        self.run.fail_apply = True
+        c = self.census_pass()["rootCensus"]
+        self.assertEqual((c["state"], c["reinstalled"]), ("error", False))
+        calls = len(self.run.argv)
+        self.assertEqual(self.census_pass(now=T0 + 120)["rootCensus"]["state"], "error")
+        self.assertEqual(len(self.run.argv), calls)
+        self.run.fail_apply = False
+        self.assertEqual(self.census_pass(now=T0 + heal.HYGIENE_RETRY_S + 1)["rootCensus"]["state"], "current")
+
+    def test_an_enrolled_account_keeps_the_census_itself(self) -> None:
+        report = self.census_pass()
+        self.assertNotIn("rootCensus", report)
+        self.assertFalse(any("--root-census" in a for a in self.run.argv), "one writer: the account's own --apply")
+
+    def test_a_ci_mini_is_a_mac_whose_fleet_user_runs_enrolled_runners_never_lawrence_or_ec2(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            home = Path(d)
+            pw = mock.Mock(pw_dir=os.fspath(home), pw_name="cmux")
+            with mock.patch.object(heal.sys, "platform", "darwin"), \
+                    mock.patch.object(heal, "fleet_user", return_value=pw), \
+                    mock.patch.object(heal, "platform_node", return_value="cmux-mac-018.local"), \
+                    mock.patch.object(heal.pwd, "getpwnam", side_effect=KeyError("ec2-user")):
+                self.assertIn("not a CI mini", heal.ci_mini_why_not())
+                runner = home / "actions-runner-glaeda-1"
+                (runner / "glaeda-hooks").mkdir(parents=True)
+                self.assertIn("not a CI mini", heal.ci_mini_why_not(), "a .runner config too")
+                (runner / ".runner").write_text("{}")
+                self.assertEqual(heal.ci_mini_why_not(), "")
+                with mock.patch.object(heal, "platform_node", return_value="cmux-lawrence.local"):
+                    self.assertIn("lawrence", heal.ci_mini_why_not())
+            with mock.patch.object(heal.sys, "platform", "darwin"), \
+                    mock.patch.object(heal.pwd, "getpwnam", return_value=mock.Mock()):
+                self.assertIn("EC2", heal.ci_mini_why_not())
 
     def test_the_release_chain_brings_both_files_and_the_root_pass_uses_them(self) -> None:
         for name in (heal.DISK_NAME, heal.HYGIENE_NAME, heal.INSTALLED):

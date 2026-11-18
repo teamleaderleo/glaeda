@@ -300,6 +300,43 @@ class RunnerHygieneTest(unittest.TestCase):
         self.assertFalse(self.install.census_plist.exists())
         self.assertFalse(self.install.census_dir.exists())
 
+    def test_the_root_census_alone_installs_and_checks_with_no_account(self) -> None:
+        # A CI mini no account was ever enrolled on (the lent CI minis, 2026-11-18): root daemon-heal runs
+        # --root-census, which goes through the same census checks and writes the same plist an account's --apply does.
+        census = rh.Census(Path("/usr/bin/python3"), self.source, self.root, self.daemons, self.launchctl)
+        self.assertEqual((census.census_dir, census.census_snapshot, census.census_plist),
+                         (self.install.census_dir, self.install.census_snapshot, self.install.census_plist))
+        self.assertEqual(rh.census_plist_bytes(census), rh.census_plist_bytes(self.install), "one plist, one writer's bytes")
+        before = sorted(self.base.rglob("*"))
+        self.assertEqual(rh.census_plan(census)["census"], "missing")
+        with mock.patch.object(rh, "service_loaded", return_value=False):
+            self.assertEqual(rh.check_census(census)["stale"], ["root census snapshot missing", "root census plist missing"])
+        self.assertEqual(before, sorted(self.base.rglob("*")), "plan and check write nothing")
+        calls = []
+
+        def ctl(install, *args):
+            calls.append(args)
+            return SimpleNamespace(returncode=0, stderr="", stdout="")
+        with mock.patch.object(rh, "_require_root"), mock.patch.object(rh, "_check_root_install_path"), \
+                mock.patch.object(rh, "_immutable"), mock.patch.object(rh, "launchctl_run", side_effect=ctl), \
+                mock.patch.object(rh, "service_loaded", return_value=True), mock.patch.object(rh.os, "chown"):
+            self.assertEqual(rh.apply_root_census(census)["operation"], "root-census")
+        self.assertEqual(calls, [("bootstrap", "system", str(census.census_plist))])
+        self.assertEqual(census.census_snapshot.read_bytes(), self.source.read_bytes())
+        self.assertFalse(self.install.install_dir.exists(), "no account's job is made")
+        with mock.patch.object(rh, "service_loaded", return_value=True):
+            self.assertEqual(rh.check_census(census)["state"], "current")
+        self.install.census_plist.write_bytes(plistlib.dumps({"Label": rh.CENSUS_LABEL, "ProgramArguments": ["x"]}))
+        with mock.patch.object(rh, "_require_root"), mock.patch.object(rh, "_check_root_install_path"), \
+                self.assertRaisesRegex(rh.HygieneError, "not a glaeda-runner-hygiene plist"):
+            rh.apply_root_census(census)
+
+    def test_root_census_takes_no_account_on_the_command_line(self) -> None:
+        with mock.patch.object(rh.platform, "system", return_value="Darwin"):
+            for argv in (["--root-census", "--user", self.account.name], ["--root-census", "--uninstall"], ["--check"]):
+                with self.assertRaises(SystemExit):
+                    rh.main(argv)
+
     def test_check_is_read_only_on_the_command_line(self) -> None:
         with mock.patch.object(rh.platform, "system", return_value="Darwin"), \
                 self.assertRaises(SystemExit):

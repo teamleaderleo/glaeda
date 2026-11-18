@@ -12,6 +12,8 @@ Examples::
     sudo glaeda-runner-hygiene --user cmux --apply
     sudo glaeda-runner-hygiene --user cmux --uninstall --apply
     glaeda-runner-hygiene --user cmux --check    is the installed job what --apply of this source leaves (JSON)
+    sudo glaeda-runner-hygiene --root-census --apply    the host's root census alone, with no account enrolled
+    glaeda-runner-hygiene --root-census --check  is the host's root census what --apply of this source leaves (JSON)
 
 The root glaeda-daemon-heal pass runs --check and then --apply from its verified copy of the stable release, so
 the pinned snapshot follows stable with no hand step (docs/RUNNER_ACCOUNT_HYGIENE.md).
@@ -54,7 +56,8 @@ ROOT_UID = 0  # the owner an install must have (tests patch it with their own ui
 # account's job, so a CI mini's accounting sizes every folder of every account (other homes, /private/var, /Library,
 # guarded folders) instead of reporting them unreadable. It runs as root, read-only: du, listdir and lstat, and one
 # JSON doc under /Library/Application Support/glaeda/root-census. Its snapshot is pinned and root-owned like the
-# account's. Only hosts with an enrolled runner account (CI minis) have it; a devbox has none.
+# account's. CI minis have it: every enrolled account's job keeps it, and on a CI mini where no account was ever
+# enrolled (the lent CI minis, 2026-11-18: none had it) root daemon-heal keeps it with --root-census. A devbox has none.
 CENSUS_LABEL = f"{LABEL_PREFIX}.root-census"
 CENSUS_DIR_NAME = "root-census"
 CENSUS_INTERVAL = 30 * 60
@@ -97,6 +100,29 @@ class Install:
     @property
     def census_plist(self) -> Path:
         return self.plist.parent / f"{CENSUS_LABEL}.plist"
+
+
+@dataclasses.dataclass(frozen=True)
+class Census:
+    """The host's root census alone, with no account: what --root-census installs and checks. It has every attribute
+    the census functions read from an Install, so both go through the same checks."""
+    python: Path
+    source: Path
+    root: Path
+    daemons: Path
+    launchctl: Path
+
+    @property
+    def census_dir(self) -> Path:
+        return self.root / CENSUS_DIR_NAME
+
+    @property
+    def census_snapshot(self) -> Path:
+        return self.census_dir / DISK_NAME
+
+    @property
+    def census_plist(self) -> Path:
+        return self.daemons / f"{CENSUS_LABEL}.plist"
 
 
 def _absolute_real(path: Path, label: str) -> Path:
@@ -283,6 +309,19 @@ def build_install(account_name: str, source: Path | None = None, python: Path | 
     return Install(account, python_path, source_path, root, uid_dir, snapshot,
                    uid_dir / MANIFEST_NAME, plist, f"{LABEL_PREFIX}.{account.uid}",
                    _launchctl(launchctl))
+
+
+def build_census(source: Path | None = None, python: Path | None = None, root: Path = INSTALL_ROOT,
+                 daemons: Path = LAUNCH_DAEMONS, launchctl: Path | None = None) -> Census:
+    """The host's root census with no account: the same source, python, path and launchctl checks as an account's."""
+    source_path = _source(source or DEFAULT_SOURCE)
+    python_path = resolve_python(python)
+    root = _absolute_real(root, "install root") if root.exists() else root
+    if root.exists() and root.is_symlink():
+        raise HygieneError(f"install root must not be a symlink: {root}")
+    _existing_parent_chain(root)
+    daemons = _absolute_real(daemons, "LaunchDaemons directory") if daemons.exists() else daemons
+    return Census(python_path, source_path, root, daemons, _launchctl(launchctl))
 
 
 def _sha256(path: Path) -> str:
@@ -712,6 +751,45 @@ def apply_census(install: Install, source_bytes: bytes, digest: str) -> None:
             raise HygieneError("launchctl bootstrap returned success but the root census is not loaded")
 
 
+def census_plan(census: Census) -> dict:
+    """Read-only and launchctl-free, like plan(): what --root-census --apply would install."""
+    note = _managed_census(census)
+    if note not in {"missing", "managed"}:
+        raise HygieneError(note)
+    return {"state": "planned", "operation": "root-census", "label": CENSUS_LABEL, "census": note,
+            "plist": os.fspath(census.census_plist), "snapshot": os.fspath(census.census_snapshot),
+            "sha256": _sha256(census.source), "program_arguments": census_plist_for(census)["ProgramArguments"]}
+
+
+def check_census(census: Census) -> dict:
+    """Read-only, like check(): is the host's root census what --root-census --apply of this source leaves."""
+    want = _sha256(census.source)
+    stale = census_stale(census, want)
+    return {"state": "stale" if stale else "current", "stale": stale, "label": CENSUS_LABEL, "sha256": want,
+            "installed": _sha256(census.census_snapshot) if census.census_snapshot.is_file() else None}
+
+
+def apply_root_census(census: Census) -> dict:
+    """Install or refresh the host's root census on its own, so a CI mini with no enrolled account still has it.
+    The same root-owned path checks as an account's --apply, then apply_census (which refuses a plist or directory
+    that is not ours)."""
+    _require_root()
+    _check_root_install_path(census.root, True)
+    _check_root_install_path(census.daemons, True)
+    try:
+        source_bytes = census.source.read_bytes()
+    except OSError as exc:
+        raise HygieneError(f"cannot read glaeda-disk source: {census.source}: {exc}") from exc
+    digest = _sha256_bytes(source_bytes)
+    if not census.root.exists():  # the root an account's enrollment checks later: root-owned, writable by root only
+        census.root.mkdir(mode=0o755, parents=True)
+        os.chown(census.root, 0, _root_gid())
+        os.chmod(census.root, 0o755)
+    apply_census(census, source_bytes, digest)
+    return {"state": "applied", "operation": "root-census", "label": CENSUS_LABEL, "sha256": digest,
+            "snapshot": os.fspath(census.census_snapshot), "plist": os.fspath(census.census_plist), "loaded": True}
+
+
 def uninstall_census(install: Install) -> bool:
     """Remove the host's root census once no enrolled account's job is left; True when it was removed."""
     with contextlib.suppress(OSError):
@@ -766,8 +844,10 @@ def apply_uninstall(install: Install) -> dict:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--user", "--account", dest="user", required=True,
+    parser.add_argument("--user", "--account", dest="user",
                         help="named non-system macOS account to clean")
+    parser.add_argument("--root-census", action="store_true",
+                        help="the host's root census alone, with no account: plan, --check or --apply")
     parser.add_argument("--apply", action="store_true", help="perform the planned install/removal")
     parser.add_argument("--uninstall", action="store_true", help="plan/remove the managed job")
     parser.add_argument("--check", action="store_true",
@@ -785,7 +865,17 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--check is read-only and only checks an install")
     if args.uninstall and args.source is not None:
         parser.error("--source is only valid for install")
+    if args.root_census and (args.user or args.uninstall):
+        parser.error("--root-census takes no --user and no --uninstall (the last account's --uninstall removes it)")
+    if not args.root_census and not args.user:
+        parser.error("--user is required (or --root-census)")
     try:
+        if args.root_census:
+            census = build_census(args.source, args.python, args.install_root, args.launch_daemons, args.launchctl)
+            result = (check_census(census) if args.check else
+                      apply_root_census(census) if args.apply else census_plan(census))
+            print(json.dumps(result, sort_keys=True))
+            return 0
         install = build_install(args.user, None if args.uninstall else args.source, args.python,
                                 args.install_root, args.launch_daemons, args.launchctl,
                                 uninstall=args.uninstall)

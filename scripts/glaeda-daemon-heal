@@ -51,6 +51,10 @@ this snapshot; for every account that already has a job, that glaeda-runner-hygi
 and plist with what its --apply leaves, and a stale job is reinstalled by its --apply. A second pass finds them
 current and changes nothing. The report's runnerHygiene says per account: current, stale (with why), or error;
 glaeda-mini-health turns a stale or failed one into disk_root_copy_stale.
+On a CI mini where no account was ever enrolled (ci_mini_why_not: the fleet user runs runners glaeda-cmux-runner
+enrolled; never an EC2 Mac or cmux-lawrence), the same pass keeps the host's read-only root census with that
+release's glaeda-runner-hygiene --root-census --check and --apply (runnerHygiene.rootCensus; glaeda-mini-health:
+disk_root_census_stale). Where an account is enrolled its own job keeps the census, so one writer owns its plist.
 The same pass keeps the fleet user's glaeda-update LaunchAgent running (updater_pass): when launchd has it
 disabled and no fleet or host-local reservation holds the host (fleet_ops_hold, failing closed), it enables it and
 bootstraps it into that user's gui domain, with one line in the log. A host whose updater stayed disabled after a
@@ -168,6 +172,9 @@ HYGIENE_LABEL = "com.teamleaderleo.glaeda.runner-hygiene"  # its LABEL_PREFIX; t
 HYGIENE_RECHECK_S = 6 * 3600  # an unchanged, current install is checked again this often (launchd may drop it)
 HYGIENE_TIMEOUT = 120
 HYGIENE_RETRY_S = 900  # a check or reinstall that failed is tried again this long after, not every pass
+# The python glaeda-runner-hygiene --root-census pins into the census plist: the one resolve_python() picks first, so
+# a later account enrollment writes the same plist bytes.
+CENSUS_PYTHON = "/usr/bin/python3"
 # sandboxd's self-heal: fixed here, never from the policy, so no policy file names what root runs.
 SANDBOX_REBOOT = ["/sbin/shutdown", "-r", "now", "glaeda-daemon-heal: sandboxd is wedged (sandbox probe hangs)"]
 SANDBOX_JOURNAL = "sandboxd-heal.jsonl"  # in the state dir
@@ -1564,15 +1571,95 @@ def account_name(uid: int) -> str:
     return pwd.getpwuid(uid).pw_name
 
 
+def ci_mini_why_not(fleet_root: Path = FLEET_ROOT) -> str:
+    """Why this host is not a CI mini ("" when it is), glaeda-disk's own test (hygiene_mirror_host) read by root: a Mac
+    whose fleet user (the owner of the fleet root) runs runners glaeda-cmux-runner enrolled (~/actions-runner* with a
+    .runner config and glaeda-hooks beside it). Never an EC2 Mac and never cmux-lawrence; a devbox or an interactive
+    Mac has no enrolled runner."""
+    if sys.platform != "darwin":
+        return "not macOS"
+    with contextlib.suppress(KeyError):
+        pwd.getpwnam("ec2-user")
+        return "an EC2 Mac (ec2-user)"
+    try:
+        user = fleet_user(fleet_root)
+    except (OSError, KeyError) as e:
+        return f"no fleet user (owner of {fleet_root}): {type(e).__name__}"
+    home = Path(user.pw_dir)
+    names = {platform_node().split(".")[0].lower(), str(user.pw_name).lower()}
+    with contextlib.suppress(OSError, KeyError, ValueError, AttributeError):
+        host = strict_json(read_small(home / ".config/glaeda/update.json")).get("host")
+        if isinstance(host, str) and host:
+            names.add(host.lower())
+    if any("lawrence" in n for n in names):
+        return "cmux-lawrence: not a CI mini"
+    try:
+        runners = [r for r in home.glob("actions-runner*")
+                   if not r.is_symlink() and (r / ".runner").is_file() and (r / "glaeda-hooks").is_dir()]
+    except OSError as e:
+        return f"cannot list {home}: {type(e).__name__}"
+    if not runners:
+        return f"no runner glaeda-cmux-runner enrolled under {home}: not a CI mini"
+    return ""
+
+
+def _keep_current(argv: list[str], inputs, cache: dict[str, Any], key: str, entry: dict[str, Any], now: float,
+                  live: bool, run) -> None:
+    """One glaeda-runner-hygiene job (an account's, or the host's root census) on its release: the cache answers an
+    unchanged current one until HYGIENE_RECHECK_S and a failed one until HYGIENE_RETRY_S; otherwise --check, and on
+    a root pass a stale one is reinstalled by --apply and checked again. entry gets state, why and action."""
+    k = inputs()
+    seen = cache.get(key) if isinstance(cache.get(key), dict) else {}
+    if seen.get("key") == k and now - float(seen.get("at") or 0) < HYGIENE_RECHECK_S:
+        entry.update(state="current", why=f"checked at {iso(float(seen['at']))}")
+        return
+    if seen.get("failed") and seen.get("inputs") == k and now - float(seen.get("at") or 0) < HYGIENE_RETRY_S:
+        entry.update(state=seen.get("state") or "error", why=str(seen["failed"]), action="reinstall")
+        return
+
+    def ask(*flags: str) -> tuple[dict[str, Any] | None, str]:
+        code, said, err = run(argv + list(flags), timeout=HYGIENE_TIMEOUT)
+        try:
+            doc = json.loads(said) if code == 0 else None
+        except ValueError:
+            doc = None
+        return (doc if isinstance(doc, dict) else None), re.sub(r"\s+", " ", (err or said).strip())[-200:]
+
+    doc, said = ask("--check")
+    if doc is not None and doc.get("state") == "stale" and live:
+        applied, said = ask("--apply")
+        entry["reinstalled"] = applied is not None
+        if applied is not None:
+            entry["at"] = iso(now)
+            doc, said = ask("--check")
+    if doc is not None and doc.get("state") == "current":
+        entry.update(state="current", why="matches its release" + (" after a reinstall" if entry.get("reinstalled") else ""))
+        cache[key] = {"key": inputs(), "at": now}
+        return
+    if doc is None or doc.get("state") != "stale":
+        entry.update(state="error", why=f"glaeda-runner-hygiene: {said or 'no answer'}")
+    else:  # a root pass that tried to reinstall and is still stale has failed: an error, retried
+        failed = live and "reinstalled" in entry
+        entry.update(state="error" if failed else "stale", why=", ".join(map(str, doc.get("stale") or [])) +
+                     ("" if live else "; a root pass reinstalls it") +
+                     (f"; reinstall failed: {said}" if entry.get("reinstalled") is False else
+                      "; still stale after a reinstall" if failed else ""), action="reinstall")
+    if live:  # a root pass that could not fix it waits HYGIENE_RETRY_S before trying again
+        cache[key] = {"failed": entry["why"], "state": entry["state"], "inputs": inputs(), "at": now}
+    else:
+        cache.pop(key, None)
+
+
 def hygiene_pass(install_dir: Path, state: dict[str, Any], now: float, live: bool, hygiene_root: Path = HYGIENE_ROOT,
                  daemons: Path = HYGIENE_DAEMONS, run=bounded_run, python: str = SYSTEM_PYTHON,
-                 account=account_name) -> dict[str, Any]:
+                 account=account_name, ci_mini=ci_mini_why_not) -> dict[str, Any]:
     """Keep every runner account's glaeda-runner-hygiene job (a root-pinned glaeda-disk and its LaunchDaemon) on the
     release this copy runs. For each account that already has one (an operator enrolled it once; nothing is
     adopted), the release's own glaeda-runner-hygiene --check compares the snapshot and plist with what that
     release's --apply leaves; a stale one is reinstalled by that release's --apply. Only the two files refresh()
     took from the verified release and recorded in installed.json ever run as root. state["runner_hygiene"] remembers
-    each account's last current inputs, so an unchanged one is not checked again until HYGIENE_RECHECK_S."""
+    each account's last current inputs, so an unchanged one is not checked again until HYGIENE_RECHECK_S.
+    With no enrolled account on a CI mini, the host's root census alone is kept the same way (root_census_pass)."""
     out: dict[str, Any] = {"accounts": {}}
     try:
         dirs = sorted((d for d in hygiene_root.iterdir() if d.name.isdigit() and (d / "manifest.json").is_file()),
@@ -1587,8 +1674,14 @@ def hygiene_pass(install_dir: Path, state: dict[str, Any], now: float, live: boo
     wants = files.get(DISK_NAME)
     verified = bool(wants and files.get(HYGIENE_NAME)) and all(
         files.get(p.name) == sha256(read_bytes(p) or b"") for p in (tool, disk))
+    hold = "this copy holds no glaeda-disk and glaeda-runner-hygiene its release recorded; a release pass brings them"
     if dirs and not verified:
-        out["hold"] = "this copy holds no glaeda-disk and glaeda-runner-hygiene its release recorded; a release pass brings them"
+        out["hold"] = hold
+    if dirs:
+        state.pop("root_census", None)  # each enrolled account's --check and --apply keep the census here
+    else:
+        out["rootCensus"] = root_census_pass(tool, disk, verified, hold, state, now, live, hygiene_root, daemons, run,
+                                             python, ci_mini)
     cache = state.setdefault("runner_hygiene", {})
     for d in dirs:
         uid = d.name
@@ -1606,56 +1699,43 @@ def hygiene_pass(install_dir: Path, state: dict[str, Any], now: float, live: boo
             entry.update(state="unchecked", why=out["hold"])  # daemon_heal_stale covers a release pass that fails
             continue
 
-        def inputs() -> str:  # what --check reads: the release's two files, the snapshot, its manifest and plist
+        def inputs(d: Path = d, uid: str = uid) -> str:  # what --check reads: the release's two files, the snapshot,
+            # its manifest and plist
             return sha256(json.dumps([files.get(DISK_NAME), files.get(HYGIENE_NAME)] + [
                 sha256(read_bytes(p) or b"") for p in (d / DISK_NAME, d / "manifest.json",
                                                        daemons / f"{HYGIENE_LABEL}.{uid}.plist")]).encode())
 
-        key = inputs()
-        seen = cache.get(uid) if isinstance(cache.get(uid), dict) else {}
-        if seen.get("key") == key and now - float(seen.get("at") or 0) < HYGIENE_RECHECK_S:
-            entry.update(state="current", why=f"checked at {iso(float(seen['at']))}")
-            continue
-        if seen.get("failed") and seen.get("inputs") == key and now - float(seen.get("at") or 0) < HYGIENE_RETRY_S:
-            entry.update(state=seen.get("state") or "error", why=str(seen["failed"]), action="reinstall")
-            continue
         argv = [python, "-I", os.fspath(tool), "--user", user, "--source", os.fspath(disk),
                 "--python", manifest["python"]]
-
-        def ask(*flags: str) -> tuple[dict[str, Any] | None, str]:
-            code, said, err = run(argv + list(flags), timeout=HYGIENE_TIMEOUT)
-            try:
-                doc = json.loads(said) if code == 0 else None
-            except ValueError:
-                doc = None
-            return (doc if isinstance(doc, dict) else None), re.sub(r"\s+", " ", (err or said).strip())[-200:]
-
-        doc, said = ask("--check")
-        if doc is not None and doc.get("state") == "stale" and live:
-            applied, said = ask("--apply")
-            entry["reinstalled"] = applied is not None
-            if applied is not None:
-                entry["at"] = iso(now)
-                doc, said = ask("--check")
-        if doc is not None and doc.get("state") == "current":
-            entry.update(state="current", why="matches its release" + (" after a reinstall" if entry.get("reinstalled") else ""))
-            cache[uid] = {"key": inputs(), "at": now}
-            continue
-        if doc is None or doc.get("state") != "stale":
-            entry.update(state="error", why=f"glaeda-runner-hygiene: {said or 'no answer'}")
-        else:  # a root pass that tried to reinstall and is still stale has failed: an error, retried
-            failed = live and "reinstalled" in entry
-            entry.update(state="error" if failed else "stale", why=", ".join(map(str, doc.get("stale") or [])) +
-                         ("" if live else "; a root pass reinstalls it") +
-                         (f"; reinstall failed: {said}" if entry.get("reinstalled") is False else
-                          "; still stale after a reinstall" if failed else ""), action="reinstall")
-        if live:  # a root pass that could not fix it waits HYGIENE_RETRY_S before trying again
-            cache[uid] = {"failed": entry["why"], "state": entry["state"], "inputs": inputs(), "at": now}
-        else:
-            cache.pop(uid, None)
+        _keep_current(argv, inputs, cache, uid, entry, now, live, run)
     for uid in [u for u in cache if u not in out["accounts"]]:
         cache.pop(uid)
     return out
+
+
+def root_census_pass(tool: Path, disk: Path, verified: bool, hold: str, state: dict[str, Any], now: float, live: bool,
+                     hygiene_root: Path, daemons: Path, run, python: str, ci_mini) -> dict[str, Any]:
+    """The host's root census (glaeda-disk --root-census, read-only, every 30 min) on a CI mini no account was ever
+    enrolled on: glaeda-runner-hygiene --root-census --check, and on a root pass --apply when stale. Before this only
+    an account's enrollment installed it, and no lent CI mini had one (2026-11-18). Every check of an account's
+    install applies: a plist or directory that is not ours is refused, the snapshot is pinned and root-owned."""
+    cache = state.setdefault("root_census", {})
+    why = ci_mini()
+    if why:
+        cache.clear()
+        return {"state": "skipped", "why": why}
+    if not verified:
+        return {"state": "unchecked", "why": hold}
+    entry: dict[str, Any] = {"wants": sha256(read_bytes(disk) or b"")}
+    census = hygiene_root / "root-census"
+
+    def inputs() -> str:  # what --check reads: the release's two files, the census snapshot and its plist
+        return sha256(json.dumps([sha256(read_bytes(p) or b"") for p in (
+            tool, disk, census / DISK_NAME, daemons / f"{HYGIENE_LABEL}.root-census.plist")]).encode())
+
+    argv = [python, "-I", os.fspath(tool), "--root-census", "--source", os.fspath(disk), "--python", CENSUS_PYTHON]
+    _keep_current(argv, inputs, cache, "host", entry, now, live, run)
+    return entry
 
 
 # ---------------------------------------------------------------- main
@@ -1675,7 +1755,7 @@ def run_pass(policy_path: Path, state_dir: Path, apply: bool, host: Host | None 
     root = os.geteuid() == 0
     if install_dir is None and root and Path(__file__).resolve() == (INSTALL_DIR / SCRIPT_NAME).resolve():
         install_dir = INSTALL_DIR
-    for key in ("release", "reload_at", "runner_hygiene", "updater"):
+    for key in ("release", "reload_at", "runner_hygiene", "root_census", "updater"):
         if key in state:
             new_state[key] = state[key]
     if apply and install_dir is not None:
