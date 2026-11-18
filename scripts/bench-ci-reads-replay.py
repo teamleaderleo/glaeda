@@ -45,6 +45,7 @@ def load(base: Path):
     loader = importlib.machinery.SourceFileLoader("glaeda_gh_bench", str(Path(__file__).with_name("glaeda-gh")))
     spec = importlib.util.spec_from_loader("glaeda_gh_bench", loader)
     gg = importlib.util.module_from_spec(spec)
+    sys.modules[loader.name] = gg
     loader.exec_module(gg)
     return gg
 
