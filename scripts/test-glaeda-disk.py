@@ -2458,6 +2458,73 @@ class GlaedaDiskTest(unittest.TestCase):
         self.assertTrue(gd.remove_spm_scratch(scratch / "raced"))
         self.assertFalse((scratch / "raced").exists())
 
+    def test_the_fast_tier_seed_root_goes_under_its_lock_after_slot_builds(self) -> None:
+        """cmux#44271, 2026-11-18: owned-mini fast-tier jobs restore the base seed at the seed workspace
+        (cmux owned_spm_scratch.py seed_lease). Its package builds go under pressure only while no job holds the
+        root's lock, and after per-slot cold builds of the same size and age: every slot's cold build costs a
+        whole compile, the seed root one restore."""
+        seed = self.root / "runner/_work/cmux"
+        ws = seed / "cmux"
+        next_build = make(ws / "Packages/macOS/CmuxNext/.build", mib=4, age_hours=50)
+        home_build = make(ws / "Packages/Shared/CmuxHomeRender/.build", mib=1, age_hours=50)
+        (ws / "Packages/macOS/CmuxNext/Package.swift").write_text("// swift-tools-version:6.0\n")
+        lock = seed / gd.SEED_ROOT_LOCK
+        lock.touch()
+        ci = self.root / "ci"
+        make(ci / "seeds/p-a", age_hours=1)
+        with mock.patch.object(gd, "CMUX_SEED_ROOT", seed):
+            fams = [f for f in gd.fleet_families(ci) if f.id == gd.SEED_ROOT_FAMILY]
+        self.assertEqual([f.root for f in fams], [ws / "Packages"])
+        with mock.patch.object(gd, "CMUX_SEED_ROOT", self.root / "absent"):
+            self.assertEqual([f for f in gd.fleet_families(ci) if f.id == gd.SEED_ROOT_FAMILY], [],
+                             "a mini without the seed workspace has no such family")
+        fam = fams[0]
+        self.assertFalse(gd.job_busy(fam, next_build), "its lock, not a slot marker search, decides")
+
+        def verdicts() -> dict[str, str]:
+            return {os.path.relpath(i.path, ws): i.verdict for i in gd.survey(fams, 6, 0)}
+
+        self.assertEqual(verdicts(), {"Packages/macOS/CmuxNext/.build": "reclaimable",
+                                      "Packages/Shared/CmuxHomeRender/.build": "reclaimable"})
+        # a fast-tier job's holder keeps the lock exclusive for the whole job
+        holder = subprocess.Popen([sys.executable, "-c", "import fcntl, sys, time\n"
+                                   "f = open(sys.argv[1], 'a'); fcntl.flock(f, fcntl.LOCK_EX)\n"
+                                   "print('held', flush=True); time.sleep(60)\n", os.fspath(lock)],
+                                  stdout=subprocess.PIPE, text=True)
+        self.addCleanup(holder.stdout.close)
+        self.addCleanup(holder.wait)
+        self.addCleanup(holder.kill)
+        self.assertEqual(holder.stdout.readline().strip(), "held")
+        self.assertTrue(gd.seed_root_held(fam, next_build))
+        self.assertEqual(set(verdicts().values()), {"in-use"})
+        self.assertFalse(gd.remove_seed_root_build(fam, next_build), "the delete itself takes the lock")
+        self.assertTrue(next_build.exists())
+        holder.kill()
+        holder.wait()
+        self.assertFalse(gd.seed_root_held(fam, next_build))
+
+        # a job takes the root between the survey and the delete: apply re-checks the lock and keeps it
+        items = [i for i in gd.survey(fams, 6, 0) if i.verdict == "reclaimable"]
+        late = open(lock, "a")
+        fcntl.flock(late, fcntl.LOCK_EX)
+        with mock.patch.object(gd, "process_evidence", return_value=([], "")):
+            gd.apply(items, {f.id: f for f in fams}, self.root / "r.jsonl", None, 6)
+        late.close()
+        self.assertTrue(next_build.exists() and home_build.exists())
+        with mock.patch.object(gd, "process_evidence", return_value=([], "")):
+            gd.apply(items, {f.id: f for f in fams}, self.root / "r2.jsonl", None, 6)
+        self.assertFalse(next_build.exists() or home_build.exists())
+        self.assertTrue((ws / "Packages/macOS/CmuxNext/Package.swift").exists(), "only the builds go")
+        self.assertTrue(lock.exists())
+
+        # per-slot cold builds (a runner checkout's, a SwiftPM scratch slot's) of the same size and age go first
+        slot = make(self.root / "slot/.build", mib=4, age_hours=50)
+        item = lambda path: gd.Item("x", os.fspath(path), 4 * 1024**2, 50.0, "reclaimable")
+        runner_build = gd.Family(gd.RUNNER_BUILD_FAMILY, slot.parent, True, "rebuild", rebuild_minutes=10)
+        spm = gd.spm_scratch_family(ci)
+        self.assertLess(gd.value(item(next_build), fam), gd.value(item(slot), runner_build))
+        self.assertLess(gd.value(item(next_build), fam), gd.value(item(slot), spm))
+
     def test_canonical_root_admission_goes_under_its_root_token(self) -> None:
         """cmux7s, cmux12s, cmux13s, 2026-10-21: 8-9 GiB of admission DerivedData per idle canonical root stayed,
         because the tmp family judged the whole root and its src/ checkout holds untracked build inputs."""
