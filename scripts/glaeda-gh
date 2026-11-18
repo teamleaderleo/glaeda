@@ -726,6 +726,13 @@ CONTENT_PAUSE_REPORT_DEADLINE = 15
 # past the last answer (or the first ask, with none): a keeper broken for good then stops no create, and the outbox
 # posts as a host with no keeper does, logged once per outage and shown by `post status`.
 CONTENT_PAUSE_BLIND_MAX = 600
+# A keeper that answers the ask with a usage error (argparse's "usage: ..." or "invalid choice", exit 2) has no
+# `content-pause`: an older gh-quota than this outbox. That is an answer, not a failed ask: the outbox posts as a host
+# with no keeper does (logged once), and asks again every CONTENT_PAUSE_ABSENT_REPROBE, so the pause applies again as
+# soon as the keeper gains the command. Counted as failures, it held every create for CONTENT_PAUSE_BLIND_MAX after
+# each daemon start, on every host whose gh-quota lagged (cosmic-gray, 2026-11-18).
+CONTENT_PAUSE_ABSENT_REPROBE = 600
+CONTENT_PAUSE_USAGE = re.compile(r"(?im)^\s*usage:|invalid choice")
 # A private repository on a plan without branch protection or rulesets answers 403 with this: there are
 # no requirements to read, as for a deleted base branch.
 NO_FEATURE = re.compile(r"Upgrade to GitHub Pro|make this repository public to enable this feature", re.I)
@@ -3390,6 +3397,7 @@ class Daemon:
         self.pause_timeouts = 0  # of those, the ones that timed out
         self.pause_error: str | None = None  # the last failed ask's error
         self.pause_blind_logged = False  # past CONTENT_PAUSE_BLIND_MAX this outage, logged once
+        self.pause_absent = False  # the keeper answered a usage error: it has no content-pause (CONTENT_PAUSE_USAGE)
         self.pause_report: threading.Thread | None = None  # the --hold report in flight (report_content_pause)
         self.pause_report_want: tuple[float, str] | None = None  # the hold it is to report next
         self.pause_report_lock = threading.Lock()
@@ -4325,13 +4333,19 @@ class Daemon:
         return self.pause_until
 
     def content_pause_ask(self, cmd: list[str], asked: float) -> None:
-        """The ask, on its own thread: sets pause_result to ("ok", (asked, blocked_until)), ("timeout", why) or
-        ("error", why), and nothing else."""
+        """The ask, on its own thread: sets pause_result to ("ok", (asked, blocked_until)), ("absent", (asked, why)):
+        the keeper has no content-pause, ("timeout", why) or ("error", why), and nothing else."""
         try:
             done = run_bounded([*cmd, "content-pause"], CONTENT_PAUSE_SLOW_DEADLINE)
+            said = (done.stderr or done.stdout or "").strip()
+            if done.returncode != 0 and CONTENT_PAUSE_USAGE.search(said):
+                # argparse's last line says what it refused; the usage before it can run past keeper_text's bound
+                why = next((line for line in reversed(said.splitlines()) if CONTENT_PAUSE_USAGE.search(line)), said)
+                self.pause_result = ("absent", (asked, f"exit {done.returncode}: {keeper_text(why.strip())}"))
+                return
             doc = json.loads(done.stdout) if done.returncode == 0 else None
             if not isinstance(doc, dict):
-                raise WatchError(f"exit {done.returncode}: {keeper_text((done.stderr or done.stdout or '').strip())}")
+                raise WatchError(f"exit {done.returncode}: {keeper_text(said)}")
             # The keeper prints a number, 0 for no pause. Anything else ("", [], {}, a bool, null, no key, NaN or
             # Infinity) is a failed ask and the last answer stands: `or 0` read "", [] and {} as "no pause".
             until = doc.get("blocked_until")
@@ -4354,6 +4368,20 @@ class Daemon:
             return
         kind, value = outcome
         clock = self.clock()
+        if kind == "absent":
+            asked, why = value
+            if not self.pause_absent:
+                log({"event": "content-pause-absent", "error": why,
+                     "next": f"posting as with no keeper; asked again every {CONTENT_PAUSE_ABSENT_REPROBE}s"})
+            self.pause_absent = True
+            self.pause_next = asked + CONTENT_PAUSE_ABSENT_REPROBE
+            self.pause_answered_at = clock  # an answer: a later failure holds from here, for CONTENT_PAUSE_BLIND_MAX
+            self.pause_failures = self.pause_timeouts = 0
+            self.pause_error, self.pause_blind_logged = None, False
+            return
+        if self.pause_absent:
+            log({"event": "content-pause-absent", "error": None, "next": "the keeper answers content-pause again"})
+            self.pause_absent = False
         if kind == "ok":
             asked, until = value
             until = min(until, clock + PACE_HOLD_MAX)  # a corrupt far future holds an hour at most
@@ -4377,8 +4405,8 @@ class Daemon:
         """Whether creates wait because the pause is not known: no answer within CONTENT_PAUSE_RETRY, and the ask is
         still running or failing. For CONTENT_PAUSE_BLIND_MAX past the last answer (or the first ask) at most: past
         it a keeper that never answers stops nothing, and the outbox posts as a host with no keeper (logged once)."""
-        if self.pause_ask is None and self.pause_failures == 0:
-            return False
+        if self.pause_ask is None and self.pause_failures == 0 or self.pause_absent:
+            return False  # a recent answer, or a keeper without content-pause: no keeper, as on a host with none
         clock = self.clock()
         known = self.pause_answered_at if self.pause_answered_at is not None else self.pause_first_ask
         if known is None or clock - known < CONTENT_PAUSE_RETRY and self.pause_answered_at is not None:
@@ -4399,7 +4427,8 @@ class Daemon:
         return {"until": self.pause_until if self.pause_until > clock else None,
                 "answeredAgo": None if self.pause_answered_at is None else round(clock - self.pause_answered_at),
                 "failures": self.pause_failures, "timeouts": self.pause_timeouts, "lastError": self.pause_error,
-                "asking": self.pause_ask is not None, "holding": self.content_pause_unknown()}
+                "asking": self.pause_ask is not None, "holding": self.content_pause_unknown(),
+                "absent": self.pause_absent}
 
     def content_pause_settle(self, timeout: float) -> None:
         """Wait up to `timeout` for the ask and the report in flight, and take the ask's answer (tests). Nothing
@@ -4423,8 +4452,8 @@ class Daemon:
         self.pause_until = max(self.pause_until, until)
         self.pause_reported = (self.clock(), max(until, self.pause_reported[1] if self.pause_reported else until))
         cmd = content_pause_cmd()
-        if cmd is None:
-            return
+        if cmd is None or self.pause_absent:
+            return  # no keeper, or one without content-pause: the hold stays this daemon's own
         with self.pause_report_lock:
             want = self.pause_report_want
             self.pause_report_want = (until, kind) if want is None or until > want[0] else want
@@ -18385,6 +18414,8 @@ def pause_line(pause: Any) -> list[str]:
         parts.append(f"pause ask failed {failures} in a row ({pause.get('timeouts') or 0} timed out; last: "
                      f"{pause.get('lastError')}); last answer "
                      + (f"{span(ago)} ago" if isinstance(ago, (int, float)) else "never"))
+    if pause.get("absent"):
+        parts.append("the pause keeper has no content-pause (an older gh-quota): creates go out as with no keeper")
     if pause.get("holding"):
         parts.append("creates wait until the pause is known")
     return parts

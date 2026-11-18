@@ -51,6 +51,9 @@ spec = importlib.util.spec_from_loader("glaeda_gh", loader)
 gg = importlib.util.module_from_spec(spec)
 sys.modules["glaeda_gh"] = gg
 loader.exec_module(gg)
+# The host's own create-pause keeper, as the daemon resolves it, before the overrides below hide it: only
+# InstalledKeeperTest asks it, so producer (gh-quota) and consumer (the outbox) cannot disagree silently.
+HOST_PACE_CLI, HOST_CONTENT_PAUSE_NAMES = gg.PACE_CLI, gg.CONTENT_PAUSE_NAMES
 # A host's own upstream.json (a lane VM's) must not turn every Daemon here into an upstream client.
 gg.UPSTREAM_CONFIG = Path(tempfile.gettempdir()) / f"glaeda-gh-test-no-upstream-{os.getpid()}.json"
 # Nor may a host's own gh-daemon.json change the pacing the tests expect.
@@ -73,6 +76,15 @@ gg.NOTICES_DIR = Path(_NOTICES.name)
 
 TOKEN = "ghp_faketoken_must_never_touch_disk"
 NOW = float(int(time.time()))  # watch files carry real mtimes
+# What cosmic-gray's gh-quota answered the outbox's `content-pause` ask on 2026-11-18 (it had no such command).
+OLD_GH_QUOTA_USAGE = (
+    "usage: gh-quota [-h]\n"
+    "                {check,serve,fallback,serve-first,serve-rest,fallback-rest,store,content-kind,content-failure,"
+    "content-empty,merged,merge-refused,rate-mark,not-modified,usage}\n"
+    "                ...\n"
+    "gh-quota: error: argument cmd: invalid choice: 'content-pause' (choose from 'check', 'serve', 'fallback', "
+    "'serve-first', 'serve-rest', 'fallback-rest', 'store', 'content-kind', 'content-failure', 'content-empty', "
+    "'merged', 'merge-refused', 'rate-mark', 'not-modified', 'usage')\n")
 
 
 def pr_node(number: int, state: str = "OPEN", rollup: str | None = "PENDING", checks: list | None = None) -> dict:
@@ -12524,6 +12536,76 @@ class PostTest(unittest.TestCase):
         self.assertEqual((d.pause_failures, d.pause_timeouts, d.content_pause_unknown()), (0, 0, False))
         self.assertEqual(d.content_pause_status()["answeredAgo"], 0)
 
+    def test_a_keeper_without_content_pause_is_no_keeper_and_is_asked_again(self) -> None:
+        # cosmic-gray, 2026-11-18: the installed gh-quota had no content-pause. Each ask's usage error counted as a
+        # failed ask, so `post pr` sat held ("pause ask failed 9 in a row ... creates wait until the pause is known").
+        first = self.queue("comment", "o/r#1", "--body", "one")
+        root = Path(self.tmp.name) / "old-keeper"
+        root.mkdir()
+        (root / "usage").write_text(OLD_GH_QUOTA_USAGE)
+        cmd = root / "gh-quota"
+        cmd.write_text(f'#!/bin/sh\necho "$*" >> {shlex.quote(os.fspath(root / "calls"))}\n'
+                       f'[ -f {shlex.quote(os.fspath(root / "pause.json"))} ] && '
+                       f'exec cat {shlex.quote(os.fspath(root / "pause.json"))}\n'
+                       f'cat {shlex.quote(os.fspath(root / "usage"))} >&2\nexit 2\n')
+        cmd.chmod(0o755)
+        lines: list[dict] = []
+        ok = (201, {}, {"html_url": "u"})
+        with mock.patch.dict(os.environ, {gg.CONTENT_PAUSE_ENV: shlex.quote(os.fspath(cmd))}), \
+                mock.patch.object(gg, "log", lines.append):
+            d, t = self.daemon(ok, ok, ok)
+            d.clock_real = False
+            clock = [NOW]
+            d.clock = lambda: clock[0]
+            self.step(d, NOW)
+            d.content_pause_settle(10)
+            self.step(d, NOW)  # the answer is in: no keeper, so the create goes out at once
+            self.assertEqual(gg.post_state(first["id"])["state"], "posted")
+            status = d.content_pause_status()
+            self.assertEqual({k: status[k] for k in ("failures", "holding", "absent", "lastError")},
+                             {"failures": 0, "holding": False, "absent": True, "lastError": None})
+            self.assertIn("has no content-pause", " ".join(gg.pause_line(status)))
+            self.assertFalse(any(e.startswith("content pause") for e in d.errors))
+            d.report_content_pause(NOW + 30, "comment")  # a throttle is this daemon's own: no --hold it cannot take
+            d.content_pause_settle(10)
+            second = self.queue("comment", "o/r#2", "--body", "two")
+            for at in (NOW + 31, NOW + 31 + gg.POST_SPACING):
+                clock[0] = at
+                self.step(d, at)
+                d.content_pause_settle(10)
+            self.assertEqual(gg.post_state(second["id"])["state"], "posted")
+            self.assertEqual((root / "calls").read_text().splitlines(), ["content-pause"])  # not re-asked yet
+            # the keeper gains the command: the next probe hears it, and its pause holds creates again
+            (root / "pause.json").write_text(json.dumps({"blocked_until": NOW + 2000, "level": 1}))
+            third = self.queue("comment", "o/r#3", "--body", "three")
+            clock[0] = NOW + gg.CONTENT_PAUSE_ABSENT_REPROBE
+            self.step(d, clock[0])
+            d.content_pause_settle(10)
+            self.step(d, clock[0])
+        self.assertEqual(gg.post_state(third["id"])["state"], "queued")
+        self.assertEqual((d.pause_absent, d.pause_until), (False, NOW + 2000))
+        self.assertEqual(len(t.calls), 2)
+        absent = [e for e in lines if e.get("event") == "content-pause-absent"]
+        self.assertEqual(len(absent), 2)  # once when it went missing, once when it came back
+        self.assertIn("invalid choice: 'content-pause'", absent[0]["error"])
+
+    def test_a_keepers_real_failure_still_holds_creates(self) -> None:
+        # Only a usage error is "no command": a crash (exit 1, no usage) is a failed ask, held for the blind bound.
+        self.queue("comment", "o/r#1", "--body", "one")
+        calls = self.pause_cmd(0, level=0)
+        (calls.parent / "stderr").write_text("Traceback (most recent call last):\nOSError: lock busy")
+        d, t = self.daemon((201, {}, {"html_url": "u"}))
+        d.clock_real = False
+        d.clock = lambda: NOW
+        self.step(d, NOW)
+        d.content_pause_settle(10)
+        self.step(d, NOW + 1)
+        self.assertEqual((d.pause_absent, d.pause_failures, t.calls), (False, 1, []))
+        self.assertTrue(d.content_pause_unknown())
+        for said in ("usage: gh-quota [-h] {check}", "gh-quota: error: argument cmd: invalid choice: 'x'"):
+            self.assertTrue(gg.CONTENT_PAUSE_USAGE.search(said), said)
+        self.assertFalse(gg.CONTENT_PAUSE_USAGE.search("OSError: lock busy"))
+
     def test_the_hold_report_runs_off_the_posts_path_with_its_own_bound(self) -> None:
         # The report was bounded by the ask's 2 s on the post's path: a keeper waiting on its file lock was killed
         # mid-write, and the pause the throttled write was to share never reached the other writers.
@@ -12757,6 +12839,38 @@ class PostTest(unittest.TestCase):
         status = d.tick(now=NOW)
         self.assertEqual(len(t.calls), 1)
         self.assertEqual(status["outbox"], {"queued": 1, "holdUntil": None, "pause": None})  # no keeper, no ask
+
+
+class InstalledKeeperTest(unittest.TestCase):
+    """The outbox asks the host's gh-quota `content-pause`; cosmic-gray's had no such command on 2026-11-18, and every
+    queued create sat held behind its usage error. This asks the keeper this host actually has, resolved as the daemon
+    resolves it, and checks the daemon reads its answer for what it is: a usage error exactly when the keeper's own
+    usage lists no content-pause. Skipped on a host with no keeper (CI)."""
+
+    def test_the_installed_keepers_answer_is_read_for_what_it_is(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        with mock.patch.object(gg, "PACE_CLI", HOST_PACE_CLI), \
+                mock.patch.object(gg, "CONTENT_PAUSE_NAMES", HOST_CONTENT_PAUSE_NAMES), \
+                mock.patch.dict(os.environ, {}), mock.patch.object(gg, "BASE", Path(tmp.name) / "gh"), \
+                mock.patch.object(gg, "log", lambda line: None):
+            os.environ.pop(gg.CONTENT_PAUSE_ENV, None)
+            cmd = gg.content_pause_cmd()
+            if cmd is None:
+                self.skipTest("no gh-quota on this host")
+            usage = gg.run_bounded([*cmd, "-h"], 30)
+            if usage.returncode != 0 or "{" not in usage.stdout:
+                self.skipTest(f"{cmd} -h printed no subcommand list (exit {usage.returncode})")
+            listed = re.search(r"\{([^}]*)\}", usage.stdout).group(1).replace("\n", "").replace(" ", "").split(",")
+            d = gg.Daemon(transport=Scripted(), token=lambda: TOKEN, controller=None)
+            d.content_pause_until()
+            d.content_pause_settle(gg.CONTENT_PAUSE_SLOW_DEADLINE + 5)
+        has = "content-pause" in listed
+        self.assertEqual(d.pause_absent, not has, (cmd, listed, d.pause_error))
+        if has:  # it may fail for real (no broker), but never as a command it lacks
+            self.assertFalse(d.pause_error and gg.CONTENT_PAUSE_USAGE.search(d.pause_error), d.pause_error)
+        else:
+            self.assertEqual((d.pause_failures, d.content_pause_unknown()), (0, False))
 
 
 class PostJoinTest(unittest.TestCase):
