@@ -3587,5 +3587,26 @@ class UnmanagedServiceTest(unittest.TestCase):
                 self.assertEqual(out["heals"], [])
 
 
+class PressureBlocked(unittest.TestCase):
+    """disk_pressure_blocked: under pressure with almost nothing reclaimable while tens of GiB are blocked."""
+
+    G = 1024**3
+
+    def summary(self, reclaimable: float, blocked: float, under: bool = True) -> dict:
+        return {"schema": "glaeda-disk/v1", "reclaimable": reclaimable * self.G, "blocked": blocked * self.G,
+                "filesystems": [{"mount": "/", "free": 27 * self.G, "total": 460 * self.G, "under": under}]}
+
+    def test_the_panel_that_read_reclaimable_zero_warns(self) -> None:
+        out = health.pressure_blocked_findings(self.summary(0.0, 153.5))
+        self.assertEqual([f["id"] for f in out], ["disk_pressure_blocked"])
+        self.assertIn("blocked 153.5 GiB", out[0]["evidence"])
+
+    def test_no_pressure_enough_reclaimable_or_little_blocked_is_quiet(self) -> None:
+        self.assertEqual(health.pressure_blocked_findings(self.summary(0.0, 153.5, under=False)), [])
+        self.assertEqual(health.pressure_blocked_findings(self.summary(20.0, 153.5)), [])
+        self.assertEqual(health.pressure_blocked_findings(self.summary(0.0, 10.0)), [])
+        self.assertEqual(health.pressure_blocked_findings({"schema": "glaeda-disk/v1"}), [])
+
+
 if __name__ == "__main__":
     unittest.main()

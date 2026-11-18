@@ -490,6 +490,7 @@ class Mini:
             try:
                 loader = importlib.machinery.SourceFileLoader("glaeda_cmux_runner_hook_for_health", os.fspath(path))
                 module = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
+                sys.modules[loader.name] = module  # before exec_module: a dataclass in the module looks its module up here
                 loader.exec_module(module)
                 self._hook = module
             except Exception:  # noqa: BLE001  (an unreadable hook skips the checks that need it)
@@ -1668,6 +1669,28 @@ def check_git_mirror(mini: Mini, now: float) -> list[dict[str, Any]]:
                     "glaeda-git-mirror (plan) says what the next pass does; ~/Library/Logs/glaeda-git-mirror.jsonl")]
 
 
+PRESSURE_BLOCKED_MIN = 20 * 1024**3  # blocked bytes worth a look
+PRESSURE_BLOCKED_SHARE = 0.05  # reclaimable under this share of blocked, under pressure: the classifier keeps too much
+
+
+def pressure_blocked_findings(summary: dict[str, Any]) -> list[dict[str, Any]]:
+    """disk_pressure_blocked: a filesystem is under pressure while glaeda-disk calls almost nothing reclaimable and
+    holds tens of GiB blocked. A fleet mini sat at 27 GB free of 460 with 372 GB measured build/cache and
+    "Reclaimable 0.0 GB" (2026-11-18): a stale socket, a 12 h mirror window and a 2-day image window kept 108 GiB."""
+    under = [f for f in summary.get("filesystems") or [] if isinstance(f, dict) and f.get("under")]
+    reclaimable, blocked = summary.get("reclaimable"), summary.get("blocked")
+    if not under or not isinstance(reclaimable, (int, float)) or not isinstance(blocked, (int, float)):
+        return []
+    if blocked < PRESSURE_BLOCKED_MIN or reclaimable >= PRESSURE_BLOCKED_SHARE * blocked:
+        return []
+    mounts = ", ".join(str(f.get("mount")) for f in under)
+    return [finding("disk_pressure_blocked", "warn",
+                    f"under pressure on {mounts}: reclaimable {reclaimable / 1024**3:.1f} GiB, blocked "
+                    f"{blocked / 1024**3:.1f} GiB", "pending",
+                    "run `glaeda-disk --pressure --json` and fix the verdict that keeps the biggest build/cache items "
+                    "(handbook: build-caches-classified-keep)")]
+
+
 def check_disk_accounting(mini: Mini) -> list[dict[str, Any]]:
     summary = mini.disk_summary()
     if summary.get("schema") != "glaeda-disk/v1":
@@ -1733,6 +1756,7 @@ def check_disk_accounting(mini: Mini) -> list[dict[str, Any]]:
         findings.append(finding("eviction_contention", "warn",
                                 f"eviction skipped while pid {pid} ({account}, {state}) held the lock",
                                 "impossible", "the next scheduled pass retries; live scans are never killed"))
+    findings.extend(pressure_blocked_findings(summary))
     accounting = summary.get("accounting") or []
     # The enrolled-runner profile deliberately measures only its rebuildable cache allowlist.
     # Its df-used remainder includes unrelated system and account data, so comparing it with the
