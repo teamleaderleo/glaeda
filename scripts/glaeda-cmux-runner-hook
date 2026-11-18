@@ -4804,12 +4804,15 @@ def fleet_disk_wait(capacity_dir: Path | None) -> dict[str, Any] | None:
                 if isinstance(since, bool) or isinstance(want, bool):
                     continue
                 since, want = float(since), int(want)
-            except (OSError, ValueError, TypeError, KeyError, AttributeError, OverflowError):
+                if not math.isfinite(since) or want <= 0:
+                    continue
+                # every conversion of the untrusted body stays in here: a want too large for a float (OverflowError)
+                # or a body nested past the parser's depth (RecursionError) must never raise out of the gate's look,
+                # whose repeated failures run the runner ungated, every hold lost
+                wait = {"pid": pid, "since": since, "want_gib": round(want / 1024 ** 3, 1),
+                        "who": str(data.get("who") or "")[:200], "id": f"{pid}:{since:.3f}"}
+            except (OSError, ValueError, TypeError, KeyError, AttributeError, OverflowError, RecursionError):
                 continue
-            if not math.isfinite(since) or want <= 0:
-                continue
-            wait = {"pid": pid, "since": since, "want_gib": round(want / 1024 ** 3, 1),
-                    "who": str(data.get("who") or "")[:200], "id": f"{pid}:{since:.3f}"}
             if best is None or wait["want_gib"] > best["want_gib"]:
                 best = wait
     return best
@@ -6630,8 +6633,8 @@ def admission_waiters(capacity_dir: Path, skip_pid: int = 0) -> list[dict[str, A
             if not math.isfinite(since):  # an infinite or NaN since would break the one total order
                 continue
             wants = [str(kind) for kind in data.get("wants") or [] if isinstance(kind, str)]
-        except (OSError, ValueError, TypeError, KeyError, AttributeError, OverflowError):
-            continue  # OverflowError: a since too large for a float (an integer past 1e308)
+        except (OSError, ValueError, TypeError, KeyError, AttributeError, OverflowError, RecursionError):
+            continue  # OverflowError: a since too large for a float (an integer past 1e308); RecursionError: a deep body
         tier = data.get("tier") if data.get("tier") in (TIER_NIGHTLY, TIER_DEV, TIER_STACK) else ""
         lane = data.get("lane") if data.get("lane") in (SESSION_LANE, SIM_LANE) else ""
         waiters.append({"pid": pid, "since": since, "wants": wants, "who": str(data.get("who") or "")[:200],

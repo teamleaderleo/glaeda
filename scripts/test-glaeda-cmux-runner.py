@@ -12155,7 +12155,9 @@ class GateTest(unittest.TestCase):
         self.assertFalse(old.exists(), "a marker the worker stopped refreshing is removed")
         for body in ("not json", json.dumps({"since": now}), json.dumps({"since": True, "want_bytes": 1 << 30}),
                      json.dumps({"since": now, "want_bytes": True}), json.dumps({"since": "inf", "want_bytes": 1 << 30}),
-                     json.dumps({"since": now, "want_bytes": 0})):
+                     json.dumps({"since": now, "want_bytes": 0}),
+                     '{"since": 1, "want_bytes": 1' + '0' * 400 + '}',  # past a float: OverflowError
+                     '{"since": ' + '[' * 30000 + ']' * 30000 + '}'):  # past the parser's depth: RecursionError
             (capacity / f"{hook.FLEET_DISK_WANT}{os.getpid()}").write_text(body)
             self.assertIsNone(hook.fleet_disk_wait(capacity), body)
         (capacity / f"{hook.FLEET_DISK_WANT}{os.getpid()}").unlink()
