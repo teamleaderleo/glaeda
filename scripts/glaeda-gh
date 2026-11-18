@@ -7968,6 +7968,8 @@ LAND_WS_SYNC_TAIL = 16384  # bytes of the record read: hours of 10-minute runs
 
 def land_ws_sync_seen(head: str, log_path: Path | None = None) -> float | None:
     """When ws-sync's newest no-op or deployed line found main at HEAD (a fetch that ended at HEAD's commit), or None."""
+    if not head:
+        return None
     try:
         with open(log_path or LAND_WS_SYNC_LOG, "rb") as f:
             f.seek(0, os.SEEK_END)
@@ -7979,7 +7981,7 @@ def land_ws_sync_seen(head: str, log_path: Path | None = None) -> float | None:
         m = LAND_WS_SYNC_SEEN.match(line)
         if not m:
             continue
-        if not head or not head.startswith(m.group(2) or m.group(3)):
+        if not head.startswith(m.group(2) or m.group(3)):
             return None  # the newest fetch found main elsewhere: it says nothing of this checkout
         try:
             return float(calendar.timegm(time.strptime(m.group(1), "%Y-%m-%dT%H:%M:%SZ")))
@@ -9372,7 +9374,11 @@ class LandQueue:
             log({"event": "land-error", "site": "check_behind", "error": describe(error)})
             return
         path = land_dir() / LAND_STALE_CHECKOUT_FILE
-        key = None if why is None else (re.sub(r"\d+(?:\.\d+)?", "N", why), os.fspath(use) if use else None)
+        if why is not None and use is None:
+            why += (f"; no current ws-sync release to run instead ({release} "
+                    + ("is not current either)" if release.is_file() and not same else
+                       "is this checkout)" if same else "does not exist)"))
+        key = None if why is None else (re.sub(r"\d+(?:\.\d+)?|(?<=change)s\b", "N", why), os.fspath(use) if use else None)
         if key == self.stale_checkout:
             if why is not None:  # the same finding: keep the file's numbers current for `land status`, say nothing
                 write_json(path, {**(read_json(path) or {}), "reason": why, "checkedAt": self.now})
@@ -9395,12 +9401,9 @@ class LandQueue:
             self.notice("land-merge-hold-fallback", "info", f"glaeda land: {text}",
                         {"mergeHold": os.fspath(mh), "fallback": os.fspath(use)})
             return
-        nothing = (f"; no current ws-sync release to run instead ({release} "
-                   + ("is not current either)" if release.is_file() and not same else
-                      "is this checkout)" if same else "does not exist)"))
-        write_json(path, {"reason": why + nothing, "at": self.now, "mergeHold": os.fspath(mh)})
-        log({"event": "land-checkout-stale", "reason": why + nothing})
-        self.notice("land-checkout-stale", "warn", f"glaeda land: {why}{nothing}", {"mergeHold": os.fspath(mh)})
+        write_json(path, {"reason": why, "at": self.now, "mergeHold": os.fspath(mh)})
+        log({"event": "land-checkout-stale", "reason": why})
+        self.notice("land-checkout-stale", "warn", f"glaeda land: {why}", {"mergeHold": os.fspath(mh)})
 
     def reap(self) -> None:
         for key, fut in list(self.jobs.items()):

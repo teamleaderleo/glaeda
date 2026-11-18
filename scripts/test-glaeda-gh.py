@@ -20553,13 +20553,15 @@ class LandTest(Base):
                    "log -1 --format=%ct HEAD": str(int(now - 9 * 3600)), "log -1 --format=%ct origin/main": str(int(now)),
                    "rev-parse --path-format=absolute --git-path FETCH_HEAD": os.fspath(fetch)}
         git = lambda args: answers.get(" ".join(args))  # noqa: E731
-        why = gg.land_checkout_behind(Path("/ws/tools/merge_hold.py"), 20, 6.0, now, git)
+        no_log = Path(self.tmp.name) / "no-deploys.log"  # never the host's own ws-sync record
+        why = gg.land_checkout_behind(Path("/ws/tools/merge_hold.py"), 20, 6.0, now, git, no_log)
         self.assertIn("28 commits behind origin/main (over 20)", why)
         self.assertIn("9.0 h newer than HEAD", why)
         self.assertIn("/ws/tools/ws-deploy --local", why)
         self.assertNotIn("last fetched", why)
-        self.assertIn("last fetched 7.0 h ago", gg.land_checkout_behind(Path("/ws/x"), 100, 6.0, now + 7 * 3600, git))
-        self.assertIsNone(gg.land_checkout_behind(Path("/ws/x"), 100, 24.0, now, git))
+        self.assertIn("last fetched 7.0 h ago", gg.land_checkout_behind(Path("/ws/x"), 100, 6.0, now + 7 * 3600, git,
+                                                                         no_log))
+        self.assertIsNone(gg.land_checkout_behind(Path("/ws/x"), 100, 24.0, now, git, no_log))
         self.assertIsNone(gg.land_checkout_behind(Path("/nogit/x"), 0, 0.1, now, lambda args: None))
 
     def checkout_git(self, now: float, head: str, main: str, dirty: str = "") -> tuple[Any, Path]:
@@ -20649,6 +20651,11 @@ class LandTest(Base):
         self.assertEqual([n[0] for n in self.w.notices], ["land-checkout-stale"])
         self.assertIn(f"no current ws-sync release to run instead ({rel} is not current either)", self.w.notices[0][2])
         self.assertIn("/ws/tools/ws-deploy --local", self.w.notices[0][2])
+        self.q.now += gg.LAND_MH_BEHIND_EVERY + 1
+        self.q.refuse()  # the same finding: not said again, and `land status` keeps naming why there is no release
+        self.assertEqual(len(self.w.notices), 1)
+        stale = json.loads((gg.land_dir() / gg.LAND_STALE_CHECKOUT_FILE).read_text())
+        self.assertIn("no current ws-sync release to run instead", stale["reason"])
         rel.unlink()
         self.q.stale_checkout = None
         self.q.now += gg.LAND_MH_BEHIND_EVERY + 1
