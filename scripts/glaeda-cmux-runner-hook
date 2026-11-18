@@ -6628,7 +6628,8 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
     reserved unit. A costlier one waits its turn (fair_turn) like any job; its gate keeps the reserve until it is
     admitted (Gate.admitted), so the reserved unit stays out of other lanes' reach meanwhile.
     One detached holder keeps, for the whole job: a shared lock on the fleet host lock (with-host-lock
-    takes it exclusively, so the build worker and our jobs exclude each other), `units` unit files and
+    takes it exclusively, so the build worker and our jobs exclude each other; a gateway client takes none,
+    GATEWAY_NO_HOST_LOCK), `units` unit files and
     the job class's tokens. Everything is a flock, so a holder that dies releases all of it."""
     if klass:  # a class given outright (a ci-step, the fast tier, a console skipper admitted as light) costs its own
         pinned, need = False, class_need(klass)
