@@ -8895,9 +8895,9 @@ class LandQueue:
             self.pass_first_gated = e["key"]
 
     def log_pool(self) -> None:
-        """Once per LAND_POOL_LOG_EVERY, the pool as the last pass left it: workers busy and on what, snapshot waits, and
-        how many due judgments waited for a worker (the first in line named), so a land that is not judged can be told
-        apart from one that is never considered."""
+        """Once per LAND_POOL_LOG_EVERY, the pool as the last pass left it: workers busy and on what, snapshot waits,
+        and how many due judgments waited for a worker (the first in line named), so a land that is not judged can be
+        told apart from one that is never considered."""
         if self.now - self.pool_logged < LAND_POOL_LOG_EVERY:
             return
         self.pool_logged = self.now
