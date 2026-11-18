@@ -248,7 +248,7 @@ effect without a restart.
   dependency (--after: that PR merged) changed, never while its head's checks run. It stops and tells the requester
   (`acpmux send --no-wait HOST/SESSION`, default this host/$ACPMUX_SESSION_NAME) on a merge, a stop merge_hold names
   (a BLOCK, a hold, a conflict...), a step only a person can take, the PR or a dependency closed, or 3 identical
-  refusals in a row. Its calls carry CMUX_AGENT_SESSION=glaeda-land and MAY_MERGE_PATH=glaeda-land, so the gh-quota
+  refusals in a row (a named update-branch never counts: it is sent once per head). Its calls carry CMUX_AGENT_SESSION=glaeda-land and MAY_MERGE_PATH=glaeda-land, so the gh-quota
   call log and the landing record tell them from a person's. State in land/ (entries/, requests/, counts.json: the
   steps taken per day, which `land status` prints); ~/.config/glaeda/land.json may set gh, mergeHold, acpmux,
   routerReview, python, workers and env. merge_hold.py is mergeHold, else the ws-sync deploy's, else
@@ -8035,6 +8035,21 @@ LAND_QUOTA_SAID = (re.compile(r"\bno attempt before\s+(\d{2}):(\d{2})(?::(\d{2})
 LAND_STEP_BACKOFF = 60.0
 LAND_STEP_BACKOFF_MAX = 1800.0
 LAND_STEP_STOP = 6  # 60+120+240+480+960 s of backoff (~31 min) before the 6th identical refusal stops it
+# A refusal whose step is an update-branch (merge_hold's action kind "update_branch", any code: tip_merge, stale_green,
+# ws_check_stale_base, startup_failure, red_not_excused with --needs-newer-base) is taken, not counted. Before, the
+# judgment counted it toward LAND_STREAK_STOP before the step ran, so an update refused once or twice at a head (or
+# deferred, or sent with the cache still showing the old head) stopped the entry at the third judgment with the named
+# update never done: cmux#45870 on gcp-codex-lane-11, 2026-11-18 (judged, refused, judged, refused, judged: "3 identical
+# refusals in a row"), and claude-sr2-coord ran the update by hand on cmux#44938, #45870, #45709 and #46281 within the
+# hour. Decided (claude-sr2-coord): "when merge_hold's refusal names an update-branch (expected_head_sha=...), the
+# daemon runs it once per head and requeues, with no third refusal and no person". So update_branch:
+# - sends it pinned to the judged head (take refuses any other pin), at most once per head: e["updateSent"] is written
+#   when the step is claimed (a restart mid-send counts as sent) and dropped when the step is refused before GitHub;
+# - a refused send backs off on the step's own count (step_refused, LAND_STEP_STOP), never the judgment's;
+# - a second refusal naming the update at a head it was sent at waits for the new head instead, and stops, saying so,
+#   once LAND_UPDATE_ONCE has passed since the send with no new head.
+# A teammate's PR is a merge_hold stop (code teammate) before any update is named, so this never sends one there.
+LAND_UPDATE_ONCE = 3600.0
 LAND_STEP_NEXT_UPDATE = re.compile(r"\bnext: (?:gh pr update-branch \d+|gh api -X PUT \S*/pulls/\d+/update-branch)")
 LAND_STEP_NEXT_WAIT = re.compile(r"\bnext: glaeda-gh wait pr \S+[^\n;]*?(?:--timeout (\d+))?(?=\s*(?:\(|$|\n|;))")
 LAND_STEP_CODE = re.compile(r"\brefused \[([a-z_]+)")
@@ -9329,6 +9344,10 @@ class LandQueue:
             e.pop("quotaRefusals", None)
             if answer.get("ok"):
                 e["streak"] = None
+            elif act.get("kind") == "update_branch":
+                # The refusal's step is the pinned update (any code: LAND_UPDATE_ONCE's comment): taken, never counted
+                # toward the identical-refusal stop. update_branch sends it once per head and bounds the rest.
+                pass
             elif self.streak(e, f"{answer.get('code')}|{head}|{act.get('kind')}", act.get("kind") in LAND_RETRY_KINDS,
                              counts):
                 self.stop(e, str(answer.get("code") or "refused"),
@@ -9491,10 +9510,14 @@ class LandQueue:
                           "install the gh-quota shim (tools/host-baseline) or set gh in ~/.config/glaeda/land.json")
             return
         with self.lock:
+            if kind == "update_branch":
+                e["updateSent"] = {"head": head, "at": self.now}  # saved by claim: a restart mid-send counts as sent
             self.claim(e, kind, before=head, **extra)
         got = self.call([gh, *args], LAND_GH_DEADLINE, e)
         named = None
         with self.lock:
+            if kind == "update_branch" and got.returncode != 0:
+                e.pop("updateSent", None)  # refused: not sent; step_refused counts and backs off its retries
             self.finish(e, got)
             e["preStepHead"] = head if got.returncode == 0 else ""
             if got.returncode == 0:
@@ -9557,6 +9580,22 @@ class LandQueue:
         cache (an event wait, no explain) instead. An update at a head that an update of this queue made, after its
         checks finished, is the base moving during CI: counted in history as update_again."""
         repo, number = e["repo"], str(e["number"])
+        sent = e.get("updateSent") or {}
+        if head and sent.get("head") == head:
+            # Once per head (LAND_UPDATE_ONCE's comment): never a second update at this head. Wait for the new head
+            # it makes; with none by the bound, stop and say so.
+            waited = self.now - float(sent.get("at") or 0)
+            with self.lock:
+                if waited >= LAND_UPDATE_ONCE:
+                    self.stop(e, "update_branch_no_new_head",
+                              f"the update-branch sent at {head[:12]} {waited:.0f} s ago made no new head the queue "
+                              "could read; it is sent once per head",
+                              f"glaeda-gh status pr {repo}#{number}")
+                    return
+                self.history(e, "update_once", head=head[:12], why="already sent at this head: waiting for the new one")
+                self.nudge(e["key"])
+                self.wait(e, {"kind": "head_change", "before": head, "since": self.now}, LAND_UPDATE_ONCE - waited)
+            return
         data = (self.cache_of(e["key"]) or {}).get("data") or {}
         held = e.get("updateDeferred") or {}
         stuck = held.get("head") == head and self.now - float(held.get("at") or 0) >= LAND_WAIT_DEFAULT
