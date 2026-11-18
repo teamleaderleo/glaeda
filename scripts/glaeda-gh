@@ -674,11 +674,19 @@ GRAPHQL_SLOT_WANT_TOUCH = 0.25
 # process while no pr read was stored for 600 s and nothing said who held them. Past the bound the watchdog closes the
 # holder's slot file (the lock goes with it), logged once naming the thread, what it read and for how long.
 GRAPHQL_SLOT_HOLD_MAX = 2.0 * HTTP_DEADLINE
+# A slot whose request is on the wire (graphql_slot_flight) is past the reap's reach until this: a land worker's thread
+# has no SIGALRM deadline, and its slot freed under it let a second request in (review of glaeda#2189, F3). Every
+# daemon request is in flight from take to release, so a hung one is still freed past it, logged as in flight with its
+# thread and its call (review of glaeda#2199).
+GRAPHQL_SLOT_FLIGHT_MAX = 4.0 * GRAPHQL_SLOT_HOLD_MAX
 STALE_RESTART_ADVICE = "`glaeda-gh restart` restarts a daemon in this state."
 STALE_DEFERRED_ADVICE = "A restart would not read any sooner: the budget above holds the reads back."
 STALE_PACED_ADVICE = ("A restart would not read any sooner: the pace above is too slow for what waits are blocked on; "
                       "raise graphqlPerMinute in the policy, or block fewer waits at once.")
 STALE_ADVICE = {"deferred": STALE_DEFERRED_ADVICE, "paced": STALE_PACED_ADVICE}  # verdicts a restart cannot fix
+# Reads a wait or a due land is blocked on go first in every window; watches nothing is blocked on still get one batch
+# (one REST read) at least this often, per kind, so a blocked set past the pace cannot starve them (review of #2199).
+PLAIN_FLOOR_EVERY = 60.0
 # serve registers SIGUSR1 (faulthandler): every thread's stack goes to the daemon's stderr (the unit's journal) and it
 # goes on serving. huge-blue, 2026-11-18: a stalled daemon's threads (one on a futex) could only be guessed at.
 STALE_DUMP_ADVICE = ("Where each thread is: kill -USR1 <daemon pid> (daemon.json pid); the stacks go to the daemon's "
@@ -2081,15 +2089,18 @@ def graphql_slot_holders(now: float | None = None) -> list[dict[str, Any]]:
     return sorted(rows, key=lambda r: -r["heldS"])
 
 
-def graphql_slot_reap(bound: float = GRAPHQL_SLOT_HOLD_MAX, now: float | None = None) -> list[dict[str, Any]]:
+def graphql_slot_reap(bound: float = GRAPHQL_SLOT_HOLD_MAX, now: float | None = None,
+                      flight_bound: float = GRAPHQL_SLOT_FLIGHT_MAX) -> list[dict[str, Any]]:
     """Free every slot this process has held past BOUND (GRAPHQL_SLOT_HOLD_MAX) with no request on the wire
-    (graphql_slot_flight): its file is closed, so the lock goes and the next taker (the daemon's pr batch) gets it. The
-    holder's own release later is a no-op. Returns who held each: {"slot", "thread", "what", "heldS"}."""
+    (graphql_slot_flight), or past FLIGHT_BOUND with one: its file is closed, so the lock goes and the next taker (the
+    daemon's pr batch) gets it. The holder's own release later is a no-op. Returns who held each: {"slot", "thread",
+    "what", "heldS", "inFlight"}."""
     now = time.monotonic() if now is None else now
     with _SLOT_HOLDERS_LOCK:
         for k in [k for k, h in _SLOT_HOLDERS.items() if _slot_gone(h)]:  # closed or dropped without release
             _SLOT_HOLDERS.pop(k, None)
-        stale = [(k, h) for k, h in _SLOT_HOLDERS.items() if now - h["since"] > bound and not h.get("flight")]
+        stale = [(k, h) for k, h in _SLOT_HOLDERS.items()
+                 if now - h["since"] > (flight_bound if h.get("flight") else bound)]
         for k, _ in stale:
             _SLOT_HOLDERS.pop(k, None)
     out = []
@@ -2099,7 +2110,8 @@ def graphql_slot_reap(bound: float = GRAPHQL_SLOT_HOLD_MAX, now: float | None = 
             continue
         with contextlib.suppress(OSError, ValueError):
             handle.close()
-        out.append({"slot": h["slot"], "thread": h["thread"], "what": h["what"], "heldS": round(now - h["since"], 1)})
+        out.append({"slot": h["slot"], "thread": h["thread"], "what": h["what"], "heldS": round(now - h["since"], 1),
+                    "inFlight": bool(h.get("flight"))})
     return out
 
 
@@ -3602,6 +3614,8 @@ class Daemon:
         self.stall_said: dict[str, str] = {}  # kind -> the cause stall_cause last logged (said once per cause)
         self.defer_why: dict[str, tuple[float, str]] = {}  # kind -> (when, why) its reads were last deferred
         self.blocked: dict[str, int] = {}  # kind -> open watches a wait or a due land is blocked on (oldest_data)
+        self.paced_at: dict[str, float] = {}  # kind -> when graphqlPerMinute last held its reads (batched)
+        self.plain_at: dict[str, float] = {}  # kind, or "rest" -> last read of a watch nothing is blocked on
         self.failing: dict[str, Any] | None = None  # set while ticks raise: the latest error and since when
         self.tick_deadline = float("inf")  # time.monotonic() after which this tick starts no request
         self.deferred: set[str] = set()  # keys a tick ran out of time for: read first on the next tick
@@ -3757,8 +3771,10 @@ class Daemon:
         once with its holder: the next pr batch gets the slot instead of waiting out every tick's budget for it."""
         freed = graphql_slot_reap()
         for r in freed:
-            log({"event": "slot-freed", **r, "bound": GRAPHQL_SLOT_HOLD_MAX,
-                 "why": f"held past {GRAPHQL_SLOT_HOLD_MAX:.0f} s; a slot is held per request"})
+            bound = GRAPHQL_SLOT_FLIGHT_MAX if r["inFlight"] else GRAPHQL_SLOT_HOLD_MAX
+            log({"event": "slot-freed", **r, "bound": bound,
+                 "why": (f"its request ({r['what']}) still on the wire past {bound:.0f} s" if r["inFlight"]
+                         else f"held past {bound:.0f} s; a slot is held per request")})
         return freed
 
     def progress_call(self) -> dict[str, Any] | None:
@@ -3836,12 +3852,20 @@ class Daemon:
         last tick) once per STALE_DATA_AFTER, the numbers: {"blocked", "needed", "pace", "text"}, NEEDED being the
         points a minute that takes (a query per batch, at the points KIND's queries cost over READ_PROGRESS_WINDOW).
         None while the pace covers them. huge-blue 2026-11-18 21:5xZ: waited pr data 3403 s old at 40 points a
-        minute, and the alarm offered a restart, which reads no faster."""
+        minute, and the alarm offered a restart, which reads no faster. Only with evidence the pace held them: KIND
+        reads over GraphQL, the pace refused a query of it (paced_at) and its queries answered and stored reads in the
+        window; arithmetic alone would cover a stall (review of glaeda#2199: nothing answered, batch 1, read "paced")."""
         n = (getattr(self, "blocked", None) or {}).get(kind) or 0
-        if not n:
+        if not n or self.paths.get(kind) != "graphql":
+            return None
+        if self.now - self.paced_at.get(kind, float("-inf")) > READ_PROGRESS_WINDOW:
+            return None
+        if not [t for t in self.read_done.get(kind, []) if self.now - t < READ_PROGRESS_WINDOW]:
             return None
         costs = [points for at, why, points in self.gql_log if why == kind and self.now - at < READ_PROGRESS_WINDOW]
-        per_query = sum(costs) / len(costs) if costs else 1.0
+        if not costs:
+            return None
+        per_query = sum(costs) / len(costs)
         needed = math.ceil(math.ceil(n / max(1, self.batch.get(kind) or 1)) * per_query * 60 / STALE_DATA_AFTER)
         pace = self.policy.get("graphqlPerMinute", GRAPHQL_PER_MINUTE)
         if needed <= pace:
@@ -5655,9 +5679,10 @@ class Daemon:
         one read each, and then it is an ordinary key. Keys the last tick ran out of time for go next, ahead of new ones
         of either kind (due() put them first only within their kind, so deferred runs still sat behind every new
         PR), oldest deferral first, so a newer one (a new watch, never read) cannot overtake a key deferred tick
-        after tick. Then the longest unread, a key a wait is blocked on counted WAIT_PRIORITY older, and waited
-        first on a tie (two never-read keys). Aging, not an absolute rank: an unread key's place only improves
-        while read keys move back, so waiters cannot starve the rest."""
+        after tick, except that a deferred key a wait is blocked on goes ahead of every deferred plain one. Then the
+        longest unread, a key a wait is blocked on counted WAIT_PRIORITY older, and waited first on a tie (two
+        never-read keys). The deferred rank can starve plain keys while blocked ones fill the share; tick() keeps
+        them a floor (PLAIN_FLOOR_EVERY: the first plain key goes first once a minute)."""
         carried = self.deferred_before
         # Among the deferred, a key a wait is blocked on (an interactive wait, a due land) goes ahead of every plain
         # watch: huge-blue 2026-11-18 19:56Z, 740 deferred keys, mostly plain watches, ahead of every wait; and at
@@ -6027,9 +6052,23 @@ class Daemon:
         # What waits and due lands are blocked on, of every kind, goes ahead of the round robin's turns: a minute's
         # points read it first, and only what is left reads the rest (huge-blue 2026-11-18 21:5xZ: waited pr data
         # 3403 s old at 40 points/min while unblocked watches took the points).
+        # The watches nothing is blocked on keep a floor first (PLAIN_FLOOR_EVERY): one batch of them per kind.
         blocked = {kind: [e for e in due[kind] if self.waited(e)] for kind in kinds}
+        floor: set[str] = set()
         for kind in kinds[first:] + kinds[:first]:
-            if over[kind] == "graphql" and blocked[kind]:
+            if over[kind] != "graphql":
+                continue
+            plain = [e for e in due[kind] if not self.waited(e)]
+            # (a minute with none read since it was first due: a fresh daemon's first tick is no starvation)
+            if plain and blocked[kind] and self.now - self.plain_at.setdefault(kind, self.now) >= PLAIN_FLOOR_EVERY:
+                chunk = plain[:max(1, self.batch[kind])]
+                floor |= {e["key"] for e in chunk}
+                before = len(self.gql_log)
+                with self.phase(f"read {kind}"):
+                    spilled += self.batched(kind, chunk, self.graphql_fetch[kind])
+                if len(self.gql_log) > before:
+                    self.plain_at[kind] = self.now
+            if blocked[kind]:
                 with self.phase(f"read {kind}"):
                     spilled += self.batched(kind, blocked[kind], self.graphql_fetch[kind])
                 self.post_between()
@@ -6040,8 +6079,10 @@ class Daemon:
             if over[kind] == "graphql":
                 before = len(self.gql_log)
                 with self.phase(f"read {kind}"):
-                    spilled += self.batched(kind, [e for e in due[kind] if not self.waited(e)],
+                    spilled += self.batched(kind, [e for e in due[kind] if not self.waited(e) and e["key"] not in floor],
                                             self.graphql_fetch[kind])
+                if len(self.gql_log) > before:
+                    self.plain_at[kind] = self.now
                 if self.gql_paced == kind:
                     paced_sent = len(self.gql_log) > before
                 self.post_between()
@@ -6058,6 +6099,12 @@ class Daemon:
         # With PRs always ahead of runs, a busy daemon read PRs tick after tick while a blocked `wait run` sat on a
         # run nobody reached (2026-10-27: 581 s and counting, with STALE_RUN_REREAD due at 180 s).
         over_rest = self.rest_order(over_rest)
+        plain = next((e for e in over_rest if not self.waited(e) and not self.wait_confirms(e)), None)
+        if plain is not None and any(self.waited(e) for e in over_rest) \
+                and self.now - self.plain_at.setdefault("rest", self.now) >= PLAIN_FLOOR_EVERY:
+            # the floor (PLAIN_FLOOR_EVERY): the first watch nothing is blocked on goes next after the confirmations
+            confirms = [e for e in over_rest if self.wait_confirms(e)]
+            over_rest = confirms + [plain] + [e for e in over_rest if e is not plain and not self.wait_confirms(e)]
         for i, e in enumerate(over_rest):
             # A read is admitted only when its worst case fits in the share, so the share holds at a
             # request, not at a batch; the rest go first next tick, over whichever bucket is richer.
@@ -6088,6 +6135,8 @@ class Daemon:
                 self.to_graphql(over_rest[i:], spilled)
                 break
             self.rest_tried[e["key"]] = self.now  # read, or failed: either way it moves back
+            if not self.waited(e):
+                self.plain_at["rest"] = self.now
             # and a read that deferred itself for the rest of its work (fill_steps_rest) queues as a new deferral
             self.deferred_since.pop(e["key"], None)
         for e in self.jobs_only:
@@ -6654,6 +6703,7 @@ class Daemon:
                            f"{self.policy.get('graphqlPerMinute', GRAPHQL_PER_MINUTE)} points this minute")
                 if getattr(self, "gql_paced", None) is None:
                     self.gql_paced = kind
+                self.paced_at[kind] = self.now  # the evidence pace_short needs
                 return to_rest
             self.gql_limited = False
             self.gql_reason = kind
