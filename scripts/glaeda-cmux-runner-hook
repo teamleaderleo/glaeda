@@ -10699,7 +10699,8 @@ class Gate:
         running Worker's exit. Job admission keeps its existing measured disk-growth checks and disk-low ledger. Disk
         observations never arm JOB_END_FREEZE.
 
-        No reading holds the listener (DISK_RECLAIM_NOW). An idle pool runner short of one job's measured peak
+        No floor holds the listener (DISK_RECLAIM_NOW); only a full disk does, free under RUNNER_JOBS_FLOOR_GIB where
+        no job fits (DISK_FULL_NO_LISTEN, the one reason this returns). An idle pool runner short of one job's measured peak
         (job_disk_gib, DISK_SHORT_RECLAIM), whatever the floor, or of the jobs in flight's disk (RUNNER_JOBS_DISK)
         starts reclaim at once aimed at what it lacks, and records it (disk_short), so its listener's next start waits
         at most DISK_RECLAIM_WAIT_S for room (disk_room_wait) and then listens whatever that freed. These readings used
@@ -10739,6 +10740,18 @@ class Gate:
         short: tuple[str, float] | None = None
         if not scope.dedicated and not nightly_own and not scope.gateway and scope.min_free_gib > 0:
             peak, whose = listener_disk_peak(scope)
+            # DISK_FULL_NO_LISTEN: under the hard floor no job fits, and one taken fails with ENOSPC, so this is no
+            # floor to warn about but a full disk: reclaim, and hold the listener (its look after a job stops it too)
+            # until reclaim or the running jobs' ends free it. Leo: "A busy machine makes things slower, never makes
+            # them fail." 2026-11-18 19:46-19:55Z: cmux18's listeners took jobs at 8.5 GiB free beside five running,
+            # which wrote it down to 1.8 GiB while the lent fleet worker beside them sat at claim_paused disk.
+            # An unreadable reading holds nothing (free_or_none: None).
+            if (free := free_or_none(path)) is not None and free < RUNNER_JOBS_FLOOR_GIB:
+                self.disk_short = None
+                self.evict_in_background(path, max(floor, peak))
+                # the same words every poll: the gate logs a hold again only when its reason changes
+                return (f"disk full: under the {RUNNER_JOBS_FLOOR_GIB:g} GiB hard floor where no job fits; "
+                        "reclaiming (DISK_FULL_NO_LISTEN)")
             if under := disk_refusal(path, peak):
                 short = (f"disk: {under} for {whose} (DISK_SHORT_RECLAIM)", max(floor, peak))
             elif crowded := self.runner_jobs_short(path):
@@ -10865,22 +10878,14 @@ class Gate:
         idle = self.idle_evict is not None and self.idle_evict.is_alive()
         return own or idle or wait_for_running_pass(time.monotonic())
 
-    def disk_room_wait(self) -> bool:
+    def disk_room_wait(self) -> None:
         """DISK_RECLAIM_NOW, right before the listener starts: an idle pool runner found short at the last look
         (disk_short; low_disk has started reclaim already) waits at most DISK_RECLAIM_WAIT_S for that room, looking
         every DISK_RECLAIM_POLL_S, ending early once the room is there, no reclaim runs or the agent stops. Then the
         listener starts whatever was freed: a disk floor never holds it. A listener already online is never stopped
-        for disk, so only a start waits.
-
-        It reports whether the listener may start. One reading alone keeps it off: free disk still under
-        RUNNER_JOBS_FLOOR_GIB (the controller's hard floor, where a fleet worker stops a running build) after the
-        wait. That is no floor but a full disk: no job fits there, and one taken fails with ENOSPC, so the gate
-        reclaims again on its next poll, seconds later, instead (DISK_FULL_NO_LISTEN; Leo: "A busy machine makes
-        things slower, never makes them fail"). 2026-11-18 19:46-19:55Z: cmux18's listeners started after their
-        30 s wait at 8.5 GiB free with five jobs running, the jobs wrote it down to 1.8 GiB, and the lent fleet
-        worker beside them sat at claim_paused disk with suites queued 4-5 h."""
+        for disk, so only a start waits."""
         if self.disk_short is None:
-            return True
+            return
         why, target = self.disk_short
         self.disk_short = None
         path = os.path.dirname(self.host_lock)
@@ -10892,13 +10897,9 @@ class Gate:
             self.reap_eviction(path, target)
         after = free_or_none(path)
         freed = f"{after - before:.1f} GiB" if before is not None and after is not None else "an unknown amount"
-        full = after is not None and after < RUNNER_JOBS_FLOOR_GIB
-        room = ("the room is there" if not disk_refusal(path, target) else
-                f"under the {RUNNER_JOBS_FLOOR_GIB:g} GiB hard floor, where no job fits; not listening, reclaiming "
-                "again next poll (DISK_FULL_NO_LISTEN)" if full else "still short; listening anyway")
+        room = "the room is there" if not disk_refusal(path, target) else "still short; listening anyway"
         gate_log(f"{why}: waited {time.monotonic() - start:.0f} s for reclaim (at most {DISK_RECLAIM_WAIT_S:g} s), "
                  f"freed {freed}, {room} (DISK_RECLAIM_NOW)")
-        return not full
 
     def locked(self, fresh: bool = False) -> str | None:
         """For the gui and session runners only: why their console session cannot run a GUI job (console_refusal),
@@ -11631,10 +11632,13 @@ class Gate:
                 # RUNNER_DRAIN stops it at the job's end too, and so does a signing job's claim (exclusive_yield):
                 # a job that ends while the signing job waits for the drain is the one a queued job replaces at once
                 reserved = self.still_reserved() or self.draining() or self.exclusive_yield()
-                self.job_waited = bool(self.waiting) or reserved is not None
-                self.low_disk()  # advisory cleanup only: never watch or freeze a Worker for disk
+                # A disk floor is advisory cleanup only: never watch or freeze a Worker for it. A full disk
+                # (DISK_FULL_NO_LISTEN) is not a floor: the next job would fail there, so the listener stops at this
+                # job's end as for a reservation, and starts again once reclaim or the other jobs' ends free room.
+                full = self.low_disk()
+                self.job_waited = bool(self.waiting) or reserved is not None or full is not None
                 workers = tuple(pid for pid in self.worker_pids() if pid not in self.done) \
-                    if self.waiting or reserved or self.job_ending else ()
+                    if self.waiting or reserved or full or self.job_ending else ()
                 if workers:
                     if workers != self.watching:  # once per job: the request its Worker runs, and who runs it
                         self.job_request, self.listener_pids = self.taking(), self.listener_list()
@@ -11719,8 +11723,7 @@ class Gate:
             self.held, self.free_since, self.free_logged = None, None, False
         if self.terminating:  # SIGTERM during the look above
             return 0
-        if not self.disk_room_wait():  # DISK_RECLAIM_NOW: seconds for room; only a full disk keeps it off
-            return None
+        self.disk_room_wait()  # DISK_RECLAIM_NOW: seconds for room, never a hold
         if self.terminating:
             return 0
         self.start()
