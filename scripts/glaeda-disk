@@ -158,7 +158,10 @@ root's newest one under pressure (two during idle sweeps), and a root's kept bui
 trusted seeder, a seed its serve log shows streamed whole to the seed archive (cmux-lawrence's SSD) is
 reclaimable at once instead of after the idle window: the PR minis restore it from there over the LAN.
 SwiftPM scratch (spm-scratch/<fingerprint>) that no job holds by its lock ages like any cache, and goes
-whatever its age once free space is below the emergency floor. The Chromium source tree under
+whatever its age once free space is below the emergency floor. The fast tier's seed root
+(/Users/runner/_work/cmux, cmux owned_spm_scratch.py seed_lease) keeps its package builds while a job holds
+its lock, and under pressure they go after the per-slot builds: the next job restores them from the seed.
+The Chromium source tree under
 cmux-browser-fleet/build and protected release-support caches are never deleted. Small top-level
 browser tour artifacts and fleet cache entries older than the 2026-09-17 migration cutoff are
 disposable; newer ones stay when a live reservation or lease names them.
@@ -1193,6 +1196,9 @@ def fleet_families(ci: Path | None = None) -> list[Family]:
                            platform="macos"))
     if fams:  # root 1's store is the mini's, and the only one that holds SwiftPM scratch (cmux mini_store)
         fams.append(spm_scratch_family(fleet_stores(ci)[0]))
+    packages = CMUX_SEED_ROOT / "cmux/Packages"
+    if packages.is_dir() and not CMUX_SEED_ROOT.is_symlink():  # a fast-tier job used the seed root here
+        fams.append(seed_root_family(packages))
     return fams
 
 
@@ -1455,6 +1461,65 @@ def remove_spm_scratch(path: Path) -> bool:
         os.rename(path, aside)
         path.with_name(path.name + ".size").unlink(missing_ok=True)
     shutil.rmtree(aside, onerror=_chmod_retry)
+    return True
+
+
+# cmux CI's fast-tier seed root (cmux scripts/ci/owned_spm_scratch.py seed_lease): an owned mini's fast-tier job
+# builds at the workspace path the base seed was built at on Blacksmith (SwiftPM records absolute paths), restores
+# that seed into its packages' .build, and holds <root>/.cmux-seed-root.lock exclusive for the whole job. The next
+# job restores the seed again, so a build left there costs one restore (minutes) and goes after the per-slot cold
+# builds (runner checkouts, SwiftPM scratch), each of which costs a whole compile (cmux#44271, 2026-11-18). Only
+# the builds go, only under that lock; the mirrored source beside them is small.
+CMUX_SEED_ROOT = Path("/Users/runner/_work/cmux")
+SEED_ROOT_FAMILY = "cmux-fast-tier-seed-root"
+SEED_ROOT_LOCK = ".cmux-seed-root.lock"  # owned_spm_scratch.SEED_LOCK
+SEED_ROOT_REBUILD_MINUTES = 30.0  # above every per-slot build family: they go first under pressure
+
+
+def seed_root_family(packages: Path) -> Family:
+    """The seed workspace's package builds: PACKAGES is <seed root>/cmux/Packages."""
+    return Family(SEED_ROOT_FAMILY, packages, True, "the next fast-tier job on this mini restores the base seed",
+                  depth=3, match=".build", build_output=True,  # <platform>/<package>/.build
+                  owner="cmux owned_spm_scratch.py (seed_lease)", rebuild_minutes=SEED_ROOT_REBUILD_MINUTES,
+                  platform="macos")
+
+
+def seed_root_lock(fam: Family) -> Path:
+    return fam.root.parent.parent / SEED_ROOT_LOCK
+
+
+def seed_root_held(fam: Family, path: Path) -> bool:
+    """Whether a fast-tier job holds the seed root: its holder keeps <root>/.cmux-seed-root.lock exclusive.
+    Probed exclusive and released at once; seed_lease takes it non-blocking and falls back to the shared roots for
+    that moment. No lock file means no job ever took it. An unreadable lock counts as held."""
+    try:
+        fd = os.open(seed_root_lock(fam), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return True
+    finally:
+        os.close(fd)
+    return False
+
+
+def remove_seed_root_build(fam: Family, path: Path) -> bool:
+    """Delete one package build in the seed root under an exclusive lock on its lock file, so no job takes the
+    root mid-delete. False, touching nothing, while a job holds it."""
+    if path.is_symlink():
+        raise OSError("refusing symlink")
+    if os.path.ismount(path) or path.lstat().st_dev != path.parent.stat().st_dev:
+        raise OSError("refusing a mount point")
+    with open(seed_root_lock(fam), "a") as handle:  # created as seed_lease creates it
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return False
+        shutil.rmtree(path, onerror=_chmod_retry)
     return True
 
 
@@ -8596,6 +8661,8 @@ def job_busy(fam: Family, path: Path) -> bool:
         return False
     if fam.id == SPM_SCRATCH:  # dozens of package builds within three levels; its lock is its in-use signal
         return False
+    if fam.id == SEED_ROOT_FAMILY:  # a package build; the seed root's lock is its in-use signal
+        return False
     if fam.id == CANONICAL_ADMISSION:  # a DerivedData; the root's token is its in-use signal
         return False
     if fam.id == RUNNER_ROOT_ADMISSION:  # a DerivedData; its runner's Runner.Worker is its in-use signal
@@ -9363,6 +9430,8 @@ def _survey(families, idle_hours, min_bytes, known, evidence, defer_bulk=False,
             references = references_by_root.setdefault(key, live_artifact_references(fam.reference_root))
             if artifact_referenced(path, references):
                 reasons.append("live lease or running job")
+        if fam.id == SEED_ROOT_FAMILY and seed_root_held(fam, path):
+            reasons.append("a fast-tier job holds the seed root's lock (owned_spm_scratch.py seed_lease)")
         if fam.id == SPM_SCRATCH and spm_scratch_held(path):
             reasons.append("a job holds its lock (owned_spm_scratch.py)")
         if fam.id == TART_VMS and not blind and (why := tart_vm_held(path, cmds)):
@@ -11374,6 +11443,7 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
                     and artifact_referenced(p, fresh_artifact_references(fam.reference_root)))
                 or (i.family == "claude-scratchpad" and claude_session_active(p.name, idle_hours * 3600))
                 or (i.family == SPM_SCRATCH and spm_scratch_held(p))
+                or (i.family == SEED_ROOT_FAMILY and seed_root_held(fam, p))
                 or (i.family == CANONICAL_ADMISSION and canonical_root_held(p))
                 or (tmp_canonical_root(fam, p) and canonical_root_held(p, whole_root=True))):
             outcome = "changed:in-use"
@@ -11433,6 +11503,8 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
                     released += max(0, original_bytes - destination.stat().st_size)
                 elif i.family == SPM_SCRATCH:
                     gone = remove_spm_scratch(p)  # only under its lock: a job may link it right now
+                elif i.family == SEED_ROOT_FAMILY:
+                    gone = remove_seed_root_build(fam, p)  # only under its lock: a job may take the root now
                 elif i.family == CANONICAL_ADMISSION:
                     gone = remove_canonical_admission(p)  # only under its root's token: a job may take it now
                 elif tmp_canonical_root(fam, p):
