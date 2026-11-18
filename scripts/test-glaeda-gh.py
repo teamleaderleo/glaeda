@@ -20600,9 +20600,41 @@ class LandTest(Base):
         self.assertEqual((pool["gated"], pool["dueLate"], pool["firstGated"]), (1, 1, "o/r#11"))
         del self.q.jobs["pr:o/r#99"]
         self.retries(1)
-        e = self.tick(30) and self.q.entries[key]
+        self.tick(30)
+        e = self.q.entries[key]
         self.assertEqual(self.explained(), ["11"])
         self.assertNotIn("dueLate", e)
+
+    def test_a_stopped_predecessor_merged_by_hand_is_still_read_for_its_follower(self):
+        """Review: an --after PR whose own entry stopped is read by nothing else once only due entries hold watches; its
+        follower must still read it (one peek per LAND_PEEK_EVERY), or a hand merge never shows and the follower stops
+        after_stopped a day later."""
+        a = self.stuck(2, 0, state="stopped")
+        self.q.entries[a]["stop"] = {"code": "block", "reason": "blocked", "at": self.t - 60}
+        e_key = self.stuck(11, 0, state="waiting_after", after=[a])
+        self.w.watched.clear()
+        self.tick(30)
+        self.assertIn(a, self.w.watched)
+        self.assertEqual(self.q.entries[e_key]["state"], "waiting_after")
+        self.w.set_pr(a, land_pr("b" * 40, state="MERGED"), self.t)  # what that read stores
+        self.retries(2)
+        self.tick(30)
+        self.assertEqual(self.explained(), ["11"])
+
+    def test_a_due_row_put_on_running_checks_drops_its_latch_mark(self):
+        """Review: a due row the latch held, then found with checks running, waits on a wake an hour ahead: it is not
+        due, so its status no longer says the latch holds it, and its windows do not carry into later latches."""
+        key = self.stuck(11, 0, state="queued")  # queued: due, its checks not read yet
+        self.latch("graphql", self.t + 300)
+        self.tick(30)
+        self.assertIn("latchHeld", self.q.entries[key])
+        self.clear_latch()
+        self.pr("b".rjust(40, "b"), key=key, checks=[("ci", "IN_PROGRESS", None)])
+        self.tick(30)
+        e = self.q.entries[key]
+        self.assertEqual((e["state"], e["wait"]["kind"]), ("waiting", "pr"))
+        self.assertNotIn("latchHeld", e)
+        self.assertNotIn("held by the login latch", gg.land_line(e, self.t))
 
     def test_only_due_entries_hold_a_waited_pr_watch(self):
         """huge-blue, 2026-11-18 20:00Z: 525 of 725 pr watches were the land queue's, each open entry's waited watch

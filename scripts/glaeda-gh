@@ -9172,7 +9172,7 @@ class LandQueue:
             e.update(state="queued", head="", explain=None, action=None, streak=None, wakeAt=None,
                      wait=None, seen=None, seenHead="", mergeSha="", stop=None, preStepHead="",
                      lastAction=None, reviewed=[], updateSent=None, updateDeferred=None, waitRefused=None,
-                     waitBudget=None, afterStopped=None, reruns=None, latchHeld=None, dueLate=None)
+                     waitBudget=None, afterStopped=None, reruns=None, latchHeld=None, dueLate=None, dueAt=self.now)
             self.history(e, "queued", by=e["requester"], via=e["requesterFrom"], after=",".join(e["after"]))
         else:
             self.history(e, "updated", by=e["requester"], after=",".join(e["after"]))
@@ -9403,7 +9403,9 @@ class LandQueue:
         wake = e.get("wakeAt")
         if e["state"] == "waiting" and isinstance(wake, (int, float)) and not isinstance(wake, bool):
             return float(wake)
-        at = (e.get("explain") or {}).get("at")
+        at = e.get("dueAt")  # when it was last queued (apply, after_merged, unparked)
+        if not isinstance(at, (int, float)) or isinstance(at, bool):
+            at = (e.get("explain") or {}).get("at")
         if not isinstance(at, (int, float)) or isinstance(at, bool):
             at = e.get("created")
         return float(at) if isinstance(at, (int, float)) and not isinstance(at, bool) else 0.0
@@ -9449,7 +9451,9 @@ class LandQueue:
         wake = e.get("wakeAt")
         if isinstance(wake, (int, float)) and self.now < wake:
             return True
-        e.update(state="queued", wait=None, wakeAt=None, freshAfter=self.now)  # nothing was read for it while parked
+        # nothing was read for it while parked; due since its wake
+        e.update(state="queued", wait=None, wakeAt=None, freshAfter=self.now, dueAt=float(wake)
+                 if isinstance(wake, (int, float)) and not isinstance(wake, bool) else self.now)
         self.history(e, "unparked")
         self.save(e)
         return False
@@ -9706,7 +9710,10 @@ class LandQueue:
             if self.now - self.touched.get(k, float("-inf")) >= LAND_TOUCH:
                 self.watch_now(k)
         peeks = [] if waited else [e["key"]]
-        peeks += [a for a in e.get("after", []) if a not in self.entries]
+        # (an --after PR whose entry here ended unmerged, stopped or forwarded, is read no more by its own entry: a
+        # hand merge of it must still show, or this one waits out LAND_AFTER_STOPPED_WAIT and stops)
+        peeks += [a for a in e.get("after", []) if (self.entries.get(a) or {}).get("state", LAND_FORWARDED)
+                  in LAND_DONE - {"merged", "cancelled"}]
         for k in peeks:
             if self.now - self.peeked.get(k, float("-inf")) >= LAND_PEEK_EVERY:
                 self.peeked[k] = self.now
@@ -9762,7 +9769,7 @@ class LandQueue:
                 self.save(e)
             return
         if e["state"] == "waiting_after":
-            e["state"], e["wait"], e["wakeAt"] = "queued", None, None
+            e["state"], e["wait"], e["wakeAt"], e["dueAt"] = "queued", None, None, self.now
             self.history(e, "after_merged")  # judged at once: its base may need an update or a retarget
         head = str(data.get("headRefOid") or "").lower()
         fp = land_fingerprint(c)
@@ -9935,6 +9942,8 @@ class LandQueue:
         e.update(state="waiting", wait={"kind": "pr", "sha": head, "why": "checks running"}, seen=fp, head=head,
                  wakeAt=self.now + LAND_WAIT_DEFAULT)
         e.pop("seenChecks", None)  # checks ran since the last verdict: the next is judged, even if they end the same
+        self.unhold(e)  # not due now: its wake is ahead (hold, LAND_DUE_LATE)
+        e.pop("dueLate", None)
         self.history(e, "checks_running", head=head[:12])
         self.save(e)
 
@@ -10060,6 +10069,7 @@ class LandQueue:
                  judging={"sha": sha, "at": self.now, "counts": counts})
         self.unhold(e)
         e.pop("dueLate", None)
+        e.pop("dueAt", None)
         self.save(e)
         self.submit(e["key"], self.job, e["key"], sha, int(e.get("gen") or 0))
         return True
