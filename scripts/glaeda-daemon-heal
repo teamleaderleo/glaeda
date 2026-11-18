@@ -1266,7 +1266,10 @@ def strict_json(raw: bytes) -> Any:
         if len(keys) != len(set(keys)):
             raise ValueError("a key given twice")
         return dict(pairs)
-    return json.loads(raw, parse_constant=refuse, object_pairs_hook=unique)
+    try:
+        return json.loads(raw, parse_constant=refuse, object_pairs_hook=unique)
+    except RecursionError:  # deep nesting within read_small's cap is a malformed file, not a crashed root pass
+        raise ValueError("nested too deeply") from None
 
 
 def names_list(value: Any, what: str) -> set[str]:

@@ -1759,6 +1759,12 @@ class RunnerHygiene(unittest.TestCase):
                     mock.patch.object(heal.pwd, "getpwnam", return_value=mock.Mock()):
                 self.assertIn("EC2", heal.ci_mini_why_not())
 
+    def test_a_deeply_nested_json_file_is_malformed_not_a_crashed_root_pass(self) -> None:
+        # The fleet user writes update.json and the reservation files root reads; nesting under read_small's cap
+        # raised RecursionError, which no caller catches. strict_json says ValueError, which every caller handles.
+        with self.assertRaisesRegex(ValueError, "nested too deeply"):
+            heal.strict_json(b"[" * 100000 + b"]" * 100000)
+
     def test_the_release_chain_brings_both_files_and_the_root_pass_uses_them(self) -> None:
         for name in (heal.DISK_NAME, heal.HYGIENE_NAME, heal.INSTALLED):
             (self.dir / name).unlink()
