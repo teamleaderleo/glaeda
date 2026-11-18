@@ -64,7 +64,7 @@ The cmux-next workflow keeps per-runner state under
 ~/Library/Caches/cmux-next-ci.  Its SourcePackages and module/SDK caches are
 reusable inputs, so the explicit cmux-next family below only considers the
 generated Build, Index, Logs and Products children beneath a validated runner
-or dev-daily Release root.  Those children require a DEFAULT_AGE_HOURS (12 h) idle
+or dev-daily Release root.  Those children require a DEFAULT_AGE_HOURS (1 h) idle
 window plus a fresh process/lock/lease check; unknown children and all preserved
 inputs remain visible to accounting and are kept.  The cache has an LRU size cap
 (cmux_next_ci_cap_gib in disk-policy.json or --cmux-next-cap-gib, default 40 GiB, 0 off): while a
@@ -4682,8 +4682,8 @@ def runner_cache_families() -> list[Family]:
     if (HOME / "Library/Caches" / CMUX_NEXT_CI_ROOT).is_dir():
         roots.append(replace(cmux_next_ci_family(), min_idle_hours=RUNNER_CACHE_IDLE_HOURS))
     if nightly_next_split():
-        roots.append(replace(nightly_next_family(), min_idle_hours=RUNNER_CACHE_IDLE_HOURS,
-                             max_idle_hours=RUNNER_CACHE_IDLE_HOURS))
+        warm = max(RUNNER_CACHE_IDLE_HOURS, NIGHTLY_WARM_IDLE_HOURS)  # the nightly's warm tree keeps its 12 h
+        roots.append(replace(nightly_next_family(), min_idle_hours=warm, max_idle_hours=warm))
     return [f for f in roots if f.root.is_dir()]
 
 
