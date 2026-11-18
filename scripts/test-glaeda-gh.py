@@ -20530,6 +20530,33 @@ class LandTest(Base):
     def explained(self) -> list[str]:
         return [c[4] for c in self.w.explains()]
 
+    def test_stale_wakes_go_before_a_fresh_request_oldest_first(self):
+        """sr2-coord's ask, 2026-11-18 20:48Z: rows re-requested at 19:53Z still showed their 17:18Z verdict 55 min
+        later. A row whose wake has passed is judged before a request queued after it, oldest wake first; the fresh
+        request, never judged before, comes after them (its due time is when it was queued)."""
+        self.pr(LA)
+        self.land()  # o/r#1: a fresh request, queued now
+        self.stuck(12, 2 * 3600)
+        self.stuck(11, 4 * 3600)
+        self.retries(2)
+        self.w.answers.append(ok_answer(LA))
+        self.tick()
+        self.assertEqual(self.explained(), ["11", "12", "1"])
+
+    def test_a_merge_is_one_land_merged_log_line(self):
+        """Merges per hour are counted from the daemon log (land-merged), not from every entry's history."""
+        logs: list[dict] = []
+        p = mock.patch.object(gg, "log", logs.append)
+        p.start()
+        self.addCleanup(p.stop)
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(ok_answer(LA))
+        self.tick()
+        self.assert_merged_at(LA)
+        self.assertEqual([(r["key"], r["sha"]) for r in logs if r.get("event") == "land-merged"],
+                         [(self.KEY, "f" * 40)])
+
     def test_due_rows_go_oldest_wake_first_ahead_of_rows_judged_only_for_a_change(self):
         """No latch at all. Due rows (retry, woke 2-4 h ago) are judged before an entry judged only because its cache
         changed (a wait on its checks, its wake ahead, last judged 26 h ago), oldest wake first: sorted by the last

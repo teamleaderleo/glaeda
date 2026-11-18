@@ -11179,6 +11179,7 @@ class LandQueue:
     def merged(self, e: dict, merge_sha: str, how: str) -> None:
         e.update(state="merged", mergeSha=merge_sha, wait=None, wakeAt=None, action=None)
         self.history(e, "merged", sha=merge_sha, how=how)
+        log({"event": "land-merged", "key": e["key"], "sha": merge_sha, "how": how})  # merges per hour: grep the log
         self.save(e)
         self.notify(e, e.get("requester") or "",
                     f"glaeda land: {self.url(e)} merged" + (f" at {merge_sha}" if merge_sha else ""))
