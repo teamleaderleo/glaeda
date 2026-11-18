@@ -5690,20 +5690,15 @@ class Daemon:
         self.status = status
         return status
 
-    def land_busy(self, drain: bool = False) -> bool:
-        """A land step (a merge, an update-branch: a claimed action) is running: a re-exec waits for it, so the new
-        daemon never sends a step beside one the old one still runs. A judgment alone (merge_hold explain, minutes at
-        times) sends nothing: a re-exec drops it and the next daemon judges that entry first (judge_order), where waiting
-        for it hit REEXEC_DRAIN_MAX (huge-blue, 2026-11-18: 08:42, 09:20, 10:17, 11:10Z). DRAIN (an update is waiting):
-        from now on no judgment claims a step (LandQueue.draining)."""
+    def land_busy(self) -> bool:
+        """A land job (a judgment or the step it took) is running. An update waits for it (reexec_due): under
+        REEXEC_UPDATE_GAP of uptime it holds and the queue works on; past it, it drains (no new job starts) for at most
+        REEXEC_DRAIN_MAX, and a step's claim is judged again by the next daemon (LandQueue.claim)."""
         q = self.land_queue
         if q is None:
             return False
         q.reap()
-        with q.lock:
-            if drain:
-                q.draining = True
-            return any((q.entries.get(k) or {}).get("state") == "acting" for k in q.jobs)
+        return bool(q.jobs)
 
     def land_tick(self) -> None:
         """The land queue's pass: cheap (its entries are in memory; judgments and steps run on its workers). None while
@@ -7981,6 +7976,7 @@ LAND_ENV = ON_EVENT_ENV + ("GH_CONFIG_DIR", "XDG_CONFIG_HOME", "GH_HOST", "SSH_A
 LAND_ENV_TAGS = {"CMUX_AGENT_SESSION": LAND_TAG, "MAY_MERGE_PATH": LAND_TAG, "GLAEDA_GH_AGENT": LAND_TAG}
 LAND_PATH_EXTRA = ("~/.local/bin", "/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin")
 LAND_WORKERS = 4
+LAND_WORKERS_MAX = 16
 LAND_EXPLAIN_DEADLINE = 1500.0  # merge_hold's own CHECK_BUDGET_S is 1470 s
 LAND_MERGE_DEADLINE = 1800.0  # the shim judges the merge again before it sends it
 LAND_GH_DEADLINE = 120.0  # update-branch, rerun, pr edit, pr view
@@ -8091,7 +8087,9 @@ LAND_SNAPSHOT_WAIT = 120.0
 # first for (Daemon.snapshot_waits) could not come within LAND_SNAPSHOT_WAIT. Ahead of the workers at most this many
 # per worker wait on their snapshot reads.
 LAND_SNAPSHOT_AHEAD = 1
-LAND_POOL_LOG_EVERY = 300.0  # the land-pool log line (LandQueue.log_pool)
+LAND_POOL_LOG_EVERY = 300.0
+LAND_LATCH_FREE_EVERY = 60.0  # how often an owner's unlatched read source is asked again (LandQueue.latch_free)
+LAND_LATCH_FREE_DEADLINE = 10.0  # the land-pool log line (LandQueue.log_pool)
 # The head a judgement pins is the cache's only when the cache read the PR after the entry was unparked or the login's
 # latch last cleared (LandQueue.fresh_head). huge-blue, 2026-11-18 09:43Z: parked on the latch, the daemon read
 # nothing for 37 min; on resume glaeda#2140 waited on, then judged, its old head 401ccf880760 though bc1601b6 had been
@@ -8549,7 +8547,7 @@ class LandQueue:
         self.touched: dict[str, float] = {}
         self.pass_gated, self.pass_first_gated = 0, None  # this pass's due judgments that waited for a worker
         self.pool_logged = float("-inf")
-        self.draining = False  # an update waits to re-exec: no judgment claims a step (claim; Daemon.land_busy)
+        self.latch_free_seen: dict[str, tuple[float, bool]] = {}  # owner -> (asked at, has an unlatched source)
         self.snapshot_waiting: set[str] = set()  # keys with a snapshot wait, run out or not (judge's cap)
         self.pool: Any = None
         self.now = time.time()
@@ -8718,8 +8716,8 @@ class LandQueue:
                         (self.entries_dir() / file_name(key)).unlink(missing_ok=True)
                         del self.entries[key]
                     continue
-                if key in self.jobs or latch is not None:
-                    continue  # a held latch: no judge, read, watch or nudge for any entry this pass
+                if key in self.jobs or latch is not None and not self.latch_free(e):
+                    continue  # a held latch: no judge, read, watch or nudge for this entry this pass
                 with self.lock:
                     if self.parked(e):
                         continue
@@ -8989,8 +8987,41 @@ class LandQueue:
                             self.history(e, "error", error=describe(err))
                             self.save(e)
 
+    def latch_free(self, e: dict) -> bool:
+        """Whether E's reads have a source the login's latch does not hold, so it is judged while the latch holds:
+        LAND_LATCH_FREE_COMMAND (land.json latchFreeCommand, else gh_app_token.py beside merge_hold.py) exits 0 for
+        E's owner. huge-blue, 2026-11-18 15:24Z: GraphQL latched, workers busy=0, 382 open lands, nothing judged,
+        though merge_hold reads manaflow-ai through the lander App pools (gh_app_token.hop_dir). Asked once per owner
+        per LAND_LATCH_FREE_EVERY; a missing tool, an error or a timeout is "no" (held, as before)."""
+        owner = str(e.get("repo") or "").split("/")[0].lower()
+        if not owner:
+            return False
+        seen = self.latch_free_seen.get(owner)
+        if seen is not None and self.now - seen[0] < LAND_LATCH_FREE_EVERY:
+            return seen[1]
+        argv = self.latch_free_argv(owner)
+        free = False
+        if argv is not None:
+            got = self.call(argv, LAND_LATCH_FREE_DEADLINE)
+            free = got.returncode == 0
+        if seen is None or seen[1] != free:
+            log({"event": "land-latch-free" if free else "land-latch-holds", "owner": owner})
+        self.latch_free_seen[owner] = (self.now, free)
+        return free
+
+    def latch_free_argv(self, owner: str) -> list[str] | None:
+        given = self.config().get("latchFreeCommand")
+        if isinstance(given, list) and given and all(isinstance(a, str) for a in given):
+            return [a.replace("{owner}", owner) for a in given]
+        mh, _ = self.merge_hold()
+        tool = mh.parent / "gh_app_token.py" if mh is not None else None
+        if tool is None or not tool.is_file():
+            return None
+        return [self.path("python", Path(sys.executable)).as_posix(), os.fspath(tool), "ready", "--owner", owner]
+
     def workers(self) -> int:
-        return int(land_seconds(self.config().get("workers"), LAND_WORKERS, 1, 16))
+        """land.json "workers", else LAND_WORKERS; nothing else sizes it (no load-based sizing)."""
+        return int(land_seconds(self.config().get("workers"), LAND_WORKERS, 1, LAND_WORKERS_MAX))
 
     def gated(self, e: dict) -> None:
         """E was due a judgment this pass and waits for a worker (judge): counted for the pass's land-pool line."""
@@ -9007,7 +9038,8 @@ class LandQueue:
         self.pool_logged = self.now
         with self.lock:
             running = {k: (self.entries.get(k) or {}).get("state") for k in self.jobs}
-        log({"event": "land-pool", "workers": self.workers(), "busy": len(running),
+        log({"event": "land-pool", "workers": self.workers(),
+             "workersFrom": "land.json" if "workers" in self.config() else "default", "busy": len(running),
              "running": [f"{key_name(k)}:{v}" for k, v in running.items()][:16],
              "snapshotWaiting": len(self.snapshot_waiting), "gated": self.pass_gated,
              "firstGated": key_name(self.pass_first_gated) if self.pass_first_gated else None,
@@ -9036,7 +9068,9 @@ class LandQueue:
             return
         if self.pool is None:
             import concurrent.futures
-            self.pool = concurrent.futures.ThreadPoolExecutor(max_workers=self.workers(), thread_name_prefix="land")
+            # at the ceiling (threads start only as jobs need them): judge's cap is the live land.json "workers",
+            # so changing it takes effect at once instead of at the next restart
+            self.pool = concurrent.futures.ThreadPoolExecutor(max_workers=LAND_WORKERS_MAX, thread_name_prefix="land")
         self.jobs[key] = self.pool.submit(fn, *args)
 
     def keep_watching(self, e: dict) -> None:
@@ -9523,11 +9557,8 @@ class LandQueue:
         return s["count"] >= (LAND_RETRY_STREAK_STOP if retry else LAND_STREAK_STOP)
 
     def claim(self, e: dict, kind: str, **args: Any) -> None:
-        """Written before the step starts: a restart sees it and judges again instead of running it on its own. None
-        while an update waits to re-exec (draining): the entry is queued again, and the next daemon judges it."""
+        """Written before the step starts: a restart sees it and judges again instead of running it on its own."""
         self.check(e)
-        if self.draining:
-            raise LandCancelled("an update waits to re-exec")
         e["action"] = {"kind": kind, "claimedAt": self.now, "head": e.get("head"), **args}
         e["state"] = "acting"
         self.save(e)
@@ -10666,16 +10697,24 @@ def hold_daemon_lock() -> Any:
 # (land_tick), so it waits only for the steps in flight, and at most REEXEC_DRAIN_MAX: a step's claim is written before
 # it starts, and a restart judges a claimed step again rather than run it twice (LandQueue.claim).
 REEXEC_DRAIN_MAX = 300.0
+# A release update re-execs a daemon with land work running at most once per this many seconds of its uptime; until
+# then the update waits and the land queue works on ("hold"). huge-blue, 2026-11-18: glaeda main merges re-exec'd the
+# daemon at 14:51, 15:06, 15:09, 15:22 and 15:24Z, each dropping every judgment in flight. Idle, it re-execs at once.
+REEXEC_UPDATE_GAP = 1800.0
 
 
-def reexec_due(changed: bool, busy: bool, waiting_since: float | bool, now: float) -> str | None:
-    """What serve does about an update: None (nothing changed), "defer" (a land step runs; no new one starts),
-    "reexec", or a reason string for a re-exec past REEXEC_DRAIN_MAX with a step still running."""
+def reexec_due(changed: bool, busy: bool, waiting_since: float | bool, now: float,
+               up: float = REEXEC_UPDATE_GAP) -> str | None:
+    """What serve does about an update: None (nothing changed), "hold" (land work runs and the daemon is up under
+    REEXEC_UPDATE_GAP: it goes on, the update waits), "defer" (draining: the running land jobs end, no new one starts),
+    "reexec", or a reason string for a re-exec past REEXEC_DRAIN_MAX with a job still running."""
     if not changed:
         return None
     if not busy:
         return "reexec"
     since = waiting_since if isinstance(waiting_since, (int, float)) and not isinstance(waiting_since, bool) else None
+    if since is None and up < REEXEC_UPDATE_GAP:
+        return "hold"
     if since is not None and now - since >= REEXEC_DRAIN_MAX:
         return f"a land step still ran after {int(REEXEC_DRAIN_MAX)} s; its claim is judged again"
     return "defer"
@@ -10692,6 +10731,7 @@ def serve(foreground_ok: bool = False) -> int:
             log({"event": "swept", "tempFiles": swept})
     me = Path(__file__).resolve()
     stamp = me.stat().st_mtime
+    started, held = time.monotonic(), False  # (REEXEC_UPDATE_GAP; "reexec-held" logged once)
     daemon = Daemon()
     log({"event": "start", "pid": os.getpid()})
     watchdog = Watchdog(WATCHDOG_AFTER, backstop=WATCHDOG_BACKSTOP)
@@ -10719,8 +10759,14 @@ def serve(foreground_ok: bool = False) -> int:
                 daemon.restart_self()
                 os.execv(sys.executable, [sys.executable, os.fspath(me), "serve"] + (["--foreground-ok"] if foreground_ok else []))
             changed = me.stat().st_mtime != stamp
-            due = reexec_due(changed, daemon.land_busy(drain=changed), daemon.reexec_waiting, time.monotonic())
-            if due == "defer":
+            due = reexec_due(changed, daemon.land_busy(), daemon.reexec_waiting, time.monotonic(),
+                             time.monotonic() - started)
+            if due == "hold":
+                if not held:
+                    held = True
+                    log({"event": "reexec-held", "why": f"land work runs; the update waits until the daemon has been "
+                                                        f"up {int(REEXEC_UPDATE_GAP)} s or the queue is idle"})
+            elif due == "defer":
                 if not daemon.reexec_waiting:
                     log({"event": "reexec-deferred", "why": "a land step is running; no new one starts until it ends"})
                     daemon.reexec_waiting = time.monotonic()

@@ -16750,6 +16750,15 @@ class ReexecDrainTest(Base):
         self.assertNotIn(late, (None, "defer", "reexec"))
         self.assertEqual(gg.reexec_due(True, False, 100.0, 101.0), "reexec", "the steps ended: re-exec at once")
 
+    def test_an_update_under_land_work_holds_until_the_gap_then_drains(self) -> None:
+        # huge-blue, 2026-11-18: glaeda main merges re-exec'd the daemon at 14:51, 15:06, 15:09, 15:22 and 15:24Z, each
+        # dropping every judgment in flight. Busy, an update waits out REEXEC_UPDATE_GAP of uptime; idle, it goes now.
+        self.assertEqual(gg.reexec_due(True, True, False, 100.0, up=120.0), "hold")
+        self.assertEqual(gg.reexec_due(True, True, False, 100.0, up=gg.REEXEC_UPDATE_GAP - 1), "hold")
+        self.assertEqual(gg.reexec_due(True, False, False, 100.0, up=120.0), "reexec")
+        self.assertEqual(gg.reexec_due(True, True, False, 100.0, up=gg.REEXEC_UPDATE_GAP), "defer")
+        self.assertEqual(gg.reexec_due(True, True, 50.0, 100.0, up=120.0), "defer", "a drain begun goes on")
+
     def test_a_waiting_reexec_starts_no_land_step(self) -> None:
         queue = mock.Mock()
         self.daemon.land_queue = queue
@@ -19826,23 +19835,51 @@ class LandTest(Base):
         fut.exception.return_value = None
         self.assertFalse(self.daemon.land_busy())
 
-    def test_reexec_drops_a_running_judgment_and_no_judgment_claims_a_step_after_it(self):
-        # huge-blue, 2026-11-18: merge_hold explains run for minutes, so every update waited REEXEC_DRAIN_MAX (300 s,
-        # no new land step meanwhile) and then re-executed anyway. A judgment sends nothing: the re-exec need not wait.
+    def test_a_running_judgment_holds_an_update(self):
         gg.land_dir().mkdir(parents=True)
         self.daemon.land_tick()
         q = self.daemon.land_queue
         fut = mock.Mock()
         fut.done.return_value = False
         q.jobs["pr:o/r#1"] = fut
-        q.entries["pr:o/r#1"] = e = {"key": "pr:o/r#1", "state": "judging"}
-        self.assertFalse(self.daemon.land_busy())
-        self.assertFalse(q.draining)
-        self.assertFalse(self.daemon.land_busy(drain=True))
-        self.assertTrue(q.draining)
-        with self.assertRaises(gg.LandCancelled):
-            q.claim(e, "merge")
-        self.assertNotIn("action", e)
+        q.entries["pr:o/r#1"] = {"key": "pr:o/r#1", "state": "judging"}
+        self.assertTrue(self.daemon.land_busy())
+
+    def test_the_latch_holds_only_lands_with_no_unlatched_source(self):
+        # huge-blue, 2026-11-18 15:24Z: the login's GraphQL latched, 382 open lands, workers busy=0, nothing judged,
+        # though merge_hold reads manaflow-ai through the lander App pools.
+        self.latch_dir.mkdir(parents=True, exist_ok=True)
+        (self.latch_dir / "graphql-exhausted.json").write_text(json.dumps({"until": self.t + 3000, "at": self.t}))
+        self.w.config["latchFreeCommand"] = ["/fake/ready", "--owner", "{owner}"]
+        asked: list[list[str]] = []
+        run = self.w.run
+
+        def ready(argv, timeout, env):
+            if argv[0] == "/fake/ready":
+                asked.append(list(argv))
+                return subprocess.CompletedProcess(argv, 0 if argv[-1] == "o" else 1, "", "")
+            return run(argv, timeout, env)
+        self.q.run = ready
+        self.pr(LA)
+        self.pr(LA, key="pr:p/r#2")
+        self.land()
+        self.land("p/r#2")
+        self.w.answers.append(ok_answer(LA))
+        self.tick()
+        self.tick()
+        self.assert_merged_at(LA)  # o's reads have an unlatched source: judged and merged under the latch
+        self.assertEqual(self.q.entries["pr:p/r#2"]["state"], "queued")  # p's have none: held, as before
+        self.assertEqual(sorted({a[-1] for a in asked}), ["o", "p"])
+        self.assertLessEqual(len(asked), 2, "asked once per owner per LAND_LATCH_FREE_EVERY")
+
+    def test_the_pool_takes_a_raised_worker_count_without_a_restart(self):
+        self.w.config["workers"] = 1
+        self.q.inline = False
+        self.q.submit("pr:o/r#1", lambda: None)
+        self.assertEqual(self.q.pool._max_workers, gg.LAND_WORKERS_MAX)
+        self.w.config["workers"] = 4
+        self.assertEqual(self.q.workers(), 4)
+        self.q.pool.shutdown(wait=True)
 
     def test_daemon_tick_runs_the_land_pass_only_once_land_exists(self):
         self.daemon.land_tick()
