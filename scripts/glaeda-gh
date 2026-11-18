@@ -696,7 +696,7 @@ PACE_CLI = Path.home() / ".local/lib/gh-quota/bin/gh"  # a link into the pacer's
 PACE_DEADLINE = 5
 PACE_HOLD_MAX = 3600
 # The login's create pause (GitHub's secondary content-creation limit), one fact per login that the gh guard keeps:
-# `<cmd> content-pause` prints {"blocked_until": epoch seconds, "level": n} (0 or absent: not paused), and
+# `<cmd> content-pause` prints {"blocked_until": epoch seconds, "level": n} (blocked_until alone says paused), and
 # `<cmd> content-pause --hold UNTIL --what TEXT` extends it (never shortens). The outbox posts with the token, not
 # through the guard, so it asks before each create and reports its own throttles: a writer that kept posting through
 # the pause renewed it for every other writer on the login. CONTENT_PAUSE_ENV names the command (shell words; empty
@@ -4092,10 +4092,9 @@ class Daemon:
             if not isinstance(doc, dict):
                 raise ValueError(f"exit {done.returncode}: {(done.stderr or done.stdout or '').strip()[:200]}")
             until = doc.get("blocked_until") or 0
-            if isinstance(until, bool) or not isinstance(until, (int, float)):
-                raise ValueError(f"blocked_until {until!r}")
-            if not doc.get("level", 1):
-                until = 0  # level 0: not paused, whatever blocked_until says
+            if isinstance(until, bool) or not isinstance(until, (int, float)) or not math.isfinite(until):
+                raise ValueError(f"blocked_until {until!r}")  # NaN or Infinity: a failed ask, the last answer stands
+            # blocked_until alone decides; level is the pacer's backoff state, never whether it is paused.
             until = min(float(until), clock + PACE_HOLD_MAX)  # a corrupt far future holds an hour at most
             if until > max(self.now, self.pause_until):
                 log({"event": "post-paused", "source": "login", "hold": round(until - self.now)})

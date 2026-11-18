@@ -11850,6 +11850,32 @@ class PostTest(unittest.TestCase):
         self.step(d, NOW + 100)  # the last answer's pause is over
         self.assertEqual(len(t.calls), 1)
 
+    def test_a_live_pause_holds_whatever_its_level_says(self) -> None:
+        # blocked_until alone decides: a pause merged from an answer whose level was no int is stored at level 0.
+        self.queue("comment", "o/r#1", "--body", "one")
+        self.pause_cmd(NOW + 100, level=0)
+        d, t = self.daemon((201, {}, {"html_url": "u"}))
+        d.clock_real = False
+        self.step(d, NOW)
+        self.assertEqual(t.calls, [])
+        self.assertEqual(d.pause_until, NOW + 100)
+
+    def test_a_non_finite_pause_is_a_failed_ask_and_the_last_answer_stands(self) -> None:
+        # json.loads takes NaN and Infinity: either would lose the last pause (NaN) or hold for good (Infinity).
+        self.queue("comment", "o/r#1", "--body", "one")
+        calls = self.pause_cmd(NOW + 100)
+        d, t = self.daemon((201, {}, {"html_url": "u"}))
+        d.clock_real = False
+        self.step(d, NOW)
+        for said in ('{"blocked_until": NaN, "level": 1}', '{"blocked_until": Infinity, "level": 1}'):
+            (calls.parent / "pause.json").write_text(said)
+            d.pause_read = 0.0  # ask again now
+            failed = len(d.errors)
+            self.step(d, NOW + 20)
+            self.assertEqual(d.pause_until, NOW + 100, said)
+            self.assertTrue(any(e.startswith("content pause:") for e in d.errors[failed:]), said)
+        self.assertEqual(t.calls, [])
+
     def test_a_throttled_write_extends_the_logins_create_pause(self) -> None:
         item = self.queue("comment", "o/r#7", "--body", "x")
         calls = self.pause_cmd(0, level=0)
