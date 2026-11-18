@@ -18970,13 +18970,15 @@ class LandTest(Base):
         self.assertEqual((len(updates), e["state"]), (1, "waiting"))  # the crashed one only
 
     def test_an_update_cancelled_before_it_was_sent_is_sent_after_the_reexec(self):
-        # review F1: a claim refused while the daemon drains for a re-exec sent nothing, so it never counts as sent
+        # review F1: a claim refused (LandCancelled: a newer land came in) sent nothing, so it never counts as sent.
+        # A re-exec no longer refuses claims (#2169: the daemon stops ticking the queue instead), so the refusal is
+        # the cancel's.
         self.pr(LA)
         self.land()
         answer = lambda: refusal("tip_merge", LA, {"kind": "update_branch", "expected_head_sha": LA})
         self.w.answers.append(answer())
-        self.q.draining = True
-        self.tick()
+        with mock.patch.object(gg.LandQueue, "claim", side_effect=gg.LandCancelled("pr:o/r#1")):
+            self.tick()
         self.assertEqual(self.w.gh_calls("api"), [])
         self.q = self.queue()
         e = self.run_hour(answer, seconds=60)
