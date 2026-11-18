@@ -2002,12 +2002,16 @@ BUDGET_FAMILY_IDS = frozenset({
     *FLEET_FAMILY_IDS, SPM_SCRATCH, CANONICAL_ADMISSION, RUNNER_ROOT_ADMISSION, CMUX_NEXT_CI_FAMILY,
     NIGHTLY_NEXT_FAMILY, "runner-checkout-build", "xcode-derived-data", "cmux-job-cache", "fleet-artifacts",
     "hq-build-fleet-cache", "cmux-node-products", "cmux-git-mirror", "browser-artifacts", "journey-builds",
-    "journey-fetch",
-})  # RUNNER_BUILD_FAMILY, HQ_CACHE_FAMILY and the JOURNEY_SUBDIRS families, defined below (a test keeps them equal)
+    "journey-fetch", "tart-vms", "lima-vms",
+})  # RUNNER_BUILD_FAMILY, HQ_CACHE_FAMILY, the JOURNEY_SUBDIRS families, TART_VMS and LIMA_VMS, defined below (a test
+#    keeps them equal). Only a stale VM's bytes count (vm_budget_counted): a running or referenced one is no cache.
 BUDGET_WARM_FAMILY_IDS = frozenset({  # not FLEET_FAMILY_IDS: pressure already spends them past pressure_idle_hours
     # not cmux-job-cache: its half-day minimum keeps a reload-cloud slot used in the same work period (its Family)
     CANONICAL_ADMISSION, RUNNER_ROOT_ADMISSION, "runner-checkout-build", "xcode-derived-data",
     "journey-builds", "journey-fetch",
+    # stale Tart and Lima VMs: a referenced one is kept by keep_verdict and a running one is in use, so the dropped
+    # window only ever reaches a VM nothing references (vm_reference)
+    "tart-vms", "lima-vms",
 })
 # The fleet Xcode compilation cache (node-store and the local CAS under FLEET_CAS_ROOT) is no family: its bytes come
 # from glaeda-fleet-cas-prune's own report of its last run (fleet_cas_node_cap keeps it here), after what that run
@@ -2092,12 +2096,17 @@ def _budget_dev_bytes(fams: list[Family], sizes: dict[str, int]) -> dict[int, di
             continue
     roots.sort(key=lambda r: len(r[0]), reverse=True)
     owned: dict[str, tuple[str, int]] = {}
+    counted: dict[str, bool] = {}  # VM directory -> stale (vm_budget_counted), read once per VM
     for path, size in sizes.items():
         if size <= 0:
             continue
         for root, f, dev in roots:
             if path.startswith(root + "/"):
-                owned[path] = (f.id, dev)
+                vm = root + "/" + path[len(root) + 1:].split("/", 1)[0]
+                if f.id in VM_FAMILIES and vm not in counted:
+                    counted[vm] = vm_budget_counted(f, Path(vm))
+                if f.id not in VM_FAMILIES or counted[vm]:
+                    owned[path] = (f.id, dev)
                 break
     out: dict[int, dict[str, int]] = {}
     for path in _outermost(list(owned)):
@@ -7034,10 +7043,8 @@ def keep_verdict(fam: "Family", path: Path) -> str:
         return rustup_verdict(path)
     if fam.checkout_builds and path.parent.name == "cache" and path.parent.parent.name == "apple-build":
         return apple_build_verdict(path)
-    if fam.id in (TART_VMS, LIMA_VMS) and os.path.lexists(path / ROLE_KEEP_MARKER):
-        return f"claimed ({ROLE_KEEP_MARKER} in it)"
-    if fam.id == LIMA_VMS and path.name in LIMA_BASE_NAMES:
-        return "the Linux worker VMs' base (ai.manaflow.cmux-linux-vm clones every slot from it)"
+    if fam.id in (TART_VMS, LIMA_VMS):  # referenced: claimed, configured, or a clone source (vm_reference)
+        return vm_reference(fam, path)
     return ""
 
 
@@ -9463,6 +9470,249 @@ def lima_vm_held(path: Path, cmds: str) -> str:
     return ""
 
 
+# Referenced or stale (Leo, 2026-11-18: "there are dozens if not hundreds of gb of build stuff that just keep getting
+# accumulated. it's too much"). glaeda#2060's host cache budget freed 0 GiB on a 460 GiB fleet mini whose Tart and
+# Lima VMs (~100 GiB that day) sat outside it: ~/.tart/vms/cumv15-1 (30.4 GiB, running), cumv15-build (28.9 GiB,
+# "recent" with no reason, idle 36.7 h: the source cumv15-1 was cloned from, same config.json ecid) and
+# ~/.lima/cmux-linux-bake (40.4 GiB, claimed by ai.manaflow.cmux-linux-vm). A VM something references stays whatever
+# its age and the budget, with a reason naming what: it runs (tart_vm_held, lima_vm_held), another VM here was cloned
+# from it (vm_clones), a current config names it (a .glaeda-keep.json whose owner is an installed launchd job, a
+# person's claim, LIMA_BASE_NAMES), or a fleet lease names its path (the family's reference_root). Everything else
+# is stale (an old base no clone or config names any more, an orphaned clone, a claim whose launchd job is gone):
+# it joins the host cache budget (BUDGET_FAMILY_IDS counts only stale VMs' bytes, vm_budget_counted), so a budgeted
+# pressure pass takes it past BUDGET_IDLE_HOURS, by value like the other budget families, not after 48 h.
+VM_FAMILIES = frozenset({TART_VMS, LIMA_VMS})
+# a claim's owner that is a launchd label (reverse DNS: ai.manaflow.cmux-linux-vm); any other owner is a person's
+LAUNCHD_LABEL = re.compile(r"[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+){2,}")
+LAUNCHCTL = "/bin/launchctl"
+LAUNCHD_PLIST_SCAN = 400  # plists read per directory when no <label>.plist names the job
+_LAUNCHD_INSTALLED: dict[str, bool | None] = {}
+# a Lima instance's lima.yaml or disk naming another instance's directory (~/.lima/<name>/...) as where it came from
+LIMA_INSTANCE_REF = re.compile(r"\.lima/([A-Za-z0-9][A-Za-z0-9._-]*)/")
+QCOW2_MAGIC = b"QFI\xfb"
+
+
+def launchd_plist_dirs() -> tuple[Path, ...]:
+    return HOME / "Library/LaunchAgents", Path("/Library/LaunchAgents"), Path("/Library/LaunchDaemons")
+
+
+def launchd_job_installed(label: str) -> bool | None:
+    """Whether a launchd job of LABEL is installed: a plist in a LaunchAgents or LaunchDaemons directory names it, or
+    launchctl prints it in the user's gui domain or the system domain. False only when launchctl answers "Could not
+    find service" in both domains and no plist names it; None when that cannot be told (no launchctl: not macOS, a
+    timeout, a domain it cannot read), which keeps the claim. Cached for the run."""
+    if label in _LAUNCHD_INSTALLED:
+        return _LAUNCHD_INSTALLED[label]
+    found: bool | None = None
+    needle = f"<string>{label}</string>".encode()
+    for d in launchd_plist_dirs():
+        with contextlib.suppress(OSError):
+            if (d / f"{label}.plist").is_file():
+                found = True
+                break
+            for n, plist in enumerate(sorted(d.glob("*.plist"))):
+                if n >= LAUNCHD_PLIST_SCAN:
+                    break
+                with contextlib.suppress(OSError), plist.open("rb") as f:
+                    if needle in f.read(1 << 16):
+                        found = True
+                        break
+        if found:
+            break
+    if not found:
+        found = None
+        if os.access(LAUNCHCTL, os.X_OK):
+            answers = []
+            for domain in (f"gui/{os.getuid()}", "system"):
+                try:
+                    r = subprocess.run([LAUNCHCTL, "print", f"{domain}/{label}"], capture_output=True, text=True,
+                                       timeout=10, stdin=subprocess.DEVNULL)
+                except (OSError, subprocess.SubprocessError):
+                    answers.append(None)
+                    continue
+                if r.returncode == 0:
+                    answers.append(True)
+                elif "could not find service" in (r.stdout + r.stderr).lower():
+                    answers.append(False)
+                else:
+                    answers.append(None)
+            found = True if True in answers else False if answers == [False, False] else None
+    _LAUNCHD_INSTALLED[label] = found
+    return found
+
+
+def vm_file_read(path: Path, limit: int, offset: int = 0) -> bytes | None:
+    """Up to LIMIT bytes of a VM's file at OFFSET, never through a symlink, None when it cannot be read. The read
+    moves the file's atime (Linux relatime, APFS), and tart_vm_last_use counts its files' atime, so Tart's or Lima's
+    date is handed back, or judging what references a VM would itself make every stopped VM read as used."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError:
+        return None
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            return None
+        data = os.pread(fd, limit, offset)
+        with contextlib.suppress(OSError, NotImplementedError):
+            os.utime(fd, ns=(st.st_atime_ns, st.st_mtime_ns))
+        return data
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+
+
+def vm_claim(path: Path) -> tuple[str, str]:
+    """(why a VM's ROLE_KEEP_MARKER claims it, why that claim is stale), "" each. An owner that is a launchd label
+    claims it while that job is installed (launchd_job_installed; unknown keeps it) and is stale once the job is
+    gone; an owner that is no label (a person), no owner, or an unreadable or malformed marker still claims it."""
+    marker = path / ROLE_KEEP_MARKER
+    if not os.path.lexists(marker):
+        return "", ""
+    doc: Any = None
+    if (raw := vm_file_read(marker, 1 << 16)) is not None:
+        with contextlib.suppress(ValueError):
+            doc = json.loads(raw)
+    owner = doc.get("owner") if isinstance(doc, dict) else None
+    why = doc.get("why") if isinstance(doc, dict) else None
+    note = f": {why.strip()[:120]}" if isinstance(why, str) and why.strip() else ""
+    if not isinstance(owner, str) or not owner.strip():
+        return f"claimed ({ROLE_KEEP_MARKER} in it)", ""
+    owner = owner.strip()
+    if not LAUNCHD_LABEL.fullmatch(owner):
+        return f"claimed by {owner[:80]} ({ROLE_KEEP_MARKER} in it{note})", ""
+    installed = launchd_job_installed(owner)
+    if installed:
+        return f"named by a current config: launchd job {owner} is installed ({ROLE_KEEP_MARKER}{note})", ""
+    if installed is None:
+        return f"claimed by {owner} ({ROLE_KEEP_MARKER}{note}; launchd cannot be read here to check the job)", ""
+    return "", f"claim by {owner} is stale: no such launchd job"
+
+
+def vm_siblings(path: Path) -> list[Path]:
+    """The other VMs beside PATH in its store: real directories, no dot, "_" (Lima's own) or aside entries."""
+    out = []
+    for e in _entries(path.parent):
+        if (e.name == path.name or e.name.startswith((".", "_")) or DELETING_RE.fullmatch(e.name)
+                or not e.is_dir(follow_symlinks=False)):
+            continue
+        out.append(Path(e.path))
+    return out
+
+
+def tart_ecid(vm: Path) -> str:
+    """The ecid in a Tart VM's config.json ("" when none: a Linux VM, an unreadable or malformed config). `tart
+    clone` keeps it, so VMs sharing one are a source and its clones (cumv15-1 and cumv15-build, 2026-11-18)."""
+    raw = vm_file_read(vm / "config.json", 1 << 20)
+    try:
+        doc = json.loads(raw) if raw else None
+    except ValueError:
+        return ""
+    ecid = doc.get("ecid") if isinstance(doc, dict) else None
+    return ecid if isinstance(ecid, str) else ""
+
+
+def vm_born(vm: Path) -> float:
+    """When a VM was made: the directory's birth time where the filesystem keeps one (macOS; `tart clone` makes a new
+    directory), else its config.json's mtime (`tart clone` writes the clone's config with a new MAC address)."""
+    with contextlib.suppress(OSError, AttributeError):
+        return vm.lstat().st_birthtime
+    with contextlib.suppress(OSError):
+        return (vm / "config.json").lstat().st_mtime
+    with contextlib.suppress(OSError):
+        return vm.lstat().st_mtime
+    return 0.0
+
+
+def lima_named_instances(vm: Path) -> set[str]:
+    """The instances a Lima instance's lima.yaml or its qcow2 diffdisk's backing file names (~/.lima/<name>/...),
+    itself excluded: where it was cloned or based from. Bounded reads, never through a symlink."""
+    texts = []
+    if (yaml := vm_file_read(vm / "lima.yaml", 1 << 18)) is not None:
+        texts.append(yaml.decode("utf-8", "replace"))
+    head = vm_file_read(vm / "diffdisk", 20) or b""
+    if len(head) == 20 and head[:4] == QCOW2_MAGIC:
+        offset, size = int.from_bytes(head[8:16], "big"), int.from_bytes(head[16:20], "big")
+        if 0 < size <= 4096 and 0 < offset <= 1 << 16:
+            texts.append((vm_file_read(vm / "diffdisk", size, offset) or b"").decode("utf-8", "replace"))
+    names = {m.group(1) for text in texts for m in LIMA_INSTANCE_REF.finditer(text)}
+    names.discard(vm.name)
+    return names
+
+
+def vm_clones(fam: "Family", path: Path) -> list[Path]:
+    """The other VMs here made from PATH. Tart: those sharing its config.json ecid when PATH is the oldest of them
+    (vm_born; a tie counts each as the other's source, which only keeps more). Lima: the instances whose lima.yaml
+    or diffdisk names PATH (lima_named_instances)."""
+    if fam.id == TART_VMS:
+        ecid = tart_ecid(path)
+        if not ecid:
+            return []
+        group = [s for s in vm_siblings(path) if tart_ecid(s) == ecid]
+        born = vm_born(path)
+        return group if group and all(born <= vm_born(s) for s in group) else []
+    if fam.id == LIMA_VMS:
+        return [s for s in vm_siblings(path) if path.name in lima_named_instances(s)]
+    return []
+
+
+def vm_clone_source(fam: "Family", path: Path) -> str:
+    """The name of the VM here PATH was cloned from (Tart: the oldest VM sharing its ecid), or ""."""
+    if fam.id == TART_VMS and (ecid := tart_ecid(path)):
+        group = [s for s in vm_siblings(path) if tart_ecid(s) == ecid]
+        if group:
+            oldest = min(group, key=vm_born)
+            return oldest.name if vm_born(oldest) < vm_born(path) else ""
+    if fam.id == LIMA_VMS:
+        named = sorted(n for n in lima_named_instances(path) if (path.parent / n).is_dir())
+        return named[0] if named else ""
+    return ""
+
+
+def vm_held_quick(fam: "Family", path: Path) -> str:
+    """Why a VM runs by its own lock or pid file alone (no command lines): Tart's config.json lock, Lima's ha.pid."""
+    return tart_vm_held(path, "") if fam.id == TART_VMS else lima_vm_held(path, "") if fam.id == LIMA_VMS else ""
+
+
+def vm_reference(fam: "Family", path: Path) -> str:
+    """What references a stopped Tart or Lima VM, so it stays whatever its age and the budget, or "": a claim
+    (vm_claim), LIMA_BASE_NAMES, or another VM here cloned from it (vm_clones, naming the running ones)."""
+    reasons = []
+    claim, _ = vm_claim(path)
+    if claim:
+        reasons.append(claim)
+    if fam.id == LIMA_VMS and path.name in LIMA_BASE_NAMES:
+        reasons.append("the Linux worker VMs' base (ai.manaflow.cmux-linux-vm clones every slot from it)")
+    if clones := vm_clones(fam, path):
+        named = [("running VM " if vm_held_quick(fam, c) else "VM ") + c.name
+                 for c in sorted(clones, key=lambda c: (not vm_held_quick(fam, c), c.name))]
+        more = f" and {len(named) - 3} more" if len(named) > 3 else ""
+        reasons.append("clone source of " + ", ".join(named[:3]) + more)
+    return "; ".join(reasons)
+
+
+def vm_stale_reason(fam: "Family", path: Path) -> str:
+    """Why a stopped VM nothing references is stale (the dry run's reason for each such Tart or Lima item)."""
+    parts = []
+    if source := vm_clone_source(fam, path):
+        parts.append(f"a stopped clone of {source}")
+    _, stale_claim = vm_claim(path)
+    if stale_claim:
+        parts.append(stale_claim)
+    parts.append("nothing references it (not running, no VM here cloned from it, no current config or lease names "
+                 "it): it counts toward the host cache budget")
+    return "stale: " + "; ".join(parts)
+
+
+def vm_budget_counted(fam: "Family", path: Path) -> bool:
+    """Whether a VM's bytes count toward the host cache budget: only a stale one (neither running nor referenced).
+    A referenced VM is no cache the budget can spend, so counting it would keep the volume over for nothing."""
+    if fam.reference_root is not None and artifact_referenced(path, live_artifact_references(fam.reference_root)):
+        return False  # a fleet lease or job names it
+    return not vm_held_quick(fam, path) and not vm_reference(fam, path)
+
+
 def candidates(fam: Family) -> list[Path]:
     if fam.id in ROOT_SAFE_FAMILIES and not tart_root_safe(fam.root):
         return []
@@ -10052,6 +10302,8 @@ def _survey(families, idle_hours, min_bytes, known, evidence, defer_bulk=False,
                                "(unpushed commits go to a verified bundle in ~/archive first)")
         if jobs is not None and verdict in ("recent", "reclaimable"):
             reasons.append(reasons_jobs)
+        if fam.id in VM_FAMILIES and verdict in ("recent", "reclaimable"):
+            reasons.append(vm_stale_reason(fam, path))  # every Tart/Lima item says referenced-by or stale-because
         if fam.id in HOME_SCRATCH_FAMILIES and (gone := retired_owner(path)):
             reasons.append(f"its owner retired (~/{RETIRED_OWNER_DIR}/{gone}): no idle clock")
             if verdict == "in-use" and "open by a process" in reasons and (held := retired_holder_reason(path, gone)):
