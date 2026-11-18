@@ -1139,7 +1139,8 @@ def share_slow(shed: dict | None, spenders: list[dict]) -> dict | None:
     if shed and (other is None or shed["counted"] >= other["rest"]):
         return {"caller": shed["waiter"], "rest": shed["counted"], "via": "glaeda-gh waits"}
     if other is not None:
-        return {"caller": other["caller"], "rest": other["rest"], "via": other.get("source") or "gh"}
+        return {"caller": other["caller"], "rest": other["rest"], "via": other.get("source") or "gh",
+                **({"host": other["host"]} if other.get("host") else {})}
     return None
 
 
@@ -1148,7 +1149,8 @@ def share_slow_text(slow: dict | None) -> str:
         return "No caller to slow is known: the spend is the daemon's own; check restYield in its policy."
     if slow["via"] == "glaeda-gh waits":
         return f"Slow {slow['caller']} ({slow['rest']} counted REST, its glaeda-gh waits): end or slow its waits."
-    return f"Slow {slow['caller']} ({slow['rest']} REST this hour, {slow['via']}): the login's top REST caller here."
+    where = f"on {slow['host']}" if slow.get("host") else "here"
+    return f"Slow {slow['caller']} ({slow['rest']} REST this hour, {slow['via']}): the login's top REST caller {where}."
 
 
 # The pool alarm names the REST no log on this host holds, once it is this share of what the pool spent and at least
@@ -3909,7 +3911,8 @@ class Daemon:
             if self.now - self.share_over_at >= ALARM_EVERY:
                 self.share_over_at = self.now
                 log({"event": "share-over", "spent": spent, "cap": cap, "left": left, "floor": floor,
-                     "note": "nothing to do: the login's REST pool is at or above its floor"})
+                     "note": "nothing to do: the login's REST pool is at or above its floor" if left is not None
+                     else "nothing to do: the login's REST pool is not seen this window, so nothing is known short"})
             return None
         polling = [r for r in self.spend_rows(3600) if r["bucket"] == "rest" and r["kind"] != "outbox"]
         mine = spend_summary(polling, 3600, top=3)["restByRoute"]
