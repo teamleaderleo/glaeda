@@ -147,7 +147,11 @@ the daemon is the only process that talks to GitHub, and clients only read its c
   under the cap is only a share-pace log line ("nothing to do, projection only"), as the cap holds the hour. Each is a notice line in
   ~/.local/state/notices/glaeda-gh.jsonl and a `tell-coordinator --from glaeda-gh` (WARN, or FIRE under the
   reserve or within 10 minutes of dry), naming the top routes; at most once an hour unless it gets worse.
-- The token comes from `gh auth token` and stays in memory; it is never written or logged.
+- The token comes from `gh auth token` and stays in memory; it is never written or logged. A repo read
+  (REST GET) of an owner leo-workspace's role Apps are on goes instead on the ci-watch App's installation
+  token when this host holds that App (~/.config/gh-app-tokens/ci-watch.*): `gh_app_token.py token
+  ci-watch`, also kept only in memory. Without it, or when the App refuses, the read is the login's, as
+  before (AppPool). daemon.json appPool and `budget` say what the App served.
 - A host with no GitHub login of its own (a VM that may hold no token) can read through an upstream
   instead: ~/.config/glaeda/upstream.json, {"command": ["PROGRAM", "ARG", ...]}, names a program that
   carries `read` requests to another host's glaeda-gh (a broker that daemon's host serves, say). The
@@ -1965,6 +1969,153 @@ def gh_token() -> str:
     return token
 
 
+# ---------------------------------------------------------------- the ci-watch App pool (reads off the login)
+
+# Leo, 2026-11-18: "you use the apps where they're useful, and it just does it automatically, so no agents necessarily
+# even have to think about it." leo-workspace machines/gh-app-roles.json gives glaeda-gh to the ci-watch role, but that
+# routing lives in the gh-quota shim (tools/gh_app_token.py route), and this daemon talks to GitHub itself with
+# `gh auth token`, so all its reads (about 295 REST an hour on cosmic-gray that day) stayed on the account's login.
+# Now a REST GET of a repo the role's Apps are installed on goes out on the ci-watch installation token when this host
+# holds that App (~/.config/gh-app-tokens/ci-watch.json and .pem, written by gh_app_token.py when the App was made):
+# the token is `gh_app_token.py token ci-watch --owner OWNER` (the copy next to the gh-quota shim gh_quota.py, which
+# caches it an hour), kept in memory, never written or logged. Writes, GraphQL, /rate_limit and every other repo stay
+# on the login, so authorship (CLA, receipts) and the login's budget readings are as before. A host without the App,
+# a mint that fails, or an App answer that is refused (401, 403, 429) or under APP_POOL_FLOOR left sends the read on
+# the login at once, exactly as before, and rests the pool (APP_POOL_REST, or until the App's reset). App reads are
+# not charged to restShare and their rate headers are not the login's budget: daemon.json appPool says what they spent.
+APP_POOL_ROLE = "ci-watch"
+APP_POOL_DIR = Path(os.environ.get("GH_APP_TOKEN_DIR") or Path.home() / ".config/gh-app-tokens")
+APP_POOL_TTL = 300.0  # a token from gh_app_token.py is used this long (it hands out one with 10+ minutes left)
+APP_POOL_REST = 300.0  # a failed mint or a refused answer: the pool is not asked again for this long
+APP_POOL_ROUTE_REST = 3600.0  # a route the App answered 403 or 404 stays on the login this long
+APP_POOL_FLOOR = 500  # an App answer with fewer left: the pool's other users (base_red_watch, cmux-ci) keep the rest
+APP_POOL_REPO = re.compile(r"/repos/([A-Za-z0-9][A-Za-z0-9-]{0,38})/[A-Za-z0-9._-]+(?:/|\?|$)")
+
+
+def app_pool_tool() -> Path | None:
+    """gh_app_token.py beside the gh-quota shim's gh_quota.py (leo-workspace tools/), or None."""
+    with contextlib.suppress(OSError, RuntimeError):
+        cli = PACE_CLI.resolve().parent / "gh_app_token.py"
+        if cli.is_file():
+            return cli
+    return None
+
+
+class AppPool:
+    """The ci-watch role's installation tokens on this host, per owner, for the daemon's repo reads (see above)."""
+
+    def __init__(self, role: str = APP_POOL_ROLE, mint: Callable[[str], str | None] | None = None,
+                 owners: Callable[[], list[str]] | None = None, ready: Callable[[], bool] | None = None,
+                 clock: Callable[[], float] = time.time) -> None:
+        self.role, self.clock = role, clock
+        self.mint_fn = mint or self.mint_with_tool
+        self.owners_fn = owners or self.owners_from_config
+        self.ready_fn = ready or self.held_here
+        self.owners_at: tuple[frozenset[str], float] = (frozenset(), float("-inf"))  # (owners, read again after)
+        self.tokens: dict[str, tuple[str, float]] = {}  # owner (lowercase) -> (token, use until)
+        self.unreadable: dict[str, float] = {}  # route template -> on the login until then (answered)
+        self.rest_until: dict[str, float] = {}  # owner (lowercase) -> not asked again before this
+        self.why = ""  # the last reason the pool was passed over, for daemon.json (never a token)
+        self.served = self.fell_back = 0
+        self.seen: dict | None = None  # the App's last rate headers: {"limit", "remaining", "reset"}
+
+    def held_here(self) -> bool:
+        """Whether this host holds the role's App: its metadata and key files (a file test, no request)."""
+        return ((APP_POOL_DIR / f"{self.role}.json").is_file() and (APP_POOL_DIR / f"{self.role}.pem").is_file()
+                and app_pool_tool() is not None)
+
+    def owners_from_config(self) -> list[str]:
+        """machines/gh-app-roles.json `owners`, the accounts the role Apps are installed on, beside the tool."""
+        cli = app_pool_tool()
+        doc = read_json(cli.parent.parent / "machines" / "gh-app-roles.json") if cli else None
+        owners = doc.get("owners") if isinstance(doc, dict) else None
+        return [o.lower() for o in owners if isinstance(o, str)] if isinstance(owners, list) else []
+
+    def mint_with_tool(self, owner: str) -> str | None:
+        cli = app_pool_tool()
+        if cli is None:
+            return None
+        try:
+            result = run_bounded([sys.executable, "-I", os.fspath(cli), "token", self.role, "--owner", owner])
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        token = result.stdout.strip()
+        return token if result.returncode == 0 and TOKEN_RE.fullmatch(token) else None
+
+    def owner_of(self, method: str, path: str) -> str | None:
+        """The owner a request may go to the pool for (a repo GET of an owner the Apps are on), else None."""
+        if method != "GET":
+            return None
+        m = APP_POOL_REPO.match(path)
+        if not m:
+            return None
+        now = self.clock()
+        if self.owners_at[1] <= now:  # the config is read once per APP_POOL_TTL, not per request
+            self.owners_at = (frozenset(self.owners_fn()), now + APP_POOL_TTL)
+        owner = m.group(1).lower()
+        return owner if owner in self.owners_at[0] else None
+
+    def token(self, owner: str) -> str | None:
+        """OWNER's installation token, or None: the read then goes on the login, as it always did."""
+        now = self.clock()
+        if self.rest_until.get(owner, 0.0) > now:
+            return None
+        held = self.tokens.get(owner)
+        if held and held[1] > now:
+            return held[0]
+        self.tokens.pop(owner, None)
+        if not self.ready_fn():
+            self.why = f"no {self.role} App on this host"
+            self.rest_until[owner] = now + APP_POOL_REST
+            return None
+        token = self.mint_fn(owner)
+        if not token:
+            self.why = f"gh_app_token.py token {self.role} --owner {owner} gave no token"
+            self.rest_until[owner] = now + APP_POOL_REST
+            return None
+        self.tokens[owner] = (token, now + APP_POOL_TTL)
+        return token
+
+    def covers(self, route: str) -> bool:
+        """Whether ROUTE is one the App has not refused lately (a permission it lacks, a repo it is not on)."""
+        return self.unreadable.get(route, 0.0) <= self.clock()
+
+    def answered(self, owner: str, route: str, status: int, headers: dict, message: str = "") -> bool:
+        """Note the App's answer; False when the read must go again on the login. A rate limit or a dead token rests
+        the pool; a 403 or 404 of one route (a permission or repository the App lacks: branch protection needs
+        administration, which ci-watch does not hold) keeps that route on the login for APP_POOL_ROUTE_REST."""
+        now = self.clock()
+        try:
+            remaining, reset = int(headers.get("x-ratelimit-remaining", "")), float(headers.get("x-ratelimit-reset", ""))
+            self.seen = {"limit": int(headers.get("x-ratelimit-limit") or 0), "remaining": remaining, "reset": reset}
+        except ValueError:
+            remaining, reset = None, None
+        limited = status == 429 or (status == 403 and (remaining == 0 or bool(headers.get("retry-after"))
+                                                       or bool(SECONDARY.search(message))))
+        if status == 401 or limited:
+            self.tokens.pop(owner, None)
+            spent = remaining == 0 and reset is not None and reset > now
+            self.rest_until[owner] = min(reset, now + PACE_HOLD_MAX) if spent else now + APP_POOL_REST
+            self.why = f"the {self.role} App answered HTTP {status}"
+            self.fell_back += 1
+            return False
+        if status in {403, 404}:
+            self.unreadable[route] = now + APP_POOL_ROUTE_REST
+            self.fell_back += 1
+            return False
+        if remaining is not None and remaining < APP_POOL_FLOOR and reset is not None:
+            self.rest_until[owner] = max(self.rest_until.get(owner, 0.0), reset)  # this answer still counts
+            self.why = f"the {self.role} App is under its floor ({remaining} left)"
+        self.served += 1
+        return True
+
+    def status(self) -> dict:
+        now = self.clock()
+        resting = {o: round(t) for o, t in self.rest_until.items() if t > now}
+        return {"role": self.role, "served": self.served, "fellBack": self.fell_back, "seen": self.seen,
+                "resting": resting or None, "why": self.why or None}
+
+
 # ---------------------------------------------------------------- upstream (a host with no login)
 
 
@@ -3149,8 +3300,11 @@ def read_rollup(key: str) -> dict | None:
 
 class Daemon:
     def __init__(self, transport: Callable = http, token: Callable[[], str] = gh_token,
-                 controller: Any = "env", upstream: Any = "config") -> None:
+                 controller: Any = "env", upstream: Any = "config", app_pool: Any = "auto") -> None:
         self.transport = transport
+        # The ci-watch App's tokens for repo reads (AppPool); "auto" finds them on this host, None keeps every read on
+        # the login.
+        self.app_pool: AppPool | None = AppPool(clock=lambda: self.clock()) if app_pool == "auto" else app_pool
         # False for an upstream host's direct read: the lane-gh broker answers GET branches/B from git (the tip, no
         # protection, and on 2026-11-16 no answer within 60 s), so fetch_pr_rest takes GraphQL's last word instead.
         self.reads_protection = True
@@ -3982,13 +4136,39 @@ class Daemon:
             raise WatchError(f"held: GitHub's secondary rate limit, {max(0, int(self.secondary_until - self.clock()))}s left")
         if self.upstream() is not None:
             raise WatchError("this host reads GitHub through its upstream (upstream.json) and has no login")
+        raw_body = json.dumps(body).encode() if body is not None else None
+        pool = self.app_pool
+        owner = (pool.owner_of(method, path) if pool is not None and bucket == "rest" and not free and not content
+                 and not self.writing and raw_body is None else None)
+        route = route_of(method, path)
+        app_token = pool.token(owner) if owner and pool.covers(route) else None
+        if app_token:
+            headers = {"Authorization": f"Bearer {app_token}", "Accept": "application/vnd.github+json",
+                       "User-Agent": "glaeda-gh", "X-GitHub-Api-Version": "2022-11-28"}
+            if etag:
+                headers["If-None-Match"] = etag
+            try:
+                status, h, raw = self.transport(method, API + path, headers, None)
+            except BaseException:
+                self.note_spend("rest", route, 0)  # the App's pool, never the login's share
+                raise
+            try:
+                doc = json.loads(raw) if raw else None
+            except ValueError:
+                doc = None
+            message = str(doc.get("message") or "") if isinstance(doc, dict) else ""
+            if pool.answered(owner, route, status, h, message):
+                self.note_spend("rest", route, 0)
+                self.sent.append((self.now, "app"))
+                return status, h, doc
+            log({"event": "app-pool-refused", "role": pool.role, "owner": owner, "status": status})
+            # refused: the same read goes on the login at once, as it would have without the App
         if self.token is None:
             self.token = self.token_source()
         headers = {"Authorization": f"Bearer {self.token}", "Accept": "application/vnd.github+json",
                    "User-Agent": "glaeda-gh", "X-GitHub-Api-Version": "2022-11-28"}
         if etag:
             headers["If-None-Match"] = etag
-        raw_body = json.dumps(body).encode() if body is not None else None
         if raw_body is not None:
             headers["Content-Type"] = "application/json"
         # The outbox -- a write and the lookups that keep it from landing twice -- is what sessions
@@ -5485,7 +5665,7 @@ class Daemon:
         self.write_consumers()
         self.sent = [(t, what) for t, what in self.sent if self.now - t < 3600]
         hour = {what: sum(1 for _, w in self.sent if w == what)
-                for what in ("rest", "rest304", "graphql", "free", "write")}
+                for what in ("rest", "rest304", "graphql", "free", "write", "app")}
         self.reads = [r for r in self.reads if self.now - r[0] < 3600]
         self.gql_log = [g for g in self.gql_log if self.now - g[0] < 3600]
         graphql_by: dict[str, dict[str, int]] = {}
@@ -5519,6 +5699,8 @@ class Daemon:
                              "pause": self.content_pause_status()}}
         if self.upstream_status is not None:
             status["upstream"] = self.upstream_status
+        if self.app_pool is not None and (self.app_pool.served or self.app_pool.fell_back or self.app_pool.why):
+            status["appPool"] = self.app_pool.status()
         # the heartbeat lets clients tell a hung daemon (lock held, nothing written) from an idle one
         recovered, self.failing = self.failing is not None, None
         if recovered or prs or runs or comments or heads or self.errors or self.now - self.beat >= HEARTBEAT_EVERY:
@@ -13219,7 +13401,15 @@ def cmd_budget(as_json: bool, fleet: bool = False) -> int:
         if isinstance(hour, dict):
             print(f"daemon requests in the last hour: {hour.get('rest', 0)} REST, {hour.get('rest304', 0)} more "
                   f"REST answered 304 (free), {hour.get('graphql', 0)} GraphQL, "
-                  f"{hour.get('free', 0)} rate_limit reads (free), {hour.get('write', 0)} REST for queued writes")
+                  f"{hour.get('free', 0)} rate_limit reads (free), {hour.get('write', 0)} REST for queued writes"
+                  + (f", {hour['app']} REST on the {APP_POOL_ROLE} App (not the login)" if hour.get("app") else ""))
+        pool = status.get("appPool")
+        if isinstance(pool, dict):
+            seen = pool.get("seen") if isinstance(pool.get("seen"), dict) else {}
+            print(f"{pool.get('role', APP_POOL_ROLE)} App pool: {pool.get('served', 0)} reads served, "
+                  f"{pool.get('fellBack', 0)} sent again on the login"
+                  + (f", {seen.get('remaining')}/{seen.get('limit')} left" if seen.get("remaining") is not None else "")
+                  + (f"; resting: {pool['why']}" if pool.get("resting") and pool.get("why") else ""))
         share = status.get("restShare")
         if isinstance(share, dict):
             print(f"daemon REST spend {share.get('spent', '?')}/{share.get('cap', '?')} this hour "
