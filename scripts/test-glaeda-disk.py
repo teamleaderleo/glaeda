@@ -106,6 +106,21 @@ gd.erase_idle_sim_devices = (lambda receipt, halt=None, budget_s=gd.SIM_DEVICE_B
                                                                               below_target))
 
 
+# A fleet-mini main() sets BUILD_CACHES_UNWINDOWED for its run; a test that calls survey() itself after another
+# test's main() must not inherit it, so every main() in this suite leaves it off again.
+_gd_main = gd.main
+
+
+def _main_then_reset(*args, **kwargs):
+    try:
+        return _gd_main(*args, **kwargs)
+    finally:
+        gd.BUILD_CACHES_UNWINDOWED = False
+
+
+gd.main = _main_then_reset
+
+
 def make(path: Path, mib: int = 1, age_hours: float = 48) -> Path:
     path.mkdir(parents=True)
     (path / "blob").write_bytes(b"\0" * (mib * 1024 * 1024))
@@ -5283,13 +5298,18 @@ class GlaedaDiskTest(unittest.TestCase):
         self.assertEqual(row["reclaimed_gib"], 3.0)
         self.assertFalse(row["reached"])
         self.assertEqual(row["blocked"], {"code-sign-clones": 12.0})
-        # no pressure: still one line, nothing reclaimed, the target already met
-        status, rows, survey, _ = self._main_run(["--pressure", "--apply"], free_gib=200.0)
+        # no pressure, where build caches keep their windows: still one line, nothing reclaimed, the target already met
+        with mock.patch.dict(gd.POLICY, build_caches_unwindowed=False):
+            status, rows, survey, _ = self._main_run(["--pressure", "--apply"], free_gib=200.0)
         self.assertEqual(len(rows), 2)
         self.assertEqual((rows[1]["skipped"], rows[1]["reached"]), ("no pressure", True))
+        # a fleet mini's pass with no pressure sweeps instead (a build's caches go when it ends): one line, not skipped
+        status, rows, survey, _ = self._main_run(["--pressure", "--apply"], free_gib=200.0)
+        self.assertEqual(len(rows), 3)
+        self.assertEqual((rows[2]["mode"], rows[2]["skipped"]), ("idle", None))
         # a report writes none
         self._main_run(["report"])
-        self.assertEqual(len((self.root / "runs.jsonl").read_text().splitlines()), 2)
+        self.assertEqual(len((self.root / "runs.jsonl").read_text().splitlines()), 3)
 
     def test_a_pressure_apply_bounds_its_survey(self) -> None:
         """Every pressure --apply measures for at most pressure_measure_budget_s and judges until twice that, so it
