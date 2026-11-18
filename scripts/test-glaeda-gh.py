@@ -5844,6 +5844,16 @@ class TickBudgetTest(Base):
         self.daemon.now = NOW
         return [e["key"] for e in self.daemon.rest_order(entries)]
 
+    def test_a_deferred_key_a_wait_blocks_on_goes_ahead_of_deferred_plain_watches(self) -> None:
+        # huge-blue 2026-11-18 19:56Z: 740 deferred keys, oldest deferral first, mostly plain watches ahead of waits.
+        plain = self.entry("pr:o/r#1", "rest", NOW - 100, deferred=True)
+        waited = self.entry("pr:o/r#2", "rest", NOW - 100, waited=True, deferred=True)
+        self.daemon.deferred_before = {"pr:o/r#1": NOW - 60, "pr:o/r#2": NOW - 10}
+        self.assertEqual(self.order([plain, waited]), ["pr:o/r#2", "pr:o/r#1"])
+        # aging, not a rank: a plain watch deferred more than WAIT_PRIORITY earlier still goes first
+        self.daemon.deferred_before["pr:o/r#1"] = NOW - 10 - gg.WAIT_PRIORITY - 1
+        self.assertEqual(self.order([plain, waited]), ["pr:o/r#1", "pr:o/r#2"])
+
     def test_a_deferred_run_goes_ahead_of_new_prs(self) -> None:
         """due() put a deferred key first only within its kind, so a deferred run sat behind every new PR."""
         self.daemon.budget = {"rest": {"limit": 5000, "remaining": 4500, "reset": NOW + 1800},
@@ -14320,6 +14330,88 @@ class SpendAlarmTest(Base):
         self.assertEqual(len(said), 1, said)
         self.assertEqual((said[0]["verdict"], said[0]["reads"], said[0]["top"]), ("backlog", 2, "land"))
         self.assertIn("most in land (40.0s)", said[0]["text"])
+
+    def test_reads_a_budget_defers_are_said_with_counts_and_never_restart(self) -> None:
+        # huge-blue 2026-11-18 19:56Z: 740 keys deferred, REST share 134 of 150, pr batch halved to 5, no pr read
+        # stored for 600 s; the alarm said "Recent errors: none recorded" and offered a restart.
+        self.policy()
+        self.daemon.started_tick = NOW - 2 * gg.STALE_DATA_AFTER
+        self.daemon.stale_waited, self.daemon.stale_waited_key = {"pr": 900.0}, {"pr": "pr:o/r#5"}
+        self.daemon.fresh_waited = {"pr": 700.0}
+        self.daemon.batch["pr"] = 5
+        self.daemon.deferred = {f"pr:o/r#{n}" for n in range(740)}
+        why = "REST share is spent (134 of 150 this hour) and GraphQL stopped partway"
+        self.daemon.defer_why = {"pr": (NOW - 5, why)}
+        for i in range(3):
+            self.daemon.now = NOW + i * gg.TICK
+            self.daemon.check_alarms()
+        self.assertIsNone(self.daemon.valve_due, "a budget holds the reads: a fresh daemon would defer them the same")
+        told = self.told_lines()
+        self.assertIn("deferred: no pr read stored in the last 600s; 740 pr reads deferred, last by " + why, told[0])
+        self.assertIn("batch 5", told[0])
+        self.assertIn(gg.STALE_DEFERRED_ADVICE, told[0])
+        self.assertNotIn(gg.STALE_RESTART_ADVICE, told[0])
+        self.assertNotIn("Recent errors: none recorded", told[0])
+        why_now = self.daemon.stale_why()["pr"]
+        self.assertEqual((why_now["quota"], why_now["deferred"]), (True, 740))
+        starved = gg.daemon_starved({"at": self.daemon.now, "staleWaited": {"pr": 900.0}, "staleWhy": {"pr": why_now}})
+        self.assertTrue(starved["quota"], "`restart` says why and does not restart")
+        self.assertIn("740 pr reads deferred", starved["why"])
+
+    def test_a_stopped_bucket_is_logged_as_stopped_never_as_a_negative_rate(self) -> None:
+        # huge-blue 2026-11-18: route lines read "perMinute rest -60.0", richness's stopped mark (-1) times 60.
+        self.daemon.paths["pr"] = "rest"
+        with mock.patch.object(self.daemon, "richness", side_effect=lambda b: -1.0 if b == "rest" else 1.0), \
+                mock.patch.object(self.daemon, "rest_capped", return_value=True), \
+                mock.patch.object(gg, "log") as logged:
+            self.assertEqual(self.daemon.route("pr"), "graphql")
+        line = next(c.args[0] for c in logged.call_args_list if c.args[0].get("event") == "route")
+        self.assertNotIn("rest", line["perMinute"])
+        self.assertTrue(all(v >= 0 for v in line["perMinute"].values()), line)
+        self.assertIn("share spent", line["stopped"]["rest"])
+
+    def test_to_graphql_with_graphql_stopped_records_why_it_deferred(self) -> None:
+        self.daemon.budget = {"rest": {"limit": 5000, "remaining": 4500, "reset": NOW + 1800},
+                              "graphql": {"limit": 5000, "remaining": 0, "reset": NOW + 1800}}
+        e = {"key": "pr:o/r#5", "cache": None}
+        self.daemon.to_graphql([e], [])
+        self.assertIn("pr:o/r#5", self.daemon.deferred)
+        self.assertIn("GraphQL is stopped", self.daemon.defer_why["pr"][1])
+
+    def test_a_slot_held_past_its_bound_in_this_process_is_named_freed_and_the_next_pr_batch_reads(self) -> None:
+        # huge-blue 2026-11-18 ~20:00Z: both slots flocked by the serve process, no pr read stored for 600 s, heartbeat
+        # fresh. Replayed: two in-process holders (a land worker's thread, say) keep both slots past the bound.
+        self.policy()
+        self.addCleanup(gg._SLOT_HOLDERS.clear)
+        self.addCleanup(setattr, gg, "TICK_BUDGET", gg.TICK_BUDGET)
+        gg.TICK_BUDGET = 0.3
+        held: list[Any] = []
+        holder = threading.Thread(target=lambda: held.extend(gg.graphql_slot_take(None, what=f"land judge #{n}")
+                                                              for n in (1, 2)), name="land_0")
+        holder.start()
+        holder.join(5)
+        self.addCleanup(lambda: [gg.graphql_slot_release(h[0]) for h in held])
+        key = gg.parse_key("pr", "o/r#5")
+        gg.write_json(gg.cache_dir() / gg.file_name(key), {"key": key, "fetchedAt": NOW - 700, "dataAt": NOW - 700,
+                                                           "data": gg.parse_pr(pr_node(5)), "error": None})
+        gg.register(key, waited=True)
+        self.gh.prs[("o", "r", 5)] = pr_node(5)
+        self.daemon.tick(NOW)  # both held, within their bound: the read is not sent, and says by whom
+        self.assertLess(gg.read_cache(key)["dataAt"], NOW)
+        self.assertIn("by thread land_0 (land judge #1)", " ".join(self.daemon.status["errors"]))
+        with gg._SLOT_HOLDERS_LOCK:
+            for h in gg._SLOT_HOLDERS.values():
+                h["since"] -= gg.GRAPHQL_SLOT_HOLD_MAX + 1  # past the bound
+        out = io.StringIO()
+        dog = gg.Watchdog(300, clock=lambda: 0.0, exit=lambda code: None, reap=self.daemon.free_slots)
+        with contextlib.redirect_stdout(out):
+            self.assertFalse(dog.check())
+        freed = [json.loads(x) for x in out.getvalue().splitlines() if '"slot-freed"' in x]
+        self.assertEqual(sorted((r["thread"], r["what"]) for r in freed),
+                         [("land_0", "land judge #1"), ("land_0", "land judge #2")])
+        self.assertTrue(all(r["heldS"] > gg.GRAPHQL_SLOT_HOLD_MAX for r in freed))
+        self.daemon.tick(NOW + gg.CYCLE)  # the next pr batch gets a slot and reads
+        self.assertEqual(gg.read_cache(key)["dataAt"], NOW + gg.CYCLE)
 
     def test_the_valve_never_restarts_for_one_stale_key_while_other_waited_keys_are_read(self) -> None:
         # huge-blue, 2026-11-18: six valve restarts in six hours, each for one PR (pr:manaflow-ai/cmux#46087 at 3963 s,
