@@ -16074,6 +16074,7 @@ def body_guard_refusal(item: dict) -> str | None:
     if spec is None or spec.loader is None:
         return f"the body guard {path} could not be loaded"
     guard = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = guard  # before exec_module: a dataclass in the guard looks its module up here
     spec.loader.exec_module(guard)
     fd, name = tempfile.mkstemp(suffix=".md", prefix="glaeda-post-")
     try:
