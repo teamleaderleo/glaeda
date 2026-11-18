@@ -510,6 +510,11 @@ MAX_BODY = 8 * 1024 * 1024
 WAIT_POLL = 3  # clients re-read the cache this often
 TOUCH_EVERY = 30  # clients refresh their interest this often
 DOWN_GRACE = 5.0  # clients look this long for the daemon before calling it down (it re-executes on update)
+# `read` (an upstream serving its downstreams) looks this long before answering "not running", which each downstream
+# stores on every key it asked for. huge-blue's glaeda-gh took 9 s to restart (2026-11-18, 21:10:12-21:10:21) against
+# DOWN_GRACE's 5, so every lane VM was told it was down. Twice that, and well inside UPSTREAM_DEADLINE. Kept apart
+# from DOWN_GRACE, which a local `status`, `budget` or `restart` pays in full whenever the daemon really is down.
+UPSTREAM_DOWN_GRACE = 20.0
 # A wait that finds the daemon down keeps waiting this long before it gives up: launchd holds a
 # respawn back for up to ThrottleInterval (30 s) after a short run, and on 10-20 every wait that
 # exited in that window had its session kickstart the daemon again, killing the one just started.
@@ -579,6 +584,9 @@ UPSTREAM_MAX_KEYS = 200  # keys per upstream read (and per `read`); a longer lis
 UPSTREAM_KINDS = ("pr", "run", "comment", "head")  # a head is read for a named consumer, on its budget there
 CONSUMER_RE = re.compile(r"[A-Za-z0-9_.-]{1,40}")  # a head consumer's name (checks --consumer, read's consumer)
 UPSTREAM_ERROR_MAX = 300
+# errorFrom on a cache entry whose error is an upstream outage this host stored (upstream_read), not an error the
+# upstream gave for the key: the upstream's next answer clears it, whether or not it has data for the key.
+UPSTREAM_OUTAGE = "upstream-outage"
 CONTROLLER_DEFAULT = "http://100.89.225.106:18765"  # cmux-lawrence since the 2026-09-28 move
 CONTROLLER_CONFIG = Path.home() / ".local/share/cmux-fleet-client/client.json"
 CONTROLLER_TOKEN = Path.home() / ".config/cmux/build-fleet/controller.token"
@@ -2369,7 +2377,7 @@ def cmd_read(text: str) -> int:
     items = read_request(text)
     readers = read_readers(text)
     times = read_times(text)
-    if not daemon_running(grace=DOWN_GRACE):
+    if not daemon_running(grace=UPSTREAM_DOWN_GRACE):
         print(json.dumps({"error": "glaeda-gh is not running on the upstream host"}))
         return EXIT_DOWN
     broken = daemon_failing()
@@ -2385,7 +2393,9 @@ def cmd_read(text: str) -> int:
         cached = read_cache(key)
         budgets = (entries.get(key) or {}).get("budgets") or {}  # an earlier line's consumers, for this same key
         entries[key] = None if cached is None else {
-            k: cached.get(k) for k in ("data", "dataAt", "error", "fetchedAt", "jobs", "jobsAt", "missing", "restRun", "restRunAt")
+            # errorFrom: an outage of this host's own upstream, which a downstream clears once this host answers again
+            k: cached.get(k) for k in ("data", "dataAt", "error", "errorFrom", "fetchedAt", "jobs", "jobsAt", "missing",
+                                       "restRun", "restRunAt")
             if k in cached}
         if cached is not None and cached.get("source"):  # where the data came from, so a downstream wait can
             entries[key]["origin"] = cached.get("origin") if cached.get("source") == "upstream" else cached["source"]
@@ -6064,27 +6074,34 @@ class Daemon:
             self.errors.append(why)
             self.upstream_status = {"state": "failing", "error": why, "at": self.now}
             for e in due:  # the data is kept; a status names the outage instead of showing it as current
-                self.store(e["key"], e["cache"], error=why)
+                self.store(e["key"], e["cache"], error=why, errorFrom=UPSTREAM_OUTAGE)
             return
         self.upstream_status = {"state": "ok", "at": self.now, "keys": len(due)}
         self.upstream_denials(got)
+        # The upstream answered, so the outage is over for every key sent, whether it has data for the key or not:
+        # each `continue` below clears it (upstream_outage_over); every store() after them drops errorFrom anyway.
         for e in due:
             entry = got.get(e["key"])
             if not isinstance(entry, dict):
+                self.upstream_outage_over(e)
                 continue  # the upstream has not read it yet: asked again in UPSTREAM_NEW
             data = entry.get("data") if isinstance(entry.get("data"), dict) else None
             error = entry.get("error") if isinstance(entry.get("error"), str) else None
             if data is None and error is None:
+                self.upstream_outage_over(e)
                 continue  # registered there, not read yet
             at, fetched = entry.get("dataAt"), entry.get("fetchedAt")
             mine = (e["cache"] or {}).get("dataAt")
             if data is not None and isinstance(at, (int, float)) and isinstance(mine, (int, float)) and at < mine:
+                self.upstream_outage_over(e)
                 continue  # a wait's own read here (direct_read) is newer: the upstream's older one never replaces it
             fields: dict[str, Any] = {"error": error[:UPSTREAM_ERROR_MAX] if error else None, "source": "upstream",
                                       "missing": entry.get("missing") is True,
                                       # provenance: a controller-only finish stays unconfirmed downstream too
                                       "origin": entry.get("origin") if isinstance(entry.get("origin"), str) else None,
                                       "restRun": entry.get("restRun") if isinstance(entry.get("restRun"), dict) else None}
+            if error and entry.get("errorFrom") == UPSTREAM_OUTAGE:
+                fields["errorFrom"] = UPSTREAM_OUTAGE  # the upstream's own upstream was down: cleared as this host's is
             if isinstance(fetched, (int, float)):
                 fields["fetchedAt"] = min(self.now, float(fetched))  # a wait rules only on reads after it began
             shown = entry.get("restRunAt")  # when the upstream's GitHub read last showed restRun (run_unconfirmed)
@@ -6102,6 +6119,16 @@ class Daemon:
                 if isinstance(jobs_at, (int, float)) and not isinstance(jobs_at, bool):
                     fields["jobsAt"] = min(self.now, float(jobs_at))
             self.store(e["key"], e["cache"], **fields)
+
+    def upstream_outage_over(self, e: dict) -> None:
+        """A key the upstream answered with nothing to store no longer names an outage this host stored on it
+        (2026-11-18: huge-blue's 9 s restart showed as "not running on the upstream host" on lane VMs for 30 min).
+        An error the upstream gave for the key itself carries no errorFrom and stays."""
+        cached = e["cache"] or {}
+        if cached.get("errorFrom") != UPSTREAM_OUTAGE:
+            return
+        fetched = cached.get("fetchedAt")  # nothing was read: a wait's "read since I began" must not move
+        self.store(e["key"], e["cache"], error=None, **({"fetchedAt": fetched} if isinstance(fetched, (int, float)) else {}))
 
     def upstream_denials(self, got: dict) -> None:
         """A head consumer the upstream refused for its budget is denied here too (this host's consumers ledger), so

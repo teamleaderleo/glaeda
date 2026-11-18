@@ -54,6 +54,8 @@ loader.exec_module(gg)
 # The host's own create-pause keeper, as the daemon resolves it, before the overrides below hide it: only
 # InstalledKeeperTest asks it, so producer (gh-quota) and consumer (the outbox) cannot disagree silently.
 HOST_PACE_CLI, HOST_CONTENT_PAUSE_NAMES = gg.PACE_CLI, gg.CONTENT_PAUSE_NAMES
+# Base shortens it for every test; the grace test checks the value that ships
+SHIPPED_UPSTREAM_DOWN_GRACE = gg.UPSTREAM_DOWN_GRACE
 # A host's own upstream.json (a lane VM's) must not turn every Daemon here into an upstream client.
 gg.UPSTREAM_CONFIG = Path(tempfile.gettempdir()) / f"glaeda-gh-test-no-upstream-{os.getpid()}.json"
 # Nor may a host's own gh-daemon.json change the pacing the tests expect.
@@ -573,10 +575,10 @@ class Base(unittest.TestCase):
         global NOW
         NOW = float(int(time.time()))
         self.tmp = tempfile.TemporaryDirectory()
-        self.saved = (gg.BASE, gg.WAIT_POLL, gg.DOWN_GRACE, gg.DOWN_PATIENCE, gg.BUDGET_REFRESH)
+        self.saved = (gg.BASE, gg.WAIT_POLL, gg.DOWN_GRACE, gg.UPSTREAM_DOWN_GRACE, gg.DOWN_PATIENCE, gg.BUDGET_REFRESH)
         gg.BASE = Path(self.tmp.name) / "gh"
         gg.WAIT_POLL = 0.05
-        gg.DOWN_GRACE = 0.3
+        gg.DOWN_GRACE = gg.UPSTREAM_DOWN_GRACE = 0.3
         gg.DOWN_PATIENCE = 0.6
         # An idle tick ends with a free GET /rate_limit; these tests count the daemon's requests, so
         # it is off here and BudgetRefreshTest turns it back on.
@@ -591,7 +593,7 @@ class Base(unittest.TestCase):
         self.addCleanup(execv.stop)
 
     def tearDown(self) -> None:
-        gg.BASE, gg.WAIT_POLL, gg.DOWN_GRACE, gg.DOWN_PATIENCE, gg.BUDGET_REFRESH = self.saved
+        gg.BASE, gg.WAIT_POLL, gg.DOWN_GRACE, gg.UPSTREAM_DOWN_GRACE, gg.DOWN_PATIENCE, gg.BUDGET_REFRESH = self.saved
         gg._reader = self.saved_reader
         self.tmp.cleanup()
 
@@ -1781,6 +1783,104 @@ class UpstreamTest(Base):
         self.broken = None
         self.daemon.tick(now=NOW + 2 * gg.UPSTREAM_EVERY)
         self.assertIsNone(gg.read_cache("pr:o/r#7")["error"])
+
+    def test_an_answer_with_no_data_for_a_key_still_clears_the_outage_named_on_it(self) -> None:
+        """2026-11-18: huge-blue's glaeda-gh restarted for 9 s (21:10:12-21:10:21). The lane VMs stored "HTTP 503:
+        glaeda-gh is not running on the upstream host" on every key they sent, and a key the upstream then answered
+        with no data (not read there yet, or older than this host's own read) kept it for 30 min. The upstream
+        answering at all ends the outage on every key it was asked for."""
+        keys = {"answered": "pr:o/r#7", "absent": "pr:o/r#8", "unread": "pr:o/r#9", "older": "pr:o/r#10",
+                "run": "run:o/r/11"}
+        for k in keys.values():
+            gg.register(k)
+        self.answers[keys["answered"]] = {"data": self.pr_data(), "dataAt": NOW}
+        self.answers[keys["older"]] = {"data": self.pr_data(), "dataAt": NOW}
+        self.daemon.tick(now=NOW)
+        self.broken = gg.WatchError("upstream: HTTP 503: glaeda-gh is not running on the upstream host")
+        self.daemon.tick(now=NOW + gg.UPSTREAM_EVERY)
+        for k in keys.values():
+            self.assertIn("not running on the upstream host", gg.read_cache(k)["error"], k)
+        self.broken = None
+        self.answers[keys["unread"]] = {"data": None, "error": None}  # registered there, not read yet
+        self.answers[keys["older"]] = {"data": self.pr_data(), "dataAt": NOW - 60}  # older than this host's
+        self.answers[keys["run"]] = {"budgets": {}}  # an entry with nothing in it
+        status = self.daemon.tick(now=NOW + 2 * gg.UPSTREAM_EVERY)
+        self.assertEqual(status["upstream"]["state"], "ok")
+        for k in keys.values():
+            self.assertIsNone(gg.read_cache(k)["error"], k)
+        self.assertEqual(gg.read_cache(keys["older"])["dataAt"], NOW, "this host's newer data is kept")
+        self.assertEqual(gg.read_cache(keys["answered"])["data"]["number"], 7)
+
+    def test_a_per_key_error_the_upstream_reported_outlives_an_answer_with_no_data(self) -> None:
+        """Only the outage this host stored is cleared: an error the upstream gave for the key itself (even one that
+        names its own upstream, as a chained host's would) stays until the upstream says otherwise."""
+        gg.register("pr:o/r#7")
+        gg.register("pr:o/r#8")
+        self.answers["pr:o/r#7"] = {"data": None, "error": "NOT_FOUND", "missing": True}
+        self.answers["pr:o/r#8"] = {"data": None, "error": "upstream: no answer within 60s"}
+        self.daemon.tick(now=NOW)
+        self.answers = {}
+        self.daemon.tick(now=NOW + gg.UPSTREAM_EVERY)
+        self.answers = {"pr:o/r#7": {"data": None, "error": None}}
+        self.daemon.tick(now=NOW + 2 * gg.UPSTREAM_EVERY)
+        self.assertEqual(gg.read_cache("pr:o/r#7")["error"], "NOT_FOUND")
+        self.assertEqual(gg.read_cache("pr:o/r#8")["error"], "upstream: no answer within 60s")
+        # an outage after a per-key error replaces it, and the next answer clears it
+        self.broken = gg.WatchError("upstream: no broker socket")
+        self.daemon.tick(now=NOW + 3 * gg.UPSTREAM_EVERY)
+        self.assertIn("no broker socket", gg.read_cache("pr:o/r#7")["error"])
+        self.broken = None
+        self.daemon.tick(now=NOW + 4 * gg.UPSTREAM_EVERY)
+        self.assertIsNone(gg.read_cache("pr:o/r#7")["error"])
+
+    def test_an_outage_one_hop_up_is_cleared_when_the_middle_host_recovers(self) -> None:
+        """A chained host serves its own stored outage on (cmd_read sends errorFrom); the host below clears it once
+        the middle one answers with no error, as it would its own."""
+        gg.register("pr:o/r#7")
+        self.answers["pr:o/r#7"] = {"data": None, "error": "upstream: no broker socket", "errorFrom": gg.UPSTREAM_OUTAGE}
+        self.daemon.tick(now=NOW)
+        self.assertEqual(gg.read_cache("pr:o/r#7")["errorFrom"], gg.UPSTREAM_OUTAGE)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), mock.patch.object(gg, "daemon_running", return_value=True), \
+                mock.patch.object(gg, "daemon_failing", return_value=None):
+            gg.cmd_read(json.dumps({"keys": [{"key": "pr:o/r#7", "jobs": False}]}))
+        self.assertEqual(json.loads(out.getvalue())["entries"]["pr:o/r#7"]["errorFrom"], gg.UPSTREAM_OUTAGE)
+        self.answers["pr:o/r#7"] = {"data": None, "error": None}
+        self.daemon.tick(now=NOW + gg.UPSTREAM_EVERY)
+        self.assertIsNone(gg.read_cache("pr:o/r#7")["error"])
+
+    def test_a_daemon_restart_shorter_than_the_grace_never_answers_not_running(self) -> None:
+        """huge-blue's glaeda-gh took 9 s to restart (2026-11-18) while `read` looked for it for DOWN_GRACE, 5 s, and
+        answered "not running" to every lane VM. A restart of that length, with margin, is ridden out."""
+        restart = 9.0
+        self.assertGreaterEqual(SHIPPED_UPSTREAM_DOWN_GRACE, 2 * restart)
+        self.assertLess(SHIPPED_UPSTREAM_DOWN_GRACE, gg.UPSTREAM_DEADLINE / 2, "a read still answers in its deadline")
+        clock = [0.0]
+
+        def sleep(seconds: float) -> None:
+            clock[0] += seconds
+
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), \
+                mock.patch.object(gg, "UPSTREAM_DOWN_GRACE", SHIPPED_UPSTREAM_DOWN_GRACE), \
+                mock.patch.object(gg.time, "monotonic", side_effect=lambda: clock[0]), \
+                mock.patch.object(gg.time, "sleep", side_effect=sleep), \
+                mock.patch.object(gg, "lock_held", side_effect=lambda: clock[0] >= restart), \
+                mock.patch.object(gg, "daemon_failing", return_value=None):
+            gg.cmd_read(json.dumps({"keys": [{"key": "pr:o/r#7", "jobs": False}]}))
+        answer = json.loads(out.getvalue())
+        self.assertNotIn("error", answer)
+        self.assertIn("pr:o/r#7", answer["entries"])
+        # and a daemon that stays down is still called down, once the grace is spent
+        clock[0], out = 0.0, io.StringIO()
+        with contextlib.redirect_stdout(out), \
+                mock.patch.object(gg, "UPSTREAM_DOWN_GRACE", SHIPPED_UPSTREAM_DOWN_GRACE), \
+                mock.patch.object(gg.time, "monotonic", side_effect=lambda: clock[0]), \
+                mock.patch.object(gg.time, "sleep", side_effect=sleep), \
+                mock.patch.object(gg, "lock_held", return_value=False):
+            self.assertEqual(gg.cmd_read(json.dumps({"keys": [{"key": "pr:o/r#7", "jobs": False}]})), gg.EXIT_DOWN)
+        self.assertIn("not running on the upstream host", json.loads(out.getvalue())["error"])
+        self.assertLess(clock[0], SHIPPED_UPSTREAM_DOWN_GRACE + 1)
 
     def test_past_the_key_cap_the_least_recently_read_go_first(self) -> None:
         keys = [f"pr:o/r#{n}" for n in range(1, 6)]
