@@ -8546,6 +8546,16 @@ LAND_LATCH_STARVED_WINDOWS = 2
 # A due entry left unjudged this long past its wake with no latch (every worker busy: gated) is noted once in its
 # history and counted in the land-pool line (dueLate), so a wait past its wake always has a logged reason.
 LAND_DUE_LATE = 1800.0
+# While the login's latch holds, a due entry is still judged once per latch window from what this host holds:
+# `merge_hold.py explain --cache-only LAND_CACHE_ONLY_AGE` (leo-workspace#6006) answers every read from the host's
+# caches (the shared cache, the git mirror, this daemon's reads) and sends nothing to GitHub; a read they do not hold
+# says cacheMiss. Only when the PR's cached copy is itself under LAND_CACHE_ONLY_AGE old. No step is taken under the
+# latch (every step is a write). At the clear, an advisory ok at the head the cache still shows, under
+# LAND_CACHE_VERDICT_KEEP old, goes first and straight to its pinned merge, whose own live judgement in the gh shim
+# is the guard; anything else is judged live as before. An agent ask, 2026-11-18: lands 2-4 h past their wake, judged
+# "unreadable" under the latch, and 3 merges in 3 h with ~105 reviewed lands held.
+LAND_CACHE_ONLY_AGE = 300.0
+LAND_CACHE_VERDICT_KEEP = 900.0
 LAND_TEXT = 400  # a reason or step kept in an entry or a message, at most
 LAND_STOP_CLASSES = {"block": "block", "held": "hold", "chat_hold": "chat_hold", "classic_frozen": "classic_frozen",
                      "language_boundary": "language_boundary", "react_port": "react_port", "teammate": "teammate",
@@ -9390,7 +9400,8 @@ class LandQueue:
                     self.pass_latched += 1
                     with self.lock:
                         self.hold(e, latch)
-                    continue  # a held latch: no judge, read, watch or nudge for this entry this pass
+                        self.judge_cached(e)
+                    continue  # a held latch: no live judge, read, watch or nudge for this entry this pass
                 if ended is not None and self.now < ended + land_jitter(key, ended) \
                         and int((e.get("latchHeld") or {}).get("windows") or 0) < LAND_LATCH_STARVED_WINDOWS:
                     continue  # the latch just ended: this entry's place in the reset spread is still ahead
@@ -9613,6 +9624,64 @@ class LandQueue:
                         f"windows (now until {utc_clock(until)}). It is judged first when the latch clears; nothing "
                         "to do. The unblock is the App read pools (leo-workspace#5944)")
         self.save(e)
+
+    def cached_ok(self, e: dict, sha: str) -> dict | None:
+        """E's advisory ok from the cache (judge_cached) when it stands for SHA: the latch has cleared, it is under
+        LAND_CACHE_VERDICT_KEEP old, and SHA, the head the cache shows now, is the head it was judged at."""
+        v = e.get("cacheVerdict") or {}
+        if not v.get("ok") or not sha or v.get("head") != sha or self.pass_latch is not None:
+            return None
+        at = v.get("at")
+        if not isinstance(at, (int, float)) or isinstance(at, bool) or self.now - at >= LAND_CACHE_VERDICT_KEEP:
+            return None
+        return v
+
+    def judge_cached(self, e: dict) -> None:
+        """E is due and the login's latch holds: judge it once per latch window from this host's caches
+        (LAND_CACHE_ONLY_AGE), on a free worker, when its PR's cached copy is fresh enough; the verdict is kept in
+        cacheVerdict and said in its status. Nothing is sent to GitHub and no step is taken."""
+        if not self.due(e) or e["key"] in self.jobs or self.config().get("cacheOnlyUnderLatch") is False:
+            return
+        window = self.latch_started
+        v = e.get("cacheVerdict") or {}
+        if v.get("window") == window:
+            return
+        c = self.cache_of(e["key"]) or {}
+        head = str((c.get("data") or {}).get("headRefOid") or "").lower()
+        at = c.get("dataAt")
+        age = self.now - float(at) if isinstance(at, (int, float)) and not isinstance(at, bool) else None
+        if not head or age is None or age > LAND_CACHE_ONLY_AGE:
+            e["cacheVerdict"] = {"window": window, "at": self.now, "head": head, "miss": True,
+                                 "reason": "its PR's cached copy is " + (f"{age:.0f} s old" if age is not None
+                                                                          else "missing")
+                                           + f" (over {LAND_CACHE_ONLY_AGE:.0f} s)"}
+            self.history(e, "cache_stale", age=round(age) if age is not None else None)
+            self.save(e)
+            return
+        if len(self.jobs) >= self.workers():
+            self.gated(e)
+            return
+        e["cacheVerdict"] = {"window": window, "at": self.now, "head": head, "judging": True}
+        self.save(e)
+        self.submit(e["key"], self.cached_job, e["key"], head, window)
+
+    def cached_job(self, key: str, head: str, window: Any) -> None:
+        with self.lock:
+            e = self.entries.get(key)
+            if e is None:
+                return
+        answer = self.explain(e, head, cache_only=LAND_CACHE_ONLY_AGE)
+        with self.lock:
+            if (e.get("cacheVerdict") or {}).get("window") != window or e["state"] not in ("queued", "waiting"):
+                return  # judged live meanwhile, or done
+            miss = bool(answer.get("cacheMiss")) or answer.get("cacheOnly") is not True
+            ok = bool(answer.get("ok")) and not miss and str(answer.get("head") or head).lower() == head
+            e["cacheVerdict"] = {"window": window, "at": self.now, "head": head, "ok": ok, "miss": miss,
+                                 "code": str(answer.get("code") or ("ok" if ok else "")),
+                                 "reason": land_trim(answer.get("reason"), 200)}
+            self.count("cache_judged")
+            self.history(e, "cache_judged", code=e["cacheVerdict"]["code"], head=head[:12], miss=miss or None)
+            self.save(e)
 
     def unhold(self, e: dict) -> None:
         """E is judged: the latch no longer holds it (hold)."""
@@ -9854,6 +9923,7 @@ class LandQueue:
         head = str(data.get("headRefOid") or "")
         ready = data.get("state") == "OPEN" and data.get("mergeStateStatus") == "CLEAN" \
             and not land_checks_running(data, head)
+        ready = ready or self.cached_ok(e, head.lower()) is not None
         if self.due(e):
             return (0 if ready else 1), 0, self.due_since(e)
         at = (e.get("explain") or {}).get("at")
@@ -10315,7 +10385,7 @@ class LandQueue:
             return fb[1], tried
         return mh, tried
 
-    def explain(self, e: dict, sha: str) -> dict:
+    def explain(self, e: dict, sha: str, cache_only: float | None = None) -> dict:
         mh, tried = self.merge_hold()
         if mh is None:
             # Gone between the tick's startup check and this job: a stop that names the file, never a retry.
@@ -10325,6 +10395,8 @@ class LandQueue:
                     "action": {"v": 1, "kind": "stop", "stop": "merge_hold_missing", "why": why}}
         argv = [self.path("python", Path(sys.executable)).as_posix(), os.fspath(mh),
                 "explain", e["repo"], str(e["number"])] + (["--sha", sha] if sha else []) + ["--json"]
+        if cache_only is not None:
+            argv += ["--cache-only", f"{cache_only:g}"]
         snap, _ = self.snapshot(e["key"], sha)
         extra = {}
         if snap is not None:
@@ -10337,7 +10409,7 @@ class LandQueue:
                                   "rollup": snap.get("rollup")})
                 extra[LAND_SNAPSHOT_ENV] = os.fspath(path)
         with self.lock:
-            self.count("snapshot" if extra else "live")
+            self.count("cache_only" if cache_only is not None else "snapshot" if extra else "live")
         got = self.call(argv, LAND_EXPLAIN_DEADLINE, extra=extra)
         answer = None
         for line in reversed((got.stdout or "").strip().splitlines()):
@@ -10389,7 +10461,20 @@ class LandQueue:
             counts = counts and not e.pop("stepQuotaParked", False)
         if not self.state_first(e, None):  # GitHub said it is closed: its state first, no judgment of a finished PR
             return
-        answer = self.explain(e, sha)
+        with self.lock:
+            cached = self.cached_ok(e, sha)
+            e.pop("cacheVerdict", None)
+        if cached is not None:
+            # Judged ok from the host's caches while the latch held, at this same head: the pinned merge goes now, and
+            # its live judgement in the gh shim (merge_hold) is the guard; nothing else is read for it here
+            answer = {"ok": True, "code": "ok", "reason": "", "head": sha, "cached": True,
+                      "next": f"gh pr merge {e['number']} -R {e['repo']} --squash --match-head-commit {sha}",
+                      "action": {"v": 1, "kind": "merge", "repo": e["repo"], "number": int(e["number"]), "head": sha,
+                                 "sha": sha}}
+            with self.lock:
+                self.history(e, "cache_ok_taken", head=sha[:12], age=round(self.now - float(cached.get("at") or 0)))
+        else:
+            answer = self.explain(e, sha)
         answer["pinned"] = bool(sha)  # judged at the cache's head; unpinned, merge_hold read the head itself
         head = str(answer.get("head") or sha or "").lower()
         act = land_action(answer, head)
@@ -11283,6 +11368,11 @@ def land_line(e: dict, now: float) -> str:
         bits.append(f"held by the login latch until {time.strftime('%H:%MZ', time.gmtime(float(held.get('until') or 0)))}"
                     f" ({held.get('windows')} window{'s' if held.get('windows') != 1 else ''}, due since "
                     f"{utc_clock(float(held.get('dueSince') or 0))})")
+        cv = e.get("cacheVerdict") or {}
+        if cv and not cv.get("judging"):
+            bits.append("judged from cache: " + ("ok, merges at the clear" if cv.get("ok") else
+                                                  f"not held ({land_trim(cv.get('reason'), 120)})" if cv.get("miss")
+                                                  else f"{cv.get('code') or 'refused'}"))
     elif (e.get("dueLate") or {}) and e["state"] in ("queued", "waiting"):
         bits.append(f"due since {utc_clock(float(e['dueLate'].get('since') or 0))}: every worker busy")
     if e.get("after") and e["state"] == "waiting_after":
