@@ -19269,6 +19269,22 @@ class LandTest(Base):
         self.assertEqual((e["state"], e["waitBudget"]["kind"], e["waitBudget"]["n"]), ("waiting", "wait_comment", 3),
                          e.get("stop"))
 
+    def test_a_fetch_between_retries_keeps_their_budget(self):
+        # review of glaeda#2180 (second BLOCK): the mirror filled, still unreadable, the mirror stale again: fetch,
+        # retry, fetch, retry... A fetch relies on the streak, which each retry cleared; dropping the budget on it too
+        # left no bound at all (55 h, 111 judgments). A step that is bounded by the streak keeps the budget.
+        self.pr(LA)
+        self.land()
+        fetch = refusal("unreadable", LA, {"kind": "fetch", "argv": self.git_fetch()})
+        unread = refusal("unreadable", LA, {"kind": "retry", "after_s": 60})
+        self.w.answers += [fetch, unread] * 20
+        e = self.tick()
+        for _ in range(30):
+            if e["state"] == "stopped":
+                break
+            e = self.tick(gg.LAND_RETRY_MAX + 1)
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "retry_deadline"), e.get("waitBudget"))
+
     def test_a_retry_never_strikes_and_stops_at_its_deadline_naming_it(self):
         self.pr(LA)
         self.land()
@@ -19326,6 +19342,14 @@ class LandTest(Base):
         self.w.answers.append(refusal("cancelled", LA, {"kind": "rerun_failed", "runs": [77]}))
         e = self.tick()
         self.assertEqual((len(self.w.gh_calls("run", "rerun")), e.get("reruns")), (1, {}))
+
+    def test_a_rerun_that_timed_out_still_counts(self):
+        self.pr(LA)
+        self.land()
+        self.w.gh_rc["rerun"] = 124  # a timeout may have reached GitHub
+        self.w.answers.append(refusal("cancelled", LA, {"kind": "rerun_failed", "runs": [77]}))
+        e = self.tick()
+        self.assertEqual(e.get("reruns"), {f"{LA}|77": 1})
 
     def test_a_cancelled_judgment_never_leaves_a_rerun_count(self):
         # review of glaeda#2180 F2: a newer land arriving mid-job; the stale job's count never lands on the new entry

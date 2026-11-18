@@ -8111,7 +8111,8 @@ LAND_WAIT_STUCK = 4 * 3600.0
 # (review of glaeda#2174, F1): from its first such judgment at the head,
 # sized max(the kind's LAND_WAIT_DEADLINE, twice the action's own timeout_s, so a wait always gets judged again at
 # least once); the judgment that finds it spent stops "<kind>_deadline", naming the wait that ran out. A new head
-# starts a new budget; an "ok", a wait on the checks or any other step between drops it. A fetch is work, not a wait:
+# starts a new budget; an "ok" or a wait on the checks (checks_stuck bounds it) drops it, any other step keeps it. A fetch
+# is work, not a wait:
 # LAND_RETRY_STREAK_STOP and step_refused
 # still bound it. Only a "stop" or "command" (a red not excused, a hold, a BLOCK, a teammate's PR, a conflict) and the
 # remaining steps (repin, review, retarget) count toward or stop at LAND_STREAK_STOP.
@@ -9880,9 +9881,11 @@ class LandQueue:
                 self.park_quota(e, f"{answer.get('reason') or ''} {answer.get('next') or ''}")
                 return  # the login's state, not the PR's: no step, no streak
             e.pop("quotaRefusals", None)
-            if act.get("kind") not in LAND_WAIT_DEADLINE or answer.get("ok"):
-                # Only these waits in a row share a budget: a wait on the checks (bounded on its own, checks_stuck) or
-                # any other step between gives the next one its whole deadline (review of glaeda#2180)
+            if answer.get("ok") or act.get("kind") in LAND_WAIT_KINDS:
+                # A wait on the checks (bounded on its own: checks_stuck) between two waits gives the next its whole
+                # deadline. Any other step between keeps the budget: a fetch, repin, review or retarget is bounded by
+                # the streak, which each wait clears, so dropping the budget there too left no bound at all (review of
+                # glaeda#2180: fetch, retry, fetch, retry... 55 h)
                 e.pop("waitBudget", None)
             if answer.get("ok"):
                 e["streak"] = None
