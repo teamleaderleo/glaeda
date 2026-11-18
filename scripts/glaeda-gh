@@ -5210,7 +5210,8 @@ class Daemon:
                            # a reader came after the last fetch: a rerun or reopen may have changed it
                            or e["touched"] > c.get("fetchedAt", 0)):
                 since = self.now - c.get("fetchedAt", 0)
-                if kind == "run" and c.get("missing") and not c.get("data") and since < RUN_MISSING_RETRY:
+                if kind == "run" and c.get("missing") and not c.get("data") and since < RUN_MISSING_RETRY \
+                        and not (self.waited(e) and self.wait_start(e) > c.get("fetchedAt", 0)):  # a new wait is read once
                     continue  # not found: settled, asked again only now and then (it was read every cycle)
                 if kind == "comment" and self.fed(e["key"]) and since < COMMENT_FED_CYCLE - TICK:
                     continue  # the controller's issue_comment webhooks carry its new comments (merge_comments)
@@ -6917,20 +6918,23 @@ class Daemon:
     def gql_blind(self, e: dict) -> bool:
         return self.now - float((e["cache"] or {}).get("gqlBlindAt") or float("-inf")) < GQL_BLIND_TTL
 
-    def gql_blind_read(self, e: dict) -> bool:
+    def gql_blind_read(self, e: dict, stamp: bool) -> bool:
         """Read a run GraphQL cannot resolve over REST, which is authoritative for it: data on a 200, missing on a
-        404 for a run never shown, an error otherwise. The entry remembers (gqlBlindAt) so the next cycles go
-        straight to REST. False when REST has no room: the caller stores GraphQL's own answer."""
+        404 for a run never shown, an error otherwise. `stamp` (a fresh GraphQL null) starts GQL_BLIND_TTL (gqlBlindAt),
+        so the next cycles go straight to REST; a read inside the window leaves the stamp, so the window ends.
+        False when REST has no room: the caller stores GraphQL's own answer, or reads it over GraphQL."""
         if self.mode("rest") == "stop" or not self.rest_room(REST_READ_MAX["run"]):
             return False
         try:
             with self.calling(*caller_of(e["key"]), waiter_of(e)):
                 self.fetch_run(e)
-        except OutOfTime:
+        except OutOfTime:  # nothing was read: nothing is stored, and the run goes first next tick
             self.deferred.add(e["key"])
-        read = read_cache(e["key"]) or {}
-        self.store(e["key"], read or e["cache"], gqlBlindAt=self.now, error=read.get("error"),
-                   missing=read.get("missing"))
+            return True
+        if stamp:
+            read = read_cache(e["key"]) or {}
+            self.store(e["key"], read or e["cache"], gqlBlindAt=self.now, error=read.get("error"),
+                       missing=read.get("missing"))
         return True
 
     def fetch_runs_graphql(self, entries: list[dict]) -> str | None:
@@ -6939,10 +6943,8 @@ class Daemon:
         read ever showed it: a run that exists has data from its first read."""
         # A run GraphQL went blind to (resource() null for it: a private repo the GraphQL token has no installation on)
         # is read over REST at once, without a query that cannot answer, until GQL_BLIND_TTL passes.
-        blind = [e for e in entries if self.gql_blind(e)]
-        for e in blind:
-            self.gql_blind_read(e)
-        entries = [e for e in entries if e not in blind]
+        blind = [e for e in entries if self.gql_blind(e) and self.gql_blind_read(e, False)]
+        entries = [e for e in entries if e not in blind]  # (REST without room leaves a run to GraphQL's own answer)
         if not entries:
             return None
         query, variables = run_query([e["key"] for e in entries])
@@ -6962,7 +6964,10 @@ class Daemon:
             if not isinstance(node, dict) or node.get("__typename") != "WorkflowRun":
                 message = "graphql: " + str((problems.get(f"w{i}") or {}).get("message") or "no workflow run at this URL")[:200]
                 problem = problems.get(f"w{i}") or {}
-                if not any(p.get("type") in ("RATE_LIMITED", "FORBIDDEN") for p in problems.values()) and self.gql_blind_read(e):
+                # null with no problem of its own, or NOT_FOUND: GraphQL cannot see it (a timeout or a 5xx says nothing)
+                if (not problem or problem.get("type") == "NOT_FOUND") \
+                        and not any(p.get("type") in ("RATE_LIMITED", "FORBIDDEN") for p in problems.values()) \
+                        and self.gql_blind_read(e, True):
                     continue  # REST answered for it (a run the GraphQL token cannot see, or does not exist)
                 self.errors.append(f"{e['key']}: {message}")
                 self.store(e["key"], e["cache"], error=message,

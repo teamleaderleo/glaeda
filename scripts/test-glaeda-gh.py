@@ -4036,6 +4036,34 @@ class ClientTest(Base):
         self.daemon.last_cycle["run"] = 0
         self.assertEqual(self.daemon.due("run", [{**gone, "cache": cache}]), [])
 
+    def test_a_blind_runs_read_window_ends_and_an_unread_one_is_not_stored(self) -> None:
+        self.daemon.now = NOW
+        self.gh.runs[9] = {"id": 9, "name": "CI", "display_title": "x", "status": "completed", "conclusion": "success",
+                           "html_url": "u", "head_sha": "b" * 40, "head_branch": "x", "event": "push",
+                           "run_attempt": 1, "created_at": iso(NOW - 99), "updated_at": iso(NOW - 9)}
+        entry = {"key": "run:o/r/9", "cache": None, "jobs": False, "touched": NOW}
+        with mock.patch.object(self.daemon, "graphql", return_value=({"data": {"w0": None}}, None)):
+            self.daemon.fetch_runs_graphql([entry])
+        stamp = gg.read_cache("run:o/r/9")["gqlBlindAt"]
+        self.daemon.now = NOW + 60
+        with mock.patch.object(self.daemon, "graphql") as gql:
+            self.daemon.fetch_runs_graphql([{**entry, "cache": gg.read_cache("run:o/r/9")}])
+        self.assertEqual(gg.read_cache("run:o/r/9")["gqlBlindAt"], stamp)  # reading inside the window keeps its end
+        gql.assert_not_called()
+        # out of time: nothing stored, the run is deferred
+        fresh = {"key": "run:o/r/10", "cache": None, "jobs": False, "touched": NOW}
+        with mock.patch.object(self.daemon, "graphql", return_value=({"data": {"w0": None}}, None)), \
+                mock.patch.object(self.daemon, "fetch_run", side_effect=gg.OutOfTime()):
+            self.daemon.fetch_runs_graphql([fresh])
+        self.assertIsNone(gg.read_cache("run:o/r/10"))
+        self.assertIn("run:o/r/10", self.daemon.deferred)
+        # a timeout for the alias is not blindness: no fallback
+        with mock.patch.object(self.daemon, "graphql", return_value=({"data": {"w0": None}, "errors": [
+                {"path": ["w0"], "type": "SERVICE_UNAVAILABLE", "message": "timeout"}]}, None)), \
+                mock.patch.object(self.daemon, "fetch_run") as rest:
+            self.daemon.fetch_runs_graphql([{**fresh, "key": "run:o/r/11"}])
+        rest.assert_not_called()
+
     def test_a_never_read_key_a_wait_is_on_goes_ahead_of_deferred_ones(self) -> None:
         self.daemon.now = NOW
         old = [{"key": f"pr:o/r#{n}", "cache": {"data": {}, "fetchedAt": NOW - 999}, "touched": NOW} for n in range(1, 4)]
