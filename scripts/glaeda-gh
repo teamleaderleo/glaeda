@@ -8523,12 +8523,14 @@ def land_jitter(key: str, reset: float = 0.0) -> float:
 
 def land_latch_spread(now: float) -> float | None:
     """The until of the login's latch mark GitHub named (LATCH_GITHUB_SOURCES) that ended less than reset_spread_s
-    before NOW, or None: entries resume past it each at its own land_jitter, not all at its first second."""
+    before NOW, or None: entries resume past it each at its own land_jitter, not all at its first second. Only a mark
+    land_latch would have held on: a share or a REST login_only mark held no land, so its end spreads none."""
     width = pace_settings()["reset_spread_s"]
     best = None
     for pool in ("rest", "graphql"):
         doc = read_json(latch_state_dir() / f"{pool}-exhausted.json")
-        if not isinstance(doc, dict) or doc.get("share") is True or doc.get("source") not in LATCH_GITHUB_SOURCES:
+        if not isinstance(doc, dict) or doc.get("share") is True or (pool == "rest" and doc.get("login_only") is True) \
+                or doc.get("source") not in LATCH_GITHUB_SOURCES:
             continue
         until = doc.get("until")
         if isinstance(until, (int, float)) and not isinstance(until, bool) and until <= now < until + width:

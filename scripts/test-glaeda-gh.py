@@ -20460,6 +20460,15 @@ class ResetPaceTest(unittest.TestCase):
         self.assertLessEqual(worst, cap)
         self.assertLessEqual(times[-1], self.R + 121)
 
+    def test_only_a_mark_that_held_lands_spreads_them_when_it_ends(self) -> None:
+        self.state.mkdir(parents=True)
+        mark = {"until": self.R, "at": self.R - 600, "reset": self.R, "source": "x-ratelimit-reset", "identity": "login"}
+        for extra, spreads in (({}, True), ({"login_only": True}, False), ({"share": True}, False)):
+            with self.subTest(extra=extra):
+                (self.state / "rest-exhausted.json").write_text(json.dumps({**mark, **extra}))
+                self.assertEqual(gg.land_latch(self.R - 1) is not None, spreads, "held while it ran")
+                self.assertEqual(gg.land_latch_spread(self.R + 5), self.R if spreads else None)
+
     def test_the_daemons_minute_cap_holds_reads_and_names_when(self) -> None:
         self.policy.write_text(json.dumps({"minute_cap_calls": 5}))
         d = gg.Daemon(transport=lambda *a: (200, {}, b"{}"), token=lambda: "t", controller=None)
