@@ -921,7 +921,7 @@ RUN_FIELDS = """__typename ... on WorkflowRun { databaseId runAttempt event crea
 workflow { name } checkSuite { status conclusion commit { oid } branch { name } } }"""
 STEPS_QUERY = """query($ids: [ID!]!) { rateLimit { limit remaining resetAt cost }
 nodes(ids: $ids) { ... on CheckRun { id steps(first: 100) { nodes { name conclusion } } } } }"""
-TOKEN_RE = re.compile(r"(gh[pousr]_[A-Za-z0-9_]{20,251}|github_pat_[A-Za-z0-9_]{20,251}|[0-9a-f]{40})")
+TOKEN_RE = re.compile(r"(gh[pousr]_[A-Za-z0-9._-]{20,2048}|github_pat_[A-Za-z0-9_]{20,251}|[0-9a-f]{40})")
 
 
 class WatchError(RuntimeError):
@@ -13639,7 +13639,7 @@ GIT_CONFIG_SECTION_NAME_RE = re.compile(r"[A-Za-z0-9-]+")
 GIT_CONFIG_KEY_RE = re.compile(r"^([A-Za-z][A-Za-z0-9-]*)\s*(?:=\s*(.*))?$")
 GIT_CONFIG_ESCAPES = {"n": "\n", "t": "\t", "b": "\b", '"': '"', "\\": "\\"}
 # GitHub's own credential shapes, never written to the shared log whatever slot they arrived in
-BROKER_SECRET_RE = re.compile(r"gh[posur]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}", re.IGNORECASE)
+BROKER_SECRET_RE = re.compile(r"gh[posur]_[A-Za-z0-9._-]{20,}|github_pat_[A-Za-z0-9_]{20,}", re.IGNORECASE)
 # How long git may take to say what this checkout's remotes are. Two forks in front of a real gh
 # call, so it is bounded like everything else here: a checkout on a hung mount declines, which
 # costs one request, rather than hanging the call. Tighter than SUBPROCESS_DEADLINE because nothing

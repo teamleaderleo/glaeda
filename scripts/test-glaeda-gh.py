@@ -74,6 +74,8 @@ _NOTICES = tempfile.TemporaryDirectory(prefix="glaeda-gh-test-notices-")  # remo
 gg.NOTICES_DIR = Path(_NOTICES.name)
 
 TOKEN = "ghp_faketoken_must_never_touch_disk"
+# An installation token as GitHub mints them since 2026-11: 383 characters with "." and "-" in them.
+DOTTED_APP_TOKEN = "ghs_" + ".".join(["A1b-C_d" * 9] * 5) + "-x" * 30
 NOW = float(int(time.time()))  # watch files carry real mtimes
 
 
@@ -2287,6 +2289,21 @@ class DaemonTest(Base):
         self.assertTrue(gg.TOKEN_RE.fullmatch("gho_" + "a" * 36))
         self.assertTrue(gg.TOKEN_RE.fullmatch("github_pat_" + "A1_" * 20))
         self.assertFalse(gg.TOKEN_RE.fullmatch("To get started with GitHub CLI, please run: gh auth login"))
+
+    def test_a_dotted_installation_token_is_a_token(self) -> None:
+        """GitHub's installation tokens grew to about 383 characters with "." and "-" in them (leo-workspace
+        gh_app_token.TOKEN_RE, ghs_[A-Za-z0-9._-]{20,2048}): a daemon handed one must not call it "not a GitHub
+        token", and AppPool's mint must keep it."""
+        token = DOTTED_APP_TOKEN
+        self.assertEqual(len(token), 383)
+        self.assertTrue(gg.TOKEN_RE.fullmatch(token))
+        with mock.patch.object(gg, "find_gh", return_value="/bin/gh"), mock.patch.object(
+                gg, "run_bounded", return_value=subprocess.CompletedProcess([], 0, token + "\n", "")):
+            self.assertEqual(gg.gh_token(), token)
+        pool = gg.AppPool(owners=lambda: ["o"], ready=lambda: True)
+        with mock.patch.object(gg, "app_pool_tool", return_value=Path("/x/gh_app_token.py")), mock.patch.object(
+                gg, "run_bounded", return_value=subprocess.CompletedProcess([], 0, token + "\n", "")):
+            self.assertEqual(pool.token("o"), token)
 
     def test_bad_keys_are_refused(self) -> None:
         for kind, text in (("pr", "o/r"), ("pr", "o/r#x"), ("run", "o/r"), ("pr", "o/r#1) { x }")):
@@ -10590,6 +10607,17 @@ class BrokerLogTest(BrokerBase):
         text = Path(os.environ["CMUX_GH_LOG"]).read_text()
         self.assertNotIn(token, text)
         self.assertIn("[redacted]", text)
+
+    def test_a_dotted_installation_token_is_dropped_whole(self) -> None:
+        """An installation token with "." and "-" (about 383 characters): a pattern that stopped at the first "."
+        left most of it in the shared log."""
+        token = DOTTED_APP_TOKEN
+        self.assertEqual(gg.BROKER_SECRET_RE.sub("[redacted]", f"api repos/o/{token}"), "api repos/o/[redacted]")
+        self.run_gh(["api", f"repos/o/{token}/contents/x"])
+        text = Path(os.environ["CMUX_GH_LOG"]).read_text()
+        for piece in token.split("."):
+            self.assertNotIn(piece[4:] if piece.startswith("ghs_") else piece, text)
+        self.assertNotIn("ghs_", text)  # the log drops a path it cannot read, or redacts it: never a piece
 
     def test_a_newline_in_a_subcommand_slot_cannot_forge_a_log_line(self) -> None:
         forged = "2026-10-21T00:00:00Z other-session pr view pr:o/r#1"
