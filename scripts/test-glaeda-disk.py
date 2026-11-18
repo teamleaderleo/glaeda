@@ -25,6 +25,7 @@ import sys
 import tempfile
 import time
 import types
+import functools
 import unittest
 from dataclasses import replace
 from unittest import mock
@@ -42,6 +43,34 @@ spec = importlib.util.spec_from_loader("glaeda_disk", loader)
 gd = importlib.util.module_from_spec(spec)
 sys.modules["glaeda_disk"] = gd
 loader.exec_module(gd)
+
+
+# The ages before Leo's 1 h default (2026-11-18). Tests of rules other than the window's length (a git veto, a lease,
+# a seed keep, LRU order, a reservation) were written with fixtures aged around the 12 h window; they run under it, and
+# the 1 h window itself is pinned by test_every_disposable_age_is_one_hour and its neighbours.
+TWELVE_HOUR_AGES = {name: 12.0 for name in (
+    "DEFAULT_AGE_HOURS", "KEPT_BUILD_IDLE_HOURS", "IDLE_SWEEP_HOURS", "PARKED_NO_LOG_IDLE_HOURS",
+    "CMUX_NEXT_CI_MIN_IDLE_HOURS", "CANONICAL_ADMISSION_IDLE_HOURS", "IDLE_SEED_HOURS", "SIM_DEVICE_IDLE_HOURS",
+    "CHECKOUT_BUILD_IDLE_HOURS", "RUNNER_CACHE_IDLE_HOURS", "RUNNER_STALE_CHECKOUT_HOURS",
+    "TMP_TEST_RESIDUE_IDLE_HOURS", "CMUX_JOB_MIRROR_HOURS")}
+TWELVE_HOUR_AGES["RUNTIME_IDLE_DAYS"] = 0.5
+
+
+def twelve_hour_ages(test):
+    """Run TEST (a method or a TestCase class) with the 12 h ages and the matching policy defaults."""
+    if isinstance(test, type):
+        for name in [n for n in vars(test) if n.startswith("test") or n == "setUp"]:
+            setattr(test, name, twelve_hour_ages(getattr(test, name)))
+        return test
+
+    @functools.wraps(test)
+    def run(*args, **kwargs):
+        policy = {**gd.POLICY, "soft_idle_hours": 12.0, "stale_marker_max_hours": 12.0}
+        with mock.patch.multiple(gd, **TWELVE_HOUR_AGES), mock.patch.object(gd, "POLICY", policy):
+            return test(*args, **kwargs)
+    return run
+
+
 # Every test runs on an unreserved host unless it says otherwise (HostReservationTest): an empty reservation list, so a
 # test's host never reads the real ~/.local/share/glaeda/fleet-reservations.json, or fails closed without one.
 _NO_RESERVATIONS = tempfile.NamedTemporaryFile("w", suffix="-fleet-reservations.json", delete=False)
@@ -1778,6 +1807,7 @@ class GlaedaDiskTest(unittest.TestCase):
                 mock.patch.object(gd.subprocess, "run", lambda argv, **_: subprocess.CompletedProcess(argv, 113)):
             self.assertTrue(gd.owner_retired(one))
 
+    @twelve_hour_ages
     def test_a_retired_workers_cache_entries_idle_a_week_are_mirrors(self) -> None:
         """cmux14, 2026-10-25: at the 30 GiB floor with 0.0G reclaimable, while its unloaded hq workers'
         cmux-workspaces (idle 190 h), cmux-tui-target (289 h) and swiftpm (310 h) read git-checkout or unchecked."""
@@ -2340,6 +2370,7 @@ class GlaedaDiskTest(unittest.TestCase):
         # cmux-scheme/<runner> stays dedupe_roots(cmux-scheme)'s, so no root is walked twice
         self.assertNotIn("cmux-scheme/runner-a/SourcePackages", got)
 
+    @twelve_hour_ages
     def test_fleet_ci_hot_tier(self) -> None:
         ci = self.root / "ci"
         (ci / "seeds").mkdir(parents=True)
@@ -2519,6 +2550,7 @@ class GlaedaDiskTest(unittest.TestCase):
         self.assertTrue(gd.canonical_root_held(tmp / "cmux-ci-next" / "derived-data-x"))
         self.assertFalse(gd.remove_canonical_admission(tmp / "cmux-ci-next" / "derived-data-x"))
 
+    @twelve_hour_ages
     def test_canonical_admission_gives_way_under_the_runner_floor_only_while_no_job_holds_its_root(self) -> None:
         """cmux14, 2026-10-25: at the 30 GiB floor with 9.1 and 8.7 GiB of admission DerivedData idle 9 and 21 h
         ("recent" under the 24 h window) on two roots no job held, and 0.0G reclaimable."""
@@ -2609,6 +2641,7 @@ class GlaedaDiskTest(unittest.TestCase):
         self.assertTrue(one.exists())
         self.assertEqual(sorted(p.name for p in tmp.iterdir()), ["cmux-ci"], "nothing renamed aside is left behind")
 
+    @twelve_hour_ages
     def test_a_per_runner_root_gives_its_admission_build_up_while_its_runner_has_no_job(self) -> None:
         """cmux18, 2026-11-16: /private/tmp/cmux-ci-cmux18-glaeda (a per-runner root canonical-build-root.sh names
         after RUNNER_NAME) held 9.3G of derived-data-compile-admission beside a 1.2G src/ checkout, idle 10.3 h.
@@ -3051,17 +3084,23 @@ class GlaedaDiskTest(unittest.TestCase):
         sock = socket.socket(socket.AF_UNIX)
         self.addCleanup(sock.close)
         sock.bind(str(d / "default"))
+        sock.listen(1)
         # a long-lived server's socket is as old as its directory; only an old enough item pays for the socket walk
         for p in (d / "default", d):
             os.utime(p, (time.time() - 48 * 3600,) * 2)
         v = self.verdicts()
         self.assertEqual(v["tmux-1000"], "in-use")
         self.assertEqual(v["plain"], "reclaimable")
+        self.assertTrue(gd.holds_socket(d))
         forced = [gd.Item("xcode-derived-data", str(d), 1, 48, "reclaimable")]
         receipt = self.receipt()
         gd.apply(forced, {self.fam.id: self.fam}, receipt, None, 24)
         self.assertTrue(d.exists())
         self.assertIn("changed:in-use", receipt.read_text())
+        sock.close()  # its owner exited and left the file: a stopped Tart VM's control.sock (cmux11s, 40 GiB)
+        self.assertFalse(gd.socket_live(str(d / "default")))
+        self.assertFalse(gd.holds_socket(d))
+        self.assertEqual(self.verdicts()["tmux-1000"], "reclaimable")
 
     def _age(self, root: Path, hours: float = 48) -> None:
         t = time.time() - hours * 3600
@@ -3770,6 +3809,7 @@ class GlaedaDiskTest(unittest.TestCase):
             got = {Path(i.path).name: i.verdict for i in gd.survey([fam], 24, 0)}
         self.assertEqual(got, {"Build": "reclaimable", "cmux-next-build.log": "reclaimable"})
 
+    @twelve_hour_ages
     def test_under_the_runner_floor_idle_runners_whole_slots_go_least_recently_used_after_their_output(self) -> None:
         """cmux14, 2026-10-25: 115 GiB of cmux-next-ci, most of it the slots' inputs, at 10.8 GiB free under a
         30 GiB floor. Under the floor hold an idle enrolled runner's whole slot may go, after every generated
@@ -3870,6 +3910,7 @@ class GlaedaDiskTest(unittest.TestCase):
         for key in ("mini-glaeda", "daily"):
             self.assertIn(st[key], removed, key)
 
+    @twelve_hour_ages
     def test_a_slots_bytes_count_once_with_its_children(self) -> None:
         home, fam, st = self._cmux_next_cap_tree()
         worker = f"{home}/actions-runner-glaeda-2/bin/Runner.Worker spawnclient 1 2\n"  # runner 2 has a job
@@ -5172,7 +5213,8 @@ class GlaedaDiskTest(unittest.TestCase):
             budget = gd.PRESSURE_MEASURE_BUDGET_S
             self.assertGreaterEqual(kw["deadline"], start + budget)
             self.assertAlmostEqual(kw["judge_deadline"] - kw["deadline"], budget, delta=0.01)
-            self.assertIsNone(apply.call_args[0][5], "no deadline, no busy hold: the sweep's deletions never halt")
+            self.assertIs(apply.call_args[0][5], gd.host_saturated,
+                          "no deadline, no busy hold: only a saturated CPU halts the sweep's deletions")
             self.assertFalse(rows[-1]["run_deadline_reached"])
             # the caller's deadline 5 min away: walks get a third of the 240 s before its margin, verdicts two thirds
             stamp.unlink()
@@ -5970,7 +6012,7 @@ class GlaedaDiskTest(unittest.TestCase):
         for fam in fams:  # at least DEFAULT_AGE_HOURS idle, however tight the disk (the pressure window is shorter)
             self.assertEqual(fam.min_idle_hours, gd.DEFAULT_AGE_HOURS)
             self.assertIsNone(fam.max_idle_hours)
-            self.assertEqual(gd.idle_window(fam, 6.0), gd.DEFAULT_AGE_HOURS)
+            self.assertEqual(gd.idle_window(fam, 0.5), gd.DEFAULT_AGE_HOURS)
         # a job's scratch wider than cmux_active's bounded search is not "busy" forever: age decides
         big = home / "actions-runner-glaeda-ios-internal/_work/_temp/archive-scratch"
         big.mkdir()
@@ -5979,6 +6021,7 @@ class GlaedaDiskTest(unittest.TestCase):
         self.assertTrue(gd.cmux_active(big), "the bounded search alone would call it busy")
         self.assertFalse(gd.job_busy(fams[0], big))
 
+    @twelve_hour_ages
     def test_stale_runner_checkouts_go_above_the_floor_and_without_one(self) -> None:
         """Old runner work dirs go by age: a checkout no job used for DEFAULT_AGE_HOURS goes whatever the free space,
         unless git would lose something (a commit on no remote-tracking ref) or holds a lock; younger ones stay."""
@@ -6034,6 +6077,7 @@ class GlaedaDiskTest(unittest.TestCase):
             with config.open("a") as f:
                 f.write(f'[remote "origin"]\n\turl = https://github.com/manaflow-ai/{co.name}.git\n')
 
+    @twelve_hour_ages
     def test_a_bloated_runner_checkout_goes_once_quiet_at_any_free_space(self) -> None:
         """2026-10-27: one runner per mini held a 6.8 GiB full-history checkout with 22k remote refs while its
         siblings held about 0.55 GiB. Far above the floor, it goes once its runner is quiet; its siblings stay."""
@@ -6071,6 +6115,7 @@ class GlaedaDiskTest(unittest.TestCase):
         with mock.patch.object(gd, "RUNNER_CHECKOUT_BLOAT_RATIO", float("inf")):  # a reserved host keeps legacy ages
             self.assertEqual(gd.bloated_runner_checkouts(cos), {})
 
+    @twelve_hour_ages
     def test_a_bloated_checkout_keeps_a_commit_only_it_has(self) -> None:
         names = {"actions-runner-glaeda": 2, "actions-runner-glaeda-2": 2, "actions-runner-glaeda-11": 2}
         home, cos = self._idle_checkouts(names)
@@ -6306,6 +6351,7 @@ class GlaedaDiskTest(unittest.TestCase):
         (line,) = map(json.loads, (self.root / "runs.jsonl").read_text().splitlines())
         self.assertEqual(line["mode"], "own-runner-checkout")
 
+    @twelve_hour_ages
     def test_past_the_target_under_the_floor_a_bloated_checkout_keeps_a_commit_only_it_has(self) -> None:
         """Under the floor the last resort takes quiet checkouts without the git veto only until the target; a
         bloated one past it goes only when git loses nothing."""
@@ -6511,6 +6557,7 @@ class GlaedaDiskTest(unittest.TestCase):
             self.skipTest("this filesystem refuses names that are not UTF-8")
         self.assertEqual(gd.runner_checkout_git_veto(co), "git could not say whether a commit is only here")
 
+    @twelve_hour_ages
     def test_a_job_that_starts_during_the_git_veto_keeps_its_checkout(self) -> None:
         names = {"actions-runner-glaeda": 2, "actions-runner-glaeda-2": 2, "actions-runner-glaeda-11": 2}
         home, cos = self._idle_checkouts(names)
@@ -6577,22 +6624,59 @@ class GlaedaDiskTest(unittest.TestCase):
         finally:
             locked.chmod(0o755)
 
-    def test_every_disposable_age_is_twelve_hours(self) -> None:
-        """Leo, 2026-10-26: "When have we ever had something useful greater than 12 hours?" Only the newest warm
-        compile cache per builder (the per-host cmux-next root) is exempt, by role."""
-        self.assertEqual(gd.DEFAULT_AGE_HOURS, 12.0)
+    def test_every_disposable_age_is_one_hour(self) -> None:
+        """Leo, 2026-11-18: "6 hours may be too hard of a thing to hit. these days, it should be more like 1." Only
+        the newest warm compile cache per builder (the per-host cmux-next root) is exempt by role, and the nightly
+        builders' warm inputs (cmux-nightly-next, the cmux-cua source clone) keep NIGHTLY_WARM_IDLE_HOURS."""
+        self.assertEqual(gd.DEFAULT_AGE_HOURS, 1.0)
+        self.assertEqual(gd.NIGHTLY_WARM_IDLE_HOURS, 12.0)
         for name in ("KEPT_BUILD_IDLE_HOURS", "IDLE_SWEEP_HOURS", "IDLE_SEED_HOURS", "PARKED_NO_LOG_IDLE_HOURS",
                      "CMUX_NEXT_CI_MIN_IDLE_HOURS", "CANONICAL_ADMISSION_IDLE_HOURS", "CHECKOUT_BUILD_IDLE_HOURS",
                      "TMP_TEST_RESIDUE_IDLE_HOURS", "RUNNER_STALE_CHECKOUT_HOURS"):
             with self.subTest(name):
-                self.assertEqual(getattr(gd, name), 12.0)
-        self.assertEqual(gd.RUNTIME_IDLE_DAYS * 24, 12.0)
+                self.assertEqual(getattr(gd, name), 1.0)
+        self.assertEqual(gd.RUNTIME_IDLE_DAYS * 24, 1.0)
         for key in ("soft_idle_hours", "stale_marker_max_hours"):
-            self.assertEqual(gd.POLICY_DEFAULTS[key], 12.0, key)
+            self.assertEqual(gd.POLICY_DEFAULTS[key], 1.0, key)
         self.assertEqual(gd.POLICY_DEFAULTS["cmux_next_ci_host_idle_hours"], float("inf"))
         for fam in [*gd.default_families(), *gd.runner_cache_families()]:
             with self.subTest(fam.id):
-                self.assertLessEqual(fam.min_idle_hours, 12.0)
+                self.assertLessEqual(fam.min_idle_hours, gd.NIGHTLY_WARM_IDLE_HOURS)
+        fam = gd.nightly_next_family(Path("/nonexistent/cmux-nightly-next"))
+        self.assertEqual((fam.min_idle_hours, fam.max_idle_hours), (12.0, 12.0))
+
+    def test_cua_source_clone_keeps_the_nightly_window_and_its_build_tree_does_not(self) -> None:
+        """The nightly's Computer Use step clones cmux-cua from GitHub when src-<sha> is gone; run 44232805509 failed
+        on that fetch timing out on cmux15. The source clone keeps 12 h; its build tree (build-src-*) goes at 1 h."""
+        fam = gd.Family("cua-cache", Path("/x/cmux-cua"), True, "rebuilds", min_idle_hours=gd.DEFAULT_AGE_HOURS)
+        src, build = Path("/x/cmux-cua/src-e0f7"), Path("/x/cmux-cua/build-src-e0f7-46b7")
+        self.assertTrue(gd.cua_source_clone(fam, src))
+        self.assertFalse(gd.cua_source_clone(fam, build))
+        self.assertEqual(gd.item_window(fam, src, gd.DEFAULT_AGE_HOURS, frozenset()), 12.0)
+        self.assertEqual(gd.item_window(fam, build, gd.DEFAULT_AGE_HOURS, frozenset()), 1.0)
+
+    def test_registry_images_go_at_any_age_under_pressure_only(self) -> None:
+        fam = gd.Family(gd.TART_IMAGES, Path("/x/OCIs"), True, "pull again", min_idle_hours=gd.TART_IDLE_HOURS)
+        image = Path("/x/OCIs/ghcr.io/cirruslabs/macos-tahoe-base")
+        with mock.patch.object(gd, "ACTIVITY_MODE", "pressure"):
+            self.assertEqual(gd.item_window(fam, image, gd.DEFAULT_AGE_HOURS, frozenset()), 0.0)
+        with mock.patch.object(gd, "ACTIVITY_MODE", "sweep"):
+            self.assertEqual(gd.item_window(fam, image, gd.DEFAULT_AGE_HOURS, frozenset()), gd.TART_IDLE_HOURS)
+
+    def test_host_saturated_reads_the_one_minute_load_per_core(self) -> None:
+        with mock.patch.object(gd.os, "cpu_count", return_value=14):
+            with mock.patch.object(gd.os, "getloadavg", return_value=(9.4, 14.1, 19.5)):
+                self.assertEqual(gd.host_saturated(), "")
+            with mock.patch.object(gd.os, "getloadavg", return_value=(14.0, 14.1, 19.5)):
+                self.assertIn("saturated", gd.host_saturated())
+            with mock.patch.object(gd.os, "getloadavg", side_effect=OSError):
+                self.assertEqual(gd.host_saturated(), "")
+
+    def test_saturation_never_holds_below_the_emergency_floor(self) -> None:
+        with mock.patch.object(gd, "emergency_devs", return_value=frozenset({1})):
+            self.assertIsNone(gd.saturation_halt({}, "10%"))
+        with mock.patch.object(gd, "emergency_devs", return_value=frozenset()):
+            self.assertIs(gd.saturation_halt({}, "10%"), gd.host_saturated)
 
     def test_idle_runner_checkouts_go_between_the_floor_and_the_gates_resume_mark(self) -> None:
         # the gate holds until floor + 2 GiB; at 31 GiB it still holds, so the last resort still acts
@@ -6602,6 +6686,7 @@ class GlaedaDiskTest(unittest.TestCase):
             self.assertGreater(gd.evict_idle_runner_checkouts(self.receipt(), 30.0, home), 0)
         self.assertTrue(removed)
 
+    @twelve_hour_ages
     def test_idle_runner_checkouts_go_least_recently_used_first_until_the_target(self) -> None:
         home, cos = self._idle_checkouts({"actions-runner-glaeda": 3, "actions-runner-glaeda-2": 9,
                                           "actions-runner-glaeda-3": 6})
@@ -7745,6 +7830,7 @@ class GlaedaDiskTest(unittest.TestCase):
             repack.assert_called_once()
         self.assertEqual(order[-2:], ["release", "gc"])  # a long gc never holds the eviction lock
 
+    @twelve_hour_ages
     def test_idle_sweep_windows_follow_reuse(self) -> None:
         ci = self.root / "ci"
         (ci / "seeds").mkdir(parents=True)
@@ -8068,6 +8154,7 @@ class GlaedaDiskTest(unittest.TestCase):
             # a report's --refresh still re-measures every size
             self.assertEqual(walked(["--refresh", "--top", "0", "--min-mib", "0"]), sorted(everything))
 
+    @twelve_hour_ages
     def test_simulator_runtimes_go_only_when_nothing_uses_them(self) -> None:
         now = time.time()
         old = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now - 30 * 86400))
@@ -8140,6 +8227,7 @@ class SimDeviceTest(unittest.TestCase):
         return {i.reasons[0].split(" (")[0]: (i.verdict, i.reasons[1:])
                 for i in gd.sim_device_items(SIM_REPLAY, cmds, opened, SIM_NOW, leases)}
 
+    @twelve_hour_ages
     def test_the_cmux11s_replay(self) -> None:
         v = self.verdicts()
         self.assertEqual(v["kit-kit-composer-files"][0], "reclaimable", "shutdown, 12 days since its last boot")
@@ -8203,6 +8291,7 @@ class SimDeviceTest(unittest.TestCase):
         finally:
             root.chmod(0o755)
 
+    @twelve_hour_ages
     def test_erase_judges_again_and_erases_only_what_is_still_idle(self) -> None:
         """The first reading finds two idle devices; by the second, a job booted one. Only the other is erased, with
         `simctl erase` (never delete), largest first, and both get a receipt line."""
@@ -8330,6 +8419,7 @@ class SimDeviceTest(unittest.TestCase):
         finally:
             os.close(mine)
 
+    @twelve_hour_ages
     def test_an_unreadable_size_after_the_erase_counts_zero(self) -> None:
         readings = iter([SIM_REPLAY, SIM_REPLAY, None])
         with mock.patch.object(gd, "DARWIN", True), mock.patch.object(gd.shutil, "which", return_value="/usr/bin/xcrun"), \
@@ -8345,6 +8435,7 @@ class SimDeviceTest(unittest.TestCase):
         self.assertEqual((rec["outcome"], rec["bytes"]), ("reclaimed", 0))
         self.assertIn("could not be read", rec["reasons"][-1])
 
+    @twelve_hour_ages
     def test_a_reserved_host_keeps_its_devices(self) -> None:
         self.assertEqual(gd.LEGACY_AGES["SIM_DEVICE_IDLE_HOURS"], float("inf"))
         self.assertEqual(gd.SIM_DEVICE_IDLE_HOURS, 12.0)
@@ -9016,8 +9107,8 @@ class SparkleAppcastTest(unittest.TestCase):
             os.utime(folder, (stamp, stamp))
         return path
 
-    def test_extracted_apps_go_after_six_hours_even_with_deep_generated_bundles(self) -> None:
-        old, recent = self.extract("old", 7), self.extract("recent", 5)
+    def test_extracted_apps_go_after_an_hour_even_with_deep_generated_bundles(self) -> None:
+        old, recent = self.extract("old", 2), self.extract("recent", 0.5)
         with mock.patch.object(gd, "process_evidence", return_value=([], "")):
             items = gd.survey([self.fam], 24, 0)
             by_path = {i.path: i for i in items}
@@ -9091,6 +9182,7 @@ class LinuxLayoutTest(unittest.TestCase):
         # scratch clones and leaked files are judged on any filesystem, not only a tmpfs
         self.assertTrue(tmp.files and tmp.git_disposable)
 
+    @twelve_hour_ages
     def test_cmux_job_units_go_and_unpushed_checkouts_go_to_a_bundle(self) -> None:
         job = self.home / ".cache/cmux-job"
         # as on cmux13s: SwiftPM clones inside DerivedData, and each slot's clone one level below cmux-base
@@ -9153,6 +9245,7 @@ class LinuxLayoutTest(unittest.TestCase):
             gd.process_evidence = saved
         self.assertEqual(again[str(left)], ("interrupted-deletions", "reclaimable"))
 
+    @twelve_hour_ages
     def test_idle_cmux_job_mirrors_go_after_12h_bundled_unless_a_job_holds_them(self) -> None:
         """2026-10-11: 107 GiB of reload-cloud trees idle since Sep 28-Oct 2 on eight minis, all kept as
         "git-checkout (checkout below the top level)", so glaeda-disk reported 0.0 G reclaimable."""
@@ -12084,13 +12177,13 @@ class NightlyNextFallbackTest(unittest.TestCase):
         policy = {**gd.POLICY, "nightly_next_dedicated_label": gd.NIGHTLY_NEXT_DEDICATED_LABEL}
         with mock.patch.object(gd, "POLICY", policy):
             fam = {f.id: f for f in gd.runner_cache_families()}[gd.NIGHTLY_NEXT_FAMILY]
-        self.assertEqual(gd.idle_window(fam, 1.0), gd.RUNNER_CACHE_IDLE_HOURS)
+        self.assertEqual(gd.idle_window(fam, 1.0), gd.NIGHTLY_WARM_IDLE_HOURS)
         self.assertEqual(sorted(p.name for p in gd.candidates(fam)),
                          ["cmux14-glaeda", "cmux9s-mac-mini-glaeda-2", "cmux9s-mac-mini-glaeda-5"])
 
     def test_pool_tree_goes_after_its_own_idle_window(self) -> None:
         fam = gd.nightly_next_family(self.root)
-        window = gd.DEFAULT_AGE_HOURS
+        window = gd.NIGHTLY_WARM_IDLE_HOURS  # the nightly's warm trees keep 12 h under the 1 h default
         with mock.patch.object(gd, "DEFAULT_AGE_HOURS", 24.0):  # keep_legacy_ages on a reserved host
             self.assertEqual(gd.idle_window(gd.nightly_next_family(self.root), 1.0), 24.0)
         self.assertEqual(gd.idle_window(fam, gd.DEFAULT_AGE_HOURS), window)
@@ -12141,6 +12234,7 @@ class ActivityClockTest(unittest.TestCase):
         self.assertTrue(self.due("pressure", 30, self.starts(1, 2)))
         self.assertFalse(self.due("sweep", 30, self.starts(1, 2)))
 
+    @twelve_hour_ages
     def test_many_jobs_past_it_make_it_a_candidate(self) -> None:
         busy = self.starts(*[i / 100 for i in range(100)])  # 100 jobs in the last hour
         self.assertTrue(self.due("pressure", 1.5, busy))    # past pressure_jobs (80)
@@ -12512,13 +12606,13 @@ class HostReservationTest(unittest.TestCase):
         self.assertEqual(seen, {"low": "30", "target": f"{30 + margin:g}", "reserved": True})
         self.assertEqual(run["reserved"], why)
         self.assertEqual(run["age_hours"], 24.0, "the reserved run used the legacy ages")
-        self.assertEqual(gd.DEFAULT_AGE_HOURS, 12.0, "and put the 12 h ages back for whatever runs next")
+        self.assertEqual(gd.DEFAULT_AGE_HOURS, 1.0, "and put the 1 h ages back for whatever runs next")
         # the runner-account caches were 168 h before the 12 h default, and stay 168 h on a reserved host
         home = self.root / "runner-home"
         for rel in ("Library/Developer/Xcode/DerivedData", ".cache/cmux-job"):
             (home / rel).mkdir(parents=True)
         with mock.patch.object(gd, "DARWIN", True), mock.patch.object(gd, "HOME", home):
-            self.assertEqual({f.min_idle_hours for f in gd.runner_cache_families()}, {12.0})
+            self.assertEqual({f.min_idle_hours for f in gd.runner_cache_families()}, {gd.DEFAULT_AGE_HOURS})
             with mock.patch.multiple(gd, **{k: getattr(gd, k) for k in gd.LEGACY_AGES}), \
                     mock.patch.dict(gd.POLICY, dict(gd.POLICY)):
                 gd.keep_legacy_ages()
@@ -12531,10 +12625,10 @@ class HostReservationTest(unittest.TestCase):
             code, out, seen, run = self.run_disk("--runner-caches", reserved=why, floor=30.0, free_gib=50)
         self.assertIn("nothing deleted", out)
         self.assertEqual(seen, {})
-        # an unreserved host keeps its policy and the 12 h ages
+        # an unreserved host keeps its policy and the 1 h ages
         code, out, seen, run = self.run_disk("--pressure", reserved="", floor=30.0, free_gib=50)
         self.assertEqual(seen, {"low": gd.POLICY["low"], "target": gd.POLICY["target"]})
-        self.assertEqual(run["age_hours"], 12.0)
+        self.assertEqual(run["age_hours"], 1.0)
 
 class FleetCasNodeCapTest(unittest.TestCase):
     """glaeda-disk's pressure passes (before every job and under the floor) run the fleet-cas node-store cap."""

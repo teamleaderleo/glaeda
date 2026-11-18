@@ -278,7 +278,10 @@ import fcntl
 import glob
 import gzip
 import hashlib
+import importlib.util
 from http.client import HTTPException  # the http() helper below shadows the `http` package
+import http.client as http_client
+import ipaddress
 import json
 import math
 import os
@@ -1558,6 +1561,190 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
 OPENER = urllib.request.build_opener(NoRedirect)
 
 
+# api.github.com edges. On 2026-11-17 from 22:40Z one host resolved api.github.com only to one edge (from 8.8.8.8
+# and the host's VPN resolver alike); from there it dropped most SYNs and answered the rest with a 403 that carried no
+# rate-limit headers, while GitHub's other edges answered every call. With SOCKET_TIMEOUT's 20 s per connect every read
+# failed (URLError) and a tick's reads queued behind each other. Now each connect and TLS handshake to api.github.com
+# gets EDGE_CONNECT_TIMEOUT, and a dead edge (a timeout, a failed connect, or the bare 403 edge_refused names) gets one
+# retry on another edge address, from a second resolver (DNS over HTTPS) since the system one named only the dead edge.
+# No address is written here, and TLS still checks api.github.com's certificate, so a wrong address can only fail. The
+# gh-quota shim gives every gh call the same (leo-workspace tools/gh_edge.py); this daemon talks to GitHub itself.
+EDGE_HOSTS = {"api.github.com"}
+EDGE_CONNECT_TIMEOUT = 3.0
+EDGE_BAD_TTL = 600.0
+EDGE_DOH_TTL = 300.0
+EDGE_DOH_DEFAULT = "https://dns.google/resolve,https://cloudflare-dns.com/dns-query"
+
+
+def edge_refused(status: int, headers: dict) -> bool:
+    """A 403 the edge made, not GitHub's API: no X-RateLimit-* header and no Retry-After. GitHub's own 403s (a rate
+    limit, a permission) carry the rate-limit headers and reach the caller as before."""
+    if status != 403:
+        return False
+    return not any(k.lower().startswith("x-ratelimit-") or k.lower() == "retry-after" for k in headers)
+
+
+class EdgeFailed(OSError):
+    def __init__(self, why: str):
+        super().__init__(why)
+        self.why = why
+
+
+class Edges:
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.reset()
+
+    def reset(self) -> None:
+        self.bad: dict[str, float] = {}
+        self.doh_cache: tuple[float, list[str]] = (float("-inf"), [])
+        self.local = threading.local()
+
+    def is_bad(self, ip: str) -> bool:
+        return self.bad.get(ip, 0) > time.time()
+
+    def mark_bad(self, ip: str) -> None:
+        with self.lock:
+            now = time.time()
+            self.bad = {k: v for k, v in self.bad.items() if v > now}
+            self.bad[ip] = now + EDGE_BAD_TTL
+
+    def last_ip(self) -> str | None:
+        return getattr(self.local, "ip", None)
+
+    @staticmethod
+    def resolve(host: str) -> list[str]:
+        override = os.environ.get("GLAEDA_EDGE_TEST_RESOLVE", "")
+        if override.startswith(host + "="):
+            return [ip for ip in override.split("=", 1)[1].split(",") if ip]
+        try:
+            infos = socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)
+        except OSError:
+            return []
+        return list(dict.fromkeys(info[4][0] for info in infos))
+
+    def doh(self, host: str) -> list[str]:
+        """A second resolver's addresses for HOST: DNS over HTTPS (JSON), each provider in GLAEDA_EDGE_DOH in turn."""
+        at, ips = self.doh_cache
+        if at + EDGE_DOH_TTL > time.time():
+            return ips
+        plain = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        out: list[str] = []
+        for url in (os.environ.get("GLAEDA_EDGE_DOH") or EDGE_DOH_DEFAULT).split(","):
+            url = url.strip()
+            for rtype in ("A", "AAAA"):
+                if not url:
+                    break
+                query = url + ("&" if "?" in url else "?") + urllib.parse.urlencode({"name": host, "type": rtype})
+                try:
+                    with plain.open(urllib.request.Request(query, headers={"Accept": "application/dns-json"}),
+                                    timeout=2) as answer:
+                        records = json.loads(answer.read(65536)).get("Answer") or []
+                except (OSError, HTTPException, ValueError, AttributeError):
+                    continue
+                for record in records:
+                    data = record.get("data") if isinstance(record, dict) else None
+                    if isinstance(record, dict) and record.get("type") in (1, 28) and isinstance(data, str):
+                        try:
+                            ipaddress.ip_address(data)
+                        except ValueError:
+                            continue
+                        if data not in out:
+                            out.append(data)
+            if out:
+                break
+        self.doh_cache = (time.time(), out)
+        return out
+
+    @staticmethod
+    def attempt(ip: str, port: int, host: str, context: ssl.SSLContext, timeout: float):
+        try:
+            raw = socket.create_connection((ip, port), timeout=EDGE_CONNECT_TIMEOUT)
+        except TimeoutError:
+            raise EdgeFailed("connect-timeout") from None
+        except OSError:
+            raise EdgeFailed("connect-failed") from None
+        try:
+            tls = context.wrap_socket(raw, server_hostname=host)
+        except TimeoutError:
+            raw.close()
+            raise EdgeFailed("tls-timeout") from None
+        except ssl.SSLCertVerificationError:
+            raw.close()
+            raise  # this host's trust store, not the edge: no verdict, the request fails as it did before
+        except OSError:
+            raw.close()
+            raise EdgeFailed("tls-failed") from None
+        tls.settimeout(timeout)
+        return tls
+
+    def candidates(self, host: str, tried: set[str]) -> list[str]:
+        """Edges to retry on: the system resolver's other addresses, then the second resolver's, none marked bad."""
+        out: list[str] = []
+        for ip in self.resolve(host) + self.doh(host):
+            if ip not in tried and ip not in out and not self.is_bad(ip):
+                out.append(ip)
+        return out
+
+    def connect(self, host: str, context: ssl.SSLContext, timeout: float):
+        """A TLS connection to an edge for HOST: the first try, then at most one retry on another edge."""
+        port = int(os.environ.get("GLAEDA_EDGE_TEST_PORT") or 443)
+        primary = self.resolve(host)
+        first = next((ip for ip in primary if not self.is_bad(ip)), None)
+        if first is None:
+            alts = self.candidates(host, set(primary))
+            if alts:  # every resolved edge failed lately: another one, the retry spent on it
+                return self.second(host, port, context, timeout, None, "all-marked-bad", alts[0])
+            # None known: the resolver's own first answer once more (a blip must not lock reads out for EDGE_BAD_TTL).
+            first = primary[0] if primary else None
+            if first is None:
+                raise EdgeFailed(f"{host} resolves to nothing")
+        try:
+            sock = self.attempt(first, port, host, context, timeout)
+            self.local.ip = first
+            return sock
+        except EdgeFailed as error:
+            self.mark_bad(first)
+            alts = self.candidates(host, {first})
+            if not alts:
+                log({"event": "edge-retry", "host": host, "from": first, "to": None, "why": error.why, "ok": False})
+                raise
+            return self.second(host, port, context, timeout, first, error.why, alts[0])
+
+    def second(self, host: str, port: int, context: ssl.SSLContext, timeout: float, frm: str | None, why: str,
+               to: str):
+        try:
+            sock = self.attempt(to, port, host, context, timeout)
+        except EdgeFailed as error:
+            self.mark_bad(to)
+            log({"event": "edge-retry", "host": host, "from": frm, "to": to, "why": why, "ok": False, "why2": error.why})
+            raise
+        if frm is not None:  # a known-bad first edge skipped is no retry
+            log({"event": "edge-retry", "host": host, "from": frm, "to": to, "why": why, "ok": True})
+        self.local.ip = to
+        return sock
+
+
+EDGE = Edges()
+
+
+class EdgeHTTPSConnection(http_client.HTTPSConnection):
+
+    def connect(self) -> None:
+        if self._tunnel_host or self.host not in EDGE_HOSTS:  # through a proxy, or another host: as before
+            super().connect()
+            return
+        self.sock = EDGE.connect(self.host, self._context, self.timeout)
+
+
+class EdgeHTTPSHandler(urllib.request.HTTPSHandler):
+    def https_open(self, req):  # noqa: ANN001
+        return self.do_open(EdgeHTTPSConnection, req)
+
+
+GITHUB_OPENER = urllib.request.build_opener(NoRedirect, EdgeHTTPSHandler)
+
+
 def error_site(error: BaseException) -> str:
     """Where `error` was raised: file, line and function only, never values, so a recurring error
     can be found without reproducing it."""
@@ -1616,13 +1803,31 @@ def http(method: str, url: str, headers: dict[str, str], body: bytes | None = No
     if not url.startswith(API + "/"):
         raise WatchError("refusing a request outside api.github.com")
     request = urllib.request.Request(url, data=body, method=method, headers=headers)
+
+    def once() -> tuple[int, dict, bytes]:
+        try:
+            with GITHUB_OPENER.open(request, timeout=SOCKET_TIMEOUT) as response:
+                return response.status, {k.lower(): v for k, v in response.headers.items()}, response.read(MAX_BODY)
+        except urllib.error.HTTPError as error:  # 304, refused redirects and every 4xx/5xx land here
+            return error.code, {k.lower(): v for k, v in (error.headers or {}).items()}, error.read(MAX_BODY)
+
     try:
         with hard_deadline(HTTP_DEADLINE):
-            try:
-                with OPENER.open(request, timeout=SOCKET_TIMEOUT) as response:
-                    return response.status, {k.lower(): v for k, v in response.headers.items()}, response.read(MAX_BODY)
-            except urllib.error.HTTPError as error:  # 304, refused redirects and every 4xx/5xx land here
-                return error.code, {k.lower(): v for k, v in (error.headers or {}).items()}, error.read(MAX_BODY)
+            EDGE.local.ip = None
+            answer = once()
+            edge = EDGE.last_ip()
+            if edge is not None and edge_refused(answer[0], answer[1]):
+                # The edge's own 403 (no rate-limit headers): GitHub never saw the request. Once more, elsewhere.
+                # With no other edge known, the edge's 403 is the answer, as before.
+                EDGE.mark_bad(edge)
+                if EDGE.candidates(urllib.parse.urlsplit(url).hostname or "", {edge}):
+                    EDGE.local.ip = None
+                    try:
+                        answer = once()
+                    finally:
+                        log({"event": "edge-retry", "host": urllib.parse.urlsplit(url).hostname, "from": edge,
+                             "to": EDGE.last_ip(), "why": "edge-403", "ok": EDGE.last_ip() is not None})
+            return answer
     except (OSError, HTTPException, ValueError) as error:  # DeadlineTimeout is a TimeoutError, an OSError
         raise WatchError(f"request failed: {type(error).__name__}") from None
 
@@ -2446,6 +2651,8 @@ def parse_pr(node: dict) -> dict:
             check = {"name": c.get("name"), "workflow": workflow, "status": c.get("status"),
                      "conclusion": c.get("conclusion"), "url": c.get("detailsUrl"), "id": c.get("id"),
                      "runId": run_id or None, "startedAt": c.get("startedAt"), "completedAt": c.get("completedAt")}
+            if c.get("status") != "COMPLETED" and c.get("databaseId"):
+                check["jobId"] = c["databaseId"]  # an unfinished run's Actions job, for straggler_cut's jobs read
             # databaseId first: a queued rerun has no startedAt yet but is still the newer attempt
             order = (c.get("databaseId") or 0, c.get("startedAt") or "")
         check["required"] = bool(c.get("isRequired"))
@@ -3387,22 +3594,8 @@ class Daemon:
                                "shed": {"waiter": shed[0], "counted": shed[1]} if shed else None})
 
     def write_notice(self, kind: str, level: str, text: str, data: dict) -> None:
-        """One notice line (cmuxterm-hq tools/fleet-reconcilers/notices.py's schema) in NOTICES_DIR/glaeda-gh.jsonl."""
-        line = {"ts": dt.datetime.fromtimestamp(self.now, dt.timezone.utc).isoformat(timespec="seconds"),
-                "source": "glaeda-gh", "level": "warn" if level in ("warn", "fire") else "info", "kind": kind,
-                "key": policy_host(), "text": text, "data": {**data, "severity": level}}
-        try:
-            NOTICES_DIR.mkdir(parents=True, exist_ok=True)
-            path = NOTICES_DIR / "glaeda-gh.jsonl"
-            with open(path, "a") as out:
-                out.write(json.dumps(line, sort_keys=True) + "\n")
-            lines = path.read_text().splitlines()
-            if len(lines) > 2500:  # notices.py's KEEP, with its slack
-                tmp = path.with_suffix(".jsonl.tmp")
-                tmp.write_text("\n".join(lines[-2000:]) + "\n")
-                tmp.replace(path)
-        except OSError as error:
-            log({"event": "notice-failed", "error": describe(error)})
+        """One notice line (notice_line) at the daemon's time."""
+        notice_line(self.now, kind, level, text, data)
 
     def send_alarm(self, name: str, level: str, text: str, data: dict) -> None:
         """The notice line, then tell-coordinator in the background: a slow or missing inbox never holds a tick."""
@@ -4633,9 +4826,33 @@ class Daemon:
         if kind == "run":
             self.confirming = {e["key"]: (rest_run((e["cache"] or {}).get("data")), (e["cache"] or {}).get("fetchedAt"))
                                for e in out if self.wait_confirms(e)}
+        if kind == "pr":
+            out = self.snapshot_first(mine, out)
         for e in out:
             self.attempted[e["key"]] = self.now
         return out
+
+    def snapshot_first(self, mine: list[dict], out: list[dict]) -> list[dict]:
+        """OUT with the PRs a land judgment waits on for its rollup snapshot (snapshot_waits) first, due or not, ahead
+        of the deferred backlog: the judgment runs merge_hold live, on its own reads, if the snapshot is not there
+        within LAND_SNAPSHOT_WAIT. One read per waiting head at most every NUDGE_MIN; the rest keep their order."""
+        waiting = self.snapshot_waits()
+        if not waiting:
+            return out
+        front = [e for e in mine if e["key"] in waiting and e.get("cache") is not None
+                 and not terminal("pr", (e["cache"] or {}).get("data"))
+                 and self.now - self.attempted.get(e["key"], float("-inf")) >= NUDGE_MIN]
+        keys = {e["key"] for e in front}
+        return front + [e for e in out if e["key"] not in keys]
+
+    def snapshot_waits(self) -> frozenset[str]:
+        """The PRs whose land judgment waits for the daemon's read of its head's rollup (LandQueue.snapshot_wait)."""
+        q = self.land_queue
+        if q is None:
+            return frozenset()
+        with q.lock:
+            return frozenset(k for k, e in q.entries.items()
+                             if e.get("state") not in LAND_DONE and isinstance(e.get("snapshotWait"), dict))
 
     def wait_confirms(self, e: dict) -> bool:
         """A finished run a wait is blocked on that GitHub has not shown since the wait (run_needs_confirm): the cache
@@ -5288,6 +5505,21 @@ class Daemon:
         except Exception:  # noqa: BLE001  a progress line never stops a wait from being ruled on
             pass
 
+    def straggler_reads(self, repo: str, paths: list[str]) -> dict[str, Any]:
+        """straggler_pass's reads from a wait the daemon serves: through this daemon's own GET, charged and within the
+        tick's deadline, when it has a login; an upstream host's through the broker within STRAGGLER_TICK_BUDGET.
+        straggler_pass asks at most one list and STRAGGLER_JOB_READS jobs a head, the list once per STRAGGLER_FRESH."""
+        if self.upstream() is not None:
+            return straggler_get(repo, paths, STRAGGLER_TICK_BUDGET)
+        out: dict[str, Any] = {}
+        for path in paths:
+            try:
+                state, doc, _ = self.get(f"/repos/{repo}/{path}", None)
+            except OutOfTime:
+                state, doc = "error", "out of time this tick"
+            out[path] = doc if state == "fresh" else str(doc)
+        return out
+
     def serve_wait(self, d: Path, rid: str, req: Any, now: float, touch: dict[str, bool]) -> bool | None:
         """One request: None while pending, else whether its blocker was woken. Raises on a bad one."""
         if (isinstance(req, dict) and req.get("stale") is not None and waiter_alive(req.get("pid"))
@@ -5306,7 +5538,7 @@ class Daemon:
                 req["touched"] = now
                 self.note_wait_state(d, rid, req)
             try:
-                done, err = wait_step(req, now), ""
+                done, err = wait_step(req, now, self.straggler_reads), ""
             except WatchError as error:
                 done, err = wait_refusal(req, "refused", str(error), "glaeda-gh wait --help")
             except Exception as error:  # noqa: BLE001  said to the waiter, not raised into the tick
@@ -7360,6 +7592,13 @@ LAND_QUOTA_BACKOFF = 300.0
 LAND_QUOTA_BACKOFF_MAX = 3600.0
 LAND_QUOTA_MAX_S = 3700.0  # gh_latch MAX_S: a reset never lies more than GitHub's hour ahead
 LAND_QUOTA_REFUSAL = re.compile(r"quota: not judged|\[quota: not judged")
+# A step's own output (update-branch, rerun, merge) that GitHub refused for the login's quota, in the words the broker
+# and the gh-quota shim use, as well as merge_hold's. Read on a step's output only, never on merge_hold's reason (which
+# can quote a red job's log). Before, only merge_hold's words parked a step: cmux#42244's update-branch was refused
+# "GitHub rate limit (HTTP 403) on the broker host's gh login" twice, each judgment after it counted, and the entry
+# stopped "3 identical refusals in a row" at 19:17Z on a quota that reset minutes later.
+LAND_STEP_QUOTA = re.compile(LAND_QUOTA_REFUSAL.pattern + r"|GitHub(?:'s)? (?:REST |GraphQL )?rate limit"
+                             r"|rate limit is spent|secondary rate limit|content-creation cooldown", re.I)
 # The time a refusal names, in gh_latch.reset_from's order: merge_hold's "no attempt before", then "retry after" /
 # "until" (the latch SENTENCE). HH:MMZ with no seconds is the end of that minute, as gh_latch reads it.
 LAND_QUOTA_SAID = (re.compile(r"\bno attempt before\s+(\d{2}):(\d{2})(?::(\d{2}))?Z"),
@@ -7704,13 +7943,15 @@ def land_latch(now: float) -> tuple[str, float] | None:
     reset is never more than MAX_S (3700 s) ahead. Writers are atomic and never shorten a held mark; a mark whose source
     is GitHub's own (x-ratelimit-reset, retry-after, said) is never voided early, so a reader trusts until as written.
     A lane-share mark (share: true, the broker's refusal of a VM's share) does not hold a land: lands pass the share
-    (gh_latch.held(share=False)). The land queue only reads these marks: merge_hold, the broker and the daemon write
-    them."""
+    (gh_latch.held(share=False)). A REST mark with login_only: true (a broker client's refusal that named the shared
+    login) holds no judgement either: merge_hold's REST reads of a repo the broker's read pool covers go on its read
+    Apps, and merge_hold's own stop (quota_held) judges that per repo. The land queue only reads these marks:
+    merge_hold, the broker and the daemon write them."""
     state = Path(os.environ.get("GH_QUOTA_STATE") or Path.home() / ".local/state/gh-quota")
     best: tuple[str, float] | None = None
     for pool in ("rest", "graphql"):
         doc = read_json(state / f"{pool}-exhausted.json")
-        if not isinstance(doc, dict) or doc.get("share") is True:
+        if not isinstance(doc, dict) or doc.get("share") is True or (pool == "rest" and doc.get("login_only") is True):
             continue
         until = doc.get("until")
         if not isinstance(until, (int, float)) or isinstance(until, bool) or not now < until:
@@ -8380,13 +8621,22 @@ class LandQueue:
         if self.reads_upstream():
             return None, "upstream"
         c = self.cache_of(key) or {}
-        if not isinstance(c.get("fp"), str):
-            return None, "no fingerprint"  # not a whole GraphQL read (REST, partial): no snapshot is kept for it
+        fp = c.get("fp")
+        if not isinstance(fp, str) and c.get("via") != "graphql":
+            return None, "no fingerprint"  # not a GraphQL full read (REST, a probe of one): no snapshot is kept for it
         data = c.get("data") or {}
         snap = self.snapshot_of(key)
+        # A whole read is matched by its fingerprint. One the daemon kept partial (a fold of its own failed: a page
+        # past the per-minute ceiling, a suite's last real attempt) has none, but its rollup capture may still be
+        # whole: it is matched by being that same read (the snapshot's readAt is the cache's fullAt).
+        if not isinstance(snap, dict):
+            same = False
+        elif isinstance(fp, str):
+            same = snap.get("fp") == fp
+        else:
+            same = snap.get("fp") is None and snap.get("readAt") is not None and snap.get("readAt") == c.get("fullAt")
         if not isinstance(snap, dict) or str(data.get("headRefOid") or "").lower() != sha \
-                or str(snap.get("head") or "").lower() != sha or snap.get("fp") != c.get("fp") \
-                or not isinstance(c.get("fp"), str):
+                or str(snap.get("head") or "").lower() != sha or not same:
             return None, "wait"
         at = c.get("dataAt")
         if not isinstance(at, (int, float)) or isinstance(at, bool) or self.now - at > LAND_SNAPSHOT_MAX_AGE:
@@ -8547,6 +8797,9 @@ class LandQueue:
             e = self.entries[key]
             self.check(e)
             counts = (e.pop("judging", None) or {}).get("counts", True)
+            # The step after the last judgment was refused for quota (step_refused, do_merge): this judgment repeats
+            # it and is not a new refusal of the PR's.
+            counts = counts and not e.pop("stepQuotaParked", False)
         answer = self.explain(e, sha)
         answer["pinned"] = bool(sha)  # judged at the cache's head; unpinned, merge_hold read the head itself
         head = str(answer.get("head") or sha or "").lower()
@@ -8819,8 +9072,10 @@ class LandQueue:
         """KIND, the step merge_hold named, failed at HEAD (LAND_STEP_BACKOFF's comment). Under the lock. Waits or
         stops the entry; answers "update_branch" when the refusal names that step and the caller should take it now."""
         out = f"{got.stderr or ''}\n{got.stdout or ''}"
-        if LAND_QUOTA_REFUSAL.search(out):
+        if LAND_STEP_QUOTA.search(out):
             self.park_quota(e, out)  # the login's state, not the PR's: parked, never counted toward a stop
+            e["stepQuotaParked"] = True  # so the judgment after the reset does not count toward a stop either
+            self.save(e)
             return None
         cls = land_step_class(out)
         sig = f"{kind}|{head}|{cls}"
@@ -8872,10 +9127,12 @@ class LandQueue:
         got = self.call([gh, "pr", "merge", number, "-R", repo, "--squash", "--match-head-commit", sha],
                         LAND_MERGE_DEADLINE, e)
         said = f"{got.stderr or ''} {got.stdout or ''}"
-        if got.returncode != 0 and LAND_QUOTA_REFUSAL.search(said):
+        if got.returncode != 0 and LAND_STEP_QUOTA.search(said):
             with self.lock:  # the shim's merge_hold judged it on a spent quota: parked, and no `pr view` after it
                 self.finish(e, got)
                 self.park_quota(e, said)
+                e["stepQuotaParked"] = True
+                self.save(e)
             return
         view = self.call([gh, "pr", "view", number, "-R", repo, "--json", "state,mergeCommit,headRefOid"],
                          LAND_GH_DEADLINE)
@@ -10185,11 +10442,385 @@ def pending_on_every_page(data: dict) -> int:
     return max(0, pending - superseded)
 
 
+# A job nothing requires, queued and never given a runner, held every `wait --until done` to its deadline: 2026-11-17,
+# six cmux heads (cmux#45147 at 8941c2cc among them) waited their whole 90 minutes on "publish artifacts", "upload cmux-tui
+# dSYMs" (the overflow runner's 8-vCPU label) and "web / react-apps-base-check" (its 16-vCPU label), queued
+# 40+ minutes with runner_id 0 and no steps, while every check that decides had ended an hour before. Such a job
+# (straggler_cut) no longer holds a done wait past STRAGGLER_AFTER: the wait ends on the finished checks' verdict and
+# names the stragglers. A required one never ends it; it is named at the same bound and the wait goes on.
+# STRAGGLER_AFTER is past the slow tail of jobs that did start on that label that day: 15 jobs of ci.yml run
+# 44152015850 waited median 21.4 min, p90 25.0, max 25.05 (the stragglers: 40 and 52 min and counting).
+STRAGGLER_AFTER = 30 * 60
+STRAGGLER_REREAD = 300  # a head's queued check-run list is read again at most this often while it waits
+STRAGGLER_FRESH = 90  # ... and once more before a wait ends on it, when it is older than this
+STRAGGLER_JOB_READS = 6  # jobs read for labels per pass (each job once: its labels and attempt never change)
+STRAGGLER_READ_BUDGET = 30  # seconds one pass's reads may take in a waiter's own process
+STRAGGLER_TICK_BUDGET = 10  # ... and in the daemon's tick, through the broker on an upstream host
+STRAGGLER_DIR = "stragglers"  # under BASE: one file per PR, the head's queued list and its jobs
+STRAGGLER_NOTICE_EVERY = 3600  # one stragglers notice per runner label this often, whatever the heads
+STRAGGLER_SEEN = "stragglers-seen.json"  # under BASE: {label: {key: [count, at]}} and when each label was noticed
+
+
+def check_required(c: dict, data: dict) -> bool:
+    """Whether GitHub, the base or this repository's expected contexts require the check C of DATA."""
+    return (bool(c.get("required")) or c.get("name") in set(data.get("requiredNames") or [])
+            or c.get("name") in expected_contexts(pr_repo(data)))
+
+
+def queued_unfinished(data: dict) -> list[dict] | None:
+    """Every unfinished context of DATA's head, each a queued check run ({name, workflow, startedAt, jobId}), or None:
+    something else is unfinished (in progress, waiting, a pending status, a held red), a required check has not
+    reported, or the head is past one page and its queued runs have not been read (queuedRuns, straggler_pass). On a
+    truncated rollup the counts over every page decide what is unfinished, so it costs no read to say None."""
+    checks = data.get("checks") or []
+    if data.get("checksPageError") or data.get("requiredMissing") or data.get("requiredUnread"):
+        return None
+    if classify(data)["held"]:
+        return None
+    shown = [c for c in checks if c.get("status") != "COMPLETED"]
+    if any(c.get("status") != "QUEUED" or not c.get("jobId") for c in shown):
+        return None
+    if not data.get("checksTruncated"):
+        return shown
+    counts = data.get("checkCounts")
+    if not isinstance(counts, dict):
+        return None
+    runs, statuses = counts.get("runs") or {}, counts.get("statuses") or {}
+    if any(n for state, n in statuses.items() if state in COUNT_PENDING):
+        return None
+    if any(n for state, n in runs.items() if state in COUNT_PENDING and state != "QUEUED"):
+        return None
+    superseded = sum(1 for c in data.get("superseded") or []
+                     if not c.get("conclusion") and not c.get("lastRealAttempt"))
+    total = max(0, int(runs.get("QUEUED") or 0) - superseded)
+    read = data.get("queuedRuns")
+    if not isinstance(read, list):
+        return None
+    merged = {c["jobId"]: c for c in shown}
+    for c in read:
+        if isinstance(c, dict) and c.get("jobId"):
+            merged.setdefault(c["jobId"], c)
+    if data.get("queuedRunsCount") != counts_print(data) or len(merged) < total:
+        # read when any count was another (a queued run that started and finished while another was queued leaves
+        # QUEUED the same, never the rest), or short of it: read again first (straggler_pass)
+        return None
+    return list(merged.values())
+
+
+def num(value: Any) -> float:
+    """VALUE as seconds since the epoch, 0 for anything that is not a number (a store written by hand or cut short)."""
+    return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else 0.0
+
+
+def counts_print(data: dict) -> str:
+    """DATA's rollup counts over every page and its context total, as one string: a queued list read at another print
+    may name other runs, whatever its QUEUED count."""
+    counts = data.get("checkCounts") if isinstance(data.get("checkCounts"), dict) else {}
+    return json.dumps([counts.get("runs") or {}, counts.get("statuses") or {}, data.get("checksTotal")],
+                      sort_keys=True, default=str)
+
+
+def straggler_of(c: dict, data: dict, now: float, bound: float = STRAGGLER_AFTER) -> dict | None:
+    """The queued check run C as a straggler {name, workflow, label, minutes, required}, or None while it may still
+    start: queued less than BOUND, or its job is unread, has a runner, is not queued, or is a rerun (attempt past 1,
+    which has no startedAt in the rollup either)."""
+    started = iso_epoch(c.get("startedAt"))
+    if started is None or now - started < bound:
+        return None
+    job = (data.get("queuedJobs") or {}).get(str(c.get("jobId")))
+    if not isinstance(job, dict) or job.get("status") != "queued" or job.get("runner") or job.get("attempt") != 1:
+        return None
+    # a job's workflow_name is its run's name: a run-name such as "v1;sha=...;ref=..." names no workflow
+    named = str(job.get("workflow") or "")
+    return {"name": c.get("name"), "workflow": c.get("workflow") or ("" if ";" in named else named),
+            "label": ",".join(job.get("labels") or []) or "?", "minutes": int((now - started) // 60),
+            "required": check_required(c, data), "jobId": c.get("jobId")}
+
+
+def straggler_cut(data: dict, now: float, bound: float = STRAGGLER_AFTER) -> dict | None:
+    """DATA without its stragglers, when every unfinished context is one that nothing requires (straggler_of): the
+    head as if they were not there, for check_verdict to judge as before (its "stragglers" name them). None when any
+    unfinished context is not such a straggler, or the head has none."""
+    if data.get("stragglers") is not None:
+        return None  # already cut
+    if data.get("checksTruncated") and now - float(data.get("queuedRunsAt") or 0) > STRAGGLER_REREAD + STRAGGLER_FRESH:
+        return None  # the queued list past page 1 is too old to end a wait on (a read that keeps failing)
+    queued = queued_unfinished(data)
+    if not queued:
+        return None
+    found = [straggler_of(c, data, now, bound) for c in queued]
+    if any(s is None or s["required"] for s in found):
+        return None
+    ids = {c.get("jobId") for c in queued}
+    cut = {**data, "stragglers": found,
+           "checks": [c for c in data.get("checks") or [] if c.get("jobId") not in ids]}
+    if data.get("checksTruncated") and isinstance(data.get("checkCounts"), dict):
+        counts = data["checkCounts"]
+        runs = {state: n for state, n in (counts.get("runs") or {}).items() if state != "QUEUED"}
+        cut["checkCounts"] = {**counts, "runs": runs}
+        if data.get("checkState") not in {"FAILURE", "ERROR"}:
+            rows = [*runs.items(), *(counts.get("statuses") or {}).items()]
+            cut["checkState"] = "FAILURE" if any(n for state, n in rows if state in COUNT_BAD) else "SUCCESS"
+    return cut
+
+
+def straggler_lines(data: dict, now: float, bound: float = STRAGGLER_AFTER) -> list[str]:
+    """What a done wait says of its stragglers: the ones it ended without, and a required one it goes on waiting for."""
+    lines = []
+    def said(items: list[dict]) -> str:
+        return "; ".join(f"{s['name']} ({s['workflow'] or '?'}, {s['label']}, {s['minutes']} min)" for s in items)
+    ended = [s for s in data.get("stragglers") or [] if not s.get("required")]
+    if ended:
+        lines.append(f"  stragglers, not required, queued with no runner past {int(bound // 60)} min (the wait ended "
+                     f"without them; merge_hold still counts them running, checks_queued_no_runner): {said(ended)}. "
+                     + STRAGGLER_STEP.format(label="its label"))
+    queued = queued_unfinished(data) if data.get("stragglers") is None else None
+    required = [s for s in (straggler_of(c, data, now, bound) for c in queued or []) if s and s["required"]]
+    if required:
+        lines.append(f"  required, queued with no runner past {int(bound // 60)} min (the wait goes on): "
+                     f"{said(required)}. " + STRAGGLER_STEP.format(label="its label"))
+    return lines
+
+
+def straggler_path(key: str) -> Path:
+    return BASE / STRAGGLER_DIR / f"{file_name(key)}.json"
+
+
+def straggler_wants(data: dict, now: float, bound: float = STRAGGLER_AFTER) -> tuple[bool, list[int]]:
+    """(read the queued list, the job ids to read) that would let straggler_cut rule on DATA: nothing when something
+    other than queued check runs is unfinished. Costs no request: the rollup's counts say so first."""
+    if data.get("state") != "OPEN":
+        return False, []
+    probe = {**data, "queuedRuns": data.get("queuedRuns") or [], "queuedRunsCount": data.get("queuedRunsCount", -1)}
+    trunc = bool(data.get("checksTruncated"))
+    if trunc:
+        counts = (data.get("checkCounts") or {}).get("runs") or {}
+        if not counts.get("QUEUED"):
+            return False, []
+        probe["queuedRunsCount"] = counts_print(data)
+        probe["queuedRuns"] = [{"jobId": -i - 1} for i in range(int(counts["QUEUED"]))]  # the shape alone
+        if queued_unfinished(probe) is None:
+            return False, []
+    queued = queued_unfinished(data)
+    if queued is None:
+        return trunc, []
+    jobs = data.get("queuedJobs") or {}
+    old = [c for c in queued if (iso_epoch(c.get("startedAt")) or now) <= now - bound]
+    return False, [int(c["jobId"]) for c in old if str(c["jobId"]) not in jobs][:STRAGGLER_JOB_READS]
+
+
+def straggler_get(repo: str, paths: list[str], budget: float = STRAGGLER_READ_BUDGET) -> dict[str, Any]:
+    """{path: doc or an error string} for each GET of /repos/REPO/PATH, read by this process the way direct_read
+    reads: this host's login, or the broker's GET on an upstream host, within BUDGET seconds. Never a whole
+    check-runs list: the callers ask for queued runs only, and single jobs. The daemon reads through its own queue
+    instead (Daemon.straggler_reads)."""
+    broker = direct_command() if upstream_command() is not None else None
+    if upstream_command() is not None and broker is None:
+        return {p: DIRECT_UPSTREAM for p in paths}
+    if broker is not None:
+        daemon = Daemon(transport=broker_transport(broker, lambda: daemon.tick_deadline), token=lambda: "",
+                        controller=None, upstream=None)
+        daemon.reads_protection = False
+        daemon.etags = False
+    else:
+        daemon = Daemon(controller=None, upstream=None)
+    modes = (read_json(BASE / "daemon.json") or {}).get("modes")
+    if daemon.mode("rest") == "stop" or (isinstance(modes, dict) and modes.get("rest") == "stop"):
+        return {p: DIRECT_QUOTA for p in paths}
+    daemon.charge_rest = lambda minute, n: None  # type: ignore[method-assign]  (as direct_read: a session's read)
+    daemon.now = time.time()
+    daemon.tick_deadline = time.monotonic() + budget
+    out: dict[str, Any] = {}
+    with daemon.calling(*caller_of(f"pr:{repo}#0"), "tool:glaeda-gh wait (queued jobs)"):
+        for path in paths:
+            try:
+                state, doc, _ = daemon.get(f"/repos/{repo}/{path}", None)
+            except OutOfTime:
+                state, doc = "error", "out of time"
+            out[path] = doc if state == "fresh" else str(doc)
+    return out
+
+
+def straggler_pass(key: str, data: dict, now: float, get: Callable[[str, list[str]], dict] | None = None,
+                   bound: float = STRAGGLER_AFTER) -> dict:
+    """DATA with what is known of its queued check runs (queuedRuns, queuedRunsCount, queuedJobs), reading only what
+    straggler_wants names and only as often as STRAGGLER_REREAD allows: one `commits/SHA/check-runs?status=queued`
+    (sized by the queued runs, not by the head's checks) and one `actions/jobs/ID` per queued run past BOUND."""
+    head = str(data.get("headRefOid") or "")
+    repo = pr_repo(data)
+    if not head or not repo or data.get("state") != "OPEN":
+        return data
+    path = straggler_path(key)
+    store = read_json(path)
+    if not isinstance(store, dict) or store.get("head") != head:
+        store = {"head": head, "jobs": {}}
+    jobs = store.get("jobs") if isinstance(store.get("jobs"), dict) else {}
+    merged = {**data, "queuedJobs": jobs}
+    if isinstance(store.get("runs"), list):
+        merged.update(queuedRuns=store["runs"], queuedRunsCount=store.get("count", -1), queuedRunsAt=store.get("at"))
+    want_list, want_jobs = straggler_wants(merged, now, bound)
+    count = counts_print(data)
+    age = now - num(store.get("at"))
+    if want_list:
+        # unread, read at other counts (a run started, finished or was queued since), or old
+        want_list = store.get("count") != count or age >= STRAGGLER_REREAD
+    elif data.get("checksTruncated") and isinstance(store.get("runs"), list):
+        # about to end on it: the list must be this fresh, so a run queued since is never missed
+        # (judged as if it were fresh: straggler_cut refuses an old list, which only this read can renew)
+        want_list = age >= STRAGGLER_FRESH and straggler_cut({**merged, "queuedRunsAt": now}, now, bound) is not None
+    # a list read is tried at most once per STRAGGLER_FRESH, answered or not (a read that keeps failing is no loop)
+    want_list = want_list and now - num(store.get("listTried")) >= STRAGGLER_FRESH
+    if want_list:
+        store["listTried"] = now
+    tried = store.get("tried") if isinstance(store.get("tried"), dict) else {}
+    want_jobs = [j for j in want_jobs if now - num(tried.get(str(j))) >= STRAGGLER_REREAD]
+    noticed = now - num(store.get("seenAt")) < STRAGGLER_REREAD
+    if not want_list and not want_jobs and noticed:
+        return merged
+    paths = ([f"commits/{head}/check-runs?status=queued&filter=latest&per_page=100"] if want_list else [])
+    answers = (get or straggler_get)(repo, paths + [f"actions/jobs/{j}" for j in want_jobs]) \
+        if paths or want_jobs else {}
+    if want_list:
+        doc = answers.get(paths[0])
+        if isinstance(doc, dict) and isinstance(doc.get("check_runs"), list):
+            store.update(at=now, count=count, runs=[
+                {"name": r.get("name"), "workflow": None, "status": "QUEUED", "startedAt": r.get("started_at"),
+                 "jobId": r.get("id")} for r in doc["check_runs"]
+                if isinstance(r, dict) and r.get("status") == "queued" and r.get("id")])
+    for j in want_jobs:
+        doc = answers.get(f"actions/jobs/{j}")
+        tried[str(j)] = now
+        if isinstance(doc, dict) and doc.get("id"):
+            jobs[str(j)] = {"status": doc.get("status"), "runner": doc.get("runner_name") or doc.get("runner_id") or "",
+                            "attempt": doc.get("run_attempt"), "workflow": doc.get("workflow_name"),
+                            "labels": [str(x) for x in doc.get("labels") or []]}
+    merged = {**data, "queuedJobs": jobs}
+    if isinstance(store.get("runs"), list):
+        merged.update(queuedRuns=store["runs"], queuedRunsCount=store.get("count", -1), queuedRunsAt=store.get("at"))
+    straggler_notice(key, merged, now, bound)  # the detector: every STRAGGLER_REREAD a head waits, and on each read
+    store.update(jobs=jobs, tried=tried, seenAt=now)
+    with contextlib.suppress(OSError, ValueError, TypeError):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        write_json(path, store)
+    return merged
+
+
+def notice_line(now: float, kind: str, level: str, text: str, data: dict) -> None:
+    """One notice line (cmuxterm-hq tools/fleet-reconcilers/notices.py's schema) in NOTICES_DIR/glaeda-gh.jsonl."""
+    line = {"ts": dt.datetime.fromtimestamp(now, dt.timezone.utc).isoformat(timespec="seconds"),
+            "source": "glaeda-gh", "level": "warn" if level in ("warn", "fire") else "info", "kind": kind,
+            "key": policy_host(), "text": text, "data": {**data, "severity": level}}
+    try:
+        NOTICES_DIR.mkdir(parents=True, exist_ok=True)
+        path = NOTICES_DIR / "glaeda-gh.jsonl"
+        with open(path, "a") as out:
+            out.write(json.dumps(line, sort_keys=True) + "\n")
+        lines = path.read_text().splitlines()
+        if len(lines) > 2500:  # notices.py's KEEP, with its slack
+            tmp = path.with_suffix(".jsonl.tmp")
+            tmp.write_text("\n".join(lines[-2000:]) + "\n")
+            tmp.replace(path)
+    except OSError as error:
+        log({"event": "notice-failed", "error": describe(error)})
+
+
+def straggler_notice(key: str, data: dict, now: float, bound: float = STRAGGLER_AFTER) -> None:
+    """The stragglers detector: KEY's queued runs with no runner past BOUND (required or not), kept per runner label
+    over every watched head for STRAGGLER_NOTICE_EVERY, and one "stragglers" notice per label that often, naming the
+    label, how many jobs and on how many heads (not one per head)."""
+    found = [s for s in (straggler_of(c, data, now, bound) for c in queued_any(data)) if s]
+    BASE.mkdir(parents=True, exist_ok=True)
+    # every waiter and the daemon update the one file: held while read, changed and written, so no count is lost
+    # and no label is noticed twice (a lock not had in time skips this pass; the next one counts it)
+    with bounded_lock(BASE / f"{STRAGGLER_SEEN}.lock") as held:
+        if not held:
+            return
+        doc = read_json(BASE / STRAGGLER_SEEN)
+        doc = doc if isinstance(doc, dict) else {}
+        seen = doc.get("seen") if isinstance(doc.get("seen"), dict) else {}
+        noticed = {k: num(v) for k, v in (doc.get("noticed") if isinstance(doc.get("noticed"), dict) else {}).items()}
+        for label in list(seen):
+            heads = seen[label] if isinstance(seen[label], dict) else {}
+            heads.pop(key, None)
+            seen[label] = {k: [int(num(v[0])), num(v[1])] for k, v in heads.items()
+                           if isinstance(v, list) and len(v) == 2 and now - num(v[1]) < STRAGGLER_NOTICE_EVERY}
+        for s in found:
+            heads = seen.setdefault(s["label"], {})
+            heads[key] = [(heads.get(key) or [0])[0] + 1, now]
+        for label, heads in seen.items():
+            if not heads or now - noticed.get(label, 0.0) < STRAGGLER_NOTICE_EVERY:
+                continue
+            jobs = sum(v[0] for v in heads.values())
+            text = (f"WARN glaeda-gh on {policy_host()}: {jobs} job(s) on runner label {label} queued with no runner "
+                    f"past {int(bound // 60)} min on {len(heads)} watched head(s), e.g. {key_name(next(iter(heads)))}. "
+                    f"{STRAGGLER_STEP.format(label=label)}")
+            notice_line(now, "stragglers", "warn", text, {"label": label, "jobs": jobs, "heads": sorted(heads)})
+            coord_alert_spawn(text)
+            noticed[label] = now
+        seen = {label: heads for label, heads in seen.items() if heads}
+        with contextlib.suppress(OSError, ValueError, TypeError):
+            write_json(BASE / STRAGGLER_SEEN, {"seen": seen, "noticed": {
+                k: v for k, v in noticed.items() if now - v < 2 * STRAGGLER_NOTICE_EVERY}})
+
+
+# What ends such a job, said in the wait's line and the notice. 2026-11-17 (job 134322701364): a job rerun is refused
+# while its run runs ("The workflow run containing this job is already running", HTTP 403), and runs-on is fixed when
+# the job is queued (vars.RUNNER_POOLS), so a flipped runner variable reaches only jobs queued after it. Only a runner
+# on that label, a cancel, or a new push ends it.
+STRAGGLER_STEP = ("Nothing starts it until runner label {label} has a runner (runner capacity's owner); a rerun is "
+                  "refused while its run runs, and a new push queues it under the runner variables then in force")
+COORD_ALERT = Path(os.environ.get("GLAEDA_GH_COORD_ALERT")
+                   or Path.home() / "Projects/leo-workspace/tools/coord_alert.py")
+
+
+def coord_alert_spawn(text: str) -> None:
+    """TEXT to the coordinator through leo-workspace's coord_alert (its routes: tell-coordinator, acpmux, then lane-gh
+    send on a lane VM), in a process of its own so its bounded routes never hold a tick. Logged, never raised."""
+    if not COORD_ALERT.is_file():
+        log({"event": "alert-unsent", "why": f"no {COORD_ALERT}", "text": text})
+        return
+    try:
+        subprocess.Popen([sys.executable, "-I", os.path.abspath(__file__), "coord-alert", text],
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         start_new_session=True)
+    except OSError as error:
+        log({"event": "alert-unsent", "why": describe(error), "text": text})
+
+
+def coord_alert_send(text: str) -> int:
+    """`glaeda-gh coord-alert TEXT`: coord_alert.send(TEXT, "glaeda-gh"), the route it took logged."""
+    try:
+        spec = importlib.util.spec_from_file_location("coord_alert", COORD_ALERT)
+        module = importlib.util.module_from_spec(spec)  # type: ignore[arg-type]
+        spec.loader.exec_module(module)  # type: ignore[union-attr]
+        via = module.send(text, "glaeda-gh", budget=180)
+    except Exception as error:  # noqa: BLE001  an alert's failure is logged, never raised
+        log({"event": "alert-unsent", "why": describe(error), "text": text})
+        return EXIT_FAIL
+    log({"event": "alert", "alarm": "stragglers", "via": via or None, "text": text})
+    return EXIT_OK if via else EXIT_FAIL
+
+
+def queued_any(data: dict) -> list[dict]:
+    """DATA's queued check runs, shown or read past page 1, whatever else is unfinished (the detector's view)."""
+    shown = [c for c in data.get("checks") or [] if c.get("status") == "QUEUED" and c.get("jobId")]
+    merged = {c["jobId"]: c for c in shown}
+    for c in data.get("queuedRuns") or []:
+        if isinstance(c, dict) and c.get("jobId"):
+            merged.setdefault(c["jobId"], c)
+    return list(merged.values())
+
+
 def check_verdict(data: dict, until: str = "green", now: float | None = None,
                   grace: float = RESCUE_GRACE, settle: float = SETTLE_GRACE) -> int | None:
     """The checks alone, whatever the PR's state or head: EXIT_OK, EXIT_FAIL, EXIT_NOTHING (nothing reported on the
-    head past its settle window), or None while pending."""
+    head past its settle window), or None while pending. --until done judges a head whose only unfinished checks are
+    stragglers nothing requires (straggler_cut) without them."""
     now = time.time() if now is None else now
+    if until == "done":
+        cut = straggler_cut(data, now)
+        if cut is not None:
+            return check_verdict(cut, until, now, grace, settle)
     checks = data.get("checks") or []
     if data.get("checksPageError"):
         return None  # a partial cached rollup is not evidence of a green head
@@ -10408,6 +11039,9 @@ def summary(key: str, entry: dict | None, until: str = "done", grace: float = RE
             lines.append(f"  required, not reported yet: {', '.join(data['requiredMissing'])}{why}")
         if data.get("requiredUnread"):
             lines.append(f"  required, not read yet (check pages held): {', '.join(data['requiredUnread'])}")
+        if until in ("done", "merged"):
+            cut = straggler_cut(data, now)
+            lines += straggler_lines(cut if cut is not None else data, now)
         # Required checks first, then real failures before cancelled ones: the capped list leads with what to fix.
         bad = sorted(groups["failed"], key=lambda c: (marked and not c.get("required"),
                                                       str(c.get("conclusion") or "").lower() == "cancelled"))
@@ -10984,7 +11618,7 @@ def run_unconfirmed(entry: dict | None, since: float, now: float) -> bool:
     return now - since < RUN_CONFIRM_MAX
 
 
-def wait_step(req: dict, now: float) -> tuple[int, str] | None:
+def wait_step(req: dict, now: float, get: Callable[[str, list[str]], dict] | None = None) -> tuple[int, str] | None:
     """One look at a `wait pr|run` (wait_request): (exit code, what it prints) once it is decided or out
     of time, else None. Rules only on data the daemon fetched after the wait began, never on an older
     cache. A short --sha that GitHub's head resolves is written back into REQ. Raises WatchError."""
@@ -11028,6 +11662,13 @@ def wait_step(req: dict, now: float) -> tuple[int, str] | None:
             # resolved: a later push now counts as pending, as for a full id
             req["sha"], req["exact"] = sha, exact = head, True
     settle = float(req.get("settle", SETTLE_GRACE))
+    if usable and kind == "pr" and until == "done" and data.get("state") == "OPEN":
+        try:
+            # the queued runs a done wait may end without (straggler_cut), read only once nothing else is unfinished
+            data = straggler_pass(key, data, now, get)
+            entry = {**entry, "data": data}
+        except Exception as error:  # noqa: BLE001  a straggler read never stops the wait
+            log({"event": "straggler-pass-failed", "key": key, "error": describe(error)})
     result = (verdict(kind, data, until, sha, (entry or {}).get("jobs"), time.time(), grace, f"{owner}/{repo}", settle)
               if usable else None)
     if result is not None:
@@ -16573,6 +17214,9 @@ def main(argv: list[str] | None = None) -> int:
             print(f"broker {BROKER_CONTRACT}")
             return EXIT_OK
         return cmd_gh(raw[1:])
+    if raw[:1] == ["coord-alert"] and len(raw) == 2:
+        # Not a command anyone types: straggler_notice's alert, in its own process (coord_alert_spawn).
+        return coord_alert_send(raw[1])
     if raw[:1] == ["wait-resume"] and len(raw) == 2:
         # Not a command anyone types: BLOCKER hands a `wait pr|run` back here (resume_wait).
         try:

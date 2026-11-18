@@ -4007,6 +4007,42 @@ class HookTest(unittest.TestCase):
         self.assertTrue(set(hook.GATEWAY_TOKENS) <= set(hook.CLASS_COST[hook.EXCLUSIVE_CLASS][1]))
         self.assertEqual(hook.CLASS_COST[hook.GATEWAY_CLASS], (0, (hook.GATEWAY_TOKEN_KIND,)))
 
+    def test_a_gateway_job_takes_no_host_lock(self) -> None:
+        """GATEWAY_NO_HOST_LOCK (cmuxterm-hq#13078; Leo, 2026-11-17: "also fix the measurement queue so this never
+        stalls again"). A gateway client only waits on the fleet, often for a step that needs this very mini, so
+        holding host.lock shared kept the fleet worker's lend drain waiting for a job that waited for it. Every
+        GATEWAY_JOBS job is admitted without host.lock: a fleet build can claim the mini while it waits, and one
+        handed to the runner while a build holds the mini still starts. Detector for cmuxterm-hq's handbook page
+        fleet-waiter-job-holds-its-mini.md."""
+        import fcntl
+        fleet = self.fleet()
+        for workflow, job in sorted(hook.GATEWAY_JOBS):
+            env = {"GITHUB_WORKFLOW_REF": f"manaflow-ai/cmux/.github/workflows/{workflow}@refs/heads/x"}
+            with self.subTest(workflow=workflow, job=job):
+                try:
+                    ok = self.job(job, "gw", 14, None, "--gateway-runner", env=env)
+                    self.assertEqual(ok.returncode, 0, ok.stdout + ok.stderr)
+                    self.assertIn(f"for {job} (gateway", ok.stdout)
+                    self.assertTrue(self.lock_free(), f"{workflow} {job} holds host.lock while it waits on the fleet")
+                finally:
+                    self.finish("gw")
+                build = os.open(fleet / "host.lock", os.O_RDWR)  # a fleet build has the mini
+                try:
+                    fcntl.flock(build, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    ok = self.job(job, "gw", 14, None, "--gateway-runner", env=env)
+                    self.assertEqual(ok.returncode, 0, ok.stdout + ok.stderr)
+                    self.assertNotIn("holds the host lock", ok.stdout)
+                finally:
+                    os.close(build)
+                    self.finish("gw")
+        # the control: any other job still holds host.lock shared for its whole run
+        try:
+            side = self.job("app-compile-fleet", "s0", 20, None, env=self.FAST_TIER)
+            self.assertEqual(side.returncode, 0, side.stdout + side.stderr)
+            self.assertTrue(self.shared_lock_blocks_exclusive(), "a side job no longer holds host.lock")
+        finally:
+            self.finish("s0")
+
     def test_job_log_records_started_refused_and_completed(self) -> None:
         self.fleet()
         log = self.dir / "Library/Logs/glaeda-cmux-jobs.jsonl"
@@ -8829,6 +8865,72 @@ class HostLoadCapTest(unittest.TestCase):
                          "only 2 of 14 capacity units on this mini are free; its next job needs 3",
                          "it still needs room for its own job")
 
+    def test_a_side_listener_never_takes_a_queue_head_it_cannot_start(self) -> None:
+        # HEAD_FIT, 2026-11-17: cmux#44505's generated files (job 134087426027) reached cmux18-glaeda-8, which
+        # listened at the side fit with 1 unit free; the job needed 8, waited 19 min for them in "Set up runner" and
+        # was cancelled by its 40-min timeout mid-compile. GitHub hands the oldest queued job first, so the listener
+        # must hold until the head's need fits.
+        side = ["glaeda-mini", "glaeda-side-std-xcode-26.6"]
+        real_need = hook.job_need
+
+        def need(klass, job, repo, home_repo=hook.DEFAULT_HOME_REPO, workflow="", needs=hook._LOAD):
+            return hook.Need(8) if (workflow, job) == ("cmux-next.yml", "generated-files") else \
+                real_need(klass, job, repo, home_repo, workflow, needs)
+        head = dict(self.job("queued", ago=3 * 3600 - 60, labels=["glaeda-side-std-xcode-26.6"]),
+                    name="cmux-next generated files")
+        newer = dict(self.job("queued", ago=60, labels=["glaeda-side-std-xcode-26.6"]),
+                     name="cmux app scheme compile (Debug)")
+        with mock.patch.object(hook, "job_need", side_effect=need):
+            side_fit = hook.side_fit_units(hook.RunnerScope(units=14))
+            self.assertLess(side_fit, 8, "the replay needs a side fit under generated-files' 8")
+            self.jobs = [self.job("in_progress", "cmux20-glaeda-1"), newer, head]
+            self.assertEqual(self.full(self.side_gate(13, side)),
+                             "only 1 of 14 capacity units on this mini are free; its next job needs 8",
+                             "1 free, the head needs 8: held, so the job stays queued in GitHub")
+            fits_side = 14 - side_fit
+            self.assertEqual(self.full(self.side_gate(fits_side, side)),
+                             f"only {side_fit} of 14 capacity units on this mini are free; its next job needs 8",
+                             "room for the side fit is not room for the head")
+            self.assertIsNone(self.full(self.side_gate(6, side)), "8 free: it listens")
+            self.jobs = [self.job("in_progress", "cmux20-glaeda-1"), newer]
+            self.assertIsNone(self.full(self.side_gate(fits_side, side)), "a smaller head keeps the side fit")
+            self.jobs = [dict(head, name="some job the hook does not know")]
+            self.assertIsNone(self.full(self.side_gate(fits_side, side)), "an unknown head keeps the side fit")
+            self.jobs = [head]
+            with mock.patch.object(hook, "load_cap_fetch", return_value=None):
+                self.assertIsNone(self.full(self.side_gate(fits_side, side)), "an unreadable feed keeps today's rule")
+        self.assertEqual(hook.head_fit_units(None, frozenset(side), time.time()), None)
+
+
+    def test_head_fit_reads_every_known_cmux_next_job_from_its_display_name(self) -> None:
+        # cmux#44472's "macOS fast tier" (run 44024082059, glaeda-side-std-xcode-26.6) was cancelled by its timeout
+        # while waiting for units: HEAD_FIT knew six names and not this one.
+        for name, key in (("macOS fast tier", ("cmux-next.yml", "fast-tier")),
+                          ("cmux-next fast tier", ("cmux-next.yml", "fast-tier")),
+                          ("cmux-next daemon tests", ("cmux-next.yml", "daemon-test")),
+                          ("cmux-next generated files", ("cmux-next.yml", "generated-files")),
+                          ("cmux-next Swift canary", ("cmux-next.yml", "swift-canary")),
+                          ("cmux-next Release compile (Xcode 26)", ("cmux-next.yml", "release-compile")),
+                          ("cmux app scheme compile (Debug)", ("cmux-next.yml", "cmux-scheme-compile"))):
+            self.assertEqual(hook.head_job_key(name), key, name)
+        self.assertIsNone(hook.head_job_key("some job the hook does not know"))
+        self.assertIsNone(hook.head_job_key(""))
+        side = frozenset(["glaeda-mini", "glaeda-side-std-xcode-26.6"])
+        now = time.time()
+        summary = {"at": now, "delivery": now, "jobs": [
+            {"labels": sorted(side), "status": "queued", "created": now - 600, "host": None, "urgent": False,
+             "name": "macOS fast tier"}]}
+        seen = []
+
+        def need(workflow, job):
+            seen.append((workflow, job))
+            return 8
+        self.assertEqual(hook.head_fit_units(summary, side, now, need), (8, "macOS fast tier"))
+        self.assertEqual(seen, [("cmux-next.yml", "fast-tier")])
+        stale = dict(summary, delivery=now - 10 * 3600)
+        self.assertIsNone(hook.head_fit_units(stale, side, now, need), "a stale feed keeps today's rule")
+        self.assertIsNone(hook.head_fit_units(dict(summary, jobs=[]), side, now, need), "an empty queue too")
+
 
 class StarvedReserveTest(unittest.TestCase):
     """cmux#45614 (STARVED_RESERVE): on 2026-11-17 cmux NEXT DEV's DMG build (glaeda-std-xcode-26.6, a compile: 5
@@ -8932,7 +9034,7 @@ class StarvedReserveTest(unittest.TestCase):
         free = 5 + self.need - 1
         self.assertEqual(hook.mini_full(capacity, 14, side, 5),
                          f"only {free} of 14 capacity units on this mini are free; its next job needs 5 and "
-                         f"{self.need} are {hook.STARVED_NOTE}")
+                         f"{self.need} {'is' if self.need == 1 else 'are'} {hook.STARVED_NOTE}")
         self.assertIn(hook.STARVED_NOTE, hook.mini_full(capacity, 14, hook.RunnerScope(14, 2, 2, gui=True), 5) or "")
         self.assertIsNone(hook.mini_full(capacity, 14, hook.RunnerScope(14, 2, 2, root=True)),
                           "a root runner takes the starved job: the hold is its room")
@@ -9679,6 +9781,33 @@ class GateTest(unittest.TestCase):
             self.assertTrue(hook.runner_job_running())
         with mock.patch.object(hook.subprocess, "run", side_effect=subprocess.TimeoutExpired("pgrep", 5)):
             self.assertTrue(hook.runner_job_running(), "a reading that cannot tell counts as busy")
+
+    def test_a_gateway_waiter_is_no_running_job_for_a_drain(self) -> None:
+        """GATEWAY_NO_HOST_LOCK: a drain's busy reading (host_taken) agrees with the worker's claimHost
+        (cmuxterm-hq gateway_waiter.go): a gateway runner's job whose tree is only a waiting fleet client does not
+        count; any other work in it, CPU over the mark, or a runner that is not a gateway runner does."""
+        base = ("53339 87196 0.6 /U/actions-runner-glaeda-4/bin/Runner.Worker spawnclient 156 159\n"
+                "54480 53339 0.0 /opt/homebrew/bin/bash -e /U/actions-runner-glaeda-4/_work/_temp/x.sh\n"
+                "54482 54480 0.0 /opt/homebrew/bin/python3 /U/.local/share/cmux-fleet-client/versions/v/ci-client.py run\n"
+                "54483 54480 0.0 tee -a /U/actions-runner-glaeda-4/_work/_temp/look.log\n")
+        gateway = lambda d: d == "/U/actions-runner-glaeda-4"  # noqa: E731
+        self.assertEqual(hook.working_runner_jobs(hook.parse_process_table(base), gateway), 0)
+        for extra in ("60000 54480 0.0 /usr/bin/git fetch\n", "60001 54482 40.0 /bin/sh -c true\n"):
+            self.assertEqual(hook.working_runner_jobs(hook.parse_process_table(base + extra), gateway), 1, extra)
+        self.assertEqual(hook.working_runner_jobs(hook.parse_process_table(base), lambda d: False), 1)
+        self.assertIsNone(hook.parse_process_table(base + "1 1 0,6 x\n"))
+        runner = self.tmp / "actions-runner-glaeda-4"
+        (runner / "glaeda-hooks").mkdir(parents=True)
+        self.assertFalse(hook.gateway_runner_dir(os.fspath(runner)))
+        (runner / hook.RUNNER_HOOK_SCRIPT).write_text("exec hook job-started --gateway-runner --instance 4\n")
+        self.assertTrue(hook.gateway_runner_dir(os.fspath(runner)))
+        table = base.replace("/U/actions-runner-glaeda-4", os.fspath(runner))
+        answers = [subprocess.CompletedProcess([], 0), subprocess.CompletedProcess([], 0, stdout=table)]
+        with mock.patch.object(hook.subprocess, "run", side_effect=answers):
+            self.assertFalse(hook.runner_job_running(), "a mini with only a gateway waiter reads as busy")
+        answers = [subprocess.CompletedProcess([], 0), subprocess.CompletedProcess([], 0, stdout=table + "60000 54480 0.0 /usr/bin/git fetch\n")]
+        with mock.patch.object(hook.subprocess, "run", side_effect=answers):
+            self.assertTrue(hook.runner_job_running())
 
     def test_a_capture_lease_drain_is_a_drain_waiter_and_says_so(self) -> None:
         # cmuxterm-hq's worker publishes an exclusive (capture) lease's waiter as "capture_lease_drain", not
