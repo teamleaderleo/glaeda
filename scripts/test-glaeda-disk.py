@@ -6759,6 +6759,11 @@ class GlaedaDiskTest(unittest.TestCase):
         self.assertEqual(gd.POLICY_DEFAULTS["cmux_next_ci_host_idle_hours"], float("inf"))
         for fam in [*gd.default_families(), *gd.runner_cache_families()]:
             with self.subTest(fam.id):
+                if fam.id in (gd.TART_VMS, gd.LIMA_VMS):
+                    # a stopped VM's window is Leo's own (2026-11-17, TART_VM_IDLE_HOURS); only hosts with the
+                    # store list the family, so this held only where ~/.tart/vms or ~/.lima was absent
+                    self.assertEqual(fam.min_idle_hours, gd.TART_VM_IDLE_HOURS)
+                    continue
                 self.assertLessEqual(fam.min_idle_hours, gd.NIGHTLY_WARM_IDLE_HOURS)
         fam = gd.nightly_next_family(Path("/nonexistent/cmux-nightly-next"))
         self.assertEqual((fam.min_idle_hours, fam.max_idle_hours), (12.0, 12.0))
