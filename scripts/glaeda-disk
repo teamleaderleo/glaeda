@@ -20,6 +20,8 @@
     glaeda-disk --dedupe --dedupe-builds
                                     additionally clone identical files in inactive cmux-next Products trees
     glaeda-disk --runner-caches     use only the enrolled runner-account cache allowlist
+    glaeda-disk --root-ledger       as root, daily: clone-aware accounting of the whole data volume, open-deleted
+                                    bytes, purgeable space and inodes, with deltas; report only (root_ledger_main)
 
 Parallel sessions each keep a full DerivedData, and its SourcePackages artifacts and module
 caches are byte-identical across them. --dedupe replaces each duplicate with a copy-on-write
@@ -10839,13 +10841,17 @@ def write_health_summary(fss: list[Fs], items: list[Item], accounting: list[dict
             blocked = sum(i.bytes for i in live if i.verdict != "reclaimable")
             unchecked = sum(i.bytes for i in live if i.verdict == "unchecked")
             accounting_gap = 0
+        # the root ledger's last pass (root_ledger_health): its gap alarm and staleness are this summary's findings
+        ledger, ledger_findings = root_ledger_health()
         payload = {"schema": "glaeda-disk/v1", "at": int(time.time()),
                    "reclaimable": reclaimable, "blocked": blocked, "unchecked": unchecked,
                    "accounting_gap": accounting_gap,
-                   "findings": list(EVICTION_STUCK),
+                   "findings": list(EVICTION_STUCK) + ledger_findings,
                    "accounting": [dict(x) for x in accounting],
                    "filesystems": [{"mount": x.mount, "free": x.free, "total": x.total,
                                     "under": x.under} for x in fss]}
+        if ledger is not None:
+            payload["root_ledger"] = ledger
         if receipt is not None:
             contention = read_eviction_contention(receipt)
             if contention is not None:
@@ -13830,11 +13836,515 @@ def _logged_main(args: list[str]) -> int:
             write_run_line(started, before)
 
 
+# ---------------------------------------------------------------- root ledger (--root-ledger)
+# "everything needs to be accounted for on all of them, or at least the deltas" (Leo, 2026-11-17). The passes above
+# run as the runner account, so a root-only directory, another process's open-deleted file, purgeable space and APFS
+# metadata were one unnamed gap (14-93 GiB per host), and du counts every APFS clone in full (one host: 2.3 TiB on a
+# 460 GiB disk). --root-ledger runs as root once a day (glaeda-runner-hygiene --root-ledger installs its
+# LaunchDaemon): a clone-aware walk of the data volume (glaeda-cdu, du when the binary is missing), the open-deleted
+# bytes by process (lsof +L1, one count per device and inode), purgeable space and the inode count, kept as a JSON
+# snapshot per run for ROOT_LEDGER_KEEP_DAYS with per-path deltas against the last one. Report only: it deletes
+# nothing but its own expired snapshots. The runner account's pass folds latest.json (root-owned, world-readable)
+# into summary.json, where mini-health reads its findings.
+ROOT_LEDGER_DIR = Path("/Library/Application Support/glaeda/root-ledger" if DARWIN else "/var/lib/glaeda/root-ledger")
+ROOT_LEDGER_STATE = ROOT_LEDGER_DIR / "state"
+ROOT_LEDGER_LATEST = ROOT_LEDGER_STATE / "latest.json"
+ROOT_LEDGER_SCHEMA = "glaeda-disk/root-ledger/v1"
+ROOT_LEDGER_CDU = "glaeda-cdu"  # the compiled walker beside the pinned glaeda-disk (glaeda-runner-hygiene builds it)
+ROOT_LEDGER_KEEP_DAYS = 14
+ROOT_LEDGER_KEEP_MAX = 64  # snapshots, whatever their age: an hourly retry that succeeds every time stays bounded
+ROOT_LEDGER_EVERY_S = 20 * 3600  # daily; the LaunchDaemon wakes hourly so a host that was busy gets its turn later
+ROOT_LEDGER_STALE_S = 3 * 86400  # no snapshot this long (busy every hour, or failing): a finding of its own
+ROOT_LEDGER_WALK_BUDGET_S = 3600.0
+ROOT_LEDGER_LSOF_TIMEOUT_S = 120.0
+ROOT_LEDGER_DEPTH = 3
+ROOT_LEDGER_PATH_FLOOR = 16 * 1024**2  # a snapshot keeps only paths this big; a smaller one's delta is lost in the floor
+ROOT_LEDGER_TOP = 25
+ROOT_LEDGER_COVERAGE = 0.97  # walk + open-deleted under this share of df used: the gap alarm
+# A TCC-protected folder can block a root read in the kernel (one host hung in a user's Library/News). glaeda-cdu
+# skips the known ones (its TCC_SKIP) and bounds every directory read to this; a walk it had to abandon is run again
+# without the stalled path, at most ROOT_LEDGER_WALK_RETRIES times, and the path is remembered for later walks.
+ROOT_LEDGER_DIR_TIMEOUT_S = 60
+ROOT_LEDGER_WALK_RETRIES = 3
+ROOT_LEDGER_LEARNED_DAYS = 30
+CDU_STALLED_EXIT = 3
+# du (the fallback) can skip only by name: the TCC-guarded folder names no build or cache uses.
+DU_TCC_NAMES = ("News", "Mail", "Messages", "Safari", "Cookies", "Calendars", "Reminders", "HomeKit", "Suggestions",
+                "IdentityServices", "AddressBook", "CallHistoryDB", "CallHistoryTransactions", "com.apple.TCC",
+                "Knowledge", "Biome", "PersonalizationPortrait")
+APFS_META_PER_INODE = 2048  # measured on the fleet: APFS metadata grows ~2 KiB per inode
+LEDGER_SNAPSHOT_NAME = re.compile(r"^ledger-(\d{10,})\.json$")
+
+
+def root_ledger_root() -> Path:
+    """The volume the ledger walks: the macOS data volume (everything writable), or / elsewhere."""
+    return Path("/System/Volumes/Data") if DARWIN else Path("/")
+
+
+def _ledger_low_priority() -> None:
+    """Nice the whole run and, on macOS, throttle its disk I/O; children (cdu, du, lsof) inherit both."""
+    with contextlib.suppress(OSError):
+        os.nice(10)
+    if DARWIN:
+        with contextlib.suppress(OSError, AttributeError):
+            libc = ctypes.CDLL(None, use_errno=True)
+            libc.setiopolicy_np(0, 0, 3)  # IOPOL_TYPE_DISK, IOPOL_SCOPE_PROCESS, IOPOL_THROTTLE
+
+
+def _bounded_lines(argv: list[str], timeout: float) -> tuple[str, str, bool, int | None]:
+    """stdout, stderr, whether the time bound stopped it and its exit code. A stopped walk keeps what it printed."""
+    proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                            stdin=subprocess.DEVNULL, start_new_session=True)
+    try:
+        out, err = proc.communicate(timeout=timeout)
+        return out, err, False, proc.returncode
+    except subprocess.TimeoutExpired:
+        with contextlib.suppress(OSError):
+            os.killpg(proc.pid, signal.SIGKILL)  # this run's own child and its group, nothing else
+        out, err = proc.communicate()
+        return out or "", err or "", True, proc.returncode
+
+
+def _empty_walk(tool: str) -> dict[str, Any]:
+    return {"tool": tool, "clone_aware": tool == "glaeda-cdu" and DARWIN, "paths": {}, "total": 0, "files": None,
+            "errors": 0, "error_paths": [], "partial": True, "shared_saved": 0, "volume": None,
+            "skipped": [], "skipped_count": {"tcc": 0, "excluded": 0, "stalled": 0}, "unreadable": {"sip": 0, "tcc": 0}}
+
+
+def _note_skip(walk: dict[str, Any], kind: str, path: str) -> None:
+    counts = walk["skipped_count"]
+    counts[kind] = counts.get(kind, 0) + 1
+    if len(walk["skipped"]) < 200 and {"kind": kind, "path": path} not in walk["skipped"]:
+        walk["skipped"].append({"kind": kind, "path": path})
+
+
+def parse_cdu(text: str) -> dict[str, Any]:
+    """glaeda-cdu's records (see scripts/glaeda-cdu.c) as the ledger's walk."""
+    walk = _empty_walk("glaeda-cdu")
+    for line in text.splitlines():
+        f = line.split("\t")
+        with contextlib.suppress(ValueError, IndexError):
+            if f[0] == "D" and len(f) >= 4:
+                walk["paths"]["\t".join(f[3:])] = int(f[1])
+            elif f[0] == "E" and len(f) >= 3:
+                path = "\t".join(f[2:])
+                # root reading a folder SIP guards gets EPERM; a TCC folder too (by path: it is under a Library)
+                if int(f[1]) in (errno.EPERM, errno.EACCES):
+                    walk["unreadable"]["tcc" if "/Library/" in path else "sip"] += 1
+                if len(walk["error_paths"]) < 20:
+                    walk["error_paths"].append({"errno": int(f[1]), "path": path})
+            elif f[0] == "S" and len(f) >= 3:
+                _note_skip(walk, f[1], "\t".join(f[2:]))
+            elif f[0] == "T" and len(f) >= 9:
+                walk.update(total=int(f[1]), files=int(f[2]), errors=int(f[4]), partial=f[5] != "0",
+                            shared_files=int(f[6]), shared_saved=int(f[7]), unmapped_files=int(f[8]))
+            elif f[0] == "V" and len(f) >= 6:
+                walk["volume"] = {"total": int(f[1]), "free": int(f[2]), "avail": int(f[3]),
+                                  "important_avail": int(f[4]), "inodes_used": int(f[5])}
+    return walk
+
+
+def parse_du_depth(text: str, err: str, root: Path, stopped: bool) -> dict[str, Any]:
+    """`du -xk -d N ROOT` as the ledger's walk: not clone aware, so an APFS clone counts in full."""
+    walk = _empty_walk("du")
+    paths: dict[str, int] = walk["paths"]
+    for line in text.splitlines():
+        kib, _, path = line.partition("\t")
+        with contextlib.suppress(ValueError):
+            paths[path] = int(kib) * 1024
+    errors = [line for line in err.splitlines() if line.startswith("du:")]
+    for line in errors:
+        if "Operation not permitted" in line or "Permission denied" in line:
+            walk["unreadable"]["tcc" if "/Library/" in line else "sip"] += 1
+    total = paths.get(os.fspath(root))
+    if total is None:  # stopped before the root's line: the top-level children it finished are a lower bound
+        depth = len(root.parts)
+        total = sum(b for p, b in paths.items() if len(Path(p).parts) == depth + 1)
+    walk.update(total=total, errors=len(errors), error_paths=[{"errno": None, "path": e[:300]} for e in errors[:20]],
+                partial=stopped or os.fspath(root) not in paths)
+    if DARWIN:
+        walk["skip_names"] = list(DU_TCC_NAMES)
+    return walk
+
+
+def ledger_learned_skips(state: Path, now: float) -> dict[str, float]:
+    """Paths an earlier walk stalled in, by when: later walks skip them for ROOT_LEDGER_LEARNED_DAYS."""
+    try:
+        doc = json.loads((state / "learned-skips.json").read_text())
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(doc, dict):
+        return {}
+    return {p: float(at) for p, at in doc.items() if isinstance(p, str) and isinstance(at, (int, float))
+            and now - float(at) < ROOT_LEDGER_LEARNED_DAYS * 86400}
+
+
+def ledger_walk(root: Path, cdu: Path | None, depth: int, budget_s: float, state: Path | None = None,
+                now: float | None = None) -> dict[str, Any]:
+    """The clone-aware walk with glaeda-cdu, or du when the binary is missing; bounded by budget_s either way.
+    glaeda-cdu bounds each directory read too; a walk it abandons in a stalled path runs again without it."""
+    now = time.time() if now is None else now
+    if cdu is not None and os.access(cdu, os.X_OK):
+        learned = ledger_learned_skips(state, now) if state is not None else {}
+        deadline = time.monotonic() + budget_s
+        stalled: list[str] = []
+        for _attempt in range(ROOT_LEDGER_WALK_RETRIES + 1):
+            left = max(1.0, deadline - time.monotonic())
+            excludes = [arg for path in sorted(set(learned) | set(stalled))[:200] for arg in ("-x", path)]
+            out, _err, stopped, code = _bounded_lines(
+                _background_argv([os.fspath(cdu), "-v", "-d", str(depth), "-t", str(round(left)),
+                                  "-s", str(ROOT_LEDGER_DIR_TIMEOUT_S), *excludes, os.fspath(root)]),
+                left + 3 * ROOT_LEDGER_DIR_TIMEOUT_S)
+            walk = parse_cdu(out)
+            walk["partial"] = walk["partial"] or stopped
+            if code != CDU_STALLED_EXIT or stopped:
+                break
+            new = [s["path"] for s in walk["skipped"] if s["kind"] == "stalled" and s["path"] not in stalled]
+            if not new or time.monotonic() >= deadline:
+                break
+            stalled += new
+        for path in stalled:  # the abandoned attempts' stalls are this walk's too
+            _note_skip(walk, "stalled", path)
+        found = [s["path"] for s in walk["skipped"] if s["kind"] == "stalled"]
+        if state is not None and found:
+            learned.update({path: now for path in found})
+            with contextlib.suppress(OSError):
+                _ledger_write(state / "learned-skips.json", dict(sorted(learned.items(), key=lambda kv: -kv[1])[:200]))
+        return walk
+    skips = [arg for name in sorted(MEASURE_SKIP_COMPONENTS | (set(DU_TCC_NAMES) if DARWIN else set()))
+             for arg in (("-I", name) if DARWIN else (f"--exclude={name}",))]
+    out, err, stopped, _code = _bounded_lines(
+        _background_argv(["du", "-xk", "-d", str(depth), *skips, os.fspath(root)]), budget_s)
+    return parse_du_depth(out, err, root, stopped)
+
+
+def parse_lsof_deleted(text: str, device: int | None) -> dict[str, Any]:
+    """`lsof -F pcDisk +L1`: open files with no name left. Each device+inode counts once, to its first holder."""
+    files: dict[tuple[int, int], dict[str, Any]] = {}
+    pid, command, cur = 0, "", None
+
+    def done(entry: dict[str, Any] | None) -> None:
+        if not entry or entry.get("inode") is None or entry.get("dev") is None:
+            return
+        if entry.get("links", 0) > 0:
+            return
+        key = (entry["dev"], entry["inode"])
+        seen = files.get(key)
+        if seen is None:
+            files[key] = entry
+        else:
+            seen["size"] = max(seen["size"], entry["size"])
+            seen["pids"].add(entry["pid"])
+
+    for line in text.splitlines():
+        if not line:
+            continue
+        tag, value = line[0], line[1:]
+        with contextlib.suppress(ValueError):
+            if tag == "p":
+                done(cur)
+                cur, pid, command = None, int(value), ""
+            elif tag == "c":
+                command = value
+            elif tag == "f":
+                done(cur)
+                cur = {"pid": pid, "pids": {pid}, "command": command, "size": 0, "dev": None, "inode": None, "links": 0}
+            elif cur is not None and tag == "D":
+                cur["dev"] = int(value, 16) if value.startswith("0x") else int(value)
+            elif cur is not None and tag == "i":
+                cur["inode"] = int(value)
+            elif cur is not None and tag == "s":
+                cur["size"] = int(value)
+            elif cur is not None and tag == "k":
+                cur["links"] = int(value)
+    done(cur)
+    by: dict[str, dict[str, Any]] = {}
+    total = on_volume = 0
+    for (dev, _ino), entry in files.items():
+        total += entry["size"]
+        if device is not None and dev != device:
+            continue
+        on_volume += entry["size"]
+        row = by.setdefault(entry["command"] or "?", {"command": entry["command"] or "?", "bytes": 0, "files": 0,
+                                                       "pids": set()})
+        row["bytes"] += entry["size"]
+        row["files"] += 1
+        row["pids"] |= entry["pids"]
+    rows = sorted(by.values(), key=lambda r: -r["bytes"])[:10]
+    return {"bytes": on_volume, "all_volumes_bytes": total, "files": len(files),
+            "by_process": [{**r, "pids": sorted(r["pids"])[:8]} for r in rows]}
+
+
+def ledger_open_deleted(device: int | None, timeout: float = ROOT_LEDGER_LSOF_TIMEOUT_S) -> dict[str, Any]:
+    lsof = "/usr/sbin/lsof" if os.path.exists("/usr/sbin/lsof") else shutil.which("lsof")
+    if not lsof:
+        return {"bytes": 0, "files": 0, "by_process": [], "error": "no lsof"}
+    out, err, stopped, _code = _bounded_lines(_background_argv([lsof, "-nPw", "+L1", "-F", "pcDisk"]), timeout)
+    doc = parse_lsof_deleted(out, device)
+    if stopped:
+        doc["error"] = f"lsof stopped at its {timeout:.0f}s bound; a lower bound"
+    elif not out and err.strip():
+        doc["error"] = err.strip()[-200:]
+    return doc
+
+
+def ledger_volume(root: Path, walk: dict[str, Any]) -> dict[str, Any]:
+    """df's view of the walked volume: used, free, purgeable (macOS: important-usage capacity over free) and inodes."""
+    st = os.statvfs(root)
+    frsize = st.f_frsize or st.f_bsize
+    vol = {"total": st.f_blocks * frsize, "free": st.f_bfree * frsize, "avail": st.f_bavail * frsize,
+           "used": (st.f_blocks - st.f_bfree) * frsize, "inodes_used": max(0, st.f_files - st.f_ffree),
+           "purgeable": None, "device": os.stat(root).st_dev}
+    seen = walk.get("volume") or {}
+    important = seen.get("important_avail")
+    if isinstance(important, int) and important >= 0:
+        vol["purgeable"] = max(0, important - vol["avail"])
+    return vol
+
+
+def ledger_account(vol: dict[str, Any], walk: dict[str, Any], deleted: dict[str, Any],
+                   churn: int = 0) -> dict[str, Any]:
+    """Coverage of df used by walk + open-deleted, and every byte outside the walk by category, largest first:
+    open-deleted (per process), purgeable, APFS metadata, churn (df used moving during the walk), then what is left,
+    named by why the walk could not see it: SIP dirs, TCC-skipped, a walk stopped at its bound, or churn."""
+    used = max(1, int(vol["used"]))
+    explained = int(walk["total"]) + int(deleted["bytes"])
+    gap = max(0, used - explained)
+    left = max(0, used - int(walk["total"]))  # outside the walk; open-deleted files are the first of it
+    categories: list[dict[str, Any]] = []
+
+    def take(cid: str, nbytes: int, detail: str) -> None:
+        nonlocal left
+        n = max(0, min(int(nbytes), left))
+        left -= n
+        if n > 0:
+            categories.append({"id": cid, "bytes": n, "detail": detail})
+
+    rows = deleted.get("by_process") or []
+    for row in rows:
+        take(f"open-deleted:{row.get('command') or '?'}", int(row.get("bytes") or 0),
+             f"{row.get('files', 0)} open-deleted file(s), pids {row.get('pids', [])}")
+    take("open-deleted:other", int(deleted["bytes"]) - sum(int(r.get("bytes") or 0) for r in rows),
+         "open-deleted files of smaller holders")
+    take("purgeable", int(vol["purgeable"] or 0), "local snapshots and caches macOS may free")
+    take("apfs-metadata", int(vol["inodes_used"]) * APFS_META_PER_INODE if DARWIN else 0, "~2 KiB per inode")
+    take("churn", churn, "df used moved this much while the walk ran")
+    counts = walk.get("skipped_count") or {}
+    unreadable = walk.get("unreadable") or {}
+    tcc = int(counts.get("tcc", 0)) + int(counts.get("stalled", 0)) + int(unreadable.get("tcc", 0))
+    sip = int(unreadable.get("sip", 0))
+    if walk.get("partial"):
+        take("walk-incomplete", left, "the walk stopped at its time bound or a stall")
+    elif tcc and sip:
+        take("sip+tcc", left, f"{sip} SIP dir(s) and {tcc} TCC-protected dir(s) the walk could not read or skipped")
+    elif tcc:
+        take("tcc-skipped", left, f"{tcc} TCC-protected dir(s) skipped or stalled: "
+             + ", ".join(s["path"] for s in (walk.get("skipped") or [])[:3]))
+    elif sip:
+        take("sip", left, f"{sip} SIP-protected dir(s) root cannot read")
+    else:
+        take("churn", left, "no directory shows it: files written and removed between df and the walk")
+    merged: dict[str, dict[str, Any]] = {}
+    for c in categories:  # the measured and the residual churn are one row
+        if c["id"] in merged:
+            merged[c["id"]]["bytes"] += c["bytes"]
+        else:
+            merged[c["id"]] = dict(c)
+    categories = sorted(merged.values(), key=lambda c: -c["bytes"])
+    unexplained = [c for c in categories if not c["id"].startswith("open-deleted")]
+    coverage = explained / used
+    return {"df_used": used, "walk_bytes": int(walk["total"]), "open_deleted_bytes": int(deleted["bytes"]),
+            "explained": explained, "gap": gap, "coverage": round(coverage, 4),
+            "alarm": coverage < ROOT_LEDGER_COVERAGE, "categories": categories,
+            "largest": categories[0] if categories else None,
+            "largest_unexplained": unexplained[0] if unexplained else None}
+
+
+def ledger_snapshots(state: Path) -> list[tuple[int, Path]]:
+    try:
+        names = [(int(m.group(1)), state / "snapshots" / e.name)
+                 for e in os.scandir(state / "snapshots") if (m := LEDGER_SNAPSHOT_NAME.match(e.name))]
+    except OSError:
+        return []
+    return sorted(names)
+
+
+def ledger_deltas(prev: dict[str, Any] | None, cur: dict[str, Any], top: int = ROOT_LEDGER_TOP) -> dict[str, Any]:
+    """Per-path and total changes since the last snapshot, largest change first."""
+    if not isinstance(prev, dict):
+        return {"since": None, "paths": [], "totals": {}}
+    before = prev.get("paths") if isinstance(prev.get("paths"), dict) else {}
+    after = cur["paths"]
+    rows = []
+    for path in set(before) | set(after):
+        a, b = int(before.get(path, 0)), int(after.get(path, 0))
+        if a != b:
+            rows.append({"path": path, "bytes": b, "delta": b - a,
+                         **({"new": True} if path not in before else {"gone": True} if path not in after else {})})
+    rows.sort(key=lambda r: (-abs(r["delta"]), r["path"]))
+    totals = {}
+    for key in ("df_used", "walk_bytes", "open_deleted_bytes", "gap"):
+        if isinstance(prev.get("account", {}).get(key), int):
+            totals[key] = cur["account"][key] - prev["account"][key]
+    if isinstance(prev.get("volume", {}).get("purgeable"), int) and isinstance(cur["volume"].get("purgeable"), int):
+        totals["purgeable"] = cur["volume"]["purgeable"] - prev["volume"]["purgeable"]
+    return {"since": prev.get("at"), "paths": rows[:top], "totals": totals}
+
+
+def _ledger_write(path: Path, doc: dict[str, Any]) -> None:
+    """Root writes it, every account reads it: 0644 in a 0755 directory, replaced atomically."""
+    path.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o644)
+    with os.fdopen(fd, "w") as handle:
+        json.dump(doc, handle, separators=(",", ":"))
+    os.chmod(tmp, 0o644)
+    os.replace(tmp, path)
+
+
+def ledger_prune(state: Path, now: float, keep_days: float) -> int:
+    """Remove this ledger's own snapshots past keep_days (and beyond ROOT_LEDGER_KEEP_MAX): its only deletion."""
+    snaps = ledger_snapshots(state)
+    doomed = [p for at, p in snaps if now - at > keep_days * 86400]
+    keep = [p for _at, p in snaps if p not in doomed]
+    doomed += keep[:max(0, len(keep) - ROOT_LEDGER_KEEP_MAX)]
+    for p in doomed:
+        with contextlib.suppress(OSError):
+            p.unlink()
+    return len(doomed)
+
+
+def root_ledger_run(state: Path, root: Path, cdu: Path | None, depth: int, budget_s: float, keep_days: float,
+                    now: float | None = None) -> dict[str, Any]:
+    """One ledger pass: walk, open-deleted, volume, accounting, deltas, snapshot. Returns latest.json's document."""
+    now = time.time() if now is None else now
+    started = time.monotonic()
+    st = os.statvfs(root)
+    used_before = (st.f_blocks - st.f_bfree) * (st.f_frsize or st.f_bsize)
+    walk = ledger_walk(root, cdu, depth, budget_s, state, now)
+    vol = ledger_volume(root, walk)
+    deleted = ledger_open_deleted(vol["device"])
+    account = ledger_account(vol, walk, deleted, abs(vol["used"] - used_before))
+    paths = {p: b for p, b in walk["paths"].items() if b >= ROOT_LEDGER_PATH_FLOOR}
+    snaps = ledger_snapshots(state)
+    prev = None
+    if snaps:
+        with contextlib.suppress(OSError, ValueError):
+            prev = json.loads(snaps[-1][1].read_text())
+    snap = {"schema": ROOT_LEDGER_SCHEMA, "at": int(now), "host": platform.node(), "root": os.fspath(root),
+            "walk": {k: v for k, v in walk.items() if k not in ("paths", "volume")}, "volume": vol,
+            "open_deleted": deleted, "account": account, "paths": paths, "path_floor": ROOT_LEDGER_PATH_FLOOR,
+            "elapsed_s": round(time.monotonic() - started, 1)}
+    snap["deltas"] = ledger_deltas(prev, snap)
+    _ledger_write(state / "snapshots" / f"ledger-{int(now)}.json", snap)
+    pruned = ledger_prune(state, now, keep_days)
+    top = sorted(paths.items(), key=lambda kv: -kv[1])[:ROOT_LEDGER_TOP]
+    latest = {k: v for k, v in snap.items() if k != "paths"}
+    latest.update(top_paths=[{"path": p, "bytes": b} for p, b in top], pruned=pruned)
+    _ledger_write(state / "latest.json", latest)
+    return latest
+
+
+def root_ledger_main(args: list[str]) -> int:
+    ap = argparse.ArgumentParser(prog="glaeda-disk --root-ledger",
+                                 description="root, clone-aware disk accounting; report only")
+    ap.add_argument("--root-ledger", action="store_true")
+    ap.add_argument("--state-dir", type=Path, default=ROOT_LEDGER_STATE)
+    ap.add_argument("--root", type=Path, default=None, help="volume to walk (default: the data volume)")
+    ap.add_argument("--cdu", type=Path, default=None, help="glaeda-cdu binary (default: beside this script)")
+    ap.add_argument("--depth", type=int, default=ROOT_LEDGER_DEPTH)
+    ap.add_argument("--walk-budget-s", type=float, default=ROOT_LEDGER_WALK_BUDGET_S)
+    ap.add_argument("--keep-days", type=float, default=ROOT_LEDGER_KEEP_DAYS)
+    ap.add_argument("--force", action="store_true", help="run even when not due or while a job holds the host")
+    a = ap.parse_args(args)
+    _ledger_low_priority()
+    state = a.state_dir
+    try:
+        state.mkdir(mode=0o755, parents=True, exist_ok=True)
+        lock = open(state / "ledger.lock", "a")
+    except OSError as e:
+        print(json.dumps({"state": "error", "why": f"cannot open {state}: {e}"}))
+        return 1
+    with lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            print(json.dumps({"state": "skipped", "why": "another ledger run holds the lock"}))
+            return 0
+        now = time.time()
+        snaps = ledger_snapshots(state)
+        if not a.force and snaps and now - snaps[-1][0] < ROOT_LEDGER_EVERY_S:
+            print(json.dumps({"state": "skipped", "why": "not due", "last": snaps[-1][0]}))
+            return 0
+        busy = "" if a.force else host_busy()
+        if busy:
+            # the next hourly wake tries again; latest.json keeps the last full ledger and says why this one waited
+            with contextlib.suppress(OSError, ValueError):
+                latest = json.loads((state / "latest.json").read_text())
+                if isinstance(latest, dict):
+                    latest["last_skip"] = {"at": int(now), "why": busy[:200]}
+                    _ledger_write(state / "latest.json", latest)
+            print(json.dumps({"state": "skipped", "why": busy[:200]}))
+            return 0
+        root = a.root or root_ledger_root()
+        cdu = a.cdu or Path(__file__).resolve().parent / ROOT_LEDGER_CDU
+        latest = root_ledger_run(state, root, cdu, a.depth, a.walk_budget_s, a.keep_days, now)
+    print(json.dumps({"state": "done", "tool": latest["walk"]["tool"], "partial": latest["walk"]["partial"],
+                      **{k: latest["account"][k] for k in ("df_used", "explained", "coverage", "alarm")},
+                      "largest_unexplained": latest["account"]["largest_unexplained"],
+                      "skipped": latest["walk"].get("skipped_count")}))
+    return 0
+
+
+def root_ledger_health(path: Path | None = None, now: float | None = None) -> tuple[dict[str, Any] | None,
+                                                                                    list[dict[str, Any]]]:
+    """latest.json as summary.json's root_ledger block and its findings; (None, []) where no ledger runs."""
+    path = ROOT_LEDGER_LATEST if path is None else path
+    now = time.time() if now is None else now
+    try:
+        doc = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None, []
+    if not isinstance(doc, dict) or doc.get("schema") != ROOT_LEDGER_SCHEMA or not isinstance(doc.get("account"), dict):
+        return None, []
+    acct = doc["account"]
+    at = doc.get("at") if isinstance(doc.get("at"), int) else 0
+    block = {"at": at, "age_s": int(now - at), "tool": (doc.get("walk") or {}).get("tool"),
+             "partial": (doc.get("walk") or {}).get("partial"),
+             **{k: acct.get(k) for k in ("df_used", "walk_bytes", "open_deleted_bytes", "explained", "gap",
+                                         "coverage", "alarm", "largest", "largest_unexplained")},
+             "categories": (acct.get("categories") or [])[:6],
+             "skipped": (doc.get("walk") or {}).get("skipped_count"),
+             "purgeable_bytes": (doc.get("volume") or {}).get("purgeable"),
+             "open_deleted_top": ((doc.get("open_deleted") or {}).get("by_process") or [])[:3],
+             "deltas_top": ((doc.get("deltas") or {}).get("paths") or [])[:5]}
+    if isinstance(doc.get("last_skip"), dict):
+        block["last_skip"] = doc["last_skip"]
+    findings = []
+    if acct.get("alarm") is True:
+        cats = [c for c in acct.get("categories") or [] if isinstance(c, dict)]
+        top = ", ".join(f"{c.get('id', '?')} {int(c.get('bytes') or 0) / GIB:.1f} GiB" for c in cats[:3])
+        largest = acct.get("largest_unexplained") or {}
+        findings.append({"id": "disk_ledger_gap", "severity": "warn", "auto_fix": "impossible",
+                         "evidence": f"walk + open-deleted cover {float(acct.get('coverage') or 0):.1%} of df used; "
+                                     f"{int(acct.get('gap') or 0) / GIB:.1f} GiB unexplained, largest: "
+                                     f"{largest.get('id', '?')} {int(largest.get('bytes') or 0) / GIB:.1f} GiB; "
+                                     f"outside the walk: {top or 'nothing'}"})
+    if now - at > ROOT_LEDGER_STALE_S:
+        why = (doc.get("last_skip") or {}).get("why") if isinstance(doc.get("last_skip"), dict) else None
+        findings.append({"id": "disk_ledger_stale", "severity": "warn", "auto_fix": "pending",
+                         "evidence": f"the root disk ledger last ran {(now - at) / 86400:.1f} days ago"
+                                     + (f"; last skipped: {why}" if why else "")})
+    return block, findings
+
+
 def main(argv: list[str] | None = None) -> int:
     """Run the disk command, bounding only the owned background refresh process."""
     args = list(sys.argv[1:] if argv is None else argv)
     if "--census" in args:
         return census_main(args)
+    if "--root-ledger" in args:
+        return root_ledger_main(args)
     if "--own-runner-checkout" in args:
         return own_runner_checkout_main(args)
     background = "--refresh" in args and "--refresh-lock-fd" in args and "--apply" not in args

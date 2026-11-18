@@ -11,6 +11,8 @@ Examples::
     glaeda-runner-hygiene --user cmux
     sudo glaeda-runner-hygiene --user cmux --apply
     sudo glaeda-runner-hygiene --user cmux --uninstall --apply
+    sudo glaeda-runner-hygiene --root-ledger --apply     the root disk ledger (glaeda-disk --root-ledger), hourly wake,
+                                                          daily run; report only
     glaeda-runner-hygiene --user cmux --check    is the installed job what --apply of this source leaves (JSON)
 
 The root glaeda-daemon-heal pass runs --check and then --apply from its verified copy of the stable release, so
@@ -51,6 +53,19 @@ LAUNCHCTL_TIMEOUT = 10
 MANAGED_COMMENT = "glaeda-runner-hygiene managed plist v1"
 ROOT_UID = 0  # the owner an install must have (tests patch it with their own uid)
 OK_INSTALL = {"missing", "managed", "repairable"}  # _managed_install notes --apply may proceed from
+# The root disk ledger (glaeda-disk --root-ledger): the same pinned-snapshot install, but its LaunchDaemon runs as root
+# (no UserName) because only root can read every directory and see every process's open-deleted files. It sits in its
+# own root, outside INSTALL_ROOT's numeric per-account directories that glaeda-daemon-heal keeps current. Beside the
+# snapshot: glaeda-cdu, compiled at --apply from glaeda-cdu.c next to the source; without a compiler the ledger
+# walks with du (not clone aware) and says so in its snapshot.
+LEDGER_ROOT = Path("/Library/Application Support/glaeda/root-ledger")
+LEDGER_LABEL = "com.teamleaderleo.glaeda.root-ledger"
+LEDGER_COMMENT = "glaeda-runner-hygiene managed root-ledger plist v1"
+LEDGER_INTERVAL = 60 * 60  # an hourly wake; glaeda-disk runs the ledger once a day, and later when a job held the host
+CDU_NAME = "glaeda-cdu"
+CDU_SOURCE_NAME = "glaeda-cdu.c"
+CC = Path("/usr/bin/cc")
+CC_TIMEOUT = 300
 
 
 class HygieneError(RuntimeError):
@@ -76,6 +91,10 @@ class Install:
     plist: Path
     label: str
     launchctl: Path
+    ledger: bool = False  # the root disk ledger's install (build_ledger_install), not a runner account's
+
+
+ROOT_ACCOUNT = Account("root", 0, Path("/var/root"))  # the ledger's daemon runs as root; its manifest records this
 
 
 def _absolute_real(path: Path, label: str) -> Path:
@@ -264,6 +283,52 @@ def build_install(account_name: str, source: Path | None = None, python: Path | 
                    _launchctl(launchctl))
 
 
+def build_ledger_install(source: Path | None = None, python: Path | None = None, root: Path = LEDGER_ROOT,
+                         daemons: Path = LAUNCH_DAEMONS, launchctl: Path | None = None,
+                         uninstall: bool = False) -> Install:
+    """The root disk ledger's install: <root>/bin holds the pinned glaeda-disk, glaeda-cdu and the manifest."""
+    if root.exists() and root.is_symlink():
+        raise HygieneError(f"install root must not be a symlink: {root}")
+    _existing_parent_chain(root)
+    install_dir = root / "bin"
+    if install_dir.exists() and install_dir.is_symlink():
+        raise HygieneError(f"install directory must not be a symlink: {install_dir}")
+    daemons = _absolute_real(daemons, "LaunchDaemons directory") if daemons.exists() else daemons
+    snapshot = install_dir / DISK_NAME
+    if uninstall:
+        source_path = snapshot if snapshot.is_file() else Path("/dev/null")
+        python_path = Path("/usr/bin/python3")
+        with contextlib.suppress(OSError, ValueError):
+            saved = json.loads((install_dir / MANIFEST_NAME).read_text())
+            if isinstance(saved, dict) and isinstance(saved.get("python"), str):
+                python_path = Path(saved["python"])
+    else:
+        source_path, python_path = _source(source or DEFAULT_SOURCE), resolve_python(python)
+    return Install(ROOT_ACCOUNT, python_path, source_path, root, install_dir, snapshot, install_dir / MANIFEST_NAME,
+                   daemons / f"{LEDGER_LABEL}.plist", LEDGER_LABEL, _launchctl(launchctl), ledger=True)
+
+
+def build_cdu(install: Install, cc: Path = CC) -> tuple[bytes | None, str]:
+    """glaeda-cdu compiled from the C source beside the pinned glaeda-disk, or None and why not."""
+    source = install.source.parent / CDU_SOURCE_NAME
+    if not source.is_file():
+        return None, f"no {CDU_SOURCE_NAME} beside {install.source}"
+    if not cc.exists():
+        return None, f"no compiler at {cc}"
+    with tempfile.TemporaryDirectory(prefix="glaeda-cdu.") as work:
+        out = Path(work) / CDU_NAME
+        argv = [os.fspath(cc), "-O2", "-o", os.fspath(out), os.fspath(source)]
+        if platform.system() == "Darwin":
+            argv += ["-framework", "CoreFoundation"]
+        try:
+            result = subprocess.run(argv, capture_output=True, text=True, timeout=CC_TIMEOUT, check=False)
+        except (OSError, subprocess.SubprocessError) as exc:
+            return None, f"cc failed: {exc}"
+        if result.returncode or not out.is_file():
+            return None, f"cc failed: {(result.stderr or result.stdout).strip()[-200:]}"
+        return out.read_bytes(), "built"
+
+
 def _sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -277,6 +342,19 @@ def _sha256_bytes(data: bytes) -> str:
 
 
 def plist_for(install: Install) -> dict:
+    if install.ledger:
+        return {
+            "Label": install.label,
+            "Comment": LEDGER_COMMENT,
+            "ProgramArguments": [os.fspath(install.python), "-I", os.fspath(install.snapshot), "--root-ledger"],
+            "StartInterval": LEDGER_INTERVAL,
+            "RunAtLoad": True,
+            "ProcessType": "Background",
+            "LowPriorityIO": True,
+            "Nice": 10,
+            "StandardOutPath": "/dev/null",
+            "StandardErrorPath": "/dev/null",
+        }
     return {
         "Label": install.label,
         "Comment": MANAGED_COMMENT,
@@ -306,9 +384,10 @@ def _managed_plist(install: Install) -> tuple[bool, str]:
         content = plistlib.loads(install.plist.read_bytes())
     except (OSError, plistlib.InvalidFileException, ValueError) as exc:
         return False, f"unreadable plist: {exc}"
-    if not isinstance(content, dict) or content.get("Comment") != MANAGED_COMMENT:
+    if not isinstance(content, dict) or content.get("Comment") != (LEDGER_COMMENT if install.ledger else MANAGED_COMMENT):
         return False, "existing plist is not a glaeda-runner-hygiene plist"
-    if content.get("Label") != install.label or content.get("UserName") != install.account.name:
+    if content.get("Label") != install.label or content.get("UserName") != (
+            None if install.ledger else install.account.name):
         return False, "existing plist belongs to another account or label"
     if content != plist_for(install) and _recorded_plist_sha256(install) != _sha256(install.plist):
         # A plist an older release wrote (its manifest records these bytes) is ours to replace; any other is an edit.
@@ -349,8 +428,17 @@ def _managed_install(install: Install) -> tuple[bool, str]:
             or (directory_stat.st_mode & 0o777) != 0o755):
         return False, "install directory is not root-owned and protected"
     names = {p.name for p in install.install_dir.iterdir()}
-    if names - {DISK_NAME, MANIFEST_NAME}:
+    if names - ({DISK_NAME, MANIFEST_NAME, CDU_NAME} if install.ledger else {DISK_NAME, MANIFEST_NAME}):
         return False, "install directory contains unrelated files"
+    if CDU_NAME in names:
+        cdu = install.install_dir / CDU_NAME
+        try:
+            cst = cdu.lstat()
+        except OSError as exc:
+            return False, f"cannot stat {CDU_NAME}: {exc}"
+        if (not stat.S_ISREG(cst.st_mode) or cst.st_uid != ROOT_UID or cst.st_gid != _root_gid()
+                or (cst.st_mode & 0o777) != 0o555):
+            return False, f"{CDU_NAME} is not a root-owned, protected file"
     if MANIFEST_NAME not in names:
         return False, "install directory is incomplete"
     # Under a valid root-owned manifest, a missing snapshot is repairable (an interrupted --apply); --apply rewrites it.
@@ -565,6 +653,15 @@ def apply_install(install: Install) -> dict:
             _immutable(install.snapshot, False)
         _atomic_write(install.snapshot, source_bytes, 0o555)
         _immutable(install.snapshot, True)
+    cdu_note = None
+    if install.ledger:
+        cdu = install.install_dir / CDU_NAME
+        built, cdu_note = build_cdu(install)
+        if built is not None and (not cdu.is_file() or _sha256(cdu) != _sha256_bytes(built)):
+            if cdu.exists():
+                _immutable(cdu, False)
+            _atomic_write(cdu, built, 0o555)
+            _immutable(cdu, True)
     expected = plist_bytes(install)
     changed = not install.plist.exists() or install.plist.read_bytes() != expected
     if changed:
@@ -587,7 +684,8 @@ def apply_install(install: Install) -> dict:
             raise HygieneError("launchctl bootstrap returned success but the daemon is not loaded")
     return {"state": "applied", "operation": "install", "uid": install.account.uid,
             "user": install.account.name, "label": install.label, "sha256": digest,
-            "snapshot": os.fspath(install.snapshot), "plist": os.fspath(install.plist), "loaded": True}
+            "snapshot": os.fspath(install.snapshot), "plist": os.fspath(install.plist), "loaded": True,
+            **({"cdu": cdu_note} if install.ledger else {})}
 
 
 def apply_uninstall(install: Install) -> dict:
@@ -614,6 +712,10 @@ def apply_uninstall(install: Install) -> dict:
         if install.snapshot.exists():
             _immutable(install.snapshot, False)
         install.snapshot.unlink(missing_ok=True)
+        cdu = install.install_dir / CDU_NAME
+        if install.ledger and cdu.exists():
+            _immutable(cdu, False)
+            cdu.unlink()
         install.manifest.unlink(missing_ok=True)
         with contextlib.suppress(OSError):
             install.install_dir.rmdir()
@@ -623,8 +725,10 @@ def apply_uninstall(install: Install) -> dict:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--user", "--account", dest="user", required=True,
+    parser.add_argument("--user", "--account", dest="user", default=None,
                         help="named non-system macOS account to clean")
+    parser.add_argument("--root-ledger", action="store_true",
+                        help="the root disk ledger's LaunchDaemon (glaeda-disk --root-ledger) instead of an account's")
     parser.add_argument("--apply", action="store_true", help="perform the planned install/removal")
     parser.add_argument("--uninstall", action="store_true", help="plan/remove the managed job")
     parser.add_argument("--check", action="store_true",
@@ -642,10 +746,17 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--check is read-only and only checks an install")
     if args.uninstall and args.source is not None:
         parser.error("--source is only valid for install")
+    if bool(args.user) == args.root_ledger:
+        parser.error("name one of --user ACCOUNT or --root-ledger")
     try:
-        install = build_install(args.user, None if args.uninstall else args.source, args.python,
-                                args.install_root, args.launch_daemons, args.launchctl,
-                                uninstall=args.uninstall)
+        if args.root_ledger:
+            install = build_ledger_install(None if args.uninstall else args.source, args.python,
+                                           LEDGER_ROOT if args.install_root == INSTALL_ROOT else args.install_root,
+                                           args.launch_daemons, args.launchctl, uninstall=args.uninstall)
+        else:
+            install = build_install(args.user, None if args.uninstall else args.source, args.python,
+                                    args.install_root, args.launch_daemons, args.launchctl,
+                                    uninstall=args.uninstall)
         result = (check(install) if args.check else
                   apply_uninstall(install) if args.uninstall and args.apply else
                   apply_install(install) if args.apply else plan(install, args.uninstall))

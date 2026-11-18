@@ -74,3 +74,66 @@ recorded) is replaced; a plist edited by hand is still refused.
 Before removing a runner account or running `glaeda-mini-setup --uninstall`,
 uninstall its root job first with `--uninstall --apply`; the normal setup
 uninstall does not own or remove this separate LaunchDaemon.
+
+## Root disk ledger
+
+The runner-account passes cannot see root-only directories or other processes'
+open-deleted files, and `du` counts every APFS clone in full, so part of each
+host's used space had no name. `glaeda-disk --root-ledger` accounts for it as
+root, once a day, and only reports: it deletes nothing but its own expired
+snapshots. The same installer puts it in place:
+
+```sh
+/path/to/reviewed-release/scripts/glaeda-runner-hygiene --root-ledger           # plan, no writes
+sudo /path/to/reviewed-release/scripts/glaeda-runner-hygiene --root-ledger --apply
+glaeda-runner-hygiene --root-ledger --check                                      # read-only
+sudo /path/to/reviewed-release/scripts/glaeda-runner-hygiene --root-ledger --uninstall --apply
+```
+
+On a fleet mini the operator form is `fleet-sudo HOST <release>/scripts/glaeda-runner-hygiene --root-ledger --apply`.
+`--apply` pins `glaeda-disk` at
+`/Library/Application Support/glaeda/root-ledger/bin/glaeda-disk`, compiles
+`scripts/glaeda-cdu.c` beside it into `glaeda-cdu` with `/usr/bin/cc` (without
+a compiler the ledger walks with `du` and its snapshot says `"tool": "du"`), and
+installs `/Library/LaunchDaemons/com.teamleaderleo.glaeda.root-ledger.plist`:
+root (no `UserName`), an hourly wake, `Nice` 10, `LowPriorityIO`, background
+process type. The run itself also throttles its disk I/O. `glaeda-daemon-heal`
+does not yet keep this install on the stable release; rerun `--apply` from a new
+release to update it.
+
+Each wake runs the ledger only when the last snapshot is 20 hours old and
+`host_busy` finds no CI job, build, dev-build worker job, reservation or held
+host lock; otherwise it waits for the next wake and records why in
+`latest.json`'s `last_skip`. A pass:
+
+- walks `/System/Volumes/Data` on one volume with `glaeda-cdu`, bounded to an
+  hour: a file that may share blocks (`EF_MAY_SHARE_BLOCKS`) has its physical
+  extents (`F_LOG2PHYS_EXT`) marked in a block bitmap, so every block counts
+  once, to the first path that reaches it; hard links count once. It does
+  not enter the folders macOS guards with TCC under any `Library` (News, Mail,
+  Messages, Safari, Cookies, `Containers/com.apple.*`, Apple's Group
+  Containers, `Application Support/AddressBook`, `CallHistoryDB`,
+  `com.apple.TCC` and the rest of `TCC_SKIP` in `glaeda-cdu.c`): as root a read
+  there can block in the kernel. A watchdog bounds every directory read to 60 s;
+  a read it cannot interrupt ends the walk with exit 3, and the ledger walks
+  again without that path (up to 3 times) and remembers it for 30 days
+  (`state/learned-skips.json`). Every skipped or stalled path is in the
+  snapshot's `walk.skipped`;
+- lists open-deleted files with `lsof +L1`, each device and inode once, by
+  process;
+- reads purgeable space (important-usage capacity over free) and the inode
+  count (APFS metadata, about 2 KiB per inode);
+- writes `state/snapshots/ledger-<epoch>.json` (paths of 16 MiB or more, to
+  depth 3) and keeps 14 days of them, with per-path and total deltas against
+  the previous snapshot;
+- writes `state/latest.json` (root-owned, world-readable, bounded).
+
+The runner account's own `glaeda-disk` pass folds `latest.json` into
+`~/.local/state/glaeda/disk/summary.json` as `root_ledger`. When the walk plus
+open-deleted bytes cover less than 97% of `df` used, it adds the finding
+`disk_ledger_gap`. Every byte outside the walk gets one category:
+`open-deleted:<process>`, `purgeable`, `apfs-metadata`, `churn` (df used moving
+during the walk, and any remainder no directory shows), then what the walk could
+not see: `sip`, `tcc-skipped`, `sip+tcc` or `walk-incomplete`. The finding names
+the largest category that is not open-deleted and lists the top three. A ledger with no snapshot for 3 days adds `disk_ledger_stale`.
+`glaeda-mini-health` reports both like any other glaeda-disk finding.

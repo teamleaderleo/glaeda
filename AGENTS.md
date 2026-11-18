@@ -26,7 +26,7 @@ Most current work is the fleet track in `scripts/`:
 | Fleet operator commands (status, disk, runners, seeds) | `docs/FLEET_OPERATIONS.md` |
 | Where a cmux job runs (`glaeda-route`) | `docs/GLAEDA_ROUTE.md` |
 | Releases and host updates (`glaeda-update`, deploys) | `docs/GLAEDA_OTA.md` |
-| Disk and checkout hygiene (`glaeda-disk`, `glaeda-projects`, `glaeda-worktree`) | `docs/DEVBOX_DISK_AND_PROJECTS.md` |
+| Disk and checkout hygiene (`glaeda-disk`, `glaeda-projects`, `glaeda-worktree`) | `docs/DEVBOX_DISK_AND_PROJECTS.md`; the root disk ledger: `docs/RUNNER_ACCOUNT_HYGIENE.md` |
 
 The paused Rust/Lima runtime track (`src/`, `docs/ROADMAP.md`):
 
