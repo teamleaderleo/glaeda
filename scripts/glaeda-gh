@@ -614,6 +614,8 @@ HEAD_BATCH_MAX_CONTEXTS_PAGES = 20  # pages of 100 checks one head is followed t
 # glaeda hold the same commits (sync-main.yml), and Verify (ci.yml) verifies every main head in the fork on
 # Blacksmith, not in the personal-account repository, so a teamleaderleo/glaeda head's checks include the fork's.
 CHECKS_OF_RECORD = {("teamleaderleo", "glaeda"): ("manaflow-ai", "glaeda")}
+GQL_BLIND_TTL = 3600  # a run GraphQL answered null for is read over REST this long before GraphQL is tried again
+RUN_MISSING_RETRY = 600  # a run no read ever showed (GraphQL and REST both say none) is asked about this rarely
 HEAD_MISSING_RETRY = 600  # a commit GitHub does not know is asked about this rarely
 CONSUMER_WINDOW = 3600
 CONSUMER_DEFAULTS = {"reserved": {"autoland": 1500}, "limit": 240, "pool": 600}  # head reads an hour
@@ -5208,6 +5210,8 @@ class Daemon:
                            # a reader came after the last fetch: a rerun or reopen may have changed it
                            or e["touched"] > c.get("fetchedAt", 0)):
                 since = self.now - c.get("fetchedAt", 0)
+                if kind == "run" and c.get("missing") and not c.get("data") and since < RUN_MISSING_RETRY:
+                    continue  # not found: settled, asked again only now and then (it was read every cycle)
                 if kind == "comment" and self.fed(e["key"]) and since < COMMENT_FED_CYCLE - TICK:
                     continue  # the controller's issue_comment webhooks carry its new comments (merge_comments)
                 want = self.idle_interval(e, interval) if kind == "pr" and not terminal(kind, c.get("data")) else interval
@@ -6192,7 +6196,7 @@ class Daemon:
             base = current if isinstance(current, dict) else prior
             entry = {"key": key, "fetchedAt": self.now, "dataAt": None, "data": None, "error": None}
             if base:
-                entry.update({k: base[k] for k in ("dataAt", "data", "etag", "jobs", "jobsEtag", "jobsAt", "jobsTried", "restAt", "source", "restParts", "restRun", "restRunAt", "origin", "via", "rerunAt", "fp", "fullAt", "wholeAt", "restFullAt", "updatedAtAt")
+                entry.update({k: base[k] for k in ("dataAt", "data", "etag", "jobs", "jobsEtag", "jobsAt", "jobsTried", "restAt", "source", "restParts", "restRun", "restRunAt", "origin", "via", "rerunAt", "gqlBlindAt", "fp", "fullAt", "wholeAt", "restFullAt", "updatedAtAt")
                               if k in base})
             entry.update(fields)
             if "data" in fields and "updatedAtAt" not in fields:
@@ -6910,10 +6914,36 @@ class Daemon:
             fields["restRunAt"] = self.now  # a 304: what the ETag's read showed is still GitHub's
         self.read_jobs(e, fields, state == "fresh")
 
+    def gql_blind(self, e: dict) -> bool:
+        return self.now - float((e["cache"] or {}).get("gqlBlindAt") or float("-inf")) < GQL_BLIND_TTL
+
+    def gql_blind_read(self, e: dict) -> bool:
+        """Read a run GraphQL cannot resolve over REST, which is authoritative for it: data on a 200, missing on a
+        404 for a run never shown, an error otherwise. The entry remembers (gqlBlindAt) so the next cycles go
+        straight to REST. False when REST has no room: the caller stores GraphQL's own answer."""
+        if self.mode("rest") == "stop" or not self.rest_room(REST_READ_MAX["run"]):
+            return False
+        try:
+            with self.calling(*caller_of(e["key"]), waiter_of(e)):
+                self.fetch_run(e)
+        except OutOfTime:
+            self.deferred.add(e["key"])
+        read = read_cache(e["key"]) or {}
+        self.store(e["key"], read or e["cache"], gqlBlindAt=self.now)
+        return True
+
     def fetch_runs_graphql(self, entries: list[dict]) -> str | None:
         """Runs over GraphQL, for when REST is the poorer bucket: one aliased query by run URL. A run
         GraphQL cannot resolve is an error, as REST's 404 is; it is also missing (wait_step's not-found) when no
         read ever showed it: a run that exists has data from its first read."""
+        # A run GraphQL went blind to (resource() null for it: a private repo the GraphQL token has no installation on)
+        # is read over REST at once, without a query that cannot answer, until GQL_BLIND_TTL passes.
+        blind = [e for e in entries if self.gql_blind(e)]
+        for e in blind:
+            self.gql_blind_read(e)
+        entries = [e for e in entries if e not in blind]
+        if not entries:
+            return None
         query, variables = run_query([e["key"] for e in entries])
         self.reads += [(self.now, "run", "graphql")] * len(entries)
         doc, error = self.graphql(query, variables)
@@ -6930,8 +6960,10 @@ class Daemon:
             node = data.get(f"w{i}")
             if not isinstance(node, dict) or node.get("__typename") != "WorkflowRun":
                 message = "graphql: " + str((problems.get(f"w{i}") or {}).get("message") or "no workflow run at this URL")[:200]
-                self.errors.append(f"{e['key']}: {message}")
                 problem = problems.get(f"w{i}") or {}
+                if problem.get("type") not in ("RATE_LIMITED", "FORBIDDEN") and self.gql_blind_read(e):
+                    continue  # REST answered for it (a run the GraphQL token cannot see, or does not exist)
+                self.errors.append(f"{e['key']}: {message}")
                 self.store(e["key"], e["cache"], error=message,
                            missing=not (e["cache"] or {}).get("data")
                            and (problem.get("type") == "NOT_FOUND" or not problems))

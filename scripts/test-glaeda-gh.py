@@ -348,7 +348,10 @@ class FakeGitHub:
                 return 404, self.rate("core", self.rest_remaining), b'{"message": "Not Found"}'
         elif parts[4] == "actions" and len(parts) > 6:
             run_id = int(parts[6])
-            payload = {"jobs": self.jobs.get(run_id, [])} if parts[-1] == "jobs" else self.runs[run_id]
+            payload = {"jobs": self.jobs.get(run_id, [])} if parts[-1] == "jobs" else self.runs.get(run_id)
+            if payload is None:
+                self.rest_remaining -= 1
+                return 404, self.rate("core", self.rest_remaining), b'{"message": "Not Found"}'
         else:
             payload = self.rest_pr(parts, path)
             if payload is None:
@@ -2527,7 +2530,7 @@ class BalanceTest(Base):
         gg.register("run:o/r/404")
         self.daemon.tick(NOW + gg.TERMINAL_REFRESH + gg.CYCLE)
         missing = gg.read_cache("run:o/r/404")
-        self.assertIn("no workflow run", missing["error"])
+        self.assertIn("404", missing["error"])  # REST decided it, after GraphQL's null
         # never shown by any read: missing (wait's not-found), as REST's 404 for such a run now is
         self.assertTrue(missing.get("missing"))
 
@@ -4000,6 +4003,38 @@ class ClientTest(Base):
         with mock.patch.object(self.daemon, "graphql", return_value=(limited, None)):
             self.daemon.fetch_runs_graphql([{"key": "run:o/r/3", "cache": None}])
         self.assertFalse(gg.read_cache("run:o/r/3").get("missing"))
+
+    def test_a_run_graphql_cannot_see_is_read_over_rest_once_not_retried_every_cycle(self) -> None:
+        """leo-workspace runs 44343207314 and 44348360740 (2026-11-18): resource(url:) answered null for a private
+        repo the GraphQL token cannot see, every cycle, "no workflow run at this URL", forever. REST (the login) sees it."""
+        self.daemon.now = NOW
+        run = {"id": 9, "name": "CI", "display_title": "x", "status": "completed", "conclusion": "success",
+               "html_url": "https://github.com/o/r/actions/runs/9", "head_sha": "b" * 40, "head_branch": "x",
+               "event": "push", "run_attempt": 1, "created_at": iso(NOW - 99), "updated_at": iso(NOW - 9)}
+        self.gh.runs[9] = run
+        entry = {"key": "run:o/r/9", "cache": None, "jobs": False, "touched": NOW}
+        blind = ({"data": {"w0": None}}, None)
+        with mock.patch.object(self.daemon, "graphql", return_value=blind) as gql:
+            self.daemon.fetch_runs_graphql([entry])
+            got = gg.read_cache("run:o/r/9")
+            self.assertEqual(got["data"], gg.slim_run(run))  # REST's answer, not an error
+            self.assertFalse(got.get("missing"))
+            self.assertIsNone(got["error"])
+            self.assertEqual(gql.call_count, 1)
+            self.daemon.now = NOW + 60  # the next cycle asks REST directly: no GraphQL query is spent
+            self.daemon.fetch_runs_graphql([{**entry, "cache": got}])
+            self.assertEqual(gql.call_count, 1)
+        self.assertEqual(len(self.gh.run_calls()), 2)
+        # a run neither source shows: missing once, then not re-read every cycle
+        gone = {"key": "run:o/r/404", "cache": None, "jobs": False, "touched": NOW}
+        with mock.patch.object(self.daemon, "graphql", return_value=({"data": {"w0": None}}, None)):
+            self.daemon.fetch_runs_graphql([gone])
+        cache = gg.read_cache("run:o/r/404")
+        self.assertTrue(cache["missing"])
+        self.assertIsNone(cache.get("data"))
+        self.daemon.now = cache["fetchedAt"] + gg.CYCLE
+        self.daemon.last_cycle["run"] = 0
+        self.assertEqual(self.daemon.due("run", [{**gone, "cache": cache}]), [])
 
     def test_a_never_read_key_a_wait_is_on_goes_ahead_of_deferred_ones(self) -> None:
         self.daemon.now = NOW
