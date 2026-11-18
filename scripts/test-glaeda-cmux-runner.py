@@ -405,8 +405,9 @@ class HookTest(unittest.TestCase):
         """cmux job 135147612854 (gcp-agent-lane-6, 2026-11-18; cmuxterm-hq#13682): .git/config said
         core.sparseCheckout = true, config.worktree said false, so the effective config read clean. actions/checkout
         unset extensions.worktreeConfig after its disable, the true came back, and its forced checkout applied the
-        old patterns and lost files. job-started reads each config file on its own and resets a workspace with
-        per-worktree config, so that checkout writes every file."""
+        old patterns and lost files. job-started reads each config file on its own and resets that workspace, so
+        the checkout writes every file. A workspace a full checkout left (config.worktree saying false, nothing
+        sparse) keeps its build caches."""
         git_env = {"PATH": "/usr/bin:/bin", "HOME": os.fspath(self.dir), "GIT_AUTHOR_NAME": "t",
                    "GIT_AUTHOR_EMAIL": "t@example.com", "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.com"}
 
@@ -441,19 +442,26 @@ class HookTest(unittest.TestCase):
         self.assertEqual(git(masked, "config", "--bool", "--default", "false", "core.sparseCheckout"), "false")
         self.assertEqual(git(masked, "status", "--porcelain"), "")
         self.assertNotIn("S ", git(masked, "ls-files", "-v"))
-        worktree_only = workspace("actions-runner-glaeda-3")  # config.worktree alone, nothing sparse
-        for ws, why in ((masked, "sparse (in config)"), (worktree_only, "per-worktree config")):
-            with self.subTest(ws.parts[-4]):
-                result = self.run_hook("job-started", "push", path, "--allowed-repo", "manaflow-ai/cmux",
-                                       "--no-disk", repo="manaflow-ai/cmux", env={"GITHUB_WORKSPACE": os.fspath(ws)})
-                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-                self.assertIn(why, result.stdout)
-                self.assertEqual(sorted(p.name for p in ws.iterdir()), [".git"])
-                self.assertFalse((ws / ".git" / "config.worktree").exists())
-                git(ws, "reset", "-q", "--hard", "HEAD")
-                actions_checkout(ws)
-                self.assertEqual((ws / "Packages" / "B.swift").read_text(), "b\n")
-                self.assertEqual(git(ws, "ls-files", "-v", "Packages/B.swift"), "H Packages/B.swift")
+        result = self.run_hook("job-started", "push", path, "--allowed-repo", "manaflow-ai/cmux",
+                               "--no-disk", repo="manaflow-ai/cmux", env={"GITHUB_WORKSPACE": os.fspath(masked)})
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("sparse (in config)", result.stdout)
+        self.assertEqual(sorted(p.name for p in masked.iterdir()), [".git"])
+        self.assertFalse((masked / ".git" / "config.worktree").exists())
+        git(masked, "reset", "-q", "--hard", "HEAD")
+        actions_checkout(masked)
+        self.assertEqual((masked / "Packages" / "B.swift").read_text(), "b\n")
+        self.assertEqual(git(masked, "ls-files", "-v", "Packages/B.swift"), "H Packages/B.swift")
+
+        # The next job: that full checkout left config.worktree (sparseCheckout = false) and nothing sparse.
+        (masked / ".build").mkdir()
+        actions_checkout(masked)
+        self.assertTrue((masked / ".git" / "config.worktree").is_file())
+        result = self.run_hook("job-started", "push", path, "--allowed-repo", "manaflow-ai/cmux",
+                               "--no-disk", repo="manaflow-ai/cmux", env={"GITHUB_WORKSPACE": os.fspath(masked)})
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotIn("reset the", result.stdout)
+        self.assertTrue((masked / ".build").is_dir() and (masked / "Packages" / "B.swift").is_file())
 
         # Without the hook, the same state loses the file: the case the test reproduces.
         unhooked = workspace("actions-runner-glaeda-4")
