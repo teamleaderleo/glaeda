@@ -17825,7 +17825,7 @@ class LandTest(Base):
         self.addCleanup(state.stop)
         # The fleet's machine names (land_session_host): pinned, never the test host's registry.
         self.real_fleet_machines = getattr(gg, "fleet_machines", None)
-        machines =mock.patch.object(gg, "fleet_machines", lambda: frozenset({"host", "other"}), create=True)
+        machines = mock.patch.object(gg, "fleet_machines", lambda: frozenset({"host", "other"}), create=True)
         machines.start()
         self.addCleanup(machines.stop)
         self.t = NOW
@@ -18820,6 +18820,38 @@ class LandTest(Base):
             e = self.tick()
             self.assertNotIn("lane", e)
             self.assertEqual(gg.land_lane(e), "second")
+
+    def test_a_session_less_re_request_keeps_the_open_entrys_lane(self):
+        # A timer adding --after with no session would otherwise turn a good lane into glaeda-land.
+        with mock.patch.object(gg, "policy_host", lambda: "host"):
+            gg.land_request("land", "o/r#1", [], "host/a", lane=("a", "host"))
+            self.pr(LA, checks=[("ci", "IN_PROGRESS", None)])
+            self.tick()
+            gg.land_request("land", "o/r#1", ["o/r#9"], "", lane=("", ""))
+            e = self.tick()
+            self.assertEqual((e["after"], gg.land_lane(e)), (["pr:o/r#9"], "a"))
+            self.q.entries[self.KEY]["state"] = "merged"  # a fresh land by a session-less caller names none
+            gg.land_request("land", "o/r#1", [], "", lane=("", ""))
+            self.assertEqual(gg.land_lane(self.tick()), "")
+
+    def test_an_old_notify_requester_on_an_unknown_host_names_no_lane_here(self):
+        with mock.patch.object(gg, "policy_host", lambda: "host"):
+            self.assertEqual(gg.land_lane({"requester": "newvm/coord", "requesterFrom": "--notify"}), "")
+            self.assertEqual(gg.land_lane({"requester": "parent/child", "requesterFrom": "$ACPMUX_SESSION_NAME"}),
+                             "child")
+            self.assertEqual(gg.land_lane({"requester": "host/x", "requesterFrom": "--notify"}), "x")
+
+    def test_land_json_says_when_no_lane_is_named_on_a_broker_host(self):
+        self.lane_client.parent.mkdir(parents=True, exist_ok=True)
+        self.lane_client.write_text("#!/bin/sh\nexec lane-gh-credential gh \"$@\"\n")
+        for env, warned in (({"ACPMUX_SESSION_NAME": "", "LANE_GH_LANE": "", "ACPMUX_SESSION": ""}, True),
+                            ({"ACPMUX_SESSION_NAME": "p/c"}, False)):
+            with self.subTest(env=env), mock.patch.object(gg, "daemon_running", return_value=True), \
+                    mock.patch.dict(os.environ, env), mock.patch.object(gg, "policy_host", return_value="host"), \
+                    contextlib.redirect_stdout(io.StringIO()) as out:
+                gg.main(["land", "o/r#1", "--json"])
+            doc = json.loads(out.getvalue())
+            self.assertEqual(("laneWarning" in doc, doc["lane"]), (warned, "" if warned else "c"))
 
     def test_a_malformed_registry_alias_never_breaks_a_step(self):
         doc = {"machines": {"a": {"aliases": "abc"}, "b": {"aliases": 5}, "c": {"aliases": ["c2", 7]}},

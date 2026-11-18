@@ -8177,7 +8177,12 @@ def land_lane(e: dict) -> str:
     if "lane" in e:
         lane = str(e.get("lane") or "")
         return lane if e.get("laneHost") == policy_host() and land_session_lane(lane) == lane else ""
-    host, name = land_session_host(str(e.get("requester") or ""))
+    requester = str(e.get("requester") or "")
+    host, name = land_session_host(requester)
+    if host == policy_host() and name == requester and "/" in name and e.get("requesterFrom") == "--notify":
+        # Only this host's own environment wrote a hostless PARENT/CHILD; a --notify one names a host the registry
+        # does not know (a VM newer than its copy), never a session here.
+        return ""
     return land_session_lane(name) if host == policy_host() and name else ""
 
 
@@ -8633,8 +8638,11 @@ class LandQueue:
         e.update(after=[a for a in after if a != key], requester=str(req.get("requester") or ""),
                  requesterFrom=str(req.get("requesterFrom") or ""), queuedBy=str(req.get("queuedBy") or ""),
                  requestId=req.get("id"), gen=int(e.get("gen") or 0) + 1)
-        if "lane" in req:
-            e.update(lane=str(req.get("lane") or ""), laneHost=str(req.get("laneHost") or ""))
+        if req.get("lane"):
+            e.update(lane=str(req["lane"]), laneHost=str(req.get("laneHost") or ""))
+        elif "lane" in req:  # a session-less re-request of an open entry (an --after added) keeps its lane
+            if fresh or not e.get("lane"):
+                e.update(lane="", laneHost="")
         elif fresh:  # an older sender's request: land_lane reads its requester, never an earlier queuer's lane
             e.pop("lane", None)
             e.pop("laneHost", None)
@@ -10111,9 +10119,11 @@ def cmd_land(target: str, after: list[str], notify: str | None, wait: float, as_
     lane = land_queue_lane()
     rid = land_request("land", f"{repo}#{number}", [land_key(a)[1] + f"#{land_key(a)[2]}" for a in after], requester,
                        source, lane=(lane, policy_host() if lane else ""))
-    if not lane and land_broker_client() and not as_json:
-        say_waiting(f"glaeda-gh land: no lane here (${LAND_LANE_ENV}, $ACPMUX_SESSION_NAME): its steps write as "
-                    f"{LAND_QUEUE_LANE}, which the broker refuses while another lane holds the PR's branch lease")
+    no_lane = (f"no lane here (${LAND_LANE_ENV}, $ACPMUX_SESSION_NAME): an entry queued with one keeps it, else its "
+               f"steps write as {LAND_QUEUE_LANE}, which the broker refuses while another lane holds the PR's branch "
+               "lease") if not lane and land_broker_client() else ""
+    if no_lane and not as_json:
+        say_waiting(f"glaeda-gh land: {no_lane}")
     running = daemon_running()
     deadline = time.monotonic() + wait
     entry = None
@@ -10126,7 +10136,9 @@ def cmd_land(target: str, after: list[str], notify: str | None, wait: float, as_
     picked = isinstance(entry, dict) and entry.get("requestId") == rid
     state = entry.get("state") if picked else "requested"
     out = {"ok": running, "key": key, "state": state, "requester": requester, "request": rid,
-           "entry": entry if picked else None}
+           "entry": entry if picked else None, "lane": lane}
+    if no_lane:
+        out["laneWarning"] = no_lane
     if not running:
         out.update(code="daemon_down", reason=down_message(), next="glaeda-gh restart")
     if as_json:
