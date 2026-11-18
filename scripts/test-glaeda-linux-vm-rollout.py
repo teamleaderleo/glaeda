@@ -38,7 +38,8 @@ class Fake:
             "base": (0, {"disposition": "unchanged", "plan": [], "receipt": {"state": "ready_stopped"}}),
             "stage": (0, {"disposition": "unchanged", "plan": [], "stage": {"glaeda": "aa"},
                           "installed": INSTALLED_OK, "next": []}),
-            "enroll": (0, {"mode": "apply", "runner_group": {"action": "exists"},
+            "enroll": (0, {"mode": "apply", "runner_group": {"action": "exists", "name": "cmux-fleet-linux",
+                                                             "selected_workflows": [WORKFLOW]},
                            "scale_set": {"action": "create"},
                            "enrollment": {"scale_set_id": 7, "scale_set_name": SET, "runner_group_id": 3,
                                           "labels": ["glaeda-linux-arm64"], "owner": "manaflow-ai",
@@ -164,6 +165,24 @@ class RolloutTest(unittest.TestCase):
         with self.assertRaisesRegex(rollout.Refused, "another scale set"):
             self.make(Fake(), apply=True).execute()
         self.assertIn('"glaeda-linux-arm64"', path.read_text())
+
+    def test_stored_enrollment_for_another_workflow_list_is_not_reused(self):
+        self.make(Fake(), apply=True).execute()
+        other = "manaflow-ai/cmux/.github/workflows/other.yml@refs/heads/main"
+        with self.assertRaisesRegex(rollout.Refused, "workflow list"):
+            self.make(Fake(), apply=True, workflows=(other,)).execute()
+
+    def test_stored_enrollment_for_another_runner_group_is_not_reused(self):
+        path = self.root / "serve" / "scaleset-enroll.json"
+        doc = Fake().docs["enroll"][1]
+        doc["runner_group"]["name"] = "glaeda-linux-trusted"
+        path.write_text(json.dumps(doc))
+        with self.assertRaisesRegex(rollout.Refused, "runner group"):
+            self.make(Fake(), apply=True).execute()
+
+    def test_next_commands_run_from_any_directory(self):
+        out = self.make(Fake(base=(0, {"disposition": "plan", "plan": ["x"], "receipt": {}}))).execute()
+        self.assertTrue(out["next"][0].startswith("python3 /repo/scripts/glaeda-linux-vm-rollout --host mini-a "))
 
     def test_enroll_error_refuses(self):
         fake = Fake(enroll=(1, {"error": "runner_group_conflict", "next": "pass --runner-group x"}))

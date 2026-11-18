@@ -43,6 +43,8 @@ from typing import Any, Sequence
 SCHEMA = "glaeda-linux-vm-rollout/v1"
 LABEL = "glaeda-linux-arm64"
 SCALE_SET_PREFIX = LABEL + "-"
+# scaleset-enroll's defaults, which the rollout never overrides; a stored enrollment must name them.
+ORG, REPOSITORY, RUNNER_GROUP = "manaflow-ai", "cmux", "cmux-fleet-linux"
 HOST_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,80}$")
 WORKFLOW_PATTERN = re.compile(
     r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}/[A-Za-z0-9][A-Za-z0-9._-]{0,99}/\.github/workflows/"
@@ -103,7 +105,7 @@ class Rollout:
 
     # ---- helpers ----------------------------------------------------------------------------------
     def self_command(self, *, apply: bool, approve: str | None = None) -> str:
-        parts = ["glaeda-linux-vm-rollout", "--host", self.host]
+        parts = ["python3", str(self.scripts / "glaeda-linux-vm-rollout"), "--host", self.host]
         for workflow in self.workflows:
             parts += ["--workflow", workflow]
         if apply:
@@ -190,8 +192,14 @@ class Rollout:
         except (OSError, ValueError):
             return None
         item = doc.get("enrollment") if isinstance(doc, dict) else None
-        if (isinstance(item, dict) and item.get("scale_set_name") == self.scale_set
-                and item.get("labels") == [LABEL] and not doc.get("error")):
+        group = doc.get("runner_group") if isinstance(doc, dict) else None
+        if not (isinstance(item, dict) and isinstance(group, dict)) or doc.get("error"):
+            return None
+        workflows = group.get("selected_workflows")
+        if (item.get("scale_set_name") == self.scale_set and item.get("labels") == [LABEL]
+                and item.get("owner") == ORG and item.get("repository") == REPOSITORY
+                and group.get("name") == RUNNER_GROUP
+                and isinstance(workflows, list) and sorted(set(workflows)) == self.workflows):
             return item
         return None
 
@@ -200,7 +208,7 @@ class Rollout:
             self.steps.append({"step": "enroll", "state": "enrolled", "scale_set": self.scale_set})
             return None
         if self.enroll_out.exists():
-            raise Refused(f"enroll: {self.enroll_out} names another scale set or failed; read it and move it "
+            raise Refused(f"enroll: {self.enroll_out} names another scale set, runner group or workflow list, or failed; read it and move it "
                           f"aside to enroll {self.scale_set}")
         argv = [str(self.enroll_bin), "--token-file", str(self.token_file), "--scale-set", self.scale_set,
                 "--label", LABEL]
