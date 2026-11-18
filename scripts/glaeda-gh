@@ -7989,6 +7989,19 @@ LAND_WAIT_DEFAULT = 3600.0  # a wait whose action named no timeout
 LAND_RETRY_DEFAULT = 120.0
 LAND_RETRY_MAX = 1800.0
 LAND_REVIEW_WAIT = 3600.0
+# A wait_pr verdict is kept, not judged again, while what it judged is unchanged (LandQueue.verdict_holds): the same
+# head and the same check runs, statuses and conclusions in the daemon's own cache (land_check_fingerprint), with no
+# run of checks between. hq docs/investigations/2026-11-18-boneheaded-designs.md §4.2, huge-blue 2026-11-18:
+# glaeda-land ran 841 explains (816 live reads, 46 snapshot judgments) for 97 merges; one PR made 214 shim calls in
+# 44 min at an unchanged head, and at 14:29-14:45Z host:glaeda-land was the broker's top caller every minute (~1,400
+# REST/h). One leak: land_fingerprint holds `mergeable`, which GitHub turns UNKNOWN and back on every push to the base,
+# so each base push woke every PR parked on a wait_pr verdict twice, each a merge_hold explain answering the same. A
+# head or check change, a CONFLICTING turn and a wait's own timeout (merge_hold's timed step, its timeout_s) still
+# judge at once. 600 s bounds what the fingerprint cannot see (the base moving under a green head: stale_green,
+# tip_merge; a webview wait): a change it held back is judged at most this late, so a PR parked on a wait costs at
+# most 6 explains an hour from base churn, not two per base push. Twice LAND_SNAPSHOT_MAX_AGE and under merge_hold's
+# RUNNING_WAIT_S (1800 s), so a wait merge_hold names still times out on its own clock.
+LAND_VERDICT_KEEP = 600.0
 LAND_STREAK_STOP = 3  # identical refusals in a row (code, head, step) that stop an entry
 LAND_RETRY_STREAK_STOP = 8  # ... for could-not-judge answers (quota, unreadable), which back off between tries
 # The steps of a could-not-judge answer: a retry, and the mirror fill an unreadable answer names (fetch), whose
@@ -8218,16 +8231,24 @@ def land_step_named(out: str) -> dict | None:
     return None
 
 
-def land_fingerprint(cache: dict | None) -> str:
+def land_fingerprint(cache: dict | None, conflict_only: bool = False) -> str:
     """What could change merge_hold's answer, as the cache shows it: head, state, mergeability, each check. (Not
-    mergeStateStatus: it flips with every push to the base, and each flip would be a judgment.)"""
+    mergeStateStatus: it flips with every push to the base, and each flip would be a judgment.) CONFLICT_ONLY:
+    mergeability only as CONFLICTING or not (land_check_fingerprint)."""
     data = (cache or {}).get("data") or {}
     if not data:
         return ""
     checks = sorted((str(c.get("workflow") or ""), str(c.get("name") or ""), str(c.get("status") or ""),
                      str(c.get("conclusion") or "")) for c in data.get("checks") or [])
-    doc = [data.get("headRefOid"), data.get("state"), data.get("mergeable"), checks]
+    mergeable = data.get("mergeable") == "CONFLICTING" if conflict_only else data.get("mergeable")
+    doc = [data.get("headRefOid"), data.get("state"), mergeable, checks]
     return hashlib.sha256(json.dumps(doc, sort_keys=True).encode()).hexdigest()[:16]
+
+
+def land_check_fingerprint(cache: dict | None) -> str:
+    """What a kept verdict was judged on (LAND_VERDICT_KEEP): the head, its state, each check run and status, and
+    mergeability only as CONFLICTING or not: UNKNOWN <-> MERGEABLE turns on every push to the base."""
+    return land_fingerprint(cache, conflict_only=True)
 
 
 def land_fetch_mirror_ok(mirror: str) -> bool:
@@ -9012,9 +9033,31 @@ class LandQueue:
                 self.wait_running(e, head, fp)
             return
         if woke or fp != e.get("seen"):
+            if not woke and self.verdict_holds(e, c, head, fp):
+                return  # merge_hold would answer the same wait (LAND_VERDICT_KEEP)
             # A change alone (checks finished, mergeability computed) is not the step running its course: the same
             # refusal after it does not count toward the stop; after its timeout it does.
             self.judge(e, head, fp, counts=woke)
+
+    def verdict_holds(self, e: dict, c: dict | None, head: str, fp: str) -> bool:
+        """True while E's last verdict, a wait_pr at HEAD, still stands (LAND_VERDICT_KEEP): judged within the bound, at
+        this head, on the check fingerprint the cache shows now, with no run of checks between (wait_running drops
+        it). A change it keeps is noted once (history "kept") and judged when the bound runs out, if it still holds."""
+        x = e.get("explain") or {}
+        at = x.get("at")
+        if not head or x.get("head") != head or e.get("seenHead") != head \
+                or (x.get("action") or {}).get("kind") != "wait_pr":
+            return False
+        if not isinstance(at, (int, float)) or isinstance(at, bool) or self.now - at >= LAND_VERDICT_KEEP:
+            return False
+        if not e.get("seenChecks") or e["seenChecks"] != land_check_fingerprint(c):
+            return False
+        if e.get("keptFp") != fp:
+            e["keptFp"] = fp
+            self.count("kept")
+            self.history(e, "kept", head=head[:12], code=x.get("code"), age=round(self.now - at))
+            self.save(e)
+        return True
 
     def refresh_due(self, e: dict, c: dict | None) -> bool:
         """On an upstream host, a read of the entry's PR through the broker when the upstream's copy is older than
@@ -9062,6 +9105,7 @@ class LandQueue:
         """Checks still run at the head: merge_hold is not asked until they finish (the cache says when)."""
         e.update(state="waiting", wait={"kind": "pr", "sha": head, "why": "checks running"}, seen=fp, head=head,
                  wakeAt=self.now + LAND_WAIT_DEFAULT)
+        e.pop("seenChecks", None)  # checks ran since the last verdict: the next is judged, even if they end the same
         self.history(e, "checks_running", head=head[:12])
         self.save(e)
 
@@ -9175,8 +9219,10 @@ class LandQueue:
             return False  # judged on the daemon's next read of this head (one read, shared), not on merge_hold's own
         if not free:
             return False
-        head = str((((self.cache_of(e["key"]) or {}).get("data")) or {}).get("headRefOid") or "").lower()
-        e.update(state="judging", seen=fp, seenHead=head, judging={"sha": sha, "at": self.now, "counts": counts})
+        c = self.cache_of(e["key"]) or {}
+        head = str((c.get("data") or {}).get("headRefOid") or "").lower()
+        e.update(state="judging", seen=fp, seenHead=head, seenChecks=land_check_fingerprint(c), keptFp=None,
+                 judging={"sha": sha, "at": self.now, "counts": counts})
         self.save(e)
         self.submit(e["key"], self.job, e["key"], sha, int(e.get("gen") or 0))
         return True

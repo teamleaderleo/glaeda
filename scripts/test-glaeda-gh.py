@@ -18166,6 +18166,59 @@ class LandTest(Base):
         self.tick()
         self.assert_merged_at(LA)
 
+    def test_a_wait_verdict_is_kept_while_its_head_and_checks_hold(self):
+        # hq boneheaded-designs §4.2, huge-blue 2026-11-18: 841 explains for 97 merges, 214 shim calls in 44 min at one
+        # head. Each base push turned the parked PR's mergeable UNKNOWN and back, and each turn judged it again.
+        wait = {"kind": "wait_pr", "sha": LA, "until": "done", "timeout_s": 1800}
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(refusal("ws_check_missing", LA, wait))
+        self.tick()
+        for mergeable in ("UNKNOWN", "MERGEABLE", "UNKNOWN", "MERGEABLE"):  # base pushes: same head, same checks
+            self.w.cache[self.KEY]["data"]["mergeable"] = mergeable
+            self.w.cache[self.KEY]["data"]["mergeStateStatus"] = "BEHIND"
+            e = self.tick(30)
+        self.assertEqual((e["state"], e["wait"]["kind"], len(self.w.explains())), ("waiting", "pr", 1))
+        self.assertEqual([h["event"] for h in e["history"]].count("kept"), 1)  # once per fingerprint it kept
+        self.assertEqual(gg.land_counts()[gg.land_day(self.t)]["kept"], 1)
+        # A changed snapshot (a check's conclusion) is judged at once.
+        self.pr(LA, checks=[("ci", "COMPLETED", "SUCCESS"), ("ws-check", "COMPLETED", "FAILURE")])
+        self.w.answers.append(refusal("ws_check_missing", LA, wait))
+        self.tick()
+        self.assertEqual(len(self.w.explains()), 2)
+        # A CONFLICTING turn is judged at once.
+        self.w.cache[self.KEY]["data"]["mergeable"] = "CONFLICTING"
+        self.w.answers.append(refusal("ws_check_missing", LA, wait))
+        self.tick()
+        self.assertEqual(len(self.w.explains()), 3)
+        # A changed head is judged at once.
+        self.pr(LB)
+        self.w.answers.append(refusal("ws_check_missing", LB, {**wait, "sha": LB}))
+        self.tick()
+        self.assertEqual(self.w.explains()[-1][-2:], [LB, "--json"])
+        self.assertEqual(len(self.w.explains()), 4)
+        # Past LAND_VERDICT_KEEP the change it held back is judged, though head and checks still hold.
+        self.w.cache[self.KEY]["data"]["mergeable"] = "UNKNOWN"
+        self.tick(30)
+        self.assertEqual(len(self.w.explains()), 4)
+        self.w.answers.append(refusal("ws_check_missing", LB, {**wait, "sha": LB}))
+        self.tick(gg.LAND_VERDICT_KEEP)
+        self.assertEqual(len(self.w.explains()), 5)
+
+    def test_a_kept_wait_verdict_still_judges_at_its_own_timeout(self):
+        wait = {"kind": "wait_pr", "sha": LA, "until": "done", "timeout_s": 120}
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(refusal("ws_check_missing", LA, wait))
+        self.tick()
+        self.w.cache[self.KEY]["data"]["mergeable"] = "UNKNOWN"
+        self.tick(30)
+        self.assertEqual(len(self.w.explains()), 1)
+        # merge_hold's timed step: its timeout judges again, the verdict's age notwithstanding.
+        self.w.answers.append(refusal("ws_check_missing", LA, {**wait, "timeout_s": 1800}))
+        self.tick(100)
+        self.assertEqual(len(self.w.explains()), 2)
+
     def test_stale_green_from_an_old_merge_hold_uses_the_fallback_table(self):
         self.pr(LA)
         self.land()
