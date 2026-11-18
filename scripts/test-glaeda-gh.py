@@ -18460,6 +18460,21 @@ class LandTest(Base):
         self.assert_merged_at(LA)
         self.assertFalse((gg.land_dir() / gg.LAND_LATCH_FILE).exists())
 
+    def test_an_echo_mark_holds_no_land(self):
+        """huge-blue, 2026-11-18 09:05-09:43Z: our own quota refusal read back as GitHub's word held every land 37 min
+        past its wake. An echo (gh_latch.ECHO, lw#5869) is a guess no request made: each entry is judged (and parks on
+        its own refusal), the queue is not stopped; a GitHub-sourced mark still stops it."""
+        self.pr(LA)
+        self.land()
+        self.latch("graphql", self.t + 600)
+        self.tick(30)
+        self.assertEqual(self.reads(), (0, 0, 0, 0))
+        self.latch("graphql", self.t + 600, source=gg.LAND_LATCH_ECHO)
+        self.w.answers.append(ok_answer(LA))
+        self.tick(1)
+        self.assert_merged_at(LA)
+        self.assertFalse((gg.land_dir() / gg.LAND_LATCH_FILE).exists())
+
     def test_jitter_is_within_the_spread_and_fixed_per_caller(self):
         keys = [f"pr:o/r#{n}" for n in range(200)]
         offsets = [gg.land_jitter(k) for k in keys]

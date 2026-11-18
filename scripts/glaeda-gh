@@ -7838,6 +7838,7 @@ LAND_QUOTA_JITTER = 120
 LAND_QUOTA_BACKOFF = 300.0
 LAND_QUOTA_BACKOFF_MAX = 3600.0
 LAND_QUOTA_MAX_S = 3700.0  # gh_latch MAX_S: a reset never lies more than GitHub's hour ahead
+LAND_LATCH_ECHO = "echo"  # gh_latch.ECHO (lw#5869): our own refusal of a held mark read back; holds no land (land_latch)
 LAND_QUOTA_REFUSAL = re.compile(r"quota: not judged|\[quota: not judged")
 # A step's own output (update-branch, rerun, merge) that GitHub refused for the login's quota, in the words the broker
 # and the gh-quota shim use, as well as merge_hold's. Read on a step's output only, never on merge_hold's reason (which
@@ -8192,13 +8193,17 @@ def land_latch(now: float) -> tuple[str, float] | None:
     A lane-share mark (share: true, the broker's refusal of a VM's share) does not hold a land: lands pass the share
     (gh_latch.held(share=False)). A REST mark with login_only: true (a broker client's refusal that named the shared
     login) holds no judgement either: merge_hold's REST reads of a repo the broker's read pool covers go on its read
-    Apps, and merge_hold's own stop (quota_held) judges that per repo. The land queue only reads these marks:
-    merge_hold, the broker and the daemon write them."""
+    Apps, and merge_hold's own stop (quota_held) judges that per repo. A mark with source "echo" (LAND_LATCH_ECHO: our
+    own refusal of a held mark read back, a guess no request to GitHub made) holds no entry either: each is judged and
+    parks on its own refusal (park_quota). huge-blue 2026-11-18 09:05-09:43Z: such a read-back, marked as GitHub's
+    word, held every land 37 min past its wake. The land queue only reads these marks: merge_hold, the broker and the
+    daemon write them."""
     state = Path(os.environ.get("GH_QUOTA_STATE") or Path.home() / ".local/state/gh-quota")
     best: tuple[str, float] | None = None
     for pool in ("rest", "graphql"):
         doc = read_json(state / f"{pool}-exhausted.json")
-        if not isinstance(doc, dict) or doc.get("share") is True or (pool == "rest" and doc.get("login_only") is True):
+        if not isinstance(doc, dict) or doc.get("share") is True or (pool == "rest" and doc.get("login_only") is True) \
+                or doc.get("source") == LAND_LATCH_ECHO:
             continue
         until = doc.get("until")
         if not isinstance(until, (int, float)) or isinstance(until, bool) or not now < until:
