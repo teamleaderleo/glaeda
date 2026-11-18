@@ -45,6 +45,7 @@ def load_disk_module() -> Any:
     # SourceFileLoader's load_module is gone in Python 3.15; from 10-18 every run on a 3.15 host failed here.
     loader = importlib.machinery.SourceFileLoader("glaeda_disk_for_idle_repair", os.fspath(path))
     module = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
+    sys.modules[loader.name] = module  # dataclasses look their module up in sys.modules while it loads
     loader.exec_module(module)
     return module
 
