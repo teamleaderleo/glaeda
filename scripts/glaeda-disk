@@ -10138,6 +10138,7 @@ CENSUS_AUTOLAUNCH = True
 CENSUS_AFTER_SKIPS = (None, "no pressure", "no pressure; idle sweep ran within the hour")  # apply runs it follows
 DATA_VOLUME = Path("/System/Volumes/Data")
 APFS_INVISIBLE = "apfs-invisible (open-deleted/purgeable)"
+OPEN_DELETED = "open-deleted (files a process still holds; lsof +L1 names them)"  # Linux has no purgeable space
 
 
 _CENSUS_FIRMLINK_MEM: dict[str, bool] = {}
@@ -10182,9 +10183,18 @@ def _private_link(name: str) -> bool:
 
 
 def census_roots() -> list[Path]:
-    if not DARWIN or RUNNER_CACHE_PROFILE:
+    """The volume the census walks: the Data volume on macOS, and on Linux the filesystem that holds HOME, from its
+    mount point (the walk stays on that device). huge-blue, 2026-11-16: this returned [] off macOS, so a Linux host
+    never had a census and its accounting said "unwalked (no volume census yet)" for 169 GiB of a full 252 GiB root
+    while lanes failed with ENOSPC and glaeda-disk found 0 reclaimable."""
+    if RUNNER_CACHE_PROFILE:
         return []
-    return [DATA_VOLUME] if DATA_VOLUME.is_dir() else []
+    if DARWIN:
+        return [DATA_VOLUME] if DATA_VOLUME.is_dir() else []
+    try:
+        return [mount_point(HOME)]
+    except OSError:
+        return []
 
 
 def load_census(path: Path | None = None) -> dict[str, Any]:
@@ -10702,7 +10712,7 @@ def filesystem_accounting(fss: list[Fs], items: list[Item],
             # The census already sized the shared tree by path, so the path-less coverage rows add nothing.
             gap = unclassified
             unreadable = sum(1 for row in census["rows"].values() if row[1] in ("unreadable", "skipped"))
-            residual = APFS_INVISIBLE + (f" and {unreadable} unreadable or skipped dirs (lower bounds)"
+            residual = (APFS_INVISIBLE if DARWIN else OPEN_DELETED) + (f" and {unreadable} unreadable or skipped dirs (lower bounds)"
                                          if unreadable else "") + census_unreadable_named(census)
         else:
             gap = max(0, unclassified - known_coverage)
