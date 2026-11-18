@@ -2563,6 +2563,8 @@ def item_due(fam: "Family", idle_hours: float, window: float) -> tuple[bool, int
     A build cache with no age window (build_cache_unwindowed) is due at once, sweep or pressure: no job count and
     no running job's age keep it, only its own live evidence (judged by the caller and again by apply)."""
     jobs = jobs_since_use(fam, idle_hours)
+    if fam.id in BUILD_STATE_FAMILY_IDS:  # stale only by hours untouched: a busy host's job count never shortens it
+        return idle_hours >= window, None
     if window <= 0 and build_cache_unwindowed(fam):
         return True, jobs
     if ACTIVITY_MODE == "pressure" and fam.id in FLEET_FAMILY_IDS:

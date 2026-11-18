@@ -13831,6 +13831,12 @@ class BuildStateUnderBudgetTest(unittest.TestCase):
                       gd.build_state_held(work, self.runner / "_work/_tool", job))
         self.assertEqual(gd.build_state_held(work, self.runner / "_work/_tool", ""), "")
 
+    def test_stale_means_hours_untouched_whatever_the_job_count(self) -> None:
+        fam = next(f for f in self.fams() if f.id == gd.FLEET_RELEASE_DD)
+        with mock.patch.object(gd, "jobs_since_use", return_value=500), mock.patch.object(gd, "ACTIVITY_MODE", "sweep"):
+            self.assertEqual(gd.item_due(fam, 4.2, 12.0), (False, None))
+            self.assertEqual(gd.item_due(fam, 12.5, 12.0), (True, None))
+
     def test_a_held_slot_lock_keeps_the_release_build(self) -> None:
         fam = next(f for f in self.fams() if f.id == gd.FLEET_RELEASE_DD)
         dd = self.fleet / "xcode/next-release/DerivedData"
