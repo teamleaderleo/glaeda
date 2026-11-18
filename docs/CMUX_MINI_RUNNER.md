@@ -2041,7 +2041,10 @@ rebuild-tier from main's head, and each mini had sat fully idle 17 to 33% of the
   the yield below, so a rollout in either order is safe. Under `capacity/admission.lock` it takes the root's
   token, a persistent-dd token and a compile's units, with the host lock shared, writes
   `capacity/idle-warm.json` (its pid and those names), and lets the admission lock go. Then cmux's
-  `scripts/ci/owned_catch_up.sh`, run from a clean checkout of main's head kept under `ci/.catch-up/cmux` (a shallow, blobless clone),
+  `scripts/ci/owned_catch_up.sh`, run from a clean checkout of main's head kept under `ci/.catch-up/cmux` (a shallow, blobless
+  clone that
+  borrows the objects of the mini's git mirror, `git/cmux.git`, so it keeps no copy of them; the seed prefetch's
+  `ci/.prefetch/cmux.git` borrows them the same way),
   runs the steps of a main dispatch's compile admission (check, prefer against kept seeds, adopt, record,
   compile, keep with main's head as `merged_onto`, save). Logs: `ci/.catch-up/logs/`, one line per run in
   `~/Library/Logs/glaeda-idle-warm.jsonl`.
