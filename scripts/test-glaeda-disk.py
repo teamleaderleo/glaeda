@@ -13759,6 +13759,20 @@ class LeaseHoldsOnlyItsJobTest(unittest.TestCase):
         gd.LEASE.clear()
         self.assertEqual(gd.lease_holds(fam, new), "", "no lease: nothing held by one")
 
+    def test_a_host_reservation_references_only_the_paths_it_names_never_the_fleet_root(self) -> None:
+        fleet = self.root / "fleet"
+        (fleet / "ci/source-packages").mkdir(parents=True)
+        job = fleet / "cache/job-a"
+        job.mkdir(parents=True)
+        (fleet / "reservation.json").write_text(json.dumps({
+            "schema": "glaeda-reservation/v1", "since": int(time.time()) - 60, "until": int(time.time()) + 3600,
+            "owner": "node:lane", "paths": [os.fspath(fleet), os.fspath(job)]}))
+        gd._LIVE_REFERENCES.clear()
+        self.addCleanup(gd._LIVE_REFERENCES.clear)
+        refs = gd.live_artifact_references(fleet)
+        self.assertFalse(gd.artifact_referenced(fleet / "ci/source-packages", refs), refs)
+        self.assertTrue(gd.artifact_referenced(job, refs), refs)
+
 
 class BuildStateUnderBudgetTest(unittest.TestCase):
     """The build state no family held (build-fleet slots and package stores, runner leftovers, home folders, aside

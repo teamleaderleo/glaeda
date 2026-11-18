@@ -917,11 +917,19 @@ def live_artifact_references(root: Path = FLEET_ROOT) -> frozenset[str]:
     refs: set[str] = set()
     now = time.time()
     reservation = root / "reservation.json"
+    # An active host reservation references the paths it names, never the whole fleet root: naming the root kept every
+    # build-fleet family "live lease or running job" for the lease's length (a mini under a two-hour lease, 2026-11-18:
+    # a SwiftPM store untouched 320 h among them). The leased job's own paths stay by lease_holds and the in-use checks.
     try:
-        doc = json.loads(reservation.read_text())
+        text = reservation.read_text()
+        doc = json.loads(text)
         if doc.get("schema") == "glaeda-reservation/v1" and float(doc["until"]) > now:
-            refs.add(os.path.realpath(root))
-    except (OSError, ValueError, TypeError, KeyError):
+            top = os.path.realpath(root)
+            for match in re.findall(r"/(?:Users|private|tmp|var)/[^\s\"']+", text):
+                ref = os.path.realpath(match.rstrip(",]}"))
+                if ref != top and not top.startswith(ref + os.sep):
+                    refs.add(ref)
+    except (OSError, ValueError, TypeError, KeyError, AttributeError):
         pass
     # Jobs and product leases are small JSON markers. Old history and empty lock files must not
     # pin the whole cache forever.
