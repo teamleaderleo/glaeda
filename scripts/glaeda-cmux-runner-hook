@@ -6431,10 +6431,13 @@ def _blocked_lock_pids(listing: str, pids: set[int]) -> set[int]:
 
 def lsof_holders(path: str, timeout: float) -> list[int] | None:
     """The pids with PATH open, from lsof's full listing matched by name: lsof -- PATH would stat every mount point
-    (LSOF_NO_MOUNT_STAT). The kernel names a file by its resolved path, so PATH matches in either spelling. None when
-    lsof cannot run."""
+    (LSOF_NO_MOUNT_STAT). The kernel names a file by its resolved path, so PATH matches in either spelling. Only this
+    user's processes are listed (-a -u): an unprivileged lsof can read no other user's descriptors anyway, and the
+    whole table takes seconds (6 s on a lane VM, past the 5 s bound) where one user's takes 0.1 s. None when lsof
+    cannot run."""
+    user = ["-a", "-u", str(os.geteuid())] if os.geteuid() != 0 else []
     try:
-        out = subprocess.run([LSOF, *LSOF_NO_MOUNT_STAT, "-nP", "-Fpn"], stdin=subprocess.DEVNULL,
+        out = subprocess.run([LSOF, *LSOF_NO_MOUNT_STAT, "-nP", *user, "-Fpn"], stdin=subprocess.DEVNULL,
                              capture_output=True, text=True, errors="replace", timeout=timeout, check=False).stdout
     except (OSError, subprocess.SubprocessError):
         return None
