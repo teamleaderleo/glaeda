@@ -11637,6 +11637,9 @@ def straggler_get(repo: str, paths: list[str], budget: float = STRAGGLER_READ_BU
     return out
 
 
+head_runs_get = straggler_get  # head_runs_unfinished's reader outside the daemon (a test swaps in its fake)
+
+
 def straggler_pass(key: str, data: dict, now: float, get: Callable[[str, list[str]], dict] | None = None,
                    bound: float = STRAGGLER_AFTER) -> dict:
     """DATA with what is known of its queued check runs (queuedRuns, queuedRunsCount, queuedJobs), reading only what
@@ -12204,9 +12207,9 @@ def wait_outcome(req: dict, result: int, entry: dict | None, waited: int) -> dic
         return fail_fields("conflict", f"{name} conflicts with its base (mergeable CONFLICTING)",
                            "none (merge or rebase onto the base and push; checks run after that push)")
     if result == EXIT_INCONCLUSIVE:
-        if data.get("checksPageError"):
-            return fail_fields("inconclusive", f"{name}: the last read was partial ({data['checksPageError']})",
-                               wait_command(req))
+        if data.get("checksPageError") or req.get("runsUnread"):
+            why = data.get("checksPageError") or "its Actions runs could not be read"
+            return fail_fields("inconclusive", f"{name}: the last read was partial ({why})", wait_command(req))
         return fail_fields("inconclusive", f"{name}: {inconclusive_note(data, time.time())}",
                            f"glaeda-gh status pr {name} (the queued checks' runner label; merge_hold counts them "
                            "running)")
@@ -12683,6 +12686,18 @@ def wait_step(req: dict, now: float, get: Callable[[str, list[str]], dict] | Non
             log({"event": "straggler-pass-failed", "key": key, "error": describe(error)})
     result = (verdict(kind, data, until, sha, (entry or {}).get("jobs"), time.time(), grace, f"{owner}/{repo}", settle)
               if usable else None)
+    if result == EXIT_OK and kind == "pr" and until in ("done", "green") and data.get("state") == "OPEN":
+        runs = head_runs_unfinished(key, data, now, get)
+        if runs is None:
+            req["runsUnread"] = True  # held; at the deadline, inconclusive
+            result = None
+        elif runs:
+            req.pop("runsUnread", None)
+            req["runsUnfinished"] = runs[:10]
+            result = None  # a run queued or running at the head: not done, whatever the rollup shows
+        else:
+            req.pop("runsUnread", None)
+            req.pop("runsUnfinished", None)
     if result is not None:
         outcome_name = {EXIT_OK: "success", EXIT_CONFLICT: "conflict", EXIT_NOTHING: "nothing-reported",
                         EXIT_INCONCLUSIVE: "inconclusive"}.get(result, "failure")
@@ -12705,14 +12720,18 @@ def wait_step(req: dict, now: float, get: Callable[[str, list[str]], dict] | Non
             extra["note"] = f"a glaeda runner refused this attempt at setup and no rescue attempt followed within {int(grace)}s"
         extra.update(wait_outcome(req, result, entry, waited))
         return result, render(key, entry, as_json, extra, until, grace, bool(req.get("verbose")))
-    if now - began >= req["timeout"] and kind == "pr" and data and data.get("checksPageError"):
+    unread = (data or {}).get("checksPageError") or (
+        "the head's Actions runs could not be read (actions/runs?head_sha)" if req.get("runsUnread") else None)
+    if now - began >= req["timeout"] and kind == "pr" and data and unread:
         # the deadline passed on a read that never came back whole: not a pass and not a plain timeout
         extra = {"result": "inconclusive", "waited_s": waited,
-                 "note": f"the last read of this PR was partial ({data['checksPageError']}): its checks are unknown"}
+                 "note": f"the last read of this PR was partial ({unread}): its checks are unknown"}
         extra.update(wait_outcome(req, EXIT_INCONCLUSIVE, entry, waited))
         return EXIT_INCONCLUSIVE, render(key, entry, as_json, extra, until, grace, bool(req.get("verbose")))
     if now - began >= req["timeout"]:
         extra = {"result": "timeout", "waited_s": waited}
+        if req.get("runsUnfinished"):
+            extra["note"] = "Actions runs at the head not finished: " + ", ".join(req["runsUnfinished"])
         if sha and entry and entry.get("data"):
             head = entry["data"].get("headRefOid") or entry["data"].get("head_sha") or ""
             if not str(head).startswith(sha) and not (kind == "run" and run_tests_commit(entry["data"], f"{owner}/{repo}", sha)):
@@ -12720,6 +12739,51 @@ def wait_step(req: dict, now: float, get: Callable[[str, list[str]], dict] | Non
         extra.update(wait_outcome(req, EXIT_TIMEOUT, entry, waited))
         return EXIT_TIMEOUT, render(key, entry, as_json, extra, until, grace, bool(req.get("verbose")))
     return None
+
+
+# A green rollup is not a done head while an Actions run at the head is unfinished: a run queued with no runner may
+# have made no check run yet, so the rollup never shows it (merge_hold's unfinished_runs reads the same list).
+# claude-sr2-coord-old, 2026-11-18: `wait pr manaflow-ai/cmuxterm-hq#13397 --until done --sha a6534f4d` said success
+# twice after 185-192 s (the first read after the wait began: HEAD_PENDING_FED_TTL) while 7 jobs sat queued on one
+# runner label, counting only the 3 checks that had finished. Before a done or green wait says success on an open PR,
+# it reads `actions/runs?head_sha=` once (kept HEAD_RUNS_REREAD per head): an unfinished run holds it, and a read that
+# fails holds it too and ends it inconclusive at its deadline, never success.
+HEAD_RUNS_REREAD = 60
+HEAD_RUNS_PAGE = 100
+
+
+def head_runs_path(key: str) -> Path:
+    return BASE / STRAGGLER_DIR / f"{file_name(key)}.runs.json"
+
+
+def head_runs_unfinished(key: str, data: dict, now: float,
+                         get: Callable[[str, list[str]], dict] | None = None) -> list[str] | None:
+    """The names of DATA's head's Actions runs not completed (queued, in progress, waiting, requested, pending), [] when
+    every one completed, or None when they could not be read (no head or repository, a failed read, or more runs than
+    one page holds: unread, never "none")."""
+    head, repo = str(data.get("headRefOid") or ""), pr_repo(data)
+    if not SHA40.fullmatch(head) or not repo:
+        return None
+    path = head_runs_path(key)
+    kept = read_json(path)
+    if isinstance(kept, dict) and kept.get("head") == head and now - num(kept.get("at")) < HEAD_RUNS_REREAD \
+            and isinstance(kept.get("unfinished"), list):
+        return [str(n) for n in kept["unfinished"]]
+    query = f"actions/runs?head_sha={head}&per_page={HEAD_RUNS_PAGE}"
+    try:
+        doc = (get or head_runs_get)(repo, [query]).get(query)
+    except Exception as error:  # noqa: BLE001  a failed read is unread, never "none"
+        log({"event": "head-runs-failed", "key": key, "error": describe(error)})
+        return None
+    runs = doc.get("workflow_runs") if isinstance(doc, dict) else None
+    if not isinstance(runs, list) or int(doc.get("total_count") or 0) > len(runs):
+        return None
+    unfinished = [str(r.get("name") or r.get("id")) for r in runs
+                  if isinstance(r, dict) and str(r.get("status") or "").lower() != "completed"]
+    with contextlib.suppress(OSError, ValueError, TypeError):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        write_json(path, {"head": head, "at": now, "unfinished": unfinished})
+    return unfinished
 
 
 def inconclusive_note(data: dict, now: float) -> str:

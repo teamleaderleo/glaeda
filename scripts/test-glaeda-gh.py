@@ -69,6 +69,15 @@ gg.SPENDERS_CMD = os.fspath(Path(tempfile.gettempdir()) / f"glaeda-gh-test-no-sp
 gg.CONTENT_PAUSE_NAMES = ()
 os.environ.pop(gg.CONTENT_PAUSE_ENV, None)
 _NOTICES = tempfile.TemporaryDirectory(prefix="glaeda-gh-test-notices-")  # removed when the run ends
+
+
+def no_head_runs(repo: str, paths: list[str], budget: float = 0) -> dict:
+    """GitHub with every Actions run at a head finished: no test reads the real one (a test names its own get)."""
+    return {p: {"total_count": 0, "workflow_runs": []} if p.startswith("actions/runs?") else "no reads in tests"
+            for p in paths}
+
+
+gg.head_runs_get = no_head_runs
 gg.NOTICES_DIR = Path(_NOTICES.name)
 
 TOKEN = "ghp_faketoken_must_never_touch_disk"
@@ -5942,6 +5951,7 @@ sys.modules["glaeda_gh"] = gg
 loader.exec_module(gg)
 gg.BASE = Path(sys.argv[3])
 gg.UPSTREAM_CONFIG = Path(sys.argv[3]) / "no-upstream.json"
+gg.head_runs_get = lambda repo, paths, budget=0: {p: {"total_count": 0, "workflow_runs": []} for p in paths}
 """
 
 
@@ -20983,6 +20993,68 @@ class QueuedNeverDoneTest(unittest.TestCase):
         gg.write_json(gg.cache_dir() / gg.file_name(key),
                       {"key": key, "fetchedAt": self.now, "dataAt": self.now, "data": whole, "error": None})
         self.assertEqual(gg.wait_step(req, self.now, lambda repo, paths: {})[0], gg.EXIT_TIMEOUT)
+
+    def test_hq13397_runs_queued_with_no_check_runs_hold_the_wait(self) -> None:
+        """claude-sr2-coord-old: `wait pr manaflow-ai/cmuxterm-hq#13397 --until done --sha a6534f4d` said success twice
+        after 185-192 s while 7 jobs were queued on one runner label, counting only the 3 checks that had finished.
+        Here the rollup shows the 3 finished checks only; the 7 queued jobs sit in 6 Actions runs at the head, some
+        with no check run yet. Done and green hold on the runs (merge_hold's unfinished_runs); a failed runs read
+        ends the wait inconclusive at its deadline; once every run completed, the wait says success."""
+        key = "pr:o/r#13397"
+        head = "a6534f4df0f5a47207272a486e8997b420306150"
+        node = pr_node(13397, checks=[check_run("Socket Security: Pull Request Alerts"), check_run("CodeRabbit"),
+                                      check_run("Socket Security: Project Report")])
+        data = {**gg.parse_pr({**node, "headRefOid": head}), "updatedAt": iso(self.now - 600)}
+        self.assertEqual(gg.verdict("pr", data, "done", now=self.now), gg.EXIT_OK)  # the rollup alone is green
+        queued = ["sweep tests", "Agent launch lint", "Skills tests", "Polling guard", "Test integrity", "CLAUDE.md size"]
+        reads: list[str] = []
+
+        def runs(status: str | None) -> Any:
+            def get(repo: str, paths: list[str]) -> dict:
+                reads.extend(paths)
+                if status is None:
+                    return {p: "HTTP 403: rate limited" for p in paths}
+                return {p: {"total_count": len(queued), "workflow_runs": [
+                    {"id": 44329907657 + i, "name": n, "status": status} for i, n in enumerate(queued)]}
+                    for p in paths}
+            return get
+        gg.write_json(gg.cache_dir() / gg.file_name(key),
+                      {"key": key, "fetchedAt": self.now, "dataAt": self.now, "data": data, "error": None})
+        for until in ("done", "green"):
+            req = gg.wait_request("pr", "o/r#13397", until, 3600, False, False, head, True, gg.RESCUE_GRACE)
+            req["began"] = self.now - 190
+            self.assertIsNone(gg.wait_step(req, self.now, runs("queued")), until)
+            gg.head_runs_path(key).unlink()
+        self.assertTrue(all(p.startswith(f"actions/runs?head_sha={head}") for p in reads), reads)
+        # at the deadline with the runs still queued: a timeout naming them, never success
+        req = gg.wait_request("pr", "o/r#13397", "done", 60, False, False, head, True, gg.RESCUE_GRACE)
+        req["began"] = self.now - 61
+        code, text = gg.wait_step(req, self.now, runs("queued"))
+        self.assertEqual(code, gg.EXIT_TIMEOUT, text)
+        self.assertIn("Actions runs at the head not finished: sweep tests", text)
+        # a runs read that fails is unread: inconclusive at the deadline
+        gg.head_runs_path(key).unlink()
+        code, text = gg.wait_step(req, self.now, runs(None))
+        self.assertEqual(code, gg.EXIT_INCONCLUSIVE, text)
+        self.assertIn("result: inconclusive", text)
+        # every run completed: success, and the answer is kept HEAD_RUNS_REREAD
+        self.assertFalse(gg.head_runs_path(key).exists())  # a failed read keeps no answer
+        req = gg.wait_request("pr", "o/r#13397", "done", 3600, False, False, head, True, gg.RESCUE_GRACE)
+        req["began"] = self.now - 190
+        self.assertEqual(gg.wait_step(req, self.now, runs("completed"))[0], gg.EXIT_OK)
+        before = len(reads)
+        self.assertEqual(gg.wait_step(req, self.now + 1, runs("completed"))[0], gg.EXIT_OK)
+        self.assertEqual(len(reads), before)
+
+    def test_hq13397_jobs_queued_past_the_bound_are_inconclusive(self) -> None:
+        """The same head read 30+ minutes on: 3 finished, 7 queued check runs with no runner. Never success."""
+        data, get = self.head(13397, ["Socket Security: Pull Request Alerts", "CodeRabbit",
+                                      "Socket Security: Project Report"],
+                              ["Agent launch lint", "tests", "Skill test scope", "polling-guard", "lazy-regex-sweep",
+                               "deleted-or-weakened-tests", "size"], 34 * 60)
+        data = self.read("pr:o/r#13397", data, get)
+        self.assertEqual(gg.verdict("pr", data, "done", now=self.now), gg.EXIT_INCONCLUSIVE)
+        self.assertIsNone(gg.verdict("pr", data, "green", now=self.now))
 
     def test_land_sees_running_checks_past_the_first_page(self) -> None:
         """land's own predicate gives the same answer: unfinished contexts the rollup counts past page 1 are running."""
