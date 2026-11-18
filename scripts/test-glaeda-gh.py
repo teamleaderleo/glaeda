@@ -11,6 +11,7 @@ import importlib.machinery
 import importlib.util
 import io
 import json
+import math
 import os
 import re
 import shlex
@@ -9593,6 +9594,160 @@ class BrokerFailOpenTest(BrokerBase):
         self.assertIsNotNone(passed)
 
 
+FAKE_GH_INFLIGHT = """#!{python} -I
+# A stand-in gh for GraphqlSlotsTest: counts the calls in flight at once (under a lock), and keeps the highest.
+import fcntl, json, os, sys, time
+state = {state!r}
+def bump(n):
+    with open(state + ".lock", "a+") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            doc = json.load(open(state))
+        except (OSError, ValueError):
+            doc = {{"now": 0, "max": 0, "calls": 0}}
+        doc["now"] += n
+        doc["max"] = max(doc["max"], doc["now"])
+        doc["calls"] += n > 0
+        json.dump(doc, open(state, "w"))
+bump(1)
+time.sleep({hold})
+bump(-1)
+print(json.dumps({{"data": {{"viewer": {{"login": "x"}}}}}}))
+"""
+
+
+class GraphqlSlotsTest(BrokerBase):
+    """hq#13031: at most graphql_slots() GraphQL requests in flight per login per host, across processes: the daemon's
+    reads (Daemon.request) and every `glaeda-gh gh` GraphQL read share one set of flock'd slot files under BASE."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        os.environ["GLAEDA_GH_QUOTA_POLICY"] = str(self.home / "no-policy.json")
+        for name in ("GLAEDA_GH_GRAPHQL_SLOTS", gg.GRAPHQL_SLOT_ENV):
+            os.environ.pop(name, None)
+        self.addCleanup(os.environ.pop, "GLAEDA_GH_QUOTA_POLICY", None)
+        self.addCleanup(os.environ.pop, gg.GRAPHQL_SLOT_ENV, None)
+
+    def inflight_gh(self, hold: float) -> tuple[Path, Path]:
+        state = self.home / "inflight.json"
+        path = self.home / "bin" / "gh-inflight"
+        path.write_text(FAKE_GH_INFLIGHT.format(python=sys.executable, state=str(state), hold=hold))
+        path.chmod(0o755)
+        return path, state
+
+    def parallel_reads(self, n: int, ttl: str) -> dict:
+        real, state = self.inflight_gh(0.4)
+        env = {**os.environ, "GLAEDA_GH_DIR": os.fspath(gg.BASE), "GLAEDA_GH_REAL": str(real),
+               "GLAEDA_GH_CACHE_TTL": ttl}
+        procs = [subprocess.Popen([sys.executable, os.fspath(ROOT / "scripts" / "glaeda-gh"), "gh", "api", "graphql",
+                                   "-f", "query=query($n:Int!){viewer{login}}", "-F", f"n={i}"],
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL, env=env)
+                 for i in range(n)]
+        outs = []
+        for proc in procs:
+            out, err = proc.communicate(timeout=120)
+            outs.append((proc.returncode, out, err))
+        for rc, out, err in outs:
+            self.assertEqual(rc, 0, err)
+            self.assertIn(b'"login": "x"', out)
+        return json.loads(state.read_text())
+
+    def test_seven_parallel_cli_reads_never_more_than_two_in_flight(self) -> None:
+        for ttl in ("0", "90"):  # the exec path (no answer cache) and the answer cache's fill
+            with self.subTest(cache_ttl=ttl):
+                (self.home / "inflight.json").unlink(missing_ok=True)
+                doc = self.parallel_reads(7, ttl)
+                self.assertEqual(doc["calls"], 7)
+                self.assertEqual(doc["max"], 2, doc)
+                self.assertEqual(doc["now"], 0)
+
+    def test_the_policy_names_the_slot_count(self) -> None:
+        (self.home / "no-policy.json").write_text(json.dumps({"login_concurrency": 3}))
+        self.assertEqual(gg.graphql_slots(), 3)
+        os.environ["GLAEDA_GH_GRAPHQL_SLOTS"] = "1"
+        self.addCleanup(os.environ.pop, "GLAEDA_GH_GRAPHQL_SLOTS", None)
+        self.assertEqual(gg.graphql_slots(), 1)
+        os.environ["GLAEDA_GH_GRAPHQL_SLOTS"] = "zero"
+        self.assertEqual(gg.graphql_slots(), gg.GRAPHQL_SLOTS_DEFAULT)
+
+    def test_slots_are_per_login(self) -> None:
+        conf = self.home / "gh-config"
+        conf.mkdir(parents=True, exist_ok=True)
+        (conf / "hosts.yml").write_text("github.com:\n    git_protocol: ssh\n    users:\n        alice:\n"
+                                        "    user: alice\n")
+        self.assertEqual(gg.graphql_login(), "alice")
+        held = [gg.graphql_slot_take(None) for _ in range(2)]
+        self.assertIsNone(gg.graphql_slot_take(None))  # alice's two are held
+        (conf / "hosts.yml").write_text("github.com:\n    user: bob\n")
+        other = gg.graphql_slot_take(None)
+        self.assertIsNotNone(other)  # bob's are his own
+        for got in [*held, other]:
+            got[0].close()
+
+    def test_which_gh_calls_take_a_slot(self) -> None:
+        self.assertTrue(gg.gh_graphql_read(["api", "graphql", "-f", "query=query{viewer{login}}"]))
+        self.assertTrue(gg.gh_graphql_read(["pr", "view", "7", "-R", "o/r", "--json", "state"]))
+        self.assertFalse(gg.gh_graphql_read(["pr", "checks", "7", "--watch"]))
+        self.assertFalse(gg.gh_graphql_read(["api", "repos/o/r/pulls/7"]))
+        self.assertFalse(gg.gh_graphql_read(["api", "graphql", "-f", "query=mutation{addComment(input:{}){clientMutationId}}"]))
+
+    def test_a_gh_call_nested_under_a_held_slot_uses_its_parents(self) -> None:
+        held = [gg.graphql_slot_take(None) for _ in range(2)]
+        os.environ[gg.GRAPHQL_SLOT_ENV] = str(os.getpid())  # this process holds one: a nested call never waits
+        start = time.monotonic()
+        self.assertIsNone(gg.gh_graphql_slot_for(["api", "graphql", "-f", "query=query{viewer{login}}"]))
+        self.assertLess(time.monotonic() - start, 1.0)
+        for got in held:
+            got[0].close()
+
+    def test_the_daemon_takes_the_same_slots(self) -> None:
+        self.gh.prs[("o", "r", 7)] = pr_node(7)
+        seen: list[int] = []
+        transport = self.daemon.transport
+
+        def counting(method, url, headers, body):
+            if url.endswith("/graphql"):
+                free = gg.graphql_slot_take(None)  # what another process would find while this one is in flight
+                seen.append(0 if free is None else 1)
+                if free is not None:
+                    free[0].close()
+            return transport(method, url, headers, body)
+
+        self.daemon.transport = counting
+        mine = gg.graphql_slot_take(None)  # a CLI read holds one: the daemon's read takes the other
+        self.daemon.tick_deadline = time.monotonic() + 30
+        doc, error = self.daemon.graphql("query{viewer{login}}", {})
+        self.assertIsNone(error)
+        self.assertEqual(seen, [0])  # while the daemon's read was in flight, both slots were held
+        theirs = gg.graphql_slot_take(None)  # and it gave its slot back
+        self.assertIsNotNone(theirs)
+        theirs[0].close()
+        # both held by CLI reads: the daemon's read is not sent, and says why
+        other = gg.graphql_slot_take(None)
+        self.daemon.tick_deadline = time.monotonic() + 0.2
+        sent = len([c for c in self.gh.calls if c[1].endswith("/graphql")])
+        doc, error = self.daemon.graphql("query{viewer{login}}", {})
+        self.assertIsNone(doc)
+        self.assertIn("GraphQL slots", error)
+        self.assertEqual(len([c for c in self.gh.calls if c[1].endswith("/graphql")]), sent)
+        for got in (mine, other):
+            got[0].close()
+
+    def test_a_daemon_refresh_waits_for_a_slot_and_then_reads(self) -> None:
+        self.gh.prs[("o", "r", 7)] = pr_node(7)
+        gg.register("pr:o/r#7")
+        held = [gg.graphql_slot_take(None) for _ in range(2)]
+        release = threading.Timer(0.3, lambda: [got[0].close() for got in held])
+        release.start()
+        self.addCleanup(release.cancel)
+        start = time.monotonic()
+        self.daemon.now = NOW
+        self.daemon.tick()
+        self.assertGreaterEqual(time.monotonic() - start, 0.25)  # it waited for a CLI read's slot
+        self.assertTrue(any(c[1].endswith("/graphql") for c in self.gh.calls))
+        self.assertIsNotNone(gg.read_cache("pr:o/r#7").get("data"))
+
+
 class BrokerMergeGuardTest(BrokerBase):
     """A merge typed as `glaeda-gh gh ...` is handed to the gh-quota guard, never run on the real gh unjudged."""
 
@@ -9710,6 +9865,26 @@ class BrokerMergeGuardTest(BrokerBase):
                 self.assertEqual(passed, args)
                 self.assertEqual(os.environ["PATH"].split(os.pathsep)[0], str(self.guard.parent))
 
+    def test_a_comment_in_combined_short_flags_is_a_create(self) -> None:
+        # `-dc x` is --delete-branch then --comment x; `-cx` is --comment x: both close with a comment, which creates.
+        for args in (["pr", "close", "7", "-R", "o/r", "-dc", "x"],
+                     ["pr", "close", "7", "-R", "o/r", "-cx"],
+                     ["pr", "close", "7", "-R", "o/r", "-dcx"],
+                     ["issue", "close", "7", "-R", "o/r", "-c=x"],
+                     ["issue", "reopen", "7", "-R", "o/r", "-c", "x"]):
+            with self.subTest(args=args):
+                self.assertTrue(gg.broker_create_call(args))
+                _code, _err, path, _passed = self.route(args)
+                self.assertEqual(path, str(self.guard))
+        # no comment: a boolean alone, a value flag whose value starts with c (-Rc is the repository "c", -rc the
+        # reason "c"), and a -c that is a long flag's value
+        for args in (["pr", "close", "7", "-R", "o/r", "-d"],
+                     ["pr", "close", "7", "-Rc/r"],
+                     ["issue", "close", "7", "-R", "o/r", "-rcompleted"],
+                     ["issue", "close", "7", "-R", "o/r", "--reason", "-c"]):
+            with self.subTest(args=args):
+                self.assertFalse(gg.broker_create_call(args))
+
     def test_a_create_the_guard_judged_passes_to_the_real_gh(self) -> None:
         os.environ["GH_QUOTA_CHECKED"] = "1"
         args = ["pr", "comment", "7", "-R", "o/r", "--body", "x"]
@@ -9803,6 +9978,26 @@ class BrokerArgumentTest(unittest.TestCase):
 
     def test_everything_after_a_bare_double_dash_is_positional(self) -> None:
         self.assertEqual(gg.broker_words(["pr", "view", "--", "-R"])[0], ["pr", "view", "-R"])
+
+    def test_a_boolean_letter_glued_before_minus_x_keeps_the_method(self) -> None:
+        # cobra runs a short cluster's letters as boolean flags until one that takes a value, which takes the rest of
+        # the word or the next one: `-iXPOST` is --include then --method POST. Reading it as booleans hid the method,
+        # so a create spelled that way was not seen as one, and `-iXGET` with a field was seen as a POST.
+        for args, expect in ((["api", "-iXPOST", "repos/o/r/issues/1/comments"], "POST"),
+                             (["api", "-iXPOST", "repos/o/r/issues/1/comments", "-f", "body=x"], "POST"),
+                             (["api", "-iX", "POST", "repos/o/r/issues/1/comments", "-f", "body=x"], "POST"),
+                             (["api", "repos/o/r/issues", "-iXGET", "-f", "state=open"], "GET"),
+                             (["api", "-XPOST", "repos/o/r/issues", "-iXGET", "-f", "state=open"], "GET"),
+                             (["api", "-iXGET", "repos/o/r/issues/1/comments", "-iXPOST"], "POST")):
+            with self.subTest(args=args):
+                words, method, seen, _values = gg.broker_words(args)
+                self.assertEqual(method, expect)
+                self.assertNotIn("POST", words)
+                self.assertTrue({"-i", "--method"} <= seen)
+                self.assertEqual(gg.broker_create_call(args), expect == "POST")
+        _words, _method, seen, values = gg.broker_words(["api", "x", "-iX"])  # no value: gh exits 1, never served
+        self.assertIn("--method", seen)
+        self.assertNotIn("--method", values)
 
 
 class AuditTest(BrokerBase):
@@ -11867,6 +12062,11 @@ class PostTest(unittest.TestCase):
         cmd = root / "content-pause-cmd"
         cmd.write_text(f'#!/bin/sh\necho "$*" >> {shlex.quote(os.fspath(root / "calls"))}\n'
                        f'[ -f {shlex.quote(os.fspath(root / "hang"))} ] && exec sleep 30\n'
+                       f'[ "$2" = --hold ] && [ -f {shlex.quote(os.fspath(root / "hang-hold"))} ] && exec sleep 30\n'
+                       f'[ "$2" = --hold ] && [ -f {shlex.quote(os.fspath(root / "slow-hold"))} ] && sleep 3 && '
+                       f'echo held >> {shlex.quote(os.fspath(root / "calls"))}\n'
+                       f'[ -f {shlex.quote(os.fspath(root / "stderr"))} ] && cat {shlex.quote(os.fspath(root / "stderr"))} >&2 && exit 1\n'
+                       f'[ -f {shlex.quote(os.fspath(root / "slow"))} ] && sleep 1\n'
                        f'[ "$2" = --hold ] || cat {shlex.quote(os.fspath(root / "pause.json"))}\n')
         cmd.chmod(0o755)
         env = mock.patch.dict(os.environ, {gg.CONTENT_PAUSE_ENV: shlex.quote(os.fspath(cmd))})
@@ -11902,7 +12102,10 @@ class PostTest(unittest.TestCase):
         self.step(d, NOW + 20)
         self.assertEqual(t.calls, [])
         self.assertTrue(any(e.startswith("content pause:") for e in d.errors))
-        self.step(d, NOW + 100)  # the last answer's pause is over
+        self.step(d, NOW + 100)  # the last answer's pause is over, but that answer is 100 s old and asks fail
+        self.assertEqual(t.calls, [])  # unknown: the write waits (content_pause_unknown)
+        (calls.parent / "pause.json").write_text('{"blocked_until": 0, "level": 0}')
+        self.step(d, NOW + 160)  # the next ask answers: no pause
         self.assertEqual(len(t.calls), 1)
 
     def test_a_live_pause_holds_whatever_its_level_says(self) -> None:
@@ -11931,6 +12134,131 @@ class PostTest(unittest.TestCase):
             self.assertTrue(any(e.startswith("content pause:") for e in d.errors[failed:]), said)
         self.assertEqual(t.calls, [])
 
+    def test_a_pause_too_large_for_a_float_is_a_failed_ask_and_the_last_answer_stands(self) -> None:
+        # json reads a 401-digit blocked_until as an int; float() of it raised OverflowError past the ask's except.
+        self.queue("comment", "o/r#1", "--body", "one")
+        calls = self.pause_cmd(NOW + 100)
+        d, t = self.daemon((201, {}, {"html_url": "u"}))
+        d.clock_real = False
+        self.step(d, NOW)
+        (calls.parent / "pause.json").write_text('{"blocked_until": 1' + "0" * 400 + ', "level": 1}')
+        d.pause_next = float("-inf")  # ask again now
+        failed = len(d.errors)
+        self.step(d, NOW + 20)
+        self.assertEqual(d.pause_until, NOW + 100)
+        self.assertTrue(any(e.startswith("content pause:") for e in d.errors[failed:]))
+        self.assertEqual(t.calls, [])
+
+    def test_an_empty_or_non_numeric_pause_is_a_failed_ask_and_the_last_answer_stands(self) -> None:
+        # `doc.get("blocked_until") or 0` read "", [] and {} as "no pause". The keeper prints a number, 0 for none, so
+        # anything else (a string, a list, an object, a bool, null, no key at all) is a failed ask.
+        self.queue("comment", "o/r#1", "--body", "one")
+        calls = self.pause_cmd(NOW + 100)
+        d, t = self.daemon((201, {}, {"html_url": "u"}))
+        d.clock_real = False
+        self.step(d, NOW)
+        for said in ('""', "[]", "{}", '"null"', '"0"', "true", "false", "null"):
+            (calls.parent / "pause.json").write_text(f'{{"blocked_until": {said}, "level": 1}}')
+            d.pause_next = float("-inf")  # ask again now
+            failed = len(d.errors)
+            self.step(d, NOW + 20)
+            self.assertEqual(d.pause_until, NOW + 100, said)
+            self.assertTrue(any(e.startswith("content pause:") for e in d.errors[failed:]), said)
+        (calls.parent / "pause.json").write_text('{"level": 1}')
+        d.pause_next = float("-inf")
+        failed = len(d.errors)
+        self.step(d, NOW + 20)
+        self.assertEqual(d.pause_until, NOW + 100)
+        self.assertTrue(any(e.startswith("content pause:") for e in d.errors[failed:]))
+        self.assertEqual(t.calls, [])
+        for said in ("0", "0.0"):  # the keeper's own "no pause"
+            (calls.parent / "pause.json").write_text(f'{{"blocked_until": {said}, "level": 0}}')
+            d.pause_next = float("-inf")
+            self.step(d, NOW + 20)
+            self.assertEqual((d.pause_until, d.pause_failures), (0.0, 0), said)
+
+    def test_an_ask_started_before_a_report_never_lowers_the_reported_pause(self) -> None:
+        # An ask in flight carries the keeper's answer from before the 403; adopting it after the report set
+        # pause_until back to that older answer, and creates went out into the pause just reported.
+        self.queue("comment", "o/r#1", "--body", "one")
+        calls = self.pause_cmd(0, level=0)
+        (calls.parent / "slow").touch()  # the ask answers "no pause" in about 1 s
+        d, t = self.daemon((201, {}, {"html_url": "u"}))
+        d.clock_real = False
+        clock = [NOW]
+        d.clock = lambda: clock[0]
+        with mock.patch.object(gg, "CONTENT_PAUSE_DEADLINE", 0.05):
+            d.content_pause_until()  # the ask starts with the old answer
+            self.assertIsNotNone(d.pause_ask)
+            clock[0] = NOW + 0.5
+            d.report_content_pause(NOW + 120, "comment")  # a 403 meanwhile
+            self.assertEqual(d.pause_until, NOW + 120)
+            d.content_pause_settle(10)  # the ask finishes: "no pause", asked before the report
+        self.assertEqual(d.pause_until, NOW + 120)
+        self.assertEqual(d.pause_failures, 0)
+        clock[0] = NOW + 1
+        self.step(d, NOW + 1)
+        self.assertEqual(t.calls, [])
+        (calls.parent / "slow").unlink()
+        clock[0] = NOW + 30  # an ask made after the report: the keeper's word stands, as it never shortens
+        d.pause_next = float("-inf")
+        (calls.parent / "pause.json").write_text(json.dumps({"blocked_until": NOW + 200, "level": 1}))
+        d.content_pause_until()
+        d.content_pause_settle(10)
+        self.assertEqual(d.pause_until, NOW + 200)
+
+    def test_the_keepers_stderr_is_kept_free_of_secrets(self) -> None:
+        # Up to 200 characters of the keeper's stderr reach daemon.json (outbox.pause.lastError) and the
+        # post-pause-unknown log line: a token in it went with them.
+        self.queue("comment", "o/r#1", "--body", "one")
+        calls = self.pause_cmd(0, level=0)
+        secrets = ["ghp_" + "A1b2C3d4" * 5, "github_pat_" + "Z9_y8" * 10, "gho_" + "q" * 36,
+                   "ghs_" + "R" * 36, "deadbeef" * 8, "QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVo0MTIzNDU2Nzg5MDEy"]
+        (calls.parent / "stderr").write_text(
+            f"auth failed for {secrets[0]} (Authorization: Bearer abc.def-ghi_jkl) pat {secrets[1]} {secrets[2]} "
+            f"{secrets[3]} key {secrets[4]} blob {secrets[5]} " + "x" * 400)
+        d, t = self.daemon((201, {}, {"html_url": "u"}))
+        d.clock_real = False
+        self.step(d, NOW)
+        d.content_pause_settle(10)
+        status = d.content_pause_status()
+        for text in (status["lastError"], d.pause_error, *[e for e in d.errors if e.startswith("content pause:")]):
+            for secret in [*secrets, "abc.def-ghi_jkl"]:
+                self.assertNotIn(secret, text)
+            self.assertIn("auth failed for", text)
+            self.assertLessEqual(len(text), 260)
+        self.assertEqual(t.calls, [])
+        self.assertEqual(gg.keeper_text("exit 1: no lock"), "exit 1: no lock")  # plain words pass as written
+
+    def test_the_daemons_status_carries_the_pause(self) -> None:
+        self.queue("comment", "o/r#7", "--body", "x")
+        self.pause_cmd(NOW + 100)
+        d, t = self.daemon((201, {}, {"html_url": "u"}))
+        d.clock = lambda: NOW
+        status = d.tick(now=NOW)
+        self.assertEqual(t.calls, [])
+        pause = status["outbox"]["pause"]
+        self.assertEqual((pause["until"], pause["failures"], pause["holding"]), (NOW + 100, 0, False))
+        self.assertEqual(gg.read_json(gg.BASE / "daemon.json")["outbox"]["pause"]["until"], NOW + 100)
+
+    def test_a_saved_outbox_hold_is_clamped_as_every_other_hold(self) -> None:
+        # daemon.json's outbox.holdUntil was read with no bound: a corrupt far future held the outbox for good, and
+        # a string or a number too large for a float stopped the daemon from starting.
+        for saved, ceiling in ((time.time() + 10 ** 9, True), (10 ** 400, True), (-(10 ** 400), False),
+                               ("Infinity", False), ("-Infinity", False), (-5, False),
+                               ("NaN", False), ("soon", False), (True, False), ([1], False), (None, False)):
+            with self.subTest(saved=str(saved)[:20]):
+                gg.write_json(gg.BASE / "daemon.json", {"outbox": {"holdUntil": saved}})
+                d, _t = self.daemon()
+                self.assertTrue(math.isfinite(d.post_hold))
+                self.assertLessEqual(d.post_hold, time.time() + gg.PACE_HOLD_MAX)
+                if ceiling:
+                    self.assertGreater(d.post_hold, time.time() + gg.PACE_HOLD_MAX - 60)
+                else:
+                    self.assertEqual(d.post_hold, 0.0)
+        gg.write_json(gg.BASE / "daemon.json", {"outbox": {"holdUntil": NOW + 30}})
+        self.assertEqual(self.daemon()[0].post_hold, NOW + 30)  # an ordinary hold is kept as written
+
     def test_a_throttled_write_extends_the_logins_create_pause(self) -> None:
         item = self.queue("comment", "o/r#7", "--body", "x")
         calls = self.pause_cmd(0, level=0)
@@ -11938,6 +12266,7 @@ class PostTest(unittest.TestCase):
             "You have exceeded a secondary rate limit and have been temporarily blocked from content creation.")}))
         d.clock_real = False
         self.step(d, NOW)
+        d.content_pause_settle(10)  # the report runs off the post's path
         self.assertEqual(len(t.calls), 1)
         self.assertEqual(calls.read_text().splitlines(),
                          ["content-pause", f"content-pause --hold {int(NOW) + 120} --what glaeda outbox comment"])
@@ -11972,6 +12301,7 @@ class PostTest(unittest.TestCase):
                     "creation.")}))
                 d.clock_real = False
                 self.step(d, NOW)
+                d.content_pause_settle(10)
                 self.assertEqual(len(t.calls), 1)
                 self.assertEqual(gg.post_state(item["id"])["state"], "queued")
                 self.assertLessEqual(d.post_hold, NOW + gg.PACE_HOLD_MAX)
@@ -12019,9 +12349,11 @@ class PostTest(unittest.TestCase):
         self.step(d, NOW)
         self.assertEqual(d.pause_until, NOW + 100)
         (calls.parent / "hang").touch()
-        with mock.patch.object(gg, "CONTENT_PAUSE_DEADLINE", 0.3):
+        with mock.patch.object(gg, "CONTENT_PAUSE_DEADLINE", 0.1), \
+                mock.patch.object(gg, "CONTENT_PAUSE_SLOW_DEADLINE", 0.3):
             clock[0] = NOW + 20
             self.step(d, NOW + 20)  # this ask times out
+            d.content_pause_settle(10)
             self.assertTrue(any(e.startswith("content pause:") for e in d.errors))
             self.assertEqual(d.pause_until, NOW + 100)
             for at in (NOW + 40, NOW + 60, NOW + 79):
@@ -12034,6 +12366,112 @@ class PostTest(unittest.TestCase):
         self.assertEqual(len(calls.read_text().splitlines()), 3)
         self.assertEqual(t.calls, [])
         self.assertLessEqual(gg.CONTENT_PAUSE_DEADLINE, 2)  # a healthy local answer takes about 0.1 s
+
+    def test_a_keeper_slower_than_the_deadline_is_heard_and_its_pause_held(self) -> None:
+        # Every ask of a keeper slower than CONTENT_PAUSE_DEADLINE timed out, so it was never heard, and creates went
+        # out into a pause other writers had reported.
+        self.queue("comment", "o/r#1", "--body", "one")
+        calls = self.pause_cmd(NOW + 100)
+        (calls.parent / "slow").touch()  # answers in about 1 s
+        d, t = self.daemon((201, {}, {"html_url": "u"}))
+        d.clock_real = False
+        clock = [NOW]
+        d.clock = lambda: clock[0]
+        with mock.patch.object(gg, "CONTENT_PAUSE_DEADLINE", 0.2):
+            self.step(d, NOW)  # the ask goes on past the deadline: nothing is known, nothing is sent
+            self.assertEqual(t.calls, [])
+            d.content_pause_settle(10)
+            clock[0] = NOW + 1
+            self.step(d, NOW + 1)
+        self.assertEqual(d.pause_until, NOW + 100)
+        self.assertEqual((d.pause_failures, t.calls), (0, []))
+        self.assertGreaterEqual(gg.CONTENT_PAUSE_SLOW_DEADLINE, 10)
+
+    def test_asks_that_keep_failing_hold_creates_for_a_bound_and_status_shows_them(self) -> None:
+        # With no answer, the pause is unknown: creates wait rather than go out into one other writers reported, for
+        # CONTENT_PAUSE_BLIND_MAX past the last answer at most, so a keeper broken for good stops nothing for long.
+        item = self.queue("comment", "o/r#1", "--body", "one")
+        calls = self.pause_cmd(0, level=0)
+        (calls.parent / "hang").touch()
+        d, t = self.daemon((201, {}, {"html_url": "u"}))
+        d.clock_real = False
+        clock = [NOW]
+        d.clock = lambda: clock[0]
+        lines: list[dict] = []
+
+        def at(when: float) -> None:
+            clock[0] = when
+            self.step(d, when)
+            d.content_pause_settle(10)
+
+        with mock.patch.object(gg, "CONTENT_PAUSE_DEADLINE", 0.1), \
+                mock.patch.object(gg, "CONTENT_PAUSE_SLOW_DEADLINE", 0.3), mock.patch.object(gg, "log", lines.append):
+            at(NOW)  # the first ask times out
+            at(NOW + 1)
+            at(NOW + gg.CONTENT_PAUSE_RETRY + 1)  # and the next
+            at(NOW + gg.CONTENT_PAUSE_RETRY + 2)
+            self.assertEqual(t.calls, [])
+            status = d.content_pause_status()
+            self.assertEqual({k: status[k] for k in ("failures", "timeouts", "answeredAgo", "holding")},
+                             {"failures": 2, "timeouts": 2, "answeredAgo": None, "holding": True})
+            self.assertIn("no answer within", status["lastError"])
+            gg.write_json(gg.BASE / "daemon.json", {"outbox": {"holdUntil": time.time() + 90, "pause": status}})
+            line = gg.post_line(gg.post_state(item["id"]))
+            self.assertIn("pause ask failed 2 in a row (2 timed out", line)
+            self.assertIn("last answer never", line)
+            self.assertIn("creates wait until the pause is known", line)
+            self.assertRegex(line, r"GitHub holds writes for (89|90)s;")  # a length, not an epoch's age
+            at(NOW + gg.CONTENT_PAUSE_BLIND_MAX + 1)  # past the bound: it posts as a host with no keeper
+            self.assertEqual(len(t.calls), 1)
+            self.assertEqual(len([e for e in lines if e.get("event") == "post-pause-unknown"]), 1)
+            (calls.parent / "hang").unlink()
+            clock[0] = NOW + gg.CONTENT_PAUSE_BLIND_MAX + gg.CONTENT_PAUSE_RETRY + 2  # the keeper answers again
+            d.content_pause_until()  # the outbox is empty, so no pass asks: ask as one would
+            d.content_pause_settle(10)
+        self.assertEqual((d.pause_failures, d.pause_timeouts, d.content_pause_unknown()), (0, 0, False))
+        self.assertEqual(d.content_pause_status()["answeredAgo"], 0)
+
+    def test_the_hold_report_runs_off_the_posts_path_with_its_own_bound(self) -> None:
+        # The report was bounded by the ask's 2 s on the post's path: a keeper waiting on its file lock was killed
+        # mid-write, and the pause the throttled write was to share never reached the other writers.
+        self.assertEqual(gg.CONTENT_PAUSE_REPORT_DEADLINE, 15)
+        self.assertEqual(gg.CONTENT_PAUSE_DEADLINE, 2)
+        item = self.queue("comment", "o/r#7", "--body", "x")
+        calls = self.pause_cmd(0, level=0)
+        (calls.parent / "slow-hold").touch()  # the report takes about 3 s: a 2 s bound killed it
+        d, t = self.daemon((403, {"retry-after": "120"}, {"message": (
+            "You have exceeded a secondary rate limit and have been temporarily blocked from content creation.")}),
+            (403, {"retry-after": "120"}, {"message": "temporarily blocked from content creation"}))
+        d.clock_real = False
+        bounds: list[float] = []
+        real = gg.run_bounded
+
+        def bounded(argv, timeout, *rest, **kw):
+            if "--hold" in argv:
+                bounds.append(timeout)
+            return real(argv, timeout, *rest, **kw)
+
+        with mock.patch.object(gg, "run_bounded", bounded):
+            started = time.monotonic()
+            self.step(d, NOW)
+            self.assertLess(time.monotonic() - started, 1.5)  # the post did not wait for the report
+            self.assertEqual((len(t.calls), gg.post_state(item["id"])["state"], d.pause_until),
+                             (1, "queued", NOW + 120))
+            d.content_pause_settle(20)
+            self.assertGreaterEqual(time.monotonic() - started, 2.5)
+            self.assertEqual(bounds, [15])
+            self.assertEqual([e for e in d.errors if e.startswith("content pause hold")], [])
+            self.assertEqual(calls.read_text().splitlines()[-1], "held")  # the keeper finished its write
+            (calls.parent / "slow-hold").unlink()
+            (calls.parent / "hang-hold").touch()
+            with mock.patch.object(gg, "CONTENT_PAUSE_REPORT_DEADLINE", 0.5):
+                d.report_content_pause(NOW + 300, "comment")
+                started = time.monotonic()
+                d.content_pause_settle(20)
+                self.assertLess(time.monotonic() - started, 1.5)  # killed at its own bound, not a fixed one
+        self.assertEqual(bounds, [15, 0.5])
+        self.assertIn("content pause hold: no answer within 0.5s", d.errors)
+        self.assertIsNone(d.pause_report)
 
     def test_the_pause_holds_writes_not_reads(self) -> None:
         self.queue("comment", "o/r#1", "--body", "one")
@@ -12225,7 +12663,7 @@ class PostTest(unittest.TestCase):
         d, t = self.daemon((201, {}, {"html_url": "u"}))
         status = d.tick(now=NOW)
         self.assertEqual(len(t.calls), 1)
-        self.assertEqual(status["outbox"], {"queued": 1, "holdUntil": None})
+        self.assertEqual(status["outbox"], {"queued": 1, "holdUntil": None, "pause": None})  # no keeper, no ask
 
 
 class PostJoinTest(unittest.TestCase):
@@ -16495,6 +16933,23 @@ class StaleDataTest(Base):
         self.assertEqual(gg.direct_parts_load(later), {})
         self.assertEqual(len(gg.direct_parts_load(time.time())), 2)
 
+    def test_land_refreshes_of_one_pr_coalesce_after_the_first_fresh_read(self) -> None:
+        """Two land workers noticing one stale PR share the first answer instead of repeating its pull/head reads."""
+        config = Path(self.tmp.name) / "upstream.json"
+        gg.write_json(config, {"command": ["/home/cmux/.local/bin/lane-gh", "glaeda-read"]})
+        patcher = mock.patch.object(gg, "UPSTREAM_CONFIG", config)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        gg.BASE.mkdir(parents=True, exist_ok=True)
+        self.gh.prs[("o", "r", 9)] = pr_node(9, rollup="SUCCESS", checks=[check_run("a")])
+        served: list[str] = []
+        with mock.patch.object(gg, "run_bounded", side_effect=self.broker_get(served)), \
+                mock.patch.object(gg, "gh_token", side_effect=AssertionError("read a login on an upstream host")):
+            self.assertIsNone(gg.land_direct_read("pr:o/r#9"))
+            self.assertIsNone(gg.land_direct_read("pr:o/r#9"))
+        self.assertEqual(len([p for p in served if p == "pulls/9"]), 1, served)
+        self.assertEqual(len([p for p in served if p.startswith("commits/")]), 3, served)
+
     def test_an_upstream_with_no_broker_get_still_says_why_it_cannot_read(self) -> None:
         """An upstream that is not lane-gh, with no "direct" command: the fallback refuses as before, and the
         "upstream" explanation keeps such a wait on its blocker (its own read could not help)."""
@@ -18314,6 +18769,21 @@ class LandTest(Base):
         self.assert_merged_at(LA)
         self.assertFalse((gg.land_dir() / gg.LAND_LATCH_FILE).exists())
 
+    def test_an_echo_mark_holds_no_land(self):
+        """huge-blue, 2026-11-18 09:05-09:43Z: our own quota refusal read back as GitHub's word held every land 37 min
+        past its wake. An echo (gh_latch.ECHO, lw#5869) is a guess no request made: each entry is judged (and parks on
+        its own refusal), the queue is not stopped; a GitHub-sourced mark still stops it."""
+        self.pr(LA)
+        self.land()
+        self.latch("graphql", self.t + 600)
+        self.tick(30)
+        self.assertEqual(self.reads(), (0, 0, 0, 0))
+        self.latch("graphql", self.t + 600, source=gg.LAND_LATCH_ECHO)
+        self.w.answers.append(ok_answer(LA))
+        self.tick(1)
+        self.assert_merged_at(LA)
+        self.assertFalse((gg.land_dir() / gg.LAND_LATCH_FILE).exists())
+
     def test_jitter_is_within_the_spread_and_fixed_per_caller(self):
         keys = [f"pr:o/r#{n}" for n in range(200)]
         offsets = [gg.land_jitter(k) for k in keys]
@@ -19581,6 +20051,7 @@ class ConfirmedUpdatedAtTest(Base):
                          {"updatedAtAt": 5.0, "data": {"headRefOid": "a", "updatedAt": "y"}})
         for node in ({"headRefOid": "b", "updatedAt": "y"}, {"headRefOid": "a"}, None):
             self.assertEqual(gg.confirmed_updated({"data": data}, node, 5.0), {})
+
 
 
 if __name__ == "__main__":
