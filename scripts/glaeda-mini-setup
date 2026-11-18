@@ -1169,11 +1169,29 @@ def agent_names(ctx: Context) -> list[str]:
         return [label for label in agent_plists(ctx)
                 if (not ctx.gh_only or is_update_agent(label) or is_gh_agent(label)
                     or label == LABEL_PREFIX + "disk-pressure")
-                and (runner_only_ok or label not in RUNNER_ONLY_AGENTS)]
+                and (runner_only_ok or label not in RUNNER_ONLY_AGENTS)
+                and not (is_reclaim_agent(label) and reclaim_owned_elsewhere(ctx))]
     if ctx.gh_only:
         return [name for name in LINUX_UNITS if name in GH_ONLY_LINUX_UNITS]
     return [name for name in LINUX_UNITS
-            if (ctx.role == "devbox" and ctx.projects_tidy) or name not in DEVBOX_LINUX_UNITS]
+            if ((ctx.role == "devbox" and ctx.projects_tidy) or name not in DEVBOX_LINUX_UNITS)
+            and not (is_reclaim_agent(name) and reclaim_owned_elsewhere(ctx))]
+
+
+# leo-workspace's hygiene reconciler (tools/host-baseline) runs worktree reclaim where it is installed and retires
+# glaeda's reclaim agent there as a legacy scheduler. On a Linux agent host, 2026-11-11 to 18:
+# each hourly OTA rerun reinstalled glaeda-worktree-reclaim, each ws-sync deleted it, and a run whose unit file
+# vanished mid-sweep was killed at systemd's default 90 s start timeout and left `not-found failed`. One owner:
+# where the reconciler is installed, setup leaves its reclaim agent out (and removes the one it owns).
+RECONCILER_LABEL = "ai.leo-workspace.hygiene-reconciler"
+
+
+def reclaim_owned_elsewhere(ctx: Context) -> bool:
+    if ctx.platform == "linux":
+        marker = ctx.home / ".config/systemd/user" / f"{RECONCILER_LABEL}.timer"
+    else:
+        marker = ctx.home / "Library/LaunchAgents" / f"{RECONCILER_LABEL}.plist"
+    return marker.is_file()
 
 
 def stale_agent_actions(ctx: Context, desired: set[str], owned: dict[str, str | None]) -> list[dict[str, Any]]:

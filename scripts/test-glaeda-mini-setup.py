@@ -1307,6 +1307,30 @@ class MiniSetupTest(unittest.TestCase):
             with mock.patch.object(ms, "run", fake_run):
                 ms.install_service_file(ctx, destination, b"headless plist\n", 0o644)
             self.assertEqual(destination.read_bytes(), b"headless plist\n")
+
+    def test_reclaim_agent_is_left_out_where_the_hygiene_reconciler_owns_reclaim(self) -> None:
+        """A Linux agent host, 2026-11: setup reinstalled glaeda-worktree-reclaim every hour, leo-workspace's host-baseline
+        deleted it after every sync, and a run whose unit vanished mid-sweep died at the default start timeout."""
+        for platform, marker, reclaim in (
+                ("linux", ".config/systemd/user/ai.leo-workspace.hygiene-reconciler.timer",
+                 {"glaeda-worktree-reclaim.service", "glaeda-worktree-reclaim.timer"}),
+                ("macos", "Library/LaunchAgents/ai.leo-workspace.hygiene-reconciler.plist",
+                 {"com.teamleaderleo.glaeda.worktree-reclaim"})):
+            with self.subTest(platform=platform):
+                ctx = ms.Context(self.home, False, "/usr/bin/python3", True, self.reclaim, None, None,
+                                 ms.CMUX_XCODE_APP, 50, hygiene_only=True, platform_name=platform)
+                with mock.patch.object(ms, "has_glaeda_runner", lambda *_: True):
+                    self.assertTrue(reclaim <= set(ms.agent_names(ctx)))
+                    path = self.home / marker
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_text("")
+                    names = set(ms.agent_names(ctx))
+                    path.unlink()
+                self.assertFalse(reclaim & names)
+                self.assertTrue(names)  # the rest of the profile stays
+        unit = (ms.REPO / "ops/systemd/glaeda-worktree-reclaim.service").read_text()
+        self.assertIn("TimeoutStartSec=", unit)
+
     def test_git_below_2_55_is_installed_with_our_brew_or_handed_to_the_operator(self) -> None:
         ctx = ms.Context(self.home, False, "/usr/bin/python3", True, self.reclaim, None, None,
                          ms.CMUX_XCODE_APP, 50, hygiene_only=True)
