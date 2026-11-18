@@ -13895,7 +13895,7 @@ class SpendAlarmTest(Base):
         self.assertEqual(list(view["hours"].values()), [42, 300])
 
     def test_past_the_cap_with_the_pool_above_its_floor_is_a_log_line_not_an_alarm(self) -> None:
-        """2026-11-18: big-red "60 counted REST past its cap of 0", huge-blue "151 past its cap of 150", cosmic-gray
+        """2026-11-18: a host with no share "60 counted REST past its cap of 0", huge-blue "151 past its cap of 150", cosmic-gray
         "301 past its cap of 300", while the login's pool had about 2000 an hour to spare. Nobody had anything to slow:
         one share-over log line an hour, no notice, no tell-coordinator; under the floor it is the alarm again."""
         self.policy()

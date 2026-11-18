@@ -3890,7 +3890,7 @@ class Daemon:
         its few exempt reads (a failed attempt's job list) warned on every one: the alarm needs spend past
         max(cap, SHARE_ALARM_FLOOR), though the cap itself still holds reads to 0.
         Past the cap it is an alarm only while the login's shared REST pool is under its floor (floors.rest): a host
-        over its share takes from no one while the pool has room. On 2026-11-18 it warned big-red (60 past a cap of
+        over its share takes from no one while the pool has room. On 2026-11-18 it warned a host with no share (60 past a cap of
         0), huge-blue (151 past 150) and cosmic-gray (301 past 300) while the pool had about 2000 an hour to spare;
         that is one share-over log line an hour now. The alarm names the one caller to slow (share_slow), read when
         it is sent."""
