@@ -2526,24 +2526,6 @@ class GlaedaDiskTest(unittest.TestCase):
                          "no aside tree left behind")
         self.assertTrue(lock.exists())
 
-        # A build the last job wrote minutes ago stays under its idle window, and goes at once below the runner
-        # floor (the floor hold) or the emergency floor, unless a job holds the root
-        fresh = make(ws / "Packages/macOS/CmuxNext/.build", mib=4, age_hours=0.1)
-        self.assertEqual(verdicts(), {"Packages/macOS/CmuxNext/.build": "recent"})
-        dev = fam.root.stat().st_dev
-        with mock.patch.object(gd, "FLOOR_HOLD", {dev: 1 << 60}):
-            self.assertEqual(verdicts(), {"Packages/macOS/CmuxNext/.build": "reclaimable"})
-        with mock.patch.object(gd, "EMERGENCY_DEVS", frozenset({dev})):
-            self.assertEqual(verdicts(), {"Packages/macOS/CmuxNext/.build": "reclaimable"})
-            late = open(lock, "a")
-            fcntl.flock(late, fcntl.LOCK_EX)
-            self.assertEqual(verdicts(), {"Packages/macOS/CmuxNext/.build": "in-use"})
-            late.close()
-        # a delete cut short after its rename leaves a deleting-named tree that the interrupted sweep finishes
-        aside = fresh.with_name(f"{gd.DELETING_PREFIX}.build-99")
-        os.rename(fresh, aside)
-        self.assertIn(aside.parent, [f.root for f in gd.interrupted_families(fams)])
-
         # per-slot cold builds (a runner checkout's, a SwiftPM scratch slot's) of the same size and age go first
         slot = make(self.root / "slot/.build", mib=4, age_hours=50)
         item = lambda path: gd.Item("x", os.fspath(path), 4 * 1024**2, 50.0, "reclaimable")
@@ -2551,6 +2533,38 @@ class GlaedaDiskTest(unittest.TestCase):
         spm = gd.spm_scratch_family(ci)
         self.assertLess(gd.value(item(next_build), fam), gd.value(item(slot), runner_build))
         self.assertLess(gd.value(item(next_build), fam), gd.value(item(slot), spm))
+
+    def test_a_fresh_seed_root_build_goes_only_below_a_floor(self) -> None:
+        """Review of glaeda#2137: nearly every fast-tier job rewrites the seed root's builds, so they never age past
+        the idle window. Below the runner floor (the floor hold) or the emergency floor they go once no job holds
+        the root, and a delete cut short leaves a deleting-named tree the interrupted sweep finishes."""
+        seed = self.root / "runner/_work/cmux"
+        ws = seed / "cmux"
+        fresh = make(ws / "Packages/macOS/CmuxNext/.build", mib=4, age_hours=0.1)
+        (seed / ".cmux-seed-root").touch()
+        lock = seed / gd.SEED_ROOT_LOCK
+        lock.touch()
+        with mock.patch.object(gd, "CMUX_SEED_ROOT", seed):
+            fams = [f for f in gd.fleet_families(self.root / "ci") if f.id == gd.SEED_ROOT_FAMILY]
+        dev = fams[0].root.stat().st_dev
+
+        def verdict() -> str:
+            got = {os.path.relpath(i.path, ws): i.verdict for i in gd.survey(fams, 6, 0)}
+            self.assertEqual(list(got), ["Packages/macOS/CmuxNext/.build"])
+            return got["Packages/macOS/CmuxNext/.build"]
+
+        self.assertEqual(verdict(), "recent")
+        with mock.patch.object(gd, "FLOOR_HOLD", {dev: 1 << 60}):
+            self.assertEqual(verdict(), "reclaimable")
+        with mock.patch.object(gd, "EMERGENCY_DEVS", frozenset({dev})):
+            self.assertEqual(verdict(), "reclaimable")
+            late = open(lock, "a")
+            fcntl.flock(late, fcntl.LOCK_EX)
+            self.assertEqual(verdict(), "in-use")
+            late.close()
+        aside = fresh.with_name(f"{gd.DELETING_PREFIX}.build-99")
+        os.rename(fresh, aside)
+        self.assertIn(aside.parent, [f.root for f in gd.interrupted_families(fams)])
 
     def test_canonical_root_admission_goes_under_its_root_token(self) -> None:
         """cmux7s, cmux12s, cmux13s, 2026-10-21: 8-9 GiB of admission DerivedData per idle canonical root stayed,
