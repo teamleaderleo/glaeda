@@ -8352,6 +8352,22 @@ LAND_HISTORY = 60
 LAND_KEEP = 7 * 86400  # finished entries are kept this long for `land status`
 LAND_COUNT_DAYS = 30
 LAND_TOUCH = TOUCH_EVERY  # the daemon re-registers the PRs, runs and comments it waits on this often
+# Only an entry that is due (queued, past its wake, or waiting on its own push's new head) holds a waited watch on its
+# PR (LandQueue.keep_watching). Every other open entry (a wait on its checks, a retry or a park whose wake is ahead,
+# waiting_after) asks for one unwaited, one-off read (register once=True, like `status`) at most this often, and a
+# latched one asks for nothing. huge-blue, 2026-11-18 20:00Z: 525 of the daemon's 725 pr watches were the land
+# queue's, every open entry's waited watch renewed every LAND_TOUCH, and pr caches fetched in the last 600 s: 0, so
+# even the PRs a due land needed were never read.
+LAND_PEEK_EVERY = 600.0
+# A due entry the login's latch skipped through this many latch windows (each a hold of the latch: LandQueue.hold)
+# tells its requester once, naming the latch and its end; from its second window it goes at the latch's clear without
+# the reset spread (land_latch_spread). huge-blue, 2026-11-18 17:18-19:53Z: 22 lands past their wake for 2-4 h
+# through five latch windows of 2-25 min each, nothing said to anyone. The real unblock is the App read pools
+# (leo-workspace#5944: gh_app_token.py ready --owner, latch_free).
+LAND_LATCH_STARVED_WINDOWS = 2
+# A due entry left unjudged this long past its wake with no latch (every worker busy: gated) is noted once in its
+# history and counted in the land-pool line (dueLate), so a wait past its wake always has a logged reason.
+LAND_DUE_LATE = 1800.0
 LAND_TEXT = 400  # a reason or step kept in an entry or a message, at most
 LAND_STOP_CLASSES = {"block": "block", "held": "hold", "chat_hold": "chat_hold", "classic_frozen": "classic_frozen",
                      "language_boundary": "language_boundary", "react_port": "react_port", "teammate": "teammate",
@@ -8963,7 +8979,8 @@ class LandQueue:
                  behind: Callable[[Path, int, float, float], str | None] = land_checkout_behind,
                  forward: Callable[[list[str], dict, float], dict] = land_forward,
                  broker_client: Callable[[], bool] = land_broker_client,
-                 snapshot_of: Callable[[str], dict | None] = read_rollup) -> None:
+                 snapshot_of: Callable[[str], dict | None] = read_rollup,
+                 peek: Callable[[str], None] | None = None) -> None:
         self.broker_client = broker_client
         self.snapshot_of = snapshot_of
         self.run = run or (lambda argv, timeout, env: self._run_real(argv, timeout, env))
@@ -8974,6 +8991,11 @@ class LandQueue:
         self.forward_fails = 0
         self.cache_of = cache_of
         self.watch = watch or (lambda key: register(key, waited=True, reader=f"tool:{LAND_TAG}"))
+        # one unwaited, one-off read of a key (LAND_PEEK_EVERY); a test's WATCH alone records both
+        self.peek = peek or ((lambda key: register(key, reader=f"tool:{LAND_TAG}", once=True)) if watch is None
+                             else self.watch)
+        self.peeked: dict[str, float] = {}
+        self.latch_started: float | None = None  # when the latch this pass sees began to hold (a window: hold)
         self.nudge = nudge or (lambda key: None)
         self.notice = notice or (lambda kind, level, text, data: None)
         self.inline = inline
@@ -9141,7 +9163,7 @@ class LandQueue:
             e.update(state="queued", head="", explain=None, action=None, streak=None, wakeAt=None,
                      wait=None, seen=None, seenHead="", mergeSha="", stop=None, preStepHead="",
                      lastAction=None, reviewed=[], updateSent=None, updateDeferred=None, waitRefused=None,
-                     waitBudget=None, afterStopped=None, reruns=None)
+                     waitBudget=None, afterStopped=None, reruns=None, latchHeld=None, dueLate=None)
             self.history(e, "queued", by=e["requester"], via=e["requesterFrom"], after=",".join(e["after"]))
         else:
             self.history(e, "updated", by=e["requester"], after=",".join(e["after"]))
@@ -9167,6 +9189,10 @@ class LandQueue:
         self.pass_gated, self.pass_first_gated = 0, None
         self.pass_latch = latch
         self.pass_latched = 0
+        if latch is None:
+            self.latch_started = None
+        elif self.latch_started is None:
+            self.latch_started = self.now
         for key in sorted(self.entries, key=self.judge_order):
             try:
                 e = self.entries[key]
@@ -9179,8 +9205,11 @@ class LandQueue:
                     continue
                 if latch is not None and not self.latch_free(e):
                     self.pass_latched += 1
+                    with self.lock:
+                        self.hold(e, latch)
                     continue  # a held latch: no judge, read, watch or nudge for this entry this pass
-                if ended is not None and self.now < ended + land_jitter(key, ended):
+                if ended is not None and self.now < ended + land_jitter(key, ended) \
+                        and int((e.get("latchHeld") or {}).get("windows") or 0) < LAND_LATCH_STARVED_WINDOWS:
                     continue  # the latch just ended: this entry's place in the reset spread is still ahead
                 with self.lock:
                     if self.parked(e):
@@ -9353,6 +9382,57 @@ class LandQueue:
                 log({"event": "land-latch-held", "pool": held[0], "until": held[1]})
         return latch
 
+    def due(self, e: dict) -> bool:
+        """Whether E is owed a judgment now: queued, or waiting past its wake (any kind, a park's too)."""
+        if e["state"] == "queued":
+            return True
+        wake = e.get("wakeAt")
+        return e["state"] == "waiting" and isinstance(wake, (int, float)) and not isinstance(wake, bool) \
+            and wake <= self.now
+
+    def due_since(self, e: dict) -> float:
+        """When E became due: its wake, else (queued) its last judgment, else when it was queued."""
+        wake = e.get("wakeAt")
+        if e["state"] == "waiting" and isinstance(wake, (int, float)) and not isinstance(wake, bool):
+            return float(wake)
+        at = (e.get("explain") or {}).get("at")
+        if not isinstance(at, (int, float)) or isinstance(at, bool):
+            at = e.get("created")
+        return float(at) if isinstance(at, (int, float)) and not isinstance(at, bool) else 0.0
+
+    def hold(self, e: dict, latch: tuple[str, float]) -> None:
+        """E, due, was skipped for the login's LATCH this pass: its status says so (latchHeld, land_line), once per
+        latch window in its history; at LAND_LATCH_STARVED_WINDOWS windows its requester is told once. An entry not
+        due is only skipped: it owes no judgment yet."""
+        if not self.due(e):
+            return
+        mark = e.get("latchHeld") or {}
+        window = self.latch_started if self.latch_started is not None else self.now
+        until = round(latch[1])
+        if mark.get("window") == window:
+            if mark.get("until") != until:
+                mark["until"] = until
+                self.save(e)
+            return
+        n = int(mark.get("windows") or 0) + 1
+        e["latchHeld"] = mark = {"pool": latch[0], "until": until, "window": window, "windows": n,
+                                 "since": float(mark.get("since") or self.now), "dueSince": self.due_since(e)}
+        self.history(e, "latch_held", pool=latch[0], until=utc_clock(until), windows=n)
+        if n == LAND_LATCH_STARVED_WINDOWS:
+            self.notify(e, e.get("requester") or "",
+                        f"glaeda land: {self.url(e)} has been due since {utc_clock(mark['dueSince'])} and not judged: "
+                        f"the login's {'REST' if latch[0] == 'rest' else 'GraphQL'} latch has held through {n} "
+                        f"windows (now until {utc_clock(until)}). It is judged first when the latch clears; nothing "
+                        "to do. The unblock is the App read pools (leo-workspace#5944)")
+        self.save(e)
+
+    def unhold(self, e: dict) -> None:
+        """E is judged: the latch no longer holds it (hold)."""
+        mark = e.pop("latchHeld", None)
+        if mark:
+            self.history(e, "latch_released", windows=mark.get("windows"),
+                         waited=round(self.now - float(mark.get("dueSince") or self.now)))
+
     def parked(self, e: dict) -> bool:
         """True while E is parked on a quota refusal (park_quota): nothing is read for it. Past its wake it is judged
         afresh, as a queued entry."""
@@ -9521,6 +9601,12 @@ class LandQueue:
         self.pass_gated += 1
         if self.pass_first_gated is None:
             self.pass_first_gated = e["key"]
+        if self.due(e) and self.now - self.due_since(e) >= LAND_DUE_LATE and not e.get("dueLate"):
+            # A wait past its wake always has a reason on record: here, every worker was busy (LAND_DUE_LATE)
+            e["dueLate"] = {"at": self.now, "since": self.due_since(e)}
+            self.history(e, "due_late", waited=round(self.now - self.due_since(e)), why="every worker busy",
+                         workers=self.workers(), busy=len(self.jobs))
+            self.save(e)
 
     def log_pool(self) -> None:
         """Once per LAND_POOL_LOG_EVERY, the pool as the last pass left it: workers busy and on what, snapshot waits,
@@ -9536,6 +9622,7 @@ class LandQueue:
             states: dict[str, int] = {}
             waits: dict[str, int] = {}
             due: list[tuple[float, str]] = []
+            held = late = 0
             for k, e in self.entries.items():
                 state = str(e.get("state") or "?")
                 if state in LAND_DONE:
@@ -9544,10 +9631,11 @@ class LandQueue:
                 if state == "waiting":
                     kind = str((e.get("wait") or {}).get("kind") or "?")
                     waits[kind] = waits.get(kind, 0) + 1
-                wake = e.get("wakeAt")
-                if k not in self.jobs and (state == "queued" or state == "waiting" and isinstance(wake, (int, float))
-                                           and not isinstance(wake, bool) and wake <= self.now):
-                    due.append((self.judge_order(k)[1], k))
+                if k not in self.jobs and self.due(e):
+                    since = self.due_since(e)
+                    due.append((since, k))
+                    held += 1 if e.get("latchHeld") else 0
+                    late += 1 if since and self.now - since >= LAND_DUE_LATE else 0
         oldest = min(due) if due else None
         latch = self.pass_latch
         log({"event": "land-pool", "workers": self.workers(),
@@ -9557,26 +9645,32 @@ class LandQueue:
              "firstGated": key_name(self.pass_first_gated) if self.pass_first_gated else None,
              "open": sum(states.values()), "states": states, "waits": waits,
              "latch": None if latch is None else {"pool": latch[0], "until": utc_clock(latch[1])},
-             "latched": self.pass_latched, "due": len(due),
+             "latched": self.pass_latched, "due": len(due), "dueLatchHeld": held, "dueLate": late,
              "oldestDue": None if oldest is None else {"pr": key_name(oldest[1]),
                                                        "waitingS": int(self.now - oldest[0]) if oldest[0] else None}})
 
-    def judge_order(self, key: str) -> tuple[int, float]:
+    def judge_order(self, key: str) -> tuple[int, int, float]:
         """The tick's order, so a free worker goes first to the land most likely to merge, then to the one that waited
         longest: a PR the cache shows CLEAN with no check running (one merge away) ahead of the rest, then by when it
         began to wait, its last judgment or else when it was queued (both on disk, so a restart does not start over
         from the same few). huge-blue, 2026-11-18 after glaeda#2161: "never judged" sorted first, so cmux#45661 (CLEAN,
-        60/60 green, judged hours before) sat behind every PR queued since and got no worker between two restarts."""
+        60/60 green, judged hours before) sat behind every PR queued since and got no worker between two restarts.
+        Within each, an entry that is due (queued or past its wake: due) goes ahead of one judged only because its
+        cache changed, oldest due first (by its wake, due_since), so a latch window's few workers go to the lands
+        waiting longest past their wake. huge-blue, 2026-11-18 17:18-19:53Z: 22 lands woke at 17:18 and, sorted by
+        their 17:17 judgment, sat behind 300 others through every short window between the login's latches."""
         e = self.entries[key]
         data = (self.cache_of(key) or {}).get("data") or {}
         head = str(data.get("headRefOid") or "")
         ready = data.get("state") == "OPEN" and data.get("mergeStateStatus") == "CLEAN" \
             and not land_checks_running(data, head)
+        if self.due(e):
+            return (0 if ready else 1), 0, self.due_since(e)
         at = (e.get("explain") or {}).get("at")
         if not isinstance(at, (int, float)) or isinstance(at, bool):
             at = e.get("created")
         since = float(at) if isinstance(at, (int, float)) and not isinstance(at, bool) else 0.0
-        return (0 if ready else 1), since
+        return (0 if ready else 1), 1, since
 
     def submit(self, key: str, fn: Callable[..., None], *args: Any) -> None:
         if self.inline:
@@ -9591,16 +9685,25 @@ class LandQueue:
 
     def keep_watching(self, e: dict) -> None:
         """The PR, its --after PRs and whatever it waits on stay watched and waited, so the daemon reads them at
-        full pace."""
-        keys = [e["key"], *e.get("after", [])]
+        full pace: only while E is due (due), or waits on its own push's new head. Otherwise (LAND_PEEK_EVERY) its PR
+        and --after PRs get one unwaited read per LAND_PEEK_EVERY, below every wait's in the daemon's order, and an
+        --after PR with its own entry here none (that entry reads it, and its merge shows in its state). The run or
+        comment a wait is on stays watched and waited: that is what it waits for."""
         w = e.get("wait") or {}
-        if w.get("kind") == "run" and w.get("key"):
-            keys.append(w["key"])
-        if w.get("kind") == "comment" and w.get("key"):
+        waited = self.due(e) or w.get("kind") == "head_change"
+        keys = [e["key"]] if waited else []
+        if w.get("kind") in ("run", "comment") and w.get("key"):
             keys.append(w["key"])
         for k in keys:
             if self.now - self.touched.get(k, float("-inf")) >= LAND_TOUCH:
                 self.watch_now(k)
+        peeks = [] if waited else [e["key"]]
+        peeks += [a for a in e.get("after", []) if a not in self.entries]
+        for k in peeks:
+            if self.now - self.peeked.get(k, float("-inf")) >= LAND_PEEK_EVERY:
+                self.peeked[k] = self.now
+                with contextlib.suppress(OSError, WatchError):
+                    self.peek(k)
 
     def watch_now(self, key: str) -> None:
         self.touched[key] = self.now
@@ -9941,11 +10044,14 @@ class LandQueue:
         elif self.snapshot_wait(e, sha, free):
             return False  # judged on the daemon's next read of this head (one read, shared), not on merge_hold's own
         if not free:
+            self.gated(e)  # a judgment it could start: ready, waiting for a worker
             return False
         c = self.cache_of(e["key"]) or {}
         head = str((c.get("data") or {}).get("headRefOid") or "").lower()
         e.update(state="judging", seen=fp, seenHead=head, seenChecks=land_check_fingerprint(c), keptFp=None,
                  judging={"sha": sha, "at": self.now, "counts": counts})
+        self.unhold(e)
+        e.pop("dueLate", None)
         self.save(e)
         self.submit(e["key"], self.job, e["key"], sha, int(e.get("gen") or 0))
         return True
@@ -10974,7 +11080,15 @@ def land_line(e: dict, now: float) -> str:
     if w.get("kind") == "quota" and e["state"] == "waiting" and isinstance(e.get("wakeAt"), (int, float)):
         bits.append(f"parked until {time.strftime('%H:%MZ', time.gmtime(e['wakeAt']))} (quota)")
     elif isinstance(e.get("wakeAt"), (int, float)) and e["state"] == "waiting":
-        bits.append(f"wakes {utc_clock(e['wakeAt'])}")
+        bits.append(f"{'woke' if e['wakeAt'] <= now else 'wakes'} {utc_clock(e['wakeAt'])}")
+    held = e.get("latchHeld") or {}
+    if held and e["state"] in ("queued", "waiting"):
+        # A due land the login's latch skips says so, never a silent wait past its wake (LandQueue.hold)
+        bits.append(f"held by the login latch until {time.strftime('%H:%MZ', time.gmtime(float(held.get('until') or 0)))}"
+                    f" ({held.get('windows')} window{'s' if held.get('windows') != 1 else ''}, due since "
+                    f"{utc_clock(float(held.get('dueSince') or 0))})")
+    elif (e.get("dueLate") or {}) and e["state"] in ("queued", "waiting"):
+        bits.append(f"due since {utc_clock(float(e['dueLate'].get('since') or 0))}: every worker busy")
     if e.get("after") and e["state"] == "waiting_after":
         bits.append("after " + ", ".join(key_name(a) for a in e["after"]))
     la = e.get("lastAction") or {}
