@@ -1512,8 +1512,12 @@ def seed_root_held(fam: Family, path: Path) -> bool:
 
 
 def remove_seed_root_build(fam: Family, path: Path) -> bool:
-    """Delete one package build in the seed root under an exclusive lock on its lock file, so no job takes the
-    root mid-delete. False, touching nothing, while a job holds it."""
+    """Under an exclusive lock on the seed root's lock file, so no job takes the root meanwhile, rename one package
+    build aside with remove()'s deleting name, then delete it outside the lock. A delete cut short leaves an aside
+    tree (interrupted_families finishes it), never a half .build the next job builds on. False, touching nothing,
+    while a job holds the root."""
+    if toolchain_held(path, fresh=True):
+        raise OSError("refusing the job toolchain (toolchain_keep)")
     if path.is_symlink():
         raise OSError("refusing symlink")
     if os.path.ismount(path) or path.lstat().st_dev != path.parent.stat().st_dev:
@@ -1523,7 +1527,9 @@ def remove_seed_root_build(fam: Family, path: Path) -> bool:
             fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             return False
-        shutil.rmtree(path, onerror=_chmod_retry)
+        doomed = path.with_name(f"{DELETING_PREFIX}{path.name}-{os.getpid()}")
+        os.rename(path, doomed)
+    shutil.rmtree(doomed, onerror=_chmod_retry)
     return True
 
 
@@ -1782,6 +1788,10 @@ def item_window(fam: Family, path: Path, idle_hours: float, archived: frozenset[
         return max(window, CMUX_TUI_SETTLE_HOURS)
     if fam.id == CMUX_NEXT_CI_FAMILY and (CMUX_NEXT_CI_DRAIN or cmux_next_ci_over()):
         return 0.0
+    if fam.id == SEED_ROOT_FAMILY:  # rewritten by nearly every fast-tier job, so its window rarely passes: below the
+        with contextlib.suppress(OSError):  # emergency floor it goes once no job holds it (the floor hold: below)
+            if fam.root.stat().st_dev in EMERGENCY_DEVS:
+                return 0.0
     if fam.id == SPM_SCRATCH:
         if path.name.startswith(SPM_TRASH):
             return 0.0
@@ -1804,8 +1814,9 @@ def floor_hold_family(fam: Family, path: Path) -> bool:
     it while a compile or a product consumer holds the root: canonical_root_held, re-checked at apply with fresh
     process evidence and taken exclusive to delete; the next compile on the root clears it anyway, and a rerun
     restores it from the artifact; a root without a token file keeps its 12 h window), and code-sign clones
-    (keep_live_app_clones and app_clone_running keep the live ones)."""
-    if (fam.id in (RUNNER_BUILD_FAMILY, RUNNER_ROOT_ADMISSION) or fam.app_clones
+    (keep_live_app_clones and app_clone_running keep the live ones), and the fast tier's seed root builds (its
+    lock keeps the ones a job holds)."""
+    if (fam.id in (RUNNER_BUILD_FAMILY, RUNNER_ROOT_ADMISSION, SEED_ROOT_FAMILY) or fam.app_clones
             or media_tour_warm_slot(fam, path)):
         return True
     if fam.id == CANONICAL_ADMISSION:  # only where the runner hook's token protocol is in force on this root
