@@ -1650,8 +1650,7 @@ in at the producer's root. So one root job per root per mini:
   `daemon-test-fleet`, `fleet-compile-check.yml`'s `compile-check`, `fleet-test-compile.yml`'s `compile` and
   `cmux-next-tip-test-compile.yml`'s `compile`, and the feat-cmux-next evals on `CI_EVAL_STEP_GATEWAY`:
   `cmux-next-perf-bench.yml`'s `bench`, `cu-driver-eval.yml`'s `eval` and `screen-stream-eval.yml`'s `eval`, whose
-  steps run on the bench mini or a measure worker, and `cmux-next-hot-verify.yml`'s `look`, whose step runs on a
-  display worker, and `native-sidebar-gallery.yml`'s `capture`, which submits the native sidebar suite to a
+  steps run on the bench mini or a measure worker, and `native-sidebar-gallery.yml`'s `capture`, which submits the native sidebar suite to a
   display worker and leaves its PNG archive in fleet storage); job-started refuses any other job at once. Its gate is never held
   for CPU saturation or the shared units, only for memory pressure, the disk floor, heat, the fleet's host claim,
   a nightly job waiting on the mini, a signing job waiting for the gateway tokens, or both gateway tokens taken.

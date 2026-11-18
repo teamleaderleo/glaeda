@@ -697,9 +697,8 @@ FAST_JOBS = {("cmux-next.yml", "fast-tier")}
 # cu-driver-eval.yml's and screen-stream-eval.yml's eval (cmux-ci run --label measure). Each only submits its step and
 # waits, but waits longer than a compile client (job timeouts 420, 150 and 300 min), holding one gateway token; a
 # nightly signing drain on that mini then waits its hour. They start once a day each, one at a time per workflow.
-# cmux-next-hot-verify.yml's look, the feat-cmux-next half of a pull request's hot verify, submits cmuxterm-hq's
-# build-fleet/pr_capture/fleet-step-hot-verify.sh (cmux-ci run --class light --display; the step runs on a display
-# worker) and waits up to 75 min, once per eligible pull request head (a newer head cancels it).
+# cmux-next-hot-verify.yml's look is no longer here: the cmux-ci controller queues that display step itself from the
+# workflow's request job and posts the result from a completion callback, so no runner waits for it (cmux#46197).
 # native-sidebar-gallery.yml's capture also submits a display-worker step; its gateway runs only the client
 # and shell builtins, checks the exact source and artifact receipt, and leaves the archive in fleet storage.
 # cmux-next-tab-switch.yml's frames (an advisory pull request check; Leo, 2026-11-15, asked for CI on tab switching)
@@ -723,8 +722,7 @@ GATEWAY_JOBS = frozenset({("cmux-next.yml", "app-compile-fleet"), ("cmux-next.ym
                           ("fleet-compile-check.yml", "compile-check"), ("fleet-test-compile.yml", "compile"),
                           ("cmux-next-tip-test-compile.yml", "compile"), ("cmux-next-perf-bench.yml", "bench"),
                           ("cu-driver-eval.yml", "eval"), ("screen-stream-eval.yml", "eval"),
-                          ("cmux-next-hot-verify.yml", "look"), ("native-sidebar-gallery.yml", "capture"),
-                          ("cmux-next-tab-switch.yml", "frames")})
+                          ("native-sidebar-gallery.yml", "capture"), ("cmux-next-tab-switch.yml", "frames")})
 GATEWAY_CAPACITY_WAIT_S = 600.0  # SIGNING_DRAIN_WAIT_S: the longest a nightly signing job waits here to drain the mini
 # exclusive (SIGNING_JOBS): more units than any mini has, so admission caps it at the mini's whole count, plus both
 # fast tokens and both gateway tokens, the capacity 0-unit jobs take (no PR client runs beside the key either), and
