@@ -628,6 +628,9 @@ class Family:
     # in mirror_exclude (a warm tree kept by role)
     mirror_include: tuple[str, ...] = ()
     mirror_exclude: tuple[str, ...] = ()
+    # an item's last use is the newest mtime anywhere below it (deep_newest_mtime), not near its top: a session's task
+    # output five levels down is its liveness, and a walk that cannot finish reads as used now (kept)
+    deep_mtime: bool = False
     platform: str = "unknown"  # macos | linux | shared | unknown; reporting only, never deletion authority
 
 
@@ -4837,8 +4840,11 @@ def default_families(role: str = "fleet-mini") -> list[Family]:
                git_disposable=True, nested_git=True, platform="shared"),
         # Scratch and disposable CI checkouts are cold after an hour under either pressure or an
         # idle sweep. Process, socket, root-token and git-loss checks still veto live or valuable work.
+        # On Linux the lane VM families take acpmux's per-user directory, /tmp/wt-* and /tmp/bsz item by item
+        # (lane_vm_families): as one "tmp" item each, a live session's TMPDIR kept a hundred closed ones'.
         Family("tmp", tmp, True, "agent scratch under the temp dir",
-               skip=(f"claude-{uid}",), files=True, max_idle_hours=1.0,
+               skip=(f"claude-{uid}", *(() if DARWIN else (f"acpmux-{uid}",))),
+               skip_prefixes=() if DARWIN else ("wt-", "bsz"), files=True, max_idle_hours=1.0,
                min_bytes=1024**2 if tmpfs or role == "devbox" else None, git_disposable=True, owner="agents and tools",
                rebuild_minutes=0.5, platform=host_cache_platform()),
         # cmux's cloud reload and CI jobs keep warm trees per unit (reload-cloud/{cmux-base,work},
@@ -4957,6 +4963,13 @@ def default_families(role: str = "fleet-mini") -> list[Family]:
         lib = next(i for i, f in enumerate(fams) if f.id == "library-caches")
         fams[lib] = replace(fams[lib], skip=(*fams[lib].skip, NIGHTLY_NEXT_ROOT))
         fams.append(nightly_next_family())
+    if not DARWIN:
+        # Claude Code's per-session task output and scratch (<slug>/<session id>) on a Linux lane VM: a session's
+        # task output five levels down is its liveness, so the same deep window and session holds apply
+        scratch = next(i for i, f in enumerate(fams) if f.id == "claude-scratchpad")
+        fams[scratch] = replace(fams[scratch], min_idle_hours=LANE_SESSION_IDLE_HOURS,
+                                mirror_idle_hours=LANE_SESSION_IDLE_HOURS, deep_mtime=True)
+        fams += lane_vm_families(tmp, uid)
     user_tmp = darwin_user_tmp() if DARWIN else None
     if user_tmp is not None:
         # Apple daemons keep live state in com.apple.* entries without holding them open.
@@ -5751,6 +5764,8 @@ def item_mtime(fam: Family, path: Path) -> float:
     owner retired (retired_owner) counts as unused since the epoch."""
     if fam.id in HOME_SCRATCH_FAMILIES and retired_owner(path):
         return 0.0
+    if fam.deep_mtime:
+        return deep_newest_mtime(path)
     # Git's index refresh rewrites metadata without using the build output. In
     # the enrolled-account profile that bookkeeping must not extend the cache's
     # reuse window. Active jobs are still protected by process evidence and the
@@ -6537,7 +6552,234 @@ def claude_session_active(session_id: str, idle_s: float) -> bool:
     return False
 
 
-DELETING_PREFIX = ".glaeda-disk-deleting-"  # remove() renames a tree to this before deleting it
+# A Linux lane VM's own families (lane_vm_families). One reached 100% (4.2 GB free of 495 GB) and its tests failed
+# with ENOSPC while this script found 0.0G reclaimable in 141 GiB: /tmp/wt-rd 23G, /tmp/claude-<uid> 17G, /tmp/bsz 13G
+# and /tmp/acpmux-<uid> 11G were each one "tmp" item, in use or unchecked as a whole, because a live session's
+# TMPDIR sits beside a hundred closed ones' (Leo: "there are dozens if not hundreds of gb of build stuff that just
+# keep getting accumulated. it's too much"). Each item now is one session's folder or one tree, and it goes only when
+# - its session is dead: acpmux lists it closed (a session acpmux does not list, or an unreadable list, keeps it),
+#   and no running process carries its id (ACPMUX_SESSION_ID in its environment, or the id in its command line);
+# - nothing holds it: no process has its cwd, an open file or its TMPDIR below it, no command names it, no open
+#   acpmux session works in it (tools/wt's session_hold), no live socket sits in it;
+# - nothing below it changed for LANE_SESSION_IDLE_HOURS, however deep (deep_newest_mtime);
+# and, as a mirror (mirror_idle_hours), only after its unpushed commits and uncommitted work went to ~/archive.
+LANE_SESSION_IDLE_HOURS = 6.0
+ACPMUX_SESSION_TMP = "acpmux-session-tmp"
+TMP_WORKTREES = "tmp-worktrees"
+TMP_BSZ = "tmp-bsz"
+LANE_TMP_FAMILY_IDS = frozenset({ACPMUX_SESSION_TMP, TMP_WORKTREES, TMP_BSZ})
+SESSION_HOLD_FAMILY_IDS = LANE_TMP_FAMILY_IDS | {"claude-scratchpad"}
+ACPMUX_DEAD_STATUSES = frozenset({"closed"})  # acpmux's own: a closed session's folder goes at its purge
+SESSION_ID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+SESSION_ENV_KEYS = ("ACPMUX_SESSION_ID",)
+SESSION_TMP_ENV_KEYS = ("TMPDIR", "ACPMUX_SESSION_TMPDIR")
+DEEP_MTIME_BUDGET = 400_000  # entries; a tree past it reads as used now (kept)
+ACPMUX_LS_TIMEOUT_S = 120
+_ACPMUX_ROWS: list[dict] | None | bool = False  # False: not read yet this run
+_SESSION_ENV: tuple[frozenset[str], frozenset[str]] | None | bool = False
+
+
+def deep_newest_mtime(path: Path, budget: int = DEEP_MTIME_BUDGET) -> float:
+    """The newest mtime of path and everything below it (lstat, never following a link). Now, so the item reads as
+    just used, when the walk cannot finish: past BUDGET entries, a directory it cannot list, another filesystem."""
+    now = time.time()
+    try:
+        st = path.lstat()
+    except FileNotFoundError:
+        return 0.0
+    except OSError:
+        return now
+    newest, dev = st.st_mtime, st.st_dev
+    if not stat.S_ISDIR(st.st_mode):
+        return newest
+    stack = [os.fspath(path)]
+    while stack:
+        d = stack.pop()
+        try:
+            with os.scandir(d) as it:
+                for e in it:
+                    budget -= 1
+                    if budget < 0:
+                        return now
+                    try:
+                        est = e.stat(follow_symlinks=False)
+                    except FileNotFoundError:
+                        continue
+                    except OSError:
+                        return now
+                    newest = max(newest, est.st_mtime)
+                    if stat.S_ISDIR(est.st_mode):
+                        if est.st_dev != dev:
+                            return now  # a mount inside: not this tree's to judge
+                        stack.append(e.path)
+        except FileNotFoundError:
+            continue
+        except OSError:
+            return now
+    return newest
+
+
+def acpmux_home() -> Path:
+    return Path(os.environ.get("ACPMUX_HOME") or HOME / ".acpmux")
+
+
+def acpmux_rows(fresh: bool = False) -> list[dict] | None:
+    """This host's acpmux sessions (`acpmux ls --json`, no peer's), read once per run unless FRESH. [] where acpmux is
+    not used (no program, no ~/.acpmux); None when it is used but its list cannot be read (every session is kept)."""
+    global _ACPMUX_ROWS
+    if not fresh and _ACPMUX_ROWS is not False:
+        return _ACPMUX_ROWS  # type: ignore[return-value]
+    exe = shutil.which("acpmux") or (os.fspath(HOME / ".local/bin/acpmux")
+                                     if os.access(HOME / ".local/bin/acpmux", os.X_OK) else None)
+    rows: list[dict] | None
+    if exe is None:
+        rows = None if acpmux_home().exists() else []
+    else:
+        try:
+            code, out = _owned_query([exe, "ls", "--json", "--fields",
+                                      "sessionId,agentSessionId,status,peer,cwd,name"], ACPMUX_LS_TIMEOUT_S)
+            got = json.loads(out) if code == 0 else None
+            rows = got.get("sessions") if isinstance(got, dict) else None
+            if not isinstance(rows, list) or not all(isinstance(r, dict) for r in rows):
+                rows = None
+        except (OSError, ValueError, subprocess.TimeoutExpired):
+            rows = None
+    if rows is not None:
+        rows = [r for r in rows if not r.get("peer")]
+    _ACPMUX_ROWS = rows
+    return rows
+
+
+def session_env(fresh: bool = False) -> tuple[frozenset[str], frozenset[str]] | None:
+    """(session ids, TMPDIRs) in this user's running processes' environments (/proc/<pid>/environ), read once per run
+    unless FRESH; None when /proc cannot show them (every session is kept)."""
+    global _SESSION_ENV
+    if not fresh and _SESSION_ENV is not False:
+        return _SESSION_ENV  # type: ignore[return-value]
+    proc = Path("/proc")
+    ids: set[str] = set()
+    dirs: set[str] = set()
+    read = 0
+    uid = os.getuid()
+    result: tuple[frozenset[str], frozenset[str]] | None = None
+    if not DARWIN and proc.is_dir():
+        for pid in proc.iterdir():
+            if not pid.name.isdigit():
+                continue
+            try:
+                if pid.stat().st_uid != uid:
+                    continue
+                raw = (pid / "environ").read_bytes()
+            except OSError:
+                continue  # exited, or another user's
+            read += 1
+            for entry in raw.split(b"\0"):
+                key, _, value = entry.decode("utf-8", "replace").partition("=")
+                if key in SESSION_ENV_KEYS and value:
+                    ids.add(value)
+                elif key in SESSION_TMP_ENV_KEYS and value.startswith("/"):
+                    dirs.update({value.rstrip("/") or "/", os.path.realpath(value)})
+        if read:  # this process at least: none read means /proc is unusable
+            result = frozenset(ids), frozenset(dirs)
+    _SESSION_ENV = result
+    return result
+
+
+def _within(inner: str, outer: str) -> bool:
+    return inner == outer or inner.startswith(outer.rstrip("/") + "/")
+
+
+def session_hold(fam: Family, path: Path, cmds: str, fresh: bool = False) -> str:
+    """Why a lane VM's session or scratch item is live (SESSION_HOLD_FAMILY_IDS), or "" when it is provably not.
+    Unknown liveness is a hold: an unreadable acpmux list or process table, a session acpmux does not list."""
+    if fam.id not in SESSION_HOLD_FAMILY_IDS:
+        return ""
+    name = path.name
+    real = os.path.realpath(path)
+    mine = {os.fspath(path), real}
+    rows = acpmux_rows(fresh)
+    if rows is None:
+        return "acpmux session list unreadable: liveness unknown"
+    for r in rows:
+        if r.get("status") in ACPMUX_DEAD_STATUSES or not isinstance(r.get("cwd"), str) or not r["cwd"]:
+            continue
+        cwd = r["cwd"]
+        if any(_within(c, m) for c in (cwd, os.path.realpath(cwd)) for m in mine):
+            return f"the cwd of open acpmux session {r.get('name') or r.get('sessionId')}"
+    if fam.id == ACPMUX_SESSION_TMP:
+        if not SESSION_ID_RE.fullmatch(name):
+            return "not a session folder (acpmux names each by its session id)"
+        row = next((r for r in rows if r.get("sessionId") == name), None)
+        if row is None:
+            return "a session acpmux does not list: liveness unknown"
+        if row.get("status") not in ACPMUX_DEAD_STATUSES:
+            return f"acpmux session {row.get('name') or name} is {row.get('status') or 'in an unknown state'}"
+    if fam.id == "claude-scratchpad":
+        for r in rows:
+            if r.get("agentSessionId") == name and r.get("status") not in ACPMUX_DEAD_STATUSES:
+                return f"its Claude session is acpmux session {r.get('name') or r.get('sessionId')} " \
+                       f"({r.get('status') or 'unknown state'})"
+    env = session_env(fresh)
+    if env is None:
+        return "process environments unreadable: liveness unknown"
+    ids, dirs = env
+    if name in ids:
+        return "a running process belongs to the session (ACPMUX_SESSION_ID)"
+    if any(_within(d, m) for d in dirs for m in mine):
+        return "a running process's TMPDIR is in it"
+    if SESSION_ID_RE.fullmatch(name) and re.search(r"(?<![0-9a-f-])" + re.escape(name) + r"(?![0-9a-f-])", cmds):
+        return "a running command names its session id"
+    return ""
+
+
+def acpmux_daemon_roots(base: Path) -> list[Path]:
+    """The per-daemon roots in acpmux's per-user directory (<base>/t/<hash>) whose .home names the acpmux home this
+    host's `acpmux ls` answers for. Another daemon's root (a test's, a Chief home's) is that daemon's to sweep."""
+    out: list[Path] = []
+    try:
+        entries = sorted((base / "t").iterdir())
+    except OSError:
+        return out
+    want = os.path.realpath(acpmux_home())
+    for d in entries:
+        try:
+            if d.is_symlink() or not d.is_dir() or d.lstat().st_uid != os.getuid():
+                continue
+            named = (d / ".home").read_text().strip()
+        except OSError:
+            continue
+        if named and os.path.realpath(named) == want:
+            out.append(d)
+    return out
+
+
+def lane_vm_families(tmp: Path, uid: int) -> list[Family]:
+    """A Linux host's agent scratch, one item per session or tree (see LANE_SESSION_IDLE_HOURS)."""
+    window = LANE_SESSION_IDLE_HOURS
+    # A closed session's TMPDIR goes whole, as acpmux's own purge takes it (session_tmp.rs: "a purge removes it"):
+    # it is scratch by contract, and on a lane VM it is mostly test fixtures (empty `git init` repos, fake remotes)
+    # that no bundle can hold, so a mirror's git veto kept every one (a lane VM, 2026-11-18: 17.9G of four closed
+    # sessions, all "uncommitted: no HEAD" or "unreadable refs"). The session holds and the 6 h window still apply.
+    fams = [
+        Family(ACPMUX_SESSION_TMP, root, True, "a closed session's TMPDIR: acpmux makes it again if the session resumes",
+               skip_prefixes=(".",), build_output=True, min_idle_hours=window, deep_mtime=True,
+               owner="acpmux (one TMPDIR per session)", rebuild_minutes=0.5, platform="linux")
+        for root in acpmux_daemon_roots(tmp / f"acpmux-{uid}")
+    ]
+    fams.append(Family(TMP_WORKTREES, tmp, True, "the lane that left it adds the worktree again",
+                       include=("wt-",), git_disposable=True, nested_git=True, min_idle_hours=window,
+                       mirror_idle_hours=window, deep_mtime=True, owner="agent lanes (git worktree add /tmp/wt-*)",
+                       rebuild_minutes=2, platform="linux"))
+    # No tool writes /tmp/bsz: an agent's bundle-size analysis scratch (cmuxterm-hq docs/perf/bundle-size.md names
+    # /tmp/bsz/tools/symmap.py). With no owner's rule, it goes by age and no holder, like the rest.
+    fams.append(Family(TMP_BSZ, tmp, True, "the bundle-size analysis that left it runs again",
+                       include=("bsz",), git_disposable=True, nested_git=True, min_idle_hours=window,
+                       mirror_idle_hours=window, deep_mtime=True, owner="bundle-size analysis scratch (no owning tool)",
+                       rebuild_minutes=2, platform="linux"))
+    return fams
+
+
+DELETING_PREFIX =".glaeda-disk-deleting-"  # remove() renames a tree to this before deleting it
 DELETING_RE = re.compile(re.escape(DELETING_PREFIX) + r".+-([0-9]+)")  # ...<name>-<pid of the deleter>
 
 
@@ -9953,8 +10195,10 @@ def _survey(families, idle_hours, min_bytes, known, evidence, defer_bulk=False,
             reasons.append("open by a process")
         if named_by(sp, cmds):
             reasons.append("named by a running command")
-        if fam.id == "claude-scratchpad" and claude_session_active(path.name, idle_hours * 3600):
+        if fam.id == "claude-scratchpad" and claude_session_active(path.name, idle_window(fam, idle_hours) * 3600):
             reasons.append("claude session active")
+        if fam.id in SESSION_HOLD_FAMILY_IDS and not blind and (why := session_hold(fam, path, cmds)):
+            reasons.append(why)
         references = frozenset()
         if fam.reference_root is not None:
             key = os.fspath(fam.reference_root)
@@ -12134,6 +12378,8 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
             return (-0.5, value(i, families[i.family]), 0, 0)
         if i.family == RUNNER_GIT_GARBAGE_FAMILY:  # garbage nothing reads goes before anything that costs a rebuild
             return (2, 0, i.idle_hours, i.bytes)
+        if family_of(i).deep_mtime:  # a dead session's or lane's scratch: least recently modified first
+            return (0.5, i.idle_hours, i.bytes, 0)
         if cmux_next_ci_fallback_item(family_of(i), Path(i.path)):  # due by its own window: first of its band
             return (0, math.inf, i.idle_hours, i.bytes)
         if ACTIVITY_MODE == "pressure" and (i.family in FLEET_FAMILY_IDS or i.family == RUNNER_BUILD_FAMILY):
@@ -12192,6 +12438,7 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
             break
         if fam.id in FLEET_FAMILY_IDS or fam.id in (CMUX_NEXT_CI_FAMILY, HQ_CACHE_FAMILY, CANONICAL_ADMISSION,
                                                      RUNNER_ROOT_ADMISSION, NIGHTLY_NEXT_FAMILY) \
+                or fam.id in SESSION_HOLD_FAMILY_IDS \
                 or media_tour_dd(fam, p) or budget_only(fam, i, idle_hours) or (
                 fam.id == INTERRUPTED and fam.root in cmux_next_ci_aside_parents(HOME / "Library/Caches" / CMUX_NEXT_CI_ROOT)):
             # Pressure eligibility is intentionally broad, so take fresh cwd/open-file evidence immediately
@@ -12256,7 +12503,8 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
                 or in_cwd(i.path, cwds) or named_by(i.path, cmds) or holds_socket(p) or job_busy(fam, p)
                 or (fam.reference_root is not None
                     and artifact_referenced(p, fresh_artifact_references(fam.reference_root)))
-                or (i.family == "claude-scratchpad" and claude_session_active(p.name, idle_hours * 3600))
+                or (i.family == "claude-scratchpad" and claude_session_active(p.name, idle_window(fam, idle_hours) * 3600))
+                or (fam.id in SESSION_HOLD_FAMILY_IDS and session_hold(fam, p, cmds, fresh=True))
                 or (i.family == SPM_SCRATCH and spm_scratch_held(p))
                 or (i.family == SEED_ROOT_FAMILY and seed_root_held(fam, p))
                 or (i.family == CANONICAL_ADMISSION and canonical_root_held(p))
