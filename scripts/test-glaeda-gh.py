@@ -13875,9 +13875,68 @@ class SpendAlarmTest(Base):
             self.daemon.rest_minutes = {minute: n}
             self.assertIsNone(self.daemon.share_alarm(0, []), n)
         self.daemon.rest_minutes = {minute: 51}
+        self.assertIsNone(self.daemon.share_alarm(0, []))  # the pool is unseen: nothing to take from
+        self.seen(900, self.daemon.now, self.daemon.now + 1200)
         alarm = self.daemon.share_alarm(0, [])
         self.assertIsNotNone(alarm)
         self.assertIn("past its cap of 0", alarm[1])
+
+    def test_rest_spend_is_kept_by_the_hour_for_a_day(self) -> None:
+        """Caps are set from a day of real use: minutes leaving the trailing hour fold into rest-hours.json, kept
+        REST_HOURS_KEEP hours across restarts, and daemon.json shows the whole hours and their peak."""
+        hour = int(self.daemon.clock() // 3600)
+        self.daemon.fold_rest_hours({(hour - 30) * 60: 7, (hour - 3) * 60 + 5: 40, (hour - 3) * 60 + 50: 2,
+                                     (hour - 2) * 60: 300, (hour - 1) * 60: 9})
+        self.assertEqual(self.daemon.rest_hours, {hour - 3: 42, hour - 2: 300, hour - 1: 9})  # 30 h back dropped
+        again = gg.Daemon(transport=lambda *a: (200, {}, b"{}"), token=lambda: TOKEN, controller=None)
+        self.assertEqual(again.rest_hours, self.daemon.rest_hours)
+        view = self.daemon.rest_hours_view()
+        self.assertEqual(view["peak"], 300)  # hour - 1 still has minutes in the trailing hour: not whole yet
+        self.assertEqual(list(view["hours"].values()), [42, 300])
+
+    def test_past_the_cap_with_the_pool_above_its_floor_is_a_log_line_not_an_alarm(self) -> None:
+        """2026-11-18: big-red "60 counted REST past its cap of 0", huge-blue "151 past its cap of 150", cosmic-gray
+        "301 past its cap of 300", while the login's pool had about 2000 an hour to spare. Nobody had anything to slow:
+        one share-over log line an hour, no notice, no tell-coordinator; under the floor it is the alarm again."""
+        self.policy()
+        self.daemon.policy = {**self.daemon.policy, "restShare": 0.03}  # a cap of 150
+        minute = int(self.daemon.clock() // 60)
+        self.daemon.rest_minutes = {minute: 151}
+        self.seen(3200, self.daemon.now, self.daemon.now + 1800)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.daemon.check_alarms()
+            self.daemon.now += 60
+            self.daemon.check_alarms()
+        self.assertEqual(self.told_lines(), [])
+        self.assertEqual(self.notice_lines(), [])
+        lines = [json.loads(x) for x in out.getvalue().splitlines() if '"share-over"' in x]
+        self.assertEqual(len(lines), 1, out.getvalue())
+        self.assertEqual((lines[0]["spent"], lines[0]["cap"], lines[0]["left"], lines[0]["floor"]), (151, 150, 3200, 1500))
+        self.seen(1400, self.daemon.now + 60, self.daemon.now + 1800)
+        self.daemon.check_alarms()
+        told = self.told_lines()
+        self.assertEqual(len(told), 1, told)
+        self.assertIn("past its cap of 150, with the login's REST pool at 1400 (under its floor of 1500)", told[0])
+
+    def test_the_share_alarm_names_the_logins_top_caller_when_it_outspends_the_daemons_waiters(self) -> None:
+        """The pool is the login's: when a gh caller on this host spent more than any waiter of the daemon's, that
+        caller is the one to slow, never the daemon itself."""
+        self.policy()
+        self.spenders([{"caller": "daemon:glaeda-gh", "rest": 2000, "graphql": 0, "source": "glaeda-gh"},
+                       {"caller": "tool:pr_owner.py", "rest": 900, "graphql": 3, "source": "gh shim"}])
+        self.daemon.policy = {**self.daemon.policy, "restShare": 0.03}
+        self.daemon.transport = lambda *a: (200, {}, b"{}")
+        with self.daemon.calling("pr", "o/r", "session:lane-7"):
+            for n in range(160):
+                self.daemon.request("GET", f"/repos/o/r/pulls/{n}")
+        self.seen(1000, self.daemon.now, self.daemon.now + 1800)
+        self.daemon.check_alarms()
+        told = self.told_lines()
+        self.assertEqual(len(told), 1, told)
+        self.assertIn("Slow tool:pr_owner.py (900 REST this hour, gh shim)", told[0])
+        self.assertNotIn("Slow session:lane-7", told[0])
+        self.assertEqual(self.notice_lines()[-1]["data"]["slow"]["caller"], "tool:pr_owner.py")
 
     def test_the_share_alarm_fires_on_the_measured_hour_and_names_the_waiter_to_shed(self) -> None:
         """Past the cap over the measured trailing hour (what the cap exempts, or a restYield), the alarm names the
@@ -13900,12 +13959,14 @@ class SpendAlarmTest(Base):
         with self.daemon.calling("outbox", "o/r"), mock.patch.object(self.daemon, "writing", True):
             for n in range(200):  # sessions' writes are not the share's
                 self.daemon.request("POST", f"/repos/o/r/issues/{n}/comments", content=True)
-        self.daemon.now = NOW
+        self.seen(1200, NOW, NOW + 1800)  # the login's pool under its floor of 1500
+        self.spenders([{"caller": "daemon:glaeda-gh", "rest": 620, "graphql": 0, "source": "glaeda-gh"},
+                       {"caller": "tool:quiet.py", "rest": 40, "graphql": 0, "source": "gh shim"}])
         self.daemon.check_alarms()
         told = self.told_lines()
         self.assertEqual(len(told), 1, told)
         self.assertIn("spent 620 counted REST in the last hour, past its cap of 300", told[0])
-        self.assertIn("Shed session:lane-7 (250 counted REST)", told[0])
+        self.assertIn("Slow session:lane-7 (250 counted REST, its glaeda-gh waits)", told[0])
         self.assertIn("GET /repos/{owner}/{repo}/commits/{sha}/check-runs?check_name&per_page 250 (pr o/r; waiter "
                       "session:lane-7)", told[0])
         self.assertEqual(self.notice_lines()[-1]["data"]["shed"], {"waiter": "session:lane-7", "counted": 250})
@@ -15027,7 +15088,8 @@ class DaemonPolicyTest(Base):
         self.spend_rest(990)
         self.daemon.tick(NOW)
         status = gg.read_json(gg.BASE / "daemon.json")
-        self.assertEqual(status["restShare"], {"spent": 990, "cap": 2000, "yield": 0, "share": 0.4, "capped": False})
+        self.assertEqual(status["restShare"], {"spent": 990, "cap": 2000, "yield": 0, "share": 0.4, "capped": False,
+                                               "hours": {"peak": 0, "hours": {}}})
         lock = open(gg.BASE / "daemon.lock", "a+")
         fcntl.flock(lock, fcntl.LOCK_EX)
         try:

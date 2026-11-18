@@ -144,7 +144,9 @@ the daemon is the only process that talks to GitHub, and clients only read its c
   drain over the last minutes runs it dry before its reset, or that drain is past alarms.paceShare (0.5) of the
   hourly limit (42 a minute of 5000); it names the host's top REST callers (gh-quota usage) as well as this
   daemon's routes and their waiters. The share alarm (every host) when this daemon's own counted REST over
-  the measured last hour is past its cap, naming the waiter to shed; a fast 10 minutes inside a measured hour
+  the measured last hour is past its cap while the login's REST pool is under its floor (floors.rest), naming
+  the one caller to slow (the host's top gh caller, or the daemon's top waiter); past the cap with the pool
+  above its floor is one share-over log line an hour. A fast 10 minutes inside a measured hour
   under the cap is only a share-pace log line ("nothing to do, projection only"), as the cap holds the hour. Each is a notice line in
   ~/.local/state/notices/glaeda-gh.jsonl and a `tell-coordinator --from glaeda-gh` (WARN, or FIRE under the
   reserve or within 10 minutes of dry), naming the top routes; at most once an hour unless it gets worse.
@@ -372,6 +374,11 @@ DAEMON_CONFIG = Path.home() / ".config/glaeda/gh-daemon.json"  # cycle, commentC
 FLEET_POLICY = Path.home() / ".local/share/glaeda/gh-daemon.json"
 UPDATE_CONFIG = Path.home() / ".config/glaeda/update.json"
 REST_SPEND_FILE = "rest-spend.json"  # the daemon's counted REST requests per minute, kept across restarts
+# The same counts by the hour (epoch // 3600 -> counted), folded in as minutes leave rest-spend.json's hour and kept
+# REST_HOURS_KEEP hours, so a cap is set from a day of real use (daemon.json restShare.hours). On 2026-11-18 the caps
+# had to be set from alarm lines, as no host kept more than the last hour.
+REST_HOURS_FILE = "rest-hours.json"
+REST_HOURS_KEEP = 25
 # What the daemon spent by path: per minute, REST requests by route template (GET /repos/{owner}/{repo}/pulls/{id})
 # and GraphQL points by query name (pr, run, last-real-attempt, ...), each with the caller that made it (the watch
 # kind and repository, or outbox for a session's queued write). rest-spend.json says how much; this says on what.
@@ -1122,6 +1129,26 @@ def host_spenders(run: Callable[..., Any] = subprocess.run) -> tuple[list[dict],
     rows.sort(key=lambda r: (-r["rest"], str(r.get("caller"))))
     return ([{k: r.get(k) for k in ("caller", "rest", "graphql", "source", "host") if k in r} for r in rows[:SPENDERS_TOP]],
             sum(r["rest"] for r in rows))
+
+
+def share_slow(shed: dict | None, spenders: list[dict]) -> dict | None:
+    """The one caller the share alarm names to slow: the login's top REST spender on this host (host_spenders), unless
+    that is this daemon, or the daemon's top waiter (share_alarm's shed) spent more; then that waiter. None when
+    neither is known."""
+    other = next((r for r in spenders if not str(r.get("caller") or "").startswith("daemon:")), None)
+    if shed and (other is None or shed["counted"] >= other["rest"]):
+        return {"caller": shed["waiter"], "rest": shed["counted"], "via": "glaeda-gh waits"}
+    if other is not None:
+        return {"caller": other["caller"], "rest": other["rest"], "via": other.get("source") or "gh"}
+    return None
+
+
+def share_slow_text(slow: dict | None) -> str:
+    if slow is None:
+        return "No caller to slow is known: the spend is the daemon's own; check restYield in its policy."
+    if slow["via"] == "glaeda-gh waits":
+        return f"Slow {slow['caller']} ({slow['rest']} counted REST, its glaeda-gh waits): end or slow its waits."
+    return f"Slow {slow['caller']} ({slow['rest']} REST this hour, {slow['via']}): the login's top REST caller here."
 
 
 # The pool alarm names the REST no log on this host holds, once it is this share of what the pool spent and at least
@@ -3370,6 +3397,7 @@ class Daemon:
         self.named_reads: dict[str, tuple[str | None, Any]] = load_named_reads(read_json(BASE / NAMED_READS_FILE))
         self.named_dirty = False
         self.share_pace_at = float("-inf")  # the last share-pace log line (share_alarm)
+        self.share_over_at = float("-inf")  # the last share-over log line (share_alarm: past the cap, the pool fine)
         self.token_source = token
         self.token: str | None = None
         doc = read_json(BASE / "budget.json")
@@ -3460,6 +3488,10 @@ class Daemon:
             int(k): int(v) for k, v in (spend if isinstance(spend, dict) else {}).items()
             if str(k).isdigit() and isinstance(v, int) and not isinstance(v, bool) and v > 0}
         self.saved_rest_minutes = dict(self.rest_minutes)
+        hours = read_json(BASE / REST_HOURS_FILE)
+        self.rest_hours: dict[int, int] = {
+            int(k): int(v) for k, v in (hours if isinstance(hours, dict) else {}).items()
+            if str(k).isdigit() and isinstance(v, int) and not isinstance(v, bool) and v > 0}
         # the spend log (SPEND_FILE): minute -> "bucket\troute\tkind\trepo" -> [requests, counted, points]
         self.spend: dict[int, dict[str, list[int]]] = load_spend(read_json(BASE / SPEND_FILE))
         self.spend_saved_at = float("-inf")
@@ -3824,6 +3856,11 @@ class Daemon:
                                               fleet=any(r.get("host") for r in spenders))
                 data = {**data, "spenders": spenders, "hostRest": host_rest, "unlogged": gap}
                 text += " " + spenders_text(spenders) + gap_text
+            if name == "share":  # read only when it is sent, like the pool's
+                spenders, _ = host_spenders()
+                slow = share_slow(data.get("shed"), spenders)
+                data = {**data, "spenders": spenders, "slow": slow}
+                text = text.replace(" Top routes, last hour:", f" {share_slow_text(slow)} Top routes, last hour:", 1)
             self.send_alarm(name, level, text, data)
             self.alarms[name] = {"at": self.now, "level": level, "text": text,
                                  **({"reset": data["reset"]} if "reset" in data else {})}
@@ -3849,7 +3886,12 @@ class Daemon:
         anyone to do (2026-11-15: "306/h against its cap of 150 (142 in the last hour)").
         A restShare of 0 (every host the config does not name: PR and run reads over GraphQL only) is a cap of 0, and
         its few exempt reads (a failed attempt's job list) warned on every one: the alarm needs spend past
-        max(cap, SHARE_ALARM_FLOOR), though the cap itself still holds reads to 0."""
+        max(cap, SHARE_ALARM_FLOOR), though the cap itself still holds reads to 0.
+        Past the cap it is an alarm only while the login's shared REST pool is under its floor (floors.rest): a host
+        over its share takes from no one while the pool has room. On 2026-11-18 it warned big-red (60 past a cap of
+        0), huge-blue (151 past 150) and cosmic-gray (301 past 300) while the pool had about 2000 an hour to spare;
+        that is one share-over log line an hour now. The alarm names the one caller to slow (share_slow), read when
+        it is sent."""
         spent = self.rest_spent()
         # the share's own measure: the outbox (sessions' writes) is never held to it (request)
         recent = [r for r in recent_rows if r["bucket"] == "rest" and r["kind"] != "outbox"]
@@ -3859,6 +3901,15 @@ class Daemon:
                 self.share_pace_at = self.now
                 log({"event": "share-pace", "pace": pace, "spent": spent, "cap": cap,
                      "note": "nothing to do, projection only: the measured hour is within the cap, which holds it"})
+            return None
+        floor = self.policy["floors"]["rest"][0]
+        seen = self.budget.get("rest") or {}
+        left = seen.get("remaining") if seen and (seen.get("reset") or 0) > self.now else None
+        if not isinstance(left, int) or left >= floor:
+            if self.now - self.share_over_at >= ALARM_EVERY:
+                self.share_over_at = self.now
+                log({"event": "share-over", "spent": spent, "cap": cap, "left": left, "floor": floor,
+                     "note": "nothing to do: the login's REST pool is at or above its floor"})
             return None
         polling = [r for r in self.spend_rows(3600) if r["bucket"] == "rest" and r["kind"] != "outbox"]
         mine = spend_summary(polling, 3600, top=3)["restByRoute"]
@@ -3870,11 +3921,10 @@ class Daemon:
         shed = max(waiters.items(), key=lambda kv: (kv[1], kv[0]), default=None)
         routes = "; ".join(f"{r['route']} {r['counted']} ({r['topCaller'] or '?'}{route_waiter(r)})"
                            for r in mine if r["counted"])
-        action = (f"Shed {shed[0]} ({shed[1]} counted REST): end or slow its waits." if shed else
-                  "No waiter to shed: the spend is the daemon's own; check restYield in its policy.")
-        text = (f"WARN glaeda-gh on {policy_host()} spent {spent} counted REST in the last hour, past its cap of {cap}. "
-                f"{action} Top routes, last hour: {routes or 'none logged'}.")
-        return ("warn", text, {"pace": pace, "cap": cap, "spent": spent, "top": mine,
+        text = (f"WARN glaeda-gh on {policy_host()} spent {spent} counted REST in the last hour, past its cap of {cap}, "
+                f"with the login's REST pool at {left} (under its floor of {floor}). "
+                f"Top routes, last hour: {routes or 'none logged'}.")
+        return ("warn", text, {"pace": pace, "cap": cap, "spent": spent, "top": mine, "remaining": left, "floor": floor,
                                "shed": {"waiter": shed[0], "counted": shed[1]} if shed else None})
 
     def write_notice(self, kind: str, level: str, text: str, data: dict) -> None:
@@ -3905,6 +3955,27 @@ class Daemon:
         minute: the minute an hour back counts whole, so this errs toward the cap, not past it."""
         oldest = int(self.clock() // 60) - 60
         return sum(n for minute, n in self.rest_minutes.items() if minute >= oldest)
+
+    def fold_rest_hours(self, gone: dict[int, int]) -> None:
+        """Add the minutes leaving the trailing hour to their hours (REST_HOURS_FILE), dropping hours past
+        REST_HOURS_KEEP. An hour's total is whole once its last minute has left, an hour after it ended."""
+        oldest = int(self.clock() // 3600) - REST_HOURS_KEEP
+        hours = dict(self.rest_hours)
+        for minute, n in gone.items():
+            hours[minute // 60] = hours.get(minute // 60, 0) + n
+        hours = {h: n for h, n in hours.items() if h >= oldest}
+        if hours != self.rest_hours:
+            self.rest_hours = hours
+            write_json(BASE / REST_HOURS_FILE, {str(h): n for h, n in sorted(hours.items())})
+
+    def rest_hours_view(self) -> dict:
+        """The last day's whole hours (an hour ended at least an hour ago, so no minute of it is still in
+        rest_minutes) for daemon.json: each hour's counted REST by its start, and the peak. A missing hour is
+        none counted (the daemon down, or nothing read)."""
+        last = int(self.clock() // 3600) - 2
+        hours = {h: n for h, n in self.rest_hours.items() if last - 23 <= h <= last}
+        stamp = lambda h: dt.datetime.fromtimestamp(h * 3600, dt.timezone.utc).strftime("%Y-%m-%dT%H:00Z")  # noqa: E731
+        return {"peak": max(hours.values(), default=0), "hours": {stamp(h): n for h, n in sorted(hours.items())}}
 
     def rest_cap(self) -> int:
         limit = (self.budget.get("rest") or {}).get("limit") or 5000
@@ -5727,6 +5798,7 @@ class Daemon:
         self.prune({e["key"] for e in entries})
         self.post_prune()
         first_minute = int(self.clock() // 60) - 60
+        self.fold_rest_hours({m: n for m, n in self.rest_minutes.items() if m < first_minute})
         self.rest_minutes = {m: n for m, n in self.rest_minutes.items() if m >= first_minute}
         if self.rest_minutes != self.saved_rest_minutes:
             write_json(BASE / REST_SPEND_FILE, {str(m): n for m, n in self.rest_minutes.items()})
@@ -5763,7 +5835,8 @@ class Daemon:
                   if self.secondary_until > self.now else None, "forceLow": list(self.policy.get("forceLow", ())),
                   "lastHour": hour,
                   "restShare": {"spent": self.rest_spent(), "cap": self.rest_cap(), "yield": self.rest_yield(),
-                                "share": self.policy["restShare"], "capped": self.rest_capped()},
+                                "share": self.policy["restShare"], "capped": self.rest_capped(),
+                                "hours": self.rest_hours_view()},
                   "heartbeat": HEARTBEAT_EVERY, "paths": dict(self.paths), "reads": reads, "graphqlBy": graphql_by,
                   "spendBy": self.spend_by(), "alarms": self.alarms,
                   "perMinute": {b: round(self.richness(b) * 60, 1) for b in ("rest", "graphql")},
