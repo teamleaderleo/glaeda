@@ -18029,8 +18029,10 @@ class LandWorld:
         self.fetch_err = "fatal: unable to access 'https://github.com/o/r.git/': Could not resolve host"
         self.files: list[str] = []  # the PR's changed files, as `gh api repos/o/r/pulls/1/files` lists them
         # `lane-gh call land_handoff`: the broker host's answer (rc, stdout, stderr)
-        self.handoff = (0, json.dumps({"ok": True, "key": "pr:o/r#1", "state": "queued", "host": "huge-blue",
-                                       "request": "lane-handoff:o.r.1:" + "a" * 40}), "")
+        # as lane-gh prints it: the broker's whole envelope, indented over many lines
+        self.handoff = (0, json.dumps({"ok": True, "status": 200, "data": {
+            "ok": True, "key": "pr:o/r#1", "state": "queued", "host": "huge-blue",
+            "request": "lane-handoff:o.r.1:" + "a" * 40}}, indent=1), "")
 
     def set_pr(self, key: str, data: dict, fetched: float) -> None:
         self.cache[key] = {"key": key, "data": data, "fetchedAt": fetched, "dataAt": fetched}
@@ -19707,7 +19709,8 @@ class LandTest(Base):
         self.land()
         self.w.gh_rc["merge"] = 1
         self.w.gh_err["merge"] = self.NOT_OWNER
-        self.w.handoff = (1, "", "lane-gh: refused: unknown tool 'land_handoff'")
+        self.w.handoff = (1, json.dumps({"ok": False, "error": "refused: unknown tool 'land_handoff'"}, indent=1),
+                          "lane-gh call land_handoff: refused: unknown tool 'land_handoff'")
         e = {}
         for _ in range(gg.LAND_STEP_STOP):
             self.w.answers.append(ok_answer(LA))

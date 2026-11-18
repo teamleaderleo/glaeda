@@ -10269,15 +10269,17 @@ class LandQueue:
             self.claim(e, "hand_off", head=head)
         got = self.call([lane_gh, "call", LAND_HANDOFF_TOOL, e["repo"], json.dumps(args, sort_keys=True)],
                         LAND_HANDOFF_DEADLINE, e)
-        doc: Any = None
+        # `lane-gh call` prints the broker's whole envelope ({"ok", "status", "data"}) as indented JSON over many lines
+        # (tools/lane-gh main: json.dumps(answer, indent=1)): the whole stdout is one document.
+        envelope: Any = None
         with contextlib.suppress(ValueError):
-            lines = (got.stdout or "").strip().splitlines()
-            doc = json.loads(lines[-1]) if lines else None
-        if isinstance(doc, dict) and isinstance(doc.get("data"), dict):
-            doc = doc["data"]  # the broker's envelope, where lane-gh prints it whole
+            envelope = json.loads(got.stdout or "")
+        doc = envelope.get("data") if isinstance(envelope, dict) else None
+        taken = got.returncode == 0 and isinstance(envelope, dict) and envelope.get("ok") is True \
+            and not envelope.get("error") and isinstance(doc, dict) and doc.get("ok") is True
         with self.lock:
             self.finish(e, got)
-            if got.returncode == 0 and isinstance(doc, dict) and doc.get("ok", True):
+            if taken:
                 host = str(doc.get("host") or "the broker host")
                 e.pop("handoffDue", None)
                 e.pop("handoffFail", None)
