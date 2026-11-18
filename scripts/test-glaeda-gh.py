@@ -20753,6 +20753,19 @@ class LandTest(Base):
         self.assertEqual(self.w.gh_calls("pr", "merge"), [])
         self.assertNotIn("--cache-only", self.w.explains()[-1])
 
+    def test_a_latched_row_on_a_host_with_no_gh_quota_shim_is_not_judged_from_the_cache(self):
+        """Review of #2193: with no gh-quota shim (land.json gh missing), nothing answers merge_hold's reads from the
+        caches, so explain --cache-only is never run; the row says why and waits for the clear."""
+        key, head = self.latched_fresh_row()
+        self.w.gh.unlink()
+        self.latch("rest", self.t + 600)
+        self.w.cache_answers.append(self.cached_answer(head))
+        self.tick(30)
+        self.assertEqual((self.w.explains(), self.w.cache_explains()), ([], []))
+        e = self.q.entries[key]
+        self.assertIn("cache_no_shim", [h["event"] for h in e["history"]])
+        self.assertIn("no gh-quota shim", gg.land_line(e, self.t))
+
     def test_a_latched_row_with_an_old_cached_copy_is_not_judged_from_it(self):
         key = self.stuck(11, 3 * 3600)  # its PR read 600 s ago: over LAND_CACHE_ONLY_AGE
         self.latch("rest", self.t + 600)
