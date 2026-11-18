@@ -55,7 +55,8 @@ re-runs it elsewhere) when:
 Otherwise it takes that lock for the job: a small detached holder keeps it until job-completed releases
 it or the job's Runner.Worker exits, so fleet builds wait for the PR job and a crash cannot strand it.
 With --capacity-units N (several runners on one mini, docs/CMUX_MINI_RUNNER.md 2d) it takes a weighted
-share instead: a shared lock on host.lock plus units and tokens under FLEET_DIR/capacity (take_capacity). When
+share instead: a shared lock on host.lock plus units and tokens under FLEET_DIR/capacity (take_capacity; a gateway
+client takes its token and no host.lock, GATEWAY_NO_HOST_LOCK). When
 they are taken a cmux job waits for them, with no time limit, and logs what it waits for and who holds it
 (CAPACITY_WAIT); another repository's job waits --guest-wait seconds and then refuses with "refused: capacity: ...".
 Only then does it trigger the same queued glaeda-disk --pressure pass job-completed does (below), never able to fail
@@ -676,6 +677,15 @@ FAST_JOBS = {("cmux-next.yml", "fast-tier")}
 # cmux-next-tab-switch.yml's frames (an advisory pull request check; Leo, 2026-11-15, asked for CI on tab switching)
 # submits scripts/measure/tab-switch.sh (cmux-ci run --class exclusive --measurement --display) for a pull request
 # head that touches a tab, a pane or the chat pane, and waits at most 130 min (1 h queue, 1 h step), once per head.
+# GATEWAY_NO_HOST_LOCK: a gateway job takes no shared host.lock (take_capacity), so a fleet worker may claim the mini
+# while the client waits. Leo, 2026-11-17: "also fix the measurement queue so this never stalls again". At 23:52Z
+# cmux22, cmux23 and cmux17 were claim-paused runner_job at 1-8% CPU: their gateway jobs (hot-verify look) held
+# host.lock shared while their one process, ci-client.py, waited at 0% CPU for fleet steps that needed exactly these
+# gui-session-v1 minis, so the lend drain waited for jobs that waited for it (cmuxterm-hq#13078). The fleet worker
+# likewise counts no such waiter as a running job (cmuxterm-hq build-fleet/cmd/worker/gateway_waiter.go). The gateway
+# token still bounds the clients, a signing job still takes both tokens, and the gate still stops the listener while
+# a fleet build holds host.lock exclusively, so no new client starts beside a claimed build; one already waiting
+# keeps waiting at no cost.
 GATEWAY_CLASS = "gateway"
 GATEWAY_TOKEN_KIND = "gateway"  # CLASS_COST's token kind: any one of GATEWAY_TOKENS
 GATEWAY_TOKENS = ("gateway-0", "gateway-1")
@@ -6704,7 +6714,9 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
         yielded = yield_idle_warm(capacity_dir)  # under admission.lock, so a catch-up cannot start meanwhile
         if uses_gui or klass == EXCLUSIVE_CLASS:  # it drives the console session, or takes the whole mini: the idle
             yielded += yield_idle_fuzz(capacity_dir)  # fuzzer's app must be gone first
-        if os.path.isdir(os.path.dirname(host_lock)):
+        # GATEWAY_NO_HOST_LOCK: a gateway client (GATEWAY_JOBS) takes no host.lock. It only waits on the fleet, and
+        # its step often needs this very mini (cmuxterm-hq#13078).
+        if klass != GATEWAY_CLASS and os.path.isdir(os.path.dirname(host_lock)):
             # created if missing, so a worker that starts later still has to wait for this job
             fd = os.open(host_lock, os.O_RDONLY | os.O_CREAT | os.O_NOFOLLOW, 0o660)
             for attempt in range(6):  # a fleet probe takes it exclusively for microseconds; a build keeps it

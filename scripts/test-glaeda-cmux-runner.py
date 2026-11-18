@@ -4007,6 +4007,42 @@ class HookTest(unittest.TestCase):
         self.assertTrue(set(hook.GATEWAY_TOKENS) <= set(hook.CLASS_COST[hook.EXCLUSIVE_CLASS][1]))
         self.assertEqual(hook.CLASS_COST[hook.GATEWAY_CLASS], (0, (hook.GATEWAY_TOKEN_KIND,)))
 
+    def test_a_gateway_job_takes_no_host_lock(self) -> None:
+        """GATEWAY_NO_HOST_LOCK (cmuxterm-hq#13078; Leo, 2026-11-17: "also fix the measurement queue so this never
+        stalls again"). A gateway client only waits on the fleet, often for a step that needs this very mini, so
+        holding host.lock shared kept the fleet worker's lend drain waiting for a job that waited for it. Every
+        GATEWAY_JOBS job is admitted without host.lock: a fleet build can claim the mini while it waits, and one
+        handed to the runner while a build holds the mini still starts. Detector for cmuxterm-hq's handbook page
+        fleet-waiter-job-holds-its-mini.md."""
+        import fcntl
+        fleet = self.fleet()
+        for workflow, job in sorted(hook.GATEWAY_JOBS):
+            env = {"GITHUB_WORKFLOW_REF": f"manaflow-ai/cmux/.github/workflows/{workflow}@refs/heads/x"}
+            with self.subTest(workflow=workflow, job=job):
+                try:
+                    ok = self.job(job, "gw", 14, None, "--gateway-runner", env=env)
+                    self.assertEqual(ok.returncode, 0, ok.stdout + ok.stderr)
+                    self.assertIn(f"for {job} (gateway", ok.stdout)
+                    self.assertTrue(self.lock_free(), f"{workflow} {job} holds host.lock while it waits on the fleet")
+                finally:
+                    self.finish("gw")
+                build = os.open(fleet / "host.lock", os.O_RDWR)  # a fleet build has the mini
+                try:
+                    fcntl.flock(build, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    ok = self.job(job, "gw", 14, None, "--gateway-runner", env=env)
+                    self.assertEqual(ok.returncode, 0, ok.stdout + ok.stderr)
+                    self.assertNotIn("holds the host lock", ok.stdout)
+                finally:
+                    os.close(build)
+                    self.finish("gw")
+        # the control: any other job still holds host.lock shared for its whole run
+        try:
+            side = self.job("app-compile-fleet", "s0", 20, None, env=self.FAST_TIER)
+            self.assertEqual(side.returncode, 0, side.stdout + side.stderr)
+            self.assertTrue(self.shared_lock_blocks_exclusive(), "a side job no longer holds host.lock")
+        finally:
+            self.finish("s0")
+
     def test_job_log_records_started_refused_and_completed(self) -> None:
         self.fleet()
         log = self.dir / "Library/Logs/glaeda-cmux-jobs.jsonl"
