@@ -640,6 +640,10 @@ GRAPHQL_SLOT_WANT_TOUCH = 0.25
 GRAPHQL_SLOT_HOLD_MAX = 2.0 * HTTP_DEADLINE
 STALE_RESTART_ADVICE = "`glaeda-gh restart` restarts a daemon in this state."
 STALE_DEFERRED_ADVICE = "A restart would not read any sooner: the budget above holds the reads back."
+# serve registers SIGUSR1 (faulthandler): every thread's stack goes to the daemon's stderr (the unit's journal) and it
+# goes on serving. huge-blue, 2026-11-18: a stalled daemon's threads (one on a futex) could only be guessed at.
+STALE_DUMP_ADVICE = ("Where each thread is: kill -USR1 <daemon pid> (daemon.json pid); the stacks go to the daemon's "
+                     "stderr (journalctl --user -u glaeda-gh -n 200, or the unit's StandardError file)")
 DIRECT_QUOTA = "GitHub's quota for this read is spent"  # direct_read's refusals no restart can help with
 DIRECT_UPSTREAM = "this host reads GitHub through an upstream (no login here)"
 DIRECT_READ_BUDGET = 60  # seconds a wait's own fallback read (direct_read) may take
@@ -3926,7 +3930,7 @@ class Daemon:
         said = "" if cause["verdict"] == "deferred" and errors == "none recorded" else f" Recent errors: {errors}."
         text = (f"{level.upper()} glaeda-gh on {policy_host()}: {kind} data that waits are blocked on is {age_s}s old "
                 f"(over {STALE_DATA_AFTER}s; oldest {key_name(where) if where != '?' else '?'}) while its heartbeat is "
-                f"fresh.{quota} Reads: {cause['text']}.{said} {advice}")
+                f"fresh.{quota} Reads: {cause['text']}.{said} {advice} {STALE_DUMP_ADVICE}.")
         return level, text, {"kind": kind, "age": age_s, "key": where, "cause": cause["verdict"],
                              **({"quota": hold[0]} if hold else {})}
 
@@ -11883,6 +11887,8 @@ def serve(foreground_ok: bool = False) -> int:
     started, held = time.monotonic(), False  # (REEXEC_UPDATE_GAP; "reexec-held" logged once)
     daemon = Daemon()
     log({"event": "start", "pid": os.getpid()})
+    with contextlib.suppress(AttributeError, ValueError, RuntimeError, OSError):  # (no SIGUSR1: Windows)
+        faulthandler.register(signal.SIGUSR1, file=sys.stderr, all_threads=True)  # STALE_DUMP_ADVICE
     watchdog = Watchdog(WATCHDOG_AFTER, backstop=WATCHDOG_BACKSTOP,
                         where=lambda: {"inCall": daemon.progress_call(), "lastCall": daemon.last_call},
                         reap=lambda: daemon.free_slots())  # (late-bound: a check's error is suppressed)
@@ -19201,6 +19207,7 @@ def cmd_restart(force: bool = False) -> int:
                 if starved.get("why") else " Nothing recorded explains it."
             if starved.get("cause"):
                 slowed += f" The daemon's reads: {starved['cause']}."
+            slowed += f" Before it restarts, for the record: {STALE_DUMP_ADVICE}."
             print(f"glaeda-gh: the daemon's heartbeat is fresh, but its {starved['kind']} data for waits is "
                   f"{int(starved['age'])}s old (over {STALE_DATA_AFTER}s): it is not refreshing, so restarting it."
                   f"{slowed}")
