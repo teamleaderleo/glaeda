@@ -18011,7 +18011,7 @@ class LandTest(Base):
         self.q.run = quota_update
         for n in range(1, gg.LAND_STREAK_STOP + 3):
             self.w.answers.append(refusal("stale_green", LA, {"kind": "update_branch", "expected_head_sha": LA}))
-            e = self.tick(0 if n == 1 else 700)
+            e = self.tick(0 if n == 1 else max(700, e["wakeAt"] - self.t + 1))  # past the reset, its jitter (host-hashed) and backoff
             self.assertEqual((e["state"], (e.get("wait") or {}).get("kind")), ("waiting", "quota"), n)
             self.assertNotIn("stepFail", e)
         self.assertEqual(len(refused), gg.LAND_STREAK_STOP + 2)
