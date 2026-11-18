@@ -860,6 +860,22 @@ class DiskAndLeaks(Base):
                                                                        {"unmeasured": None}]}
         self.assertEqual(self.run_once()["findings"], [])
 
+    def test_gate_restarts_of_a_stuck_listener_are_healed_for_a_day(self) -> None:
+        # glaeda-cmux-runner-hook stuck_acquire writes one line per restart; ci-dash shows them under healed
+        self.mini.home = self.dir
+        path = self.dir / ".local/state/glaeda/cmux-runner" / health.GATE_RESTARTS
+        path.parent.mkdir(parents=True)
+        line = {"cause": "listener_acquire_stuck", "runner": "actions-runner-glaeda-12", "request": "f233fe94",
+                "acknowledged": "2026-11-17 08:02:33Z", "held_s": 901, "bound_s": 900.0}
+        path.write_text(json.dumps({**line, "t": NOW - 2 * health.HEALED_KEEP_S}) + "\nnot json\n" +
+                        json.dumps({**line, "t": NOW - 60, "at": "then"}) + "\n")
+        healed = self.run_once()["healed"]
+        self.assertEqual([(h["id"], h["code"], h["auto_fix"]) for h in healed],
+                         [("listener_acquire_stuck:actions-runner-glaeda-12:f233fe94", "listener_acquire_stuck",
+                           "done")])
+        self.assertIn("started no Worker in 901 s", healed[0]["evidence"])
+        self.assertEqual(health.gate_restarts_healed(Path("/nonexistent"), NOW), [])
+
     def test_orphaned_apps_are_healed_by_the_backstop(self) -> None:
         self.mini.leaks = [(99, "/tmp/cmux DEV.app")]
         report = self.run_once()
@@ -3036,9 +3052,65 @@ class ClaudeMissing(Base):
         self.mini.route = "en0"
         with mock.patch.object(self.mini, "foreign_runners", return_value=[], create=True):
             report = health.run(self.mini, True, now=NOW, state_path=self.state, report_path=self.report, runner=False)
-        self.assertEqual([f["code"] for f in report["findings"]], ["claude_missing"], "no Tailscale finding here")
+        self.assertEqual([f["code"] for f in report["findings"]], ["claude_missing"],
+                         "tailscale_no_route is reported only from its second run")
         self.assertIn("not installed while the tunnel is down", report["findings"][0]["note"])
         self.assertFalse([d for d in self.mini.did if d.startswith(("install ", "probe ", "route "))])
+
+    def capture_only(self, at: float = NOW) -> dict:
+        with mock.patch.object(self.mini, "foreign_runners", return_value=[], create=True):
+            return health.run(self.mini, True, now=at, state_path=self.state, report_path=self.report, runner=False)
+
+    def test_a_capture_only_mini_gets_tailscale_up_when_stopped_twice(self) -> None:
+        # cmux-mac-mini, 2026-11-17: Stopped (WantRunning=false) after a power loss until a person ran `tailscale up`
+        self.mini.claude = "/Users/cmux/.local/bin/claude"
+        self.mini.claude_env = {"ANTHROPIC_BASE_URL": SR2, "ANTHROPIC_AUTH_TOKEN": "subrouter"}
+        self.mini.ts, self.mini.ts_after = ("app", "Stopped", ""), ["Running"]
+        first = self.capture_only()
+        # claude_route is held (not probed, not rerouted) while the tunnel is down, as on a runner host
+        self.assertEqual([f["code"] for f in first["findings"]], ["tailscale_down", "claude_route"])
+        self.assertNotIn("up", self.mini.did, "one sighting never heals")
+        second = self.capture_only(NOW + 120)
+        self.assertEqual(self.mini.did.count("up"), 1)
+        self.assertNotIn("tailscale_down", [f["code"] for f in second["findings"]])
+        self.assertFalse([d for d in self.mini.did if d.startswith(("probe ", "route ", "vpn"))])
+        third = self.capture_only(NOW + 240)  # the tunnel is back: the route is probed again and clears
+        self.assertEqual(third["findings"], [])
+        self.assertEqual([h["action"] for h in second["healed"] if h["code"] == "tailscale_down"],
+                         ["tailscale up: Running"])
+
+    def test_a_capture_only_mini_with_a_running_tailscale_has_no_tailscale_finding(self) -> None:
+        self.mini.claude = "/Users/cmux/.local/bin/claude"
+        self.mini.claude_env = {"ANTHROPIC_BASE_URL": SR2, "ANTHROPIC_AUTH_TOKEN": "subrouter"}
+        for at in (NOW, NOW + 120):
+            self.assertEqual(self.capture_only(at)["findings"], [])
+        self.assertFalse([d for d in self.mini.did if d.startswith(("up", "vpn", "restart"))])
+
+    def test_a_capture_only_mini_reports_a_stuck_starting_without_restarting_the_vpn(self) -> None:
+        self.mini.claude = "/Users/cmux/.local/bin/claude"
+        self.mini.claude_env = {"ANTHROPIC_BASE_URL": SR2, "ANTHROPIC_AUTH_TOKEN": "subrouter"}
+        self.mini.ts = ("app", "Starting", "")
+        for at in (NOW, NOW + 120):
+            found = [f for f in self.capture_only(at)["findings"] if f["code"] == "tailscale_down"]
+        self.assertEqual(found[0]["auto_fix"], "impossible")
+        self.assertFalse([d for d in self.mini.did if d.startswith(("up", "vpn", "restart"))])
+
+    def test_a_capture_only_mini_reports_no_route_and_never_restarts(self) -> None:
+        self.mini.claude = "/Users/cmux/.local/bin/claude"
+        self.mini.claude_env = {"ANTHROPIC_BASE_URL": SR2, "ANTHROPIC_AUTH_TOKEN": "subrouter"}
+        self.mini.route = "en0"
+        self.mini.opt_in = ({"hosts": ["cmux-mac-mini"]}, "")  # even an opt-in never restarts a capture-only mini
+        self.assertEqual([f["code"] for f in self.capture_only()["findings"]], ["claude_route"])
+        report = self.capture_only(NOW + 120)
+        route = [f for f in report["findings"] if f["code"] == "tailscale_no_route"]
+        self.assertEqual(len(route), 1)
+        self.assertEqual(route[0]["auto_fix"], "impossible")
+        self.assertIn("not restarted here", route[0]["note"])
+        self.assertNotIn("flavor", route[0])
+        self.assertFalse([d for d in self.mini.did if d.startswith(("up", "vpn", "restart", "probe ", "route "))])
+        self.assertEqual(report["heals"], [])
+        claude = [f for f in report["findings"] if f["code"] == "claude_route"]
+        self.assertIn("rerouted while the tunnel is down", claude[0]["note"])
 
     def test_main_on_a_capture_only_mini_runs_the_claude_pass(self) -> None:
         # main(): no runner dirs, no Claude yet; the claude_missing check alone opens the pass.
@@ -3513,6 +3585,27 @@ class UnmanagedServiceTest(unittest.TestCase):
                 out = health.run(mini, True, now=NOW, state_path=state, report_path=report, runner=runner)
                 self.assertIn("unmanaged_service:ai.manaflow.x-worker", [f["id"] for f in out["findings"]], runner)
                 self.assertEqual(out["heals"], [])
+
+
+class PressureBlocked(unittest.TestCase):
+    """disk_pressure_blocked: under pressure with almost nothing reclaimable while tens of GiB are blocked."""
+
+    G = 1024**3
+
+    def summary(self, reclaimable: float, blocked: float, under: bool = True) -> dict:
+        return {"schema": "glaeda-disk/v1", "reclaimable": reclaimable * self.G, "blocked": blocked * self.G,
+                "filesystems": [{"mount": "/", "free": 27 * self.G, "total": 460 * self.G, "under": under}]}
+
+    def test_the_panel_that_read_reclaimable_zero_warns(self) -> None:
+        out = health.pressure_blocked_findings(self.summary(0.0, 153.5))
+        self.assertEqual([f["id"] for f in out], ["disk_pressure_blocked"])
+        self.assertIn("blocked 153.5 GiB", out[0]["evidence"])
+
+    def test_no_pressure_enough_reclaimable_or_little_blocked_is_quiet(self) -> None:
+        self.assertEqual(health.pressure_blocked_findings(self.summary(0.0, 153.5, under=False)), [])
+        self.assertEqual(health.pressure_blocked_findings(self.summary(20.0, 153.5)), [])
+        self.assertEqual(health.pressure_blocked_findings(self.summary(0.0, 10.0)), [])
+        self.assertEqual(health.pressure_blocked_findings({"schema": "glaeda-disk/v1"}), [])
 
 
 if __name__ == "__main__":

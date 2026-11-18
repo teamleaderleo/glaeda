@@ -55,6 +55,9 @@ class PrefetchBase(unittest.TestCase):
         self.commit()
         self.calls = base / "calls"
         self.saved = (sp.REPO_URL, sp.running_commands, dict(os.environ))
+        saved_mirror_dir = sp.GIT_MIRROR_DIR  # never the host's own git mirror (a mini running this suite has one)
+        self.addCleanup(setattr, sp, "GIT_MIRROR_DIR", saved_mirror_dir)
+        sp.GIT_MIRROR_DIR = os.fspath(base / "git")
         sp.REPO_URL = self.repo.as_uri()
         sp.running_commands = lambda: ["/usr/libexec/something", "zsh"]
         os.environ["FAKE_CALLS"] = os.fspath(self.calls)
@@ -80,6 +83,31 @@ class PrefetchBase(unittest.TestCase):
 
 
 class SeedPrefetchTest(PrefetchBase):
+    def test_the_prefetch_mirror_borrows_the_minis_git_mirror(self):
+        mirror = Path(sp.GIT_MIRROR_DIR) / "cmux.git"
+        subprocess.run(["git", "clone", "-q", "--mirror", os.fspath(self.repo), os.fspath(mirror)], check=True)
+        (mirror / "glaeda-verified").write_text("")
+        work = self.state / ".prefetch"
+        own, head = sp.main_head(work)
+        self.assertEqual(head, subprocess.run([*self.git, "rev-parse", "HEAD"], capture_output=True, text=True,
+                                              check=True).stdout.strip())
+        self.assertEqual((own / "objects/info/alternates").read_text().strip(), os.fspath(mirror / "objects"))
+        self.assertEqual(json.loads((own / sp.BORROW_RECORD).read_text())["objects"], os.fspath(mirror / "objects"))
+        # A rebuilt git mirror may lack what this one relied on: it starts over, borrowing the new one.
+        (own / "marker").write_text("old")
+        mirror.rename(mirror.with_name("old.git"))  # held aside, so the new one cannot reuse its inode
+        subprocess.run(["git", "clone", "-q", "--mirror", os.fspath(self.repo), os.fspath(mirror)], check=True)
+        (mirror / "glaeda-verified").write_text("")
+        own, again = sp.main_head(work)
+        self.assertEqual(again, head)
+        self.assertFalse((own / "marker").exists())
+        self.assertEqual((own / "objects/info/alternates").read_text().strip(), os.fspath(mirror / "objects"))
+        # No usable git mirror: it fetches from GitHub alone, as before.
+        (mirror / "glaeda-repair-pending").write_text("")
+        own, again = sp.main_head(work)
+        self.assertEqual(again, head)
+        self.assertFalse((own / "objects/info/alternates").exists())
+
     def test_a_mini_no_owned_job_has_recorded_is_skipped(self):
         result = sp.run(True, self.state)
         self.assertEqual(result["state"], "skip")
@@ -868,6 +896,55 @@ class LanSeedTest(PrefetchBase):
         self.assertIn("No route to host", lan["reason"])
         self.assertIn("Local Network Privacy", lan["reason"])
         self.assert_clean()
+
+    def archive_config(self, seeder: str, addresses: list[str] | None = None) -> None:
+        (self.conf / "config.json").write_text(json.dumps({"schema": 1, "seeder": seeder, "user": "cmux",
+                                                           "addresses": addresses or ["172.20.21.158"]}))
+
+    def test_archive_list_is_recorded_for_glaeda_disk_when_the_seeder_is_the_archive(self):
+        self.record(self.state)
+        old, head = self.commit(), self.commit()
+        self.seeder_keeps(old)
+        self.seeder_keeps(head)
+        self.archive_config("cmux-lawrence", ["172.20.21.157", "172.20.21.158"])
+        os.environ["FAKE_UNREACHABLE"] = "172.20.21.157"  # the next address answers
+        record = sp.run(True, self.state)
+        self.assertEqual(record["archive_list"], {"state": "listed", "count": 2, "address": "172.20.21.158"})
+        listed = json.loads((self.state / ".prefetch" / sp.ARCHIVE_LIST).read_text())
+        self.assertEqual((listed["schema"], listed["seeder"]), (1, "cmux-lawrence"))
+        self.assertEqual(sorted(listed["keys"]), sorted([self.key(old), self.key(head)]))
+        self.assertLessEqual(abs(listed["time"] - time.time()), 60)
+        self.assertEqual(list((self.state / ".prefetch").glob(f".{sp.ARCHIVE_LIST}.*")), [])
+        # a plan never asks
+        self.ssh_log.unlink()
+        sp.run(False, self.state)
+        self.assertFalse(self.ssh_log.exists())
+
+    def test_a_failed_archive_list_keeps_the_last_one_and_bounds_the_wait(self):
+        self.record(self.state)
+        self.commit()
+        self.archive_config("cmux-lawrence")
+        os.environ["FAKE_SSH_MODE"] = "silent"
+        started = time.monotonic()
+        got = sp.record_archive_list(self.state, sp.lan_config(), timeout=1.0)
+        self.assertLess(time.monotonic() - started, 10)
+        self.assertEqual(got, {"state": "error", "reason": "seed-list-v1 timed out"})
+        self.assertFalse((self.state / sp.ARCHIVE_LIST).exists())
+        os.environ["FAKE_SSH_MODE"] = "busy"
+        self.assertEqual(sp.record_archive_list(self.state, sp.lan_config())["reason"], "seeder: busy")
+
+    def test_a_mini_reading_the_trusted_seeder_never_lists_it(self):
+        # the seeder's glaeda-disk reads a client that lists as the archive's filler (archived_seeds)
+        self.record(self.state)
+        self.seeder_keeps(self.commit())
+        for config in ({"schema": 1, "seeder": "cmux15", "user": "cmux", "addresses": ["172.20.21.202"]},
+                       {"schema": 1, "user": "cmux", "addresses": ["172.20.21.202"]}):
+            (self.conf / "config.json").write_text(json.dumps(config))
+            record = sp.run(True, self.state)
+            self.assertEqual(record["archive_list"]["state"], "off")
+            asked = [json.loads(line)[-1] for line in self.ssh_log.read_text().splitlines()]
+            self.assertNotIn("seed-list-v1", asked)
+            self.assertFalse((self.state / ".prefetch" / sp.ARCHIVE_LIST).exists())
 
     def test_every_bad_stream_leaves_the_cache_as_it_was(self):
         self.record(self.state)

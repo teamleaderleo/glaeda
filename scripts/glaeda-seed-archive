@@ -91,6 +91,7 @@ def prefetch_module():
                                                   os.fspath(SCRIPT_DIR / "glaeda-seed-prefetch"))
     spec = importlib.util.spec_from_loader(loader.name, loader)
     module = importlib.util.module_from_spec(spec)
+    sys.modules[loader.name] = module  # dataclasses look their module up in sys.modules while it loads
     loader.exec_module(module)
     return module
 
@@ -119,27 +120,8 @@ def ask(config: dict, request: str) -> subprocess.Popen:
 
 
 def seeder_list(config: dict) -> tuple[list[tuple[str, int]], str]:
-    """The seeder's kept seeds (key, mtime), newest first, or [] and why."""
-    proc = ask(config, "seed-list-v1")
-    try:
-        out, err = proc.communicate(timeout=LIST_TIMEOUT)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        proc.communicate()
-        return [], "seed-list-v1 timed out"
-    head, _, body = out.partition(b"\n")
-    while head and not head.startswith(pm.SERVE_HEADER) and body:  # a noisy login shell printed first
-        head, _, body = body.partition(b"\n")
-    words = head[len(pm.SERVE_HEADER):].decode(errors="replace").split()
-    if not head.startswith(pm.SERVE_HEADER) or len(words) != 2 or words[0] != "list" or not words[1].isdigit():
-        detail = " ".join(words)[:120] or err.decode(errors="replace").strip()[-160:] or f"exit {proc.returncode}"
-        return [], f"seeder: {detail}"
-    kept = []
-    for line in body.decode(errors="replace").splitlines()[:int(words[1])]:
-        parts = line.split()
-        if len(parts) == 2 and pm.KEY_RE.fullmatch(parts[0]) and parts[1].isdigit():
-            kept.append((parts[0], int(parts[1])))
-    return kept, ""
+    """The seeder's kept seeds (key, mtime), newest first, or [] and why (glaeda-seed-prefetch's client)."""
+    return pm.seed_list(config, config["addresses"][0], LIST_TIMEOUT)
 
 
 def check(path: Path, key: str) -> str:

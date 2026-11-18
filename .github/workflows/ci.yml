@@ -214,6 +214,12 @@ jobs:
               Path("scripts/cmux_fleet_bootstrap.py"),
               Path("scripts/glaeda-mini-setup"),
               Path("scripts/test-glaeda-mini-setup.py"),
+              Path("scripts/glaeda-linux-vm-base"),
+              Path("scripts/test-glaeda-linux-vm-base.py"),
+              Path("scripts/glaeda-linux-vm-serve"),
+              Path("scripts/test-glaeda-linux-vm-serve.py"),
+              Path("scripts/glaeda-linux-vm-rollout"),
+              Path("scripts/test-glaeda-linux-vm-rollout.py"),
               Path("scripts/glaeda-mini-enroll"),
               Path("scripts/test-glaeda-mini-enroll.py"),
               Path("scripts/glaeda-cmux-runner"),
@@ -292,6 +298,8 @@ jobs:
               Path("scripts/test-glaeda-lan-fetch.py"),
               Path("scripts/glaeda-gh"),
               Path("scripts/test-glaeda-gh.py"),
+              Path("scripts/test-glaeda-gh-edge.py"),
+              Path("scripts/benchmark-land-forward.py"),
               Path("scripts/glaeda-wallpaper-rotate"),
               Path("scripts/glaeda-sync-main"),
               Path("scripts/glaeda-nightly-only-admit"),
@@ -377,6 +385,7 @@ jobs:
           suite python3 scripts/test-glaeda-seed-lan.py
           suite python3 scripts/test-glaeda-lan-fetch.py
           suite python3 scripts/test-glaeda-gh.py
+          suite python3 scripts/test-glaeda-gh-edge.py
           suite python3 scripts/test-glaeda-wallpaper-rotate.py
           suite python3 scripts/test-glaeda-sync-main.py
           suite python3 scripts/test-delivery-concurrency.py
@@ -394,6 +403,9 @@ jobs:
           suite python3 scripts/test-cmux-fleet-operator-summary.py
           suite python3 scripts/test-cmux-fleet-bootstrap.py
           suite python3 scripts/test-glaeda-mini-setup.py
+          suite python3 scripts/test-glaeda-linux-vm-base.py
+          suite python3 scripts/test-glaeda-linux-vm-serve.py
+          suite python3 scripts/test-glaeda-linux-vm-rollout.py
           suite python3 scripts/test-glaeda-mini-enroll.py
           suite python3 scripts/test-glaeda-cmux-runner-fleet.py
           suite python3 scripts/test-glaeda-promotion-admit.py

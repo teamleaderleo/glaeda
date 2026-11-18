@@ -202,7 +202,7 @@ def observe(pid: int) -> Proc | None:
 def debugger_connected(pid: int) -> bool:
     """Whether anything holds an established TCP connection to this process."""
     try:
-        out = subprocess.run([LSOF, "-a", "-n", "-P", "-p", str(pid), "-iTCP", "-sTCP:ESTABLISHED", "-Fn"],
+        out = subprocess.run([LSOF, "-b", "-w", "-a", "-n", "-P", "-p", str(pid), "-iTCP", "-sTCP:ESTABLISHED", "-Fn"],
                              capture_output=True, text=True, timeout=TIMEOUT, env=CHILD_ENV)
     except (OSError, subprocess.TimeoutExpired) as e:
         raise NoEvidence(f"lsof: {e}") from e

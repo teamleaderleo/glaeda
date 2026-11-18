@@ -512,7 +512,8 @@ class PromotionTest(unittest.TestCase):
         (self.control / "worker-exit").touch()
         self.wait_for(lambda: self.state().get("phase") == "released", why="release after the Worker")
         self.wait_for(lambda: not any(self.units_held()), why="units free")
-        self.assertFalse((self.lease_dir() / "runner").exists())
+        # cleanup() removes the runner dir after the units free and the state is written: wait for it, never race it
+        self.wait_for(lambda: not (self.lease_dir() / "runner").exists(), why="runner dir removed")
 
     # ---------------------------------------------------------------- (5) status after the receipt
 
@@ -660,7 +661,8 @@ class PromotionTest(unittest.TestCase):
         self.wait_for(lambda: self.state().get("phase") == "failed", why="dead listener withdrawal")
         self.assertIn("listener exited", self.state()["reason"])
         self.wait_for(lambda: not any(self.units_held()), why="units free")
-        self.assertFalse((self.lease_dir() / "runner").exists())
+        # cleanup() removes the runner dir after the units free and the state is written: wait for it, never race it
+        self.wait_for(lambda: not (self.lease_dir() / "runner").exists(), why="runner dir removed")
 
     def test_only_the_recorded_supervisor_writes_the_lease_state(self) -> None:
         request = self.request()

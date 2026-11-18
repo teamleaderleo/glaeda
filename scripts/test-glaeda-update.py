@@ -115,7 +115,7 @@ class Server:
             **extra,
         })
         name = gr.hygiene_asset(TARGET)
-        release_raw = gr.canonical(gr.release_manifest(source, tag, {name: archive}))
+        release_raw = gr.canonical(gr.release_manifest(source, tag, {name: archive}, committed="2026-09-25T00:00:00Z"))
         self.files[gu.release_url(tag, name, self.source)] = archive
         self.files[gu.release_url(tag, "release.json", self.source)] = release_raw
         entry = gr.channel_entry("canary", json.loads(release_raw), release_raw, "2026-09-25T00:00:00Z")
@@ -1020,6 +1020,124 @@ class UpdateTest(unittest.TestCase):
         with self.assertRaises(KeyError):
             self.run_update()
 
+    def test_a_mirror_host_reads_channels_upstream_first_and_downloads_what_the_mirror_lacks_upstream(self) -> None:
+        # The mirror copies releases and rings every 15 minutes (often later): a promotion must not wait for it.
+        mirror = "manaflow-ai/glaeda"
+        entry = self.server.publish(SOURCES[0])  # upstream only: the mirror has not copied it yet
+        control, ring = self.server.channel("stable")
+        self.server.files[gu.release_url("ota-channels", "control.json")] = control
+        self.server.files[gu.release_url("ota-channels", "stable.json")] = ring
+        self.server.files[gu.release_url("ota-channels", "control.json", mirror)] = control
+        asked: list[str] = []
+
+        def fetch(url: str, limit: int) -> bytes:
+            asked.append(url)
+            if url not in self.server.files:
+                raise urllib.error.HTTPError(url, 404, "Not Found", {}, None)
+            return self.server.files[url]
+        gu.fetch = fetch
+        self.assertEqual(gu.channel_sources(mirror), (gu.REPOSITORY, mirror))
+        self.assertEqual(gu.asset_sources(mirror), (mirror, gu.REPOSITORY))
+        self.assertEqual(gu.channel_sources(gu.REPOSITORY), (gu.REPOSITORY,))
+        self.assertEqual(gu.fetch_channel("stable", mirror), (control, ring))
+        self.assertTrue(asked[0].startswith(f"https://github.com/{gu.REPOSITORY}/"), asked)
+        self.config.update(ring="stable", source=mirror)
+        done = gu.update(True, self.config, self.state, gu.fetch_channel("stable", mirror), self.bin)
+        self.assertEqual(done["result"], "updated", done)
+        self.assertEqual(gu.load_state(self.state)["current"], entry["tag"])
+        self.assertIn(gu.release_url(entry["tag"], "release.json", mirror), asked)  # the mirror was asked first
+        # with this repository unreachable, the mirror's channel files still serve
+        down = urllib.error.URLError("unreachable")
+
+        def offline_upstream(url: str, limit: int) -> bytes:
+            if url.startswith(f"https://github.com/{gu.REPOSITORY}/"):
+                raise down
+            return fetch(url, limit)
+        gu.fetch = offline_upstream
+        self.assertEqual(gu.fetch_channel("stable", mirror), (control, None))  # mirror: no stable.json yet
+        with self.assertRaises(urllib.error.URLError):
+            gu.fetch_channel("stable", gu.REPOSITORY)
+
+    def headers(self, code: int, **fields: str) -> mock.MagicMock:
+        response = mock.MagicMock()
+        response.status, response.headers = code, dict(fields)
+        response.__enter__.return_value = response
+        return response
+
+    def test_the_channel_fingerprint_is_the_asset_each_file_redirects_to(self) -> None:
+        location = "https://release-assets.githubusercontent.com/github-production-release-asset/1/{}?sig=x&se=1"
+        answers = {"control.json": urllib.error.HTTPError("u", 302, "Found", {"Location": location.format("c1")}, None),
+                   "stable.json": urllib.error.HTTPError("u", 302, "Found", {"Location": location.format("s1")}, None)}
+        opener = mock.Mock()
+        opener.open.side_effect = lambda request, timeout: (_ for _ in ()).throw(answers[request.full_url.rsplit("/", 1)[1]])
+        with mock.patch.object(gu.urllib.request, "build_opener", return_value=opener):
+            seen = gu.channel_fingerprint("stable", "manaflow-ai/glaeda")
+            self.assertEqual(seen, {"repo": gu.REPOSITORY, "control.json": location.format("c1").split("?")[0],
+                                    "stable.json": location.format("s1").split("?")[0]})
+            self.assertEqual({c.args[0].get_method() for c in opener.open.call_args_list}, {"HEAD"})
+            # a signature that changes every request is not a change; a new upload (a new asset path) is
+            answers["stable.json"] = urllib.error.HTTPError(
+                "u", 302, "Found", {"Location": location.format("s1").replace("sig=x", "sig=y")}, None)
+            self.assertEqual(gu.channel_fingerprint("stable"), seen)
+            answers["stable.json"] = urllib.error.HTTPError("u", 302, "Found", {"Location": location.format("s2")}, None)
+            self.assertNotEqual(gu.channel_fingerprint("stable"), seen)
+            answers["stable.json"] = urllib.error.HTTPError("u", 404, "Not Found", {}, None)
+            self.assertEqual(gu.channel_fingerprint("stable")["stable.json"], "absent")
+            answers["stable.json"] = urllib.error.HTTPError("u", 500, "Server Error", {}, None)
+            self.assertIsNone(gu.channel_fingerprint("stable"))
+            answers["stable.json"] = urllib.error.URLError("offline")
+            self.assertIsNone(gu.channel_fingerprint("stable"))
+        opener.open.side_effect = None
+        opener.open.return_value = self.headers(200, ETag='"0x1"')
+        with mock.patch.object(gu.urllib.request, "build_opener", return_value=opener):
+            self.assertEqual(gu.channel_fingerprint("canary")["canary.json"], '"0x1"')
+
+    def test_the_minute_probe_runs_the_full_update_only_when_due_or_the_channel_changed(self) -> None:
+        now = 1_800_000_000.0
+        seen = {"repo": gu.REPOSITORY, "control.json": "c1", "stable.json": "s1"}
+        with mock.patch.object(gu, "channel_fingerprint", return_value=seen):
+            self.assertEqual(gu.probe_gate(self.config, now, self.state), (True, seen, "due"))  # never ran
+            gu.save_probe({"channel": seen, "fullRunAt": now}, self.state)
+            self.assertEqual(gu.probe_gate(self.config, now + gu.PROBE_EVERY_S, self.state)[0::2], (False, "unchanged"))
+            self.assertEqual(gu.probe_gate(self.config, now + gu.APPLY_EVERY_S - 1, self.state)[0], False)
+            self.assertEqual(gu.probe_gate(self.config, now + gu.APPLY_EVERY_S, self.state)[0::2], (True, "due"))
+            self.assertEqual(gu.probe_gate(self.config, now - 1, self.state)[0::2], (True, "due"))  # a clock step back
+        changed = {**seen, "stable.json": "s2"}
+        with mock.patch.object(gu, "channel_fingerprint", return_value=changed):
+            self.assertEqual(gu.probe_gate(self.config, now + gu.PROBE_EVERY_S, self.state),
+                             (True, changed, "channel changed"))
+        # a probe that cannot tell starts nothing between full runs (an outage never means a full run a minute)
+        with mock.patch.object(gu, "channel_fingerprint", return_value=None):
+            self.assertEqual(gu.probe_gate(self.config, now + gu.PROBE_EVERY_S, self.state)[0::2], (False, "unchanged"))
+        (self.state / gu.PROBE.name).write_text("not json")
+        with mock.patch.object(gu, "channel_fingerprint", return_value=seen):
+            self.assertTrue(gu.probe_gate(self.config, now, self.state)[0])
+
+    def test_main_probes_silently_and_records_the_probe_after_a_full_run_even_one_that_fails(self) -> None:
+        seen = {"repo": gu.REPOSITORY, "control.json": "c1", "canary.json": "k1"}
+        now = time.time()
+        out = io.StringIO()
+        with mock.patch.object(gu, "STATE_DIR", self.state), mock.patch.object(gu, "load_config", return_value=self.config), \
+                mock.patch.object(gu, "channel_fingerprint", return_value=seen), \
+                mock.patch.object(gu, "schedule_reload", return_value=None), \
+                mock.patch.object(gu, "apply_once", side_effect=urllib.error.URLError("offline")) as full, \
+                contextlib.redirect_stdout(out):
+            self.assertEqual(gu.main(["--apply"]), 1)  # a full run (never ran), which fails
+            self.assertEqual(gu.load_probe(self.state)["channel"], seen)
+            self.assertGreaterEqual(gu.load_probe(self.state)["fullRunAt"], now)
+            printed = out.getvalue()
+            self.assertEqual(gu.main(["--apply"]), 0)  # within APPLY_EVERY_S, unchanged: nothing runs, nothing printed
+            self.assertEqual(full.call_count, 1)
+            self.assertEqual(out.getvalue(), printed)
+        with mock.patch.object(gu, "STATE_DIR", self.state), mock.patch.object(gu, "load_config", return_value=self.config), \
+                mock.patch.object(gu, "channel_fingerprint", return_value={**seen, "canary.json": "k2"}), \
+                mock.patch.object(gu, "schedule_reload", return_value=None), \
+                mock.patch.object(gu, "apply_once", return_value={"result": "current"}) as full, \
+                contextlib.redirect_stdout(io.StringIO()) as printed:
+            self.assertEqual(gu.main(["--apply"]), 0)
+        self.assertEqual(full.call_count, 1)
+        self.assertEqual(json.loads(printed.getvalue())["trigger"], "channel changed")
+
     def test_config_defaults_and_refusals(self) -> None:
         path = self.root / "update.json"
         self.assertEqual(gu.load_config(path)["ring"], "stable")
@@ -1095,6 +1213,35 @@ class UpdateTest(unittest.TestCase):
         self.assertEqual((doc["since"], doc["alertAfter"], doc["attempts"]), (None, None, 0))
         self.assertEqual(self.health_findings(1_800_000_000.0 + 10 * gu.ALERT_AFTER_S)[1:], [])
         self.assertEqual(entry["tag"], doc["running"]["tag"])
+
+    def test_converge_records_merge_to_live_for_the_release_and_each_runners_hook(self) -> None:
+        # Leo, 2026-11-17: ci related changes should reflect much faster; each host says how long it took
+        home, staged, hook = self.runner_mini()
+        before = time.time()
+        entry = self.server.publish(SOURCES[0], runner_files=self.runner_files("the fast release"),
+                                    hook_history=self.older())
+        self.apply(1_800_000_000.0, home, staged)
+        live = self.converge()["live"]
+        self.assertEqual((live["tag"], live["source"], live["merged"]), (entry["tag"], SOURCES[0], "2026-09-25T00:00:00Z"))
+        installed = gu.parse_utc(live["installedAt"])
+        self.assertLessEqual(int(before) - 1, installed)
+        self.assertEqual(live["mergeToInstallS"], int(installed - gu.parse_utc(live["merged"])))
+        row = self.converge()["running"]["hooks"][0]
+        self.assertTrue(row["current"])
+        self.assertGreaterEqual(gu.parse_utc(row["installedAt"]), int(before) - 1)  # the refresh renamed it in
+        self.assertEqual(live["hooksLiveAt"], max(live["installedAt"], row["installedAt"]))
+        self.assertEqual(live["mergeToHooksLiveS"],
+                         int(gu.parse_utc(live["hooksLiveAt"]) - gu.parse_utc(live["merged"])))
+        self.assertEqual(json.loads((self.state / "state.json").read_text())["installed"]["tag"], entry["tag"])
+        # a runner whose hook is not the release's yet leaves hooksLiveAt open
+        hook.write_bytes(b"# someone else's hook\n")
+        self.assertIsNone(gu.live_summary(gu.observe(self.state, self.bin, home, staged))["hooksLiveAt"])
+        # a release without `committed` (published before it existed) still converges; the spans are unknown
+        self.assertEqual(gu.live_summary({"tag": entry["tag"], "installedAt": live["installedAt"]})["mergeToInstallS"], None)
+        # a malformed record of the install is dropped, never a refusal to update
+        state = json.loads((self.state / "state.json").read_text())
+        (self.state / "state.json").write_text(json.dumps({**state, "installed": "yesterday"}))
+        self.assertNotIn("installed", gu.load_state(self.state))
 
     def test_the_runner_sign_hold_is_kept_in_the_run_log_and_converge_without_unconverging_it(self) -> None:
         """2026-11-05 10:16Z: the runner's sign hold failed open on a signing runner and only said so on a stderr
@@ -1269,9 +1416,14 @@ class UpdateTest(unittest.TestCase):
         setup = importlib.machinery.SourceFileLoader("glaeda_mini_setup_for_update", os.fspath(ROOT / "scripts/glaeda-mini-setup"))
         module = importlib.util.module_from_spec(importlib.util.spec_from_loader(setup.name, setup))
         setup.exec_module(module)
-        self.assertEqual(module.update_every_s(), gu.APPLY_EVERY_S)
+        self.assertEqual(module.update_every_s(), gu.PROBE_EVERY_S)
         timer = (ROOT / "ops/systemd/glaeda-update.timer").read_text()
-        self.assertIn(f"OnCalendar=*:0/{gu.APPLY_EVERY_S // 60}\n", timer)
+        self.assertEqual(gu.PROBE_EVERY_S, 60)
+        self.assertIn("OnCalendar=*:*:00\n", timer)
+        # the spread stays inside one probe period, so a host still probes once a minute
+        self.assertIn("RandomizedDelaySec=30s\n", timer)
+        self.assertLess(30, gu.PROBE_EVERY_S)
+        self.assertLess(gu.PROBE_EVERY_S, gu.APPLY_EVERY_S)
         # a failing canary's report (waited out up to FAILURE_WAIT_MAX, then retried after a backoff) lands
         # before the CI smoke may promote a release no canary reported on
         self.assertGreater(gr.CANARY_SILENT_HOURS * 3600, gu.FAILURE_WAIT_MAX + gu.BACKOFF_MAX_S)
@@ -1505,6 +1657,43 @@ class ReleaseTest(unittest.TestCase):
             self.assertFalse(gr.promotion(candidate, None, failed, self.NOW)[0])
             self.assertEqual(gr.promotion(candidate, None, [self.status("air-blue", "pending", at)], self.NOW),
                              (False, "no canary host reported success"))
+
+    def test_a_quorum_of_healthy_canaries_ends_the_soak_and_any_red_or_pending_keeps_it(self) -> None:
+        # Leo, 2026-11-17: "we should be able to propagate and have ci related changes reflect much faster"
+        candidate = {**self.canary("2026-09-25T11:57:00Z"), "policy": gr.policy_for_paths(["scripts/glaeda-cmux-runner-hook"])}
+        at = "2026-09-25T11:59:00Z"
+        one = [self.status("air-blue", "success", at)]
+        two = one + [self.status("cosmic-gray", "success", at)]
+        self.assertEqual(gr.CANARY_QUORUM, 2)
+        ok, why = gr.promotion(candidate, None, one, self.NOW)
+        self.assertFalse(ok)
+        self.assertIn("1 of 2 canary hosts healthy", why)
+        ok, why = gr.promotion(candidate, None, two, self.NOW)
+        self.assertTrue(ok, why)
+        self.assertIn("quorum of 2 ends the soak", why)
+        # halt on red: one failure, from any canary, blocks it however many succeeded
+        self.assertFalse(gr.promotion(candidate, None, two + [self.status("canary-3", "failure", at)], self.NOW)[0])
+        # a canary still retrying (pending) holds it until the soak ends, as before
+        self.assertFalse(gr.promotion(candidate, None, two + [self.status("canary-3", "pending", at)], self.NOW)[0])
+        # choose() takes it from the quorum, and a newer release's failure still blocks it
+        held = {"entry": candidate, "statuses": two, "descendsFromStable": True, "policy": candidate["policy"]}
+        self.assertEqual(gr.choose([held], None, self.NOW)[0]["tag"], candidate["tag"])
+        newer = {"entry": self.entry("c", "2026-09-25T11:58:00Z"), "statuses": [self.status("cosmic-gray", "failure", at)],
+                 "descendsFromStable": True}
+        self.assertIsNone(gr.choose([newer, held], None, self.NOW)[0])
+
+    def test_the_manifest_records_when_its_commit_landed(self) -> None:
+        head = subprocess.run(["git", "-C", str(ROOT), "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
+        if not gr.SHA_RE.fullmatch(head):
+            self.skipTest("not a git checkout")
+        seconds = subprocess.run(["git", "-C", str(ROOT), "show", "-s", "--format=%ct", head],
+                                 capture_output=True, text=True).stdout.strip()
+        stamp = gr.commit_time(ROOT, head)
+        self.assertEqual(gu.parse_utc(stamp), float(seconds))
+        doc = gr.release_manifest(head, gr.release_tag(head, self.NOW), {"x": b"x"}, committed=stamp)
+        raw = gr.canonical(doc)
+        self.assertEqual(gr.parse_release(raw, gr.sha256(raw))["committed"], stamp)
+        self.assertNotIn("committed", gr.release_manifest(head, gr.release_tag(head, self.NOW), {"x": b"x"}))
 
     def test_policies_signed_with_required_hosts_parse_and_are_not_enforced(self) -> None:
         legacy = {"schema": gr.POLICY_SCHEMA, "risk": "high", "soakHours": 0.25,
