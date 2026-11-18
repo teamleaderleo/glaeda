@@ -18815,7 +18815,7 @@ class LandTest(Base):
     def test_a_command_naming_a_run_wait_is_waited_then_judged_again(self):
         """cmux#45404, 2026-11-17: merge_hold's checks_running step was {"kind": "command", "text": "glaeda-gh wait run
         manaflow-ai/cmux/44061804279 --timeout 3600"}, and land stopped on it (and every land queued after it). It is a
-        step: land waits on that run, judges again, and stops only at the third identical refusal in a row."""
+        step: land waits on that run and judges again, and a wait never counts toward the identical-refusal stop."""
         self.pr(LA)
         self.land()
         step = {"kind": "command", "text": "glaeda-gh wait run o/r/44061804279 --timeout 600"}
@@ -18826,10 +18826,10 @@ class LandTest(Base):
         self.assertEqual((e["wait"]["kind"], e["wait"]["run"]), ("run", 44061804279))
         self.assertEqual(e["explain"]["action"]["kind"], "wait_run")
         e = self.tick(601)  # the wait's timeout: judged again, the same refusal
-        self.assertEqual((e["state"], e["streak"]["count"], len(self.w.explains())), ("waiting", 2, 2))
+        self.assertEqual((e["state"], e["streak"], len(self.w.explains())), ("waiting", None, 2))
         e = self.tick(601)
-        self.assertEqual((e["state"], len(self.w.explains())), ("stopped", 3))
-        self.assertIn("3 identical refusals", self.w.sent()[-1][-1])
+        self.assertEqual((e["state"], e["waitRefused"]["count"], len(self.w.explains())), ("waiting", 3, 3))
+        self.assertEqual(self.w.sent(), [])
 
     def test_a_command_naming_a_wait_on_another_repository_still_stops(self):
         self.pr(LA)
@@ -18851,7 +18851,7 @@ class LandTest(Base):
         self.pr(LA)
         self.land()
         for _ in range(3):
-            self.w.answers.append(refusal("ws_check_missing", LA, {"kind": "wait_pr", "sha": LA, "timeout_s": 600}))
+            self.w.answers.append(refusal("review_running", LA, {"kind": "wait_comment", "timeout_s": 600}))
         e = self.tick()
         self.assertEqual(e["streak"]["count"], 1)
         e = self.tick(601)
@@ -18869,7 +18869,68 @@ class LandTest(Base):
         for i in range(3):  # another check finished each time: judged again, the same answer
             self.pr(LA, checks=[("ci", "COMPLETED", "SUCCESS")] + [(f"x{j}", "COMPLETED", "SUCCESS") for j in range(i + 1)])
             e = self.tick()
-        self.assertEqual((e["state"], e["streak"]["count"], len(self.w.explains())), ("waiting", 1, 4))
+        self.assertEqual((e["state"], e["streak"], e["waitRefused"]["count"], len(self.w.explains())),
+                         ("waiting", None, 4, 4))
+        self.assertEqual(e["waitRefused"]["movedAt"], self.t)  # each change is the wait making progress
+
+    def queued_wait(self, head: str = LA, timeout: int = 1800) -> tuple[int, dict]:
+        nxt = f"glaeda-gh wait pr o/r#1 --until done --sha {head} --timeout {timeout}"
+        return refusal("checks_running", head, {"kind": "wait_pr", "sha": head, "until": "done", "timeout_s": timeout},
+                       nxt=nxt, reason=f"merge-hold: refused: checks still running at {head[:8]}")
+
+    def test_checks_running_refusals_at_one_head_never_stop(self):
+        # hq#12626 (d5bf1325) and hq#12595 (db2a372b), 2026-11-18 ~15:50Z: hosted Linux runners queued ~50 min, each
+        # 1800 s wait timed out with the checks still queued, and the third judgment stopped both: "checks_running: 3
+        # identical refusals in a row". Checks still running are a wait: taken and judged again, never a stop.
+        self.pr(LA, checks=[("ci", "COMPLETED", "SUCCESS"), ("linux", "QUEUED", None)])
+        self.land()
+        e = self.run_hour(self.queued_wait, seconds=3 * gg.LAND_WAIT_DEFAULT, step=60.0)
+        judged = [h for h in e["history"] if h["event"] == "judged"]
+        self.assertGreaterEqual(len(judged), 3)
+        self.assertEqual({h["code"] for h in judged}, {"checks_running"})
+        self.assertEqual((e["state"], e["wait"]["kind"], e["streak"], e["waitRefused"]["count"]),
+                         ("waiting", "pr", None, len(judged)))
+        self.assertEqual(self.w.sent(), [], "no stop, nobody asked to requeue")
+        # the checks start: progress, the wait goes on past the bound counted from the first refusal
+        self.pr(LA, checks=[("ci", "COMPLETED", "SUCCESS"), ("linux", "IN_PROGRESS", None)])
+        e = self.run_hour(self.queued_wait, seconds=gg.LAND_WAIT_STUCK - 2 * gg.LAND_WAIT_DEFAULT, step=60.0)
+        self.assertEqual((e["state"], self.w.sent()), ("waiting", []))
+        # they finish green: merged at that head
+        self.pr(LA, checks=[("ci", "COMPLETED", "SUCCESS"), ("linux", "COMPLETED", "SUCCESS")])
+        self.w.answers[:] = [ok_answer(LA)]
+        self.tick()
+        self.assert_merged_at(LA)
+
+    def test_checks_that_never_start_stop_at_the_long_bound_naming_them(self):
+        for code in ("checks_running", "checks_queued_no_runner"):
+            with self.subTest(code=code):
+                shutil.rmtree(gg.land_dir(), ignore_errors=True)
+                self.w = LandWorld(self.tmp.name)
+                self.q = self.queue()
+                self.pr(LA, checks=[("ci", "COMPLETED", "SUCCESS"), ("linux", "QUEUED", None)])
+                self.land()
+                start = self.t
+                e = self.run_hour(lambda: refusal(code, LA, {"kind": "wait_pr", "sha": LA, "timeout_s": 1800}),
+                                  seconds=gg.LAND_WAIT_STUCK + 2 * gg.LAND_WAIT_DEFAULT, step=60.0)
+                self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "checks_stuck"))
+                self.assertGreaterEqual(e["stop"]["at"] - start, gg.LAND_WAIT_STUCK)
+                self.assertIn("w/linux (queued)", e["stop"]["reason"])
+                self.assertNotIn("identical refusals", self.w.sent()[-1][-1])
+                self.assertIn("checks_stuck", self.w.sent()[-1][-1])
+
+    def test_a_merge_refused_for_running_checks_never_counts_toward_the_step_stop(self):
+        # The same class through a step: "ok", then the pinned merge refused [checks_running] naming a wait, again and
+        # again at one head. Each is a wait, never one of LAND_STEP_STOP's refusals; the long bound still ends it.
+        self.pr(LA)
+        self.land()
+        self.w.gh_rc["merge"] = 1
+        self.w.gh_err["merge"] = ("merge-hold: refused [checks_running]: checks still running; next: glaeda-gh wait "
+                                  f"pr o/r#1 --until done --sha {LA} --timeout 900 (why: guard-why)")
+        e = self.run_hour(lambda: ok_answer(LA), seconds=3 * gg.LAND_WAIT_DEFAULT, step=60.0)
+        self.assertGreater(len(self.w.gh_calls("pr", "merge")), gg.LAND_STEP_STOP)
+        self.assertEqual((e["state"], e.get("stepFail"), self.w.sent()), ("waiting", None, []))
+        e = self.run_hour(lambda: ok_answer(LA), seconds=2 * gg.LAND_WAIT_DEFAULT, step=60.0)
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "checks_stuck"))
 
     def test_checks_running_never_calls_explain(self):
         self.pr(LA, checks=[("ci", "IN_PROGRESS", None)])
@@ -19082,13 +19143,12 @@ class LandTest(Base):
         self.assertEqual((len(updates), e["state"]), (1, "waiting"))  # the crashed one only
 
     def test_an_update_cancelled_before_it_was_sent_is_sent_after_the_reexec(self):
-        # review F1: a claim refused while the daemon drains for a re-exec sent nothing, so it never counts as sent
+        # review F1, on #2169's drain: while an update waits to re-exec no new land job starts (reexec_due "defer"),
+        # so a due update-branch is not sent by the old daemon; the next one judges it and sends it exactly once
         self.pr(LA)
         self.land()
         answer = lambda: refusal("tip_merge", LA, {"kind": "update_branch", "expected_head_sha": LA})
-        self.w.answers.append(answer())
-        self.q.draining = True
-        self.tick()
+        self.assertEqual(gg.reexec_due(True, True, self.q.now, self.q.now), "defer")
         self.assertEqual(self.w.gh_calls("api"), [])
         self.q = self.queue()
         e = self.run_hour(answer, seconds=60)

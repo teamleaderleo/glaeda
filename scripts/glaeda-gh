@@ -8005,6 +8005,19 @@ LAND_RETRY_STREAK_STOP = 8  # ... for could-not-judge answers (quota, unreadable
 # The steps of a could-not-judge answer: a retry, and the mirror fill an unreadable answer names (fetch), whose
 # failures step_refused counts on their own
 LAND_RETRY_KINDS = frozenset({"retry", "fetch"})
+# A refusal whose step is a wait on the PR's checks (wait_pr, wait_run: checks_running, checks_queued_no_runner,
+# ws_check_missing, a "command" that is a glaeda-gh wait) never counts toward LAND_STREAK_STOP, nor a refused step's
+# LAND_STEP_STOP when its `next:` is such a wait. Checks still running are a wait, not a failure. 2026-11-18 ~15:50Z,
+# hosted Linux runners queued ~50 min: merge_hold refused hq#12626 (d5bf1325) and hq#12595 (db2a372b) checks_running
+# with a 1800 s wait; each wait timed out with the checks still queued, the judgment after it counted, and the third
+# stopped both: "checks_running: 3 identical refusals in a row", each a requeue by hand. Now such a refusal takes its
+# wait and is judged again, for as long as the checks move: the bound is LAND_WAIT_STUCK with no change at that head in
+# any check's status or conclusion (land_check_fingerprint), and its stop (checks_stuck) names the checks still
+# unfinished. A new head or a requeue starts it again (an "ok" whose merge is refused for running checks does not).
+# Past STRAGGLER_AFTER a check queued with no runner is a straggler to `wait`; four hours of nothing moving at all is
+# a check that will never start.
+LAND_WAIT_KINDS = frozenset({"wait_pr", "wait_run"})
+LAND_WAIT_STUCK = 4 * 3600.0
 # A quota refusal parks the entry: no judge, read, watch or nudge for it until the reset the refusal names (Leo,
 # 2026-11-17, on Claude desktop's "GitHub rate limit" hover: "this is... interesting. so claude desktop shows rate limit
 # on hover of the github links sometimes..."). Before, every quota-refused entry was judged again about every 5 min
@@ -8040,6 +8053,7 @@ LAND_QUOTA_SAID = (re.compile(r"\bno attempt before\s+(\d{2}):(\d{2})(?::(\d{2})
 # step was judged again 5 s (merge) or 60 s (update-branch) later. Now a step refused at the same head (step_refused):
 # - takes the step the refusal itself names, when it names one this queue runs: an update-branch (LAND_STEP_NEXT_UPDATE)
 #   or a wait on the PR's checks (LAND_STEP_NEXT_WAIT: an event wait on the daemon's cache, no explain until it moves);
+#   a named wait is never counted toward LAND_STEP_STOP (LAND_WAIT_STUCK bounds it);
 # - else waits LAND_STEP_BACKOFF, doubling with each identical refusal at that head, at most LAND_STEP_BACKOFF_MAX;
 # - and stops the entry, telling the requester, at the LAND_STEP_STOP-th identical refusal at that head. A new head
 #   starts the count again. An "ok" judgment never clears it: only the step's own success or a new head does.
@@ -8115,7 +8129,8 @@ LAND_FRESH_WAIT = 120.0
 # manaflow-ai/cmux/44061804279 --timeout 3600"}, and land stopped on it twice, each stop also stopping every land queued
 # `--after` it (#45302, #45281, #45350). A refusal that names a next step is a step, not a stop: a command that is
 # exactly `glaeda-gh wait run OWNER/REPO/ID` or `glaeda-gh wait pr OWNER/REPO#N` (with --timeout, --until) on this PR's
-# repository is taken as that wait, then judged again; LAND_STREAK_STOP identical refusals in a row still stop it.
+# repository is taken as that wait, then judged again; it never counts toward
+# LAND_STREAK_STOP (LAND_WAIT_KINDS): only LAND_WAIT_STUCK with nothing moving stops it.
 LAND_COMMAND_WAIT_RUN = re.compile(r"\s*glaeda-gh wait run ([\w.-]+/[\w.-]+)/(\d+)((?:\s+--[a-z-]+(?:[ =]\S+)?)*)\s*")
 LAND_COMMAND_WAIT_PR = re.compile(r"\s*glaeda-gh wait pr ([\w.-]+/[\w.-]+)#(\d+)((?:\s+--[a-z-]+(?:[ =]\S+)?)*)\s*")
 LAND_COMMAND_TIMEOUT = re.compile(r"--timeout[ =](\d+)")
@@ -8404,6 +8419,20 @@ def land_checks_running(data: dict, head: str) -> bool:
     if not data or data.get("state") != "OPEN" or not head or data.get("headRefOid") != head:
         return False
     return any(str(c.get("status") or "").upper() not in ("COMPLETED", "") for c in data.get("checks") or [])
+
+
+def land_unfinished(data: dict, now: float, limit: int = 6) -> str:
+    """The checks DATA shows unfinished, as said in a checks_stuck stop: "NAME (STATUS N min), ..." or ""."""
+    out = []
+    for c in data.get("checks") or []:
+        status = str(c.get("status") or "").upper()
+        if status in ("COMPLETED", ""):
+            continue
+        name = "/".join(str(x) for x in (c.get("workflow"), c.get("name")) if x) or "?"
+        started = iso_epoch(c.get("startedAt")) if c.get("startedAt") else None
+        out.append(f"{name} ({status.lower()}" + (f" {int((now - started) // 60)} min)" if started else ")"))
+    more = f", +{len(out) - limit} more" if len(out) > limit else ""
+    return ", ".join(out[:limit]) + more
 
 
 def land_step_class(out: str) -> str:
@@ -8812,7 +8841,7 @@ class LandQueue:
         if fresh:
             e.update(state="queued", head="", explain=None, action=None, streak=None, wakeAt=None,
                      wait=None, seen=None, seenHead="", mergeSha="", stop=None, preStepHead="",
-                     lastAction=None, reviewed=[], updateSent=None, updateDeferred=None)
+                     lastAction=None, reviewed=[], updateSent=None, updateDeferred=None, waitRefused=None)
             self.history(e, "queued", by=e["requester"], via=e["requesterFrom"], after=",".join(e["after"]))
         else:
             self.history(e, "updated", by=e["requester"], after=",".join(e["after"]))
@@ -9671,6 +9700,11 @@ class LandQueue:
             e.pop("quotaRefusals", None)
             if answer.get("ok"):
                 e["streak"] = None
+            elif act.get("kind") in LAND_WAIT_KINDS:
+                # A wait on the checks is taken, never counted toward the identical-refusal stop (LAND_WAIT_STUCK).
+                if self.wait_refused(e, head, str(answer.get("code") or "refused"), answer.get("reason"),
+                                     answer.get("next")):
+                    return
             elif act.get("kind") == "update_branch":
                 # The refusal's step is the pinned update (any code: LAND_UPDATE_ONCE's comment): taken, never counted
                 # toward the identical-refusal stop. update_branch sends it once per head and bounds the rest.
@@ -9692,6 +9726,32 @@ class LandQueue:
         s = {"signature": sig, "count": int(s.get("count") or 0) + (1 if counts else 0) if same else 1}
         e["streak"] = s
         return s["count"] >= (LAND_RETRY_STREAK_STOP if retry else LAND_STREAK_STOP)
+
+    def wait_refused(self, e: dict, head: str, code: str, reason: Any, nxt: Any) -> bool:
+        """One refusal whose step is a wait on the checks at HEAD (LAND_WAIT_STUCK's comment). Under the lock. It
+        breaks the identical-refusal streak and counts toward nothing; True when nothing at HEAD has moved for
+        LAND_WAIT_STUCK, and E is stopped naming the checks still unfinished."""
+        c = self.cache_of(e["key"]) or {}
+        data = c.get("data") or {}
+        fp = land_check_fingerprint(c) if str(data.get("headRefOid") or "").lower() == head else ""
+        w = e.get("waitRefused") or {}
+        if w.get("head") != head:
+            w = {"head": head, "since": self.now, "movedAt": self.now, "fp": fp, "count": 0}
+        elif fp and fp != w.get("fp"):
+            w.update(fp=fp, movedAt=self.now)
+        w["count"] = int(w.get("count") or 0) + 1
+        w["code"] = code
+        e["waitRefused"] = w
+        e["streak"] = None
+        idle = self.now - float(w.get("movedAt") or self.now)
+        self.history(e, "wait_refused", code=code, head=head[:12], n=w["count"], idle=round(idle))
+        if idle < LAND_WAIT_STUCK:
+            return False
+        left = land_unfinished(data, self.now) if fp else ""
+        self.stop(e, "checks_stuck", f"no check at {head[:12]} moved in {idle / 3600:.1f} h of waits ({code}, "
+                  f"{w['count']} refusals naming a wait); still unfinished: {left or 'none the cache shows'}; "
+                  f"{land_trim(reason, 200)}", land_trim(nxt))
+        return True
 
     def claim(self, e: dict, kind: str, **args: Any) -> None:
         """Written before the step starts: a restart sees it and judges again instead of running it on its own."""
@@ -10037,11 +10097,20 @@ class LandQueue:
         # An update-branch's refusals count per head whatever their words: the judgment's streak no longer bounds them
         # (LAND_UPDATE_ONCE), so a refusal whose text varies must not restart the count.
         sig = f"{kind}|{head}" if kind == "update_branch" else f"{kind}|{head}|{cls}"
+        named = land_step_named(out)
+        if named and named["kind"] == "wait_pr":
+            # Its next is a wait on the checks: taken, never counted toward LAND_STEP_STOP (LAND_WAIT_STUCK bounds it).
+            self.history(e, "step_refused", kind=kind, head=head[:12], why=cls, n=0)
+            if self.wait_refused(e, head, cls, land_tail(out, 300), land_tail(out, 200)):
+                return None
+            self.history(e, "refusal_named", step="wait_pr")
+            self.wait(e, {"kind": "pr", "sha": head, "until": "done", "why": f"{kind} refused: its next is a wait"},
+                      land_seconds(named.get("timeout_s"), LAND_WAIT_DEFAULT))
+            return None
         last = e.get("stepFail") or {}
         n = int(last.get("count") or 0) + 1 if last.get("sig") == sig else 1
         e["stepFail"] = {"sig": sig, "kind": kind, "head": head, "class": cls, "count": n, "at": self.now}
         self.history(e, "step_refused", kind=kind, head=head[:12], why=cls, n=n)
-        named = land_step_named(out)
         if n >= LAND_STEP_STOP:
             self.stop(e, f"{kind}_refused", f"the {kind} merge_hold named was refused {n} times in a row at "
                       f"{head[:12]} ({cls}): {land_trim(land_tail(out), 300)}",
@@ -10050,11 +10119,6 @@ class LandQueue:
         if named and named["kind"] == "update_branch" and kind != "update_branch":
             self.history(e, "refusal_named", step="update_branch")
             return "update_branch"
-        if named and named["kind"] == "wait_pr":
-            self.history(e, "refusal_named", step="wait_pr")
-            self.wait(e, {"kind": "pr", "sha": head, "until": "done", "why": f"{kind} refused: its next is a wait"},
-                      land_seconds(named.get("timeout_s"), LAND_WAIT_DEFAULT))
-            return None
         after = min(LAND_STEP_BACKOFF_MAX, LAND_STEP_BACKOFF * (2 ** (n - 1)))
         self.wait(e, {"kind": "retry", "why": f"{kind} refused at the same head ({cls}): backoff {after:.0f} s"}, after)
         return None
