@@ -33,6 +33,7 @@ import json
 import os
 import pathlib
 import platform
+import posixpath
 import shutil
 import subprocess
 import sys
@@ -230,7 +231,7 @@ class Installer:
                     name = pathlib.PurePosixPath(member.name)
                     if name.is_absolute() or ".." in name.parts or not (member.isfile() or member.isdir() or member.issym()):
                         raise Failed(f"Lima archive holds an unexpected entry {member.name!r}")
-                    if member.issym() and (member.linkname.startswith("/") or ".." in pathlib.PurePosixPath(member.linkname).parts):
+                    if member.issym() and not link_stays_inside(member.name, member.linkname):
                         raise Failed(f"Lima archive holds an escaping link {member.name!r}")
                 if hasattr(tarfile, "data_filter"):
                     tar.extractall(tree, filter="data")
@@ -470,6 +471,14 @@ class Installer:
         out["actions"] = self.actions
         out["disposition"] = "changed" if self.actions else "unchanged"
         return out
+
+
+def link_stays_inside(name: str, target: str) -> bool:
+    """A relative symlink whose target, resolved from its own directory, stays in the archive root."""
+    if target.startswith("/"):
+        return False
+    resolved = posixpath.normpath(posixpath.join(posixpath.dirname(posixpath.normpath(name)), target))
+    return resolved != ".." and not resolved.startswith("../") and not resolved.startswith("/")
 
 
 def receipt_created(receipt: dict[str, Any] | None) -> str:

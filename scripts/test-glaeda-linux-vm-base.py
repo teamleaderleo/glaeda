@@ -121,13 +121,18 @@ class FakeLima:
         raise AssertionError(argv)
 
 
-def lima_archive() -> bytes:
+def lima_archive(extra_link: tuple[str, str] | None = None) -> bytes:
     buffer = io.BytesIO()
     with tarfile.open(fileobj=buffer, mode="w:gz") as tar:
         data = b"#!/bin/sh\n"
         info = tarfile.TarInfo("./bin/limactl")
         info.size, info.mode = len(data), 0o755
         tar.addfile(info, io.BytesIO(data))
+        # The real 2.2.0 archive carries this in-tree relative link.
+        for name, target in [("./share/doc/lima/templates", "../../lima/templates")] + ([extra_link] if extra_link else []):
+            link = tarfile.TarInfo(name)
+            link.type, link.linkname = tarfile.SYMTYPE, target
+            tar.addfile(link)
     return buffer.getvalue()
 
 
@@ -233,6 +238,18 @@ class InstallerTests(unittest.TestCase):
             self.installer().execute(apply=True)
         self.assertFalse((self.root / "lima-2.2.0").exists())
         self.assertFalse([c for c in self.fake.calls if "start" in c])
+
+    def test_archive_link_escaping_the_tree_fails_before_install(self):
+        self.archive = lima_archive(("./share/x", "../../../etc"))
+        base.LIMA_BYTES, base.LIMA_SHA256 = len(self.archive), hashlib.sha256(self.archive).hexdigest()
+        with self.assertRaisesRegex(base.Failed, "escaping link"):
+            self.installer().execute(apply=True)
+        self.assertFalse((self.root / "lima-2.2.0").exists())
+
+    def test_link_stays_inside(self):
+        self.assertTrue(base.link_stays_inside("./share/doc/lima/templates", "../../lima/templates"))
+        self.assertFalse(base.link_stays_inside("./share/x", "../../etc"))
+        self.assertFalse(base.link_stays_inside("./a", "/etc"))
 
     def test_template_digest_mismatch_refuses(self):
         other = pathlib.Path(self.tmp.name) / "t.yaml"
