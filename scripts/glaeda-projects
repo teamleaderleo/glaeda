@@ -252,7 +252,7 @@ def process_evidence() -> tuple[list[Path], str]:
         if lsof is None:
             raise EvidenceUnavailable("cannot inspect open files")
         try:
-            opened = subprocess.run([lsof, "-nP", "-Fn"],
+            opened = subprocess.run([lsof, "-b", "-w", "-nP", "-Fn"],
                                     capture_output=True, text=True, timeout=30, check=False,
                                     env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"})
         except (OSError, subprocess.SubprocessError):

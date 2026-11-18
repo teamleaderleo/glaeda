@@ -498,6 +498,31 @@ What `--apply` does:
        `memoryCap` in `config/runner-gate.json` (`true`, `false`, or a dict of `needGiB`,
        `resumeGiB` and `maxWaitMin`) sets it by default or per host; `GLAEDA_RUNNER_MEMORY_CAP=off`
        in the runner LaunchAgent's environment turns it off.
+     - **Starved-job reserve** (`STARVED_RESERVE`, cmux#45614). A large job can starve behind
+       smaller ones that share its units: on 2026-11-17 cmux NEXT DEV's DMG build
+       (`glaeda-std-xcode-26.6`, a compile, 5 units) queued 23 min with no std runner listening,
+       because every std mini had 3-4 of 14 units free and side, session and fleet-step jobs took
+       each unit back as it freed. Nothing was down. Now a root runner's gate, held off by units
+       while a job it could take has waited `afterMin` (10) in the controller's feed (the load
+       cap's), holds `capacity/starved.hold` on its mini's turn: `spreadMin` (20) times a stable
+       hash of the host and the job, so one mini goes first and others join only while the job still
+       waits (about one more every spreadMin divided by the std minis). While it is held, every other listener on the mini except the root runners and
+       the freshness slot, and the fleet step fit (`step_fits`), leave `root_fit_units()` free
+       beside their own need. Admissions never count it, so no job already taken is refused or
+       made to wait; running jobs finish, the units drain to the compile's need, and the root
+       runner takes the job. The hold ends when its runner takes a job, no takeable job has
+       waited long enough, the root runner is held for something other than units, the feed
+       cannot be read (fail open), or after `maxHoldMin` (30), after which that job never gets
+       this mini's hold again. `starvedReserve` in `config/runner-gate.json` (`true`, `false`, or
+       a dict of `afterMin`, `spreadMin` and `maxHoldMin`, each at most 120) sets it by default or
+       per host; `GLAEDA_RUNNER_STARVED_RESERVE=off` turns it off. The gate logs each hold and
+       release, and a held-off listener's line says "N are kept for a starved job of a root
+       runner's label". Before a hold starts, one unauthenticated read of the public job on GitHub
+       confirms it still queues: the feed can keep a job cancelled before it started as queued for
+       hours, and a job GitHub says left the queue never gets a hold here. A read that fails holds
+       nothing; that job is asked again a minute later at the earliest, and after a 403 or 429 no
+       job is asked about until GitHub's rate-limit reset (the gates of a mini share one 60-an-hour
+       address). The read runs on its own thread, so it never holds up a gate step.
      - The gui runner is never held for CPU saturation (85% busy), only for memory
        pressure: its jobs come one per mini and are admitted by units like any other,
        and the CPU mark held it whenever the other lanes kept the mini busy. Nothing
@@ -548,17 +573,44 @@ What `--apply` does:
      gives way and the nightly skips rather than fails. An unreadable state changes nothing;
      `GLAEDA_RUNNER_CONSOLE_GATE=0` in the runner LaunchAgent turns it off.
    - **When free disk is under the housekeeping target** (every runner). The gate reads the runner's
-     `--min-free-gib` and warns, requesting the existing bounded background cleanup at most every 15 minutes.
+     `--min-free-gib` and warns, starting the bounded background cleanup at once (a pass of its own at most
+     every `GATE_DISK_REPASS_S`, 60 s; one already deleting under `evict.lock` is joined, not duplicated).
      It keeps listeners online, never arms the Worker-exit freeze for a disk reading, and has no disk resume
      hysteresis. Unresolved warnings repeat at most every 30 minutes. The builder reserve remains a cleanup
      target. Job admission retains its existing measured job-growth floor (normally 20 GiB), tour and dedicated
-     builder requirements, and single-job disk-low ledger; this change adds no hard-stop threshold.
-     One reading does hold an idle pool runner (`DISK_SHORT_HOLD`), whatever its floor: free disk under one job's
-     measured peak (`GLAEDA_RUNNER_JOB_DISK_GIB`, 20 GiB). A job taken there cannot fit (2026-11-11: a fast tier
-     admitted at 19.8 GiB free failed its link with `ld` errno 28 after 13 minutes), so the listener stops and the
-     job goes to a runner with room or waits, slower but never failed. A running job is never stopped or frozen
-     for it; the nightly's own listeners, dedicated builders, gateway runners and runners with no floor are never
-     held for disk.
+     builder requirements, and single-job disk-low ledger, all warnings; this change adds no hard-stop threshold.
+     **A disk floor never holds a listener or pauses work for more than seconds (`DISK_RECLAIM_NOW`; Leo,
+     2026-11-18: disk floors trigger reclaim and wait seconds).** Free disk under one job's measured peak
+     (`GLAEDA_RUNNER_JOB_DISK_GIB`, 20 GiB; `DISK_SHORT_RECLAIM`) or under 10 GiB plus one runner job's p95
+     (`glaeda-runner-job-disk.json`) for each job in flight, each idle listener sorted before it, and the next job
+     (`RUNNER_JOBS_DISK`) makes an idle pool runner start reclaim at once aimed at what it lacks, wait at most
+     `DISK_RECLAIM_WAIT_S` (30 s) for that room before its listener starts, and then listen whatever was freed.
+     These readings used to hold the listener (`DISK_SHORT_HOLD`) and space evictions 15 minutes apart, which idled
+     units while jobs queued (ci-dash, 2026-11-18: cmux17 lost 4.2 unit-hours to the disk floor in 30 minutes).
+     job-started's whole disk phase (floor eviction, the disk ledger's turn, the pre-job target) shares the same
+     30 s budget, down from 300 s. A running job is never stopped or frozen for disk; the nightly's own listeners,
+     dedicated builders, gateway runners and runners with no floor never wait.
+     Pattern, *reservation counted twice*: a reservation for space a job will write must shrink as the job writes
+     it, or the bytes count once as gone from free disk and again as reserved (2026-11-17 12:36Z-12:55Z: cmux17,
+     cmux18, cmux19 and cmux21 held side-std listeners at 25-35 GiB free with every idle cache deleted while 160
+     side-std jobs queued under 60% CPU). So a running job is charged `max(0, p95 - written)` (`RUNNER_JOB_WRITTEN`):
+     its own sampler measures the growth of its runner's `_work` and of the `spm-scratch` its packages link, every
+     3 minutes with a bounded `du`, capped by its own free-disk drop, and writes it to
+     `~/.local/state/glaeda/cmux-runner/job-written/written-<runner>.json`; a gate trusts it only for that live
+     `Runner.Worker` and for 9 minutes, else charges the full p95. A pid and a freshness window do not name a job
+     (a late sampler, or a next job whose Worker reuses the pid, read the earlier job's record as its own), so
+     job-started draws a per-job nonce into `job-written/nonce-<runner>.json` with the Worker's pid and start
+     identity (a pid reused before the next job-started is not that Worker): the sampler writes it into every
+     record, writes only while it is still the runner's current nonce, removes a record (and, the job over, the
+     nonce) only when it carries its own, each under a per-runner flock, and a gate trusts a record only with the
+     current nonce for that Worker.
+     A record discounts disk the gate admits work against, so only the hook's own counts: `job-written/` is made
+     0700, both files are written 0600 without following a symlink, and a gate reads (and cleanup removes) only a
+     regular file of its own uid with no group or other access in a directory that is the same; a record in the
+     state directory itself is never read. Jobs run as the hook's user, so this keeps out records that are stale,
+     foreign, loose or linked, not a job that sets out to forge one. The detector is the gate's reclaim line: a
+     `RUNNER_JOBS_DISK` reclaim whose free disk is well above the floor with no `less ... already wrote` is a
+     reservation that is not shrinking.
      `glaeda-disk --pressure` reads the highest floor among the user's runner hooks and starts freeing at floor
      + 4 GiB, up to floor + 20 GiB (never past half the disk). Cleanup can run during CI and protects live work.
      cmux CI's hot tier (parked PR builds,
@@ -578,12 +630,33 @@ What `--apply` does:
      pressure run takes its least recently used generated output, and whole states no enrolled runner
      owns, whatever their age, back down to the cap, keeping every in-use veto ([CMUX_NEXT_CI_RETENTION.md](CMUX_NEXT_CI_RETENTION.md); cmux11s,
      2026-10-21: jobs refused at 21 GiB free with 78 GiB there and nothing reclaimable).
+     Over all of these sits one host **cache budget** (`cache_budget`, default `35%` of the volume): every
+     build-cache family together (seeds, kept and parked builds, spm-scratch, admission roots, runner build
+     output, Xcode DerivedData, cmux-next-ci, hq's fleet cache, and the fleet Xcode CAS's node store and local
+     CAS, sized from `glaeda-fleet-cas-prune`'s report of its last run, measured again by a plan-only run
+     whenever that report is over 2 h old). Only a `--pressure` run applies it;
+     a report, `--json` or a plain `--apply` never does. Before its survey the run sizes the families from
+     the snapshot (paths deleted since are dropped): over the budget, the volume is under pressure whatever
+     its free space, and its warm families (admission roots, runner build output, Xcode DerivedData, journey
+     builds) are judged on a 1 h idle window. After the survey, the sizes it just took decide how much goes:
+     the fleet CAS is capped first (`--cap-only`, both stores at 2.5% of the volume; a missing object is
+     fetched again, never rebuilt), then warm build state past 1 h idle goes by value (space per rebuild
+     minute, idle longest first) after everything already due, keeping every in-use veto and fresh process
+     evidence per item, until the caches are back under 90% of the budget. The budget never shortens
+     cmux-job-cache's half-day minimum, a media host's warm tour slots, or the 12 h window of a canonical
+     root's admission DerivedData without its token file.
+     The caches also give back what keeps `cache_budget_free` (default `30%`) of the volume free, whichever
+     asks more, but only up to what the survey found reclaimable in those families: the rest of that
+     shortfall is no cache's to close, so it is reported (`free_short_left_gib`), and the next pass (within
+     6 h) counts only the shortfall beyond it, so a disk whose non-cache use alone is over 70% is not
+     forced into a pressure pass every time. The run line's `cache_budget` and the health summary's `cache_budget` rows show
+     used against budget per volume and family (cmux13s, 2026-11-17: 58 of 460 GB free with every family
+     inside its own window).
    - **Stopping.** After two idle polls in a row, and one fresh look right before the
-     signal, the gate sends `SIGINT` to the runner's `Runner.Listener`. Under the disk
-     floor the first idle poll is enough, ahead of any other hold, and while a job runs
-     under the floor the gate watches its `Runner.Worker` every 0.1 s and polls every 0.1 s
-     for 5 s after it exits: the listener asks for its next job as soon as the Worker
-     exits and got one 2 s later, inside one 2 s poll, so every job it took was refused
+     signal, the gate sends `SIGINT` to the runner's `Runner.Listener`. Disk never stops a
+     listener (`DISK_RECLAIM_NOW`). For the holds that remain, while a job runs the gate watches
+     its `Runner.Worker` and stops the listener at its exit (`JOB_END_FREEZE`): the listener asks
+     for its next job as soon as the Worker exits and got one 2 s later, inside one 2 s poll
      (cmux9s, 2026-09-30: four in 34 s on one runner).
      - The listener's graceful exit ends its session, and GitHub shows the runner as
        offline.
@@ -611,6 +684,19 @@ What `--apply` does:
        session at 03:46:41, stopped at 03:46:44). The job can come any time in that poll:
        on cmux7s's roots (2026-10-21) one queued 25 s in was lost to a stop at 30 s. A job
        that arrives on a full host is refused at job-started in seconds and rescued instead.
+     - **POST_JOB_POLL.** A listener's poll after its own job is a first poll too: when the
+       Worker exits, the listener goes `JobState: Online` and opens a new message poll at
+       once, and GitHub hands a queued job to it within a second. For `GATE_FIRST_POLL_S`
+       after a job's end a hold waits the same way. Only a JOB_END_FREEZE stop goes at once,
+       and only when the frozen listener's diag shows it never went Online after the job.
+       If the freeze came too late, or never came (the job-end marker seen after the Worker
+       exited, a cancelled job whose Worker was killed before job-completed ran), the hold
+       waits that poll out. A reload also waits while the job-end marker stands: job-completed
+       installs a staged hook as the job ends, and a gate re-executed then met the job's end
+       with no freeze armed. On 2026-11-17 these stops cut the Online polls of session runners
+       on std minis while daemon tests and generated files queued for over an hour on
+       `glaeda-session-std-xcode-26.6`, and GitHub cancelled those jobs as not acquired
+       (cmuxterm-hq#12960).
      - A listener that hasn't exited after 60 s is killed, unless a job slipped in.
    - **Restarting and logs.** The gate starts `run.sh` again after two free polls and,
      once it has stopped a listener, a whole free `GATE_RESTART_FREE_S` (60 s,
@@ -655,6 +741,15 @@ What `--apply` does:
      idle (glaeda#1825). Before a drain, a non-dedicated runner's planned hook writes
      land, so an older gate reloads one that reads the marker.
    - job-started still refuses a job handed over in the moment before a stop.
+   - **A drained host.** Every listener role honours `.glaeda-drain` (gui, session,
+     nightly, fast and dedicated runners included). When every runner on a mini has a live
+     marker, as a hand drain for a repair writes, the mini is drained as a whole
+     (`HOST_DRAIN`): the build worker's `fits` advertises no ci-step (its `refusal`
+     says why) and `admit` refuses, so no new ci-step takes `host.lock`. Markers the
+     apply writes for a relabel or a retirement (`"by": "glaeda-cmux-runner --apply"`)
+     never make a host drain, even on every runner. Fleet builds outside ci-steps
+     (`with-host-lock`) do not read the marker; hold the mini's build worker with a
+     controller reservation (`cmux-ci reserve --workers W --pool P`) for those.
 5. Confirms through the GitHub API that the runner is listed with every label and
    waits up to 90 s for it to report online.
 
@@ -1012,11 +1107,26 @@ job's need fit the host's cores, and their RAM plus this job's fits the host's R
   flag, so rolling a member that has `reserveCores` back below it needs a re-apply from that older checkout.
   `GLAEDA_RUNNER_RAM_LEDGER=0` in the runner's environment turns RAM accounting off. The memory-pressure gate and
   the disk floor stay.
+- Held units follow live use (the hook's LIVE_UNITS; Leo, 2026-11-17: "maximizing the amount of time that we're
+  using our stuff"). A job is admitted at its estimate and keeps it for its first 2 min (`DYNAMIC_WARMUP_S`, 7 for
+  compile-gui). Then its sampler takes the peak of its tree's cores over the last 2 min (`DYNAMIC_WINDOW_S`, at
+  least 1 min of samples, else it keeps what it holds), and its holder lets every unit above
+  `ceil(peak * 1.25)` (at least 1) go at once, so the next admission and every idle listener's gate see them free.
+  A daemon-test admitted at 6 units that runs at 1 core keeps 2. Units only shrink: a job that bursts back above
+  them shares the cores (slower, never failed), and the gate's CPU mark holds new work while the host is busy. No
+  release while host CPU is at 80% or more, under memory pressure, thermally limited, or with many processes in
+  uninterruptible wait (the job record's contended threshold). Signing jobs and a reserving runner's own job keep
+  their admission. RAM chunks are never released early: the floor and the memory-pressure gate stay.
 - A job whose RAM need is more than the host's RAM capacity takes all of it, so it runs only when the host is
   otherwise RAM-idle; it is never refused for RAM. A job waiting for RAM waits as for units (its marker wants
   `units`), so FEED_FIRST, the nightly slot and the signing drain are unchanged.
 - The listener gate holds a runner while the RAM its costliest job needs (that fits the host at all) is taken, as it
   does for cores.
+- HEAD_FIT: a plain side runner listens with room for the head of its queue (the oldest queued job it could take, in
+  the build controller's workflow_job feed) when that job's own need is larger than the side fit. GitHub hands that
+  job first, and a job that waits for units in "Set up runner" spends its timeout-minutes there (cmux#44505's
+  generated files, 2026-11-17: 19 min waiting for 8 units, then cancelled at 40 min). Every job of a cmux-next workflow that the hook's job tables name (`head_job_key`, read from its display
+  name, so "macOS fast tier" counts) counts; an unknown name, a stale or unreadable feed, or no queued job keeps the side fit.
 - `scripts/glaeda-cmux-runner-hook needs` prints what a host's admission reads (cores, RAM, floor, each class's need).
 - Listeners: a member's plan summary carries `listeners`, `glaeda_fleet_labels.listener_count()`: as many runners as
   the host could run of the smallest common job (1 core, 1 GiB) by cores and by RAM over the floor, at most
@@ -1599,22 +1709,34 @@ on the label, or a job could wait for a label no online runner has.
 Hook classes:
 
 - `mobile-core-package` is `isolated` (3 units, `JOB_CORES`; own SwiftPM `.build`, no canonical root).
-- `ios-simulator-build` (3 units, `JOB_CORES`) builds and then boots the simulator to run its tests. On a mini with
-  one sim slot it stays `isolated`, as before (no token, up to 3 at once); above one (`SIM_SLOT_JOBS`) it is a
-  `simulator` job at its own cost: a token copy, `GLAEDA_SIM_SLOT`, and the sim-first runner takes it.
+- `ios-simulator-build` (3 units, `JOB_CORES`) builds and then boots the simulator to run its tests. On a mini
+  whose simulator ceiling is 1 it stays `isolated`, as before (no token, up to 3 at once); above one
+  (`SIM_SLOT_JOBS`) it is a `simulator` job at its own cost: a token copy, `GLAEDA_SIM_SLOT`, and the sim-first
+  runner takes it.
 - `ios-simulator` and `screenshots` are `simulator` (1 unit, p75 0.28 cores per job), plus a copy of the
   `simulator` token: they reuse, erase and boot named devices in the user's one CoreSimulator service. A job
   refused only for that token waits for it at job start, as any capacity wait does.
-- `runner.classes.<class>.simSlots` (1 to 4, default 1; a member without the simulator role keeps 1) gives the
-  hook `--sim-slots N`: the token comes in N copies (`simulator`, `simulator-1`, ...), and the job is told its copy
-  as `GLAEDA_SIM_SLOT` in `$GITHUB_ENV` and `$RUNNER_TEMP/glaeda-sim-slot` (a ci-step: `sim_slot` in its admit
-  answer), so a workflow can boot devices of its own slot. A copy past the first is admitted only with headroom,
-  the rule leo-workspace#5539 uses for lanes, and the refusal names the term that failed: load1 under 0.75 of the
-  cores, memory pressure under level 2, swap under 10% used (`vm.swapusage`, parsed as cmuxterm-hq's worker
-  does), and, with the RAM ledger off, one more job of the class's measured RAM plus the floor within the host's
-  RAM. The sim-first runner listens while any copy is free (a later one only with that headroom). glaeda-disk's
-  device eraser holds every copy. Above 1, the mini's `glaeda-ios-sim` runners and its sim-first runner also carry
-  `glaeda-sim-slots-<N>`, from which cmux's iOS picker (cmux#44908) learns the slot count.
+- Simulator copies are dynamic (`SIM_DYNAMIC`; Leo, 2026-11-17: "hm why 3 tho shouldn't this be more dynamic? i
+  think it's finally time to start getting these things done"). No count is set by hand: the token comes in copies
+  (`simulator`, `simulator-1`, ...), and the job is told its copy as `GLAEDA_SIM_SLOT` in `$GITHUB_ENV` and
+  `$RUNNER_TEMP/glaeda-sim-slot` (a ci-step: `sim_slot` in its admit answer), so a workflow can boot devices of its
+  own slot. Copy 0 is always admissible; a later copy only while, measured now, one more simulator keeps the host
+  under the 80% line, and the refusal names the term that failed:
+  - free RAM (`kern.memorystatus_level`) less one simulator's RSS stays at least 20% of the RAM;
+  - load1 under 0.8 of the cores;
+  - memory pressure green (level 1);
+  - swap not growing (used swap rose under 256 MiB in 5 minutes; `vm.swapusage`, parsed as cmuxterm-hq's worker
+    does).
+  The only number is a hard ceiling computed on the host: floor((RAM - reserve) / one simulator's p95 RSS), the
+  reserve being 20% of the RAM (at least the RAM floor). One simulator's RSS comes from the needs file (the
+  `simulator` class row, else `test-ios.yml/ios-simulator-build`; `rss_peak_mib_p95`, else `rss_peak_mib_p90`),
+  else 4.5 GiB. `glaeda-cmux-runner-hook needs` prints the ceiling and where it came from. The sim-first runner
+  listens while any copy is admissible. glaeda-disk's device eraser holds `simulator-copies.gate` and every copy;
+  a copy past the first is taken only under that gate shared. Kill switch: `GLAEDA_SIMULATORS_OFF=1` in the runner
+  environment, or `touch` `simulators.off` in the capacity ledger (live), and no simulator copy is taken.
+  `runner.classes.<class>.simSlots` and the hook's `--sim-slots` are ignored (a deprecation line says so). No label
+  carries a simulator count: a simulator mini has `glaeda-ios-sim` alone (`glaeda-sim-slots-<N>` is no longer
+  written), and its sim-first runner is online exactly while one more simulator is admissible.
 - A build worker's `simulator` ci-step (cmuxterm-hq's `scripts/ci/cmux-next-ios-sim.sh` steps) is admitted only on
   a mini where a runner registered with `glaeda-ios-sim` (its install receipt says so). It takes the same
   `simulator` token, plus an isolated build's 4 units because it also builds the app, and holds them until
@@ -1945,7 +2067,10 @@ rebuild-tier from main's head, and each mini had sat fully idle 17 to 33% of the
   the yield below, so a rollout in either order is safe. Under `capacity/admission.lock` it takes the root's
   token, a persistent-dd token and a compile's units, with the host lock shared, writes
   `capacity/idle-warm.json` (its pid and those names), and lets the admission lock go. Then cmux's
-  `scripts/ci/owned_catch_up.sh`, run from a clean checkout of main's head kept under `ci/.catch-up/cmux` (a shallow, blobless clone),
+  `scripts/ci/owned_catch_up.sh`, run from a clean checkout of main's head kept under `ci/.catch-up/cmux` (a shallow, blobless
+  clone that
+  borrows the objects of the mini's git mirror, `git/cmux.git`, so it keeps no copy of them; the seed prefetch's
+  `ci/.prefetch/cmux.git` borrows them the same way),
   runs the steps of a main dispatch's compile admission (check, prefer against kept seeds, adopt, record,
   compile, keep with main's head as `merged_onto`, save). Logs: `ci/.catch-up/logs/`, one line per run in
   `~/Library/Logs/glaeda-idle-warm.jsonl`.

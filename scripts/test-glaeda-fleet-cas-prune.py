@@ -539,6 +539,40 @@ class PruneTest(unittest.TestCase):
         rec = self.run_main("--apply", "--node-gib", "0")
         self.assertTrue(rec["result"].startswith("deferred: ps failed"), rec)
 
+    def test_cap_only_caps_both_stores_with_no_sweep_or_gc(self) -> None:
+        self.env()
+        paths = self.node(6)
+        blob = self.local_cas()
+        left = self.root / ".cas.pruning-4242/v1"
+        left.mkdir(parents=True)
+        rec = self.run_main("--apply", "--cap-only", "--node-gib", "0", "--local-cas-gib", "0")
+        self.assertEqual((rec["result"], rec["local_cas"]), ("ok", "removed"), rec)
+        self.assertEqual(rec["local_cas_bytes"], 8192)
+        self.assertEqual(rec["node_store_freed_bytes"], rec["node_store_bytes"])
+        self.assertFalse(any(p.exists() for p in paths) or blob.exists())
+        self.assertTrue(left.exists(), "no sweep")
+        self.assertNotIn("gc", rec)
+        self.assertNotIn("swept_bytes", rec)
+
+    def test_cap_only_still_caps_the_node_store_when_ps_fails_and_keeps_the_local_cas(self) -> None:
+        self.env()
+        paths = self.node(6)
+        blob = self.local_cas()
+        fp.running_commands = lambda: None
+        rec = self.run_main("--apply", "--cap-only", "--node-gib", "0", "--local-cas-gib", "0")
+        self.assertIn("removed", rec["node_store"], rec)
+        self.assertFalse(any(p.exists() for p in paths))
+        self.assertTrue(rec["local_cas"].startswith("deferred: ps failed"), rec)
+        self.assertEqual(rec["result"], rec["local_cas"])
+        self.assertTrue(blob.exists())
+
+    def test_node_only_reports_the_local_cas_size_without_judging_it(self) -> None:
+        self.env()
+        blob = self.local_cas()
+        rec = self.run_main("--apply", "--node-only", "--local-cas-gib", "0")
+        self.assertEqual((rec["local_cas"], rec["local_cas_bytes"]), ("not judged (--node-only)", 8192))
+        self.assertTrue(blob.exists())
+
 
     def test_a_reserved_host_above_its_floor_is_left_alone(self) -> None:
         self.env()

@@ -444,6 +444,7 @@ def fleet_labels() -> Any:
     loader = importlib.machinery.SourceFileLoader("glaeda_fleet_labels", os.fspath(path))
     spec = importlib.util.spec_from_loader("glaeda_fleet_labels", loader)
     module = importlib.util.module_from_spec(spec)
+    sys.modules[loader.name] = module  # dataclasses look their module up in sys.modules while it loads
     loader.exec_module(module)
     return module
 
@@ -790,10 +791,7 @@ def hook_wrappers(ctx: Context) -> dict[str, bytes]:
         slots =int((ctx.member or {}).get("compileSlots") or 1)
         if slots > 1:
             scope += f" --compile-slots {slots}"
-        # SIM_SLOTS: simulator token copies (the member's simSlots); every runner on the mini passes the same count
-        sims = int((ctx.member or {}).get("simSlots") or 1)
-        if sims > 1:
-            scope += f" --sim-slots {sims}"
+        # SIM_DYNAMIC: no simulator count is passed; the hook admits copies by measured headroom
         roots = int((ctx.member or {}).get("canonicalRoots") or 1)
         if roots > 1:
             # instance i prefers root i+1, so a root runner keeps compiling in the tree its warm labels name
@@ -1576,6 +1574,7 @@ def hook_module() -> Any:
     loader = importlib.machinery.SourceFileLoader("glaeda_cmux_runner_hook", os.fspath(HOOK_SOURCE))
     spec = importlib.util.spec_from_loader("glaeda_cmux_runner_hook", loader)
     module = importlib.util.module_from_spec(spec)
+    sys.modules[loader.name] = module  # dataclasses look their module up in sys.modules while it loads
     loader.exec_module(module)
     return module
 
@@ -3100,11 +3099,9 @@ def main(argv: list[str] | None = None) -> int:
                  if is_root else [*member.get("sidePools", []), *member.get("sharedSidePools", [])])
         # Dedicated roles leave out ordinary pool and iOS labels, so those jobs cannot take a DEV, GUI or fast
         # instance. The pool's live count includes only the root and side instances it can route to.
-        # The sim-slots label (glaeda_fleet_labels.sim_slots_label, cmux#44908) goes only where simulator jobs go: the
-        # glaeda-ios-sim runners and the sim-first runner.
-        slots_prefix = getattr(fleet_labels(), "SIM_SLOTS_LABEL_PREFIX", "glaeda-sim-slots-")
+        # An older rule's glaeda-sim-slots-<N> (no longer written, SIM_DYNAMIC) never reaches a dedicated runner.
         own = ([label for label in member["labels"] if label not in member.get("pools", []) and label != IOS_SIM_JOB_LABEL
-                and (ctx.sim_runner or not label.startswith(slots_prefix))]
+                and (ctx.sim_runner or not label.startswith("glaeda-sim-slots-"))]
                if dev or nightly or gateway or ctx.gui_runner or ctx.session_runner or ctx.fast_runner
                else member["labels"])
         ctx.labels = list(dict.fromkeys([*BASE_LABELS, *own, *roots]))

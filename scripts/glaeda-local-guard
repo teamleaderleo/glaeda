@@ -464,7 +464,7 @@ def write_seen(seen: dict[str, dict], path: Path = SEEN) -> None:
 def lsof_cwds(pids: list[int]) -> dict[int, str]:
     """cwd of each pid that still exists; an unreadable lsof yields nothing, so nothing is stopped."""
     try:
-        out = subprocess.run([LSOF, "-a", "-d", "cwd", "-n", "-P", "-Fpn", "-p", ",".join(map(str, pids))],
+        out = subprocess.run([LSOF, "-b", "-w", "-a", "-d", "cwd", "-n", "-P", "-Fpn", "-p", ",".join(map(str, pids))],
                              capture_output=True, text=True, timeout=gp.TIMEOUT, env=gp.CHILD_ENV)
     except (OSError, subprocess.TimeoutExpired):
         return {}
@@ -485,7 +485,8 @@ def parse_lsof(text: str) -> dict[int, str]:
 def lsof_fds(pids: list[int]) -> dict[int, dict]:
     """cwd and stdout (lsof type, device, peer) of each pid; what lsof cannot read stays missing and is kept."""
     try:
-        out = subprocess.run([LSOF, "-a", "-d", "cwd,1", "-n", "-P", "-Fpftdn", "-p", ",".join(map(str, pids))],
+        out = subprocess.run([LSOF, "-b", "-w", "-a", "-d", "cwd,1", "-n", "-P", "-Fpftdn",
+                              "-p", ",".join(map(str, pids))],
                              capture_output=True, text=True, timeout=gp.TIMEOUT, env=gp.CHILD_ENV)
     except (OSError, subprocess.TimeoutExpired):
         return {}
@@ -521,7 +522,7 @@ def lsof_holders() -> dict[str, set[int]] | None:
     Without root, lsof sees only this user's processes, so a reader owned by someone else is not seen.
     """
     try:
-        out = subprocess.run([LSOF, "-n", "-P", "-Fpd"], capture_output=True, text=True, timeout=gp.TIMEOUT,
+        out = subprocess.run([LSOF, "-b", "-w", "-n", "-P", "-Fpd"], capture_output=True, text=True, timeout=gp.TIMEOUT,
                              env=gp.CHILD_ENV)
     except (OSError, subprocess.TimeoutExpired):
         return None

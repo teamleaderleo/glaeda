@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import re
+import sys
 from typing import Any, Callable, NamedTuple
 
 MINI_LABEL = "glaeda-mini"
@@ -86,12 +87,11 @@ SIM_PREFIX = "sim"
 # one heavy job's 20 GiB (SMALL_ONLY). On 2026-11-16 that 20 GiB held 12 of cmux18's 14 runners at 17.2 GiB free.
 MAX_SMALL_RUNNERS = 2
 SMALL_PREFIX = "small"
-# simSlots (1 to MAX_SIM_SLOTS, default 1) is how many copies of the simulator token a simulator mini's hook hands
-# out (glaeda-cmux-runner-hook SIM_SLOTS, --sim-slots): that many simulator jobs may run at once, each told its copy
-# (GLAEDA_SIM_SLOT) to boot its own devices, and every copy past the first only with headroom for it (load, memory
-# pressure, the class's measured RAM). Leo, 2026-11-17: "aziz also wanted to look into packing more ios simulators
-# at once and right-sizing them in ci". A member without the simulator role keeps 1.
-MAX_SIM_SLOTS = 4  # the hook's MAX_SIM_SLOTS (a test keeps them equal)
+# simSlots is ignored (logged once per class, SIM_SLOTS_IGNORED): no simulator count is set by hand (Leo,
+# 2026-11-17: "hm why 3 tho shouldn't this be more dynamic? i think it's finally time to start getting these things
+# done"). A simulator mini's hook hands out simulator token copies by measured headroom up to a ceiling it computes
+# from the host's RAM and one simulator's measured RSS (glaeda-cmux-runner-hook SIM_DYNAMIC), each job told its copy
+# (GLAEDA_SIM_SLOT) to boot its own devices.
 COMPILE_CORES = 5  # the hook's CLASS_COST["compile"] units (a test keeps them equal)
 MAX_RUNNERS = 16
 # A host's overrides.runner {trustedRef: refs/heads/main, trustedRepo: owner/name} makes its runners trusted-only:
@@ -402,14 +402,10 @@ def small_label(version: str) -> str:
     return f"glaeda-{SMALL_PREFIX}-xcode-{version}"
 
 
-SIM_SLOTS_LABEL_PREFIX = "glaeda-sim-slots-"
-
-
-def sim_slots_label(slots: int) -> str:
-    """glaeda-sim-slots-<N>: a simulator mini's slot count (simSlots above 1), on its glaeda-ios-sim runners and its
-    sim-first runner. cmux's picker (scripts/ci/ios_runner_pool.py, cmux#44908) reads it to learn how many simulator
-    jobs the mini runs at once, and routes test-ios to the sim-first runner only where it is. None at 1."""
-    return f"{SIM_SLOTS_LABEL_PREFIX}{slots}"
+# No simulator count label: a simulator mini carries IOS_SIM_LABEL alone (cmuxterm-hq lane/sim-dynamic-admission's
+# contract), and its hook admits simulator jobs by measured headroom (glaeda-cmux-runner-hook SIM_DYNAMIC); its
+# sim-first runner listens exactly while one more is admissible. glaeda-sim-slots-<N> is no longer written.
+SIM_SLOTS_IGNORED: set[str] = set()  # the classes whose simSlots was logged as ignored, once each
 
 
 def _role_label(pool: str, role: str) -> str:
@@ -576,11 +572,13 @@ def member_labels(manifest: Any, member: str, xcode_ok: Callable[[dict[str, Any]
         gateway = declared.get("gatewayRunners", 0)
         sim = declared.get("simRunners", 0)
         small = declared.get("smallRunners", 0)
-        sim_slots = declared.get("simSlots", 1)
+        if "simSlots" in declared and klass not in SIM_SLOTS_IGNORED:
+            SIM_SLOTS_IGNORED.add(klass)
+            print(f"glaeda_fleet_labels: runner.classes.{klass}.simSlots is ignored: simulator copies follow "
+                  "measured headroom (glaeda-cmux-runner-hook SIM_DYNAMIC)", file=sys.stderr)
         reserve = declared.get("reserveCores", 0)
     else:
         compile_slots, roots, gui, fast, gateway, sim, small, reserve = 1, 1, 0, 0, 0, 0, 0, 0
-        sim_slots = 1
     if dedicated_only:
         gateway = sim = small = 0  # DEDICATED_ONLY: no pool instance, so no gateway, sim-first or small runner either
     if not (isinstance(runners, int) and not isinstance(runners, bool) and 1 <= runners <= MAX_RUNNERS):
@@ -614,11 +612,6 @@ def member_labels(manifest: Any, member: str, xcode_ok: Callable[[dict[str, Any]
     # simulator (a trustedRef nightly host) is not misconfigured by it. On 2026-11-14 the check ran first and held
     # cmux15, the nightly host, out of every runner-heal pass ("simRunners needs a dedicated runner").
     sim = sim if ios_sim else 0
-    if not (isinstance(sim_slots, int) and not isinstance(sim_slots, bool) and 1 <= sim_slots <= MAX_SIM_SLOTS):
-        return None, f"runner.classes.{klass}.simSlots must be 1 to {MAX_SIM_SLOTS}"
-    sim_slots = sim_slots if ios_sim else 1  # a class default, read the same way as simRunners
-    if sim_slots > 1:  # cmux#44908: the picker learns the slot count from this label
-        labels.append(sim_slots_label(sim_slots))
     if sim and (trusted_ref is not None or availability != "dedicated" or normal_pool_prefix):
         return None, (f"{member} runner.classes.{klass}.simRunners needs a dedicated runner without trustedRef "
                       "(a sim-first runner takes pull request jobs) in the default pool namespace (no poolPrefix)")
@@ -663,7 +656,7 @@ def member_labels(manifest: Any, member: str, xcode_ok: Callable[[dict[str, Any]
             "gatewayRunners": gateway,
             "gatewayPools": list(dict.fromkeys(gateway_label(v) for v in (versions if pools else []))) if gateway
             else [],
-            "simRunners": sim, "simSlots": sim_slots,
+            "simRunners": sim,
             "simPools": list(dict.fromkeys(sim_label(v) for v in (versions if pools else []))) if sim else [],
             "smallRunners": small,
             "smallPools": list(dict.fromkeys(small_label(v) for v in (versions if pools else []))) if small else [],

@@ -16,6 +16,12 @@
       "resumeGiB": 5,
       "maxWaitMin": 10,
       "why": "2026-11-16/17 (Leo, 2026-11-05: \"i meant can you do all of htem\"; cmuxterm-hq#12838): the 16 GiB minis cmux17, 18, 21 and 22 showed the out-of-application-memory panel running 4-6 jobs; cmux17's 22:34Z JetsamEvent killed daemons for low swap while eight swift-frontend processes held 2.8-6.5 GiB each. A swift-frontend peaks near 4 GiB, so a new job waits for that much reclaimable memory while another host has room."
+    },
+    "starvedReserve": {
+      "afterMin": 10,
+      "spreadMin": 20,
+      "maxHoldMin": 30,
+      "why": "2026-11-17 (Leo, 2026-11-05: \"i meant can you do all of htem\"; cmux#45614): cmux NEXT DEV's DMG build (glaeda-std-xcode-26.6, a compile, 5 units) queued 23 min with no std runner listening: every std mini had 3-4 of 14 units free and side, session and fleet-step jobs took each unit back as it freed. A root runner whose label has a job queued afterMin holds root_fit_units on its mini (STARVED_RESERVE) on that mini's turn (spreadMin x a hash of host and job, so one mini goes first); the mini's other listeners and fleet steps leave the units free, running jobs finish, and the root runner takes the job. Held at most maxHoldMin; a feed that cannot be read holds nothing."
     }
   },
   "hosts": {
