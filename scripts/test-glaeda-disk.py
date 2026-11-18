@@ -13360,7 +13360,9 @@ class DeadItemsTest(unittest.TestCase):
                           "cmux21-lvm-0", "cmux21-lvm-2", "cmux21-lvm-3"},
                          "Lima's own _ entries (_config, _disks, _networks, ...) and dot entries are never items")
         cmds = "/opt/homebrew/bin/limactl start cmux21-lvm-2 --tty=false\n"
-        with mock.patch.object(gd, "process_evidence", return_value=([], cmds)):
+        # the slot's claim names ai.manaflow.cmux-linux-vm: installed here, whatever this test host has
+        with mock.patch.object(gd, "process_evidence", return_value=([], cmds)), \
+                mock.patch.object(gd, "launchd_job_installed", return_value=True):
             items = {Path(i.path).name: i for i in gd.survey([fam], 12, 0)}
         self.assertEqual(items["cmux-old-lvm-9"].verdict, "reclaimable", items["cmux-old-lvm-9"].reasons)
         self.assertEqual(items["cmux21-lvm-3"].verdict, "reclaimable", items["cmux21-lvm-3"].reasons)
@@ -13880,6 +13882,218 @@ class KeptAsideRestoreTest(unittest.TestCase):
         with mock.patch.object(gd, "process_evidence", return_value=([], f"vim {self.aside}/x\n")):
             self.assertEqual(gd.restore_stale_kept_asides([self.fam]), 0)
         self.assertTrue(self.aside.is_dir())
+
+
+class TartLimaReferencesTest(unittest.TestCase):
+    """Tart and Lima VMs something references stay uncapped with a reason naming what; the rest are stale and join
+    the host cache budget (Leo, 2026-11-18: "there are dozens if not hundreds of gb of build stuff that just keep
+    getting accumulated. it's too much"; glaeda#2060's budget freed 0 GiB on a 460 GiB mini whose ~100 GiB of VMs sat
+    outside it). The fixtures are that mini's: cumv15-1 running, cloned from cumv15-build, and cmux-linux-bake."""
+
+    ECID = "AAAAAAAAAAA="
+    LVM_LABEL = "ai.manaflow.cmux-linux-vm"
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(os.path.realpath(self.tmp.name))
+        self.home = self.root / "home"
+        self.home.mkdir()
+        stack = contextlib.ExitStack()
+        self.addCleanup(stack.close)
+        keep_main_globals(stack)
+        stack.enter_context(mock.patch.object(gd, "HOME", self.home))
+        stack.enter_context(mock.patch.object(gd, "FLEET_ROOT", self.root / "shared-fleet"))
+        stack.enter_context(mock.patch.dict(gd._LAUNCHD_INSTALLED, {}, clear=True))
+        gd._DISCOVERED.clear()
+        self.addCleanup(gd._DISCOVERED.clear)
+
+    def age(self, tree: Path, hours: float) -> None:
+        t = time.time() - hours * 3600
+        for dirpath, dirnames, filenames in os.walk(tree):
+            for name in filenames + dirnames:
+                os.utime(os.path.join(dirpath, name), (t, t), follow_symlinks=False)
+        os.utime(tree, (t, t))
+
+    def tart_vm(self, name: str, hours: float, ecid: str | None = None) -> Path:
+        vm = self.home / ".tart/vms" / name
+        vm.mkdir(parents=True)
+        config = {"os": "darwin", **({"ecid": ecid} if ecid else {})}
+        (vm / "config.json").write_text(json.dumps(config))
+        (vm / "disk.img").write_bytes(b"\0" * 4096)
+        (vm / "nvram.bin").write_bytes(b"\0" * 64)
+        self.age(vm, hours)
+        return vm
+
+    def lima_vm(self, name: str, hours: float, yaml: str = "vmType: vz\n", disk: bytes = b"\0" * 4096) -> Path:
+        vm = self.home / ".lima" / name
+        vm.mkdir(parents=True)
+        (vm / "lima.yaml").write_text(yaml)
+        (vm / "diffdisk").write_bytes(disk)
+        self.age(vm, hours)
+        return vm
+
+    def claim(self, vm: Path, owner: str | None, hours: float) -> None:
+        doc = {"why": "the Linux worker VMs base image (build-fleet/mini-ops/linux-vm)"}
+        if owner is not None:
+            doc["owner"] = owner
+        (vm / gd.ROLE_KEEP_MARKER).write_text(json.dumps(doc))
+        self.age(vm, hours)
+
+    def lock(self, vm: Path) -> None:
+        """Hold the VM's config.json lock the way `tart run` does (its PIDLock)."""
+        holder = subprocess.Popen([sys.executable, "-I", "-c",
+                                   "import fcntl, os, sys, time\n"
+                                   "fd = os.open(sys.argv[1], os.O_RDWR)\n"
+                                   "fcntl.lockf(fd, fcntl.LOCK_EX)\n"
+                                   "print('locked', flush=True)\n"
+                                   "time.sleep(60)\n", os.fspath(vm / "config.json")],
+                                  stdout=subprocess.PIPE, text=True)
+        self.addCleanup(holder.wait)
+        self.addCleanup(holder.kill)
+        self.assertEqual(holder.stdout.readline().strip(), "locked")
+
+    def fam(self, fid: str) -> gd.Family:
+        return next(f for f in gd.default_families() if f.id == fid)
+
+    def survey(self, *fids: str) -> dict[str, gd.Item]:
+        with mock.patch.object(gd, "process_evidence", return_value=([], "")):
+            return {Path(i.path).name: i for i in gd.survey([self.fam(f) for f in fids], 12, 0)}
+
+    def test_the_measured_mini_keeps_its_clone_source_and_its_configured_base_with_reasons(self) -> None:
+        build = self.tart_vm("cumv15-build", 36.7, self.ECID)
+        running = self.tart_vm("cumv15-1", 0.5, self.ECID)  # `tart clone cumv15-build cumv15-1`, then `tart run`
+        self.lock(running)
+        bake = self.lima_vm("cmux-linux-bake", 26 * 24)
+        self.claim(bake, self.LVM_LABEL, 26 * 24)
+        with mock.patch.object(gd, "launchd_job_installed", side_effect=lambda label: label == self.LVM_LABEL):
+            items = self.survey(gd.TART_VMS, gd.LIMA_VMS)
+            self.assertEqual(items["cumv15-1"].verdict, "in-use", items["cumv15-1"].reasons)
+            self.assertIn("tart runs it (its config.json lock is held)", items["cumv15-1"].reasons)
+            self.assertEqual(items["cumv15-build"].verdict, "kept", items["cumv15-build"].reasons)
+            self.assertIn("clone source of running VM cumv15-1", items["cumv15-build"].reasons)
+            self.assertEqual(items["cmux-linux-bake"].verdict, "kept")
+            why = "; ".join(items["cmux-linux-bake"].reasons)
+            self.assertIn(f"launchd job {self.LVM_LABEL} is installed", why)
+            self.assertIn("the Linux worker VMs' base", why)
+            # referenced VMs are no cache: none of their bytes count toward the budget, however old
+            sizes = {os.fspath(build): 29 * gd.GIB, os.fspath(running): 30 * gd.GIB, os.fspath(bake): 40 * gd.GIB}
+            fams = [self.fam(gd.TART_VMS), self.fam(gd.LIMA_VMS)]
+            self.assertEqual(gd._budget_dev_bytes(fams, sizes), {})
+
+    def test_a_stopped_clone_an_orphaned_clone_and_a_stale_claim_are_stale_and_say_why(self) -> None:
+        base = self.tart_vm("ubase", 30 * 24, self.ECID)
+        clone = self.tart_vm("vm0", 26 * 24, self.ECID)  # stopped since 2026-10-19 (cmux23), cloned from ubase
+        orphan = self.tart_vm("vm5", 26 * 24, "BBBBBBBBBBB=")  # its source is gone
+        young = self.tart_vm("vm6", 10, "CCCCCCCCCCC=")  # stale, but inside the 48 h window while under budget
+        gone_job = self.lima_vm("cmux-old-lvm-1", 26 * 24)
+        self.claim(gone_job, "ai.manaflow.cmux-retired-vm", 26 * 24)
+        person = self.lima_vm("leo-scratch", 26 * 24)
+        self.claim(person, "leo", 26 * 24)
+        unknowable = self.lima_vm("cmux21-lvm-0", 26 * 24)
+        self.claim(unknowable, self.LVM_LABEL, 26 * 24)
+        installed = {"ai.manaflow.cmux-retired-vm": False, self.LVM_LABEL: None}
+        with mock.patch.object(gd, "launchd_job_installed", side_effect=installed.get):
+            items = self.survey(gd.TART_VMS, gd.LIMA_VMS)
+        self.assertEqual(items["ubase"].verdict, "kept", items["ubase"].reasons)
+        self.assertIn("clone source of VM vm0", items["ubase"].reasons)
+        self.assertEqual(items["vm0"].verdict, "reclaimable", items["vm0"].reasons)
+        self.assertTrue(items["vm0"].reasons[-1].startswith("stale: a stopped clone of ubase"), items["vm0"].reasons)
+        self.assertEqual(items["vm5"].verdict, "reclaimable", items["vm5"].reasons)
+        self.assertIn("stale: nothing references it", items["vm5"].reasons[-1])
+        self.assertEqual(items["vm6"].verdict, "recent")
+        self.assertIn("stale: nothing references it", items["vm6"].reasons[-1], "a recent VM says why too")
+        self.assertEqual(items["cmux-old-lvm-1"].verdict, "reclaimable", items["cmux-old-lvm-1"].reasons)
+        self.assertIn("claim by ai.manaflow.cmux-retired-vm is stale: no such launchd job",
+                      items["cmux-old-lvm-1"].reasons[-1])
+        self.assertEqual(items["leo-scratch"].verdict, "kept", "a person's claim still holds")
+        self.assertIn("claimed by leo", items["leo-scratch"].reasons[-1])
+        self.assertEqual(items["cmux21-lvm-0"].verdict, "kept", "a job launchd cannot be asked about keeps its claim")
+        # every Tart/Lima item names what references it or why it is stale
+        for name, item in items.items():
+            self.assertTrue(item.reasons, name)
+        # the stale ones count toward the budget, the referenced ones do not
+        sizes = {os.fspath(p): 10 * gd.GIB for p in (base, clone, orphan, young, gone_job, person, unknowable)}
+        sizes[os.fspath(clone / "disk.img")] = 9 * gd.GIB  # inside a counted VM: counted once
+        with mock.patch.object(gd, "launchd_job_installed", side_effect=installed.get):
+            by = gd._budget_dev_bytes([self.fam(gd.TART_VMS), self.fam(gd.LIMA_VMS)], sizes)
+        self.assertEqual(by, {self.home.stat().st_dev: {gd.TART_VMS: 30 * gd.GIB, gd.LIMA_VMS: 10 * gd.GIB}})
+        receipt = self.root / "receipt.jsonl"
+        with contextlib.redirect_stdout(io.StringIO()), \
+                mock.patch.object(gd, "process_evidence", return_value=([], "")), \
+                mock.patch.object(gd, "launchd_job_installed", side_effect=installed.get):
+            gd.apply(list(items.values()), {f: self.fam(f) for f in (gd.TART_VMS, gd.LIMA_VMS)}, receipt, None, 12)
+        for vm in (clone, orphan, gone_job):
+            self.assertFalse(vm.exists(), receipt.read_text())
+        for vm in (base, young, person, unknowable):
+            self.assertTrue(vm.exists())
+
+    def test_over_the_budget_a_stale_vm_goes_past_an_hour_and_a_referenced_one_stays(self) -> None:
+        base = self.tart_vm("cumv15-build", 3, self.ECID)
+        running = self.tart_vm("cumv15-1", 0.5, self.ECID)
+        self.lock(running)
+        stale = self.tart_vm("aside-1", 3, "BBBBBBBBBBB=")
+        lima_stale = self.lima_vm("cmux-old-lvm-2", 3)
+        dev = self.home.stat().st_dev
+        self.assertIn(gd.TART_VMS, gd.BUDGET_FAMILY_IDS)
+        self.assertIn(gd.LIMA_VMS, gd.BUDGET_FAMILY_IDS)
+        self.assertLessEqual(gd.BUDGET_WARM_FAMILY_IDS, gd.BUDGET_FAMILY_IDS)
+        with mock.patch.object(gd, "ACTIVITY_MODE", "pressure"), \
+                mock.patch.object(gd, "BUDGET_WARM_DEVS", frozenset({dev})):
+            items = self.survey(gd.TART_VMS, gd.LIMA_VMS)
+            self.assertEqual(items["aside-1"].verdict, "reclaimable", items["aside-1"].reasons)
+            self.assertTrue(gd.budget_only(self.fam(gd.TART_VMS), items["aside-1"], 12))
+            self.assertEqual(items["cmux-old-lvm-2"].verdict, "reclaimable", items["cmux-old-lvm-2"].reasons)
+            self.assertEqual(items["cumv15-build"].verdict, "kept", "referenced: no budget takes it")
+            self.assertEqual(items["cumv15-1"].verdict, "in-use")
+        # under the budget the 48 h window holds
+        items = self.survey(gd.TART_VMS, gd.LIMA_VMS)
+        self.assertEqual(items["aside-1"].verdict, "recent")
+        self.assertTrue(base.exists() and stale.exists() and lima_stale.exists())
+
+    def test_a_lima_instance_named_as_another_ones_source_is_referenced(self) -> None:
+        base = self.lima_vm("cmux-linux-bake-v2", 26 * 24)
+        self.lima_vm("cmux21-lvm-1", 26 * 24, yaml=f"images:\n- location: {self.home}/.lima/cmux-linux-bake-v2/basedisk\n")
+        backing = f"{self.home}/.lima/cmux-linux-bake-v1/basedisk".encode()
+        header = bytearray(gd.QCOW2_MAGIC + (3).to_bytes(4, "big") + (512).to_bytes(8, "big")
+                           + len(backing).to_bytes(4, "big"))
+        disk = bytes(header) + b"\0" * (512 - len(header)) + backing + b"\0" * 64
+        v1 = self.lima_vm("cmux-linux-bake-v1", 26 * 24)
+        self.lima_vm("cmux21-lvm-2", 26 * 24, disk=disk)
+        old = self.lima_vm("cmux-linux-bake-v0", 26 * 24)  # an old base no instance names any more
+        self.assertEqual(gd.lima_named_instances(self.home / ".lima/cmux21-lvm-2"), {"cmux-linux-bake-v1"})
+        items = self.survey(gd.LIMA_VMS)
+        self.assertEqual(items[base.name].verdict, "kept", items[base.name].reasons)
+        self.assertIn("clone source of VM cmux21-lvm-1", items[base.name].reasons)
+        self.assertEqual(items[v1.name].verdict, "kept")
+        self.assertIn("clone source of VM cmux21-lvm-2", items[v1.name].reasons)
+        self.assertEqual(items[old.name].verdict, "reclaimable")
+        self.assertEqual(items["cmux21-lvm-1"].verdict, "reclaimable")
+        self.assertIn("stale: a stopped clone of cmux-linux-bake-v2", items["cmux21-lvm-1"].reasons[-1])
+
+    def test_never_delete_still_wins(self) -> None:
+        self.tart_vm("vm0", 26 * 24)
+        with mock.patch.object(gd, "NEVER_DELETE", (*gd.NEVER_DELETE, ".tart/vms/vm0")):
+            self.assertEqual(gd.candidates(self.fam(gd.TART_VMS)), [])
+
+    def test_launchd_job_installed_reads_plists_then_launchctl(self) -> None:
+        agents = self.home / "Library/LaunchAgents"
+        agents.mkdir(parents=True)
+        (agents / "x.plist").write_bytes(plistlib.dumps({"Label": self.LVM_LABEL}))
+        fake = self.root / "launchctl"
+        with mock.patch.object(gd, "LAUNCHCTL", os.fspath(fake)):
+            self.assertTrue(gd.launchd_job_installed(self.LVM_LABEL), "a plist naming the label")
+            self.assertIsNone(gd.launchd_job_installed("ai.manaflow.gone"), "no launchctl: cannot tell")
+            gd._LAUNCHD_INSTALLED.clear()
+            fake.write_text('#!/bin/sh\necho "Could not find service \\"$2\\" in domain" >&2\nexit 113\n')
+            fake.chmod(0o755)
+            self.assertIs(gd.launchd_job_installed("ai.manaflow.gone"), False)
+            gd._LAUNCHD_INSTALLED.clear()
+            fake.write_text('#!/bin/sh\necho "Could not find domain for port" >&2\nexit 1\n')
+            self.assertIsNone(gd.launchd_job_installed("ai.manaflow.gone"), "an unreadable domain is no answer")
+            gd._LAUNCHD_INSTALLED.clear()
+            fake.write_text('#!/bin/sh\ncase "$2" in gui/*) exit 0;; esac\nexit 113\n')
+            self.assertTrue(gd.launchd_job_installed("ai.manaflow.gone"), "loaded without a plist we read")
 
 
 if __name__ == "__main__":
