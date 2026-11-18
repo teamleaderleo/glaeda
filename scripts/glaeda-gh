@@ -695,6 +695,17 @@ PACE_FILE = "pace.json"
 PACE_CLI = Path.home() / ".local/lib/gh-quota/bin/gh"  # a link into the pacer's checkout, next to gh_quota.py
 PACE_DEADLINE = 5
 PACE_HOLD_MAX = 3600
+# The login's create pause (GitHub's secondary content-creation limit), one fact per login that the gh guard keeps:
+# `<cmd> content-pause` prints {"blocked_until": epoch seconds, "level": n} (0 or absent: not paused), and
+# `<cmd> content-pause --hold UNTIL --what TEXT` extends it (never shortens). The outbox posts with the token, not
+# through the guard, so it asks before each create and reports its own throttles: a writer that kept posting through
+# the pause renewed it for every other writer on the login. CONTENT_PAUSE_ENV names the command (shell words; empty
+# turns it off); else the guard's gh_quota.py next to PACE_CLI's link, else CONTENT_PAUSE_NAMES on PATH. With none,
+# the outbox posts as before.
+CONTENT_PAUSE_ENV = "GLAEDA_CONTENT_PAUSE_CMD"
+CONTENT_PAUSE_NAMES = ("gh-quota",)
+CONTENT_PAUSE_TTL = 15  # seconds an answer is reused
+CONTENT_PAUSE_DEADLINE = 10
 # A private repository on a plan without branch protection or rulesets answers 403 with this: there are
 # no requirements to read, as for a deleted base branch.
 NO_FEATURE = re.compile(r"Upgrade to GitHub Pro|make this repository public to enable this feature", re.I)
@@ -1855,6 +1866,22 @@ def run_bounded(argv: list[str], timeout: float | None = None, input_text: str |
                     stream.close()
             raise subprocess.TimeoutExpired(argv, timeout) from None
     return subprocess.CompletedProcess(argv, proc.returncode, out, err)
+
+
+def content_pause_cmd() -> list[str] | None:
+    """The command that reads and extends the login's create pause (CONTENT_PAUSE_ENV), or None: none on this host."""
+    named = os.environ.get(CONTENT_PAUSE_ENV)
+    if named is not None:
+        return shlex.split(named) or None
+    with contextlib.suppress(OSError):
+        cli = PACE_CLI.resolve().parent / "gh_quota.py"
+        if cli.is_file():
+            return [sys.executable, "-I", os.fspath(cli)]
+    for name in CONTENT_PAUSE_NAMES:
+        found = shutil.which(name)
+        if found:
+            return [found]
+    return None
 
 
 def find_gh() -> str | None:
@@ -3161,6 +3188,8 @@ class Daemon:
         held = (read_json(BASE / "daemon.json") or {}).get("outbox") or {}
         self.post_hold = float(held.get("holdUntil") or 0.0)  # GitHub's secondary limit holds the outbox until then
         self.post_backoff = POST_BACKOFF  # the next hold without a Retry-After
+        self.pause_until = 0.0  # the login's create pause (content_pause_until), as last read
+        self.pause_read = float("-inf")  # when it was last asked
         saved = read_json(BASE / CONSUMERS_FILE)
         spends = saved.get("spends") if isinstance(saved, dict) else None
         # consumer -> times of the head reads charged to it in the last hour
@@ -4022,6 +4051,8 @@ class Daemon:
                 continue  # it goes out in (or went out with) its leader's comment: no request of its own
             if self.backoff["rest"] > self.now and not (item.get("kind") == "comment" and self.post_over_graphql(item)):
                 continue  # REST's hour is spent (rest_out): it waits for the reset; a comment behind it goes over GraphQL
+            if self.now < self.content_pause_until():
+                return  # the login's create pause: every write waits it out, in order, none dropped
             self.writing = True
             try:
                 with self.calling("outbox", str(item.get("repo") or "")):
@@ -4045,6 +4076,48 @@ class Daemon:
         finally:
             self.now = tick_now
 
+    def content_pause_until(self) -> float:
+        """When the login's create pause ends (0: none), asked at most every CONTENT_PAUSE_TTL. A failed ask keeps
+        the last answer; the pacer's own hold (adopt_pace_hold) applies either way."""
+        cmd = content_pause_cmd()
+        if cmd is None:
+            return 0.0
+        clock = self.clock()
+        if clock - self.pause_read < CONTENT_PAUSE_TTL:
+            return self.pause_until
+        self.pause_read = clock
+        try:
+            done = run_bounded([*cmd, "content-pause"], CONTENT_PAUSE_DEADLINE)
+            doc = json.loads(done.stdout) if done.returncode == 0 else None
+            if not isinstance(doc, dict):
+                raise ValueError(f"exit {done.returncode}: {(done.stderr or done.stdout or '').strip()[:200]}")
+            until = doc.get("blocked_until") or 0
+            if isinstance(until, bool) or not isinstance(until, (int, float)):
+                raise ValueError(f"blocked_until {until!r}")
+            if not doc.get("level", 1):
+                until = 0  # level 0: not paused, whatever blocked_until says
+            until = min(float(until), clock + PACE_HOLD_MAX)  # a corrupt far future holds an hour at most
+            if until > max(self.now, self.pause_until):
+                log({"event": "post-paused", "source": "login", "hold": round(until - self.now)})
+            self.pause_until = until
+        except (OSError, subprocess.SubprocessError, ValueError) as error:
+            self.errors.append(f"content pause: {describe(error)}")
+        return self.pause_until
+
+    def report_content_pause(self, until: float, kind: str) -> None:
+        """Extend the login's create pause to `until` for this throttled write, so every writer waits it out."""
+        self.pause_until = max(self.pause_until, until)
+        cmd = content_pause_cmd()
+        if cmd is None:
+            return
+        try:
+            done = run_bounded([*cmd, "content-pause", "--hold", str(int(math.ceil(until))),
+                                "--what", f"glaeda outbox {kind}"], CONTENT_PAUSE_DEADLINE)
+            if done.returncode != 0:
+                self.errors.append(f"content pause hold: exit {done.returncode}")
+        except (OSError, subprocess.SubprocessError) as error:
+            self.errors.append(f"content pause hold: {describe(error)}")
+
     def post_hold_for(self, h: dict, path: Path, item: dict) -> None:
         try:
             wait = float(h["retry-after"]) if h.get("retry-after") else (
@@ -4058,6 +4131,9 @@ class Daemon:
         item["holdUntil"] = self.post_hold
         write_json(path, item)
         log({"event": "post-throttled", "id": item["id"], "wait": round(wait)})
+        if h.get("retry-after") or h.get("x-ratelimit-remaining") != "0":
+            # the secondary limit, not the hourly one: the pause is the login's, so report it where every writer reads
+            self.report_content_pause(self.post_hold, str(item.get("kind") or "write"))
 
     def post_one(self, path: Path, item: dict) -> None:
         if item.get("delivered"):

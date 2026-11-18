@@ -64,6 +64,9 @@ gg.ALARM_CMD = Path(tempfile.gettempdir()) / f"glaeda-gh-test-no-alarm-{os.getpi
 gg.COORD_ALERT = Path(tempfile.gettempdir()) / f"glaeda-gh-test-no-alarm-{os.getpid()}" / "coord_alert.py"
 # Nor may a pool alarm run the host's own gh-quota for its spenders list.
 gg.SPENDERS_CMD = os.fspath(Path(tempfile.gettempdir()) / f"glaeda-gh-test-no-spenders-{os.getpid()}" / "gh-quota")
+# Nor may the outbox ask (or extend) the host's own create pause: only a test that names a command has one.
+gg.CONTENT_PAUSE_NAMES = ()
+os.environ.pop(gg.CONTENT_PAUSE_ENV, None)
 _NOTICES = tempfile.TemporaryDirectory(prefix="glaeda-gh-test-notices-")  # removed when the run ends
 gg.NOTICES_DIR = Path(_NOTICES.name)
 
@@ -11801,6 +11804,77 @@ class PostTest(unittest.TestCase):
         self.assertEqual([c[1] for c in t.calls], ["/repos/o/r/issues/1/comments", "/repos/o/r/pulls/2/reviews"])
         self.assertEqual(t.calls[1][2], {"body": "two", "event": "APPROVE"})
         self.assertEqual([gg.post_state(i["id"])["state"] for i in (first, second)], ["posted", "posted"])
+
+    def pause_cmd(self, blocked_until: float, level: int = 1) -> Path:
+        """A fake create-pause command, named in CONTENT_PAUSE_ENV: it logs its arguments and prints the pause."""
+        root = Path(self.tmp.name) / "pause"
+        root.mkdir(exist_ok=True)
+        (root / "pause.json").write_text(json.dumps({"blocked_until": blocked_until, "level": level}))
+        cmd = root / "content-pause-cmd"
+        cmd.write_text(f'#!/bin/sh\necho "$*" >> {shlex.quote(os.fspath(root / "calls"))}\n'
+                       f'[ "$2" = --hold ] || cat {shlex.quote(os.fspath(root / "pause.json"))}\n')
+        cmd.chmod(0o755)
+        env = mock.patch.dict(os.environ, {gg.CONTENT_PAUSE_ENV: shlex.quote(os.fspath(cmd))})
+        env.start()
+        self.addCleanup(env.stop)
+        return root / "calls"
+
+    def test_the_logins_create_pause_holds_queued_writes_in_order(self) -> None:
+        first = self.queue("comment", "o/r#1", "--body", "one")
+        second = self.queue("comment", "o/r#2", "--body", "two")
+        calls = self.pause_cmd(NOW + 100)
+        ok = (201, {}, {"html_url": "u"})
+        d, t = self.daemon(ok, ok)
+        d.clock_real = False
+        for at in (NOW, NOW + 10, NOW + 20):
+            self.step(d, at)
+        self.assertEqual(t.calls, [])  # paused: nothing sent, nothing dropped
+        self.assertEqual([gg.post_state(i["id"])["state"] for i in (first, second)], ["queued", "queued"])
+        self.assertEqual(calls.read_text().splitlines(), ["content-pause"] * 2)  # asked every 15 s at most
+        (calls.parent / "pause.json").write_text(json.dumps({"blocked_until": 0, "level": 0}))
+        self.step(d, NOW + 100)
+        self.step(d, NOW + 100 + gg.POST_SPACING)
+        self.assertEqual([c[1] for c in t.calls], ["/repos/o/r/issues/1/comments", "/repos/o/r/issues/2/comments"])
+        self.assertEqual([gg.post_state(i["id"])["state"] for i in (first, second)], ["posted", "posted"])
+
+    def test_a_failed_pause_read_keeps_the_last_answer(self) -> None:
+        self.queue("comment", "o/r#1", "--body", "one")
+        calls = self.pause_cmd(NOW + 100)
+        d, t = self.daemon((201, {}, {"html_url": "u"}))
+        d.clock_real = False
+        self.step(d, NOW)
+        (calls.parent / "pause.json").write_text("not json")
+        self.step(d, NOW + 20)
+        self.assertEqual(t.calls, [])
+        self.assertTrue(any(e.startswith("content pause:") for e in d.errors))
+        self.step(d, NOW + 100)  # the last answer's pause is over
+        self.assertEqual(len(t.calls), 1)
+
+    def test_a_throttled_write_extends_the_logins_create_pause(self) -> None:
+        item = self.queue("comment", "o/r#7", "--body", "x")
+        calls = self.pause_cmd(0, level=0)
+        d, t = self.daemon((403, {"retry-after": "120"}, {"message": (
+            "You have exceeded a secondary rate limit and have been temporarily blocked from content creation.")}))
+        d.clock_real = False
+        self.step(d, NOW)
+        self.assertEqual(len(t.calls), 1)
+        self.assertEqual(calls.read_text().splitlines(),
+                         ["content-pause", f"content-pause --hold {int(NOW) + 120} --what glaeda outbox comment"])
+        self.assertEqual(gg.post_state(item["id"])["state"], "queued")
+        self.assertEqual(d.pause_until, NOW + 120)
+
+    def test_no_pause_command_posts_as_before(self) -> None:
+        item = self.queue("comment", "o/r#7", "--body", "x")
+        d, t = self.daemon((403, {"retry-after": "120"}, {"message": "temporarily blocked from content creation"}),
+                           (201, {}, {"html_url": "u"}))
+        self.assertIsNone(gg.content_pause_cmd())
+        with mock.patch.object(gg, "run_bounded", side_effect=AssertionError("no pause command to run")):
+            self.step(d, NOW)
+            self.step(d, NOW + 120)
+        self.assertEqual(len(t.calls), 2)
+        self.assertEqual(gg.post_state(item["id"])["state"], "posted")
+        with mock.patch.dict(os.environ, {gg.CONTENT_PAUSE_ENV: ""}):
+            self.assertIsNone(gg.content_pause_cmd())  # an empty setting turns it off
 
     def test_secondary_limit_holds_the_outbox_not_the_reads(self) -> None:
         item = self.queue("pr", "o/r", "--head", "lane/x", "--base", "main", "--title", "T", "--body", "b",
