@@ -8038,6 +8038,26 @@ LAND_STEP_STOP = 6  # 60+120+240+480+960 s of backoff (~31 min) before the 6th i
 LAND_STEP_NEXT_UPDATE = re.compile(r"\bnext: (?:gh pr update-branch \d+|gh api -X PUT \S*/pulls/\d+/update-branch)")
 LAND_STEP_NEXT_WAIT = re.compile(r"\bnext: glaeda-gh wait pr \S+[^\n;]*?(?:--timeout (\d+))?(?=\s*(?:\(|$|\n|;))")
 LAND_STEP_CODE = re.compile(r"\brefused \[([a-z_]+)")
+# A finished PR is never stepped. manaflow-ai/cmuxterm-hq#13226, 2026-11-18: it merged at 07:38Z (squash e2c89417ace1)
+# while this lane VM's copy of it stayed OPEN (every broker refresh refused "read Apps busy"). merge_hold judged the
+# stale head tip_merge against its own squash merge ("base commit e2c89417ace1 ... changed goals/agent-shortcut-found.md,
+# which this PR changes"), the queue sent update-branch 12 times ("PR 13226 is closed ..."), and 7 hours later stopped on
+# "3 identical refusals in a row", telling the requester to update a merged PR's branch. Now:
+# - an entry whose PR reads MERGED ends merged (with the merge commit), CLOSED ends stopped "closed unmerged": no step,
+#   no refusal counted, no message asking for one (LandQueue.ended), whether the cache, a merge's read or a state read
+#   says so;
+# - a step GitHub refused because the PR is closed (LAND_STEP_CLOSED) is not counted: the PR's state is read
+#   (LandQueue.state_first) before anything else is judged or taken for it;
+# - on a host that reads PRs through an upstream (a lane VM), a base-changing step (LAND_STATE_FIRST_KINDS: its
+#   base change can be the PR's own merge commit) is never taken on a copy older than LAND_REFRESH_AFTER: the state is
+#   read first. A state read that fails is no refusal either: the entry waits and reads it again (backoff doubling to
+#   LAND_STEP_BACKOFF_MAX), and stops only after LAND_RETRY_STREAK_STOP failed reads in a row.
+# A broker refusal "closed or its head is not a branch of" also fits a fork's open PR: a read that says OPEN at that
+# head lets the next such refusal count as before (stateOpen).
+LAND_STEP_CLOSED = re.compile(r"\bPR #?\d+ is closed\b|\bpull request (?:#?\d+ )?(?:is|was) (?:closed|already merged)\b"
+                              r"|\bwas already merged\b|\bpull request is not open\b|\bPR is (?:closed|not open)\b",
+                              re.I)
+LAND_STATE_FIRST_KINDS = frozenset({"update_branch", "retarget", "rerun_failed"})  # a merge reads it after (do_merge)
 # The check snapshot merge_hold explain judges from (ROLLUP_DIR's comment): the per-judgment copy's file under
 # land/LAND_SNAPSHOT_DIR, named to merge_hold by LAND_SNAPSHOT_ENV. It is handed over only when the daemon's cache
 # entry shows the same head and fingerprint it was read at, within LAND_SNAPSHOT_MAX_AGE (merge_hold keeps its own
@@ -8923,11 +8943,7 @@ class LandQueue:
         if self.refresh_due(e, c):
             return  # judged on the fresh copy, next tick
         data = (c or {}).get("data") or {}
-        if data.get("state") == "MERGED":
-            self.merged(e, e.get("mergeSha") or "", "the cache shows it merged")
-            return
-        if data.get("state") == "CLOSED":
-            self.stop(e, "closed", "the PR was closed without being merged", "reopen it and land it again")
+        if self.ended(e, str(data.get("state") or ""), e.get("mergeSha") or "", "the cache shows it"):
             return
         pending = []
         for a in e.get("after") or []:
@@ -9310,10 +9326,18 @@ class LandQueue:
             # The step after the last judgment was refused for quota (step_refused, do_merge): this judgment repeats
             # it and is not a new refusal of the PR's.
             counts = counts and not e.pop("stepQuotaParked", False)
+        if not self.state_first(e, None):  # GitHub said it is closed: its state first, no judgment of a finished PR
+            return
         answer = self.explain(e, sha)
         answer["pinned"] = bool(sha)  # judged at the cache's head; unpinned, merge_hold read the head itself
         head = str(answer.get("head") or sha or "").lower()
         act = land_action(answer, head)
+        # A base-changing step on a stale copy: the base change can be the PR's own merge commit (hq#13226). Read
+        # before the refusal counts, so a finished PR never reaches the identical-refusal stop.
+        if not self.state_first(e, act.get("kind")):
+            with self.lock:
+                self.count("explain")
+            return
         with self.lock:
             self.check(e)
             self.count("explain")
@@ -9590,6 +9614,13 @@ class LandQueue:
             e["stepQuotaParked"] = True  # so the judgment after the reset does not count toward a stop either
             self.save(e)
             return None
+        if LAND_STEP_CLOSED.search(out) and e.get("stateOpen") != head:
+            # GitHub says the PR is closed: no refusal counted, its state read before anything else (state_first).
+            e["closedSeen"] = {"kind": kind, "head": head, "at": self.now, "why": land_trim(land_tail(out), 200)}
+            self.history(e, "step_closed", kind=kind, head=head[:12], why=land_step_class(out))
+            self.wait(e, {"kind": "retry", "why": f"{kind} refused: GitHub says the PR is closed; its state is read "
+                          "next"}, float(NUDGE_MIN))
+            return None
         cls = land_step_class(out)
         sig = f"{kind}|{head}|{cls}"
         last = e.get("stepFail") or {}
@@ -9659,6 +9690,8 @@ class LandQueue:
             if state == "MERGED":
                 self.merged(e, merge_sha, "merged pinned")
                 return
+            if self.ended(e, state, merge_sha, "the read after its merge shows it"):
+                return  # CLOSED: closed unmerged, no refusal counted
             self.nudge(e["key"])
             if got.returncode == 0 and not state:
                 self.wait(e, {"kind": "retry", "why": "merged? the cache will say"}, LAND_RETRY_DEFAULT)
@@ -9739,6 +9772,83 @@ class LandQueue:
         self.save(e)
         self.notify(e, e.get("requester") or "",
                     f"glaeda land: {self.url(e)} merged" + (f" at {merge_sha}" if merge_sha else ""))
+
+    def ended(self, e: dict, state: str, merge_sha: str, how: str) -> bool:
+        """Under the lock. A PR that reads MERGED or CLOSED ends its entry (LAND_STEP_CLOSED's comment): merged with
+        MERGE_SHA, or stopped "closed unmerged" naming no step. True when it ended."""
+        if state == "MERGED":
+            self.merged(e, merge_sha or e.get("mergeSha") or "", f"{how} merged")
+            return True
+        if state == "CLOSED":
+            self.stop(e, "closed", f"closed unmerged ({how} closed)", "")
+            return True
+        return False
+
+    def read_state(self, e: dict) -> tuple[str, str, str]:
+        """One read of the PR's state through the gh shim (or the broker's gh): (state, merge commit, why not), state
+        empty when it could not be read."""
+        gh = self.gh()
+        if gh is None:
+            return "", "", "no gh to read the PR's state with"
+        got = self.call([gh, "pr", "view", str(e["number"]), "-R", e["repo"], "--json", "state,mergeCommit"],
+                        LAND_GH_DEADLINE, e)
+        with contextlib.suppress(ValueError, AttributeError):
+            doc = json.loads(got.stdout or "")
+            state = str(doc.get("state") or "")
+            if got.returncode == 0 and state in ("OPEN", "MERGED", "CLOSED"):
+                return state, str((doc.get("mergeCommit") or {}).get("oid") or ""), ""
+        return "", "", land_tail(f"{got.stderr or ''} {got.stdout or ''}".strip() or f"exit {got.returncode}", 300)
+
+    def state_due(self, e: dict, kind: str | None) -> bool:
+        """Under the lock. Whether the PR's state is read before KIND is taken: GitHub said the PR is closed
+        (closedSeen), or a base-changing step on an upstream host's copy older than LAND_REFRESH_AFTER."""
+        if e.get("closedSeen"):
+            return True
+        if kind not in LAND_STATE_FIRST_KINDS or not self.reads_upstream():
+            return False
+        at = (self.cache_of(e["key"]) or {}).get("dataAt")
+        fresh = max(float(at) if isinstance(at, (int, float)) and not isinstance(at, bool) else 0.0,
+                    float(e.get("stateReadAt") or 0))
+        return self.now - fresh >= LAND_REFRESH_AFTER
+
+    def state_first(self, e: dict, kind: str | None) -> bool:
+        """Outside the lock. When state_due, read the PR's state before KIND is taken: True to go on (it reads OPEN,
+        or no read was due); False when the entry ended (ended), was parked on quota, or waits to read it again."""
+        with self.lock:
+            if not self.state_due(e, kind):
+                return True
+        state, merge_sha, why = self.read_state(e)
+        with self.lock:
+            self.check(e)
+            seen = e.get("closedSeen") or {}
+            self.history(e, "state_read", state=state or "unreadable", before=kind,
+                         why="GitHub said it is closed" if seen else "stale copy before a base-changing step")
+            if self.ended(e, state, merge_sha, "a state read shows it"):
+                return False
+            if state == "OPEN":
+                e.pop("closedSeen", None)
+                e.pop("stateUnread", None)
+                e["stateReadAt"] = self.now
+                if seen:
+                    e["stateOpen"] = seen.get("head") or e.get("head") or ""  # its next "closed" refusal counts
+                self.save(e)
+                return True
+            if LAND_STEP_QUOTA.search(why):
+                self.park_quota(e, why)  # the login's state, not the PR's: parked, never counted
+                e["stepQuotaParked"] = True
+                self.save(e)
+                return False
+            n = int(e.get("stateUnread") or 0) + 1
+            e["stateUnread"] = n
+            if n >= LAND_RETRY_STREAK_STOP:
+                self.stop(e, "state_unreadable", f"the PR's state could not be read {n} times in a row before "
+                          f"{kind or 'judging it'}" + (" (GitHub said it is closed)" if seen else "") + f": {why}",
+                          f"gh pr view {e['number']} -R {e['repo']} --json state")
+                return False
+            after = min(LAND_STEP_BACKOFF_MAX, LAND_STEP_BACKOFF * (2 ** (n - 1)))
+            self.wait(e, {"kind": "retry", "why": f"the PR's state is read before {kind or 'judging'}: unreadable, "
+                          f"again in {after:.0f} s"}, after)
+            return False
 
     def stop(self, e: dict, code: str, reason: str, nxt: str) -> None:
         self.check(e)

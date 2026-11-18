@@ -17728,6 +17728,8 @@ class LandWorld:
         self.gh_rc: dict[str, int] = {}
         self.gh_err: dict[str, str] = {}  # a refused step's stderr, by kind (default "<kind> refused")
         self.merged_on_merge = True
+        self.view_state: str | None = None  # what a `pr view --json state,...` answers (None: OPEN, or MERGED after a merge)
+        self.view_err: str | None = None  # a state read that fails, with these words
         self.body = ""  # the PR body a `pr view --json body --jq .body` read answers
         self.raise_on: str | None = None
         self.nudged: list[str] = []
@@ -17775,7 +17777,9 @@ class LandWorld:
                 return subprocess.CompletedProcess(argv, 0, self.body + "\n", "")
             if words[:2] == ["pr", "view"]:
                 merged = any(c[1:3] == ["pr", "merge"] and self.gh_rc.get("merge", 0) == 0 for c in self.calls)
-                state = "MERGED" if merged and self.merged_on_merge else "OPEN"
+                if self.view_err is not None:
+                    return subprocess.CompletedProcess(argv, 1, "", self.view_err)
+                state = self.view_state or ("MERGED" if merged and self.merged_on_merge else "OPEN")
                 return subprocess.CompletedProcess(argv, 0, json.dumps(
                     {"state": state, "mergeCommit": {"oid": "f" * 40} if state == "MERGED" else None}), "")
             kind = "merge" if words[:2] == ["pr", "merge"] else "update" if "update-branch" in " ".join(words) \
@@ -17934,6 +17938,112 @@ class LandTest(Base):
                          [["pr", "update-branch", "1", "-R", "o/r", "--needs-newer-base", "ws-check",
                            "--needs-newer-base", "build (macos, arm64)", "--match-head-commit", LA]])
         self.assertEqual((e["state"], e["wait"]["kind"], e["wait"]["before"]), ("waiting", "head_change", LA))
+
+    CLOSED_REFUSAL = ("gh: lane-gh call update_branch o/r: refused: PR 1 is closed or its head is not a branch of o/r; "
+                      "a read-only call runs only for an open PR whose head is in the repo")
+
+    def tip_merge(self, head: str = LA) -> tuple[int, dict]:
+        return refusal("tip_merge", head, {"kind": "update_branch", "expected_head_sha": head},
+                       nxt=f"gh api -X PUT repos/o/r/pulls/1/update-branch -f expected_head_sha={head}",
+                       reason="merge_hold: refused: base commit e2c89417ace1 changed goals/x.md, which this PR changes")
+
+    def lane_vm(self) -> None:
+        self.broker = self.upstream = True
+        self.fresh_head = None  # every broker refresh is refused ("read Apps busy"): the copy stays OPEN
+        self.q = self.queue()
+
+    def test_a_merged_pr_whose_update_branch_is_refused_closed_ends_merged(self):
+        # manaflow-ai/cmuxterm-hq#13226 (2026-11-18): merged while the lane VM's copy stayed OPEN; merge_hold judged
+        # tip_merge against its own squash merge, update-branch was refused "PR 13226 is closed" 12 times, and the
+        # entry stopped on "3 identical refusals in a row" telling the requester to update a merged PR.
+        self.lane_vm()
+        self.pr(LA)
+        self.land()
+        self.w.answers += [self.tip_merge() for _ in range(5)]
+        self.w.gh_rc["update"], self.w.gh_err["update"] = 1, self.CLOSED_REFUSAL
+        self.w.view_state = "MERGED"
+        e = self.tick()
+        self.assertEqual(len(self.w.gh_calls("pr", "update-branch")), 1)
+        self.assertEqual((e["state"], e["wait"]["kind"], e.get("stepFail")), ("waiting", "retry", None))
+        self.assertEqual(e["closedSeen"]["head"], LA)
+        for _ in range(4):
+            e = self.tick(30)
+        self.assertEqual((e["state"], e["mergeSha"]), ("merged", "f" * 40))
+        self.assertEqual((len(self.w.gh_calls("pr", "update-branch")), len(self.w.explains())), (1, 1))
+        self.assertEqual(e["streak"]["count"], 1)  # the one judgment before the step, never more
+        self.assertEqual([m[-1] for m in self.w.sent()], ["glaeda land: https://github.com/o/r/pull/1 merged at "
+                                                          + "f" * 40])
+
+    def test_a_stale_copy_reads_state_before_a_base_change_and_never_updates_a_merged_pr(self):
+        self.lane_vm()
+        self.pr(LA)
+        self.w.cache[self.KEY]["dataAt"] = self.t - 3600  # the upstream's copy is an hour old
+        self.land()
+        self.w.answers.append(self.tip_merge())
+        self.w.view_state = "MERGED"
+        for _ in range(4):
+            e = self.tick(10)
+        self.assertEqual(self.w.gh_calls("pr", "update-branch"), [])
+        self.assertEqual((e["state"], e["mergeSha"]), ("merged", "f" * 40))
+
+    def test_an_unreadable_state_waits_never_counts_never_asks_for_a_step(self):
+        self.lane_vm()
+        self.pr(LA)
+        self.land()
+        self.w.answers += [self.tip_merge() for _ in range(10)]
+        self.w.gh_rc["update"], self.w.gh_err["update"] = 1, self.CLOSED_REFUSAL
+        self.w.view_err = "gh: rest: HTTP 403 read Apps busy"
+        self.tick()
+        for _ in range(60):
+            e = self.tick(100)
+        self.assertEqual(e["state"], "waiting")
+        self.assertEqual(len(self.w.gh_calls("pr", "update-branch")), 1)  # never sent again while unreadable
+        self.assertEqual(len(self.w.explains()), 1)  # nor judged: the state is read first
+        self.assertGreaterEqual(e["stateUnread"], 3)
+        self.assertEqual(self.w.sent(), [])
+        self.w.view_err, self.w.view_state = None, "MERGED"
+        for _ in range(25):
+            e = self.tick(100)
+        self.assertEqual(e["state"], "merged")
+        self.assertNotIn("update-branch", self.w.sent()[-1][-1])
+
+    def test_a_closed_pr_whose_step_is_refused_closed_stops_closed_unmerged_naming_no_step(self):
+        self.lane_vm()
+        self.pr(LA)
+        self.land()
+        self.w.answers += [self.tip_merge() for _ in range(3)]
+        self.w.gh_rc["update"], self.w.gh_err["update"] = 1, self.CLOSED_REFUSAL
+        self.w.view_state = "CLOSED"
+        self.tick()
+        for _ in range(3):
+            e = self.tick(30)
+        self.assertEqual((e["state"], e["stop"]["code"], e["stop"]["next"]), ("stopped", "closed", ""))
+        self.assertIn("closed unmerged", e["stop"]["reason"])
+        self.assertEqual(len(self.w.gh_calls("pr", "update-branch")), 1)
+        self.assertNotIn("next:", self.w.sent()[-1][-1])
+
+    def test_the_cache_showing_merged_or_closed_ends_the_entry_with_no_step(self):
+        for state, want in (("MERGED", "merged"), ("CLOSED", "stopped")):
+            self.pr(LA, state=state)
+            self.land()
+            e = self.tick()
+            self.assertEqual(e["state"], want)
+        self.assertEqual((self.w.explains(), self.w.gh_calls("pr", "update-branch")), ([], []))
+
+    def test_a_closed_refusal_on_a_pr_that_reads_open_counts_as_before(self):
+        # The broker's "closed or its head is not a branch of" also fits a fork's open PR: once a read says OPEN at
+        # that head, the same refusal counts toward the stop again.
+        self.lane_vm()
+        self.pr(LA)
+        self.land()
+        self.w.answers += [self.tip_merge() for _ in range(4)]
+        self.w.gh_rc["update"], self.w.gh_err["update"] = 1, self.CLOSED_REFUSAL
+        self.tick()
+        for _ in range(3):
+            e = self.tick(30)
+        self.assertEqual(e["stateOpen"], LA)
+        self.assertEqual(len(self.w.gh_calls("pr", "update-branch")), 2)
+        self.assertEqual(e["stepFail"]["count"], 1)
 
     def test_a_host_with_its_own_login_keeps_the_pinned_rest_update_branch(self):
         # gh's own `pr update-branch` takes no head: off a lane VM the pinned REST PUT stays.
