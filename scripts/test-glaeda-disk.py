@@ -2517,11 +2517,32 @@ class GlaedaDiskTest(unittest.TestCase):
             gd.apply(items, {f.id: f for f in fams}, self.root / "r.jsonl", None, 6)
         late.close()
         self.assertTrue(next_build.exists() and home_build.exists())
+        items = [i for i in gd.survey(fams, 6, 0) if i.verdict == "reclaimable"]
         with mock.patch.object(gd, "process_evidence", return_value=([], "")):
             gd.apply(items, {f.id: f for f in fams}, self.root / "r2.jsonl", None, 6)
         self.assertFalse(next_build.exists() or home_build.exists())
         self.assertTrue((ws / "Packages/macOS/CmuxNext/Package.swift").exists(), "only the builds go")
+        self.assertEqual(sorted(p.name for p in (ws / "Packages/macOS/CmuxNext").iterdir()), ["Package.swift"],
+                         "no aside tree left behind")
         self.assertTrue(lock.exists())
+
+        # A build the last job wrote minutes ago stays under its idle window, and goes at once below the runner
+        # floor (the floor hold) or the emergency floor, unless a job holds the root
+        fresh = make(ws / "Packages/macOS/CmuxNext/.build", mib=4, age_hours=0.1)
+        self.assertEqual(verdicts(), {"Packages/macOS/CmuxNext/.build": "recent"})
+        dev = fam.root.stat().st_dev
+        with mock.patch.object(gd, "FLOOR_HOLD", {dev: 1 << 60}):
+            self.assertEqual(verdicts(), {"Packages/macOS/CmuxNext/.build": "reclaimable"})
+        with mock.patch.object(gd, "EMERGENCY_DEVS", frozenset({dev})):
+            self.assertEqual(verdicts(), {"Packages/macOS/CmuxNext/.build": "reclaimable"})
+            late = open(lock, "a")
+            fcntl.flock(late, fcntl.LOCK_EX)
+            self.assertEqual(verdicts(), {"Packages/macOS/CmuxNext/.build": "in-use"})
+            late.close()
+        # a delete cut short after its rename leaves a deleting-named tree that the interrupted sweep finishes
+        aside = fresh.with_name(f"{gd.DELETING_PREFIX}.build-99")
+        os.rename(fresh, aside)
+        self.assertIn(aside.parent, [f.root for f in gd.interrupted_families(fams)])
 
         # per-slot cold builds (a runner checkout's, a SwiftPM scratch slot's) of the same size and age go first
         slot = make(self.root / "slot/.build", mib=4, age_hours=50)
