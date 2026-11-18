@@ -6151,6 +6151,36 @@ gg.serve(foreground_ok=True)
             finally:
                 gg.BASE = saved
 
+    def test_serve_dumps_every_thread_on_sigusr1_and_keeps_serving(self) -> None:
+        """huge-blue 2026-11-18: a stalled daemon's threads (one on a futex) could be named only by py-spy, which was not
+        installed. `kill -USR1 PID` (STALE_DUMP_ADVICE) dumps every thread's stack to the unit's stderr (the journal)
+        and the daemon goes on."""
+        with tempfile.TemporaryDirectory() as tmp:
+            code = CHILD_PRELUDE + """
+gg.WATCHDOG_AFTER = 4.0
+class Stuck:
+    def tick(self):
+        time.sleep(120)  # where a stall would sit
+gg.Daemon = Stuck
+gg.serve(foreground_ok=True)
+"""
+            child = subprocess.Popen([sys.executable, "-c", code, os.fspath(ROOT / "scripts" / "glaeda-gh"), "serve", tmp],
+                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            try:
+                first = child.stdout.readline()  # the "start" line: serve has registered its handlers
+                self.assertIn('"start"', first)
+                time.sleep(0.3)
+                child.send_signal(signal.SIGUSR1)
+                _, err = child.communicate(timeout=60)
+            finally:
+                if child.poll() is None:
+                    child.kill()
+                    child.wait()
+            dumps = err.split("glaeda-gh: watchdog:")
+            self.assertIn("in tick", dumps[0], "the SIGUSR1 dump, before the watchdog's, names the stuck function")
+            self.assertEqual(child.returncode, gg.EXIT_WATCHDOG, "SIGUSR1 did not end the daemon: the watchdog did")
+        self.assertIn("kill -USR1", gg.STALE_DUMP_ADVICE)
+
 
 class TakeoverTest(unittest.TestCase):
     """A daemon waiting for the lock stops a holder whose heartbeat went stale, after checking that
@@ -14311,6 +14341,7 @@ class SpendAlarmTest(Base):
         self.assertIn("no pr read stored", self.daemon.valve_due["cause"])
         told = self.told_lines()
         self.assertIn("Reads: stalled: no pr read stored", told[0])
+        self.assertIn(gg.STALE_DUMP_ADVICE.split(":")[0], told[0], "the alarm says how to dump the threads")
         starved = gg.daemon_starved(status)
         self.assertIn("GraphQL slots", starved["cause"])
 
