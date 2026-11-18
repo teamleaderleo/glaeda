@@ -18128,6 +18128,10 @@ class LandTest(Base):
         paths = mock.patch.object(gg, "LAND_MERGE_HOLD_PATHS", (Path(self.w.mh),))
         paths.start()
         self.addCleanup(paths.stop)
+        # No ws-sync release unless a test makes one: the host's own never decides which merge_hold.py runs.
+        release = mock.patch.object(gg, "LAND_MERGE_HOLD", Path(self.tmp.name) / "no-ws-sync" / "merge_hold.py")
+        release.start()
+        self.addCleanup(release.stop)
         # Not a lane VM unless a test says so: the host's own lane-gh wrapper never decides the update-branch form.
         self.lane_client = Path(self.tmp.name) / "lane-gh" / "gh"
         lane = mock.patch.object(gg, "LAND_LANE_GH_CLIENT", self.lane_client)
@@ -20557,6 +20561,99 @@ class LandTest(Base):
         self.assertIn("last fetched 7.0 h ago", gg.land_checkout_behind(Path("/ws/x"), 100, 6.0, now + 7 * 3600, git))
         self.assertIsNone(gg.land_checkout_behind(Path("/ws/x"), 100, 24.0, now, git))
         self.assertIsNone(gg.land_checkout_behind(Path("/nogit/x"), 0, 0.1, now, lambda args: None))
+
+    def checkout_git(self, now: float, head: str, main: str, dirty: str = "") -> tuple[Any, Path]:
+        """A fake `git -C` for land_checkout_behind: a checkout at HEAD, origin/main at MAIN, every fetch file at NOW."""
+        fetch = Path(self.tmp.name) / "FETCH_HEAD"
+        fetch.write_text("")
+        os.utime(fetch, (now, now))
+        answers = {"rev-parse --show-toplevel": "/ws", "rev-list --count HEAD..origin/main": "0" if head == main else "3",
+                   "log -1 --format=%ct HEAD": str(int(now)), "log -1 --format=%ct origin/main": str(int(now)),
+                   "rev-parse HEAD": head, "rev-parse origin/main": main,
+                   "status --porcelain --untracked-files=no": dirty,
+                   "rev-parse --path-format=absolute --git-path FETCH_HEAD": os.fspath(fetch)}
+        return (lambda args: answers.get(" ".join(args))), Path(self.tmp.name) / "deploys.log"
+
+    def test_a_ws_sync_no_op_at_head_counts_as_a_fetch(self):
+        """interim-coord, 2026-11-18: huge-blue's land said "last fetched 7.7 h ago" while ws-sync ran `no-op f2923c5`
+        every 10 minutes at that checkout's HEAD. ws-sync's own record of a fetch that found main at HEAD is a fetch."""
+        then = NOW - 8 * 3600
+        head = "f2923c569789d780be3702ff901320efd4a7511a"
+        git, log_path = self.checkout_git(then, head, head)
+        stamp = lambda t: time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t))  # noqa: E731
+        log_path.write_text(f"{stamp(NOW - 1200)} deployed 38f0454..f2923c5 paths: tools/x\n"
+                            f"{stamp(NOW - 600)} no-op f2923c5\n")
+        self.assertIsNone(gg.land_checkout_behind(Path("/ws/tools/merge_hold.py"), 20, 6.0, NOW, git, log_path))
+        # the newest run found main somewhere else: it says nothing of this checkout
+        log_path.write_text(f"{stamp(NOW - 600)} no-op 0123456\n")
+        why = gg.land_checkout_behind(Path("/ws/tools/merge_hold.py"), 20, 6.0, NOW, git, log_path)
+        self.assertIn("main has not been fetched for 8.0 h", why)
+        self.assertNotIn("stale", why)
+        self.assertNotIn("last fetched", why)  # at its origin/main: main may have moved, the code is not known old
+        other, _ = self.checkout_git(then, "a" * 40, "b" * 40)
+        self.assertIn("last fetched 8.0 h ago", gg.land_checkout_behind(Path("/ws/x"), 20, 6.0, NOW, other, log_path))
+
+    def test_a_checkout_with_tracked_changes_is_not_current(self):
+        """cosmic-gray, 2026-11-18: one unowned draft brief kept its shared checkout at cb2724750 (ws-deploy: "shared
+        checkout kept (tracked changes)"); nothing moves such a checkout, so its merge_hold is not trusted."""
+        git, log_path = self.checkout_git(NOW, "a" * 40, "a" * 40, dirty=" M briefs/draft.md")
+        why = gg.land_checkout_behind(Path("/ws/tools/merge_hold.py"), 20, 6.0, NOW, git, log_path)
+        self.assertIn("1 tracked change (someone's local edit", why)
+        self.assertIn("/ws/tools/ws-deploy --local", why)
+
+    def release(self) -> Path:
+        rel = Path(self.tmp.name) / "ws-sync" / "deploy" / "tools" / "merge_hold.py"
+        rel.parent.mkdir(parents=True, exist_ok=True)
+        rel.write_text("raise SystemExit('not run in tests')\n")
+        patch = mock.patch.object(gg, "LAND_MERGE_HOLD", rel)
+        patch.start()
+        self.addCleanup(patch.stop)
+        return rel
+
+    def test_a_stale_configured_checkout_falls_back_to_a_current_release_said_once(self):
+        """land.json's mergeHold pinned huge-blue's shared checkout. A configured merge_hold.py whose checkout is not
+        current is not run while the ws-sync release is: the land runs the release, said once, back when it clears."""
+        rel = self.release()
+        whys = {self.w.mh: "merge_hold.py's checkout /ws is not current: 30 commits behind origin/main (over 20)"}
+        self.q.behind = lambda mh, *a: whys.get(os.fspath(mh))
+        self.q.now = self.t
+        self.assertFalse(self.q.refuse())
+        self.assertEqual(self.q.merge_hold()[0], rel)
+        self.assertEqual([n[0] for n in self.w.notices], ["land-merge-hold-fallback"])
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            gg.cmd_land_status(None, False)
+        self.assertIn(f"merge_hold.py runs from the ws-sync release {rel}, not {self.w.mh}", out.getvalue())
+        self.assertNotIn("WARNING", out.getvalue())
+        # the same finding with other numbers is not said again
+        whys[self.w.mh] = whys[self.w.mh].replace("30 commits", "31 commits")
+        self.q.now += gg.LAND_MH_BEHIND_EVERY + 1
+        self.q.refuse()
+        self.assertEqual(len(self.w.notices), 1)
+        self.assertEqual(self.q.merge_hold()[0], rel)
+        # current again: the configured one runs
+        whys.clear()
+        self.q.now += gg.LAND_MH_BEHIND_EVERY + 1
+        self.q.refuse()
+        self.assertEqual(self.q.merge_hold()[0], Path(self.w.mh))
+        self.assertFalse((gg.land_dir() / gg.LAND_STALE_CHECKOUT_FILE).exists())
+        self.assertEqual([n[0] for n in self.w.notices], ["land-merge-hold-fallback", "land-checkout-current"])
+
+    def test_no_current_release_warns_naming_the_command_and_runs_the_checkout(self):
+        rel = self.release()
+        why = "merge_hold.py's checkout /ws is not current: 2 tracked changes. next: /ws/tools/ws-deploy --local"
+        self.q.behind = lambda mh, *a: why  # the release is not current either
+        self.q.now = self.t
+        self.q.refuse()
+        self.assertEqual(self.q.merge_hold()[0], Path(self.w.mh))
+        self.assertEqual([n[0] for n in self.w.notices], ["land-checkout-stale"])
+        self.assertIn(f"no current ws-sync release to run instead ({rel} is not current either)", self.w.notices[0][2])
+        self.assertIn("/ws/tools/ws-deploy --local", self.w.notices[0][2])
+        rel.unlink()
+        self.q.stale_checkout = None
+        self.q.now += gg.LAND_MH_BEHIND_EVERY + 1
+        self.q.refuse()
+        self.assertIn(f"({rel} does not exist)", self.w.notices[-1][2])
 
     def test_status_names_why_explain_failed(self):
         e = {"key": self.KEY, "state": "waiting", "explain": {"code": "explain_failed",

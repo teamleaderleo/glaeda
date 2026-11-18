@@ -259,7 +259,8 @@ effect without a restart.
   call log and the landing record tell them from a person's. State in land/ (entries/, requests/, counts.json: the
   steps taken per day, which `land status` prints); ~/.config/glaeda/land.json may set gh, mergeHold, acpmux,
   routerReview, python, workers and env. merge_hold.py is mergeHold, else the ws-sync deploy's, else
-  ~/Projects/leo-workspace/tools/merge_hold.py; with none of them the land worker refuses to start (land/refused.json,
+  ~/Projects/leo-workspace/tools/merge_hold.py (one whose checkout is behind main, unfetched or edited runs only while
+  the ws-sync release is not current; else the release runs, said once in `land status`); with none of them the land worker refuses to start (land/refused.json,
   which `land status` prints) and `land` refuses to queue (merge_hold_missing). router-review is routerReview, else
   the first of ~/.local/bin, the ws-sync deploy's tools/ and the leo-workspace checkout's tools/, else PATH. On a lane VM (an upstream host) the
   worker reads a landing PR itself through the broker when the upstream's copy is over LAND_REFRESH_AFTER old.
@@ -280,6 +281,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import calendar
 import contextlib
 import datetime as dt
 import faulthandler
@@ -7942,20 +7944,56 @@ def land_router_review(config: dict) -> tuple[Path | None, list[Path]]:
 # that may sit far behind main when nothing deploys it. gcp-codex-lane-12, 2026-11-17: its checkout sat at
 # leo-workspace#5512 while main moved on, and its old merge_hold could not read main's TWINS (after #5580), so every
 # pinned merge from that VM was refused "unreadable: not judged, retry" until `tools/ws-deploy --local` ran. The check
-# warns (it never refuses: an old merge_hold still judges) when the checkout is more than LAND_MH_BEHIND_COMMITS
-# commits behind its origin/main, its origin/main tip is more than LAND_MH_BEHIND_HOURS newer than its HEAD, or it
-# was last fetched more than LAND_MH_BEHIND_HOURS ago. land.json's mergeHoldBehindCommits and mergeHoldBehindHours
-# override them. Read at most every LAND_MH_BEHIND_EVERY seconds.
+# warns when the checkout is more than LAND_MH_BEHIND_COMMITS commits behind its origin/main, its origin/main tip is
+# more than LAND_MH_BEHIND_HOURS newer than its HEAD, it was last fetched more than LAND_MH_BEHIND_HOURS ago, or it has
+# tracked changes (someone's local edit: ws-deploy keeps such a checkout as it is, so nothing moves it again).
+# land.json's mergeHoldBehindCommits and mergeHoldBehindHours override the bounds. Read at most every
+# LAND_MH_BEHIND_EVERY seconds. Such a checkout is not run when the ws-sync deploy release is current
+# (LandQueue.check_behind falls back to it, said once); with no current release the land runs it and warns, naming
+# the command that makes one. It never refuses: an old merge_hold still judges.
+# "Last fetched" is the newest of what a fetch leaves: FETCH_HEAD's mtime, the origin/main reflog's, and ws-sync's own
+# record (LAND_WS_SYNC_LOG: a `no-op SHA` or `deployed OLD..SHA` line is a fetch that found main at SHA) when SHA is
+# this checkout's HEAD. A fetch that writes no FETCH_HEAD (--no-write-fetch-head, a broker's update-ref) and finds
+# nothing new touches neither file. When HEAD is its origin/main and fetch age is the only finding, the line says main
+# has not moved since that fetch rather than calling the code old (interim-coord, 2026-11-18: "last fetched 7.7 h ago"
+# while leo-workspace main had not moved for 13 h and huge-blue's checkout sat at main, ws-sync's no-op every 10 min).
 LAND_MH_BEHIND_COMMITS = 20
 LAND_MH_BEHIND_HOURS = 6.0
 LAND_MH_BEHIND_EVERY = 600.0
 LAND_MH_BEHIND_DEADLINE = 10.0
+LAND_WS_SYNC_LOG = Path(os.environ.get("WS_SYNC_STATE") or Path.home() / ".cache/ws-sync") / "deploys.log"
+LAND_WS_SYNC_SEEN = re.compile(r"^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ) (?:no-op ([0-9a-f]{7,40})\b|deployed [0-9a-f]+\.\.([0-9a-f]{7,40})\b)")
+LAND_WS_SYNC_TAIL = 16384  # bytes of the record read: hours of 10-minute runs
+
+
+def land_ws_sync_seen(head: str, log_path: Path | None = None) -> float | None:
+    """When ws-sync's newest no-op or deployed line found main at HEAD (a fetch that ended at HEAD's commit), or None."""
+    try:
+        with open(log_path or LAND_WS_SYNC_LOG, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            f.seek(max(0, f.tell() - LAND_WS_SYNC_TAIL))
+            lines = f.read().decode("utf-8", "replace").splitlines()
+    except OSError:
+        return None
+    for line in reversed(lines):
+        m = LAND_WS_SYNC_SEEN.match(line)
+        if not m:
+            continue
+        if not head or not head.startswith(m.group(2) or m.group(3)):
+            return None  # the newest fetch found main elsewhere: it says nothing of this checkout
+        try:
+            return float(calendar.timegm(time.strptime(m.group(1), "%Y-%m-%dT%H:%M:%SZ")))
+        except ValueError:
+            return None
+    return None
 
 
 def land_checkout_behind(script: Path, max_commits: int, max_hours: float, now: float,
-                         git: Callable[[list[str]], str | None] | None = None) -> str | None:
-    """Why the git checkout holding SCRIPT is too far behind its origin/main to trust its merge_hold, or None (current,
-    or not a checkout, or git could not tell). GIT runs `git -C DIR ARGS` and answers its stdout, or None."""
+                         git: Callable[[list[str]], str | None] | None = None,
+                         ws_log: Path | None = None) -> str | None:
+    """Why the git checkout holding SCRIPT is too far behind its origin/main, or edited, to trust its merge_hold, or
+    None (current, or not a checkout, or git could not tell). GIT runs `git -C DIR ARGS` and answers its stdout, or
+    None. WS_LOG is ws-sync's record (LAND_WS_SYNC_LOG)."""
     def real(args: list[str]) -> str | None:
         try:
             got = run_bounded(["git", "-C", os.fspath(script.parent), *args], LAND_MH_BEHIND_DEADLINE)
@@ -7968,21 +8006,40 @@ def land_checkout_behind(script: Path, max_commits: int, max_hours: float, now: 
         return None
     behind = git(["rev-list", "--count", "HEAD..origin/main"])
     times = (git(["log", "-1", "--format=%ct", "HEAD"]), git(["log", "-1", "--format=%ct", "origin/main"]))
-    fetch = git(["rev-parse", "--path-format=absolute", "--git-path", "FETCH_HEAD"])
+    shas = (git(["rev-parse", "HEAD"]), git(["rev-parse", "origin/main"]))
+    dirty = git(["status", "--porcelain", "--untracked-files=no"])
     why = []
     if behind and behind.isdigit() and int(behind) > max_commits:
         why.append(f"{behind} commits behind origin/main (over {max_commits})")
     if all(x and x.isdigit() for x in times) and (int(times[1]) - int(times[0])) / 3600 > max_hours:
         why.append(f"origin/main is {(int(times[1]) - int(times[0])) / 3600:.1f} h newer than HEAD (over {max_hours:g})")
-    with contextlib.suppress(OSError, TypeError):
-        age = (now - Path(fetch).stat().st_mtime) / 3600 if fetch else None
-        if age is not None and age > max_hours:
+    seen = []
+    for name in ("FETCH_HEAD", "logs/refs/remotes/origin/main"):
+        path = git(["rev-parse", "--path-format=absolute", "--git-path", name])
+        with contextlib.suppress(OSError, TypeError):
+            if path:
+                seen.append(Path(path).stat().st_mtime)
+    synced = land_ws_sync_seen(shas[0] or "", ws_log)
+    if synced is not None:
+        seen.append(synced)
+    age = (now - max(seen)) / 3600 if seen else None
+    if age is not None and age > max_hours:
+        if not why and shas[0] and shas[0] == shas[1]:
+            why.append(f"at its origin/main, but main has not been fetched for {age:.1f} h (over {max_hours:g}), so "
+                       "main may have moved since")
+        else:
             why.append(f"last fetched {age:.1f} h ago (over {max_hours:g})")
+    if dirty:
+        n = len(dirty.splitlines())
+        why.append(f"{n} tracked change{'' if n == 1 else 's'} (someone's local edit; ws-deploy keeps such a checkout "
+                   "as it is, so nothing moves it)")
     if not why:
         return None
-    return (f"merge_hold.py's checkout {root} is stale: " + "; ".join(why) + f". next: {root}/tools/ws-deploy --local "
-            "(an old merge_hold can refuse every merge as unreadable; knobs: land.json mergeHoldBehindCommits, "
-            "mergeHoldBehindHours)")
+    return (f"merge_hold.py's checkout {root} is not current: " + "; ".join(why) + f". next: {root}/tools/ws-deploy "
+            f"--local (on a pinned host it deploys the ws-sync release {LAND_MERGE_HOLD.parent.parent}, which the land "
+            "then runs; an ff host's checkout moves only once it is clean), or set land.json mergeHold to a current "
+            "merge_hold.py (an old merge_hold can refuse every merge as unreadable; knobs: land.json "
+            "mergeHoldBehindCommits, mergeHoldBehindHours)")
 
 
 def land_reads_upstream() -> bool:
@@ -8863,7 +8920,8 @@ class LandQueue:
         self.refresh = refresh
         self.behind = behind
         self.behind_at = float("-inf")
-        self.stale_checkout: str | None = None
+        self.stale_checkout: tuple[str, str | None] | None = None  # check_behind's last finding, numbers out
+        self.mh_fallback: tuple[Path, Path] | None = None  # (merge_hold.py configured, the release run instead)
         self.latched: tuple[str, int] | None = None
         self.latch_cleared = float("-inf")  # when the login's latch last cleared: no cached head before it is pinned
         refused =read_json(land_dir() / LAND_REFUSED_FILE)
@@ -9269,7 +9327,7 @@ class LandQueue:
     def refuse(self) -> bool:
         """The startup check, every tick: True (no entry is judged or stepped) while no merge_hold.py resolves.
         The refusal is said once (log, notice, land/refused.json), and once more when it clears."""
-        mh, tried = self.merge_hold()
+        mh, tried = land_merge_hold(self.config())  # as configured: check_behind judges it, merge_hold() may not run it
         path = land_dir() / LAND_REFUSED_FILE
         if mh is not None:
             if self.refused is not None:
@@ -9291,30 +9349,58 @@ class LandQueue:
         return True
 
     def check_behind(self, mh: Path) -> None:
-        """Warn once (log, notice, land/stale-checkout.json, which `land status` prints) when merge_hold.py's checkout
-        is behind (LAND_MH_BEHIND_COMMITS), and once when it is current again."""
+        """Judge merge_hold.py's checkout MH (land_checkout_behind) at most every LAND_MH_BEHIND_EVERY. One not current
+        is not run while the ws-sync release (LAND_MERGE_HOLD) is current: merge_hold() runs the release instead,
+        said once (log, notice, land/stale-checkout.json with "fallback"). With no current release MH still runs,
+        and the warning, naming the command that makes one, is said once. Each is said once more when it clears. A
+        reason that differs only in its numbers (hours, counts) is the same reason, never said again."""
         if self.now - self.behind_at < LAND_MH_BEHIND_EVERY:
             return
         self.behind_at = self.now
         cfg = self.config()
         commits = int(land_seconds(cfg.get("mergeHoldBehindCommits"), LAND_MH_BEHIND_COMMITS, 0, 1e6))
         hours = land_seconds(cfg.get("mergeHoldBehindHours"), LAND_MH_BEHIND_HOURS, 0.1, 1e4)
+        release = LAND_MERGE_HOLD
         try:
             why = self.behind(mh, commits, hours, self.now)
+            same = release.is_file() and os.path.realpath(release) == os.path.realpath(mh)
+            use = None
+            if why is not None and not same and release.is_file() and \
+                    self.behind(release, commits, hours, self.now) is None:
+                use = release
         except Exception as error:  # noqa: BLE001  a warning's own failure never stops the queue
             log({"event": "land-error", "site": "check_behind", "error": describe(error)})
             return
         path = land_dir() / LAND_STALE_CHECKOUT_FILE
-        if why == self.stale_checkout:
+        key = None if why is None else (re.sub(r"\d+(?:\.\d+)?", "N", why), os.fspath(use) if use else None)
+        if key == self.stale_checkout:
+            if why is not None:  # the same finding: keep the file's numbers current for `land status`, say nothing
+                write_json(path, {**(read_json(path) or {}), "reason": why, "checkedAt": self.now})
             return
-        self.stale_checkout = why
+        was = self.mh_fallback
+        self.stale_checkout = key
+        self.mh_fallback = (mh, use) if use is not None else None
         if why is None:
             path.unlink(missing_ok=True)
             log({"event": "land-checkout-current", "mergeHold": os.fspath(mh)})
+            if was is not None:
+                self.notice("land-checkout-current", "info", f"glaeda land: merge_hold.py runs from {mh} again "
+                            "(its checkout is current)", {"mergeHold": os.fspath(mh)})
             return
-        write_json(path, {"reason": why, "at": self.now, "mergeHold": os.fspath(mh)})
-        log({"event": "land-checkout-stale", "reason": why})
-        self.notice("land-checkout-stale", "warn", f"glaeda land: {why}", {"mergeHold": os.fspath(mh)})
+        if use is not None:
+            text = (f"merge_hold.py runs from the ws-sync release {use}, not {mh}: {why}")
+            write_json(path, {"reason": why, "at": self.now, "mergeHold": os.fspath(mh), "fallback": os.fspath(use)})
+            log({"event": "land-merge-hold-fallback", "mergeHold": os.fspath(mh), "fallback": os.fspath(use),
+                 "reason": why})
+            self.notice("land-merge-hold-fallback", "info", f"glaeda land: {text}",
+                        {"mergeHold": os.fspath(mh), "fallback": os.fspath(use)})
+            return
+        nothing = (f"; no current ws-sync release to run instead ({release} "
+                   + ("is not current either)" if release.is_file() and not same else
+                      "is this checkout)" if same else "does not exist)"))
+        write_json(path, {"reason": why + nothing, "at": self.now, "mergeHold": os.fspath(mh)})
+        log({"event": "land-checkout-stale", "reason": why + nothing})
+        self.notice("land-checkout-stale", "warn", f"glaeda land: {why}{nothing}", {"mergeHold": os.fspath(mh)})
 
     def reap(self) -> None:
         for key, fut in list(self.jobs.items()):
@@ -9841,8 +9927,13 @@ class LandQueue:
         return os.fspath(p) if p.exists() and os.access(p, os.X_OK) else None
 
     def merge_hold(self) -> tuple[Path | None, list[Path]]:
-        """(the merge_hold.py to run, or None; every path tried): land.json's mergeHold, then LAND_MERGE_HOLD_PATHS."""
-        return land_merge_hold(self.config())
+        """(the merge_hold.py to run, or None; every path tried): land.json's mergeHold, then LAND_MERGE_HOLD_PATHS; the
+        ws-sync release instead while check_behind found that one's checkout not current and the release current."""
+        mh, tried = land_merge_hold(self.config())
+        fb = self.mh_fallback
+        if fb is not None and mh == fb[0] and fb[1].is_file():
+            return fb[1], tried
+        return mh, tried
 
     def explain(self, e: dict, sha: str) -> dict:
         mh, tried = self.merge_hold()
@@ -10836,7 +10927,10 @@ def cmd_land_status(target: str | None, as_json: bool) -> int:
               + (f"; {doc['pendingForward']} request(s) wait here to be sent" if doc["pendingForward"] else "")
               + (f"; the executor did not answer: {doc['executorError']}" if doc.get("executorError") else ""))
     stale = doc.get("stale")
-    if isinstance(stale, dict) and stale.get("reason"):
+    if isinstance(stale, dict) and stale.get("reason") and stale.get("fallback"):
+        print(f"glaeda land: merge_hold.py runs from the ws-sync release {stale['fallback']}, not "
+              f"{stale.get('mergeHold')}: {stale['reason']}")
+    elif isinstance(stale, dict) and stale.get("reason"):
         print(f"glaeda land: WARNING: {stale['reason']}")
     if refused:
         print(f"glaeda land: REFUSED to start since {utc_clock(float(refused.get('at') or 0))}: "
