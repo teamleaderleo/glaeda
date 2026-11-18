@@ -22,6 +22,7 @@ import sys
 from pathlib import Path
 
 ALWAYS = re.compile(r"\balways\(\s*\)")
+CANCEL_GUARD = re.compile(r"!\s*cancelled\(\s*\)")  # `always() && !cancelled()` already skips on a cancel
 _KEY = re.compile(r"^(\s*)(['\"]?)([A-Za-z0-9_.-]+)\2\s*:(.*)$")
 
 
@@ -84,16 +85,26 @@ def workflow_files(folder: Path) -> list[Path]:
     return sorted(list(folder.glob("*.yml")) + list(folder.glob("*.yaml")))
 
 
+def text_bounds(name: str, text: str) -> tuple[list[str], dict[str, str]]:
+    """For one workflow file's text: `name:job` of each job that runs steps with no `timeout-minutes` (a `uses:`
+    caller cannot take one), and `name:job` -> `if:` of each job whose condition uses always() with no
+    `!cancelled()` beside it. A caller that reads files at a git revision (a pre-push hook) uses this directly."""
+    missing, unguarded = [], {}
+    for job, keys in jobs(text):
+        if "uses" not in keys and "timeout-minutes" not in keys:
+            missing.append(f"{name}:{job}")
+        cond = keys.get("if", "")
+        if ALWAYS.search(cond) and not CANCEL_GUARD.search(cond):
+            unguarded[f"{name}:{job}"] = cond
+    return missing, unguarded
+
+
 def missing_timeouts(path: Path) -> list[str]:
-    """`file:job` for each job that runs steps and has no `timeout-minutes` (a `uses:` caller cannot take one)."""
-    return [f"{path.name}:{name}" for name, keys in jobs(path.read_text(encoding="utf-8"))
-            if "uses" not in keys and "timeout-minutes" not in keys]
+    return text_bounds(path.name, path.read_text(encoding="utf-8"))[0]
 
 
 def always_jobs(path: Path) -> dict[str, str]:
-    """`file:job` -> its `if:` for each job whose condition uses always()."""
-    return {f"{path.name}:{name}": keys["if"] for name, keys in jobs(path.read_text(encoding="utf-8"))
-            if ALWAYS.search(keys.get("if", ""))}
+    return text_bounds(path.name, path.read_text(encoding="utf-8"))[1]
 
 
 def findings(folder: Path, always_on_cancel: dict[str, str]) -> list[str]:
