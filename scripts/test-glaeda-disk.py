@@ -3051,12 +3051,17 @@ class GlaedaDiskTest(unittest.TestCase):
         sock = socket.socket(socket.AF_UNIX)
         self.addCleanup(sock.close)
         sock.bind(str(d / "default"))
+        sock.listen(1)
         # a long-lived server's socket is as old as its directory; only an old enough item pays for the socket walk
         for p in (d / "default", d):
             os.utime(p, (time.time() - 48 * 3600,) * 2)
         v = self.verdicts()
         self.assertEqual(v["tmux-1000"], "in-use")
         self.assertEqual(v["plain"], "reclaimable")
+        self.assertTrue(gd.holds_socket(d))
+        sock.close()  # its owner exited and left the file: a stopped Tart VM's control.sock (cmux11s, 40 GiB)
+        self.assertFalse(gd.socket_live(str(d / "default")))
+        self.assertFalse(gd.holds_socket(d))
         forced = [gd.Item("xcode-derived-data", str(d), 1, 48, "reclaimable")]
         receipt = self.receipt()
         gd.apply(forced, {self.fam.id: self.fam}, receipt, None, 24)
@@ -6577,22 +6582,59 @@ class GlaedaDiskTest(unittest.TestCase):
         finally:
             locked.chmod(0o755)
 
-    def test_every_disposable_age_is_twelve_hours(self) -> None:
-        """Leo, 2026-10-26: "When have we ever had something useful greater than 12 hours?" Only the newest warm
-        compile cache per builder (the per-host cmux-next root) is exempt, by role."""
-        self.assertEqual(gd.DEFAULT_AGE_HOURS, 12.0)
+    def test_every_disposable_age_is_one_hour(self) -> None:
+        """Leo, 2026-11-18: "6 hours may be too hard of a thing to hit. these days, it should be more like 1." Only
+        the newest warm compile cache per builder (the per-host cmux-next root) is exempt by role, and the nightly
+        builders' warm inputs (cmux-nightly-next, the cmux-cua source clone) keep NIGHTLY_WARM_IDLE_HOURS."""
+        self.assertEqual(gd.DEFAULT_AGE_HOURS, 1.0)
+        self.assertEqual(gd.NIGHTLY_WARM_IDLE_HOURS, 12.0)
         for name in ("KEPT_BUILD_IDLE_HOURS", "IDLE_SWEEP_HOURS", "IDLE_SEED_HOURS", "PARKED_NO_LOG_IDLE_HOURS",
                      "CMUX_NEXT_CI_MIN_IDLE_HOURS", "CANONICAL_ADMISSION_IDLE_HOURS", "CHECKOUT_BUILD_IDLE_HOURS",
                      "TMP_TEST_RESIDUE_IDLE_HOURS", "RUNNER_STALE_CHECKOUT_HOURS"):
             with self.subTest(name):
-                self.assertEqual(getattr(gd, name), 12.0)
-        self.assertEqual(gd.RUNTIME_IDLE_DAYS * 24, 12.0)
+                self.assertEqual(getattr(gd, name), 1.0)
+        self.assertEqual(gd.RUNTIME_IDLE_DAYS * 24, 1.0)
         for key in ("soft_idle_hours", "stale_marker_max_hours"):
-            self.assertEqual(gd.POLICY_DEFAULTS[key], 12.0, key)
+            self.assertEqual(gd.POLICY_DEFAULTS[key], 1.0, key)
         self.assertEqual(gd.POLICY_DEFAULTS["cmux_next_ci_host_idle_hours"], float("inf"))
         for fam in [*gd.default_families(), *gd.runner_cache_families()]:
             with self.subTest(fam.id):
-                self.assertLessEqual(fam.min_idle_hours, 12.0)
+                self.assertLessEqual(fam.min_idle_hours, gd.NIGHTLY_WARM_IDLE_HOURS)
+        fam = gd.nightly_next_family(Path("/nonexistent/cmux-nightly-next"))
+        self.assertEqual((fam.min_idle_hours, fam.max_idle_hours), (12.0, 12.0))
+
+    def test_cua_source_clone_keeps_the_nightly_window_and_its_build_tree_does_not(self) -> None:
+        """The nightly's Computer Use step clones cmux-cua from GitHub when src-<sha> is gone; run 44232805509 failed
+        on that fetch timing out on cmux15. The source clone keeps 12 h; its build tree (build-src-*) goes at 1 h."""
+        fam = gd.Family("cua-cache", Path("/x/cmux-cua"), True, "rebuilds", min_idle_hours=gd.DEFAULT_AGE_HOURS)
+        src, build = Path("/x/cmux-cua/src-e0f7"), Path("/x/cmux-cua/build-src-e0f7-46b7")
+        self.assertTrue(gd.cua_source_clone(fam, src))
+        self.assertFalse(gd.cua_source_clone(fam, build))
+        self.assertEqual(gd.item_window(fam, src, gd.DEFAULT_AGE_HOURS, frozenset()), 12.0)
+        self.assertEqual(gd.item_window(fam, build, gd.DEFAULT_AGE_HOURS, frozenset()), 1.0)
+
+    def test_registry_images_go_at_any_age_under_pressure_only(self) -> None:
+        fam = gd.Family(gd.TART_IMAGES, Path("/x/OCIs"), True, "pull again", min_idle_hours=gd.TART_IDLE_HOURS)
+        image = Path("/x/OCIs/ghcr.io/cirruslabs/macos-tahoe-base")
+        with mock.patch.object(gd, "ACTIVITY_MODE", "pressure"):
+            self.assertEqual(gd.item_window(fam, image, gd.DEFAULT_AGE_HOURS, frozenset()), 0.0)
+        with mock.patch.object(gd, "ACTIVITY_MODE", "sweep"):
+            self.assertEqual(gd.item_window(fam, image, gd.DEFAULT_AGE_HOURS, frozenset()), gd.TART_IDLE_HOURS)
+
+    def test_host_saturated_reads_the_one_minute_load_per_core(self) -> None:
+        with mock.patch.object(gd.os, "cpu_count", return_value=14):
+            with mock.patch.object(gd.os, "getloadavg", return_value=(9.4, 14.1, 19.5)):
+                self.assertEqual(gd.host_saturated(), "")
+            with mock.patch.object(gd.os, "getloadavg", return_value=(14.0, 14.1, 19.5)):
+                self.assertIn("saturated", gd.host_saturated())
+            with mock.patch.object(gd.os, "getloadavg", side_effect=OSError):
+                self.assertEqual(gd.host_saturated(), "")
+
+    def test_saturation_never_holds_below_the_emergency_floor(self) -> None:
+        with mock.patch.object(gd, "emergency_devs", return_value=frozenset({1})):
+            self.assertIsNone(gd.saturation_halt({}, "10%"))
+        with mock.patch.object(gd, "emergency_devs", return_value=frozenset()):
+            self.assertIs(gd.saturation_halt({}, "10%"), gd.host_saturated)
 
     def test_idle_runner_checkouts_go_between_the_floor_and_the_gates_resume_mark(self) -> None:
         # the gate holds until floor + 2 GiB; at 31 GiB it still holds, so the last resort still acts
