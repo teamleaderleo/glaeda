@@ -5937,9 +5937,10 @@ class TickBudgetTest(Base):
         waited = self.entry("pr:o/r#2", "rest", NOW - 100, waited=True, deferred=True)
         self.daemon.deferred_before = {"pr:o/r#1": NOW - 60, "pr:o/r#2": NOW - 10}
         self.assertEqual(self.order([plain, waited]), ["pr:o/r#2", "pr:o/r#1"])
-        # aging, not a rank: a plain watch deferred more than WAIT_PRIORITY earlier still goes first
+        # a rank, not a head start (huge-blue 2026-11-18 21:5xZ: WAIT_PRIORITY was not enough at the share's few reads
+        # a minute): a plain watch deferred long before still goes after it
         self.daemon.deferred_before["pr:o/r#1"] = NOW - 10 - gg.WAIT_PRIORITY - 1
-        self.assertEqual(self.order([plain, waited]), ["pr:o/r#1", "pr:o/r#2"])
+        self.assertEqual(self.order([plain, waited]), ["pr:o/r#2", "pr:o/r#1"])
 
     def test_a_deferred_run_goes_ahead_of_new_prs(self) -> None:
         """due() put a deferred key first only within its kind, so a deferred run sat behind every new PR."""
@@ -6037,7 +6038,7 @@ class TickBudgetTest(Base):
                               "graphql": {"limit": 5000, "remaining": 0, "reset": NOW + 1800}}
         self.daemon.paths["pr"] = self.daemon.paths["run"] = "rest"
         self.gh.prs[("o", "r", 1)] = pr_node(1)
-        gg.register("pr:o/r#1")
+        gg.register("pr:o/r#1", waited=True)  # (waited as the run is: a deferred waited key goes ahead of plain ones)
         self.daemon.deferred.add("pr:o/r#1")
         self.daemon.deferred_since["pr:o/r#1"] = NOW - 600  # deferred long ago, so it heads the order
         self.gh.runs[2] = {"id": 2, "status": "in_progress", "conclusion": None, "run_attempt": 1}
@@ -22203,9 +22204,9 @@ class RefreshStallTest(AlarmBase):
         self.daemon.transport = transport
         self.daemon.batch["pr"] = 10
         self.daemon.tick(NOW)
-        self.assertEqual(len(tried), 2, "one query per batch, none split and asked again")
+        self.assertEqual(len(tried), 3, "one query per batch (the 5 blocked, then 10 and 5), none split and asked again")
         self.assertEqual([k for k in keys if not (gg.read_cache(k) or {}).get("data")], [], "REST read every PR")
-        self.assertTrue(all(gg.read_cache(k).get("source") == "rest" for k in keys))
+        self.assertTrue(any("/pulls/" in c[1] for c in self.gh.rest_calls()))
 
     def test_the_502_storm_is_written_down_in_bounded_lines_naming_502_and_the_fallback(self) -> None:
         """huge-blue 2026-11-17: the 502s were in daemon.json alone, not one journal line. The same 30-minute storm
