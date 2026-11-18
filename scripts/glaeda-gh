@@ -6467,7 +6467,10 @@ class Daemon:
         self.write_consumers()
         self.sent = [(t, what) for t, what in self.sent if self.now - t < 3600]
         hour = {what: sum(1 for _, w in self.sent if w == what)
-                for what in ("rest", "rest304", "graphql", "free", "write", "kept", "app")}
+                for what in ("rest", "rest304", "graphql", "free", "write", "kept")}
+        app_reads = sum(1 for _, w in self.sent if w == "app")  # on the ci-watch App (AppPool), never the login's
+        if app_reads:
+            hour["app"] = app_reads
         self.reads = [r for r in self.reads if self.now - r[0] < 3600]
         self.gql_log = [g for g in self.gql_log if self.now - g[0] < 3600]
         graphql_by: dict[str, dict[str, int]] = {}
