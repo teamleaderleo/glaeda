@@ -8915,7 +8915,11 @@ class VolumeCensusTest(unittest.TestCase):
         self.assertIn("Xcode command line", gd.census_owner("/Library/Developer/CommandLineTools"))
         self.assertIn("installed apps", gd.census_owner("/Applications"))
         self.assertEqual(gd.census_owner("/Applicationsx"), "")
-        self.assertEqual(gd.census_owner(str(gd.HOME / ".acpmux")), "acpmux sessions (acpmux_store_reclaim)")
+        self.assertIn("~/.acpmux-supervised", gd.census_owner(str(gd.HOME / ".acpmux")))
+        self.assertIn("acpmux_store_reclaim", gd.census_owner(str(gd.HOME / ".acpmux-supervised")))
+        self.assertIn("worktree_reclaim", gd.census_owner(str(gd.HOME / "lanes/pool/cmux")))
+        self.assertIn("worktree_reclaim", gd.census_owner(str(gd.HOME / "out/.work/tag")))
+        self.assertEqual(gd.census_owner(str(gd.HOME / "out/tag")), "")
         census = {"complete": True, "at": 1.0, "rows": {"/opt": [gd.GIB, "unclassified", True]}}
         child = gd.census_coverage_row(census)["children"][0]
         self.assertEqual((child["category"], child["owner"]), ("unclassified:/opt", gd.census_owner("/opt")))
@@ -13961,7 +13965,8 @@ class LaneVmFamiliesTest(unittest.TestCase):
         self.rows = None
         item = self.survey([fam])[dead.name]
         self.assertEqual(item.verdict, "in-use")
-        self.assertIn("acpmux session list unreadable: liveness unknown", item.reasons)
+        self.assertTrue(any(r.startswith("acpmux session list unreadable: liveness unknown (") for r in item.reasons),
+                        item.reasons)
         self.rows = [{"sessionId": dead.name, "status": "closed"}]
         self.env_ids = None
         item = self.survey([fam])[dead.name]
@@ -14145,6 +14150,235 @@ class LaneVmFamiliesTest(unittest.TestCase):
             self.apply([fam], items, targets={dev: 1})
         self.assertFalse(older.exists())  # least recently modified first
         self.assertTrue(newer.exists())  # and the pass stopped at the target
+
+    def home_tree(self, name: str, entry: str, hours: float, size: int = 8192) -> Path:
+        p = self.home / name / entry
+        p.mkdir(parents=True)
+        (p / "blob").write_bytes(b"x" * size)
+        self.age(p, hours)
+        return p
+
+    def test_lab_trees_and_builder_output_in_home_go_by_age_and_no_holder(self) -> None:
+        old_tmp = self.home_tree("lab-tmp", "run-a", 8)
+        new_tmp = self.home_tree("lab-tmp", "run-b", 1)
+        held = self.home_tree("lab-tmp", "run-c", 8)
+        target = self.home_tree("lab-target", "debug", 8)
+        (target.parent / "CACHEDIR.TAG").write_text("Signature: 8a477f597d28d172789f06886806bc55")
+        data = self.home_tree("lab-data", "set", 8)
+        tag = self.home_tree("out", "nightly-linux", 8)
+        envargs = self.home / "out/nightly-linux.envargs"
+        envargs.write_text("-e X=1\n")
+        work = self.home_tree("out", ".work", 80)  # worktree_reclaim's pressure cache: never ours
+        self.age(envargs, 8)
+        fams = self.lane()
+        self.assertTrue(gd.LANE_HOME_FAMILY_IDS <= {f.id for f in fams})
+        self.assertTrue(all(f.id in gd.SESSION_HOLD_FAMILY_IDS for f in fams if f.id in gd.LANE_HOME_FAMILY_IDS))
+        items = self.survey(fams, opened=[str(held / "blob")])
+        for p in (old_tmp, target, data, tag, envargs):
+            self.assertEqual(items[p.name].verdict, "reclaimable", (p, items[p.name].reasons))
+        self.assertEqual(items[new_tmp.name].verdict, "recent")
+        self.assertEqual(items[held.name].verdict, "in-use")
+        self.assertNotIn(".work", items)
+        self.assertNotIn("CACHEDIR.TAG", [n for n, i in items.items() if i.verdict == "reclaimable"])
+        self.apply(fams, list(items.values()), opened=[str(held / "blob")])
+        for p in (old_tmp, target, data, tag, envargs):
+            self.assertFalse(p.exists(), p)
+        for p in (new_tmp, held, work):
+            self.assertTrue(p.exists(), p)
+
+    def test_a_lab_tree_held_by_a_live_session_or_process_env_stays(self) -> None:
+        cwd = self.home_tree("lab-tmp", "lane-cwd", 30)
+        envd = self.home_tree("lab-tmp", "lane-env", 30)
+        self.rows = [{"sessionId": "s", "status": "ready", "name": "lab-lane", "cwd": str(cwd / "sub")}]
+        self.env_ids = (frozenset(), frozenset({str(envd / "t")}))
+        items = self.survey(self.lane("home-lab-tmp"))
+        self.assertIn("the cwd of open acpmux session lab-lane", items[cwd.name].reasons)
+        self.assertIn("a running process's TMPDIR is in it", items[envd.name].reasons)
+        self.rows = None
+        gd.ACPMUX_ROWS_ERROR = "`acpmux ls` exited 2: daemon socket not found"
+        self.addCleanup(setattr, gd, "ACPMUX_ROWS_ERROR", "")
+        reasons = self.survey(self.lane("home-lab-tmp"))[cwd.name].reasons
+        self.assertIn("acpmux session list unreadable: liveness unknown "
+                      "(`acpmux ls` exited 2: daemon socket not found)", reasons)
+
+    def test_git_work_in_a_lab_tree_waits_12_hours_and_is_archived_first(self) -> None:
+        repo = self.home / "lab-data/repo"
+        subprocess.run(["git", "init", "-q", str(repo)], check=True, env=self.env)
+        (repo / "f").write_text("x")
+        subprocess.run(["git", "-C", str(repo), "add", "f"], check=True, env=self.env)
+        subprocess.run(["git", "-C", str(repo), "commit", "-qm", "only here"], check=True, env=self.env)
+        self.age(repo, 8)
+        fams = self.lane("home-lab-data")
+        self.assertNotEqual(self.survey(fams)["repo"].verdict, "reclaimable")  # 8 h: under the 12 h git-work rule
+        self.age(repo, 13)
+        item = self.survey(fams)["repo"]
+        self.assertEqual(item.verdict, "reclaimable", item.reasons)
+        self.apply(fams, [item])
+        self.assertFalse(repo.exists())
+        self.assertEqual(len(list((self.home / "archive/glaeda-disk").glob("*.bundle"))), 1)
+
+    def test_no_home_family_for_a_tree_that_is_missing_or_a_link(self) -> None:
+        (self.home / "lab-tmp").symlink_to(self.base)
+        ids = {f.id for f in self.lane()}
+        self.assertFalse(ids & gd.LANE_HOME_FAMILY_IDS)
+
+
+class AcpmuxListOverReachTest(unittest.TestCase):
+    """`reach HOST 'glaeda-disk ...'` is a non-interactive ssh shell: PATH /usr/bin:/bin, no acpmux relay. There
+    acpmux printed "other machines' sessions are not listed: cannot run the relay listing" on stderr, the reader took
+    stderr with stdout, its JSON failed to parse, and every lane VM item came out "acpmux session list unreadable"
+    (gcp-agent-lane-2, 2026-11-18: /tmp/bsz and /tmp/wt-rd, 0 reclaimable)."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.home = Path(os.path.realpath(self.tmp.name))
+        self.saved = (gd.HOME, gd._ACPMUX_ROWS, gd.ACPMUX_ROWS_ERROR)
+        gd.HOME = self.home
+        gd._ACPMUX_ROWS = False
+        self.bin = self.home / ".local/bin"
+        self.bin.mkdir(parents=True)
+        (self.home / ".acpmux").mkdir()
+        env = {"PATH": "/usr/bin:/bin", "HOME": str(self.home)}
+        patcher = mock.patch.dict(os.environ, env, clear=True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def tearDown(self) -> None:
+        gd.HOME, gd._ACPMUX_ROWS, gd.ACPMUX_ROWS_ERROR = self.saved
+        self.tmp.cleanup()
+
+    def fake_acpmux(self, body: str) -> Path:
+        exe = self.bin / "acpmux"
+        exe.write_text("#!/bin/sh\n" + body)
+        exe.chmod(0o755)
+        return exe
+
+    def test_a_relay_warning_on_stderr_does_not_spoil_the_list(self) -> None:
+        argv_log = self.home / "argv"
+        self.fake_acpmux(f'echo "$@" > {argv_log}\n'
+                         'echo "acpmux: other machines\' sessions are not listed: cannot run the relay '
+                         'listing \\"lane-gh\\"" >&2\n'
+                         'echo \'{"sessions": [{"sessionId": "a", "status": "closed", "peer": null},'
+                         ' {"sessionId": "b", "status": "ready", "peer": "huge-blue"}]}\'\n')
+        self.assertIsNone(shutil.which("acpmux"))  # not on the bare PATH: found in ~/.local/bin
+        rows = gd.acpmux_rows(fresh=True)
+        self.assertEqual(rows, [{"sessionId": "a", "status": "closed", "peer": None}])  # no peer's rows
+        self.assertEqual(gd.ACPMUX_ROWS_ERROR, "")
+        self.assertIn("--machine local", argv_log.read_text())
+
+    def test_a_failed_list_names_the_command_its_exit_code_and_stderr(self) -> None:
+        exe = self.fake_acpmux('echo "acpmux: cannot reach the daemon at /x/acpmux.sock" >&2\nexit 3\n')
+        self.assertIsNone(gd.acpmux_rows(fresh=True))
+        self.assertIn(f"`{exe} ls --json --machine local", gd.ACPMUX_ROWS_ERROR)
+        self.assertIn("exited 3: acpmux: cannot reach the daemon at /x/acpmux.sock", gd.ACPMUX_ROWS_ERROR)
+        self.fake_acpmux("echo not json\n")
+        self.assertIsNone(gd.acpmux_rows(fresh=True))
+        self.assertIn("printed no JSON", gd.ACPMUX_ROWS_ERROR)
+        self.assertIn("not json", gd.ACPMUX_ROWS_ERROR)
+
+    def test_no_program_anywhere_is_named_with_where_it_looked(self) -> None:
+        self.assertIsNone(gd.acpmux_rows(fresh=True))
+        self.assertIn("no acpmux program on PATH (/usr/bin:/bin)", gd.ACPMUX_ROWS_ERROR)
+        self.assertIn(str(self.bin / "acpmux"), gd.ACPMUX_ROWS_ERROR)
+        shutil.rmtree(self.home / ".acpmux")
+        self.assertEqual(gd.acpmux_rows(fresh=True), [])  # acpmux not used here: nothing to keep for it
+
+    def test_acpmux_bin_wins_over_path(self) -> None:
+        named = self.home / "named-acpmux"
+        named.write_text("#!/bin/sh\necho '{\"sessions\": []}'\n")
+        named.chmod(0o755)
+        with mock.patch.dict(os.environ, {"ACPMUX_BIN": str(named)}):
+            self.assertEqual(gd.acpmux_exe(), str(named))
+            self.assertEqual(gd.acpmux_rows(fresh=True), [])
+
+
+class OwnedElsewhereTest(unittest.TestCase):
+    """What other tools own on a Linux lane VM is named with its size, the owner's reasons and its commands, and
+    glaeda-disk deletes nothing there (a lane VM, 2026-11-18: ~/Projects/checkouts 104.6G and ~/.acpmux 56.5G kept with
+    no word on who frees them)."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.home = Path(os.path.realpath(self.tmp.name))
+        self.saved = (gd.HOME, gd._ACPMUX_ROWS)
+        gd.HOME = self.home
+        state = self.home / gd.WORKTREE_RECLAIM_STATE_REL
+        state.mkdir(parents=True)
+        gib = 1 << 30
+        (state / "checkout-keep-report.json").write_text(json.dumps({"at": time.time() - 1800, "rows": [
+            {"path": "a", "bytes": 11 * gib, "reasons": ["wt reclaim: owner liveness unknown here"]},
+            {"path": "b", "bytes": 9 * gib, "reasons": ["wt reclaim: owner liveness unknown here; 1 dirty files"]},
+            {"path": "c", "bytes": 2 * gib, "reasons": ["wt reclaim: owner session is running; live owner"]},
+        ], "total_bytes": 22 * gib}))
+        (state / "log.jsonl").write_text(
+            json.dumps({"kind": "summary", "mode": "pressure", "at": "2026-11-18T19:51:33+0000", "freed_gb": 0.0}) + "\n"
+            + json.dumps({"kind": "pressure_build", "path": "x"}) + "\n")
+        tool = self.home / gd.WORKTREE_RECLAIM_TOOL_REL
+        tool.parent.mkdir(parents=True)
+        tool.write_text("")
+        self.store = self.home / ".acpmux/sessions"
+        for sid in ("01a1d212-4250-7272-94b4-33a324d4aed3", "01a1e755-8220-725d-9347-29e5487b1770"):
+            (self.store / sid / "events").mkdir(parents=True)
+            (self.store / sid / "events/0").write_bytes(b"e" * 65536)
+        envp = mock.patch.dict(os.environ, {"ACPMUX_HOME": str(self.home / ".acpmux")})
+        envp.start()
+        self.addCleanup(envp.stop)
+
+    def tearDown(self) -> None:
+        gd.HOME, gd._ACPMUX_ROWS = self.saved
+        self.tmp.cleanup()
+
+    def test_it_names_what_the_checkout_and_acpmux_reclaimers_keep_and_how_to_run_them(self) -> None:
+        rows = [{"sessionId": "01a1d212-4250-7272-94b4-33a324d4aed3", "status": "closed"},
+                {"sessionId": "01a1e755-8220-725d-9347-29e5487b1770", "status": "running"}]
+        with mock.patch.object(gd, "acpmux_rows", return_value=rows):
+            text = "\n".join(gd.owned_elsewhere_lines())
+        self.assertIn("keep 22.0G in 3 (their keep report, 0.5h old)", text)
+        self.assertRegex(text, r"20\.0G\s+2\s+wt reclaim: owner liveness unknown here\n")
+        self.assertIn("worktree_reclaim's last pass: pressure at 2026-11-18T19:51:33+0000, freed 0.0 GB", text)
+        self.assertIn(f"acpmux store {self.store}: 1 closed sessions hold", text)
+        self.assertIn("acpmux_store_reclaim takes only", text)
+        self.assertIn("dry run: python3 ~/Projects/leo-workspace/tools/worktree_reclaim.py plan", text)
+        self.assertIn("apply:   python3 ~/Projects/leo-workspace/tools/worktree_reclaim.py pressure", text)
+        self.assertTrue(all(p.exists() for p in self.store.iterdir()))  # report only
+
+    def test_an_unreadable_session_list_is_named_not_guessed(self) -> None:
+        gd.ACPMUX_ROWS_ERROR = "`acpmux ls` exited 3: no daemon"
+        self.addCleanup(setattr, gd, "ACPMUX_ROWS_ERROR", "")
+        with mock.patch.object(gd, "acpmux_rows", return_value=None):
+            text = "\n".join(gd.owned_elsewhere_lines())
+        self.assertIn("its closed sessions are unknown: `acpmux ls` exited 3: no daemon", text)
+
+    def test_a_supervised_store_is_acpmux_store_reclaims(self) -> None:
+        sup = self.home / ".acpmux-supervised"
+        sup.mkdir()
+        with mock.patch.dict(os.environ, {"ACPMUX_HOME": str(sup)}):
+            text = "\n".join(gd.owned_elsewhere_lines())
+        self.assertIn("acpmux_store_reclaim archives and purges its closed sessions", text)
+
+    def test_no_keep_report_says_who_writes_it(self) -> None:
+        (self.home / gd.WORKTREE_RECLAIM_STATE_REL / "checkout-keep-report.json").unlink()
+        with mock.patch.object(gd, "acpmux_rows", return_value=[]):
+            text = "\n".join(gd.owned_elsewhere_lines())
+        self.assertIn("no keep report (hygiene_reconciler writes", text)
+
+    @unittest.skipIf(os.geteuid() == 0, "root reads every folder")
+    def test_an_unreadable_census_row_says_who_owns_what_it_could_not_read(self) -> None:
+        tree = self.home / "lane-scratch"
+        (tree / "x/locked").mkdir(parents=True)
+        me = gd.pwd_name(os.getuid())
+        try:
+            (tree / "x/locked").chmod(0)
+            why = gd.unreadable_why(str(tree))
+            self.assertIn(f"{tree}/x/locked is owned by {me}, mode 0000", why)
+            tree.chmod(0)
+            self.assertEqual(gd.unreadable_why(str(tree)), f"owned by {me}, mode 0000")
+            row = gd.census_coverage_row({"complete": True, "at": 0, "rows": {str(tree): [5, "unreadable", False]}})
+            self.assertEqual(row["children"][0]["why"], f"owned by {me}, mode 0000")
+        finally:
+            tree.chmod(0o755)
+            (tree / "x/locked").chmod(0o755)
+        self.assertIn("cannot stat", gd.unreadable_why(str(self.home / "gone")))
 
 
 if __name__ == "__main__":
