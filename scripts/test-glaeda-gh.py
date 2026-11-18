@@ -18028,6 +18028,9 @@ class LandWorld:
         self.fetch_rc = 0
         self.fetch_err = "fatal: unable to access 'https://github.com/o/r.git/': Could not resolve host"
         self.files: list[str] = []  # the PR's changed files, as `gh api repos/o/r/pulls/1/files` lists them
+        # `lane-gh call land_handoff`: the broker host's answer (rc, stdout, stderr)
+        self.handoff = (0, json.dumps({"ok": True, "key": "pr:o/r#1", "state": "queued", "host": "huge-blue",
+                                       "request": "lane-handoff:o.r.1:" + "a" * 40}), "")
 
     def set_pr(self, key: str, data: dict, fetched: float) -> None:
         self.cache[key] = {"key": key, "data": data, "fetchedAt": fetched, "dataAt": fetched}
@@ -18044,6 +18047,9 @@ class LandWorld:
             return subprocess.CompletedProcess(argv, 0, "", "")
         if argv[0] == "/fake/git" and argv[3:] == ["config", "--get", "remote.origin.url"]:
             return subprocess.CompletedProcess(argv, 0 if self.origin else 1, self.origin + "\n", "")
+        if argv[0] == "/fake/lane-gh" and argv[1:3] == ["call", "land_handoff"]:
+            rc, out, err = self.handoff
+            return subprocess.CompletedProcess(argv, rc, out + "\n", err)
         if argv[0] in ("/fake/git", "/fake/lane-gh"):
             return subprocess.CompletedProcess(argv, self.fetch_rc, "", "" if self.fetch_rc == 0 else self.fetch_err)
         if argv[0] == os.fspath(self.gh):
@@ -19618,6 +19624,115 @@ class LandTest(Base):
                 self.assertEqual(len(self.w.explains()), 1)
                 self.assertTrue(any("no_lane" in " ".join(c) for c in self.w.sent()), "the requester is told")
                 self.broker = False
+
+    NOT_OWNER = ("! gh pr merge: refused: PR 1's branch 'lane/drag-like-paste' was not pushed by host "
+                 "(lane-gh-broker own); nor is it a PR host adopted (no claim)")
+
+    def handoffs(self) -> list[list[str]]:
+        return [c for c in self.w.calls if c[0] == "/fake/lane-gh" and c[1:3] == ["call", "land_handoff"]]
+
+    def test_an_ownership_refusal_on_a_lane_vm_hands_the_land_to_the_broker_host_once(self):
+        # cmux#45756, 2026-11-18: "branch lane/drag-like-paste was not pushed by gcp-agent-lane-6": a lander lane only
+        # judged. The refusal hands the PR to the broker host's land queue (huge-blue), which judges and merges it.
+        self.broker = True
+        self.pr(LA)
+        with mock.patch.object(gg, "policy_host", lambda: "host"):
+            self.land(requester="host/lane")
+            self.w.gh_rc["merge"] = 1
+            self.w.gh_err["merge"] = self.NOT_OWNER
+            self.w.answers.append(ok_answer(LA))
+            e = self.tick()
+        [call] = self.handoffs()
+        self.assertEqual(call[3], "o/r")
+        self.assertEqual(json.loads(call[4]), {"number": 1, "sha": LA, "requester": "host/lane"})
+        self.assertEqual((e["state"], e.get("forwardedTo")), ("forwarded", "huge-blue"))
+        self.assertEqual(e["handedOff"]["head"], LA)
+        self.assertTrue(any(h.get("event") == "handed_off" for h in e["history"]), e["history"])
+        self.assertTrue(any("handed to huge-blue" in c[-1] for c in self.w.sent()), self.w.sent())
+        # nothing more here: no judgment, no step, no second hand-off
+        for _ in range(5):
+            self.tick(600)
+        self.assertEqual((len(self.handoffs()), len(self.w.explains())), (1, 1))
+        # queued again at the same head: refused the same way, handed off never again (idempotent per PR and head)
+        with mock.patch.object(gg, "policy_host", lambda: "host"):
+            self.land(requester="host/lane")
+            self.w.answers.append(ok_answer(LA))
+            e = self.tick()
+        self.assertEqual((len(self.handoffs()), e["state"]), (1, "forwarded"))
+
+    def test_a_requester_on_another_host_is_not_named_to_the_broker(self):
+        # The broker takes only a session on the calling VM; with none named it tells the VM's lane.
+        self.broker = True
+        self.pr(LA)
+        with mock.patch.object(gg, "policy_host", lambda: "host"):
+            self.land(requester="other/coord")
+            self.w.gh_rc["merge"] = 1
+            self.w.gh_err["merge"] = self.NOT_OWNER
+            self.w.answers.append(ok_answer(LA))
+            self.tick()
+        [call] = self.handoffs()
+        self.assertEqual(json.loads(call[4]), {"number": 1, "sha": LA})
+
+    def test_a_ci_or_hold_refusal_is_never_handed_off(self):
+        self.broker = True
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(refusal("red", LA, {"kind": "stop", "stop": "red", "why": "CI failed at the head"}))
+        e = self.tick()
+        self.assertEqual((e["state"], e["stop"]["code"], self.handoffs()), ("stopped", "red", []))
+        # a merge the broker refused for anything but ownership counts and backs off as before
+        shutil.rmtree(gg.land_dir(), ignore_errors=True)
+        self.w = LandWorld(self.tmp.name)
+        self.q = self.queue()
+        self.pr(LA)
+        self.land()
+        self.w.gh_rc["merge"] = 1
+        self.w.gh_err["merge"] = "merge_hold: HOLD: a HOLD line in the PR body"
+        self.w.answers.append(ok_answer(LA))
+        e = self.tick()
+        self.assertEqual((e["state"], self.handoffs()), ("waiting", []))
+
+    def test_a_host_with_its_own_login_never_hands_off(self):
+        self.pr(LA)
+        self.land()
+        self.w.gh_rc["merge"] = 1
+        self.w.gh_err["merge"] = self.NOT_OWNER
+        self.w.answers.append(ok_answer(LA))
+        e = self.tick()
+        self.assertEqual((e["state"], self.handoffs()), ("waiting", []))
+
+    def test_a_refused_hand_off_backs_off_then_stops_and_says_so(self):
+        self.broker = True
+        self.pr(LA)
+        self.land()
+        self.w.gh_rc["merge"] = 1
+        self.w.gh_err["merge"] = self.NOT_OWNER
+        self.w.handoff = (1, "", "lane-gh: refused: unknown tool 'land_handoff'")
+        e = {}
+        for _ in range(gg.LAND_STEP_STOP):
+            self.w.answers.append(ok_answer(LA))
+            e = self.tick(gg.LAND_STEP_BACKOFF_MAX + 1)
+        self.assertEqual(len(self.handoffs()), gg.LAND_STEP_STOP)
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "handoff_refused"))
+        self.assertIn("unknown tool", e["stop"]["reason"])
+
+    def test_a_handed_off_teammates_pr_is_still_refused_by_the_executors_daemon(self):
+        # On the broker host the hand-off is a plain queued land: merge_hold's teammate rule stops it there, nothing
+        # is merged, and the requester the lane named is told.
+        rid, why = gg.land_serve_one({"op": "land", "target": "o/r#1", "after": [], "requester": "lanevm/lane",
+                                      "requesterFrom": "lane-gh land_handoff", "queuedBy": "broker:lanevm",
+                                      "id": "lane-handoff:o.r.1:" + LA})
+        self.assertEqual(why, "")
+        self.pr(LA)
+        self.w.answers.append(refusal("teammate", LA, {"kind": "stop", "stop": "teammate",
+                                                       "why": "a teammate's PR: lands only on their opt-in"}))
+        e = self.tick()
+        self.assertEqual((e["state"], e["stop"]["code"], self.w.gh_calls("pr", "merge")), ("stopped", "teammate", []))
+        self.assertTrue(any(c[2:4] == ["--no-wait", "lanevm/lane"] and "teammate" in c[-1] for c in self.w.sent()))
+        # the same hand-off again is applied once: the stop stands
+        gg.land_serve_one({"op": "land", "target": "o/r#1", "requester": "lanevm/lane", "id": "lane-handoff:o.r.1:" + LA})
+        e = self.tick()
+        self.assertEqual((e["state"], len(self.w.explains())), ("stopped", 1))
 
     def test_a_forwarded_land_keeps_its_lane_and_host(self):
         req = {"op": "land", "target": "o/r#1", "requester": "host/parent/child", "id": "r1", "lane": "child",
