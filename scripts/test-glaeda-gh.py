@@ -20712,7 +20712,7 @@ class StragglerTest(unittest.TestCase):
         data, get = self.head(counts=red)
         for _ in range(3):
             data = gg.straggler_pass("pr:o/r#45147", data, self.now, get)
-        self.assertEqual(gg.verdict("pr", data, "done", now=self.now), gg.EXIT_INCONCLUSIVE)
+        self.assertEqual(gg.verdict("pr", data, "done", now=self.now), gg.EXIT_FAIL)  # a red already in stays a failure
 
     def test_no_read_while_anything_else_runs(self) -> None:
         """The cost stays flat: while a check runs, waits, or a status is pending, no straggler read is made."""
@@ -21037,8 +21037,13 @@ class QueuedNeverDoneTest(unittest.TestCase):
         code, text = gg.wait_step(req, self.now, runs(None))
         self.assertEqual(code, gg.EXIT_INCONCLUSIVE, text)
         self.assertIn("result: inconclusive", text)
+        # a failed read is kept HEAD_RUNS_REREAD too: a read that keeps failing is no GET a tick
+        before = len(reads)
+        for t in range(5):
+            gg.wait_step(req, self.now + t, runs(None))
+        self.assertEqual(len(reads), before)
         # every run completed: success, and the answer is kept HEAD_RUNS_REREAD
-        self.assertFalse(gg.head_runs_path(key).exists())  # a failed read keeps no answer
+        gg.head_runs_path(key).unlink()
         req = gg.wait_request("pr", "o/r#13397", "done", 3600, False, False, head, True, gg.RESCUE_GRACE)
         req["began"] = self.now - 190
         self.assertEqual(gg.wait_step(req, self.now, runs("completed"))[0], gg.EXIT_OK)

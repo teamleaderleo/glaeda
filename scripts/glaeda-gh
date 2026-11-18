@@ -11819,8 +11819,11 @@ def check_verdict(data: dict, until: str = "green", now: float | None = None,
     (straggler_cut): they are still queued, and run if a runner comes, so the head is not done (hq#13438, hq#13202:
     the cut used to judge the head without them and said success while 7 and 8 of 13 checks were queued)."""
     now = time.time() if now is None else now
-    if until == "done" and straggler_cut(data, now) is not None:
-        return EXIT_INCONCLUSIVE
+    if until == "done":
+        cut = straggler_cut(data, now)
+        if cut is not None:
+            # a red already in stays a failure (it can never turn green); otherwise the head is not done
+            return EXIT_FAIL if check_verdict(cut, "green", now, grace, settle) == EXIT_FAIL else EXIT_INCONCLUSIVE
     checks = data.get("checks") or []
     if data.get("checksPageError"):
         return None  # a partial cached rollup is not evidence of a green head
@@ -12722,7 +12725,7 @@ def wait_step(req: dict, now: float, get: Callable[[str, list[str]], dict] | Non
         return result, render(key, entry, as_json, extra, until, grace, bool(req.get("verbose")))
     unread = (data or {}).get("checksPageError") or (
         "the head's Actions runs could not be read (actions/runs?head_sha)" if req.get("runsUnread") else None)
-    if now - began >= req["timeout"] and kind == "pr" and data and unread:
+    if now - began >= req["timeout"] and kind == "pr" and until in ("done", "green") and data and unread:
         # the deadline passed on a read that never came back whole: not a pass and not a plain timeout
         extra = {"result": "inconclusive", "waited_s": waited,
                  "note": f"the last read of this PR was partial ({unread}): its checks are unknown"}
@@ -12766,23 +12769,31 @@ def head_runs_unfinished(key: str, data: dict, now: float,
         return None
     path = head_runs_path(key)
     kept = read_json(path)
-    if isinstance(kept, dict) and kept.get("head") == head and now - num(kept.get("at")) < HEAD_RUNS_REREAD \
-            and isinstance(kept.get("unfinished"), list):
-        return [str(n) for n in kept["unfinished"]]
+    if isinstance(kept, dict) and kept.get("head") == head and now - num(kept.get("at")) < HEAD_RUNS_REREAD:
+        # an answer, or a failed read, is kept as long: a read that keeps failing costs one GET a minute, not one a tick
+        return [str(n) for n in kept["unfinished"]] if isinstance(kept.get("unfinished"), list) else None
+
+    def keep(unfinished: list[str] | None) -> None:
+        with contextlib.suppress(OSError, ValueError, TypeError):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            write_json(path, {"head": head, "at": now, "unfinished": unfinished})
     query = f"actions/runs?head_sha={head}&per_page={HEAD_RUNS_PAGE}"
     try:
         doc = (get or head_runs_get)(repo, [query]).get(query)
     except Exception as error:  # noqa: BLE001  a failed read is unread, never "none"
         log({"event": "head-runs-failed", "key": key, "error": describe(error)})
+        keep(None)
         return None
     runs = doc.get("workflow_runs") if isinstance(doc, dict) else None
-    if not isinstance(runs, list) or int(doc.get("total_count") or 0) > len(runs):
+    if not isinstance(runs, list):
+        keep(None)
         return None
     unfinished = [str(r.get("name") or r.get("id")) for r in runs
                   if isinstance(r, dict) and str(r.get("status") or "").lower() != "completed"]
-    with contextlib.suppress(OSError, ValueError, TypeError):
-        path.parent.mkdir(parents=True, exist_ok=True)
-        write_json(path, {"head": head, "at": now, "unfinished": unfinished})
+    if int(doc.get("total_count") or 0) > len(runs) and not unfinished:
+        keep(None)  # more runs than one page: an unfinished one may be past it
+        return None
+    keep(unfinished)
     return unfinished
 
 
