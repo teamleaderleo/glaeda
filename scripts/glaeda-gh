@@ -248,8 +248,11 @@ effect without a restart.
   (a head read before the step is never pinned). It is judged only when its PR's cache entry, a wait, a wake-at or a
   dependency (--after: that PR merged) changed, never while its head's checks run. It stops and tells the requester
   (`acpmux send --no-wait HOST/SESSION`, default this host/$ACPMUX_SESSION_NAME) on a merge, a stop merge_hold names
-  (a BLOCK, a hold, a conflict...), a step only a person can take, the PR or a dependency closed, or 3 identical
-  refusals in a row (a named update-branch never counts: it is sent once per head). Its calls carry CMUX_AGENT_SESSION=glaeda-land and MAY_MERGE_PATH=glaeda-land, so the gh-quota
+  (a BLOCK, a hold, a conflict...), a step only a person can take, the PR or a dependency closed, 3 identical
+  refusals in a row of a step that is not a wait (a named update-branch never counts: it is sent once per head), or a
+  wait past its bound (checks: 4 h with none moving, checks_stuck; a review, an unreadable retry or a cancelled job's
+  rerun: 2 h, `<kind>_deadline`). A land --after one that stopped keeps waiting for it (24 h): landing or merging
+  the stopped one resumes the chain. Its calls carry CMUX_AGENT_SESSION=glaeda-land and MAY_MERGE_PATH=glaeda-land, so the gh-quota
   call log and the landing record tell them from a person's. State in land/ (entries/, requests/, counts.json: the
   steps taken per day, which `land status` prints); ~/.config/glaeda/land.json may set gh, mergeHold, acpmux,
   routerReview, python, workers and env. merge_hold.py is mergeHold, else the ws-sync deploy's, else
@@ -8056,6 +8059,25 @@ LAND_RETRY_KINDS = frozenset({"retry", "fetch"})
 # a check that will never start.
 LAND_WAIT_KINDS = frozenset({"wait_pr", "wait_run"})
 LAND_WAIT_STUCK = 4 * 3600.0
+# The rest of the waits merge_hold names never count toward LAND_STREAK_STOP either: a review still running
+# (wait_comment), a judgment it could not make (retry: unreadable, explain_failed) and the rerun of a cancelled job
+# (rerun_failed; its checks' wait after it is a wait_pr above). interim-coord, 2026-11-18: "A refusal whose next step
+# is a wait (a check queued, pending or cancelled-and-rerun) should keep waiting up to a deadline, with no strike; only
+# a real red or a hold counts toward the 3" (cmux#46183, #46220: cancelled shards a rerun clears). Keyed on the action's
+# kind, never its words. Each (kind, head) has one budget (e["waitBudget"], wait_spent): from its first such judgment,
+# sized max(the kind's LAND_WAIT_DEADLINE, twice the action's own timeout_s, so a wait always gets judged again at
+# least once); the judgment that finds it spent stops "<kind>_deadline", naming the wait that ran out. A new head or
+# kind starts a new budget, an "ok" drops it. A fetch is work, not a wait: LAND_RETRY_STREAK_STOP and step_refused
+# still bound it. Only a "stop" or "command" (a red not excused, a hold, a BLOCK, a teammate's PR, a conflict) and the
+# remaining steps (repin, review, retarget) count toward or stop at LAND_STREAK_STOP.
+LAND_WAIT_DEADLINE = {"wait_comment": 7200.0, "retry": 7200.0, "rerun_failed": 7200.0}
+LAND_WAIT_WHAT = {"wait_comment": "a review verdict at the head", "retry": "a judgment merge_hold could not make",
+                  "rerun_failed": "the rerun of the cancelled jobs"}
+# An --after PR whose predecessor's land stopped keeps waiting for it this long (consider, after_stopped), telling its
+# requester once: landing the predecessor again, or merging it, resumes the whole chain, and nobody re-queues the PRs
+# behind it (before, each stopped at once: cmux#46237, #46217, #46236 behind #46157, #46183, #46220). Past it, it
+# stops naming the predecessor and the one command that re-queues it. A cancelled predecessor stops it at once.
+LAND_AFTER_STOPPED_WAIT = 86400.0
 # A quota refusal parks the entry: no judge, read, watch or nudge for it until the reset the refusal names (Leo,
 # 2026-11-17, on Claude desktop's "GitHub rate limit" hover: "this is... interesting. so claude desktop shows rate limit
 # on hover of the github links sometimes..."). Before, every quota-refused entry was judged again about every 5 min
@@ -8777,7 +8799,8 @@ class LandQueue:
         if fresh:
             e.update(state="queued", head="", explain=None, action=None, streak=None, wakeAt=None,
                      wait=None, seen=None, seenHead="", mergeSha="", stop=None, preStepHead="",
-                     lastAction=None, reviewed=[], updateSent=None, updateDeferred=None, waitRefused=None)
+                     lastAction=None, reviewed=[], updateSent=None, updateDeferred=None, waitRefused=None,
+                     waitBudget=None, afterStopped=None)
             self.history(e, "queued", by=e["requester"], via=e["requesterFrom"], after=",".join(e["after"]))
         else:
             self.history(e, "updated", by=e["requester"], after=",".join(e["after"]))
@@ -9191,7 +9214,7 @@ class LandQueue:
         data = (c or {}).get("data") or {}
         if self.ended(e, str(data.get("state") or ""), e.get("mergeSha") or "", "the cache shows it"):
             return
-        pending = []
+        pending, stopped = [], None
         for a in e.get("after") or []:
             ad = (self.cache_of(a) or {}).get("data") or {}
             ae = self.entries.get(a)
@@ -9201,11 +9224,18 @@ class LandQueue:
                 self.stop(e, "after_closed", f"{key_name(a)}, which it lands after, was closed without being merged",
                           f"glaeda-gh land {key_name(e['key'])} (without --after) once its base is right")
                 return
-            if ae and ae["state"] in ("stopped", "cancelled"):
-                self.stop(e, "after_stopped", f"{key_name(a)}, which it lands after, {ae['state']}",
-                          f"land {key_name(a)} first, or land this one again without --after")
+            if ae and ae["state"] == "cancelled":
+                self.stop(e, "after_cancelled", f"{key_name(a)}, which it lands after, was cancelled",
+                          f"glaeda-gh land {key_name(a)} && glaeda-gh land {key_name(e['key'])} --after {key_name(a)}")
                 return
+            if ae and ae["state"] == "stopped" and stopped is None:
+                stopped = (a, ae)
             pending.append(a)
+        if stopped and self.after_stopped(e, *stopped):
+            return
+        if not stopped and e.get("afterStopped"):
+            self.history(e, "after_resumed", after=(e.pop("afterStopped") or {}).get("key"))
+            self.save(e)
         if pending:
             if e["state"] != "waiting_after":
                 e["state"] = "waiting_after"
@@ -9279,6 +9309,31 @@ class LandQueue:
             # A change alone (checks finished, mergeability computed) is not the step running its course: the same
             # refusal after it does not count toward the stop; after its timeout it does.
             self.judge(e, head, fp, counts=woke)
+
+    def after_stopped(self, e: dict, a: str, ae: dict) -> bool:
+        """E lands after A, whose land stopped (LAND_AFTER_STOPPED_WAIT): E keeps waiting for A, telling its requester
+        once per stop of A; True when A has stayed stopped past the wait and E stopped, naming A and the command that
+        re-queues E."""
+        st = ae.get("stop") or {}
+        mark = e.get("afterStopped") or {}
+        if mark.get("key") != a or mark.get("stopAt") != st.get("at"):
+            mark = {"key": a, "stopAt": st.get("at"), "since": self.now}
+            e["afterStopped"] = mark
+            self.history(e, "after_stopped_waiting", after=a, code=st.get("code"))
+            self.save(e)
+            self.notify(e, e.get("requester") or "",
+                        f"glaeda land: {self.url(e)} waits: {key_name(a)}, which it lands after, stopped "
+                        f"({st.get('code') or 'stopped'}); this land stays queued behind it until "
+                        f"{utc_clock(self.now + LAND_AFTER_STOPPED_WAIT)}. next: glaeda-gh land {key_name(a)} once "
+                        "its stop is cleared, or merge it; this one follows")
+            return False
+        if self.now - float(mark.get("since") or self.now) < LAND_AFTER_STOPPED_WAIT:
+            return False
+        self.stop(e, "after_stopped",
+                  f"{key_name(a)}, which it lands after, stayed stopped ({st.get('code') or 'stopped'}: "
+                  f"{land_trim(st.get('reason'), 160)}) for {LAND_AFTER_STOPPED_WAIT:.0f} s",
+                  f"glaeda-gh land {key_name(a)} && glaeda-gh land {key_name(e['key'])} --after {key_name(a)}")
+        return True
 
     def verdict_holds(self, e: dict, c: dict | None, head: str, fp: str) -> bool:
         """True while E's last verdict, a wait_pr at HEAD, still stands (LAND_VERDICT_KEEP): judged within the bound, at
@@ -9630,6 +9685,11 @@ class LandQueue:
             e.pop("quotaRefusals", None)
             if answer.get("ok"):
                 e["streak"] = None
+                e.pop("waitBudget", None)
+            elif act.get("kind") in LAND_WAIT_DEADLINE:
+                # Another wait: never a strike, a deadline (LAND_WAIT_DEADLINE's comment)
+                if self.wait_spent(e, act, answer, head):
+                    return
             elif act.get("kind") in LAND_WAIT_KINDS:
                 # A wait on the checks is taken, never counted toward the identical-refusal stop (LAND_WAIT_STUCK).
                 if self.wait_refused(e, head, str(answer.get("code") or "refused"), answer.get("reason"),
@@ -9656,6 +9716,28 @@ class LandQueue:
         s = {"signature": sig, "count": int(s.get("count") or 0) + (1 if counts else 0) if same else 1}
         e["streak"] = s
         return s["count"] >= (LAND_RETRY_STREAK_STOP if retry else LAND_STREAK_STOP)
+
+    def wait_spent(self, e: dict, act: dict, answer: dict, head: str) -> bool:
+        """One more judgment naming the wait ACT at HEAD (LAND_WAIT_DEADLINE's comment). Under the lock. It breaks the
+        identical-refusal streak and counts toward nothing; True when the wait's budget is spent and E is stopped."""
+        kind = str(act.get("kind"))
+        key = f"{kind}|{head}"
+        size = max(LAND_WAIT_DEADLINE[kind], 2 * land_seconds(act.get("timeout_s"), 0.0, 0.0))
+        b = e.get("waitBudget") or {}
+        if b.get("key") != key:
+            b = {"key": key, "since": self.now, "deadline": size, "n": 0}
+        b.update(code=str(answer.get("code") or ""), n=int(b.get("n") or 0) + 1,
+                 deadline=max(float(b.get("deadline") or 0), size))
+        e["waitBudget"] = b
+        e["streak"] = None
+        waited = self.now - float(b["since"])
+        if waited < b["deadline"]:
+            return False
+        self.stop(e, f"{kind}_deadline",
+                  f"waited {waited:.0f} s (deadline {b['deadline']:.0f} s, {b['n']} judgments) at {head[:12] or '?'} "
+                  f"for {LAND_WAIT_WHAT[kind]}, still {b['code'] or 'refused'}: {land_trim(answer.get('reason'))}",
+                  land_trim(answer.get("next")))
+        return True
 
     def wait_refused(self, e: dict, head: str, code: str, reason: Any, nxt: Any) -> bool:
         """One refusal whose step is a wait on the checks at HEAD (LAND_WAIT_STUCK's comment). Under the lock. It
@@ -9823,7 +9905,7 @@ class LandQueue:
                     self.nudge(e["key"])
                     self.wait(e, {"kind": "head_change", "before": head, "since": self.now}, LAND_HEAD_TIMEOUT)
             elif kind == "retry":
-                n = int((e.get("streak") or {}).get("count") or 1)
+                n = int((e.get("waitBudget") or {}).get("n") or (e.get("streak") or {}).get("count") or 1)
                 after = land_seconds(act.get("after_s"), LAND_RETRY_DEFAULT) * (2 ** max(0, n - 1))
                 self.wait(e, {"kind": "retry"}, min(LAND_RETRY_MAX, after))
             self.count(kind)

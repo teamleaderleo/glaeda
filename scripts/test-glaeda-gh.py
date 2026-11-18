@@ -18799,17 +18799,140 @@ class LandTest(Base):
         self.assertEqual((e["state"], e["wait"]["kind"], e["wait"]["until"]), ("waiting", "pr", "done"))
 
     def test_three_identical_refusals_stop_and_notify(self):
+        # a step that is not a wait (a repin to the cached head: a pinned retry, #2170) still counts
         self.pr(LA)
         self.land()
         for _ in range(3):
-            self.w.answers.append(refusal("review_running", LA, {"kind": "wait_comment", "timeout_s": 600}))
+            self.w.answers.append(refusal("pin", LA, {"kind": "repin", "sha": LA}))
         e = self.tick()
         self.assertEqual(e["streak"]["count"], 1)
-        e = self.tick(601)
+        e = self.tick(gg.LAND_HEAD_TIMEOUT + 1)
         self.assertEqual((e["state"], e["streak"]["count"]), ("waiting", 2))
-        e = self.tick(601)
+        e = self.tick(gg.LAND_HEAD_TIMEOUT + 1)
         self.assertEqual((e["state"], len(self.w.explains())), ("stopped", 3))
         self.assertIn("3 identical refusals", self.w.sent()[-1][-1])
+
+    # interim-coord, 2026-11-18: "Land gives up after '3 identical refusals in a row' even when the refusal is only
+    # waiting: cmux#46157 stopped on 'react-apps-base-check: queued', and #46183 and #46220 on cancelled shards that a
+    # rerun clears. Each stop also kills every --after PR behind it (#46237, #46217, #46236)".
+
+    def test_a_queued_check_waits_past_three_judgments_without_a_strike(self):
+        # cmux#46157: checks_running on a queued check, a wait_pr each time; it lands once the check runs green
+        self.pr(LA)
+        self.land()
+        queued = refusal("checks_running", LA, {"kind": "wait_pr", "sha": LA, "until": "done", "timeout_s": 600},
+                         nxt=f"glaeda-gh wait pr o/r#1 --until done --sha {LA} --timeout 600",
+                         reason="merge-hold: refused: checks still running at the head: react-apps-base-check: queued")
+        for _ in range(5):
+            self.w.answers.append(queued)
+        e = self.tick()
+        for _ in range(4):
+            e = self.tick(601)
+        self.assertEqual((e["state"], e.get("streak"), len(self.w.explains())), ("waiting", None, 5), e.get("stop"))
+        self.assertEqual(self.w.sent(), [])
+        self.w.answers.append(ok_answer(LA))
+        self.tick(601)
+        self.assert_merged_at(LA)
+
+    def test_a_review_wait_never_strikes_and_stops_at_its_deadline_naming_it(self):
+        self.pr(LA)
+        self.land()
+        running = refusal("review_running", LA, {"kind": "wait_comment", "match": "SHIP|BLOCK", "timeout_s": 1800},
+                          reason="merge-hold: refused: a review is running at the head")
+        for _ in range(6):
+            self.w.answers.append(running)
+        e = self.tick()
+        for _ in range(3):
+            e = self.tick(1801)
+        self.assertEqual((e["state"], e.get("streak"), e["waitBudget"]["n"]), ("waiting", None, 4))  # 5403 s < 2 h
+        e = self.tick(1801)
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "wait_comment_deadline"))
+        self.assertIn("for a review verdict at the head, still review_running", e["stop"]["reason"])
+        self.assertNotIn("identical refusals", self.w.sent()[-1][-1])
+
+    def test_a_cancelled_shard_rerun_never_strikes(self):
+        # cmux#46183, #46220: a cancelled shard, rerun; merge_hold then answers cancelled_rerun (a wait on the rerun)
+        # until it runs, and cancelled again once more; it lands once the rerun is green.
+        self.pr(LA)
+        self.land()
+        cancelled = refusal("cancelled", LA, {"kind": "rerun_failed", "runs": [77]})
+        rerun = refusal("cancelled_rerun", LA, {"kind": "wait_pr", "sha": LA, "until": "done", "timeout_s": 900},
+                        reason="merge-hold: refused: a cancelled shard's rerun is waiting: test (shard 3/4)")
+        self.w.answers += [cancelled, rerun, rerun, cancelled, rerun, rerun]
+        e = self.tick()
+        self.assertEqual(self.w.gh_calls("run", "rerun"), [["run", "rerun", "77", "--failed", "-R", "o/r"]])
+        # each wait's own timeout: the rerun's (LAND_WAIT_DEFAULT), then cancelled_rerun's 900 s
+        for wait in (gg.LAND_WAIT_DEFAULT, 900, 900, gg.LAND_WAIT_DEFAULT, 900):
+            e = self.tick(wait + 1)
+        self.assertEqual((e["state"], e.get("streak"), len(self.w.explains())), ("waiting", None, 6), e.get("stop"))
+        self.assertEqual(len(self.w.gh_calls("run", "rerun")), 2)
+        self.assertEqual(self.w.sent(), [])
+        self.w.answers.append(ok_answer(LA))
+        self.tick(901)
+        self.assert_merged_at(LA)
+
+    def test_reruns_cancelled_again_past_the_deadline_stop_naming_the_rerun(self):
+        self.pr(LA)
+        self.land()
+        cancelled = refusal("cancelled", LA, {"kind": "rerun_failed", "runs": [77]})
+        self.w.answers += [cancelled, cancelled, cancelled]
+        self.tick()
+        e = self.tick(gg.LAND_WAIT_DEFAULT + 1)
+        self.assertEqual((e["state"], e.get("streak")), ("waiting", None))  # a second rerun, no strike
+        e = self.tick(gg.LAND_WAIT_DEFAULT + 1)
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "rerun_failed_deadline"))
+        self.assertIn("for the rerun of the cancelled jobs", e["stop"]["reason"])
+
+    def test_an_after_chain_of_three_survives_its_first_stop(self):
+        # #46237, #46217, #46236: #1 after #2 after #3. #3 stops; #2 and #1 stay queued behind it (#2's requester is
+        # told once), and landing #3 again lands the whole chain with nobody re-queuing #2 or #1.
+        def numbered(answer: tuple[int, dict], n: int) -> tuple[int, dict]:
+            rc, doc = answer
+            doc = {**doc, "number": str(n), "action": {**doc["action"], "number": n}}
+            return rc, doc
+
+        for n, head in ((1, LA), (2, LB), (3, LC)):
+            self.pr(head, key=f"pr:o/r#{n}")
+        self.land("o/r#3", requester="host/three")
+        self.land("o/r#2", after=["o/r#3"], requester="host/two")
+        self.land("o/r#1", after=["o/r#2"], requester="host/one")
+        self.w.answers.append(numbered(refusal("block", LC, {"kind": "stop", "stop": "block", "why": "BLOCK"}), 3))
+        self.tick()
+        self.tick()
+        es = self.q.entries
+        self.assertEqual([es[f"pr:o/r#{n}"]["state"] for n in (3, 2, 1)], ["stopped", "waiting_after", "waiting_after"])
+        told = {m[3]: m[4] for m in self.w.sent()}
+        self.assertIn("o/r#3, which it lands after, stopped (block)", told["host/two"])
+        self.assertIn("next: glaeda-gh land o/r#3", told["host/two"])
+        self.assertNotIn("host/one", told)  # #1 waits on #2, which is still queued
+        for _ in range(5):
+            self.tick(600)
+        self.assertEqual(len(self.w.sent()), 2)  # told once, never again while #3 stays stopped
+        # #3 is fixed and landed again: the chain lands in order (one judged at a time, so answers in chain order)
+        self.w.answers += [numbered(ok_answer(LC), 3), numbered(ok_answer(LB), 2), numbered(ok_answer(LA), 1)]
+        self.land("o/r#3", requester="host/three")
+        for _ in range(3):
+            self.tick()
+        self.assertEqual([es[f"pr:o/r#{n}"]["state"] for n in (3, 2, 1)], ["merged", "merged", "merged"])
+        self.assertEqual([m[-1] for m in self.w.gh_calls("pr", "merge")], [LC, LB, LA])
+        self.assertIsNone(es["pr:o/r#2"].get("afterStopped"))
+        self.assertIn("after_resumed", [h.get("event") for h in es["pr:o/r#2"]["history"]])
+
+    def test_an_after_pr_whose_predecessor_stays_stopped_stops_naming_it(self):
+        self.pr(LA)
+        self.pr(LC, key="pr:o/r#2")
+        self.land("o/r#2", requester="host/two")
+        self.land(after=["o/r#2"])
+        rc, doc = refusal("block", LC, {"kind": "stop", "stop": "block", "why": "BLOCK"})
+        self.w.answers.append((rc, {**doc, "number": "2", "action": {**doc["action"], "number": 2}}))
+        e = self.tick()
+        self.assertEqual(e["state"], "waiting_after")
+        e = self.tick(gg.LAND_AFTER_STOPPED_WAIT - 10)
+        self.assertEqual(e["state"], "waiting_after")
+        e = self.tick(20)
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "after_stopped"))
+        self.assertEqual(e["stop"]["next"], "glaeda-gh land o/r#2 && glaeda-gh land o/r#1 --after o/r#2")
+        self.assertIn("o/r#2, which it lands after, stayed stopped (block", e["stop"]["reason"])
 
     def test_a_change_alone_does_not_count_toward_the_stop(self):
         self.pr(LA)
