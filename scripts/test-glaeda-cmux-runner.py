@@ -3795,6 +3795,15 @@ class HookTest(unittest.TestCase):
 
     # ------------------------------------------------------------ the gateway runners (GATEWAY)
 
+    def test_cmux_kernel_free_fast_checks_cost_like_hqs(self) -> None:
+        """cmux fast-checks.yml's checks-mac (`cmux-ci test --setup kernel-free`) builds nothing in a canonical root:
+        it costs what hq's kernel-free fast checks cost as a guest (isolated), not an unlisted compile's 5 units with
+        the persistent-dd and root tokens."""
+        self.assertEqual(hook.job_class("checks-mac", "manaflow-ai/cmux", workflow="fast-checks.yml"),
+                         ("isolated", False))
+        self.assertEqual(hook.job_class("checks", "manaflow-ai/cmuxterm-hq", workflow="fast-checks.yml"),
+                         ("isolated", False))
+
     def test_the_sim_first_runner_admits_only_simulator_jobs(self) -> None:
         """SIM_FIRST: the sim-first runner listens on a full mini and its job's wait holds the mini's other runners, so
         only simulator jobs (the simulator and simulator-step classes) are admitted there; a build or compile routed
