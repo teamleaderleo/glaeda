@@ -312,6 +312,7 @@ import traceback
 import urllib.error
 import urllib.parse
 import urllib.request
+import weakref
 import zlib
 from pathlib import Path
 from typing import Any, Callable
@@ -632,7 +633,13 @@ READ_PROGRESS_WINDOW = 600.0
 # whose one read serves every wait, not to the next of the broker's `gh` calls polling the same locks.
 GRAPHQL_SLOT_WANT_FRESH = 1.0
 GRAPHQL_SLOT_WANT_TOUCH = 0.25
+# A slot is held per request, for at most this long by anyone in this process (graphql_slot_reap): the daemon's own
+# request ends within HTTP_DEADLINE. huge-blue, 2026-11-18 ~20:00Z: both of the login's slots flocked by the serve
+# process while no pr read was stored for 600 s and nothing said who held them. Past the bound the watchdog closes the
+# holder's slot file (the lock goes with it), logged once naming the thread, what it read and for how long.
+GRAPHQL_SLOT_HOLD_MAX = 2.0 * HTTP_DEADLINE
 STALE_RESTART_ADVICE = "`glaeda-gh restart` restarts a daemon in this state."
+STALE_DEFERRED_ADVICE = "A restart would not read any sooner: the budget above holds the reads back."
 DIRECT_QUOTA = "GitHub's quota for this read is spent"  # direct_read's refusals no restart can help with
 DIRECT_UPSTREAM = "this host reads GitHub through an upstream (no login here)"
 DIRECT_READ_BUDGET = 60  # seconds a wait's own fallback read (direct_read) may take
@@ -1969,9 +1976,62 @@ def graphql_slot_wanted(want: Path) -> bool:
         return False
 
 
-def graphql_slot_take(deadline: float | None, priority: bool = False) -> tuple[Any, int] | None:
+# id(handle) -> {"handle": a weak reference (a holder that drops its handle unreleased frees the slot as before, when
+# the file is collected), "slot", "thread", "what", "since"}
+_SLOT_HOLDERS: dict[int, dict[str, Any]] = {}
+_SLOT_HOLDERS_LOCK = threading.Lock()
+
+
+def _slot_gone(h: dict[str, Any]) -> bool:
+    handle = h["handle"]()
+    return handle is None or handle.closed
+
+
+def graphql_slot_release(handle: Any) -> None:
+    """Give back a slot graphql_slot_take handed out (closing its file frees the lock). Never raises."""
+    with _SLOT_HOLDERS_LOCK:
+        _SLOT_HOLDERS.pop(id(handle), None)
+    with contextlib.suppress(OSError, ValueError):
+        handle.close()
+
+
+def graphql_slot_holders(now: float | None = None) -> list[dict[str, Any]]:
+    """The slots this process holds: {"slot", "thread", "what", "heldS"}, longest first."""
+    now = time.monotonic() if now is None else now
+    with _SLOT_HOLDERS_LOCK:
+        for k in [k for k, h in _SLOT_HOLDERS.items() if _slot_gone(h)]:  # closed or dropped without release
+            _SLOT_HOLDERS.pop(k, None)
+        rows = [{"slot": h["slot"], "thread": h["thread"], "what": h["what"], "heldS": round(now - h["since"], 1)}
+                for h in _SLOT_HOLDERS.values()]
+    return sorted(rows, key=lambda r: -r["heldS"])
+
+
+def graphql_slot_reap(bound: float = GRAPHQL_SLOT_HOLD_MAX, now: float | None = None) -> list[dict[str, Any]]:
+    """Free every slot this process has held past BOUND (GRAPHQL_SLOT_HOLD_MAX): its file is closed, so the lock goes
+    and the next taker (the daemon's pr batch) gets it. The holder's own release later is a no-op. Returns who held
+    each: {"slot", "thread", "what", "heldS"}."""
+    now = time.monotonic() if now is None else now
+    with _SLOT_HOLDERS_LOCK:
+        for k in [k for k, h in _SLOT_HOLDERS.items() if _slot_gone(h)]:  # closed or dropped without release
+            _SLOT_HOLDERS.pop(k, None)
+        stale = [(k, h) for k, h in _SLOT_HOLDERS.items() if now - h["since"] > bound]
+        for k, _ in stale:
+            _SLOT_HOLDERS.pop(k, None)
+    out = []
+    for _, h in stale:
+        handle = h["handle"]()
+        if handle is None:
+            continue
+        with contextlib.suppress(OSError, ValueError):
+            handle.close()
+        out.append({"slot": h["slot"], "thread": h["thread"], "what": h["what"], "heldS": round(now - h["since"], 1)})
+    return out
+
+
+def graphql_slot_take(deadline: float | None, priority: bool = False, what: str = "") -> tuple[Any, int] | None:
     """A held GraphQL slot (its open file, its index) for this login on this host, waiting until DEADLINE
-    (time.monotonic()); None once it passes with every slot held. None deadline: try once. PRIORITY (the daemon's
+    (time.monotonic()); None once it passes with every slot held. None deadline: try once. WHAT names the holder
+    (graphql_slot_holders, graphql_slot_reap). PRIORITY (the daemon's
     reads) marks the wait (GRAPHQL_SLOT_WANT_FRESH): while the mark is fresh no other taker takes a free slot, so the
     daemon is never starved by the broker's `gh` reads polling the same locks."""
     d = BASE / GRAPHQL_SLOT_DIR
@@ -1995,6 +2055,10 @@ def graphql_slot_take(deadline: float | None, priority: bool = False) -> tuple[A
                     except OSError:
                         handle.close()
                         continue
+                    with _SLOT_HOLDERS_LOCK:
+                        _SLOT_HOLDERS[id(handle)] = {"handle": weakref.ref(handle), "slot": i, "what": what or "?",
+                                                     "thread": threading.current_thread().name,
+                                                     "since": time.monotonic()}
                     return handle, i
             if deadline is None or time.monotonic() >= deadline:
                 return None
@@ -2039,7 +2103,7 @@ def gh_graphql_slot_for(args: list[str]) -> Any:
             os.kill(int(holder), 0)  # the holder still runs: this call is nested inside its slot
             return None
     start = time.monotonic()
-    got = graphql_slot_take(start + GRAPHQL_SLOT_WAIT)
+    got = graphql_slot_take(start + GRAPHQL_SLOT_WAIT, what="gh " + " ".join(args[:2]))
     if got is None:
         graphql_slot_overflow(" ".join(args[:3]), time.monotonic() - start)
         return None
@@ -3454,6 +3518,7 @@ class Daemon:
         self.in_call: dict[str, Any] | None = None
         self.last_call: dict[str, Any] | None = None
         self.stall_said: dict[str, str] = {}  # kind -> the cause stall_cause last logged (said once per cause)
+        self.defer_why: dict[str, tuple[float, str]] = {}  # kind -> (when, why) its reads were last deferred
         self.failing: dict[str, Any] | None = None  # set while ticks raise: the latest error and since when
         self.tick_deadline = float("inf")  # time.monotonic() after which this tick starts no request
         self.deferred: set[str] = set()  # keys a tick ran out of time for: read first on the next tick
@@ -3598,12 +3663,48 @@ class Daemon:
                 "reads": {k: len(v) for k, v in self.read_done.items()},
                 "lastReadAt": {k: (round(v[-1], 3) if v else None) for k, v in self.read_done.items()},
                 "spentS": {k: round(v, 1) for k, v in sorted(phases.items(), key=lambda x: -x[1])},
-                "inCall": self.progress_call(), "lastCall": self.last_call}
+                "inCall": self.progress_call(), "lastCall": self.last_call, "slots": graphql_slot_holders()}
+
+    def free_slots(self) -> list[dict[str, Any]]:
+        """Free the GraphQL slots this process has held past GRAPHQL_SLOT_HOLD_MAX (graphql_slot_reap), each logged
+        once with its holder: the next pr batch gets the slot instead of waiting out every tick's budget for it."""
+        freed = graphql_slot_reap()
+        for r in freed:
+            log({"event": "slot-freed", **r, "bound": GRAPHQL_SLOT_HOLD_MAX,
+                 "why": f"held past {GRAPHQL_SLOT_HOLD_MAX:.0f} s; a slot is held per request"})
+        return freed
 
     def progress_call(self) -> dict[str, Any] | None:
         """The GitHub request in flight and its age (another thread may ask: the watchdog), or None."""
         call = self.in_call
         return None if call is None else {"what": call["what"], "ageS": round(time.monotonic() - call["since"], 1)}
+
+    def rest_hold(self) -> str:
+        """Why REST takes no more reads now, with its numbers (for deferral's sentence)."""
+        if self.mode("rest") == "stop":
+            left = (self.budget.get("rest") or {}).get("remaining", "?")
+            return f"is under its reserve ({left} left)"
+        return f"share is spent ({self.rest_spent()} of {self.rest_cap()} this hour)"
+
+    def deferral(self, kind: str) -> dict[str, Any] | None:
+        """Why KIND's reads are held back by a budget, not stuck: its keys this daemon deferred (DEFERRED), the
+        last reason it deferred them within READ_PROGRESS_WINDOW, the batch size, the REST share and the login's
+        latch. None when none of its keys is deferred, or none was for a reason this long. huge-blue, 2026-11-18
+        19:56Z: 740 keys deferred (REST share 134 of 150, a pr batch halved to 5 after RESOURCE_LIMITS_EXCEEDED,
+        the login latched) while the alarm said "Recent errors: none recorded" and offered a restart."""
+        n = sum(1 for k in self.deferred if k.startswith(kind + ":"))
+        why = self.defer_why.get(kind)
+        if not n or why is None or self.now - why[0] > READ_PROGRESS_WINDOW:
+            return None
+        latch = land_latch(self.now)
+        parts = [f"{n} {kind} reads deferred, last by {why[1]}", f"batch {self.batch.get(kind)}",
+                 f"REST share {self.rest_spent()} of {self.rest_cap()}"]
+        if latch is not None:
+            parts.append(f"the login's {'REST' if latch[0] == 'rest' else 'GraphQL'} latch holds until "
+                         f"{utc_clock(latch[1])}")
+        return {"deferred": n, "why": why[1], "batch": self.batch.get(kind), "restSpent": self.rest_spent(),
+                "restCap": self.rest_cap(), "latch": None if latch is None else utc_clock(latch[1]),
+                "text": "; ".join(parts)}
 
     def stall_cause(self, kind: str) -> dict[str, Any]:
         """Why KIND's waited data is old though the heartbeat is fresh (READ_PROGRESS_WINDOW's comment): "stalled"
@@ -3616,21 +3717,28 @@ class Daemon:
         tick = sum(v for k, v in spent.items() if k not in ("slot", "github")) or 0.0
         top = next((k for k in spent if k not in ("slot", "github")), None)
         slot, github = spent.get("slot", 0.0), spent.get("github", 0.0)
-        verdict = "backlog" if reads else "stalled"
+        held = self.deferral(kind)
+        # Stalled only with no read stored and no budget holding the reads back: that alone is a restart's to fix.
+        verdict = "backlog" if reads else "deferred" if held is not None else "stalled"
         window = int(READ_PROGRESS_WINDOW)
         parts = [f"{reads} {kind} reads stored in the last {window}s" if reads
                  else f"no {kind} read stored in the last {window}s"]
+        if held is not None:
+            parts.append(held["text"])
         if tick:
             parts.append(f"ticks spent {tick:.1f}s, most in {top} ({spent[top]:.1f}s)")
         if slot > 0 and (slot >= 1 or slot >= tick / 4):
-            parts.append(f"{slot:.1f}s waiting for one of the login's {graphql_slots()} GraphQL slots "
-                         f"(GitHub answered in {github:.1f}s)")
+            held = ", ".join(f"slot {r['slot']} by thread {r['thread']} ({r['what']}) for {r['heldS']:.0f}s"
+                             for r in p["slots"]) or "held outside this process"
+            parts.append(f"{slot:.1f}s waiting for one of the login's {graphql_slots()} GraphQL slots ({held}; "
+                         f"GitHub answered in {github:.1f}s)")
         if p["inCall"] is not None:
             parts.append(f"in flight: {p['inCall']['what']} for {p['inCall']['ageS']:.0f}s")
         elif p["lastCall"]:
             parts.append(f"last request: {p['lastCall'].get('what')}, {p['lastCall'].get('tookS')}s")
         return {"verdict": verdict, "reads": reads, "top": top, "slotS": round(slot, 1), "githubS": round(github, 1),
-                "inCall": p["inCall"], "lastCall": p["lastCall"], "text": f"{verdict}: " + "; ".join(parts)}
+                "inCall": p["inCall"], "lastCall": p["lastCall"], "deferral": held,
+                "text": f"{verdict}: " + "; ".join(parts)}
 
     def say_stall(self, kind: str, cause: dict[str, Any], age: Any, key: Any) -> None:
         """Log the stale cause once per (kind, verdict, top phase): what a session reads instead of restarting."""
@@ -3639,7 +3747,8 @@ class Daemon:
             return
         self.stall_said[kind] = mark
         log({"event": "stale-cause", "kind": kind, "age": age, "key": key,
-             **{k: cause[k] for k in ("verdict", "reads", "top", "slotS", "githubS", "inCall", "lastCall", "text")}})
+             **{k: cause[k] for k in ("verdict", "reads", "top", "slotS", "githubS", "inCall", "lastCall", "deferral",
+                                      "text")}})
 
     def note_spend(self, bucket: str, name: str, counted: int, points: int = 0) -> None:
         """One request in the spend log: NAME is a REST route template or a GraphQL query name; COUNTED is 1 when
@@ -3780,6 +3889,11 @@ class Daemon:
         alarm and `restart` say it instead of calling old data a fault."""
         out = {}
         for kind, age_s in (getattr(self, "stale_waited", None) or {}).items():
+            if isinstance(age_s, (int, float)) and age_s > STALE_DATA_AFTER and self.quota_hold(kind) is None:
+                held = self.deferral(kind)
+                if held is not None:  # a budget defers the reads: a restart cannot read sooner (daemon_starved)
+                    out[kind] = {"why": held["text"], "quota": True, "deferred": held["deferred"]}
+                    continue
             if isinstance(age_s, (int, float)) and age_s > STALE_DATA_AFTER:
                 hold = self.quota_hold(kind)
                 if hold is not None:
@@ -3808,9 +3922,11 @@ class Daemon:
         quota = f" Quota: {hold[0]}." if hold else ""
         cause = self.stall_cause(kind)
         self.say_stall(kind, cause, age_s, where)
+        advice = STALE_DEFERRED_ADVICE if cause["verdict"] == "deferred" else STALE_RESTART_ADVICE
+        said = "" if cause["verdict"] == "deferred" and errors == "none recorded" else f" Recent errors: {errors}."
         text = (f"{level.upper()} glaeda-gh on {policy_host()}: {kind} data that waits are blocked on is {age_s}s old "
                 f"(over {STALE_DATA_AFTER}s; oldest {key_name(where) if where != '?' else '?'}) while its heartbeat is "
-                f"fresh.{quota} Reads: {cause['text']}. Recent errors: {errors}. {STALE_RESTART_ADVICE}")
+                f"fresh.{quota} Reads: {cause['text']}.{said} {advice}")
         return level, text, {"kind": kind, "age": age_s, "key": where, "cause": cause["verdict"],
                              **({"quota": hold[0]} if hold else {})}
 
@@ -3850,6 +3966,10 @@ class Daemon:
         # Only this daemon's own reads (stall_cause "backlog") make it one key: a cache another process wrote (a wait's
         # direct read) is fresh data, not a reader that works.
         reading = data.get("cause", "backlog") == "backlog"
+        if data.get("cause") == "deferred":
+            # The reads are held back by a budget (deferral): a fresh daemon would defer them the same way, and drop
+            # every land judgment in flight besides. The alarm says what holds them.
+            return level, text, {**data, "valve": "deferred"}
         if reading and isinstance(fresh, (int, float)) and fresh < STALE_DATA_AFTER:
             # The daemon reads its other waited keys (one of them is FRESH s old): this one key is stale, and a restart
             # would only drop every land judgment in flight. huge-blue, 2026-11-18: six valve restarts in six hours,
@@ -4095,6 +4215,12 @@ class Daemon:
             return True  # not seen yet, or reset since: a full hour's quota
         return int(seen.get("remaining") or 0) - cost >= self.policy["floors"]["rest"][0]
 
+    def stopped_why(self, bucket: str) -> str:
+        """Why richness() says BUCKET is stopped (-1): its reserve, or the daemon's REST share."""
+        if self.mode(bucket) == "stop":
+            return "under its reserve"
+        return f"share spent ({self.rest_spent()} of {self.rest_cap()})" if bucket == "rest" else "stopped"
+
     def richness(self, bucket: str) -> float:
         """What this bucket can still spend per second until its own reset, above its reserve; -1
         while it is stopped. A bucket not seen yet, or past its reset, counts as a full hour's quota."""
@@ -4151,8 +4277,11 @@ class Daemon:
             low = self.mode(current) != "normal" and self.mode(OTHER[current]) == "normal"
             into_low = self.mode(OTHER[current]) != "normal" and self.mode(current) == "normal"
             if there >= 0 and (here < 0 or low or (not into_low and there > here * SWITCH_MARGIN)):
+                # richness's -1 is "stopped", not a rate: the line said "perMinute rest -60.0" (huge-blue 2026-11-18)
                 log({"event": "route", "kind": kind, "from": current, "to": OTHER[current],
-                     "perMinute": {current: round(here * 60, 1), OTHER[current]: round(there * 60, 1)},
+                     "perMinute": {b: round(r * 60, 1) for b, r in ((current, here), (OTHER[current], there))
+                                   if r >= 0},
+                     **({"stopped": {current: self.stopped_why(current)}} if here < 0 else {}),
                      **({"readCost": {b: round(c, 2) for b, c in cost.items()}} if cost else {})})
                 self.paths[kind] = current = OTHER[current]
         return current
@@ -4331,16 +4460,19 @@ class Daemon:
         # One of the login's GraphQL slots on this host (graphql_slot_take), shared with every `glaeda-gh gh` read and every
         # other process's daemon or direct read, waited for within the tick's budget and held only while in flight.
         # The daemon's take wants the slot (priority): the next one that frees is its, ahead of the CLI's polling.
+        what = (f"{method} {route_of(method, path)}" if bucket == "rest"
+                else f"graphql {self.gql_reason or ''}").strip()
         waited_at = time.monotonic()
-        slot = graphql_slot_take(min(self.tick_deadline, time.monotonic() + GRAPHQL_SLOT_WAIT), priority=True) \
-            if bucket == "graphql" else None
+        slot = graphql_slot_take(min(self.tick_deadline, time.monotonic() + GRAPHQL_SLOT_WAIT), priority=True,
+                                 what=f"daemon {what}") if bucket == "graphql" else None
         if bucket == "graphql":
             self.note_spent("slot", time.monotonic() - waited_at)
         if bucket == "graphql" and slot is None:
+            held = "; ".join(f"slot {r['slot']} by thread {r['thread']} ({r['what']}) for {r['heldS']:.0f}s"
+                             for r in graphql_slot_holders()) or "by other processes"
             raise WatchError(f"held: all {graphql_slots()} GraphQL slots of this login on this host are in flight "
-                             f"({GRAPHQL_SLOT_DIR}/); not sent")
-        what = f"{method} {route_of(method, path) if bucket == 'rest' else 'graphql ' + str(self.gql_reason or '')}"
-        self.in_call = {"what": what.strip(), "since": time.monotonic()}
+                             f"({GRAPHQL_SLOT_DIR}/: {held}); not sent")
+        self.in_call = {"what": what, "since": time.monotonic()}
         try:
             status, h, raw = self.transport(method, API + path, headers, raw_body)
         except BaseException:
@@ -4350,11 +4482,10 @@ class Daemon:
         finally:
             took = time.monotonic() - self.in_call["since"]
             self.note_spent("github", took)
-            self.last_call = {"what": what.strip(), "tookS": round(took, 1), "at": round(self.now, 3)}
+            self.last_call = {"what": what, "tookS": round(took, 1), "at": round(self.now, 3)}
             self.in_call = None
             if slot is not None:
-                with contextlib.suppress(OSError):
-                    slot[0].close()
+                graphql_slot_release(slot[0])
         if charged and status == 304:
             self.charge_rest(minute, -1)
         if bucket == "rest":  # GraphQL's points are known from its answer (graphql)
@@ -5332,8 +5463,11 @@ class Daemon:
         first on a tie (two never-read keys). Aging, not an absolute rank: an unread key's place only improves
         while read keys move back, so waiters cannot starve the rest."""
         carried = self.deferred_before
+        # Among the deferred too, a key a wait is blocked on (an interactive wait, a due land) counts WAIT_PRIORITY
+        # longer deferred: huge-blue 2026-11-18 19:56Z, 740 deferred keys, mostly plain watches, ahead of every wait.
         return sorted(entries, key=lambda e: (not self.wait_confirms(e), e["key"] not in carried,
-                                              carried.get(e["key"], 0.0),
+                                              carried.get(e["key"], 0.0) - (WAIT_PRIORITY if e["key"] in carried
+                                                                            and self.waited(e) else 0),
                                               self.last_read(e) - (WAIT_PRIORITY if self.waited(e) else 0),
                                               not self.waited(e)))
 
@@ -5633,15 +5767,22 @@ class Daemon:
             write_json(BASE / CONSUMERS_FILE, {**doc, "at": self.now})
             self.saved_consumers = text
 
-    def defer(self, entries: list[dict]) -> None:
+    def defer(self, entries: list[dict], why: str = "") -> None:
+        """Read ENTRIES first next tick. WHY (the budget, pace or limit that held them) is kept per kind for
+        deferral(): old waited data behind a deferral is the budget's, not a stuck reader's."""
         self.deferred.update(e["key"] for e in entries)
         for e in entries:
             self.refund(e["key"])
+        if why:
+            for kind in {split_key(e["key"])[0] for e in entries if ":" in e["key"]}:
+                self.defer_why[kind] = (self.now, why)
 
     def tick(self, now: float | None = None) -> dict:
         self.now = time.time() if now is None else now
         self.clock_real = now is None
         self.tick_deadline = time.monotonic() + TICK_BUDGET
+        with contextlib.suppress(Exception):  # never stops a tick
+            self.free_slots()
         if self.started_tick is None:
             self.started_tick = self.now
         self.errors = []
@@ -5721,7 +5862,7 @@ class Daemon:
                 with self.calling(*caller_of(e["key"]), waiter_of(e)), self.phase("read rest"):
                     self.rest_fetch[e["key"].split(":", 1)[0]](e)
             except OutOfTime:
-                self.defer(over_rest[i:])
+                self.defer(over_rest[i:], f"the tick's {TICK_BUDGET} s read budget ran out")
                 if len(self.sent) > sent:  # cut off partway: it had its turn, and queues as a new deferral
                     self.rest_tried[e["key"]] = self.now
                     self.deferred_since.pop(e["key"], None)
@@ -5834,14 +5975,14 @@ class Daemon:
         is not stopped (and they did not just come from it); the rest go first next tick."""
         came = {e["key"] for e in spilled}
         if self.mode("graphql") == "stop":
-            return self.defer(left)
+            return self.defer(left, f"REST {self.rest_hold()} and GraphQL is stopped (under its reserve)")
         held = [e for e in left if e["key"] in came]
         for kind in ("pr", "comment", "run", "head"):
             mine = [e for e in left if e["key"].startswith(kind + ":") and e["key"] not in came]
             if mine:
                 log({"event": "fallback", "to": "graphql", "kind": kind, "entries": len(mine)})
                 held += self.batched(kind, mine, self.graphql_fetch[kind])
-        self.defer(held)
+        self.defer(held, f"REST {self.rest_hold()} and GraphQL stopped partway")
 
     def finish_tick(self, entries: list[dict], prs: list[dict], runs: list[dict], comments: list[dict],
                     heads: list[dict]) -> dict:
@@ -6276,7 +6417,9 @@ class Daemon:
             if not self.gql_room():
                 # Over the per-minute ceiling: the rest wait, first next tick. Not REST's to read: GraphQL is not
                 # spent, only paced, and a REST spill of a whole post-reset refresh would be the same burst there.
-                self.defer(chunk + [e for c in queue for e in c])
+                self.defer(chunk + [e for c in queue for e in c],
+                           f"the GraphQL pace: {self.gql_minute_points()} of "
+                           f"{self.policy.get('graphqlPerMinute', GRAPHQL_PER_MINUTE)} points this minute")
                 if getattr(self, "gql_paced", None) is None:
                     self.gql_paced = kind
                 return []
@@ -6290,7 +6433,7 @@ class Daemon:
                 spilled, self.spill = self.spill, []
                 limited, self.limited = self.limited, []
             except OutOfTime:
-                self.defer(chunk + [e for c in queue for e in c])
+                self.defer(chunk + [e for c in queue for e in c], f"the tick's {TICK_BUDGET} s read budget ran out")
                 return []
             except Exception as failure:  # noqa: BLE001  one bad batch must not stop the rest
                 # A bug on one entry's answer (an AttributeError on a null node, huge-blue 2026-11-11) used to drop the
@@ -11545,8 +11688,10 @@ class Watchdog:
 
     def __init__(self, limit: float, clock: Callable[[], float] = time.monotonic,
                  exit: Callable[[int], Any] = os._exit, backstop: float | None = None,
-                 where: Callable[[], dict | None] | None = None) -> None:
+                 where: Callable[[], dict | None] | None = None,
+                 reap: Callable[[], Any] | None = None) -> None:
         self.limit, self.clock, self.exit, self.backstop = limit, clock, exit, backstop
+        self.reap = reap  # run on every check: frees slots held past their bound (Daemon.free_slots), even mid-tick
         self.where = where  # what the loop was doing (Daemon.progress: the request in flight and its age), logged
         self.last = clock()
 
@@ -11557,6 +11702,9 @@ class Watchdog:
 
     def check(self) -> bool:
         """True (after calling exit) when the loop is overdue."""
+        if self.reap is not None:
+            with contextlib.suppress(Exception):
+                self.reap()
         lag = self.clock() - self.last
         if lag <= self.limit:
             return False
@@ -11736,7 +11884,8 @@ def serve(foreground_ok: bool = False) -> int:
     daemon = Daemon()
     log({"event": "start", "pid": os.getpid()})
     watchdog = Watchdog(WATCHDOG_AFTER, backstop=WATCHDOG_BACKSTOP,
-                        where=lambda: {"inCall": daemon.progress_call(), "lastCall": daemon.last_call})
+                        where=lambda: {"inCall": daemon.progress_call(), "lastCall": daemon.last_call},
+                        reap=lambda: daemon.free_slots())  # (late-bound: a check's error is suppressed)
     watchdog.start()
     last = None
     while True:
@@ -17690,8 +17839,7 @@ def gh_cache_fill(real: str, args: list[str], key: str, repo: str | None, ran: l
         finally:
             if slot is not None:
                 os.environ.pop(GRAPHQL_SLOT_ENV, None)
-                with contextlib.suppress(OSError):
-                    slot.close()
+                graphql_slot_release(slot)
         ran.append(rc)
         with contextlib.suppress(Exception):
             long = words[:1] == ["api"] and len(words) > 1 and bool(GH_CACHE_LONG_RE.match(words[1]))
