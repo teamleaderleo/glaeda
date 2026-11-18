@@ -4576,7 +4576,7 @@ def default_families(role: str = "fleet-mini") -> list[Family]:
                reference_root=FLEET_ROOT, platform="macos"),
         # Lima instances (LIMA_VMS: ~/.lima/<name>, the Linux worker VMs and their base), judged like Tart VMs.
         Family(LIMA_VMS, HOME / ".lima", True, "a stopped VM nobody claims: the next limactl clone makes it again",
-               skip=LIMA_SKIP, skip_prefixes=(".",), owner="Lima (limactl create, limactl clone)",
+               skip_prefixes=(".", "_"), owner="Lima (limactl create, limactl clone)",
                rebuild_minutes=30, min_idle_hours=TART_VM_IDLE_HOURS, reference_root=FLEET_ROOT, platform="macos"),
         # cmux's journey harness keeps a build per job and its fetch scratch here (scripts/journeys/build_cache.py,
         # ~/.cache/cmux-journeys/{builds,fetch}/<entry>). As one ~/.cache item it read "unchecked" (an app bundle is too
@@ -6704,6 +6704,8 @@ def keep_verdict(fam: "Family", path: Path) -> str:
         return apple_build_verdict(path)
     if fam.id in (TART_VMS, LIMA_VMS) and os.path.lexists(path / ROLE_KEEP_MARKER):
         return f"claimed ({ROLE_KEEP_MARKER} in it)"
+    if fam.id == LIMA_VMS and path.name in LIMA_BASE_NAMES:
+        return "the Linux worker VMs' base (ai.manaflow.cmux-linux-vm clones every slot from it)"
     return ""
 
 
@@ -9077,11 +9079,13 @@ def tart_vm_held(path: Path, cmds: str) -> str:
 # "and you guys haven't even set up linux vms on any of them... glaeda many months ago the whole point was to have
 # that"). Like a Tart VM, a stopped instance nothing touched for TART_VM_IDLE_HOURS goes: a running hostagent (its
 # ha.pid names a live process), a limactl command naming it, an open file, a fleet lease naming its path or a
-# .glaeda-keep.json claim in it (the supervisor writes one into each slot and the base) keeps it. Lima's own _config,
-# _disks and _networks and dot entries are never items, and a ~/.lima that is a symlink or resolves outside HOME is
-# never walked (tart_root_safe).
+# .glaeda-keep.json claim in it (the supervisor writes one into each slot and the base) keeps it, and the base
+# (LIMA_BASE_NAMES) stays by name too. Lima's own entries (_config, _disks, _networks: every "_" name) and dot
+# entries are never items, and a ~/.lima that is a symlink or resolves outside HOME is never walked (tart_root_safe).
 LIMA_VMS = "lima-vms"
-LIMA_SKIP = ("_config", "_disks", "_networks")
+# the base every slot is cloned from: an APFS clonefile clone reads none of its blocks, so its dates never move and
+# a missing claim would let --dead take it after TART_VM_IDLE_HOURS; it stays by name as well as by its claim
+LIMA_BASE_NAMES = frozenset({"cmux-linux-bake"})
 LIMA_VM_RUN = re.compile(r"(?:^|/)(?:limactl|lima)\s")
 ROOT_SAFE_FAMILIES = TART_FAMILIES | {LIMA_VMS}  # walked only when tart_root_safe(root)
 

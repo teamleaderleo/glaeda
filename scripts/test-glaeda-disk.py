@@ -12933,8 +12933,11 @@ class DeadItemsTest(unittest.TestCase):
         hostagent or a limactl command naming one keeps it; a stopped unclaimed one idle past the VM window goes."""
         old = self.lima_vm("cmux-old-lvm-9", 26)
         recent = self.lima_vm("cmux21-lvm-1", 1)
-        claimed = self.lima_vm("cmux-linux-bake", 26)
-        (claimed / gd.ROLE_KEEP_MARKER).write_text('{"owner": "ai.manaflow.cmux-linux-vm", "why": "base"}')
+        claimed = self.lima_vm("cmux21-lvm-5", 26)
+        (claimed / gd.ROLE_KEEP_MARKER).write_text('{"owner": "ai.manaflow.cmux-linux-vm", "why": "slot"}')
+        self.age(claimed, 26 * 24)
+        base = self.lima_vm("cmux-linux-bake", 26)  # no claim: clones never move its dates, so its name keeps it
+        racer = self.lima_vm("cmux21-lvm-4", 26)  # stopped at survey; its hostagent starts before the delete
         running = self.lima_vm("cmux21-lvm-0", 26)
         (running / "ha.pid").write_text(f"{os.getpid()}\n")
         self.age(running, 26 * 24)
@@ -12944,33 +12947,40 @@ class DeadItemsTest(unittest.TestCase):
         dead.wait()
         (stale / "ha.pid").write_text(f"{dead.pid}\n")
         self.age(stale, 26 * 24)
-        for internal in ("_config", "_disks", "_networks", ".hidden"):
+        for internal in ("_config", "_disks", "_networks", "_a_future_lima_dir", ".hidden"):
             (self.home / ".lima" / internal).mkdir()
             self.age(self.home / ".lima" / internal, 26 * 24)
         fam = self.lima_family()
         self.assertEqual({p.name for p in gd.candidates(fam)},
-                         {"cmux-old-lvm-9", "cmux21-lvm-1", "cmux-linux-bake", "cmux21-lvm-0", "cmux21-lvm-2",
-                          "cmux21-lvm-3"}, "Lima's own _config, _disks, _networks and dot entries are never items")
+                         {"cmux-old-lvm-9", "cmux21-lvm-1", "cmux21-lvm-5", "cmux-linux-bake", "cmux21-lvm-4",
+                          "cmux21-lvm-0", "cmux21-lvm-2", "cmux21-lvm-3"},
+                         "Lima's own _ entries (_config, _disks, _networks, ...) and dot entries are never items")
         cmds = "/opt/homebrew/bin/limactl start cmux21-lvm-2 --tty=false\n"
         with mock.patch.object(gd, "process_evidence", return_value=([], cmds)):
             items = {Path(i.path).name: i for i in gd.survey([fam], 12, 0)}
         self.assertEqual(items["cmux-old-lvm-9"].verdict, "reclaimable", items["cmux-old-lvm-9"].reasons)
         self.assertEqual(items["cmux21-lvm-3"].verdict, "reclaimable", items["cmux21-lvm-3"].reasons)
         self.assertEqual(items["cmux21-lvm-1"].verdict, "recent")
-        self.assertEqual(items["cmux-linux-bake"].verdict, "kept")
+        self.assertEqual(items["cmux21-lvm-5"].verdict, "kept")
+        self.assertEqual(items["cmux-linux-bake"].verdict, "kept", items["cmux-linux-bake"].reasons)
+        self.assertEqual(items["cmux21-lvm-4"].verdict, "reclaimable", items["cmux21-lvm-4"].reasons)
         self.assertEqual(items["cmux21-lvm-0"].verdict, "in-use")
         self.assertIn(f"Lima runs it (hostagent pid {os.getpid()} in ha.pid is live)", items["cmux21-lvm-0"].reasons)
         self.assertEqual(items["cmux21-lvm-2"].verdict, "in-use")
         self.assertIn(gd.LIMA_VMS, gd.dead_family_ids())
+        # the racer's hostagent starts between the survey and the delete (its dates aged back, so only the ha.pid
+        # re-read in apply can keep it)
+        (racer / "ha.pid").write_text(f"{os.getpid()}\n")
+        self.age(racer, 26 * 24)
         receipt = self.root / "receipt.jsonl"
         with contextlib.redirect_stdout(io.StringIO()), mock.patch.object(gd, "process_evidence",
                                                                           return_value=([], "")):
-            gd.apply([items["cmux-old-lvm-9"], items["cmux21-lvm-3"], items["cmux21-lvm-0"]], {fam.id: fam},
+            gd.apply([items["cmux-old-lvm-9"], items["cmux21-lvm-3"], items["cmux21-lvm-4"]], {fam.id: fam},
                      receipt, None, 12)
         self.assertFalse(old.exists())
         self.assertFalse(stale.exists())
-        self.assertTrue(running.exists(), "the hostagent's pid is read again right before the delete")
-        for vm in (recent, claimed, named):
+        self.assertTrue(racer.exists(), "the hostagent's pid is read again right before the delete")
+        for vm in (recent, claimed, base, running, named):
             self.assertTrue(vm.exists())
 
     def test_a_symlinked_or_out_of_home_lima_root_is_never_walked(self) -> None:
