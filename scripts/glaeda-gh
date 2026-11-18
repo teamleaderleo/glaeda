@@ -8106,15 +8106,22 @@ LAND_WAIT_STUCK = 4 * 3600.0
 # (rerun_failed; its checks' wait after it is a wait_pr above). interim-coord, 2026-11-18: "A refusal whose next step
 # is a wait (a check queued, pending or cancelled-and-rerun) should keep waiting up to a deadline, with no strike; only
 # a real red or a hold counts toward the 3" (cmux#46183, #46220: cancelled shards a rerun clears). Keyed on the action's
-# kind, never its words. Each (kind, head) has one budget (e["waitBudget"], wait_spent): from its first such judgment,
+# kind, never its words. Each head has one budget over all these waits (e["waitBudget"], wait_spent), so kinds that
+# alternate (a review running while reads flap unreadable: wait_comment, retry, wait_comment...) never restart it
+# (review of glaeda#2174, F1): from its first such judgment at the head,
 # sized max(the kind's LAND_WAIT_DEADLINE, twice the action's own timeout_s, so a wait always gets judged again at
-# least once); the judgment that finds it spent stops "<kind>_deadline", naming the wait that ran out. A new head or
-# kind starts a new budget, an "ok" drops it. A fetch is work, not a wait: LAND_RETRY_STREAK_STOP and step_refused
+# least once); the judgment that finds it spent stops "<kind>_deadline", naming the wait that ran out. A new head
+# starts a new budget, an "ok" drops it. A fetch is work, not a wait: LAND_RETRY_STREAK_STOP and step_refused
 # still bound it. Only a "stop" or "command" (a red not excused, a hold, a BLOCK, a teammate's PR, a conflict) and the
 # remaining steps (repin, review, retarget) count toward or stop at LAND_STREAK_STOP.
 LAND_WAIT_DEADLINE = {"wait_comment": 7200.0, "retry": 7200.0, "rerun_failed": 7200.0}
 LAND_WAIT_WHAT = {"wait_comment": "a review verdict at the head", "retry": "a judgment merge_hold could not make",
                   "rerun_failed": "the rerun of the cancelled jobs"}
+# A cancelled job is rerun at most this many times per (head, run) (e["reruns"], take's rerun_failed): its rerun's checks
+# can finish within minutes, so the 2 h budget alone let a job cancelled every time (a concurrency group, a timeout
+# reported as cancelled) be rerun dozens of times (review of glaeda#2174, F2). The next names it and stops
+# "rerun_failed_cap". A new head starts the count again.
+LAND_RERUN_CAP = 3
 # An --after PR whose predecessor's land stopped keeps waiting for it this long (consider, after_stopped), telling its
 # requester once: landing the predecessor again, or merging it, resumes the whole chain, and nobody re-queues the PRs
 # behind it (before, each stopped at once: cmux#46237, #46217, #46236 behind #46157, #46183, #46220). Past it, it
@@ -8948,7 +8955,7 @@ class LandQueue:
             e.update(state="queued", head="", explain=None, action=None, streak=None, wakeAt=None,
                      wait=None, seen=None, seenHead="", mergeSha="", stop=None, preStepHead="",
                      lastAction=None, reviewed=[], updateSent=None, updateDeferred=None, waitRefused=None,
-                     waitBudget=None, afterStopped=None)
+                     waitBudget=None, afterStopped=None, reruns=None)
             self.history(e, "queued", by=e["requester"], via=e["requesterFrom"], after=",".join(e["after"]))
         else:
             self.history(e, "updated", by=e["requester"], after=",".join(e["after"]))
@@ -9406,6 +9413,13 @@ class LandQueue:
                 return
             if ae and ae["state"] == "stopped" and stopped is None:
                 stopped = (a, ae)
+            if ae is None and (e.get("afterStopped") or {}).get("key") == a:
+                # It stopped, and its entry aged out (LAND_KEEP) before this one's wait ran out: nothing would ever
+                # resume or stop this one (review of glaeda#2174, F3)
+                self.stop(e, "after_stopped", f"{key_name(a)}, which it lands after, stopped and is no longer queued "
+                          "(its land entry aged out)",
+                          f"glaeda-gh land {key_name(a)} && glaeda-gh land {key_name(e['key'])} --after {key_name(a)}")
+                return
             pending.append(a)
         if stopped and self.after_stopped(e, *stopped):
             return
@@ -9903,12 +9917,12 @@ class LandQueue:
         """One more judgment naming the wait ACT at HEAD (LAND_WAIT_DEADLINE's comment). Under the lock. It breaks the
         identical-refusal streak and counts toward nothing; True when the wait's budget is spent and E is stopped."""
         kind = str(act.get("kind"))
-        key = f"{kind}|{head}"
+        key = head  # one budget per head, whatever kind of wait (LAND_WAIT_DEADLINE's comment)
         size = max(LAND_WAIT_DEADLINE[kind], 2 * land_seconds(act.get("timeout_s"), 0.0, 0.0))
         b = e.get("waitBudget") or {}
         if b.get("key") != key:
             b = {"key": key, "since": self.now, "deadline": size, "n": 0}
-        b.update(code=str(answer.get("code") or ""), n=int(b.get("n") or 0) + 1,
+        b.update(kind=kind, code=str(answer.get("code") or ""), n=int(b.get("n") or 0) + 1,
                  deadline=max(float(b.get("deadline") or 0), size))
         e["waitBudget"] = b
         e["streak"] = None
@@ -10033,6 +10047,17 @@ class LandQueue:
                               land_trim(answer.get("next")))
                 return
             with self.lock:
+                sent = {k: v for k, v in (e.get("reruns") or {}).items() if k.startswith(f"{head}|")}
+                capped = [r for r in runs if int(sent.get(f"{head}|{r}") or 0) >= LAND_RERUN_CAP]
+                if capped:
+                    self.stop(e, "rerun_failed_cap",
+                              f"run {', '.join(map(str, capped))} was rerun {LAND_RERUN_CAP} times at {head[:12]} and "
+                              f"is still cancelled: {land_trim(answer.get('reason'))}",
+                              f"gh run view {capped[0]} -R {repo}")
+                    return
+                for r in runs:  # counted before the send: a restart mid-send counts it
+                    sent[f"{head}|{r}"] = int(sent.get(f"{head}|{r}") or 0) + 1
+                e["reruns"] = sent
                 self.claim(e, "rerun_failed", runs=runs)
             results = [self.call([gh, "run", "rerun", str(r), "--failed", "-R", repo], LAND_GH_DEADLINE, e)
                        for r in runs]
