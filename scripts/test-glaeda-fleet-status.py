@@ -419,6 +419,12 @@ class SafetyTests(unittest.TestCase):
         self.assertIn("never_touch", f["action"]["note"])
         self.assertTrue(next(m for m in doc["members"] if m["name"] == "coordinator")["never_touch"])
 
+    def test_a_dotted_installation_token_is_redacted_whole(self):
+        """GitHub's installation tokens now carry "." and "-" (about 383 characters): none of it may stay."""
+        token = "ghs_" + ".".join(["A1b-C_d" * 9] * 5) + "-x" * 30
+        self.assertEqual(len(token), 383)
+        self.assertEqual(fs.clean(f"mint gave {token} here", limit=1000), "mint gave [redacted] here")
+
     def test_secrets_and_home_paths_never_reach_the_document(self):
         doc = build(check=src({"issues": [{"host": "mini-a", "area": "worker",
                                            "detail": "token=abc123 ghp_" + "x" * 30 + " in /Users/alice/secret",

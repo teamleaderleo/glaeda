@@ -58,6 +58,8 @@ gg.DAEMON_CONFIG = Path(tempfile.gettempdir()) / f"glaeda-gh-test-no-daemon-conf
 gg.FLEET_POLICY = Path(tempfile.gettempdir()) / f"glaeda-gh-test-no-fleet-policy-{os.getpid()}.json"
 # Nor may a host's own pacer hear about the tests' secondary 403s.
 gg.PACE_CLI = Path(tempfile.gettempdir()) / f"glaeda-gh-test-no-pacer-{os.getpid()}" / "gh"
+# Nor may a host's own ci-watch App (~/.config/gh-app-tokens) take the tests' reads.
+gg.APP_POOL_DIR = Path(tempfile.gettempdir()) / f"glaeda-gh-test-no-app-pool-{os.getpid()}"
 # Nor may a host's own expected-contexts.json add contexts the tests do not post.
 gg.EXPECTED_CONFIG = Path(tempfile.gettempdir()) / f"glaeda-gh-test-no-expected-{os.getpid()}.json"
 # Nor may a test's alarm reach the host's coordinator, or its notices.
@@ -72,6 +74,8 @@ _NOTICES = tempfile.TemporaryDirectory(prefix="glaeda-gh-test-notices-")  # remo
 gg.NOTICES_DIR = Path(_NOTICES.name)
 
 TOKEN = "ghp_faketoken_must_never_touch_disk"
+# An installation token as GitHub mints them since 2026-11: 383 characters with "." and "-" in them.
+DOTTED_APP_TOKEN = "ghs_" + ".".join(["A1b-C_d" * 9] * 5) + "-x" * 30
 NOW = float(int(time.time()))  # watch files carry real mtimes
 
 
@@ -2285,6 +2289,21 @@ class DaemonTest(Base):
         self.assertTrue(gg.TOKEN_RE.fullmatch("gho_" + "a" * 36))
         self.assertTrue(gg.TOKEN_RE.fullmatch("github_pat_" + "A1_" * 20))
         self.assertFalse(gg.TOKEN_RE.fullmatch("To get started with GitHub CLI, please run: gh auth login"))
+
+    def test_a_dotted_installation_token_is_a_token(self) -> None:
+        """GitHub's installation tokens grew to about 383 characters with "." and "-" in them (leo-workspace
+        gh_app_token.TOKEN_RE, ghs_[A-Za-z0-9._-]{20,2048}): a daemon handed one must not call it "not a GitHub
+        token", and AppPool's mint must keep it."""
+        token = DOTTED_APP_TOKEN
+        self.assertEqual(len(token), 383)
+        self.assertTrue(gg.TOKEN_RE.fullmatch(token))
+        with mock.patch.object(gg, "find_gh", return_value="/bin/gh"), mock.patch.object(
+                gg, "run_bounded", return_value=subprocess.CompletedProcess([], 0, token + "\n", "")):
+            self.assertEqual(gg.gh_token(), token)
+        pool = gg.AppPool(owners=lambda: ["o"], ready=lambda: True)
+        with mock.patch.object(gg, "app_pool_tool", return_value=Path("/x/gh_app_token.py")), mock.patch.object(
+                gg, "run_bounded", return_value=subprocess.CompletedProcess([], 0, token + "\n", "")):
+            self.assertEqual(pool.token("o"), token)
 
     def test_bad_keys_are_refused(self) -> None:
         for kind, text in (("pr", "o/r"), ("pr", "o/r#x"), ("run", "o/r"), ("pr", "o/r#1) { x }")):
@@ -5942,6 +5961,7 @@ sys.modules["glaeda_gh"] = gg
 loader.exec_module(gg)
 gg.BASE = Path(sys.argv[3])
 gg.UPSTREAM_CONFIG = Path(sys.argv[3]) / "no-upstream.json"
+gg.APP_POOL_DIR = Path(sys.argv[3]) / "no-app-pool"
 """
 
 
@@ -10607,6 +10627,17 @@ class BrokerLogTest(BrokerBase):
         text = Path(os.environ["CMUX_GH_LOG"]).read_text()
         self.assertNotIn(token, text)
         self.assertIn("[redacted]", text)
+
+    def test_a_dotted_installation_token_is_dropped_whole(self) -> None:
+        """An installation token with "." and "-" (about 383 characters): a pattern that stopped at the first "."
+        left most of it in the shared log."""
+        token = DOTTED_APP_TOKEN
+        self.assertEqual(gg.BROKER_SECRET_RE.sub("[redacted]", f"api repos/o/{token}"), "api repos/o/[redacted]")
+        self.run_gh(["api", f"repos/o/{token}/contents/x"])
+        text = Path(os.environ["CMUX_GH_LOG"]).read_text()
+        for piece in token.split("."):
+            self.assertNotIn(piece[4:] if piece.startswith("ghs_") else piece, text)
+        self.assertNotIn("ghs_", text)  # the log drops a path it cannot read, or redacts it: never a piece
 
     def test_a_newline_in_a_subcommand_slot_cannot_forge_a_log_line(self) -> None:
         forged = "2026-10-21T00:00:00Z other-session pr view pr:o/r#1"
@@ -19865,6 +19896,182 @@ class ConfirmedUpdatedAtTest(Base):
                          {"updatedAtAt": 5.0, "data": {"headRefOid": "a", "updatedAt": "y"}})
         for node in ({"headRefOid": "b", "updatedAt": "y"}, {"headRefOid": "a"}, None):
             self.assertEqual(gg.confirmed_updated({"data": data}, node, 5.0), {})
+
+
+APP_TOKEN = "ghs_" + "a" * 36  # the ci-watch App's installation token in these tests
+
+
+class AppPoolTest(Base):
+    """Leo, 2026-11-18: "you use the apps where they're useful, and it just does it automatically, so no agents
+    necessarily even have to think about it." gh-app-roles.json gives glaeda-gh to the ci-watch role, but this daemon
+    calls GitHub itself with `gh auth token`, so its reads stayed on the login. A repo read of an owner the Apps are
+    on now goes on the ci-watch App when this host holds it, and on the login exactly as before otherwise."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.minted: list[str] = []
+        self.app_answers: list[tuple[int, dict, bytes]] = []  # answers the App gives, in turn; else a 200
+        self.app_calls: list[tuple[str, str]] = []
+        self.ready = True
+        self.mint_token: str | None = APP_TOKEN
+        self.login_reads = 0
+
+        def mint(owner: str) -> str | None:
+            self.minted.append(owner)
+            return self.mint_token
+
+        def login_token() -> str:
+            self.login_reads += 1
+            return TOKEN
+
+        self.pool = gg.AppPool(mint=mint, owners=lambda: ["manaflow-ai"], ready=lambda: self.ready,
+                               clock=lambda: self.daemon.clock())
+        self.daemon = gg.Daemon(transport=self.transport, token=login_token, controller=None, app_pool=self.pool)
+        self.daemon.clock_real = False
+        self.daemon.now = NOW
+
+    def transport(self, method: str, url: str, headers: dict, body: bytes | None) -> tuple[int, dict, bytes]:
+        if headers["Authorization"] == f"Bearer {APP_TOKEN}":
+            self.app_calls.append((method, url))
+            if self.app_answers:
+                return self.app_answers.pop(0)
+            return 200, {"x-ratelimit-limit": "15000", "x-ratelimit-remaining": "14000",
+                         "x-ratelimit-reset": str(int(NOW + 1800)), "x-ratelimit-resource": "core"}, b'{"app": true}'
+        return self.gh(method, url, headers, body)
+
+    def test_a_repo_read_goes_on_the_app_and_costs_the_login_nothing(self) -> None:
+        status, _, doc = self.daemon.request("GET", "/repos/manaflow-ai/cmux/pulls/1")
+        self.assertEqual((status, doc), (200, {"app": True}))
+        self.assertEqual(self.app_calls, [("GET", gg.API + "/repos/manaflow-ai/cmux/pulls/1")])
+        self.assertEqual(self.gh.calls, [])
+        self.assertEqual(self.login_reads, 0, "the login's token is not even read")
+        self.assertEqual(self.daemon.rest_spent(), 0, "not charged to the login's restShare")
+        self.assertNotIn("rest", self.daemon.budget, "the App's headers are not the login's budget")
+        self.assertEqual(self.pool.seen["remaining"], 14000)
+        self.daemon.request("GET", "/repos/manaflow-ai/cmux/actions/runs/5")
+        self.assertEqual(self.minted, ["manaflow-ai"], "one mint, then the token is kept in memory")
+        self.assertNotIn(APP_TOKEN, json.dumps(self.pool.status()))
+
+    def test_writes_graphql_rate_limit_and_other_owners_stay_on_the_login(self) -> None:
+        self.daemon.request("GET", "/repos/o/r/pulls/1")
+        self.daemon.request("GET", "/rate_limit", free=True)
+        self.daemon.request("POST", "/repos/manaflow-ai/cmux/issues/1/comments", {"body": "x"}, content=True)
+        self.daemon.request("POST", "/graphql", {"query": "query { viewer { login } }", "variables": {}})
+        self.assertEqual(self.app_calls, [])
+        self.assertEqual(len(self.gh.calls), 4)
+
+    def test_no_app_on_this_host_keeps_the_login_and_asks_again_only_after_a_rest(self) -> None:
+        self.ready = False
+        self.daemon.request("GET", "/repos/manaflow-ai/cmux/pulls/1")
+        self.daemon.request("GET", "/repos/manaflow-ai/cmux/pulls/2")
+        self.assertEqual((self.app_calls, self.minted), ([], []))
+        self.assertEqual(len(self.gh.calls), 2)
+        self.ready = True
+        self.daemon.now = NOW + gg.APP_POOL_REST + 1
+        self.daemon.request("GET", "/repos/manaflow-ai/cmux/pulls/3")
+        self.assertEqual(len(self.app_calls), 1, "a key placed later is used without a restart")
+
+    def test_a_failed_mint_keeps_the_login(self) -> None:
+        self.mint_token = None
+        self.daemon.request("GET", "/repos/manaflow-ai/cmux/pulls/1")
+        self.assertEqual(len(self.gh.calls), 1)
+        self.assertEqual(self.app_calls, [])
+        self.daemon.request("GET", "/repos/manaflow-ai/cmux/pulls/2")
+        self.assertEqual(self.minted, ["manaflow-ai"], "a failed mint rests the pool")
+
+    def test_a_spent_app_sends_the_same_read_on_the_login_and_rests_until_its_reset(self) -> None:
+        reset = NOW + 900
+        self.app_answers.append((403, {"x-ratelimit-limit": "15000", "x-ratelimit-remaining": "0",
+                                       "x-ratelimit-reset": str(int(reset))}, b'{"message": "API rate limit exceeded"}'))
+        self.daemon.request("GET", "/repos/manaflow-ai/cmux/pulls/1")
+        self.assertEqual(len(self.app_calls), 1)
+        self.assertEqual([c[1] for c in self.gh.calls], [gg.API + "/repos/manaflow-ai/cmux/pulls/1"])
+        self.assertEqual(self.daemon.backoff["rest"], 0.0, "the App's limit is not the login's")
+        self.daemon.request("GET", "/repos/manaflow-ai/cmux/pulls/2")
+        self.assertEqual(len(self.app_calls), 1, "resting until the App's reset")
+        self.daemon.now = reset + 1
+        self.daemon.request("GET", "/repos/manaflow-ai/cmux/pulls/3")
+        self.assertEqual(len(self.app_calls), 2)
+        self.assertEqual(self.pool.status()["fellBack"], 1)
+
+    def test_a_route_the_app_cannot_read_stays_on_the_login_and_the_others_keep_the_app(self) -> None:
+        self.app_answers.append((403, {"x-ratelimit-remaining": "14000", "x-ratelimit-reset": str(int(NOW + 900))},
+                                 b'{"message": "Resource not accessible by integration"}'))
+        self.daemon.request("GET", "/repos/manaflow-ai/cmux/branches/main/protection")
+        self.daemon.request("GET", "/repos/manaflow-ai/cmux/branches/main/protection")
+        self.assertEqual(len(self.app_calls), 1)
+        self.assertEqual(len(self.gh.calls), 2)
+        self.daemon.request("GET", "/repos/manaflow-ai/cmux/pulls/1")
+        self.assertEqual(len(self.app_calls), 2, "only that route left the App")
+
+    def test_under_the_floor_the_app_is_left_to_its_other_users(self) -> None:
+        self.app_answers.append((200, {"x-ratelimit-limit": "15000", "x-ratelimit-remaining": str(gg.APP_POOL_FLOOR - 1),
+                                       "x-ratelimit-reset": str(int(NOW + 600))}, b"{}"))
+        self.daemon.request("GET", "/repos/manaflow-ai/cmux/pulls/1")
+        self.daemon.request("GET", "/repos/manaflow-ai/cmux/pulls/2")
+        self.assertEqual(len(self.app_calls), 1)
+        self.assertEqual(len(self.gh.calls), 1)
+
+    def test_a_dead_app_token_is_minted_again_after_the_rest(self) -> None:
+        self.app_answers.append((401, {}, b'{"message": "Bad credentials"}'))
+        self.daemon.request("GET", "/repos/manaflow-ai/cmux/pulls/1")
+        self.assertEqual(len(self.gh.calls), 1)
+        self.daemon.now = NOW + gg.APP_POOL_REST + 1
+        self.daemon.request("GET", "/repos/manaflow-ai/cmux/pulls/2")
+        self.assertEqual(self.minted, ["manaflow-ai", "manaflow-ai"])
+        self.assertEqual(len(self.app_calls), 2)
+
+    def test_the_hour_and_daemon_json_count_app_reads_apart(self) -> None:
+        self.daemon.request("GET", "/repos/manaflow-ai/cmux/pulls/1")
+        self.daemon.tick(NOW)
+        text = (gg.BASE / "daemon.json").read_text()
+        status = json.loads(text)
+        self.assertEqual(status["lastHour"]["app"], 1)
+        self.assertEqual(status["appPool"]["served"], 1)
+        self.assertNotIn(APP_TOKEN, text)
+
+
+class AppPoolHostTest(unittest.TestCase):
+    """The default pool finds the App and gh_app_token.py on the host by itself: no agent sets anything."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        root = Path(self.tmp.name)
+        self.saved = (gg.APP_POOL_DIR, gg.PACE_CLI)
+        self.addCleanup(self.restore)
+        tools, machines, self.creds = root / "lw/tools", root / "lw/machines", root / "creds"
+        for d in (tools, machines, self.creds):
+            d.mkdir(parents=True)
+        (machines / "gh-app-roles.json").write_text(json.dumps({"owners": ["manaflow-ai"]}))
+        (tools / "gh-quota-shim").write_text("#!/bin/sh\n")
+        (tools / "gh_app_token.py").write_text(
+            "import sys\n"
+            "ok = sys.argv[1:] == ['token', 'ci-watch', '--owner', 'manaflow-ai']\n"
+            f"print({APP_TOKEN!r} if ok else '')\n"
+            "sys.exit(0 if ok else 1)\n")
+        (root / "bin").mkdir()
+        (root / "bin/gh").symlink_to(tools / "gh-quota-shim")
+        gg.PACE_CLI, gg.APP_POOL_DIR = root / "bin/gh", self.creds
+
+    def restore(self) -> None:
+        gg.APP_POOL_DIR, gg.PACE_CLI = self.saved
+        self.tmp.cleanup()
+
+    def test_without_the_app_files_the_pool_is_not_ready_and_mints_nothing(self) -> None:
+        pool = gg.AppPool()
+        self.assertFalse(pool.held_here())
+        self.assertEqual(pool.owner_of("GET", "/repos/manaflow-ai/cmux/pulls/1"), "manaflow-ai")
+        self.assertIsNone(pool.token("manaflow-ai"))
+
+    def test_with_the_app_files_it_mints_through_gh_app_token(self) -> None:
+        (self.creds / "ci-watch.json").write_text("{}")
+        (self.creds / "ci-watch.pem").write_text("not read here")
+        pool = gg.AppPool()
+        self.assertTrue(pool.held_here())
+        self.assertIsNone(pool.owner_of("GET", "/repos/someone-else/x/pulls/1"))
+        self.assertIsNone(pool.owner_of("POST", "/repos/manaflow-ai/cmux/pulls"))
+        self.assertEqual(pool.token("manaflow-ai"), APP_TOKEN)
+
 
 
 if __name__ == "__main__":
