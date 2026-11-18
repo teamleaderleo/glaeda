@@ -8567,6 +8567,8 @@ class LandQueue:
         self.touched: dict[str, float] = {}
         self.pass_gated, self.pass_first_gated = 0, None  # this pass's due judgments that waited for a worker
         self.pool_logged = float("-inf")
+        self.pass_latch: tuple[str, float] | None = None  # the login's latch as this pass saw it (log_pool)
+        self.pass_latched = 0  # open entries this pass skipped for it
         self.latch_free_seen: dict[str, tuple[float, bool]] = {}  # owner -> (asked at, has an unlatched source)
         self.snapshot_waiting: set[str] = set()  # keys with a snapshot wait, run out or not (judge's cap)
         self.pool: Any = None
@@ -8733,6 +8735,8 @@ class LandQueue:
         self.snapshot_waiting = {k for k, e in self.entries.items() if e.get("state") not in LAND_DONE
                                  and isinstance(e.get("snapshotWait"), dict)}
         self.pass_gated, self.pass_first_gated = 0, None
+        self.pass_latch = latch
+        self.pass_latched = 0
         for key in sorted(self.entries, key=self.judge_order):
             try:
                 e = self.entries[key]
@@ -8741,7 +8745,10 @@ class LandQueue:
                         (self.entries_dir() / file_name(key)).unlink(missing_ok=True)
                         del self.entries[key]
                     continue
-                if key in self.jobs or latch is not None and not self.latch_free(e):
+                if key in self.jobs:
+                    continue
+                if latch is not None and not self.latch_free(e):
+                    self.pass_latched += 1
                     continue  # a held latch: no judge, read, watch or nudge for this entry this pass
                 with self.lock:
                     if self.parked(e):
@@ -9056,19 +9063,42 @@ class LandQueue:
 
     def log_pool(self) -> None:
         """Once per LAND_POOL_LOG_EVERY, the pool as the last pass left it: workers busy and on what, snapshot waits,
-        and how many due judgments waited for a worker (the first in line named), so a land that is not judged can be
-        told apart from one that is never considered."""
+        how many due judgments waited for a worker (the first in line named), the open entries per state and per wait
+        kind, the login's latch and how many entries it skipped, and how many are due (queued, or past their wake) with
+        the one waiting longest. huge-blue, 2026-11-18 16:11Z: "busy 0, gated 0, open 399" every 5 min said nothing of
+        where the other 397 were."""
         if self.now - self.pool_logged < LAND_POOL_LOG_EVERY:
             return
         self.pool_logged = self.now
         with self.lock:
             running = {k: (self.entries.get(k) or {}).get("state") for k in self.jobs}
+            states: dict[str, int] = {}
+            waits: dict[str, int] = {}
+            due: list[tuple[float, str]] = []
+            for k, e in self.entries.items():
+                state = str(e.get("state") or "?")
+                if state in LAND_DONE:
+                    continue
+                states[state] = states.get(state, 0) + 1
+                if state == "waiting":
+                    kind = str((e.get("wait") or {}).get("kind") or "?")
+                    waits[kind] = waits.get(kind, 0) + 1
+                wake = e.get("wakeAt")
+                if k not in self.jobs and (state == "queued" or state == "waiting" and isinstance(wake, (int, float))
+                                           and not isinstance(wake, bool) and wake <= self.now):
+                    due.append((self.judge_order(k)[1], k))
+        oldest = min(due) if due else None
+        latch = self.pass_latch
         log({"event": "land-pool", "workers": self.workers(),
              "workersFrom": "land.json" if "workers" in self.config() else "default", "busy": len(running),
              "running": [f"{key_name(k)}:{v}" for k, v in running.items()][:16],
              "snapshotWaiting": len(self.snapshot_waiting), "gated": self.pass_gated,
              "firstGated": key_name(self.pass_first_gated) if self.pass_first_gated else None,
-             "open": sum(1 for e in self.entries.values() if e.get("state") not in LAND_DONE)})
+             "open": sum(states.values()), "states": states, "waits": waits,
+             "latch": None if latch is None else {"pool": latch[0], "until": utc_clock(latch[1])},
+             "latched": self.pass_latched, "due": len(due),
+             "oldestDue": None if oldest is None else {"pr": key_name(oldest[1]),
+                                                       "waitingS": int(self.now - oldest[0]) if oldest[0] else None}})
 
     def judge_order(self, key: str) -> tuple[int, float]:
         """The tick's order, so a free worker goes first to the land most likely to merge, then to the one that waited

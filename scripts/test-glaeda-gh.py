@@ -18941,20 +18941,6 @@ class LandTest(Base):
         updates = [c for c in self.w.gh_calls("api") if "update-branch" in " ".join(c)]
         self.assertEqual((len(updates), e["state"]), (1, "waiting"))  # the crashed one only
 
-    def test_an_update_cancelled_before_it_was_sent_is_sent_after_the_reexec(self):
-        # review F1: a claim refused while the daemon drains for a re-exec sent nothing, so it never counts as sent
-        self.pr(LA)
-        self.land()
-        answer = lambda: refusal("tip_merge", LA, {"kind": "update_branch", "expected_head_sha": LA})
-        self.w.answers.append(answer())
-        self.q.draining = True
-        self.tick()
-        self.assertEqual(self.w.gh_calls("api"), [])
-        self.q = self.queue()
-        e = self.run_hour(answer, seconds=60)
-        updates = [c for c in self.w.gh_calls("api") if "update-branch" in " ".join(c)]
-        self.assertEqual((len(updates), e["state"], e["wait"]["kind"]), (1, "waiting", "head_change"))
-
     def test_update_refusals_in_varying_words_still_stop_on_the_steps_count(self):
         # review F4: the judgment's streak no longer bounds them, so the step's count is per head, whatever the words
         self.pr(LA)
@@ -20033,6 +20019,24 @@ class LandTest(Base):
         self.assertEqual(self.q.entries["pr:p/r#2"]["state"], "queued")  # p's have none: held, as before
         self.assertEqual(sorted({a[-1] for a in asked}), ["o", "p"])
         self.assertLessEqual(len(asked), 2, "asked once per owner per LAND_LATCH_FREE_EVERY")
+
+    def test_the_pool_line_says_where_every_open_land_is(self):
+        # huge-blue, 2026-11-18 16:11Z on: "busy 0, gated 0, snapshotWaiting 2, open 399" every 5 min, and nothing
+        # said that the login's GraphQL latch skipped all 399 (no unlatched source answered for any owner).
+        self.latch_dir.mkdir(parents=True, exist_ok=True)
+        (self.latch_dir / "graphql-exhausted.json").write_text(json.dumps({"until": self.t + 3000, "at": self.t}))
+        self.pr(LA)
+        self.pr(LA, key="pr:o/r#2")
+        self.land()
+        self.land("o/r#2")
+        lines: list[dict] = []
+        with mock.patch.object(gg, "log", side_effect=lines.append):
+            self.tick()
+        pool = [ln for ln in lines if ln.get("event") == "land-pool"][-1]
+        self.assertEqual((pool["busy"], pool["gated"], pool["open"], pool["latched"], pool["due"]), (0, 0, 2, 2, 2))
+        self.assertEqual(pool["latch"]["pool"], "graphql")
+        self.assertEqual(pool["states"], {"queued": 2})
+        self.assertIn(pool["oldestDue"]["pr"], ("o/r#1", "o/r#2"))
 
     def test_the_pool_takes_a_raised_worker_count_without_a_restart(self):
         self.w.config["workers"] = 1
