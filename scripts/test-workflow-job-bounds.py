@@ -2,7 +2,7 @@
 """Every glaeda workflow job has a timeout, and none runs after a cancel unless listed with its reason.
 
 scripts/workflow_job_bounds.py is byte-identical to manaflow-ai/cmux scripts/ci/workflow_job_bounds.py and
-manaflow-ai/cmuxterm-hq tools/workflow_job_bounds.py (cmuxterm-hq
+manaflow-ai/cmuxterm-hq tests/workflow_job_bounds.py (cmuxterm-hq
 docs/investigations/2026-11-18-boneheaded-designs.md §11).
 """
 from __future__ import annotations

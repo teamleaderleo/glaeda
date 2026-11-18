@@ -9,7 +9,7 @@ it (cmuxterm-hq docs/investigations/2026-11-18-boneheaded-designs.md §11; the 4
 cancel (one that releases a lease, or a required-check aggregator that must fail closed rather than be skipped,
 since a skipped required check reads as passing) is listed with its reason.
 
-This file is byte-identical in manaflow-ai/cmux scripts/ci/, manaflow-ai/cmuxterm-hq tools/ and
+This file is byte-identical in manaflow-ai/cmux scripts/ci/, manaflow-ai/cmuxterm-hq tests/ and
 teamleaderleo/glaeda scripts/; each repo's test passes its own allowlist. It reads the YAML by indentation, with
 no PyYAML, so it runs on any runner's python3.
 
