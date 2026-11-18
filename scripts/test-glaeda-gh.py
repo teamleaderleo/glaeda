@@ -2963,6 +2963,91 @@ class BalanceTest(Base):
         self.assertEqual(set(reads), {"pr", "comment", "run", "head"}, "".join(k[0] for k in reads))
         self.assertTrue(all(reads.count(k) >= 1 for k in ("comment", "run", "head")), reads)
 
+    def blocked_fleet(self, pr_path: str, seconds: float, heavy: int = 0) -> tuple[dict[str, list[float]], list[dict]]:
+        """800 watched PRs, each read lately (so due every cycle), 20 of them blocked on by a wait or a due land (their
+        waitedAt renewed every tick, as a wait's touches do), and 100 comment watches due as well; GraphQL paced at 40
+        points a minute (a point a PR, as a heavy rollup costs); PRs over PR_PATH, with REST's share leaving room for
+        3 reads a minute and the rest spilling to GraphQL; HEAVY unblocked PRs read alone (batched's heavy entries).
+        Ticks every TICK for SECONDS; the times each PR was read."""
+        d = self.daemon
+        reads: dict[str, list[float]] = {}
+        rest_log: list[float] = []
+        cache = lambda key, at: {"key": key, "fetchedAt": at, "dataAt": at, "source": "graphql",  # noqa: E731
+                                 "data": {"state": "OPEN", "number": 1} if key.startswith("pr:") else []}
+        entries = [{"key": key, "cache": cache(key, NOW - 30), "touched": NOW, "waitedAt": None, "waitBegan": None,
+                    "readers": [], "reader": "", "consumers": {}, "since": None, "jobs": False}
+                   for key in [f"pr:o/r#{n}" for n in range(800)] + [f"comment:o/r#{n}" for n in range(100)]]
+        blocked = [e for e in entries if e["key"].startswith("pr:")][7::40]
+
+        def watches() -> list[dict]:
+            for e in entries:
+                e["touched"] = d.now
+            for e in blocked:
+                e["waitedAt"] = d.now
+                e["waitBegan"] = NOW - 60
+            for e in entries[:heavy]:
+                d.heavy[e["key"]] = {"at": d.now, "fails": 1, "oks": 0}
+            return entries
+
+        def read(e: dict) -> None:
+            e["cache"] = cache(e["key"], d.now)
+            reads.setdefault(e["key"], []).append(d.now)
+
+        def gql(kind: str):
+            def fetch(chunk: list[dict]) -> None:
+                if not d.gql_room():
+                    raise AssertionError("a query past the pace")
+                for e in chunk:
+                    read(e)
+                d.gql_log.append((d.now, kind, len(chunk)))
+            return fetch
+
+        def rest(e: dict) -> None:
+            read(e)
+            rest_log.append(d.now)
+
+        def route(kind: str) -> str:
+            d.paths[kind] = pr_path if kind == "pr" else "graphql"
+            return d.paths[kind]
+
+        self.budgets(rest=(4000, 3000), graphql=(4000, 3000))
+        d.batch["pr"] = 10
+        policy = {**d.policy, "graphqlPerMinute": 40}
+        fetchers = {k: gql(k) for k in ("pr", "comment", "run", "head")}
+        with mock.patch.object(gg, "daemon_policy", return_value=policy), \
+                mock.patch.object(gg.Daemon, "graphql_fetch", property(lambda _: fetchers)), \
+                mock.patch.object(gg.Daemon, "rest_fetch", property(lambda _: {"pr": rest})), \
+                mock.patch.object(d, "watches", side_effect=watches), \
+                mock.patch.object(d, "route", side_effect=route), \
+                mock.patch.object(d, "rest_room", side_effect=lambda cost: sum(1 for t in rest_log if d.now - t < 60) < 3), \
+                mock.patch.object(d, "serve_waits", return_value=0), \
+                mock.patch.object(d, "check_alarms"):
+            for t in range(0, int(seconds), gg.TICK):
+                d.tick(NOW + t)
+        return reads, blocked
+
+    def assert_read_within_the_stale_bound(self, reads: dict[str, list[float]], blocked: list[dict], end: float) -> None:
+        for e in blocked:
+            times = [NOW - 30] + reads.get(e["key"], []) + [end]
+            gap = max(b - a for a, b in zip(times, times[1:]))
+            self.assertLessEqual(gap, gg.STALE_DATA_AFTER, f"{e['key']}: data {gap:.0f}s old at worst; read at "
+                                 f"{[int(t - NOW) for t in reads.get(e['key'], [])]}")
+
+    def test_twenty_blocked_of_800_paced_prs_over_graphql_are_read_within_one_stale_bound(self) -> None:
+        # huge-blue 2026-11-18 21:5xZ: pr data waits were blocked on 3403 s old (heartbeat fresh) with GraphQL paced at
+        # 40 points a minute. The pace can read the 20 blocked PRs every minute; they go ahead of the 780 others (60 of
+        # them heavy, each read alone) and the comment watches in every window, so none waits past STALE_DATA_AFTER.
+        reads, blocked = self.blocked_fleet("graphql", 2 * gg.STALE_DATA_AFTER, heavy=60)
+        self.assert_read_within_the_stale_bound(reads, blocked, NOW + 2 * gg.STALE_DATA_AFTER)
+        self.assertGreater(sum(len(v) for k, v in reads.items() if k.startswith("pr:")), 20 * 10,
+                           "the unblocked PRs get what is left of the pace")
+
+    def test_twenty_blocked_of_800_prs_over_a_spent_rest_share_are_read_within_one_stale_bound(self) -> None:
+        # The same over REST, its share leaving room for 3 reads a minute: the rest spill to GraphQL at its pace, and
+        # a blocked PR deferred lately goes ahead of plain watches deferred long before it.
+        reads, blocked = self.blocked_fleet("rest", 2 * gg.STALE_DATA_AFTER)
+        self.assert_read_within_the_stale_bound(reads, blocked, NOW + 2 * gg.STALE_DATA_AFTER)
+
     def test_pr_refreshes_paced_by_the_ceiling_do_not_starve_runs(self) -> None:
         """Review of #1834: with the ceiling held by PR batches every minute, a watched run stayed unread for minutes.
         The kind after the one the ceiling held goes first next tick."""
@@ -14412,6 +14497,31 @@ class SpendAlarmTest(AlarmBase):
         starved = gg.daemon_starved(status)
         self.assertIn("GraphQL slots", starved["cause"])
 
+    def test_reads_cut_off_by_a_tick_spent_waiting_for_slots_are_no_budgets_deferral(self) -> None:
+        # Review of glaeda#2189 (F1): with the slots held, each tick's first pr query waits out the tick's budget for one
+        # and the next meets OutOfTime, which deferred the rest "by the tick's read budget": the cause read "deferred",
+        # the valve stood down and the alarm said a restart would not help, though nothing but the slots held them.
+        self.policy()
+        self.addCleanup(setattr, gg, "TICK_BUDGET", gg.TICK_BUDGET)
+        gg.TICK_BUDGET = 0.3
+        held = [gg.graphql_slot_take(None) for _ in range(2)]
+        self.addCleanup(lambda: [h[0].close() for h in held])
+        for n in range(5, 9):
+            key = gg.parse_key("pr", f"o/r#{n}")
+            gg.write_json(gg.cache_dir() / gg.file_name(key), {"key": key, "fetchedAt": NOW - 700, "dataAt": NOW - 700,
+                                                               "data": gg.parse_pr(pr_node(n)), "error": None})
+            gg.register(key, waited=True)
+            self.gh.prs[("o", "r", n)] = pr_node(n)
+        self.daemon.waited_since = {gg.parse_key("pr", f"o/r#{n}"): NOW - 700 for n in range(5, 9)}
+        self.daemon.batch["pr"] = 1  # one query per PR: the second meets the spent budget
+        self.daemon.started_tick = NOW - 2 * gg.STALE_DATA_AFTER
+        for i in range(2):
+            self.daemon.tick(NOW + i * gg.CYCLE)
+        self.assertTrue(any(k.startswith("pr:") for k in self.daemon.deferred), "the budget cut the tick off")
+        cause = gg.read_json(gg.BASE / "daemon.json")["staleCause"]["pr"]
+        self.assertTrue(cause.startswith("stalled: no pr read stored"), cause)
+        self.assertIsNotNone(self.daemon.valve_due, "the slots held the reads: the valve acts")
+
     def test_a_backlog_is_said_once_with_its_cause_and_never_restarts(self) -> None:
         self.policy()
         self.daemon.started_tick = NOW - 2 * gg.STALE_DATA_AFTER
@@ -14510,6 +14620,58 @@ class SpendAlarmTest(AlarmBase):
         self.assertTrue(all(r["heldS"] > gg.GRAPHQL_SLOT_HOLD_MAX for r in freed))
         self.daemon.tick(NOW + gg.CYCLE)  # the next pr batch gets a slot and reads
         self.assertEqual(gg.read_cache(key)["dataAt"], NOW + gg.CYCLE)
+
+    def test_a_slot_whose_request_is_still_in_flight_is_never_freed_under_it(self) -> None:
+        # Review of glaeda#2189 (F3): a land worker's request outlives the bound (a thread has no SIGALRM deadline); the
+        # reap closed its slot file under it, and a second request took the slot while the first was still on the wire.
+        self.addCleanup(gg._SLOT_HOLDERS.clear)
+        flying = gg.graphql_slot_take(None, what="land judge #1")
+        leaked = gg.graphql_slot_take(None, what="land judge #2")
+        self.addCleanup(lambda: [gg.graphql_slot_release(h[0]) for h in (flying, leaked)])
+        gg.graphql_slot_flight(flying[0], True)
+        with gg._SLOT_HOLDERS_LOCK:
+            for h in gg._SLOT_HOLDERS.values():
+                h["since"] -= gg.GRAPHQL_SLOT_HOLD_MAX + 1
+        freed = gg.graphql_slot_reap()
+        self.assertEqual([r["what"] for r in freed], ["land judge #2"], "only the slot nothing is reading on")
+        self.assertFalse(flying[0].closed)
+        self.assertEqual([r["what"] for r in gg.graphql_slot_holders()], ["land judge #1"])
+        gg.graphql_slot_flight(flying[0], False)  # its answer is in, and the slot is still not given back: freed
+        self.assertEqual([r["what"] for r in gg.graphql_slot_reap()], ["land judge #1"])
+
+    def test_a_deferral_beside_a_slot_wait_keeps_its_record(self) -> None:
+        # Review of glaeda#2189 (F2): the slot sentence overwrote the deferral record, so stale-cause logged a string.
+        self.daemon.now = NOW
+        self.daemon.deferred = {f"pr:o/r#{n}" for n in range(7)}
+        self.daemon.defer_why = {"pr": (NOW - 5, "the GraphQL pace: 40 of 40 points this minute")}
+        self.daemon.spent = [(NOW - 30, "read pr", 20.0), (NOW - 30, "slot", 15.0)]
+        cause = self.daemon.stall_cause("pr")
+        self.assertEqual(cause["deferral"]["deferred"], 7)
+        self.assertIn("7 pr reads deferred", cause["text"])
+        self.assertIn("15.0s waiting for one of the login's", cause["text"])
+
+    def test_a_pace_too_slow_for_the_blocked_set_says_its_numbers_and_never_restarts(self) -> None:
+        # huge-blue 2026-11-18 21:5xZ: 3403 s old at 40 points a minute, and the alarm offered a restart. When the pace
+        # cannot read every blocked PR within STALE_DATA_AFTER, the alarm says so with the numbers and the valve stands.
+        self.policy()
+        self.daemon.started_tick = NOW - 2 * gg.STALE_DATA_AFTER
+        self.daemon.policy = {**self.daemon.policy, "graphqlPerMinute": 4}
+        self.daemon.paths["pr"] = "graphql"
+        self.daemon.stale_waited, self.daemon.stale_waited_key = {"pr": 900.0}, {"pr": "pr:o/r#5"}
+        self.daemon.fresh_waited = {"pr": 700.0}
+        self.daemon.blocked = {"pr": 300}
+        self.daemon.batch["pr"] = 5
+        self.daemon.gql_log = [(NOW - 30, "pr", 2), (NOW - 20, "pr", 2)]  # 2 points a query of 5
+        self.daemon.read_done = {**self.daemon.read_done, "pr": [NOW - 30, NOW - 20]}
+        for i in range(3):
+            self.daemon.now = NOW + i * gg.TICK
+            self.daemon.check_alarms()
+        self.assertIsNone(self.daemon.valve_due, "a faster pace, not a restart, reads them")
+        told = self.told_lines()
+        # 300 blocked, 60 queries of 5 at 2 points each within 600 s: 12 points a minute, the pace allows 4
+        self.assertIn("blocked 300 pr reads need 12 GraphQL points per minute to stay under 600s; the pace allows 4",
+                      told[0])
+        self.assertNotIn(gg.STALE_RESTART_ADVICE, told[0])
 
     def test_the_valve_never_restarts_for_one_stale_key_while_other_waited_keys_are_read(self) -> None:
         # huge-blue, 2026-11-18: six valve restarts in six hours, each for one PR (pr:manaflow-ai/cmux#46087 at 3963 s,
@@ -22025,6 +22187,25 @@ class RefreshStallTest(AlarmBase):
             self.daemon.tick(NOW + i)
             self.assertLessEqual(self.oldest_age(keys, NOW + i), 2 * gg.CYCLE)
         self.assertFalse(self.daemon.gql_down(), "GraphQL is not held out once GitHub answers")
+
+    def test_graphql_with_no_answer_reads_the_whole_batch_over_rest_at_once(self) -> None:
+        """huge-blue 2026-11-18 21:5xZ: URLError on graphql beside the pace. No answer at all says nothing about the
+        batch (a 502 can be one PR's doing; a refused connection is not), so the batch is not split and asked again
+        query after query: REST reads all of it this tick while REST has room, as for a 502 that cannot be split."""
+        keys = self.watch(20, waited=5)
+        tried: list[int] = []
+
+        def transport(method, url, headers, body):
+            if url.endswith("/graphql") and "pullRequest(number:" in json.loads(body)["query"]:
+                tried.append(1)
+                raise gg.WatchError("request failed: URLError")
+            return self.gh(method, url, headers, body)
+        self.daemon.transport = transport
+        self.daemon.batch["pr"] = 10
+        self.daemon.tick(NOW)
+        self.assertEqual(len(tried), 2, "one query per batch, none split and asked again")
+        self.assertEqual([k for k in keys if not (gg.read_cache(k) or {}).get("data")], [], "REST read every PR")
+        self.assertTrue(all(gg.read_cache(k).get("source") == "rest" for k in keys))
 
     def test_the_502_storm_is_written_down_in_bounded_lines_naming_502_and_the_fallback(self) -> None:
         """huge-blue 2026-11-17: the 502s were in daemon.json alone, not one journal line. The same 30-minute storm
