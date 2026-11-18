@@ -12782,7 +12782,7 @@ def until_epoch(target: str, now: float) -> float | None:
     match = re.fullmatch(r"(\d+)([smhd])", text)
     if match:
         return now + int(match.group(1)) * {"s": 1, "m": 60, "h": 3600, "d": 86400}[match.group(2)]
-    match = re.fullmatch(r"(\d\d?):(\d\d)Z", text)
+    match = re.fullmatch(r"([01]?\d|2[0-3]):([0-5]\d)Z", text)  # 24:30Z and 14:61Z fall through to the refusal
     if match:
         day = dt.datetime.fromtimestamp(now, dt.timezone.utc)
         at = day.replace(hour=int(match.group(1)), minute=int(match.group(2)), second=0, microsecond=0).timestamp()

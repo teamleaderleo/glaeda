@@ -8696,7 +8696,7 @@ class FileAndPidWaitTest(unittest.TestCase):
         self.assertEqual(gg.until_epoch("2026-11-18T14:40:00Z", now), 1_795_012_800.0)
         self.assertEqual(gg.until_epoch("14:40Z", now), 1_795_012_800.0)
         self.assertEqual(gg.until_epoch("08:00Z", now), 1_795_075_200.0)  # passed today: tomorrow
-        for bad in ("soon", "2026-11-18T14:40:00", "-5m"):
+        for bad in ("soon", "2026-11-18T14:40:00", "-5m", "24:30Z", "14:61Z"):
             with self.assertRaises(gg.WatchError):
                 gg.until_epoch(bad, now)
         state = self.dir / "gh-quota"
