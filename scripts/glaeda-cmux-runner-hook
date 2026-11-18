@@ -10865,14 +10865,22 @@ class Gate:
         idle = self.idle_evict is not None and self.idle_evict.is_alive()
         return own or idle or wait_for_running_pass(time.monotonic())
 
-    def disk_room_wait(self) -> None:
+    def disk_room_wait(self) -> bool:
         """DISK_RECLAIM_NOW, right before the listener starts: an idle pool runner found short at the last look
         (disk_short; low_disk has started reclaim already) waits at most DISK_RECLAIM_WAIT_S for that room, looking
         every DISK_RECLAIM_POLL_S, ending early once the room is there, no reclaim runs or the agent stops. Then the
         listener starts whatever was freed: a disk floor never holds it. A listener already online is never stopped
-        for disk, so only a start waits."""
+        for disk, so only a start waits.
+
+        It reports whether the listener may start. One reading alone keeps it off: free disk still under
+        RUNNER_JOBS_FLOOR_GIB (the controller's hard floor, where a fleet worker stops a running build) after the
+        wait. That is no floor but a full disk: no job fits there, and one taken fails with ENOSPC, so the gate
+        reclaims again on its next poll, seconds later, instead (DISK_FULL_NO_LISTEN; Leo: "A busy machine makes
+        things slower, never makes them fail"). 2026-11-18 19:46-19:55Z: cmux18's listeners started after their
+        30 s wait at 8.5 GiB free with five jobs running, the jobs wrote it down to 1.8 GiB, and the lent fleet
+        worker beside them sat at claim_paused disk with suites queued 4-5 h."""
         if self.disk_short is None:
-            return
+            return True
         why, target = self.disk_short
         self.disk_short = None
         path = os.path.dirname(self.host_lock)
@@ -10884,9 +10892,13 @@ class Gate:
             self.reap_eviction(path, target)
         after = free_or_none(path)
         freed = f"{after - before:.1f} GiB" if before is not None and after is not None else "an unknown amount"
-        room = "the room is there" if not disk_refusal(path, target) else "still short; listening anyway"
+        full = after is not None and after < RUNNER_JOBS_FLOOR_GIB
+        room = ("the room is there" if not disk_refusal(path, target) else
+                f"under the {RUNNER_JOBS_FLOOR_GIB:g} GiB hard floor, where no job fits; not listening, reclaiming "
+                "again next poll (DISK_FULL_NO_LISTEN)" if full else "still short; listening anyway")
         gate_log(f"{why}: waited {time.monotonic() - start:.0f} s for reclaim (at most {DISK_RECLAIM_WAIT_S:g} s), "
                  f"freed {freed}, {room} (DISK_RECLAIM_NOW)")
+        return not full
 
     def locked(self, fresh: bool = False) -> str | None:
         """For the gui and session runners only: why their console session cannot run a GUI job (console_refusal),
@@ -11707,7 +11719,8 @@ class Gate:
             self.held, self.free_since, self.free_logged = None, None, False
         if self.terminating:  # SIGTERM during the look above
             return 0
-        self.disk_room_wait()  # DISK_RECLAIM_NOW: seconds for room, never a hold
+        if not self.disk_room_wait():  # DISK_RECLAIM_NOW: seconds for room; only a full disk keeps it off
+            return None
         if self.terminating:
             return 0
         self.start()
