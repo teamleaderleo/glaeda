@@ -211,6 +211,16 @@ class LoadDiskModuleTest(unittest.TestCase):
                 if re.match(r"\s*[\w.]+\.exec_module\(\w+\)", line) and \
                         not any("sys.modules[" in prior for prior in lines[max(0, i - 3):i]):
                     missing.append(f"{name}:{i + 1}: {line.strip()}")
+            # The registration names sys, so the script imports it (a bare `sys.modules[...]` raises NameError
+            # at load, which compiling never shows: cmux_fleet_operator_summary.py, #2129).
+            # An import counts at the top level, or earlier at no deeper indent (a function's own import).
+            imports = [(i, len(line) - len(line.lstrip())) for i, line in enumerate(lines)
+                       if re.match(r"\s*import\s+(?:[\w.]+\s*,\s*)*sys\b", line)]
+            for i, line in enumerate(lines):
+                if "sys.modules[" in line and not line.lstrip().startswith("#"):
+                    indent = len(line) - len(line.lstrip())
+                    if not any(depth == 0 or (at < i and depth <= indent) for at, depth in imports):
+                        missing.append(f"{name}:{i + 1}: sets sys.modules[...] with no `import sys` in scope")
         self.assertEqual(missing, [], "set sys.modules[loader.name] = module before loader.exec_module(module):\n"
                          + "\n".join(missing))
 
