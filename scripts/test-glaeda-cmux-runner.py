@@ -11594,10 +11594,10 @@ class GateTest(unittest.TestCase):
                 why = self.short(small_gate)
                 self.assertIn("RUNNER_JOBS_DISK", why or "", "10 GiB + 5.3 GiB for its own job is not free at 12")
                 free["gib"] = 7.5
-                why = self.short(small_gate)
-                self.assertIn("DISK_SHORT_RECLAIM", why or "")
-                self.assertIn("7.5 GiB free, 8 GiB required", why or "")
-                self.assertIn("small jobs' measured peak", why or "")
+                # under its own 8 GiB peak and the hard floor no small job fits: a full disk, held (DISK_FULL_NO_LISTEN)
+                self.assertEqual(small_gate.low_disk(),
+                                 "disk full: under 8 GiB, where no job of this runner fits; reclaiming "
+                                 "(DISK_FULL_NO_LISTEN)")
                 self.assertEqual(cleanup.call_args.args[1], 30.0, "cleanup still aims at the floor")
         self.assertEqual(hook.side_fit_units(hook.runner_scope(small)), 1,
                          "a small runner never waits for room for the fast tier's units")
@@ -12022,7 +12022,7 @@ class GateTest(unittest.TestCase):
         """DISK_FULL_NO_LISTEN at a job's end (review of glaeda#2188): a disk floor never watches or freezes a Worker,
         but a full disk is no floor. Seen during a job, it stops the listener as that job ends, as a reservation does,
         so the next job is not taken where it would fail; the job itself runs on."""
-        full = "disk full: under the 10 GiB hard floor where no job fits; reclaiming (DISK_FULL_NO_LISTEN)"
+        full = "disk full: under 10 GiB, where no job of this runner fits; reclaiming (DISK_FULL_NO_LISTEN)"
         gate, stops = self.gate([None] * 3, busy=[True, True])
         gate.worker_pids = lambda: [4343]
         with mock.patch.object(hook, "host_waiters", return_value=set()), \

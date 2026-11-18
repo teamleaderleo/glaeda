@@ -10745,12 +10745,14 @@ class Gate:
             # until reclaim or the running jobs' ends free it. Leo: "A busy machine makes things slower, never makes
             # them fail." 2026-11-18 19:46-19:55Z: cmux18's listeners took jobs at 8.5 GiB free beside five running,
             # which wrote it down to 1.8 GiB while the lent fleet worker beside them sat at claim_paused disk.
-            # An unreadable reading holds nothing (free_or_none: None).
-            if (free := free_or_none(path)) is not None and free < RUNNER_JOBS_FLOOR_GIB:
+            # Full is under the hard floor and under this runner's own job peak (a small runner's 8 GiB: its jobs are
+            # measured to fit under the hard floor). An unreadable reading holds nothing (free_or_none: None).
+            full_gib = min(RUNNER_JOBS_FLOOR_GIB, peak)
+            if (free := free_or_none(path)) is not None and free < full_gib:
                 self.disk_short = None
                 self.evict_in_background(path, max(floor, peak))
                 # the same words every poll: the gate logs a hold again only when its reason changes
-                return (f"disk full: under the {RUNNER_JOBS_FLOOR_GIB:g} GiB hard floor where no job fits; "
+                return (f"disk full: under {full_gib:g} GiB, where no job of this runner fits; "
                         "reclaiming (DISK_FULL_NO_LISTEN)")
             if under := disk_refusal(path, peak):
                 short = (f"disk: {under} for {whose} (DISK_SHORT_RECLAIM)", max(floor, peak))
