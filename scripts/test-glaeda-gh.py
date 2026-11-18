@@ -12841,6 +12841,64 @@ class PostTest(unittest.TestCase):
         self.assertEqual(status["outbox"], {"queued": 1, "holdUntil": None, "pause": None})  # no keeper, no ask
 
 
+class PauseKeeperNeverStallsReadsTest(Base):
+    """2026-11-18: a daemon whose gh-quota answered every `content-pause` ask with a usage error was found with PR data
+    an hour old behind a fresh heartbeat, the ask's error the newest in its stale alarm. The ask runs on its own
+    thread; the tick waits CONTENT_PAUSE_DEADLINE for a new one at most, and holds only the outbox's creates. Whatever
+    the keeper answers (a usage error, a crash, nothing at all), every tick still reads what its waits need."""
+
+    def keeper(self, body: str) -> None:
+        root = Path(self.tmp.name) / "keeper"
+        root.mkdir(exist_ok=True)
+        cmd = root / "gh-quota"
+        cmd.write_text("#!/bin/sh\n" + body)
+        cmd.chmod(0o755)
+        env = mock.patch.dict(os.environ, {gg.CONTENT_PAUSE_ENV: shlex.quote(os.fspath(cmd))})
+        env.start()
+        self.addCleanup(env.stop)
+
+    def reads_through(self, body: str) -> Any:
+        self.keeper(body)
+        self.gh.prs[("o", "r", 1)] = pr_node(1)
+        gg.register("pr:o/r#1", waited=True)
+        args = gg.parser().parse_args(["post", "comment", "o/r#9", "--body", "held"])
+        item = gg.post_item(args)
+        gg.write_json(gg.outbox_dir() / f"{item['id']}.json", item)  # a create, so every tick asks the pause
+        reads = lambda: sum(1 for c in self.gh.gql_calls() if "pullRequest(number:" in json.loads(c[3])["query"])  # noqa: E731
+        slowest = 0.0
+        with mock.patch.object(gg, "CONTENT_PAUSE_DEADLINE", 0.3), \
+                mock.patch.object(gg, "CONTENT_PAUSE_SLOW_DEADLINE", 0.6), \
+                mock.patch.object(gg, "CONTENT_PAUSE_RETRY", gg.CYCLE):  # a new ask every tick: the worst case
+            for i in range(5):
+                before = reads()
+                at = NOW + i * gg.CYCLE
+                path = gg.watch_dir() / gg.file_name("pr:o/r#1")
+                os.utime(path, (at, at))  # read on every cycle: a waiter asks for it
+                started = time.monotonic()
+                self.daemon.tick(at)
+                slowest = max(slowest, time.monotonic() - started)
+                self.assertEqual(reads() - before, 1, f"tick {i} read no PR")
+                time.sleep(0.05)  # an ask that answers at once is taken on the next tick at the latest
+            self.daemon.content_pause_settle(5)
+        self.assertLess(slowest, 0.3 + 1.5)  # the tick waits CONTENT_PAUSE_DEADLINE for the ask, never more
+        return self.daemon
+
+    def test_a_keeper_without_the_command_never_stalls_reads(self) -> None:
+        d = self.reads_through(f"cat >&2 <<'EOF'\n{OLD_GH_QUOTA_USAGE}EOF\nexit 2\n")
+        self.assertTrue(d.pause_absent)
+        self.assertEqual(d.pause_failures, 0)
+
+    def test_a_hung_keeper_never_stalls_reads(self) -> None:
+        d = self.reads_through("exec sleep 30\n")
+        self.assertGreater(d.pause_timeouts, 0)
+        self.assertFalse(d.pause_absent)
+
+    def test_a_crashing_keeper_never_stalls_reads(self) -> None:
+        d = self.reads_through("echo 'Traceback (most recent call last):' >&2\nexit 1\n")
+        self.assertGreater(d.pause_failures, 0)
+        self.assertFalse(d.pause_absent)
+
+
 class InstalledKeeperTest(unittest.TestCase):
     """The outbox asks the host's gh-quota `content-pause`; cosmic-gray's had no such command on 2026-11-18, and every
     queued create sat held behind its usage error. This asks the keeper this host actually has, resolved as the daemon
