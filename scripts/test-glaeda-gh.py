@@ -2963,11 +2963,13 @@ class BalanceTest(Base):
         self.assertEqual(set(reads), {"pr", "comment", "run", "head"}, "".join(k[0] for k in reads))
         self.assertTrue(all(reads.count(k) >= 1 for k in ("comment", "run", "head")), reads)
 
-    def blocked_fleet(self, pr_path: str, seconds: float, heavy: int = 0) -> tuple[dict[str, list[float]], list[dict]]:
+    def blocked_fleet(self, pr_path: str, seconds: float, heavy: int = 0, every: int = 40,
+                      pace: int = 40) -> tuple[dict[str, list[float]], list[dict]]:
         """800 watched PRs, each read lately (so due every cycle), 20 of them blocked on by a wait or a due land (their
         waitedAt renewed every tick, as a wait's touches do), and 100 comment watches due as well; GraphQL paced at 40
         points a minute (a point a PR, as a heavy rollup costs); PRs over PR_PATH, with REST's share leaving room for
         3 reads a minute and the rest spilling to GraphQL; HEAVY unblocked PRs read alone (batched's heavy entries).
+        EVERY: one PR in that many is blocked; PACE: graphqlPerMinute.
         Ticks every TICK for SECONDS; the times each PR was read."""
         d = self.daemon
         reads: dict[str, list[float]] = {}
@@ -2977,7 +2979,7 @@ class BalanceTest(Base):
         entries = [{"key": key, "cache": cache(key, NOW - 30), "touched": NOW, "waitedAt": None, "waitBegan": None,
                     "readers": [], "reader": "", "consumers": {}, "since": None, "jobs": False}
                    for key in [f"pr:o/r#{n}" for n in range(800)] + [f"comment:o/r#{n}" for n in range(100)]]
-        blocked = [e for e in entries if e["key"].startswith("pr:")][7::40]
+        blocked = [e for e in entries if e["key"].startswith("pr:")][7::every]
 
         def watches() -> list[dict]:
             for e in entries:
@@ -3012,7 +3014,7 @@ class BalanceTest(Base):
 
         self.budgets(rest=(4000, 3000), graphql=(4000, 3000))
         d.batch["pr"] = 10
-        policy = {**d.policy, "graphqlPerMinute": 40}
+        policy = {**d.policy, "graphqlPerMinute": pace}
         fetchers = {k: gql(k) for k in ("pr", "comment", "run", "head")}
         with mock.patch.object(gg, "daemon_policy", return_value=policy), \
                 mock.patch.object(gg.Daemon, "graphql_fetch", property(lambda _: fetchers)), \
@@ -3047,6 +3049,23 @@ class BalanceTest(Base):
         # a blocked PR deferred lately goes ahead of plain watches deferred long before it.
         reads, blocked = self.blocked_fleet("rest", 2 * gg.STALE_DATA_AFTER)
         self.assert_read_within_the_stale_bound(reads, blocked, NOW + 2 * gg.STALE_DATA_AFTER)
+
+    def assert_plain_read_every_floor(self, reads: dict[str, list[float]], blocked: list[dict], seconds: float) -> None:
+        plain = sorted(t for k, v in reads.items() if k.startswith("pr:") and k not in {e["key"] for e in blocked}
+                       for t in v)
+        times = [NOW] + plain + [NOW + seconds]
+        gap = max(b - a for a, b in zip(times, times[1:]))
+        self.assertLessEqual(gap, gg.PLAIN_FLOOR_EVERY + gg.CYCLE, f"no plain PR read for {gap:.0f}s")
+
+    def test_a_blocked_set_past_the_pace_still_leaves_plain_watches_a_floor(self) -> None:
+        # Review of glaeda#2199: blocked first with no floor let 400 blocked PRs at 40 points a minute take every
+        # point, and the 400 plain watches were never read. One unblocked batch a minute (PLAIN_FLOOR_EVERY) still is.
+        reads, blocked = self.blocked_fleet("graphql", gg.STALE_DATA_AFTER, every=2)
+        self.assert_plain_read_every_floor(reads, blocked, gg.STALE_DATA_AFTER)
+
+    def test_a_blocked_set_past_the_rest_share_still_leaves_plain_watches_a_floor(self) -> None:
+        reads, blocked = self.blocked_fleet("rest", gg.STALE_DATA_AFTER, every=2)
+        self.assert_plain_read_every_floor(reads, blocked, gg.STALE_DATA_AFTER)
 
     def test_pr_refreshes_paced_by_the_ceiling_do_not_starve_runs(self) -> None:
         """Review of #1834: with the ceiling held by PR batches every minute, a watched run stayed unread for minutes.
@@ -14637,8 +14656,40 @@ class SpendAlarmTest(AlarmBase):
         self.assertEqual([r["what"] for r in freed], ["land judge #2"], "only the slot nothing is reading on")
         self.assertFalse(flying[0].closed)
         self.assertEqual([r["what"] for r in gg.graphql_slot_holders()], ["land judge #1"])
-        gg.graphql_slot_flight(flying[0], False)  # its answer is in, and the slot is still not given back: freed
-        self.assertEqual([r["what"] for r in gg.graphql_slot_reap()], ["land judge #1"])
+        # Review of glaeda#2199: every daemon request is in flight from take to release, so a hung one is still freed,
+        # past GRAPHQL_SLOT_FLIGHT_MAX, and said as in flight
+        with gg._SLOT_HOLDERS_LOCK:
+            for h in gg._SLOT_HOLDERS.values():
+                h["since"] -= gg.GRAPHQL_SLOT_FLIGHT_MAX
+        freed = gg.graphql_slot_reap()
+        self.assertEqual([(r["what"], r["inFlight"], r["thread"]) for r in freed],
+                         [("land judge #1", True, threading.current_thread().name)])
+        self.assertTrue(flying[0].closed)
+
+    def test_a_pace_with_no_evidence_it_held_anything_is_no_cover_for_a_stall(self) -> None:
+        # Review of glaeda#2199 (BLOCK): pace_short was arithmetic alone. No query answered, no read stored, 500 blocked
+        # at batch 1 (RESOURCE_LIMITS halving reaches it) read "paced", and the valve and `restart` stood down.
+        self.policy()
+        self.daemon.started_tick = NOW - 2 * gg.STALE_DATA_AFTER
+        self.daemon.paths["pr"] = "graphql"
+        self.daemon.stale_waited, self.daemon.stale_waited_key = {"pr": 900.0}, {"pr": "pr:o/r#5"}
+        self.daemon.blocked = {"pr": 500}
+        self.daemon.batch["pr"] = 1
+        self.daemon.gql_log = []
+        for i in range(3):
+            self.daemon.now = NOW + i * gg.TICK
+            self.daemon.check_alarms()
+        self.assertEqual(self.daemon.stall_cause("pr")["verdict"], "stalled")
+        self.assertIsNotNone(self.daemon.valve_due, "nothing shows the pace held a read: the valve acts")
+        self.assertNotIn("pr", self.daemon.stale_why())
+        # and with reads, but no pace refusal recorded, nor over REST: not "paced" either
+        self.daemon.read_done = {**self.daemon.read_done, "pr": [self.daemon.now - 30]}
+        self.daemon.gql_log = [(self.daemon.now - 30, "pr", 1)]
+        self.assertEqual(self.daemon.stall_cause("pr")["verdict"], "backlog")
+        self.daemon.paced_at = {"pr": self.daemon.now - 10}
+        self.assertEqual(self.daemon.stall_cause("pr")["verdict"], "paced")
+        self.daemon.paths["pr"] = "rest"
+        self.assertEqual(self.daemon.stall_cause("pr")["verdict"], "backlog")
 
     def test_a_deferral_beside_a_slot_wait_keeps_its_record(self) -> None:
         # Review of glaeda#2189 (F2): the slot sentence overwrote the deferral record, so stale-cause logged a string.
@@ -14663,6 +14714,7 @@ class SpendAlarmTest(AlarmBase):
         self.daemon.blocked = {"pr": 300}
         self.daemon.batch["pr"] = 5
         self.daemon.gql_log = [(NOW - 30, "pr", 2), (NOW - 20, "pr", 2)]  # 2 points a query of 5
+        self.daemon.paced_at = {"pr": NOW - 10}  # the pace held pr reads this window
         self.daemon.read_done = {**self.daemon.read_done, "pr": [NOW - 30, NOW - 20]}
         for i in range(3):
             self.daemon.now = NOW + i * gg.TICK
