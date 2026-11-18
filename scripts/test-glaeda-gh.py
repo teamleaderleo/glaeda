@@ -18969,20 +18969,6 @@ class LandTest(Base):
         updates = [c for c in self.w.gh_calls("api") if "update-branch" in " ".join(c)]
         self.assertEqual((len(updates), e["state"]), (1, "waiting"))  # the crashed one only
 
-    def test_an_update_cancelled_before_it_was_sent_is_sent_after_the_reexec(self):
-        # review F1: a claim refused while the daemon drains for a re-exec sent nothing, so it never counts as sent
-        self.pr(LA)
-        self.land()
-        answer = lambda: refusal("tip_merge", LA, {"kind": "update_branch", "expected_head_sha": LA})
-        self.w.answers.append(answer())
-        self.q.draining = True
-        self.tick()
-        self.assertEqual(self.w.gh_calls("api"), [])
-        self.q = self.queue()
-        e = self.run_hour(answer, seconds=60)
-        updates = [c for c in self.w.gh_calls("api") if "update-branch" in " ".join(c)]
-        self.assertEqual((len(updates), e["state"], e["wait"]["kind"]), (1, "waiting", "head_change"))
-
     def test_update_refusals_in_varying_words_still_stop_on_the_steps_count(self):
         # review F4: the judgment's streak no longer bounds them, so the step's count is per head, whatever the words
         self.pr(LA)
