@@ -9007,6 +9007,15 @@ class LandQueue:
         self.stale_checkout: tuple[str, str | None] | None = None  # check_behind's last finding, numbers out
         self.mh_fallback: tuple[Path, Path] | None = None  # (merge_hold.py configured, the release run instead)
         self.latched: tuple[str, int] | None = None
+        # The latch a previous daemon saw holding (land/latch.json): a restart or re-exec inside one hold is the same
+        # window (hold), not a new one; its end is still logged and still marks latch_cleared.
+        seen = read_json(land_dir() / LAND_LATCH_FILE)
+        if isinstance(seen, dict) and isinstance(seen.get("pool"), str) \
+                and isinstance(seen.get("until"), (int, float)) and not isinstance(seen.get("until"), bool):
+            self.latched = (seen["pool"], round(seen["until"]))
+            since = seen.get("since", seen.get("at"))
+            if isinstance(since, (int, float)) and not isinstance(since, bool):
+                self.latch_started = float(since)
         self.latch_cleared = float("-inf")  # when the login's latch last cleared: no cached head before it is pinned
         refused =read_json(land_dir() / LAND_REFUSED_FILE)
         self.refused: dict | None = refused if isinstance(refused, dict) else None
@@ -9189,10 +9198,6 @@ class LandQueue:
         self.pass_gated, self.pass_first_gated = 0, None
         self.pass_latch = latch
         self.pass_latched = 0
-        if latch is None:
-            self.latch_started = None
-        elif self.latch_started is None:
-            self.latch_started = self.now
         for key in sorted(self.entries, key=self.judge_order):
             try:
                 e = self.entries[key]
@@ -9371,14 +9376,17 @@ class LandQueue:
         latch = land_latch(self.now)
         held = None if latch is None else (latch[0], round(latch[1]))
         if held != self.latched:
-            self.latched = held
+            was, self.latched = self.latched, held
             path = land_dir() / LAND_LATCH_FILE
             if held is None:
                 path.unlink(missing_ok=True)
                 self.latch_cleared = self.now  # every cached head is from before or during the park (fresh_head)
+                self.latch_started = None
                 log({"event": "land-latch-clear"})
             else:
-                write_json(path, {"pool": held[0], "until": held[1], "at": self.now})
+                if was is None or self.latch_started is None:
+                    self.latch_started = self.now  # a new hold: a new window (a longer until is the same one)
+                write_json(path, {"pool": held[0], "until": held[1], "at": self.now, "since": self.latch_started})
                 log({"event": "land-latch-held", "pool": held[0], "until": held[1]})
         return latch
 

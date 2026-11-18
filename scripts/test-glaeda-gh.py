@@ -20551,6 +20551,10 @@ class LandTest(Base):
             self.tick(60)
         self.assertEqual([h["event"] for h in self.q.entries[keys[0]]["history"]].count("latch_held"), 1)
         self.assertEqual(self.w.sent(), [])
+        self.q = self.queue()  # a re-exec inside the same hold: the same window, not a second one
+        self.tick(60)
+        self.assertEqual([self.q.entries[k]["latchHeld"]["windows"] for k in keys], [1, 1, 1])
+        self.assertEqual(self.w.sent(), [])
         # It clears; every row's place in the reset spread is still ahead, and the login is spent again before it
         self.tick(reset1 + 1 - self.t)
         self.assertEqual(self.w.explains(), [])
