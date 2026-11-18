@@ -91,6 +91,7 @@ def prefetch_module():
                                                   os.fspath(SCRIPT_DIR / "glaeda-seed-prefetch"))
     spec = importlib.util.spec_from_loader(loader.name, loader)
     module = importlib.util.module_from_spec(spec)
+    sys.modules[loader.name] = module  # dataclasses look their module up in sys.modules while it loads
     loader.exec_module(module)
     return module
 
