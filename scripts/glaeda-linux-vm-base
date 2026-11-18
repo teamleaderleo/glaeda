@@ -232,7 +232,10 @@ class Installer:
                         raise Failed(f"Lima archive holds an unexpected entry {member.name!r}")
                     if member.issym() and (member.linkname.startswith("/") or ".." in pathlib.PurePosixPath(member.linkname).parts):
                         raise Failed(f"Lima archive holds an escaping link {member.name!r}")
-                tar.extractall(tree)  # noqa: S202 - every member checked above
+                if hasattr(tarfile, "data_filter"):
+                    tar.extractall(tree, filter="data")
+                else:  # every member was checked above
+                    tar.extractall(tree)  # noqa: S202
             if not os.access(tree / "bin" / "limactl", os.X_OK):
                 raise Failed("Lima archive has no bin/limactl")
             os.rename(tree, self.prefix)
