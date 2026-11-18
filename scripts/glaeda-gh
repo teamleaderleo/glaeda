@@ -8512,6 +8512,8 @@ class LandQueue:
                 if isinstance(claimed, dict) and claimed.get("kind") in ("update_branch", "retarget") and before:
                     # It may have pushed: never judge (or pin) the head from before it.
                     e["preStepHead"] = before
+                    if claimed.get("kind") == "update_branch":  # sent once at that head (LAND_UPDATE_ONCE)
+                        e["updateSent"] = {"head": before, "at": float(claimed.get("claimedAt") or self.now)}
                     e["state"] = "waiting"
                     e["wait"] = {"kind": "head_change", "before": before, "since": self.now}
                     e["wakeAt"] = self.now + LAND_HEAD_TIMEOUT
@@ -8598,7 +8600,7 @@ class LandQueue:
         if fresh:
             e.update(state="queued", head="", explain=None, action=None, streak=None, wakeAt=None,
                      wait=None, seen=None, seenHead="", mergeSha="", stop=None, preStepHead="",
-                     lastAction=None, reviewed=[])
+                     lastAction=None, reviewed=[], updateSent=None, updateDeferred=None)
             self.history(e, "queued", by=e["requester"], via=e["requesterFrom"], after=",".join(e["after"]))
         else:
             self.history(e, "updated", by=e["requester"], after=",".join(e["after"]))
@@ -9510,14 +9512,17 @@ class LandQueue:
                           "install the gh-quota shim (tools/host-baseline) or set gh in ~/.config/glaeda/land.json")
             return
         with self.lock:
+            self.claim(e, kind, before=head, **extra)  # may raise LandCancelled (draining, a newer land): nothing sent
             if kind == "update_branch":
-                e["updateSent"] = {"head": head, "at": self.now}  # saved by claim: a restart mid-send counts as sent
-            self.claim(e, kind, before=head, **extra)
+                e["updateSent"] = {"head": head, "at": self.now}  # a restart mid-send counts as sent (load)
+                self.save(e)
         got = self.call([gh, *args], LAND_GH_DEADLINE, e)
         named = None
         with self.lock:
-            if kind == "update_branch" and got.returncode != 0:
-                e.pop("updateSent", None)  # refused: not sent; step_refused counts and backs off its retries
+            if kind == "update_branch" and got.returncode not in (0, 124):
+                # refused: not sent; step_refused counts and backs off its retries. A timeout (124) may have reached
+                # GitHub: it stays sent.
+                e.pop("updateSent", None)
             self.finish(e, got)
             e["preStepHead"] = head if got.returncode == 0 else ""
             if got.returncode == 0:
@@ -9630,7 +9635,9 @@ class LandQueue:
             self.save(e)
             return None
         cls = land_step_class(out)
-        sig = f"{kind}|{head}|{cls}"
+        # An update-branch's refusals count per head whatever their words: the judgment's streak no longer bounds them
+        # (LAND_UPDATE_ONCE), so a refusal whose text varies must not restart the count.
+        sig = f"{kind}|{head}" if kind == "update_branch" else f"{kind}|{head}|{cls}"
         last = e.get("stepFail") or {}
         n = int(last.get("count") or 0) + 1 if last.get("sig") == sig else 1
         e["stepFail"] = {"sig": sig, "kind": kind, "head": head, "class": cls, "count": n, "at": self.now}
