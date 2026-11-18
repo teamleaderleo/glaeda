@@ -184,6 +184,29 @@ another template, or broken is reported (exit 2), never replaced. A clone is
 `limactl --tty=false clone glaeda-linux-arm64-base NAME --cpus 4 --memory 8 --mount-none --start`
 with that `LIMA_HOME`; 3 to 4 fit on a 48 GB mini.
 
+## Linux VM rollout on every mini
+
+`glaeda-linux-vm-rollout` brings a mini's whole tier up in one order: base, stage
+(`glaeda-linux-vm-serve`), install-root, token, enroll, finish. Run it on the mini as the
+operator, from the glaeda checkout to install; it plans by default and stops at the first step with
+work left, printing `stopped_at` and the exact `next` commands:
+
+```bash
+W=manaflow-ai/cmux/.github/workflows/FILE.yml@refs/heads/main   # the runner group's list, repeated exactly
+python3 scripts/glaeda-linux-vm-rollout --host HOST --workflow "$W"            # plan
+python3 scripts/glaeda-linux-vm-rollout --host HOST --workflow "$W" --apply    # stops at install_root
+fleet-sudo HOST .../glaeda-linux-vm-serve install-root ... --apply              # printed; the controller runs it
+python3 scripts/glaeda-linux-vm-rollout --host HOST --workflow "$W" --apply    # enrolls, stops at approve
+python3 scripts/glaeda-linux-vm-rollout --host HOST --workflow "$W" --apply --approve-plan ID   # serving
+```
+
+Each mini enrolls its own scale set, `glaeda-linux-arm64-HOST`, in the shared runner group, all
+carrying the one job label `glaeda-linux-arm64`. A scale set's message session belongs to one
+listener, and every listener sizes itself from the whole scale set's assigned-job count, so minis
+cannot share one. The token step waits for the org-runners token push to reach the host. Each mini
+advertises a maximum capacity of one clone today: the bridge target refuses any other value, and
+the fleet host lock does not count VM clones yet, so a higher cap waits for that accounting.
+
 ## Runbook map
 
 - [`FLEET_STATUS.md`](FLEET_STATUS.md) defines the typed status document and finding schema.
