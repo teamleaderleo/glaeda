@@ -184,6 +184,27 @@ another template, or broken is reported (exit 2), never replaced. A clone is
 `limactl --tty=false clone glaeda-linux-arm64-base NAME --cpus 4 --memory 8 --mount-none --start`
 with that `LIMA_HOME`; 3 to 4 fit on a 48 GB mini.
 
+Step two is the installed disposable-worker service that clones that base per job
+(`docs/DISPOSABLE_INSTALLED_SERVICE_ACCEPTANCE.md`), staged by `scripts/glaeda-linux-vm-serve`:
+
+```bash
+python3 scripts/glaeda-linux-vm-serve --apply      # operator: pinned Go 1.26.3, Rust 1.97.1, build + stage
+fleet-sudo HOST "$PWD/scripts/glaeda-linux-vm-serve" install-root --from ~/.glaeda/linux-vm \
+  --glaeda-sha256 X --bridge-sha256 Y --apply      # root: exact staged digests to /opt/smolrunner/bin, 0555
+# once ~/.config/glaeda/scaleset-token.json is pushed:
+~/.glaeda/linux-vm/serve/stage/scaleset-enroll --token-file ~/.config/glaeda/scaleset-token.json \
+  --workflow ORG/REPO/.github/workflows/F.yml@refs/heads/main --apply > ~/.glaeda/linux-vm/serve/scaleset-enroll.json
+python3 scripts/glaeda-linux-vm-serve finish --scale-set ~/.glaeda/linux-vm/serve/scaleset-enroll.json   # prints plan_identity
+python3 scripts/glaeda-linux-vm-serve finish --scale-set ... --apply --approve-plan sha256:...
+```
+
+The operator run prints the exact `install-root` line with both digests. `finish` writes the
+canonical schema-2 enrollment (`installation_token_file` credential, base VM as the clone source,
+4 vCPU / 8 GiB / 20 GiB) to `~/.glaeda/linux-vm/serve/enrollment.json` at mode 0600, re-plans,
+runs `service apply` only for the approved identity, and requires `service status` to read
+`loaded_exact`. Paths under `/opt/smolrunner` and the `io.smolrunner.disposable-worker` label are
+the code's existing contracts. A file it did not install is reported, never replaced.
+
 ## Runbook map
 
 - [`FLEET_STATUS.md`](FLEET_STATUS.md) defines the typed status document and finding schema.
