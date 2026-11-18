@@ -8715,6 +8715,88 @@ class VolumeCensusTest(unittest.TestCase):
             self.assertIn("--exclude=Pictures", gd.du_skip_args())  # GNU du never gets BSD's -I
             self.assertNotIn("-I", gd.du_skip_args())
 
+    def test_a_du_walk_that_reaches_a_home_library_skips_its_guarded_folders(self) -> None:
+        # cmux19, 2026-11-17 09:52, with #2088 installed: the worker's lent eviction ran glaeda-disk, whose
+        # accounting `du -xk -d 1 /System/Volumes/Data/Users` walked into ~/Library/Photos (Photos-guarded)
+        # after 113 checks on other apps' data (~/Library/Containers, Group Containers), and macOS asked
+        # "Allow worker-ad02c96c... to access your photo library?". Every walk whose root reaches a home's
+        # Library names its guarded folders in -I; a walk of the shared build tree does not, so a build
+        # folder that happens to be called Photos or Messages is still sized there.
+        def ignored(argv: list[str]) -> set[str]:
+            return ({argv[i + 1] for i, a in enumerate(argv[:-1]) if a == "-I"}
+                    | {a.removeprefix("--exclude=") for a in argv if a.startswith("--exclude=")})
+
+        home = self.root / "home"
+        seen: list[list[str]] = []
+
+        def fake(argv, *args, **kwargs):
+            seen.append(list(argv))
+            return f"4 {argv[-1]}\n"
+
+        guarded = ("Photos", "Containers", "Group Containers", "Mail", "Messages", "Safari", "Calendars",
+                   "Reminders", "HomeKit", "Cookies", "AddressBook", "com.apple.TCC")
+        with mock.patch.object(gd, "DARWIN", True), mock.patch.object(gd, "HOME", home), \
+                mock.patch.object(gd, "_measurement_path_allowed", return_value=True), \
+                mock.patch.object(gd, "_measurement_on_timeout_cooldown", return_value=False), \
+                mock.patch.object(gd, "_du_output", side_effect=fake):
+            for root in (Path("/"), Path("/System/Volumes/Data"), Path("/System/Volumes/Data/Users"),
+                         Path("/Users"), Path("/Users/cmux"), Path("/Users/cmux/Library"),
+                         Path("/Users/cmux/Library/Application Support"), home, home / "Library"):
+                seen.clear()
+                gd.du_bytes(root, record_timeout=False)
+                gd.du_children(root, record_timeout=False)
+                gd.du_children_with_status(root, record_timeout=False)
+                seen.append(gd._census_du_argv(root))
+                self.assertEqual(len(seen), 4, root)
+                for argv in seen:
+                    for name in guarded:
+                        self.assertIn(name, ignored(argv), (root, argv))
+                    self.assertEqual(argv[-1], str(root))
+            # below a Library only its own guarded parents: a simulator's data/Containers stays sized
+            for root in (Path("/Users/Shared/cmux-build-fleet/cache"), Path("/Users/Shared"),
+                         Path("/System/Volumes/Data/Users/Shared"), Path("/Users/cmux/Projects/cmux"),
+                         Path("/Users/cmux/Library/Caches"), Path("/Users/cmux/Library/Developer/CoreSimulator"),
+                         home / "Projects", home / "Library" / "Caches"):
+                self.assertNotIn("Photos", ignored(gd._census_du_argv(root)), root)
+                self.assertNotIn("Messages", ignored(["du", *gd.du_skip_args(root), str(root)]), root)
+        with mock.patch.object(gd, "DARWIN", False):
+            self.assertNotIn("Photos", ignored(["du", *gd.du_skip_args(Path("/home/runner")), "/home/runner"]))
+
+    def test_the_census_never_opens_a_privacy_guarded_folder(self) -> None:
+        # The census lists the Data volume a directory at a time; opening ~/Pictures or ~/Library/Photos asks a
+        # person (cmux19, 2026-11-17). Those are named as skipped, never listed; a build folder that happens to be
+        # called Photos outside a Library, or a simulator's data/Containers, is still walked. _census_du answers
+        # None (as for a timed-out du), so the census opens every directory it does not skip.
+        home = self.root / "Users" / "cmux"
+        sim = "Users/cmux/Library/Developer/CoreSimulator/Devices/u/data/Containers"
+        for rel in ("Users/cmux/Pictures/Photos Library.photoslibrary/db", "Users/cmux/Library/Photos/x",
+                    "Users/cmux/Library/Containers/c/y", "Users/cmux/Library/Group Containers/g/y",
+                    "Users/cmux/Library/Application Support/AddressBook/z", "Users/cmux/Library/Caches/z",
+                    "Users/cmux/Projects/app/Photos/p", "Users/cmux/Projects/app/Desktop/d", f"{sim}/app/s"):
+            self.write(rel)
+        opened: list[str] = []
+        listdir = os.listdir
+
+        def spy(path):
+            opened.append(str(path))
+            return listdir(path)
+
+        with mock.patch.object(gd, "DARWIN", True), mock.patch.object(gd, "HOME", home), \
+                mock.patch.object(gd.os, "listdir", side_effect=spy), \
+                mock.patch.object(gd, "_census_du", return_value=None):
+            state = gd.census_pass([self.root], set(), budget_s=1000, path=self.state)
+        self.assertTrue(state["complete"])
+        for rel in ("Users/cmux/Pictures", "Users/cmux/Library/Photos", "Users/cmux/Library/Containers",
+                    "Users/cmux/Library/Group Containers", "Users/cmux/Library/Application Support/AddressBook",
+                    "Users/cmux/Projects/app/Desktop"):
+            self.assertFalse([p for p in opened if p == str(self.root / rel) or p.startswith(f"{self.root / rel}/")],
+                             rel)
+            self.assertEqual(state["rows"][str(self.root / rel)][1], "skipped", rel)
+        for rel in ("Users/cmux/Library/Caches", "Users/cmux/Projects/app/Photos", sim):
+            self.assertIn(str(self.root / rel), opened, rel)
+        with mock.patch.object(gd, "DARWIN", False), mock.patch.object(gd, "HOME", home):
+            self.assertFalse(gd.privacy_guarded(home, "Pictures"))  # Linux has no TCC
+
     def test_a_sized_dir_whose_size_goes_is_walked_before_completion(self) -> None:
         a, b = self.write("a/blob").parent, self.write("b/blob").parent
         state = {"schema": "glaeda-disk-census/v1", "started_at": 1.0, "dev": self.root.stat().st_dev,

@@ -292,6 +292,7 @@ jobs:
               Path("scripts/test-glaeda-lan-fetch.py"),
               Path("scripts/glaeda-gh"),
               Path("scripts/test-glaeda-gh.py"),
+              Path("scripts/test-glaeda-gh-edge.py"),
               Path("scripts/benchmark-land-forward.py"),
               Path("scripts/glaeda-wallpaper-rotate"),
               Path("scripts/glaeda-sync-main"),
@@ -378,6 +379,7 @@ jobs:
           suite python3 scripts/test-glaeda-seed-lan.py
           suite python3 scripts/test-glaeda-lan-fetch.py
           suite python3 scripts/test-glaeda-gh.py
+          suite python3 scripts/test-glaeda-gh-edge.py
           suite python3 scripts/test-glaeda-wallpaper-rotate.py
           suite python3 scripts/test-glaeda-sync-main.py
           suite python3 scripts/test-delivery-concurrency.py
