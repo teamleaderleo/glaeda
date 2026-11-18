@@ -597,6 +597,21 @@ What `--apply` does:
      listens again once reclaim or the other jobs' ends bring the disk above the hard floor. An unreadable disk
      holds nothing. 2026-11-18 19:46-19:55Z: cmux18's listeners started at 8.5 GiB free beside five jobs, which
      wrote it down to 1.8 GiB while the lent fleet worker sat at `claim_paused disk` with suites queued 4-5 h.
+     **A fleet suite step goes first on a lent mini's disk, for at most 15 minutes per wait (`SUITE_FIRST_HOLD`).**
+     The PR jobs on a lent mini took every GiB a job's end freed, so a fleet suite step (20 GiB growth plus the
+     10 GiB hard floor) waited for disk for hours. The decision, verbatim: "A pool listener on a lent mini holds
+     while a fleet suite step there waits for disk, but for at most 15 minutes per wait. After that, the PR job starts
+     anyway, because macOS PR CI has no [cloud] overflow right now. Log each hold and its length." While the fleet
+     worker is paused for disk, holds no job and has less free disk than the controller wants for a step it would place
+     there, it keeps `capacity/fleet-disk.want-<pid>` fresh (`FLEET_DISK_WANT`: `since`, `want_bytes`; no admission
+     waiter, so no turn order waits on it; stale by age or a dead pid). An idle pool listener's gate then holds while
+     free disk is under `want_bytes`, at most `SUITE_FIRST_HOLD_S` (900 s) from the wait's `since`, and its reclaim aims
+     at `want_bytes`. A wait seen during a job only arms the stop at that job's end, as a full disk does; the job runs on.
+     The nightly's own listeners, a dedicated builder, a gateway runner and a runner with no floor never hold for it.
+     After the bound it listens until that wait ends; a new wait may hold again. The detector is the gate's own pair of
+     lines, `suite-first hold started: ... (SUITE_FIRST_HOLD)` and
+     `suite-first hold ended after N s: room|bound|wait gone (SUITE_FIRST_HOLD)`; the hold's reason itself is the same
+     words every poll, so `holding the listener off: ...` is logged once per hold.
      Pattern, *reservation counted twice*: a reservation for space a job will write must shrink as the job writes
      it, or the bytes count once as gone from free disk and again as reserved (2026-11-17 12:36Z-12:55Z: cmux17,
      cmux18, cmux19 and cmux21 held side-std listeners at 25-35 GiB free with every idle cache deleted while 160

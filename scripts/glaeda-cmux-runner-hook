@@ -4754,6 +4754,67 @@ def nightly_disk_wait(capacity_dir: Path, on: bool):
                 marker.unlink()
 
 
+# SUITE_FIRST_HOLD (2026-11-18): on a mini lent to the build fleet, the PR runners' jobs took every GiB a job's end
+# freed, so a fleet suite step (its 20 GiB growth plus the 10 GiB hard floor) waited for disk for hours while its
+# worker sat paused for disk beside them. The decision, verbatim: "Decided: build the suite-first hold, with a bound. A
+# pool listener on a lent mini holds while a fleet suite step there waits for disk, but for at most 15 minutes per
+# wait. After that, the PR job starts anyway, because macOS PR CI has no [cloud] overflow right now. Log each hold and
+# its length." So:
+#   - the fleet worker, while it is lent, paused for disk, holds no job and has less free disk than the controller
+#     wants for a step it would place there, keeps capacity/fleet-disk.want-<pid> fresh (FLEET_DISK_WANT: since,
+#     want_bytes). It is no admission waiter (ADMIT_WANT): no runner's turn order waits on it;
+#   - an idle pool listener's gate holds while free disk is under want_bytes (Gate.suite_first), at most
+#     SUITE_FIRST_HOLD_S from the wait's start (its since: the worker writes the marker only while free disk is under
+#     the want, so a gate's first hold of the wait comes within a poll of it), aims its reclaim at the want, and logs
+#     the hold's start and its end with the length and why it ended: room, bound or wait gone. After the bound it
+#     listens until that wait ends; a new wait may hold again;
+#   - a listener with a job is never stopped, killed or frozen for it: a look during the job only arms the stop at
+#     the job's end (JOB_END_FREEZE), as a full disk does. The nightly's own listeners, a dedicated builder, a
+#     gateway runner and a runner with no disk floor never hold for it.
+FLEET_DISK_WANT = "fleet-disk.want-"
+SUITE_FIRST_HOLD_S = 15 * 60.0
+SUITE_FIRST = "SUITE_FIRST_HOLD"
+
+
+def fleet_disk_wait(capacity_dir: Path | None) -> dict[str, Any] | None:
+    """The fleet worker's live disk wait on this mini (FLEET_DISK_WANT), or None: pid, since (Unix seconds), want_gib,
+    who and id (one per wait: its pid and since). A marker older than ADMIT_FRESH_S, or whose worker is gone, is no
+    wait (and removed where this user may). The fleet worker writes it, so it is read as untrusted."""
+    if capacity_dir is None:
+        return None
+    best: dict[str, Any] | None = None
+    with contextlib.suppress(OSError):
+        for marker in capacity_dir.glob(f"{FLEET_DISK_WANT}*"):
+            if marker.name.endswith(".tmp"):
+                continue
+            try:
+                pid = int(marker.name[len(FLEET_DISK_WANT):])
+                fresh = time.time() - marker.stat().st_mtime < ADMIT_FRESH_S
+            except (OSError, ValueError):
+                continue
+            if not 0 < pid < 2 ** 31:
+                continue
+            if not fresh or not pid_alive(pid):
+                with contextlib.suppress(OSError):
+                    marker.unlink()  # a worker that was killed
+                continue
+            try:
+                data = json.loads(read_bounded(marker) or b"")
+                since, want = data["since"], data["want_bytes"]
+                if isinstance(since, bool) or isinstance(want, bool):
+                    continue
+                since, want = float(since), int(want)
+            except (OSError, ValueError, TypeError, KeyError, AttributeError, OverflowError):
+                continue
+            if not math.isfinite(since) or want <= 0:
+                continue
+            wait = {"pid": pid, "since": since, "want_gib": round(want / 1024 ** 3, 1),
+                    "who": str(data.get("who") or "")[:200], "id": f"{pid}:{since:.3f}"}
+            if best is None or wait["want_gib"] > best["want_gib"]:
+                best = wait
+    return best
+
+
 RUNNER_WORK_HELD = "a nightly job's eviction still holds this runner's work"  # job-started refuses on it
 EVICT_RUNNER_LOCK = ".glaeda-evict.lock"  # <runner>/: held while another runner's job takes this runner's work away
 
@@ -9991,6 +10052,11 @@ class Gate:
         # DISK_RECLAIM_NOW: (why, the free GiB wanted) while an idle pool runner is short of one job's peak or of the
         # jobs in flight's disk at the last look; the listener's next start waits for room at most DISK_RECLAIM_WAIT_S
         self.disk_short: tuple[str, float] | None = None
+        # SUITE_FIRST_HOLD: the fleet disk wait last seen (its id), when this gate's hold for it began (wall clock;
+        # None while not holding) and the free GiB the wait wants while held, which low_disk's reclaim aims at too
+        self.suite_wait: str | None = None
+        self.suite_held_at: float | None = None
+        self.suite_want_gib: float | None = None
         self.watching: tuple[int, ...] = ()
         # JOB_END_FREEZE: armed while a job runs that the gate may stop the listener after; the listener pids and the
         # job's request, read during the job, so the freeze at the Worker's exit needs no ps and the look after it
@@ -10118,7 +10184,7 @@ class Gate:
             self.load_since = None  # the fleet's claim, not load, is holding this gate
             self.yield_to_fleet()
         return (why or self.shed(self.saturated()) or self.load_capped() or self.memory_capped() or self.full() or self.shed(self.hot()) or self.stalled()
-                or self.locked() or self.low_disk() or self.ineligible() or self.off_tailnet())
+                or self.locked() or self.low_disk() or self.suite_first() or self.ineligible() or self.off_tailnet())
 
     def exclusive_yield(self) -> str | None:
         """YIELD_TO_EXCLUSIVE at the listener: why a yieldToExclusive dedicated runner takes no job now (a signing
@@ -10666,7 +10732,7 @@ class Gate:
             self.load_since = None
             self.yield_to_fleet()
         return (why or self.shed(self.saturated()) or self.load_capped() or self.memory_capped() or self.full(fresh=True) or self.shed(self.hot(fresh=True))
-                or self.stalled() or self.locked(fresh=True) or self.low_disk() or self.ineligible() or self.off_tailnet())
+                or self.stalled() or self.locked(fresh=True) or self.low_disk() or self.suite_first() or self.ineligible() or self.off_tailnet())
 
     def still_waiting(self) -> str | None:
         """A fleet build seen waiting during the job that just ended, still waiting in a fresh reading."""
@@ -10733,6 +10799,7 @@ class Gate:
                 floor = builder + job_disk_gib()
                 reserve = f" (the dedicated builder's {builder:g} GiB floor + {job_disk_gib():g} GiB for a job here)"
         path = os.path.dirname(self.host_lock)
+        aim = self.suite_want_gib or 0.0  # SUITE_FIRST_HOLD: while a suite step's hold runs, reclaim aims at its want
         self.reap_eviction(path, floor)
         why = disk_refusal(path, floor)
         # The peak is read on its own, not only under the floor: a floor under one job's peak (--min-free-gib 30 with
@@ -10750,7 +10817,7 @@ class Gate:
             full_gib = min(RUNNER_JOBS_FLOOR_GIB, peak)
             if (free := free_or_none(path)) is not None and free < full_gib:
                 self.disk_short = None
-                self.evict_in_background(path, max(floor, peak))
+                self.evict_in_background(path, max(floor, peak, aim))
                 # the same words every poll: the gate logs a hold again only when its reason changes
                 return (f"disk full: under {full_gib:g} GiB, where no job of this runner fits; "
                         "reclaiming (DISK_FULL_NO_LISTEN)")
@@ -10760,7 +10827,7 @@ class Gate:
                 short = (f"disk: {crowded[0]} (RUNNER_JOBS_DISK)", max(floor, crowded[1]))
         self.disk_short = short
         if short:
-            self.evict_in_background(path, short[1])
+            self.evict_in_background(path, max(short[1], aim))
             if reserve:
                 self.evict_idle_in_background(path, short[1] + GATE_DISK_RESUME_GIB)
             now = time.monotonic()
@@ -10769,7 +10836,7 @@ class Gate:
                 self.disk_warned_at = now
             return None
         if why:
-            self.evict_in_background(path, floor)
+            self.evict_in_background(path, max(floor, aim))
             if scope.dedicated or reserve:
                 self.evict_idle_in_background(path, floor + GATE_DISK_RESUME_GIB)
             now = time.monotonic()
@@ -10777,6 +10844,55 @@ class Gate:
                 gate_log(f"disk warning: {why}{reserve}; keeping the listener online and requesting cleanup")
                 self.disk_warned_at = now
         return None
+
+    def suite_first(self, busy: bool = False) -> str | None:
+        """SUITE_FIRST_HOLD: why this pool listener stays off for a fleet suite step that waits for disk on this mini
+        (fleet_disk_wait), or None. It holds while free disk is under the step's want, at most SUITE_FIRST_HOLD_S from
+        the wait's start, and its reclaim aims at the want; one line logs the hold's start and one its end, with its
+        length and why (room, bound, wait gone). The reason is the same words every poll, so the gate's own hold line
+        is logged once. busy: a look while this runner's job runs, which only reads (no log, no reclaim, no state):
+        its answer arms the stop at the job's end, as a full disk does; the job itself runs on. The nightly's own
+        listeners, a dedicated builder, a gateway runner and a runner with no disk floor never hold for it."""
+        scope = runner_scope(self.runner_dir)
+        nightly_own = (scope.nightly or scope.trusted_signing) and not scope.dedicated
+        if scope.dedicated or nightly_own or scope.gateway or scope.min_free_gib <= 0:
+            return None
+        wait = fleet_disk_wait(self.capacity_dir or Path(FLEET_DIR) / "capacity")
+        now = time.time()
+        if not busy and (wait is None or wait["id"] != self.suite_wait):
+            self.suite_end("wait gone", now)
+            self.suite_wait = wait["id"] if wait else None
+        if wait is None:
+            return None
+        path = os.path.dirname(self.host_lock)
+        free, want = free_or_none(path), wait["want_gib"]
+        if free is None or free >= want:
+            if not busy:
+                self.suite_end("room", now)
+            return None
+        left = SUITE_FIRST_HOLD_S - (now - min(wait["since"], now))
+        if left <= 0:
+            if not busy:
+                self.suite_end("bound", now)
+            return None
+        why = (f"a fleet suite step waits for {want:g} GiB free on this mini; holding at most "
+               f"{SUITE_FIRST_HOLD_S / 60:g} min per wait ({SUITE_FIRST})")
+        if busy:
+            return why
+        if self.suite_held_at is None:
+            self.suite_held_at = now
+            gate_log(f"suite-first hold started: a fleet suite step waits for {want:g} GiB free, {free:.1f} GiB free "
+                     f"({wait['who'] or 'pid ' + str(wait['pid'])}); this idle listener holds at most {left:.0f} s "
+                     f"more ({SUITE_FIRST})")
+        self.suite_want_gib = want
+        self.evict_in_background(path, want)
+        return why
+
+    def suite_end(self, why: str, now: float) -> None:
+        """SUITE_FIRST_HOLD: log the end of this gate's hold, if one runs, with its length and why it ended."""
+        if self.suite_held_at is not None:
+            gate_log(f"suite-first hold ended after {max(0.0, now - self.suite_held_at):.0f} s: {why} ({SUITE_FIRST})")
+        self.suite_held_at, self.suite_want_gib = None, None
 
     def runner_jobs_short(self, path: str) -> tuple[str, float] | None:
         """RUNNER_JOBS_DISK: (why, the free disk wanted) when free disk is under the floor plus one measured job's
@@ -11605,7 +11721,7 @@ class Gate:
                 finished = self.job_request
                 self.watching, self.job_waited, self.freeze_at_exit, self.job_request = (), False, False, None
                 ending = self.job_end() if self.job_ending else None
-                if (why := self.draining() or self.low_disk() or self.still_waiting() or self.still_reserved()
+                if (why := self.draining() or self.low_disk() or self.suite_first() or self.still_waiting() or self.still_reserved()
                         or self.exclusive_yield() or ending):
                     if not listener_went_online(self.runner_dir):
                         self.unclaim()
@@ -11637,7 +11753,8 @@ class Gate:
                 # A disk floor is advisory cleanup only: never watch or freeze a Worker for it. A full disk
                 # (DISK_FULL_NO_LISTEN) is not a floor: the next job would fail there, so the listener stops at this
                 # job's end as for a reservation, and starts again once reclaim or the other jobs' ends free room.
-                full = self.low_disk()
+                # A fleet suite step waiting for disk here (SUITE_FIRST_HOLD) only arms that stop too: the job runs on.
+                full = self.low_disk() or self.suite_first(busy=True)
                 self.job_waited = bool(self.waiting) or reserved is not None or full is not None
                 workers = tuple(pid for pid in self.worker_pids() if pid not in self.done) \
                     if self.waiting or reserved or full or self.job_ending else ()

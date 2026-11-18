@@ -12039,6 +12039,156 @@ class GateTest(unittest.TestCase):
             gate.step(); gate.step(); gate.step()
         self.assertEqual((stops, gate.watching), ([], ()))
 
+    def suite_marker(self, since: float, want_gib: float = 30.0, pid: int | None = None) -> Path:
+        """SUITE_FIRST_HOLD: the fleet worker's disk-want marker in this test's capacity ledger, as the worker
+        writes it (build-fleet/cmd/worker fleet_disk_want.go)."""
+        capacity = self.tmp / "capacity"
+        capacity.mkdir(exist_ok=True)
+        marker = capacity / f"{hook.FLEET_DISK_WANT}{pid or os.getpid()}"
+        marker.write_text(json.dumps({"schema": "cmux-fleet-disk-want/v1", "since": since,
+                                      "want_bytes": int(want_gib * 1024**3), "free_bytes": 22 * 1024**3,
+                                      "who": "fleet worker test"}) + "\n")
+        return marker
+
+    def test_a_fleet_suite_step_waiting_for_disk_holds_an_idle_pool_listener_at_most_15_minutes(self) -> None:
+        """SUITE_FIRST_HOLD (2026-11-18: lent minis' PR jobs took every freed GiB while a fleet suite step waited for
+        disk for hours). The decision: "A pool listener on a lent mini holds while a fleet suite step there waits for
+        disk, but for at most 15 minutes per wait. ... Log each hold and its length." An idle pool listener holds
+        while free disk is under the step's want, with one reason every poll and one start line; its reclaim aims at
+        the want; the hold ends when the room is there, at the bound (from the wait's start), or when the wait goes,
+        each logged once with its length; past the bound it listens until that wait ends; a new wait holds again."""
+        write_hook(self.runner, "exec python3 /hook job-started --min-free-gib 30 --capacity-units 14\n")
+        capacity = self.tmp / "capacity"
+        gate = hook.Gate(self.runner, os.fspath(self.lock), "", self.state, capacity_dir=capacity)
+        clock, free, logs, aims = {"t": 1_800_000_000.0}, {"gib": 22.0}, [], []
+        gate.evict_in_background = lambda _path, floor: aims.append(floor)
+        start = clock["t"]
+        marker = self.suite_marker(start)
+        with mock.patch.object(hook.shutil, "disk_usage",
+                               side_effect=lambda _p: mock.Mock(free=int(free["gib"] * 1024**3))), \
+                mock.patch.object(hook, "gate_log", side_effect=logs.append), \
+                mock.patch.object(hook, "ADMIT_FRESH_S", 1e9), \
+                mock.patch.object(hook.time, "time", side_effect=lambda: clock["t"]):
+            whys = []
+            for _ in range(5):
+                whys.append(gate.suite_first())
+                clock["t"] += hook.GATE_POLL_S
+            self.assertTrue(whys[0] and hook.SUITE_FIRST in whys[0], whys)
+            self.assertEqual(len(set(whys)), 1, f"the same reason every poll, so the gate logs its hold once: {whys}")
+            self.assertEqual(aims[-1], 30.0, "reclaim aims at the step's want")
+            self.assertEqual(gate.suite_want_gib, 30.0, "low_disk's reclaim aims there too")
+            started = [line for line in logs if line.startswith("suite-first hold started")]
+            self.assertEqual(len(started), 1, logs)
+            # the room is there: the hold ends, logged once with its length
+            free["gib"] = 31.0
+            self.assertIsNone(gate.suite_first())
+            self.assertIsNone(gate.suite_first())
+            ended = [line for line in logs if line.startswith("suite-first hold ended")]
+            self.assertEqual(ended, [f"suite-first hold ended after {5 * hook.GATE_POLL_S:.0f} s: room "
+                                     f"({hook.SUITE_FIRST})"])
+            # the PR jobs write it down again within the same wait: it holds again, until 15 min from the wait's start
+            free["gib"] = 22.0
+            clock["t"] = start + 600
+            self.assertIsNotNone(gate.suite_first())
+            clock["t"] = start + hook.SUITE_FIRST_HOLD_S - 1
+            self.assertIsNotNone(gate.suite_first())
+            clock["t"] = start + hook.SUITE_FIRST_HOLD_S
+            self.assertIsNone(gate.suite_first(), "past the bound the PR job starts anyway")
+            self.assertTrue(logs[-1].startswith("suite-first hold ended after 300 s: bound"), logs[-1])
+            count = len(logs)
+            for _ in range(3):
+                clock["t"] += 60
+                self.assertIsNone(gate.suite_first(), "it listens until the wait ends")
+            self.assertEqual(len(logs), count, "nothing more is logged for a bounded wait")
+            self.assertIsNone(gate.suite_want_gib)
+            # a new wait (the worker leased, then waits again) holds again; its marker going ends that hold
+            marker = self.suite_marker(clock["t"])
+            self.assertIsNotNone(gate.suite_first())
+            self.assertTrue(logs[-1].startswith("suite-first hold started"), logs[-1])
+            clock["t"] += 42
+            marker.unlink()
+            self.assertIsNone(gate.suite_first())
+            self.assertEqual(logs[-1], f"suite-first hold ended after 42 s: wait gone ({hook.SUITE_FIRST})")
+        self.assertEqual(hook.SUITE_FIRST_HOLD_S, 15 * 60.0)
+
+    def test_a_fleet_suite_step_never_holds_the_nightly_dedicated_gateway_or_a_floorless_runner(self) -> None:
+        """SUITE_FIRST_HOLD holds pool runners only: the nightly's own listeners (their jobs come first), a dedicated
+        builder, a gateway runner (its clients build elsewhere) and a runner with no disk floor never hold for it."""
+        capacity = self.tmp / "capacity"
+        self.suite_marker(time.time())
+        logs: list[str] = []
+        texts = ("exec python3 /hook job-started --min-free-gib 30 --nightly-runner\n",
+                 "exec python3 /hook job-started --min-free-gib 30 --trusted-next-signing\n",
+                 "exec python3 /hook job-started --min-free-gib 30 --dedicated-admit /x/a.sh\n",
+                 "exec python3 /hook job-started --min-free-gib 30 --gateway-runner\n",
+                 "exec python3 /hook job-started --capacity-units 14\n")
+        with mock.patch.object(hook.shutil, "disk_usage", return_value=mock.Mock(free=5 * 1024**3)), \
+                mock.patch.object(hook, "gate_log", side_effect=logs.append):
+            for text in texts:
+                write_hook(self.runner, text)
+                gate = hook.Gate(self.runner, os.fspath(self.lock), "", self.state, capacity_dir=capacity)
+                gate.evict_in_background = lambda *_: self.fail("no reclaim for a runner that never holds")
+                self.assertIsNone(gate.suite_first(), text)
+                self.assertIsNone(gate.suite_first(busy=True), text)
+            write_hook(self.runner, "exec python3 /hook job-started --min-free-gib 30 --capacity-units 14\n")
+            gate = hook.Gate(self.runner, os.fspath(self.lock), "", self.state, capacity_dir=capacity)
+            gate.evict_in_background = lambda *_: None
+            self.assertIsNotNone(gate.suite_first(), "a pool runner does hold")
+        self.assertEqual(len(logs), 1, logs)
+
+    def test_a_stale_dead_or_malformed_fleet_disk_marker_is_no_wait_and_no_admission_waiter(self) -> None:
+        """FLEET_DISK_WANT is read as untrusted: a dead worker's, an old or a malformed marker is no wait (the dead and
+        old ones are removed), and no marker is an admission waiter, so no runner's turn order waits on it."""
+        capacity = self.tmp / "capacity"
+        now = time.time()
+        live = self.suite_marker(now)
+        wait = hook.fleet_disk_wait(capacity)
+        self.assertEqual((wait["pid"], wait["since"], wait["want_gib"]), (os.getpid(), now, 30.0))
+        self.assertEqual(hook.admission_waiters(capacity), [], "the fleet's disk want is no admission waiter")
+        live.unlink()
+        dead = self.suite_marker(now, pid=2147483646)
+        self.assertIsNone(hook.fleet_disk_wait(capacity))
+        self.assertFalse(dead.exists(), "a dead worker's marker is removed")
+        old = self.suite_marker(now)
+        os.utime(old, (now - hook.ADMIT_FRESH_S - 5, now - hook.ADMIT_FRESH_S - 5))
+        self.assertIsNone(hook.fleet_disk_wait(capacity))
+        self.assertFalse(old.exists(), "a marker the worker stopped refreshing is removed")
+        for body in ("not json", json.dumps({"since": now}), json.dumps({"since": True, "want_bytes": 1 << 30}),
+                     json.dumps({"since": now, "want_bytes": True}), json.dumps({"since": "inf", "want_bytes": 1 << 30}),
+                     json.dumps({"since": now, "want_bytes": 0})):
+            (capacity / f"{hook.FLEET_DISK_WANT}{os.getpid()}").write_text(body)
+            self.assertIsNone(hook.fleet_disk_wait(capacity), body)
+        (capacity / f"{hook.FLEET_DISK_WANT}{os.getpid()}").unlink()
+        tmp = self.suite_marker(now)
+        tmp.rename(tmp.with_name(tmp.name + ".tmp"))
+        self.assertIsNone(hook.fleet_disk_wait(capacity), "a half-written .tmp is not read")
+        self.assertIsNone(hook.fleet_disk_wait(None))
+
+    def test_a_suite_step_waiting_for_disk_during_a_job_stops_the_listener_only_as_the_job_ends(self) -> None:
+        """SUITE_FIRST_HOLD never stops, kills or freezes a running job: a listener takes its next job within a second
+        of its Worker's exit, faster than an idle look, so a wait seen during a job arms the stop at the job's end
+        (as a full disk does), reading only (no hold logged, no reclaim) until then; the job runs on."""
+        write_hook(self.runner, "exec python3 /hook job-started --min-free-gib 30 --capacity-units 14\n")
+        self.suite_marker(time.time())
+        gate, stops = self.gate([None] * 3, busy=[True, True])
+        gate.capacity_dir = self.tmp / "capacity"
+        gate.worker_pids = lambda: [4343]
+        aims: list[float] = []
+        gate.evict_in_background = lambda _path, floor: aims.append(floor)
+        logs: list[str] = []
+        with mock.patch.object(hook, "host_waiters", return_value=set()), \
+                mock.patch.object(gate, "low_disk", return_value=None), \
+                mock.patch.object(hook, "gate_log", side_effect=logs.append), \
+                mock.patch.object(hook.shutil, "disk_usage", return_value=mock.Mock(free=22 * 1024**3)):
+            gate.step(); gate.step()
+            self.assertEqual((stops, gate.watching), ([], (4343,)), "never stopped under its job; its Worker is watched")
+            self.assertEqual((aims, [line for line in logs if "suite-first" in line]), ([], []),
+                             "a look during the job only reads")
+            gate.step()  # the job ended
+        self.assertEqual(len(stops), 1, stops)
+        self.assertIn(hook.SUITE_FIRST, stops[0])
+        self.assertEqual(len([line for line in logs if line.startswith("suite-first hold started")]), 1, logs)
+
     def drain(self, until: float | None = None, reason: str = "a relabel to a,b") -> Path:
         marker = self.runner / hook.RUNNER_DRAIN_FILE
         marker.write_text(json.dumps({"reason": reason, "until": until if until is not None else time.time() + 600}))
