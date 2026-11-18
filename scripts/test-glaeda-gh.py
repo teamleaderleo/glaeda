@@ -13931,6 +13931,26 @@ class SpendAlarmTest(Base):
         self.daemon.stale_valve(("warn", "x", {"kind": "pr"}), self.daemon.policy["alarms"])
         self.assertIsNotNone(self.daemon.valve_due, "past the cooldown the valve acts again")
 
+    def test_the_valve_never_restarts_for_one_stale_key_while_other_waited_keys_are_read(self) -> None:
+        # huge-blue, 2026-11-18: six valve restarts in six hours, each for one PR (pr:manaflow-ai/cmux#46087 at 3963 s,
+        # 16 ticks) while the daemon read the rest, and each threw away the land queue's judgments in flight.
+        self.policy()
+        self.daemon.started_tick = NOW - 2 * gg.STALE_DATA_AFTER
+        self.daemon.stale_waited, self.daemon.stale_waited_key = {"pr": 3963.0}, {"pr": "pr:o/r#5"}
+        self.daemon.fresh_waited = {"pr": 30.0}
+        for i in range(3):
+            self.daemon.now = NOW + i * gg.TICK
+            self.daemon.check_alarms()
+        self.assertIsNone(self.daemon.valve_due)
+        self.assertIn("pr:o/r#5", self.daemon.nudged)  # its read goes first instead
+        verdict = self.daemon.stale_valve(("warn", "x", {"kind": "pr", "key": "pr:o/r#5"}), self.daemon.policy["alarms"])
+        self.assertEqual((verdict[2]["valve"], verdict[2]["freshest"]), ("one_key", 30))
+        # nothing read anywhere (every waited key old): that is a stuck daemon, and the valve still acts
+        self.daemon.fresh_waited = {"pr": float(gg.STALE_DATA_AFTER + 1)}
+        self.daemon.now += gg.TICK
+        self.daemon.check_alarms()
+        self.assertIsNotNone(self.daemon.valve_due)
+
     def test_the_valve_waits_for_a_daemon_to_have_had_its_chance_and_obeys_policy(self) -> None:
         self.policy()
         stale = ("warn", "x", {"kind": "pr"})
@@ -19330,11 +19350,31 @@ class LandTest(Base):
         self.assertFalse(self.daemon.land_busy())
         fut = mock.Mock()
         fut.done.return_value = False
-        self.daemon.land_queue.jobs["pr:o/r#1"] = fut
+        q = self.daemon.land_queue
+        q.jobs["pr:o/r#1"] = fut
+        q.entries["pr:o/r#1"] = {"key": "pr:o/r#1", "state": "acting"}
         self.assertTrue(self.daemon.land_busy())
         fut.done.return_value = True
         fut.exception.return_value = None
         self.assertFalse(self.daemon.land_busy())
+
+    def test_reexec_drops_a_running_judgment_and_no_judgment_claims_a_step_after_it(self):
+        # huge-blue, 2026-11-18: merge_hold explains run for minutes, so every update waited REEXEC_DRAIN_MAX (300 s,
+        # no new land step meanwhile) and then re-executed anyway. A judgment sends nothing: the re-exec need not wait.
+        gg.land_dir().mkdir(parents=True)
+        self.daemon.land_tick()
+        q = self.daemon.land_queue
+        fut = mock.Mock()
+        fut.done.return_value = False
+        q.jobs["pr:o/r#1"] = fut
+        q.entries["pr:o/r#1"] = e = {"key": "pr:o/r#1", "state": "judging"}
+        self.assertFalse(self.daemon.land_busy())
+        self.assertFalse(q.draining)
+        self.assertFalse(self.daemon.land_busy(drain=True))
+        self.assertTrue(q.draining)
+        with self.assertRaises(gg.LandCancelled):
+            q.claim(e, "merge")
+        self.assertNotIn("action", e)
 
     def test_daemon_tick_runs_the_land_pass_only_once_land_exists(self):
         self.daemon.land_tick()

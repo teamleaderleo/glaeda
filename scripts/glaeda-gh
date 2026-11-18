@@ -3673,6 +3673,15 @@ class Daemon:
         level, text, data = stale
         if not policy.get("staleRestart", True):
             return stale
+        fresh = (getattr(self, "fresh_waited", None) or {}).get(data.get("kind"))
+        if isinstance(fresh, (int, float)) and fresh < STALE_DATA_AFTER:
+            # The daemon reads its other waited keys (one of them is FRESH s old): this one key is stale, and a restart
+            # would only drop every land judgment in flight. huge-blue, 2026-11-18: six valve restarts in six hours,
+            # each for one PR (pr:manaflow-ai/cmux#46087 at 3963 s), each starting the 596-land queue over. Its read
+            # goes first instead (nudged), and the alarm stands.
+            if data.get("key"):
+                self.nudged.add(str(data["key"]))
+            return level, text, {**data, "valve": "one_key", "freshest": int(fresh)}
         up = self.now - (self.started_tick if self.started_tick is not None else self.now)
         if up < STALE_DATA_AFTER:
             return level, text, {**data, "valve": "young", "up": int(up)}
@@ -5679,14 +5688,20 @@ class Daemon:
         self.status = status
         return status
 
-    def land_busy(self) -> bool:
-        """A land job (an explain, a merge, an update-branch) is running: a re-exec waits for it, so the new daemon
-        never sends a step beside one the old one still runs."""
+    def land_busy(self, drain: bool = False) -> bool:
+        """A land step (a merge, an update-branch: a claimed action) is running: a re-exec waits for it, so the new
+        daemon never sends a step beside one the old one still runs. A judgment alone (merge_hold explain, minutes at
+        times) sends nothing: a re-exec drops it and the next daemon judges that entry first (judge_order), where waiting
+        for it hit REEXEC_DRAIN_MAX (huge-blue, 2026-11-18: 08:42, 09:20, 10:17, 11:10Z). DRAIN (an update is waiting):
+        from now on no judgment claims a step (LandQueue.draining)."""
         q = self.land_queue
         if q is None:
             return False
         q.reap()
-        return bool(q.jobs)
+        with q.lock:
+            if drain:
+                q.draining = True
+            return any((q.entries.get(k) or {}).get("state") == "acting" for k in q.jobs)
 
     def land_tick(self) -> None:
         """The land queue's pass: cheap (its entries are in memory; judgments and steps run on its workers). None while
@@ -6116,6 +6131,7 @@ class Daemon:
         (STALE_DATA_AFTER), where an idle PR's old data is only its backoff."""
         oldest: dict[str, float | None] = {kind: None for kind in CYCLES}
         self.stale_waited = {kind: None for kind in CYCLES}
+        self.fresh_waited: dict[str, float | None] = {kind: None for kind in CYCLES}  # the newest waited data's age
         self.stale_waited_key: dict[str, str] = {}
         # A waited key this daemon has not seen yet is watched since its wait began (waitBegan) at the latest: after a
         # restart, a target never read successfully (504s since it was registered) keeps its age instead of starting
@@ -6140,6 +6156,8 @@ class Daemon:
             age_s = max(0.0, self.now - seen)
             oldest[kind] = max(oldest[kind] or 0.0, age_s)
             blocked = min(age_s, self.now - self.waited_since[e["key"]]) if self.waited(e) else 0.0
+            if self.waited(e) and (self.fresh_waited[kind] is None or age_s < self.fresh_waited[kind]):
+                self.fresh_waited[kind] = age_s
             if self.waited(e) and blocked >= (self.stale_waited[kind] or 0.0):
                 self.stale_waited[kind] = blocked
                 self.stale_waited_key[kind] = e["key"]
@@ -8426,7 +8444,8 @@ class LandQueue:
         self.entries: dict[str, dict] = {}
         self.jobs: dict[str, Any] = {}
         self.touched: dict[str, float] = {}
-        self.snapshot_waiting: set[str] = set()  # keys whose snapshot wait has not run out (judge's cap)
+        self.draining = False  # an update waits to re-exec: no judgment claims a step (claim; Daemon.land_busy)
+        self.snapshot_waiting: set[str] = set()  # keys with a snapshot wait, run out or not (judge's cap)
         self.pool: Any = None
         self.now = time.time()
         self.load()
@@ -8457,6 +8476,7 @@ class LandQueue:
             if not isinstance(e, dict) or not isinstance(e.get("key"), str) or e.get("state") not in LAND_STATES \
                     or not isinstance(e.get("repo"), str) or not str(e.get("number", "")).isdigit():
                 continue
+            e.pop("snapshotWait", None)  # a fresh daemon's waits start within its own cap (judge)
             if e.get("state") in ("judging", "acting"):
                 claimed = e.get("action")
                 self.history(e, "restart", note="re-judged after a restart",
@@ -8578,7 +8598,7 @@ class LandQueue:
             return
         latch = self.latch_held()
         self.snapshot_waiting = {k for k, e in self.entries.items() if e.get("state") not in LAND_DONE
-                                 and isinstance(e.get("snapshotWait"), dict) and self.now - float(e["snapshotWait"].get("since") or 0) < LAND_SNAPSHOT_WAIT}
+                                 and isinstance(e.get("snapshotWait"), dict)}
         for key in sorted(self.entries, key=self.judge_order):
             try:
                 e = self.entries[key]
@@ -8934,9 +8954,8 @@ class LandQueue:
         if not data:
             since = e.setdefault("noDataSince", self.now)
             self.nudge(e["key"])
-            if self.now - since >= LAND_NO_DATA_AFTER:
+            if self.now - since >= LAND_NO_DATA_AFTER and self.judge(e, "", fp):  # merge_hold reads the head
                 e.pop("noDataSince", None)
-                self.judge(e, "", fp)  # merge_hold reads the head itself
             return
         e.pop("noDataSince", None)
         running = land_checks_running(data, head)
@@ -8954,8 +8973,8 @@ class LandQueue:
                     e["updatedHead"] = head  # this queue's own base merge made it (update_again)
                 self.wait_running(e, head, fp) if running else self.judge(e, head, fp)
             elif woke:
-                self.history(e, "head_timeout", before=w.get("before"))
-                self.judge(e, "", fp)  # merge_hold reads the head itself: the cache never showed the new one
+                if self.judge(e, "", fp):  # merge_hold reads the head itself: the cache never showed the new one
+                    self.history(e, "head_timeout", before=w.get("before"))
             elif float((c or {}).get("fetchedAt") or 0) < float(w.get("since") or 0) or self.now - float(
                     w.get("nudgedAt") or 0) >= NUDGE_MIN:
                 w["nudgedAt"] = self.now
@@ -9002,6 +9021,8 @@ class LandQueue:
             return False
         if not self.reads_upstream():
             return False  # a host with its own login: the nudge (and the stale valve) refresh it
+        if len(self.jobs) >= self.workers():
+            return True  # read on a free worker, a later tick; judged after it
         e["refresh"] = {"at": self.now, "age": round(self.now - at)}
         self.save(e)
         self.submit(e["key"], self.refresh_job, e["key"])
@@ -9091,23 +9112,26 @@ class LandQueue:
         self.history(e, "snapshot_missing", head=sha[:12])
         return False
 
-    def judge(self, e: dict, sha: str, fp: str, counts: bool = True) -> None:
-        """Judge E at SHA on a free worker. None free: it stays as it is and is considered again next tick (the tick
-        goes least recently judged first), so the pool never queues; ahead of the workers at most LAND_SNAPSHOT_AHEAD
-        per worker start their snapshot wait, the rest wait for room without nudging a read."""
+    def judge(self, e: dict, sha: str, fp: str, counts: bool = True) -> bool:
+        """Judge E at SHA on a free worker; True when it was handed one. None free: it stays as it is and is considered
+        again next tick (the tick goes least recently judged first), so the pool never queues. Ahead of the workers at
+        most LAND_SNAPSHOT_AHEAD per worker start a snapshot wait (each puts its PR's read first); past that, one whose
+        snapshot is ready (or that needs none) still takes a free worker, and the rest wait without nudging a read."""
         workers = self.workers()
         free = len(self.jobs) < workers
         mine = (e.get("snapshotWait") or {}).get("sha") == sha
         if not mine and len(self.jobs) + len(self.snapshot_waiting) >= workers * (1 + LAND_SNAPSHOT_AHEAD):
-            return
-        if self.snapshot_wait(e, sha, free):
-            return  # judged on the daemon's next read of this head (one read, shared), not on merge_hold's own
+            if not free or self.snapshot(e["key"], sha)[1] == "wait":
+                return False
+        elif self.snapshot_wait(e, sha, free):
+            return False  # judged on the daemon's next read of this head (one read, shared), not on merge_hold's own
         if not free:
-            return
+            return False
         head = str((((self.cache_of(e["key"]) or {}).get("data")) or {}).get("headRefOid") or "").lower()
         e.update(state="judging", seen=fp, seenHead=head, judging={"sha": sha, "at": self.now, "counts": counts})
         self.save(e)
         self.submit(e["key"], self.job, e["key"], sha, int(e.get("gen") or 0))
+        return True
 
     # -- a job: one judgment and the step it names (a worker thread)
 
@@ -9276,8 +9300,11 @@ class LandQueue:
         return s["count"] >= (LAND_RETRY_STREAK_STOP if retry else LAND_STREAK_STOP)
 
     def claim(self, e: dict, kind: str, **args: Any) -> None:
-        """Written before the step starts: a restart sees it and judges again instead of running it on its own."""
+        """Written before the step starts: a restart sees it and judges again instead of running it on its own. None
+        while an update waits to re-exec (draining): the entry is queued again, and the next daemon judges it."""
         self.check(e)
+        if self.draining:
+            raise LandCancelled("an update waits to re-exec")
         e["action"] = {"kind": kind, "claimedAt": self.now, "head": e.get("head"), **args}
         e["state"] = "acting"
         self.save(e)
@@ -10357,7 +10384,8 @@ def serve(foreground_ok: bool = False) -> int:
                 # the stale valve (Daemon.stale_valve): a fresh daemon, the way an update starts one
                 daemon.restart_self()
                 os.execv(sys.executable, [sys.executable, os.fspath(me), "serve"] + (["--foreground-ok"] if foreground_ok else []))
-            due = reexec_due(me.stat().st_mtime != stamp, daemon.land_busy(), daemon.reexec_waiting, time.monotonic())
+            changed = me.stat().st_mtime != stamp
+            due = reexec_due(changed, daemon.land_busy(drain=changed), daemon.reexec_waiting, time.monotonic())
             if due == "defer":
                 if not daemon.reexec_waiting:
                     log({"event": "reexec-deferred", "why": "a land step is running; no new one starts until it ends"})
