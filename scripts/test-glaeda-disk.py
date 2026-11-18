@@ -2562,9 +2562,19 @@ class GlaedaDiskTest(unittest.TestCase):
             fcntl.flock(late, fcntl.LOCK_EX)
             self.assertEqual(verdict(), "in-use")
             late.close()
-        aside = fresh.with_name(f"{gd.DELETING_PREFIX}.build-99")
-        os.rename(fresh, aside)
-        self.assertIn(aside.parent, [f.root for f in gd.interrupted_families(fams)])
+            # below the emergency floor but above the runner floor's hold, apply deletes it too
+            items = [i for i in gd.survey(fams, 6, 0) if i.verdict == "reclaimable"]
+            with mock.patch.object(gd, "process_evidence", return_value=([], "")):
+                gd.apply(items, {f.id: f for f in fams}, self.root / "r.jsonl", None, 6)
+        self.assertFalse(fresh.exists())
+        # the aside tree sits beside the lock, outside the workspace the next job mirrors into, and a delete cut
+        # short there is finished by the interrupted sweep
+        self.assertEqual([p.name for p in seed.iterdir() if gd.DELETING_RE.fullmatch(p.name)], [])
+        aside = seed / f"{gd.DELETING_PREFIX}CmuxNext.build-99"
+        make(aside)
+        self.assertIn(seed, [f.root for f in gd.interrupted_families(fams)])
+        doomed = gd.seed_root_aside(fams[0], make(ws / "Packages/macOS/CmuxNext/.build"))
+        self.assertEqual(doomed.parent, seed)
 
     def test_canonical_root_admission_goes_under_its_root_token(self) -> None:
         """cmux7s, cmux12s, cmux13s, 2026-10-21: 8-9 GiB of admission DerivedData per idle canonical root stayed,
