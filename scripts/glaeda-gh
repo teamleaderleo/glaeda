@@ -43,7 +43,7 @@
     glaeda-gh on-event replay --run-file F [--jobs-file F] [--wait S] [--json]
                                                         one run record through the same path, deduped the same way
     glaeda-gh land OWNER/REPO#N [--after OWNER/REPO#M]... [--notify HOST/SESSION] [--wait S] [--json]
-                                                        land a PR: the daemon asks merge_hold, takes each step it
+                                                        land a PR: the daemon asks land-judge, takes each step it
                                                         names (update-branch, rerun, retarget, review, waits, the
                                                         pinned merge) and tells the requester on a merge or a stop
     glaeda-gh land status [OWNER/REPO#N] [--json]       each entry's state, last step, refusals; the steps per day
@@ -239,24 +239,25 @@ name the error instead of waiting on a daemon that refreshes nothing. The daemon
 effect without a restart.
 
 - `land` is the land queue. A lane says `glaeda-gh land OWNER/REPO#N` once (idempotent per PR: again updates
-  --after and --notify) and the daemon lands it: it asks `merge_hold.py explain R N --sha HEAD --json` at the head the
+  --after and --notify) and the daemon lands it: it asks `land-judge explain R N --sha HEAD --json` at the head the
   cache shows, and takes the step the answer's "action" names, from an allowlist, as argv lists, every `gh` through
   the gh-quota shim (~/.local/lib/gh-quota/bin/gh; without it nothing is merged): a pinned squash merge, a pinned
   update-branch, `gh run rerun ID --failed`, a base change, `router-review R N --post` once per head, or a wait on
   the PR, a run or a review comment. After a push-making step it judges nothing until the cache shows the new head
   (a head read before the step is never pinned). It is judged only when its PR's cache entry, a wait, a wake-at or a
   dependency (--after: that PR merged) changed, never while its head's checks run. It stops and tells the requester
-  (`acpmux send --no-wait HOST/SESSION`, default this host/$ACPMUX_SESSION_NAME) on a merge, a stop merge_hold names
+  (`acpmux send --no-wait HOST/SESSION`, default this host/$ACPMUX_SESSION_NAME) on a merge, a stop land-judge names
   (a BLOCK, a hold, a conflict...), a step only a person can take, the PR or a dependency closed, or 3 identical
   refusals in a row. Its calls carry CMUX_AGENT_SESSION=glaeda-land and MAY_MERGE_PATH=glaeda-land, so the gh-quota
   call log and the landing record tell them from a person's. State in land/ (entries/, requests/, counts.json: the
-  steps taken per day, which `land status` prints); ~/.config/glaeda/land.json may set gh, mergeHold, acpmux,
-  routerReview, python, workers and env. merge_hold.py is mergeHold, else the ws-sync deploy's, else
-  ~/Projects/leo-workspace/tools/merge_hold.py; with none of them the land worker refuses to start (land/refused.json,
+  steps taken per day, which `land status` prints); ~/.config/glaeda/land.json may set gh, landJudge (or mergeHold),
+  acpmux, routerReview, python, workers and env. land-judge (merge_hold renamed) is landJudge, else mergeHold, else the
+  ws-sync deploy's tools/land-judge, else its tools/merge_hold.py, else the same two in ~/Projects/leo-workspace/tools
+  (a host older than land-judge runs its merge_hold.py); with none of them the land worker refuses to start (land/refused.json,
   which `land status` prints) and `land` refuses to queue (merge_hold_missing). router-review is routerReview, else
   the first of ~/.local/bin, the ws-sync deploy's tools/ and the leo-workspace checkout's tools/, else PATH. On a lane VM (an upstream host) the
   worker reads a landing PR itself through the broker when the upstream's copy is over LAND_REFRESH_AFTER old.
-  A quota refusal (merge_hold's, or the shim's on the merge) parks the PR until the reset it names plus a 0-120 s
+  A quota refusal (land-judge's, or the shim's on the merge) parks the PR until the reset it names plus a 0-120 s
   per-caller jitter, with no read, judge, watch or nudge before it (`land status`: "parked until HH:MMZ (quota)");
   one that names no time backs off 5, 10, 20 ... at most 60 min. While the login's latch mark holds
   (rest-exhausted.json / graphql-exhausted.json under $GH_QUOTA_STATE, lw#5626) no entry is judged at all.
@@ -7619,6 +7620,12 @@ LAND_MERGE_HOLD = Path.home() / ".local/share/ws-sync/deploy/tools/merge_hold.py
 # at once with merge_hold_missing naming every path tried. Before, python exited 2 ("can't open file"), every job judged
 # explain_failed and retried, and `land status` read like quota trouble (one lane VM, 2026-11-17).
 LAND_MERGE_HOLD_PATHS = (LAND_MERGE_HOLD, Path.home() / "Projects/leo-workspace/tools/merge_hold.py")
+# merge_hold is being renamed land-judge (Leo, 2026-11-18: "Should it really be called merge hold?" ... "Yeah, land
+# judges could."). leo-workspace's tools/land-judge runs exactly as tools/merge_hold.py does (python3 PATH explain R N
+# --sha HEAD --json: same output, flags, exit codes and JSON), and merge_hold.py stays. So at each default location the
+# land-judge beside merge_hold.py is run when it exists, else that location's merge_hold.py: a host whose deploy or
+# checkout predates land-judge keeps working. land.json's landJudge, then its mergeHold, are run as given, before them.
+LAND_JUDGE_NAME = "land-judge"
 # The land worker's startup check: with no merge_hold.py at any of those paths it refuses to start (no entry is judged
 # or stepped; the daemon itself runs on), writes why to land/refused.json, and `glaeda-gh land` refuses to queue. It is
 # checked every tick, so installing merge_hold.py or setting land.json's mergeHold starts it without a restart. Before,
@@ -7638,18 +7645,24 @@ LAND_REFRESH_EVERY = float(STALE_DATA_AFTER)
 
 
 def land_merge_hold(config: dict) -> tuple[Path | None, list[Path]]:
-    """(the merge_hold.py to run, or None; every path tried): CONFIG's mergeHold, then LAND_MERGE_HOLD_PATHS."""
-    given = config.get("mergeHold")
-    tried = [Path(os.path.expanduser(given))] if isinstance(given, str) and given else []
-    tried += [p for p in LAND_MERGE_HOLD_PATHS if p not in tried]
+    """(the land-judge or merge_hold.py to run, or None; every path tried): CONFIG's landJudge, then its mergeHold (each
+    as given), then at each of LAND_MERGE_HOLD_PATHS the land-judge beside it, then that merge_hold.py."""
+    tried: list[Path] = []
+    for key in ("landJudge", "mergeHold"):
+        given = config.get(key)
+        if isinstance(given, str) and given and Path(os.path.expanduser(given)) not in tried:
+            tried.append(Path(os.path.expanduser(given)))
+    for p in LAND_MERGE_HOLD_PATHS:
+        tried += [c for c in (p.parent / LAND_JUDGE_NAME, p) if c not in tried]
     return next((p for p in tried if p.is_file()), None), tried
 
 
 def land_merge_hold_missing(tried: list[Path]) -> tuple[str, str]:
-    """(why, the step that fixes it) when no merge_hold.py is at any path TRIED."""
-    why = "merge_hold.py is not at any of " + ", ".join(map(os.fspath, tried))
-    nxt = (f'set "mergeHold" in {LAND_CONFIG} to merge_hold.py\'s path (on a lane VM: '
-           "~/Projects/leo-workspace/tools/merge_hold.py, from `reach enroll HOST --apply`)")
+    """(why, the step that fixes it) when no land-judge (or merge_hold.py) is at any path TRIED."""
+    why = "land-judge is not at any of " + ", ".join(map(os.fspath, tried))
+    nxt = (f'set "landJudge" (or "mergeHold") in {LAND_CONFIG} to land-judge\'s path (on a lane VM: '
+           "~/Projects/leo-workspace/tools/land-judge, or tools/merge_hold.py on an older checkout, from "
+           "`reach enroll HOST --apply`)")
     return why, nxt
 
 
@@ -7716,8 +7729,8 @@ def land_checkout_behind(script: Path, max_commits: int, max_hours: float, now: 
             why.append(f"last fetched {age:.1f} h ago (over {max_hours:g})")
     if not why:
         return None
-    return (f"merge_hold.py's checkout {root} is stale: " + "; ".join(why) + f". next: {root}/tools/ws-deploy --local "
-            "(an old merge_hold can refuse every merge as unreadable; knobs: land.json mergeHoldBehindCommits, "
+    return (f"{script.name}'s checkout {root} is stale: " + "; ".join(why) + f". next: {root}/tools/ws-deploy --local "
+            "(an old land-judge can refuse every merge as unreadable; knobs: land.json mergeHoldBehindCommits, "
             "mergeHoldBehindHours)")
 
 
@@ -8650,14 +8663,14 @@ class LandQueue:
         self.save(e)
 
     def refuse(self) -> bool:
-        """The startup check, every tick: True (no entry is judged or stepped) while no merge_hold.py resolves.
+        """The startup check, every tick: True (no entry is judged or stepped) while no land-judge resolves.
         The refusal is said once (log, notice, land/refused.json), and once more when it clears."""
         mh, tried = self.merge_hold()
         path = land_dir() / LAND_REFUSED_FILE
         if mh is not None:
             if self.refused is not None:
                 log({"event": "land-started", "mergeHold": os.fspath(mh), "refusedAt": self.refused.get("at")})
-                self.notice("land-started", "info", f"glaeda land started: merge_hold.py is {mh}",
+                self.notice("land-started", "info", f"glaeda land started: land-judge is {mh}",
                             {"mergeHold": os.fspath(mh)})
                 path.unlink(missing_ok=True)
                 self.refused = None
@@ -9001,7 +9014,7 @@ class LandQueue:
         return os.fspath(p) if p.exists() and os.access(p, os.X_OK) else None
 
     def merge_hold(self) -> tuple[Path | None, list[Path]]:
-        """(the merge_hold.py to run, or None; every path tried): land.json's mergeHold, then LAND_MERGE_HOLD_PATHS."""
+        """(the land-judge or merge_hold.py to run, or None; every path tried): land_merge_hold's order."""
         return land_merge_hold(self.config())
 
     def explain(self, e: dict, sha: str) -> dict:
@@ -9037,7 +9050,7 @@ class LandQueue:
                     break
         if answer is None or got.returncode not in (0, 1, 3):
             why = land_trim(got.stderr or got.stdout or f"exit {got.returncode}")
-            return {"ok": False, "code": "explain_failed", "reason": f"merge_hold explain exit {got.returncode}: {why}",
+            return {"ok": False, "code": "explain_failed", "reason": f"{mh.name} explain exit {got.returncode}: {why}",
                     "next": "", "head": sha, "action": {"v": 1, "kind": "retry", "after_s": LAND_RETRY_DEFAULT}}
         if got.returncode != 0:
             answer["ok"] = False
@@ -16226,7 +16239,7 @@ def broker_merge_handoff(args: list[str]) -> int | None:
         return BROKER_EXIT_REFUSED
     if not usable:
         print(f"glaeda-gh: refused: {' '.join(['gh', *args][:3])} merges, and merges go through the host's gh-quota "
-              f"guard (merge_hold), which is not at {guard}. Run `gh pr merge N --squash --match-head-commit SHA` "
+              f"guard (land-judge), which is not at {guard}. Run `gh pr merge N --squash --match-head-commit SHA` "
               f"on a host with the guard (leo-workspace tools/host-baseline gh-quota).", file=sys.stderr)
         return BROKER_EXIT_REFUSED
     try:
@@ -17586,7 +17599,7 @@ def parser() -> argparse.ArgumentParser:
     oe.add_argument("--wait", type=float, default=0, metavar="S",
                     help="replay: wait up to S seconds for the command to end, to print its exit code")
     oe.add_argument("--json", action="store_true")
-    ld = sub.add_parser("land", help="land a PR: the daemon takes each step merge_hold names until it merges or stops "
+    ld = sub.add_parser("land", help="land a PR: the daemon takes each step land-judge names until it merges or stops "
                                      "(land status, land cancel)")
     ld.add_argument("words", nargs="+",
                     metavar="OWNER/REPO#N | status [OWNER/REPO#N] | cancel OWNER/REPO#N | serve")
