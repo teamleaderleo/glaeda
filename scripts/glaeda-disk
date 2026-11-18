@@ -6793,6 +6793,124 @@ def session_hold(fam: Family, path: Path, cmds: str, fresh: bool = False) -> str
     return ""
 
 
+# A repository in an item that something outside the item still uses keeps the whole item, whatever its family's git
+# rule (a mirror's bundle, build output's plain delete): a linked worktree's record (<repo>/worktrees/*/gitdir) naming
+# a tree that exists outside it, a checkout outside whose .git file points into it, or a repository outside whose
+# objects/info/alternates borrows its objects. gcp-agent-lane-2, 2026-11-18: the dry run marked /tmp/wt-rd (22.1G)
+# "reclaimable: its checkouts are mirrors" while its .wt-mirrors/manaflow-ai/cmux.git still served three checkouts
+# under ~/Projects/checkouts/cmux; the worktree guard ran only inside the bundle step at apply.
+GIT_HOLDER_WALK_BUDGET = 400_000  # entries; an item too large to search stays
+_GIT_OUTSIDE_INDEX: list[tuple[str, str, str]] | None = None  # (user outside, path it points to, how) per run
+
+
+def git_holder_family(fam: Family) -> bool:
+    """Families whose items may hold a repository others use: agent scratch, mirrors, a session's TMPDIR."""
+    return fam.reclaimable and (fam.git_disposable or fam.id in SESSION_HOLD_FAMILY_IDS)
+
+
+def _gitdir_pointer(dotgit: Path) -> str | None:
+    """The git dir a `.git` file points to (a linked worktree's or a submodule's), absolute; None if not one."""
+    try:
+        line = dotgit.read_text(errors="replace").splitlines()[0]
+    except (OSError, IndexError):
+        return None
+    if not line.startswith("gitdir:"):
+        return None
+    target = line.split(":", 1)[1].strip()
+    return os.path.normpath(os.path.join(os.fspath(dotgit.parent), target))
+
+
+def _alternates(gitdir: Path) -> list[str]:
+    try:
+        lines = (gitdir / "objects/info/alternates").read_text(errors="replace").splitlines()
+    except OSError:
+        return []
+    return [os.path.normpath(os.path.join(os.fspath(gitdir / "objects"), ln.strip()))
+            for ln in lines if ln.strip() and not ln.startswith("#")]
+
+
+def git_outside_index(fresh: bool = False) -> list[tuple[str, str, str]]:
+    """Who outside any item points into a repository: every checkout two levels under ~/Projects/checkouts (its .git
+    file's git dir, or its .git dir's alternates) and every wt mirror under ~/Projects/.wt-mirrors (alternates)."""
+    global _GIT_OUTSIDE_INDEX
+    if _GIT_OUTSIDE_INDEX is not None and not fresh:
+        return _GIT_OUTSIDE_INDEX
+    out: list[tuple[str, str, str]] = []
+    for co in glob.glob(os.fspath(HOME / "Projects/checkouts/*/*")):
+        dotgit = Path(co) / ".git"
+        if dotgit.is_file():
+            if (target := _gitdir_pointer(dotgit)):
+                out.append((co, target, "a checkout's .git file points into it"))
+        elif dotgit.is_dir():
+            out += [(co, alt, "a checkout borrows its objects (alternates)") for alt in _alternates(dotgit)]
+    mirrors = HOME / "Projects/.wt-mirrors"
+    for depth in ("*", "*/*", "*/*/*"):
+        for g in glob.glob(os.fspath(mirrors / depth)):
+            if g.endswith(".git") and os.path.isdir(g):
+                out += [(g, alt, "a wt mirror borrows its objects (alternates)") for alt in _alternates(Path(g))]
+    _GIT_OUTSIDE_INDEX = out
+    return out
+
+
+def git_used_from_outside(path: Path, fresh: bool = False, budget: int = GIT_HOLDER_WALK_BUDGET) -> str:
+    """Why an item must stay because a repository in it is used from outside it ("" when none is): see
+    GIT_HOLDER_WALK_BUDGET. Every repository at any depth is read (bare ones, *.git, .wt-mirrors, a checkout's .git);
+    a walk it cannot finish keeps the item."""
+    try:
+        if path.is_symlink() or not path.is_dir():
+            return ""
+    except OSError:
+        return ""
+    inside = os.path.realpath(path)
+    holders: list[str] = []
+
+    def outside_live(p: str) -> bool:
+        return os.path.lexists(p) and not _within(os.path.realpath(p), inside)
+
+    for user, target, how in git_outside_index(fresh):
+        if _within(os.path.realpath(target), inside) and outside_live(user):
+            holders.append(f"{user} ({how})")
+    stack = [inside]
+    while stack and len(holders) < 8:
+        d = stack.pop()
+        try:
+            with os.scandir(d) as it:
+                entries = list(it)
+        except FileNotFoundError:
+            continue
+        except OSError as e:
+            return f"a repository in it may be used from outside: cannot read {d} ({e.strerror or e})"
+        budget -= len(entries)
+        if budget < 0:
+            return "a repository in it may be used from outside: too large to search for linked worktrees"
+        names = {e.name for e in entries}
+        repo = "HEAD" in names and "objects" in names and "refs" in names
+        if repo and "worktrees" in names:
+            try:
+                records = list(os.scandir(os.path.join(d, "worktrees")))
+            except OSError as e:
+                return f"{d}: unreadable linked worktree records ({e.strerror or e}); kept"
+            for rec in records:
+                try:
+                    tree = os.path.dirname(Path(rec.path, "gitdir").read_text().strip())
+                except (OSError, ValueError):
+                    continue  # a record without gitdir names no tree
+                if tree and outside_live(tree):
+                    holders.append(f"{tree} (a linked worktree of {d})")
+        for e in entries:
+            if repo and e.name == "objects":
+                continue  # loose objects and packs: no repository below
+            try:
+                if e.is_dir(follow_symlinks=False):
+                    stack.append(e.path)
+            except OSError:
+                continue
+    if not holders:
+        return ""
+    return (f"a repository in it is used from outside: {', '.join(holders[:8])}"
+            + (" and more" if len(holders) >= 8 else "") + "; kept")
+
+
 def acpmux_daemon_roots(base: Path) -> list[Path]:
     """The per-daemon roots in acpmux's per-user directory (<base>/t/<hash>) whose .home names the acpmux home this
     host's `acpmux ls` answers for. Another daemon's root (a test's, a Chief home's) is that daemon's to sweep."""
@@ -10301,6 +10419,8 @@ def _survey(families, idle_hours, min_bytes, known, evidence, defer_bulk=False,
             reasons.append("claude session active")
         if fam.id in SESSION_HOLD_FAMILY_IDS and not blind and (why := session_hold(fam, path, cmds)):
             reasons.append(why)
+        if git_holder_family(fam) and (why := git_used_from_outside(path)):
+            reasons.append(why)
         references = frozenset()
         if fam.reference_root is not None:
             key = os.fspath(fam.reference_root)
@@ -12789,6 +12909,7 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
                     and artifact_referenced(p, fresh_artifact_references(fam.reference_root)))
                 or (i.family == "claude-scratchpad" and claude_session_active(p.name, idle_window(fam, idle_hours) * 3600))
                 or (fam.id in SESSION_HOLD_FAMILY_IDS and session_hold(fam, p, cmds, fresh=True))
+                or (git_holder_family(fam) and git_used_from_outside(p, fresh=True))
                 or (i.family == SPM_SCRATCH and spm_scratch_held(p))
                 or (i.family == SEED_ROOT_FAMILY and seed_root_held(fam, p))
                 or (i.family == CANONICAL_ADMISSION and canonical_root_held(p))

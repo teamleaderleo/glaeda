@@ -3422,6 +3422,7 @@ class GlaedaDiskTest(unittest.TestCase):
         self.assertIn("refs/heads/wt", self._git("-C", str(origin), "for-each-ref"))
 
     def test_checkouts_with_hidden_git_state_are_kept(self) -> None:
+        self.maxDiff = None
         root, origin = self._tmp_repos()
         # a clean, pushed clone that backs a worktree with an unpushed detached commit
         self._git("clone", "-q", str(origin), str(root / "main"))
@@ -3455,8 +3456,11 @@ class GlaedaDiskTest(unittest.TestCase):
         for d in root.iterdir():
             self._age(d)
         why = {Path(i.path).name: (i.verdict, i.reasons) for i in gd.survey([self.fam], 24, 0)}
+        # the worktree outside keeps its repository, named (git_used_from_outside)
+        self.assertEqual(why.pop("main"), ("in-use", [
+            f"a repository in it is used from outside: {self.root / 'elsewhere'} (a linked worktree of "
+            f"{root / 'main/.git'}); kept"]))
         self.assertEqual(why, {
-            "main": ("git-checkout", ["other worktrees use this repository"]),
             "super": ("git-checkout", ["submodule sm: commits no remote confirms"]),
             "skipped": ("git-checkout", ["files hidden from status"]),
             "bisect": ("git-checkout", ["HEAD on no ref"]),
@@ -3575,12 +3579,14 @@ class GlaedaDiskTest(unittest.TestCase):
             self._age(c)
         why = {Path(i.path).name: (i.verdict, i.reasons) for i in gd.survey([self.fam], 24, 0)}
         confirm = ["submodule sm: commits no remote confirms"]
+        verdict, reasons = why.pop("sub-worktree")  # the worktree outside keeps it, named (git_used_from_outside)
+        self.assertEqual(verdict, "in-use")
+        self.assertIn(f"{self.root / 'sub-wt'} (a linked worktree of", reasons[0])
         self.assertEqual(why, {
             "orphaned": ("git-checkout", confirm),
             "commit-tree": ("git-checkout", confirm),
             "expired": ("git-checkout", confirm),
             "embedded": ("git-checkout", confirm),
-            "sub-worktree": ("git-checkout", ["submodule sm: has worktrees of its own"]),
             "local-fetch": ("git-checkout", confirm)})
 
     def test_local_remotes_never_vouch_for_commits(self) -> None:
@@ -9900,6 +9906,15 @@ class LinuxLayoutTest(unittest.TestCase):
             gd.apply(items, {f.id: f for f in fams}, receipt, None, 24)
         return json.loads(receipt.read_text().splitlines()[-1]), err.getvalue()
 
+    def survey_mirror(self, unit: Path):
+        t = time.time() - 24 * 3600
+        for dirpath, dirnames, filenames in os.walk(unit):
+            for n in dirnames + filenames:
+                os.utime(os.path.join(dirpath, n), (t, t), follow_symlinks=False)
+        os.utime(unit, (t, t))
+        fams = [f for f in gd.default_families() if f.id == "cmux-job-cache"]
+        return next(i for i in gd.survey(fams, 24, 0) if i.path == os.fspath(unit))
+
     def bundle_heads(self) -> dict[str, str]:
         heads = {}
         for b in sorted((self.home / "archive/glaeda-disk").glob("*.bundle")):
@@ -10018,7 +10033,12 @@ class LinuxLayoutTest(unittest.TestCase):
             self.assertIn(str(w), why)
         self.assertIn("1 whose tree is gone", why)
         self.assertNotIn(str(gone), why)
-        rec, _ = self.apply_mirror(unit)
+        held = self.survey_mirror(unit)  # kept by the plan itself, before any bundle (git_used_from_outside)
+        self.assertEqual(held.verdict, "in-use")
+        for w in live:
+            self.assertIn(f"{w} (a linked worktree of", " ".join(held.reasons))
+        with mock.patch.object(gd, "git_used_from_outside", return_value=""):  # and by the bundle step too
+            rec, _ = self.apply_mirror(unit)
         self.assertEqual(rec["outcome"], "blocked:bundle-failed")
         self.assertTrue(all((w / ".git").is_file() for w in live))
 
@@ -10598,7 +10618,9 @@ class LinuxLayoutTest(unittest.TestCase):
         store = clone / ".git/modules/sub"
         store.mkdir(parents=True)
         try:
-            rec, _ = self.apply_mirror(unit, between=lambda: os.chmod(store, 0))
+            with mock.patch.object(gd, "git_used_from_outside", return_value=""):  # the bundle step's own check
+                rec, _ = self.apply_mirror(unit, between=lambda: os.chmod(store, 0))
+            self.assertIn("cannot read", gd.git_used_from_outside(unit, fresh=True))  # the guard alone keeps it too
         finally:
             os.chmod(store, 0o755)
         self.assertEqual(rec["outcome"], "blocked:bundle-failed")
@@ -10878,7 +10900,9 @@ class LinuxLayoutTest(unittest.TestCase):
         outside = self.home / "elsewhere"
         self.git(clone, "worktree", "add", "-q", "--detach", str(outside), env=env)
         self.assertIn("has linked worktrees outside it", gd.mirror_repos(unit)[0])
-        rec, _ = self.apply_mirror(unit)
+        self.assertEqual(self.survey_mirror(unit).verdict, "in-use")
+        with mock.patch.object(gd, "git_used_from_outside", return_value=""):
+            rec, _ = self.apply_mirror(unit)
         self.assertEqual(rec["outcome"], "blocked:bundle-failed")
         self.assertTrue((outside / ".git").is_file())
         shutil.rmtree(outside)  # a stale record: git worktree prune would drop it, but its HEAD is not judged here
@@ -14216,6 +14240,97 @@ class LaneVmFamiliesTest(unittest.TestCase):
         self.apply(fams, [item])
         self.assertFalse(repo.exists())
         self.assertEqual(len(list((self.home / "archive/glaeda-disk").glob("*.bundle"))), 1)
+
+    def wt_mirror(self, where: Path) -> Path:
+        """A bare mirror the way `wt` lays one out (.wt-mirrors/<owner>/<repo>.git), with one commit on main."""
+        src = self.base / "src"
+        if not src.exists():
+            subprocess.run(["git", "init", "-q", "-b", "main", str(src)], check=True, env=self.env)
+            (src / "f").write_text("x")
+            subprocess.run(["git", "-C", str(src), "add", "f"], check=True, env=self.env)
+            subprocess.run(["git", "-C", str(src), "commit", "-qm", "c"], check=True, env=self.env)
+        mirror = where / ".wt-mirrors/manaflow-ai/cmux.git"
+        mirror.parent.mkdir(parents=True)
+        subprocess.run(["git", "clone", "-q", "--bare", str(src), str(mirror)], check=True, env=self.env)
+        return mirror
+
+    def test_a_mirror_with_a_linked_worktree_outside_keeps_the_whole_item_on_every_path(self) -> None:
+        wt = self.fake_tmp / "wt-rd"
+        mirror = self.wt_mirror(wt)
+        checkout = self.home / "Projects/checkouts/cmux/lane--base-red-next-checks"
+        checkout.parent.mkdir(parents=True)
+        subprocess.run(["git", "-C", str(mirror), "worktree", "add", "-q", "-b", "lane/x", str(checkout)],
+                       check=True, env=self.env)
+        self.age(wt, 30)
+        fams = self.lane(gd.TMP_WORKTREES)
+        item = self.survey(fams)["wt-rd"]
+        self.assertEqual(item.verdict, "in-use", item.reasons)
+        why = next(r for r in item.reasons if r.startswith("a repository in it is used from outside"))
+        self.assertIn(str(checkout), why)
+        self.assertNotIn("its checkouts are mirrors", " ".join(item.reasons))
+        # an item judged reclaimable earlier is still kept by apply's fresh check
+        stale = gd.Item(item.family, item.path, item.bytes, item.idle_hours, "reclaimable", [], None, item.platform)
+        self.apply(fams, [stale])
+        self.assertTrue(mirror.is_dir())
+        self.assertTrue((checkout / "f").exists())
+        # the same mirror once its outside worktree is gone (and pruned) goes
+        subprocess.run(["git", "-C", str(mirror), "worktree", "remove", "--force", str(checkout)], check=True,
+                       env=self.env)
+        self.age(wt, 30)
+        item = self.survey(fams)["wt-rd"]
+        self.assertEqual(item.verdict, "reclaimable", item.reasons)
+        self.apply(fams, [item])
+        self.assertFalse(wt.exists())
+
+    def test_a_record_naming_a_tree_inside_the_item_or_one_that_is_gone_does_not_hold_it(self) -> None:
+        wt = self.fake_tmp / "wt-rd"
+        mirror = self.wt_mirror(wt)
+        subprocess.run(["git", "-C", str(mirror), "worktree", "add", "-q", "-b", "in", str(wt / "inside")],
+                       check=True, env=self.env)
+        gone = self.base / "gone-tree"
+        subprocess.run(["git", "-C", str(mirror), "worktree", "add", "-q", "-b", "gone", str(gone)],
+                       check=True, env=self.env)
+        shutil.rmtree(gone)
+        self.assertEqual(gd.git_used_from_outside(wt, fresh=True), "")
+
+    def test_an_alternates_user_outside_keeps_the_item(self) -> None:
+        wt = self.fake_tmp / "wt-rd"
+        mirror = self.wt_mirror(wt)
+        user = self.home / "Projects/checkouts/cmux/lane--borrower"
+        subprocess.run(["git", "clone", "-q", "--shared", str(mirror), str(user)], check=True, env=self.env)
+        self.assertTrue((user / ".git/objects/info/alternates").exists())
+        why = gd.git_used_from_outside(wt, fresh=True)
+        self.assertIn(f"{user} (a checkout borrows its objects (alternates))", why)
+        other = self.home / "Projects/.wt-mirrors/o/borrower.git"
+        other.parent.mkdir(parents=True)
+        subprocess.run(["git", "clone", "-q", "--bare", "--shared", str(mirror), str(other)], check=True, env=self.env)
+        shutil.rmtree(user)
+        self.assertIn(f"{other} (a wt mirror borrows its objects (alternates))", gd.git_used_from_outside(wt, fresh=True))
+        shutil.rmtree(other)
+        self.assertEqual(gd.git_used_from_outside(wt, fresh=True), "")
+
+    def test_a_closed_sessions_tmpdir_holding_a_used_mirror_is_kept_despite_its_plain_delete(self) -> None:
+        sid = "01a1d212-4250-7272-94b4-33a324d4aed3"
+        d = self.session(sid)
+        mirror = self.wt_mirror(d)
+        outside = self.base / "outside-tree"
+        subprocess.run(["git", "-C", str(mirror), "worktree", "add", "-q", "-b", "o", str(outside)],
+                       check=True, env=self.env)
+        self.age(d, 30)
+        self.rows = [{"sessionId": sid, "status": "closed"}]
+        fam = self.acpmux_family()
+        item = self.survey([fam])[sid]
+        self.assertEqual(item.verdict, "in-use", item.reasons)
+        self.apply([fam], [gd.Item(item.family, item.path, item.bytes, item.idle_hours, "reclaimable", [], None,
+                                   item.platform)])
+        self.assertTrue(mirror.is_dir())
+
+    def test_a_walk_too_large_to_finish_keeps_the_item(self) -> None:
+        tree = self.fake_tmp / "bsz"
+        (tree / "a").mkdir(parents=True)
+        for n in range(5):
+            (tree / "a" / str(n)).write_text("x")
+        self.assertIn("too large", gd.git_used_from_outside(tree, fresh=True, budget=3))
 
     def test_no_home_family_for_a_tree_that_is_missing_or_a_link(self) -> None:
         (self.home / "lab-tmp").symlink_to(self.base)
