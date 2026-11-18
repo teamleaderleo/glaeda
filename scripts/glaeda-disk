@@ -937,7 +937,7 @@ PARKED_IDLE_HOURS = float("inf")  # parked builds age by host-job reuse distance
 # remain in force before any deletion.
 PARKED_NO_LOG_IDLE_HOURS = DEFAULT_AGE_HOURS
 # No age window for a build cache on a fleet mini (Leo, 2026-11-18: "these build caches, if they're not being used,
-# they're not useful. So stop fucking holding on to bullshit."). Local disk holds only what a running or queued build
+# they're not useful. So stop holding on to [junk]."). Local disk holds only what a running or queued build
 # uses now: a build cache (DerivedData, target dirs, per-hash and per-PR caches, seeds, admission and scheme output)
 # goes on the first pass after nothing live holds it, under pressure or not, past the free target, with no job-count
 # reuse distance and no pressure-only rule. What still keeps one: the never-delete list, live evidence (an open file,

@@ -8228,8 +8228,8 @@ class GlaedaDiskTest(unittest.TestCase):
             self.assertFalse((self.root / "old").exists())
 
     def test_a_finished_builds_cache_goes_on_the_next_pass_with_no_pressure(self) -> None:
-        """Leo, 2026-11-18: "these build caches, if they're not being used, they're not useful. So stop fucking holding
-        on to bullshit." A fleet mini's pass after a job (--pressure --apply, plenty free) sweeps, and a build cache
+        """Leo, 2026-11-18: "these build caches, if they're not being used, they're not useful. So stop holding
+        on to [junk]." A fleet mini's pass after a job (--pressure --apply, plenty free) sweeps, and a build cache
         minutes old goes: no age window, no hourly sweep stamp. What a process holds stays."""
         make(self.root / "finished", age_hours=0.05)
         make(self.root / "live", age_hours=0.05)
