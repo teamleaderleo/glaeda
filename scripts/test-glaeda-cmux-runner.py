@@ -20145,5 +20145,75 @@ class LsofNoMountStatTest(unittest.TestCase):
                 child.stdout.close()
 
 
+class DiskBoundEvictQueueTest(unittest.TestCase):
+    """DISK_BOUND lets evict.lock's queue go first: no new pass while a live waiter's ticket waits (a fleet mini,
+    2026-11-18: 35 floor evictions and 27 other runs skipped as eviction_busy behind pass after pass in five hours),
+    and a pass that yielded evict.lock keeps its trigger."""
+
+    setUp = DiskPassCoalesceTest.setUp
+    bound = DiskPassCoalesceTest.bound
+    fake_disk = DiskPassCoalesceTest.fake_disk
+    waiting = DiskPassCoalesceTest.waiting
+    run_count = DiskPassCoalesceTest.run_count
+
+    def ticket(self, pid: int) -> Path:
+        waiters = hook.evict_lock_path().parent / "evict.waiters"
+        waiters.mkdir(parents=True, exist_ok=True)
+        ticket = waiters / f"0-{time.time_ns():020d}-{pid}.ticket"
+        ticket.write_text("{}")
+        return ticket
+
+    def sleeper(self) -> subprocess.Popen:
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+        self.addCleanup(lambda: (child.kill(), child.wait()))
+        return child
+
+    def test_no_pass_starts_while_a_live_waiter_waits(self) -> None:
+        disk = self.fake_disk()
+        self.pending.touch()
+        ticket = self.ticket(self.sleeper().pid)
+        bound = self.bound(disk)
+        self.addCleanup(lambda: bound.poll() is None and (bound.kill(), bound.wait()))
+        time.sleep(1.5)
+        self.assertEqual(self.run_count(), 0, "the waiter goes first")
+        self.assertIsNone(bound.poll())
+        ticket.unlink()  # served: the waiter took evict.lock and left the queue
+        self.assertEqual(bound.wait(30), 0)
+        self.assertEqual(self.run_count(), 1)
+        self.assertFalse(self.waiting(), "the trigger was served once the queue was clear")
+
+    def test_a_dead_waiters_ticket_does_not_hold_a_pass_back(self) -> None:
+        disk = self.fake_disk()
+        self.pending.touch()
+        gone = subprocess.Popen([sys.executable, "-c", "pass"])
+        gone.wait()
+        self.ticket(gone.pid)
+        start = time.monotonic()
+        self.assertEqual(self.bound(disk).wait(30), 0)
+        self.assertLess(time.monotonic() - start, 10)
+        self.assertEqual(self.run_count(), 1)
+
+    def test_a_waiter_outlasting_the_pass_bound_leaves_the_trigger(self) -> None:
+        disk = self.fake_disk()
+        self.pending.touch()
+        self.ticket(self.sleeper().pid)
+        self.assertEqual(self.bound(disk, timeout=1, lifetime=3).wait(30), 0)
+        self.assertEqual(self.run_count(), 0)
+        self.assertTrue(self.waiting(), "no trigger dropped: the next bound serves it")
+
+    def test_a_pass_that_yielded_evict_lock_keeps_its_trigger_and_goes_on(self) -> None:
+        runs = self.dir / "runs"
+        disk = make_executable(self.dir / "glaeda-disk", "import pathlib\n"
+                               f"runs = pathlib.Path({os.fspath(runs)!r})\n"
+                               "n = len(runs.read_text().splitlines()) if runs.exists() else 0\n"
+                               "with runs.open('a') as f:\n    f.write('run\\n')\n"
+                               "if n == 0:\n"
+                               "    print('stopped: evict.lock yielded to a waiting eviction (1 waiting)')\n")
+        self.pending.touch()
+        self.assertEqual(self.bound(disk).wait(30), 0)
+        self.assertEqual(self.run_count(), 2, "the yielded pass did not finish: one more after the waiter")
+        self.assertFalse(self.waiting())
+
+
 if __name__ == "__main__":
     unittest.main()

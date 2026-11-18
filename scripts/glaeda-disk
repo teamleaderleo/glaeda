@@ -296,9 +296,31 @@ CI_DEFER_MARK = "deferred: a CI job is running"  # the hook's bound reads this (
 # A run the floor needs waits this long for evict.lock before it leaves the space to the holder's pass. The holder
 # picks its own families, so it need not free what this floor needs: measured on a mini at 47.8 GiB free against a
 # 50 GiB floor, where every out-of-band run skipped as eviction_busy while the holder evicted other families
-# (glaeda#1897 F2). Manual and LaunchAgent runs above the floor still skip at once.
-EVICT_WAIT_FLOOR_S = 120.0
+# (glaeda#1897 F2).
+# One holder of evict.lock keeps it at most EVICT_SLICE_S while another eviction waits (evict_yield_halt): past it,
+# it finishes the item it is deleting and lets go between items, never mid-delete. A fleet mini, 2026-11-18 05:31 to
+# 10:22, 400 run lines: the runner hook's DISK_BOUND ran pass after pass for up to 4 pass bounds, each taking
+# evict.lock, while 39 floor evictions ran and 35 skipped as eviction_busy, and the LaunchAgent (9), launchd (11) and
+# build-worker (7) runs skipped about as often as they ran. 5 min: the walks stop starting at
+# PRESSURE_MEASURE_BUDGET_S (4 min), so a pass that measured within it gets a minute of deletions, largest first,
+# before it yields (and one that measured longer still deletes its first item: the yield never fires on the first
+# deletion's check); it is a third of the hook's 15 min pass bound, so a waiter is served within a slice and one item
+# instead of behind a whole pass and the next one the bound starts.
+EVICT_SLICE_S = 5 * 60.0
+# A waiter's bound covers a holder that took the lock just before it: one slice plus one item's delete, for which
+# the old floor wait (120 s, glaeda#1897 F2) stays the allowance. A run the floor needs waits this long, within its
+# caller's cutoff; any other applying run waits only within a bound its caller set (HYGIENE_RUN_DEADLINE: the
+# LaunchAgent's 840 s, the hygiene reconciler's 900 s), half of what is left, so the pass still has time to work.
+# A run with no bound at all (a person at a terminal) still skips a held lock at once.
+EVICT_ITEM_GRACE_S = 120.0
+EVICT_WAIT_FLOOR_S = EVICT_SLICE_S + EVICT_ITEM_GRACE_S
 EVICT_WAIT_POLL_S = 2.0
+# The fair queue: a run that waits for evict.lock leaves a ticket in EVICT_LOCK's directory (evict_waiters_dir), named
+# so the sort is the serving order: floor waiters first (rank 0; a floor waiter goes ahead of a hook follow-up pass),
+# then first come first served. A ticket whose pid is gone, or older than any wait could be, is ignored.
+EVICT_WAITERS = "evict.waiters"
+EVICT_TICKET_STALE_S = 2 * EVICT_WAIT_FLOOR_S
+EVICT_YIELD_MARK = "evict.lock yielded to a waiting eviction"  # the hook's DISK_BOUND keeps its trigger on it
 # When a caller that bounds the run says this run's wait for another eviction runs out (the hook's floor_disk_env,
 # half its own timeout, as a wall-clock time because its timeout started at launch and this run reaches its wait
 # later). The run deadline would do it, but that one bounds every walk and verdict too and would stop a short pass
@@ -342,6 +364,10 @@ REFRESH_BUDGET_S = 10 * 60
 PRESSURE_MEASURE_BUDGET_S = 4 * 60
 EVICTION_STUCK: list[dict[str, Any]] = []
 _EVICT_HANDLE = None
+_EVICT_TAKEN_AT = 0.0  # monotonic time this run took evict.lock (evict_yield_halt's slice)
+_EVICT_TICKET: Path | None = None  # this run's place in the evict.lock queue while it waits (take_evict_ticket)
+_EVICT_RANK = 1  # 0: this run is one the floor needs (floor_evict_wait_until), served and yielded to first
+_EVICT_HALTS = 0  # the yield check's calls while holding: the first (before the first deletion) never yields
 _MEASURE_BUDGET_REACHED = False
 _REFRESH_PROGRESS_KNOWN: dict[str, int] | None = None
 # A timed-out walk is left unsized and protected.  Do not relaunch the same
@@ -1222,6 +1248,7 @@ CMUX_NEXT_DRAIN_HOOK_SHA256 = frozenset({
     "52e9a71a38132cdf79e49f2b751940cb6b10dceededf16fa43ae28bf2cb05e72",
     "5bb42957d1041edc213fbd24fcb2c6e854c9b743fd55c9a417b4e9dd0b0bc3c5",
     "a5958215b862d5848961bd9fdf3b9c52ea14d0acbb1deadeddf0a59c67ccebd6",
+    "efaa110114dc957a68e983fc5b964411568f712915d07cb11ec486bf1da10179",
 })
 CMUX_NEXT_CI_PRESERVED_NAMES = frozenset({
     "SourcePackages", "ModuleCache.noindex", "SDKStatCaches.noindex",
@@ -12391,13 +12418,121 @@ def floor_evict_wait_until(apply_: bool) -> float:
     return time.monotonic() + budget if budget > 0 else 0.0
 
 
-def wait_for_evict_lock(until: float) -> bool:
-    """True once the lock looks free before `until`, False when that time passed with it still held.
+def queue_wait_until(apply_: bool) -> float:
+    """The monotonic time an applying run the floor does not need may wait in the evict.lock queue until, or 0.0
+    for none: only within a bound its caller set (RUN_DEADLINE_ENV), half of what is left of it, at most
+    EVICT_WAIT_FLOOR_S, so the pass keeps the other half to work in. A run with no bound skips at once, as before."""
+    left = run_deadline_left() if apply_ else None
+    if left is None or left <= 0:
+        return 0.0
+    return time.monotonic() + min(EVICT_WAIT_FLOOR_S, left / 2)
+
+
+def evict_waiters_dir() -> Path:
+    """The evict.lock queue's tickets, beside the lock (EVICT_WAITERS)."""
+    return EVICT_LOCK.parent / EVICT_WAITERS
+
+
+def evict_waiters(now: float | None = None) -> list[str]:
+    """The live tickets in serving order (their names sort that way: rank, then wall-clock ns, then pid). A ticket
+    whose pid is gone is ignored and removed; one older than EVICT_TICKET_STALE_S (no wait lasts that long, so its
+    pid was reused) is ignored. A directory that cannot be read is an empty queue: the lock alone decides, as before."""
+    now = time.time() if now is None else now
+    try:
+        names = sorted(os.listdir(evict_waiters_dir()))
+    except OSError:
+        return []
+    live = []
+    for name in names:
+        try:
+            rank, at_ns, pid = name.removesuffix(".ticket").split("-")
+            int(rank)
+            at, pid_n = int(at_ns) / 1e9, int(pid)
+        except ValueError:
+            continue
+        if now - at > EVICT_TICKET_STALE_S:
+            continue
+        try:
+            os.kill(pid_n, 0)
+        except ProcessLookupError:
+            with contextlib.suppress(OSError):
+                (evict_waiters_dir() / name).unlink()
+            continue
+        except OSError:
+            pass  # another account's live process: still waiting
+        live.append(name)
+    return live
+
+
+def evict_queue_ahead(ticket: Path | None = None) -> list[str]:
+    """The live tickets served before `ticket` (every live one for a run that holds none)."""
+    mine = ticket.name if ticket is not None else None
+    return [name for name in evict_waiters() if mine is None or name < mine]
+
+
+def take_evict_ticket() -> Path | None:
+    """Join the evict.lock queue: this run's ticket (_EVICT_TICKET), ranked by _EVICT_RANK, or None when the
+    directory cannot be written (the run then waits on the lock alone, as before)."""
+    global _EVICT_TICKET
+    if _EVICT_TICKET is not None:
+        return _EVICT_TICKET
+    ticket = evict_waiters_dir() / f"{_EVICT_RANK}-{time.time_ns():020d}-{os.getpid()}.ticket"
+    try:
+        ticket.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(ticket, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    except OSError:
+        return None
+    with contextlib.suppress(OSError):
+        os.write(fd, json.dumps({"pid": os.getpid(), "started_at": time.time(), "caller": RUN.get("caller"),
+                                 "floor": _EVICT_RANK == 0}).encode())
+    os.close(fd)
+    _EVICT_TICKET = ticket
+    return ticket
+
+
+def drop_evict_ticket() -> None:
+    """Leave the queue: served (the lock is this run's), or its wait ran out."""
+    global _EVICT_TICKET
+    if _EVICT_TICKET is not None:
+        with contextlib.suppress(OSError):
+            _EVICT_TICKET.unlink()
+    _EVICT_TICKET = None
+
+
+def evict_yield_halt() -> str:
+    """Why the evict.lock holder stops deleting now, or "": it has held the lock EVICT_SLICE_S and a waiter of its
+    rank or better (a floor waiter for a floor run; any waiter otherwise) is queued. Asked before each deletion, so the
+    item under way always finishes; the first ask (before this run's first deletion) never yields, so a holder whose
+    measuring ran past the slice still deletes its largest item. Once it yields, every later step stops too."""
+    global _EVICT_HALTS
+    if _EVICT_HANDLE is None:
+        return ""  # after the release (the home clone gc, the repacks): nothing to yield
+    if RUN.get("evict_yielded"):
+        return EVICT_YIELD_MARK
+    _EVICT_HALTS += 1
+    held = time.monotonic() - _EVICT_TAKEN_AT
+    if _EVICT_HALTS == 1 or held < EVICT_SLICE_S:
+        return ""
+    ahead = [name for name in evict_waiters() if name.split("-", 1)[0] <= str(_EVICT_RANK)]
+    if not ahead:
+        return ""
+    RUN["evict_yielded"] = len(ahead)
+    return f"{EVICT_YIELD_MARK} ({len(ahead)} waiting) after holding it {held:.0f} s; the next pass goes on"
+
+
+def with_evict_yield(halt):
+    """HALT, also stopping between items once evict_yield_halt says the holder's slice is up with a waiter queued."""
+    return lambda: evict_yield_halt() or (halt() if halt is not None else "")
+
+
+def wait_for_evict_lock(until: float, ticket: Path | None = None) -> bool:
+    """True once the lock looks free before `until` (and, with `ticket`, no live ticket is ahead of it), False when
+    that time passed with it still held or another waiter still ahead.
 
     It only probes: the holder's own release ends the wait, and the acquire after it still decides. A lock that
     cannot be inspected (eviction_lock_is_held None) ends the wait too, so the acquire fails closed instead.
     """
-    while eviction_lock_is_held():
+    while eviction_lock_is_held() or (ticket is not None and evict_queue_ahead(ticket)):
         left = until - time.monotonic()
         if left <= 0:
             return False
@@ -12406,9 +12541,13 @@ def wait_for_evict_lock(until: float) -> bool:
     return time.monotonic() < until
 
 
-def acquire_evict_lock():
-    """Acquire the eviction lock and publish an owner record for stale-lock recovery."""
-    global _EVICT_HANDLE
+def acquire_evict_lock(queued: bool = False):
+    """Acquire the eviction lock and publish an owner record for stale-lock recovery. With `queued`, never ahead of
+    a live waiter served before this run (evict_queue_ahead): a free lock between a holder's release and a waiter's
+    acquire is that waiter's turn, not the next newcomer's."""
+    global _EVICT_HANDLE, _EVICT_TAKEN_AT, _EVICT_HALTS
+    if queued and evict_queue_ahead(_EVICT_TICKET):
+        return None
     EVICT_LOCK.parent.mkdir(parents=True, exist_ok=True)
     handle = EVICT_LOCK.open("a")
     with contextlib.suppress(OSError):
@@ -12419,6 +12558,7 @@ def acquire_evict_lock():
             fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
             _write_evict_owner()
             _EVICT_HANDLE = handle
+            _EVICT_TAKEN_AT, _EVICT_HALTS = time.monotonic(), 0
             return handle
         except BlockingIOError:
             if attempt == 0 and _take_over_stale_evict_owner():
@@ -12449,6 +12589,7 @@ def release_evict_lock(handle) -> None:
 
 
 def _release_evict_lock_at_exit() -> None:
+    drop_evict_ticket()
     if _EVICT_HANDLE is not None:
         release_evict_lock(_EVICT_HANDLE)
 
@@ -14833,6 +14974,34 @@ def _main_impl(argv: list[str] | None = None) -> int:
     CMUX_NEXT_HOST_FLOOR = {dev: int(floor_gib * GIB) for dev in FLOOR_HOLD}
     # read once, after FLOOR_HOLD: a run the floor needs waits for evict.lock instead of skipping at once
     floor_evict_until = floor_evict_wait_until(a.apply and not a.cmux_next_drain and not RUNNER_CACHE_PROFILE)
+    # the evict.lock queue: a floor run is served (and yielded to) first; any other waits only within its caller's
+    # bound (queue_wait_until); drain and runner-cache-profile runs keep the lock alone, as before
+    global _EVICT_RANK
+    queued_apply = a.apply and not a.cmux_next_drain and not RUNNER_CACHE_PROFILE
+    _EVICT_RANK = 0 if FLOOR_HOLD or FLOOR_CALLER_MARK in (os.environ.get(CALLER_ENV) or "") else 1
+    evict_until = floor_evict_until or queue_wait_until(queued_apply)
+    wait_started: float | None = None
+
+    def join_queue() -> Path | None:
+        """Take this run's ticket and note its place, once: the run line's evict_queue_position."""
+        nonlocal wait_started
+        if wait_started is None:
+            wait_started = time.monotonic()
+            RUN["evict_queue_position"] = len(evict_queue_ahead()) + 1
+        return take_evict_ticket()
+
+    def waited() -> None:
+        if wait_started is not None:
+            RUN["evict_wait_s"] = round(time.monotonic() - wait_started, 1)
+
+    def busy_tail() -> str:
+        if RUN.get("evict_floor_wait") == "expired":
+            return (f"; the floor's {EVICT_WAIT_FLOOR_S:.0f}s wait ended with it still evicting, so its pass serves "
+                    "this floor")
+        if wait_started is not None:
+            return (f"; its {RUN.get('evict_wait_s', 0):.0f}s wait in the queue (place "
+                    f"{RUN.get('evict_queue_position')}) ended with it still evicting")
+        return ""
     busy = host_busy() if sweep else ""
     if sweep:
         print(f"idle sweep: {'host busy, ' + busy if busy else 'host idle'}")
@@ -14882,23 +15051,29 @@ def _main_impl(argv: list[str] | None = None) -> int:
                 RUN["skipped"] = "defer_during_ci"
                 return 0
         if a.apply and not a.cmux_next_drain and not RUNNER_CACHE_PROFILE:
-            held = eviction_lock_is_held()
-            if held and floor_evict_until and wait_for_evict_lock(floor_evict_until):
+            # a free lock with waiters queued is theirs first: this run queues behind them, or skips
+            held = eviction_lock_is_held() or bool(evict_queue_ahead())
+            if held and evict_until and wait_for_evict_lock(evict_until, join_queue()):
                 held = False
-                RUN["evict_floor_wait"] = "took its turn"
-                print(f"floor eviction: the running eviction finished within the floor's "
-                      f"{EVICT_WAIT_FLOOR_S:.0f}s wait; this run takes its turn")
-            elif held and floor_evict_until:
-                RUN["evict_floor_wait"] = "expired"
+                waited()
+                if floor_evict_until:
+                    RUN["evict_floor_wait"] = "took its turn"
+                    print(f"floor eviction: the running eviction finished within the floor's "
+                          f"{EVICT_WAIT_FLOOR_S:.0f}s wait; this run takes its turn")
+                else:
+                    print(f"evict.lock queue: this run's turn came after {RUN['evict_wait_s']:.0f}s")
+            elif held and evict_until:
+                waited()
+                if floor_evict_until:
+                    RUN["evict_floor_wait"] = "expired"
             if held:
+                drop_evict_ticket()
                 owner = eviction_owner_status()
                 RUN["evict_owner"] = owner
                 write_eviction_status(a.receipt, owner)
                 write_eviction_contention_health(a.receipt)
                 return deferred("eviction_busy", f"another eviction running; skipped before measuring "
-                                                 f"({eviction_owner_text(owner)})"
-                                + (f"; the floor's {EVICT_WAIT_FLOOR_S:.0f}s wait ended with it still evicting, so "
-                                   "its pass serves this floor" if RUN.get("evict_floor_wait") == "expired" else ""),
+                                                 f"({eviction_owner_text(owner)})" + busy_tail(),
                                 owner=owner)
     # only a pressure run measures the cap (one du) and acts on it (cmux_next_ci_over); a text report shows the last
     # measurement, and --json (glaeda-fleet-status asks every mini on every call) neither measures nor shows it
@@ -14938,11 +15113,13 @@ def _main_impl(argv: list[str] | None = None) -> int:
         # A second eviction would only race the first for the same items; its caller re-reads free
         # space instead.  The owner record lets a later run recover from a daemon that died while
         # its lock descriptor remained open.
-        handle = acquire_evict_lock()
-        if handle is None and floor_evict_until and wait_for_evict_lock(floor_evict_until):
-            handle = acquire_evict_lock()  # one more turn: the holder released within the floor's wait
-            if handle is not None:
+        handle = acquire_evict_lock(queued=queued_apply)
+        if handle is None and evict_until and wait_for_evict_lock(evict_until, join_queue() if queued_apply else None):
+            handle = acquire_evict_lock(queued=queued_apply)  # one more turn: the holder released within the wait
+            waited()
+            if handle is not None and floor_evict_until:
                 RUN["evict_floor_wait"] = "took its turn"
+            if handle is not None:
                 if cap is not None and pressure:
                     # the holder was evicting while this run waited, so the cap measured before it is spent: a
                     # waiter that kept its old budget would take young build output the holder had already freed
@@ -14952,17 +15129,17 @@ def _main_impl(argv: list[str] | None = None) -> int:
                     if cap and not a.json:
                         print(f"cmux-next-ci: {gib(cap['used']).strip()} of its {cap['cap'] / GIB:g} GiB cap "
                               f"({gib(cap['over']).strip()} over), measured again after the wait")
+        drop_evict_ticket()  # served, or its wait ran out
         if handle is None:
             if floor_evict_until:
                 RUN["evict_floor_wait"] = "expired"
+            waited()
             owner = eviction_owner_status()
             RUN["evict_owner"] = owner
             write_eviction_status(a.receipt, owner)
             write_eviction_contention_health(a.receipt)
             result = deferred("eviction_busy", f"another eviction running; skipped ({eviction_owner_text(owner)})"
-                              + (f"; the floor's {EVICT_WAIT_FLOOR_S:.0f}s wait ended with it still evicting, so its "
-                                 "pass serves this floor" if RUN.get("evict_floor_wait") == "expired" else ""),
-                              owner=owner)
+                              + busy_tail(), owner=owner)
             if maintenance_handle is not None:
                 fcntl.flock(maintenance_handle, fcntl.LOCK_UN)
                 maintenance_handle.close()
@@ -15148,6 +15325,10 @@ def _main_impl(argv: list[str] | None = None) -> int:
         halt = with_run_deadline(cmux_next_drain_halt if a.cmux_next_drain
                                  else host_busy if sweep and POLICY["defer_during_ci"]
                                  else saturation_halt(fss, a.emergency, floor_gib))
+        # a bounded hold: past EVICT_SLICE_S with a waiter queued, a pressure pass lets go between items. The idle
+        # sweep keeps its own halt: it runs only with no filesystem under pressure, so no floor eviction waits on it
+        if queued_apply and ACTIVITY_MODE == "pressure":
+            halt = with_evict_yield(halt)
         by_id = {f.id: f for f in fams}
         # the per-host cmux-next build root goes after everything else, idle runners' whole checkouts included
         last = {id(i) for i in items if i.family in by_id and cmux_next_ci_host_root(by_id[i.family], Path(i.path))}
@@ -15251,6 +15432,9 @@ def _main_impl(argv: list[str] | None = None) -> int:
               f"accounting gap {gib(summary['accounting_gap_bytes']).strip()}{gap_named(after_accounting)}; "
               f"receipt {a.receipt}")
         release_evict_lock(_EVICT_HANDLE)
+        if RUN.get("evict_yielded"):
+            print(f"{EVICT_YIELD_MARK}: {RUN['evict_yielded']} waiting after its {EVICT_SLICE_S:.0f}s slice; "
+                  "the next pass goes on from here")
         if maintenance_handle is not None:
             fcntl.flock(maintenance_handle, fcntl.LOCK_UN)
             maintenance_handle.close()
@@ -15416,6 +15600,8 @@ def write_run_line(started: float, free_before: int | None) -> None:
            "bundle_failed": RUN.get("bundle_failed", []),
            "bundle_failed_remembered": RUN.get("bundle_failed_remembered", []),
            "out_of_band": RUN.get("out_of_band"), "evict_floor_wait": RUN.get("evict_floor_wait"),
+           "evict_wait_s": RUN.get("evict_wait_s"), "evict_queue_position": RUN.get("evict_queue_position"),
+           "evict_yielded": RUN.get("evict_yielded"),
            "measure_budget_reached": bool(RUN.get("measure_budget_reached")),
            "run_deadline_reached": bool(RUN.get("run_deadline_reached"))}
     if RUN.get("cache_budget"):  # a budgeted pressure pass: used against budget per volume (cache_budget_rows)
@@ -15437,8 +15623,9 @@ def _logged_main(args: list[str]) -> int:
         status = _main_impl(args)
         # an out-of-band run skipped the job-owned families, so it never serves the queue's triggers: one claimed
         # before the run narrowed (the lock was free, then a CI job sent it out of band) is left for a full pass
+        # a run that yielded evict.lock stopped short of its pass: its claimed triggers stay for the next one
         release_hook_pass(served=status == 0 and RUN.get("skipped") not in UNSERVED
-                          and not RUN.get("out_of_band"))
+                          and not RUN.get("out_of_band") and not RUN.get("evict_yielded"))
         # A CI mini only ever runs --apply passes (the runner hooks and the pressure agent), never the report that
         # starts the census, so its accounting said "unwalked (no volume census yet)" for 258-291 GiB on cmux15,
         # cmux10s, cmux8s and cmuxs-6 (2026-11-02). A pass that ran starts the slice once its deletions are done;
@@ -15452,6 +15639,7 @@ def _logged_main(args: list[str]) -> int:
         release_hook_pass(served=False)
         raise
     finally:
+        drop_evict_ticket()
         if RUN.get("apply"):
             write_run_line(started, before)
 

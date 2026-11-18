@@ -13452,6 +13452,11 @@ DISK_BOUND = """# glaeda-disk-bound (leftover_spared reads this name)
 # another evict.lock holder outlasted the bound or glaeda-disk skipped as busy), and checks both again after it lets
 # go of LOCK, so no trigger is dropped.
 # Each pass is bounded by TIMEOUT and the holder by LIFETIME; a trigger left then is served by the next one.
+# Before each pass it lets evict.lock's queue go first (glaeda-disk's EVICT_WAITERS beside EVICT_LOCK: a ticket per
+# waiting run, named RANK-NS-PID.ticket): it starts no pass while a live waiter waits, so a floor eviction or the
+# LaunchAgent is served between this bound's passes instead of skipping as eviction_busy behind pass after pass (a
+# fleet mini, 2026-11-18: 35 floor evictions and 27 other runs skipped so in five hours). A pass that let go of
+# evict.lock for a waiter (glaeda-disk's EVICT_YIELD_MARK) did not finish, so its trigger stays claimed.
 import fcntl, os, subprocess, sys, time
 timeout, lifetime = float(sys.argv[1]), float(sys.argv[2])
 lock, pending, evict = sys.argv[3:6]
@@ -13459,14 +13464,42 @@ argv = sys.argv[6:]
 os.environ["GLAEDA_DISK_HOOK_PASS"] = "1"  # glaeda-disk's HOOK_PASS_ENV: this is the queue's own pass
 os.environ.setdefault("GLAEDA_DISK_CALLER", "runner hook pass")
 end = time.monotonic() + lifetime
-BUSY = (b"another eviction running", b"another measurement running", b"deferred: a CI job is running")
+BUSY = (b"another eviction running", b"another measurement running", b"deferred: a CI job is running",
+        b"evict.lock yielded to a waiting eviction")
+waiters = os.path.join(os.path.dirname(evict), "evict.waiters")
 
 claimed = pending + ".claimed"  # the triggers the current pass serves; removed only once a pass ran after them
 
 def waiting():
     return os.path.lexists(pending) or os.path.lexists(claimed)
 
+def queued():
+    # a live waiter's ticket (its pid runs; glaeda-disk ignores one older than its stale age too)
+    try:
+        names = os.listdir(waiters)
+    except OSError:
+        return False
+    now = time.time()
+    for name in names:
+        try:
+            _, at, pid = name[:-len(".ticket")].split("-") if name.endswith(".ticket") else ("", "", "")
+            if now - int(at) / 1e9 > 840:  # glaeda-disk's EVICT_TICKET_STALE_S
+                continue
+            os.kill(int(pid), 0)
+        except ProcessLookupError:
+            continue
+        except ValueError:
+            continue
+        except OSError:
+            pass
+        return True
+    return False
+
 def evict_free(deadline):
+    while queued():  # the queue goes first: never start a pass while an older waiter waits
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(1)
     try:
         fd = os.open(evict, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except OSError:
