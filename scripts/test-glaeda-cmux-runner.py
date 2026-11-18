@@ -9782,6 +9782,33 @@ class GateTest(unittest.TestCase):
         with mock.patch.object(hook.subprocess, "run", side_effect=subprocess.TimeoutExpired("pgrep", 5)):
             self.assertTrue(hook.runner_job_running(), "a reading that cannot tell counts as busy")
 
+    def test_a_gateway_waiter_is_no_running_job_for_a_drain(self) -> None:
+        """GATEWAY_NO_HOST_LOCK: a drain's busy reading (host_taken) agrees with the worker's claimHost
+        (cmuxterm-hq gateway_waiter.go): a gateway runner's job whose tree is only a waiting fleet client does not
+        count; any other work in it, CPU over the mark, or a runner that is not a gateway runner does."""
+        base = ("53339 87196 0.6 /U/actions-runner-glaeda-4/bin/Runner.Worker spawnclient 156 159\n"
+                "54480 53339 0.0 /opt/homebrew/bin/bash -e /U/actions-runner-glaeda-4/_work/_temp/x.sh\n"
+                "54482 54480 0.0 /opt/homebrew/bin/python3 /U/.local/share/cmux-fleet-client/versions/v/ci-client.py run\n"
+                "54483 54480 0.0 tee -a /U/actions-runner-glaeda-4/_work/_temp/look.log\n")
+        gateway = lambda d: d == "/U/actions-runner-glaeda-4"  # noqa: E731
+        self.assertEqual(hook.working_runner_jobs(hook.parse_process_table(base), gateway), 0)
+        for extra in ("60000 54480 0.0 /usr/bin/git fetch\n", "60001 54482 40.0 /bin/sh -c true\n"):
+            self.assertEqual(hook.working_runner_jobs(hook.parse_process_table(base + extra), gateway), 1, extra)
+        self.assertEqual(hook.working_runner_jobs(hook.parse_process_table(base), lambda d: False), 1)
+        self.assertIsNone(hook.parse_process_table(base + "1 1 0,6 x\n"))
+        runner = self.tmp / "actions-runner-glaeda-4"
+        (runner / "glaeda-hooks").mkdir(parents=True)
+        self.assertFalse(hook.gateway_runner_dir(os.fspath(runner)))
+        (runner / hook.RUNNER_HOOK_SCRIPT).write_text("exec hook job-started --gateway-runner --instance 4\n")
+        self.assertTrue(hook.gateway_runner_dir(os.fspath(runner)))
+        table = base.replace("/U/actions-runner-glaeda-4", os.fspath(runner))
+        answers = [subprocess.CompletedProcess([], 0), subprocess.CompletedProcess([], 0, stdout=table)]
+        with mock.patch.object(hook.subprocess, "run", side_effect=answers):
+            self.assertFalse(hook.runner_job_running(), "a mini with only a gateway waiter reads as busy")
+        answers = [subprocess.CompletedProcess([], 0), subprocess.CompletedProcess([], 0, stdout=table + "60000 54480 0.0 /usr/bin/git fetch\n")]
+        with mock.patch.object(hook.subprocess, "run", side_effect=answers):
+            self.assertTrue(hook.runner_job_running())
+
     def test_a_capture_lease_drain_is_a_drain_waiter_and_says_so(self) -> None:
         # cmuxterm-hq's worker publishes an exclusive (capture) lease's waiter as "capture_lease_drain", not
         # "lend_drain": on 2026-11-17 cmux18's gate logged "a fleet build is waiting for the host (pid 15419)" for
