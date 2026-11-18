@@ -743,6 +743,10 @@ REST_REPO_PART_KEEP = 3600  # an answer past its TTL still lends its ETag to the
 # status, 17 workflow-run and 22 pull reads in an hour and not one came back 304. Short, so a nudged PR (NUDGE_MIN)
 # still reads its head anew. REST_SHARED_MAX bounds the store; the oldest answers go first.
 REST_HEAD_PART_TTL = 15
+# Land refreshes are launched by separate worker processes. Keep one successful answer hot for the same short
+# window as commit/head parts, so two workers that noticed the same stale PR do not both spend the broker read.
+LAND_DIRECT_REUSE = REST_HEAD_PART_TTL
+LAND_DIRECT_LOCK_WAIT = DIRECT_READ_BUDGET + LAND_DIRECT_REUSE + 1
 REST_SHARED_MAX = 600
 # A pull's ETag moves without the pull changing: GET pulls/N embeds its base and head repositories whole (pushed_at,
 # open_issues_count, ...), so on a busy repository every read is a counted 200. cosmic-gray, 2026-11-16 15:25 to
@@ -7479,7 +7483,7 @@ def land_update_branch_args(repo: str, number: str, head: str, needs: list[str],
 
 def land_direct_read(key: str) -> str | None:
     """One read of KEY's PR from GitHub through the broker, stored in the cache; None, or why it could not."""
-    return direct_read({"key": key, "kind": "pr", "jobs": False, "began": time.time()})
+    return direct_read({"key": key, "kind": "pr", "jobs": False, "began": time.time(), "land": True})
 
 
 # The land executor: a host that only forwards its lands. cosmic-gray (Leo's Mac), 2026-11-17: load 48 on 15 cores,
@@ -11733,7 +11737,7 @@ def wait_starved(req: dict, entry: dict | None, now: float) -> float | None:
     return age_s if age_s > bound else None
 
 
-def direct_read(req: dict) -> str | None:
+def _direct_read(req: dict) -> str | None:
     """One read of the wait's target from GitHub by this process, outside the daemon's queue, stored in the cache the
     way the daemon stores it (so wait_step rules on it): a PR over GraphQL, a run over REST. The fallback for a wait
     whose daemon heartbeats but has not refreshed this target (wait_starved). None, or why it could not read."""
@@ -11792,6 +11796,29 @@ def direct_read(req: dict) -> str | None:
         return error
     cached = read_cache(key) or {}
     return None if (cached.get("dataAt") or 0) >= daemon.now else (cached.get("error") or "no data stored")
+
+
+def _land_direct_cache_fresh(key: str, now: float) -> bool:
+    """Whether a recent successful land refresh already answered KEY."""
+    cached = read_cache(key) or {}
+    at = cached.get("dataAt")
+    return isinstance(at, (int, float)) and not isinstance(at, bool) and 0 <= now - at < LAND_DIRECT_REUSE \
+        and isinstance(cached.get("data"), dict) and not cached.get("error")
+
+
+def direct_read(req: dict) -> str | None:
+    """Read a wait target, coalescing same-key land refreshes across worker processes."""
+    if not req.get("land"):
+        return _direct_read(req)
+    key = req["key"]
+    lock_path = BASE / f".land-direct-{file_name(key)}.lock"
+    with bounded_lock(lock_path, LAND_DIRECT_LOCK_WAIT) as held:
+        if not held:
+            return "land refresh lock unavailable"
+        now = time.time()
+        if _land_direct_cache_fresh(key, now):
+            return None
+        return _direct_read(req)
 
 
 # A lane VM's direct reads (direct_read through the broker: a starved wait, the land worker's refresh) are one process
