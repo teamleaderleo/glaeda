@@ -303,7 +303,7 @@ import urllib.parse
 import urllib.request
 import zlib
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Sequence
 
 BASE = Path(os.environ.get("GLAEDA_GH_DIR") or Path.home() / ".cache/glaeda/gh")
 API = "https://api.github.com"
@@ -2044,31 +2044,59 @@ def keeper_text(text: str) -> str:
 
 
 _CONTENT_PAUSE_UNREAD: set[str] = set()  # CONTENT_PAUSE_ENV values already logged as unreadable
+# A keeper that has no `content-pause` verb: the command, and the (mtime, size) of its program when it said so. glaeda
+# shipped its ask before the gh guard shipped the verb (leo-workspace#5824), and a guard of that age answers argparse's
+# usage, exit 2: huge-blue, 2026-11-18, logged "content pause: exit 2: usage: gh-quota {check,serve,...}" on every
+# pass, held each create CONTENT_PAUSE_BLIND_MAX after every start, and its pr data went stale twice in an hour. Such
+# a keeper is no keeper (the outbox posts as on a host with none) until its program changes: a deploy asks again.
+CONTENT_PAUSE_NO_VERB = re.compile(r"invalid choice: '?content-pause'?|usage: \S+ \{(?![^}]*\bcontent-pause\b)[^}]*\}")
+_CONTENT_PAUSE_LACKING: dict[tuple[str, ...], tuple[float, int] | None] = {}
+
+
+def keeper_program(cmd: Sequence[str]) -> tuple[float, int] | None:
+    """(mtime, size) of the program CMD runs (its last word naming a file: gh_quota.py after `python3 -I`, else the
+    command itself), or None when there is none to look at."""
+    for word in reversed(cmd):
+        with contextlib.suppress(OSError):
+            st = Path(word).stat()
+            if Path(word).is_file():
+                return (st.st_mtime, st.st_size)
+    return None
+
+
+def keeper_lacks_verb(cmd: Sequence[str]) -> bool:
+    """Whether CMD said it has no content-pause verb and its program has not changed since."""
+    key = tuple(cmd)
+    return key in _CONTENT_PAUSE_LACKING and _CONTENT_PAUSE_LACKING[key] == keeper_program(cmd)
 
 
 def content_pause_cmd() -> list[str] | None:
     """The command that reads and extends the login's create pause (CONTENT_PAUSE_ENV), or None: none on this host.
     A setting shlex cannot read (an unclosed quote) is no command, logged once: raising here stopped every outbox
-    pass."""
+    pass. So is a keeper that said it has no content-pause verb, until its program changes (keeper_lacks_verb)."""
     named = os.environ.get(CONTENT_PAUSE_ENV)
+    found: list[str] | None = None
     if named is not None:
         try:
-            return shlex.split(named) or None
+            found = shlex.split(named) or None
         except ValueError as error:
             if named not in _CONTENT_PAUSE_UNREAD:
                 _CONTENT_PAUSE_UNREAD.add(named)
                 log({"event": "content-pause-cmd",
                      "error": f"{CONTENT_PAUSE_ENV} unreadable ({error}): no pause asked"})
             return None
-    with contextlib.suppress(OSError):
-        cli = PACE_CLI.resolve().parent / "gh_quota.py"
-        if cli.is_file():
-            return [sys.executable, "-I", os.fspath(cli)]
-    for name in CONTENT_PAUSE_NAMES:
-        found = shutil.which(name)
-        if found:
-            return [found]
-    return None
+    if found is None and named is None:
+        with contextlib.suppress(OSError):
+            cli = PACE_CLI.resolve().parent / "gh_quota.py"
+            if cli.is_file():
+                found = [sys.executable, "-I", os.fspath(cli)]
+    if found is None and named is None:
+        for name in CONTENT_PAUSE_NAMES:
+            which = shutil.which(name)
+            if which:
+                found = [which]
+                break
+    return None if found is None or keeper_lacks_verb(found) else found
 
 
 def find_gh() -> str | None:
@@ -4316,6 +4344,9 @@ class Daemon:
         ("error", why), and nothing else."""
         try:
             done = run_bounded([*cmd, "content-pause"], CONTENT_PAUSE_SLOW_DEADLINE)
+            if done.returncode == 2 and CONTENT_PAUSE_NO_VERB.search(done.stderr or ""):
+                self.pause_result = ("no-verb", (cmd, keeper_program(cmd)))
+                return
             doc = json.loads(done.stdout) if done.returncode == 0 else None
             if not isinstance(doc, dict):
                 raise WatchError(f"exit {done.returncode}: {keeper_text((done.stderr or done.stdout or '').strip())}")
@@ -4341,6 +4372,15 @@ class Daemon:
             return
         kind, value = outcome
         clock = self.clock()
+        if kind == "no-verb":  # an older keeper (keeper_lacks_verb): no keeper, not a failure; asked again after a deploy
+            cmd, program = value
+            _CONTENT_PAUSE_LACKING[tuple(cmd)] = program
+            log({"event": "content-pause-cmd",
+                 "error": f"{keeper_text(shlex.join(cmd))} has no content-pause verb: no pause asked until it changes"})
+            self.pause_first_ask = self.pause_answered_at = None
+            self.pause_failures = self.pause_timeouts = 0
+            self.pause_error, self.pause_blind_logged = None, False
+            return
         if kind == "ok":
             asked, until = value
             until = min(until, clock + PACE_HOLD_MAX)  # a corrupt far future holds an hour at most

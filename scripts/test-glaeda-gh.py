@@ -12322,6 +12322,38 @@ class PostTest(unittest.TestCase):
         for unread in ("nan", "-inf", "soon", "", None):
             self.assertIsNone(gg.retry_after_seconds(unread), unread)
 
+    def test_a_keeper_without_the_verb_is_no_keeper_until_its_program_changes(self) -> None:
+        # huge-blue, 2026-11-18: glaeda asked `gh_quota.py content-pause` before the gh guard there had the verb
+        # (leo-workspace#5824); argparse's usage, exit 2, was a failed ask every pass and held creates.
+        first = self.queue("comment", "o/r#1", "--body", "one")
+        second = self.queue("comment", "o/r#2", "--body", "two")
+        root = Path(self.tmp.name) / "old-keeper"
+        root.mkdir()
+        calls = root / "calls"
+        cmd = root / "gh-quota"
+        cmd.write_text(f'#!/bin/sh\necho "$*" >> {shlex.quote(os.fspath(calls))}\n'
+                       "echo 'usage: gh-quota {check,serve,store,content-kind,usage} ...' >&2\n"
+                       "echo \"gh-quota: error: argument cmd: invalid choice: 'content-pause'\" >&2\nexit 2\n")
+        cmd.chmod(0o755)
+        ok = (201, {}, {"html_url": "u"})
+        d, t = self.daemon(ok, ok)
+        d.clock_real = False
+        lines: list[dict] = []
+        with mock.patch.dict(os.environ, {gg.CONTENT_PAUSE_ENV: shlex.quote(os.fspath(cmd))}), \
+                mock.patch.object(gg, "log", lines.append), mock.patch.dict(gg._CONTENT_PAUSE_LACKING, clear=True):
+            self.step(d, NOW)
+            d.content_pause_settle(10)
+            self.step(d, NOW + gg.POST_SPACING)
+            self.step(d, NOW + 2 * gg.POST_SPACING + gg.CONTENT_PAUSE_RETRY)
+            self.assertIsNone(gg.content_pause_cmd())  # no keeper while the program is the same
+            self.assertEqual([gg.post_state(i["id"])["state"] for i in (first, second)], ["posted", "posted"])
+            self.assertFalse([e for e in d.errors if e.startswith("content pause")])
+            self.assertEqual(calls.read_text().splitlines(), ["content-pause"])  # asked once, not every pass
+            self.assertEqual(len([e for e in lines if e.get("event") == "content-pause-cmd"]), 1)
+            self.assertIsNone(d.content_pause_status())
+            cmd.write_text(cmd.read_text() + "# deployed\n")  # a new gh guard: asked again
+            self.assertEqual(gg.content_pause_cmd(), [os.fspath(cmd)])
+
     def test_a_malformed_pause_command_is_no_command_logged_once(self) -> None:
         # shlex.split raised ValueError outside post_tick's try: every pass failed and nothing was ever sent.
         first = self.queue("comment", "o/r#1", "--body", "one")
