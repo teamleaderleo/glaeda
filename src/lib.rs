@@ -43,6 +43,8 @@ pub mod disposable_attempt_state;
 pub mod disposable_clone_runtime;
 #[cfg(unix)]
 pub(crate) mod disposable_host_storage;
+#[cfg(unix)]
+pub(crate) mod disposable_host_yield;
 /// Exact plan plus explicitly approved macOS apply boundary for the disposable-worker LaunchAgent.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub mod disposable_launchd_service;

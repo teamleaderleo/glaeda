@@ -22,6 +22,7 @@ use crate::disposable_clone_runtime::{
     DisposableCloneRuntimeError, DisposableCloneTransactionOutcome, admission_seal,
 };
 use crate::disposable_host_storage::{DisposableHostStorageSource, HOST_STORAGE_UNAVAILABLE_CODE};
+use crate::disposable_host_yield::{DisposableHostYieldSource, HostYieldReason, NoHostYield};
 use crate::disposable_runner_runtime::{
     DisposableRunnerRegistrationSource, DisposableRunnerRuntime, DisposableRunnerRuntimeError,
 };
@@ -89,6 +90,8 @@ impl DisposableWorkerServiceBridge for ScaleSetBridgeClient {
 pub(crate) enum DisposableWorkerCoordinatorDisposition {
     Idle,
     HostStorageUnavailable,
+    /// The Mac's own work holds new workers off; zero capacity was advertised.
+    HostYielding(HostYieldReason),
     TemplateAdvanced(DisposableTemplateRuntimeDisposition),
     DeliverySettled {
         acquired: usize,
@@ -133,6 +136,7 @@ pub(crate) struct DisposableWorkerCoordinator {
     state_root: PathBuf,
     policy: ScaleSetDeliveryConsumerPolicy,
     host_storage: Box<dyn DisposableHostStorageSource>,
+    host_yield: Box<dyn DisposableHostYieldSource>,
 }
 
 impl DisposableWorkerCoordinator {
@@ -145,7 +149,18 @@ impl DisposableWorkerCoordinator {
             state_root: state_root.into(),
             policy,
             host_storage,
+            host_yield: Box::new(NoHostYield),
         }
+    }
+
+    /// Advertise zero capacity while the host's own work holds new workers off. A worker that
+    /// already has its job keeps it.
+    pub(crate) fn with_host_yield(
+        mut self,
+        host_yield: Box<dyn DisposableHostYieldSource>,
+    ) -> Self {
+        self.host_yield = host_yield;
+        self
     }
 
     #[cfg(test)]
@@ -254,7 +269,16 @@ impl DisposableWorkerCoordinator {
                 )
             });
         if !operation_owns_live_poll {
-            let available_capacity = advertised_capacity(&catalog, self.host_storage.as_ref());
+            let host_yield = if catalog.active().is_empty() {
+                self.host_yield.host_yield()
+            } else {
+                None
+            };
+            let available_capacity = if host_yield.is_some() {
+                0
+            } else {
+                advertised_capacity(&catalog, self.host_storage.as_ref())
+            };
             let host_storage_available = available_capacity == 1;
             let observed_at = clock
                 .epoch_millis()
@@ -289,6 +313,11 @@ impl DisposableWorkerCoordinator {
                 ScaleSetDeliveryControllerDisposition::Idle => {}
             }
 
+            if let Some(reason) = host_yield
+                && catalog.active().is_empty()
+            {
+                return Ok(DisposableWorkerCoordinatorDisposition::HostYielding(reason));
+            }
             if catalog.active().is_empty() && !host_storage_available {
                 return Ok(DisposableWorkerCoordinatorDisposition::HostStorageUnavailable);
             }
