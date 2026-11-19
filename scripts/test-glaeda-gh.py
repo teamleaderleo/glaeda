@@ -5652,7 +5652,7 @@ class FleetBudgetTest(Base):
         self.assertIn("(0 of 3 hosts read; unread: here, far, down; a lower bound)", text)
 
     def test_unread_host_is_not_zero_and_the_total_is_a_lower_bound(self) -> None:
-        """2026-11-19 on cosmic-gray: huge-blue, big-red and air-blue "reported 0" while unread, and the sum explained
+        """2026-11-19 on cosmic-gray: three Linux hosts "reported 0" while unread, and the sum explained
         far less than the ~3000 REST spent. A host or lane VM whose spend was not read is unread with its reason."""
         now = time.time()
         reports = self.reports(now)

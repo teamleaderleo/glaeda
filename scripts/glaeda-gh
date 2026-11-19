@@ -15935,8 +15935,8 @@ def hard_reserve() -> dict:
 
 def spend_unread_why(report: dict) -> str | None:
     """Why a reached host's login spend was not read (its gh-quota usage gave nothing, an empty list, rows with no
-    REST count from an older gh-quota, or an answer cut short), or None when it was. 2026-11-19: huge-blue, big-red and
-    air-blue printed "REST 0" from cosmic-gray while the read hosts explained well under half the ~3000 REST spent:
+    REST count from an older gh-quota, or an answer cut short), or None when it was. 2026-11-19: three Linux hosts
+    printed "REST 0" from cosmic-gray while the read hosts explained well under half the ~3000 REST spent:
     an unread host is unknown, not idle."""
     usage = report.get("usage")
     if report.get("truncated"):
