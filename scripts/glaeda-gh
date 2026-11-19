@@ -2344,6 +2344,7 @@ def gh_token() -> str:
     if gh is None:
         raise WatchError("gh not found")
     try:
+        # gh-auth-token-lint: allow authored-write: direct writes need the host login identity.
         result = run_bounded([gh, "auth", "token", "--hostname", "github.com"])
     except (OSError, subprocess.TimeoutExpired) as error:
         raise WatchError(f"gh auth token: {type(error).__name__}") from None

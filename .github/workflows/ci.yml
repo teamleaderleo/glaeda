@@ -173,6 +173,7 @@ jobs:
 
       - name: Validate and test scripts
         run: |
+          python3 scripts/gh_auth_token_lint.py
           python3 - <<'PY'
           from pathlib import Path
 
