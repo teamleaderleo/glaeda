@@ -18541,7 +18541,7 @@ class LogScanTest(Base):
                 b"2026-11-19T01:00:02.4Z    --> src/lib.rs:9:3\n"
                 b"2026-11-19T01:00:02.5Z ##[endgroup]\n"
                 b"2026-11-19T01:00:03.1Z ##[group]Run python3 -m unittest\n"
-                b"2026-11-19T01:00:03.2Z FAIL: test_pkill (__main__.FleetRuleLints.test_pkill)\n"
+                b"2026-11-19T01:00:03.2Z FAIL: test_no_stray_sleep (__main__.FleetRuleLints.test_no_stray_sleep)\n"
                 b"2026-11-19T01:00:03.3Z ##[error]Process completed with exit code 1.\n"
                 b"2026-11-19T01:00:04.1Z Cleaning up orphan processes\n")
     QUIET_LOG = (b"2026-11-19T01:00:00Z ##[group]Run make\n"
@@ -18633,8 +18633,8 @@ class LogScanTest(Base):
         doc = json.loads(text)
         self.assertEqual(code, 0)
         rows = {t["test"]: t for t in doc["tests"]}
-        self.assertEqual(set(rows), {"sessions::resume_keeps_order", "FleetRuleLints.test_pkill"})
-        row = rows["FleetRuleLints.test_pkill"]
+        self.assertEqual(set(rows), {"sessions::resume_keeps_order", "FleetRuleLints.test_no_stray_sleep"})
+        row = rows["FleetRuleLints.test_no_stray_sleep"]
         self.assertEqual((row["verdict"], row["fails"], row["runs"], row["rerun_green"]), ("flaky", 2, 2, 1))
         self.assertEqual(doc["jobs_rerun_green"], {"cargo test": 1})
         code, text = self.run_cmd(gg.cmd_log_flaky, "o/r", "resume", as_json=True)
@@ -18646,7 +18646,7 @@ class LogScanTest(Base):
         self.rec(42, run=None, minutes_ago=30)
         self.rec(43, run=None, conclusion="success", minutes_ago=20)
         self.ctl_logs[40] = self.ctl_logs[42] = (200, self.FAIL_LOG)
-        code, text = self.run_cmd(gg.cmd_log_flaky, "o/r", "pkill", as_json=True)
+        code, text = self.run_cmd(gg.cmd_log_flaky, "o/r", "stray_sleep", as_json=True)
         doc = json.loads(text)
         self.assertEqual((code, doc["tests"][0]["rerun_green"], doc["jobs_rerun_green"]), (1, 0, {}))
 
@@ -18680,7 +18680,7 @@ class LogScanTest(Base):
         for job in range(20, 23):
             self.rec(job, run=job, minutes_ago=30 - job % 10)
             self.ctl_logs[job] = (200, self.FAIL_LOG)
-        code, text = self.run_cmd(gg.cmd_log_flaky, "o/r", "pkill", as_json=True)
+        code, text = self.run_cmd(gg.cmd_log_flaky, "o/r", "stray_sleep", as_json=True)
         self.assertEqual(code, 1)
         self.assertEqual(json.loads(text)["tests"][0]["verdict"], "repeats")
 
@@ -18708,7 +18708,7 @@ class LogScanTest(Base):
         self.assertEqual(found["steps"][0]["lines"], [
             "test sessions::resume_keeps_order ... FAILED", "thread 'x' panicked at src/lib.rs:4:5:",
             "error[E0599]: no method named `foo`", "   --> src/lib.rs:9:3"])
-        self.assertEqual(found["steps"][1]["lines"], ["FAIL: test_pkill (__main__.FleetRuleLints.test_pkill)",
+        self.assertEqual(found["steps"][1]["lines"], ["FAIL: test_no_stray_sleep (__main__.FleetRuleLints.test_no_stray_sleep)",
                                                       "Process completed with exit code 1."])
         capped = gg.log_errors(self.FAIL_LOG, limit=2)
         self.assertEqual((capped["total"], capped["shown"]), (6, 2))
