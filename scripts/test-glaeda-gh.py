@@ -23531,6 +23531,21 @@ class AppPoolTest(Base):
         self.assertEqual(self.daemon.backoff["graphql"], 0.0)
         self.assertEqual(self.pool.status()["fellBack"], 1)
 
+    def test_an_app_graphql_rate_limit_stays_out_of_the_login_budget(self) -> None:
+        self.daemon.budget["graphql"] = {"limit": 5000, "remaining": 4000, "reset": NOW + 1800}
+        self.app_answers.append((200, {"x-ratelimit-limit": "10000", "x-ratelimit-remaining": "100",
+                                       "x-ratelimit-reset": str(int(NOW + 900))},
+                                 b'{"data":{"rateLimit":{"limit":10000,"remaining":100,"resetAt":"2030-01-01T00:00:00Z","cost":7}}}'))
+        query = {"query": "query($o0:String!,$r0:String!,$n0:Int!){repository(owner:$o0,name:$r0){pullRequest(number:$n0){number}}}",
+                 "variables": {"o0": "manaflow-ai", "r0": "cmux", "n0": 1}}
+        doc, error = self.daemon.graphql(query["query"], query["variables"])
+        self.assertIsNone(error)
+        self.assertIsInstance(doc, dict)
+        self.assertEqual(self.daemon.budget["graphql"]["remaining"], 4000)
+        self.assertEqual(self.daemon.gql_log, [], "App points do not pace or stop the login")
+        self.assertEqual(self.pool.status()["graphqlPoints"], 7)
+        self.assertEqual(self.pool.status()["graphqlSeen"]["remaining"], 100)
+
     def test_no_app_on_this_host_keeps_the_login_and_asks_again_only_after_a_rest(self) -> None:
         self.ready = False
         self.daemon.request("GET", "/repos/manaflow-ai/cmux/pulls/1")

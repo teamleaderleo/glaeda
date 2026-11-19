@@ -2359,6 +2359,9 @@ class AppPool:
         self.why = ""  # the last reason the pool was passed over, for daemon.json (never a token)
         self.served = self.fell_back = 0
         self.seen: dict | None = None  # the App's last rate headers: {"limit", "remaining", "reset"}
+        self.graphql_served = 0
+        self.graphql_points = 0
+        self.graphql_seen: dict | None = None
 
     def held_here(self) -> bool:
         """Whether this host holds the role's App: its metadata and key files (a file test, no request)."""
@@ -2473,7 +2476,20 @@ class AppPool:
         now = self.clock()
         resting = {o: round(t) for o, t in self.rest_until.items() if t > now}
         return {"role": self.role, "served": self.served, "fellBack": self.fell_back, "seen": self.seen,
-                "resting": resting or None, "why": self.why or None}
+                "resting": resting or None, "why": self.why or None,
+                "graphqlServed": self.graphql_served, "graphqlPoints": self.graphql_points,
+                "graphqlSeen": self.graphql_seen}
+
+    def graphql_answered(self, rate: dict, points: int) -> None:
+        """Keep an App GraphQL answer in the App pool; it must never become the login's budget or pacing data."""
+        self.graphql_served += 1
+        self.graphql_points += points
+        if isinstance(rate, dict):
+            try:
+                self.graphql_seen = {"limit": int(rate["limit"]), "remaining": int(rate["remaining"]),
+                                     "reset": iso_epoch(rate.get("resetAt"))}
+            except (KeyError, TypeError, ValueError):
+                pass
 
 
 # ---------------------------------------------------------------- upstream (a host with no login)
@@ -3749,6 +3765,7 @@ class Daemon:
     def __init__(self, transport: Callable = http, token: Callable[[], str] = gh_token,
                  controller: Any = "env", upstream: Any = "config", app_pool: Any = "auto") -> None:
         self.transport = transport
+        self.last_request_source = "login"  # credential used by the most recent request (App or login)
         # The ci-watch App's tokens for repo reads (AppPool); "auto" finds them on this host, None keeps every read on
         # the login.
         self.app_pool: AppPool | None = AppPool(clock=lambda: self.clock()) if app_pool == "auto" else app_pool
@@ -4842,6 +4859,7 @@ class Daemon:
         creation) holds the outbox, not the read buckets.
         free: /rate_limit, which counts against no primary limit. Counting it as a REST request
         would overstate the spend of the very call that reads the spend."""
+        self.last_request_source = "login"
         if time.monotonic() >= self.tick_deadline:
             raise OutOfTime
         bucket = "graphql" if path == "/graphql" else "rest"
@@ -4857,6 +4875,7 @@ class Daemon:
         route = route_of(method, path)
         app_token = pool.token(owner) if owner and pool.covers(route) else None
         if app_token:
+            self.last_request_source = "app"
             headers = {"Authorization": f"Bearer {app_token}", "Accept": "application/vnd.github+json",
                        "User-Agent": "glaeda-gh", "X-GitHub-Api-Version": "2022-11-28"}
             if etag:
@@ -4885,6 +4904,7 @@ class Daemon:
                 return status, h, doc
             log({"event": "app-pool-refused", "role": pool.role, "owner": owner, "status": status})
             # refused: the same read goes on the login at once, as it would have without the App
+            self.last_request_source = "login"
         if self.token is None:
             self.token = self.token_source()
         headers = {"Authorization": f"Bearer {self.token}", "Accept": "application/vnd.github+json",
@@ -7216,11 +7236,16 @@ class Daemon:
         rate =((doc.get("data") or {}).get("rateLimit") or {}) if isinstance(doc, dict) else {}
         cost = rate.get("cost") if isinstance(rate, dict) else None
         points = cost if isinstance(cost, int) and not isinstance(cost, bool) and cost > 0 else 1
-        self.gql_log.append((self.now, self.gql_reason, points))
-        self.note_spend("graphql", self.gql_reason, 1, points)
+        if self.last_request_source == "app":
+            # The App has its own GraphQL bucket. Do not let its rateLimit answer stop or pace the login.
+            if self.app_pool is not None:
+                self.app_pool.graphql_answered(rate if isinstance(rate, dict) else {}, points)
+        else:
+            self.gql_log.append((self.now, self.gql_reason, points))
+            self.note_spend("graphql", self.gql_reason, 1, points)
         if status != 200 or not isinstance(doc, dict):
             return None, f"graphql: HTTP {status}"
-        if rate:
+        if rate and self.last_request_source != "app":
             self.note_budget("graphql", rate.get("limit"), rate.get("remaining"), iso_epoch(rate.get("resetAt")))
         return doc, None
 
