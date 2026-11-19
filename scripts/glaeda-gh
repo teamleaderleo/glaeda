@@ -4878,9 +4878,6 @@ class Daemon:
         if time.monotonic() >= self.tick_deadline:
             raise OutOfTime
         bucket = "graphql" if path == "/graphql" else "rest"
-        if not self.secondary_admit(bucket, 1):
-            # never sent: any request during a secondary hold (a write, a free /rate_limit) would only extend it
-            raise WatchError(f"held: GitHub's secondary rate limit, {max(0, int(self.secondary_until - self.clock()))}s left")
         if self.upstream() is not None:
             raise WatchError("this host reads GitHub through its upstream (upstream.json) and has no login")
         raw_body = json.dumps(body).encode() if body is not None else None
@@ -4921,8 +4918,13 @@ class Daemon:
             log({"event": "app-pool-refused", "role": pool.role, "owner": owner, "status": status})
             # refused: the same read goes on the login at once, as it would have without the App
             self.last_request_source = "login"
-            if self.mode(bucket) == "stop":
+            if self.mode(bucket) == "stop" and self.clock() >= self.secondary_until:
                 raise WatchError(f"{pool.role} App refused {scope}; login {bucket} is under its reserve")
+        # The login's secondary hold (this daemon's, the pacer's, or a latch mark another caller wrote) holds the login
+        # only: an App installation token has its own limits, so an App read above goes on while it lasts.
+        if not self.secondary_admit(bucket, 1):
+            # never sent: any request during a secondary hold (a write, a free /rate_limit) would only extend it
+            raise WatchError(f"held: GitHub's secondary rate limit, {max(0, int(self.secondary_until - self.clock()))}s left")
         if self.token is None:
             self.token = self.token_source()
         headers = {"Authorization": f"Bearer {self.token}", "Accept": "application/vnd.github+json",

@@ -23633,6 +23633,20 @@ class AppPoolTest(Base):
         self.assertEqual([e["key"] for e in due], [entry["key"]])
         self.assertEqual(self.minted, ["manaflow-ai"], "eligibility checks the App before spending login quota")
 
+    def test_a_login_secondary_hold_holds_the_login_but_not_the_app(self) -> None:
+        """The login's secondary limit (or a latch mark another caller wrote) is the login's: an installation token has
+        its own limits, so the daemon's App reads go on while the login waits, and a login read is still held."""
+        self.daemon.secondary_until = self.daemon.clock() + 600
+        status, _, doc = self.daemon.request("GET", "/repos/manaflow-ai/cmux/pulls/1")
+        self.assertEqual((status, doc), (200, {"app": True}))
+        with self.assertRaisesRegex(gg.WatchError, "^held: "):
+            self.daemon.request("GET", "/repos/o/r/pulls/1")
+        self.app_answers.append((403, {"x-ratelimit-remaining": "14000", "x-ratelimit-reset": str(int(NOW + 900))},
+                                 b'{"message": "Resource not accessible by integration"}'))
+        with self.assertRaisesRegex(gg.WatchError, "^held: "):
+            self.daemon.request("GET", "/repos/manaflow-ai/cmux/branches/main/protection")
+        self.assertEqual(self.gh.calls, [], "nothing went on the login during its hold")
+
     def test_under_the_floor_the_app_is_left_to_its_other_users(self) -> None:
         self.app_answers.append((200, {"x-ratelimit-limit": "15000", "x-ratelimit-remaining": str(gg.APP_POOL_FLOOR - 1),
                                        "x-ratelimit-reset": str(int(NOW + 600))}, b"{}"))
