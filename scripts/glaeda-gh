@@ -9086,6 +9086,13 @@ LAND_MH_BEHIND_COMMITS = 20
 LAND_MH_BEHIND_HOURS = 6.0
 LAND_MH_BEHIND_EVERY = 600.0
 LAND_MH_BEHIND_DEADLINE = 10.0
+# The check refreshes such a checkout itself, never only warns: it runs the `tools/ws-deploy --local` its warning names
+# (beside merge_hold.py) off the tick, bounded by LAND_MH_REFRESH_DEADLINE, at most every LAND_MH_REFRESH_EVERY, then
+# judges the checkout again. gcp-agent-lane-6, 2026-11-19: `land status` warned "last fetched 6.5 h ago" while
+# cmux#46208 and #46210 stopped retry_deadline ("waited 10152 s ... still unreadable"), and nothing ran the command the
+# warning named. land.json "mergeHoldRefresh": false turns it off.
+LAND_MH_REFRESH_EVERY = 1800.0
+LAND_MH_REFRESH_DEADLINE = 600.0
 LAND_WS_SYNC_LOG = Path(os.environ.get("WS_SYNC_STATE") or Path.home() / ".cache/ws-sync") / "deploys.log"
 LAND_WS_SYNC_SEEN = re.compile(r"^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ) (?:no-op ([0-9a-f]{7,40})\b|deployed [0-9a-f]+\.\.([0-9a-f]{7,40})\b)")
 LAND_WS_SYNC_TAIL = 16384  # bytes of the record read: hours of 10-minute runs
@@ -9361,6 +9368,16 @@ LAND_TRAIN_HOLDER = re.compile(r"\b([\w.-]+/[\w.-]+#\d+) \(label [\w.-]+, head (
 # reported as cancelled) be rerun dozens of times (review of glaeda#2174, F2). The next names it and stops
 # "rerun_failed_cap". A new head starts the count again.
 LAND_RERUN_CAP = 3
+# A stop whose cause can clear by itself is re-armed (LandQueue.rearm): retry_deadline (merge_hold could not judge:
+# an old merge_hold checkout, a mirror, a flapping read) and <step>_transient (the step timed out or GitHub answered
+# 5xx, LAND_STEP_TRANSIENT). It is queued again once merge_hold's checkout was refreshed or turned current after the
+# stop (retry_deadline), else LAND_REARM_AFTER after it, at most LAND_REARM_CAP times per entry per UTC day. Its wait
+# budget and transient count are kept, so a judgment that still reads the same stops it again at once (one probe, not
+# another 2 h); one that reads clean goes on. gcp-agent-lane-6, 2026-11-19: cmux#46208 and #46210 stayed stopped
+# retry_deadline behind a stale merge_hold checkout, each landing only on a requeue by hand.
+LAND_REARM_CODES = re.compile(r"^(?:retry_deadline|[a-z_]+_transient)$")
+LAND_REARM_AFTER = 3600.0
+LAND_REARM_CAP = 3
 # An --after PR whose predecessor's land stopped keeps waiting for it this long (consider, after_stopped), telling its
 # requester once: landing the predecessor again, or merging it, resumes the whole chain, and nobody re-queues the PRs
 # behind it (before, each stopped at once: cmux#46237, #46217, #46236 behind #46157, #46183, #46220). Past it, it
@@ -9408,6 +9425,13 @@ LAND_QUOTA_SAID = (re.compile(r"\bno attempt before\s+(\d{2}):(\d{2})(?::(\d{2})
 LAND_STEP_BACKOFF = 60.0
 LAND_STEP_BACKOFF_MAX = 1800.0
 LAND_STEP_STOP = 6  # 60+120+240+480+960 s of backoff (~31 min) before the 6th identical refusal stops it
+# A step that timed out (exit 124: LandQueue.call's bound) or that GitHub answered 5xx is transient: it never counts
+# toward LAND_STEP_STOP. It backs off on its own count (e["stepTransient"], per head) and stops "<kind>_transient" only
+# after LAND_RETRY_STREAK_STOP in a row, a stop LAND_REARM_CODES re-arms. cmux#46145, 2026-11-19: five broker refusals
+# and one "timed out after 120s" stopped it update_branch_refused, the timeout counted as the sixth.
+LAND_STEP_TRANSIENT = re.compile(r"\btimed out after \d+s\b|\bHTTP 5\d\d\b|\b5\d\d (?:Bad Gateway|Service Unavailable"
+                                 r"|Gateway Time-?out|Internal Server Error)\b|\bconnection (?:reset|timed out)\b",
+                                 re.I)
 # A refusal whose step is an update-branch (merge_hold's action kind "update_branch", any code: tip_merge, stale_green,
 # ws_check_stale_base, startup_failure, red_not_excused with --needs-newer-base) is taken, not counted. Before, the
 # judgment counted it toward LAND_STREAK_STOP before the step ran, so an update refused once or twice at a head (or
@@ -10141,6 +10165,9 @@ class LandQueue:
         self.behind_at = float("-inf")
         self.stale_checkout: tuple[str, str | None] | None = None  # check_behind's last finding, numbers out
         self.mh_fallback: tuple[Path, Path] | None = None  # (merge_hold.py configured, the release run instead)
+        self.mh_refresh_at = float("-inf")  # when refresh_checkout last started ws-deploy (LAND_MH_REFRESH_EVERY)
+        self.mh_refreshing = False
+        self.mh_changed_at = float("-inf")  # when merge_hold's checkout was refreshed or turned current (rearm)
         self.latched: tuple[str, int] | None = None
         # The latch a previous daemon saw holding (land/latch.json): a restart or re-exec inside one hold is the same
         # window (hold), not a new one; its end is still logged and still marks latch_cleared.
@@ -10307,7 +10334,8 @@ class LandQueue:
             e.update(state="queued", head="", explain=None, action=None, streak=None, wakeAt=None,
                      wait=None, seen=None, seenHead="", mergeSha="", stop=None, preStepHead="",
                      lastAction=None, reviewed=[], updateSent=None, updateDeferred=None, waitRefused=None,
-                     waitBudget=None, afterStopped=None, reruns=None, latchHeld=None, dueLate=None, dueAt=self.now)
+                     waitBudget=None, afterStopped=None, reruns=None, latchHeld=None, dueLate=None, dueAt=self.now,
+                     stepTransient=None)
             self.history(e, "queued", by=e["requester"], via=e["requesterFrom"], after=",".join(e["after"]))
         else:
             self.history(e, "updated", by=e["requester"], after=",".join(e["after"]))
@@ -10340,6 +10368,9 @@ class LandQueue:
                     if self.now - float(e.get("updated") or 0) > LAND_KEEP:
                         (self.entries_dir() / file_name(key)).unlink(missing_ok=True)
                         del self.entries[key]
+                    elif e["state"] == "stopped" and key not in self.jobs:
+                        with self.lock:
+                            self.rearm(e)  # judged from the next pass
                     continue
                 if key in self.jobs:
                     continue
@@ -10665,16 +10696,21 @@ class LandQueue:
             why += (f"; no current ws-sync release to run instead ({release} "
                     + ("is not current either)" if release.is_file() and not same else
                        "is this checkout)" if same else "does not exist)"))
+        if why is not None and use is None:
+            self.refresh_checkout(mh)  # what the warning names, run here rather than only said
         key = None if why is None else (re.sub(r"\d+(?:\.\d+)?|(?<=change)s\b", "N", why), os.fspath(use) if use else None)
         if key == self.stale_checkout:
             if why is not None:  # the same finding: keep the file's numbers current for `land status`, say nothing
                 write_json(path, {**(read_json(path) or {}), "reason": why, "checkedAt": self.now})
+            else:  # current from this daemon's first check: an earlier daemon's warning must not outlive it
+                path.unlink(missing_ok=True)
             return
         was = self.mh_fallback
         self.stale_checkout = key
         self.mh_fallback = (mh, use) if use is not None else None
         if why is None:
             path.unlink(missing_ok=True)
+            self.mh_changed_at = self.now  # a retry_deadline stop before it is re-armed (rearm)
             log({"event": "land-checkout-current", "mergeHold": os.fspath(mh)})
             if was is not None:
                 self.notice("land-checkout-current", "info", f"glaeda land: merge_hold.py runs from {mh} again "
@@ -10691,6 +10727,61 @@ class LandQueue:
         write_json(path, {"reason": why, "at": self.now, "mergeHold": os.fspath(mh)})
         log({"event": "land-checkout-stale", "reason": why})
         self.notice("land-checkout-stale", "warn", f"glaeda land: {why}", {"mergeHold": os.fspath(mh)})
+
+    def refresh_checkout(self, mh: Path) -> None:
+        """Run `tools/ws-deploy --local` beside MH, the step check_behind's warning names (LAND_MH_REFRESH_EVERY's
+        comment): off the tick, bounded, at most every LAND_MH_REFRESH_EVERY; the checkout is judged again on the next
+        tick. Its outcome goes to the log and the stale-checkout record (`land status`)."""
+        tool = mh.parent / "ws-deploy"
+        if self.mh_refreshing or self.now - self.mh_refresh_at < LAND_MH_REFRESH_EVERY \
+                or self.config().get("mergeHoldRefresh") is False or not tool.is_file():
+            return
+        self.mh_refresh_at, self.mh_refreshing = self.now, True
+        argv, started = [os.fspath(tool), "--local"], self.now
+
+        def go() -> None:
+            try:
+                got = self.call(argv, LAND_MH_REFRESH_DEADLINE)
+            finally:
+                self.mh_refreshing = False
+            said = land_tail(f"{got.stderr or ''}\n{got.stdout or ''}".strip(), 200)
+            log({"event": "land-checkout-refresh", "argv": argv, "rc": got.returncode, "out": said})
+            path = land_dir() / LAND_STALE_CHECKOUT_FILE
+            rec = read_json(path)
+            if isinstance(rec, dict):
+                write_json(path, {**rec, "refresh": {"at": started, "rc": got.returncode, "out": said}})
+            if got.returncode == 0:
+                self.mh_changed_at = started
+            self.behind_at = float("-inf")  # judged again on the next tick
+
+        if self.inline:
+            go()
+        else:
+            threading.Thread(target=go, name="land-checkout-refresh", daemon=True).start()
+
+    def rearm(self, e: dict) -> bool:
+        """Queue a stopped E again when its stop can clear by itself (LAND_REARM_CODES' comment). Under the lock."""
+        st = e.get("stop") or {}
+        code = str(st.get("code") or "")
+        if not LAND_REARM_CODES.match(code):
+            return False
+        at = float(st.get("at") or 0)
+        cleared = code == "retry_deadline" and self.mh_changed_at > at
+        if not cleared and self.now - at < LAND_REARM_AFTER:
+            return False
+        day = land_day(self.now)
+        r = e.get("rearms") or {}
+        n = int(r.get("n") or 0) if r.get("day") == day else 0
+        if n >= LAND_REARM_CAP:
+            return False
+        e["rearms"] = {"day": day, "n": n + 1}
+        e.update(state="queued", stop=None, wait=None, wakeAt=None, action=None, streak=None, updateSent=None,
+                 lastStop=st, dueAt=self.now, gen=int(e.get("gen") or 0) + 1)
+        why = "merge_hold's checkout was refreshed" if cleared else f"{self.now - at:.0f} s after the stop"
+        self.history(e, "rearmed", code=code, why=why, n=n + 1)
+        log({"event": "land-rearmed", "key": e["key"], "code": code, "why": why, "n": n + 1})
+        self.save(e)
+        return True
 
     def reap(self) -> None:
         for key, fut in list(self.jobs.items()):
@@ -11705,6 +11796,7 @@ class LandQueue:
             e["preStepHead"] = head if got.returncode == 0 else ""
             if got.returncode == 0:
                 e.pop("stepFail", None)
+                e.pop("stepTransient", None)
             if got.returncode == 0 and kind == "update_branch":
                 self.nudge(e["key"])
                 self.wait(e, {"kind": "head_change", "before": head, "since": self.now}, LAND_HEAD_TIMEOUT)
@@ -11753,6 +11845,7 @@ class LandQueue:
             self.nudge(e["key"])
             if got.returncode == 0:
                 e.pop("stepFail", None)
+                e.pop("stepTransient", None)
                 self.wait(e, {"kind": "retry", "why": "filled the mirror merge_hold could not read"}, NUDGE_MIN * 3)
             else:
                 named = self.step_refused(e, "fetch", head, got)
@@ -11830,6 +11923,21 @@ class LandQueue:
                           "next"}, float(NUDGE_MIN))
             return None
         cls = land_step_class(out)
+        if got.returncode == 124 or LAND_STEP_TRANSIENT.search(out):
+            # A timeout or a 5xx: never counted toward LAND_STEP_STOP (LAND_STEP_TRANSIENT's comment)
+            last = e.get("stepTransient") or {}
+            n = int(last.get("count") or 0) + 1 if last.get("head") == head else 1
+            e["stepTransient"] = {"head": head, "kind": kind, "count": n, "at": self.now}
+            self.history(e, "step_refused", kind=kind, head=head[:12], why=cls, n=0, transient=n)
+            if n >= LAND_RETRY_STREAK_STOP:
+                self.stop(e, f"{kind}_transient", f"the {kind} merge_hold named timed out or met a GitHub 5xx {n} "
+                          f"times in a row at {head[:12]}: {land_trim(land_tail(out), 300)}",
+                          f"none: it is re-armed by itself (at most {LAND_REARM_CAP} times a day)")
+                return None
+            after = min(LAND_STEP_BACKOFF_MAX, LAND_STEP_BACKOFF * (2 ** (n - 1)))
+            self.wait(e, {"kind": "retry", "why": f"{kind} at {head[:12]} transient ({cls}): backoff {after:.0f} s"},
+                      after)
+            return None
         # An update-branch's refusals count per head whatever their words: the judgment's streak no longer bounds them
         # (LAND_UPDATE_ONCE), so a refusal whose text varies must not restart the count.
         sig = f"{kind}|{head}" if kind == "update_branch" else f"{kind}|{head}|{cls}"
@@ -12277,7 +12385,29 @@ def land_status_doc(target: str | None) -> dict:
     refused = read_json(land_dir() / LAND_REFUSED_FILE)
     stale = read_json(land_dir() / LAND_STALE_CHECKOUT_FILE)
     return {"ok": True, "entries": entries, "steps": land_counts(), "refused": refused if isinstance(refused, dict)
-            else None, "stale": stale if isinstance(stale, dict) else None}
+            else None, "stale": stale if land_stale_fresh(stale, time.time()) else None,
+            "stoppedByCause": land_stopped_by_cause(entries)}
+
+
+def land_stale_fresh(stale: Any, now: float) -> bool:
+    """Whether check_behind's record STALE was written or confirmed within 2 x LAND_MH_BEHIND_EVERY: an older one is a
+    verdict no running check holds any more. gcp-agent-lane-6, 2026-11-19: `land status` printed a 17:40Z "last fetched
+    6.5 h ago" warning 15 h later, its checkout at origin/main, fetched minutes before, ws-deploy a no-op."""
+    if not isinstance(stale, dict) or not stale.get("reason"):
+        return False
+    seen = [float(v) for v in (stale.get("at"), stale.get("checkedAt"))
+            if isinstance(v, (int, float)) and not isinstance(v, bool)]
+    return bool(seen) and now - max(seen) <= 2 * LAND_MH_BEHIND_EVERY
+
+
+def land_stopped_by_cause(entries: list[dict]) -> dict[str, int]:
+    """Stopped entries counted by their stop code, the detector's read of `land status` (stoppedByCause)."""
+    out: dict[str, int] = {}
+    for e in entries:
+        if e.get("state") == "stopped":
+            code = str((e.get("stop") or {}).get("code") or "unknown")
+            out[code] = out.get(code, 0) + 1
+    return dict(sorted(out.items(), key=lambda kv: (-kv[1], kv[0])))
 
 
 def cmd_land_status(target: str | None, as_json: bool) -> int:
@@ -12297,6 +12427,7 @@ def cmd_land_status(target: str | None, as_json: bool) -> int:
         doc["pendingForward"] = len(list(d.glob("*.json"))) if d.is_dir() else 0
         doc["forward"] = read_json(land_dir() / LAND_FORWARD_FILE)
     entries, counts, refused = doc["entries"], doc.get("steps") or {}, doc.get("refused")
+    doc["stoppedByCause"] = land_stopped_by_cause(entries)
     if as_json:
         print(json.dumps(doc, sort_keys=True))
         return EXIT_OK if entries or not target else EXIT_FAIL
@@ -12310,7 +12441,10 @@ def cmd_land_status(target: str | None, as_json: bool) -> int:
         print(f"glaeda land: merge_hold.py runs from the ws-sync release {stale['fallback']}, not "
               f"{stale.get('mergeHold')}: {stale['reason']}")
     elif isinstance(stale, dict) and stale.get("reason"):
-        print(f"glaeda land: WARNING: {stale['reason']}")
+        ran = stale.get("refresh") if isinstance(stale.get("refresh"), dict) else {}
+        print(f"glaeda land: WARNING: {stale['reason']}" + (
+            f" (the land ran ws-deploy --local itself at {utc_clock(float(ran.get('at') or 0))}: exit {ran.get('rc')}"
+            f"{': ' + ran['out'] if ran.get('rc') and ran.get('out') else ''})" if ran else ""))
     if refused:
         print(f"glaeda land: REFUSED to start since {utc_clock(float(refused.get('at') or 0))}: "
               f"{refused.get('reason')}\nnext: {refused.get('next')}")
@@ -12337,6 +12471,7 @@ def cmd_land_status(target: str | None, as_json: bool) -> int:
     def fmt(d: dict) -> str:
         return ", ".join(f"{k} {v}" for k, v in sorted(d.items(), key=lambda x: -x[1])) or "none"
     print(f"steps taken today: {fmt(today)}; last 7 days: {fmt(week)}")
+    print(f"stopped by cause: {fmt(doc['stoppedByCause'])}")
     if target and not entries:
         return EXIT_FAIL
     return EXIT_OK

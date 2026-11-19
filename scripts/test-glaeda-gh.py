@@ -20264,6 +20264,84 @@ class LandTest(Base):
         self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "retry_deadline"))
         self.assertIn("for a judgment merge_hold could not make, still unreadable", e["stop"]["reason"])
 
+    def stop_retry_deadline(self) -> dict:
+        """E stopped retry_deadline: unreadable at every judgment for the 2 h budget (cmux#46208, #46210)."""
+        self.t = (NOW // 86400 + 1) * 86400 + 3600  # 01:00Z: the re-arms of a test stay inside one UTC day
+        self.pr(LA)
+        self.land()
+        self.w.answers += [refusal("unreadable", LA, {"kind": "retry", "after_s": 60})] * 5
+        e = self.tick()
+        for _ in range(4):
+            e = self.tick(gg.LAND_RETRY_MAX + 1)
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "retry_deadline"))
+        return e
+
+    def test_a_retry_deadline_stop_is_rearmed_probed_once_and_capped(self):
+        # gcp-agent-lane-6, 2026-11-19: cmux#46208 and #46210 stayed stopped retry_deadline until a requeue by hand.
+        e = self.stop_retry_deadline()
+        judged = len(self.w.explains())
+        e = self.tick(gg.LAND_REARM_AFTER - 10)
+        self.assertEqual(e["state"], "stopped")  # not before the hour
+        for n in range(1, gg.LAND_REARM_CAP + 1):
+            self.w.answers.append(refusal("unreadable", LA, {"kind": "retry", "after_s": 60}))
+            e = self.tick(gg.LAND_REARM_AFTER)
+            self.assertEqual((e["state"], e["rearms"]["n"]), ("queued", n))
+            e = self.tick()
+            # still unreadable at the same head: one judgment, and stopped again at once (its budget is spent)
+            self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "retry_deadline"))
+            self.assertEqual(len(self.w.explains()), judged + n)
+        e = self.tick(gg.LAND_REARM_AFTER * 3)
+        self.assertEqual((e["state"], len(self.w.explains())), ("stopped", judged + gg.LAND_REARM_CAP))  # the cap
+        self.assertIn("rearmed", [h["event"] for h in e["history"]])
+
+    def test_a_rearmed_entry_that_reads_clean_merges(self):
+        self.stop_retry_deadline()
+        self.w.answers.append(ok_answer(LA))
+        self.tick(gg.LAND_REARM_AFTER)
+        self.tick()
+        self.assert_merged_at(LA)
+
+    def test_a_retry_deadline_stop_is_rearmed_once_the_checkout_turns_current(self):
+        self.stale_why = "merge_hold.py's checkout /ws is not current: last fetched 6.5 h ago (over 6)"
+        self.stop_retry_deadline()
+        self.stale_why = None
+        self.w.answers.append(ok_answer(LA))
+        self.tick(gg.LAND_MH_BEHIND_EVERY + 1)  # well inside the hour: the cause cleared
+        self.tick()
+        self.assert_merged_at(LA)
+
+    def test_other_stops_are_never_rearmed(self):
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(refusal("block", LA, {"kind": "stop", "stop": "block"}))
+        self.tick()
+        e = self.tick(gg.LAND_REARM_AFTER * 2)
+        self.assertEqual((e["state"], e["stop"]["code"], e.get("rearms")), ("stopped", "block", None))
+
+    def test_a_transient_step_refusal_never_counts_toward_the_step_stop(self):
+        # cmux#46145, 2026-11-19: broker refusals and one "timed out after 120s" made the "6 times in a row" stop.
+        self.t = (NOW // 86400 + 1) * 86400 + 3600
+        self.pr(LA)
+        self.land()
+        self.w.gh_rc["update"] = 1
+        self.w.gh_err["update"] = "gh: lane-gh call update_branch o/r: GitHub answered HTTP 502: Bad Gateway"
+        answer = lambda: refusal("stale_green", LA, {"kind": "update_branch", "expected_head_sha": LA})  # noqa: E731
+        e = self.run_hour(answer)
+        updates = lambda: [c for c in self.w.gh_calls("api") if "update-branch" in " ".join(c)]  # noqa: E731
+        self.assertGreaterEqual(len(updates()), gg.LAND_STEP_STOP)
+        self.assertNotEqual(e["state"], "stopped", e.get("stop"))
+        e = self.run_hour(answer, seconds=4 * 3600)
+        self.assertEqual((e["state"], e["stop"]["code"], len(updates())),
+                         ("stopped", "update_branch_transient", gg.LAND_RETRY_STREAK_STOP))
+        # the cause clears: re-armed after the hour, the update goes through
+        self.w.gh_rc["update"] = 0
+        self.w.answers[:] = [answer()]
+        e = self.tick(gg.LAND_REARM_AFTER)
+        self.assertEqual(e["state"], "queued")
+        e = self.tick()
+        self.assertEqual((e["state"], len(updates())), ("waiting", gg.LAND_RETRY_STREAK_STOP + 1), e.get("stop"))
+        self.assertNotIn("stepTransient", e)
+
     def test_a_rerun_is_sent_at_most_three_times_per_run_at_a_head(self):
         # each rerun's checks finish (cancelled again) within minutes, so the 2 h deadline alone allowed dozens
         self.pr(LA)
@@ -21983,6 +22061,72 @@ class LandTest(Base):
         self.q.now += gg.LAND_MH_BEHIND_EVERY + 1
         self.q.refuse()
         self.assertIn(f"({rel} does not exist)", self.w.notices[-1][2])
+
+    def test_a_stale_checkout_is_refreshed_by_the_land_itself(self):
+        """gcp-agent-lane-6, 2026-11-19: the warning named `tools/ws-deploy --local` and nothing ran it. The land runs
+        it (bounded, off the tick), at most every LAND_MH_REFRESH_EVERY, and judges the checkout again after it."""
+        tool = Path(self.w.mh).parent / "ws-deploy"
+        tool.write_text("#!/bin/sh\nexit 0\n")
+        ran: list[list[str]] = []
+
+        def run(argv, timeout, env):
+            if argv[0] == os.fspath(tool):
+                ran.append(list(argv))
+                self.assertEqual(timeout, gg.LAND_MH_REFRESH_DEADLINE)
+                self.stale_why = None  # the deploy fetched and moved the checkout
+                return subprocess.CompletedProcess(argv, 0, "no-op 12ee4b0\n", "")
+            return self.w.run(argv, timeout, env)
+        self.q.run = run
+        self.stale_why = "merge_hold.py's checkout /ws is not current: last fetched 6.5 h ago (over 6)"
+        self.tick()
+        self.assertEqual(ran, [[os.fspath(tool), "--local"]])
+        self.tick()  # judged again at once after the refresh: current, the warning gone
+        self.assertFalse((gg.land_dir() / gg.LAND_STALE_CHECKOUT_FILE).exists())
+        self.assertGreater(self.q.mh_changed_at, float("-inf"))  # a retry_deadline stop before it is re-armed
+        self.stale_why = "merge_hold.py's checkout /ws is not current: last fetched 6.5 h ago (over 6)"
+        self.tick(gg.LAND_MH_BEHIND_EVERY + 1)
+        self.assertEqual(len(ran), 1)  # at most every LAND_MH_REFRESH_EVERY
+        self.tick(gg.LAND_MH_REFRESH_EVERY)
+        self.assertEqual(len(ran), 2)
+        self.w.config["mergeHoldRefresh"] = False
+        self.stale_why = "merge_hold.py's checkout /ws is not current: last fetched 6.5 h ago (over 6)"
+        self.tick(gg.LAND_MH_REFRESH_EVERY + gg.LAND_MH_BEHIND_EVERY)
+        self.assertEqual(len(ran), 2)
+
+    def test_an_old_stale_checkout_record_is_neither_shown_nor_kept(self):
+        """gcp-agent-lane-6, 2026-11-19: `land status` printed a 17:40Z "is stale: last fetched 6.5 h ago" 15 h later;
+        the checkout was current, and nothing removed the record a previous daemon wrote."""
+        path = gg.land_dir() / gg.LAND_STALE_CHECKOUT_FILE
+        path.parent.mkdir(parents=True, exist_ok=True)
+        old = {"reason": "merge_hold.py's checkout /ws is stale: last fetched 6.5 h ago (over 6)",
+               "at": time.time() - 3 * gg.LAND_MH_BEHIND_EVERY, "mergeHold": "/ws/tools/merge_hold.py"}
+        gg.write_json(path, old)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            gg.cmd_land_status(None, False)
+        self.assertNotIn("WARNING", out.getvalue())
+        gg.write_json(path, {**old, "at": time.time()})
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            gg.cmd_land_status(None, False)
+        self.assertIn("WARNING: merge_hold.py's checkout /ws is stale", out.getvalue())
+        self.stale_why = None
+        self.q = self.queue()  # a new daemon, its checkout current from its first check
+        self.tick()
+        self.assertFalse(path.exists())
+
+    def test_status_counts_stopped_entries_by_cause(self):
+        self.stop_retry_deadline()
+        self.pr(LA, key="pr:o/r#2")
+        self.land("o/r#2")
+        rc, doc = refusal("block", LA, {"kind": "stop", "stop": "block"})
+        self.w.answers.append((rc, {**doc, "number": "2", "action": {**doc["action"], "number": 2}}))
+        self.tick()
+        self.assertEqual(gg.land_status_doc(None)["stoppedByCause"], {"block": 1, "retry_deadline": 1})
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            gg.cmd_land_status(None, False)
+        self.assertIn("stopped by cause: block 1, retry_deadline 1", out.getvalue())
 
     def test_status_names_why_explain_failed(self):
         e = {"key": self.KEY, "state": "waiting", "explain": {"code": "explain_failed",
