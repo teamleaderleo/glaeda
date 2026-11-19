@@ -23590,6 +23590,49 @@ class AppPoolTest(Base):
         self.daemon.request("GET", "/repos/manaflow-ai/cmux/pulls/1")
         self.assertEqual(len(self.app_calls), 2, "only that route left the App")
 
+    def test_a_rest_refusal_for_one_repository_does_not_disable_the_other_repository(self) -> None:
+        self.app_answers.append((404, {"x-ratelimit-remaining": "14000", "x-ratelimit-reset": str(int(NOW + 900))},
+                                 b'{"message": "Not Found"}'))
+        self.daemon.request("GET", "/repos/manaflow-ai/not-installed/pulls/1")
+        self.daemon.request("GET", "/repos/manaflow-ai/cmux/pulls/1")
+        self.assertEqual([call[1] for call in self.app_calls], [
+            gg.API + "/repos/manaflow-ai/not-installed/pulls/1",
+            gg.API + "/repos/manaflow-ai/cmux/pulls/1",
+        ])
+        self.assertEqual(len(self.gh.calls), 1, "only the refused repository falls back to the login")
+
+    def test_a_graphql_refusal_for_one_repository_does_not_disable_the_other_repository(self) -> None:
+        self.app_answers.append((403, {"x-ratelimit-remaining": "14000", "x-ratelimit-reset": str(int(NOW + 900))},
+                                 b'{"message": "Resource not accessible by integration"}'))
+        query = lambda repo: {"query": "query($o0:String!,$r0:String!,$n0:Int!){repository(owner:$o0,name:$r0){pullRequest(number:$n0){number}}}",
+                              "variables": {"o0": "manaflow-ai", "r0": repo, "n0": 1}}
+        self.daemon.request("POST", "/graphql", query("not-installed"))
+        self.daemon.request("POST", "/graphql", query("cmux"))
+        self.assertEqual(len(self.app_calls), 2, "the second repository still uses the App")
+        self.assertEqual(len(self.gh.calls), 1, "only the refused repository falls back to the login")
+
+    def test_a_run_graphql_refusal_is_scoped_to_its_repository(self) -> None:
+        self.app_answers.append((403, {"x-ratelimit-remaining": "14000", "x-ratelimit-reset": str(int(NOW + 900))},
+                                 b'{"message": "Resource not accessible by integration"}'))
+        query = lambda repo: {"query": "query($u0:URI!){resource(url:$u0){databaseId}}",
+                              "variables": {"u0": f"https://github.com/manaflow-ai/{repo}/actions/runs/1"}}
+        self.daemon.request("POST", "/graphql", query("not-installed"))
+        self.daemon.request("POST", "/graphql", query("cmux"))
+        self.assertEqual(len(self.app_calls), 2)
+        self.assertEqual(len(self.gh.calls), 1)
+
+    def test_scheduler_keeps_an_app_read_eligible_when_login_buckets_are_below_reserve(self) -> None:
+        reserve = gg.FLOORS["rest"][1]
+        self.daemon.budget = {
+            "rest": {"limit": 5000, "remaining": reserve - 1, "reset": NOW + 900},
+            "graphql": {"limit": 5000, "remaining": gg.FLOORS["graphql"][1] - 1, "reset": NOW + 900},
+        }
+        entry = {"key": "pr:manaflow-ai/cmux#1", "cache": None, "touched": NOW}
+        self.daemon.last_cycle["pr"] = NOW - gg.CYCLE
+        due = self.daemon.due("pr", [entry])
+        self.assertEqual([e["key"] for e in due], [entry["key"]])
+        self.assertEqual(self.minted, ["manaflow-ai"], "eligibility checks the App before spending login quota")
+
     def test_under_the_floor_the_app_is_left_to_its_other_users(self) -> None:
         self.app_answers.append((200, {"x-ratelimit-limit": "15000", "x-ratelimit-remaining": str(gg.APP_POOL_FLOOR - 1),
                                        "x-ratelimit-reset": str(int(NOW + 600))}, b"{}"))

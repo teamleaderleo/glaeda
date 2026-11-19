@@ -2330,7 +2330,7 @@ APP_POOL_ROUTE_REST = 3600.0  # a route the App answered 403 or 404 stays on the
 APP_POOL_FLOOR = 500  # an App answer with fewer left: the pool's other users (base_red_watch, cmux-ci) keep the rest
 APP_POOL_REPO = re.compile(r"/repos/([A-Za-z0-9][A-Za-z0-9-]{0,38})/[A-Za-z0-9._-]+(?:/|\?|$)")
 APP_POOL_GRAPHQL_OWNER = re.compile(r"^o\d+$")
-APP_POOL_GRAPHQL_URL = re.compile(r"^https://github\.com/([A-Za-z0-9][A-Za-z0-9-]{0,38})/[A-Za-z0-9._-]+(?:/|$)", re.I)
+APP_POOL_GRAPHQL_URL = re.compile(r"^https://github\.com/([A-Za-z0-9][A-Za-z0-9-]{0,38})/([A-Za-z0-9._-]+)(?:/|$)", re.I)
 
 
 def app_pool_tool() -> Path | None:
@@ -2354,7 +2354,7 @@ class AppPool:
         self.ready_fn = ready or self.held_here
         self.owners_at: tuple[frozenset[str], float] = (frozenset(), float("-inf"))  # (owners, read again after)
         self.tokens: dict[str, tuple[str, float]] = {}  # owner (lowercase) -> (token, use until)
-        self.unreadable: dict[str, float] = {}  # route template -> on the login until then (answered)
+        self.unreadable: dict[str, float] = {}  # installation/repository/resource scope -> on the login until then
         self.rest_until: dict[str, float] = {}  # owner (lowercase) -> not asked again before this
         self.why = ""  # the last reason the pool was passed over, for daemon.json (never a token)
         self.served = self.fell_back = 0
@@ -2438,11 +2438,26 @@ class AppPool:
         self.tokens[owner] = (token, now + APP_POOL_TTL)
         return token
 
-    def covers(self, route: str) -> bool:
-        """Whether ROUTE is one the App has not refused lately (a permission it lacks, a repo it is not on)."""
-        return self.unreadable.get(route, 0.0) <= self.clock()
+    @staticmethod
+    def scope(owner: str, method: str, path: str, body: dict | None = None) -> str:
+        """Key a refusal to the installation and resource that produced it, never the whole owner pool."""
+        if path == "/graphql":
+            repos = set()
+            for key, value in (body or {}).get("variables", {}).items():
+                if re.fullmatch(r"r\d+", str(key)) and isinstance(value, str):
+                    repos.add(str(value).lower())
+                elif re.fullmatch(r"u\d+", str(key)) and isinstance(value, str):
+                    match = APP_POOL_GRAPHQL_URL.match(value)
+                    if match:
+                        repos.add(match.group(2).lower())
+            return "graphql:" + owner + (":" + ",".join(repos) if repos else "")
+        return f"{method} {path.split('?', 1)[0]}"
 
-    def answered(self, owner: str, route: str, status: int, headers: dict, message: str = "") -> bool:
+    def covers(self, scope: str) -> bool:
+        """Whether SCOPE is one the App has not refused lately (a permission or resource it lacks)."""
+        return self.unreadable.get(scope, 0.0) <= self.clock()
+
+    def answered(self, owner: str, scope: str, status: int, headers: dict, message: str = "") -> bool:
         """Note the App's answer; False when the read must go again on the login. A rate limit or a dead token rests
         the pool; a 403 or 404 of one route (a permission or repository the App lacks: branch protection needs
         administration, which ci-watch does not hold) keeps that route on the login for APP_POOL_ROUTE_REST."""
@@ -2463,7 +2478,7 @@ class AppPool:
             self.fell_back += 1
             return False
         if status in {403, 404} or (status == 200 and bool(re.search(r"FORBIDDEN|NOT_FOUND", message))):
-            self.unreadable[route] = now + APP_POOL_ROUTE_REST
+            self.unreadable[scope] = now + APP_POOL_ROUTE_REST
             self.fell_back += 1
             return False
         if remaining is not None and remaining < APP_POOL_FLOOR and reset is not None:
@@ -4873,7 +4888,8 @@ class Daemon:
         owner = (pool.owner_of(method, path, body) if pool is not None and not free and not content
                  and not self.writing else None)
         route = route_of(method, path)
-        app_token = pool.token(owner) if owner and pool.covers(route) else None
+        scope = pool.scope(owner, method, path, body) if owner else ""
+        app_token = pool.token(owner) if owner and pool.covers(scope) else None
         if app_token:
             self.last_request_source = "app"
             headers = {"Authorization": f"Bearer {app_token}", "Accept": "application/vnd.github+json",
@@ -4898,13 +4914,15 @@ class Daemon:
                 message = " ".join(filter(None, (str(doc.get("message") or ""), error_text)))
             else:
                 message = ""
-            if pool.answered(owner, route, status, h, message):
+            if pool.answered(owner, scope, status, h, message):
                 self.note_spend("rest", route, 0)
                 self.sent.append((self.now, "app"))
                 return status, h, doc
             log({"event": "app-pool-refused", "role": pool.role, "owner": owner, "status": status})
             # refused: the same read goes on the login at once, as it would have without the App
             self.last_request_source = "login"
+            if self.mode(bucket) == "stop":
+                raise WatchError(f"{pool.role} App refused {scope}; login {bucket} is under its reserve")
         if self.token is None:
             self.token = self.token_source()
         headers = {"Authorization": f"Bearer {self.token}", "Accept": "application/vnd.github+json",
@@ -5963,7 +5981,11 @@ class Daemon:
         mine = [e for e in entries if e["key"].startswith(kind + ":")]
         path = self.route(kind)
         mode = self.mode(path)
-        if mode == "stop" or (path == "rest" and kind in BALANCED + FALLBACK and self.rest_capped()):
+        app_mine = self.app_entries_eligible(kind, mine, path)
+        if app_mine:
+            mine = app_mine
+            mode = "normal"
+        if (mode == "stop" or (path == "rest" and kind in BALANCED + FALLBACK and self.rest_capped())) and not app_mine:
             # Spent, or the daemon's REST share is and GraphQL is stopped too: a kind with nowhere to
             # go waits rather than spend the REST the sessions are left with. Except a failed attempt
             # whose job list is not read yet, the one read the share does not hold back, whichever
@@ -6325,7 +6347,9 @@ class Daemon:
         for i, e in enumerate(over_rest):
             # A read is admitted only when its worst case fits in the share, so the share holds at a
             # request, not at a batch; the rest go first next tick, over whichever bucket is richer.
-            if self.mode("rest") == "stop" or not self.rest_room(REST_READ_MAX[e["key"].split(":", 1)[0]]):
+            kind = e["key"].split(":", 1)[0]
+            app_ok = bool(self.app_entries_eligible(kind, [e], "rest"))
+            if (self.mode("rest") == "stop" or not self.rest_room(REST_READ_MAX[kind])) and not app_ok:
                 self.to_graphql(over_rest[i:], spilled)
                 break
             sent = len(self.sent)
@@ -6914,6 +6938,42 @@ class Daemon:
         return {"pr": self.fetch_prs, "comment": self.fetch_comments, "run": self.fetch_runs_graphql,
                 "head": self.fetch_heads}
 
+    def app_request_for(self, kind: str, entries: list[dict], bucket: str) -> tuple[str, str, dict] | None:
+        """Return the representative App request when one installation can answer the whole read."""
+        pool = self.app_pool
+        if pool is None or not entries:
+            return None
+        if bucket == "rest":
+            _, owner, repo, value = split_key(entries[0]["key"])
+            paths = {"pr": f"/repos/{owner}/{repo}/pulls/{value}",
+                     "run": f"/repos/{owner}/{repo}/actions/runs/{value}",
+                     "comment": f"/repos/{owner}/{repo}/issues/{value}",
+                     "head": f"/repos/{owner}/{repo}/commits/{value}/check-runs"}
+            path = paths.get(kind)
+            return ("GET", path, {}) if path else None
+        if kind == "run":
+            query, variables = run_query([e["key"] for e in entries])
+        elif kind in ("pr", "comment"):
+            query, variables = pr_query([e["key"] for e in entries], kind)
+        else:
+            return None
+        return "POST", "/graphql", {"query": query, "variables": variables}
+
+    def app_entries_eligible(self, kind: str, entries: list[dict], bucket: str) -> list[dict]:
+        """Entries that can be served by the held App without touching the login quota."""
+        pool = self.app_pool
+        request = self.app_request_for(kind, entries, bucket)
+        if pool is None or request is None:
+            return []
+        method, path, body = request
+        owner = pool.owner_of(method, path, body)
+        if owner is None:
+            return []
+        scope = pool.scope(owner, method, path, body)
+        if pool.token(owner) is None or not pool.covers(scope):
+            return []
+        return entries
+
     @property
     def rest_fetch(self) -> dict[str, Callable[[dict], None]]:
         return {"pr": self.fetch_pr_rest, "run": self.fetch_run, "comment": self.fetch_comment_rest,
@@ -6943,7 +7003,8 @@ class Daemon:
         to_rest: list[dict] = []
         while queue:
             chunk = queue.pop(0)
-            if self.mode("graphql") == "stop" or self.gql_down():
+            if ((self.mode("graphql") == "stop" and not self.app_entries_eligible(kind, chunk, "graphql"))
+                    or self.gql_down()):
                 return to_rest + chunk + [e for c in queue for e in c]
             if not self.gql_room():
                 # Over the per-minute ceiling: the rest wait, first next tick. Not REST's to read: GraphQL is not
