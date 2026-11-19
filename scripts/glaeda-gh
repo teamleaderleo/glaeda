@@ -9623,8 +9623,9 @@ LAND_QUOTA_REFUSAL = re.compile(r"quota: not judged|\[quota: not judged")
 # that code's reason only: it names the read that failed, never a red job's log. Such a judgment is the login's state,
 # not the PR's, so it parks until the reset it names (park_quota) as a "quota" answer does. The broker client
 # gcp-agent-lane-1, 2026-11-19 22:38-22:50Z: 30 of 63 judgments were "unreadable" with "gh-quota: refused: GitHub's
-# GraphQL rate limit is spent for login until 23:38Z"; each took the 120 s retry (LAND_RETRY_DEFAULT) and spent about 9
-# REST (`pr view`, check-runs, runs and jobs) before its refused GraphQL read: session glaeda-land, 568 REST in 12 min.
+# GraphQL rate limit is spent for login until 23:38Z"; each took the 120 s retry (LAND_RETRY_DEFAULT) and spent about 5
+# REST (`pr view`, check-runs, runs) before its refused read. The 44 explains after an "unreadable" answer took 262 of
+# session glaeda-land's 568 REST in those 12 min, with glaeda#2234's stagger loaded (it caps only latch-held entries).
 LAND_UNREAD_QUOTA = re.compile(r"gh-quota: refused: GitHub(?:'s)? (?:REST |GraphQL )?rate limit is spent")
 # A step's own output (update-branch, rerun, merge) that GitHub refused for the login's quota, in the words the broker
 # and the gh-quota shim use, as well as merge_hold's. Read on a step's output only, never on merge_hold's reason (which
