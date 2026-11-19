@@ -19917,6 +19917,26 @@ class LandTest(Base):
             e = self.tick(gg.LAND_RETRY_MAX + 1)
         self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "retry_deadline"), e.get("waitBudget"))
 
+    def test_a_train_wait_gets_a_new_budget_with_each_holder_head(self):
+        # 2026-11-19: six hq PRs stopped retry_deadline "still train_wait" behind hq#13113, whose reservation moved to a
+        # new head mid-wait; one budget per waiting head spanned both reservations. Each holder head is its own budget.
+        self.pr(LA)
+        self.land()
+
+        def train(holder: str) -> tuple[int, dict]:
+            return refusal("train_wait", LA, {"kind": "retry", "after_s": 1800}, reason=(
+                "merge_hold: refused: a merge-train PR's rerun holds the base for a file this PR changes: o/r#13113 "
+                f"(label merge-train, head {holder}) lost the checked tree twice"))
+
+        self.w.answers += [train("5395c374953b")] * 4 + [train("f88b029f4655")] * 5
+        e = self.tick()
+        for _ in range(7):
+            e = self.tick(gg.LAND_RETRY_MAX + 1)
+        self.assertEqual(e["state"], "waiting", e.get("stop"))  # 8 judgments, ~3.5 h: under each holder head's 2 h
+        self.assertEqual(e["waitBudget"]["n"], 4, e["waitBudget"])
+        e = self.tick(gg.LAND_RETRY_MAX + 1)
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "retry_deadline"))  # one holder head, 2 h
+
     def test_a_retry_never_strikes_and_stops_at_its_deadline_naming_it(self):
         self.pr(LA)
         self.land()

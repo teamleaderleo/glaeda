@@ -8930,6 +8930,12 @@ LAND_WAIT_STUCK = 4 * 3600.0
 LAND_WAIT_DEADLINE = {"wait_comment": 7200.0, "retry": 7200.0, "rerun_failed": 7200.0}
 LAND_WAIT_WHAT = {"wait_comment": "a review verdict at the head", "retry": "a judgment merge_hold could not make",
                   "rerun_failed": "the rerun of the cancelled jobs"}
+# A train_wait (another PR's merge-train reservation holds the base for a file this one changes) is a retry merge_hold
+# itself bounds: the reservation lives TRAIN_HOLD_S (1.5 h) from the holder's head, under the retry's 2 h. So its budget
+# is the reservation's, keyed on the holder and its head: a new holder head is a new reservation and a new budget. Keyed
+# on the waiting head alone, one budget spanned every holder head: 2026-11-19 hq#12558, #13035, #12713, #12590, #12844
+# and #12653 each stopped retry_deadline ("still train_wait") behind hq#13113's two heads, each a requeue by hand.
+LAND_TRAIN_HOLDER = re.compile(r"\b([\w.-]+/[\w.-]+#\d+) \(label [\w.-]+, head ([0-9a-f]{7,40})\)")
 # A cancelled job is rerun at most this many times per (head, run) (e["reruns"], take's rerun_failed): its rerun's checks
 # can finish within minutes, so the 2 h budget alone let a job cancelled every time (a concurrency group, a timeout
 # reported as cancelled) be rerun dozens of times (review of glaeda#2174, F2). The next names it and stops
@@ -10987,6 +10993,10 @@ class LandQueue:
         identical-refusal streak and counts toward nothing; True when the wait's budget is spent and E is stopped."""
         kind = str(act.get("kind"))
         key = head  # one budget per head, whatever kind of wait (LAND_WAIT_DEADLINE's comment)
+        train = LAND_TRAIN_HOLDER.search(str(answer.get("reason") or "")) \
+            if str(answer.get("code") or "") == "train_wait" else None
+        if train:
+            key = f"{head}|train:{train.group(1)}@{train.group(2)}"  # LAND_TRAIN_HOLDER's comment
         size = max(LAND_WAIT_DEADLINE[kind], 2 * land_seconds(act.get("timeout_s"), 0.0, 0.0))
         b = e.get("waitBudget") or {}
         if b.get("key") != key:
