@@ -40,11 +40,16 @@ FAKE_SSH = """#!{python}
 import json, os, sys, time
 log = os.environ["FAKE_LOG"]
 args = sys.argv[1:]
-while args and args[0] == "-o":
+user = None
+while args and args[0] in ("-o", "-l"):
+    if args[0] == "-l":
+        user = args[1]
     args = args[2:]
 host, remote = args[0], " ".join(args[1:])
 data = sys.stdin.read()
-open(log, "a").write(json.dumps({{"tool": "ssh", "host": host, "remote": remote, "stdin": data[:40]}}) + "\\n")
+open(log, "a").write(json.dumps({{"tool": "ssh", "host": host, "user": user, "remote": remote, "stdin": data[:40]}}) + "\\n")
+if user and user in os.environ.get("FAKE_USER_DENIED", "").split(","):
+    sys.stderr.write(user + "@" + host + ": Permission denied (publickey).\\n"); sys.exit(255)
 if host in os.environ.get("FAKE_DOWN", "").split(","):
     sys.stderr.write("ssh: connect to host " + host + " port 22: Connection refused\\n"); sys.exit(255)
 if remote.startswith("head -c") and ".glaeda-source.json" in remote:
@@ -437,6 +442,56 @@ class FleetTest(unittest.TestCase):
                         "its labels are read from its own scope, so a mini without gh never re-registers it")
         staged = json.loads((self.dir / "calls.jsonl.mini-a.manifest").read_text())
         self.assertEqual(staged["hosts"]["mini-a"]["overrides"]["runner"]["dedicated"][0]["name"], "nightly-next")
+
+    def test_a_user_entry_is_staged_and_applied_as_its_user_at_its_own_repo(self) -> None:
+        """DEDICATED_USER (cmuxterm-hq#13863): a trusted entry with a user is staged into that account's home and applied
+        over ssh -l USER, at its own repository even under --org (a light pool member's org pools), with the token on
+        stdin. Nothing for it runs as the member's user. When ssh as that user fails, that entry alone fails, typed."""
+        manifest = json.loads(json.dumps(MANIFEST))
+        entry = {"name": "hq-two-mac-a", "repo": "manaflow-ai/other", "trustedRef": "refs/heads/main",
+                 "trustedRepo": "manaflow-ai/other", "labels": ["glaeda-hq-two-mac-a"], "admit": ["/usr/bin/true"],
+                 "user": "cmuxci-gui-01"}
+        plain = {"name": "nightly-next", "repo": "manaflow-ai/cmux", "labels": ["glaeda-trusted-next-nightly"],
+                 "admit": ["/usr/bin/true"]}
+        manifest["hosts"]["mini-a"]["overrides"] = {"runner": {"dedicated": [plain, entry]}}
+        self.manifest.write_text(json.dumps(manifest))
+        plan = self.fleet("--hosts", "mini-a", "--org", "manaflow-ai", "--group", "glaeda-minis", FAKE_GROUPS=GROUP)
+        row = json.loads(plan.stdout)["members"][0]
+        self.assertEqual(row["dedicatedUsers"], {"hq-two-mac-a": "cmuxci-gui-01"})
+        self.assertFalse([c for c in self.calls() if c["tool"] == "ssh" and c.get("user")], "a plan never ssh's as it")
+        self.log.unlink()
+        result = self.fleet("--apply", "--hosts", "mini-a", "--org", "manaflow-ai", "--group", "glaeda-minis",
+                            FAKE_GROUPS=GROUP)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        row = json.loads(result.stdout)["members"][0]
+        mine = [i for i in row["instances"] if i.get("dedicated") == "hq-two-mac-a"]
+        self.assertEqual(mine[0]["exit"], 0, mine)
+        self.assertEqual(mine[0]["user"], "cmuxci-gui-01")
+        as_user = [c for c in self.calls() if c["tool"] == "ssh" and c.get("user") == "cmuxci-gui-01"]
+        applies = [c for c in as_user if "--dedicated" in c["remote"]]
+        self.assertEqual(len(applies), 1)
+        self.assertIn("--dedicated hq-two-mac-a", applies[0]["remote"])
+        self.assertIn("--repo manaflow-ai/other", applies[0]["remote"])
+        self.assertNotIn("--org", applies[0]["remote"])
+        self.assertEqual(applies[0]["stdin"].strip(), TOKEN)
+        self.assertTrue(any("mkdir -p ~/glaeda-runner/scripts" in c["remote"] for c in as_user), "staged as the user")
+        self.assertFalse([c for c in as_user if "glaeda-promotion-admit ~/.local/bin" in c["remote"]
+                          or ".local/bin/glaeda-promotion-admit" in c["remote"]])
+        member_side = [c for c in self.calls() if c["tool"] == "ssh" and not c.get("user")]
+        self.assertFalse([c for c in member_side if "hq-two-mac-a" in c["remote"]], "never applied as the member user")
+        scps = [c["argv"][-1] for c in self.calls() if c["tool"] == "scp"]
+        self.assertIn("cmuxci-gui-01@mini-a:glaeda-runner/mini-fleet.json", scps)
+        # that account has no ssh access yet: its entry fails typed, the member's own entry still applies
+        self.log.unlink()
+        denied = self.fleet("--apply", "--hosts", "mini-a", "--org", "manaflow-ai", "--group", "glaeda-minis",
+                            FAKE_GROUPS=GROUP, FAKE_USER_DENIED="cmuxci-gui-01")
+        row = json.loads(denied.stdout)["members"][0]
+        mine = [i for i in row["instances"] if i.get("dedicated") == "hq-two-mac-a"][0]
+        self.assertEqual(mine["missing"], "user-ssh")
+        self.assertIn("authorized_keys", mine["state"])
+        self.assertEqual([i for i in row["instances"] if i.get("dedicated") == "nightly-next"][0]["exit"], 0)
+        self.assertFalse([c for c in self.calls() if c["tool"] == "ssh" and "--dedicated hq-two-mac-a" in c["remote"]])
+        self.assertEqual(row["action"], "failed")
 
     def test_a_repo_dedicated_only_member_needs_no_org_group_but_every_other_member_does(self) -> None:
         """REPO_DEDICATED_ONLY: a dedicatedOnly member whose only runners are repository-scoped dedicated ones

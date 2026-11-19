@@ -747,6 +747,9 @@ def hook_wrappers(ctx: Context) -> dict[str, bytes]:
         scope += f" --dedicated-admit {shlex.quote(os.fspath(ctx.hook_dir / DEDICATED_ADMIT))}"
         if dedicated.get("yieldToExclusive"):  # the hook's YIELD_TO_EXCLUSIVE
             scope += " --yield-to-exclusive"
+    # DEDICATED_USER: the account's own ledger directory (dedicated_context), for every phase and the gate
+    own_ledger = f" --capacity-dir {shlex.quote(os.fspath(capacity_dir))}" if (dedicated or {}).get("user") else ""
+    scope += own_ledger
     trusted_entry = dedicated if (dedicated or {}).get("trustedRef") else None
     if trusted_entry:
         # A trusted runner.dedicated entry (glaeda_fleet_labels DEDICATED_TRUSTED) holds a trusted pool's labels:
@@ -814,11 +817,11 @@ def hook_wrappers(ctx: Context) -> dict[str, bytes]:
     completed = (
         "#!/bin/bash\n"
         "# glaeda-cmux-runner job-completed hook (generated, receipt-owned). Never fails the job.\n"
-        f"{python} {hook} job-completed || true\n"
+        f"{python} {hook} job-completed{own_ledger} || true\n"
         "exit 0\n"
     )
     gate = (f"{python} {hook} listen --runner-dir {shlex.quote(os.fspath(ctx.runner_dir))}"
-            + ("" if ctx.capacity_units else " --no-waiters"))
+            + ("" if ctx.capacity_units else " --no-waiters") + own_ledger)
     # Listening with fewer free units (cores) than the label's costliest job only takes one to wait for units, and
     # a job waiting here holds every runner on the mini (cmuxterm-hq#661 Workstream 7). The iOS picker sends
     # isolated builds (mobile-core-package, ios-simulator-build) to glaeda-ios-sim; a session runner takes cmux-next's
@@ -1241,6 +1244,9 @@ def plan_install(ctx: Context, receipt: dict[str, Any] | None) -> list[dict[str,
         if blocked_dir:
             act["state"] = "blocked"
         actions.append(act)
+    private = plan_private(ctx)
+    if private is not None:  # DEDICATED_USER: after the download made the runner directory, before the token lands
+        actions.append(private)
 
     reg = {"kind": "register", "scope": ctx.org or ctx.repo, "name": ctx.name, "labels": ctx.labels,
            "ephemeral": False}
@@ -1490,7 +1496,8 @@ def download_and_unpack(ctx: Context, act: dict[str, Any], install_id: str) -> N
         act["state"], act["note"] = "failed", how
         return
     act["tarball"] = how
-    ctx.runner_dir.mkdir(parents=True, exist_ok=True, mode=0o755)  # a rerun after a failed unpack
+    # a rerun after a failed unpack; a user entry's is 0700 from the start (DEDICATED_USER)
+    ctx.runner_dir.mkdir(parents=True, exist_ok=True, mode=PRIVATE_MODE if private_paths(ctx) else 0o755)
     # The marker lands first, so a failed unpack still leaves a directory this command owns.
     (ctx.runner_dir / MARKER).write_text(install_id + "\n")
     tar = which("tar", ("/usr/bin/tar",)) or "tar"
@@ -1859,6 +1866,8 @@ def apply_install(ctx: Context, actions: list[dict[str, Any]], receipt_doc: dict
             if act["state"] != "failed":
                 receipt_doc["runnerVersion"] = act["version"]
                 receipt_doc["runnerSha256"] = act["sha256"]
+        elif kind == "private" and state == "create":
+            apply_private(ctx, act)
         elif kind == "register" and state == "create":
             register(ctx, act)
             if act["state"] != "failed":
@@ -3036,7 +3045,7 @@ def main(argv: list[str] | None = None) -> int:
         except (OSError, ValueError) as error:
             print(f"glaeda-cmux-runner: cannot read manifest: {type(error).__name__}", file=sys.stderr)
             return 2
-        why = dedicated_context(ctx, args, manifest)
+        why = dedicated_context(ctx, args, manifest) or dedicated_user_refusal(ctx, manifest, args.member)
         if why:
             print(f"glaeda-cmux-runner: {why}", file=sys.stderr)
             return 2
@@ -3147,7 +3156,9 @@ def dedicated_only_refusal(ctx: Any, args: argparse.Namespace) -> str | None:
         marker.unlink(missing_ok=True)
         return None
     if dedicated_of(ctx) is not None:
-        if not getattr(ctx, "dedicated_only", False):
+        # a user entry (DEDICATED_USER) lives in its own account: this Mac's pool instances and marker are the member
+        # user's, in that user's home
+        if not getattr(ctx, "dedicated_only", False) or dedicated_of(ctx).get("user"):
             return None
         left = pool_installs(ctx.home)
         if left:
@@ -3221,6 +3232,11 @@ def dedicated_context(ctx: Context, args: argparse.Namespace, manifest: Any) -> 
     ctx.org, ctx.repo, ctx.group = entry["org"], entry["repo"], entry["group"]
     ctx.labels, ctx.labels_requested = list(entry["labels"]), True
     ctx.capacity_units = 0  # never in the mini's capacity ledger: its jobs are the builder's, admitted by its hook
+    if entry.get("user"):
+        # DEDICATED_USER: its hook keeps the ledger files it writes (a nightly-style disk waiter, the disk-low turn)
+        # under this account's own 0700 state, never in the member user's shared capacity directory, which it cannot
+        # write and whose waiters must not hold that user's PR runners for a probe
+        ctx.capacity_dir = ctx.home / ".local/state/glaeda/cmux-runner" / USER_CAPACITY_DIR
     if not args.min_free_gib:
         # the entry's own floor (its builder's), else the member's disk.min_free_gib
         summary, _ = fleet_labels().member_labels(manifest, args.member, lambda app: True)
@@ -3232,6 +3248,86 @@ def dedicated_of(ctx: Any) -> dict[str, Any] | None:
     """ctx's runner.dedicated entry (--dedicated), or None for a pool instance."""
     entry = getattr(ctx, "dedicated", None)
     return entry if isinstance(entry, dict) else None
+
+
+# DEDICATED_USER (glaeda_fleet_labels): a runner.dedicated entry with a user runs as that macOS account, never the
+# member's own user. glaeda-cmux-runner-fleet applies it over ssh as that user. Run as anyone else, --dedicated refuses
+# it, so a run as the member's user never installs it in that user's home; an entry without a user is the member user's
+# and refuses another account. The account's home and the runner directory are made 0700 (PRIVATE), so no other user
+# on the Mac (the PR runners' among them) can read its RUNNER_TEMP, _work or session state.
+USER_CAPACITY_DIR = "capacity"
+PRIVATE_MODE = 0o700
+
+
+def current_user() -> str | None:
+    """This process's macOS short name, or None when it cannot be read."""
+    try:
+        name = pwd.getpwuid(os.getuid()).pw_name
+    except (KeyError, OSError):
+        return None
+    return name if isinstance(name, str) and name else None
+
+
+def dedicated_user_refusal(ctx: Context, manifest: Any, member: str) -> str | None:
+    """Why this account may not run ctx's runner.dedicated entry (DEDICATED_USER), or None."""
+    entry = dedicated_of(ctx) or {}
+    user, me = entry.get("user"), current_user()
+    if user:
+        if me != user:
+            return (f"runner.dedicated {entry.get('name')} runs as macOS user {user}, not {me or 'an unknown user'}: "
+                    f"glaeda-cmux-runner-fleet --apply installs it over ssh as {user}; nothing changed")
+        return None
+    host = ((manifest.get("hosts") or {}).get(member) or {}) if isinstance(manifest, dict) else {}
+    owner = (host.get("ssh_user") if isinstance(host, dict) else None) or \
+        (manifest.get("ssh_user") if isinstance(manifest, dict) else None)
+    if isinstance(owner, str) and me is not None and me != owner:
+        return (f"runner.dedicated {entry.get('name')} declares no user, so it is {owner}'s runner, not {me}'s; "
+                "nothing changed")
+    return None
+
+
+def private_paths(ctx: Context) -> list[Path]:
+    """The paths a user entry keeps at PRIVATE_MODE: the account's home and its runner directory."""
+    return [ctx.home, ctx.runner_dir] if (dedicated_of(ctx) or {}).get("user") else []
+
+
+def path_mode(path: Path) -> int | None:
+    try:
+        st = os.stat(path, follow_symlinks=False)
+    except OSError:
+        return None
+    return None if stat.S_ISLNK(st.st_mode) else st.st_mode & 0o777
+
+
+def plan_private(ctx: Context) -> dict[str, Any] | None:
+    """The PRIVATE step of a user entry's install: its home and runner directory at 0700. None for any other runner."""
+    paths = private_paths(ctx)
+    if not paths:
+        return None
+    modes = {os.fspath(p): path_mode(p) for p in paths}
+    ok = all(m == PRIVATE_MODE for m in modes.values())
+    return {"kind": "private", "state": "unchanged" if ok else "create", "user": (dedicated_of(ctx) or {}).get("user"),
+            "paths": list(modes), "modes": {k: (None if m is None else f"{m:o}") for k, m in modes.items()},
+            "note": "" if ok else "the account's home and runner directory become 0700: no other user reads its _work"}
+
+
+def apply_private(ctx: Context, act: dict[str, Any]) -> None:
+    """chmod 0700, then read the modes back (fresh post-effect observation): anything else fails the step."""
+    for path in private_paths(ctx):
+        try:
+            if os.path.islink(path):
+                raise OSError("a symlink")
+            os.chmod(path, PRIVATE_MODE)
+        except OSError as error:
+            act["state"], act["note"] = "failed", f"cannot make {ctx.show(path)} 0700 ({type(error).__name__})"
+            return
+    modes = {os.fspath(p): path_mode(p) for p in private_paths(ctx)}
+    act["modes"] = {k: (None if m is None else f"{m:o}") for k, m in modes.items()}
+    wrong = [k for k, m in modes.items() if m != PRIVATE_MODE]
+    if wrong:
+        act["state"], act["note"] = "failed", "not 0700 after chmod: " + ", ".join(ctx.show(Path(k)) for k in wrong)
+        return
+    act["applied"] = True
 
 
 def dedicated_word(ctx: Context, word: str) -> str:

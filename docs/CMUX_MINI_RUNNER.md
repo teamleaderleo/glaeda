@@ -1514,6 +1514,46 @@ declare `"lanRelay": "A.B.C.D:PORT"`, one private (RFC 1918) address and port, a
 
 This deliberately crosses macOS Local Network privacy for one address and port on an owner-only mini.
 
+### A runner in its own macOS account (`user`)
+
+Every other glaeda runner on a mini runs as the member's one user (its `ssh_user`), PR runners included. A trusted
+runner.dedicated entry may instead declare `"user": "<macOS short name>"`, and its runner runs as that account: its
+directory, `_work`, receipt and LaunchAgent live in that account's home, and it loads into that account's own
+`gui/<uid>` session. Use it for a runner whose jobs hold something no PR job may reach, such as a production test
+account's session and a token (cmuxterm-hq#13863): a PR job on the same Mac then never shares a macOS user with it.
+
+```json
+{"name": "hq-two-mac-a", "repo": "OWNER/REPO", "trustedRef": "refs/heads/main", "trustedRepo": "OWNER/REPO",
+ "labels": ["glaeda-hq-two-mac-a"], "admit": ["/usr/bin/true"], "user": "cmuxci-gui-01"}
+```
+
+- Allowed only on a trusted entry (`trustedRef` and `trustedRepo`, registered at that repository even when the
+  member's pools are org-scoped), so only merged code of that branch runs in the account (push and schedule jobs).
+  Refused: root, the member's own `ssh_user`, a name outside `[a-z_][a-z0-9_-]{0,31}`, and `user` together with
+  `lanRelay` or `yieldToExclusive` (both are the member user's: its relay socket, its capacity ledger).
+- `glaeda-cmux-runner-fleet --apply` stages the scripts into that account's home and runs
+  `glaeda-cmux-runner --dedicated NAME --apply` over `ssh -l USER MEMBER` (the same options; the token on stdin). The
+  plan names the user per entry. When ssh as that user fails, that entry alone fails, reported `missing: user-ssh`.
+- `glaeda-cmux-runner --dedicated NAME` refuses, changing nothing, when run as any user but the entry's (so the
+  member user's apply never installs it), and an entry without a user refuses any account but the member's
+  `ssh_user` (the staged manifest carries it).
+- The install makes the account's home and the runner directory 0700 (a macOS home is readable by every local user)
+  and reads the modes back. Its hook keeps its ledger files in `~/.local/state/glaeda/cmux-runner/capacity` of that
+  account (`--capacity-dir`), never the member user's shared capacity directory, and takes no capacity unit, like every
+  dedicated runner. It writes no dedicatedOnly marker. The member user's runners never see it: their disk reserve,
+  idle eviction and `glaeda-disk` work in their own home.
+- Not reached from the member user: `glaeda-update` refreshes only that user's hooks, and mini-health, idle-warm and
+  `glaeda-disk` read only its home. A hook change reaches a user entry by `glaeda-cmux-runner-fleet --apply`.
+
+Before the first apply, once per host and outside glaeda (root, or a person at the Mac):
+
+1. SSH for the operator's key into that account: append the operator's public key to `~USER/.ssh/authorized_keys`
+   (`~/.ssh` 0700, the file 0600, both owned by USER) and allow USER in Remote Login
+   (`sudo dseditgroup -o edit -a USER -t user com.apple.access_ssh`, when Remote Login is limited to listed users).
+2. The account logged in to its own GUI session (`launchctl bootstrap gui/<uid>` needs one).
+3. A person grants Screen Recording and Accessibility inside that account to what its jobs run; macOS keeps those
+   grants per user, and no command grants them.
+
 ## 2e2. Other repositories on the same minis (org scope)
 
 Registered to `manaflow-ai/cmux`, the runners serve only cmux. To let another repository of the org use

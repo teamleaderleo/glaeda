@@ -696,6 +696,15 @@ DEFAULT_LABELS = ("self-hosted", "macos", "arm64", MINI_LABEL)
 # A dedicated command's first word may be this: the runner's own hook interpreter (glaeda-cmux-runner hook_python), so
 # a command that loads the hook runs on the Python the hook runs on, never a pinned path.
 PYTHON_WORD = "{python}"
+# DEDICATED_USER: a trusted runner.dedicated entry's "user" is the macOS account its runner runs as, instead of the
+# member's one user (its ssh_user, which every pool and PR runner runs as). glaeda-cmux-runner-fleet applies it over
+# ssh as that user, so the runner, its _work and its LaunchAgent live in that account's home and its own gui/<uid>
+# session, and a PR job on the Mac never shares a macOS user with it (cmuxterm-hq#13863: probes that hold a production
+# test account's session and a token). Only on a trusted entry (trustedRef: no PR code ever runs in that account), never
+# with lanRelay (the relay is the member user's) or yieldToExclusive (it reads the member user's capacity ledger, which a
+# user entry keeps out of: its hook keeps its own under that account's home). A lowercase short name, never root and
+# never the member's own ssh_user.
+DEDICATED_USER_RE = r"[a-z_][a-z0-9_-]{0,31}"
 
 
 # Where a member's pool instances register (glaeda-cmux-runner-fleet, when no --org/--repo is passed): the manifest's
@@ -735,10 +744,11 @@ def pool_scope(manifest: Any, member: str) -> tuple[dict[str, str | None] | None
 
 
 def dedicated_runners(manifest: Any, member: str) -> tuple[list[dict[str, Any]], str | None]:
-    """([{name, repo, org, group, labels, admit, watch, env, keep, minFreeGib, lanRelay}], None), or ([], why the
-    member's list is unusable). Pure. A member with no runner.dedicated has none. minFreeGib is the entry's own disk
+    """([{name, repo, org, group, labels, admit, watch, env, keep, minFreeGib, lanRelay, user}], None), or ([], why
+    the member's list is unusable). Pure. A member with no runner.dedicated has none. minFreeGib is the entry's own disk
     floor, or None for the member's disk.min_free_gib. lanRelay is the one private LAN IPv4:port the entry's relay
-    agent forwards to (LAN_RELAY), or None."""
+    agent forwards to (LAN_RELAY), or None. user is the macOS account the runner runs as (DEDICATED_USER), or None for
+    the member's own user."""
     hosts = manifest.get("hosts") if isinstance(manifest, dict) else None
     host = hosts.get(member) if isinstance(hosts, dict) else None
     if not isinstance(host, dict):
@@ -761,7 +771,7 @@ def dedicated_runners(manifest: Any, member: str) -> tuple[list[dict[str, Any]],
             return [], f"{where} is not an object"
         unknown = sorted(set(entry) - {"name", "repo", "org", "group", "labels", "admit", "watch", "env", "keep",
                                        "minFreeGib", "note", "trustedRef", "trustedRepo", "yieldToExclusive",
-                                       "lanRelay"})
+                                       "lanRelay", "user"})
         if unknown:
             return [], f"{where} has unknown keys: {', '.join(unknown)}"
         name, repo, org, group = entry.get("name"), entry.get("repo"), entry.get("org"), entry.get("group")
@@ -841,11 +851,24 @@ def dedicated_runners(manifest: Any, member: str) -> tuple[list[dict[str, Any]],
                                runner.get("dedicatedOnly") is True)
         if why:
             return [], why
+        user = entry.get("user")
+        if user is not None:
+            owner = host.get("ssh_user") or manifest.get("ssh_user")
+            if not (isinstance(user, str) and re.fullmatch(DEDICATED_USER_RE, user)) or user == "root":
+                return [], f"{where}.user must be a macOS short name ({DEDICATED_USER_RE}), never root"
+            if user == owner:
+                return [], f"{where}.user {user} is the member's own ssh_user: leave user out for a runner of that user"
+            if trusted_ref is None:
+                return [], (f"{where}.user needs trustedRef and trustedRepo: a runner in its own macOS account takes "
+                            "only merged code of its repository, never PR code")
+            if relay is not None or yields:
+                return [], (f"{where}.user goes without lanRelay and yieldToExclusive: both are the member user's "
+                            "(its relay socket, its capacity ledger)")
         out.append({"name": name, "repo": repo, "org": org, "group": group, "labels": list(labels),
                     "admit": commands["admit"], "watch": commands.get("watch"), "env": dict(env),
                     "keep": list(keep), "minFreeGib": None if floor is None else float(floor),
                     "trustedRef": trusted_ref, "trustedRepo": trusted_repo, "yieldToExclusive": yields,
-                    "lanRelay": relay})
+                    "lanRelay": relay, "user": user})
     # LAN_RELAY: every runner of a member runs as the one macOS user, so any of them could open a relay's socket. A
     # relay is allowed only when every dedicated entry beside it is trusted too (dedicatedOnly leaves no pool instance).
     relays, untrusted = [d["name"] for d in out if d["lanRelay"]], [d["name"] for d in out if d["trustedRef"] is None]
