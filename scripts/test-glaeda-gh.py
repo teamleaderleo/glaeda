@@ -9193,6 +9193,22 @@ class BudgetRefreshTest(Base):
         self.assertEqual(self.daemon.budget["graphql"]["remaining"], 67)
         self.assertEqual(self.daemon.budget["rest"]["seenAt"], NOW)
 
+    def test_the_land_queue_reads_rate_limit_to_check_a_latch_mark(self) -> None:
+        """Daemon.land_reading: a free GET /rate_limit at most every LAND_READING_REFRESH; no login, no read."""
+        self.gh.rest_remaining = 1947
+        self.daemon.now = NOW
+        with mock.patch.object(gg, "land_broker_client", lambda: False):
+            seen = self.daemon.land_reading("rest")
+            self.assertEqual((seen["remaining"], seen["seenAt"]), (1947, NOW))
+            self.assertEqual(self.gh.rate_limit_calls, 1)
+            self.daemon.now = NOW + gg.LAND_READING_REFRESH - 1
+            self.daemon.land_reading("rest")
+            self.assertEqual(self.gh.rate_limit_calls, 1)
+        with mock.patch.object(gg, "land_broker_client", lambda: True):
+            self.daemon.now = NOW + gg.LAND_READING_REFRESH + 1
+            self.daemon.land_reading("rest")  # a lane-gh broker client: no /rate_limit of the login to send
+            self.assertEqual(self.gh.rate_limit_calls, 1)
+
     def test_a_recent_view_is_not_read_again(self) -> None:
         self.daemon.tick(NOW)
         self.daemon.tick(NOW + gg.BUDGET_REFRESH - 1)
@@ -21270,14 +21286,14 @@ class LandTest(Base):
     def test_a_held_latch_skips_every_judge(self):
         self.pr(LA)
         self.land()
-        self.latch("graphql", self.t + 600)
+        self.latch("rest", self.t + 600)
         for _ in range(10):
             e = self.tick(30)
         self.assertEqual(self.reads(), (0, 0, 0, 0))
         self.assertEqual(e["state"], "queued")
-        self.assertEqual(gg.read_json(gg.land_dir() / gg.LAND_LATCH_FILE)["pool"], "graphql")
+        self.assertEqual(gg.read_json(gg.land_dir() / gg.LAND_LATCH_FILE)["pool"], "rest")
         # A lane-share mark is the broker's refusal of a VM's share, which a land passes: it holds nothing here.
-        self.latch("graphql", self.t, share=True)
+        self.latch("rest", self.t, share=True)
         self.latch("rest", self.t + 600, share=True)
         self.w.answers.append(ok_answer(LA))
         self.tick(1)
@@ -21306,14 +21322,119 @@ class LandTest(Base):
         its own refusal), the queue is not stopped; a GitHub-sourced mark still stops it."""
         self.pr(LA)
         self.land()
-        self.latch("graphql", self.t + 600)
+        self.latch("rest", self.t + 600)
         self.tick(30)
         self.assertEqual(self.reads(), (0, 0, 0, 0))
-        self.latch("graphql", self.t + 600, source=gg.LAND_LATCH_ECHO)
+        self.latch("rest", self.t + 600, source=gg.LAND_LATCH_ECHO)
         self.w.answers.append(ok_answer(LA))
         self.tick(1)
         self.assert_merged_at(LA)
         self.assertFalse((gg.land_dir() / gg.LAND_LATCH_FILE).exists())
+
+    # -- a mark checked against GitHub's own count (2026-11-19 09:2x-09:50Z: a "retry-after" mark by lane-gh, a broker
+    # read-App wait, held ~40 lands 30-50 min while /rate_limit read REST 1947/5000 and GraphQL 4323/5000)
+
+    def give_reading(self, pool: str, remaining: int, reset: float, seen_ago: float = 0.0) -> None:
+        """The login's reading of POOL as the daemon's land_reading answers it, seen SEEN_AGO before each pass."""
+        readings = getattr(self, "readings", None)
+        if readings is None:
+            readings = self.readings = {}
+            self.q.reading = lambda p: (None if p not in readings else
+                                        {**readings[p], "seenAt": self.t - readings[p]["ago"]})
+        readings[pool] = {"limit": 5000, "remaining": remaining, "reset": reset, "ago": seen_ago}
+
+    def test_a_fresh_reading_above_the_reserve_releases_a_retry_after_mark(self):
+        logs: list[dict] = []
+        p = mock.patch.object(gg, "log", logs.append)
+        p.start()
+        self.addCleanup(p.stop)
+        self.pr(LA)
+        self.land()
+        self.latch("rest", self.t + 630, at=self.t - 120, reset=None, source="retry-after", by="lane-gh")
+        self.give_reading("rest", 1947, self.t + 900)
+        self.w.answers.append(ok_answer(LA))
+        self.tick(30)
+        self.assert_merged_at(LA)
+        over = [r for r in logs if r.get("event") == "land-latch-overridden"]
+        self.assertEqual(len(over), 1)
+        self.assertEqual((over[0]["pool"], over[0]["source"], over[0]["by"], over[0]["remaining"], over[0]["why"]),
+                         ("rest", "retry-after", "lane-gh", 1947, "reading_above_reserve"))
+        self.assertEqual(over[0]["reset"], gg.utc_clock(self.t - 30 + 900))
+        self.assertIn("holds no land: GitHub's count reads 1947 left",
+                      gg.land_latch_note(gg.land_latch_judge(self.t, self.q.reading)[1][0]))
+
+    def test_a_retry_after_mark_holds_its_first_secondary_hold(self):
+        """A secondary 403's Retry-After its writer did not call secondary: held its first secondary_hold_s."""
+        self.pr(LA)
+        self.land()
+        self.latch("rest", self.t + 630, reset=None, source="retry-after", by="lane-gh")
+        self.give_reading("rest", 1947, self.t + 900)
+        self.tick(30)
+        self.assertEqual(self.reads(), (0, 0, 0, 0))
+        self.w.answers.append(ok_answer(LA))
+        self.tick(gg.PACE_DEFAULTS["secondary_hold_s"])
+        self.assert_merged_at(LA)
+
+    def test_a_reading_under_the_reserve_keeps_holding_to_githubs_reset(self):
+        """At or under the hard reserve the mark holds; a said "HH:MM:59" mark ends at GitHub's real reset."""
+        self.pr(LA)
+        self.land()
+        reset = self.t + 300
+        self.latch("rest", self.t + 359, source="said", by="gh-quota")
+        self.give_reading("rest", gg.hard_reserve_floor()["rest"], reset)
+        for _ in range(5):
+            self.tick(30)
+        self.assertEqual(self.reads(), (0, 0, 0, 0))
+        latch = gg.read_json(gg.land_dir() / gg.LAND_LATCH_FILE)
+        self.assertEqual((latch["until"], latch["reading"], latch["source"]), (round(reset), "fresh", "said"))
+        self.w.answers.append(ok_answer(LA))
+        self.tick(reset - self.t + 1)  # GitHub's window reset: the reading is past it, the mark's 59 s never held
+        self.assert_merged_at(LA)
+
+    def test_a_stale_reading_never_starts_or_extends_a_hold(self):
+        """cosmic-gray 2026-11-19: "graphql 0/5000 left, resets 09:37:39Z, seen 19m ago" after that reset."""
+        self.pr(LA)
+        self.land()
+        self.give_reading("rest", 0, self.t - 60, seen_ago=1200)  # 0 left, its reset passed: unknown, not spent
+        self.give_reading("graphql", 0, self.t - 60, seen_ago=1200)
+        self.latch("rest", self.t + 300, source="said", by="gh-quota")
+        self.tick(30)
+        self.assertEqual(self.reads(), (0, 0, 0, 0))
+        latch = gg.read_json(gg.land_dir() / gg.LAND_LATCH_FILE)
+        self.assertEqual((latch["until"], latch["reading"]), (round(self.t - 30 + 300), "stale"))
+        note = gg.land_latch_judge(self.t, self.q.reading)[1][0]
+        self.assertIn("GitHub's count is stale", gg.land_latch_note(note))
+        self.clear_latch()  # no mark: a stale 0 starts nothing
+        self.w.answers.append(ok_answer(LA))
+        self.tick(1)
+        self.assert_merged_at(LA)
+
+    def test_a_secondary_mark_holds_to_its_own_until_whatever_the_reading(self):
+        self.pr(LA)
+        self.land()
+        until = self.t + 300
+        for pool in ("rest", "graphql"):
+            self.latch(pool, until, reset=None, source="secondary", by="glaeda-gh")
+        self.give_reading("rest", 4000, self.t + 1800)
+        self.give_reading("graphql", 4000, self.t + 1800)
+        for _ in range(5):
+            self.tick(30)
+        self.assertEqual(self.reads(), (0, 0, 0, 0))
+        self.assertEqual(gg.read_json(gg.land_dir() / gg.LAND_LATCH_FILE)["until"], round(until))  # never extended
+        self.w.answers.append(ok_answer(LA))
+        self.tick(until - self.t + 1 + gg.PACE_DEFAULTS["reset_spread_s"])
+        self.assert_merged_at(LA)
+
+    def test_a_graphql_mark_holds_no_land(self):
+        """gcp-agent-lane-1 2026-11-19: a GraphQL "until HH:38:59Z" mark held every due land ~30 min each hour while
+        REST had ~2000 left. merge_hold judges over REST (its quota_held reads only the REST latch)."""
+        self.pr(LA)
+        self.land()
+        self.latch("graphql", self.t + 1800, source="said", by="gh-quota")
+        self.w.answers.append(ok_answer(LA))
+        self.tick(30)
+        self.assert_merged_at(LA)
+        self.assertIsNotNone(gg.land_latch(self.t, lands=False))  # the daemon's own reads still see it
 
     def clear_latch(self) -> None:
         for path in self.latch_dir.glob("*-exhausted*.json"):
@@ -21325,7 +21446,7 @@ class LandTest(Base):
         been its head. After the latch clears, a cached head is pinned only once a read since then shows it."""
         self.pr(LA)
         self.land()
-        self.latch("graphql", self.t + 600)
+        self.latch("rest", self.t + 600)
         self.tick(30)
         self.assertEqual(self.reads(), (0, 0, 0, 0))
         self.github_head[self.KEY] = LB  # pushed while the latch held: the cache still says LA
@@ -21344,7 +21465,7 @@ class LandTest(Base):
         self.nudge_reads = False
         self.pr(LA)
         self.land()
-        self.latch("graphql", self.t + 600)
+        self.latch("rest", self.t + 600)
         self.tick(30)
         self.clear_latch()
         self.tick(1)
@@ -21410,7 +21531,7 @@ class LandTest(Base):
             self.addCleanup(p.stop)
         keys = [self.stuck(11, 4 * 3600), self.stuck(12, 2 * 3600), self.stuck(13, 3 * 3600)]
         reset1 = self.t + 600
-        self.latch("graphql", reset1)
+        self.latch("rest", reset1)
         self.tick(30)
         self.assertEqual(self.w.explains(), [])
         for k in keys:
@@ -21501,7 +21622,7 @@ class LandTest(Base):
         """Review: a due row the latch held, then found with checks running, waits on a wake an hour ahead: it is not
         due, so its status no longer says the latch holds it, and its windows do not carry into later latches."""
         key = self.stuck(11, 0, state="queued")  # queued: due, its checks not read yet
-        self.latch("graphql", self.t + 300)
+        self.latch("rest", self.t + 300)
         self.tick(30)
         self.assertIn("latchHeld", self.q.entries[key])
         self.clear_latch()
@@ -21546,7 +21667,7 @@ class LandTest(Base):
         self.assertEqual(len(peeks), len(calls) - len([c for c in calls if c[1]]))
         # Latched: nothing at all
         calls.clear()
-        self.latch("graphql", self.t + 1200)
+        self.latch("rest", self.t + 1200)
         for _ in range(10):
             self.tick(30)
         self.assertEqual(calls, [])
@@ -22139,7 +22260,7 @@ class LandTest(Base):
         # huge-blue, 2026-11-18 15:24Z: the login's GraphQL latched, 382 open lands, workers busy=0, nothing judged,
         # though merge_hold reads manaflow-ai through the lander App pools.
         self.latch_dir.mkdir(parents=True, exist_ok=True)
-        (self.latch_dir / "graphql-exhausted.json").write_text(json.dumps({"until": self.t + 3000, "at": self.t}))
+        (self.latch_dir / "rest-exhausted.json").write_text(json.dumps({"until": self.t + 3000, "at": self.t}))
         self.w.config["latchFreeCommand"] = ["/fake/ready", "--owner", "{owner}"]
         asked: list[list[str]] = []
         run = self.w.run
@@ -22166,7 +22287,7 @@ class LandTest(Base):
         # huge-blue, 2026-11-18 16:11Z on: "busy 0, gated 0, snapshotWaiting 2, open 399" every 5 min, and nothing
         # said that the login's GraphQL latch skipped all 399 (no unlatched source answered for any owner).
         self.latch_dir.mkdir(parents=True, exist_ok=True)
-        (self.latch_dir / "graphql-exhausted.json").write_text(json.dumps({"until": self.t + 3000, "at": self.t}))
+        (self.latch_dir / "rest-exhausted.json").write_text(json.dumps({"until": self.t + 3000, "at": self.t}))
         self.pr(LA)
         self.pr(LA, key="pr:o/r#2")
         self.land()
@@ -22176,7 +22297,7 @@ class LandTest(Base):
             self.tick()
         pool = [ln for ln in lines if ln.get("event") == "land-pool"][-1]
         self.assertEqual((pool["busy"], pool["gated"], pool["open"], pool["latched"], pool["due"]), (0, 0, 2, 2, 2))
-        self.assertEqual(pool["latch"]["pool"], "graphql")
+        self.assertEqual(pool["latch"]["pool"], "rest")
         self.assertEqual(pool["states"], {"queued": 2})
         self.assertIn(pool["oldestDue"]["pr"], ("o/r#1", "o/r#2"))
 

@@ -4085,7 +4085,7 @@ class Daemon:
         why = self.defer_why.get(kind)
         if not n or why is None or self.now - why[0] > READ_PROGRESS_WINDOW:
             return None
-        latch = land_latch(self.now)
+        latch = land_latch(self.now, lands=False)
         parts = [f"{n} {kind} reads deferred, last by {why[1]}", f"batch {self.batch.get(kind)}",
                  f"REST share {self.rest_spent()} of {self.rest_cap()}"]
         if latch is not None:
@@ -4913,6 +4913,11 @@ class Daemon:
         ages = [self.now - t for t in seen if isinstance(t, (int, float))]
         if len(ages) == 2 and max(ages) < BUDGET_REFRESH:
             return  # every bucket's view is recent enough; a bucket never seen always refreshes
+        self.read_rate_limit()
+
+    def read_rate_limit(self) -> None:
+        """One GET /rate_limit (free: no primary limit counts it) into the budget: refresh_budget's read, and the land
+        queue's check of a latch mark against GitHub's own count (land_reading)."""
         try:
             with self.calling("budget"):
                 status, _, doc = self.request("GET", "/rate_limit", free=True)
@@ -4938,6 +4943,25 @@ class Daemon:
         turned a broken token into a busy loop on the disk."""
         self.errors.append(f"rate_limit: {why}")
         self.budget_retry = self.now + BUDGET_RETRY
+
+    def land_reading(self, pool: str) -> dict | None:
+        """The land queue's reading of the login's POOL ("rest" or "graphql") while a latch mark would hold its lands
+        (land_latch): GET /rate_limit (free) when the last answer is LAND_READING_REFRESH old, then the budget's poorest
+        live counter. None with no login here (an upstream reader or a lane-gh broker client: no /rate_limit of the
+        login it can send; the mark holds as written there) or while GitHub's secondary limit or a refused /rate_limit
+        holds the read. 2026-11-19 09:2x-09:50Z: a "retry-after" mark by lane-gh (a broker read-App wait, not GitHub's
+        limit) held ~40 lands 30-50 min while /rate_limit said REST 1947/5000 and GraphQL 4323/5000 left."""
+        if self.upstream() is not None or land_broker_client():
+            return None
+        if self.now - self.rate_limit_at >= LAND_READING_REFRESH and self.now >= self.budget_retry \
+                and self.clock() >= self.secondary_until:
+            deadline, self.tick_deadline = self.tick_deadline, max(self.tick_deadline, time.monotonic() + 30.0)
+            try:
+                self.read_rate_limit()
+            finally:
+                self.tick_deadline = deadline
+        seen = self.budget.get(pool)
+        return dict(seen) if isinstance(seen, dict) else None
 
     # -- requests
 
@@ -6693,7 +6717,7 @@ class Daemon:
         if self.land_queue is None:
             if not land_dir().is_dir():
                 return
-            self.land_queue = LandQueue(nudge=self.nudged.add, notice=self.write_notice)
+            self.land_queue = LandQueue(nudge=self.nudged.add, notice=self.write_notice, reading=self.land_reading)
         self.land_queue.tick(None if getattr(self, "clock_real", True) else self.now)
 
     # -- upstream: no login here; another host's glaeda-gh reads GitHub (UPSTREAM_CONFIG)
@@ -9381,6 +9405,13 @@ LAND_QUOTA_BACKOFF = 300.0
 LAND_QUOTA_BACKOFF_MAX = 3600.0
 LAND_QUOTA_MAX_S = 3700.0  # gh_latch MAX_S: a reset never lies more than GitHub's hour ahead
 LAND_LATCH_ECHO = "echo"  # gh_latch.ECHO (lw#5869): our own refusal of a held mark read back; holds no land (land_latch)
+# A latch mark is checked against GitHub's own count (land_latch, Daemon.land_reading): GET /rate_limit no more often
+# than LAND_READING_REFRESH while a mark would hold, and a reading counts only when seen after the mark was written,
+# at most LAND_READING_MAX_AGE ago, with its reset still ahead (a passed reset is unknown, never "0 left").
+LAND_READING_REFRESH = 60.0
+LAND_READING_MAX_AGE = 300.0
+LAND_LATCH_OVERRIDES = ("reading_above_reserve", "ends_at_reading_reset", "window_reset", "graphql_rest_judges")
+LAND_LATCH_SECONDARY = "secondary"  # GitHub's secondary limit: /rate_limit cannot see it; it holds to its own until
 LAND_QUOTA_REFUSAL = re.compile(r"quota: not judged|\[quota: not judged")
 # A step's own output (update-branch, rerun, merge) that GitHub refused for the login's quota, in the words the broker
 # and the gh-quota shim use, as well as merge_hold's. Read on a step's output only, never on merge_hold's reason (which
@@ -10050,7 +10081,8 @@ def land_latch_spread(now: float) -> float | None:
     for pool in ("rest", "graphql"):
         doc = read_json(latch_state_dir() / f"{pool}-exhausted.json")
         if not isinstance(doc, dict) or doc.get("share") is True or (pool == "rest" and doc.get("login_only") is True) \
-                or doc.get("source") not in LATCH_GITHUB_SOURCES:
+                or doc.get("source") not in LATCH_GITHUB_SOURCES \
+                or (pool == "graphql" and doc.get("source") != LAND_LATCH_SECONDARY):
             continue
         until = doc.get("until")
         if isinstance(until, (int, float)) and not isinstance(until, bool) and until <= now < until + width:
@@ -10058,24 +10090,64 @@ def land_latch_spread(now: float) -> float | None:
     return best
 
 
-def land_latch(now: float) -> tuple[str, float] | None:
-    """(pool, until) of the login's latch mark that holds at NOW and ends last, or None.
+def land_budget_reading(pool: str) -> dict | None:
+    """The daemon's last reading of the login's POOL (budget.json), for a reader with no daemon of its own (`land
+    status`): land_latch judges its age and its reset itself."""
+    doc = read_json(BASE / "budget.json")
+    seen = doc.get(pool) if isinstance(doc, dict) else None
+    return dict(seen) if isinstance(seen, dict) else None
 
-    The contract (leo-workspace tools/gh_latch.py, lw#5626; glaeda never imports it, it reads the same files): dir
-    $GH_QUOTA_STATE, else ~/.local/state/gh-quota; the host's login has rest-exhausted.json and graphql-exhausted.json,
-    JSON {until, at, reset, source, by, identity} (older marks: until, at, counter); a mark holds iff now < until, and a
-    reset is never more than MAX_S (3700 s) ahead. Writers are atomic and never shorten a held mark; a mark whose source
-    is GitHub's own (x-ratelimit-reset, retry-after, said) is never voided early, so a reader trusts until as written.
-    A lane-share mark (share: true, the broker's refusal of a VM's share) does not hold a land: lands pass the share
-    (gh_latch.held(share=False)). A REST mark with login_only: true (a broker client's refusal that named the shared
-    login) holds no judgement either: merge_hold's REST reads of a repo the broker's read pool covers go on its read
-    Apps, and merge_hold's own stop (quota_held) judges that per repo. A mark with source "echo" (LAND_LATCH_ECHO: our
-    own refusal of a held mark read back, a guess no request to GitHub made) holds no entry either: each is judged and
-    parks on its own refusal (park_quota). huge-blue 2026-11-18 09:05-09:43Z: such a read-back, marked as GitHub's
-    word, held every land 37 min past its wake. The land queue only reads these marks: merge_hold, the broker and the
-    daemon write them."""
+
+def land_reading_state(seen: dict | None, mark_at: Any, now: float) -> str:
+    """"fresh" when SEEN (a reading {remaining, limit, reset, seenAt}) was taken after the mark (MARK_AT), at most
+    LAND_READING_MAX_AGE ago, and its reset is still ahead; "stale" when it exists but is not (a passed reset is an
+    unknown count, never "0 left": cosmic-gray 2026-11-19 showed "graphql 0/5000 left, resets 09:37:39Z, seen 19m
+    ago" after that reset); "unread" with none."""
+    if not isinstance(seen, dict):
+        return "unread"
+    remaining, reset, at = seen.get("remaining"), seen.get("reset"), seen.get("seenAt")
+    if not all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in (remaining, reset, at)):
+        return "stale"
+    if reset <= now or now - at > LAND_READING_MAX_AGE:
+        return "stale"
+    if isinstance(mark_at, (int, float)) and not isinstance(mark_at, bool) and at < mark_at:
+        return "stale"
+    return "fresh"
+
+
+def land_window_reset(seen: dict | None, mark_at: Any, now: float) -> bool:
+    """Whether SEEN, a reading taken after the mark (MARK_AT), names a reset after the mark that has passed by NOW:
+    GitHub's window the mark was written in has refilled, so the mark (a primary limit's) holds no more. A stale
+    reading's count is unknown; its reset is still GitHub's word for when that window ended."""
+    if not isinstance(seen, dict) or not isinstance(mark_at, (int, float)) or isinstance(mark_at, bool):
+        return False
+    reset, at = seen.get("reset"), seen.get("seenAt")
+    if not all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in (reset, at)):
+        return False
+    return at >= mark_at and mark_at < reset <= now
+
+
+def land_latch_judge(now: float, reading: Callable[[str], dict | None] | None = None,
+                     lands: bool = True) -> tuple[tuple[str, float] | None, list[dict]]:
+    """land_latch's answer and, per held mark, what it found: {pool, source, by, at, until (as written), holds, why,
+    heldUntil, reading ("fresh", "stale", "unread" or None: not asked), remaining, reset, seenAt, reserve}.
+
+    LANDS (the land queue's question, not the daemon's reads): a GraphQL mark other than GitHub's secondary limit holds
+    no land: merge_hold judges over REST (its quota_held reads only the REST latch; a GraphQL-limited read goes on to
+    `gh api repos/O/R/pulls/N`), and the shim refuses a `gh pr merge` on the GraphQL latch unsent, which parks the entry
+    on its own words (park_quota). gcp-agent-lane-1 2026-11-19: a GraphQL "until HH:38:59Z" mark held every due land
+    ~30 min each hour (07:11-07:38, 08:21-08:38, 09:06-09:38) while REST had ~2000 left.
+
+    READING (Daemon.land_reading: GET /rate_limit, free) checks a held REST mark against GitHub's own count: a fresh
+    reading (land_reading_state) above the pool's hard reserve (hard_reserve_floor, gh-quota.json hard_reserve_calls)
+    holds no land, lands proceed in the reserve; at or under it the mark holds, ending at the reading's reset when that
+    comes first (an "HH:MM:59" said-mark ends at GitHub's real reset). A reading never starts or extends a hold, and a
+    stale one changes nothing. Not checked: a "secondary" mark (/rate_limit cannot see that limit; it holds to its own
+    until, which nothing here extends), and a "retry-after" mark in its first secondary_hold_s (a secondary 403's
+    Retry-After written by a caller that did not call it secondary)."""
     state = Path(os.environ.get("GH_QUOTA_STATE") or Path.home() / ".local/state/gh-quota")
     best: tuple[str, float] | None = None
+    notes: list[dict] = []
     for pool in ("rest", "graphql"):
         doc = read_json(state / f"{pool}-exhausted.json")
         if not isinstance(doc, dict) or doc.get("share") is True or (pool == "rest" and doc.get("login_only") is True) \
@@ -10084,10 +10156,66 @@ def land_latch(now: float) -> tuple[str, float] | None:
         until = doc.get("until")
         if not isinstance(until, (int, float)) or isinstance(until, bool) or not now < until:
             continue
-        until = min(float(until), now + LAND_QUOTA_MAX_S)
+        written = float(until)
+        until = min(written, now + LAND_QUOTA_MAX_S)
+        source = doc.get("source")
+        note = {"pool": pool, "source": source, "by": doc.get("by"), "at": doc.get("at"), "until": written,
+                "holds": True, "why": "mark", "heldUntil": until, "reading": None}
+        notes.append(note)
+        if lands and pool == "graphql" and source != LAND_LATCH_SECONDARY:
+            note.update(holds=False, why="graphql_rest_judges", heldUntil=None)
+            continue
+        at = doc.get("at")
+        if reading is None or source == LAND_LATCH_SECONDARY:
+            note["why"] = "secondary" if source == LAND_LATCH_SECONDARY else "mark"
+        elif source == "retry-after" and isinstance(at, (int, float)) and not isinstance(at, bool) \
+                and now < float(at) + pace_settings()["secondary_hold_s"]:
+            note["why"] = "retry_after_first_hold"
+        else:
+            seen = reading(pool)
+            fresh = land_reading_state(seen, at, now)
+            reserve = hard_reserve_floor()[pool]
+            note["reading"] = fresh
+            note["reserve"] = reserve
+            if isinstance(seen, dict):
+                note.update(remaining=seen.get("remaining"), reset=seen.get("reset"), seenAt=seen.get("seenAt"))
+            if fresh == "fresh" and seen["remaining"] > reserve:
+                note.update(holds=False, why="reading_above_reserve", heldUntil=None)
+                continue
+            if land_window_reset(seen, at, now):
+                note.update(holds=False, why="window_reset", heldUntil=None)
+                continue
+            if fresh == "fresh" and float(seen["reset"]) < until:
+                until = float(seen["reset"])
+                note.update(why="ends_at_reading_reset", heldUntil=until)
+            elif fresh == "fresh":
+                note["why"] = "reading_under_reserve"
         if best is None or until > best[1]:
             best = (pool, until)
-    return best
+    return best, notes
+
+
+def land_latch(now: float, reading: Callable[[str], dict | None] | None = None,
+               lands: bool = True) -> tuple[str, float] | None:
+    """(pool, until) of the login's latch mark that holds at NOW and ends last, or None (land_latch_judge: with
+    READING a REST mark is checked against GitHub's own count; with LANDS False every pool's mark counts, the daemon's
+    own reads' question).
+
+    The contract (leo-workspace tools/gh_latch.py, lw#5626; glaeda never imports it, it reads the same files): dir
+    $GH_QUOTA_STATE, else ~/.local/state/gh-quota; the host's login has rest-exhausted.json and graphql-exhausted.json,
+    JSON {until, at, reset, source, by, identity} (older marks: until, at, counter); a mark holds iff now < until, and a
+    reset is never more than MAX_S (3700 s) ahead. Writers are atomic and never shorten a held mark; a mark whose source
+    is GitHub's own (x-ratelimit-reset, retry-after, said) is never voided early by a writer; the land queue checks it
+    against a fresh /rate_limit (land_latch_judge) and never holds lands past GitHub's own count. A lane-share mark
+    (share: true, the broker's refusal of a VM's share) does not hold a land: lands pass the share
+    (gh_latch.held(share=False)). A REST mark with login_only: true (a broker client's refusal that named the shared
+    login) holds no judgement either: merge_hold's REST reads of a repo the broker's read pool covers go on its read
+    Apps, and merge_hold's own stop (quota_held) judges that per repo. A mark with source "echo" (LAND_LATCH_ECHO: our
+    own refusal of a held mark read back, a guess no request to GitHub made) holds no entry either: each is judged and
+    parks on its own refusal (park_quota). huge-blue 2026-11-18 09:05-09:43Z: such a read-back, marked as GitHub's
+    word, held every land 37 min past its wake. The land queue only reads these marks: merge_hold, the broker and the
+    daemon write them."""
+    return land_latch_judge(now, reading, lands)[0]
 
 
 def land_seconds(value: Any, default: float, low: float = 1.0, high: float = 86400.0) -> float:
@@ -10115,8 +10243,11 @@ class LandQueue:
                  forward: Callable[[list[str], dict, float], dict] = land_forward,
                  broker_client: Callable[[], bool] = land_broker_client,
                  snapshot_of: Callable[[str], dict | None] = read_rollup,
-                 peek: Callable[[str], None] | None = None) -> None:
+                 peek: Callable[[str], None] | None = None,
+                 reading: Callable[[str], dict | None] | None = land_budget_reading) -> None:
         self.broker_client = broker_client
+        self.reading = reading  # the login's reading of a pool, to check a latch mark against (land_latch_judge)
+        self.overridden: set[tuple] = set()  # (pool, at, until) of marks a fresh reading voided, logged once each
         self.snapshot_of = snapshot_of
         self.run = run or (lambda argv, timeout, env: self._run_real(argv, timeout, env))
         self.forward = forward
@@ -10142,6 +10273,7 @@ class LandQueue:
         self.stale_checkout: tuple[str, str | None] | None = None  # check_behind's last finding, numbers out
         self.mh_fallback: tuple[Path, Path] | None = None  # (merge_hold.py configured, the release run instead)
         self.latched: tuple[str, int] | None = None
+        self.latch_reading: str | None = None  # the reading state latch.json last said (latch_held)
         # The latch a previous daemon saw holding (land/latch.json): a restart or re-exec inside one hold is the same
         # window (hold), not a new one; its end is still logged and still marks latch_cleared.
         seen = read_json(land_dir() / LAND_LATCH_FILE)
@@ -10507,11 +10639,31 @@ class LandQueue:
 
     def latch_held(self) -> tuple[str, float] | None:
         """The login's latch (land_latch) before a judge pass; logged once when it starts holding and once when it
-        clears, and kept in land/latch.json for `land status`."""
-        latch = land_latch(self.now)
+        clears, and kept in land/latch.json for `land status`. Each pass checks a held mark against the login's fresh
+        reading (land_latch_judge; a window's end is such a pass too): a mark that reading voids is logged once
+        (land-latch-overridden: pool, the mark's source, by and until, remaining, reset), so its before and after are
+        measurable."""
+        latch, notes = land_latch_judge(self.now, self.reading)
+        for note in notes:
+            if note["why"] not in LAND_LATCH_OVERRIDES:
+                continue
+            once = (note["pool"], note.get("at"), note["until"], note["why"])
+            if once in self.overridden:
+                continue
+            self.overridden.add(once)
+            log({"event": "land-latch-overridden", "pool": note["pool"], "why": note["why"],
+                 "source": note.get("source"), "by": note.get("by"), "until": utc_clock(note["until"]),
+                 "heldUntil": None if note.get("heldUntil") is None else utc_clock(note["heldUntil"]),
+                 "remaining": note.get("remaining"), "reset": None if not isinstance(note.get("reset"), (int, float))
+                 else utc_clock(note["reset"]), "seenAt": note.get("seenAt"), "reserve": note.get("reserve")})
+        if len(self.overridden) > 64:
+            self.overridden = {o for o in self.overridden if isinstance(o[2], (int, float)) and o[2] > self.now}
         held = None if latch is None else (latch[0], round(latch[1]))
-        if held != self.latched:
-            was, self.latched = self.latched, held
+        note = {} if held is None else next((n for n in notes if n["pool"] == held[0] and n["holds"]), {})
+        # what the status says of GitHub's own count: fresh, stale (its reset passed: unknown, never 0 left) or unread
+        reading = None if held is None else (note.get("reading") or "unread")
+        if held != self.latched or (held is not None and reading != self.latch_reading):
+            was, self.latched, self.latch_reading = self.latched, held, reading
             path = land_dir() / LAND_LATCH_FILE
             if held is None:
                 path.unlink(missing_ok=True)
@@ -10521,8 +10673,11 @@ class LandQueue:
             else:
                 if was is None or self.latch_started is None:
                     self.latch_started = self.now  # a new hold: a new window (a longer until is the same one)
-                write_json(path, {"pool": held[0], "until": held[1], "at": self.now, "since": self.latch_started})
-                log({"event": "land-latch-held", "pool": held[0], "until": held[1]})
+                write_json(path, {"pool": held[0], "until": held[1], "at": self.now, "since": self.latch_started,
+                                  "source": note.get("source"), "by": note.get("by"), "reading": reading,
+                                  "remaining": note.get("remaining"), "reset": note.get("reset")})
+                log({"event": "land-latch-held", "pool": held[0], "until": held[1], "source": note.get("source"),
+                     "by": note.get("by"), "reading": reading})
         return latch
 
     def due(self, e: dict) -> bool:
@@ -12280,6 +12435,33 @@ def land_status_doc(target: str | None) -> dict:
             else None, "stale": stale if isinstance(stale, dict) else None}
 
 
+def land_latch_note(note: dict) -> str:
+    """One `land status` line for a held latch mark land_latch_judge looked at: whether it holds lands, and what
+    GitHub's own count said of it (fresh, stale or unread)."""
+    pool = "REST" if note["pool"] == "rest" else "GraphQL"
+    mark = (f"the login's {pool} mark ({note.get('source')} by {note.get('by') or '?'}, "
+            f"until {utc_clock(note['until'])})")
+    reset = note.get("reset")
+    count = (f"{note.get('remaining')} left, resets {utc_clock(reset)}" if isinstance(reset, (int, float))
+             and not isinstance(reset, bool) else f"{note.get('remaining')} left")
+    why = note["why"]
+    if why == "graphql_rest_judges":
+        return f"glaeda land: {mark} holds no land: merge_hold judges over REST; a merge it refuses parks on its own"
+    if why == "reading_above_reserve":
+        return f"glaeda land: {mark} holds no land: GitHub's count reads {count} (hard reserve {note.get('reserve')})"
+    if why == "window_reset":
+        return f"glaeda land: {mark} holds no land: GitHub's window it was written in reset at {utc_clock(reset)}"
+    if why == "ends_at_reading_reset":
+        return f"glaeda land: {mark} ends at GitHub's reset {utc_clock(note['heldUntil'])} ({count})"
+    if note.get("reading") == "stale":
+        return f"glaeda land: {mark} holds; GitHub's count is stale ({count}, seen before the mark or its reset passed)"
+    if note.get("reading") == "unread":
+        return f"glaeda land: {mark} holds; GitHub's count is unread"
+    if why == "reading_under_reserve":
+        return f"glaeda land: {mark} holds: GitHub's count reads {count}, at or under the hard reserve"
+    return f"glaeda land: {mark} holds ({why})"
+
+
 def cmd_land_status(target: str | None, as_json: bool) -> int:
     doc = land_status_doc(target)
     executor = land_executor()
@@ -12314,7 +12496,9 @@ def cmd_land_status(target: str | None, as_json: bool) -> int:
     if refused:
         print(f"glaeda land: REFUSED to start since {utc_clock(float(refused.get('at') or 0))}: "
               f"{refused.get('reason')}\nnext: {refused.get('next')}")
-    latch = land_latch(now)
+    latch, notes = land_latch_judge(now, land_budget_reading)
+    for note in notes:
+        print(land_latch_note(note))
     if latch:
         print(f"glaeda land: parked until {time.strftime('%H:%MZ', time.gmtime(latch[1]))} (quota): the login's "
               f"{'REST' if latch[0] == 'rest' else 'GraphQL'} latch holds; no entry is judged before it")
