@@ -21801,6 +21801,45 @@ class LandTest(Base):
         self.assertNotIn("latchHeld", e)
         self.assertNotIn("held by the login latch", gg.land_line(e, self.t))
 
+    def test_a_latch_held_row_is_due_the_tick_its_mark_is_gone_even_with_no_worker_free(self):
+        """gcp-agent-lane-1 2026-11-19 11:18Z: with no mark on disk, 12 rows printed "held by the login latch until
+        11:43Z" (each its own stored until), every worker busy. The mark is re-read each tick: the tick it is gone, a
+        row the latch held is due and says why it waits (every worker busy), never a latch, and while a mark holds its
+        status names that mark's until as read now, not the one the row stored."""
+        self.w.config["workers"] = 1
+
+        class Busy:
+            def done(self) -> bool:
+                return False
+        key = self.stuck(11, 3 * 3600)
+        until = self.t + 1500
+        self.latch("rest", until)
+        self.tick(30)
+        e = self.q.entries[key]
+        self.assertEqual(e["latchHeld"]["until"], round(until))
+        self.assertIn(f"held by the login latch until {time.strftime('%H:%MZ', time.gmtime(until))}",
+                      gg.land_line(e, self.t))
+        shorter = self.t + 120  # a mark rewritten shorter: the line follows the mark, not the row's stored until
+        self.latch("rest", shorter)
+        self.assertIn(f"held by the login latch until {time.strftime('%H:%MZ', time.gmtime(shorter))}",
+                      gg.land_line(e, self.t))
+        self.assertNotIn("held by the login latch", gg.land_line(e, self.t, None))
+        self.q.jobs["pr:o/r#99"] = Busy()
+        self.clear_latch()  # gone well before either until (a reading voided it, a writer dropped it)
+        self.assertNotIn("held by the login latch", gg.land_line(e, self.t))
+        self.tick(30)
+        e = self.q.entries[key]
+        self.assertNotIn("latchHeld", e)
+        self.assertIn("latch_released", [h["event"] for h in e["history"]])
+        self.assertTrue(self.q.due(e))
+        self.assertNotIn("held by the login latch", gg.land_line(e, self.t))
+        self.assertIn("every worker busy", gg.land_line(e, self.t))
+        self.assertEqual(self.explained(), [])
+        del self.q.jobs["pr:o/r#99"]
+        self.retries(1)
+        self.tick(30)
+        self.assertEqual(self.explained(), ["11"])
+
     def test_only_due_entries_hold_a_waited_pr_watch(self):
         """huge-blue, 2026-11-18 20:00Z: 525 of 725 pr watches were the land queue's, each open entry's waited watch
         renewed every 30 s, and no pr cache was read in 600 s. With 440 open entries for an hour: an entry waiting on

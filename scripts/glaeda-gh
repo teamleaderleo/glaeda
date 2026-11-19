@@ -10534,6 +10534,11 @@ class LandQueue:
                 with self.lock:
                     if self.parked(e):
                         continue
+                    if e.get("latchHeld"):
+                        # no mark holds it this pass (re-read above, never the until it stored): due now, and its
+                        # status names no latch, even if no worker takes it yet (gated)
+                        self.unhold(e)
+                        self.save(e)
                     self.keep_watching(e)
                     self.consider(e)
             except Exception as error:  # noqa: BLE001  one bad entry must not stop the others
@@ -12502,7 +12507,14 @@ def land_request_lane(req: dict) -> tuple[str, str] | None:
     return (lane, host) if land_session_lane(lane) == lane and re.fullmatch(r"[A-Za-z0-9._-]{0,100}", host) else ("", "")
 
 
-def land_line(e: dict, now: float) -> str:
+LAND_LATCH_READ = object()  # land_line's default: read the login's latch now (land_latch)
+
+
+def land_line(e: dict, now: float, latch: Any = LAND_LATCH_READ) -> str:
+    """E's status line. LATCH is the login's latch now ((pool, until) or None; read here by default): an entry the
+    latch held (latchHeld) says so only while a mark holds, and names the mark's until as read now, never the one it
+    stored. gcp-agent-lane-1 2026-11-19 11:18Z: with no mark on disk, 12 entries printed "held by the login latch until
+    11:43Z", each its own stored until."""
     w = e.get("wait") or {}
     bits = [f"{key_name(e['key'])}", e.get("state", "?")]
     if e.get("head"):
@@ -12519,9 +12531,11 @@ def land_line(e: dict, now: float) -> str:
     elif isinstance(e.get("wakeAt"), (int, float)) and e["state"] == "waiting":
         bits.append(f"{'woke' if e['wakeAt'] <= now else 'wakes'} {utc_clock(e['wakeAt'])}")
     held = e.get("latchHeld") or {}
-    if held and e["state"] in ("queued", "waiting"):
+    if held and e["state"] in ("queued", "waiting") and latch is LAND_LATCH_READ:
+        latch = land_latch(now, land_budget_reading)
+    if held and e["state"] in ("queued", "waiting") and latch is not None:
         # A due land the login's latch skips says so, never a silent wait past its wake (LandQueue.hold)
-        bits.append(f"held by the login latch until {time.strftime('%H:%MZ', time.gmtime(float(held.get('until') or 0)))}"
+        bits.append(f"held by the login latch until {time.strftime('%H:%MZ', time.gmtime(float(latch[1])))}"
                     f" ({held.get('windows')} window{'s' if held.get('windows') != 1 else ''}, due since "
                     f"{utc_clock(float(held.get('dueSince') or 0))})")
     elif (e.get("dueLate") or {}) and e["state"] in ("queued", "waiting"):
@@ -12654,7 +12668,7 @@ def cmd_land_status(target: str | None, as_json: bool) -> int:
         print(f"glaeda land: parked until {time.strftime('%H:%MZ', time.gmtime(latch[1]))} (quota): the login's "
               f"{'REST' if latch[0] == 'rest' else 'GraphQL'} latch holds; no entry is judged before it")
     for e in entries:
-        print(land_line(e, now))
+        print(land_line(e, now, latch))
         if target:
             for h in e.get("history") or []:
                 extra = " ".join(f"{k}={v}" for k, v in h.items() if k not in ("at", "event"))
