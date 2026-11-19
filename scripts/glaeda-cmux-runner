@@ -3308,9 +3308,18 @@ LAN_RELAY_NC = "/usr/bin/nc"
 LAN_RELAY_CONNECT_S = 5
 LAN_RELAY_IDLE_S = 900  # an ssh session quiet this long is closed; ssh's ServerAliveInterval keeps a live one open
 SOCKET_PATH_MAX = 103  # sockaddr_un.sun_path on macOS is 104 bytes with its NUL
+# LAN_RELAY_ADAPTERS: a lanRelay list (one host's adapter addresses, one port) runs Apple's /bin/sh with this fixed
+# loop instead of nc alone. It tries /usr/bin/nc to each declared address in order and stops at the first that
+# connects: nc exits 1 only when it could not connect (or set up), and once connected it exits with the session's
+# status, which ends the loop. Nothing waits on stdin before a connect, so the next address gets the client's bytes
+# intact. The addresses and port are positional arguments the manifest validated, never part of the script, and
+# both programs are Apple's, so the relay still has no non-Apple ancestor. A single address keeps plain nc.
+LAN_RELAY_SH = "/bin/sh"
+LAN_RELAY_LOOP = ('c=$1 w=$2 p=$3; shift 3; for a do /usr/bin/nc -G "$c" -w "$w" "$a" "$p"; s=$?; '
+                  '[ "$s" -eq 1 ] || exit "$s"; done; exit 1')
 
 
-def relay_of(ctx: Any) -> str | None:
+def relay_of(ctx: Any) -> str | list[str] | None:
     return (dedicated_of(ctx) or {}).get("lanRelay")
 
 
@@ -3328,10 +3337,16 @@ def relay_plist_path(ctx: Context) -> Path | None:
 
 
 def relay_plist(ctx: Context) -> dict[str, Any]:
-    address, port = relay_of(ctx).rsplit(":", 1)
+    relay = relay_of(ctx)
+    if isinstance(relay, list):  # LAN_RELAY_ADAPTERS: one port (glaeda_fleet_labels.lan_relay checked it)
+        port = relay[0].rsplit(":", 1)[1]
+        argv = [LAN_RELAY_SH, "-c", LAN_RELAY_LOOP, "glaeda-lan-relay", str(LAN_RELAY_CONNECT_S),
+                str(LAN_RELAY_IDLE_S), port, *(r.rsplit(":", 1)[0] for r in relay)]
+    else:
+        address, port = relay.rsplit(":", 1)
+        argv = [LAN_RELAY_NC, "-G", str(LAN_RELAY_CONNECT_S), "-w", str(LAN_RELAY_IDLE_S), address, port]
     return {"Label": relay_label(ctx),
-            "ProgramArguments": [LAN_RELAY_NC, "-G", str(LAN_RELAY_CONNECT_S), "-w", str(LAN_RELAY_IDLE_S),
-                                 address, port],
+            "ProgramArguments": argv,
             "inetdCompatibility": {"Wait": False},
             "Sockets": {"Listener": {"SockPathName": os.fspath(relay_socket(ctx)), "SockPathMode": 0o600,
                                      "SockType": "stream"}},

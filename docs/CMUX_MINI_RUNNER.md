@@ -1514,12 +1514,20 @@ declare `"lanRelay": "A.B.C.D:PORT"`, one private (RFC 1918) address and port, a
 - Nothing a job sends chooses the destination, and the address is in the member's manifest entry, never in a job.
 - Each connection ends at either side's EOF, after 5 s with no connect, or after 900 s with no byte either way. Between
   connections launchd only holds the socket.
+- One host with several wired adapters (one per Studio Display, so its LAN address depends on which display it is
+  plugged into) may list them instead: `"lanRelay": ["A.B.C.D:PORT", "A.B.C.E:PORT"]`, at most 4, distinct, every one RFC 1918, all on one port
+  (`LAN_RELAY_ADAPTERS`). Per connection launchd then starts Apple's `/bin/sh` with a fixed loop that runs
+  `/usr/bin/nc -G 5 -w 900 ADDRESS PORT` for each address in order and stops at the first that connects (nc exits 1
+  only when it could not connect; a connected session ends the loop whatever its status). The addresses are
+  arguments, never script text, and no name is resolved, so the trust stays these declared addresses of one host,
+  one port. A single string, or a list of one, keeps plain nc.
 - Refused: any address outside RFC 1918, an entry without `trustedRef` (so a pull request's code never runs beside the
   relay), and a member without `runner.dedicatedOnly` (so no other runner of the same user shares the Mac).
 - `glaeda-cmux-runner-fleet --apply --hosts M` installs it. Dropping the key, or `--uninstall`, boots it out and
   removes its plist and socket. mini-health counts it as glaeda's (`com.teamleaderleo.glaeda.*`).
 
-This deliberately crosses macOS Local Network privacy for one address and port on an owner-only mini.
+This deliberately crosses macOS Local Network privacy for one host (one address, or its declared adapter addresses)
+and one port on an owner-only mini.
 
 ## 2e2. Other repositories on the same minis (org scope)
 
