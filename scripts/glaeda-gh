@@ -12439,7 +12439,12 @@ class LandQueue:
                             {"pr": self.url(e), "queuedBy": e.get("queuedBy") or ""})
             return
         acpmux = self.path("acpmux", Path(shutil.which("acpmux", path=self.env()["PATH"]) or "acpmux"))
-        argv = [os.fspath(acpmux), "send", "--no-wait", to, message]
+        # A notice from a named sender, never a bare send: acpmux records a bare send as the person's own words, and
+        # leo-asks filed ~30 of these as Leo's asks (2026-11-19 12:28-12:31Z, Leo: "This needs to shut up").
+        title = land_trim(message, 200)
+        severity = "info" if message.startswith(f"glaeda land: {self.url(e)} merged") else "warn"
+        argv = [os.fspath(acpmux), "send", "--no-wait", to, "--notice", "--severity", severity, "--sender", LAND_TAG,
+                "--title", title] + ([message] if title != message else [])
 
         def send() -> None:
             got = self.call(argv, LAND_NOTIFY_DEADLINE)
