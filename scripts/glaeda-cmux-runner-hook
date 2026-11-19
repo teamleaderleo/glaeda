@@ -14418,8 +14418,11 @@ def main(argv: list[str] | None = None) -> int:
                 repo, args.home_repo, os.environ.get("GITHUB_EVENT_NAME"),
                 os.environ.get("GITHUB_REF"), event, os.environ.get("GITHUB_JOB", ""), job_workflow()))
             cap = slot_capacity_wait(cap, args.dev_compile_runner)
-            cap = bounded_wait(cap, fast_tier_capacity_wait(repo, args.home_repo, job_workflow(),
-                                                            os.environ.get("GITHUB_JOB", "")))
+            fast_bound = fast_tier_capacity_wait(repo, args.home_repo, job_workflow(), os.environ.get("GITHUB_JOB", ""))
+            cap = bounded_wait(cap, fast_bound)
+            if fast_bound is not None:
+                print(f"{PREFIX}: the fast tier: it waits {fast_bound:g} s at most for capacity (FAST_TIER_WAIT), "
+                      "then is refused so the owned-pool rescue re-runs it inside its 20-minute timeout", flush=True)
             tier = job_tier(os.environ.get("GITHUB_EVENT_NAME"), os.environ.get("GITHUB_REF"),
                             os.environ.get("GITHUB_REPOSITORY"), event, os.environ.get("GITHUB_WORKFLOW_REF"),
                             os.environ.get("GITHUB_JOB")) or stack_blocker_tier(
