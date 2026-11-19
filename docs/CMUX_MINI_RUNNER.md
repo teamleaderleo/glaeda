@@ -1542,6 +1542,16 @@ account's session and a token (cmuxterm-hq#13863): a PR job on the same Mac then
   account (`--capacity-dir`), never the member user's shared capacity directory, and takes no capacity unit, like every
   dedicated runner. It writes no dedicatedOnly marker. The member user's runners never see it: their disk reserve,
   idle eviction and `glaeda-disk` work in their own home.
+- A protected toolchain (PROTECTED_TOOLCHAIN). The member user's PR jobs can write what that user owns (Homebrew
+  under `/opt/homebrew`, an Xcode it installed, its home), so a user entry execs none of it. The fleet runs the
+  installer as `PATH=/usr/bin:/bin:/usr/sbin:/sbin DEVELOPER_DIR=/Library/Developer/CommandLineTools /usr/bin/python3`.
+  The hooks run on `/usr/bin/python3` (unless `--python` names another one that passes the check). The runner agent,
+  the listener gate, the watch agent and `.path` hold only the system directories plus the entry's declared `PATH`
+  entries, with `DEVELOPER_DIR` pinned to the Command Line Tools. Before anything else, `--dedicated` checks the
+  installer's interpreter, the hooks' interpreter, the Command Line Tools' `python3`, every PATH directory and each
+  admit and watch command. Each path, its resolved target and every directory above them must be owned by root or by
+  the account itself, with no group or other write bit. If any fails, the whole install is blocked (`toolchain`,
+  `missing: protected-toolchain`). A job that needs Xcode chooses one itself; the probes should not need one.
 - Not reached from the member user: `glaeda-update` refreshes only that user's hooks, and mini-health, idle-warm and
   `glaeda-disk` read only its home. A hook change reaches a user entry by `glaeda-cmux-runner-fleet --apply`.
 

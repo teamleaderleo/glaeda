@@ -918,6 +918,10 @@ def apply_dedicated(member: str, entry: dict[str, Any], extra: list[str]) -> dic
               f"--manifest ~/{REMOTE_DIR}/mini-fleet.json --member {_quote(member)} --dedicated {_quote(entry['name'])} "
               f"--latest-runner-version {_quote(version)} --latest-runner-sha256 {_quote(sha)} {observed}--output json "
               + " ".join(_quote(a) for a in extra if a != "--headless"))
+    if entry.get("user"):
+        # PROTECTED_TOOLCHAIN (glaeda-cmux-runner): the installer runs on Apple's python3 against the root-owned Command
+        # Line Tools with only the system PATH, never a Homebrew python the member user can replace
+        remote = f"PATH={USER_PATH} DEVELOPER_DIR={USER_DEVELOPER_DIR} {USER_PYTHON} {remote}"
     code, out, err = run([*ssh_argv(member, entry.get("user")), remote], APPLY_TIMEOUT_S, stdin=token + "\n")
     del token
     try:
@@ -935,6 +939,9 @@ def apply_dedicated(member: str, entry: dict[str, Any], extra: list[str]) -> dic
 # DEDICATED_USER: what an entry with a user needs on the member before its apply, outside glaeda (a root step per
 # host): that account reachable over ssh with the operator's key. Typed, so the operator sees the missing step.
 USER_SSH_MISSING = "user-ssh"
+USER_PATH = "/usr/bin:/bin:/usr/sbin:/sbin"  # glaeda-cmux-runner PROTECTED_PATH
+USER_PYTHON = "/usr/bin/python3"  # PROTECTED_PYTHON
+USER_DEVELOPER_DIR = "/Library/Developer/CommandLineTools"  # PROTECTED_DEVELOPER_DIR
 
 
 def user_stage(member: str, entry: dict[str, Any], manifest: dict[str, Any], scratch: Path,

@@ -471,6 +471,9 @@ class FleetTest(unittest.TestCase):
         applies = [c for c in as_user if "--dedicated" in c["remote"]]
         self.assertEqual(len(applies), 1)
         self.assertIn("--dedicated hq-two-mac-a", applies[0]["remote"])
+        self.assertTrue(applies[0]["remote"].startswith(
+            "PATH=/usr/bin:/bin:/usr/sbin:/sbin DEVELOPER_DIR=/Library/Developer/CommandLineTools /usr/bin/python3 "
+            "~/glaeda-runner/scripts/glaeda-cmux-runner "), "a protected interpreter, never Homebrew's")
         self.assertIn("--repo manaflow-ai/other", applies[0]["remote"])
         self.assertNotIn("--org", applies[0]["remote"])
         self.assertEqual(applies[0]["stdin"].strip(), TOKEN)

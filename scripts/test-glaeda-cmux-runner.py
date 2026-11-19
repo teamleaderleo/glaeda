@@ -17920,7 +17920,8 @@ class DedicatedRunnerTest(unittest.TestCase):
             self.assertEqual(RunnerTest.tree(self), before, "nothing changed")
         self.home.chmod(0o755)
         with mock.patch.object(cr.pwd, "getpwuid", return_value=fake_pw), \
-                mock.patch.object(cr, "current_user", return_value="cmuxci-gui-01"):
+                mock.patch.object(cr, "current_user", return_value="cmuxci-gui-01"), \
+                mock.patch.object(cr, "untrusted_exec", return_value=None):
             receipt = self.invoke("--apply", "--manifest", os.fspath(path), "--member", "mini-std",
                                   "--dedicated", "hq-two-mac-a")
         self.assertTrue(receipt["ready"], receipt["blocking"])
@@ -17939,10 +17940,104 @@ class DedicatedRunnerTest(unittest.TestCase):
         self.assertFalse((self.home / ".local/state/glaeda/cmux-runner" / cr.DEDICATED_ONLY_MARKER).exists())
         # a re-run finds it private and changes nothing there
         with mock.patch.object(cr.pwd, "getpwuid", return_value=fake_pw), \
-                mock.patch.object(cr, "current_user", return_value="cmuxci-gui-01"):
+                mock.patch.object(cr, "current_user", return_value="cmuxci-gui-01"), \
+                mock.patch.object(cr, "untrusted_exec", return_value=None):
             again = self.invoke("--apply", "--manifest", os.fspath(path), "--member", "mini-std",
                                 "--dedicated", "hq-two-mac-a")
         self.assertEqual(self.by_kind(again)["private"]["state"], "unchanged")
+
+    def test_the_toolchain_check_takes_only_root_or_self_owned_unwritable_paths(self) -> None:
+        """PROTECTED_TOOLCHAIN (review of 7c91dc6b): a user entry execs nothing another account can replace. Each path,
+        its target and every directory above must be owned by root or this account, with no group or other write."""
+        me = 5101
+        d, f, link = stat.S_IFDIR, stat.S_IFREG, stat.S_IFLNK
+
+        def table(**extra):
+            entries = {"/": (0, d | 0o755), "/usr": (0, d | 0o755), "/usr/bin": (0, d | 0o755),
+                       "/usr/bin/python3": (0, f | 0o755), "/opt": (0, d | 0o755),
+                       "/opt/homebrew": (501, d | 0o775), "/opt/homebrew/bin": (501, d | 0o775),
+                       "/opt/homebrew/bin/python3": (501, link | 0o755), "/Users": (0, d | 0o755),
+                       "/Users/gui": (me, d | 0o700), "/Users/gui/bin": (me, d | 0o755),
+                       "/Users/gui/bin/tool": (me, f | 0o755), "/Users/gui/open": (me, d | 0o777),
+                       "/Users/gui/cmux-made": (501, f | 0o755), **extra}
+
+            def lstat(path):
+                if path not in entries:
+                    raise FileNotFoundError(path)
+                uid, mode = entries[path]
+                return mock.Mock(st_uid=uid, st_mode=mode)
+            return lstat
+        lstat = table()
+        with mock.patch.object(cr.os.path, "realpath", side_effect=lambda x: x):
+            self.assertIsNone(cr.untrusted_exec("/usr/bin/python3", me, lstat))
+            self.assertIsNone(cr.untrusted_exec("/Users/gui/bin/tool", me, lstat))
+            self.assertIn("owned by uid 501", cr.untrusted_exec("/opt/homebrew/bin/python3", me, lstat))
+            self.assertIn("owned by uid 501", cr.untrusted_exec("/Users/gui/cmux-made", me, lstat))
+            self.assertIn("writable by group or other", cr.untrusted_exec("/Users/gui/open", me, lstat))
+            self.assertIn("cannot be read", cr.untrusted_exec("/usr/bin/missing", me, lstat))
+            self.assertEqual(cr.untrusted_exec("relative/tool", me, lstat), "not an absolute path")
+            # an owner-written dir that is group-writable still fails (macOS /Applications is root:admin 0775)
+            self.assertIn("writable by group or other",
+                          cr.untrusted_exec("/usr/bin/python3", me, table(**{"/usr/bin": (0, d | 0o775)})))
+        # a symlink whose target fails is refused through its target
+        with mock.patch.object(cr.os.path, "realpath",
+                               side_effect=lambda x: "/opt/homebrew/bin/python3" if x == "/usr/bin/python3" else x):
+            self.assertIn("owned by uid 501", cr.untrusted_exec("/usr/bin/python3", me, lstat))
+
+    def test_a_user_entry_runs_a_protected_toolchain_and_refuses_an_unprotected_one(self) -> None:
+        """PROTECTED_TOOLCHAIN: with no --python a user entry's hooks run Apple's /usr/bin/python3; its agent, watch,
+        listener gate and .path hold only the system PATH and DEVELOPER_DIR is the Command Line Tools. A declared PATH
+        entry, an admit command or an interpreter that fails the check blocks the whole install, typed."""
+        fake_pw = mock.Mock(pw_dir=os.fspath(self.home))
+        entry = {**HQ_USER, "watch": ["/usr/bin/true"], "env": {"PATH": "~/.local/bin"}}
+        manifest = dedicated_manifest(entry)
+        path = self.state / "mini-fleet.json"
+        path.write_text(json.dumps(manifest))
+        argv = ["--output", "json", "--gh", os.fspath(self.gh), "--apply", "--manifest", os.fspath(path),
+                "--member", "mini-std", "--dedicated", "hq-two-mac-a"]
+        out = io.StringIO()
+        with mock.patch.object(cr.pwd, "getpwuid", return_value=fake_pw), \
+                mock.patch.object(cr, "current_user", return_value="cmuxci-gui-01"), \
+                mock.patch.object(cr, "untrusted_exec", return_value=None), contextlib.redirect_stdout(out):
+            self.assertEqual(cr.main(argv), 0, out.getvalue()[-2000:])
+        receipt = json.loads(out.getvalue())
+        self.assertEqual(receipt["actions"][0]["kind"], "toolchain")
+        self.assertEqual(receipt["actions"][0]["state"], "unchanged")
+        runner = self.home / "actions-runner-glaeda-hq-two-mac-a"
+        hooks = runner / cr.HOOK_DIR
+        self.assertTrue((hooks / "job-started.sh").read_text().splitlines()[-1].startswith("exec /usr/bin/python3 "))
+        listen = (hooks / "listen.sh").read_text()
+        self.assertIn(f"export DEVELOPER_DIR={cr.PROTECTED_DEVELOPER_DIR}\nexport PATH={cr.PROTECTED_PATH}\n", listen)
+        label = "com.teamleaderleo.glaeda.cmux-runner.dedicated.hq-two-mac-a"
+        agent = plistlib.loads((self.home / "Library/LaunchAgents" / f"{label}.plist").read_bytes())
+        self.assertEqual(agent["EnvironmentVariables"]["PATH"], cr.PROTECTED_PATH)
+        self.assertEqual(agent["EnvironmentVariables"]["DEVELOPER_DIR"], cr.PROTECTED_DEVELOPER_DIR)
+        watch = plistlib.loads((self.home / "Library/LaunchAgents" / f"{label}.watch.plist").read_bytes())
+        self.assertEqual(watch["EnvironmentVariables"]["PATH"], f"{self.home}/.local/bin:{cr.PROTECTED_PATH}")
+        dot_path = (runner / ".path").read_text().strip().split(":")
+        self.assertEqual(dot_path, [f"{self.home}/.local/bin", *cr.PROTECTED_PATH.split(":")])
+        for dirs in (dot_path, watch["EnvironmentVariables"]["PATH"].split(":"), agent["EnvironmentVariables"]["PATH"].split(":")):
+            self.assertFalse([e for e in dirs if e.startswith(("/opt/homebrew", "/usr/local"))])
+        # the checked set: the interpreters, the Command Line Tools' python3, each PATH dir, the admit and watch commands
+        with mock.patch.object(cr.pwd, "getpwuid", return_value=fake_pw), \
+                mock.patch.object(cr, "current_user", return_value="cmuxci-gui-01"):
+            checked = []
+
+            def record(p, uid, lstat=None):
+                checked.append(p)
+                return "owned by uid 501, not root or this account" if p == f"{self.home}/.local/bin" else None
+            with mock.patch.object(cr, "untrusted_exec", side_effect=record), \
+                    contextlib.redirect_stdout(io.StringIO()) as out2:
+                code = cr.main([*argv[:-1], "hq-two-mac-a"])
+        self.assertEqual(code, 1)
+        doc = json.loads(out2.getvalue())
+        tool = doc["actions"][0]
+        self.assertEqual((tool["kind"], tool["state"], tool["missing"]), ("toolchain", "blocked", "protected-toolchain"))
+        self.assertIn(".local/bin", tool["note"])
+        for want in ("/usr/bin/python3", f"{cr.PROTECTED_DEVELOPER_DIR}/usr/bin/python3", "/usr/bin", "/sbin",
+                     "/usr/bin/true", sys.executable):
+            self.assertIn(want, checked)
+        self.assertFalse([a for a in doc["actions"][1:] if a.get("applied")], "nothing applied past a blocked toolchain")
 
     def test_an_entry_without_a_user_refuses_another_account(self) -> None:
         """An entry with no user is the member user's: run as another account (a hidden GUI user) it refuses."""

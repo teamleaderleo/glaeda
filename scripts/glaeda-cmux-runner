@@ -834,6 +834,8 @@ def hook_wrappers(ctx: Context) -> dict[str, bytes]:
     # (the hook's listener_env does the same for the run.sh the gate starts).
     xcode_apps = (ctx.member or {}).get("xcodeApps") or []
     toolchain_env = "unset SDKROOT TOOLCHAINS\n" + (
+        f"export DEVELOPER_DIR={PROTECTED_DEVELOPER_DIR}\nexport PATH={PROTECTED_PATH}\n"
+        if user_entry(ctx) else "") + (
         f"export DEVELOPER_DIR={shlex.quote(os.fspath(Path(xcode_apps[0]) / 'Contents/Developer'))}\n"
         if xcode_apps else "")
     home = ctx.home if isinstance(getattr(ctx, "home", None), Path) else Path.home()
@@ -943,7 +945,7 @@ def hook_wrappers(ctx: Context) -> dict[str, bytes]:
 def agent_plist(ctx: Context) -> dict[str, Any]:
     # Exactly cmux's workload PATH (cmux_fleet_bootstrap CMUX_WORKLOAD_TOOL_PATH): a tool under the
     # user's home, such as an old ~/.local/bin/zig, must never shadow the one the class accepted.
-    path = WORKLOAD_PATH
+    path = PROTECTED_PATH if user_entry(ctx) else WORKLOAD_PATH
     if ctx.headless:
         # A system daemon survives a reboot without a GUI login. The helper waits for a
         # listener left by an in-flight apply, then hands the registration to listen.sh.
@@ -967,6 +969,9 @@ def agent_plist(ctx: Context) -> dict[str, Any]:
             "ACTIONS_RUNNER_HOOK_JOB_STARTED": os.fspath(ctx.hook_dir / "job-started.sh"),
             "ACTIONS_RUNNER_HOOK_JOB_COMPLETED": os.fspath(ctx.hook_dir / "job-completed.sh"),
             "PATH": path,
+            # PROTECTED_TOOLCHAIN: /usr/bin/python3 and the other xcrun shims resolve to the root-owned Command Line
+            # Tools, never an Xcode another admin account can write
+            **({"DEVELOPER_DIR": PROTECTED_DEVELOPER_DIR} if user_entry(ctx) else {}),
         },
         "StandardOutPath": os.fspath(ctx.log_path),
         "StandardErrorPath": os.fspath(ctx.logs / f"glaeda-cmux-runner{ctx.suffix}.err"),
@@ -1221,6 +1226,9 @@ def plan_install(ctx: Context, receipt: dict[str, Any] | None) -> list[dict[str,
     if conflict:
         return [{"kind": "receipt", "path": os.fspath(ctx.receipt_path), "state": "blocked", "note": conflict}]
     actions: list[dict[str, Any]] = []
+    toolchain = plan_toolchain(ctx)
+    if toolchain is not None:  # PROTECTED_TOOLCHAIN: blocked here, nothing below is applied
+        actions.append(toolchain)
     ours = owned_dir(ctx, receipt)
     configured = (ctx.runner_dir / ".runner").is_file()
     exists = ctx.runner_dir.exists()
@@ -1508,13 +1516,14 @@ def download_and_unpack(ctx: Context, act: dict[str, Any], install_id: str) -> N
     act["applied"] = True
 
 
-def runner_path(home: Path, *paths: str) -> str:
+def runner_path(home: Path, *paths: str, protected: bool = False) -> str:
     """The PATH a runner's .path keeps: Homebrew first (the workload PATH's order), every entry the given PATHs
-    already had in their order, then the runner user's ~/.cargo/bin and the system directories, each once."""
-    entries = ["/opt/homebrew/bin", "/usr/local/bin"]
+    already had in their order, then the runner user's ~/.cargo/bin and the system directories, each once. protected
+    (a user entry, PROTECTED_TOOLCHAIN): the given entries, then only the system directories."""
+    entries = [] if protected else ["/opt/homebrew/bin", "/usr/local/bin"]
     for path in paths:
         entries += path.split(":")
-    entries += [os.fspath(home / ".cargo/bin"), *WORKLOAD_PATH.split(":")]
+    entries += PROTECTED_PATH.split(":") if protected else [os.fspath(home / ".cargo/bin"), *WORKLOAD_PATH.split(":")]
     return ":".join(dict.fromkeys(e for e in entries if e))
 
 
@@ -1533,7 +1542,10 @@ def keep_runner_path(ctx: Context, before: str) -> None:
     (2026-10-26). Merge the .path that was there before with the new one and make sure Homebrew and ~/.cargo/bin
     are on it."""
     after = read_runner_path(ctx.runner_dir)
-    merged = runner_path(ctx.home, before, after)
+    merged = runner_path(ctx.home, before, after, protected=user_entry(ctx))
+    if user_entry(ctx):  # config.sh's PATH may name Homebrew; a user entry's .path holds only checked directories
+        merged = runner_path(ctx.home, *[":".join(e for e in (x or "").split(":") if e in declared_path(ctx))
+                                         for x in (before, after)], protected=True)
     if merged != after:
         write_atomic(ctx.runner_dir / ".path", (merged + "\n").encode("utf-8", "surrogateescape"), 0o644,
                      make_parent=False)
@@ -3232,6 +3244,8 @@ def dedicated_context(ctx: Context, args: argparse.Namespace, manifest: Any) -> 
     ctx.org, ctx.repo, ctx.group = entry["org"], entry["repo"], entry["group"]
     ctx.labels, ctx.labels_requested = list(entry["labels"]), True
     ctx.capacity_units = 0  # never in the mini's capacity ledger: its jobs are the builder's, admitted by its hook
+    if entry.get("user") and not args.python:
+        ctx.python = PROTECTED_PYTHON  # PROTECTED_TOOLCHAIN: Apple's shim, never a Homebrew python
     if entry.get("user"):
         # DEDICATED_USER: its hook keeps the ledger files it writes (a nightly-style disk waiter, the disk-low turn)
         # under this account's own 0700 state, never in the member user's shared capacity directory, which it cannot
@@ -3284,6 +3298,81 @@ def dedicated_user_refusal(ctx: Context, manifest: Any, member: str) -> str | No
         return (f"runner.dedicated {entry.get('name')} declares no user, so it is {owner}'s runner, not {me}'s; "
                 "nothing changed")
     return None
+
+
+# PROTECTED_TOOLCHAIN (review of 7c91dc6b): a user entry's runner holds a session and a token the member user's PR
+# jobs must never reach, and those jobs can write whatever the member user owns: Homebrew (/opt/homebrew, given to that
+# user by fleet provisioning), an Xcode it installed, its home. So everything the runner, its hooks and its agents exec
+# comes from a protected toolchain: Apple's /usr/bin/python3 with DEVELOPER_DIR pinned to the root-owned Command Line
+# Tools, a PATH of only the system directories (plus declared entries that pass the check), and admit and watch
+# commands that pass it. The check (untrusted_exec): the path, its resolved target and every directory above either are
+# owned by root or by this account and writable by neither group nor other. --dedicated on a user entry plans a
+# toolchain step that blocks the whole install, typed, when anything fails it.
+PROTECTED_PATH = "/usr/bin:/bin:/usr/sbin:/sbin"
+PROTECTED_PYTHON = "/usr/bin/python3"
+PROTECTED_DEVELOPER_DIR = "/Library/Developer/CommandLineTools"
+TOOLCHAIN_MISSING = "protected-toolchain"
+
+
+def user_entry(ctx: Any) -> bool:
+    """ctx is a runner.dedicated entry with a user (DEDICATED_USER)."""
+    return bool((dedicated_of(ctx) or {}).get("user"))
+
+
+def declared_path(ctx: Context) -> list[str]:
+    """The entry's declared PATH entries, expanded."""
+    return [e for e in dedicated_word(ctx, ((dedicated_of(ctx) or {}).get("env") or {}).get("PATH", "")).split(":") if e]
+
+
+def untrusted_exec(path: str, uid: int, lstat: Callable[[str], os.stat_result] = os.lstat) -> str | None:
+    """Why `path` is not safe for a user entry to exec or search (PROTECTED_TOOLCHAIN), or None. The path, its resolved
+    target and every directory above either must exist and be owned by root or uid, with no group or other write bit
+    (a symlink's own mode is not checked; its directory is). Pure but for lstat (and realpath)."""
+    if not path.startswith("/"):
+        return "not an absolute path"
+    for target in dict.fromkeys([os.path.normpath(path), os.path.realpath(path)]):
+        parts = Path(target).parts
+        for depth in range(1, len(parts) + 1):
+            here = os.path.join(*parts[:depth])
+            try:
+                st = lstat(here)
+            except OSError as error:
+                return f"{here}: cannot be read ({type(error).__name__})"
+            if st.st_uid not in (0, uid):
+                return f"{here} is owned by uid {st.st_uid}, not root or this account"
+            if not stat.S_ISLNK(st.st_mode) and st.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+                return f"{here} is writable by group or other (mode {st.st_mode & 0o7777:o})"
+    return None
+
+
+def toolchain_paths(ctx: Context) -> list[str]:
+    """Everything a user entry's runner execs or searches: the installer's and the hooks' interpreter (and, for Apple's
+    shim, the Command Line Tools' python3 it runs), every PATH directory, and each absolute word of its admit and watch
+    commands that names a file."""
+    paths = [sys.executable, ctx.python or PROTECTED_PYTHON]
+    if (ctx.python or PROTECTED_PYTHON) == PROTECTED_PYTHON:
+        paths.append(f"{PROTECTED_DEVELOPER_DIR}/usr/bin/python3")
+    paths += runner_path(ctx.home, ":".join(declared_path(ctx)), protected=True).split(":")
+    entry = dedicated_of(ctx) or {}
+    for key in ("admit", "watch"):
+        words = [dedicated_word(ctx, w) for w in entry.get(key) or []]
+        paths += [w for i, w in enumerate(words) if i == 0 or (w.startswith("/") and os.path.isfile(w))]
+    return list(dict.fromkeys(paths))
+
+
+def plan_toolchain(ctx: Context) -> dict[str, Any] | None:
+    """The PROTECTED_TOOLCHAIN step of a user entry's install, first: blocked, typed, when any path fails the check."""
+    if not user_entry(ctx):
+        return None
+    refused = [{"path": ctx.show(p), "why": why} for p in toolchain_paths(ctx)
+               if (why := untrusted_exec(p, os.getuid()))]
+    act = {"kind": "toolchain", "state": "blocked" if refused else "unchanged", "python": ctx.python,
+           "path": PROTECTED_PATH, "developerDir": PROTECTED_DEVELOPER_DIR, "refused": refused}
+    if refused:
+        act["missing"] = TOOLCHAIN_MISSING
+        act["note"] = ("a user entry execs only root- or self-owned, group/other-unwritable paths: "
+                       + "; ".join(f"{r['path']}: {r['why']}" for r in refused))[:600]
+    return act
 
 
 def private_paths(ctx: Context) -> list[Path]:
@@ -3348,7 +3437,8 @@ def watch_env(ctx: Context) -> dict[str, str]:
     """The watch loop's env: the entry's env, with a declared PATH folded into the workload PATH (runner_path), never
     replacing it."""
     env = dedicated_env(ctx)
-    return {**env, "PATH": runner_path(ctx.home, env.get("PATH", ""))}
+    return {**env, "PATH": runner_path(ctx.home, env.get("PATH", ""), protected=user_entry(ctx)),
+            **({"DEVELOPER_DIR": PROTECTED_DEVELOPER_DIR} if user_entry(ctx) else {})}
 
 
 def watch_label(ctx: Context) -> str:
@@ -3520,10 +3610,13 @@ def keep_runner_env(ctx: Context, write: bool = True) -> bool:
     declared = [e for e in env.pop("PATH", "").split(":") if e]
     current = read_runner_path(ctx.runner_dir)
     kept_path = [e for e in current.split(":") if e and (e not in previous_path or e in declared)]
-    base = runner_path(ctx.home)  # what every runner's .path has anyway: never owned, never removed
+    if user_entry(ctx):  # PROTECTED_TOOLCHAIN: only checked directories stay on a user entry's .path
+        kept_path = [e for e in kept_path if e in declared or e in PROTECTED_PATH.split(":")]
+    # what every runner's .path has anyway: never owned, never removed
+    base = runner_path(ctx.home, protected=user_entry(ctx))
     owned_path = [e for e in declared if e not in base.split(":") and (e not in kept_path or e in previous_path)]
     if declared or previous_path:
-        merged = runner_path(ctx.home, ":".join(declared), ":".join(kept_path))
+        merged = runner_path(ctx.home, ":".join(declared), ":".join(kept_path), protected=user_entry(ctx))
         if merged != current:
             changed = True
             if write:
