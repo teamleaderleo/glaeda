@@ -22898,6 +22898,37 @@ class LandTest(Base):
         self.assertEqual(gg.latch_free_reason(subprocess.CompletedProcess([], 2, "", "")),
                          "the latch-free check exited 2")
 
+    def test_a_lane_vm_judges_an_owner_the_brokers_read_app_covers_under_the_login_mark(self):
+        # gcp-agent-lane-1, 2026-11-19 12:28-14:25Z: a copied login mark held 16 lands four windows; the ready command
+        # can never say yes on a lane VM (no App credential there by design), though the broker answers a pinned
+        # land's reads (LANE_GH_LAND) from its read App, which cosmic-gray judged the same PRs on.
+        self.latch_dir.mkdir(parents=True, exist_ok=True)
+        (self.latch_dir / "rest-exhausted.json").write_text(json.dumps(
+            {"until": self.t + 3000, "at": self.t, "source": "x-ratelimit-reset", "by": "lane-gh"}))
+        self.w.config["latchFreeCommand"] = ["/fake/ready", "--owner", "{owner}"]
+        self.w.config["brokerReadOwners"] = ["O"]
+        asked: list[list[str]] = []
+        run = self.w.run
+
+        def ready(argv, timeout, env):
+            if argv[0] == "/fake/ready":
+                asked.append(list(argv))
+                return subprocess.CompletedProcess(argv, 1, "", "gh-app-token: not ready for o: no landing-role App")
+            return run(argv, timeout, env)
+        self.q.run = ready
+        self.q.broker_client = lambda: True
+        self.pr(LA)
+        self.pr(LA, key="pr:p/r#2")
+        self.land()
+        self.land("p/r#2")
+        self.w.answers.append(ok_answer(LA))
+        self.tick()
+        self.tick()
+        self.assert_merged_at(LA)  # o: the broker's read App covers it, judged and merged under the copied mark
+        self.assertEqual(self.q.entries["pr:p/r#2"]["state"], "queued")  # p: not covered, held as before
+        self.assertIn("covers o, not p", self.q.latch_free_why(self.q.entries["pr:p/r#2"]))
+        self.assertEqual(asked, [], "a broker client never asks the ready command")
+
     def test_the_pool_line_says_where_every_open_land_is(self):
         # huge-blue, 2026-11-18 16:11Z on: "busy 0, gated 0, snapshotWaiting 2, open 399" every 5 min, and nothing
         # said that the login's GraphQL latch skipped all 399 (no unlatched source answered for any owner).

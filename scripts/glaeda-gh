@@ -11160,7 +11160,17 @@ class LandQueue:
         argv = self.latch_free_argv(owner)
         free, why = False, "no latch-free check on this host (land.json latchFreeCommand, or gh_app_token.py " \
             "beside merge_hold.py)"
-        if argv is not None:
+        broker = self.broker_read_owners() if self.broker_client() else None
+        if broker is not None:
+            # A lane VM holds no App credential by design, so the ready command always says no here. Its land's reads
+            # carry LANE_GH_LAND (merge_hold land_reads), pass the VM's own copy of the login's mark (lane-gh
+            # land_read) and the broker answers them from its read App for an owner that App is installed on.
+            # gcp-agent-lane-1, 2026-11-19 12:28-14:25Z: 16 lands held four windows by a copied login mark while
+            # cosmic-gray judged the same PRs on the lander App.
+            free = owner in broker
+            why = "" if free else (f"the broker's read pool covers {', '.join(sorted(broker)) or 'no owner'}, "
+                                   f"not {owner}")
+        elif argv is not None:
             got = self.call(argv, LAND_LATCH_FREE_DEADLINE)
             free = got.returncode == 0
             why = "" if free else latch_free_reason(got)
@@ -11174,6 +11184,23 @@ class LandQueue:
         """Why E's owner has no source the latch does not hold, as the latch-free check last said (latch_free)."""
         seen = self.latch_free_seen.get(str(e.get("repo") or "").split("/")[0].lower())
         return (seen[2] if seen and not seen[1] else "") or "the latch-free check gave no reason"
+
+    def broker_read_owners(self) -> set[str] | None:
+        """On a broker client: the owners the lane-gh broker's read Apps are installed on (land.json brokerReadOwners,
+        else every read_apps entry's owners in machines/lane-gh-broker.json beside merge_hold.py's tools/, its on_host
+        entries too), lower case; None when neither says (the ready command decides, as before)."""
+        given = self.config().get("brokerReadOwners")
+        if isinstance(given, list) and all(isinstance(o, str) for o in given):
+            return {o.lower() for o in given}
+        mh, _ = self.merge_hold()
+        doc = read_json(mh.parent.parent / "machines" / "lane-gh-broker.json") if mh is not None else None
+        if not isinstance(doc, dict):
+            return None
+        apps = list(doc.get("read_apps") or [])
+        for host in (doc.get("on_host") or {}).values():
+            if isinstance(host, dict):
+                apps += list(host.get("read_apps") or [])
+        return {str(o).lower() for a in apps if isinstance(a, dict) for o in a.get("owners") or []}
 
     def latch_free_argv(self, owner: str) -> list[str] | None:
         given = self.config().get("latchFreeCommand")
