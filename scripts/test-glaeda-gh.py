@@ -21938,6 +21938,138 @@ class LandTest(Base):
         for path in self.latch_dir.glob("*-exhausted*.json"):
             path.unlink()
 
+    # -- the reset stagger (LAND_RESET_JUDGES_PER_MIN): K held entries, the latch lifts at t=0
+
+    # REST one merge_hold explain costs the login, from the broker host's own log over 11:37-13:37Z on 2026-11-19
+    # (host:glaeda-land: 1473 REST over 191 `pr view` rows, one per judgment): a `pr view` of its 15 fields (2, comments
+    # and reviews over REST), `pulls/N` (~0.7), the head's check-runs (1), combined status (~0.35), Actions runs and
+    # their jobs (~1.5 and ~0.65 charged, the rest 304s). Whole numbers: 2 + 1 + 1 + 1 + 1 + 1 = 7 live. A judgment
+    # handed the daemon's rollup snapshot (MERGE_HOLD_ROLLUP_SNAPSHOT) reads only the `pr view` and `pulls/N` (3) once
+    # merge_hold reads that snapshot (leo-workspace#5702, open): until then every judgment costs 7.
+    EXPLAIN_REST_LIVE = 7
+    EXPLAIN_REST_SNAPSHOT = 3
+
+    def reset_profile(self, k: int, per_minute: int, minutes: int = 10, snapshot_read: bool = True,
+                      daemon_every: float = 60.0) -> dict:
+        """K due entries held by a REST latch (GitHub's x-ratelimit-reset) through one window; it lifts at t=0. The
+        daemon reads every PR watched or nudged once per DAEMON_EVERY in one batched GraphQL read (no REST: its
+        LandSnapshotTest), which keeps each PR's rollup snapshot. Each judgment is answered "merge" and merged.
+        Returns REST per minute after the lift (judgments x EXPLAIN_REST_*), the judgments per minute, and when
+        each PR merged."""
+        self.w.config["resetJudgesPerMinute"] = per_minute
+        self.q = self.queue()
+        pending: set[str] = set()
+        self.q.watch = self.q.peek = pending.add
+        self.q.nudge = pending.add
+        heads = {n: format(0xA0 + n, "040x") for n in range(1, k + 1)}
+        start = self.t
+        for n, head in heads.items():
+            key = f"pr:o/r#{n}"
+            self.w.set_pr(key, land_pr(head), start - 3600)  # the daemon's last read: before the latch
+            self.w.cache[key].update(fp=f"fp{n}", via="graphql", fullAt=start - 3600)
+            self.snaps[key] = {"head": head, "fp": f"fp{n}", "complete": True, "readAt": start - 3600,
+                               "rollup": {"nodes": []}}
+            self.land(f"o/r#{n}")
+        judged: list[tuple[float, int, bool]] = []
+        real = self.w.run
+
+        def run(argv, timeout, env):
+            if argv[1:3] == [self.w.mh, "explain"]:
+                n = int(argv[4])
+                judged.append((self.t, n, gg.LAND_SNAPSHOT_ENV in env))
+                if n in heads:
+                    self.w.answers.append(ok_answer(heads[n]))
+                    self.w.answers[-1][1]["action"].update(number=n)
+            return real(argv, timeout, env)
+        self.q.run = run
+        lift = start + 600
+        self.latch("rest", lift)
+        # the window the latch holds: every entry due and skipped (latchHeld), nothing read for it
+        while self.t < lift:
+            self.tick(5)
+        self.assertEqual(judged, [])
+        self.assertTrue(all(self.q.entries[f"pr:o/r#{n}"].get("latchHeld") for n in heads))
+        self.clear_latch()
+        self.latch("rest", lift)  # the mark stays on disk past its until, as it does on a host (land_latch_spread)
+        next_read = lift
+        while self.t < lift + minutes * 60:
+            if self.t >= next_read:  # the daemon's batched read of every PR it is asked for
+                if snapshot_read:
+                    for key in sorted(pending):
+                        c = self.w.cache[key]
+                        c.update(fetchedAt=self.t, dataAt=self.t, fullAt=self.t)
+                        self.snaps[key]["readAt"] = self.t
+                pending.clear()
+                next_read += daemon_every
+            self.tick(5)
+        rest = [0] * minutes
+        judgments = [0] * minutes
+        for at, _, snap in judged:
+            m = int((at - lift) // 60)
+            if 0 <= m < minutes:
+                rest[m] += self.EXPLAIN_REST_SNAPSHOT if snap else self.EXPLAIN_REST_LIVE
+                judgments[m] += 1
+        live = [0] * minutes
+        for at, _, _ in judged:
+            m = int((at - lift) // 60)
+            if 0 <= m < minutes:
+                live[m] += self.EXPLAIN_REST_LIVE
+        merged = {n: self.q.entries[f"pr:o/r#{n}"]["state"] for n in heads}
+        return {"rest": rest, "restLive": live, "judgments": judgments, "first5": sum(rest[:5]),
+                "first5Live": sum(live[:5]), "snapshots": sum(1 for *_, s in judged if s), "judged": len(judged),
+                "merged": sum(1 for s in merged.values() if s == "merged"),
+                "lastJudgedS": max((at - lift for at, *_ in judged), default=None)}
+
+    def test_held_entries_are_judged_in_a_stagger_after_the_latch_lifts(self):
+        """The broker host, 2026-11-19: ~10 entries "held by the login latch until 12:53Z" were all judged as it
+        lifted, each reading its PR, check-runs and runs' jobs over REST; host:glaeda-land was the login's top REST
+        caller in the 5 minutes after each reset (115 REST in 12:53-12:58Z). The stagger judges at most
+        LAND_RESET_JUDGES_PER_MIN held entries a minute, oldest due first, and every one still merges."""
+        cap = gg.LAND_RESET_JUDGES_PER_MIN
+        out = {}
+        for k in (10, 30):
+            for per_minute in (0, 1, cap, 3):
+                self.tearDown_entries()
+                out[(k, per_minute)] = p = self.reset_profile(k, per_minute, minutes=k // max(per_minute, 1) + 3)
+                self.assertEqual((p["judged"], p["merged"]), (k, k), (k, per_minute, p))
+                if per_minute:
+                    self.assertTrue(all(j <= per_minute for j in p["judgments"]), p)
+        if os.environ.get("LAND_RESET_PROFILE"):
+            print("\nPROFILE " + json.dumps({f"K={k} perMinute={m}": v for (k, m), v in out.items()}))
+        for k in (10, 30):
+            before, after = out[(k, 0)], out[(k, cap)]
+            # no minute after the lift spends more than the cap's judgments, where all K went in the first two
+            self.assertEqual(sum(before["restLive"][:4]), k * self.EXPLAIN_REST_LIVE)  # the spread, one daemon read
+            self.assertLessEqual(max(after["restLive"]), cap * self.EXPLAIN_REST_LIVE)
+            self.assertLess(max(after["restLive"]), max(before["restLive"]))
+            self.assertLessEqual(after["first5Live"], min(before["first5Live"], 5 * cap * self.EXPLAIN_REST_LIVE))
+            self.assertLessEqual(after["first5"], before["first5"])
+            # while it waits for its place its PR is watched: the judgment pins a fresh head with the daemon's snapshot
+            self.assertEqual(after["snapshots"], k, after)
+        self.assertLess(out[(30, cap)]["first5Live"], out[(30, 0)]["first5Live"])
+
+    def tearDown_entries(self) -> None:
+        """A fresh queue directory for the next profile: no entry, request or latch left from the last."""
+        for d in (gg.LandQueue.entries_dir(), gg.LandQueue.requests_dir()):
+            if d.exists():
+                shutil.rmtree(d)
+        (gg.land_dir() / gg.LAND_LATCH_FILE).unlink(missing_ok=True)
+        self.clear_latch()
+        self.w.calls.clear()
+        self.w.answers.clear()
+
+    def test_the_stagger_holds_back_no_entry_the_latch_did_not_hold(self):
+        """An entry queued after the latch lifted owes the stagger nothing: it is judged at once."""
+        self.reset_profile(6, 1, minutes=3)  # past the reset spread (land_latch_spread), which holds every entry
+        self.w.set_pr("pr:o/r#40", land_pr(LB), self.t)
+        self.land("o/r#40")
+        self.w.answers.append(ok_answer(LB))
+        self.w.answers[-1][1]["action"].update(number=40)
+        before = len(self.w.explains())
+        self.tick(1)
+        self.assertEqual(self.q.entries["pr:o/r#40"]["state"], "merged")
+        self.assertGreater(len(self.w.explains()), before)
+
     def test_a_head_cached_before_the_latch_is_read_again_before_it_is_pinned(self):
         """huge-blue, 2026-11-18 09:43Z: parked on the login's latch, the daemon read nothing; on resume glaeda#2140
         waited on, then judged, its old head 401ccf880760 (snapshot_wait, snapshot_missing) though bc1601b6 had long
@@ -22068,6 +22200,10 @@ class LandTest(Base):
         # The next clear: at once, past no spread, oldest wake first
         self.retries(3)
         self.tick(reset2 + 1 - self.t)
+        # LAND_RESET_JUDGES_PER_MIN (2) of them at once, the third a minute later (the reset stagger)
+        self.assertEqual(self.explained(), ["11", "13"])
+        self.assertIn("reset_staggered", [h["event"] for h in self.q.entries[keys[1]]["history"]])
+        self.tick(60)
         self.assertEqual(self.explained(), ["11", "13", "12"])
         for k in keys:
             e = self.q.entries[k]

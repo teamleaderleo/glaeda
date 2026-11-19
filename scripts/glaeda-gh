@@ -9710,6 +9710,18 @@ LAND_PEEK_EVERY = 600.0
 # through five latch windows of 2-25 min each, nothing said to anyone. The real unblock is the App read pools
 # (leo-workspace#5944: gh_app_token.py ready --owner, latch_free).
 LAND_LATCH_STARVED_WINDOWS = 2
+# After the login's latch lifts, the entries it held are judged at most this many a minute (land.json
+# "resetJudgesPerMinute"; 0 turns the stagger off), the longest due first (judge_order: a PR the cache shows one merge
+# away goes ahead of the rest), for LAND_RESET_STAGGER_S after the clear. Only a judgment (merge_hold explain: its
+# `gh pr view`, check-runs, Actions runs and jobs reads) waits for its place; a merge a judgment names is never held
+# back, and an entry the latch did not hold is never counted or capped. While an entry waits for its place, its PR
+# stays watched (keep_watching), so the daemon's batched read gives it a fresh head and a rollup snapshot first, and
+# its judgment hands merge_hold that snapshot (LAND_SNAPSHOT_ENV). The broker host, 2026-11-19: ~10 entries "held by
+# the login latch until 12:53Z" were all judged as the latch lifted; host:glaeda-land was the login's top REST caller
+# in the first 5 minutes after each reset (115 REST in 12:53-12:58Z, 1473 over 11:37-13:37Z), and the REST bucket was
+# empty within ~8 minutes of every reset.
+LAND_RESET_JUDGES_PER_MIN = 2
+LAND_RESET_STAGGER_S = 3600.0
 # A due entry left unjudged this long past its wake with no latch (every worker busy: gated) is noted once in its
 # history and counted in the land-pool line (dueLate), so a wait past its wake always has a logged reason.
 LAND_DUE_LATE = 1800.0
@@ -10488,6 +10500,8 @@ class LandQueue:
         self.pool_logged = float("-inf")
         self.pass_latch: tuple[str, float] | None = None  # the login's latch as this pass saw it (log_pool)
         self.pass_latched = 0  # open entries this pass skipped for it
+        self.reset_judged: list[float] = []  # when each latch-held entry's judgment started (reset_staggered)
+        self.pass_staggered = 0  # this pass's latch-held judgments that waited for their place in the stagger
         # owner -> (asked at, has an unlatched source, why not: the check's own reason, quoted by hold's notice)
         self.latch_free_seen: dict[str, tuple[float, bool, str]] = {}
         self.snapshot_waiting: set[str] = set()  # keys with a snapshot wait, run out or not (judge's cap)
@@ -10660,6 +10674,7 @@ class LandQueue:
         self.pass_gated, self.pass_first_gated = 0, None
         self.pass_latch = latch
         self.pass_latched = 0
+        self.pass_staggered = 0
         for key in sorted(self.entries, key=self.judge_order):
             try:
                 e = self.entries[key]
@@ -10680,6 +10695,9 @@ class LandQueue:
                     continue  # a held latch: no judge, read, watch or nudge for this entry this pass
                 if ended is not None and self.now < ended + land_jitter(key, ended) \
                         and int((e.get("latchHeld") or {}).get("windows") or 0) < LAND_LATCH_STARVED_WINDOWS:
+                    if self.reset_cap():
+                        with self.lock:
+                            self.keep_watching(e)  # read by the daemon's batch now, judged from that copy later
                     continue  # the latch just ended: this entry's place in the reset spread is still ahead
                 with self.lock:
                     if self.parked(e):
@@ -11260,9 +11278,36 @@ class LandQueue:
              "firstGated": key_name(self.pass_first_gated) if self.pass_first_gated else None,
              "open": sum(states.values()), "states": states, "waits": waits,
              "latch": None if latch is None else {"pool": latch[0], "until": utc_clock(latch[1])},
-             "latched": self.pass_latched, "due": len(due), "dueLatchHeld": held, "dueLate": late,
+             "latched": self.pass_latched, "staggered": self.pass_staggered, "due": len(due), "dueLatchHeld": held,
+             "dueLate": late,
              "oldestDue": None if oldest is None else {"pr": key_name(oldest[1]),
                                                        "waitingS": int(self.now - oldest[0]) if oldest[0] else None}})
+
+    def reset_cap(self) -> int:
+        """land.json "resetJudgesPerMinute", else LAND_RESET_JUDGES_PER_MIN; 0: no stagger after a latch lifts."""
+        value = self.config().get("resetJudgesPerMinute")
+        if value == 0 and not isinstance(value, bool):
+            return 0  # off: held entries are judged as their place in the reset spread comes (land_latch_spread)
+        return int(land_seconds(value, LAND_RESET_JUDGES_PER_MIN, 1, 600))
+
+    def reset_staggered(self, e: dict) -> bool:
+        """True while E, held by the login's latch (latchHeld) that cleared less than LAND_RESET_STAGGER_S ago, waits
+        for its place in the stagger: reset_cap judgments of held entries started in the last 60 s. Noted once per
+        latch window in its history and counted in the pass's land-pool line ("staggered")."""
+        cap = self.reset_cap()
+        mark = e.get("latchHeld")
+        if not cap or not isinstance(mark, dict) or self.latched is not None \
+                or self.now - self.latch_cleared >= LAND_RESET_STAGGER_S:
+            return False
+        self.reset_judged = [t for t in self.reset_judged if self.now - t < 60.0]
+        if len(self.reset_judged) < cap:
+            return False
+        self.pass_staggered += 1
+        if mark.get("staggered") != mark.get("window"):
+            mark["staggered"] = mark.get("window")
+            self.history(e, "reset_staggered", perMinute=cap)
+            self.save(e)
+        return True
 
     def judge_order(self, key: str) -> tuple[int, int, float]:
         """The tick's order, so a free worker goes first to the land most likely to merge, then to the one that waited
@@ -11646,6 +11691,8 @@ class LandQueue:
         again next tick (the tick goes least recently judged first), so the pool never queues. Ahead of the workers at
         most LAND_SNAPSHOT_AHEAD per worker start a snapshot wait (each puts its PR's read first); past that, one whose
         snapshot is ready (or that needs none) still takes a free worker, and the rest wait without nudging a read."""
+        if self.reset_staggered(e):
+            return False  # its place in the stagger after the latch lifted is ahead: no read nudged, no wait begun
         workers = self.workers()
         free = len(self.jobs) < workers
         room = len(self.jobs) + len(self.snapshot_waiting) < workers * (1 + LAND_SNAPSHOT_AHEAD)
@@ -11671,6 +11718,8 @@ class LandQueue:
             return False
         c = self.cache_of(e["key"]) or {}
         head = str((c.get("data") or {}).get("headRefOid") or "").lower()
+        if e.get("latchHeld"):
+            self.reset_judged.append(self.now)  # a place in the stagger (reset_staggered)
         self.unhold(e)
         # Held by the login's latch while due (unhold: heldFor), or parked on a quota refusal since (LAND_WAIT_HELD)
         held = float(e.pop("heldFor", None) or 0.0)
