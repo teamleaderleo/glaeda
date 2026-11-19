@@ -20294,9 +20294,9 @@ class LandTest(Base):
         self.land()
         review = refusal("review_running", LA, {"kind": "wait_comment", "match": "SHIP|BLOCK", "timeout_s": 600})
         unread = refusal("unreadable", LA, {"kind": "retry", "after_s": 60})
-        self.w.answers += [review, unread] * 6
+        self.w.answers += [review, unread] * 10
         e = self.tick()
-        for _ in range(8):
+        for _ in range(16):  # the unreadable retry's own bound (LAND_UNREAD_DEADLINE) is the longest of them
             if e["state"] == "stopped":
                 break
             e = self.tick(gg.LAND_RETRY_MAX + 1)
@@ -20361,23 +20361,46 @@ class LandTest(Base):
     def test_a_retry_never_strikes_and_stops_at_its_deadline_naming_it(self):
         self.pr(LA)
         self.land()
-        self.w.answers += [refusal("unreadable", LA, {"kind": "retry", "after_s": 60})] * 8
+        self.w.answers += [refusal("regen_retry", LA, {"kind": "retry", "after_s": 60})] * 8
         e = self.tick()
         for _ in range(3):
             e = self.tick(gg.LAND_RETRY_MAX + 1)
         self.assertEqual((e["state"], e.get("streak")), ("waiting", None))  # 4 judgments, 5403 s: no strike
         e = self.tick(gg.LAND_RETRY_MAX + 1)
         self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "retry_deadline"))
+        self.assertIn("for a judgment merge_hold could not make, still regen_retry", e["stop"]["reason"])
+
+    def test_a_read_that_could_not_complete_never_stops_a_land_inside_its_long_bound(self):
+        # 2026-11-19: cmux#46508 at 0ca8cdb6 and #46516 at fa982deb stopped retry_deadline after 3 judgments over
+        # 14,131 s, #46754 at d6c38be508bc after 7,542 s (the live webview-verdict read "took over 40 s" each time), and
+        # #46995 at 6dbdbf3a8801 after 14,356 s (base_red_excuse.py's gh api graphql read failed). An unreadable
+        # answer judged nothing: it waits LAND_UNREAD_DEADLINE, no strike, and still ends there.
+        self.pr(LA)
+        self.land()
+        self.w.answers += [refusal("unreadable", LA, {"kind": "retry", "after_s": 60}, reason=(
+            "merge_hold: refused: its webview verdict is not published for 0ca8cdb60000 yet, and the live read took "
+            "over 40 s (stopped); retry in a minute; its checks could not be read: RuntimeError: timed out"))] * 16
+        e = self.tick()
+        waited = 0.0
+        while waited + gg.LAND_RETRY_MAX + 1 < gg.LAND_UNREAD_DEADLINE:
+            e = self.tick(gg.LAND_RETRY_MAX + 1)
+            waited += gg.LAND_RETRY_MAX + 1
+            self.assertEqual((e["state"], e.get("streak")), ("waiting", None), (waited, e.get("stop")))
+        self.assertGreater(waited, 14356)  # past each stopped land's wait
+        e = self.tick(gg.LAND_RETRY_MAX + 1)
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "retry_deadline"))  # the bound holds
         self.assertIn("for a judgment merge_hold could not make, still unreadable", e["stop"]["reason"])
 
     def stop_retry_deadline(self) -> dict:
-        """E stopped retry_deadline: unreadable at every judgment for the 2 h budget (cmux#46208, #46210)."""
+        """E stopped retry_deadline: unreadable at every judgment for its budget (cmux#46208, #46210)."""
         self.t = (NOW // 86400 + 1) * 86400 + 3600  # 01:00Z: the re-arms of a test stay inside one UTC day
         self.pr(LA)
         self.land()
-        self.w.answers += [refusal("unreadable", LA, {"kind": "retry", "after_s": 60})] * 5
+        self.w.answers += [refusal("unreadable", LA, {"kind": "retry", "after_s": 60})] * 13
         e = self.tick()
-        for _ in range(4):
+        for _ in range(13):
+            if e["state"] == "stopped":
+                break
             e = self.tick(gg.LAND_RETRY_MAX + 1)
         self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "retry_deadline"))
         return e
