@@ -907,6 +907,13 @@ no other admission takes a unit, every other runner's gate on the mini holds,
 and it keeps no reserve. NEXT's app build on attempt 1 still waits at most
 `NIGHTLY_CAPACITY_WAIT_S`, then is refused so its re-run takes Blacksmith.
 
+cmux-next.yml's fast tier waits at most `FAST_TIER_CAPACITY_WAIT_S` (60 s) for units or
+tokens, on any runner, then is refused (FAST_TIER_WAIT). Its 20-minute timeout counts the
+wait in "Set up runner", and a run after admission takes 866 s p50: of 191 fast tiers that
+waited 60 s or more (2026-11-16 to 11-19), 3 passed, and 141 timeouts had spent 68202 s of
+their caps waiting. cmux's owned-pool rescue re-runs a refusal; it never re-runs a PR job
+GitHub timed out.
+
 Right after nightly jobs in that line come stack-blocker jobs: a `manaflow-ai/cmux`
 pull request job (same repository, not a fork) whose PR carries the `stack-blocker` label
 in the job's own event payload (`GITHUB_EVENT_PATH`, no API call). They go ahead of DEV

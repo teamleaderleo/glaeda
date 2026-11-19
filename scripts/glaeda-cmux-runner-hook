@@ -2071,6 +2071,24 @@ def stack_slot_capacity_wait(cap: float | None, tier: str, nightly_runner: bool)
     return bounded_wait(cap, STACK_SLOT_CAPACITY_WAIT_S) if nightly_runner and tier == TIER_STACK else cap
 
 
+# FAST_TIER_WAIT: cmux-next.yml's fast tier has a 20-minute timeout-minutes that counts its wait in "Set up runner",
+# and its run after admission takes 866 s p50 and 1114 s p90 (856 owned fast tiers, 2026-11-16 14Z to 11-19 01Z).
+# Waiting with no limit (CAPACITY_WAIT) left it no time to run: of the 191 that waited 60 s or more for units, 3
+# passed, and 141 of the 348 that ran out the 20 minutes had waited 60 s or more, 68202 s of their caps in all
+# (run 44290763187 on ultra2: admitted at 1203 s, cancelled before its first step). cmux's owned-pool rescue moves
+# a job held in setup only after SETUP_WAIT_SECONDS (15 minutes) and once its siblings end, too late for that cap,
+# and it never re-runs a PR job GitHub timed out. So on any runner the fast tier waits this long at most and is then
+# refused: the rescue reads the refusal by its step (hook_refused()) and re-runs it, placed again.
+FAST_TIER_CAPACITY_WAIT_S = 60.0
+
+
+def fast_tier_capacity_wait(repo: str | None, home_repo: str, workflow: str, job: str) -> float | None:
+    """FAST_TIER_CAPACITY_WAIT_S for the home repository's FAST_JOBS, else None (FAST_TIER_WAIT)."""
+    if repo is None or repo.lower() != home_repo.lower() or (workflow, job) not in FAST_JOBS:
+        return None
+    return FAST_TIER_CAPACITY_WAIT_S
+
+
 def slot_capacity_wait(cap: float | None, dev_compile_runner: bool) -> float | None:
     """`cap`, bounded on the freshness slot (an explicit longer --gui-wait is clamped too): every job it admits (a push's release-compile too, which
     dev_compile_capacity_wait does not name) waits at most DEV_COMPILE_CAPACITY_WAIT_S. GitHub never moves a job
@@ -14400,6 +14418,8 @@ def main(argv: list[str] | None = None) -> int:
                 repo, args.home_repo, os.environ.get("GITHUB_EVENT_NAME"),
                 os.environ.get("GITHUB_REF"), event, os.environ.get("GITHUB_JOB", ""), job_workflow()))
             cap = slot_capacity_wait(cap, args.dev_compile_runner)
+            cap = bounded_wait(cap, fast_tier_capacity_wait(repo, args.home_repo, job_workflow(),
+                                                            os.environ.get("GITHUB_JOB", "")))
             tier = job_tier(os.environ.get("GITHUB_EVENT_NAME"), os.environ.get("GITHUB_REF"),
                             os.environ.get("GITHUB_REPOSITORY"), event, os.environ.get("GITHUB_WORKFLOW_REF"),
                             os.environ.get("GITHUB_JOB")) or stack_blocker_tier(
