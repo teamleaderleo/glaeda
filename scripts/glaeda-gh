@@ -592,6 +592,12 @@ CONTROLLER_DEFAULT = "http://100.89.225.106:18765"  # cmux-lawrence since the 20
 CONTROLLER_CONFIG = Path.home() / ".local/share/cmux-fleet-client/client.json"
 CONTROLLER_TOKEN = Path.home() / ".config/cmux/build-fleet/controller.token"
 CONTROLLER_TIMEOUT = 3  # a tick must not stall on an unreachable controller
+# Every controller request a tick makes (the feed, run baselines, on-event job lookups) together, at most: air-blue
+# 2026-11-18 22:4xZ, 17.1 of a 19.1 s tick went to a controller answering TimeoutError, one on-event lookup after
+# another (a failed lookup did not take the controller out), and no PR was refreshed for 2196 s. A request is cut at
+# what is left of it (Controller.budget_end); the first failure takes the controller out for CONTROLLER_RETRY and more
+# (controller_down), and REST, GitHub's own reads and the cache serve meanwhile.
+CONTROLLER_TICK_BUDGET = 4.0
 CONTROLLER_DEADLINE = 6  # one whole controller request
 CONTROLLER_RUN_MAX_WAIT = 300  # one bounded long-poll request for an active run waiter
 CONTROLLER_FEED_EVERY = 20  # seconds between change-feed reads: each request costs the controller a tailnet
@@ -683,6 +689,7 @@ GRAPHQL_SLOT_WANT_TOUCH = 0.25
 GRAPHQL_SLOT_HOLD_MAX = 2.0 * HTTP_DEADLINE
 STALE_RESTART_ADVICE = "`glaeda-gh restart` restarts a daemon in this state."
 STALE_DEFERRED_ADVICE = "A restart would not read any sooner: the budget above holds the reads back."
+STALE_NO_RESTART = ("deferred",)  # stall_cause verdicts a restart cannot fix: the alarm, the valve and `restart` agree
 # serve registers SIGUSR1 (faulthandler): every thread's stack goes to the daemon's stderr (the unit's journal) and it
 # goes on serving. huge-blue, 2026-11-18: a stalled daemon's threads (one on a futex) could only be guessed at.
 STALE_DUMP_ADVICE = ("Where each thread is: kill -USR1 <daemon pid> (daemon.json pid); the stacks go to the daemon's "
@@ -2565,6 +2572,9 @@ class Controller:
         try:
             budget = CONTROLLER_TIMEOUT if timeout is None else timeout
             deadline = CONTROLLER_DEADLINE if timeout is None else timeout + CONTROLLER_DEADLINE
+            # the daemon's tick gives its controller requests one budget together (CONTROLLER_TICK_BUDGET)
+            left = getattr(self, "budget_end", float("inf")) - time.monotonic()
+            budget, deadline = min(budget, max(0.1, left)), min(deadline, max(0.2, left + 0.1))
             with hard_deadline(deadline), OPENER.open(request, timeout=budget) as response:
                 doc = json.loads(response.read(MAX_BODY))
         except urllib.error.HTTPError as error:
@@ -3596,6 +3606,7 @@ class Daemon:
         self.controller_down_until = 0.0
         self.controller_feed_at = float("-inf")
         self.controller_failures = 0
+        self.controller_budget_end = float("inf")  # time.monotonic() past which this tick asks the controller nothing
         self.controller_filled: set[str] = set()  # watched runs the controller tracks, while its feed answers
         self.controller_cursor: int | None = None
         self.controller_seen: dict[str, bool] = {}  # watched run key -> the controller knows the run
@@ -3677,6 +3688,9 @@ class Daemon:
         self.in_call: dict[str, Any] | None = None
         self.last_call: dict[str, Any] | None = None
         self.stall_said: dict[str, str] = {}  # kind -> the cause stall_cause last logged (said once per cause)
+        self.stale_now: tuple[str, str, dict] | str | None = None  # this tick's stale verdict (stale_verdict)
+        self.stale_reason = ""  # the reason the alarm that verdict came from gave (stall_cause's sentence)
+        self.stale_last: dict[str, Any] | None = None  # the last verdict that was not fresh (stale_record)
         self.defer_why: dict[str, tuple[float, str]] = {}  # kind -> (when, why) its reads were last deferred
         self.failing: dict[str, Any] | None = None  # set while ticks raise: the latest error and since when
         self.tick_deadline = float("inf")  # time.monotonic() after which this tick starts no request
@@ -4088,6 +4102,7 @@ class Daemon:
         hold = self.quota_hold(kind)
         quota = f" Quota: {hold[0]}." if hold else ""
         cause = self.stall_cause(kind)
+        self.stale_reason = cause["text"]
         self.say_stall(kind, cause, age_s, where)
         advice = STALE_DEFERRED_ADVICE if cause["verdict"] == "deferred" else STALE_RESTART_ADVICE
         said = "" if cause["verdict"] == "deferred" and errors == "none recorded" else f" Recent errors: {errors}."
@@ -4096,6 +4111,58 @@ class Daemon:
                 f"fresh.{quota} Reads: {cause['text']}.{said} {advice} {STALE_DUMP_ADVICE}.")
         return level, text, {"kind": kind, "age": age_s, "key": where, "cause": cause["verdict"],
                              **({"quota": hold[0]} if hold else {})}
+
+    def stale_verdict(self) -> tuple[str, str, dict] | str | None:
+        """THE stale predicate, once a tick (check_alarms): waited data past STALE_DATA_AFTER (stale_alarm), else no PR
+        refreshed that long (stall_alarm). The alarm sends it, the valve acts on it, and daemon.json "stale"
+        (stale_record) carries it with its one reason, which `restart` (daemon_starved) reads instead of judging
+        again from other numbers. air-blue 2026-11-18 22:4xZ: the alarm said "no PR refreshed for 2196s ... `glaeda-gh
+        restart` restarts a daemon in this state" and `restart` answered "under 600s old; nothing to restart"."""
+        self.stale_reason = ""
+        verdict = self.stale_alarm()
+        if not isinstance(verdict, tuple):  # no wait starved: the refresh loop itself may still be (stall_alarm)
+            stall = self.stall_alarm()
+            verdict = stall if stall is not None else verdict
+        return verdict
+
+    def stale_record(self) -> dict[str, Any]:
+        """daemon.json "stale": this tick's stale_verdict as {"state": fresh | held | stale, "kind", "age", "key",
+        "restart" (whether a restart can help: what the alarm advises and `restart` does), "reason", "at"}, and the
+        last verdict that was not fresh, within ALARM_EVERY, under "last" (`restart` says it cleared since)."""
+        v = self.stale_now
+        rec: dict[str, Any] = {"at": round(self.now, 3)}
+        if isinstance(v, tuple):
+            data = v[2]
+            rec.update(state="stale", level=v[0], kind=data.get("kind"), age=data.get("age"), key=data.get("key"),
+                       restart=data.get("cause") not in STALE_NO_RESTART, reason=self.stale_reason)
+        elif v == "held":
+            stale = {k: a for k, a in (getattr(self, "stale_waited", None) or {}).items()
+                     if isinstance(a, (int, float)) and a > STALE_DATA_AFTER}
+            kind = max(stale, key=stale.get, default="pr")
+            age = stale.get(kind, (getattr(self, "newest_data", None) or {}).get("pr"))
+            rec.update(state="held", kind=kind, age=int(age) if isinstance(age, (int, float)) else None,
+                       restart=False, reason=self.held_why(kind))
+        else:
+            rec.update(state="fresh", restart=False, reason="")
+            last = self.stale_last
+            if last is not None and self.now - last["at"] < ALARM_EVERY:
+                rec["last"] = last
+        return rec
+
+    def held_why(self, kind: str) -> str:
+        """Why old data of KIND is explained (stale_explained, catching_up): the reason a held verdict gives."""
+        if (getattr(self, "upstream_status", None) or {}).get("state") == "ok":
+            return "this host reads GitHub through an upstream, whose daemon reads it"
+        hold = self.quota_hold(kind) if kind in CYCLES else None
+        if hold is not None:
+            return hold[0]
+        if self.quota_starved():
+            return "GitHub's quota is spent (GraphQL stopped, REST at its share)"
+        since = self.catching_up(kind)
+        if since is not None:
+            return (f"the quota held these reads until {int(since)}s ago and the daemon is reading the backlog it "
+                    "left, waited data first")
+        return "the quota holds these reads back"
 
     def stall_alarm(self) -> tuple[str, str, dict] | str | None:
         """The refresh loop's own pulse, beside stale_alarm (which needs a wait blocked on old data): when even the
@@ -4118,6 +4185,7 @@ class Daemon:
         # Why the reads did not happen (stall_cause), as stale_alarm says it: a budget that defers them is no fault a
         # restart fixes, and the valve does not restart for it (stale_valve, "deferred")
         cause = self.stall_cause("pr")
+        self.stale_reason = cause["text"]
         advice = STALE_DEFERRED_ADVICE if cause["verdict"] == "deferred" else STALE_RESTART_ADVICE
         said = "" if cause["verdict"] == "deferred" and errors == "none recorded" else f" Recent errors: {errors}."
         text = (f"{level.upper()} glaeda-gh on {policy_host()}: no PR has been refreshed for {age_s}s (over "
@@ -4252,12 +4320,11 @@ class Daemon:
             share = self.share_alarm(self.rest_cap(), rows)
             if share is not None:
                 firing["share"] = share
+        self.stale_now = self.stale_verdict()
+        if self.stale_now is not None:
+            self.stale_last = self.stale_record()
         if policy.get("stale", True):
-            verdict = self.stale_alarm()
-            if not isinstance(verdict, tuple):  # no wait starved: the refresh loop itself may still be (stall_alarm)
-                stall = self.stall_alarm()
-                verdict = stall if stall is not None else verdict
-            stale = self.stale_valve(verdict, policy)
+            stale = self.stale_valve(self.stale_now, policy)
             if stale == "held":
                 held.add("stale")
             elif stale is not None:
@@ -6316,7 +6383,7 @@ class Daemon:
                   "newestData": dict(self.newest_data),
                   "graphqlDown": {"until": round(self.gql_down_until, 3), "strikes": self.gql_down_strikes}
                   if self.gql_down() else None,
-                  "staleWaited": dict(self.stale_waited), "staleAfter": STALE_DATA_AFTER,
+                  "staleWaited": dict(self.stale_waited), "staleAfter": STALE_DATA_AFTER, "stale": self.stale_record(),
                   "staleWhy": self.stale_why(), "progress": self.progress(), "staleCause": self.stale_causes(),
                   "staleExplainedAt": {k: round(t, 3) for k, t in self.explained_at.items()},
                   "recentErrors": [{"error": m, "at": t} for m, t in self.recent_errors.items()],
@@ -8224,6 +8291,8 @@ class Daemon:
             return [doc]
         pages = []
         for _ in range(FEED_PAGES):
+            if pages and not self.controller_room():
+                break  # the tick's controller budget is spent: the backlog continues next tick, from the cursor
             doc = self.controller.events(self.controller_cursor)
             if doc.get("reset"):
                 self.controller_cursor, self.controller_seen = doc["cursor"], {}
@@ -8263,7 +8332,24 @@ class Daemon:
         self.follow_controller()
         if self.controller is None or self.now < self.controller_down_until:
             return
-        deadline = time.monotonic() + TICK  # a slow controller must not stall the tick
+        self.controller_budget_end = time.monotonic() + CONTROLLER_TICK_BUDGET
+        with contextlib.suppress(AttributeError):  # (a controller object without the attribute just is not cut)
+            self.controller.budget_end = self.controller_budget_end
+        try:
+            self.read_controller(entries)
+        finally:
+            self.controller_budget_end = float("inf")
+            with contextlib.suppress(AttributeError):
+                self.controller.budget_end = float("inf")
+
+    def controller_room(self) -> bool:
+        """Whether this tick may ask the controller one more thing: it is not out (controller_down) and the tick's
+        CONTROLLER_TICK_BUDGET is not spent."""
+        return (self.controller is not None and self.now >= self.controller_down_until
+                and time.monotonic() < self.controller_budget_end)
+
+    def read_controller(self, entries: list[dict]) -> None:
+        """from_controller's reads, within the tick's CONTROLLER_TICK_BUDGET."""
         pages: list[dict] = []
         if self.now - self.controller_feed_at >= CONTROLLER_FEED_EVERY:
             self.controller_feed_at = self.now
@@ -8289,7 +8375,7 @@ class Daemon:
         for key, e in runs.items():
             if key in self.controller_seen:
                 continue
-            if time.monotonic() > deadline:
+            if not self.controller_room():
                 break  # the rest get their baseline on the next tick; REST covers them meanwhile
             _, owner, repo, run_id = split_key(key)
             try:
@@ -8413,12 +8499,14 @@ class Daemon:
         repo, run_id, attempt = str(run.get("repo") or "").lower(), int(run.get("id")), int(run.get("attempt") or 1)
         if given is not None:
             return on_event_job(given, name)
-        if self.controller is not None and hasattr(self.controller, "run_jobs"):
+        if self.controller_room() and hasattr(self.controller, "run_jobs"):
             try:
                 doc = self.controller.run_jobs(repo, run_id, attempt)
             except WatchError as error:
+                # One failure takes the controller out (CONTROLLER_TICK_BUDGET's comment): each pending run asking it
+                # again was how a timing-out controller took 17.1 s of the tick
                 doc = {}
-                self.errors.append(f"on-event run-jobs: {describe(error)}")
+                self.controller_down(error)
             job = on_event_job(doc.get("jobs") if doc.get("known") else None, name)
             if job is not None:
                 return job
@@ -12261,6 +12349,10 @@ def first_heartbeat(now: float | None = None) -> None:
     status.pop("staleWaited", None)  # the previous process's starvation is not this one's (daemon_starved)
     for stale in ("newestData", "stalled", "healthy"):  # nor its stalled refresh loop (stall_alarm)
         status.pop(stale, None)
+    before = status.pop("stale", None)  # nor its verdict (stale_record): kept only as the last one, for `restart`
+    if isinstance(before, dict):
+        last = before if before.get("state") in ("held", "stale") else before.get("last")
+        status["stale"] = {"state": "starting", **({"last": last} if isinstance(last, dict) else {})}
     write_json(BASE / "daemon.json", {**status, "pid": os.getpid(), "at": now, "startedAt": now,
                                       "heartbeat": HEARTBEAT_EVERY})
 
@@ -12826,6 +12918,17 @@ def daemon_starved(status: Any = None) -> dict | None:
     status = read_json(BASE / "daemon.json") if status is None else status
     if not isinstance(status, dict):
         return None
+    verdict = status.get("stale")
+    if isinstance(verdict, dict) and verdict.get("state") in ("fresh", "held", "stale"):
+        # the daemon's own verdict, the one its alarm and valve acted on (stale_verdict): never judged again here
+        if verdict["state"] == "fresh":
+            return None
+        at = status.get("at") if isinstance(status.get("at"), (int, float)) else time.time()
+        age = verdict.get("age") if isinstance(verdict.get("age"), (int, float)) else 0
+        reason = str(verdict.get("reason") or "") or None
+        helps = verdict.get("restart") is True
+        return {"kind": verdict.get("kind") or "pr", "age": age + max(0.0, time.time() - at), "quota": not helps,
+                "why": None if helps else reason, "cause": reason}
     stale = status.get("staleWaited")
     if not isinstance(stale, dict):
         return None
@@ -19804,8 +19907,15 @@ def cmd_restart(force: bool = False) -> int:
                   "A restart would not read any sooner; a wait reads its own target once (direct_read).")
             return EXIT_OK
         if running and lag is None and starved is None and not force:
+            status = read_json(BASE / "daemon.json")
+            last = ((status.get("stale") if isinstance(status, dict) else None) or {}).get("last")
+            cleared = ""
+            if isinstance(last, dict) and isinstance(last.get("at"), (int, float)):
+                cleared = (f" The daemon's last stale verdict, at {utc_clock(last['at'])} ({last.get('kind')} data "
+                           f"{last.get('age')}s old: {last.get('reason') or last.get('state')}), cleared since.")
             print("glaeda-gh: the daemon is running, its heartbeat is fresh and the data its waits are blocked on is "
-                  f"under {STALE_DATA_AFTER}s old; nothing to restart. If a wait printed an older warning, re-run it.")
+                  f"under {STALE_DATA_AFTER}s old; nothing to restart.{cleared} If a wait printed an older warning, "
+                  "re-run it.")
             return EXIT_OK
         if starved is not None:
             slowed = f" The quota slows it ({starved['why']}), which alone should not leave it this old." \
