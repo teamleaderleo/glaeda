@@ -9670,9 +9670,29 @@ LAND_FALLBACK = {"tip_merge": "update_branch", "stale_green": "update_branch", "
                  "review_running": "wait_comment", "no_ship": "review", "same_model": "review",
                  "regen_refused": "review"}
 LAND_KINDS = frozenset({"merge", "update_branch", "wait_pr", "wait_run", "wait_comment", "rerun_failed", "repin",
-                        "retry", "review", "retarget", "stop", "command", "fetch"})
+                        "retry", "review", "retarget", "stop", "command", "fetch", "ws_check"})
 SHA40 = re.compile(r"[0-9a-f]{40}")
 BRANCH_SAFE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,250}")
+# A "ws_check" step runs leo-workspace's `tools/ws-check HEAD --force --number N` on this host, the one that asked to
+# land the PR. merge_hold names it when the head's ws-check is still the role timer's "in line" pending: 2026-11-19
+# lw#5757, lw#5618 and lw#6038 sat in that line 4-8 h behind about 260 heads until this queue stopped them
+# checks_stuck, and a lane's `ws-check --force` by hand was the only way out. The tool is the one beside the
+# merge_hold.py this queue runs. It is started detached (a run takes 15-35 min, its verdict posted by the broker or
+# ws-check itself), once per head per LAND_WS_CHECK_HOLD, at most LAND_WS_CHECK_CAP times per head (the step never
+# counts toward LAND_STREAK_STOP); the queue then waits on the PR's checks.
+LAND_WS_CHECK_HOLD = 3600.0
+LAND_WS_CHECK_CAP = 3
+LAND_WS_CHECK_WAIT = 2700.0  # merge_hold's WS_CHECK_WAIT_S: one run and its post
+
+
+def land_spawn(argv: list[str], log: Path, env: dict[str, str]) -> None:
+    """Start ARGV detached, its output appended to LOG; raises OSError when it cannot start."""
+    log.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with open(log, "ab") as sink:
+        subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=sink, stderr=subprocess.STDOUT, env=env,
+                         start_new_session=True, close_fds=True, cwd=os.environ.get("HOME") or "/")
+
+
 # A "fetch" step fills this host's mirror of the PR's repository. huge-blue, 2026-11-17 ~14:01Z: merge_hold could not
 # read its mirror (ls-remote failed) and refused leo-workspace#5653 and #5614 "unreadable", naming a fetch of that
 # mirror as a "command" step; the queue stops on a command, no lane can run one on huge-blue, and a coordinator ran
@@ -10115,7 +10135,9 @@ class LandQueue:
                  forward: Callable[[list[str], dict, float], dict] = land_forward,
                  broker_client: Callable[[], bool] = land_broker_client,
                  snapshot_of: Callable[[str], dict | None] = read_rollup,
-                 peek: Callable[[str], None] | None = None) -> None:
+                 peek: Callable[[str], None] | None = None,
+                 spawn: Callable[[list[str], Path, dict[str, str]], None] | None = None) -> None:
+        self.spawn = spawn or land_spawn  # a detached step (ws_check): started, never waited on here
         self.broker_client = broker_client
         self.snapshot_of = snapshot_of
         self.run = run or (lambda argv, timeout, env: self._run_real(argv, timeout, env))
@@ -11386,6 +11408,8 @@ class LandQueue:
                 if self.wait_refused(e, head, str(answer.get("code") or "refused"), answer.get("reason"),
                                      answer.get("next")):
                     return
+            elif act.get("kind") == "ws_check":
+                pass  # taken, never counted: do_ws_check starts it at most LAND_WS_CHECK_CAP times per head
             elif act.get("kind") == "update_branch":
                 # The refusal's step is the pinned update (any code: LAND_UPDATE_ONCE's comment): taken, never counted
                 # toward the identical-refusal stop. update_branch sends it once per head and bounds the rest.
@@ -11534,6 +11558,9 @@ class LandQueue:
                     self.stop(e, "policy", f"retarget to an unsafe base name {base!r}", land_trim(answer.get("next")))
                 return
             self.push_step(e, "retarget", head, ["pr", "edit", number, "-R", repo, "--base", base], base=base)
+            return
+        if kind == "ws_check":
+            self.do_ws_check(e, act, answer, head)
             return
         if kind == "fetch":
             self.do_fetch(e, act, answer, head)
@@ -11720,6 +11747,51 @@ class LandQueue:
             self.hand_off(e, head)
         elif named == "update_branch" and kind != "update_branch":
             self.update_branch(e, head)
+
+    def do_ws_check(self, e: dict, act: dict, answer: dict, head: str) -> None:
+        """Start `ws-check HEAD --force --number N` here (LAND_WS_CHECK_HOLD's comment), then wait on the PR's checks.
+        A step at another head, or with no ws-check beside merge_hold.py, stops as policy; a second step at the same
+        head within LAND_WS_CHECK_HOLD waits on the run already started."""
+        repo, number = e["repo"], str(e["number"])
+        sha = str(act.get("head") or head).lower()
+        mh, _ = self.merge_hold()
+        tool = mh.parent / "ws-check" if mh is not None else None
+        why = (f"ws_check named {sha[:12] or 'nothing'}, not the judged head {head[:12] or '?'}"
+               if not SHA40.fullmatch(sha) or sha != head else
+               "no tools/ws-check beside merge_hold.py on this host" if tool is None or not tool.is_file() else "")
+        if why:
+            with self.lock:
+                self.stop(e, "policy", why, land_trim(answer.get("next")))
+            return
+        argv = [os.fspath(tool), sha, "--force", "--number", number]
+        with self.lock:
+            started = e.get("wsCheck") or {}
+            same = started.get("head") == sha
+            fresh = same and self.now - float(started.get("at") or 0) < LAND_WS_CHECK_HOLD
+            n = int(started.get("n") or 0) if same else 0
+            if not fresh and n >= LAND_WS_CHECK_CAP:
+                self.stop(e, "ws_check_cap", f"ws-check was started here {n} times at {sha[:12]} and its status is "
+                          f"still in the timer's line: {land_trim(answer.get('reason'))}", " ".join(argv))
+                return
+            if not fresh:
+                e["wsCheck"] = {"head": sha, "at": self.now, "n": n + 1}
+                self.claim(e, "ws_check", argv=argv)
+        if not fresh:
+            log = land_dir() / "logs" / f"ws-check-{repo.replace('/', '_')}-{number}-{sha[:12]}.log"
+            try:
+                self.spawn(argv, log, self.env(e))
+                error = None
+            except OSError as exc:
+                error = describe(exc)
+            with self.lock:
+                self.finish(e, None, **({"error": error} if error else {"started": True}))
+                if error:
+                    e.pop("wsCheck", None)
+                    self.stop(e, "ws_check_failed", f"ws-check could not start: {error}", " ".join(argv))
+                    return
+        with self.lock:
+            self.wait(e, {"kind": "pr", "sha": sha, "until": "done",
+                          "why": "ran ws-check here for a head still in the timer's line"}, LAND_WS_CHECK_WAIT)
 
     def do_fetch(self, e: dict, act: dict, answer: dict, head: str) -> None:
         """Fill this host's mirror as merge_hold named (LAND_FETCH_DEADLINE's comment), then judge again soon. An argv

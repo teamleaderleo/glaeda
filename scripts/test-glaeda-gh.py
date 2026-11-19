@@ -20252,6 +20252,64 @@ class LandTest(Base):
         e = self.tick(gg.LAND_RETRY_MAX + 1)
         self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "retry_deadline"))  # one holder head, 2 h
 
+    def ws_check_world(self) -> tuple[Path, list[list[str]]]:
+        """A tools/ws-check beside the fake merge_hold.py, and the argvs the queue starts detached."""
+        tool = Path(self.w.mh).parent / "ws-check"
+        tool.write_text("#!/bin/sh\nexit 0\n")
+        tool.chmod(0o755)
+        spawned: list[list[str]] = []
+        self.q.spawn = lambda argv, log, env: spawned.append(argv)
+        return tool, spawned
+
+    def test_a_head_still_in_the_timers_line_gets_its_ws_check_run_here_once(self):
+        # 2026-11-19: lw#5757, lw#5618 and lw#6038 sat "in line for the ws-check timer" 4-8 h until this queue stopped
+        # them checks_stuck. merge_hold now names a ws_check step: the requesting host runs ws-check itself, once per
+        # head per LAND_WS_CHECK_HOLD, never counted toward the identical-refusal stop, then waits on the checks.
+        tool, spawned = self.ws_check_world()
+        self.pr(LA)
+        self.land()
+        in_line = refusal("ws_check_in_line", LA, {"kind": "ws_check"})
+        self.w.answers += [in_line] * 4
+        e = self.tick()
+        self.assertEqual(spawned, [[os.fspath(tool), LA, "--force", "--number", "1"]])
+        self.assertEqual((e["state"], (e.get("wait") or {}).get("kind")), ("waiting", "pr"), e.get("stop"))
+        e = self.tick(gg.LAND_WS_CHECK_WAIT + 1)  # judged again inside the hour: no second run, no strike
+        self.assertLess(self.t - NOW, gg.LAND_WS_CHECK_HOLD)
+        self.assertEqual(len(spawned), 1)
+        self.assertEqual((e["state"], (e.get("wait") or {}).get("kind"), e.get("streak")), ("waiting", "pr", None),
+                         e.get("stop"))
+        e = self.tick(gg.LAND_WS_CHECK_WAIT + 1)  # past the hour, still in line: run once more
+        self.assertEqual(len(spawned), 2)
+
+    def test_ws_check_is_started_at_most_its_cap_per_head_then_stops_naming_it(self):
+        tool, spawned = self.ws_check_world()
+        self.pr(LA)
+        self.land()
+        self.w.answers += [refusal("ws_check_in_line", LA, {"kind": "ws_check"})] * 6
+        e = self.tick()
+        for _ in range(5):
+            if e["state"] == "stopped":
+                break
+            e = self.tick(gg.LAND_WS_CHECK_HOLD + 1)
+        self.assertEqual(len(spawned), gg.LAND_WS_CHECK_CAP)
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "ws_check_cap"))
+        self.assertIn(os.fspath(tool), e["stop"]["next"])
+
+    def test_a_ws_check_step_with_no_tool_here_or_at_another_head_stops_as_policy(self):
+        _, spawned = self.ws_check_world()
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(refusal("ws_check_in_line", LA, {"kind": "ws_check", "head": LB}))
+        e = self.tick()
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "policy"))
+        (Path(self.w.mh).parent / "ws-check").unlink()
+        self.land()
+        self.w.answers.append(refusal("ws_check_in_line", LA, {"kind": "ws_check"}))
+        e = self.tick()
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "policy"))
+        self.assertIn("no tools/ws-check", e["stop"]["reason"])
+        self.assertEqual(spawned, [])
+
     def test_a_retry_never_strikes_and_stops_at_its_deadline_naming_it(self):
         self.pr(LA)
         self.land()
