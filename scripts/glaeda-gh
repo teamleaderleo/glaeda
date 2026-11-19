@@ -9619,6 +9619,13 @@ LAND_READING_MAX_AGE = 300.0
 LAND_LATCH_OVERRIDES = ("reading_above_reserve", "ends_at_reading_reset", "window_reset", "graphql_rest_judges")
 LAND_LATCH_SECONDARY = "secondary"  # GitHub's secondary limit: /rate_limit cannot see it; it holds to its own until
 LAND_QUOTA_REFUSAL = re.compile(r"quota: not judged|\[quota: not judged")
+# An "unreadable" judgment (LAND_UNREAD_CODES) whose read the gh-quota shim refused, in the shim's own words. Read on
+# that code's reason only: it names the read that failed, never a red job's log. Such a judgment is the login's state,
+# not the PR's, so it parks until the reset it names (park_quota) as a "quota" answer does. The broker client
+# gcp-agent-lane-1, 2026-11-19 22:38-22:50Z: 30 of 63 judgments were "unreadable" with "gh-quota: refused: GitHub's
+# GraphQL rate limit is spent for login until 23:38Z"; each took the 120 s retry (LAND_RETRY_DEFAULT) and spent about 9
+# REST (`pr view`, check-runs, runs and jobs) before its refused GraphQL read: session glaeda-land, 568 REST in 12 min.
+LAND_UNREAD_QUOTA = re.compile(r"gh-quota: refused: GitHub(?:'s)? (?:REST |GraphQL )?rate limit is spent")
 # A step's own output (update-branch, rerun, merge) that GitHub refused for the login's quota, in the words the broker
 # and the gh-quota shim use, as well as merge_hold's. Read on a step's output only, never on merge_hold's reason (which
 # can quote a red job's log). Before, only merge_hold's words parked a step: cmux#42244's update-branch was refused
@@ -11953,7 +11960,9 @@ class LandQueue:
                             "head": head, "action": act, "fallback": not isinstance(answer.get("action"), dict)}
             self.history(e, "judged", code=answer.get("code") or ("ok" if answer.get("ok") else ""),
                          head=head[:12], step=act.get("kind"))
-            if str(answer.get("code") or "") == "quota" or LAND_QUOTA_REFUSAL.search(str(answer.get("reason") or "")):
+            reason = str(answer.get("reason") or "")
+            if str(answer.get("code") or "") == "quota" or LAND_QUOTA_REFUSAL.search(reason) \
+                    or str(answer.get("code") or "") in LAND_UNREAD_CODES and LAND_UNREAD_QUOTA.search(reason):
                 self.park_quota(e, f"{answer.get('reason') or ''} {answer.get('next') or ''}")
                 return  # the login's state, not the PR's: no step, no streak
             e.pop("quotaRefusals", None)
