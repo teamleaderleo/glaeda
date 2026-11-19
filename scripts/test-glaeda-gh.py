@@ -18996,6 +18996,7 @@ class LandWorld:
         self.nudged: list[str] = []
         self.refreshed: list[str] = []
         self.watched: list[str] = []
+        self.cache_answers: list[tuple[int, dict]] = []  # explain --cache-only's answers (else a miss)
         self.notices: list[tuple] = []
         self.gh = Path(tmp) / "bin" / "gh"
         self.gh.parent.mkdir(parents=True, exist_ok=True)
@@ -19029,6 +19030,14 @@ class LandWorld:
         self.envs.append(dict(env))
         if self.raise_on and self.raise_on in " ".join(argv):
             raise LandCrash(argv)
+        if argv[1:3] == [self.mh, "explain"] and "--cache-only" in argv:
+            # explain --cache-only (judge_cached, under the login's latch): its own answers, else a cache miss
+            if self.cache_answers:
+                rc, doc = self.cache_answers.pop(0)
+            else:
+                rc, doc = 3, {"ok": False, "code": "unreadable", "reason": "cache-only: not held", "next": "",
+                              "cacheOnly": True, "cacheMiss": True}
+            return subprocess.CompletedProcess(argv, rc, json.dumps(doc) + "\n", "")
         if argv[1:3] == [self.mh, "explain"]:
             rc, doc = self.answers.pop(0)
             return subprocess.CompletedProcess(argv, rc, json.dumps(doc) + "\n", "")
@@ -19061,7 +19070,11 @@ class LandWorld:
         return subprocess.CompletedProcess(argv, 127, "", "unknown program")
 
     def explains(self) -> list[list[str]]:
-        return [c for c in self.calls if c[1:3] == [self.mh, "explain"]]
+        """The live explains (every one that may read GitHub); cache_explains: those that read only the caches."""
+        return [c for c in self.calls if c[1:3] == [self.mh, "explain"] and "--cache-only" not in c]
+
+    def cache_explains(self) -> list[list[str]]:
+        return [c for c in self.calls if c[1:3] == [self.mh, "explain"] and "--cache-only" in c]
 
     def gh_calls(self, *prefix: str) -> list[list[str]]:
         return [c[1:] for c in self.calls if c[0] == os.fspath(self.gh) and c[1:1 + len(prefix)] == list(prefix)]
@@ -21674,6 +21687,33 @@ class LandTest(Base):
     def explained(self) -> list[str]:
         return [c[4] for c in self.w.explains()]
 
+    def test_stale_wakes_go_before_a_fresh_request_oldest_first(self):
+        """sr2-coord's ask, 2026-11-18 20:48Z: rows re-requested at 19:53Z still showed their 17:18Z verdict 55 min
+        later. A row whose wake has passed is judged before a request queued after it, oldest wake first; the fresh
+        request, never judged before, comes after them (its due time is when it was queued)."""
+        self.pr(LA)
+        self.land()  # o/r#1: a fresh request, queued now
+        self.stuck(12, 2 * 3600)
+        self.stuck(11, 4 * 3600)
+        self.retries(2)
+        self.w.answers.append(ok_answer(LA))
+        self.tick()
+        self.assertEqual(self.explained(), ["11", "12", "1"])
+
+    def test_a_merge_is_one_land_merged_log_line(self):
+        """Merges per hour are counted from the daemon log (land-merged), not from every entry's history."""
+        logs: list[dict] = []
+        p = mock.patch.object(gg, "log", logs.append)
+        p.start()
+        self.addCleanup(p.stop)
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(ok_answer(LA))
+        self.tick()
+        self.assert_merged_at(LA)
+        self.assertEqual([(r["key"], r["sha"]) for r in logs if r.get("event") == "land-merged"],
+                         [(self.KEY, "f" * 40)])
+
     def test_due_rows_go_oldest_wake_first_ahead_of_rows_judged_only_for_a_change(self):
         """No latch at all. Due rows (retry, woke 2-4 h ago) are judged before an entry judged only because its cache
         changed (a wait on its checks, its wake ahead, last judged 26 h ago), oldest wake first: sorted by the last
@@ -21800,6 +21840,97 @@ class LandTest(Base):
         self.assertEqual((e["state"], e["wait"]["kind"]), ("waiting", "pr"))
         self.assertNotIn("latchHeld", e)
         self.assertNotIn("held by the login latch", gg.land_line(e, self.t))
+
+    def cached_answer(self, head: str, ok: bool = True, miss: bool = False, code: str = "ok") -> tuple[int, dict]:
+        doc = {"ok": ok, "code": code, "reason": "" if ok else f"merge-hold: refused: {code}", "head": head,
+               "next": "", "cacheOnly": True, "cacheMiss": miss}
+        if ok:
+            doc["action"] = {"v": 1, "kind": "merge", "repo": "o/r", "number": 11, "head": head, "sha": head}
+        return (0 if ok else 3), doc
+
+    def latched_fresh_row(self) -> tuple[str, str]:
+        p = mock.patch.object(gg, "land_jitter", lambda key, reset=0.0: 0.0)
+        p.start()
+        self.addCleanup(p.stop)
+        key = self.stuck(11, 3 * 3600)
+        head = self.q.entries[key]["head"]
+        self.w.set_pr(key, land_pr(head), self.t)  # the daemon read it just now
+        return key, head
+
+    def test_a_latched_due_row_is_judged_from_the_cache_and_merges_at_the_clear(self):
+        """The login's latch holds: a due row whose PR the daemon read within LAND_CACHE_ONLY_AGE is judged once per
+        latch window with merge_hold explain --cache-only (leo-workspace#6006), nothing else sent; its status says so;
+        at the clear its advisory ok at the same head goes straight to the pinned merge, with no live explain."""
+        key, head = self.latched_fresh_row()
+        reset = self.t + 600
+        self.latch("rest", reset)
+        self.w.cache_answers.append(self.cached_answer(head))
+        self.tick(30)
+        self.assertEqual((len(self.w.cache_explains()), self.w.explains()), (1, []))
+        self.assertEqual(self.w.cache_explains()[0][-2:], ["--cache-only", f"{gg.LAND_CACHE_ONLY_AGE:g}"])
+        self.assertEqual(self.w.gh_calls(), [])
+        e = self.q.entries[key]
+        self.assertTrue(e["cacheVerdict"]["ok"])
+        self.assertIn("judged from cache: ok, merges at the clear", gg.land_line(e, self.t))
+        self.tick(60)
+        self.assertEqual(len(self.w.cache_explains()), 1, "once per latch window")
+        self.tick(reset + 1 - self.t)
+        self.assertEqual(self.w.explains(), [], "no live explain: the pinned merge's own gate judges it")
+        self.assertEqual(self.w.gh_calls("pr", "merge"),
+                         [["pr", "merge", "11", "-R", "o/r", "--squash", "--match-head-commit", head]])
+        self.assertIn("cache_ok_taken", [h["event"] for h in self.q.entries[key]["history"]])
+
+    def test_a_cache_miss_or_a_moved_head_is_judged_live_at_the_clear(self):
+        key, head = self.latched_fresh_row()
+        reset = self.t + 600
+        self.latch("rest", reset)
+        self.w.cache_answers.append(self.cached_answer(head, ok=False, miss=True, code="unreadable"))
+        self.tick(30)
+        e = self.q.entries[key]
+        self.assertTrue(e["cacheVerdict"]["miss"])
+        self.assertIn("judged from cache: not held", gg.land_line(e, self.t))
+        self.retries(1)
+        self.tick(reset + 1 - self.t)
+        self.assertEqual(len(self.w.explains()), 1)
+        self.assertEqual(self.w.gh_calls("pr", "merge"), [])
+        # an ok at a head the cache no longer shows: live
+        key2 = self.stuck(12, 3 * 3600)
+        h2 = self.q.entries[key2]["head"]
+        self.w.set_pr(key2, land_pr(h2), self.t)
+        reset2 = self.t + 600
+        self.latch("rest", reset2)
+        self.w.cache_answers.append(self.cached_answer(h2))
+        self.tick(30)
+        self.assertTrue(self.q.entries[key2]["cacheVerdict"]["ok"])
+        self.github_head[key2] = "c" * 40  # pushed meanwhile; the nudge's read at the clear shows it
+        self.w.set_pr(key2, land_pr("c" * 40), self.t)
+        self.retries(4)
+        self.tick(reset2 + 1 - self.t)
+        self.tick(2)
+        self.assertEqual(self.w.gh_calls("pr", "merge"), [])
+        self.assertNotIn("--cache-only", self.w.explains()[-1])
+
+    def test_a_latched_row_on_a_host_with_no_gh_quota_shim_is_not_judged_from_the_cache(self):
+        """Review of #2193: with no gh-quota shim (land.json gh missing), nothing answers merge_hold's reads from the
+        caches, so explain --cache-only is never run; the row says why and waits for the clear."""
+        key, head = self.latched_fresh_row()
+        self.w.gh.unlink()
+        self.latch("rest", self.t + 600)
+        self.w.cache_answers.append(self.cached_answer(head))
+        self.tick(30)
+        self.assertEqual((self.w.explains(), self.w.cache_explains()), ([], []))
+        e = self.q.entries[key]
+        self.assertIn("cache_no_shim", [h["event"] for h in e["history"]])
+        self.assertIn("no gh-quota shim", gg.land_line(e, self.t))
+
+    def test_a_latched_row_with_an_old_cached_copy_is_not_judged_from_it(self):
+        key = self.stuck(11, 3 * 3600)  # its PR read 600 s ago: over LAND_CACHE_ONLY_AGE
+        self.latch("rest", self.t + 600)
+        self.tick(30)
+        self.assertEqual((self.w.explains(), self.w.cache_explains()), ([], []))
+        e = self.q.entries[key]
+        self.assertIn("cache_stale", [h["event"] for h in e["history"]])
+        self.assertIn("judged from cache: not held (its PR's cached copy is", gg.land_line(e, self.t))
 
     def test_only_due_entries_hold_a_waited_pr_watch(self):
         """huge-blue, 2026-11-18 20:00Z: 525 of 725 pr watches were the land queue's, each open entry's waited watch
