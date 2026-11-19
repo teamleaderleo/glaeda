@@ -14155,9 +14155,10 @@ COORD_ALERT = Path(os.environ.get("GLAEDA_GH_COORD_ALERT")
 
 def coord_alert_spawn(text: str) -> None:
     """TEXT to the coordinator through leo-workspace's coord_alert (its routes: tell-coordinator, acpmux, then lane-gh
-    send on a lane VM), in a process of its own so its bounded routes never hold a tick. Logged, never raised."""
+    send on a lane VM), in a process of its own so its bounded routes never hold a tick. Logged, never raised.
+    With no coord_alert, the alert is a FIRE (coord_alert_missing), never only a log line."""
     if not COORD_ALERT.is_file():
-        log({"event": "alert-unsent", "why": f"no {COORD_ALERT}", "text": text})
+        coord_alert_missing(text)
         return
     try:
         subprocess.Popen([sys.executable, "-I", os.path.abspath(__file__), "coord-alert", text],
@@ -14167,8 +14168,33 @@ def coord_alert_spawn(text: str) -> None:
         log({"event": "alert-unsent", "why": describe(error), "text": text})
 
 
+def coord_alert_missing(text: str) -> None:
+    """TEXT with no coord_alert to send it: a FIRE naming the missing tool, as a notice line (written even with no
+    inbox tool) and through the alarm path the daemon's other alarms use (ALARM_CMD, tell-coordinator), with TEXT in
+    it. 2026-11-19: coord_alert.py never merged (leo-workspace#5760 open), and huge-blue logged 12 straggler alerts
+    as alert-unsent over a day while nobody heard of any."""
+    fire = (f"FIRE glaeda-gh on {policy_host()}: its alert tool {COORD_ALERT} is missing, so this alert came by "
+            f"{ALARM_CMD.name} instead; restore the tool or set GLAEDA_GH_COORD_ALERT. The alert: {text}")
+    notice_line(time.time(), "alert-tool-missing", "fire", fire, {"tool": os.fspath(COORD_ALERT)})
+    if not (ALARM_CMD.is_file() and os.access(ALARM_CMD, os.X_OK)):
+        log({"event": "alert-unsent", "why": f"no {COORD_ALERT} and no {ALARM_CMD}", "text": text})
+        return
+    try:
+        subprocess.Popen([os.fspath(ALARM_CMD), "--from", "glaeda-gh", "--severity", "fire", fire],
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         start_new_session=True)
+    except OSError as error:
+        log({"event": "alert-unsent", "why": f"no {COORD_ALERT}; {ALARM_CMD}: {describe(error)}", "text": text})
+        return
+    log({"event": "alert", "alarm": "stragglers", "via": f"{ALARM_CMD} (no {COORD_ALERT}: FIRE)", "text": text})
+
+
 def coord_alert_send(text: str) -> int:
-    """`glaeda-gh coord-alert TEXT`: coord_alert.send(TEXT, "glaeda-gh"), the route it took logged."""
+    """`glaeda-gh coord-alert TEXT`: coord_alert.send(TEXT, "glaeda-gh"), the route it took logged (with no
+    coord_alert, coord_alert_missing's FIRE)."""
+    if not COORD_ALERT.is_file():
+        coord_alert_missing(text)
+        return EXIT_OK
     try:
         spec = importlib.util.spec_from_file_location("coord_alert", COORD_ALERT)
         module = importlib.util.module_from_spec(spec)  # type: ignore[arg-type]
