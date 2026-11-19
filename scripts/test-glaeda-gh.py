@@ -20787,6 +20787,7 @@ class LandTest(Base):
         for env in self.w.envs:
             self.assertEqual((env["CMUX_AGENT_SESSION"], env["MAY_MERGE_PATH"], env["GLAEDA_GH_AGENT"]),
                              ("glaeda-land", "glaeda-land", "glaeda-land"))
+            self.assertEqual(env["GH_QUOTA_LANDING_READ"], "merge-hold")
             for k in ("ACPMUX_SESSION_NAME", "CLAUDE_SESSION_ID", "CODEX_THREAD_ID", "ACPMUX_SESSION_ID"):
                 self.assertNotIn(k, env)
 
@@ -23444,8 +23445,6 @@ class ConfirmedUpdatedAtTest(Base):
             self.assertEqual(gg.confirmed_updated({"data": data}, node, 5.0), {})
 
 
-<<<<<<< HEAD
-=======
 APP_TOKEN = "ghs_" + "a" * 36  # the ci-watch App's installation token in these tests
 
 
@@ -23507,6 +23506,30 @@ class AppPoolTest(Base):
         self.daemon.request("POST", "/graphql", {"query": "query { viewer { login } }", "variables": {}})
         self.assertEqual(self.app_calls, [])
         self.assertEqual(len(self.gh.calls), 4)
+
+    def test_a_single_owner_graphql_read_goes_on_the_app_but_opaque_and_mixed_queries_do_not(self) -> None:
+        query = {"query": "query($o0:String!,$r0:String!,$n0:Int!){repository(owner:$o0,name:$r0){pullRequest(number:$n0){number}}}",
+                 "variables": {"o0": "manaflow-ai", "r0": "cmux", "n0": 1}}
+        self.daemon.request("POST", "/graphql", query)
+        self.daemon.request("POST", "/graphql", {"query": "query { viewer { login } }", "variables": {}})
+        self.daemon.request("POST", "/graphql", {"query": "query($o0:String!,$r0:String!,$n0:Int!,$o1:String!,$r1:String!,$n1:Int!){x}",
+                                                      "variables": {"o0": "manaflow-ai", "r0": "cmux", "n0": 1,
+                                                                    "o1": "other", "r1": "r", "n1": 1}})
+        self.assertEqual(len(self.app_calls), 1)
+        self.assertEqual(len(self.gh.calls), 2)
+        self.assertEqual(self.app_calls[0], ("POST", gg.API + "/graphql"))
+
+    def test_a_graphql_app_rate_limit_falls_back_without_poisoning_the_login(self) -> None:
+        self.app_answers.append((200, {"x-ratelimit-limit": "10000", "x-ratelimit-remaining": "0",
+                                       "x-ratelimit-reset": str(int(NOW + 900))},
+                                 b'{"errors":[{"type":"RATE_LIMITED","message":"rate limit exceeded"}]}'))
+        query = {"query": "query($o0:String!,$r0:String!,$n0:Int!){repository(owner:$o0,name:$r0){pullRequest(number:$n0){number}}}",
+                 "variables": {"o0": "manaflow-ai", "r0": "cmux", "n0": 1}}
+        self.daemon.request("POST", "/graphql", query)
+        self.assertEqual(len(self.app_calls), 1)
+        self.assertEqual(len(self.gh.calls), 1)
+        self.assertEqual(self.daemon.backoff["graphql"], 0.0)
+        self.assertEqual(self.pool.status()["fellBack"], 1)
 
     def test_no_app_on_this_host_keeps_the_login_and_asks_again_only_after_a_rest(self) -> None:
         self.ready = False
@@ -23620,8 +23643,6 @@ class AppPoolHostTest(unittest.TestCase):
         self.assertIsNone(pool.owner_of("POST", "/repos/manaflow-ai/cmux/pulls"))
         self.assertEqual(pool.token("manaflow-ai"), APP_TOKEN)
 
-
->>>>>>> 726f9c05 (glaeda-gh: daemon repo reads go on the ci-watch App pool when the host holds it)
 
 if __name__ == "__main__":
     unittest.main()
