@@ -73,7 +73,9 @@ the daemon is the only process that talks to GitHub, and clients only read its c
   does not change.
 - Runs use REST with If-None-Match, so an unchanged run answers 304, which GitHub does not count
   against the quota. The job list is read when a client passed --jobs, and once per attempt when
-  a run fails, for the failed steps.
+  a run fails, for the failed steps. While a waited run is still in progress its list is re-read
+  at most every RUN_JOBS_RUNNING_EVERY (600 s); a one-off `--jobs` look and a completed run are
+  read at once.
 - REST and GraphQL are one pool. Each tick, PR reads and run reads each go to whichever bucket is
   richer for the time it has left: what remains above its reserve divided by the seconds until
   its own reset (600 left with 2 minutes to go is rich; 600 left with 50 is poor). A kind moves
@@ -346,6 +348,12 @@ CACHE_KEEP = 3600  # unwatched cache files are removed after this long
 # this long after the first, or a wait's own last touch after the wait ended, is dropped once the daemon has read it.
 ONCE_SPAN = CYCLE
 ONCE_SLACK = 2.0  # a wait's touch writes waitedAt and the file's mtime a moment apart
+# A waited `--jobs` watch of a run still in progress re-reads its job list at most this often, and is answered from the
+# kept list in between (Daemon.read_jobs, jobs_spaced). On 2026-11-19 14:15Z the broker host's daemon spent 199 counted
+# REST in an hour against its cap of 150, every one GET .../actions/runs/{id}/jobs for the land queue's waiter: on cmux a
+# running run's job list changes every cycle, so each read was a counted 200, never a 304. A wait rules on the run's own
+# state, which the run read gives each cycle; the list matters once the run completes, and that read is never spaced.
+RUN_JOBS_RUNNING_EVERY = 600
 LEAN_FACTOR = 4  # below the floor, poll this many times less often
 FLOORS = {"rest": (1500, 300), "graphql": (500, 100)}  # (floor, reserve) per quota: the module defaults
 # Every reserve is raised to the hard reserve (hard_reserve_floor, 500 REST and 500 GraphQL by default), which the
@@ -8179,6 +8187,28 @@ class Daemon:
                 fields["source"] = "graphql"
             self.read_jobs(e, fields, fresh)
 
+    def jobs_spaced(self, e: dict, run: dict, attempt: int) -> bool:
+        """Whether a `--jobs` watch of a run still in progress keeps its job list this cycle instead of reading it
+        (RUN_JOBS_RUNNING_EVERY): only a watch a wait keeps live, whose last interest was that wait (a touch at its
+        waitedAt) or came before the kept list, and whose kept list is this attempt's and younger than the spacing.
+        A one-off `--jobs` look (a `status`, a downstream's read) asked since the list was read is never spaced, so it
+        gets a list read after its ask (F2, once_answered); nor is a new wait started since; nor a completed run."""
+        if run.get("status") == "completed" or not self.waited(e):
+            return False
+        prior = e["cache"] or {}
+        jobs, jobs_at = prior.get("jobs"), prior.get("jobsAt")
+        if not isinstance(jobs, list) or not jobs or jobs_attempt(jobs) != attempt \
+                or not isinstance(jobs_at, (int, float)) or isinstance(jobs_at, bool) \
+                or not 0 <= self.now - jobs_at < RUN_JOBS_RUNNING_EVERY:
+            return False
+        touched, waited_at, began = e.get("touched"), e.get("waitedAt"), e.get("waitBegan")
+        if isinstance(began, (int, float)) and began > jobs_at:
+            return False  # a wait that began after the kept list: its first look reads one
+        if isinstance(touched, (int, float)) and touched > jobs_at:
+            # interest since the kept list: a wait's own touch (at its waitedAt) is not an ask for a new list
+            return isinstance(waited_at, (int, float)) and touched <= waited_at + ONCE_SLACK
+        return True
+
     def read_jobs(self, e: dict, fields: dict[str, Any], fresh: bool) -> None:
         """Store a run read, with its job list when wanted. Job lists come from REST on either path:
         only REST names the runner and its labels, which tell a runner's refusal from a failure."""
@@ -8211,6 +8241,10 @@ class Daemon:
                 self.sent.append((self.now, "kept"))  # a job list answered with no request (budget: hour.kept)
                 self.store(e["key"], e["cache"], **fields)
                 return
+        if e["jobs"] and not failed_attempt and self.jobs_spaced(e, run, attempt):
+            self.sent.append((self.now, "kept"))  # served from the kept list (budget: hour.kept)
+            self.store(e["key"], e["cache"], **fields)
+            return
         if (e["jobs"] and self.mode("rest") == "normal") or failed_attempt:
             try:
                 with self.calling(*caller_of(e["key"]), waiter_of(e)):  # its own waiter, inside a batch's call too

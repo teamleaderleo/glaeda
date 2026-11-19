@@ -1410,6 +1410,34 @@ class GraphqlDietTest(Base):
         self.assertEqual([e for e in self.daemon.watches() if e["key"] == key], [])
         self.assertEqual(self.watched(), set())
 
+    def test_a_waited_running_runs_job_list_is_read_once_per_spacing_and_at_completion(self) -> None:
+        """2026-11-19 14:15Z: the broker host's daemon spent 199 counted REST in an hour (cap 150), every one GET
+        .../actions/runs/{id}/jobs for the land queue's waiter: a running run's list changes each cycle, so each read
+        was a counted 200. Over 20 cycles of a waited `--jobs` watch of a running run: a read at the start and one per
+        RUN_JOBS_RUNNING_EVERY, not 20; at completion one more at once; a one-off look asked since is never spaced."""
+        key = "run:o/r/9"
+        running = {"status": "in_progress", "run_attempt": 1}
+        e = {"key": key, "jobs": True, "touched": NOW, "waitedAt": NOW, "waitBegan": NOW, "cache": {}}
+        reads = 0
+        for i in range(20):
+            self.daemon.now = t = NOW + i * gg.CYCLE
+            e["touched"] = e["waitedAt"] = t  # the wait's own touch each cycle
+            if not self.daemon.jobs_spaced(e, running, 1):
+                reads += 1
+                e["cache"] = {"jobs": [{"id": 1, "run_attempt": 1, "status": "in_progress"}], "jobsAt": t}
+        self.assertEqual(reads, 2, "20 cycles of 60 s with 600 s spacing: the first read and one more")
+        self.daemon.now = NOW + 20 * gg.CYCLE
+        self.assertFalse(self.daemon.jobs_spaced(e, {"status": "completed", "run_attempt": 1}, 1),
+                         "a completed run's list is read at once")
+        kept_at = e["cache"]["jobsAt"]
+        look = {**e, "touched": kept_at + 30, "waitedAt": kept_at - 300}
+        self.daemon.now = kept_at + 31
+        self.assertFalse(self.daemon.jobs_spaced(look, running, 1), "a one-off look since the list gets a read")
+        self.assertFalse(self.daemon.jobs_spaced({**e, "waitBegan": kept_at + 10}, running, 1),
+                         "a wait begun since the list gets a read")
+        self.assertFalse(self.daemon.jobs_spaced(e, {"status": "in_progress", "run_attempt": 2}, 2),
+                         "a new attempt's list is read")
+
     def test_a_registration_racing_the_set_aside_is_kept(self) -> None:
         """Review of #1960: the daemon sets an answered look aside under .register.lock and only if its mtime is what
         it read, so a wait registered in between is never lost."""
