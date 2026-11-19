@@ -4134,7 +4134,8 @@ class Daemon:
         if isinstance(v, tuple):
             data = v[2]
             rec.update(state="stale", level=v[0], kind=data.get("kind"), age=data.get("age"), key=data.get("key"),
-                       restart=data.get("cause") not in STALE_NO_RESTART, reason=self.stale_reason)
+                       restart=data.get("cause") not in STALE_NO_RESTART and data.get("valve") != "spent",
+                       reason=self.stale_reason)
         elif v == "held":
             stale = {k: a for k, a in (getattr(self, "stale_waited", None) or {}).items()
                      if isinstance(a, (int, float)) and a > STALE_DATA_AFTER}
@@ -8284,7 +8285,10 @@ class Daemon:
 
     def read_feed(self) -> list[dict]:
         """The feed pages after the cursor. The first call only learns the cursor; a reset (the
-        controller lost its state) starts over, so every watched run gets a fresh baseline."""
+        controller lost its state) starts over, so every watched run gets a fresh baseline. A page after the first
+        that fails ends the read with the pages before it (the cursor is past them: dropping them would lose their
+        runs' on-event hooks) and leaves its error in controller_feed_error."""
+        self.controller_feed_error = None
         if self.controller_cursor is None:
             doc = self.controller.events(None)
             self.controller_cursor, self.controller_seen = doc["cursor"], {}
@@ -8293,7 +8297,13 @@ class Daemon:
         for _ in range(FEED_PAGES):
             if pages and not self.controller_room():
                 break  # the tick's controller budget is spent: the backlog continues next tick, from the cursor
-            doc = self.controller.events(self.controller_cursor)
+            try:
+                doc = self.controller.events(self.controller_cursor)
+            except WatchError as error:
+                if not pages:
+                    raise
+                self.controller_feed_error = error
+                break
             if doc.get("reset"):
                 self.controller_cursor, self.controller_seen = doc["cursor"], {}
                 return [doc]
@@ -8343,10 +8353,11 @@ class Daemon:
                 self.controller.budget_end = float("inf")
 
     def controller_room(self) -> bool:
-        """Whether this tick may ask the controller one more thing: it is not out (controller_down) and the tick's
-        CONTROLLER_TICK_BUDGET is not spent."""
+        """Whether this tick may ask the controller one more thing: it is not out (controller_down) and a whole
+        CONTROLLER_TIMEOUT fits in what is left of the tick's CONTROLLER_TICK_BUDGET. A request is never started to be
+        cut short by the budget: that cut would read as the controller failing, and take it out (#2201 review)."""
         return (self.controller is not None and self.now >= self.controller_down_until
-                and time.monotonic() < self.controller_budget_end)
+                and time.monotonic() + CONTROLLER_TIMEOUT <= self.controller_budget_end)
 
     def read_controller(self, entries: list[dict]) -> None:
         """from_controller's reads, within the tick's CONTROLLER_TICK_BUDGET."""
@@ -8381,6 +8392,7 @@ class Daemon:
             try:
                 run = self.controller.run(run_id)
             except WatchError as error:
+                self.controller_feed_error = None
                 return self.controller_down(error)
             known = run is not None and (run.get("repo") or "").lower() == f"{owner}/{repo}"
             self.controller_seen[key] = known
@@ -8395,7 +8407,10 @@ class Daemon:
             self.nudge(entries, page)
             self.merge_comments(entries, page)
         self.controller_filled = {k for k, known in self.controller_seen.items() if known}
-        if pages:
+        if pages and getattr(self, "controller_feed_error", None) is not None:
+            error, self.controller_feed_error = self.controller_feed_error, None
+            return self.controller_down(error)
+        if pages and self.now >= self.controller_down_until:  # an on-event lookup above may have taken it out
             self.controller_status = {"state": "ok", "lastDelivery": pages[-1].get("receiver_last_delivery"),
                                       "token": bool(self.controller.token)}
 
@@ -8502,6 +8517,9 @@ class Daemon:
         if self.controller_room() and hasattr(self.controller, "run_jobs"):
             try:
                 doc = self.controller.run_jobs(repo, run_id, attempt)
+            except NoReceiver as error:  # no run-jobs endpoint (or a brief 503): the feed is still served
+                doc = {}
+                self.errors.append(f"on-event jobs of {repo}/{run_id}/{attempt}: {describe(error)}")
             except WatchError as error:
                 # One failure takes the controller out (CONTROLLER_TICK_BUDGET's comment): each pending run asking it
                 # again was how a timing-out controller took 17.1 s of the tick

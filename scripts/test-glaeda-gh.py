@@ -808,6 +808,14 @@ class ControllerTest(Base):
             ctl.events(5)
         self.assertLess(time.monotonic() - began, 1.5)
 
+    def test_no_controller_request_starts_that_the_budget_would_cut(self) -> None:
+        # #2201 review: a request started with less than CONTROLLER_TIMEOUT left is cut by the daemon's own budget,
+        # and that cut reads as the controller failing. It waits for the next tick instead.
+        self.daemon.controller_budget_end = time.monotonic() + gg.CONTROLLER_TIMEOUT - 0.5
+        self.assertFalse(self.daemon.controller_room())
+        self.daemon.controller_budget_end = time.monotonic() + gg.CONTROLLER_TIMEOUT + 0.5
+        self.assertTrue(self.daemon.controller_room())
+
     def test_tracked_run_costs_no_quota(self) -> None:
         self.ctl.runs[21] = ctl_run(21, "in_progress")
         key = gg.parse_key("run", "o/r/21")
@@ -18295,6 +18303,43 @@ class OnEventTest(Base):
             self.assertEqual((len(self.ctl.job_reads), len(self.ctl.feeds)), (1, feeds), "skipped the next tick too")
         self.assertEqual(len(gg.on_event_state()["pending"]), 8, "the runs stay pending for later")
 
+    def test_a_later_feed_page_that_fails_keeps_the_pages_before_it(self) -> None:
+        # #2201 review: the cursor moves past each page as it is read, so a page 2 that fails (a slow controller) must
+        # not drop page 1: its finished run's hook would never fire, the feed being the only place it comes from.
+        self.baseline()
+        self.ctl.held_jobs[(320, 1)] = [held_job("promote-production")]
+        self.ctl.runs[320] = backend_run(320)
+        read = self.ctl.events
+
+        def pages(since: int | None) -> dict:
+            if len(self.ctl.feeds) > 1:
+                self.ctl.feeds.append(since)
+                raise gg.WatchError("controller: TimeoutError")
+            return {**read(since), "more": True}
+
+        with mock.patch.object(self.ctl, "events", side_effect=pages):
+            self.daemon.tick(NOW + gg.TICK)
+        self.settle()
+        self.assertEqual(len(self.fired()), 1, "page 1's run is not lost")
+        self.assertEqual(self.daemon.controller_status["state"], "down", "page 2's failure still takes it out")
+
+    def test_a_run_jobs_endpoint_that_is_absent_leaves_the_feed_up(self) -> None:
+        # #2201 review: a 404 or 503 from run-jobs is that endpoint, not the controller: one error per lookup, as
+        # before, and the feed is still read (controller_down would take it all out for CONTROLLER_ABSENT).
+        self.baseline()
+        self.ctl.runs[330] = backend_run(330)
+
+        def absent(repo: str, run_id: int, attempt: int) -> dict:
+            self.ctl.job_reads.append((repo, run_id, attempt))
+            raise gg.NoReceiver("controller HTTP 404")
+
+        with mock.patch.object(self.ctl, "run_jobs", side_effect=absent):
+            self.daemon.tick(NOW + gg.TICK)
+            feeds = len(self.ctl.feeds)
+            self.assertEqual(self.daemon.controller_status["state"], "ok")
+            self.daemon.tick(NOW + 2 * gg.TICK)
+        self.assertGreater(len(self.ctl.feeds), feeds, "the feed is read the next tick")
+
     def test_runs_the_deadline_cut_off_go_first_next_tick(self) -> None:
         # #2022 F1: unresolved runs that use up every tick must not starve a later run whose job is ready
         self.baseline()
@@ -22513,6 +22558,15 @@ class RefreshStallTest(AlarmBase):
         starved = gg.daemon_starved({"at": time.time(), "staleWaited": {}, "stale": verdict})
         self.assertTrue(starved["quota"])
         self.assertEqual(starved["why"], verdict["reason"])
+
+    def test_a_spent_valve_tells_restart_not_to_help_either(self) -> None:
+        # #2201 review: the alarm says another restart will not help once the valve's restart did not; the verdict
+        # restart reads says the same.
+        self.daemon.stale_now = ("warn", "text", {"kind": "pr", "age": 4000, "key": "newest", "valve": "spent"})
+        self.daemon.stale_reason = "no PR has been refreshed for 4000s"
+        self.assertEqual(self.daemon.stale_record()["restart"], False)
+        self.daemon.stale_now = ("warn", "text", {"kind": "pr", "age": 4000, "key": "newest", "valve": "restarting"})
+        self.assertEqual(self.daemon.stale_record()["restart"], True)
 
     def test_a_cleared_verdict_is_named_when_restart_finds_nothing_to_do(self) -> None:
         self.policy()
