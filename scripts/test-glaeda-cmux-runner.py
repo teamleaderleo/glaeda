@@ -9431,7 +9431,8 @@ class MemoryCapTest(unittest.TestCase):
             patcher = mock.patch.object(hook, name, side_effect=fake)
             patcher.start()
             self.addCleanup(patcher.stop)
-        patcher = mock.patch.dict(os.environ, {"GLAEDA_RUNNER_MEMORY_CAP": ""})
+        # 50 GiB of RAM: the code marks (5% and 10%) are 2.5 and 5 GiB
+        patcher = mock.patch.dict(os.environ, {"GLAEDA_RUNNER_MEMORY_CAP": "", hook.HOST_MEM_ENV: "51200"})
         patcher.start()
         self.addCleanup(patcher.stop)
         self.gate = hook.Gate(self.runner, os.fspath(self.tmp / "host.lock"), os.fspath(self.tmp / "none.json"),
@@ -9473,7 +9474,7 @@ class MemoryCapTest(unittest.TestCase):
     def test_settings_and_the_kill_switch(self) -> None:
         now = 1_800_000_000.0
         code = hook.gate_memory_cap(None, "x", now, raw="")
-        self.assertEqual(code, hook.MemoryCap(4096, 5120, 600.0), "on by default at the code marks")
+        self.assertEqual(code, hook.MemoryCap(2560, 5120, 600.0), "on by default at the code marks: 5% and 10% of 50 GiB")
         for raw in ("off", "0", "false", "OFF"):
             self.assertIsNone(hook.gate_memory_cap(None, "x", now, raw=raw), raw)
         later = datetime.datetime.fromtimestamp(now + 60, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -9490,8 +9491,18 @@ class MemoryCapTest(unittest.TestCase):
         self.assertIs(hook._memory_cap({"maxWaitMin": 61}), False, "no hold may outlast an hour")
         self.assertIs(hook._memory_cap({"maxWaitMin": float("inf")}), False)
         self.assertIsNone(hook.gate_memory_cap({"defaults": {"memoryCap": False}}, "x", now, raw=""))
+        # 2026-11-19 (Leo: "stretch everything till it's at like... 90% cpu/ram / we can be more wary at >95%"): the
+        # marks are a share of the RAM, so a 16 GiB mini takes jobs to 95% used and listens again at 90%.
+        self.assertEqual(hook.gate_memory_cap(None, "x", now, raw="", ram_mib=16384), hook.MemoryCap(819, 1638, 600.0))
+        self.assertEqual(hook.gate_memory_cap(None, "x", now, raw="", ram_mib=98304), hook.MemoryCap(4915, 9830, 600.0))
+        self.assertEqual(hook._memory_cap({"needPct": 2, "resumePct": 4}, 51200), hook.MemoryCap(1024, 2048, 600.0))
+        self.assertEqual(hook._memory_cap({"needGiB": 3, "needPct": 50}, 51200), hook.MemoryCap(3072, 5120, 600.0),
+                         "GiB wins over Pct")
+        self.assertIs(hook._memory_cap({"needPct": 0}, 51200), False)
+        self.assertIs(hook._memory_cap({"resumePct": 101}, 51200), False)
+        self.assertIs(hook._memory_cap({"needPct": 20, "resumePct": 10}, 51200), False, "resume under need")
         declared = json.loads((ROOT / "config" / "runner-gate.json").read_text())
-        self.assertEqual(hook.gate_memory_cap(declared, "cmux17", now, raw=""), hook.MemoryCap(4096, 5120, 600.0),
+        self.assertEqual(hook.gate_memory_cap(declared, "cmux17", now, raw=""), hook.MemoryCap(2560, 5120, 600.0),
                          "the declared cap")
 
     def test_reclaimable_and_short(self) -> None:
@@ -10669,15 +10680,15 @@ class GateTest(unittest.TestCase):
         busy[0] = hook.GATE_CPU_PAUSE
         self.assertEqual(gate.claimed(), "a fleet build holds the host lock", "the fleet's claim comes first")
 
-    def test_the_listener_gate_pauses_at_85_and_resumes_below_80_by_default(self) -> None:
+    def test_the_listener_gate_pauses_at_95_and_resumes_below_90_by_default(self) -> None:
         """With units that are cores, admission stops near the core count, and the gate is the margin for jobs
-        above their estimate: by default an idle listener stops at 85% sampled CPU and listens again below 80%.
+        above their estimate: by default an idle listener stops at 95% sampled CPU and listens again below 90%.
         The hook is loaded fresh without the GLAEDA_RUNNER_GATE_CPU_* overrides this module sets."""
         clean = {k: v for k, v in os.environ.items() if not k.startswith("GLAEDA_RUNNER_GATE_CPU_")}
         with mock.patch.dict(os.environ, clean, clear=True):
             fresh = load("glaeda_cmux_runner_hook_gate_defaults", HOOK)
         self.addCleanup(sys.modules.pop, "glaeda_cmux_runner_hook_gate_defaults", None)
-        self.assertEqual((fresh.GATE_CPU_PAUSE, fresh.GATE_CPU_RESUME), (85.0, 80.0))
+        self.assertEqual((fresh.GATE_CPU_PAUSE, fresh.GATE_CPU_RESUME), (95.0, 90.0))
         self.assertEqual(fresh.GATE_CPU_WINDOW_S, 60.0, "the marks apply to a 60 s average by default")
         busy = [0.0]
         gate = fresh.Gate(self.runner, os.fspath(self.lock), os.fspath(self.tmp / "none.json"), self.state)
@@ -10687,14 +10698,14 @@ class GateTest(unittest.TestCase):
                 mock.patch.object(fresh, "memory_pressure_level", return_value=1), \
                 mock.patch.object(fresh, "load_1min", return_value=1.0), \
                 mock.patch.object(fresh, "thermal_pressure_level", return_value=0):
-            for cpu, held in ((84.9, False), (85.0, True), (82.0, True), (80.0, True), (79.9, False), (84.0, False),
-                              (90.0, True)):
+            for cpu, held in ((94.9, False), (95.0, True), (92.0, True), (90.0, True), (89.9, False), (94.0, False),
+                              (99.0, True)):
                 busy[0] = cpu
                 why = gate.claimed()
                 self.assertEqual(why is not None, held, f"{cpu}% CPU: {why}")
                 if held:
                     self.assertTrue(why.startswith(fresh.SATURATED), why)
-                    self.assertIn("listening resumes below 80% CPU", why)
+                    self.assertIn("listening resumes below 90% CPU", why)
 
     def gate_settings_release(self, doc: object, tag: str = "r-20261030-test") -> Path:
         """A fake glaeda-update state dir whose current release carries `doc` as config/runner-gate.json."""
@@ -10810,7 +10821,7 @@ class GateTest(unittest.TestCase):
         # the gate: with the CPU hold off (the declared default) a side listener is still held for overload,
         # a gui runner is not, and a hold past GATE_LOAD_MAX_HOLD_S listens anyway so no label is stranded
         update = self.gate_settings_release({"schema": hook.GATE_SETTINGS_SCHEMA, "defaults": {
-            "cpuHold": False, "overloadHold": {"pausePerCore": 2.0, "resumePerCore": 1.5, "cpuAtLeast": 80}}})
+            "cpuHold": False, "overloadHold": {"pausePerCore": 2.0, "resumePerCore": 1.5, "cpuAtLeast": 95}}})
         load = [100.0]
         for name, value in (("GATE_CPU_EVERY_S", 0.0), ("GATE_SETTINGS_EVERY_S", 0.0),
                             ("GATE_SETTINGS_DIR", os.fspath(update))):
@@ -19975,12 +19986,12 @@ class CapacityArithmeticTest(unittest.TestCase):
             self.assertIn("2/12 GiB", why)
 
     def test_the_listener_gate_holds_for_ram(self) -> None:
-        needs = self.needs({f"{self.GUEST}/build-fleet-go.yml/test": self.row(1.0, 5500)})
+        needs = self.needs({f"{self.GUEST}/build-fleet-go.yml/test": self.row(1.0, 6500)})
         with self.host(12, 16, needs):
             for _ in range(2):
                 self.assertTrue(self.take("test")[0])
             why = hook.mini_full(self.dir / "capacity", 12, hook.RunnerScope(units=12))
-            self.assertIn("only 0 of 12 GiB of RAM", why)
+            self.assertIn("only 0 of 14 GiB of RAM", why)
             self.assertIn(hook.UNITS_FULL, why, "a RAM hold reads as a units hold (SESSION_FIRST, reserves)")
             self.assertEqual(hook.fit_mem_chunks([20000, 3000], 12), 3, "a job that never fits holds nothing")
             self.assertEqual(hook.fit_mem_chunks([], 12), 1)
@@ -19994,7 +20005,7 @@ class CapacityArithmeticTest(unittest.TestCase):
                              capture_output=True, text=True, env=env, timeout=60)
         self.assertEqual(out.returncode, 0, out.stderr)
         answer = json.loads(out.stdout)
-        self.assertEqual(answer["host"], {"cores": 12, "mem_mib": 16384, "mem_floor_mib": 4096, "mem_chunks": 12,
+        self.assertEqual(answer["host"], {"cores": 12, "mem_mib": 16384, "mem_floor_mib": 1638, "mem_chunks": 14,
                                           "mem_chunk_mib": 1024})
         self.assertEqual(answer["classes"]["compile"], {"cores": 3, "mib": 9000})
         out = subprocess.run([sys.executable, os.fspath(HOOK), "needs", "--needs-file", os.fspath(self.dir / "x")],
@@ -20181,20 +20192,20 @@ class SimDynamicTest(unittest.TestCase):
         self.assertFalse(hook.probe(self.capacity / hook.SIM_GATE), "a copy past the first holds the gate shared")
 
     def test_the_ceiling_is_never_exceeded(self) -> None:
-        self.assertEqual(hook.sim_ceiling(), (5, "(32 GiB - 6.4 reserve) / 4.5 GiB (stock fallback) = 5"))
-        for _ in range(5):
+        self.assertEqual(hook.sim_ceiling(), (6, "(32 GiB - 3.2 reserve) / 4.5 GiB (stock fallback) = 6"))
+        for _ in range(6):
             self.assertTrue(self.take()[0])
         ok, why = self.take()
         self.assertFalse(ok)
-        self.assertEqual(why, "capacity: all 5 simulator tokens are taken (ios-simulator is simulator)")
-        self.assertFalse((self.capacity / "simulator-5.token").exists(), "no copy past the ceiling is ever made")
-        self.assertEqual(hook.sim_copy_room(5, 0, self.capacity),
-                         "the ceiling is 5 simulators: (32 GiB - 6.4 reserve) / 4.5 GiB (stock fallback) = 5")
-        self.assertEqual(len(hook.sim_token_names()), 5)
+        self.assertEqual(why, "capacity: all 6 simulator tokens are taken (ios-simulator is simulator)")
+        self.assertFalse((self.capacity / "simulator-6.token").exists(), "no copy past the ceiling is ever made")
+        self.assertEqual(hook.sim_copy_room(6, 0, self.capacity),
+                         "the ceiling is 6 simulators: (32 GiB - 3.2 reserve) / 4.5 GiB (stock fallback) = 6")
+        self.assertEqual(len(hook.sim_token_names()), 6)
         with mock.patch.dict(os.environ, {hook.HOST_MEM_ENV: str(16 * 1024)}):
-            self.assertEqual(hook.sim_ceiling()[0], 2, "16 GiB: (16 - 4) / 4.5")
+            self.assertEqual(hook.sim_ceiling()[0], 3, "16 GiB: (16 - 1.6) / 4.5")
         with mock.patch.dict(os.environ, {hook.HOST_MEM_ENV: str(96 * 1024)}):
-            self.assertEqual(hook.sim_ceiling()[0], 17, "96 GiB: (96 - 19.2) / 4.5")
+            self.assertEqual(hook.sim_ceiling()[0], 19, "96 GiB: (96 - 9.6) / 4.5")
         with mock.patch.dict(os.environ, {hook.HOST_MEM_ENV: ""}), mock.patch.object(hook.sys, "platform", "linux"):
             self.assertEqual(hook.sim_ceiling(), (1, "RAM unmeasured"), "unmeasured: one per mini, as before")
 
@@ -20204,7 +20215,7 @@ class SimDynamicTest(unittest.TestCase):
         self.assertEqual(hook.sim_rss_mib(), (3846, "test-ios.yml/ios-simulator-build rss p90"))
         self.needs(jobs={hook.SIM_RSS_JOB_ROW: {**row, "rss_peak_mib_p95": 5120}})
         self.assertEqual(hook.sim_rss_mib(), (5120, "test-ios.yml/ios-simulator-build rss p95"))
-        self.assertEqual(hook.sim_ceiling()[0], 5, "(32 - 6.4) / 5")
+        self.assertEqual(hook.sim_ceiling()[0], 5, "(32 - 3.2) / 5")
         self.needs(classes={"simulator": {"n": 40, "cores_p90": 0.2, "rss_peak_mib_p95": 8192}},
                    jobs={hook.SIM_RSS_JOB_ROW: {**row, "rss_peak_mib_p95": 5120}})
         self.assertEqual(hook.sim_rss_mib(), (8192, "simulator rss p95"), "the class row first")
@@ -20212,30 +20223,30 @@ class SimDynamicTest(unittest.TestCase):
         self.needs(classes={"simulator": {"n": 4, "cores_p90": 0.2, "rss_peak_mib_p95": 8192}})
         self.assertEqual(hook.sim_rss_mib(), (hook.SIM_RSS_FALLBACK_MIB, "stock fallback"), "too few runs")
 
-    def test_copies_stop_at_80_percent_ram(self) -> None:
+    def test_copies_stop_at_90_percent_ram(self) -> None:
         self.assertTrue(self.take()[0])
-        os.environ[hook.HOST_MEM_FREE_ENV] = "33"  # 10.6 GiB free less 4.5 is 6.1 < 6.4
+        os.environ[hook.HOST_MEM_FREE_ENV] = "24"  # 7.7 GiB free less 4.5 is 3.2 < 3.2 (3.18 < 3.28)
         ok, why = self.take()
         self.assertFalse(ok)
         self.assertTrue(why.startswith("capacity:"), "a headroom refusal waits like any capacity wait")
-        self.assertIn("; simulator-1 needs headroom: free RAM 10.6 GiB less one simulator 4.5 GiB < 20% of 32 GiB",
+        self.assertIn("; simulator-1 needs headroom: free RAM 7.7 GiB less one simulator 4.5 GiB < 10% of 32 GiB",
                       why)
-        os.environ[hook.HOST_MEM_FREE_ENV] = "35"  # 11.2 - 4.5 = 6.7 >= 6.4
+        os.environ[hook.HOST_MEM_FREE_ENV] = "25"  # 8.0 - 4.5 = 3.5 >= 3.2
         self.assertTrue(self.take()[0])
-        os.environ[hook.HOST_MEM_FREE_ENV] = "60"
-        self.assertIn("free RAM 19.2 GiB less one simulator 16.0 GiB", hook.sim_copy_room(2, 16 * 1024, None),
+        os.environ[hook.HOST_MEM_FREE_ENV] = "55"
+        self.assertIn("free RAM 17.6 GiB less one simulator 16.0 GiB", hook.sim_copy_room(2, 16 * 1024, None),
                       "a job measured bigger than one simulator counts as itself")
         os.environ[hook.HOST_MEM_FREE_ENV] = "junk"
         self.assertIsNone(hook.sim_copy_room(2, 0, None), "unreadable: holds nothing")
 
-    def test_copies_stop_at_load_80_percent_of_the_cores(self) -> None:
+    def test_copies_stop_at_load_95_percent_of_the_cores(self) -> None:
         self.assertTrue(self.take()[0])
-        self.load = 7.9
+        self.load = 9.4
         self.assertTrue(self.take()[0])
-        self.load = 8.0
+        self.load = 9.5
         ok, why = self.take()
         self.assertFalse(ok)
-        self.assertIn("; simulator-2 needs headroom: load1 8.0 >= 0.8 x 10 cores", why)
+        self.assertIn("; simulator-2 needs headroom: load1 9.5 >= 0.95 x 10 cores", why)
 
     def test_copies_stop_on_pressure_and_on_growing_swap(self) -> None:
         self.assertTrue(self.take()[0])
