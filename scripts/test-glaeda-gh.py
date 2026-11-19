@@ -793,6 +793,21 @@ class ControllerTest(Base):
         self.addCleanup(setattr, gg, "CONTROLLER_FEED_EVERY", feed_every)
         self.daemon = gg.Daemon(transport=self.gh, token=lambda: TOKEN, controller=self.ctl)
 
+    def test_a_controller_request_ends_at_the_ticks_controller_budget(self) -> None:
+        # air-blue 2026-11-18 22:4xZ: 17.1 of a 19.1 s tick went to a controller answering TimeoutError. A controller
+        # that accepts the connection and never answers is cut at the budget the daemon gave this tick, not at
+        # CONTROLLER_TIMEOUT per request.
+        hole = socket.socket()
+        hole.bind(("127.0.0.1", 0))
+        hole.listen(8)
+        self.addCleanup(hole.close)
+        ctl = gg.Controller(f"http://127.0.0.1:{hole.getsockname()[1]}", None)
+        ctl.budget_end = time.monotonic() + 0.5
+        began = time.monotonic()
+        with self.assertRaises(gg.WatchError):
+            ctl.events(5)
+        self.assertLess(time.monotonic() - began, 1.5)
+
     def test_tracked_run_costs_no_quota(self) -> None:
         self.ctl.runs[21] = ctl_run(21, "in_progress")
         key = gg.parse_key("run", "o/r/21")
@@ -18254,6 +18269,32 @@ class OnEventTest(Base):
         self.settle()
         self.assertEqual(len(self.fired()), 2)
 
+    def test_a_controller_that_times_out_never_eats_the_tick_and_blocked_prs_are_read(self) -> None:
+        # air-blue 2026-11-18 22:4xZ: the controller answered TimeoutError and took 17.1 s of a 19.1 s tick; "no PR
+        # refreshed for 2196s". Eight finished runs wait on their job lists; each lookup times out. The first timeout
+        # takes the controller out for this tick and the next (CONTROLLER_RETRY), and the blocked PR is read.
+        self.gh.prs[("o", "r", 5)] = pr_node(5)
+        gg.register("pr:o/r#5", waited=True)
+        self.baseline()
+        for rid in range(300, 308):
+            self.ctl.runs[rid] = backend_run(rid)
+
+        def timeout(repo: str, run_id: int, attempt: int) -> dict:
+            self.ctl.job_reads.append((repo, run_id, attempt))
+            time.sleep(1.0)
+            raise gg.WatchError("controller: TimeoutError")
+
+        with mock.patch.object(self.ctl, "run_jobs", side_effect=timeout):
+            self.daemon.tick(NOW + gg.CYCLE)
+            spent = self.daemon.progress()["spentS"].get("controller", 0.0)
+            self.assertLess(spent, 5.0, "the controller ate the tick")
+            self.assertEqual(len(self.ctl.job_reads), 1, "one timeout, and the controller is left alone")
+            self.assertEqual(gg.read_cache("pr:o/r#5")["dataAt"], NOW + gg.CYCLE, "the blocked PR is read")
+            feeds = len(self.ctl.feeds)
+            self.daemon.tick(NOW + gg.CYCLE + gg.TICK)
+            self.assertEqual((len(self.ctl.job_reads), len(self.ctl.feeds)), (1, feeds), "skipped the next tick too")
+        self.assertEqual(len(gg.on_event_state()["pending"]), 8, "the runs stay pending for later")
+
     def test_runs_the_deadline_cut_off_go_first_next_tick(self) -> None:
         # #2022 F1: unresolved runs that use up every tick must not starve a later run whose job is ready
         self.baseline()
@@ -22419,6 +22460,76 @@ class RefreshStallTest(AlarmBase):
         self.assertIsNone(self.daemon.valve_due)
         self.assertEqual(self.told_lines(), [])
         self.assertEqual(self.daemon.stall_alarm(), "held")
+
+    def restart_says(self, status: dict) -> str:
+        """What `glaeda-gh restart` prints for STATUS (daemon.json), up to the restart itself."""
+        gg.write_json(gg.BASE / "daemon.json", status)
+        with mock.patch.object(gg, "daemon_running", return_value=True), \
+                mock.patch.object(gg, "daemon_stale", return_value=None), \
+                mock.patch.object(gg, "daemon_failing", return_value=None), \
+                mock.patch.object(gg, "recent_restart", return_value=1.0), \
+                mock.patch.object(gg, "restart_record", return_value={}), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            gg.cmd_restart()
+        return out.getvalue()
+
+    def test_the_stall_alarm_and_restart_judge_from_one_verdict(self) -> None:
+        # air-blue 2026-11-18 22:4xZ: the alarm said "no PR refreshed for 2196s ... `glaeda-gh restart` restarts a
+        # daemon in this state" and `restart` answered "under 600s old; nothing to restart". Both now read the one
+        # verdict the tick wrote (daemon.json stale), with one reason.
+        self.policy()
+        keys = self.watch(3)
+        self.daemon.tick(NOW)
+        self.daemon.transport = lambda *a: (_ for _ in ()).throw(gg.WatchError("request failed: URLError"))
+        late = NOW + 2196
+        self.daemon.started_tick = NOW - 2 * gg.STALE_DATA_AFTER
+        self.keep_alive(keys, late)
+        self.daemon.tick(late)
+        told = self.told_lines()
+        self.assertIn("no PR has been refreshed for 2196s", told[-1])
+        self.assertIn(gg.STALE_RESTART_ADVICE, told[-1])
+        written = {**gg.read_json(gg.BASE / "daemon.json"), "at": time.time()}
+        verdict = written["stale"]
+        self.assertEqual((verdict["state"], verdict["kind"], verdict["restart"]), ("stale", "pr", True))
+        self.assertIn(verdict["reason"], told[-1], "the alarm says the verdict's reason")
+        # a wait just read one PR: its freshest data is new, the other two still 2196 s old
+        gg.write_json(gg.cache_dir() / gg.file_name(keys[0]), {**gg.read_cache(keys[0]), "dataAt": late})
+        said = self.restart_says(written)
+        self.assertNotIn("nothing to restart", said)
+        self.assertIn("2196s old", said)
+        self.assertIn(verdict["reason"], said, "restart says the alarm's reason")
+        starved = gg.daemon_starved(written)
+        self.assertFalse(starved["quota"])
+
+    def test_a_held_verdict_is_the_same_reason_for_the_alarm_and_restart(self) -> None:
+        self.policy()
+        self.daemon.started_tick = NOW - 2 * gg.STALE_DATA_AFTER
+        self.daemon.stale_waited, self.daemon.newest_data = {"pr": None}, {"pr": gg.STALE_DATA_AFTER * 3}
+        self.daemon.backoff = {"rest": NOW + 600, "graphql": NOW + 600}  # GitHub's own limits stop every read
+        self.daemon.check_alarms()
+        self.assertEqual(self.told_lines(), [])
+        verdict = self.daemon.stale_record()
+        self.assertEqual((verdict["state"], verdict["restart"]), ("held", False))
+        starved = gg.daemon_starved({"at": time.time(), "staleWaited": {}, "stale": verdict})
+        self.assertTrue(starved["quota"])
+        self.assertEqual(starved["why"], verdict["reason"])
+
+    def test_a_cleared_verdict_is_named_when_restart_finds_nothing_to_do(self) -> None:
+        self.policy()
+        self.stalled(gg.STALE_DATA_AFTER + 100)
+        self.daemon.check_alarms()
+        stale = self.daemon.stale_record()
+        self.stalled(30)
+        self.daemon.now = NOW + gg.TICK
+        self.daemon.check_alarms()
+        fresh = self.daemon.stale_record()
+        self.assertEqual(fresh["state"], "fresh")
+        self.assertEqual(fresh["last"]["reason"], stale["reason"])
+        said = self.restart_says({"at": time.time(), "staleWaited": {"pr": None}, "newestData": {"pr": 30},
+                                  "stale": fresh})
+        self.assertIn("nothing to restart", said)
+        self.assertIn("cleared since", said)
+        self.assertIn(stale["reason"], said)
 
     def test_only_live_pr_watches_count_toward_the_pulse(self) -> None:
         """An idle PR nobody waits on or has read lately is polled every IDLE_BACKOFF_MAX by design: its age is not
