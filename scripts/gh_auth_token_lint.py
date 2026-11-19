@@ -43,7 +43,9 @@ def python_hits(path: Path, text: str) -> list[tuple[int, str]]:
         for arg in node.args:
             if isinstance(arg, (ast.List, ast.Tuple)):
                 values = [literal(item) for item in arg.elts]
-                if len(values) >= 3 and values[1:3] == ["auth", "token"] and values[0] in {"gh", "gh_path"}:
+                first = values[0] or ""
+                if len(values) >= 3 and values[1:3] == ["auth", "token"] and (
+                        first in {"gh", "gh_path", "gh_bin"} or first.endswith("/gh")):
                     if not allowed(lines, node.lineno - 1):
                         hits.append((node.lineno, "Python argv invokes gh auth token"))
     return hits
