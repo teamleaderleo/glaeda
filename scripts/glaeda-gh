@@ -12597,6 +12597,8 @@ class LandQueue:
         self.check(e)
         e.update(state="stopped", wait=None, wakeAt=None, action=None,
                  stop={"code": code, "reason": land_trim(reason), "next": land_trim(nxt), "at": self.now})
+        for held in ("parkedSince", "heldFor", "latchHeld"):  # a stopped entry is held by nothing (LAND_WAIT_HELD)
+            e.pop(held, None)
         self.history(e, "stopped", code=code, reason=land_trim(reason, 160))
         self.save(e)
         msg = f"glaeda land: {self.url(e)} stopped: {code}: {land_trim(reason, 300)}"
