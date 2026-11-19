@@ -18622,7 +18622,7 @@ class LogScanTest(Base):
             self.ctl_logs[job] = (0, b"")
         _, text = self.run_cmd(gg.cmd_log_search, "o/r", "x", as_json=True)
         self.assertEqual(len(self.ctl_reads), 3)
-        self.assertEqual(json.loads(text)["unread"], {"controller down": 3, "over --reads": 4})
+        self.assertEqual(json.loads(text)["unread"], {"controller down": 7})  # read 3, the rest counted under it
 
     def test_flaky_is_a_test_whose_job_passed_on_rerun(self) -> None:
         self.rec(10, run=7, attempt=1, minutes_ago=50)  # failed, then the re-run passed
@@ -18640,6 +18640,42 @@ class LogScanTest(Base):
         code, text = self.run_cmd(gg.cmd_log_flaky, "o/r", "resume", as_json=True)
         self.assertEqual([t["test"] for t in json.loads(text)["tests"]], ["sessions::resume_keeps_order"])
 
+    def test_a_sibling_passing_in_the_same_attempt_or_a_record_without_a_run_is_no_rerun(self) -> None:
+        self.rec(40, run=9, attempt=1, minutes_ago=50)  # a matrix leg failed
+        self.rec(41, run=9, attempt=1, conclusion="success", minutes_ago=40)  # a sibling of the same name passed
+        self.rec(42, run=None, minutes_ago=30)
+        self.rec(43, run=None, conclusion="success", minutes_ago=20)
+        self.ctl_logs[40] = self.ctl_logs[42] = (200, self.FAIL_LOG)
+        code, text = self.run_cmd(gg.cmd_log_flaky, "o/r", "pkill", as_json=True)
+        doc = json.loads(text)
+        self.assertEqual((code, doc["tests"][0]["rerun_green"], doc["jobs_rerun_green"]), (1, 0, {}))
+
+    def test_a_bad_regex_is_a_usage_error_not_a_crash(self) -> None:
+        for call in (lambda: self.run_cmd(gg.cmd_log_flaky, "o/r", "("),
+                     lambda: self.run_cmd(gg.cmd_log_flaky, "o/r", job="["),
+                     lambda: self.run_cmd(gg.cmd_log_search, "o/r", "x", workflow="("),
+                     lambda: self.run_cmd(gg.cmd_log_search, "o/r", "(")):
+            with self.assertRaises(gg.WatchError):
+                call()
+
+    def test_a_cut_history_keeps_the_newest_jobs_and_says_so(self) -> None:
+        for job in range(1, 8):
+            self.rec(job, minutes_ago=100 - job)
+            self.ctl_logs[job] = (200, self.QUIET_LOG)
+        with mock.patch.object(gg, "LOG_SCAN_KEEP", 3):
+            recs, cut = gg.log_records(self.ctl, "o/r", 0)
+            code, text = self.run_cmd(gg.cmd_log_search, "o/r", "linking")
+        self.assertEqual(([r["id"] for r in recs], cut), ([5, 6, 7], True))
+        self.assertEqual(set(recs[0]), set(gg.LOG_RECORD_FIELDS))  # steps and the rest are not kept
+        self.assertIn("history cut to the newest jobs", text)
+
+    def test_logs_past_a_stop_are_counted_under_its_reason(self) -> None:
+        for job in range(1, 6):
+            self.rec(job, minutes_ago=60 - job)
+            self.ctl_logs[job] = (429, b"")
+        _, text = self.run_cmd(gg.cmd_log_search, "o/r", "x", as_json=True)
+        self.assertEqual(json.loads(text)["unread"], {"controller log reads spent": 5})
+
     def test_a_test_failing_on_every_run_without_a_green_rerun_repeats(self) -> None:
         for job in range(20, 23):
             self.rec(job, run=job, minutes_ago=30 - job % 10)
@@ -18656,11 +18692,15 @@ class LogScanTest(Base):
                b"FAILED tests/test_x.py::test_y - assert 1\n"
                b"ERROR: test_z (pkg.mod.Case)\n"
                b"--- FAIL: TestGo (0.00s)\n"
-               b"  \xc3\x97 renders the chat (12 ms)\n"
+               b"  \xc3\x97 renders the chat 12ms\n"
+               b"  \xe2\x9c\x95 opens the menu (3 ms)\n"
+               b"  \xc3\x97 failed to resolve import `./x`\n"  # a diagnostic, not a test
+               b"Test Case 'SidebarTests.testLinux' failed (0.002 seconds)\n"
                b"test a::b ... FAILED\n")
         self.assertEqual(gg.log_failed_tests(log), [
             "a::b", "acpmux tests::resume", "CmuxTests.SidebarTests testHover", "hoverCardOpens()",
-            "tests/test_x.py::test_y", "pkg.mod.Case.test_z", "TestGo", "renders the chat"])
+            "tests/test_x.py::test_y", "pkg.mod.Case.test_z", "TestGo", "renders the chat", "opens the menu",
+            "SidebarTests.testLinux"])
 
     def test_errors_groups_error_lines_by_step(self) -> None:
         found = gg.log_errors(self.FAIL_LOG)

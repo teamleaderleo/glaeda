@@ -20283,6 +20283,8 @@ def job_log_read(repo: str, job: int, controller: Any = "env", rest: Callable | 
             return body, "controller", ""
     if status == 410:
         return None, "", "expired"
+    if rest is None and status == 200:
+        return None, "", "too large"
     if rest is None:
         return None, "", {0: "controller down", 409: "still running", 429: "controller log reads spent"}.get(
             status, "not kept by the controller")
@@ -20320,8 +20322,10 @@ def cmd_log_job(repo: str, job: int, controller: Any = "env", rest: Callable = r
 # from the build controller's timing history (every finished job of the repository, 8 days, no GitHub read) and the
 # logs from job_log_read without REST (this host's kept copy, else the controller's, kept 72 h): a scan across
 # hundreds of jobs spends no user quota, and a log neither holds is reported unread, never fetched.
-LOG_SCAN_PAGE = 5000  # timing records per controller read
-LOG_SCAN_PAGES = 40  # at most this many reads: 200,000 jobs, days of cmux
+LOG_SCAN_PAGE = 2000  # timing records per controller read (a record's step list keeps a page well under MAX_BODY)
+LOG_SCAN_PAGES = 200  # at most this many reads: 400,000 jobs, over a week of cmux
+LOG_SCAN_KEEP = 60000  # the newest records a scan keeps: only the newest have logs (72 h), and this bounds memory
+LOG_RECORD_FIELDS = ("at", "id", "job", "run", "attempt", "conclusion", "workflow", "seg")
 LOG_SCAN_READS = 40  # default cap on logs read from the controller per command (kept copies are free)
 LOG_LINE_MAX = 300  # a printed log line is cut here
 LOG_FAILED = frozenset({"failure", "timed_out"})
@@ -20331,12 +20335,13 @@ LOG_ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 LOG_TEST_FAILS = (
     re.compile(r"^test (\S+) \.\.\. FAILED$"),
     re.compile(r"^\s*(?:FAIL|TIMEOUT|SIGSEGV|SIGABRT) \[\s*[\d.]+s\]\s+(?:\(\d+/\d+\)\s+)?(\S+(?: \S+)?)\s*$"),
-    re.compile(r"Test Case '-\[(\S+ \S+)\]' failed"),
+    re.compile(r"Test Case '(?:-\[(\S+ \S+)\]|([\w.]+))' failed"),  # macOS `-[Class test]`, Linux `Class.test`
     re.compile(r"✘ Test (\"[^\"]+\"|[\w.]+(?:\([^)]*\))?) (?:failed|recorded an issue)"),
     re.compile(r"^FAILED (\S+::\S+)"),
     re.compile(r"^(?:FAIL|ERROR): (\w+ \([\w.]+\))"),
     re.compile(r"^\s*--- FAIL: (\S+)"),
-    re.compile(r"^\s*(?:✕|×) (.+?)(?: \(\d+(?:\.\d+)? ?m?s\))?$"),
+    # jest's ✕; vitest's × only with its duration, as diagnostics (miette, biome, turbo) print `× message` too
+    re.compile(r"^\s*(?:✕ (.+?)(?: \(\d+(?:\.\d+)? ?m?s\))?|× (.+?) \d+(?:\.\d+)? ?m?s)$"),
 )
 LOG_ERROR = re.compile(r"##\[error\]|^error(?:\[E\d+\])?:|: (?:fatal )?error:|^fatal( error)?:|panicked at|"
                        r"^Traceback \(most recent call last\)|^\w*(?:Error|Exception): |^Error: |\bFAILED\b|"
@@ -20360,7 +20365,7 @@ def log_failed_tests(text: bytes) -> list[str]:
         for pattern in LOG_TEST_FAILS:
             match = pattern.search(line)
             if match:
-                name = match.group(1).strip().strip('"')
+                name = next(g for g in match.groups() if g is not None).strip().strip('"')
                 unit = re.fullmatch(r"(\w+) \(([\w.]+)\)", name)  # unittest: `test_x (__main__.Case.test_x)`
                 if unit:
                     qual = unit.group(2).removeprefix("__main__.")
@@ -20418,21 +20423,38 @@ def log_errors(text: bytes, limit: int = 40) -> dict:
 
 
 def log_records(ctl: "Controller", repo: str, since: float, pages: int = LOG_SCAN_PAGES) -> tuple[list[dict], bool]:
-    """(finished job records of REPO since SINCE, oldest first; whether more were left unread past PAGES reads)."""
+    """(finished job records of REPO since SINCE, oldest first, each cut to LOG_RECORD_FIELDS; whether older ones were
+    dropped). The controller answers oldest first, so the scan pages to the end and keeps the newest LOG_SCAN_KEEP:
+    only the newest jobs still have logs. Past PAGES reads the history is cut at its newest end too, and said."""
     out: dict[int, dict] = {}
-    cursor = int(since)
+    cursor, cut = int(since), False
     for _ in range(pages):
         doc = ctl.get(f"/v1/github/timing/records?repo={urllib.parse.quote(repo, safe='/')}&since={cursor}"
                       f"&limit={LOG_SCAN_PAGE}", timeout=30)
         recs = [r for r in doc.get("records") or [] if isinstance(r, dict)]
         for r in recs:
             if r.get("job") and r.get("id"):
-                out[int(r["id"])] = r
+                out[int(r["id"])] = {k: r.get(k) for k in LOG_RECORD_FIELDS}
+        if len(out) > 2 * LOG_SCAN_KEEP:  # drop the oldest as it goes, so memory stays bounded
+            out = dict(sorted(out.items(), key=lambda kv: kv[1].get("at") or "")[-LOG_SCAN_KEEP:])
+            cut = True
         last = max((iso_epoch(r.get("at")) or 0 for r in recs), default=0)
         if not doc.get("more") or not recs:
-            return sorted(out.values(), key=lambda r: r.get("at") or ""), False
+            break
         cursor = int(last) if int(last) > cursor else cursor + 1  # a page all in one second moves on a second
-    return sorted(out.values(), key=lambda r: r.get("at") or ""), True
+    else:
+        cut = True
+    kept = sorted(out.values(), key=lambda r: r.get("at") or "")
+    return kept[-LOG_SCAN_KEEP:], cut or len(kept) > LOG_SCAN_KEEP
+
+
+def log_regex(text: str | None, what: str, flags: int = 0) -> re.Pattern | None:
+    if not text:
+        return None
+    try:
+        return re.compile(text, flags)
+    except re.error as error:
+        raise WatchError(f"{what} is not a regular expression: {error}") from None
 
 
 def log_since(text: str) -> float:
@@ -20449,8 +20471,8 @@ def log_job_url(repo: str, r: dict) -> str:
 def log_pick(recs: list[dict], job: str | None, workflow: str | None, seg: str | None,
              conclusion: str) -> list[dict]:
     """The records a scan reads, newest first."""
-    job_re = re.compile(job, re.I) if job else None
-    wf_re = re.compile(workflow, re.I) if workflow else None
+    job_re = log_regex(job, "--job", re.I)
+    wf_re = log_regex(workflow, "--workflow", re.I)
     picked = []
     for r in reversed(recs):
         if job_re and not job_re.search(r.get("job") or ""):
@@ -20473,6 +20495,7 @@ class LogScan:
     def __init__(self, repo: str, reads: int, controller: Any):
         self.repo, self.reads, self.controller = repo, reads, controller
         self.read = self.down = 0
+        self.stopped = "over --reads"  # why a log past the cap was not read
         self.unread: dict[str, int] = {}
 
     def text(self, job: int) -> bytes | None:
@@ -20480,7 +20503,7 @@ class LogScan:
         if kept is not None:
             return kept
         if self.read >= self.reads:
-            self.unread["over --reads"] = self.unread.get("over --reads", 0) + 1
+            self.unread[self.stopped] = self.unread.get(self.stopped, 0) + 1
             return None
         self.read += 1
         text, _, why = job_log_read(self.repo, job, self.controller, rest=None)
@@ -20489,6 +20512,7 @@ class LogScan:
             self.unread[why] = self.unread.get(why, 0) + 1
             if why == "controller log reads spent" or self.down >= 3:
                 self.reads = self.read  # no use asking again (one slow read is the controller reading GitHub)
+                self.stopped = why
         return text
 
     def note(self) -> str:
@@ -20537,6 +20561,7 @@ def cmd_log_search(repo: str, pattern: str, since: str = "24h", job: str | None 
         print(json.dumps(out, sort_keys=True))
     else:
         note = f"; unread: {scan.note()}" if scan.unread else ""
+        note += "; history cut to the newest jobs" if more else ""
         print(f"{len(matches)} of {scanned} logs read printed /{pattern}/ ({len(picked)} {conclusion} jobs in "
               f"--since {since}{note})")
         for m in matches:
@@ -20553,14 +20578,16 @@ def cmd_log_flaky(repo: str, test: str | None = None, since: str = "72h", job: s
     """Failing tests by name across recent failed jobs, and which of them are flaky: a test is flaky when the job
     that failed on it passed when re-run (a later attempt of the same run). With TEST (a regex), only those tests.
     Exit 0 when a flaky test is listed, 1 when none."""
-    test_re = re.compile(test, re.I) if test else None
+    test_re = log_regex(test, "TEST", re.I)
+    job_re = log_regex(job, "--job", re.I)
     repo, ctl, recs, more = log_scan_setup(repo, since, controller)
-    job_re = re.compile(job, re.I) if job else None
-    passed_later: dict[tuple, float] = {}  # (run, job name) -> when an attempt passed
+    # (run, job name) -> the latest attempt that passed. A re-run is a later attempt of the same run: a matrix sibling
+    # with the same name passing in the same attempt is not one, and a record without a run is never matched.
+    passed_attempt: dict[tuple, int] = {}
     for r in recs:
-        if r.get("conclusion") == "success":
+        if r.get("conclusion") == "success" and r.get("run"):
             key = (r.get("run"), r.get("job"))
-            passed_later[key] = max(passed_later.get(key, 0), iso_epoch(r.get("at")) or 0)
+            passed_attempt[key] = max(passed_attempt.get(key, 0), int(r.get("attempt") or 1))
     failed = [r for r in reversed(recs) if (r.get("conclusion") or "") in LOG_FAILED
               and (not job_re or job_re.search(r.get("job") or ""))]
     scan = LogScan(repo, reads, ctl)
@@ -20568,7 +20595,8 @@ def cmd_log_flaky(repo: str, test: str | None = None, since: str = "72h", job: s
     jobs_rerun_green: dict[str, int] = {}
     scanned = 0
     for r in failed:
-        rerun_green = passed_later.get((r.get("run"), r.get("job")), 0) > (iso_epoch(r.get("at")) or 0)
+        rerun_green = bool(r.get("run")) and \
+            passed_attempt.get((r.get("run"), r.get("job")), 0) > int(r.get("attempt") or 1)
         if rerun_green:
             jobs_rerun_green[r.get("job") or ""] = jobs_rerun_green.get(r.get("job") or "", 0) + 1
         text = scan.text(int(r["id"]))
@@ -20602,6 +20630,7 @@ def cmd_log_flaky(repo: str, test: str | None = None, since: str = "72h", job: s
         print(json.dumps(out, sort_keys=True))
         return EXIT_OK if flaky else EXIT_FAIL
     note = f"; unread: {scan.note()}" if scan.unread else ""
+    note += "; history cut to the newest jobs" if more else ""
     print(f"{len(rows)} failing tests in {scanned} of {len(failed)} failed jobs, --since {since}{note}")
     for x in rows[:limit]:
         print(f"{x['verdict']:7} {x['test']}: failed {x['fails']}x in {x['runs']} runs, {x['rerun_green']} passed on "
@@ -20614,7 +20643,8 @@ def cmd_log_flaky(repo: str, test: str | None = None, since: str = "72h", job: s
 
 def cmd_log_errors(repo: str, job: int, limit: int = 40, as_json: bool = False, controller: Any = "env",
                    rest: Callable = rest_job_log) -> int:
-    """One job's error-level lines by step, not its whole log. Exit 0 with lines, 1 without a log."""
+    """One job's error-level lines by step, not its whole log. Exit 0 with its log read (a log with no error line
+    prints a count of 0), 1 without a log."""
     if not re.fullmatch(rf"{NAME}/{NAME}", repo) or job <= 0:
         raise WatchError("log errors takes OWNER/REPO and a job id (the number after /job/ in the job's URL)")
     repo = repo.lower()
