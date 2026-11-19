@@ -9517,6 +9517,13 @@ LAND_WAIT_STUCK = 4 * 3600.0
 # still bound it. Only a "stop" or "command" (a red not excused, a hold, a BLOCK, a teammate's PR, a conflict) and the
 # remaining steps (repin, review, retarget) count toward or stop at LAND_STREAK_STOP.
 LAND_WAIT_DEADLINE = {"wait_comment": 7200.0, "retry": 7200.0, "rerun_failed": 7200.0}
+# LAND_WAIT_HELD: a wait budget counts the time the queue chose to wait (each judgment's backoff), never the time the
+# login's quota kept it from judging: due and held by the login's latch (hold), or parked on a quota refusal
+# (park_quota), up to the judgment that follows (e["waitBudget"]["held"], wait_spent). 2026-11-19: two PRs stopped retry_deadline "waited 8273 s (deadline 7200 s,
+# 3 judgments) ... still unreadable" and "waited 7965 s ... 3 judgments", each held by the latch through three or four
+# windows: three judgments in over two hours was the latch's doing, not the PR's. A stop the old count made that way is
+# queued again with a whole budget once the latch clears (rearm, latch_owed). A wait that keeps failing for its own
+# reason still runs its budget out in the time the queue spent waiting.
 LAND_WAIT_WHAT = {"wait_comment": "a review verdict at the head", "retry": "a judgment merge_hold could not make",
                   "rerun_failed": "the rerun of the cancelled jobs"}
 # A judgment merge_hold could not make because a read could not complete (code "unreadable": a live read that timed
@@ -10947,6 +10954,7 @@ class LandQueue:
             w = {"kind": "quota", "until": wake, "said": False}
         self.history(e, "parked", until=utc_clock(wake), said=utc_clock(said) if said is not None else None, n=n)
         self.check(e)
+        e.setdefault("parkedSince", self.now)  # held from here to the next judgment (LAND_WAIT_HELD)
         e["state"] = "waiting"
         e["wait"] = w
         e["wakeAt"] = wake
@@ -11075,7 +11083,8 @@ class LandQueue:
             return False
         at = float(st.get("at") or 0)
         cleared = code == "retry_deadline" and self.mh_changed_at > at
-        if not cleared and self.now - at < LAND_REARM_AFTER:
+        latched = code == "retry_deadline" and self.latch_owed(e, at)
+        if not cleared and not latched and self.now - at < LAND_REARM_AFTER:
             return False
         day = land_day(self.now)
         r = e.get("rearms") or {}
@@ -11085,11 +11094,27 @@ class LandQueue:
         e["rearms"] = {"day": day, "n": n + 1}
         e.update(state="queued", stop=None, wait=None, wakeAt=None, action=None, streak=None, updateSent=None,
                  lastStop=st, dueAt=self.now, gen=int(e.get("gen") or 0) + 1)
-        why = "merge_hold's checkout was refreshed" if cleared else f"{self.now - at:.0f} s after the stop"
+        if latched:
+            e["waitBudget"] = None  # its budget was spent by the latch, not by merge_hold: a whole one
+        why = "merge_hold's checkout was refreshed" if cleared else "the login's latch that held it cleared" \
+            if latched else f"{self.now - at:.0f} s after the stop"
         self.history(e, "rearmed", code=code, why=why, n=n + 1)
         log({"event": "land-rearmed", "key": e["key"], "code": code, "why": why, "n": n + 1})
         self.save(e)
         return True
+
+    def latch_owed(self, e: dict, at: float) -> bool:
+        """Whether E's retry_deadline stop at AT is owed a whole budget now (LAND_WAIT_HELD): the login's latch held it
+        during that budget, every judgment in it was unreadable, the budget was counted before held time was left out
+        (no "held"), and the latch has cleared since the stop."""
+        b = e.get("waitBudget") or {}
+        if "held" in b or b.get("code") != "unreadable" or set(b.get("perKind") or {}) != {"retry"}:
+            return False
+        if self.latched is not None or self.latch_cleared <= at:
+            return False
+        since = float(b.get("since") or at)
+        return any(h.get("event") == "latch_held" and since <= float(h.get("at") or 0) <= at
+                   for h in e.get("history") or [])
 
     def reap(self) -> None:
         for key, fut in list(self.jobs.items()):
@@ -11599,8 +11624,12 @@ class LandQueue:
             return False
         c = self.cache_of(e["key"]) or {}
         head = str((c.get("data") or {}).get("headRefOid") or "").lower()
+        # Held by the login's latch while due, or parked on a quota refusal, since (LAND_WAIT_HELD)
+        latch = e.get("latchHeld") or {}
+        since = min(float(latch.get("dueSince") or self.now) if latch else self.now,
+                    float(e.pop("parkedSince", None) or self.now))
         e.update(state="judging", seen=fp, seenHead=head, seenChecks=land_check_fingerprint(c), keptFp=None,
-                 judging={"sha": sha, "at": self.now, "counts": counts})
+                 judging={"sha": sha, "at": self.now, "counts": counts, "held": max(0.0, self.now - since)})
         self.unhold(e)
         e.pop("dueLate", None)
         e.pop("dueAt", None)
@@ -11739,7 +11768,9 @@ class LandQueue:
         with self.lock:
             e = self.entries[key]
             self.check(e)
-            counts = (e.pop("judging", None) or {}).get("counts", True)
+            judging = e.pop("judging", None) or {}
+            counts = judging.get("counts", True)
+            held = float(judging.get("held") or 0.0)
             # The step after the last judgment was refused for quota (step_refused, do_merge): this judgment repeats
             # it and is not a new refusal of the PR's.
             counts = counts and not e.pop("stepQuotaParked", False)
@@ -11778,7 +11809,7 @@ class LandQueue:
                 e["streak"] = None
             elif act.get("kind") in LAND_WAIT_DEADLINE:
                 # Another wait: never a strike, a deadline (LAND_WAIT_DEADLINE's comment)
-                if self.wait_spent(e, act, answer, head):
+                if self.wait_spent(e, act, answer, head, held):
                     return
             elif act.get("kind") in LAND_WAIT_KINDS:
                 # A wait on the checks is taken, never counted toward the identical-refusal stop (LAND_WAIT_STUCK).
@@ -11807,9 +11838,10 @@ class LandQueue:
         e["streak"] = s
         return s["count"] >= (LAND_RETRY_STREAK_STOP if retry else LAND_STREAK_STOP)
 
-    def wait_spent(self, e: dict, act: dict, answer: dict, head: str) -> bool:
+    def wait_spent(self, e: dict, act: dict, answer: dict, head: str, held: float = 0.0) -> bool:
         """One more judgment naming the wait ACT at HEAD (LAND_WAIT_DEADLINE's comment). Under the lock. It breaks the
-        identical-refusal streak and counts toward nothing; True when the wait's budget is spent and E is stopped."""
+        identical-refusal streak and counts toward nothing; True when the wait's budget is spent and E is stopped.
+        HELD, the time E sat due and not judged before this judgment, is not counted (LAND_WAIT_HELD)."""
         kind = str(act.get("kind"))
         key = head  # one budget per head, whatever kind of wait (LAND_WAIT_DEADLINE's comment)
         train = LAND_TRAIN_HOLDER.search(str(answer.get("reason") or "")) \
@@ -11821,18 +11853,22 @@ class LandQueue:
             size = max(size, LAND_UNREAD_DEADLINE)  # a read that could not complete (LAND_UNREAD_DEADLINE's comment)
         b = e.get("waitBudget") or {}
         if b.get("key") != key:
-            b = {"key": key, "since": self.now, "deadline": size, "n": 0}
+            b = {"key": key, "since": self.now, "deadline": size, "n": 0, "held": 0.0}
+        else:
+            b["held"] = float(b.get("held") or 0.0) + held
         per = dict(b.get("perKind") or {})
         per[kind] = int(per.get(kind) or 0) + 1  # a retry's backoff counts its own kind's judgments only
         b.update(kind=kind, code=str(answer.get("code") or ""), n=int(b.get("n") or 0) + 1, perKind=per,
                  deadline=max(float(b.get("deadline") or 0), size))
         e["waitBudget"] = b
         e["streak"] = None
-        waited = self.now - float(b["since"])
+        waited = self.now - float(b["since"]) - float(b["held"])
         if waited < b["deadline"]:
             return False
+        idle = f"; {b['held']:.0f} s due and not judged, not counted" if b["held"] else ""
         self.stop(e, f"{kind}_deadline",
-                  f"waited {waited:.0f} s (deadline {b['deadline']:.0f} s, {b['n']} judgments) at {head[:12] or '?'} "
+                  f"waited {waited:.0f} s (deadline {b['deadline']:.0f} s, {b['n']} judgments{idle}) at "
+                  f"{head[:12] or '?'} "
                   f"for {LAND_WAIT_WHAT[kind]}, still {b['code'] or 'refused'}: {land_trim(answer.get('reason'))}",
                   land_trim(answer.get("next")))
         return True

@@ -20606,6 +20606,98 @@ class LandTest(Base):
         self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "retry_deadline"))  # the bound holds
         self.assertIn("for a judgment merge_hold could not make, still unreadable", e["stop"]["reason"])
 
+    def test_time_due_and_not_judged_never_counts_toward_a_wait_deadline(self):
+        # 2026-11-19: a PR stopped retry_deadline "waited 8273 s (deadline 7200 s, 3 judgments) ... still unreadable"
+        # while the login's latch held it through four windows: about half the budget was the queue not judging it.
+        # The budget counts the retry backoff the queue chose, not the time a due entry waited for the latch or a
+        # worker. Each round here: a 1801 s backoff counted, then 2400 s due under the latch, not counted.
+        self.pr(LA)
+        self.land()
+        self.w.answers += [refusal("unreadable", LA, {"kind": "retry", "after_s": 60})] * 5
+        e = self.tick()
+        for _ in range(3):
+            self.latch("rest", self.t + gg.LAND_RETRY_MAX + 2402)
+            e = self.tick(gg.LAND_RETRY_MAX + 1)  # due now, under the latch
+            self.assertIn("latchHeld", e)
+            e = self.tick(2400)
+            self.clear_latch()
+            e = self.tick()  # judged
+        self.assertGreater(self.t - NOW, 3 * (gg.LAND_RETRY_MAX + 2400))  # 12,600 s of wall time, over the 2 h
+        self.assertEqual(e["state"], "waiting", e.get("stop"))
+        self.assertGreaterEqual(e["waitBudget"]["held"], 3 * 2400)
+        # The backoff it chose still runs the budget out: a judgment that keeps failing for its own reason stops.
+        self.w.answers += [refusal("unreadable", LA, {"kind": "retry", "after_s": 60})] * 6
+        for _ in range(6):
+            e = self.tick(gg.LAND_RETRY_MAX + 1)
+            if e["state"] == "stopped":
+                break
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "retry_deadline"))
+        self.assertGreaterEqual(self.t - NOW - e["waitBudget"]["held"], 7200)
+        self.assertIn("not judged, not counted", e["stop"]["reason"])
+
+    def test_time_parked_on_quota_never_counts_toward_a_wait_deadline(self):
+        # A quota refusal parks the entry until the reset it names (park_quota); those minutes are the login's, not the
+        # PR's. Unreadable, parked 50 min, unreadable, parked: over 3 h of wall time, under 2 h of it counted.
+        self.pr(LA)
+        self.land()
+        unread = refusal("unreadable", LA, {"kind": "retry", "after_s": 60})
+        self.w.answers += [unread, unread]
+        e = self.tick()
+        e = self.tick(gg.LAND_RETRY_MAX + 1)
+        for _ in range(2):
+            at = time.strftime("%H:%M", time.gmtime(self.t + gg.LAND_RETRY_MAX + 3000))
+            self.w.answers.append(refusal("quota", LA, {"kind": "retry", "after_s": 300},
+                                          reason=f"quota: not judged, retry after {at}Z (reset)"))
+            e = self.tick(gg.LAND_RETRY_MAX + 1)
+            for _ in range(3):
+                e = self.tick()
+            self.assertEqual((e["state"], (e.get("wait") or {}).get("kind")), ("waiting", "quota"))
+            self.w.answers.append(unread)
+            e = self.tick(float(e["wakeAt"]) - self.t + 1)  # unparked
+            for _ in range(3):
+                e = self.tick()  # judged
+        self.assertEqual(self.w.answers, [])  # every judgment was made
+        self.assertGreater(self.t - NOW, 3 * 3600)
+        self.assertEqual(e["state"], "waiting", e.get("stop"))
+        self.assertGreaterEqual(e["waitBudget"]["held"], 2 * 2900)
+
+    def test_a_retry_deadline_stop_the_latch_held_is_taken_up_when_it_clears(self):
+        # The same stop, made before the budget left the latch out, is queued again with a whole budget once the latch
+        # clears, not an hour later to be stopped again at its first unreadable judgment.
+        self.t = (NOW // 86400 + 1) * 86400 + 3600
+        self.pr(LA)
+        self.land()
+        self.w.answers += [refusal("unreadable", LA, {"kind": "retry", "after_s": 60})] * 9
+        e = self.tick()
+        self.latch("rest", self.t + 2000)
+        e = self.tick(130)  # due, under the latch
+        e = self.tick(2000)
+        self.clear_latch()
+        for _ in range(8):
+            e = self.tick(gg.LAND_RETRY_MAX + 1)
+            if e["state"] == "stopped":
+                break
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "retry_deadline"))
+        e["waitBudget"].pop("held", None)  # as a stop made by the old count
+        self.latch("rest", self.t + 300)
+        e = self.tick(1)
+        self.assertEqual(e["state"], "stopped")  # never while the latch holds
+        self.clear_latch()
+        e = self.tick(301)
+        self.assertEqual((e["state"], e["rearms"]["n"]), ("queued", 1))
+        self.assertIsNone(e.get("waitBudget"))  # a whole budget
+        self.w.answers.append(refusal("unreadable", LA, {"kind": "retry", "after_s": 60}))
+        e = self.tick()
+        self.assertEqual(e["state"], "waiting", e.get("stop"))
+
+    def test_a_retry_deadline_stop_the_latch_never_held_waits_the_hour(self):
+        e = self.stop_retry_deadline()
+        self.latch("rest", self.t + 300)
+        self.tick(1)
+        self.clear_latch()
+        e = self.tick(301)
+        self.assertEqual(e["state"], "stopped")
+
     def stop_retry_deadline(self) -> dict:
         """E stopped retry_deadline: unreadable at every judgment for its budget (cmux#46208, #46210)."""
         self.t = (NOW // 86400 + 1) * 86400 + 3600  # 01:00Z: the re-arms of a test stay inside one UTC day
