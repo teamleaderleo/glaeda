@@ -41,18 +41,33 @@ def python_hits(path: Path, text: str) -> list[tuple[int, str]]:
         return []
     lines = text.splitlines()
     hits: list[tuple[int, str]] = []
+    # A comparison against a mocked argv or a table of command prefixes does not
+    # execute anything. Inspect command arguments and directly assigned argv.
+    command_args = set()
     for node in ast.walk(tree):
-        if not isinstance(node, ast.Call):
-            continue
-        for arg in node.args:
-            if isinstance(arg, (ast.List, ast.Tuple)):
-                values = [literal(item) for item in arg.elts]
-                first = (values[0] if values else "") or ""
-                if len(values) >= 3 and values[1:3] == ["auth", "token"] and (
-                        first in {"gh", "gh_path", "gh_bin"} or first.endswith("/gh")):
-                    if not allowed(path, lines, node.lineno - 1):
-                        hits.append((node.lineno, "Python argv invokes gh auth token"))
+        if isinstance(node, ast.Call):
+            command_args.update(id(arg) for arg in node.args)
+            command_args.update(id(kw.value) for kw in node.keywords if kw.arg == "args")
+        elif isinstance(node, (ast.Assign, ast.AnnAssign)):
+            command_args.add(id(node.value))
+    for node in ast.walk(tree):
+        if id(node) in command_args and isinstance(node, (ast.List, ast.Tuple)):
+            values = [literal(item) for item in node.elts]
+            first = (values[0] if values else "") or ""
+            if len(values) >= 3 and values[1:3] == ["auth", "token"] and (
+                    first in {"gh", "gh_path", "gh_bin"} or first.endswith("/gh")):
+                if not allowed(path, lines, node.lineno - 1):
+                    hits.append((node.lineno, "Python argv invokes gh auth token"))
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr in (
+                "run", "Popen", "system", "popen", "getoutput", "getstatusoutput", "check_output", "check_call", "call"):
+            arg = node.args[0] if node.args else next((k.value for k in node.keywords if k.arg == "args"), None)
+            if isinstance(arg, ast.Constant) and isinstance(arg.value, str) and SHELL_TOKEN.search(arg.value):
+                if not allowed(path, lines, node.lineno - 1):
+                    hits.append((node.lineno, "Python shell command invokes gh auth token"))
     return hits
+
+
+SHELL_TOKEN = re.compile(r"(?<![\w-])gh[ \t]+auth[ \t]+token\b")
 
 
 def shell_hits(path: Path, text: str) -> list[tuple[int, str]]:
@@ -62,7 +77,7 @@ def shell_hits(path: Path, text: str) -> list[tuple[int, str]]:
         code = raw.split("#", 1)[0]
         if "gh" not in code or "auth" not in code or "token" not in code:
             continue
-        if re.search(r"(?<![\w-])gh[ \t]+auth[ \t]+token\b", code) and not allowed(path, lines, number - 1):
+        if SHELL_TOKEN.search(code) and not allowed(path, lines, number - 1):
             hits.append((number, "Shell command invokes gh auth token"))
     return hits
 
@@ -75,7 +90,7 @@ def tracked(root: Path) -> list[Path]:
 def scan(root: Path) -> list[str]:
     findings: list[str] = []
     for path in tracked(root):
-        if path.suffix.lower() in SKIP_SUFFIXES or path.name == Path(__file__).name:
+        if path.is_symlink() or path.suffix.lower() in SKIP_SUFFIXES or path == root / "scripts/gh_auth_token_lint.py":
             continue
         try:
             text = path.read_text(encoding="utf-8")
