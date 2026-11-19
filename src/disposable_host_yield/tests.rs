@@ -101,30 +101,96 @@ fn quiet_host_yields_nothing() {
     assert_eq!(host_yield_reason(&HostYieldFacts::quiet()), None);
 }
 
+fn jobs(nightly: u16, promote: u16, dev: u16, lease: u16) -> Option<HostFirstJobs> {
+    Some(HostFirstJobs {
+        nightly,
+        promote,
+        dev,
+        lease,
+    })
+}
+
+fn ledger(waiters: u16, nightly: u16, dev: u16, disk_low: u16) -> Option<CapacityLedger> {
+    Some(CapacityLedger {
+        waiters,
+        nightly_waiters: nightly,
+        dev_waiters: dev,
+        disk_low,
+    })
+}
+
 #[test]
 fn each_held_fact_yields_and_nightly_comes_first() {
     let quiet = HostYieldFacts::quiet();
     let cases = [
         (
             HostYieldFacts {
-                nightly_jobs: Some(1),
+                host_first_jobs: jobs(1, 0, 0, 0),
                 ..quiet
             },
             HostYieldReason::NightlyJobRunning { jobs: 1 },
         ),
         (
             HostYieldFacts {
-                admission_waiters: Some(2),
+                host_first_jobs: jobs(0, 1, 0, 0),
+                ..quiet
+            },
+            HostYieldReason::PromoteJobRunning { jobs: 1 },
+        ),
+        (
+            HostYieldFacts {
+                host_first_jobs: jobs(0, 0, 2, 0),
+                ..quiet
+            },
+            HostYieldReason::DevJobRunning { jobs: 2 },
+        ),
+        (
+            HostYieldFacts {
+                host_first_jobs: jobs(0, 0, 0, 1),
+                ..quiet
+            },
+            HostYieldReason::LeaseJobRunning { jobs: 1 },
+        ),
+        (
+            HostYieldFacts {
+                ledger: ledger(2, 1, 0, 0),
+                ..quiet
+            },
+            HostYieldReason::NightlyJobWaiting { jobs: 1 },
+        ),
+        (
+            HostYieldFacts {
+                ledger: ledger(2, 0, 1, 0),
+                ..quiet
+            },
+            HostYieldReason::DevJobWaiting { jobs: 1 },
+        ),
+        (
+            HostYieldFacts {
+                ledger: ledger(2, 0, 0, 0),
                 ..quiet
             },
             HostYieldReason::RunnerJobWaiting { jobs: 2 },
         ),
         (
             HostYieldFacts {
-                disk_low_jobs: Some(1),
+                ledger: ledger(0, 0, 0, 1),
                 ..quiet
             },
             HostYieldReason::DiskLow { jobs: 1 },
+        ),
+        (
+            HostYieldFacts {
+                disk: Some(DiskReading {
+                    free_mib: 40 * 1024 + 512,
+                    floor_mib: 50 * 1024,
+                }),
+                ..quiet
+            },
+            HostYieldReason::DiskUnderFloor {
+                free_gib: 40,
+                floor_gib: 50,
+            },
         ),
         (
             HostYieldFacts {
@@ -149,6 +215,19 @@ fn each_held_fact_yields_and_nightly_comes_first() {
         ),
         (
             HostYieldFacts {
+                host_lock_waiters: Some(LockWaiters {
+                    waiters: 2,
+                    drains: 1,
+                }),
+                ..quiet
+            },
+            HostYieldReason::HostLockWanted {
+                waiters: 2,
+                drains: 1,
+            },
+        ),
+        (
+            HostYieldFacts {
                 reservation_active: Some(true),
                 ..quiet
             },
@@ -159,17 +238,43 @@ fn each_held_fact_yields_and_nightly_comes_first() {
         assert_eq!(host_yield_reason(&facts), Some(reason), "{facts:?}");
     }
     let everything = HostYieldFacts {
-        nightly_jobs: Some(1),
-        admission_waiters: Some(3),
-        disk_low_jobs: Some(1),
+        host_first_jobs: jobs(1, 1, 1, 1),
+        ledger: ledger(3, 1, 1, 1),
+        disk: Some(DiskReading {
+            free_mib: 1,
+            floor_mib: 2,
+        }),
         memory_pressure_level: Some(4),
         host_lock_held: Some(true),
+        host_lock_waiters: Some(LockWaiters {
+            waiters: 1,
+            drains: 1,
+        }),
         reservation_active: Some(true),
     };
     assert_eq!(
         host_yield_reason(&everything),
         Some(HostYieldReason::NightlyJobRunning { jobs: 1 })
     );
+    // Free disk at the floor, or with no floor, holds nothing.
+    for disk in [
+        DiskReading {
+            free_mib: 50 * 1024,
+            floor_mib: 50 * 1024,
+        },
+        DiskReading {
+            free_mib: 0,
+            floor_mib: 0,
+        },
+    ] {
+        assert_eq!(
+            host_yield_reason(&HostYieldFacts {
+                disk: Some(disk),
+                ..quiet
+            }),
+            None
+        );
+    }
 }
 
 #[test]
@@ -185,6 +290,24 @@ fn an_unreadable_source_yields_but_a_held_reason_is_named_first() {
         })
     );
     assert_eq!(
+        host_yield_reason(&HostYieldFacts {
+            disk: None,
+            ..quiet
+        }),
+        Some(HostYieldReason::Unobservable {
+            source: HostYieldSource::Disk
+        })
+    );
+    assert_eq!(
+        host_yield_reason(&HostYieldFacts {
+            host_lock_waiters: None,
+            ..quiet
+        }),
+        Some(HostYieldReason::Unobservable {
+            source: HostYieldSource::HostLockWaiters
+        })
+    );
+    assert_eq!(
         host_yield_reason(&HostYieldFacts::default()),
         Some(HostYieldReason::Unobservable {
             source: HostYieldSource::Processes
@@ -192,7 +315,7 @@ fn an_unreadable_source_yields_but_a_held_reason_is_named_first() {
     );
     assert_eq!(
         host_yield_reason(&HostYieldFacts {
-            nightly_jobs: None,
+            host_first_jobs: None,
             host_lock_held: Some(true),
             ..quiet
         }),
@@ -207,6 +330,22 @@ fn reasons_serialize_as_bounded_tagged_receipts() {
         r#"{"reason":"nightly_job_running","jobs":1}"#
     );
     assert_eq!(
+        serde_json::to_string(&HostYieldReason::DiskUnderFloor {
+            free_gib: 12,
+            floor_gib: 50
+        })
+        .unwrap(),
+        r#"{"reason":"disk_under_floor","free_gib":12,"floor_gib":50}"#
+    );
+    assert_eq!(
+        serde_json::to_string(&HostYieldReason::HostLockWanted {
+            waiters: 1,
+            drains: 1
+        })
+        .unwrap(),
+        r#"{"reason":"host_lock_wanted","waiters":1,"drains":1}"#
+    );
+    assert_eq!(
         serde_json::to_string(&HostYieldReason::Unobservable {
             source: HostYieldSource::CapacityLedger
         })
@@ -216,35 +355,198 @@ fn reasons_serialize_as_bounded_tagged_receipts() {
 }
 
 #[test]
-fn nightly_workers_are_the_nightly_slots_and_nightly_paths() {
+fn host_first_workers_are_counted_by_their_runner_class() {
     let listing = concat!(
         "/sbin/launchd\n",
         "/Users/cmux/actions-runner-glaeda-1/bin/Runner.Listener\n",
         "/Users/cmux/actions-runner-glaeda-2/bin/Runner.Worker\n",
         "/Users/cmux/actions-runner-glaeda-4/bin.2.330.0/Runner.Worker\n",
         "/Users/cmux/actions-runner-glaeda-5/bin/Runner.Worker\n",
+        "/Users/cmux/actions-runner-glaeda-6/bin/Runner.Worker\n",
+        "/Users/cmux/actions-runner-glaeda-7/bin/Runner.Worker\n",
         "/Users/cmux/actions-runner-nightly/bin/Runner.Worker\n",
+        "/Users/cmux/.local/state/glaeda/promotion/p1/runner/bin/Runner.Worker\n",
+        "/Users/cmux/.local/state/glaeda/capture/c1/runner/bin/Runner.Worker\n",
         "/tmp/not-a-runner/bin/Runner.Worker\n",
     );
-    let hooks = |runner: &Path| match runner.file_name()?.to_str()? {
-        "actions-runner-glaeda-2" => {
-            Some("exec hook --instance 2 --canonical-roots 2\n".to_owned())
+    let hooks = |runner: &Path| {
+        let name = runner.file_name()?.to_str()?;
+        let parent = runner.parent()?.file_name()?.to_str()?;
+        match (parent, name) {
+            (_, "actions-runner-glaeda-2") => {
+                Some("exec hook --instance 2 --canonical-roots 2\n".to_owned())
+            }
+            (_, "actions-runner-glaeda-4") => {
+                Some("exec hook --instance 4 --nightly-runner\n".to_owned())
+            }
+            (_, "actions-runner-glaeda-5") => {
+                Some("exec hook --trusted-next-signing --x\n".to_owned())
+            }
+            (_, "actions-runner-glaeda-6") => {
+                Some("exec hook --instance 6 --dev-compile-runner\n".to_owned())
+            }
+            (_, "actions-runner-glaeda-7") => {
+                Some("exec hook --dedicated-admit /x/dedicated-admit.sh\n".to_owned())
+            }
+            ("p1", "runner") => Some("exec hook job-started --promotion-lease /x/p1\n".to_owned()),
+            ("c1", "runner") => Some("exec hook job-started --capture-lease /x/c1\n".to_owned()),
+            _ => None,
         }
-        "actions-runner-glaeda-4" => Some("exec hook --instance 4 --nightly-runner\n".to_owned()),
-        "actions-runner-glaeda-5" => Some("exec hook --trusted-next-signing --x\n".to_owned()),
-        _ => None,
     };
-    assert_eq!(count_nightly_workers(listing, hooks), Some(3));
+    assert_eq!(count_host_first_workers(listing, hooks), jobs(4, 1, 1, 1));
     assert_eq!(
-        count_nightly_workers("/x/actions-runner-glaeda-2/bin/Runner.Worker\n", |_| None),
-        Some(0)
+        count_host_first_workers("/x/actions-runner-glaeda-2/bin/Runner.Worker\n", |_| None),
+        jobs(0, 0, 0, 0)
     );
     // A flag word only counts whole: --nightly-runner-x is not the nightly slot.
     assert_eq!(
-        count_nightly_workers("/x/actions-runner-glaeda-2/bin/Runner.Worker\n", |_| {
-            Some("--nightly-runner-x".to_owned())
+        count_host_first_workers("/x/actions-runner-glaeda-2/bin/Runner.Worker\n", |_| {
+            Some("--nightly-runner-x --dev-compile-runner-y".to_owned())
         }),
-        Some(0)
+        jobs(0, 0, 0, 0)
+    );
+}
+
+#[test]
+fn runner_floor_is_the_largest_min_free_and_a_builders_floor_plus_one_job() {
+    assert!((hook_min_free_gib("exec hook --min-free-gib 30 --x") - 30.0).abs() < f64::EPSILON);
+    assert!((hook_min_free_gib("exec hook --min-free-gib=45.5") - 45.5).abs() < f64::EPSILON);
+    assert!(
+        (hook_min_free_gib("--min-free-gib 10 --min-free-gib 25") - 25.0).abs() < f64::EPSILON,
+        "the last one wins, as in the hook"
+    );
+    assert!(hook_min_free_gib("exec hook --instance 2").abs() < f64::EPSILON);
+    assert!(hook_min_free_gib("--min-free-gib nan").abs() < f64::EPSILON);
+    assert!(hook_min_free_gib("--min-free-gib -5").abs() < f64::EPSILON);
+
+    let pool = "exec hook --instance 1 --min-free-gib 30";
+    let builder = "exec hook --dedicated-admit /x/admit.sh --min-free-gib 40";
+    assert!((disk_floor_gib([pool]) - 30.0).abs() < f64::EPSILON);
+    assert!(
+        (disk_floor_gib([pool, builder]) - (40.0 + DISK_JOB_PEAK_GIB)).abs() < f64::EPSILON,
+        "NIGHTLY_DISK_RESERVE: the builder's floor plus one job"
+    );
+    assert!(disk_floor_gib(std::iter::empty()).abs() < f64::EPSILON);
+}
+
+#[test]
+fn disk_reads_the_runner_installs_floor_and_free_space() {
+    let root = TempRoot::new();
+    let home = root.0.join("home");
+    let fleet = root.0.join("fleet");
+    fs::create_dir_all(&fleet).unwrap();
+
+    // No runner home: no floor, nothing held.
+    let source =
+        MacHostYield::new(fleet.clone(), FakeExecutor::quiet()).with_runner_home(home.clone());
+    assert_eq!(source.observe(now()).disk, Some(DiskReading::default()));
+
+    // A floor no volume can meet holds; the reading names it.
+    let hooks = home.join("actions-runner-glaeda-1/glaeda-hooks");
+    fs::create_dir_all(&hooks).unwrap();
+    fs::write(
+        hooks.join("job-started.sh"),
+        "exec hook job-started --min-free-gib 9999\n",
+    )
+    .unwrap();
+    fs::create_dir_all(home.join("actions-runner-glaeda-2")).unwrap();
+    fs::create_dir_all(home.join("unrelated")).unwrap();
+    let source =
+        MacHostYield::new(fleet.clone(), FakeExecutor::quiet()).with_runner_home(home.clone());
+    let disk = source.observe(now()).disk.unwrap();
+    assert_eq!(disk.floor_mib, 9999 * 1024);
+    assert!(disk.free_mib < disk.floor_mib);
+    assert!(matches!(
+        source.host_yield(),
+        Some(HostYieldReason::DiskUnderFloor {
+            floor_gib: 9999,
+            ..
+        })
+    ));
+
+    // A floor the volume meets holds nothing.
+    fs::write(
+        hooks.join("job-started.sh"),
+        "exec hook job-started --min-free-gib 0.001\n",
+    )
+    .unwrap();
+    let source = MacHostYield::new(fleet, FakeExecutor::quiet()).with_runner_home(home.clone());
+    assert_eq!(source.host_yield(), None);
+
+    // An unreadable hook yields as unobservable.
+    fs::remove_file(hooks.join("job-started.sh")).unwrap();
+    fs::create_dir(hooks.join("job-started.sh")).unwrap();
+    assert_eq!(runner_disk_floor_gib(&home), None);
+}
+
+#[test]
+fn waiter_tier_reads_nightly_and_dev_only() {
+    assert_eq!(
+        waiter_tier(r#"{"since":1,"wants":["units"],"tier":"nightly"}"#),
+        Some(TIER_NIGHTLY)
+    );
+    assert_eq!(waiter_tier(r#"{"since":1,"tier":"dev"}"#), Some(TIER_DEV));
+    assert_eq!(waiter_tier(r#"{"since":1,"tier":"stack"}"#), None);
+    assert_eq!(waiter_tier(r#"{"since":1,"tier":7}"#), None);
+    assert_eq!(waiter_tier("{}"), None);
+    assert_eq!(waiter_tier("not json"), None);
+}
+
+#[test]
+fn lock_waiter_names_follow_the_hooks_pattern() {
+    assert_eq!(lock_waiter_pid("4242-refresh-lend_drain-17"), Some(4242));
+    assert_eq!(lock_waiter_pid("4242-with-host-lock"), Some(4242));
+    assert_eq!(lock_waiter_pid("4242-"), None);
+    assert_eq!(lock_waiter_pid("x-refresh"), None);
+    assert_eq!(lock_waiter_pid("1-init"), None);
+    assert_eq!(lock_waiter_pid("4242-a b"), None);
+}
+
+#[test]
+fn lock_waiters_count_live_fresh_markers_and_their_drains() {
+    let root = TempRoot::new();
+    let directory = root.0.join(HOST_LOCK_WAITERS);
+    assert_eq!(
+        observe_lock_waiters(&directory, now()),
+        Some(LockWaiters::default())
+    );
+    fs::create_dir(&directory).unwrap();
+    let mine = own_pid();
+    fs::write(directory.join(format!("{mine}-refresh-lend_drain-1")), "").unwrap();
+    fs::write(directory.join(format!("{mine}-with-host-lock")), "").unwrap();
+    fs::write(directory.join(format!("{DEAD_PID}-with-host-lock")), "").unwrap();
+    fs::write(directory.join("README"), "").unwrap();
+    fs::create_dir(directory.join(format!("{mine}-a-directory"))).unwrap();
+    assert_eq!(
+        observe_lock_waiters(&directory, now()),
+        Some(LockWaiters {
+            waiters: 2,
+            drains: 1
+        })
+    );
+    // A polling waiter that stopped refreshing is gone; a blocking one stands while its pid lives.
+    assert_eq!(
+        observe_lock_waiters(&directory, now() + LOCK_WAITER_FRESH_SECONDS + 5),
+        Some(LockWaiters {
+            waiters: 1,
+            drains: 0
+        })
+    );
+    let source = MacHostYield::new(root.0.clone(), FakeExecutor::quiet());
+    assert_eq!(
+        source.host_yield(),
+        Some(HostYieldReason::HostLockWanted {
+            waiters: 2,
+            drains: 1
+        })
+    );
+
+    let alias = root.0.join("alias.waiters");
+    symlink(&directory, &alias).unwrap();
+    assert_eq!(
+        observe_lock_waiters(&alias, now()),
+        None,
+        "a symlinked waiter directory is not read"
     );
 }
 
@@ -292,17 +594,58 @@ fn ledger_counts_fresh_live_waiters_and_live_disk_low_markers() {
     fs::write(capacity.join("disk-low.lock"), "").unwrap();
     fs::write(capacity.join("units.token"), "").unwrap();
 
-    assert_eq!(observe_capacity_ledger(&capacity, now()), Some((1, 1)));
+    assert_eq!(
+        observe_capacity_ledger(&capacity, now()),
+        ledger(1, 0, 0, 1)
+    );
     // A waiter that has not rewritten its marker for ADMIT_FRESH_S is gone.
     assert_eq!(
         observe_capacity_ledger(&capacity, now() + ADMIT_FRESH_SECONDS + 5),
-        Some((0, 1))
+        ledger(0, 0, 0, 1)
     );
 
     let source = MacHostYield::new(root.0.clone(), FakeExecutor::quiet());
     assert_eq!(
         source.host_yield(),
         Some(HostYieldReason::RunnerJobWaiting { jobs: 1 })
+    );
+}
+
+#[test]
+fn ledger_names_queued_nightly_promote_and_dev_jobs_by_tier() {
+    let root = TempRoot::new();
+    let capacity = root.capacity();
+    // Two live pids: this test and its parent.
+    let mine = own_pid();
+    let parent = std::os::unix::process::parent_id();
+    fs::write(
+        capacity.join(format!("{ADMIT_WANT}{mine}")),
+        r#"{"since":1,"wants":["units"],"tier":"dev"}"#,
+    )
+    .unwrap();
+    fs::write(capacity.join(format!("{ADMIT_WANT}{parent}")), "not json").unwrap();
+    assert_eq!(
+        observe_capacity_ledger(&capacity, now()),
+        ledger(2, 0, 1, 0)
+    );
+    assert_eq!(
+        MacHostYield::new(root.0.clone(), FakeExecutor::quiet()).host_yield(),
+        Some(HostYieldReason::DevJobWaiting { jobs: 1 })
+    );
+
+    // A promote job ranks nightly (the hook's job_tier), and a nightly job freeing disk too.
+    fs::write(
+        capacity.join(format!("{ADMIT_WANT}{parent}")),
+        r#"{"since":1,"wants":["disk","units"],"tier":"nightly"}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        observe_capacity_ledger(&capacity, now()),
+        ledger(2, 1, 1, 0)
+    );
+    assert_eq!(
+        MacHostYield::new(root.0.clone(), FakeExecutor::quiet()).host_yield(),
+        Some(HostYieldReason::NightlyJobWaiting { jobs: 1 })
     );
 }
 
