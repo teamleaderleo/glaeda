@@ -5546,7 +5546,8 @@ class FleetBudgetTest(Base):
         self.policy = self.home / "gh-quota.json"
         env = mock.patch.dict(os.environ, {"GLAEDA_GH_BUDGET_HOSTS": "here,far,down",
                                            "GLAEDA_GH_QUOTA_POLICY": os.fspath(self.policy),
-                                           "GH_QUOTA_STATE": os.fspath(self.home / "state")})
+                                           "GH_QUOTA_STATE": os.fspath(self.home / "state"),
+                                           "GLAEDA_GH_BUDGET_LANE_VMS": ""})
         env.start()
         self.addCleanup(env.stop)
         host = mock.patch.object(gg, "policy_host", return_value="here")
@@ -5616,15 +5617,24 @@ class FleetBudgetTest(Base):
         self.assertRegex(text, r"far: REST 2250, GraphQL 440 \(free: 77 daemon 304s, 42 served from a cache\)")
         self.assertRegex(text, r"broker:gcp-agent-lane-5 +REST +1200")
         self.assertIn("here (this host): REST 7", text)
-        self.assertIn("down: unreachable", text)
+        self.assertIn("down: unread (unreachable", text)
         self.assertIn("here is not a client of this broker; read each host instead", text)
         # a host with no login of its own (upstream.json) spent through a broker: named, not added twice
         with mock.patch.object(gg, "UPSTREAM_CONFIG", self.policy):  # any file that exists
             doc = gg.fleet_budget(now + 3 * gg.FLEET_BUDGET_TTL, fetch=fetch, view=view)
         self.assertTrue(doc["hosts"]["here"]["brokerClient"])
         text = "\n".join(gg.fleet_lines(doc))
-        self.assertIn("here (this host) (a broker client", text)
-        self.assertIn("reachable hosts together: REST 2250,", text)
+        # no read host has a broker:here row: its own log is its one appearance in the sum
+        self.assertIn("here (this host) (a broker client: no read host has a broker:here row", text)
+        self.assertIn("read hosts together: REST 2257,", text)
+        # far's broker rows carry it: named, not added twice
+        reports["far"]["usage"].append({"caller": "broker:here/session:mine", "rest": 7, "graphql": 3})
+        with mock.patch.object(gg, "UPSTREAM_CONFIG", self.policy):
+            doc = gg.fleet_budget(now + 5 * gg.FLEET_BUDGET_TTL, fetch=fetch, view=view)
+        text = "\n".join(gg.fleet_lines(doc))
+        self.assertIn("here (this host) (a broker client: in far's broker:here rows, so not added below)", text)
+        self.assertIn("read hosts together: REST 2257,", text)  # far's 2250 + its broker:here row's 7
+        self.assertEqual(doc["total"]["laneVms"]["brokered"], {"gcp-agent-lane-5": "far", "here": "far"})
 
     def test_reserve_default_and_marks_when_no_daemon_reads_the_account(self) -> None:
         now = time.time()
@@ -5639,7 +5649,87 @@ class FleetBudgetTest(Base):
         self.assertIn("REST spent until", text)
         self.assertIn("GraphQL unknown", text)
         self.assertIn("no lane-gh here; read each host instead", text)
-        self.assertIn("(0 of 3 hosts)", text)
+        self.assertIn("(0 of 3 hosts read; unread: here, far, down; a lower bound)", text)
+
+    def test_unread_host_is_not_zero_and_the_total_is_a_lower_bound(self) -> None:
+        """2026-11-19 on cosmic-gray: huge-blue, big-red and air-blue "reported 0" while unread, and the sum explained
+        far less than the ~3000 REST spent. A host or lane VM whose spend was not read is unread with its reason."""
+        now = time.time()
+        reports = self.reports(now)
+        reports["far"]["usage"] = None  # reached, but its gh-quota usage gave nothing
+        with mock.patch.dict(os.environ, {"GLAEDA_GH_BUDGET_LANE_VMS": "here,gcp-agent-lane-5,gcp-agent-lane-9"}):
+            doc = gg.fleet_budget(now, fetch=lambda h, local: reports.get(h) or {"error": "unreachable (exit 4: x)"},
+                                  view=lambda: {"ok": False, "error": "no lane-gh here"})
+        far = doc["hosts"]["far"]
+        self.assertIsNone(far["rest"])
+        self.assertIsNone(far["graphql"])
+        total = doc["total"]
+        self.assertEqual((total["rest"], total["graphql"], total["read"]), (7, 3, ["here"]))
+        self.assertEqual(sorted(total["unread"]), ["down", "far"])
+        self.assertIn("gh-quota usage gave nothing", total["unread"]["far"])
+        self.assertTrue(total["lowerBound"])
+        self.assertEqual(sorted(total["laneVms"]["unread"]), ["gcp-agent-lane-5", "gcp-agent-lane-9"])  # here is read
+        self.assertIn('"rest": null', json.dumps(far))
+        text = "\n".join(gg.fleet_lines(doc))
+        self.assertIn("far: unread (gh-quota usage gave nothing); not summed", text)
+        self.assertIn("down: unread (unreachable (exit 4: x))", text)
+        self.assertNotRegex(text, r"(far|down): REST 0")
+        self.assertIn("lane VMs unread (2: no broker:VM row on any read host", text)
+        self.assertIn("read hosts together: REST 7, GraphQL 3 (1 of 3 hosts read; unread: far, down; 2 lane VMs; "
+                      "a lower bound)", text)
+        # an empty list and an older gh-quota's rows with no counts are unread too, never idle
+        self.assertIn("listed no caller", gg.summarize_host({"usage": []}, now)["unread"])
+        self.assertIn("older gh-quota", gg.summarize_host({"usage": [{"caller": "x", "calls": 9}]}, now)["unread"])
+        self.assertIn("cut short", gg.summarize_host({"usage": [{"caller": "x", "rest": 1}], "truncated": True},
+                                                    now)["unread"])
+        self.assertNotIn("unread", gg.summarize_host({"usage": [{"caller": "x", "rest": 0, "graphql": 0}]}, now))
+
+    def test_unattributed_gap_against_the_accounts_count(self) -> None:
+        """The read sum beside GitHub's own count (limit - remaining of the freshest live reading): the gap is
+        printed, so calls from nowhere are visible."""
+        now = time.time()
+        reports = self.reports(now)
+        doc = gg.fleet_budget(now, fetch=lambda h, local: reports.get(h) or {"error": "unreachable"},
+                              view=lambda: {"ok": False, "error": "no lane-gh here"})
+        gap = doc["total"]["unattributed"]
+        # far read REST 12/5000 left: 4988 used; here 7 + far 2250 attributed
+        self.assertEqual((gap["rest"]["used"], gap["rest"]["attributed"], gap["rest"]["unattributed"]),
+                         (4988, 2257, 2731))
+        self.assertEqual(gap["graphql"]["unattributed"], 2500 - 443)
+        text = "\n".join(gg.fleet_lines(doc))
+        self.assertRegex(text, r"unattributed: 2731 REST \(GitHub counted 4988 in the window to \d\d:\d\dZ, the read "
+                               r"hosts' logs hold 2257\); 2057 GraphQL")
+        # no fresh reading: unknown, not 0
+        doc = gg.fleet_budget(now + 2 * gg.FLEET_BUDGET_TTL, fetch=lambda h, local: {"error": "unreachable"},
+                              view=lambda: {"ok": False, "error": "no lane-gh here"})
+        self.assertIsNone(doc["total"]["unattributed"]["rest"])
+        self.assertIn("unattributed: REST unknown", "\n".join(gg.fleet_lines(doc)))
+
+    def test_local_reading_past_its_reset_is_unknown_not_zero_left(self) -> None:
+        """"graphql 0/5000 left, resets 09:37:39Z, seen 19m ago" shown after 09:37: that window is over, so what is left
+        is unknown until the daemon reads again."""
+        now = time.time()
+        gg.write_json(gg.BASE / "budget.json", {
+            "graphql": {"remaining": 0, "limit": 5000, "reset": now - 60, "seenAt": now - 19 * 60},
+            "rest": {"remaining": 4000, "limit": 5000, "reset": now + 600, "seenAt": now - 5}})
+        gg.write_json(gg.BASE / "daemon.json", {"at": now, "heartbeat": 30})
+        lock = open(gg.BASE / "daemon.lock", "a+")
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            with mock.patch.object(gg, "daemon_stale", return_value=None):
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+                    gg.cmd_budget(False)
+                text = out.getvalue()
+                self.assertRegex(text, r"graphql +unknown: reset passed \d\d:\d\dZ, not read since \(last reading 19m ago\)")
+                self.assertNotRegex(text, r"graphql +0/5000")
+                self.assertRegex(text, r"rest +4000/5000 left")
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+                    gg.cmd_budget(True)
+                self.assertEqual(json.loads(out.getvalue())["resetPassed"], ["graphql"])
+        finally:
+            lock.close()
 
     def test_spend_view_is_the_answer_where_lane_gh_serves_it(self) -> None:
         """The broker's spend_view (every host's census against GitHub's count) is shown as it is, and no host is read."""

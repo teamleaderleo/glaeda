@@ -15933,6 +15933,24 @@ def hard_reserve() -> dict:
             else f"default: {path.name} has no hard_reserve_calls yet"}
 
 
+def spend_unread_why(report: dict) -> str | None:
+    """Why a reached host's login spend was not read (its gh-quota usage gave nothing, an empty list, rows with no
+    REST count from an older gh-quota, or an answer cut short), or None when it was. 2026-11-19: huge-blue, big-red and
+    air-blue printed "REST 0" from cosmic-gray while the read hosts explained well under half the ~3000 REST spent:
+    an unread host is unknown, not idle."""
+    usage = report.get("usage")
+    if report.get("truncated"):
+        return "its answer was cut short"
+    if usage is None:
+        return "gh-quota usage gave nothing"
+    if not isinstance(usage, list) or not usage:
+        return "gh-quota usage listed no caller"
+    rows = [r for r in usage if isinstance(r, dict)]
+    if not rows or not any("rest" in r or "graphql" in r for r in rows):
+        return "gh-quota usage has no rest or graphql counts (an older gh-quota)"
+    return None
+
+
 def summarize_host(report: dict, now: float) -> dict:
     """One reachable host's row: its callers (gh-quota usage, which already counts the daemon and the broker's VMs),
     the REST and GraphQL they spent, what was free (304s the daemon got, reads served from a cache or mirror), and
@@ -15958,6 +15976,9 @@ def summarize_host(report: dict, now: float) -> dict:
     out = {"ok": True, "rest": sum(c["rest"] for c in callers), "graphql": sum(c["graphql"] for c in callers),
            "notModified": n(hour.get("rest304")), "served": sum(c["served"] for c in callers), "callers": callers,
            "usage": report.get("usage") is not None}
+    why = spend_unread_why(report)
+    if why:  # reached, but its spend was not read: unknown (None), never 0 (sweep_tally leaves it out of the sum)
+        out.update(rest=None, graphql=None, unread=why)
     budget = report.get("budget") if isinstance(report.get("budget"), dict) else {}
     out["readings"] = {b: {k: budget[b].get(k) for k in ("remaining", "limit", "reset", "seenAt")}
                        for b in ("rest", "graphql") if isinstance(budget.get(b), dict)}
@@ -16065,7 +16086,77 @@ def host_sweep(clock: float, fetch: Callable[[str, bool], dict]) -> dict:
         rows[host] = {"ok": False, "error": report["error"]} if report.get("error") else summarize_host(report, clock)
     if rows[me].get("ok") and UPSTREAM_CONFIG.exists():  # no login here: every call went through a broker
         rows[me]["brokerClient"] = True
-    return {"hosts": rows, "account": account_reading(rows, clock), "exhausted": exhausted_marks(clock)}
+    doc = {"hosts": rows, "account": account_reading(rows, clock), "exhausted": exhausted_marks(clock)}
+    doc["total"] = sweep_tally(doc, fleet_lane_vms())
+    return doc
+
+
+def fleet_lane_vms() -> list[str]:
+    """The lane VMs that spend the login through a broker: GLAEDA_GH_BUDGET_LANE_VMS (comma-separated; set and empty
+    is none), else the fleet registry's machines marked agent_vm and not retired."""
+    env = os.environ.get("GLAEDA_GH_BUDGET_LANE_VMS")
+    if env is not None:
+        return [v.strip() for v in env.split(",") if v.strip()]
+    for doc in fleet_registries():
+        machines = doc.get("machines")
+        if isinstance(machines, dict) and machines:
+            return sorted(str(name) for name, spec in machines.items()
+                          if isinstance(spec, dict) and spec.get("agent_vm") and not spec.get("retired"))
+    return []
+
+
+def broker_vm(caller: str) -> str | None:
+    """VM of a broker host's "broker:VM" or "broker:VM/SESSION" caller row, else None."""
+    if not caller.startswith("broker:"):
+        return None
+    return caller[len("broker:"):].split("/", 1)[0] or None
+
+
+def sweep_tally(doc: dict, lane_vms: list[str]) -> dict:
+    """The host sweep's sum over the hosts whose spend was read, with every host and lane VM it does not cover named
+    (unread, with why) and the account's own count beside it (unattributed). Each lane VM is counted once: in a read
+    broker host's broker:VM rows; a broker client (this host, a VM) is added from its own log only when no read host
+    has a broker row for it; a VM in neither is unread, never absent."""
+    hosts = doc.get("hosts") or {}
+    rest = gql = 0
+    read: list[str] = []
+    unread: dict[str, str] = {}
+    brokered: dict[str, str] = {}  # VM -> the read host whose broker rows carry it
+    for host, h in hosts.items():
+        if h.get("ok") and not h.get("unread"):
+            for c in h.get("callers") or []:
+                vm = broker_vm(str(c.get("caller", "")))
+                if vm:
+                    brokered.setdefault(vm, host)
+    for host, h in hosts.items():
+        if not h.get("ok"):
+            unread[host] = h.get("error") or "unreachable"
+            continue
+        if h.get("unread"):
+            unread[host] = h["unread"]
+            continue
+        read.append(host)
+        if h.get("brokerClient") and host in brokered:
+            continue  # already in brokered[host]'s broker:VM rows
+        rest += h.get("rest") or 0
+        gql += h.get("graphql") or 0
+    covered = set(read) | set(brokered)
+    vms_unread = {vm: "no broker:" + vm + " row on any read host (idle, or its broker host is unread)"
+                  for vm in lane_vms if vm not in covered and vm not in unread}
+    out: dict[str, Any] = {"rest": rest, "graphql": gql, "hosts": len(hosts), "read": read, "unread": unread,
+                           "laneVms": {"brokered": brokered, "unread": vms_unread},
+                           "lowerBound": bool(unread or vms_unread)}
+    gaps: dict[str, Any] = {}
+    for bucket, spent in (("rest", rest), ("graphql", gql)):
+        r = (doc.get("account") or {}).get(bucket)
+        if not r:
+            gaps[bucket] = None
+            continue
+        used = int(r["limit"]) - int(r["remaining"])
+        gaps[bucket] = {"used": used, "attributed": spent, "unattributed": used - spent, "reset": r.get("reset"),
+                        "host": r.get("host")}
+    out["unattributed"] = gaps
+    return out
 
 
 def fleet_budget(now: float | None = None, fetch: Callable[[str, bool], dict] | None = None,
@@ -16121,7 +16212,9 @@ def view_lines(view: dict) -> list[str]:
         out.append(f"  {POOL_NAMES.get(p.get('pool'), p.get('pool'))}: {left}; {acct}")
     out.append("by host (the window; a broker client's calls are in its broker host's broker:VM rows):")
     for h in view.get("hosts") or []:
-        if isinstance(h, dict):
+        if isinstance(h, dict) and not isinstance(h.get("rest"), int):  # no count is unread, never 0
+            out.append(f"  {str(h.get('host')):<22} unread ({h.get('note') or h.get('source') or 'no count'})")
+        elif isinstance(h, dict):
             out.append(f"  {str(h.get('host')):<22} REST {h.get('rest', 0):>5}  GraphQL {h.get('graphql', 0):>5}  "
                        f"search {h.get('search', 0):>3}  {h.get('source', '')}, {int(h.get('age_s') or 0) // 60} min old"
                        + (f"; {h['note']}" if h.get("note") else ""))
@@ -16164,21 +16257,22 @@ def sweep_lines(doc: dict) -> list[str]:
            f"{doc.get('spendView') or 'lane-gh spend_view unavailable'}; read each host instead",
            "who spent it, last hour, per host and caller (REST counted; 304s and cache, mirror or glaeda answers are "
            "free and not counted):"]
-    total_rest = total_gql = reached = 0
+    tally = doc.get("total") if isinstance(doc.get("total"), dict) else sweep_tally(doc, [])
+    brokered = (tally.get("laneVms") or {}).get("brokered") or {}
     for host, h in (doc.get("hosts") or {}).items():
         mine = " (this host)" if host == doc.get("thisHost") else ""
         if not h.get("ok"):
-            out.append(f"  {host}{mine}: {h.get('error') or 'unreachable'}")
+            out.append(f"  {host}{mine}: unread ({h.get('error') or 'unreachable'})")
             continue
-        reached += 1
+        if h.get("unread"):
+            out.append(f"  {host}{mine}: unread ({h['unread']}); not summed")
+            continue
         if h.get("brokerClient"):
-            mine += " (a broker client: its broker host counts these in its broker:VM rows, so not added below)"
-        else:
-            total_rest += h.get("rest", 0)
-            total_gql += h.get("graphql", 0)
+            mine += (f" (a broker client: in {brokered[host]}'s broker:{host} rows, so not added below)"
+                     if host in brokered else
+                     " (a broker client: no read host has a broker:" + host + " row, so its own log is added below)")
         free = f"free: {h.get('notModified', 0)} daemon 304s, {h.get('served', 0)} served from a cache"
-        no_usage = "" if h.get("usage", True) else "; gh-quota usage gave nothing"
-        out.append(f"  {host}{mine}: REST {h.get('rest', 0)}, GraphQL {h.get('graphql', 0)} ({free}{no_usage})")
+        out.append(f"  {host}{mine}: REST {h.get('rest', 0)}, GraphQL {h.get('graphql', 0)} ({free})")
         callers = h.get("callers") or []
         for c in callers[:FLEET_CALLERS_TOP]:
             out.append(f"    {c['caller']:<40} REST {c['rest']:>5}  GraphQL {c['graphql']:>5}"
@@ -16187,8 +16281,30 @@ def sweep_lines(doc: dict) -> list[str]:
         if rest_of:
             out.append(f"    ... {len(rest_of)} more callers: REST {sum(c['rest'] for c in rest_of)}, "
                        f"GraphQL {sum(c['graphql'] for c in rest_of)}")
-    out.append(f"  reachable hosts together: REST {total_rest}, GraphQL {total_gql} "
-               f"({reached} of {len(doc.get('hosts') or {})} hosts)")
+    unread = tally.get("unread") or {}
+    vms_unread = (tally.get("laneVms") or {}).get("unread") or {}
+    if vms_unread:
+        out.append(f"  lane VMs unread ({len(vms_unread)}: no broker:VM row on any read host; idle, or its broker host "
+                   f"is unread): {', '.join(vms_unread)}")
+    read_n, hosts_n = len(tally.get("read") or []), tally.get("hosts", 0)
+    names = ", ".join(unread) + ("; " if unread and vms_unread else "") \
+        + (f"{len(vms_unread)} lane VMs" if vms_unread else "")
+    out.append(f"  read hosts together: REST {tally.get('rest', 0)}, GraphQL {tally.get('graphql', 0)} "
+               f"({read_n} of {hosts_n} hosts read"
+               + (f"; unread: {names}; a lower bound)" if tally.get("lowerBound") else ")"))
+    gaps = tally.get("unattributed") or {}
+    parts = []
+    for bucket in ("rest", "graphql"):
+        g = gaps.get(bucket)
+        if not isinstance(g, dict):
+            parts.append(f"{POOL_NAMES[bucket]} unknown (no fresh reading of the account's count)")
+        elif g["unattributed"] >= 0:
+            parts.append(f"{g['unattributed']} {POOL_NAMES[bucket]} (GitHub counted {g['used']} in the window to "
+                         f"{hhmm(g.get('reset'))}, the read hosts' logs hold {g['attributed']})")
+        else:
+            parts.append(f"0 {POOL_NAMES[bucket]} (the read hosts' last hour holds {-g['unattributed']} more than "
+                         f"GitHub's window to {hhmm(g.get('reset'))} counted, {g['used']}: the windows differ)")
+    out.append("  unattributed: " + "; ".join(parts))
     return out
 
 
@@ -16217,7 +16333,11 @@ def cmd_budget(as_json: bool, fleet: bool = False) -> int:
     if as_json:
         doc = {"daemon": running, "stale": lag is not None, "failing": broken is not None,
                "budget": budget, "watching": watching, "last": status,
-               "healthy": running and lag is None and broken is None and not isinstance(status.get("stalled"), dict)}
+               "healthy": running and lag is None and broken is None and not isinstance(status.get("stalled"), dict),
+               # buckets whose reading's reset has passed: their "remaining" is unknown now, not what it says
+               "resetPassed": [b for b in ("rest", "graphql") if isinstance(budget.get(b), dict)
+                               and isinstance(budget[b].get("reset"), (int, float))
+                               and budget[b]["reset"] <= time.time()]}
         if spread is not None:
             doc["fleet"] = spread
         print(json.dumps(doc, sort_keys=True))
@@ -16245,11 +16365,16 @@ def cmd_budget(as_json: bool, fleet: bool = False) -> int:
                 print(f"{bucket:<8} not seen yet")
                 continue
             reset = b.get("reset")
+            if isinstance(reset, (int, float)) and not isinstance(reset, bool) and reset <= time.time():
+                # the window this reading counted has ended: what is left now is unknown, never its old "0 left"
+                print(f"{bucket:<8} unknown: reset passed {hhmm(reset)}, not read since "
+                      f"(last reading {age(b.get('seenAt'))})")
+                continue
             when = dt.datetime.fromtimestamp(reset, dt.timezone.utc).strftime("%H:%M:%SZ") if reset else "?"
             rate = (status.get("perMinute") or {}).get(bucket)
             spend = f", {rate}/min to spend until then" if isinstance(rate, (int, float)) and rate >= 0 else ""
             print(f"{bucket:<8} {b.get('remaining')}/{b.get('limit')} left, resets {when}{spend}, seen {age(b.get('seenAt'))}")
-            counters = rest_counters(budget) if bucket == "rest" else []
+            counters = [c for c in rest_counters(budget) if c["reset"] > time.time()] if bucket == "rest" else []
             if len(counters) > 1:
                 print("         core counters (the poorest is the one above): " + "; ".join(
                     f"{c['remaining']}/{c.get('limit')} until "
