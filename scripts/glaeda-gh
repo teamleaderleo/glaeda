@@ -20325,6 +20325,7 @@ def cmd_log_job(repo: str, job: int, controller: Any = "env", rest: Callable = r
 LOG_SCAN_PAGE = 2000  # timing records per controller read (a record's step list keeps a page well under MAX_BODY)
 LOG_SCAN_PAGES = 200  # at most this many reads: 400,000 jobs, over a week of cmux
 LOG_SCAN_KEEP = 60000  # the newest records a scan keeps: only the newest have logs (72 h), and this bounds memory
+LOG_KEPT_S = 72 * 3600  # how long the controller keeps a read log (ghevents.JobLogRetention)
 LOG_RECORD_FIELDS = ("at", "id", "job", "run", "attempt", "conclusion", "workflow", "seg")
 LOG_SCAN_READS = 40  # default cap on logs read from the controller per command (kept copies are free)
 LOG_LINE_MAX = 300  # a printed log line is cut here
@@ -20525,7 +20526,9 @@ def log_scan_setup(repo: str, since: str, controller: Any) -> tuple[str, Any, li
     ctl = Controller.from_env() if controller == "env" else controller
     if ctl is None:
         raise WatchError("no build controller configured (CMUX_CI_CONTROLLER): log search reads its job history")
-    recs, more = log_records(ctl, repo.lower(), log_since(since))
+    # Older jobs' logs are gone from the controller (72 h) and every history page re-reads a day file there: a scan
+    # never asks for history it could not read the logs of.
+    recs, more = log_records(ctl, repo.lower(), max(log_since(since), time.time() - LOG_KEPT_S))
     return repo.lower(), ctl, recs, more
 
 
@@ -20887,7 +20890,7 @@ def parser() -> argparse.ArgumentParser:
         else:
             ls.add_argument("test", nargs="?", default=None, metavar="TEST", help="only tests matching this regex")
         ls.add_argument("--since", default="24h" if kind == "search" else "72h",
-                        help="how far back: 90m, 24h, 3d (default %(default)s; logs are kept 72 h)")
+                        help="how far back: 90m, 24h, 72h (default %(default)s; at most 72 h, as long as the controller keeps logs)")
         ls.add_argument("--job", default=None, metavar="REGEX", help="only jobs whose name matches")
         if kind == "search":
             ls.add_argument("--workflow", default=None, metavar="REGEX", help="only workflows whose name matches")
