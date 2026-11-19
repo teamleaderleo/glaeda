@@ -9,17 +9,26 @@ from __future__ import annotations
 
 import argparse
 import ast
+import re
 import subprocess
 import sys
 from pathlib import Path
 
+# Only the audited call sites may keep a local login probe or authored-write source.
+# Copying an exception comment into a new tool must not grant it one.
+APPROVED = {
+    "tools/lane-gh-broker/parts/10-core.py": "authored-write",
+    "scripts/glaeda-gh": "authored-write",
+    "scripts/glaeda-update": "presence-only",
+    "build-fleet/swift-linux-builder/classic/classic-components.sh": "presence-only",
+}
 MARKER = "gh-auth-token-lint: allow"
 SKIP_SUFFIXES = {".md", ".rst", ".txt", ".json", ".lock", ".svg", ".png", ".jpg"}
 
 
-def allowed(lines: list[str], line: int) -> bool:
-    lo = max(0, line - 4)
-    return any(MARKER in lines[i] for i in range(lo, min(len(lines), line + 1)))
+def allowed(path, lines: list[str], line: int) -> bool:
+    reason = APPROVED.get(str(path))
+    return bool(reason and line > 0 and lines[line - 1].lstrip().startswith(f"# {MARKER} {reason}:"))
 
 
 def literal(node: ast.AST) -> str | None:
@@ -46,7 +55,7 @@ def python_hits(path: Path, text: str) -> list[tuple[int, str]]:
                 first = (values[0] if values else "") or ""
                 if len(values) >= 3 and values[1:3] == ["auth", "token"] and (
                         first in {"gh", "gh_path", "gh_bin"} or first.endswith("/gh")):
-                    if not allowed(lines, node.lineno - 1):
+                    if not allowed(path, node.lineno - 1):
                         hits.append((node.lineno, "Python argv invokes gh auth token"))
     return hits
 
@@ -58,7 +67,7 @@ def shell_hits(path: Path, text: str) -> list[tuple[int, str]]:
         code = raw.split("#", 1)[0]
         if "gh" not in code or "auth" not in code or "token" not in code:
             continue
-        if "gh auth token" in code and not allowed(lines, number - 1):
+        if re.search(r"(?<![\w-])gh[ \t]+auth[ \t]+token\b", code) and not allowed(path, number - 1):
             hits.append((number, "Shell command invokes gh auth token"))
     return hits
 
@@ -77,8 +86,11 @@ def scan(root: Path) -> list[str]:
             text = path.read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError):
             continue
+        if not all(word in text for word in ("gh", "auth", "token")):
+            continue
         is_python = path.suffix == ".py" or text.startswith("#!") and "python" in text.splitlines()[0]
-        hits = python_hits(path, text) if is_python else shell_hits(path, text)
+        rel = path.relative_to(root)
+        hits = python_hits(rel, text) if is_python else shell_hits(rel, text)
         findings.extend(f"{path.relative_to(root)}:{line}: {why}" for line, why in hits)
     return findings
 
