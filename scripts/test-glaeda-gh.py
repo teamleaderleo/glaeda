@@ -2620,8 +2620,8 @@ class DaemonTest(Base):
         sent = self.replay_one_runs_life(waiters, done_cycles=60)
         if os.environ.get("GLAEDA_REPLAY_PRINT"):
             print(f"waiters={waiters} job list requests by phase: {sent}", file=sys.stderr)
-        # in progress: each cycle (the list moves), conditional after the first; each finish: one read, then none
-        self.assertEqual(sent, {"queued": 1, "running": 4, "completed": 1, "rerun running": 2, "rerun completed": 1})
+        # in progress: once, then kept for RUN_JOBS_RUNNING_EVERY (a waited watch); each finish: one read, then none
+        self.assertEqual(sent, {"queued": 1, "running": 1, "completed": 1, "rerun running": 1, "rerun completed": 1})
         entry = gg.read_cache("run:o/r/9")
         self.assertEqual((entry["jobsDone"], gg.jobs_attempt(entry["jobs"])), (2, 2))
         self.assertTrue(all(c[2].get("If-None-Match") for c in self.gh.job_calls()[1:]))
