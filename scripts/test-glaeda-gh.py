@@ -20250,7 +20250,7 @@ class LandTest(Base):
         self.tick()
         es = self.q.entries
         self.assertEqual([es[f"pr:o/r#{n}"]["state"] for n in (3, 2, 1)], ["stopped", "waiting_after", "waiting_after"])
-        told = {m[3]: m[4] for m in self.w.sent()}
+        told = {m[3]: m[-1] for m in self.w.sent()}
         self.assertIn("o/r#3, which it lands after, stopped (block)", told["host/two"])
         self.assertIn("next: glaeda-gh land o/r#3", told["host/two"])
         self.assertNotIn("host/one", told)  # #1 waits on #2, which is still queued
