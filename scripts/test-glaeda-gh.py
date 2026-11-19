@@ -22556,6 +22556,24 @@ class LandTest(Base):
         self.assertEqual(self.q.workers(), 4)
         self.q.pool.shutdown(wait=True)
 
+    def test_login_workers_caps_only_lands_whose_reads_spend_the_login(self):
+        # huge-blue, 2026-11-19: workers raised past 4 for the App-pool lands; the login's REST reserve, which landing
+        # reads spend down to 0, must be spent no faster, so judgments read on the login keep their own cap.
+        self.assertEqual(self.q.login_workers(), self.q.workers())  # unset: no separate cap, as before
+        self.w.config.update(workers=16, loginWorkers=2)
+        self.assertEqual((self.q.workers(), self.q.login_workers()), (16, 2))
+        self.q.latch_free_seen.update({"o": (self.t, True, ""), "p": (self.t, False, "no App pool here serves p")})
+        for n, owner in enumerate(["p", "p", "o", "o", "o"]):
+            self.q.entries[f"pr:{owner}/r#{n}"] = {"key": f"pr:{owner}/r#{n}", "repo": f"{owner}/r"}
+            self.q.jobs[f"pr:{owner}/r#{n}"] = mock.Mock()
+        self.assertTrue(self.q.login_room({"repo": "o/r"}))  # App-pool reads: only workers caps it
+        self.assertFalse(self.q.login_room({"repo": "p/r"}))  # two login judgments run: at its cap
+        del self.q.jobs["pr:p/r#0"]
+        self.assertTrue(self.q.login_room({"repo": "p/r"}))
+        self.w.config["loginWorkers"] = 32
+        self.assertEqual(self.q.login_workers(), 16)  # never above workers
+        self.q.jobs.clear()
+
     def test_daemon_tick_runs_the_land_pass_only_once_land_exists(self):
         self.daemon.land_tick()
         self.assertIsNone(self.daemon.land_queue)

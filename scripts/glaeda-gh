@@ -11026,6 +11026,28 @@ class LandQueue:
         """land.json "workers", else LAND_WORKERS; nothing else sizes it (no load-based sizing)."""
         return int(land_seconds(self.config().get("workers"), LAND_WORKERS, 1, LAND_WORKERS_MAX))
 
+    def login_workers(self) -> int:
+        """land.json "loginWorkers": at most this many judgments at once whose reads spend the login (latch_free says
+        no for their owner), else workers(). So "workers" can grow for lands read through the App pools (each its own
+        installation quota) while the login's REST reserve, which landing reads spend down to 0, is spent no faster.
+        huge-blue, 2026-11-19 14:00Z: 4 of 4 busy, 187 due, 123 dueLate, 32 cores at load ~10-14."""
+        given = self.config().get("loginWorkers")
+        if given is None:
+            return self.workers()
+        return min(self.workers(), int(land_seconds(given, LAND_WORKERS, 1, LAND_WORKERS_MAX)))
+
+    def login_room(self, e: dict) -> bool:
+        """Whether E may start now under login_workers: an owner with an unlatched source always may."""
+        cap = self.login_workers()
+        if cap >= self.workers() or self.latch_free(e):
+            return True
+        on_login = 0
+        for k in self.jobs:
+            owner = str((self.entries.get(k) or {}).get("repo") or "").split("/")[0].lower()
+            seen = self.latch_free_seen.get(owner)
+            on_login += 0 if seen and seen[1] else 1
+        return on_login < cap
+
     def gated(self, e: dict) -> None:
         """E was due a judgment this pass and waits for a worker (judge): counted for the pass's land-pool line."""
         self.pass_gated += 1
@@ -11068,7 +11090,7 @@ class LandQueue:
                     late += 1 if since and self.now - since >= LAND_DUE_LATE else 0
         oldest = min(due) if due else None
         latch = self.pass_latch
-        log({"event": "land-pool", "workers": self.workers(),
+        log({"event": "land-pool", "workers": self.workers(), "loginWorkers": self.login_workers(),
              "workersFrom": "land.json" if "workers" in self.config() else "default", "busy": len(running),
              "running": [f"{key_name(k)}:{v}" for k, v in running.items()][:16],
              "snapshotWaiting": len(self.snapshot_waiting), "gated": self.pass_gated,
@@ -11480,6 +11502,9 @@ class LandQueue:
             return False  # judged on the daemon's next read of this head (one read, shared), not on merge_hold's own
         if not free:
             self.gated(e)  # a judgment it could start: ready, waiting for a worker
+            return False
+        if not self.login_room(e):
+            self.gated(e)  # its reads spend the login: the login's share of the workers is busy
             return False
         c = self.cache_of(e["key"]) or {}
         head = str((c.get("data") or {}).get("headRefOid") or "").lower()
