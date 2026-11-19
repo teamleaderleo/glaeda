@@ -10693,7 +10693,7 @@ class LandQueue:
                     with self.lock:
                         self.hold(e, latch)
                     continue  # a held latch: no judge, read, watch or nudge for this entry this pass
-                if ended is not None and self.now < ended + land_jitter(key, ended) \
+                if ended is not None and self.now < ended + land_jitter(key, ended) and not e.get("staggeredAt") \
                         and int((e.get("latchHeld") or {}).get("windows") or 0) < LAND_LATCH_STARVED_WINDOWS:
                     if self.reset_cap():
                         with self.lock:
@@ -11295,16 +11295,15 @@ class LandQueue:
         for its place in the stagger: reset_cap judgments of held entries started in the last 60 s. Noted once per
         latch window in its history and counted in the pass's land-pool line ("staggered")."""
         cap = self.reset_cap()
-        mark = e.get("latchHeld")
-        if not cap or not isinstance(mark, dict) or self.latched is not None \
+        if not cap or not land_latch_held(e) or self.latched is not None \
                 or self.now - self.latch_cleared >= LAND_RESET_STAGGER_S:
             return False
         self.reset_judged = [t for t in self.reset_judged if self.now - t < 60.0]
         if len(self.reset_judged) < cap:
             return False
         self.pass_staggered += 1
-        if mark.get("staggered") != mark.get("window"):
-            mark["staggered"] = mark.get("window")
+        if float(e.get("staggeredAt") or float("-inf")) < self.latch_cleared:
+            e["staggeredAt"] = self.now  # noted once per latch window; past the reset spread, waiting on the stagger
             self.history(e, "reset_staggered", perMinute=cap)
             self.save(e)
         return True
@@ -11718,8 +11717,9 @@ class LandQueue:
             return False
         c = self.cache_of(e["key"]) or {}
         head = str((c.get("data") or {}).get("headRefOid") or "").lower()
-        if e.get("latchHeld"):
+        if land_latch_held(e):
             self.reset_judged.append(self.now)  # a place in the stagger (reset_staggered)
+        e.pop("staggeredAt", None)
         self.unhold(e)
         # Held by the login's latch while due (unhold: heldFor), or parked on a quota refusal since (LAND_WAIT_HELD)
         held = float(e.pop("heldFor", None) or 0.0)
@@ -12773,6 +12773,12 @@ def land_request_lane(req: dict) -> tuple[str, str] | None:
         return None
     lane, host = str(req.get("lane") or ""), str(req.get("laneHost") or "")
     return (lane, host) if land_session_lane(lane) == lane and re.fullmatch(r"[A-Za-z0-9._-]{0,100}", host) else ("", "")
+
+
+def land_latch_held(e: dict) -> bool:
+    """E was held by the login's latch and is not judged since: still marked (latchHeld), or released on the first pass
+    no mark held it (LandQueue.tick's unhold) with its wait kept for the judgment (heldFor)."""
+    return isinstance(e.get("latchHeld"), dict) or "heldFor" in e
 
 
 LAND_LATCH_READ = object()  # land_line's default: read the login's latch now (land_latch)
