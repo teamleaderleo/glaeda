@@ -429,7 +429,7 @@ What `--apply` does:
        stopped one, keeps nothing. Before it, side and root jobs filled every unit on the
        minis and the gui runners sat held as full: on 2026-10-21 about 6 of 13 gui
        runners listened and gui-label jobs queued 1.5 to 3 h.
-     - The CPU saturation marks (pause at 85% busy, resume below 80%) apply to the host's
+     - The CPU saturation marks (pause at 95% busy, resume below 90%; 85/80 until 2026-11-19) apply to the host's
        CPU busy averaged over the last 60 s (`GATE_CPU_WINDOW_S`, bounded to 30-60 s; 0 goes
        back to one `iostat` second), read from the kernel's CPU tick counters on the gate's
        own looks every 10 s (`host_cpu_ticks`, one mach call: no process, thread or wait),
@@ -455,7 +455,7 @@ What `--apply` does:
        pressure were the binding limits. Reserved minis keep the hold by host entry.
      - **Overload hold** (`overloadHold` in the same file, on with or without the CPU hold). A
        side or root listener stops while the 1-minute load is at least `pausePerCore` times the
-       cores (2.0) and CPU busy is at least `cpuAtLeast` (80%), and listens again below
+       cores (2.0) and CPU busy is at least `cpuAtLeast` (95%; 80% until 2026-11-19), and listens again below
        `resumePerCore` (1.5). Without the CPU check, the old load-only gate held 578 runner-hours on
        09-28 at 34-59% CPU. On 2026-11-05 the units ledger let cmux8s-14 take jobs at loads of
        90-122 on 14 cores while other Macs idled. The gui, session, freshness, nightly and
@@ -488,15 +488,15 @@ What `--apply` does:
        processes held 2.8-6.5 GiB each. The memory-pressure hold reacts only once Darwin is already
        compressing and swapping. So an idle listener also reads what a new job could get without
        compression or swap: free, purgeable and file-backed pages (one `sysctl`).
-       Under `needGiB` (4), or at memory pressure level 2 or more, it takes no new job, and listens
-       again at `resumeGiB` (5) and normal pressure. It never strands or fails a job; it only
+       Under `needPct` (5% of the RAM, so over 95% used; a fixed 4 GiB until 2026-11-19), or at memory pressure level 2 or more, it takes no new job, and listens
+       again at `resumePct` (10%, 90% used) and normal pressure. It never strands or fails a job; it only
        defers. While another host's listener keeps up with the label (the load cap's feed) it
        holds. An urgent or pinned job queued, a job of its label waiting `maxWaitMin` (10), or a
        hold that long with no other listener known to keep up, and it listens until memory
        recovers: the job runs here, slower. When memory recovers, one held listener on a mini resumes at a time, 90 s apart (`mem-cap-start` in the state dir), as a new job's compile peaks minutes after it starts; `maxWaitMin` above 60 is not a setting. The nightly, freshness, gateway and dedicated runners
        are exempt; the gui and session runners are not, as they are held for memory pressure too.
-       `memoryCap` in `config/runner-gate.json` (`true`, `false`, or a dict of `needGiB`,
-       `resumeGiB` and `maxWaitMin`) sets it by default or per host; `GLAEDA_RUNNER_MEMORY_CAP=off`
+       `memoryCap` in `config/runner-gate.json` (`true`, `false`, or a dict of `needPct` or `needGiB`,
+       `resumePct` or `resumeGiB`, and `maxWaitMin`; GiB wins) sets it by default or per host; `GLAEDA_RUNNER_MEMORY_CAP=off`
        in the runner LaunchAgent's environment turns it off.
      - **Starved-job reserve** (`STARVED_RESERVE`, cmux#45614). A large job can starve behind
        smaller ones that share its units: on 2026-11-17 cmux NEXT DEV's DMG build
@@ -523,7 +523,7 @@ What `--apply` does:
        nothing; that job is asked again a minute later at the earliest, and after a 403 or 429 no
        job is asked about until GitHub's rate-limit reset (the gates of a mini share one 60-an-hour
        address). The read runs on its own thread, so it never holds up a gate step.
-     - The gui runner is never held for CPU saturation (85% busy), only for memory
+     - The gui runner is never held for CPU saturation (95% busy), only for memory
        pressure: its jobs come one per mini and are admitted by units like any other,
        and the CPU mark held it whenever the other lanes kept the mini busy. Nothing
        local says whether gui jobs are queued, and the gate polls no GitHub API, so the
@@ -597,6 +597,21 @@ What `--apply` does:
      listens again once reclaim or the other jobs' ends bring the disk above the hard floor. An unreadable disk
      holds nothing. 2026-11-18 19:46-19:55Z: cmux18's listeners started at 8.5 GiB free beside five jobs, which
      wrote it down to 1.8 GiB while the lent fleet worker sat at `claim_paused disk` with suites queued 4-5 h.
+     **A fleet suite step goes first on a lent mini's disk, for at most 15 minutes per wait (`SUITE_FIRST_HOLD`).**
+     The PR jobs on a lent mini took every GiB a job's end freed, so a fleet suite step (20 GiB growth plus the
+     10 GiB hard floor) waited for disk for hours. The decision, verbatim: "A pool listener on a lent mini holds
+     while a fleet suite step there waits for disk, but for at most 15 minutes per wait. After that, the PR job starts
+     anyway, because macOS PR CI has no [cloud] overflow right now. Log each hold and its length." While the fleet
+     worker is paused for disk, holds no job and has less free disk than the controller wants for a step it would place
+     there, it keeps `capacity/fleet-disk.want-<pid>` fresh (`FLEET_DISK_WANT`: `since`, `want_bytes`; no admission
+     waiter, so no turn order waits on it; stale by age or a dead pid). An idle pool listener's gate then holds while
+     free disk is under `want_bytes`, at most `SUITE_FIRST_HOLD_S` (900 s) from the wait's `since`, and its reclaim aims
+     at `want_bytes`. A wait seen during a job only arms the stop at that job's end, as a full disk does; the job runs on.
+     The nightly's own listeners, a dedicated builder, a gateway runner and a runner with no floor never hold for it.
+     After the bound it listens until that wait ends; a new wait may hold again. The detector is the gate's own pair of
+     lines, `suite-first hold started: ... (SUITE_FIRST_HOLD)` and
+     `suite-first hold ended after N s: room|bound|wait gone (SUITE_FIRST_HOLD)`; the hold's reason itself is the same
+     words every poll, so `holding the listener off: ...` is logged once per hold.
      Pattern, *reservation counted twice*: a reservation for space a job will write must shrink as the job writes
      it, or the bytes count once as gone from free disk and again as reserved (2026-11-17 12:36Z-12:55Z: cmux17,
      cmux18, cmux19 and cmux21 held side-std listeners at 25-35 GiB free with every idle cache deleted while 160
@@ -1107,7 +1122,7 @@ job's need fit the host's cores, and their RAM plus this job's fits the host's R
   back), and merge.
 - A host's capacity is read on the host: cores from `hw.ncpu` less `--reserve-cores` (the manifest's
   `runner.classes.<class>.reserveCores`, for cores kept for work outside the ledger), RAM from `hw.memsize` less a
-  floor of an eighth of it (at least 4 GiB), in 1 GiB `mem-N` flock files beside the `unit-N` ones.
+  floor of a tenth of it (at least 1 GiB; an eighth, at least 4 GiB, until 2026-11-19), in 1 GiB `mem-N` flock files beside the `unit-N` ones.
   `--capacity-units` still turns the ledger on and is the count only where the host cannot be measured. Every
   caller of the same ledger passes the same `--reserve-cores` (the build worker's `fits` and `admit` too;
   `glaeda-promotion-admit` reads it from the runner's `job-started.sh`). A hook older than this change rejects the
@@ -1121,7 +1136,7 @@ job's need fit the host's cores, and their RAM plus this job's fits the host's R
   `ceil(peak * 1.25)` (at least 1) go at once, so the next admission and every idle listener's gate see them free.
   A daemon-test admitted at 6 units that runs at 1 core keeps 2. Units only shrink: a job that bursts back above
   them shares the cores (slower, never failed), and the gate's CPU mark holds new work while the host is busy. No
-  release while host CPU is at 80% or more, under memory pressure, thermally limited, or with many processes in
+  release while host CPU is at 95% or more, under memory pressure, thermally limited, or with many processes in
   uninterruptible wait (the job record's contended threshold). Signing jobs and a reserving runner's own job keep
   their admission. RAM chunks are never released early: the floor and the memory-pressure gate stay.
 - A job whose RAM need is more than the host's RAM capacity takes all of it, so it runs only when the host is
@@ -1728,14 +1743,14 @@ Hook classes:
   (`simulator`, `simulator-1`, ...), and the job is told its copy as `GLAEDA_SIM_SLOT` in `$GITHUB_ENV` and
   `$RUNNER_TEMP/glaeda-sim-slot` (a ci-step: `sim_slot` in its admit answer), so a workflow can boot devices of its
   own slot. Copy 0 is always admissible; a later copy only while, measured now, one more simulator keeps the host
-  under the 80% line, and the refusal names the term that failed:
-  - free RAM (`kern.memorystatus_level`) less one simulator's RSS stays at least 20% of the RAM;
-  - load1 under 0.8 of the cores;
+  under the 90% line (Leo, 2026-11-19; it was his 80% line), and the refusal names the term that failed:
+  - free RAM (`kern.memorystatus_level`) less one simulator's RSS stays at least 10% of the RAM;
+  - load1 under 0.95 of the cores;
   - memory pressure green (level 1);
   - swap not growing (used swap rose under 256 MiB in 5 minutes; `vm.swapusage`, parsed as cmuxterm-hq's worker
     does).
   The only number is a hard ceiling computed on the host: floor((RAM - reserve) / one simulator's p95 RSS), the
-  reserve being 20% of the RAM (at least the RAM floor). One simulator's RSS comes from the needs file (the
+  reserve being 10% of the RAM (at least the RAM floor). One simulator's RSS comes from the needs file (the
   `simulator` class row, else `test-ios.yml/ios-simulator-build`; `rss_peak_mib_p95`, else `rss_peak_mib_p90`),
   else 4.5 GiB. `glaeda-cmux-runner-hook needs` prints the ceiling and where it came from. The sim-first runner
   listens while any copy is admissible. glaeda-disk's device eraser holds `simulator-copies.gate` and every copy;

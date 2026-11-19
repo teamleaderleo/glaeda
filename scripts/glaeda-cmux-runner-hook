@@ -849,8 +849,11 @@ HOST_MEM_ENV = "GLAEDA_HOST_MEM_MIB"  # tests: the host's RAM instead of hw.mems
 # 96 GiB host with no OOM (2026-11-08..14), and on the canary the ledger held big jobs 10-17 min with 93% of RAM free.
 RAM_LEDGER_ENV = "GLAEDA_RUNNER_RAM_LEDGER"
 MEM_CHUNK_MIB = 1024
-MEM_FLOOR_MIN_MIB = 4096
-MEM_FLOOR_FRACTION = 8  # the floor is an eighth of the RAM, at least MEM_FLOOR_MIN_MIB: 4 GiB of 16, 6 of 48, 12 of 96
+# 2026-11-19 (Leo: "while things have headroom we ought to really stretch everything till it's at like... 90%
+# cpu/ram"): the floor is a tenth of the RAM, so admission runs to 90%, at least MEM_FLOOR_MIN_MIB: 1.6 GiB of 16,
+# 4.8 of 48, 9.6 of 96. It was an eighth, at least 4 GiB (75% of a 16 GiB mini).
+MEM_FLOOR_MIN_MIB = 1024
+MEM_FLOOR_FRACTION = 10
 MEM_UNIT = "mem"  # ledger files mem-0 .. mem-<chunks - 1>
 
 
@@ -2527,8 +2530,9 @@ def export_root(name: str) -> str:
 #
 # glaeda-disk's eraser holds every copy that exists and SIM_GATE exclusive through its erase; a copy past the first is
 # taken only under SIM_GATE shared, so no new copy file can appear between the eraser's listing and its erase.
-SIM_FREE_SHARE = 0.20  # free RAM after one more simulator stays at least 20% of the RAM (Leo's 80% line)
-SIM_LOAD_SHARE = 0.80  # load1 under 0.8 x cores (Leo's 80% line)
+# 2026-11-19 (Leo: "admit to 90% cpu/ram, more wary at >95%"; it was his earlier 80% line, 0.20 and 0.80):
+SIM_FREE_SHARE = 0.10  # free RAM after one more simulator stays at least 10% of the RAM (90% used)
+SIM_LOAD_SHARE = 0.95  # load1 under 0.95 x cores: wary only above 95%
 SIM_SWAP_GROWTH_MIB = 256  # swap used grew by more than this within SIM_SWAP_WINDOW_S: growing
 SIM_SWAP_WINDOW_S = 300.0
 SIM_SWAP_SAMPLES = "simulator-swap.json"  # capacity ledger: [[epoch, used bytes], ...] within SIM_SWAP_WINDOW_S
@@ -2699,10 +2703,11 @@ GATE_CONFIRM = 2  # consecutive idle polls, so a hook's or a probe's momentary h
 # for elevated/critical Darwin VM pressure even when CPU is quiet. An unreadable sample fails open; job admission's
 # unit locks and the existing load-independent safety checks remain in force.
 # With units that are cores (CLASS_COST), admission already stops near the core count, so the gate is the margin
-# for jobs above their p75: it pauses at 85% and resumes below 80% (it was 80/70 while units were 2.8 cores and the
+# for jobs above their p75: it pauses at 95% and resumes below 90% (2026-11-19, Leo: "we can be more wary at >95%
+# utilization of stuff but below that, we should just go"; it was 85/80, and 80/70 while units were 2.8 cores and the
 # gate was the only real limit; 10-12 to 10-19 the std minis' CPU busy at job end was p50 52-68%, p90 79-93%).
-GATE_CPU_PAUSE = float(os.environ.get("GLAEDA_RUNNER_GATE_CPU_PAUSE") or 85.0)
-GATE_CPU_RESUME = float(os.environ.get("GLAEDA_RUNNER_GATE_CPU_RESUME") or 80.0)
+GATE_CPU_PAUSE = float(os.environ.get("GLAEDA_RUNNER_GATE_CPU_PAUSE") or 95.0)
+GATE_CPU_RESUME = float(os.environ.get("GLAEDA_RUNNER_GATE_CPU_RESUME") or 90.0)
 GATE_CPU_EVERY_S = float(os.environ.get("GLAEDA_RUNNER_GATE_CPU_EVERY_S") or 10.0)
 # The marks apply to CPU busy averaged over the last GATE_CPU_WINDOW_S, not to one iostat second every 10 s. A mini
 # running compiles swings 60-100% second to second, so a lone sample crossed both marks about once a minute: on
@@ -2742,7 +2747,8 @@ GATE_SETTINGS_EVERY_S = 60.0
 # mini_saturated (old operator tooling) keeps the same marks.
 GATE_LOAD_PAUSE = float(os.environ.get("GLAEDA_RUNNER_GATE_LOAD_PAUSE") or 2.0)
 GATE_LOAD_RESUME = float(os.environ.get("GLAEDA_RUNNER_GATE_LOAD_RESUME") or 1.5)
-GATE_OVERLOAD_CPU_MIN = float(os.environ.get("GLAEDA_RUNNER_GATE_OVERLOAD_CPU_MIN") or 80.0)
+# 2026-11-19 (Leo: "wary at >95%"): the CPU must be at least 95% busy (was 80) for the load to hold.
+GATE_OVERLOAD_CPU_MIN = float(os.environ.get("GLAEDA_RUNNER_GATE_OVERLOAD_CPU_MIN") or 95.0)
 OVERLOADED = "the mini is overloaded"
 SATURATED = "the mini is saturated"
 # A load hold longer than this is not a compile (measured compile p99 is about 18 min): something outside CI (a leaked process,
@@ -4757,6 +4763,70 @@ def nightly_disk_wait(capacity_dir: Path, on: bool):
                 marker.unlink()
 
 
+# SUITE_FIRST_HOLD (2026-11-18): on a mini lent to the build fleet, the PR runners' jobs took every GiB a job's end
+# freed, so a fleet suite step (its 20 GiB growth plus the 10 GiB hard floor) waited for disk for hours while its
+# worker sat paused for disk beside them. The decision, verbatim: "Decided: build the suite-first hold, with a bound. A
+# pool listener on a lent mini holds while a fleet suite step there waits for disk, but for at most 15 minutes per
+# wait. After that, the PR job starts anyway, because macOS PR CI has no [cloud] overflow right now. Log each hold and
+# its length." So:
+#   - the fleet worker, while it is lent, paused for disk, holds no job and has less free disk than the controller
+#     wants for a step it would place there, keeps capacity/fleet-disk.want-<pid> fresh (FLEET_DISK_WANT: since,
+#     want_bytes). It is no admission waiter (ADMIT_WANT): no runner's turn order waits on it;
+#   - an idle pool listener's gate holds while free disk is under want_bytes (Gate.suite_first), at most
+#     SUITE_FIRST_HOLD_S from the wait's start (its since: the worker writes the marker only while free disk is under
+#     the want, so a gate's first hold of the wait comes within a poll of it), aims its reclaim at the want, and logs
+#     the hold's start and its end with the length and why it ended: room, bound or wait gone. After the bound it
+#     listens until that wait ends; a new wait may hold again;
+#   - a listener with a job is never stopped, killed or frozen for it: a look during the job only arms the stop at
+#     the job's end (JOB_END_FREEZE), as a full disk does. The nightly's own listeners, a dedicated builder, a
+#     gateway runner and a runner with no disk floor never hold for it.
+FLEET_DISK_WANT = "fleet-disk.want-"
+SUITE_FIRST_HOLD_S = 15 * 60.0
+SUITE_FIRST = "SUITE_FIRST_HOLD"
+
+
+def fleet_disk_wait(capacity_dir: Path | None) -> dict[str, Any] | None:
+    """The fleet worker's live disk wait on this mini (FLEET_DISK_WANT), or None: pid, since (Unix seconds), want_gib,
+    who and id (one per wait: its pid and since). A marker older than ADMIT_FRESH_S, or whose worker is gone, is no
+    wait (and removed where this user may). The fleet worker writes it, so it is read as untrusted."""
+    if capacity_dir is None:
+        return None
+    best: dict[str, Any] | None = None
+    with contextlib.suppress(OSError):
+        for marker in capacity_dir.glob(f"{FLEET_DISK_WANT}*"):
+            if marker.name.endswith(".tmp"):
+                continue
+            try:
+                pid = int(marker.name[len(FLEET_DISK_WANT):])
+                fresh = time.time() - marker.stat().st_mtime < ADMIT_FRESH_S
+            except (OSError, ValueError):
+                continue
+            if not 0 < pid < 2 ** 31:
+                continue
+            if not fresh or not pid_alive(pid):
+                with contextlib.suppress(OSError):
+                    marker.unlink()  # a worker that was killed
+                continue
+            try:
+                data = json.loads(read_bounded(marker) or b"")
+                since, want = data["since"], data["want_bytes"]
+                if isinstance(since, bool) or isinstance(want, bool):
+                    continue
+                since, want = float(since), int(want)
+                if not math.isfinite(since) or want <= 0:
+                    continue
+                # every conversion of the untrusted body stays in here: a want too large for a float (OverflowError)
+                # or a body nested past the parser's depth (RecursionError) must never raise out of the gate's look,
+                # whose repeated failures run the runner ungated, every hold lost
+                wait = {"pid": pid, "since": since, "want_gib": round(want / 1024 ** 3, 1),
+                        "who": str(data.get("who") or "")[:200], "id": f"{pid}:{since:.3f}"}
+            except (OSError, ValueError, TypeError, KeyError, AttributeError, OverflowError, RecursionError):
+                continue
+            if best is None or wait["want_gib"] > best["want_gib"]:
+                best = wait
+    return best
+
+
 RUNNER_WORK_HELD = "a nightly job's eviction still holds this runner's work"  # job-started refuses on it
 EVICT_RUNNER_LOCK = ".glaeda-evict.lock"  # <runner>/: held while another runner's job takes this runner's work away
 
@@ -6584,8 +6654,8 @@ def admission_waiters(capacity_dir: Path, skip_pid: int = 0) -> list[dict[str, A
             if not math.isfinite(since):  # an infinite or NaN since would break the one total order
                 continue
             wants = [str(kind) for kind in data.get("wants") or [] if isinstance(kind, str)]
-        except (OSError, ValueError, TypeError, KeyError, AttributeError, OverflowError):
-            continue  # OverflowError: a since too large for a float (an integer past 1e308)
+        except (OSError, ValueError, TypeError, KeyError, AttributeError, OverflowError, RecursionError):
+            continue  # OverflowError: a since too large for a float (an integer past 1e308); RecursionError: a deep body
         tier = data.get("tier") if data.get("tier") in (TIER_NIGHTLY, TIER_DEV, TIER_STACK) else ""
         lane = data.get("lane") if data.get("lane") in (SESSION_LANE, SIM_LANE) else ""
         waiters.append({"pid": pid, "since": since, "wants": wants, "who": str(data.get("who") or "")[:200],
@@ -8782,11 +8852,16 @@ def starved_note(kept: int) -> str:
 # label (the controller's feed, shared with the load cap) it holds; a job of its label that has waited maxWaitMin,
 # an urgent (nightly, promotion) or pinned job, or a hold past maxWaitMin with no feed to say, and it listens: the
 # job then runs here, slower, rather than not at all. Exempt like the load cap: the nightly, freshness, gateway and
-# dedicated runners. config/runner-gate.json's memoryCap (true, false or a dict of needGiB, resumeGiB and
-# maxWaitMin) sets it by default or per host; GLAEDA_RUNNER_MEMORY_CAP=off in the runner's environment turns it off.
+# dedicated runners. config/runner-gate.json's memoryCap (true, false or a dict of needPct and resumePct, a share of
+# the host's RAM, or needGiB and resumeGiB, plus maxWaitMin) sets it by default or per host; GiB marks win over Pct
+# ones; GLAEDA_RUNNER_MEMORY_CAP=off in the runner's environment turns it off.
+# 2026-11-19 (Leo: "stretch everything till it's at like... 90% cpu/ram / we can be more wary at >95% utilization"):
+# the code marks are a share of the RAM, holding under 5% reclaimable (over 95% used) and listening again at 10%
+# (90% used). They were a fixed 4 GiB and 5 GiB (a swift-frontend at its peak), 75% of a 16 GiB mini.
 MEMORY_CAP_ENV = "GLAEDA_RUNNER_MEMORY_CAP"
-MEMORY_CAP_NEED_GIB = 4.0  # a swift-frontend at its peak (2.8-6.5 GiB in the 11-16 Jetsam reports)
-MEMORY_CAP_RESUME_GIB = 5.0
+MEMORY_CAP_NEED_PCT = 5.0
+MEMORY_CAP_RESUME_PCT = 10.0
+MEMORY_CAP_UNMEASURED_RAM_MIB = 16 * 1024  # the Pct marks' base when the RAM cannot be read: the smallest mini
 MEMORY_CAP_MAX_WAIT_MIN = 10.0
 MEMORY_CAP_MAX_WAIT_LIMIT_MIN = 60.0  # a longer maxWaitMin is not a setting: no hold may outlast an hour
 # One idle listener on a mini resumes at a time: every gate there reads the same memory, and a swift-frontend reaches
@@ -8807,18 +8882,31 @@ class MemoryCap(NamedTuple):
     max_wait_s: float
 
 
-def _memory_cap(value: Any) -> MemoryCap | None | bool:
-    """One memoryCap value read: false is off (None), true the code marks, a dict sets needGiB <= resumeGiB and
-    maxWaitMin (> 0 each), each defaulting to the code mark. Anything else is not a setting (False)."""
-    code = (MEMORY_CAP_NEED_GIB, MEMORY_CAP_RESUME_GIB, MEMORY_CAP_MAX_WAIT_MIN)
+def _memory_cap(value: Any, ram_mib: int | None = None) -> MemoryCap | None | bool:
+    """One memoryCap value read: false is off (None), true the code marks, a dict sets need <= resume (needGiB or
+    needPct of `ram_mib`, resumeGiB or resumePct; GiB wins) and maxWaitMin (> 0 each), each defaulting to the code
+    mark. Anything else is not a setting (False). `ram_mib` is the host's RAM (host_mem_mib() when None)."""
+    ram = ram_mib if ram_mib else (host_mem_mib() or MEMORY_CAP_UNMEASURED_RAM_MIB)
+    code = (ram * MEMORY_CAP_NEED_PCT / 100.0, ram * MEMORY_CAP_RESUME_PCT / 100.0, MEMORY_CAP_MAX_WAIT_MIN)
     if value is False:
         return None
     if value is True:
         need, resume, wait = code
     elif isinstance(value, dict):
         try:
-            need = float(value.get("needGiB", code[0]))
-            resume = float(value.get("resumeGiB", max(code[1], need)))
+            pcts = [float(value[key]) for key in ("needPct", "resumePct") if key in value]
+            if not all(0 < pct <= 100 for pct in pcts):
+                return False
+            if "needGiB" in value:
+                need = float(value["needGiB"]) * 1024
+            else:
+                need = ram * float(value.get("needPct", MEMORY_CAP_NEED_PCT)) / 100.0
+            if "resumeGiB" in value:
+                resume = float(value["resumeGiB"]) * 1024
+            elif "resumePct" in value:
+                resume = ram * float(value["resumePct"]) / 100.0
+            else:
+                resume = max(code[1], need)
             wait = float(value.get("maxWaitMin", code[2]))
         except (TypeError, ValueError):
             return False
@@ -8826,24 +8914,27 @@ def _memory_cap(value: Any) -> MemoryCap | None | bool:
             return False
     else:
         return False
-    return MemoryCap(int(need * 1024), int(resume * 1024), wait * 60.0)
+    return MemoryCap(int(need), int(resume), wait * 60.0)
 
 
-def gate_memory_cap(doc: dict[str, Any] | None, host: str, now: float, raw: str | None = None) -> MemoryCap | None:
+def gate_memory_cap(doc: dict[str, Any] | None, host: str, now: float, raw: str | None = None,
+                    ram_mib: int | None = None) -> MemoryCap | None:
     """The memory cap for this mini, or None when it is off: GLAEDA_RUNNER_MEMORY_CAP "off" (or 0, false, no) wins;
     else the host's live memoryCap entry in runner-gate.json, else defaults.memoryCap, else the code marks. A value
     that is not a bool or a valid dict is ignored."""
     env = os.environ.get(MEMORY_CAP_ENV) if raw is None else raw
     if env is not None and env.strip().lower() in ("off", "0", "false", "no", "disabled"):
         return None
-    cap: MemoryCap | None = _memory_cap(True)  # type: ignore[assignment]
+    ram = ram_mib if ram_mib else (host_mem_mib() or MEMORY_CAP_UNMEASURED_RAM_MIB)
+    cap: MemoryCap | None = _memory_cap(True, ram)  # type: ignore[assignment]
     defaults = doc.get("defaults") if isinstance(doc, dict) else None
-    if isinstance(defaults, dict) and "memoryCap" in defaults and (got := _memory_cap(defaults["memoryCap"])) is not False:
+    if isinstance(defaults, dict) and "memoryCap" in defaults \
+            and (got := _memory_cap(defaults["memoryCap"], ram)) is not False:
         cap = got  # type: ignore[assignment]
     hosts = doc.get("hosts") if isinstance(doc, dict) else None
     entry = hosts.get(host) if isinstance(hosts, dict) else None
     if isinstance(entry, dict) and "memoryCap" in entry and _live_entry(entry, now) \
-            and (got := _memory_cap(entry["memoryCap"])) is not False:
+            and (got := _memory_cap(entry["memoryCap"], ram)) is not False:
         cap = got  # type: ignore[assignment]
     return cap
 
@@ -10006,6 +10097,11 @@ class Gate:
         # DISK_RECLAIM_NOW: (why, the free GiB wanted) while an idle pool runner is short of one job's peak or of the
         # jobs in flight's disk at the last look; the listener's next start waits for room at most DISK_RECLAIM_WAIT_S
         self.disk_short: tuple[str, float] | None = None
+        # SUITE_FIRST_HOLD: the fleet disk wait last seen (its id), when this gate's hold for it began (wall clock;
+        # None while not holding) and the free GiB the wait wants while held, which low_disk's reclaim aims at too
+        self.suite_wait: str | None = None
+        self.suite_held_at: float | None = None
+        self.suite_want_gib: float | None = None
         self.watching: tuple[int, ...] = ()
         # JOB_END_FREEZE: armed while a job runs that the gate may stop the listener after; the listener pids and the
         # job's request, read during the job, so the freeze at the Worker's exit needs no ps and the look after it
@@ -10133,7 +10229,7 @@ class Gate:
             self.load_since = None  # the fleet's claim, not load, is holding this gate
             self.yield_to_fleet()
         return (why or self.shed(self.saturated()) or self.load_capped() or self.memory_capped() or self.full() or self.shed(self.hot()) or self.stalled()
-                or self.locked() or self.low_disk() or self.ineligible() or self.off_tailnet())
+                or self.locked() or self.low_disk() or self.suite_first() or self.ineligible() or self.off_tailnet())
 
     def exclusive_yield(self) -> str | None:
         """YIELD_TO_EXCLUSIVE at the listener: why a yieldToExclusive dedicated runner takes no job now (a signing
@@ -10681,7 +10777,7 @@ class Gate:
             self.load_since = None
             self.yield_to_fleet()
         return (why or self.shed(self.saturated()) or self.load_capped() or self.memory_capped() or self.full(fresh=True) or self.shed(self.hot(fresh=True))
-                or self.stalled() or self.locked(fresh=True) or self.low_disk() or self.ineligible() or self.off_tailnet())
+                or self.stalled() or self.locked(fresh=True) or self.low_disk() or self.suite_first() or self.ineligible() or self.off_tailnet())
 
     def still_waiting(self) -> str | None:
         """A fleet build seen waiting during the job that just ended, still waiting in a fresh reading."""
@@ -10748,6 +10844,7 @@ class Gate:
                 floor = builder + job_disk_gib()
                 reserve = f" (the dedicated builder's {builder:g} GiB floor + {job_disk_gib():g} GiB for a job here)"
         path = os.path.dirname(self.host_lock)
+        aim = self.suite_want_gib or 0.0  # SUITE_FIRST_HOLD: while a suite step's hold runs, reclaim aims at its want
         self.reap_eviction(path, floor)
         why = disk_refusal(path, floor)
         # The peak is read on its own, not only under the floor: a floor under one job's peak (--min-free-gib 30 with
@@ -10765,7 +10862,7 @@ class Gate:
             full_gib = min(RUNNER_JOBS_FLOOR_GIB, peak)
             if (free := free_or_none(path)) is not None and free < full_gib:
                 self.disk_short = None
-                self.evict_in_background(path, max(floor, peak))
+                self.evict_in_background(path, max(floor, peak, aim))
                 # the same words every poll: the gate logs a hold again only when its reason changes
                 return (f"disk full: under {full_gib:g} GiB, where no job of this runner fits; "
                         "reclaiming (DISK_FULL_NO_LISTEN)")
@@ -10775,7 +10872,7 @@ class Gate:
                 short = (f"disk: {crowded[0]} (RUNNER_JOBS_DISK)", max(floor, crowded[1]))
         self.disk_short = short
         if short:
-            self.evict_in_background(path, short[1])
+            self.evict_in_background(path, max(short[1], aim))
             if reserve:
                 self.evict_idle_in_background(path, short[1] + GATE_DISK_RESUME_GIB)
             now = time.monotonic()
@@ -10784,7 +10881,7 @@ class Gate:
                 self.disk_warned_at = now
             return None
         if why:
-            self.evict_in_background(path, floor)
+            self.evict_in_background(path, max(floor, aim))
             if scope.dedicated or reserve:
                 self.evict_idle_in_background(path, floor + GATE_DISK_RESUME_GIB)
             now = time.monotonic()
@@ -10792,6 +10889,55 @@ class Gate:
                 gate_log(f"disk warning: {why}{reserve}; keeping the listener online and requesting cleanup")
                 self.disk_warned_at = now
         return None
+
+    def suite_first(self, busy: bool = False) -> str | None:
+        """SUITE_FIRST_HOLD: why this pool listener stays off for a fleet suite step that waits for disk on this mini
+        (fleet_disk_wait), or None. It holds while free disk is under the step's want, at most SUITE_FIRST_HOLD_S from
+        the wait's start, and its reclaim aims at the want; one line logs the hold's start and one its end, with its
+        length and why (room, bound, wait gone). The reason is the same words every poll, so the gate's own hold line
+        is logged once. busy: a look while this runner's job runs, which only reads (no log, no reclaim, no state):
+        its answer arms the stop at the job's end, as a full disk does; the job itself runs on. The nightly's own
+        listeners, a dedicated builder, a gateway runner and a runner with no disk floor never hold for it."""
+        scope = runner_scope(self.runner_dir)
+        nightly_own = (scope.nightly or scope.trusted_signing) and not scope.dedicated
+        if scope.dedicated or nightly_own or scope.gateway or scope.min_free_gib <= 0:
+            return None
+        wait = fleet_disk_wait(self.capacity_dir or Path(FLEET_DIR) / "capacity")
+        now = time.time()
+        if not busy and (wait is None or wait["id"] != self.suite_wait):
+            self.suite_end("wait gone", now)
+            self.suite_wait = wait["id"] if wait else None
+        if wait is None:
+            return None
+        path = os.path.dirname(self.host_lock)
+        free, want = free_or_none(path), wait["want_gib"]
+        if free is None or free >= want:
+            if not busy:
+                self.suite_end("room", now)
+            return None
+        left = SUITE_FIRST_HOLD_S - (now - min(wait["since"], now))
+        if left <= 0:
+            if not busy:
+                self.suite_end("bound", now)
+            return None
+        why = (f"a fleet suite step waits for {want:g} GiB free on this mini; holding at most "
+               f"{SUITE_FIRST_HOLD_S / 60:g} min per wait ({SUITE_FIRST})")
+        if busy:
+            return why
+        if self.suite_held_at is None:
+            self.suite_held_at = now
+            gate_log(f"suite-first hold started: a fleet suite step waits for {want:g} GiB free, {free:.1f} GiB free "
+                     f"({wait['who'] or 'pid ' + str(wait['pid'])}); this idle listener holds at most {left:.0f} s "
+                     f"more ({SUITE_FIRST})")
+        self.suite_want_gib = want
+        self.evict_in_background(path, want)
+        return why
+
+    def suite_end(self, why: str, now: float) -> None:
+        """SUITE_FIRST_HOLD: log the end of this gate's hold, if one runs, with its length and why it ended."""
+        if self.suite_held_at is not None:
+            gate_log(f"suite-first hold ended after {max(0.0, now - self.suite_held_at):.0f} s: {why} ({SUITE_FIRST})")
+        self.suite_held_at, self.suite_want_gib = None, None
 
     def runner_jobs_short(self, path: str) -> tuple[str, float] | None:
         """RUNNER_JOBS_DISK: (why, the free disk wanted) when free disk is under the floor plus one measured job's
@@ -11620,7 +11766,7 @@ class Gate:
                 finished = self.job_request
                 self.watching, self.job_waited, self.freeze_at_exit, self.job_request = (), False, False, None
                 ending = self.job_end() if self.job_ending else None
-                if (why := self.draining() or self.low_disk() or self.still_waiting() or self.still_reserved()
+                if (why := self.draining() or self.low_disk() or self.suite_first() or self.still_waiting() or self.still_reserved()
                         or self.exclusive_yield() or ending):
                     if not listener_went_online(self.runner_dir):
                         self.unclaim()
@@ -11652,7 +11798,8 @@ class Gate:
                 # A disk floor is advisory cleanup only: never watch or freeze a Worker for it. A full disk
                 # (DISK_FULL_NO_LISTEN) is not a floor: the next job would fail there, so the listener stops at this
                 # job's end as for a reservation, and starts again once reclaim or the other jobs' ends free room.
-                full = self.low_disk()
+                # A fleet suite step waiting for disk here (SUITE_FIRST_HOLD) only arms that stop too: the job runs on.
+                full = self.low_disk() or self.suite_first(busy=True)
                 self.job_waited = bool(self.waiting) or reserved is not None or full is not None
                 workers = tuple(pid for pid in self.worker_pids() if pid not in self.done) \
                     if self.waiting or reserved or full or self.job_ending else ()
@@ -11936,7 +12083,7 @@ THERMAL_EVERY = 6  # pmset -g therm every Nth sample
 DYNAMIC_WARMUP_S = float(os.environ.get("GLAEDA_DYNAMIC_WARMUP_S") or 120.0)
 DYNAMIC_LOW_S = float(os.environ.get("GLAEDA_DYNAMIC_LOW_S") or 60.0)
 DYNAMIC_WINDOW_S = float(os.environ.get("GLAEDA_DYNAMIC_WINDOW_S") or 120.0)
-DYNAMIC_TARGET_BUSY_PCT = 80.0
+DYNAMIC_TARGET_BUSY_PCT = 95.0  # 2026-11-19 (Leo: "wary at >95%"): was 80
 DYNAMIC_MARGIN = 1.25
 MEMORY_PRESSURE_KEY = "kern.memorystatus_vm_pressure_level"
 PS = "/bin/ps"

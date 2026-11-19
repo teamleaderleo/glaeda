@@ -191,7 +191,7 @@ class HookLagTest(unittest.TestCase):
 
     def test_a_runner_two_changes_behind_lags_inside_the_window(self) -> None:
         pause = 'GLAEDA_RUNNER_GATE_CPU_PAUSE") or '
-        older = old_hook(self.hook).replace(pause + "85.0", pause + "70.0")  # a change released before #1572
+        older = old_hook(self.hook).replace(pause + "95.0", pause + "70.0")  # a change released before #1572
         self.assertNotEqual(older, old_hook(self.hook))
         self.install("mini-a", "actions-runner-glaeda", older)
         now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
